@@ -72,8 +72,8 @@ function producer(out: chan<int>) {
   close(out)                     // signal completion
 }
 
-function consumer(in: chan<int>) {
-  for v of in {                  // receives until closed and drained
+function consumer(input: chan<int>) {
+  for v of input {               // receives until closed and drained
     // handle v
   }
 }
@@ -92,9 +92,9 @@ if present, runs when no case is immediately ready, making the select
 non-blocking.
 
 ```bit
-function pump(in: chan<int>, out: chan<int>, next: int) {
+function pump(input: chan<int>, out: chan<int>, next: int) {
   select {
-    case v = <- in:
+    case v = <- input:
       handle(v)
     case out <- next:
       advance()

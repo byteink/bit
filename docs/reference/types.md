@@ -161,7 +161,7 @@ alias and its target are the same type (there are no nominal newtypes in v0.1).
 ```bit
 type Celsius = f64
 type IntPair = (int, int)
-type Handler = (string) => ()!
+type Transform = (int) => int
 
 function freezing(): Celsius {
   return 0.0            // Celsius and f64 are identical types
@@ -232,6 +232,16 @@ function operators(a: int, b: int): int {
 
 `string` is a reference type but deeply immutable, so sharing is unobservable.
 The zero value of every reference type is `nil`.
+
+## Memory management
+
+Bit is **garbage collected** by a tracing collector linked into every binary.
+There is no manual `free`, no use-after-free, and no double-free. Allocation is
+implicit — composite literals, constructors, closures, `append` growth, and
+boxing an interface value all allocate. Every reachable object stays live and
+unreachable objects are eventually reclaimed; object identity is stable for the
+object's lifetime. There are no finalizers in v0.1 — use `defer` (see
+[Errors](errors.md#deferred-cleanup-with-defer)) for deterministic cleanup.
 
 ## Comparability
 

@@ -1,0 +1,127 @@
+# Modules
+
+A module is a **directory** of `.bit` files that share one flat declaration
+namespace. There is no per-file package clause — membership is by directory, and
+declarations in the same module may reference each other in any order. (Spec:
+§17.)
+
+## Imports
+
+Import from another module with `import ... from "path"`. The path is a
+standard-library module like `"std/io"` or a relative project path like
+`"./util"` or `"../shared"`.
+
+```bit
+import io from "std/io"                       // namespace: io.println(...)
+import * as fs from "std/fs"                  // explicit namespace form
+import { println, printf } from "std/io"      // named members
+import { println as say } from "std/io"       // rename on import
+```
+
+- A namespace import binds one name; members are accessed as `io.println(...)`.
+- A named import binds members directly.
+- `as` renames, either the namespace or an individual member.
+
+Only exported members are importable, and import cycles between modules are an
+error.
+
+```bit
+import { readAll } from "std/fs"
+import { println } from "std/io"
+
+function show(path: string): ()! {
+  println(readAll(path)?)
+  return
+}
+```
+
+## Visibility with `export`
+
+Visibility is by the explicit `export` keyword, not by identifier casing.
+Unmarked declarations are module-private.
+
+```bit
+export function publicApi(): int { return 42 }   // visible to importers
+
+function helper(): int { return 1 }               // module-private
+
+export struct Config {
+  export name: string      // field visible outside the module
+  secret: string           // field module-private
+}
+```
+
+- `export` on a top-level declaration exports it.
+- `export` on a struct field makes that field readable and writable outside the
+  module; an unexported field cannot appear in a foreign composite literal or be
+  selected outside its module.
+- Export a method by placing `export` before its `function` keyword:
+
+```bit
+export function (c: Config) describe(): string {
+  return c.name
+}
+```
+
+## The `main` entry point
+
+The executable module is the root directory passed to `bit build`. It must
+declare exactly one `main` function. Three signatures are permitted:
+
+```bit
+function main() { }              // exit code 0 on normal return
+
+function main(): int {           // returned int is the process exit code
+  return 0
+}
+
+function main(): ()! {           // a returned error prints to stderr, exit 1
+  return
+}
+```
+
+`main` takes no parameters; read command-line arguments and the environment via
+the standard library (`std/os`). A library module has no `main`.
+
+## Builtins
+
+A handful of functions are predeclared in every module and need no import:
+`len`, `cap`, `append`, `delete`, `close`, `panic`, `assert`.
+
+```bit
+function builtins(xs: []int, m: map<string, int>) {
+  let n = len(xs)
+  let c = cap(xs)
+  let ys = append(xs, 4, 5)
+  delete(m, "key")
+  assert(n >= 0)
+}
+```
+
+## A complete program
+
+```bit
+import { println } from "std/io"
+
+interface Shape { area(): f64 }
+
+struct Circle { export r: f64 }
+struct Rect   { export w: f64; export h: f64 }
+
+function (c: Circle) area(): f64 { return 3.14159 * c.r * c.r }
+function (r: Rect)   area(): f64 { return r.w * r.h }
+
+function totalArea<T: Shape>(shapes: []T): f64 {
+  let sum = 0.0
+  for s of shapes {
+    sum += s.area()
+  }
+  return sum
+}
+
+function main(): ()! {
+  let shapes: []Shape = [Circle{ r: 1.0 }, Rect{ w: 2.0, h: 3.0 }]
+  println("area = ${totalArea(shapes)}")
+  return
+}
+```

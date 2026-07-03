@@ -55,7 +55,8 @@ left without a reference page:
 | §11.3 generics | Generics |
 | §12 expressions, operators, conversions | Types, Functions |
 | §13.1–§13.5 statements, memory, arithmetic | Variables, Types, Functions |
-| §13.6 GC, §13.7 concurrency memory model | Concurrency |
+| §13.6 garbage collection | Types |
+| §13.7 concurrency memory model | Concurrency |
 | §14 type system, assertions, comparability | Types, Interfaces |
 | §15 type inference | Variables, Types, Generics |
 | §16 concurrency | Concurrency |

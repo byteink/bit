@@ -141,8 +141,10 @@ function countdown(n: int) {
 
 ### `for`
 
-Three forms: C-style counting, `for ... of` over a collection or channel, and
-`for ... in`. An empty `for { }` loops forever.
+Two documented forms: C-style counting and `for ... of` over a collection or
+channel. An empty `for { }` loops forever. (The grammar also reserves a
+`for ident in expr` form; its semantics are not yet fixed in the spec, so it is
+not documented here — this reference will add it when the spec does.)
 
 ```bit
 function loops(xs: []int, m: map<string, int>) {
