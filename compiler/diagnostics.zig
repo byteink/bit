@@ -60,6 +60,13 @@ pub const Code = enum(u16) {
     // Checker: 40–59
     undefined_name = 40,
     type_mismatch = 41,
+    duplicate_declaration = 42,
+    use_before_init = 43,
+    import_cycle = 44,
+    import_not_found = 45,
+    unexported_name = 46,
+    type_cycle = 47,
+    shadows_predeclared = 48,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {
