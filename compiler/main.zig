@@ -8,6 +8,7 @@ const parser = @import("parser.zig");
 const resolve = @import("resolve.zig");
 const check = @import("check.zig");
 const fmt = @import("fmt.zig");
+const lsp = @import("lsp.zig");
 
 /// Seed compiler version. Kept in sync with `build.zig.zon`.
 pub const version = "0.0.0";
@@ -28,6 +29,10 @@ pub fn main(init: std.process.Init) !void {
         try stderr_w.interface.flush();
         if (failed) return error.FormatFailed;
         return;
+    }
+
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "lsp")) {
+        return lsp.run(gpa, io);
     }
 
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "check")) {
