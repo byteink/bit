@@ -5,6 +5,8 @@ const diagnostics = @import("diagnostics.zig");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const resolve = @import("resolve.zig");
+const check = @import("check.zig");
 const fmt = @import("fmt.zig");
 
 /// Seed compiler version. Kept in sync with `build.zig.zon`.
@@ -25,6 +27,24 @@ pub fn main(init: std.process.Init) !void {
         const failed = try runFmt(gpa, io, &stderr_w.interface, argv[2..]);
         try stderr_w.interface.flush();
         if (failed) return error.FormatFailed;
+        return;
+    }
+
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "check")) {
+        var rest = argv[2..];
+        var dump_types = false;
+        if (rest.len >= 1 and std.mem.eql(u8, rest[0], "--dump-types")) {
+            dump_types = true;
+            rest = rest[1..];
+        }
+        var out_buf: [4096]u8 = undefined;
+        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        const failed = try runCheck(gpa, io, &stdout_w.interface, &stderr_w.interface, dump_types, rest);
+        try stdout_w.interface.flush();
+        try stderr_w.interface.flush();
+        if (failed) return error.CheckFailed;
         return;
     }
 
@@ -66,6 +86,34 @@ fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, paths: []const [:
     return any_failed;
 }
 
+/// `bitc check [--dump-types] <path>...`: type-checks each file independently
+/// (each is its own single-file module — matches `compileReport`'s scope).
+/// Diagnostics go to `err_out`; with `dump_types`, a clean file's inferred
+/// types print to `out` instead of producing no output. Returns `true` iff
+/// any file failed, mirroring `runFmt`'s per-file-independence contract.
+fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer, dump_types: bool, paths: []const [:0]const u8) !bool {
+    var any_failed = false;
+    for (paths) |path| {
+        const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
+            try err_out.print("bitc check: {s}: {s}\n", .{ path, @errorName(e) });
+            any_failed = true;
+            continue;
+        };
+        defer gpa.free(source);
+
+        const report = if (dump_types) try typesReport(gpa, path, source) else try compileReport(gpa, path, source);
+        defer gpa.free(report.text);
+
+        if (report.failed) {
+            try err_out.writeAll(report.text);
+            any_failed = true;
+            continue;
+        }
+        try out.writeAll(report.text);
+    }
+    return any_failed;
+}
+
 /// Outcome of driving the front-end over a single source buffer.
 pub const CompileReport = struct {
     /// Rendered diagnostics, human format, ANSI disabled (deterministic).
@@ -75,13 +123,16 @@ pub const CompileReport = struct {
     failed: bool,
 };
 
-/// Drives every front-end stage that currently exists (lexer, parser) over
-/// `source` and renders the resulting diagnostics. `path` labels the source in
-/// diagnostics. The returned `text` is owned by `gpa`; `failed` reports whether
-/// compilation would fail (any error-severity diagnostic).
+/// Drives every front-end stage (lexer, parser, symbol resolution, type
+/// checker) over a single-file `source` and renders the resulting
+/// diagnostics. `path` labels the source in diagnostics. The returned `text`
+/// is owned by `gpa`; `failed` reports whether compilation would fail (any
+/// error-severity diagnostic).
 ///
-/// ponytail: the checker pass appends here once it lands; the golden test
-/// harness needs no change when it does.
+/// Each stage only runs if the previous one produced no errors: resolve and
+/// check both assume a syntactically valid tree, and check assumes resolved
+/// symbols, so running them over a broken tree would cascade into noise
+/// rather than the single precise diagnostic a golden case expects.
 pub fn compileReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
@@ -94,11 +145,69 @@ pub fn compileReport(gpa: std.mem.Allocator, path: []const u8, source: []const u
     defer tree.deinit();
     try parser.parse(gpa, &tree, &diags, file, source);
 
+    if (!diags.hasErrors()) resolve_and_check: {
+        const mf = resolve.ModuleFile{ .file = file, .source = source, .tree = &tree };
+        var no_imports: resolve.ImportTable = .{};
+        defer no_imports.deinit(gpa);
+        const files = [_]resolve.ModuleFile{mf};
+
+        var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+        defer module.deinit();
+        if (diags.hasErrors()) break :resolve_and_check;
+
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var checked = try check.checkModule(gpa, &diags, &ctx, &files, &module, @enumFromInt(0), &.{}, false);
+        defer checked.deinit();
+    }
+
     var rendered: Io.Writer.Allocating = .init(gpa);
     defer rendered.deinit();
     try diags.renderAll(&rendered.writer);
 
     return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = diags.hasErrors() };
+}
+
+/// Drives the front-end through the type checker with `dump_types = true`
+/// and renders either its diagnostics (on failure) or its type dump (on
+/// success) — the `bitc check --dump-types` positive-suite surface named by
+/// task #335's Verify section. `text` is owned by `gpa`.
+pub fn typesReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    const file = try sm.addFile(path, source);
+
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree = try ast.Tree.init(gpa);
+    defer tree.deinit();
+    try parser.parse(gpa, &tree, &diags, file, source);
+
+    var dump: ?[]u8 = null;
+    if (!diags.hasErrors()) resolve_and_check: {
+        const mf = resolve.ModuleFile{ .file = file, .source = source, .tree = &tree };
+        var no_imports: resolve.ImportTable = .{};
+        defer no_imports.deinit(gpa);
+        const files = [_]resolve.ModuleFile{mf};
+
+        var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+        defer module.deinit();
+        if (diags.hasErrors()) break :resolve_and_check;
+
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var checked = try check.checkModule(gpa, &diags, &ctx, &files, &module, @enumFromInt(0), &.{}, true);
+        defer checked.deinit();
+        if (!diags.hasErrors()) dump = try gpa.dupe(u8, checked.type_dump.?);
+    }
+
+    if (dump) |d| return .{ .text = d, .failed = false };
+
+    var rendered: Io.Writer.Allocating = .init(gpa);
+    defer rendered.deinit();
+    try diags.renderAll(&rendered.writer);
+    return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = true };
 }
 
 /// Outcome of parsing a single source buffer for AST-dump golden tests.

@@ -57,7 +57,7 @@ pub const Code = enum(u16) {
     unexpected_token = 20,
     expected_token = 21,
 
-    // Checker: 40–59
+    // Checker: 40–79
     undefined_name = 40,
     type_mismatch = 41,
     duplicate_declaration = 42,
@@ -67,6 +67,26 @@ pub const Code = enum(u16) {
     unexported_name = 46,
     type_cycle = 47,
     shadows_predeclared = 48,
+    not_callable = 49,
+    arg_count_mismatch = 50,
+    missing_method = 51,
+    not_comparable = 52,
+    invalid_operand = 53,
+    not_indexable = 54,
+    missing_return = 55,
+    invalid_break_continue = 56,
+    unknown_member = 57,
+    generic_arity_mismatch = 58,
+    tuple_index_out_of_range = 59,
+    fail_outside_fallible = 60,
+    try_outside_fallible = 61,
+    immutable_assignment = 62,
+    invalid_spread = 63,
+    non_constant_expr = 64,
+    invalid_expr_statement = 65,
+    expected_call_expr = 66,
+    catch_block_incomplete = 67,
+    cannot_infer_type = 68,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {

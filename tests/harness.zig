@@ -10,12 +10,15 @@
 //!                documentation and start executing when codegen arrives.
 //!   `// fmt`   — `bitc fmt` canonicalization must byte-match `.expected`
 //!                (task #333's golden pairs: messy input -> canonical output).
+//!   `// types` — compilation must succeed; `bitc check --dump-types`'
+//!                inferred-type dump must byte-match `.expected` (task #335's
+//!                positive suite: nested lambdas, generic calls).
 //!
 //! A mismatch fails the build with a readable diff (via `expectEqualStrings`).
 //!
-//! Every `run`/`fmt` case (i.e. every case that is valid Bit source, per its
-//! own directive) also feeds a corpus-wide property check: fmt must be
-//! idempotent and must never drop a comment (see "fmt corpus properties"
+//! Every `run`/`fmt`/`types` case (i.e. every case that is valid Bit source,
+//! per its own directive) also feeds a corpus-wide property check: fmt must
+//! be idempotent and must never drop a comment (see "fmt corpus properties"
 //! below) — `// error` cases are deliberately malformed and out of scope.
 
 const std = @import("std");
@@ -33,7 +36,7 @@ const max_cases = 4096;
 /// Upper bound on any single case/expected file.
 const max_file_bytes = 1 << 20; // 1 MiB
 
-const Directive = enum { run, err, fmt };
+const Directive = enum { run, err, fmt, types };
 const Outcome = enum { checked, skipped };
 
 test "golden cases" {
@@ -67,7 +70,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
     defer gpa.free(source);
 
     const directive = directiveOf(source) orelse {
-        std.debug.print("case '{s}': line 1 must be '// run', '// error', or '// fmt'\n", .{name});
+        std.debug.print("case '{s}': line 1 must be '// run', '// error', '// fmt', or '// types'\n", .{name});
         return error.MissingDirective;
     };
     if (directive == .run) return .skipped;
@@ -105,6 +108,17 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
                 std.debug.print("case '{s}' fmt mismatch:\n", .{name});
             try testing.expectEqualStrings(expected, report.text);
         },
+        .types => {
+            const report = try bitc.typesReport(gpa, name, source);
+            defer gpa.free(report.text);
+            if (report.failed) {
+                std.debug.print("case '{s}': expected type-check to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
+                return error.TypeCheckFailed;
+            }
+            if (!std.mem.eql(u8, expected, report.text))
+                std.debug.print("case '{s}' type-dump mismatch:\n", .{name});
+            try testing.expectEqualStrings(expected, report.text);
+        },
     }
     return .checked;
 }
@@ -119,6 +133,7 @@ fn directiveOf(source: []const u8) ?Directive {
     if (std.mem.startsWith(u8, line, "// error")) return .err;
     if (std.mem.startsWith(u8, line, "// run")) return .run;
     if (std.mem.startsWith(u8, line, "// fmt")) return .fmt;
+    if (std.mem.startsWith(u8, line, "// types")) return .types;
     return null;
 }
 
@@ -126,6 +141,7 @@ test "directiveOf parses line-1 modes" {
     try testing.expectEqual(Directive.err, directiveOf("// error\nlet x = @\n").?);
     try testing.expectEqual(Directive.run, directiveOf("// run\r\nmain()\n").?);
     try testing.expectEqual(Directive.fmt, directiveOf("// fmt\nlet x=1\n").?);
+    try testing.expectEqual(Directive.types, directiveOf("// types\nlet x=1\n").?);
     try testing.expectEqual(Directive.err, directiveOf("// error: stray byte").?);
     try testing.expectEqual(@as(?Directive, null), directiveOf("let x = 1\n"));
 }
