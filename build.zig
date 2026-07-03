@@ -51,4 +51,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(lexer_tests).step);
+
+    // Golden-file harness: discovers tests/cases/*.bit and checks each against
+    // its sibling .expected. The cases directory (absolute) is injected as a
+    // build option so the runner is independent of the process cwd.
+    const golden_opts = b.addOptions();
+    golden_opts.addOption([]const u8, "cases_dir", b.pathFromRoot("tests/cases"));
+
+    const golden_mod = b.createModule(.{
+        .root_source_file = b.path("tests/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    golden_mod.addImport("bitc", exe.root_module);
+    golden_mod.addOptions("build_options", golden_opts);
+
+    const golden_tests = b.addTest(.{ .root_module = golden_mod });
+    test_step.dependOn(&b.addRunArtifact(golden_tests).step);
 }
