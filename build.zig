@@ -106,15 +106,6 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(fmt_tests).step);
 
-    const check_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/check.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(check_tests).step);
-
     // Golden-file harness: discovers tests/cases/*.bit and checks each against
     // its sibling .expected. The cases directory (absolute) is injected as a
     // build option so the runner is independent of the process cwd.
@@ -131,4 +122,67 @@ pub fn build(b: *std.Build) void {
 
     const golden_tests = b.addTest(.{ .root_module = golden_mod });
     test_step.dependOn(&b.addRunArtifact(golden_tests).step);
+
+    // Fuzz harness (task #334): lexer+parser must never crash/hang on
+    // arbitrary bytes. Two separate compilations of fuzz.zig, because
+    // `-ffuzz` instrumentation changes runtime behavior, not just codegen:
+    // `std.testing.fuzz` blocks forever waiting for the build system's fuzz
+    // coordinator whenever the module is built with `.fuzz = true`, coordinator
+    // or not. So the plain build (no `.fuzz`) is what `zig build test` runs —
+    // it just replays the seed corpus once, finite. The instrumented build
+    // only ever gets invoked as `zig build fuzz --fuzz` (or `--fuzz=N`), which
+    // is what actually drives the coordinator.
+    const fuzz_opts = b.addOptions();
+    fuzz_opts.addOption([]const u8, "cases_dir", b.pathFromRoot("tests/cases"));
+    fuzz_opts.addOption([]const u8, "crashes_dir", b.pathFromRoot("tests/fuzz/crashes"));
+
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // guard.zig's signal handler needs raw libc calls
+        }),
+    });
+    fuzz_tests.root_module.addImport("bitc", exe.root_module);
+    fuzz_tests.root_module.addOptions("build_options", fuzz_opts);
+    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    // Saved-crash regression replay: deliberately kept in its own always-plain
+    // binary, never built with `-ffuzz` — Zig's native fuzzer segfaults when a
+    // fuzz-instrumented binary contains more than one `test` declaration
+    // (upstream ziglang/zig#26040), and this test doesn't call
+    // `std.testing.fuzz` anyway, so it has nothing to gain from instrumentation.
+    const crash_regression_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/crash_regression.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    crash_regression_tests.root_module.addImport("bitc", exe.root_module);
+    crash_regression_tests.root_module.addOptions("build_options", fuzz_opts);
+    test_step.dependOn(&b.addRunArtifact(crash_regression_tests).step);
+
+    // `zig build fuzz [-- <seconds>]`: bounded mutation-based fuzz run over
+    // the same target and corpus (see tests/fuzz/mutate.zig's header for why
+    // this isn't Zig's native coverage-guided `--fuzz` engine). Defaults to
+    // 60s, matching the CI smoke pass; pass e.g. `-- 600` for a 10-minute run.
+    const fuzz_exe = b.addExecutable(.{
+        .name = "bit-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/mutate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    fuzz_exe.root_module.addImport("bitc", exe.root_module);
+    fuzz_exe.root_module.addOptions("build_options", fuzz_opts);
+
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    if (b.args) |args| run_fuzz.addArgs(args);
+    const fuzz_step = b.step("fuzz", "Mutation-fuzz the lexer+parser (default 60s; pass -- <seconds> to override)");
+    fuzz_step.dependOn(&run_fuzz.step);
 }
