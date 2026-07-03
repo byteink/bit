@@ -5,16 +5,65 @@ const diagnostics = @import("diagnostics.zig");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const fmt = @import("fmt.zig");
 
 /// Seed compiler version. Kept in sync with `build.zig.zon`.
 pub const version = "0.0.0";
 
+/// Upper bound on a single source file `bitc fmt` will read. Matches the
+/// golden harness's own cap (tests/harness.zig max_file_bytes).
+const max_fmt_file_bytes = 1 << 20; // 1 MiB
+
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "fmt")) {
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        const failed = try runFmt(gpa, io, &stderr_w.interface, argv[2..]);
+        try stderr_w.interface.flush();
+        if (failed) return error.FormatFailed;
+        return;
+    }
+
     var buf: [64]u8 = undefined;
-    var stdout: Io.File.Writer = .init(.stdout(), init.io, &buf);
+    var stdout: Io.File.Writer = .init(.stdout(), io, &buf);
     const out = &stdout.interface;
     try out.print("bitc {s}\n", .{version});
     try out.flush();
+}
+
+/// `bitc fmt <path>...`: reformats each file to Bit's one canonical style,
+/// rewriting it in place only when the canonical text differs (idempotent:
+/// an already-canonical file is never touched). A file that fails to parse
+/// is left untouched and its diagnostics are rendered to `err_out`; returns
+/// `true` iff any file failed, so the caller can pick a nonzero exit code —
+/// every remaining path is still attempted, matching gofmt's per-file
+/// independence.
+fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, paths: []const [:0]const u8) !bool {
+    var any_failed = false;
+    for (paths) |path| {
+        const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
+            try err_out.print("bitc fmt: {s}: {s}\n", .{ path, @errorName(e) });
+            any_failed = true;
+            continue;
+        };
+        defer gpa.free(source);
+
+        const result = try fmt.format(gpa, path, source);
+        defer gpa.free(result.text);
+
+        if (result.failed) {
+            try err_out.writeAll(result.text);
+            any_failed = true;
+            continue;
+        }
+        if (std.mem.eql(u8, source, result.text)) continue;
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = result.text });
+    }
+    return any_failed;
 }
 
 /// Outcome of driving the front-end over a single source buffer.
@@ -81,6 +130,24 @@ pub fn parseReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8)
         return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = true };
     }
     return .{ .text = try ast.dump(gpa, &tree, source), .failed = false };
+}
+
+/// Outcome of formatting a single source buffer for golden fmt tests.
+pub const FormatReport = fmt.FormatResult;
+
+/// Formats `source` to Bit's one canonical style (see fmt.zig). Thin
+/// forwarder kept alongside `compileReport`/`parseReport` so the golden-test
+/// harness only ever depends on this module's public surface.
+pub fn formatReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !FormatReport {
+    return fmt.format(gpa, path, source);
+}
+
+/// Number of line/block comments in `source`, per fmt's own comment
+/// re-derivation. Used by the golden-test harness to assert fmt drops none.
+pub fn commentCount(gpa: std.mem.Allocator, source: []const u8) !usize {
+    const comments = try fmt.collectComments(gpa, source);
+    defer gpa.free(comments);
+    return comments.len;
 }
 
 test "version string is non-empty" {
