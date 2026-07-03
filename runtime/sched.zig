@@ -332,7 +332,9 @@ fn writeFd(fd: std.posix.fd_t, buf: []const u8) !usize {
 /// Monotonic clock in nanoseconds. `std.time.Timer` moved behind the new `Io`
 /// interface in this Zig version (see the module doc comment on why this
 /// runtime doesn't depend on `Io`); read `CLOCK_MONOTONIC` directly instead.
-fn monoNs() u64 {
+/// `pub` so other runtime modules (e.g. `chan.zig`'s `select` fairness seed)
+/// don't need their own copy of this platform-branching syscall wrapper.
+pub fn monoNs() u64 {
     var ts: std.posix.timespec = undefined;
     switch (builtin.os.tag) {
         .linux => _ = std.os.linux.clock_gettime(.MONOTONIC, &ts),
@@ -403,19 +405,21 @@ const Deque = struct {
     }
 };
 
-/// Minimal spinlock for the rare, O(1) global-queue critical sections. Never
-/// held across a blocking call, so spinning (rather than a futex/condvar) is
-/// both simple and correct.
-const SpinLock = struct {
+/// Minimal spinlock for rare, O(1)-ish critical sections (the global run queue
+/// here; channel send/recv/close in `chan.zig`). Never held across a blocking
+/// call or a context switch, so spinning (rather than a futex/condvar) is both
+/// simple and correct. `pub` so other runtime modules share one implementation
+/// instead of hand-rolling their own.
+pub const SpinLock = struct {
     locked: std.atomic.Value(bool) = .init(false),
 
-    fn acquire(self: *SpinLock) void {
+    pub fn acquire(self: *SpinLock) void {
         while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
     }
 
-    fn release(self: *SpinLock) void {
+    pub fn release(self: *SpinLock) void {
         self.locked.store(false, .release);
     }
 };
