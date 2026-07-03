@@ -34,6 +34,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(runtime_tests).step);
 
+    const sched_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("runtime/sched.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(sched_tests).step);
+
     const diagnostics_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("compiler/diagnostics.zig"),
@@ -51,6 +60,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(lexer_tests).step);
+
+    const ast_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/ast.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ast_tests).step);
+
+    const parser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/parser.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(parser_tests).step);
 
     // Golden-file harness: discovers tests/cases/*.bit and checks each against
     // its sibling .expected. The cases directory (absolute) is injected as a

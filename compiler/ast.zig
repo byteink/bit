@@ -173,18 +173,18 @@ pub const Tree = struct {
         self.* = undefined;
     }
 
-    /// Appends a node whose children are `kids` (copied into `extra`) and returns
-    /// its index. `main` is the tag-specific scalar (0 when unused).
-    pub fn add(self: *Tree, tag: Tag, span: Span, main: u32, kids: []const Index) !Index {
+    /// Appends a node whose children are `child_ids` (copied into `extra`) and
+    /// returns its index. `main` is the tag-specific scalar (0 when unused).
+    pub fn add(self: *Tree, tag: Tag, span: Span, main: u32, child_ids: []const Index) !Index {
         const start: u32 = @intCast(self.extra.items.len);
-        try self.extra.appendSlice(self.gpa, kids);
+        try self.extra.appendSlice(self.gpa, child_ids);
         const idx: u32 = @intCast(self.nodes.len);
         try self.nodes.append(self.gpa, .{
             .tag = tag,
             .span = span,
             .main = main,
             .kids_start = start,
-            .kids_len = @intCast(kids.len),
+            .kids_len = @intCast(child_ids.len),
         });
         return idx;
     }

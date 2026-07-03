@@ -3,6 +3,8 @@ const Io = std.Io;
 
 const diagnostics = @import("diagnostics.zig");
 const lexer = @import("lexer.zig");
+const ast = @import("ast.zig");
+const parser = @import("parser.zig");
 
 /// Seed compiler version. Kept in sync with `build.zig.zon`.
 pub const version = "0.0.0";
@@ -24,17 +26,13 @@ pub const CompileReport = struct {
     failed: bool,
 };
 
-/// Hard cap on tokens per source (Power of 10 bound); real inputs never approach
-/// it. The lexer always advances or returns `.eof`, so the loop is bounded.
-const max_tokens = 1 << 20;
-
-/// Drives every front-end stage that currently exists over `source` and renders
-/// the resulting diagnostics. `path` labels the source in diagnostics. The
-/// returned `text` is owned by `gpa`; `failed` reports whether compilation would
-/// fail (any error-severity diagnostic).
+/// Drives every front-end stage that currently exists (lexer, parser) over
+/// `source` and renders the resulting diagnostics. `path` labels the source in
+/// diagnostics. The returned `text` is owned by `gpa`; `failed` reports whether
+/// compilation would fail (any error-severity diagnostic).
 ///
-/// ponytail: only the lexer runs today. Parser and checker passes append here as
-/// they land, so the golden test harness needs no change when they do.
+/// ponytail: the checker pass appends here once it lands; the golden test
+/// harness needs no change when it does.
 pub fn compileReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
@@ -43,20 +41,46 @@ pub fn compileReport(gpa: std.mem.Allocator, path: []const u8, source: []const u
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
     defer diags.deinit();
 
-    var lx = lexer.Lexer.init(file, source, &diags);
-    var count: usize = 0;
-    // Bounded by the token cap; each step consumes input or reaches EOF.
-    while (count < max_tokens) : (count += 1) {
-        const tok = try lx.next();
-        if (tok.kind == .eof) break;
-    }
-    std.debug.assert(count < max_tokens);
+    var tree = try ast.Tree.init(gpa);
+    defer tree.deinit();
+    try parser.parse(gpa, &tree, &diags, file, source);
 
     var rendered: Io.Writer.Allocating = .init(gpa);
     defer rendered.deinit();
     try diags.renderAll(&rendered.writer);
 
     return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = diags.hasErrors() };
+}
+
+/// Outcome of parsing a single source buffer for AST-dump golden tests.
+pub const ParseReport = struct {
+    /// The AST s-expression dump on success, or the rendered diagnostics on
+    /// failure. Owned by the `gpa` passed to `parseReport`.
+    text: []u8,
+    failed: bool,
+};
+
+/// Parses `source` and returns either its AST dump (§9-§18 grammar) or, if
+/// parsing produced any diagnostic, the rendered diagnostics instead.
+pub fn parseReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !ParseReport {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    const file = try sm.addFile(path, source);
+
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree = try ast.Tree.init(gpa);
+    defer tree.deinit();
+    try parser.parse(gpa, &tree, &diags, file, source);
+
+    if (diags.hasErrors()) {
+        var rendered: Io.Writer.Allocating = .init(gpa);
+        defer rendered.deinit();
+        try diags.renderAll(&rendered.writer);
+        return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = true };
+    }
+    return .{ .text = try ast.dump(gpa, &tree, source), .failed = false };
 }
 
 test "version string is non-empty" {
