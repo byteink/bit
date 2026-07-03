@@ -50,6 +50,8 @@ pub const Code = enum(u16) {
     unterminated_string = 2,
     unterminated_block_comment = 3,
     invalid_number = 4,
+    invalid_escape = 5,
+    invalid_rune = 6,
 
     // Parser: 20–39
     unexpected_token = 20,
