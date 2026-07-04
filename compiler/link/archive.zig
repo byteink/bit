@@ -1,11 +1,12 @@
 //! `ar` archive reader (task #345): extracts the member object(s) out of
-//! `libbitrt.a` so `elf_reader.zig`/`macho_reader.zig` can parse them. Common
-//! (System V / GNU) format only — the format `zig build libbitrt` actually
-//! writes (verified against a real build: `!<arch>\n` magic, a `/` global
-//! symbol-table member, real member names short enough to fit inline with a
-//! GNU trailing-`/` terminator). BSD's `#1/<len>` inline-long-name variant is
-//! also handled since it costs little and this reader has no way to know in
-//! advance which `ar` produced an archive fed to it.
+//! `libbitrt.a` so `elf_reader.zig`/`macho_reader.zig` can parse them. Handles
+//! both formats `zig build libbitrt` actually writes: **GNU/System V** for ELF
+//! targets (a `/` symbol-table member, a `//` long-name table, GNU trailing-`/`
+//! short names) and **BSD** for Mach-O targets (an `__.SYMDEF` symbol table and
+//! `#1/<len>` names carried as a null-padded prefix of each member's own data).
+//! Both symbol tables are skipped — `link.zig`'s merge builds the whole-link
+//! global table from every member's own symbols for dead-strip anyway, so an
+//! index would save nothing (see below).
 //!
 //! Deliberately does *not* use the `/` symbol-table member to route straight
 //! to the member defining a wanted symbol — `link.zig`'s merge always needs
@@ -72,19 +73,31 @@ pub fn parse(gpa: Allocator, bytes: []const u8) Error![]Member {
             continue;
         }
 
-        const name = try resolveName(gpa, raw_name, long_names, data);
-        try members.append(gpa, .{ .name = name, .data = data });
+        const resolved = try resolveName(raw_name, long_names, data);
+        // BSD symbol tables carry an `__.SYMDEF`/`__.SYMDEF SORTED`/`__.SYMDEF_64`
+        // name (the macOS `ar`/Zig-for-macho form of the GNU `/` member) — the
+        // index we deliberately don't use, same as `/` above.
+        if (std.mem.startsWith(u8, resolved.name, "__.SYMDEF")) continue;
+        try members.append(gpa, .{ .name = resolved.name, .data = data[resolved.data_start..] });
     }
 
     return members.toOwnedSlice(gpa);
 }
 
+const Resolved = struct {
+    name: []const u8,
+    /// Offset within the member's raw data where its real content begins —
+    /// nonzero only for BSD `#1/<len>`, whose name is a prefix of the data.
+    data_start: usize,
+};
+
 /// `data` is needed only for the BSD `#1/<len>` case, where the name is a
-/// prefix of the member's own data rather than a separate table lookup.
-fn resolveName(gpa: Allocator, raw_name: []const u8, long_names: []const u8, data: []const u8) Error![]const u8 {
+/// prefix of the member's own data rather than a separate table lookup. Every
+/// returned name aliases `raw_name`/`long_names`/`data` — never allocated.
+fn resolveName(raw_name: []const u8, long_names: []const u8, data: []const u8) Error!Resolved {
     // GNU: "name/" — trailing slash marks the end of a short inline name.
     if (std.mem.endsWith(u8, raw_name, "/")) {
-        return raw_name[0 .. raw_name.len - 1];
+        return .{ .name = raw_name[0 .. raw_name.len - 1], .data_start = 0 };
     }
     // GNU: "/<decimal offset>" — name lives in the `//` long-name table,
     // terminated by `\n`.
@@ -94,16 +107,16 @@ fn resolveName(gpa: Allocator, raw_name: []const u8, long_names: []const u8, dat
         const end = std.mem.indexOfScalarPos(u8, long_names, off, '\n') orelse return error.BadLongName;
         var name_end = end;
         if (name_end > off and long_names[name_end - 1] == '/') name_end -= 1;
-        return long_names[off..name_end];
+        return .{ .name = long_names[off..name_end], .data_start = 0 };
     }
-    // BSD: "#1/<len>" — the name is the first `len` bytes of the member's
-    // own data (and does not count as part of the member's real content).
+    // BSD: "#1/<len>" — the name is the first `len` (null-padded) bytes of the
+    // member's own data; the real content follows at `data[len..]`.
     if (std.mem.startsWith(u8, raw_name, "#1/")) {
         const len = std.fmt.parseInt(usize, raw_name[3..], 10) catch return error.BadLongName;
         if (len > data.len) return error.BadLongName;
-        return gpa.dupe(u8, std.mem.trimEnd(u8, data[0..len], &.{0})) catch return error.OutOfMemory;
+        return .{ .name = std.mem.trimEnd(u8, data[0..len], &.{0}), .data_start = len };
     }
-    return raw_name;
+    return .{ .name = raw_name, .data_start = 0 };
 }
 
 fn isAllDigits(s: []const u8) bool {
@@ -163,4 +176,37 @@ fn appendHeader(gpa: Allocator, buf: *std.ArrayList(u8), name: []const u8, size:
 
 test "rejects a file missing the ar magic" {
     try testing.expectError(error.BadMagic, parse(testing.allocator, "not an archive"));
+}
+
+test "parses a BSD archive, skips __.SYMDEF, strips the #1/ name prefix" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, magic);
+
+    // The exact shape macOS `ar` / Zig-for-macho produces: a BSD symbol-table
+    // member named "__.SYMDEF" (must be skipped) then one real object whose
+    // name is a null-padded prefix of its own data (must be stripped off).
+    try appendBsdMember(gpa, &buf, "__.SYMDEF", "INDEX-BYTES");
+    try appendBsdMember(gpa, &buf, "libbitrt_zcu.o", "MACHOCONTENT");
+
+    const members = try parse(gpa, buf.items);
+    defer gpa.free(members);
+
+    try testing.expectEqual(@as(usize, 1), members.len);
+    try testing.expectEqualStrings("libbitrt_zcu.o", members[0].name);
+    try testing.expectEqualStrings("MACHOCONTENT", members[0].data);
+}
+
+/// Appends one BSD `#1/<len>` member: a `#1/N` header whose data is the
+/// name (null-padded to a 4-byte boundary, exercising the trim) then `content`.
+fn appendBsdMember(gpa: Allocator, buf: *std.ArrayList(u8), name: []const u8, content: []const u8) !void {
+    const name_field = std.mem.alignForward(usize, name.len, 4);
+    var hdr_name_buf: [16]u8 = undefined;
+    const hdr_name = std.fmt.bufPrint(&hdr_name_buf, "#1/{d}", .{name_field}) catch unreachable;
+    try appendHeader(gpa, buf, hdr_name, name_field + content.len);
+    try buf.appendSlice(gpa, name);
+    try buf.appendNTimes(gpa, 0, name_field - name.len);
+    try buf.appendSlice(gpa, content);
+    if (buf.items.len % 2 == 1) try buf.append(gpa, '\n');
 }
