@@ -136,6 +136,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(arm64_tests).step);
 
+    // Rooted at `compiler/` (not `compiler/codegen/`) via the anchor file, so
+    // `x64.zig`'s `../ir.zig`-style imports resolve — see that file's doc
+    // comment. `compileFunction`'s native-execution tests self-skip off
+    // x86-64 Linux (see `x64.zig`'s `can_exec_native`), so this is safe to
+    // run on every CI host.
+    const x64_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/codegen_x64_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(x64_tests).step);
+
     const opt_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("compiler/opt.zig"),
