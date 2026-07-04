@@ -426,8 +426,31 @@ fn startEntry() callconv(.naked) noreturn {
     }
 }
 
+/// macOS entry point. dyld's `LC_MAIN` (task #345's Mach-O writer) calls this
+/// with the C `main(argc, argv, envp, apple)` ABI — args in registers, a valid
+/// aligned stack already set up — and calls `exit()` with the returned code.
+/// That is a different contract from `startEntry` above (which reads the raw
+/// initial stack the kernel hands a Linux `_start`), so macOS gets its own
+/// entry rather than sharing the naked one. No TLS bootstrap here: libSystem's
+/// initializer has already installed the main thread's TLV/pthread state before
+/// dyld transfers control (the runtime reaches TLS through libSystem on macOS —
+/// see this file's `std.c`/`threadlocal` use and ABI.md §9).
+fn machoMain(argc: c_int, argv: [*]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) callconv(.c) c_int {
+    g_argc = @intCast(argc);
+    g_argv = argv;
+    const environ = std.process.Environ{ .block = .{ .slice = std.mem.span(envp) } };
+    return boot(bit_main, environ) catch fatal("runtime boot failed");
+}
+
 comptime {
-    if (!builtin.is_test) @export(&startEntry, .{ .name = "_start" });
+    if (!builtin.is_test) {
+        // Both export the fixed entry symbol `_start`; the linker points the
+        // header's entry field (ELF `e_entry` / Mach-O `LC_MAIN`) at it.
+        if (builtin.os.tag == .macos)
+            @export(&machoMain, .{ .name = "_start" })
+        else
+            @export(&startEntry, .{ .name = "_start" });
+    }
 }
 
 // ---------------------------------------------------------------------------

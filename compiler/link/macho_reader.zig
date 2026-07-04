@@ -310,7 +310,8 @@ fn classify(sh: *const Section64) ?object.SectionKind {
     const sect = std.mem.sliceTo(&sh.sectname, 0);
     switch (sh.flags & SECTION_TYPE) {
         S_THREAD_LOCAL_ZEROFILL => return .tls_bss,
-        S_THREAD_LOCAL_REGULAR, S_THREAD_LOCAL_VARIABLES => return .tls_data,
+        S_THREAD_LOCAL_VARIABLES => return .tls_vars, // tlv_descriptors
+        S_THREAD_LOCAL_REGULAR => return .tls_data, // thread-local init image
         S_ZEROFILL => return .bss,
         else => {},
     }

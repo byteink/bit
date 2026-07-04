@@ -97,6 +97,9 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
                 .bss => &bss,
                 .tls_data => &tdata,
                 .tls_bss => &tbss,
+                // `.tls_vars` is a macOS `tlv_descriptor` section (§ link/macho.zig);
+                // ELF has no equivalent and `elf_reader.zig` never produces it.
+                .tls_vars => unreachable,
             };
             try list.append(arena, .{ .id = id });
         }

@@ -63,6 +63,11 @@ const MH_EXECUTE: u32 = 0x2;
 const MH_DYLDLINK: u32 = 0x4;
 const MH_TWOLEVEL: u32 = 0x80;
 const MH_PIE: u32 = 0x200000;
+/// Tells dyld the image carries `S_THREAD_LOCAL_VARIABLES` descriptors it must
+/// register (allocate a pthread key, replace each descriptor's `_tlv_bootstrap`
+/// thunk with the real resolver). Without it dyld skips TLV setup and the first
+/// thread-local access calls the placeholder thunk → `_tlv_bootstrap_error`.
+const MH_HAS_TLV_DESCRIPTORS: u32 = 0x800000;
 
 const LC_REQ_DYLD: u32 = 0x80000000;
 const LC_SEGMENT_64: u32 = 0x19;
@@ -79,6 +84,9 @@ const S_REGULAR: u32 = 0x0;
 const S_ZEROFILL: u32 = 0x1;
 const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 const S_SYMBOL_STUBS: u32 = 0x8;
+const S_THREAD_LOCAL_REGULAR: u32 = 0x11; // __thread_data (init image)
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12; // __thread_bss
+const S_THREAD_LOCAL_VARIABLES: u32 = 0x13; // __thread_vars (tlv_descriptors)
 const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x80000000;
 const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400;
 
@@ -101,7 +109,9 @@ const BIND_TYPE_POINTER: u8 = 1;
 const REBASE_OPCODE_DONE: u8 = 0x00;
 const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10;
 const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
-const REBASE_OPCODE_DO_REBASE_ULEB_TIMES: u8 = 0x50;
+// 0x50 is DO_REBASE_IMM_TIMES (count in the low nibble); 0x60 would be the
+// _ULEB_TIMES form with a trailing count uleb. We rebase one pointer at a time.
+const REBASE_OPCODE_DO_REBASE_IMM_TIMES: u8 = 0x50;
 const REBASE_TYPE_POINTER: u8 = 1;
 
 const MachHeader64 = extern struct {
@@ -227,6 +237,9 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
     var rodata: std.ArrayList(Placed) = .empty;
     var data: std.ArrayList(Placed) = .empty;
     var bss: std.ArrayList(Placed) = .empty;
+    var tls_vars: std.ArrayList(Placed) = .empty; // __thread_vars descriptors
+    var tls_data: std.ArrayList(Placed) = .empty; // __thread_data init image
+    var tls_bss: std.ArrayList(Placed) = .empty; // __thread_bss
     for (modules, 0..) |mod, mi| {
         for (mod.atoms, 0..) |atom, ai| {
             const id = AtomId{ .module = @intCast(mi), .atom = @intCast(ai) };
@@ -236,7 +249,9 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
                 .rodata => try rodata.append(arena, .{ .id = id }),
                 .data => try data.append(arena, .{ .id = id }),
                 .bss => try bss.append(arena, .{ .id = id }),
-                .tls_data, .tls_bss => return error.UnsupportedTls,
+                .tls_vars => try tls_vars.append(arena, .{ .id = id }),
+                .tls_data => try tls_data.append(arena, .{ .id = id }),
+                .tls_bss => try tls_bss.append(arena, .{ .id = id }),
             }
         }
     }
@@ -263,9 +278,11 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
         for (mod.atoms, 0..) |atom, ai| {
             if (!kept.contains((AtomId{ .module = @intCast(mi), .atom = @intCast(ai) }).key())) continue;
             for (atom.relocs) |r| {
-                if (strip.needsTlvp(r.kind)) return error.UnsupportedTls;
                 const is_import = r.target == .global and globals.get(r.target.global) == null;
-                if (strip.needsGot(r.kind)) {
+                // A TLVP slot is a GOT-like pointer to an internal tlv_descriptor
+                // (the access site does `adrp/ldr` to load &descriptor), so it
+                // uses the same internal-GOT machinery as a plain GOT reference.
+                if (strip.needsGot(r.kind) or strip.needsTlvp(r.kind)) {
                     if (is_import) {
                         _ = try gotForImport(arena, &got_list, &got_of_import, r.target.global);
                     } else {
@@ -294,11 +311,16 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
     const has_got = got_list.items.len > 0;
     const has_data = data.items.len > 0;
     const has_bss = bss.items.len > 0;
-    const has_data_seg = has_got or has_data or has_bss;
+    const has_tls_vars = tls_vars.items.len > 0;
+    const has_tls_data = tls_data.items.len > 0;
+    const has_tls_bss = tls_bss.items.len > 0;
+    const has_data_seg = has_got or has_data or has_bss or has_tls_vars or has_tls_data or has_tls_bss;
 
     // ---- fixed load-command sizes (values filled after layout) -------------
     const text_nsects: u32 = 1 + @as(u32, @intFromBool(has_stubs)) + @as(u32, @intFromBool(has_rodata));
-    const data_nsects: u32 = @as(u32, @intFromBool(has_got)) + @as(u32, @intFromBool(has_data)) + @as(u32, @intFromBool(has_bss));
+    const data_nsects: u32 = @as(u32, @intFromBool(has_got)) + @as(u32, @intFromBool(has_data)) +
+        @as(u32, @intFromBool(has_tls_vars)) + @as(u32, @intFromBool(has_tls_data)) +
+        @as(u32, @intFromBool(has_tls_bss)) + @as(u32, @intFromBool(has_bss));
     const seg_sz = @sizeOf(SegmentCommand64);
     const sect_sz = @sizeOf(Section64);
     var sizeofcmds: u32 = 0;
@@ -328,20 +350,33 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
     const text_seg_filesize = alignUp(cursor - base_vaddr, seg_align);
     const text_seg_vmsize = text_seg_filesize;
 
-    // ---- __DATA layout: got, data atoms, bss -------------------------------
+    // ---- __DATA layout: got, data, TLS, then zero-fill last ----------------
+    // File-backed sections first (got, data, __thread_vars descriptors,
+    // __thread_data init image), then the zero-fill sections (__thread_bss,
+    // __bss). __thread_data and __thread_bss stay adjacent so they form one
+    // contiguous per-thread TLV template dyld can copy.
     const data_seg_vaddr = base_vaddr + text_seg_vmsize;
     cursor = data_seg_vaddr;
     const got_vaddr = cursor;
     cursor += @as(u64, got_list.items.len) * ptr_size;
     placeAtoms(modules, data.items, &cursor);
+    placeAtoms(modules, tls_vars.items, &cursor);
+    placeAtoms(modules, tls_data.items, &cursor);
     const data_file_end = cursor; // last file-backed byte in __DATA
-    placeAtoms(modules, bss.items, &cursor); // memsz only
+    placeAtoms(modules, tls_bss.items, &cursor); // zero-fill, contiguous w/ tls_data
+    placeAtoms(modules, bss.items, &cursor); // zero-fill
     const data_seg_filesize = if (has_data_seg) alignUp(data_file_end - data_seg_vaddr, seg_align) else 0;
     const data_seg_vmsize = if (has_data_seg) alignUp(cursor - data_seg_vaddr, seg_align) else 0;
 
+    // Base of the per-thread TLV template (__thread_data then __thread_bss). A
+    // tlv_descriptor's data field is the variable's *offset* within this
+    // template (a constant dyld validates against the template size), not an
+    // absolute address — so an abs64 into TLS storage resolves relative to here.
+    const tls_template_base: u64 = if (has_tls_data) tls_data.items[0].vaddr else if (has_tls_bss) tls_bss.items[0].vaddr else 0;
+
     // ---- address lookup for every placed atom ------------------------------
     var addr_of = std.AutoHashMapUnmanaged(u64, u64){};
-    for ([_][]const Placed{ text.items, rodata.items, data.items, bss.items }) |group|
+    for ([_][]const Placed{ text.items, rodata.items, data.items, bss.items, tls_vars.items, tls_data.items, tls_bss.items }) |group|
         for (group) |p| try addr_of.put(arena, p.id.key(), p.vaddr);
 
     const entry_vaddr = addr_of.get(entry.key()) orelse return error.MissingEntry;
@@ -385,7 +420,7 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
                     try strip.apply(r.kind, field, .{ .s = stubAddr.at(si), .p = p });
                     continue;
                 }
-                if (strip.needsGot(r.kind)) {
+                if (strip.needsGot(r.kind) or strip.needsTlvp(r.kind)) {
                     const gi = if (is_import)
                         got_of_import.get(r.target.global).?
                     else
@@ -395,15 +430,30 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
                 }
                 if (r.kind == .abs64 and is_import) {
                     // Absolute pointer to an import: dyld binds it; leave zero.
+                    // (Includes a tlv_descriptor's thunk field -> _tlv_bootstrap.)
                     try data_binds.append(arena, .{ .seg_off = (atom_vaddr + r.offset) - data_seg_vaddr, .name = r.target.global });
                     continue;
                 }
-                // Everything else resolves to a concrete address.
                 const tid = try strip.resolveRef(&globals, @intCast(mi), r.target);
                 const tgt = addr_of.get(tid.key()) orelse return error.UndefinedSymbol;
+                const target_kind = modules[tid.module].atoms[tid.atom].kind;
+
+                // A pointer into thread-local storage (a tlv_descriptor's data
+                // field -> `x$tlv$init`) is stored as the variable's constant
+                // offset within the TLV template, which dyld reads directly — not
+                // an absolute address, and never rebased.
+                if (r.kind == .abs64 and (target_kind == .tls_data or target_kind == .tls_bss)) {
+                    const off: u64 = @bitCast(@as(i64, @bitCast(tgt - tls_template_base)) + r.addend);
+                    try strip.apply(.abs64, field, .{ .s = off });
+                    continue;
+                }
+
+                // Everything else resolves to a concrete address.
                 const s: u64 = @bitCast(@as(i64, @bitCast(tgt)) + r.addend);
                 try strip.apply(r.kind, field, .{ .s = s, .p = p });
-                if (r.kind == .abs64 and atom.kind == .data)
+                // An absolute internal pointer in a writable segment is rebased so
+                // dyld slides it.
+                if (r.kind == .abs64 and isDataSeg(atom.kind))
                     try data_rebases.append(arena, (atom_vaddr + r.offset) - data_seg_vaddr);
             }
             try patched.put(arena, id.key(), buf);
@@ -446,8 +496,7 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
         for (data_rebases.items) |off| {
             try rebase_ops.append(arena, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | data_seg_index);
             try uleb(&rebase_ops, arena, off);
-            try rebase_ops.append(arena, REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
-            try uleb(&rebase_ops, arena, 1);
+            try rebase_ops.append(arena, REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1); // rebase exactly one pointer
         }
         try rebase_ops.append(arena, REBASE_OPCODE_DONE);
     }
@@ -488,8 +537,10 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
     const file = try arena.alloc(u8, linkedit_file_end);
     @memset(file, 0);
 
-    // Copy every byte-backed atom (patched if it had relocations).
-    for ([_][]const Placed{ text.items, rodata.items, data.items }) |group| {
+    // Copy every byte-backed atom (patched if it had relocations). TLS
+    // descriptors (__thread_vars) and the __thread_data init image are
+    // file-backed; __thread_bss/__bss are zero-fill and carry no bytes.
+    for ([_][]const Placed{ text.items, rodata.items, data.items, tls_vars.items, tls_data.items }) |group| {
         for (group) |p| {
             const bytes = patched.get(p.id.key()) orelse modules[p.id.module].atoms[p.id.atom].data;
             if (bytes.len == 0) continue;
@@ -544,8 +595,11 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
         try appendSeg(&lc, arena, "__DATA", data_seg_vaddr, data_seg_vmsize, text_seg_filesize, data_seg_filesize, 3, 3, data_nsects);
         // indirect symtab index base: stubs occupy [0, nstubs); got starts at nstubs.
         if (has_got) try appendSect(&lc, arena, "__got", "__DATA", got_vaddr, @as(u64, got_list.items.len) * ptr_size, @intCast(got_vaddr - base_vaddr), 3, S_NON_LAZY_SYMBOL_POINTERS, @intCast(stub_list.items.len), 0);
-        if (has_data) try appendSect(&lc, arena, "__data", "__DATA", data.items[0].vaddr, dataSize(modules, data.items), @intCast(data.items[0].vaddr - base_vaddr), 3, S_REGULAR, 0, 0);
-        if (has_bss) try appendSect(&lc, arena, "__bss", "__DATA", bss.items[0].vaddr, bssSize(modules, bss.items), 0, 3, S_ZEROFILL, 0, 0);
+        if (has_data) try appendSect(&lc, arena, "__data", "__DATA", data.items[0].vaddr, rodataSize(modules, data.items), @intCast(data.items[0].vaddr - base_vaddr), 3, S_REGULAR, 0, 0);
+        if (has_tls_vars) try appendSect(&lc, arena, "__thread_vars", "__DATA", tls_vars.items[0].vaddr, rodataSize(modules, tls_vars.items), @intCast(tls_vars.items[0].vaddr - base_vaddr), 3, S_THREAD_LOCAL_VARIABLES, 0, 0);
+        if (has_tls_data) try appendSect(&lc, arena, "__thread_data", "__DATA", tls_data.items[0].vaddr, rodataSize(modules, tls_data.items), @intCast(tls_data.items[0].vaddr - base_vaddr), 3, S_THREAD_LOCAL_REGULAR, 0, 0);
+        if (has_tls_bss) try appendSect(&lc, arena, "__thread_bss", "__DATA", tls_bss.items[0].vaddr, rodataSize(modules, tls_bss.items), 0, 3, S_THREAD_LOCAL_ZEROFILL, 0, 0);
+        if (has_bss) try appendSect(&lc, arena, "__bss", "__DATA", bss.items[0].vaddr, rodataSize(modules, bss.items), 0, 3, S_ZEROFILL, 0, 0);
     }
     // __LINKEDIT
     try appendSeg(&lc, arena, "__LINKEDIT", linkedit_vaddr, alignUp(linkedit_filesize, seg_align), linkedit_fileoff, linkedit_filesize, 1, 1, 0);
@@ -577,7 +631,7 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
         .filetype = MH_EXECUTE,
         .ncmds = ncmds(has_data_seg),
         .sizeofcmds = sizeofcmds,
-        .flags = MH_DYLDLINK | MH_TWOLEVEL | MH_PIE,
+        .flags = MH_DYLDLINK | MH_TWOLEVEL | MH_PIE | (if (has_tls_vars) MH_HAS_TLV_DESCRIPTORS else 0),
         .reserved = 0,
     };
     @memcpy(file[0..@sizeOf(MachHeader64)], std.mem.asBytes(&header));
@@ -600,6 +654,15 @@ fn isBranch(kind: RelocKind) bool {
     return kind == .aarch64_call26 or kind == .aarch64_jump26;
 }
 
+/// True for a writable, file-backed __DATA section kind that can hold a
+/// rebasable absolute pointer (plain data or a tlv_descriptor's fields).
+fn isDataSeg(kind: object.SectionKind) bool {
+    return switch (kind) {
+        .data, .tls_vars, .tls_data => true,
+        else => false,
+    };
+}
+
 fn emitBind(ops: *std.ArrayList(u8), gpa: Allocator, name: []const u8, seg: u8, off: u64) !void {
     try ops.append(gpa, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0);
     try ops.appendSlice(gpa, name);
@@ -620,16 +683,12 @@ fn placeAtoms(mods: []const object.Module, items: []Placed, cursor: *u64) void {
     }
 }
 
+/// Byte extent of a placed group: from its first atom's address to the end of
+/// its last (a section's `size` in the output header).
 fn rodataSize(mods: []const object.Module, items: []const Placed) u64 {
     if (items.len == 0) return 0;
     const last = items[items.len - 1];
     return last.vaddr + mods[last.id.module].atoms[last.id.atom].size - items[0].vaddr;
-}
-fn dataSize(mods: []const object.Module, items: []const Placed) u64 {
-    return rodataSize(mods, items);
-}
-fn bssSize(mods: []const object.Module, items: []const Placed) u64 {
-    return rodataSize(mods, items);
 }
 
 fn appendU32s(lc: *std.ArrayList(u8), gpa: Allocator, vals: []const u32) !void {
@@ -764,6 +823,41 @@ test "de-risk: emits a well-formed signed arm64 Mach-O and (on macOS) runs" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = "zig-out/bit-macho-derisk", .data = exe }) catch {};
+
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+}
+
+test "links the real aarch64 runtime + a bit_main into a signed image that boots on macOS" {
+    const gpa = testing.allocator;
+    const archive = @import("archive.zig");
+    const macho_reader = @import("macho_reader.zig");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const lib = std.Io.Dir.cwd().readFileAlloc(threaded.io(), "zig-out/lib/aarch64-macos/libbitrt.a", arena, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest, // `zig build libbitrt` not run here
+        else => return err,
+    };
+
+    // A synthetic Bit program: `bit_main` = `mov w0,#0 ; ret` (exit code 0).
+    // Linked against the real runtime, this exercises the entire macOS path —
+    // reader, TLV, GOT/stubs, binds, signature — and the runtime actually
+    // booting (heap, GC, scheduler + a worker thread using thread-locals).
+    const code = [_]u8{ 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6 };
+    var atoms = [_]object.Atom{
+        .{ .name = "_bit_main", .kind = .text, .binding = .global, .data = &code, .size = code.len, .alignment = 4, .relocs = &.{} },
+    };
+    var modules: std.ArrayList(object.Module) = .empty;
+    try modules.append(arena, .{ .name = "bit.o", .atoms = &atoms });
+    for (try archive.parse(arena, lib)) |m| try modules.append(arena, try macho_reader.read(arena, m.name, m.data));
+
+    const exe = try linkExecutable(gpa, modules.items, .{ .identifier = "bit-runtime" });
+    defer gpa.free(exe);
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = "zig-out/bit-macho-runtime", .data = exe }) catch {};
 
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 }

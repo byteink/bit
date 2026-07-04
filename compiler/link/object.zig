@@ -28,11 +28,18 @@ pub const SectionKind = enum {
     rodata,
     data,
     bss,
+    /// macOS thread-local *variable descriptors* (`__thread_vars`,
+    /// `S_THREAD_LOCAL_VARIABLES`) — 24-byte `tlv_descriptor`s dyld rewrites at
+    /// load; distinct from the init image below because it carries a different
+    /// output section flag. ELF has no equivalent and never produces it.
+    tls_vars,
+    /// Thread-local initialized data (ELF `.tdata`, macOS `__thread_data`).
     tls_data,
+    /// Thread-local zero-fill (ELF `.tbss`, macOS `__thread_bss`).
     tls_bss,
 
     pub fn isTls(self: SectionKind) bool {
-        return self == .tls_data or self == .tls_bss;
+        return self == .tls_vars or self == .tls_data or self == .tls_bss;
     }
 
     pub fn isBss(self: SectionKind) bool {
