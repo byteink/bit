@@ -61,6 +61,22 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(root_tests).step);
 
+    // Linux-only (see runtime/shims.zig's module doc comment): gated on the
+    // resolved target's OS, not a runtime skip, since the file itself
+    // `@compileError`s off non-Linux and so cannot even be built for e.g. a
+    // macOS `-Dtarget`. Silently absent from `zig build test` on every other
+    // host, same as this project's other target-gated modules.
+    if (target.result.os.tag == .linux) {
+        const shims_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("runtime/shims.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(shims_tests).step);
+    }
+
     const diagnostics_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("compiler/diagnostics.zig"),
@@ -180,6 +196,19 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(pe_tests).step);
 
+    // One artifact rooted at `elf_reader.zig` covers the whole `link/` package:
+    // it imports `object.zig` and `archive.zig`, whose tests come along. The
+    // "real libbitrt.a" test self-skips when `zig build libbitrt` hasn't
+    // populated `zig-out/lib/` in this environment.
+    const link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/link/elf_reader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(link_tests).step);
+
     // Standalone object writer (task #343): no imports outside `std`. Its
     // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
     // hosts (those tools don't exist there), so this is safe on every CI host.
@@ -289,15 +318,37 @@ pub fn build(b: *std.Build) void {
     };
     for (libbitrt_targets) |query| {
         const rt_target = b.resolveTargetQuery(query);
+        // The runtime archive's build settings are fixed regardless of the
+        // top-level `-Doptimize` a user passes: the static linker (#345)
+        // consumes this, and its object reader deliberately handles only the
+        // minimal, no-unwind relocation/section set a stripped ReleaseSmall
+        // runtime produces. ReleaseSmall + strip drops DWARF/`__eh_frame`;
+        // `.unwind_tables = .none` drops `__compact_unwind` (ABI.md §12
+        // promises no backtrace/unwind contract anyway). `.pic = false` on
+        // Linux keeps every code reference a plain absolute/PC-relative reloc
+        // — no GOT/PLT — since a static zero-dynamic-linker ELF never needs
+        // it. Darwin mandates PIC (the toolchain refuses `-fno-PIC`), so the
+        // macOS archives keep it and the linker's Mach-O reader handles the
+        // GOT-page reloc pair that entails.
         const lib = b.addLibrary(.{
             .linkage = .static,
             .name = "bitrt",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("runtime/root.zig"),
                 .target = rt_target,
-                .optimize = optimize,
+                .optimize = .ReleaseSmall,
+                .strip = true,
+                .unwind_tables = .none,
+                .pic = if (query.os_tag == .macos) null else false,
             }),
         });
+        // Bundle compiler-rt into the archive so the static linker (#345)
+        // finds correct `memcpy`/`memset`/`memmove`/`__divti3` there rather
+        // than us hand-rolling them (a naive Zig `memcpy` recurses: `@memcpy`
+        // lowers back to a `memcpy` call). `runtime/shims.zig` then only has
+        // to supply the two symbols compiler-rt does not: `strlen` and
+        // `getauxval`.
+        lib.bundle_compiler_rt = true;
         const install = b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{query.zigTriple(b.allocator) catch @panic("OOM")}) } },
         });

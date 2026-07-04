@@ -16,6 +16,14 @@ const gc_mod = @import("gc.zig");
 const sched = @import("sched.zig");
 const chan = @import("chan.zig");
 
+/// Linux-only C-runtime shims (`memcpy`/`__divti3`/`getauxval`/...) — see
+/// that file's module doc comment for why this runtime needs them at all.
+/// `struct {}` on Darwin: `shims.zig` itself `@compileError`s off non-Linux,
+/// so this must stay an untaken comptime branch there, matching the
+/// `if (builtin.os.tag == .windows) @import(...) else struct {}` idiom Zig's
+/// own std lib uses for OS-specific modules.
+const shims = if (builtin.os.tag == .linux) @import("shims.zig") else struct {};
+
 comptime {
     switch (builtin.os.tag) {
         .linux, .macos => {},
@@ -300,6 +308,13 @@ fn rawExit(code: u8) noreturn {
 /// (see `g_argc`/`g_argv`'s doc comment) — free, since finding `envp` already
 /// requires walking past them.
 ///
+/// On Linux, also locates and installs this process's static TLS area
+/// (`initLinuxTls`'s doc comment) — before `boot` ever spawns a scheduler
+/// worker thread, since `sched.zig`'s `Worker.tls` (and Zig std's own
+/// panic-recursion guard / thread-id cache) are real `threadlocal`s that
+/// need a correctly-installed thread pointer the moment any code runs on
+/// a worker OS thread.
+///
 /// Not `export`ed: `_start` below reaches it by taking `&rtStartMain` as an
 /// inline-asm input operand (a real Zig reference, unlike a bare symbol name
 /// in the asm text), which is what ties this function's liveness — and
@@ -315,10 +330,46 @@ fn rtStartMain(sp: usize) callconv(.c) noreturn {
 
     const envp_base = argv_base + (argc + 1) * @sizeOf(usize); // past argv[0..argc) and its NULL
     const envp_multi: [*:null]const ?[*:0]const u8 = @ptrFromInt(envp_base);
-    const environ = std.process.Environ{ .block = .{ .slice = std.mem.span(envp_multi) } };
+    const envp_slice = std.mem.span(envp_multi);
+    const environ = std.process.Environ{ .block = .{ .slice = envp_slice } };
+
+    if (builtin.os.tag == .linux) {
+        // Standard Linux ABI: the auxv array follows envp's own terminating
+        // NULL immediately — no padding, both are plain pointer-width arrays.
+        const auxv_addr = @intFromPtr(envp_slice.ptr) + (envp_slice.len + 1) * @sizeOf(usize);
+        initLinuxTls(auxv_addr);
+    }
 
     const code = boot(bit_main, environ) catch fatal("runtime boot failed");
     rawExit(@bitCast(@as(i8, @truncate(code))));
+}
+
+/// Captures the real auxv (so `shims.getauxval` has real data to answer
+/// from) and installs this thread's TLS: reads this process's own `PT_TLS`
+/// program header (found via `AT_PHDR`/`AT_PHNUM`, standard ELF TLS ABI —
+/// see `compiler/link.zig`'s doc comment on the `PT_TLS` segment it emits)
+/// and hands it to `std.os.linux.tls.initStatic`, the exact routine Zig's
+/// own `std.start` uses for a normal Linux program's main thread. That one
+/// call both sets this (the process's first) thread's thread pointer AND
+/// populates `std.os.linux.tls.area_desc`, which `std.Thread.spawn`'s
+/// `LinuxThreadImpl` reads to set up TLS for every worker OS thread the
+/// scheduler spawns afterward — reusing std's own bootstrap, not
+/// hand-rolling per-thread TLS setup here (see task #345's own guidance to
+/// prefer this over raw `arch_prctl`/`set_tls` syscalls).
+fn initLinuxTls(auxv_addr: usize) void {
+    const auxv: [*]const std.elf.Auxv = @ptrFromInt(auxv_addr);
+    shims.setTable(auxv);
+
+    const at_phdr = shims.getauxval(std.elf.AT_PHDR);
+    const at_phnum = shims.getauxval(std.elf.AT_PHNUM);
+    const at_phent = shims.getauxval(std.elf.AT_PHENT);
+    // Our own linker (`compiler/link.zig`) always emits standard
+    // `Elf64_Phdr`-shaped entries; a mismatch here means the binary that's
+    // running isn't one our linker produced, which this runtime cannot cope
+    // with regardless (its whole TLS/entry contract assumes it).
+    std.debug.assert(at_phent == @sizeOf(std.elf.Phdr));
+    const phdrs: [*]std.elf.Phdr = @ptrFromInt(at_phdr);
+    std.os.linux.tls.initStatic(phdrs[0..at_phnum]);
 }
 
 /// The process entry point: the linker (task #345) designates this exact
