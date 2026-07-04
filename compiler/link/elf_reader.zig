@@ -186,6 +186,7 @@ pub fn read(gpa: Allocator, target: Target, name: []const u8, bytes: []const u8)
             .offset = @intCast(sym.st_value),
             .size = @intCast(sym.st_size),
             .binding = if (stb == @intFromEnum(elf.STB.LOCAL)) .local else .global,
+            .weak = stb == @intFromEnum(elf.STB.WEAK),
             .alignment = alignment,
         });
     }

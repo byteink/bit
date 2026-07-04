@@ -131,6 +131,10 @@ pub const Atom = struct {
     /// 1, or a power of two — the byte alignment this atom's final address
     /// must satisfy (from the source symbol/section's own alignment).
     alignment: u32,
+    /// A weak global definition — a linker may override it with a strong one
+    /// (compiler-rt provides weak `memcpy`/`strlen`/... the runtime overrides).
+    /// Meaningless for `.local` atoms.
+    weak: bool = false,
     relocs: []const Reloc,
 };
 
@@ -165,6 +169,8 @@ pub const RawSymbol = struct {
     /// 0 means "unknown, infer from next symbol" (see doc comment above).
     size: u32,
     binding: Binding,
+    /// STB_WEAK (ELF) — a weak global definition. See `Atom.weak`.
+    weak: bool = false,
     alignment: u32 = 1,
 };
 
@@ -288,19 +294,22 @@ pub fn atomizeModule(
         while (gi < order.len) {
             const off = symbols[order[gi]].offset;
             var gj = gi;
-            var primary = order[gi]; // prefer a global for the atom's identity
+            var primary = order[gi]; // prefer a global, and a strong one, for identity
             var max_align: u32 = 1;
-            var explicit_size: u32 = 0;
             while (gj < order.len and symbols[order[gj]].offset == off) : (gj += 1) {
                 const s = symbols[order[gj]];
-                if (s.binding == .global and symbols[primary].binding != .global) primary = order[gj];
+                const p = symbols[primary];
+                const better = (s.binding == .global and p.binding != .global) or
+                    (s.binding == .global and p.binding == .global and !s.weak and p.weak);
+                if (better) primary = order[gj];
                 max_align = @max(max_align, s.alignment);
-                if (s.size != 0) explicit_size = @max(explicit_size, s.size);
             }
             const next_offset: u64 = if (gj < order.len) symbols[order[gj]].offset else section.size;
             std.debug.assert(next_offset >= off);
-            const extent: u32 = @intCast(next_offset - off);
-            const size = if (explicit_size != 0) explicit_size else extent;
+            // Span to the next symbol, not the symbol's declared `st_size`: any
+            // padding/data between a symbol's size and the next symbol still
+            // carries bytes and relocations that must belong to some atom.
+            const size: u32 = @intCast(next_offset - off);
 
             const atom_idx: u32 = @intCast(atoms.items.len);
             for (order[gi..gj]) |alias| atom_of_symbol[alias] = atom_idx;
@@ -315,6 +324,7 @@ pub fn atomizeModule(
                 .data = if (section.kind.isBss()) &.{} else section.data[off..][0..@min(size, section.data.len - off)],
                 .size = size,
                 .alignment = max_align,
+                .weak = psym.weak,
                 .relocs = &.{}, // filled in below, once every section is atomized
             });
             gi = gj;

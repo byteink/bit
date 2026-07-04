@@ -196,13 +196,14 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(pe_tests).step);
 
-    // One artifact rooted at `elf_reader.zig` covers the whole `link/` package:
-    // it imports `object.zig` and `archive.zig`, whose tests come along. The
-    // "real libbitrt.a" test self-skips when `zig build libbitrt` hasn't
-    // populated `zig-out/lib/` in this environment.
+    // Rooted at the linker driver `link.zig`, which imports the whole `link/`
+    // package (object/archive/elf_reader/strip) plus `obj/elf.zig`, so their
+    // tests all come along. The end-to-end tests (link a real object against
+    // `libbitrt.a` and run it) self-skip when `zig build libbitrt` hasn't
+    // populated `zig-out/lib/`, or off x86-64 Linux where the ELF can't run.
     const link_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/link/elf_reader.zig"),
+            .root_source_file = b.path("compiler/link.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -349,6 +350,15 @@ pub fn build(b: *std.Build) void {
         // to supply the two symbols compiler-rt does not: `strlen` and
         // `getauxval`.
         lib.bundle_compiler_rt = true;
+        // One section per function/global so the linker's symbol-granularity
+        // dead-strip is sound: without this, a call to a function inside a
+        // shared `.text` is a `.text + offset` section relocation whose
+        // PC-relative addend (offset - 4) lands in the *previous* function's
+        // atom, dropping the real target and misresolving the call. With each
+        // symbol in its own section, a reference names that symbol's own
+        // section at offset 0 (unambiguous), exactly as `--gc-sections` needs.
+        lib.link_function_sections = true;
+        lib.link_data_sections = true;
         const install = b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{query.zigTriple(b.allocator) catch @panic("OOM")}) } },
         });
