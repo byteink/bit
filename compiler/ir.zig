@@ -504,7 +504,8 @@ pub const FunctionBuilder = struct {
     /// Terminator: branch on `cond` to `then_blk`(`then_args`) or
     /// `else_blk`(`else_args`).
     pub fn br(self: *FunctionBuilder, cond: ValueId, then_blk: BlockId, then_args: []const ValueId, else_blk: BlockId, else_args: []const ValueId) Allocator.Error!void {
-        var buf = try self.gpa.alloc(u32, 4 + then_args.len + else_args.len);
+        // Layout: cond, then_blk, then_argc, then_args..., else_blk, else_argc, else_args...
+        var buf = try self.gpa.alloc(u32, 5 + then_args.len + else_args.len);
         defer self.gpa.free(buf);
         buf[0] = vid(cond);
         buf[1] = @intFromEnum(then_blk);
