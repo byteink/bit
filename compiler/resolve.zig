@@ -149,7 +149,7 @@ const predeclared_types = [_][]const u8{
     "byte", "rune", "bool", "string", "error",
 };
 const predeclared_funcs = [_][]const u8{
-    "len", "cap", "append", "delete", "close", "panic", "assert",
+    "len", "cap", "append", "delete", "close", "panic", "assert", "print",
 };
 
 // ============================================================================

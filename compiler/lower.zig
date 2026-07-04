@@ -311,6 +311,7 @@ pub const Lowerer = struct {
         const shape = if (gen_env.len > 0) try self.ctx.substFuncShape(template_shape, gen_env) else template_shape;
 
         var b = ir.FunctionBuilder.init(self.gpa);
+        errdefer b.deinit(self.gpa); // freed here only if lowering errors before finish
         const entry = try b.newBlock();
         b.beginBlock(entry);
 
@@ -374,6 +375,7 @@ pub const Lowerer = struct {
         const k = mf.tree.kids(node); // [arrow_params, body]
 
         var b = ir.FunctionBuilder.init(self.gpa);
+        errdefer b.deinit(self.gpa); // freed here only if lowering errors before finish
         const entry = try b.newBlock();
         b.beginBlock(entry);
 
@@ -449,7 +451,9 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
     for (rmodule.symbols.items, 0..) |sym, sid| {
         if (sid == 0 or sym.kind != .func or sym.decl == ast.none) continue;
         const gsym = GlobalSymbol{ .module = @enumFromInt(0), .id = @enumFromInt(sid) };
-        if ((ctx.decl_generics.get(gsym.pack()) orelse &[_]GlobalSymbol{}).len > 0) continue;
+        if (ctx.decl_generics.get(gsym.pack())) |gens| {
+            if (gens.len > 0) continue; // generic template, not directly lowered
+        }
         try l.func_ids.put(gpa, gsym.pack(), @enumFromInt(direct_syms.items.len));
         try direct_syms.append(gpa, gsym);
     }
@@ -1064,6 +1068,10 @@ const FnCtx = struct {
             _ = try self.b.rtCall(void_ty, .panic, &.{v});
             try self.emitUnreachable();
             return self.b.constNil(void_ty);
+        }
+        if (std.mem.eql(u8, name, "print")) {
+            const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+            return self.b.rtCall(void_ty, .print, &.{v});
         }
         if (std.mem.eql(u8, name, "assert")) {
             const vals = try self.lowerArgs(args_node);

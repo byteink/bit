@@ -1193,6 +1193,7 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .string_from_bool => "bit_rt_string_from_bool",
         .panic => "bit_rt_panic",
         .assert => "bit_rt_assert",
+        .print => "bit_rt_print",
         .chan_make => "bit_rt_chan_make",
         .chan_send => "bit_rt_chan_send",
         .chan_recv => "bit_rt_chan_recv",

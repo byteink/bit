@@ -403,9 +403,10 @@ fn linkAndRun(gpa: Allocator, name: []const u8, exe: []const u8) !u8 {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // A path with a slash: `execve` resolves it against the cwd directly, no
-    // PATH search — so the relative `zig-out/<name>` runs as-is.
-    const sub = try std.fmt.allocPrintSentinel(gpa, "zig-out/{s}", .{name}, 0);
+    // An absolute path under /tmp: always writable and isolated from the build
+    // system's `zig-out/` (which it fails to write into under `zig build
+    // test`), and `execve`-able directly.
+    const sub = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-{s}", .{name}, 0);
     defer gpa.free(sub);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sub, .data = exe });
     _ = std.os.linux.fchmodat(std.os.linux.AT.FDCWD, sub, 0o755); // exec bit; caller is x86-64 Linux

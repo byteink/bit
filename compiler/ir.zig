@@ -67,6 +67,10 @@ pub const RtFn = enum {
     string_from_bool,
     panic,
     assert,
+    /// One `string` arg: writes its bytes to stdout (no trailing newline).
+    /// Backs the `print` builtin (SPEC.md); `println` adds the newline in
+    /// lowering. v1 takes the string heap-object `{ptr,len}` view directly.
+    print,
     chan_make,
     chan_send,
     chan_recv,
@@ -358,19 +362,24 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         for (self.funcs.items) |*f| f.deinit(self.gpa);
         self.funcs.deinit(self.gpa);
+        for (self.string_pool.items) |str| self.gpa.free(str);
         self.string_pool.deinit(self.gpa);
         self.* = undefined;
     }
 
     /// Interns `s` into the string pool, deduping by content (bounded linear
-    /// scan — a module's distinct string literal count is always small).
+    /// scan — a module's distinct string literal count is always small). The
+    /// pool owns its copy, so callers keep ownership of `s` (a `.string_lit`
+    /// lowers a freshly-unescaped, then-freed buffer through here).
     /// Returns its pool index.
     pub fn internString(self: *Module, s: []const u8) Allocator.Error!u32 {
         for (self.string_pool.items, 0..) |existing, i| {
             if (std.mem.eql(u8, existing, s)) return @intCast(i);
         }
         const idx: u32 = @intCast(self.string_pool.items.len);
-        try self.string_pool.append(self.gpa, s);
+        const owned = try self.gpa.dupe(u8, s);
+        errdefer self.gpa.free(owned);
+        try self.string_pool.append(self.gpa, owned);
         return idx;
     }
 
@@ -400,6 +409,17 @@ pub const FunctionBuilder = struct {
 
     pub fn init(gpa: Allocator) FunctionBuilder {
         return .{ .gpa = gpa };
+    }
+
+    /// Frees a builder abandoned before `finish` (e.g. lowering hit an
+    /// `error.UnsupportedConstruct` mid-function). `finish` moves these three
+    /// allocations into the returned `Function`, so it is never both finished
+    /// and deinited — call this only on the error path.
+    pub fn deinit(self: *FunctionBuilder, gpa: Allocator) void {
+        self.insts.deinit(gpa);
+        self.extra.deinit(gpa);
+        self.blocks.deinit(gpa);
+        self.* = undefined;
     }
 
     /// Reserves a fresh, empty block and returns its id. Its instruction
@@ -627,7 +647,7 @@ pub const FunctionBuilder = struct {
     pub fn finish(self: *FunctionBuilder, name: []const u8, param_types: []const TypeId, result: TypeId, is_fallible: bool, err_ty: TypeId, entry: BlockId) Allocator.Error!Function {
         std.debug.assert(!self.block_open);
         for (self.blocks.items) |b| std.debug.assert(b.insts_len > 0);
-        return .{
+        const f = Function{
             .name = name,
             .param_types = try self.gpa.dupe(TypeId, param_types),
             .result = result,
@@ -638,6 +658,10 @@ pub const FunctionBuilder = struct {
             .insts = self.insts,
             .extra = try self.extra.toOwnedSlice(self.gpa),
         };
+        // Ownership of every allocation has moved into `f`; empty the builder
+        // so a defensive `deinit` (the caller's error path) is a safe no-op.
+        self.insts = .{};
+        return f;
     }
 };
 

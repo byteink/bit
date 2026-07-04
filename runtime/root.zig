@@ -154,6 +154,16 @@ export fn bit_rt_assert(cond: bool, msg: *const RtBytes) callconv(.c) void {
 /// heap-object header. See `bit_rt_panic`'s doc comment.
 pub const RtBytes = extern struct { ptr: [*]const u8, len: usize };
 
+const stdout_fd = 1;
+
+/// `bit_rt_print` (ABI.md §12): backs the `print` builtin — writes a string's
+/// bytes to stdout, no trailing newline. v1's `string` heap object is a
+/// `{ptr, len}` header (same shape as `RtBytes`); for a string literal it is
+/// static `.rodata` the compiler emits, so this only ever reads it.
+export fn bit_rt_print(s: *const RtBytes) callconv(.c) void {
+    writeAllFd(stdout_fd, s.ptr[0..s.len]);
+}
+
 // ---------------------------------------------------------------------------
 // GC entry points (ABI.md §1-§2, §6)
 // ---------------------------------------------------------------------------
