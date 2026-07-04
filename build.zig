@@ -124,6 +124,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(regalloc_tests).step);
 
+    const elf_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/obj/elf.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(elf_tests).step);
+
     // Rooted at `compiler/` (not `compiler/codegen/`) via the anchor file, so
     // `arm64.zig`/`common.zig`'s `../ir.zig`-style imports resolve — see that
     // file's doc comment. Covers both files: `arm64.zig` imports `common.zig`.
