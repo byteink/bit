@@ -73,7 +73,10 @@ pub const GlobalSymbol = struct {
     module: ModuleId,
     id: SymbolId,
 
-    fn pack(self: GlobalSymbol) u64 {
+    /// `pub`: lowering (`lower.zig`) keys its own func/instantiation tables by
+    /// this same packed id, matching every table in `TypeContext` (see its
+    /// doc comments) instead of inventing a parallel identity scheme.
+    pub fn pack(self: GlobalSymbol) u64 {
         return (@as(u64, @intFromEnum(self.module)) << 32) | @as(u64, @intFromEnum(self.id));
     }
 };
@@ -535,6 +538,119 @@ pub const TypeContext = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.gpa, rec);
     }
+
+    /// `pub`: the index into `instantiations` recording `(generic, args)`,
+    /// found by the same bounded linear scan `findInstantiation` already does
+    /// (never `null` right after a `recordInstantiation`/`instantiateFunc`
+    /// call for that same pair). Lowering needs the index itself, not just
+    /// the result `TypeId` `findInstantiation` returns: two *different*
+    /// generic function instantiations can substitute to a structurally
+    /// identical `.func` `TypeId` (interning dedupes by shape, not by
+    /// source), so `result` alone can't tell two call sites' monomorphized
+    /// bodies apart, only `(generic, args)` (equivalently, this index) can.
+    pub fn findInstantiationIndex(self: *const TypeContext, generic: GlobalSymbol, args: []const TypeId) ?u32 {
+        for (self.instantiations.items, 0..) |inst, i| {
+            if (inst.generic.module != generic.module or inst.generic.id != generic.id) continue;
+            if (inst.args.len != args.len) continue;
+            var same = true;
+            for (inst.args, args) |a, b| {
+                if (a != b) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// `pub`: rebuilds `ty` with every `type_param` leaf bound in `env`
+    /// replaced by its binding (§13.6), returning `ty` unchanged (no new
+    /// allocation) when nothing in it needs substituting. Exposed on
+    /// `TypeContext` (rather than kept private to `Checker`) because lowering
+    /// needs the exact same operation: a generic function's body is
+    /// type-checked exactly once, against its own template's unbound
+    /// `type_param` ids (see `Checker.rebuiltOwnGenericEnv`); to lower one
+    /// concrete monomorphization, lowering re-derives each body node's
+    /// *concrete* type by calling this with the instantiation's own
+    /// `(param symbol -> concrete arg)` bindings — see `lower.zig`'s module
+    /// doc comment on generic function lowering.
+    pub fn subst(self: *TypeContext, ty: TypeId, env: GenericEnv, depth: u32) Error!TypeId {
+        if (env.len == 0) return ty;
+        if (depth >= max_type_depth) return ty;
+        const data = self.typeOf(ty);
+        switch (data) {
+            .type_param => |g| return envLookup(env, g) orelse ty,
+            .slice => |e| {
+                const ne = try self.subst(e, env, depth + 1);
+                if (ne == e) return ty;
+                return self.types.intern(.{ .slice = ne });
+            },
+            .chan => |e| {
+                const ne = try self.subst(e, env, depth + 1);
+                if (ne == e) return ty;
+                return self.types.intern(.{ .chan = ne });
+            },
+            .array => |a| {
+                const ne = try self.subst(a.elem, env, depth + 1);
+                if (ne == a.elem) return ty;
+                return self.types.intern(.{ .array = .{ .len = a.len, .elem = ne } });
+            },
+            .map => |m| {
+                const nk = try self.subst(m.key, env, depth + 1);
+                const nv = try self.subst(m.val, env, depth + 1);
+                if (nk == m.key and nv == m.val) return ty;
+                return self.types.intern(.{ .map = .{ .key = nk, .val = nv } });
+            },
+            .tuple => |ts| {
+                var changed = false;
+                var buf = try self.gpa.alloc(TypeId, ts.len);
+                defer self.gpa.free(buf);
+                for (ts, 0..) |t, i| {
+                    buf[i] = try self.subst(t, env, depth + 1);
+                    if (buf[i] != t) changed = true;
+                }
+                if (!changed) return ty;
+                return self.types.intern(.{ .tuple = try dupe(self.arena(), TypeId, buf) });
+            },
+            .func => |f| {
+                var changed = false;
+                var buf = try self.gpa.alloc(TypeId, f.params.len);
+                defer self.gpa.free(buf);
+                for (f.params, 0..) |p, i| {
+                    buf[i] = try self.subst(p, env, depth + 1);
+                    if (buf[i] != p) changed = true;
+                }
+                const nr = try self.subst(f.result, env, depth + 1);
+                if (nr != f.result) changed = true;
+                if (!changed) return ty;
+                return self.types.intern(.{ .func = .{ .params = try dupe(self.arena(), TypeId, buf), .variadic = f.variadic, .result = nr } });
+            },
+            .fallible => |f| {
+                const nok = try self.subst(f.ok, env, depth + 1);
+                const nerr = try self.subst(f.err, env, depth + 1);
+                if (nok == f.ok and nerr == f.err) return ty;
+                return self.types.intern(.{ .fallible = .{ .ok = nok, .err = nerr } });
+            },
+            // Struct/interface fields may reference the enclosing generic's
+            // params too, but only when *instantiating* a generic struct;
+            // `instantiateRecursive` handles those directly (it needs the
+            // reserve-then-fill cycle guard, not plain rebuild-and-intern)
+            // rather than going through here.
+            .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .prim, .@"struct", .interface => return ty,
+        }
+    }
+
+    /// `pub`: substitutes every param and the result of `shape` — the
+    /// per-`FuncShape` counterpart to `subst`, used by lowering to compute a
+    /// monomorphized function's own concrete signature from its template
+    /// `ctx.func_sigs` entry.
+    pub fn substFuncShape(self: *TypeContext, shape: FuncShape, env: GenericEnv) Error!FuncShape {
+        var params = try self.gpa.alloc(TypeId, shape.params.len);
+        defer self.gpa.free(params);
+        for (shape.params, 0..) |p, i| params[i] = try self.subst(p, env, 0);
+        return .{ .params = try dupe(self.arena(), TypeId, params), .variadic = shape.variadic, .result = try self.subst(shape.result, env, 0) };
+    }
 };
 
 test "TypeContext seeds primitives, void, and the predeclared error interface" {
@@ -557,14 +673,17 @@ test "TypeContext seeds primitives, void, and the predeclared error interface" {
 // ============================================================================
 
 /// `sym` bound in the generic environment to concrete/rigid type `to` (see
-/// `GenericEnv`).
-const GenericBinding = struct { sym: GlobalSymbol, to: TypeId };
+/// `GenericEnv`). `pub`: lowering rebuilds one of these per generic
+/// instantiation (from `Instantiation.args` zipped with `decl_generics`) to
+/// drive `TypeContext.subst` over a template function body's checked types —
+/// see `TypeContext.subst`'s doc comment.
+pub const GenericBinding = struct { sym: GlobalSymbol, to: TypeId };
 /// The generic parameters currently in scope while evaluating a type
 /// expression: a struct/interface/function's own `<T, U: Bound>` list while
 /// building its *template* shape (bound to their own rigid `type_param` ids),
 /// or a call/instantiation site's concrete bindings while substituting one.
 /// Always small (a handful of type parameters) — linear scan is simplest.
-const GenericEnv = []const GenericBinding;
+pub const GenericEnv = []const GenericBinding;
 
 /// Cached per-method context — see `Checker.method_ctx`.
 const MethodCtx = struct { recv_ty: TypeId, env: GenericEnv };
@@ -586,6 +705,99 @@ fn envLookup(env: GenericEnv, g: GlobalSymbol) ?TypeId {
 /// real programs never approach this; hitting it means malformed/cyclic input
 /// that upstream passes should already have rejected (Power of 10: bounded).
 const max_type_depth = 128;
+
+/// Dependencies needed to render a `TypeId` as text outside a live `Checker`
+/// (the LSP's hover/completion has a `TypeContext` and a `resolve.Module` but
+/// no `Checker` instance). Mirrors the subset of `Checker`'s own fields that
+/// `describeType` needs.
+pub const NameCtx = struct {
+    gpa: Allocator,
+    ctx: *const TypeContext,
+    module_id: ModuleId,
+    module: *const Module,
+    all_modules: []const Module,
+};
+
+/// Renders `ty` as source-shaped text (`[]i32`, `map<string, Point>`, ...) —
+/// the same rules `Checker.typeName` uses for its own "expected X, found Y"
+/// diagnostics. Public so external consumers (the LSP's hover/completion) can
+/// format an arbitrary `TypeId` without a live `Checker`.
+pub fn describeType(nc: NameCtx, ty: TypeId) Error![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(nc.gpa);
+    try appendTypeName(nc, &buf, ty, 0);
+    return buf.toOwnedSlice(nc.gpa);
+}
+
+fn appendTypeName(nc: NameCtx, buf: *std.ArrayList(u8), ty: TypeId, depth: u32) Error!void {
+    if (depth >= max_type_depth) return buf.appendSlice(nc.gpa, "...");
+    switch (nc.ctx.typeOf(ty)) {
+        .invalid => try buf.appendSlice(nc.gpa, "<error>"),
+        .void => try buf.appendSlice(nc.gpa, "()"),
+        .untyped_int => try buf.appendSlice(nc.gpa, "untyped int"),
+        .untyped_float => try buf.appendSlice(nc.gpa, "untyped float"),
+        .untyped_rune => try buf.appendSlice(nc.gpa, "untyped rune"),
+        .untyped_bool => try buf.appendSlice(nc.gpa, "untyped bool"),
+        .untyped_string => try buf.appendSlice(nc.gpa, "untyped string"),
+        .untyped_nil => try buf.appendSlice(nc.gpa, "nil"),
+        .prim => |p| try buf.appendSlice(nc.gpa, @tagName(p)),
+        .slice => |e| {
+            try buf.appendSlice(nc.gpa, "[]");
+            try appendTypeName(nc, buf, e, depth + 1);
+        },
+        .chan => |e| {
+            try buf.appendSlice(nc.gpa, "chan<");
+            try appendTypeName(nc, buf, e, depth + 1);
+            try buf.appendSlice(nc.gpa, ">");
+        },
+        .array => |a| {
+            var num: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&num, "[{d}]", .{a.len}) catch unreachable; // bounded: u64 max digits
+            try buf.appendSlice(nc.gpa, s);
+            try appendTypeName(nc, buf, a.elem, depth + 1);
+        },
+        .map => |m| {
+            try buf.appendSlice(nc.gpa, "map<");
+            try appendTypeName(nc, buf, m.key, depth + 1);
+            try buf.appendSlice(nc.gpa, ", ");
+            try appendTypeName(nc, buf, m.val, depth + 1);
+            try buf.appendSlice(nc.gpa, ">");
+        },
+        .tuple => |ts| {
+            try buf.appendSlice(nc.gpa, "(");
+            for (ts, 0..) |t, i| {
+                if (i != 0) try buf.appendSlice(nc.gpa, ", ");
+                try appendTypeName(nc, buf, t, depth + 1);
+            }
+            try buf.appendSlice(nc.gpa, ")");
+        },
+        .func => |f| {
+            try buf.appendSlice(nc.gpa, "(");
+            for (f.params, 0..) |p, i| {
+                if (i != 0) try buf.appendSlice(nc.gpa, ", ");
+                try appendTypeName(nc, buf, p, depth + 1);
+            }
+            try buf.appendSlice(nc.gpa, ") => ");
+            try appendTypeName(nc, buf, f.result, depth + 1);
+        },
+        .fallible => |f| {
+            try appendTypeName(nc, buf, f.ok, depth + 1);
+            try buf.appendSlice(nc.gpa, "!");
+            if (f.err != nc.ctx.error_id) try appendTypeName(nc, buf, f.err, depth + 1);
+        },
+        .@"struct", .interface => {
+            if (nc.ctx.display_names.get(@intFromEnum(ty))) |n| {
+                try buf.appendSlice(nc.gpa, n);
+            } else {
+                try buf.appendSlice(nc.gpa, if (nc.ctx.typeOf(ty) == .@"struct") "struct{...}" else "interface{...}");
+            }
+        },
+        .type_param => |g| {
+            const owner = if (g.module == nc.module_id) nc.module else &nc.all_modules[@intFromEnum(g.module)];
+            try buf.appendSlice(nc.gpa, owner.symbols.items[@intFromEnum(g.id)].name);
+        },
+    }
+}
 
 const Checker = struct {
     gpa: Allocator,
@@ -616,6 +828,15 @@ const Checker = struct {
     /// double-emit a receiver-type diagnostic (e.g. a malformed generic
     /// receiver) once per pass.
     method_ctx: std.AutoHashMapUnmanaged(u64, MethodCtx) = .{},
+    /// `(file_idx, call node)` (packed) -> the index into `ctx.instantiations`
+    /// that call site's generic-function call resolved to (`checkGenericCall`
+    /// populates this). `ctx.instantiations` alone dedupes by `(generic,
+    /// args)`, not by call site, so lowering — which needs "which concrete
+    /// function does *this* call node invoke" — can't recover that from `ctx`
+    /// alone; this is the minimal per-call-site link back to it. Moved into
+    /// `CheckedModule` (not freed by `deinitLocal`) so lowering can consume it
+    /// after this `Checker` goes out of scope.
+    call_insts: std.AutoHashMapUnmanaged(u64, u32) = .{},
 
     fn deinitLocal(self: *Checker) void {
         self.const_inits.deinit(self.gpa);
@@ -684,73 +905,14 @@ const Checker = struct {
     // ---- generic-param / type_param substitution ---------------------------
 
     /// Rebuilds `ty` with every `type_param` leaf bound in `env` replaced by
-    /// its binding; returns `ty` unchanged (no new allocation) when nothing
-    /// in it needs substituting. This is what turns a generic declaration's
-    /// unbound template into a concrete instantiation (§13.6).
+    /// its binding (§13.6). Delegates to `TypeContext.subst` — moved there
+    /// (task #336) because lowering needs the exact same substitution to
+    /// re-derive a generic function body's *concrete* per-node types from its
+    /// once-checked template types (see that function's doc comment); a
+    /// second copy of this logic in `lower.zig` would be exactly the
+    /// "reimplementing checker logic" the task warns against.
     fn subst(self: *Checker, ty: TypeId, env: GenericEnv, depth: u32) Error!TypeId {
-        if (env.len == 0) return ty;
-        if (depth >= max_type_depth) return ty;
-        const data = self.ctx.typeOf(ty);
-        switch (data) {
-            .type_param => |g| return envLookup(env, g) orelse ty,
-            .slice => |e| {
-                const ne = try self.subst(e, env, depth + 1);
-                if (ne == e) return ty;
-                return self.ctx.types.intern(.{ .slice = ne });
-            },
-            .chan => |e| {
-                const ne = try self.subst(e, env, depth + 1);
-                if (ne == e) return ty;
-                return self.ctx.types.intern(.{ .chan = ne });
-            },
-            .array => |a| {
-                const ne = try self.subst(a.elem, env, depth + 1);
-                if (ne == a.elem) return ty;
-                return self.ctx.types.intern(.{ .array = .{ .len = a.len, .elem = ne } });
-            },
-            .map => |m| {
-                const nk = try self.subst(m.key, env, depth + 1);
-                const nv = try self.subst(m.val, env, depth + 1);
-                if (nk == m.key and nv == m.val) return ty;
-                return self.ctx.types.intern(.{ .map = .{ .key = nk, .val = nv } });
-            },
-            .tuple => |ts| {
-                var changed = false;
-                var buf = try self.gpa.alloc(TypeId, ts.len);
-                defer self.gpa.free(buf);
-                for (ts, 0..) |t, i| {
-                    buf[i] = try self.subst(t, env, depth + 1);
-                    if (buf[i] != t) changed = true;
-                }
-                if (!changed) return ty;
-                return self.ctx.types.intern(.{ .tuple = try dupe(self.ctx.arena(), TypeId, buf) });
-            },
-            .func => |f| {
-                var changed = false;
-                var buf = try self.gpa.alloc(TypeId, f.params.len);
-                defer self.gpa.free(buf);
-                for (f.params, 0..) |p, i| {
-                    buf[i] = try self.subst(p, env, depth + 1);
-                    if (buf[i] != p) changed = true;
-                }
-                const nr = try self.subst(f.result, env, depth + 1);
-                if (nr != f.result) changed = true;
-                if (!changed) return ty;
-                return self.ctx.types.intern(.{ .func = .{ .params = try dupe(self.ctx.arena(), TypeId, buf), .variadic = f.variadic, .result = nr } });
-            },
-            .fallible => |f| {
-                const nok = try self.subst(f.ok, env, depth + 1);
-                const nerr = try self.subst(f.err, env, depth + 1);
-                if (nok == f.ok and nerr == f.err) return ty;
-                return self.ctx.types.intern(.{ .fallible = .{ .ok = nok, .err = nerr } });
-            },
-            // Struct/interface fields may reference the enclosing generic's
-            // params too, but only when *instantiating* a generic struct;
-            // `instantiateStruct`/`instantiateInterface` handle those
-            // directly (they need the reserve-then-fill cycle guard, not
-            // plain rebuild-and-intern) rather than going through here.
-            .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .prim, .@"struct", .interface => return ty,
-        }
+        return self.ctx.subst(ty, env, depth);
     }
 
     // ---- type-expression evaluation (§11) -----------------------------------
@@ -1529,77 +1691,13 @@ const Checker = struct {
     // ---- type-name rendering (for expected-vs-found diagnostics) -----------
 
     fn typeName(self: *Checker, ty: TypeId) Error![]u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(self.gpa);
-        try self.appendTypeName(&buf, ty, 0);
-        return buf.toOwnedSlice(self.gpa);
-    }
-
-    fn appendTypeName(self: *Checker, buf: *std.ArrayList(u8), ty: TypeId, depth: u32) Error!void {
-        if (depth >= max_type_depth) return buf.appendSlice(self.gpa, "...");
-        switch (self.ctx.typeOf(ty)) {
-            .invalid => try buf.appendSlice(self.gpa, "<error>"),
-            .void => try buf.appendSlice(self.gpa, "()"),
-            .untyped_int => try buf.appendSlice(self.gpa, "untyped int"),
-            .untyped_float => try buf.appendSlice(self.gpa, "untyped float"),
-            .untyped_rune => try buf.appendSlice(self.gpa, "untyped rune"),
-            .untyped_bool => try buf.appendSlice(self.gpa, "untyped bool"),
-            .untyped_string => try buf.appendSlice(self.gpa, "untyped string"),
-            .untyped_nil => try buf.appendSlice(self.gpa, "nil"),
-            .prim => |p| try buf.appendSlice(self.gpa, @tagName(p)),
-            .slice => |e| {
-                try buf.appendSlice(self.gpa, "[]");
-                try self.appendTypeName(buf, e, depth + 1);
-            },
-            .chan => |e| {
-                try buf.appendSlice(self.gpa, "chan<");
-                try self.appendTypeName(buf, e, depth + 1);
-                try buf.appendSlice(self.gpa, ">");
-            },
-            .array => |a| {
-                var num: [24]u8 = undefined;
-                const s = std.fmt.bufPrint(&num, "[{d}]", .{a.len}) catch unreachable; // bounded: u64 max digits
-                try buf.appendSlice(self.gpa, s);
-                try self.appendTypeName(buf, a.elem, depth + 1);
-            },
-            .map => |m| {
-                try buf.appendSlice(self.gpa, "map<");
-                try self.appendTypeName(buf, m.key, depth + 1);
-                try buf.appendSlice(self.gpa, ", ");
-                try self.appendTypeName(buf, m.val, depth + 1);
-                try buf.appendSlice(self.gpa, ">");
-            },
-            .tuple => |ts| {
-                try buf.appendSlice(self.gpa, "(");
-                for (ts, 0..) |t, i| {
-                    if (i != 0) try buf.appendSlice(self.gpa, ", ");
-                    try self.appendTypeName(buf, t, depth + 1);
-                }
-                try buf.appendSlice(self.gpa, ")");
-            },
-            .func => |f| {
-                try buf.appendSlice(self.gpa, "(");
-                for (f.params, 0..) |p, i| {
-                    if (i != 0) try buf.appendSlice(self.gpa, ", ");
-                    try self.appendTypeName(buf, p, depth + 1);
-                }
-                try buf.appendSlice(self.gpa, ") => ");
-                try self.appendTypeName(buf, f.result, depth + 1);
-            },
-            .fallible => |f| {
-                try self.appendTypeName(buf, f.ok, depth + 1);
-                try buf.appendSlice(self.gpa, "!");
-                if (f.err != self.ctx.error_id) try self.appendTypeName(buf, f.err, depth + 1);
-            },
-            .@"struct", .interface => {
-                if (self.ctx.display_names.get(@intFromEnum(ty))) |n| {
-                    try buf.appendSlice(self.gpa, n);
-                } else {
-                    try buf.appendSlice(self.gpa, if (self.ctx.typeOf(ty) == .@"struct") "struct{...}" else "interface{...}");
-                }
-            },
-            .type_param => |g| try buf.appendSlice(self.gpa, self.symbolOf(g).name),
-        }
+        return describeType(.{
+            .gpa = self.gpa,
+            .ctx = self.ctx,
+            .module_id = self.module_id,
+            .module = self.module,
+            .all_modules = self.all_modules,
+        }, ty);
     }
 
     // ---- `bitc check --dump-types` (task #335 positive suite) --------------
@@ -1765,11 +1863,10 @@ const Checker = struct {
 
     // ---- generic function calls (§15.3) -------------------------------------
 
+    /// Delegates to `TypeContext.substFuncShape` — see `subst`'s doc comment
+    /// on why this moved out of `Checker`.
     fn substFuncShape(self: *Checker, shape: FuncShape, env: GenericEnv) Error!FuncShape {
-        var params = try self.gpa.alloc(TypeId, shape.params.len);
-        defer self.gpa.free(params);
-        for (shape.params, 0..) |p, i| params[i] = try self.subst(p, env, 0);
-        return .{ .params = try dupe(self.ctx.arena(), TypeId, params), .variadic = shape.variadic, .result = try self.subst(shape.result, env, 0) };
+        return self.ctx.substFuncShape(shape, env);
     }
 
     /// Mirrors `instantiateGeneric` for a generic *function* symbol: caches
@@ -1840,6 +1937,15 @@ const Checker = struct {
         }
     }
 
+    /// Links call-site `node` to the `(gsym, args)` instantiation it just
+    /// resolved to — see `call_insts`'s doc comment. `instantiateFunc` just
+    /// above always either found or recorded exactly this pair, so the index
+    /// is always present.
+    fn recordCallInstantiation(self: *Checker, file_idx: usize, node: ast.Index, gsym: GlobalSymbol, args: []const TypeId) Error!void {
+        const idx = self.ctx.findInstantiationIndex(gsym, args).?;
+        try self.call_insts.put(self.gpa, packFileNode(file_idx, node), idx);
+    }
+
     fn checkGenericCall(self: *Checker, file_idx: usize, node: ast.Index, gsym: GlobalSymbol, type_args_node: ast.Index, arg_items: []const ast.Index, env: GenericEnv, fctx: FnCtx, expected: TypeId) Error!TypeId {
         _ = expected;
         const mf = self.files[file_idx];
@@ -1857,6 +1963,7 @@ const Checker = struct {
                 return .invalid;
             }
             const shape = try self.instantiateFunc(gsym, targs, mf, node);
+            try self.recordCallInstantiation(file_idx, node, gsym, targs);
             try self.checkArgs(file_idx, node, shape, arg_items, env, fctx);
             return shape.result;
         }
@@ -1894,6 +2001,7 @@ const Checker = struct {
         if (!all_bound) return .invalid;
 
         const shape = try self.instantiateFunc(gsym, args, mf, node);
+        try self.recordCallInstantiation(file_idx, node, gsym, args);
         // Arguments were already checked above for their *natural* types
         // (each `checkExpr` ran exactly once); only the assignability check
         // against the now-concrete substituted param type remains, reusing
@@ -3669,16 +3777,26 @@ pub const CheckedModule = struct {
     /// call expression, sorted by source position. `null` otherwise so the
     /// normal compile path pays nothing for it.
     type_dump: ?[]u8 = null,
+    /// Moved out of `Checker.call_insts` (see its doc comment) — lowering's
+    /// only use for this module past `checkModule` returning.
+    call_insts: std.AutoHashMapUnmanaged(u64, u32) = .{},
 
     pub fn deinit(self: *CheckedModule) void {
         for (self.node_types) |nt| self.gpa.free(nt);
         self.gpa.free(self.node_types);
         if (self.type_dump) |d| self.gpa.free(d);
+        self.call_insts.deinit(self.gpa);
         self.* = undefined;
     }
 
     pub fn typeOf(self: *const CheckedModule, file_idx: usize, node: ast.Index) TypeId {
         return self.node_types[file_idx][node];
+    }
+
+    /// The `ctx.instantiations` index a generic-function call node resolved
+    /// to, if `node` is such a call — see `Checker.call_insts`.
+    pub fn instantiationOf(self: *const CheckedModule, file_idx: usize, node: ast.Index) ?u32 {
+        return self.call_insts.get(packFileNode(file_idx, node));
     }
 };
 
@@ -3744,8 +3862,11 @@ pub fn checkModule(
     try checker.collectDecls();
     try checker.checkBodies();
     const dump = if (dump_types) try checker.dumpTypesText() else null;
+    // `call_insts` is moved out (not freed by `deinitLocal`, which only ever
+    // owned the checking-time-only tables) into the returned `CheckedModule`.
+    const call_insts = checker.call_insts;
     checker.deinitLocal();
-    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump };
+    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts };
 }
 
 const testing = std.testing;
