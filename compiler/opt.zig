@@ -547,10 +547,15 @@ fn foldConstantsAndPrune(gpa: Allocator, ctx: *const check.TypeContext, f: *cons
 
 /// Instructions whose effect is more than "produce this value" — always
 /// kept regardless of use count. Allocation and closure creation are kept
-/// conservatively (no escape analysis yet, see module doc comment).
+/// conservatively (no escape analysis yet, see module doc comment). Integer
+/// division/remainder and indexing are kept too: per spec/SPEC.md §13.5 and
+/// §11/13 they panic on a zero divisor or an out-of-range index even when
+/// their result is unused, so dropping an unused one would silently delete a
+/// mandated runtime panic. `fdiv` is excluded — IEEE float division by zero
+/// produces inf/nan, it never traps.
 fn isSideEffecting(op: ir.Op) bool {
     return switch (op) {
-        .call, .call_value, .call_iface, .rt_call, .field_set, .index_set, .gc_alloc, .make_closure => true,
+        .call, .call_value, .call_iface, .rt_call, .field_set, .index_set, .index_get, .gc_alloc, .make_closure, .sdiv, .udiv, .srem, .urem => true,
         else => op.isTerminator(),
     };
 }
@@ -873,6 +878,38 @@ test "deadCodeElim drops an unused pure value" {
     try ir.verifyFunction(gpa, &cleaned);
 
     try testing.expectEqual(@as(usize, 2), cleaned.insts.len); // param + ret only
+}
+
+test "deadCodeElim keeps an unused sdiv/index_get since both can panic" {
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const p0 = try b.addParam(i64_ty);
+    const zero = try b.constInt(i64_ty, 0);
+    _ = try b.binary(.sdiv, i64_ty, p0, zero); // dead result, but the divide-by-zero panic must fire
+    _ = try b.indexGet(i64_ty, p0, zero); // dead result, but an out-of-range index must panic
+    try b.ret(&.{p0});
+    b.endBlock();
+    var f = try b.finish("f", &.{i64_ty}, i64_ty, false, .invalid, entry);
+    defer f.deinit(gpa);
+
+    var cleaned = try deadCodeElim(gpa, &f);
+    defer cleaned.deinit(gpa);
+    try ir.verifyFunction(gpa, &cleaned);
+
+    var saw_sdiv = false;
+    var saw_index_get = false;
+    for (cleaned.insts.items(.op)) |op| {
+        if (op == .sdiv) saw_sdiv = true;
+        if (op == .index_get) saw_index_get = true;
+    }
+    try testing.expect(saw_sdiv);
+    try testing.expect(saw_index_get);
 }
 
 test "deadCodeElim keeps a side-effecting call even when its result is unused" {
