@@ -168,6 +168,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(opt_tests).step);
 
+    // Standalone object writer (task #343): no imports outside `std`. Its
+    // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
+    // hosts (those tools don't exist there), so this is safe on every CI host.
+    const macho_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/obj/macho.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(macho_tests).step);
+
     // Golden-file harness: discovers tests/cases/*.bit and checks each against
     // its sibling .expected. The cases directory (absolute) is injected as a
     // build option so the runner is independent of the process cwd.
