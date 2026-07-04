@@ -85,6 +85,13 @@ pub const RelocKind = enum {
     aarch64_adr_got_page,
     /// AArch64 `LDR` low 12 bits addressing a GOT slot: (GOT slot & 0xfff) >> 3.
     aarch64_ld64_got_lo12_nc,
+    /// macOS thread-local `ADRP`/`LDR` pair (`ARM64_RELOC_TLVP_LOAD_*`): the
+    /// same page/lo12 arithmetic as the GOT kinds, but the indirection slot
+    /// lives in the thread-pointer table (`__thread_ptr`), each slot holding
+    /// the address of a `__thread_vars` `tlv_descriptor` (§ `link/macho.zig`).
+    /// The driver passes the slot address in `Values.got_slot`, same as GOT.
+    aarch64_tlvp_adr_page21,
+    aarch64_tlvp_ld64_lo12,
 
     /// AArch64 local-exec TLS `ADD` high bits: (TPOFF(S)+A) bits [23:12].
     tlsle_add_tprel_hi12,

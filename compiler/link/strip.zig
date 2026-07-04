@@ -133,8 +133,8 @@ pub fn deadStrip(gpa: Allocator, modules: []const Module, globals: *const Global
 /// `tp_offset` is the target's offset from the thread pointer (TLS kinds only,
 /// negative under the x86-64 variant-II local-exec model).
 pub const Values = struct {
-    s: u64,
-    p: u64,
+    s: u64 = 0,
+    p: u64 = 0,
     got_slot: u64 = 0,
     tp_offset: i64 = 0,
 };
@@ -160,8 +160,68 @@ pub fn apply(kind: RelocKind, field: []u8, v: Values) Error!void {
             if (v.tp_offset < std.math.minInt(i32) or v.tp_offset > std.math.maxInt(i32)) return error.RelocationOutOfRange;
             std.mem.writeInt(i32, field[0..4], @intCast(v.tp_offset), .little);
         },
-        else => return error.UnsupportedRelocation,
+
+        // ---- AArch64 instruction-field kinds (Mach-O arm64 executable) -----
+        // Each patches a 4-byte little-endian instruction word in place. `s`
+        // already folds the addend; GOT/TLVP kinds address their indirection
+        // slot via `got_slot`.
+        .aarch64_call26, .aarch64_jump26 => try writeBranch26(field, v.s, v.p),
+        .aarch64_adr_prel_pg_hi21 => try writeAdrp(field, v.s, v.p),
+        .aarch64_adr_got_page, .aarch64_tlvp_adr_page21 => try writeAdrp(field, v.got_slot, v.p),
+        .aarch64_add_abs_lo12_nc => writeLo12(field, v.s, 0),
+        .aarch64_ldst8_abs_lo12_nc => writeLo12(field, v.s, 0),
+        .aarch64_ldst16_abs_lo12_nc => writeLo12(field, v.s, 1),
+        .aarch64_ldst32_abs_lo12_nc => writeLo12(field, v.s, 2),
+        .aarch64_ldst64_abs_lo12_nc => writeLo12(field, v.s, 3),
+        .aarch64_ldst128_abs_lo12_nc => writeLo12(field, v.s, 4),
+        .aarch64_ld64_got_lo12_nc, .aarch64_tlvp_ld64_lo12 => writeLo12(field, v.got_slot, 3),
+
+        .tlsle_add_tprel_hi12, .tlsle_add_tprel_lo12_nc => return error.UnsupportedRelocation,
     }
+}
+
+fn readInsn(field: []const u8) u32 {
+    return std.mem.readInt(u32, field[0..4], .little);
+}
+fn writeInsn(field: []u8, insn: u32) void {
+    std.mem.writeInt(u32, field[0..4], insn, .little);
+}
+
+/// `BL`/`B` imm26 = (target - P) >> 2, signed 26-bit, at instruction bits [25:0].
+fn writeBranch26(field: []u8, target: u64, p: u64) Error!void {
+    const disp: i64 = @as(i64, @bitCast(target)) - @as(i64, @bitCast(p));
+    if (disp & 3 != 0) return error.UnsupportedRelocation; // branch targets are 4-aligned
+    const imm: i64 = disp >> 2;
+    if (imm < -(1 << 25) or imm >= (1 << 25)) return error.RelocationOutOfRange;
+    const bits: u64 = @bitCast(imm);
+    const insn = (readInsn(field) & 0xFC000000) | @as(u32, @intCast(bits & 0x03FFFFFF));
+    writeInsn(field, insn);
+}
+
+/// `ADRP` imm21 = (page(target) - page(P)) >> 12, split into immlo (bits
+/// [30:29]) and immhi (bits [23:5]). `page(x) = x & ~0xfff`.
+fn writeAdrp(field: []u8, target: u64, p: u64) Error!void {
+    const page_mask = ~@as(u64, 0xFFF);
+    const delta: i64 = @as(i64, @bitCast(target & page_mask)) - @as(i64, @bitCast(p & page_mask));
+    const imm: i64 = delta >> 12;
+    if (imm < -(1 << 20) or imm >= (1 << 20)) return error.RelocationOutOfRange;
+    const uimm: u32 = @intCast(@as(u64, @bitCast(imm)) & 0x1FFFFF);
+    const immlo = uimm & 0x3;
+    const immhi = (uimm >> 2) & 0x7FFFF;
+    var insn = readInsn(field);
+    insn &= ~((@as(u32, 0x3) << 29) | (@as(u32, 0x7FFFF) << 5));
+    insn |= (immlo << 29) | (immhi << 5);
+    writeInsn(field, insn);
+}
+
+/// `ADD`/`LDR`/`STR` imm12 = (value & 0xfff) >> scale, at bits [21:10]. `scale`
+/// is the access-size log2 (0 for `ADD` and byte access, 3 for a 64-bit load).
+fn writeLo12(field: []u8, value: u64, scale: u5) void {
+    const imm12: u32 = @intCast((value & 0xFFF) >> scale);
+    var insn = readInsn(field);
+    insn &= ~(@as(u32, 0xFFF) << 10);
+    insn |= imm12 << 10;
+    writeInsn(field, insn);
 }
 
 fn writePcRel32(field: []u8, target: u64, p: u64) Error!void {
@@ -175,6 +235,16 @@ fn writePcRel32(field: []u8, target: u64, p: u64) Error!void {
 pub fn needsGot(kind: RelocKind) bool {
     return switch (kind) {
         .got32, .aarch64_adr_got_page, .aarch64_ld64_got_lo12_nc => true,
+        else => false,
+    };
+}
+
+/// True for a macOS thread-local kind that must materialize a `__thread_ptr`
+/// slot for its target `tlv_descriptor` (the driver sizes that table the same
+/// way it sizes the GOT).
+pub fn needsTlvp(kind: RelocKind) bool {
+    return switch (kind) {
+        .aarch64_tlvp_adr_page21, .aarch64_tlvp_ld64_lo12 => true,
         else => false,
     };
 }
@@ -261,4 +331,41 @@ test "apply computes each x86-64 relocation kind" {
 
     // abs32_signed out of range is rejected, not truncated.
     try testing.expectError(error.RelocationOutOfRange, apply(.abs32_signed, buf[0..4], .{ .s = 0x8000_0000, .p = 0 }));
+}
+
+test "apply encodes AArch64 instruction-field relocations" {
+    var insn: [4]u8 = undefined;
+
+    // BL forward: target = P + 0x1000 -> imm26 = 0x400.
+    std.mem.writeInt(u32, &insn, 0x94000000, .little); // bl #0
+    try apply(.aarch64_call26, &insn, .{ .s = 0x1000, .p = 0 });
+    try testing.expectEqual(@as(u32, 0x94000400), std.mem.readInt(u32, &insn, .little));
+
+    // BL backward: target = P - 8 -> the canonical `bl .-8` == 0x97FFFFFE.
+    std.mem.writeInt(u32, &insn, 0x94000000, .little);
+    try apply(.aarch64_call26, &insn, .{ .s = 0, .p = 8 });
+    try testing.expectEqual(@as(u32, 0x97FFFFFE), std.mem.readInt(u32, &insn, .little));
+
+    // ADRP x0: page(target) - page(P) = 0x4000 -> imm=4 (immlo=0, immhi=1).
+    std.mem.writeInt(u32, &insn, 0x90000000, .little);
+    try apply(.aarch64_adr_prel_pg_hi21, &insn, .{ .s = 0x100004ABC, .p = 0x100000000 });
+    try testing.expectEqual(@as(u32, 0x90000020), std.mem.readInt(u32, &insn, .little));
+
+    // ADD x0,x0,#imm: lo12 of 0x...4ABC = 0xABC, unscaled.
+    std.mem.writeInt(u32, &insn, 0x91000000, .little);
+    try apply(.aarch64_add_abs_lo12_nc, &insn, .{ .s = 0x100004ABC, .p = 0 });
+    try testing.expectEqual(@as(u32, 0x912AF000), std.mem.readInt(u32, &insn, .little));
+
+    // LDR x0,[x0,#imm]: lo12 of 0x...4AC0 scaled by 8 = 0x158.
+    std.mem.writeInt(u32, &insn, 0xF9400000, .little);
+    try apply(.aarch64_ldst64_abs_lo12_nc, &insn, .{ .s = 0x100004AC0, .p = 0 });
+    try testing.expectEqual(@as(u32, 0xF9456000), std.mem.readInt(u32, &insn, .little));
+
+    // GOT/TLVP page kinds address `got_slot`, not `s`: page delta 0x8000 -> imm=8.
+    std.mem.writeInt(u32, &insn, 0x90000000, .little);
+    try apply(.aarch64_adr_got_page, &insn, .{ .s = 0, .p = 0x100000000, .got_slot = 0x100008000 });
+    try testing.expectEqual(@as(u32, 0x90000040), std.mem.readInt(u32, &insn, .little));
+
+    // A branch past ±128 MB is rejected, not truncated.
+    try testing.expectError(error.RelocationOutOfRange, apply(.aarch64_call26, &insn, .{ .s = 0x10000000, .p = 0 }));
 }
