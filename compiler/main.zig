@@ -11,6 +11,7 @@ const lower = @import("lower.zig");
 const opt = @import("opt.zig");
 const emit = @import("emit.zig");
 const link = @import("link.zig");
+const macho = @import("link/macho.zig");
 const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 
@@ -84,8 +85,25 @@ const max_source_bytes = 8 << 20; // 8 MiB
 /// Location of the runtime archive. // ponytail: fixed dev-build path;
 /// resolve relative to the `bit` binary's own install prefix, and honor an
 /// env override, once packaging (#358) lands.
-fn libbitrtPath() []const u8 {
-    return "zig-out/lib/x86_64-linux/libbitrt.a";
+/// The native binary target `bit build`/`run` produces. Defaults to the host
+/// (x86-64 Linux); `--target aarch64-macos` cross-produces an Apple-Silicon
+/// Mach-O (which only a Mac can execute, so `bit run` for it just builds).
+const BuildTarget = enum {
+    x86_64_linux,
+    aarch64_macos,
+
+    fn parse(s: []const u8) ?BuildTarget {
+        if (std.mem.eql(u8, s, "x86_64-linux")) return .x86_64_linux;
+        if (std.mem.eql(u8, s, "aarch64-macos") or std.mem.eql(u8, s, "arm64-macos")) return .aarch64_macos;
+        return null;
+    }
+};
+
+fn libbitrtPath(target: BuildTarget) []const u8 {
+    return switch (target) {
+        .x86_64_linux => "zig-out/lib/x86_64-linux/libbitrt.a",
+        .aarch64_macos => "zig-out/lib/aarch64-macos/libbitrt.a",
+    };
 }
 
 /// `bit build <file.bit> [-o out]` / `bit run <file.bit>`: the full pipeline to
@@ -93,37 +111,58 @@ fn libbitrtPath() []const u8 {
 /// program's own exit code after a run. Compile diagnostics go to `err_out`;
 /// a compile error returns exit code 1, a usage error 2 (SPEC/#347 §Scope).
 fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bool, args: []const [:0]const u8) !u8 {
-    if (args.len < 1) {
-        try err_out.writeAll("usage: bit build|run <file.bit> [-o out]\n");
-        return 2;
-    }
-    const src_path = args[0];
+    // Parse: one positional <file.bit>, plus `-o <out>` and `--target <t>` in
+    // any order.
+    var src_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
-    if (!is_run and args.len >= 3 and std.mem.eql(u8, args[1], "-o")) out_path = args[2];
+    var target: BuildTarget = .x86_64_linux;
+    var ai: usize = 0;
+    while (ai < args.len) {
+        const arg = args[ai];
+        if (std.mem.eql(u8, arg, "-o") and ai + 1 < args.len) {
+            out_path = args[ai + 1];
+            ai += 2;
+        } else if ((std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) and ai + 1 < args.len) {
+            target = BuildTarget.parse(args[ai + 1]) orelse {
+                try err_out.print("bit: unknown target '{s}' (x86_64-linux | aarch64-macos)\n", .{args[ai + 1]});
+                return 2;
+            };
+            ai += 2;
+        } else {
+            if (src_path == null) src_path = arg;
+            ai += 1;
+        }
+    }
+    const src = src_path orelse {
+        try err_out.writeAll("usage: bit build|run <file.bit> [-o out] [--target x86_64-linux|aarch64-macos]\n");
+        return 2;
+    };
 
-    const source = Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .limited(max_source_bytes)) catch |e| {
-        try err_out.print("bit: {s}: {s}\n", .{ src_path, @errorName(e) });
+    const source = Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(max_source_bytes)) catch |e| {
+        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
         return 1;
     };
     defer gpa.free(source);
 
-    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(), gpa, .unlimited) catch |e| {
-        try err_out.print("bit: runtime archive {s}: {s} (set BIT_LIBBITRT)\n", .{ libbitrtPath(), @errorName(e) });
+    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch |e| {
+        try err_out.print("bit: runtime archive {s}: {s} (set BIT_LIBBITRT)\n", .{ libbitrtPath(target), @errorName(e) });
         return 1;
     };
     defer gpa.free(lib);
 
-    const exe = (try buildExecutable(gpa, src_path, source, lib, err_out)) orelse return 1;
+    const exe = (try buildExecutable(gpa, src, source, lib, target, err_out)) orelse return 1;
     defer gpa.free(exe);
 
     // Output binary: `-o`, else the source stem, written to the cwd.
-    const dest = out_path orelse std.fs.path.stem(src_path);
+    const dest = out_path orelse std.fs.path.stem(src);
     const dest_z = try gpa.dupeZ(u8, dest);
     defer gpa.free(dest_z);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = dest_z, .data = exe });
     _ = std.os.linux.fchmodat(std.os.linux.AT.FDCWD, dest_z, 0o755);
 
-    if (!is_run) return 0;
+    // A cross-produced macOS binary cannot run on this (Linux) host; `bit run`
+    // for it just builds.
+    if (!is_run or target != .x86_64_linux) return 0;
 
     // Run it: `execve` needs a slash to resolve a path against the cwd.
     const run_path = try std.fmt.allocPrintSentinel(gpa, "./{s}", .{dest_z}, 0);
@@ -140,7 +179,7 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
 /// runnable executable's bytes. Returns `null` (after rendering diagnostics to
 /// `err_out`) if any stage before codegen reported an error; the caller maps
 /// that to exit code 1.
-fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
+fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
     const file = try sm.addFile(path, source);
@@ -172,10 +211,19 @@ fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8,
     defer module.deinit();
     try opt.optimizeModule(gpa, &module, .o1);
 
-    const object = try emit.emitObject(gpa, &module);
-    defer gpa.free(object);
-
-    return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+    switch (target) {
+        .x86_64_linux => {
+            const object = try emit.emitObject(gpa, &module);
+            defer gpa.free(object);
+            return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+        },
+        .aarch64_macos => {
+            const object = try emit.emitMachoObject(gpa, &module);
+            defer gpa.free(object);
+            const ident = std.fs.path.stem(path);
+            return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
+        },
+    }
 }
 
 fn renderFail(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, err_out: *Io.Writer) !?[]u8 {

@@ -33,6 +33,8 @@ const Allocator = std.mem.Allocator;
 const object = @import("object.zig");
 const strip = @import("strip.zig");
 const codesign = @import("codesign.zig");
+const archive = @import("archive.zig");
+const macho_reader = @import("macho_reader.zig");
 
 const AtomId = strip.AtomId;
 const RelocKind = object.RelocKind;
@@ -52,6 +54,31 @@ pub const Options = struct {
     /// Code-signing identifier (typically the output filename stem).
     identifier: []const u8,
 };
+
+pub const Input = union(enum) {
+    /// A single relocatable Mach-O object — the compiled Bit program.
+    object: []const u8,
+    /// An `ar` archive (`libbitrt.a`); every member is read as its own module.
+    archive: []const u8,
+};
+
+/// Reads `inputs` (the compiled Bit Mach-O object plus `libbitrt.a`) into the
+/// generic object model and links them into an ad-hoc-signed executable — the
+/// macOS analogue of `link.zig`'s `linkExecutable(target, inputs)`.
+pub fn link(gpa: Allocator, inputs: []const Input, opts: Options) (Error || macho_reader.Error || archive.Error)![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var modules: std.ArrayList(object.Module) = .empty;
+    for (inputs) |input| switch (input) {
+        .object => |bytes| try modules.append(arena, try macho_reader.read(arena, "bit.o", bytes)),
+        .archive => |bytes| {
+            for (try archive.parse(arena, bytes)) |m| try modules.append(arena, try macho_reader.read(arena, m.name, m.data));
+        },
+    };
+    return linkExecutable(gpa, modules.items, opts);
+}
 
 // ---------------------------------------------------------------------------
 // Mach-O load-command constants + structs (`<mach-o/loader.h>`, transcribed).
@@ -829,8 +856,6 @@ test "de-risk: emits a well-formed signed arm64 Mach-O and (on macOS) runs" {
 
 test "links the real aarch64 runtime + a bit_main into a signed image that boots on macOS" {
     const gpa = testing.allocator;
-    const archive = @import("archive.zig");
-    const macho_reader = @import("macho_reader.zig");
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

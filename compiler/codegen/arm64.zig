@@ -103,7 +103,12 @@ const common = @import("common.zig");
 const Allocator = std.mem.Allocator;
 const TypeId = check.TypeId;
 const TypeContext = check.TypeContext;
-const Reloc = common.Reloc;
+
+/// How an object writer must patch a relocation's instruction field: a `BL`'s
+/// 26-bit branch immediate (calls), or the `ADRP`/`ADD` pair that materializes
+/// a static symbol's address (a `const_string`'s `__bitstr_N` header).
+pub const RelocKind = enum { branch, page21, pageoff12 };
+pub const Reloc = struct { offset: u32, symbol: []const u8, kind: RelocKind = .branch };
 pub const CodegenError = common.CodegenError;
 
 // ============================================================================
@@ -223,6 +228,8 @@ pub const FuncCode = struct {
     relocs: []Reloc,
     safepoints: []SafepointEntry,
     frame_size: u32,
+    /// Owned `__bitstr_N` names that `relocs` borrow (one per `const_string`).
+    owned_syms: [][]u8 = &.{},
 
     pub fn deinit(self: *FuncCode) void {
         self.gpa.free(self.code);
@@ -232,6 +239,8 @@ pub const FuncCode = struct {
             self.gpa.free(sp.frame_offsets);
         }
         self.gpa.free(self.safepoints);
+        for (self.owned_syms) |s| self.gpa.free(s);
+        self.gpa.free(self.owned_syms);
         self.* = undefined;
     }
 };
@@ -276,6 +285,7 @@ const Ctx = struct {
     f: *const ir.Function,
     code: std.ArrayList(u8) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
+    owned_syms: std.ArrayList([]u8) = .empty,
     inst_to_vreg: []const u32,
     result: *const regalloc.Result,
     int_regs: []const Reg,
@@ -691,7 +701,21 @@ const Ctx = struct {
     fn emitCallReloc(self: *Ctx, symbol: []const u8) !void {
         const off: u32 = @intCast(self.code.items.len);
         try self.emitWord(0x94000000); // BL, imm26=0 placeholder
-        try self.relocs.append(self.gpa, .{ .offset = off, .symbol = symbol });
+        try self.relocs.append(self.gpa, .{ .offset = off, .symbol = symbol, .kind = .branch });
+    }
+
+    /// Materializes the address of a static symbol into `dst` via the AArch64
+    /// `ADRP`/`ADD` pair (imm fields are 0 placeholders the linker patches from
+    /// the `page21`/`pageoff12` relocations). No `movabs` equivalent exists on
+    /// AArch64; this is the standard PC-relative address-of sequence.
+    fn emitAddrOf(self: *Ctx, dst: Reg, symbol: []const u8) !void {
+        const d: u32 = @intFromEnum(dst);
+        const adrp_off: u32 = @intCast(self.code.items.len);
+        try self.emitWord(0x90000000 | d); // ADRP dst, 0
+        try self.relocs.append(self.gpa, .{ .offset = adrp_off, .symbol = symbol, .kind = .page21 });
+        const add_off: u32 = @intCast(self.code.items.len);
+        try self.emitWord(0x91000000 | (d << 5) | d); // ADD dst, dst, #0
+        try self.relocs.append(self.gpa, .{ .offset = add_off, .symbol = symbol, .kind = .pageoff12 });
     }
 
     fn emitJumpFixup(self: *Ctx, target: ir.BlockId) !void {
@@ -1098,6 +1122,15 @@ fn emitConstNil(self: *Ctx, dst: u32) !void {
     try self.movImm64(scratch1, 0);
     try putInt(self, dst, scratch1);
 }
+/// A `const_string` value is the address of its static `{ptr,len}` header
+/// (`__bitstr_N`, materialized by the object writer + linker into `.rodata`);
+/// loads that address into the destination via the `ADRP`/`ADD` pair.
+fn emitConstString(self: *Ctx, dst: u32, pool_idx: u32) !void {
+    const name = try std.fmt.allocPrint(self.gpa, "__bitstr_{d}", .{pool_idx});
+    try self.owned_syms.append(self.gpa, name);
+    try self.emitAddrOf(scratch1, name);
+    try putInt(self, dst, scratch1);
+}
 fn emitConstFloat(self: *Ctx, dst: u32, val: f64, width: u8) !void {
     if (width == 8) {
         try self.movImm64(scratch1, @bitCast(val));
@@ -1298,7 +1331,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .const_int => |v| try emitConstInt(self, i, v),
         .const_float => |v| try emitConstFloat(self, i, v, common.widthOf(self.tctx(), ty).bytes),
         .const_bool => |v| try emitConstBool(self, i, v),
-        .const_string => return error.UnsupportedConstruct,
+        .const_string => |pool_idx| try emitConstString(self, i, pool_idx),
         .const_nil => try emitConstNil(self, i),
         .bin => |b| switch (op) {
             .add => try emitBinaryInt(self, .add, i, b.lhs, b.rhs),
@@ -1576,6 +1609,8 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     };
     defer ctx.code.deinit(gpa);
     defer ctx.relocs.deinit(gpa);
+    defer ctx.owned_syms.deinit(gpa);
+    errdefer for (ctx.owned_syms.items) |s| gpa.free(s); // freed by FuncCode on success
     defer ctx.jump_fixups.deinit(gpa);
     defer ctx.safepoints.deinit(gpa);
 
@@ -1626,6 +1661,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         .code = try ctx.code.toOwnedSlice(gpa),
         .relocs = try ctx.relocs.toOwnedSlice(gpa),
         .safepoints = try ctx.safepoints.toOwnedSlice(gpa),
+        .owned_syms = try ctx.owned_syms.toOwnedSlice(gpa),
         .frame_size = frame_size,
     };
 }

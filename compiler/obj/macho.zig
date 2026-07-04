@@ -143,21 +143,27 @@ pub const RelocKind = enum {
     /// Absolute pointer-sized reference, e.g. a `.bit_gc` `TypeInfo`
     /// pointer into `.rodata`.
     unsigned64,
+    /// ARM64 `ADRP` page-of-symbol immediate (`ARM64_RELOC_PAGE21`) — the high
+    /// half of an address-of sequence (a `const_string`'s `__bitstr_N`).
+    page21,
+    /// ARM64 `ADD`/`LDR` low-12-bits immediate (`ARM64_RELOC_PAGEOFF12`) — the
+    /// low half of that sequence.
+    pageoff12,
 
     fn width(self: RelocKind) u64 {
         return switch (self) {
-            .branch => 4,
+            .branch, .page21, .pageoff12 => 4,
             .unsigned64 => 8,
         };
     }
 
     fn pcrel(self: RelocKind) bool {
-        return self == .branch;
+        return self == .branch or self == .page21;
     }
 
     fn length(self: RelocKind) u2 {
         return switch (self) {
-            .branch => 2, // 4 bytes
+            .branch, .page21, .pageoff12 => 2, // 4 bytes
             .unsigned64 => 3, // 8 bytes
         };
     }
@@ -166,16 +172,21 @@ pub const RelocKind = enum {
     /// `ARM64_RELOC_BRANCH26` are both `2`; `X86_64_RELOC_UNSIGNED` and
     /// `ARM64_RELOC_UNSIGNED` are both `0` — spelled out per-target anyway
     /// (not collapsed to one constant) so a future third target with a
-    /// different ordinal is a one-line change, not a hidden assumption.
+    /// different ordinal is a one-line change, not a hidden assumption. The
+    /// `page21`/`pageoff12` kinds are AArch64-only (x86-64 materializes a
+    /// symbol address as an absolute `unsigned64`, never a PC-relative pair).
     fn machoType(self: RelocKind, target: Target) u4 {
         return switch (target) {
             .x86_64 => switch (self) {
                 .branch => 2, // X86_64_RELOC_BRANCH
                 .unsigned64 => 0, // X86_64_RELOC_UNSIGNED
+                .page21, .pageoff12 => unreachable, // AArch64-only, never emitted for x86-64
             },
             .aarch64 => switch (self) {
                 .branch => 2, // ARM64_RELOC_BRANCH26
                 .unsigned64 => 0, // ARM64_RELOC_UNSIGNED
+                .page21 => 3, // ARM64_RELOC_PAGE21
+                .pageoff12 => 4, // ARM64_RELOC_PAGEOFF12
             },
         };
     }
