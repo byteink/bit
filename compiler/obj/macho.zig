@@ -824,3 +824,72 @@ test "x86-64: object links via system ld/clang and the resulting binary runs (Ro
     const helper_code = [_]u8{ 0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3 };
     try checkArchLinksAndRuns(testing.allocator, .x86_64, &main_code, &helper_code, "x86_64", 1);
 }
+
+test "x86-64: unsigned64 relocation to a local rodata symbol resolves correctly when linked and run" {
+    // Covers the reloc kind + binding combination `checkArchLinksAndRuns`
+    // doesn't exercise: `.unsigned64` (not `.branch`) against a `.local`
+    // (not external) symbol — the exact shape a `.bit_gc` `TypeInfo` pointer
+    // uses (see this file's doc comment). `r_extern=1` naming a non-`N_EXT`
+    // symbol is legal Mach-O (this writer always sets `r_extern`, per
+    // `write`'s comment on the field), but whether `ld` emits the rebase
+    // info this pointer needs to survive dyld's ASLR slide was previously
+    // unverified by any real link+run.
+    //
+    // The pointer slot lives in `.gc_meta` (`__DATA`, writable), not
+    // `.text`: an earlier version of this test tried embedding the pointer
+    // as a `movabs` immediate inside `_main` and `ld` correctly rejected it
+    // — "Illegal text-relocations" — since macOS forbids absolute
+    // relocations in read-only/executable segments. That's not a gap here;
+    // it's confirmation the writer's only legitimate placement for
+    // `.unsigned64` is a data section, exactly what `.bit_gc` already does.
+    //
+    // `main.c` (not hand-written machine code) reads the pointer: computing
+    // a data symbol's address from position-independent code needs GOT-
+    // relative addressing this writer deliberately doesn't implement (no
+    // Bit-emitted code ever needs to address-of a symbol; only the object
+    // format needs to patch one). `clang` supplies that addressing; this
+    // test only has to prove the *pointer value our writer patched in* is
+    // correct once dyld has mapped and rebased the real executable.
+    try skipUnlessMacos();
+    const gpa = testing.allocator;
+
+    const rodata = [_]u8{42};
+    const ptr_slot = [_]u8{0} ** 8;
+
+    const gc_obj = try write(gpa, .x86_64, .{
+        .sections = &.{
+            .{ .kind = .rodata, .data = &rodata, .alignment = 1 },
+            .{ .kind = .gc_meta, .data = &ptr_slot, .alignment = 8 },
+        },
+        .symbols = &.{
+            .{ .name = "msg", .section = .rodata, .offset = 0, .size = rodata.len, .binding = .local },
+            .{ .name = "_ptr_slot", .section = .gc_meta, .offset = 0, .size = ptr_slot.len, .binding = .global },
+        },
+        .relocations = &.{
+            .{ .section = .gc_meta, .offset = 0, .symbol = "msg", .kind = .unsigned64 },
+        },
+    });
+    defer gpa.free(gc_obj);
+
+    const main_c =
+        \\extern unsigned long long ptr_slot;
+        \\int main(void) { return *(unsigned char *)ptr_slot; }
+        \\
+    ;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "gc.o", .data = gc_obj });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.c", .data = main_c });
+
+    try testing.expect(try runOk(gpa, io, tmp.dir, &.{ "clang", "-arch", "x86_64", "main.c", "gc.o", "-o", "exe" }));
+
+    const run_result = try runCapture(gpa, io, tmp.dir, &.{"./exe"});
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, run_result.term);
+}
