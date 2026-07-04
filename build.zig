@@ -52,6 +52,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(chan_tests).step);
 
+    const root_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("runtime/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(root_tests).step);
+
     const diagnostics_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("compiler/diagnostics.zig"),
@@ -215,4 +224,36 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_fuzz.addArgs(args);
     const fuzz_step = b.step("fuzz", "Mutation-fuzz the lexer+parser (default 60s; pass -- <seconds> to override)");
     fuzz_step.dependOn(&run_fuzz.step);
+
+    // `zig build libbitrt`: the runtime archive the static linker (task #345)
+    // consumes, one `libbitrt.a` per target this runtime actually supports.
+    // Fixed target queries, not `-Dtarget` — the point is to produce every
+    // supported target's archive in one invocation regardless of host.
+    // Windows and other architectures are deliberately absent: `sched.zig`
+    // and `root.zig` both `@compileError` outside POSIX x86-64/ARM64 today
+    // (see their module doc comments) — Windows lands when the scheduler
+    // and GC gain Windows support, not before.
+    const libbitrt_step = b.step("libbitrt", "Build libbitrt.a for every target this runtime supports");
+    const libbitrt_targets = [_]std.Target.Query{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux },
+        .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    };
+    for (libbitrt_targets) |query| {
+        const rt_target = b.resolveTargetQuery(query);
+        const lib = b.addLibrary(.{
+            .linkage = .static,
+            .name = "bitrt",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("runtime/root.zig"),
+                .target = rt_target,
+                .optimize = optimize,
+            }),
+        });
+        const install = b.addInstallArtifact(lib, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{query.zigTriple(b.allocator) catch @panic("OOM")}) } },
+        });
+        libbitrt_step.dependOn(&install.step);
+    }
 }

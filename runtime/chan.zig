@@ -375,6 +375,15 @@ pub fn Chan(comptime T: type) type {
         count: usize = 0,
         sendq: WaitQueue(Waiter) = .{},
         recvq: WaitQueue(Waiter) = .{},
+        /// True when a buffered `T` may itself be a GC reference — set by the
+        /// caller after `init` (root.zig's `bit_rt_chan_make`), never by
+        /// `Chan(T)` itself. Gates whether `scanRegistryRoots` treats this
+        /// channel's buffer as GC roots (ABI.md §11).
+        is_ref: bool = false,
+        /// Intrusive link for the per-`T` registry below. Unset (`null`) for
+        /// channels that are never `register`ed — i.e. every plain
+        /// stack-local test channel in this file.
+        registry_next: ?*Self = null,
 
         /// `capacity == 0` is an unbuffered (synchronous) channel.
         pub fn init(capacity: usize) !Self {
@@ -382,6 +391,47 @@ pub fn Chan(comptime T: type) type {
             // valid empty slice with no actual OS allocation.
             const buf = try std.heap.page_allocator.alloc(T, capacity);
             return .{ .buf = buf, .cap = capacity };
+        }
+
+        // -- GC root registry -------------------------------------------
+        //
+        // A buffered value is reachable only through this ring buffer while
+        // it sits unreceived — no stack or register holds it. The registry
+        // lets the GC's root scanner (root.zig, ABI.md §11) find every live
+        // channel of this instantiation and treat `is_ref` ones' buffered
+        // elements as extra roots. One registry per distinct `T` — the ABI
+        // only ever registers `Chan(u64)` (see this file's `IntChan`); other
+        // instantiations (this file's own tests) never call `register`, so
+        // their registries stay empty.
+        //
+        // Channels are never removed from the registry: v1 has no explicit
+        // channel-free primitive (§11), so a registered channel's backing
+        // memory is process-lifetime — never freed, hence never dangling.
+
+        var registry_lock: sched.SpinLock = .{};
+        var registry_head: ?*Self = null;
+
+        /// Register `self` (which must already be at its final, stable
+        /// address — heap-allocated by the caller) so the GC's root scanner
+        /// will visit it. Not called by `init`: only the ABI's channel
+        /// constructor opts a channel into this bookkeeping.
+        pub fn register(self: *Self) void {
+            registry_lock.acquire();
+            defer registry_lock.release();
+            self.registry_next = registry_head;
+            registry_head = self;
+        }
+
+        /// Visit every registered, `is_ref` channel's currently-buffered
+        /// elements as GC roots via `mark`. Called once per collection from
+        /// root.zig's root scanner.
+        pub fn scanRegistryRoots(mark: *const fn (T) void) void {
+            registry_lock.acquire();
+            defer registry_lock.release();
+            var node = registry_head;
+            while (node) |c| : (node = c.registry_next) { // bounded: one registered channel per link
+                if (c.is_ref) c.forEachBuffered(mark);
+            }
         }
 
         pub fn deinit(self: *Self) void {
@@ -532,7 +582,14 @@ pub fn Chan(comptime T: type) type {
             ctx.self.lock.release();
         }
 
-        pub fn recv(self: *Self, sp: *sched.Scheduler) struct { value: T, ok: bool } {
+        /// Named (not an inline anonymous struct literal) so `recvNilable`
+        /// can declare the identical return type: two separately-written
+        /// `struct { value: T, ok: bool }` literals are distinct nominal
+        /// types to Zig even when structurally identical, which previously
+        /// broke `recvNilable`'s direct `return self.recv(sp)`.
+        pub const RecvResult = struct { value: T, ok: bool };
+
+        pub fn recv(self: *Self, sp: *sched.Scheduler) RecvResult {
             self.lock.acquire();
             var value: T = undefined;
             var ok: bool = undefined;
@@ -593,7 +650,7 @@ pub fn Chan(comptime T: type) type {
             self.send(sp, value);
         }
 
-        pub fn recvNilable(maybe_self: ?*Self, sp: *sched.Scheduler) struct { value: T, ok: bool } {
+        pub fn recvNilable(maybe_self: ?*Self, sp: *sched.Scheduler) RecvResult {
             const self = maybe_self orelse {
                 sched.park(null, null);
                 unreachable;
@@ -681,8 +738,34 @@ pub fn Chan(comptime T: type) type {
         pub fn sendCase(self: *Self, value: *const T) SelectCase {
             return .{ .dir = .send, .chan = @ptrCast(self), .elem = @ptrCast(@constCast(value)), .vtable = &vtable };
         }
+
+        /// Visits every currently-buffered element, in queue order, under the
+        /// channel's own lock. A buffered value that is itself a GC reference
+        /// is reachable only through this buffer while it sits unreceived —
+        /// not from any stack — so `runtime/ABI.md` §11 has the GC's root
+        /// scanner call this to keep such values alive. Read-only: `visit`
+        /// must not block or re-enter the channel.
+        pub fn forEachBuffered(self: *Self, visit: *const fn (T) void) void {
+            self.lock.acquire();
+            defer self.lock.release();
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) visit(self.buf[(self.head + i) % self.cap]);
+        }
     };
 }
+
+/// The ABI's one channel element type (ABI.md §11): every `chan<T>` in a Bit
+/// program is realized at the runtime boundary as a channel of this single
+/// 8-byte word, whatever `T` actually is. A `T` that fits in 8 bytes (every
+/// integer width, `bool`, `f64`, and every reference type) is carried by
+/// value, bit-reinterpreted; a `T` that does not fit is out of scope for v1
+/// channels — box it in a GC object and send the (8-byte) reference instead.
+/// This is what makes a single prebuilt `libbitrt.a` able to serve `chan<T>`
+/// for every monomorphized `T` a Bit program ever declares, without the
+/// runtime archive needing per-`T` instantiations it cannot know ahead of
+/// time. Named `WordChan` (not `IntChan`) to stay clear of this file's own
+/// unrelated per-test `IntChan` locals below.
+pub const WordChan = Chan(u64);
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -745,7 +828,7 @@ test "buffered channel: FIFO order and ring-buffer wraparound" {
         var ok_count: std.atomic.Value(usize) = .init(0);
         var done: std.atomic.Value(bool) = .init(false);
 
-        fn run(_: ?*anyopaque) void {
+        fn run(_: ?*anyopaque) callconv(.c) void {
             // Fill to capacity, drain, then wrap the ring buffer around at
             // least once — exercises `head`/`count` modulo arithmetic.
             var sent: i64 = 0;
@@ -792,12 +875,12 @@ test "unbuffered channel: producer/consumer, 1,000,000 messages, no loss or reor
         var in_order: bool = true;
         var done: std.atomic.Value(bool) = .init(false);
 
-        fn produce(_: ?*anyopaque) void {
+        fn produce(_: ?*anyopaque) callconv(.c) void {
             var i: u64 = 0;
             while (i < total) : (i += 1) ch_ptr.send(sp, i);
         }
 
-        fn consume(_: ?*anyopaque) void {
+        fn consume(_: ?*anyopaque) callconv(.c) void {
             var i: u64 = 0;
             while (i < total) : (i += 1) {
                 const r = ch_ptr.recv(sp);
@@ -845,7 +928,7 @@ test "select: one ready among three fires the correct arm" {
         var ok: bool = undefined;
         var done: std.atomic.Value(bool) = .init(false);
 
-        fn run(_: ?*anyopaque) void {
+        fn run(_: ?*anyopaque) callconv(.c) void {
             b_ptr.send(sp, 42); // only B has a value ready; A and C are empty.
             var dest_a: i32 = undefined;
             var dest_b: i32 = undefined;
@@ -896,7 +979,7 @@ test "close: wakes every blocked receiver with (zero, false)" {
         var started: std.atomic.Value(usize) = .init(0);
         var woke_correctly: std.atomic.Value(usize) = .init(0);
 
-        fn receive(_: ?*anyopaque) void {
+        fn receive(_: ?*anyopaque) callconv(.c) void {
             _ = started.fetchAdd(1, .monotonic);
             const r = ch_ptr.recv(sp);
             if (!r.ok and r.value == 0) _ = woke_correctly.fetchAdd(1, .monotonic);
@@ -946,7 +1029,7 @@ test "stress: many senders and receivers, total count conserved" {
         var received: std.atomic.Value(usize) = .init(0);
         var checksum: std.atomic.Value(u64) = .init(0);
 
-        fn send(_: ?*anyopaque) void {
+        fn send(_: ?*anyopaque) callconv(.c) void {
             var i: u32 = 0;
             while (i < per_sender) : (i += 1) {
                 ch_ptr.send(sp, i);
@@ -958,7 +1041,7 @@ test "stress: many senders and receivers, total count conserved" {
         // channel closed and the buffer is drained — the standard fan-in
         // shutdown, and the only deadlock-free way to end a receiver whose
         // channel might otherwise still have more values coming.
-        fn recv(_: ?*anyopaque) void {
+        fn recv(_: ?*anyopaque) callconv(.c) void {
             while (true) {
                 const r = ch_ptr.recv(sp);
                 if (!r.ok) return;

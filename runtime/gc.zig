@@ -6,7 +6,7 @@
 //! all-objects list so sweep can walk the whole heap in one pass.
 //!
 //! Precision comes from two compiler-emitted tables, defined in `runtime/ABI.md`:
-//!   * per-type pointer maps (`TypeInfo.ptr_offsets`) — which fields of an object
+//!   * per-type pointer maps (`TypeInfo.ptrOffsets()`) — which fields of an object
 //!     are GC references, so tracing follows only real pointers;
 //!   * per-callsite stack maps — which stack/register slots hold live references
 //!     at a safepoint, surfaced to the collector through `RootScanner`.
@@ -26,19 +26,47 @@ const heap_mod = @import("alloc.zig");
 const Heap = heap_mod.Heap;
 
 /// Per-type layout descriptor emitted by the compiler, one static instance per
-/// distinct (monomorphized) type. See `runtime/ABI.md` for the binary contract.
+/// distinct (monomorphized) type. See `runtime/ABI.md` §2 for the binary
+/// contract.
 ///
-/// `ptr_offsets` lists the byte offset, within the object body, of every field
-/// that holds a GC reference. Offsets must be pointer-aligned and lie fully
-/// inside the body. Fields that are not GC references are absent; the collector
-/// never inspects them.
-pub const TypeInfo = struct {
+/// `extern` and split into raw `ptr`/`len` pairs (not Zig `[]const T` slices):
+/// this struct is written directly into an object file's `.rodata` by
+/// codegen — a different compiler than the one building this runtime — so
+/// its layout must be a frozen, language-neutral contract, not whatever
+/// in-memory shape Zig slices happen to have today.
+///
+/// `ptr_offsets` (via `ptrOffsets()`) lists the byte offset, within the object
+/// body, of every field that holds a GC reference. Offsets must be
+/// pointer-aligned and lie fully inside the body. Fields that are not GC
+/// references are absent; the collector never inspects them.
+pub const TypeInfo = extern struct {
     /// Object body size in bytes, excluding the GC header.
     size: usize,
-    /// Byte offsets of GC-reference fields within the body.
-    ptr_offsets: []const usize,
-    /// Static type name, for stats/debugging only. May be empty.
-    name: []const u8 = "",
+    ptr_offsets_ptr: [*]const usize,
+    ptr_offsets_len: usize,
+    /// Static type name, for stats/debugging only. May be empty (`name_len == 0`).
+    name_ptr: [*]const u8,
+    name_len: usize,
+
+    /// Zig-side convenience constructor from ordinary slices. Codegen instead
+    /// writes the four raw fields directly into static data.
+    pub fn of(size: usize, ptr_offsets: []const usize, name: []const u8) TypeInfo {
+        return .{
+            .size = size,
+            .ptr_offsets_ptr = ptr_offsets.ptr,
+            .ptr_offsets_len = ptr_offsets.len,
+            .name_ptr = name.ptr,
+            .name_len = name.len,
+        };
+    }
+
+    pub fn ptrOffsets(self: *const TypeInfo) []const usize {
+        return self.ptr_offsets_ptr[0..self.ptr_offsets_len];
+    }
+
+    pub fn typeName(self: *const TypeInfo) []const u8 {
+        return self.name_ptr[0..self.name_len];
+    }
 };
 
 /// Root-scanning interface — the runtime side of the stack-map contract.
@@ -279,7 +307,7 @@ pub const Gc = struct {
 
     fn scanObject(self: *Gc, h: *GcHeader) void {
         const body = bodyFromHeader(h);
-        const offs = h.info.ptr_offsets;
+        const offs = h.info.ptrOffsets();
         var i: usize = 0;
         while (i < offs.len) : (i += 1) { // bounded: num_ptrs for this type
             const off = offs[i];
@@ -375,11 +403,11 @@ const testing = std.testing;
 
 /// Two-pointer node body: children at offsets 0 and 8.
 const node_offsets = [_]usize{ 0, 8 };
-const node_info = TypeInfo{ .size = 16, .ptr_offsets = &node_offsets, .name = "Node" };
+const node_info = TypeInfo.of(16, &node_offsets, "Node");
 
 /// Eight-pointer node body: fans out wide enough to overflow a small worklist.
 const wide_offsets = [_]usize{ 0, 8, 16, 24, 32, 40, 48, 56 };
-const wide_info = TypeInfo{ .size = 64, .ptr_offsets = &wide_offsets, .name = "Wide" };
+const wide_info = TypeInfo.of(64, &wide_offsets, "Wide");
 
 fn setPtr(body: [*]u8, off: usize, target: ?[*]u8) void {
     const slot: *?[*]u8 = @ptrCast(@alignCast(body + off));

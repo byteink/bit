@@ -128,7 +128,12 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
 // Task: one green thread
 // ---------------------------------------------------------------------------
 
-pub const TaskFn = *const fn (arg: ?*anyopaque) void;
+/// `callconv(.c)`: a spawned task's body eventually runs codegen-emitted
+/// (non-Zig) machine code, and `root.zig`'s `bit_rt_spawn` takes this exact
+/// type as one of its two ABI-facing parameters (`runtime/ABI.md` §9) — a
+/// plain-Zig-callconv function pointer has no cross-language-stable ABI to
+/// promise there.
+pub const TaskFn = *const fn (arg: ?*anyopaque) callconv(.c) void;
 
 pub const TaskState = enum(u8) { runnable, running, parked, done };
 
@@ -312,7 +317,9 @@ fn closeFd(fd: std.posix.fd_t) void {
     }
 }
 
-fn writeFd(fd: std.posix.fd_t, buf: []const u8) !usize {
+/// `pub`: also used by `root.zig`'s panic protocol to write to stderr without
+/// a libc dependency (same rationale as this file's own use below).
+pub fn writeFd(fd: std.posix.fd_t, buf: []const u8) !usize {
     switch (builtin.os.tag) {
         .linux => {
             const rc = std.os.linux.write(fd, buf.ptr, buf.len);
@@ -343,7 +350,9 @@ pub fn monoNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-fn sleepNs(ns: u64) void {
+/// `pub`: also used by `root.zig`'s boot sequence to poll for the main task's
+/// completion (same raw-syscall rationale as this file's own use below).
+pub fn sleepNs(ns: u64) void {
     const req: std.posix.timespec = .{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
@@ -815,7 +824,7 @@ test "GlobalQueue: FIFO order" {
     try testing.expect(gq.pop() == null);
 }
 
-fn incTask(arg: ?*anyopaque) void {
+fn incTask(arg: ?*anyopaque) callconv(.c) void {
     const counter: *std.atomic.Value(usize) = @ptrCast(@alignCast(arg));
     _ = counter.fetchAdd(1, .monotonic);
 }
@@ -859,13 +868,13 @@ test "park/unpark: a parked task does not block others on the same worker" {
         var parked_task: ?*Task = null;
         var done_count: std.atomic.Value(usize) = .init(0);
 
-        fn parkSelf(_: ?*anyopaque) void {
+        fn parkSelf(_: ?*anyopaque) callconv(.c) void {
             parked_task = Worker.current().running.?;
             park(null, null);
             _ = done_count.fetchAdd(1, .monotonic); // resumes only after unpark()
         }
 
-        fn finishQuick(_: ?*anyopaque) void {
+        fn finishQuick(_: ?*anyopaque) callconv(.c) void {
             _ = done_count.fetchAdd(1, .monotonic);
         }
     };
@@ -930,7 +939,7 @@ test "netpoller: register on a pipe wakes the parked task" {
             sched_ptr.poller.register(read_fd, .read, t) catch unreachable;
         }
 
-        fn waitOnPipe(_: ?*anyopaque) void {
+        fn waitOnPipe(_: ?*anyopaque) callconv(.c) void {
             park(registerSetup, null);
             var byte: [1]u8 = undefined;
             _ = std.posix.read(read_fd, &byte) catch unreachable;
