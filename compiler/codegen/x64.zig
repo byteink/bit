@@ -492,6 +492,16 @@ const Ctx = struct {
         try self.emitByte(0x90 | @as(u8, cc));
         try self.emitByte(modrmRegByte(0, @intFromEnum(r)));
     }
+    /// `movzx dst64, src8` (REX.W 0F B6 /r) — zero-extends the low byte of
+    /// `src` into the full 64-bit `dst`. Used to widen a `setcc` result to a
+    /// clean 0/1 *without* the flag-clobbering `xor` that zeroing-before-setcc
+    /// would need (setcc must read the flags left by the preceding compare).
+    fn movzxb(self: *Ctx, dst: Reg, src: Reg) !void {
+        try self.maybeRex(true, @intFromEnum(dst) >= 8, false, @intFromEnum(src) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xB6);
+        try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
+    }
     fn and8(self: *Ctx, dst: Reg, src: Reg) !void {
         try self.emitByte(rex(false, @intFromEnum(src) >= 8, false, @intFromEnum(dst) >= 8));
         try self.emitByte(0x20);
@@ -1065,43 +1075,47 @@ fn emitIcmp(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId) !
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     const r = try getInt(self, vregOf(self, rhs), scratch2);
     try self.arithRR(.cmp, l, r);
-    try self.zero32(scratch1);
+    // `setcc` must read the flags `cmp` just set — capture the byte first,
+    // then zero-extend it. Zeroing `scratch1` beforehand would clobber those
+    // flags (its `xor` forces ZF=1), making every comparison read as false.
     try self.setcc(icmp_cc.get(op).?, scratch1);
+    try self.movzxb(scratch1, scratch1);
     try putInt(self, dst, scratch1);
 }
 
 fn emitFcmp(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, width: u8) !void {
     const l = try getFloat(self, vregOf(self, lhs), fscratch1);
     const r = try getFloat(self, vregOf(self, rhs), fscratch2);
+    // As in `emitIcmp`, `setcc` must read the flags the `ucomis` just set, so
+    // the destination is widened with a trailing `movzxb` rather than zeroed
+    // up front — a `zero32` between the compare and the `setcc` would clobber
+    // those flags. The eq/ne paths combine two `setcc` bytes (both reading the
+    // same `ucomis` result; `setcc`/`and8`/`or8` on the low byte are enough,
+    // and the final `movzxb` produces a clean 0/1).
     switch (op) {
         .fcmp_gt, .fcmp_ge => {
             try self.ucomis(l, r, width);
-            try self.zero32(scratch1);
             try self.setcc(if (op == .fcmp_gt) CC.a else CC.ae, scratch1);
         },
         .fcmp_lt, .fcmp_le => {
             try self.ucomis(r, l, width); // swapped: lhs<rhs === rhs>lhs
-            try self.zero32(scratch1);
             try self.setcc(if (op == .fcmp_lt) CC.a else CC.ae, scratch1);
         },
         .fcmp_eq => {
             try self.ucomis(l, r, width);
-            try self.zero32(scratch1);
-            try self.zero32(scratch2);
             try self.setcc(CC.np, scratch2); // ordered
             try self.setcc(CC.e, scratch1); // equal
             try self.and8(scratch1, scratch2);
         },
         .fcmp_ne => {
             try self.ucomis(l, r, width);
-            try self.zero32(scratch1);
-            try self.zero32(scratch2);
             try self.setcc(CC.p, scratch2); // unordered
             try self.setcc(CC.ne, scratch1); // not equal
             try self.or8(scratch1, scratch2);
         },
         else => unreachable,
     }
+    try self.movzxb(scratch1, scratch1);
     try putInt(self, dst, scratch1);
 }
 
@@ -1251,6 +1265,39 @@ fn emitParamMoves(self: *Ctx, target: ir.BlockId, args: []const u32) !void {
     try sequentializeAndEmit(self, float_moves.items, .float);
 }
 
+/// Binds the incoming argument registers (per `self.cc`) into the entry
+/// block's param vregs, as one parallel move per class — the mirror image of
+/// `emitParamMoves`, but the sources are the ABI argument registers rather
+/// than another block's values (`arm64.zig` does the equivalent in its
+/// prologue). Without this the entry params hold whatever the allocator left
+/// in their registers, so every function that reads its own parameters
+/// returns garbage. Emitted right after the prologue, whose only register
+/// writes are to callee-saved GPRs and rbp/rsp — never an argument register —
+/// so the incoming values are still live here.
+fn bindIncomingArgs(self: *Ctx) !void {
+    const entry = self.f.block(self.f.entry);
+    var int_moves: std.ArrayList(PMove) = .empty;
+    defer int_moves.deinit(self.gpa);
+    var float_moves: std.ArrayList(PMove) = .empty;
+    defer float_moves.deinit(self.gpa);
+
+    var int_ordinal: u32 = 0;
+    var float_ordinal: u32 = 0;
+    var p: u32 = 0;
+    while (p < entry.param_count) : (p += 1) {
+        const param_val = entry.paramValue(p);
+        const class = classOf(self.tctx(), self.f.valueType(param_val));
+        const ordinal = if (class == .int) int_ordinal else float_ordinal;
+        const reg = argReg(self.cc, class, p, ordinal) orelse return error.TooManyArguments;
+        if (class == .int) int_ordinal += 1 else float_ordinal += 1;
+        const to = plocOf(self, vregOf(self, param_val), class);
+        const list = if (class == .int) &int_moves else &float_moves;
+        try list.append(self.gpa, .{ .from = .{ .reg = reg }, .to = to });
+    }
+    try sequentializeAndEmit(self, int_moves.items, .int);
+    try sequentializeAndEmit(self, float_moves.items, .float);
+}
+
 /// True iff `target` is a loop back-edge from the block currently being
 /// emitted (`ir.zig`/`regalloc.zig`'s shared heuristic: a jump/br whose
 /// target's index is <= the branching block's own — see the module doc
@@ -1362,10 +1409,13 @@ fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallRet
     // alignment the frame prologue already established.
     if (self.cc == .win64) try self.rspAddSub(true, 32);
     try self.emitCallReloc(symbol);
-    if (self.cc == .win64) try self.rspAddSub(false, 32);
-
+    // The safepoint's code offset is the return address — the byte right
+    // after the call, before any home-space teardown. Recording it after the
+    // Win64 `add rsp,32` would push it 7 bytes past the real return address
+    // and corrupt stack-map lookups during a GC triggered by the callee.
     self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
     self.next_safepoint_idx += 1;
+    if (self.cc == .win64) try self.rspAddSub(false, 32);
 
     if (ret) |r| {
         switch (classOf(self.tctx(), r.ty)) {
@@ -1709,6 +1759,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     errdefer ctx.jump_fixups.deinit(gpa);
 
     try emitPrologue(&ctx);
+    try bindIncomingArgs(&ctx);
     for (f.blocks, 0..) |blk, bi| {
         ctx.cur_block_idx = @intCast(bi);
         ctx.block_offsets[bi] = @intCast(ctx.code.items.len);
@@ -1895,6 +1946,14 @@ test "setcc always forces a REX prefix" {
     try testing.expectEqualSlices(u8, &.{ 0x40, 0x0F, 0x94, 0xC0 }, ctx.code.items);
 }
 
+test "movzxb encodes REX.W + MOVZX r64,r/m8" {
+    const gpa = testing.allocator;
+    var ctx = testCtx(gpa);
+    defer ctx.code.deinit(gpa);
+    try ctx.movzxb(.rax, .rax); // movzx rax, al
+    try testing.expectEqualSlices(u8, &.{ 0x48, 0x0F, 0xB6, 0xC0 }, ctx.code.items);
+}
+
 test "movFRR encodes movsd for width 8" {
     const gpa = testing.allocator;
     var ctx = testCtx(gpa);
@@ -2008,6 +2067,42 @@ test "compileFunction: branch + block params select max(a, b)" {
     try testing.expectEqual(@as(i64, 5), fn_ptr(5, 5));
 }
 
+test "compileFunction: icmp_sgt yields a clean 0/1 without clobbering the compare flags" {
+    // Regression guard: `setcc` reads the flags the `cmp` set, so the result
+    // must be widened afterward — zeroing the destination first (an `xor`)
+    // would force ZF=1 and make every comparison read false.
+    if (!can_exec_native) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tctx = try TypeContext.init(gpa);
+    defer tctx.deinit();
+    const i64_ty = tctx.prim_ids.get(.i64);
+    const bool_ty = tctx.prim_ids.get(.bool);
+
+    var module = ir.Module.init(gpa, &tctx);
+    defer module.deinit();
+
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const p0 = try b.addParam(i64_ty);
+    const p1 = try b.addParam(i64_ty);
+    const gt = try b.binary(.icmp_sgt, bool_ty, p0, p1);
+    try b.ret(&.{gt});
+    b.endBlock();
+    var f = try b.finish("gt", &.{ i64_ty, i64_ty }, bool_ty, false, .invalid, entry);
+    defer f.deinit(gpa);
+
+    var code = try compileFunction(gpa, &module, &f, .sysv);
+    defer code.deinit();
+
+    const mem = try mmapExec(code.code);
+    defer std.posix.munmap(mem);
+    const fn_ptr: *const fn (i64, i64) callconv(.c) i64 = @ptrCast(mem.ptr);
+    try testing.expectEqual(@as(i64, 1), fn_ptr(9, 4));
+    try testing.expectEqual(@as(i64, 0), fn_ptr(4, 9));
+    try testing.expectEqual(@as(i64, 0), fn_ptr(5, 5));
+}
+
 test "compileFunction: a loop back-edge records one safepoint per iteration site" {
     // sum(n) { total = 0; i = 0; while (i < n) { total += i; i += 1 }; return total }
     // Exercises loop-carried block-param rotation and back-edge safepoint
@@ -2104,6 +2199,41 @@ test "compileFunction: field_get loads a typed value at a byte offset" {
     try testing.expectEqual(@as(i64, 222), fn_ptr(@intCast(@intFromPtr(&backing[0]))));
 }
 
+test "compileFunction: index_get on a static array base loads the element" {
+    if (!can_exec_native) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tctx = try TypeContext.init(gpa);
+    defer tctx.deinit();
+    const i64_ty = tctx.prim_ids.get(.i64);
+    const arr_ty = try tctx.arrayType(3, i64_ty); // a real `.array` — the positive path
+
+    var module = ir.Module.init(gpa, &tctx);
+    defer module.deinit();
+
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const base = try b.addParam(arr_ty);
+    const idx = try b.addParam(i64_ty);
+    const v = try b.indexGet(i64_ty, base, idx);
+    try b.ret(&.{v});
+    b.endBlock();
+    var f = try b.finish("at", &.{ arr_ty, i64_ty }, i64_ty, false, .invalid, entry);
+    defer f.deinit(gpa);
+
+    var code = try compileFunction(gpa, &module, &f, .sysv);
+    defer code.deinit();
+
+    const mem = try mmapExec(code.code);
+    defer std.posix.munmap(mem);
+    const fn_ptr: *const fn (*const i64, i64) callconv(.c) i64 = @ptrCast(mem.ptr);
+
+    const backing = [_]i64{ 10, 20, 30 };
+    try testing.expectEqual(@as(i64, 10), fn_ptr(&backing[0], 0));
+    try testing.expectEqual(@as(i64, 20), fn_ptr(&backing[0], 1));
+    try testing.expectEqual(@as(i64, 30), fn_ptr(&backing[0], 2));
+}
+
 test "compileFunction: index_get on a non-array base is unsupported" {
     const gpa = testing.allocator;
     var tctx = try TypeContext.init(gpa);
@@ -2149,15 +2279,18 @@ test "compileFunction: a multi-value ret is unsupported" {
     try testing.expectError(error.UnsupportedConstruct, compileFunction(gpa, &module, &f, .sysv));
 }
 
-test "compileFunction: gc_alloc is unsupported (no TypeInfo ABI yet)" {
-    // `gc_alloc` is rejected unconditionally regardless of the type being
-    // allocated (module doc comment) — a scalar `TypeId` exercises the same
-    // rejection path as a real `.array`/`.struct` one without reaching into
-    // `check.zig`'s package-private `TypeTable.intern`.
+test "compileFunction: a Win64 call records its safepoint at the return address, before the home-space restore" {
+    // Structural (not executed — the runtime symbol is unresolved until a
+    // linker exists). A Win64 `call` is bracketed by `sub rsp,32` / `add
+    // rsp,32` home-space adjustments; the safepoint's code offset must be the
+    // return address (right after the 5-byte `E8 rel32`), NOT after the
+    // trailing `add rsp,32`, or a GC stack-map lookup keyed on the return
+    // address would miss by the 7 bytes of that restore.
     const gpa = testing.allocator;
     var tctx = try TypeContext.init(gpa);
     defer tctx.deinit();
     const i64_ty = tctx.prim_ids.get(.i64);
+    const string_ty = tctx.prim_ids.get(.string);
 
     var module = ir.Module.init(gpa, &tctx);
     defer module.deinit();
@@ -2165,7 +2298,42 @@ test "compileFunction: gc_alloc is unsupported (no TypeInfo ABI yet)" {
     var b = ir.FunctionBuilder.init(gpa);
     const entry = try b.newBlock();
     b.beginBlock(entry);
-    const v = try b.gcAlloc(i64_ty, 8, &.{});
+    const n = try b.addParam(i64_ty);
+    const s = try b.rtCall(string_ty, .string_from_int, &.{n}); // a real call → one safepoint
+    try b.ret(&.{s});
+    b.endBlock();
+    var f = try b.finish("toStr", &.{i64_ty}, string_ty, false, .invalid, entry);
+    defer f.deinit(gpa);
+
+    var code = try compileFunction(gpa, &module, &f, .win64);
+    defer code.deinit();
+
+    try testing.expectEqual(@as(usize, 1), code.safepoints.len);
+    const sp = code.safepoints[0].code_offset;
+    // The 5 bytes ending at `sp` are the call; the bytes starting at `sp` are
+    // the `add rsp,32` home-space restore (48 81 C4 ...).
+    try testing.expectEqual(@as(u8, 0xE8), code.code[sp - 5]);
+    try testing.expectEqualSlices(u8, &.{ 0x48, 0x81, 0xC4 }, code.code[sp .. sp + 3]);
+}
+
+test "compileFunction: gc_alloc is unsupported (no TypeInfo ABI yet)" {
+    // `gc_alloc` is rejected unconditionally regardless of the type being
+    // allocated (module doc comment); allocate a real aggregate `.array` type
+    // so the rejection is exercised on the exact shape the front end emits it
+    // for, not a scalar stand-in.
+    const gpa = testing.allocator;
+    var tctx = try TypeContext.init(gpa);
+    defer tctx.deinit();
+    const i64_ty = tctx.prim_ids.get(.i64);
+    const arr_ty = try tctx.arrayType(4, i64_ty);
+
+    var module = ir.Module.init(gpa, &tctx);
+    defer module.deinit();
+
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const v = try b.gcAlloc(arr_ty, 32, &.{});
     try b.ret(&.{v});
     b.endBlock();
     var f = try b.finish("bad", &.{}, i64_ty, false, .invalid, entry);

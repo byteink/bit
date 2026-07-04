@@ -487,6 +487,15 @@ pub const TypeContext = struct {
         return self.types.get(id);
     }
 
+    /// Interns the fixed-length array type `elem[len]`. A thin public wrapper
+    /// over the table's own interning (which the checker reaches directly);
+    /// exposed so consumers that already hold a `TypeContext` — e.g. the
+    /// codegen backends' tests — can name a real `.array` type without
+    /// routing a source string through the whole front end.
+    pub fn arrayType(self: *TypeContext, len: u64, elem: TypeId) Error!TypeId {
+        return self.types.intern(.{ .array = .{ .len = len, .elem = elem } });
+    }
+
     fn arena(self: *TypeContext) Allocator {
         return self.types.arena.allocator();
     }
