@@ -701,7 +701,7 @@ const Ctx = struct {
     }
     fn emitCondJumpFixup(self: *Ctx, cond: u4, target: ir.BlockId) !void {
         const off: u32 = @intCast(self.code.items.len);
-        try self.emitWord(0x54000000 | cond); // B.cond, imm19=0 placeholder
+        try self.emitWord(0x54000000 | @as(u32, cond)); // B.cond, imm19=0 placeholder
         try self.jump_fixups.append(self.gpa, .{ .patch_offset = off, .cond = cond, .target = target });
     }
 
@@ -712,7 +712,7 @@ const Ctx = struct {
     /// end against `block_offsets`).
     fn emitLocalCondBranch(self: *Ctx, cond: u4) !u32 {
         const off: u32 = @intCast(self.code.items.len);
-        try self.emitWord(0x54000000 | cond);
+        try self.emitWord(0x54000000 | @as(u32, cond));
         return off;
     }
     fn patchLocalCondBranch(self: *Ctx, patch_offset: u32) void {
@@ -1366,7 +1366,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .unreachable_ => try self.udf(),
         .call => |c| {
             const target = self.module.func(c.func);
-            try emitCall(self, if (ty != .invalid) i else null, ty, target.name, c.args, false);
+            try emitCall(self, if (ty != .invalid) i else null, ty, target.name, c.args, true);
         },
         .call_value, .call_iface => return error.UnsupportedConstruct,
         .gc_alloc => return error.UnsupportedConstruct,
@@ -1376,7 +1376,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .index_set => |is_| try emitIndexSet(self, is_.base, is_.index, is_.value, self.f.valueType(is_.value)),
         .slice_len => return error.UnsupportedConstruct,
         .make_closure => return error.UnsupportedConstruct,
-        .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, false),
+        .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
     }
 }
 
@@ -1400,7 +1400,7 @@ fn hasCalls(f: *const ir.Function) bool {
 /// back-edge terminators) so the emission pass can match each
 /// `regalloc.Result.stack_maps` entry back to its `bl` by cursor position.
 fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Function, safepoints: *std.ArrayList(u32)) Allocator.Error![]regalloc.Interval {
-    const n = f.insts.len();
+    const n = f.insts.len;
     const intervals = try gpa.alloc(regalloc.Interval, n);
     for (0..n) |i| {
         const ty = f.insts.items(.ty)[i];
@@ -2066,4 +2066,37 @@ test "jump/branch fixups patch to the correct relative word offset" {
     ctx.patchJumpFixups();
     const got = std.mem.readInt(u32, ctx.code.items[0..4], .little);
     try testing.expectEqual(@as(u32, 0x14000000 | (1048 / 4)), got);
+}
+
+// Regression for the desync between `buildIntervals`'s safepoint-position
+// list and `emitCall`'s actual emission: a real `rt_call` with no loop
+// back-edge in the same function used to get zero recorded safepoints (see
+// this file's module doc comment / `runtime/ABI.md` §5, which both require
+// one at *every* call/rt_call) even though `buildIntervals` already counted
+// it and handed regalloc a stack map for it — a GC pausing at that call's
+// return address would find `FuncCode.safepoints` empty and scan nothing.
+test "compileFunction records a safepoint at a real rt_call with no back-edge" {
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+    const string_ty = ctx.prim_ids.get(.string);
+
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const p0 = try b.addParam(i64_ty);
+    const s = try b.rtCall(string_ty, .string_from_int, &.{p0});
+    try b.ret(&.{s});
+    b.endBlock();
+    var f = try b.finish("f", &.{i64_ty}, string_ty, false, .invalid, entry);
+    defer f.deinit(gpa);
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+
+    var code = try compileFunction(gpa, &module, &f);
+    defer code.deinit();
+
+    try testing.expectEqual(@as(usize, 1), code.safepoints.len);
 }
