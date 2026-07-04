@@ -168,6 +168,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(opt_tests).step);
 
+    // Rooted at `compiler/` (not `compiler/obj/`) via the anchor file, so
+    // `pe.zig`'s `../codegen/x64.zig` import resolves — see that file's doc
+    // comment and `obj_pe_test.zig`'s.
+    const pe_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/obj_pe_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(pe_tests).step);
+
     // Standalone object writer (task #343): no imports outside `std`. Its
     // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
     // hosts (those tools don't exist there), so this is safe on every CI host.
