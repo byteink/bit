@@ -115,6 +115,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(regalloc_tests).step);
 
+    // Rooted at `compiler/` (not `compiler/codegen/`) via the anchor file, so
+    // `arm64.zig`/`common.zig`'s `../ir.zig`-style imports resolve — see that
+    // file's doc comment. Covers both files: `arm64.zig` imports `common.zig`.
+    const arm64_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/codegen_arm64_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(arm64_tests).step);
+
     // Golden-file harness: discovers tests/cases/*.bit and checks each against
     // its sibling .expected. The cases directory (absolute) is injected as a
     // build option so the runner is independent of the process cwd.
