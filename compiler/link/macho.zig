@@ -843,11 +843,12 @@ test "links the real aarch64 runtime + a bit_main into a signed image that boots
         else => return err,
     };
 
-    // A synthetic Bit program: `bit_main` = `mov w0,#0 ; ret` (exit code 0).
+    // A synthetic Bit program: `bit_main` = `mov w0,#42 ; ret` (exit code 42).
     // Linked against the real runtime, this exercises the entire macOS path —
     // reader, TLV, GOT/stubs, binds, signature — and the runtime actually
-    // booting (heap, GC, scheduler + a worker thread using thread-locals).
-    const code = [_]u8{ 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6 };
+    // booting (heap, GC, scheduler + a worker thread using thread-locals) and
+    // propagating bit_main's return value out as the process exit code.
+    const code = [_]u8{ 0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6 };
     var atoms = [_]object.Atom{
         .{ .name = "_bit_main", .kind = .text, .binding = .global, .data = &code, .size = code.len, .alignment = 4, .relocs = &.{} },
     };

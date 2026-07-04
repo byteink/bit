@@ -63,7 +63,12 @@ comptime {
 /// around the switch (see module doc comment).
 const Context = switch (builtin.cpu.arch) {
     .x86_64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0 },
-    .aarch64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0 },
+    // AArch64 additionally saves `x30` (the link register): unlike x86-64,
+    // where the return address lives on the stack, on AArch64 the compiler can
+    // and does keep a live value in `x30` across the switch, and an inline-asm
+    // *clobber* of `x30` is not reliably honored by LLVM — so the switch must
+    // preserve it explicitly (like `fp`), not merely declare it clobbered.
+    .aarch64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0, lr: u64 = 0 },
     else => unreachable, // gated by the comptime check above
 };
 
@@ -86,21 +91,27 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
             \\ ldr x3, [x2, #16]
             \\ mov x4, sp
             \\ stp x4, fp, [x0]
+            \\ str x30, [x0, #24]
             \\ adr x5, 0f
             \\ ldp x4, fp, [x2]
+            \\ ldr x30, [x2, #24]
             \\ str x5, [x0, #16]
             \\ mov sp, x4
             \\ br x3
             \\0:
             : [received_message] "={x1}" (-> *const Switch),
             : [message_to_send] "{x1}" (s),
+            // `x30` is deliberately NOT clobbered: the switch saves and restores
+            // it (offset 24 in `Context`), so it is genuinely preserved across
+            // the switch — declaring it clobbered instead is what previously
+            // let LLVM stash a live `Worker*` there and lose it on resume.
             : .{
                 .x0 = true,  .x2 = true,  .x3 = true,  .x4 = true,  .x5 = true,
                 .x6 = true,  .x7 = true,  .x8 = true,  .x9 = true,  .x10 = true,
                 .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
                 .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
                 .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true,
+                .x27 = true, .x28 = true, .x29 = true, .memory = true,
             }),
         .x86_64 => asm volatile (
             \\ movq 0(%%rsi), %%rax
@@ -187,7 +198,9 @@ fn initialContext(stack_top: usize) Context {
     // mapping top already is (page-aligned, stack_size a multiple of 16).
     return switch (builtin.cpu.arch) {
         .x86_64 => .{ .sp = stack_top - 8, .fp = 0, .pc = @intFromPtr(&trampoline) },
-        .aarch64 => .{ .sp = stack_top, .fp = 0, .pc = @intFromPtr(&trampoline) },
+        // A fresh task enters `trampoline` by a plain jump; it never returns via
+        // `x30`, so the initial link register is just 0.
+        .aarch64 => .{ .sp = stack_top, .fp = 0, .pc = @intFromPtr(&trampoline), .lr = 0 },
         else => unreachable,
     };
 }
