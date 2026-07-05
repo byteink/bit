@@ -194,6 +194,13 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     return 0;
 }
 
+/// Builds `source` into a native executable's bytes for the host target,
+/// linking `libbitrt` — the entry the golden `// run` harness uses. Returns
+/// `null` (diagnostics written to `err_out`) if compilation failed.
+pub fn buildHostExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
+    return buildExecutable(gpa, path, source, libbitrt, host_target, err_out);
+}
+
 /// Drives one source buffer through the whole compiler — front-end (parse,
 /// resolve, check), then lower -> optimize -> codegen/object -> link — into a
 /// runnable executable's bytes. Returns `null` (after rendering diagnostics to

@@ -317,8 +317,15 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .x86_64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     };
+    // The host test target always matches one of the four above, so the golden
+    // `// run` harness reuses that archive to link and execute real binaries
+    // under `zig build test`. Captured in the loop; stays empty (run-cases skip)
+    // if the host is not a supported runtime target.
+    var host_libbitrt_path: []const u8 = "";
+    var host_libbitrt_install: ?*std.Build.Step = null;
     for (libbitrt_targets) |query| {
         const rt_target = b.resolveTargetQuery(query);
+        const triple = query.zigTriple(b.allocator) catch @panic("OOM");
         // The runtime archive's build settings are fixed regardless of the
         // top-level `-Doptimize` a user passes: the static linker (#345)
         // consumes this, and its object reader deliberately handles only the
@@ -360,8 +367,19 @@ pub fn build(b: *std.Build) void {
         lib.link_function_sections = true;
         lib.link_data_sections = true;
         const install = b.addInstallArtifact(lib, .{
-            .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{query.zigTriple(b.allocator) catch @panic("OOM")}) } },
+            .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{triple}) } },
         });
         libbitrt_step.dependOn(&install.step);
+
+        if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
+            host_libbitrt_path = b.getInstallPath(.{ .custom = b.fmt("lib/{s}", .{triple}) }, "libbitrt.a");
+            host_libbitrt_install = &install.step;
+        }
     }
+
+    // Hand the golden harness the host archive (absolute path) and make the
+    // run-cases depend on it existing, so `// run` cases execute under
+    // `zig build test` rather than silently skipping.
+    golden_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
+    if (host_libbitrt_install) |inst| golden_tests.step.dependOn(inst);
 }

@@ -73,7 +73,6 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
         std.debug.print("case '{s}': line 1 must be '// run', '// error', '// fmt', or '// types'\n", .{name});
         return error.MissingDirective;
     };
-    if (directive == .run) return .skipped;
 
     const expected_name = try std.fmt.allocPrint(gpa, "{s}.expected", .{name[0 .. name.len - ".bit".len]});
     defer gpa.free(expected_name);
@@ -85,7 +84,59 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
     defer gpa.free(expected);
 
     switch (directive) {
-        .run => unreachable, // handled above
+        .run => {
+            // Skip when the host is not a supported runtime target (no archive
+            // to link against — build.zig leaves `libbitrt_path` empty then).
+            if (build_options.libbitrt_path.len == 0) return .skipped;
+
+            // A dedicated `Io.Threaded` over `gpa` (not the shared global io):
+            // `std.process.run`'s spawn arena is backed by the io's allocator,
+            // and mixing the global io's allocator with the per-test
+            // `testing.allocator` trips its leak detector. This mirrors the e2e
+            // test in main.zig.
+            var run_threaded = Io.Threaded.init(gpa, .{});
+            defer run_threaded.deinit();
+            const run_io = run_threaded.io();
+
+            const libbitrt = Dir.cwd().readFileAlloc(run_io, build_options.libbitrt_path, gpa, .limited(16 << 20)) catch |e| {
+                std.debug.print("case '{s}': cannot read libbitrt '{s}': {s}\n", .{ name, build_options.libbitrt_path, @errorName(e) });
+                return e;
+            };
+            defer gpa.free(libbitrt);
+
+            var discard: Io.Writer.Allocating = .init(gpa);
+            defer discard.deinit();
+            const exe = (try bitc.buildHostExecutable(gpa, name, source, libbitrt, &discard.writer)) orelse {
+                std.debug.print("case '{s}': expected compile to succeed, got diagnostics:\n{s}\n", .{ name, discard.written() });
+                return error.RunCompileFailed;
+            };
+            defer gpa.free(exe);
+
+            const stem = name[0 .. name.len - ".bit".len];
+            const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-golden-{s}", .{stem}, 0);
+            defer gpa.free(bin_path);
+            try Dir.cwd().writeFile(run_io, .{
+                .sub_path = bin_path,
+                .data = exe,
+                .flags = .{ .permissions = .executable_file },
+            });
+            defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
+
+            const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path} });
+            defer gpa.free(result.stdout);
+            defer gpa.free(result.stderr);
+            const code: u8 = switch (result.term) {
+                .exited => |c| c,
+                else => 255,
+            };
+            if (code != 0) {
+                std.debug.print("case '{s}': binary exited with {d}\nstderr: {s}\n", .{ name, code, result.stderr });
+                return error.RunFailed;
+            }
+            if (!std.mem.eql(u8, expected, result.stdout))
+                std.debug.print("case '{s}' stdout mismatch:\n", .{name});
+            try testing.expectEqualStrings(expected, result.stdout);
+        },
         .err => {
             const report = try bitc.compileReport(gpa, name, source);
             defer gpa.free(report.text);
