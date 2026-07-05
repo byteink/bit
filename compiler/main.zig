@@ -162,28 +162,36 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     const exe = (try buildExecutable(gpa, src, source, lib, target, err_out)) orelse return 1;
     defer gpa.free(exe);
 
+    // `bit run` on a binary this host can exec runs it and throws it away, like
+    // `zig run` — it must never litter the cwd. A plain build, or a `run` of a
+    // foreign-target binary that can't exec here, instead keeps the artifact at
+    // `-o`/the source stem.
+    if (is_run and target == host_target) {
+        // ponytail: fixed /tmp name keyed by the stem; two concurrent runs of
+        // the same-named file would collide — add a pid/nonce if that bites.
+        const tmp = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-run-{s}", .{std.fs.path.stem(src)}, 0);
+        defer gpa.free(tmp);
+        try Io.Dir.cwd().writeFile(io, .{
+            .sub_path = tmp,
+            .data = exe,
+            .flags = .{ .permissions = .executable_file },
+        });
+        defer Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        var child = try std.process.spawn(io, .{ .argv = &.{tmp} });
+        return switch (try child.wait(io)) {
+            .exited => |c| c,
+            else => 1,
+        };
+    }
+
     // Output binary: `-o`, else the source stem, written to the cwd.
     const dest = out_path orelse std.fs.path.stem(src);
-    const dest_z = try gpa.dupeZ(u8, dest);
-    defer gpa.free(dest_z);
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = dest_z,
+        .sub_path = dest,
         .data = exe,
         .flags = .{ .permissions = .executable_file },
     });
-
-    // A cross-produced binary can't run on this host; `bit run` for a foreign
-    // target just builds.
-    if (!is_run or target != host_target) return 0;
-
-    // Run it: `execve` needs a slash to resolve a path against the cwd.
-    const run_path = try std.fmt.allocPrintSentinel(gpa, "./{s}", .{dest_z}, 0);
-    defer gpa.free(run_path);
-    var child = try std.process.spawn(io, .{ .argv = &.{run_path} });
-    return switch (try child.wait(io)) {
-        .exited => |c| c,
-        else => 1,
-    };
+    return 0;
 }
 
 /// Drives one source buffer through the whole compiler — front-end (parse,
