@@ -243,6 +243,7 @@ pub const Function = struct {
     extra: []const u32,
 
     pub fn deinit(self: *Function, gpa: Allocator) void {
+        gpa.free(self.name);
         gpa.free(self.param_types);
         gpa.free(self.blocks);
         self.insts.deinit(gpa);
@@ -666,7 +667,10 @@ pub const FunctionBuilder = struct {
         std.debug.assert(!self.block_open);
         for (self.blocks.items) |b| std.debug.assert(b.insts_len > 0);
         const f = Function{
-            .name = name,
+            // Owned: callers pass borrowed slices (source-backed symbol names,
+            // freshly-allocated instantiation names freed right after). Dupe so
+            // a Function's name always outlives its caller's buffer.
+            .name = try self.gpa.dupe(u8, name),
             .param_types = try self.gpa.dupe(TypeId, param_types),
             .result = result,
             .is_fallible = is_fallible,

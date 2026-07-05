@@ -88,6 +88,14 @@ codegen instead writes the four raw fields directly.
 The runtime traces an object by reading a reference at `body + offset` for each
 entry and marking it. That is the entire precision contract for the heap.
 
+A **closure value** is one such object: `gc_alloc`'d, a fixed 16-byte
+`{ code_ptr, env_ptr }` cell (`TypeInfo{ size = 16, ptr_offsets = [8] }`). The
+code pointer at +0 targets `.text` and is never a GC reference; the environment
+pointer at +8 is the cell's one ref field. Codegen calls a closure by loading
+both and calling `code_ptr(env_ptr, args...)` — the environment is threaded in
+as the callee's leading argument. Nothing new is required of the runtime: a
+closure cell is scanned by the same `ptr_offsets` mechanism as any struct.
+
 ---
 
 ## 3. Reference contract
@@ -323,8 +331,7 @@ bit_rt_chan_send(ch: ?*anyopaque, value: u64)    -> void
 bit_rt_chan_recv(ch: ?*anyopaque)                -> ChanRecvResult
 bit_rt_chan_close(ch: ?*anyopaque)                -> void
 
-ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return —
-                                          // the same tuple shape as `make_closure`
+ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
 ```
 
 - `capacity == 0` is unbuffered (synchronous rendezvous); `capacity > 0` is a

@@ -33,12 +33,20 @@ fn collectTypeInfos(a: Allocator, module: *const ir.Module) Allocator.Error![]Ty
     for (module.funcs.items) |*f| {
         var i: u32 = 0;
         while (i < f.insts.len) : (i += 1) {
-            if (f.insts.items(.op)[i] != .gc_alloc) continue;
-            const g = f.decode(@enumFromInt(i)).gc_alloc;
-            const name = try ir.typeInfoSymbol(a, g.size, g.ptr_offsets);
+            // A `make_closure` allocates the fixed 16-byte `{code, env}` cell
+            // (see x64/arm64 codegen); its env pointer at +8 is the one GC field.
+            const layout: TypeInfoLayout = switch (f.insts.items(.op)[i]) {
+                .gc_alloc => blk: {
+                    const g = f.decode(@enumFromInt(i)).gc_alloc;
+                    break :blk .{ .size = g.size, .ptr_offsets = g.ptr_offsets };
+                },
+                .make_closure => .{ .size = 16, .ptr_offsets = &.{8} },
+                else => continue,
+            };
+            const name = try ir.typeInfoSymbol(a, layout.size, layout.ptr_offsets);
             if (seen.contains(name)) continue;
             try seen.put(a, name, {});
-            try out.append(a, .{ .size = g.size, .ptr_offsets = g.ptr_offsets });
+            try out.append(a, layout);
         }
     }
     return out.toOwnedSlice(a);

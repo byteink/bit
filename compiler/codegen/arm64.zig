@@ -47,14 +47,12 @@
 //!
 //! ## Deliberately NOT covered
 //!
-//! Identical exclusion list to `x64.zig`, for identical reasons (these are
-//! IR/lowering-level gaps, not backend-specific ones — see that file's
-//! module comment for the full rationale): `call_value`, `call_iface`,
-//! `make_closure`, `gc_alloc`, `const_string`, `slice_len`, and a `ret`
-//! carrying more than one value all return `error.UnsupportedConstruct`.
-//! `field_get`/`field_set`, `index_get`/`index_set` (array base only, which
-//! is the only base shape `lower.zig` ever emits these for), and `rt_call`
-//! ARE covered.
+//! Same exclusions as `x64.zig`, for identical reasons (these are
+//! IR/lowering-level gaps, not backend-specific ones): `call_iface`,
+//! `slice_len` (non-array base), and a `ret` carrying more than one value
+//! all return `error.UnsupportedConstruct`. `field_get`/`field_set`,
+//! `index_get`/`index_set` (array base only), `gc_alloc`, `const_string`,
+//! `make_closure`, `call_value`, and `rt_call` ARE covered.
 //!
 //! ## Sub-64-bit integers
 //!
@@ -704,6 +702,12 @@ const Ctx = struct {
         try self.relocs.append(self.gpa, .{ .offset = off, .symbol = symbol, .kind = .branch });
     }
 
+    /// `BLR Xn` — indirect branch-with-link through a register. Used for
+    /// `call_value` (closure dispatch through a loaded code pointer).
+    fn blr(self: *Ctx, reg: Reg) !void {
+        try self.emitWord(0xD63F0000 | (@as(u32, @intFromEnum(reg)) << 5));
+    }
+
     /// Materializes the address of a static symbol into `dst` via the AArch64
     /// `ADRP`/`ADD` pair (imm fields are 0 placeholders the linker patches from
     /// the `page21`/`pageoff12` relocations). No `movabs` equivalent exists on
@@ -1243,9 +1247,13 @@ const safepoint_symbol = "bit_rt_safepoint";
 /// registers via the parallel-move sequencer, then emits `bl symbol` and
 /// binds the single result (if any) into `dst`. Shared by `call` and
 /// `rt_call` — the only difference between them is how `symbol` is named.
-fn emitCall(self: *Ctx, dst: ?u32, dst_ty: TypeId, symbol: []const u8, args: []const u32, is_safepoint: bool) CodegenError!void {
-    var int_ord: u32 = 0;
-    var float_ord: u32 = 0;
+/// Marshals `args` into argument registers via parallel moves, with the
+/// integer/float register banks already `base_int_ord`/`base_float_ord` deep.
+/// `emitCall` passes zeros (a plain call); `emitCallValue` passes `1,0` to
+/// reserve x0 for the closure's environment pointer.
+fn marshalArgs(self: *Ctx, args: []const u32, base_int_ord: u32, base_float_ord: u32) CodegenError!void {
+    var int_ord: u32 = base_int_ord;
+    var float_ord: u32 = base_float_ord;
     var int_moves = try std.ArrayList(PMove).initCapacity(self.gpa, args.len);
     defer int_moves.deinit(self.gpa);
     var float_moves = try std.ArrayList(PMove).initCapacity(self.gpa, args.len);
@@ -1262,6 +1270,10 @@ fn emitCall(self: *Ctx, dst: ?u32, dst_ty: TypeId, symbol: []const u8, args: []c
     }
     try sequentializeAndEmit(self, int_moves.items, .int);
     try sequentializeAndEmit(self, float_moves.items, .float);
+}
+
+fn emitCall(self: *Ctx, dst: ?u32, dst_ty: TypeId, symbol: []const u8, args: []const u32, is_safepoint: bool) CodegenError!void {
+    try marshalArgs(self, args, 0, 0);
 
     try self.emitCallReloc(symbol);
     const ret_off: u32 = @intCast(self.code.items.len);
@@ -1301,6 +1313,52 @@ fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) Codege
     const ret_off: u32 = @intCast(self.code.items.len);
     try recordSafepoint(self, ret_off);
     try putInt(self, dst, @enumFromInt(retRegNum(.int)));
+}
+
+/// A closure value is a pointer to a 16-byte GC cell `{ code_ptr, env_ptr }`:
+/// the code pointer at +0 (into `.text`, never a GC ref) and the captured
+/// environment at +8 (the cell's one GC field). Single-word, so it flows
+/// through the register allocator like any other reference. Mirrors x64.zig.
+const closure_cell_size: u32 = 16;
+const closure_cell_ptr_offsets = [_]u32{8};
+
+/// `make_closure`: allocate the `{code, env}` cell (a GC point, like
+/// `emitGcAlloc`), then store the target function's address at +0 and the
+/// already-materialized environment pointer at +8.
+fn emitMakeClosure(self: *Ctx, dst: u32, func: ir.FuncId, env: ir.ValueId) CodegenError!void {
+    const ti = try ir.typeInfoSymbol(self.gpa, closure_cell_size, &closure_cell_ptr_offsets);
+    try self.owned_syms.append(self.gpa, ti);
+    try self.emitAddrOf(@enumFromInt(argReg(.int, 0).?), ti); // x0 = &TypeInfo
+    try self.emitCallReloc("bit_rt_gc_alloc");
+    const ret_off: u32 = @intCast(self.code.items.len);
+    try recordSafepoint(self, ret_off);
+    // x0 = cell. Store code address at +0 and the env pointer at +8.
+    const cell: u5 = retRegNum(.int); // x0
+    try self.emitAddrOf(scratch1, self.module.func(func).name); // x9 = &code
+    try self.storeImm(scratch1, cell, 0, 8);
+    const env_reg = try getInt(self, vregOf(self, env), scratch1);
+    try self.storeImm(env_reg, cell, 8, 8);
+    try putInt(self, dst, @enumFromInt(cell));
+}
+
+/// `call_value`: dispatch through a closure. Load the environment (+8) and
+/// code pointer (+0) into reserved scratch regs argument marshaling never
+/// touches (x10/x11 are not argument registers; x9 is the parallel-move cycle
+/// temp), marshal the real arguments into x1.., place the environment in x0,
+/// then `blr`. A call is a GC point, so it records a safepoint.
+fn emitCallValue(self: *Ctx, dst: ?u32, dst_ty: TypeId, callee: ir.ValueId, args: []const u32) CodegenError!void {
+    const cell = try getInt(self, vregOf(self, callee), scratch1);
+    try self.loadImm(scratch2, @intFromEnum(cell), 8, 8, false); // x10 = env
+    try self.loadImm(scratch3, @intFromEnum(cell), 0, 8, false); // x11 = code
+    try marshalArgs(self, args, 1, 0);
+    try self.movRR(@enumFromInt(argReg(.int, 0).?), scratch2); // x0 = env
+    try self.blr(scratch3);
+    const ret_off: u32 = @intCast(self.code.items.len);
+    try recordSafepoint(self, ret_off);
+    if (dst) |d| {
+        const class = common.classOf(self.tctx(), dst_ty);
+        if (class == .int) try putInt(self, d, @enumFromInt(retRegNum(.int))) else try putFloat(self, d, @enumFromInt(retRegNum(.float)));
+    }
 }
 
 /// True iff `jump`/`br` targeting `target` is a loop back-edge — see module
@@ -1421,14 +1479,15 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
             const target = self.module.func(c.func);
             try emitCall(self, if (ty != .invalid) i else null, ty, target.name, c.args, true);
         },
-        .call_value, .call_iface => return error.UnsupportedConstruct,
+        .call_value => |c| try emitCallValue(self, if (ty != .invalid) i else null, ty, c.callee, c.args),
+        .call_iface => return error.UnsupportedConstruct,
         .gc_alloc => |g| try emitGcAlloc(self, i, g.size, g.ptr_offsets),
         .field_get => |fg| try emitFieldGet(self, i, fg.base, fg.offset, ty),
         .field_set => |fs| try emitFieldSet(self, fs.base, fs.offset, fs.value, self.f.valueType(fs.value)),
         .index_get => |ig| try emitIndexGet(self, i, ig.base, ig.index, ty),
         .index_set => |is_| try emitIndexSet(self, is_.base, is_.index, is_.value, self.f.valueType(is_.value)),
         .slice_len => return error.UnsupportedConstruct,
-        .make_closure => return error.UnsupportedConstruct,
+        .make_closure => |mc| try emitMakeClosure(self, i, mc.func, mc.env),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
     }
 }
@@ -1439,7 +1498,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
 
 fn hasCalls(f: *const ir.Function) bool {
     for (f.insts.items(.op)) |op| {
-        if (op == .call or op == .rt_call or op == .gc_alloc) return true;
+        if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value) return true;
     }
     return false;
 }
@@ -1473,7 +1532,7 @@ fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Functio
         while (idx < end) : (idx += 1) {
             const id: ir.ValueId = @enumFromInt(idx);
             const op = f.insts.items(.op)[idx];
-            if (op == .call or op == .rt_call or op == .gc_alloc) try safepoints.append(gpa, idx);
+            if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value) try safepoints.append(gpa, idx);
             const dd = f.decode(id);
             extendUses(intervals, idx, dd);
             switch (dd) {

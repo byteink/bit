@@ -27,15 +27,7 @@
 //! ## Deliberately NOT covered (returns `error.UnsupportedConstruct`, never a
 //! silently-wrong codegen — mirrors `lower.zig`'s own scope-exclusion style)
 //!
-//! - `call_value`, `call_iface`, `make_closure`: closure/vtable layout is not
-//!   decided anywhere yet (`ir.zig`'s own doc comment defers "unpacking
-//!   callee into code pointer and env pointer" to codegen — a real decision,
-//!   not this ticket's to make unilaterally).
-//! - `gc_alloc`, `const_string`: both need a stable, `extern`-ABI byte layout
-//!   for `runtime/gc.zig`'s `TypeInfo` / a string header, which isn't
-//!   `extern` yet and has no exported C symbol (`runtime/ABI.md` §6 explicitly
-//!   assigns "wiring the process-wide collector instance and any C-callable
-//!   export symbols" to a separate runtime-init ticket).
+//! - `call_iface`: interface vtable dispatch layout is not decided yet.
 //! - `index_get`/`index_set`/`slice_len` on anything but a static `.array`
 //!   base: array element addressing is fully determined by `lower.zig`'s
 //!   "everything non-scalar is one boxed pointer, arrays have no header, a
@@ -545,6 +537,13 @@ const Ctx = struct {
     fn pop(self: *Ctx, r: Reg) !void {
         if (@intFromEnum(r) >= 8) try self.emitByte(rex(false, false, false, true));
         try self.emitByte(0x58 | @as(u8, @intFromEnum(r) & 7));
+    }
+    /// `call r/m64` (indirect through a register) — `FF /2`. Used for
+    /// `call_value` (closure dispatch through a loaded code pointer).
+    fn callReg(self: *Ctx, r: Reg) !void {
+        if (@intFromEnum(r) >= 8) try self.emitByte(rex(false, false, false, true));
+        try self.emitByte(0xFF);
+        try self.emitByte(modrmRegByte(2, @intFromEnum(r)));
     }
     fn ret(self: *Ctx) !void {
         try self.emitByte(0xC3);
@@ -1190,6 +1189,58 @@ fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) !void 
     try putInt(self, dst, .rax);
 }
 
+/// A closure value is a pointer to a 16-byte GC cell `{ code_ptr, env_ptr }`:
+/// the code pointer at +0 (into `.text`, never a GC ref) and the captured
+/// environment at +8 (the cell's one GC field). This keeps a closure a single
+/// word, so it flows through the register allocator like any other reference.
+const closure_cell_size: u32 = 16;
+const closure_cell_ptr_offsets = [_]u32{8};
+
+/// `make_closure`: allocate the `{code, env}` cell (a GC point, like
+/// `emitGcAlloc`), then store the target function's address at +0 and the
+/// already-materialized environment pointer at +8.
+fn emitMakeClosure(self: *Ctx, dst: u32, func: ir.FuncId, env: ir.ValueId) !void {
+    const ti = try ir.typeInfoSymbol(self.gpa, closure_cell_size, &closure_cell_ptr_offsets);
+    try self.owned_syms.append(self.gpa, ti);
+    const arg0: Reg = if (self.cc == .win64) .rcx else .rdi;
+    try self.movAbsReloc(arg0, ti);
+    if (self.cc == .win64) try self.rspAddSub(true, 32);
+    try self.emitCallReloc("bit_rt_gc_alloc");
+    self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
+    self.next_safepoint_idx += 1;
+    if (self.cc == .win64) try self.rspAddSub(false, 32);
+    // rax = cell. The function name is module-owned (outlives this reloc list).
+    try self.movAbsReloc(scratch1, self.module.func(func).name);
+    try self.movStore(.rax, null, 1, 0, scratch1, 8);
+    const env_reg = try getInt(self, vregOf(self, env), scratch1);
+    try self.movStore(.rax, null, 1, 8, env_reg, 8);
+    try putInt(self, dst, .rax);
+}
+
+/// `call_value`: dispatch through a closure. Load the environment (+8) and
+/// code pointer (+0) into reserved scratch regs that argument marshaling never
+/// disturbs (r10/r12 are not argument registers; r11 is the parallel-move
+/// cycle temp), marshal the real arguments into arg1.., place the environment
+/// in arg0, then call indirectly. A call is a GC point, so it records a
+/// safepoint at the return address like `emitCallLike`.
+fn emitCallValue(self: *Ctx, dst: u32, ty: TypeId, callee: ir.ValueId, args: []const u32) CodegenError!void {
+    const cell = try getInt(self, vregOf(self, callee), scratch1);
+    try self.movLoad(scratch2, cell, null, 1, 8, 8, false); // r10 = env
+    try self.movLoad(scratch3, cell, null, 1, 0, 8, false); // r12 = code
+    try marshalArgs(self, args, 1, 1, 0);
+    const arg0: Reg = if (self.cc == .win64) .rcx else .rdi;
+    try self.movRR(arg0, scratch2);
+    if (self.cc == .win64) try self.rspAddSub(true, 32);
+    try self.callReg(scratch3);
+    self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
+    self.next_safepoint_idx += 1;
+    if (self.cc == .win64) try self.rspAddSub(false, 32);
+    if (self.tctx().typeOf(ty) != .void) switch (classOf(self.tctx(), ty)) {
+        .int => try putInt(self, dst, .rax),
+        .float => try putFloat(self, dst, .xmm0),
+    };
+}
+
 fn emitConstInt(self: *Ctx, dst: u32, val: i64) !void {
     try self.movRI(scratch1, val);
     try putInt(self, dst, scratch1);
@@ -1403,8 +1454,8 @@ fn emitRet(self: *Ctx, vals: []const u32) !void {
 }
 
 // ============================================================================
-// Calls (direct `call` and opaque `rt_call`, both real x86-64 calls —
-// `call_value`/`call_iface` are unsupported, see module doc comment)
+// Calls (direct `call`, opaque `rt_call`, and closure `call_value` — all real
+// x86-64 calls; `call_iface` vtable dispatch is unsupported, see module doc)
 // ============================================================================
 
 /// Per-`RtFn` runtime symbol name (module doc comment: "generically
@@ -1437,18 +1488,23 @@ const CallReturn = struct { dst: u32, ty: TypeId };
 /// module doc comment: a function containing any safepoint restricts its
 /// whole allocatable file to the callee-saved subset), so these parallel
 /// moves can never collide with the argument registers they target.
-fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallReturn) CodegenError!void {
+/// Marshals `args` into argument registers via parallel moves, starting at
+/// positional slot `base_position` with the integer/float register banks
+/// already `base_int_ord`/`base_float_ord` deep. `emitCallLike` passes all
+/// zeros (a plain call); `emitCallValue` passes `1,1,0` to reserve arg0 for
+/// the closure's environment pointer (which it moves in after marshaling).
+fn marshalArgs(self: *Ctx, args: []const u32, base_position: u32, base_int_ord: u32, base_float_ord: u32) CodegenError!void {
     var int_moves: std.ArrayList(PMove) = .empty;
     defer int_moves.deinit(self.gpa);
     var float_moves: std.ArrayList(PMove) = .empty;
     defer float_moves.deinit(self.gpa);
 
-    var int_ordinal: u32 = 0;
-    var float_ordinal: u32 = 0;
+    var int_ordinal: u32 = base_int_ord;
+    var float_ordinal: u32 = base_float_ord;
     for (args, 0..) |raw, position| {
         const class = classOf(self.tctx(), self.f.valueType(@enumFromInt(raw)));
         const ordinal = if (class == .int) int_ordinal else float_ordinal;
-        const reg = argReg(self.cc, class, @intCast(position), ordinal) orelse return error.TooManyArguments;
+        const reg = argReg(self.cc, class, @intCast(base_position + position), ordinal) orelse return error.TooManyArguments;
         if (class == .int) int_ordinal += 1 else float_ordinal += 1;
         const from = plocOf(self, self.inst_to_vreg[raw], class);
         const list = if (class == .int) &int_moves else &float_moves;
@@ -1456,6 +1512,10 @@ fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallRet
     }
     try sequentializeAndEmit(self, int_moves.items, .int);
     try sequentializeAndEmit(self, float_moves.items, .float);
+}
+
+fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallReturn) CodegenError!void {
+    try marshalArgs(self, args, 0, 0, 0);
 
     // Win64 requires the caller to reserve 32 bytes of "home space" right
     // below the call; done dynamically around just this call site (not
@@ -1641,7 +1701,7 @@ fn collectSafepoints(gpa: Allocator, f: *const ir.Function) Allocator.Error![]u3
         const end = blk.insts_start + blk.insts_len;
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
-                .call, .rt_call, .gc_alloc => try out.append(gpa, @intCast(i)),
+                .call, .rt_call, .gc_alloc, .make_closure, .call_value => try out.append(gpa, @intCast(i)),
                 .jump => {
                     const j = f.decode(@enumFromInt(i)).jump;
                     if (@intFromEnum(j.target) <= bi) try out.append(gpa, @intCast(i));
@@ -1671,7 +1731,7 @@ fn scanFuncFlags(f: *const ir.Function) FuncFlags {
         const end = blk.insts_start + blk.insts_len;
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
-                .call, .rt_call, .gc_alloc => flags.has_safepoints = true,
+                .call, .rt_call, .gc_alloc, .make_closure, .call_value => flags.has_safepoints = true,
                 .sdiv, .udiv, .srem, .urem => flags.needs_rax_rdx = true,
                 .shl, .ashr, .lshr => {
                     const b = f.decode(@enumFromInt(i)).bin;
@@ -1743,7 +1803,9 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .index_get => try emitIndexGet(self, dst, d.index_get.base, d.index_get.index, ty),
         .index_set => try emitIndexSet(self, d.index_set.base, d.index_set.index, d.index_set.value, self.f.valueType(d.index_set.value)),
         .gc_alloc => try emitGcAlloc(self, dst, d.gc_alloc.size, d.gc_alloc.ptr_offsets),
-        .slice_len, .call_value, .call_iface, .make_closure => return error.UnsupportedConstruct,
+        .make_closure => try emitMakeClosure(self, dst, d.make_closure.func, d.make_closure.env),
+        .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
+        .slice_len, .call_iface => return error.UnsupportedConstruct,
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
     }
 }

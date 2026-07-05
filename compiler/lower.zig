@@ -255,6 +255,14 @@ pub const Lowerer = struct {
     /// `lookupMethod`); built once by `buildMethodTable`.
     method_table: std.ArrayList(MethodEntry) = .empty,
     layouts: std.AutoHashMapUnmanaged(u32, StructLayout) = .{},
+    /// Closures are lowered lazily as their `arrow_fn` is encountered, mid-body.
+    /// They cannot append straight into `out.funcs` — that would shift the
+    /// `FuncId`s Pass A/A2/A3 reserved for the top-level/instantiation/method
+    /// functions still being appended. Instead they collect here and get
+    /// `FuncId`s past the reserved block (`reserved_count + index`), then are
+    /// moved into `out.funcs` once the reserved block is fully appended.
+    closure_funcs: std.ArrayList(ir.Function) = .empty,
+    reserved_count: usize = 0,
 
     fn lookupMethod(self: *const Lowerer, ty: TypeId, name: []const u8) ?MethodEntry {
         for (self.method_table.items) |e| {
@@ -374,12 +382,10 @@ pub const Lowerer = struct {
         var param_types: std.ArrayList(TypeId) = .empty;
         defer param_types.deinit(self.gpa);
 
+        // Block params must all precede any non-param instruction, so add the
+        // env param + every arrow param first, then unpack captures (fieldGet).
         const env_param = try b.addParam(env_ty);
         try param_types.append(self.gpa, env_ty);
-        for (captures, 0..) |c, i| {
-            const fv = try b.fieldGet(c.ty, env_param, env_layout.field_offsets[i]);
-            try env.declare(self.gpa, c.name, fv, c.ty);
-        }
 
         const param_nodes = mf.tree.kids(k[0]);
         if (param_nodes.len != shape.params.len) return error.UnsupportedConstruct;
@@ -388,6 +394,11 @@ pub const Lowerer = struct {
             try param_types.append(self.gpa, pty);
             const p = try b.addParam(pty);
             try env.declare(self.gpa, identTextOf(mf, pk[0]), p, pty);
+        }
+
+        for (captures, 0..) |c, i| {
+            const fv = try b.fieldGet(c.ty, env_param, env_layout.field_offsets[i]);
+            try env.declare(self.gpa, c.name, fv, c.ty);
         }
 
         var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env };
@@ -407,9 +418,15 @@ pub const Lowerer = struct {
         }
         b.endBlock();
 
-        const f = try b.finish("closure", param_types.items, shape.result, false, .invalid, entry);
-        const fid: ir.FuncId = @enumFromInt(self.out.funcs.items.len);
-        try self.out.funcs.append(self.gpa, f);
+        // Past the reserved block so it never aliases a top-level/method FuncId;
+        // moved into `out.funcs` after Pass B (see `closure_funcs`).
+        const fid: ir.FuncId = @enumFromInt(self.reserved_count + self.closure_funcs.items.len);
+        // Unique per-module name so each closure gets a distinct object symbol
+        // (`finish` dupes the name, so the temporary is freed right after).
+        const name = try std.fmt.allocPrint(self.gpa, "closure${d}", .{@intFromEnum(fid)});
+        defer self.gpa.free(name);
+        const f = try b.finish(name, param_types.items, shape.result, false, .invalid, entry);
+        try self.closure_funcs.append(self.gpa, f);
         return fid;
     }
 };
@@ -483,7 +500,17 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         }
     }
 
+    // Closures collected during Pass B are freed here only if lowering errors
+    // before they are moved into `out.funcs` (success path clears the list).
+    defer {
+        for (l.closure_funcs.items) |*cf| cf.deinit(gpa);
+        l.closure_funcs.deinit(gpa);
+    }
+
     // Pass B: lower bodies in the exact same order as Pass A/A2/A3 assigned ids.
+    // Closures append to `l.closure_funcs` (see the field doc), so the reserved
+    // FuncId space stays contiguous; `reserved_count` puts closures past it.
+    l.reserved_count = method_base + method_decls.items.len;
     for (direct_syms.items) |gsym| {
         const sym = rmodule.symbols.items[@intFromEnum(gsym.id)];
         const f = try l.lowerFunction(gsym, &.{}, sym.name);
@@ -502,6 +529,12 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, m.name);
         try l.out.funcs.append(gpa, f);
     }
+
+    // Move closures into `out.funcs` at the FuncIds they were assigned
+    // (`reserved_count + index`). Ownership transfers; clear so the defer above
+    // does not double-free the now-moved functions.
+    try l.out.funcs.appendSlice(gpa, l.closure_funcs.items);
+    l.closure_funcs.clearRetainingCapacity();
 
     return l.out;
 }
@@ -1803,7 +1836,7 @@ test "monomorphizes a generic function per call-site instantiation" {
         \\function main(): i64 {
         \\  let a = identity(1)
         \\  let b = identity(true)
-        \\  if b { return a }
+        \\  if (b) { return a }
         \\  return 0
         \\}
         \\
@@ -1821,7 +1854,7 @@ test "lowers a closure that captures an outer variable" {
     const src =
         \\function main(): i64 {
         \\  let base = 10
-        \\  let addBase = (x: i64): i64 => x + base
+        \\  let addBase = (x: i64) => x + base
         \\  return addBase(5)
         \\}
         \\
