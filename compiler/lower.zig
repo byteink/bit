@@ -204,7 +204,19 @@ const Env = struct {
     }
 };
 
-const LoopCtx = struct { exit: ir.BlockId, cont: ir.BlockId, pre_len: usize };
+/// One entry per enclosing `break`-able construct. `switch`/`select` are
+/// break-able but not `continue`-able (SPEC §13.6): `continue` scans past
+/// `.switch_like` frames to the innermost `.loop`. `exit_used` records whether
+/// any `break` actually targeted this frame's exit — a switch whose every arm
+/// `break`s has a live join even though no arm falls through.
+const LoopKind = enum { loop, switch_like };
+const LoopCtx = struct {
+    exit: ir.BlockId,
+    cont: ir.BlockId,
+    pre_len: usize,
+    kind: LoopKind = .loop,
+    exit_used: bool = false,
+};
 
 /// A captured outer variable, snapshotted at `arrow_fn` lowering time (see
 /// module doc comment on closures).
@@ -670,8 +682,9 @@ const FnCtx = struct {
             .for_c => try self.lowerForC(node),
             .for_of => try self.lowerForOf(node),
             .for_inf => try self.lowerForInf(node),
+            .switch_stmt => try self.lowerSwitch(node),
             .block => try self.lowerBlockScoped(node),
-            else => return error.UnsupportedConstruct, // fail_stmt, for_in, switch/select_stmt, send_stmt
+            else => return error.UnsupportedConstruct, // fail_stmt, for_in, select_stmt, send_stmt
         }
     }
 
@@ -783,16 +796,29 @@ const FnCtx = struct {
     }
 
     fn lowerBreak(self: *FnCtx) Error!void {
-        const top = self.loop_stack.items[self.loop_stack.items.len - 1];
+        // `break` targets the innermost break-able (loop or switch/select).
+        const idx = self.loop_stack.items.len - 1;
+        self.loop_stack.items[idx].exit_used = true;
+        const top = self.loop_stack.items[idx];
         const vals = try self.env.snapshotValues(self.gpa, top.pre_len);
         defer self.gpa.free(vals);
         try self.emitJump(top.exit, vals);
     }
     fn lowerContinue(self: *FnCtx) Error!void {
-        const top = self.loop_stack.items[self.loop_stack.items.len - 1];
-        const vals = try self.env.snapshotValues(self.gpa, top.pre_len);
-        defer self.gpa.free(vals);
-        try self.emitJump(top.cont, vals);
+        // `continue` targets the innermost loop, stepping past any switch/select
+        // frames in between (the checker already rejects `continue` with no
+        // enclosing loop, so a `.loop` frame is guaranteed present).
+        var i = self.loop_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.loop_stack.items[i].kind != .loop) continue;
+            const top = self.loop_stack.items[i];
+            const vals = try self.env.snapshotValues(self.gpa, top.pre_len);
+            defer self.gpa.free(vals);
+            try self.emitJump(top.cont, vals);
+            return;
+        }
+        unreachable;
     }
 
     /// Re-adds the loop header's block params for names `[0, pre_len)`,
@@ -856,6 +882,124 @@ const FnCtx = struct {
         } else {
             try self.emitUnreachable();
         }
+    }
+
+    /// Emits `a == b` as a `bool` value. Strings compare via the runtime
+    /// `string_eq`; floats via `fcmp_eq`; everything else (ints, runes, bools,
+    /// references) via a word-wise `icmp_eq`.
+    fn emitEq(self: *FnCtx, ty: TypeId, a: ir.ValueId, b: ir.ValueId) Error!ir.ValueId {
+        const bool_ty = self.ctx.prim_ids.get(.bool);
+        const data = self.ctx.typeOf(ty);
+        if (data == .prim and data.prim == .string) return self.b.rtCall(bool_ty, .string_eq, &.{ a, b });
+        const is_float = data == .prim and (data.prim == .f32 or data.prim == .f64);
+        return self.b.binary(if (is_float) .fcmp_eq else .icmp_eq, bool_ty, a, b);
+    }
+
+    /// A `switch` lowers to a linear decision chain, mirroring Go semantics: no
+    /// implicit fallthrough (each arm jumps straight to the join), `default`
+    /// runs only when no `case` matched regardless of its source position, and
+    /// arms `break` to the join. A subject-less `switch { case cond: … }` tests
+    /// each `case` expression as a bool directly.
+    ///
+    /// ponytail: a multi-expression `case a, b:` ORs its comparisons rather than
+    /// short-circuiting, so both `a` and `b` are evaluated even when `a`
+    /// matches. Case expressions are constants in practice; revisit only if a
+    /// side-effecting case expression ever needs Go's left-to-right stop.
+    fn lowerSwitch(self: *FnCtx, node: ast.Index) Error!void {
+        const k = self.kids(node); // [subject_or_none, case_list]
+        const has_subject = k[0] != ast.none;
+        const bool_ty = self.ctx.prim_ids.get(.bool);
+        const subject_ty: TypeId = if (has_subject) try self.nodeType(k[0]) else bool_ty;
+        const subject: ir.ValueId = if (has_subject) try self.lowerExprH(k[0], subject_ty) else undefined;
+
+        const pre_len = self.env.bindings.items.len;
+        const orig = try self.env.snapshotValues(self.gpa, pre_len);
+        defer self.gpa.free(orig);
+
+        const cases = self.kids(k[1]);
+        var default_stmts: ast.Index = ast.none;
+        var m: usize = 0; // count of non-default cases
+        for (cases) |c| {
+            switch (self.tree().get(c).tag) {
+                .switch_case => m += 1,
+                .switch_default => default_stmts = self.kids(c)[0],
+                else => {},
+            }
+        }
+
+        const join = try self.b.newBlock();
+        const dflt = if (m > 0) try self.b.newBlock() else undefined;
+        try self.loop_stack.append(self.gpa, .{ .exit = join, .cont = join, .pre_len = pre_len, .kind = .switch_like });
+        var join_reachable = false;
+
+        var seen: usize = 0;
+        for (cases) |c| {
+            if (self.tree().get(c).tag != .switch_case) continue;
+            const ck = self.kids(c); // [expr_list, stmt_list]
+            const exprs = self.kids(ck[0]);
+
+            var cond = try self.matchExpr(has_subject, subject_ty, subject, exprs[0]);
+            for (exprs[1..]) |e| {
+                const next_cond = try self.matchExpr(has_subject, subject_ty, subject, e);
+                cond = try self.b.binary(.bor, bool_ty, cond, next_cond);
+            }
+
+            const body_blk = try self.b.newBlock();
+            const is_last = seen == m - 1;
+            const next_blk = if (is_last) dflt else try self.b.newBlock();
+            try self.emitBr(cond, body_blk, &.{}, next_blk, &.{});
+
+            self.switchBlock(body_blk);
+            self.env.restoreValues(orig);
+            const mark = self.env.mark();
+            try self.lowerStmtList(ck[1]);
+            self.env.restoreCount(mark);
+            if (!self.terminated) {
+                join_reachable = true;
+                const vals = try self.env.snapshotValues(self.gpa, pre_len);
+                defer self.gpa.free(vals);
+                try self.emitJump(join, vals);
+            }
+            self.env.restoreValues(orig);
+            self.switchBlock(next_blk);
+            seen += 1;
+        }
+
+        // Now positioned in the "no case matched" block (the `dflt` reached via
+        // the last test's else edge, or the caller's own block when m == 0).
+        self.env.restoreValues(orig);
+        if (default_stmts != ast.none) {
+            const mark = self.env.mark();
+            try self.lowerStmtList(default_stmts);
+            self.env.restoreCount(mark);
+        }
+        if (!self.terminated) {
+            join_reachable = true;
+            const vals = try self.env.snapshotValues(self.gpa, pre_len);
+            defer self.gpa.free(vals);
+            try self.emitJump(join, vals);
+        }
+        self.env.restoreValues(orig);
+
+        const ctx = self.loop_stack.pop().?;
+        if (ctx.exit_used) join_reachable = true;
+
+        self.b.endBlock();
+        self.b.beginBlock(join);
+        if (join_reachable) {
+            try self.addLoopParams(pre_len);
+            self.terminated = false;
+        } else {
+            try self.emitUnreachable();
+        }
+    }
+
+    /// One arm of a `switch`'s decision chain: `subject == e` for a value
+    /// switch, or `e` itself (a bool) for a subject-less switch.
+    fn matchExpr(self: *FnCtx, has_subject: bool, subject_ty: TypeId, subject: ir.ValueId, e: ast.Index) Error!ir.ValueId {
+        if (!has_subject) return self.lowerExprH(e, self.ctx.prim_ids.get(.bool));
+        const ev = try self.lowerExprH(e, subject_ty);
+        return self.emitEq(subject_ty, subject, ev);
     }
 
     fn lowerWhile(self: *FnCtx, node: ast.Index) Error!void {
@@ -1908,16 +2052,47 @@ test "lowers string interpolation to a concat rt_call" {
     try ir.verify(gpa, &out.module);
 }
 
-test "unsupported construct (switch) reports UnsupportedConstruct, not a crash" {
+test "lowers a value switch with a multi-expression case and default" {
     const gpa = testing.allocator;
     const src =
-        \\function f(x: i64): i64 {
+        \\function classify(x: i64): i64 {
+        \\  let r = 0
         \\  switch (x) {
-        \\    case 1: return 1
-        \\    default: return 0
+        \\    case 1, 2: r = 10
+        \\    case 3: r = 20
+        \\    default: r = 30
         \\  }
+        \\  return r
         \\}
         \\
     ;
-    try testing.expectError(error.UnsupportedConstruct, lowerSource(gpa, src));
+    var out = try lowerSource(gpa, src);
+    defer out.module.deinit();
+    defer out.ctx.deinit();
+    try ir.verify(gpa, &out.module);
+}
+
+test "lowers a switch whose every arm breaks (join reachable only via break)" {
+    const gpa = testing.allocator;
+    const src =
+        \\function f(x: i64): i64 {
+        \\  let r = 0
+        \\  switch (x) {
+        \\    case 1: {
+        \\      r = 1
+        \\      break
+        \\    }
+        \\    default: {
+        \\      r = 2
+        \\      break
+        \\    }
+        \\  }
+        \\  return r
+        \\}
+        \\
+    ;
+    var out = try lowerSource(gpa, src);
+    defer out.module.deinit();
+    defer out.ctx.deinit();
+    try ir.verify(gpa, &out.module);
 }

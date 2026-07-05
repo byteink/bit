@@ -386,10 +386,24 @@ const Printer = struct {
     /// header for why fmt doesn't lean on ASI in general.
     fn endsInBlock(self: *const Printer, idx: Index) bool {
         return switch (self.tree.get(idx).tag) {
-            .func_decl, .struct_decl, .interface_decl, .if_stmt, .while_stmt, .for_c, .for_of, .for_in, .for_inf, .switch_stmt, .select_stmt => true,
+            .block, .func_decl, .struct_decl, .interface_decl, .if_stmt, .while_stmt, .for_c, .for_of, .for_in, .for_inf, .switch_stmt, .select_stmt => true,
             .@"export" => self.endsInBlock(self.tree.kids(idx)[0]),
             else => false,
         };
+    }
+
+    /// Like `printSeq`, but never keeps a blank line before the *first* item.
+    /// Used for `switch`/`select` clause lists (no blank after the opening `{`)
+    /// and `case`/`default` clause bodies (no blank after the `:` label): the
+    /// opener and the first item land on adjacent lines, and preserving a source
+    /// blank there is both unwanted and non-idempotent (a second pass re-reads
+    /// the kept blank as a paragraph break and would grow another).
+    fn printNoLeadBlank(self: *Printer, items: []const Index, stmt_style: bool) FmtError!void {
+        for (items, 0..) |it, i| {
+            try self.gap(self.tree.get(it).span.start, i != 0);
+            try self.printNode(it);
+            if (stmt_style and !self.endsInBlock(it)) try self.raw(";");
+        }
     }
 
     /// Statement/declaration sequence (program top decls, block statements,
@@ -413,7 +427,11 @@ const Printer = struct {
             return;
         }
         self.indent += 1;
-        try self.printSeq(items, true);
+        // No blank line is kept right after `{` (gofmt strips it). Besides being
+        // the one true style, this is what makes a block idempotent when its `{`
+        // lands on its own line — e.g. a `case X: { … }` clause body, where the
+        // opener and the first statement are separated by the `:` label line.
+        try self.printNoLeadBlank(items, true);
         try self.gap(n.span.end, true);
         self.indent -= 1;
         try self.raw("}");
@@ -760,7 +778,7 @@ const Printer = struct {
             .case_list => {
                 try self.raw("{");
                 self.indent += 1;
-                try self.printSeq(self.kids(idx), false);
+                try self.printNoLeadBlank(self.kids(idx), false);
                 try self.gap(n.span.end, true);
                 self.indent -= 1;
                 try self.raw("}");
@@ -771,14 +789,14 @@ const Printer = struct {
                 try self.printFlatList(self.kids(k[0]), ", ");
                 try self.raw(":");
                 self.indent += 1;
-                try self.printSeq(self.kids(k[1]), true);
+                try self.printNoLeadBlank(self.kids(k[1]), true);
                 self.indent -= 1;
             },
             .switch_default => {
                 const k = self.kids(idx);
                 try self.raw("default:");
                 self.indent += 1;
-                try self.printSeq(self.kids(k[0]), true);
+                try self.printNoLeadBlank(self.kids(k[0]), true);
                 self.indent -= 1;
             },
 
@@ -786,7 +804,7 @@ const Printer = struct {
                 try self.raw("select ");
                 try self.raw("{");
                 self.indent += 1;
-                try self.printSeq(self.kids(idx), false);
+                try self.printNoLeadBlank(self.kids(idx), false);
                 try self.gap(n.span.end, true);
                 self.indent -= 1;
                 try self.raw("}");
@@ -797,14 +815,14 @@ const Printer = struct {
                 try self.printNode(k[0]);
                 try self.raw(":");
                 self.indent += 1;
-                try self.printSeq(self.kids(k[1]), true);
+                try self.printNoLeadBlank(self.kids(k[1]), true);
                 self.indent -= 1;
             },
             .comm_default => {
                 const k = self.kids(idx);
                 try self.raw("default:");
                 self.indent += 1;
-                try self.printSeq(self.kids(k[0]), true);
+                try self.printNoLeadBlank(self.kids(k[0]), true);
                 self.indent -= 1;
             },
             .recv_bind => {
