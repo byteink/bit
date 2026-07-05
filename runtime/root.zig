@@ -184,6 +184,61 @@ export fn bit_rt_safepoint() callconv(.c) void {
 }
 
 // ---------------------------------------------------------------------------
+// Strings (ABI.md §2): a `string` value is a pointer to a GC-allocated
+// `{ptr, len}` header immediately followed by its bytes; `ptr` points at those
+// inline bytes, so the object is a leaf (no traced refs, shared `string_info`).
+// Dynamic strings (concat, from-number) allocate here; string literals are
+// static `.rodata` the compiler emits. All share the `RtBytes` wire shape.
+// ---------------------------------------------------------------------------
+
+const string_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "string");
+const string_hdr_size = @sizeOf(RtBytes); // {ptr, len} = 16 bytes
+
+/// Allocates a `len`-byte string body; returns the header and a writable view
+/// of its bytes for the caller to fill. OOM is fatal (no fallible string form).
+fn allocString(len: usize) struct { hdr: *RtBytes, bytes: []u8 } {
+    const body = g_gc.allocRaw(string_hdr_size + len, &string_info) orelse fatal("out of memory");
+    const hdr: *RtBytes = @ptrCast(@alignCast(body));
+    const bytes = (body + string_hdr_size)[0..len];
+    hdr.* = .{ .ptr = bytes.ptr, .len = len };
+    return .{ .hdr = hdr, .bytes = bytes };
+}
+
+/// `bit_rt_string_concat` (ABI.md §2): a fresh string holding `a` then `b`.
+/// Binary — lowering folds an N-part interpolation into a chain of these.
+export fn bit_rt_string_concat(a: *const RtBytes, b: *const RtBytes) callconv(.c) *const RtBytes {
+    const s = allocString(a.len + b.len);
+    @memcpy(s.bytes[0..a.len], a.ptr[0..a.len]);
+    @memcpy(s.bytes[a.len..][0..b.len], b.ptr[0..b.len]);
+    return s.hdr;
+}
+
+/// `bit_rt_string_eq` (ABI.md §2): byte-wise equality; backs string `==`/`!=`.
+export fn bit_rt_string_eq(a: *const RtBytes, b: *const RtBytes) callconv(.c) bool {
+    return std.mem.eql(u8, a.ptr[0..a.len], b.ptr[0..b.len]);
+}
+
+fn stringFromBytes(txt: []const u8) *const RtBytes {
+    const s = allocString(txt.len);
+    @memcpy(s.bytes, txt);
+    return s.hdr;
+}
+
+export fn bit_rt_string_from_int(v: i64) callconv(.c) *const RtBytes {
+    var buf: [24]u8 = undefined; // fits any i64 decimal + sign
+    return stringFromBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
+}
+
+export fn bit_rt_string_from_float(v: f64) callconv(.c) *const RtBytes {
+    var buf: [32]u8 = undefined;
+    return stringFromBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
+}
+
+export fn bit_rt_string_from_bool(v: bool) callconv(.c) *const RtBytes {
+    return stringFromBytes(if (v) "true" else "false");
+}
+
+// ---------------------------------------------------------------------------
 // Channels (ABI.md §11)
 // ---------------------------------------------------------------------------
 

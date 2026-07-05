@@ -54,10 +54,10 @@ pub const FuncId = enum(u32) { _ };
 /// `select_stmt` (§13.7) — its exact runtime signature is `runtime/chan.zig`'s
 /// to define, not lowering's; this tag just names the call site.
 pub const RtFn = enum {
-    /// Variadic: concatenates every arg (each already `string`-typed) into one
-    /// new string. Backs `str_interp` (§5.7) — `lower.zig` converts each
-    /// non-string part first via `string_from_*` below, then issues one
-    /// `string_concat` over the whole part list.
+    /// Two `string` args -> one fresh `string` (`a` then `b`). Backs `+` on
+    /// strings and `str_interp` (§5.7): `lower.zig` converts each non-string
+    /// part via `string_from_*` below, then folds the parts left-to-right into
+    /// a chain of binary `string_concat`s.
     string_concat,
     /// One arg of any integer-prim type; codegen picks the concrete
     /// conversion from that arg's own recorded `TypeId` (every value is
@@ -65,6 +65,9 @@ pub const RtFn = enum {
     string_from_int,
     string_from_float,
     string_from_bool,
+    /// Two `string` args -> `bool`: byte-wise equality. Backs string `==`/`!=`
+    /// (`!=` negates the result). Distinct from integer `icmp_eq`.
+    string_eq,
     panic,
     assert,
     /// One `string` arg: writes its bytes to stdout (no trailing newline).

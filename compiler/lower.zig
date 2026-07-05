@@ -1406,8 +1406,16 @@ const FnCtx = struct {
         else
             self.defaultTy(lty);
         const cdata = self.ctx.typeOf(common);
-        if (cdata == .prim and cdata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus))
-            return error.UnsupportedConstruct; // string equality/concat via `+`: needs a not-yet-added RtFn
+        if (cdata == .prim and cdata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus)) {
+            const sl = try self.lowerExprH(k[0], common);
+            const sr = try self.lowerExprH(k[1], common);
+            if (op == .plus) return self.b.rtCall(common, .string_concat, &.{ sl, sr });
+            const bool_ty = self.ctx.prim_ids.get(.bool);
+            const eq = try self.b.rtCall(bool_ty, .string_eq, &.{ sl, sr });
+            if (op == .eq_eq) return eq;
+            const f = try self.b.constBool(bool_ty, false); // `!=` is `(a == b) == false`
+            return self.b.binary(.icmp_eq, bool_ty, eq, f);
+        }
         const lval = try self.lowerExprH(k[0], common);
         const rval = try self.lowerExprH(k[1], common);
         const result_ty = try self.nodeType(node);
@@ -1518,7 +1526,10 @@ const FnCtx = struct {
                 vals[i] = try self.lowerToString(v, ty);
             }
         }
-        return self.b.rtCall(string_ty, .string_concat, vals);
+        // `string_concat` is binary; fold the parts left-to-right.
+        var acc = vals[0];
+        for (vals[1..]) |v| acc = try self.b.rtCall(string_ty, .string_concat, &.{ acc, v });
+        return acc;
     }
 
     fn lowerArrowFn(self: *FnCtx, node: ast.Index) Error!ir.ValueId {

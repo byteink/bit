@@ -203,6 +203,24 @@ pub const Gc = struct {
         return body;
     }
 
+    /// Like `alloc`, but for objects whose body size is not fixed by their
+    /// `TypeInfo` (strings, byte buffers). `body_size` is the real body length;
+    /// `info` must have empty `ptr_offsets` (a leaf object — `scanObject` never
+    /// reads `info.size` then, so the descriptor can be shared across lengths).
+    pub fn allocRaw(self: *Gc, body_size: usize, info: *const TypeInfo) ?[*]u8 {
+        std.debug.assert(info.ptr_offsets_len == 0);
+        const total = header_size + body_size;
+        const raw = self.heap.alloc(total, gc_align) orelse return null;
+        const h: *GcHeader = @ptrCast(@alignCast(raw));
+        h.* = .{ .info = info, .next = self.all, .size = total, .marked = false };
+        self.all = h;
+        self.num_objects += 1;
+        self.stats.total_allocated += 1;
+        const body = raw + header_size;
+        @memset(body[0..body_size], 0);
+        return body;
+    }
+
     /// Poll point for automatic collection. A mutator calls this where the stack
     /// maps make the roots precise; if the live heap has crossed the trigger the
     /// world stops and a collection runs.
