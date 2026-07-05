@@ -233,7 +233,7 @@ const CallTarget = union(enum) {
     value: struct { callee: ir.ValueId, result: TypeId },
 };
 
-const MethodEntry = struct { ty: TypeId, name: []const u8, sym: GlobalSymbol };
+const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, result: TypeId };
 
 // ============================================================================
 // Lowerer — module-level driver and shared tables
@@ -256,30 +256,9 @@ pub const Lowerer = struct {
     method_table: std.ArrayList(MethodEntry) = .empty,
     layouts: std.AutoHashMapUnmanaged(u32, StructLayout) = .{},
 
-    fn buildMethodTable(self: *Lowerer) Error!void {
-        for (self.rmodule.symbols.items, 0..) |sym, sid| {
-            if (sid == 0 or sym.kind != .func or sym.decl == ast.none) continue;
-            const mf = self.files[sym.file_idx];
-            const k = mf.tree.kids(sym.decl); // func_decl: [recv, name, generics, params, result, body]
-            if (k[0] == ast.none) continue; // free function
-            const rk = mf.tree.kids(k[0]); // receiver: [name_ident, type]
-            const recv_ty_node = rk[1];
-            if (mf.tree.get(recv_ty_node).tag != .ident) continue; // generic-struct receiver: deferred, not registered
-            const recv_sid = self.rmodule.node_symbols[sym.file_idx][recv_ty_node];
-            if (recv_sid == .none) continue;
-            const recv_gsym = GlobalSymbol{ .module = @enumFromInt(0), .id = recv_sid };
-            const struct_ty = self.ctx.decl_memo.get(recv_gsym.pack()) orelse continue;
-            try self.method_table.append(self.gpa, .{
-                .ty = struct_ty,
-                .name = identTextOf(mf, k[1]),
-                .sym = .{ .module = @enumFromInt(0), .id = @enumFromInt(sid) },
-            });
-        }
-    }
-
-    fn lookupMethod(self: *const Lowerer, ty: TypeId, name: []const u8) ?GlobalSymbol {
+    fn lookupMethod(self: *const Lowerer, ty: TypeId, name: []const u8) ?MethodEntry {
         for (self.method_table.items) |e| {
-            if (e.ty == ty and std.mem.eql(u8, e.name, name)) return e.sym;
+            if (e.ty == ty and std.mem.eql(u8, e.name, name)) return e;
         }
         return null;
     }
@@ -301,14 +280,24 @@ pub const Lowerer = struct {
         return env;
     }
 
-    /// Lowers one non-generic or already-monomorphized function/method body.
-    /// `gen_env` is empty for a non-generic function.
+    /// Lowers one non-generic or already-monomorphized free function body,
+    /// resolving its signature from `ctx.func_sigs`. `gen_env` is empty for a
+    /// non-generic function. Methods (which have no module symbol or func_sig)
+    /// go through `lowerFunctionDecl` directly — see `lowerModule`'s method pass.
     fn lowerFunction(self: *Lowerer, gsym: GlobalSymbol, gen_env: GenericEnv, name: []const u8) Error!ir.Function {
         const sym = self.rmodule.symbols.items[@intFromEnum(gsym.id)];
-        const mf = self.files[sym.file_idx];
-        const k = mf.tree.kids(sym.decl); // [recv_or_none, name, generics, params, result_or_none, body]
         const template_shape = self.ctx.func_sigs.get(gsym.pack()) orelse return error.UnsupportedConstruct;
         const shape = if (gen_env.len > 0) try self.ctx.substFuncShape(template_shape, gen_env) else template_shape;
+        return self.lowerFunctionDecl(sym.file_idx, sym.decl, shape, gen_env, name);
+    }
+
+    /// Lowers one function/method body given its resolved `shape` directly, so
+    /// it serves both free functions (via `lowerFunction`) and methods (whose
+    /// signature comes from the receiver's method set, not `func_sigs`). Binds
+    /// the receiver (if the decl has one) as the leading parameter.
+    fn lowerFunctionDecl(self: *Lowerer, file_idx: usize, decl: ast.Index, shape: check.FuncShape, gen_env: GenericEnv, name: []const u8) Error!ir.Function {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(decl); // [recv_or_none, name, generics, params, result_or_none, body]
 
         var b = ir.FunctionBuilder.init(self.gpa);
         errdefer b.deinit(self.gpa); // freed here only if lowering errors before finish
@@ -325,7 +314,7 @@ pub const Lowerer = struct {
             const rk = mf.tree.kids(k[0]);
             const recv_ty_node = rk[1];
             if (mf.tree.get(recv_ty_node).tag != .ident) return error.UnsupportedConstruct;
-            const recv_sid = self.rmodule.node_symbols[sym.file_idx][recv_ty_node];
+            const recv_sid = self.rmodule.node_symbols[file_idx][recv_ty_node];
             if (recv_sid == .none) return error.UnsupportedConstruct;
             const recv_struct_ty = self.ctx.decl_memo.get((GlobalSymbol{ .module = @enumFromInt(0), .id = recv_sid }).pack()) orelse
                 return error.UnsupportedConstruct;
@@ -353,7 +342,7 @@ pub const Lowerer = struct {
             err_ty = rdata.fallible.err;
         }
 
-        var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = sym.file_idx, .gen_env = gen_env };
+        var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env };
         defer fc.deinit();
 
         try fc.lowerStmtList(k[5]);
@@ -440,9 +429,7 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         l.layouts.deinit(gpa);
     }
 
-    try l.buildMethodTable();
-
-    // Pass A: every non-generic func/method gets a `FuncId` up front (stable
+    // Pass A: every non-generic func gets a `FuncId` up front (stable
     // symbol-table order), so forward/mutually-recursive direct calls always
     // resolve. Pass A2: every generic instantiation the checker already
     // discovered gets the next block of ids, in `ctx.instantiations` order.
@@ -462,7 +449,41 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         try l.inst_ids.put(gpa, @intCast(i), @enumFromInt(base + i));
     }
 
-    // Pass B: lower bodies in the exact same order as Pass A/A2 assigned ids.
+    // Pass A3: methods on concrete structs. They are not module symbols (§10.4,
+    // resolve.zig keeps them out of the flat namespace so different types can
+    // reuse a method name), so their signature comes from the receiver's method
+    // set and they get `FuncId`s after the instantiations. `l.method_table`
+    // maps (receiver type, name) -> that id for `resolveCallTarget`.
+    const MethodDecl = struct { file_idx: usize, decl: ast.Index, name: []const u8, shape: check.FuncShape };
+    var method_decls: std.ArrayList(MethodDecl) = .empty;
+    defer method_decls.deinit(gpa);
+    const method_base = base + ctx.instantiations.items.len;
+    for (files, 0..) |mf, fidx| {
+        for (mf.tree.kids(mf.tree.root)) |top| {
+            if (top == ast.none) continue;
+            const inner = if (mf.tree.get(top).tag == .@"export") mf.tree.kids(top)[0] else top;
+            if (mf.tree.get(inner).tag != .func_decl) continue;
+            const k = mf.tree.kids(inner); // [recv, name, generics, params, result, body]
+            if (k[0] == ast.none) continue; // free function, handled by Pass A
+            const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
+            if (mf.tree.get(rk[1]).tag != .ident) continue; // generic-struct receiver: deferred
+            const recv_sid = rmodule.node_symbols[fidx][rk[1]];
+            if (recv_sid == .none) continue;
+            const recv_gsym = GlobalSymbol{ .module = @enumFromInt(0), .id = recv_sid };
+            if (ctx.decl_generics.get(recv_gsym.pack())) |gens| {
+                if (gens.len > 0) continue; // method on a generic struct: deferred
+            }
+            const recv_ty = ctx.decl_memo.get(recv_gsym.pack()) orelse continue;
+            const name = identTextOf(mf, k[1]);
+            const bucket = ctx.methodsOf(recv_ty) orelse continue;
+            const method = bucket.get(name) orelse continue;
+            const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
+            try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result });
+            try method_decls.append(gpa, .{ .file_idx = fidx, .decl = inner, .name = name, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
+        }
+    }
+
+    // Pass B: lower bodies in the exact same order as Pass A/A2/A3 assigned ids.
     for (direct_syms.items) |gsym| {
         const sym = rmodule.symbols.items[@intFromEnum(gsym.id)];
         const f = try l.lowerFunction(gsym, &.{}, sym.name);
@@ -475,6 +496,10 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         const name = try std.fmt.allocPrint(gpa, "{s}${d}", .{ sym.name, i });
         defer gpa.free(name);
         const f = try l.lowerFunction(inst.generic, env, name);
+        try l.out.funcs.append(gpa, f);
+    }
+    for (method_decls.items) |m| {
+        const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, m.name);
         try l.out.funcs.append(gpa, f);
     }
 
@@ -1046,11 +1071,9 @@ const FnCtx = struct {
                     const fshape = self.ctx.typeOf(f.ty).func;
                     return .{ .value = .{ .callee = fv, .result = fshape.result } };
                 }
-                if (self.l.lookupMethod(recv_ty, name)) |gsym| {
+                if (self.l.lookupMethod(recv_ty, name)) |entry| {
                     const recv_val = try self.lowerExpr(k[0]);
-                    const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
-                    const shape = self.ctx.func_sigs.get(gsym.pack()).?;
-                    return .{ .direct_method = .{ .func = fid, .recv = recv_val, .result = shape.result } };
+                    return .{ .direct_method = .{ .func = entry.fid, .recv = recv_val, .result = entry.result } };
                 }
             }
             return error.UnsupportedConstruct;
@@ -1390,11 +1413,10 @@ const FnCtx = struct {
                 const layout = try self.l.structLayout(recv_ty);
                 return self.b.fieldGet(f.ty, recv_val, layout.field_offsets[i]);
             }
-            if (self.l.lookupMethod(recv_ty, name)) |gsym| {
+            if (self.l.lookupMethod(recv_ty, name)) |entry| {
                 const recv_val = try self.lowerExpr(k[0]);
-                const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
                 const fty = try self.nodeType(node);
-                return self.b.makeClosure(fty, fid, recv_val);
+                return self.b.makeClosure(fty, entry.fid, recv_val);
             }
         }
         return error.UnsupportedConstruct; // interface method value (not called immediately): deferred
@@ -1435,9 +1457,8 @@ const FnCtx = struct {
                 else => self.b.rtCall(string_ty, .string_from_int, &.{v}),
             };
         }
-        if (self.l.lookupMethod(ty, "show")) |gsym| {
-            const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
-            return self.b.call(string_ty, fid, &.{v});
+        if (self.l.lookupMethod(ty, "show")) |entry| {
+            return self.b.call(string_ty, entry.fid, &.{v});
         }
         if (data == .interface) {
             for (data.interface, 0..) |m, i| {
