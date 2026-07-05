@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const diagnostics = @import("diagnostics.zig");
@@ -85,9 +86,10 @@ const max_source_bytes = 8 << 20; // 8 MiB
 /// Location of the runtime archive. // ponytail: fixed dev-build path;
 /// resolve relative to the `bit` binary's own install prefix, and honor an
 /// env override, once packaging (#358) lands.
-/// The native binary target `bit build`/`run` produces. Defaults to the host
-/// (x86-64 Linux); `--target aarch64-macos` cross-produces an Apple-Silicon
-/// Mach-O (which only a Mac can execute, so `bit run` for it just builds).
+/// The native binary target `bit build`/`run` produces. Defaults to whichever
+/// host is running this `bit` (so `bit run` on a Mac execs an arm64 binary, on
+/// Linux an x86-64 one); `--target` cross-produces the other, which only its
+/// own host can execute (so `bit run` for a foreign target just builds).
 const BuildTarget = enum {
     x86_64_linux,
     aarch64_macos,
@@ -97,6 +99,13 @@ const BuildTarget = enum {
         if (std.mem.eql(u8, s, "aarch64-macos") or std.mem.eql(u8, s, "arm64-macos")) return .aarch64_macos;
         return null;
     }
+};
+
+/// The target matching the host this `bit` binary itself runs on — the default
+/// `bit build`/`run` target, and the only one `bit run` can `exec` directly.
+const host_target: BuildTarget = switch (builtin.target.os.tag) {
+    .macos => .aarch64_macos,
+    else => .x86_64_linux,
 };
 
 fn libbitrtPath(target: BuildTarget) []const u8 {
@@ -115,7 +124,7 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     // any order.
     var src_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
-    var target: BuildTarget = .x86_64_linux;
+    var target: BuildTarget = host_target;
     var ai: usize = 0;
     while (ai < args.len) {
         const arg = args[ai];
@@ -157,12 +166,15 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     const dest = out_path orelse std.fs.path.stem(src);
     const dest_z = try gpa.dupeZ(u8, dest);
     defer gpa.free(dest_z);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dest_z, .data = exe });
-    _ = std.os.linux.fchmodat(std.os.linux.AT.FDCWD, dest_z, 0o755);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dest_z,
+        .data = exe,
+        .flags = .{ .permissions = .executable_file },
+    });
 
-    // A cross-produced macOS binary cannot run on this (Linux) host; `bit run`
-    // for it just builds.
-    if (!is_run or target != .x86_64_linux) return 0;
+    // A cross-produced binary can't run on this host; `bit run` for a foreign
+    // target just builds.
+    if (!is_run or target != host_target) return 0;
 
     // Run it: `execve` needs a slash to resolve a path against the cwd.
     const run_path = try std.fmt.allocPrintSentinel(gpa, "./{s}", .{dest_z}, 0);
@@ -466,26 +478,28 @@ test "compileReport reports success on clean source" {
 }
 
 test "build: a printing program compiles, links, and runs" {
-    const builtin = @import("builtin");
     if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(), gpa, .unlimited) catch
+    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(.x86_64_linux), gpa, .unlimited) catch
         return error.SkipZigTest; // `zig build libbitrt` not run here
     defer gpa.free(lib);
 
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
     const src = "function main() {\n  print(\"hi from bit\")\n}\n";
-    const exe = (try buildExecutable(gpa, "e2e.bit", src, lib, &discard.writer)) orelse return error.CompileFailed;
+    const exe = (try buildExecutable(gpa, "e2e.bit", src, lib, .x86_64_linux, &discard.writer)) orelse return error.CompileFailed;
     defer gpa.free(exe);
 
     const path = "/tmp/bit-e2e-test";
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = exe });
-    _ = std.os.linux.fchmodat(std.os.linux.AT.FDCWD, path, 0o755);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = exe,
+        .flags = .{ .permissions = .executable_file },
+    });
 
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
