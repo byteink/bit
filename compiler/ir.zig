@@ -82,6 +82,15 @@ pub const RtFn = enum {
     map_iter_init,
     map_iter_next,
     select,
+    /// Dynamic `[]T` (ABI.md §2). `slice_new(len, cap, is_ref) -> slice`;
+    /// `slice_append(slice, word) -> slice` (grows, returns the header);
+    /// `slice_get(slice, index) -> word` and `slice_set(slice, index, word)`
+    /// are bounds-checked (SPEC §18.4). Elements are one word each; `len(s)` on
+    /// a slice stays the `slice_len` op (a plain header load, not a call).
+    slice_new,
+    slice_append,
+    slice_get,
+    slice_set,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

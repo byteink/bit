@@ -28,15 +28,14 @@
 //! silently-wrong codegen — mirrors `lower.zig`'s own scope-exclusion style)
 //!
 //! - `call_iface`: interface vtable dispatch layout is not decided yet.
-//! - `index_get`/`index_set`/`slice_len` on anything but a static `.array`
-//!   base: array element addressing is fully determined by `lower.zig`'s
-//!   "everything non-scalar is one boxed pointer, arrays have no header, a
-//!   static length" scheme, so `base + index*width` is unambiguous. A slice
-//!   or `string`'s runtime length has no defined home anywhere yet (same gap
-//!   as `gc_alloc`'s `TypeInfo`) — `lower.zig` only ever emits `slice_len`
-//!   for those two shapes (never `.array`, which lowers its length as a
-//!   `const_int` instead — see `lower.zig`'s `for..of` lowering), so this
-//!   exclusion never blocks a supported program from using arrays.
+//! - `index_get`/`index_set` on anything but a static `.array` base: array
+//!   element addressing is fully determined by `lower.zig`'s "arrays have no
+//!   header, a static length" scheme, so `base + index*width` is unambiguous.
+//!   A dynamic `[]T` instead carries a `{ptr, len, cap, is_ref}` header
+//!   (ABI.md §2) and indexes through the bounds-checked `slice_get`/`slice_set`
+//!   runtime calls, so `lower.zig` never emits the `index_*` ops against a
+//!   slice. `slice_len` IS covered here: it loads the `len` word (offset 8),
+//!   shared by the slice and `string` headers.
 //! - A `ret` carrying more than one value: `ir.zig` itself notes "codegen
 //!   decides ABI packing for a multi-value tuple return" — undecided, so an
 //!   explicit error rather than a guessed packing.
@@ -1325,6 +1324,18 @@ fn emitIndexGet(self: *Ctx, dst: u32, base: ir.ValueId, index: ir.ValueId, ty: T
     }
 }
 
+/// `slice_len` reads the `len` word from a slice or string header. A `[]T`
+/// header is `{ptr, len, cap, is_ref}` and a `string` header is `{ptr, len}`
+/// (ABI.md §2) — both keep `len` at offset 8, so one load serves both. `len`
+/// on a static `[N]T` array never reaches here (lowering folds it to a
+/// `const_int`), and dynamic slice indexing goes through the `slice_get`/`_set`
+/// runtime calls, so this op only ever loads a header length.
+fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
+    const base_reg = try getInt(self, vregOf(self, base), scratch2);
+    try self.movLoad(scratch1, base_reg, null, 1, 8, 8, false);
+    try putInt(self, dst, scratch1);
+}
+
 /// `ty` is `value`'s own type (the array's element type) — see `emitIndexGet`.
 fn emitIndexSet(self: *Ctx, base: ir.ValueId, index: ir.ValueId, value: ir.ValueId, ty: TypeId) CodegenError!void {
     if (self.tctx().typeOf(self.f.valueType(base)) != .array) return error.UnsupportedConstruct;
@@ -1477,6 +1488,10 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .map_iter_init = "bit_rt_map_iter_init",
     .map_iter_next = "bit_rt_map_iter_next",
     .select = "bit_rt_select",
+    .slice_new = "bit_rt_slice_new",
+    .slice_append = "bit_rt_slice_append",
+    .slice_get = "bit_rt_slice_get",
+    .slice_set = "bit_rt_slice_set",
 });
 
 const CallReturn = struct { dst: u32, ty: TypeId };
@@ -1826,7 +1841,8 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .gc_alloc => try emitGcAlloc(self, dst, d.gc_alloc.size, d.gc_alloc.ptr_offsets),
         .make_closure => try emitMakeClosure(self, dst, d.make_closure.func, d.make_closure.env),
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
-        .slice_len, .call_iface => return error.UnsupportedConstruct,
+        .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
+        .call_iface => return error.UnsupportedConstruct,
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
     }
 }

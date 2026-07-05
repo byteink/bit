@@ -17,10 +17,11 @@
 //! Deliberately NOT covered (returns `error.UnsupportedConstruct`, never a
 //! silently-wrong lowering): maps (construction and `for..in` — the
 //! iteration protocol itself is still an open placeholder, see
-//! `ir.RtFn.map_iter_init`'s doc comment); `switch`/`select`; slice/array
-//! *construction* (`slice_lit`, `append`) — `ir.zig`'s `Op` set has no
-//! slice-construction instruction yet, only ops that read an *existing*
-//! slice (`index_get`/`slice_len`); fallible functions' `fail`/`?`/`catch`
+//! `ir.RtFn.map_iter_init`'s doc comment); `select` (channels are not yet
+//! lowered — #1146); slice re-slicing `s[lo:hi]` and the `[]T(n[, m])`
+//! constructor (`slice_lit`/`[]T{...}`, `append`, dynamic index, and `len`/`cap`
+//! all lower via the `slice_*` runtime calls — ABI.md §2); fallible functions'
+//! `fail`/`?`/`catch`
 //! (the `Result` calling convention is undecided — a plain `return` in a
 //! fallible function still lowers fine, since it needs no convention beyond
 //! "pass the ok value"); tuple-destructuring bindings; methods on a still-
@@ -720,10 +721,11 @@ const FnCtx = struct {
             },
             .index => {
                 const k = self.kids(node);
+                const is_slice = self.ctx.typeOf(try self.nodeType(k[0])) == .slice;
                 const recv_val = try self.lowerExpr(k[0]);
                 const idx_val = try self.lowerExpr(k[1]);
                 const elem_ty = try self.nodeType(node);
-                return .{ .elem = .{ .recv = recv_val, .index = idx_val, .ty = elem_ty } };
+                return .{ .elem = .{ .recv = recv_val, .index = idx_val, .ty = elem_ty, .is_slice = is_slice } };
             },
             else => return error.UnsupportedConstruct,
         }
@@ -732,14 +734,19 @@ const FnCtx = struct {
         return switch (lv) {
             .local => |i| self.env.bindings.items[i].value,
             .field => |f| self.b.fieldGet(f.ty, f.recv, f.offset),
-            .elem => |e| self.b.indexGet(e.ty, e.recv, e.index),
+            .elem => |e| if (e.is_slice)
+                self.b.rtCall(e.ty, .slice_get, &.{ e.recv, e.index })
+            else
+                self.b.indexGet(e.ty, e.recv, e.index),
         };
     }
     fn writeLvalue(self: *FnCtx, lv: Lvalue, val: ir.ValueId) Error!void {
         switch (lv) {
             .local => |i| self.env.bindings.items[i].value = val,
             .field => |f| try self.b.fieldSet(f.recv, f.offset, val),
-            .elem => |e| try self.b.indexSet(e.recv, e.index, val),
+            .elem => |e| if (e.is_slice) {
+                _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ e.recv, e.index, val });
+            } else try self.b.indexSet(e.recv, e.index, val),
         }
     }
 
@@ -1293,16 +1300,37 @@ const FnCtx = struct {
             return self.b.rtCall(void_ty, .assert, vals);
         }
         if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "cap")) {
+            const is_cap = std.mem.eql(u8, name, "cap");
             const arg = self.kids(arg_nodes[0])[0];
             const arg_ty = try self.nodeType(arg);
             const i64ty = self.ctx.prim_ids.get(.i64);
             const data = self.ctx.typeOf(arg_ty);
-            if (data == .array) return self.b.constInt(i64ty, @intCast(data.array.len));
+            if (data == .array) return self.b.constInt(i64ty, @intCast(data.array.len)); // len == cap
             const v = try self.lowerExpr(arg);
-            if (data == .slice or (data == .prim and data.prim == .string)) return self.b.sliceLen(i64ty, v);
+            // Slice header is `{ptr, len, cap, is_ref}`: `len` at +8 (`slice_len`,
+            // shared with `string`), `cap` at +16. `cap` is slice-only.
+            if (data == .slice) return if (is_cap) self.b.fieldGet(i64ty, v, 16) else self.b.sliceLen(i64ty, v);
+            if (!is_cap and data == .prim and data.prim == .string) return self.b.sliceLen(i64ty, v);
             return error.UnsupportedConstruct;
         }
-        return error.UnsupportedConstruct; // append/delete/close: deferred
+        if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
+        return error.UnsupportedConstruct; // delete/close: deferred
+    }
+
+    /// `append(s, e1, e2, ...)`: folds each element through `slice_append`,
+    /// threading the returned (possibly regrown) header so the caller's
+    /// `s = append(s, ...)` observes the new length. The elements are checked
+    /// against the slice's element type, so each lowers with that hint.
+    fn lowerAppend(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const arg_nodes = self.kids(self.kids(node)[2]);
+        const slice_ty = try self.nodeType(self.kids(arg_nodes[0])[0]);
+        const elem_ty = self.ctx.typeOf(slice_ty).slice;
+        var acc = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+        for (arg_nodes[1..]) |an| {
+            const v = try self.lowerExprH(self.kids(an)[0], elem_ty);
+            acc = try self.b.rtCall(slice_ty, .slice_append, &.{ acc, v });
+        }
+        return acc;
     }
 
     fn lowerCall(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
@@ -1478,12 +1506,17 @@ const FnCtx = struct {
                 const recv = try self.lowerExpr(k[0]);
                 const idxv = try self.lowerExpr(k[1]);
                 const ty = try self.nodeType(node);
+                // A dynamic `[]T` reads through the bounds-checked runtime; a
+                // static `[N]T` array is a direct data pointer (codegen op).
+                if (self.ctx.typeOf(try self.nodeType(k[0])) == .slice)
+                    break :blk self.b.rtCall(ty, .slice_get, &.{ recv, idxv });
                 break :blk self.b.indexGet(ty, recv, idxv);
             },
             .str_interp => self.lowerStrInterp(node),
             .composite_lit => self.lowerCompositeLit(node),
+            .slice_lit => self.lowerSliceElems(try self.nodeType(node), self.kids(node)),
             .arrow_fn => self.lowerArrowFn(node),
-            else => error.UnsupportedConstruct, // try_expr/catch_*/type_assert/tuple_index/slice_expr/slice_lit/map literals
+            else => error.UnsupportedConstruct, // try_expr/catch_*/type_assert/tuple_index/slice_expr/map literals
         };
     }
 
@@ -1607,11 +1640,44 @@ const FnCtx = struct {
         return error.UnsupportedConstruct; // interface method value (not called immediately): deferred
     }
 
+    /// True when a value of `ty` is a single-word GC reference (mirrors
+    /// `codegen/common.isRefType`): recorded in a slice header so #1106 can
+    /// scan the element buffer. Value-typed elements wider than a word are
+    /// boxed, so their word is a reference too.
+    fn elemIsRef(self: *const FnCtx, ty: TypeId) bool {
+        return switch (self.ctx.typeOf(ty)) {
+            .prim => |p| p == .string,
+            .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible => false,
+            else => true, // slice/array/map/tuple/chan/struct/interface/func
+        };
+    }
+
+    /// Builds a `[]T` from an element list (a bare `[a, b]` `slice_lit` or a
+    /// typed `[]T{a, b}` composite): allocate a length-N slice, then store each
+    /// element. `items` are `arg`/`arg_spread` wrappers; the element expression
+    /// is each item's first child.
+    fn lowerSliceElems(self: *FnCtx, slice_ty: TypeId, items: []const ast.Index) Error!ir.ValueId {
+        const elem_ty = self.ctx.typeOf(slice_ty).slice;
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const n: i64 = @intCast(items.len);
+        const len = try self.b.constInt(i64ty, n);
+        const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
+        const s = try self.b.rtCall(slice_ty, .slice_new, &.{ len, len, is_ref });
+        for (items, 0..) |a, i| {
+            const inner = self.kids(a)[0];
+            const v = try self.lowerExprH(inner, elem_ty);
+            const idx = try self.b.constInt(i64ty, @intCast(i));
+            _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ s, idx, v });
+        }
+        return s;
+    }
+
     fn lowerCompositeLit(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [type, init]
         const ty = try self.nodeType(node);
         const data = self.ctx.typeOf(ty);
-        if (data != .@"struct") return error.UnsupportedConstruct; // slice/map literals: deferred
+        if (data == .slice) return self.lowerSliceElems(ty, self.kids(k[1])); // []T{...}
+        if (data != .@"struct") return error.UnsupportedConstruct; // map literals: deferred
         const init_node = k[1];
         if (self.tree().get(init_node).tag != .field_inits) return error.UnsupportedConstruct;
         const layout = try self.l.structLayout(ty);
@@ -1801,7 +1867,7 @@ const FnCtx = struct {
 const Lvalue = union(enum) {
     local: usize,
     field: struct { recv: ir.ValueId, ty: TypeId, offset: u32 },
-    elem: struct { recv: ir.ValueId, index: ir.ValueId, ty: TypeId },
+    elem: struct { recv: ir.ValueId, index: ir.ValueId, ty: TypeId, is_slice: bool },
 };
 
 /// The base arithmetic op a compound-assign token (`+=` etc.) applies.
@@ -2043,6 +2109,23 @@ test "lowers string interpolation to a concat rt_call" {
     const src =
         \\function greet(name: string, age: i64): string {
         \\  return "hi ${name}, age ${age}"
+        \\}
+        \\
+    ;
+    var out = try lowerSource(gpa, src);
+    defer out.module.deinit();
+    defer out.ctx.deinit();
+    try ir.verify(gpa, &out.module);
+}
+
+test "lowers a slice literal, append, indexed store, and len" {
+    const gpa = testing.allocator;
+    const src =
+        \\function build(): i64 {
+        \\  let xs = [1, 2, 3]
+        \\  xs = append(xs, 4)
+        \\  xs[0] = 9
+        \\  return xs[0] + len(xs) + cap(xs)
         \\}
         \\
     ;

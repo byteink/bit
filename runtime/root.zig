@@ -239,6 +239,74 @@ export fn bit_rt_string_from_bool(v: bool) callconv(.c) *const RtBytes {
 }
 
 // ---------------------------------------------------------------------------
+// Slices (ABI.md §2): a `[]T` value is a pointer to a GC-allocated
+// `{ptr, len, cap, is_ref}` header; `ptr` points at a *separate* GC element
+// buffer the header traces (`ptr_offsets = [0]`). Elements are one 8-byte word
+// each — the same word model channels use (ABI.md §11): a `T` that fits in a
+// word is stored by value, a wider `T` is boxed and its reference stored. This
+// keeps `[]T` a single-word value and makes indexing a fixed stride, at the
+// cost of one word per element (a packed `[]byte` is a later optimization).
+// `is_ref` records whether each word is a GC reference, for #1106's buffer
+// scanning; the buffer itself is a leaf today (its elements are not yet traced).
+// ---------------------------------------------------------------------------
+
+const SliceHeader = extern struct {
+    ptr: [*]u64, // +0  element buffer (a GC object); the header's one traced ref
+    len: usize, // +8
+    cap: usize, // +16
+    is_ref: usize, // +24  0/1: are the buffered words GC references (for #1106)
+};
+
+const slice_info = gc_mod.TypeInfo.of(@sizeOf(SliceHeader), &[_]usize{0}, "slice");
+const slicebuf_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "slicebuf"); // leaf
+
+/// Allocates a `cap`-word element buffer (a leaf GC object). `cap == 0` yields
+/// a valid zero-length body — never indexed (bounds checks reject it).
+fn allocSliceBuf(cap: usize) [*]u64 {
+    const body = g_gc.allocRaw(cap * @sizeOf(u64), &slicebuf_info) orelse fatal("out of memory");
+    return @ptrCast(@alignCast(body));
+}
+
+/// `bit_rt_slice_new`: a fresh `[]T` of length `len`, capacity `max(len, cap)`,
+/// elements zeroed. Backs slice literals (`len == cap == N`) and `[]T(n[, m])`.
+export fn bit_rt_slice_new(len: usize, cap: usize, is_ref: usize) callconv(.c) *SliceHeader {
+    const c = if (cap < len) len else cap;
+    const h: *SliceHeader = @ptrCast(@alignCast(g_gc.alloc(&slice_info) orelse fatal("out of memory")));
+    h.* = .{ .ptr = allocSliceBuf(c), .len = len, .cap = c, .is_ref = is_ref };
+    return h;
+}
+
+/// `bit_rt_slice_append`: appends one word, growing the buffer (doubling, from
+/// 1) when full. Mutates the header in place and returns it, so `s = append(s,
+/// x)` observes the new length/buffer through the same value.
+export fn bit_rt_slice_append(h: *SliceHeader, word: u64) callconv(.c) *SliceHeader {
+    if (h.len == h.cap) {
+        const newcap = if (h.cap == 0) 1 else h.cap * 2;
+        const nb = allocSliceBuf(newcap);
+        @memcpy(nb[0..h.len], h.ptr[0..h.len]);
+        h.ptr = nb;
+        h.cap = newcap;
+    }
+    h.ptr[h.len] = word;
+    h.len += 1;
+    return h;
+}
+
+/// `bit_rt_slice_get`: bounds-checked element read (SPEC §18.4 — out-of-range
+/// panics). Returns the raw word; a sub-word `T` occupies its low bytes exactly
+/// as the producer left it (already correctly extended in its register).
+export fn bit_rt_slice_get(h: *const SliceHeader, index: usize) callconv(.c) u64 {
+    if (index >= h.len) fatal("index out of range");
+    return h.ptr[index];
+}
+
+/// `bit_rt_slice_set`: bounds-checked element write (SPEC §18.4).
+export fn bit_rt_slice_set(h: *SliceHeader, index: usize, word: u64) callconv(.c) void {
+    if (index >= h.len) fatal("index out of range");
+    h.ptr[index] = word;
+}
+
+// ---------------------------------------------------------------------------
 // Channels (ABI.md §11)
 // ---------------------------------------------------------------------------
 

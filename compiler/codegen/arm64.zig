@@ -48,11 +48,13 @@
 //! ## Deliberately NOT covered
 //!
 //! Same exclusions as `x64.zig`, for identical reasons (these are
-//! IR/lowering-level gaps, not backend-specific ones): `call_iface`,
-//! `slice_len` (non-array base), and a `ret` carrying more than one value
-//! all return `error.UnsupportedConstruct`. `field_get`/`field_set`,
-//! `index_get`/`index_set` (array base only), `gc_alloc`, `const_string`,
-//! `make_closure`, `call_value`, and `rt_call` ARE covered.
+//! IR/lowering-level gaps, not backend-specific ones): `call_iface` and a
+//! `ret` carrying more than one value return `error.UnsupportedConstruct`.
+//! `field_get`/`field_set`, `index_get`/`index_set` (array base only),
+//! `slice_len` (loads the header `len` word — slice/string), `gc_alloc`,
+//! `const_string`, `make_closure`, `call_value`, and `rt_call` ARE covered.
+//! Dynamic `[]T` indexing goes through the `slice_get`/`slice_set` runtime
+//! calls (ABI.md §2), never the `index_*` ops.
 //!
 //! ## Sub-64-bit integers
 //!
@@ -1147,6 +1149,18 @@ fn emitConstFloat(self: *Ctx, dst: u32, val: f64, width: u8) !void {
     try putFloat(self, dst, fscratch1);
 }
 
+/// `slice_len` reads the `len` word from a slice or string header. A `[]T`
+/// header is `{ptr, len, cap, is_ref}` and a `string` header is `{ptr, len}`
+/// (ABI.md §2) — both keep `len` at offset 8, so one load serves both. `len`
+/// on a static `[N]T` array folds to a `const_int` in lowering, and dynamic
+/// slice indexing goes through the `slice_get`/`_set` runtime calls, so this op
+/// only ever loads a header length.
+fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
+    const base_reg = try getInt(self, vregOf(self, base), scratch2);
+    try self.loadImm(scratch1, @intFromEnum(base_reg), 8, 8, false);
+    try putInt(self, dst, scratch1);
+}
+
 fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId) !void {
     const w = common.widthOf(self.tctx(), ty);
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
@@ -1240,6 +1254,10 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .map_iter_init => "bit_rt_map_iter_init",
         .map_iter_next => "bit_rt_map_iter_next",
         .select => "bit_rt_select",
+        .slice_new => "bit_rt_slice_new",
+        .slice_append => "bit_rt_slice_append",
+        .slice_get => "bit_rt_slice_get",
+        .slice_set => "bit_rt_slice_set",
     };
 }
 const safepoint_symbol = "bit_rt_safepoint";
@@ -1487,7 +1505,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .field_set => |fs| try emitFieldSet(self, fs.base, fs.offset, fs.value, self.f.valueType(fs.value)),
         .index_get => |ig| try emitIndexGet(self, i, ig.base, ig.index, ty),
         .index_set => |is_| try emitIndexSet(self, is_.base, is_.index, is_.value, self.f.valueType(is_.value)),
-        .slice_len => return error.UnsupportedConstruct,
+        .slice_len => |sl| try emitSliceLen(self, i, sl.base),
         .make_closure => |mc| try emitMakeClosure(self, i, mc.func, mc.env),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
     }
