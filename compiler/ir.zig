@@ -388,6 +388,24 @@ pub const Module = struct {
     }
 };
 
+/// Deterministic symbol name for the static `TypeInfo` a `gc_alloc` of the
+/// given layout references. Same (size, ptr_offsets) -> same name, so codegen
+/// (which references it) and the object emitter (which defines it) agree with
+/// no shared index, and identical TypeInfos dedup naturally. Caller owns the
+/// returned bytes.
+pub fn typeInfoSymbol(gpa: Allocator, size: u32, ptr_offsets: []const u32) Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    var numbuf: [16]u8 = undefined;
+    try list.appendSlice(gpa, "__bittype_");
+    try list.appendSlice(gpa, std.fmt.bufPrint(&numbuf, "{d}", .{size}) catch unreachable);
+    for (ptr_offsets) |off| {
+        try list.append(gpa, '_');
+        try list.appendSlice(gpa, std.fmt.bufPrint(&numbuf, "{d}", .{off}) catch unreachable);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
 // ============================================================================
 // Builder
 // ============================================================================

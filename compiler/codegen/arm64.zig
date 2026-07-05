@@ -1266,22 +1266,41 @@ fn emitCall(self: *Ctx, dst: ?u32, dst_ty: TypeId, symbol: []const u8, args: []c
     try self.emitCallReloc(symbol);
     const ret_off: u32 = @intCast(self.code.items.len);
 
-    if (is_safepoint) {
-        const pos = self.safepoint_positions[self.next_safepoint_idx];
-        const sm = self.result.stack_maps[self.next_safepoint_idx];
-        std.debug.assert(sm.pos == pos);
-        const regs = try self.gpa.alloc(Reg, sm.regs.len);
-        for (sm.regs, 0..) |idx, i| regs[i] = self.int_regs[idx];
-        const offs = try self.gpa.alloc(i32, sm.slots.len);
-        for (sm.slots, 0..) |slot, i| offs[i] = @intCast(self.frame.spillOffset(slot));
-        try self.safepoints.append(self.gpa, .{ .code_offset = ret_off, .regs = regs, .frame_offsets = offs });
-        self.next_safepoint_idx += 1;
-    }
+    if (is_safepoint) try recordSafepoint(self, ret_off);
 
     if (dst) |d| {
         const class = common.classOf(self.tctx(), dst_ty);
         if (class == .int) try putInt(self, d, @enumFromInt(retRegNum(.int))) else try putFloat(self, d, @enumFromInt(retRegNum(.float)));
     }
+}
+
+/// Records the stack map for the safepoint at `ret_off` (a call return
+/// address) from the register allocator's precomputed `stack_maps`, in the
+/// same first-seen order `buildIntervals` collected them. Shared by every
+/// safepoint-bearing call site (`emitCall`, `emitGcAlloc`).
+fn recordSafepoint(self: *Ctx, ret_off: u32) CodegenError!void {
+    const pos = self.safepoint_positions[self.next_safepoint_idx];
+    const sm = self.result.stack_maps[self.next_safepoint_idx];
+    std.debug.assert(sm.pos == pos);
+    const regs = try self.gpa.alloc(Reg, sm.regs.len);
+    for (sm.regs, 0..) |idx, i| regs[i] = self.int_regs[idx];
+    const offs = try self.gpa.alloc(i32, sm.slots.len);
+    for (sm.slots, 0..) |slot, i| offs[i] = @intCast(self.frame.spillOffset(slot));
+    try self.safepoints.append(self.gpa, .{ .code_offset = ret_off, .regs = regs, .frame_offsets = offs });
+    self.next_safepoint_idx += 1;
+}
+
+/// `gc_alloc`: load the static `TypeInfo` blob's address into x0 and `bl
+/// bit_rt_gc_alloc`, which returns the zeroed body pointer in x0. A GC point,
+/// so it records a safepoint (buildIntervals/hasCalls count `gc_alloc` too).
+fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) CodegenError!void {
+    const name = try ir.typeInfoSymbol(self.gpa, size, ptr_offsets);
+    try self.owned_syms.append(self.gpa, name);
+    try self.emitAddrOf(@enumFromInt(argReg(.int, 0).?), name); // arg0 = x0
+    try self.emitCallReloc("bit_rt_gc_alloc");
+    const ret_off: u32 = @intCast(self.code.items.len);
+    try recordSafepoint(self, ret_off);
+    try putInt(self, dst, @enumFromInt(retRegNum(.int)));
 }
 
 /// True iff `jump`/`br` targeting `target` is a loop back-edge — see module
@@ -1403,7 +1422,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
             try emitCall(self, if (ty != .invalid) i else null, ty, target.name, c.args, true);
         },
         .call_value, .call_iface => return error.UnsupportedConstruct,
-        .gc_alloc => return error.UnsupportedConstruct,
+        .gc_alloc => |g| try emitGcAlloc(self, i, g.size, g.ptr_offsets),
         .field_get => |fg| try emitFieldGet(self, i, fg.base, fg.offset, ty),
         .field_set => |fs| try emitFieldSet(self, fs.base, fs.offset, fs.value, self.f.valueType(fs.value)),
         .index_get => |ig| try emitIndexGet(self, i, ig.base, ig.index, ty),
@@ -1420,7 +1439,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
 
 fn hasCalls(f: *const ir.Function) bool {
     for (f.insts.items(.op)) |op| {
-        if (op == .call or op == .rt_call) return true;
+        if (op == .call or op == .rt_call or op == .gc_alloc) return true;
     }
     return false;
 }
@@ -1454,7 +1473,7 @@ fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Functio
         while (idx < end) : (idx += 1) {
             const id: ir.ValueId = @enumFromInt(idx);
             const op = f.insts.items(.op)[idx];
-            if (op == .call or op == .rt_call) try safepoints.append(gpa, idx);
+            if (op == .call or op == .rt_call or op == .gc_alloc) try safepoints.append(gpa, idx);
             const dd = f.decode(id);
             extendUses(intervals, idx, dd);
             switch (dd) {

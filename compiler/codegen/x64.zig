@@ -1171,6 +1171,25 @@ fn emitConstString(self: *Ctx, dst: u32, pool_idx: u32) !void {
     try putInt(self, dst, scratch1);
 }
 
+/// `gc_alloc`: load the static `TypeInfo` blob's address into arg0 and call
+/// `bit_rt_gc_alloc`, which returns the zeroed body pointer. This is a real
+/// call and a GC point, so — like `emitCallLike` — it records a safepoint at
+/// the return address so a collection triggered by the allocation finds the
+/// caller's live pointers in the stack map (`collectSafepoints`/`scanFuncFlags`
+/// count `gc_alloc` as a safepoint site so the slot exists).
+fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) !void {
+    const name = try ir.typeInfoSymbol(self.gpa, size, ptr_offsets);
+    try self.owned_syms.append(self.gpa, name);
+    const arg0: Reg = if (self.cc == .win64) .rcx else .rdi; // SysV rdi / Win64 rcx
+    try self.movAbsReloc(arg0, name);
+    if (self.cc == .win64) try self.rspAddSub(true, 32);
+    try self.emitCallReloc("bit_rt_gc_alloc");
+    self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
+    self.next_safepoint_idx += 1;
+    if (self.cc == .win64) try self.rspAddSub(false, 32);
+    try putInt(self, dst, .rax);
+}
+
 fn emitConstInt(self: *Ctx, dst: u32, val: i64) !void {
     try self.movRI(scratch1, val);
     try putInt(self, dst, scratch1);
@@ -1622,7 +1641,7 @@ fn collectSafepoints(gpa: Allocator, f: *const ir.Function) Allocator.Error![]u3
         const end = blk.insts_start + blk.insts_len;
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
-                .call, .rt_call => try out.append(gpa, @intCast(i)),
+                .call, .rt_call, .gc_alloc => try out.append(gpa, @intCast(i)),
                 .jump => {
                     const j = f.decode(@enumFromInt(i)).jump;
                     if (@intFromEnum(j.target) <= bi) try out.append(gpa, @intCast(i));
@@ -1652,7 +1671,7 @@ fn scanFuncFlags(f: *const ir.Function) FuncFlags {
         const end = blk.insts_start + blk.insts_len;
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
-                .call, .rt_call => flags.has_safepoints = true,
+                .call, .rt_call, .gc_alloc => flags.has_safepoints = true,
                 .sdiv, .udiv, .srem, .urem => flags.needs_rax_rdx = true,
                 .shl, .ashr, .lshr => {
                     const b = f.decode(@enumFromInt(i)).bin;
@@ -1723,7 +1742,8 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .field_set => try emitFieldSet(self, d.field_set.base, d.field_set.offset, d.field_set.value, self.f.valueType(d.field_set.value)),
         .index_get => try emitIndexGet(self, dst, d.index_get.base, d.index_get.index, ty),
         .index_set => try emitIndexSet(self, d.index_set.base, d.index_set.index, d.index_set.value, self.f.valueType(d.index_set.value)),
-        .slice_len, .gc_alloc, .call_value, .call_iface, .make_closure => return error.UnsupportedConstruct,
+        .gc_alloc => try emitGcAlloc(self, dst, d.gc_alloc.size, d.gc_alloc.ptr_offsets),
+        .slice_len, .call_value, .call_iface, .make_closure => return error.UnsupportedConstruct,
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
     }
 }
@@ -2364,11 +2384,11 @@ test "compileFunction: a Win64 call records its safepoint at the return address,
     try testing.expectEqualSlices(u8, &.{ 0x48, 0x81, 0xC4 }, code.code[sp .. sp + 3]);
 }
 
-test "compileFunction: gc_alloc is unsupported (no TypeInfo ABI yet)" {
-    // `gc_alloc` is rejected unconditionally regardless of the type being
-    // allocated (module doc comment); allocate a real aggregate `.array` type
-    // so the rejection is exercised on the exact shape the front end emits it
-    // for, not a scalar stand-in.
+test "compileFunction: gc_alloc calls bit_rt_gc_alloc with a TypeInfo reloc" {
+    // A real aggregate `.array` type — the exact shape the front end emits
+    // `gc_alloc` for. Codegen loads the deduped `__bittype_*` TypeInfo blob's
+    // address and calls the runtime allocator; the object emitter defines the
+    // blob (see emit.zig) and the linker resolves `bit_rt_gc_alloc`.
     const gpa = testing.allocator;
     var tctx = try TypeContext.init(gpa);
     defer tctx.deinit();
@@ -2384,8 +2404,18 @@ test "compileFunction: gc_alloc is unsupported (no TypeInfo ABI yet)" {
     const v = try b.gcAlloc(arr_ty, 32, &.{});
     try b.ret(&.{v});
     b.endBlock();
-    var f = try b.finish("bad", &.{}, i64_ty, false, .invalid, entry);
+    var f = try b.finish("mkarr", &.{}, i64_ty, false, .invalid, entry);
     defer f.deinit(gpa);
 
-    try testing.expectError(error.UnsupportedConstruct, compileFunction(gpa, &module, &f, .sysv));
+    var fc = try compileFunction(gpa, &module, &f, .sysv);
+    defer fc.deinit();
+
+    var saw_call = false;
+    var saw_type = false;
+    for (fc.relocs) |r| {
+        if (std.mem.eql(u8, r.symbol, "bit_rt_gc_alloc")) saw_call = true;
+        if (std.mem.startsWith(u8, r.symbol, "__bittype_")) saw_type = true;
+    }
+    try testing.expect(saw_call);
+    try testing.expect(saw_type);
 }

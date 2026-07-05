@@ -20,6 +20,30 @@ const obj_macho = @import("obj/macho.zig");
 
 pub const Error = error{NoMain} || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
 
+/// One distinct `gc_alloc` layout — turned into a static `TypeInfo` blob the
+/// runtime's `bit_rt_gc_alloc` reads (runtime/gc.zig). `size` is the body
+/// size; `ptr_offsets` the byte offsets of pointer fields the GC must scan.
+const TypeInfoLayout = struct { size: u32, ptr_offsets: []const u32 };
+
+/// Every distinct `gc_alloc` layout in the module, deduped by its `TypeInfo`
+/// symbol name (so identical struct shapes share one blob). Bytes owned by `a`.
+fn collectTypeInfos(a: Allocator, module: *const ir.Module) Allocator.Error![]TypeInfoLayout {
+    var seen = std.StringHashMapUnmanaged(void){};
+    var out: std.ArrayList(TypeInfoLayout) = .empty;
+    for (module.funcs.items) |*f| {
+        var i: u32 = 0;
+        while (i < f.insts.len) : (i += 1) {
+            if (f.insts.items(.op)[i] != .gc_alloc) continue;
+            const g = f.decode(@enumFromInt(i)).gc_alloc;
+            const name = try ir.typeInfoSymbol(a, g.size, g.ptr_offsets);
+            if (seen.contains(name)) continue;
+            try seen.put(a, name, {});
+            try out.append(a, .{ .size = g.size, .ptr_offsets = g.ptr_offsets });
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// Emits `module` as an x86-64 ELF relocatable object. The returned bytes are
 /// owned by `gpa`; the module's `main` becomes the runtime entry.
 pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
@@ -96,6 +120,40 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try symbols.append(a, .{ .name = hdr_name, .section = .rodata, .offset = hdr_off, .size = 16, .binding = .global, .kind = .object });
         try defined.put(a, hdr_name, {});
         try relocs.append(a, .{ .section = .rodata, .offset = hdr_off, .symbol = data_name, .kind = .abs64, .addend = 0 });
+    }
+
+    // ---- gc_alloc TypeInfo blobs -> .rodata -------------------------------
+    // extern struct TypeInfo { size, ptr_offsets_ptr, ptr_offsets_len,
+    // name_ptr, name_len } (runtime/gc.zig), preceded by its usize[] offsets.
+    for (try collectTypeInfos(a, module)) |ti| {
+        const name = try ir.typeInfoSymbol(a, ti.size, ti.ptr_offsets);
+        var offs_name: []const u8 = "";
+        if (ti.ptr_offsets.len > 0) {
+            while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
+            const offs_off: u64 = rodata.items.len;
+            for (ti.ptr_offsets) |off| {
+                var b: [8]u8 = undefined;
+                std.mem.writeInt(u64, &b, off, .little);
+                try rodata.appendSlice(a, &b);
+            }
+            offs_name = try std.fmt.allocPrint(a, "{s}_offs", .{name});
+            try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local, .kind = .object });
+            try defined.put(a, offs_name, {});
+        }
+        while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
+        const ti_off: u64 = rodata.items.len;
+        var field: [8]u8 = undefined;
+        std.mem.writeInt(u64, &field, ti.size, .little);
+        try rodata.appendSlice(a, &field); // size
+        try rodata.appendSlice(a, &(.{0} ** 8)); // ptr_offsets_ptr (reloc below if any)
+        std.mem.writeInt(u64, &field, ti.ptr_offsets.len, .little);
+        try rodata.appendSlice(a, &field); // ptr_offsets_len
+        try rodata.appendSlice(a, &(.{0} ** 8)); // name_ptr = null
+        try rodata.appendSlice(a, &(.{0} ** 8)); // name_len = 0
+        try symbols.append(a, .{ .name = name, .section = .rodata, .offset = ti_off, .size = 40, .binding = .global, .kind = .object });
+        try defined.put(a, name, {});
+        if (ti.ptr_offsets.len > 0)
+            try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 8, .symbol = offs_name, .kind = .abs64, .addend = 0 });
     }
 
     // ---- undefined externals for everything the object references but does
@@ -201,6 +259,42 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try symbols.append(a, .{ .name = hdr_name, .section = .data, .offset = hdr_off, .size = 16, .binding = .global });
         try defined.put(a, hdr_name, {});
         try relocs.append(a, .{ .section = .data, .offset = hdr_off, .symbol = data_name, .kind = .unsigned64 });
+    }
+
+    // ---- gc_alloc TypeInfo blobs ------------------------------------------
+    // The TypeInfo holds an absolute ptr_offsets pointer, so — like the string
+    // headers — it lives in writable `.data` (dyld only rebases writable
+    // segments under PIE); the plain offsets array stays in read-only `.rodata`.
+    for (try collectTypeInfos(a, module)) |ti| {
+        const name = try ir.typeInfoSymbol(a, ti.size, ti.ptr_offsets);
+        var offs_name: []const u8 = "";
+        if (ti.ptr_offsets.len > 0) {
+            while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
+            const offs_off: u64 = rodata.items.len;
+            for (ti.ptr_offsets) |off| {
+                var b: [8]u8 = undefined;
+                std.mem.writeInt(u64, &b, off, .little);
+                try rodata.appendSlice(a, &b);
+            }
+            offs_name = try mac(a, try std.fmt.allocPrint(a, "{s}_offs", .{name}));
+            try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local });
+            try defined.put(a, offs_name, {});
+        }
+        while (data.items.len % 8 != 0) try data.append(a, 0);
+        const ti_off: u64 = data.items.len;
+        var field: [8]u8 = undefined;
+        std.mem.writeInt(u64, &field, ti.size, .little);
+        try data.appendSlice(a, &field); // size
+        try data.appendSlice(a, &(.{0} ** 8)); // ptr_offsets_ptr (rebased by dyld if any)
+        std.mem.writeInt(u64, &field, ti.ptr_offsets.len, .little);
+        try data.appendSlice(a, &field); // ptr_offsets_len
+        try data.appendSlice(a, &(.{0} ** 8)); // name_ptr = null
+        try data.appendSlice(a, &(.{0} ** 8)); // name_len = 0
+        const ti_name = try mac(a, name);
+        try symbols.append(a, .{ .name = ti_name, .section = .data, .offset = ti_off, .size = 40, .binding = .global });
+        try defined.put(a, ti_name, {});
+        if (ti.ptr_offsets.len > 0)
+            try relocs.append(a, .{ .section = .data, .offset = ti_off + 8, .symbol = offs_name, .kind = .unsigned64 });
     }
 
     // ---- undefined externals for runtime symbols --------------------------
