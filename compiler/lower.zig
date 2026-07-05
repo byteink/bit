@@ -677,6 +677,7 @@ const FnCtx = struct {
             .break_stmt => try self.lowerBreak(),
             .continue_stmt => try self.lowerContinue(),
             .spawn_stmt => try self.lowerSpawn(node),
+            .send_stmt => try self.lowerSend(node),
             .defer_stmt => try self.lowerDefer(node),
             .if_stmt => try self.lowerIf(node),
             .while_stmt => try self.lowerWhile(node),
@@ -685,7 +686,7 @@ const FnCtx = struct {
             .for_inf => try self.lowerForInf(node),
             .switch_stmt => try self.lowerSwitch(node),
             .block => try self.lowerBlockScoped(node),
-            else => return error.UnsupportedConstruct, // fail_stmt, for_in, select_stmt, send_stmt
+            else => return error.UnsupportedConstruct, // fail_stmt, for_in, select_stmt
         }
     }
 
@@ -1333,9 +1334,27 @@ const FnCtx = struct {
         return acc;
     }
 
+    /// `chan<T>()` / `chan<T>(n)`: construct a channel of capacity `n` (0 =
+    /// unbuffered). `is_ref` marks whether the element word is a GC reference,
+    /// so the runtime treats a buffered element as a root (ABI.md §11).
+    fn lowerChanMake(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const k = self.kids(node); // [callee, type_args, args]
+        const chan_ty = try self.nodeType(node);
+        const elem_ty = self.ctx.typeOf(chan_ty).chan;
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const arg_nodes = self.kids(k[2]);
+        const cap = if (arg_nodes.len >= 1)
+            try self.lowerExpr(self.kids(arg_nodes[0])[0])
+        else
+            try self.b.constInt(i64ty, 0);
+        const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
+        return self.b.rtCall(chan_ty, .chan_make, &.{ cap, is_ref });
+    }
+
     fn lowerCall(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [callee, type_args_or_none, args]
         const callee = k[0];
+        if (self.tree().get(callee).tag == .chan_type) return self.lowerChanMake(node);
         if (self.tree().get(callee).tag == .ident and self.env.lookup(self.identText(callee)) == null) {
             if (self.nodeSymbol(callee)) |gsym| {
                 const sym = self.l.rmodule.symbols.items[@intFromEnum(gsym.id)];
@@ -1356,6 +1375,16 @@ const FnCtx = struct {
             .iface => |x| self.b.callIface(x.result, x.recv, x.method_index, args.items),
             .value => |x| self.b.callValue(x.result, x.callee, args.items),
         };
+    }
+
+    /// `ch <- v`: send one word to a channel (blocks per SPEC §16.2).
+    fn lowerSend(self: *FnCtx, node: ast.Index) Error!void {
+        const k = self.kids(node); // [chan_expr, value_expr]
+        const chan_ty = try self.nodeType(k[0]);
+        const elem_ty = self.ctx.typeOf(chan_ty).chan;
+        const ch = try self.lowerExpr(k[0]);
+        const v = try self.lowerExprH(k[1], elem_ty);
+        _ = try self.b.rtCall(self.ctx.void_id, .chan_send, &.{ ch, v });
     }
 
     fn lowerSpawn(self: *FnCtx, node: ast.Index) Error!void {
@@ -1603,6 +1632,14 @@ const FnCtx = struct {
     fn lowerUnary(self: *FnCtx, node: ast.Index, hint: ?TypeId) Error!ir.ValueId {
         const op: lexer.Kind = @enumFromInt(self.tree().get(node).main);
         const operand = self.kids(node)[0];
+        if (op == .arrow_left) {
+            // `<- ch`: receive one word. `bit_rt_chan_recv` returns `{value, ok}`
+            // (ABI.md §11); the value word is the result. The two-result form
+            // `v, ok = <- ch` needs tuple-destructuring lowering (deferred).
+            const elem_ty = try self.nodeType(node);
+            const ch = try self.lowerExpr(operand);
+            return self.b.rtCall(elem_ty, .chan_recv, &.{ch});
+        }
         const ty = try self.materializeType(node, hint);
         const val = try self.lowerExprH(operand, ty);
         if (op == .bang) {
