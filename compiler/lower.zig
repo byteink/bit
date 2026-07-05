@@ -761,7 +761,11 @@ const FnCtx = struct {
 
         self.switchBlock(then_blk);
         try self.lowerBlockScoped(k[1]);
-        var join_reachable = false;
+        // With no `else`, the `br`'s else edge targets `join` directly, so it is
+        // always a predecessor (carrying `orig`) even when the then-branch
+        // terminates — e.g. a guard clause `if (c) { return }`. Only a full
+        // if/else where *both* arms terminate leaves `join` unreachable.
+        var join_reachable = (else_blk == null);
         if (!self.terminated) {
             join_reachable = true;
             const then_vals = try self.env.snapshotValues(self.gpa, pre_len);

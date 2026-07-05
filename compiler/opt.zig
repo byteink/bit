@@ -284,7 +284,9 @@ fn foldUnary(ctx: *const check.TypeContext, op: ir.Op, ty: TypeId, v: ConstVal) 
             const bits = widthOf(p);
             if (isSignedPrim(p)) {
                 const a = signExtend(v.int, bits);
-                const min_val: i64 = -(@as(i64, 1) << @intCast(bits - 1));
+                // Compute via i128: for a 64-bit type `1 << 63` overflows i64
+                // before the negation, so the intermediate must be wider.
+                const min_val: i64 = @intCast(-(@as(i128, 1) << @intCast(bits - 1)));
                 if (a == min_val) break :blk null; // negating MIN overflows: preserve the trap
                 break :blk .{ .int = maskTo(@bitCast(-a), bits) };
             }
