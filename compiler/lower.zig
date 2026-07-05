@@ -622,7 +622,7 @@ const FnCtx = struct {
             const bk = self.kids(bind); // binding: [pattern, type_or_none, init_or_none]
             if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct; // tuple destructuring: deferred
             const ty = try self.nodeType(bk[0]);
-            const val = if (bk[2] != ast.none) try self.lowerExpr(bk[2]) else try self.zeroValue(ty);
+            const val = if (bk[2] != ast.none) try self.lowerExprH(bk[2], ty) else try self.zeroValue(ty);
             try self.env.declare(self.gpa, self.identText(bk[0]), val, ty);
         }
     }
@@ -681,8 +681,8 @@ const FnCtx = struct {
             std.debug.assert(lhs_items.len == 1 and rhs_items.len == 1);
             const lv = try self.resolveLvalue(lhs_items[0]);
             const cur = try self.readLvalue(lv);
-            const rhs_val = try self.lowerExpr(rhs_items[0]);
             const ty = try self.nodeType(lhs_items[0]);
+            const rhs_val = try self.lowerExprH(rhs_items[0], ty);
             const iop = try binOpFor(compoundBase(op), self.ctx.typeOf(ty));
             const result = try self.b.binary(iop, ty, cur, rhs_val);
             try self.writeLvalue(lv, result);
@@ -695,7 +695,7 @@ const FnCtx = struct {
         for (lhs_items, 0..) |ln, i| lvs[i] = try self.resolveLvalue(ln);
         const vals = try self.gpa.alloc(ir.ValueId, rhs_items.len);
         defer self.gpa.free(vals);
-        for (rhs_items, 0..) |rn, i| vals[i] = try self.lowerExpr(rn);
+        for (rhs_items, 0..) |rn, i| vals[i] = try self.lowerExprH(rn, try self.nodeType(lhs_items[i]));
         std.debug.assert(lvs.len == vals.len);
         for (lvs, vals) |lv, v| try self.writeLvalue(lv, v);
     }
@@ -813,9 +813,13 @@ const FnCtx = struct {
 
         const cond = try self.lowerExpr(k[0]);
         {
+            // `body_blk` has this `br` as its only predecessor and is dominated
+            // by `header`, so it takes no params and reads the loop-carried
+            // values straight from `header`'s. Only `exit_blk` is a real merge
+            // (this edge plus every `break`), so it alone receives args here.
             const cur = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(cur);
-            try self.emitBr(cond, body_blk, cur, exit_blk, cur);
+            try self.emitBr(cond, body_blk, &.{}, exit_blk, cur);
         }
 
         try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = header, .pre_len = pre_len });
@@ -885,11 +889,14 @@ const FnCtx = struct {
         {
             const cur = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(cur);
+            // `body_blk` is dominated by `header` and reached only from here,
+            // so it takes no params (see `lowerWhile`); `exit_blk` merges this
+            // edge with every `break`, so it receives the carried values.
             if (k[1] != ast.none) {
                 const cond = try self.lowerExpr(k[1]);
-                try self.emitBr(cond, body_blk, cur, exit_blk, cur);
+                try self.emitBr(cond, body_blk, &.{}, exit_blk, cur);
             } else {
-                try self.emitJump(body_blk, cur);
+                try self.emitJump(body_blk, &.{});
             }
         }
 
@@ -955,9 +962,12 @@ const FnCtx = struct {
             try self.b.sliceLen(i64ty, iter_val);
         const cmp = try self.b.binary(.icmp_slt, self.ctx.prim_ids.get(.bool), idx_val, len_val);
         {
+            // `body_blk` is dominated by `header` and reached only here, so it
+            // takes no params (see `lowerWhile`); `exit_blk` merges this edge
+            // with every `break`, so it receives the carried values.
             const cur = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(cur);
-            try self.emitBr(cmp, body_blk, cur, exit_blk, cur);
+            try self.emitBr(cmp, body_blk, &.{}, exit_blk, cur);
         }
 
         try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = header, .pre_len = pre_len });
@@ -1177,33 +1187,77 @@ const FnCtx = struct {
     // ---- expressions ------------------------------------------------------
 
     fn lowerExpr(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        return self.lowerExprH(node, null);
+    }
+
+    /// Whether `ty` is one of the checker's untyped-constant sentinels (§15.4)
+    /// — a type an int/float/rune/bool/string/nil literal carries until it is
+    /// committed to a concrete type by its surrounding context.
+    fn isUntypedTy(self: *const FnCtx, ty: TypeId) bool {
+        return ty == self.ctx.untyped_int_id or ty == self.ctx.untyped_float_id or
+            ty == self.ctx.untyped_rune_id or ty == self.ctx.untyped_bool_id or
+            ty == self.ctx.untyped_string_id or ty == self.ctx.untyped_nil_id;
+    }
+
+    /// The concrete type an untyped constant assumes with no context to adapt
+    /// to (§15.4). Mirrors `check.zig`'s `defaultType`; anything already
+    /// concrete is returned unchanged.
+    fn defaultTy(self: *const FnCtx, ty: TypeId) TypeId {
+        if (ty == self.ctx.untyped_int_id) return self.ctx.prim_ids.get(.i64);
+        if (ty == self.ctx.untyped_float_id) return self.ctx.prim_ids.get(.f64);
+        if (ty == self.ctx.untyped_rune_id) return self.ctx.prim_ids.get(.i32);
+        if (ty == self.ctx.untyped_bool_id) return self.ctx.prim_ids.get(.bool);
+        if (ty == self.ctx.untyped_string_id) return self.ctx.prim_ids.get(.string);
+        return ty;
+    }
+
+    /// The concrete type to materialize `node`'s value as. The checker records
+    /// an *untyped* type on literal nodes and only commits the concrete type at
+    /// the binder/operand/argument that consumes them; lowering must never emit
+    /// an untyped-typed value (block params, operands, and args are all
+    /// concrete, so an untyped value fails the IR verifier). Concrete node
+    /// types pass through; an untyped node adopts `hint` when it is concrete
+    /// (the assignability was already proven by the checker), else its default.
+    fn materializeType(self: *FnCtx, node: ast.Index, hint: ?TypeId) Error!TypeId {
+        const nt = try self.nodeType(node);
+        if (!self.isUntypedTy(nt)) return nt;
+        if (hint) |h| {
+            if (h != .invalid and !self.isUntypedTy(h)) return h;
+        }
+        return self.defaultTy(nt);
+    }
+
+    /// Lowers `node`, materializing any untyped constant it produces at `hint`
+    /// (see `materializeType`). `hint` is `null` where the context imposes no
+    /// concrete type; `lowerExpr` is the null-hint shorthand.
+    fn lowerExprH(self: *FnCtx, node: ast.Index, hint: ?TypeId) Error!ir.ValueId {
         return switch (self.tree().get(node).tag) {
             .int_lit => blk: {
-                const ty = try self.nodeType(node);
+                const ty = try self.materializeType(node, hint);
                 break :blk self.b.constInt(ty, @truncate(check.parseIntLiteral(self.spanText(node))));
             },
             .rune_lit => blk: {
-                const ty = try self.nodeType(node);
+                const ty = try self.materializeType(node, hint);
                 break :blk self.b.constInt(ty, @truncate(check.parseRuneLiteral(self.spanText(node))));
             },
             .float_lit => blk: {
-                const ty = try self.nodeType(node);
+                const ty = try self.materializeType(node, hint);
                 break :blk self.b.constFloat(ty, try self.parseFloat(self.spanText(node)));
             },
             .bool_lit => blk: {
-                const ty = try self.nodeType(node);
+                const ty = try self.materializeType(node, hint);
                 break :blk self.b.constBool(ty, std.mem.eql(u8, self.spanText(node), "true"));
             },
-            .nil_lit => self.b.constNil(try self.nodeType(node)),
+            .nil_lit => self.b.constNil(try self.materializeType(node, hint)),
             .string_lit => blk: {
-                const ty = try self.nodeType(node);
+                const ty = try self.materializeType(node, hint);
                 const text = try self.unescapeString(self.spanText(node));
                 defer self.gpa.free(text);
                 const idx = try self.l.out.internString(text);
                 break :blk self.b.constString(ty, idx);
             },
             .raw_string_lit => blk: {
-                const ty = try self.nodeType(node);
+                const ty = try self.materializeType(node, hint);
                 const raw = self.spanText(node);
                 const text = try self.normalizeRaw(raw[1 .. raw.len - 1]);
                 defer self.gpa.free(text);
@@ -1211,8 +1265,8 @@ const FnCtx = struct {
                 break :blk self.b.constString(ty, idx);
             },
             .ident => self.lowerIdent(node),
-            .binary => self.lowerBinary(node),
-            .unary => self.lowerUnary(node),
+            .binary => self.lowerBinary(node, hint),
+            .unary => self.lowerUnary(node, hint),
             .call => self.lowerCall(node),
             .member => self.lowerMember(node),
             .index => blk: {
@@ -1268,26 +1322,44 @@ const FnCtx = struct {
         return self.b.addParam(bool_ty);
     }
 
-    fn lowerBinary(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+    fn lowerBinary(self: *FnCtx, node: ast.Index, hint: ?TypeId) Error!ir.ValueId {
         const op: lexer.Kind = @enumFromInt(self.tree().get(node).main);
         const k = self.kids(node);
         if (op == .amp_amp or op == .pipe_pipe) return self.lowerShortCircuit(op, k[0], k[1]);
+        // Both operands share one concrete type: whichever side the checker
+        // already typed concretely, else the arithmetic result's type (a
+        // concrete hint carried in), else the constants' default. Comparisons
+        // yield bool but still need matching concrete operands.
+        const is_cmp = switch (op) {
+            .eq_eq, .bang_eq, .lt, .lt_eq, .gt, .gt_eq => true,
+            else => false,
+        };
         const lty = try self.nodeType(k[0]);
-        const ldata = self.ctx.typeOf(lty);
-        if (ldata == .prim and ldata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus))
+        const rty = try self.nodeType(k[1]);
+        // A comparison's `hint` is bool (the result), never the operand type,
+        // so only arithmetic may adopt it for two untyped operands.
+        const usable_hint = hint != null and hint.? != .invalid and !self.isUntypedTy(hint.?) and !is_cmp;
+        const common: TypeId = if (!self.isUntypedTy(lty)) lty else if (!self.isUntypedTy(rty))
+            rty
+        else if (usable_hint)
+            hint.?
+        else
+            self.defaultTy(lty);
+        const cdata = self.ctx.typeOf(common);
+        if (cdata == .prim and cdata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus))
             return error.UnsupportedConstruct; // string equality/concat via `+`: needs a not-yet-added RtFn
-        const lval = try self.lowerExpr(k[0]);
-        const rval = try self.lowerExpr(k[1]);
+        const lval = try self.lowerExprH(k[0], common);
+        const rval = try self.lowerExprH(k[1], common);
         const result_ty = try self.nodeType(node);
-        const iop = try binOpFor(op, ldata);
+        const iop = try binOpFor(op, cdata);
         return self.b.binary(iop, result_ty, lval, rval);
     }
 
-    fn lowerUnary(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+    fn lowerUnary(self: *FnCtx, node: ast.Index, hint: ?TypeId) Error!ir.ValueId {
         const op: lexer.Kind = @enumFromInt(self.tree().get(node).main);
         const operand = self.kids(node)[0];
-        const val = try self.lowerExpr(operand);
-        const ty = try self.nodeType(node);
+        const ty = try self.materializeType(node, hint);
+        const val = try self.lowerExprH(operand, ty);
         if (op == .bang) {
             const f = try self.b.constBool(ty, false);
             return self.b.binary(.icmp_eq, ty, val, f);
@@ -1628,7 +1700,7 @@ test "lowers if/else through a merge block" {
     const src =
         \\function abs(x: i64): i64 {
         \\  let r = x
-        \\  if x < 0 {
+        \\  if (x < 0) {
         \\    r = -x
         \\  } else {
         \\    r = x
@@ -1649,7 +1721,7 @@ test "lowers a while loop with a loop-carried variable" {
         \\function sum(n: i64): i64 {
         \\  let total = 0
         \\  let i = 0
-        \\  while i < n {
+        \\  while (i < n) {
         \\    total += i
         \\    i++
         \\  }
@@ -1771,7 +1843,7 @@ test "unsupported construct (switch) reports UnsupportedConstruct, not a crash" 
     const gpa = testing.allocator;
     const src =
         \\function f(x: i64): i64 {
-        \\  switch x {
+        \\  switch (x) {
         \\    case 1: return 1
         \\    default: return 0
         \\  }
