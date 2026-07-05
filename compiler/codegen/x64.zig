@@ -1685,7 +1685,27 @@ fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Functio
             markUses(intervals, f.decode(@enumFromInt(i)), i);
         }
     }
+    forceParamInterference(intervals, f);
     return intervals;
+}
+
+/// All of a block's params are live simultaneously at block entry — the
+/// predecessor edge's parallel move writes every one before the jump. A param
+/// that is never read afterward would otherwise keep its initial empty `[i, i]`
+/// interval and could be coalesced onto a live sibling param's register, so the
+/// edge move clobbers one param with another (a returned value coming back as
+/// some other incoming argument). Extend every param's interval to its block's
+/// last param position so all params of a block mutually interfere and land in
+/// distinct registers.
+fn forceParamInterference(intervals: []regalloc.Interval, f: *const ir.Function) void {
+    for (f.blocks) |blk| {
+        if (blk.param_count == 0) continue;
+        const last_param: u32 = @intCast(blk.insts_start + blk.param_count - 1);
+        var p: usize = blk.insts_start;
+        while (p < blk.insts_start + blk.param_count) : (p += 1) {
+            if (intervals[p].end < last_param) intervals[p].end = last_param;
+        }
+    }
 }
 
 /// Positions (raw instruction indices) `regalloc.allocate` should build a GC
