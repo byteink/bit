@@ -259,12 +259,19 @@ fn isRefType(tctx: *const TypeContext, ty: TypeId) bool {
 // Output records
 // ============================================================================
 
+/// How the object writer patches a relocation's field. `.call` is the 4-byte
+/// PC-relative branch immediate (`E8 rel32`); `.abs64` is a full 64-bit
+/// absolute pointer, how a `const_string` loads its static header's address.
+pub const RelocKind = enum { call, abs64 };
+
 pub const Reloc = struct {
-    /// Byte offset in `FuncCode.code` of the 4-byte PC-relative field.
+    /// Byte offset in `FuncCode.code` of the field to patch.
     offset: u32,
-    /// Target symbol name: a Bit function's own name, or a runtime symbol
-    /// (`bit_rt_<RtFn tag>`, `bit_rt_safepoint`) — see module doc comment.
+    /// Target symbol name: a Bit function's own name, a runtime symbol
+    /// (`bit_rt_<RtFn tag>`, `bit_rt_safepoint`), or a `const_string` header
+    /// (`__bitstr_N`) — see module doc comment.
     symbol: []const u8,
+    kind: RelocKind = .call,
 };
 
 pub const SafepointEntry = struct {
@@ -284,6 +291,8 @@ pub const FuncCode = struct {
     relocs: []Reloc, // `symbol` slices borrowed (module func names / static strings)
     safepoints: []SafepointEntry,
     frame_size: u32,
+    /// Owned `__bitstr_N` names some `relocs` borrow (see `Ctx.owned_syms`).
+    owned_syms: [][]u8 = &.{},
 
     pub fn deinit(self: *FuncCode) void {
         self.gpa.free(self.code);
@@ -293,6 +302,8 @@ pub const FuncCode = struct {
             self.gpa.free(sp.frame_offsets);
         }
         self.gpa.free(self.safepoints);
+        for (self.owned_syms) |s| self.gpa.free(s);
+        self.gpa.free(self.owned_syms);
         self.* = undefined;
     }
 };
@@ -333,6 +344,9 @@ const Ctx = struct {
     f: *const ir.Function,
     code: std.ArrayList(u8) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
+    /// Symbol names this function synthesized (per-`const_string` `__bitstr_N`)
+    /// and that its relocations borrow — owned here, moved into `FuncCode`.
+    owned_syms: std.ArrayList([]u8) = .empty,
     inst_to_vreg: []const u32,
     result: *const regalloc.Result,
     int_regs: []const Reg,
@@ -395,6 +409,17 @@ const Ctx = struct {
             try self.emitByte(0xB8 | @as(u8, @intFromEnum(dst) & 7));
             try self.emitU64(@bitCast(imm));
         }
+    }
+
+    /// `movabs dst, <address of symbol>` — a `REX.W B8+r` with an 8-byte
+    /// immediate the linker fills via an `abs64` relocation. Loads the address
+    /// of a static symbol (a `const_string`'s `__bitstr_N` header) into `dst`.
+    fn movAbsReloc(self: *Ctx, dst: Reg, symbol: []const u8) !void {
+        try self.maybeRex(true, false, false, @intFromEnum(dst) >= 8);
+        try self.emitByte(0xB8 | @as(u8, @intFromEnum(dst) & 7));
+        const off: u32 = @intCast(self.code.items.len);
+        try self.emitU64(0);
+        try self.relocs.append(self.gpa, .{ .offset = off, .symbol = symbol, .kind = .abs64 });
     }
 
     const ArithOp = enum { add, or_, and_, sub, xor, cmp };
@@ -1135,6 +1160,17 @@ fn emitFneg(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
     try putFloat(self, dst, fscratch1);
 }
 
+/// `const_string` loads the address of its static string header (`__bitstr_N`,
+/// where `N` is the string-pool index) — the compiler driver emits that header
+/// (`{ptr,len}` + the bytes) into the object's `.rodata` under this same name.
+/// v1 string literals are static, so the value is a plain pointer, no GC.
+fn emitConstString(self: *Ctx, dst: u32, pool_idx: u32) !void {
+    const name = try std.fmt.allocPrint(self.gpa, "__bitstr_{d}", .{pool_idx});
+    try self.owned_syms.append(self.gpa, name);
+    try self.movAbsReloc(scratch1, name);
+    try putInt(self, dst, scratch1);
+}
+
 fn emitConstInt(self: *Ctx, dst: u32, val: i64) !void {
     try self.movRI(scratch1, val);
     try putInt(self, dst, scratch1);
@@ -1361,6 +1397,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .string_from_bool = "bit_rt_string_from_bool",
     .panic = "bit_rt_panic",
     .assert = "bit_rt_assert",
+    .print = "bit_rt_print",
     .chan_make = "bit_rt_chan_make",
     .chan_send = "bit_rt_chan_send",
     .chan_recv = "bit_rt_chan_recv",
@@ -1648,6 +1685,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
     const d = self.f.decode(id);
     switch (op) {
         .const_int => try emitConstInt(self, dst, d.const_int),
+        .const_string => try emitConstString(self, dst, d.const_string),
         .const_bool => try emitConstBool(self, dst, d.const_bool),
         .const_nil => try emitConstNil(self, dst),
         .const_float => try emitConstFloat(self, dst, d.const_float, widthOf(self.tctx(), ty).bytes),
@@ -1685,7 +1723,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .field_set => try emitFieldSet(self, d.field_set.base, d.field_set.offset, d.field_set.value, self.f.valueType(d.field_set.value)),
         .index_get => try emitIndexGet(self, dst, d.index_get.base, d.index_get.index, ty),
         .index_set => try emitIndexSet(self, d.index_set.base, d.index_set.index, d.index_set.value, self.f.valueType(d.index_set.value)),
-        .slice_len, .gc_alloc, .const_string, .call_value, .call_iface, .make_closure => return error.UnsupportedConstruct,
+        .slice_len, .gc_alloc, .call_value, .call_iface, .make_closure => return error.UnsupportedConstruct,
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
     }
 }
@@ -1757,6 +1795,10 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     errdefer ctx.code.deinit(gpa);
     errdefer ctx.relocs.deinit(gpa);
     errdefer ctx.jump_fixups.deinit(gpa);
+    errdefer {
+        for (ctx.owned_syms.items) |s| gpa.free(s);
+        ctx.owned_syms.deinit(gpa);
+    }
 
     try emitPrologue(&ctx);
     try bindIncomingArgs(&ctx);
@@ -1776,6 +1818,11 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     errdefer gpa.free(code);
     const relocs = try ctx.relocs.toOwnedSlice(gpa);
     errdefer gpa.free(relocs);
+    const owned_syms = try ctx.owned_syms.toOwnedSlice(gpa);
+    errdefer {
+        for (owned_syms) |s| gpa.free(s);
+        gpa.free(owned_syms);
+    }
 
     const sp_entries = try gpa.alloc(SafepointEntry, safepoints.len);
     var built: usize = 0;
@@ -1806,6 +1853,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         .relocs = relocs,
         .safepoints = sp_entries,
         .frame_size = frame.frame_size,
+        .owned_syms = owned_syms,
     };
 }
 

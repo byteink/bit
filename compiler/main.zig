@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const diagnostics = @import("diagnostics.zig");
@@ -7,6 +8,11 @@ const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const resolve = @import("resolve.zig");
 const check = @import("check.zig");
+const lower = @import("lower.zig");
+const opt = @import("opt.zig");
+const emit = @import("emit.zig");
+const link = @import("link.zig");
+const macho = @import("link/macho.zig");
 const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 
@@ -35,6 +41,20 @@ pub fn main(init: std.process.Init) !void {
         return lsp.run(gpa, io);
     }
 
+    if (argv.len >= 2 and (std.mem.eql(u8, argv[1], "build") or std.mem.eql(u8, argv[1], "run"))) {
+        const is_run = std.mem.eql(u8, argv[1], "run");
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        const code = runBuildOrRun(gpa, io, &stderr_w.interface, is_run, argv[2..]) catch |e| {
+            try stderr_w.interface.print("bit {s}: {s}\n", .{ argv[1], @errorName(e) });
+            try stderr_w.interface.flush();
+            return error.BuildFailed;
+        };
+        try stderr_w.interface.flush();
+        if (code != 0) std.process.exit(code);
+        return;
+    }
+
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "check")) {
         var rest = argv[2..];
         var dump_types = false;
@@ -58,6 +78,172 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout.interface;
     try out.print("bitc {s}\n", .{version});
     try out.flush();
+}
+
+/// Upper bound on a `.bit` source file `bit build`/`bit run` will read.
+const max_source_bytes = 8 << 20; // 8 MiB
+
+/// Location of the runtime archive. // ponytail: fixed dev-build path;
+/// resolve relative to the `bit` binary's own install prefix, and honor an
+/// env override, once packaging (#358) lands.
+/// The native binary target `bit build`/`run` produces. Defaults to whichever
+/// host is running this `bit` (so `bit run` on a Mac execs an arm64 binary, on
+/// Linux an x86-64 one); `--target` cross-produces the other, which only its
+/// own host can execute (so `bit run` for a foreign target just builds).
+const BuildTarget = enum {
+    x86_64_linux,
+    aarch64_macos,
+
+    fn parse(s: []const u8) ?BuildTarget {
+        if (std.mem.eql(u8, s, "x86_64-linux")) return .x86_64_linux;
+        if (std.mem.eql(u8, s, "aarch64-macos") or std.mem.eql(u8, s, "arm64-macos")) return .aarch64_macos;
+        return null;
+    }
+};
+
+/// The target matching the host this `bit` binary itself runs on — the default
+/// `bit build`/`run` target, and the only one `bit run` can `exec` directly.
+const host_target: BuildTarget = switch (builtin.target.os.tag) {
+    .macos => .aarch64_macos,
+    else => .x86_64_linux,
+};
+
+fn libbitrtPath(target: BuildTarget) []const u8 {
+    return switch (target) {
+        .x86_64_linux => "zig-out/lib/x86_64-linux/libbitrt.a",
+        .aarch64_macos => "zig-out/lib/aarch64-macos/libbitrt.a",
+    };
+}
+
+/// `bit build <file.bit> [-o out]` / `bit run <file.bit>`: the full pipeline to
+/// a native binary. Returns the exit code to propagate — 0 after a build, the
+/// program's own exit code after a run. Compile diagnostics go to `err_out`;
+/// a compile error returns exit code 1, a usage error 2 (SPEC/#347 §Scope).
+fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bool, args: []const [:0]const u8) !u8 {
+    // Parse: one positional <file.bit>, plus `-o <out>` and `--target <t>` in
+    // any order.
+    var src_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var target: BuildTarget = host_target;
+    var ai: usize = 0;
+    while (ai < args.len) {
+        const arg = args[ai];
+        if (std.mem.eql(u8, arg, "-o") and ai + 1 < args.len) {
+            out_path = args[ai + 1];
+            ai += 2;
+        } else if ((std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) and ai + 1 < args.len) {
+            target = BuildTarget.parse(args[ai + 1]) orelse {
+                try err_out.print("bit: unknown target '{s}' (x86_64-linux | aarch64-macos)\n", .{args[ai + 1]});
+                return 2;
+            };
+            ai += 2;
+        } else {
+            if (src_path == null) src_path = arg;
+            ai += 1;
+        }
+    }
+    const src = src_path orelse {
+        try err_out.writeAll("usage: bit build|run <file.bit> [-o out] [--target x86_64-linux|aarch64-macos]\n");
+        return 2;
+    };
+
+    const source = Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(max_source_bytes)) catch |e| {
+        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
+        return 1;
+    };
+    defer gpa.free(source);
+
+    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch |e| {
+        try err_out.print("bit: runtime archive {s}: {s} (set BIT_LIBBITRT)\n", .{ libbitrtPath(target), @errorName(e) });
+        return 1;
+    };
+    defer gpa.free(lib);
+
+    const exe = (try buildExecutable(gpa, src, source, lib, target, err_out)) orelse return 1;
+    defer gpa.free(exe);
+
+    // Output binary: `-o`, else the source stem, written to the cwd.
+    const dest = out_path orelse std.fs.path.stem(src);
+    const dest_z = try gpa.dupeZ(u8, dest);
+    defer gpa.free(dest_z);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dest_z,
+        .data = exe,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    // A cross-produced binary can't run on this host; `bit run` for a foreign
+    // target just builds.
+    if (!is_run or target != host_target) return 0;
+
+    // Run it: `execve` needs a slash to resolve a path against the cwd.
+    const run_path = try std.fmt.allocPrintSentinel(gpa, "./{s}", .{dest_z}, 0);
+    defer gpa.free(run_path);
+    var child = try std.process.spawn(io, .{ .argv = &.{run_path} });
+    return switch (try child.wait(io)) {
+        .exited => |c| c,
+        else => 1,
+    };
+}
+
+/// Drives one source buffer through the whole compiler — front-end (parse,
+/// resolve, check), then lower -> optimize -> codegen/object -> link — into a
+/// runnable executable's bytes. Returns `null` (after rendering diagnostics to
+/// `err_out`) if any stage before codegen reported an error; the caller maps
+/// that to exit code 1.
+fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    const file = try sm.addFile(path, source);
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree = try ast.Tree.init(gpa);
+    defer tree.deinit();
+    try parser.parse(gpa, &tree, &diags, file, source);
+
+    const mf = resolve.ModuleFile{ .file = file, .source = source, .tree = &tree };
+    const files = [_]resolve.ModuleFile{mf};
+    var no_imports: resolve.ImportTable = .{};
+    defer no_imports.deinit(gpa);
+
+    if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
+
+    var rmodule = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+    defer rmodule.deinit();
+    if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
+
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    var checked = try check.checkModule(gpa, &diags, &ctx, &files, &rmodule, @enumFromInt(0), &.{}, false);
+    defer checked.deinit();
+    if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
+
+    var module = try lower.lowerModule(gpa, &ctx, &files, &checked, &rmodule);
+    defer module.deinit();
+    try opt.optimizeModule(gpa, &module, .o1);
+
+    switch (target) {
+        .x86_64_linux => {
+            const object = try emit.emitObject(gpa, &module);
+            defer gpa.free(object);
+            return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+        },
+        .aarch64_macos => {
+            const object = try emit.emitMachoObject(gpa, &module);
+            defer gpa.free(object);
+            const ident = std.fs.path.stem(path);
+            return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
+        },
+    }
+}
+
+fn renderFail(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, err_out: *Io.Writer) !?[]u8 {
+    var rendered: Io.Writer.Allocating = .init(gpa);
+    defer rendered.deinit();
+    try diags.renderAll(&rendered.writer);
+    try err_out.writeAll(rendered.written());
+    return null;
 }
 
 /// `bitc fmt <path>...`: reformats each file to Bit's one canonical style,
@@ -289,4 +475,38 @@ test "compileReport reports success on clean source" {
     defer gpa.free(report.text);
     try std.testing.expect(!report.failed);
     try std.testing.expectEqualStrings("", report.text);
+}
+
+test "build: a printing program compiles, links, and runs" {
+    if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(.x86_64_linux), gpa, .unlimited) catch
+        return error.SkipZigTest; // `zig build libbitrt` not run here
+    defer gpa.free(lib);
+
+    var discard: Io.Writer.Allocating = .init(gpa);
+    defer discard.deinit();
+    const src = "function main() {\n  print(\"hi from bit\")\n}\n";
+    const exe = (try buildExecutable(gpa, "e2e.bit", src, lib, .x86_64_linux, &discard.writer)) orelse return error.CompileFailed;
+    defer gpa.free(exe);
+
+    const path = "/tmp/bit-e2e-test";
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = exe,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 0), switch (result.term) {
+        .exited => |c| c,
+        else => 1,
+    });
+    try std.testing.expectEqualStrings("hi from bit", result.stdout);
 }

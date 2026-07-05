@@ -2279,6 +2279,17 @@ const Checker = struct {
             try self.checkArgsLoose(file_idx, arg_items, env, fctx);
             return self.ctx.void_id;
         }
+        if (std.mem.eql(u8, name, "print")) {
+            if (arg_items.len != 1) {
+                try self.emit(mf, node, .arg_count_mismatch, "'print' takes exactly 1 argument, found {d}", .{arg_items.len}, null);
+            }
+            if (arg_items.len >= 1) {
+                const inner = mf.tree.kids(arg_items[0])[0];
+                const t = try self.checkExpr(file_idx, inner, env, fctx, self.ctx.prim_ids.get(.string));
+                try self.expect(file_idx, inner, t, self.ctx.prim_ids.get(.string));
+            }
+            return self.ctx.void_id;
+        }
         if (std.mem.eql(u8, name, "assert")) {
             if (arg_items.len != 1 and arg_items.len != 2) {
                 try self.emit(mf, node, .arg_count_mismatch, "'assert' takes a condition and an optional message, found {d} argument(s)", .{arg_items.len}, null);
