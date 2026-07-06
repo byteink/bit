@@ -366,6 +366,14 @@ pub fn build(b: *std.Build) void {
                 .strip = true,
                 .unwind_tables = .none,
                 .pic = if (query.os_tag == .macos) null else false,
+                // The green-thread context switch (sched.zig) rewrites `rsp` to
+                // another stack mid-function. The x86-64 red zone — 128 bytes
+                // below `rsp` that leaf code may use without reserving — is not
+                // preserved across that stack swap, so a value the compiler
+                // parked in the outgoing stack's red zone is read back from the
+                // incoming stack's red zone (garbage). Disable it for the
+                // runtime; ARM64 has no red zone, so this is x86-64's concern.
+                .red_zone = false,
             }),
         });
         // Bundle compiler-rt into the archive so the static linker (#345)
