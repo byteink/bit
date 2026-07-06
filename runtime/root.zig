@@ -225,11 +225,16 @@ fn conservativeStack(_: *anyopaque, sp: usize, top: usize) void {
     }
 }
 
+fn markTaskArg(_: *anyopaque, arg: usize) void {
+    g_gc.markConservative(arg);
+}
+
 fn scanRoots(_: *anyopaque, g: *gc_mod.Gc) void {
     _ = g;
     chan.WordChan.scanRegistryRoots(markChanWord);
     scanCurrentTask();
     g_sched.forEachOtherStack(sched.currentTask(), @ptrCast(&scan_ctx), conservativeStack);
+    g_sched.forEachTaskArg(@ptrCast(&scan_ctx), markTaskArg);
 }
 
 /// `ctx` is unused by `scanRoots` — any live, non-null pointer satisfies the

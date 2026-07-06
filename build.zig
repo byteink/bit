@@ -257,6 +257,25 @@ pub fn build(b: *std.Build) void {
     const examples_tests = b.addTest(.{ .root_module = examples_mod });
     test_step.dependOn(&b.addRunArtifact(examples_tests).step);
 
+    // Concurrency + GC stress suite (task #350): compiles + runs each
+    // tests/stress/* program twice — default policy and BIT_GC=stress (collect
+    // every safepoint) — and diffs stdout against its `.expected`. The
+    // production-readiness gate for spawn/channels/select/GC under load. Shares
+    // the host libbitrt archive wired in at the tail.
+    const stress_opts = b.addOptions();
+    stress_opts.addOption([]const u8, "stress_dir", b.pathFromRoot("tests/stress"));
+
+    const stress_mod = b.createModule(.{
+        .root_source_file = b.path("tests/stress.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stress_mod.addImport("bitc", exe.root_module);
+    stress_mod.addOptions("build_options", stress_opts);
+
+    const stress_tests = b.addTest(.{ .root_module = stress_mod });
+    test_step.dependOn(&b.addRunArtifact(stress_tests).step);
+
     // Fuzz harness (task #334): lexer+parser must never crash/hang on
     // arbitrary bytes. Two separate compilations of fuzz.zig, because
     // `-ffuzz` instrumentation changes runtime behavior, not just codegen:
@@ -412,4 +431,8 @@ pub fn build(b: *std.Build) void {
     // Same archive for the examples guard.
     examples_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
     if (host_libbitrt_install) |inst| examples_tests.step.dependOn(inst);
+
+    // Same archive for the stress suite.
+    stress_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
+    if (host_libbitrt_install) |inst| stress_tests.step.dependOn(inst);
 }

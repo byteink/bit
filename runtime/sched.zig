@@ -796,6 +796,25 @@ pub const Scheduler = struct {
         }
     }
 
+    /// Marks every registered task's opaque `arg` as a root candidate (ABI.md
+    /// §5/§9). A spawn thunk is a GC object reachable only through the pending
+    /// task's `arg` — not on any stack until the task starts and unpacks it — so
+    /// without this a collection between `spawn` and the task running would
+    /// sweep the thunk out from under it. Covers all tasks (a consumed `arg` is
+    /// simply not an object, or harmlessly retained one cycle); the mark
+    /// callback validates before treating the word as an object.
+    pub fn forEachTaskArg(self: *Scheduler, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, arg: usize) void) void {
+        self.reg_lock.acquire();
+        defer self.reg_lock.release();
+        var it = self.reg_head;
+        var guard: usize = 0;
+        while (it) |t| : (it = t.reg_next) {
+            guard += 1;
+            if (guard > max_registered_tasks) break;
+            cb(ctx, @intFromPtr(t.arg));
+        }
+    }
+
     /// Signal every worker to stop once it next finds no work.
     pub fn shutdown(self: *Scheduler) void {
         self.stopping.store(true, .release);

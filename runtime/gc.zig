@@ -87,6 +87,10 @@ pub const RootScanner = struct {
 pub const Config = struct {
     /// When false, `safepoint` never auto-collects; explicit `collect` still runs.
     enabled: bool = true,
+    /// Torture mode: every safepoint collects, ignoring the byte trigger. Turns
+    /// the stress suite into a precise-rooting oracle — any root the compiler
+    /// fails to report is swept on the very next poll and surfaces immediately.
+    stress: bool = false,
     /// Live-heap bytes that must accumulate before a collection is triggered.
     min_trigger: usize = 4 * 1024 * 1024,
     /// After each collection the next trigger is `max(min_trigger, live * pct/100)`.
@@ -249,7 +253,7 @@ pub const Gc = struct {
     /// world stops and a collection runs.
     pub fn safepoint(self: *Gc, scanner: RootScanner) void {
         if (!self.cfg.enabled) return;
-        if (self.heap.liveBytes() < self.next_gc_bytes) return;
+        if (!self.cfg.stress and self.heap.liveBytes() < self.next_gc_bytes) return;
         self.collect(scanner);
     }
 
@@ -414,6 +418,7 @@ fn bodyFromHeader(h: *GcHeader) [*]u8 {
 /// Build a `Config` from `BIT_GC*` environment variables, over the defaults.
 ///
 ///   BIT_GC=off|0            disable automatic collection
+///   BIT_GC=stress           collect at every safepoint (torture the root scan)
 ///   BIT_GC_MIN_KB=<n>       min live KiB before the first/next collection
 ///   BIT_GC_GROWTH_PCT=<n>   heap growth percent between collections (>= 100)
 ///   BIT_GC_MARKSTACK=<n>    mark worklist capacity in entries (> 0)
@@ -429,6 +434,7 @@ pub fn configFromEnv(environ: std.process.Environ) Config {
     var c = Config{};
     if (lookupEnv(environ, "BIT_GC")) |v| {
         if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "0")) c.enabled = false;
+        if (std.mem.eql(u8, v, "stress")) c.stress = true;
     }
     if (envUsize(environ, "BIT_GC_MIN_KB")) |kb| c.min_trigger = kb *| 1024;
     if (envUsize(environ, "BIT_GC_GROWTH_PCT")) |g| {
@@ -580,6 +586,11 @@ test "configFromEnv: empty env gives defaults, set vars override" {
         "BIT_GC_MARKSTACK=32",
         "BIT_GC_STATS=on",
     };
+    const stress_entries = [_:null]?[*:0]const u8{"BIT_GC=stress"};
+    const stress_env = std.process.Environ{ .block = .{ .slice = &stress_entries } };
+    const sc = configFromEnv(stress_env);
+    try testing.expect(sc.enabled and sc.stress);
+
     const env = std.process.Environ{ .block = .{ .slice = &entries } };
     const c = configFromEnv(env);
     try testing.expect(!c.enabled);

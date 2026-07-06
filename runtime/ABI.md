@@ -281,7 +281,7 @@ Read once at startup by `configFromEnv`. Knobs tune policy, never correctness.
 
 | Variable            | Default | Effect                                             |
 |---------------------|---------|----------------------------------------------------|
-| `BIT_GC`            | on      | `off` or `0` disables automatic collection         |
+| `BIT_GC`            | on      | `off`/`0` disables collection; `stress` collects at every safepoint |
 | `BIT_GC_MIN_KB`     | 4096    | Min live KiB before the first/next collection      |
 | `BIT_GC_GROWTH_PCT` | 200     | Heap growth percent between collections (>= 100)   |
 | `BIT_GC_MARKSTACK`  | 8192    | Mark worklist capacity in entries (> 0)            |
