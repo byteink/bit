@@ -239,6 +239,24 @@ pub fn build(b: *std.Build) void {
     const golden_tests = b.addTest(.{ .root_module = golden_mod });
     test_step.dependOn(&b.addRunArtifact(golden_tests).step);
 
+    // Examples guard: discovers examples/*.bit and compiles + runs each so the
+    // showcase can never rot as the language grows. No .expected files — this
+    // only asserts they build and exit 0; output correctness stays the golden
+    // corpus's job. Shares the host libbitrt archive wired in at the tail.
+    const examples_opts = b.addOptions();
+    examples_opts.addOption([]const u8, "examples_dir", b.pathFromRoot("examples"));
+
+    const examples_mod = b.createModule(.{
+        .root_source_file = b.path("tests/examples.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    examples_mod.addImport("bitc", exe.root_module);
+    examples_mod.addOptions("build_options", examples_opts);
+
+    const examples_tests = b.addTest(.{ .root_module = examples_mod });
+    test_step.dependOn(&b.addRunArtifact(examples_tests).step);
+
     // Fuzz harness (task #334): lexer+parser must never crash/hang on
     // arbitrary bytes. Two separate compilations of fuzz.zig, because
     // `-ffuzz` instrumentation changes runtime behavior, not just codegen:
@@ -382,4 +400,8 @@ pub fn build(b: *std.Build) void {
     // `zig build test` rather than silently skipping.
     golden_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
     if (host_libbitrt_install) |inst| golden_tests.step.dependOn(inst);
+
+    // Same archive for the examples guard.
+    examples_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
+    if (host_libbitrt_install) |inst| examples_tests.step.dependOn(inst);
 }
