@@ -96,6 +96,7 @@ pub const RtFn = enum {
     slice_append,
     slice_get,
     slice_set,
+    slice_slice,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

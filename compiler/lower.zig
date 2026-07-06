@@ -1429,9 +1429,10 @@ const FnCtx = struct {
             const data = self.ctx.typeOf(arg_ty);
             if (data == .array) return self.b.constInt(i64ty, @intCast(data.array.len)); // len == cap
             const v = try self.lowerExpr(arg);
-            // Slice header is `{ptr, len, cap, is_ref}`: `len` at +8 (`slice_len`,
-            // shared with `string`), `cap` at +16. `cap` is slice-only.
-            if (data == .slice) return if (is_cap) self.b.fieldGet(i64ty, v, 16) else self.b.sliceLen(i64ty, v);
+            // Slice header is `{buf, len, off, cap, is_ref}`: `len` at +8
+            // (`slice_len`, shared with `string`), `cap` at +24. `cap` is
+            // slice-only.
+            if (data == .slice) return if (is_cap) self.b.fieldGet(i64ty, v, 24) else self.b.sliceLen(i64ty, v);
             if (!is_cap and data == .prim and data.prim == .string) return self.b.sliceLen(i64ty, v);
             return error.UnsupportedConstruct;
         }
@@ -1680,8 +1681,9 @@ const FnCtx = struct {
             .str_interp => self.lowerStrInterp(node),
             .composite_lit => self.lowerCompositeLit(node),
             .slice_lit => self.lowerSliceElems(try self.nodeType(node), self.kids(node)),
+            .slice_expr => self.lowerSliceExpr(node),
             .arrow_fn => self.lowerArrowFn(node),
-            else => error.UnsupportedConstruct, // try_expr/catch_*/type_assert/tuple_index/slice_expr/map literals
+            else => error.UnsupportedConstruct, // try_expr/catch_*/type_assert/tuple_index/map literals
         };
     }
 
@@ -1843,6 +1845,20 @@ const FnCtx = struct {
             _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ s, idx, v });
         }
         return s;
+    }
+
+    /// `s[lo:hi]` (SPEC §12.6): a new `[]T` view sharing `s`'s buffer. `lo`
+    /// defaults to 0, `hi` to `len(s)`. Only a slice base is supported here;
+    /// re-slicing a `[N]T` array or a `string` is deferred (#1147).
+    fn lowerSliceExpr(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const k = self.kids(node); // [recv, lo_or_none, hi_or_none]
+        const recv_ty = try self.nodeType(k[0]);
+        if (self.ctx.typeOf(recv_ty) != .slice) return error.UnsupportedConstruct;
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const recv = try self.lowerExpr(k[0]);
+        const lo = if (k[1] != ast.none) try self.lowerExprH(k[1], i64ty) else try self.b.constInt(i64ty, 0);
+        const hi = if (k[2] != ast.none) try self.lowerExprH(k[2], i64ty) else try self.b.sliceLen(i64ty, recv);
+        return self.b.rtCall(try self.nodeType(node), .slice_slice, &.{ recv, lo, hi });
     }
 
     fn lowerCompositeLit(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
@@ -2331,14 +2347,15 @@ test "lowers a select with a recv case, a send case, and a default" {
     try ir.verify(gpa, &out.module);
 }
 
-test "lowers a slice literal, append, indexed store, and len" {
+test "lowers a slice literal, append, indexed store, len, and reslice" {
     const gpa = testing.allocator;
     const src =
         \\function build(): i64 {
         \\  let xs = [1, 2, 3]
         \\  xs = append(xs, 4)
         \\  xs[0] = 9
-        \\  return xs[0] + len(xs) + cap(xs)
+        \\  let mid = xs[1:3]
+        \\  return xs[0] + len(xs) + cap(xs) + mid[0]
         \\}
         \\
     ;

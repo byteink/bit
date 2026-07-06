@@ -96,18 +96,23 @@ both and calling `code_ptr(env_ptr, args...)` — the environment is threaded in
 as the callee's leading argument. Nothing new is required of the runtime: a
 closure cell is scanned by the same `ptr_offsets` mechanism as any struct.
 
-A **dynamic slice value** (`[]T`) is a pointer to a `gc_alloc`'d 32-byte header
-`{ ptr, len, cap, is_ref }` (`TypeInfo{ size = 32, ptr_offsets = [0] }`). `ptr`
-at +0 points at a *separate* `gc_alloc`'d element buffer — the header's one
-traced reference; `len`/`cap` at +8/+16 are word counts; `is_ref` at +24 records
-whether each buffered word is itself a GC reference. Elements are **one word
-each** (the same word model channels use, §11): a `T` that fits in a word is
-stored by value, a wider `T` is boxed and its reference stored. The runtime owns
-construction/growth/bounds-checked access via `bit_rt_slice_new/append/get/set`
-(§9); `len(s)` reads the header word directly (`slice_len`, offset 8, shared with
-the `string` header). The element buffer is a leaf today — scanning its `is_ref`
-words as roots is deferred to the safepoint/stack-map work (#1106); the header
-already keeps the buffer itself alive.
+A **dynamic slice value** (`[]T`) is a pointer to a `gc_alloc`'d 40-byte header
+`{ buf, len, off, cap, is_ref }` (`TypeInfo{ size = 40, ptr_offsets = [0] }`).
+`buf` at +0 points at a *separate* `gc_alloc`'d element buffer (the header's one
+traced reference); the slice views the `len` words at `buf[off .. off + len]`,
+with capacity `cap` counted from `off` (so `buf` holds `off + cap` words).
+`len`/`off`/`cap`/`is_ref` sit at +8/+16/+24/+32. Keeping `buf` a base pointer
+and carrying an `off` means a reslice `s[lo:hi]` shares the same `buf` and only
+bumps `off`/`len`/`cap` — **no interior pointer is ever stored as a GC
+reference** (§3). `is_ref` records whether each buffered word is itself a GC
+reference. Elements are **one word each** (the same word model channels use,
+§11): a `T` that fits in a word is stored by value, a wider `T` is boxed and its
+reference stored. The runtime owns construction/growth/bounds-checked
+access/reslicing via `bit_rt_slice_new/append/get/set/slice` (§9); `len(s)` reads
+the header word directly (`slice_len`, offset 8, shared with the `string`
+header). The element buffer is a leaf today — scanning its `is_ref` words as
+roots is deferred to the safepoint/stack-map work (#1106); the header already
+keeps the buffer itself alive.
 
 ---
 
@@ -304,6 +309,7 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_slice_append` | `(h: *SliceHeader, word: u64) -> *SliceHeader` (§2)     |
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize) -> u64` (§2)     |
 | `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64) -> void` (§2) |
+| `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2) |
 
 Every symbol above is `callconv(.c)` with plain C linkage — the entire
 compiler-facing surface of `libbitrt.a`. Nothing else in `runtime/` is a stable

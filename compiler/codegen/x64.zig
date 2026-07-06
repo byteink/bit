@@ -1493,6 +1493,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .slice_append = "bit_rt_slice_append",
     .slice_get = "bit_rt_slice_get",
     .slice_set = "bit_rt_slice_set",
+    .slice_slice = "bit_rt_slice_slice",
 });
 
 const CallReturn = struct { dst: u32, ty: TypeId };
