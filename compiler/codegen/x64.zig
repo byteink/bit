@@ -84,6 +84,7 @@ const std = @import("std");
 const ir = @import("../ir.zig");
 const check = @import("../check.zig");
 const regalloc = @import("../regalloc.zig");
+const common = @import("common.zig");
 
 const Allocator = std.mem.Allocator;
 const TypeId = check.TypeId;
@@ -281,6 +282,10 @@ pub const FuncCode = struct {
     code: []u8,
     relocs: []Reloc, // `symbol` slices borrowed (module func names / static strings)
     safepoints: []SafepointEntry,
+    /// Callee-saved registers this function's prologue preserves, and where
+    /// (rbp-relative, i.e. fp-relative) it stashed the caller's value — the
+    /// runtime stack walker (`runtime/ABI.md` §4) restores them when unwinding.
+    saved_regs: []common.SavedReg,
     frame_size: u32,
     /// Owned `__bitstr_N` names some `relocs` borrow (see `Ctx.owned_syms`).
     owned_syms: [][]u8 = &.{},
@@ -293,6 +298,7 @@ pub const FuncCode = struct {
             self.gpa.free(sp.frame_offsets);
         }
         self.gpa.free(self.safepoints);
+        self.gpa.free(self.saved_regs);
         for (self.owned_syms) |s| self.gpa.free(s);
         self.gpa.free(self.owned_syms);
         self.* = undefined;
@@ -1977,12 +1983,22 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     gpa.free(inst_to_vreg);
     gpa.free(block_offsets);
 
+    // Register-recovery slots: the prologue does `push rbp; mov rbp,rsp; push
+    // saved_gpr[i]...`, so the caller's value of `saved_gpr[i]` lands at
+    // rbp - 8*(i+1) — fp-relative, matching `SafepointEntry.frame_offsets`.
+    const saved_regs = try gpa.alloc(common.SavedReg, frame.saved_gpr.len);
+    for (frame.saved_gpr, 0..) |r, i| saved_regs[i] = .{
+        .reg = @intFromEnum(r),
+        .fp_off = -@as(i32, @intCast(8 * (i + 1))),
+    };
+
     return .{
         .gpa = gpa,
         .name = f.name,
         .code = code,
         .relocs = relocs,
         .safepoints = sp_entries,
+        .saved_regs = saved_regs,
         .frame_size = frame.frame_size,
         .owned_syms = owned_syms,
     };

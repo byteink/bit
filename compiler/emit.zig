@@ -15,10 +15,32 @@ const Allocator = std.mem.Allocator;
 const ir = @import("ir.zig");
 const x64 = @import("codegen/x64.zig");
 const arm64 = @import("codegen/arm64.zig");
+const common = @import("codegen/common.zig");
 const obj_elf = @import("obj/elf.zig");
 const obj_macho = @import("obj/macho.zig");
 
 pub const Error = error{NoMain} || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
+
+/// Symbol naming the module's GC stack-map table (`runtime/ABI.md` §4); the
+/// runtime reads it via a `bit_stack_maps` extern to walk Bit frames at a
+/// collection. Mach-O prefixes it `_` like every other symbol.
+const stackmaps_symbol = "bit_stack_maps";
+
+/// Builds one function's arch-neutral stack-map view (arena-owned) from its
+/// backend `FuncCode` records. `Sp` is the backend's `SafepointEntry` type;
+/// its `regs` are physical registers whose numbers (`@intFromEnum`) the
+/// runtime indexes directly. `frame_offsets` are already frame-pointer-relative
+/// (both backends normalize to that). Kept generic because x86-64 and ARM64
+/// carry structurally identical records under distinct `Reg` enums.
+fn stackMapOf(a: Allocator, code_size: usize, saved: []const common.SavedReg, comptime Sp: type, safepoints: []const Sp) Allocator.Error!common.FuncStackMap {
+    const views = try a.alloc(common.SafepointView, safepoints.len);
+    for (safepoints, 0..) |sp, i| {
+        const regs = try a.alloc(u16, sp.regs.len);
+        for (sp.regs, 0..) |r, ri| regs[ri] = @intFromEnum(r);
+        views[i] = .{ .ret_offset = sp.code_offset, .slots = try a.dupe(i32, sp.frame_offsets), .regs = regs };
+    }
+    return .{ .code_size = @intCast(code_size), .saved = try a.dupe(common.SavedReg, saved), .safepoints = views };
+}
 
 /// One distinct `gc_alloc` layout — turned into a static `TypeInfo` blob the
 /// runtime's `bit_rt_gc_alloc` reads (runtime/gc.zig). `size` is the body
@@ -64,6 +86,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     var symbols: std.ArrayList(obj_elf.Symbol) = .empty;
     var relocs: std.ArrayList(obj_elf.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
+    var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -88,6 +111,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
                 .abs64 => 0,
             },
         });
+        try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, x64.SafepointEntry, fc.safepoints));
         if (std.mem.eql(u8, f.name, "main")) {
             have_main = true;
             main_void = module.ctx.typeOf(f.result) == .void;
@@ -164,6 +188,25 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 8, .symbol = offs_name, .kind = .abs64, .addend = 0 });
     }
 
+    // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata ----------------
+    // One `bit_stack_maps` blob the runtime walks at a collection; each
+    // function's code address is an abs64 reloc to its `.text` symbol.
+    {
+        const blob_off: u64 = rodata.items.len;
+        const code_relocs = try common.writeStackMaps(a, &rodata, stackmaps.items);
+        try symbols.append(a, .{ .name = stackmaps_symbol, .section = .rodata, .offset = blob_off, .size = rodata.items.len - blob_off, .binding = .global, .kind = .object });
+        try defined.put(a, stackmaps_symbol, {});
+        // `writeStackMaps` records offsets against `rodata` itself, so they are
+        // already section-relative — do not add `blob_off` again.
+        for (code_relocs, 0..) |ro, fi| try relocs.append(a, .{
+            .section = .rodata,
+            .offset = ro,
+            .symbol = try a.dupe(u8, module.funcs.items[fi].name),
+            .kind = .abs64,
+            .addend = 0,
+        });
+    }
+
     // ---- undefined externals for everything the object references but does
     //      not define (runtime `bit_rt_*` symbols) --------------------------
     var externs = std.StringHashMapUnmanaged(void){};
@@ -197,6 +240,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     var symbols: std.ArrayList(obj_macho.Symbol) = .empty;
     var relocs: std.ArrayList(obj_macho.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
+    var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
 
     const mac = struct {
         fn prefix(al: Allocator, name: []const u8) ![]u8 {
@@ -224,6 +268,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
                 .pageoff12 => .pageoff12,
             },
         });
+        try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, arm64.SafepointEntry, fc.safepoints));
         if (std.mem.eql(u8, f.name, "main")) {
             have_main = true;
             main_void = module.ctx.typeOf(f.result) == .void;
@@ -303,6 +348,26 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try defined.put(a, ti_name, {});
         if (ti.ptr_offsets.len > 0)
             try relocs.append(a, .{ .section = .data, .offset = ti_off + 8, .symbol = offs_name, .kind = .unsigned64 });
+    }
+
+    // ---- GC stack-map table (runtime/ABI.md §4) ---------------------------
+    // Like the string/TypeInfo blobs, each entry holds an absolute code
+    // pointer, so the table lives in writable `.data` (dyld only rebases
+    // writable segments under PIE); the runtime reads it via `_bit_stack_maps`.
+    {
+        const blob_off: u64 = data.items.len;
+        const code_relocs = try common.writeStackMaps(a, &data, stackmaps.items);
+        const sym = try mac(a, stackmaps_symbol);
+        try symbols.append(a, .{ .name = sym, .section = .data, .offset = blob_off, .size = data.items.len - blob_off, .binding = .global });
+        try defined.put(a, sym, {});
+        // `writeStackMaps` records offsets against `data` itself — already
+        // section-relative, so no `blob_off` adjustment.
+        for (code_relocs, 0..) |ro, fi| try relocs.append(a, .{
+            .section = .data,
+            .offset = ro,
+            .symbol = try mac(a, module.funcs.items[fi].name),
+            .kind = .unsigned64,
+        });
     }
 
     // ---- undefined externals for runtime symbols --------------------------

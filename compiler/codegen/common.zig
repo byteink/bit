@@ -81,6 +81,100 @@ pub const CodegenError = error{
     TooManyArguments,
 } || Allocator.Error;
 
+// ============================================================================
+// GC stack-map table (`runtime/ABI.md` §4)
+//
+// The precise collector walks each Bit frame at a safepoint and needs, per
+// return address, which stack slots and callee-saved registers hold a live GC
+// reference — plus, to unwind past a frame, where that frame stashed the
+// caller's callee-saved registers. Each backend computes this per function
+// (`SafepointEntry` + the frame's saved-register list); `writeStackMaps`
+// serializes the whole module into one blob the runtime reads at collection
+// time via the `bit_stack_maps` symbol.
+//
+// All offsets are **frame-pointer-relative** (`rbp` on x86-64, `x29` on
+// AArch64), normalized by each backend so the runtime walker is arch-neutral.
+// Both arches chain frames identically: `*(fp)` is the caller's fp and
+// `*(fp+8)` is the return address.
+// ============================================================================
+
+/// One callee-saved register a function preserves in its prologue, and the
+/// frame-relative slot where it stashed the CALLER's value. Unwinding past
+/// this frame, the walker restores the register from `*(fp + fp_off)`.
+pub const SavedReg = struct { reg: u16, fp_off: i32 };
+
+/// The live-reference set at one safepoint (a call/back-edge return address).
+pub const SafepointView = struct {
+    /// Return address = the function's code address + this offset.
+    ret_offset: u32,
+    /// Frame-pointer-relative offsets of stack slots holding a live reference.
+    slots: []const i32,
+    /// Physical register numbers holding a live reference at this point.
+    regs: []const u16,
+};
+
+/// One function's contribution to the module stack-map table.
+pub const FuncStackMap = struct {
+    code_size: u32,
+    saved: []const SavedReg,
+    safepoints: []const SafepointView,
+};
+
+fn appendU16(out: *std.ArrayList(u8), gpa: Allocator, v: u16) !void {
+    var b: [2]u8 = undefined;
+    std.mem.writeInt(u16, &b, v, .little);
+    try out.appendSlice(gpa, &b);
+}
+
+fn appendU32(out: *std.ArrayList(u8), gpa: Allocator, v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try out.appendSlice(gpa, &b);
+}
+
+/// Serializes the module stack-map table (`runtime/ABI.md` §4) by appending
+/// its blob to `out`. Returns, for each function in order, the byte offset
+/// within `out` of that function's 8-byte code-address field — the object
+/// writer relocates each to the function's own symbol so the runtime reads a
+/// real code address. Offsets are section-relative because `out` already holds
+/// everything emitted before the table.
+///
+/// Layout (little-endian, tightly packed — the runtime reads it with unaligned
+/// `readInt`s): `u32 num_funcs`, then per function `u64 code_addr`, `u32
+/// code_size`, `u16 num_saved` × `{u16 reg, i32 fp_off}`, `u16 num_safepoints`
+/// × `{u32 ret_offset, u16 num_slots × i32, u16 num_regs × u16}`.
+pub fn writeStackMaps(gpa: Allocator, out: *std.ArrayList(u8), funcs: []const FuncStackMap) Allocator.Error![]u32 {
+    const reloc_offsets = try gpa.alloc(u32, funcs.len);
+    errdefer gpa.free(reloc_offsets);
+
+    try appendU32(out, gpa, @intCast(funcs.len));
+    for (funcs, 0..) |fsm, fi| {
+        reloc_offsets[fi] = @intCast(out.items.len);
+        try out.appendSlice(gpa, &(.{0} ** 8)); // code_addr — filled by the reloc
+        try appendU32(out, gpa, fsm.code_size);
+        try appendU16(out, gpa, @intCast(fsm.saved.len));
+        for (fsm.saved) |s| {
+            try appendU16(out, gpa, s.reg);
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, s.fp_off, .little);
+            try out.appendSlice(gpa, &b);
+        }
+        try appendU16(out, gpa, @intCast(fsm.safepoints.len));
+        for (fsm.safepoints) |sp| {
+            try appendU32(out, gpa, sp.ret_offset);
+            try appendU16(out, gpa, @intCast(sp.slots.len));
+            for (sp.slots) |slot| {
+                var b: [4]u8 = undefined;
+                std.mem.writeInt(i32, &b, slot, .little);
+                try out.appendSlice(gpa, &b);
+            }
+            try appendU16(out, gpa, @intCast(sp.regs.len));
+            for (sp.regs) |r| try appendU16(out, gpa, r);
+        }
+    }
+    return reloc_offsets;
+}
+
 test "widthOf classifies every primitive" {
     const gpa = std.testing.allocator;
     var ctx = try TypeContext.init(gpa);

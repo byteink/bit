@@ -227,6 +227,10 @@ pub const FuncCode = struct {
     code: []u8,
     relocs: []Reloc,
     safepoints: []SafepointEntry,
+    /// Callee-saved registers this function's prologue preserves, and where
+    /// (frame-pointer/x29-relative) it stashed the caller's value — the runtime
+    /// stack walker (`runtime/ABI.md` §4) restores them when unwinding.
+    saved_regs: []common.SavedReg,
     frame_size: u32,
     /// Owned `__bitstr_N` names that `relocs` borrow (one per `const_string`).
     owned_syms: [][]u8 = &.{},
@@ -239,6 +243,7 @@ pub const FuncCode = struct {
             self.gpa.free(sp.frame_offsets);
         }
         self.gpa.free(self.safepoints);
+        self.gpa.free(self.saved_regs);
         for (self.owned_syms) |s| self.gpa.free(s);
         self.gpa.free(self.owned_syms);
         self.* = undefined;
@@ -1317,8 +1322,11 @@ fn recordSafepoint(self: *Ctx, ret_off: u32) CodegenError!void {
     std.debug.assert(sm.pos == pos);
     const regs = try self.gpa.alloc(Reg, sm.regs.len);
     for (sm.regs, 0..) |idx, i| regs[i] = self.int_regs[idx];
+    // Normalize to frame-pointer-relative (x29 = sp + frame_size - 16), so the
+    // runtime walker (`runtime/ABI.md` §4) is arch-neutral: `*(x29 + off)`.
+    const fp_base: i32 = @intCast(self.frame.fpOffset()); // frame_size - 16
     const offs = try self.gpa.alloc(i32, sm.slots.len);
-    for (sm.slots, 0..) |slot, i| offs[i] = @intCast(self.frame.spillOffset(slot));
+    for (sm.slots, 0..) |slot, i| offs[i] = @as(i32, @intCast(self.frame.spillOffset(slot))) - fp_base;
     try self.safepoints.append(self.gpa, .{ .code_offset = ret_off, .regs = regs, .frame_offsets = offs });
     self.next_safepoint_idx += 1;
 }
@@ -1784,12 +1792,24 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     }
     ctx.patchJumpFixups();
 
+    // Register-recovery slots: the prologue saves callee-saved `saved_gpr[i]`
+    // at `gprSaveOffset(i)` from sp; convert to x29-relative (fp = sp +
+    // frame_size - 16) so the runtime walker reads `*(x29 + fp_off)`.
+    const fp_base: i32 = @intCast(frame.fpOffset());
+    const saved_regs = try gpa.alloc(common.SavedReg, frame.saved_gpr.len);
+    errdefer gpa.free(saved_regs);
+    for (frame.saved_gpr, 0..) |r, i| saved_regs[i] = .{
+        .reg = @intFromEnum(r),
+        .fp_off = @as(i32, @intCast(frame.gprSaveOffset(i))) - fp_base,
+    };
+
     return .{
         .gpa = gpa,
         .name = f.name,
         .code = try ctx.code.toOwnedSlice(gpa),
         .relocs = try ctx.relocs.toOwnedSlice(gpa),
         .safepoints = try ctx.safepoints.toOwnedSlice(gpa),
+        .saved_regs = saved_regs,
         .owned_syms = try ctx.owned_syms.toOwnedSlice(gpa),
         .frame_size = frame_size,
     };

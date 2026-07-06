@@ -245,6 +245,7 @@ fn fakeFunc(name: []const u8, code: []const u8, relocs: []const x64.Reloc) x64.F
         .code = @constCast(code),
         .relocs = @constCast(relocs),
         .safepoints = &.{},
+        .saved_regs = &.{},
         .frame_size = 0,
     };
 }

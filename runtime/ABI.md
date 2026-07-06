@@ -149,10 +149,61 @@ RootScanner {
   live reference slots (frame offsets and live registers). The stack-map walker
   implements `RootScanner.scan` by decoding those maps up the call stack and
   calling `gc.markRoot` for each live reference.
-- Roots passed to `markRoot` obey §3 (base pointers or null).
-- The exact stack-map encoding (per-callsite table format, how safepoints are
-  keyed by return address) is defined by the codegen ticket that produces it; the
-  runtime only requires that `scan` surfaces a precise, complete root set.
+- Roots passed to `markRoot` should obey §3 (base pointers or null), but
+  `markRoot` is defensively total: it marks a word only if it is exactly a live
+  object base, ignoring null, interior, and foreign pointers. This matters
+  because the type system lists some single-word pointers as "references" that
+  are not GC objects — a `chan` handle is page-allocated and process-lifetime, a
+  bare function value is a code address — and both stack maps and object pointer
+  maps legitimately carry them; the collector must not decode one as an object.
+
+**Register file.** A function containing any safepoint restricts its allocatable
+registers to the callee-saved subset only (x86-64 `rbx`/`r13`/`r14`/`r15`;
+AArch64 `x19`..`x28`), so any live reference at a safepoint is in one of those
+registers or spilled to a frame slot — never a call-clobbered register. This is
+what makes the walk below tractable: callee-saved values are recoverable by
+unwinding, call-clobbered ones would be lost.
+
+**Snapshot.** Collection only ever runs from `bit_rt_safepoint` (below), which is
+a naked shim that records the caller's return address, frame pointer, and
+callee-saved registers *before* any runtime code can overwrite them, into a
+process-global frame. The walk starts there.
+
+**Frame chain.** Both backends establish an identical frame record: `*(fp)` is
+the caller's frame pointer and `*(fp+8)` is the return address (`fp` = `rbp` on
+x86-64, `x29` on AArch64). All stack-map offsets are **frame-pointer-relative**,
+normalized by each backend, so the walker is arch-neutral.
+
+**Wire format (`bit_stack_maps`).** The compiler emits one table per program,
+defined as the symbol `bit_stack_maps` (Mach-O: `_bit_stack_maps`) in read-only
+data (ELF) or writable data (Mach-O, so dyld can rebase its absolute code
+pointers under PIE). The runtime reads it via an `extern` of that symbol.
+Little-endian, tightly packed (read with unaligned loads):
+
+```
+u32 num_funcs
+per function (num_funcs times):
+  u64 code_addr        # abs reloc -> the function's code symbol
+  u32 code_size        # bytes; the function spans [code_addr, code_addr+code_size)
+  u16 num_saved
+  per saved (num_saved times):
+    u16 reg            # physical register number the prologue preserved
+    i32 fp_off         # caller's value is at *(fp + fp_off)
+  u16 num_safepoints
+  per safepoint (num_safepoints times):
+    u32 ret_offset     # this safepoint's return address = code_addr + ret_offset
+    u16 num_slots
+    i32 slot_fp_off[num_slots]   # live-reference stack slots, fp-relative
+    u16 num_regs
+    u16 reg[num_regs]            # physical registers holding a live reference
+```
+
+The walk, per frame: find the function whose code range contains `pc`; at the
+matching `ret_offset`, `markRoot` each `slot_fp_off` slot and each live register
+(read from the running snapshot for the innermost frame, or reconstructed from
+inner frames' `saved` entries as the walk unwinds); apply this frame's `saved`
+entries to recover the caller's registers; then step to `*(fp)` / `*(fp+8)`.
+`pc` leaving every function's range ends the Bit portion of the stack.
 
 ---
 
@@ -176,6 +227,18 @@ RootScanner {
   collecting thread proceeds) — future ticket, not built here.
 - The collector never moves objects (non-moving mark-sweep), so references are
   stable across a collection and no pointer fix-up is required.
+
+**Live-task registry and parked stacks.** The scheduler keeps every task on an
+all-tasks registry (`Scheduler.registerTask`, from `spawn` until the task's
+`.done` teardown). At a collection the running task's stack is walked precisely
+(§4); every *other* registered task's stack is scanned **conservatively** —
+every 8-byte word in `[ctx.sp, stack_top)` that is exactly a live object base
+(`Gc.markConservative`) is treated as a root. This is sound because a parked
+task's live callee-saved references are all spilled to its own stack by the
+runtime call chain that parked it (a channel op → `park` → context switch), so
+they lie within that range; the non-moving collector makes a false positive
+merely retain garbage, never corrupt. Precise per-frame maps for parked tasks
+(instead of the conservative scan) are a later refinement.
 
 ---
 
