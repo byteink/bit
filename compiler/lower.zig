@@ -685,8 +685,9 @@ const FnCtx = struct {
             .for_of => try self.lowerForOf(node),
             .for_inf => try self.lowerForInf(node),
             .switch_stmt => try self.lowerSwitch(node),
+            .select_stmt => try self.lowerSelect(node),
             .block => try self.lowerBlockScoped(node),
-            else => return error.UnsupportedConstruct, // fail_stmt, for_in, select_stmt
+            else => return error.UnsupportedConstruct, // fail_stmt, for_in
         }
     }
 
@@ -1008,6 +1009,126 @@ const FnCtx = struct {
         if (!has_subject) return self.lowerExprH(e, self.ctx.prim_ids.get(.bool));
         const ev = try self.lowerExprH(e, subject_ty);
         return self.emitEq(subject_ty, subject, ev);
+    }
+
+    /// `select` (SPEC §16.3): each comm clause's channel operand (and a send
+    /// case's value) is evaluated once, marshaled into a `select_alloc`'d
+    /// descriptor buffer, and handed to the runtime `select`, which returns the
+    /// fired case index (or `n` for `default`). The result then dispatches on
+    /// that index exactly like a value `switch`, binding a recv case's received
+    /// word before its body.
+    fn lowerSelect(self: *FnCtx, node: ast.Index) Error!void {
+        const cases = self.kids(node);
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const desc_size: u32 = 32; // sizeof(SelectCaseDesc): {dir, chan, word, ok}
+
+        var n: usize = 0;
+        var default_stmts: ast.Index = ast.none;
+        for (cases) |c| switch (self.tree().get(c).tag) {
+            .comm_case => n += 1,
+            .comm_default => default_stmts = self.kids(c)[0],
+            else => {},
+        };
+        const has_default = default_stmts != ast.none;
+
+        // Pass 1: allocate the buffer and evaluate every comm exactly once.
+        const nconst = try self.b.constInt(i64ty, @intCast(n));
+        const buf = try self.b.rtCall(i64ty, .select_alloc, &.{nconst});
+        {
+            var i: usize = 0;
+            for (cases) |c| {
+                if (self.tree().get(c).tag != .comm_case) continue;
+                const comm = self.kids(c)[0];
+                const off: u32 = @intCast(i * desc_size);
+                if (self.tree().get(comm).tag == .send_stmt) {
+                    const sk = self.kids(comm); // [chan, value]
+                    const elem_ty = self.ctx.typeOf(try self.nodeType(sk[0])).chan;
+                    const ch = try self.lowerExpr(sk[0]);
+                    const v = try self.lowerExprH(sk[1], elem_ty);
+                    try self.b.fieldSet(buf, off + 0, try self.b.constInt(i64ty, 1)); // dir = send
+                    try self.b.fieldSet(buf, off + 8, ch);
+                    try self.b.fieldSet(buf, off + 16, v); // word = value to send
+                } else { // recv_bind: [binder_or_none, chan]
+                    const ch = try self.lowerExpr(self.kids(comm)[1]);
+                    try self.b.fieldSet(buf, off + 0, try self.b.constInt(i64ty, 0)); // dir = recv
+                    try self.b.fieldSet(buf, off + 8, ch);
+                }
+                i += 1;
+            }
+        }
+        const hd = try self.b.constInt(i64ty, if (has_default) 1 else 0);
+        const fired = try self.b.rtCall(i64ty, .select, &.{ buf, nconst, hd });
+
+        // Pass 2: dispatch on `fired` (a value switch), binding recv results.
+        const pre_len = self.env.bindings.items.len;
+        const orig = try self.env.snapshotValues(self.gpa, pre_len);
+        defer self.gpa.free(orig);
+        const join = try self.b.newBlock();
+        const dflt = if (n > 0) try self.b.newBlock() else undefined;
+        try self.loop_stack.append(self.gpa, .{ .exit = join, .cont = join, .pre_len = pre_len, .kind = .switch_like });
+        var join_reachable = false;
+
+        var i: usize = 0;
+        for (cases) |c| {
+            if (self.tree().get(c).tag != .comm_case) continue;
+            const comm = self.kids(c)[0];
+            const body = self.kids(c)[1];
+            const off: u32 = @intCast(i * desc_size);
+            const cond = try self.emitEq(i64ty, fired, try self.b.constInt(i64ty, @intCast(i)));
+            const body_blk = try self.b.newBlock();
+            const next_blk = if (i == n - 1) dflt else try self.b.newBlock();
+            try self.emitBr(cond, body_blk, &.{}, next_blk, &.{});
+
+            self.switchBlock(body_blk);
+            self.env.restoreValues(orig);
+            const mark = self.env.mark();
+            if (self.tree().get(comm).tag == .recv_bind) {
+                const binder = self.kids(comm)[0];
+                if (binder != ast.none) {
+                    if (self.tree().get(binder).tag != .ident) return error.UnsupportedConstruct; // (v, ok) form: deferred
+                    const elem_ty = self.ctx.typeOf(try self.nodeType(self.kids(comm)[1])).chan;
+                    const rv = try self.b.fieldGet(elem_ty, buf, off + 16);
+                    try self.env.declare(self.gpa, self.identText(binder), rv, elem_ty);
+                }
+            }
+            try self.lowerStmtList(body);
+            self.env.restoreCount(mark);
+            if (!self.terminated) {
+                join_reachable = true;
+                const vals = try self.env.snapshotValues(self.gpa, pre_len);
+                defer self.gpa.free(vals);
+                try self.emitJump(join, vals);
+            }
+            self.env.restoreValues(orig);
+            self.switchBlock(next_blk);
+            i += 1;
+        }
+
+        // "default fired" block (or the caller's block when there are no cases).
+        self.env.restoreValues(orig);
+        if (has_default) {
+            const mark = self.env.mark();
+            try self.lowerStmtList(default_stmts);
+            self.env.restoreCount(mark);
+        }
+        if (!self.terminated) {
+            join_reachable = true;
+            const vals = try self.env.snapshotValues(self.gpa, pre_len);
+            defer self.gpa.free(vals);
+            try self.emitJump(join, vals);
+        }
+        self.env.restoreValues(orig);
+
+        const ctx = self.loop_stack.pop().?;
+        if (ctx.exit_used) join_reachable = true;
+        self.b.endBlock();
+        self.b.beginBlock(join);
+        if (join_reachable) {
+            try self.addLoopParams(pre_len);
+            self.terminated = false;
+        } else {
+            try self.emitUnreachable();
+        }
     }
 
     fn lowerWhile(self: *FnCtx, node: ast.Index) Error!void {
@@ -2146,6 +2267,46 @@ test "lowers string interpolation to a concat rt_call" {
     const src =
         \\function greet(name: string, age: i64): string {
         \\  return "hi ${name}, age ${age}"
+        \\}
+        \\
+    ;
+    var out = try lowerSource(gpa, src);
+    defer out.module.deinit();
+    defer out.ctx.deinit();
+    try ir.verify(gpa, &out.module);
+}
+
+test "lowers channel construction, send, and receive" {
+    const gpa = testing.allocator;
+    const src =
+        \\function main() {
+        \\  let ch = chan<i64>(1)
+        \\  ch <- 42
+        \\  let v = <- ch
+        \\  print("${v}")
+        \\}
+        \\
+    ;
+    var out = try lowerSource(gpa, src);
+    defer out.module.deinit();
+    defer out.ctx.deinit();
+    try ir.verify(gpa, &out.module);
+}
+
+test "lowers a select with a recv case, a send case, and a default" {
+    const gpa = testing.allocator;
+    const src =
+        \\function main() {
+        \\  let a = chan<i64>(1)
+        \\  let b = chan<i64>(1)
+        \\  select {
+        \\    case x = <- a:
+        \\      print("${x}")
+        \\    case b <- 1:
+        \\      print("sent")
+        \\    default:
+        \\      print("idle")
+        \\  }
         \\}
         \\
     ;

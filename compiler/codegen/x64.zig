@@ -1487,6 +1487,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .spawn = "bit_rt_spawn",
     .map_iter_init = "bit_rt_map_iter_init",
     .map_iter_next = "bit_rt_map_iter_next",
+    .select_alloc = "bit_rt_select_alloc",
     .select = "bit_rt_select",
     .slice_new = "bit_rt_slice_new",
     .slice_append = "bit_rt_slice_append",

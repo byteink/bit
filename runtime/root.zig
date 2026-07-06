@@ -348,6 +348,48 @@ export fn bit_rt_chan_close(ch: ?*anyopaque) callconv(.c) void {
     chan.WordChan.closeNilable(c, &g_sched);
 }
 
+/// One `select` case as codegen marshals it (ABI.md §11). `word` is in/out: for
+/// a send case it holds the value to send; for a recv case the runtime writes
+/// the received value into it. `ok` receives recv validity (low byte, 0 =
+/// channel closed and drained). Codegen fills a zeroed array of these, one per
+/// case, in an `bit_rt_select_alloc`'d buffer.
+const SelectCaseDesc = extern struct {
+    dir: u64, // 0 = recv, 1 = send
+    chan: ?*anyopaque,
+    word: u64,
+    ok: u64,
+};
+
+/// `bit_rt_select_alloc`: a zeroed `n`-case descriptor buffer (a leaf GC
+/// object). Codegen populates `dir`/`chan` (and, for a send, `word`) per case,
+/// then calls `bit_rt_select`.
+export fn bit_rt_select_alloc(n: usize) callconv(.c) [*]SelectCaseDesc {
+    const body = g_gc.allocRaw(n * @sizeOf(SelectCaseDesc), &slicebuf_info) orelse fatal("out of memory");
+    return @ptrCast(@alignCast(body));
+}
+
+/// `bit_rt_select` (SPEC §16.3): blocks until one case can proceed, choosing
+/// uniformly at random among those ready; `has_default` makes it non-blocking
+/// (run the default clause when none is ready). Returns the fired case index,
+/// or `n` to signal the default clause. The received value of a recv case is
+/// left in that case's `word` for codegen to read back.
+export fn bit_rt_select(descs: [*]SelectCaseDesc, n: usize, has_default: bool) callconv(.c) usize {
+    std.debug.assert(n <= chan.max_select_cases);
+    var cases: [chan.max_select_cases]chan.SelectCase = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c: *chan.WordChan = @ptrCast(@alignCast(descs[i].chan.?));
+        cases[i] = if (descs[i].dir == 0)
+            c.recvCase(&descs[i].word, @ptrCast(&descs[i].ok))
+        else
+            c.sendCase(&descs[i].word);
+    }
+    return switch (chan.select(&g_sched, cases[0..n], has_default)) {
+        .fired => |idx| idx,
+        .default => n,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Spawn (ABI.md §9)
 // ---------------------------------------------------------------------------

@@ -290,6 +290,8 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_chan_send`    | `(ch: ?*anyopaque, value: u64) -> void` (§11)          |
 | `bit_rt_chan_recv`    | `(ch: ?*anyopaque) -> ChanRecvResult` (§11)             |
 | `bit_rt_chan_close`   | `(ch: ?*anyopaque) -> void` (§11)                       |
+| `bit_rt_select_alloc` | `(n: usize) -> *SelectCaseDesc` (§11)                   |
+| `bit_rt_select`       | `(descs: *SelectCaseDesc, n: usize, has_default: bool) -> usize` (§11) |
 | `bit_rt_panic`        | `(msg: *const RtBytes) -> noreturn` (§12)               |
 | `bit_rt_assert`       | `(cond: bool, msg: *const RtBytes) -> void` (§12)       |
 | `bit_rt_print`        | `(s: *const RtBytes) -> void` (§12)                     |
@@ -375,6 +377,25 @@ ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
   their handles (not their buffered elements, which the GC still reclaims
   once unreachable). Acceptable for v1 — see `chan.zig`'s registry note for
   the rationale — revisit if a real program's channel count matters.
+
+### Select (§16.3)
+
+```
+SelectCaseDesc { dir: u64, chan: *WordChan, word: u64, ok: u64 }   // 32 bytes
+bit_rt_select_alloc(n)                     -> *SelectCaseDesc[n]  (zeroed)
+bit_rt_select(descs, n, has_default: bool) -> usize
+```
+
+Codegen evaluates each comm clause's channel (and a send case's value) once,
+`bit_rt_select_alloc`s a zeroed `n`-descriptor buffer, and fills `dir` (0 recv /
+1 send), `chan`, and — for a send — `word` (the value to send). `word` is
+**in/out**: for a recv case the runtime writes the received value there, so
+codegen reads it back from `descs[fired].word` after the call. `bit_rt_select`
+returns the fired case index, or `n` to signal the `default` clause ran. The
+descriptor buffer is a leaf GC object; its channel pointers are also held by the
+caller's live channel values, so nothing is lost before collection is wired
+(#1106). Nil-channel cases are the caller's responsibility to omit (a nil case
+is never ready).
 
 ### Root scanning integration
 

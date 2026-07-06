@@ -81,6 +81,11 @@ pub const RtFn = enum {
     spawn,
     map_iter_init,
     map_iter_next,
+    /// `select_alloc(n) -> *desc[n]` reserves a zeroed case-descriptor buffer;
+    /// codegen fills `dir`/`chan`/`word` per case, then `select(descs, n,
+    /// has_default) -> fired index` (or `n` for the default clause), leaving a
+    /// recv case's value in its descriptor `word` (ABI.md §11).
+    select_alloc,
     select,
     /// Dynamic `[]T` (ABI.md §2). `slice_new(len, cap, is_ref) -> slice`;
     /// `slice_append(slice, word) -> slice` (grows, returns the header);
