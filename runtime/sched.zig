@@ -169,6 +169,18 @@ pub const Task = struct {
     state: std.atomic.Value(TaskState) = .init(.runnable),
     /// Intrusive link; owned by whichever queue currently holds the task.
     next: ?*Task = null,
+    /// Intrusive links for the scheduler's all-live-tasks registry (ABI.md §5),
+    /// distinct from `next` because a task is on the registry for its whole
+    /// life yet simultaneously moves between run queues. Used only by the GC to
+    /// find every parked/runnable stack to scan; see `Scheduler.registerTask`.
+    reg_next: ?*Task = null,
+    reg_prev: ?*Task = null,
+
+    /// Highest address of this task's usable stack (exclusive) — the byte just
+    /// past the mapping. A conservative scan covers `[ctx.sp, stackTop())`.
+    fn stackTop(t: *const Task) usize {
+        return @intFromPtr(t.mapping.ptr) + t.mapping.len;
+    }
 
     fn create(f: TaskFn, arg: ?*anyopaque) !*Task {
         const t = try std.heap.page_allocator.create(Task);
@@ -661,7 +673,10 @@ const Worker = struct {
                         self.park_setup_arg = null;
                     }
                 },
-                .done => Task.destroy(t),
+                .done => {
+                    self.sched.unregisterTask(t);
+                    Task.destroy(t);
+                },
                 .running => unreachable, // yield/park/trampoline must set this before switching back
             }
         }
@@ -690,6 +705,14 @@ pub const Scheduler = struct {
     global: GlobalQueue = .{},
     poller: NetPoller,
     stopping: std.atomic.Value(bool) = .init(false),
+
+    /// All-live-tasks registry (ABI.md §5): every `Task` from `spawn` until its
+    /// `.done` teardown, so the GC can find every parked/runnable stack to scan
+    /// conservatively at a collection. The lock is future-proofing — under v1's
+    /// single-worker pin the only mutator is the one worker thread, which is
+    /// also the only thread that ever collects, so there is no live contention.
+    reg_lock: SpinLock = .{},
+    reg_head: ?*Task = null,
 
     /// `nthreads == 0` auto-detects the CPU count (GOMAXPROCS default).
     /// Bookkeeping (worker array, task control blocks, stacks) is allocated
@@ -723,10 +746,53 @@ pub const Scheduler = struct {
     /// caller isn't a worker at all.
     pub fn spawn(self: *Scheduler, f: TaskFn, arg: ?*anyopaque) !void {
         const t = try Task.create(f, arg);
+        self.registerTask(t);
         if (Worker.tls) |w| {
             if (!w.deque.pushBottom(t)) self.global.push(t);
         } else {
             self.global.push(t);
+        }
+    }
+
+    /// Link `t` onto the all-tasks registry. Called once, at spawn, before the
+    /// task is queued anywhere.
+    fn registerTask(self: *Scheduler, t: *Task) void {
+        self.reg_lock.acquire();
+        defer self.reg_lock.release();
+        t.reg_prev = null;
+        t.reg_next = self.reg_head;
+        if (self.reg_head) |h| h.reg_prev = t;
+        self.reg_head = t;
+    }
+
+    /// Unlink `t` from the registry. Called once, when the worker tears a
+    /// finished task down, strictly before `Task.destroy` frees it.
+    fn unregisterTask(self: *Scheduler, t: *Task) void {
+        self.reg_lock.acquire();
+        defer self.reg_lock.release();
+        if (t.reg_prev) |p| p.reg_next = t.reg_next else self.reg_head = t.reg_next;
+        if (t.reg_next) |n| n.reg_prev = t.reg_prev;
+        t.reg_prev = null;
+        t.reg_next = null;
+    }
+
+    /// Visit the conservative stack range `[sp, top)` of every registered task
+    /// except `running` (the collector scans that one precisely from its
+    /// register snapshot) and any not-yet-started task (empty range). Used only
+    /// by the GC root scan (ABI.md §5). Safe under the single-worker pin: the
+    /// calling thread is the only worker, so no task's context is changing
+    /// underneath this walk.
+    pub fn forEachOtherStack(self: *Scheduler, running: ?*Task, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, sp: usize, top: usize) void) void {
+        self.reg_lock.acquire();
+        defer self.reg_lock.release();
+        var it = self.reg_head;
+        var guard: usize = 0;
+        while (it) |t| : (it = t.reg_next) {
+            guard += 1;
+            if (guard > max_registered_tasks) break; // Power-of-10: statically bounded walk
+            if (t == running) continue;
+            if (t.state.load(.acquire) == .done) continue;
+            cb(ctx, t.ctx.sp, t.stackTop());
         }
     }
 
@@ -746,6 +812,19 @@ pub const Scheduler = struct {
         std.heap.page_allocator.free(self.workers);
     }
 };
+
+/// Upper bound on the registry walk (a runaway-loop backstop, far above any
+/// real live-task count; the scheduler caps concurrent OS threads, not green
+/// threads, so this only guards the GC's own traversal).
+const max_registered_tasks: usize = 1 << 24;
+
+/// The task currently executing on the calling worker, or null if the caller
+/// is not a worker thread (e.g. the boot thread). The GC excludes this task
+/// from the conservative parked-stack scan — it is walked precisely instead.
+pub fn currentTask() ?*Task {
+    const w = Worker.tls orelse return null;
+    return w.running;
+}
 
 // ---------------------------------------------------------------------------
 // Tests

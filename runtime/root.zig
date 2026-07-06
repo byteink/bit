@@ -61,25 +61,175 @@ pub const MainFn = *const fn () callconv(.c) i32;
 extern fn bit_main() callconv(.c) i32;
 
 // ---------------------------------------------------------------------------
-// Root scanning (ABI.md §11): channel-buffered references
+// Root scanning (ABI.md §4/§5/§11)
+//
+// A collection roots from three sources, all funneled through `scanRoots`:
+//   1. the running (collecting) task's own stack — walked *precisely* via the
+//      compiler's stack-map table (`bit_stack_maps`, ABI.md §4), starting from
+//      the register/frame snapshot `bit_rt_safepoint` captured at the poll;
+//   2. every other live task's stack — scanned *conservatively* (ABI.md §5),
+//      sound because a parked task's callee-saved references are all spilled to
+//      its stack by the runtime call chain that parked it;
+//   3. buffered `is_ref` channel elements (ABI.md §11).
 // ---------------------------------------------------------------------------
 
-/// Scans everything this runtime *can* precisely root today: buffered,
-/// `is_ref` channel elements (ABI.md §11). Deliberately does NOT walk any
-/// task's stack — the per-callsite stack-map wire format is the codegen
-/// ticket's deliverable (ABI.md §4), and scanning every other, currently
-/// parked task's stack additionally needs a live-task registry that does not
-/// exist yet (ABI.md §5). Nothing calls `bit_rt_safepoint` yet (no codegen
-/// emits it), so this partial root set is inert-safe today; it becomes a real
-/// (documented) gap the moment codegen starts inserting safepoint polls, and
-/// closing it is that ticket's job, not a silent hazard introduced here.
-fn scanRoots(_: *anyopaque, g: *gc_mod.Gc) void {
-    chan.WordChan.scanRegistryRoots(markChanWord);
-    _ = g;
+/// The compiler-emitted stack-map table (ABI.md §4). One `extern const` so the
+/// platform's C symbol mangling matches how `emit.zig` defines it (plain on
+/// ELF, `_`-prefixed on Mach-O) — same mechanism as `bit_main`. Its address is
+/// only ever taken from non-test builds (a unit-test binary links no user
+/// object, so the symbol is undefined there); the reads below are gated on
+/// `!builtin.is_test` exactly so that reference never forces resolution.
+extern const bit_stack_maps: u8;
+
+/// The running task's register+frame state at the safepoint poll, captured by
+/// `bit_rt_safepoint` before any runtime code could clobber it (ABI.md §4).
+/// `regs[n]` is physical register `n`'s live value; `ret`/`fp` locate the
+/// innermost Bit frame. A single global is correct under the single-worker pin
+/// (only one task ever collects at a time); it becomes per-worker when the pin
+/// lifts. `ret == 0` means "never captured" — the walk then roots nothing from
+/// the current stack, which is inert-safe (collection only ever runs *from*
+/// `bit_rt_safepoint`, which always sets it first).
+const SafepointFrame = extern struct {
+    ret: usize = 0,
+    fp: usize = 0,
+    regs: [32]usize = [_]usize{0} ** 32,
+};
+var g_safepoint_frame: SafepointFrame = .{};
+
+/// Marks one root candidate from a stack slot or register named by a stack map
+/// (§4). Routed through the validating `markRoot` (via `markConservative`'s
+/// `usize` door) because the type system lists some non-GC single-word
+/// pointers — notably `chan` handles — as references; `markRoot` skips any word
+/// that is not a live object base. See `Gc.markRoot`.
+fn markRootWord(word: usize) void {
+    g_gc.markConservative(word);
 }
 
 fn markChanWord(word: u64) void {
-    if (word != 0) g_gc.markRoot(@ptrFromInt(word));
+    markRootWord(@intCast(word));
+}
+
+fn blobU16(base: [*]const u8, off: usize) u16 {
+    return std.mem.readInt(u16, (base + off)[0..2], .little);
+}
+fn blobU32(base: [*]const u8, off: usize) u32 {
+    return std.mem.readInt(u32, (base + off)[0..4], .little);
+}
+fn blobU64(base: [*]const u8, off: usize) u64 {
+    return std.mem.readInt(u64, (base + off)[0..8], .little);
+}
+fn blobI32(base: [*]const u8, off: usize) i32 {
+    return std.mem.readInt(i32, (base + off)[0..4], .little);
+}
+
+/// Reads one machine word from an address on the (currently running) mutator
+/// stack. Only ever the live stack below this collecting frame, always mapped.
+fn stackWord(addr: usize) usize {
+    return @as(*const usize, @ptrFromInt(addr)).*;
+}
+
+fn fpSlot(fp: usize, off: i32) usize {
+    return @intCast(@as(i64, @intCast(fp)) + off);
+}
+
+/// Statically bounded frame-walk depth (Power-of-10): a runaway backstop far
+/// above any real Bit call depth on a 64KB task stack.
+const max_walk_frames: usize = 1 << 16;
+
+/// Finds the `bit_stack_maps` function entry whose code range contains `pc`
+/// and, if found, (a) marks every live reference the safepoint at `pc` names —
+/// stack slots via `fp`, registers via `regs` — and (b) rewrites `regs` to the
+/// caller's callee-saved values this frame saved, so the next (outer) frame
+/// reads them correctly. Returns false when `pc` is not in any Bit function
+/// (the top of the Bit portion of the stack), which stops the walk.
+fn scanFrame(base: [*]const u8, pc: usize, fp: usize, regs: *[32]usize) bool {
+    var off: usize = 0;
+    const num_funcs = blobU32(base, off);
+    off += 4;
+    var fi: usize = 0;
+    while (fi < num_funcs) : (fi += 1) {
+        const code_addr: usize = @intCast(blobU64(base, off));
+        off += 8;
+        const code_size = blobU32(base, off);
+        off += 4;
+        const num_saved = blobU16(base, off);
+        off += 2;
+        const saved_off = off;
+        off += @as(usize, num_saved) * 6; // u16 reg + i32 fp_off
+        const num_sps = blobU16(base, off);
+        off += 2;
+        const hit = pc >= code_addr and pc < code_addr + code_size;
+        var si: usize = 0;
+        while (si < num_sps) : (si += 1) {
+            const ret_off = blobU32(base, off);
+            off += 4;
+            const num_slots = blobU16(base, off);
+            off += 2;
+            const slots_off = off;
+            off += @as(usize, num_slots) * 4;
+            const num_regs = blobU16(base, off);
+            off += 2;
+            const regs_off = off;
+            off += @as(usize, num_regs) * 2;
+            if (hit and code_addr + ret_off == pc) {
+                var k: usize = 0;
+                while (k < num_slots) : (k += 1) {
+                    const slot = blobI32(base, slots_off + k * 4);
+                    markRootWord(stackWord(fpSlot(fp, slot)));
+                }
+                k = 0;
+                while (k < num_regs) : (k += 1) {
+                    markRootWord(regs[blobU16(base, regs_off + k * 2)]);
+                }
+            }
+        }
+        if (hit) {
+            var k: usize = 0;
+            while (k < num_saved) : (k += 1) {
+                const rn = blobU16(base, saved_off + k * 6);
+                const foff = blobI32(base, saved_off + k * 6 + 2);
+                regs[rn] = stackWord(fpSlot(fp, foff));
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Precisely walks the running task's Bit frames from the safepoint snapshot,
+/// marking every live reference each frame's stack map names (ABI.md §4).
+fn scanCurrentTask() void {
+    if (builtin.is_test) return; // no stack-map table is linked into unit-test binaries
+    if (g_safepoint_frame.ret == 0) return;
+    const base: [*]const u8 = @ptrCast(&bit_stack_maps);
+    var regs = g_safepoint_frame.regs;
+    var pc = g_safepoint_frame.ret;
+    var fp = g_safepoint_frame.fp;
+    var frame: usize = 0;
+    while (frame < max_walk_frames) : (frame += 1) {
+        if (!scanFrame(base, pc, fp, &regs)) break; // pc left the Bit call graph
+        const ret = stackWord(fp + 8);
+        const next_fp = stackWord(fp);
+        if (next_fp <= fp) break; // frame pointers grow toward higher addresses; anything else is the boundary
+        pc = ret;
+        fp = next_fp;
+    }
+}
+
+/// Conservatively marks any word in `[sp, top)` that is a live object base
+/// (ABI.md §5). Bounded by the fixed task-stack size.
+fn conservativeStack(_: *anyopaque, sp: usize, top: usize) void {
+    var a = std.mem.alignForward(usize, sp, @alignOf(usize));
+    while (a + @sizeOf(usize) <= top) : (a += @sizeOf(usize)) {
+        g_gc.markConservative(stackWord(a));
+    }
+}
+
+fn scanRoots(_: *anyopaque, g: *gc_mod.Gc) void {
+    _ = g;
+    chan.WordChan.scanRegistryRoots(markChanWord);
+    scanCurrentTask();
+    g_sched.forEachOtherStack(sched.currentTask(), @ptrCast(&scan_ctx), conservativeStack);
 }
 
 /// `ctx` is unused by `scanRoots` — any live, non-null pointer satisfies the
@@ -176,11 +326,73 @@ export fn bit_rt_gc_alloc(info: *const gc_mod.TypeInfo) callconv(.c) [*]u8 {
     return g_gc.alloc(info) orelse fatal("out of memory");
 }
 
-/// `bit_rt_safepoint` (ABI.md §4/§5): zero-arg poll, inserted by codegen at
-/// loop back-edges (and implicitly covered by allocation sites). See
-/// `scanRoots`'s doc comment for what root set this collects against today.
-export fn bit_rt_safepoint() callconv(.c) void {
+/// The real safepoint poll, called by the `bit_rt_safepoint` shim below after
+/// the caller's registers are safely snapshotted. `noinline` so the shim's
+/// `call`/`bl` is a real ABI boundary (the snapshot must reflect the caller's
+/// state, not this function's). Collects iff the allocation trigger was crossed.
+noinline fn safepointImpl() callconv(.c) void {
     g_gc.safepoint(scanner());
+}
+
+/// `bit_rt_safepoint` (ABI.md §4/§5): the zero-arg poll codegen emits at loop
+/// back-edges. Naked so it runs with *no* prologue — it captures the caller's
+/// return address, frame pointer, and callee-saved registers (the ones that
+/// may hold a live GC reference, per each backend's callee-saved-only register
+/// file) into `g_safepoint_frame` before any Zig code could overwrite them,
+/// then calls `safepointImpl`. The precise stack walk (`scanCurrentTask`)
+/// starts from that snapshot. Register/offset layout matches `SafepointFrame`:
+/// `ret` at +0, `fp` at +8, `regs[n]` at +16+8n.
+fn safepointEntry() callconv(.naked) void {
+    switch (builtin.cpu.arch) {
+        // rbx=3, r13=13, r14=14, r15=15 -> regs[n] at 16+8n = 40,120,128,136.
+        // The caller's `call` left its return address at (%rsp); rbp is still
+        // the caller's frame pointer (no prologue ran). Operands are pinned to
+        // caller-saved rax/rcx so materializing them cannot clobber a
+        // callee-saved register before it is snapshotted.
+        .x86_64 => asm volatile (
+            \\ movq (%%rsp), %%r8
+            \\ movq %%r8, 0(%%rax)
+            \\ movq %%rbp, 8(%%rax)
+            \\ movq %%rbx, 40(%%rax)
+            \\ movq %%r13, 120(%%rax)
+            \\ movq %%r14, 128(%%rax)
+            \\ movq %%r15, 136(%%rax)
+            \\ subq $8, %%rsp
+            \\ call *%%rcx
+            \\ addq $8, %%rsp
+            \\ ret
+            :
+            : [fr] "{rax}" (&g_safepoint_frame),
+              [impl] "{rcx}" (&safepointImpl),
+            : .{ .r8 = true, .memory = true }
+        ),
+        // x19..x28 -> regs[n] at 16+8n = 168..240. x30 (link register) is the
+        // caller's return address; x29 the caller's frame pointer. Operands are
+        // pinned to caller-saved x0/x1. x30 is preserved across the call by the
+        // stack save/restore below.
+        .aarch64 => asm volatile (
+            \\ str x30, [x0, #0]
+            \\ str x29, [x0, #8]
+            \\ stp x19, x20, [x0, #168]
+            \\ stp x21, x22, [x0, #184]
+            \\ stp x23, x24, [x0, #200]
+            \\ stp x25, x26, [x0, #216]
+            \\ stp x27, x28, [x0, #232]
+            \\ str x30, [sp, #-16]!
+            \\ blr x1
+            \\ ldr x30, [sp], #16
+            \\ ret
+            :
+            : [fr] "{x0}" (&g_safepoint_frame),
+              [impl] "{x1}" (&safepointImpl),
+            : .{ .memory = true }
+        ),
+        else => unreachable, // gated by the comptime arch check at file top
+    }
+}
+
+comptime {
+    @export(&safepointEntry, .{ .name = "bit_rt_safepoint" });
 }
 
 // ---------------------------------------------------------------------------

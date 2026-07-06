@@ -154,6 +154,14 @@ pub const Gc = struct {
     next_gc_bytes: usize,
     stats: Stats = .{},
 
+    /// Inclusive-lower / exclusive-upper bounds of every object body pointer
+    /// ever handed out, so a conservative stack scan (`markConservative`) can
+    /// reject the vast majority of non-pointer words in O(1) before the O(n)
+    /// `owns` membership check. Monotonic — never shrinks on sweep, which only
+    /// widens the reject window slightly and costs nothing in correctness.
+    lo_addr: usize = std.math.maxInt(usize),
+    hi_addr: usize = 0,
+
     /// Create a collector over `heap`. Allocates the fixed mark worklist up front
     /// (startup allocation — never grows afterwards).
     pub fn init(heap: *Heap, cfg: Config) error{OutOfMemory}!Gc {
@@ -199,6 +207,7 @@ pub const Gc = struct {
         self.num_objects += 1;
         self.stats.total_allocated += 1;
         const body = raw + header_size;
+        self.noteBody(@intFromPtr(body));
         @memset(body[0..info.size], 0);
         return body;
     }
@@ -217,8 +226,22 @@ pub const Gc = struct {
         self.num_objects += 1;
         self.stats.total_allocated += 1;
         const body = raw + header_size;
+        self.noteBody(@intFromPtr(body));
         @memset(body[0..body_size], 0);
         return body;
+    }
+
+    fn noteBody(self: *Gc, addr: usize) void {
+        if (addr < self.lo_addr) self.lo_addr = addr;
+        if (addr + 1 > self.hi_addr) self.hi_addr = addr + 1;
+    }
+
+    /// Mark one raw machine word from a conservative root source (a parked
+    /// task's stack scan, `runtime/ABI.md` §5). A `usize`-taking front door for
+    /// `markRoot`, which does the actual validation — sound because the
+    /// collector is non-moving, so a false positive only retains garbage.
+    pub fn markConservative(self: *Gc, word: usize) void {
+        if (word != 0) self.markRoot(@ptrFromInt(word));
     }
 
     /// Poll point for automatic collection. A mutator calls this where the stack
@@ -259,10 +282,28 @@ pub const Gc = struct {
         }
     }
 
-    /// Mark a single root reference (an object body pointer). Null is ignored.
-    /// Root scanners call this for every live reference the stack maps report.
+    /// Mark a single reference, marking it *only if* it is exactly the body
+    /// base of a live managed object. Null, interior pointers, and foreign
+    /// pointers are ignored.
+    ///
+    /// The validation is not defensive nicety: the type system calls several
+    /// single-word pointers "references" that are not GC objects — a `chan`
+    /// handle is page-allocated and process-lifetime, a bare function value is
+    /// a code address — and both the stack maps (§4) and object pointer maps
+    /// (§2) legitimately list them. Feeding one to a blind mark would decode
+    /// `ptr - header` as a bogus `GcHeader` and corrupt or crash. The O(1)
+    /// address-bounds gate rejects the common foreign pointer; `owns` is the
+    /// exact backstop.
+    ///
+    /// ponytail: `owns` is an O(objects) list scan, so tracing a large *live*
+    /// graph is O(n^2). Fine for v1's small heaps and the correctness goldens;
+    /// the upgrade when it bites (a stress workload, #350) is an address->object
+    /// index (hash set of live body pointers) making this O(1).
     pub fn markRoot(self: *Gc, ref: ?[*]u8) void {
-        if (ref) |p| self.markObject(headerFromBody(p));
+        const p = ref orelse return;
+        const word = @intFromPtr(p);
+        if (word < self.lo_addr or word >= self.hi_addr) return;
+        if (self.owns(p)) self.markObject(headerFromBody(p));
     }
 
     /// True iff `ptr` is the body base of a live managed object. Interior and
