@@ -147,11 +147,14 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
         return 2;
     };
 
-    const source = Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(max_source_bytes)) catch |e| {
-        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
-        return 1;
-    };
-    defer gpa.free(source);
+    const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
+    defer {
+        for (inputs) |f| {
+            gpa.free(f.path);
+            gpa.free(f.source);
+        }
+        gpa.free(inputs);
+    }
 
     const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch |e| {
         try err_out.print("bit: runtime archive {s}: {s} (set BIT_LIBBITRT)\n", .{ libbitrtPath(target), @errorName(e) });
@@ -159,7 +162,10 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     };
     defer gpa.free(lib);
 
-    const exe = (try buildExecutable(gpa, src, source, lib, target, err_out)) orelse return 1;
+    // The object identifier / default output name is the module's own name: the
+    // directory's basename for a directory module, or the file stem otherwise —
+    // `stem` yields both ("examples/countdown" -> "countdown", "a.bit" -> "a").
+    const exe = (try buildModule(gpa, inputs, std.fs.path.stem(src), lib, target, err_out)) orelse return 1;
     defer gpa.free(exe);
 
     // `bit run` on a binary this host can exec runs it and throws it away, like
@@ -201,40 +207,156 @@ pub fn buildHostExecutable(gpa: std.mem.Allocator, path: []const u8, source: []c
     return buildExecutable(gpa, path, source, libbitrt, host_target, err_out);
 }
 
-/// Drives one source buffer through the whole compiler — front-end (parse,
-/// resolve, check), then lower -> optimize -> codegen/object -> link — into a
-/// runnable executable's bytes. Returns `null` (after rendering diagnostics to
-/// `err_out`) if any stage before codegen reported an error; the caller maps
-/// that to exit code 1.
+/// One source file of the module being built: its path (for diagnostics and
+/// naming) and contents. Both are owned by whoever produced the `SrcFile`.
+const SrcFile = struct { path: []const u8, source: []const u8 };
+
+/// Upper bound on `.bit` files in one module directory — keeps the directory
+/// walk provably bounded (Power of 10). Raise if a real module approaches it.
+const max_module_files = 1024;
+
+/// Resolves the `bit build`/`run` argument to the module's source files. A
+/// directory is the module (SPEC §17.1): every `.bit` file directly inside,
+/// sorted by name so the build is deterministic. A plain path is a single-file
+/// module. Returns `null` (diagnostics already written to `err_out`) on an I/O
+/// error or an empty module directory. The caller owns and frees each
+/// `path`/`source` and the returned slice.
+fn gatherModule(gpa: std.mem.Allocator, io: Io, src: []const u8, err_out: *Io.Writer) !?[]SrcFile {
+    const stat = Io.Dir.cwd().statFile(io, src, .{}) catch |e| {
+        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
+        return null;
+    };
+    if (stat.kind != .directory) {
+        const source = Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(max_source_bytes)) catch |e| {
+            try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
+            return null;
+        };
+        const out = try gpa.alloc(SrcFile, 1);
+        out[0] = .{ .path = try gpa.dupe(u8, src), .source = source };
+        return out;
+    }
+
+    var dir = Io.Dir.cwd().openDir(io, src, .{ .iterate = true }) catch |e| {
+        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
+        return null;
+    };
+    defer dir.close(io);
+
+    var list: std.ArrayList(SrcFile) = .empty;
+    errdefer {
+        for (list.items) |f| {
+            gpa.free(f.path);
+            gpa.free(f.source);
+        }
+        list.deinit(gpa);
+    }
+
+    var it = dir.iterate();
+    var scanned: u32 = 0;
+    while (scanned < max_module_files) : (scanned += 1) {
+        const entry = (try it.next(io)) orelse break;
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bit")) continue;
+
+        const path = try std.fs.path.join(gpa, &.{ src, entry.name });
+        const source = dir.readFileAlloc(io, entry.name, gpa, .limited(max_source_bytes)) catch |e| {
+            try err_out.print("bit: {s}: {s}\n", .{ path, @errorName(e) });
+            gpa.free(path);
+            return null;
+        };
+        list.append(gpa, .{ .path = path, .source = source }) catch |e| {
+            gpa.free(path);
+            gpa.free(source);
+            return e;
+        };
+    }
+    std.debug.assert(scanned < max_module_files);
+
+    if (list.items.len == 0) {
+        try err_out.print("bit: {s}: no .bit files in module directory\n", .{src});
+        list.deinit(gpa);
+        return null;
+    }
+
+    const out = try list.toOwnedSlice(gpa);
+    std.mem.sort(SrcFile, out, {}, lessByPath);
+    return out;
+}
+
+fn lessByPath(_: void, a: SrcFile, b: SrcFile) bool {
+    return std.mem.lessThan(u8, a.path, b.path);
+}
+
+/// Directory-or-file module build for the host target — the entry the examples
+/// guard uses so it exercises the real `bit build <dir>` path (gather + parse +
+/// resolve/check/lower over the whole directory), not just a single file. A
+/// directory is a module (SPEC §17.1). Returns `null` (diagnostics written to
+/// `err_out`) on an I/O or compile error.
+pub fn buildHostModule(gpa: std.mem.Allocator, io: Io, path: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
+    const inputs = (try gatherModule(gpa, io, path, err_out)) orelse return null;
+    defer {
+        for (inputs) |f| {
+            gpa.free(f.path);
+            gpa.free(f.source);
+        }
+        gpa.free(inputs);
+    }
+    return buildModule(gpa, inputs, std.fs.path.stem(path), libbitrt, host_target, err_out);
+}
+
+/// Single-file convenience entry (the golden `// run` harness uses this): one
+/// buffer, one module. Delegates to `buildModule`.
 fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
+    const one = [_]SrcFile{.{ .path = path, .source = source }};
+    return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, target, err_out);
+}
+
+/// Drives a module's source files through the whole compiler — front-end
+/// (parse each file, then resolve + check the files as one namespace), then
+/// lower -> optimize -> codegen/object -> link — into a runnable executable's
+/// bytes. `ident` names the produced object. Returns `null` (after rendering
+/// diagnostics to `err_out`) if any stage before codegen reported an error;
+/// the caller maps that to exit code 1.
+fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
+    std.debug.assert(inputs.len >= 1);
+
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
-    const file = try sm.addFile(path, source);
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
     defer diags.deinit();
 
-    var tree = try ast.Tree.init(gpa);
-    defer tree.deinit();
-    try parser.parse(gpa, &tree, &diags, file, source);
+    const trees = try gpa.alloc(ast.Tree, inputs.len);
+    var trees_built: usize = 0;
+    defer {
+        for (trees[0..trees_built]) |*t| t.deinit();
+        gpa.free(trees);
+    }
+    const files = try gpa.alloc(resolve.ModuleFile, inputs.len);
+    defer gpa.free(files);
 
-    const mf = resolve.ModuleFile{ .file = file, .source = source, .tree = &tree };
-    const files = [_]resolve.ModuleFile{mf};
+    for (inputs, 0..) |in, i| {
+        const file = try sm.addFile(in.path, in.source);
+        trees[i] = try ast.Tree.init(gpa);
+        trees_built += 1;
+        try parser.parse(gpa, &trees[i], &diags, file, in.source);
+        files[i] = .{ .file = file, .source = in.source, .tree = &trees[i] };
+    }
+
     var no_imports: resolve.ImportTable = .{};
     defer no_imports.deinit(gpa);
 
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
-    var rmodule = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+    var rmodule = try resolve.resolveModule(gpa, &diags, files, &no_imports, &.{});
     defer rmodule.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
     var ctx = try check.TypeContext.init(gpa);
     defer ctx.deinit();
-    var checked = try check.checkModule(gpa, &diags, &ctx, &files, &rmodule, @enumFromInt(0), &.{}, false);
+    var checked = try check.checkModule(gpa, &diags, &ctx, files, &rmodule, @enumFromInt(0), &.{}, false);
     defer checked.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
-    var module = try lower.lowerModule(gpa, &ctx, &files, &checked, &rmodule);
+    var module = try lower.lowerModule(gpa, &ctx, files, &checked, &rmodule);
     defer module.deinit();
     try opt.optimizeModule(gpa, &module, .o1);
 
@@ -247,7 +369,6 @@ fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8,
         .aarch64_macos => {
             const object = try emit.emitMachoObject(gpa, &module);
             defer gpa.free(object);
-            const ident = std.fs.path.stem(path);
             return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
         },
     }

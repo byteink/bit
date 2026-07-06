@@ -23,9 +23,6 @@ const Dir = std.Io.Dir;
 /// (Power of 10). Raise if the folder ever approaches it.
 const max_examples = 1024;
 
-/// Upper bound on any single example file.
-const max_file_bytes = 1 << 20; // 1 MiB
-
 test "examples compile and run" {
     // No archive to link against: the host is not a supported runtime target,
     // so there is nothing to execute. The golden `// run` cases skip the same
@@ -50,7 +47,8 @@ test "examples compile and run" {
     // Each example is its own module: a subdirectory of examples/ holding one
     // `.bit` file (SPEC §17.1 — a module is a directory, and §17.4 — the root
     // module declares exactly one `main`). A flat folder of standalone programs
-    // would put many `main`s in one namespace and fail resolve.
+    // would put many `main`s in one namespace and fail resolve. Build each the
+    // way `bit run <dir>` does — over the whole directory.
     var it = dir.iterate();
     var scanned: u32 = 0;
     while (scanned < max_examples) : (scanned += 1) {
@@ -61,37 +59,18 @@ test "examples compile and run" {
         const sub = try gpa.dupe(u8, entry.name);
         defer gpa.free(sub);
 
-        try runModule(gpa, io, dir, sub, libbitrt);
+        const dir_abs = try std.fs.path.join(gpa, &.{ build_options.examples_dir, sub });
+        defer gpa.free(dir_abs);
+
+        try runExample(gpa, io, sub, dir_abs, libbitrt);
     }
     try testing.expect(scanned < max_examples); // folder stayed within bound
 }
 
-fn runModule(gpa: std.mem.Allocator, io: Io, parent: Dir, sub: []const u8, libbitrt: []const u8) !void {
-    var dir = try parent.openDir(io, sub, .{ .iterate = true });
-    defer dir.close(io);
-
-    var it = dir.iterate();
-    var scanned: u32 = 0;
-    while (scanned < max_examples) : (scanned += 1) {
-        const entry = (try it.next(io)) orelse break;
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".bit")) continue;
-
-        const name = try gpa.dupe(u8, entry.name);
-        defer gpa.free(name);
-
-        try runExample(gpa, io, dir, name, libbitrt);
-    }
-    try testing.expect(scanned < max_examples);
-}
-
-fn runExample(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8, libbitrt: []const u8) !void {
-    const source = try dir.readFileAlloc(io, name, gpa, .limited(max_file_bytes));
-    defer gpa.free(source);
-
+fn runExample(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const u8, libbitrt: []const u8) !void {
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
-    const exe = (try bitc.buildHostExecutable(gpa, name, source, libbitrt, &discard.writer)) orelse {
+    const exe = (try bitc.buildHostModule(gpa, io, dir_abs, libbitrt, &discard.writer)) orelse {
         std.debug.print("example '{s}': expected compile to succeed, got diagnostics:\n{s}\n", .{ name, discard.written() });
         return error.ExampleCompileFailed;
     };
@@ -105,8 +84,7 @@ fn runExample(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8, libbit
     defer run_threaded.deinit();
     const run_io = run_threaded.io();
 
-    const stem = name[0 .. name.len - ".bit".len];
-    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-example-{s}", .{stem}, 0);
+    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-example-{s}", .{name}, 0);
     defer gpa.free(bin_path);
     try Dir.cwd().writeFile(run_io, .{
         .sub_path = bin_path,
