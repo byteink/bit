@@ -1472,9 +1472,24 @@ const FnCtx = struct {
         return self.b.rtCall(chan_ty, .chan_make, &.{ cap, is_ref });
     }
 
+    /// `[]T(n)` / `[]T(n, m)`: allocate a length-`n`, capacity-`m` (default `n`)
+    /// slice, elements zeroed (SPEC §11). Reuses `slice_new`.
+    fn lowerSliceCtor(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const k = self.kids(node); // [callee, type_args, args]
+        const slice_ty = try self.nodeType(node);
+        const elem_ty = self.ctx.typeOf(slice_ty).slice;
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const arg_nodes = self.kids(k[2]);
+        const len = try self.lowerExprH(self.kids(arg_nodes[0])[0], i64ty);
+        const cap = if (arg_nodes.len >= 2) try self.lowerExprH(self.kids(arg_nodes[1])[0], i64ty) else len;
+        const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
+        return self.b.rtCall(slice_ty, .slice_new, &.{ len, cap, is_ref });
+    }
+
     fn lowerCall(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [callee, type_args_or_none, args]
         const callee = k[0];
+        if (self.tree().get(callee).tag == .slice_type) return self.lowerSliceCtor(node);
         if (self.tree().get(callee).tag == .chan_type) return self.lowerChanMake(node);
         if (self.tree().get(callee).tag == .ident and self.env.lookup(self.identText(callee)) == null) {
             if (self.nodeSymbol(callee)) |gsym| {
