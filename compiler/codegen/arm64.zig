@@ -1362,6 +1362,14 @@ fn emitMakeClosure(self: *Ctx, dst: u32, func: ir.FuncId, env: ir.ValueId) Codeg
     try putInt(self, dst, @enumFromInt(cell));
 }
 
+/// `func_addr`: materialize a function's code address into `dst` via a
+/// page21/pageoff12 relocation pair to its own symbol (the same primitive
+/// `make_closure` uses to fill a cell's code slot, minus the cell). No call.
+fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) CodegenError!void {
+    try self.emitAddrOf(scratch1, self.module.func(func).name);
+    try putInt(self, dst, scratch1);
+}
+
 /// `call_value`: dispatch through a closure. Load the environment (+8) and
 /// code pointer (+0) into reserved scratch regs argument marshaling never
 /// touches (x10/x11 are not argument registers; x9 is the parallel-move cycle
@@ -1509,6 +1517,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .index_set => |is_| try emitIndexSet(self, is_.base, is_.index, is_.value, self.f.valueType(is_.value)),
         .slice_len => |sl| try emitSliceLen(self, i, sl.base),
         .make_closure => |mc| try emitMakeClosure(self, i, mc.func, mc.env),
+        .func_addr => |fa| try emitFuncAddr(self, i, fa.func),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
     }
 }
@@ -1634,6 +1643,7 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
         },
         .slice_len => |sl| extendOne(intervals, use_pos, @intFromEnum(sl.base)),
         .make_closure => |mc| extendOne(intervals, use_pos, @intFromEnum(mc.env)),
+        .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| extendOne(intervals, use_pos, a),
     }
 }

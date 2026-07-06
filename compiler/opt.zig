@@ -487,6 +487,7 @@ fn emitTranslated(
         .index_set => |is_| try bldr.indexSet(tr(remap, @intFromEnum(is_.base)), tr(remap, @intFromEnum(is_.index)), tr(remap, @intFromEnum(is_.value))),
         .slice_len => |sl| remap[idx] = try bldr.sliceLen(ty, tr(remap, @intFromEnum(sl.base))),
         .make_closure => |mc| remap[idx] = try bldr.makeClosure(ty, mc.func, tr(remap, @intFromEnum(mc.env))),
+        .func_addr => |fa| remap[idx] = try bldr.funcAddr(ty, fa.func),
         .rt_call => |rc| {
             const args = try trList(gpa, remap, rc.args);
             defer gpa.free(args);
@@ -564,7 +565,7 @@ fn isSideEffecting(op: ir.Op) bool {
 
 fn markOperandsLive(f: *const ir.Function, live: []bool, id: ir.ValueId) void {
     switch (f.decode(id)) {
-        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc => {},
+        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc, .func_addr => {},
         .bin => |b| {
             live[@intFromEnum(b.lhs)] = true;
             live[@intFromEnum(b.rhs)] = true;

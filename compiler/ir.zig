@@ -184,6 +184,12 @@ pub const Op = enum {
     // ---- closures: extra = [FuncId, env] ----------------------------------
     make_closure,
 
+    // ---- raw function address: extra = [FuncId] ---------------------------
+    // Materializes a function's code address as a plain pointer value (no env
+    // cell, unlike `make_closure`). Codegen emits an absolute relocation to the
+    // function's own symbol. Used to hand `bit_rt_spawn` its trampoline (§9).
+    func_addr,
+
     // ---- opaque runtime call: extra = [RtFn, argc, args...] --------------
     rt_call,
 
@@ -324,6 +330,7 @@ pub const Function = struct {
             .index_set => .{ .index_set = .{ .base = @enumFromInt(raw[0]), .index = @enumFromInt(raw[1]), .value = @enumFromInt(raw[2]) } },
             .slice_len => .{ .slice_len = .{ .base = @enumFromInt(raw[0]) } },
             .make_closure => .{ .make_closure = .{ .func = @enumFromInt(raw[0]), .env = @enumFromInt(raw[1]) } },
+            .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
             .rt_call => .{ .rt_call = .{ .rt = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
             else => if (op.isBinary())
                 .{ .bin = .{ .lhs = @enumFromInt(raw[0]), .rhs = @enumFromInt(raw[1]) } }
@@ -361,6 +368,7 @@ pub const Decoded = union(enum) {
     index_set: struct { base: ValueId, index: ValueId, value: ValueId },
     slice_len: struct { base: ValueId },
     make_closure: struct { func: FuncId, env: ValueId },
+    func_addr: struct { func: FuncId },
     rt_call: struct { rt: RtFn, args: []const u32 },
 };
 
@@ -669,6 +677,12 @@ pub const FunctionBuilder = struct {
         return self.push(.make_closure, ty, &.{ @intFromEnum(target), vid(env) });
     }
 
+    /// Materializes `target`'s raw code address as a pointer value (no env
+    /// cell) — the trampoline pointer handed to `bit_rt_spawn` (§9).
+    pub fn funcAddr(self: *FunctionBuilder, ty: TypeId, target: FuncId) Allocator.Error!ValueId {
+        return self.push(.func_addr, ty, &.{@intFromEnum(target)});
+    }
+
     pub fn rtCall(self: *FunctionBuilder, ty: TypeId, rt: RtFn, args: []const ValueId) Allocator.Error!ValueId {
         var buf = try self.gpa.alloc(u32, 2 + args.len);
         defer self.gpa.free(buf);
@@ -918,6 +932,7 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
         .index_set => |is_| try w.print("  index_set %{d}[%{d}] = %{d}\n", .{ @intFromEnum(is_.base), @intFromEnum(is_.index), @intFromEnum(is_.value) }),
         .slice_len => |sl| try w.print("  %{d} = slice_len %{d}\n", .{ i, @intFromEnum(sl.base) }),
         .make_closure => |mc| try w.print("  %{d} = make_closure @{s}, %{d}\n", .{ i, module.func(mc.func).name, @intFromEnum(mc.env) }),
+        .func_addr => |fa| try w.print("  %{d} = func_addr @{s}\n", .{ i, module.func(fa.func).name }),
         .rt_call => |rc| {
             try w.print("  %{d} = rt_call {s}(", .{ i, @tagName(rc.rt) });
             try dumpValList(w, rc.args);
@@ -1083,6 +1098,7 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
         },
         .slice_len => |sl| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(sl.base)),
         .make_closure => |mc| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(mc.env)),
+        .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a),
     }
 }

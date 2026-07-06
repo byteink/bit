@@ -442,6 +442,62 @@ pub const Lowerer = struct {
         try self.closure_funcs.append(self.gpa, f);
         return fid;
     }
+
+    /// Synthesizes one `spawn` site's trampoline — the `TaskFn`-shaped function
+    /// (`(thunk) -> void`, ABI.md §9) the scheduler actually invokes. It reads
+    /// the packed arguments back out of the thunk and calls the spawned target.
+    /// Appended to `closure_funcs` like a lowered arrow_fn, so it lands at a
+    /// reserved `FuncId` and is emitted as its own object symbol.
+    ///
+    /// `direct_fn` distinguishes the two target shapes lowerSpawn packs:
+    ///   - direct (a named function): call it by id — a top-level function has
+    ///     no leading env parameter, so `call_value` (which threads an env)
+    ///     would misalign every argument. The thunk holds only the args.
+    ///   - closure/value (`direct_fn == null`): the thunk's field 0 is the
+    ///     closure; unpack it and `call_value` it.
+    /// `fn_ty` types the thunk pointer, `arg_tys` the packed args, `result_ty`
+    /// the (discarded) callee result, `layout` the thunk struct lowerSpawn built.
+    fn synthSpawnTrampoline(self: *Lowerer, fn_ty: TypeId, direct_fn: ?ir.FuncId, arg_tys: []const TypeId, result_ty: TypeId, layout: StructLayout) Error!ir.FuncId {
+        var b = ir.FunctionBuilder.init(self.gpa);
+        errdefer b.deinit(self.gpa);
+        const entry = try b.newBlock();
+        b.beginBlock(entry);
+
+        // Single parameter: the packed-thunk pointer (TaskFn's `arg`). Block
+        // params must precede any other instruction, so add it before the loads.
+        const thunk = try b.addParam(fn_ty);
+
+        const has_closure = direct_fn == null;
+        const closure: ir.ValueId = if (has_closure)
+            try b.fieldGet(fn_ty, thunk, layout.field_offsets[0])
+        else
+            undefined;
+        const arg_base: usize = if (has_closure) 1 else 0;
+
+        var call_args: std.ArrayList(ir.ValueId) = .empty;
+        defer call_args.deinit(self.gpa);
+        for (arg_tys, 0..) |t, ai| {
+            try call_args.append(self.gpa, try b.fieldGet(t, thunk, layout.field_offsets[arg_base + ai]));
+        }
+
+        // Result is discarded (spawn has no return channel); the produced value
+        // is dead and drops out in regalloc.
+        if (direct_fn) |fid| {
+            _ = try b.call(result_ty, fid, call_args.items);
+        } else {
+            _ = try b.callValue(result_ty, closure, call_args.items);
+        }
+        try b.ret(&.{});
+        b.endBlock();
+
+        const fid: ir.FuncId = @enumFromInt(self.reserved_count + self.closure_funcs.items.len);
+        const name = try std.fmt.allocPrint(self.gpa, "spawn$trampoline${d}", .{@intFromEnum(fid)});
+        defer self.gpa.free(name);
+        const param_types = [_]TypeId{fn_ty};
+        const f = try b.finish(name, &param_types, self.ctx.void_id, false, .invalid, entry);
+        try self.closure_funcs.append(self.gpa, f);
+        return fid;
+    }
 };
 
 /// Lowers one already-resolved, type-checked, single-module program.
@@ -1524,27 +1580,85 @@ const FnCtx = struct {
         _ = try self.b.rtCall(self.ctx.void_id, .chan_send, &.{ ch, v });
     }
 
+    /// `spawn f(args)` (ABI.md §9). `bit_rt_spawn` has a fixed 2-arg shape
+    /// `(TaskFn, arg)`, so the spawned call's arguments cannot ride along
+    /// natively. Codegen packs them (plus the closure, for a closure target)
+    /// into one gc_alloc'd thunk and hands spawn a synthesized trampoline that
+    /// unpacks the thunk and calls the target. `fn_ptr`/`arg` are that
+    /// trampoline and its thunk, never `f` and its raw arguments.
     fn lowerSpawn(self: *FnCtx, node: ast.Index) Error!void {
         const call_node = self.kids(node)[0];
         const k = self.kids(call_node);
         const target = try self.resolveCallTarget(call_node, k[0]);
-        const closure_val: ir.ValueId = switch (target) {
-            .direct => |d| blk: {
-                const fty = try self.nodeType(k[0]);
-                const nilv = try self.b.constNil(fty);
-                break :blk try self.b.makeClosure(fty, d.func, nilv);
-            },
-            .value => |v| v.callee,
+        const fty = try self.nodeType(k[0]);
+
+        // Two target shapes: a named function is called directly by the
+        // trampoline (no env); a closure/fn-value is packed into the thunk and
+        // called through `call_value`. Methods and interface values are out of
+        // scope (task #1149).
+        const direct_fn: ?ir.FuncId = switch (target) {
+            .direct => |d| d.func,
+            .value => null,
             .direct_method, .iface => return error.UnsupportedConstruct,
         };
-        var args: std.ArrayList(ir.ValueId) = .empty;
-        defer args.deinit(self.gpa);
-        try args.append(self.gpa, closure_val);
-        for (self.kids(k[2])) |an| {
+        const closure_val: ?ir.ValueId = switch (target) {
+            .value => |v| v.callee,
+            else => null,
+        };
+
+        // Lower each argument with the callee's parameter type as the hint, and
+        // type the thunk slot by that same parameter type — not by the argument
+        // expression's own type. An untyped literal like `10` has type
+        // `untyped_int`; storing it under that type and reloading it in the
+        // trampoline would hand the callee an `untyped_int` where it declares
+        // `i64`, and IR verification rejects the operand-type mismatch. The
+        // parameter type is what the callee actually expects. Evaluate in source
+        // order, before allocating the thunk.
+        const shape = self.ctx.typeOf(fty).func;
+        const arg_nodes = self.kids(k[2]);
+        if (arg_nodes.len != shape.params.len) return error.UnsupportedConstruct; // variadic spawn out of scope
+        var arg_vals: std.ArrayList(ir.ValueId) = .empty;
+        defer arg_vals.deinit(self.gpa);
+        var arg_tys: std.ArrayList(TypeId) = .empty;
+        defer arg_tys.deinit(self.gpa);
+        for (arg_nodes, 0..) |an, i| {
             if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct;
-            try args.append(self.gpa, try self.lowerExpr(self.kids(an)[0]));
+            const pty = shape.params[i];
+            try arg_tys.append(self.gpa, pty);
+            try arg_vals.append(self.gpa, try self.lowerExprH(self.kids(an)[0], pty));
         }
-        _ = try self.b.rtCall(self.ctx.void_id, .spawn, args.items);
+
+        // Thunk layout: [closure?] ++ args. `layoutFields` puts every ref field
+        // (the closure, plus any ref-typed arg) into `ptr_offsets`, so the thunk
+        // traces correctly once task-stack scanning lands (#1106).
+        const has_closure = closure_val != null;
+        const nfields = @as(usize, if (has_closure) 1 else 0) + arg_tys.items.len;
+        const fields = try self.gpa.alloc(check.Field, nfields);
+        defer self.gpa.free(fields);
+        var fi: usize = 0;
+        if (has_closure) {
+            fields[0] = .{ .name = "fn", .ty = fty, .exported = false };
+            fi = 1;
+        }
+        for (arg_tys.items) |t| {
+            fields[fi] = .{ .name = "a", .ty = t, .exported = false };
+            fi += 1;
+        }
+        var layout = try layoutFields(self.gpa, self.ctx, fields);
+        defer layout.deinit(self.gpa);
+
+        // Allocate and populate the thunk.
+        const thunk = try self.b.gcAlloc(fty, layout.size, layout.ptr_offsets);
+        if (closure_val) |cv| try self.b.fieldSet(thunk, layout.field_offsets[0], cv);
+        const arg_base: usize = if (has_closure) 1 else 0;
+        for (arg_vals.items, 0..) |v, ai| {
+            try self.b.fieldSet(thunk, layout.field_offsets[arg_base + ai], v);
+        }
+
+        // Synthesize the trampoline, take its address, and spawn it.
+        const tramp = try self.l.synthSpawnTrampoline(fty, direct_fn, arg_tys.items, shape.result, layout);
+        const tramp_addr = try self.b.funcAddr(fty, tramp);
+        _ = try self.b.rtCall(self.ctx.void_id, .spawn, &.{ tramp_addr, thunk });
     }
 
     fn lowerDefer(self: *FnCtx, node: ast.Index) Error!void {
@@ -1762,7 +1876,13 @@ const FnCtx = struct {
         }
         const lval = try self.lowerExprH(k[0], common);
         const rval = try self.lowerExprH(k[1], common);
-        const result_ty = try self.nodeType(node);
+        // The result type must match the operands (`common`), which the IR
+        // verifier enforces (`ty == lhs type`). `nodeType(node)` can't be used:
+        // the checker leaves an all-untyped arithmetic node (`7 * 6`) typed
+        // `untyped_int`, but the operands were just materialized as `common`
+        // (e.g. `i64` from a send/param hint) — a mismatch. A comparison always
+        // yields `bool` regardless of its operand type.
+        const result_ty = if (is_cmp) self.ctx.prim_ids.get(.bool) else common;
         const iop = try binOpFor(op, cdata);
         return self.b.binary(iop, result_ty, lval, rval);
     }

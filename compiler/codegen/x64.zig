@@ -1216,6 +1216,14 @@ fn emitMakeClosure(self: *Ctx, dst: u32, func: ir.FuncId, env: ir.ValueId) !void
     try putInt(self, dst, .rax);
 }
 
+/// `func_addr`: materialize a function's code address into `dst` via an
+/// absolute relocation to its own symbol (the same primitive `make_closure`
+/// uses to fill a cell's code slot, minus the cell). No call, no safepoint.
+fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) !void {
+    try self.movAbsReloc(scratch1, self.module.func(func).name);
+    try putInt(self, dst, scratch1);
+}
+
 /// `call_value`: dispatch through a closure. Load the environment (+8) and
 /// code pointer (+0) into reserved scratch regs that argument marshaling never
 /// disturbs (r10/r12 are not argument registers; r11 is the parallel-move
@@ -1670,6 +1678,7 @@ fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
         },
         .slice_len => |sl| markUse(intervals, @intFromEnum(sl.base), pos),
         .make_closure => |mc| markUse(intervals, @intFromEnum(mc.env), pos),
+        .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| markUse(intervals, a, pos),
     }
 }
@@ -1842,6 +1851,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .index_set => try emitIndexSet(self, d.index_set.base, d.index_set.index, d.index_set.value, self.f.valueType(d.index_set.value)),
         .gc_alloc => try emitGcAlloc(self, dst, d.gc_alloc.size, d.gc_alloc.ptr_offsets),
         .make_closure => try emitMakeClosure(self, dst, d.make_closure.func, d.make_closure.env),
+        .func_addr => try emitFuncAddr(self, dst, d.func_addr.func),
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
         .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
         .call_iface => return error.UnsupportedConstruct,
