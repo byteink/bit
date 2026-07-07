@@ -228,12 +228,14 @@ const DeferredCall = union(enum) {
     direct: struct { func: ir.FuncId, args: []ir.ValueId, result: TypeId },
     iface: struct { recv: ir.ValueId, method_index: u32, args: []ir.ValueId, result: TypeId },
     value: struct { callee: ir.ValueId, args: []ir.ValueId, result: TypeId },
+    /// A deferred builtin (`print`/`assert`): replayed as its `rt_call` on
+    /// return. Builtins bypass `resolveCallTarget`, so `lowerDefer` handles
+    /// them separately (mirroring `lowerCall`'s builtin dispatch).
+    builtin: struct { rt: ir.RtFn, args: []ir.ValueId, result: TypeId },
 
     fn deinit(self: DeferredCall, gpa: Allocator) void {
         switch (self) {
-            .direct => |x| gpa.free(x.args),
-            .iface => |x| gpa.free(x.args),
-            .value => |x| gpa.free(x.args),
+            inline else => |x| gpa.free(x.args),
         }
     }
 };
@@ -1767,6 +1769,15 @@ const FnCtx = struct {
     fn lowerDefer(self: *FnCtx, node: ast.Index) Error!void {
         const call_node = self.kids(node)[0];
         const k = self.kids(call_node);
+        // A builtin callee (`print`/`assert`) never resolves through
+        // `resolveCallTarget` (see `lowerCall`), so route it here: evaluate the
+        // args now (Go semantics) and stash the `rt_call` for `runDefers`.
+        if (self.tree().get(k[0]).tag == .ident and self.env.lookup(self.identText(k[0])) == null) {
+            if (self.nodeSymbol(k[0])) |gsym| {
+                const sym = self.l.symbolOf(gsym);
+                if (sym.kind == .builtin_func) return self.lowerDeferBuiltin(call_node, sym.name);
+            }
+        }
         const target = try self.resolveCallTarget(call_node, k[0]);
         var args: std.ArrayList(ir.ValueId) = .empty;
         if (target == .direct_method) try args.append(self.gpa, target.direct_method.recv);
@@ -1787,6 +1798,20 @@ const FnCtx = struct {
         try self.defers.append(self.gpa, entry);
     }
 
+    /// Records a deferred `print`/`assert`. `panic` is excluded (it terminates
+    /// control flow — deferring it is meaningless); value-returning builtins
+    /// (`len`/`cap`/`append`) have no side effect worth deferring.
+    fn lowerDeferBuiltin(self: *FnCtx, call_node: ast.Index, name: []const u8) Error!void {
+        const rt: ir.RtFn = if (std.mem.eql(u8, name, "print"))
+            .print
+        else if (std.mem.eql(u8, name, "assert"))
+            .assert
+        else
+            return error.UnsupportedConstruct;
+        const args = try self.lowerArgs(self.kids(call_node)[2]);
+        try self.defers.append(self.gpa, .{ .builtin = .{ .rt = rt, .args = args, .result = self.ctx.void_id } });
+    }
+
     fn runDefers(self: *FnCtx) Error!void {
         var i = self.defers.items.len;
         while (i > 0) {
@@ -1795,6 +1820,7 @@ const FnCtx = struct {
                 .direct => |x| _ = try self.b.call(x.result, x.func, x.args),
                 .iface => |x| _ = try self.b.callIface(x.result, x.recv, x.method_index, x.args),
                 .value => |x| _ = try self.b.callValue(x.result, x.callee, x.args),
+                .builtin => |x| _ = try self.b.rtCall(x.result, x.rt, x.args),
             }
         }
     }
