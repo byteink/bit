@@ -577,13 +577,19 @@ const Parser = struct {
         return self.tree.add(.chan_type, join(start, end), 0, &.{elem});
     }
 
-    /// `(` already means one of: `()  => R` (func_type, zero params), a tuple
-    /// type, a parenthesized type, or a func_type with 1+ params — all
-    /// deterministic from the tokens seen so far, no speculation needed.
+    /// `(` already means one of: `()` (the unit type — chiefly `()!`, §18.2),
+    /// `() => R` (func_type, zero params), a tuple type, a parenthesized type,
+    /// or a func_type with 1+ params — all deterministic from the tokens seen
+    /// so far, no speculation needed.
     fn parseTupleOrFuncOrParenType(self: *Parser) ParseError!Index {
         const start = try self.expect(.l_paren, "'('");
         if (try self.accept(.r_paren)) {
-            _ = try self.expect(.fat_arrow, "'=>'");
+            // `() =>` is a zero-param function type; a bare `()` is the unit
+            // (void) type, which only appears where a result is written but
+            // cannot be omitted — i.e. carrying `!` (`()!`).
+            if (!try self.accept(.fat_arrow)) {
+                return self.tree.add(.void_type, join(start, start), 0, &.{});
+            }
             const result = try self.parseResultType();
             const list = try self.tree.add(.type_list, join(start, start), 0, &.{});
             return self.tree.add(.func_type, join(start, self.span(result)), 0, &.{ list, result });

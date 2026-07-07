@@ -106,6 +106,13 @@ pub const RtFn = enum {
     slice_get,
     slice_set,
     slice_slice,
+    /// Filesystem primitives (ABI.md §14), the low-level layer under std/fs.
+    /// `fs_open(path, write) -> i64` fd or -1; `fs_read_all(fd) -> string`;
+    /// `fs_write(fd, s) -> i64` bytes or -1; `fs_close(fd) -> i64` (always 0).
+    fs_open,
+    fs_read_all,
+    fs_write,
+    fs_close,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

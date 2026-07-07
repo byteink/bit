@@ -501,8 +501,10 @@ result_type  = type [ "!" [ type ] ] .          (* fallible marker, §18 *)
 ```
 
 Note: a bare `"(" type ")"` is a parenthesized type; a tuple type needs **two or
-more** elements. The one-element void result is written as an omitted result type,
-never as `()` in source.
+more** elements. The **void (unit) result** is normally written as an omitted
+result type; the one place it must be spelled is when it carries `!` and so
+cannot be omitted, written `()` — chiefly `()!`, "returns nothing or an error"
+(§18.2). A bare `()` is thus a valid type only in result position.
 
 ### 11.1 Primitive Types
 
@@ -773,7 +775,7 @@ lhs           = IDENT | index | member | tuple_pat .
 assign_op     = "=" | "+=" | "-=" | "*=" | "/=" | "%="
               | "&=" | "|=" | "^=" | "<<=" | ">>=" .
 inc_dec_stmt  = lhs ( "++" | "--" ) .
-expr_stmt     = expression .                     (* must be a call, receive, or ? chain *)
+expr_stmt     = expression .                     (* call, receive, ? chain, or catch *)
 send_stmt     = expression "<-" expression .     (* ch <- v *)
 return_stmt   = "return" [ expression { "," expression } ] .
 fail_stmt     = "fail" expression .
@@ -786,8 +788,10 @@ defer_stmt    = "defer" call_expression .
 - Multi-assignment `a, b = b, a` evaluates all right-hand sides before assigning
   (simultaneous). Compound assignment operators require a single lhs and rhs.
 - An `expr_stmt` is legal only if the expression has a side effect that can stand
-  alone: a function call, a channel receive, or an error-propagation chain. A bare
-  `a + b` statement is a compile error (guards against mistakes).
+  alone: a function call, a channel receive, an error-propagation chain (`?`), or
+  a `catch` (deliberate error handling — its ok value is intentionally discarded,
+  or is `void`; §18.3). A bare `a + b` statement is a compile error (guards
+  against mistakes).
 - `return` with multiple expressions constructs a tuple result matching the tuple
   result type.
 

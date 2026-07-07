@@ -1269,6 +1269,10 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .slice_get => "bit_rt_slice_get",
         .slice_set => "bit_rt_slice_set",
         .slice_slice => "bit_rt_slice_slice",
+        .fs_open => "bit_rt_fs_open",
+        .fs_read_all => "bit_rt_fs_read_all",
+        .fs_write => "bit_rt_fs_write",
+        .fs_close => "bit_rt_fs_close",
     };
 }
 const safepoint_symbol = "bit_rt_safepoint";

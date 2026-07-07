@@ -1036,6 +1036,7 @@ const Checker = struct {
                 const elem = try self.checkType(file_idx, mf.tree.kids(node)[0], env);
                 return self.ctx.types.intern(.{ .chan = elem });
             },
+            .void_type => return self.ctx.void_id, // the unit type `()` (§18.2, e.g. `()!`)
             else => return .invalid, // parser error-recovery poison node
         }
     }
@@ -2302,8 +2303,46 @@ const Checker = struct {
             if (arg_items.len >= 2) _ = try self.checkArgExprType(file_idx, arg_items[1], env, fctx);
             return self.ctx.void_id;
         }
+        // Low-level filesystem primitives (ABI.md §14). Fixed signatures over
+        // string/i64/bool; the fallible File/open/readFile ergonomics live in
+        // std/fs, so these stay plain (errors surface as a -1 fd / byte count).
+        const string_id = self.ctx.prim_ids.get(.string);
+        const i64_id = self.ctx.prim_ids.get(.i64);
+        const bool_id = self.ctx.prim_ids.get(.bool);
+        if (std.mem.eql(u8, name, "fsOpen")) {
+            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{ string_id, bool_id }, env, fctx);
+            return i64_id;
+        }
+        if (std.mem.eql(u8, name, "fsReadAll")) {
+            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{i64_id}, env, fctx);
+            return string_id;
+        }
+        if (std.mem.eql(u8, name, "fsWrite")) {
+            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{ i64_id, string_id }, env, fctx);
+            return i64_id;
+        }
+        if (std.mem.eql(u8, name, "fsClose")) {
+            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{i64_id}, env, fctx);
+            return i64_id;
+        }
         try self.checkArgsLoose(file_idx, arg_items, env, fctx);
         return .invalid;
+    }
+
+    /// Checks a fixed-arity builtin call: exactly `want.len` arguments, each
+    /// assignable to its declared type. Used by the filesystem primitives.
+    fn checkFixedArgs(self: *Checker, file_idx: usize, node: ast.Index, name: []const u8, arg_items: []const ast.Index, want: []const TypeId, env: GenericEnv, fctx: FnCtx) Error!void {
+        const mf = self.files[file_idx];
+        if (arg_items.len != want.len) {
+            try self.emit(mf, node, .arg_count_mismatch, "'{s}' takes exactly {d} argument(s), found {d}", .{ name, want.len, arg_items.len }, null);
+            try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+            return;
+        }
+        for (arg_items, want) |a, ty| {
+            const inner = mf.tree.kids(a)[0];
+            const t = try self.checkExpr(file_idx, inner, env, fctx, ty);
+            try self.expect(file_idx, inner, t, ty);
+        }
     }
 
     fn checkCall(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx, expected: TypeId) Error!TypeId {
@@ -3029,10 +3068,15 @@ const Checker = struct {
         const mf = self.files[file_idx];
         const inner = mf.tree.kids(node)[0];
         const n = mf.tree.get(inner);
+        // `catch` is a valid statement: at statement position it is deliberate
+        // error handling (the ok value is intentionally discarded, or the ok
+        // type is `void`), not an accidentally-unused expression — the same
+        // reason a bare `call` is allowed. (§18.3)
         const legal = n.tag == .call or n.tag == .try_expr or
+            n.tag == .catch_default or n.tag == .catch_bind or
             (n.tag == .unary and @as(lexer.Kind, @enumFromInt(n.main)) == .arrow_left);
         if (!legal) {
-            try self.emit(mf, node, .invalid_expr_statement, "expression result unused; only a call, channel receive, or '?' chain is a valid statement", .{}, null);
+            try self.emit(mf, node, .invalid_expr_statement, "expression result unused; only a call, channel receive, '?' chain, or 'catch' is a valid statement", .{}, null);
         }
         _ = try self.checkExpr(file_idx, inner, fctx.env, fctx, .invalid);
     }

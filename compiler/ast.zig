@@ -88,6 +88,7 @@ pub const Tag = enum {
     array_type, // [size_int, elem_type]
     map_type, // [key_type, val_type]
     tuple_type, // [type, type, ...]        two or more
+    void_type, // []                        the unit type `()` (only as a result, e.g. `()!`)
     func_type, // [type_list, result]
     type_list, // [type...]
     chan_type, // [elem_type]

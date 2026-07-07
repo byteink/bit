@@ -640,6 +640,7 @@ const Printer = struct {
                 try self.raw(">");
             },
             .tuple_type => try self.printCommaList(self.kids(idx), "(", ")", n.span.end),
+            .void_type => try self.raw("()"),
             .func_type => {
                 const k = self.kids(idx);
                 try self.printNode(k[0]);

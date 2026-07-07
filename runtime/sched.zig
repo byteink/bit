@@ -335,10 +335,79 @@ fn protect(mem: []align(std.heap.page_size_min) u8, prot: std.posix.PROT) !void 
 // the new `Io` interface, which this freestanding runtime does not depend on
 // — see the module doc comment); call the raw syscalls directly instead.
 
-fn closeFd(fd: std.posix.fd_t) void {
+pub fn closeFd(fd: std.posix.fd_t) void {
     switch (builtin.os.tag) {
         .linux => _ = std.os.linux.close(fd),
         else => _ = std.c.close(fd),
+    }
+}
+
+/// Open a NUL-terminated `path` read-only, or create+truncate write-only.
+/// Returns the fd or an error. Raw syscall, per-platform like `writeFd` (no
+/// libc dependency on the hot path — see the module doc comment).
+pub fn openFd(path: [*:0]const u8, write: bool) !std.posix.fd_t {
+    switch (builtin.os.tag) {
+        .linux => {
+            const flags: std.os.linux.O = if (write)
+                .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }
+            else
+                .{ .ACCMODE = .RDONLY };
+            const rc = std.os.linux.open(path, flags, 0o644);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                else => return error.OpenFailed,
+            }
+        },
+        else => {
+            const flags: std.c.O = if (write)
+                .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }
+            else
+                .{ .ACCMODE = .RDONLY };
+            const fd = std.c.open(path, flags, @as(std.c.mode_t, 0o644));
+            if (fd < 0) return error.OpenFailed;
+            return fd;
+        },
+    }
+}
+
+/// Read up to `buf.len` bytes into `buf`; returns the count (0 at EOF).
+pub fn readFd(fd: std.posix.fd_t, buf: []u8) !usize {
+    switch (builtin.os.tag) {
+        .linux => {
+            const rc = std.os.linux.read(fd, buf.ptr, buf.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return rc,
+                else => return error.ReadFailed,
+            }
+        },
+        else => {
+            const rc = std.c.read(fd, buf.ptr, buf.len);
+            if (rc < 0) return error.ReadFailed;
+            return @intCast(rc);
+        },
+    }
+}
+
+/// File size in bytes: seek to the end for the offset, then rewind. `lseek`
+/// avoids the per-platform `stat` struct entirely and targets regular files
+/// (a pipe/socket seek errors, which the caller turns into an empty read).
+pub fn fileSize(fd: std.posix.fd_t) !u64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            const end = std.os.linux.lseek(fd, 0, std.os.linux.SEEK.END);
+            switch (std.posix.errno(end)) {
+                .SUCCESS => {},
+                else => return error.SeekFailed,
+            }
+            _ = std.os.linux.lseek(fd, 0, std.os.linux.SEEK.SET);
+            return @intCast(end);
+        },
+        else => {
+            const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+            if (end < 0) return error.SeekFailed;
+            _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+            return @intCast(end);
+        },
     }
 }
 

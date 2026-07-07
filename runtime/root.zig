@@ -481,6 +481,61 @@ export fn bit_rt_string_byte(s: *const RtBytes, index: usize) callconv(.c) u64 {
     return s.ptr[index];
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem (ABI.md §14) — thin POSIX wrappers; the ergonomic File/open/
+// readFile/writeFile layer lives in std/fs, built on these primitives.
+// ---------------------------------------------------------------------------
+
+const max_path = 4096;
+
+/// `bit_rt_fs_open`: open `path` read-only (`write=false`), or create+truncate
+/// write-only (`write=true`). Returns the fd, or -1 on any error. The Bit path
+/// is a `{ptr,len}` view with no NUL terminator, so copy it into a bounded
+/// stack buffer first (a path at/over `max_path` is rejected, not truncated).
+export fn bit_rt_fs_open(path: *const RtBytes, write: bool) callconv(.c) i64 {
+    if (path.len >= max_path) return -1;
+    var buf: [max_path]u8 = undefined;
+    @memcpy(buf[0..path.len], path.ptr[0..path.len]);
+    buf[path.len] = 0;
+    const fd = sched.openFd(buf[0..path.len :0].ptr, write) catch return -1;
+    return fd;
+}
+
+/// `bit_rt_fs_read_all`: the whole file as a fresh `string`. Sized from
+/// `fstat`, so it targets regular files; a stat error or non-regular fd yields
+/// the empty string. A short read leaves the tail zero-filled (GC memory is
+/// zeroed) — acceptable for v1's regular-file use.
+export fn bit_rt_fs_read_all(fd: i64) callconv(.c) *const RtBytes {
+    const size: usize = @intCast(sched.fileSize(@intCast(fd)) catch return stringFromBytes(""));
+    const s = allocString(size);
+    var off: usize = 0;
+    while (off < size) { // bounded by file size
+        const n = sched.readFd(@intCast(fd), s.bytes[off..]) catch break;
+        if (n == 0) break;
+        off += n;
+    }
+    return s.hdr;
+}
+
+/// `bit_rt_fs_write`: write all of `s`'s bytes to `fd`. Returns the byte count
+/// written, or -1 on any write error.
+export fn bit_rt_fs_write(fd: i64, s: *const RtBytes) callconv(.c) i64 {
+    var off: usize = 0;
+    while (off < s.len) { // bounded by s.len
+        const n = sched.writeFd(@intCast(fd), s.ptr[off..s.len]) catch return -1;
+        if (n == 0) break;
+        off += n;
+    }
+    return @intCast(off);
+}
+
+/// `bit_rt_fs_close`: close `fd`. Always reports success (the raw close wrapper
+/// swallows `EINTR`/`EBADF`); a caller that must know uses the fd's own errors.
+export fn bit_rt_fs_close(fd: i64) callconv(.c) i64 {
+    sched.closeFd(@intCast(fd));
+    return 0;
+}
+
 fn stringFromBytes(txt: []const u8) *const RtBytes {
     const s = allocString(txt.len);
     @memcpy(s.bytes, txt);

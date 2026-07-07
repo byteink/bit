@@ -591,3 +591,28 @@ check, so the goroutine cannot migrate workers in that window. The error value
 is an `error`-interface object pointer (a GC object); because it is live in the
 slot only across that safepoint-free window, it needs no distinct root
 registration — the caller roots it the instant it reads it.
+
+## 14. Filesystem primitives
+
+```
+bit_rt_fs_open(path: *const RtBytes, write: bool) -> i64   // fd, or -1
+bit_rt_fs_read_all(fd: i64)          -> *const RtBytes      // whole file as a string
+bit_rt_fs_write(fd: i64, s: *const RtBytes) -> i64          // bytes written, or -1
+bit_rt_fs_close(fd: i64)             -> i64                 // always 0
+```
+
+The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
+surface as a `-1` fd/byte-count that the Bit `std/fs` wrappers turn into real
+errors (`fail newError(...)`), so all error *ergonomics* live in Bit, not the
+runtime. Backed by the raw per-platform syscalls in `sched.zig` (`openFd`/
+`readFd`/`writeFd`/`closeFd`/`fileSize`, dispatched `std.os.linux.*` on Linux,
+`std.c.*` on Darwin — no libc dependency on the hot path).
+
+- `fs_open` copies the (non-NUL-terminated) Bit path into a bounded stack buffer
+  before the syscall; `write=false` opens read-only, `write=true`
+  creates+truncates write-only (mode `0644`).
+- `fs_read_all` sizes the result with `lseek(SEEK_END)` then reads, so it targets
+  regular files; a non-regular fd or stat error yields the empty string. A short
+  read leaves the tail zero-filled (v1 regular-file scope).
+- `fs_close` reports success unconditionally (the raw wrapper swallows
+  `EINTR`/`EBADF`).

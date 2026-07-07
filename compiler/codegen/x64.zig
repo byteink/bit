@@ -1544,6 +1544,10 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .slice_get = "bit_rt_slice_get",
     .slice_set = "bit_rt_slice_set",
     .slice_slice = "bit_rt_slice_slice",
+    .fs_open = "bit_rt_fs_open",
+    .fs_read_all = "bit_rt_fs_read_all",
+    .fs_write = "bit_rt_fs_write",
+    .fs_close = "bit_rt_fs_close",
 });
 
 const CallReturn = struct { dst: u32, ty: TypeId };

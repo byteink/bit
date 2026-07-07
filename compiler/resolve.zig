@@ -149,7 +149,10 @@ const predeclared_types = [_][]const u8{
     "byte", "rune", "bool", "string", "error",
 };
 const predeclared_funcs = [_][]const u8{
-    "len", "cap", "append", "delete", "close", "panic", "assert", "print",
+    "len",    "cap",       "append",  "delete",  "close", "panic", "assert", "print",
+    // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
+    // readFile layer wraps these in std/fs.
+    "fsOpen", "fsReadAll", "fsWrite", "fsClose",
 };
 
 // ============================================================================

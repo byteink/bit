@@ -1032,6 +1032,13 @@ const FnCtx = struct {
     fn getErr(self: *FnCtx, err_ty: TypeId) Error!ir.ValueId {
         return self.b.rtCall(err_ty, .err_get, &.{});
     }
+    /// Return from a fallible function on the err path: a zero ok value, or no
+    /// value at all when the ok type is `void` (`()!`, §18.2).
+    fn emitFallibleZeroRet(self: *FnCtx) Error!void {
+        if (self.fallible_ok == self.ctx.void_id) return self.emitRet(&.{});
+        const zero = try self.zeroValue(self.fallible_ok);
+        try self.emitRet(&.{zero});
+    }
 
     /// `fail e` (§18.3): evaluate the error, run defers, then publish it and
     /// return a zero ok value. The error is stored *after* defers so a deferred
@@ -1041,8 +1048,7 @@ const FnCtx = struct {
         const errv = try self.lowerExprH(self.kids(node)[0], self.fallible_err);
         try self.runDefers();
         try self.setErr(errv);
-        const zero = try self.zeroValue(self.fallible_ok);
-        try self.emitRet(&.{zero});
+        try self.emitFallibleZeroRet();
     }
 
     /// `expr?` (§18.3): lower the fallible call (its ok value lands normally),
@@ -1063,18 +1069,20 @@ const FnCtx = struct {
         self.switchBlock(prop);
         try self.runDefers();
         try self.setErr(errv);
-        const zero = try self.zeroValue(self.fallible_ok);
-        try self.emitRet(&.{zero});
+        try self.emitFallibleZeroRet();
 
         self.switchBlock(cont);
         return okv; // dominates `cont` (single predecessor), no block param needed
     }
 
-    /// `expr catch default` / `expr catch e { ... }` (§18.3). Both merge an ok
-    /// value and a handled value at a join block carrying one result param.
+    /// `expr catch default` / `expr catch e { ... }` (§18.3). Merges the ok
+    /// value and the handled value at a join block. A `void` ok type carries no
+    /// value, so no result param is threaded (the catch is a statement); the ok
+    /// value, which dominates the join, stands in as the placeholder result.
     fn lowerCatch(self: *FnCtx, node: ast.Index, bind: bool) Error!ir.ValueId {
         const k = self.kids(node); // default: [expr, dflt]; bind: [expr, err_ident, block]
         const fdata = self.ctx.typeOf(try self.nodeType(k[0])).fallible;
+        const is_void = fdata.ok == self.ctx.void_id;
         const okv = try self.lowerExpr(k[0]);
         const errv = try self.getErr(fdata.err);
         const is_err = try self.neNil(errv, fdata.err);
@@ -1086,16 +1094,15 @@ const FnCtx = struct {
         const err_blk = try self.b.newBlock();
         const join = try self.b.newBlock();
 
-        // Ok edge threads unchanged locals plus the ok value as the result.
-        const ok_args = try self.gpa.alloc(ir.ValueId, pre_len + 1);
+        // Each edge threads the unchanged locals, plus the value result unless
+        // the ok type is `void` (nothing to merge).
+        const ok_args = try self.catchEdgeArgs(orig, okv, is_void);
         defer self.gpa.free(ok_args);
-        @memcpy(ok_args[0..pre_len], orig);
-        ok_args[pre_len] = okv;
         try self.emitBr(is_err, err_blk, &.{}, join, ok_args);
 
         self.switchBlock(err_blk);
         try self.clearErr(); // the error is handled here
-        var handled: ir.ValueId = undefined;
+        var handled: ?ir.ValueId = null;
         if (bind) {
             const mark = self.env.mark();
             try self.env.declare(self.gpa, self.identText(k[1]), errv, fdata.err);
@@ -1107,10 +1114,8 @@ const FnCtx = struct {
         if (!self.terminated) {
             const err_vals = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(err_vals);
-            const args = try self.gpa.alloc(ir.ValueId, pre_len + 1);
+            const args = try self.catchEdgeArgs(err_vals, handled.?, is_void);
             defer self.gpa.free(args);
-            @memcpy(args[0..pre_len], err_vals);
-            args[pre_len] = handled;
             try self.emitJump(join, args);
         }
         self.env.restoreValues(orig);
@@ -1118,27 +1123,39 @@ const FnCtx = struct {
         self.b.endBlock();
         self.b.beginBlock(join);
         try self.addLoopParams(pre_len);
-        const result = try self.b.addParam(fdata.ok);
+        const result = if (is_void) okv else try self.b.addParam(fdata.ok);
         self.terminated = false;
         return result;
     }
 
+    /// Builds a catch join edge's block-args: the threaded locals, plus the
+    /// merged value unless the ok type is `void`. Caller owns the returned slice.
+    fn catchEdgeArgs(self: *FnCtx, locals: []const ir.ValueId, value: ir.ValueId, is_void: bool) Error![]ir.ValueId {
+        const n = locals.len + @intFromBool(!is_void);
+        const args = try self.gpa.alloc(ir.ValueId, n);
+        @memcpy(args[0..locals.len], locals);
+        if (!is_void) args[locals.len] = value;
+        return args;
+    }
+
     /// Lowers a `catch e { ... }` block (§18.3): every statement but the last
-    /// runs normally; a trailing bare expression is the handled value, else the
-    /// block diverts (return/fail/panic/break/continue) and yields no value.
+    /// runs normally; a trailing bare expression is the handled value. Returns
+    /// `null` when the block diverts (return/fail/panic/break/continue) — it
+    /// then yields no value and must not emit into the terminated block.
     /// Mirrors the checker's `checkCatchBlock`.
-    fn lowerCatchBlock(self: *FnCtx, node: ast.Index, ok_ty: TypeId) Error!ir.ValueId {
+    fn lowerCatchBlock(self: *FnCtx, node: ast.Index, ok_ty: TypeId) Error!?ir.ValueId {
         const stmts = self.kids(node);
         const last = stmts[stmts.len - 1];
         for (stmts[0 .. stmts.len - 1]) |s| {
             if (self.terminated) break;
             try self.lowerStmt(s);
         }
-        if (!self.terminated and self.tree().get(last).tag == .expr_stmt) {
-            return self.lowerExprH(self.kids(last)[0], ok_ty);
+        if (self.terminated) return null;
+        if (self.tree().get(last).tag == .expr_stmt) {
+            return try self.lowerExprH(self.kids(last)[0], ok_ty);
         }
-        if (!self.terminated) try self.lowerStmt(last);
-        return self.zeroValue(ok_ty); // unused: the block diverted (terminated)
+        try self.lowerStmt(last); // diverts (checker-guaranteed if not an expr)
+        return null;
     }
 
     /// `x != nil` as a bool, for the fallible error-slot check.
@@ -1790,6 +1807,23 @@ const FnCtx = struct {
             return error.UnsupportedConstruct;
         }
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
+        // Filesystem primitives (ABI.md §14): each maps 1:1 to a runtime call,
+        // result typed by the checker (i64 fd/count or a fresh string).
+        const fs_rt: ?ir.RtFn = if (std.mem.eql(u8, name, "fsOpen"))
+            .fs_open
+        else if (std.mem.eql(u8, name, "fsReadAll"))
+            .fs_read_all
+        else if (std.mem.eql(u8, name, "fsWrite"))
+            .fs_write
+        else if (std.mem.eql(u8, name, "fsClose"))
+            .fs_close
+        else
+            null;
+        if (fs_rt) |rt| {
+            const vals = try self.lowerArgs(args_node);
+            defer self.gpa.free(vals);
+            return self.b.rtCall(try self.nodeType(node), rt, vals);
+        }
         return error.UnsupportedConstruct; // delete/close: deferred
     }
 
