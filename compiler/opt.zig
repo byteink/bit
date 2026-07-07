@@ -496,6 +496,11 @@ fn emitTranslated(
     }
 }
 
+/// Orders blocks by original emission position — see `rebuild`.
+fn startsBefore(blocks: []const ir.BasicBlock, a: u32, b: u32) bool {
+    return blocks[a].insts_start < blocks[b].insts_start;
+}
+
 /// Rebuilds `f`, keeping only blocks marked in `block_reachable` and, within
 /// each kept block, only instructions marked in `inst_keep` (block params
 /// and terminators are always emitted regardless — see the per-pass
@@ -506,12 +511,27 @@ fn rebuild(gpa: Allocator, f: *const ir.Function, known: []const ?ConstVal, bloc
     const remap = try gpa.alloc(ir.ValueId, f.insts.len);
     defer gpa.free(remap);
 
+    // Visit blocks in their original emission order (ascending `insts_start`),
+    // not block-ID order. Lowering emits blocks in a valid linear schedule
+    // (loop headers before bodies, loop-exit blocks after the loop body — an
+    // RPO), which the x64 linear-scan allocator's interval numbering and its
+    // back-edge detection both assume. A loop's exit block is created (and so
+    // ID'd) before the body's inner blocks but emitted after them; iterating by
+    // ID here would move it back into the middle of the loop, corrupting
+    // live-interval numbering (spill-slot aliasing → wrong values). `insts_start`
+    // is unique per block, so this order is deterministic.
+    const order = try gpa.alloc(u32, f.blocks.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, f.blocks, startsBefore);
+
     var bldr = ir.FunctionBuilder.init(gpa);
-    for (block_reachable, 0..) |ok, bi| {
-        if (ok) block_map[bi] = try bldr.newBlock();
+    for (order) |bi| {
+        if (block_reachable[bi]) block_map[bi] = try bldr.newBlock();
     }
 
-    for (f.blocks, 0..) |b, bi| {
+    for (order) |bi| {
+        const b = f.blocks[bi];
         if (!block_reachable[bi]) continue;
         bldr.beginBlock(block_map[bi]);
         var idx = b.insts_start;

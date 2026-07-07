@@ -1717,8 +1717,42 @@ fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Functio
             markUses(intervals, f.decode(@enumFromInt(i)), i);
         }
     }
+    extendParamsToPreds(intervals, f);
     forceParamInterference(intervals, f);
     return intervals;
+}
+
+/// A block param's storage is written by each predecessor's edge move, which
+/// runs at the predecessor's terminator. Under the RPO block order a forward
+/// branch can target a block emitted *later*, so the write happens well before
+/// the param's own instruction index. Extend every param's interval start back
+/// to its earliest predecessor terminator, so the param is live across that gap
+/// and interferes with any value live there; without this, a value that dies in
+/// the gap can be handed the same register/spill slot and then be clobbered by
+/// the edge move — the caller reads the wrong value (e.g. an early `return` from
+/// inside a loop reading a spilled loop-carried local). A back-edge predecessor
+/// sits at a higher position than the param, so it never lowers the start.
+fn extendParamsToPreds(intervals: []regalloc.Interval, f: *const ir.Function) void {
+    for (f.blocks) |pblk| {
+        const term_pos: u32 = @intCast(pblk.insts_start + pblk.insts_len - 1);
+        switch (f.decode(@enumFromInt(term_pos))) {
+            .jump => |j| extendBlockParams(intervals, f, j.target, term_pos),
+            .br => |b| {
+                extendBlockParams(intervals, f, b.then_blk, term_pos);
+                extendBlockParams(intervals, f, b.else_blk, term_pos);
+            },
+            else => {},
+        }
+    }
+}
+
+fn extendBlockParams(intervals: []regalloc.Interval, f: *const ir.Function, target: ir.BlockId, edge_pos: u32) void {
+    const blk = f.blocks[@intFromEnum(target)];
+    var p: u32 = blk.insts_start;
+    const end = blk.insts_start + blk.param_count;
+    while (p < end) : (p += 1) {
+        if (intervals[p].start > edge_pos) intervals[p].start = edge_pos;
+    }
 }
 
 /// All of a block's params are live simultaneously at block entry — the
