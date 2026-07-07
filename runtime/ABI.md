@@ -557,3 +557,36 @@ RtBytes { ptr: *const u8, len: usize }   // extern struct — a transient,
   time a panic reaches `bit_rt_panic`, every `defer` between the panic site
   and the abort must already have run. The runtime only terminates the
   process; it does not itself walk or run deferred calls.
+
+## 13. Fallible results — the error channel (SPEC.md §18)
+
+A fallible function (`T!`) returns its **ok value** in the normal return
+register (`rax` / `x0`, or `xmm0` / `d0` for a float ok), exactly like a
+non-fallible one. The **error** rides a separate side channel: a per-worker
+threadlocal error slot, accessed through two symbols.
+
+```
+bit_rt_set_err(e: ?*anyopaque)  -> void   // publish (or, with nil, clear)
+bit_rt_get_err()                -> ?*anyopaque   // read; non-null ⇒ failed
+```
+
+The convention (a fallible callee's postcondition):
+
+- **ok return** — leaves the slot **null**. Codegen clears it after running
+  defers (`bit_rt_set_err(nil)`), so a deferred call can't leave a stale error.
+- **`fail e`** — runs defers, then `bit_rt_set_err(e)` (after defers, so a
+  deferred call cannot clobber the error), then returns a zero ok value.
+- **`expr?`** — after the call, `bit_rt_get_err()`; if non-null, propagate: run
+  defers, re-`set_err` the saved error (defers may have overwritten the slot),
+  and return a zero ok value. If null, use the call's ok result.
+- **`catch`** — after the call, `bit_rt_get_err()`; if non-null, `set_err(nil)`
+  (the error is handled) and evaluate the default / run the binding block; if
+  null, use the ok result.
+
+The slot is **read immediately after the call, before any yield or GC
+safepoint**, so a plain threadlocal is goroutine-correct even under M:N: no
+scheduling point sits between a fallible call's return and its `?`/`catch`
+check, so the goroutine cannot migrate workers in that window. The error value
+is an `error`-interface object pointer (a GC object); because it is live in the
+slot only across that safepoint-free window, it needs no distinct root
+registration — the caller roots it the instant it reads it.

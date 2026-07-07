@@ -320,6 +320,30 @@ export fn bit_rt_print(s: *const RtBytes) callconv(.c) void {
 }
 
 // ---------------------------------------------------------------------------
+// Fallible-result error channel (ABI.md §13, SPEC §18)
+// ---------------------------------------------------------------------------
+
+/// The pending error for the currently-executing goroutine. A fallible
+/// function returns with this null on the ok path and set to the error value
+/// (an `error`-interface object pointer) on the fail path; the caller reads it
+/// immediately after the call (via `?`/`catch`) before any yield, so a plain
+/// per-worker threadlocal is goroutine-correct: nothing between a fallible
+/// call's return and its check migrates the goroutine to another worker.
+threadlocal var pending_err: ?*anyopaque = null;
+
+/// `bit_rt_set_err` (ABI.md §13): `fail e` / `?`-propagation store the error
+/// here; a null argument clears it (an ok return, or `catch` consuming it).
+export fn bit_rt_set_err(e: ?*anyopaque) callconv(.c) void {
+    pending_err = e;
+}
+
+/// `bit_rt_get_err` (ABI.md §13): the caller reads the pending error right
+/// after a fallible call. Non-null means the call failed.
+export fn bit_rt_get_err() callconv(.c) ?*anyopaque {
+    return pending_err;
+}
+
+// ---------------------------------------------------------------------------
 // GC entry points (ABI.md §1-§2, §6)
 // ---------------------------------------------------------------------------
 

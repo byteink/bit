@@ -245,6 +245,7 @@ pub fn build(b: *std.Build) void {
     // corpus's job. Shares the host libbitrt archive wired in at the tail.
     const examples_opts = b.addOptions();
     examples_opts.addOption([]const u8, "examples_dir", b.pathFromRoot("examples"));
+    examples_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
 
     const examples_mod = b.createModule(.{
         .root_source_file = b.path("tests/examples.zig"),

@@ -74,6 +74,12 @@ pub const RtFn = enum {
     /// Backs the `print` builtin (SPEC.md); `println` adds the newline in
     /// lowering. v1 takes the string heap-object `{ptr,len}` view directly.
     print,
+    /// Fallible-result error channel (SPEC §18, ABI.md §13). `err_set(e)`
+    /// stores the pending error (`fail`/`?`-propagate); a nil arg clears it
+    /// (ok return / handled `catch`). `err_get() -> error` reads it right
+    /// after a fallible call — non-null means the callee failed.
+    err_set,
+    err_get,
     chan_make,
     chan_send,
     chan_recv,

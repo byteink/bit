@@ -1198,10 +1198,18 @@ function loadConfig(path: string): Config! {
     log("bad config: ${e.message()}")
     return defaults()                    // recover with a default Config
   }
-  if (!cfg.valid()) { fail error("config failed validation") }
+  if (!cfg.valid()) { fail newError("config failed validation") }
   return cfg
 }
 ```
+
+The predeclared **`newError(msg: string): error`** (core prelude, §17) builds a
+basic error whose `message()` returns `msg` — the ordinary way to produce an
+`error` when no richer error type is warranted. A program that needs structured
+errors instead defines its own type with a `message(): string` method (any such
+type satisfies the `error` interface structurally, §10.6) and `fail`s a value of
+it. `error` is a type name, so the constructor cannot itself be named `error`
+(value and type names share one namespace, §17.1).
 
 ### 18.4 Panics
 

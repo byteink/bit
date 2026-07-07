@@ -417,11 +417,18 @@ pub const Lowerer = struct {
         }
 
         var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env };
+        if (is_fallible) {
+            fc.fallible_ok = result_ty;
+            fc.fallible_err = err_ty;
+        }
         defer fc.deinit();
 
         try fc.lowerStmtList(k[5]);
         if (!fc.terminated) {
+            // Falling off the end of a `()!` function is an ok-void return, so
+            // clear the pending error before returning (§18: ok ⇒ slot null).
             try fc.runDefers();
+            if (is_fallible) try fc.clearErr();
             try fc.emitRet(&.{});
         }
         b.endBlock();
@@ -756,6 +763,12 @@ const FnCtx = struct {
     file_idx: usize,
     gen_env: GenericEnv,
     terminated: bool = false,
+    /// Fallible-function context (SPEC §18). `fallible_err == .invalid` iff the
+    /// enclosing function is not fallible; otherwise these hold the ok/err
+    /// halves of its `T!` result — the ok type for the zero value a `fail`/`?`
+    /// propagation returns, the err type for `?`/`catch` null-checks.
+    fallible_ok: TypeId = .invalid,
+    fallible_err: TypeId = .invalid,
     loop_stack: std.ArrayList(LoopCtx) = .empty,
     defers: std.ArrayList(DeferredCall) = .empty,
 
@@ -870,6 +883,7 @@ const FnCtx = struct {
             .dec_stmt => try self.lowerIncDec(node, .sub),
             .expr_stmt => _ = try self.lowerExpr(self.kids(node)[0]),
             .return_stmt => try self.lowerReturn(node),
+            .fail_stmt => try self.lowerFail(node),
             .break_stmt => try self.lowerBreak(),
             .continue_stmt => try self.lowerContinue(),
             .spawn_stmt => try self.lowerSpawn(node),
@@ -883,7 +897,7 @@ const FnCtx = struct {
             .switch_stmt => try self.lowerSwitch(node),
             .select_stmt => try self.lowerSelect(node),
             .block => try self.lowerBlockScoped(node),
-            else => return error.UnsupportedConstruct, // fail_stmt, for_in
+            else => return error.UnsupportedConstruct, // for_in
         }
     }
 
@@ -997,7 +1011,140 @@ const FnCtx = struct {
         defer self.gpa.free(vals);
         for (exprs, 0..) |e, i| vals[i] = try self.lowerExpr(e);
         try self.runDefers();
+        // A fallible function's ok return must leave the error slot null; clear
+        // it after defers (a deferred fallible call may have set it — §18.5).
+        if (self.fallible_err != .invalid) try self.clearErr();
         try self.emitRet(vals);
+    }
+
+    // ---- fallible-result error channel (SPEC §18) ---------------------------
+
+    /// `err_set(e)` — record the pending error for the caller's `?`/`catch`.
+    fn setErr(self: *FnCtx, val: ir.ValueId) Error!void {
+        _ = try self.b.rtCall(self.ctx.void_id, .err_set, &.{val});
+    }
+    /// `err_set(nil)` — an ok return / handled `catch` clears the slot.
+    fn clearErr(self: *FnCtx) Error!void {
+        const nil = try self.b.constNil(self.ctx.error_id);
+        try self.setErr(nil);
+    }
+    /// `err_get()` — read the pending error right after a fallible call.
+    fn getErr(self: *FnCtx, err_ty: TypeId) Error!ir.ValueId {
+        return self.b.rtCall(err_ty, .err_get, &.{});
+    }
+
+    /// `fail e` (§18.3): evaluate the error, run defers, then publish it and
+    /// return a zero ok value. The error is stored *after* defers so a deferred
+    /// fallible call can't clobber it; it is computed *before* so its arguments
+    /// see the state at the `fail`, matching Go-style `defer` timing.
+    fn lowerFail(self: *FnCtx, node: ast.Index) Error!void {
+        const errv = try self.lowerExprH(self.kids(node)[0], self.fallible_err);
+        try self.runDefers();
+        try self.setErr(errv);
+        const zero = try self.zeroValue(self.fallible_ok);
+        try self.emitRet(&.{zero});
+    }
+
+    /// `expr?` (§18.3): lower the fallible call (its ok value lands normally),
+    /// then branch on the error slot. On error, propagate — run defers, restore
+    /// the error (defers may have overwritten the slot), and return zero ok. On
+    /// ok, the expression's value is the call's ok result.
+    fn lowerTryExpr(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const operand = self.kids(node)[0];
+        const fdata = self.ctx.typeOf(try self.nodeType(operand)).fallible;
+        const okv = try self.lowerExpr(operand);
+        const errv = try self.getErr(fdata.err);
+        const is_err = try self.neNil(errv, fdata.err);
+
+        const prop = try self.b.newBlock();
+        const cont = try self.b.newBlock();
+        try self.emitBr(is_err, prop, &.{}, cont, &.{});
+
+        self.switchBlock(prop);
+        try self.runDefers();
+        try self.setErr(errv);
+        const zero = try self.zeroValue(self.fallible_ok);
+        try self.emitRet(&.{zero});
+
+        self.switchBlock(cont);
+        return okv; // dominates `cont` (single predecessor), no block param needed
+    }
+
+    /// `expr catch default` / `expr catch e { ... }` (§18.3). Both merge an ok
+    /// value and a handled value at a join block carrying one result param.
+    fn lowerCatch(self: *FnCtx, node: ast.Index, bind: bool) Error!ir.ValueId {
+        const k = self.kids(node); // default: [expr, dflt]; bind: [expr, err_ident, block]
+        const fdata = self.ctx.typeOf(try self.nodeType(k[0])).fallible;
+        const okv = try self.lowerExpr(k[0]);
+        const errv = try self.getErr(fdata.err);
+        const is_err = try self.neNil(errv, fdata.err);
+
+        const pre_len = self.env.bindings.items.len;
+        const orig = try self.env.snapshotValues(self.gpa, pre_len);
+        defer self.gpa.free(orig);
+
+        const err_blk = try self.b.newBlock();
+        const join = try self.b.newBlock();
+
+        // Ok edge threads unchanged locals plus the ok value as the result.
+        const ok_args = try self.gpa.alloc(ir.ValueId, pre_len + 1);
+        defer self.gpa.free(ok_args);
+        @memcpy(ok_args[0..pre_len], orig);
+        ok_args[pre_len] = okv;
+        try self.emitBr(is_err, err_blk, &.{}, join, ok_args);
+
+        self.switchBlock(err_blk);
+        try self.clearErr(); // the error is handled here
+        var handled: ir.ValueId = undefined;
+        if (bind) {
+            const mark = self.env.mark();
+            try self.env.declare(self.gpa, self.identText(k[1]), errv, fdata.err);
+            handled = try self.lowerCatchBlock(k[2], fdata.ok);
+            self.env.restoreCount(mark);
+        } else {
+            handled = try self.lowerExprH(k[1], fdata.ok);
+        }
+        if (!self.terminated) {
+            const err_vals = try self.env.snapshotValues(self.gpa, pre_len);
+            defer self.gpa.free(err_vals);
+            const args = try self.gpa.alloc(ir.ValueId, pre_len + 1);
+            defer self.gpa.free(args);
+            @memcpy(args[0..pre_len], err_vals);
+            args[pre_len] = handled;
+            try self.emitJump(join, args);
+        }
+        self.env.restoreValues(orig);
+
+        self.b.endBlock();
+        self.b.beginBlock(join);
+        try self.addLoopParams(pre_len);
+        const result = try self.b.addParam(fdata.ok);
+        self.terminated = false;
+        return result;
+    }
+
+    /// Lowers a `catch e { ... }` block (§18.3): every statement but the last
+    /// runs normally; a trailing bare expression is the handled value, else the
+    /// block diverts (return/fail/panic/break/continue) and yields no value.
+    /// Mirrors the checker's `checkCatchBlock`.
+    fn lowerCatchBlock(self: *FnCtx, node: ast.Index, ok_ty: TypeId) Error!ir.ValueId {
+        const stmts = self.kids(node);
+        const last = stmts[stmts.len - 1];
+        for (stmts[0 .. stmts.len - 1]) |s| {
+            if (self.terminated) break;
+            try self.lowerStmt(s);
+        }
+        if (!self.terminated and self.tree().get(last).tag == .expr_stmt) {
+            return self.lowerExprH(self.kids(last)[0], ok_ty);
+        }
+        if (!self.terminated) try self.lowerStmt(last);
+        return self.zeroValue(ok_ty); // unused: the block diverted (terminated)
+    }
+
+    /// `x != nil` as a bool, for the fallible error-slot check.
+    fn neNil(self: *FnCtx, val: ir.ValueId, ty: TypeId) Error!ir.ValueId {
+        const nil = try self.b.constNil(ty);
+        return self.b.binary(.icmp_ne, self.ctx.prim_ids.get(.bool), val, nil);
     }
 
     fn lowerBreak(self: *FnCtx) Error!void {
@@ -1712,12 +1859,21 @@ const FnCtx = struct {
             if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct;
             try args.append(self.gpa, try self.lowerExpr(self.kids(an)[0]));
         }
+        // A fallible callee delivers its ok value in the normal return register
+        // (the error rides the runtime slot — §18), so the call instruction's
+        // result type is the ok type, never the boxed `T!`.
         return switch (target) {
-            .direct => |d| self.b.call(d.result, d.func, args.items),
-            .direct_method => |d| self.b.call(d.result, d.func, args.items),
-            .iface => |x| self.b.callIface(x.result, x.recv, x.method_index, args.items),
-            .value => |x| self.b.callValue(x.result, x.callee, args.items),
+            .direct => |d| self.b.call(self.okResult(d.result), d.func, args.items),
+            .direct_method => |d| self.b.call(self.okResult(d.result), d.func, args.items),
+            .iface => |x| self.b.callIface(self.okResult(x.result), x.recv, x.method_index, args.items),
+            .value => |x| self.b.callValue(self.okResult(x.result), x.callee, args.items),
         };
+    }
+
+    /// The ok half of a `T!` result, or `ty` unchanged when not fallible.
+    fn okResult(self: *const FnCtx, ty: TypeId) TypeId {
+        const data = self.ctx.typeOf(ty);
+        return if (data == .fallible) data.fallible.ok else ty;
     }
 
     /// `ch <- v`: send one word to a channel (blocks per SPEC §16.2).
@@ -1971,7 +2127,10 @@ const FnCtx = struct {
             .slice_lit => self.lowerSliceElems(try self.nodeType(node), self.kids(node)),
             .slice_expr => self.lowerSliceExpr(node),
             .arrow_fn => self.lowerArrowFn(node),
-            else => error.UnsupportedConstruct, // try_expr/catch_*/type_assert/tuple_index/map literals
+            .try_expr => self.lowerTryExpr(node),
+            .catch_default => self.lowerCatch(node, false),
+            .catch_bind => self.lowerCatch(node, true),
+            else => error.UnsupportedConstruct, // type_assert/tuple_index/map literals
         };
     }
 
