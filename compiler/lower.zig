@@ -1422,10 +1422,16 @@ const FnCtx = struct {
         };
         const i64ty = self.ctx.prim_ids.get(.i64);
         const outer_mark = self.env.mark();
+        // Carry the iterable as a hidden binding so it threads through the loop's
+        // block params alongside `$idx`; reading the pre-header `iter_val` inside
+        // the body is a stale SSA value once the header rebinds every carried
+        // local to a block param.
+        try self.env.declare(self.gpa, "$iter", iter_val, iter_ty);
         const zero = try self.b.constInt(i64ty, 0);
         try self.env.declare(self.gpa, "$idx", zero, i64ty);
         const pre_len = self.env.bindings.items.len;
         const idx_slot = pre_len - 1;
+        const iter_slot = pre_len - 2;
 
         const header = try self.b.newBlock();
         const body_blk = try self.b.newBlock();
@@ -1440,10 +1446,11 @@ const FnCtx = struct {
         try self.addLoopParams(pre_len);
 
         const idx_val = self.env.bindings.items[idx_slot].value;
+        const iter_cur = self.env.bindings.items[iter_slot].value;
         const len_val = if (data == .array)
             try self.b.constInt(i64ty, @intCast(data.array.len))
         else
-            try self.b.sliceLen(i64ty, iter_val);
+            try self.b.sliceLen(i64ty, iter_cur);
         const cmp = try self.b.binary(.icmp_slt, self.ctx.prim_ids.get(.bool), idx_val, len_val);
         {
             // `body_blk` is dominated by `header` and reached only here, so it
@@ -1456,7 +1463,10 @@ const FnCtx = struct {
 
         try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = header, .pre_len = pre_len });
         self.switchBlock(body_blk);
-        const elem_val = try self.b.indexGet(elem_ty, iter_val, idx_val);
+        const elem_val = if (data == .slice)
+            try self.b.rtCall(elem_ty, .slice_get, &.{ iter_cur, idx_val })
+        else
+            try self.b.indexGet(elem_ty, iter_cur, idx_val);
         const body_mark = self.env.mark();
         try self.declareBinder(k[0], elem_val, elem_ty);
         try self.lowerStmtList(k[2]);
