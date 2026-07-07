@@ -91,6 +91,7 @@ const TypeId = check.TypeId;
 const TypeContext = check.TypeContext;
 const TypeData = check.TypeData;
 const GlobalSymbol = check.GlobalSymbol;
+const ModuleId = resolve.ModuleId;
 const GenericEnv = check.GenericEnv;
 const GenericBinding = check.GenericBinding;
 const ModuleFile = resolve.ModuleFile;
@@ -252,9 +253,28 @@ const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, resul
 // Lowerer — module-level driver and shared tables
 // ============================================================================
 
+/// One module's resolved+checked front-end outputs, as `lowerProject` consumes
+/// them. The `checked`/`rmodule` must be the outputs of `check.checkModule` /
+/// `resolve.resolveModule` over the same `files`, and the array index must be
+/// the module's `ModuleId` (so cross-module `GlobalSymbol`s index it directly).
+pub const ModuleInput = struct {
+    files: []const ModuleFile,
+    checked: *const check.CheckedModule,
+    rmodule: *const resolve.Module,
+};
+
 pub const Lowerer = struct {
     gpa: Allocator,
     ctx: *TypeContext,
+    /// Every module in the program, indexed by `ModuleId`. Lowering walks all
+    /// of them into one `ir.Module`; cross-module calls resolve through the
+    /// shared, module-qualified tables in `ctx` and `func_ids`.
+    modules: []const ModuleInput,
+    /// The module whose function is currently being lowered. `files`/`checked`/
+    /// `rmodule` below are cursors into `modules[cur_module]`, re-pointed before
+    /// each function so the per-function `FnCtx` code reads the right module
+    /// without threading a module id through every call.
+    cur_module: ModuleId = @enumFromInt(0),
     files: []const ModuleFile,
     checked: *const check.CheckedModule,
     rmodule: *const resolve.Module,
@@ -276,6 +296,24 @@ pub const Lowerer = struct {
     /// moved into `out.funcs` once the reserved block is fully appended.
     closure_funcs: std.ArrayList(ir.Function) = .empty,
     reserved_count: usize = 0,
+
+    /// Re-point the per-module cursors at `m` before lowering one of its
+    /// functions, so `FnCtx` (which reads `self.l.files/checked/rmodule`) sees
+    /// the right module without a module id threaded through every method.
+    fn setModule(self: *Lowerer, m: ModuleId) void {
+        self.cur_module = m;
+        const mi = self.modules[@intFromEnum(m)];
+        self.files = mi.files;
+        self.checked = mi.checked;
+        self.rmodule = mi.rmodule;
+    }
+
+    /// The resolve-level symbol a `GlobalSymbol` names, indexed in *its own*
+    /// module's table — correct even when `gsym` is a cross-module reference and
+    /// the cursor points elsewhere.
+    fn symbolOf(self: *const Lowerer, gsym: GlobalSymbol) resolve.Symbol {
+        return self.modules[@intFromEnum(gsym.module)].rmodule.symbols.items[@intFromEnum(gsym.id)];
+    }
 
     fn lookupMethod(self: *const Lowerer, ty: TypeId, name: []const u8) ?MethodEntry {
         for (self.method_table.items) |e| {
@@ -306,7 +344,7 @@ pub const Lowerer = struct {
     /// non-generic function. Methods (which have no module symbol or func_sig)
     /// go through `lowerFunctionDecl` directly — see `lowerModule`'s method pass.
     fn lowerFunction(self: *Lowerer, gsym: GlobalSymbol, gen_env: GenericEnv, name: []const u8) Error!ir.Function {
-        const sym = self.rmodule.symbols.items[@intFromEnum(gsym.id)];
+        const sym = self.symbolOf(gsym);
         const template_shape = self.ctx.func_sigs.get(gsym.pack()) orelse return error.UnsupportedConstruct;
         const shape = if (gen_env.len > 0) try self.ctx.substFuncShape(template_shape, gen_env) else template_shape;
         return self.lowerFunctionDecl(sym.file_idx, sym.decl, shape, gen_env, name);
@@ -337,7 +375,7 @@ pub const Lowerer = struct {
             if (mf.tree.get(recv_ty_node).tag != .ident) return error.UnsupportedConstruct;
             const recv_sid = self.rmodule.node_symbols[file_idx][recv_ty_node];
             if (recv_sid == .none) return error.UnsupportedConstruct;
-            const recv_struct_ty = self.ctx.decl_memo.get((GlobalSymbol{ .module = @enumFromInt(0), .id = recv_sid }).pack()) orelse
+            const recv_struct_ty = self.ctx.decl_memo.get((GlobalSymbol{ .module = self.cur_module, .id = recv_sid }).pack()) orelse
                 return error.UnsupportedConstruct;
             try param_types.append(self.gpa, recv_struct_ty);
             const p = try b.addParam(recv_struct_ty);
@@ -501,10 +539,31 @@ pub const Lowerer = struct {
 };
 
 /// Lowers one already-resolved, type-checked, single-module program.
-/// `files`/`rmodule`/`checked` must be the outputs of `resolve.resolveModule`
-/// and `check.checkModule` over the same `files`.
+/// Single-module convenience wrapper — the front-end's one-module callers and
+/// the existing tests keep working unchanged. `files`/`rmodule`/`checked` must
+/// be the outputs of `resolve.resolveModule` and `check.checkModule` over the
+/// same `files`.
 pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile, checked: *const check.CheckedModule, rmodule: *const resolve.Module) Error!ir.Module {
-    var l: Lowerer = .{ .gpa = gpa, .ctx = ctx, .files = files, .checked = checked, .rmodule = rmodule, .out = ir.Module.init(gpa, ctx) };
+    return lowerProject(gpa, ctx, &.{.{ .files = files, .checked = checked, .rmodule = rmodule }});
+}
+
+/// Lowers a whole program — the root module and every module it transitively
+/// imports (`modules`, indexed by `ModuleId`) — into one `ir.Module`. Every
+/// module's functions get `FuncId`s in a single global space, so a cross-module
+/// call is an ordinary direct call; the shared, module-qualified `ctx` tables
+/// (`func_sigs`, `instantiations`, `decl_generics`, `decl_memo`) supply every
+/// module's signatures. `modules[0]` is the root (its `main` is the entry).
+pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleInput) Error!ir.Module {
+    std.debug.assert(modules.len >= 1);
+    var l: Lowerer = .{
+        .gpa = gpa,
+        .ctx = ctx,
+        .modules = modules,
+        .files = modules[0].files,
+        .checked = modules[0].checked,
+        .rmodule = modules[0].rmodule,
+        .out = ir.Module.init(gpa, ctx),
+    };
     errdefer l.out.deinit();
     defer l.func_ids.deinit(gpa);
     defer l.inst_ids.deinit(gpa);
@@ -515,57 +574,62 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         l.layouts.deinit(gpa);
     }
 
-    // Pass A: every non-generic func gets a `FuncId` up front (stable
-    // symbol-table order), so forward/mutually-recursive direct calls always
-    // resolve. Pass A2: every generic instantiation the checker already
-    // discovered gets the next block of ids, in `ctx.instantiations` order.
+    // Pass A: every non-generic func in every module gets a `FuncId` up front
+    // (stable module-then-symbol order), so forward/mutually-recursive and
+    // cross-module direct calls always resolve. Pass A2: every generic
+    // instantiation the checker discovered gets the next block of ids, in
+    // `ctx.instantiations` order.
     var direct_syms: std.ArrayList(GlobalSymbol) = .empty;
     defer direct_syms.deinit(gpa);
-    for (rmodule.symbols.items, 0..) |sym, sid| {
-        if (sid == 0 or sym.kind != .func or sym.decl == ast.none) continue;
-        const gsym = GlobalSymbol{ .module = @enumFromInt(0), .id = @enumFromInt(sid) };
-        if (ctx.decl_generics.get(gsym.pack())) |gens| {
-            if (gens.len > 0) continue; // generic template, not directly lowered
+    for (modules, 0..) |mod, mi| {
+        for (mod.rmodule.symbols.items, 0..) |sym, sid| {
+            if (sid == 0 or sym.kind != .func or sym.decl == ast.none) continue;
+            const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = @enumFromInt(sid) };
+            if (ctx.decl_generics.get(gsym.pack())) |gens| {
+                if (gens.len > 0) continue; // generic template, not directly lowered
+            }
+            try l.func_ids.put(gpa, gsym.pack(), @enumFromInt(direct_syms.items.len));
+            try direct_syms.append(gpa, gsym);
         }
-        try l.func_ids.put(gpa, gsym.pack(), @enumFromInt(direct_syms.items.len));
-        try direct_syms.append(gpa, gsym);
     }
     const base = direct_syms.items.len;
     for (0..ctx.instantiations.items.len) |i| {
         try l.inst_ids.put(gpa, @intCast(i), @enumFromInt(base + i));
     }
 
-    // Pass A3: methods on concrete structs. They are not module symbols (§10.4,
-    // resolve.zig keeps them out of the flat namespace so different types can
-    // reuse a method name), so their signature comes from the receiver's method
-    // set and they get `FuncId`s after the instantiations. `l.method_table`
-    // maps (receiver type, name) -> that id for `resolveCallTarget`.
-    const MethodDecl = struct { file_idx: usize, decl: ast.Index, name: []const u8, shape: check.FuncShape };
+    // Pass A3: methods on concrete structs, across every module. They are not
+    // module symbols (§10.4, resolve.zig keeps them out of the flat namespace so
+    // different types can reuse a method name), so their signature comes from
+    // the receiver's method set and they get `FuncId`s after the instantiations.
+    // `l.method_table` maps (receiver type, name) -> that id.
+    const MethodDecl = struct { module: ModuleId, file_idx: usize, decl: ast.Index, name: []const u8, shape: check.FuncShape };
     var method_decls: std.ArrayList(MethodDecl) = .empty;
     defer method_decls.deinit(gpa);
     const method_base = base + ctx.instantiations.items.len;
-    for (files, 0..) |mf, fidx| {
-        for (mf.tree.kids(mf.tree.root)) |top| {
-            if (top == ast.none) continue;
-            const inner = if (mf.tree.get(top).tag == .@"export") mf.tree.kids(top)[0] else top;
-            if (mf.tree.get(inner).tag != .func_decl) continue;
-            const k = mf.tree.kids(inner); // [recv, name, generics, params, result, body]
-            if (k[0] == ast.none) continue; // free function, handled by Pass A
-            const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
-            if (mf.tree.get(rk[1]).tag != .ident) continue; // generic-struct receiver: deferred
-            const recv_sid = rmodule.node_symbols[fidx][rk[1]];
-            if (recv_sid == .none) continue;
-            const recv_gsym = GlobalSymbol{ .module = @enumFromInt(0), .id = recv_sid };
-            if (ctx.decl_generics.get(recv_gsym.pack())) |gens| {
-                if (gens.len > 0) continue; // method on a generic struct: deferred
+    for (modules, 0..) |mod, mi| {
+        for (mod.files, 0..) |mf, fidx| {
+            for (mf.tree.kids(mf.tree.root)) |top| {
+                if (top == ast.none) continue;
+                const inner = if (mf.tree.get(top).tag == .@"export") mf.tree.kids(top)[0] else top;
+                if (mf.tree.get(inner).tag != .func_decl) continue;
+                const k = mf.tree.kids(inner); // [recv, name, generics, params, result, body]
+                if (k[0] == ast.none) continue; // free function, handled by Pass A
+                const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
+                if (mf.tree.get(rk[1]).tag != .ident) continue; // generic-struct receiver: deferred
+                const recv_sid = mod.rmodule.node_symbols[fidx][rk[1]];
+                if (recv_sid == .none) continue;
+                const recv_gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = recv_sid };
+                if (ctx.decl_generics.get(recv_gsym.pack())) |gens| {
+                    if (gens.len > 0) continue; // method on a generic struct: deferred
+                }
+                const recv_ty = ctx.decl_memo.get(recv_gsym.pack()) orelse continue;
+                const name = identTextOf(mf, k[1]);
+                const bucket = ctx.methodsOf(recv_ty) orelse continue;
+                const method = bucket.get(name) orelse continue;
+                const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
+                try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result });
+                try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
             }
-            const recv_ty = ctx.decl_memo.get(recv_gsym.pack()) orelse continue;
-            const name = identTextOf(mf, k[1]);
-            const bucket = ctx.methodsOf(recv_ty) orelse continue;
-            const method = bucket.get(name) orelse continue;
-            const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
-            try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result });
-            try method_decls.append(gpa, .{ .file_idx = fidx, .decl = inner, .name = name, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
         }
     }
 
@@ -576,26 +640,38 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
         l.closure_funcs.deinit(gpa);
     }
 
-    // Pass B: lower bodies in the exact same order as Pass A/A2/A3 assigned ids.
-    // Closures append to `l.closure_funcs` (see the field doc), so the reserved
-    // FuncId space stays contiguous; `reserved_count` puts closures past it.
+    // Pass B: lower bodies in the exact same order as Pass A/A2/A3 assigned ids,
+    // re-pointing the module cursor (`setModule`) before each. Every emitted
+    // name is module-qualified for imported modules (`m<id>$`) so two modules'
+    // same-named functions never collide at link; module 0 (the root) keeps its
+    // bare names so `main` stays `main` and the single-module path is unchanged.
     l.reserved_count = method_base + method_decls.items.len;
     for (direct_syms.items) |gsym| {
-        const sym = rmodule.symbols.items[@intFromEnum(gsym.id)];
-        const f = try l.lowerFunction(gsym, &.{}, sym.name);
+        l.setModule(gsym.module);
+        const sym = l.rmodule.symbols.items[@intFromEnum(gsym.id)];
+        const nm = try moduleQualified(gpa, gsym.module, sym.name);
+        defer gpa.free(nm);
+        const f = try l.lowerFunction(gsym, &.{}, nm);
         try l.out.funcs.append(gpa, f);
     }
     for (ctx.instantiations.items, 0..) |inst, i| {
+        l.setModule(inst.generic.module);
         const env = try l.buildGenericEnv(inst);
         defer gpa.free(env);
-        const sym = rmodule.symbols.items[@intFromEnum(inst.generic.id)];
-        const name = try std.fmt.allocPrint(gpa, "{s}${d}", .{ sym.name, i });
-        defer gpa.free(name);
-        const f = try l.lowerFunction(inst.generic, env, name);
+        const sym = l.rmodule.symbols.items[@intFromEnum(inst.generic.id)];
+        const nm = if (@intFromEnum(inst.generic.module) == 0)
+            try std.fmt.allocPrint(gpa, "{s}${d}", .{ sym.name, i })
+        else
+            try std.fmt.allocPrint(gpa, "m{d}${s}${d}", .{ @intFromEnum(inst.generic.module), sym.name, i });
+        defer gpa.free(nm);
+        const f = try l.lowerFunction(inst.generic, env, nm);
         try l.out.funcs.append(gpa, f);
     }
     for (method_decls.items) |m| {
-        const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, m.name);
+        l.setModule(m.module);
+        const nm = try moduleQualified(gpa, m.module, m.name);
+        defer gpa.free(nm);
+        const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, nm);
         try l.out.funcs.append(gpa, f);
     }
 
@@ -606,6 +682,17 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
     l.closure_funcs.clearRetainingCapacity();
 
     return l.out;
+}
+
+/// The link-level symbol name for a function `base` declared in module `module`.
+/// Module 0 (the root) keeps the bare name (so `main` stays `main` and the
+/// single-module path is byte-identical); every imported module gets an
+/// `m<id>$` prefix so two modules' same-named functions never collide. Always
+/// returns an owned copy — `FunctionBuilder.finish` dupes it, so the caller
+/// frees this immediately after lowering.
+fn moduleQualified(gpa: Allocator, module: ModuleId, base: []const u8) Allocator.Error![]u8 {
+    if (@intFromEnum(module) == 0) return gpa.dupe(u8, base);
+    return std.fmt.allocPrint(gpa, "m{d}${s}", .{ @intFromEnum(module), base });
 }
 
 // ============================================================================
@@ -650,20 +737,25 @@ const FnCtx = struct {
     }
 
     /// The `GlobalSymbol` an `ident`/type-name node resolved to, following
-    /// same-module re-export chains. `null` for the blank identifier or an
-    /// already-diagnosed undefined name.
+    /// import re-export chains — across module boundaries: when an `import_item`
+    /// points into another module, the walk switches to that module's symbol
+    /// table and carries its `ModuleId`, so a cross-module reference resolves to
+    /// the defining module's symbol (its `func_id` / `func_sig` key). `null` for
+    /// the blank identifier or an already-diagnosed undefined name.
     fn nodeSymbol(self: *const FnCtx, node: ast.Index) ?GlobalSymbol {
         const sid = self.l.rmodule.node_symbols[self.file_idx][node];
         if (sid == .none) return null;
+        var mod = self.l.cur_module;
         var cur = sid;
         var guard: u32 = 0;
         while (guard < 64) : (guard += 1) {
-            const s = self.l.rmodule.symbols.items[@intFromEnum(cur)];
+            const s = self.l.modules[@intFromEnum(mod)].rmodule.symbols.items[@intFromEnum(cur)];
             if (s.kind != .import_item) break;
             const target = s.imported_from orelse break;
+            mod = target.module;
             cur = target.symbol;
         }
-        return .{ .module = @enumFromInt(0), .id = cur };
+        return .{ .module = mod, .id = cur };
     }
 
     // ---- block/terminator plumbing -----------------------------------------
@@ -1398,7 +1490,7 @@ const FnCtx = struct {
         const callee_tag = self.tree().get(callee).tag;
         if (callee_tag == .ident and self.env.lookup(self.identText(callee)) == null) {
             if (self.nodeSymbol(callee)) |gsym| {
-                const sym = self.l.rmodule.symbols.items[@intFromEnum(gsym.id)];
+                const sym = self.l.symbolOf(gsym);
                 if (sym.kind == .func) {
                     const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
                     const shape = self.ctx.func_sigs.get(gsym.pack()).?;
@@ -1550,7 +1642,7 @@ const FnCtx = struct {
         if (self.tree().get(callee).tag == .chan_type) return self.lowerChanMake(node);
         if (self.tree().get(callee).tag == .ident and self.env.lookup(self.identText(callee)) == null) {
             if (self.nodeSymbol(callee)) |gsym| {
-                const sym = self.l.rmodule.symbols.items[@intFromEnum(gsym.id)];
+                const sym = self.l.symbolOf(gsym);
                 if (sym.kind == .builtin_func) return self.lowerBuiltinCall(node, sym.name);
             }
         }
@@ -1805,8 +1897,15 @@ const FnCtx = struct {
         const name = self.identText(node);
         if (self.env.lookup(name)) |idx| return self.env.bindings.items[idx].value;
         const gsym = self.nodeSymbol(node) orelse return error.UnsupportedConstruct;
-        const sym = self.l.rmodule.symbols.items[@intFromEnum(gsym.id)];
+        const sym = self.l.symbolOf(gsym);
         if (sym.kind != .const_binding) return error.UnsupportedConstruct; // top-level mutable `let`: no IR global-variable op exists yet
+        // Cross-module const folding is out of scope (check.zig defers it too):
+        // `lowerTopConst` re-lowers the initializer in the current module's file
+        // list, which would misindex a foreign module's file. Cross-module value
+        // references (consts, function values) are a documented follow-up; a
+        // cross-module *call* never reaches here (it goes through
+        // `resolveCallTarget`'s direct path).
+        if (gsym.module != self.l.cur_module) return error.UnsupportedConstruct;
         return self.lowerTopConst(sym.decl, sym.file_idx);
     }
 
