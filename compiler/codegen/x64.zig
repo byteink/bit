@@ -27,7 +27,6 @@
 //! ## Deliberately NOT covered (returns `error.UnsupportedConstruct`, never a
 //! silently-wrong codegen — mirrors `lower.zig`'s own scope-exclusion style)
 //!
-//! - `call_iface`: interface vtable dispatch layout is not decided yet.
 //! - `index_get`/`index_set` on anything but a static `.array` base: array
 //!   element addressing is fully determined by `lower.zig`'s "arrays have no
 //!   header, a static length" scheme, so `base + index*width` is unambiguous.
@@ -1513,8 +1512,8 @@ fn emitRet(self: *Ctx, vals: []const u32) !void {
 }
 
 // ============================================================================
-// Calls (direct `call`, opaque `rt_call`, and closure `call_value` — all real
-// x86-64 calls; `call_iface` vtable dispatch is unsupported, see module doc)
+// Calls (direct `call`, opaque `rt_call`, closure `call_value`, and interface
+// `call_iface` — all real x86-64 calls; see `emitCallIface` for dispatch)
 // ============================================================================
 
 /// Per-`RtFn` runtime symbol name (module doc comment: "generically

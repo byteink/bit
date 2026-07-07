@@ -48,11 +48,12 @@
 //! ## Deliberately NOT covered
 //!
 //! Same exclusions as `x64.zig`, for identical reasons (these are
-//! IR/lowering-level gaps, not backend-specific ones): `call_iface` and a
-//! `ret` carrying more than one value return `error.UnsupportedConstruct`.
+//! IR/lowering-level gaps, not backend-specific ones): a `ret` carrying more
+//! than one value returns `error.UnsupportedConstruct`.
 //! `field_get`/`field_set`, `index_get`/`index_set` (array base only),
 //! `slice_len` (loads the header `len` word — slice/string), `gc_alloc`,
-//! `const_string`, `make_closure`, `call_value`, and `rt_call` ARE covered.
+//! `const_string`, `make_closure`, `call_value`, `call_iface`, and `rt_call`
+//! ARE covered.
 //! Dynamic `[]T` indexing goes through the `slice_get`/`slice_set` runtime
 //! calls (ABI.md §2), never the `index_*` ops.
 //!
