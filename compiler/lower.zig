@@ -2116,10 +2116,14 @@ const FnCtx = struct {
                 const recv = try self.lowerExpr(k[0]);
                 const idxv = try self.lowerExpr(k[1]);
                 const ty = try self.nodeType(node);
-                // A dynamic `[]T` reads through the bounds-checked runtime; a
-                // static `[N]T` array is a direct data pointer (codegen op).
-                if (self.ctx.typeOf(try self.nodeType(k[0])) == .slice)
+                const recv_data = self.ctx.typeOf(try self.nodeType(k[0]));
+                // A dynamic `[]T` and a `string` both read a `{ptr,len,...}`
+                // header through the bounds-checked runtime; a static `[N]T`
+                // array is a direct data pointer (codegen op).
+                if (recv_data == .slice)
                     break :blk self.b.rtCall(ty, .slice_get, &.{ recv, idxv });
+                if (recv_data == .prim and recv_data.prim == .string)
+                    break :blk self.b.rtCall(ty, .string_byte, &.{ recv, idxv });
                 break :blk self.b.indexGet(ty, recv, idxv);
             },
             .str_interp => self.lowerStrInterp(node),

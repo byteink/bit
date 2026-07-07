@@ -471,6 +471,16 @@ export fn bit_rt_string_eq(a: *const RtBytes, b: *const RtBytes) callconv(.c) bo
     return std.mem.eql(u8, a.ptr[0..a.len], b.ptr[0..b.len]);
 }
 
+/// `bit_rt_string_byte` (ABI.md §2): the byte at `index`, backing `s[i]` on a
+/// string (SPEC §12.2 — result type `u8`). Out-of-range panics, mirroring
+/// slice indexing (SPEC §18.4). Returns `u64` (zero-extended), like
+/// `bit_rt_slice_get`, so the whole return register is defined — a `u8` return
+/// leaves rax's upper bits undefined under the C ABI.
+export fn bit_rt_string_byte(s: *const RtBytes, index: usize) callconv(.c) u64 {
+    if (index >= s.len) fatal("index out of range");
+    return s.ptr[index];
+}
+
 fn stringFromBytes(txt: []const u8) *const RtBytes {
     const s = allocString(txt.len);
     @memcpy(s.bytes, txt);

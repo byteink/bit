@@ -68,6 +68,9 @@ pub const RtFn = enum {
     /// Two `string` args -> `bool`: byte-wise equality. Backs string `==`/`!=`
     /// (`!=` negates the result). Distinct from integer `icmp_eq`.
     string_eq,
+    /// `(string, index) -> u8`: the byte at `index`, bounds-checked (panics on
+    /// out-of-range, SPEC §18.4). Backs `s[i]` on a string.
+    string_byte,
     panic,
     assert,
     /// One `string` arg: writes its bytes to stdout (no trailing newline).
