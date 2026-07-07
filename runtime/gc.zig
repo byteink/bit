@@ -39,6 +39,14 @@ const Heap = heap_mod.Heap;
 /// body, of every field that holds a GC reference. Offsets must be
 /// pointer-aligned and lie fully inside the body. Fields that are not GC
 /// references are absent; the collector never inspects them.
+/// One method of a concrete type, for structural interface dispatch (ABI.md
+/// §2.1). `id` is the global method-name id; `fn_ptr` is the method's code
+/// address, taking the receiver (object body pointer) as its leading argument.
+pub const Method = extern struct {
+    id: u64,
+    fn_ptr: *const anyopaque,
+};
+
 pub const TypeInfo = extern struct {
     /// Object body size in bytes, excluding the GC header.
     size: usize,
@@ -47,16 +55,25 @@ pub const TypeInfo = extern struct {
     /// Static type name, for stats/debugging only. May be empty (`name_len == 0`).
     name_ptr: [*]const u8,
     name_len: usize,
+    /// This type's methods (ABI.md §2.1). May be empty (`methods_len == 0`).
+    methods_ptr: [*]const Method,
+    methods_len: usize,
 
     /// Zig-side convenience constructor from ordinary slices. Codegen instead
-    /// writes the four raw fields directly into static data.
+    /// writes the raw fields directly into static data.
     pub fn of(size: usize, ptr_offsets: []const usize, name: []const u8) TypeInfo {
+        return ofWithMethods(size, ptr_offsets, name, &.{});
+    }
+
+    pub fn ofWithMethods(size: usize, ptr_offsets: []const usize, name: []const u8, method_list: []const Method) TypeInfo {
         return .{
             .size = size,
             .ptr_offsets_ptr = ptr_offsets.ptr,
             .ptr_offsets_len = ptr_offsets.len,
             .name_ptr = name.ptr,
             .name_len = name.len,
+            .methods_ptr = method_list.ptr,
+            .methods_len = method_list.len,
         };
     }
 
@@ -67,7 +84,20 @@ pub const TypeInfo = extern struct {
     pub fn typeName(self: *const TypeInfo) []const u8 {
         return self.name_ptr[0..self.name_len];
     }
+
+    pub fn methods(self: *const TypeInfo) []const Method {
+        return self.methods_ptr[0..self.methods_len];
+    }
 };
+
+/// Sentinel descriptor for a GC-reference element buffer — a dynamic slice's
+/// backing store when its elements are references (ABI.md §2, completing the
+/// #1106 deferral). It has no fixed `ptrOffsets`: the collector traces *every*
+/// 8-byte word of the body as a potential reference, using the body size from
+/// the object header (the buffer length is dynamic, not known to the type).
+/// Trailing/unset words read as null and are skipped by `markRoot`. Non-ref
+/// slice buffers keep a plain leaf descriptor and are never traced.
+pub const ref_array_info = TypeInfo.of(0, &[_]usize{}, "refarray");
 
 /// Root-scanning interface — the runtime side of the stack-map contract.
 ///
@@ -370,6 +400,18 @@ pub const Gc = struct {
 
     fn scanObject(self: *Gc, h: *GcHeader) void {
         const body = bodyFromHeader(h);
+        // A reference element buffer has no static pointer map: trace every word
+        // of the (dynamically sized) body as a potential root. Bounded by the
+        // buffer's word count.
+        if (h.info == &ref_array_info) {
+            const nwords = (h.size - header_size) / @sizeOf(usize);
+            var w: usize = 0;
+            while (w < nwords) : (w += 1) {
+                const slot: *const ?[*]u8 = @ptrCast(@alignCast(body + w * @sizeOf(usize)));
+                self.markRoot(slot.*);
+            }
+            return;
+        }
         const offs = h.info.ptrOffsets();
         var i: usize = 0;
         while (i < offs.len) : (i += 1) { // bounded: num_ptrs for this type

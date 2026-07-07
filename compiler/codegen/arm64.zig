@@ -1335,7 +1335,8 @@ fn recordSafepoint(self: *Ctx, ret_off: u32) CodegenError!void {
 /// bit_rt_gc_alloc`, which returns the zeroed body pointer in x0. A GC point,
 /// so it records a safepoint (buildIntervals/hasCalls count `gc_alloc` too).
 fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) CodegenError!void {
-    const name = try ir.typeInfoSymbol(self.gpa, size, ptr_offsets);
+    const disc: u32 = @intFromEnum(self.f.valueType(@enumFromInt(dst)));
+    const name = try ir.typeInfoSymbol(self.gpa, disc, size, ptr_offsets);
     try self.owned_syms.append(self.gpa, name);
     try self.emitAddrOf(@enumFromInt(argReg(.int, 0).?), name); // arg0 = x0
     try self.emitCallReloc("bit_rt_gc_alloc");
@@ -1355,7 +1356,8 @@ const closure_cell_ptr_offsets = [_]u32{8};
 /// `emitGcAlloc`), then store the target function's address at +0 and the
 /// already-materialized environment pointer at +8.
 fn emitMakeClosure(self: *Ctx, dst: u32, func: ir.FuncId, env: ir.ValueId) CodegenError!void {
-    const ti = try ir.typeInfoSymbol(self.gpa, closure_cell_size, &closure_cell_ptr_offsets);
+    const disc: u32 = @intFromEnum(self.f.valueType(@enumFromInt(dst)));
+    const ti = try ir.typeInfoSymbol(self.gpa, disc, closure_cell_size, &closure_cell_ptr_offsets);
     try self.owned_syms.append(self.gpa, ti);
     try self.emitAddrOf(@enumFromInt(argReg(.int, 0).?), ti); // x0 = &TypeInfo
     try self.emitCallReloc("bit_rt_gc_alloc");
@@ -1389,6 +1391,32 @@ fn emitCallValue(self: *Ctx, dst: ?u32, dst_ty: TypeId, callee: ir.ValueId, args
     try self.loadImm(scratch3, @intFromEnum(cell), 0, 8, false); // x11 = code
     try marshalArgs(self, args, 1, 0);
     try self.movRR(@enumFromInt(argReg(.int, 0).?), scratch2); // x0 = env
+    try self.blr(scratch3);
+    const ret_off: u32 = @intCast(self.code.items.len);
+    try recordSafepoint(self, ret_off);
+    if (dst) |d| {
+        const class = common.classOf(self.tctx(), dst_ty);
+        if (class == .int) try putInt(self, d, @enumFromInt(retRegNum(.int))) else try putFloat(self, d, @enumFromInt(retRegNum(.float)));
+    }
+}
+
+/// `call_iface`: structural interface dispatch (ABI.md §2.1). Load the receiver
+/// object's `TypeInfo` (`*(recv - 32)`, the header's `info` field), resolve the
+/// method id to a code address via `bit_rt_iface_lookup`, then `blr` it with the
+/// receiver in x0. The lookup never collects, so only the final method call
+/// records a safepoint (like `emitCallValue`); the receiver is reloaded from its
+/// vreg afterward (its home survives the lookup call).
+fn emitCallIface(self: *Ctx, dst: ?u32, dst_ty: TypeId, iface_val: ir.ValueId, method_id: u32, args: []const u32) CodegenError!void {
+    const recv = try getInt(self, vregOf(self, iface_val), scratch1);
+    try self.addSubImmediate(true, @intFromEnum(scratch2), @intFromEnum(recv), 32, false); // x10 = recv - 32
+    try self.loadImm(scratch2, @intFromEnum(scratch2), 0, 8, false); // x10 = info
+    try self.movRR(@enumFromInt(argReg(.int, 0).?), scratch2); // x0 = info
+    try self.movImm64(@enumFromInt(argReg(.int, 1).?), method_id); // x1 = id
+    try self.emitCallReloc("bit_rt_iface_lookup"); // x0 = method code address
+    try self.movRR(scratch3, @enumFromInt(retRegNum(.int))); // x11 = fn, survives marshaling
+    try marshalArgs(self, args, 1, 0);
+    const recv2 = try getInt(self, vregOf(self, iface_val), scratch1);
+    try self.movRR(@enumFromInt(argReg(.int, 0).?), recv2); // x0 = recv
     try self.blr(scratch3);
     const ret_off: u32 = @intCast(self.code.items.len);
     try recordSafepoint(self, ret_off);
@@ -1517,7 +1545,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
             try emitCall(self, if (ty != .invalid) i else null, ty, target.name, c.args, true);
         },
         .call_value => |c| try emitCallValue(self, if (ty != .invalid) i else null, ty, c.callee, c.args),
-        .call_iface => return error.UnsupportedConstruct,
+        .call_iface => |c| try emitCallIface(self, if (ty != .invalid) i else null, ty, c.iface, c.method_index, c.args),
         .gc_alloc => |g| try emitGcAlloc(self, i, g.size, g.ptr_offsets),
         .field_get => |fg| try emitFieldGet(self, i, fg.base, fg.offset, ty),
         .field_set => |fs| try emitFieldSet(self, fs.base, fs.offset, fs.value, self.f.valueType(fs.value)),
@@ -1536,7 +1564,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
 
 fn hasCalls(f: *const ir.Function) bool {
     for (f.insts.items(.op)) |op| {
-        if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value) return true;
+        if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value or op == .call_iface) return true;
     }
     return false;
 }
@@ -1570,7 +1598,7 @@ fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Functio
         while (idx < end) : (idx += 1) {
             const id: ir.ValueId = @enumFromInt(idx);
             const op = f.insts.items(.op)[idx];
-            if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value) try safepoints.append(gpa, idx);
+            if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value or op == .call_iface) try safepoints.append(gpa, idx);
             const dd = f.decode(id);
             extendUses(intervals, idx, dd);
             switch (dd) {

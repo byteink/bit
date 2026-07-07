@@ -376,11 +376,24 @@ pub const Decoded = union(enum) {
 /// pool. Struct/interface layout is never duplicated here — it comes
 /// straight from `ctx` (the same project-lifetime `check.TypeContext` the
 /// checker built), so there is exactly one type system in the compiler.
+/// One method of a concrete type, for interface dispatch (ABI.md §2.1).
+/// `id` is the global method-name id; `func` is the method's lowered function.
+pub const MethodSlot = struct { id: u32, func: FuncId };
+
+/// A concrete type's method table. `type_disc` is the type's discriminator
+/// (`@intFromEnum(TypeId)`), matching the discriminator codegen threads into the
+/// type's `TypeInfo` symbol so the emitter can attach the table to the right
+/// descriptor.
+pub const MethodTable = struct { type_disc: u32, methods: []const MethodSlot };
+
 pub const Module = struct {
     gpa: Allocator,
     ctx: *TypeContext,
     funcs: std.ArrayList(Function) = .empty,
     string_pool: std.ArrayList([]const u8) = .empty,
+    /// Per-type method tables (ABI.md §2.1), owned by the module. Empty for
+    /// programs with no methods.
+    method_tables: []const MethodTable = &.{},
 
     pub fn init(gpa: Allocator, ctx: *TypeContext) Module {
         return .{ .gpa = gpa, .ctx = ctx };
@@ -391,7 +404,17 @@ pub const Module = struct {
         self.funcs.deinit(self.gpa);
         for (self.string_pool.items) |str| self.gpa.free(str);
         self.string_pool.deinit(self.gpa);
+        for (self.method_tables) |mt| self.gpa.free(mt.methods);
+        self.gpa.free(self.method_tables);
         self.* = undefined;
+    }
+
+    /// The method table for `type_disc`, or null if the type has no methods.
+    pub fn methodTable(self: *const Module, type_disc: u32) ?MethodTable {
+        for (self.method_tables) |mt| {
+            if (mt.type_disc == type_disc) return mt;
+        }
+        return null;
     }
 
     /// Interns `s` into the string pool, deduping by content (bounded linear
@@ -415,16 +438,21 @@ pub const Module = struct {
     }
 };
 
-/// Deterministic symbol name for the static `TypeInfo` a `gc_alloc` of the
-/// given layout references. Same (size, ptr_offsets) -> same name, so codegen
-/// (which references it) and the object emitter (which defines it) agree with
-/// no shared index, and identical TypeInfos dedup naturally. Caller owns the
-/// returned bytes.
-pub fn typeInfoSymbol(gpa: Allocator, size: u32, ptr_offsets: []const u32) Allocator.Error![]u8 {
+/// Deterministic symbol name for the static `TypeInfo` a `gc_alloc` references.
+/// `disc` is the type discriminator (`@intFromEnum(TypeId)` of the allocation's
+/// result type): descriptors are now **per type**, not per layout, so a type's
+/// method table (ABI.md §2.1) attaches to the right one — two types with the
+/// same size/offsets but different methods must not share a `TypeInfo`. Same
+/// (disc, size, ptr_offsets) -> same name, so codegen (which references it) and
+/// the object emitter (which defines it) agree with no shared index. Caller owns
+/// the returned bytes.
+pub fn typeInfoSymbol(gpa: Allocator, disc: u32, size: u32, ptr_offsets: []const u32) Allocator.Error![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
     var numbuf: [16]u8 = undefined;
     try list.appendSlice(gpa, "__bittype_");
+    try list.appendSlice(gpa, std.fmt.bufPrint(&numbuf, "{d}", .{disc}) catch unreachable);
+    try list.append(gpa, '_');
     try list.appendSlice(gpa, std.fmt.bufPrint(&numbuf, "{d}", .{size}) catch unreachable);
     for (ptr_offsets) |off| {
         try list.append(gpa, '_');

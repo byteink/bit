@@ -42,13 +42,15 @@ fn stackMapOf(a: Allocator, code_size: usize, saved: []const common.SavedReg, co
     return .{ .code_size = @intCast(code_size), .saved = try a.dupe(common.SavedReg, saved), .safepoints = views };
 }
 
-/// One distinct `gc_alloc` layout — turned into a static `TypeInfo` blob the
-/// runtime's `bit_rt_gc_alloc` reads (runtime/gc.zig). `size` is the body
-/// size; `ptr_offsets` the byte offsets of pointer fields the GC must scan.
-const TypeInfoLayout = struct { size: u32, ptr_offsets: []const u32 };
+/// One distinct `TypeInfo` blob the runtime's `bit_rt_gc_alloc` reads
+/// (runtime/gc.zig). `disc` is the type discriminator (`@intFromEnum(TypeId)` of
+/// the allocation's result type) — descriptors are per type, not per layout, so
+/// each type's method table (ABI.md §2.1) attaches to the right one. `size` is
+/// the body size; `ptr_offsets` the byte offsets of pointer fields the GC scans.
+const TypeInfoLayout = struct { disc: u32, size: u32, ptr_offsets: []const u32 };
 
-/// Every distinct `gc_alloc` layout in the module, deduped by its `TypeInfo`
-/// symbol name (so identical struct shapes share one blob). Bytes owned by `a`.
+/// Every distinct `TypeInfo` in the module, deduped by its symbol name (so a
+/// type used at many allocation sites shares one blob). Bytes owned by `a`.
 fn collectTypeInfos(a: Allocator, module: *const ir.Module) Allocator.Error![]TypeInfoLayout {
     var seen = std.StringHashMapUnmanaged(void){};
     var out: std.ArrayList(TypeInfoLayout) = .empty;
@@ -60,18 +62,47 @@ fn collectTypeInfos(a: Allocator, module: *const ir.Module) Allocator.Error![]Ty
             const layout: TypeInfoLayout = switch (f.insts.items(.op)[i]) {
                 .gc_alloc => blk: {
                     const g = f.decode(@enumFromInt(i)).gc_alloc;
-                    break :blk .{ .size = g.size, .ptr_offsets = g.ptr_offsets };
+                    break :blk .{ .disc = @intFromEnum(f.valueType(@enumFromInt(i))), .size = g.size, .ptr_offsets = g.ptr_offsets };
                 },
-                .make_closure => .{ .size = 16, .ptr_offsets = &.{8} },
+                .make_closure => .{ .disc = @intFromEnum(f.valueType(@enumFromInt(i))), .size = 16, .ptr_offsets = &.{8} },
                 else => continue,
             };
-            const name = try ir.typeInfoSymbol(a, layout.size, layout.ptr_offsets);
+            const name = try ir.typeInfoSymbol(a, layout.disc, layout.size, layout.ptr_offsets);
             if (seen.contains(name)) continue;
             try seen.put(a, name, {});
             try out.append(a, layout);
         }
     }
     return out.toOwnedSlice(a);
+}
+
+/// A function-pointer relocation site inside a method table: patch `off` to the
+/// absolute address of the `.text` symbol `sym`.
+const FnReloc = struct { off: u64, sym: []const u8 };
+
+/// A type's emitted method table (ABI.md §2.1): the local array symbol, its
+/// rodata offset/size, and the per-entry `fn` relocation sites. Empty
+/// (`sym.len == 0`) for a type with no methods.
+const EmittedMethods = struct { sym: []const u8, off: u64, size: usize, relocs: []const FnReloc };
+
+/// Appends a type's method table to `rodata` as `Method[]` (`{ u64 id, u64 fn }`
+/// each) and returns its placement + `fn` reloc sites. Format-neutral: the ELF
+/// and Mach-O emitters each turn `relocs` into their own abs64/unsigned64
+/// relocation records, keeping the byte layout identical across formats.
+fn emitMethodTable(a: Allocator, module: *const ir.Module, rodata: *std.ArrayList(u8), disc: u32, ti_symbol: []const u8) Error!EmittedMethods {
+    const mt = module.methodTable(disc) orelse return .{ .sym = "", .off = 0, .size = 0, .relocs = &.{} };
+    while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
+    const base: u64 = rodata.items.len;
+    var relocs: std.ArrayList(FnReloc) = .empty;
+    for (mt.methods) |m| {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, m.id, .little);
+        try rodata.appendSlice(a, &b); // id
+        try relocs.append(a, .{ .off = rodata.items.len, .sym = module.func(m.func).name });
+        try rodata.appendSlice(a, &(.{0} ** 8)); // fn — filled by the reloc
+    }
+    const name = try std.fmt.allocPrint(a, "{s}_methods", .{ti_symbol});
+    return .{ .sym = name, .off = base, .size = mt.methods.len * 16, .relocs = try relocs.toOwnedSlice(a) };
 }
 
 /// Emits `module` as an x86-64 ELF relocatable object. The returned bytes are
@@ -156,9 +187,10 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
 
     // ---- gc_alloc TypeInfo blobs -> .rodata -------------------------------
     // extern struct TypeInfo { size, ptr_offsets_ptr, ptr_offsets_len,
-    // name_ptr, name_len } (runtime/gc.zig), preceded by its usize[] offsets.
+    // name_ptr, name_len, methods_ptr, methods_len } (runtime/gc.zig), preceded
+    // by its usize[] offsets and (if any) its Method[] table (ABI.md §2.1).
     for (try collectTypeInfos(a, module)) |ti| {
-        const name = try ir.typeInfoSymbol(a, ti.size, ti.ptr_offsets);
+        const name = try ir.typeInfoSymbol(a, ti.disc, ti.size, ti.ptr_offsets);
         var offs_name: []const u8 = "";
         if (ti.ptr_offsets.len > 0) {
             while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
@@ -172,6 +204,11 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local, .kind = .object });
             try defined.put(a, offs_name, {});
         }
+        const methods = try emitMethodTable(a, module, &rodata, ti.disc, name);
+        if (methods.sym.len > 0) {
+            try symbols.append(a, .{ .name = methods.sym, .section = .rodata, .offset = methods.off, .size = methods.size, .binding = .local, .kind = .object });
+            try defined.put(a, methods.sym, {});
+        }
         while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
         const ti_off: u64 = rodata.items.len;
         var field: [8]u8 = undefined;
@@ -182,10 +219,17 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try rodata.appendSlice(a, &field); // ptr_offsets_len
         try rodata.appendSlice(a, &(.{0} ** 8)); // name_ptr = null
         try rodata.appendSlice(a, &(.{0} ** 8)); // name_len = 0
-        try symbols.append(a, .{ .name = name, .section = .rodata, .offset = ti_off, .size = 40, .binding = .global, .kind = .object });
+        try rodata.appendSlice(a, &(.{0} ** 8)); // methods_ptr (reloc below if any)
+        std.mem.writeInt(u64, &field, methods.size / 16, .little);
+        try rodata.appendSlice(a, &field); // methods_len
+        try symbols.append(a, .{ .name = name, .section = .rodata, .offset = ti_off, .size = 56, .binding = .global, .kind = .object });
         try defined.put(a, name, {});
         if (ti.ptr_offsets.len > 0)
             try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 8, .symbol = offs_name, .kind = .abs64, .addend = 0 });
+        if (methods.sym.len > 0)
+            try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 40, .symbol = methods.sym, .kind = .abs64, .addend = 0 });
+        for (methods.relocs) |r|
+            try relocs.append(a, .{ .section = .rodata, .offset = r.off, .symbol = r.sym, .kind = .abs64, .addend = 0 });
     }
 
     // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata ----------------
@@ -319,7 +363,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     // headers — it lives in writable `.data` (dyld only rebases writable
     // segments under PIE); the plain offsets array stays in read-only `.rodata`.
     for (try collectTypeInfos(a, module)) |ti| {
-        const name = try ir.typeInfoSymbol(a, ti.size, ti.ptr_offsets);
+        const name = try ir.typeInfoSymbol(a, ti.disc, ti.size, ti.ptr_offsets);
         var offs_name: []const u8 = "";
         if (ti.ptr_offsets.len > 0) {
             while (rodata.items.len % 8 != 0) try rodata.append(a, 0);
@@ -333,6 +377,18 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local });
             try defined.put(a, offs_name, {});
         }
+        // Method table (ABI.md §2.1) holds absolute fn pointers, so it also lives
+        // in writable `.data` (dyld rebases). `emitMethodTable` writes the bytes;
+        // symbol + fn relocs are mangled/tagged here for the Mach-O format.
+        const methods = try emitMethodTable(a, module, &data, ti.disc, name);
+        var methods_name: []const u8 = "";
+        if (methods.sym.len > 0) {
+            methods_name = try mac(a, methods.sym);
+            try symbols.append(a, .{ .name = methods_name, .section = .data, .offset = methods.off, .size = methods.size, .binding = .local });
+            try defined.put(a, methods_name, {});
+            for (methods.relocs) |r|
+                try relocs.append(a, .{ .section = .data, .offset = r.off, .symbol = try mac(a, r.sym), .kind = .unsigned64 });
+        }
         while (data.items.len % 8 != 0) try data.append(a, 0);
         const ti_off: u64 = data.items.len;
         var field: [8]u8 = undefined;
@@ -343,11 +399,16 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try data.appendSlice(a, &field); // ptr_offsets_len
         try data.appendSlice(a, &(.{0} ** 8)); // name_ptr = null
         try data.appendSlice(a, &(.{0} ** 8)); // name_len = 0
+        try data.appendSlice(a, &(.{0} ** 8)); // methods_ptr (rebased by dyld if any)
+        std.mem.writeInt(u64, &field, methods.size / 16, .little);
+        try data.appendSlice(a, &field); // methods_len
         const ti_name = try mac(a, name);
-        try symbols.append(a, .{ .name = ti_name, .section = .data, .offset = ti_off, .size = 40, .binding = .global });
+        try symbols.append(a, .{ .name = ti_name, .section = .data, .offset = ti_off, .size = 56, .binding = .global });
         try defined.put(a, ti_name, {});
         if (ti.ptr_offsets.len > 0)
             try relocs.append(a, .{ .section = .data, .offset = ti_off + 8, .symbol = offs_name, .kind = .unsigned64 });
+        if (methods.sym.len > 0)
+            try relocs.append(a, .{ .section = .data, .offset = ti_off + 40, .symbol = methods_name, .kind = .unsigned64 });
     }
 
     // ---- GC stack-map table (runtime/ABI.md §4) ---------------------------

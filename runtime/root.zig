@@ -331,6 +331,18 @@ export fn bit_rt_gc_alloc(info: *const gc_mod.TypeInfo) callconv(.c) [*]u8 {
     return g_gc.alloc(info) orelse fatal("out of memory");
 }
 
+/// `bit_rt_iface_lookup` (ABI.md §2.1): resolve an interface method call to a
+/// concrete method's code address. Linearly scans the receiver type's method
+/// table for `id` — types have few methods, so this is a short, allocation-free
+/// walk. The checker guarantees the receiver satisfies the interface, so a miss
+/// is a compiler bug (a call_iface id with no matching method), hence fatal.
+export fn bit_rt_iface_lookup(info: *const gc_mod.TypeInfo, id: u64) callconv(.c) *const anyopaque {
+    for (info.methods()) |m| {
+        if (m.id == id) return m.fn_ptr;
+    }
+    fatal("interface method not found");
+}
+
 /// The real safepoint poll, called by the `bit_rt_safepoint` shim below after
 /// the caller's registers are safely snapshotted. `noinline` so the shim's
 /// `call`/`bl` is a real ABI boundary (the snapshot must reflect the caller's
@@ -467,8 +479,9 @@ export fn bit_rt_string_from_bool(v: bool) callconv(.c) *const RtBytes {
 // by value, a wider `T` is boxed and its reference stored. This keeps `[]T` a
 // single-word value and indexing a fixed stride, at the cost of one word per
 // element (a packed `[]byte` is a later optimization). `is_ref` records whether
-// each word is a GC reference, for #1106's buffer scanning; the buffer itself is
-// a leaf today (its elements are not yet traced). `len` sits at offset 8, the
+// each word is a GC reference: a ref buffer is allocated with `ref_array_info`
+// so the collector traces its words as roots (elements reachable only through
+// the slice survive), a non-ref buffer stays a leaf. `len` sits at offset 8, the
 // same as the `string` header's, so `slice_len` serves both.
 // ---------------------------------------------------------------------------
 
@@ -481,12 +494,16 @@ const SliceHeader = extern struct {
 };
 
 const slice_info = gc_mod.TypeInfo.of(@sizeOf(SliceHeader), &[_]usize{0}, "slice");
-const slicebuf_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "slicebuf"); // leaf
+const slicebuf_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "slicebuf"); // leaf (non-ref elements)
 
-/// Allocates a `cap`-word element buffer (a leaf GC object). `cap == 0` yields
-/// a valid zero-length body — never indexed (bounds checks reject it).
-fn allocSliceBuf(cap: usize) [*]u64 {
-    const body = g_gc.allocRaw(cap * @sizeOf(u64), &slicebuf_info) orelse fatal("out of memory");
+/// Allocates a `cap`-word element buffer. When the elements are GC references
+/// (`is_ref`) the buffer carries the `ref_array_info` descriptor so the
+/// collector traces its words as roots (ABI.md §2); otherwise it is a leaf.
+/// `cap == 0` yields a valid zero-length body — never indexed (bounds checks
+/// reject it).
+fn allocSliceBuf(cap: usize, is_ref: bool) [*]u64 {
+    const info = if (is_ref) &gc_mod.ref_array_info else &slicebuf_info;
+    const body = g_gc.allocRaw(cap * @sizeOf(u64), info) orelse fatal("out of memory");
     return @ptrCast(@alignCast(body));
 }
 
@@ -495,7 +512,7 @@ fn allocSliceBuf(cap: usize) [*]u64 {
 export fn bit_rt_slice_new(len: usize, cap: usize, is_ref: usize) callconv(.c) *SliceHeader {
     const c = if (cap < len) len else cap;
     const h: *SliceHeader = @ptrCast(@alignCast(g_gc.alloc(&slice_info) orelse fatal("out of memory")));
-    h.* = .{ .buf = allocSliceBuf(c), .len = len, .off = 0, .cap = c, .is_ref = is_ref };
+    h.* = .{ .buf = allocSliceBuf(c, is_ref != 0), .len = len, .off = 0, .cap = c, .is_ref = is_ref };
     return h;
 }
 
@@ -506,7 +523,7 @@ export fn bit_rt_slice_new(len: usize, cap: usize, is_ref: usize) callconv(.c) *
 export fn bit_rt_slice_append(h: *SliceHeader, word: u64) callconv(.c) *SliceHeader {
     if (h.len == h.cap) {
         const newcap = if (h.cap == 0) 1 else h.cap * 2;
-        const nb = allocSliceBuf(newcap);
+        const nb = allocSliceBuf(newcap, h.is_ref != 0);
         @memcpy(nb[0..h.len], (h.buf + h.off)[0..h.len]);
         h.buf = nb;
         h.off = 0;

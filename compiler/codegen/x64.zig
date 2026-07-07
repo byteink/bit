@@ -1182,7 +1182,8 @@ fn emitConstString(self: *Ctx, dst: u32, pool_idx: u32) !void {
 /// caller's live pointers in the stack map (`collectSafepoints`/`scanFuncFlags`
 /// count `gc_alloc` as a safepoint site so the slot exists).
 fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) !void {
-    const name = try ir.typeInfoSymbol(self.gpa, size, ptr_offsets);
+    const disc: u32 = @intFromEnum(self.f.valueType(@enumFromInt(dst)));
+    const name = try ir.typeInfoSymbol(self.gpa, disc, size, ptr_offsets);
     try self.owned_syms.append(self.gpa, name);
     const arg0: Reg = if (self.cc == .win64) .rcx else .rdi; // SysV rdi / Win64 rcx
     try self.movAbsReloc(arg0, name);
@@ -1205,7 +1206,8 @@ const closure_cell_ptr_offsets = [_]u32{8};
 /// `emitGcAlloc`), then store the target function's address at +0 and the
 /// already-materialized environment pointer at +8.
 fn emitMakeClosure(self: *Ctx, dst: u32, func: ir.FuncId, env: ir.ValueId) !void {
-    const ti = try ir.typeInfoSymbol(self.gpa, closure_cell_size, &closure_cell_ptr_offsets);
+    const disc: u32 = @intFromEnum(self.f.valueType(@enumFromInt(dst)));
+    const ti = try ir.typeInfoSymbol(self.gpa, disc, closure_cell_size, &closure_cell_ptr_offsets);
     try self.owned_syms.append(self.gpa, ti);
     const arg0: Reg = if (self.cc == .win64) .rcx else .rdi;
     try self.movAbsReloc(arg0, ti);
@@ -1243,6 +1245,38 @@ fn emitCallValue(self: *Ctx, dst: u32, ty: TypeId, callee: ir.ValueId, args: []c
     try marshalArgs(self, args, 1, 1, 0);
     const arg0: Reg = if (self.cc == .win64) .rcx else .rdi;
     try self.movRR(arg0, scratch2);
+    if (self.cc == .win64) try self.rspAddSub(true, 32);
+    try self.callReg(scratch3);
+    self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
+    self.next_safepoint_idx += 1;
+    if (self.cc == .win64) try self.rspAddSub(false, 32);
+    if (self.tctx().typeOf(ty) != .void) switch (classOf(self.tctx(), ty)) {
+        .int => try putInt(self, dst, .rax),
+        .float => try putFloat(self, dst, .xmm0),
+    };
+}
+
+/// `call_iface`: structural interface dispatch (ABI.md §2.1). Load the receiver
+/// object's `TypeInfo` (`*(recv - 32)`, the header's `info` field), resolve the
+/// method id to a code address via `bit_rt_iface_lookup`, then call it with the
+/// receiver as arg0. The lookup itself never collects, so only the final
+/// (indirect) method call records a safepoint — like `emitCallValue`. The
+/// receiver is reloaded from its vreg after the lookup call (its home is a
+/// callee-saved reg or spill slot, both surviving the call).
+fn emitCallIface(self: *Ctx, dst: u32, ty: TypeId, iface_val: ir.ValueId, method_id: u32, args: []const u32) CodegenError!void {
+    const recv = try getInt(self, vregOf(self, iface_val), scratch1);
+    try self.movLoad(scratch2, recv, null, 1, -32, 8, false); // r10 = info = *(recv - 32)
+    const arg0: Reg = if (self.cc == .win64) .rcx else .rdi;
+    const arg1: Reg = if (self.cc == .win64) .rdx else .rsi;
+    try self.movRR(arg0, scratch2);
+    try self.movRI(arg1, @intCast(method_id));
+    if (self.cc == .win64) try self.rspAddSub(true, 32);
+    try self.emitCallReloc("bit_rt_iface_lookup"); // rax = method code address
+    if (self.cc == .win64) try self.rspAddSub(false, 32);
+    try self.movRR(scratch3, .rax); // r12 = fn, survives arg marshaling (like emitCallValue)
+    try marshalArgs(self, args, 1, 1, 0);
+    const recv2 = try getInt(self, vregOf(self, iface_val), scratch1);
+    try self.movRR(arg0, recv2);
     if (self.cc == .win64) try self.rspAddSub(true, 32);
     try self.callReg(scratch3);
     self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
@@ -1788,7 +1822,7 @@ fn collectSafepoints(gpa: Allocator, f: *const ir.Function) Allocator.Error![]u3
         const end = blk.insts_start + blk.insts_len;
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
-                .call, .rt_call, .gc_alloc, .make_closure, .call_value => try out.append(gpa, @intCast(i)),
+                .call, .rt_call, .gc_alloc, .make_closure, .call_value, .call_iface => try out.append(gpa, @intCast(i)),
                 .jump => {
                     const j = f.decode(@enumFromInt(i)).jump;
                     if (@intFromEnum(j.target) <= bi) try out.append(gpa, @intCast(i));
@@ -1818,7 +1852,7 @@ fn scanFuncFlags(f: *const ir.Function) FuncFlags {
         const end = blk.insts_start + blk.insts_len;
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
-                .call, .rt_call, .gc_alloc, .make_closure, .call_value => flags.has_safepoints = true,
+                .call, .rt_call, .gc_alloc, .make_closure, .call_value, .call_iface => flags.has_safepoints = true,
                 .sdiv, .udiv, .srem, .urem => flags.needs_rax_rdx = true,
                 .shl, .ashr, .lshr => {
                     const b = f.decode(@enumFromInt(i)).bin;
@@ -1894,7 +1928,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .func_addr => try emitFuncAddr(self, dst, d.func_addr.func),
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
         .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
-        .call_iface => return error.UnsupportedConstruct,
+        .call_iface => try emitCallIface(self, dst, ty, d.call_iface.iface, d.call_iface.method_index, d.call_iface.args),
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
     }
 }

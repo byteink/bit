@@ -289,6 +289,10 @@ pub const Lowerer = struct {
     /// Linear-scanned (bounded by the program's total method count — see
     /// `lookupMethod`); built once by `buildMethodTable`.
     method_table: std.ArrayList(MethodEntry) = .empty,
+    /// Global method-name -> dense id, the interface-dispatch key (ABI.md §2.1).
+    /// Structural interfaces match by name, so a name is a sufficient dispatch
+    /// key. Assigned on first use, shared across every type and call site.
+    method_ids: std.StringHashMapUnmanaged(u32) = .{},
     layouts: std.AutoHashMapUnmanaged(u32, StructLayout) = .{},
     /// Closures are lowered lazily as their `arrow_fn` is encountered, mid-body.
     /// They cannot append straight into `out.funcs` — that would shift the
@@ -322,6 +326,15 @@ pub const Lowerer = struct {
             if (e.ty == ty and std.mem.eql(u8, e.name, name)) return e;
         }
         return null;
+    }
+
+    /// The global dispatch id for a method name, assigning the next dense id on
+    /// first use. `name` is source-backed (lives for the whole compile), so it
+    /// keys the map directly with no copy.
+    fn methodId(self: *Lowerer, name: []const u8) Allocator.Error!u32 {
+        const gop = try self.method_ids.getOrPut(self.gpa, name);
+        if (!gop.found_existing) gop.value_ptr.* = self.method_ids.count() - 1;
+        return gop.value_ptr.*;
     }
 
     fn structLayout(self: *Lowerer, ty: TypeId) Error!StructLayout {
@@ -571,6 +584,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     defer l.func_ids.deinit(gpa);
     defer l.inst_ids.deinit(gpa);
     defer l.method_table.deinit(gpa);
+    defer l.method_ids.deinit(gpa);
     defer {
         var it = l.layouts.valueIterator();
         while (it.next()) |lay| lay.deinit(gpa);
@@ -605,7 +619,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     // different types can reuse a method name), so their signature comes from
     // the receiver's method set and they get `FuncId`s after the instantiations.
     // `l.method_table` maps (receiver type, name) -> that id.
-    const MethodDecl = struct { module: ModuleId, file_idx: usize, decl: ast.Index, name: []const u8, shape: check.FuncShape };
+    const MethodDecl = struct { module: ModuleId, file_idx: usize, decl: ast.Index, name: []const u8, ty: TypeId, shape: check.FuncShape };
     var method_decls: std.ArrayList(MethodDecl) = .empty;
     defer method_decls.deinit(gpa);
     const method_base = base + ctx.instantiations.items.len;
@@ -631,9 +645,34 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
                 const method = bucket.get(name) orelse continue;
                 const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
                 try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result });
-                try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
+                try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .ty = recv_ty, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
             }
         }
+    }
+
+    // Per-type method tables (ABI.md §2.1) from Pass A3's (type, name -> fid)
+    // entries, one per distinct receiver type, each name assigned its global
+    // dispatch id. `call_iface` resolves through these at runtime.
+    {
+        var tables: std.ArrayList(ir.MethodTable) = .empty;
+        errdefer {
+            for (tables.items) |t| gpa.free(t.methods);
+            tables.deinit(gpa);
+        }
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .{};
+        defer seen.deinit(gpa);
+        for (l.method_table.items) |e0| {
+            const disc: u32 = @intFromEnum(e0.ty);
+            if ((try seen.getOrPut(gpa, disc)).found_existing) continue;
+            var methods: std.ArrayList(ir.MethodSlot) = .empty;
+            errdefer methods.deinit(gpa);
+            for (l.method_table.items) |e| {
+                if (@intFromEnum(e.ty) != disc) continue;
+                try methods.append(gpa, .{ .id = try l.methodId(e.name), .func = e.fid });
+            }
+            try tables.append(gpa, .{ .type_disc = disc, .methods = try methods.toOwnedSlice(gpa) });
+        }
+        l.out.method_tables = try tables.toOwnedSlice(gpa);
     }
 
     // Closures collected during Pass B are freed here only if lowering errors
@@ -672,7 +711,13 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     }
     for (method_decls.items) |m| {
         l.setModule(m.module);
-        const nm = try moduleQualified(gpa, m.module, root, m.name);
+        const base_nm = try moduleQualified(gpa, m.module, root, m.name);
+        defer gpa.free(base_nm);
+        // Disambiguate by receiver type: distinct types may share a method name
+        // (`area` on both Circle and Square), yet each needs a unique link symbol.
+        // Every reference resolves through the method's FuncId, so the exact
+        // spelling is free — it only has to be collision-proof.
+        const nm = try std.fmt.allocPrint(gpa, "{s}$t{d}", .{ base_nm, @intFromEnum(m.ty) });
         defer gpa.free(nm);
         const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, nm);
         try l.out.funcs.append(gpa, f);
@@ -1518,10 +1563,10 @@ const FnCtx = struct {
             const name = self.identText(k[1]);
             const data = self.ctx.typeOf(recv_ty);
             if (data == .interface) {
-                for (data.interface, 0..) |m, i| {
+                for (data.interface) |m| {
                     if (!std.mem.eql(u8, m.name, name)) continue;
                     const recv_val = try self.lowerExpr(k[0]);
-                    return .{ .iface = .{ .recv = recv_val, .method_index = @intCast(i), .result = m.result } };
+                    return .{ .iface = .{ .recv = recv_val, .method_index = try self.l.methodId(m.name), .result = m.result } };
                 }
                 return error.UnsupportedConstruct;
             }
@@ -2157,8 +2202,8 @@ const FnCtx = struct {
             return self.b.call(string_ty, entry.fid, &.{v});
         }
         if (data == .interface) {
-            for (data.interface, 0..) |m, i| {
-                if (std.mem.eql(u8, m.name, "show")) return self.b.callIface(string_ty, v, @intCast(i), &.{});
+            for (data.interface) |m| {
+                if (std.mem.eql(u8, m.name, "show")) return self.b.callIface(string_ty, v, try self.l.methodId(m.name), &.{});
             }
         }
         return error.UnsupportedConstruct;

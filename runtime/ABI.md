@@ -59,12 +59,14 @@ The compiler emits one static `TypeInfo` per distinct (monomorphized) type and
 passes a pointer to it at each allocation site (`bit_rt_gc_alloc`, §6).
 
 ```
-TypeInfo {                       // extern struct, 40 bytes, 8-aligned
+TypeInfo {                       // extern struct, 56 bytes, 8-aligned
     size            : usize      // body size in bytes, excluding the header
     ptr_offsets_ptr : [*]const usize  // -\ byte offsets of GC-ref fields
     ptr_offsets_len : usize           // -/ (ptr_offsets_ptr[0..ptr_offsets_len])
     name_ptr        : [*]const u8     // -\ static type name; debug/stats only
     name_len        : usize           // -/ (may be empty: name_len == 0)
+    methods_ptr     : [*]const Method // -\ this type's methods, for interface
+    methods_len     : usize           // -/  dispatch (§2.1; may be empty)
 }
 ```
 
@@ -74,7 +76,13 @@ writes this struct directly into an object file's `.rodata`, so its layout
 must be a frozen, language-neutral contract, not whichever in-memory shape
 happens to match Zig slices today. `runtime/gc.zig`'s `TypeInfo.of(size,
 ptr_offsets, name)` is the Zig-side convenience constructor tests use;
-codegen instead writes the four raw fields directly.
+codegen instead writes the raw fields directly.
+
+Because dispatch reads `methods` through the object's `info` pointer, a
+`TypeInfo` is now **per concrete type**, not per layout: two distinct types with
+identical `size`/`ptr_offsets` (e.g. `struct Circle { r: f64 }` and
+`struct Square { s: f64 }`) get separate `TypeInfo`s so their method sets stay
+distinct. Codegen keys the descriptor by the type's identity, not its layout.
 
 - `ptr_offsets` lists the byte offset, **within the body**, of every field that
   holds a GC reference. Non-reference fields (integers, floats, inline structs of
@@ -87,6 +95,35 @@ codegen instead writes the four raw fields directly.
 
 The runtime traces an object by reading a reference at `body + offset` for each
 entry and marking it. That is the entire precision contract for the heap.
+
+### 2.1 Method table (interface dispatch)
+
+`methods` lists every method the concrete type defines, for structural
+interface dispatch (SPEC §14). Each entry is:
+
+```
+Method {                         // extern struct, 16 bytes, 8-aligned
+    id  : u64                    // global method id (§ below); 0-extended u32
+    fn  : *const anyopaque       // the method's code address (.text)
+}
+```
+
+- **Method id.** The compiler assigns every distinct method *name* a stable
+  dense `u32` id, shared program-wide. Interfaces are structural and matched by
+  the checker on name+signature, so a name uniquely identifies the method within
+  any one type (a type can't declare two methods of the same name), which makes
+  the name id a sufficient dispatch key.
+- Each method's `fn` takes the receiver (the object body pointer) as its leading
+  argument, then the call's own arguments — identical to a static method call.
+- Entries are unordered; `methods_len` may be 0 (a type with no methods).
+
+Dispatch (`call_iface value.id(args)`): the callee loads
+`info = *(value - 32)` (the header's `info` field, §1), then
+`fn = bit_rt_iface_lookup(info, id)` (§9), then calls `fn(value, args...)`.
+`bit_rt_iface_lookup` linearly scans `info.methods` for `id` — types have few
+methods, so this is a short, allocation-free walk — and returns the code
+address. The checker guarantees the receiver satisfies the interface, so the id
+is always present; a miss is a compiler bug and traps.
 
 A **closure value** is one such object: `gc_alloc`'d, a fixed 16-byte
 `{ code_ptr, env_ptr }` cell (`TypeInfo{ size = 16, ptr_offsets = [8] }`). The
@@ -110,9 +147,11 @@ reference. Elements are **one word each** (the same word model channels use,
 reference stored. The runtime owns construction/growth/bounds-checked
 access/reslicing via `bit_rt_slice_new/append/get/set/slice` (§9); `len(s)` reads
 the header word directly (`slice_len`, offset 8, shared with the `string`
-header). The element buffer is a leaf today — scanning its `is_ref` words as
-roots is deferred to the safepoint/stack-map work (#1106); the header already
-keeps the buffer itself alive.
+header). When `is_ref`, the element buffer carries the `ref_array_info`
+descriptor (§2) and the collector traces every word of its (dynamically sized)
+body as a root — so objects reachable only through a slice survive collection.
+A non-ref buffer stays a leaf. The header keeps the buffer itself alive via its
+`ptr_offsets = [0]`.
 
 ---
 
@@ -352,6 +391,7 @@ fallible surface form), so codegen never checks a return value.
 | Symbol               | Signature                                              |
 |-----------------------|--------------------------------------------------------|
 | `bit_rt_gc_alloc`     | `(info: *const TypeInfo) -> *u8` (§6)                  |
+| `bit_rt_iface_lookup` | `(info: *const TypeInfo, id: u64) -> *const anyopaque` (§2.1) |
 | `bit_rt_safepoint`    | `() -> void` (§6)                                      |
 | `bit_rt_spawn`        | `(fn_ptr: TaskFn, arg: ?*anyopaque) -> void`            |
 | `bit_rt_chan_make`    | `(capacity: usize, is_ref: bool) -> *anyopaque` (§11)  |
