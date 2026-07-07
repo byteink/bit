@@ -654,7 +654,7 @@ fn buildSnapshot(gpa: Allocator, io: Io, dir_abs: []const u8, overlays: *const s
 
     var no_imports: resolve.ImportTable = .{};
     defer no_imports.deinit(gpa);
-    snap.module = try resolve.resolveModule(gpa, &snap.diags, snap.files, &no_imports, &.{});
+    snap.module = try resolve.resolveModule(gpa, &snap.diags, snap.files, &no_imports, &.{}, null);
     snap.resolved = true;
     if (snap.diags.hasErrors()) return snap;
 

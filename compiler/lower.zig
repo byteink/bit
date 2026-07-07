@@ -544,7 +544,7 @@ pub const Lowerer = struct {
 /// be the outputs of `resolve.resolveModule` and `check.checkModule` over the
 /// same `files`.
 pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile, checked: *const check.CheckedModule, rmodule: *const resolve.Module) Error!ir.Module {
-    return lowerProject(gpa, ctx, &.{.{ .files = files, .checked = checked, .rmodule = rmodule }});
+    return lowerProject(gpa, ctx, &.{.{ .files = files, .checked = checked, .rmodule = rmodule }}, @enumFromInt(0));
 }
 
 /// Lowers a whole program — the root module and every module it transitively
@@ -553,8 +553,9 @@ pub fn lowerModule(gpa: Allocator, ctx: *TypeContext, files: []const ModuleFile,
 /// call is an ordinary direct call; the shared, module-qualified `ctx` tables
 /// (`func_sigs`, `instantiations`, `decl_generics`, `decl_memo`) supply every
 /// module's signatures. `modules[0]` is the root (its `main` is the entry).
-pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleInput) Error!ir.Module {
+pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleInput, root: ModuleId) Error!ir.Module {
     std.debug.assert(modules.len >= 1);
+    std.debug.assert(@intFromEnum(root) < modules.len);
     var l: Lowerer = .{
         .gpa = gpa,
         .ctx = ctx,
@@ -649,7 +650,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     for (direct_syms.items) |gsym| {
         l.setModule(gsym.module);
         const sym = l.rmodule.symbols.items[@intFromEnum(gsym.id)];
-        const nm = try moduleQualified(gpa, gsym.module, sym.name);
+        const nm = try moduleQualified(gpa, gsym.module, root, sym.name);
         defer gpa.free(nm);
         const f = try l.lowerFunction(gsym, &.{}, nm);
         try l.out.funcs.append(gpa, f);
@@ -659,7 +660,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
         const env = try l.buildGenericEnv(inst);
         defer gpa.free(env);
         const sym = l.rmodule.symbols.items[@intFromEnum(inst.generic.id)];
-        const nm = if (@intFromEnum(inst.generic.module) == 0)
+        const nm = if (inst.generic.module == root)
             try std.fmt.allocPrint(gpa, "{s}${d}", .{ sym.name, i })
         else
             try std.fmt.allocPrint(gpa, "m{d}${s}${d}", .{ @intFromEnum(inst.generic.module), sym.name, i });
@@ -669,7 +670,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     }
     for (method_decls.items) |m| {
         l.setModule(m.module);
-        const nm = try moduleQualified(gpa, m.module, m.name);
+        const nm = try moduleQualified(gpa, m.module, root, m.name);
         defer gpa.free(nm);
         const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, nm);
         try l.out.funcs.append(gpa, f);
@@ -684,14 +685,14 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     return l.out;
 }
 
-/// The link-level symbol name for a function `base` declared in module `module`.
-/// Module 0 (the root) keeps the bare name (so `main` stays `main` and the
-/// single-module path is byte-identical); every imported module gets an
-/// `m<id>$` prefix so two modules' same-named functions never collide. Always
-/// returns an owned copy — `FunctionBuilder.finish` dupes it, so the caller
-/// frees this immediately after lowering.
-fn moduleQualified(gpa: Allocator, module: ModuleId, base: []const u8) Allocator.Error![]u8 {
-    if (@intFromEnum(module) == 0) return gpa.dupe(u8, base);
+/// The link-level symbol name for a function `base` declared in `module`. The
+/// root module keeps the bare name (so `main` stays `main` and the single-module
+/// path is byte-identical); every imported module gets an `m<id>$` prefix so two
+/// modules' same-named functions never collide. Always returns an owned copy —
+/// `FunctionBuilder.finish` dupes it, so the caller frees this immediately after
+/// lowering.
+fn moduleQualified(gpa: Allocator, module: ModuleId, root: ModuleId, base: []const u8) Allocator.Error![]u8 {
+    if (module == root) return gpa.dupe(u8, base);
     return std.fmt.allocPrint(gpa, "m{d}${s}", .{ @intFromEnum(module), base });
 }
 
@@ -2348,7 +2349,7 @@ fn lowerSource(gpa: Allocator, source: []const u8) !struct { module: ir.Module, 
     defer no_imports.deinit(gpa);
     const files = [_]ModuleFile{mf};
 
-    var rmodule = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+    var rmodule = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
     defer rmodule.deinit();
     try testing.expect(!diags.hasErrors());
 

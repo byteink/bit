@@ -177,6 +177,9 @@ const Resolver = struct {
     files: []const ModuleFile,
     imports: *const ImportTable,
     all_modules: []const Module,
+    /// The prelude module whose exports are auto-imported into this module
+    /// (`std/core`), or null when there is none / this *is* the prelude.
+    prelude: ?ModuleId,
 
     symbols: std.ArrayList(Symbol) = .empty,
     scopes: std.ArrayList(Scope) = .empty,
@@ -191,8 +194,9 @@ const Resolver = struct {
         files: []const ModuleFile,
         imports: *const ImportTable,
         all_modules: []const Module,
+        prelude: ?ModuleId,
     ) Error!Resolver {
-        var r = Resolver{ .gpa = gpa, .diags = diags, .files = files, .imports = imports, .all_modules = all_modules };
+        var r = Resolver{ .gpa = gpa, .diags = diags, .files = files, .imports = imports, .all_modules = all_modules, .prelude = prelude };
         // Index 0 is the reserved `.none` sentinel, matching `ast.Tree`.
         try r.symbols.append(gpa, .{ .name = "", .kind = .poison });
 
@@ -275,6 +279,28 @@ const Resolver = struct {
 
     fn unwrapExport(mf: ModuleFile, idx: ast.Index) ast.Index {
         return if (mf.tree.get(idx).tag == .@"export") mf.tree.kids(idx)[0] else idx;
+    }
+
+    /// Auto-imports the prelude module's exports into this module's flat scope
+    /// (SPEC §17 — a prelude), as if each were an explicit `import { name } from
+    /// "std/core"`. Runs after the module's own top-level declarations, so a
+    /// name the user declares (or explicitly imports) shadows the prelude rather
+    /// than colliding with it — the injected binding is simply skipped. No-op
+    /// when there is no prelude (the prelude module itself, or a std-less build).
+    fn injectPrelude(self: *Resolver) Error!void {
+        const pid = self.prelude orelse return;
+        const pmod = self.all_modules[@intFromEnum(pid)];
+        var it = pmod.exports.iterator();
+        while (it.next()) |e| {
+            const name = e.key_ptr.*;
+            if (self.scope(self.module_scope).names.contains(name)) continue; // user name wins
+            const id = try self.newSymbol(.{
+                .name = name,
+                .kind = .import_item,
+                .imported_from = .{ .module = pid, .symbol = e.value_ptr.* },
+            });
+            try self.scope(self.module_scope).names.put(self.gpa, name, id);
+        }
     }
 
     fn emit(
@@ -911,10 +937,12 @@ pub fn resolveModule(
     files: []const ModuleFile,
     imports: *const ImportTable,
     all_modules: []const Module,
+    prelude: ?ModuleId,
 ) !Module {
-    var r = try Resolver.init(gpa, diags, files, imports, all_modules);
+    var r = try Resolver.init(gpa, diags, files, imports, all_modules, prelude);
     defer r.deinitTemp();
     try r.collectTopLevel();
+    try r.injectPrelude(); // after the module's own decls, so user names shadow it
     try r.checkTypeCycles();
     try r.resolveBodies();
     return r.intoModule();
@@ -932,10 +960,21 @@ pub const LoadedProject = struct {
     trees: std.ArrayList(*ast.Tree) = .empty,
     sources: std.ArrayList([]u8) = .empty,
     modules: std.ArrayList(Module) = .empty,
+    /// The `ModuleFile` list of each module, parallel to `modules` (indexed by
+    /// `ModuleId`) — the check/lower stages need them after resolution. Each
+    /// slice is owned here; its `source`/`tree` members point into
+    /// `sources`/`trees`.
+    module_files: std.ArrayList([]ModuleFile) = .empty,
+    /// The module `bit build` was invoked on — its `main` is the entry point.
+    /// Modules load in dependency order (imports first), so the root is loaded
+    /// last and is not necessarily module 0.
+    root: ModuleId = @enumFromInt(0),
 
     pub fn deinit(self: *LoadedProject) void {
         for (self.modules.items) |*m| m.deinit();
         self.modules.deinit(self.gpa);
+        for (self.module_files.items) |mf| self.gpa.free(mf);
+        self.module_files.deinit(self.gpa);
         for (self.trees.items) |t| {
             t.deinit();
             self.gpa.destroy(t);
@@ -962,6 +1001,14 @@ const Loader = struct {
     diags: *Diagnostics,
     sm: *diagnostics.SourceManager,
     project: *LoadedProject,
+    /// Absolute directory the `std/*` import prefix maps into (the shipped
+    /// stdlib root), or null when no stdlib is available — then `std/*` imports
+    /// resolve as `not_found`, same as before a stdlib existed.
+    std_root: ?[]const u8 = null,
+    /// The prelude module (`std/core`) once loaded, whose exports every
+    /// subsequently-loaded module auto-imports. Null while loading the prelude
+    /// itself (so it doesn't import itself) and when no stdlib is present.
+    prelude: ?ModuleId = null,
     /// Canonical directory path -> its fully resolved module.
     resolved: std.StringHashMapUnmanaged(ModuleId) = .{},
     /// Canonical directory paths currently being loaded (the recursion
@@ -1031,19 +1078,32 @@ const Loader = struct {
             }
         }
 
-        const result = try resolveModule(self.gpa, self.diags, files.items, &import_table, self.project.modules.items);
+        const result = try resolveModule(self.gpa, self.diags, files.items, &import_table, self.project.modules.items, self.prelude);
         const id: ModuleId = @enumFromInt(self.project.modules.items.len);
         try self.project.modules.append(self.gpa, result);
+        // Store this module's files parallel to `modules` (same index) so the
+        // check/lower stages can reach them by `ModuleId`. Ownership moves here.
+        std.debug.assert(self.project.module_files.items.len == @intFromEnum(id));
+        try self.project.module_files.append(self.gpa, try files.toOwnedSlice(self.gpa));
         try self.resolved.put(self.gpa, canon, id);
         return .{ .id = id };
     }
 
+    /// Resolves an import path string to a module directory and loads it. A
+    /// `std/<pkg>` path maps into the shipped stdlib root (`std_root`); a `./`
+    /// or `../` path is project-relative to the importing module's directory.
+    /// Anything else (a bare package name with no std root) is `not_found`.
     fn resolveImportPath(self: *Loader, from_dir: []const u8, path_text: []const u8) anyerror!ImportResolution {
-        // No standard-library search path exists yet (stdlib ships in a later
-        // task); only project-relative imports resolve for now.
-        if (!std.mem.startsWith(u8, path_text, "./") and !std.mem.startsWith(u8, path_text, "../")) return .not_found;
         const arena = self.project.path_arena.allocator();
-        const target_dir = try std.fs.path.join(arena, &.{ from_dir, path_text });
+        var target_dir: []const u8 = undefined;
+        if (std.mem.startsWith(u8, path_text, "std/")) {
+            const std_root = self.std_root orelse return .not_found;
+            target_dir = try std.fs.path.join(arena, &.{ std_root, path_text["std/".len..] });
+        } else if (std.mem.startsWith(u8, path_text, "./") or std.mem.startsWith(u8, path_text, "../")) {
+            target_dir = try std.fs.path.join(arena, &.{ from_dir, path_text });
+        } else {
+            return .not_found;
+        }
         return switch (try self.loadModule(target_dir)) {
             .id => |m| .{ .ok = m },
             .cycle => .cycle,
@@ -1069,18 +1129,37 @@ fn insertionSort(items: [][]const u8) void {
 /// Loads and resolves every module reachable from `root_dir_abs` (an absolute
 /// path), recursing into relatively-imported directories in dependency order.
 /// Diagnostics from every stage (lex/parse/resolve) accumulate in `diags`.
+/// `std_root` (absolute) is where `std/*` imports resolve; pass null when no
+/// stdlib ships with this build (then `std/*` imports are `not_found`).
 pub fn loadProject(
     gpa: Allocator,
     io: Io,
     diags: *Diagnostics,
     sm: *diagnostics.SourceManager,
     root_dir_abs: []const u8,
+    std_root: ?[]const u8,
 ) !LoadedProject {
     var project = LoadedProject{ .gpa = gpa, .path_arena = std.heap.ArenaAllocator.init(gpa) };
     errdefer project.deinit();
-    var loader = Loader{ .gpa = gpa, .io = io, .diags = diags, .sm = sm, .project = &project };
+    var loader = Loader{ .gpa = gpa, .io = io, .diags = diags, .sm = sm, .project = &project, .std_root = std_root };
     defer loader.deinit();
-    _ = try loader.loadModule(root_dir_abs);
+
+    // Load the prelude module (`std/core`) first, if a stdlib is present, so its
+    // exports auto-import into every module loaded afterward. Its own load sees
+    // `loader.prelude == null`, so it does not import itself. A missing prelude
+    // is not an error — programs then only see the builtins.
+    if (std_root) |sr| {
+        const core_dir = try std.fs.path.join(project.path_arena.allocator(), &.{ sr, "core" });
+        switch (try loader.loadModule(core_dir)) {
+            .id => |m| loader.prelude = m,
+            .cycle, .not_found => {},
+        }
+    }
+
+    switch (try loader.loadModule(root_dir_abs)) {
+        .id => |m| project.root = m,
+        .cycle, .not_found => {}, // diagnostics already emitted; root stays 0
+    }
     return project;
 }
 
@@ -1106,7 +1185,7 @@ fn resolveSource(gpa: Allocator, source: []const u8) !struct { text: []u8, faile
     var imports: ImportTable = .{};
     defer imports.deinit(gpa);
     const files = [_]ModuleFile{.{ .file = file, .source = source, .tree = &tree }};
-    var mod = try resolveModule(gpa, &diags, &files, &imports, &.{});
+    var mod = try resolveModule(gpa, &diags, &files, &imports, &.{}, null);
     defer mod.deinit();
 
     var rendered: Io.Writer.Allocating = .init(gpa);
@@ -1213,7 +1292,7 @@ test "cross-module import resolves an exported symbol" {
     var no_imports: ImportTable = .{};
     defer no_imports.deinit(gpa);
     const util_files = [_]ModuleFile{.{ .file = util_file, .source = util_src, .tree = &util_tree }};
-    var util_mod = try resolveModule(gpa, &diags, &util_files, &no_imports, &.{});
+    var util_mod = try resolveModule(gpa, &diags, &util_files, &no_imports, &.{}, null);
     defer util_mod.deinit();
     try testing.expect(!diags.hasErrors());
     try testing.expect(util_mod.exports.contains("add"));
@@ -1230,7 +1309,7 @@ test "cross-module import resolves an exported symbol" {
     defer imports.deinit(gpa);
     try imports.put(gpa, "./util", .{ .ok = @enumFromInt(0) });
     const main_files = [_]ModuleFile{.{ .file = main_file, .source = main_src, .tree = &main_tree }};
-    var main_mod = try resolveModule(gpa, &diags, &main_files, &imports, &all_modules);
+    var main_mod = try resolveModule(gpa, &diags, &main_files, &imports, &all_modules, null);
     defer main_mod.deinit();
 
     try testing.expect(!diags.hasErrors());
@@ -1253,7 +1332,7 @@ test "importing an unexported name is rejected" {
     var no_imports: ImportTable = .{};
     defer no_imports.deinit(gpa);
     const util_files = [_]ModuleFile{.{ .file = util_file, .source = util_src, .tree = &util_tree }};
-    var util_mod = try resolveModule(gpa, &diags, &util_files, &no_imports, &.{});
+    var util_mod = try resolveModule(gpa, &diags, &util_files, &no_imports, &.{}, null);
     defer util_mod.deinit();
 
     const all_modules = [_]Module{util_mod};
@@ -1267,7 +1346,7 @@ test "importing an unexported name is rejected" {
     defer imports.deinit(gpa);
     try imports.put(gpa, "./util", .{ .ok = @enumFromInt(0) });
     const main_files = [_]ModuleFile{.{ .file = main_file, .source = main_src, .tree = &main_tree }};
-    var main_mod = try resolveModule(gpa, &diags, &main_files, &imports, &all_modules);
+    var main_mod = try resolveModule(gpa, &diags, &main_files, &imports, &all_modules, null);
     defer main_mod.deinit();
 
     try testing.expect(diags.hasErrors());
@@ -1296,7 +1375,7 @@ test "an import cycle is reported, not an infinite loop" {
     defer imports.deinit(gpa);
     try imports.put(gpa, "./self", .cycle);
     const files = [_]ModuleFile{.{ .file = file, .source = src, .tree = &tree }};
-    var mod = try resolveModule(gpa, &diags, &files, &imports, &.{});
+    var mod = try resolveModule(gpa, &diags, &files, &imports, &.{}, null);
     defer mod.deinit();
 
     try testing.expect(diags.hasErrors());

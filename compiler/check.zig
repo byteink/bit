@@ -3915,7 +3915,7 @@ test "collectDecls builds a struct's field types" {
     var no_imports: resolve.ImportTable = .{};
     defer no_imports.deinit(gpa);
     const files = [_]ModuleFile{mf};
-    var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+    var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
     defer module.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -3951,7 +3951,7 @@ test "constEval folds literals, unary, binary, and const references" {
     var no_imports: resolve.ImportTable = .{};
     defer no_imports.deinit(gpa);
     const files = [_]ModuleFile{mf};
-    var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+    var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
     defer module.deinit();
 
     var ctx = try TypeContext.init(gpa);

@@ -115,6 +115,11 @@ fn libbitrtPath(target: BuildTarget) []const u8 {
     };
 }
 
+/// Where `std/*` imports resolve, relative to the cwd. // ponytail: fixed
+/// dev-build path (matches `libbitrtPath`'s own note); resolve relative to the
+/// `bit` binary's install prefix + honor an env override once packaging lands.
+const stdlib_dir = "stdlib";
+
 /// `bit build <file.bit> [-o out]` / `bit run <file.bit>`: the full pipeline to
 /// a native binary. Returns the exit code to propagate — 0 after a build, the
 /// program's own exit code after a run. Compile diagnostics go to `err_out`;
@@ -147,15 +152,6 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
         return 2;
     };
 
-    const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
-    defer {
-        for (inputs) |f| {
-            gpa.free(f.path);
-            gpa.free(f.source);
-        }
-        gpa.free(inputs);
-    }
-
     const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch |e| {
         try err_out.print("bit: runtime archive {s}: {s} (set BIT_LIBBITRT)\n", .{ libbitrtPath(target), @errorName(e) });
         return 1;
@@ -165,7 +161,35 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     // The object identifier / default output name is the module's own name: the
     // directory's basename for a directory module, or the file stem otherwise —
     // `stem` yields both ("examples/countdown" -> "countdown", "a.bit" -> "a").
-    const exe = (try buildModule(gpa, inputs, std.fs.path.stem(src), lib, target, err_out)) orelse return 1;
+    const ident = std.fs.path.stem(src);
+
+    // A directory is a module that may import others (relative + std) and gets
+    // the prelude, so it goes through the whole-project pipeline; a lone file is
+    // a single self-contained module built directly.
+    const stat = Io.Dir.cwd().statFile(io, src, .{}) catch |e| {
+        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
+        return 1;
+    };
+    var exe: []u8 = undefined;
+    if (stat.kind == .directory) {
+        const root_abs = try absFromCwd(gpa, io, src);
+        defer gpa.free(root_abs);
+        // Best-effort: a build without a stdlib checkout still works (std/*
+        // imports then error cleanly); only a real stdlib dir enables them.
+        const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+        defer if (std_root) |s| gpa.free(s);
+        exe = (try buildProject(gpa, io, root_abs, std_root, ident, lib, target, err_out)) orelse return 1;
+    } else {
+        const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
+        defer {
+            for (inputs) |f| {
+                gpa.free(f.path);
+                gpa.free(f.source);
+            }
+            gpa.free(inputs);
+        }
+        exe = (try buildModule(gpa, inputs, ident, lib, target, err_out)) orelse return 1;
+    }
     defer gpa.free(exe);
 
     // `bit run` on a binary this host can exec runs it and throws it away, like
@@ -303,11 +327,89 @@ pub fn buildHostModule(gpa: std.mem.Allocator, io: Io, path: []const u8, libbitr
     return buildModule(gpa, inputs, std.fs.path.stem(path), libbitrt, host_target, err_out);
 }
 
+/// Whole-project build for the host target — the entry the imports/prelude
+/// harness uses so it exercises the real multi-module pipeline (`loadProject` +
+/// per-module check + `lowerProject`). `root_abs`/`std_root` must be absolute
+/// (`std_root` null for no stdlib). Returns `null` (diagnostics to `err_out`) on
+/// any front-end error.
+pub fn buildHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
+    return buildProject(gpa, io, root_abs, std_root, ident, libbitrt, host_target, err_out);
+}
+
 /// Single-file convenience entry (the golden `// run` harness uses this): one
 /// buffer, one module. Delegates to `buildModule`.
 fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
     const one = [_]SrcFile{.{ .path = path, .source = source }};
     return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, target, err_out);
+}
+
+/// Absolute path of `rel` (an existing file/dir) resolved against the process
+/// cwd. Callers own the result. `loadProject` and the `std/*` root both need
+/// absolute paths (the module loader uses `openDirAbsolute`); the CLI hands us
+/// cwd-relative paths. Errors if `rel` does not exist.
+fn absFromCwd(gpa: std.mem.Allocator, io: Io, rel: []const u8) ![]u8 {
+    const abs = try Io.Dir.cwd().realPathFileAlloc(io, rel, gpa);
+    defer gpa.free(abs);
+    return gpa.dupe(u8, abs);
+}
+
+/// Builds a whole project — a root module directory plus every module it
+/// imports (relative `./` and `std/*`) — into a native executable. Loads the
+/// import graph (`resolve.loadProject`), type-checks every module in dependency
+/// order into one shared `TypeContext`, lowers the whole graph into one
+/// `ir.Module` (`lower.lowerProject`), then codegens + links. `root_abs` and
+/// `std_root` must be absolute (or `std_root` null for no stdlib). Returns
+/// `null` (diagnostics rendered to `err_out`) on any front-end error.
+pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root);
+    defer project.deinit();
+    if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
+
+    const n = project.modules.items.len;
+    std.debug.assert(n >= 1);
+
+    // Check every module in dependency order (loaded imports-first, so index
+    // order suffices) into one shared TypeContext — cross-module type info
+    // accumulates as module-qualified keys the lowerer then reads.
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const checked = try gpa.alloc(check.CheckedModule, n);
+    var checked_built: usize = 0;
+    defer {
+        for (checked[0..checked_built]) |*c| c.deinit();
+        gpa.free(checked);
+    }
+    for (0..n) |i| {
+        checked[i] = try check.checkModule(gpa, &diags, &ctx, project.module_files.items[i], &project.modules.items[i], @enumFromInt(i), project.modules.items, false);
+        checked_built += 1;
+        if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
+    }
+
+    const inputs = try gpa.alloc(lower.ModuleInput, n);
+    defer gpa.free(inputs);
+    for (0..n) |i| inputs[i] = .{ .files = project.module_files.items[i], .checked = &checked[i], .rmodule = &project.modules.items[i] };
+
+    var module = try lower.lowerProject(gpa, &ctx, inputs, project.root);
+    defer module.deinit();
+    try opt.optimizeModule(gpa, &module, .o1);
+
+    switch (target) {
+        .x86_64_linux => {
+            const object = try emit.emitObject(gpa, &module);
+            defer gpa.free(object);
+            return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+        },
+        .aarch64_macos => {
+            const object = try emit.emitMachoObject(gpa, &module);
+            defer gpa.free(object);
+            return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
+        },
+    }
 }
 
 /// Drives a module's source files through the whole compiler — front-end
@@ -346,7 +448,7 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
 
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
-    var rmodule = try resolve.resolveModule(gpa, &diags, files, &no_imports, &.{});
+    var rmodule = try resolve.resolveModule(gpa, &diags, files, &no_imports, &.{}, null);
     defer rmodule.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
@@ -478,7 +580,7 @@ pub fn compileReport(gpa: std.mem.Allocator, path: []const u8, source: []const u
         defer no_imports.deinit(gpa);
         const files = [_]resolve.ModuleFile{mf};
 
-        var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+        var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
         defer module.deinit();
         if (diags.hasErrors()) break :resolve_and_check;
 
@@ -518,7 +620,7 @@ pub fn typesReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8)
         defer no_imports.deinit(gpa);
         const files = [_]resolve.ModuleFile{mf};
 
-        var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{});
+        var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
         defer module.deinit();
         if (diags.hasErrors()) break :resolve_and_check;
 

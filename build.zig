@@ -276,6 +276,25 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.addTest(.{ .root_module = stress_mod });
     test_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
+    // Multi-module imports + prelude guard (#1153): builds + runs each
+    // tests/imports/* program through the whole-project pipeline (relative and
+    // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is
+    // where `std/*` resolves; `imports_dir` holds the programs.
+    const imports_opts = b.addOptions();
+    imports_opts.addOption([]const u8, "imports_dir", b.pathFromRoot("tests/imports"));
+    imports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+
+    const imports_mod = b.createModule(.{
+        .root_source_file = b.path("tests/imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    imports_mod.addImport("bitc", exe.root_module);
+    imports_mod.addOptions("build_options", imports_opts);
+
+    const imports_tests = b.addTest(.{ .root_module = imports_mod });
+    test_step.dependOn(&b.addRunArtifact(imports_tests).step);
+
     // Fuzz harness (task #334): lexer+parser must never crash/hang on
     // arbitrary bytes. Two separate compilations of fuzz.zig, because
     // `-ffuzz` instrumentation changes runtime behavior, not just codegen:
@@ -435,4 +454,8 @@ pub fn build(b: *std.Build) void {
     // Same archive for the stress suite.
     stress_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
     if (host_libbitrt_install) |inst| stress_tests.step.dependOn(inst);
+
+    // Same archive for the imports/prelude guard.
+    imports_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
+    if (host_libbitrt_install) |inst| imports_tests.step.dependOn(inst);
 }
