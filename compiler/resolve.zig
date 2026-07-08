@@ -718,6 +718,10 @@ const Resolver = struct {
         for (mf.tree.kids(k[1])) |arm_idx| {
             const ak = mf.tree.kids(arm_idx); // [variant_pat, body]
             const arm_scope = try self.pushScope(scope_id);
+            const vk = mf.tree.kids(ak[0]); // variant_pat: [name, binders_or_none]
+            if (vk[1] != ast.none) {
+                for (mf.tree.kids(vk[1])) |b| _ = try self.activateLocal(file_idx, b, .let_binding, arm_scope);
+            }
             try self.resolveNode(file_idx, ak[1], arm_scope);
         }
     }

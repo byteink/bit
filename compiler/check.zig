@@ -147,9 +147,18 @@ pub const Field = struct { name: []const u8, ty: TypeId, exported: bool };
 /// declaring enum's `variants` list.
 pub const Variant = struct { name: []const u8, payload: []const TypeId };
 
-/// A nominal enum type (§14.4): identity is the declaring symbol, NOT the
+/// A nominal enum type (§14.7): identity is the declaring symbol, NOT the
 /// variant list, so two `enum`s with identical variants are distinct types.
 pub const EnumType = struct { decl: GlobalSymbol, variants: []const Variant };
+
+/// True iff any variant carries a payload — then a value is a boxed
+/// `{tag, payloadPtr}` object (a GC ref); otherwise it is a bare tag word.
+pub fn enumBoxed(e: EnumType) bool {
+    for (e.variants) |v| {
+        if (v.payload.len > 0) return true;
+    }
+    return false;
+}
 
 /// A method signature. Shared shape for interface method sets (part of type
 /// identity, §14.1) and struct/alias method sets (not part of identity —
@@ -2430,6 +2439,18 @@ const Checker = struct {
             }
         }
 
+        // `EnumName.Variant(args)` — constructing a payload-carrying variant.
+        if (mf.tree.get(callee).tag == .member) {
+            const mk = mf.tree.kids(callee); // [recv, name]
+            if (mf.tree.get(mk[0]).tag == .ident) {
+                if (self.nodeSymbol(file_idx, mk[0])) |gs| {
+                    if (self.symbolOf(gs).kind == .enum_type) {
+                        return self.checkVariantConstruction(file_idx, node, gs, env, fctx);
+                    }
+                }
+            }
+        }
+
         const callee_ty = try self.checkExpr(file_idx, callee, env, fctx, .invalid);
         if (self.ctx.typeOf(callee_ty) != .func) {
             if (callee_ty != .invalid) try self.emit(mf, callee, .not_callable, "value is not callable", .{}, null);
@@ -2532,6 +2553,41 @@ const Checker = struct {
             }
         }
         try self.emit(mf, k[1], .unknown_member, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, name }, null);
+        return .invalid;
+    }
+
+    /// `EnumName.Variant(args)` — construct a payload-carrying variant. The
+    /// arguments are checked against the variant's payload types (arity + each
+    /// type); the result is the enum. The callee `member` node is typed as the
+    /// enum so lowering can recover the variant.
+    fn checkVariantConstruction(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node); // [callee(member), type_args, args]
+        const mk = mf.tree.kids(k[0]); // member: [recv, name]
+        const vname = Checker.identText(mf, mk[1]);
+        const arg_items = mf.tree.kids(k[2]);
+        const enum_ty = try self.declTypeOf(enum_sym);
+        const data = self.ctx.typeOf(enum_ty);
+        if (data != .@"enum") {
+            try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+            return .invalid;
+        }
+        self.setType(file_idx, k[0], enum_ty);
+        for (data.@"enum".variants) |v| {
+            if (!std.mem.eql(u8, v.name, vname)) continue;
+            if (arg_items.len != v.payload.len) {
+                try self.emit(mf, node, .arg_count_mismatch, "variant '{s}' takes {d} argument(s), found {d}", .{ vname, v.payload.len, arg_items.len }, null);
+            }
+            for (arg_items, 0..) |a, i| {
+                const inner = mf.tree.kids(a)[0];
+                const want: TypeId = if (i < v.payload.len) v.payload[i] else .invalid;
+                const got = try self.checkExpr(file_idx, inner, env, fctx, want);
+                if (want != .invalid) try self.expect(file_idx, inner, got, want);
+            }
+            return enum_ty;
+        }
+        try self.emit(mf, mk[1], .unknown_variant, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, vname }, null);
+        try self.checkArgsLoose(file_idx, arg_items, env, fctx);
         return .invalid;
     }
 
@@ -3570,18 +3626,33 @@ const Checker = struct {
 
         for (mf.tree.kids(k[1])) |arm_idx| {
             const ak = mf.tree.kids(arm_idx); // [variant_pat, body]
-            const vname = Checker.identText(mf, mf.tree.kids(ak[0])[0]);
+            const vp = mf.tree.kids(ak[0]); // variant_pat: [name, binders_or_none]
+            const vname = Checker.identText(mf, vp[0]);
+            const binders: []const ast.Index = if (vp[1] != ast.none) mf.tree.kids(vp[1]) else &.{};
             if (is_enum) {
-                var matched = false;
+                var matched: ?Variant = null;
                 for (variants, 0..) |v, i| {
                     if (std.mem.eql(u8, v.name, vname)) {
                         if (seen[i]) try self.emit(mf, ak[0], .duplicate_declaration, "duplicate arm for variant '{s}'", .{vname}, null);
                         seen[i] = true;
-                        matched = true;
+                        matched = v;
                         break;
                     }
                 }
-                if (!matched) try self.emit(mf, ak[0], .unknown_variant, "no variant '{s}' on this enum", .{vname}, null);
+                if (matched) |v| {
+                    // Bind the payload: `V(a, b) => ...` binds `a`/`b` to the
+                    // variant's payload types. Arity must match; a no-payload
+                    // variant with binders (or vice versa) is an error.
+                    if (binders.len != v.payload.len) {
+                        try self.emit(mf, ak[0], .arg_count_mismatch, "variant '{s}' binds {d} value(s), found {d}", .{ vname, v.payload.len, binders.len }, null);
+                    }
+                    for (binders, 0..) |b, i| {
+                        try self.bindSimple(file_idx, b, if (i < v.payload.len) v.payload[i] else .invalid);
+                    }
+                } else {
+                    try self.emit(mf, ak[0], .unknown_variant, "no variant '{s}' on this enum", .{vname}, null);
+                    for (binders) |b| try self.bindSimple(file_idx, b, .invalid);
+                }
             }
             try self.checkStmt(file_idx, ak[1], fctx);
         }

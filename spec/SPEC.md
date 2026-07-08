@@ -128,8 +128,7 @@ match    nil       of        return    select    spawn
 struct   switch    true      type      while
 ```
 
-`match` selects on an enum value (§13.8). Its payload-binding form
-(`V(a, b) => …`) is reserved for a later release; v0.1 binds no payload.
+`match` selects on an enum value and binds its payload (§13.8).
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
@@ -897,12 +896,14 @@ memory by communicating.*
 ```
 match_stmt  = "match" "(" expression ")" "{" { match_arm [ ";" ] } "}" .
 match_arm   = variant_pat "=>" statement .
-variant_pat = IDENT .                            (* a variant name *)
+variant_pat = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binders *)
 ```
 
 The subject expression must be an enum type. Each arm names one of the enum's
 variants (bare, unqualified — the subject's type disambiguates) and runs its
-body statement when the value is that variant. A `match` is:
+body statement when the value is that variant. A payload variant's arm binds its
+payload: `Circle(r) => …` binds `r` to the `f64` inside; the binder count must
+match the variant's payload arity. A `match` is:
 
 - **Exhaustive** — every variant of the enum must have an arm; a missing variant
   is a compile error (`E0071`). This is `match`'s central guarantee: adding a
@@ -911,8 +912,8 @@ body statement when the value is that variant. A `match` is:
   a compile error).
 
 Arms do not fall through. `break`/`continue` inside an arm target the enclosing
-loop, not the `match`. Payload-binding arms (`V(a, b) => …`) are reserved for a
-later release (§14.7).
+loop, not the `match`. `match` is a statement in v0.1; a value-yielding
+expression form is deferred.
 
 ---
 
@@ -1004,18 +1005,29 @@ enum_variant = IDENT [ "(" type { "," type } ")" ] .   (* payload reserved *)
 
 ```
 enum Color { Red, Green, Blue }
-let c = Color.Green            // construct a value: EnumName.Variant
+let c = Color.Green            // no-payload variant: EnumName.Variant
+
+enum Shape { Circle(f64), Rect(f64, f64), Unit }
+let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
 ```
 
 - **Nominal identity** (unlike structs/interfaces, §14.1): two enums with the same
   variant names are still distinct types. A bare `Color` is a type, not a value;
   a value is written `Color.Variant`.
+- A variant may carry an ordered **payload** (`Circle(f64)`), making the enum a
+  tagged union / sum type. A payload variant is constructed by calling it with
+  arguments (`Shape.Rect(3.0, 4.0)`); the argument types and count must match the
+  declaration. A no-payload variant is written bare (`Shape.Unit`).
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
-  variants. Enums are not ordered and not `==`-comparable in v0.1 — use `match`.
-- The parenthesized payload form (`Circle(f64)`, carrying data per variant, i.e.
-  a full tagged-union / sum type) is parsed but reserved for a later release; v0.1
-  variants carry no payload. Generic enums (`enum Option<T> { Some(T), None }`)
-  are likewise deferred until payloads land.
+  variants and binds a variant's payload in its arm. Enums are not ordered and not
+  `==`-comparable in v0.1 — use `match`.
+- Generic enums (`enum Option<T> { Some(T), None }`) are deferred to a later
+  release.
+
+Representation (non-normative): a no-payload-only enum is a bare tag word; an
+enum with any payload is a boxed `{tag, payloadPtr}` object whose payload is a
+separately allocated, GC-traced record. Inline (unboxed) payload layout is a
+future optimization.
 
 ---
 
@@ -1367,10 +1379,9 @@ function main(): ()! {
 
 Intentionally **not** in v0.1, to keep the surface minimal:
 
-- Enum payloads / sum types (`enum E { V(T) }`) and payload-binding `match` arms
-  (`V(a) => …`): v0.1 has C-like enums + exhaustive `match` (§14.7, §13.8), but
-  variants carry no data yet. `match` as an *expression* (yielding a value) is
-  also deferred; v0.1's `match` is a statement.
+- Generic enums (`enum Option<T> { Some(T), None }`) and `match` as an
+  *expression* (yielding a value): v0.1 has monomorphic sum types + exhaustive
+  statement-form `match` (§14.7, §13.8).
 - General union and optional types; `null` (absence is modeled by `nil` zero
   values and the Result model).
 - Pointers, `&`/`*`, value-vs-pointer receivers.
@@ -1474,7 +1485,7 @@ switch_case   = "case" expression { "," expression } ":" { statement ";" }
               | "default" ":" { statement ";" } .
 match_stmt    = "match" "(" expression ")" "{" { match_arm [ ";" ] } "}" .
 match_arm     = variant_pat "=>" statement .
-variant_pat   = IDENT .                          (* payload binders reserved; §13.8 *)
+variant_pat   = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binders; §13.8 *)
 select_stmt   = "select" "{" { comm_clause } "}" .
 comm_clause   = "case" ( send_stmt | recv_bind ) ":" { statement ";" }
               | "default" ":" { statement ";" } .

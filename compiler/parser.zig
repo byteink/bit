@@ -944,11 +944,24 @@ const Parser = struct {
     }
 
     /// A variant pattern: a variant name, optionally binding its payload
-    /// `V(a, b)` (Stage 2 — Stage 1 has no payload, so binders stay `none`).
+    /// `V(a, b)` — the binder list is `none` for a no-payload variant.
     fn parseVariantPat(self: *Parser) ParseError!Index {
         const start = self.tok.span;
         const name = try self.expectIdent();
-        return self.tree.add(.variant_pat, join(start, self.span(name)), 0, &.{ name, none });
+        var binders: Index = none;
+        var end = self.span(name);
+        if (try self.accept(.l_paren)) {
+            const ids = try self.commaList(.r_paren, expectIdentItem, false);
+            defer self.gpa.free(ids);
+            end = try self.expect(.r_paren, "')'");
+            binders = try self.tree.add(.expr_list, join(start, end), 0, ids);
+        }
+        return self.tree.add(.variant_pat, join(start, end), 0, &.{ name, binders });
+    }
+
+    /// A bare identifier as a `commaList` item (a match-arm payload binder).
+    fn expectIdentItem(self: *Parser) ParseError!Index {
+        return self.expectIdent();
     }
 
     // ---- select (§16.3) --------------------------------------------------------

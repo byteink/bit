@@ -124,8 +124,9 @@ fn fieldLayout(data: TypeData) FieldLayout {
             .string => .{ .size = 8, .is_ptr = true },
         };
     }
-    // A Stage 1 enum is a bare tag word, not a boxed handle (no payloads yet).
-    if (data == .@"enum") return .{ .size = 8, .is_ptr = false };
+    // A no-payload enum is a bare tag word; a payload-carrying one is a boxed
+    // `{tag, payloadPtr}` handle (a GC ref).
+    if (data == .@"enum") return .{ .size = 8, .is_ptr = check.enumBoxed(data.@"enum") };
     // slice/array/map/tuple/chan/struct/interface/func: uniform boxed handle.
     // void/untyped_*/invalid/type_param/fallible must never reach here in a
     // fully checked, monomorphized program.
@@ -1376,11 +1377,19 @@ const FnCtx = struct {
     fn lowerMatch(self: *FnCtx, node: ast.Index) Error!void {
         const k = self.kids(node); // [subject, arm_list]
         const subject_ty = try self.nodeType(k[0]);
-        const tag = try self.lowerExprH(k[0], subject_ty);
+        const subject = try self.lowerExprH(k[0], subject_ty);
         const ed = self.ctx.typeOf(subject_ty);
         const variants: []const check.Variant = if (ed == .@"enum") ed.@"enum".variants else &.{};
+        const boxed = ed == .@"enum" and check.enumBoxed(ed.@"enum");
         const arms = self.kids(k[1]);
         if (arms.len == 0) return; // subject wasn't an enum; checker already diagnosed
+
+        // A boxed enum's value is the object pointer; its tag (an i64) is word
+        // 0. A bare enum's value IS the tag (enum-typed). The compare operands
+        // must share a type, so tag and each arm's constant use `tag_ty`.
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const tag_ty = if (boxed) i64ty else subject_ty;
+        const tag = if (boxed) try self.b.fieldGet(tag_ty, subject, 0) else subject;
 
         const pre_len = self.env.bindings.items.len;
         const orig = try self.env.snapshotValues(self.gpa, pre_len);
@@ -1396,13 +1405,13 @@ const FnCtx = struct {
             const arm_tag = variantTag(variants, self.identText(self.kids(ak[0])[0]));
             const body_blk = try self.b.newBlock();
             const next_blk = try self.b.newBlock();
-            const cond = try self.emitEq(subject_ty, tag, try self.b.constInt(subject_ty, arm_tag));
+            const cond = try self.emitEq(tag_ty, tag, try self.b.constInt(tag_ty, arm_tag));
             try self.emitBr(cond, body_blk, &.{}, next_blk, &.{});
             self.switchBlock(body_blk);
-            try self.lowerMatchArmBody(ak[1], orig, pre_len, join, &join_reachable);
+            try self.lowerMatchArm(arm, subject, variants, boxed, orig, pre_len, join, &join_reachable);
             self.switchBlock(next_blk);
         }
-        try self.lowerMatchArmBody(self.kids(arms[arms.len - 1])[1], orig, pre_len, join, &join_reachable);
+        try self.lowerMatchArm(arms[arms.len - 1], subject, variants, boxed, orig, pre_len, join, &join_reachable);
 
         self.b.endBlock();
         self.b.beginBlock(join);
@@ -1414,13 +1423,27 @@ const FnCtx = struct {
         }
     }
 
-    /// Lowers one match arm body in the current block, carrying any reassigned
-    /// env values to `join` (unless the body diverged). Restores the pre-match
-    /// env afterward so the next arm starts clean.
-    fn lowerMatchArmBody(self: *FnCtx, body: ast.Index, orig: []const ir.ValueId, pre_len: usize, join: ir.BlockId, join_reachable: *bool) Error!void {
+    /// Lowers one match arm in the current block: binds the variant's payload
+    /// (`V(a, b) =>` loads word `i` of the box into `a`/`b`), lowers the body,
+    /// then carries any reassigned env to `join` (unless the body diverged).
+    /// Restores the pre-match env afterward so the next arm starts clean.
+    fn lowerMatchArm(self: *FnCtx, arm: ast.Index, subject: ir.ValueId, variants: []const check.Variant, boxed: bool, orig: []const ir.ValueId, pre_len: usize, join: ir.BlockId, join_reachable: *bool) Error!void {
+        const ak = self.kids(arm); // [variant_pat, body]
+        const vp = self.kids(ak[0]); // variant_pat: [name, binders_or_none]
         self.env.restoreValues(orig);
         const mark = self.env.mark();
-        try self.lowerStmt(body);
+        if (boxed and vp[1] != ast.none) {
+            const v = findVariant(variants, self.identText(vp[0]));
+            // The payload box lives at word 1 of the enum object; word `i` of
+            // the box is binder `i`.
+            const box = try self.b.fieldGet(self.ctx.prim_ids.get(.i64), subject, 8);
+            for (self.kids(vp[1]), 0..) |b, i| {
+                const bty = if (v != null and i < v.?.payload.len) v.?.payload[i] else self.ctx.prim_ids.get(.i64);
+                const bv = try self.b.fieldGet(bty, box, @intCast(8 * i));
+                try self.env.declare(self.gpa, self.identText(b), bv, bty);
+            }
+        }
+        try self.lowerStmt(ak[1]);
         self.env.restoreCount(mark);
         if (!self.terminated) {
             join_reachable.* = true;
@@ -1431,6 +1454,47 @@ const FnCtx = struct {
         self.env.restoreValues(orig);
     }
 
+    /// `EnumName.Variant(args)` — allocate the payload box (word `i` = arg `i`,
+    /// GC-tracing its ref fields) and wrap it in the enum object `{tag, box}`.
+    fn lowerVariantConstruction(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const k = self.kids(node); // [callee(member), type_args, args]
+        const enum_ty = try self.nodeType(k[0]); // checkVariantConstruction typed the member as the enum
+        const ed = self.ctx.typeOf(enum_ty);
+        if (ed != .@"enum") return error.UnsupportedConstruct;
+        const vname = self.identText(self.kids(k[0])[1]);
+        const v = findVariant(ed.@"enum".variants, vname) orelse return error.UnsupportedConstruct;
+        const tag = variantTag(ed.@"enum".variants, vname);
+        const arg_nodes = self.kids(k[2]);
+
+        var box: ?ir.ValueId = null;
+        if (v.payload.len > 0) {
+            var offs: std.ArrayList(u32) = .empty;
+            defer offs.deinit(self.gpa);
+            for (v.payload, 0..) |pty, i| {
+                if (fieldLayout(self.ctx.typeOf(pty)).is_ptr) try offs.append(self.gpa, @intCast(8 * i));
+            }
+            const b = try self.b.gcAlloc(enum_ty, @intCast(8 * v.payload.len), offs.items);
+            for (arg_nodes, 0..) |an, i| {
+                if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct;
+                const av = try self.lowerExprH(self.kids(an)[0], v.payload[i]);
+                try self.b.fieldSet(b, @intCast(8 * i), av);
+            }
+            box = b;
+        }
+        return self.buildEnumObj(enum_ty, tag, box);
+    }
+
+    /// Builds a boxed enum object: `{ tag: i64 @0, payloadPtr @8 }` (16 bytes,
+    /// the payload pointer at offset 8 is the one GC-traced word; null for a
+    /// no-payload variant).
+    fn buildEnumObj(self: *FnCtx, enum_ty: TypeId, tag: i64, payload: ?ir.ValueId) Error!ir.ValueId {
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const obj = try self.b.gcAlloc(enum_ty, 16, &.{8});
+        try self.b.fieldSet(obj, 0, try self.b.constInt(i64ty, tag));
+        try self.b.fieldSet(obj, 8, payload orelse try self.b.constInt(i64ty, 0));
+        return obj;
+    }
+
     /// The tag (declaration index) of the variant named `name`, or 0 if not
     /// found (the checker already rejected an unknown variant).
     fn variantTag(variants: []const check.Variant, name: []const u8) i64 {
@@ -1438,6 +1502,13 @@ const FnCtx = struct {
             if (std.mem.eql(u8, v.name, name)) return @intCast(i);
         }
         return 0;
+    }
+
+    fn findVariant(variants: []const check.Variant, name: []const u8) ?check.Variant {
+        for (variants) |v| {
+            if (std.mem.eql(u8, v.name, name)) return v;
+        }
+        return null;
     }
 
     /// One arm of a `switch`'s decision chain: `subject == e` for a value
@@ -1970,6 +2041,15 @@ const FnCtx = struct {
                 if (sym.kind == .builtin_type) return self.lowerConvert(node);
             }
         }
+        // `EnumName.Variant(args)` — construct a payload-carrying variant.
+        if (self.tree().get(callee).tag == .member) {
+            const mk = self.kids(callee); // [recv, name]
+            if (self.tree().get(mk[0]).tag == .ident) {
+                if (self.nodeSymbol(mk[0])) |gs| {
+                    if (self.l.symbolOf(gs).kind == .enum_type) return self.lowerVariantConstruction(node);
+                }
+            }
+        }
         const target = try self.resolveCallTarget(node, callee);
         var args: std.ArrayList(ir.ValueId) = .empty;
         defer args.deinit(self.gpa);
@@ -2411,7 +2491,11 @@ const FnCtx = struct {
                     const ed = self.ctx.typeOf(enum_ty);
                     if (ed == .@"enum") {
                         for (ed.@"enum".variants, 0..) |v, i| {
-                            if (std.mem.eql(u8, v.name, name)) return self.b.constInt(enum_ty, @intCast(i));
+                            if (!std.mem.eql(u8, v.name, name)) continue;
+                            // A boxed enum's no-payload variant is still an
+                            // object `{tag, null}`; a bare enum's is just the tag.
+                            if (check.enumBoxed(ed.@"enum")) return self.buildEnumObj(enum_ty, @intCast(i), null);
+                            return self.b.constInt(enum_ty, @intCast(i));
                         }
                     }
                     return error.UnsupportedConstruct;
