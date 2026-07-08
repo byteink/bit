@@ -226,8 +226,28 @@ const SpillPool = struct {
         self.active.items.len = remaining;
     }
 
-    fn assign(self: *SpillPool, gpa: Allocator, intervals: []const Interval, idx: u32) Allocator.Error!u32 {
-        const slot = self.free.pop() orelse blk: {
+    /// Assigns a stack slot to interval `idx`. `reuse` controls whether a
+    /// recycled slot (from the free list) may be handed out or a fresh one
+    /// must be minted.
+    ///
+    /// Recycling is sound ONLY when intervals are assigned in nondecreasing
+    /// start order: a freed slot's last occupant ended before the current
+    /// scan position (`expire` frees on `end < start`), so it cannot overlap
+    /// an interval starting at or after that position. The main-loop spill
+    /// path satisfies this — it spills the interval currently being processed,
+    /// whose start IS the scan frontier — so it passes `reuse = true`.
+    ///
+    /// The eviction path does NOT: it spills an interval that has been
+    /// register-resident since before the frontier, so in the single-location
+    /// model its slot is live for its whole `[start, end]`, reaching back
+    /// before the frontier. A recycled slot may have been occupied during that
+    /// backward span (its occupant ended before the frontier yet still overlaps
+    /// the evicted interval), which is exactly the aliasing that corrupts a
+    /// live value. So eviction passes `reuse = false` to force a fresh slot,
+    /// which is unused across all time until it is itself freed post-`end`.
+    fn assign(self: *SpillPool, gpa: Allocator, intervals: []const Interval, idx: u32, reuse: bool) Allocator.Error!u32 {
+        const recycled = if (reuse) self.free.pop() else null;
+        const slot = recycled orelse blk: {
             const s = self.next;
             self.next += 1;
             break :blk s;
@@ -293,15 +313,19 @@ pub fn allocate(gpa: Allocator, target: TargetRegs, intervals: []const Interval,
         } else if (state.len == 0 or intervals[state.active[state.len - 1].idx].end <= iv.end) {
             // Nothing active is worth evicting (either the class has no
             // registers at all, or `iv` itself has the furthest end) —
-            // Poletto & Sarkar's `SpillAtInterval` "else" branch.
-            const slot = try spills.assign(gpa, intervals, idx);
+            // Poletto & Sarkar's `SpillAtInterval` "else" branch. `iv` is the
+            // interval being processed, so its start is the scan frontier and
+            // recycling a freed slot is sound (see `assign`).
+            const slot = try spills.assign(gpa, intervals, idx, true);
             locations[@intFromEnum(iv.vreg)] = .{ .spill = slot };
         } else {
             // Evict the active interval with the furthest end and hand its
-            // register to `iv` — `SpillAtInterval`'s "if" branch.
+            // register to `iv` — `SpillAtInterval`'s "if" branch. The evicted
+            // interval started before the frontier, so it must get a fresh
+            // slot, never a recycled one (see `assign`).
             const evicted = state.active[state.len - 1];
             state.len -= 1;
-            const slot = try spills.assign(gpa, intervals, evicted.idx);
+            const slot = try spills.assign(gpa, intervals, evicted.idx, false);
             locations[@intFromEnum(intervals[evicted.idx].vreg)] = .{ .spill = slot };
             locations[@intFromEnum(iv.vreg)] = .{ .reg = evicted.reg };
             state.insertActive(intervals, .{ .idx = idx, .reg = evicted.reg });
