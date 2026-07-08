@@ -438,7 +438,10 @@ fn emitTranslated(
         .const_string => |pool_idx| remap[idx] = try bldr.constString(ty, pool_idx),
         .const_nil => remap[idx] = try bldr.constNil(ty),
         .bin => |b| remap[idx] = try bldr.binary(op, ty, tr(remap, @intFromEnum(b.lhs)), tr(remap, @intFromEnum(b.rhs))),
-        .un => |u| remap[idx] = try bldr.unary(op, ty, tr(remap, @intFromEnum(u.operand))),
+        .un => |u| remap[idx] = if (op == .convert)
+            try bldr.convert(ty, tr(remap, @intFromEnum(u.operand)))
+        else
+            try bldr.unary(op, ty, tr(remap, @intFromEnum(u.operand))),
         .jump => |j| {
             const args = try trList(gpa, remap, j.args);
             defer gpa.free(args);

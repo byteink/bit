@@ -733,6 +733,61 @@ const Ctx = struct {
         try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
     }
 
+    // ---- integer width conversion (movsx/movzx/movsxd) ----------------------
+    // Each re-represents `reg`'s low `width` bytes as a full 64-bit value: sign-
+    // extend (signed) or zero-extend (unsigned). Used by `emitConvert` (§12.9).
+    fn ext0F(self: *Ctx, opcode: u8, dst: Reg, src: Reg) !void {
+        try self.maybeRex(true, @intFromEnum(dst) >= 8, false, @intFromEnum(src) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(opcode);
+        try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
+    }
+    /// Canonicalize `reg` from a `width`-byte value to a full 64-bit register.
+    fn extendReg(self: *Ctx, reg: Reg, width: u8, signed: bool) !void {
+        switch (width) {
+            1 => try self.ext0F(if (signed) 0xBE else 0xB6, reg, reg), // movsx/movzx r64, r/m8
+            2 => try self.ext0F(if (signed) 0xBF else 0xB7, reg, reg), // movsx/movzx r64, r/m16
+            4 => if (signed) {
+                try self.maybeRex(true, @intFromEnum(reg) >= 8, false, @intFromEnum(reg) >= 8);
+                try self.emitByte(0x63); // movsxd r64, r/m32
+                try self.emitByte(modrmRegByte(@intFromEnum(reg), @intFromEnum(reg)));
+            } else {
+                // mov r32, r/m32 zero-extends the low 32 bits into the full 64.
+                try self.maybeRex(false, @intFromEnum(reg) >= 8, false, @intFromEnum(reg) >= 8);
+                try self.emitByte(0x8B);
+                try self.emitByte(modrmRegByte(@intFromEnum(reg), @intFromEnum(reg)));
+            },
+            else => {}, // 8 bytes: already the full register
+        }
+    }
+
+    // ---- int↔float / float↔float conversion (SSE) ---------------------------
+    /// `cvtsi2sd/ss xmm, r64` — a signed 64-bit int to `fwidth`-byte float.
+    fn cvtI2F(self: *Ctx, dst: XReg, src: Reg, fwidth: u8) !void {
+        try self.emitByte(if (fwidth == 8) 0xF2 else 0xF3);
+        try self.maybeRex(true, @intFromEnum(dst) >= 8, false, @intFromEnum(src) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x2A);
+        try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
+    }
+    /// `cvttsd2si/cvttss2si r64, xmm` — a `fwidth`-byte float to a signed 64-bit
+    /// int, truncating toward zero (SPEC §12.9).
+    fn cvtF2I(self: *Ctx, dst: Reg, src: XReg, fwidth: u8) !void {
+        try self.emitByte(if (fwidth == 8) 0xF2 else 0xF3);
+        try self.maybeRex(true, @intFromEnum(dst) >= 8, false, @intFromEnum(src) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x2C);
+        try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
+    }
+    /// `cvtsd2ss` (from_width 8) / `cvtss2sd` (from_width 4) — float to float.
+    fn cvtF2F(self: *Ctx, dst: XReg, src: XReg, from_width: u8) !void {
+        try self.emitByte(if (from_width == 8) 0xF2 else 0xF3);
+        try self.maybeRex(false, @intFromEnum(dst) >= 8, false, @intFromEnum(src) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x5A);
+        try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
+    }
+
     // ---- calls / jumps (relocations & intra-function fixups) ---------------
 
     fn emitCallReloc(self: *Ctx, symbol: []const u8) !void {
@@ -1062,6 +1117,44 @@ fn emitUnaryInt(self: *Ctx, op: ir.Op, dst: u32, operand: ir.ValueId) !void {
         else => unreachable,
     }
     try putInt(self, dst, scratch1);
+}
+
+/// `T(x)` numeric conversion (§12.9). The four class combinations: int↔int
+/// (extend/truncate to the destination width), int→float (`cvtsi2*`), float→int
+/// (`cvtt*2si`, truncating), float→float (`cvt*2*`). Int operands are first
+/// canonicalized to their true 64-bit value from the *source* width, then
+/// re-canonicalized to the destination width — correct whether widening,
+/// narrowing, or same-size. (Unsigned 64-bit ↔ float uses the signed path; a
+/// value with bit 63 set is out of range — a documented v1 limit.)
+fn emitConvert(self: *Ctx, dst: u32, src: ir.ValueId, dst_ty: TypeId) !void {
+    const sw = widthOf(self.tctx(), self.f.valueType(src));
+    const dw = widthOf(self.tctx(), dst_ty);
+    if (sw.class == .int and dw.class == .int) {
+        const r = try getInt(self, vregOf(self, src), scratch1);
+        try self.movRR(scratch1, r);
+        try self.extendReg(scratch1, sw.bytes, sw.signed);
+        try self.extendReg(scratch1, dw.bytes, dw.signed);
+        try putInt(self, dst, scratch1);
+    } else if (sw.class == .int and dw.class == .float) {
+        const r = try getInt(self, vregOf(self, src), scratch1);
+        try self.movRR(scratch1, r);
+        try self.extendReg(scratch1, sw.bytes, sw.signed);
+        try self.cvtI2F(fscratch1, scratch1, dw.bytes);
+        try putFloat(self, dst, fscratch1);
+    } else if (sw.class == .float and dw.class == .int) {
+        const x = try getFloat(self, vregOf(self, src), fscratch1);
+        try self.cvtF2I(scratch1, x, sw.bytes);
+        try self.extendReg(scratch1, dw.bytes, dw.signed);
+        try putInt(self, dst, scratch1);
+    } else {
+        const x = try getFloat(self, vregOf(self, src), fscratch1);
+        if (sw.bytes == dw.bytes) {
+            try self.movFRR(fscratch1, x, sw.bytes);
+        } else {
+            try self.cvtF2F(fscratch1, x, sw.bytes);
+        }
+        try putFloat(self, dst, fscratch1);
+    }
 }
 
 /// Peeks whether `v` is a `const_int` instruction, returning its value
@@ -1910,6 +2003,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .ashr => try emitShiftInt(self, .sar, dst, d.bin.lhs, d.bin.rhs),
         .lshr => try emitShiftInt(self, .shr, dst, d.bin.lhs, d.bin.rhs),
         .neg, .bnot => try emitUnaryInt(self, op, dst, d.un.operand),
+        .convert => try emitConvert(self, dst, d.un.operand, ty),
         .fneg => try emitFneg(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
         .icmp_eq, .icmp_ne, .icmp_slt, .icmp_sle, .icmp_sgt, .icmp_sge, .icmp_ult, .icmp_ule, .icmp_ugt, .icmp_uge => try emitIcmp(self, op, dst, d.bin.lhs, d.bin.rhs),
         .fcmp_eq, .fcmp_ne, .fcmp_lt, .fcmp_le, .fcmp_gt, .fcmp_ge => try emitFcmp(self, op, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), self.f.valueType(d.bin.lhs)).bytes),

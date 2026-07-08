@@ -1883,6 +1883,10 @@ const FnCtx = struct {
             if (self.nodeSymbol(callee)) |gsym| {
                 const sym = self.l.symbolOf(gsym);
                 if (sym.kind == .builtin_func) return self.lowerBuiltinCall(node, sym.name);
+                // A prim-type name in call position is a conversion `T(x)`
+                // (§12.9); struct/interface "construction" uses a composite
+                // literal, never a call, so a `builtin_type` here is numeric.
+                if (sym.kind == .builtin_type) return self.lowerConvert(node);
             }
         }
         const target = try self.resolveCallTarget(node, callee);
@@ -1908,6 +1912,21 @@ const FnCtx = struct {
     fn okResult(self: *const FnCtx, ty: TypeId) TypeId {
         const data = self.ctx.typeOf(ty);
         return if (data == .fallible) data.fallible.ok else ty;
+    }
+
+    /// A numeric conversion `T(x)` (§12.9). An untyped-constant operand is
+    /// materialized at its natural default type first (so `f64(5)` converts an
+    /// i64, `i64(3.9)` converts an f64 — never an int literal typed as float or
+    /// vice versa); an identical source type is a no-op; otherwise codegen
+    /// performs the trunc/extend/float cast.
+    fn lowerConvert(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const arg = self.kids(self.kids(self.kids(node)[2])[0])[0]; // args -> arg -> inner
+        const dst_ty = try self.nodeType(node);
+        const raw_ty = try self.nodeType(arg);
+        const src_ty = if (self.isUntypedTy(raw_ty)) self.defaultTy(raw_ty) else raw_ty;
+        const src = try self.lowerExprH(arg, src_ty);
+        if (src_ty == dst_ty) return src;
+        return self.b.convert(dst_ty, src);
     }
 
     /// `ch <- v`: send one word to a channel (blocks per SPEC §16.2).

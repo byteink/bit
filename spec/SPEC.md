@@ -733,7 +733,10 @@ chan<int>(16)     // buffered channel, capacity 16
 Numeric conversions are always explicit. There are **no** implicit numeric
 conversions between distinct numeric types (including `i32`→`i64`); this is a
 deliberate safety choice. Untyped constant literals are the only exception and
-adapt to context (§15.4).
+adapt to context (§15.4). Integer conversions sign- or zero-extend / truncate to
+the destination width; float→int truncates toward zero. *(v1 limit: converting a
+`u64` whose top bit is set to or from a float uses the signed path, so such a
+value is out of range — fixed when a full unsigned float path lands.)*
 
 ---
 

@@ -152,6 +152,12 @@ pub const Op = enum {
     fneg,
     bnot,
 
+    // ---- numeric conversion (unary shape: extra = [src]) -----------------
+    // `T(x)` (SPEC §12.9): the result type is the target prim, the operand's
+    // recorded type is the source; codegen picks trunc/extend (int↔int),
+    // cvt-to/from-float (int↔float), or f32↔f64 from those two widths/classes.
+    convert,
+
     // ---- compare (binary: extra = [lhs, rhs]; result type is always bool) -
     icmp_eq,
     icmp_ne,
@@ -345,6 +351,7 @@ pub const Function = struct {
             .index_get => .{ .index_get = .{ .base = @enumFromInt(raw[0]), .index = @enumFromInt(raw[1]) } },
             .index_set => .{ .index_set = .{ .base = @enumFromInt(raw[0]), .index = @enumFromInt(raw[1]), .value = @enumFromInt(raw[2]) } },
             .slice_len => .{ .slice_len = .{ .base = @enumFromInt(raw[0]) } },
+            .convert => .{ .un = .{ .operand = @enumFromInt(raw[0]) } },
             .make_closure => .{ .make_closure = .{ .func = @enumFromInt(raw[0]), .env = @enumFromInt(raw[1]) } },
             .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
             .rt_call => .{ .rt_call = .{ .rt = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
@@ -597,6 +604,12 @@ pub const FunctionBuilder = struct {
     pub fn unary(self: *FunctionBuilder, op: Op, ty: TypeId, operand: ValueId) Allocator.Error!ValueId {
         std.debug.assert(op.isUnary());
         return self.push(op, ty, &.{vid(operand)});
+    }
+
+    /// Numeric conversion `T(x)` (§12.9): result type `ty` is the target prim,
+    /// `src`'s recorded type the source; codegen derives the cast from both.
+    pub fn convert(self: *FunctionBuilder, ty: TypeId, src: ValueId) Allocator.Error!ValueId {
+        return self.push(.convert, ty, &.{vid(src)});
     }
 
     /// Terminator: unconditional jump to `target`, passing `args` matching
@@ -1168,7 +1181,9 @@ fn checkOperandTypes(f: *const Function, op: Op, ty: TypeId, d: Decoded) VerifyE
             if (ty != lt) return error.OperandTypeMismatch;
         },
         .un => |u| {
-            if (f.valueType(u.operand) != ty) return error.OperandTypeMismatch;
+            // `convert` deliberately changes type (its operand is the source,
+            // `ty` the target); every other unary op preserves it.
+            if (op != .convert and f.valueType(u.operand) != ty) return error.OperandTypeMismatch;
         },
         else => {},
     }

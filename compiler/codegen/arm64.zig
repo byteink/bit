@@ -693,6 +693,13 @@ const Ctx = struct {
     fn fmovFromFp(self: *Ctx, dst: Reg, src: FReg, width: u8) !void {
         try self.fpConvertGpr(width == 8, width, 0b110, @intFromEnum(src), @intFromEnum(dst));
     }
+    /// FP↔int conversion (SCVTF/FCVTZS), the full form with the `rmode` field
+    /// `fpConvertGpr` hardcodes to 0. `sf` is the GPR width (1 = 64-bit),
+    /// `width` the float precision; `rn`→`rd` per the group's `Rn<<5 | Rd`.
+    fn fpIntConv(self: *Ctx, sf: bool, width: u8, rmode: u2, opcode: u3, rn: u5, rd: u5) !void {
+        const word: u32 = (@as(u32, @intFromBool(sf)) << 31) | (0b11110 << 24) | (@as(u32, fpType(width)) << 22) | (@as(u32, 1) << 21) | (@as(u32, rmode) << 19) | (@as(u32, opcode) << 16) | (@as(u32, rn) << 5) | rd;
+        try self.emitWord(word);
+    }
 
     // ---- branches / calls / return -----------------------------------
 
@@ -1032,6 +1039,51 @@ fn emitUnaryInt(self: *Ctx, op: ir.Op, dst: u32, operand: ir.ValueId) !void {
         else => unreachable,
     }
     try putInt(self, dst, scratch1);
+}
+
+/// Re-represent `src`'s low `width` bytes as a full 64-bit value in `dst`:
+/// SBFM (signed) or UBFM (unsigned), the SXTB/UXTB/... family. Width 8 is a
+/// plain move.
+fn extendRegA(self: *Ctx, dst: Reg, src: Reg, width: u8, signed: bool) !void {
+    const opc: u2 = if (signed) 0b00 else 0b10; // SBFM / UBFM
+    switch (width) {
+        1 => try self.bitfieldImm(opc, dst, src, 0, 7),
+        2 => try self.bitfieldImm(opc, dst, src, 0, 15),
+        4 => try self.bitfieldImm(opc, dst, src, 0, 31),
+        else => if (@intFromEnum(dst) != @intFromEnum(src)) try self.movRR(dst, src),
+    }
+}
+
+/// `T(x)` numeric conversion (§12.9) — the arm64 mirror of x64's `emitConvert`.
+/// Int operands are canonicalized to their true 64-bit value from the source
+/// width, then to the destination width (SBFM/UBFM); int↔float uses SCVTF /
+/// FCVTZS (truncating), float↔float uses FCVT. (Unsigned 64-bit ↔ float takes
+/// the signed path — a value with bit 63 set is out of range, a v1 limit.)
+fn emitConvert(self: *Ctx, dst: u32, src: ir.ValueId, dst_ty: TypeId) !void {
+    const sw = common.widthOf(self.tctx(), self.f.valueType(src));
+    const dw = common.widthOf(self.tctx(), dst_ty);
+    if (sw.class == .int and dw.class == .int) {
+        const r = try getInt(self, vregOf(self, src), scratch1);
+        try extendRegA(self, scratch1, r, sw.bytes, sw.signed);
+        try extendRegA(self, scratch1, scratch1, dw.bytes, dw.signed);
+        try putInt(self, dst, scratch1);
+    } else if (sw.class == .int and dw.class == .float) {
+        const r = try getInt(self, vregOf(self, src), scratch1);
+        try extendRegA(self, scratch1, r, sw.bytes, sw.signed);
+        try self.fpIntConv(true, dw.bytes, 0b00, 0b010, @intFromEnum(scratch1), @intFromEnum(fscratch1)); // SCVTF
+        try putFloat(self, dst, fscratch1);
+    } else if (sw.class == .float and dw.class == .int) {
+        const x = try getFloat(self, vregOf(self, src), fscratch1);
+        try self.fpIntConv(true, sw.bytes, 0b11, 0b000, @intFromEnum(x), @intFromEnum(scratch1)); // FCVTZS
+        try extendRegA(self, scratch1, scratch1, dw.bytes, dw.signed);
+        try putInt(self, dst, scratch1);
+    } else {
+        // float → float, always differing widths (same-type is filtered in lowering).
+        const x = try getFloat(self, vregOf(self, src), fscratch1);
+        const opcode: u6 = if (dw.bytes == 8) 0b000101 else 0b000100; // FCVT to double / to single
+        try self.fp1Source(opcode, sw.bytes, fscratch1, x);
+        try putFloat(self, dst, fscratch1);
+    }
 }
 
 /// Peeks whether `v` is a `const_int` instruction, returning its value
@@ -1512,6 +1564,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         },
         .un => |u| switch (op) {
             .neg, .bnot => try emitUnaryInt(self, op, i, u.operand),
+            .convert => try emitConvert(self, i, u.operand, ty),
             .fneg => try emitFneg(self, i, u.operand, common.widthOf(self.tctx(), ty).bytes),
             else => unreachable,
         },
