@@ -2201,27 +2201,33 @@ const FnCtx = struct {
         const gsym = self.nodeSymbol(node) orelse return error.UnsupportedConstruct;
         const sym = self.l.symbolOf(gsym);
         if (sym.kind != .const_binding) return error.UnsupportedConstruct; // top-level mutable `let`: no IR global-variable op exists yet
-        // Cross-module const folding is out of scope (check.zig defers it too):
-        // `lowerTopConst` re-lowers the initializer in the current module's file
-        // list, which would misindex a foreign module's file. Cross-module value
-        // references (consts, function values) are a documented follow-up; a
-        // cross-module *call* never reaches here (it goes through
-        // `resolveCallTarget`'s direct path).
-        if (gsym.module != self.l.cur_module) return error.UnsupportedConstruct;
-        return self.lowerTopConst(sym.decl, sym.file_idx);
+        return self.lowerTopConst(gsym, sym.file_idx);
     }
 
     /// Inlines a top-level `const`'s initializer at the reference site
     /// (re-lowered fresh each time — top-level consts are always
     /// constant-foldable expressions per the checker, so this is always
     /// valid, if occasionally redundant across multiple references).
-    fn lowerTopConst(self: *FnCtx, decl: ast.Index, file_idx: usize) Error!ir.ValueId {
+    ///
+    /// The initializer node comes from the const's own module's checked
+    /// tables (`constInitOf`), so an imported `export const` works too. Both
+    /// the module cursor and the file index are re-pointed at that module for
+    /// the duration — every source read (`tree`/`nodeType`/`nodeSymbol`)
+    /// indexes through `self.l.{files,checked,rmodule}[file_idx]` — then
+    /// restored. The initializer lowers into the *current* function's IR
+    /// builder regardless; only the source-reading context moves.
+    fn lowerTopConst(self: *FnCtx, gsym: GlobalSymbol, file_idx: usize) Error!ir.ValueId {
+        const mi = self.l.modules[@intFromEnum(gsym.module)];
+        const init_node = mi.checked.constInitOf(gsym.id) orelse return error.UnsupportedConstruct;
+        const saved_module = self.l.cur_module;
         const saved_file = self.file_idx;
+        self.l.setModule(gsym.module);
         self.file_idx = file_idx;
-        defer self.file_idx = saved_file;
-        const bk = self.kids(decl); // binding: [pattern, type_or_none, init_or_none]
-        if (bk[2] == ast.none) return error.UnsupportedConstruct;
-        return self.lowerExpr(bk[2]);
+        defer {
+            self.l.setModule(saved_module);
+            self.file_idx = saved_file;
+        }
+        return self.lowerExpr(init_node);
     }
 
     fn lowerShortCircuit(self: *FnCtx, op: lexer.Kind, lhs: ast.Index, rhs: ast.Index) Error!ir.ValueId {

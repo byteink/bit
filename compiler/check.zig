@@ -401,6 +401,11 @@ pub const TypeContext = struct {
     /// GlobalSymbol.pack() -> signature, for every func_decl (free function or
     /// method) and every generic function's own template signature.
     func_sigs: std.AutoHashMapUnmanaged(u64, FuncShape) = .{},
+    /// GlobalSymbol.pack() -> resolved type, for every top-level `const`. The
+    /// only value binding memoized project-wide (a module's per-binding
+    /// `var_types` dies with its `Checker`), so a dependent module can type a
+    /// reference to an imported `const` — and lowering can inline it.
+    const_types: std.AutoHashMapUnmanaged(u64, TypeId) = .{},
     /// TypeId (as u32) -> its method set, name-keyed. Deliberately separate
     /// from `TypeData.struct`/`.interface`: struct method sets are *not* part
     /// of type identity (§14.1 only lists fields), only of satisfaction
@@ -468,6 +473,7 @@ pub const TypeContext = struct {
         self.types.deinit();
         self.decl_memo.deinit(self.gpa);
         self.func_sigs.deinit(self.gpa);
+        self.const_types.deinit(self.gpa);
         var mit = self.method_sets.valueIterator();
         while (mit.next()) |bucket| bucket.deinit(self.gpa);
         self.method_sets.deinit(self.gpa);
@@ -820,7 +826,10 @@ const Checker = struct {
     /// SymbolId (this module only) -> its `let`/`const` initializer node, for
     /// the bounded constant evaluator (`constEval`, §15.4). Populated as each
     /// binding is seen, top-level ones during `collectDecls` (so order is
-    /// irrelevant, §9) and local ones as their statement is checked.
+    /// irrelevant, §9) and local ones as their statement is checked. Moved into
+    /// `CheckedModule` (not freed by `deinitLocal`) so lowering can inline a
+    /// top-level `const`'s initializer — including one imported from another
+    /// module — after this `Checker` goes out of scope.
     const_inits: std.AutoHashMapUnmanaged(SymbolId, ast.Index) = .{},
     /// SymbolId (this module only) -> resolved `TypeId`, for every
     /// `let`/`const`/`param`/`receiver` binding and every loop/catch/arrow
@@ -848,7 +857,6 @@ const Checker = struct {
     call_insts: std.AutoHashMapUnmanaged(u64, u32) = .{},
 
     fn deinitLocal(self: *Checker) void {
-        self.const_inits.deinit(self.gpa);
         self.var_types.deinit(self.gpa);
         self.method_ctx.deinit(self.gpa);
     }
@@ -2800,12 +2808,12 @@ const Checker = struct {
         const sym = self.symbolOf(gsym);
         switch (sym.kind) {
             .let_binding, .const_binding, .param, .receiver => {
-                // Cross-module let/const value lookups aren't memoized in
-                // `ctx` (only decl types/signatures are project-lifetime) —
-                // resolves to `.invalid` rather than crashing; fine for now
-                // since `bit build`'s single-pass-per-module driver doesn't
-                // exist yet (task #347).
-                if (gsym.module != self.module_id) return .invalid;
+                // A cross-module reference can only be to a top-level `const`
+                // (imports expose nothing else that lives in `var_types`), and
+                // its type is memoized project-wide in `ctx.const_types`; a
+                // mutable cross-module `let` has no such entry and stays
+                // `.invalid`. Same-module bindings read `var_types` directly.
+                if (gsym.module != self.module_id) return self.ctx.const_types.get(gsym.pack()) orelse .invalid;
                 return self.var_types.get(gsym.id) orelse .invalid;
             },
             .func => {
@@ -3045,7 +3053,13 @@ const Checker = struct {
                 try self.emit(mf, init_node, .non_constant_expr, "top-level 'const' initializer must be a compile-time constant expression", .{}, null);
             }
             if (mf.tree.get(pat).tag == .ident) {
-                if (self.nodeSymbol(file_idx, pat)) |gs| try self.const_inits.put(self.gpa, gs.id, init_node);
+                if (self.nodeSymbol(file_idx, pat)) |gs| {
+                    try self.const_inits.put(self.gpa, gs.id, init_node);
+                    // Memoize the type project-wide so a dependent module can
+                    // resolve a reference to this `const` (its own `var_types`
+                    // dies with this `Checker`).
+                    if (is_top) try self.ctx.const_types.put(self.gpa, gs.pack(), bind_ty);
+                }
             }
         }
     }
@@ -3849,12 +3863,17 @@ pub const CheckedModule = struct {
     /// Moved out of `Checker.call_insts` (see its doc comment) — lowering's
     /// only use for this module past `checkModule` returning.
     call_insts: std.AutoHashMapUnmanaged(u64, u32) = .{},
+    /// Moved out of `Checker.const_inits` (see its doc comment) — lowering
+    /// inlines a top-level `const`'s initializer by re-lowering the node this
+    /// maps its symbol to.
+    const_inits: std.AutoHashMapUnmanaged(SymbolId, ast.Index) = .{},
 
     pub fn deinit(self: *CheckedModule) void {
         for (self.node_types) |nt| self.gpa.free(nt);
         self.gpa.free(self.node_types);
         if (self.type_dump) |d| self.gpa.free(d);
         self.call_insts.deinit(self.gpa);
+        self.const_inits.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -3866,6 +3885,13 @@ pub const CheckedModule = struct {
     /// to, if `node` is such a call — see `Checker.call_insts`.
     pub fn instantiationOf(self: *const CheckedModule, file_idx: usize, node: ast.Index) ?u32 {
         return self.call_insts.get(packFileNode(file_idx, node));
+    }
+
+    /// The initializer node of the top-level `const` bound to `sym` (a
+    /// simple-`ident` binding in this module), or `null` — see
+    /// `Checker.const_inits`. Lowering inlines it at each reference.
+    pub fn constInitOf(self: *const CheckedModule, sym: SymbolId) ?ast.Index {
+        return self.const_inits.get(sym);
     }
 };
 
@@ -3931,11 +3957,13 @@ pub fn checkModule(
     try checker.collectDecls();
     try checker.checkBodies();
     const dump = if (dump_types) try checker.dumpTypesText() else null;
-    // `call_insts` is moved out (not freed by `deinitLocal`, which only ever
-    // owned the checking-time-only tables) into the returned `CheckedModule`.
+    // `call_insts`/`const_inits` are moved out (not freed by `deinitLocal`,
+    // which only ever owned the checking-time-only tables) into the returned
+    // `CheckedModule`.
     const call_insts = checker.call_insts;
+    const const_inits = checker.const_inits;
     checker.deinitLocal();
-    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts };
+    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts, .const_inits = const_inits };
 }
 
 const testing = std.testing;
@@ -4014,6 +4042,7 @@ test "constEval folds literals, unary, binary, and const references" {
     defer {
         gpa.free(checker.node_types[0]);
         gpa.free(checker.node_types);
+        checker.const_inits.deinit(gpa); // normally moved into CheckedModule; freed by hand here
         checker.deinitLocal();
     }
     try checker.collectDecls();
