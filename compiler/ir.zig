@@ -71,6 +71,8 @@ pub const RtFn = enum {
     /// `(string, index) -> u8`: the byte at `index`, bounds-checked (panics on
     /// out-of-range, SPEC §18.4). Backs `s[i]` on a string.
     string_byte,
+    /// `(f64) -> f64`: square root (hardware `sqrtsd`/`fsqrt`), backs std/math.
+    sqrt,
     panic,
     assert,
     /// One `string` arg: writes its bytes to stdout (no trailing newline).

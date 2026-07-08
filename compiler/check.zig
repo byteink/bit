@@ -2325,6 +2325,11 @@ const Checker = struct {
             try self.checkFixedArgs(file_idx, node, name, arg_items, &.{i64_id}, env, fctx);
             return i64_id;
         }
+        if (std.mem.eql(u8, name, "fsqrt")) {
+            const f64_id = self.ctx.prim_ids.get(.f64);
+            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{f64_id}, env, fctx);
+            return f64_id;
+        }
         try self.checkArgsLoose(file_idx, arg_items, env, fctx);
         return .invalid;
     }

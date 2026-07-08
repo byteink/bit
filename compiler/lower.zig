@@ -1824,6 +1824,10 @@ const FnCtx = struct {
             defer self.gpa.free(vals);
             return self.b.rtCall(try self.nodeType(node), rt, vals);
         }
+        if (std.mem.eql(u8, name, "fsqrt")) {
+            const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+            return self.b.rtCall(try self.nodeType(node), .sqrt, &.{v});
+        }
         return error.UnsupportedConstruct; // delete/close: deferred
     }
 

@@ -471,6 +471,12 @@ export fn bit_rt_string_eq(a: *const RtBytes, b: *const RtBytes) callconv(.c) bo
     return std.mem.eql(u8, a.ptr[0..a.len], b.ptr[0..b.len]);
 }
 
+/// `bit_rt_sqrt` (ABI.md §14): the square root, backing `std/math`'s `sqrt`.
+/// `@sqrt` lowers to the hardware instruction (`sqrtsd`/`fsqrt`) — no libm.
+export fn bit_rt_sqrt(x: f64) callconv(.c) f64 {
+    return @sqrt(x);
+}
+
 /// `bit_rt_string_byte` (ABI.md §2): the byte at `index`, backing `s[i]` on a
 /// string (SPEC §12.2 — result type `u8`). Out-of-range panics, mirroring
 /// slice indexing (SPEC §18.4). Returns `u64` (zero-extended), like

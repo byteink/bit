@@ -153,6 +153,8 @@ const predeclared_funcs = [_][]const u8{
     // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
     // readFile layer wraps these in std/fs.
     "fsOpen", "fsReadAll", "fsWrite", "fsClose",
+    // Float square root (hardware instruction); std/math re-exports it as `sqrt`.
+    "fsqrt",
 };
 
 // ============================================================================
