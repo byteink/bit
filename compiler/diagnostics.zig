@@ -87,6 +87,9 @@ pub const Code = enum(u16) {
     expected_call_expr = 66,
     catch_block_incomplete = 67,
     cannot_infer_type = 68,
+    not_an_enum = 69,
+    unknown_variant = 70,
+    non_exhaustive_match = 71,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {

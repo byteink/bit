@@ -265,6 +265,7 @@ const Parser = struct {
             .kw_function => return self.parseFuncDecl(),
             .kw_struct => return self.parseStructDecl(),
             .kw_interface => return self.parseInterfaceDecl(),
+            .kw_enum => return self.parseEnumDecl(),
             .kw_type => return self.parseTypeAlias(),
             else => {
                 try self.fail("a top-level declaration");
@@ -280,6 +281,7 @@ const Parser = struct {
             .kw_function => return self.parseFuncDecl(),
             .kw_struct => return self.parseStructDecl(),
             .kw_interface => return self.parseInterfaceDecl(),
+            .kw_enum => return self.parseEnumDecl(),
             .kw_type => return self.parseTypeAlias(),
             else => {
                 try self.fail("a declaration after 'export'");
@@ -487,6 +489,35 @@ const Parser = struct {
         return self.tree.add(.@"export", join(start, self.span(ty)), 0, &.{node});
     }
 
+    fn parseEnumDecl(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        try self.advance(); // 'enum'
+        const name = try self.expectIdent();
+        const generics = try self.maybeGenericParams();
+        _ = try self.expect(.l_brace, "'{'");
+        const items = try self.commaList(.r_brace, parseVariant, true);
+        defer self.gpa.free(items);
+        const end = try self.expect(.r_brace, "'}'");
+        const variant_list = try self.tree.add(.variant_list, join(start, end), 0, items);
+        return self.tree.add(.enum_decl, join(start, end), 0, &.{ name, generics, variant_list });
+    }
+
+    /// One enum variant: a name, optionally followed by a parenthesized payload
+    /// type list `V(T, U)` (Stage 2 — parsed now, carried as `type_list`).
+    fn parseVariant(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        const name = try self.expectIdent();
+        var payload: Index = none;
+        var end = self.span(name);
+        if (try self.accept(.l_paren)) {
+            const tys = try self.commaList(.r_paren, parseType, false);
+            defer self.gpa.free(tys);
+            end = try self.expect(.r_paren, "')'");
+            payload = try self.tree.add(.type_list, join(start, end), 0, tys);
+        }
+        return self.tree.add(.enum_variant, join(start, end), 0, &.{ name, payload });
+    }
+
     fn parseInterfaceDecl(self: *Parser) ParseError!Index {
         const start = self.tok.span;
         try self.advance(); // 'interface'
@@ -653,7 +684,7 @@ const Parser = struct {
                     return;
                 },
                 .r_brace, .kw_case, .kw_default => return,
-                .kw_let, .kw_const, .kw_if, .kw_while, .kw_for, .kw_switch, .kw_select, .kw_return, .kw_fail, .kw_break, .kw_continue, .kw_spawn, .kw_defer => return,
+                .kw_let, .kw_const, .kw_if, .kw_while, .kw_for, .kw_switch, .kw_match, .kw_select, .kw_return, .kw_fail, .kw_break, .kw_continue, .kw_spawn, .kw_defer => return,
                 else => {},
             }
             _ = self.advance() catch return;
@@ -667,6 +698,7 @@ const Parser = struct {
             .kw_while => return self.parseWhileStmt(),
             .kw_for => return self.parseForStmt(),
             .kw_switch => return self.parseSwitchStmt(),
+            .kw_match => return self.parseMatchStmt(),
             .kw_select => return self.parseSelectStmt(),
             .kw_return => return self.parseReturnStmt(),
             .kw_fail => return self.parseFailStmt(),
@@ -874,6 +906,49 @@ const Parser = struct {
             }
         }
         return stmts.toOwnedSlice(self.gpa);
+    }
+
+    // ---- match (§16.4) ---------------------------------------------------------
+
+    fn parseMatchStmt(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        try self.advance(); // 'match'
+        _ = try self.expect(.l_paren, "'('");
+        const subject = try self.parseExpression();
+        _ = try self.expect(.r_paren, "')'");
+        _ = try self.expect(.l_brace, "'{'");
+        var arms: std.ArrayList(Index) = .empty;
+        defer arms.deinit(self.gpa);
+        var guard: u32 = 0;
+        while (self.tok.kind != .r_brace and self.tok.kind != .eof and guard < max_case_clauses) : (guard += 1) {
+            if (try self.accept(.semicolon)) continue;
+            try arms.append(self.gpa, try self.parseMatchArm());
+            const at_boundary = self.tok.kind == .r_brace or self.tok.kind == .eof;
+            if (!try self.accept(.semicolon) and !at_boundary) {
+                try self.fail("';'");
+                self.synchronizeStatement();
+            }
+        }
+        std.debug.assert(guard < max_case_clauses);
+        const end = try self.expect(.r_brace, "'}'");
+        const arm_list = try self.tree.add(.arm_list, join(start, end), 0, arms.items);
+        return self.tree.add(.match_stmt, join(start, end), 0, &.{ subject, arm_list });
+    }
+
+    fn parseMatchArm(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        const pat = try self.parseVariantPat();
+        _ = try self.expect(.fat_arrow, "'=>'");
+        const body = try self.parseStatement();
+        return self.tree.add(.match_arm, join(start, self.span(body)), 0, &.{ pat, body });
+    }
+
+    /// A variant pattern: a variant name, optionally binding its payload
+    /// `V(a, b)` (Stage 2 — Stage 1 has no payload, so binders stay `none`).
+    fn parseVariantPat(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        const name = try self.expectIdent();
+        return self.tree.add(.variant_pat, join(start, self.span(name)), 0, &.{ name, none });
     }
 
     // ---- select (§16.3) --------------------------------------------------------

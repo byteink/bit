@@ -241,7 +241,7 @@ fn classOf(tctx: *const TypeContext, ty: TypeId) regalloc.Class {
 fn isRefType(tctx: *const TypeContext, ty: TypeId) bool {
     return switch (tctx.typeOf(ty)) {
         .prim => |p| p == .string,
-        .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible => false,
+        .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible, .@"enum" => false, // enum: bare tag word (Stage 1)
         else => true, // slice/array/map/tuple/chan/struct/interface/func
     };
 }

@@ -743,6 +743,7 @@ fn symbolKindLabel(k: resolve.SymbolKind) []const u8 {
         .type_alias => "type",
         .struct_type => "struct",
         .interface_type => "interface",
+        .enum_type => "enum",
         .import_namespace, .import_item => "import",
         .builtin_type => "type",
         .builtin_func => "func",

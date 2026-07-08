@@ -69,6 +69,7 @@ pub const SymbolKind = enum {
     type_alias,
     struct_type,
     interface_type,
+    enum_type,
     import_namespace,
     import_item,
     builtin_type,
@@ -462,6 +463,10 @@ const Resolver = struct {
                 const name = mf.tree.kids(idx)[0];
                 _ = try self.insertModuleSymbol(file_idx, name, .{ .name = identText(mf, name), .kind = .interface_type, .decl = idx, .file_idx = @intCast(file_idx), .exported = forced_export });
             },
+            .enum_decl => {
+                const name = mf.tree.kids(idx)[0];
+                _ = try self.insertModuleSymbol(file_idx, name, .{ .name = identText(mf, name), .kind = .enum_type, .decl = idx, .file_idx = @intCast(file_idx), .exported = forced_export });
+            },
             else => {}, // a poisoned decl from parser error recovery
         }
     }
@@ -645,6 +650,7 @@ const Resolver = struct {
             .func_decl => try self.resolveFuncDecl(file_idx, idx),
             .struct_decl => try self.resolveStructDecl(file_idx, idx),
             .interface_decl => try self.resolveInterfaceDecl(file_idx, idx),
+            .enum_decl => try self.resolveEnumDecl(file_idx, idx),
             else => {},
         }
     }
@@ -697,6 +703,42 @@ const Resolver = struct {
                 try self.reportDuplicate(mf, fk[0], fname);
             } else {
                 try seen.put(self.gpa, fname, {});
+            }
+        }
+    }
+
+    /// Resolves a `match`: the subject expression, then each arm's body in its
+    /// own scope. A `variant_pat`'s name is NOT a scope lookup — the checker
+    /// resolves it against the subject's enum type — so it is skipped here.
+    /// The per-arm scope is where Stage 2's payload binders will activate.
+    fn resolveMatch(self: *Resolver, file_idx: usize, idx: ast.Index, scope_id: u32) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [subject, arm_list]
+        try self.resolveNode(file_idx, k[0], scope_id);
+        for (mf.tree.kids(k[1])) |arm_idx| {
+            const ak = mf.tree.kids(arm_idx); // [variant_pat, body]
+            const arm_scope = try self.pushScope(scope_id);
+            try self.resolveNode(file_idx, ak[1], arm_scope);
+        }
+    }
+
+    fn resolveEnumDecl(self: *Resolver, file_idx: usize, idx: ast.Index) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [name, generics, variant_list]
+        const scope_id = try self.pushGenericsScope(file_idx, k[1], self.module_scope);
+
+        var seen: std.StringHashMapUnmanaged(void) = .{};
+        defer seen.deinit(self.gpa);
+        for (mf.tree.kids(k[2])) |v_idx| {
+            const vk = mf.tree.kids(v_idx); // [name, payload_or_none]
+            if (vk[1] != ast.none) {
+                for (mf.tree.kids(vk[1])) |ty| try self.resolveNode(file_idx, ty, scope_id);
+            }
+            const vname = identText(mf, vk[0]);
+            if (seen.contains(vname)) {
+                try self.reportDuplicate(mf, vk[0], vname);
+            } else {
+                try seen.put(self.gpa, vname, {});
             }
         }
     }
@@ -892,6 +934,7 @@ const Resolver = struct {
             .for_of => try self.resolveForOf(file_idx, idx, scope_id),
             .for_in => try self.resolveForIn(file_idx, idx, scope_id),
             .switch_stmt => try self.resolveSwitch(file_idx, idx, scope_id),
+            .match_stmt => try self.resolveMatch(file_idx, idx, scope_id),
             .select_stmt => try self.resolveSelect(file_idx, idx, scope_id),
             .catch_bind => {
                 const k = mf.tree.kids(idx); // [expr, err_ident, block]

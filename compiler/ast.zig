@@ -77,6 +77,9 @@ pub const Tag = enum {
     interface_decl, // [name_ident, generics_or_none, method_sig_list]
     method_sig_list, // [method_sig...]
     method_sig, // [name_ident, params, result_or_none]
+    enum_decl, // [name_ident, generics_or_none, variant_list]
+    variant_list, // [enum_variant...]
+    enum_variant, // [name_ident, payload_or_none]   payload = type_list (Stage 2)
     generic_params, // [generic_param...]
     generic_param, // [name_ident, constraint_or_none]
     constraint, // [type_name...]          interface bounds joined by `&`
@@ -125,6 +128,10 @@ pub const Tag = enum {
     comm_case, // [comm, stmt_list]        comm = send_stmt | recv_bind
     comm_default, // [stmt_list]
     recv_bind, // [binder_or_none, chan_expr]
+    match_stmt, // [subject, arm_list]
+    arm_list, // [match_arm...]
+    match_arm, // [variant_pat, body]      body = statement (block or single)
+    variant_pat, // [name_ident, binders_or_none]   binders = ident list (Stage 2)
 
     // ---- expressions -----------------------------------------------------
     binary, // main=op; [lhs, rhs]

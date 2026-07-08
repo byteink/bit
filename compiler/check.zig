@@ -142,6 +142,15 @@ pub const Prim = enum {
 
 pub const Field = struct { name: []const u8, ty: TypeId, exported: bool };
 
+/// One enum variant: a name and its ordered payload types (empty for a
+/// no-payload / C-like variant). The variant's tag is its index in the
+/// declaring enum's `variants` list.
+pub const Variant = struct { name: []const u8, payload: []const TypeId };
+
+/// A nominal enum type (§14.4): identity is the declaring symbol, NOT the
+/// variant list, so two `enum`s with identical variants are distinct types.
+pub const EnumType = struct { decl: GlobalSymbol, variants: []const Variant };
+
 /// A method signature. Shared shape for interface method sets (part of type
 /// identity, §14.1) and struct/alias method sets (not part of identity —
 /// stored separately in `TypeContext.method_sets`, §14.3).
@@ -186,6 +195,9 @@ pub const TypeData = union(enum) {
     interface: []const Method,
     /// A rigid, unbound generic parameter (or an interface's `Self`, §14.3).
     type_param: GlobalSymbol,
+    /// A nominal enum (§14.4) — identity is `EnumType.decl` (see `hashTypeData`
+    /// / `eql`), so two enums with the same variants stay distinct.
+    @"enum": EnumType,
     /// A boxed fallible result value (§18.2) — not a real union, cannot be
     /// constructed except via `return`/`fail`, only produced by calling a
     /// fallible function and consumed by `?`/`catch`.
@@ -226,6 +238,7 @@ fn hashTypeData(data: TypeData) u64 {
             h.update(std.mem.asBytes(&m.result));
         },
         .type_param => |g| h.update(std.mem.asBytes(&g)),
+        .@"enum" => |e| h.update(std.mem.asBytes(&e.decl)), // nominal: decl alone
         .fallible => |f| {
             h.update(std.mem.asBytes(&f.ok));
             h.update(std.mem.asBytes(&f.err));
@@ -271,6 +284,7 @@ fn eqlTypeData(a: TypeData, b: TypeData) bool {
             break :blk true;
         },
         .type_param => |g| g.module == b.type_param.module and g.id == b.type_param.id,
+        .@"enum" => |e| e.decl.module == b.@"enum".decl.module and e.decl.id == b.@"enum".decl.id,
         .fallible => |f| f.ok == b.fallible.ok and f.err == b.fallible.err,
     };
 }
@@ -652,7 +666,7 @@ pub const TypeContext = struct {
             // `instantiateRecursive` handles those directly (it needs the
             // reserve-then-fill cycle guard, not plain rebuild-and-intern)
             // rather than going through here.
-            .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .prim, .@"struct", .interface => return ty,
+            .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .prim, .@"struct", .interface, .@"enum" => return ty,
         }
     }
 
@@ -800,11 +814,15 @@ fn appendTypeName(nc: NameCtx, buf: *std.ArrayList(u8), ty: TypeId, depth: u32) 
             try buf.appendSlice(nc.gpa, "!");
             if (f.err != nc.ctx.error_id) try appendTypeName(nc, buf, f.err, depth + 1);
         },
-        .@"struct", .interface => {
+        .@"struct", .interface, .@"enum" => {
             if (nc.ctx.display_names.get(@intFromEnum(ty))) |n| {
                 try buf.appendSlice(nc.gpa, n);
             } else {
-                try buf.appendSlice(nc.gpa, if (nc.ctx.typeOf(ty) == .@"struct") "struct{...}" else "interface{...}");
+                try buf.appendSlice(nc.gpa, switch (nc.ctx.typeOf(ty)) {
+                    .@"struct" => "struct{...}",
+                    .@"enum" => "enum{...}",
+                    else => "interface{...}",
+                });
             }
         },
         .type_param => |g| {
@@ -941,7 +959,7 @@ const Checker = struct {
         switch (sym.kind) {
             .builtin_type => return builtinTypeId(self.ctx, sym.name) orelse .invalid,
             .generic_param => return envLookup(env, gsym) orelse try self.ctx.typeParamId(gsym),
-            .struct_type, .interface_type, .type_alias => {
+            .struct_type, .interface_type, .type_alias, .enum_type => {
                 const arity = self.declGenericArity(gsym);
                 if (arity > 0) {
                     try self.emit(mf, node, .generic_arity_mismatch, "'{s}' needs {d} type argument(s); write '{s}<...>'", .{ sym.name, arity, sym.name }, null);
@@ -1077,7 +1095,7 @@ const Checker = struct {
                 for (fields) |f| if (!self.comparable(f.ty)) break :blk false;
                 break :blk true;
             },
-            .slice, .map, .func, .chan, .void, .fallible => false,
+            .slice, .map, .func, .chan, .void, .fallible, .@"enum" => false, // enums: use `match`, not `==` (Stage 1)
         };
     }
 
@@ -1120,8 +1138,9 @@ const Checker = struct {
         return switch (sym.kind) {
             .struct_type => self.buildStructTemplate(gsym, sym),
             .interface_type => self.buildInterfaceTemplate(gsym, sym),
+            .enum_type => self.buildEnumTemplate(gsym, sym),
             .type_alias => self.buildAlias(gsym, sym),
-            else => unreachable, // caller only reaches here for these three kinds
+            else => unreachable, // caller only reaches here for these kinds
         };
     }
 
@@ -1194,6 +1213,31 @@ const Checker = struct {
             try fields.append(self.gpa, .{ .name = Checker.identText(mf, fk[0]), .ty = fty, .exported = exported });
         }
         self.ctx.types.fill(placeholder, .{ .@"struct" = try dupe(self.ctx.arena(), Field, fields.items) });
+        try setDisplayName(self.ctx, placeholder, sym.name);
+        return placeholder;
+    }
+
+    fn buildEnumTemplate(self: *Checker, gsym: GlobalSymbol, sym: Symbol) Error!TypeId {
+        const placeholder = try self.ctx.types.reserve(.{ .@"enum" = .{ .decl = gsym, .variants = &.{} } });
+        try self.ctx.decl_memo.put(self.gpa, gsym.pack(), placeholder);
+        const mf = self.files[sym.file_idx];
+        const k = mf.tree.kids(sym.decl); // [name, generics, variant_list]
+        const env = try self.buildOwnGenericEnv(gsym, sym.file_idx, k[1]);
+
+        var variants: std.ArrayList(Variant) = .empty;
+        defer variants.deinit(self.gpa);
+        for (mf.tree.kids(k[2])) |v_idx| {
+            const vk = mf.tree.kids(v_idx); // [name, payload_or_none]
+            var payload: []const TypeId = &.{};
+            if (vk[1] != ast.none) {
+                var ptys: std.ArrayList(TypeId) = .empty;
+                defer ptys.deinit(self.gpa);
+                for (mf.tree.kids(vk[1])) |ty| try ptys.append(self.gpa, try self.checkType(sym.file_idx, ty, env));
+                payload = try dupe(self.ctx.arena(), TypeId, ptys.items);
+            }
+            try variants.append(self.gpa, .{ .name = Checker.identText(mf, vk[0]), .payload = payload });
+        }
+        self.ctx.types.fill(placeholder, .{ .@"enum" = .{ .decl = gsym, .variants = try dupe(self.ctx.arena(), Variant, variants.items) } });
         try setDisplayName(self.ctx, placeholder, sym.name);
         return placeholder;
     }
@@ -1501,7 +1545,7 @@ const Checker = struct {
         const mf = self.files[file_idx];
         const inner = if (mf.tree.get(idx).tag == .@"export") mf.tree.kids(idx)[0] else idx;
         switch (mf.tree.get(inner).tag) {
-            .struct_decl, .interface_decl, .type_alias => {
+            .struct_decl, .interface_decl, .type_alias, .enum_decl => {
                 const gsym = self.nodeSymbol(file_idx, mf.tree.kids(inner)[0]) orelse return;
                 _ = try self.declTypeOf(gsym);
             },
@@ -2047,7 +2091,7 @@ const Checker = struct {
             .ident => {
                 const gsym = self.nodeSymbol(file_idx, node) orelse return false;
                 return switch (self.symbolOf(gsym).kind) {
-                    .builtin_type, .struct_type, .interface_type, .type_alias => true,
+                    .builtin_type, .struct_type, .interface_type, .type_alias, .enum_type => true,
                     else => false,
                 };
             },
@@ -2468,17 +2512,42 @@ const Checker = struct {
         }
     }
 
+    /// `EnumName.Variant` — a variant reference. For a no-payload variant it
+    /// IS a value of the enum type. (A payload variant is a constructor, handled
+    /// in Stage 2 via a `call` on this member; Stage 1 enums have no payloads.)
+    fn checkVariantRef(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node); // [recv, name]
+        const name = Checker.identText(mf, k[1]);
+        const enum_ty = try self.declTypeOf(enum_sym);
+        const data = self.ctx.typeOf(enum_ty);
+        if (data != .@"enum") return .invalid;
+        for (data.@"enum".variants) |v| {
+            if (std.mem.eql(u8, v.name, name)) {
+                if (v.payload.len != 0) {
+                    try self.emit(mf, k[1], .arg_count_mismatch, "variant '{s}' carries a payload; construct it with arguments", .{name}, null);
+                    return .invalid;
+                }
+                return enum_ty;
+            }
+        }
+        try self.emit(mf, k[1], .unknown_member, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, name }, null);
+        return .invalid;
+    }
+
     fn checkMember(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node); // [recv, name]
         if (mf.tree.get(k[0]).tag == .ident) {
             if (self.nodeSymbol(file_idx, k[0])) |gs| {
-                if (self.symbolOf(gs).kind == .import_namespace) {
+                const gk = self.symbolOf(gs).kind;
+                if (gk == .import_namespace) {
                     // Cross-module namespace member lookup isn't wired (no
                     // multi-file driver exists yet, task #347): resolves to
                     // `.invalid` rather than crashing.
                     return .invalid;
                 }
+                if (gk == .enum_type) return self.checkVariantRef(file_idx, node, gs);
             }
         }
         const recv_ty = try self.checkExpr(file_idx, k[0], env, fctx, .invalid);
@@ -2820,7 +2889,7 @@ const Checker = struct {
                 const shape = self.ctx.func_sigs.get(gsym.pack()) orelse return .invalid;
                 return self.ctx.types.intern(.{ .func = shape });
             },
-            .struct_type, .interface_type, .type_alias, .builtin_type, .generic_param => {
+            .struct_type, .interface_type, .type_alias, .enum_type, .builtin_type, .generic_param => {
                 try self.emit(mf, node, .type_mismatch, "'{s}' is a type, not a value", .{sym.name}, null);
                 return .invalid;
             },
@@ -3472,8 +3541,55 @@ const Checker = struct {
                 try self.checkBlock(file_idx, mf.tree.kids(node)[0], inner);
             },
             .switch_stmt => try self.checkSwitchStmt(file_idx, node, fctx),
+            .match_stmt => try self.checkMatchStmt(file_idx, node, fctx),
             .select_stmt => try self.checkSelectStmt(file_idx, node, fctx),
             else => {},
+        }
+    }
+
+    /// `match (subject) { V => stmt, ... }` (§16.4): the subject must be an
+    /// enum; every arm names one of its variants; arms must be exhaustive and
+    /// non-duplicated. Arm bodies are checked regardless so their own errors
+    /// surface even when the subject or a pattern is bad.
+    fn checkMatchStmt(self: *Checker, file_idx: usize, node: ast.Index, fctx: FnCtx) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node); // [subject, arm_list]
+        const subject_ty = try self.checkExpr(file_idx, k[0], fctx.env, fctx, .invalid);
+        const data = self.ctx.typeOf(subject_ty);
+        const is_enum = subject_ty != .invalid and data == .@"enum";
+        if (subject_ty != .invalid and !is_enum) {
+            const n = try self.typeName(subject_ty);
+            defer self.gpa.free(n);
+            try self.emit(mf, k[0], .not_an_enum, "'match' requires an enum subject, found '{s}'", .{n}, null);
+        }
+        const variants: []const Variant = if (is_enum) data.@"enum".variants else &.{};
+
+        const seen = try self.gpa.alloc(bool, variants.len);
+        defer self.gpa.free(seen);
+        @memset(seen, false);
+
+        for (mf.tree.kids(k[1])) |arm_idx| {
+            const ak = mf.tree.kids(arm_idx); // [variant_pat, body]
+            const vname = Checker.identText(mf, mf.tree.kids(ak[0])[0]);
+            if (is_enum) {
+                var matched = false;
+                for (variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v.name, vname)) {
+                        if (seen[i]) try self.emit(mf, ak[0], .duplicate_declaration, "duplicate arm for variant '{s}'", .{vname}, null);
+                        seen[i] = true;
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) try self.emit(mf, ak[0], .unknown_variant, "no variant '{s}' on this enum", .{vname}, null);
+            }
+            try self.checkStmt(file_idx, ak[1], fctx);
+        }
+
+        if (is_enum) {
+            for (variants, 0..) |v, i| {
+                if (!seen[i]) try self.emit(mf, k[0], .non_exhaustive_match, "non-exhaustive 'match': variant '{s}' is not handled", .{v.name}, null);
+            }
         }
     }
 

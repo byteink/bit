@@ -835,7 +835,7 @@ fn writeTypeName(w: *Writer, ctx: *const TypeContext, ty: TypeId, depth: u32) !v
             try writeTypeName(w, ctx, e, depth + 1);
             try w.writeAll(">");
         },
-        .@"struct", .interface => {
+        .@"struct", .interface, .@"enum" => {
             const name = ctx.display_names.get(@intFromEnum(ty)) orelse "<anon>";
             try w.writeAll(name);
         },

@@ -121,14 +121,15 @@ Reserved; may not be used as identifiers:
 
 ```
 as       assert    break     case      catch     chan
-const    continue  default   defer     else      export
-fail      false    for       from      function  if
-import   in        interface let       map       match
-nil      of        return    select    spawn     struct
-switch   true      type      while
+const    continue  default   defer     else      enum
+export   fail      false     for       from      function
+if       import    in        interface let       map
+match    nil       of        return    select    spawn
+struct   switch    true      type      while
 ```
 
-`match` is reserved for a future release but is not otherwise used in v0.1.
+`match` selects on an enum value (§13.8). Its payload-binding form
+(`V(a, b) => …`) is reserved for a later release; v0.1 binds no payload.
 
 ### 5.3 Predeclared Identifiers (not keywords)
 
@@ -353,6 +354,7 @@ top_decl     = import_decl
              | [ "export" ] func_decl
              | [ "export" ] struct_decl
              | [ "export" ] interface_decl
+             | [ "export" ] enum_decl
              | [ "export" ] type_alias
              | method_decl .            (* export follows the receiver type *)
 ```
@@ -462,6 +464,8 @@ field       = [ "export" ] IDENT ":" type .
 ```
 interface_decl = "interface" IDENT [ generic_params ] "{" [ method_sig { ( ";" | "," ) method_sig } [ ";" | "," ] ] "}" .
 method_sig     = IDENT signature .
+enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_variant { ( ";" | "," ) enum_variant } [ ";" | "," ] ] "}" .
+enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* payload reserved; §14.7 *)
 ```
 
 Interfaces are **structural** (§14.3): a type satisfies an interface if it has all
@@ -753,6 +757,7 @@ statement = value_decl
           | for_stmt
           | while_stmt
           | switch_stmt
+          | match_stmt
           | select_stmt
           | return_stmt
           | fail_stmt
@@ -885,6 +890,30 @@ synchronization (mutex, atomics) is deferred to the standard library in a later
 release. The recommended discipline: *do not communicate by sharing memory; share
 memory by communicating.*
 
+### 13.8 Match
+
+`match` dispatches on an enum value (§14.7):
+
+```
+match_stmt  = "match" "(" expression ")" "{" { match_arm [ ";" ] } "}" .
+match_arm   = variant_pat "=>" statement .
+variant_pat = IDENT .                            (* a variant name *)
+```
+
+The subject expression must be an enum type. Each arm names one of the enum's
+variants (bare, unqualified — the subject's type disambiguates) and runs its
+body statement when the value is that variant. A `match` is:
+
+- **Exhaustive** — every variant of the enum must have an arm; a missing variant
+  is a compile error (`E0071`). This is `match`'s central guarantee: adding a
+  variant to an enum turns every `match` that forgot it into a compile error.
+- **Non-overlapping** — a variant may appear in at most one arm (a duplicate is
+  a compile error).
+
+Arms do not fall through. `break`/`continue` inside an arm target the enclosing
+loop, not the `match`. Payload-binding arms (`V(a, b) => …`) are reserved for a
+later release (§14.7).
+
 ---
 
 ## 14. Type System
@@ -963,6 +992,30 @@ See §15.4.
   comparable — a documented runtime condition).
 - Map keys (`K`) must be a comparable type; a non-comparable key type is a compile
   error.
+
+### 14.7 Enum Types
+
+An enum is a nominal type whose values are one of a fixed, named set of variants:
+
+```
+enum_decl    = "enum" IDENT [ generic_params ] "{" { enum_variant [ "," ] } "}" .
+enum_variant = IDENT [ "(" type { "," type } ")" ] .   (* payload reserved *)
+```
+
+```
+enum Color { Red, Green, Blue }
+let c = Color.Green            // construct a value: EnumName.Variant
+```
+
+- **Nominal identity** (unlike structs/interfaces, §14.1): two enums with the same
+  variant names are still distinct types. A bare `Color` is a type, not a value;
+  a value is written `Color.Variant`.
+- Enum values are consumed by `match` (§13.8), which is exhaustive over the
+  variants. Enums are not ordered and not `==`-comparable in v0.1 — use `match`.
+- The parenthesized payload form (`Circle(f64)`, carrying data per variant, i.e.
+  a full tagged-union / sum type) is parsed but reserved for a later release; v0.1
+  variants carry no payload. Generic enums (`enum Option<T> { Some(T), None }`)
+  are likewise deferred until payloads land.
 
 ---
 
@@ -1314,7 +1367,10 @@ function main(): ()! {
 
 Intentionally **not** in v0.1, to keep the surface minimal:
 
-- `match` expressions / pattern matching (keyword reserved).
+- Enum payloads / sum types (`enum E { V(T) }`) and payload-binding `match` arms
+  (`V(a) => …`): v0.1 has C-like enums + exhaustive `match` (§14.7, §13.8), but
+  variants carry no data yet. `match` as an *expression* (yielding a value) is
+  also deferred; v0.1's `match` is a statement.
 - General union and optional types; `null` (absence is modeled by `nil` zero
   values and the Result model).
 - Pointers, `&`/`*`, value-vs-pointer receivers.
@@ -1342,6 +1398,7 @@ top_decl      = import_decl
               | [ "export" ] func_decl
               | [ "export" ] struct_decl
               | [ "export" ] interface_decl
+              | [ "export" ] enum_decl
               | [ "export" ] type_alias
               | method_decl .
 
@@ -1415,6 +1472,9 @@ for_in        = IDENT "in" expression .
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
 switch_case   = "case" expression { "," expression } ":" { statement ";" }
               | "default" ":" { statement ";" } .
+match_stmt    = "match" "(" expression ")" "{" { match_arm [ ";" ] } "}" .
+match_arm     = variant_pat "=>" statement .
+variant_pat   = IDENT .                          (* payload binders reserved; §13.8 *)
 select_stmt   = "select" "{" { comm_clause } "}" .
 comm_clause   = "case" ( send_stmt | recv_bind ) ":" { statement ";" }
               | "default" ":" { statement ";" } .

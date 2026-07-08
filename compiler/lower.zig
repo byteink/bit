@@ -124,6 +124,8 @@ fn fieldLayout(data: TypeData) FieldLayout {
             .string => .{ .size = 8, .is_ptr = true },
         };
     }
+    // A Stage 1 enum is a bare tag word, not a boxed handle (no payloads yet).
+    if (data == .@"enum") return .{ .size = 8, .is_ptr = false };
     // slice/array/map/tuple/chan/struct/interface/func: uniform boxed handle.
     // void/untyped_*/invalid/type_param/fallible must never reach here in a
     // fully checked, monomorphized program.
@@ -895,6 +897,7 @@ const FnCtx = struct {
             .for_of => try self.lowerForOf(node),
             .for_inf => try self.lowerForInf(node),
             .switch_stmt => try self.lowerSwitch(node),
+            .match_stmt => try self.lowerMatch(node),
             .select_stmt => try self.lowerSelect(node),
             .block => try self.lowerBlockScoped(node),
             else => return error.UnsupportedConstruct, // for_in
@@ -1361,6 +1364,80 @@ const FnCtx = struct {
         } else {
             try self.emitUnreachable();
         }
+    }
+
+    /// `match (subject) { V => stmt, ... }` (§16.4). The subject lowers to its
+    /// tag (a bare i64, Stage 1). Arms test `tag == variantIndex` in order; the
+    /// checker guarantees exhaustiveness with no duplicates, so the final arm is
+    /// the unconditional else. Env values an arm reassigns are carried to the
+    /// join as block params (`addLoopParams`), mirroring `lowerSwitch`. `match`
+    /// is not a break target — `break`/`continue` in an arm reach the enclosing
+    /// loop via `loop_stack`, so none is pushed here.
+    fn lowerMatch(self: *FnCtx, node: ast.Index) Error!void {
+        const k = self.kids(node); // [subject, arm_list]
+        const subject_ty = try self.nodeType(k[0]);
+        const tag = try self.lowerExprH(k[0], subject_ty);
+        const ed = self.ctx.typeOf(subject_ty);
+        const variants: []const check.Variant = if (ed == .@"enum") ed.@"enum".variants else &.{};
+        const arms = self.kids(k[1]);
+        if (arms.len == 0) return; // subject wasn't an enum; checker already diagnosed
+
+        const pre_len = self.env.bindings.items.len;
+        const orig = try self.env.snapshotValues(self.gpa, pre_len);
+        defer self.gpa.free(orig);
+
+        const join = try self.b.newBlock();
+        var join_reachable = false;
+
+        // Every arm but the last: `tag == variant` selects the body, else the
+        // next test. The last arm is the exhaustive fallthrough.
+        for (arms[0 .. arms.len - 1]) |arm| {
+            const ak = self.kids(arm); // [variant_pat, body]
+            const arm_tag = variantTag(variants, self.identText(self.kids(ak[0])[0]));
+            const body_blk = try self.b.newBlock();
+            const next_blk = try self.b.newBlock();
+            const cond = try self.emitEq(subject_ty, tag, try self.b.constInt(subject_ty, arm_tag));
+            try self.emitBr(cond, body_blk, &.{}, next_blk, &.{});
+            self.switchBlock(body_blk);
+            try self.lowerMatchArmBody(ak[1], orig, pre_len, join, &join_reachable);
+            self.switchBlock(next_blk);
+        }
+        try self.lowerMatchArmBody(self.kids(arms[arms.len - 1])[1], orig, pre_len, join, &join_reachable);
+
+        self.b.endBlock();
+        self.b.beginBlock(join);
+        if (join_reachable) {
+            try self.addLoopParams(pre_len);
+            self.terminated = false;
+        } else {
+            try self.emitUnreachable();
+        }
+    }
+
+    /// Lowers one match arm body in the current block, carrying any reassigned
+    /// env values to `join` (unless the body diverged). Restores the pre-match
+    /// env afterward so the next arm starts clean.
+    fn lowerMatchArmBody(self: *FnCtx, body: ast.Index, orig: []const ir.ValueId, pre_len: usize, join: ir.BlockId, join_reachable: *bool) Error!void {
+        self.env.restoreValues(orig);
+        const mark = self.env.mark();
+        try self.lowerStmt(body);
+        self.env.restoreCount(mark);
+        if (!self.terminated) {
+            join_reachable.* = true;
+            const vals = try self.env.snapshotValues(self.gpa, pre_len);
+            defer self.gpa.free(vals);
+            try self.emitJump(join, vals);
+        }
+        self.env.restoreValues(orig);
+    }
+
+    /// The tag (declaration index) of the variant named `name`, or 0 if not
+    /// found (the checker already rejected an unknown variant).
+    fn variantTag(variants: []const check.Variant, name: []const u8) i64 {
+        for (variants, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, name)) return @intCast(i);
+        }
+        return 0;
     }
 
     /// One arm of a `switch`'s decision chain: `subject == e` for a value
@@ -2323,9 +2400,26 @@ const FnCtx = struct {
 
     fn lowerMember(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [recv, name]
+        const name = self.identText(k[1]);
+        // `EnumName.Variant` — a variant reference lowers to its tag (Stage 1:
+        // a bare i64, enum-typed). The member node itself was typed as the enum
+        // by `checkVariantRef`, so its variant list gives the tag index.
+        if (self.tree().get(k[0]).tag == .ident) {
+            if (self.nodeSymbol(k[0])) |gs| {
+                if (self.l.symbolOf(gs).kind == .enum_type) {
+                    const enum_ty = try self.nodeType(node);
+                    const ed = self.ctx.typeOf(enum_ty);
+                    if (ed == .@"enum") {
+                        for (ed.@"enum".variants, 0..) |v, i| {
+                            if (std.mem.eql(u8, v.name, name)) return self.b.constInt(enum_ty, @intCast(i));
+                        }
+                    }
+                    return error.UnsupportedConstruct;
+                }
+            }
+        }
         const recv_ty = try self.nodeType(k[0]);
         const data = self.ctx.typeOf(recv_ty);
-        const name = self.identText(k[1]);
         if (data == .@"struct") {
             for (data.@"struct", 0..) |f, i| {
                 if (!std.mem.eql(u8, f.name, name)) continue;

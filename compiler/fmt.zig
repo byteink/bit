@@ -599,6 +599,24 @@ const Printer = struct {
                     try self.printNode(k[2]);
                 }
             },
+            .enum_decl => {
+                const k = self.kids(idx);
+                try self.raw("enum ");
+                try self.printNode(k[0]);
+                if (k[1] != none) try self.printNode(k[1]);
+                try self.raw(" ");
+                try self.printNode(k[2]);
+            },
+            .variant_list => try self.printCommaList(self.kids(idx), "{", "}", n.span.end),
+            .enum_variant => {
+                const k = self.kids(idx);
+                try self.printNode(k[0]);
+                if (k[1] != none) {
+                    try self.raw("(");
+                    try self.printFlatList(self.kids(k[1]), ", ");
+                    try self.raw(")");
+                }
+            },
             .generic_params => try self.printCommaList(self.kids(idx), "<", ">", n.span.end),
             .generic_param => {
                 const k = self.kids(idx);
@@ -799,6 +817,32 @@ const Printer = struct {
                 self.indent += 1;
                 try self.printNoLeadBlank(self.kids(k[0]), true);
                 self.indent -= 1;
+            },
+            .match_stmt => {
+                const k = self.kids(idx);
+                try self.raw("match (");
+                try self.printNode(k[0]);
+                try self.raw(") ");
+                try self.printNode(k[1]);
+            },
+            .arm_list => {
+                try self.raw("{");
+                self.indent += 1;
+                try self.printNoLeadBlank(self.kids(idx), false);
+                try self.gap(n.span.end, true);
+                self.indent -= 1;
+                try self.raw("}");
+            },
+            .match_arm => {
+                const k = self.kids(idx);
+                try self.printNode(k[0]);
+                try self.raw(" => ");
+                try self.printNode(k[1]);
+            },
+            .variant_pat => {
+                const k = self.kids(idx);
+                try self.printNode(k[0]);
+                if (k[1] != none) try self.printCommaList(self.kids(k[1]), "(", ")", n.span.end);
             },
 
             .select_stmt => {
