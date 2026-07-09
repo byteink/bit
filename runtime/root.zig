@@ -685,6 +685,205 @@ export fn bit_rt_slice_slice(h: *const SliceHeader, lo: usize, hi: usize) callco
 }
 
 // ---------------------------------------------------------------------------
+// Maps (SPEC §11.2, §13.5; ABI.md §15) — open-addressing hash table
+// ---------------------------------------------------------------------------
+// A `map<K,V>` is a `MapHeader` GC object over three parallel `cap`-slot
+// buffers: `keys`, `vals` (slice-style word buffers, ref-typed — hence traced
+// element-wise — when the stored word is a GC reference), and `ctrl` (one
+// state byte per slot). Linear probing. It grows (doubling `cap`, rehashing,
+// dropping tombstones) once full+tombstone load reaches 7/8, so an EMPTY slot
+// always exists and every probe loop terminates in <= `cap` steps.
+//
+// A key is one word: a scalar compared/hashed by value, or a `string`
+// (`*RtBytes`) compared/hashed by its bytes — `key_is_string` selects which,
+// and also whether the key buffer is a traced ref-array (`string` is the only
+// comparable reference key type; §14.6). `val_is_ref` traces the value buffer.
+
+const CtrlEmpty: u8 = 0;
+const CtrlFull: u8 = 1;
+const CtrlTomb: u8 = 2;
+
+const MapHeader = extern struct {
+    keys: [*]u64, // +0   slot keys (ref-array iff key_is_string) — traced
+    vals: [*]u64, // +8   slot values (ref-array iff val_is_ref)   — traced
+    ctrl: [*]u8, // +16   per-slot state (leaf buffer, kept alive) — traced base
+    len: usize, // +24    live entries
+    cap: usize, // +32    slot count (power of two, >= 8)
+    used: usize, // +40   FULL + TOMB slots (drives growth)
+    key_is_string: usize, // +48
+    val_is_ref: usize, // +56
+};
+
+const map_info = gc_mod.TypeInfo.of(@sizeOf(MapHeader), &[_]usize{ 0, 8, 16 }, "map");
+const mapctrl_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "mapctrl"); // leaf
+
+fn allocCtrl(cap: usize) [*]u8 {
+    const body = g_gc.allocRaw(cap, &mapctrl_info) orelse fatal("out of memory");
+    return @ptrCast(body); // zeroed by allocRaw => every slot CtrlEmpty
+}
+
+fn mapHash(m: *const MapHeader, key: u64) u64 {
+    if (m.key_is_string != 0) {
+        const s: *const RtBytes = @ptrFromInt(@as(usize, @intCast(key)));
+        return std.hash.Wyhash.hash(0, s.ptr[0..s.len]);
+    }
+    // splitmix64 finalizer: cheap avalanche so low-entropy integer keys
+    // (0,1,2,…) don't cluster in the low probe bins.
+    var x = key;
+    x = (x ^ (x >> 30)) *% 0xbf58476d1ce4e5b9;
+    x = (x ^ (x >> 27)) *% 0x94d049bb133111eb;
+    return x ^ (x >> 31);
+}
+
+fn mapKeyEq(m: *const MapHeader, a: u64, b: u64) bool {
+    if (m.key_is_string != 0) {
+        const sa: *const RtBytes = @ptrFromInt(@as(usize, @intCast(a)));
+        const sb: *const RtBytes = @ptrFromInt(@as(usize, @intCast(b)));
+        return std.mem.eql(u8, sa.ptr[0..sa.len], sb.ptr[0..sb.len]);
+    }
+    return a == b;
+}
+
+// Locates `key`'s slot. `found` => `slot` holds it; otherwise `slot` is where
+// it belongs (the first tombstone seen, else the terminating EMPTY).
+fn mapProbe(m: *const MapHeader, key: u64) struct { slot: usize, found: bool } {
+    const mask = m.cap - 1;
+    var i = mapHash(m, key) & mask;
+    var first_tomb: usize = m.cap; // sentinel: "none seen"
+    var steps: usize = 0;
+    while (steps < m.cap) : ({
+        i = (i + 1) & mask;
+        steps += 1;
+    }) {
+        switch (m.ctrl[i]) {
+            CtrlEmpty => return .{ .slot = if (first_tomb != m.cap) first_tomb else i, .found = false },
+            CtrlTomb => if (first_tomb == m.cap) {
+                first_tomb = i;
+            },
+            else => if (mapKeyEq(m, m.keys[i], key)) return .{ .slot = i, .found = true },
+        }
+    }
+    fatal("map probe overflow"); // unreachable: load factor guarantees an EMPTY slot
+}
+
+fn mapGrow(m: *MapHeader) void {
+    const newcap = m.cap * 2;
+    const nkeys = allocSliceBuf(newcap, m.key_is_string != 0);
+    const nvals = allocSliceBuf(newcap, m.val_is_ref != 0);
+    const nctrl = allocCtrl(newcap);
+    const mask = newcap - 1;
+    var i: usize = 0;
+    while (i < m.cap) : (i += 1) {
+        if (m.ctrl[i] != CtrlFull) continue;
+        const key = m.keys[i];
+        var j = mapHash(m, key) & mask;
+        while (nctrl[j] == CtrlFull) : (j = (j + 1) & mask) {}
+        nkeys[j] = key;
+        nvals[j] = m.vals[i];
+        nctrl[j] = CtrlFull;
+    }
+    m.keys = nkeys;
+    m.vals = nvals;
+    m.ctrl = nctrl;
+    m.cap = newcap;
+    m.used = m.len; // tombstones reclaimed
+}
+
+/// `bit_rt_map_new`: an empty map. `key_is_string`/`val_is_ref` (0/1) are fixed
+/// by K/V at the call site and decide hashing/equality and GC tracing.
+export fn bit_rt_map_new(key_is_string: usize, val_is_ref: usize) callconv(.c) *MapHeader {
+    const cap: usize = 8;
+    const m: *MapHeader = @ptrCast(@alignCast(g_gc.alloc(&map_info) orelse fatal("out of memory")));
+    m.* = .{
+        .keys = allocSliceBuf(cap, key_is_string != 0),
+        .vals = allocSliceBuf(cap, val_is_ref != 0),
+        .ctrl = allocCtrl(cap),
+        .len = 0,
+        .cap = cap,
+        .used = 0,
+        .key_is_string = key_is_string,
+        .val_is_ref = val_is_ref,
+    };
+    return m;
+}
+
+/// `bit_rt_map_set`: insert or overwrite `m[key] = val`. Panics on a nil map
+/// (Go/SPEC §11.2 — writing a nil map is a fatal condition).
+export fn bit_rt_map_set(m: ?*MapHeader, key: u64, val: u64) callconv(.c) void {
+    const mm = m orelse fatal("assignment to entry in nil map");
+    if ((mm.used + 1) * 8 >= mm.cap * 7) mapGrow(mm);
+    const p = mapProbe(mm, key);
+    if (!p.found) {
+        if (mm.ctrl[p.slot] == CtrlEmpty) mm.used += 1; // reusing a TOMB keeps `used`
+        mm.ctrl[p.slot] = CtrlFull;
+        mm.len += 1;
+    }
+    mm.keys[p.slot] = key;
+    mm.vals[p.slot] = val;
+}
+
+/// `bit_rt_map_get`: `m[key]`, or the zero word when absent (SPEC §11.2 — an
+/// absent key reads as the zero value of V). Nil map reads as empty.
+export fn bit_rt_map_get(m: ?*MapHeader, key: u64) callconv(.c) u64 {
+    const mm = m orelse return 0;
+    if (mm.len == 0) return 0;
+    const p = mapProbe(mm, key);
+    return if (p.found) mm.vals[p.slot] else 0;
+}
+
+/// `bit_rt_map_has`: presence test (backs the deferred two-result form + tests).
+export fn bit_rt_map_has(m: ?*MapHeader, key: u64) callconv(.c) bool {
+    const mm = m orelse return false;
+    if (mm.len == 0) return false;
+    return mapProbe(mm, key).found;
+}
+
+/// `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent. Leaves a
+/// tombstone (reclaimed on the next grow) and drops the slot's ref words so the
+/// collector can reclaim a removed key/value.
+export fn bit_rt_map_delete(m: ?*MapHeader, key: u64) callconv(.c) void {
+    const mm = m orelse return;
+    if (mm.len == 0) return;
+    const p = mapProbe(mm, key);
+    if (!p.found) return;
+    mm.ctrl[p.slot] = CtrlTomb;
+    mm.keys[p.slot] = 0;
+    mm.vals[p.slot] = 0;
+    mm.len -= 1;
+}
+
+/// `bit_rt_map_len`: `len(m)` — live entry count (nil map => 0).
+export fn bit_rt_map_len(m: ?*MapHeader) callconv(.c) i64 {
+    const mm = m orelse return 0;
+    return @intCast(mm.len);
+}
+
+/// Iteration (`for k of m`, §13.5): `map_iter_init` returns the first FULL slot
+/// index or -1; `map_iter_next` the next FULL slot after `prev` or -1;
+/// `map_key_at`/`map_val_at` read that slot. Slot order is unspecified and a
+/// concurrent insert may rehash — iteration assumes no mutation, per spec.
+export fn bit_rt_map_iter_init(m: ?*MapHeader) callconv(.c) i64 {
+    return bit_rt_map_iter_next(m, -1);
+}
+
+export fn bit_rt_map_iter_next(m: ?*MapHeader, prev: i64) callconv(.c) i64 {
+    const mm = m orelse return -1;
+    var i: usize = @intCast(prev + 1);
+    while (i < mm.cap) : (i += 1) {
+        if (mm.ctrl[i] == CtrlFull) return @intCast(i);
+    }
+    return -1;
+}
+
+export fn bit_rt_map_key_at(m: *MapHeader, slot: i64) callconv(.c) u64 {
+    return m.keys[@intCast(slot)];
+}
+
+export fn bit_rt_map_val_at(m: *MapHeader, slot: i64) callconv(.c) u64 {
+    return m.vals[@intCast(slot)];
+}
+
+// ---------------------------------------------------------------------------
 // Channels (ABI.md §11)
 // ---------------------------------------------------------------------------
 

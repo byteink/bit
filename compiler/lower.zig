@@ -946,7 +946,14 @@ const FnCtx = struct {
             },
             .index => {
                 const k = self.kids(node);
-                const is_slice = self.ctx.typeOf(try self.nodeType(k[0])) == .slice;
+                const recv_ty = try self.nodeType(k[0]);
+                const recv_data = self.ctx.typeOf(recv_ty);
+                if (recv_data == .map) {
+                    const recv_val = try self.lowerExpr(k[0]);
+                    const key_val = try self.lowerExprH(k[1], recv_data.map.key);
+                    return .{ .map_elem = .{ .recv = recv_val, .key = key_val, .val_ty = recv_data.map.val } };
+                }
+                const is_slice = recv_data == .slice;
                 const recv_val = try self.lowerExpr(k[0]);
                 const idx_val = try self.lowerExpr(k[1]);
                 const elem_ty = try self.nodeType(node);
@@ -963,6 +970,7 @@ const FnCtx = struct {
                 self.b.rtCall(e.ty, .slice_get, &.{ e.recv, e.index })
             else
                 self.b.indexGet(e.ty, e.recv, e.index),
+            .map_elem => |e| self.b.rtCall(e.val_ty, .map_get, &.{ e.recv, e.key }),
         };
     }
     fn writeLvalue(self: *FnCtx, lv: Lvalue, val: ir.ValueId) Error!void {
@@ -972,6 +980,7 @@ const FnCtx = struct {
             .elem => |e| if (e.is_slice) {
                 _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ e.recv, e.index, val });
             } else try self.b.indexSet(e.recv, e.index, val),
+            .map_elem => |e| _ = try self.b.rtCall(self.ctx.void_id, .map_set, &.{ e.recv, e.key, val }),
         }
     }
 
@@ -1865,9 +1874,14 @@ const FnCtx = struct {
         const iter_val = try self.lowerExpr(k[1]);
         const iter_ty = try self.nodeType(k[1]);
         const data = self.ctx.typeOf(iter_ty);
+        // A map iterates by slot cursor (`$idx` walks FULL slots via
+        // `map_iter_*`, -1 = done), binding each key; a slice/array by a 0..len
+        // counter, binding each element.
+        const is_map = data == .map;
         const elem_ty = switch (data) {
             .slice => |e| e,
             .array => |a| a.elem,
+            .map => |m| m.key,
             else => return error.UnsupportedConstruct,
         };
         const i64ty = self.ctx.prim_ids.get(.i64);
@@ -1877,8 +1891,11 @@ const FnCtx = struct {
         // the body is a stale SSA value once the header rebinds every carried
         // local to a block param.
         try self.env.declare(self.gpa, "$iter", iter_val, iter_ty);
-        const zero = try self.b.constInt(i64ty, 0);
-        try self.env.declare(self.gpa, "$idx", zero, i64ty);
+        const start = if (is_map)
+            try self.b.rtCall(i64ty, .map_iter_init, &.{iter_val})
+        else
+            try self.b.constInt(i64ty, 0);
+        try self.env.declare(self.gpa, "$idx", start, i64ty);
         const pre_len = self.env.bindings.items.len;
         const idx_slot = pre_len - 1;
         const iter_slot = pre_len - 2;
@@ -1897,11 +1914,17 @@ const FnCtx = struct {
 
         const idx_val = self.env.bindings.items[idx_slot].value;
         const iter_cur = self.env.bindings.items[iter_slot].value;
-        const len_val = if (data == .array)
-            try self.b.constInt(i64ty, @intCast(data.array.len))
-        else
-            try self.b.sliceLen(i64ty, iter_cur);
-        const cmp = try self.b.binary(.icmp_slt, self.ctx.prim_ids.get(.bool), idx_val, len_val);
+        const bool_ty = self.ctx.prim_ids.get(.bool);
+        // Map: continue while the slot cursor is >= 0. Slice/array: while idx < len.
+        const cmp = if (is_map)
+            try self.b.binary(.icmp_sge, bool_ty, idx_val, try self.b.constInt(i64ty, 0))
+        else blk: {
+            const len_val = if (data == .array)
+                try self.b.constInt(i64ty, @intCast(data.array.len))
+            else
+                try self.b.sliceLen(i64ty, iter_cur);
+            break :blk try self.b.binary(.icmp_slt, bool_ty, idx_val, len_val);
+        };
         {
             // `body_blk` is dominated by `header` and reached only here, so it
             // takes no params (see `lowerWhile`); `exit_blk` merges this edge
@@ -1913,18 +1936,32 @@ const FnCtx = struct {
 
         try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = header, .pre_len = pre_len });
         self.switchBlock(body_blk);
-        const elem_val = if (data == .slice)
-            try self.b.rtCall(elem_ty, .slice_get, &.{ iter_cur, idx_val })
-        else
-            try self.b.indexGet(elem_ty, iter_cur, idx_val);
         const body_mark = self.env.mark();
-        try self.declareBinder(k[0], elem_val, elem_ty);
+        if (is_map) {
+            // `for (key, value) of m` (checker requires the pair binder). Read
+            // both from the current FULL slot; a `_` sub is bound and left unread.
+            const m = data.map;
+            const subs = self.kids(k[0]); // tuple_pat: [key_binder, val_binder]
+            const key_val = try self.b.rtCall(m.key, .map_key_at, &.{ iter_cur, idx_val });
+            const val_val = try self.b.rtCall(m.val, .map_val_at, &.{ iter_cur, idx_val });
+            try self.declareBinder(subs[0], key_val, m.key);
+            try self.declareBinder(subs[1], val_val, m.val);
+        } else {
+            const elem_val = if (data == .slice)
+                try self.b.rtCall(elem_ty, .slice_get, &.{ iter_cur, idx_val })
+            else
+                try self.b.indexGet(elem_ty, iter_cur, idx_val);
+            try self.declareBinder(k[0], elem_val, elem_ty);
+        }
         try self.lowerStmtList(k[2]);
         self.env.restoreCount(body_mark);
         _ = self.loop_stack.pop();
         if (!self.terminated) {
-            const one = try self.b.constInt(i64ty, 1);
-            const next_idx = try self.b.binary(.add, i64ty, self.env.bindings.items[idx_slot].value, one);
+            const cur_idx = self.env.bindings.items[idx_slot].value;
+            const next_idx = if (is_map)
+                try self.b.rtCall(i64ty, .map_iter_next, &.{ iter_cur, cur_idx })
+            else
+                try self.b.binary(.add, i64ty, cur_idx, try self.b.constInt(i64ty, 1));
             self.env.bindings.items[idx_slot].value = next_idx;
             const back = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(back);
@@ -2037,7 +2074,9 @@ const FnCtx = struct {
         if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "cap")) {
             const is_cap = std.mem.eql(u8, name, "cap");
             const arg = self.kids(arg_nodes[0])[0];
-            const arg_ty = try self.nodeType(arg);
+            // Default the arg type: `len("literal")` types the string literal as
+            // `untyped_string`, which must dispatch like a concrete `string`.
+            const arg_ty = self.defaultTy(try self.nodeType(arg));
             const i64ty = self.ctx.prim_ids.get(.i64);
             const data = self.ctx.typeOf(arg_ty);
             if (data == .array) return self.b.constInt(i64ty, @intCast(data.array.len)); // len == cap
@@ -2046,8 +2085,15 @@ const FnCtx = struct {
             // (`slice_len`, shared with `string`), `cap` at +24. `cap` is
             // slice-only.
             if (data == .slice) return if (is_cap) self.b.fieldGet(i64ty, v, 24) else self.b.sliceLen(i64ty, v);
+            if (!is_cap and data == .map) return self.b.rtCall(i64ty, .map_len, &.{v});
             if (!is_cap and data == .prim and data.prim == .string) return self.b.sliceLen(i64ty, v);
             return error.UnsupportedConstruct;
+        }
+        if (std.mem.eql(u8, name, "delete")) {
+            const mv = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+            const key_ty = self.ctx.typeOf(try self.nodeType(self.kids(arg_nodes[0])[0])).map.key;
+            const kv = try self.lowerExprH(self.kids(arg_nodes[1])[0], key_ty);
+            return self.b.rtCall(void_ty, .map_delete, &.{ mv, kv });
         }
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
         // Filesystem primitives (ABI.md §14): each maps 1:1 to a runtime call,
@@ -2137,6 +2183,7 @@ const FnCtx = struct {
         const callee = k[0];
         if (self.tree().get(callee).tag == .slice_type) return self.lowerSliceCtor(node);
         if (self.tree().get(callee).tag == .chan_type) return self.lowerChanMake(node);
+        if (self.tree().get(callee).tag == .map_type) return self.lowerMapMake(node);
         if (self.tree().get(callee).tag == .ident and self.env.lookup(self.identText(callee)) == null) {
             if (self.nodeSymbol(callee)) |gsym| {
                 const sym = self.l.symbolOf(gsym);
@@ -2445,6 +2492,8 @@ const FnCtx = struct {
                 // array is a direct data pointer (codegen op).
                 if (recv_data == .slice)
                     break :blk self.b.rtCall(ty, .slice_get, &.{ recv, idxv });
+                if (recv_data == .map)
+                    break :blk self.b.rtCall(ty, .map_get, &.{ recv, idxv });
                 if (recv_data == .prim and recv_data.prim == .string)
                     break :blk self.b.rtCall(ty, .string_byte, &.{ recv, idxv });
                 break :blk self.b.indexGet(ty, recv, idxv);
@@ -2651,6 +2700,42 @@ const FnCtx = struct {
         };
     }
 
+    /// Whether a map key type `K` is `string` — the sole reference key type
+    /// (§14.6), and the one the runtime hashes/compares by bytes rather than by
+    /// word. Drives both `bit_rt_map_new`'s `key_is_string` flag and its GC
+    /// tracing of the key buffer.
+    fn keyIsString(self: *const FnCtx, ty: TypeId) bool {
+        const d = self.ctx.typeOf(ty);
+        return d == .prim and d.prim == .string;
+    }
+
+    /// `map<K,V>()` / `map<K,V>{...}`: a fresh map. The `key_is_string` and
+    /// `val_is_ref` flags (§14.6, ABI.md §12) come from K/V and are constant.
+    fn lowerMapMake(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const map_ty = try self.nodeType(node);
+        const m = self.ctx.typeOf(map_ty).map;
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const kflag = try self.b.constInt(i64ty, if (self.keyIsString(m.key)) 1 else 0);
+        const vflag = try self.b.constInt(i64ty, if (self.elemIsRef(m.val)) 1 else 0);
+        return self.b.rtCall(map_ty, .map_new, &.{ kflag, vflag });
+    }
+
+    /// `map<K,V>{ k1: v1, ... }` (§12.3): build an empty map, then set each
+    /// entry left-to-right (a later duplicate key overwrites, matching runtime
+    /// insert semantics).
+    fn lowerMapLit(self: *FnCtx, node: ast.Index, entries_node: ast.Index) Error!ir.ValueId {
+        const map_ty = try self.nodeType(node);
+        const m = self.ctx.typeOf(map_ty).map;
+        const mv = try self.lowerMapMake(node);
+        for (self.kids(entries_node)) |e| {
+            const ek = self.kids(e); // map_entry: [key, val]
+            const key = try self.lowerExprH(ek[0], m.key);
+            const val = try self.lowerExprH(ek[1], m.val);
+            _ = try self.b.rtCall(self.ctx.void_id, .map_set, &.{ mv, key, val });
+        }
+        return mv;
+    }
+
     /// Builds a `[]T` from an element list (a bare `[a, b]` `slice_lit` or a
     /// typed `[]T{a, b}` composite): allocate a length-N slice, then store each
     /// element. `items` are `arg`/`arg_spread` wrappers; the element expression
@@ -2695,7 +2780,8 @@ const FnCtx = struct {
         const ty = try self.nodeType(node);
         const data = self.ctx.typeOf(ty);
         if (data == .slice) return self.lowerSliceElems(ty, self.kids(k[1])); // []T{...}
-        if (data != .@"struct") return error.UnsupportedConstruct; // map literals: deferred
+        if (data == .map) return self.lowerMapLit(node, k[1]); // map<K,V>{...}
+        if (data != .@"struct") return error.UnsupportedConstruct;
         const init_node = k[1];
         if (self.tree().get(init_node).tag != .field_inits) return error.UnsupportedConstruct;
         const layout = try self.l.structLayout(ty);
@@ -2886,6 +2972,7 @@ const Lvalue = union(enum) {
     local: usize,
     field: struct { recv: ir.ValueId, ty: TypeId, offset: u32 },
     elem: struct { recv: ir.ValueId, index: ir.ValueId, ty: TypeId, is_slice: bool },
+    map_elem: struct { recv: ir.ValueId, key: ir.ValueId, val_ty: TypeId },
 };
 
 /// The base arithmetic op a compound-assign token (`+=` etc.) applies.

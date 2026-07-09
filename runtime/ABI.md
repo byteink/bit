@@ -417,6 +417,16 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize) -> u64` (§2)     |
 | `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64) -> void` (§2) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2) |
+| `bit_rt_map_new`      | `(key_is_string: usize, val_is_ref: usize) -> *MapHeader` (§15) |
+| `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
+| `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
+| `bit_rt_map_has`      | `(m: ?*MapHeader, key: u64) -> bool` (§15)              |
+| `bit_rt_map_delete`   | `(m: ?*MapHeader, key: u64) -> void` (§15)              |
+| `bit_rt_map_len`      | `(m: ?*MapHeader) -> i64` (§15)                         |
+| `bit_rt_map_iter_init`| `(m: ?*MapHeader) -> i64` (§15)                         |
+| `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
+| `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
+| `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 
 Every symbol above is `callconv(.c)` with plain C linkage — the entire
 compiler-facing surface of `libbitrt.a`. Nothing else in `runtime/` is a stable
@@ -619,3 +629,49 @@ runtime. Backed by the raw per-platform syscalls in `sched.zig` (`openFd`/
   read leaves the tail zero-filled (v1 regular-file scope).
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
+
+---
+
+## 15. Maps (`runtime/root.zig`)
+
+`map<K,V>` (SPEC §11.2, §13.5) is a `MapHeader` GC object over three parallel
+`cap`-slot buffers — an open-addressing hash table with linear probing.
+
+```
+MapHeader {
+  keys: [*]u64          // +0   slot keys   (ref-array iff key_is_string) — traced
+  vals: [*]u64          // +8   slot values (ref-array iff val_is_ref)    — traced
+  ctrl: [*]u8           // +16  per-slot state: 0 EMPTY / 1 FULL / 2 TOMB — traced base
+  len:  usize           // +24  live entries
+  cap:  usize           // +32  slot count (power of two, >= 8)
+  used: usize           // +40  FULL + TOMB (drives growth)
+  key_is_string: usize  // +48
+  val_is_ref:    usize  // +56
+}
+```
+
+`map_info`'s pointer map is `{0, 8, 16}`: the three buffer bases are traced as
+references. The `keys`/`vals` buffers use `ref_array_info` (every word traced)
+exactly when their flag is set — `string` is the only comparable reference key
+type (§2, SPEC §14.6), so `key_is_string` doubles as "trace the key buffer".
+The `ctrl` buffer is always a leaf; tracing its base only keeps it alive. Empty,
+tombstoned, and unused slots hold a zero key/value word, which `markRoot` skips.
+
+- **Word model.** A key or value is one word, same as slice elements (§2): a
+  scalar by value, a `string` as its `*RtBytes` object base, a wider `V` boxed.
+- **Hash / equality.** `key_is_string` picks the strategy: a string key is
+  Wyhash'd over its bytes and compared byte-wise; any other key is hashed with a
+  splitmix64 finalizer (so low-entropy integer keys avalanche) and compared by
+  word.
+- **Growth.** At `(used+1)*8 >= cap*7` the table doubles and rehashes, dropping
+  tombstones (`used` resets to `len`). This keeps an EMPTY slot present at all
+  times, so every probe terminates in `<= cap` steps (a statically bounded loop).
+- **Delete** leaves a `TOMB` and zeroes the slot's key/value words (dropping the
+  refs so a removed entry becomes collectable); the tombstone is reclaimed at the
+  next grow.
+- **Nil.** Reads on a nil map (`?*MapHeader == null`) yield the zero word /
+  `false` / `0`; `map_set` on a nil map is fatal (SPEC §11.2, Go semantics).
+- **Iteration** (`for (k, v) of m`, §13.5) is by slot cursor: `map_iter_init`
+  returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
+  then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
+  protocol assumes no concurrent mutation (a resize would invalidate the cursor).

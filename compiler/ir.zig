@@ -48,11 +48,11 @@ pub const BlockId = enum(u32) { _ };
 pub const FuncId = enum(u32) { _ };
 
 /// Opaque runtime entry points lowering calls into `runtime/*.zig` symbols by
-/// name (task's "until #346 nails the ABI further"). `map_iter_init`/
-/// `map_iter_next` back `for..in` over a map (§13.5) — a placeholder until
-/// stdlib/map defines its real iteration protocol; `select` backs
-/// `select_stmt` (§13.7) — its exact runtime signature is `runtime/chan.zig`'s
-/// to define, not lowering's; this tag just names the call site.
+/// name (task's "until #346 nails the ABI further"). The `map_*` tags back
+/// `map<K,V>` (§11.2, §13.5) — the real hash-table protocol, ABI.md §15;
+/// `select` backs `select_stmt` (§13.7) — its exact runtime signature is
+/// `runtime/chan.zig`'s to define, not lowering's; this tag just names the call
+/// site.
 pub const RtFn = enum {
     /// Two `string` args -> one fresh `string` (`a` then `b`). Backs `+` on
     /// strings and `str_interp` (§5.7): `lower.zig` converts each non-string
@@ -101,8 +101,23 @@ pub const RtFn = enum {
     chan_recv,
     chan_close,
     spawn,
+    /// Hash map primitives (ABI.md §15), backing `map<K,V>` (§11.2, §13.5).
+    /// `map_new(key_is_string, val_is_ref) -> map` — the two flags are compile
+    /// constants from K/V. `map_set(m, key, val)`; `map_get(m, key) -> val` (zero
+    /// word if absent); `map_has(m, key) -> bool`; `map_delete(m, key)`;
+    /// `map_len(m) -> i64`. Iteration is by slot index: `map_iter_init(m) -> i64`
+    /// (first live slot or -1), `map_iter_next(m, prev) -> i64`, then
+    /// `map_key_at(m, slot)`/`map_val_at(m, slot)` read the pair.
+    map_new,
+    map_set,
+    map_get,
+    map_has,
+    map_delete,
+    map_len,
     map_iter_init,
     map_iter_next,
+    map_key_at,
+    map_val_at,
     /// `select_alloc(n) -> *desc[n]` reserves a zeroed case-descriptor buffer;
     /// codegen fills `dir`/`chan`/`word` per case, then `select(descs, n,
     /// has_default) -> fired index` (or `n` for the default clause), leaving a
