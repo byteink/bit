@@ -2017,9 +2017,13 @@ const FnCtx = struct {
         const void_ty = self.ctx.void_id;
         if (std.mem.eql(u8, name, "panic")) {
             const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
-            _ = try self.b.rtCall(void_ty, .panic, &.{v});
+            // The call result is void and dead (panic never returns); return it
+            // as the expression value rather than pushing a `const_nil` *after*
+            // the `unreachable` terminator, which would leave a non-terminator
+            // as the block's last instruction (endBlock asserts otherwise).
+            const r = try self.b.rtCall(void_ty, .panic, &.{v});
             try self.emitUnreachable();
-            return self.b.constNil(void_ty);
+            return r;
         }
         if (std.mem.eql(u8, name, "print")) {
             const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
