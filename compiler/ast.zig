@@ -128,9 +128,9 @@ pub const Tag = enum {
     comm_case, // [comm, stmt_list]        comm = send_stmt | recv_bind
     comm_default, // [stmt_list]
     recv_bind, // [binder_or_none, chan_expr]
-    match_stmt, // [subject, arm_list]
+    match_stmt, // [subject, arm_list]   (stmt or expression position — see parseMatch)
     arm_list, // [match_arm...]
-    match_arm, // [variant_pat, body]      body = statement (block or single)
+    match_arm, // [variant_pat, body]      body = statement (stmt match) or expression (expr match)
     variant_pat, // [name_ident, binders_or_none]   binders = ident list (Stage 2)
 
     // ---- expressions -----------------------------------------------------

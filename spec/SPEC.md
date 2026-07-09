@@ -894,16 +894,16 @@ memory by communicating.*
 `match` dispatches on an enum value (§14.7):
 
 ```
-match_stmt  = "match" "(" expression ")" "{" { match_arm [ ";" ] } "}" .
-match_arm   = variant_pat "=>" statement .
+match_stmt  = "match" "(" expression ")" "{" { match_arm [ "," | ";" ] } "}" .
+match_arm   = variant_pat "=>" ( statement | expression ) .
 variant_pat = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binders *)
 ```
 
 The subject expression must be an enum type. Each arm names one of the enum's
 variants (bare, unqualified — the subject's type disambiguates) and runs its
-body statement when the value is that variant. A payload variant's arm binds its
-payload: `Circle(r) => …` binds `r` to the `f64` inside; the binder count must
-match the variant's payload arity. A `match` is:
+body when the value is that variant. A payload variant's arm binds its payload:
+`Circle(r) => …` binds `r` to the `f64` inside; the binder count must match the
+variant's payload arity. A `match` is:
 
 - **Exhaustive** — every variant of the enum must have an arm; a missing variant
   is a compile error (`E0071`). This is `match`'s central guarantee: adding a
@@ -912,8 +912,15 @@ match the variant's payload arity. A `match` is:
   a compile error).
 
 Arms do not fall through. `break`/`continue` inside an arm target the enclosing
-loop, not the `match`. `match` is a statement in v0.1; a value-yielding
-expression form is deferred.
+loop, not the `match`.
+
+`match` is both a **statement** and an **expression**. In statement position each
+arm body is a statement (a block or a single statement). In expression position
+(`let x = match (…) { … }`, a `return`, an operand, a string interpolation) each
+arm body is an *expression* and the whole `match` yields their common type: the
+expected type when one is imposed by the context, otherwise the first arm's type,
+to which the remaining arms must be assignable (a mismatch is `E0041`, like a
+`return`). Arms separate on `,` or a newline.
 
 ---
 
@@ -1394,9 +1401,6 @@ function main(): ()! {
 
 Intentionally **not** in v0.1, to keep the surface minimal:
 
-- `match` as an *expression* (yielding a value): v0.1 has exhaustive
-  statement-form `match` (§13.8). Generic enums *are* in v0.1 — the prelude's
-  `Option<T>`/`Result<T, E>` (§14.7, §17).
 - General union and optional types; `null` (absence is modeled by `nil` zero
   values and the Result model).
 - Pointers, `&`/`*`, value-vs-pointer receivers.

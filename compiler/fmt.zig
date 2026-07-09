@@ -122,8 +122,13 @@ fn scanGap(gpa: Allocator, out: *std.ArrayList(Comment), file: FileId, source: [
 }
 
 /// Newlines strictly within `source[a..b]` — used to decide "same source
-/// line" (0) and "blank line present" (>= 2). Bounded by `b - a`.
+/// line" (0) and "blank line present" (>= 2). Bounded by `b - a`. Returns 0
+/// when `a >= b`: a `match` (or any statement-shaped node) in expression
+/// position can leave `src_pos` ahead of a later node's `span.start` (width
+/// measurement via `renderFlat` advances `src_pos` without restoring it), and
+/// a backwards range has no forward gap to preserve.
 fn newlinesBetween(source: []const u8, a: u32, b: u32) u32 {
+    if (a >= b) return 0;
     var n: u32 = 0;
     for (source[a..b]) |c| {
         if (c == '\n') n += 1;
@@ -1020,6 +1025,16 @@ const Printer = struct {
                     const kn = self.tree.get(k);
                     if (kn.tag == .str_part) {
                         try self.raw(self.source[kn.span.start..kn.span.end]);
+                    } else if (kn.tag == .match_stmt) {
+                        // A `match` expression renders multi-line, which cannot
+                        // live inside a string literal; copy its (necessarily
+                        // single-line) source verbatim so the interpolation stays
+                        // valid. ponytail: the fmt pass could inline it with
+                        // `,`-separated arms instead of preserving source.
+                        try self.raw("${");
+                        try self.raw(self.source[kn.span.start..kn.span.end]);
+                        try self.raw("}");
+                        if (kn.span.end > self.src_pos) self.src_pos = kn.span.end;
                     } else {
                         try self.raw("${");
                         try self.printNode(k);

@@ -698,7 +698,7 @@ const Parser = struct {
             .kw_while => return self.parseWhileStmt(),
             .kw_for => return self.parseForStmt(),
             .kw_switch => return self.parseSwitchStmt(),
-            .kw_match => return self.parseMatchStmt(),
+            .kw_match => return self.parseMatch(false),
             .kw_select => return self.parseSelectStmt(),
             .kw_return => return self.parseReturnStmt(),
             .kw_fail => return self.parseFailStmt(),
@@ -910,7 +910,12 @@ const Parser = struct {
 
     // ---- match (§16.4) ---------------------------------------------------------
 
-    fn parseMatchStmt(self: *Parser) ParseError!Index {
+    /// `match (subject) { Pat => body, ... }` (§13.8). `as_expr` selects the arm
+    /// body grammar: an expression (the match yields that value, §13.8) in
+    /// expression position, or a statement (block or single) in statement
+    /// position. The node tag (`match_stmt`) is shared; the check/lower stage
+    /// picks the value- or effect-producing path by where the node appears.
+    fn parseMatch(self: *Parser, as_expr: bool) ParseError!Index {
         const start = self.tok.span;
         try self.advance(); // 'match'
         _ = try self.expect(.l_paren, "'('");
@@ -921,11 +926,13 @@ const Parser = struct {
         defer arms.deinit(self.gpa);
         var guard: u32 = 0;
         while (self.tok.kind != .r_brace and self.tok.kind != .eof and guard < max_case_clauses) : (guard += 1) {
-            if (try self.accept(.semicolon)) continue;
-            try arms.append(self.gpa, try self.parseMatchArm());
+            // Arms separate on `,` or `;` (ASI supplies the `;` at a newline);
+            // one-liners `A => x, B => y` and multi-line bodies both parse.
+            if (try self.accept(.semicolon) or try self.accept(.comma)) continue;
+            try arms.append(self.gpa, try self.parseMatchArm(as_expr));
             const at_boundary = self.tok.kind == .r_brace or self.tok.kind == .eof;
-            if (!try self.accept(.semicolon) and !at_boundary) {
-                try self.fail("';'");
+            if (!try self.accept(.semicolon) and !try self.accept(.comma) and !at_boundary) {
+                try self.fail("',' or ';'");
                 self.synchronizeStatement();
             }
         }
@@ -935,11 +942,11 @@ const Parser = struct {
         return self.tree.add(.match_stmt, join(start, end), 0, &.{ subject, arm_list });
     }
 
-    fn parseMatchArm(self: *Parser) ParseError!Index {
+    fn parseMatchArm(self: *Parser, as_expr: bool) ParseError!Index {
         const start = self.tok.span;
         const pat = try self.parseVariantPat();
         _ = try self.expect(.fat_arrow, "'=>'");
-        const body = try self.parseStatement();
+        const body = if (as_expr) try self.parseExpression() else try self.parseStatement();
         return self.tree.add(.match_arm, join(start, self.span(body)), 0, &.{ pat, body });
     }
 
@@ -1089,7 +1096,7 @@ const Parser = struct {
 
     fn canStartExpression(k: Kind) bool {
         return switch (k) {
-            .ident, .int_lit, .float_lit, .string_lit, .str_part, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .l_paren, .l_bracket, .kw_map, .kw_chan, .bang, .minus, .plus, .tilde, .arrow_left => true,
+            .ident, .int_lit, .float_lit, .string_lit, .str_part, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .l_paren, .l_bracket, .kw_map, .kw_chan, .kw_match, .bang, .minus, .plus, .tilde, .arrow_left => true,
             else => false,
         };
     }
@@ -1375,6 +1382,7 @@ const Parser = struct {
             .l_bracket => return self.parseBracketPrimary(),
             .kw_map => return self.parseMapPrimary(),
             .kw_chan => return self.parseChanPrimary(),
+            .kw_match => return self.parseMatch(true),
             else => {
                 try self.fail("an expression");
                 const bad = self.tok.span;

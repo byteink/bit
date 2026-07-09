@@ -1463,6 +1463,88 @@ const FnCtx = struct {
         self.env.restoreValues(orig);
     }
 
+    /// `match` in expression position (§13.8): like `lowerMatch`, but each arm
+    /// lowers its body *expression* to a value and jumps to the join carrying it
+    /// as an extra block param (the same value-merge shape `lowerCatch` uses).
+    /// The join's trailing param is the whole `match`'s value.
+    fn lowerMatchExpr(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const k = self.kids(node); // [subject, arm_list]
+        const result_ty = try self.nodeType(node); // checkMatchExpr typed the match
+        const subject_ty = try self.nodeType(k[0]);
+        const subject = try self.lowerExprH(k[0], subject_ty);
+        const ed = self.ctx.typeOf(subject_ty);
+        const variants: []const check.Variant = if (ed == .@"enum") ed.@"enum".variants else &.{};
+        const boxed = ed == .@"enum" and check.enumBoxed(ed.@"enum");
+        const arms = self.kids(k[1]);
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const is_void = result_ty == self.ctx.void_id or result_ty == .invalid;
+        if (arms.len == 0) return self.zeroValue(if (is_void) i64ty else result_ty); // checker already diagnosed
+
+        const tag_ty = if (boxed) i64ty else subject_ty;
+        const tag = if (boxed) try self.b.fieldGet(tag_ty, subject, 0) else subject;
+
+        const pre_len = self.env.bindings.items.len;
+        const orig = try self.env.snapshotValues(self.gpa, pre_len);
+        defer self.gpa.free(orig);
+
+        const join = try self.b.newBlock();
+        var join_reachable = false;
+
+        for (arms[0 .. arms.len - 1]) |arm| {
+            const ak = self.kids(arm);
+            const arm_tag = variantTag(variants, self.identText(self.kids(ak[0])[0]));
+            const body_blk = try self.b.newBlock();
+            const next_blk = try self.b.newBlock();
+            const cond = try self.emitEq(tag_ty, tag, try self.b.constInt(tag_ty, arm_tag));
+            try self.emitBr(cond, body_blk, &.{}, next_blk, &.{});
+            self.switchBlock(body_blk);
+            try self.lowerMatchExprArm(arm, subject, variants, boxed, orig, pre_len, join, result_ty, is_void, &join_reachable);
+            self.switchBlock(next_blk);
+        }
+        try self.lowerMatchExprArm(arms[arms.len - 1], subject, variants, boxed, orig, pre_len, join, result_ty, is_void, &join_reachable);
+
+        self.b.endBlock();
+        self.b.beginBlock(join);
+        if (!join_reachable) {
+            // Every arm diverged (e.g. all `panic`): the match yields no value.
+            const ph = try self.zeroValue(if (is_void) i64ty else result_ty);
+            try self.emitUnreachable();
+            return ph;
+        }
+        try self.addLoopParams(pre_len);
+        const result = if (is_void) try self.b.constInt(i64ty, 0) else try self.b.addParam(result_ty);
+        self.terminated = false;
+        return result;
+    }
+
+    fn lowerMatchExprArm(self: *FnCtx, arm: ast.Index, subject: ir.ValueId, variants: []const check.Variant, boxed: bool, orig: []const ir.ValueId, pre_len: usize, join: ir.BlockId, result_ty: TypeId, is_void: bool, join_reachable: *bool) Error!void {
+        const ak = self.kids(arm); // [variant_pat, body]
+        const vp = self.kids(ak[0]); // variant_pat: [name, binders_or_none]
+        self.env.restoreValues(orig);
+        const mark = self.env.mark();
+        if (boxed and vp[1] != ast.none) {
+            const v = findVariant(variants, self.identText(vp[0]));
+            const box = try self.b.fieldGet(self.ctx.prim_ids.get(.i64), subject, 8);
+            for (self.kids(vp[1]), 0..) |b, i| {
+                const bty = if (v != null and i < v.?.payload.len) v.?.payload[i] else self.ctx.prim_ids.get(.i64);
+                const bv = try self.b.fieldGet(bty, box, @intCast(8 * i));
+                try self.env.declare(self.gpa, self.identText(b), bv, bty);
+            }
+        }
+        var val: ir.ValueId = undefined;
+        if (is_void) _ = try self.lowerExpr(ak[1]) else val = try self.lowerExprH(ak[1], result_ty);
+        self.env.restoreCount(mark);
+        if (!self.terminated) {
+            join_reachable.* = true;
+            const locals = try self.env.snapshotValues(self.gpa, pre_len);
+            defer self.gpa.free(locals);
+            const args = try self.catchEdgeArgs(locals, val, is_void);
+            defer self.gpa.free(args);
+            try self.emitJump(join, args);
+        }
+        self.env.restoreValues(orig);
+    }
+
     /// `EnumName.Variant(args)` — allocate the payload box (word `i` = arg `i`,
     /// GC-tracing its ref fields) and wrap it in the enum object `{tag, box}`.
     fn lowerVariantConstruction(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
@@ -2357,6 +2439,7 @@ const FnCtx = struct {
             .try_expr => self.lowerTryExpr(node),
             .catch_default => self.lowerCatch(node, false),
             .catch_bind => self.lowerCatch(node, true),
+            .match_stmt => self.lowerMatchExpr(node),
             else => error.UnsupportedConstruct, // type_assert/tuple_index/map literals
         };
     }

@@ -3270,6 +3270,7 @@ const Checker = struct {
             .try_expr => try self.checkTryExpr(file_idx, node, env, fctx),
             .composite_lit => try self.checkCompositeLit(file_idx, node, env, fctx),
             .slice_lit => try self.checkSliceLit(file_idx, node, env, fctx, expected),
+            .match_stmt => try self.checkMatchExpr(file_idx, node, env, fctx, expected),
             else => .invalid, // parser error-recovery poison node
         };
         self.setType(file_idx, node, ty);
@@ -3870,6 +3871,75 @@ const Checker = struct {
                 if (!seen[i]) try self.emit(mf, k[0], .non_exhaustive_match, "non-exhaustive 'match': variant '{s}' is not handled", .{v.name}, null);
             }
         }
+    }
+
+    /// `match` in expression position (§13.8): the same subject/exhaustiveness/
+    /// payload-binding rules as the statement form, but each arm body is an
+    /// *expression* and the whole `match` yields their common type. The result
+    /// type is the expected type when one is pushed in, else the first arm's
+    /// type (later arms must be assignable to it).
+    fn checkMatchExpr(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx, expected: TypeId) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node); // [subject, arm_list]
+        const subject_ty = try self.checkExpr(file_idx, k[0], env, fctx, .invalid);
+        const data = self.ctx.typeOf(subject_ty);
+        const is_enum = subject_ty != .invalid and data == .@"enum";
+        if (subject_ty != .invalid and !is_enum) {
+            const n = try self.typeName(subject_ty);
+            defer self.gpa.free(n);
+            try self.emit(mf, k[0], .not_an_enum, "'match' requires an enum subject, found '{s}'", .{n}, null);
+        }
+        const variants: []const Variant = if (is_enum) data.@"enum".variants else &.{};
+
+        const seen = try self.gpa.alloc(bool, variants.len);
+        defer self.gpa.free(seen);
+        @memset(seen, false);
+
+        var result: TypeId = expected;
+        for (mf.tree.kids(k[1])) |arm_idx| {
+            const ak = mf.tree.kids(arm_idx); // [variant_pat, body]
+            const vp = mf.tree.kids(ak[0]); // variant_pat: [name, binders_or_none]
+            const vname = Checker.identText(mf, vp[0]);
+            const binders: []const ast.Index = if (vp[1] != ast.none) mf.tree.kids(vp[1]) else &.{};
+            if (is_enum) {
+                var matched: ?Variant = null;
+                for (variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v.name, vname)) {
+                        if (seen[i]) try self.emit(mf, ak[0], .duplicate_declaration, "duplicate arm for variant '{s}'", .{vname}, null);
+                        seen[i] = true;
+                        matched = v;
+                        break;
+                    }
+                }
+                if (matched) |v| {
+                    if (binders.len != v.payload.len) {
+                        try self.emit(mf, ak[0], .arg_count_mismatch, "variant '{s}' binds {d} value(s), found {d}", .{ vname, v.payload.len, binders.len }, null);
+                    }
+                    for (binders, 0..) |b, i| {
+                        try self.bindSimple(file_idx, b, if (i < v.payload.len) v.payload[i] else .invalid);
+                    }
+                } else {
+                    try self.emit(mf, ak[0], .unknown_variant, "no variant '{s}' on this enum", .{vname}, null);
+                    for (binders) |b| try self.bindSimple(file_idx, b, .invalid);
+                }
+            }
+            // The arm body is an expression; its value is the arm's result. The
+            // first arm fixes the result type when none was pushed in; the rest
+            // must be assignable to it (untyped literals coerce via `expect`).
+            const got = try self.checkExpr(file_idx, ak[1], env, fctx, result);
+            if (result == .invalid) {
+                result = self.defaultType(got);
+            } else {
+                try self.expect(file_idx, ak[1], got, result);
+            }
+        }
+
+        if (is_enum) {
+            for (variants, 0..) |v, i| {
+                if (!seen[i]) try self.emit(mf, k[0], .non_exhaustive_match, "non-exhaustive 'match': variant '{s}' is not handled", .{v.name}, null);
+            }
+        }
+        return result;
     }
 
     // ---- return-path / divert-path completeness (§10.3, §18.3) --------------
