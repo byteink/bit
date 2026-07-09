@@ -103,6 +103,28 @@ pub const ModuleFile = struct {
     tree: *const ast.Tree,
 };
 
+/// A single in-memory source substitution: `text` is used for the file at
+/// absolute `path` instead of its disk contents. The LSP's dot-completion
+/// splices a marker into one open file and reparses via this.
+pub const Overlay = struct { path: []const u8, text: []const u8 };
+
+/// In-memory source substitutions for `loadProject`. An editor (the LSP)
+/// passes unsaved buffers here so the loaded project reflects live edits
+/// instead of stale disk contents; files not named here read from disk as
+/// usual. Both members are borrowed and must outlive the load.
+pub const SourceOverrides = struct {
+    /// Absolute file path -> unsaved buffer text.
+    map: ?*const std.StringHashMapUnmanaged([]u8) = null,
+    /// A single extra override that wins over `map` and disk.
+    one: ?Overlay = null,
+
+    fn lookup(self: SourceOverrides, path: []const u8) ?[]const u8 {
+        if (self.one) |o| if (std.mem.eql(u8, o.path, path)) return o.text;
+        if (self.map) |m| if (m.get(path)) |t| return t;
+        return null;
+    }
+};
+
 /// Outcome of resolving one `import ... from "path"` string against the
 /// module graph. Computed by the caller (`loadProject`, or a test's stub
 /// table) *before* calling `resolveModule`, so the pure core never touches
@@ -1061,6 +1083,9 @@ const Loader = struct {
     /// subsequently-loaded module auto-imports. Null while loading the prelude
     /// itself (so it doesn't import itself) and when no stdlib is present.
     prelude: ?ModuleId = null,
+    /// In-memory source substitutions (unsaved editor buffers); empty for a
+    /// normal disk build.
+    overrides: SourceOverrides = .{},
     /// Canonical directory path -> its fully resolved module.
     resolved: std.StringHashMapUnmanaged(ModuleId) = .{},
     /// Canonical directory paths currently being loaded (the recursion
@@ -1106,7 +1131,12 @@ const Loader = struct {
         defer files.deinit(self.gpa);
         for (names.items) |name| {
             const full_path = try std.fs.path.join(arena, &.{ canon, name });
-            const source = try dir.readFileAlloc(self.io, name, self.gpa, .limited(max_file_bytes));
+            // An unsaved editor buffer (LSP overlay) wins over disk; a normal
+            // build has no overrides and always reads disk.
+            const source = if (self.overrides.lookup(full_path)) |text|
+                try self.gpa.dupe(u8, text)
+            else
+                try dir.readFileAlloc(self.io, name, self.gpa, .limited(max_file_bytes));
             try self.project.sources.append(self.gpa, source);
             const file_id = try self.sm.addFile(full_path, source);
 
@@ -1183,6 +1213,8 @@ fn insertionSort(items: [][]const u8) void {
 /// Diagnostics from every stage (lex/parse/resolve) accumulate in `diags`.
 /// `std_root` (absolute) is where `std/*` imports resolve; pass null when no
 /// stdlib ships with this build (then `std/*` imports are `not_found`).
+/// `overrides` substitutes in-memory buffers for named files (the LSP's
+/// unsaved edits); pass `.{}` for a plain disk build.
 pub fn loadProject(
     gpa: Allocator,
     io: Io,
@@ -1190,10 +1222,11 @@ pub fn loadProject(
     sm: *diagnostics.SourceManager,
     root_dir_abs: []const u8,
     std_root: ?[]const u8,
+    overrides: SourceOverrides,
 ) !LoadedProject {
     var project = LoadedProject{ .gpa = gpa, .path_arena = std.heap.ArenaAllocator.init(gpa) };
     errdefer project.deinit();
-    var loader = Loader{ .gpa = gpa, .io = io, .diags = diags, .sm = sm, .project = &project, .std_root = std_root };
+    var loader = Loader{ .gpa = gpa, .io = io, .diags = diags, .sm = sm, .project = &project, .std_root = std_root, .overrides = overrides };
     defer loader.deinit();
 
     // Load the prelude module (`std/core`) first, if a stdlib is present, so its

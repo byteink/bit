@@ -366,7 +366,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_ro
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
     defer diags.deinit();
 
-    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root);
+    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root, .{});
     defer project.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 

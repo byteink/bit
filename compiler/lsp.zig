@@ -286,11 +286,16 @@ const Server = struct {
         return self.snapshots.getPtr(key).?;
     }
 
+    /// Publishes diagnostics for the *root* module's files only — the prelude
+    /// and stdlib modules are loaded for name resolution, but the user never
+    /// opened them, so their (absent) diagnostics must not be sprayed onto
+    /// their URIs. Diagnostics are keyed by `FileId` (global across all loaded
+    /// modules), not by root-file index.
     fn publishDiagnostics(self: *Server, snap: *const Snapshot, out: *Io.Writer) !void {
-        for (snap.paths, 0..) |path, file_idx| {
+        for (snap.rootFiles(), 0..) |mf, file_idx| {
             var body: Io.Writer.Allocating = .init(self.gpa);
             defer body.deinit();
-            const uri = try pathToUri(self.gpa, path);
+            const uri = try pathToUri(self.gpa, snap.paths[file_idx]);
             defer self.gpa.free(uri);
 
             try body.writer.writeAll("{\"uri\":");
@@ -298,10 +303,10 @@ const Server = struct {
             try body.writer.writeAll(",\"diagnostics\":[");
             var first = true;
             for (snap.diags.list.items) |d| {
-                if (@intFromEnum(d.span.file) != file_idx) continue;
+                if (d.span.file != mf.file) continue;
                 if (!first) try body.writer.writeByte(',');
                 first = false;
-                try writeLspDiagnostic(&body.writer, snap.sources[file_idx], d);
+                try writeLspDiagnostic(&body.writer, mf.source, d);
             }
             try body.writer.writeAll("]}");
             try self.notify("textDocument/publishDiagnostics", body.written(), out);
@@ -329,9 +334,9 @@ const Server = struct {
         const snap = self.ensureSnapshot(dir) catch return respondRaw(self.gpa, out, id, "null");
         const file_idx = findFileIndex(snap, path) orelse return respondRaw(self.gpa, out, id, "null");
 
-        const source = snap.sources[file_idx];
+        const source = snap.srcOf(file_idx);
         const offset = utf16ToByteOffset(source, tdp.pos);
-        const node = nodeAt(&snap.trees[file_idx], offset);
+        const node = nodeAt(snap.treeOf(file_idx), offset);
         if (node == ast.none) return respondRaw(self.gpa, out, id, "null");
 
         const text = try hoverText(self.gpa, snap, file_idx, node) orelse return respondRaw(self.gpa, out, id, "null");
@@ -348,20 +353,22 @@ const Server = struct {
         const dir = std.fs.path.dirname(path) orelse return respondRaw(self.gpa, out, id, "null");
         const snap = self.ensureSnapshot(dir) catch return respondRaw(self.gpa, out, id, "null");
         const file_idx = findFileIndex(snap, path) orelse return respondRaw(self.gpa, out, id, "null");
-        if (!snap.resolved) return respondRaw(self.gpa, out, id, "null");
-
-        const offset = utf16ToByteOffset(snap.sources[file_idx], tdp.pos);
-        const node = nodeAt(&snap.trees[file_idx], offset);
-        const sym_id = snap.module.node_symbols[file_idx][node];
+        const offset = utf16ToByteOffset(snap.srcOf(file_idx), tdp.pos);
+        const node = nodeAt(snap.treeOf(file_idx), offset);
+        const sym_id = snap.rootModule().node_symbols[file_idx][node];
         if (sym_id == .none) return respondRaw(self.gpa, out, id, "null");
-        const sym = snap.module.symbols.items[@intFromEnum(sym_id)];
-        if (sym.decl == ast.none) return respondRaw(self.gpa, out, id, "null");
+        const sym = snap.rootModule().symbols.items[@intFromEnum(sym_id)];
+        // `decl == none` covers prelude/imported symbols (they declare nothing
+        // in this module); `file_idx` then indexes another module, so jumping
+        // to it here would mis-index the root module's files. Same-module
+        // symbols carry a real `decl` and a `file_idx` within the root module.
+        if (sym.decl == ast.none or sym.file_idx >= snap.rootFiles().len) return respondRaw(self.gpa, out, id, "null");
 
         const target_idx = sym.file_idx;
-        const name_span = defNameSpan(&snap.trees[target_idx], sym.decl);
+        const name_span = defNameSpan(snap.treeOf(target_idx), sym.decl);
         const uri = try pathToUri(self.gpa, snap.paths[target_idx]);
         defer self.gpa.free(uri);
-        const loc = Location{ .uri = uri, .range = spanToRange(snap.sources[target_idx], name_span) };
+        const loc = Location{ .uri = uri, .range = spanToRange(snap.srcOf(target_idx), name_span) };
         try respondValue(self.gpa, out, id, loc);
     }
 
@@ -376,7 +383,7 @@ const Server = struct {
 
         var syms: std.ArrayList(SymbolInformation) = .empty;
         defer syms.deinit(self.gpa);
-        try collectDocumentSymbols(self.gpa, &snap.trees[file_idx], snap.sources[file_idx], uri, &syms);
+        try collectDocumentSymbols(self.gpa, snap.treeOf(file_idx), snap.srcOf(file_idx), uri, &syms);
         try respondValue(self.gpa, out, id, syms.items);
     }
 
@@ -398,13 +405,11 @@ const Server = struct {
     fn scopeCompletion(self: *Server, dir: []const u8, id: json.Value, out: *Io.Writer) !void {
         const empty = CompletionList{ .items = &.{} };
         const snap = self.ensureSnapshot(dir) catch return respondValue(self.gpa, out, id, empty);
-        if (!snap.resolved) return respondValue(self.gpa, out, id, empty);
-
         var items: std.ArrayList(CompletionItem) = .empty;
         defer items.deinit(self.gpa);
-        var it = snap.module.all_names.iterator();
+        var it = snap.rootModule().all_names.iterator();
         while (it.next()) |e| {
-            const sym = snap.module.symbols.items[@intFromEnum(e.value_ptr.*)];
+            const sym = snap.rootModule().symbols.items[@intFromEnum(e.value_ptr.*)];
             try items.append(self.gpa, .{ .label = e.key_ptr.*, .kind = completionKind(sym.kind) });
         }
         try respondValue(self.gpa, out, id, CompletionList{ .items = items.items });
@@ -432,17 +437,17 @@ const Server = struct {
 
         var path_stack: std.ArrayList(ast.Index) = .empty;
         defer path_stack.deinit(self.gpa);
-        try nodePath(&snap.trees[file_idx], offset, &path_stack, self.gpa);
+        try nodePath(snap.treeOf(file_idx), offset, &path_stack, self.gpa);
         if (path_stack.items.len < 2) return respondValue(self.gpa, out, id, empty);
         const marker_node = path_stack.items[path_stack.items.len - 1];
         const parent_node = path_stack.items[path_stack.items.len - 2];
-        const tree = &snap.trees[file_idx];
+        const tree = snap.treeOf(file_idx);
         if (tree.get(parent_node).tag != .member) return respondValue(self.gpa, out, id, empty);
         const member_kids = tree.kids(parent_node);
         if (member_kids[1] != marker_node) return respondValue(self.gpa, out, id, empty);
 
-        const recv_ty = snap.checked.typeOf(file_idx, member_kids[0]);
-        const nc = check.NameCtx{ .gpa = self.gpa, .ctx = &snap.ctx, .module_id = @enumFromInt(0), .module = &snap.module, .all_modules = &.{} };
+        const recv_ty = snap.rootChecked().typeOf(file_idx, member_kids[0]);
+        const nc = check.NameCtx{ .gpa = self.gpa, .ctx = &snap.ctx, .module_id = snap.root_id, .module = snap.rootModule(), .all_modules = snap.project.modules.items };
 
         var items: std.ArrayList(CompletionItem) = .empty;
         defer {
@@ -494,53 +499,98 @@ fn funcSignature(gpa: Allocator, nc: check.NameCtx, params: []const check.TypeId
 
 const max_files_per_dir = 4096;
 const max_file_bytes = 1 << 20;
+const max_ancestors = 64;
 
-const Override = struct { path: []const u8, text: []const u8 };
-
+/// One directory's snapshot, built as a *whole project* — the edited directory
+/// (`root_id`) plus the prelude (`std/core`) and every module it imports
+/// (`std/*` and relative) — so prelude names (`println`) and stdlib imports
+/// resolve exactly as a real `bit build` does, instead of squiggling as
+/// undefined. `resolve.loadProject` does the loading; unsaved buffers are fed
+/// in as overlays. All per-file operations index the *root* module.
+/// `// ponytail: reloads + rechecks the whole stdlib on every keystroke;
+/// caching the unchanged std modules across snapshots is the upgrade path once
+/// the stdlib is big enough for it to matter.`
 const Snapshot = struct {
     gpa: Allocator,
     dir: []u8,
-    sources: [][]u8,
+    /// Absolute paths of the *root* module's files, parallel to its
+    /// `ModuleFile` slice — for URI mapping and `findFileIndex`.
     paths: [][]u8,
     /// Heap-allocated so `Diagnostics.sources`'s pointer into it stays valid
     /// no matter how many times this `Snapshot` itself is copied (returned by
     /// value, moved into `Server.snapshots`, ...).
     sm: *diagnostics.SourceManager,
     diags: diagnostics.Diagnostics,
-    trees: []ast.Tree,
-    files: []resolve.ModuleFile,
-    module: resolve.Module,
+    /// Owns every module's trees/sources/symbol tables.
+    project: resolve.LoadedProject,
+    root_id: resolve.ModuleId,
     ctx: check.TypeContext,
-    checked: check.CheckedModule,
-    /// True once `module` was assigned (parse had no errors).
-    resolved: bool,
-    /// True once `ctx`/`checked` were assigned (resolve had no errors either).
+    /// One `CheckedModule` per module, parallel to `project.modules`; empty
+    /// until `checked_ok`.
+    checked: []check.CheckedModule,
+    /// True once `ctx`/`checked` were assigned (no parse/resolve errors).
     checked_ok: bool,
 
     fn deinit(self: *Snapshot) void {
         if (self.checked_ok) {
-            self.checked.deinit();
+            for (self.checked) |*c| c.deinit();
+            self.gpa.free(self.checked);
             self.ctx.deinit();
         }
-        if (self.resolved) self.module.deinit();
+        self.project.deinit();
         self.diags.deinit();
         self.sm.deinit();
         self.gpa.destroy(self.sm);
-        for (self.trees) |*t| t.deinit();
-        self.gpa.free(self.trees);
-        self.gpa.free(self.files);
-        for (self.sources) |s| self.gpa.free(s);
-        self.gpa.free(self.sources);
         for (self.paths) |p| self.gpa.free(p);
         self.gpa.free(self.paths);
         self.gpa.free(self.dir);
         self.* = undefined;
+    }
+
+    /// The edited directory's files (the module all per-file ops index into).
+    fn rootFiles(self: *const Snapshot) []const resolve.ModuleFile {
+        return self.project.module_files.items[@intFromEnum(self.root_id)];
+    }
+    fn rootModule(self: *const Snapshot) *const resolve.Module {
+        return &self.project.modules.items[@intFromEnum(self.root_id)];
+    }
+    fn rootChecked(self: *const Snapshot) *const check.CheckedModule {
+        return &self.checked[@intFromEnum(self.root_id)];
+    }
+    fn srcOf(self: *const Snapshot, file_idx: usize) []const u8 {
+        return self.rootFiles()[file_idx].source;
+    }
+    fn treeOf(self: *const Snapshot, file_idx: usize) *const ast.Tree {
+        return self.rootFiles()[file_idx].tree;
     }
 };
 
 fn findFileIndex(snap: *const Snapshot, path: []const u8) ?usize {
     for (snap.paths, 0..) |p, i| {
         if (std.mem.eql(u8, p, path)) return i;
+    }
+    return null;
+}
+
+/// Walks up from `start_dir` (absolute) for the first ancestor holding a
+/// `stdlib/core` directory — the shipped Bit stdlib — and returns that
+/// `stdlib` path (owned). Null when none is found (a std-less checkout), which
+/// makes `std/*` imports resolve as not-found and drops the prelude, exactly
+/// as the CLI does without a stdlib. Bounded walk (Power of 10).
+fn findStdRoot(gpa: Allocator, io: Io, start_dir: []const u8) !?[]u8 {
+    var cur = start_dir;
+    var i: u32 = 0;
+    while (i < max_ancestors) : (i += 1) {
+        const core = try std.fs.path.join(gpa, &.{ cur, "stdlib", "core" });
+        defer gpa.free(core);
+        if (Io.Dir.openDirAbsolute(io, core, .{})) |d| {
+            var dd = d;
+            dd.close(io);
+            return try std.fs.path.join(gpa, &.{ cur, "stdlib" });
+        } else |_| {}
+        const parent = std.fs.path.dirname(cur) orelse break;
+        if (parent.len >= cur.len) break;
+        cur = parent;
     }
     return null;
 }
@@ -556,59 +606,14 @@ fn insertionSort(items: [][]u8) void {
     }
 }
 
-/// Parses, resolves, and type-checks every `.bit` file directly inside
-/// `dir_abs` (non-recursive — one directory is one module). Each file's
-/// content comes from `override` (if it names that path), else `overlays`
-/// (an open document's unsaved buffer), else disk. Always succeeds in
-/// building `sources`/`trees` (even a file with syntax errors gets a tree,
-/// via the parser's own recovery); `resolved`/`checked_ok` report how far
-/// the pipeline got before diagnostics stopped it, mirroring
-/// `main.zig`'s `compileReport` gating.
-fn buildSnapshot(gpa: Allocator, io: Io, dir_abs: []const u8, overlays: *const std.StringHashMapUnmanaged([]u8), override: ?Override) !Snapshot {
-    var dir = try Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true });
-    defer dir.close(io);
-
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |n| gpa.free(n);
-        names.deinit(gpa);
-    }
-    var it = dir.iterate();
-    var guard: u32 = 0;
-    while (guard < max_files_per_dir) : (guard += 1) {
-        const entry = (try it.next(io)) orelse break;
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bit")) continue;
-        try names.append(gpa, try gpa.dupe(u8, entry.name));
-    }
-    std.debug.assert(guard < max_files_per_dir);
-    insertionSort(names.items);
-
-    const n = names.items.len;
-    const paths = try gpa.alloc([]u8, n);
-    var paths_built: usize = 0;
-    errdefer {
-        for (paths[0..paths_built]) |p| gpa.free(p);
-        gpa.free(paths);
-    }
-    const sources = try gpa.alloc([]u8, n);
-    var sources_built: usize = 0;
-    errdefer {
-        for (sources[0..sources_built]) |s| gpa.free(s);
-        gpa.free(sources);
-    }
-    for (names.items, 0..) |name, i| {
-        paths[i] = try std.fs.path.join(gpa, &.{ dir_abs, name });
-        paths_built = i + 1;
-        if (override != null and std.mem.eql(u8, override.?.path, paths[i])) {
-            sources[i] = try gpa.dupe(u8, override.?.text);
-        } else if (overlays.get(paths[i])) |text| {
-            sources[i] = try gpa.dupe(u8, text);
-        } else {
-            sources[i] = try dir.readFileAlloc(io, name, gpa, .limited(max_file_bytes));
-        }
-        sources_built = i + 1;
-    }
-
+/// Loads `dir_abs` as a whole project — the edited directory plus the prelude
+/// and every module it imports — with `overlays` (open documents' unsaved
+/// buffers) and `override` (a single mid-edit splice) substituted for disk
+/// contents. All per-file operations then index the *root* module (the edited
+/// directory). Always builds a `project` (the parser recovers from syntax
+/// errors); `checked_ok` reports whether type info is available, mirroring
+/// `main.zig`'s `buildProject` gating (no check when parse/resolve errored).
+fn buildSnapshot(gpa: Allocator, io: Io, dir_abs: []const u8, overlays: *const std.StringHashMapUnmanaged([]u8), override: ?resolve.Overlay) !Snapshot {
     const sm = try gpa.create(diagnostics.SourceManager);
     sm.* = diagnostics.SourceManager.init(gpa);
     errdefer {
@@ -618,48 +623,59 @@ fn buildSnapshot(gpa: Allocator, io: Io, dir_abs: []const u8, overlays: *const s
     var diags = diagnostics.Diagnostics.init(gpa, sm);
     errdefer diags.deinit();
 
-    const trees = try gpa.alloc(ast.Tree, n);
-    var trees_built: usize = 0;
-    errdefer {
-        for (trees[0..trees_built]) |*t| t.deinit();
-        gpa.free(trees);
-    }
-    const files = try gpa.alloc(resolve.ModuleFile, n);
-    errdefer gpa.free(files);
+    // Best-effort: a checkout without a stdlib still works — `std/*` imports
+    // then error cleanly and there is no prelude, same as the CLI.
+    const std_root = try findStdRoot(gpa, io, dir_abs);
+    defer if (std_root) |s| gpa.free(s);
 
-    for (sources, 0..) |source, i| {
-        const file_id = try sm.addFile(paths[i], source);
-        trees[i] = try ast.Tree.init(gpa);
-        trees_built = i + 1;
-        try parser.parse(gpa, &trees[i], &diags, file_id, source);
-        files[i] = .{ .file = file_id, .source = source, .tree = &trees[i] };
+    var project = try resolve.loadProject(gpa, io, &diags, sm, dir_abs, std_root, .{ .map = overlays, .one = override });
+    errdefer project.deinit();
+
+    // Owned absolute paths of the root module's files, for URI mapping.
+    const root_files = project.module_files.items[@intFromEnum(project.root)];
+    const paths = try gpa.alloc([]u8, root_files.len);
+    var paths_built: usize = 0;
+    errdefer {
+        for (paths[0..paths_built]) |p| gpa.free(p);
+        gpa.free(paths);
+    }
+    for (root_files, 0..) |mf, i| {
+        paths[i] = try gpa.dupe(u8, sm.path(mf.file));
+        paths_built = i + 1;
     }
 
     var snap = Snapshot{
         .gpa = gpa,
         .dir = try gpa.dupe(u8, dir_abs),
-        .sources = sources,
         .paths = paths,
         .sm = sm,
         .diags = diags,
-        .trees = trees,
-        .files = files,
-        .module = undefined,
+        .project = project,
+        .root_id = project.root,
         .ctx = undefined,
-        .checked = undefined,
-        .resolved = false,
+        .checked = &.{},
         .checked_ok = false,
     };
     if (snap.diags.hasErrors()) return snap;
 
-    var no_imports: resolve.ImportTable = .{};
-    defer no_imports.deinit(gpa);
-    snap.module = try resolve.resolveModule(gpa, &snap.diags, snap.files, &no_imports, &.{}, null);
-    snap.resolved = true;
-    if (snap.diags.hasErrors()) return snap;
-
     snap.ctx = try check.TypeContext.init(gpa);
-    snap.checked = try check.checkModule(gpa, &snap.diags, &snap.ctx, snap.files, &snap.module, @enumFromInt(0), &.{}, false);
+    errdefer snap.ctx.deinit();
+
+    const n = project.modules.items.len;
+    const checked = try gpa.alloc(check.CheckedModule, n);
+    var checked_built: usize = 0;
+    errdefer {
+        for (checked[0..checked_built]) |*c| c.deinit();
+        gpa.free(checked);
+    }
+    // Check every module in dependency order (imports loaded first, so index
+    // order suffices) into one shared context — the same contract
+    // `main.zig`'s `buildProject` relies on.
+    for (0..n) |i| {
+        checked[i] = try check.checkModule(gpa, &snap.diags, &snap.ctx, project.module_files.items[i], &project.modules.items[i], @enumFromInt(i), project.modules.items, false);
+        checked_built += 1;
+    }
+    snap.checked = checked;
     snap.checked_ok = true;
     return snap;
 }
@@ -751,7 +767,7 @@ fn symbolKindLabel(k: resolve.SymbolKind) []const u8 {
     };
 }
 
-/// Builds hover markdown for `node` in `snap.files[file_idx]`: `kind name`
+/// Builds hover markdown for `node` in the root module's `file_idx`: `kind name`
 /// from the symbol it resolves to (if any), `: type` from the checker's own
 /// per-node type map (if any), and the nearest doc comment above the
 /// *declaring* node (if any). Returns `null` when neither is available (an
@@ -760,11 +776,8 @@ fn hoverText(gpa: Allocator, snap: *const Snapshot, file_idx: usize, node: ast.I
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
 
-    var sym: ?resolve.Symbol = null;
-    if (snap.resolved) {
-        const sym_id = snap.module.node_symbols[file_idx][node];
-        if (sym_id != .none) sym = snap.module.symbols.items[@intFromEnum(sym_id)];
-    }
+    const sym_id = snap.rootModule().node_symbols[file_idx][node];
+    const sym: ?resolve.Symbol = if (sym_id != .none) snap.rootModule().symbols.items[@intFromEnum(sym_id)] else null;
 
     if (sym) |s| {
         try buf.appendSlice(gpa, symbolKindLabel(s.kind));
@@ -773,14 +786,14 @@ fn hoverText(gpa: Allocator, snap: *const Snapshot, file_idx: usize, node: ast.I
     }
 
     if (snap.checked_ok) {
-        const ty = snap.checked.typeOf(file_idx, node);
+        const ty = snap.rootChecked().typeOf(file_idx, node);
         if (ty != .invalid) {
-            const nc = check.NameCtx{ .gpa = gpa, .ctx = &snap.ctx, .module_id = @enumFromInt(0), .module = &snap.module, .all_modules = &.{} };
+            const nc = check.NameCtx{ .gpa = gpa, .ctx = &snap.ctx, .module_id = snap.root_id, .module = snap.rootModule(), .all_modules = snap.project.modules.items };
             const type_text = try check.describeType(nc, ty);
             defer gpa.free(type_text);
             if (buf.items.len == 0) {
-                const src = snap.sources[file_idx];
-                const span = snap.trees[file_idx].get(node).span;
+                const src = snap.srcOf(file_idx);
+                const span = snap.treeOf(file_idx).get(node).span;
                 try buf.appendSlice(gpa, src[span.start..span.end]);
             }
             try buf.appendSlice(gpa, ": ");
@@ -801,8 +814,11 @@ fn hoverText(gpa: Allocator, snap: *const Snapshot, file_idx: usize, node: ast.I
     buf.deinit(gpa);
 
     if (sym) |s| {
-        if (s.decl != ast.none) {
-            if (try docCommentFor(gpa, snap.sources[s.file_idx], snap.trees[s.file_idx].get(s.decl).span.start)) |doc| {
+        // A real `decl` within the root module carries a doc comment; prelude/
+        // imported symbols have `decl == none` (their `file_idx` belongs to
+        // another module), so they're skipped rather than mis-indexed.
+        if (s.decl != ast.none and s.file_idx < snap.rootFiles().len) {
+            if (try docCommentFor(gpa, snap.srcOf(s.file_idx), snap.treeOf(s.file_idx).get(s.decl).span.start)) |doc| {
                 defer gpa.free(doc);
                 try out.appendSlice(gpa, "\n\n");
                 try out.appendSlice(gpa, doc);
@@ -1351,6 +1367,80 @@ fn positionParams(gpa: Allocator, uri: []const u8, text: []const u8, offset: u32
     try json.Stringify.encodeJsonString(uri, .{}, &out.writer);
     try out.writer.print("}},\"position\":{{\"line\":{d},\"character\":{d}}}}}", .{ pos.line, pos.character });
     return try out.toOwnedSlice();
+}
+
+test "session: prelude names and std imports resolve without false errors" {
+    // Regression: the server used to check each file in isolation (no prelude,
+    // no imports), so `println` and `std/*` imports squiggled as undefined.
+    // Loading the whole project (prelude + stdlib) clears them. Anchored to the
+    // repo's real `stdlib/`, discovered by walking up from the temp dir.
+    const gpa = testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+    var tmp = try makeTestDir(gpa, io, "bitls_prelude");
+    defer gpa.free(tmp.abs);
+    defer tmp.dir.close(io);
+    const text =
+        \\import { sqrt } from "std/math"
+        \\function main() {
+        \\  let d = sqrt(9.0)
+        \\  println("d = ${d}")
+        \\}
+        \\
+    ;
+    try writeTestFile(io, tmp.dir, "main.bit", text);
+
+    var session = TestSession.init(gpa, io);
+    defer session.deinit();
+    const main_path = try std.fs.path.join(gpa, &.{ tmp.abs, "main.bit" });
+    defer gpa.free(main_path);
+    const uri = try pathToUri(gpa, main_path);
+    defer gpa.free(uri);
+
+    var body: Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try body.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":");
+    try json.Stringify.encodeJsonString(uri, .{}, &body.writer);
+    try body.writer.writeAll(",\"text\":");
+    try json.Stringify.encodeJsonString(text, .{}, &body.writer);
+    try body.writer.writeAll("}}}");
+    try session.send(body.written());
+
+    const msgs = try session.drain();
+    defer freeMsgs(gpa, msgs);
+    // Exactly one publishDiagnostics (for main.bit — never for the stdlib
+    // files), carrying an empty diagnostics array.
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+    try testing.expect(std.mem.indexOf(u8, msgs[0], "publishDiagnostics") != null);
+    try testing.expect(std.mem.indexOf(u8, msgs[0], "\"diagnostics\":[]") != null);
+}
+
+test "session: scope completion includes prelude names" {
+    const gpa = testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+    var tmp = try makeTestDir(gpa, io, "bitls_scope_completion");
+    defer gpa.free(tmp.abs);
+    defer tmp.dir.close(io);
+    const text = "function main() {\n  \n}\n";
+    try writeTestFile(io, tmp.dir, "main.bit", text);
+
+    var session = TestSession.init(gpa, io);
+    defer session.deinit();
+    const main_path = try std.fs.path.join(gpa, &.{ tmp.abs, "main.bit" });
+    defer gpa.free(main_path);
+    const uri = try pathToUri(gpa, main_path);
+    defer gpa.free(uri);
+    try didOpen(gpa, &session, uri, text);
+
+    // A non-`.` completion inside the function body lists module scope, which
+    // now includes the auto-imported prelude (`println`).
+    const offset: u32 = @intCast(std.mem.indexOf(u8, text, "  \n").? + 2);
+    const params = try positionParams(gpa, uri, text, offset);
+    defer gpa.free(params);
+
+    const msgs = try request(gpa, &session, 4, "textDocument/completion", params);
+    defer freeMsgs(gpa, msgs);
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+    try testing.expect(std.mem.indexOf(u8, msgs[0], "\"println\"") != null);
 }
 
 test "session: hover on an inferred let shows its type" {
