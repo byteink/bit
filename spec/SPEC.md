@@ -1233,8 +1233,10 @@ Every module implicitly imports the exports of `std/core` — the **prelude** �
 if by `import { ... } from "std/core"`, with no `import` line. A name the module
 declares or explicitly imports shadows the prelude name. The prelude provides the
 handful of names a program is expected to reach for unqualified: `println`,
-`newError`, and the generic enums `Option<T>` and `Result<T, E>` (§14.7). A build
-without a standard-library checkout simply has no prelude.
+`newError`, the generic enums `Option<T>` and `Result<T, E>` (§14.7), and their
+helpers — `unwrap`/`unwrapOr`/`isSome`/`isNone` for `Option`, and
+`unwrapOk`/`okOr`/`isOk`/`isErr` for `Result` (the `unwrap*` forms panic on the
+empty case). A build without a standard-library checkout simply has no prelude.
 
 ---
 
