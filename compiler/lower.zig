@@ -2132,14 +2132,11 @@ const FnCtx = struct {
                 if (sym.kind == .builtin_type) return self.lowerConvert(node);
             }
         }
-        // `EnumName.Variant(args)` — construct a payload-carrying variant.
+        // `EnumName.Variant(args)` / `Enum<Args>.Variant(args)` — construct a
+        // payload-carrying variant.
         if (self.tree().get(callee).tag == .member) {
             const mk = self.kids(callee); // [recv, name]
-            if (self.tree().get(mk[0]).tag == .ident) {
-                if (self.nodeSymbol(mk[0])) |gs| {
-                    if (self.l.symbolOf(gs).kind == .enum_type) return self.lowerVariantConstruction(node);
-                }
-            }
+            if (self.isEnumTypeRef(mk[0])) return self.lowerVariantConstruction(node);
         }
         const target = try self.resolveCallTarget(node, callee);
         var args: std.ArrayList(ir.ValueId) = .empty;
@@ -2570,29 +2567,38 @@ const FnCtx = struct {
         return self.b.unary(iop, ty, val);
     }
 
+    /// Whether `recv` names an enum *type* — a bare enum name or a turbofish
+    /// `Enum<Args>` (`generic_inst`) — rather than a value-producing expression.
+    /// A member/call on such a receiver is a variant reference/construction.
+    fn isEnumTypeRef(self: *FnCtx, recv: ast.Index) bool {
+        const base = switch (self.tree().get(recv).tag) {
+            .ident => recv,
+            .generic_inst => self.kids(recv)[0],
+            else => return false,
+        };
+        if (self.tree().get(base).tag != .ident) return false;
+        const gs = self.nodeSymbol(base) orelse return false;
+        return self.l.symbolOf(gs).kind == .enum_type;
+    }
+
     fn lowerMember(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [recv, name]
         const name = self.identText(k[1]);
-        // `EnumName.Variant` — a variant reference lowers to its tag (Stage 1:
-        // a bare i64, enum-typed). The member node itself was typed as the enum
-        // by `checkVariantRef`, so its variant list gives the tag index.
-        if (self.tree().get(k[0]).tag == .ident) {
-            if (self.nodeSymbol(k[0])) |gs| {
-                if (self.l.symbolOf(gs).kind == .enum_type) {
-                    const enum_ty = try self.nodeType(node);
-                    const ed = self.ctx.typeOf(enum_ty);
-                    if (ed == .@"enum") {
-                        for (ed.@"enum".variants, 0..) |v, i| {
-                            if (!std.mem.eql(u8, v.name, name)) continue;
-                            // A boxed enum's no-payload variant is still an
-                            // object `{tag, null}`; a bare enum's is just the tag.
-                            if (check.enumBoxed(ed.@"enum")) return self.buildEnumObj(enum_ty, @intCast(i), null);
-                            return self.b.constInt(enum_ty, @intCast(i));
-                        }
-                    }
-                    return error.UnsupportedConstruct;
+        // `EnumName.Variant` / `Enum<Args>.Variant` — a variant reference lowers
+        // to its tag (a bare i64 for a C-like enum, a `{tag, null}` object for a
+        // boxed one). The member node itself was typed as the concrete enum by
+        // `checkVariantRef`/`variantRefResult`, so its variant list gives the tag.
+        if (self.isEnumTypeRef(k[0])) {
+            const enum_ty = try self.nodeType(node);
+            const ed = self.ctx.typeOf(enum_ty);
+            if (ed == .@"enum") {
+                for (ed.@"enum".variants, 0..) |v, i| {
+                    if (!std.mem.eql(u8, v.name, name)) continue;
+                    if (check.enumBoxed(ed.@"enum")) return self.buildEnumObj(enum_ty, @intCast(i), null);
+                    return self.b.constInt(enum_ty, @intCast(i));
                 }
             }
+            return error.UnsupportedConstruct;
         }
         const recv_ty = try self.nodeType(k[0]);
         const data = self.ctx.typeOf(recv_ty);

@@ -1029,13 +1029,17 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
   variants and binds a variant's payload in its arm. Enums are not ordered and not
   `==`-comparable in v0.1 — use `match`.
 - An enum may be **generic** (`enum Option<T> { Some(T), None }`), monomorphized
-  per instantiation like a generic struct (§14.1, §15). A construction never
-  spells its type arguments: they are inferred from the payload argument
-  (`Option.Some(5)` gives `Option<i64>`) or, when no argument constrains a
-  parameter — a bare `None`, or the `E` in `Result.Ok(v)` — from the expected type
-  (`let o: Option<i64> = Option.None`, or a function's declared return type). A
-  parameter that neither source fixes is an error; annotate the target. The
-  prelude (§17) defines `Option<T>` and `Result<T, E>` this way.
+  per instantiation like a generic struct (§14.1, §15). A construction's type
+  arguments are usually inferred: from the payload argument (`Option.Some(5)`
+  gives `Option<i64>`), from the expected type when no argument constrains a
+  parameter — a bare `None`, or the `E` in `Result.Ok(v)` (`let o: Option<i64> =
+  Option.None`, a function's declared return type) — and, for a nested
+  construction, from a parameter an earlier argument already fixed (the tail of
+  `List.Cons(1, List.Cons(2, List.Nil))` needs no annotation). When inference has
+  nothing to go on, spell the arguments explicitly with a **turbofish** at the
+  variant site: `Option<i64>.None`, `Result<i64, string>.Ok(v)`. A parameter left
+  unfixed with no turbofish is an error. The prelude (§17) defines `Option<T>` and
+  `Result<T, E>` this way.
 
 Representation (non-normative): a no-payload-only enum is a bare tag word; an
 enum with any payload is a boxed `{tag, payloadPtr}` object whose payload is a

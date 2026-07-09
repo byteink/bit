@@ -2556,7 +2556,9 @@ const Checker = struct {
             }
         }
 
-        // `EnumName.Variant(args)` — constructing a payload-carrying variant.
+        // `EnumName.Variant(args)` — constructing a payload-carrying variant,
+        // with `EnumName` either a bare name (inferred/expected type args) or a
+        // turbofish `Enum<Args>` (explicit type args).
         if (mf.tree.get(callee).tag == .member) {
             const mk = mf.tree.kids(callee); // [recv, name]
             if (mf.tree.get(mk[0]).tag == .ident) {
@@ -2565,6 +2567,10 @@ const Checker = struct {
                         return self.checkVariantConstruction(file_idx, node, gs, env, fctx, expected);
                     }
                 }
+            }
+            if (try self.enumTurbofish(file_idx, mk[0], env)) |tf| {
+                const vname = Checker.identText(mf, mk[1]);
+                return self.checkVariantConcrete(file_idx, node, tf.sym, tf.ty, vname, arg_items, env, fctx);
             }
         }
 
@@ -2664,29 +2670,51 @@ const Checker = struct {
         return if (d.module == enum_sym.module and d.id == enum_sym.id) expected else null;
     }
 
+    /// `Enum<Args>.Variant` — the turbofish receiver, resolved to its concrete
+    /// instantiation. Null when `recv` is not a `generic_inst` over an enum (the
+    /// caller then falls back to expected-type inference or a plain member).
+    const EnumTurbofish = struct { sym: GlobalSymbol, ty: TypeId };
+    fn enumTurbofish(self: *Checker, file_idx: usize, recv: ast.Index, env: GenericEnv) Error!?EnumTurbofish {
+        const mf = self.files[file_idx];
+        if (mf.tree.get(recv).tag != .generic_inst) return null;
+        const base = mf.tree.kids(recv)[0];
+        if (mf.tree.get(base).tag != .ident) return null;
+        const gs = self.nodeSymbol(file_idx, base) orelse return null;
+        if (self.symbolOf(gs).kind != .enum_type) return null;
+        return .{ .sym = gs, .ty = try self.checkTypeGenericInst(file_idx, recv, env) };
+    }
+
     /// `EnumName.Variant` — a variant reference. For a no-payload variant it
     /// IS a value of the enum type. (A payload variant is a constructor, handled
     /// via a `call` on this member — see `checkVariantConstruction`.)
     fn checkVariantRef(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, expected: TypeId) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node); // [recv, name]
-        const name = Checker.identText(mf, k[1]);
         const enum_ty = (try self.enumInstance(enum_sym, expected)) orelse {
             try self.emit(mf, k[1], .cannot_infer_type, "cannot infer type arguments for '{s}'; annotate the target type", .{self.symbolOf(enum_sym).name}, null);
             return .invalid;
         };
+        return self.variantRefResult(file_idx, k[1], enum_sym, enum_ty);
+    }
+
+    /// The no-payload variant lookup against an already-concrete enum type,
+    /// shared by inferred (`checkVariantRef`) and turbofish (`Enum<T>.Variant`)
+    /// references.
+    fn variantRefResult(self: *Checker, file_idx: usize, name_node: ast.Index, enum_sym: GlobalSymbol, enum_ty: TypeId) Error!TypeId {
+        const mf = self.files[file_idx];
+        const name = Checker.identText(mf, name_node);
         const data = self.ctx.typeOf(enum_ty);
         if (data != .@"enum") return .invalid;
         for (data.@"enum".variants) |v| {
             if (std.mem.eql(u8, v.name, name)) {
                 if (v.payload.len != 0) {
-                    try self.emit(mf, k[1], .arg_count_mismatch, "variant '{s}' carries a payload; construct it with arguments", .{name}, null);
+                    try self.emit(mf, name_node, .arg_count_mismatch, "variant '{s}' carries a payload; construct it with arguments", .{name}, null);
                     return .invalid;
                 }
                 return enum_ty;
             }
         }
-        try self.emit(mf, k[1], .unknown_member, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, name }, null);
+        try self.emit(mf, name_node, .unknown_member, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, name }, null);
         return .invalid;
     }
 
@@ -2737,12 +2765,66 @@ const Checker = struct {
         return .invalid;
     }
 
-    /// Generic-enum construction with no expected type: unify each argument's
-    /// natural type against the variant's payload template to solve the enum's
-    /// type parameters (`Option.Some(5)` => `Option<i64>`), then validate the
-    /// arguments against the resulting concrete payload. A parameter that no
-    /// argument constrains (e.g. `Result.Err(e)` leaves `T` free) is a
-    /// `cannot_infer` error — annotate the target instead.
+    /// Whether `ty` mentions any of `gparams` as a `type_param` leaf, descending
+    /// through composite types and (via `inst_by_result`) a nested generic type's
+    /// instantiation args — the "is this still generic?" test for `concretePayload`.
+    fn mentionsAnyParam(self: *Checker, ty: TypeId, gparams: []const GlobalSymbol, depth: u32) bool {
+        if (depth >= max_type_depth) return false;
+        switch (self.ctx.typeOf(ty)) {
+            .type_param => |g| {
+                for (gparams) |gp| if (gp.module == g.module and gp.id == g.id) return true;
+                return false;
+            },
+            .slice => |e| return self.mentionsAnyParam(e, gparams, depth + 1),
+            .chan => |e| return self.mentionsAnyParam(e, gparams, depth + 1),
+            .array => |a| return self.mentionsAnyParam(a.elem, gparams, depth + 1),
+            .map => |m| return self.mentionsAnyParam(m.key, gparams, depth + 1) or self.mentionsAnyParam(m.val, gparams, depth + 1),
+            .tuple => |ts| {
+                for (ts) |t| if (self.mentionsAnyParam(t, gparams, depth + 1)) return true;
+                return false;
+            },
+            .func => |f| {
+                for (f.params) |p| if (self.mentionsAnyParam(p, gparams, depth + 1)) return true;
+                return self.mentionsAnyParam(f.result, gparams, depth + 1);
+            },
+            .fallible => |f| return self.mentionsAnyParam(f.ok, gparams, depth + 1) or self.mentionsAnyParam(f.err, gparams, depth + 1),
+            .@"struct", .interface, .@"enum" => {
+                const idx = self.ctx.inst_by_result.get(@intFromEnum(ty)) orelse return false;
+                for (self.ctx.instantiations.items[idx].args) |a| {
+                    if (self.mentionsAnyParam(a, gparams, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// `payload_ty` with the parameters solved so far substituted in, or null if
+    /// it still mentions an unsolved parameter (so the argument can't yet be
+    /// checked against a concrete expected type). Drives left-to-right inference.
+    fn concretePayload(self: *Checker, payload_ty: TypeId, gparams: []const GlobalSymbol, bound: []const ?TypeId) Error!?TypeId {
+        var env_buf = try self.gpa.alloc(GenericBinding, gparams.len);
+        defer self.gpa.free(env_buf);
+        var n: usize = 0;
+        for (gparams, 0..) |gp, i| {
+            if (bound[i]) |t| {
+                env_buf[n] = .{ .sym = gp, .to = t };
+                n += 1;
+            }
+        }
+        const w = try self.subst(payload_ty, env_buf[0..n], 0);
+        if (self.mentionsAnyParam(w, gparams, 0)) return null;
+        return w;
+    }
+
+    /// Generic-enum construction with no expected type: solve the enum's type
+    /// parameters from the arguments (`Option.Some(5)` => `Option<i64>`), then
+    /// validate the arguments against the resulting concrete payload. Arguments
+    /// are visited left to right so an earlier one that fixes a parameter lets a
+    /// later one be checked against a concrete expected type — a nested bare
+    /// variant (`List.Cons(1, List.Nil)`) is typed rather than failing an
+    /// inference-free check. A parameter no argument constrains (e.g. the free
+    /// side of `Result.Err(e)`) is a `cannot_infer` error — annotate the target.
     fn inferVariantEnum(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, vname: []const u8, arg_items: []const ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node);
@@ -2769,7 +2851,22 @@ const Checker = struct {
 
         var natural = try self.gpa.alloc(TypeId, arg_items.len);
         defer self.gpa.free(natural);
+        const want_checked = try self.gpa.alloc(bool, arg_items.len);
+        defer self.gpa.free(want_checked);
+        @memset(want_checked, false);
         for (arg_items, 0..) |a, i| {
+            const inner = mf.tree.kids(a)[0];
+            // Once earlier args have fixed enough parameters to make this arg's
+            // payload concrete, check it against that expected type; otherwise
+            // check it naturally and unify to solve more parameters.
+            if (i < payload.len) {
+                if (try self.concretePayload(payload[i], gparams, bound)) |w| {
+                    natural[i] = try self.checkExpr(file_idx, inner, env, fctx, w);
+                    try self.expect(file_idx, inner, natural[i], w);
+                    want_checked[i] = true;
+                    continue;
+                }
+            }
             natural[i] = try self.checkArgExprType(file_idx, a, env, fctx);
             if (i < payload.len) self.unify(payload[i], self.defaultType(natural[i]), gparams, bound, 0);
         }
@@ -2792,6 +2889,7 @@ const Checker = struct {
             if (!std.mem.eql(u8, cv.name, vname)) continue;
             for (arg_items, 0..) |a, i| {
                 if (i >= cv.payload.len) break;
+                if (want_checked[i]) continue; // already checked against its concrete payload
                 try self.expect(file_idx, mf.tree.kids(a)[0], natural[i], cv.payload[i]);
             }
             break;
@@ -2813,6 +2911,10 @@ const Checker = struct {
                 }
                 if (gk == .enum_type) return self.checkVariantRef(file_idx, node, gs, expected);
             }
+        }
+        // `Enum<Args>.Variant` (turbofish, no-payload variant).
+        if (try self.enumTurbofish(file_idx, k[0], env)) |tf| {
+            return self.variantRefResult(file_idx, k[1], tf.sym, tf.ty);
         }
         const recv_ty = try self.checkExpr(file_idx, k[0], env, fctx, .invalid);
         if (recv_ty == .invalid) return .invalid;

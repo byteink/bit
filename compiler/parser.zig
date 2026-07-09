@@ -1329,6 +1329,13 @@ const Parser = struct {
             const generic_ty = try self.tree.add(.generic_inst, join(self.span(expr), gt_span), 0, &.{ expr, targs });
             return self.parseStructCompositeLitBody(generic_ty);
         }
+        // `Enum<T>.Variant` (turbofish at a variant site): `<...>` before `.` is
+        // never a comparison — `(a < b) > .x` has no valid parse — so a `.` here
+        // is unambiguously a generic instantiation whose member the postfix loop
+        // then reads (`Option<i64>.None`, `Result<i64, E>.Ok(v)`).
+        if (self.tok.kind == .dot) {
+            return self.tree.add(.generic_inst, join(self.span(expr), gt_span), 0, &.{ expr, targs });
+        }
         return error.Speculative;
     }
 
