@@ -994,7 +994,7 @@ const Checker = struct {
         for (arg_nodes, 0..) |an, i| args[i] = try self.checkType(file_idx, an, env);
 
         switch (sym.kind) {
-            .struct_type, .interface_type, .type_alias => {},
+            .struct_type, .interface_type, .type_alias, .enum_type => {},
             else => {
                 try self.emit(mf, node, .type_mismatch, "'{s}' is not a generic type", .{sym.name}, null);
                 return .invalid;
@@ -1345,6 +1345,7 @@ const Checker = struct {
         const id = try self.ctx.types.reserve(switch (shape) {
             .@"struct" => TypeData{ .@"struct" = &.{} },
             .interface => TypeData{ .interface = &.{} },
+            .@"enum" => TypeData{ .@"enum" = .{ .decl = gsym, .variants = &.{} } },
             else => unreachable,
         });
         try self.ctx.recordInstantiation(gsym, args, id);
@@ -1354,6 +1355,21 @@ const Checker = struct {
                 defer self.gpa.free(nf);
                 for (fields, 0..) |f, i| nf[i] = .{ .name = f.name, .ty = try self.subst(f.ty, env, 0), .exported = f.exported };
                 self.ctx.types.fill(id, .{ .@"struct" = try dupe(self.ctx.arena(), Field, nf) });
+            },
+            // Nominal identity keys on `decl` alone, but each instantiation is a
+            // distinct *reserved* id (never re-interned by content), so keeping
+            // `decl = gsym` here can't collide `Option<i64>` with `Option<string>`
+            // — `findInstantiation` (keyed on args) is what dedupes them.
+            .@"enum" => |e| {
+                var nv = try self.gpa.alloc(Variant, e.variants.len);
+                defer self.gpa.free(nv);
+                for (e.variants, 0..) |v, i| {
+                    var np = try self.gpa.alloc(TypeId, v.payload.len);
+                    defer self.gpa.free(np);
+                    for (v.payload, 0..) |pty, j| np[j] = try self.subst(pty, env, 0);
+                    nv[i] = .{ .name = v.name, .payload = try dupe(self.ctx.arena(), TypeId, np) };
+                }
+                self.ctx.types.fill(id, .{ .@"enum" = .{ .decl = gsym, .variants = try dupe(self.ctx.arena(), Variant, nv) } });
             },
             .interface => |methods| {
                 var nm = try self.gpa.alloc(Method, methods.len);
@@ -1401,7 +1417,7 @@ const Checker = struct {
                 try self.ctx.recordInstantiation(gsym, args, result);
                 break :blk result;
             },
-            .struct_type, .interface_type => self.instantiateRecursive(gsym, args, template, env_buf),
+            .struct_type, .interface_type, .enum_type => self.instantiateRecursive(gsym, args, template, env_buf),
             else => unreachable,
         };
     }
@@ -2445,7 +2461,7 @@ const Checker = struct {
             if (mf.tree.get(mk[0]).tag == .ident) {
                 if (self.nodeSymbol(file_idx, mk[0])) |gs| {
                     if (self.symbolOf(gs).kind == .enum_type) {
-                        return self.checkVariantConstruction(file_idx, node, gs, env, fctx);
+                        return self.checkVariantConstruction(file_idx, node, gs, env, fctx, expected);
                     }
                 }
             }
@@ -2533,14 +2549,31 @@ const Checker = struct {
         }
     }
 
+    /// If `enum_sym` is a *generic* enum, resolves it to the concrete
+    /// instantiation carried by the expected type — the only inference source a
+    /// bare `E.V` (no arguments) has. Returns null when `expected` is not an
+    /// instantiation of this enum (caller emits `cannot_infer`); for a
+    /// non-generic enum, always returns its template (which *is* concrete).
+    fn enumInstance(self: *Checker, enum_sym: GlobalSymbol, expected: TypeId) Error!?TypeId {
+        if (self.declGenericArity(enum_sym) == 0) return try self.declTypeOf(enum_sym);
+        if (expected == .invalid) return null;
+        const ed = self.ctx.typeOf(expected);
+        if (ed != .@"enum") return null;
+        const d = ed.@"enum".decl;
+        return if (d.module == enum_sym.module and d.id == enum_sym.id) expected else null;
+    }
+
     /// `EnumName.Variant` — a variant reference. For a no-payload variant it
     /// IS a value of the enum type. (A payload variant is a constructor, handled
-    /// in Stage 2 via a `call` on this member; Stage 1 enums have no payloads.)
-    fn checkVariantRef(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol) Error!TypeId {
+    /// via a `call` on this member — see `checkVariantConstruction`.)
+    fn checkVariantRef(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, expected: TypeId) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node); // [recv, name]
         const name = Checker.identText(mf, k[1]);
-        const enum_ty = try self.declTypeOf(enum_sym);
+        const enum_ty = (try self.enumInstance(enum_sym, expected)) orelse {
+            try self.emit(mf, k[1], .cannot_infer_type, "cannot infer type arguments for '{s}'; annotate the target type", .{self.symbolOf(enum_sym).name}, null);
+            return .invalid;
+        };
         const data = self.ctx.typeOf(enum_ty);
         if (data != .@"enum") return .invalid;
         for (data.@"enum".variants) |v| {
@@ -2560,13 +2593,25 @@ const Checker = struct {
     /// arguments are checked against the variant's payload types (arity + each
     /// type); the result is the enum. The callee `member` node is typed as the
     /// enum so lowering can recover the variant.
-    fn checkVariantConstruction(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+    fn checkVariantConstruction(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, env: GenericEnv, fctx: FnCtx, expected: TypeId) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node); // [callee(member), type_args, args]
         const mk = mf.tree.kids(k[0]); // member: [recv, name]
         const vname = Checker.identText(mf, mk[1]);
         const arg_items = mf.tree.kids(k[2]);
-        const enum_ty = try self.declTypeOf(enum_sym);
+        // A concrete enum (non-generic, or a generic one locked by the expected
+        // type) checks its arguments directly; a generic enum without an
+        // expected type infers its type arguments from the arguments themselves.
+        if (try self.enumInstance(enum_sym, expected)) |enum_ty|
+            return self.checkVariantConcrete(file_idx, node, enum_sym, enum_ty, vname, arg_items, env, fctx);
+        return self.inferVariantEnum(file_idx, node, enum_sym, vname, arg_items, env, fctx);
+    }
+
+    /// Checks a variant construction against an already-concrete enum type,
+    /// pushing each payload type as the argument's expected type (§16.4).
+    fn checkVariantConcrete(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, enum_ty: TypeId, vname: []const u8, arg_items: []const ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node);
         const data = self.ctx.typeOf(enum_ty);
         if (data != .@"enum") {
             try self.checkArgsLoose(file_idx, arg_items, env, fctx);
@@ -2586,12 +2631,74 @@ const Checker = struct {
             }
             return enum_ty;
         }
-        try self.emit(mf, mk[1], .unknown_variant, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, vname }, null);
+        try self.emit(mf, mf.tree.kids(k[0])[1], .unknown_variant, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, vname }, null);
         try self.checkArgsLoose(file_idx, arg_items, env, fctx);
         return .invalid;
     }
 
-    fn checkMember(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+    /// Generic-enum construction with no expected type: unify each argument's
+    /// natural type against the variant's payload template to solve the enum's
+    /// type parameters (`Option.Some(5)` => `Option<i64>`), then validate the
+    /// arguments against the resulting concrete payload. A parameter that no
+    /// argument constrains (e.g. `Result.Err(e)` leaves `T` free) is a
+    /// `cannot_infer` error — annotate the target instead.
+    fn inferVariantEnum(self: *Checker, file_idx: usize, node: ast.Index, enum_sym: GlobalSymbol, vname: []const u8, arg_items: []const ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node);
+        const template = try self.declTypeOf(enum_sym);
+        const tdata = self.ctx.typeOf(template);
+        if (tdata != .@"enum") {
+            try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+            return .invalid;
+        }
+        const variant: ?Variant = for (tdata.@"enum".variants) |v| {
+            if (std.mem.eql(u8, v.name, vname)) break v;
+        } else null;
+        if (variant == null) {
+            try self.emit(mf, mf.tree.kids(k[0])[1], .unknown_variant, "enum '{s}' has no variant '{s}'", .{ self.symbolOf(enum_sym).name, vname }, null);
+            try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+            return .invalid;
+        }
+        const payload = variant.?.payload;
+
+        const gparams = self.ctx.decl_generics.get(enum_sym.pack()) orelse &[_]GlobalSymbol{};
+        const bound = try self.gpa.alloc(?TypeId, gparams.len);
+        defer self.gpa.free(bound);
+        @memset(bound, null);
+
+        var natural = try self.gpa.alloc(TypeId, arg_items.len);
+        defer self.gpa.free(natural);
+        for (arg_items, 0..) |a, i| {
+            natural[i] = try self.checkArgExprType(file_idx, a, env, fctx);
+            if (i < payload.len) self.unify(payload[i], self.defaultType(natural[i]), gparams, bound, 0);
+        }
+        if (arg_items.len != payload.len) {
+            try self.emit(mf, node, .arg_count_mismatch, "variant '{s}' takes {d} argument(s), found {d}", .{ vname, payload.len, arg_items.len }, null);
+        }
+
+        var targs = try self.gpa.alloc(TypeId, gparams.len);
+        defer self.gpa.free(targs);
+        for (bound, 0..) |b, i| {
+            targs[i] = b orelse {
+                try self.emit(mf, node, .cannot_infer_type, "cannot infer type argument for '{s}'; annotate the target type", .{self.symbolOf(gparams[i]).name}, null);
+                return .invalid;
+            };
+        }
+        const enum_ty = try self.instantiateGeneric(enum_sym, targs, mf, node);
+        self.setType(file_idx, k[0], enum_ty);
+        const cdata = self.ctx.typeOf(enum_ty).@"enum";
+        for (cdata.variants) |cv| {
+            if (!std.mem.eql(u8, cv.name, vname)) continue;
+            for (arg_items, 0..) |a, i| {
+                if (i >= cv.payload.len) break;
+                try self.expect(file_idx, mf.tree.kids(a)[0], natural[i], cv.payload[i]);
+            }
+            break;
+        }
+        return enum_ty;
+    }
+
+    fn checkMember(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx, expected: TypeId) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node); // [recv, name]
         if (mf.tree.get(k[0]).tag == .ident) {
@@ -2603,7 +2710,7 @@ const Checker = struct {
                     // `.invalid` rather than crashing.
                     return .invalid;
                 }
-                if (gk == .enum_type) return self.checkVariantRef(file_idx, node, gs);
+                if (gk == .enum_type) return self.checkVariantRef(file_idx, node, gs, expected);
             }
         }
         const recv_ty = try self.checkExpr(file_idx, k[0], env, fctx, .invalid);
@@ -3056,7 +3163,7 @@ const Checker = struct {
             .call => try self.checkCall(file_idx, node, env, fctx, expected),
             .index => try self.checkIndex(file_idx, node, env, fctx),
             .slice_expr => try self.checkSliceExpr(file_idx, node, env, fctx),
-            .member => try self.checkMember(file_idx, node, env, fctx),
+            .member => try self.checkMember(file_idx, node, env, fctx, expected),
             .tuple_index => try self.checkTupleIndex(file_idx, node, env, fctx),
             .type_assert => try self.checkTypeAssert(file_idx, node, env, fctx),
             .try_expr => try self.checkTryExpr(file_idx, node, env, fctx),

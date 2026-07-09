@@ -464,7 +464,7 @@ field       = [ "export" ] IDENT ":" type .
 interface_decl = "interface" IDENT [ generic_params ] "{" [ method_sig { ( ";" | "," ) method_sig } [ ";" | "," ] ] "}" .
 method_sig     = IDENT signature .
 enum_decl      = "enum" IDENT [ generic_params ] "{" [ enum_variant { ( ";" | "," ) enum_variant } [ ";" | "," ] ] "}" .
-enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* payload reserved; §14.7 *)
+enum_variant   = IDENT [ "(" type { "," type } ")" ] .   (* optional payload; §14.7 *)
 ```
 
 Interfaces are **structural** (§14.3): a type satisfies an interface if it has all
@@ -1000,7 +1000,7 @@ An enum is a nominal type whose values are one of a fixed, named set of variants
 
 ```
 enum_decl    = "enum" IDENT [ generic_params ] "{" { enum_variant [ "," ] } "}" .
-enum_variant = IDENT [ "(" type { "," type } ")" ] .   (* payload reserved *)
+enum_variant = IDENT [ "(" type { "," type } ")" ] .   (* optional payload *)
 ```
 
 ```
@@ -1021,8 +1021,14 @@ let s = Shape.Rect(3.0, 4.0)   // payload variant: construct with arguments
 - Enum values are consumed by `match` (§13.8), which is exhaustive over the
   variants and binds a variant's payload in its arm. Enums are not ordered and not
   `==`-comparable in v0.1 — use `match`.
-- Generic enums (`enum Option<T> { Some(T), None }`) are deferred to a later
-  release.
+- An enum may be **generic** (`enum Option<T> { Some(T), None }`), monomorphized
+  per instantiation like a generic struct (§14.1, §15). A construction never
+  spells its type arguments: they are inferred from the payload argument
+  (`Option.Some(5)` gives `Option<i64>`) or, when no argument constrains a
+  parameter — a bare `None`, or the `E` in `Result.Ok(v)` — from the expected type
+  (`let o: Option<i64> = Option.None`, or a function's declared return type). A
+  parameter that neither source fixes is an error; annotate the target. The
+  prelude (§17) defines `Option<T>` and `Result<T, E>` this way.
 
 Representation (non-normative): a no-payload-only enum is a bare tag word; an
 enum with any payload is a boxed `{tag, payloadPtr}` object whose payload is a
@@ -1200,6 +1206,15 @@ function main(): ()! { ... }     // a returned error prints to stderr, exit code
 
 `main` takes no parameters; command-line arguments and environment are read via
 the standard library (`std/os`). A non-executable (library) module has no `main`.
+
+### 17.5 Prelude
+
+Every module implicitly imports the exports of `std/core` — the **prelude** — as
+if by `import { ... } from "std/core"`, with no `import` line. A name the module
+declares or explicitly imports shadows the prelude name. The prelude provides the
+handful of names a program is expected to reach for unqualified: `println`,
+`newError`, and the generic enums `Option<T>` and `Result<T, E>` (§14.7). A build
+without a standard-library checkout simply has no prelude.
 
 ---
 
@@ -1379,9 +1394,9 @@ function main(): ()! {
 
 Intentionally **not** in v0.1, to keep the surface minimal:
 
-- Generic enums (`enum Option<T> { Some(T), None }`) and `match` as an
-  *expression* (yielding a value): v0.1 has monomorphic sum types + exhaustive
-  statement-form `match` (§14.7, §13.8).
+- `match` as an *expression* (yielding a value): v0.1 has exhaustive
+  statement-form `match` (§13.8). Generic enums *are* in v0.1 — the prelude's
+  `Option<T>`/`Result<T, E>` (§14.7, §17).
 - General union and optional types; `null` (absence is modeled by `nil` zero
   values and the Result model).
 - Pointers, `&`/`*`, value-vs-pointer receivers.

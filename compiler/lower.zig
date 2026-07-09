@@ -619,9 +619,17 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
             try direct_syms.append(gpa, gsym);
         }
     }
+    // Only *function* instantiations become lowered functions. `ctx.instantiations`
+    // also holds generic type instantiations (struct/enum/interface), which
+    // produce no code — a function template is exactly one with a `func_sigs`
+    // entry. Skip the rest here and in Pass B so FuncIds stay dense and aligned;
+    // call sites only ever look up function instantiations (via `call_insts`).
     const base = direct_syms.items.len;
-    for (0..ctx.instantiations.items.len) |i| {
-        try l.inst_ids.put(gpa, @intCast(i), @enumFromInt(base + i));
+    var func_inst_count: u32 = 0;
+    for (ctx.instantiations.items, 0..) |inst, i| {
+        if (!ctx.func_sigs.contains(inst.generic.pack())) continue;
+        try l.inst_ids.put(gpa, @intCast(i), @enumFromInt(base + func_inst_count));
+        func_inst_count += 1;
     }
 
     // Pass A3: methods on concrete structs, across every module. They are not
@@ -632,7 +640,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     const MethodDecl = struct { module: ModuleId, file_idx: usize, decl: ast.Index, name: []const u8, ty: TypeId, shape: check.FuncShape };
     var method_decls: std.ArrayList(MethodDecl) = .empty;
     defer method_decls.deinit(gpa);
-    const method_base = base + ctx.instantiations.items.len;
+    const method_base = base + func_inst_count;
     for (modules, 0..) |mod, mi| {
         for (mod.files, 0..) |mf, fidx| {
             for (mf.tree.kids(mf.tree.root)) |top| {
@@ -707,6 +715,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
         try l.out.funcs.append(gpa, f);
     }
     for (ctx.instantiations.items, 0..) |inst, i| {
+        if (!ctx.func_sigs.contains(inst.generic.pack())) continue; // type instantiation: no code
         l.setModule(inst.generic.module);
         const env = try l.buildGenericEnv(inst);
         defer gpa.free(env);
