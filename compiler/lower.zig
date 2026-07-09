@@ -2104,13 +2104,24 @@ const FnCtx = struct {
     }
 
     /// `[]T(n)` / `[]T(n, m)`: allocate a length-`n`, capacity-`m` (default `n`)
-    /// slice, elements zeroed (SPEC §11). Reuses `slice_new`.
+    /// slice, elements zeroed (SPEC §11). Reuses `slice_new`. A single `string`
+    /// argument is instead the conversion `[]byte(s)` (SPEC §12.9), dispatched
+    /// to `bytes_from_string` — the checker already accepts only a `[]u8` target
+    /// for it.
     fn lowerSliceCtor(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [callee, type_args, args]
         const slice_ty = try self.nodeType(node);
         const elem_ty = self.ctx.typeOf(slice_ty).slice;
         const i64ty = self.ctx.prim_ids.get(.i64);
         const arg_nodes = self.kids(k[2]);
+        if (arg_nodes.len == 1) {
+            const arg = self.kids(arg_nodes[0])[0];
+            const at = self.ctx.typeOf(try self.nodeType(arg));
+            if (at == .prim and at.prim == .string) {
+                const s = try self.lowerExpr(arg);
+                return self.b.rtCall(slice_ty, .bytes_from_string, &.{s});
+            }
+        }
         const len = try self.lowerExprH(self.kids(arg_nodes[0])[0], i64ty);
         const cap = if (arg_nodes.len >= 2) try self.lowerExprH(self.kids(arg_nodes[1])[0], i64ty) else len;
         const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
@@ -2175,6 +2186,12 @@ const FnCtx = struct {
         const src_ty = if (self.isUntypedTy(raw_ty)) self.defaultTy(raw_ty) else raw_ty;
         const src = try self.lowerExprH(arg, src_ty);
         if (src_ty == dst_ty) return src;
+        // `string(b)` for a `[]u8` (SPEC §12.9) is a heap conversion, not a
+        // numeric cast; the checker restricts the source to a byte slice.
+        const dd = self.ctx.typeOf(dst_ty);
+        if (dd == .prim and dd.prim == .string and self.ctx.typeOf(src_ty) == .slice) {
+            return self.b.rtCall(dst_ty, .string_from_bytes, &.{src});
+        }
         return self.b.convert(dst_ty, src);
     }
 
@@ -2650,18 +2667,23 @@ const FnCtx = struct {
         return s;
     }
 
-    /// `s[lo:hi]` (SPEC §12.6): a new `[]T` view sharing `s`'s buffer. `lo`
-    /// defaults to 0, `hi` to `len(s)`. Only a slice base is supported here;
-    /// re-slicing a `[N]T` array or a `string` is deferred (#1147).
+    /// `s[lo:hi]` (SPEC §12.6). On a `[]T`, a new view sharing `s`'s buffer; on
+    /// a `string`, a fresh copy of bytes `[lo, hi)` (string headers hold interior
+    /// pointers, so a shared view can't keep its backing GC-alive). `lo` defaults
+    /// to 0, `hi` to `len(s)` — the `len` field load is shared by both layouts.
+    /// Re-slicing a `[N]T` array is deferred (arrays aren't yet constructible).
     fn lowerSliceExpr(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [recv, lo_or_none, hi_or_none]
         const recv_ty = try self.nodeType(k[0]);
-        if (self.ctx.typeOf(recv_ty) != .slice) return error.UnsupportedConstruct;
+        const rd = self.ctx.typeOf(recv_ty);
+        const is_string = rd == .prim and rd.prim == .string;
+        if (rd != .slice and !is_string) return error.UnsupportedConstruct;
         const i64ty = self.ctx.prim_ids.get(.i64);
         const recv = try self.lowerExpr(k[0]);
         const lo = if (k[1] != ast.none) try self.lowerExprH(k[1], i64ty) else try self.b.constInt(i64ty, 0);
         const hi = if (k[2] != ast.none) try self.lowerExprH(k[2], i64ty) else try self.b.sliceLen(i64ty, recv);
-        return self.b.rtCall(try self.nodeType(node), .slice_slice, &.{ recv, lo, hi });
+        const rt: ir.RtFn = if (is_string) .string_slice else .slice_slice;
+        return self.b.rtCall(try self.nodeType(node), rt, &.{ recv, lo, hi });
     }
 
     fn lowerCompositeLit(self: *FnCtx, node: ast.Index) Error!ir.ValueId {

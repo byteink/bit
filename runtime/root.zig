@@ -487,6 +487,37 @@ export fn bit_rt_string_byte(s: *const RtBytes, index: usize) callconv(.c) u64 {
     return s.ptr[index];
 }
 
+/// `bit_rt_string_slice` (ABI.md §2): `s[lo:hi]` (SPEC §12.6) — a fresh string
+/// holding bytes `[lo, hi)`. Copies rather than sharing `s`'s buffer: a string
+/// header's `ptr` is an interior pointer into its own GC object, so a shared
+/// view could not keep the backing alive (a slice can, because its header names
+/// the buffer object base). Panics unless `0 <= lo <= hi <= len`.
+export fn bit_rt_string_slice(s: *const RtBytes, lo: usize, hi: usize) callconv(.c) *const RtBytes {
+    if (!(lo <= hi and hi <= s.len)) fatal("string bounds out of range");
+    const out = allocString(hi - lo);
+    @memcpy(out.bytes, s.ptr[lo..hi]);
+    return out.hdr;
+}
+
+/// `bit_rt_bytes_from_string` (ABI.md §2): `[]byte(s)` (SPEC §12.9) — a fresh
+/// `[]u8` whose element `i` is `s[i]`. Slices are word-stored (ABI.md §2), so
+/// each byte lands zero-extended in its own word; the buffer is a leaf (non-ref).
+export fn bit_rt_bytes_from_string(s: *const RtBytes) callconv(.c) *SliceHeader {
+    const h = bit_rt_slice_new(s.len, s.len, 0);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) h.buf[i] = s.ptr[i];
+    return h;
+}
+
+/// `bit_rt_string_from_bytes` (ABI.md §2): `string(b)` for a `[]u8` (SPEC §12.9)
+/// — a fresh string whose byte `i` is the low byte of element word `i`.
+export fn bit_rt_string_from_bytes(h: *const SliceHeader) callconv(.c) *const RtBytes {
+    const out = allocString(h.len);
+    var i: usize = 0;
+    while (i < h.len) : (i += 1) out.bytes[i] = @truncate(h.buf[h.off + i]);
+    return out.hdr;
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem (ABI.md §14) — thin POSIX wrappers; the ergonomic File/open/
 // readFile/writeFile layer lives in std/fs, built on these primitives.

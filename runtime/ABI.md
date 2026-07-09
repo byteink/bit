@@ -406,6 +406,9 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_string_concat`| `(a: *const RtBytes, b: *const RtBytes) -> *const RtBytes` (§2) |
 | `bit_rt_string_eq`    | `(a: *const RtBytes, b: *const RtBytes) -> bool` (§2)   |
 | `bit_rt_string_byte`  | `(s: *const RtBytes, index: usize) -> u64` (§2, `s[i]`; u64-widened) |
+| `bit_rt_string_slice` | `(s: *const RtBytes, lo: usize, hi: usize) -> *const RtBytes` (§2, `s[lo:hi]`; copies) |
+| `bit_rt_bytes_from_string` | `(s: *const RtBytes) -> *SliceHeader` (§2, `[]byte(s)`) |
+| `bit_rt_string_from_bytes` | `(h: *const SliceHeader) -> *const RtBytes` (§2, `string(b)`) |
 | `bit_rt_string_from_int`   | `(v: i64) -> *const RtBytes` (§2)                  |
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |

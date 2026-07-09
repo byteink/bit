@@ -2281,7 +2281,11 @@ const Checker = struct {
                     .prim => |ap| p.isNumeric() and ap.isNumeric(),
                     .untyped_int, .untyped_float, .untyped_rune => p.isNumeric(),
                     .untyped_string => p == .string,
-                    .slice => |e| p == .string and (e == self.ctx.prim_ids.get(.u8) or e == self.ctx.prim_ids.get(.i32)),
+                    // `string([]u8)` copies bytes verbatim. A `[]rune`/`[]i32`
+                    // source needs UTF-8 encoding (deferred with rune iteration,
+                    // #348 unit D), so it's rejected here rather than silently
+                    // narrowing each code point to a byte.
+                    .slice => |e| p == .string and e == self.ctx.prim_ids.get(.u8),
                     .invalid => true,
                     else => false,
                 };
@@ -2296,8 +2300,12 @@ const Checker = struct {
                 if (arg_items.len == 1) {
                     const arg_ty = try self.checkArgExprType(file_idx, arg_items[0], env, fctx);
                     const arg_data = self.ctx.typeOf(arg_ty);
+                    // `[]byte(s)` copies bytes verbatim; a `[]rune(s)` would need
+                    // UTF-8 decoding (deferred, #348 unit D), so only `[]u8` is a
+                    // conversion here — anything else falls through to the numeric
+                    // length-constructor path below.
                     const is_string_conv = arg_data == .prim and arg_data.prim == .string and
-                        (elem == self.ctx.prim_ids.get(.u8) or elem == self.ctx.prim_ids.get(.i32));
+                        elem == self.ctx.prim_ids.get(.u8);
                     if (!is_string_conv) try self.expectNumeric(file_idx, arg_items[0], arg_ty);
                     return target;
                 }

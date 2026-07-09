@@ -679,8 +679,12 @@ Method values are closures bound to their receiver.
   two-result form `let (v, ok) = m[k]` also reports presence (`ok: bool`). The
   two-result form is only valid as the sole right-hand side of a value declaration
   or assignment.
-- `s[lo:hi]` slices; `lo` defaults to `0`, `hi` to `len(s)`. Indices satisfy
-  `0 <= lo <= hi <= cap(s)`; violation panics.
+- `s[lo:hi]` slices; `lo` defaults to `0`, `hi` to `len(s)`. Violation panics.
+  On a `[]T` the result is a view sharing the backing buffer (`0 <= lo <= hi <=
+  cap(s)`). On a `string` the result is a fresh string copying bytes `[lo, hi)`
+  (`0 <= lo <= hi <= len(s)`) — string headers hold interior pointers, so a
+  shared view could not keep the backing alive. Re-slicing a `[N]T` array is not
+  yet supported (§20).
 
 ### 12.7 Generic Call Disambiguation (`<`)
 
@@ -724,7 +728,7 @@ A type used in call position converts or constructs:
 ```
 i32(x)            // numeric conversion (explicit; no implicit narrowing)
 f64(n)            // int -> float
-string(runeVal)   // rune/[]byte/[]rune -> string
+string(b)         // []byte -> string (copy)
 []byte(s)         // string -> []byte (copy)
 []int(n)          // allocate a length-n zeroed slice
 []int(n, m)       // length n, capacity m
@@ -732,6 +736,11 @@ map<string,int>() // empty map
 chan<int>()       // unbuffered channel
 chan<int>(16)     // buffered channel, capacity 16
 ```
+
+`string(b)` and `[]byte(s)` copy bytes verbatim: a `[]byte` is the raw byte
+view of a string and round-trips through it. The rune-oriented conversions
+(`string(rune)`, `string([]rune)`, `[]rune(s)`) require UTF-8 encode/decode and
+are deferred until rune iteration lands (§20).
 
 Numeric conversions are always explicit. There are **no** implicit numeric
 conversions between distinct numeric types (including `i32`→`i64`); this is a
@@ -1413,6 +1422,11 @@ Intentionally **not** in v0.1, to keep the surface minimal:
 - Mutexes, atomics, `sync`-style primitives (channels only in v0.1).
 - Nominal newtypes (all `type` aliases are transparent in v0.1).
 - Thread handles / structured concurrency for `spawn`.
+- UTF-8 rune conversions (`string(rune)`, `string([]rune)`, `[]rune(s)`) and
+  rune iteration (`for r of s`); byte-level `string`/`[]byte` conversion (§12.9)
+  and byte indexing (§12.6) are available now.
+- Re-slicing a fixed-size array `[N]T` (arrays are not yet constructible as
+  values); `[]T` and `string` re-slicing (§12.6) are available now.
 
 These are recorded so downstream tooling (grammar, checker, docs) knows the
 boundaries of v0.1 and does not accidentally depend on unspecified behavior.

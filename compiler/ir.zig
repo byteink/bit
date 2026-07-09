@@ -71,6 +71,17 @@ pub const RtFn = enum {
     /// `(string, index) -> u8`: the byte at `index`, bounds-checked (panics on
     /// out-of-range, SPEC §18.4). Backs `s[i]` on a string.
     string_byte,
+    /// `(string, lo, hi) -> string`: `s[lo:hi]` (SPEC §12.6) — a fresh string
+    /// copying bytes `[lo, hi)`, bounds-checked. Copies rather than sharing: a
+    /// string's `ptr` is an interior pointer, so a view can't keep its backing
+    /// object GC-alive (unlike a slice, whose header names the buffer base).
+    string_slice,
+    /// `(string) -> []u8`: `[]byte(s)` (SPEC §12.9) — a fresh `[]u8` with byte
+    /// `i` of `s` in element word `i` (slices are word-stored, ABI.md §2).
+    bytes_from_string,
+    /// `([]u8) -> string`: `string(b)` (SPEC §12.9) — narrows each element word
+    /// to its low byte into a fresh string.
+    string_from_bytes,
     /// `(f64) -> f64`: square root (hardware `sqrtsd`/`fsqrt`), backs std/math.
     sqrt,
     panic,
