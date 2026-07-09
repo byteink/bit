@@ -4148,6 +4148,20 @@ const Checker = struct {
                 }
                 return has_default and all;
             },
+            .match_stmt => {
+                // A `match` diverges when every arm's body does. Exhaustiveness
+                // is enforced separately (E0071), so an all-arms-diverge match on
+                // valid code truly cannot fall through; on a non-exhaustive match
+                // the program is already rejected, so a suppressed `missing_return`
+                // is harmless. Conservative: no arms -> not diverging.
+                const k = mf.tree.kids(node); // [subject, arm_list]
+                const arms = mf.tree.kids(k[1]);
+                if (arms.len == 0) return false;
+                for (arms) |arm_idx| {
+                    if (!self.diverges(file_idx, mf.tree.kids(arm_idx)[1], count_break_continue)) return false;
+                }
+                return true;
+            },
             .select_stmt => {
                 const clauses = mf.tree.kids(node);
                 if (clauses.len == 0) return true; // `select {}` blocks forever
