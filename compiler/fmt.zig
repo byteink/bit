@@ -5,12 +5,17 @@
 //! Style choices (there is exactly one, by design):
 //!   * 2-space indent (TypeScript-flavored syntax; gofmt's tab doesn't fit
 //!     the "easy to write" pillar as cleanly as the common TS convention).
-//!   * Every statement and top-level declaration gets an explicit trailing
-//!     `;` rather than leaning on the lexer's automatic-semicolon insertion:
-//!     ASI (§7) only fires after a fixed set of "terminator" token kinds
-//!     (lexer.isTerminator), which does not cover every valid statement
-//!     ending (e.g. a generic type or a bare `!` result type) — printing the
-//!     `;` ourselves sidesteps that gap entirely and keeps re-parsing exact.
+//!   * Trailing `;` is omitted wherever the lexer's automatic-semicolon
+//!     insertion (§7) would supply one — i.e. when the statement's last token
+//!     is an ASI "terminator" (lexer.isTerminator) — and kept only where ASI
+//!     would NOT fire (e.g. a statement ending in a generic type's `>` or a
+//!     bare `!` result type). This matches the semicolon-free house style of
+//!     the sample corpus while keeping re-parsing byte-exact.
+//!   * A brace block whose sole content is one simple statement prints inline
+//!     as `{ stmt }` at the two spots the house style keeps compact — match-arm
+//!     bodies and function bodies — but never for control-flow bodies (if /
+//!     while / for always stack). A comment inside the braces forces the
+//!     multi-line form so it can't be swallowed.
 //!   * Struct/interface/import bodies always print with commas (the source
 //!     may use `;`, commaList accepts either) — one separator, not two.
 //!   * Arrow function parameters always print parenthesized, even when
@@ -158,6 +163,11 @@ const FmtError = Allocator.Error || Writer.Error || error{TreeTooDeep};
 const Printer = struct {
     gpa: Allocator,
     source: []const u8,
+    /// The source's file id and a diagnostics sink — only used to re-lex a
+    /// statement's last token in `endsInTerminator` (the tree is already valid,
+    /// so this lexing never actually reports).
+    file: FileId,
+    diags: *diagnostics.Diagnostics,
     tree: *const ast.Tree,
     w: *Writer,
     comments: []const Comment,
@@ -391,10 +401,63 @@ const Printer = struct {
     /// header for why fmt doesn't lean on ASI in general.
     fn endsInBlock(self: *const Printer, idx: Index) bool {
         return switch (self.tree.get(idx).tag) {
-            .block, .func_decl, .struct_decl, .interface_decl, .if_stmt, .while_stmt, .for_c, .for_of, .for_in, .for_inf, .switch_stmt, .select_stmt => true,
+            .block, .func_decl, .struct_decl, .interface_decl, .enum_decl, .if_stmt, .while_stmt, .for_c, .for_of, .for_in, .for_inf, .switch_stmt, .select_stmt, .match_stmt => true,
             .@"export" => self.endsInBlock(self.tree.kids(idx)[0]),
             else => false,
         };
+    }
+
+    /// Whether `idx`'s canonical form ends in a token after which ASI (§7,
+    /// `lexer.isTerminator`) inserts a semicolon — so an explicit `;` can be
+    /// omitted and the text still re-parses identically. The last token kind is
+    /// invariant under canonicalization (which only rewrites separators,
+    /// spacing, and parens *within* a construct, never its final token), so
+    /// reading it from the source span is sound. Bounded by the span length.
+    fn endsInTerminator(self: *const Printer, idx: Index) bool {
+        const span = self.tree.get(idx).span;
+        if (span.end <= span.start) return false;
+        var lx = lexer.Lexer.init(self.file, self.source[span.start..span.end], self.diags);
+        var last: Kind = .eof;
+        var guard: u32 = 0;
+        const bound = span.end - span.start + 1;
+        while (guard < bound) : (guard += 1) {
+            const tok = lx.next() catch return false;
+            if (tok.kind == .eof) break;
+            last = tok.kind;
+        }
+        // The lexer itself synthesizes a `.semicolon` at end-of-input after a
+        // terminator (its own ASI, §7) — so a trailing synthesized `;` is the
+        // definitive signal that ASI would fire and the explicit one is
+        // redundant. Fall back to the raw terminator check for safety.
+        return last == .semicolon or lexer.isTerminator(last);
+    }
+
+    /// A `{ stmt }` block that canonicalizes onto one line: exactly one child,
+    /// that child is itself a simple statement (not a block or control-flow,
+    /// which must stack), and no comment sits inside the braces (a comment
+    /// forces the break so it can never be swallowed). The two callers —
+    /// match-arm and function bodies — decide *where* inlining is allowed; the
+    /// house style never inlines control-flow bodies.
+    fn blockInlineable(self: *const Printer, idx: Index) bool {
+        const items = self.kids(idx);
+        if (items.len != 1) return false;
+        if (self.endsInBlock(items[0])) return false;
+        return !self.hasCommentBefore(self.tree.get(idx).span.end);
+    }
+
+    /// Prints a body that is either a `.block` (collapsed to `{ stmt }` when
+    /// `blockInlineable`, else stacked) or, for a braceless match arm, a bare
+    /// statement. Used only at the match-arm and function-body sites.
+    fn printBodyBlock(self: *Printer, idx: Index) FmtError!void {
+        const n = self.tree.get(idx);
+        if (n.tag == .block and self.blockInlineable(idx)) {
+            try self.raw("{ ");
+            try self.printNode(self.kids(idx)[0]);
+            try self.raw(" }");
+            if (n.span.end > self.src_pos) self.src_pos = n.span.end;
+            return;
+        }
+        try self.printNode(idx);
     }
 
     /// Like `printSeq`, but never keeps a blank line before the *first* item.
@@ -407,7 +470,7 @@ const Printer = struct {
         for (items, 0..) |it, i| {
             try self.gap(self.tree.get(it).span.start, i != 0);
             try self.printNode(it);
-            if (stmt_style and !self.endsInBlock(it)) try self.raw(";");
+            if (stmt_style and !self.endsInBlock(it) and !self.endsInTerminator(it)) try self.raw(";");
         }
     }
 
@@ -420,7 +483,7 @@ const Printer = struct {
         for (items) |it| {
             try self.gap(self.tree.get(it).span.start, true);
             try self.printNode(it);
-            if (stmt_style and !self.endsInBlock(it)) try self.raw(";");
+            if (stmt_style and !self.endsInBlock(it) and !self.endsInTerminator(it)) try self.raw(";");
         }
     }
 
@@ -548,7 +611,7 @@ const Printer = struct {
                     try self.raw(t);
                 }
                 try self.raw(" ");
-                try self.printBlock(k[5], self.tree.get(k[5]));
+                try self.printBodyBlock(k[5]);
             },
             .receiver => {
                 const k = self.kids(idx);
@@ -842,7 +905,7 @@ const Printer = struct {
                 const k = self.kids(idx);
                 try self.printNode(k[0]);
                 try self.raw(" => ");
-                try self.printNode(k[1]);
+                try self.printBodyBlock(k[1]);
             },
             .variant_pat => {
                 const k = self.kids(idx);
@@ -1086,6 +1149,8 @@ pub fn format(gpa: Allocator, path: []const u8, source: []const u8) !FormatResul
     var p = Printer{
         .gpa = gpa,
         .source = source,
+        .file = file,
+        .diags = &diags,
         .tree = &tree,
         .w = &out.writer,
         .comments = comments,
@@ -1121,12 +1186,12 @@ fn expectIdempotent(gpa: Allocator, src: []const u8) !void {
 test "canonical function declaration" {
     try expectFmt(
         "function add(a:i32,b:i32):i32{return a+b}",
-        "function add(a: i32, b: i32): i32 {\n  return a + b;\n}\n",
+        "function add(a: i32, b: i32): i32 { return a + b }\n",
     );
 }
 
 test "let/const, struct, interface canonicalize to comma separators" {
-    try expectFmt("let   x=1", "let x = 1;\n");
+    try expectFmt("let   x=1", "let x = 1\n");
     try expectFmt(
         "struct Point { x: f64; y: f64 }",
         "struct Point { x: f64, y: f64 }\n",
@@ -1138,35 +1203,63 @@ test "let/const, struct, interface canonicalize to comma separators" {
 }
 
 test "blank line between top-level decls is preserved, collapsed to one" {
-    try expectFmt("let a = 1\n\n\n\nlet b = 2", "let a = 1;\n\nlet b = 2;\n");
-    try expectFmt("let a = 1\nlet b = 2", "let a = 1;\nlet b = 2;\n");
+    try expectFmt("let a = 1\n\n\n\nlet b = 2", "let a = 1\n\nlet b = 2\n");
+    try expectFmt("let a = 1\nlet b = 2", "let a = 1\nlet b = 2\n");
 }
 
 test "line and block comments are re-attached" {
     try expectFmt(
         "// leading\nlet x = 1 // trailing\n",
-        "// leading\nlet x = 1; // trailing\n",
+        "// leading\nlet x = 1 // trailing\n",
     );
-    try expectFmt("let x = 1 /* c */", "let x = 1; /* c */\n");
+    try expectFmt("let x = 1 /* c */", "let x = 1 /* c */\n");
 }
 
 test "re-parenthesization preserves precedence and grouping" {
-    try expectFmt("let x = (1 + 2) * 3", "let x = (1 + 2) * 3;\n");
-    try expectFmt("let x = 1 + 2 * 3", "let x = 1 + 2 * 3;\n");
-    try expectFmt("let x = 1 - (2 - 3)", "let x = 1 - (2 - 3);\n");
-    try expectFmt("let x = (1 - 2) - 3", "let x = 1 - 2 - 3;\n");
-    try expectFmt("let x = -(a + b)", "let x = -(a + b);\n");
-    try expectFmt("let x = (a + b).c", "let x = (a + b).c;\n");
+    try expectFmt("let x = (1 + 2) * 3", "let x = (1 + 2) * 3\n");
+    try expectFmt("let x = 1 + 2 * 3", "let x = 1 + 2 * 3\n");
+    try expectFmt("let x = 1 - (2 - 3)", "let x = 1 - (2 - 3)\n");
+    try expectFmt("let x = (1 - 2) - 3", "let x = 1 - 2 - 3\n");
+    try expectFmt("let x = -(a + b)", "let x = -(a + b)\n");
+    try expectFmt("let x = (a + b).c", "let x = (a + b).c\n");
 }
 
 test "arrow params always canonicalize to parenthesized form" {
-    try expectFmt("let f = x => x * 2", "let f = (x) => x * 2;\n");
+    try expectFmt("let f = x => x * 2", "let f = (x) => x * 2\n");
 }
 
 test "long param list wraps one per line with a trailing comma" {
     try expectFmt(
         "function f(aaaaaaaaaa: int, bbbbbbbbbb: int, cccccccccc: int, dddddddddd: int, eeeeeeeeee: int): int { return 0 }",
-        "function f(\n  aaaaaaaaaa: int,\n  bbbbbbbbbb: int,\n  cccccccccc: int,\n  dddddddddd: int,\n  eeeeeeeeee: int,\n): int {\n  return 0;\n}\n",
+        "function f(\n  aaaaaaaaaa: int,\n  bbbbbbbbbb: int,\n  cccccccccc: int,\n  dddddddddd: int,\n  eeeeeeeeee: int,\n): int { return 0 }\n",
+    );
+}
+
+test "semicolons omitted after ASI terminators, kept where ASI would not fire" {
+    // Ends in a terminator (int_lit, `)`, ident) -> no `;`.
+    try expectFmt("let x = 1", "let x = 1\n");
+    try expectFmt("let x = f()", "let x = f()\n");
+    // Ends in `>` (a generic type), which ASI does NOT treat as a terminator,
+    // so the explicit `;` must stay or re-parsing would change.
+    try expectFmt("type Boxed = Box<int>", "type Boxed = Box<int>;\n");
+}
+
+test "single-statement match arm and function body inline; a match never gets a trailing ';'" {
+    try expectFmt(
+        "enum Light { Red, Green }\nfunction next(l: Light): Light {\n  match (l) {\n    Red => { return Light.Green }\n    Green => { return Light.Red }\n  }\n}\n",
+        "enum Light { Red, Green }\nfunction next(l: Light): Light {\n  match (l) {\n    Red => { return Light.Green }\n    Green => { return Light.Red }\n  }\n}\n",
+    );
+    // A single-statement function body inlines too.
+    try expectFmt(
+        "function area(r: f64): f64 {\n  return 3 * r\n}\n",
+        "function area(r: f64): f64 { return 3 * r }\n",
+    );
+}
+
+test "a comment inside a single-statement block forces the multi-line form" {
+    try expectFmt(
+        "function f(): i64 {\n  return 1 // note\n}\n",
+        "function f(): i64 {\n  return 1 // note\n}\n",
     );
 }
 

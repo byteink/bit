@@ -681,7 +681,9 @@ pub const Lexer = struct {
 };
 
 /// Terminator tokens trigger an automatic semicolon at a following newline (§7).
-fn isTerminator(k: Kind) bool {
+/// Public so `fmt` can omit an explicit `;` exactly where ASI would insert one
+/// (and keep it where ASI would not), staying byte-exact on re-parse.
+pub fn isTerminator(k: Kind) bool {
     return switch (k) {
         .ident,
         .int_lit,
