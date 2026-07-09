@@ -124,10 +124,16 @@ pub const RelocKind = enum {
     abs64,
     /// ARM64 `R_AARCH64_CALL26`: a `bl`'s 26-bit PC-relative immediate.
     aarch64_call26,
+    /// ARM64 `R_AARCH64_ADR_PREL_PG_HI21`: an `ADRP`'s ±4 GiB page immediate
+    /// (page(S+A) - page(P)) — the high half of a two-instruction address load.
+    aarch64_adr_prel_pg_hi21,
+    /// ARM64 `R_AARCH64_ADD_ABS_LO12_NC`: an `ADD` immediate's low 12 bits
+    /// ((S+A) & 0xfff) — the low half paired with the `ADRP` above.
+    aarch64_add_abs_lo12_nc,
 
     fn width(self: RelocKind) u64 {
         return switch (self) {
-            .pc32, .aarch64_call26 => 4,
+            .pc32, .aarch64_call26, .aarch64_adr_prel_pg_hi21, .aarch64_add_abs_lo12_nc => 4,
             .abs64 => 8,
         };
     }
@@ -140,6 +146,8 @@ pub const RelocKind = enum {
                 .aarch64 => @intFromEnum(elf.R_AARCH64.ABS64),
             },
             .aarch64_call26 => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.CALL26) else null,
+            .aarch64_adr_prel_pg_hi21 => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.ADR_PREL_PG_HI21) else null,
+            .aarch64_add_abs_lo12_nc => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.ADD_ABS_LO12_NC) else null,
         };
     }
 };

@@ -92,10 +92,12 @@ const max_source_bytes = 8 << 20; // 8 MiB
 /// own host can execute (so `bit run` for a foreign target just builds).
 const BuildTarget = enum {
     x86_64_linux,
+    aarch64_linux,
     aarch64_macos,
 
     fn parse(s: []const u8) ?BuildTarget {
         if (std.mem.eql(u8, s, "x86_64-linux")) return .x86_64_linux;
+        if (std.mem.eql(u8, s, "aarch64-linux") or std.mem.eql(u8, s, "arm64-linux")) return .aarch64_linux;
         if (std.mem.eql(u8, s, "aarch64-macos") or std.mem.eql(u8, s, "arm64-macos")) return .aarch64_macos;
         return null;
     }
@@ -103,14 +105,19 @@ const BuildTarget = enum {
 
 /// The target matching the host this `bit` binary itself runs on — the default
 /// `bit build`/`run` target, and the only one `bit run` can `exec` directly.
+/// Keyed on both OS and arch: a Linux host can be x86-64 or AArch64.
 const host_target: BuildTarget = switch (builtin.target.os.tag) {
     .macos => .aarch64_macos,
-    else => .x86_64_linux,
+    else => switch (builtin.target.cpu.arch) {
+        .aarch64 => .aarch64_linux,
+        else => .x86_64_linux,
+    },
 };
 
 fn libbitrtPath(target: BuildTarget) []const u8 {
     return switch (target) {
         .x86_64_linux => "zig-out/lib/x86_64-linux/libbitrt.a",
+        .aarch64_linux => "zig-out/lib/aarch64-linux/libbitrt.a",
         .aarch64_macos => "zig-out/lib/aarch64-macos/libbitrt.a",
     };
 }
@@ -404,6 +411,11 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_ro
             defer gpa.free(object);
             return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
+        .aarch64_linux => {
+            const object = try emit.emitObjectArm64Elf(gpa, &module);
+            defer gpa.free(object);
+            return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+        },
         .aarch64_macos => {
             const object = try emit.emitMachoObject(gpa, &module);
             defer gpa.free(object);
@@ -467,6 +479,11 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
             const object = try emit.emitObject(gpa, &module);
             defer gpa.free(object);
             return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+        },
+        .aarch64_linux => {
+            const object = try emit.emitObjectArm64Elf(gpa, &module);
+            defer gpa.free(object);
+            return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
         .aarch64_macos => {
             const object = try emit.emitMachoObject(gpa, &module);

@@ -28,10 +28,19 @@ const strip = @import("link/strip.zig");
 
 pub const Target = enum {
     x86_64_linux,
+    aarch64_linux,
 
     fn readerTarget(self: Target) elf_reader.Target {
         return switch (self) {
             .x86_64_linux => .x86_64,
+            .aarch64_linux => .aarch64,
+        };
+    }
+
+    fn machine(self: Target) elf.EM {
+        return switch (self) {
+            .x86_64_linux => .X86_64,
+            .aarch64_linux => .AARCH64,
         };
     }
 };
@@ -78,6 +87,21 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
     var globals = try strip.resolveGlobals(arena, mods);
     var kept = try strip.deadStrip(arena, mods, &globals, &.{entry_symbol});
     defer kept.deinit(arena);
+
+    // `-fdata-sections` can emit one variable as several adjacent symbols in a
+    // single section (std's TLS `area_desc` is split into `area_desc.0/.1/...`).
+    // Dead-stripping the unreferenced pieces would repack the survivors and shift
+    // the variable's fields, corrupting it. Keep every mutable-data atom (.data,
+    // .bss, and the TLS init/bss) so their in-section layout is preserved; code
+    // (.text) and read-only constants (.rodata) are still granularly stripped.
+    for (mods, 0..) |mod, mi| {
+        for (mod.atoms, 0..) |atom, ai| {
+            switch (atom.kind) {
+                .data, .bss, .tls_data, .tls_bss => try kept.set.put(arena, (strip.AtomId{ .module = @intCast(mi), .atom = @intCast(ai) }).key(), {}),
+                else => {},
+            }
+        }
+    }
 
     // ---- collect kept atoms, partitioned by output class ------------------
     var text: std.ArrayList(Placed) = .empty;
@@ -189,10 +213,18 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
     var tpoff_of = std.AutoHashMapUnmanaged(u64, i64){};
     for ([_][]const Placed{ tdata.items, tbss.items }) |group| {
         for (group) |p| {
-            // Variant II (x86-64): the static TLS block sits below the thread
-            // pointer, so a symbol at block offset `o` is at TP - (aligned
-            // block size) + o.
-            try tpoff_of.put(arena, p.id.key(), @as(i64, @intCast(p.tls_offset)) - @as(i64, @intCast(tls_size_aligned)));
+            const tpoff: i64 = switch (target) {
+                // Variant II (x86-64): the static TLS block sits below the thread
+                // pointer, so a symbol at block offset `o` is at TP - (aligned
+                // block size) + o.
+                .x86_64_linux => @as(i64, @intCast(p.tls_offset)) - @as(i64, @intCast(tls_size_aligned)),
+                // Variant I (AArch64): the block sits above the thread pointer,
+                // after a 16-byte ABI TCB aligned to the block's own alignment
+                // (Zig's `std.os.linux.tls` layout — @sizeOf(AbiTcb)=16), so a
+                // symbol at block offset `o` is at TP + alignUp(16, align) + o.
+                .aarch64_linux => @intCast(alignUp(16, tls_align) + p.tls_offset),
+            };
+            try tpoff_of.put(arena, p.id.key(), tpoff);
         }
     }
 
@@ -247,6 +279,7 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
         .got_vaddr = got_vaddr,
         .got_targets = got_targets.items,
         .addr_of = &addr_of,
+        .machine = target.machine(),
     }, .{
         .text = text.items,
         .rodata = rodata.items,
@@ -280,6 +313,7 @@ const Layout = struct {
     got_vaddr: u64,
     got_targets: []const strip.AtomId,
     addr_of: *std.AutoHashMapUnmanaged(u64, u64),
+    machine: elf.EM,
 };
 
 const Placed = struct { id: strip.AtomId, vaddr: u64 = 0, tls_offset: u64 = 0 };
@@ -324,7 +358,7 @@ fn writeElf(gpa: Allocator, l: Layout, g: Groups, mods: []const object.Module, p
     ehdr.e_ident[elf.EI_DATA] = elf.ELFDATA2LSB;
     ehdr.e_ident[elf.EI_VERSION] = 1;
     ehdr.e_type = .EXEC;
-    ehdr.e_machine = .X86_64;
+    ehdr.e_machine = l.machine;
     ehdr.e_version = 1;
     ehdr.e_entry = l.entry;
     ehdr.e_phoff = @sizeOf(elf.Elf64_Ehdr);

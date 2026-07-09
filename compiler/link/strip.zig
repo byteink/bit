@@ -176,7 +176,16 @@ pub fn apply(kind: RelocKind, field: []u8, v: Values) Error!void {
         .aarch64_ldst128_abs_lo12_nc => writeLo12(field, v.s, 4),
         .aarch64_ld64_got_lo12_nc, .aarch64_tlvp_ld64_lo12 => writeLo12(field, v.got_slot, 3),
 
-        .tlsle_add_tprel_hi12, .tlsle_add_tprel_lo12_nc => return error.UnsupportedRelocation,
+        .tlsle_add_tprel_hi12, .tlsle_add_tprel_lo12_nc => {
+            // AArch64 local-exec TLS (Variant I): X = TPREL(S) + A, already
+            // folded into `tp_offset` by the driver. The pair sets an `ADD`
+            // immediate to bits [23:12] (HI12) and [11:0] (LO12) of X, together
+            // covering a 24-bit thread-pointer offset.
+            const x: u64 = @bitCast(v.tp_offset);
+            if (x >= (1 << 24)) return error.RelocationOutOfRange;
+            const bits12: u64 = if (kind == .tlsle_add_tprel_hi12) x >> 12 else x;
+            writeLo12(field, bits12, 0);
+        },
     }
 }
 
@@ -365,6 +374,15 @@ test "apply encodes AArch64 instruction-field relocations" {
     std.mem.writeInt(u32, &insn, 0x90000000, .little);
     try apply(.aarch64_adr_got_page, &insn, .{ .s = 0, .p = 0x100000000, .got_slot = 0x100008000 });
     try testing.expectEqual(@as(u32, 0x90000040), std.mem.readInt(u32, &insn, .little));
+
+    // TLS local-exec ADD pair for X = tp_offset = 0x12345 (a 24-bit value):
+    // HI12 = bits [23:12] = 0x12 -> imm12; LO12 = bits [11:0] = 0x345 -> imm12.
+    std.mem.writeInt(u32, &insn, 0x91000000, .little);
+    try apply(.tlsle_add_tprel_hi12, &insn, .{ .s = 0, .p = 0, .tp_offset = 0x12345 });
+    try testing.expectEqual(@as(u32, 0x91004800), std.mem.readInt(u32, &insn, .little));
+    std.mem.writeInt(u32, &insn, 0x91000000, .little);
+    try apply(.tlsle_add_tprel_lo12_nc, &insn, .{ .s = 0, .p = 0, .tp_offset = 0x12345 });
+    try testing.expectEqual(@as(u32, 0x910D1400), std.mem.readInt(u32, &insn, .little));
 
     // A branch past ±128 MB is rejected, not truncated.
     try testing.expectError(error.RelocationOutOfRange, apply(.aarch64_call26, &insn, .{ .s = 0x10000000, .p = 0 }));

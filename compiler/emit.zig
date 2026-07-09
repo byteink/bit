@@ -165,6 +165,33 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     try symbols.append(a, .{ .name = "bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global, .kind = .func });
     try defined.put(a, "bit_main", {});
 
+    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items);
+
+    var sections: std.ArrayList(obj_elf.Section) = .empty;
+    try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+
+    return obj_elf.write(gpa, .x86_64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
+}
+
+/// Emits the arch-independent ELF data — string-pool headers, gc_alloc TypeInfo
+/// blobs (`extern struct TypeInfo { size, ptr_offsets_ptr, ptr_offsets_len,
+/// name_ptr, name_len, methods_ptr, methods_len }`, preceded by its usize[]
+/// offsets and any Method[] table, ABI.md §2.1), and the GC stack-map table —
+/// all into `.rodata` with `abs64` pointer relocations — then declares an
+/// undefined extern for every referenced-but-undefined symbol (the runtime
+/// `bit_rt_*` calls). Shared by `emitObject` (x86-64) and `emitObjectArm64Elf`;
+/// their only differences (codegen, the entry trampoline, the code-relocation
+/// kinds) are all handled by the caller before this runs.
+fn emitElfBlobs(
+    a: Allocator,
+    module: *const ir.Module,
+    rodata: *std.ArrayList(u8),
+    symbols: *std.ArrayList(obj_elf.Symbol),
+    relocs: *std.ArrayList(obj_elf.Relocation),
+    defined: *std.StringHashMapUnmanaged(void),
+    stackmaps: []const common.FuncStackMap,
+) !void {
     // ---- string pool -> .rodata headers + bytes ---------------------------
     for (module.string_pool.items, 0..) |s, i| {
         const data_off: u64 = rodata.items.len;
@@ -186,9 +213,6 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     }
 
     // ---- gc_alloc TypeInfo blobs -> .rodata -------------------------------
-    // extern struct TypeInfo { size, ptr_offsets_ptr, ptr_offsets_len,
-    // name_ptr, name_len, methods_ptr, methods_len } (runtime/gc.zig), preceded
-    // by its usize[] offsets and (if any) its Method[] table (ABI.md §2.1).
     for (try collectTypeInfos(a, module)) |ti| {
         const name = try ir.typeInfoSymbol(a, ti.disc, ti.size, ti.ptr_offsets);
         var offs_name: []const u8 = "";
@@ -204,7 +228,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local, .kind = .object });
             try defined.put(a, offs_name, {});
         }
-        const methods = try emitMethodTable(a, module, &rodata, ti.disc, name);
+        const methods = try emitMethodTable(a, module, rodata, ti.disc, name);
         if (methods.sym.len > 0) {
             try symbols.append(a, .{ .name = methods.sym, .section = .rodata, .offset = methods.off, .size = methods.size, .binding = .local, .kind = .object });
             try defined.put(a, methods.sym, {});
@@ -233,11 +257,9 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     }
 
     // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata ----------------
-    // One `bit_stack_maps` blob the runtime walks at a collection; each
-    // function's code address is an abs64 reloc to its `.text` symbol.
     {
         const blob_off: u64 = rodata.items.len;
-        const code_relocs = try common.writeStackMaps(a, &rodata, stackmaps.items);
+        const code_relocs = try common.writeStackMaps(a, rodata, stackmaps);
         try symbols.append(a, .{ .name = stackmaps_symbol, .section = .rodata, .offset = blob_off, .size = rodata.items.len - blob_off, .binding = .global, .kind = .object });
         try defined.put(a, stackmaps_symbol, {});
         // `writeStackMaps` records offsets against `rodata` itself, so they are
@@ -251,20 +273,82 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         });
     }
 
-    // ---- undefined externals for everything the object references but does
-    //      not define (runtime `bit_rt_*` symbols) --------------------------
+    // ---- undefined externals (runtime `bit_rt_*` symbols) -----------------
     var externs = std.StringHashMapUnmanaged(void){};
     for (relocs.items) |r| {
         if (defined.contains(r.symbol) or externs.contains(r.symbol)) continue;
         try externs.put(a, r.symbol, {});
         try symbols.append(a, .{ .name = r.symbol, .section = null, .binding = .global, .kind = .notype });
     }
+}
+
+/// Emits `module` as an AArch64 ELF relocatable object — the arm64-linux
+/// analogue of `emitObject`. Same non-PIE static data layout (string/TypeInfo/
+/// stack-map blobs in `.rodata`, absolute pointers via `abs64` — shared through
+/// `emitElfBlobs`), but the function bodies and the `bit_main` entry trampoline
+/// use AArch64 encodings, and code relocations are the ADRP/ADD/BL kinds arm64
+/// codegen emits.
+pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module) Error![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var code: std.ArrayList(u8) = .empty;
+    var rodata: std.ArrayList(u8) = .empty;
+    var symbols: std.ArrayList(obj_elf.Symbol) = .empty;
+    var relocs: std.ArrayList(obj_elf.Relocation) = .empty;
+    var defined = std.StringHashMapUnmanaged(void){};
+    var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
+
+    // ---- every function -> one .text symbol + its relocations -------------
+    var main_void = false;
+    var have_main = false;
+    for (module.funcs.items) |*f| {
+        var fc = try arm64.compileFunction(gpa, module, f);
+        defer fc.deinit();
+        const off: u64 = code.items.len;
+        try code.appendSlice(a, fc.code);
+        try symbols.append(a, .{ .name = try a.dupe(u8, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = .global, .kind = .func });
+        try defined.put(a, f.name, {});
+        for (fc.relocs) |r| try relocs.append(a, .{
+            .section = .text,
+            .offset = off + r.offset,
+            .symbol = try a.dupe(u8, r.symbol),
+            .kind = switch (r.kind) {
+                .branch => .aarch64_call26,
+                .page21 => .aarch64_adr_prel_pg_hi21,
+                .pageoff12 => .aarch64_add_abs_lo12_nc,
+            },
+            .addend = 0,
+        });
+        try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, arm64.SafepointEntry, fc.safepoints));
+        if (std.mem.eql(u8, f.name, "main")) {
+            have_main = true;
+            main_void = module.ctx.typeOf(f.result) == .void;
+        }
+    }
+    if (!have_main) return error.NoMain;
+
+    // ---- bit_main entry trampoline (AArch64) ------------------------------
+    //   stp x29,x30,[sp,#-16]! ; bl main ; [movz w0,#0 if void] ; ldp ; ret
+    const tramp: u64 = code.items.len;
+    try appendWord(&code, a, 0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+    const call_field: u64 = code.items.len;
+    try appendWord(&code, a, 0x94000000); // bl main (placeholder)
+    try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "main", .kind = .aarch64_call26, .addend = 0 });
+    if (main_void) try appendWord(&code, a, 0x52800000); // movz w0, #0
+    try appendWord(&code, a, 0xA8C17BFD); // ldp x29, x30, [sp], #16
+    try appendWord(&code, a, 0xD65F03C0); // ret
+    try symbols.append(a, .{ .name = "bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global, .kind = .func });
+    try defined.put(a, "bit_main", {});
+
+    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
 
-    return obj_elf.write(gpa, .x86_64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
+    return obj_elf.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
 
 /// Emits `module` as an ARM64 Mach-O relocatable object (macOS). Same shape as

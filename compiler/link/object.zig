@@ -288,7 +288,12 @@ pub fn atomizeModule(
     for (sections, 0..) |section, sec_idx| {
         const order = per_section_order[sec_idx].items;
         if (order.len == 0) {
-            if (section.size == 0) continue;
+            // A symbol-less section still gets one anonymous atom so a
+            // relocation targeting it (via its section symbol) resolves to its
+            // address — including a *size-0* section, e.g. AArch64's empty
+            // `unreachable`-bodied Allocator vtable stubs, whose address a
+            // vtable's `abs64` pointer needs even though the body is empty. The
+            // atom dead-strips if nothing references it.
             section_anon[sec_idx] = @intCast(atoms.items.len);
             try atoms.append(gpa, .{
                 .name = section.name,
