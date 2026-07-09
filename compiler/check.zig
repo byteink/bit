@@ -443,6 +443,13 @@ pub const TypeContext = struct {
     /// hash key.
     inst_index: std.AutoHashMapUnmanaged(u64, std.ArrayList(Instantiation)) = .{},
     instantiations: std.ArrayList(Instantiation) = .empty,
+    /// A *nominal type* instantiation's result `TypeId` (as u32) -> its index in
+    /// `instantiations`. The reverse of `recordInstantiation`, populated only for
+    /// struct/enum/interface instantiations (`instantiateRecursive`/
+    /// `reinstantiate`), so `subst` can recover the `(generic, args)` behind a
+    /// nested generic type (`Box<T>` inside `Pair<T>`) and re-instantiate it at
+    /// the outer substitution's concrete args. Alias/function results are absent.
+    inst_by_result: std.AutoHashMapUnmanaged(u32, u32) = .{},
     /// Best-effort display name for a struct/interface `TypeId`, set once from
     /// the first declaring symbol seen — cosmetic only (identity stays
     /// structural); falls back to a structural spelling when absent.
@@ -505,6 +512,7 @@ pub const TypeContext = struct {
         while (iit.next()) |list| list.deinit(self.gpa);
         self.inst_index.deinit(self.gpa);
         self.instantiations.deinit(self.gpa);
+        self.inst_by_result.deinit(self.gpa);
         self.display_names.deinit(self.gpa);
         self.decl_generics.deinit(self.gpa);
         self.generic_bounds.deinit(self.gpa);
@@ -670,13 +678,90 @@ pub const TypeContext = struct {
                 if (nok == f.ok and nerr == f.err) return ty;
                 return self.types.intern(.{ .fallible = .{ .ok = nok, .err = nerr } });
             },
-            // Struct/interface fields may reference the enclosing generic's
-            // params too, but only when *instantiating* a generic struct;
-            // `instantiateRecursive` handles those directly (it needs the
-            // reserve-then-fill cycle guard, not plain rebuild-and-intern)
-            // rather than going through here.
-            .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .prim, .@"struct", .interface, .@"enum" => return ty,
+            // A nested generic type instantiation (`Box<T>` used inside another
+            // generic's body) is a struct/enum/interface whose fields still
+            // mention the outer generic's params. `inst_by_result` recovers the
+            // `(generic, args)` it came from; re-instantiating at the
+            // substituted args yields the concrete `Box<i64>`. A struct/enum/
+            // interface that is not a recorded nominal instantiation (a plain
+            // type, or a template) has no params to bind — return it unchanged.
+            .@"struct", .interface, .@"enum" => {
+                const rec_idx = self.inst_by_result.get(@intFromEnum(ty)) orelse return ty;
+                const rec = self.instantiations.items[rec_idx];
+                var buf = try self.gpa.alloc(TypeId, rec.args.len);
+                defer self.gpa.free(buf);
+                var changed = false;
+                for (rec.args, 0..) |a, i| {
+                    buf[i] = try self.subst(a, env, depth + 1);
+                    if (buf[i] != a) changed = true;
+                }
+                if (!changed) return ty;
+                return self.reinstantiate(rec.generic, buf, depth + 1);
+            },
+            .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .prim => return ty,
         }
+    }
+
+    /// Monomorphizes nominal type `generic` at concrete `args` from its template
+    /// (`decl_memo`) — the substitution-time counterpart to `Checker`'s
+    /// `instantiateRecursive`, callable without a `Checker` (lowering's `subst`
+    /// reaches it). Reserve-record-then-fill breaks reference cycles: a
+    /// self-referential field re-entering here finds the reserved id via
+    /// `findInstantiation`. Bounds are not re-checked (the outer use site
+    /// already did); generic-type methods are deferred, so none are copied.
+    fn reinstantiate(self: *TypeContext, generic: GlobalSymbol, args: []const TypeId, depth: u32) Error!TypeId {
+        if (self.findInstantiation(generic, args)) |id| return id;
+        const template = self.decl_memo.get(generic.pack()) orelse return .invalid;
+        const shape = self.typeOf(template);
+        const placeholder: TypeData = switch (shape) {
+            .@"struct" => .{ .@"struct" = &.{} },
+            .interface => .{ .interface = &.{} },
+            .@"enum" => .{ .@"enum" = .{ .decl = generic, .variants = &.{} } },
+            else => return template, // not a nominal shape (e.g. alias target): transparent
+        };
+        const id = try self.types.reserve(placeholder);
+        try self.recordInstantiation(generic, args, id);
+        try self.inst_by_result.put(self.gpa, @intFromEnum(id), @intCast(self.instantiations.items.len - 1));
+
+        const params = self.decl_generics.get(generic.pack()) orelse &[_]GlobalSymbol{};
+        var env_buf = try self.gpa.alloc(GenericBinding, params.len);
+        defer self.gpa.free(env_buf);
+        for (params, 0..) |p, i| env_buf[i] = .{ .sym = p, .to = if (i < args.len) args[i] else self.void_id };
+        const env2: GenericEnv = env_buf;
+
+        switch (shape) {
+            .@"struct" => |fields| {
+                var nf = try self.gpa.alloc(Field, fields.len);
+                defer self.gpa.free(nf);
+                for (fields, 0..) |f, i| nf[i] = .{ .name = f.name, .ty = try self.subst(f.ty, env2, depth + 1), .exported = f.exported };
+                self.types.fill(id, .{ .@"struct" = try dupe(self.arena(), Field, nf) });
+            },
+            .@"enum" => |e| {
+                var nv = try self.gpa.alloc(Variant, e.variants.len);
+                defer self.gpa.free(nv);
+                for (e.variants, 0..) |v, i| {
+                    var np = try self.gpa.alloc(TypeId, v.payload.len);
+                    defer self.gpa.free(np);
+                    for (v.payload, 0..) |pty, j| np[j] = try self.subst(pty, env2, depth + 1);
+                    nv[i] = .{ .name = v.name, .payload = try dupe(self.arena(), TypeId, np) };
+                }
+                self.types.fill(id, .{ .@"enum" = .{ .decl = generic, .variants = try dupe(self.arena(), Variant, nv) } });
+            },
+            .interface => |methods| {
+                var nm = try self.gpa.alloc(Method, methods.len);
+                defer self.gpa.free(nm);
+                for (methods, 0..) |m, i| {
+                    var np = try self.gpa.alloc(TypeId, m.params.len);
+                    defer self.gpa.free(np);
+                    for (m.params, 0..) |p, j| np[j] = try self.subst(p, env2, depth + 1);
+                    nm[i] = .{ .name = m.name, .params = try dupe(self.arena(), TypeId, np), .variadic = m.variadic, .result = try self.subst(m.result, env2, depth + 1) };
+                }
+                self.types.fill(id, .{ .interface = try dupe(self.arena(), Method, nm) });
+            },
+            else => unreachable,
+        }
+        if (self.display_names.get(@intFromEnum(template))) |nm| try self.display_names.put(self.gpa, @intFromEnum(id), nm);
+        return id;
     }
 
     /// `pub`: substitutes every param and the result of `shape` — the
@@ -1349,6 +1434,10 @@ const Checker = struct {
             else => unreachable,
         });
         try self.ctx.recordInstantiation(gsym, args, id);
+        // Reverse-map the result so `subst` can recover `(gsym, args)` when this
+        // instantiation is nested inside another generic's body (see
+        // `TypeContext.inst_by_result`).
+        try self.ctx.inst_by_result.put(self.gpa, @intFromEnum(id), @intCast(self.ctx.instantiations.items.len - 1));
         switch (shape) {
             .@"struct" => |fields| {
                 var nf = try self.gpa.alloc(Field, fields.len);
@@ -2019,6 +2108,18 @@ const Checker = struct {
                     for (f.params, af.params) |tp, ap| self.unify(tp, ap, gparams, bound, depth + 1);
                     self.unify(f.result, af.result, gparams, bound, depth + 1);
                 }
+            },
+            // A generic type parameter (`p: Pair<T>`) is solved by unifying the
+            // template's and the argument's instantiation args pairwise — both
+            // are recorded nominal instantiations of the same generic.
+            .@"struct", .interface, .@"enum" => {
+                const ti = self.ctx.inst_by_result.get(@intFromEnum(template)) orelse return;
+                const ai = self.ctx.inst_by_result.get(@intFromEnum(actual)) orelse return;
+                const t_rec = self.ctx.instantiations.items[ti];
+                const a_rec = self.ctx.instantiations.items[ai];
+                if (t_rec.generic.module != a_rec.generic.module or t_rec.generic.id != a_rec.generic.id) return;
+                if (t_rec.args.len != a_rec.args.len) return;
+                for (t_rec.args, a_rec.args) |ta, aa| self.unify(ta, aa, gparams, bound, depth + 1);
             },
             else => {},
         }
