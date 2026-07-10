@@ -1,5 +1,19 @@
 const std = @import("std");
 
+/// Wires the host `libbitrt.a` into a test harness as the `libbitrt_path` build
+/// option. `bin` is the freshly-built runtime archive (the `lib`'s emitted
+/// binary) when the host is a supported runtime target, else null. Uses
+/// `addOptionPath` rather than a static install-path string on purpose: it both
+/// resolves the option to the *current* archive and records a build-graph
+/// dependency on it, so a harness can never link a stale, ABI-mismatched runtime
+/// (a mismatch links a malformed binary the kernel then kills by signal). The
+/// archive is rebuilt and the path re-resolved whenever a runtime source
+/// changes. When the host is not a runtime target the option is the empty
+/// string and the harness self-skips.
+fn wireLibbitrt(opts: *std.Build.Step.Options, bin: ?std.Build.LazyPath) void {
+    if (bin) |lp| opts.addOptionPath("libbitrt_path", lp) else opts.addOption([]const u8, "libbitrt_path", "");
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -438,11 +452,15 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .x86_64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     };
-    // The host test target always matches one of the four above, so the golden
-    // `// run` harness reuses that archive to link and execute real binaries
-    // under `zig build test`. Captured in the loop; stays empty (run-cases skip)
-    // if the host is not a supported runtime target.
-    var host_libbitrt_path: []const u8 = "";
+    // The host test target always matches one of the four above, so every test
+    // harness reuses that archive to link and execute real binaries under
+    // `zig build test`. Captured in the loop as the runtime `lib`'s emitted
+    // binary (a LazyPath into the build cache, always the fresh archive), not
+    // the install-path string — see `wireLibbitrt`. Stays null (harnesses skip)
+    // if the host is not a supported runtime target. `host_libbitrt_install` is
+    // kept so `zig build test` still populates `zig-out/lib/<triple>/` for the
+    // CLI-path end-to-end tests (link.zig, main.zig) that read it there.
+    var host_libbitrt_bin: ?std.Build.LazyPath = null;
     var host_libbitrt_install: ?*std.Build.Step = null;
     for (libbitrt_targets) |query| {
         const rt_target = b.resolveTargetQuery(query);
@@ -501,34 +519,30 @@ pub fn build(b: *std.Build) void {
         libbitrt_step.dependOn(&install.step);
 
         if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
-            host_libbitrt_path = b.getInstallPath(.{ .custom = b.fmt("lib/{s}", .{triple}) }, "libbitrt.a");
+            host_libbitrt_bin = lib.getEmittedBin();
             host_libbitrt_install = &install.step;
         }
     }
 
-    // Hand the golden harness the host archive (absolute path) and make the
-    // run-cases depend on it existing, so `// run` cases execute under
-    // `zig build test` rather than silently skipping.
-    golden_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
-    if (host_libbitrt_install) |inst| golden_tests.step.dependOn(inst);
+    // Wire the fresh host archive into every harness that links + runs real
+    // binaries. `wireLibbitrt` uses the emitted-bin LazyPath, so each harness
+    // carries a build-graph dependency on the current archive and can never
+    // link a stale one. The old design passed the `zig-out` install-path string
+    // and only ordered the harness *compile* after the install step; when that
+    // compile was cached the harness could run before the install refreshed
+    // `zig-out`, linking a stale, ABI-mismatched runtime whose malformed binary
+    // the kernel then killed by signal (#1229).
+    wireLibbitrt(golden_opts, host_libbitrt_bin);
+    wireLibbitrt(examples_opts, host_libbitrt_bin);
+    wireLibbitrt(stress_opts, host_libbitrt_bin);
+    wireLibbitrt(testcmd_opts, host_libbitrt_bin);
+    wireLibbitrt(osenv_opts, host_libbitrt_bin);
+    wireLibbitrt(imports_opts, host_libbitrt_bin);
 
-    // Same archive for the examples guard.
-    examples_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
-    if (host_libbitrt_install) |inst| examples_tests.step.dependOn(inst);
-
-    // Same archive for the stress suite.
-    stress_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
-    if (host_libbitrt_install) |inst| stress_tests.step.dependOn(inst);
-
-    // Same archive for the `bit test` runner guard.
-    testcmd_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
-    if (host_libbitrt_install) |inst| testcmd_tests.step.dependOn(inst);
-
-    // Same archive for the std/os env guard.
-    osenv_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
-    if (host_libbitrt_install) |inst| osenv_tests.step.dependOn(inst);
-
-    // Same archive for the imports/prelude guard.
-    imports_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
-    if (host_libbitrt_install) |inst| imports_tests.step.dependOn(inst);
+    // Still install the host archive under `zig build test` so the CLI-path
+    // end-to-end tests (link.zig, main.zig) that read `zig-out/lib/<triple>/`
+    // keep running rather than self-skipping. Harnesses no longer read that
+    // path — they link the emitted-bin archive above — so this is only for
+    // those `zig-out`-reading tests.
+    if (host_libbitrt_install) |inst| test_step.dependOn(inst);
 }
