@@ -699,3 +699,56 @@ chaining — use a mode of operation for multi-block messages.
 Deciphers one 16-byte `block`, returning a fresh 16-byte plaintext block — the
 inverse of `encryptBlock` under the same key, so `decryptBlock(encryptBlock(b))`
 equals `b`. `block` must be exactly 16 bytes.
+
+## Poly1305
+
+Poly1305 (RFC 8439 §2.5) is a **one-time** message authentication code: it takes
+a 32-byte key `r‖s` and a message and produces a 16-byte tag. It evaluates a
+polynomial in the message blocks modulo the prime 2^130 - 5, then adds the
+secret pad `s` modulo 2^128 — no hash function underneath, just field
+arithmetic, so it is fast and simple to make constant-time.
+
+The **one-time** part is not a suggestion: a given key must authenticate **at
+most one message**. Authenticating two different messages under the same key
+lets an attacker solve for `r` and forge tags for any message. In practice the
+key is never a constant — it is derived per-message from a nonce, which is
+exactly what ChaCha20-Poly1305 does (it keys Poly1305 with the first block of the
+cipher's keystream). Use Poly1305 directly only when you produce a fresh key for
+every single message.
+
+Verification must be constant-time. `poly1305Verify` recomputes the tag and
+compares with `ctEq`, never `==`: a comparison that stops at the first differing
+byte leaks *where* two tags diverge, and that timing oracle is enough to forge a
+valid tag one byte at a time.
+
+```bit
+import { poly1305, poly1305Verify, encodeHex } from "std/crypto"
+
+// The 16-byte tag of `msg` under a 32-byte one-time key, as lowercase hex. The
+// key is r‖s and must be used for exactly one message — a real caller derives a
+// fresh key per message (e.g. from a nonce-keyed ChaCha20 keystream), never a
+// reused constant.
+function authTag(key: []byte, msg: []byte): string {
+  return encodeHex(poly1305(key, msg))
+}
+
+// The receiver recomputes the tag and checks it in constant time. Prefer this
+// over comparing `poly1305(key, msg)` to the received tag with `==`, which would
+// leak the mismatch position through timing.
+function verified(key: []byte, msg: []byte, tag: []byte): bool {
+  return poly1305Verify(key, msg, tag)
+}
+```
+
+### `poly1305(key: []byte, msg: []byte): []byte`
+
+The 16-byte Poly1305 tag of `msg` under the 32-byte one-time `key` (`r` in the
+first 16 bytes, `s` in the last 16). `key` must be exactly 32 bytes. Remember it
+is one-time: never authenticate two messages with the same key.
+
+### `poly1305Verify(key: []byte, msg: []byte, tag: []byte): bool`
+
+Recompute the tag of `msg` under `key` and compare it against `tag` in constant
+time, returning true iff they match. Always use this to check a tag rather than
+comparing bytes with `==`, which leaks the first mismatch position through
+timing.

@@ -1,0 +1,227 @@
+// Bit standard library — crypto module, Poly1305 one-time MAC (RFC 8439 §2.5).
+//
+// Poly1305 authenticates a message under a 32-byte one-time key `r‖s`, producing
+// a 16-byte tag. It evaluates a polynomial in the message blocks modulo the
+// prime 2^130 - 5, then adds the secret pad `s` modulo 2^128. The key is
+// *one-time*: a given key must authenticate at most one message — reusing it
+// across two messages leaks `r` and destroys all security.
+//
+// The 130-bit accumulator is held as five 26-bit limbs in `u64` words, so every
+// product and carry stays well inside 64 bits with no bignum dependency. This is
+// the field arithmetic of the reference "donna" 32-bit code: multiplying a limb
+// of `r` by 5 folds the 2^130 overflow back in, since 2^130 ≡ 5 (mod 2^130 - 5).
+// The carry edges of that partial reduction are the whole game here; the RFC
+// §A.3 vectors (all-ones blocks, the s-overflow case) pin them down.
+//
+// The limbs live in fixed five-element `[]u64` arrays, and the per-block field
+// step and the finalization are split into their own small functions — both to
+// keep each unit readable and to keep any one function's working set modest.
+//
+// The implementation is constant-time by construction: control flow and memory
+// access depend only on the message length, never on key or message bytes, and
+// the final "is h >= p" choice is a branchless bit-mask, not an `if`.
+
+// Read four bytes of `b` starting at `off` as a little-endian `u64`.
+function ld32le(b: []byte, off: int): u64 {
+  return u64(b[off]) | (u64(b[off + 1]) << 8) | (u64(b[off + 2]) << 16) | (u64(b[off + 3]) << 24)
+}
+
+// Write the low 32 bits of `v` into `b` at `off`, little-endian.
+function st32le(b: []byte, off: int, v: u64) {
+  b[off] = byte(v)
+  b[off + 1] = byte(v >> 8)
+  b[off + 2] = byte(v >> 16)
+  b[off + 3] = byte(v >> 24)
+}
+
+// Clamp r (RFC 8439 §2.5): r &= 0x0ffffffc0ffffffc0ffffffc0fffffff, split into
+// five 26-bit limbs in `r`, and pre-fold 5·r[1..4] into `sr` for the reduction.
+// The clamp clears the bits the field math cannot carry, keeping every partial
+// product bounded. `sr[0]` is unused. Fills `r` and `sr` in place.
+function clampKey(key: []byte, r: []u64, sr: []u64) {
+  let t0 = ld32le(key, 0)
+  let t1 = ld32le(key, 4)
+  let t2 = ld32le(key, 8)
+  let t3 = ld32le(key, 12)
+
+  r[0] = t0 & 0x3ffffff
+  r[1] = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03
+  r[2] = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff
+  r[3] = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff
+  r[4] = (t3 >> 8) & 0x00fffff
+
+  sr[1] = r[1] * 5
+  sr[2] = r[2] * 5
+  sr[3] = r[3] * 5
+  sr[4] = r[4] * 5
+}
+
+// Absorb one 16-byte `block` into the accumulator `h`: h = (h + block) · r mod
+// (2^130 - 5). `r` is the five clamped 26-bit limbs; `sr` holds 5·r[1..4] for
+// the reduction fold. `hibit` frames the block's 129th bit — 2^24 for a full
+// block, 0 for a final partial block (whose framing 0x01 already sits inside
+// `block`). Mutates `h` in place.
+function absorbBlock(h: []u64, r: []u64, sr: []u64, block: []byte, hibit: u64) {
+  // h += block, splitting the 128-bit block across the five 26-bit limbs; the
+  // top limb takes the framing high bit.
+  h[0] = h[0] + (ld32le(block, 0) & 0x3ffffff)
+  h[1] = h[1] + ((ld32le(block, 3) >> 2) & 0x3ffffff)
+  h[2] = h[2] + ((ld32le(block, 6) >> 4) & 0x3ffffff)
+  h[3] = h[3] + ((ld32le(block, 9) >> 6) & 0x3ffffff)
+  h[4] = h[4] + ((ld32le(block, 12) >> 8) | hibit)
+
+  // h *= r (schoolbook, with 5·r_i folding the >2^130 terms back down). Every
+  // d_i is a sum of five limb products, each < 2^58, so it stays inside u64.
+  let d0 = h[0] * r[0] + h[1] * sr[4] + h[2] * sr[3] + h[3] * sr[2] + h[4] * sr[1]
+  let d1 = h[0] * r[1] + h[1] * r[0] + h[2] * sr[4] + h[3] * sr[3] + h[4] * sr[2]
+  let d2 = h[0] * r[2] + h[1] * r[1] + h[2] * r[0] + h[3] * sr[4] + h[4] * sr[3]
+  let d3 = h[0] * r[3] + h[1] * r[2] + h[2] * r[1] + h[3] * r[0] + h[4] * sr[4]
+  let d4 = h[0] * r[4] + h[1] * r[3] + h[2] * r[2] + h[3] * r[1] + h[4] * r[0]
+
+  // Partial carry-propagate the double-width limbs back to 26-bit h limbs. The
+  // carry out of d4 re-enters h[0] scaled by 5 (the 2^130 ≡ 5 fold).
+  let c = d0 >> 26
+  h[0] = d0 & 0x3ffffff
+  d1 = d1 + c
+  c = d1 >> 26
+  h[1] = d1 & 0x3ffffff
+  d2 = d2 + c
+  c = d2 >> 26
+  h[2] = d2 & 0x3ffffff
+  d3 = d3 + c
+  c = d3 >> 26
+  h[3] = d3 & 0x3ffffff
+  d4 = d4 + c
+  c = d4 >> 26
+  h[4] = d4 & 0x3ffffff
+  h[0] = h[0] + c * 5
+  c = h[0] >> 26
+  h[0] = h[0] & 0x3ffffff
+  h[1] = h[1] + c
+}
+
+// Finalize: fully reduce `h` mod (2^130 - 5), add the pad s = key[16:32] mod
+// 2^128, and serialize the 16-byte little-endian tag.
+function finishTag(h: []u64, key: []byte): []byte {
+  // Fully carry h so every limb is a clean 26 bits (h[1] may have grown above).
+  let c = h[1] >> 26
+  h[1] = h[1] & 0x3ffffff
+  h[2] = h[2] + c
+  c = h[2] >> 26
+  h[2] = h[2] & 0x3ffffff
+  h[3] = h[3] + c
+  c = h[3] >> 26
+  h[3] = h[3] & 0x3ffffff
+  h[4] = h[4] + c
+  c = h[4] >> 26
+  h[4] = h[4] & 0x3ffffff
+  h[0] = h[0] + c * 5
+  c = h[0] >> 26
+  h[0] = h[0] & 0x3ffffff
+  h[1] = h[1] + c
+
+  // g = h + 5, i.e. h - p with the final -2^130 folded into g[4]. If h >= p then
+  // g[4] stays non-negative; if h < p the last subtraction underflows in u64 and
+  // sets g[4]'s top bit — the borrow we test next.
+  let g = []u64(5)
+  g[0] = h[0] + 5
+  c = g[0] >> 26
+  g[0] = g[0] & 0x3ffffff
+  g[1] = h[1] + c
+  c = g[1] >> 26
+  g[1] = g[1] & 0x3ffffff
+  g[2] = h[2] + c
+  c = g[2] >> 26
+  g[2] = g[2] & 0x3ffffff
+  g[3] = h[3] + c
+  c = g[3] >> 26
+  g[3] = g[3] & 0x3ffffff
+  g[4] = h[4] + c - (u64(1) << 26)
+
+  // Branchless select: keep g (= h - p) when h >= p, else keep h. g[4]'s bit 63
+  // is the borrow — 0 when h >= p, 1 when h < p — so `(g[4] >> 63) - 1` is
+  // all-ones exactly when we should take g. No branch on any secret.
+  let mask = (g[4] >> 63) - 1
+  let keep = ~mask
+  let i = 0
+  while (i < 5) {
+    h[i] = (h[i] & keep) | (g[i] & mask)
+    i = i + 1
+  }
+
+  // Reassemble the five 26-bit limbs into four 32-bit little-endian words (h mod
+  // 2^128), then add the pad s = key[16:32] with carry, also mod 2^128.
+  let f0 = (h[0] | (h[1] << 26)) & 0xffffffff
+  let f1 = ((h[1] >> 6) | (h[2] << 20)) & 0xffffffff
+  let f2 = ((h[2] >> 12) | (h[3] << 14)) & 0xffffffff
+  let f3 = ((h[3] >> 18) | (h[4] << 8)) & 0xffffffff
+
+  let tag = []byte(16)
+  let acc = f0 + ld32le(key, 16)
+  st32le(tag, 0, acc & 0xffffffff)
+  acc = f1 + ld32le(key, 20) + (acc >> 32)
+  st32le(tag, 4, acc & 0xffffffff)
+  acc = f2 + ld32le(key, 24) + (acc >> 32)
+  st32le(tag, 8, acc & 0xffffffff)
+  acc = f3 + ld32le(key, 28) + (acc >> 32)
+  st32le(tag, 12, acc & 0xffffffff)
+  return tag
+}
+
+// The Poly1305 tag of `msg` under the 32-byte one-time `key` (`r` in the first
+// 16 bytes, `s` in the last 16). Returns the 16-byte tag. `key` must be exactly
+// 32 bytes; a shorter key is a programmer error and faults on the out-of-range
+// read. The key is one-time — never authenticate two messages with one key.
+export function poly1305(key: []byte, msg: []byte): []byte {
+  // Clamp r and pre-fold 5·r into the two limb tables.
+  let r = []u64(5)
+  let sr = []u64(5)
+  clampKey(key, r, sr)
+
+  // Accumulator h, five 26-bit limbs, starts at 0 (`[]u64` is zero-initialized).
+  let h = []u64(5)
+
+  // Absorb the message one 16-byte block at a time. A full block frames its
+  // 129th bit with `hibit`; a final partial block instead carries the framing
+  // 0x01 byte inside the buffer, right after the last message byte.
+  let total = len(msg)
+  let off = 0
+  let block = []byte(16)
+  while (off < total) {
+    let n = total - off
+    if (n > 16) {
+      n = 16
+    }
+
+    // Assemble the block: message bytes, then 0x01 for a partial block, then
+    // zero padding — rewritten in full every pass, so no stale bytes survive.
+    let i = 0
+    while (i < 16) {
+      if (i < n) {
+        block[i] = msg[off + i]
+      } else if (i == n) {
+        block[i] = 1
+      } else {
+        block[i] = 0
+      }
+      i = i + 1
+    }
+    let hibit: u64 = 0
+    if (n == 16) {
+      hibit = u64(1) << 24
+    }
+
+    absorbBlock(h, r, sr, block, hibit)
+    off = off + n
+  }
+
+  return finishTag(h, key)
+}
+
+// Recompute the Poly1305 tag of `msg` under `key` and compare it against `tag`
+// in constant time (`ctEq`, never `==`). Returns true iff they match. The
+// constant-time compare is essential: a timing oracle on where the tags first
+// differ is enough to forge a valid tag byte by byte.
+export function poly1305Verify(key: []byte, msg: []byte, tag: []byte): bool {
+  return ctEq(poly1305(key, msg), tag)
+}
