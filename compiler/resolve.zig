@@ -190,6 +190,8 @@ const predeclared_funcs = [_][]const u8{
     "timeMonoNs", "timeUnixNs", "timeSleepNs",
     // Process environment (ABI.md §19); std/os wraps these.
     "osArgc", "osArgAt", "osEnv", "osExit",
+    // Crypto boundary primitives (ABI.md §21); std/crypto wraps these.
+    "cryptoRandomBytes", "cryptoSecureZero",
 };
 
 // ============================================================================

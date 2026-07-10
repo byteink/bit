@@ -2462,6 +2462,25 @@ const Checker = struct {
             try self.expect(file_idx, inner, t, key);
             return self.ctx.void_id;
         }
+        // `cryptoSecureZero(b: []byte)`: special-cased rather than a `prim_sigs`
+        // row because its `[]byte` parameter is not a `Prim` (ABI.md §21).
+        if (std.mem.eql(u8, name, "cryptoSecureZero")) {
+            if (arg_items.len != 1) {
+                try self.emit(mf, node, .arg_count_mismatch, "'cryptoSecureZero' takes exactly 1 argument, found {d}", .{arg_items.len}, null);
+                try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+                return self.ctx.void_id;
+            }
+            const arg_ty = try self.checkArgExprType(file_idx, arg_items[0], env, fctx);
+            const is_byte_slice = arg_ty != .invalid and
+                self.ctx.typeOf(arg_ty) == .slice and
+                self.ctx.typeOf(arg_ty).slice == self.ctx.prim_ids.get(.u8);
+            if (!is_byte_slice and arg_ty != .invalid) {
+                const n = try self.typeName(arg_ty);
+                defer self.gpa.free(n);
+                try self.emit(mf, arg_items[0], .invalid_operand, "'cryptoSecureZero' requires a '[]byte', found '{s}'", .{n}, null);
+            }
+            return self.ctx.void_id;
+        }
         if (std.mem.eql(u8, name, "close")) {
             if (arg_items.len != 1) {
                 try self.emit(mf, node, .arg_count_mismatch, "'close' takes exactly 1 argument, found {d}", .{arg_items.len}, null);
@@ -2575,6 +2594,10 @@ const Checker = struct {
         .{ "osArgAt", PrimSig{ .params = &.{.i64}, .ret = .string } },
         .{ "osEnv", PrimSig{ .params = &.{.string}, .ret = .string } },
         .{ "osExit", PrimSig{ .params = &.{.i64}, .ret = null } },
+        // Crypto (ABI.md §21) — under std/crypto. `cryptoSecureZero(b: []byte)`
+        // is not here: its `[]byte` parameter is not a `Prim`, so it is
+        // special-cased in `checkBuiltinCall`.
+        .{ "cryptoRandomBytes", PrimSig{ .params = &.{.i64}, .ret = .string } },
     });
 
     fn primSig(name: []const u8) ?PrimSig {

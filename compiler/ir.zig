@@ -205,6 +205,13 @@ pub const RtFn = enum {
     os_arg_at,
     os_env,
     os_exit,
+    /// Crypto boundary primitives under `std/crypto` (ABI.md §21): the parts
+    /// crypto needs from the runtime but that cannot be pure Bit.
+    /// `random_bytes(len) -> string` fills `len` bytes from the OS CSPRNG (fatal
+    /// on entropy failure — never weak bytes); `secure_zero(b)` wipes a `[]byte`
+    /// with an optimizer-proof barrier, for clearing key material.
+    random_bytes,
+    secure_zero,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

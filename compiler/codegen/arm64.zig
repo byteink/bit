@@ -1381,6 +1381,8 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .os_arg_at => "bit_rt_os_arg_at",
         .os_env => "bit_rt_os_env",
         .os_exit => "bit_rt_os_exit",
+        .random_bytes => "bit_rt_random_bytes",
+        .secure_zero => "bit_rt_secure_zero",
     };
 }
 const safepoint_symbol = "bit_rt_safepoint";

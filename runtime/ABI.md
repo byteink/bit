@@ -463,6 +463,8 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_net_udp_sender_host` | `() -> *const RtBytes` (§20)                    |
 | `bit_rt_net_udp_sender_port` | `() -> i64` (§20)                               |
 | `bit_rt_net_resolve`  | `(host: *const RtBytes) -> *const RtBytes` (§20)       |
+| `bit_rt_random_bytes` | `(len: i64) -> *const RtBytes` (§21)                   |
+| `bit_rt_secure_zero`  | `(h: *SliceHeader) -> void` (§21)                      |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -862,3 +864,43 @@ right trade for an occasional lookup (see the note in `net.zig`).
 ```
 bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on failure
 ```
+
+---
+
+## 21. Crypto (`runtime/rand.zig` + `runtime/root.zig`)
+
+The Zig↔Bit boundary primitives that cryptography needs from the runtime but
+that cannot be written in pure Bit — OS entropy and an optimizer-proof wipe.
+The low-level layer under `std/crypto`.
+
+```
+bit_rt_random_bytes(len: i64)   -> string   // len CSPRNG bytes; "" for len <= 0; fatal on entropy failure
+bit_rt_secure_zero(h)           -> void     // wipe a []byte's element words, un-elidable
+```
+
+**Entropy source is the OS CSPRNG, never a userspace PRNG and never a weak or
+zero fallback.** A weak-entropy result silently returned is worse than a crash,
+so an OS failure is **fatal** (routed through the §12 panic path), never a
+degraded draw. Per platform (`runtime/rand.zig`, raw syscalls for the same
+reason as `net.zig`):
+
+- **Linux** — `getrandom(buf, len, 0)`: the `/dev/urandom` pool, **blocking**
+  until first-seeded (`flags = 0`, never `GRND_NONBLOCK`/`GRND_RANDOM`).
+  `EINTR` retries; a short draw loops to fill the rest; `ENOSYS` (pre-3.17
+  kernel) falls back to reading `/dev/urandom`.
+- **macOS** — `arc4random_buf`: always present, a CSPRNG on Darwin, infallible.
+- **Windows** — `BCryptGenRandom(NULL, buf, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG)`,
+  checking the `NTSTATUS`. Windows is not yet an executable runtime target (§9
+  gates the runtime to POSIX x86-64/ARM64); this path is compile-checked only,
+  and live Windows validation is deferred to when the scheduler/GC gain Windows
+  support.
+
+`random_bytes` returns the bytes as a fresh GC `string` (byte-exact, length
+`len`), the same return path as `fs_read_all`.
+
+`secure_zero` takes the `[]byte`'s `SliceHeader` and zeroes the `len` element
+words it views (`buf[off .. off+len]`). Because a `[]byte`'s word model stores
+one byte per 8-byte word (§2), wiping the word range clears every logical byte.
+The wipe is `@memset` followed by a compiler memory barrier so dead-store
+elimination cannot drop it — the standard defense against a "cleared" key
+lingering in memory.

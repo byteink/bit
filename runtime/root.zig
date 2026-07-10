@@ -16,6 +16,7 @@ const gc_mod = @import("gc.zig");
 const sched = @import("sched.zig");
 const chan = @import("chan.zig");
 const net = @import("net.zig");
+const rand = @import("rand.zig");
 
 /// Linux-only C-runtime shims (`memcpy`/`__divti3`/`getauxval`/...) — see
 /// that file's module doc comment for why this runtime needs them at all.
@@ -778,6 +779,31 @@ export fn bit_rt_net_resolve(host: *const RtBytes) callconv(.c) *const RtBytes {
     const ip = net.resolve(hostBytes(host)) catch return stringFromBytes("");
     var buf: [15]u8 = undefined;
     return stringFromBytes(net.formatOctets(ip, &buf));
+}
+
+// ---------------------------------------------------------------------------
+// Crypto (ABI.md §21) — the Zig↔Bit boundary primitives crypto needs but that
+// cannot be written in pure Bit. Entropy comes only from the OS CSPRNG.
+// ---------------------------------------------------------------------------
+
+/// `bit_rt_random_bytes`: a fresh `string` of `len` cryptographically-secure
+/// random bytes from the OS CSPRNG. A non-positive `len` yields the empty string
+/// (mirroring `fs_read`); an OS entropy failure is **fatal** — this never hands
+/// back weak or zero bytes.
+export fn bit_rt_random_bytes(len: i64) callconv(.c) *const RtBytes {
+    if (len <= 0) return stringFromBytes("");
+    const s = allocString(@intCast(len));
+    rand.fill(s.bytes) catch fatal("random_bytes: OS CSPRNG failed");
+    return s.hdr;
+}
+
+/// `bit_rt_secure_zero`: wipe a `[]byte`'s element words to zero with a barrier
+/// the optimizer cannot elide (`std/crypto` uses it to clear key material). The
+/// slice's word model (ABI.md §2) stores one byte per 8-byte word, so wiping the
+/// whole `[off, off+len)` word range zeroes every logical byte the slice views.
+export fn bit_rt_secure_zero(h: *SliceHeader) callconv(.c) void {
+    const words = h.buf[h.off .. h.off + h.len];
+    rand.secureZero(std.mem.sliceAsBytes(words));
 }
 
 // ---------------------------------------------------------------------------

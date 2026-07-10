@@ -2259,6 +2259,8 @@ const FnCtx = struct {
         .{ "osArgAt", ir.RtFn.os_arg_at },
         .{ "osEnv", ir.RtFn.os_env },
         .{ "osExit", ir.RtFn.os_exit },
+        .{ "cryptoRandomBytes", ir.RtFn.random_bytes },
+        .{ "cryptoSecureZero", ir.RtFn.secure_zero },
     });
 
     /// `append(s, e1, e2, ...)`: folds each element through `slice_append`,
