@@ -452,6 +452,16 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 
+**Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
+rest of the return register **unspecified**; the same is true of any sub-word
+integer. A Bit `bool` is a full-width 0/1, because `!b` and the branch tests read
+the whole register. Codegen therefore zero-extends a `bool`-typed call result at
+the call boundary, on both targets. Do not rely on a particular callee zeroing
+it: `bit_rt_string_eq` happened to, `bit_rt_fs_exists` did not, and
+`!fsExists(missing)` silently evaluated to `false` on x86-64. A primitive that
+returns a wider integer (e.g. `bit_rt_string_byte` returning `u64` rather than
+`u8`) sidesteps the question entirely, which is why it does.
+
 Every symbol above is `callconv(.c)` with plain C linkage — the entire
 compiler-facing surface of `libbitrt.a`. Nothing else in `runtime/` is a stable
 call target for codegen; reach the collector, scheduler, and channels only

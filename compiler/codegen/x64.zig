@@ -1737,10 +1737,29 @@ fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallRet
 
     if (ret) |r| {
         switch (classOf(self.tctx(), r.ty)) {
-            .int => try putInt(self, r.dst, .rax),
+            .int => {
+                // The C ABI returns a `bool` in `al` and leaves rax's upper bits
+                // **unspecified** — the same hazard ABI.md §2 records for a `u8`
+                // return. A Bit `bool` is a full-width 0/1, because `!b` and the
+                // branch tests read the whole register. Normalize here, at the
+                // one boundary where a foreign callee's convention meets ours.
+                //
+                // Whether a particular callee happens to zero `eax` is not
+                // something to rely on: `bit_rt_string_eq` did, `bit_rt_fs_exists`
+                // did not, and `!fsExists(missing)` silently evaluated to false.
+                if (isBoolTy(self.tctx(), r.ty)) try self.movzxb(.rax, .rax);
+                try putInt(self, r.dst, .rax);
+            },
             .float => try putFloat(self, r.dst, .xmm0),
         }
     }
+}
+
+/// Whether `ty` is the `bool` primitive — the one integer-class type whose
+/// return register a C callee may leave partially undefined.
+fn isBoolTy(tctx: *const TypeContext, ty: TypeId) bool {
+    const d = tctx.typeOf(ty);
+    return d == .prim and d.prim == .bool;
 }
 
 // ============================================================================

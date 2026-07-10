@@ -711,6 +711,14 @@ const Ctx = struct {
         try self.emitWord(0);
     }
 
+    /// `UXTB Wr, Wr` — zero the register above its low byte. Encoded as
+    /// `UBFM Wr, Wr, #0, #7` (sf=0, opc=10, N=0, immr=0, imms=7), which also
+    /// clears bits [63:32] because a 32-bit destination write does.
+    fn uxtb(self: *Ctx, r: Reg) !void {
+        const n: u32 = @intFromEnum(r);
+        try self.emitWord(0x53001C00 | (n << 5) | n);
+    }
+
     fn emitCallReloc(self: *Ctx, symbol: []const u8) !void {
         const off: u32 = @intCast(self.code.items.len);
         try self.emitWord(0x94000000); // BL, imm26=0 placeholder
@@ -1404,8 +1412,24 @@ fn emitCall(self: *Ctx, dst: ?u32, dst_ty: TypeId, symbol: []const u8, args: []c
 
     if (dst) |d| {
         const class = common.classOf(self.tctx(), dst_ty);
-        if (class == .int) try putInt(self, d, @enumFromInt(retRegNum(.int))) else try putFloat(self, d, @enumFromInt(retRegNum(.float)));
+        if (class == .int) {
+            // A C callee returns `bool` in `w0`, leaving x0's upper bits
+            // unspecified. A Bit `bool` is a full-width 0/1 — `!b` and the
+            // branch tests read the whole register — so normalize at this
+            // boundary, where a foreign convention meets ours. x64's
+            // `emitCallLike` does the same, for the same reason; see ABI.md §2
+            // on a narrow return leaving the register partly undefined.
+            if (isBoolTy(self.tctx(), dst_ty)) try self.uxtb(@enumFromInt(retRegNum(.int)));
+            try putInt(self, d, @enumFromInt(retRegNum(.int)));
+        } else try putFloat(self, d, @enumFromInt(retRegNum(.float)));
     }
+}
+
+/// Whether `ty` is the `bool` primitive — the one integer-class type whose
+/// return register a C callee may leave partially undefined.
+fn isBoolTy(tctx: *const TypeContext, ty: TypeId) bool {
+    const d = tctx.typeOf(ty);
+    return d == .prim and d.prim == .bool;
 }
 
 /// Records the stack map for the safepoint at `ret_off` (a call return
