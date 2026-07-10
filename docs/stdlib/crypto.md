@@ -752,3 +752,71 @@ Recompute the tag of `msg` under `key` and compare it against `tag` in constant
 time, returning true iff they match. Always use this to check a tag rather than
 comparing bytes with `==`, which leaks the first mismatch position through
 timing.
+
+## HMAC
+
+HMAC (RFC 2104) keys a message authentication code out of any unkeyed hash `H`:
+
+    HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
+
+where `ipad` is the byte `0x36` and `opad` the byte `0x5c`, each repeated across
+one hash block, and `K'` is the key sized to that block. The two nested hashes
+with the pad-masked key are what make it a pseudo-random function even when the
+bare hash is not, and they close the length-extension weakness of the
+Merkle–Damgård hashes (SHA-1, SHA-2). Unlike Poly1305 it is not one-time: the
+same key authenticates any number of messages.
+
+The construction is generic over the digest. `hmac` takes a hash *constructor*
+(`() => Hash`) rather than a hash value, so the same code runs over SHA-256,
+SHA-384, or SHA-512 — it asks the hash for its own `blockSize` instead of
+hard-coding one, and calls the constructor once per message to get a fresh
+hasher. The SHA-512 family already returns `Hash`, so `newSha512`/`newSha384`
+pass directly; `newSha256` returns the concrete `Sha256`, so wrap it in a tiny
+`() => Hash` function.
+
+The key is normalized to exactly one block (RFC 2104 §2): a key longer than
+`blockSize` is hashed down first (then it is `size` bytes, always at most a
+block), and a shorter key is zero-padded up. Verify a tag with `hmacEqual`, which
+compares in constant time via `ctEq` — never with `==`, whose first-mismatch
+timing leaks enough to forge a tag one byte at a time.
+
+```bit
+import { Hash, hmac, hmacEqual, newSha256, newSha512, encodeHex } from "std/crypto"
+
+// SHA-256 returns the concrete `Sha256`, so expose its constructor as a
+// `() => Hash` value; the SHA-512 family already returns `Hash` (see below).
+function sha256Hash(): Hash { return newSha256() }
+
+// The HMAC-SHA-256 tag of `msg` under `key`, as lowercase hex.
+function tagHex(key: []byte, msg: []byte): string {
+  return encodeHex(hmac(sha256Hash, key, msg))
+}
+
+// The same call over a different hash — HMAC-SHA-512 — by handing in another
+// constructor. `newSha512` already returns `Hash`, so it needs no wrapper.
+function tag512Hex(key: []byte, msg: []byte): string {
+  return encodeHex(hmac(newSha512, key, msg))
+}
+
+// Verify a received tag in constant time. Prefer this over comparing the tag
+// bytes with `==`, which leaks the first mismatch position through timing.
+function verify(key: []byte, msg: []byte, tag: []byte): bool {
+  return hmacEqual(hmac(sha256Hash, key, msg), tag)
+}
+```
+
+### `hmac(newHash: () => Hash, key: []byte, msg: []byte): []byte`
+
+The HMAC of `msg` under `key`, using the hash built by `newHash`. The tag length
+is the hash's own `size` (32 bytes for SHA-256, 64 for SHA-512). A key longer
+than the hash's block is hashed down first; a shorter key is zero-padded.
+`newHash` must return a fresh, empty hasher on each call — the SHA-512 family
+constructors qualify directly, while `newSha256`/`newSha224` are wrapped as a
+`() => Hash` since they return the concrete `Sha256`.
+
+### `hmacEqual(a: []byte, b: []byte): bool`
+
+Constant-time equality of two HMAC tags, via `ctEq`. Returns true iff `a` and `b`
+have the same length and bytes, always scanning the full length so it never
+leaks *where* two tags diverge. Use it to check a tag rather than comparing bytes
+with `==`.
