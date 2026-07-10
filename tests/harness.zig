@@ -8,6 +8,11 @@
 //!   `// run`   — compile + execute, compare stdout to `.expected`. Skipped for
 //!                now: the backend does not exist yet, so run-mode cases land as
 //!                documentation and start executing when codegen arrives.
+//!   `// panic` — compile + execute; the program must panic: exit code 2 and
+//!                stderr byte-matching `.expected` (SPEC.md §18.4). This is the
+//!                only mode that can observe a panic *message*, so it is how the
+//!                runtime's failure paths — failed `assert`, index out of range,
+//!                divide by zero — are held to the text they promise.
 //!   `// fmt`   — `bitc fmt` canonicalization must byte-match `.expected`
 //!                (task #333's golden pairs: messy input -> canonical output).
 //!   `// types` — compilation must succeed; `bitc check --dump-types`'
@@ -36,8 +41,13 @@ const max_cases = 4096;
 /// Upper bound on any single case/expected file.
 const max_file_bytes = 1 << 20; // 1 MiB
 
-const Directive = enum { run, err, fmt, types };
+const Directive = enum { run, panic, err, fmt, types };
 const Outcome = enum { checked, skipped };
+
+/// Exit code the runtime uses for every panic (`runtime/root.zig`'s `fatal`,
+/// SPEC.md §18.4). Matching it exactly — rather than merely "non-zero" — keeps
+/// a crash (signal, 255) from passing as a panic.
+const panic_exit_code: u8 = 2;
 
 test "golden cases" {
     const gpa = testing.allocator;
@@ -84,7 +94,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
     defer gpa.free(expected);
 
     switch (directive) {
-        .run => {
+        .run, .panic => {
             // Skip when the host is not a supported runtime target (no archive
             // to link against — build.zig leaves `libbitrt_path` empty then).
             if (build_options.libbitrt_path.len == 0) return .skipped;
@@ -129,6 +139,16 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
                 .exited => |c| c,
                 else => 255,
             };
+            if (directive == .panic) {
+                if (code != panic_exit_code) {
+                    std.debug.print("case '{s}': expected a panic (exit {d}), got exit {d}\nstderr: {s}\n", .{ name, panic_exit_code, code, result.stderr });
+                    return error.ExpectedPanic;
+                }
+                if (!std.mem.eql(u8, expected, result.stderr))
+                    std.debug.print("case '{s}' stderr mismatch:\n", .{name});
+                try testing.expectEqualStrings(expected, result.stderr);
+                return .checked;
+            }
             if (code != 0) {
                 std.debug.print("case '{s}': binary exited with {d}\nstderr: {s}\n", .{ name, code, result.stderr });
                 return error.RunFailed;
@@ -182,6 +202,9 @@ fn directiveOf(source: []const u8) ?Directive {
     if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
     line = std.mem.trim(u8, line, " \t");
     if (std.mem.startsWith(u8, line, "// error")) return .err;
+    // Before `// run`: `startsWith` would never reach a `// panic` case, but an
+    // ordering bug here would silently downgrade it to a stdout comparison.
+    if (std.mem.startsWith(u8, line, "// panic")) return .panic;
     if (std.mem.startsWith(u8, line, "// run")) return .run;
     if (std.mem.startsWith(u8, line, "// fmt")) return .fmt;
     if (std.mem.startsWith(u8, line, "// types")) return .types;
@@ -191,6 +214,7 @@ fn directiveOf(source: []const u8) ?Directive {
 test "directiveOf parses line-1 modes" {
     try testing.expectEqual(Directive.err, directiveOf("// error\nlet x = @\n").?);
     try testing.expectEqual(Directive.run, directiveOf("// run\r\nmain()\n").?);
+    try testing.expectEqual(Directive.panic, directiveOf("// panic\nmain()\n").?);
     try testing.expectEqual(Directive.fmt, directiveOf("// fmt\nlet x=1\n").?);
     try testing.expectEqual(Directive.types, directiveOf("// types\nlet x=1\n").?);
     try testing.expectEqual(Directive.err, directiveOf("// error: stray byte").?);

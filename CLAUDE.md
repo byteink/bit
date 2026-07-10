@@ -54,7 +54,7 @@ dist/       packaging (brew formula, install scripts)
 
 ## Testing Conventions
 
-- Golden-file tests: `tests/cases/*.bit` with sibling `.expected`; line-1 directive `// run` (execute, compare stdout) or `// error` (expect diagnostics). Every compiler stage adds cases as it lands.
+- Golden-file tests: `tests/cases/*.bit` with sibling `.expected`; line-1 directive selects the mode — `// run` (execute, compare stdout), `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics), `// fmt` (canonicalization), `// types` (inferred-type dump). Every compiler stage adds cases as it lands.
 - Differential testing is the self-hosting gate: Zig and Bit implementations must produce byte-identical AST/type/IR dumps over the full corpus.
 - Doc snippets are CI-verified — tutorial and stdlib docs compile as part of the build; docs that don't compile fail CI.
 
