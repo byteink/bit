@@ -2938,18 +2938,33 @@ const Checker = struct {
         return enum_ty;
     }
 
+    /// `ns.member`, where `ns` came from `import ns from "..."` or
+    /// `import * as ns from "..."`. The member names an exported symbol of that
+    /// module, so it resolves to exactly what the `import { member }` form binds.
+    fn checkNamespaceMember(self: *Checker, file_idx: usize, node: ast.Index, ns: GlobalSymbol) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node); // [recv, name]
+        const sym = self.symbolOf(ns);
+
+        // A namespace whose import target failed to resolve is already
+        // diagnosed; staying `.invalid` here avoids a second, derived error.
+        const mid = sym.namespace_module orelse return .invalid;
+
+        const name = Checker.identText(mf, k[1]);
+        const target = self.moduleOf(mid).exports.get(name) orelse {
+            try self.emit(mf, k[1], .unexported_name, "'{s}' is not exported by '{s}'", .{ name, sym.name }, "add 'export' to its declaration in the source module, or check the spelling");
+            return .invalid;
+        };
+        return self.typeOfValueSymbol(file_idx, node, self.canonicalize(.{ .module = mid, .id = target }));
+    }
+
     fn checkMember(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx, expected: TypeId) Error!TypeId {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(node); // [recv, name]
         if (mf.tree.get(k[0]).tag == .ident) {
             if (self.nodeSymbol(file_idx, k[0])) |gs| {
                 const gk = self.symbolOf(gs).kind;
-                if (gk == .import_namespace) {
-                    // Cross-module namespace member lookup isn't wired (no
-                    // multi-file driver exists yet, task #347): resolves to
-                    // `.invalid` rather than crashing.
-                    return .invalid;
-                }
+                if (gk == .import_namespace) return self.checkNamespaceMember(file_idx, node, gs);
                 if (gk == .enum_type) return self.checkVariantRef(file_idx, node, gs, expected);
             }
         }
@@ -3279,8 +3294,15 @@ const Checker = struct {
     // ---- expression dispatch --------------------------------------------------
 
     fn checkIdentExpr(self: *Checker, file_idx: usize, node: ast.Index) Error!TypeId {
-        const mf = self.files[file_idx];
         const gsym = self.nodeSymbol(file_idx, node) orelse return .invalid;
+        return self.typeOfValueSymbol(file_idx, node, gsym);
+    }
+
+    /// The type of `gsym` referenced as a value. Shared by a plain identifier and
+    /// by a namespace member (`strings.toUpper`), which names the very symbol an
+    /// `import { toUpper } from "std/strings"` would have bound.
+    fn typeOfValueSymbol(self: *Checker, file_idx: usize, node: ast.Index, gsym: GlobalSymbol) Error!TypeId {
+        const mf = self.files[file_idx];
         const sym = self.symbolOf(gsym);
         switch (sym.kind) {
             .let_binding, .const_binding, .param, .receiver => {

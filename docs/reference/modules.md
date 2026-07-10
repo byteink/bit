@@ -18,19 +18,24 @@ import { readFile as slurp } from "std/fs"    // rename on import
 
 A namespace import binds the module itself, and members are reached through it:
 
-```bit ignore
+```bit
 import io from "std/io"       // namespace: io.stdout()
 import * as fs from "std/fs"  // explicit namespace form
-```
 
-> Namespace imports parse and resolve, but member access through one does not
-> yet lower — `bit check` accepts `io.stdout()` and `bit build` rejects it
-> (task #1154). Use named imports until that lands. This block is not
-> doc-tested, because the doc-tests only typecheck and so would not catch it.
+function dump(path: string): ()! {
+  let w = io.stdout()
+  w.write(fs.readFile(path)?)
+  w.flush()
+  return
+}
+```
 
 - A namespace import binds one name; members are accessed as `io.stdout()`.
 - A named import binds members directly.
 - `as` renames, either the namespace or an individual member.
+- A namespace member names an *exported* symbol of that module: `io.Stdout` reads
+  the constant, `io.stdout()` calls the function. Naming an unexported one is an
+  error, not a silent miss.
 
 Only exported members are importable, and import cycles between modules are an
 error.

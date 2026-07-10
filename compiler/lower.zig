@@ -324,6 +324,21 @@ pub const Lowerer = struct {
         return self.modules[@intFromEnum(gsym.module)].rmodule.symbols.items[@intFromEnum(gsym.id)];
     }
 
+    /// Follows `import_item` re-export chains to the defining symbol. Bounded: a
+    /// longer chain implies an upstream bug, not valid input — `resolve.zig`
+    /// already rejects genuine import cycles.
+    fn canonicalGlobal(self: *const Lowerer, g: GlobalSymbol) GlobalSymbol {
+        var cur = g;
+        var guard: u32 = 0;
+        while (guard < 64) : (guard += 1) {
+            const s = self.symbolOf(cur);
+            if (s.kind != .import_item) return cur;
+            const t = s.imported_from orelse return cur;
+            cur = .{ .module = t.module, .id = t.symbol };
+        }
+        return cur;
+    }
+
     fn lookupMethod(self: *const Lowerer, ty: TypeId, name: []const u8) ?MethodEntry {
         for (self.method_table.items) |e| {
             if (e.ty == ty and std.mem.eql(u8, e.name, name)) return e;
@@ -829,6 +844,23 @@ const FnCtx = struct {
             cur = target.symbol;
         }
         return .{ .module = mod, .id = cur };
+    }
+
+    /// The symbol a `member` node names when its receiver is a namespace import
+    /// (`strings.toUpper` after `import strings from "std/strings"`): the export
+    /// `toUpper` of that module, canonicalized through any re-export. `null` when
+    /// the receiver is not a namespace, so ordinary field/method access falls
+    /// through. The checker has already rejected an unexported name.
+    fn namespaceMember(self: *const FnCtx, member: ast.Index) ?GlobalSymbol {
+        const k = self.kids(member); // [recv, name]
+        if (self.tree().get(k[0]).tag != .ident) return null;
+        const ns = self.nodeSymbol(k[0]) orelse return null;
+        const sym = self.l.symbolOf(ns);
+        if (sym.kind != .import_namespace) return null;
+        const mid = sym.namespace_module orelse return null;
+        const exports = &self.l.modules[@intFromEnum(mid)].rmodule.exports;
+        const target = exports.get(self.identText(k[1])) orelse return null;
+        return self.l.canonicalGlobal(.{ .module = mid, .id = target });
     }
 
     // ---- block/terminator plumbing -----------------------------------------
@@ -1998,6 +2030,15 @@ const FnCtx = struct {
         }
 
         if (callee_tag == .member) {
+            // `strings.toUpper(s)` — a namespace member is a direct cross-module
+            // call, not a field or method of a receiver value.
+            if (self.namespaceMember(callee)) |gsym| {
+                if (self.l.symbolOf(gsym).kind == .func) {
+                    const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
+                    const shape = self.ctx.func_sigs.get(gsym.pack()).?;
+                    return .{ .direct = .{ .func = fid, .result = shape.result } };
+                }
+            }
             const k = self.kids(callee); // [recv, name]
             const recv_ty = try self.nodeType(k[0]);
             const name = self.identText(k[1]);
@@ -2692,6 +2733,14 @@ const FnCtx = struct {
     fn lowerMember(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const k = self.kids(node); // [recv, name]
         const name = self.identText(k[1]);
+        // `time.Millisecond` — a namespace member read as a value. Only an
+        // exported `const` can be, exactly as for a bare identifier (`lowerIdent`);
+        // a call goes through `resolveCallTarget` and never reaches here.
+        if (self.namespaceMember(node)) |gsym| {
+            const sym = self.l.symbolOf(gsym);
+            if (sym.kind != .const_binding) return error.UnsupportedConstruct;
+            return self.lowerTopConst(gsym, sym.file_idx);
+        }
         // `EnumName.Variant` / `Enum<Args>.Variant` — a variant reference lowers
         // to its tag (a bare i64 for a C-like enum, a `{tag, null}` object for a
         // boxed one). The member node itself was typed as the concrete enum by
