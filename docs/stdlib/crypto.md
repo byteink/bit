@@ -820,3 +820,111 @@ Constant-time equality of two HMAC tags, via `ctEq`. Returns true iff `a` and `b
 have the same length and bytes, always scanning the full length so it never
 leaks *where* two tags diverge. Use it to check a tag rather than comparing bytes
 with `==`.
+
+## ChaCha20-Poly1305
+
+The ChaCha20-Poly1305 (RFC 8439 §2.8) and XChaCha20-Poly1305
+(draft-irtf-cfrg-xchacha §2.1) authenticated ciphers. Each is an `Aead`: `seal`
+encrypts the plaintext and authenticates it together with the `aad`, returning
+`ciphertext ‖ tag` (a 16-byte Poly1305 tag); `open` recomputes the tag, verifies
+it in constant time, and *fails* on any mismatch — a tampered message, or a wrong
+key, nonce, or `aad` — so unauthenticated plaintext never reaches the caller.
+
+`ChaChaPoly` derives a one-time Poly1305 key from ChaCha20 block 0, encrypts with
+the counter starting at block 1, and authenticates
+`aad ‖ pad16 ‖ ciphertext ‖ pad16 ‖ le64(len aad) ‖ le64(len ct)`. Its nonce is
+**12 bytes** and, like any stream cipher, MUST be unique per key: a repeat XORs
+two plaintexts under one keystream and leaks their difference.
+
+`XChaChaPoly` takes a **24-byte** nonce. It derives a subkey with HChaCha20 over
+the key and the first 16 nonce bytes, then runs the same construction under that
+subkey. The 192-bit nonce makes a random-nonce collision negligible, so — unlike
+the 96-bit variant — a freshly random nonce per message is safe.
+
+Both compose the audited `chacha20`, `hchacha20`, `poly1305`, and
+`poly1305Verify` primitives, so they inherit their constant-time-by-construction
+property. Outputs are checked against the RFC 8439 §2.8.2 and §A.5 vectors and a
+libsodium-verified XChaCha20-Poly1305 vector.
+
+```bit
+import { newChaChaPoly, newXChaChaPoly } from "std/crypto"
+
+// Encrypt-then-authenticate with ChaCha20-Poly1305, then verify-then-decrypt.
+// `open` returns the original plaintext or fails — it never returns unverified
+// bytes. `key` is 32 bytes and `nonce` 12 bytes, unique per key.
+function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
+  let c = newChaChaPoly(key)?
+  let sealed = c.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
+  return c.open(nonce, sealed, aad)?
+}
+
+// The same with XChaCha20-Poly1305: a 24-byte nonce, wide enough that a random
+// nonce per message is safe.
+function protectX(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
+  let c = newXChaChaPoly(key)?
+  let sealed = c.seal(nonce, msg, aad)
+  return c.open(nonce, sealed, aad)?
+}
+```
+
+### `ChaChaPoly`
+
+A ChaCha20-Poly1305 cipher (RFC 8439 §2.8), an `Aead` with a 12-byte nonce and a
+16-byte tag. Build one with `newChaChaPoly`; a value seals and opens any number of
+messages under its key.
+
+### `newChaChaPoly(key: []byte): ChaChaPoly!`
+
+Build a ChaCha20-Poly1305 cipher from a 32-byte `key`. Fails on any other length.
+The key is copied into the cipher, so the caller may reuse or wipe its slice.
+
+### `ChaChaPoly.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
+
+Encrypt `plaintext` and authenticate it with `aad`, returning `ciphertext ‖ tag`
+(16 bytes longer than `plaintext`). `nonce` must be 12 bytes and unique per key;
+a wrong length panics, like Go's `cipher.AEAD.Seal`.
+
+### `ChaChaPoly.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
+
+Verify the tag over `ciphertext` and `aad` in constant time, then decrypt.
+Returns the plaintext, or *fails* on a tampered message, a wrong key/nonce/`aad`,
+or an input shorter than the tag — never unauthenticated plaintext. A wrong nonce
+length panics.
+
+### `ChaChaPoly.nonceSize(): int`
+
+The required nonce length in bytes: 12.
+
+### `ChaChaPoly.overhead(): int`
+
+The number of bytes `seal` adds — the 16-byte tag length.
+
+### `XChaChaPoly`
+
+An XChaCha20-Poly1305 cipher (draft-irtf-cfrg-xchacha §2.1), an `Aead` with a
+24-byte nonce and a 16-byte tag. The extended nonce makes a random nonce per
+message safe. Build one with `newXChaChaPoly`.
+
+### `newXChaChaPoly(key: []byte): XChaChaPoly!`
+
+Build an XChaCha20-Poly1305 cipher from a 32-byte `key`. Fails on any other
+length. The key is copied.
+
+### `XChaChaPoly.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
+
+Encrypt `plaintext` and authenticate it with `aad`, returning `ciphertext ‖ tag`.
+`nonce` must be 24 bytes; at this width a random nonce per message is safe. A
+wrong length panics.
+
+### `XChaChaPoly.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
+
+Verify the tag over `ciphertext` and `aad` in constant time, then decrypt. Fails
+on any mismatch or a short input. A wrong nonce length panics.
+
+### `XChaChaPoly.nonceSize(): int`
+
+The required nonce length in bytes: 24.
+
+### `XChaChaPoly.overhead(): int`
+
+The number of bytes `seal` adds — the 16-byte tag length.
