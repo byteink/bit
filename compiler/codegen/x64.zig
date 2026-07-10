@@ -46,12 +46,21 @@
 //!
 //! ## Sub-64-bit integers
 //!
-//! Every integer SSA value lives in a full 64-bit GPR, correctly sign/zero
-//! extended at `field_get`/load time and truncated at `field_set`/store time
-//! (`widthOf`), but arithmetic between two loads is always full-width —
-//! narrow-width wraparound (e.g. `i8` overflow wrapping at 8 bits mid
-//! expression) is not modeled. `// ponytail: widen-to-word arithmetic, add
-//! per-width truncation if a corpus test demands exact narrow wraparound`.
+//! Every integer SSA value lives in a full 64-bit GPR held **width-canonical**:
+//! its bits above the type width always match the type — zero for an unsigned
+//! type, a copy of the sign bit for a signed one — so every consumer (logical
+//! right shift, signed/unsigned compare, unsigned div/mod, rotate) reads a
+//! correct value with no per-op masking. The invariant is upheld at every
+//! definition site: loads sign/zero-extend to width (`movLoad`/`emitFieldGet`),
+//! narrow constants are in-range by construction, and the ops that CAN push
+//! bits past the type width — `add`/`sub`/`mul`/`shl` and unary `neg`/`bnot` —
+//! re-narrow their result through `canonNarrow` (`movzx`/`movsx`/`movsxd`)
+//! before it is stored. Bitwise `and`/`or`/`xor`, the right shifts, and
+//! `div`/`mod` already carry canonical inputs to canonical outputs, so they add
+//! no mask; `u64`/`i64` (register width == type width) stay on the zero-cost
+//! fast path. This is what makes narrow `add` + `>>`/rotate round-trips exact —
+//! the SHA-256/ChaCha20/BLAKE prerequisite (#1158) — instead of leaking the
+//! overflow bits a full-width add left behind.
 //!
 //! ## Safepoints
 //!
@@ -1079,19 +1088,31 @@ fn vregOf(self: *Ctx, v: ir.ValueId) u32 {
     return self.inst_to_vreg[@intFromEnum(v)];
 }
 
-fn emitBinaryInt(self: *Ctx, op: Ctx.ArithOp, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId) !void {
+/// Re-narrow a freshly-computed result in `reg` to its type width, restoring
+/// the width-canonical invariant (see module doc comment). A no-op for the
+/// 64-bit and non-int classes, where the register width already equals the
+/// type width.
+fn canonNarrow(self: *Ctx, reg: Reg, w: Width) !void {
+    if (w.class == .int and w.bytes < 8) try self.extendReg(reg, w.bytes, w.signed);
+}
+
+fn emitBinaryInt(self: *Ctx, op: Ctx.ArithOp, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) !void {
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     const r = try getInt(self, vregOf(self, rhs), scratch2);
     try self.movRR(scratch1, l);
     try self.arithRR(op, scratch1, r);
+    // `add`/`sub` can overflow past the type width; bitwise `and`/`or`/`xor`
+    // (the other `arithRR` ops) preserve canonical operands, so skip them.
+    if (op == .add or op == .sub) try canonNarrow(self, scratch1, w);
     try putInt(self, dst, scratch1);
 }
 
-fn emitMulInt(self: *Ctx, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId) !void {
+fn emitMulInt(self: *Ctx, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) !void {
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     const r = try getInt(self, vregOf(self, rhs), scratch2);
     try self.movRR(scratch1, l);
     try self.imulRR(scratch1, r);
+    try canonNarrow(self, scratch1, w);
     try putInt(self, dst, scratch1);
 }
 
@@ -1109,14 +1130,15 @@ fn emitDivInt(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId)
     try putInt(self, dst, result_reg);
 }
 
-fn emitUnaryInt(self: *Ctx, op: ir.Op, dst: u32, operand: ir.ValueId) !void {
+fn emitUnaryInt(self: *Ctx, op: ir.Op, dst: u32, operand: ir.ValueId, w: Width) !void {
     const v = try getInt(self, vregOf(self, operand), scratch1);
     try self.movRR(scratch1, v);
     switch (op) {
-        .neg => try self.negR(scratch1),
-        .bnot => try self.notR(scratch1),
+        .neg => try self.negR(scratch1), // two's-complement negate sets high bits
+        .bnot => try self.notR(scratch1), // bitwise-not sets every bit above width
         else => unreachable,
     }
+    try canonNarrow(self, scratch1, w);
     try putInt(self, dst, scratch1);
 }
 
@@ -1167,7 +1189,7 @@ fn constShiftAmount(f: *const ir.Function, v: ir.ValueId) ?u6 {
     return @truncate(@as(u64, @bitCast(val)));
 }
 
-fn emitShiftInt(self: *Ctx, op: Ctx.ShiftOp, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId) !void {
+fn emitShiftInt(self: *Ctx, op: Ctx.ShiftOp, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) !void {
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     try self.movRR(scratch1, l);
     if (constShiftAmount(self.f, rhs)) |amt| {
@@ -1177,6 +1199,9 @@ fn emitShiftInt(self: *Ctx, op: Ctx.ShiftOp, dst: u32, lhs: ir.ValueId, rhs: ir.
         try self.movRR(.rcx, r);
         try self.shiftCl(op, scratch1);
     }
+    // Only `shl` (`.shl`) pushes bits past the type width; `shr`/`sar` keep a
+    // canonical operand canonical, so a full-width right shift needs no mask.
+    if (op == .shl) try canonNarrow(self, scratch1, w);
     try putInt(self, dst, scratch1);
 }
 
@@ -2052,27 +2077,28 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
     const ty = self.f.insts.items(.ty)[i];
     const dst = self.inst_to_vreg[i];
     const d = self.f.decode(id);
+    const iw = widthOf(self.tctx(), ty); // result width: drives narrow re-canonicalization
     switch (op) {
         .const_int => try emitConstInt(self, dst, d.const_int),
         .const_string => try emitConstString(self, dst, d.const_string),
         .const_bool => try emitConstBool(self, dst, d.const_bool),
         .const_nil => try emitConstNil(self, dst),
-        .const_float => try emitConstFloat(self, dst, d.const_float, widthOf(self.tctx(), ty).bytes),
-        .add => try emitBinaryInt(self, .add, dst, d.bin.lhs, d.bin.rhs),
-        .sub => try emitBinaryInt(self, .sub, dst, d.bin.lhs, d.bin.rhs),
-        .band => try emitBinaryInt(self, .and_, dst, d.bin.lhs, d.bin.rhs),
-        .bor => try emitBinaryInt(self, .or_, dst, d.bin.lhs, d.bin.rhs),
-        .bxor => try emitBinaryInt(self, .xor, dst, d.bin.lhs, d.bin.rhs),
-        .fadd => try emitBinaryFloat(self, .add, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), ty).bytes),
-        .fsub => try emitBinaryFloat(self, .sub, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), ty).bytes),
-        .fmul => try emitBinaryFloat(self, .mul, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), ty).bytes),
-        .fdiv => try emitBinaryFloat(self, .div, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), ty).bytes),
-        .mul => try emitMulInt(self, dst, d.bin.lhs, d.bin.rhs),
+        .const_float => try emitConstFloat(self, dst, d.const_float, iw.bytes),
+        .add => try emitBinaryInt(self, .add, dst, d.bin.lhs, d.bin.rhs, iw),
+        .sub => try emitBinaryInt(self, .sub, dst, d.bin.lhs, d.bin.rhs, iw),
+        .band => try emitBinaryInt(self, .and_, dst, d.bin.lhs, d.bin.rhs, iw),
+        .bor => try emitBinaryInt(self, .or_, dst, d.bin.lhs, d.bin.rhs, iw),
+        .bxor => try emitBinaryInt(self, .xor, dst, d.bin.lhs, d.bin.rhs, iw),
+        .fadd => try emitBinaryFloat(self, .add, dst, d.bin.lhs, d.bin.rhs, iw.bytes),
+        .fsub => try emitBinaryFloat(self, .sub, dst, d.bin.lhs, d.bin.rhs, iw.bytes),
+        .fmul => try emitBinaryFloat(self, .mul, dst, d.bin.lhs, d.bin.rhs, iw.bytes),
+        .fdiv => try emitBinaryFloat(self, .div, dst, d.bin.lhs, d.bin.rhs, iw.bytes),
+        .mul => try emitMulInt(self, dst, d.bin.lhs, d.bin.rhs, iw),
         .sdiv, .udiv, .srem, .urem => try emitDivInt(self, op, dst, d.bin.lhs, d.bin.rhs),
-        .shl => try emitShiftInt(self, .shl, dst, d.bin.lhs, d.bin.rhs),
-        .ashr => try emitShiftInt(self, .sar, dst, d.bin.lhs, d.bin.rhs),
-        .lshr => try emitShiftInt(self, .shr, dst, d.bin.lhs, d.bin.rhs),
-        .neg, .bnot => try emitUnaryInt(self, op, dst, d.un.operand),
+        .shl => try emitShiftInt(self, .shl, dst, d.bin.lhs, d.bin.rhs, iw),
+        .ashr => try emitShiftInt(self, .sar, dst, d.bin.lhs, d.bin.rhs, iw),
+        .lshr => try emitShiftInt(self, .shr, dst, d.bin.lhs, d.bin.rhs, iw),
+        .neg, .bnot => try emitUnaryInt(self, op, dst, d.un.operand, iw),
         .convert => try emitConvert(self, dst, d.un.operand, ty),
         .fneg => try emitFneg(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
         .icmp_eq, .icmp_ne, .icmp_slt, .icmp_sle, .icmp_sgt, .icmp_sge, .icmp_ult, .icmp_ule, .icmp_ugt, .icmp_uge => try emitIcmp(self, op, dst, d.bin.lhs, d.bin.rhs),
