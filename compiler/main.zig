@@ -11,6 +11,7 @@ const check = @import("check.zig");
 const lower = @import("lower.zig");
 const opt = @import("opt.zig");
 pub const testgen = @import("testgen.zig");
+pub const doc = @import("doc.zig");
 const emit = @import("emit.zig");
 const link = @import("link.zig");
 const macho = @import("link/macho.zig");
@@ -69,6 +70,22 @@ pub fn main(init: std.process.Init) !void {
         try stdout_w.interface.flush();
         try stderr_w.interface.flush();
         if (code != 0) std.process.exit(code);
+        return;
+    }
+
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "doc")) {
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var out_buf: [4096]u8 = undefined;
+        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        const failed = runDoc(gpa, io, &stdout_w.interface, &stderr_w.interface, argv[2..]) catch |e| {
+            try stderr_w.interface.print("bit doc: {s}\n", .{@errorName(e)});
+            try stderr_w.interface.flush();
+            return error.DocFailed;
+        };
+        try stdout_w.interface.flush();
+        try stderr_w.interface.flush();
+        if (failed) return error.DocFailed;
         return;
     }
 
@@ -510,6 +527,37 @@ fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8,
 /// cwd. Callers own the result. `loadProject` and the `std/*` root both need
 /// absolute paths (the module loader uses `openDirAbsolute`); the CLI hands us
 /// cwd-relative paths. Errors if `rel` does not exist.
+/// `bit doc [--json] <module-dir>`: the module's exported symbols, derived from
+/// the checker rather than from a list somebody has to remember to update.
+/// Returns `true` iff the module failed to compile.
+fn runDoc(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer, args: []const [:0]const u8) !bool {
+    var rest = args;
+    var as_json = false;
+    if (rest.len >= 1 and std.mem.eql(u8, rest[0], "--json")) {
+        as_json = true;
+        rest = rest[1..];
+    }
+    if (rest.len != 1) {
+        try err_out.writeAll("usage: bit doc [--json] <module-dir>\n");
+        return true;
+    }
+
+    const root_abs = try absFromCwd(gpa, io, rest[0]);
+    defer gpa.free(root_abs);
+    const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+    defer if (std_root) |s| gpa.free(s);
+
+    var d = (try doc.moduleDoc(gpa, io, root_abs, std_root, err_out)) orelse return true;
+    defer d.deinit();
+
+    if (as_json) {
+        try doc.writeJson(d, out);
+        return false;
+    }
+    for (d.symbols) |s| try out.print("{s} {s} {s}\n", .{ s.kind.text(), s.name, s.type_text });
+    return false;
+}
+
 fn absFromCwd(gpa: std.mem.Allocator, io: Io, rel: []const u8) ![]u8 {
     const abs = try Io.Dir.cwd().realPathFileAlloc(io, rel, gpa);
     defer gpa.free(abs);

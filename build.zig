@@ -327,6 +327,20 @@ pub fn build(b: *std.Build) void {
     const docs_tests = b.addTest(.{ .root_module = docs_mod });
     test_step.dependOn(&b.addRunArtifact(docs_tests).step);
 
+    // Stdlib doc coverage (#356): every symbol `bit doc` reports as exported must
+    // have a section in `docs/stdlib/<module>.md`. Shares the docs options (same
+    // `docs_dir` + `stdlib_dir`). Front end only — needs no libbitrt.
+    const stdlib_docs_mod = b.createModule(.{
+        .root_source_file = b.path("tests/stdlib_docs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stdlib_docs_mod.addImport("bitc", exe.root_module);
+    stdlib_docs_mod.addOptions("build_options", docs_opts);
+
+    const stdlib_docs_tests = b.addTest(.{ .root_module = stdlib_docs_mod });
+    test_step.dependOn(&b.addRunArtifact(stdlib_docs_tests).step);
+
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is

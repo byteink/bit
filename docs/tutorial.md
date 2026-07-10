@@ -269,5 +269,8 @@ A failing assertion prints the values it compared, not just that it failed.
 
 - [Language reference](reference/README.md) — types, functions, interfaces,
   generics, errors, modules, concurrency.
+- [Standard library](stdlib/README.md) — one page per module, every exported
+  symbol.
 - `examples/` in the repository — one small program per feature.
-- `bit fmt` formats; `bit lsp` backs the editor extension.
+- `bit fmt` formats; `bit doc <module>` lists what a module exports; `bit lsp`
+  backs the editor extension.

@@ -22,6 +22,9 @@ single static native binary. The guiding goal is **easy to write**.
 | [Errors](errors.md) | fallible functions, `?`, `catch`, `fail`, `defer`, panics |
 | [Modules](modules.md) | modules, imports, `export` visibility, the `main` entry point |
 
+For the library rather than the language, see the
+[standard library reference](../stdlib/README.md).
+
 ## How to read the examples
 
 Every feature has a runnable example. Snippets that contain executable

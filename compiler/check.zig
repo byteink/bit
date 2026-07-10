@@ -168,6 +168,10 @@ pub const Method = struct {
     params: []const TypeId,
     variadic: bool,
     result: TypeId,
+    /// Whether the declaration carried `export`. Method sets hold a type's
+    /// private methods too — satisfaction checks need them — so anything
+    /// reporting a module's *public* surface (`doc.zig`) must filter on this.
+    exported: bool = false,
 };
 
 pub const FuncShape = struct {
@@ -558,6 +562,12 @@ pub const TypeContext = struct {
     /// named but shape-identical structs share one method set.
     pub fn methodsOf(self: *TypeContext, receiver: TypeId) ?*const MethodBucket {
         return self.method_sets.getPtr(@intFromEnum(receiver));
+    }
+
+    /// The function type for `shape`. `pub` so `doc.zig` can render a signature
+    /// out of `func_sigs` without the intern table itself becoming public.
+    pub fn funcType(self: *TypeContext, shape: FuncShape) Error!TypeId {
+        return self.types.intern(.{ .func = shape });
     }
 
     fn findInstantiation(self: *TypeContext, generic: GlobalSymbol, args: []const TypeId) ?TypeId {
@@ -1608,7 +1618,7 @@ const Checker = struct {
         return dupe(self.ctx.arena(), GenericBinding, bindings);
     }
 
-    fn collectFuncDecl(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
+    fn collectFuncDecl(self: *Checker, file_idx: usize, idx: ast.Index, exported: bool) Error!void {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(idx); // [recv, name, generics, params, result, body]
         const is_method = k[0] != ast.none;
@@ -1645,7 +1655,7 @@ const Checker = struct {
         const recv_ty = try self.checkType(file_idx, rk[1], env);
         if (recv_ty == .invalid) return; // receiver type already failed to resolve; don't cascade
         const name = Checker.identText(mf, k[1]);
-        const method = Method{ .name = name, .params = shape.params, .variadic = shape.variadic, .result = shape.result };
+        const method = Method{ .name = name, .params = shape.params, .variadic = shape.variadic, .result = shape.result, .exported = exported };
         const bucket = try self.ctx.methodBucket(recv_ty);
         if (bucket.contains(name)) {
             try self.emit(mf, k[1], .duplicate_declaration, "method '{s}' is already declared for this type", .{name}, "rename or remove one of the declarations");
@@ -1657,13 +1667,14 @@ const Checker = struct {
 
     fn collectTopDecl(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
         const mf = self.files[file_idx];
-        const inner = if (mf.tree.get(idx).tag == .@"export") mf.tree.kids(idx)[0] else idx;
+        const exported = mf.tree.get(idx).tag == .@"export";
+        const inner = if (exported) mf.tree.kids(idx)[0] else idx;
         switch (mf.tree.get(inner).tag) {
             .struct_decl, .interface_decl, .type_alias, .enum_decl => {
                 const gsym = self.nodeSymbol(file_idx, mf.tree.kids(inner)[0]) orelse return;
                 _ = try self.declTypeOf(gsym);
             },
-            .func_decl => try self.collectFuncDecl(file_idx, inner),
+            .func_decl => try self.collectFuncDecl(file_idx, inner, exported),
             .let_decl, .const_decl => {
                 for (mf.tree.kids(inner)) |binding_idx| {
                     const bk = mf.tree.kids(binding_idx); // [pattern, type_or_none, init_or_none]
