@@ -902,3 +902,80 @@ only; prefer `ctr` or an AEAD for new designs.
 Decrypts `data` in AES CBC mode with the explicit 16-byte `iv` — the inverse of
 `cbcEncrypt`. Fails (fallible `[]byte!`) if `data` is not a multiple of 16 bytes,
 since a truncated ciphertext cannot be a valid CBC stream. Interop only.
+
+## AES-GCM
+
+Authenticated encryption (NIST SP 800-38D) — the AEAD behind TLS 1.2/1.3, IPsec,
+and SSH. AES-GCM layers a GHASH authentication tag onto AES counter mode, so one
+pass gives confidentiality for the plaintext and integrity for both the plaintext
+and the associated data. `AesGcm` is the concrete cipher; it satisfies the `Aead`
+interface, so code written against `Aead` accepts it without naming it.
+
+`newGcm` keys the cipher once — expanding the AES schedule and deriving the GHASH
+subkey `H = AES_K(0)` — and the returned value seals and opens any number of
+messages under 16- or 32-byte keys (AES-128-GCM / AES-256-GCM). Each `seal` takes
+a 12-byte (96-bit) nonce and appends a 16-byte tag; `open` recomputes the tag,
+compares it in constant time, and *fails* on any mismatch — a tampered ciphertext,
+a wrong key, nonce, or `aad` — so unverified bytes never reach the caller.
+
+The **nonce must be unique for every `seal` under a given key.** It need not be
+secret or random — a per-key counter is ideal — but a single repeat is
+catastrophic for GCM: it exposes the XOR of two plaintexts *and* leaks the GHASH
+subkey `H`, which lets an attacker forge tags for any message under that key. If
+unique nonces cannot be guaranteed (random nonces at high volume risk a birthday
+collision), reach for a misuse-resistant scheme instead (XChaCha20-Poly1305 or
+AES-GCM-SIV).
+
+GHASH multiplies in GF(2^128) with a constant-time, bit-by-bit shift-and-xor —
+not a key- or ciphertext-indexed table, which would leak through cache timing.
+Correctness over speed: a PCLMULQDQ/PMULL hardware GHASH is a separate later track.
+
+```bit
+import { newGcm, encodeHex } from "std/crypto"
+
+// Seal then open one message. `key` is 16 or 32 bytes (AES-128/256-GCM); `nonce`
+// is 12 bytes and MUST be unique per key — never reuse one under the same key.
+// `aad` is authenticated but not encrypted (headers, sequence numbers). Returns
+// the recovered plaintext as hex, or fails if the tag does not verify.
+function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
+  let cipher = newGcm(key)?
+  let sealed = cipher.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
+  let opened = cipher.open(nonce, sealed, aad)? // fails on any tag mismatch
+  return encodeHex(opened)
+}
+```
+
+### `AesGcm`
+
+A keyed AES-GCM cipher. Build one with `newGcm`, not a struct literal — the
+constructor validates the key length and derives the GHASH subkey. One value
+seals and opens any number of messages; it satisfies the `Aead` interface.
+
+### `newGcm(key: []byte): AesGcm!`
+
+Keys an AES-GCM cipher from `key`, whose length selects the variant: 16 bytes
+(AES-128-GCM) or 32 bytes (AES-256-GCM); 24 (AES-192) also works. Fails on any
+other length. The GHASH subkey is derived here once and reused by every later
+`seal`/`open`.
+
+### `AesGcm.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
+
+Encrypts `plaintext` under the 12-byte `nonce` and authenticates both it and the
+unencrypted `aad`, returning the ciphertext with the 16-byte tag appended (so
+`len(seal(...))` is `len(plaintext) + 16`). The **nonce must be unique per key** —
+reuse is catastrophic for GCM. A wrong nonce length is a caller error and panics.
+
+### `AesGcm.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
+
+Verifies and decrypts `ciphertext` (the sealed `ct ‖ tag`) under `nonce` and
+`aad`. Recomputes the tag and compares it in constant time, *failing* on any
+mismatch — a tampered message, or a wrong key, nonce, or `aad` — without returning
+the plaintext. Also fails if the input is shorter than the 16-byte tag.
+
+### `AesGcm.nonceSize(): int`
+
+The required nonce length in bytes: `12` (96-bit), the GCM/TLS standard.
+
+### `AesGcm.overhead(): int`
+
+The number of bytes `seal` appends: `16`, the authentication tag length.
