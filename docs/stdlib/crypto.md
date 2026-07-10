@@ -149,3 +149,66 @@ function rollDie(): uint {
   return randomUintBelow(6) + 1
 }
 ```
+
+## Constant-time
+
+Branchless, data-independent building blocks for constant-time code — tag
+comparison, secret-dependent selection, and wiping key material. Each is written
+so its control flow and memory access depend only on public values (slice
+lengths), never on secret contents.
+
+Policy for v1: the library is written to be constant-time *by construction* —
+no primitive here branches on, or indexes memory by, a secret. The compiler does
+**not** machine-verify constant-timeness; it is a property of how this code is
+written, not a guarantee the toolchain enforces. And these are software
+implementations: they defend against data-dependent branches and lookups, but
+**not** against hardware micro-architectural side channels (cache, speculation,
+port contention, data-dependent instruction timing). Defeating those needs
+constant-time hardware primitives — a later hardware-acceleration track, out of
+scope here.
+
+Because Bit is Go-like it has no `bool`->`int` conversion, so — like Go's own
+`crypto/subtle` — the selector for `ctSelect` is an `int` in `{0, 1}` (the 0/1
+result of a prior constant-time comparison), not a `bool`.
+
+```bit
+import { ctEq, ctSelect, secureZero } from "std/crypto"
+
+// Verify a MAC tag in constant time — no early exit reveals where a forgery
+// first diverges — then wipe the key so it can't linger in memory.
+function checkTag(key: []byte, want: []byte, got: []byte): bool {
+  let ok = ctEq(want, got)
+  secureZero(key)
+  return ok
+}
+
+// Pick `hi` when `v` is 1 and `lo` when `v` is 0, with no branch on `v`.
+function pick(v: int, hi: int, lo: int): int {
+  return ctSelect(v, hi, lo)
+}
+```
+
+### `ctEq(a: []byte, b: []byte): bool`
+
+Constant-time byte-slice equality, for comparing MACs and hash digests. Unlike
+`a == b`, which can stop at the first differing byte and so leak *where* two tags
+diverge, this always scans the full length before deciding. The one
+length-dependent branch is the fast `len(a) != len(b)` reject — slice lengths are
+public, not secret — after which it OR-accumulates every `a[i] ^ b[i]` and
+returns whether that accumulator is still zero.
+
+### `ctSelect(v: int, a: int, b: int): int`
+
+Constant-time select: returns `a` when `v` is 1 and `b` when `v` is 0, with no
+branch on `v`. `v` must be exactly 0 or 1 — pass the 0/1 result of a prior
+constant-time comparison. Internally `0 - v` is an all-ones mask for `v == 1` and
+an all-zeros mask for `v == 0`; `a` survives through the mask, `b` through its
+complement, and the two are ORed, so the choice never becomes a branch.
+
+### `secureZero(b: []byte)`
+
+Wipe every byte of `b` to zero through the runtime's un-elidable barrier
+(ABI.md §21), so a dead-store optimizer cannot drop the clear. Use it to destroy
+key material, plaintext, or intermediate secrets the moment they are no longer
+needed; `b`'s length is unchanged.
+
