@@ -87,14 +87,36 @@ Writes `res` to the connection and closes it.
 
 Stops listening.
 
-```bit
-import { serve, ok, Server, Exchange } from "std/http"
+### `listenAndServe(host: string, port: int, handler: (Request) => Response): ()!`
 
+Serves HTTP on `host:port` forever, dispatching every request to `handler` on its
+own green thread — the idiomatic server. `handler` is an ordinary function value.
+Returns only on a bind or accept error. For a kernel-chosen port, or to serve a
+bounded number of requests, drive `serve`/`accept`/`respond` yourself.
+
+```bit
+import { serve, listenAndServe, ok, respond, Server, Exchange, Request, Response } from "std/http"
+import { hasPrefix } from "std/strings"
+
+// A request handler is just a function value.
+function route(req: Request): Response {
+  if (req.path == "/") {
+    return ok("hello from bit")
+  }
+  return respond(404, "not found")
+}
+
+function main() {
+  listenAndServe("127.0.0.1", 8080, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
+}
+
+// Or drive the loop yourself for a kernel-chosen port or bounded serving:
 function handle(ex: Exchange): ()! {
   ex.respond(ok("hello from bit"))?
 }
 
-// Serve `n` requests, one green thread each.
 function runServer(s: Server, n: int): ()! {
   let i = 0
   while (i < n) {
