@@ -820,3 +820,85 @@ Constant-time equality of two HMAC tags, via `ctEq`. Returns true iff `a` and `b
 have the same length and bytes, always scanning the full length so it never
 leaks *where* two tags diverge. Use it to check a tag rather than comparing bytes
 with `==`.
+## AES modes
+
+Modes of operation (NIST SP 800-38A) that turn the single-block `AesCipher` into
+a cipher over arbitrary-length messages. Each rides an already-keyed cipher, so
+it reuses the expanded key schedule and adds no key handling of its own.
+
+`ctr` is the workhorse — counter mode, and the keystream generator AES-GCM is
+built on. It enciphers a big-endian 128-bit counter starting from the 16-byte
+`iv`, then XORs that keystream into the data. Because XOR is its own inverse,
+encryption and decryption are the *same* operation, so one function serves both;
+it needs no padding and handles a trailing partial block.
+
+`cbcEncrypt` / `cbcDecrypt` are cipher-block-chaining, provided for interop with
+existing CBC protocols rather than as a default. They do no padding, so the data
+must already be an exact multiple of the 16-byte block size. `ecbEncryptBlock` is
+the bare block permutation, exposed only for QUIC header protection — it is unsafe
+as a general mode because ECB reveals when two plaintext blocks are equal.
+
+None of these authenticate: a mode gives confidentiality only. Whenever the
+ciphertext could be tampered with, use an AEAD (AES-GCM, ChaCha20-Poly1305).
+
+```bit
+import { newAes, ctr, ecbEncryptBlock, cbcEncrypt, cbcDecrypt, encodeHex } from "std/crypto"
+
+// CTR encrypts and decrypts with the same call. `key` is 16/24/32 bytes and `iv`
+// is the 16-byte initial counter block; the result is the ciphertext as hex.
+function ctrHex(key: []byte, iv: []byte, data: []byte): string! {
+  let cipher = newAes(key)?
+  return encodeHex(ctr(cipher, iv, data))
+}
+
+// CBC over block-aligned data (`data` must be a multiple of 16 bytes).
+function cbcHex(key: []byte, iv: []byte, data: []byte): string! {
+  let cipher = newAes(key)?
+  return encodeHex(cbcEncrypt(cipher, iv, data))
+}
+
+// CBC decrypt is fallible: a ciphertext that is not a whole number of blocks
+// fails rather than returning garbage.
+function cbcOpen(key: []byte, iv: []byte, ct: []byte): []byte! {
+  let cipher = newAes(key)?
+  return cbcDecrypt(cipher, iv, ct)?
+}
+
+// QUIC header protection derives a mask from one sampled ciphertext block via
+// the bare ECB permutation — never a general-purpose cipher.
+function headerMask(key: []byte, sample: []byte): string! {
+  let cipher = newAes(key)?
+  return encodeHex(ecbEncryptBlock(cipher, sample))
+}
+```
+
+### `ctr(cipher: AesCipher, iv: []byte, data: []byte): []byte`
+
+Encrypts or decrypts `data` in AES counter (CTR) mode under the keyed `cipher`.
+The 16-byte `iv` is the initial value of a big-endian 128-bit counter block; each
+successive block enciphers the incremented counter and XORs that keystream into
+the data. XORing the keystream is its own inverse, so the same call both encrypts
+and decrypts, and `data` may be any length. This is the keystream engine AES-GCM
+is built on.
+
+### `ecbEncryptBlock(cipher: AesCipher, block: []byte): []byte`
+
+Enciphers one 16-byte `block` as a bare ECB block — the raw AES permutation with
+no chaining or IV. Exposed **only** for QUIC header protection, which enciphers a
+sampled ciphertext block to derive the header mask. It is unsafe as a general
+mode: ECB reveals when two plaintext blocks are equal, so never encrypt more than
+one block of real data through it.
+
+### `cbcEncrypt(cipher: AesCipher, iv: []byte, data: []byte): []byte`
+
+Encrypts `data` in AES cipher-block-chaining (CBC) mode with the explicit 16-byte
+`iv`, XORing each plaintext block with the previous ciphertext block before
+enciphering. `data` must already be an exact multiple of 16 bytes — CBC does no
+padding, so a non-block-multiple length is a caller error and panics. Interop
+only; prefer `ctr` or an AEAD for new designs.
+
+### `cbcDecrypt(cipher: AesCipher, iv: []byte, data: []byte): []byte!`
+
+Decrypts `data` in AES CBC mode with the explicit 16-byte `iv` — the inverse of
+`cbcEncrypt`. Fails (fallible `[]byte!`) if `data` is not a multiple of 16 bytes,
+since a truncated ciphertext cannot be a valid CBC stream. Interop only.
