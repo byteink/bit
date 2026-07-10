@@ -371,3 +371,112 @@ function sha1Stream(head: []byte, tail: []byte): []byte {
 A fresh SHA-1 hasher in the empty state, typed as the streaming `Hash` interface
 — digest size 20 bytes, block size 64. Legacy: interop only, not
 collision-resistant; never use it for new signatures or MACs.
+
+## AEAD
+
+Authenticated encryption with associated data. `Aead` is the contract every
+authenticated cipher in the library satisfies; concrete algorithms — AES-GCM,
+ChaCha20-Poly1305 — are separate types that conform to it structurally, so code
+can encrypt against `Aead` without naming a specific algorithm.
+
+AEAD binds confidentiality and integrity in one operation. `seal` encrypts the
+plaintext and authenticates both it and the unencrypted `aad` (additional
+authenticated data — headers, sequence numbers: data you must not hide but must
+not let an attacker forge), returning the ciphertext with the authentication tag
+appended. `open` recomputes that tag in constant time and *fails* on any
+mismatch, so a tampered message — or a wrong key, nonce, or `aad` — yields an
+error, never unauthenticated plaintext.
+
+Because interfaces are structural, a type is an `Aead` simply by having the four
+methods below. The example is a stand-in cipher — it XORs against a fixed pad
+rather than encrypting — but a real one plugs in exactly the same way.
+
+```bit
+import { Aead } from "std/crypto"
+
+// A stand-in "cipher", NOT real encryption: it XORs each byte with a fixed pad
+// and appends a one-byte XOR-fold as the "tag". A real AES-GCM satisfies `Aead`
+// the same way — by its four methods.
+struct XorSeal {
+  pad: byte
+}
+
+function (x: XorSeal) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
+  let out = []byte(len(plaintext) + 1)
+  let tag: byte = 0
+  let i = 0
+  while (i < len(plaintext)) {
+    let c = plaintext[i] ^ x.pad
+    out[i] = c
+    tag = tag ^ c
+    i = i + 1
+  }
+  out[len(plaintext)] = tag // the 1-byte authentication tag
+  return out
+}
+
+function (x: XorSeal) open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte! {
+  if (len(ciphertext) < 1) {
+    fail newError("open: ciphertext shorter than the tag")
+  }
+  let n = len(ciphertext) - 1
+  let out = []byte(n)
+  let tag: byte = 0
+  let i = 0
+  while (i < n) {
+    let c = ciphertext[i]
+    tag = tag ^ c
+    out[i] = c ^ x.pad
+    i = i + 1
+  }
+  if (tag != ciphertext[n]) { // tag mismatch: reject, never return plaintext
+    fail newError("open: authentication failed")
+  }
+  return out
+}
+
+function (x: XorSeal) nonceSize(): int {
+  return 12
+}
+
+function (x: XorSeal) overhead(): int {
+  return 1
+}
+
+// Encrypt-then-decrypt through the `Aead` interface: `open` recovers what `seal`
+// produced, or fails if the ciphertext was tampered with.
+function roundtrip(a: Aead, nonce: []byte, msg: []byte, aad: []byte): []byte! {
+  let ct = a.seal(nonce, msg, aad)
+  return a.open(nonce, ct, aad)?
+}
+```
+
+### `Aead`
+
+The authenticated-encryption contract:
+
+```bit ignore
+interface Aead {
+  seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte,   // ciphertext‖tag
+  open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!, // verify, then decrypt
+  nonceSize(): int, // required nonce length in bytes
+  overhead(): int,  // bytes seal adds — the tag length
+}
+```
+
+`seal` returns the ciphertext with the tag appended, so `len(seal(...))` is
+`len(plaintext) + overhead()`. `open` verifies the tag in constant time and
+returns `[]byte!` — it *fails* rather than return plaintext when the tag does not
+match, which is the whole point of authenticated encryption: unverified bytes
+never reach the caller.
+
+The **nonce must be unique per key** for every `seal`. It need not be secret or
+random — a per-key counter is fine — but it must never repeat under one key.
+Nonce reuse is catastrophic: it exposes the XOR of two plaintexts, and for
+AES-GCM a single repeat also leaks the polynomial authentication key `H`,
+letting an attacker forge tags for *any* message under that key. If you cannot
+guarantee uniqueness — random nonces at high volume risk a birthday collision,
+and distributed writers cannot share a counter — use a misuse-resistant scheme:
+XChaCha20-Poly1305 (a 192-bit random nonce makes collision negligible) or
+AES-GCM-SIV (nonce reuse degrades only to revealing message equality, not
+catastrophe).
