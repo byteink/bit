@@ -348,6 +348,12 @@ pub fn buildHostTestExecutable(gpa: std.mem.Allocator, path: []const u8, source:
     return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, host_target, err_out, tests_out);
 }
 
+/// `buildHostTestExecutable` for a directory module, so the tests can import
+/// `std/testing` and the rest of the stdlib (a single-file build has no prelude).
+pub fn buildHostTestProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer, tests_out: *[]testgen.Test) !?[]u8 {
+    return buildProject(gpa, io, root_abs, std_root, ident, libbitrt, host_target, err_out, tests_out);
+}
+
 /// One source file of the module being built: its path (for diagnostics and
 /// naming) and contents. Both are owned by whoever produced the `SrcFile`.
 const SrcFile = struct { path: []const u8, source: []const u8 };

@@ -93,3 +93,42 @@ test "bit test: discovers test_ functions and reports pass/fail per test" {
     // test binary run by hand is a harmless no-op.
     try testing.expect(try runOne(gpa, run_io, bin_path, 99));
 }
+
+test "bit test: a directory module's tests can import std/testing" {
+    if (build_options.libbitrt_path.len == 0) return; // host not a runtime target
+
+    const gpa = testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    const libbitrt = try Dir.cwd().readFileAlloc(io, build_options.libbitrt_path, gpa, .limited(16 << 20));
+    defer gpa.free(libbitrt);
+
+    var discard: Io.Writer.Allocating = .init(gpa);
+    defer discard.deinit();
+
+    var tests: []bitc.testgen.Test = &.{};
+    const exe = (try bitc.buildHostTestProject(gpa, io, build_options.testproj_dir, build_options.stdlib_dir, "testproj", libbitrt, &discard.writer, &tests)) orelse {
+        std.debug.print("testproj fixture: compile failed:\n{s}\n", .{discard.written()});
+        return error.TestCompileFailed;
+    };
+    defer gpa.free(exe);
+    defer bitc.testgen.freeTests(gpa, tests);
+
+    // Only the root module's tests, never std/testing's own helpers.
+    try testing.expectEqual(@as(usize, 4), tests.len);
+    try testing.expectEqualStrings("test_scalars", tests[0].name);
+    try testing.expectEqualStrings("test_fails_explicitly", tests[3].name);
+
+    var run_threaded = Io.Threaded.init(gpa, .{});
+    defer run_threaded.deinit();
+    const run_io = run_threaded.io();
+
+    const bin_path = "/tmp/bit-testproj-fixture";
+    try Dir.cwd().writeFile(run_io, .{ .sub_path = bin_path, .data = exe, .flags = .{ .permissions = .executable_file } });
+    defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
+
+    try testing.expect(try runOne(gpa, run_io, bin_path, 0)); // test_scalars
+    try testing.expect(try runOne(gpa, run_io, bin_path, 1)); // test_floats_and_slices
+    try testing.expect(!try runOne(gpa, run_io, bin_path, 2)); // eq diff panics
+    try testing.expect(!try runOne(gpa, run_io, bin_path, 3)); // failNow panics
+}

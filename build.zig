@@ -281,6 +281,8 @@ pub fn build(b: *std.Build) void {
     // its own process (a failed `assert` panics). Shares the host libbitrt
     // archive wired in at the tail.
     const testcmd_opts = b.addOptions();
+    testcmd_opts.addOption([]const u8, "testproj_dir", b.pathFromRoot("tests/testproj"));
+    testcmd_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
     const testcmd_mod = b.createModule(.{
         .root_source_file = b.path("tests/testcmd.zig"),
         .target = target,
