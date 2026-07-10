@@ -81,7 +81,8 @@ test "bit test: discovers test_ functions and reports pass/fail per test" {
     defer run_threaded.deinit();
     const run_io = run_threaded.io();
 
-    const bin_path = "/tmp/bit-testcmd-fixture";
+    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-testcmd-fixture-{x}", .{testing.random_seed}, 0);
+    defer gpa.free(bin_path);
     try Dir.cwd().writeFile(run_io, .{ .sub_path = bin_path, .data = exe, .flags = .{ .permissions = .executable_file } });
     defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
 
@@ -123,7 +124,8 @@ test "bit test: a directory module's tests can import std/testing" {
     defer run_threaded.deinit();
     const run_io = run_threaded.io();
 
-    const bin_path = "/tmp/bit-testproj-fixture";
+    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-testproj-fixture-{x}", .{testing.random_seed}, 0);
+    defer gpa.free(bin_path);
     try Dir.cwd().writeFile(run_io, .{ .sub_path = bin_path, .data = exe, .flags = .{ .permissions = .executable_file } });
     defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
 

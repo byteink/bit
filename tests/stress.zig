@@ -73,7 +73,7 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     const expected = try Dir.cwd().readFileAlloc(io, expected_path, gpa, .limited(64 << 10));
     defer gpa.free(expected);
 
-    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-stress-{s}", .{name}, 0);
+    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-stress-{s}-{x}", .{ name, testing.random_seed }, 0);
     defer gpa.free(bin_path);
 
     // Per-test io over `gpa` so `std.process.run`'s spawn arena does not trip

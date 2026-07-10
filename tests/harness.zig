@@ -123,7 +123,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             defer gpa.free(exe);
 
             const stem = name[0 .. name.len - ".bit".len];
-            const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-golden-{s}", .{stem}, 0);
+            const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-golden-{s}-{x}", .{ stem, testing.random_seed }, 0);
             defer gpa.free(bin_path);
             try Dir.cwd().writeFile(run_io, .{
                 .sub_path = bin_path,

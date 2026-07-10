@@ -105,7 +105,8 @@ test "every ```bit block in docs/ typechecks" {
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();
 
-    const scratch = "/tmp/bit-doctest";
+    const scratch = try std.fmt.allocPrint(gpa, "/tmp/bit-doctest-{x}", .{testing.random_seed});
+    defer gpa.free(scratch);
     Dir.cwd().deleteTree(io, scratch) catch {};
     try Dir.cwd().createDirPath(io, scratch);
     defer Dir.cwd().deleteTree(io, scratch) catch {};

@@ -84,7 +84,7 @@ fn runExample(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const
     defer run_threaded.deinit();
     const run_io = run_threaded.io();
 
-    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-example-{s}", .{name}, 0);
+    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-example-{s}-{x}", .{ name, testing.random_seed }, 0);
     defer gpa.free(bin_path);
     try Dir.cwd().writeFile(run_io, .{
         .sub_path = bin_path,
