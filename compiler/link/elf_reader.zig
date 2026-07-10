@@ -113,11 +113,13 @@ pub fn read(gpa: Allocator, target: Target, name: []const u8, bytes: []const u8)
     for (shdrs, 0..) |sh, i| {
         const kind = classify(sh) orelse continue;
         section_map[i] = @intCast(raw_sections.items.len);
+        const sec_align: u32 = @intCast(@max(sh.sh_addralign, 1));
         try raw_sections.append(gpa, .{
             .name = try cstr(shstrtab, sh.sh_name),
             .kind = kind,
             .data = if (kind.isBss()) &.{} else try sectionBytes(bytes, sh),
             .size = sh.sh_size,
+            .alignment = if (kind == .text) @max(sec_align, target.minTextAlign()) else sec_align,
         });
     }
 
@@ -134,7 +136,7 @@ pub fn read(gpa: Allocator, target: Target, name: []const u8, bytes: []const u8)
         undefined_: []const u8,
         section: u32, // our RawSection index
         raw: u32, // index into raw_symbols
-        ignored, // STT_FILE, or defined in a dropped section — never a valid relocation target
+        ignored, // STT_FILE, a mapping symbol, or defined in a dropped section — never a valid relocation target
     };
     const sym_infos = try gpa.alloc(SymInfo, sym_count);
     defer gpa.free(sym_infos);
@@ -172,6 +174,11 @@ pub fn read(gpa: Allocator, target: Target, name: []const u8, bytes: []const u8)
 
         if (stt == @intFromEnum(elf.STT.SECTION)) {
             sym_infos[i] = .{ .section = mapped };
+            continue;
+        }
+
+        if (isMappingSymbol(sym_name, stt, stb, sym.st_size)) {
+            sym_infos[i] = .ignored;
             continue;
         }
 
@@ -258,6 +265,34 @@ fn nextOrTruncated(it: *elf.SectionHeaderBufferIterator) error{Malformed}!?elf.E
     return it.next() catch error.Malformed;
 }
 
+/// Whether `name` is an ARM/AArch64 **mapping symbol** (AAELF64 §5.5.5): `$x`
+/// starts a run of A64 instructions, `$d` a run of data, and ARM32 adds
+/// `$a`/`$t`; each may carry a `.suffix` (`$d.1`). They are `STT_NOTYPE`,
+/// `STB_LOCAL`, size 0, and name no object — they only tell a disassembler
+/// where code turns into data.
+///
+/// They must never become symbols here. `atomizeModule` splits a section into
+/// one atom per symbol offset, so admitting them carves a `.rodata` literal
+/// pool into arbitrary `$d`-named slices. A relocation into that pool then
+/// resolves against whichever slice happens to cover its offset, with the
+/// remainder folded into the addend — and once dead-strip drops an unreferenced
+/// slice and layout repacks the survivors, that addend points at the wrong
+/// bytes. The symptom is silent: compiler-rt's `log`/`log2`/`log10` read their
+/// musl lookup tables at shifted addresses and return garbage, while inputs
+/// that hit a table-free fast path (`log2(8.0)`) stay exact. x86-64 objects
+/// have no mapping symbols, so this only ever corrupted AArch64 links.
+///
+/// Skipping them leaves such a pool as its section's single anonymous atom,
+/// whose interior offsets are then immune to repacking.
+fn isMappingSymbol(name: []const u8, stt: u8, stb: u8, size: u64) bool {
+    if (name.len < 2 or name[0] != '$') return false;
+    if (stt != @intFromEnum(elf.STT.NOTYPE) or stb != @intFromEnum(elf.STB.LOCAL) or size != 0) return false;
+    return switch (name[1]) {
+        'a', 'd', 't', 'x' => name.len == 2 or name[2] == '.',
+        else => false,
+    };
+}
+
 fn classify(sh: elf.Elf64_Shdr) ?object.SectionKind {
     const flags = sh.sh_flags;
     if (flags & elf.SHF_ALLOC == 0) return null;
@@ -328,6 +363,28 @@ fn readAt(comptime T: type, sub: []const u8, offset: usize, endian: std.builtin.
 }
 
 const testing = std.testing;
+
+test "isMappingSymbol recognizes AArch64/ARM mapping symbols only" {
+    const notype = @intFromEnum(elf.STT.NOTYPE);
+    const local = @intFromEnum(elf.STB.LOCAL);
+    const func = @intFromEnum(elf.STT.FUNC);
+    const global = @intFromEnum(elf.STB.GLOBAL);
+
+    try testing.expect(isMappingSymbol("$d", notype, local, 0));
+    try testing.expect(isMappingSymbol("$x", notype, local, 0));
+    try testing.expect(isMappingSymbol("$a", notype, local, 0));
+    try testing.expect(isMappingSymbol("$t", notype, local, 0));
+    try testing.expect(isMappingSymbol("$d.1", notype, local, 0));
+
+    // Real symbols that merely start with `$`, or that carry a type/size/binding
+    // a mapping symbol never has, must survive.
+    try testing.expect(!isMappingSymbol("$done", notype, local, 0));
+    try testing.expect(!isMappingSymbol("$d", func, local, 0));
+    try testing.expect(!isMappingSymbol("$d", notype, global, 0));
+    try testing.expect(!isMappingSymbol("$d", notype, local, 4));
+    try testing.expect(!isMappingSymbol("log2", notype, local, 0));
+    try testing.expect(!isMappingSymbol("$", notype, local, 0));
+}
 
 test "rejects a non-ELF file" {
     // At least `@sizeOf(Elf64_Ehdr)` (64) bytes: `elf.Header.read` peeks

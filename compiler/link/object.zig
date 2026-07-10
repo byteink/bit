@@ -168,6 +168,12 @@ pub const RawSection = struct {
     /// Empty for `.bss`/`.tls_bss` — those carry only `size`.
     data: []const u8,
     size: u64,
+    /// The section's own required alignment. An atom carved out of this section
+    /// can never be laid out looser than this — in particular a symbol-less
+    /// section's single anonymous atom, which has no symbol to inherit an
+    /// alignment from. AArch64 literal pools reached by `ldr q0` are 16-byte
+    /// aligned, and under-aligning one faults the load.
+    alignment: u32 = 1,
 };
 
 /// One symbol as read from an object, before atomization has split its
@@ -301,7 +307,10 @@ pub fn atomizeModule(
                 .binding = .local,
                 .data = if (section.kind.isBss()) &.{} else section.data,
                 .size = @intCast(section.size),
-                .alignment = 1,
+                // The section's own alignment: there is no symbol to inherit
+                // one from, and an AArch64 literal pool loaded with `ldr q0`
+                // faults if it lands under-aligned.
+                .alignment = section.alignment,
                 .relocs = &.{},
             });
             continue;
@@ -314,7 +323,9 @@ pub fn atomizeModule(
             const off = symbols[order[gi]].offset;
             var gj = gi;
             var primary = order[gi]; // prefer a global, and a strong one, for identity
-            var max_align: u32 = 1;
+            // The first atom starts at the section's base, so it inherits the
+            // section's alignment; a later atom's is its symbols' own.
+            var max_align: u32 = if (off == 0) section.alignment else 1;
             while (gj < order.len and symbols[order[gj]].offset == off) : (gj += 1) {
                 const s = symbols[order[gj]];
                 const p = symbols[primary];
@@ -500,6 +511,33 @@ test "atomizeModule routes global-bound symbol references through SymbolRef.glob
     defer freeModule(gpa, &mod);
 
     try testing.expectEqualStrings("bit_rt_gc_alloc", mod.atoms[0].relocs[0].target.global);
+}
+
+test "atomizeModule gives a symbol-less section's anonymous atom the section's alignment" {
+    // Regression: the anonymous atom hardcoded alignment 1. An AArch64 `.rodata`
+    // literal pool (16-byte aligned, loaded with `ldr q0`) has no symbol of its
+    // own once mapping symbols are excluded, so under-aligning it faults.
+    const gpa = testing.allocator;
+    const pool = [_]u8{0} ** 32;
+    const sections = [_]RawSection{.{ .name = ".rodata.cst16", .kind = .rodata, .data = &pool, .size = pool.len, .alignment = 16 }};
+    var mod = try atomizeModule(gpa, "m", &sections, &.{}, &.{});
+    defer freeModule(gpa, &mod);
+
+    try testing.expectEqual(@as(usize, 1), mod.atoms.len);
+    try testing.expectEqual(@as(u32, 16), mod.atoms[0].alignment);
+}
+
+test "atomizeModule floors the leading atom's alignment at the section's" {
+    // A symbol at offset 0 starts at the section base, so it can never be laid
+    // out looser than the section requires.
+    const gpa = testing.allocator;
+    const data = [_]u8{0} ** 16;
+    const sections = [_]RawSection{.{ .name = ".rodata", .kind = .rodata, .data = &data, .size = data.len, .alignment = 16 }};
+    const symbols = [_]RawSymbol{.{ .name = "tbl", .section = 0, .offset = 0, .size = 16, .binding = .global, .alignment = 1 }};
+    var mod = try atomizeModule(gpa, "m", &sections, &symbols, &.{});
+    defer freeModule(gpa, &mod);
+
+    try testing.expectEqual(@as(u32, 16), mod.atoms[0].alignment);
 }
 
 test "atomizeModule keeps a bss section's atom size without data bytes" {

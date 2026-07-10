@@ -181,6 +181,8 @@ pub fn read(gpa: Allocator, name: []const u8, bytes: []const u8) Error!object.Mo
                             .kind = k,
                             .data = data,
                             .size = sh.size,
+                            // Mach-O stores log2 of the required alignment.
+                            .alignment = @as(u32, 1) << @intCast(sh.@"align"),
                         });
                     } else {
                         try sect_meta.append(gpa, .{ .hdr = sh, .raw_index = null, .kind = null });
