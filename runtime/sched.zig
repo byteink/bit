@@ -728,9 +728,20 @@ pub const NetPoller = struct {
                     .events = io_bit | std.os.linux.EPOLL.ONESHOT,
                     .data = .{ .ptr = @intFromPtr(task) },
                 };
-                const rc = std.os.linux.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_ADD, fd, &ev);
-                switch (std.posix.errno(rc)) {
+                // ONESHOT disarms the fd on the first event but leaves it in the
+                // set, so the *next* registration of the same open fd must
+                // re-arm with CTL_MOD — CTL_ADD would return EEXIST. kqueue's
+                // EV_ADD re-arms in place, so this split is Linux-only. The
+                // common per-fd sequence (connect waits .write, then the first
+                // read waits .read) re-registers within one fd's lifetime, so
+                // this is the hot path, not an edge case.
+                const add = std.os.linux.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_ADD, fd, &ev);
+                switch (std.posix.errno(add)) {
                     .SUCCESS => {},
+                    .EXIST => {
+                        const mod = std.os.linux.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_MOD, fd, &ev);
+                        if (std.posix.errno(mod) != .SUCCESS) return error.RegisterFailed;
+                    },
                     else => return error.RegisterFailed,
                 }
             },
@@ -1357,4 +1368,28 @@ test "netpoller: register on a pipe wakes the parked task" {
         if (deadline.expired()) return error.Timeout;
         sleepNs(10_000);
     }
+}
+
+test "netpoller: re-registering the same fd re-arms rather than failing" {
+    // ONESHOT leaves a fired fd in the set, so the second registration of the
+    // same open fd must re-arm (Linux CTL_MOD). A `Conn` does exactly this —
+    // connect waits `.write`, then the first read waits `.read` on the same fd
+    // — so a naive CTL_ADD returns EEXIST and breaks every real connection.
+    // Regression for the net epoll hang/crash on Linux.
+    var poller = try NetPoller.init();
+    defer poller.deinit();
+
+    var fds: [2]i32 = undefined;
+    switch (builtin.os.tag) {
+        .linux => try testing.expectEqual(std.os.linux.E.SUCCESS, std.posix.errno(std.os.linux.pipe(&fds))),
+        else => try testing.expect(std.c.pipe(&fds) == 0),
+    }
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    // `register` only records the pointer (`@intFromPtr`), never dereferences
+    // it, so an uninitialized `Task` is a legitimate registration target here.
+    var dummy: Task = undefined;
+    try poller.register(fds[0], .read, &dummy); // fresh fd -> add
+    try poller.register(fds[0], .read, &dummy); // already present -> must re-arm
 }
