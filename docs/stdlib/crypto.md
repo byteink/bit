@@ -641,3 +641,61 @@ and distributed writers cannot share a counter — use a misuse-resistant scheme
 XChaCha20-Poly1305 (a 192-bit random nonce makes collision negligible) or
 AES-GCM-SIV (nonce reuse degrades only to revealing message equality, not
 catastrophe).
+## AES
+
+The AES block cipher (FIPS 197) for 128-, 192-, and 256-bit keys. `newAes`
+expands a key once into an `AesCipher`; that value then enciphers or deciphers
+any number of 16-byte blocks. This is the raw single-block permutation — no
+chaining, no padding, no IV. Real messages need a mode of operation (CBC, CTR,
+GCM) layered on top; never encrypt more than one block under bare ECB, because
+identical plaintext blocks would then produce identical ciphertext.
+
+The S-box is computed in GF(2^8) — the multiplicative inverse via `x^254`
+followed by the affine map — not read from a 256-byte table indexed by a secret
+byte. So there is no key- or plaintext-dependent memory access or branch
+anywhere in the cipher: it is constant-time by construction, which is the whole
+point of shipping it rather than a table-driven version that leaks through the
+data cache. The cost is speed — each substitution is a short chain of field
+multiplies instead of one load. Hardware AES (AES-NI, ARMv8 crypto) is a
+separate, later track; this is the portable reference every target shares.
+
+```bit
+import { newAes, encodeHex } from "std/crypto"
+
+// Encipher a single 16-byte block with AES-128 and return the ciphertext as
+// hex. `newAes` fails unless the key is 16, 24, or 32 bytes, so this is fallible.
+function encryptBlockHex(key: []byte, block: []byte): string! {
+  let cipher = newAes(key)?
+  return encodeHex(cipher.encryptBlock(block))
+}
+
+// Decipher one block — the inverse of encryptBlock under the same key.
+function decryptBlockHex(key: []byte, block: []byte): string! {
+  let cipher = newAes(key)?
+  return encodeHex(cipher.decryptBlock(block))
+}
+```
+
+### `AesCipher`
+
+A key-scheduled AES cipher. Build one with `newAes` rather than a struct
+literal — the constructor validates the key length and expands the round-key
+schedule once, which every `encryptBlock`/`decryptBlock` call then reuses. One
+value ciphers any number of blocks.
+
+### `newAes(key: []byte): AesCipher!`
+
+Builds an AES cipher from `key`. The key length selects the variant: 16 bytes is
+AES-128, 24 is AES-192, 32 is AES-256. Fails on any other length.
+
+### `AesCipher.encryptBlock(block: []byte): []byte`
+
+Enciphers one 16-byte `block`, returning a fresh 16-byte ciphertext block.
+`block` must be exactly 16 bytes. This is the bare block permutation with no
+chaining — use a mode of operation for multi-block messages.
+
+### `AesCipher.decryptBlock(block: []byte): []byte`
+
+Deciphers one 16-byte `block`, returning a fresh 16-byte plaintext block — the
+inverse of `encryptBlock` under the same key, so `decryptBlock(encryptBlock(b))`
+equals `b`. `block` must be exactly 16 bytes.

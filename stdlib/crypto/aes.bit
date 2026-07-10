@@ -1,0 +1,315 @@
+// Bit standard library — crypto module, the AES block cipher (FIPS 197).
+//
+// AES-128, AES-192, and AES-256: the same round structure keyed by a 16-, 24-,
+// or 32-byte key (10, 12, or 14 rounds). `newAes` expands the key once; the
+// returned `AesCipher` then enciphers or deciphers any number of 16-byte blocks
+// with `encryptBlock`/`decryptBlock`. This is the raw block primitive — a single
+// 128-bit permutation with no chaining or padding. A mode of operation (CBC,
+// CTR, GCM) sits on top of it; do not encrypt more than one block of real data
+// under ECB semantics.
+//
+// CONSTANT-TIME BY CONSTRUCTION. The classic S-box is a 256-byte table indexed
+// by a secret byte, which leaks the byte through the data cache. This module has
+// no such table: `sbox`/`invSbox` compute the multiplicative inverse in GF(2^8)
+// arithmetically (Fermat: x^254 == x^-1, since x^255 == 1 for x != 0), built
+// from a branchless GF multiply, then apply the affine map with rotates and
+// XORs. Every operation's control flow and memory access is independent of the
+// data, so there is no key- or plaintext-dependent timing. The cost is speed —
+// each S-box is ~13 field multiplies rather than one load. Hardware AES-NI /
+// ARMv8 crypto acceleration is a separate, later track; this is the portable
+// reference every target shares.
+//
+// All byte math is `u8`, so shifts and adds wrap mod 2^8 exactly as the field
+// requires (§13.5). The reduction polynomial is AES's x^8 + x^4 + x^3 + x + 1
+// (0x11b), whose reduction byte is 0x1b.
+
+// Branchless GF(2^8) multiply of `a` and `b` under the AES polynomial. Runs the
+// full 8-bit shift-and-add every call; the "add this partial product" and
+// "reduce after the shift" decisions are folded into all-ones/all-zeros masks
+// (`u8(0) - bit`) rather than branches, so the timing never depends on the
+// operands. Both are secret in the S-box, so this must not branch on either.
+function gmul(a: u8, b: u8): u8 {
+  let product: u8 = 0
+  let x = a
+  let y = b
+  let i = 0
+  while (i < 8) {
+    let addMask: u8 = u8(0) - (y & 1)
+    product = product ^ (x & addMask)
+    let carry: u8 = (x >> 7) & 1
+    let reduceMask: u8 = u8(0) - carry
+    x = (x << 1) ^ (0x1b & reduceMask)
+    y = y >> 1
+    i = i + 1
+  }
+  return product
+}
+
+// Multiply `a` by 2 in GF(2^8): shift left, conditionally reduce by 0x1b when a
+// bit carried out of bit 7. Branchless via the same mask trick. The multiplier
+// is public (always 2), but the operand is secret in MixColumns, so this stays
+// data-independent too.
+function xtime(a: u8): u8 {
+  let carry: u8 = (a >> 7) & 1
+  let reduceMask: u8 = u8(0) - carry
+  return (a << 1) ^ (0x1b & reduceMask)
+}
+
+// The multiplicative inverse of `x` in GF(2^8), with inverse(0) defined as 0.
+// Since the non-zero elements form a group of order 255, x^255 == 1 and thus
+// x^254 == x^-1; 0^254 == 0 falls out for free. The exponent 254 = 0b11111110
+// is reached by squaring up to x^128 and multiplying the seven even powers —
+// a fixed 13-multiply addition chain, identical work for every input.
+function gInverse(x: u8): u8 {
+  let p2 = gmul(x, x)
+  let p4 = gmul(p2, p2)
+  let p8 = gmul(p4, p4)
+  let p16 = gmul(p8, p8)
+  let p32 = gmul(p16, p16)
+  let p64 = gmul(p32, p32)
+  let p128 = gmul(p64, p64)
+  let r = gmul(p2, p4)
+  r = gmul(r, p8)
+  r = gmul(r, p16)
+  r = gmul(r, p32)
+  r = gmul(r, p64)
+  r = gmul(r, p128)
+  return r
+}
+
+// Rotate the byte `x` left by `n` bits (1..7). The two shifted halves cover
+// disjoint bit positions, so the `|` reassembles the rotation.
+function rotl8(x: u8, n: u8): u8 {
+  return (x << n) | (x >> (8 - n))
+}
+
+// The AES S-box: GF(2^8) inverse followed by the affine map. The affine map
+// b ^ (b<<<1) ^ (b<<<2) ^ (b<<<3) ^ (b<<<4) ^ 0x63 (rotates on 8 bits) is the
+// compact form of FIPS 197 §5.1.1's bit matrix.
+function sbox(x: u8): u8 {
+  let b = gInverse(x)
+  return b ^ rotl8(b, 1) ^ rotl8(b, 2) ^ rotl8(b, 3) ^ rotl8(b, 4) ^ 0x63
+}
+
+// The inverse S-box: the inverse affine map rotl(s,1) ^ rotl(s,3) ^ rotl(s,6) ^
+// 0x05 (FIPS 197 §5.3.2) followed by the same GF(2^8) inverse.
+function invSbox(x: u8): u8 {
+  let b = rotl8(x, 1) ^ rotl8(x, 3) ^ rotl8(x, 6) ^ 0x05
+  return gInverse(b)
+}
+
+// Products by the fixed InvMixColumns coefficients {9, 11, 13, 14}, each built
+// from the doubling chain x, 2x, 4x, 8x. Public multipliers, secret operand;
+// xtime is branchless, so these are constant-time.
+function mul9(x: u8): u8 { let x2 = xtime(x); let x4 = xtime(x2); let x8 = xtime(x4); return x8 ^ x }
+function mul11(x: u8): u8 { let x2 = xtime(x); let x4 = xtime(x2); let x8 = xtime(x4); return x8 ^ x2 ^ x }
+function mul13(x: u8): u8 { let x2 = xtime(x); let x4 = xtime(x2); let x8 = xtime(x4); return x8 ^ x4 ^ x }
+function mul14(x: u8): u8 { let x2 = xtime(x); let x4 = xtime(x2); let x8 = xtime(x4); return x8 ^ x4 ^ x2 }
+
+// Expand `key` (nk 32-bit words) into the round-key schedule: nb*(nr+1) = 4*(nr+1)
+// words, laid out as bytes. FIPS 197 §5.2. Every fourth word (every nk-th for
+// 256-bit keys, plus the extra SubWord) passes through the S-box, so the schedule
+// is as key-dependent — and as constant-time — as the cipher itself.
+function expandKey(key: []byte, nk: int, nr: int): []byte {
+  let total = 16 * (nr + 1)
+  let rk = []byte(total)
+  let nk4 = nk * 4
+
+  let i = 0
+  while (i < nk4) {
+    rk[i] = key[i]
+    i = i + 1
+  }
+
+  // The round constant RC[j] = x^(j-1) in GF(2^8); it starts at 1 and doubles
+  // each time the key-schedule core fires. It is public (never key-dependent).
+  let rcon: u8 = 1
+  let temp = []byte(4)
+  let n = nk4
+  while (n < total) {
+    temp[0] = rk[n - 4]
+    temp[1] = rk[n - 3]
+    temp[2] = rk[n - 2]
+    temp[3] = rk[n - 1]
+
+    let pos = n % nk4
+    if (pos == 0) {
+      // RotWord, then SubWord, then XOR the round constant into byte 0.
+      let t = temp[0]
+      temp[0] = sbox(temp[1]) ^ rcon
+      temp[1] = sbox(temp[2])
+      temp[2] = sbox(temp[3])
+      temp[3] = sbox(t)
+      rcon = xtime(rcon)
+    } else if (nk > 6 && pos == 16) {
+      // 256-bit keys apply an extra SubWord at the word four in from the core.
+      temp[0] = sbox(temp[0])
+      temp[1] = sbox(temp[1])
+      temp[2] = sbox(temp[2])
+      temp[3] = sbox(temp[3])
+    }
+
+    let base = n - nk4
+    let j = 0
+    while (j < 4) {
+      rk[n] = rk[base + j] ^ temp[j]
+      n = n + 1
+      j = j + 1
+    }
+  }
+  return rk
+}
+
+// XOR the 16 bytes of round key `round` into the state, in place (AddRoundKey).
+function addRoundKey(s: []byte, rk: []byte, round: int) {
+  let off = round * 16
+  let i = 0
+  while (i < 16) {
+    s[i] = s[i] ^ rk[off + i]
+    i = i + 1
+  }
+}
+
+// SubBytes / InvSubBytes: apply the S-box (or its inverse) to all 16 bytes.
+function subBytes(s: []byte) {
+  let i = 0
+  while (i < 16) {
+    s[i] = sbox(s[i])
+    i = i + 1
+  }
+}
+
+function invSubBytes(s: []byte) {
+  let i = 0
+  while (i < 16) {
+    s[i] = invSbox(s[i])
+    i = i + 1
+  }
+}
+
+// ShiftRows: cyclically left-shift row r by r bytes. The state is column-major
+// (byte 4*c+r is row r, column c), so row r lives at indices r, r+4, r+8, r+12.
+function shiftRows(s: []byte) {
+  let t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t
+  t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t
+  t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t
+}
+
+// InvShiftRows: cyclically right-shift row r by r bytes (undoes ShiftRows).
+function invShiftRows(s: []byte) {
+  let t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t
+  t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t
+  t = s[3]; s[3] = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = t
+}
+
+// MixColumns: multiply each column by the fixed matrix [2 3 1 1 / 1 2 3 1 /
+// 1 1 2 3 / 3 1 1 2] over GF(2^8). 2*x is xtime(x); 3*x is xtime(x) ^ x.
+function mixColumns(s: []byte) {
+  let c = 0
+  while (c < 4) {
+    let i = c * 4
+    let a0 = s[i]
+    let a1 = s[i + 1]
+    let a2 = s[i + 2]
+    let a3 = s[i + 3]
+    s[i] = xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3
+    s[i + 1] = a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3
+    s[i + 2] = a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3)
+    s[i + 3] = (xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3)
+    c = c + 1
+  }
+}
+
+// InvMixColumns: multiply each column by the inverse matrix [14 11 13 9 / ...].
+function invMixColumns(s: []byte) {
+  let c = 0
+  while (c < 4) {
+    let i = c * 4
+    let a0 = s[i]
+    let a1 = s[i + 1]
+    let a2 = s[i + 2]
+    let a3 = s[i + 3]
+    s[i] = mul14(a0) ^ mul11(a1) ^ mul13(a2) ^ mul9(a3)
+    s[i + 1] = mul9(a0) ^ mul14(a1) ^ mul11(a2) ^ mul13(a3)
+    s[i + 2] = mul13(a0) ^ mul9(a1) ^ mul14(a2) ^ mul11(a3)
+    s[i + 3] = mul11(a0) ^ mul13(a1) ^ mul9(a2) ^ mul14(a3)
+    c = c + 1
+  }
+}
+
+// A key-scheduled AES cipher. `roundKeys` is the flattened schedule (16*(nr+1)
+// bytes) and `nr` the round count (10, 12, or 14). Build one with `newAes`, not
+// a struct literal — the constructor validates the key length and expands the
+// schedule. One value ciphers any number of blocks.
+export struct AesCipher {
+  roundKeys: []byte
+  nr: int
+}
+
+// Build an AES cipher from `key`, whose length selects the variant: 16 bytes
+// (AES-128), 24 (AES-192), or 32 (AES-256). Fails on any other length. The key
+// schedule is expanded once here and reused by every `encryptBlock`/
+// `decryptBlock` call.
+export function newAes(key: []byte): AesCipher! {
+  let n = len(key)
+  if (n == 16) { return AesCipher{ roundKeys: expandKey(key, 4, 10), nr: 10 } }
+  if (n == 24) { return AesCipher{ roundKeys: expandKey(key, 6, 12), nr: 12 } }
+  if (n == 32) { return AesCipher{ roundKeys: expandKey(key, 8, 14), nr: 14 } }
+  fail newError("newAes: key must be 16, 24, or 32 bytes, got ${n}")
+}
+
+// Encipher one 16-byte `block`, returning a fresh 16-byte ciphertext block. The
+// input must be exactly 16 bytes. This is the bare block permutation with no
+// chaining — use a mode of operation for multi-block messages.
+export function (c: AesCipher) encryptBlock(block: []byte): []byte {
+  assert(len(block) == 16, "aes.encryptBlock: block must be 16 bytes")
+  let s = []byte(16)
+  let i = 0
+  while (i < 16) {
+    s[i] = block[i]
+    i = i + 1
+  }
+
+  addRoundKey(s, c.roundKeys, 0)
+  let round = 1
+  while (round < c.nr) {
+    subBytes(s)
+    shiftRows(s)
+    mixColumns(s)
+    addRoundKey(s, c.roundKeys, round)
+    round = round + 1
+  }
+  // The last round omits MixColumns.
+  subBytes(s)
+  shiftRows(s)
+  addRoundKey(s, c.roundKeys, c.nr)
+  return s
+}
+
+// Decipher one 16-byte `block`, returning a fresh 16-byte plaintext block. The
+// inverse of `encryptBlock` under the same key: `decryptBlock(encryptBlock(b))`
+// == b. The input must be exactly 16 bytes.
+export function (c: AesCipher) decryptBlock(block: []byte): []byte {
+  assert(len(block) == 16, "aes.decryptBlock: block must be 16 bytes")
+  let s = []byte(16)
+  let i = 0
+  while (i < 16) {
+    s[i] = block[i]
+    i = i + 1
+  }
+
+  addRoundKey(s, c.roundKeys, c.nr)
+  let round = c.nr - 1
+  while (round > 0) {
+    invShiftRows(s)
+    invSubBytes(s)
+    addRoundKey(s, c.roundKeys, round)
+    invMixColumns(s)
+    round = round - 1
+  }
+  // The last (first, in decryption order) round omits InvMixColumns.
+  invShiftRows(s)
+  invSubBytes(s)
+  addRoundKey(s, c.roundKeys, 0)
+  return s
+}
