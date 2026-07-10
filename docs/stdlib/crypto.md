@@ -193,3 +193,60 @@ Like `encodeHex`, but with uppercase digits (`0-9A-F`).
 The bytes `s` spells in hex, high nibble first. Case-insensitive. Fails if `s`
 has an odd length or contains any character outside `[0-9a-fA-F]`, so it is the
 exact inverse of `encodeHex`/`encodeHexUpper` on well-formed input.
+
+## SHA-512 family
+
+The 64-bit SHA-2 hashes from FIPS 180-4: SHA-512, SHA-384, and SHA-512/256. All
+three share one compression function over a 128-byte block and differ only in
+their initial value and how much of the final state they keep, so they cost the
+same and behave identically through the `Hash` interface. Each constructor
+returns a fresh `Hash`, so everything in the Hashing section applies: stream with
+`write` then read with `sum`, or hash a single buffer with `digest`. `sum` is
+non-destructive, so a value can be read and then written to further.
+
+SHA-512/256 is not SHA-512 truncated to 32 bytes: it uses a distinct initial
+value (FIPS 180-4 §5.3.6), which makes it a different function that happens to
+share the engine. Prefer it over SHA-256 on 64-bit hardware, where it is faster.
+
+```bit
+import { digest, newSha512, newSha384, newSha512_256, encodeHex } from "std/crypto"
+
+// One-shot: hash a whole buffer and render the digest as lowercase hex.
+function sha512Hex(data: []byte): string {
+  return encodeHex(digest(newSha512(), data))
+}
+
+// The shorter digests share the exact same call shape.
+function sha384Hex(data: []byte): string {
+  return encodeHex(digest(newSha384(), data))
+}
+
+function sha512_256Hex(data: []byte): string {
+  return encodeHex(digest(newSha512_256(), data))
+}
+
+// Streaming: absorb a message across as many `write`s as you like, read once.
+function fingerprint(head: []byte, tail: []byte): string {
+  let h = newSha512()
+  h.write(head)
+  h.write(tail)
+  return encodeHex(h.sum())
+}
+```
+
+### `newSha512(): Hash`
+
+A new SHA-512 hasher: a 64-byte (512-bit) digest computed over 128-byte blocks.
+The strongest and, on 64-bit hardware, typically the fastest SHA-2 variant.
+
+### `newSha384(): Hash`
+
+A new SHA-384 hasher: a 48-byte (384-bit) digest, the SHA-512 engine with a
+different initial value and the last two output words dropped. Its truncation
+also makes it resistant to the length-extension attack that SHA-512 admits.
+
+### `newSha512_256(): Hash`
+
+A new SHA-512/256 hasher: a 32-byte (256-bit) digest from the SHA-512 engine
+with the FIPS 180-4 §5.3.6 initial value. A drop-in 256-bit hash that is not
+SHA-256 and, on 64-bit hardware, outruns it.
