@@ -149,3 +149,47 @@ function rollDie(): uint {
   return randomUintBelow(6) + 1
 }
 ```
+
+## Hex encoding
+
+Byte-slice <-> hex-string conversion. Each byte is two hex digits, high nibble
+first, so `n` bytes become a `2n`-character string. Encoding never fails;
+decoding does, on an odd length or a non-hex digit, so a malformed string is a
+handled error rather than silent garbage.
+
+```bit
+import { encodeHex, encodeHexUpper, decodeHex } from "std/crypto"
+
+// Lowercase hex, e.g. a hash or key rendered for logs.
+function fingerprint(raw: []byte): string {
+  return encodeHex(raw)
+}
+
+// Uppercase hex, for formats that expect it.
+function shout(raw: []byte): string {
+  return encodeHexUpper(raw)
+}
+
+// Parse hex back to bytes, handling a malformed string at the call site.
+function parse(s: string): []byte {
+  return decodeHex(s) catch e {
+    println("bad hex: ${e.message()}")
+    return []byte(0)
+  }
+}
+```
+
+### `encodeHex(b: []byte): string`
+
+`b` rendered as lowercase hex (`0-9a-f`), high nibble first. An empty slice
+yields `""`. Never fails.
+
+### `encodeHexUpper(b: []byte): string`
+
+Like `encodeHex`, but with uppercase digits (`0-9A-F`).
+
+### `decodeHex(s: string): []byte!`
+
+The bytes `s` spells in hex, high nibble first. Case-insensitive. Fails if `s`
+has an odd length or contains any character outside `[0-9a-fA-F]`, so it is the
+exact inverse of `encodeHex`/`encodeHexUpper` on well-formed input.
