@@ -122,10 +122,14 @@ fn addrIn(ip: [4]u8, port: u16) posix.sockaddr.in {
 
 /// The dotted-quad of a `sockaddr.in`'s address, written into `buf` (which must
 /// hold the longest form, "255.255.255.255" = 15 bytes). Returns the slice used.
-/// Hand-rolled for the same reason as `parseIpv4`: no `std.fmt` dependency on a
-/// freestanding hot path.
 pub fn formatIpv4(sa: *const posix.sockaddr.in, buf: *[15]u8) []const u8 {
-    const octets: [4]u8 = @bitCast(sa.addr);
+    return formatOctets(@bitCast(sa.addr), buf);
+}
+
+/// The dotted-quad of four address octets, written into `buf`. Hand-rolled for
+/// the same reason as `parseIpv4`: no `std.fmt` dependency on a freestanding hot
+/// path.
+pub fn formatOctets(octets: [4]u8, buf: *[15]u8) []const u8 {
     var n: usize = 0;
     for (octets, 0..) |o, i| {
         if (i != 0) {
@@ -477,6 +481,245 @@ pub fn recvFrom(fd: fd_t, buf: []u8, from: *posix.sockaddr.in) Error!usize {
         return Error.Io;
     }
     return Error.Io;
+}
+
+// ---------------------------------------------------------------------------
+// DNS (A-record resolution)
+// ---------------------------------------------------------------------------
+//
+// A minimal stub resolver: one A query to the first nameserver in
+// /etc/resolv.conf over UDP/53, returning the first A record. No search domains,
+// no caching, no AAAA, no TCP fallback for truncated replies — a hostname that
+// needs any of those is out of scope for v1.
+//
+// ponytail: blocking socket with SO_RCVTIMEO + bounded retransmits, not the
+// netpoller. It blocks the calling worker for up to `dns_timeout_ms` on a lost
+// packet. DNS is an occasional, usually-millisecond cost, so this buys
+// correctness (no hang, a real error on failure) without timer-driven poller
+// wakes; move it onto the poller if resolution ever sits on a hot path.
+
+const dns_timeout_ms = 2000;
+const dns_retries = 3;
+
+fn firstNameserver(buf: *[4]u8) Error!void {
+    const fd = sched.openFd("/etc/resolv.conf", .read) catch return Error.Io;
+    defer sched.closeFd(fd);
+    var file: [4096]u8 = undefined;
+    const n = sched.readFd(fd, &file) catch return Error.Io;
+    var lines = std.mem.splitScalar(u8, file[0..n], '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const key = "nameserver";
+        if (!std.mem.startsWith(u8, trimmed, key)) continue;
+        const rest = std.mem.trim(u8, trimmed[key.len..], " \t");
+        if (parseIpv4(rest)) |ip| {
+            buf.* = ip;
+            return;
+        }
+    }
+    return Error.BadAddress; // no usable nameserver line
+}
+
+/// Writes a DNS A-record query for `host` into `out` and returns the length. The
+/// QNAME is `host` split on '.', each label length-prefixed, NUL-terminated.
+fn buildQuery(out: []u8, host: []const u8, id: u16) Error!usize {
+    if (host.len == 0 or host.len > 253) return Error.BadAddress;
+    var n: usize = 0;
+    // Header: id, flags=RD, qd=1, an=ns=ar=0.
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x0100, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    @memset(out[6..12], 0);
+    n = 12;
+    // QNAME.
+    var labels = std.mem.splitScalar(u8, host, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63) return Error.BadAddress;
+        if (n + 1 + label.len + 5 > out.len) return Error.BadAddress;
+        out[n] = @intCast(label.len);
+        n += 1;
+        @memcpy(out[n..][0..label.len], label);
+        n += label.len;
+    }
+    out[n] = 0; // root label
+    n += 1;
+    std.mem.writeInt(u16, out[n..][0..2], 1, .big); // QTYPE = A
+    std.mem.writeInt(u16, out[n + 2 ..][0..2], 1, .big); // QCLASS = IN
+    return n + 4;
+}
+
+/// Advances past a DNS name at `msg[off]`, following the length-prefix labels
+/// and stopping at the root label or a compression pointer (0xC0). Returns the
+/// offset just past the name. Compression is only *skipped* here, never
+/// followed — the caller does not need the name's text, only its length.
+fn skipName(msg: []const u8, off: usize) Error!usize {
+    var i = off;
+    while (i < msg.len) {
+        const len = msg[i];
+        if (len == 0) return i + 1;
+        if (len & 0xC0 == 0xC0) return i + 2; // pointer: 2 bytes, name ends here
+        i += 1 + len;
+    }
+    return Error.Io; // ran off the end
+}
+
+/// Parses a DNS response and writes the first A record into `out`. Verifies the
+/// transaction id and a non-error RCODE, skips the question, then walks answers.
+fn parseAnswer(msg: []const u8, want_id: u16, out: *[4]u8) Error!void {
+    if (msg.len < 12) return Error.Io;
+    if (std.mem.readInt(u16, msg[0..2], .big) != want_id) return Error.Io;
+    const flags = std.mem.readInt(u16, msg[2..4], .big);
+    if (flags & 0x000F != 0) return Error.Io; // RCODE != 0 (NXDOMAIN, SERVFAIL, …)
+    const qd = std.mem.readInt(u16, msg[4..6], .big);
+    const an = std.mem.readInt(u16, msg[6..8], .big);
+
+    var off: usize = 12;
+    var q: usize = 0;
+    while (q < qd) : (q += 1) {
+        off = try skipName(msg, off);
+        off += 4; // QTYPE + QCLASS
+    }
+    var a: usize = 0;
+    while (a < an) : (a += 1) {
+        off = try skipName(msg, off);
+        if (off + 10 > msg.len) return Error.Io;
+        const rtype = std.mem.readInt(u16, msg[off..][0..2], .big);
+        const rdlen = std.mem.readInt(u16, msg[off + 8 ..][0..2], .big);
+        off += 10;
+        if (off + rdlen > msg.len) return Error.Io;
+        if (rtype == 1 and rdlen == 4) {
+            out.* = msg[off..][0..4].*;
+            return;
+        }
+        off += rdlen;
+    }
+    return Error.Io; // no A record in the answer
+}
+
+fn dnsSocket() Error!fd_t {
+    // Blocking on purpose (see the section note): a bounded SO_RCVTIMEO gives a
+    // real timeout without poller machinery.
+    const fd = if (is_linux) blk: {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        if (posix.errno(rc) != .SUCCESS) return Error.Socket;
+        break :blk @as(fd_t, @intCast(rc));
+    } else blk: {
+        const rc = std.c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        if (rc < 0) return Error.Socket;
+        break :blk rc;
+    };
+    errdefer sched.closeFd(fd);
+    const tv: posix.timeval = .{ .sec = dns_timeout_ms / 1000, .usec = (dns_timeout_ms % 1000) * 1000 };
+    const tvb = std.mem.asBytes(&tv);
+    if (is_linux) {
+        if (posix.errno(linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, tvb.ptr, tvb.len)) != .SUCCESS) return Error.Socket;
+    } else {
+        if (std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, tvb.ptr, tvb.len) < 0) return Error.Socket;
+    }
+    return fd;
+}
+
+/// Resolves `host` to an IPv4 address. A dotted quad passes straight through; a
+/// hostname is looked up via the first nameserver in /etc/resolv.conf.
+pub fn resolve(host: []const u8) Error![4]u8 {
+    if (parseIpv4(host)) |ip| return ip;
+
+    var ns: [4]u8 = undefined;
+    try firstNameserver(&ns);
+
+    // A fixed transaction id is fine: the socket is connectionless and used for
+    // exactly one exchange, so there is nothing to correlate against.
+    const id: u16 = 0x1B17;
+    var query: [512]u8 = undefined;
+    const qlen = try buildQuery(&query, host, id);
+
+    const fd = try dnsSocket();
+    defer sched.closeFd(fd);
+
+    const sa = addrIn(ns, 53);
+    const salen: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    var attempt: u32 = 0;
+    while (attempt < dns_retries) : (attempt += 1) {
+        const sent = if (is_linux)
+            linux.sendto(fd, &query, qlen, 0, @ptrCast(&sa), salen)
+        else
+            @as(usize, @bitCast(std.c.sendto(fd, &query, qlen, 0, @ptrCast(&sa), salen)));
+        if ((if (is_linux) posix.errno(sent) else posix.errno(@as(isize, @bitCast(sent)))) != .SUCCESS) continue;
+
+        var reply: [512]u8 = undefined;
+        const got = if (is_linux)
+            linux.recvfrom(fd, &reply, reply.len, 0, null, null)
+        else
+            @as(usize, @bitCast(std.c.recvfrom(fd, &reply, reply.len, 0, null, null)));
+        const e = if (is_linux) posix.errno(got) else posix.errno(@as(isize, @bitCast(got)));
+        if (e == .AGAIN or e == .INTR) continue; // timed out or interrupted: retransmit
+        if (e != .SUCCESS) return Error.Io;
+        const n = if (is_linux) got else @as(usize, @bitCast(got));
+
+        var out: [4]u8 = undefined;
+        parseAnswer(reply[0..n], id, &out) catch continue; // malformed/no-answer: retry
+        return out;
+    }
+    return Error.Io;
+}
+
+test "buildQuery encodes header and QNAME" {
+    var buf: [512]u8 = undefined;
+    const n = try buildQuery(&buf, "a.bc", 0x1234);
+    // 12 header + [1]'a'[2]'b''c'[0] (6) + QTYPE+QCLASS (4) = 22
+    try std.testing.expectEqual(@as(usize, 22), n);
+    try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, buf[0..2], .big));
+    try std.testing.expectEqual(@as(u16, 0x0100), std.mem.readInt(u16, buf[2..4], .big));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 'a', 2, 'b', 'c', 0 }, buf[12..18]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, buf[18..20], .big)); // A
+}
+
+test "parseAnswer extracts the first A record past a compressed name" {
+    const id: u16 = 0xABCD;
+    // Header: id, flags RD+RA rcode 0, qd=1, an=1.
+    var msg = [_]u8{0} ** 64;
+    std.mem.writeInt(u16, msg[0..2], id, .big);
+    std.mem.writeInt(u16, msg[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, msg[4..6], 1, .big);
+    std.mem.writeInt(u16, msg[6..8], 1, .big);
+    // Question at 12: "x" root, A, IN.
+    var o: usize = 12;
+    msg[o] = 1;
+    msg[o + 1] = 'x';
+    msg[o + 2] = 0;
+    o += 3;
+    std.mem.writeInt(u16, msg[o..][0..2], 1, .big);
+    std.mem.writeInt(u16, msg[o + 2 ..][0..2], 1, .big);
+    o += 4;
+    // Answer: compressed name (ptr to 12), type A, class IN, ttl, rdlen 4, 1.2.3.4.
+    msg[o] = 0xC0;
+    msg[o + 1] = 12;
+    o += 2;
+    std.mem.writeInt(u16, msg[o..][0..2], 1, .big); // A
+    std.mem.writeInt(u16, msg[o + 2 ..][0..2], 1, .big); // IN
+    std.mem.writeInt(u32, msg[o + 4 ..][0..4], 300, .big); // TTL
+    std.mem.writeInt(u16, msg[o + 8 ..][0..2], 4, .big); // RDLENGTH
+    o += 10;
+    msg[o] = 1;
+    msg[o + 1] = 2;
+    msg[o + 2] = 3;
+    msg[o + 3] = 4;
+    o += 4;
+
+    var out: [4]u8 = undefined;
+    try parseAnswer(msg[0..o], id, &out);
+    try std.testing.expectEqual([4]u8{ 1, 2, 3, 4 }, out);
+}
+
+test "parseAnswer rejects a mismatched id and a SERVFAIL rcode" {
+    var msg = [_]u8{0} ** 12;
+    std.mem.writeInt(u16, msg[0..2], 0x1111, .big);
+    std.mem.writeInt(u16, msg[4..6], 0, .big);
+    var out: [4]u8 = undefined;
+    try std.testing.expectError(Error.Io, parseAnswer(&msg, 0x2222, &out)); // id mismatch
+    std.mem.writeInt(u16, msg[0..2], 0x2222, .big);
+    std.mem.writeInt(u16, msg[2..4], 0x8182, .big); // rcode 2 = SERVFAIL
+    try std.testing.expectError(Error.Io, parseAnswer(&msg, 0x2222, &out));
 }
 
 test "formatIpv4 round-trips parseIpv4" {

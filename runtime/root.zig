@@ -771,6 +771,15 @@ export fn bit_rt_net_udp_sender_port() callconv(.c) i64 {
     return udp_last_sender.port;
 }
 
+/// `bit_rt_net_resolve`: the first IPv4 A-record for `host` as a dotted quad, or
+/// `""` on failure. A dotted-quad `host` passes straight back. Uses the first
+/// nameserver in /etc/resolv.conf (ABI.md §20).
+export fn bit_rt_net_resolve(host: *const RtBytes) callconv(.c) *const RtBytes {
+    const ip = net.resolve(hostBytes(host)) catch return stringFromBytes("");
+    var buf: [15]u8 = undefined;
+    return stringFromBytes(net.formatOctets(ip, &buf));
+}
+
 // ---------------------------------------------------------------------------
 // Math (ABI.md §17) — the low-level layer under `std/math`
 // ---------------------------------------------------------------------------

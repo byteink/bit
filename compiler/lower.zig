@@ -2188,6 +2188,7 @@ const FnCtx = struct {
         .{ "netUdpRecv", ir.RtFn.net_udp_recv },
         .{ "netUdpSenderHost", ir.RtFn.net_udp_sender_host },
         .{ "netUdpSenderPort", ir.RtFn.net_udp_sender_port },
+        .{ "netResolve", ir.RtFn.net_resolve },
         .{ "fsqrt", ir.RtFn.sqrt },
         .{ "ffloor", ir.RtFn.floor },
         .{ "fceil", ir.RtFn.ceil },

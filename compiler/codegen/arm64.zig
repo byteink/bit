@@ -1363,6 +1363,7 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .net_udp_recv => "bit_rt_net_udp_recv",
         .net_udp_sender_host => "bit_rt_net_udp_sender_host",
         .net_udp_sender_port => "bit_rt_net_udp_sender_port",
+        .net_resolve => "bit_rt_net_resolve",
         .test_index => "bit_rt_test_index",
         .floor => "bit_rt_floor",
         .ceil => "bit_rt_ceil",

@@ -176,6 +176,7 @@ pub const RtFn = enum {
     net_udp_recv,
     net_udp_sender_host,
     net_udp_sender_port,
+    net_resolve,
     /// `() -> i64`: which test this process should run (`BIT_TEST_INDEX`, or -1).
     /// Only ever emitted into the synthetic `main` that `compiler/testgen.zig`
     /// appends under `bit test` (ABI.md §16).

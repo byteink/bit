@@ -2554,6 +2554,7 @@ const Checker = struct {
         .{ "netUdpRecv", PrimSig{ .params = &.{ .i64, .i64 }, .ret = .string } },
         .{ "netUdpSenderHost", PrimSig{ .params = &.{}, .ret = .string } },
         .{ "netUdpSenderPort", PrimSig{ .params = &.{}, .ret = .i64 } },
+        .{ "netResolve", PrimSig{ .params = &.{.string}, .ret = .string } },
         // Math (ABI.md §17) — under std/math.
         .{ "fsqrt", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
         .{ "ffloor", PrimSig{ .params = &.{.f64}, .ret = .f64 } },

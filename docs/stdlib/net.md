@@ -183,3 +183,21 @@ function echo(s: UdpSocket, n: int): ()! {
   s.close()
 }
 ```
+
+## Name resolution
+
+### `resolve(host: string): string!`
+
+Resolves a hostname to an IPv4 address (a dotted quad), using the first
+nameserver in `/etc/resolv.conf`. A dotted-quad argument comes back unchanged, so
+it is safe on an address that may already be numeric. A records only — no IPv6,
+no search domains, no caching. `dial` and `udpBind` take numeric addresses, so
+resolve first:
+
+```bit
+import { dial, resolve, Conn } from "std/net"
+
+function connectByName(host: string, port: int): Conn! {
+  return dial(resolve(host)?, port)?
+}
+```
