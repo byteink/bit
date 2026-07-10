@@ -243,16 +243,22 @@ const DeferredCall = union(enum) {
     }
 };
 
+/// `params` is the callee's declared parameter types (the *explicit* ones, so
+/// a `direct_method`'s implicit receiver is excluded). `lowerCall` hints each
+/// argument with its parameter type so an untyped literal (`rotr32(x, 4)`)
+/// materializes at the parameter's type rather than its own default — see
+/// `lowerSpawn` for the same reasoning; without it the inliner fuses a
+/// mistyped argument into the callee's body and IR verification rejects it.
 const CallTarget = union(enum) {
-    direct: struct { func: ir.FuncId, result: TypeId },
+    direct: struct { func: ir.FuncId, result: TypeId, params: []const TypeId },
     /// A struct method (static dispatch): `recv` is prepended to the user
     /// args as the callee's own leading parameter.
-    direct_method: struct { func: ir.FuncId, recv: ir.ValueId, result: TypeId },
-    iface: struct { recv: ir.ValueId, method_index: u32, result: TypeId },
-    value: struct { callee: ir.ValueId, result: TypeId },
+    direct_method: struct { func: ir.FuncId, recv: ir.ValueId, result: TypeId, params: []const TypeId },
+    iface: struct { recv: ir.ValueId, method_index: u32, result: TypeId, params: []const TypeId },
+    value: struct { callee: ir.ValueId, result: TypeId, params: []const TypeId },
 };
 
-const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, result: TypeId };
+const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, result: TypeId, params: []const TypeId };
 
 // ============================================================================
 // Lowerer — module-level driver and shared tables
@@ -730,7 +736,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
                 const bucket = ctx.methodsOf(recv_ty) orelse continue;
                 const method = bucket.get(name) orelse continue;
                 const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
-                try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result });
+                try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result, .params = method.params });
                 try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .ty = recv_ty, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
             }
         }
@@ -2067,7 +2073,7 @@ const FnCtx = struct {
             const inst = self.ctx.instantiations.items[idx];
             const shape = self.ctx.typeOf(inst.result).func;
             const fid = self.l.inst_ids.get(idx).?;
-            return .{ .direct = .{ .func = fid, .result = shape.result } };
+            return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params } };
         }
 
         const callee_tag = self.tree().get(callee).tag;
@@ -2077,7 +2083,7 @@ const FnCtx = struct {
                 if (sym.kind == .func) {
                     const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
                     const shape = self.ctx.func_sigs.get(gsym.pack()).?;
-                    return .{ .direct = .{ .func = fid, .result = shape.result } };
+                    return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params } };
                 }
             }
         }
@@ -2089,7 +2095,7 @@ const FnCtx = struct {
                 if (self.l.symbolOf(gsym).kind == .func) {
                     const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
                     const shape = self.ctx.func_sigs.get(gsym.pack()).?;
-                    return .{ .direct = .{ .func = fid, .result = shape.result } };
+                    return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params } };
                 }
             }
             const k = self.kids(callee); // [recv, name]
@@ -2100,7 +2106,7 @@ const FnCtx = struct {
                 for (data.interface) |m| {
                     if (!std.mem.eql(u8, m.name, name)) continue;
                     const recv_val = try self.lowerExpr(k[0]);
-                    return .{ .iface = .{ .recv = recv_val, .method_index = try self.l.methodId(m.name), .result = m.result } };
+                    return .{ .iface = .{ .recv = recv_val, .method_index = try self.l.methodId(m.name), .result = m.result, .params = m.params } };
                 }
                 return error.UnsupportedConstruct;
             }
@@ -2115,11 +2121,11 @@ const FnCtx = struct {
                     };
                     const fv = try self.b.fieldGet(f.ty, recv_val, off);
                     const fshape = self.ctx.typeOf(f.ty).func;
-                    return .{ .value = .{ .callee = fv, .result = fshape.result } };
+                    return .{ .value = .{ .callee = fv, .result = fshape.result, .params = fshape.params } };
                 }
                 if (self.l.lookupMethod(recv_ty, name)) |entry| {
                     const recv_val = try self.lowerExpr(k[0]);
-                    return .{ .direct_method = .{ .func = entry.fid, .recv = recv_val, .result = entry.result } };
+                    return .{ .direct_method = .{ .func = entry.fid, .recv = recv_val, .result = entry.result, .params = entry.params } };
                 }
             }
             return error.UnsupportedConstruct;
@@ -2128,7 +2134,7 @@ const FnCtx = struct {
         const callee_val = try self.lowerExpr(callee);
         const callee_ty = try self.nodeType(callee);
         const shape = self.ctx.typeOf(callee_ty).func;
-        return .{ .value = .{ .callee = callee_val, .result = shape.result } };
+        return .{ .value = .{ .callee = callee_val, .result = shape.result, .params = shape.params } };
     }
 
     fn lowerArgs(self: *FnCtx, args_node: ast.Index) Error![]ir.ValueId {
@@ -2345,12 +2351,20 @@ const FnCtx = struct {
             if (self.isEnumTypeRef(mk[0])) return self.lowerVariantConstruction(node);
         }
         const target = try self.resolveCallTarget(node, callee);
+        const params: []const TypeId = switch (target) {
+            inline else => |t| t.params,
+        };
         var args: std.ArrayList(ir.ValueId) = .empty;
         defer args.deinit(self.gpa);
         if (target == .direct_method) try args.append(self.gpa, target.direct_method.recv);
-        for (self.kids(k[2])) |an| {
+        // Hint each explicit argument with its parameter type so an untyped
+        // literal materializes at the callee's declared type, not its own
+        // default (see `CallTarget.params`). A variadic tail runs past the
+        // declared params and is lowered unhinted.
+        for (self.kids(k[2]), 0..) |an, i| {
             if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct;
-            try args.append(self.gpa, try self.lowerExpr(self.kids(an)[0]));
+            const hint: ?TypeId = if (i < params.len) params[i] else null;
+            try args.append(self.gpa, try self.lowerExprH(self.kids(an)[0], hint));
         }
         // A fallible callee delivers its ok value in the normal return register
         // (the error rides the runtime slot — §18), so the call instruction's
