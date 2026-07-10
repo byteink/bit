@@ -451,6 +451,18 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_os_arg_at`    | `(i: i64) -> *const RtBytes` (§19)                     |
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
+| `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
+| `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
+| `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
+| `bit_rt_net_dial`     | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
+| `bit_rt_net_read`     | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
+| `bit_rt_net_write`    | `(fd: i64, s: *const RtBytes) -> i64` (§20)            |
+| `bit_rt_net_udp_bind` | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
+| `bit_rt_net_udp_send` | `(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) -> i64` (§20) |
+| `bit_rt_net_udp_recv` | `(fd: i64, max: i64) -> *const RtBytes` (§20)          |
+| `bit_rt_net_udp_sender_host` | `() -> *const RtBytes` (§20)                    |
+| `bit_rt_net_udp_sender_port` | `() -> i64` (§20)                               |
+| `bit_rt_net_resolve`  | `(host: *const RtBytes) -> *const RtBytes` (§20)       |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -808,3 +820,45 @@ bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 `argc`/`argv` are captured by the process entry (§9) on both the raw-stack Linux
 path and the Darwin `machoMain` path; `boot` captures the environment block.
 Bit has no nil string, so an unset variable and one set to `""` both read empty.
+
+---
+
+## 20. Networking (`runtime/net.zig` + `runtime/root.zig`)
+
+The low-level layer under `std/net`/`std/http`. Every socket is `O_NONBLOCK`; an
+operation that would block registers its fd with the netpoller (§11) and parks
+the calling green thread rather than blocking an OS thread. Addresses are
+dotted-quad IPv4 literals — a socket is closed by `bit_rt_fs_close`.
+
+```
+bit_rt_net_listen(host, port)   -> fd    // TCP listener; port 0 = kernel picks. -1 on error
+bit_rt_net_local_port(fd)       -> port  // the bound port (recovers a port-0 choice). -1 on error
+bit_rt_net_accept(fd)           -> fd    // next connection; parks. -1 on error
+bit_rt_net_dial(host, port)     -> fd    // connected socket; parks past the handshake. -1 on error
+bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of stream OR on error
+bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
+```
+
+**UDP** (connectionless). `recv` records the sender in a per-goroutine
+threadlocal, read back by the two accessors with no intervening park — the same
+goroutine-correctness argument as the error slot (§13). A failed `recv` returns
+`""` with `sender_port` `-1`, which is how it is told from a legitimate
+zero-length datagram (whose sender port is `0..65535`).
+
+```
+bit_rt_net_udp_bind(host, port)         -> fd    // datagram socket; port 0 = kernel picks. -1 on error
+bit_rt_net_udp_send(fd, host, port, s)  -> n     // one datagram (all-or-nothing). -1 on error
+bit_rt_net_udp_recv(fd, max)            -> str   // next datagram; parks. records the sender
+bit_rt_net_udp_sender_host()            -> str   // last recv's sender ip, or "" on error
+bit_rt_net_udp_sender_port()            -> port  // last recv's sender port, or -1 on error
+```
+
+**DNS.** `resolve` returns the first A record for `host` as a dotted quad, or `""`
+on failure; a dotted-quad `host` passes straight back. Unlike the socket calls it
+uses a **blocking** UDP socket with `SO_RCVTIMEO` and bounded retransmits, not the
+netpoller — it blocks the calling worker for up to ~2s on a lost packet, the
+right trade for an occasional lookup (see the note in `net.zig`).
+
+```
+bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on failure
+```
