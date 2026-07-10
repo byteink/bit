@@ -282,21 +282,30 @@ pub fn atomizeModule(
     const atom_of_symbol = try gpa.alloc(u32, symbols.len);
     defer gpa.free(atom_of_symbol);
 
-    // The single anonymous atom of each symbol-less section (e.g. `.data`,
-    // `.rodata.str1.1`, `.text.unlikely.` in a real ELF object), by section
-    // index — how a relocation owned by or targeting such a section finds its
-    // atom, since there is no symbol to cover the offset. `null` for sections
-    // that have symbols (their bytes belong to per-symbol atoms) or are empty.
+    // The anonymous atom holding each section's *leading* symbol-less region,
+    // by section index — how a relocation owned by or targeting those bytes
+    // finds its atom, since no symbol covers them. Spans the whole section when
+    // the section has no symbols at all (`.data`, `.rodata.str1.1`,
+    // `.text.unlikely.` in a real ELF object); spans `[0, first symbol offset)`
+    // when the first symbol starts past the section base. `null` only when a
+    // symbol already sits at offset 0, leaving no leading region.
     const section_anon = try gpa.alloc(?u32, sections.len);
     defer gpa.free(section_anon);
     @memset(section_anon, null);
 
     for (sections, 0..) |section, sec_idx| {
         const order = per_section_order[sec_idx].items;
-        if (order.len == 0) {
-            // A symbol-less section still gets one anonymous atom so a
-            // relocation targeting it (via its section symbol) resolves to its
-            // address — including a *size-0* section, e.g. AArch64's empty
+        // Bytes before the section's first symbol belong to no symbol, so the
+        // per-symbol loop below would drop them and any relocation into them
+        // would resolve against the first symbol's atom with a *negative*
+        // addend — pointing outside that atom, at whatever layout happened to
+        // place before it. An AArch64 literal pool is exactly this shape: Zig
+        // emits `.rodata.cst8` whose `$d` mapping symbols are excluded
+        // (`elf_reader.isMappingSymbol`) and whose only real symbol is a named
+        // constant partway in. Give the region its own atom.
+        const leading: u64 = if (order.len == 0) section.size else symbols[order[0]].offset;
+        if (order.len == 0 or leading > 0) {
+            // Also covers a *size-0* section, e.g. AArch64's empty
             // `unreachable`-bodied Allocator vtable stubs, whose address a
             // vtable's `abs64` pointer needs even though the body is empty. The
             // atom dead-strips if nothing references it.
@@ -305,16 +314,16 @@ pub fn atomizeModule(
                 .name = section.name,
                 .kind = section.kind,
                 .binding = .local,
-                .data = if (section.kind.isBss()) &.{} else section.data,
-                .size = @intCast(section.size),
+                .data = if (section.kind.isBss()) &.{} else section.data[0..@min(leading, section.data.len)],
+                .size = @intCast(leading),
                 // The section's own alignment: there is no symbol to inherit
                 // one from, and an AArch64 literal pool loaded with `ldr q0`
                 // faults if it lands under-aligned.
                 .alignment = section.alignment,
                 .relocs = &.{},
             });
-            continue;
         }
+        if (order.len == 0) continue;
         // Walk `order` (sorted by offset) one offset-group at a time. Symbols
         // sharing an offset are aliases → one atom; the group spans until the
         // next distinct offset, which also bounds the atom's extent.
@@ -419,28 +428,33 @@ fn resolveSectionOffset(
     offset: i64,
 ) error{NoCoveringSymbol}!struct { atom: u32, base: i64 } {
     if (order.len == 0) return .{ .atom = anon orelse return error.NoCoveringSymbol, .base = 0 };
-    const sym = try findSymbolCovering(symbols, order, offset);
+    // Below the section's first symbol: the leading anonymous atom owns these
+    // bytes. With no such atom the first symbol sits at offset 0, so `offset`
+    // is negative — a PC-relative reference just before the section base (see
+    // `RawTarget.section_offset`) — and belongs to the offset-0 atom with the
+    // difference folded into the addend.
+    if (offset < symbols[order[0]].offset) {
+        if (anon) |a| return .{ .atom = a, .base = 0 };
+        return .{ .atom = atom_of_symbol[order[0]], .base = 0 };
+    }
+    const sym = findSymbolCovering(symbols, order, offset);
     return .{ .atom = atom_of_symbol[sym], .base = symbols[sym].offset };
 }
 
-fn findSymbolCovering(symbols: []const RawSymbol, order: []const u32, offset: i64) error{NoCoveringSymbol}!u32 {
+/// The symbol whose offset most closely precedes (or equals) `offset`. The
+/// caller has already excluded `offset` below `order[0]`, so a symbol always
+/// covers it.
+fn findSymbolCovering(symbols: []const RawSymbol, order: []const u32, offset: i64) u32 {
     // Linear scan: `symbols.len` per module is small (function/global count
     // of one compiled Bit module or `libbitrt`'s single translation unit —
     // bounded by the source program, not by anything the linker iterates
     // unboundedly), and this only runs once per relocation at ingest time.
-    var best: ?u32 = null;
+    var best: u32 = order[0];
     for (order) |idx| {
         const sym_off: i64 = symbols[idx].offset;
-        if (sym_off <= offset and (best == null or sym_off > symbols[best.?].offset)) {
-            best = idx;
-        }
+        if (sym_off <= offset and sym_off > symbols[best].offset) best = idx;
     }
-    // `offset` below the section's first symbol (a PC-relative reference just
-    // before the section base — see `RawTarget.section_offset`): attribute to
-    // the offset-0 atom (`order` is sorted ascending, so `order[0]`), letting
-    // the negative intra-atom offset fold into the addend.
-    if (best == null and order.len > 0) best = order[0];
-    return best orelse error.NoCoveringSymbol;
+    return best;
 }
 
 const testing = std.testing;
@@ -538,6 +552,57 @@ test "atomizeModule floors the leading atom's alignment at the section's" {
     defer freeModule(gpa, &mod);
 
     try testing.expectEqual(@as(u32, 16), mod.atoms[0].alignment);
+}
+
+test "atomizeModule keeps the bytes before a section's first symbol" {
+    // Regression (#1157): AArch64 literal pools are `.rodata.cst8`/`.cst16`
+    // sections whose `$d` mapping symbols are excluded, leaving a named
+    // constant partway in as the first symbol. Atomizing only from that symbol
+    // silently dropped the pool entries ahead of it — including the `<0..7>`
+    // lane-index vector `std.mem.indexOfScalar` loads — and a relocation into
+    // them resolved against the first symbol's atom with a negative addend,
+    // reading whatever layout placed before it. Both symptoms are silent.
+    const gpa = testing.allocator;
+    const pool = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 } ++ [_]u8{0xAA} ** 8;
+    const sections = [_]RawSection{.{ .name = ".rodata.cst8", .kind = .rodata, .data = &pool, .size = pool.len, .alignment = 8 }};
+    // The only real symbol starts at 8, past the lane-index vector at 0.
+    const symbols = [_]RawSymbol{.{ .name = ".L__anon_1", .section = 0, .offset = 8, .size = 8, .binding = .local, .alignment = 8 }};
+    var mod = try atomizeModule(gpa, "m", &sections, &symbols, &.{});
+    defer freeModule(gpa, &mod);
+
+    try testing.expectEqual(@as(usize, 2), mod.atoms.len);
+    const lead = mod.atoms[0];
+    try testing.expectEqualStrings(".rodata.cst8", lead.name);
+    try testing.expectEqual(@as(u32, 8), lead.size);
+    try testing.expectEqual(@as(u32, 8), lead.alignment);
+    try testing.expectEqualSlices(u8, pool[0..8], lead.data);
+    try testing.expectEqualStrings(".L__anon_1", mod.atoms[1].name);
+}
+
+test "atomizeModule resolves a reloc below the first symbol to the leading atom" {
+    // The `ldr d2, [x10, #:lo12:.rodata.cst8+0x0]` case: without a leading atom
+    // this folded a negative addend against the first symbol's atom.
+    const gpa = testing.allocator;
+    const text = [_]u8{0} ** 8;
+    const pool = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 } ++ [_]u8{0xAA} ** 8;
+    const sections = [_]RawSection{
+        .{ .name = ".text", .kind = .text, .data = &text, .size = text.len },
+        .{ .name = ".rodata.cst8", .kind = .rodata, .data = &pool, .size = pool.len, .alignment = 8 },
+    };
+    const symbols = [_]RawSymbol{
+        .{ .name = "f", .section = 0, .offset = 0, .size = 8, .binding = .global },
+        .{ .name = ".L__anon_1", .section = 1, .offset = 8, .size = 8, .binding = .local, .alignment = 8 },
+    };
+    const relocs = [_]RawReloc{
+        .{ .section = 0, .offset = 0, .kind = .abs64, .target = .{ .section_offset = .{ .section = 1, .offset = 0 } }, .addend = 0 },
+    };
+    var mod = try atomizeModule(gpa, "m", &sections, &symbols, &relocs);
+    defer freeModule(gpa, &mod);
+
+    // atoms: [0] = "f", [1] = leading `.rodata.cst8`, [2] = ".L__anon_1"
+    const r = mod.atoms[0].relocs[0];
+    try testing.expectEqualStrings(".rodata.cst8", mod.atoms[r.target.local].name);
+    try testing.expectEqual(@as(i64, 0), r.addend);
 }
 
 test "atomizeModule keeps a bss section's atom size without data bytes" {
