@@ -902,3 +902,74 @@ only; prefer `ctr` or an AEAD for new designs.
 Decrypts `data` in AES CBC mode with the explicit 16-byte `iv` — the inverse of
 `cbcEncrypt`. Fails (fallible `[]byte!`) if `data` is not a multiple of 16 bytes,
 since a truncated ciphertext cannot be a valid CBC stream. Interop only.
+
+## HKDF
+
+HKDF (RFC 5869) is the HMAC-based extract-and-expand key derivation function —
+the TLS 1.3 key schedule. It turns one input keying material into any number of
+independent, cryptographically strong output keys, in two steps built entirely
+from `hmac`:
+
+- `hkdfExtract(salt, IKM)` concentrates the entropy of the input keying material
+  into a fixed-length pseudo-random key `PRK`, exactly one digest long. A public
+  `salt` (defaulting to `HashLen` zero bytes when empty) makes it a strong
+  randomness extractor.
+- `hkdfExpand(PRK, info, L)` stretches `PRK` to `L` bytes with the counter chain
+  `T(i) = HMAC(PRK, T(i-1) || info || byte(i))`, where the application-specific
+  `info` binds the derived key to its context. Because the counter is one byte,
+  `L` cannot exceed `255 * HashLen`.
+
+`hkdf` runs both in one call. All three are generic over the digest: they take a
+hash *constructor* (`() => Hash`) and ask the hash for its own `size`, so the
+same code derives keys under SHA-256, SHA-384, or SHA-512. As with `hmac`,
+`newSha512`/`newSha384` pass directly, while `newSha256` returns the concrete
+`Sha256` and is wrapped as a `() => Hash`.
+
+```bit
+import { Hash, hkdf, hkdfExtract, hkdfExpand, newSha256, newSha512, encodeHex } from "std/crypto"
+
+// SHA-256 returns the concrete `Sha256`, so expose its constructor as a
+// `() => Hash` value; the SHA-512 family already returns `Hash`.
+function sha256Hash(): Hash { return newSha256() }
+
+// Derive a 32-byte key in two explicit steps: extract the entropy of `ikm` into
+// a pseudo-random key, then expand it under a context label to the wanted size.
+function deriveKey(salt: []byte, ikm: []byte): []byte! {
+  let prk = hkdfExtract(sha256Hash, salt, ikm)
+  return hkdfExpand(sha256Hash, prk, []byte("app v1 encryption"), 32)?
+}
+
+// The same derivation in one call — extract and expand together — as hex.
+function deriveKeyHex(salt: []byte, ikm: []byte): string! {
+  return encodeHex(hkdf(sha256Hash, salt, ikm, []byte("app v1 encryption"), 32)?)
+}
+
+// The digest selects the strength and the output ceiling: HKDF-SHA-512 can
+// derive up to 255*64 bytes. An empty salt takes the HashLen-zero default.
+function deriveLong(ikm: []byte): []byte! {
+  return hkdf(newSha512, []byte(0), ikm, []byte("stream keys"), 128)?
+}
+```
+
+### `hkdfExtract(newHash: () => Hash, salt: []byte, ikm: []byte): []byte`
+
+HKDF-Extract (RFC 5869 §2.2): the pseudo-random key `PRK = HMAC(salt, IKM)`,
+exactly one digest long. An empty `salt` is replaced by `HashLen` zero bytes, as
+the standard requires — that zero salt is what makes extraction a strong
+randomness extractor, so it is not the same as omitting the salt entirely.
+`newHash` selects the digest and must return a fresh, empty hasher on each call.
+
+### `hkdfExpand(newHash: () => Hash, prk: []byte, info: []byte, outLen: int): []byte!`
+
+HKDF-Expand (RFC 5869 §2.3): stretch the pseudo-random key `prk` to `outLen`
+bytes of output keying material, bound to the context `info`, via the
+`T(i) = HMAC(prk, T(i-1) || info || byte(i))` counter chain. Fails if `outLen`
+exceeds `255 * HashLen`, the most the one-byte block counter can address. `prk`
+should be a digest-length key from `hkdfExtract`; `info` may be empty.
+
+### `hkdf(newHash: () => Hash, salt: []byte, ikm: []byte, info: []byte, outLen: int): []byte!`
+
+HKDF (RFC 5869 §2): extract then expand in one call — derive `outLen` bytes of
+output keying material from `ikm`, salted by `salt` and bound to the context
+`info`. Equivalent to `hkdfExpand(newHash, hkdfExtract(newHash, salt, ikm),
+info, outLen)`, and fails on the same over-long `outLen` as `hkdfExpand`.
