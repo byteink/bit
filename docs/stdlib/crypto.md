@@ -333,3 +333,59 @@ The digest length in bytes: 32 for SHA-256, 28 for SHA-224.
 ### `Sha256.blockSize(): int`
 
 The internal block size in bytes — 64 for both variants. HMAC keys this block.
+
+## ChaCha20
+
+The ChaCha20 stream cipher (RFC 8439) and its HChaCha20 key-derivation core
+(draft-irtf-cfrg-xchacha §2.2). ChaCha20 turns a 256-bit key, a 96-bit nonce, and
+a 32-bit block counter into a keystream that is XORed with the data. Because XOR is
+its own inverse, one function both encrypts and decrypts: run it again over the
+ciphertext with the same key, nonce, and counter to recover the plaintext.
+
+Both are constant-time by construction — every loop bound is a public length and no
+branch or memory access depends on a key or plaintext byte. Outputs are verified
+against the RFC 8439 known-answer vectors (the §2.3.2 keystream block and the
+§2.4.2 "Ladies and Gentlemen" ciphertext) and the XChaCha draft's §2.2.1 HChaCha20
+subkey.
+
+A (key, nonce) pair must never repeat: ChaCha20 is a stream cipher, so reusing one
+XORs two plaintexts under the same keystream and leaks their difference. HChaCha20
+is not a cipher on its own — it is the step XChaCha20 uses to stretch a longer
+random nonce into a fresh ChaCha20 key.
+
+```bit
+import { chacha20, hchacha20 } from "std/crypto"
+
+// Encrypt under a 32-byte key and 12-byte nonce, starting at block counter 1.
+function seal(key: []byte, nonce: []byte, plaintext: []byte): []byte {
+  return chacha20(key, nonce, 1, plaintext)
+}
+
+// Decrypt: the identical call — XOR with the keystream is its own inverse.
+function unseal(key: []byte, nonce: []byte, ciphertext: []byte): []byte {
+  return chacha20(key, nonce, 1, ciphertext)
+}
+
+// Derive a 32-byte subkey from a 32-byte key and a 16-byte nonce, as XChaCha20
+// does to absorb a longer nonce before running ChaCha20.
+function subkey(key: []byte, nonce16: []byte): []byte {
+  return hchacha20(key, nonce16)
+}
+```
+
+### `chacha20(key: []byte, nonce: []byte, counter: u32, data: []byte): []byte`
+
+Encrypt or decrypt `data` under ChaCha20 (RFC 8439). `key` must be 32 bytes and
+`nonce` 12 bytes; `counter` is the block counter of the first block — the RFC's
+worked examples start at 1. Returns a fresh slice the length of `data`. Encryption
+and decryption are the same operation, so passing ciphertext back through the same
+key, nonce, and counter recovers the plaintext. Panics if `key` or `nonce` is the
+wrong length. A (key, nonce) pair must never be reused.
+
+### `hchacha20(key: []byte, nonce16: []byte): []byte`
+
+The HChaCha20 subkey of `key` (32 bytes) under the 16-byte `nonce16`
+(draft-irtf-cfrg-xchacha §2.2): 20 ChaCha rounds over the state with the nonce in
+the last four words and no final add-back, returning a 32-byte subkey. This is
+XChaCha20's key-derivation step — it lets XChaCha20 accept a 192-bit nonce — and is
+not a cipher on its own. Panics if `key` or `nonce16` is the wrong length.

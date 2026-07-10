@@ -1,0 +1,184 @@
+// Bit standard library — crypto module, the ChaCha20 stream cipher (RFC 8439)
+// and the HChaCha20 key-derivation core (draft-irtf-cfrg-xchacha §2.2).
+//
+// ChaCha20 keeps a 16-word (u32) state: the four constants "expand 32-byte k",
+// then the 256-bit key (8 words), a 32-bit block counter, and a 96-bit nonce (3
+// words). All input is read little-endian. Each block runs 20 rounds — 10
+// iterations of four "column" quarter-rounds then four "diagonal" ones — adds the
+// pre-round state back, and serializes the 16 words little-endian into a 64-byte
+// keystream block, which is XORed with the plaintext. Encryption and decryption
+// are the same operation: XOR with the keystream is its own inverse.
+//
+// HChaCha20 shares that core but takes a 128-bit nonce (4 words), runs the same
+// 20 rounds *without* the final add-back, and returns rows 0 and 3 of the state
+// (words 0..3 and 12..15) as a 256-bit subkey. XChaCha20 (#1183) uses it to
+// stretch a 192-bit nonce into a ChaCha20 key + 96-bit nonce.
+//
+// Both are constant-time by construction: every loop bound is a public length and
+// no branch or memory index depends on key or plaintext bytes. All arithmetic is
+// `u32`, so the additions wrap mod 2^32 exactly as the standard prescribes
+// (relies on the narrow-width wrap/rotate codegen fix, #1158).
+
+// Rotate the 32-bit word `x` left by `n` bits, `1 <= n <= 31`. The two shifted
+// halves cover disjoint bit positions, so the `|` reassembles the rotation.
+function rotl32(x: u32, n: u32): u32 {
+  return (x << n) | (x >> (32 - n))
+}
+
+// The little-endian u32 at byte offset `off` of `b` (needs `off + 4 <= len(b)`).
+function leU32(b: []byte, off: int): u32 {
+  return u32(b[off]) | (u32(b[off + 1]) << 8) | (u32(b[off + 2]) << 16) | (u32(b[off + 3]) << 24)
+}
+
+// Write `v` little-endian into the four bytes of `b` at `off`.
+function putLeU32(b: []byte, off: int, v: u32) {
+  b[off] = byte(v)
+  b[off + 1] = byte(v >> 8)
+  b[off + 2] = byte(v >> 16)
+  b[off + 3] = byte(v >> 24)
+}
+
+// The ChaCha quarter-round on the four state words `x[a], x[b], x[c], x[d]`,
+// mutating them in place. Four add/xor/rotate steps that diffuse each word into
+// the others (RFC 8439 §2.1).
+function quarterRound(x: []u32, a: int, b: int, c: int, d: int) {
+  x[a] = x[a] + x[b]
+  x[d] = rotl32(x[d] ^ x[a], 16)
+  x[c] = x[c] + x[d]
+  x[b] = rotl32(x[b] ^ x[c], 12)
+  x[a] = x[a] + x[b]
+  x[d] = rotl32(x[d] ^ x[a], 8)
+  x[c] = x[c] + x[d]
+  x[b] = rotl32(x[b] ^ x[c], 7)
+}
+
+// The 20-round permutation of the 16-word `x`, in place: 10 iterations of four
+// column quarter-rounds then four diagonal ones (RFC 8439 §2.3). Shared by the
+// ChaCha20 block function and HChaCha20.
+function rounds(x: []u32) {
+  let r = 0
+  while (r < 10) {
+    quarterRound(x, 0, 4, 8, 12)
+    quarterRound(x, 1, 5, 9, 13)
+    quarterRound(x, 2, 6, 10, 14)
+    quarterRound(x, 3, 7, 11, 15)
+    quarterRound(x, 0, 5, 10, 15)
+    quarterRound(x, 1, 6, 11, 12)
+    quarterRound(x, 2, 7, 8, 13)
+    quarterRound(x, 3, 4, 9, 14)
+    r = r + 1
+  }
+}
+
+// Load the constants, `key` (8 words) and `nonce` (3 words) into the first 16
+// words of `s`; the caller sets `s[12]` to the block counter. The four constants
+// are the ASCII of "expand 32-byte k", little-endian (RFC 8439 §2.3).
+function initState(s: []u32, key: []byte, nonce: []byte) {
+  s[0] = 0x61707865
+  s[1] = 0x3320646e
+  s[2] = 0x79622d32
+  s[3] = 0x6b206574
+  let i = 0
+  while (i < 8) {
+    s[4 + i] = leU32(key, i * 4)
+    i = i + 1
+  }
+  s[13] = leU32(nonce, 0)
+  s[14] = leU32(nonce, 4)
+  s[15] = leU32(nonce, 8)
+}
+
+// One 64-byte keystream block for `counter` into `out` (must be 64 bytes): build
+// the state, run 20 rounds on a working copy, add the original back, serialize
+// little-endian (RFC 8439 §2.3.1).
+function block(key: []byte, counter: u32, nonce: []byte, out: []byte) {
+  let s = []u32(16)
+  initState(s, key, nonce)
+  s[12] = counter
+
+  let x = []u32(16)
+  let i = 0
+  while (i < 16) {
+    x[i] = s[i]
+    i = i + 1
+  }
+  rounds(x)
+
+  i = 0
+  while (i < 16) {
+    putLeU32(out, i * 4, x[i] + s[i])
+    i = i + 1
+  }
+}
+
+// Encrypt or decrypt `data` under ChaCha20 (RFC 8439 §2.4). `key` must be 32
+// bytes and `nonce` 12 bytes; `counter` is the block counter of the first block
+// (RFC's worked examples start at 1). Returns a fresh slice the length of `data`;
+// XORing the keystream is its own inverse, so the same call decrypts.
+export function chacha20(key: []byte, nonce: []byte, counter: u32, data: []byte): []byte {
+  if (len(key) != 32) {
+    panic("chacha20: key must be 32 bytes")
+  }
+  if (len(nonce) != 12) {
+    panic("chacha20: nonce must be 12 bytes")
+  }
+
+  let out = []byte(len(data))
+  let ks = []byte(64)
+  let ctr = counter
+  let off = 0
+  while (off < len(data)) {
+    block(key, ctr, nonce, ks)
+    let n = len(data) - off
+    if (n > 64) {
+      n = 64
+    }
+    let j = 0
+    while (j < n) {
+      out[off + j] = data[off + j] ^ ks[j]
+      j = j + 1
+    }
+    off = off + 64
+    ctr = ctr + 1
+  }
+  return out
+}
+
+// The HChaCha20 subkey of `key` (32 bytes) under the 16-byte `nonce16`
+// (draft-irtf-cfrg-xchacha §2.2): 20 rounds over the state with the nonce filling
+// words 12..15, with no final add-back, returning words 0..3 and 12..15 as a
+// 32-byte subkey. This is XChaCha20's key-derivation step, not a cipher on its
+// own.
+export function hchacha20(key: []byte, nonce16: []byte): []byte {
+  if (len(key) != 32) {
+    panic("hchacha20: key must be 32 bytes")
+  }
+  if (len(nonce16) != 16) {
+    panic("hchacha20: nonce must be 16 bytes")
+  }
+
+  let x = []u32(16)
+  x[0] = 0x61707865
+  x[1] = 0x3320646e
+  x[2] = 0x79622d32
+  x[3] = 0x6b206574
+  let i = 0
+  while (i < 8) {
+    x[4 + i] = leU32(key, i * 4)
+    i = i + 1
+  }
+  x[12] = leU32(nonce16, 0)
+  x[13] = leU32(nonce16, 4)
+  x[14] = leU32(nonce16, 8)
+  x[15] = leU32(nonce16, 12)
+  rounds(x)
+
+  let out = []byte(32)
+  i = 0
+  while (i < 4) {
+    putLeU32(out, i * 4, x[i])
+    putLeU32(out, 16 + i * 4, x[12 + i])
+    i = i + 1
+  }
+  return out
+}
