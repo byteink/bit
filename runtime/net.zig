@@ -120,6 +120,37 @@ fn addrIn(ip: [4]u8, port: u16) posix.sockaddr.in {
     };
 }
 
+/// The dotted-quad of a `sockaddr.in`'s address, written into `buf` (which must
+/// hold the longest form, "255.255.255.255" = 15 bytes). Returns the slice used.
+/// Hand-rolled for the same reason as `parseIpv4`: no `std.fmt` dependency on a
+/// freestanding hot path.
+pub fn formatIpv4(sa: *const posix.sockaddr.in, buf: *[15]u8) []const u8 {
+    const octets: [4]u8 = @bitCast(sa.addr);
+    var n: usize = 0;
+    for (octets, 0..) |o, i| {
+        if (i != 0) {
+            buf[n] = '.';
+            n += 1;
+        }
+        if (o >= 100) {
+            buf[n] = '0' + o / 100;
+            n += 1;
+        }
+        if (o >= 10) {
+            buf[n] = '0' + (o / 10) % 10;
+            n += 1;
+        }
+        buf[n] = '0' + o % 10;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// The port of a `sockaddr.in`, host byte order.
+pub fn addrPort(sa: *const posix.sockaddr.in) u16 {
+    return std.mem.bigToNative(u16, sa.port);
+}
+
 test "parseIpv4 accepts a dotted quad and rejects the rest" {
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, parseIpv4("127.0.0.1").?);
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, parseIpv4("0.0.0.0").?);
@@ -366,4 +397,94 @@ pub fn writeSock(fd: fd_t, buf: []const u8) Error!usize {
     }
     if (off < buf.len) return Error.Io;
     return off;
+}
+
+// ---------------------------------------------------------------------------
+// UDP
+// ---------------------------------------------------------------------------
+
+fn sysSocketUdp() Error!fd_t {
+    if (is_linux) {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        if (posix.errno(rc) != .SUCCESS) return Error.Socket;
+        return @intCast(rc);
+    }
+    const rc = std.c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    if (rc < 0) return Error.Socket;
+    try setNonBlock(rc);
+    return rc;
+}
+
+/// A datagram socket bound to `host:port`. `port == 0` lets the kernel pick one
+/// (recover it with `localPort`, exactly like a TCP listener). Connectionless:
+/// unlike TCP there is no listen/accept — send and receive straight off the fd.
+pub fn bindUdp(host: []const u8, port: u16) Error!fd_t {
+    const ip = parseIpv4(host) orelse return Error.BadAddress;
+    const fd = try sysSocketUdp();
+    errdefer sched.closeFd(fd);
+
+    try sysSetReuseAddr(fd);
+    const sa = addrIn(ip, port);
+    try sysBind(fd, &sa);
+    return fd;
+}
+
+/// Sends one datagram to `host:port`. Parks on writability if the socket buffer
+/// is momentarily full. A datagram is all-or-nothing: a partial send is an
+/// error, never a short count, so there is no write loop as there is for TCP.
+pub fn sendTo(fd: fd_t, host: []const u8, port: u16, data: []const u8) Error!usize {
+    const ip = parseIpv4(host) orelse return Error.BadAddress;
+    const sa = addrIn(ip, port);
+    const salen: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    var stalls: u32 = 0;
+    while (stalls < max_stalls) {
+        const rc = if (is_linux)
+            linux.sendto(fd, data.ptr, data.len, 0, @ptrCast(&sa), salen)
+        else
+            @as(usize, @bitCast(std.c.sendto(fd, data.ptr, data.len, 0, @ptrCast(&sa), salen)));
+        const e = if (is_linux) posix.errno(rc) else posix.errno(@as(isize, @bitCast(rc)));
+        if (e == .SUCCESS) return if (is_linux) rc else @bitCast(rc);
+        if (wouldBlock(e)) {
+            stalls += 1;
+            try awaitReady(fd, .write);
+            continue;
+        }
+        if (e == .INTR) continue;
+        return Error.Io;
+    }
+    return Error.Io;
+}
+
+/// Receives one datagram into `buf`, parking until one arrives, and writes the
+/// sender's address into `from`. Returns the byte count (a zero-length datagram
+/// is legal, so `0` is not end-of-stream here — UDP has no stream to end).
+pub fn recvFrom(fd: fd_t, buf: []u8, from: *posix.sockaddr.in) Error!usize {
+    var stalls: u32 = 0;
+    while (stalls < max_stalls) {
+        var salen: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        const rc = if (is_linux)
+            linux.recvfrom(fd, buf.ptr, buf.len, 0, @ptrCast(from), &salen)
+        else
+            @as(usize, @bitCast(std.c.recvfrom(fd, buf.ptr, buf.len, 0, @ptrCast(from), &salen)));
+        const e = if (is_linux) posix.errno(rc) else posix.errno(@as(isize, @bitCast(rc)));
+        if (e == .SUCCESS) return if (is_linux) rc else @bitCast(rc);
+        if (wouldBlock(e)) {
+            stalls += 1;
+            try awaitReady(fd, .read);
+            continue;
+        }
+        if (e == .INTR) continue;
+        return Error.Io;
+    }
+    return Error.Io;
+}
+
+test "formatIpv4 round-trips parseIpv4" {
+    const cases = [_][]const u8{ "127.0.0.1", "0.0.0.0", "255.255.255.255", "1.2.3.4", "10.0.0.255" };
+    for (cases) |c| {
+        const ip = parseIpv4(c).?;
+        const sa = addrIn(ip, 0);
+        var buf: [15]u8 = undefined;
+        try std.testing.expectEqualStrings(c, formatIpv4(&sa, &buf));
+    }
 }

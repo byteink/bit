@@ -2511,7 +2511,9 @@ const Checker = struct {
         // `primRtFn`. They stay plain (no fallible results): the ergonomic,
         // error-returning layer lives in the Bit stdlib that wraps them.
         if (primSig(name)) |sig| {
-            var want: [2]TypeId = undefined;
+            // Widest primitive is `netUdpSend` at 4 params; 8 leaves headroom.
+            var want: [8]TypeId = undefined;
+            std.debug.assert(sig.params.len <= want.len);
             for (sig.params, 0..) |p, i| want[i] = self.ctx.prim_ids.get(p);
             try self.checkFixedArgs(file_idx, node, name, arg_items, want[0..sig.params.len], env, fctx);
             return if (sig.ret) |r| self.ctx.prim_ids.get(r) else self.ctx.void_id;
@@ -2547,6 +2549,11 @@ const Checker = struct {
         .{ "netDial", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
         .{ "netRead", PrimSig{ .params = &.{ .i64, .i64 }, .ret = .string } },
         .{ "netWrite", PrimSig{ .params = &.{ .i64, .string }, .ret = .i64 } },
+        .{ "netUdpBind", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        .{ "netUdpSend", PrimSig{ .params = &.{ .i64, .string, .i64, .string }, .ret = .i64 } },
+        .{ "netUdpRecv", PrimSig{ .params = &.{ .i64, .i64 }, .ret = .string } },
+        .{ "netUdpSenderHost", PrimSig{ .params = &.{}, .ret = .string } },
+        .{ "netUdpSenderPort", PrimSig{ .params = &.{}, .ret = .i64 } },
         // Math (ABI.md §17) — under std/math.
         .{ "fsqrt", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
         .{ "ffloor", PrimSig{ .params = &.{.f64}, .ret = .f64 } },

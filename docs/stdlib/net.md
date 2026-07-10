@@ -128,3 +128,58 @@ function echoServer(l: Listener, n: int, done: chan<int>): ()! {
   }
 }
 ```
+
+## Datagrams (UDP)
+
+Connectionless: no accept, no dial. Bind a socket and send or receive datagrams
+straight off it, each carrying its own address.
+
+### `UdpSocket`
+
+A bound UDP socket. Send to any address, receive from any address, over the one
+socket.
+
+### `Datagram`
+
+One received datagram: its `data`, and the `host`/`port` it came from. The sender
+address is what a server replies to — there is no connection to reply over.
+
+### `udpBind(host: string, port: int): UdpSocket!`
+
+Binds a datagram socket to `host:port`. As with `listen`, port `0` lets the
+kernel choose one; read it back with `port()`.
+
+### `UdpSocket.port(): int!`
+
+The port this socket is bound to. Meaningful even when `0` was requested.
+
+### `UdpSocket.send(host: string, port: int, data: string): ()!`
+
+Sends one datagram to `host:port`. All-or-nothing — a datagram is never partially
+sent, so success means every byte went.
+
+### `UdpSocket.recv(max: int): Datagram!`
+
+Receives the next datagram, up to `max` bytes, parking until one arrives. The
+result carries the sender's address. A zero-length datagram is legal and is not
+an error — unlike a TCP read, empty here does not mean "closed".
+
+### `UdpSocket.close()`
+
+Closes the socket.
+
+```bit
+import { udpBind, UdpSocket } from "std/net"
+import { toUpper } from "std/strings"
+
+// Echo `n` datagrams back, uppercased, to whoever sent them.
+function echo(s: UdpSocket, n: int): ()! {
+  let i = 0
+  while (i < n) {
+    let d = s.recv(1024)?
+    s.send(d.host, d.port, toUpper(d.data))?
+    i = i + 1
+  }
+  s.close()
+}
+```

@@ -718,6 +718,59 @@ export fn bit_rt_net_write(fd: i64, s: *const RtBytes) callconv(.c) i64 {
     return @intCast(n);
 }
 
+/// The sender of the most recent `bit_rt_net_udp_recv` on this goroutine.
+/// Read by `bit_rt_net_udp_sender_host`/`_port` immediately after the recv, with
+/// no yield in between — a per-worker threadlocal is goroutine-correct here for
+/// the same reason as `pending_err`. `port == -1` flags a failed recv, which is
+/// how `net_udp_recv`'s empty return is told apart from a real zero-length
+/// datagram (a valid sender's port is 0..65535).
+const UdpSender = struct { addr: std.posix.sockaddr.in = undefined, port: i64 = -1 };
+threadlocal var udp_last_sender: UdpSender = .{};
+
+/// `bit_rt_net_udp_bind`: a datagram socket bound to `host:port`, or `-1`.
+/// `port == 0` asks the kernel to choose one; read it back with `net_local_port`.
+export fn bit_rt_net_udp_bind(host: *const RtBytes, port: i64) callconv(.c) i64 {
+    if (port < 0 or port > 65535) return -1;
+    const fd = net.bindUdp(hostBytes(host), @intCast(port)) catch return -1;
+    return @intCast(fd);
+}
+
+/// `bit_rt_net_udp_send`: one datagram of `data` to `host:port` from `fd`.
+/// Returns the byte count, or `-1`. Parks if the send buffer is momentarily full.
+export fn bit_rt_net_udp_send(fd: i64, host: *const RtBytes, port: i64, data: *const RtBytes) callconv(.c) i64 {
+    if (port < 0 or port > 65535) return -1;
+    const n = net.sendTo(@intCast(fd), hostBytes(host), @intCast(port), data.ptr[0..data.len]) catch return -1;
+    return @intCast(n);
+}
+
+/// `bit_rt_net_udp_recv`: up to `max` bytes of the next datagram on `fd`, parking
+/// until one arrives. Records the sender for `net_udp_sender_host`/`_port`. On
+/// error returns empty and sets the sender port to `-1` (a zero-length datagram,
+/// by contrast, returns empty with a valid sender).
+export fn bit_rt_net_udp_recv(fd: i64, max: i64) callconv(.c) *const RtBytes {
+    udp_last_sender = .{};
+    if (max <= 0) return stringFromBytes("");
+    const want: usize = @intCast(max);
+    const tmp = std.heap.page_allocator.alloc(u8, want) catch return stringFromBytes("");
+    defer std.heap.page_allocator.free(tmp);
+    var from: std.posix.sockaddr.in = undefined;
+    const n = net.recvFrom(@intCast(fd), tmp, &from) catch return stringFromBytes("");
+    udp_last_sender = .{ .addr = from, .port = net.addrPort(&from) };
+    return stringFromBytes(tmp[0..n]);
+}
+
+/// `bit_rt_net_udp_sender_host`: dotted-quad of the last recv's sender, or `""`.
+export fn bit_rt_net_udp_sender_host() callconv(.c) *const RtBytes {
+    if (udp_last_sender.port < 0) return stringFromBytes("");
+    var buf: [15]u8 = undefined;
+    return stringFromBytes(net.formatIpv4(&udp_last_sender.addr, &buf));
+}
+
+/// `bit_rt_net_udp_sender_port`: the last recv's sender port, or `-1` on error.
+export fn bit_rt_net_udp_sender_port() callconv(.c) i64 {
+    return udp_last_sender.port;
+}
+
 // ---------------------------------------------------------------------------
 // Math (ABI.md §17) — the low-level layer under `std/math`
 // ---------------------------------------------------------------------------

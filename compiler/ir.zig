@@ -160,12 +160,22 @@ pub const RtFn = enum {
     /// `net_dial(host, port) -> fd`; `net_read(fd, max) -> string` (empty at end
     /// of stream); `net_write(fd, s) -> i64`. Failure is `-1`, or `""` for a read.
     /// A socket is closed by `fs_close` — `close(2)` does not care what it gets.
+    ///
+    /// UDP (connectionless): `net_udp_bind(host, port) -> fd`;
+    /// `net_udp_send(fd, host, port, data) -> i64`; `net_udp_recv(fd, max) ->
+    /// string` records the sender, read back with `net_udp_sender_host() ->
+    /// string` and `net_udp_sender_port() -> i64` (port `-1` after a failed recv).
     net_listen,
     net_local_port,
     net_accept,
     net_dial,
     net_read,
     net_write,
+    net_udp_bind,
+    net_udp_send,
+    net_udp_recv,
+    net_udp_sender_host,
+    net_udp_sender_port,
     /// `() -> i64`: which test this process should run (`BIT_TEST_INDEX`, or -1).
     /// Only ever emitted into the synthetic `main` that `compiler/testgen.zig`
     /// appends under `bit test` (ABI.md §16).
