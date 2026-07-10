@@ -193,3 +193,42 @@ Like `encodeHex`, but with uppercase digits (`0-9A-F`).
 The bytes `s` spells in hex, high nibble first. Case-insensitive. Fails if `s`
 has an odd length or contains any character outside `[0-9a-fA-F]`, so it is the
 exact inverse of `encodeHex`/`encodeHexUpper` on well-formed input.
+
+## SHA-1 (legacy)
+
+SHA-1 (FIPS 180-1) produces a 160-bit (20-byte) digest. It is provided for
+**interoperability only**: SHA-1 is **not** collision-resistant — practical
+collisions have existed since 2017 (SHAttered) — so it must **never** back a new
+signature, certificate, MAC, or any new security decision. Use it solely to
+speak formats that still mandate it: UUIDv5 (RFC 4122) and the fingerprints of
+pre-existing X.509 certificates. For anything new, use SHA-256.
+
+The hasher satisfies the streaming `Hash` interface, so it works one-shot
+through `digest` or incrementally through `write`/`sum`.
+
+```bit
+import { newSha1, digest, encodeHex } from "std/crypto"
+
+// One-shot: the lowercase hex fingerprint of a buffer. Legacy interop only —
+// e.g. a UUIDv5 namespace hash or an old certificate fingerprint, never a new
+// signature.
+function sha1Hex(data: []byte): string {
+  return encodeHex(digest(newSha1(), data))
+}
+
+// Streaming: reset, feed the bytes across as many writes as you like, then read
+// the 20-byte digest with `sum`.
+function sha1Stream(head: []byte, tail: []byte): []byte {
+  let h = newSha1()
+  h.reset()
+  h.write(head)
+  h.write(tail)
+  return h.sum()
+}
+```
+
+### `newSha1(): Hash`
+
+A fresh SHA-1 hasher in the empty state, typed as the streaming `Hash` interface
+— digest size 20 bytes, block size 64. Legacy: interop only, not
+collision-resistant; never use it for new signatures or MACs.
