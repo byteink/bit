@@ -1018,7 +1018,16 @@ fn sequentializeAndEmit(self: *Ctx, moves_in: []const PMove, class: regalloc.Cla
             cur = mv.from;
             if (plocEq(cur, start)) break;
         }
-        const scratch: PLoc = .{ .reg = if (class == .int) @intFromEnum(scratch1) else @intFromEnum(fscratch1) };
+        // The cycle scratch holds one location's value across the whole
+        // rotation, so it must be a register `emitMove` never clobbers as its
+        // own temporary. A mem->mem move inside the cycle routes through
+        // `scratch1`/`fscratch1` (see `emitMove`), so the cycle must use the
+        // *secondary* scratch — otherwise the first mem->mem rotation step
+        // overwrites the saved value and the cycle resolves to garbage (a
+        // spilled loop-carried value swap on a back-edge silently corrupts,
+        // task #1235). `scratch2`/`fscratch2` are reserved and never a move
+        // source/destination, so they are safe to hold across the rotation.
+        const scratch: PLoc = .{ .reg = if (class == .int) @intFromEnum(scratch2) else @intFromEnum(fscratch2) };
         try emitMove(self, cycle.items[0].to, scratch, class); // save the value about to be overwritten
         var i: usize = 0;
         while (i + 1 < cycle.items.len) : (i += 1) {
@@ -2346,6 +2355,32 @@ test "movRR is a no-op when src == dst" {
     defer ctx.code.deinit(gpa);
     try ctx.movRR(.rax, .rax);
     try testing.expectEqual(@as(usize, 0), ctx.code.items.len);
+}
+
+// Regression (#1235): two spilled values swapping stack slots form a
+// mem<->mem 2-cycle in an edge's parallel move. The cycle-break saves one
+// slot's value in a scratch register held across the whole rotation, so that
+// register must differ from the one `emitMove` uses as its own mem->mem copy
+// temp (`scratch1`). Using `scratch1` for both means the first rotation step
+// overwrites the saved value and the swap silently corrupts. Byte-exact so a
+// revert to `scratch1` fails here, not only in the allocation-sensitive golden.
+test "sequentializeAndEmit breaks a mem<->mem swap cycle without clobbering the saved value" {
+    const gpa = testing.allocator;
+    const moves = [_]PMove{
+        .{ .from = .{ .mem = 0 }, .to = .{ .mem = 8 } },
+        .{ .from = .{ .mem = 8 }, .to = .{ .mem = 0 } },
+    };
+    var got = testCtx(gpa);
+    defer got.code.deinit(gpa);
+    try sequentializeAndEmit(&got, &moves, .int);
+
+    var want = testCtx(gpa);
+    defer want.code.deinit(gpa);
+    try want.movLoad(scratch2, .rbp, null, 1, 8, 8, false); // save start slot into r10 (NOT r11)
+    try want.movLoad(scratch1, .rbp, null, 1, 0, 8, false); // rotate the mem->mem move via r11
+    try want.movStore(.rbp, null, 1, 8, scratch1, 8);
+    try want.movStore(.rbp, null, 1, 0, scratch2, 8); // restore saved value from r10
+    try testing.expectEqualSlices(u8, want.code.items, got.code.items);
 }
 
 test "movRI encodes a sign-extended imm32 for values that fit" {
