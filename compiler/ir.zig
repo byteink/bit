@@ -141,6 +141,18 @@ pub const RtFn = enum {
     fs_read_all,
     fs_write,
     fs_close,
+    /// The rest of the filesystem surface (ABI.md §14), under `std/fs`:
+    /// `fs_append(path) -> fd`; `fs_read(fd, max) -> string` (short at EOF, so
+    /// it works on pipes and stdin, unlike `fs_read_all`); `fs_exists`/
+    /// `fs_is_dir(path) -> bool`; `fs_mkdir`/`fs_remove(path) -> i64`;
+    /// `fs_list_dir(path) -> string` (NUL-terminated entry names).
+    fs_append,
+    fs_read,
+    fs_exists,
+    fs_is_dir,
+    fs_mkdir,
+    fs_remove,
+    fs_list_dir,
     /// `() -> i64`: which test this process should run (`BIT_TEST_INDEX`, or -1).
     /// Only ever emitted into the synthetic `main` that `compiler/testgen.zig`
     /// appends under `bit test` (ABI.md §16).

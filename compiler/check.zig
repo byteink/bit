@@ -2517,6 +2517,13 @@ const Checker = struct {
         .{ "fsReadAll", PrimSig{ .params = &.{.i64}, .ret = .string } },
         .{ "fsWrite", PrimSig{ .params = &.{ .i64, .string }, .ret = .i64 } },
         .{ "fsClose", PrimSig{ .params = &.{.i64}, .ret = .i64 } },
+        .{ "fsAppend", PrimSig{ .params = &.{.string}, .ret = .i64 } },
+        .{ "fsRead", PrimSig{ .params = &.{ .i64, .i64 }, .ret = .string } },
+        .{ "fsExists", PrimSig{ .params = &.{.string}, .ret = .bool } },
+        .{ "fsIsDir", PrimSig{ .params = &.{.string}, .ret = .bool } },
+        .{ "fsMkdir", PrimSig{ .params = &.{.string}, .ret = .i64 } },
+        .{ "fsRemove", PrimSig{ .params = &.{.string}, .ret = .i64 } },
+        .{ "fsListDir", PrimSig{ .params = &.{.string}, .ret = .string } },
         // Math (ABI.md §17) — under std/math.
         .{ "fsqrt", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
         .{ "ffloor", PrimSig{ .params = &.{.f64}, .ret = .f64 } },

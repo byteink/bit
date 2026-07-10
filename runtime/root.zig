@@ -534,12 +534,82 @@ const max_path = 4096;
 /// is a `{ptr,len}` view with no NUL terminator, so copy it into a bounded
 /// stack buffer first (a path at/over `max_path` is rejected, not truncated).
 export fn bit_rt_fs_open(path: *const RtBytes, write: bool) callconv(.c) i64 {
-    if (path.len >= max_path) return -1;
+    return openWithMode(path, if (write) .write else .read);
+}
+
+/// `bit_rt_fs_append`: open `path` create+append write-only. Returns the fd, or
+/// -1. Every write lands at the end of the file, atomically w.r.t. other
+/// appenders (`O_APPEND`).
+export fn bit_rt_fs_append(path: *const RtBytes) callconv(.c) i64 {
+    return openWithMode(path, .append);
+}
+
+/// The Bit path is a `{ptr,len}` view with no NUL terminator, so copy it into a
+/// bounded stack buffer first (a path at/over `max_path` is rejected, not
+/// truncated). Shared by every path-taking primitive below.
+fn openWithMode(path: *const RtBytes, mode: sched.OpenMode) i64 {
     var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    return sched.openFd(p, mode) catch return -1;
+}
+
+fn pathZ(path: *const RtBytes, buf: *[max_path]u8) ?[*:0]const u8 {
+    if (path.len >= max_path) return null;
     @memcpy(buf[0..path.len], path.ptr[0..path.len]);
     buf[path.len] = 0;
-    const fd = sched.openFd(buf[0..path.len :0].ptr, write) catch return -1;
-    return fd;
+    return buf[0..path.len :0].ptr;
+}
+
+/// `bit_rt_fs_read`: read up to `max` bytes from `fd` into a fresh string; the
+/// result is shorter than `max` at EOF (empty exactly at EOF). Unlike
+/// `fs_read_all` this works on pipes, sockets, and stdin, which have no size.
+export fn bit_rt_fs_read(fd: i64, max: i64) callconv(.c) *const RtBytes {
+    if (max <= 0) return stringFromBytes("");
+    const want: usize = @intCast(max);
+    const tmp = std.heap.page_allocator.alloc(u8, want) catch return stringFromBytes("");
+    defer std.heap.page_allocator.free(tmp);
+    const n = sched.readFd(@intCast(fd), tmp) catch return stringFromBytes("");
+    return stringFromBytes(tmp[0..n]);
+}
+
+/// `bit_rt_fs_exists` / `bit_rt_fs_is_dir`: both false for a missing path.
+export fn bit_rt_fs_exists(path: *const RtBytes) callconv(.c) bool {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return false;
+    return sched.statPath(p).exists;
+}
+
+export fn bit_rt_fs_is_dir(path: *const RtBytes) callconv(.c) bool {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return false;
+    return sched.statPath(p).is_dir;
+}
+
+/// `bit_rt_fs_mkdir` / `bit_rt_fs_remove`: 0 on success, -1 on failure.
+/// `remove` deletes a file or an *empty* directory.
+export fn bit_rt_fs_mkdir(path: *const RtBytes) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    return if (sched.mkdirAt(p)) 0 else -1;
+}
+
+export fn bit_rt_fs_remove(path: *const RtBytes) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    return if (sched.removeAt(p)) 0 else -1;
+}
+
+/// `bit_rt_fs_list_dir`: `path`'s entries, each terminated by a NUL byte, with
+/// `.`/`..` omitted. Empty string when the directory is empty or unreadable —
+/// `std/fs` checks `isDir` first to tell those apart. NUL separates because it
+/// is the one byte a POSIX filename cannot contain.
+export fn bit_rt_fs_list_dir(path: *const RtBytes) callconv(.c) *const RtBytes {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return stringFromBytes("");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.heap.page_allocator);
+    if (!sched.listDir(p, &out)) return stringFromBytes("");
+    return stringFromBytes(out.items);
 }
 
 /// `bit_rt_fs_read_all`: the whole file as a fresh `string`. Sized from

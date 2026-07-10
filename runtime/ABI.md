@@ -427,6 +427,13 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 | `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
+| `bit_rt_fs_append`    | `(path: *const RtBytes) -> i64` (§14)                   |
+| `bit_rt_fs_read`      | `(fd: i64, max: i64) -> *const RtBytes` (§14)           |
+| `bit_rt_fs_exists`    | `(path: *const RtBytes) -> bool` (§14)                  |
+| `bit_rt_fs_is_dir`    | `(path: *const RtBytes) -> bool` (§14)                  |
+| `bit_rt_fs_mkdir`     | `(path: *const RtBytes) -> i64` (§14)                   |
+| `bit_rt_fs_remove`    | `(path: *const RtBytes) -> i64` (§14)                   |
+| `bit_rt_fs_list_dir`  | `(path: *const RtBytes) -> *const RtBytes` (§14)        |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 | `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
 | `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
@@ -625,10 +632,17 @@ registration — the caller roots it the instant it reads it.
 ## 14. Filesystem primitives
 
 ```
-bit_rt_fs_open(path: *const RtBytes, write: bool) -> i64   // fd, or -1
-bit_rt_fs_read_all(fd: i64)          -> *const RtBytes      // whole file as a string
-bit_rt_fs_write(fd: i64, s: *const RtBytes) -> i64          // bytes written, or -1
-bit_rt_fs_close(fd: i64)             -> i64                 // always 0
+bit_rt_fs_open(path, write: bool) -> i64        // fd, or -1
+bit_rt_fs_append(path)            -> i64        // fd opened O_APPEND, or -1
+bit_rt_fs_read_all(fd)            -> string     // whole file (regular files only)
+bit_rt_fs_read(fd, max: i64)      -> string     // up to max bytes; "" at EOF
+bit_rt_fs_write(fd, s)            -> i64        // bytes written, or -1
+bit_rt_fs_close(fd)               -> i64        // always 0
+bit_rt_fs_exists(path)            -> bool
+bit_rt_fs_is_dir(path)            -> bool
+bit_rt_fs_mkdir(path)             -> i64        // 0, or -1
+bit_rt_fs_remove(path)            -> i64        // file or empty dir; 0, or -1
+bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 ```
 
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
@@ -646,6 +660,21 @@ runtime. Backed by the raw per-platform syscalls in `sched.zig` (`openFd`/
   read leaves the tail zero-filled (v1 regular-file scope).
 - `fs_close` reports success unconditionally (the raw wrapper swallows
   `EINTR`/`EBADF`).
+- `fs_read` reads once and returns what it got, so it is the primitive for
+  pipes, sockets, and stdin — none of which have a size to seek to.
+- `fs_list_dir` separates entries with a **NUL** byte, the one byte a POSIX
+  filename cannot contain (a newline can). `.` and `..` are omitted. An empty
+  result means either an empty directory or an unreadable one; `std/fs` calls
+  `is_dir` first to tell them apart.
+- `exists`/`is_dir` probe rather than `stat`: the two platforms disagree on
+  where the `Stat` struct lives. A directory answers `getdents64`, a regular
+  file answers `ENOTDIR`; Darwin's `opendir` makes the same distinction.
+
+**These calls block their worker's OS thread for the syscall's duration, and
+that is not a netpoller gap.** POSIX has no non-blocking read of a regular file:
+`epoll`/`kqueue` always report one as ready. The netpoller (§11) exists for
+sockets and pipes. A file read therefore stalls one worker, never the process —
+other green threads on other workers keep running.
 
 ---
 

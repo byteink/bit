@@ -176,6 +176,7 @@ const predeclared_funcs = [_][]const u8{
     // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
     // readFile layer wraps these in std/fs.
     "fsOpen", "fsReadAll", "fsWrite", "fsClose",
+    "fsAppend", "fsRead", "fsExists", "fsIsDir", "fsMkdir", "fsRemove", "fsListDir",
     // Float primitives (ABI.md §17); std/math re-exports them under plain names.
     "fsqrt",   "ffloor",     "fceil",   "fround",  "ftrunc",
     "fpow",    "fatan2",     "flog",    "flog2",   "flog10",

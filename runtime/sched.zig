@@ -349,16 +349,21 @@ pub fn closeFd(fd: std.posix.fd_t) void {
     }
 }
 
-/// Open a NUL-terminated `path` read-only, or create+truncate write-only.
-/// Returns the fd or an error. Raw syscall, per-platform like `writeFd` (no
-/// libc dependency on the hot path — see the module doc comment).
-pub fn openFd(path: [*:0]const u8, write: bool) !std.posix.fd_t {
+/// How `openFd` should open a path.
+pub const OpenMode = enum { read, write, append };
+
+/// Open a NUL-terminated `path`: read-only, create+truncate write-only, or
+/// create+append write-only. Returns the fd or an error. Raw syscall,
+/// per-platform like `writeFd` (no libc dependency on the hot path — see the
+/// module doc comment).
+pub fn openFd(path: [*:0]const u8, mode: OpenMode) !std.posix.fd_t {
     switch (builtin.os.tag) {
         .linux => {
-            const flags: std.os.linux.O = if (write)
-                .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }
-            else
-                .{ .ACCMODE = .RDONLY };
+            const flags: std.os.linux.O = switch (mode) {
+                .read => .{ .ACCMODE = .RDONLY },
+                .write => .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+                .append => .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+            };
             const rc = std.os.linux.open(path, flags, 0o644);
             switch (std.posix.errno(rc)) {
                 .SUCCESS => return @intCast(rc),
@@ -366,13 +371,117 @@ pub fn openFd(path: [*:0]const u8, write: bool) !std.posix.fd_t {
             }
         },
         else => {
-            const flags: std.c.O = if (write)
-                .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }
-            else
-                .{ .ACCMODE = .RDONLY };
+            const flags: std.c.O = switch (mode) {
+                .read => .{ .ACCMODE = .RDONLY },
+                .write => .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+                .append => .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+            };
             const fd = std.c.open(path, flags, @as(std.c.mode_t, 0o644));
             if (fd < 0) return error.OpenFailed;
             return fd;
+        },
+    }
+}
+
+/// Create directory `path` with mode 0o755. Returns false on any failure
+/// (including "already exists"), which `std/fs` turns into an error.
+pub fn mkdirAt(path: [*:0]const u8) bool {
+    switch (builtin.os.tag) {
+        .linux => return std.posix.errno(std.os.linux.mkdir(path, 0o755)) == .SUCCESS,
+        else => return std.c.mkdir(path, 0o755) == 0,
+    }
+}
+
+/// Remove a file, or an empty directory. Returns whether it is now gone.
+pub fn removeAt(path: [*:0]const u8) bool {
+    switch (builtin.os.tag) {
+        .linux => {
+            if (std.posix.errno(std.os.linux.unlink(path)) == .SUCCESS) return true;
+            return std.posix.errno(std.os.linux.rmdir(path)) == .SUCCESS;
+        },
+        else => {
+            if (std.c.unlink(path) == 0) return true;
+            return std.c.rmdir(path) == 0;
+        },
+    }
+}
+
+/// Whether `path` exists, and whether it is a directory. Both false when the
+/// path does not exist.
+pub const PathInfo = struct { exists: bool, is_dir: bool };
+
+/// Appends `path`'s directory entries to `out`, each terminated by a NUL byte,
+/// skipping `.` and `..`. Returns false if the directory cannot be read.
+///
+/// NUL is the separator because it is the one byte a POSIX filename cannot
+/// contain — joining on `\n` would corrupt any name with a newline in it.
+pub fn listDir(path: [*:0]const u8, out: *std.ArrayList(u8)) bool {
+    const gpa = std.heap.page_allocator;
+    switch (builtin.os.tag) {
+        .linux => {
+            const fd = openFd(path, .read) catch return false;
+            defer closeFd(fd);
+            var buf: [8192]u8 align(@alignOf(std.os.linux.dirent64)) = undefined;
+            while (true) {
+                const rc = std.os.linux.getdents64(fd, &buf, buf.len);
+                switch (std.posix.errno(rc)) {
+                    .SUCCESS => {},
+                    else => return false,
+                }
+                if (rc == 0) return true;
+                var off: usize = 0;
+                while (off < rc) {
+                    const d: *align(1) const std.os.linux.dirent64 = @ptrCast(&buf[off]);
+                    const name_ptr: [*:0]const u8 = @ptrCast(&buf[off + @offsetOf(std.os.linux.dirent64, "name")]);
+                    const name = std.mem.span(name_ptr);
+                    if (!isDotEntry(name)) {
+                        out.appendSlice(gpa, name) catch return false;
+                        out.append(gpa, 0) catch return false;
+                    }
+                    off += d.reclen;
+                }
+            }
+        },
+        else => {
+            const dir = std.c.opendir(path) orelse return false;
+            defer _ = std.c.closedir(dir);
+            while (std.c.readdir(dir)) |ent| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
+                if (isDotEntry(name)) continue;
+                out.appendSlice(gpa, name) catch return false;
+                out.append(gpa, 0) catch return false;
+            }
+            return true;
+        },
+    }
+}
+
+fn isDotEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+}
+
+/// Probes rather than `stat`s: the two platforms disagree on where the `Stat`
+/// struct lives and on its layout, and everything here needs is "does it open,
+/// and does it read as a directory". A directory answers `getdents64`; a
+/// regular file answers `ENOTDIR`. On Darwin `opendir` makes the same
+/// distinction directly.
+pub fn statPath(path: [*:0]const u8) PathInfo {
+    switch (builtin.os.tag) {
+        .linux => {
+            const fd = openFd(path, .read) catch return .{ .exists = false, .is_dir = false };
+            defer closeFd(fd);
+            var probe: [256]u8 align(@alignOf(std.os.linux.dirent64)) = undefined;
+            const rc = std.os.linux.getdents64(fd, &probe, probe.len);
+            return .{ .exists = true, .is_dir = std.posix.errno(rc) == .SUCCESS };
+        },
+        else => {
+            if (std.c.opendir(path)) |d| {
+                _ = std.c.closedir(d);
+                return .{ .exists = true, .is_dir = true };
+            }
+            const fd = openFd(path, .read) catch return .{ .exists = false, .is_dir = false };
+            closeFd(fd);
+            return .{ .exists = true, .is_dir = false };
         },
     }
 }
