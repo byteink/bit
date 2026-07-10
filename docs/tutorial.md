@@ -183,13 +183,7 @@ main thread folds them into one map. This is the whole program — it is also
 import { readFile } from "std/fs"
 import { toLower } from "std/strings"
 
-// A word -> occurrences tally. It is a struct only because writing the channel
-// element in full, `chan<map<string, int>>`, would lex its `>>` as a shift.
-struct Tally {
-  export counts: map<string, int>
-}
-
-function countWords(text: string): Tally {
+function countWords(text: string): map<string, int> {
   let counts = map<string, int>()
   let word = ""
   let i = 0
@@ -207,17 +201,17 @@ function countWords(text: string): Tally {
     }
     i = i + 1
   }
-  return Tally{ counts: counts }
+  return counts
 }
 
 // A read error yields an empty tally, so the collector below always receives
 // exactly one message per worker it spawned.
-function worker(path: string, out: chan<Tally>) {
+function worker(path: string, out: chan<map<string, int>>) {
   out <- countWords(readFile(path) catch "")
 }
 
-function countFiles(paths: []string): Tally {
-  let results = chan<Tally>(len(paths))
+function countFiles(paths: []string): map<string, int> {
+  let results = chan<map<string, int>>(len(paths))
   for p of paths {
     spawn worker(p, results)
   }
@@ -225,16 +219,17 @@ function countFiles(paths: []string): Tally {
   let total = map<string, int>()
   let i = 0
   while (i < len(paths)) {
-    for (word, n) of (<- results).counts {
+    let part = <- results
+    for (word, n) of part {
       total[word] = total[word] + n
     }
     i = i + 1
   }
-  return Tally{ counts: total }
+  return total
 }
 
 function main() {
-  let counts = countFiles(["a.txt", "b.txt", "c.txt"]).counts
+  let counts = countFiles(["a.txt", "b.txt", "c.txt"])
   println("distinct words: ${len(counts)}")
   println("the=${counts["the"]}")
 }

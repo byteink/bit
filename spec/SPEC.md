@@ -260,6 +260,12 @@ Notes on overloaded glyphs, disambiguated by grammar position:
 - `&` and `|` and `^` and `~` are bitwise; `&&` and `||` and `!` are logical.
   There is no address-of operator (Bit has no pointers, §13).
 - `...` marks a variadic parameter and performs spread in a call.
+- Maximal munch takes `>>`, `>>=` and `>=` as single tokens, but a run of `>` also
+  closes nested generic argument lists (`chan<map<string, int>>`). Where the
+  grammar requires a `>`, the parser **splits** such a token: it takes the leading
+  `>` and leaves the remainder (`>>` leaves `>`, `>>=` leaves `>=`, `>=` leaves
+  `=`) as the next token. Splitting repeats, so `Opt<Opt<i64>>= v` parses. Nothing
+  is split where a `>` is not required, so `a >> b` and `a >= b` are unaffected.
 
 ---
 
@@ -289,6 +295,11 @@ Additionally:
 - A `";"` is inserted at end of file if the last token is a terminator.
 - Consecutive synthesized/explicit semicolons collapse to one; empty statements
   are allowed and ignored.
+- A `type` alias (§10.2) needs no separator from the declaration that follows it.
+  It is the one declaration that can end at `>` — `type Ids = map<string, int>` —
+  and `>` is a binary operator, deliberately absent from the terminator list
+  above, so no `";"` is inserted after it. Every other declaration ends at `}`,
+  an identifier, or a literal, all of which do trigger insertion.
 
 **Consequence — line continuation.** A line that must continue onto the next line
 must end with a token that is **not** a terminator. In practice: leave a binary

@@ -117,6 +117,41 @@ const Parser = struct {
         return self.tok.span;
     }
 
+    /// `>>`, `>>=` and `>=` lex as single tokens, but a run of `>` also closes
+    /// nested generic argument lists — `chan<map<string, int>>`. The lexer cannot
+    /// tell the two apart without tracking angle-bracket depth (the classic C++
+    /// `vector<vector<int>>` problem), so the parser splits the token where it
+    /// knows a `>` is due: take the leading `>`, leave the remainder current.
+    ///
+    /// Splitting is iterative, which is what `let x: Opt<Opt<i64>>= v` needs:
+    /// `>>=` yields `>` and leaves `>=`, which the enclosing list then splits
+    /// again into `>` and `=`.
+    ///
+    /// A wrong guess costs nothing: in expression position this only runs under
+    /// `tryGenericPostfix`'s speculation, and `a < b >= c` rewinds via `reset`.
+    fn expectGenericClose(self: *Parser) ParseError!Span {
+        const rest: Kind = switch (self.tok.kind) {
+            .shr => .gt,
+            .shr_eq => .gt_eq,
+            .gt_eq => .eq,
+            else => return self.expect(.gt, "'>'"),
+        };
+        const s = self.tok.span;
+        self.tok = .{ .kind = rest, .span = .{ .file = s.file, .start = s.start + 1, .end = s.end } };
+        return .{ .file = s.file, .start = s.start, .end = s.start + 1 };
+    }
+
+    /// Whether the current token closes a list opened with `close`. A generic
+    /// list also closes on the `>` hiding at the front of a `>>`, `>>=` or `>=`.
+    fn atClose(self: *const Parser, close: Kind) bool {
+        if (self.tok.kind == close) return true;
+        if (close != .gt) return false;
+        return switch (self.tok.kind) {
+            .shr, .shr_eq, .gt_eq => true,
+            else => false,
+        };
+    }
+
     fn expectIdent(self: *Parser) ParseError!Index {
         if (self.tok.kind != .ident) {
             try self.fail("an identifier");
@@ -188,12 +223,12 @@ const Parser = struct {
 
         var items: std.ArrayList(Index) = .empty;
         errdefer items.deinit(self.gpa);
-        if (self.tok.kind == close) return items.toOwnedSlice(self.gpa);
+        if (self.atClose(close)) return items.toOwnedSlice(self.gpa);
         try items.append(self.gpa, try parseItem(self));
         // Bounded by remaining tokens: each iteration consumes a separator.
         while (self.tok.kind == .comma or (allow_semi and self.tok.kind == .semicolon)) {
             try self.advance();
-            if (self.tok.kind == close) break; // trailing separator
+            if (self.atClose(close)) break; // trailing separator
             try items.append(self.gpa, try parseItem(self));
         }
         return items.toOwnedSlice(self.gpa);
@@ -224,7 +259,7 @@ const Parser = struct {
             // `none` means parseTopDecl already reported and synchronized itself;
             // re-checking for ';' here would double-report the same failure.
             if (decl == none) continue;
-            if (!try self.accept(.semicolon) and self.tok.kind != .eof) {
+            if (!try self.accept(.semicolon) and self.tok.kind != .eof and !self.selfTerminating(decl)) {
                 try self.fail("';'");
                 self.synchronizeTopLevel();
             }
@@ -377,6 +412,19 @@ const Parser = struct {
     fn parsePat(self: *Parser) ParseError!Index {
         if (self.tok.kind == .l_paren) return self.parseTuplePat();
         return self.expectIdent(); // '_' lexes as an ordinary identifier
+    }
+
+    /// A declaration that needs no `;` to separate it from the next one.
+    ///
+    /// Only `type` qualifies, and only because a type can end at `>`
+    /// (`type Ids = map<string, int>`). `>` is a binary operator, so it is
+    /// deliberately absent from the ASI terminator set (§5.6) — a line ending in
+    /// one continues. Every other declaration ends at `}` or an expression, both
+    /// of which do trigger the insertion.
+    fn selfTerminating(self: *const Parser, decl: Index) bool {
+        var d = decl;
+        if (self.tree.get(d).tag == .@"export") d = self.tree.kids(d)[0];
+        return self.tree.get(d).tag == .type_alias;
     }
 
     fn parseTypeAlias(self: *Parser) ParseError!Index {
@@ -560,7 +608,7 @@ const Parser = struct {
                 try self.advance();
                 const items = try self.commaList(.gt, parseType, false);
                 defer self.gpa.free(items);
-                const end = try self.expect(.gt, "'>'");
+                const end = try self.expectGenericClose();
                 const targs = try self.tree.add(.type_args, join(self.span(name), end), 0, items);
                 return self.tree.add(.generic_inst, join(self.span(name), end), 0, &.{ name, targs });
             },
@@ -596,7 +644,7 @@ const Parser = struct {
         const key = try self.parseType();
         _ = try self.expect(.comma, "','");
         const val = try self.parseType();
-        const end = try self.expect(.gt, "'>'");
+        const end = try self.expectGenericClose();
         return self.tree.add(.map_type, join(start, end), 0, &.{ key, val });
     }
 
@@ -604,7 +652,7 @@ const Parser = struct {
         const start = try self.expect(.kw_chan, "'chan'");
         _ = try self.expect(.lt, "'<'");
         const elem = try self.parseType();
-        const end = try self.expect(.gt, "'>'");
+        const end = try self.expectGenericClose();
         return self.tree.add(.chan_type, join(start, end), 0, &.{elem});
     }
 
@@ -1315,7 +1363,7 @@ const Parser = struct {
         const items = try self.commaList(.gt, parseType, false);
         defer self.gpa.free(items);
         if (items.len == 0) return error.Speculative; // '<>' is never a type-arg list
-        const gt_span = try self.expect(.gt, "'>'");
+        const gt_span = try self.expectGenericClose();
         const targs = try self.tree.add(.type_args, join(lt_span, gt_span), 0, items);
         if (self.tok.kind == .l_paren) {
             try self.advance();
