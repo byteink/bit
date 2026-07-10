@@ -1,0 +1,362 @@
+// Bit standard library — http module.
+//
+// HTTP/1.1 over std/net TCP, built entirely in Bit: the flagship of the
+// concurrency model. A server accepts connections and handles each on its own
+// green thread; a client dials, sends one request, and reads the response.
+//
+// Scope for v1: plain HTTP (no TLS), one request per connection
+// (`Connection: close`), no chunked transfer encoding, no redirects. Headers are
+// carried as a raw block and read with `header()` — case-insensitively, by name.
+
+import { listen, dial, Listener, Conn } from "std/net"
+import { indexOf, hasPrefix, toLower } from "std/strings"
+
+// ---------------------------------------------------------------------------
+// Small parsing helpers
+// ---------------------------------------------------------------------------
+
+// A non-negative integer parsed from a decimal string, or -1 on any non-digit
+// (including the empty string). Used for status codes and Content-Length.
+function atoi(s: string): int {
+  if (len(s) == 0) {
+    return -1
+  }
+  let v = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c < '0' || c > '9') {
+      return -1
+    }
+    v = v * 10 + i64(c - '0')
+    i = i + 1
+  }
+  return v
+}
+
+// The decimal text of a non-negative integer.
+function itoa(n: int): string {
+  if (n == 0) {
+    return "0"
+  }
+  let count = 0
+  let t = n
+  while (t > 0) {
+    count = count + 1
+    t = t / 10
+  }
+  let b = []byte(count)
+  let v = n
+  let i = count - 1
+  while (v > 0) {
+    b[i] = byte(48 + v % 10)
+    v = v / 10
+    i = i - 1
+  }
+  return string(b)
+}
+
+// `s` with leading and trailing spaces and tabs removed.
+function trimSpace(s: string): string {
+  let lo = 0
+  while (lo < len(s) && (s[lo] == ' ' || s[lo] == '\t')) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && (s[hi - 1] == ' ' || s[hi - 1] == '\t')) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+// The value of header `name` in a raw header block ("Name: value\r\n..."),
+// matched case-insensitively at a line start, or "" if absent.
+export function header(block: string, name: string): string {
+  let lower = toLower(block)
+  let key = toLower(name) + ":"
+  let start = 0 - 1
+  if (hasPrefix(lower, key)) {
+    start = len(key)
+  } else {
+    let at = indexOf(lower, "\r\n" + key)
+    if (at >= 0) {
+      start = at + 2 + len(key)
+    }
+  }
+  if (start < 0) {
+    return ""
+  }
+  let rest = block[start:len(block)]
+  let end = indexOf(rest, "\r\n")
+  if (end < 0) {
+    return trimSpace(rest)
+  }
+  return trimSpace(rest[0:end])
+}
+
+// ---------------------------------------------------------------------------
+// Request / Response
+// ---------------------------------------------------------------------------
+
+// A parsed HTTP request. `headers` is the raw block; read individual fields with
+// `header(req.headers, "...")`.
+export struct Request {
+  method: string
+  path: string
+  headers: string
+  body: string
+}
+
+// An HTTP response. The server fills in `Content-Length` and `Connection` for
+// you; set `contentType` and any extra `headers` (raw, "Name: value\r\n"-framed)
+// yourself.
+export struct Response {
+  status: int
+  contentType: string
+  headers: string
+  body: string
+}
+
+// A `200 OK` response carrying `body` as UTF-8 text.
+export function ok(body: string): Response {
+  return Response{ status: 200, contentType: "text/plain; charset=utf-8", headers: "", body: body }
+}
+
+// A response with an explicit status and a text body.
+export function respond(status: int, body: string): Response {
+  return Response{ status: status, contentType: "text/plain; charset=utf-8", headers: "", body: body }
+}
+
+// The reason phrase for a status code — a small, common set; anything else is
+// labelled generically, which is legal (clients key on the numeric status).
+function reason(status: int): string {
+  if (status == 200) { return "OK" }
+  if (status == 201) { return "Created" }
+  if (status == 204) { return "No Content" }
+  if (status == 301) { return "Moved Permanently" }
+  if (status == 302) { return "Found" }
+  if (status == 400) { return "Bad Request" }
+  if (status == 401) { return "Unauthorized" }
+  if (status == 403) { return "Forbidden" }
+  if (status == 404) { return "Not Found" }
+  if (status == 405) { return "Method Not Allowed" }
+  if (status == 500) { return "Internal Server Error" }
+  return "Status"
+}
+
+// The wire form of a response: status line, framing headers, a blank line, body.
+function serializeResponse(res: Response): string {
+  let head = "HTTP/1.1 ${res.status} ${reason(res.status)}\r\n"
+  head = head + "Content-Length: ${itoa(len(res.body))}\r\n"
+  head = head + "Content-Type: ${res.contentType}\r\n"
+  head = head + "Connection: close\r\n"
+  head = head + res.headers
+  head = head + "\r\n"
+  return head + res.body
+}
+
+// ---------------------------------------------------------------------------
+// Reading a message off a connection
+// ---------------------------------------------------------------------------
+
+// Reads a full HTTP message (headers, then a Content-Length body if any) from
+// `c`. Returns the header block and body separately. An empty header block means
+// the peer closed before sending a complete message.
+function readMessage(c: Conn): Request {
+  let buf = ""
+  while (indexOf(buf, "\r\n\r\n") < 0) {
+    let chunk = c.read(4096)
+    if (len(chunk) == 0) {
+      // Peer closed mid-headers: return an empty request, the caller stops.
+      return Request{ method: "", path: "", headers: "", body: "" }
+    }
+    buf = buf + chunk
+  }
+  let sep = indexOf(buf, "\r\n\r\n")
+  let headBlock = buf[0:sep]
+  let body = buf[sep + 4:len(buf)]
+
+  // Split the request line off the top of the header block.
+  let eol = indexOf(headBlock, "\r\n")
+  let requestLine = headBlock
+  let headers = ""
+  if (eol >= 0) {
+    requestLine = headBlock[0:eol]
+    headers = headBlock[eol + 2:len(headBlock)]
+  }
+  let sp1 = indexOf(requestLine, " ")
+  let method = ""
+  let path = ""
+  if (sp1 >= 0) {
+    method = requestLine[0:sp1]
+    let afterMethod = requestLine[sp1 + 1:len(requestLine)]
+    let sp2 = indexOf(afterMethod, " ")
+    if (sp2 >= 0) {
+      path = afterMethod[0:sp2]
+    } else {
+      path = afterMethod
+    }
+  }
+
+  // Read the rest of a declared body, if it did not all arrive with the headers.
+  let cl = atoi(header(headers, "content-length"))
+  while (cl > 0 && len(body) < cl) {
+    let chunk = c.read(4096)
+    if (len(chunk) == 0) {
+      break
+    }
+    body = body + chunk
+  }
+  return Request{ method: method, path: path, headers: headers, body: body }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+// A listening HTTP server. Drive it with an `accept()` loop, spawning a green
+// thread per exchange — a slow handler cannot delay the next accept.
+export struct Server {
+  listener: Listener
+}
+
+// One accepted request and the connection to answer it on.
+export struct Exchange {
+  conn: Conn
+  request: Request
+}
+
+// Bind and start listening for HTTP on `host:port`. `port` 0 lets the kernel
+// choose one; read it back with `port()`.
+export function serve(host: string, port: int): Server! {
+  let l = listen(host, port)?
+  return Server{ listener: l }
+}
+
+// The port the server is bound to.
+export function (s: Server) port(): int! {
+  return s.listener.port()?
+}
+
+// Accept the next connection and read its request. Parks until a client
+// arrives; the returned `Exchange` carries the connection to respond on.
+export function (s: Server) accept(): Exchange! {
+  let c = s.listener.accept()?
+  let req = readMessage(c)
+  return Exchange{ conn: c, request: req }
+}
+
+// Write `res` to the exchange's connection and close it (one request per
+// connection in v1).
+export function (e: Exchange) respond(res: Response): ()! {
+  e.conn.write(serializeResponse(res))?
+  e.conn.close()
+}
+
+export function (s: Server) close() {
+  s.listener.close()
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+// A parsed http:// URL. Port defaults to 80, path to "/".
+struct Url {
+  host: string
+  port: int
+  path: string
+}
+
+function parseUrl(url: string): Url! {
+  let rest = url
+  if (hasPrefix(toLower(rest), "http://")) {
+    rest = rest[7:len(rest)]
+  }
+  // Split authority from path at the first '/'.
+  let slash = indexOf(rest, "/")
+  let authority = rest
+  let path = "/"
+  if (slash >= 0) {
+    authority = rest[0:slash]
+    path = rest[slash:len(rest)]
+  }
+  // Split host from an optional :port.
+  let host = authority
+  let port = 80
+  let colon = indexOf(authority, ":")
+  if (colon >= 0) {
+    host = authority[0:colon]
+    let p = atoi(authority[colon + 1:len(authority)])
+    if (p < 0) {
+      fail newError("bad port in ${url}")
+    }
+    port = p
+  }
+  if (len(host) == 0) {
+    fail newError("no host in ${url}")
+  }
+  return Url{ host: host, port: port, path: path }
+}
+
+// Parse a response off a fully-read connection: status line, headers, body.
+function parseResponse(raw: string): Response! {
+  let sep = indexOf(raw, "\r\n\r\n")
+  if (sep < 0) {
+    fail newError("malformed response")
+  }
+  let headBlock = raw[0:sep]
+  let body = raw[sep + 4:len(raw)]
+
+  let eol = indexOf(headBlock, "\r\n")
+  let statusLine = headBlock
+  let headers = ""
+  if (eol >= 0) {
+    statusLine = headBlock[0:eol]
+    headers = headBlock[eol + 2:len(headBlock)]
+  }
+  // "HTTP/1.1 200 OK" — the code is the token after the first space.
+  let sp1 = indexOf(statusLine, " ")
+  if (sp1 < 0) {
+    fail newError("malformed status line")
+  }
+  let afterVer = statusLine[sp1 + 1:len(statusLine)]
+  let sp2 = indexOf(afterVer, " ")
+  let codeText = afterVer
+  if (sp2 >= 0) {
+    codeText = afterVer[0:sp2]
+  }
+  let code = atoi(codeText)
+  if (code < 0) {
+    fail newError("bad status code")
+  }
+  return Response{ status: code, contentType: header(headers, "content-type"), headers: headers, body: body }
+}
+
+// Send `method url` with an optional body and return the response. The server is
+// asked to close the connection, so the whole response is read to EOF.
+export function request(method: string, url: string, body: string): Response! {
+  let u = parseUrl(url)?
+  let c = dial(u.host, u.port)?
+  let req = "${method} ${u.path} HTTP/1.1\r\n"
+  req = req + "Host: ${u.host}\r\n"
+  req = req + "Connection: close\r\n"
+  if (len(body) > 0) {
+    req = req + "Content-Length: ${itoa(len(body))}\r\n"
+  }
+  req = req + "\r\n" + body
+  c.write(req)?
+  let raw = c.readAll()
+  c.close()
+  return parseResponse(raw)?
+}
+
+// GET `url`.
+export function get(url: string): Response! {
+  return request("GET", url, "")?
+}
+
+// POST `body` to `url`.
+export function post(url: string, body: string): Response! {
+  return request("POST", url, body)?
+}

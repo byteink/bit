@@ -16,6 +16,8 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [math](math.md) | `"std/math"` | `f64` maths and integer helpers |
 | [time](time.md) | `"std/time"` | Clocks, durations, sleeping |
 | [os](os.md) | `"std/os"` | Arguments, environment, exit |
+| [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
+| [http](http.md) | `"std/http"` | HTTP/1.1 server and client |
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
 
 ## Conventions
