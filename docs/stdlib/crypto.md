@@ -427,3 +427,52 @@ also makes it resistant to the length-extension attack that SHA-512 admits.
 A new SHA-512/256 hasher: a 32-byte (256-bit) digest from the SHA-512 engine
 with the FIPS 180-4 §5.3.6 initial value. A drop-in 256-bit hash that is not
 SHA-256 and, on 64-bit hardware, outruns it.
+## Base64
+
+Base64 (RFC 4648) encodes arbitrary bytes as ASCII text, three input bytes per
+four output characters. Two variants are provided: the *standard* alphabet
+(`+`/`/`, `=`-padded) via `encode`/`decode`, and the *URL-safe* alphabet
+(`-`/`_`, no padding) via `encodeUrl`/`decodeUrl` — safe to drop into a URL or a
+filename. Each variant is self-inverse: `decode(encode(b))` and
+`decodeUrl(encodeUrl(b))` return the original bytes. Decoding is validating: an
+out-of-alphabet character or an impossible length is an error, not silent
+garbage.
+
+```bit
+import { encode, decode, encodeUrl, decodeUrl } from "std/crypto"
+
+// Standard base64 with '=' padding — round-trips any bytes.
+function roundTrip(data: []byte): []byte! {
+  return decode(encode(data))?
+}
+
+// URL-safe alphabet (-/_), no padding — for URLs, query strings, and filenames.
+function tokenize(data: []byte): string {
+  return encodeUrl(data)
+}
+
+function detokenize(token: string): []byte! {
+  return decodeUrl(token)?
+}
+```
+
+### `encode(b: []byte): string`
+
+Encodes `b` with the standard alphabet and `=` padding. The result length is
+always a multiple of 4; empty input yields the empty string.
+
+### `decode(s: string): []byte!`
+
+Decodes a standard, `=`-padded base64 string. Fails on a character outside the
+standard alphabet or a length that is not a multiple of 4.
+
+### `encodeUrl(b: []byte): string`
+
+Encodes `b` with the URL-safe alphabet (`-` and `_`) and no padding, so the
+result is safe inside a URL path, query, or filename.
+
+### `decodeUrl(s: string): []byte!`
+
+Decodes an unpadded URL-safe base64 string. Fails on a character outside the
+URL-safe alphabet — an `=` included, since URL-safe output is never padded — or a
+length that no valid encoding can produce.

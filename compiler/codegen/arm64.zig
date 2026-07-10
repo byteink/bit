@@ -1053,8 +1053,16 @@ fn emitDivInt(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId)
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     const r = try getInt(self, vregOf(self, rhs), scratch2);
     const signed = op == .sdiv or op == .srem;
-    if (signed) try self.sdivRR(scratch1, l, r) else try self.udivRR(scratch1, l, r);
-    if (op == .srem or op == .urem) try self.msubRR(scratch1, scratch1, r, l);
+    const is_rem = op == .srem or op == .urem;
+    // `rem` recovers its result with `msub dst = l - q*r`, so it still needs `l`
+    // (and `r`) after the divide. `l` aliases `scratch1` whenever it was spilled
+    // and reloaded there, so writing the quotient to `scratch1` would clobber `l`
+    // before `msub` reads it (yielding `q*(1-r)`). Divide into `scratch3` — never
+    // allocatable, and unused on this path — so `l` survives. A plain divide has
+    // no later use of `l`, so it keeps the quotient in `scratch1` as its result.
+    const q: Reg = if (is_rem) scratch3 else scratch1;
+    if (signed) try self.sdivRR(q, l, r) else try self.udivRR(q, l, r);
+    if (is_rem) try self.msubRR(scratch1, q, r, l);
     try putInt(self, dst, scratch1);
 }
 

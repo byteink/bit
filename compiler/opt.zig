@@ -153,7 +153,9 @@ fn foldSignedDivRem(op: ir.Op, bits: u8, a_raw: u64, b_raw: u64) ?ConstVal {
     const a = signExtend(a_raw, bits);
     const b = signExtend(b_raw, bits);
     if (b == 0) return null;
-    const min_val: i64 = -(@as(i64, 1) << @intCast(bits - 1));
+    // Width's most-negative value. Compute in i128 so `bits == 64` (where the
+    // negand `1 << 63` is `i64`'s min and negating it overflows) doesn't trap.
+    const min_val: i64 = @intCast(-(@as(i128, 1) << @intCast(bits - 1)));
     if (op == .sdiv and a == min_val and b == -1) return null;
     const result = switch (op) {
         .sdiv => @divTrunc(a, b),
