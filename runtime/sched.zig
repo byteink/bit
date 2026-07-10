@@ -105,13 +105,28 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
             // it (offset 24 in `Context`), so it is genuinely preserved across
             // the switch — declaring it clobbered instead is what previously
             // let LLVM stash a live `Worker*` there and lose it on resume.
+            //
+            // `x18` MUST be clobbered, and this is Linux-specific. AArch64 calls
+            // it the platform register: Darwin reserves it (so LLVM never
+            // allocates it and the omission was harmless there), but Linux
+            // leaves it general-purpose, so LLVM will keep a live value in it
+            // across this asm unless told the block destroys it. The switch does
+            // not save/restore x18, and a task can park on one worker and resume
+            // on another whose x18 differs — a stale value then faults on the
+            // first `str [x18, …]` after resume. Clobbering it (it is otherwise
+            // call-clobbered on Linux) forces a reload, exactly like x0–x17.
             : .{
                 .x0 = true,  .x2 = true,  .x3 = true,  .x4 = true,  .x5 = true,
                 .x6 = true,  .x7 = true,  .x8 = true,  .x9 = true,  .x10 = true,
                 .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                .x27 = true, .x28 = true, .x29 = true, .memory = true,
+                // Only clobber x18 where it is general-purpose. On Darwin it is
+                // a reserved platform register — listing it there is an LLVM
+                // "reserved register in clobber list" warning (and unnecessary,
+                // since LLVM never allocates it), so gate on the OS.
+                .x16 = true, .x17 = true, .x18 = builtin.os.tag == .linux,
+                .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+                .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+                .x29 = true, .memory = true,
             }),
         .x86_64 => asm volatile (
             \\ movq 0(%%rsi), %%rax
