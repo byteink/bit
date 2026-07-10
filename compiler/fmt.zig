@@ -1239,9 +1239,15 @@ test "semicolons omitted after ASI terminators, kept where ASI would not fire" {
     // Ends in a terminator (int_lit, `)`, ident) -> no `;`.
     try expectFmt("let x = 1", "let x = 1\n");
     try expectFmt("let x = f()", "let x = f()\n");
-    // Ends in `>` (a generic type), which ASI does NOT treat as a terminator,
-    // so the explicit `;` must stay or re-parsing would change.
-    try expectFmt("type Boxed = Box<int>", "type Boxed = Box<int>;\n");
+    // Ends in `>` closing a generic — a closer, which ASI now treats as a
+    // terminator, so the `;` is dropped (and re-parsing is unchanged).
+    try expectFmt("type Boxed = Box<int>", "type Boxed = Box<int>\n");
+    // A struct field whose type ends in `>` needs no separator before the next
+    // (a short struct canonicalizes inline, with commas).
+    try expectFmt(
+        "struct S {\n  m: map<string, int>\n  n: int\n}\n",
+        "struct S { m: map<string, int>, n: int }\n",
+    );
 }
 
 test "single-statement match arm and function body inline; a match never gets a trailing ';'" {

@@ -259,7 +259,7 @@ const Parser = struct {
             // `none` means parseTopDecl already reported and synchronized itself;
             // re-checking for ';' here would double-report the same failure.
             if (decl == none) continue;
-            if (!try self.accept(.semicolon) and self.tok.kind != .eof and !self.selfTerminating(decl)) {
+            if (!try self.accept(.semicolon) and self.tok.kind != .eof) {
                 try self.fail("';'");
                 self.synchronizeTopLevel();
             }
@@ -412,19 +412,6 @@ const Parser = struct {
     fn parsePat(self: *Parser) ParseError!Index {
         if (self.tok.kind == .l_paren) return self.parseTuplePat();
         return self.expectIdent(); // '_' lexes as an ordinary identifier
-    }
-
-    /// A declaration that needs no `;` to separate it from the next one.
-    ///
-    /// Only `type` qualifies, and only because a type can end at `>`
-    /// (`type Ids = map<string, int>`). `>` is a binary operator, so it is
-    /// deliberately absent from the ASI terminator set (§5.6) — a line ending in
-    /// one continues. Every other declaration ends at `}` or an expression, both
-    /// of which do trigger the insertion.
-    fn selfTerminating(self: *const Parser, decl: Index) bool {
-        var d = decl;
-        if (self.tree.get(d).tag == .@"export") d = self.tree.kids(d)[0];
-        return self.tree.get(d).tag == .type_alias;
     }
 
     fn parseTypeAlias(self: *Parser) ParseError!Index {

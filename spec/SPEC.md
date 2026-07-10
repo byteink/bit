@@ -285,6 +285,12 @@ non-comment token emitted on the line is one of the **terminator tokens**:
   `BOOL_LIT`, `NIL_LIT`);
 - one of the keywords `return`, `break`, `continue`, `fail`;
 - one of the closing delimiters `)`, `]`, `}`;
+- `>` or `>>` — the closers of a generic argument list (`map<K, V>`,
+  `chan<map<K, V>>`; `>>>` and deeper lex down to these). This is the one place
+  a token's closer role and its comparison/shift-operator role diverge: a
+  trailing `>`/`>>` meant to *continue* a comparison must be parenthesized.
+  `>=` and `>>=` are **not** terminators — they never close a generic, so they
+  stay pure operators;
 - one of the postfix operators `++`, `--`;
 - the error-propagation operator `?`.
 
@@ -295,11 +301,11 @@ Additionally:
 - A `";"` is inserted at end of file if the last token is a terminator.
 - Consecutive synthesized/explicit semicolons collapse to one; empty statements
   are allowed and ignored.
-- A `type` alias (§10.2) needs no separator from the declaration that follows it.
-  It is the one declaration that can end at `>` — `type Ids = map<string, int>` —
-  and `>` is a binary operator, deliberately absent from the terminator list
-  above, so no `";"` is inserted after it. Every other declaration ends at `}`,
-  an identifier, or a literal, all of which do trigger insertion.
+
+Because `>`/`>>` terminate, a declaration or field whose type ends in a generic
+close needs no explicit separator: `type Ids = map<string, int>`, a
+`headers: map<string, string>` struct field, and an interface method returning
+`Opt<T>` all end their line naturally.
 
 **Consequence — line continuation.** A line that must continue onto the next line
 must end with a token that is **not** a terminator. In practice: leave a binary

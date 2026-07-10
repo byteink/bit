@@ -702,6 +702,16 @@ pub fn isTerminator(k: Kind) bool {
         .r_paren,
         .r_bracket,
         .r_brace,
+        // `>` and `>>` most often *close* a generic argument list (`map<K, V>`,
+        // `chan<map<K, V>>`) — a closer, like `)`/`]`, so a line ending in one
+        // terminates. This is the one place the closer role and the
+        // comparison/shift-operator role of the same token diverge; a trailing
+        // `>`/`>>` meant as an operator-continuation must be parenthesized. `>=`
+        // and `>>=` are excluded: they never close a type, so keeping them as
+        // pure operators costs nothing. `>>>` lexes as `.shr` then `.gt`, so
+        // these two cover any nesting depth.
+        .gt,
+        .shr,
         .plus_plus,
         .minus_minus,
         .question,
