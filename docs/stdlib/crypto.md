@@ -193,3 +193,82 @@ Like `encodeHex`, but with uppercase digits (`0-9A-F`).
 The bytes `s` spells in hex, high nibble first. Case-insensitive. Fails if `s`
 has an odd length or contains any character outside `[0-9a-fA-F]`, so it is the
 exact inverse of `encodeHex`/`encodeHexUpper` on well-formed input.
+
+## SHA-2
+
+The SHA-2 32-bit digests, SHA-256 and SHA-224 (FIPS 180-4). Both share one
+64-round compression over 32-bit words and differ only in their initial state and
+output length: SHA-256 is 32 bytes, SHA-224 is 28. Each is a `Hash` (structurally,
+§14.3), so it streams — feed bytes with any number of `write` calls, then read the
+digest with `sum` — and slots into anything written against `Hash`, including HMAC
+and `digest`.
+
+`sum` finalizes on a copy of the running state, so it neither consumes the hasher
+nor blocks further writes; `reset` rewinds to the empty message. Outputs are
+verified against the FIPS 180-4 known-answer vectors (e.g. SHA-256 of `"abc"` is
+`ba7816bf…f20015ad`).
+
+```bit
+import { newSha256, newSha224, digest, encodeHex } from "std/crypto"
+
+// One-shot SHA-256 of a string, rendered as lowercase hex.
+function sha256Hex(s: string): string {
+  return encodeHex(digest(newSha256(), []byte(s)))
+}
+
+// One-shot SHA-224, rendered as hex.
+function sha224Hex(s: string): string {
+  return encodeHex(digest(newSha224(), []byte(s)))
+}
+
+// Streaming: write the message in parts, then read the digest. `size` and
+// `blockSize` report 32 and 64 for SHA-256; `reset` rewinds for reuse.
+function streamed(): []byte {
+  let h = newSha256()
+  h.write([]byte("abc"))
+  h.write([]byte("def"))
+  let d = h.sum()
+  h.reset()
+  return d
+}
+```
+
+### `Sha256`
+
+The streaming state for both SHA-256 and SHA-224. Build one with `newSha256` or
+`newSha224` rather than a literal — the constructors install the correct initial
+state and round constants. It satisfies `Hash`, so it carries the five streaming
+methods below.
+
+### `newSha256(): Sha256`
+
+A fresh SHA-256 hasher over the empty message. Its `size` is 32.
+
+### `newSha224(): Sha256`
+
+A fresh SHA-224 hasher over the empty message. Its `size` is 28. SHA-224 is
+SHA-256 with a different initial state, truncated to the first 28 output bytes.
+
+### `Sha256.write(data: []byte)`
+
+Absorb `data`, buffering internally into 64-byte blocks. Call it as many times as
+you like; the digest is of everything written since the last `reset`.
+
+### `Sha256.sum(): []byte`
+
+The digest of everything written so far — 32 bytes for SHA-256, 28 for SHA-224.
+Finalizes on a copy of the state, so it is non-destructive: you may call it
+repeatedly and keep writing afterward.
+
+### `Sha256.reset()`
+
+Rewind to the empty message, restoring the variant's initial state and dropping
+any buffered bytes, so one value can hash many messages.
+
+### `Sha256.size(): int`
+
+The digest length in bytes: 32 for SHA-256, 28 for SHA-224.
+
+### `Sha256.blockSize(): int`
+
+The internal block size in bytes — 64 for both variants. HMAC keys this block.
