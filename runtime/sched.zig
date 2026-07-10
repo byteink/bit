@@ -1124,6 +1124,14 @@ pub fn currentTask() ?*Task {
     return w.running;
 }
 
+/// The scheduler owning the calling worker, or null off a worker thread. `pub`
+/// so `net.zig`'s park callback can reach the netpoller without making `Worker`
+/// itself public.
+pub fn currentScheduler() ?*Scheduler {
+    const w = Worker.tls orelse return null;
+    return w.sched;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

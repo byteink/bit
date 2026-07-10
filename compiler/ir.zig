@@ -153,6 +153,19 @@ pub const RtFn = enum {
     fs_mkdir,
     fs_remove,
     fs_list_dir,
+    /// Non-blocking TCP (ABI.md §20), under `std/net`. Any of these may park the
+    /// calling green thread on the netpoller; none blocks an OS thread.
+    /// `net_listen(host, port) -> fd`; `net_local_port(fd) -> port` (recovers the
+    /// kernel's choice after binding port 0); `net_accept(fd) -> fd`;
+    /// `net_dial(host, port) -> fd`; `net_read(fd, max) -> string` (empty at end
+    /// of stream); `net_write(fd, s) -> i64`. Failure is `-1`, or `""` for a read.
+    /// A socket is closed by `fs_close` — `close(2)` does not care what it gets.
+    net_listen,
+    net_local_port,
+    net_accept,
+    net_dial,
+    net_read,
+    net_write,
     /// `() -> i64`: which test this process should run (`BIT_TEST_INDEX`, or -1).
     /// Only ever emitted into the synthetic `main` that `compiler/testgen.zig`
     /// appends under `bit test` (ABI.md §16).

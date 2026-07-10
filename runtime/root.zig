@@ -15,6 +15,7 @@ const heap_mod = @import("alloc.zig");
 const gc_mod = @import("gc.zig");
 const sched = @import("sched.zig");
 const chan = @import("chan.zig");
+const net = @import("net.zig");
 
 /// Linux-only C-runtime shims (`memcpy`/`__divti3`/`getauxval`/...) — see
 /// that file's module doc comment for why this runtime needs them at all.
@@ -642,9 +643,79 @@ export fn bit_rt_fs_write(fd: i64, s: *const RtBytes) callconv(.c) i64 {
 
 /// `bit_rt_fs_close`: close `fd`. Always reports success (the raw close wrapper
 /// swallows `EINTR`/`EBADF`); a caller that must know uses the fd's own errors.
+///
+/// Closes sockets too: `close(2)` does not care what kind of fd it is given, so
+/// `std/net` reuses this rather than adding an identical `netClose` primitive.
 export fn bit_rt_fs_close(fd: i64) callconv(.c) i64 {
     sched.closeFd(@intCast(fd));
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Network (ABI.md §20) — the low-level layer under `std/net`
+// ---------------------------------------------------------------------------
+// Any of these may park the calling green thread on the netpoller; none blocks
+// an OS thread. Each reports failure as `-1` (or an empty string) and leaves the
+// ergonomic, error-returning layer to `stdlib/net`.
+//
+// Addresses are dotted-quad IPv4 literals — no DNS at this level.
+// `bit_rt_fs_close` closes a socket.
+
+/// A host string's bytes. A socket takes an address, not a NUL-terminated path,
+/// so unlike `pathZ` this needs no copy and cannot fail.
+fn hostBytes(host: *const RtBytes) []const u8 {
+    return host.ptr[0..host.len];
+}
+
+/// `bit_rt_net_listen`: a listening TCP socket on `host:port`, or `-1`.
+/// `port == 0` asks the kernel to choose one; read it back with `net_local_port`.
+export fn bit_rt_net_listen(host: *const RtBytes, port: i64) callconv(.c) i64 {
+    if (port < 0 or port > 65535) return -1;
+    const fd = net.listenTcp(hostBytes(host), @intCast(port), 512) catch return -1;
+    return @intCast(fd);
+}
+
+/// `bit_rt_net_local_port`: the port `fd` is bound to, or `-1`.
+export fn bit_rt_net_local_port(fd: i64) callconv(.c) i64 {
+    const p = net.localPort(@intCast(fd)) catch return -1;
+    return @intCast(p);
+}
+
+/// `bit_rt_net_accept`: the next connection on listener `fd`, or `-1`. Parks the
+/// calling green thread until a peer arrives.
+export fn bit_rt_net_accept(fd: i64) callconv(.c) i64 {
+    const c = net.acceptTcp(@intCast(fd)) catch return -1;
+    return @intCast(c);
+}
+
+/// `bit_rt_net_dial`: a connected TCP socket to `host:port`, or `-1`. Parks until
+/// the handshake completes, and surfaces a refused connection here rather than at
+/// some later write.
+export fn bit_rt_net_dial(host: *const RtBytes, port: i64) callconv(.c) i64 {
+    if (port < 0 or port > 65535) return -1;
+    const fd = net.dialTcp(hostBytes(host), @intCast(port)) catch return -1;
+    return @intCast(fd);
+}
+
+/// `bit_rt_net_read`: up to `max` bytes from `fd`, parking until some arrive.
+/// Empty means the peer closed — an orderly end of stream. An I/O error reads as
+/// empty too: `std/net` cannot distinguish them, and a read loop should stop
+/// either way.
+export fn bit_rt_net_read(fd: i64, max: i64) callconv(.c) *const RtBytes {
+    if (max <= 0) return stringFromBytes("");
+    const want: usize = @intCast(max);
+    const tmp = std.heap.page_allocator.alloc(u8, want) catch return stringFromBytes("");
+    defer std.heap.page_allocator.free(tmp);
+    const n = net.readSock(@intCast(fd), tmp) catch return stringFromBytes("");
+    return stringFromBytes(tmp[0..n]);
+}
+
+/// `bit_rt_net_write`: all of `s` to `fd`, parking whenever the send buffer is
+/// full. Returns the byte count, or `-1`. A short write is retried internally,
+/// never reported: a caller that asked to write 12 bytes gets 12, or an error.
+export fn bit_rt_net_write(fd: i64, s: *const RtBytes) callconv(.c) i64 {
+    const n = net.writeSock(@intCast(fd), s.ptr[0..s.len]) catch return -1;
+    return @intCast(n);
 }
 
 // ---------------------------------------------------------------------------

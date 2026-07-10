@@ -177,6 +177,10 @@ const predeclared_funcs = [_][]const u8{
     // readFile layer wraps these in std/fs.
     "fsOpen", "fsReadAll", "fsWrite", "fsClose",
     "fsAppend", "fsRead", "fsExists", "fsIsDir", "fsMkdir", "fsRemove", "fsListDir",
+    // Non-blocking TCP primitives (ABI.md §20); std/net wraps these. Any of them
+    // may park the calling green thread on the netpoller. `fsClose` closes a
+    // socket too, so there is no `netClose`.
+    "netListen", "netLocalPort", "netAccept", "netDial", "netRead", "netWrite",
     // Float primitives (ABI.md §17); std/math re-exports them under plain names.
     "fsqrt",   "ffloor",     "fceil",   "fround",  "ftrunc",
     "fpow",    "fatan2",     "flog",    "flog2",   "flog10",

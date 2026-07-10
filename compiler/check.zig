@@ -2540,6 +2540,13 @@ const Checker = struct {
         .{ "fsMkdir", PrimSig{ .params = &.{.string}, .ret = .i64 } },
         .{ "fsRemove", PrimSig{ .params = &.{.string}, .ret = .i64 } },
         .{ "fsListDir", PrimSig{ .params = &.{.string}, .ret = .string } },
+        // Non-blocking TCP (ABI.md §20) — under std/net.
+        .{ "netListen", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        .{ "netLocalPort", PrimSig{ .params = &.{.i64}, .ret = .i64 } },
+        .{ "netAccept", PrimSig{ .params = &.{.i64}, .ret = .i64 } },
+        .{ "netDial", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        .{ "netRead", PrimSig{ .params = &.{ .i64, .i64 }, .ret = .string } },
+        .{ "netWrite", PrimSig{ .params = &.{ .i64, .string }, .ret = .i64 } },
         // Math (ABI.md §17) — under std/math.
         .{ "fsqrt", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
         .{ "ffloor", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
