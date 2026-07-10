@@ -159,8 +159,24 @@ ASCII letters uppercased. Bytes outside `a`–`z` are untouched.
 
 ASCII letters lowercased.
 
+### `split(s: string, sep: string): []string`
+
+`s` split on every occurrence of `sep`, in order. Adjacent or edge separators
+yield empty parts (`split("a,,b,", ",")` is `["a", "", "b", ""]`); an empty `sep`
+yields `[s]`. The inverse of `join`.
+
+### `trimSpace(s: string): string`
+
+`s` with leading and trailing ASCII spaces and tabs removed.
+
+### `parseInt(s: string): int!`
+
+The signed decimal integer `s` denotes. Fails on an empty string, a bare sign, a
+non-digit, or a value outside the `int` range — it never silently wraps. (The
+most negative `int` is rejected; the parser accumulates a positive magnitude.)
+
 ```bit
-import { join, repeat, toUpper } from "std/strings"
+import { join, repeat, toUpper, split, trimSpace, parseInt } from "std/strings"
 
 function banner(title: string): string {
   return toUpper(title) + "\n" + repeat("-", len(title))
@@ -168,5 +184,14 @@ function banner(title: string): string {
 
 function render(names: []string): string {
   return join(names, ", ")
+}
+
+// Sum a comma-separated list of integers, ignoring surrounding spaces.
+function sumCsv(line: string): int! {
+  let total = 0
+  for field of split(line, ",") {
+    total = total + parseInt(trimSpace(field))?
+  }
+  return total
 }
 ```
