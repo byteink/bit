@@ -1,5 +1,15 @@
 # std/crypto
 
+The cryptography module: hashing, message authentication, key derivation,
+authenticated encryption, public-key primitives, and cryptographically secure
+randomness. Algorithms are built from scratch in Bit and written to be
+constant-time (data-independent control flow and memory access); see each
+section for the guarantees and the known-answer vectors behind them.
+
+<!-- doctest: per-block -->
+
+## Hashing
+
 The cryptographic hash contract. `Hash` is the streaming interface every digest
 in the library satisfies; concrete algorithms — SHA-256, SHA-512 — are separate
 types that conform to it structurally, so code can hash against `Hash` without
@@ -57,8 +67,6 @@ function oneShot(c: ByteCounter): []byte {
 }
 ```
 
-## The interface
-
 ### `Hash`
 
 The streaming hash contract, modelled on Go's `hash.Hash`:
@@ -78,9 +86,66 @@ Feed input with any number of `write` calls, then read the digest with `sum`.
 the digest length and `blockSize` the algorithm's internal block size — HMAC keys
 that block, so it must be able to ask.
 
-## Helpers
-
 ### `digest(h: Hash, data: []byte): []byte`
 
 Hashes a single buffer: resets `h`, writes `data`, and returns `h.sum()`. A
 convenience over the streaming methods for the common one-buffer case.
+
+## Randomness
+
+Cryptographically secure randomness, drawn from the operating system's CSPRNG.
+Every value here traces back to `cryptoRandomBytes` (ABI.md §21) — the OS entropy
+pool, never a userspace PRNG and never a weak or zero fallback. This module only
+reshapes those raw bytes into convenient forms; it adds no randomness of its own,
+so its output is exactly as strong as the OS source.
+
+If the OS entropy source fails, a draw is fatal rather than degraded — a
+silently weak key is worse than a crash.
+
+### `randomBytes(n: int): []byte`
+
+`n` secure random bytes, as a fresh mutable slice the caller owns. A non-positive
+`n` yields an empty slice.
+
+### `fillRandom(buf: []byte)`
+
+Overwrite every byte of `buf` in place with secure random bytes; its length is
+unchanged. Use it to re-key an existing buffer without allocating a new one.
+
+```bit
+import { randomBytes, fillRandom } from "std/crypto"
+
+function token(): []byte {
+  return randomBytes(16)
+}
+
+function rekey(key: []byte) {
+  fillRandom(key)
+}
+```
+
+### `randomU64(): uint`
+
+A uniformly random 64-bit value, packed from 8 secure random bytes. Every bit is
+independent and uniform.
+
+### `randomUintBelow(n: uint): uint`
+
+A uniformly random value in `[0, n)`, free of modulo bias. `n` must be greater
+than zero.
+
+A plain `randomU64() % n` over-represents the low residues whenever `n` does not
+divide 2^64. This rejects and redraws the draws that would cause that skew — the
+top `2^64 mod n` values — so every residue is equally likely.
+
+```bit
+import { randomU64, randomUintBelow } from "std/crypto"
+
+function nonce(): uint {
+  return randomU64()
+}
+
+function rollDie(): uint {
+  return randomUintBelow(6) + 1
+}
+```
