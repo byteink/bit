@@ -12,11 +12,14 @@ A result type carrying the `!` marker is fallible. `T!` is shorthand for
 `T ! error` (the default error type); `T ! E` names a concrete error type; `()!`
 returns nothing or an error.
 
-```bit
-function readAll(path: string): string! { }          // string OR error
+```bit ignore
+function readAll(path: string): string! { }           // string OR error
 function fetch(url: string): Response ! HttpError { } // custom error type
 function run(): ()! { }                               // nothing OR error
 ```
+
+(Signatures only — the bodies are empty and `Response`/`HttpError` stand in for
+your own types, so this block is not doc-tested.)
 
 The value of a fallible function is a built-in result; you cannot construct it by
 hand, only via `return` (ok) and `fail` (err).
@@ -29,12 +32,32 @@ hand, only via `return` (ok) and `fail` (err).
   the function.
 
 ```bit
-function parsePort(s: string): int! {
-  let n = toInt(s)
-  if (n < 0 || n > 65535) {
-    fail error("port out of range")   // err result
+import { readFile } from "std/fs"
+
+// A tiny decimal parser, so this page's examples are real code.
+function toInt(s: string): int! {
+  if (len(s) == 0) {
+    fail newError("empty number")
   }
-  return n                            // ok result
+  let n = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = int(s[i])
+    if (c < 48 || c > 57) {
+      fail newError("not a digit: ${s}")
+    }
+    n = n * 10 + (c - 48)
+    i = i + 1
+  }
+  return n
+}
+
+function parsePort(s: string): int! {
+  let n = toInt(s)?
+  if (n < 0 || n > 65535) {
+    fail newError("port out of range")   // err result
+  }
+  return n                               // ok result
 }
 ```
 
@@ -50,7 +73,7 @@ assignable to the enclosing function's error type.
 
 ```bit
 function loadCount(path: string): int! {
-  let text = readAll(path)?      // returns early on a read error
+  let text = readFile(path)?     // returns early on a read error
   return parsePort(text)?        // returns early on a parse error
 }
 ```
@@ -66,20 +89,34 @@ function loadCount(path: string): int! {
   `fail`, `panic`, `break`, or `continue`.
 
 ```bit
-import { println } from "std/io"
+struct Config { export port: int }
+
+function defaults(): Config {
+  return Config{ port: 8080 }
+}
+
+function parseConfig(text: string): Config! {
+  return Config{ port: parsePort(text)? }
+}
+
+function (c: Config) valid(): bool {
+  return c.port > 0
+}
 
 function loadConfig(path: string): Config! {
-  let text = readAll(path)?
-  let cfg = parse(text) catch e {
+  let text = readFile(path)?
+  let cfg = parseConfig(text) catch e {
     println("bad config: ${e.message()}")
-    return defaults()                       // recover with a default
+    return defaults()                            // recover with a default
   }
-  if (!cfg.valid()) { fail error("config failed validation") }
+  if (!cfg.valid()) {
+    fail newError("config failed validation")
+  }
   return cfg
 }
 
 function quickCount(path: string): int {
-  return loadCount(path) catch 0            // fall back to 0 on any error
+  return loadCount(path) catch 0                 // fall back to 0 on any error
 }
 ```
 
@@ -91,12 +128,14 @@ Arguments are evaluated at the `defer` statement, not at execution time. This
 gives deterministic resource release without finalizers.
 
 ```bit
+import { open, create } from "std/fs"
+
 function copyFile(src: string, dst: string): ()! {
   let f = open(src)?
-  defer close(f)              // runs on every exit path below
+  defer f.close()             // runs on every exit path below
   let g = create(dst)?
-  defer close(g)
-  write(g, readAll(src)?)?
+  defer g.close()
+  g.write(f.readAll())?
   return
 }
 ```

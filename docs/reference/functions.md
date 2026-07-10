@@ -92,8 +92,12 @@ Functions are values. Arrow functions are concise anonymous functions; their
 parameter and return types are inferred from context when omitted.
 
 ```bit
+import { mapped } from "std/seq"
+
 function transform(xs: []int): []int {
-  return xs.map(x => x * 2)              // inferred param type
+  // `mapped` is a free function, not a method: slices have no methods, and
+  // `map` is a reserved word (the map type).
+  return mapped<i64, i64>(xs, (x: i64) => x * 2)
 }
 
 function explicit(): (int, int) => int {
@@ -202,8 +206,6 @@ a function call, a channel receive, or an error-propagation (`?`) chain. A lone
 `a + b` statement is a compile error, which catches mistakes.
 
 ```bit
-import { println } from "std/io"
-
 function effects() {
   println("side effect")   // ok: a call
   // 1 + 2                 // error: no effect

@@ -348,6 +348,46 @@ pub fn buildHostTestExecutable(gpa: std.mem.Allocator, path: []const u8, source:
     return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, host_target, err_out, tests_out);
 }
 
+/// Runs the front end (parse -> resolve -> check) over a directory module,
+/// without lowering or codegen. Returns whether it failed, having rendered the
+/// diagnostics to `err_out`.
+///
+/// This is what the documentation doc-tests need: a snippet is a module, not a
+/// program, so it has no `main` to link — but it must still typecheck against
+/// the real prelude and the real `std/*`.
+pub fn checkHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, err_out: *Io.Writer) !bool {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root, .{});
+    defer project.deinit();
+    if (diags.hasErrors()) {
+        _ = try renderFail(gpa, &diags, err_out);
+        return true;
+    }
+
+    const n = project.modules.items.len;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const checked = try gpa.alloc(check.CheckedModule, n);
+    var checked_built: usize = 0;
+    defer {
+        for (checked[0..checked_built]) |*c| c.deinit();
+        gpa.free(checked);
+    }
+    for (0..n) |i| {
+        checked[i] = try check.checkModule(gpa, &diags, &ctx, project.module_files.items[i], &project.modules.items[i], @enumFromInt(i), project.modules.items, false);
+        checked_built += 1;
+        if (diags.hasErrors()) {
+            _ = try renderFail(gpa, &diags, err_out);
+            return true;
+        }
+    }
+    return false;
+}
+
 /// `buildHostTestExecutable` for a directory module, so the tests can import
 /// `std/testing` and the rest of the stdlib (a single-file build has no prelude).
 pub fn buildHostTestProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer, tests_out: *[]testgen.Test) !?[]u8 {

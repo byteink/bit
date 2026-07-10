@@ -120,7 +120,7 @@ function accumulate() {
 Increment and decrement are statements too, not expressions:
 
 ```bit
-function count() {
+function counterDemo() {
   let n = 0
   n++
   n--
@@ -144,13 +144,16 @@ line, end the line with something that is not a value** — a binary operator, a
 comma, an opening bracket, `=`, `=>`, `.`, or `<-`.
 
 ```bit
+import { newBuilder } from "std/strings"
+
 function continuation() {
   let total = 1 +      // ends with '+', continues
               2 + 3
 
-  let n = names        // ends with '.', continues
-            .filter(isActive)
-            .length()
+  let s = newBuilder(). // ends with '.', continues
+            write("a").
+            write("b").
+            toString()
 }
 ```
 
@@ -158,7 +161,9 @@ Keep an opening brace on the same line as the construct it opens, or a semicolon
 is inserted before it:
 
 ```bit
-if (ready) {           // correct
-  work()
+function braces(ready: bool) {
+  if (ready) {         // correct: the brace opens on the construct's own line
+    println("work")
+  }
 }
 ```

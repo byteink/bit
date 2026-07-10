@@ -2201,9 +2201,12 @@ const FnCtx = struct {
         const arg_nodes = self.kids(k[2]);
         if (arg_nodes.len == 1) {
             const arg = self.kids(arg_nodes[0])[0];
-            const at = self.ctx.typeOf(try self.nodeType(arg));
+            // Default the arg type: a string literal types as `untyped_string`,
+            // so `[]byte("hi")` must dispatch like `[]byte(s)` (see the checker's
+            // matching note; same defect class as `len("literal")`).
+            const at = self.ctx.typeOf(self.defaultTy(try self.nodeType(arg)));
             if (at == .prim and at.prim == .string) {
-                const s = try self.lowerExpr(arg);
+                const s = try self.lowerExprH(arg, self.ctx.prim_ids.get(.string));
                 return self.b.rtCall(slice_ty, .bytes_from_string, &.{s});
             }
         }

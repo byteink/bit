@@ -2304,8 +2304,13 @@ const Checker = struct {
                     // UTF-8 decoding (deferred, #348 unit D), so only `[]u8` is a
                     // conversion here — anything else falls through to the numeric
                     // length-constructor path below.
-                    const is_string_conv = arg_data == .prim and arg_data.prim == .string and
-                        elem == self.ctx.prim_ids.get(.u8);
+                    //
+                    // A string *literal* argument types as `untyped_string`, not
+                    // `.prim string` (§15.4), so `[]byte("hi")` must be accepted
+                    // too — the same defect class as `len("literal")`.
+                    const is_string_arg = (arg_data == .prim and arg_data.prim == .string) or
+                        arg_data == .untyped_string;
+                    const is_string_conv = is_string_arg and elem == self.ctx.prim_ids.get(.u8);
                     if (!is_string_conv) try self.expectNumeric(file_idx, arg_items[0], arg_ty);
                     return target;
                 }

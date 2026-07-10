@@ -12,13 +12,23 @@ standard-library module like `"std/io"` or a relative project path like
 `"./util"` or `"../shared"`.
 
 ```bit
-import io from "std/io"                       // namespace: io.println(...)
-import * as fs from "std/fs"                  // explicit namespace form
-import { println, printf } from "std/io"      // named members
-import { println as say } from "std/io"       // rename on import
+import { readFile, writeFile } from "std/fs"  // named members
+import { readFile as slurp } from "std/fs"    // rename on import
 ```
 
-- A namespace import binds one name; members are accessed as `io.println(...)`.
+A namespace import binds the module itself, and members are reached through it:
+
+```bit ignore
+import io from "std/io"       // namespace: io.stdout()
+import * as fs from "std/fs"  // explicit namespace form
+```
+
+> Namespace imports parse and resolve, but member access through one does not
+> yet lower — `bit check` accepts `io.stdout()` and `bit build` rejects it
+> (task #1154). Use named imports until that lands. This block is not
+> doc-tested, because the doc-tests only typecheck and so would not catch it.
+
+- A namespace import binds one name; members are accessed as `io.stdout()`.
 - A named import binds members directly.
 - `as` renames, either the namespace or an individual member.
 
@@ -26,11 +36,8 @@ Only exported members are importable, and import cycles between modules are an
 error.
 
 ```bit
-import { readAll } from "std/fs"
-import { println } from "std/io"
-
 function show(path: string): ()! {
-  println(readAll(path)?)
+  println(readFile(path)?)   // readFile imported above
   return
 }
 ```
@@ -68,7 +75,7 @@ export function (c: Config) describe(): string {
 The executable module is the root directory passed to `bit build`. It must
 declare exactly one `main` function. Three signatures are permitted:
 
-```bit
+```bit ignore
 function main() { }              // exit code 0 on normal return
 
 function main(): int {           // returned int is the process exit code
@@ -79,6 +86,9 @@ function main(): ()! {           // a returned error prints to stderr, exit 1
   return
 }
 ```
+
+(Three alternatives for one declaration, so this block is not doc-tested — a
+module may only declare `main` once.)
 
 `main` takes no parameters; read command-line arguments and the environment via
 the standard library (`std/os`). A library module has no `main`.
@@ -101,8 +111,6 @@ function builtins(xs: []int, m: map<string, int>) {
 ## A complete program
 
 ```bit
-import { println } from "std/io"
-
 interface Shape { area(): f64 }
 
 struct Circle { export r: f64 }
@@ -120,8 +128,10 @@ function totalArea<T: Shape>(shapes: []T): f64 {
 }
 
 function main(): ()! {
-  let shapes: []Shape = [Circle{ r: 1.0 }, Rect{ w: 2.0, h: 3.0 }]
-  println("area = ${totalArea(shapes)}")
+  // `T: Shape` binds T to a concrete type that satisfies Shape, so instantiate
+  // over `Circle` rather than over `Shape` itself.
+  let circles: []Circle = [Circle{ r: 1.0 }, Circle{ r: 2.0 }]
+  println("area = ${totalArea<Circle>(circles)}")
   return
 }
 ```

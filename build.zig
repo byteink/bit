@@ -310,6 +310,23 @@ pub fn build(b: *std.Build) void {
     const osenv_tests = b.addTest(.{ .root_module = osenv_mod });
     test_step.dependOn(&b.addRunArtifact(osenv_tests).step);
 
+    // Doc-tests (#351): every ```bit block under docs/ must typecheck against
+    // the real prelude and std/*. Front end only — a snippet is a module, not a
+    // program, so it has no `main` to link. Needs no libbitrt.
+    const docs_opts = b.addOptions();
+    docs_opts.addOption([]const u8, "docs_dir", b.pathFromRoot("docs"));
+    docs_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    const docs_mod = b.createModule(.{
+        .root_source_file = b.path("tests/docs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    docs_mod.addImport("bitc", exe.root_module);
+    docs_mod.addOptions("build_options", docs_opts);
+
+    const docs_tests = b.addTest(.{ .root_module = docs_mod });
+    test_step.dependOn(&b.addRunArtifact(docs_tests).step);
+
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is

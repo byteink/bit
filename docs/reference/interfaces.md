@@ -71,7 +71,7 @@ Any type with a `message(): string` method is an `error`.
 An interface value can be narrowed to a concrete type. The two-result form
 reports success instead of panicking; the single-result form panics on mismatch.
 
-```bit
+```bit ignore
 function areaOfCircle(s: Shape): f64 {
   let (c, ok) = s.(Circle)      // ok is false if s is not a Circle
   if (!ok) { return 0.0 }

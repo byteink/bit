@@ -51,8 +51,6 @@ to `string`. Any type implementing `interface Show { show(): string }` works, as
 do all primitives. Write `\$` for a literal dollar sign.
 
 ```bit
-import { println } from "std/io"
-
 function greet(name: string, n: int) {
   println("hi ${name}, you have ${n} messages")
 }
@@ -107,7 +105,7 @@ function maps() {
 Fixed heterogeneous group, a value type, used for grouped returns and
 destructuring. Access by destructuring or by index `.0`, `.1`, …
 
-```bit
+```bit ignore
 function tuples(): (int, string) {
   let pair = (1, "one")
   let first = pair.0
@@ -115,6 +113,9 @@ function tuples(): (int, string) {
   return first, second
 }
 ```
+
+> Tuples are specified (§11.2) but not yet implemented; this block is not
+> doc-tested.
 
 ### Function and channel types
 
@@ -179,8 +180,10 @@ function conversions() {
   let n: i32 = 5
   let wide = i64(n)          // explicit widening, required
   let f = f64(n)             // int -> float
-  let s = string('A')        // rune -> string
   let bytes = []byte("hi")   // string -> []byte (copy)
+  let back = string(bytes)   // []byte -> string (copy)
+  // let s = string('A')     // rune -> string: needs UTF-8 encoding, not yet
+
   let big: u8 = 200          // ok: untyped constant, representable in u8
   // let bad: u8 = 300       // error: 300 not representable in u8
 }
