@@ -1654,6 +1654,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .fs_read_all = "bit_rt_fs_read_all",
     .fs_write = "bit_rt_fs_write",
     .fs_close = "bit_rt_fs_close",
+    .test_index = "bit_rt_test_index",
 });
 
 const CallReturn = struct { dst: u32, ty: TypeId };

@@ -50,7 +50,6 @@ pub const Kind = enum {
 
     // keywords (§5.2, minus the three literal words)
     kw_as,
-    kw_assert,
     kw_break,
     kw_case,
     kw_catch,
@@ -134,7 +133,9 @@ pub const Kind = enum {
 
 const keywords = std.StaticStringMap(Kind).initComptime(.{
     .{ "as", .kw_as },
-    .{ "assert", .kw_assert },
+    // `assert` is NOT here: like `panic`/`len`/`append` it is a predeclared
+    // builtin *function* (§16, resolve.zig `predeclared_funcs`), so it must lex
+    // as an identifier for `assert(cond)` to parse as a call.
     .{ "break", .kw_break },
     .{ "case", .kw_case },
     .{ "catch", .kw_catch },

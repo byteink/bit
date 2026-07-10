@@ -2069,6 +2069,15 @@ const FnCtx = struct {
         if (std.mem.eql(u8, name, "assert")) {
             const vals = try self.lowerArgs(args_node);
             defer self.gpa.free(vals);
+            // `bit_rt_assert` has one frozen 2-arg signature (ABI.md §12), so the
+            // 1-arg source form must still pass a message — otherwise the failing
+            // path reads an undefined register as a string pointer.
+            if (vals.len == 1) {
+                const string_ty = self.ctx.prim_ids.get(.string);
+                const idx = try self.l.out.internString("assertion failed");
+                const msg = try self.b.constString(string_ty, idx);
+                return self.b.rtCall(void_ty, .assert, &.{ vals[0], msg });
+            }
             return self.b.rtCall(void_ty, .assert, vals);
         }
         if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "cap")) {

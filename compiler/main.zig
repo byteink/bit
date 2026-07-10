@@ -10,6 +10,7 @@ const resolve = @import("resolve.zig");
 const check = @import("check.zig");
 const lower = @import("lower.zig");
 const opt = @import("opt.zig");
+pub const testgen = @import("testgen.zig");
 const emit = @import("emit.zig");
 const link = @import("link.zig");
 const macho = @import("link/macho.zig");
@@ -50,6 +51,22 @@ pub fn main(init: std.process.Init) !void {
             try stderr_w.interface.flush();
             return error.BuildFailed;
         };
+        try stderr_w.interface.flush();
+        if (code != 0) std.process.exit(code);
+        return;
+    }
+
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "test")) {
+        var out_buf: [4096]u8 = undefined;
+        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        const code = runTest(gpa, io, &stdout_w.interface, &stderr_w.interface, init.environ_map, argv[2..]) catch |e| {
+            try stderr_w.interface.print("bit test: {s}\n", .{@errorName(e)});
+            try stderr_w.interface.flush();
+            return error.TestFailed;
+        };
+        try stdout_w.interface.flush();
         try stderr_w.interface.flush();
         if (code != 0) std.process.exit(code);
         return;
@@ -185,7 +202,7 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
         // imports then error cleanly); only a real stdlib dir enables them.
         const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
         defer if (std_root) |s| gpa.free(s);
-        exe = (try buildProject(gpa, io, root_abs, std_root, ident, lib, target, err_out)) orelse return 1;
+        exe = (try buildProject(gpa, io, root_abs, std_root, ident, lib, target, err_out, null)) orelse return 1;
     } else {
         const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
         defer {
@@ -195,7 +212,7 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
             }
             gpa.free(inputs);
         }
-        exe = (try buildModule(gpa, inputs, ident, lib, target, err_out)) orelse return 1;
+        exe = (try buildModule(gpa, inputs, ident, lib, target, err_out, null)) orelse return 1;
     }
     defer gpa.free(exe);
 
@@ -231,11 +248,104 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     return 0;
 }
 
+/// `bit test <file.bit|dir>`: compiles the module with a synthetic `main` that
+/// dispatches to one test (see `testgen.zig`), then execs that binary once per
+/// discovered test with `BIT_TEST_INDEX` set. One process per test is what makes
+/// a failing `assert` attributable: it panics, so an in-process loop would take
+/// the remaining tests down with it.
+///
+/// Prints `ok`/`FAIL` per test and a summary; exit code 0 iff every test passed.
+/// Always builds for the host — a cross-compiled test binary could not be run.
+fn runTest(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer, environ_map: *std.process.Environ.Map, args: []const [:0]const u8) !u8 {
+    const src = if (args.len >= 1) args[0] else {
+        try err_out.writeAll("usage: bit test <file.bit|dir>\n");
+        return 2;
+    };
+
+    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(host_target), gpa, .unlimited) catch |e| {
+        try err_out.print("bit: runtime archive {s}: {s}\n", .{ libbitrtPath(host_target), @errorName(e) });
+        return 1;
+    };
+    defer gpa.free(lib);
+
+    const ident = std.fs.path.stem(src);
+    const stat = Io.Dir.cwd().statFile(io, src, .{}) catch |e| {
+        try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
+        return 1;
+    };
+
+    var tests: []testgen.Test = &.{};
+    var exe: []u8 = undefined;
+    if (stat.kind == .directory) {
+        const root_abs = try absFromCwd(gpa, io, src);
+        defer gpa.free(root_abs);
+        const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+        defer if (std_root) |s| gpa.free(s);
+        exe = (try buildProject(gpa, io, root_abs, std_root, ident, lib, host_target, err_out, &tests)) orelse return 1;
+    } else {
+        const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
+        defer {
+            for (inputs) |f| {
+                gpa.free(f.path);
+                gpa.free(f.source);
+            }
+            gpa.free(inputs);
+        }
+        exe = (try buildModule(gpa, inputs, ident, lib, host_target, err_out, &tests)) orelse return 1;
+    }
+    defer gpa.free(exe);
+    defer testgen.freeTests(gpa, tests);
+
+    if (tests.len == 0) {
+        try out.print("no tests in {s} (a test is a top-level `function test_<name>()`)\n", .{src});
+        return 0;
+    }
+
+    const tmp = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-test-{s}", .{ident}, 0);
+    defer gpa.free(tmp);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = tmp,
+        .data = exe,
+        .flags = .{ .permissions = .executable_file },
+    });
+    defer Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    var passed: usize = 0;
+    for (tests, 0..) |t, i| {
+        var idx_buf: [24]u8 = undefined;
+        try environ_map.put("BIT_TEST_INDEX", try std.fmt.bufPrint(&idx_buf, "{d}", .{i}));
+
+        // The child inherits stdio, so its own output and any panic message land
+        // before this test's verdict — flush ours first to keep them in order.
+        try out.flush();
+        var child = try std.process.spawn(io, .{ .argv = &.{tmp}, .environ_map = environ_map });
+        const ok = switch (try child.wait(io)) {
+            .exited => |c| c == 0,
+            else => false, // killed by a signal: a panic, or a crash
+        };
+        if (ok) passed += 1;
+        try out.print("{s} {s}\n", .{ if (ok) "ok  " else "FAIL", t.name });
+    }
+
+    const failed = tests.len - passed;
+    try out.print("\n{d} test{s}: {d} passed, {d} failed\n", .{ tests.len, if (tests.len == 1) "" else "s", passed, failed });
+    return if (failed == 0) 0 else 1;
+}
+
 /// Builds `source` into a native executable's bytes for the host target,
 /// linking `libbitrt` — the entry the golden `// run` harness uses. Returns
 /// `null` (diagnostics written to `err_out`) if compilation failed.
 pub fn buildHostExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
     return buildExecutable(gpa, path, source, libbitrt, host_target, err_out);
+}
+
+/// Like `buildHostExecutable`, but with the `bit test` entry injected: the
+/// binary runs the single test named by `BIT_TEST_INDEX`. Writes the discovered
+/// tests to `tests_out` (caller frees via `testgen.freeTests`). The `bit test`
+/// harness test drives the runner through this.
+pub fn buildHostTestExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, err_out: *Io.Writer, tests_out: *[]testgen.Test) !?[]u8 {
+    const one = [_]SrcFile{.{ .path = path, .source = source }};
+    return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, host_target, err_out, tests_out);
 }
 
 /// One source file of the module being built: its path (for diagnostics and
@@ -331,7 +441,7 @@ pub fn buildHostModule(gpa: std.mem.Allocator, io: Io, path: []const u8, libbitr
         }
         gpa.free(inputs);
     }
-    return buildModule(gpa, inputs, std.fs.path.stem(path), libbitrt, host_target, err_out);
+    return buildModule(gpa, inputs, std.fs.path.stem(path), libbitrt, host_target, err_out, null);
 }
 
 /// Whole-project build for the host target — the entry the imports/prelude
@@ -340,14 +450,14 @@ pub fn buildHostModule(gpa: std.mem.Allocator, io: Io, path: []const u8, libbitr
 /// (`std_root` null for no stdlib). Returns `null` (diagnostics to `err_out`) on
 /// any front-end error.
 pub fn buildHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
-    return buildProject(gpa, io, root_abs, std_root, ident, libbitrt, host_target, err_out);
+    return buildProject(gpa, io, root_abs, std_root, ident, libbitrt, host_target, err_out, null);
 }
 
 /// Single-file convenience entry (the golden `// run` harness uses this): one
 /// buffer, one module. Delegates to `buildModule`.
 fn buildExecutable(gpa: std.mem.Allocator, path: []const u8, source: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
     const one = [_]SrcFile{.{ .path = path, .source = source }};
-    return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, target, err_out);
+    return buildModule(gpa, &one, std.fs.path.stem(path), libbitrt, target, err_out, null);
 }
 
 /// Absolute path of `rel` (an existing file/dir) resolved against the process
@@ -367,7 +477,7 @@ fn absFromCwd(gpa: std.mem.Allocator, io: Io, rel: []const u8) ![]u8 {
 /// `ir.Module` (`lower.lowerProject`), then codegens + links. `root_abs` and
 /// `std_root` must be absolute (or `std_root` null for no stdlib). Returns
 /// `null` (diagnostics rendered to `err_out`) on any front-end error.
-pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
+pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer, tests_out: ?*[]testgen.Test) !?[]u8 {
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
@@ -403,6 +513,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_ro
 
     var module = try lower.lowerProject(gpa, &ctx, inputs, project.root);
     defer module.deinit();
+    if (tests_out) |out| out.* = try testgen.injectTestMain(gpa, &module);
     try opt.optimizeModule(gpa, &module, .o1);
 
     switch (target) {
@@ -430,7 +541,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_ro
 /// bytes. `ident` names the produced object. Returns `null` (after rendering
 /// diagnostics to `err_out`) if any stage before codegen reported an error;
 /// the caller maps that to exit code 1.
-fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer) !?[]u8 {
+fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer, tests_out: ?*[]testgen.Test) !?[]u8 {
     std.debug.assert(inputs.len >= 1);
 
     var sm = diagnostics.SourceManager.init(gpa);
@@ -472,6 +583,7 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
 
     var module = try lower.lowerModule(gpa, &ctx, files, &checked, &rmodule);
     defer module.deinit();
+    if (tests_out) |out| out.* = try testgen.injectTestMain(gpa, &module);
     try opt.optimizeModule(gpa, &module, .o1);
 
     switch (target) {

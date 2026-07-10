@@ -277,6 +277,21 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.addTest(.{ .root_module = stress_mod });
     test_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
+    // `bit test` runner (#1105): discovers `test_` functions and runs each in
+    // its own process (a failed `assert` panics). Shares the host libbitrt
+    // archive wired in at the tail.
+    const testcmd_opts = b.addOptions();
+    const testcmd_mod = b.createModule(.{
+        .root_source_file = b.path("tests/testcmd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    testcmd_mod.addImport("bitc", exe.root_module);
+    testcmd_mod.addOptions("build_options", testcmd_opts);
+
+    const testcmd_tests = b.addTest(.{ .root_module = testcmd_mod });
+    test_step.dependOn(&b.addRunArtifact(testcmd_tests).step);
+
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is
@@ -455,6 +470,10 @@ pub fn build(b: *std.Build) void {
     // Same archive for the stress suite.
     stress_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
     if (host_libbitrt_install) |inst| stress_tests.step.dependOn(inst);
+
+    // Same archive for the `bit test` runner guard.
+    testcmd_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
+    if (host_libbitrt_install) |inst| testcmd_tests.step.dependOn(inst);
 
     // Same archive for the imports/prelude guard.
     imports_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);

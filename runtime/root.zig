@@ -43,6 +43,10 @@ var g_heap: heap_mod.Heap = undefined;
 var g_gc: gc_mod.Gc = undefined;
 var g_sched: sched.Scheduler = undefined;
 var g_booted = false;
+/// The process environment block, captured by `boot` so runtime entry points
+/// reachable from Bit code (`bit_rt_test_index`) can read it. `boot` always
+/// runs before `main`, so this is initialized before any Bit code observes it.
+var g_environ: std.process.Environ = .empty;
 
 /// Raw `argc`/`argv`, captured by `rtStartMain` and kept for a future
 /// `os.args()` (stdlib `os` package, task #354) to read. Unused by this
@@ -573,6 +577,18 @@ export fn bit_rt_fs_close(fd: i64) callconv(.c) i64 {
     return 0;
 }
 
+/// `bit_rt_test_index` (ABI.md §16): the 0-based index of the one test this
+/// process should run, read from `BIT_TEST_INDEX`; `-1` when unset (so a test
+/// binary run directly is a no-op rather than running an arbitrary test).
+///
+/// `bit test` execs the test binary once per test rather than looping in-process
+/// because a failed `assert` panics the process — isolation is what lets the
+/// runner attribute the failure and still run the remaining tests.
+export fn bit_rt_test_index() callconv(.c) i64 {
+    const v = gc_mod.lookupEnv(g_environ, "BIT_TEST_INDEX") orelse return -1;
+    return std.fmt.parseInt(i64, v, 10) catch -1;
+}
+
 fn stringFromBytes(txt: []const u8) *const RtBytes {
     const s = allocString(txt.len);
     @memcpy(s.bytes, txt);
@@ -1013,6 +1029,7 @@ fn mainTrampoline(arg: ?*anyopaque) callconv(.c) void {
 pub fn boot(main_fn: MainFn, environ: std.process.Environ) !i32 {
     std.debug.assert(!g_booted);
     g_booted = true;
+    g_environ = environ;
 
     g_heap = heap_mod.Heap.init();
     g_gc = try gc_mod.Gc.init(&g_heap, gc_mod.configFromEnv(environ));

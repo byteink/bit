@@ -120,13 +120,17 @@ assigned to but never read; it discards a value (e.g. `let (_, ok) = <-c`).
 Reserved; may not be used as identifiers:
 
 ```
-as       assert    break     case      catch     chan
-const    continue  default   defer     else      enum
-export   fail      false     for       from      function
-if       import    in        interface let       map
-match    nil       of        return    select    spawn
-struct   switch    true      type      while
+as       break     case      catch     chan      const
+continue default   defer     else      enum      export
+fail     false     for       from      function  if
+import   in        interface let       map       match
+nil      of        return    select    spawn     struct
+switch   true      type      while
 ```
+
+`assert` is *not* reserved: like `panic` and `len` it is a predeclared builtin
+function (§5.3, §16), so it must be an identifier for `assert(cond)` to parse as
+a call.
 
 `match` selects on an enum value and binds its payload (§13.8).
 
@@ -684,7 +688,7 @@ Method values are closures bound to their receiver.
   cap(s)`). On a `string` the result is a fresh string copying bytes `[lo, hi)`
   (`0 <= lo <= hi <= len(s)`) — string headers hold interior pointers, so a
   shared view could not keep the backing alive. Re-slicing a `[N]T` array is not
-  yet supported (§20).
+  yet supported (§21).
 
 ### 12.7 Generic Call Disambiguation (`<`)
 
@@ -740,7 +744,7 @@ chan<int>(16)     // buffered channel, capacity 16
 `string(b)` and `[]byte(s)` copy bytes verbatim: a `[]byte` is the raw byte
 view of a string and round-trips through it. The rune-oriented conversions
 (`string(rune)`, `string([]rune)`, `[]rune(s)`) require UTF-8 encode/decode and
-are deferred until rune iteration lands (§20).
+are deferred until rune iteration lands (§21).
 
 Numeric conversions are always explicit. There are **no** implicit numeric
 conversions between distinct numeric types (including `i32`→`i64`); this is a
@@ -1352,7 +1356,38 @@ deterministic resource release without finalizers.
 
 ---
 
-## 19. Worked Example
+## 19. Testing
+
+A **test** is a top-level function whose name begins with `test_`, taking no
+parameters and returning nothing:
+
+```
+function test_addition() {
+  assert(1 + 1 == 2)
+}
+
+function test_concat() {
+  assert("ab" + "c" == "abc", "string concat")
+}
+```
+
+- No new syntax: a test is an ordinary function, so `test` is not a reserved
+  word (§5.2) and a test may call any function in its module.
+- `bit test <file.bit|dir>` discovers every `test_` function in the **root**
+  module (never in an imported one), runs each, and prints `ok`/`FAIL` per test
+  plus a summary. It exits `0` iff every test passed, `1` otherwise.
+- A test fails when it panics — which a failed `assert` (§18.4) does. Each test
+  therefore runs in its own process, so one failure neither hides the others nor
+  aborts the run.
+- Tests are ordinary unreferenced functions to `bit build`/`bit run`, so the
+  linker's dead-strip drops them from a normal program's binary.
+- Test execution order is the order of declaration; tests must not depend on it.
+
+Richer assertions with value diffs live in `std/testing`, layered on this runner.
+
+---
+
+## 20. Worked Example
 
 A complete, conforming program exercising the major features:
 
@@ -1412,7 +1447,7 @@ function main(): ()! {
 
 ---
 
-## 20. Reserved for Future Versions (non-normative)
+## 21. Reserved for Future Versions (non-normative)
 
 Intentionally **not** in v0.1, to keep the surface minimal:
 

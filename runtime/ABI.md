@@ -427,6 +427,7 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_map_iter_next`| `(m: ?*MapHeader, prev: i64) -> i64` (§15)              |
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 | `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
+| `bit_rt_test_index`   | `() -> i64` (§16)                                      |
 
 Every symbol above is `callconv(.c)` with plain C linkage — the entire
 compiler-facing surface of `libbitrt.a`. Nothing else in `runtime/` is a stable
@@ -675,3 +676,22 @@ tombstoned, and unused slots hold a zero key/value word, which `markRoot` skips.
   returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
   then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
   protocol assumes no concurrent mutation (a resize would invalidate the cursor).
+
+---
+
+## 16. Test selection (`bit test`)
+
+```
+bit_rt_test_index() -> i64   // BIT_TEST_INDEX, or -1 when unset/unparsable
+```
+
+The one runtime hook `bit test` (SPEC §19) needs. `boot` captures the process
+environment block; this reads `BIT_TEST_INDEX` out of it.
+
+A failed `assert` panics, which aborts the process — so the runner cannot loop
+over tests in one process without the first failure taking the rest down. It
+instead compiles the module **once**, with `compiler/testgen.zig` appending a
+synthetic `main` that calls this function and dispatches to that single test,
+then execs the binary once per test with `BIT_TEST_INDEX` set. An unset or
+out-of-range index matches no test and returns cleanly, so running a test binary
+by hand is a harmless no-op.

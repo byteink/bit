@@ -491,7 +491,9 @@ pub fn configFromEnv(environ: std.process.Environ) Config {
     return c;
 }
 
-fn lookupEnv(environ: std.process.Environ, key: []const u8) ?[]const u8 {
+/// POSIX environment lookup over a passed-in block. Also used by `root.zig`'s
+/// `bit_rt_test_index`, so it is public rather than GC-private.
+pub fn lookupEnv(environ: std.process.Environ, key: []const u8) ?[]const u8 {
     if (comptime builtin.os.tag == .windows) return null;
     if (environ.getPosix(key)) |v| return v;
     return null;

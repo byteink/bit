@@ -141,6 +141,10 @@ pub const RtFn = enum {
     fs_read_all,
     fs_write,
     fs_close,
+    /// `() -> i64`: which test this process should run (`BIT_TEST_INDEX`, or -1).
+    /// Only ever emitted into the synthetic `main` that `compiler/testgen.zig`
+    /// appends under `bit test` (ABI.md §16).
+    test_index,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the
