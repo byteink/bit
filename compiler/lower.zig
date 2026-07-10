@@ -306,6 +306,11 @@ pub const Lowerer = struct {
     closure_funcs: std.ArrayList(ir.Function) = .empty,
     reserved_count: usize = 0,
 
+    /// Trampolines synthesized for named functions used as first-class values,
+    /// keyed by the function's packed `GlobalSymbol` so repeated references to
+    /// the same function share one trampoline (see `funcValueTrampoline`).
+    fn_value_tramps: std.AutoHashMapUnmanaged(u64, ir.FuncId) = .{},
+
     /// Re-point the per-module cursors at `m` before lowering one of its
     /// functions, so `FnCtx` (which reads `self.l.files/checked/rmodule`) sees
     /// the right module without a module id threaded through every method.
@@ -576,6 +581,53 @@ pub const Lowerer = struct {
         try self.closure_funcs.append(self.gpa, f);
         return fid;
     }
+
+    /// The trampoline that adapts a named top-level function to the closure
+    /// calling convention, so the function can be used as a first-class value.
+    /// `call_value` threads an env as the leading argument, but a named function
+    /// has no env parameter (a *method* value reuses its receiver slot for this —
+    /// see `lowerMember` — but a plain function has no such slot). The trampoline
+    /// takes `(env, params…)`, ignores env, calls the target directly, and
+    /// returns its result; a function reference then lowers to
+    /// `make_closure(trampoline, nil)`. Cached per target so repeated references
+    /// share one trampoline.
+    fn funcValueTrampoline(self: *Lowerer, fn_ty: TypeId, gsym: GlobalSymbol, target: ir.FuncId, shape: check.FuncShape) Error!ir.FuncId {
+        if (self.fn_value_tramps.get(gsym.pack())) |fid| return fid;
+
+        var b = ir.FunctionBuilder.init(self.gpa);
+        errdefer b.deinit(self.gpa);
+        const entry = try b.newBlock();
+        b.beginBlock(entry);
+
+        var param_types: std.ArrayList(TypeId) = .empty;
+        defer param_types.deinit(self.gpa);
+
+        // Block params first: the ignored leading env, then one per target param.
+        _ = try b.addParam(fn_ty);
+        try param_types.append(self.gpa, fn_ty);
+        var call_args: std.ArrayList(ir.ValueId) = .empty;
+        defer call_args.deinit(self.gpa);
+        for (shape.params) |pty| {
+            try param_types.append(self.gpa, pty);
+            try call_args.append(self.gpa, try b.addParam(pty));
+        }
+
+        const r = try b.call(shape.result, target, call_args.items);
+        if (shape.result == self.ctx.void_id) {
+            try b.ret(&.{});
+        } else {
+            try b.ret(&.{r});
+        }
+        b.endBlock();
+
+        const fid: ir.FuncId = @enumFromInt(self.reserved_count + self.closure_funcs.items.len);
+        const name = try std.fmt.allocPrint(self.gpa, "fnvalue$trampoline${d}", .{@intFromEnum(fid)});
+        defer self.gpa.free(name);
+        const f = try b.finish(name, param_types.items, shape.result, false, .invalid, entry);
+        try self.closure_funcs.append(self.gpa, f);
+        try self.fn_value_tramps.put(self.gpa, gsym.pack(), fid);
+        return fid;
+    }
 };
 
 /// Lowers one already-resolved, type-checked, single-module program.
@@ -607,6 +659,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     };
     errdefer l.out.deinit();
     defer l.func_ids.deinit(gpa);
+    defer l.fn_value_tramps.deinit(gpa);
     defer l.inst_ids.deinit(gpa);
     defer l.method_table.deinit(gpa);
     defer l.method_ids.deinit(gpa);
@@ -2607,8 +2660,21 @@ const FnCtx = struct {
         if (self.env.lookup(name)) |idx| return self.env.bindings.items[idx].value;
         const gsym = self.nodeSymbol(node) orelse return error.UnsupportedConstruct;
         const sym = self.l.symbolOf(gsym);
+        if (sym.kind == .func) return self.lowerFuncValue(node, gsym); // a named function used as a value
         if (sym.kind != .const_binding) return error.UnsupportedConstruct; // top-level mutable `let`: no IR global-variable op exists yet
         return self.lowerTopConst(gsym, sym.file_idx);
+    }
+
+    /// A named top-level function referenced as a first-class value: wrap it in a
+    /// closure over a trampoline (`funcValueTrampoline`) with a nil environment,
+    /// so it is call-compatible with arrow closures and method values.
+    fn lowerFuncValue(self: *FnCtx, node: ast.Index, gsym: GlobalSymbol) Error!ir.ValueId {
+        const fty = try self.nodeType(node);
+        const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct; // generic function (no monomorphized id): out of scope
+        const shape = self.ctx.func_sigs.get(gsym.pack()).?;
+        const tramp = try self.l.funcValueTrampoline(fty, gsym, fid, shape);
+        const env = try self.b.constNil(fty);
+        return self.b.makeClosure(fty, tramp, env);
     }
 
     /// Inlines a top-level `const`'s initializer at the reference site
@@ -2750,6 +2816,7 @@ const FnCtx = struct {
         // a call goes through `resolveCallTarget` and never reaches here.
         if (self.namespaceMember(node)) |gsym| {
             const sym = self.l.symbolOf(gsym);
+            if (sym.kind == .func) return self.lowerFuncValue(node, gsym); // imported function used as a value
             if (sym.kind != .const_binding) return error.UnsupportedConstruct;
             return self.lowerTopConst(gsym, sym.file_idx);
         }
