@@ -577,6 +577,100 @@ export fn bit_rt_fs_close(fd: i64) callconv(.c) i64 {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Math (ABI.md §17) — the low-level layer under `std/math`
+// ---------------------------------------------------------------------------
+// `@floor`/`@ceil`/`@round`/`@trunc`/`@sqrt` lower to single instructions on
+// both targets. `pow`/`atan2`/`log*` are Zig's own pure-Zig implementations.
+//
+// Deliberately absent: `sin`/`cos`/`tan`/`exp`. Zig exposes those only as
+// builtins that LLVM lowers to libm calls (`sin`, `exp`, …), and Bit links no
+// libc — a freestanding-correct implementation is its own task, and shipping an
+// approximate one silently would be worse than not shipping it.
+
+export fn bit_rt_floor(x: f64) callconv(.c) f64 {
+    return @floor(x);
+}
+export fn bit_rt_ceil(x: f64) callconv(.c) f64 {
+    return @ceil(x);
+}
+export fn bit_rt_round(x: f64) callconv(.c) f64 {
+    return @round(x);
+}
+export fn bit_rt_trunc(x: f64) callconv(.c) f64 {
+    return @trunc(x);
+}
+export fn bit_rt_pow(x: f64, y: f64) callconv(.c) f64 {
+    return std.math.pow(f64, x, y);
+}
+export fn bit_rt_atan2(y: f64, x: f64) callconv(.c) f64 {
+    return std.math.atan2(y, x);
+}
+export fn bit_rt_log(x: f64) callconv(.c) f64 {
+    return std.math.log(f64, std.math.e, x);
+}
+export fn bit_rt_log2(x: f64) callconv(.c) f64 {
+    return std.math.log2(x);
+}
+export fn bit_rt_log10(x: f64) callconv(.c) f64 {
+    return std.math.log10(x);
+}
+
+// ---------------------------------------------------------------------------
+// Time (ABI.md §18) — the low-level layer under `std/time`
+// ---------------------------------------------------------------------------
+
+/// `bit_rt_time_mono_ns`: monotonic nanoseconds. Never jumps; measures elapsed.
+export fn bit_rt_time_mono_ns() callconv(.c) i64 {
+    return @intCast(sched.monoNs());
+}
+
+/// `bit_rt_time_unix_ns`: wall-clock nanoseconds since the Unix epoch. Can jump
+/// (NTP, clock set), so it dates events and never measures durations.
+export fn bit_rt_time_unix_ns() callconv(.c) i64 {
+    return sched.realtimeNs();
+}
+
+/// `bit_rt_time_sleep_ns`: parks the calling green thread for at least `ns`,
+/// leaving its worker free to run other tasks (ABI.md §18). A non-positive
+/// duration just yields. Never blocks the OS thread.
+export fn bit_rt_time_sleep_ns(ns: i64) callconv(.c) void {
+    if (ns <= 0) {
+        sched.yield();
+        return;
+    }
+    sched.sleepTask(@intCast(ns));
+}
+
+// ---------------------------------------------------------------------------
+// OS (ABI.md §19) — the low-level layer under `std/os`
+// ---------------------------------------------------------------------------
+
+/// `bit_rt_os_argc`: the process argument count (`argv[0]` is the program).
+export fn bit_rt_os_argc() callconv(.c) i64 {
+    return @intCast(g_argc);
+}
+
+/// `bit_rt_os_arg_at`: argument `i`, or the empty string when out of range.
+export fn bit_rt_os_arg_at(i: i64) callconv(.c) *const RtBytes {
+    if (i < 0 or @as(usize, @intCast(i)) >= g_argc) return stringFromBytes("");
+    const p = g_argv[@intCast(i)] orelse return stringFromBytes("");
+    return stringFromBytes(std.mem.span(p));
+}
+
+/// `bit_rt_os_env`: the value of environment variable `name`, or the empty
+/// string when unset (Bit has no nil string; `std/os` maps empty to absent).
+export fn bit_rt_os_env(name: *const RtBytes) callconv(.c) *const RtBytes {
+    const v = gc_mod.lookupEnv(g_environ, name.ptr[0..name.len]) orelse return stringFromBytes("");
+    return stringFromBytes(v);
+}
+
+/// `bit_rt_os_exit`: terminate the process immediately with `code`. Deferred
+/// calls do not run (SPEC §18.4's panic rules apply equally here).
+export fn bit_rt_os_exit(code: i64) callconv(.c) noreturn {
+    rawExit(@bitCast(@as(i8, @truncate(code))));
+}
+
 /// `bit_rt_test_index` (ABI.md §16): the 0-based index of the one test this
 /// process should run, read from `BIT_TEST_INDEX`; `-1` when unset (so a test
 /// binary run directly is a no-op rather than running an arbitrary test).

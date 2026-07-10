@@ -176,6 +176,13 @@ pub const Task = struct {
     reg_next: ?*Task = null,
     reg_prev: ?*Task = null,
 
+    /// Intrusive link and deadline for the scheduler's sleeping-task list
+    /// (`TimerQueue`). Set just before a `sleepNs` park; read only by the
+    /// worker that expires the timer. Distinct from `next`, which the run
+    /// queues own.
+    timer_next: ?*Task = null,
+    deadline_ns: u64 = 0,
+
     /// Highest address of this task's usable stack (exclusive) — the byte just
     /// past the mapping. A conservative scan covers `[ctx.sp, stackTop())`.
     fn stackTop(t: *const Task) usize {
@@ -442,6 +449,18 @@ pub fn monoNs() u64 {
         else => _ = std.c.clock_gettime(.MONOTONIC, &ts),
     }
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Wall-clock nanoseconds since the Unix epoch. Unlike `monoNs` this can jump
+/// backwards (NTP, manual clock set), so it dates events — it never measures
+/// elapsed time. Backs `std/time`'s `now`.
+pub fn realtimeNs() i64 {
+    var ts: std.posix.timespec = undefined;
+    switch (builtin.os.tag) {
+        .linux => _ = std.os.linux.clock_gettime(.REALTIME, &ts),
+        else => _ = std.c.clock_gettime(.REALTIME, &ts),
+    }
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 /// `pub`: also used by `root.zig`'s boot sequence to poll for the main task's
@@ -758,6 +777,12 @@ const Worker = struct {
             if (other == self) continue;
             if (other.deque.steal()) |t| return t;
         }
+        // Idle: due sleepers first (an expired timer is work), then the poller.
+        // The idle backoff caps at `max_backoff_ns`, which bounds how late a
+        // timer can fire once its worker has nothing else to run.
+        if (self.sched.timers.expire(self.sched, monoNs()) > 0) {
+            if (self.sched.global.pop()) |t| return t;
+        }
         if (self.sched.poller.pollReady(self.sched, 0) > 0) {
             if (self.sched.global.pop()) |t| return t;
         }
@@ -769,10 +794,86 @@ const Worker = struct {
 // Scheduler
 // ---------------------------------------------------------------------------
 
+/// Sleeping green threads, waiting on a wall-clock deadline (`sleepNs`).
+///
+/// An unsorted intrusive list: `push` is O(1), and `expire` is one bounded pass
+/// unparking every task whose deadline has passed. Sorting would only pay off
+/// with many timers *and* frequent expiry checks — the check runs solely on a
+/// worker's idle path (below), so a linear scan of the sleepers is cheaper than
+/// keeping the order.
+///
+/// ponytail: unsorted list, O(n) expire. Swap in a 4-ary heap if a program ever
+/// holds enough concurrent sleepers for the scan to show up in a profile.
+const TimerQueue = struct {
+    lock: SpinLock = .{},
+    head: ?*Task = null,
+
+    /// Links `t` in. Runs as a `ParkFn` — i.e. after the task's context is
+    /// safely saved — so the deadline is visible before any worker can expire it.
+    fn push(self: *TimerQueue, t: *Task) void {
+        self.lock.acquire();
+        defer self.lock.release();
+        t.timer_next = self.head;
+        self.head = t;
+    }
+
+    /// Unparks every sleeper whose deadline has passed. Returns how many woke.
+    /// Bounded by the number of live sleeping tasks (Power of 10).
+    fn expire(self: *TimerQueue, sched: *Scheduler, now: u64) usize {
+        self.lock.acquire();
+        var due: ?*Task = null;
+        var keep: ?*Task = null;
+        var it = self.head;
+        while (it) |t| {
+            const next = t.timer_next;
+            if (t.deadline_ns <= now) {
+                t.timer_next = due;
+                due = t;
+            } else {
+                t.timer_next = keep;
+                keep = t;
+            }
+            it = next;
+        }
+        self.head = keep;
+        self.lock.release();
+
+        // Unpark outside the lock: `unpark` pushes onto the global run queue,
+        // and a worker may immediately pick the task up.
+        var woken: usize = 0;
+        while (due) |t| {
+            due = t.timer_next;
+            t.timer_next = null;
+            unpark(sched, t);
+            woken += 1;
+        }
+        return woken;
+    }
+};
+
+/// Parks the calling green thread for at least `ns`, letting the worker's OS
+/// thread run other tasks meanwhile (ABI.md §11). The deadline is recorded
+/// before parking; the link onto the timer queue happens in the `ParkFn`, the
+/// same safe-registration point the netpoller uses.
+///
+/// Timers are only expired on a worker's idle path, so a deadline cannot
+/// preempt a running task — consistent with the cooperative scheduler, where a
+/// CPU-bound task already blocks everything else on its worker.
+pub fn sleepTask(ns: u64) void {
+    const t = Worker.current().running.?;
+    t.deadline_ns = monoNs() + ns;
+    park(timerPark, null);
+}
+
+fn timerPark(t: *Task, _: ?*anyopaque) void {
+    Worker.current().sched.timers.push(t);
+}
+
 pub const Scheduler = struct {
     workers: []Worker,
     global: GlobalQueue = .{},
     poller: NetPoller,
+    timers: TimerQueue = .{},
     stopping: std.atomic.Value(bool) = .init(false),
 
     /// All-live-tasks registry (ABI.md §5): every `Task` from `spawn` until its

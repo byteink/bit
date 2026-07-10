@@ -2489,32 +2489,16 @@ const Checker = struct {
             if (arg_items.len >= 2) _ = try self.checkArgExprType(file_idx, arg_items[1], env, fctx);
             return self.ctx.void_id;
         }
-        // Low-level filesystem primitives (ABI.md §14). Fixed signatures over
-        // string/i64/bool; the fallible File/open/readFile ergonomics live in
-        // std/fs, so these stay plain (errors surface as a -1 fd / byte count).
-        const string_id = self.ctx.prim_ids.get(.string);
-        const i64_id = self.ctx.prim_ids.get(.i64);
-        const bool_id = self.ctx.prim_ids.get(.bool);
-        if (std.mem.eql(u8, name, "fsOpen")) {
-            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{ string_id, bool_id }, env, fctx);
-            return i64_id;
-        }
-        if (std.mem.eql(u8, name, "fsReadAll")) {
-            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{i64_id}, env, fctx);
-            return string_id;
-        }
-        if (std.mem.eql(u8, name, "fsWrite")) {
-            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{ i64_id, string_id }, env, fctx);
-            return i64_id;
-        }
-        if (std.mem.eql(u8, name, "fsClose")) {
-            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{i64_id}, env, fctx);
-            return i64_id;
-        }
-        if (std.mem.eql(u8, name, "fsqrt")) {
-            const f64_id = self.ctx.prim_ids.get(.f64);
-            try self.checkFixedArgs(file_idx, node, name, arg_items, &.{f64_id}, env, fctx);
-            return f64_id;
+        // Runtime primitives: filesystem (ABI.md §14), math (§17), time (§18),
+        // os (§19). Fixed arities over prim types, table-driven so a new
+        // primitive is one row in `prim_sigs` and one in `lower.zig`'s matching
+        // `primRtFn`. They stay plain (no fallible results): the ergonomic,
+        // error-returning layer lives in the Bit stdlib that wraps them.
+        if (primSig(name)) |sig| {
+            var want: [2]TypeId = undefined;
+            for (sig.params, 0..) |p, i| want[i] = self.ctx.prim_ids.get(p);
+            try self.checkFixedArgs(file_idx, node, name, arg_items, want[0..sig.params.len], env, fctx);
+            return if (sig.ret) |r| self.ctx.prim_ids.get(r) else self.ctx.void_id;
         }
         try self.checkArgsLoose(file_idx, arg_items, env, fctx);
         return .invalid;
@@ -2522,6 +2506,43 @@ const Checker = struct {
 
     /// Checks a fixed-arity builtin call: exactly `want.len` arguments, each
     /// assignable to its declared type. Used by the filesystem primitives.
+    /// Signature of a fixed-arity runtime-primitive builtin. `ret == null` means
+    /// `void`. Every name here must have a matching row in `lower.zig`'s
+    /// `primRtFn` — the two tables are the whole contract for these builtins.
+    const PrimSig = struct { params: []const Prim, ret: ?Prim };
+
+    const prim_sigs = std.StaticStringMap(PrimSig).initComptime(.{
+        // Filesystem (ABI.md §14) — under std/fs.
+        .{ "fsOpen", PrimSig{ .params = &.{ .string, .bool }, .ret = .i64 } },
+        .{ "fsReadAll", PrimSig{ .params = &.{.i64}, .ret = .string } },
+        .{ "fsWrite", PrimSig{ .params = &.{ .i64, .string }, .ret = .i64 } },
+        .{ "fsClose", PrimSig{ .params = &.{.i64}, .ret = .i64 } },
+        // Math (ABI.md §17) — under std/math.
+        .{ "fsqrt", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "ffloor", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "fceil", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "fround", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "ftrunc", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "fpow", PrimSig{ .params = &.{ .f64, .f64 }, .ret = .f64 } },
+        .{ "fatan2", PrimSig{ .params = &.{ .f64, .f64 }, .ret = .f64 } },
+        .{ "flog", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "flog2", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        .{ "flog10", PrimSig{ .params = &.{.f64}, .ret = .f64 } },
+        // Time (ABI.md §18) — under std/time.
+        .{ "timeMonoNs", PrimSig{ .params = &.{}, .ret = .i64 } },
+        .{ "timeUnixNs", PrimSig{ .params = &.{}, .ret = .i64 } },
+        .{ "timeSleepNs", PrimSig{ .params = &.{.i64}, .ret = null } },
+        // OS (ABI.md §19) — under std/os.
+        .{ "osArgc", PrimSig{ .params = &.{}, .ret = .i64 } },
+        .{ "osArgAt", PrimSig{ .params = &.{.i64}, .ret = .string } },
+        .{ "osEnv", PrimSig{ .params = &.{.string}, .ret = .string } },
+        .{ "osExit", PrimSig{ .params = &.{.i64}, .ret = null } },
+    });
+
+    fn primSig(name: []const u8) ?PrimSig {
+        return prim_sigs.get(name);
+    }
+
     fn checkFixedArgs(self: *Checker, file_idx: usize, node: ast.Index, name: []const u8, arg_items: []const ast.Index, want: []const TypeId, env: GenericEnv, fctx: FnCtx) Error!void {
         const mf = self.files[file_idx];
         if (arg_items.len != want.len) {

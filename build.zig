@@ -292,6 +292,22 @@ pub fn build(b: *std.Build) void {
     const testcmd_tests = b.addTest(.{ .root_module = testcmd_mod });
     test_step.dependOn(&b.addRunArtifact(testcmd_tests).step);
 
+    // std/os args + environment round-trip (#354): one program run twice under
+    // a controlled environment. Shares the host libbitrt archive.
+    const osenv_opts = b.addOptions();
+    osenv_opts.addOption([]const u8, "osenv_dir", b.pathFromRoot("tests/osenv"));
+    osenv_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    const osenv_mod = b.createModule(.{
+        .root_source_file = b.path("tests/osenv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    osenv_mod.addImport("bitc", exe.root_module);
+    osenv_mod.addOptions("build_options", osenv_opts);
+
+    const osenv_tests = b.addTest(.{ .root_module = osenv_mod });
+    test_step.dependOn(&b.addRunArtifact(osenv_tests).step);
+
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is
@@ -474,6 +490,10 @@ pub fn build(b: *std.Build) void {
     // Same archive for the `bit test` runner guard.
     testcmd_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
     if (host_libbitrt_install) |inst| testcmd_tests.step.dependOn(inst);
+
+    // Same archive for the std/os env guard.
+    osenv_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);
+    if (host_libbitrt_install) |inst| osenv_tests.step.dependOn(inst);
 
     // Same archive for the imports/prelude guard.
     imports_opts.addOption([]const u8, "libbitrt_path", host_libbitrt_path);

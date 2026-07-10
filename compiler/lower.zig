@@ -2105,29 +2105,48 @@ const FnCtx = struct {
             return self.b.rtCall(void_ty, .map_delete, &.{ mv, kv });
         }
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
-        // Filesystem primitives (ABI.md §14): each maps 1:1 to a runtime call,
-        // result typed by the checker (i64 fd/count or a fresh string).
-        const fs_rt: ?ir.RtFn = if (std.mem.eql(u8, name, "fsOpen"))
-            .fs_open
-        else if (std.mem.eql(u8, name, "fsReadAll"))
-            .fs_read_all
-        else if (std.mem.eql(u8, name, "fsWrite"))
-            .fs_write
-        else if (std.mem.eql(u8, name, "fsClose"))
-            .fs_close
-        else
-            null;
-        if (fs_rt) |rt| {
+        // Runtime primitives (fs §14, math §17, time §18, os §19): each maps 1:1
+        // to a runtime call whose result the checker already typed. The arity and
+        // operand types were enforced there (`check.zig`'s `prim_sigs`), so the
+        // args lower generically.
+        if (primRtFn(name)) |rt| {
             const vals = try self.lowerArgs(args_node);
             defer self.gpa.free(vals);
             return self.b.rtCall(try self.nodeType(node), rt, vals);
         }
-        if (std.mem.eql(u8, name, "fsqrt")) {
-            const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
-            return self.b.rtCall(try self.nodeType(node), .sqrt, &.{v});
-        }
-        return error.UnsupportedConstruct; // delete/close: deferred
+        return error.UnsupportedConstruct; // close: deferred
     }
+
+    /// Name -> runtime call for the fixed-arity primitive builtins. Mirrors
+    /// `check.zig`'s `prim_sigs`, which types them; a primitive missing from
+    /// either table is a compile-time-unreachable builtin.
+    fn primRtFn(name: []const u8) ?ir.RtFn {
+        return prim_rt_fns.get(name);
+    }
+
+    const prim_rt_fns = std.StaticStringMap(ir.RtFn).initComptime(.{
+        .{ "fsOpen", ir.RtFn.fs_open },
+        .{ "fsReadAll", ir.RtFn.fs_read_all },
+        .{ "fsWrite", ir.RtFn.fs_write },
+        .{ "fsClose", ir.RtFn.fs_close },
+        .{ "fsqrt", ir.RtFn.sqrt },
+        .{ "ffloor", ir.RtFn.floor },
+        .{ "fceil", ir.RtFn.ceil },
+        .{ "fround", ir.RtFn.round },
+        .{ "ftrunc", ir.RtFn.trunc },
+        .{ "fpow", ir.RtFn.pow },
+        .{ "fatan2", ir.RtFn.atan2 },
+        .{ "flog", ir.RtFn.log },
+        .{ "flog2", ir.RtFn.log2 },
+        .{ "flog10", ir.RtFn.log10 },
+        .{ "timeMonoNs", ir.RtFn.time_mono_ns },
+        .{ "timeUnixNs", ir.RtFn.time_unix_ns },
+        .{ "timeSleepNs", ir.RtFn.time_sleep_ns },
+        .{ "osArgc", ir.RtFn.os_argc },
+        .{ "osArgAt", ir.RtFn.os_arg_at },
+        .{ "osEnv", ir.RtFn.os_env },
+        .{ "osExit", ir.RtFn.os_exit },
+    });
 
     /// `append(s, e1, e2, ...)`: folds each element through `slice_append`,
     /// threading the returned (possibly regrown) header so the caller's
@@ -2810,8 +2829,12 @@ const FnCtx = struct {
         return obj;
     }
 
-    fn lowerToString(self: *FnCtx, v: ir.ValueId, ty: TypeId) Error!ir.ValueId {
+    fn lowerToString(self: *FnCtx, v: ir.ValueId, raw_ty: TypeId) Error!ir.ValueId {
         const string_ty = self.ctx.prim_ids.get(.string);
+        // An interpolated literal (`"${1.5}"`, `"${42}"`) carries an untyped
+        // type; the value was already materialized at its default type, so the
+        // conversion must dispatch on that same default rather than fall through.
+        const ty = self.defaultTy(raw_ty);
         const data = self.ctx.typeOf(ty);
         if (data == .prim) {
             return switch (data.prim) {

@@ -428,6 +428,22 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_map_key_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 | `bit_rt_map_val_at`   | `(m: *MapHeader, slot: i64) -> u64` (§15)               |
 | `bit_rt_test_index`   | `() -> i64` (§16)                                      |
+| `bit_rt_floor`        | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_ceil`         | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_round`        | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_trunc`        | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_pow`          | `(x: f64, y: f64) -> f64` (§17)                        |
+| `bit_rt_atan2`        | `(y: f64, x: f64) -> f64` (§17)                        |
+| `bit_rt_log`          | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_log2`         | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_log10`        | `(x: f64) -> f64` (§17)                                |
+| `bit_rt_time_mono_ns` | `() -> i64` (§18)                                      |
+| `bit_rt_time_unix_ns` | `() -> i64` (§18)                                      |
+| `bit_rt_time_sleep_ns`| `(ns: i64) -> void` (§18)                              |
+| `bit_rt_os_argc`      | `() -> i64` (§19)                                      |
+| `bit_rt_os_arg_at`    | `(i: i64) -> *const RtBytes` (§19)                     |
+| `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
+| `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 
 Every symbol above is `callconv(.c)` with plain C linkage — the entire
 compiler-facing surface of `libbitrt.a`. Nothing else in `runtime/` is a stable
@@ -695,3 +711,61 @@ synthetic `main` that calls this function and dispatches to that single test,
 then execs the binary once per test with `BIT_TEST_INDEX` set. An unset or
 out-of-range index matches no test and returns cleanly, so running a test binary
 by hand is a harmless no-op.
+
+---
+
+## 17. Math (`runtime/root.zig`)
+
+The low-level layer under `std/math`. `floor`/`ceil`/`round`/`trunc`/`sqrt` are
+single instructions on both targets; `pow`/`atan2`/`log`/`log2`/`log10` are the
+toolchain's own libm-free implementations.
+
+**`sin`, `cos`, `tan`, and `exp` are deliberately absent.** The toolchain exposes
+them only as builtins that lower to libm calls (`sin`, `exp`, …), and a Bit
+binary links no libc. They arrive with a freestanding implementation, not as a
+silently-approximate stand-in.
+
+> The `log` family is table-driven, which is what made it the first thing to
+> notice the AArch64 mapping-symbol bug: a mis-atomized `.rodata` literal pool
+> shifted the lookup tables and these returned garbage while table-free fast
+> paths stayed exact. `tests/cases/run_math.bit` guards that.
+
+---
+
+## 18. Time (`runtime/root.zig` + `runtime/sched.zig`)
+
+```
+bit_rt_time_mono_ns()      -> i64   // monotonic; the only clock that measures elapsed time
+bit_rt_time_unix_ns()      -> i64   // wall clock, ns since the Unix epoch; may jump
+bit_rt_time_sleep_ns(ns)   -> void  // park this green thread for >= ns
+```
+
+`sleep` records a deadline on the `Task`, then `park`s with a `ParkFn` that
+links it onto the scheduler's `TimerQueue` — the same "register only after the
+context is safely saved" point the netpoller uses (§11), which is what
+guarantees the task is observably `.parked` before another worker can wake it.
+
+A worker expires due timers on its **idle** path, before polling the netpoller,
+and its idle backoff is capped at 1ms — so once a worker has nothing else to
+run, a timer fires within about a millisecond of its deadline. A deadline never
+preempts a running task, consistent with the cooperative scheduler (a CPU-bound
+task already starves its worker).
+
+`TimerQueue` is an unsorted intrusive list: O(1) insert, and `expire` is one
+bounded pass over the live sleepers. A thousand green threads sleeping 50ms
+finish together, in ~50ms, on one OS thread.
+
+---
+
+## 19. OS (`runtime/root.zig`)
+
+```
+bit_rt_os_argc()           -> i64
+bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
+bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
+bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
+```
+
+`argc`/`argv` are captured by the process entry (§9) on both the raw-stack Linux
+path and the Darwin `machoMain` path; `boot` captures the environment block.
+Bit has no nil string, so an unset variable and one set to `""` both read empty.

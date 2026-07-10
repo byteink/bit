@@ -176,8 +176,13 @@ const predeclared_funcs = [_][]const u8{
     // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
     // readFile layer wraps these in std/fs.
     "fsOpen", "fsReadAll", "fsWrite", "fsClose",
-    // Float square root (hardware instruction); std/math re-exports it as `sqrt`.
-    "fsqrt",
+    // Float primitives (ABI.md §17); std/math re-exports them under plain names.
+    "fsqrt",   "ffloor",     "fceil",   "fround",  "ftrunc",
+    "fpow",    "fatan2",     "flog",    "flog2",   "flog10",
+    // Clock + green-thread sleep (ABI.md §18); std/time wraps these.
+    "timeMonoNs", "timeUnixNs", "timeSleepNs",
+    // Process environment (ABI.md §19); std/os wraps these.
+    "osArgc", "osArgAt", "osEnv", "osExit",
 };
 
 // ============================================================================

@@ -145,6 +145,30 @@ pub const RtFn = enum {
     /// Only ever emitted into the synthetic `main` that `compiler/testgen.zig`
     /// appends under `bit test` (ABI.md §16).
     test_index,
+    /// Math primitives under `std/math` (ABI.md §17). All `(f64) -> f64` except
+    /// `pow`/`atan2`, which take two. `sin`/`cos`/`tan`/`exp` are absent: Zig
+    /// exposes them only as libm-lowering builtins, and Bit links no libc.
+    floor,
+    ceil,
+    round,
+    trunc,
+    pow,
+    atan2,
+    log,
+    log2,
+    log10,
+    /// Time primitives under `std/time` (ABI.md §18). `time_sleep_ns` parks the
+    /// calling green thread on the scheduler's timer queue — it never blocks the
+    /// OS thread.
+    time_mono_ns,
+    time_unix_ns,
+    time_sleep_ns,
+    /// OS primitives under `std/os` (ABI.md §19). `os_env` yields the empty
+    /// string for an unset variable; `os_exit` does not return.
+    os_argc,
+    os_arg_at,
+    os_env,
+    os_exit,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

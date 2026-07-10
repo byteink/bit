@@ -1655,6 +1655,22 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .fs_write = "bit_rt_fs_write",
     .fs_close = "bit_rt_fs_close",
     .test_index = "bit_rt_test_index",
+    .floor = "bit_rt_floor",
+    .ceil = "bit_rt_ceil",
+    .round = "bit_rt_round",
+    .trunc = "bit_rt_trunc",
+    .pow = "bit_rt_pow",
+    .atan2 = "bit_rt_atan2",
+    .log = "bit_rt_log",
+    .log2 = "bit_rt_log2",
+    .log10 = "bit_rt_log10",
+    .time_mono_ns = "bit_rt_time_mono_ns",
+    .time_unix_ns = "bit_rt_time_unix_ns",
+    .time_sleep_ns = "bit_rt_time_sleep_ns",
+    .os_argc = "bit_rt_os_argc",
+    .os_arg_at = "bit_rt_os_arg_at",
+    .os_env = "bit_rt_os_env",
+    .os_exit = "bit_rt_os_exit",
 });
 
 const CallReturn = struct { dst: u32, ty: TypeId };
