@@ -1,0 +1,758 @@
+// Bit standard library — http2 module, HPACK header compression (RFC 7541).
+//
+// HPACK is the header-compression format HTTP/2 carries its headers in. It
+// compresses a list of `(name, value)` header fields against two shared tables:
+// a fixed **static table** of 61 common entries (Appendix A) and a per-connection
+// **dynamic table** that both peers grow in lock-step as headers flow, so a
+// repeated header costs a single index byte. Three tools do the work: a variable-
+// length **integer** encoding (§5.1), a **string literal** encoding that is
+// optionally **Huffman**-coded (§5.2, Appendix B), and five **field
+// representations** (§6) that combine them.
+//
+// This file is byte-layer only — it turns a `[]HeaderField` into a header block
+// and back, with no knowledge of HTTP/2 frames or streams. `Encoder` and
+// `Decoder` each own their dynamic-table state; a matched encoder/decoder pair
+// walked over the same header sequence evolve identical tables, which is exactly
+// the invariant HPACK relies on. Decoding is strict, because a decoder faces
+// hostile input: a zero index, an out-of-range index, a size update over the
+// agreed limit, an EOS symbol inside a Huffman string, or non-all-ones Huffman
+// padding are all rejected rather than best-guessed.
+//
+// This file is part of the flat `std/http2` module and shares one namespace with
+// `frames.bit`; every unexported helper here is prefixed `hpack` so the two
+// files never collide.
+
+// A single header field: a `name`, its `value`, and whether it is `sensitive`.
+// A `sensitive` field (an authorization token, a cookie) is encoded
+// **never-indexed** (§6.2.3) so it is never placed in the dynamic table, where a
+// compression-ratio side channel could recover it; a decoder reports the field
+// it received under that representation with `sensitive` set.
+export struct HeaderField {
+  export name: string,
+  export value: string,
+  export sensitive: bool,
+}
+
+// One dynamic/static table entry. Values only — the `sensitive` bit is a
+// per-representation encode choice, never stored in a table.
+struct hpackEntry { name: string, value: string }
+
+// The shared dynamic-table state: `entries` newest-first (so `entries[0]` is
+// index 62, the most recently inserted), the running byte `size` (§4.1), and the
+// current `maxSize` bound. A struct is a reference type, so the table threads
+// through the `hpack*` helpers and its mutations persist for the owning
+// `Encoder`/`Decoder`.
+struct hpackTable { entries: []hpackEntry, size: int, maxSize: int }
+
+// The result of searching the tables for a field: `index` is the combined table
+// index (1-based; 0 means "no match at all"), and `full` is true only when both
+// name and value matched.
+struct hpackMatch { index: int, full: bool }
+
+// The static table (RFC 7541 Appendix A): 61 entries, index 1..61. Returned by a
+// function because a top-level `const` cannot hold a slice literal (§15.4).
+function hpackStaticTable(): []hpackEntry {
+  return []hpackEntry{
+    hpackEntry{ name: ":authority", value: "" },
+    hpackEntry{ name: ":method", value: "GET" },
+    hpackEntry{ name: ":method", value: "POST" },
+    hpackEntry{ name: ":path", value: "/" },
+    hpackEntry{ name: ":path", value: "/index.html" },
+    hpackEntry{ name: ":scheme", value: "http" },
+    hpackEntry{ name: ":scheme", value: "https" },
+    hpackEntry{ name: ":status", value: "200" },
+    hpackEntry{ name: ":status", value: "204" },
+    hpackEntry{ name: ":status", value: "206" },
+    hpackEntry{ name: ":status", value: "304" },
+    hpackEntry{ name: ":status", value: "400" },
+    hpackEntry{ name: ":status", value: "404" },
+    hpackEntry{ name: ":status", value: "500" },
+    hpackEntry{ name: "accept-charset", value: "" },
+    hpackEntry{ name: "accept-encoding", value: "gzip, deflate" },
+    hpackEntry{ name: "accept-language", value: "" },
+    hpackEntry{ name: "accept-ranges", value: "" },
+    hpackEntry{ name: "accept", value: "" },
+    hpackEntry{ name: "access-control-allow-origin", value: "" },
+    hpackEntry{ name: "age", value: "" },
+    hpackEntry{ name: "allow", value: "" },
+    hpackEntry{ name: "authorization", value: "" },
+    hpackEntry{ name: "cache-control", value: "" },
+    hpackEntry{ name: "content-disposition", value: "" },
+    hpackEntry{ name: "content-encoding", value: "" },
+    hpackEntry{ name: "content-language", value: "" },
+    hpackEntry{ name: "content-length", value: "" },
+    hpackEntry{ name: "content-location", value: "" },
+    hpackEntry{ name: "content-range", value: "" },
+    hpackEntry{ name: "content-type", value: "" },
+    hpackEntry{ name: "cookie", value: "" },
+    hpackEntry{ name: "date", value: "" },
+    hpackEntry{ name: "etag", value: "" },
+    hpackEntry{ name: "expect", value: "" },
+    hpackEntry{ name: "expires", value: "" },
+    hpackEntry{ name: "from", value: "" },
+    hpackEntry{ name: "host", value: "" },
+    hpackEntry{ name: "if-match", value: "" },
+    hpackEntry{ name: "if-modified-since", value: "" },
+    hpackEntry{ name: "if-none-match", value: "" },
+    hpackEntry{ name: "if-range", value: "" },
+    hpackEntry{ name: "if-unmodified-since", value: "" },
+    hpackEntry{ name: "last-modified", value: "" },
+    hpackEntry{ name: "link", value: "" },
+    hpackEntry{ name: "location", value: "" },
+    hpackEntry{ name: "max-forwards", value: "" },
+    hpackEntry{ name: "proxy-authenticate", value: "" },
+    hpackEntry{ name: "proxy-authorization", value: "" },
+    hpackEntry{ name: "range", value: "" },
+    hpackEntry{ name: "referer", value: "" },
+    hpackEntry{ name: "refresh", value: "" },
+    hpackEntry{ name: "retry-after", value: "" },
+    hpackEntry{ name: "server", value: "" },
+    hpackEntry{ name: "set-cookie", value: "" },
+    hpackEntry{ name: "strict-transport-security", value: "" },
+    hpackEntry{ name: "transfer-encoding", value: "" },
+    hpackEntry{ name: "user-agent", value: "" },
+    hpackEntry{ name: "vary", value: "" },
+    hpackEntry{ name: "via", value: "" },
+    hpackEntry{ name: "www-authenticate", value: "" },
+  }
+}
+
+// The number of static-table entries (61); dynamic indices start one past it.
+const hpackStaticLen: int = 61
+
+// The overhead HPACK charges each dynamic-table entry, on top of its name and
+// value byte lengths (RFC 7541 §4.1).
+const hpackEntryOverhead: int = 32
+
+// The default dynamic-table size limit, matching HTTP/2's default
+// `SETTINGS_HEADER_TABLE_SIZE` (RFC 7540 §6.5.2).
+const hpackDefaultTableSize: int = 4096
+
+// ---------------------------------------------------------------------------
+// Huffman code (RFC 7541 Appendix B)
+// ---------------------------------------------------------------------------
+
+// The bit length of each of the 257 Huffman symbols (0..255, then EOS at 256).
+// The codes themselves are the canonical Huffman codes for these lengths, listed
+// in `hpackHuffCode`; the decoder rebuilds its tables from these lengths alone.
+function hpackHuffLen(): []int {
+  return []int{
+    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+    28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+    5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+    30,
+  }
+}
+
+// The Huffman code of each of the 257 symbols, right-justified in its bit length
+// (RFC 7541 Appendix B). Symbol 256 (`0x3fffffff`, 30 bits) is EOS.
+function hpackHuffCode(): []i64 {
+  return []i64{
+    0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3, 0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
+    0xfffffe8, 0xffffea, 0x3ffffffc, 0xfffffe9, 0xfffffea, 0x3ffffffd, 0xfffffeb, 0xfffffec,
+    0xfffffed, 0xfffffee, 0xfffffef, 0xffffff0, 0xffffff1, 0xffffff2, 0x3ffffffe, 0xffffff3,
+    0xffffff4, 0xffffff5, 0xffffff6, 0xffffff7, 0xffffff8, 0xffffff9, 0xffffffa, 0xffffffb,
+    0x14, 0x3f8, 0x3f9, 0xffa, 0x1ff9, 0x15, 0xf8, 0x7fa,
+    0x3fa, 0x3fb, 0xf9, 0x7fb, 0xfa, 0x16, 0x17, 0x18,
+    0x0, 0x1, 0x2, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+    0x1e, 0x1f, 0x5c, 0xfb, 0x7ffc, 0x20, 0xffb, 0x3fc,
+    0x1ffa, 0x21, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62,
+    0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
+    0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72,
+    0xfc, 0x73, 0xfd, 0x1ffb, 0x7fff0, 0x1ffc, 0x3ffc, 0x22,
+    0x7ffd, 0x3, 0x23, 0x4, 0x24, 0x5, 0x25, 0x26,
+    0x27, 0x6, 0x74, 0x75, 0x28, 0x29, 0x2a, 0x7,
+    0x2b, 0x76, 0x2c, 0x8, 0x9, 0x2d, 0x77, 0x78,
+    0x79, 0x7a, 0x7b, 0x7ffe, 0x7fc, 0x3ffd, 0x1ffd, 0xffffffc,
+    0xfffe6, 0x3fffd2, 0xfffe7, 0xfffe8, 0x3fffd3, 0x3fffd4, 0x3fffd5, 0x7fffd9,
+    0x3fffd6, 0x7fffda, 0x7fffdb, 0x7fffdc, 0x7fffdd, 0x7fffde, 0xffffeb, 0x7fffdf,
+    0xffffec, 0xffffed, 0x3fffd7, 0x7fffe0, 0xffffee, 0x7fffe1, 0x7fffe2, 0x7fffe3,
+    0x7fffe4, 0x1fffdc, 0x3fffd8, 0x7fffe5, 0x3fffd9, 0x7fffe6, 0x7fffe7, 0xffffef,
+    0x3fffda, 0x1fffdd, 0xfffe9, 0x3fffdb, 0x3fffdc, 0x7fffe8, 0x7fffe9, 0x1fffde,
+    0x7fffea, 0x3fffdd, 0x3fffde, 0xfffff0, 0x1fffdf, 0x3fffdf, 0x7fffeb, 0x7fffec,
+    0x1fffe0, 0x1fffe1, 0x3fffe0, 0x1fffe2, 0x7fffed, 0x3fffe1, 0x7fffee, 0x7fffef,
+    0xfffea, 0x3fffe2, 0x3fffe3, 0x3fffe4, 0x7ffff0, 0x3fffe5, 0x3fffe6, 0x7ffff1,
+    0x3ffffe0, 0x3ffffe1, 0xfffeb, 0x7fff1, 0x3fffe7, 0x7ffff2, 0x3fffe8, 0x1ffffec,
+    0x3ffffe2, 0x3ffffe3, 0x3ffffe4, 0x7ffffde, 0x7ffffdf, 0x3ffffe5, 0xfffff1, 0x1ffffed,
+    0x7fff2, 0x1fffe3, 0x3ffffe6, 0x7ffffe0, 0x7ffffe1, 0x3ffffe7, 0x7ffffe2, 0xfffff2,
+    0x1fffe4, 0x1fffe5, 0x3ffffe8, 0x3ffffe9, 0xffffffd, 0x7ffffe3, 0x7ffffe4, 0x7ffffe5,
+    0xfffec, 0xfffff3, 0xfffed, 0x1fffe6, 0x3fffe9, 0x1fffe7, 0x1fffe8, 0x7ffff3,
+    0x3fffea, 0x3fffeb, 0x1ffffee, 0x1ffffef, 0xfffff4, 0xfffff5, 0x3ffffea, 0x7ffff4,
+    0x3ffffeb, 0x7ffffe6, 0x3ffffec, 0x3ffffed, 0x7ffffe7, 0x7ffffe8, 0x7ffffe9, 0x7ffffea,
+    0x7ffffeb, 0xffffffe, 0x7ffffec, 0x7ffffed, 0x7ffffee, 0x7ffffef, 0x7fffff0, 0x3ffffee,
+    0x3fffffff,
+  }
+}
+
+// The longest Huffman code, in bits (EOS is 30). No valid code exceeds this, so a
+// decode that accumulates more bits without a match is malformed.
+const hpackHuffMaxLen: int = 30
+
+// The EOS symbol index. Its code is the all-ones padding pattern; seeing it
+// *decoded* from the stream is a hard error (RFC 7541 §5.2).
+const hpackHuffEos: int = 256
+
+// The canonical decode tables, derived from the bit lengths: `count[l]` symbols
+// have length `l`, the length-`l` codes start at `firstCode[l]` and their symbols
+// occupy `syms[firstSym[l] .. ]` in ascending code order.
+struct hpackHuffDecode {
+  count: []int,
+  firstCode: []i64,
+  firstSym: []int,
+  syms: []int,
+}
+
+// Build the canonical decode tables from `hpackHuffLen`. Standard canonical-
+// Huffman reconstruction: `firstCode[l] = (firstCode[l-1] + count[l-1]) << 1`,
+// with symbols of each length laid out in ascending symbol order (which, for a
+// canonical code, is ascending code order).
+function hpackBuildHuffDecode(): hpackHuffDecode {
+  let lens = hpackHuffLen()
+  let count = []int(hpackHuffMaxLen + 1)
+  let i = 0
+  while (i < len(lens)) {
+    count[lens[i]] = count[lens[i]] + 1
+    i = i + 1
+  }
+  let firstCode = []i64(hpackHuffMaxLen + 1)
+  let firstSym = []int(hpackHuffMaxLen + 1)
+  let code = 0
+  let idx = 0
+  let l = 1
+  while (l <= hpackHuffMaxLen) {
+    code = (code + count[l - 1]) << 1
+    firstCode[l] = code
+    firstSym[l] = idx
+    idx = idx + count[l]
+    l = l + 1
+  }
+  // Place each symbol into its length's block, preserving ascending symbol order.
+  let syms = []int(len(lens))
+  let cursor = []int(hpackHuffMaxLen + 1)
+  let m = 1
+  while (m <= hpackHuffMaxLen) {
+    cursor[m] = firstSym[m]
+    m = m + 1
+  }
+  let s = 0
+  while (s < len(lens)) {
+    let ln = lens[s]
+    syms[cursor[ln]] = s
+    cursor[ln] = cursor[ln] + 1
+    s = s + 1
+  }
+  return hpackHuffDecode{ count: count, firstCode: firstCode, firstSym: firstSym, syms: syms }
+}
+
+// Huffman-encode `data` with the RFC 7541 Appendix B code, MSB-first, padding the
+// final partial byte with 1-bits (the high bits of the EOS code). The result is
+// often shorter than `data`, but not always — an encoder chooses per string
+// whether to use it.
+export function huffmanEncode(data: []byte): []byte {
+  let codes = hpackHuffCode()
+  let lens = hpackHuffLen()
+  let out = []byte(0)
+  let acc = 0
+  let n = 0
+  let i = 0
+  while (i < len(data)) {
+    let sym = int(data[i])
+    acc = (acc << lens[sym]) | codes[sym]
+    n = n + lens[sym]
+    while (n >= 8) {
+      n = n - 8
+      out = append(out, byte((acc >> n) & 0xff))
+    }
+    acc = acc & ((1 << n) - 1)
+    i = i + 1
+  }
+  if (n > 0) {
+    let pad = 8 - n
+    out = append(out, byte(((acc << pad) | ((1 << pad) - 1)) & 0xff))
+  }
+  return out
+}
+
+// Huffman-decode `data`. Fails on a code that never resolves within 30 bits, on
+// the EOS symbol appearing in the stream, or on final padding that is longer than
+// 7 bits or is not all 1-bits (RFC 7541 §5.2).
+export function huffmanDecode(data: []byte): []byte! {
+  let t = hpackBuildHuffDecode()
+  let out = []byte(0)
+  let code = 0
+  let l = 0
+  let bit = 0
+  let total = len(data) * 8
+  while (bit < total) {
+    let b = int(data[bit / 8])
+    code = (code << 1) | ((b >> (7 - bit % 8)) & 1)
+    l = l + 1
+    if (l > hpackHuffMaxLen) {
+      fail newError("hpack: huffman code exceeds 30 bits")
+    }
+    if (t.count[l] > 0 && code >= t.firstCode[l] && code < t.firstCode[l] + t.count[l]) {
+      let sym = t.syms[t.firstSym[l] + int(code - t.firstCode[l])]
+      if (sym == hpackHuffEos) {
+        fail newError("hpack: EOS symbol in huffman stream")
+      }
+      out = append(out, byte(sym))
+      code = 0
+      l = 0
+    }
+    bit = bit + 1
+  }
+  if (l > 7) {
+    fail newError("hpack: huffman padding longer than 7 bits")
+  }
+  if (l > 0 && code != (1 << l) - 1) {
+    fail newError("hpack: huffman padding is not all ones")
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Integer and string primitives (RFC 7541 §5)
+// ---------------------------------------------------------------------------
+
+// A read cursor over a header block. A reference struct, so the `hpackRead*`
+// helpers advance `pos` for their caller.
+struct hpackReader { data: []byte, pos: int }
+
+// Read one octet, failing at end of input.
+function hpackReadByte(r: hpackReader): int! {
+  if (r.pos >= len(r.data)) {
+    fail newError("hpack: unexpected end of input")
+  }
+  let b = r.data[r.pos]
+  r.pos = r.pos + 1
+  return int(b)
+}
+
+// Append `value` as an HPACK integer with a `prefix`-bit prefix (§5.1), OR-ing
+// the high `flags` bits into the first octet. `flags` must not touch the low
+// `prefix` bits.
+function hpackPutInteger(dst: []byte, prefix: int, flags: int, value: int): []byte {
+  let mask = (1 << prefix) - 1
+  if (value < mask) {
+    return append(dst, byte(flags | value))
+  }
+  let out = append(dst, byte(flags | mask))
+  let v = value - mask
+  let guard = 0
+  while (v >= 128 && guard < 12) {
+    out = append(out, byte((v & 0x7f) | 0x80))
+    v = v >> 7
+    guard = guard + 1
+  }
+  return append(out, byte(v))
+}
+
+// Decode an HPACK integer with a `prefix`-bit prefix (§5.1). `first` is the
+// already-consumed prefix octet; continuation octets are read from `r`. Fails on
+// an over-long encoding or i64 overflow.
+function hpackGetInteger(r: hpackReader, prefix: int, first: int): int! {
+  let mask = (1 << prefix) - 1
+  let value = first & mask
+  if (value < mask) {
+    return value
+  }
+  // At most 8 continuation octets: shift stays <= 49, so `(c & 0x7f) << shift`
+  // and the running sum cannot overflow i64 (each term < 2^56, the sum < 2^59) —
+  // no trap on a hostile input, and any real HPACK integer fits comfortably.
+  let shift = 0
+  let guard = 0
+  while (guard < 8) {
+    let c = hpackReadByte(r)?
+    value = value + ((c & 0x7f) << shift)
+    if (value < 0) {
+      fail newError("hpack: integer overflow")
+    }
+    if ((c & 0x80) == 0) {
+      return value
+    }
+    shift = shift + 7
+    guard = guard + 1
+  }
+  fail newError("hpack: integer encoding too long")
+}
+
+// Append `s` as an HPACK string literal (§5.2). When `huffman`, the bytes are
+// Huffman-coded and the length octet's H bit is set; otherwise they are raw.
+function hpackPutString(dst: []byte, s: []byte, huffman: bool): []byte {
+  if (huffman) {
+    let enc = huffmanEncode(s)
+    let out = hpackPutInteger(dst, 7, 0x80, len(enc))
+    return hpackAppendBytes(out, enc)
+  }
+  let out = hpackPutInteger(dst, 7, 0x00, len(s))
+  return hpackAppendBytes(out, s)
+}
+
+// Read an HPACK string literal (§5.2), Huffman-decoding it when the H bit is set.
+// Fails if the declared length runs past the buffer.
+function hpackGetString(r: hpackReader): []byte! {
+  let first = hpackReadByte(r)?
+  let huffman = (first & 0x80) != 0
+  let length = hpackGetInteger(r, 7, first)?
+  if (length < 0 || r.pos + length > len(r.data)) {
+    fail newError("hpack: string literal runs past end of input")
+  }
+  let raw = r.data[r.pos:r.pos + length]
+  r.pos = r.pos + length
+  if (huffman) {
+    return huffmanDecode(raw)?
+  }
+  return raw
+}
+
+// Append every byte of `src` onto `dst`.
+function hpackAppendBytes(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic table (RFC 7541 §2.3.2, §4)
+// ---------------------------------------------------------------------------
+
+// The byte size an entry occupies: name + value + the 32-byte overhead (§4.1).
+function hpackSizeOf(name: string, value: string): int {
+  return len(name) + len(value) + hpackEntryOverhead
+}
+
+// The entry at combined `index` (§2.3.3): 1..61 is the static table, 62 and up is
+// the dynamic table newest-first. Fails on a zero or out-of-range index.
+function hpackLookup(t: hpackTable, index: int): hpackEntry! {
+  let stat = hpackStaticTable()
+  if (index >= 1 && index <= hpackStaticLen) {
+    return stat[index - 1]
+  }
+  let dyn = index - hpackStaticLen - 1
+  if (dyn >= 0 && dyn < len(t.entries)) {
+    return t.entries[dyn]
+  }
+  fail newError("hpack: index ${index} out of range")
+}
+
+// Evict oldest entries until the table can hold `need` more bytes, or it is
+// empty. The loop is bounded by the entry count, which strictly decreases.
+function hpackEvictFor(t: hpackTable, need: int) {
+  let bound = len(t.entries)
+  let dropped = 0
+  while (t.size + need > t.maxSize && len(t.entries) > 0 && dropped <= bound) {
+    let last = len(t.entries) - 1
+    let old = t.entries[last]
+    t.size = t.size - hpackSizeOf(old.name, old.value)
+    t.entries = t.entries[0:last]
+    dropped = dropped + 1
+  }
+}
+
+// Insert `(name, value)` as the newest dynamic entry (§4.4). Entries are evicted
+// first to make room; an entry larger than the whole table empties it and is not
+// inserted.
+function hpackTableAdd(t: hpackTable, name: string, value: string) {
+  let need = hpackSizeOf(name, value)
+  hpackEvictFor(t, need)
+  if (need > t.maxSize) {
+    return
+  }
+  let next = []hpackEntry(0)
+  next = append(next, hpackEntry{ name: name, value: value })
+  let i = 0
+  while (i < len(t.entries)) {
+    next = append(next, t.entries[i])
+    i = i + 1
+  }
+  t.entries = next
+  t.size = t.size + need
+}
+
+// Set the table's maximum size (§4.3), evicting oldest entries until the running
+// size fits under the new bound.
+function hpackTableSetMax(t: hpackTable, maxSize: int) {
+  t.maxSize = maxSize
+  hpackEvictFor(t, 0)
+}
+
+// Find `(name, value)` in the tables the way a compressing encoder does: a full
+// (name and value) match wins and returns immediately, scanning the static table
+// before the dynamic one; otherwise the first name-only match (static preferred)
+// is returned as a partial. `index` 0 means nothing matched.
+function hpackFind(t: hpackTable, name: string, value: string): hpackMatch {
+  let stat = hpackStaticTable()
+  let partial = 0
+  let i = 0
+  while (i < len(stat)) {
+    if (stat[i].name == name) {
+      if (stat[i].value == value) {
+        return hpackMatch{ index: i + 1, full: true }
+      }
+      if (partial == 0) {
+        partial = i + 1
+      }
+    }
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(t.entries)) {
+    if (t.entries[j].name == name) {
+      let idx = hpackStaticLen + 1 + j
+      if (t.entries[j].value == value) {
+        return hpackMatch{ index: idx, full: true }
+      }
+      if (partial == 0) {
+        partial = idx
+      }
+    }
+    j = j + 1
+  }
+  return hpackMatch{ index: partial, full: false }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+// A stateful HPACK encoder. It owns its dynamic table and, per field, chooses the
+// smallest representation: an indexed field for a full table match, else a
+// literal with incremental indexing (adding the field to the table). `huffman`
+// selects Huffman string literals for every literal it emits. A `sensitive`
+// field is always emitted never-indexed. Reuse one encoder across a connection's
+// header blocks so its table stays in sync with the peer decoder.
+export struct Encoder {
+  table: hpackTable,
+  huffman: bool,
+  pendingActive: bool,
+  pendingMin: int,
+  pendingFinal: int,
+}
+
+// A fresh encoder: a 4096-byte dynamic table (the HTTP/2 default) and Huffman
+// string literals enabled.
+export function newEncoder(): Encoder {
+  return Encoder{
+    table: hpackTable{ entries: []hpackEntry(0), size: 0, maxSize: hpackDefaultTableSize },
+    huffman: true,
+    pendingActive: false,
+    pendingMin: 0,
+    pendingFinal: 0,
+  }
+}
+
+// An encoder with an explicit dynamic-table `maxTableSize` and `huffman` string
+// choice — matching a negotiated `SETTINGS_HEADER_TABLE_SIZE`, or reproducing the
+// raw (non-Huffman) RFC 7541 examples.
+export function newEncoderConfig(maxTableSize: int, huffman: bool): Encoder {
+  return Encoder{
+    table: hpackTable{ entries: []hpackEntry(0), size: 0, maxSize: maxTableSize },
+    huffman: huffman,
+    pendingActive: false,
+    pendingMin: 0,
+    pendingFinal: 0,
+  }
+}
+
+// Change the encoder's dynamic-table maximum size (§4.2, §6.3). The table is
+// resized immediately, and the next `encode` prepends the required size-update
+// instruction(s) — both the minimum reached and the final value, per §4.2.
+export function (e: Encoder) changeTableSize(maxTableSize: int) {
+  hpackTableSetMax(e.table, maxTableSize)
+  if (!e.pendingActive) {
+    e.pendingActive = true
+    e.pendingMin = maxTableSize
+    e.pendingFinal = maxTableSize
+  } else {
+    if (maxTableSize < e.pendingMin) {
+      e.pendingMin = maxTableSize
+    }
+    e.pendingFinal = maxTableSize
+  }
+}
+
+// The current byte size of the encoder's dynamic table (§4.1).
+export function (e: Encoder) tableSize(): int {
+  return e.table.size
+}
+
+// The number of entries in the encoder's dynamic table.
+export function (e: Encoder) tableCount(): int {
+  return len(e.table.entries)
+}
+
+// The `i`-th dynamic-table entry, newest first (`i == 0` is index 62). Fails if
+// `i` is out of range. Its `sensitive` field is always false.
+export function (e: Encoder) tableEntry(i: int): HeaderField! {
+  if (i < 0 || i >= len(e.table.entries)) {
+    fail newError("hpack: dynamic entry ${i} out of range")
+  }
+  let en = e.table.entries[i]
+  return HeaderField{ name: en.name, value: en.value, sensitive: false }
+}
+
+// Encode one field onto `dst`, choosing its representation and updating the table.
+function hpackEncodeField(e: Encoder, dst: []byte, f: HeaderField): []byte {
+  let m = hpackFind(e.table, f.name, f.value)
+  if (f.sensitive) {
+    // Never-indexed (§6.2.3): 4-bit name index, never added to the table.
+    let out = dst
+    if (m.index != 0) {
+      out = hpackPutInteger(out, 4, 0x10, m.index)
+    } else {
+      out = hpackPutInteger(out, 4, 0x10, 0)
+      out = hpackPutString(out, []byte(f.name), e.huffman)
+    }
+    return hpackPutString(out, []byte(f.value), e.huffman)
+  }
+  if (m.full) {
+    // Indexed header field (§6.1).
+    return hpackPutInteger(dst, 7, 0x80, m.index)
+  }
+  // Literal with incremental indexing (§6.2.1): 6-bit name index, added to table.
+  let out = dst
+  if (m.index != 0) {
+    out = hpackPutInteger(out, 6, 0x40, m.index)
+  } else {
+    out = hpackPutInteger(out, 6, 0x40, 0)
+    out = hpackPutString(out, []byte(f.name), e.huffman)
+  }
+  out = hpackPutString(out, []byte(f.value), e.huffman)
+  hpackTableAdd(e.table, f.name, f.value)
+  return out
+}
+
+// Encode `fields` into one HPACK header block, evolving the dynamic table. Any
+// pending dynamic-table size update (from `changeTableSize`) is emitted first.
+export function (e: Encoder) encode(fields: []HeaderField): []byte {
+  let out = []byte(0)
+  if (e.pendingActive) {
+    if (e.pendingMin != e.pendingFinal) {
+      out = hpackPutInteger(out, 5, 0x20, e.pendingMin)
+    }
+    out = hpackPutInteger(out, 5, 0x20, e.pendingFinal)
+    e.pendingActive = false
+  }
+  for f of fields {
+    out = hpackEncodeField(e, out, f)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Decoder
+// ---------------------------------------------------------------------------
+
+// A stateful HPACK decoder. It owns its dynamic table and enforces a `limit` — the
+// largest table size it will accept from a peer's size-update instruction, i.e.
+// the `SETTINGS_HEADER_TABLE_SIZE` it advertised. Reuse one decoder across a
+// connection's header blocks so its table tracks the peer encoder.
+export struct Decoder {
+  table: hpackTable,
+  limit: int,
+}
+
+// A fresh decoder with the 4096-byte default table limit.
+export function newDecoder(): Decoder {
+  return Decoder{
+    table: hpackTable{ entries: []hpackEntry(0), size: 0, maxSize: hpackDefaultTableSize },
+    limit: hpackDefaultTableSize,
+  }
+}
+
+// A decoder with an explicit table size `limit`, matching an advertised
+// `SETTINGS_HEADER_TABLE_SIZE`. A peer size update above this limit is rejected.
+export function newDecoderConfig(maxTableSize: int): Decoder {
+  return Decoder{
+    table: hpackTable{ entries: []hpackEntry(0), size: 0, maxSize: maxTableSize },
+    limit: maxTableSize,
+  }
+}
+
+// The current byte size of the decoder's dynamic table (§4.1).
+export function (d: Decoder) tableSize(): int {
+  return d.table.size
+}
+
+// The number of entries in the decoder's dynamic table.
+export function (d: Decoder) tableCount(): int {
+  return len(d.table.entries)
+}
+
+// The `i`-th dynamic-table entry, newest first (`i == 0` is index 62). Fails if
+// `i` is out of range.
+export function (d: Decoder) tableEntry(i: int): HeaderField! {
+  if (i < 0 || i >= len(d.table.entries)) {
+    fail newError("hpack: dynamic entry ${i} out of range")
+  }
+  let en = d.table.entries[i]
+  return HeaderField{ name: en.name, value: en.value, sensitive: false }
+}
+
+// Decode a literal field with a `prefix`-bit name index (§6.2). A zero index
+// means the name is a following string literal; otherwise it is a table
+// reference. `sensitive` marks a never-indexed field.
+function hpackDecodeLiteral(d: Decoder, r: hpackReader, first: int, prefix: int, sensitive: bool): HeaderField! {
+  let nameIdx = hpackGetInteger(r, prefix, first)?
+  let name = ""
+  if (nameIdx == 0) {
+    name = string(hpackGetString(r)?)
+  } else {
+    let en = hpackLookup(d.table, nameIdx)?
+    name = en.name
+  }
+  let value = string(hpackGetString(r)?)
+  return HeaderField{ name: name, value: value, sensitive: sensitive }
+}
+
+// Decode a full HPACK header `block` into its fields, evolving the dynamic table
+// and applying any dynamic-table size updates. Fails on any malformed
+// representation: a zero or out-of-range index, a size update over the decoder's
+// limit, or a bad string/integer/Huffman encoding.
+export function (d: Decoder) decode(block: []byte): []HeaderField! {
+  let r = hpackReader{ data: block, pos: 0 }
+  let out = []HeaderField(0)
+  let guard = 0
+  while (r.pos < len(block) && guard <= len(block)) {
+    let first = hpackReadByte(r)?
+    if ((first & 0x80) != 0) {
+      let idx = hpackGetInteger(r, 7, first)?
+      if (idx == 0) {
+        fail newError("hpack: indexed field with index 0")
+      }
+      let en = hpackLookup(d.table, idx)?
+      out = append(out, HeaderField{ name: en.name, value: en.value, sensitive: false })
+    } else if ((first & 0x40) != 0) {
+      let hf = hpackDecodeLiteral(d, r, first, 6, false)?
+      hpackTableAdd(d.table, hf.name, hf.value)
+      out = append(out, hf)
+    } else if ((first & 0x20) != 0) {
+      let newMax = hpackGetInteger(r, 5, first)?
+      if (newMax > d.limit) {
+        fail newError("hpack: table size update ${newMax} exceeds limit ${d.limit}")
+      }
+      hpackTableSetMax(d.table, newMax)
+    } else if ((first & 0x10) != 0) {
+      out = append(out, hpackDecodeLiteral(d, r, first, 4, true)?)
+    } else {
+      out = append(out, hpackDecodeLiteral(d, r, first, 4, false)?)
+    }
+    guard = guard + 1
+  }
+  return out
+}

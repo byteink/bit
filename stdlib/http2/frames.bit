@@ -1,0 +1,734 @@
+// Bit standard library — http2 module, the HTTP/2 frame layer (RFC 7540 / 9113).
+//
+// Every HTTP/2 message is a stream of **frames**. A frame is a fixed 9-byte
+// header — a 24-bit payload length, an 8-bit type, an 8-bit flags field, a
+// reserved bit, and a 31-bit stream identifier (§4.1) — followed by a
+// type-specific payload. This file is the pure byte codec for that layer: it
+// turns a typed frame value into wire bytes and back, with no I/O, no HPACK, and
+// no stream state machine. The header block fragments HEADERS/PUSH_PROMISE/
+// CONTINUATION carry are opaque `[]byte` here; feed them to the `Encoder`/
+// `Decoder` in `hpack.bit` to get header fields.
+//
+// Decoding is strict, as a frame parser must be against a hostile peer:
+// `readFrame` rejects a declared length over the agreed `SETTINGS_MAX_FRAME_SIZE`
+// or past the buffer; each `decode*` enforces its frame's fixed length (PRIORITY
+// is 5, RST_STREAM 4, PING 8, WINDOW_UPDATE 4), its multiple-of-6 SETTINGS
+// payload, its stream-id rule (a connection-level frame must be on stream 0; a
+// stream-level frame must not), and its padding (padding at least the size of the
+// payload is a `PROTOCOL_ERROR`). Everything that can fail returns `T!`.
+//
+// This file is part of the flat `std/http2` module and shares one namespace with
+// `hpack.bit`; every unexported helper here is prefixed `h2frame` so the two
+// files never collide.
+
+// --- frame types (RFC 7540 §6, FrameType) -----------------------------------
+
+// DATA (0x0): a stream's message body.
+export const frameData: int = 0x0
+// HEADERS (0x1): opens a stream and carries a header block fragment.
+export const frameHeaders: int = 0x1
+// PRIORITY (0x2): a stream's priority dependency and weight.
+export const framePriority: int = 0x2
+// RST_STREAM (0x3): abrupt termination of a stream.
+export const frameRstStream: int = 0x3
+// SETTINGS (0x4): connection configuration parameters.
+export const frameSettings: int = 0x4
+// PUSH_PROMISE (0x5): a server's promise to push a stream.
+export const framePushPromise: int = 0x5
+// PING (0x6): a connection liveness / round-trip measurement.
+export const framePing: int = 0x6
+// GOAWAY (0x7): connection shutdown with the last processed stream.
+export const frameGoaway: int = 0x7
+// WINDOW_UPDATE (0x8): a flow-control window increment.
+export const frameWindowUpdate: int = 0x8
+// CONTINUATION (0x9): a continued header block fragment.
+export const frameContinuation: int = 0x9
+
+// --- frame flags (RFC 7540 §6) ----------------------------------------------
+
+// END_STREAM (0x1) on DATA/HEADERS: the last frame for the stream.
+export const flagEndStream: int = 0x1
+// END_HEADERS (0x4) on HEADERS/PUSH_PROMISE/CONTINUATION: the header block is
+// complete (no CONTINUATION follows).
+export const flagEndHeaders: int = 0x4
+// PADDED (0x8) on DATA/HEADERS/PUSH_PROMISE: the payload begins with a pad-length
+// octet and ends with that many padding octets.
+export const flagPadded: int = 0x8
+// PRIORITY (0x20) on HEADERS: a priority section precedes the header block.
+export const flagPriority: int = 0x20
+// ACK (0x1) on SETTINGS/PING: acknowledges the peer's frame. Shares the bit value
+// of END_STREAM, on frame types where END_STREAM does not apply.
+export const flagAck: int = 0x1
+
+// --- SETTINGS parameters (RFC 7540 §6.5.2, SettingsParameter) ----------------
+
+// SETTINGS_HEADER_TABLE_SIZE (0x1): the HPACK dynamic-table size limit.
+export const settingsHeaderTableSize: int = 0x1
+// SETTINGS_ENABLE_PUSH (0x2): whether server push is permitted.
+export const settingsEnablePush: int = 0x2
+// SETTINGS_MAX_CONCURRENT_STREAMS (0x3): the peer's concurrent-stream cap.
+export const settingsMaxConcurrentStreams: int = 0x3
+// SETTINGS_INITIAL_WINDOW_SIZE (0x4): the initial flow-control window.
+export const settingsInitialWindowSize: int = 0x4
+// SETTINGS_MAX_FRAME_SIZE (0x5): the largest frame payload the peer accepts.
+export const settingsMaxFrameSize: int = 0x5
+// SETTINGS_MAX_HEADER_LIST_SIZE (0x6): the largest header list the peer accepts.
+export const settingsMaxHeaderListSize: int = 0x6
+
+// --- frame-size bounds (RFC 7540 §4.2) --------------------------------------
+
+// The default and minimum `SETTINGS_MAX_FRAME_SIZE` (2^14 = 16384). A peer may
+// not advertise a smaller maximum.
+export const defaultMaxFrameSize: int = 16384
+// The largest value `SETTINGS_MAX_FRAME_SIZE` may take (2^24 - 1), which is also
+// the widest a frame's 24-bit length field can express.
+export const maxMaxFrameSize: int = 16777215
+
+// --- error codes (RFC 7540 §7, ErrorCode) — for RST_STREAM and GOAWAY --------
+
+// NO_ERROR (0x0): graceful shutdown.
+export const errorNoError: int = 0x0
+// PROTOCOL_ERROR (0x1): an unspecific protocol violation.
+export const errorProtocolError: int = 0x1
+// INTERNAL_ERROR (0x2): an implementation fault.
+export const errorInternalError: int = 0x2
+// FLOW_CONTROL_ERROR (0x3): a flow-control window was exceeded.
+export const errorFlowControlError: int = 0x3
+// SETTINGS_TIMEOUT (0x4): a SETTINGS frame was not acknowledged in time.
+export const errorSettingsTimeout: int = 0x4
+// STREAM_CLOSED (0x5): a frame arrived on a half-closed or closed stream.
+export const errorStreamClosed: int = 0x5
+// FRAME_SIZE_ERROR (0x6): a frame's size was invalid for its type.
+export const errorFrameSizeError: int = 0x6
+// REFUSED_STREAM (0x7): the stream was refused before any processing.
+export const errorRefusedStream: int = 0x7
+// CANCEL (0x8): the stream is no longer needed.
+export const errorCancel: int = 0x8
+// COMPRESSION_ERROR (0x9): the HPACK decoder state is unrecoverable.
+export const errorCompressionError: int = 0x9
+// CONNECT_ERROR (0xa): a CONNECT tunnel failed.
+export const errorConnectError: int = 0xa
+// ENHANCE_YOUR_CALM (0xb): the peer is generating excessive load.
+export const errorEnhanceYourCalm: int = 0xb
+// INADEQUATE_SECURITY (0xc): the transport does not meet the security
+// requirements.
+export const errorInadequateSecurity: int = 0xc
+// HTTP_1_1_REQUIRED (0xd): the peer requires HTTP/1.1.
+export const errorHttp11Required: int = 0xd
+
+// --- low-level byte codec ---------------------------------------------------
+
+// The reserved-bit mask that isolates a 31-bit stream identifier from the top
+// (reserved) bit of its 32-bit field.
+const h2frameStreamMask: int = 0x7fffffff
+
+// Append a big-endian uint8.
+function h2framePutU8(dst: []byte, v: int): []byte {
+  return append(dst, byte(v & 0xff))
+}
+
+// Append a big-endian uint16.
+function h2framePutU16(dst: []byte, v: int): []byte {
+  let out = append(dst, byte(v >> 8 & 0xff))
+  return append(out, byte(v & 0xff))
+}
+
+// Append a big-endian uint24.
+function h2framePutU24(dst: []byte, v: int): []byte {
+  let out = append(dst, byte(v >> 16 & 0xff))
+  out = append(out, byte(v >> 8 & 0xff))
+  return append(out, byte(v & 0xff))
+}
+
+// Append a big-endian uint32.
+function h2framePutU32(dst: []byte, v: int): []byte {
+  let out = append(dst, byte(v >> 24 & 0xff))
+  out = append(out, byte(v >> 16 & 0xff))
+  out = append(out, byte(v >> 8 & 0xff))
+  return append(out, byte(v & 0xff))
+}
+
+// Append every byte of `src`.
+function h2framePutBytes(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// The big-endian uint16 at `off` (caller guarantees `off + 2 <= len(b)`).
+function h2frameU16(b: []byte, off: int): int {
+  return int(b[off]) << 8 | int(b[off + 1])
+}
+
+// The big-endian uint24 at `off` (caller guarantees `off + 3 <= len(b)`).
+function h2frameU24(b: []byte, off: int): int {
+  return int(b[off]) << 16 | int(b[off + 1]) << 8 | int(b[off + 2])
+}
+
+// The big-endian uint32 at `off` (caller guarantees `off + 4 <= len(b)`).
+function h2frameU32(b: []byte, off: int): int {
+  return int(b[off]) << 24 | int(b[off + 1]) << 16 | int(b[off + 2]) << 8 | int(b[off + 3])
+}
+
+// `n` zero bytes, for writing frame padding.
+function h2frameZeros(n: int): []byte {
+  return []byte(n)
+}
+
+// --- frame header + generic frame -------------------------------------------
+
+// A parsed 9-byte frame header (RFC 7540 §4.1): the payload `length`, the frame
+// `ftype`, its `flags`, and the 31-bit `streamId` (the reserved bit is ignored on
+// read and zero on write).
+export struct FrameHeader {
+  export length: int,
+  export ftype: int,
+  export flags: int,
+  export streamId: int,
+}
+
+// A whole frame: its `header` and the raw `payload` bytes (exactly
+// `header.length` of them). `readFrame` produces one; the `decode*` helpers turn
+// it into a typed frame.
+export struct Frame {
+  export header: FrameHeader,
+  export payload: []byte,
+}
+
+// The 9 wire bytes of a frame header. Fails if `length` does not fit the 24-bit
+// field or `streamId` does not fit 31 bits.
+export function encodeFrameHeader(h: FrameHeader): []byte! {
+  if (h.length < 0 || h.length > maxMaxFrameSize) {
+    fail newError("http2: frame length ${h.length} does not fit 24 bits")
+  }
+  if (h.streamId < 0 || h.streamId > h2frameStreamMask) {
+    fail newError("http2: stream id ${h.streamId} does not fit 31 bits")
+  }
+  let out = h2framePutU24([]byte(0), h.length)
+  out = h2framePutU8(out, h.ftype)
+  out = h2framePutU8(out, h.flags)
+  return h2framePutU32(out, h.streamId & h2frameStreamMask)
+}
+
+// The frame header the first 9 bytes of `b` spell. Fails if fewer than 9 bytes
+// are present. The reserved bit of the stream id is masked off.
+export function decodeFrameHeader(b: []byte): FrameHeader! {
+  if (len(b) < 9) {
+    fail newError("http2: short frame header (${len(b)} bytes)")
+  }
+  return FrameHeader{
+    length: h2frameU24(b, 0),
+    ftype: int(b[3]),
+    flags: int(b[4]),
+    streamId: h2frameU32(b, 5) & h2frameStreamMask,
+  }
+}
+
+// Read one whole frame from the front of `buf`, enforcing the negotiated
+// `maxFrameSize` (`SETTINGS_MAX_FRAME_SIZE`). Fails if the header is short, the
+// declared length exceeds `maxFrameSize`, or the payload runs past `buf`. The
+// caller advances by `9 + frame.header.length` to read the next frame.
+export function readFrame(buf: []byte, maxFrameSize: int): Frame! {
+  let h = decodeFrameHeader(buf)?
+  if (h.length > maxFrameSize) {
+    fail newError("http2: frame length ${h.length} exceeds max frame size ${maxFrameSize}")
+  }
+  if (9 + h.length > len(buf)) {
+    fail newError("http2: truncated frame payload")
+  }
+  return Frame{ header: h, payload: buf[9:9 + h.length] }
+}
+
+// Assemble a frame from its parts, prepending the 9-byte header. Fails if the
+// payload is too long or `streamId` does not fit 31 bits. The low-level path the
+// typed `encode*` helpers share.
+function h2frameAssemble(ftype: int, flags: int, streamId: int, payload: []byte): []byte! {
+  let h = FrameHeader{ length: len(payload), ftype: ftype, flags: flags, streamId: streamId }
+  let out = encodeFrameHeader(h)?
+  return h2framePutBytes(out, payload)
+}
+
+// Fail unless `f` is of the expected `ftype` (a decode guard).
+function h2frameExpect(f: Frame, ftype: int): ()! {
+  if (f.header.ftype != ftype) {
+    fail newError("http2: expected frame type ${ftype}, got ${f.header.ftype}")
+  }
+}
+
+// Fail if `streamId` is 0 — a stream-level frame must name a non-zero stream.
+function h2frameNeedStream(streamId: int): ()! {
+  if (streamId == 0) {
+    fail newError("http2: frame requires a non-zero stream id")
+  }
+}
+
+// Fail if `streamId` is non-zero — a connection-level frame must be on stream 0.
+function h2frameNeedConnection(streamId: int): ()! {
+  if (streamId != 0) {
+    fail newError("http2: connection-level frame must use stream 0, got ${streamId}")
+  }
+}
+
+// Strip DATA/HEADERS/PUSH_PROMISE padding from `payload` when `padded`. Returns
+// the content region `payload[start:end]` bounds via a small struct; the pad
+// length octet is consumed and the trailing padding excluded. Fails if the
+// padding is at least the size of the payload (RFC 7540 §6.1).
+function h2frameStripPadding(payload: []byte, padded: bool): h2framePad! {
+  if (!padded) {
+    return h2framePad{ start: 0, end: len(payload), padLength: -1 }
+  }
+  if (len(payload) < 1) {
+    fail newError("http2: padded frame missing pad-length octet")
+  }
+  let padLength = int(payload[0])
+  if (1 + padLength > len(payload)) {
+    fail newError("http2: padding (${padLength}) at least the size of the payload")
+  }
+  return h2framePad{ start: 1, end: len(payload) - padLength, padLength: padLength }
+}
+
+// The result of `h2frameStripPadding`: the content `[start:end]` and the decoded
+// `padLength` (-1 when the frame was not padded).
+struct h2framePad { start: int, end: int, padLength: int }
+
+// --- DATA (RFC 7540 §6.1) ---------------------------------------------------
+
+// A DATA frame: `data` is the message-body fragment; `endStream` sets END_STREAM;
+// `padLength` >= 0 requests PADDED with that many padding octets (-1 = no
+// padding). Stream id must be non-zero.
+export struct DataFrame {
+  export streamId: int,
+  export data: []byte,
+  export endStream: bool,
+  export padLength: int,
+}
+
+// The wire bytes of a DATA frame. Fails on a zero stream id or an out-of-range
+// pad length.
+export function encodeData(f: DataFrame): []byte! {
+  h2frameNeedStream(f.streamId)?
+  let flags = 0
+  if (f.endStream) {
+    flags = flags | flagEndStream
+  }
+  let payload = []byte(0)
+  if (f.padLength >= 0) {
+    if (f.padLength > 255) {
+      fail newError("http2: pad length ${f.padLength} exceeds 255")
+    }
+    flags = flags | flagPadded
+    payload = h2framePutU8(payload, f.padLength)
+    payload = h2framePutBytes(payload, f.data)
+    payload = h2framePutBytes(payload, h2frameZeros(f.padLength))
+  } else {
+    payload = h2framePutBytes(payload, f.data)
+  }
+  return h2frameAssemble(frameData, flags, f.streamId, payload)?
+}
+
+// The DATA frame `f` carries. Fails on a wrong type, a zero stream id, or padding
+// at least the payload size.
+export function decodeData(f: Frame): DataFrame! {
+  h2frameExpect(f, frameData)?
+  h2frameNeedStream(f.header.streamId)?
+  let pad = h2frameStripPadding(f.payload, (f.header.flags & flagPadded) != 0)?
+  return DataFrame{
+    streamId: f.header.streamId,
+    data: f.payload[pad.start:pad.end],
+    endStream: (f.header.flags & flagEndStream) != 0,
+    padLength: pad.padLength,
+  }
+}
+
+// --- HEADERS (RFC 7540 §6.2) ------------------------------------------------
+
+// A HEADERS frame: `blockFragment` is an HPACK header block fragment; `endStream`
+// and `endHeaders` set their flags; `padLength` >= 0 requests PADDED; when
+// `hasPriority`, the priority section (`exclusive`, `streamDependency`, and the
+// raw 8-bit `weight`) is emitted. Stream id must be non-zero.
+export struct HeadersFrame {
+  export streamId: int,
+  export blockFragment: []byte,
+  export endStream: bool,
+  export endHeaders: bool,
+  export padLength: int,
+  export hasPriority: bool,
+  export exclusive: bool,
+  export streamDependency: int,
+  export weight: int,
+}
+
+// The wire bytes of a HEADERS frame. Fails on a zero stream id or an out-of-range
+// pad length.
+export function encodeHeaders(f: HeadersFrame): []byte! {
+  h2frameNeedStream(f.streamId)?
+  let flags = 0
+  if (f.endStream) {
+    flags = flags | flagEndStream
+  }
+  if (f.endHeaders) {
+    flags = flags | flagEndHeaders
+  }
+  if (f.hasPriority) {
+    flags = flags | flagPriority
+  }
+  let payload = []byte(0)
+  if (f.padLength >= 0) {
+    if (f.padLength > 255) {
+      fail newError("http2: pad length ${f.padLength} exceeds 255")
+    }
+    flags = flags | flagPadded
+    payload = h2framePutU8(payload, f.padLength)
+  }
+  if (f.hasPriority) {
+    let dep = f.streamDependency & h2frameStreamMask
+    if (f.exclusive) {
+      dep = dep | (1 << 31)
+    }
+    payload = h2framePutU32(payload, dep)
+    payload = h2framePutU8(payload, f.weight)
+  }
+  payload = h2framePutBytes(payload, f.blockFragment)
+  if (f.padLength >= 0) {
+    payload = h2framePutBytes(payload, h2frameZeros(f.padLength))
+  }
+  return h2frameAssemble(frameHeaders, flags, f.streamId, payload)?
+}
+
+// The HEADERS frame `f` carries. Fails on a wrong type, a zero stream id, padding
+// at least the payload size, or a priority section that does not fit.
+export function decodeHeaders(f: Frame): HeadersFrame! {
+  h2frameExpect(f, frameHeaders)?
+  h2frameNeedStream(f.header.streamId)?
+  let pad = h2frameStripPadding(f.payload, (f.header.flags & flagPadded) != 0)?
+  let pos = pad.start
+  let hasPriority = (f.header.flags & flagPriority) != 0
+  let exclusive = false
+  let streamDependency = 0
+  let weight = 0
+  if (hasPriority) {
+    if (pad.end - pos < 5) {
+      fail newError("http2: HEADERS priority section runs past payload")
+    }
+    let dep = h2frameU32(f.payload, pos)
+    exclusive = (dep & (1 << 31)) != 0
+    streamDependency = dep & h2frameStreamMask
+    weight = int(f.payload[pos + 4])
+    pos = pos + 5
+  }
+  return HeadersFrame{
+    streamId: f.header.streamId,
+    blockFragment: f.payload[pos:pad.end],
+    endStream: (f.header.flags & flagEndStream) != 0,
+    endHeaders: (f.header.flags & flagEndHeaders) != 0,
+    padLength: pad.padLength,
+    hasPriority: hasPriority,
+    exclusive: exclusive,
+    streamDependency: streamDependency,
+    weight: weight,
+  }
+}
+
+// --- PRIORITY (RFC 7540 §6.3) -----------------------------------------------
+
+// A PRIORITY frame: the stream's `exclusive` flag, its `streamDependency`, and
+// the raw 8-bit `weight`. Stream id must be non-zero; the payload is always 5
+// bytes.
+export struct PriorityFrame {
+  export streamId: int,
+  export exclusive: bool,
+  export streamDependency: int,
+  export weight: int,
+}
+
+// The wire bytes of a PRIORITY frame. Fails on a zero stream id.
+export function encodePriority(f: PriorityFrame): []byte! {
+  h2frameNeedStream(f.streamId)?
+  let dep = f.streamDependency & h2frameStreamMask
+  if (f.exclusive) {
+    dep = dep | (1 << 31)
+  }
+  let payload = h2framePutU32([]byte(0), dep)
+  payload = h2framePutU8(payload, f.weight)
+  return h2frameAssemble(framePriority, 0, f.streamId, payload)?
+}
+
+// The PRIORITY frame `f` carries. Fails on a wrong type, a zero stream id, or a
+// payload that is not exactly 5 bytes.
+export function decodePriority(f: Frame): PriorityFrame! {
+  h2frameExpect(f, framePriority)?
+  h2frameNeedStream(f.header.streamId)?
+  if (len(f.payload) != 5) {
+    fail newError("http2: PRIORITY payload must be 5 bytes, got ${len(f.payload)}")
+  }
+  let dep = h2frameU32(f.payload, 0)
+  return PriorityFrame{
+    streamId: f.header.streamId,
+    exclusive: (dep & (1 << 31)) != 0,
+    streamDependency: dep & h2frameStreamMask,
+    weight: int(f.payload[4]),
+  }
+}
+
+// --- RST_STREAM (RFC 7540 §6.4) ---------------------------------------------
+
+// A RST_STREAM frame: the `errorCode` the stream is being reset with. Stream id
+// must be non-zero; the payload is always 4 bytes.
+export struct RstStreamFrame {
+  export streamId: int,
+  export errorCode: int,
+}
+
+// The wire bytes of a RST_STREAM frame. Fails on a zero stream id.
+export function encodeRstStream(f: RstStreamFrame): []byte! {
+  h2frameNeedStream(f.streamId)?
+  let payload = h2framePutU32([]byte(0), f.errorCode)
+  return h2frameAssemble(frameRstStream, 0, f.streamId, payload)?
+}
+
+// The RST_STREAM frame `f` carries. Fails on a wrong type, a zero stream id, or a
+// payload that is not exactly 4 bytes.
+export function decodeRstStream(f: Frame): RstStreamFrame! {
+  h2frameExpect(f, frameRstStream)?
+  h2frameNeedStream(f.header.streamId)?
+  if (len(f.payload) != 4) {
+    fail newError("http2: RST_STREAM payload must be 4 bytes, got ${len(f.payload)}")
+  }
+  return RstStreamFrame{ streamId: f.header.streamId, errorCode: h2frameU32(f.payload, 0) }
+}
+
+// --- SETTINGS (RFC 7540 §6.5) -----------------------------------------------
+
+// One SETTINGS parameter: a 16-bit `id` and its 32-bit `value`.
+export struct Setting {
+  export id: int,
+  export value: int,
+}
+
+// A SETTINGS frame: either an `ack` (empty) or a list of `settings`. Always on
+// stream 0.
+export struct SettingsFrame {
+  export ack: bool,
+  export settings: []Setting,
+}
+
+// The wire bytes of a SETTINGS frame — six bytes per parameter. Fails if `ack` is
+// set together with a non-empty `settings` list (an ACK carries no parameters).
+export function encodeSettings(f: SettingsFrame): []byte! {
+  let flags = 0
+  if (f.ack) {
+    if (len(f.settings) != 0) {
+      fail newError("http2: SETTINGS ACK must carry no parameters")
+    }
+    flags = flagAck
+  }
+  let payload = []byte(0)
+  for s of f.settings {
+    payload = h2framePutU16(payload, s.id)
+    payload = h2framePutU32(payload, s.value)
+  }
+  return h2frameAssemble(frameSettings, flags, 0, payload)?
+}
+
+// The SETTINGS frame `f` carries. Fails on a wrong type, a non-zero stream id, a
+// payload whose length is not a multiple of 6, or an ACK with a non-empty
+// payload.
+export function decodeSettings(f: Frame): SettingsFrame! {
+  h2frameExpect(f, frameSettings)?
+  h2frameNeedConnection(f.header.streamId)?
+  let ack = (f.header.flags & flagAck) != 0
+  if (ack && len(f.payload) != 0) {
+    fail newError("http2: SETTINGS ACK must have an empty payload")
+  }
+  if (len(f.payload) % 6 != 0) {
+    fail newError("http2: SETTINGS payload ${len(f.payload)} is not a multiple of 6")
+  }
+  let settings = []Setting(0)
+  let i = 0
+  while (i + 6 <= len(f.payload)) {
+    settings = append(settings, Setting{ id: h2frameU16(f.payload, i), value: h2frameU32(f.payload, i + 2) })
+    i = i + 6
+  }
+  return SettingsFrame{ ack: ack, settings: settings }
+}
+
+// --- PUSH_PROMISE (RFC 7540 §6.6) -------------------------------------------
+
+// A PUSH_PROMISE frame: `promisedStreamId` is the new stream the server will
+// push, `blockFragment` its request header block; `endHeaders` sets END_HEADERS;
+// `padLength` >= 0 requests PADDED. The carrying stream id must be non-zero.
+export struct PushPromiseFrame {
+  export streamId: int,
+  export promisedStreamId: int,
+  export blockFragment: []byte,
+  export endHeaders: bool,
+  export padLength: int,
+}
+
+// The wire bytes of a PUSH_PROMISE frame. Fails on a zero carrying stream id or
+// an out-of-range pad length.
+export function encodePushPromise(f: PushPromiseFrame): []byte! {
+  h2frameNeedStream(f.streamId)?
+  let flags = 0
+  if (f.endHeaders) {
+    flags = flags | flagEndHeaders
+  }
+  let payload = []byte(0)
+  if (f.padLength >= 0) {
+    if (f.padLength > 255) {
+      fail newError("http2: pad length ${f.padLength} exceeds 255")
+    }
+    flags = flags | flagPadded
+    payload = h2framePutU8(payload, f.padLength)
+  }
+  payload = h2framePutU32(payload, f.promisedStreamId & h2frameStreamMask)
+  payload = h2framePutBytes(payload, f.blockFragment)
+  if (f.padLength >= 0) {
+    payload = h2framePutBytes(payload, h2frameZeros(f.padLength))
+  }
+  return h2frameAssemble(framePushPromise, flags, f.streamId, payload)?
+}
+
+// The PUSH_PROMISE frame `f` carries. Fails on a wrong type, a zero carrying
+// stream id, padding at least the payload size, or a payload too short for the
+// promised-stream field.
+export function decodePushPromise(f: Frame): PushPromiseFrame! {
+  h2frameExpect(f, framePushPromise)?
+  h2frameNeedStream(f.header.streamId)?
+  let pad = h2frameStripPadding(f.payload, (f.header.flags & flagPadded) != 0)?
+  if (pad.end - pad.start < 4) {
+    fail newError("http2: PUSH_PROMISE payload too short for promised stream id")
+  }
+  let promised = h2frameU32(f.payload, pad.start) & h2frameStreamMask
+  return PushPromiseFrame{
+    streamId: f.header.streamId,
+    promisedStreamId: promised,
+    blockFragment: f.payload[pad.start + 4:pad.end],
+    endHeaders: (f.header.flags & flagEndHeaders) != 0,
+    padLength: pad.padLength,
+  }
+}
+
+// --- PING (RFC 7540 §6.7) ---------------------------------------------------
+
+// A PING frame: 8 opaque `data` bytes, echoed back with `ack` set. Always on
+// stream 0.
+export struct PingFrame {
+  export ack: bool,
+  export data: []byte,
+}
+
+// The wire bytes of a PING frame. Fails unless `data` is exactly 8 bytes.
+export function encodePing(f: PingFrame): []byte! {
+  if (len(f.data) != 8) {
+    fail newError("http2: PING data must be 8 bytes, got ${len(f.data)}")
+  }
+  let flags = 0
+  if (f.ack) {
+    flags = flagAck
+  }
+  return h2frameAssemble(framePing, flags, 0, f.data)?
+}
+
+// The PING frame `f` carries. Fails on a wrong type, a non-zero stream id, or a
+// payload that is not exactly 8 bytes.
+export function decodePing(f: Frame): PingFrame! {
+  h2frameExpect(f, framePing)?
+  h2frameNeedConnection(f.header.streamId)?
+  if (len(f.payload) != 8) {
+    fail newError("http2: PING payload must be 8 bytes, got ${len(f.payload)}")
+  }
+  return PingFrame{ ack: (f.header.flags & flagAck) != 0, data: f.payload }
+}
+
+// --- GOAWAY (RFC 7540 §6.8) -------------------------------------------------
+
+// A GOAWAY frame: the `lastStreamId` the sender processed, an `errorCode`, and
+// optional `debugData`. Always on stream 0.
+export struct GoawayFrame {
+  export lastStreamId: int,
+  export errorCode: int,
+  export debugData: []byte,
+}
+
+// The wire bytes of a GOAWAY frame.
+export function encodeGoaway(f: GoawayFrame): []byte! {
+  let payload = h2framePutU32([]byte(0), f.lastStreamId & h2frameStreamMask)
+  payload = h2framePutU32(payload, f.errorCode)
+  payload = h2framePutBytes(payload, f.debugData)
+  return h2frameAssemble(frameGoaway, 0, 0, payload)?
+}
+
+// The GOAWAY frame `f` carries. Fails on a wrong type, a non-zero stream id, or a
+// payload shorter than the fixed 8-byte header.
+export function decodeGoaway(f: Frame): GoawayFrame! {
+  h2frameExpect(f, frameGoaway)?
+  h2frameNeedConnection(f.header.streamId)?
+  if (len(f.payload) < 8) {
+    fail newError("http2: GOAWAY payload must be at least 8 bytes, got ${len(f.payload)}")
+  }
+  return GoawayFrame{
+    lastStreamId: h2frameU32(f.payload, 0) & h2frameStreamMask,
+    errorCode: h2frameU32(f.payload, 4),
+    debugData: f.payload[8:len(f.payload)],
+  }
+}
+
+// --- WINDOW_UPDATE (RFC 7540 §6.9) ------------------------------------------
+
+// A WINDOW_UPDATE frame: a flow-control `increment`. `streamId` 0 targets the
+// whole connection; a non-zero id targets that stream.
+export struct WindowUpdateFrame {
+  export streamId: int,
+  export increment: int,
+}
+
+// The wire bytes of a WINDOW_UPDATE frame.
+export function encodeWindowUpdate(f: WindowUpdateFrame): []byte! {
+  let payload = h2framePutU32([]byte(0), f.increment & h2frameStreamMask)
+  return h2frameAssemble(frameWindowUpdate, 0, f.streamId, payload)?
+}
+
+// The WINDOW_UPDATE frame `f` carries. Fails on a wrong type or a payload that is
+// not exactly 4 bytes.
+export function decodeWindowUpdate(f: Frame): WindowUpdateFrame! {
+  h2frameExpect(f, frameWindowUpdate)?
+  if (len(f.payload) != 4) {
+    fail newError("http2: WINDOW_UPDATE payload must be 4 bytes, got ${len(f.payload)}")
+  }
+  return WindowUpdateFrame{ streamId: f.header.streamId, increment: h2frameU32(f.payload, 0) & h2frameStreamMask }
+}
+
+// --- CONTINUATION (RFC 7540 §6.10) ------------------------------------------
+
+// A CONTINUATION frame: a continued `blockFragment`; `endHeaders` sets
+// END_HEADERS. Stream id must be non-zero and match the HEADERS/PUSH_PROMISE it
+// continues.
+export struct ContinuationFrame {
+  export streamId: int,
+  export blockFragment: []byte,
+  export endHeaders: bool,
+}
+
+// The wire bytes of a CONTINUATION frame. Fails on a zero stream id.
+export function encodeContinuation(f: ContinuationFrame): []byte! {
+  h2frameNeedStream(f.streamId)?
+  let flags = 0
+  if (f.endHeaders) {
+    flags = flagEndHeaders
+  }
+  return h2frameAssemble(frameContinuation, flags, f.streamId, f.blockFragment)?
+}
+
+// The CONTINUATION frame `f` carries. Fails on a wrong type or a zero stream id.
+export function decodeContinuation(f: Frame): ContinuationFrame! {
+  h2frameExpect(f, frameContinuation)?
+  h2frameNeedStream(f.header.streamId)?
+  return ContinuationFrame{
+    streamId: f.header.streamId,
+    blockFragment: f.payload,
+    endHeaders: (f.header.flags & flagEndHeaders) != 0,
+  }
+}
