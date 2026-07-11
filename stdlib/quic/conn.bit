@@ -1,0 +1,2042 @@
+// Bit standard library — quic module, the QUIC v1 transport core (RFC 9000
+// transport + RFC 9002 loss recovery / congestion control, #1220).
+//
+// This file is the connection layer that sits on top of the pure codec
+// (`frames.bit`), the packet-protection layer (`packet.bit`), and the QUIC-TLS
+// handshake (`tls.bit`). It turns an unreliable UDP datagram flow into reliable,
+// ordered, flow-controlled byte streams, exactly as a QUIC endpoint must:
+//
+//   * **Connection state machine** — drives the #1219 record-bypass TLS
+//     handshake to 1-RTT over CRYPTO frames across the three packet-number
+//     spaces (Initial / Handshake / AppData), installing per-level packet keys
+//     from the exposed traffic secrets, then carries application data.
+//
+//   * **Streams** — client-initiated bidirectional streams with send buffering,
+//     ordered reassembly of received STREAM data (offset/gap handling via the
+//     module's `CryptoAssembler`), and FIN.
+//
+//   * **Flow control** — per-stream and connection windows (MAX_DATA /
+//     MAX_STREAM_DATA), DATA_BLOCKED / STREAM_DATA_BLOCKED signaling, and window
+//     auto-tuning as received data is consumed.
+//
+//   * **Loss recovery (RFC 9002)** — ACK generation and processing, smoothed RTT
+//     and RTT variance, a PTO timer, packet- and time-threshold loss detection,
+//     and retransmission of lost CRYPTO / STREAM data.
+//
+//   * **Congestion control** — NewReno (slow start / congestion avoidance /
+//     recovery) gating how much in-flight data may be outstanding.
+//
+// Concurrency is the actor model, the same shape as `std/http2`'s connection:
+// one green thread (the *loop*) owns all mutable connection state and folds in
+// one event at a time, selected from three channels — datagrams pushed by a
+// *reader* thread parked on UDP recv, application *commands*, and *ticks* from a
+// timer thread. No connection state is shared across threads, so there are no
+// locks. The tick drives the RFC 9002 timers (`std/time` `monotonic` + `sleep`);
+// a native cancellable timer would replace the fixed-interval tick, but the tick
+// is sufficient and needs no runtime primitive.
+//
+// std/quic is one flat module, so this file calls `frames.bit` (`Frame`, the
+// `quicfr*` cursor helpers), `packet.bit` (`PacketKeys`, `protectPayload`,
+// `applyHeaderProtection`, the `quicpkt*` helpers, …) and `tls.bit`
+// (`levelKeyPair`, `CryptoAssembler`, `cryptoFrames`, the transport-parameter
+// codec) directly; its own private free functions are prefixed `quicconn`. The
+// cross-module imports are UDP (`std/net`), the clock (`std/time`), and the
+// handshake drivers (`std/tls`); `Hash`/`newSha256` come from `packet.bit`'s
+// import into this module's shared namespace.
+//
+// ponytail: NewReno only (no CUBIC/BBR); connection migration is CID basics only
+// (fixed 8-byte ids, no path validation); a single connection per socket (no
+// server demux); AES-128-GCM + X25519 only, matching `packet.bit`'s AEAD. The
+// upgrade paths are noted at each `// ponytail:` below.
+
+import { udpBind, UdpSocket } from "std/net"
+import { monotonic, sleep } from "std/time"
+import {
+  TlsClientConfig,
+  TlsClientHandshake,
+  tlsClientStartExts,
+  TlsServerConfig,
+  newTlsServerConfig,
+  TlsServerHandshake,
+  tlsServerStartExts,
+  TlsGroup,
+  GroupKeypair,
+  emptyTrustStore,
+  Extension,
+  TLS_AES_128_GCM_SHA256,
+} from "std/tls"
+
+// ---------------------------------------------------------------------------
+// Tunables (RFC 9002 §7.6.1 constants and local ceilings)
+// ---------------------------------------------------------------------------
+
+// The maximum UDP payload this endpoint emits for a normal packet, and the
+// datagram size a client Initial is padded up to (RFC 9000 §14.1 anti-
+// amplification floor of 1200). Loopback MTU is far larger, so the cap is
+// conservative, not a PMTU discovery result. ponytail: no PMTU discovery.
+const quicconnMaxPacket: int = 1200
+const quicconnInitialPad: int = 1160
+const quicconnFrameBudget: int = 1100
+
+// Fixed 4-byte packet-number encoding on send: values stay well under 2^32, so
+// the truncation is lossless and header-protection sampling is uniform.
+const quicconnPnLen: int = 4
+
+// Encryption-level indices, matching the three packet-number spaces.
+const quicconnLvlInitial: int = 0
+const quicconnLvlHandshake: int = 1
+const quicconnLvlApp: int = 2
+
+// Loss recovery (RFC 9002 §6.1.1 / §6.2.1). Times are nanoseconds.
+const quicconnPacketThreshold: int = 3
+const quicconnGranularity: int = 1000000
+const quicconnMinPto: int = 8000000
+const quicconnInitialPto: int = 200000000
+const quicconnTick: int = 2000000
+
+// NewReno (RFC 9002 §7.2). Bytes.
+const quicconnInitialWindow: int = 12000
+const quicconnMinWindow: int = 2400
+
+// Flow-control window we advertise and keep ahead of the peer as data is
+// consumed. Deliberately smaller than a bulk transfer so MAX_DATA /
+// MAX_STREAM_DATA updates actually drive the transfer (RFC 9000 §4.1).
+const quicconnFlowWindow: int = 32768
+
+// TLS handshake message types we scan for to know a CRYPTO flight is complete
+// (RFC 8446 §4): ClientHello, ServerHello, Finished.
+const quicconnMsgClientHello: int = 1
+const quicconnMsgServerHello: int = 2
+const quicconnMsgFinished: int = 20
+
+// Command kinds carried on the loop's command channel.
+const quicconnCmdOpen: int = 1
+const quicconnCmdAccept: int = 2
+const quicconnCmdWrite: int = 3
+const quicconnCmdFinish: int = 4
+const quicconnCmdClose: int = 5
+
+// Connection-id length this endpoint issues. ponytail: fixed, non-random ids
+// (mixed from the clock); a real endpoint uses cryptographically random ids and
+// a NEW_CONNECTION_ID pool.
+const quicconnCidLen: int = 8
+
+// ---------------------------------------------------------------------------
+// Small shared helpers
+// ---------------------------------------------------------------------------
+
+function quicconnMin(a: int, b: int): int {
+  if (a < b) {
+    return a
+  }
+  return b
+}
+
+function quicconnMax(a: int, b: int): int {
+  if (a > b) {
+    return a
+  }
+  return b
+}
+
+function quicconnAbs(a: int): int {
+  if (a < 0) {
+    return -a
+  }
+  return a
+}
+
+// Park the loop's cadence between ticks.
+function quicconnSleepTick() {
+  sleep(quicconnTick)
+}
+
+// A copy of `src` as a fresh slice — used whenever a slice viewing a transient
+// datagram buffer must outlive it (connection ids, delivered stream chunks).
+function quicconnCopyBytes(src: []byte): []byte {
+  let out = []byte(len(src))
+  let i = 0
+  while (i < len(src)) {
+    out[i] = src[i]
+    i = i + 1
+  }
+  return out
+}
+
+// A copy of `data[lo:hi]` as a fresh, independently mutable slice.
+function quicconnCopyRange(data: []byte, lo: int, hi: int): []byte {
+  let out = []byte(hi - lo)
+  let i = 0
+  while (i < hi - lo) {
+    out[i] = data[lo + i]
+    i = i + 1
+  }
+  return out
+}
+
+// An 8-byte connection id derived from `seed` with a splitmix64 step, so two
+// ids from different seeds differ. Not a secret; see the CID ponytail note.
+function quicconnMakeCid(seed: int): []byte {
+  let out = []byte(quicconnCidLen)
+  let x = u64(seed) + u64(0x9e3779b97f4a7c15)
+  let i = 0
+  while (i < quicconnCidLen) {
+    x = (x ^ (x >> u64(30))) * u64(0xbf58476d1ce4e5b9)
+    out[i] = byte(x >> u64(24))
+    i = i + 1
+  }
+  return out
+}
+
+// Zero packet keys, a placeholder until a level's keys are installed.
+function quicconnZeroKeys(): PacketKeys {
+  return PacketKeys{ key: []byte(0), iv: []byte(0), hp: []byte(0) }
+}
+
+function quicconnNewHash(): Hash {
+  return newSha256()
+}
+
+// ---------------------------------------------------------------------------
+// Frame classifiers (exhaustive matches, reused everywhere)
+// ---------------------------------------------------------------------------
+
+// Whether `f` is ack-eliciting (RFC 9002 §2): its receipt obliges the peer to
+// send an ACK, and it counts against congestion control. ACK, PADDING, and the
+// CLOSE frames are not.
+function quicconnIsAckEliciting(f: Frame): bool {
+  match (f) {
+    Padding(n) => { return false }
+    Ping => { return true }
+    Ack(a) => { return false }
+    ResetStream(id, code, size) => { return true }
+    StopSending(id, code) => { return true }
+    Crypto(offset, data) => { return true }
+    NewToken(token) => { return true }
+    Stream(s) => { return true }
+    MaxData(m) => { return true }
+    MaxStreamData(id, m) => { return true }
+    MaxStreams(bidi, m) => { return true }
+    DataBlocked(m) => { return true }
+    StreamDataBlocked(id, m) => { return true }
+    StreamsBlocked(bidi, m) => { return true }
+    NewConnectionId(seq, retire, cid, token) => { return true }
+    RetireConnectionId(seq) => { return true }
+    PathChallenge(d) => { return true }
+    PathResponse(d) => { return true }
+    ConnectionClose(code, ft, reason) => { return false }
+    ApplicationClose(code, reason) => { return false }
+    HandshakeDone => { return true }
+  }
+}
+
+// Whether `f` carries state that must be retransmitted if its packet is lost
+// (RFC 9002 §6): CRYPTO, STREAM, and the flow/stream-control frames. ACK,
+// PADDING, PING, PATH_*, and CLOSE are regenerated or dropped, never resent.
+function quicconnIsRetransmittable(f: Frame): bool {
+  match (f) {
+    Padding(n) => { return false }
+    Ping => { return false }
+    Ack(a) => { return false }
+    ResetStream(id, code, size) => { return true }
+    StopSending(id, code) => { return true }
+    Crypto(offset, data) => { return true }
+    NewToken(token) => { return true }
+    Stream(s) => { return true }
+    MaxData(m) => { return true }
+    MaxStreamData(id, m) => { return true }
+    MaxStreams(bidi, m) => { return true }
+    DataBlocked(m) => { return true }
+    StreamDataBlocked(id, m) => { return true }
+    StreamsBlocked(bidi, m) => { return true }
+    NewConnectionId(seq, retire, cid, token) => { return true }
+    RetireConnectionId(seq) => { return true }
+    PathChallenge(d) => { return false }
+    PathResponse(d) => { return false }
+    ConnectionClose(code, ft, reason) => { return false }
+    ApplicationClose(code, reason) => { return false }
+    HandshakeDone => { return true }
+  }
+}
+
+// The stream id `f` targets when it is a STREAM frame, else -1.
+function quicconnFrameStreamId(f: Frame): int {
+  match (f) {
+    Padding(n) => { return -1 }
+    Ping => { return -1 }
+    Ack(a) => { return -1 }
+    ResetStream(id, code, size) => { return -1 }
+    StopSending(id, code) => { return -1 }
+    Crypto(offset, data) => { return -1 }
+    NewToken(token) => { return -1 }
+    Stream(s) => { return int(s.id) }
+    MaxData(m) => { return -1 }
+    MaxStreamData(id, m) => { return -1 }
+    MaxStreams(bidi, m) => { return -1 }
+    DataBlocked(m) => { return -1 }
+    StreamDataBlocked(id, m) => { return -1 }
+    StreamsBlocked(bidi, m) => { return -1 }
+    NewConnectionId(seq, retire, cid, token) => { return -1 }
+    RetireConnectionId(seq) => { return -1 }
+    PathChallenge(d) => { return -1 }
+    PathResponse(d) => { return -1 }
+    ConnectionClose(code, ft, reason) => { return -1 }
+    ApplicationClose(code, reason) => { return -1 }
+    HandshakeDone => { return -1 }
+  }
+}
+
+// Whether `f` is a CRYPTO frame — used to decide whether a client Initial packet
+// must be padded to the 1200-byte floor.
+function quicconnIsCrypto(f: Frame): bool {
+  match (f) {
+    Padding(n) => { return false }
+    Ping => { return false }
+    Ack(a) => { return false }
+    ResetStream(id, code, size) => { return false }
+    StopSending(id, code) => { return false }
+    Crypto(offset, data) => { return true }
+    NewToken(token) => { return false }
+    Stream(s) => { return false }
+    MaxData(m) => { return false }
+    MaxStreamData(id, m) => { return false }
+    MaxStreams(bidi, m) => { return false }
+    DataBlocked(m) => { return false }
+    StreamDataBlocked(id, m) => { return false }
+    StreamsBlocked(bidi, m) => { return false }
+    NewConnectionId(seq, retire, cid, token) => { return false }
+    RetireConnectionId(seq) => { return false }
+    PathChallenge(d) => { return false }
+    PathResponse(d) => { return false }
+    ConnectionClose(code, ft, reason) => { return false }
+    ApplicationClose(code, reason) => { return false }
+    HandshakeDone => { return false }
+  }
+}
+
+// The concatenated wire length of `frames`, without keeping the bytes.
+function quicconnFramesLen(frames: []Frame): int {
+  let n = 0
+  for f of frames {
+    n = n + len(encodeFrame(f))
+  }
+  return n
+}
+
+// The retransmittable subset of `frames`, stored on a sent packet so a loss can
+// re-queue exactly the state it carried.
+function quicconnRetransFrames(frames: []Frame): []Frame {
+  let out = []Frame(0)
+  for f of frames {
+    if (quicconnIsRetransmittable(f)) {
+      out = append(out, f)
+    }
+  }
+  return out
+}
+
+function quicconnAnyAckEliciting(frames: []Frame): bool {
+  for f of frames {
+    if (quicconnIsAckEliciting(f)) {
+      return true
+    }
+  }
+  return false
+}
+
+function quicconnFramesHaveCrypto(frames: []Frame): bool {
+  for f of frames {
+    if (quicconnIsCrypto(f)) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Received-packet-number ranges (for ACK generation)
+// ---------------------------------------------------------------------------
+
+// One inclusive run of received (or acknowledged) packet numbers.
+struct quicconnRange {
+  lo: int,
+  hi: int,
+}
+
+// Merge `rs` into a canonical descending (by `hi`), non-overlapping,
+// gap-preserving list. Adjacent runs (`hi + 1 == next.lo`) coalesce. Bounded by
+// `len(rs)`: an insertion sort then a single merge pass.
+function quicconnMergeRanges(rs: []quicconnRange): []quicconnRange {
+  let a = rs
+  let i = 1
+  while (i < len(a)) {
+    let key = a[i]
+    let j = i - 1
+    while (j >= 0 && a[j].lo > key.lo) {
+      a[j + 1] = a[j]
+      j = j - 1
+    }
+    a[j + 1] = key
+    i = i + 1
+  }
+  let merged = []quicconnRange(0)
+  for r of a {
+    if (len(merged) > 0 && r.lo <= merged[len(merged) - 1].hi + 1) {
+      let last = merged[len(merged) - 1]
+      if (r.hi > last.hi) {
+        last.hi = r.hi
+      }
+    } else {
+      merged = append(merged, quicconnRange{ lo: r.lo, hi: r.hi })
+    }
+  }
+  let out = []quicconnRange(0)
+  let k = len(merged) - 1
+  while (k >= 0) {
+    out = append(out, merged[k])
+    k = k - 1
+  }
+  return out
+}
+
+function quicconnPnInRanges(pn: int, ranges: []quicconnRange): bool {
+  for r of ranges {
+    if (pn >= r.lo && pn <= r.hi) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Per-level (packet-number-space) state
+// ---------------------------------------------------------------------------
+
+// A sent, still-unacknowledged packet the recovery machinery tracks. `frames`
+// holds only its retransmittable frames, re-queued on loss.
+struct quicconnSent {
+  pn: int,
+  timeSent: int,
+  size: int,
+  ackEliciting: bool,
+  frames: []Frame,
+}
+
+// One encryption level's send/receive bookkeeping (RFC 9002 §6 tracks loss per
+// space). `pending` is the queue of frames waiting to be packetized, both new
+// CRYPTO and re-queued retransmits.
+struct quicconnLevel {
+  idx: int,
+  haveSend: bool,
+  haveRecv: bool,
+  ksend: PacketKeys,
+  krecv: PacketKeys,
+  nextPn: int,
+  largestAcked: int,
+  sent: []quicconnSent,
+  pending: []Frame,
+  crecv: CryptoAssembler,
+  recvRanges: []quicconnRange,
+  largestRecvPn: int,
+  ackPending: bool,
+  lossTime: int,
+  timeLastAckEliciting: int,
+}
+
+function quicconnNewLevel(idx: int): quicconnLevel {
+  return quicconnLevel{
+    idx: idx,
+    haveSend: false,
+    haveRecv: false,
+    ksend: quicconnZeroKeys(),
+    krecv: quicconnZeroKeys(),
+    nextPn: 0,
+    largestAcked: -1,
+    sent: []quicconnSent(0),
+    pending: []Frame(0),
+    crecv: newCryptoAssembler(1 << 16),
+    recvRanges: []quicconnRange(0),
+    largestRecvPn: -1,
+    ackPending: false,
+    lossTime: 0,
+    timeLastAckEliciting: 0,
+  }
+}
+
+// Record that packet `pn` was received at `lvl`, for later ACK generation.
+function quicconnRecordPn(lvl: quicconnLevel, pn: int) {
+  for r of lvl.recvRanges {
+    if (pn >= r.lo && pn <= r.hi) {
+      return
+    }
+  }
+  let all = append(lvl.recvRanges, quicconnRange{ lo: pn, hi: pn })
+  lvl.recvRanges = quicconnMergeRanges(all)
+}
+
+// Build an ACK frame covering everything received at `lvl` (RFC 9000 §19.3).
+// `delay` is sent as 0 — this endpoint acks promptly. ponytail: no ACK delay.
+function quicconnBuildAck(lvl: quicconnLevel): Frame {
+  let r0 = lvl.recvRanges[0]
+  let largest = r0.hi
+  let firstRange = r0.hi - r0.lo
+  let ranges = []AckRange(0)
+  let prevLo = r0.lo
+  let i = 1
+  while (i < len(lvl.recvRanges)) {
+    let r = lvl.recvRanges[i]
+    let gap = prevLo - r.hi - 2
+    let rangeLength = r.hi - r.lo
+    ranges = append(ranges, AckRange{ gap: u64(gap), rangeLength: u64(rangeLength) })
+    prevLo = r.lo
+    i = i + 1
+  }
+  return Frame.Ack(AckFrame{
+    largest: u64(largest),
+    delay: 0,
+    firstRange: u64(firstRange),
+    ranges: ranges,
+    ecn: false,
+    ect0: 0,
+    ect1: 0,
+    ce: 0,
+  })
+}
+
+function quicconnLevelHasWork(lvl: quicconnLevel): bool {
+  return lvl.ackPending || len(lvl.pending) > 0
+}
+
+// Take frames off `lvl.pending` up to `budget` bytes (always at least one, so a
+// single oversized CRYPTO chunk still makes progress).
+function quicconnTakePending(lvl: quicconnLevel, budget: int): []Frame {
+  let out = []Frame(0)
+  let used = 0
+  let guard = 0
+  while (len(lvl.pending) > 0 && guard <= 100000) {
+    guard = guard + 1
+    let f = lvl.pending[0]
+    let sz = len(encodeFrame(f))
+    if (used + sz > budget && len(out) > 0) {
+      break
+    }
+    out = append(out, f)
+    used = used + sz
+    lvl.pending = lvl.pending[1:len(lvl.pending)]
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream state
+// ---------------------------------------------------------------------------
+
+// One bidirectional stream. Only the loop thread touches this. Send fields track
+// the outbound byte buffer and how much has been packetized; receive fields
+// reassemble inbound STREAM data and meter the flow-control window.
+struct quicconnStream {
+  id: int,
+  isPeer: bool,
+  sendBuf: []byte,
+  sendOff: int,
+  sendLen: int,
+  finQueued: bool,
+  finSent: bool,
+  peerMaxStreamData: int,
+  blockedSignaled: bool,
+  delivered: bool,
+  hasDrain: bool,
+  drainCh: chan<int>,
+  recvAsm: CryptoAssembler,
+  recvDelivered: int,
+  recvFinalSize: int,
+  finDelivered: bool,
+  localMaxStreamData: int,
+  needMaxStreamData: bool,
+  recvCh: chan<StreamChunk>,
+}
+
+function quicconnNewStream(st: quicconnState, id: int, isPeer: bool): quicconnStream {
+  return quicconnStream{
+    id: id,
+    isPeer: isPeer,
+    sendBuf: []byte(0),
+    sendOff: 0,
+    sendLen: 0,
+    finQueued: false,
+    finSent: false,
+    peerMaxStreamData: st.peerInitStreamData,
+    blockedSignaled: false,
+    delivered: false,
+    hasDrain: false,
+    drainCh: chan<int>(1),
+    recvAsm: newCryptoAssembler(1 << 24),
+    recvDelivered: 0,
+    recvFinalSize: -1,
+    finDelivered: false,
+    localMaxStreamData: quicconnFlowWindow,
+    needMaxStreamData: false,
+    recvCh: chan<StreamChunk>(4096),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Channel message types
+// ---------------------------------------------------------------------------
+
+// A received datagram forwarded by the reader thread; `eof` on socket close.
+struct quicconnDgram {
+  data: []byte,
+  host: string,
+  port: int,
+  eof: bool,
+}
+
+// The reply to open/accept: the allocated stream id and the channel its inbound
+// data is delivered on.
+struct quicconnOpenReply {
+  id: int,
+  recvCh: chan<StreamChunk>,
+}
+
+// One command from the public API to the loop. `replyOpen` answers open/accept;
+// `replyInt` answers finish (delivery complete) and unblocks the caller.
+struct quicconnCmd {
+  kind: int,
+  id: int,
+  data: []byte,
+  replyOpen: chan<quicconnOpenReply>,
+  replyInt: chan<int>,
+}
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+// One contiguous run of received stream bytes delivered to the application, with
+// `fin` set on the final run (the end of the stream).
+export struct StreamChunk {
+  export data: []byte,
+  export fin: bool,
+}
+
+// An established QUIC connection. Its methods marshal to the owning loop thread
+// over a channel; the connection has no directly-shared mutable state.
+export struct Conn {
+  cmdCh: chan<quicconnCmd>,
+  sock: UdpSocket,
+}
+
+// One bidirectional stream on a `Conn`. `write`/`finish` queue outbound data;
+// `read` pulls the next reassembled inbound chunk.
+export struct Stream {
+  export streamId: int,
+  cmdCh: chan<quicconnCmd>,
+  recvCh: chan<StreamChunk>,
+}
+
+// ---------------------------------------------------------------------------
+// The whole connection state (owned exclusively by the loop thread)
+// ---------------------------------------------------------------------------
+
+struct quicconnState {
+  isClient: bool,
+  sock: UdpSocket,
+  peerHost: string,
+  peerPort: int,
+  havePeer: bool,
+  version: int,
+  scid: []byte,
+  dcid: []byte,
+  origDcid: []byte,
+  dcidSwitched: bool,
+  iLevel: quicconnLevel,
+  hLevel: quicconnLevel,
+  aLevel: quicconnLevel,
+  chOpt: Option<TlsClientHandshake>,
+  shOpt: Option<TlsServerHandshake>,
+  suiteId: int,
+  serverHelloDone: bool,
+  clientFlightSent: bool,
+  handshakeComplete: bool,
+  established: bool,
+  sendHandshakeDone: bool,
+  streams: map<int, quicconnStream>,
+  present: map<int, int>,
+  nextBidiId: int,
+  acceptQueue: []int,
+  acceptWaiter: chan<quicconnOpenReply>,
+  hasAcceptWaiter: bool,
+  peerMaxData: int,
+  peerInitStreamData: int,
+  dataSent: int,
+  dataBlockedSignaled: bool,
+  localMaxData: int,
+  dataConsumed: int,
+  needMaxData: bool,
+  srtt: int,
+  rttvar: int,
+  minRtt: int,
+  latestRtt: int,
+  haveRtt: bool,
+  ptoCount: int,
+  cwnd: int,
+  ssthresh: int,
+  bytesInFlight: int,
+  recoveryStart: int,
+  maxAckDelay: int,
+  inCh: chan<quicconnDgram>,
+  cmdCh: chan<quicconnCmd>,
+  tickCh: chan<int>,
+  readyCh: chan<int>,
+  running: bool,
+  closeSent: bool,
+}
+
+function quicconnNewState(isClient: bool, sock: UdpSocket, host: string, port: int, scid: []byte, dcid: []byte): quicconnState {
+  return quicconnState{
+    isClient: isClient,
+    sock: sock,
+    peerHost: host,
+    peerPort: port,
+    havePeer: isClient,
+    version: quicVersion1,
+    scid: scid,
+    dcid: dcid,
+    origDcid: dcid,
+    dcidSwitched: false,
+    iLevel: quicconnNewLevel(quicconnLvlInitial),
+    hLevel: quicconnNewLevel(quicconnLvlHandshake),
+    aLevel: quicconnNewLevel(quicconnLvlApp),
+    chOpt: Option.None,
+    shOpt: Option.None,
+    suiteId: TLS_AES_128_GCM_SHA256,
+    serverHelloDone: false,
+    clientFlightSent: false,
+    handshakeComplete: false,
+    established: false,
+    sendHandshakeDone: false,
+    streams: map<int, quicconnStream>(),
+    present: map<int, int>(),
+    nextBidiId: quicconnFirstBidiId(isClient),
+    acceptQueue: []int(0),
+    acceptWaiter: chan<quicconnOpenReply>(1),
+    hasAcceptWaiter: false,
+    peerMaxData: 1 << 20,
+    peerInitStreamData: 1 << 20,
+    dataSent: 0,
+    dataBlockedSignaled: false,
+    localMaxData: quicconnFlowWindow,
+    dataConsumed: 0,
+    needMaxData: false,
+    srtt: 0,
+    rttvar: 0,
+    minRtt: 0,
+    latestRtt: 0,
+    haveRtt: false,
+    ptoCount: 0,
+    cwnd: quicconnInitialWindow,
+    ssthresh: 1 << 30,
+    bytesInFlight: 0,
+    recoveryStart: 0,
+    maxAckDelay: 5000000,
+    inCh: chan<quicconnDgram>(256),
+    cmdCh: chan<quicconnCmd>(64),
+    tickCh: chan<int>(1),
+    readyCh: chan<int>(1),
+    running: true,
+    closeSent: false,
+  }
+}
+
+// The first bidirectional stream id this endpoint allocates (RFC 9000 §2.1):
+// clients use 0, 4, 8, …; a server would use 1, 5, 9, ….
+function quicconnFirstBidiId(isClient: bool): int {
+  if (isClient) {
+    return 0
+  }
+  return 1
+}
+
+// The three levels by index, returned by reference so callers mutate in place.
+function quicconnLvl(st: quicconnState, idx: int): quicconnLevel {
+  if (idx == quicconnLvlInitial) {
+    return st.iLevel
+  }
+  if (idx == quicconnLvlHandshake) {
+    return st.hLevel
+  }
+  return st.aLevel
+}
+
+// The QUIC transport parameters this endpoint advertises (RFC 9000 §18.2): the
+// deliberately-modest flow-control windows plus our source connection id.
+function quicconnLocalParams(scid: []byte): TransportParameters {
+  let tp = defaultTransportParameters()
+  tp.initialMaxData = u64(quicconnFlowWindow)
+  tp.initialMaxStreamDataBidiLocal = u64(quicconnFlowWindow)
+  tp.initialMaxStreamDataBidiRemote = u64(quicconnFlowWindow)
+  tp.initialMaxStreamDataUni = u64(quicconnFlowWindow)
+  tp.initialMaxStreamsBidi = u64(16)
+  tp.initialMaxStreamsUni = u64(16)
+  tp.initialSourceConnectionId = scid
+  return tp
+}
+
+// ---------------------------------------------------------------------------
+// Reader, ticker, and the loop
+// ---------------------------------------------------------------------------
+
+// Reader thread: park on UDP recv and forward each datagram; on a socket error
+// (close) emit one `eof` and stop.
+function quicconnReader(sock: UdpSocket, inCh: chan<quicconnDgram>) {
+  while (true) {
+    let d = sock.recv(2048) catch e {
+      inCh <- quicconnDgram{ data: []byte(0), host: "", port: 0, eof: true }
+      return
+    }
+    inCh <- quicconnDgram{ data: []byte(d.data), host: d.host, port: d.port, eof: false }
+  }
+}
+
+// Ticker thread: emit a tick every `quicconnTick` ns to drive the RFC 9002
+// timers. A non-blocking send drops the tick if the loop is busy, so the ticker
+// never parks; it exits when the loop clears `running`. ponytail: a fixed tick
+// stands in for a cancellable per-deadline timer — a native timer channel would
+// let the loop block precisely instead of polling on the tick.
+function quicconnTicker(st: quicconnState) {
+  while (st.running) {
+    quicconnSleepTick()
+    select {
+      case st.tickCh <- 0:
+        {}
+      default:
+        {}
+    }
+  }
+}
+
+// Loop thread: the sole owner of `st`. Kick off the handshake, then fold in one
+// datagram, command, or tick at a time until the connection ends.
+function quicconnLoop(st: quicconnState) {
+  quicconnKickoff(st) catch e {
+    quicconnFail(st)
+    return
+  }
+  while (st.running) {
+    select {
+      case ev = <- st.inCh:
+        quicconnOnDgram(st, ev) catch e {
+          quicconnFail(st)
+        }
+      case cmd = <- st.cmdCh:
+        quicconnOnCmd(st, cmd) catch e {
+          quicconnFail(st)
+        }
+      case tk = <- st.tickCh:
+        quicconnOnTick(st) catch e {
+          quicconnFail(st)
+        }
+    }
+  }
+}
+
+// Abandon the connection on an unrecoverable error: unblock a waiting
+// dial/accept with a failure sentinel and stop the loop.
+function quicconnFail(st: quicconnState) {
+  if (!st.established) {
+    select {
+      case st.readyCh <- -1:
+        {}
+      default:
+        {}
+    }
+  }
+  st.running = false
+}
+
+// Mark the connection established and release the waiting dial/accept once.
+function quicconnBecomeEstablished(st: quicconnState) {
+  if (st.established) {
+    return
+  }
+  st.established = true
+  select {
+    case st.readyCh <- 1:
+      {}
+    default:
+      {}
+  }
+}
+
+// Client-only: build the ClientHello and send the first Initial flight.
+function quicconnKickoff(st: quicconnState): ()! {
+  if (!st.isClient) {
+    return
+  }
+  match (st.chOpt) {
+    None => {}
+    Some(h) => {
+      quicconnQueueCrypto(st, quicconnLvlInitial, h.clientHelloMessage())
+      quicconnFlush(st)?
+    }
+  }
+}
+
+function quicconnOnDgram(st: quicconnState, ev: quicconnDgram): ()! {
+  if (ev.eof) {
+    st.running = false
+    return
+  }
+  st.peerHost = ev.host
+  st.peerPort = ev.port
+  st.havePeer = true
+  quicconnRecvDatagram(st, ev.data)?
+  quicconnFlush(st)?
+}
+
+function quicconnOnTick(st: quicconnState): ()! {
+  quicconnDetectLoss(st, quicconnLvlInitial)
+  quicconnDetectLoss(st, quicconnLvlHandshake)
+  quicconnDetectLoss(st, quicconnLvlApp)
+  quicconnMaybePto(st)
+  quicconnCheckDelivered(st)
+  quicconnFlush(st)?
+}
+
+// ---------------------------------------------------------------------------
+// Application commands
+// ---------------------------------------------------------------------------
+
+function quicconnOnCmd(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (cmd.kind == quicconnCmdOpen) {
+    quicconnDoOpen(st, cmd)
+    return
+  }
+  if (cmd.kind == quicconnCmdAccept) {
+    quicconnDoAccept(st, cmd)
+    return
+  }
+  if (cmd.kind == quicconnCmdWrite) {
+    quicconnDoWrite(st, cmd)?
+    return
+  }
+  if (cmd.kind == quicconnCmdFinish) {
+    quicconnDoFinish(st, cmd)?
+    return
+  }
+  if (cmd.kind == quicconnCmdClose) {
+    quicconnDoClose(st, cmd)?
+    return
+  }
+}
+
+function quicconnDoOpen(st: quicconnState, cmd: quicconnCmd) {
+  let id = st.nextBidiId
+  st.nextBidiId = st.nextBidiId + 4
+  let s = quicconnNewStream(st, id, false)
+  st.streams[id] = s
+  st.present[id] = 1
+  cmd.replyOpen <- quicconnOpenReply{ id: id, recvCh: s.recvCh }
+}
+
+function quicconnDoAccept(st: quicconnState, cmd: quicconnCmd) {
+  if (len(st.acceptQueue) > 0) {
+    let id = st.acceptQueue[0]
+    st.acceptQueue = st.acceptQueue[1:len(st.acceptQueue)]
+    let s = st.streams[id]
+    cmd.replyOpen <- quicconnOpenReply{ id: id, recvCh: s.recvCh }
+    return
+  }
+  st.acceptWaiter = cmd.replyOpen
+  st.hasAcceptWaiter = true
+}
+
+function quicconnDoWrite(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.present[cmd.id] == 0) {
+    return
+  }
+  let s = st.streams[cmd.id]
+  if (len(s.sendBuf) == 0) {
+    s.sendBuf = cmd.data
+  } else {
+    for b of cmd.data {
+      s.sendBuf = append(s.sendBuf, b)
+    }
+  }
+  s.sendLen = len(s.sendBuf)
+  quicconnFlush(st)?
+}
+
+function quicconnDoFinish(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.present[cmd.id] == 0) {
+    cmd.replyInt <- -1
+    return
+  }
+  let s = st.streams[cmd.id]
+  s.finQueued = true
+  s.drainCh = cmd.replyInt
+  s.hasDrain = true
+  quicconnFlush(st)?
+  quicconnCheckDelivered(st)
+}
+
+function quicconnDoClose(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.established && !st.closeSent) {
+    st.aLevel.pending = append(st.aLevel.pending, Frame.ApplicationClose(0, []byte(0)))
+    st.closeSent = true
+    quicconnFlush(st)?
+  }
+  st.sock.close()
+  st.running = false
+}
+
+// ---------------------------------------------------------------------------
+// Handshake progression (drives the #1219 record-bypass TLS handshake)
+// ---------------------------------------------------------------------------
+
+// Advance whichever side's handshake we run, based on freshly reassembled
+// CRYPTO. Idempotent: safe to call after every decrypted packet.
+function quicconnDriveHandshake(st: quicconnState): ()! {
+  if (st.isClient) {
+    quicconnDriveClient(st)?
+    return
+  }
+  quicconnDriveServer(st)?
+}
+
+function quicconnDriveClient(st: quicconnState): ()! {
+  match (st.chOpt) {
+    None => {}
+    Some(h) => {
+      if (!st.serverHelloDone) {
+        let contig = st.iLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgServerHello)
+        if (end > 0) {
+          let resent = h.processServerHelloMessage(contig[0:end])?
+          if (len(resent) > 0) {
+            fail newError("quic: HelloRetryRequest unsupported")
+          }
+          quicconnInstallHandshakeKeys(st, h.cipherSuiteId(), h.clientHandshakeSecret(), h.serverHandshakeSecret())
+          st.serverHelloDone = true
+        }
+      }
+      if (st.serverHelloDone && !st.clientFlightSent) {
+        let contig = st.hLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgFinished)
+        if (end > 0) {
+          let finMsg = h.clientReadHandshake(contig[0:end])?
+          quicconnInstallAppKeys(st, h.clientApplicationSecret(), h.serverApplicationSecret())
+          quicconnReadPeerParams(st, h.peerEncryptedExtensions())
+          quicconnQueueCrypto(st, quicconnLvlHandshake, finMsg)
+          st.clientFlightSent = true
+          quicconnBecomeEstablished(st)
+        }
+      }
+    }
+  }
+}
+
+function quicconnDriveServer(st: quicconnState): ()! {
+  match (st.shOpt) {
+    None => {}
+    Some(s) => {
+      if (!st.serverHelloDone) {
+        let contig = st.iLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgClientHello)
+        if (end > 0) {
+          let flight = s.processClientHelloMessage(contig[0:end])?
+          if (flight.retry) {
+            fail newError("quic: HelloRetryRequest unsupported")
+          }
+          quicconnInstallHandshakeKeys(st, s.cipherSuiteId(), s.clientHandshakeSecret(), s.serverHandshakeSecret())
+          quicconnInstallAppKeys(st, s.clientApplicationSecret(), s.serverApplicationSecret())
+          quicconnQueueCrypto(st, quicconnLvlInitial, flight.serverHello)
+          quicconnQueueCrypto(st, quicconnLvlHandshake, flight.handshake)
+          st.serverHelloDone = true
+          quicconnBecomeEstablished(st)
+        }
+      }
+      if (st.serverHelloDone && !st.handshakeComplete) {
+        let contig = st.hLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgFinished)
+        if (end > 0) {
+          let conn = s.processClientFinishedMessage(contig[0:end])?
+          st.handshakeComplete = true
+          st.sendHandshakeDone = true
+        }
+      }
+    }
+  }
+}
+
+// The byte length of `stream` up to and including the first TLS handshake
+// message of type `wantType` (RFC 8446 §4: 1-byte type, 3-byte length), or -1 if
+// no such complete message is present yet. Bounded by `len(stream)`.
+function quicconnFlightEnd(stream: []byte, wantType: int): int {
+  let p = 0
+  let guard = 0
+  while (p + 4 <= len(stream) && guard <= len(stream)) {
+    guard = guard + 1
+    let t = int(stream[p])
+    let mlen = (int(stream[p + 1]) << 16) | (int(stream[p + 2]) << 8) | int(stream[p + 3])
+    let end = p + 4 + mlen
+    if (end > len(stream)) {
+      return -1
+    }
+    if (t == wantType) {
+      return end
+    }
+    p = end
+  }
+  return -1
+}
+
+// Install a non-Initial level's keys from the TLS traffic secrets (RFC 9001
+// §5.1). The client sends with the client secret and receives with the server's;
+// the server is the mirror.
+function quicconnInstallHandshakeKeys(st: quicconnState, suiteId: int, cSec: []byte, sSec: []byte) {
+  st.suiteId = suiteId
+  let kp = levelKeyPair(quicconnNewHash, cSec, sSec, 16)
+  if (st.isClient) {
+    st.hLevel.ksend = kp.client
+    st.hLevel.krecv = kp.server
+  } else {
+    st.hLevel.ksend = kp.server
+    st.hLevel.krecv = kp.client
+  }
+  st.hLevel.haveSend = true
+  st.hLevel.haveRecv = true
+}
+
+function quicconnInstallAppKeys(st: quicconnState, cSec: []byte, sSec: []byte) {
+  let kp = levelKeyPair(quicconnNewHash, cSec, sSec, 16)
+  if (st.isClient) {
+    st.aLevel.ksend = kp.client
+    st.aLevel.krecv = kp.server
+  } else {
+    st.aLevel.ksend = kp.server
+    st.aLevel.krecv = kp.client
+  }
+  st.aLevel.haveSend = true
+  st.aLevel.haveRecv = true
+}
+
+// Adopt the peer's flow-control limits from its quic_transport_parameters
+// extension (RFC 9000 §18.2). The client, sending on a stream it opened, is
+// bounded by the server's initial_max_stream_data_bidi_remote.
+function quicconnReadPeerParams(st: quicconnState, exts: []Extension) {
+  for e of exts {
+    if (e.extType == quicTransportParametersExtension) {
+      let tp = decodeTransportParameters(e.data) catch err {
+        return
+      }
+      st.peerMaxData = int(tp.initialMaxData)
+      st.peerInitStreamData = int(tp.initialMaxStreamDataBidiRemote)
+    }
+  }
+}
+
+// Chunk `data` into CRYPTO frames at offset 0 and queue them for `level` (each
+// level carries a single one-shot flight per direction in this handshake).
+function quicconnQueueCrypto(st: quicconnState, levelIdx: int, data: []byte) {
+  let lvl = quicconnLvl(st, levelIdx)
+  let frs = cryptoFrames(data, 0, 1000)
+  for f of frs {
+    lvl.pending = append(lvl.pending, f)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+// ---------------------------------------------------------------------------
+
+function quicconnSendDatagram(st: quicconnState, dg: []byte): ()! {
+  if (!st.havePeer || len(dg) == 0) {
+    return
+  }
+  st.sock.send(st.peerHost, st.peerPort, string(dg))?
+}
+
+// Flush anything pending: coalesced Initial+Handshake datagrams, then 1-RTT.
+function quicconnFlush(st: quicconnState): ()! {
+  if (!st.havePeer) {
+    return
+  }
+  quicconnFlushHandshake(st)?
+  if (st.aLevel.haveSend) {
+    quicconnFlushApp(st)?
+  }
+}
+
+// Send the Initial and Handshake levels, coalescing the two long-header packets
+// into one datagram per round so the client always processes the ServerHello
+// (which installs Handshake keys) before the Handshake packet beside it.
+function quicconnFlushHandshake(st: quicconnState): ()! {
+  let guard = 0
+  while (guard < 100) {
+    guard = guard + 1
+    let dg = []byte(0)
+    let any = false
+    if (quicconnLevelHasWork(st.iLevel) && st.iLevel.haveSend) {
+      let pkt = quicconnBuildCryptoPacket(st, quicconnLvlInitial)?
+      dg = quicpktPutBytes(dg, pkt)
+      any = true
+    }
+    if (quicconnLevelHasWork(st.hLevel) && st.hLevel.haveSend) {
+      let pkt = quicconnBuildCryptoPacket(st, quicconnLvlHandshake)?
+      dg = quicpktPutBytes(dg, pkt)
+      any = true
+    }
+    if (!any) {
+      break
+    }
+    quicconnSendDatagram(st, dg)?
+  }
+}
+
+// The unprotected header for a CRYPTO-level packet (Initial or Handshake).
+function quicconnCryptoHeader(st: quicconnState, levelIdx: int, length: int, pn: int): []byte {
+  if (levelIdx == quicconnLvlInitial) {
+    return encodeInitialHeader(st.version, st.dcid, st.scid, []byte(0), u64(length), u64(pn), quicconnPnLen)
+  }
+  return quicconnEncodeHsHeader(st.version, st.dcid, st.scid, length, pn)
+}
+
+// A Handshake long header (RFC 9000 §17.2.4): long-form ‖ fixed ‖ type 2 ‖
+// pn-length bits, then version, the two connection ids, Length, and packet
+// number. No token (that is Initial-only).
+function quicconnEncodeHsHeader(version: int, dcid: []byte, scid: []byte, length: int, pn: int): []byte {
+  let first = 0xe0 | ((quicconnPnLen - 1) & 0x03)
+  let out = []byte(0)
+  out = append(out, byte(first))
+  out = quicpktPutU32(out, version)
+  out = append(out, byte(len(dcid)))
+  out = quicpktPutBytes(out, dcid)
+  out = append(out, byte(len(scid)))
+  out = quicpktPutBytes(out, scid)
+  out = quicpktPutBytes(out, encodeVarint(u64(length)))
+  return quicpktPutBytes(out, encodePacketNumber(u64(pn), quicconnPnLen))
+}
+
+// Build one protected Initial/Handshake packet: bundle a pending ACK, drain the
+// crypto queue up to budget, pad a client Initial carrying CRYPTO to the 1200
+// floor, then seal and header-protect. Records the packet for loss recovery.
+function quicconnBuildCryptoPacket(st: quicconnState, levelIdx: int): []byte! {
+  let lvl = quicconnLvl(st, levelIdx)
+  let frames = []Frame(0)
+  if (lvl.ackPending && len(lvl.recvRanges) > 0) {
+    frames = append(frames, quicconnBuildAck(lvl))
+    lvl.ackPending = false
+  }
+  let pend = quicconnTakePending(lvl, quicconnFrameBudget)
+  for f of pend {
+    frames = append(frames, f)
+  }
+  if (levelIdx == quicconnLvlInitial && st.isClient && quicconnFramesHaveCrypto(frames)) {
+    let plLen = quicconnFramesLen(frames)
+    if (plLen < quicconnInitialPad) {
+      frames = append(frames, Frame.Padding(quicconnInitialPad - plLen))
+    }
+  }
+  let payloadLen = quicconnFramesLen(frames)
+  let length = quicconnPnLen + payloadLen + 16
+  let header = quicconnCryptoHeader(st, levelIdx, length, lvl.nextPn)
+  return quicconnSealPacket(st, lvl, frames, header)?
+}
+
+// Seal `frames` under `lvl` behind `header`, apply header protection, advance
+// the packet number, and record the packet if it is ack-eliciting. Returns the
+// finished wire bytes.
+function quicconnSealPacket(st: quicconnState, lvl: quicconnLevel, frames: []Frame, header: []byte): []byte! {
+  let payload = encodeFrames(frames)
+  let pn = lvl.nextPn
+  let pnOffset = len(header) - quicconnPnLen
+  let sealed = protectPayload(lvl.ksend, u64(pn), header, payload)?
+  let packet = quicpktPutBytes(header, sealed)
+  let sample = headerSample(sealed, quicconnPnLen)?
+  let mask = aesHeaderMask(lvl.ksend.hp, sample)?
+  applyHeaderProtection(packet, pnOffset, mask)?
+  lvl.nextPn = pn + 1
+  if (quicconnAnyAckEliciting(frames)) {
+    let now = monotonic()
+    lvl.sent = append(lvl.sent, quicconnSent{
+      pn: pn,
+      timeSent: now,
+      size: len(packet),
+      ackEliciting: true,
+      frames: quicconnRetransFrames(frames),
+    })
+    st.bytesInFlight = st.bytesInFlight + len(packet)
+    lvl.timeLastAckEliciting = now
+  }
+  return packet
+}
+
+// Send 1-RTT packets while there is work and the congestion window permits new
+// data. ACK-only packets bypass the window; data packets are gated.
+function quicconnFlushApp(st: quicconnState): ()! {
+  let guard = 0
+  while (guard < 100000) {
+    guard = guard + 1
+    let frames = []Frame(0)
+    if (st.aLevel.ackPending && len(st.aLevel.recvRanges) > 0) {
+      frames = append(frames, quicconnBuildAck(st.aLevel))
+      st.aLevel.ackPending = false
+    }
+    frames = quicconnAppendWindowUpdates(st, frames)
+    if (st.sendHandshakeDone) {
+      frames = append(frames, Frame.HandshakeDone)
+      st.sendHandshakeDone = false
+    }
+    let pend = quicconnTakePending(st.aLevel, quicconnFrameBudget - quicconnFramesLen(frames))
+    for f of pend {
+      frames = append(frames, f)
+    }
+    if (st.bytesInFlight + quicconnMaxPacket <= st.cwnd) {
+      let data = quicconnFillStreamFrames(st, quicconnFrameBudget - quicconnFramesLen(frames))
+      for f of data {
+        frames = append(frames, f)
+      }
+    }
+    if (len(frames) == 0) {
+      break
+    }
+    let header = encodeShortHeader(st.dcid, u64(st.aLevel.nextPn), quicconnPnLen, false, false)
+    let packet = quicconnSealPacket(st, st.aLevel, frames, header)?
+    quicconnSendDatagram(st, packet)?
+  }
+}
+
+// Append any due MAX_DATA / MAX_STREAM_DATA window extensions (RFC 9000 §19.9,
+// §19.10) so the peer can keep sending.
+function quicconnAppendWindowUpdates(st: quicconnState, frames: []Frame): []Frame {
+  let out = frames
+  if (st.needMaxData) {
+    out = append(out, Frame.MaxData(u64(st.localMaxData)))
+    st.needMaxData = false
+  }
+  for (id, s) of st.streams {
+    if (s.needMaxStreamData) {
+      out = append(out, Frame.MaxStreamData(u64(id), u64(s.localMaxStreamData)))
+      s.needMaxStreamData = false
+    }
+  }
+  return out
+}
+
+// Fill up to `budget` bytes of new STREAM data from the send buffers, bounded by
+// per-stream and connection flow control (RFC 9000 §4.1). Emits a FIN on the
+// last frame of a finished stream and DATA_BLOCKED / STREAM_DATA_BLOCKED when a
+// window is exhausted with data still to send.
+// The map iteration uses no `break`/`continue`: a `for..of` cursor's implicit
+// advance is skipped by those (a compiler limitation, #1220 finding), so each
+// stream is gated by a `room > 0` check inside the body instead.
+function quicconnFillStreamFrames(st: quicconnState, budget: int): []Frame {
+  let out = []Frame(0)
+  let used = 0
+  for (id, s) of st.streams {
+    let room = budget - used - 24
+    let avail = s.sendLen - s.sendOff
+    if (room > 0 && avail == 0 && s.finQueued && !s.finSent) {
+      out = append(out, Frame.Stream(StreamFrame{
+        id: u64(id),
+        offset: u64(s.sendOff),
+        data: []byte(0),
+        hasOffset: true,
+        hasLength: true,
+        fin: true,
+      }))
+      s.finSent = true
+    } else if (room > 0 && avail > 0) {
+      let connCredit = st.peerMaxData - st.dataSent
+      let strCredit = s.peerMaxStreamData - s.sendOff
+      let can = quicconnMin(avail, quicconnMin(connCredit, quicconnMin(strCredit, room)))
+      if (can <= 0) {
+        if (strCredit <= 0 && !s.blockedSignaled) {
+          out = append(out, Frame.StreamDataBlocked(u64(id), u64(s.peerMaxStreamData)))
+          s.blockedSignaled = true
+        }
+        if (connCredit <= 0 && !st.dataBlockedSignaled) {
+          out = append(out, Frame.DataBlocked(u64(st.peerMaxData)))
+          st.dataBlockedSignaled = true
+        }
+      } else {
+        let chunk = s.sendBuf[s.sendOff:s.sendOff + can]
+        let fin = s.finQueued && (s.sendOff + can == s.sendLen)
+        out = append(out, Frame.Stream(StreamFrame{
+          id: u64(id),
+          offset: u64(s.sendOff),
+          data: chunk,
+          hasOffset: true,
+          hasLength: true,
+          fin: fin,
+        }))
+        s.sendOff = s.sendOff + can
+        st.dataSent = st.dataSent + can
+        if (fin) {
+          s.finSent = true
+        }
+        s.blockedSignaled = false
+        st.dataBlockedSignaled = false
+        used = used + can + 24
+      }
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Receiving
+// ---------------------------------------------------------------------------
+
+// Parse the (possibly coalesced) packets in one datagram (RFC 9000 §12.2), left
+// to right; a short-header 1-RTT packet is always last.
+function quicconnRecvDatagram(st: quicconnState, data: []byte): ()! {
+  let pos = 0
+  let guard = 0
+  while (pos < len(data) && guard <= len(data)) {
+    guard = guard + 1
+    let first = data[pos]
+    if ((first & 0x80) != 0) {
+      let nxt = quicconnRecvLong(st, data, pos)?
+      if (nxt <= pos) {
+        return
+      }
+      pos = nxt
+    } else if ((first & 0x40) != 0) {
+      quicconnRecvShort(st, data, pos)?
+      return
+    } else {
+      return
+    }
+  }
+}
+
+// Parse one long-header packet at `start`, decrypt and process it, and return
+// the offset of the next coalesced packet (RFC 9000 §17.2). A packet whose keys
+// are not yet installed, or that fails to decrypt, is skipped — the peer will
+// retransmit (RFC 9001 §5.4.1 / §5.5).
+function quicconnRecvLong(st: quicconnState, data: []byte, start: int): int! {
+  if (start + 7 > len(data)) {
+    return len(data)
+  }
+  let typ = int((data[start] >> 4) & 0x03)
+  let p = start + 5
+  let dcidLen = int(data[p])
+  p = p + 1
+  if (p + dcidLen + 1 > len(data)) {
+    return len(data)
+  }
+  let dcid = data[p:p + dcidLen]
+  p = p + dcidLen
+  let scidLen = int(data[p])
+  p = p + 1
+  if (p + scidLen > len(data)) {
+    return len(data)
+  }
+  let scid = data[p:p + scidLen]
+  p = p + scidLen
+  if (typ == longInitial) {
+    let r = quicfrReader{ data: data, pos: p }
+    let tokLen = int(quicfrReadVarint(r)?)
+    p = r.pos + tokLen
+    if (p > len(data)) {
+      return len(data)
+    }
+  }
+  let r2 = quicfrReader{ data: data, pos: p }
+  let length = int(quicfrReadVarint(r2)?)
+  let pnOffset = r2.pos
+  let packetEnd = pnOffset + length
+  if (packetEnd > len(data)) {
+    return len(data)
+  }
+  let levelIdx = -1
+  if (typ == longInitial) {
+    levelIdx = quicconnLvlInitial
+  } else if (typ == longHandshake) {
+    levelIdx = quicconnLvlHandshake
+  } else {
+    return packetEnd
+  }
+  if (!st.isClient && levelIdx == quicconnLvlInitial && !st.iLevel.haveRecv) {
+    quicconnServerInitKeys(st, dcid, scid)
+  }
+  if (st.isClient && !st.dcidSwitched && scidLen > 0) {
+    st.dcid = quicconnCopyBytes(scid)
+    st.dcidSwitched = true
+  }
+  let lvl = quicconnLvl(st, levelIdx)
+  if (!lvl.haveRecv) {
+    return packetEnd
+  }
+  quicconnDecryptAndProcess(st, levelIdx, data, start, pnOffset, packetEnd)?
+  return packetEnd
+}
+
+// Parse and process the trailing short-header (1-RTT) packet at `start` (RFC
+// 9000 §17.3). Its DCID length is our own issued id length.
+function quicconnRecvShort(st: quicconnState, data: []byte, start: int): ()! {
+  if (!st.aLevel.haveRecv) {
+    return
+  }
+  let pnOffset = start + 1 + len(st.scid)
+  if (pnOffset + 20 > len(data)) {
+    return
+  }
+  quicconnDecryptAndProcess(st, quicconnLvlApp, data, start, pnOffset, len(data))?
+}
+
+// Server-only: derive Initial keys from the client-chosen DCID carried in the
+// clear on its first Initial (RFC 9001 §5.2), and adopt the client's SCID as the
+// destination for replies.
+function quicconnServerInitKeys(st: quicconnState, dcid: []byte, scid: []byte) {
+  st.origDcid = quicconnCopyBytes(dcid)
+  st.dcid = quicconnCopyBytes(scid)
+  st.dcidSwitched = true
+  st.iLevel.ksend = serverInitialKeys(dcid)
+  st.iLevel.krecv = clientInitialKeys(dcid)
+  st.iLevel.haveSend = true
+  st.iLevel.haveRecv = true
+}
+
+// Remove header protection, decrypt, and process one packet's frames (RFC 9001
+// §5.4.1 / §5.3). Works on a copy of the packet so in-place unmasking never
+// disturbs the shared datagram buffer. Undecryptable packets are dropped.
+function quicconnDecryptAndProcess(st: quicconnState, levelIdx: int, data: []byte, start: int, pnOffset: int, packetEnd: int): ()! {
+  let lvl = quicconnLvl(st, levelIdx)
+  let pkt = quicconnCopyRange(data, start, packetEnd)
+  let pnOffLocal = pnOffset - start
+  if (pnOffLocal + 20 > len(pkt)) {
+    return
+  }
+  let sample = pkt[pnOffLocal + 4:pnOffLocal + 20]
+  let mask = aesHeaderMask(lvl.krecv.hp, sample)?
+  let pnLen = removeHeaderProtection(pkt, pnOffLocal, mask)?
+  let trunc = 0
+  let i = 0
+  while (i < pnLen) {
+    trunc = (trunc << 8) | int(pkt[pnOffLocal + i])
+    i = i + 1
+  }
+  let fullPn = quicconnDecodePn(lvl.largestRecvPn, trunc, pnLen)
+  let aadEnd = pnOffLocal + pnLen
+  let header = pkt[0:aadEnd]
+  let ct = pkt[aadEnd:len(pkt)]
+  let pt = unprotectPayload(lvl.krecv, u64(fullPn), header, ct) catch e {
+    return
+  }
+  if (fullPn > lvl.largestRecvPn) {
+    lvl.largestRecvPn = fullPn
+  }
+  quicconnRecordPn(lvl, fullPn)
+  let frames = parseFrames(pt) catch e {
+    return
+  }
+  let elicit = false
+  for f of frames {
+    if (quicconnIsAckEliciting(f)) {
+      elicit = true
+    }
+    quicconnHandleFrame(st, levelIdx, f)?
+  }
+  if (elicit) {
+    lvl.ackPending = true
+  }
+  quicconnDriveHandshake(st)?
+}
+
+// Reconstruct a full packet number from its truncated form and the largest one
+// received in the space (RFC 9000 §A.3).
+function quicconnDecodePn(largest: int, truncated: int, pnLen: int): int {
+  let pnWin = 1 << (8 * pnLen)
+  let pnHalf = pnWin / 2
+  let expected = largest + 1
+  let base = expected - (expected % pnWin)
+  let cand = base + truncated
+  if (cand + pnHalf <= expected && cand + pnWin < (1 << 62)) {
+    return cand + pnWin
+  }
+  if (cand > expected + pnHalf && cand >= pnWin) {
+    return cand - pnWin
+  }
+  return cand
+}
+
+// Fold one received frame into connection state.
+function quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
+  match (f) {
+    Padding(n) => {}
+    Ping => {}
+    Ack(a) => { quicconnProcessAck(st, levelIdx, a) }
+    ResetStream(id, code, size) => {}
+    StopSending(id, code) => {}
+    Crypto(offset, cdata) => { quicconnLvl(st, levelIdx).crecv.insert(offset, cdata)? }
+    NewToken(token) => {}
+    Stream(s) => { quicconnOnStream(st, s)? }
+    MaxData(m) => {
+      if (int(m) > st.peerMaxData) {
+        st.peerMaxData = int(m)
+        st.dataBlockedSignaled = false
+      }
+    }
+    MaxStreamData(id, m) => { quicconnOnMaxStreamData(st, int(id), int(m)) }
+    MaxStreams(bidi, m) => {}
+    DataBlocked(m) => {}
+    StreamDataBlocked(id, m) => {}
+    StreamsBlocked(bidi, m) => {}
+    NewConnectionId(seq, retire, cid, token) => {}
+    RetireConnectionId(seq) => {}
+    PathChallenge(d) => { st.aLevel.pending = append(st.aLevel.pending, Frame.PathResponse(d)) }
+    PathResponse(d) => {}
+    ConnectionClose(code, ft, reason) => { st.running = false }
+    ApplicationClose(code, reason) => { st.running = false }
+    HandshakeDone => { st.handshakeComplete = true }
+  }
+}
+
+function quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
+  if (st.present[id] == 0) {
+    return
+  }
+  let s = st.streams[id]
+  if (m > s.peerMaxStreamData) {
+    s.peerMaxStreamData = m
+    s.blockedSignaled = false
+  }
+}
+
+// Accept a STREAM frame (RFC 9000 §19.8): create the stream on first sight,
+// enqueue it for `acceptStream`, reassemble the data, and deliver any newly
+// contiguous prefix.
+function quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
+  let id = int(s.id)
+  if (st.present[id] == 0) {
+    let ns = quicconnNewStream(st, id, true)
+    st.streams[id] = ns
+    st.present[id] = 1
+    if (st.hasAcceptWaiter) {
+      st.acceptWaiter <- quicconnOpenReply{ id: id, recvCh: ns.recvCh }
+      st.hasAcceptWaiter = false
+    } else {
+      st.acceptQueue = append(st.acceptQueue, id)
+    }
+  }
+  let str = st.streams[id]
+  str.recvAsm.insert(s.offset, s.data)?
+  if (s.fin) {
+    str.recvFinalSize = int(s.offset) + len(s.data)
+  }
+  quicconnDeliverStream(st, str)
+}
+
+// Hand any newly contiguous received bytes to the application and advance the
+// receive flow-control window (auto-tuning, RFC 9000 §4.1). When the FIN arrives
+// after the last data was already delivered (an empty STREAM frame at the final
+// offset, or a FIN reordered ahead of nothing), emit a trailing empty
+// `fin = true` chunk so the reader still sees the end of stream.
+function quicconnDeliverStream(st: quicconnState, str: quicconnStream) {
+  let contig = str.recvAsm.contiguousLen()
+  if (contig > str.recvDelivered) {
+    let all = str.recvAsm.contiguous()
+    let chunk = quicconnCopyRange(all, str.recvDelivered, contig)
+    let n = contig - str.recvDelivered
+    let isFin = str.recvFinalSize >= 0 && contig == str.recvFinalSize
+    str.recvDelivered = contig
+    st.dataConsumed = st.dataConsumed + n
+    str.recvCh <- StreamChunk{ data: chunk, fin: isFin }
+    if (isFin) {
+      str.finDelivered = true
+    }
+    quicconnMaybeExtendWindows(st, str)
+  }
+  if (!str.finDelivered && str.recvFinalSize >= 0 && str.recvDelivered >= str.recvFinalSize) {
+    str.finDelivered = true
+    str.recvCh <- StreamChunk{ data: []byte(0), fin: true }
+  }
+}
+
+// Keep the advertised windows a full `quicconnFlowWindow` ahead of what has been
+// consumed, queuing MAX_DATA / MAX_STREAM_DATA when they cross the midpoint.
+function quicconnMaybeExtendWindows(st: quicconnState, str: quicconnStream) {
+  if (str.localMaxStreamData - str.recvDelivered < quicconnFlowWindow / 2) {
+    str.localMaxStreamData = str.recvDelivered + quicconnFlowWindow
+    str.needMaxStreamData = true
+  }
+  if (st.localMaxData - st.dataConsumed < quicconnFlowWindow / 2) {
+    st.localMaxData = st.dataConsumed + quicconnFlowWindow
+    st.needMaxData = true
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loss recovery, RTT, and NewReno congestion control (RFC 9002)
+// ---------------------------------------------------------------------------
+
+// Process an ACK frame (RFC 9002 §5, §7): retire acknowledged packets, update
+// RTT from the largest newly-acked ack-eliciting packet, feed NewReno, then run
+// loss detection and delivery checks.
+function quicconnProcessAck(st: quicconnState, levelIdx: int, a: AckFrame) {
+  let lvl = quicconnLvl(st, levelIdx)
+  let largest = int(a.largest)
+  let acked = []quicconnRange(0)
+  let hi = largest
+  let lo = largest - int(a.firstRange)
+  acked = append(acked, quicconnRange{ lo: lo, hi: hi })
+  let prevLo = lo
+  for rg of a.ranges {
+    let ghi = prevLo - int(rg.gap) - 2
+    let glo = ghi - int(rg.rangeLength)
+    acked = append(acked, quicconnRange{ lo: glo, hi: ghi })
+    prevLo = glo
+  }
+  if (largest > lvl.largestAcked) {
+    lvl.largestAcked = largest
+  }
+  let now = monotonic()
+  let largestAckedTime = -1
+  let kept = []quicconnSent(0)
+  let ackedAny = false
+  for sp of lvl.sent {
+    if (quicconnPnInRanges(sp.pn, acked)) {
+      if (sp.ackEliciting) {
+        st.bytesInFlight = st.bytesInFlight - sp.size
+      }
+      quicconnOnPacketAcked(st, sp)
+      ackedAny = true
+      if (sp.pn == largest && sp.ackEliciting) {
+        largestAckedTime = sp.timeSent
+      }
+    } else {
+      kept = append(kept, sp)
+    }
+  }
+  lvl.sent = kept
+  if (largestAckedTime >= 0) {
+    quicconnUpdateRtt(st, now - largestAckedTime)
+  }
+  if (ackedAny) {
+    st.ptoCount = 0
+    quicconnDetectLoss(st, levelIdx)
+    quicconnCheckDelivered(st)
+  }
+}
+
+// NewReno increase on acknowledgement (RFC 9002 §7.3.1 / §7.3.2). No increase
+// for a packet sent during the current recovery period.
+function quicconnOnPacketAcked(st: quicconnState, sp: quicconnSent) {
+  if (!sp.ackEliciting) {
+    return
+  }
+  if (sp.timeSent <= st.recoveryStart) {
+    return
+  }
+  if (st.cwnd < st.ssthresh) {
+    st.cwnd = st.cwnd + sp.size
+  } else {
+    st.cwnd = st.cwnd + (quicconnMaxPacket * sp.size) / st.cwnd
+  }
+}
+
+// Enter congestion recovery once per event (RFC 9002 §7.3.3): halve the window,
+// floored at the minimum.
+function quicconnOnCongestionEvent(st: quicconnState, lostSentTime: int) {
+  if (lostSentTime <= st.recoveryStart) {
+    return
+  }
+  st.recoveryStart = monotonic()
+  st.ssthresh = st.cwnd / 2
+  if (st.ssthresh < quicconnMinWindow) {
+    st.ssthresh = quicconnMinWindow
+  }
+  st.cwnd = st.ssthresh
+}
+
+// Update smoothed RTT and RTT variance (RFC 9002 §5.3). ACK delay is 0 in this
+// implementation, so it drops out.
+function quicconnUpdateRtt(st: quicconnState, latest: int) {
+  st.latestRtt = latest
+  if (!st.haveRtt) {
+    st.minRtt = latest
+    st.srtt = latest
+    st.rttvar = latest / 2
+    st.haveRtt = true
+    return
+  }
+  if (latest < st.minRtt) {
+    st.minRtt = latest
+  }
+  st.rttvar = (3 * st.rttvar + quicconnAbs(st.srtt - latest)) / 4
+  st.srtt = (7 * st.srtt + latest) / 8
+}
+
+// The time threshold for declaring a packet lost (RFC 9002 §6.1.2): 9/8 of the
+// larger of smoothed and latest RTT, floored at the timer granularity.
+function quicconnLossDelay(st: quicconnState): int {
+  let base = quicconnMax(st.srtt, st.latestRtt)
+  let delay = (base * 9) / 8
+  if (delay < quicconnGranularity) {
+    delay = quicconnGranularity
+  }
+  return delay
+}
+
+// Declare packets in `levelIdx` lost by the packet threshold (3 later packets
+// acknowledged) or the time threshold (RFC 9002 §6.1), re-queue their
+// retransmittable frames, and signal a congestion event.
+function quicconnDetectLoss(st: quicconnState, levelIdx: int) {
+  let lvl = quicconnLvl(st, levelIdx)
+  if (lvl.largestAcked < 0) {
+    return
+  }
+  let now = monotonic()
+  let lossDelay = quicconnLossDelay(st)
+  let kept = []quicconnSent(0)
+  let lostFrames = []Frame(0)
+  let lostTime = -1
+  lvl.lossTime = 0
+  for sp of lvl.sent {
+    let byPacket = sp.pn <= lvl.largestAcked - quicconnPacketThreshold
+    let byTime = sp.pn < lvl.largestAcked && now - sp.timeSent >= lossDelay
+    if (byPacket || byTime) {
+      if (sp.ackEliciting) {
+        st.bytesInFlight = st.bytesInFlight - sp.size
+      }
+      for f of sp.frames {
+        lostFrames = append(lostFrames, f)
+      }
+      if (sp.timeSent > lostTime) {
+        lostTime = sp.timeSent
+      }
+    } else {
+      kept = append(kept, sp)
+      if (sp.pn < lvl.largestAcked) {
+        let t = sp.timeSent + lossDelay
+        if (lvl.lossTime == 0 || t < lvl.lossTime) {
+          lvl.lossTime = t
+        }
+      }
+    }
+  }
+  lvl.sent = kept
+  if (len(lostFrames) > 0) {
+    for f of lostFrames {
+      if (quicconnIsRetransmittable(f)) {
+        lvl.pending = append(lvl.pending, f)
+      }
+    }
+    quicconnOnCongestionEvent(st, lostTime)
+  }
+}
+
+// The base PTO duration (RFC 9002 §6.2.1), floored so a coarse tick and green-
+// thread jitter cannot make it fire before a genuine ACK would arrive.
+function quicconnPtoDuration(st: quicconnState): int {
+  if (!st.haveRtt) {
+    return quicconnInitialPto
+  }
+  let pto = st.srtt + quicconnMax(4 * st.rttvar, quicconnGranularity) + st.maxAckDelay
+  if (pto < quicconnMinPto) {
+    pto = quicconnMinPto
+  }
+  return pto
+}
+
+// Fire the probe timeout if the PTO has elapsed since the last ack-eliciting
+// packet with data still in flight (RFC 9002 §6.2). Retransmits the oldest
+// unacked packet's frames — this is what recovers a lost tail.
+function quicconnMaybePto(st: quicconnState) {
+  if (st.bytesInFlight == 0) {
+    return
+  }
+  let last = quicconnMax(st.iLevel.timeLastAckEliciting, quicconnMax(st.hLevel.timeLastAckEliciting, st.aLevel.timeLastAckEliciting))
+  if (last == 0) {
+    return
+  }
+  let backoff = 1 << st.ptoCount
+  let deadline = last + quicconnPtoDuration(st) * backoff
+  if (monotonic() < deadline) {
+    return
+  }
+  st.ptoCount = st.ptoCount + 1
+  if (st.ptoCount > 8) {
+    st.ptoCount = 8
+  }
+  quicconnSendProbe(st)
+}
+
+// Re-queue the oldest unacknowledged packet's frames on the highest level that
+// still has one, forcing a retransmission on the next flush.
+function quicconnSendProbe(st: quicconnState) {
+  let idx = -1
+  if (len(st.aLevel.sent) > 0) {
+    idx = quicconnLvlApp
+  } else if (len(st.hLevel.sent) > 0) {
+    idx = quicconnLvlHandshake
+  } else if (len(st.iLevel.sent) > 0) {
+    idx = quicconnLvlInitial
+  }
+  if (idx < 0) {
+    return
+  }
+  let lvl = quicconnLvl(st, idx)
+  let sp = lvl.sent[0]
+  for f of sp.frames {
+    if (quicconnIsRetransmittable(f)) {
+      lvl.pending = append(lvl.pending, f)
+    }
+  }
+}
+
+// Reply to any finished stream whose send buffer is fully acknowledged, so the
+// application's `finish` returns (RFC 9000 §3.3: the send stream is drained).
+function quicconnCheckDelivered(st: quicconnState) {
+  for (id, s) of st.streams {
+    if (s.hasDrain && !s.delivered) {
+      if (s.finSent && s.sendOff == s.sendLen && !quicconnStreamOutstanding(st, id)) {
+        s.delivered = true
+        s.hasDrain = false
+        s.drainCh <- 1
+      }
+    }
+  }
+}
+
+// Whether any STREAM data for `id` is still in flight or queued for (re)send.
+function quicconnStreamOutstanding(st: quicconnState, id: int): bool {
+  for sp of st.aLevel.sent {
+    for f of sp.frames {
+      if (quicconnFrameStreamId(f) == id) {
+        return true
+      }
+    }
+  }
+  for f of st.aLevel.pending {
+    if (quicconnFrameStreamId(f) == id) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// The client TLS config for a QUIC handshake: TLS 1.3 with AES-128-GCM +
+// X25519, matching `packet.bit`'s AEAD and this module's key length.
+// insecureSkipVerify keeps the loopback path free of a trust anchor.
+function quicconnClientTlsConfig(serverName: string): TlsClientConfig {
+  return TlsClientConfig{
+    serverName: serverName,
+    alpn: []string(0),
+    trust: emptyTrustStore(),
+    insecureSkipVerify: true,
+    nowUnix: 0,
+    groups: [TlsGroup.X25519],
+    keyShareGroups: [TlsGroup.X25519],
+    suites: [TLS_AES_128_GCM_SHA256],
+    clientHelloOverride: []byte(0),
+    ephemeralOverride: []GroupKeypair(0),
+  }
+}
+
+// Open a QUIC connection to `host:port` and complete the handshake to 1-RTT.
+// Binds an ephemeral loopback UDP socket, spawns the reader/ticker/loop threads,
+// and blocks until the connection is established. ponytail: binds 127.0.0.1
+// only; no name resolution or IPv6.
+export function dialQuic(host: string, port: int, serverName: string): Conn! {
+  let sock = udpBind("127.0.0.1", 0)?
+  let scid = quicconnMakeCid(monotonic())
+  let dcid = quicconnMakeCid(monotonic() + 1)
+  let tp = quicconnLocalParams(scid)
+  let ext = Extension{ extType: quicTransportParametersExtension, data: encodeTransportParameters(tp) }
+  let h = tlsClientStartExts(quicconnClientTlsConfig(serverName), [ext])?
+  let st = quicconnNewState(true, sock, host, port, scid, dcid)
+  st.chOpt = Option.Some(h)
+  st.iLevel.ksend = clientInitialKeys(dcid)
+  st.iLevel.krecv = serverInitialKeys(dcid)
+  st.iLevel.haveSend = true
+  st.iLevel.haveRecv = true
+  spawn quicconnReader(sock, st.inCh)
+  spawn quicconnTicker(st)
+  spawn quicconnLoop(st)
+  let r = <- st.readyCh
+  if (r < 0) {
+    fail newError("quic: handshake failed")
+  }
+  return Conn{ cmdCh: st.cmdCh, sock: sock }
+}
+
+// Accept a QUIC connection on the already-bound UDP socket `sock`, using the
+// given PEM certificate chain and private key, and complete the handshake. Serves
+// exactly one connection. ponytail: single connection per socket (no connection-
+// id demultiplexing across peers).
+export function acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Conn! {
+  let cfg = newTlsServerConfig(certChainPem, keyPem, []string(0))?
+  cfg.suites = [TLS_AES_128_GCM_SHA256]
+  cfg.groups = [TlsGroup.X25519]
+  let scid = quicconnMakeCid(monotonic() + 2)
+  let tp = quicconnLocalParams(scid)
+  let ext = Extension{ extType: quicTransportParametersExtension, data: encodeTransportParameters(tp) }
+  let s = tlsServerStartExts(cfg, [ext])?
+  let st = quicconnNewState(false, sock, "", 0, scid, []byte(0))
+  st.shOpt = Option.Some(s)
+  spawn quicconnReader(sock, st.inCh)
+  spawn quicconnTicker(st)
+  spawn quicconnLoop(st)
+  let r = <- st.readyCh
+  if (r < 0) {
+    fail newError("quic: server handshake failed")
+  }
+  return Conn{ cmdCh: st.cmdCh, sock: sock }
+}
+
+// Open a new client-initiated bidirectional stream.
+export function (c: Conn) openStream(): Stream! {
+  let reply = chan<quicconnOpenReply>(1)
+  c.cmdCh <- quicconnCmd{ kind: quicconnCmdOpen, id: 0, data: []byte(0), replyOpen: reply, replyInt: chan<int>(1) }
+  let r = <- reply
+  return Stream{ streamId: r.id, cmdCh: c.cmdCh, recvCh: r.recvCh }
+}
+
+// Accept the next peer-initiated bidirectional stream, blocking until one opens.
+export function (c: Conn) acceptStream(): Stream! {
+  let reply = chan<quicconnOpenReply>(1)
+  c.cmdCh <- quicconnCmd{ kind: quicconnCmdAccept, id: 0, data: []byte(0), replyOpen: reply, replyInt: chan<int>(1) }
+  let r = <- reply
+  return Stream{ streamId: r.id, cmdCh: c.cmdCh, recvCh: r.recvCh }
+}
+
+// Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
+// socket. ponytail: no draining timeout — best-effort close.
+export function (c: Conn) close() {
+  c.cmdCh <- quicconnCmd{ kind: quicconnCmdClose, id: 0, data: []byte(0), replyOpen: chan<quicconnOpenReply>(1), replyInt: chan<int>(1) }
+}
+
+// Queue `data` on the stream. Returns once buffered; the loop delivers it under
+// flow control and congestion control, retransmitting any losses.
+export function (s: Stream) write(data: []byte): ()! {
+  s.cmdCh <- quicconnCmd{ kind: quicconnCmdWrite, id: s.streamId, data: data, replyOpen: chan<quicconnOpenReply>(1), replyInt: chan<int>(1) }
+}
+
+// Mark the send half finished (FIN) and block until every queued byte has been
+// acknowledged by the peer.
+export function (s: Stream) finish(): ()! {
+  let done = chan<int>(1)
+  s.cmdCh <- quicconnCmd{ kind: quicconnCmdFinish, id: s.streamId, data: []byte(0), replyOpen: chan<quicconnOpenReply>(1), replyInt: done }
+  <- done
+}
+
+// Read the next reassembled inbound chunk, blocking until data or the FIN
+// arrives. The final chunk carries `fin = true`; read until then to consume the
+// whole stream.
+export function (s: Stream) read(): StreamChunk! {
+  return <- s.recvCh
+}
+
+// The stream's id (RFC 9000 §2.1).
+export function (s: Stream) id(): int {
+  return s.streamId
+}

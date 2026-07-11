@@ -817,3 +817,123 @@ Reassemble the CRYPTO frames in `frames` into the contiguous handshake byte stre
 (RFC 9000 §19.6), ignoring non-CRYPTO frames. Frames may be in any order and may
 overlap; the result is the ordered prefix up to the first gap. `maxLen` bounds the
 buffer. Fails on an over-limit offset or a conflicting overlap.
+
+## Transport / connection
+
+The connection layer (`conn.bit`, RFC 9000 transport + RFC 9002 recovery) turns
+the unreliable UDP datagram flow into reliable, ordered, flow-controlled byte
+streams. It drives the [`std/tls`](tls.md) record-bypass handshake to 1-RTT over
+CRYPTO frames, then carries application data on bidirectional streams with
+per-stream and connection flow control (MAX_DATA / MAX_STREAM_DATA), ACK-based and
+PTO loss recovery, and NewReno congestion control. Each connection is owned by one
+green thread (the loop) that folds in datagrams, application commands, and timer
+ticks one at a time — no shared mutable state, no locks.
+
+ponytail: NewReno only (no CUBIC/BBR); connection migration is connection-id
+basics only (fixed 8-byte ids, no path validation); one connection per socket (no
+server-side demultiplexing across peers); AES-128-GCM + X25519 only, matching
+`packet.bit`'s AEAD.
+
+### `dialQuic(host: string, port: int, serverName: string): Conn!`
+
+Open a QUIC connection to `host:port` and complete the handshake to 1-RTT. Binds
+an ephemeral loopback UDP socket, spawns the reader/timer/loop threads, and blocks
+until the connection is established. `serverName` is the TLS SNI. Fails if the
+handshake does not complete.
+
+### `acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Conn!`
+
+Accept a QUIC connection on the already-bound UDP socket `sock`, using the PEM
+certificate chain (end-entity first) and private key, and complete the handshake.
+Serves exactly one connection. Fails if the handshake does not complete.
+
+### `Conn`
+
+An established QUIC connection. Its methods marshal to the owning loop thread over
+a channel, so the connection has no directly-shared mutable state. Obtain one from
+`dialQuic` or `acceptQuic`.
+
+### `Conn.openStream(): Stream!`
+
+Open a new client-initiated bidirectional stream (RFC 9000 §2.1).
+
+### `Conn.acceptStream(): Stream!`
+
+Accept the next peer-initiated bidirectional stream, blocking until one opens.
+
+### `Conn.close()`
+
+Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
+socket. Best-effort — there is no draining timeout.
+
+### `Stream`
+
+One bidirectional stream on a `Conn`. `write`/`finish` queue outbound data; `read`
+pulls the next reassembled inbound chunk. Obtain one from `openStream` or
+`acceptStream`.
+
+### `Stream.write(data: []byte): ()!`
+
+Queue `data` on the stream. Returns once buffered; the loop delivers it under flow
+control and congestion control, retransmitting any losses.
+
+### `Stream.finish(): ()!`
+
+Mark the send half finished (FIN) and block until every queued byte has been
+acknowledged by the peer.
+
+### `Stream.read(): StreamChunk!`
+
+Read the next reassembled inbound chunk, blocking until data or the FIN arrives.
+The final chunk carries `fin = true`; read until then to consume the whole stream.
+
+### `Stream.id(): int`
+
+The stream's id (RFC 9000 §2.1).
+
+### `StreamChunk`
+
+One contiguous run of received stream bytes delivered to the application, with
+`fin` set on the final run. Its fields are `data: []byte` and `fin: bool`.
+
+```bit
+import { dialQuic, acceptQuic, Conn, Stream, StreamChunk } from "std/quic"
+import { UdpSocket } from "std/net"
+
+// Client: open a bidirectional stream, send a request, and read the reply to the
+// end of stream.
+function request(host: string, port: int, req: []byte): []byte! {
+  let conn = dialQuic(host, port, "example.com")?
+  let s = conn.openStream()?
+  s.write(req)?
+  s.finish()?
+  let reply = []byte(0)
+  let done = false
+  while (!done) {
+    let chunk = s.read()?
+    for b of chunk.data {
+      reply = append(reply, b)
+    }
+    done = chunk.fin
+  }
+  conn.close()
+  return reply
+}
+
+// Server: accept one connection on an already-bound UDP socket, take the client's
+// stream, and drain it to the end.
+function serve(sock: UdpSocket, chainPem: string, keyPem: string): []byte! {
+  let conn = acceptQuic(sock, chainPem, keyPem)?
+  let s = conn.acceptStream()?
+  let body = []byte(0)
+  let done = false
+  while (!done) {
+    let chunk = s.read()?
+    for b of chunk.data {
+      body = append(body, b)
+    }
+    done = chunk.fin
+  }
+  return body
+}
+```
