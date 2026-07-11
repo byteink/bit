@@ -1,0 +1,1251 @@
+// Bit standard library — http2 module, the HTTP/2 connection engine (RFC 9113).
+//
+// `hpack.bit` and `frames.bit` are pure codecs; this file drives them over a
+// live byte transport. A `Conn` runs the connection preface, the SETTINGS
+// exchange, the per-stream state machine (§5.1), HEADERS+CONTINUATION assembly
+// through the HPACK decoder (§6.2), DATA flow control at both the connection and
+// stream level (§6.9), request/response multiplexing over concurrent streams,
+// and the graceful/abrupt shutdown frames GOAWAY (§6.8) and RST_STREAM (§6.4).
+// There is no TLS here — the `Transport` is any bidirectional byte stream, so a
+// `Conn` is exercised over an in-memory pipe just as well as a socket.
+//
+// Concurrency model — a Conn is an **actor**. Three green threads run per Conn:
+// a *reader* that turns transport bytes into whole frames, a *writer* that drains
+// queued frame bytes to the transport, and the *loop* that owns every piece of
+// mutable connection state (the stream table, the flow-control windows, the HPACK
+// encoder/decoder, the settings). No other thread touches that state; the public
+// API and the reader/writer communicate with the loop only through channels, so
+// there is no shared mutable memory and thus no data race (SPEC §16.4). Because
+// the single loop encodes outbound header blocks and decodes inbound ones in wire
+// order, the two peers' HPACK dynamic tables stay in lock-step for free.
+//
+// This file is part of the flat `std/http2` module and shares one namespace with
+// `hpack.bit` and `frames.bit`; every unexported helper here is prefixed
+// `h2conn` so the three files never collide.
+
+// --- the byte transport ------------------------------------------------------
+
+// An abstract bidirectional byte stream. `read` returns up to `n` bytes and an
+// empty slice at end-of-stream; `write` delivers every byte of its argument or
+// fails; `close` releases the underlying stream. A `Conn` needs nothing else, so
+// the same engine runs over a socket (`std/net`) or an in-memory pipe.
+export struct Transport {
+  export read: (int) => []byte,
+  export write: ([]byte) => ()!,
+  export shutdown: () => (),
+}
+
+// Bundle three closures into a `Transport`. `shutdown` releases the stream (the
+// socket `close`, an EOF signal on a pipe); it is named `shutdown` rather than
+// `close` to avoid shadowing the `close` channel builtin.
+export function newTransport(read: (int) => []byte, write: ([]byte) => ()!, shutdown: () => ()): Transport {
+  return Transport{ read: read, write: write, shutdown: shutdown }
+}
+
+// --- configuration -----------------------------------------------------------
+
+// The local half of the SETTINGS a `Conn` advertises: `initialWindowSize` is the
+// per-stream flow-control window we grant the peer (SETTINGS_INITIAL_WINDOW_SIZE),
+// `maxFrameSize` the largest frame payload we accept (SETTINGS_MAX_FRAME_SIZE),
+// and `headerTableSize` our HPACK dynamic-table bound (SETTINGS_HEADER_TABLE_SIZE).
+export struct Config {
+  export initialWindowSize: int,
+  export maxFrameSize: int,
+  export headerTableSize: int,
+}
+
+// The RFC-default configuration: a 65535-byte initial window, a 16384-byte max
+// frame size, and a 4096-byte header table.
+export function defaultConfig(): Config {
+  return Config{ initialWindowSize: 65535, maxFrameSize: defaultMaxFrameSize, headerTableSize: 4096 }
+}
+
+// --- request / response ------------------------------------------------------
+
+// An HTTP/2 request: the `:method`/`:scheme`/`:authority`/`:path` pseudo-headers
+// as named fields, the remaining regular `headers`, and the `body`.
+export struct Request {
+  export method: string,
+  export scheme: string,
+  export authority: string,
+  export path: string,
+  export headers: []HeaderField,
+  export body: []byte,
+}
+
+// An HTTP/2 response: the numeric `:status`, the regular `headers`, and the
+// `body`. A `status` of 0 handed back from a `serve` handler is the signal to
+// abort the stream with RST_STREAM (CANCEL) instead of answering.
+export struct Response {
+  export status: int,
+  export headers: []HeaderField,
+  export body: []byte,
+}
+
+// A GET-style request with empty headers and no body.
+export function newRequest(method: string, authority: string, path: string): Request {
+  return Request{ method: method, scheme: "https", authority: authority, path: path, headers: []HeaderField(0), body: []byte(0) }
+}
+
+// A response with a status and a body and no extra headers.
+export function newResponse(status: int, body: []byte): Response {
+  return Response{ status: status, headers: []HeaderField(0), body: body }
+}
+
+// The value of header `name` (case-sensitive, as HTTP/2 requires lower-case
+// field names), or "" if absent.
+export function getHeader(headers: []HeaderField, name: string): string {
+  for h of headers {
+    if (h.name == name) {
+      return h.value
+    }
+  }
+  return ""
+}
+
+// --- the connection handle ---------------------------------------------------
+
+// A live HTTP/2 connection. Opaque: the mutable protocol state lives entirely in
+// the loop thread, and every operation is a method that talks to it over a
+// channel. Create one with `connect` (client) or `accept` (server).
+export struct Conn {
+  isClient: bool,
+  cmdCh: chan<h2connCmd>,
+  acceptCh: chan<h2connAccept>,
+}
+
+// --- connection setup --------------------------------------------------------
+
+// The 24-byte client connection preface (RFC 9113 §3.4). The client sends it,
+// then its initial SETTINGS; the server reads and validates it before anything
+// else.
+const h2connPreface: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+// Dial: run the client side of the preface (magic + SETTINGS) over `t` and start
+// the connection. The returned `Conn` is ready for `roundTrip`.
+export function connect(t: Transport, cfg: Config): Conn! {
+  t.write([]byte(h2connPreface))?
+  let r = h2connNewFrameReader(t)
+  return h2connStart(t, cfg, true, r)?
+}
+
+// Answer: read and validate the client preface over `t`, then start the
+// connection. Drive the returned `Conn` with `serve`.
+export function accept(t: Transport, cfg: Config): Conn! {
+  let r = h2connNewFrameReader(t)
+  let magic = h2connReadExact(r, len(h2connPreface))?
+  if (!h2connBytesEqual(magic, []byte(h2connPreface))) {
+    fail newError("http2: malformed client connection preface")
+  }
+  return h2connStart(t, cfg, false, r)?
+}
+
+// Common startup: send our SETTINGS, allocate the channels, build the loop-owned
+// state, and spawn the reader, writer, and loop threads.
+function h2connStart(t: Transport, cfg: Config, isClient: bool, r: h2connFrameReader): Conn! {
+  t.write(encodeSettings(h2connOurSettings(cfg))?)?
+
+  let inCh = chan<h2connEvent>(64)
+  let cmdCh = chan<h2connCmd>(64)
+  let writeCh = chan<h2connOut>(256)
+  let acceptCh = chan<h2connAccept>(256)
+  let readyCh = chan<int>(1)
+
+  let st = h2connState{
+    isClient: isClient,
+    inCh: inCh,
+    cmdCh: cmdCh,
+    writeCh: writeCh,
+    acceptCh: acceptCh,
+    readyCh: readyCh,
+    settingsSeen: false,
+    enc: newEncoderConfig(cfg.headerTableSize, true),
+    dec: newDecoderConfig(cfg.headerTableSize),
+    streams: map<int, h2connStream>(),
+    present: map<int, int>(),
+    nextStreamId: h2connFirstId(isClient),
+    lastPeerStreamId: 0,
+    connSendWindow: 65535,
+    connRecvWindow: 65535,
+    peerInitialWindow: 65535,
+    ourInitialWindow: cfg.initialWindowSize,
+    peerMaxFrameSize: defaultMaxFrameSize,
+    ourMaxFrameSize: cfg.maxFrameSize,
+    lastStreamId: 0,
+    contStream: 0,
+    contBuf: []byte(0),
+    contEndStream: false,
+    contNewStream: false,
+    goawaySent: false,
+    goawayReceived: false,
+    running: true,
+    activeStreams: 0,
+  }
+
+  spawn h2connWriter(t, writeCh)
+  spawn h2connReader(r, inCh, cfg.maxFrameSize)
+  spawn h2connLoop(st)
+  // Complete the SETTINGS handshake before handing the connection back: block
+  // until the loop has processed the peer's initial SETTINGS, so the peer's
+  // window and frame-size limits are known before the first request is sent.
+  <- readyCh
+  return Conn{ isClient: isClient, cmdCh: cmdCh, acceptCh: acceptCh }
+}
+
+// The first stream id this endpoint allocates: clients use odd ids from 1, and a
+// server would use even ids for push (unused here, but kept correct).
+function h2connFirstId(isClient: bool): int {
+  if (isClient) {
+    return 1
+  }
+  return 2
+}
+
+// Our advertised SETTINGS built from `cfg`.
+function h2connOurSettings(cfg: Config): SettingsFrame {
+  let list = []Setting(0)
+  list = append(list, Setting{ id: settingsHeaderTableSize, value: cfg.headerTableSize })
+  list = append(list, Setting{ id: settingsInitialWindowSize, value: cfg.initialWindowSize })
+  list = append(list, Setting{ id: settingsMaxFrameSize, value: cfg.maxFrameSize })
+  return SettingsFrame{ ack: false, settings: list }
+}
+
+// --- loop-owned state --------------------------------------------------------
+
+// Stream states (RFC 9113 §5.1). The reserved-for-push states are omitted.
+const h2stIdle: int = 0
+const h2stOpen: int = 1
+const h2stHCLocal: int = 2
+const h2stHCRemote: int = 3
+const h2stClosed: int = 4
+
+// One multiplexed stream. Only the loop thread touches this. `sendWindow` is how
+// many DATA bytes we may still send (the peer's receive window); `recvWindow` how
+// many the peer may still send us. `pendingData`/`pendingEnd`/`hasPending` hold
+// body bytes waiting on flow-control credit. `replyCh` is where a client stream's
+// completed `Response` (or error) is delivered to the waiting `roundTrip`.
+struct h2connStream {
+  id: int,
+  state: int,
+  sendWindow: int,
+  recvWindow: int,
+  recvHeaders: []HeaderField,
+  headersDone: bool,
+  recvBody: []byte,
+  recvEnded: bool,
+  pendingData: []byte,
+  pendingEnd: bool,
+  hasPending: bool,
+  replyCh: chan<h2connMsg>,
+  replied: bool,
+  delivered: bool,
+  reset: bool,
+  errorCode: int,
+}
+
+// The whole connection state, owned exclusively by the loop thread.
+struct h2connState {
+  isClient: bool,
+  inCh: chan<h2connEvent>,
+  cmdCh: chan<h2connCmd>,
+  writeCh: chan<h2connOut>,
+  acceptCh: chan<h2connAccept>,
+  readyCh: chan<int>,
+  settingsSeen: bool,
+  enc: Encoder,
+  dec: Decoder,
+  streams: map<int, h2connStream>,
+  present: map<int, int>,
+  nextStreamId: int,
+  lastPeerStreamId: int,
+  connSendWindow: int,
+  connRecvWindow: int,
+  peerInitialWindow: int,
+  ourInitialWindow: int,
+  peerMaxFrameSize: int,
+  ourMaxFrameSize: int,
+  lastStreamId: int,
+  contStream: int,
+  contBuf: []byte,
+  contEndStream: bool,
+  contNewStream: bool,
+  goawaySent: bool,
+  goawayReceived: bool,
+  running: bool,
+  activeStreams: int,
+}
+
+// A fresh stream in the idle state.
+function h2connNewStream(id: int, sendWindow: int, recvWindow: int, replyCh: chan<h2connMsg>): h2connStream {
+  return h2connStream{
+    id: id,
+    state: h2stIdle,
+    sendWindow: sendWindow,
+    recvWindow: recvWindow,
+    recvHeaders: []HeaderField(0),
+    headersDone: false,
+    recvBody: []byte(0),
+    recvEnded: false,
+    pendingData: []byte(0),
+    pendingEnd: false,
+    hasPending: false,
+    replyCh: replyCh,
+    replied: false,
+    delivered: false,
+    reset: false,
+    errorCode: 0,
+  }
+}
+
+// --- channel message types ---------------------------------------------------
+
+// An inbound event from the reader thread: a whole `frame`, or `eof` when the
+// transport closed.
+struct h2connEvent {
+  eof: bool,
+  frame: Frame,
+}
+
+// A byte buffer queued for the writer thread; `stop` tells it to close and exit.
+struct h2connOut {
+  stop: bool,
+  data: []byte,
+}
+
+// Command kinds sent from the public API to the loop.
+const h2cmdOpen: int = 1
+const h2cmdRespond: int = 2
+const h2cmdGoaway: int = 3
+const h2cmdReset: int = 4
+
+// A command to the loop: open a client stream, answer a server stream, send a
+// GOAWAY, or reset a stream. Unused fields carry zero values.
+struct h2connCmd {
+  kind: int,
+  request: Request,
+  response: Response,
+  streamId: int,
+  errorCode: int,
+  replyCh: chan<h2connMsg>,
+}
+
+// The result delivered to a waiting `roundTrip`: `ok` with a `response`, or a
+// failure with `errMsg`.
+struct h2connMsg {
+  ok: bool,
+  response: Response,
+  errMsg: string,
+}
+
+// A fully-received request handed to the `serve` loop; `stop` ends the loop.
+struct h2connAccept {
+  stop: bool,
+  streamId: int,
+  request: Request,
+}
+
+// --- the three threads -------------------------------------------------------
+
+// Reader thread: read whole frames off the transport and forward them; on EOF or
+// a framing error, emit one final `eof` event and stop.
+function h2connReader(r: h2connFrameReader, inCh: chan<h2connEvent>, maxFrameSize: int) {
+  while (true) {
+    let fr = h2connNextFrame(r, maxFrameSize) catch e {
+      inCh <- h2connEvent{ eof: true, frame: h2connZeroFrame() }
+      return
+    }
+    inCh <- h2connEvent{ eof: false, frame: fr }
+  }
+}
+
+// Writer thread: drain queued frame bytes to the transport in order; a `stop`
+// message closes the transport and ends the thread.
+function h2connWriter(t: Transport, ch: chan<h2connOut>) {
+  while (true) {
+    let out = <- ch
+    if (out.stop) {
+      t.shutdown()
+      return
+    }
+    t.write(out.data) catch e {
+      return
+    }
+  }
+}
+
+// Loop thread: the sole owner of `st`. Serially fold in one inbound frame or one
+// command at a time until the transport closes.
+function h2connLoop(st: h2connState) {
+  while (st.running) {
+    select {
+      case ev = <- st.inCh:
+        h2connHandleEvent(st, ev)
+      case cmd = <- st.cmdCh:
+        h2connHandleCmd(st, cmd)
+    }
+  }
+}
+
+// --- inbound event handling --------------------------------------------------
+
+function h2connHandleEvent(st: h2connState, ev: h2connEvent) {
+  if (ev.eof) {
+    st.running = false
+    h2connFailAll(st, "http2: connection closed")
+    return
+  }
+  h2connHandleFrame(st, ev.frame)
+}
+
+// Dispatch one frame. A header block in progress (`contStream != 0`) may only be
+// continued by a CONTINUATION on the same stream — any other frame is a
+// connection error (RFC 9113 §6.2).
+function h2connHandleFrame(st: h2connState, f: Frame) {
+  let ft = f.header.ftype
+  if (st.contStream != 0 && ft != frameContinuation) {
+    h2connConnError(st, errorProtocolError, "http2: expected CONTINUATION")
+    return
+  }
+  if (ft == frameSettings) {
+    h2connOnSettings(st, f)
+    return
+  }
+  if (ft == frameHeaders) {
+    h2connOnHeaders(st, f)
+    return
+  }
+  if (ft == frameContinuation) {
+    h2connOnContinuation(st, f)
+    return
+  }
+  if (ft == frameData) {
+    h2connOnData(st, f)
+    return
+  }
+  if (ft == frameWindowUpdate) {
+    h2connOnWindowUpdate(st, f)
+    return
+  }
+  if (ft == frameRstStream) {
+    h2connOnRstStream(st, f)
+    return
+  }
+  if (ft == frameGoaway) {
+    h2connOnGoaway(st, f)
+    return
+  }
+  if (ft == framePing) {
+    h2connOnPing(st, f)
+    return
+  }
+  if (ft == framePushPromise) {
+    h2connConnError(st, errorProtocolError, "http2: unexpected PUSH_PROMISE")
+    return
+  }
+  // PRIORITY and unknown frame types are accepted and ignored (RFC 9113 §4.1).
+}
+
+function h2connOnSettings(st: h2connState, f: Frame) {
+  let sf = decodeSettings(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad SETTINGS")
+    return
+  }
+  if (sf.ack) {
+    return
+  }
+  for s of sf.settings {
+    h2connApplySetting(st, s.id, s.value)
+  }
+  h2connSendSettingsAck(st)
+  // Release `h2connStart` once the peer's opening SETTINGS is in effect.
+  if (!st.settingsSeen) {
+    st.settingsSeen = true
+    st.readyCh <- 1
+  }
+}
+
+// Apply one peer SETTINGS parameter. A changed initial window size retroactively
+// shifts every open stream's send window by the delta (RFC 9113 §6.9.2), after
+// which any stream that was blocked may be able to make progress.
+function h2connApplySetting(st: h2connState, id: int, value: int) {
+  if (id == settingsInitialWindowSize) {
+    let delta = value - st.peerInitialWindow
+    st.peerInitialWindow = value
+    for (k, s) of st.streams {
+      s.sendWindow = s.sendWindow + delta
+      h2connFlushStream(st, s)
+    }
+    return
+  }
+  if (id == settingsMaxFrameSize) {
+    st.peerMaxFrameSize = value
+    return
+  }
+  if (id == settingsHeaderTableSize) {
+    st.enc.changeTableSize(value)
+    return
+  }
+  // ENABLE_PUSH / MAX_CONCURRENT_STREAMS / MAX_HEADER_LIST_SIZE: accepted, no-op.
+}
+
+function h2connOnHeaders(st: h2connState, f: Frame) {
+  let hf = decodeHeaders(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad HEADERS")
+    return
+  }
+  st.contStream = hf.streamId
+  st.contBuf = hf.blockFragment
+  st.contEndStream = hf.endStream
+  st.contNewStream = false
+  if (!st.isClient && st.present[hf.streamId] == 0) {
+    st.contNewStream = true
+  }
+  if (hf.endHeaders) {
+    h2connFinishHeaders(st)
+  }
+}
+
+function h2connOnContinuation(st: h2connState, f: Frame) {
+  if (st.contStream == 0 || f.header.streamId != st.contStream) {
+    h2connConnError(st, errorProtocolError, "http2: unexpected CONTINUATION")
+    return
+  }
+  let cf = decodeContinuation(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad CONTINUATION")
+    return
+  }
+  st.contBuf = h2connAppendBytes(st.contBuf, cf.blockFragment)
+  if (cf.endHeaders) {
+    h2connFinishHeaders(st)
+  }
+}
+
+// A header block is complete: HPACK-decode it against the shared decoder and hand
+// the fields to the client or server path.
+function h2connFinishHeaders(st: h2connState) {
+  let streamId = st.contStream
+  let block = st.contBuf
+  let endStream = st.contEndStream
+  let isNew = st.contNewStream
+  st.contStream = 0
+  st.contBuf = []byte(0)
+  st.contEndStream = false
+  st.contNewStream = false
+  let fields = st.dec.decode(block) catch e {
+    h2connConnError(st, errorCompressionError, "http2: HPACK decode failed")
+    return
+  }
+  if (st.isClient) {
+    h2connClientHeaders(st, streamId, fields, endStream)
+    return
+  }
+  h2connServerHeaders(st, streamId, fields, endStream, isNew)
+}
+
+function h2connServerHeaders(st: h2connState, streamId: int, fields: []HeaderField, endStream: bool, isNew: bool) {
+  if (isNew) {
+    if (streamId <= st.lastPeerStreamId || streamId % 2 == 0) {
+      h2connConnError(st, errorProtocolError, "http2: illegal new stream id")
+      return
+    }
+    st.lastPeerStreamId = streamId
+    let s = h2connNewStream(streamId, st.peerInitialWindow, st.ourInitialWindow, h2connDummyReply())
+    s.state = h2stOpen
+    s.recvHeaders = fields
+    s.headersDone = true
+    st.streams[streamId] = s
+    st.present[streamId] = 1
+    st.activeStreams = st.activeStreams + 1
+    if (endStream) {
+      s.recvEnded = true
+      s.state = h2stHCRemote
+      h2connDeliverRequest(st, s)
+    }
+    return
+  }
+  if (st.present[streamId] == 0) {
+    return
+  }
+  let s = st.streams[streamId]
+  s.recvHeaders = h2connMergeHeaders(s.recvHeaders, fields)
+  if (endStream) {
+    s.recvEnded = true
+    h2connRecvEndTransition(st, s)
+    h2connDeliverRequest(st, s)
+  }
+}
+
+function h2connClientHeaders(st: h2connState, streamId: int, fields: []HeaderField, endStream: bool) {
+  if (st.present[streamId] == 0) {
+    return
+  }
+  let s = st.streams[streamId]
+  s.recvHeaders = h2connMergeHeaders(s.recvHeaders, fields)
+  s.headersDone = true
+  if (endStream) {
+    s.recvEnded = true
+    h2connRecvEndTransition(st, s)
+    h2connDeliverResponse(st, s)
+  }
+}
+
+function h2connOnData(st: h2connState, f: Frame) {
+  let df = decodeData(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad DATA")
+    return
+  }
+  if (st.present[df.streamId] == 0) {
+    h2connStreamError(st, df.streamId, errorStreamClosed)
+    return
+  }
+  let s = st.streams[df.streamId]
+  if (s.state == h2stClosed || s.state == h2stHCRemote || s.recvEnded) {
+    h2connStreamError(st, df.streamId, errorStreamClosed)
+    return
+  }
+  let n = len(df.data)
+  if (n > st.connRecvWindow || n > s.recvWindow) {
+    h2connConnError(st, errorFlowControlError, "http2: flow-control window exceeded")
+    return
+  }
+  s.recvBody = h2connAppendBytes(s.recvBody, df.data)
+  // We buffer the whole body, so the bytes are "consumed" the instant they land;
+  // replenish the windows and tell the peer with WINDOW_UPDATE so it may send on.
+  if (n > 0) {
+    h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: 0, increment: n })
+    if (!df.endStream) {
+      h2connSendWindowUpdate(st, WindowUpdateFrame{ streamId: df.streamId, increment: n })
+    }
+  }
+  if (df.endStream) {
+    s.recvEnded = true
+    h2connRecvEndTransition(st, s)
+    if (st.isClient) {
+      h2connDeliverResponse(st, s)
+      return
+    }
+    h2connDeliverRequest(st, s)
+  }
+}
+
+function h2connOnWindowUpdate(st: h2connState, f: Frame) {
+  let wu = decodeWindowUpdate(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad WINDOW_UPDATE")
+    return
+  }
+  if (wu.increment == 0) {
+    if (wu.streamId == 0) {
+      h2connConnError(st, errorProtocolError, "http2: zero connection window increment")
+      return
+    }
+    h2connStreamError(st, wu.streamId, errorProtocolError)
+    return
+  }
+  if (wu.streamId == 0) {
+    st.connSendWindow = st.connSendWindow + wu.increment
+    for (k, s) of st.streams {
+      h2connFlushStream(st, s)
+    }
+    return
+  }
+  if (st.present[wu.streamId] == 0) {
+    return
+  }
+  let s = st.streams[wu.streamId]
+  s.sendWindow = s.sendWindow + wu.increment
+  h2connFlushStream(st, s)
+}
+
+function h2connOnRstStream(st: h2connState, f: Frame) {
+  let rf = decodeRstStream(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad RST_STREAM")
+    return
+  }
+  if (st.present[rf.streamId] == 0) {
+    return
+  }
+  let s = st.streams[rf.streamId]
+  h2connFailStreamCode(st, s, rf.errorCode)
+}
+
+function h2connOnGoaway(st: h2connState, f: Frame) {
+  let gf = decodeGoaway(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad GOAWAY")
+    return
+  }
+  st.goawayReceived = true
+  st.lastStreamId = gf.lastStreamId
+}
+
+function h2connOnPing(st: h2connState, f: Frame) {
+  let pf = decodePing(f) catch e {
+    h2connConnError(st, errorProtocolError, "http2: bad PING")
+    return
+  }
+  if (!pf.ack) {
+    h2connSendPing(st, PingFrame{ ack: true, data: pf.data })
+  }
+}
+
+// --- command handling --------------------------------------------------------
+
+function h2connHandleCmd(st: h2connState, cmd: h2connCmd) {
+  if (cmd.kind == h2cmdOpen) {
+    h2connCmdOpen(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdRespond) {
+    h2connCmdRespond(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdGoaway) {
+    h2connCmdGoaway(st, cmd)
+    return
+  }
+  if (cmd.kind == h2cmdReset) {
+    h2connCmdReset(st, cmd)
+    return
+  }
+}
+
+// Open a client stream for `cmd.request`: allocate the next odd id, send its
+// header block, and queue any body for flow-controlled delivery.
+function h2connCmdOpen(st: h2connState, cmd: h2connCmd) {
+  if (st.goawaySent || st.goawayReceived || !st.running) {
+    cmd.replyCh <- h2connMsg{ ok: false, response: h2connZeroResponse(), errMsg: "http2: connection is closing" }
+    return
+  }
+  let id = st.nextStreamId
+  st.nextStreamId = st.nextStreamId + 2
+  let hasBody = len(cmd.request.body) > 0
+  let s = h2connNewStream(id, st.peerInitialWindow, st.ourInitialWindow, cmd.replyCh)
+  if (hasBody) {
+    s.state = h2stOpen
+  } else {
+    s.state = h2stHCLocal
+  }
+  st.streams[id] = s
+  st.present[id] = 1
+  st.activeStreams = st.activeStreams + 1
+
+  let block = st.enc.encode(h2connRequestFields(cmd.request))
+  h2connSendHeaderBlock(st, id, block, !hasBody)
+  if (hasBody) {
+    s.pendingData = cmd.request.body
+    s.pendingEnd = true
+    s.hasPending = true
+    h2connFlushStream(st, s)
+  }
+}
+
+// Answer a server stream. A zero status is the handler's request to abort.
+function h2connCmdRespond(st: h2connState, cmd: h2connCmd) {
+  if (st.present[cmd.streamId] == 0) {
+    return
+  }
+  let s = st.streams[cmd.streamId]
+  if (s.state == h2stClosed || s.reset) {
+    return
+  }
+  if (cmd.response.status == 0) {
+    h2connSendRstStream(st, RstStreamFrame{ streamId: cmd.streamId, errorCode: errorCancel })
+    h2connCloseStream(st, s)
+    return
+  }
+  let hasBody = len(cmd.response.body) > 0
+  let block = st.enc.encode(h2connResponseFields(cmd.response))
+  h2connSendHeaderBlock(st, cmd.streamId, block, !hasBody)
+  if (hasBody) {
+    s.pendingData = cmd.response.body
+    s.pendingEnd = true
+    s.hasPending = true
+    h2connFlushStream(st, s)
+    return
+  }
+  h2connLocalEnd(st, s)
+}
+
+function h2connCmdGoaway(st: h2connState, cmd: h2connCmd) {
+  if (st.goawaySent) {
+    return
+  }
+  st.goawaySent = true
+  h2connSendGoaway(st, GoawayFrame{ lastStreamId: st.lastPeerStreamId, errorCode: cmd.errorCode, debugData: []byte(0) })
+}
+
+function h2connCmdReset(st: h2connState, cmd: h2connCmd) {
+  h2connSendRstStream(st, RstStreamFrame{ streamId: cmd.streamId, errorCode: cmd.errorCode })
+  if (st.present[cmd.streamId] == 0) {
+    return
+  }
+  let s = st.streams[cmd.streamId]
+  h2connCloseStream(st, s)
+}
+
+// --- flow-controlled sending -------------------------------------------------
+
+// Send as much of a stream's pending body as the stream and connection windows
+// allow, in frames no larger than the peer's max frame size. Stops when the body
+// drains (ending the stream if END_STREAM was requested) or a window is
+// exhausted — a later WINDOW_UPDATE resumes it.
+function h2connFlushStream(st: h2connState, s: h2connStream) {
+  while (s.hasPending) {
+    let avail = s.sendWindow
+    if (st.connSendWindow < avail) {
+      avail = st.connSendWindow
+    }
+    if (avail <= 0) {
+      return
+    }
+    let n = len(s.pendingData)
+    if (n > avail) {
+      n = avail
+    }
+    if (n > st.peerMaxFrameSize) {
+      n = st.peerMaxFrameSize
+    }
+    let chunk = s.pendingData[0:n]
+    let last = n == len(s.pendingData) && s.pendingEnd
+    h2connSendData(st, DataFrame{ streamId: s.id, data: chunk, endStream: last, padLength: 0 - 1 })
+    s.pendingData = s.pendingData[n:len(s.pendingData)]
+    s.sendWindow = s.sendWindow - n
+    st.connSendWindow = st.connSendWindow - n
+    if (len(s.pendingData) == 0) {
+      s.hasPending = false
+      if (s.pendingEnd) {
+        h2connLocalEnd(st, s)
+      }
+    }
+  }
+}
+
+// --- stream state transitions ------------------------------------------------
+
+// We sent END_STREAM: open -> half-closed(local); half-closed(remote) -> closed.
+function h2connLocalEnd(st: h2connState, s: h2connStream) {
+  if (s.state == h2stHCRemote) {
+    h2connCloseStream(st, s)
+    return
+  }
+  s.state = h2stHCLocal
+}
+
+// The peer sent END_STREAM: open -> half-closed(remote); half-closed(local) ->
+// closed.
+function h2connRecvEndTransition(st: h2connState, s: h2connStream) {
+  if (s.state == h2stHCLocal) {
+    h2connCloseStream(st, s)
+    return
+  }
+  if (s.state == h2stOpen) {
+    s.state = h2stHCRemote
+  }
+}
+
+function h2connCloseStream(st: h2connState, s: h2connStream) {
+  if (s.state != h2stClosed) {
+    s.state = h2stClosed
+    st.activeStreams = st.activeStreams - 1
+  }
+}
+
+// --- delivering completed messages -------------------------------------------
+
+function h2connDeliverResponse(st: h2connState, s: h2connStream) {
+  if (s.replied) {
+    return
+  }
+  s.replied = true
+  let res = h2connBuildResponse(s.recvHeaders, s.recvBody)
+  s.replyCh <- h2connMsg{ ok: true, response: res, errMsg: "" }
+  h2connCloseStream(st, s)
+}
+
+function h2connDeliverRequest(st: h2connState, s: h2connStream) {
+  if (s.delivered) {
+    return
+  }
+  s.delivered = true
+  let req = h2connBuildRequest(s.recvHeaders)
+  req.body = s.recvBody
+  st.acceptCh <- h2connAccept{ stop: false, streamId: s.id, request: req }
+}
+
+// --- error paths -------------------------------------------------------------
+
+// Reset a single stream: tell the peer with RST_STREAM and tear our side down.
+function h2connStreamError(st: h2connState, streamId: int, code: int) {
+  h2connSendRstStream(st, RstStreamFrame{ streamId: streamId, errorCode: code })
+  if (st.present[streamId] == 0) {
+    return
+  }
+  let s = st.streams[streamId]
+  h2connFailStreamCode(st, s, code)
+}
+
+// Fail a stream we already hold: close it, and if a client `roundTrip` is waiting
+// on it, hand back an error.
+function h2connFailStreamCode(st: h2connState, s: h2connStream, code: int) {
+  if (s.state == h2stClosed) {
+    return
+  }
+  s.reset = true
+  s.errorCode = code
+  h2connCloseStream(st, s)
+  if (st.isClient && !s.replied) {
+    s.replied = true
+    s.replyCh <- h2connMsg{ ok: false, response: h2connZeroResponse(), errMsg: "http2: stream reset by peer (code " + h2connItoa(code) + ")" }
+  }
+}
+
+// A connection error: emit GOAWAY once and fail every waiting stream.
+function h2connConnError(st: h2connState, code: int, msg: string) {
+  if (!st.goawaySent) {
+    st.goawaySent = true
+    h2connSendGoaway(st, GoawayFrame{ lastStreamId: st.lastPeerStreamId, errorCode: code, debugData: []byte(msg) })
+  }
+  h2connFailAll(st, msg)
+}
+
+// Deliver `msg` as an error to every client stream still awaiting a response.
+function h2connFailAll(st: h2connState, msg: string) {
+  for (k, s) of st.streams {
+    if (st.isClient && !s.replied && s.state != h2stClosed) {
+      s.replied = true
+      s.replyCh <- h2connMsg{ ok: false, response: h2connZeroResponse(), errMsg: msg }
+    }
+  }
+}
+
+// --- outbound frame helpers --------------------------------------------------
+//
+// Each wrapper encodes a typed frame and queues its bytes for the writer. The
+// `catch` arms are unreachable — every frame here is built from validated fields
+// — so a failed encode drops the frame rather than crashing the loop.
+
+function h2connEnqueue(st: h2connState, b: []byte) {
+  st.writeCh <- h2connOut{ stop: false, data: b }
+}
+
+function h2connSendHeaders(st: h2connState, f: HeadersFrame) {
+  let b = encodeHeaders(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendContinuation(st: h2connState, f: ContinuationFrame) {
+  let b = encodeContinuation(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendData(st: h2connState, f: DataFrame) {
+  let b = encodeData(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendWindowUpdate(st: h2connState, f: WindowUpdateFrame) {
+  let b = encodeWindowUpdate(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendRstStream(st: h2connState, f: RstStreamFrame) {
+  let b = encodeRstStream(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendGoaway(st: h2connState, f: GoawayFrame) {
+  let b = encodeGoaway(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendPing(st: h2connState, f: PingFrame) {
+  let b = encodePing(f) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+function h2connSendSettingsAck(st: h2connState) {
+  let b = encodeSettings(SettingsFrame{ ack: true, settings: []Setting(0) }) catch e {
+    return
+  }
+  h2connEnqueue(st, b)
+}
+
+// Send a header block as a HEADERS frame, splitting into CONTINUATION frames when
+// it does not fit one frame (RFC 9113 §6.2). END_STREAM rides the HEADERS frame;
+// END_HEADERS rides the final fragment.
+function h2connSendHeaderBlock(st: h2connState, streamId: int, block: []byte, endStream: bool) {
+  let maxf = st.peerMaxFrameSize
+  if (maxf <= 0) {
+    maxf = defaultMaxFrameSize
+  }
+  if (len(block) <= maxf) {
+    h2connSendHeaders(st, HeadersFrame{ streamId: streamId, blockFragment: block, endStream: endStream, endHeaders: true, padLength: 0 - 1, hasPriority: false, exclusive: false, streamDependency: 0, weight: 0 })
+    return
+  }
+  h2connSendHeaders(st, HeadersFrame{ streamId: streamId, blockFragment: block[0:maxf], endStream: endStream, endHeaders: false, padLength: 0 - 1, hasPriority: false, exclusive: false, streamDependency: 0, weight: 0 })
+  let pos = maxf
+  while (pos < len(block)) {
+    let end = pos + maxf
+    if (end > len(block)) {
+      end = len(block)
+    }
+    let last = end == len(block)
+    h2connSendContinuation(st, ContinuationFrame{ streamId: streamId, blockFragment: block[pos:end], endHeaders: last })
+    pos = end
+  }
+}
+
+// --- header <-> struct mapping -----------------------------------------------
+
+function h2connRequestFields(req: Request): []HeaderField {
+  let fields = []HeaderField(0)
+  fields = append(fields, HeaderField{ name: ":method", value: req.method, sensitive: false })
+  fields = append(fields, HeaderField{ name: ":scheme", value: req.scheme, sensitive: false })
+  fields = append(fields, HeaderField{ name: ":authority", value: req.authority, sensitive: false })
+  fields = append(fields, HeaderField{ name: ":path", value: req.path, sensitive: false })
+  for h of req.headers {
+    fields = append(fields, h)
+  }
+  return fields
+}
+
+function h2connResponseFields(res: Response): []HeaderField {
+  let fields = []HeaderField(0)
+  fields = append(fields, HeaderField{ name: ":status", value: h2connItoa(res.status), sensitive: false })
+  for h of res.headers {
+    fields = append(fields, h)
+  }
+  return fields
+}
+
+function h2connBuildRequest(fields: []HeaderField): Request {
+  let method = ""
+  let scheme = ""
+  let authority = ""
+  let path = ""
+  let hs = []HeaderField(0)
+  for h of fields {
+    if (h.name == ":method") {
+      method = h.value
+    } else if (h.name == ":scheme") {
+      scheme = h.value
+    } else if (h.name == ":authority") {
+      authority = h.value
+    } else if (h.name == ":path") {
+      path = h.value
+    } else {
+      hs = append(hs, h)
+    }
+  }
+  return Request{ method: method, scheme: scheme, authority: authority, path: path, headers: hs, body: []byte(0) }
+}
+
+function h2connBuildResponse(fields: []HeaderField, body: []byte): Response {
+  let status = 0
+  let hs = []HeaderField(0)
+  for h of fields {
+    if (h.name == ":status") {
+      status = h2connAtoi(h.value)
+    } else {
+      hs = append(hs, h)
+    }
+  }
+  return Response{ status: status, headers: hs, body: body }
+}
+
+function h2connMergeHeaders(a: []HeaderField, b: []HeaderField): []HeaderField {
+  let out = a
+  for h of b {
+    out = append(out, h)
+  }
+  return out
+}
+
+// --- buffered frame reader ---------------------------------------------------
+
+// Reads whole frames off a `Transport`, buffering the partial tail between reads.
+// Used only by the reader thread (and, before it starts, the preface read), so
+// its `buf` has a single owner.
+struct h2connFrameReader {
+  read: (int) => []byte,
+  buf: []byte,
+}
+
+function h2connNewFrameReader(t: Transport): h2connFrameReader {
+  return h2connFrameReader{ read: t.read, buf: []byte(0) }
+}
+
+// Ensure at least `need` bytes are buffered, reading from the transport. Fails at
+// end-of-stream.
+function h2connFill(r: h2connFrameReader, need: int): ()! {
+  while (len(r.buf) < need) {
+    let chunk = r.read(4096)
+    if (len(chunk) == 0) {
+      fail newError("http2: connection closed")
+    }
+    r.buf = h2connAppendBytes(r.buf, chunk)
+  }
+}
+
+// Return the next `n` bytes as a fresh slice and advance. The copy keeps the
+// returned bytes stable as later reads mutate the buffer.
+function h2connReadExact(r: h2connFrameReader, n: int): []byte! {
+  h2connFill(r, n)?
+  let out = h2connCopyN(r.buf, n)
+  r.buf = r.buf[n:len(r.buf)]
+  return out
+}
+
+// Read one whole frame, rejecting any whose declared length exceeds `maxFrameSize`
+// (our advertised SETTINGS_MAX_FRAME_SIZE).
+function h2connNextFrame(r: h2connFrameReader, maxFrameSize: int): Frame! {
+  let hdrBytes = h2connReadExact(r, 9)?
+  let h = decodeFrameHeader(hdrBytes)?
+  if (h.length > maxFrameSize) {
+    fail newError("http2: frame exceeds max frame size")
+  }
+  let payload = h2connReadExact(r, h.length)?
+  return Frame{ header: h, payload: payload }
+}
+
+// --- small helpers -----------------------------------------------------------
+
+function h2connZeroFrame(): Frame {
+  return Frame{ header: FrameHeader{ length: 0, ftype: 0, flags: 0, streamId: 0 }, payload: []byte(0) }
+}
+
+function h2connZeroResponse(): Response {
+  return Response{ status: 0, headers: []HeaderField(0), body: []byte(0) }
+}
+
+function h2connZeroRequest(): Request {
+  return Request{ method: "", scheme: "", authority: "", path: "", headers: []HeaderField(0), body: []byte(0) }
+}
+
+function h2connDummyReply(): chan<h2connMsg> {
+  return chan<h2connMsg>(1)
+}
+
+function h2connBytesEqual(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+function h2connCopyN(src: []byte, n: int): []byte {
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = src[i]
+    i = i + 1
+  }
+  return out
+}
+
+function h2connAppendBytes(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// Decimal text of a non-negative integer.
+function h2connItoa(n: int): string {
+  if (n == 0) {
+    return "0"
+  }
+  let digits = []byte(0)
+  let v = n
+  while (v > 0) {
+    digits = append(digits, byte(48 + v % 10))
+    v = v / 10
+  }
+  let out = []byte(len(digits))
+  let i = 0
+  while (i < len(digits)) {
+    out[i] = digits[len(digits) - 1 - i]
+    i = i + 1
+  }
+  return string(out)
+}
+
+// Non-negative integer parsed from decimal text; 0 on any non-digit.
+function h2connAtoi(s: string): int {
+  let v = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c < '0' || c > '9') {
+      return 0
+    }
+    v = v * 10 + (int(c) - 48)
+    i = i + 1
+  }
+  return v
+}
+
+// --- public connection API ---------------------------------------------------
+
+// Send `req` on a fresh stream and block until its full response arrives. Safe to
+// call from many green threads at once — each request rides its own stream,
+// multiplexed over the one connection.
+export function (c: Conn) roundTrip(req: Request): Response! {
+  let replyCh = chan<h2connMsg>(1)
+  c.cmdCh <- h2connCmd{ kind: h2cmdOpen, request: req, response: h2connZeroResponse(), streamId: 0, errorCode: 0, replyCh: replyCh }
+  let msg = <- replyCh
+  if (!msg.ok) {
+    fail newError(msg.errMsg)
+  }
+  return msg.response
+}
+
+// Serve inbound requests, dispatching each to `handler` on its own green thread,
+// until the connection closes. A handler that returns a `Response` with status 0
+// aborts that stream with RST_STREAM (CANCEL).
+export function (c: Conn) serve(handler: (Request) => Response): ()! {
+  while (true) {
+    let a = <- c.acceptCh
+    if (a.stop) {
+      return
+    }
+    spawn h2connHandle(c.cmdCh, a.streamId, a.request, handler)
+  }
+}
+
+function h2connHandle(cmdCh: chan<h2connCmd>, streamId: int, req: Request, handler: (Request) => Response) {
+  let res = handler(req)
+  cmdCh <- h2connCmd{ kind: h2cmdRespond, request: h2connZeroRequest(), response: res, streamId: streamId, errorCode: 0, replyCh: h2connDummyReply() }
+}
+
+// Begin a graceful shutdown: emit GOAWAY so the peer starts no new streams.
+// In-flight streams still complete; subsequent `roundTrip` calls are refused.
+export function (c: Conn) close() {
+  c.cmdCh <- h2connCmd{ kind: h2cmdGoaway, request: h2connZeroRequest(), response: h2connZeroResponse(), streamId: 0, errorCode: errorNoError, replyCh: h2connDummyReply() }
+}
+
+// Abort stream `streamId` with RST_STREAM carrying `errorCode`.
+export function (c: Conn) resetStream(streamId: int, errorCode: int) {
+  c.cmdCh <- h2connCmd{ kind: h2cmdReset, request: h2connZeroRequest(), response: h2connZeroResponse(), streamId: streamId, errorCode: errorCode, replyCh: h2connDummyReply() }
+}

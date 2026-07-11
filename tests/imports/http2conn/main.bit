@@ -1,0 +1,311 @@
+// std/http2 connection-engine loopback (RFC 9113, task #1214).
+//
+// Two `Conn`s — a client and a server — are wired together over an in-memory
+// bidirectional byte pipe (a pair of buffered channels), with no sockets and no
+// TLS, and driven through the whole engine: the connection preface and SETTINGS
+// exchange, multiplexed concurrent streams, HPACK dynamic-table sync across
+// streams, HEADERS+CONTINUATION assembly of a header block that spans frames,
+// per-stream and connection-level DATA flow control paced by WINDOW_UPDATE
+// (bodies far larger than the initial window), a request body (client->server
+// DATA), an RST_STREAM abort, and a GOAWAY that refuses new streams. Each check
+// prints one PASS line; the concurrency is carried by std `spawn` + channels.
+
+import {
+  connect, accept, Config, defaultConfig,
+  Transport, newTransport, Conn,
+  Request, Response, newRequest, newResponse, getHeader, HeaderField,
+} from "std/http2"
+
+// --- in-memory bidirectional pipe -------------------------------------------
+
+struct h2pipeChunk { data: []byte, eof: bool }
+
+struct h2pipeEnd {
+  incoming: chan<h2pipeChunk>,
+  outgoing: chan<h2pipeChunk>,
+  leftover: []byte,
+  closed: bool,
+}
+
+function pipeRead(e: h2pipeEnd): (int) => []byte {
+  return (n) => {
+    while (len(e.leftover) == 0 && !e.closed) {
+      let ch = <- e.incoming
+      if (ch.eof) {
+        e.closed = true
+      } else {
+        e.leftover = ch.data
+      }
+    }
+    if (len(e.leftover) == 0) {
+      return []byte(0)
+    }
+    let take = n
+    if (take > len(e.leftover)) {
+      take = len(e.leftover)
+    }
+    let out = e.leftover[0:take]
+    e.leftover = e.leftover[take:len(e.leftover)]
+    return out
+  }
+}
+
+function pipeWrite(e: h2pipeEnd): ([]byte) => ()! {
+  return (bytes) => {
+    e.outgoing <- h2pipeChunk{ data: bytes, eof: false }
+  }
+}
+
+function pipeClose(e: h2pipeEnd): () => () {
+  return () => {
+    e.outgoing <- h2pipeChunk{ data: []byte(0), eof: true }
+  }
+}
+
+// --- test scaffolding --------------------------------------------------------
+
+function report(tag: string, ok: bool) {
+  if (ok) {
+    println(tag + " PASS")
+    return
+  }
+  println(tag + " FAIL")
+}
+
+function testItoa(n: int): string {
+  if (n == 0) {
+    return "0"
+  }
+  let digits = []byte(0)
+  let v = n
+  while (v > 0) {
+    digits = append(digits, byte(48 + v % 10))
+    v = v / 10
+  }
+  let out = []byte(len(digits))
+  let i = 0
+  while (i < len(digits)) {
+    out[i] = digits[len(digits) - 1 - i]
+    i = i + 1
+  }
+  return string(out)
+}
+
+// A deterministic printable byte pattern of length n.
+function makePattern(n: int): []byte {
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[i] = byte(33 + i % 90)
+    i = i + 1
+  }
+  return out
+}
+
+function bytesEqual(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The server handler used by every scenario.
+function handler(req: Request): Response {
+  if (req.path == "/reset") {
+    return Response{ status: 0, headers: []HeaderField(0), body: []byte(0) }
+  }
+  if (req.path == "/big") {
+    return newResponse(200, makePattern(100000))
+  }
+  if (req.path == "/echo") {
+    return newResponse(200, req.body)
+  }
+  if (req.path == "/hdr") {
+    return newResponse(200, []byte("hdrlen=" + testItoa(len(getHeader(req.headers, "x-big")))))
+  }
+  if (req.path == "/common") {
+    return newResponse(200, []byte(getHeader(req.headers, "x-common")))
+  }
+  let r = newResponse(200, []byte("hello " + req.path))
+  r.headers = append(r.headers, HeaderField{ name: "x-served", value: req.path, sensitive: false })
+  return r
+}
+
+function runServer(t: Transport, cfg: Config, h: (Request) => Response) {
+  let conn = accept(t, cfg) catch e {
+    return
+  }
+  conn.serve(h) catch e2 {
+    return
+  }
+}
+
+// Build a loopback: spawn a server over an in-memory pipe and return the client.
+function loopback(clientCfg: Config, serverCfg: Config): Conn! {
+  let aToB = chan<h2pipeChunk>(1024)
+  let bToA = chan<h2pipeChunk>(1024)
+  let clientEnd = h2pipeEnd{ incoming: bToA, outgoing: aToB, leftover: []byte(0), closed: false }
+  let serverEnd = h2pipeEnd{ incoming: aToB, outgoing: bToA, leftover: []byte(0), closed: false }
+  let ct = newTransport(pipeRead(clientEnd), pipeWrite(clientEnd), pipeClose(clientEnd))
+  let stt = newTransport(pipeRead(serverEnd), pipeWrite(serverEnd), pipeClose(serverEnd))
+  spawn runServer(stt, serverCfg, handler)
+  return connect(ct, clientCfg)?
+}
+
+// --- concurrent request helper ----------------------------------------------
+
+struct resItem { path: string, status: int, body: string, err: bool }
+
+function doReq(conn: Conn, path: string, out: chan<resItem>) {
+  let res = conn.roundTrip(newRequest("GET", "example.com", path)) catch e {
+    out <- resItem{ path: path, status: 0 - 1, body: "", err: true }
+    return
+  }
+  out <- resItem{ path: path, status: res.status, body: string(res.body), err: false }
+}
+
+// --- scenarios ---------------------------------------------------------------
+
+function testMultiplex() {
+  let conn = loopback(defaultConfig(), defaultConfig()) catch e {
+    report("multiplex", false)
+    return
+  }
+  let out = chan<resItem>(3)
+  spawn doReq(conn, "/a", out)
+  spawn doReq(conn, "/b", out)
+  spawn doReq(conn, "/c", out)
+  let bodies = map<string, string>()
+  let i = 0
+  while (i < 3) {
+    let r = <- out
+    bodies[r.path] = r.body
+    i = i + 1
+  }
+  report("multiplex", bodies["/a"] == "hello /a" && bodies["/b"] == "hello /b" && bodies["/c"] == "hello /c")
+}
+
+function testHpackSync() {
+  let conn = loopback(defaultConfig(), defaultConfig()) catch e {
+    report("hpack-sync", false)
+    return
+  }
+  let i = 0
+  while (i < 3) {
+    let req = newRequest("GET", "example.com", "/common")
+    req.headers = append(req.headers, HeaderField{ name: "x-common", value: "shared", sensitive: false })
+    let res = conn.roundTrip(req) catch e {
+      report("hpack-sync", false)
+      return
+    }
+    if (string(res.body) != "shared") {
+      report("hpack-sync", false)
+      return
+    }
+    i = i + 1
+  }
+  report("hpack-sync", true)
+}
+
+function testStreamFlow() {
+  let cc = Config{ initialWindowSize: 4096, maxFrameSize: 16384, headerTableSize: 4096 }
+  let conn = loopback(cc, defaultConfig()) catch e {
+    report("stream-flow", false)
+    return
+  }
+  let res = conn.roundTrip(newRequest("GET", "example.com", "/big")) catch e {
+    report("stream-flow", false)
+    return
+  }
+  report("stream-flow", bytesEqual(res.body, makePattern(100000)))
+}
+
+function testConnFlow() {
+  let cc = Config{ initialWindowSize: 1000000, maxFrameSize: 16384, headerTableSize: 4096 }
+  let conn = loopback(cc, defaultConfig()) catch e {
+    report("conn-flow", false)
+    return
+  }
+  let res = conn.roundTrip(newRequest("GET", "example.com", "/big")) catch e {
+    report("conn-flow", false)
+    return
+  }
+  report("conn-flow", bytesEqual(res.body, makePattern(100000)))
+}
+
+function testContinuation() {
+  let conn = loopback(defaultConfig(), defaultConfig()) catch e {
+    report("continuation", false)
+    return
+  }
+  let req = newRequest("GET", "example.com", "/hdr")
+  req.headers = append(req.headers, HeaderField{ name: "x-big", value: string(makePattern(60000)), sensitive: false })
+  let res = conn.roundTrip(req) catch e {
+    report("continuation", false)
+    return
+  }
+  report("continuation", string(res.body) == "hdrlen=60000")
+}
+
+function testRequestBody() {
+  let sc = Config{ initialWindowSize: 4096, maxFrameSize: 16384, headerTableSize: 4096 }
+  let conn = loopback(defaultConfig(), sc) catch e {
+    report("request-body", false)
+    return
+  }
+  let req = newRequest("POST", "example.com", "/echo")
+  req.body = makePattern(20000)
+  let res = conn.roundTrip(req) catch e {
+    report("request-body", false)
+    return
+  }
+  report("request-body", bytesEqual(res.body, makePattern(20000)))
+}
+
+function testReset() {
+  let conn = loopback(defaultConfig(), defaultConfig()) catch e {
+    report("rst-stream", false)
+    return
+  }
+  conn.roundTrip(newRequest("GET", "example.com", "/reset")) catch e {
+    report("rst-stream", true)
+    return
+  }
+  report("rst-stream", false)
+}
+
+function testGoaway() {
+  let conn = loopback(defaultConfig(), defaultConfig()) catch e {
+    report("goaway", false)
+    return
+  }
+  // one successful request first
+  let r1 = conn.roundTrip(newRequest("GET", "example.com", "/a")) catch e {
+    report("goaway", false)
+    return
+  }
+  conn.close()
+  conn.roundTrip(newRequest("GET", "example.com", "/a")) catch e {
+    report("goaway", string(r1.body) == "hello /a")
+    return
+  }
+  report("goaway", false)
+}
+
+function main() {
+  testMultiplex()
+  testHpackSync()
+  testStreamFlow()
+  testConnFlow()
+  testContinuation()
+  testRequestBody()
+  testReset()
+  testGoaway()
+}

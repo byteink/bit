@@ -596,3 +596,141 @@ The wire bytes of a CONTINUATION frame. Fails on a zero stream id.
 ### `decodeContinuation(f: Frame): ContinuationFrame!`
 
 The CONTINUATION frame `f` carries. Fails on a wrong type or a zero stream id.
+## Connection engine
+
+HPACK and the frame codec are pure — no I/O, no state machine. `conn.bit` puts
+them to work over a live connection. A `Conn` runs the client preface and the
+SETTINGS exchange, tracks each stream through the idle → open → half-closed →
+closed lifecycle (RFC 9113 §5.1), reassembles HEADERS + CONTINUATION blocks into
+header lists, paces DATA against the per-stream and connection flow-control
+windows, and multiplexes many concurrent request/response exchanges over the one
+byte stream. It is transport-agnostic and TLS-free: a `Transport` is any
+bidirectional byte stream, so the same engine runs over a socket or an in-memory
+pipe.
+
+A `Conn` is an actor. Three green threads run underneath it — a reader that turns
+transport bytes into frames, a writer that drains queued frames, and a loop that
+owns every piece of mutable state — and they talk only over channels, so there is
+no shared mutable memory to race on. Because the one loop encodes outgoing header
+blocks and decodes incoming ones in wire order, the two peers' HPACK dynamic
+tables stay in lock-step automatically. `connect` returns once the peer's opening
+SETTINGS is in effect, so the peer's window and frame-size limits are known
+before the first request goes out.
+
+```bit
+import { connect, accept, Transport, defaultConfig, Request, Response, newRequest, newResponse } from "std/http2"
+
+// Answer every request with its path echoed back in the body.
+function echo(req: Request): Response {
+  return newResponse(200, []byte("you asked for " + req.path))
+}
+
+// `client` and `server` are the two ends of one byte stream — a socket pair, or
+// an in-memory pipe in a test. Serve one end and fetch "/" from the other.
+function demo(client: Transport, server: Transport): Response! {
+  spawn serveOn(server)
+  let conn = connect(client, defaultConfig())?
+  return conn.roundTrip(newRequest("GET", "example.com", "/"))?
+}
+
+function serveOn(t: Transport) {
+  let conn = accept(t, defaultConfig()) catch e {
+    return
+  }
+  conn.serve(echo) catch e2 {
+    return
+  }
+}
+```
+
+### `Transport`
+
+A bidirectional byte stream, the substrate a `Conn` runs on. `read(n)` returns up
+to `n` bytes and an empty slice at end-of-stream; `write(b)` delivers every byte
+or fails; `shutdown()` releases the stream. All three fields are exported and are
+plain function values, so any stream — a `std/net` connection, an in-memory pipe —
+satisfies it. (The close hook is named `shutdown`, not `close`, to avoid
+shadowing the `close` channel builtin.)
+
+### `newTransport(read: (int) => []byte, write: ([]byte) => ()!, shutdown: () => ()): Transport`
+
+Bundle the three closures into a `Transport`.
+
+### `Config`
+
+The SETTINGS a `Conn` advertises: `initialWindowSize` (the per-stream receive
+window it grants the peer), `maxFrameSize` (the largest frame payload it
+accepts), and `headerTableSize` (its HPACK dynamic-table bound). All three fields
+are exported.
+
+### `defaultConfig(): Config`
+
+The RFC defaults: a 65535-byte initial window, a 16384-byte max frame size, and a
+4096-byte header table.
+
+### `Request`
+
+An HTTP/2 request: the `:method`, `:scheme`, `:authority`, and `:path`
+pseudo-headers as named fields, the remaining regular `headers` as a
+`[]HeaderField`, and the `body` bytes. All fields are exported.
+
+### `Response`
+
+An HTTP/2 response: the numeric `status`, the regular `headers`, and the `body`.
+All fields are exported. A `status` of 0 returned from a `serve` handler is the
+signal to abort that stream with RST_STREAM (CANCEL) instead of answering.
+
+### `newRequest(method: string, authority: string, path: string): Request`
+
+A request with the `https` scheme, no extra headers, and no body. Set `headers`
+and `body` on the result for anything more.
+
+### `newResponse(status: int, body: []byte): Response`
+
+A response with a status and a body and no extra headers.
+
+### `getHeader(headers: []HeaderField, name: string): string`
+
+The value of the first header named `name` (case-sensitive — HTTP/2 field names
+are lower-case), or "" if absent.
+
+### `connect(t: Transport, cfg: Config): Conn!`
+
+Run the client side of the connection: send the preface and our SETTINGS over
+`t`, and return a `Conn` once the peer's SETTINGS is in effect. Drive it with
+`roundTrip`.
+
+### `accept(t: Transport, cfg: Config): Conn!`
+
+Run the server side: read and validate the client preface over `t`, exchange
+SETTINGS, and return a `Conn`. Fails on a malformed preface. Drive it with
+`serve`.
+
+### `Conn`
+
+A live connection. Opaque — its mutable protocol state lives in the loop thread,
+and every operation is a method that talks to it over a channel, so a `Conn` is
+safe to share across green threads.
+
+### `Conn.roundTrip(req: Request): Response!`
+
+Send `req` on a fresh stream and block until its full response arrives. Safe to
+call from many green threads at once — each call rides its own stream, multiplexed
+over the one connection. Fails if the stream is reset by the peer or the
+connection is closing.
+
+### `Conn.serve(handler: (Request) => Response): ()!`
+
+Accept inbound requests and dispatch each to `handler` on its own green thread,
+until the connection closes. A handler that returns a `Response` with status 0
+aborts that stream with RST_STREAM (CANCEL).
+
+### `Conn.close()`
+
+Begin a graceful shutdown by sending GOAWAY: the peer starts no new streams and
+subsequent `roundTrip` calls are refused, while in-flight streams still complete.
+
+### `Conn.resetStream(streamId: int, errorCode: int)`
+
+Abort stream `streamId` by sending RST_STREAM with `errorCode` (an `error*`
+constant).
