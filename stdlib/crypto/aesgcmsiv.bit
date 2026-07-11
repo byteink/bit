@@ -1,0 +1,321 @@
+// Bit standard library — crypto module, AES-GCM-SIV nonce-misuse-resistant AEAD
+// (RFC 8452).
+//
+// AES-GCM-SIV is a *synthetic-IV* AEAD: the tag is derived from the plaintext
+// (via the POLYVAL universal hash) *before* it keys the CTR encryption, so a
+// repeated nonce is not catastrophic the way it is for plain GCM. Reusing a
+// nonce leaks only whether two (nonce, aad, plaintext) triples were identical —
+// their ciphertexts collide — and never exposes the authentication key or the
+// XOR of two plaintexts. That is the misuse-resistance property; it is the AEAD
+// to reach for when unique nonces cannot be guaranteed (e.g. random nonces at
+// high volume). It still satisfies the `Aead` contract (aead.bit).
+//
+// Every message re-derives a fresh pair of keys from the master key-generating
+// key and the 12-byte nonce (RFC 8452 §4): a 16-byte POLYVAL authentication key
+// and a 16- or 32-byte AES encryption key, each assembled from the low 8 bytes
+// of AES(counter ‖ nonce) blocks. The tag is POLYVAL(auth, aad, plaintext) with
+// the nonce folded in, its top bit cleared, then enciphered under the encryption
+// key; CTR then encrypts the plaintext keyed by that tag (top bit set). AES-128
+// (16-byte master key) and AES-256 (32-byte) are both supported.
+//
+// POLYVAL is GHASH's little-endian sibling: the same GF(2^128) arithmetic in the
+// byte-reversed ("POLYVAL") bit order. Rather than re-derive the field multiply,
+// this reuses gcm.bit's constant-time GHASH multiply through the RFC 8452 §3
+// identity
+//
+//     POLYVAL(H, X_1..X_n) =
+//         ByteReverse(GHASH(ByteReverse(H) · x, ByteReverse(X_1)..ByteReverse(X_n)))
+//
+// so every 16-byte block is byte-reversed on the way in, the subkey is
+// ByteReverse(H) multiplied once by x (gcm's `gcmShiftReduce`), and the result
+// is byte-reversed on the way out. Because the underlying multiply is the same
+// branchless, table-free 128-iteration shift-and-xor, POLYVAL inherits its
+// constant-time property, and `open` compares tags with `ctEq` and never returns
+// plaintext on a mismatch.
+
+// Byte-reverse the 16-byte window of `data` at `off` into a fresh block, zero-
+// padding any byte past the end (a short final block is padded to 16 *then*
+// reversed — RFC 8452 §3 ByteReverse). Used both for whole 16-byte values (H,
+// the serialized result) at `off == 0` and for each data block.
+function aesgcmsivRevBlock(data: []byte, off: int): []byte {
+  let r = []byte(16)
+  let i = 0
+  while (i < 16) {
+    let s = off + 15 - i
+    let b: byte = 0
+    if (s < len(data)) {
+      b = data[s]
+    }
+    r[i] = b
+    i = i + 1
+  }
+  return r
+}
+
+// The POLYVAL subkey in GHASH form: ByteReverse(H) multiplied once by x in the
+// GHASH field (RFC 8452 §3's mulX_GHASH), so gcm's GHASH multiply computes
+// POLYVAL directly. `h` is the 16-byte record-authentication key.
+function aesgcmsivPolyvalKey(h: []byte): []u64 {
+  let hx = gcmLoadBlock(aesgcmsivRevBlock(h, 0), 0)
+  gcmShiftReduce(hx) // · x in the GHASH field
+  return hx
+}
+
+// Fold the 16-byte block of `data` at `off` into the POLYVAL accumulator `acc`
+// under subkey `hx`: byte-reverse the block, load it as a GHASH field element,
+// and absorb acc = (acc XOR block) · hx via gcm's constant-time multiply.
+function aesgcmsivFold(acc: []u64, hx: []u64, data: []byte, off: int) {
+  let blk = gcmLoadBlock(aesgcmsivRevBlock(data, off), 0)
+  gcmMulH(acc, blk, hx)
+}
+
+// The 16-byte length block: bytelen(aad)*8 then bytelen(pt)*8, each a 64-bit
+// little-endian integer (RFC 8452 §5). Absorbed last, exactly as GHASH's length
+// block but in POLYVAL's little-endian order.
+function aesgcmsivLenBlock(aadLen: int, ptLen: int): []byte {
+  let b = []byte(16)
+  let aadBits = u64(aadLen) * 8
+  let ptBits = u64(ptLen) * 8
+  let i = 0
+  while (i < 8) {
+    let sh = u64(8 * i)
+    b[i] = byte(aadBits >> sh)
+    b[i + 8] = byte(ptBits >> sh)
+    i = i + 1
+  }
+  return b
+}
+
+// POLYVAL(H, padded-aad ‖ padded-plaintext ‖ length-block) as 16 bytes. Folds
+// every AAD block, then every plaintext block, then the length block, and byte-
+// reverses the GHASH accumulator back to POLYVAL order.
+function aesgcmsivPolyval(h: []byte, aad: []byte, pt: []byte): []byte {
+  let hx = aesgcmsivPolyvalKey(h)
+  let acc = []u64(2)
+  let off = 0
+  while (off < len(aad)) {
+    aesgcmsivFold(acc, hx, aad, off)
+    off = off + 16
+  }
+  off = 0
+  while (off < len(pt)) {
+    aesgcmsivFold(acc, hx, pt, off)
+    off = off + 16
+  }
+  aesgcmsivFold(acc, hx, aesgcmsivLenBlock(len(aad), len(pt)), 0)
+  let be = []byte(16)
+  gcmStoreWord(be, 0, acc[0])
+  gcmStoreWord(be, 8, acc[1])
+  return aesgcmsivRevBlock(be, 0)
+}
+
+// AES-encipher counter block `ctr` (little-endian u32) ‖ `nonce` under the key-
+// generating cipher `master` and return the low 8 bytes — one word of a derived
+// key (RFC 8452 §4).
+function aesgcmsivDeriveWord(master: AesCipher, ctr: u32, nonce: []byte): []byte {
+  let blk = []byte(16)
+  blk[0] = byte(ctr)
+  blk[1] = byte(ctr >> 8)
+  blk[2] = byte(ctr >> 16)
+  blk[3] = byte(ctr >> 24)
+  let i = 0
+  while (i < 12) {
+    blk[4 + i] = nonce[i]
+    i = i + 1
+  }
+  let enc = master.encryptBlock(blk)
+  let word = []byte(8)
+  let j = 0
+  while (j < 8) {
+    word[j] = enc[j]
+    j = j + 1
+  }
+  return word
+}
+
+// Copy the 8 bytes of `src` into `dst` at `off`.
+function aesgcmsivPut8(dst: []byte, off: int, src: []byte) {
+  let i = 0
+  while (i < 8) {
+    dst[off + i] = src[i]
+    i = i + 1
+  }
+}
+
+// The per-nonce record keys (RFC 8452 §4): a 16-byte POLYVAL authentication key
+// and a `keyLen`-byte AES encryption key, each the concatenated low-8-bytes of
+// successive AES(counter ‖ nonce) blocks.
+struct aesgcmsivKeys {
+  auth: []byte
+  enc: []byte
+}
+
+// Derive both record keys from the master cipher and `nonce`. Counters 0,1 build
+// the authentication key; 2,3 (and 4,5 for a 32-byte encryption key) build the
+// encryption key.
+function aesgcmsivDerive(master: AesCipher, keyLen: int, nonce: []byte): aesgcmsivKeys {
+  let auth = []byte(16)
+  aesgcmsivPut8(auth, 0, aesgcmsivDeriveWord(master, 0, nonce))
+  aesgcmsivPut8(auth, 8, aesgcmsivDeriveWord(master, 1, nonce))
+  let enc = []byte(keyLen)
+  aesgcmsivPut8(enc, 0, aesgcmsivDeriveWord(master, 2, nonce))
+  aesgcmsivPut8(enc, 8, aesgcmsivDeriveWord(master, 3, nonce))
+  if (keyLen == 32) {
+    aesgcmsivPut8(enc, 16, aesgcmsivDeriveWord(master, 4, nonce))
+    aesgcmsivPut8(enc, 24, aesgcmsivDeriveWord(master, 5, nonce))
+  }
+  return aesgcmsivKeys{ auth: auth, enc: enc }
+}
+
+// Expand a derived AES encryption key (16 or 32 bytes, always valid here) into a
+// cipher. This is the non-fallible sibling of `newAes`: the derived key length is
+// fixed by construction, so there is no error path to thread through the AEAD's
+// non-fallible `seal`.
+function aesgcmsivCipher(key: []byte): AesCipher {
+  if (len(key) == 32) {
+    return AesCipher{ roundKeys: expandKey(key, 8, 14), nr: 14 }
+  }
+  return AesCipher{ roundKeys: expandKey(key, 4, 10), nr: 10 }
+}
+
+// The tag: fold the nonce into the low 12 bytes of POLYVAL(auth, aad, pt), clear
+// the top bit of the last byte, and encipher under the encryption cipher (RFC
+// 8452 §5). `enc` is the keyed message-encryption cipher.
+function aesgcmsivTag(enc: AesCipher, auth: []byte, nonce: []byte, aad: []byte, pt: []byte): []byte {
+  let s = aesgcmsivPolyval(auth, aad, pt)
+  let i = 0
+  while (i < 12) {
+    s[i] = s[i] ^ nonce[i]
+    i = i + 1
+  }
+  s[15] = s[15] & 0x7f
+  return enc.encryptBlock(s)
+}
+
+// Increment the first 4 bytes of `counter` as a little-endian 32-bit integer,
+// wrapping mod 2^32 (RFC 8452 §4 CTR). Byte 0 is least significant; the carry
+// never leaves the low four bytes, so the top-bit domain separator is preserved.
+function aesgcmsivIncr(counter: []byte) {
+  let i = 0
+  while (i < 4) {
+    let v: u8 = counter[i] + 1
+    counter[i] = v
+    if (v != 0) {
+      return
+    }
+    i = i + 1
+  }
+}
+
+// CTR keystream over `data` keyed by `tag`: the initial counter block is `tag`
+// with the top bit of its last byte set, incremented as a little-endian u32 in
+// its first four bytes (RFC 8452 §4). XOR is its own inverse, so this both seals
+// and opens. Handles a trailing partial block. `tag` itself is not mutated.
+function aesgcmsivCtr(enc: AesCipher, tag: []byte, data: []byte): []byte {
+  let out = []byte(len(data))
+  let counter = []byte(16)
+  let i = 0
+  while (i < 16) {
+    counter[i] = tag[i]
+    i = i + 1
+  }
+  counter[15] = counter[15] | 0x80
+  let off = 0
+  while (off < len(data)) {
+    let ks = enc.encryptBlock(counter)
+    let n = len(data) - off
+    if (n > 16) {
+      n = 16
+    }
+    let j = 0
+    while (j < n) {
+      out[off + j] = data[off + j] ^ ks[j]
+      j = j + 1
+    }
+    aesgcmsivIncr(counter)
+    off = off + 16
+  }
+  return out
+}
+
+// A keyed AES-GCM-SIV cipher. `master` is the key-generating AES cipher (the
+// expanded master key) and `keyLen` is 16 or 32, selecting AES-128 or AES-256
+// for the per-nonce record keys. Build one with `newAesGcmSiv`; the same value
+// seals and opens any number of messages and satisfies the `Aead` interface.
+export struct AesGcmSiv {
+  master: AesCipher
+  keyLen: int
+}
+
+// Key an AES-GCM-SIV cipher from `key`, the key-generating key: 16 bytes selects
+// AES-128-GCM-SIV, 32 bytes AES-256-GCM-SIV. Fails on any other length (unlike
+// GCM, the SIV construction has no 24-byte variant). Per-message record keys are
+// derived from this key and the nonce inside every `seal`/`open`.
+export function newAesGcmSiv(key: []byte): AesGcmSiv! {
+  let n = len(key)
+  if (n != 16 && n != 32) {
+    fail newError("newAesGcmSiv: key must be 16 or 32 bytes, got ${n}")
+  }
+  let master = newAes(key)?
+  return AesGcmSiv{ master: master, keyLen: n }
+}
+
+// Seal: derive the per-nonce record keys, authenticate `aad` and `plaintext`
+// into the synthetic tag, and CTR-encrypt the plaintext keyed by that tag,
+// returning ciphertext with the 16-byte tag appended (so the result is
+// `len(plaintext) + 16` bytes). Unlike GCM, a repeated `nonce` is not
+// catastrophic — identical (nonce, aad, plaintext) inputs merely produce
+// identical ciphertext — but a unique nonce per message is still preferred. A
+// wrong nonce length is a caller error and panics.
+export function (g: AesGcmSiv) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
+  assert(len(nonce) == 12, "aesgcmsiv.seal: nonce must be 12 bytes")
+  let keys = aesgcmsivDerive(g.master, g.keyLen, nonce)
+  let enc = aesgcmsivCipher(keys.enc)
+  let tag = aesgcmsivTag(enc, keys.auth, nonce, aad, plaintext)
+  let ct = aesgcmsivCtr(enc, tag, plaintext)
+
+  let out = []byte(len(ct) + 16)
+  let i = 0
+  while (i < len(ct)) {
+    out[i] = ct[i]
+    i = i + 1
+  }
+  let k = 0
+  while (k < 16) {
+    out[len(ct) + k] = tag[k]
+    k = k + 1
+  }
+  return out
+}
+
+// Open: verify and decrypt `ciphertext` (the sealed `ct ‖ tag`) under `nonce`
+// and `aad`. Derives the record keys, CTR-decrypts with the received tag,
+// recomputes the synthetic tag over the recovered plaintext, and compares it to
+// the received tag in constant time — FAILING on any mismatch (a tampered
+// message, or a wrong key, nonce, or `aad`) without returning the plaintext.
+// Also fails if the input is shorter than the 16-byte tag. A wrong nonce length
+// is a caller error and panics.
+export function (g: AesGcmSiv) open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte! {
+  assert(len(nonce) == 12, "aesgcmsiv.open: nonce must be 12 bytes")
+  if (len(ciphertext) < 16) {
+    fail newError("aesgcmsiv.open: ciphertext shorter than the 16-byte tag")
+  }
+  let ctLen = len(ciphertext) - 16
+  let ct = ciphertext[0:ctLen]
+  let recvTag = ciphertext[ctLen:len(ciphertext)]
+
+  let keys = aesgcmsivDerive(g.master, g.keyLen, nonce)
+  let enc = aesgcmsivCipher(keys.enc)
+  let pt = aesgcmsivCtr(enc, recvTag, ct)
+  let wantTag = aesgcmsivTag(enc, keys.auth, nonce, aad, pt)
+  if (!ctEq(wantTag, recvTag)) {
+    fail newError("aesgcmsiv.open: authentication failed")
+  }
+  return pt
+}
+
+// The required nonce length in bytes: 12 (96-bit), fixed by RFC 8452.
+export function (g: AesGcmSiv) nonceSize(): int { return 12 }
+
+// The number of bytes `seal` appends: the 16-byte authentication tag.
+export function (g: AesGcmSiv) overhead(): int { return 16 }

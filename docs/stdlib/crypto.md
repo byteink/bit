@@ -2468,3 +2468,74 @@ given `context` string.
 
 One-shot BLAKE3 XOF: `n` output bytes of the default hash of `data`. For `n == 32`
 this equals `blake3Hash(data)`.
+## AES-GCM-SIV
+
+AES-GCM-SIV (RFC 8452) is a **nonce-misuse-resistant** AEAD. A synthetic IV — the
+authentication tag — is derived from the plaintext *before* it keys the CTR
+encryption, so unlike plain AES-GCM a repeated nonce is not catastrophic: reusing
+one leaks only whether two `(nonce, aad, plaintext)` triples were identical (their
+ciphertexts then match), and never the authentication key or the XOR of two
+plaintexts. Reach for it when unique nonces cannot be guaranteed — random nonces
+at high volume, or stateless senders that may replay a counter. Same `Aead`
+contract as `AesGcm` and `ChaChaPoly`: a 12-byte nonce and a 16-byte tag.
+
+Every message re-derives a fresh POLYVAL authentication key and AES encryption key
+from the key-generating key and the nonce, so the cost per message is a short key
+schedule plus the hash and two cipher passes. POLYVAL is GHASH's little-endian
+sibling and reuses the same constant-time, table-free GF(2^128) multiply, so tag
+verification leaks nothing through timing and `open` never returns unverified
+plaintext.
+
+```bit
+import { newAesGcmSiv, encodeHex } from "std/crypto"
+
+// Seal then open one message. `key` is 16 or 32 bytes (AES-128/256-GCM-SIV);
+// `nonce` is 12 bytes. A repeated nonce is not catastrophic here — identical
+// inputs merely produce identical ciphertext — but a unique nonce is still
+// preferred. `aad` is authenticated but not encrypted. Returns the recovered
+// plaintext as hex, or fails if the tag does not verify.
+function protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
+  let cipher = newAesGcmSiv(key)?
+  let sealed = cipher.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
+  let opened = cipher.open(nonce, sealed, aad)? // fails on any tag mismatch
+  return encodeHex(opened)
+}
+```
+
+### `AesGcmSiv`
+
+A keyed AES-GCM-SIV cipher. Build one with `newAesGcmSiv`, not a struct literal —
+the constructor validates the key length and expands the key-generating schedule.
+One value seals and opens any number of messages; it satisfies the `Aead`
+interface.
+
+### `newAesGcmSiv(key: []byte): AesGcmSiv!`
+
+Keys an AES-GCM-SIV cipher from `key`, the key-generating key: 16 bytes selects
+AES-128-GCM-SIV, 32 bytes AES-256-GCM-SIV. Fails on any other length — unlike GCM,
+the SIV construction has no 24-byte variant. The per-message record keys are
+derived from this key and the nonce inside every `seal`/`open`.
+
+### `AesGcmSiv.seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte`
+
+Encrypts `plaintext` under the 12-byte `nonce` and authenticates both it and the
+unencrypted `aad`, returning the ciphertext with the 16-byte tag appended (so
+`len(seal(...))` is `len(plaintext) + 16`). A repeated `nonce` is not catastrophic
+— identical `(nonce, aad, plaintext)` inputs produce identical ciphertext — but a
+unique nonce per message is still preferred. A wrong nonce length panics.
+
+### `AesGcmSiv.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
+
+Verifies and decrypts `ciphertext` (the sealed `ct ‖ tag`) under `nonce` and
+`aad`. Recomputes the synthetic tag over the recovered plaintext and compares it
+in constant time, *failing* on any mismatch — a tampered message, or a wrong key,
+nonce, or `aad` — without returning the plaintext. Also fails if the input is
+shorter than the 16-byte tag.
+
+### `AesGcmSiv.nonceSize(): int`
+
+The required nonce length in bytes: `12` (96-bit), fixed by RFC 8452.
+
+### `AesGcmSiv.overhead(): int`
+
+The number of bytes `seal` appends: `16`, the authentication tag length.
