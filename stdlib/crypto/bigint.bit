@@ -1,0 +1,790 @@
+// Bit standard library — crypto module, variable-width unsigned big integers.
+//
+// `Nat` is an arbitrary-precision non-negative integer backed by a slice of
+// 32-bit limbs, little-endian (`limbs[0]` is the least significant) and always
+// *normalized*: the most-significant limb is non-zero, so the number zero is the
+// empty slice and equality of magnitude is equality of length-then-limbs. All
+// arithmetic uses `u64` intermediates over `u32` limbs — there is no `u128`, and
+// a 32x32->64 product plus carries never overflows a `u64`, which keeps every
+// carry chain exact and portable.
+//
+// This is the modular-arithmetic bedrock the public-key primitives build on:
+// RSA (#1195) and the NIST curves (#1192). The design goals, in order, are
+// correctness, then a constant-time `bigintModExp` for secret exponents (RSA
+// private-key operations, ECDSA nonces), then reasonable speed. Multiplication
+// and squaring are schoolbook (Karatsuba is a later optimization); division is
+// Knuth's Algorithm D; modular exponentiation is Montgomery reduction driven by
+// a Montgomery powering ladder that performs the same multiply/square sequence
+// regardless of the exponent bits, so its timing does not leak the exponent.
+//
+// Being part of the flat `std/crypto` module, this file names `newError` from
+// the prelude without importing it. Every private helper is prefixed `bigint` to
+// keep the module's flat namespace clean.
+
+// A non-negative arbitrary-precision integer: a normalized little-endian slice
+// of 32-bit limbs. The empty slice is zero; otherwise `limbs[len-1] != 0`. The
+// field is module-private, so callers construct and inspect a `Nat` only through
+// the `bigint*` functions.
+export struct Nat {
+  limbs: []u32
+}
+
+// The larger of two ints.
+function bigintMaxInt(a: int, b: int): int {
+  if (a > b) {
+    return a
+  }
+  return b
+}
+
+// The smaller of two ints.
+function bigintMinInt(a: int, b: int): int {
+  if (a < b) {
+    return a
+  }
+  return b
+}
+
+// ---------------------------------------------------------------------------
+// Construction, normalization, and inspection
+// ---------------------------------------------------------------------------
+
+// Trim high zero limbs from `limbs` so the result is normalized, then wrap it in
+// a `Nat`. Every routine that produces limbs funnels through here, so the
+// no-leading-zero invariant holds for every `Nat` in the system.
+function bigintMake(limbs: []u32): Nat {
+  let hi = len(limbs)
+  while (hi > 0 && limbs[hi - 1] == 0) {
+    hi = hi - 1
+  }
+  if (hi == len(limbs)) {
+    return Nat{ limbs: limbs }
+  }
+  return Nat{ limbs: limbs[0:hi] }
+}
+
+// The number zero, i.e. the empty limb slice.
+export function bigintZero(): Nat {
+  return Nat{ limbs: []u32(0) }
+}
+
+// The `Nat` equal to the unsigned 64-bit value `v`. Uses one limb for values
+// below 2^32, two otherwise; zero yields the empty slice.
+export function bigintFromU64(v: u64): Nat {
+  let limbs = []u32(2)
+  limbs[0] = u32(v & 0xffffffff)
+  limbs[1] = u32(v >> 32)
+  return bigintMake(limbs)
+}
+
+// The value of `n` as a `u64`. Fails if `n` needs more than 64 bits, i.e. more
+// than two limbs. Intended for small results and test assertions; large values
+// should be compared as bytes via `bigintToBytes`.
+export function bigintToU64(n: Nat): u64! {
+  if (len(n.limbs) > 2) {
+    fail newError("bigintToU64: value exceeds 64 bits")
+  }
+  let lo: u64 = 0
+  if (len(n.limbs) > 0) {
+    lo = u64(n.limbs[0])
+  }
+  let hi: u64 = 0
+  if (len(n.limbs) > 1) {
+    hi = u64(n.limbs[1])
+  }
+  return lo | (hi << 32)
+}
+
+// Whether `n` is zero.
+export function bigintIsZero(n: Nat): bool {
+  return len(n.limbs) == 0
+}
+
+// Count leading zero bits of the non-zero word `x`, 0..31.
+function bigintClz32(x: u32): int {
+  let n = 0
+  let v = x
+  while ((v & 0x80000000) == 0) {
+    v = v << 1
+    n = n + 1
+  }
+  return n
+}
+
+// The number of significant bits in `n`: 0 for zero, otherwise the position of
+// the highest set bit plus one.
+export function bigintBitLen(n: Nat): int {
+  let k = len(n.limbs)
+  if (k == 0) {
+    return 0
+  }
+  return (k - 1) * 32 + (32 - bigintClz32(n.limbs[k - 1]))
+}
+
+// ---------------------------------------------------------------------------
+// Comparison
+// ---------------------------------------------------------------------------
+
+// Compare two normalized limb slices: -1 if a<b, 0 if equal, 1 if a>b. Shorter
+// normalized slices are strictly smaller, so length is the first discriminator.
+function bigintCmpLimbs(a: []u32, b: []u32): int {
+  if (len(a) != len(b)) {
+    if (len(a) < len(b)) {
+      return -1
+    }
+    return 1
+  }
+  let i = len(a) - 1
+  while (i >= 0) {
+    if (a[i] != b[i]) {
+      if (a[i] < b[i]) {
+        return -1
+      }
+      return 1
+    }
+    i = i - 1
+  }
+  return 0
+}
+
+// Compare `a` and `b`: -1 if `a < b`, 0 if equal, 1 if `a > b`.
+export function bigintCmp(a: Nat, b: Nat): int {
+  return bigintCmpLimbs(a.limbs, b.limbs)
+}
+
+// ---------------------------------------------------------------------------
+// Addition and subtraction
+// ---------------------------------------------------------------------------
+
+// `a + b`.
+export function bigintAdd(a: Nat, b: Nat): Nat {
+  let la = len(a.limbs)
+  let lb = len(b.limbs)
+  let m = bigintMaxInt(la, lb)
+  let out = []u32(m + 1)
+  let carry: u64 = 0
+  let i = 0
+  while (i < m) {
+    let av: u64 = 0
+    if (i < la) {
+      av = u64(a.limbs[i])
+    }
+    let bv: u64 = 0
+    if (i < lb) {
+      bv = u64(b.limbs[i])
+    }
+    let s = av + bv + carry
+    out[i] = u32(s & 0xffffffff)
+    carry = s >> 32
+    i = i + 1
+  }
+  out[m] = u32(carry)
+  return bigintMake(out)
+}
+
+// `a - b`. Fails if `b > a`: a `Nat` is unsigned, so the difference would be
+// negative and there is no value to return.
+export function bigintSub(a: Nat, b: Nat): Nat! {
+  if (bigintCmpLimbs(a.limbs, b.limbs) < 0) {
+    fail newError("bigintSub: negative result")
+  }
+  let la = len(a.limbs)
+  let lb = len(b.limbs)
+  let out = []u32(la)
+  let borrow: u64 = 0
+  let i = 0
+  while (i < la) {
+    let av = u64(a.limbs[i])
+    let bv: u64 = 0
+    if (i < lb) {
+      bv = u64(b.limbs[i])
+    }
+    let d = av + 0x100000000 - bv - borrow
+    out[i] = u32(d & 0xffffffff)
+    borrow = 1 - (d >> 32)
+    i = i + 1
+  }
+  return bigintMake(out)
+}
+
+// ---------------------------------------------------------------------------
+// Multiplication and squaring
+// ---------------------------------------------------------------------------
+
+// Schoolbook product of two limb slices as an un-normalized slice of
+// `len(a)+len(b)` limbs (empty when either operand is empty). Each partial
+// product `a[i]*b[j]` is a full `u64`; the running `carry` plus an accumulator
+// limb plus that product stays below 2^64, so no term is lost.
+function bigintMulLimbs(a: []u32, b: []u32): []u32 {
+  let la = len(a)
+  let lb = len(b)
+  if (la == 0 || lb == 0) {
+    return []u32(0)
+  }
+  let out = []u32(la + lb)
+  let i = 0
+  while (i < la) {
+    let carry: u64 = 0
+    let ai = u64(a[i])
+    let j = 0
+    while (j < lb) {
+      let s = u64(out[i + j]) + ai * u64(b[j]) + carry
+      out[i + j] = u32(s & 0xffffffff)
+      carry = s >> 32
+      j = j + 1
+    }
+    out[i + lb] = u32(carry)
+    i = i + 1
+  }
+  return out
+}
+
+// `a * b`.
+export function bigintMul(a: Nat, b: Nat): Nat {
+  return bigintMake(bigintMulLimbs(a.limbs, b.limbs))
+}
+
+// `a * a`. Shares the schoolbook multiply core today; a dedicated squaring and
+// Karatsuba are later optimizations that will not change this signature.
+export function bigintSqr(a: Nat): Nat {
+  return bigintMake(bigintMulLimbs(a.limbs, a.limbs))
+}
+
+// ---------------------------------------------------------------------------
+// Division and remainder (Knuth Algorithm D)
+// ---------------------------------------------------------------------------
+
+// The quotient and remainder of a division. Both fields are exported so callers
+// in other modules can read the two halves of a `bigintDivMod` result.
+export struct QuotRem {
+  export q: Nat
+  export r: Nat
+}
+
+// Divide the limb slice `u` by a single non-zero word `d`, returning the
+// quotient limbs and the remainder word. The classic long division: carry the
+// running remainder into the high half of each step's 64-bit dividend.
+function bigintDivModSmall(u: []u32, d: u32): QuotRem {
+  let q = []u32(len(u))
+  let rem: u64 = 0
+  let i = len(u) - 1
+  while (i >= 0) {
+    let cur = (rem << 32) | u64(u[i])
+    q[i] = u32(cur / u64(d))
+    rem = cur % u64(d)
+    i = i - 1
+  }
+  let r = []u32(1)
+  r[0] = u32(rem)
+  return QuotRem{ q: bigintMake(q), r: bigintMake(r) }
+}
+
+// Shift the limb slice `a` left by `s` bits, `0 <= s < 32`. When `extra` is
+// true the top carry becomes an appended limb (used for the Algorithm D
+// dividend); otherwise the caller guarantees the carry is zero (the divisor,
+// whose top limb is left-justified by exactly `s`).
+function bigintShlBits(a: []u32, s: int, extra: bool): []u32 {
+  let outLen = len(a)
+  if (extra) {
+    outLen = len(a) + 1
+  }
+  let out = []u32(outLen)
+  if (s == 0) {
+    let i = 0
+    while (i < len(a)) {
+      out[i] = a[i]
+      i = i + 1
+    }
+    return out
+  }
+  let carry: u32 = 0
+  let i = 0
+  while (i < len(a)) {
+    out[i] = (a[i] << u32(s)) | carry
+    carry = a[i] >> u32(32 - s)
+    i = i + 1
+  }
+  if (extra) {
+    out[len(a)] = carry
+  }
+  return out
+}
+
+// Shift the `n`-limb slice `a` right by `s` bits, `0 <= s < 32`. Used to
+// un-normalize the Algorithm D remainder.
+function bigintShrBits(a: []u32, s: int): []u32 {
+  let n = len(a)
+  let out = []u32(n)
+  if (s == 0) {
+    let i = 0
+    while (i < n) {
+      out[i] = a[i]
+      i = i + 1
+    }
+    return out
+  }
+  let carry: u32 = 0
+  let i = n - 1
+  while (i >= 0) {
+    out[i] = (a[i] >> u32(s)) | carry
+    carry = a[i] << u32(32 - s)
+    i = i - 1
+  }
+  return out
+}
+
+// Knuth's Algorithm D (TAOCP vol. 2, §4.3.1): divide the normalized limb slice
+// `u` by the normalized multi-limb `v` (len >= 2, top limb non-zero), returning
+// normalized quotient and remainder. Single-limb divisors and the `u < v` case
+// are handled by the callers below; here `len(u) >= len(v) >= 2`.
+function bigintDivModKnuth(u: []u32, v: []u32): QuotRem {
+  let n = len(v)
+  let ulen = len(u)
+  // D1: normalize so the divisor's top bit is set. `un` gains a high limb.
+  let s = bigintClz32(v[n - 1])
+  let vn = bigintShlBits(v, s, false)
+  let un = bigintShlBits(u, s, true)
+  let q = []u32(ulen - n + 1)
+
+  // D2/D7: loop the quotient digit index j from high to low.
+  let j = ulen - n
+  while (j >= 0) {
+    // D3: estimate qhat from the top two dividend limbs, then correct down. The
+    // `qhat >= 2^32` guard fires first (short-circuit), so `qhat * vn[n-2]` is
+    // only ever evaluated with qhat < 2^32 and cannot overflow u64.
+    let num = (u64(un[j + n]) << 32) | u64(un[j + n - 1])
+    let qhat = num / u64(vn[n - 1])
+    let rhat = num % u64(vn[n - 1])
+    while (qhat >= 0x100000000 || qhat * u64(vn[n - 2]) > ((rhat << 32) | u64(un[j + n - 2]))) {
+      qhat = qhat - 1
+      rhat = rhat + u64(vn[n - 1])
+      if (rhat >= 0x100000000) {
+        break
+      }
+    }
+    // D4: multiply and subtract qhat*vn from the window un[j..j+n].
+    let borrow: u64 = 0
+    let i = 0
+    while (i < n) {
+      let p = qhat * u64(vn[i]) + borrow
+      let pLow = p & 0xffffffff
+      borrow = p >> 32
+      if (u64(un[j + i]) >= pLow) {
+        un[j + i] = u32(u64(un[j + i]) - pLow)
+      } else {
+        un[j + i] = u32(u64(un[j + i]) + 0x100000000 - pLow)
+        borrow = borrow + 1
+      }
+      i = i + 1
+    }
+    // The final window limb absorbs the accumulated borrow; a shortfall means
+    // qhat was one too large (D5 test).
+    let over = false
+    if (u64(un[j + n]) >= borrow) {
+      un[j + n] = u32(u64(un[j + n]) - borrow)
+    } else {
+      un[j + n] = u32(u64(un[j + n]) + 0x100000000 - borrow)
+      over = true
+    }
+    if (over) {
+      // D6: add the divisor back once and drop qhat by one.
+      qhat = qhat - 1
+      let carry: u64 = 0
+      let k = 0
+      while (k < n) {
+        let s2 = u64(un[j + k]) + u64(vn[k]) + carry
+        un[j + k] = u32(s2 & 0xffffffff)
+        carry = s2 >> 32
+        k = k + 1
+      }
+      un[j + n] = u32(u64(un[j + n]) + carry)
+    }
+    q[j] = u32(qhat)
+    j = j - 1
+  }
+
+  // D8: the remainder is the low n limbs of un, un-normalized by the shift.
+  let rn = []u32(n)
+  let i = 0
+  while (i < n) {
+    rn[i] = un[i]
+    i = i + 1
+  }
+  return QuotRem{ q: bigintMake(q), r: bigintMake(bigintShrBits(rn, s)) }
+}
+
+// Quotient and remainder of `a / b`. Fails on division by zero. Routes tiny and
+// trivial cases directly and hands the general case to Algorithm D.
+export function bigintDivMod(a: Nat, b: Nat): QuotRem! {
+  if (bigintIsZero(b)) {
+    fail newError("bigintDivMod: divide by zero")
+  }
+  if (bigintCmpLimbs(a.limbs, b.limbs) < 0) {
+    return QuotRem{ q: bigintZero(), r: a }
+  }
+  if (len(b.limbs) == 1) {
+    return bigintDivModSmall(a.limbs, b.limbs[0])
+  }
+  return bigintDivModKnuth(a.limbs, b.limbs)
+}
+
+// `a mod b`, the non-negative remainder. Fails on a zero modulus.
+export function bigintMod(a: Nat, b: Nat): Nat! {
+  return bigintDivMod(a, b)?.r
+}
+
+// `x mod y` for a known-non-zero `y`, without the fallible wrapper — a private
+// convenience for the GCD and inverse loops.
+function bigintModNZ(x: Nat, y: Nat): Nat {
+  if (bigintCmpLimbs(x.limbs, y.limbs) < 0) {
+    return x
+  }
+  if (len(y.limbs) == 1) {
+    return bigintDivModSmall(x.limbs, y.limbs[0]).r
+  }
+  return bigintDivModKnuth(x.limbs, y.limbs).r
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-width helpers for Montgomery arithmetic
+// ---------------------------------------------------------------------------
+//
+// Montgomery code operates on limb slices of a fixed width `k = len(modulus)`,
+// which may carry high zero limbs (so it is deliberately *not* normalized). This
+// keeps every operation constant-width, a prerequisite for constant time.
+
+// `n`'s limbs zero-extended (or, where the caller guarantees it fits, truncated)
+// to exactly `k` limbs.
+function bigintWiden(n: Nat, k: int): []u32 {
+  let out = []u32(k)
+  let src = bigintMinInt(len(n.limbs), k)
+  let i = 0
+  while (i < src) {
+    out[i] = n.limbs[i]
+    i = i + 1
+  }
+  return out
+}
+
+// The fixed-width representation of one: `[1, 0, ..., 0]` of length `k`.
+function bigintOneWidth(k: int): []u32 {
+  let out = []u32(k)
+  out[0] = 1
+  return out
+}
+
+// Reduce the `(k+1)`-limb value `d`, known to be less than `2n`, to `d mod n` in
+// `k` limbs by at most one conditional subtraction of `n`. The subtraction is
+// always computed and then selected with a mask, so no branch depends on whether
+// it was needed — the constant-time core of Montgomery reduction. `d[k]` is the
+// single overflow bit (0 or 1).
+function bigintReduceOnce(d: []u32, n: []u32): []u32 {
+  let k = len(n)
+  let diff = []u32(k)
+  let borrow: u64 = 0
+  let i = 0
+  while (i < k) {
+    let x = u64(d[i]) + 0x100000000 - u64(n[i]) - borrow
+    diff[i] = u32(x & 0xffffffff)
+    borrow = 1 - (x >> 32)
+    i = i + 1
+  }
+  // d >= n  iff  the overflow bit is set OR the subtraction did not borrow out.
+  let ge = d[k] | (1 - u32(borrow))
+  let mask = u32(0) - ge
+  let out = []u32(k)
+  i = 0
+  while (i < k) {
+    out[i] = (diff[i] & mask) | (d[i] & ~mask)
+    i = i + 1
+  }
+  return out
+}
+
+// The inverse of the odd word `a` modulo 2^32, by Newton's iteration: each step
+// doubles the number of correct low bits, so five steps from a one-bit seed
+// cover all 32 bits. All arithmetic is `u32`, i.e. modulo 2^32.
+function bigintInvWord(a: u32): u32 {
+  let x: u32 = 1
+  let i = 0
+  while (i < 5) {
+    x = x * (2 - a * x)
+    i = i + 1
+  }
+  return x
+}
+
+// Montgomery multiplication (CIOS form, Koc et al. 1996): given `a, b < n` of
+// width `k`, the odd modulus `n`, and `n0inv = -n[0]^{-1} mod 2^32`, return
+// `a*b*R^{-1} mod n` where `R = 2^(32k)`. The interleaved multiply-and-reduce
+// keeps the accumulator `t` just `k+2` limbs wide; each `(carry, limb)` update
+// tops out at 2^64 - 1, so nothing overflows.
+function bigintMontMul(a: []u32, b: []u32, n: []u32, n0inv: u32): []u32 {
+  let k = len(n)
+  let t = []u32(k + 2)
+  let i = 0
+  while (i < k) {
+    // t += a * b[i]
+    let c: u64 = 0
+    let j = 0
+    while (j < k) {
+      let uv = u64(t[j]) + u64(a[j]) * u64(b[i]) + c
+      t[j] = u32(uv & 0xffffffff)
+      c = uv >> 32
+      j = j + 1
+    }
+    let uv2 = u64(t[k]) + c
+    t[k] = u32(uv2 & 0xffffffff)
+    t[k + 1] = u32(uv2 >> 32)
+    // m = t[0] * n0inv mod 2^32; t += m*n makes the low limb zero, then shift.
+    let m = u32((u64(t[0]) * u64(n0inv)) & 0xffffffff)
+    let uv3 = u64(t[0]) + u64(m) * u64(n[0])
+    c = uv3 >> 32
+    j = 1
+    while (j < k) {
+      let uv = u64(t[j]) + u64(m) * u64(n[j]) + c
+      t[j - 1] = u32(uv & 0xffffffff)
+      c = uv >> 32
+      j = j + 1
+    }
+    let uv4 = u64(t[k]) + c
+    t[k - 1] = u32(uv4 & 0xffffffff)
+    c = uv4 >> 32
+    t[k] = u32(u64(t[k + 1]) + c)
+    i = i + 1
+  }
+  // Result is t[0..k] with overflow bit t[k]; one conditional subtraction of n.
+  let d = []u32(k + 1)
+  i = 0
+  while (i < k + 1) {
+    d[i] = t[i]
+    i = i + 1
+  }
+  return bigintReduceOnce(d, n)
+}
+
+// `2^(2*32*k) mod n` (that is `R^2 mod n`, the Montgomery conversion constant),
+// by doubling one modulo `n` a fixed `2*32*k` times. Setup only, so its cost is
+// paid once per exponentiation.
+function bigintMontR2(n: []u32): []u32 {
+  let k = len(n)
+  let x = bigintOneWidth(k)
+  let total = 2 * 32 * k
+  let i = 0
+  while (i < total) {
+    // x = 2x mod n
+    let d = []u32(k + 1)
+    let carry: u32 = 0
+    let j = 0
+    while (j < k) {
+      d[j] = (x[j] << 1) | carry
+      carry = x[j] >> 31
+      j = j + 1
+    }
+    d[k] = carry
+    x = bigintReduceOnce(d, n)
+    i = i + 1
+  }
+  return x
+}
+
+// Constant-time conditional swap of the equal-length limb slices `a` and `b`:
+// swap their contents when `swap == 1`, leave them when `swap == 0`, touching
+// every limb either way so the memory-access pattern is independent of `swap`.
+function bigintCswap(a: []u32, b: []u32, swap: u32) {
+  let mask = u32(0) - swap
+  let i = 0
+  while (i < len(a)) {
+    let t = mask & (a[i] ^ b[i])
+    a[i] = a[i] ^ t
+    b[i] = b[i] ^ t
+    i = i + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Modular exponentiation
+// ---------------------------------------------------------------------------
+
+// `base^exp mod mod` by a *constant-time* Montgomery powering ladder, for an odd
+// modulus. Every exponent bit drives one conditional swap plus one multiply and
+// one square, so the operation sequence — and thus the timing — is identical for
+// every exponent of a given bit length. This is the path secret exponents (RSA
+// `d`, ECDSA nonces) must take. `expBitLen` fixes how many bits are scanned.
+function bigintModExpMont(baseReduced: Nat, exp: Nat, modN: Nat, expBitLen: int): Nat {
+  let n = bigintWiden(modN, len(modN.limbs))
+  let n0inv = u32(0) - bigintInvWord(n[0])
+  let r2 = bigintMontR2(n)
+  let one = bigintOneWidth(len(n))
+  // Convert into Montgomery form: r0 = R mod n (montgomery one), r1 = base*R mod n.
+  let r0 = bigintMontMul(one, r2, n, n0inv)
+  let r1 = bigintMontMul(bigintWiden(baseReduced, len(n)), r2, n, n0inv)
+
+  let bit = expBitLen - 1
+  while (bit >= 0) {
+    let b = (exp.limbs[bit / 32] >> u32(bit % 32)) & 1
+    bigintCswap(r0, r1, b)
+    r1 = bigintMontMul(r0, r1, n, n0inv)
+    r0 = bigintMontMul(r0, r0, n, n0inv)
+    bigintCswap(r0, r1, b)
+    bit = bit - 1
+  }
+  // Convert out of Montgomery form: r0 * 1 * R^{-1} = base^exp mod n.
+  return bigintMake(bigintMontMul(r0, one, n, n0inv))
+}
+
+// `base^exp mod mod` by variable-time square-and-multiply. Faster for small or
+// public exponents (e.g. the RSA public exponent 65537), but it branches on the
+// exponent bits, so it must never be used with a secret exponent. Also the
+// fallback for an even modulus, where Montgomery reduction does not apply.
+function bigintModExpVartime(base: Nat, exp: Nat, modN: Nat): Nat! {
+  let result = bigintFromU64(1)
+  let b = bigintMod(base, modN)?
+  let bitLen = bigintBitLen(exp)
+  let i = 0
+  while (i < bitLen) {
+    if (((exp.limbs[i / 32] >> u32(i % 32)) & 1) == 1) {
+      result = bigintMod(bigintMul(result, b), modN)?
+    }
+    b = bigintMod(bigintSqr(b), modN)?
+    i = i + 1
+  }
+  return result
+}
+
+// `base^exp mod mod`, defaulting to the constant-time Montgomery ladder so it is
+// safe for secret exponents. Fails on a zero modulus. `mod == 1` gives 0 and a
+// zero exponent gives 1. An even modulus cannot use Montgomery reduction, so it
+// falls back to variable-time square-and-multiply (even moduli do not arise in
+// the public-key settings where exponent secrecy matters).
+export function bigintModExp(base: Nat, exp: Nat, modN: Nat): Nat! {
+  if (bigintIsZero(modN)) {
+    fail newError("bigintModExp: zero modulus")
+  }
+  let one = bigintFromU64(1)
+  if (bigintCmp(modN, one) == 0) {
+    return bigintZero()
+  }
+  if (bigintIsZero(exp)) {
+    return one
+  }
+  let baseReduced = bigintMod(base, modN)?
+  if ((modN.limbs[0] & 1) == 0) {
+    return bigintModExpVartime(baseReduced, exp, modN)?
+  }
+  return bigintModExpMont(baseReduced, exp, modN, bigintBitLen(exp))
+}
+
+// `base^exp mod mod` optimized for a *public* exponent: variable-time
+// square-and-multiply, which does no multiply on a zero exponent bit. Use only
+// when the exponent is not secret (RSA verification/encryption). Fails on a zero
+// modulus.
+export function bigintModExpPublic(base: Nat, exp: Nat, modN: Nat): Nat! {
+  if (bigintIsZero(modN)) {
+    fail newError("bigintModExpPublic: zero modulus")
+  }
+  if (bigintCmp(modN, bigintFromU64(1)) == 0) {
+    return bigintZero()
+  }
+  return bigintModExpVartime(base, exp, modN)?
+}
+
+// ---------------------------------------------------------------------------
+// GCD and modular inverse
+// ---------------------------------------------------------------------------
+
+// The greatest common divisor of `a` and `b` by the Euclidean algorithm;
+// `gcd(x, 0) = x`, so `gcd(0, 0) = 0`.
+export function bigintGcd(a: Nat, b: Nat): Nat {
+  let x = a
+  let y = b
+  while (!bigintIsZero(y)) {
+    let r = bigintModNZ(x, y)
+    x = y
+    y = r
+  }
+  return x
+}
+
+// The modular inverse of `a` modulo `n`: the value `x` in `[0, n)` with
+// `a*x = 1 (mod n)`. Uses the extended Euclidean algorithm carried entirely in
+// `[0, n)` (every coefficient reduced modulo `n`), so no signed big integer is
+// needed. Fails if `a` and `n` are not coprime (no inverse exists) or `n == 0`.
+// This routine is variable-time; for a secret inverse under a prime modulus use
+// Fermat's little theorem via `bigintModExp(a, n-2, n)` instead.
+export function bigintModInverse(a: Nat, n: Nat): Nat! {
+  if (bigintIsZero(n)) {
+    fail newError("bigintModInverse: zero modulus")
+  }
+  let one = bigintFromU64(1)
+  if (bigintCmp(n, one) == 0) {
+    return bigintZero()
+  }
+  let r = n
+  let newr = bigintMod(a, n)?
+  let t = bigintZero()
+  let newt = one
+  while (!bigintIsZero(newr)) {
+    let d = bigintDivMod(r, newr)?
+    // (t, newt) = (newt, (t - q*newt) mod n)
+    let qt = bigintMod(bigintMul(d.q, newt), n)?
+    let tmp = bigintZero()
+    if (bigintCmp(t, qt) >= 0) {
+      tmp = bigintSub(t, qt)?
+    } else {
+      tmp = bigintSub(bigintAdd(t, n), qt)?
+    }
+    t = newt
+    newt = tmp
+    r = newr
+    newr = d.r
+  }
+  if (bigintCmp(r, one) != 0) {
+    fail newError("bigintModInverse: not invertible")
+  }
+  return t
+}
+
+// ---------------------------------------------------------------------------
+// Byte conversion (big-endian, RFC 8017 I2OSP / OS2IP style)
+// ---------------------------------------------------------------------------
+
+// The `Nat` whose big-endian byte encoding is `be` (most significant byte
+// first). Leading zero bytes are absorbed by normalization, so `00 00 01` and
+// `01` yield the same value. An empty slice is zero.
+export function bigintFromBytes(be: []byte): Nat {
+  let nbytes = len(be)
+  let nlimbs = (nbytes + 3) / 4
+  let limbs = []u32(nlimbs)
+  let i = 0
+  while (i < nbytes) {
+    let v = u32(be[nbytes - 1 - i])
+    limbs[i / 4] = limbs[i / 4] | (v << u32((i % 4) * 8))
+    i = i + 1
+  }
+  return bigintMake(limbs)
+}
+
+// `n` as exactly `outLen` big-endian bytes, left-padded with zeros. Fails if `n`
+// does not fit in `outLen` bytes rather than silently truncating — the safe
+// I2OSP policy, so a key or point that overflows its field width is caught.
+export function bigintToBytes(n: Nat, outLen: int): []byte! {
+  let needed = (bigintBitLen(n) + 7) / 8
+  if (needed > outLen) {
+    fail newError("bigintToBytes: value needs ${needed} bytes, only ${outLen} allowed")
+  }
+  let out = []byte(outLen)
+  let limbCount = len(n.limbs)
+  let i = 0
+  while (i < outLen) {
+    let limbIdx = i / 4
+    let shift = (i % 4) * 8
+    let v: byte = 0
+    if (limbIdx < limbCount) {
+      v = byte((n.limbs[limbIdx] >> u32(shift)) & 0xff)
+    }
+    out[outLen - 1 - i] = v
+    i = i + 1
+  }
+  return out
+}

@@ -1486,3 +1486,193 @@ function isSequence(e: Element): bool {
   return e.cls == classUniversal && e.constructed && e.tag == tagSequence
 }
 ```
+
+## Big integers
+
+Variable-width unsigned big integers — the modular-arithmetic bedrock the
+public-key primitives build on (RSA, the NIST curves). A `Nat` is an
+arbitrary-precision non-negative integer; its magnitude is unbounded, its
+representation always normalized. All routines are total on well-formed input,
+failing only where a result cannot exist (a negative difference, a zero modulus,
+a non-invertible element) or does not fit a requested fixed width.
+
+The exponentiation entry points split by whether the exponent is secret.
+`bigintModExp` defaults to a constant-time Montgomery ladder, so its timing does
+not leak the exponent — this is the path for RSA private-key operations and
+ECDSA nonces. `bigintModExpPublic` is a faster variable-time square-and-multiply
+for public exponents (RSA verification and encryption), and must never be used
+with a secret exponent. Likewise `bigintModInverse` is variable-time; for a
+secret inverse under a prime modulus use `bigintModExp(a, p-2, p)` (Fermat)
+instead.
+
+### `Nat`
+
+A non-negative arbitrary-precision integer, backed by a normalized little-endian
+slice of 32-bit limbs (zero is the empty slice). Its field is module-private, so
+a `Nat` is built and inspected only through the `bigint*` functions below —
+`bigintFromU64` and `bigintFromBytes` in, `bigintToU64` and `bigintToBytes` out.
+
+```bit
+import {
+  Nat, bigintFromBytes, bigintToBytes, bigintCmp, bigintIsZero, bigintBitLen,
+} from "std/crypto"
+
+// Parse a big-endian modulus, and report its width and whether it is nonzero.
+function inspect(nBytes: []byte): int {
+  let n = bigintFromBytes(nBytes)
+  if (bigintIsZero(n)) {
+    return 0
+  }
+  if (bigintCmp(n, n) != 0) {
+    return -1
+  }
+  return bigintBitLen(n)
+}
+
+// Re-serialize a Nat to a fixed width, restoring any leading zero bytes.
+function fixedWidth(n: Nat, width: int): []byte! {
+  return bigintToBytes(n, width)?
+}
+```
+
+### `QuotRem`
+
+The result of a division: the exported fields `q` (quotient) and `r` (remainder),
+both `Nat`. Returned by `bigintDivMod` so a caller in another module can read the
+two halves directly.
+
+### `bigintZero(): Nat`
+
+The number zero.
+
+### `bigintFromU64(v: u64): Nat`
+
+The `Nat` equal to the unsigned 64-bit value `v`.
+
+### `bigintToU64(n: Nat): u64!`
+
+The value of `n` as a `u64`; fails if `n` needs more than 64 bits. Intended for
+small results and assertions — compare large values as bytes via `bigintToBytes`.
+
+### `bigintIsZero(n: Nat): bool`
+
+Whether `n` is zero.
+
+### `bigintBitLen(n: Nat): int`
+
+The number of significant bits in `n`: 0 for zero, otherwise the position of the
+highest set bit plus one.
+
+### `bigintCmp(a: Nat, b: Nat): int`
+
+Compare `a` and `b`: `-1` if `a < b`, `0` if equal, `1` if `a > b`.
+
+### `bigintAdd(a: Nat, b: Nat): Nat`
+
+The sum `a + b`.
+
+### `bigintSub(a: Nat, b: Nat): Nat!`
+
+The difference `a - b`. Fails if `b > a`: a `Nat` is unsigned, so there is no
+negative value to return.
+
+### `bigintMul(a: Nat, b: Nat): Nat`
+
+The product `a * b` (schoolbook multiplication).
+
+### `bigintSqr(a: Nat): Nat`
+
+The square `a * a`.
+
+### `bigintDivMod(a: Nat, b: Nat): QuotRem!`
+
+The quotient and remainder of `a / b` (Knuth's Algorithm D). Fails on division by
+zero.
+
+### `bigintMod(a: Nat, b: Nat): Nat!`
+
+The non-negative remainder `a mod b`. Fails on a zero modulus.
+
+```bit
+import {
+  QuotRem, bigintFromU64, bigintDivMod, bigintMod, bigintGcd,
+  bigintAdd, bigintSub, bigintMul, bigintSqr, bigintToU64,
+} from "std/crypto"
+
+// Long division: 1000 / 7 is quotient 142, remainder 6.
+function divide(): QuotRem! {
+  return bigintDivMod(bigintFromU64(1000), bigintFromU64(7))?
+}
+
+// gcd(48, 36) == 12, and reduce it through the other primitives.
+function reduce(): u64! {
+  let g = bigintGcd(bigintFromU64(48), bigintFromU64(36))
+  let sum = bigintAdd(g, bigintFromU64(0))
+  let diff = bigintSub(sum, bigintFromU64(0))?
+  let prod = bigintMul(diff, bigintFromU64(1))
+  let sq = bigintSqr(prod)
+  return bigintToU64(bigintMod(sq, bigintFromU64(1000))?)?
+}
+```
+
+### `bigintModExp(base: Nat, exp: Nat, modN: Nat): Nat!`
+
+`base^exp mod modN` by a constant-time Montgomery ladder, safe for secret
+exponents. Fails on a zero modulus. `modN == 1` gives 0 and a zero exponent gives
+1. An even modulus (where Montgomery reduction does not apply) falls back to
+variable-time square-and-multiply.
+
+### `bigintModExpPublic(base: Nat, exp: Nat, modN: Nat): Nat!`
+
+`base^exp mod modN` by variable-time square-and-multiply, for a *public*
+exponent. Faster than the constant-time path, but it branches on the exponent
+bits — use only when the exponent is not secret. Fails on a zero modulus.
+
+```bit
+import { Nat, bigintModExp, bigintModExpPublic, bigintFromBytes, bigintToBytes, bigintFromU64 } from "std/crypto"
+
+// RSA public operation c = m^e mod n over big-endian byte strings (e = 65537).
+function rsaPublic(mBytes: []byte, nBytes: []byte): []byte! {
+  let m = bigintFromBytes(mBytes)
+  let n = bigintFromBytes(nBytes)
+  let c = bigintModExpPublic(m, bigintFromU64(65537), n)?
+  return bigintToBytes(c, len(nBytes))?
+}
+
+// RSA private operation m = c^d mod n takes the constant-time ladder.
+function rsaPrivate(c: Nat, d: Nat, n: Nat): Nat! {
+  return bigintModExp(c, d, n)?
+}
+```
+
+### `bigintModInverse(a: Nat, n: Nat): Nat!`
+
+The modular inverse of `a` modulo `n`: the value `x` in `[0, n)` with
+`a*x = 1 (mod n)`. Fails if `a` and `n` are not coprime or `n == 0`.
+Variable-time — for a secret inverse under a prime modulus prefer Fermat's little
+theorem via `bigintModExp`.
+
+```bit
+import { bigintFromU64, bigintModInverse, bigintToU64 } from "std/crypto"
+
+// The modular inverse of 3 modulo 11 is 4.
+function inverse(): u64! {
+  return bigintToU64(bigintModInverse(bigintFromU64(3), bigintFromU64(11))?)?
+}
+```
+
+### `bigintGcd(a: Nat, b: Nat): Nat`
+
+The greatest common divisor of `a` and `b` (Euclid); `gcd(x, 0) = x`.
+
+### `bigintFromBytes(be: []byte): Nat`
+
+The `Nat` whose big-endian encoding is `be`. Leading zero bytes are absorbed by
+normalization, so `00 00 01` and `01` yield the same value; an empty slice is
+zero. This is the OS2IP direction (RFC 8017).
+
+### `bigintToBytes(n: Nat, outLen: int): []byte!`
+
+`n` as exactly `outLen` big-endian bytes, left-padded with zeros. Fails if `n`
+does not fit in `outLen` bytes rather than silently truncating — the safe I2OSP
+policy, so a key or point that overflows its field width is caught.
