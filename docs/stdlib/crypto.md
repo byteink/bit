@@ -2164,3 +2164,141 @@ The raw ECDH shared secret: the fixed-width big-endian x-coordinate of
 that the peer point is on the curve and is not the identity before multiplying —
 closing the invalid-curve attack — and fails on any malformed, off-curve, or
 identity input.
+
+## BLAKE3
+
+BLAKE3 (the official specification) hashes a message through a binary Merkle tree
+of 1024-byte chunks, reduced by a seven-round compression function over a 16-word
+`u32` state. It is fast, and it is an extendable-output function (XOF): the same
+hasher yields a 32-byte digest by default or any number of bytes on demand. Three
+keying modes share one code path — the default hash, `keyed_hash` (a 32-byte-keyed
+MAC), and `derive_key` (a KDF seeded by a context string). Every value is read and
+written little-endian, so output is byte-identical on x86-64 and ARM64, and every
+result is verified against the official BLAKE3 test vectors.
+
+`Blake3` is a streaming hasher: feed bytes with any number of `write` calls, then
+read the digest with `sum` (32 bytes) or `finalize(n)` (an arbitrary-length XOF
+draw). It conforms structurally to `Hash`, so it drops into `digest`, `hmac`, and
+`hkdf` unchanged. Tree hashing here is single-threaded, and memory stays bounded
+regardless of message length. Reuse one hasher for many messages by calling
+`reset` between them.
+
+```bit
+import {
+  Hash, digest, encodeHex,
+  newBlake3, newBlake3Keyed, newBlake3DeriveKey,
+  blake3Hash, blake3KeyedHash, blake3Xof,
+} from "std/crypto"
+
+// One-shot 32-byte digest, rendered as a lowercase hex string.
+function fingerprint(data: []byte): string {
+  return encodeHex(blake3Hash(data))
+}
+
+// Streaming: feed input across as many `write` calls as convenient, read `sum`.
+function streamed(): []byte {
+  let h = newBlake3()
+  h.write([]byte("BLAKE3 "))
+  h.write([]byte("streaming"))
+  return h.sum()
+}
+
+// A keyed MAC (BLAKE3's keyed_hash) under a 32-byte key.
+function mac(key: []byte, msg: []byte): []byte! {
+  return blake3KeyedHash(key, msg)?
+}
+
+// The same keyed MAC, built as a streaming hasher.
+function keyedStream(key: []byte): []byte! {
+  let h = newBlake3Keyed(key)?
+  h.write([]byte("authenticated data"))
+  return h.sum()
+}
+
+// Key derivation: a subkey from a context string and input key material.
+function subkey(material: []byte): []byte {
+  let h = newBlake3DeriveKey("example.com 2026 session-key")
+  h.write(material)
+  return h.finalize(32)
+}
+
+// Extendable output: draw a 64-byte key stream from the default hash.
+function widen(seed: []byte): []byte {
+  return blake3Xof(seed, 64)
+}
+
+// Hashing against the `Hash` interface — the algorithm is a parameter, so BLAKE3
+// drops into any `Hash`-based helper (HMAC, HKDF, `digest`) unchanged.
+function tag(h: Hash, msg: []byte): string {
+  return encodeHex(digest(h, msg))
+}
+```
+
+### `Blake3`
+
+A streaming BLAKE3 hasher and XOF, conforming structurally to `Hash`. Build one
+with `newBlake3`, `newBlake3Keyed`, or `newBlake3DeriveKey`; do not construct it
+by field.
+
+### `newBlake3(): Blake3`
+
+A fresh unkeyed BLAKE3 hasher — the default hash function.
+
+### `newBlake3Keyed(key: []byte): Blake3!`
+
+A fresh keyed hasher (BLAKE3's `keyed_hash`, a MAC). `key` must be exactly 32
+bytes; its little-endian words become the initial key words. Fails otherwise.
+
+### `newBlake3DeriveKey(context: string): Blake3`
+
+A fresh derive-key hasher (BLAKE3's `derive_key`). The context is hashed once in
+context mode; its chaining value keys the hashing of the key material fed next.
+`context` should be a hardcoded, globally unique application string — not a
+runtime secret or variable.
+
+### `Blake3.write(data: []byte)`
+
+Absorbs more input into the running hash.
+
+### `Blake3.sum(): []byte`
+
+The 32-byte default digest of everything written since the last `reset` — exactly
+`finalize(32)`. Non-destructive, so the hasher may keep accepting input afterward.
+
+### `Blake3.finalize(n: int): []byte`
+
+Draws `n` output bytes (the XOF). Non-destructive, so the hasher may keep
+absorbing afterward. The first `n` bytes are the same for any larger `n`; a
+non-positive `n` yields an empty slice.
+
+### `Blake3.reset()`
+
+Returns the hasher to the empty message, keeping its mode (the key or derive-key
+words and flags).
+
+### `Blake3.size(): int`
+
+The default digest length in bytes (32).
+
+### `Blake3.blockSize(): int`
+
+The internal block size in bytes (64) — the value HMAC needs.
+
+### `blake3Hash(data: []byte): []byte`
+
+One-shot BLAKE3: the 32-byte default digest of `data`.
+
+### `blake3KeyedHash(key: []byte, data: []byte): []byte!`
+
+One-shot BLAKE3 keyed hash: the 32-byte MAC of `data` under the 32-byte `key`.
+Fails if the key is not exactly 32 bytes.
+
+### `blake3DeriveKey(context: string, keyMaterial: []byte): []byte`
+
+One-shot BLAKE3 key derivation: a 32-byte key derived from `keyMaterial` under the
+given `context` string.
+
+### `blake3Xof(data: []byte, n: int): []byte`
+
+One-shot BLAKE3 XOF: `n` output bytes of the default hash of `data`. For `n == 32`
+this equals `blake3Hash(data)`.
