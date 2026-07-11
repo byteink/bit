@@ -1963,3 +1963,113 @@ The DER `DigestInfo` prefix for SHA-384 (48-byte digest).
 ### `rsaDigestInfoSha512(): []byte`
 
 The DER `DigestInfo` prefix for SHA-512 (64-byte digest).
+
+## ECDSA
+
+The Elliptic Curve Digital Signature Algorithm (FIPS 186-4 / SEC 1) over the
+NIST P-256 and P-384 curves, built on the `nistec` point arithmetic, the `bigint`
+integers, the `asn1` DER codec, and `hmac`. Sign a pre-computed digest, verify a
+signature, handle keys, and serialize a signature as the standard
+`SEQUENCE { INTEGER r, INTEGER s }`.
+
+The nonce is **RFC 6979 deterministic** — derived by HMAC-DRBG from the private
+key and the message digest rather than drawn at random. A biased or repeated
+ECDSA nonce discloses the private key, so removing randomness removes that whole
+failure class; it also makes signatures reproducible, which is what lets them be
+checked against fixed known-answer vectors (the P-256/SHA-256 and P-384/SHA-384
+"sample" vectors of RFC 6979 A.2.5 / A.2.6). The secret nonce is inverted in
+constant time via Fermat's little theorem on the constant-time modular-exponent
+ladder; the scalar multiplications use `nistec`'s branchless Montgomery ladder.
+As in `nistec`, the field arithmetic is not yet timing-flat at the limb level, so
+this is branch-safe but not a defence against a limb-timing adversary.
+
+The signature is **not** low-`s` normalized: the standard accepts any `s` in
+`[1, n-1]` and the RFC 6979 vectors are themselves high-`s`. A protocol that
+requires canonical low-`s` (e.g. BIP-62) can replace `s` with `n - s` when
+`s > n/2`; verification accepts either form. The digest is caller-supplied — hash
+the message with SHA-256 (P-256) or SHA-384 (P-384) and pass the digest bytes
+plus the matching hash constructor (RFC 6979 keys its HMAC on the same hash).
+
+```bit
+import {
+  Curve, EcdsaPublicKey,
+  ecdsaPrivateKey, ecdsaSign, ecdsaVerify,
+  ecdsaSignatureToDer, ecdsaSignatureFromDer,
+  Hash, newSha256,
+} from "std/crypto"
+
+// SHA-256 as a `() => Hash` value (newSha256 returns the concrete Sha256).
+function sha256Hash(): Hash { return newSha256() }
+
+// Deterministically sign a SHA-256 digest, DER-encode and re-parse the
+// signature, and verify it against the derived public key.
+function signAndVerify(curve: Curve, scalar: []byte, digest: []byte): bool! {
+  let priv = ecdsaPrivateKey(curve, scalar)?
+  let sig = ecdsaSign(priv, digest, sha256Hash)?
+  let der = ecdsaSignatureToDer(sig)
+  let parsed = ecdsaSignatureFromDer(der)?
+  let pub = EcdsaPublicKey{ curve: curve, q: priv.q }
+  return ecdsaVerify(pub, digest, parsed)
+}
+```
+
+### `EcdsaPublicKey`
+
+An ECDSA public key: the exported `curve: Curve` it lives on and the public point
+`q: Point` (`q = d*G`). Build one from a SEC 1 point encoding with `ecdsaPublicKey`,
+or from a private key's `q` field via the struct literal.
+
+### `EcdsaPrivateKey`
+
+An ECDSA private key: the exported `curve: Curve`, the secret scalar `d: Nat` in
+`[1, n-1]`, and the cached public point `q: Point`. Build one with
+`ecdsaPrivateKey` or `ecdsaGenerateKey`.
+
+### `EcdsaSignature`
+
+An ECDSA signature: the exported `Nat` fields `r` and `s`, each in `[1, n-1]`.
+Serialize with `ecdsaSignatureToDer` and parse with `ecdsaSignatureFromDer`.
+
+### `ecdsaPublicKey(curve: Curve, sec1: []byte): EcdsaPublicKey!`
+
+The public key whose point is the SEC 1 octet string `sec1` (uncompressed
+`0x04 || X || Y` or compressed `0x02|0x03 || X`) on `curve`. The point is validated
+to lie on the curve; the point at infinity is rejected.
+
+### `ecdsaPrivateKey(curve: Curve, scalar: []byte): EcdsaPrivateKey!`
+
+The private key whose scalar is the big-endian octet string `scalar` on `curve`,
+with its public point derived. Fails unless the scalar is in `[1, n-1]`.
+
+### `ecdsaGenerateKey(curve: Curve): EcdsaPrivateKey`
+
+A freshly generated private key on `curve`, its scalar drawn uniformly from
+`[1, n-1]` via the OS CSPRNG (rejection sampling, no modulo bias). Read `priv.q`
+for the matching public point.
+
+### `ecdsaSign(priv: EcdsaPrivateKey, hash: []byte, newHash: () => Hash): EcdsaSignature!`
+
+Sign the pre-computed digest `hash` under `priv`, returning `(r, s)`. The nonce is
+RFC 6979 deterministic with HMAC over `newHash`, which must be the same hash
+family used to produce `hash` (`newSha256` for a SHA-256 digest, `newSha384` for
+SHA-384). Only the leftmost `bitlen(n)` bits of the digest are used, so any digest
+length is accepted. The signature is not low-`s` normalized.
+
+### `ecdsaVerify(pub: EcdsaPublicKey, hash: []byte, sig: EcdsaSignature): bool`
+
+Whether `sig` is a valid signature of the digest `hash` under `pub`. Rejects an
+`r` or `s` outside `[1, n-1]`, an off-curve or infinite public point, and any
+signature whose recovered `x` does not match `r`. Never fails — a malformed input
+is simply `false`.
+
+### `ecdsaSignatureToDer(sig: EcdsaSignature): []byte`
+
+The DER encoding of `sig`: `SEQUENCE { INTEGER r, INTEGER s }`, the standard X.509
+/ TLS signature form. Each integer is minimally encoded, with a `0x00` sign octet
+when its top bit is set.
+
+### `ecdsaSignatureFromDer(der: []byte): EcdsaSignature!`
+
+Parse a DER `SEQUENCE { INTEGER r, INTEGER s }` back into a signature. Fails on any
+structure that is not exactly two INTEGERs, on a negative or non-minimally encoded
+integer (the strict `asn1` reader enforces this), or on a zero `r`/`s`.

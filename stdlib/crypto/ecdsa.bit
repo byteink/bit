@@ -1,0 +1,382 @@
+// Bit standard library — crypto module, ECDSA over NIST P-256 / P-384.
+//
+// The Elliptic Curve Digital Signature Algorithm (FIPS 186-4 / SEC 1) layered on
+// the `nistec.bit` curve arithmetic, the `bigint.bit` modular integers, the
+// `asn1.bit` DER codec, and `hmac.bit`. Sign, verify, key handling, and the
+// `SEQUENCE { INTEGER r, INTEGER s }` DER encoding of a signature. Being part of
+// the flat `std/crypto` module, this file reaches every sibling's internals —
+// the `nistec*` point routines (including the module-private `Jac`, `nistecAdd`,
+// `nistecToAffine`), the `bigint*` API and its private `bigintModNZ` / `Nat.limbs`
+// / `bigintMake`, the `asn1*` codec, and `hmac` — and names `newError` from the
+// prelude directly. Every private free function is prefixed `ecdsa`.
+//
+// Two design decisions worth stating up front:
+//
+//   * Nonce generation is RFC 6979 deterministic (HMAC-DRBG seeded by the private
+//     key and the message hash), never a fresh random draw. A biased or repeated
+//     ECDSA nonce leaks the private key outright, so removing randomness from the
+//     nonce removes that entire failure class; two signatures over the same
+//     message under the same key are byte-identical, which is also what makes the
+//     signer testable against fixed known-answer vectors.
+//
+//   * The signature is NOT low-`s` normalized. FIPS 186-4 and RFC 6979 accept any
+//     `s` in `[1, n-1]`, and the published RFC 6979 test vectors are themselves
+//     high-`s`; matching them requires leaving `s` alone. Low-`s` (BIP-62)
+//     canonicalization is a policy some protocols (e.g. Bitcoin) add on top —
+//     a caller who needs it can replace `s` with `n - s` when `s > n/2`.
+//     Verification accepts either, as the standard requires.
+//
+// Constant-time scope inherits `nistec.bit`'s: the scalar multiplications use the
+// branchless Montgomery ladder and the secret nonce is inverted by Fermat
+// (`k^(n-2) mod n`) on the constant-time `bigintModExp` ladder rather than the
+// variable-time extended-Euclid `bigintModInverse`. The underlying variable-width
+// field arithmetic is not yet timing-flat at the limb level (documented in
+// `nistec.bit`), so this is branch-safe but not a defence against a limb-timing
+// adversary. In `verify`, `s` is public, so the faster variable-time inverse is
+// used deliberately.
+
+// ---------------------------------------------------------------------------
+// Keys and signature
+// ---------------------------------------------------------------------------
+
+// An ECDSA public key: the curve it lives on and the public point `q = d*G`.
+// Build one from a SEC 1 point encoding with `ecdsaPublicKey`, or from a private
+// key's `q` field. `curve` and `q` are exported for X.509 / TLS callers.
+export struct EcdsaPublicKey {
+  export curve: Curve,
+  export q: Point,
+}
+
+// An ECDSA private key: the curve, the secret scalar `d` in `[1, n-1]`, and the
+// cached public point `q = d*G` (so signing never has to recompute it and a
+// verifier can be derived without a second scalar multiply).
+export struct EcdsaPrivateKey {
+  export curve: Curve,
+  export d: Nat,
+  export q: Point,
+}
+
+// An ECDSA signature: the two integers `r` and `s`, each in `[1, n-1]`. Serialize
+// to the standard DER form with `ecdsaSignatureToDer` and back with
+// `ecdsaSignatureFromDer`.
+export struct EcdsaSignature {
+  export r: Nat,
+  export s: Nat,
+}
+
+// ---------------------------------------------------------------------------
+// Key construction
+// ---------------------------------------------------------------------------
+
+// The public key whose point is the SEC 1 octet string `sec1` (uncompressed
+// `0x04 || X || Y` or compressed `0x02|0x03 || X`) on `curve`. `nistecPointDecode`
+// validates the point lies on the curve; the point at infinity is rejected.
+export function ecdsaPublicKey(curve: Curve, sec1: []byte): EcdsaPublicKey! {
+  let q = nistecPointDecode(curve, sec1)?
+  if (q.infinity) {
+    fail newError("ecdsa: public key must not be the point at infinity")
+  }
+  return EcdsaPublicKey{ curve: curve, q: q }
+}
+
+// The private key whose scalar is the big-endian octet string `scalar` on
+// `curve`, with its public point derived. Fails unless the scalar is in the valid
+// range `[1, n-1]`.
+export function ecdsaPrivateKey(curve: Curve, scalar: []byte): EcdsaPrivateKey! {
+  let d = bigintFromBytes(scalar)
+  if (bigintIsZero(d) || bigintCmp(d, curve.n) >= 0) {
+    fail newError("ecdsa: private scalar out of range [1, n-1]")
+  }
+  return EcdsaPrivateKey{ curve: curve, d: d, q: nistecScalarBaseMult(curve, d) }
+}
+
+// A freshly generated private key on `curve`, its scalar drawn uniformly from
+// `[1, n-1]` via the OS CSPRNG (rejection sampling, so no modulo bias). The public
+// point is derived. Use `priv.q` to obtain the matching public key.
+export function ecdsaGenerateKey(curve: Curve): EcdsaPrivateKey {
+  let d = ecdsaRandomScalar(curve)
+  return EcdsaPrivateKey{ curve: curve, d: d, q: nistecScalarBaseMult(curve, d) }
+}
+
+// A uniform scalar in `[1, n-1]` by rejection sampling: draw `size` secure random
+// bytes and accept only a value already in range, so there is no modulo bias. The
+// reject probability per draw is under 2^-31 for both curves, so the bounded loop
+// effectively always returns inside it; the post-loop fallback exists only to keep
+// the function total (Power of 10) and is statistically unreachable.
+function ecdsaRandomScalar(curve: Curve): Nat {
+  let tries = 0
+  while (tries < 256) {
+    let k = bigintFromBytes(randomBytes(curve.size))
+    if (!bigintIsZero(k) && bigintCmp(k, curve.n) < 0) {
+      return k
+    }
+    tries = tries + 1
+  }
+  let nm1 = bigintSub(curve.n, bigintFromU64(1)) catch e {
+    return bigintFromU64(1)
+  }
+  let k = bigintModNZ(bigintFromBytes(randomBytes(curve.size + 8)), nm1)
+  return bigintAdd(k, bigintFromU64(1))
+}
+
+// ---------------------------------------------------------------------------
+// RFC 6979 bit/octet conversions
+// ---------------------------------------------------------------------------
+
+// Right-shift the integer `n` by `sh` bits (`sh >= 0`), i.e. `n / 2^sh`. Operates
+// on the raw limbs; a shift that clears every limb yields zero.
+function ecdsaShr(n: Nat, sh: int): Nat {
+  if (sh <= 0) {
+    return n
+  }
+  let limbShift = sh / 32
+  let bitShift = sh % 32
+  let total = len(n.limbs)
+  if (limbShift >= total) {
+    return bigintZero()
+  }
+  let outLen = total - limbShift
+  let out = []u32(outLen)
+  let i = 0
+  while (i < outLen) {
+    let lo = n.limbs[i + limbShift] >> u32(bitShift)
+    let hi: u32 = 0
+    if (bitShift != 0 && i + limbShift + 1 < total) {
+      hi = n.limbs[i + limbShift + 1] << u32(32 - bitShift)
+    }
+    out[i] = lo | hi
+    i = i + 1
+  }
+  return bigintMake(out)
+}
+
+// RFC 6979 `bits2int`: interpret `b` as a big-endian integer over its *full*
+// octet length (`8*len(b)` bits, leading zeros included), then keep only the
+// leftmost `qlenBits` bits by right-shifting away the excess. Shorter input is
+// returned unchanged.
+function ecdsaBits2Int(b: []byte, qlenBits: int): Nat {
+  let z = bigintFromBytes(b)
+  let blen = len(b) * 8
+  if (blen > qlenBits) {
+    return ecdsaShr(z, blen - qlenBits)
+  }
+  return z
+}
+
+// RFC 6979 `int2octets`: `v` (assumed `< n`) as exactly `rlen` big-endian octets,
+// left-padded with zeros. The width `rlen` is the curve field width; a value in
+// range always fits, so the `catch` is unreachable.
+function ecdsaInt2Octets(v: Nat, rlen: int): []byte {
+  return bigintToBytes(v, rlen) catch e {
+    return []byte(rlen)
+  }
+}
+
+// RFC 6979 `bits2octets`: `bits2int(b)` reduced into `[0, n)` by a single
+// conditional subtraction of `n` (not a full modulo), then `int2octets` to the
+// field width. The `catch` is unreachable — the subtraction only runs when
+// `z1 >= n`.
+function ecdsaBits2Octets(b: []byte, c: Curve): []byte {
+  let z1 = ecdsaBits2Int(b, bigintBitLen(c.n))
+  let z2 = z1
+  if (bigintCmp(z1, c.n) >= 0) {
+    z2 = bigintSub(z1, c.n) catch e {
+      return []byte(c.size)
+    }
+  }
+  return ecdsaInt2Octets(z2, c.size)
+}
+
+// Append every byte of `src` onto the caller-owned `dst`, returning the grown
+// slice.
+function ecdsaAppendBytes(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// The DRBG seed octet string `V || tag || int2octets(x) || bits2octets(h1)`,
+// the message fed to HMAC in RFC 6979 §3.2 steps (d) and (f).
+function ecdsaDrbgSeed(V: []byte, tag: byte, xoct: []byte, h1oct: []byte): []byte {
+  let out = []byte(0)
+  out = ecdsaAppendBytes(out, V)
+  out = append(out, tag)
+  out = ecdsaAppendBytes(out, xoct)
+  out = ecdsaAppendBytes(out, h1oct)
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Signing (RFC 6979 deterministic nonce)
+// ---------------------------------------------------------------------------
+
+// The projective form of an affine point: identity maps to the projective point
+// at infinity, a finite point gets `Z = 1`.
+function ecdsaToJac(p: Point): Jac {
+  if (p.infinity) {
+    return nistecInfinity()
+  }
+  return Jac{ x: p.x, y: p.y, z: bigintFromU64(1) }
+}
+
+// Sign the pre-computed message digest `hash` under `priv`, returning `(r, s)`.
+// The nonce `k` is derived deterministically (RFC 6979) with HMAC over `newHash`
+// — which must be the same hash family the caller used to produce `hash` (e.g.
+// `newSha256` for a SHA-256 digest, `newSha384` for SHA-384). The digest is
+// reduced with `bits2int`, so it may be any length; only its leftmost `bitlen(n)`
+// bits are used. The nonce is inverted in constant time via Fermat's little
+// theorem. Fails only if the (astronomically unlikely) RFC 6979 retry budget is
+// exhausted or the curve order is degenerate.
+export function ecdsaSign(priv: EcdsaPrivateKey, hash: []byte, newHash: () => Hash): EcdsaSignature! {
+  let c = priv.curve
+  let n = c.n
+  let qlenBits = bigintBitLen(n)
+  let z = ecdsaBits2Int(hash, qlenBits)
+
+  let probe = newHash()
+  let hlen = probe.size()
+  let xoct = ecdsaInt2Octets(priv.d, c.size)
+  let h1oct = ecdsaBits2Octets(hash, c)
+
+  // RFC 6979 §3.2 (b),(c): V = 0x01..., K = 0x00...
+  let V = []byte(hlen)
+  let i = 0
+  while (i < hlen) {
+    V[i] = 0x01
+    i = i + 1
+  }
+  let K = []byte(hlen)
+  // (d),(e): K = HMAC_K(V || 0x00 || x || h1); V = HMAC_K(V)
+  K = hmac(newHash, K, ecdsaDrbgSeed(V, byte(0), xoct, h1oct))
+  V = hmac(newHash, K, V)
+  // (f),(g): K = HMAC_K(V || 0x01 || x || h1); V = HMAC_K(V)
+  K = hmac(newHash, K, ecdsaDrbgSeed(V, byte(1), xoct, h1oct))
+  V = hmac(newHash, K, V)
+
+  // n - 2, the Fermat inversion exponent for the prime order n.
+  let nm2 = bigintSub(n, bigintFromU64(2)) catch e {
+    fail newError("ecdsa: degenerate curve order")
+  }
+
+  let attempts = 0
+  while (attempts < 512) {
+    // (h.1),(h.2): gather qlen bits into T. Each round appends hlen bytes, so the
+    // inner loop is bounded by ceil(qlen/(8*hlen)); the guard bounds it hard.
+    let T = []byte(0)
+    let guard = 0
+    while (len(T) * 8 < qlenBits && guard < 64) {
+      V = hmac(newHash, K, V)
+      T = ecdsaAppendBytes(T, V)
+      guard = guard + 1
+    }
+    let k = ecdsaBits2Int(T, qlenBits)
+    if (!bigintIsZero(k) && bigintCmp(k, n) < 0) {
+      let R = nistecScalarBaseMult(c, k)
+      if (!R.infinity) {
+        let r = bigintModNZ(R.x, n)
+        if (!bigintIsZero(r)) {
+          // s = k^-1 * (z + r*d) mod n, with k inverted in constant time.
+          let kinv = bigintModExp(k, nm2, n) catch e {
+            fail newError("ecdsa: nonce inversion failed")
+          }
+          let rd = bigintModNZ(bigintMul(r, priv.d), n)
+          let sum = bigintModNZ(bigintAdd(bigintModNZ(z, n), rd), n)
+          let s = bigintModNZ(bigintMul(kinv, sum), n)
+          if (!bigintIsZero(s)) {
+            return EcdsaSignature{ r: r, s: s }
+          }
+        }
+      }
+    }
+    // (h.3): reseed for the next candidate — K = HMAC_K(V || 0x00); V = HMAC_K(V).
+    let reseed = append(ecdsaAppendBytes([]byte(0), V), byte(0))
+    K = hmac(newHash, K, reseed)
+    V = hmac(newHash, K, V)
+    attempts = attempts + 1
+  }
+  fail newError("ecdsa: exhausted the RFC 6979 nonce retry budget")
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+// Whether `sig` is a valid signature of the digest `hash` under `pub`. Rejects an
+// `r` or `s` outside `[1, n-1]`, an off-curve or infinite public point (the
+// invalid-curve attack surface — `nistecScalarMult` re-checks the point lies on
+// the curve), and any signature whose recovered `x` does not match `r`. `s` is
+// public here, so its inverse uses the faster variable-time path. Never fails; a
+// malformed input is simply `false`.
+export function ecdsaVerify(pub: EcdsaPublicKey, hash: []byte, sig: EcdsaSignature): bool {
+  let c = pub.curve
+  let n = c.n
+  if (pub.q.infinity) {
+    return false
+  }
+  if (bigintIsZero(sig.r) || bigintCmp(sig.r, n) >= 0) {
+    return false
+  }
+  if (bigintIsZero(sig.s) || bigintCmp(sig.s, n) >= 0) {
+    return false
+  }
+  let z = ecdsaBits2Int(hash, bigintBitLen(n))
+  let w = bigintModInverse(sig.s, n) catch e {
+    return false
+  }
+  let u1 = bigintModNZ(bigintMul(bigintModNZ(z, n), w), n)
+  let u2 = bigintModNZ(bigintMul(sig.r, w), n)
+  // R = u1*G + u2*Q, computed via the complete projective addition.
+  let p1 = nistecScalarBaseMult(c, u1)
+  let p2 = nistecScalarMult(c, pub.q, u2) catch e {
+    return false
+  }
+  let R = nistecToAffine(c, nistecAdd(c, ecdsaToJac(p1), ecdsaToJac(p2)))
+  if (R.infinity) {
+    return false
+  }
+  return bigintCmp(bigintModNZ(R.x, n), sig.r) == 0
+}
+
+// ---------------------------------------------------------------------------
+// DER serialization — SEQUENCE { INTEGER r, INTEGER s }
+// ---------------------------------------------------------------------------
+
+// The minimal big-endian magnitude of `n` (at least one octet). `asn1BigInteger`
+// adds the DER sign octet; here we only need the unsigned bytes.
+function ecdsaMagnitude(n: Nat): []byte {
+  let w = (bigintBitLen(n) + 7) / 8
+  if (w == 0) {
+    w = 1
+  }
+  return bigintToBytes(n, w) catch e {
+    return []byte(1)
+  }
+}
+
+// The DER encoding of `sig`: `SEQUENCE { INTEGER r, INTEGER s }`, the standard
+// X.509 / TLS signature form. Each integer is minimally encoded with a sign octet
+// when its top bit is set.
+export function ecdsaSignatureToDer(sig: EcdsaSignature): []byte {
+  let kids = []Element(0)
+  kids = append(kids, asn1BigInteger(ecdsaMagnitude(sig.r)))
+  kids = append(kids, asn1BigInteger(ecdsaMagnitude(sig.s)))
+  return asn1Encode(asn1Sequence(kids))
+}
+
+// Parse a DER `SEQUENCE { INTEGER r, INTEGER s }` back into a signature. Fails on
+// any structure that is not exactly two INTEGERs, on a negative or non-minimally
+// encoded integer (the strict `asn1` reader enforces this), or on a zero `r`/`s`.
+export function ecdsaSignatureFromDer(der: []byte): EcdsaSignature! {
+  let seq = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(seq) != 2) {
+    fail newError("ecdsa: signature must be a SEQUENCE of exactly two INTEGERs")
+  }
+  let r = bigintFromBytes(asn1ReadBigInteger(seq[0])?)
+  let s = bigintFromBytes(asn1ReadBigInteger(seq[1])?)
+  if (bigintIsZero(r) || bigintIsZero(s)) {
+    fail newError("ecdsa: signature r and s must be positive")
+  }
+  return EcdsaSignature{ r: r, s: s }
+}
