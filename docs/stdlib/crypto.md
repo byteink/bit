@@ -2563,3 +2563,51 @@ step of the X25519 Montgomery ladder.
 Field inverse, `z^(-1) mod p`, computed as `z^(p-2)` by Fermat's little theorem
 using the standard Curve25519 addition chain (constant-time). The inverse of 0 is
 0.
+## bcrypt
+
+Password hashing with the bcrypt algorithm (Provos & Mazières, 1999) — a
+deliberately slow, salted hash built on the Blowfish cipher. Unlike a raw digest
+(SHA-256, BLAKE3), bcrypt is designed for *passwords*: it is intentionally
+expensive to compute, so an attacker who steals the hash database still cannot
+test candidate passwords quickly. The cost is tunable through a work factor, and
+each stored hash carries its own random salt, so identical passwords hash
+differently and precomputation (rainbow tables) does not help.
+
+A bcrypt hash is a self-describing 60-character string, `$2b$NN$` followed by a
+22-character salt and a 31-character digest. `NN` is the two-digit cost and `2b`
+is the version; `bcryptVerify` reads the version, cost, and salt straight out of
+the string, so only the hash needs to be stored. This module implements its own
+Blowfish and bcrypt base-64, and follows the `2b` rules — passwords are truncated
+to 72 bytes, which is silent and matches every mainstream implementation.
+
+### `bcryptHash(password: []byte, cost: int): string`
+
+Hash `password` with a fresh 16-byte random salt at work factor `cost`, returning
+the 60-character `$2b$` string to store. `cost` must be in `[4, 31]` (it panics
+otherwise); the key schedule runs `2^cost` times, so each step up roughly doubles
+the time — pick the largest value your latency budget allows, commonly 10–12.
+Because the salt is random, hashing the same password twice yields two different
+strings, and both verify.
+
+### `bcryptVerify(password: []byte, encoded: string): bool`
+
+Report whether `password` matches the bcrypt hash `encoded`, recomputing the
+digest under the salt and cost parsed from `encoded` and comparing it to the
+stored digest in constant time. It never panics: any malformed input — wrong
+length, bad prefix, unknown version, or a non-numeric or out-of-range cost —
+simply returns `false`. The `2a`, `2b`, `2x`, and `2y` prefixes are all accepted
+and agree for every password up to 72 bytes.
+
+```bit
+import { bcryptHash, bcryptVerify } from "std/crypto"
+
+// Hash a new user's password for storage. Cost 12 is a reasonable default.
+function register(password: string): string {
+  return bcryptHash([]byte(password), 12)
+}
+
+// Check a login attempt against the stored hash.
+function login(password: string, stored: string): bool {
+  return bcryptVerify([]byte(password), stored)
+}
+```
