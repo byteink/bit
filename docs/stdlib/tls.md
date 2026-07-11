@@ -1148,3 +1148,135 @@ function respond(conn: TlsServerConn, incoming: []byte): []byte! {
   return conn.sealApp(request.content)?
 }
 ```
+## Public API
+
+The high-level, socket-driving API most callers reach for: `dial` for a client,
+`listen` + `accept` for a server, and a `TlsConn` whose `read`/`write` speak
+plaintext over the TLS record layer of an underlying [`std/net`](net.md)
+connection. It ties the sans-I/O handshakes above to real sockets — record
+framing, flight boundaries, and the partial-record buffering a byte stream forces
+are all handled internally. Only TLS 1.3 is spoken.
+
+### `tlsVersion13: int`
+
+The TLS 1.3 wire version codepoint (`0x0304`), the default and only value
+`TlsConfig.minVersion` may name.
+
+### `TlsConfig`
+
+The configuration shared by `dial` and `listen`. `roots` is the trust anchor set
+a client verifies the server chain against; `verify` turns certificate-chain and
+hostname verification on (its `newTlsConfig` default) or off; `alpn` is the ALPN
+protocol list; `serverName` is the SNI host and the name the certificate must
+match; `minVersion` is the version floor; `nowUnix` is the clock for
+certificate-validity checks; and `certPem`/`keyPem` are the server's certificate
+chain and private key, required by `listen`.
+
+**Security note.** `verify` false — including its `false` zero value in a
+hand-built struct literal — DISABLES server authentication: the connection then
+proves only that the peer holds the CertificateVerify key and completes the
+Finished MAC, not that it is the host it claims to be. Build configs with
+`newTlsConfig`, which is secure by default, and set `verify: false` only for
+tests or pinned-key scenarios.
+
+### `newTlsConfig(roots: TrustStore): TlsConfig`
+
+A `TlsConfig` that verifies servers against `roots`, secure by default: `verify`
+is true and `minVersion` is TLS 1.3. The recommended constructor — a raw struct
+literal risks a `verify: false` zero value.
+
+### `emptyTrustStore(): TrustStore`
+
+A `TrustStore` with no roots, for a server config (which never verifies a peer) or
+a deliberately insecure client — the cases `newTrustStore`, which rejects an empty
+root set, cannot serve.
+
+### `dial(host: string, port: int, config: TlsConfig): TlsConn!`
+
+Connect to `host:port` over TCP and run the TLS 1.3 client handshake to
+completion, returning a `TlsConn`. `host` is resolved through the system resolver
+(a dotted quad passes straight through) and is the default SNI. Verifies the
+server's certificate chain and hostname against `config.roots` unless
+`config.verify` is false. Fails on a connect, resolve, or handshake/verification
+error.
+
+### `listen(host: string, port: int, config: TlsConfig): TlsListener!`
+
+Bind a TLS listener on `host:port`. `config.certPem` and `config.keyPem` (the
+server's certificate chain and matching private key, PEM) are required. `port`
+may be `0` to let the kernel choose one — read it back with `port()`.
+
+### `TlsListener.accept(): TlsConn!`
+
+Accept the next connection and run the TLS 1.3 server handshake to completion,
+returning its `TlsConn`. Fails on an accept or handshake error.
+
+### `TlsListener.port(): int!`
+
+The port the listener is bound to — meaningful even when `0` was requested.
+
+### `TlsListener.close()`
+
+Close the listening socket.
+
+### `TlsConn.read(n: int): []byte!`
+
+Up to `n` decrypted application bytes, buffering any surplus from a record for the
+next call. Post-handshake handshake records (e.g. NewSessionTicket) are skipped.
+An empty result is end of stream — a clean socket close or a TLS `close_notify`.
+Fails on a record that fails authentication.
+
+### `TlsConn.write(b: []byte): ()!`
+
+Write all of `b` as one or more `application_data` records, splitting at the
+2^14-octet plaintext limit. Fails on a socket write error.
+
+### `TlsConn.close()`
+
+Close the underlying socket. Idempotent. No `close_notify` alert is sent.
+
+### `TlsConn.alpnProtocol(): string`
+
+The ALPN protocol negotiated during the handshake, or `""` if none.
+
+### `TlsConn.cipherSuiteId(): int`
+
+The negotiated cipher suite's IANA code point.
+
+### `TlsConn.peerCertificates(): [][]byte`
+
+The peer's certificate chain as raw DER, end-entity first — the server's chain on
+a client connection, empty on a server connection (client certificates are not
+requested).
+
+```bit
+import { dial, listen, newTlsConfig, newTrustStore, emptyTrustStore } from "std/tls"
+
+// Client: dial a host, verifying its certificate against a PEM root bundle, send
+// a request, and read the reply.
+function fetch(rootsPem: string, host: string, request: []byte): []byte! {
+  let cfg = newTlsConfig(newTrustStore(rootsPem)?)   // verification on by default
+  cfg.serverName = host
+  cfg.alpn = ["http/1.1"]
+  let conn = dial(host, 443, cfg)?
+  conn.write(request)?
+  let reply = conn.read(4096)?
+  conn.close()
+  return reply
+}
+
+// Server: listen with a certificate chain and key, accept one connection, and
+// echo a single message back.
+function echoOnce(certPem: string, keyPem: string): ()! {
+  let cfg = newTlsConfig(emptyTrustStore())
+  cfg.certPem = certPem
+  cfg.keyPem = keyPem
+  cfg.alpn = ["http/1.1"]
+  let l = listen("127.0.0.1", 8443, cfg)?
+  let conn = l.accept()?
+  let msg = conn.read(1024)?
+  conn.write(msg)?
+  conn.close()
+  l.close()
+}
+```

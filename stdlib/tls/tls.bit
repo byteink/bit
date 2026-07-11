@@ -1,0 +1,510 @@
+// Bit standard library — std/tls, the public TLS 1.3 API (#1208).
+//
+// This file ties the sans-I/O handshake state machines in `client.bit` and
+// `server.bit` to real sockets from `std/net`, so a caller gets a blocking,
+// stream-like `TlsConn` instead of shuttling raw record bytes by hand:
+//
+//   let cfg  = newTlsConfig(newTrustStore(roots)?)   // secure by default
+//   let conn = dial("example.org", 443, cfg)?        // TCP + handshake
+//   conn.write([]byte("GET / HTTP/1.1\r\n\r\n"))?
+//   let reply = conn.read(4096)?                      // up to 4096 plaintext bytes
+//   conn.close()
+//
+// and, for a server,
+//
+//   let l = listen("127.0.0.1", port, serverCfg)?
+//   let conn = l.accept()?                            // TCP accept + handshake
+//
+// std/tls is one flat module, so this file calls the handshake drivers
+// (`tlsClientStart`/`processServerFlight`, `tlsServerStart`/`processClientHello`/
+// `processClientFinished`), the record-framing constants (`recordHandshake`,
+// `recordApplicationData`, `recordAlert`, `recordMaxPlaintext`,
+// `recordMaxCiphertext`, `tlsCcsType`), and the `tlsWire*`/`tlsHsPutBytes`
+// helpers directly. The only new imports are `std/net` (the transport, aliased so
+// its `dial`/`listen`/`Conn`/`Listener` do not shadow this module's public
+// `dial`/`listen`/`TlsConn`/`TlsListener`) and `std/time` (a clock default for
+// certificate validity). Every private free function is prefixed `tlsapi`.
+//
+// Driving the batched handshake over a byte stream. A `processServerFlight` /
+// `processClientFinished` call consumes a whole flight and mutates the handshake
+// on partial input, so the driver must hand it exactly one complete flight. TLS
+// 1.3 record framing (a five-byte header whose last two bytes are the fragment
+// length) lets `tlsapiFramer` cut whole records off the stream, buffering any
+// partial or surplus bytes. A flight boundary is then read structurally: the
+// server's post-ServerHello flight is the ServerHello record plus the encrypted
+// records already arrived (the peer sends its whole flight, then waits for us, so
+// reading one record past the flight would deadlock) — which is exact for a
+// single-record auth flight (the common case, and always what this module's own
+// server emits). A HelloRetryRequest is detected by parsing the ServerHello so
+// its lone-record flight is not mistaken for an incomplete one.
+
+import { dial as tlsapiTcpDial, listen as tlsapiTcpListen, resolve as tlsapiResolve } from "std/net"
+import { Conn as NetConn, Listener as NetListener } from "std/net"
+import { now as tlsapiNowNs } from "std/time"
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// The TLS protocol version this module speaks, as its wire codepoint (RFC 8446).
+// TLS 1.3 is the only version implemented; `TlsConfig.minVersion` is a floor and
+// may not exceed it.
+export const tlsVersion13: int = 0x0304
+
+// A TLS configuration shared by `dial` and `listen`.
+//
+//   roots       trust anchors the client verifies the server chain against
+//   verify      client: verify the server certificate chain AND hostname. TRUE
+//               is the secure default (`newTlsConfig` sets it). Setting it false
+//               — or leaving it false, its zero value, in a hand-built literal —
+//               DISABLES server authentication: the connection then proves only
+//               that the peer holds the CertificateVerify key and completes the
+//               Finished MAC, NOT that it is who it claims to be. Never ship a
+//               client with `verify: false`; it exists for tests and pinned
+//               replay only, and maps to the handshake's `insecureSkipVerify`.
+//   alpn        ALPN protocols, most-preferred first (client offers, server picks)
+//   serverName  SNI host and the name the certificate must match; `dial` defaults
+//               it to its `host` argument when empty
+//   minVersion  minimum TLS version as a wire codepoint (default/floor 1.3); a
+//               value above `tlsVersion13` is rejected
+//   nowUnix     Unix seconds for certificate-validity checks; `dial` fills the
+//               current time when this is 0
+//   certPem     server certificate chain PEM (end-entity first) — required by
+//               `listen`, ignored by `dial`
+//   keyPem      server private-key PEM matching `certPem` — required by `listen`
+export struct TlsConfig {
+  export roots: TrustStore,
+  export verify: bool,
+  export alpn: []string,
+  export serverName: string,
+  export minVersion: int,
+  export nowUnix: int,
+  export certPem: string,
+  export keyPem: string,
+}
+
+// A `TlsConfig` for verifying servers against `roots`, secure by default:
+// `verify` is true, `minVersion` is TLS 1.3, and everything else is empty. This
+// is the recommended constructor — a struct literal risks a `verify: false` zero
+// value. Set `serverName`/`alpn` afterward as needed; set `certPem`/`keyPem` to
+// reuse it for a `listen` server.
+export function newTlsConfig(roots: TrustStore): TlsConfig {
+  return TlsConfig{
+    roots: roots,
+    verify: true,
+    alpn: []string(0),
+    serverName: "",
+    minVersion: tlsVersion13,
+    nowUnix: 0,
+    certPem: "",
+    keyPem: "",
+  }
+}
+
+// An empty `TrustStore` — no roots. For a server `TlsConfig` (which never
+// verifies a peer) or a deliberately insecure client (`verify: false`), where
+// `newTrustStore` cannot help because it rejects an empty root set.
+export function emptyTrustStore(): TrustStore {
+  return TrustStore{ roots: []X509Certificate(0) }
+}
+
+// Reject a configured minimum version above what this module implements. A 0
+// (unset) floor means "TLS 1.3", the only version offered.
+function tlsapiCheckVersion(minVersion: int): ()! {
+  if (minVersion != 0 && minVersion > tlsVersion13) {
+    fail newError("tls: only TLS 1.3 is supported; minVersion ${minVersion} is too high")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Record framing over a byte stream
+// ---------------------------------------------------------------------------
+
+// A TLS record reader over one socket: `conn` is the transport and `buf` holds
+// bytes read from it but not yet returned as a record. A reference type, so the
+// buffer it carries survives being handed from the handshake driver to the
+// `TlsConn` that reuses it for application records.
+struct tlsapiFramer {
+  conn: NetConn,
+  buf: []byte,
+}
+
+// Read from the socket until `buf` holds at least `min` bytes. Fails if the peer
+// closes first — a record was promised by its length prefix but never arrived.
+// Bounded: each read yields at least one byte, so at most `min` iterations.
+function (f: tlsapiFramer) fillTo(min: int): ()! {
+  let guard = 0
+  while (len(f.buf) < min && guard <= min) {
+    guard = guard + 1
+    let chunk = f.conn.read(recordMaxCiphertext)
+    if (len(chunk) == 0) {
+      fail newError("tls: connection closed in the middle of a record")
+    }
+    f.buf = tlsHsPutBytes(f.buf, []byte(chunk))
+  }
+}
+
+// The next whole TLS record — its five-byte header and full fragment — consuming
+// it from `buf` and leaving any surplus buffered. Fails on a length that exceeds
+// the RFC 8446 §5.2 ciphertext cap (a hostile prefix must not drive an unbounded
+// read) or a peer that closes mid-record.
+function (f: tlsapiFramer) nextRecord(): []byte! {
+  f.fillTo(5)?
+  let n = int(f.buf[3]) << 8 | int(f.buf[4])
+  let total = 5 + n
+  if (total > 5 + recordMaxCiphertext) {
+    fail newError("tls: record fragment of ${n} bytes exceeds the maximum")
+  }
+  f.fillTo(total)?
+  let rec = f.buf[0:total]
+  f.buf = f.buf[total:len(f.buf)]
+  return rec
+}
+
+// Whether any bytes are already buffered — the driver's signal that another
+// record is (at least partly) in hand, so reading it on will not block.
+function (f: tlsapiFramer) hasBuffered(): bool {
+  return len(f.buf) > 0
+}
+
+// ---------------------------------------------------------------------------
+// TlsConn: the application-data connection
+// ---------------------------------------------------------------------------
+
+// The application-data surface shared by a completed client or server handshake:
+// `TlsClientConn` and `TlsServerConn` both satisfy it structurally, letting one
+// `TlsConn` wrap either endpoint.
+interface tlsapiSealer {
+  sealApp(plaintext: []byte): []byte!,
+  openApp(record: []byte): RecordPlaintext!,
+  alpnProtocol(): string,
+  cipherSuiteId(): int,
+}
+
+// An established TLS connection: application `read`/`write` over the record layer
+// of the underlying socket. `framer` frames inbound records (and carries any
+// bytes buffered during the handshake); `sealer` is the completed client or
+// server connection; `plain` buffers decrypted application bytes a `read` has
+// not yet returned. Obtain one from `dial` or `TlsListener.accept`.
+export struct TlsConn {
+  framer: tlsapiFramer,
+  sealer: tlsapiSealer,
+  alpn: string,
+  peerCerts: [][]byte,
+  plain: []byte,
+  closed: bool,
+}
+
+// The ALPN protocol negotiated during the handshake, or "" if none.
+export function (c: TlsConn) alpnProtocol(): string { return c.alpn }
+
+// The negotiated cipher suite's IANA code point.
+export function (c: TlsConn) cipherSuiteId(): int { return c.sealer.cipherSuiteId() }
+
+// The peer's certificate chain as raw DER, end-entity certificate first. A
+// client sees the server's chain; a server sees an empty list (this module does
+// not request client certificates).
+export function (c: TlsConn) peerCertificates(): [][]byte { return c.peerCerts }
+
+// Write all of `b` as one or more application_data records, splitting at the
+// RFC 8446 §5.2 plaintext limit so an arbitrarily large buffer is legal. Fails on
+// a socket write error. Bounded: each record advances `pos` by up to the cap.
+export function (c: TlsConn) write(b: []byte): ()! {
+  let pos = 0
+  let guard = 0
+  while (pos < len(b) && guard <= len(b)) {
+    guard = guard + 1
+    let end = pos + recordMaxPlaintext
+    if (end > len(b)) {
+      end = len(b)
+    }
+    let rec = c.sealer.sealApp(b[pos:end])?
+    c.framer.conn.write(string(rec))?
+    pos = end
+  }
+}
+
+// Up to `n` decrypted application bytes. Serves buffered plaintext first, else
+// reads and decrypts records until application data arrives, skipping
+// post-handshake handshake records (e.g. NewSessionTicket). An empty result means
+// end of stream — a clean socket close or a TLS alert (`close_notify`). Fails on
+// a record that fails authentication (`bad_record_mac`).
+export function (c: TlsConn) read(n: int): []byte! {
+  if (n <= 0) {
+    return []byte(0)
+  }
+  if (len(c.plain) == 0) {
+    c.fill()?
+  }
+  if (len(c.plain) == 0) {
+    return []byte(0)
+  }
+  let take = n
+  if (take > len(c.plain)) {
+    take = len(c.plain)
+  }
+  let out = c.plain[0:take]
+  c.plain = c.plain[take:len(c.plain)]
+  return out
+}
+
+// Read and decrypt records until `plain` gains application data or the stream
+// ends. A `recordHandshake` inner type is a post-handshake message and is
+// skipped; a `recordAlert` ends the stream. KeyUpdate re-keying is not handled —
+// a peer that issues one is not interoperable here. Bounded by a record budget so
+// a peer that only ever sends non-application records cannot spin forever.
+function (c: TlsConn) fill(): ()! {
+  let guard = 0
+  while (guard < 4096) {
+    guard = guard + 1
+    if (c.closed) {
+      return
+    }
+    let rec = c.framer.nextRecord() catch e {
+      return
+    }
+    let pt = c.sealer.openApp(rec)?
+    if (pt.contentType == recordApplicationData) {
+      c.plain = tlsHsPutBytes(c.plain, pt.content)
+      return
+    }
+    if (pt.contentType == recordAlert) {
+      return
+    }
+    if (pt.contentType != recordHandshake) {
+      fail newError("tls: unexpected inner content type ${pt.contentType}")
+    }
+  }
+  fail newError("tls: too many non-application records before data")
+}
+
+// Close the underlying socket. Idempotent. No `close_notify` alert is sent, so
+// the peer sees a transport close rather than a graceful TLS shutdown.
+export function (c: TlsConn) close() {
+  if (!c.closed) {
+    c.closed = true
+    c.framer.conn.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// dial: connect + client handshake
+// ---------------------------------------------------------------------------
+
+// The client offer set: the classical curves in supported_groups, with a single
+// X25519 key_share. A server preferring another shared group asks for it via a
+// HelloRetryRequest, which the driver completes.
+function tlsapiClientGroups(): []TlsGroup {
+  return [TlsGroup.X25519, TlsGroup.Secp256r1, TlsGroup.Secp384r1]
+}
+
+// Translate the public `TlsConfig` into the internal `TlsClientConfig`: SNI
+// defaults to `host`, the clock defaults to now, and `verify` maps (inverted) to
+// `insecureSkipVerify`.
+function tlsapiClientConfig(host: string, config: TlsConfig): TlsClientConfig! {
+  tlsapiCheckVersion(config.minVersion)?
+  let sni = config.serverName
+  if (len(sni) == 0) {
+    sni = host
+  }
+  let ts = config.nowUnix
+  if (ts == 0) {
+    ts = tlsapiNowNs() / 1000000000
+  }
+  return TlsClientConfig{
+    serverName: sni,
+    alpn: config.alpn,
+    trust: config.roots,
+    insecureSkipVerify: !config.verify,
+    nowUnix: ts,
+    groups: tlsapiClientGroups(),
+    keyShareGroups: [TlsGroup.X25519],
+    suites: []int(0),
+    clientHelloOverride: []byte(0),
+    ephemeralOverride: []GroupKeypair(0),
+  }
+}
+
+// Connect to `host:port` over TCP and run the TLS 1.3 client handshake to
+// completion, returning an application connection. `host` is resolved via the
+// system resolver (a dotted quad passes straight through) and is the default SNI.
+// The handshake verifies the server's certificate chain and hostname against
+// `config.roots` unless `config.verify` is false. Fails on a connection, resolve,
+// or handshake/verification error; the socket is closed on a handshake failure.
+export function dial(host: string, port: int, config: TlsConfig): TlsConn! {
+  let clientCfg = tlsapiClientConfig(host, config)?
+  let ip = tlsapiResolve(host)?
+  let conn = tlsapiTcpDial(ip, port)?
+  let f = tlsapiFramer{ conn: conn, buf: []byte(0) }
+  let cc = tlsapiDriveClient(f, clientCfg) catch e {
+    conn.close()
+    fail e
+  }
+  return TlsConn{
+    framer: f,
+    sealer: cc,
+    alpn: cc.alpnProtocol(),
+    peerCerts: cc.peerCertificates(),
+    plain: []byte(0),
+    closed: false,
+  }
+}
+
+// Send the ClientHello, then drive the flight exchange to completion: read a
+// server flight, process it, send the produced record(s) (a resent ClientHello
+// on HelloRetryRequest, or the client Finished when done), and stop once done.
+// Bounded to the ClientHello, one retry, and the final flight.
+function tlsapiDriveClient(f: tlsapiFramer, config: TlsClientConfig): TlsClientConn! {
+  let h = tlsClientStart(config)?
+  f.conn.write(string(h.hello))?
+  let guard = 0
+  while (guard < 4) {
+    guard = guard + 1
+    let flight = tlsapiReadServerFlight(f)?
+    let step = h.processServerFlight(flight)?
+    f.conn.write(string(step.outbound))?
+    if (step.done) {
+      return h.connection()?
+    }
+  }
+  fail newError("tls: client handshake did not complete within the flight bound")
+}
+
+// Gather one complete server flight off the stream. The ServerHello is the first
+// non-CCS record; a HelloRetryRequest ends the flight there. Otherwise the
+// encrypted authentication flight follows, and the flight is complete once at
+// least one encrypted record has been read and nothing more is buffered — the
+// server has sent its whole flight and is now waiting for the client, so reading
+// on would block. Bounded by a record budget.
+function tlsapiReadServerFlight(f: tlsapiFramer): []byte! {
+  let flight = []byte(0)
+  let sawHello = false
+  let encCount = 0
+  let guard = 0
+  while (guard < 64) {
+    guard = guard + 1
+    let rec = f.nextRecord()?
+    flight = tlsHsPutBytes(flight, rec)
+    let t = tlsWireRecordType(rec)
+    if (t == tlsCcsType) {
+      continue
+    }
+    if (!sawHello) {
+      sawHello = true
+      if (tlsapiIsHelloRetry(rec)) {
+        return flight
+      }
+      continue
+    }
+    if (t == recordApplicationData) {
+      encCount = encCount + 1
+    }
+    if (encCount >= 1 && !f.hasBuffered()) {
+      return flight
+    }
+  }
+  fail newError("tls: server flight exceeded the record bound")
+}
+
+// Whether a plaintext handshake record carries a HelloRetryRequest. A record
+// that does not parse as a ServerHello is treated as "not a retry" so the state
+// machine, not the framer, produces the precise error.
+function tlsapiIsHelloRetry(rec: []byte): bool {
+  let sh = parseServerHello(tlsWireRecordBody(rec)) catch e {
+    return false
+  }
+  return isHelloRetryRequest(sh)
+}
+
+// ---------------------------------------------------------------------------
+// listen / accept: server handshake
+// ---------------------------------------------------------------------------
+
+// A listening TLS socket: the TCP `ln` and the server handshake `config` applied
+// to each accepted connection. Build it with `listen`.
+export struct TlsListener {
+  ln: NetListener,
+  config: TlsServerConfig,
+}
+
+// Listen for TLS connections on `host:port`. `config.certPem` and `config.keyPem`
+// (the server's certificate chain and matching private key, PEM) are required;
+// `config.alpn` is the supported protocol list. `port` may be 0 to let the kernel
+// choose one — read it back with `port()`. Fails on a bad certificate/key or a
+// bind error.
+export function listen(host: string, port: int, config: TlsConfig): TlsListener! {
+  tlsapiCheckVersion(config.minVersion)?
+  if (len(config.certPem) == 0 || len(config.keyPem) == 0) {
+    fail newError("tls listen: config.certPem and config.keyPem are required for a TLS server")
+  }
+  let serverCfg = newTlsServerConfig(config.certPem, config.keyPem, config.alpn)?
+  let ln = tlsapiTcpListen(host, port)?
+  return TlsListener{ ln: ln, config: serverCfg }
+}
+
+// The port this listener is bound to — meaningful even when 0 was requested.
+export function (l: TlsListener) port(): int! {
+  return l.ln.port()?
+}
+
+// Accept the next connection and run the TLS 1.3 server handshake to completion,
+// returning its application connection. Fails on an accept or handshake error;
+// the socket is closed on a handshake failure.
+export function (l: TlsListener) accept(): TlsConn! {
+  let conn = l.ln.accept()?
+  let f = tlsapiFramer{ conn: conn, buf: []byte(0) }
+  let sc = tlsapiDriveServer(f, l.config) catch e {
+    conn.close()
+    fail e
+  }
+  return TlsConn{
+    framer: f,
+    sealer: sc,
+    alpn: sc.alpnProtocol(),
+    peerCerts: [][]byte(0),
+    plain: []byte(0),
+    closed: false,
+  }
+}
+
+export function (l: TlsListener) close() {
+  l.ln.close()
+}
+
+// Drive the server handshake: read the ClientHello flight, answer it (a
+// HelloRetryRequest loops back for the next ClientHello), then read and verify
+// the client Finished flight. Bounded to the ClientHello, one retry, and the
+// Finished.
+function tlsapiDriveServer(f: tlsapiFramer, config: TlsServerConfig): TlsServerConn! {
+  let s = tlsServerStart(config)?
+  let guard = 0
+  while (guard < 4) {
+    guard = guard + 1
+    let chFlight = tlsapiReadMessageFlight(f)?
+    let step = s.processClientHello(chFlight)?
+    f.conn.write(string(step.outbound))?
+    if (!step.retry) {
+      let finFlight = tlsapiReadMessageFlight(f)?
+      return s.processClientFinished(finFlight)?
+    }
+  }
+  fail newError("tls: server handshake did not complete within the flight bound")
+}
+
+// Read a single-message flight: any change_cipher_spec records, then exactly one
+// content record. Both flights the server reads — the ClientHello and the client
+// Finished — are one record, so one non-CCS record completes the flight. Bounded
+// by a small CCS budget.
+function tlsapiReadMessageFlight(f: tlsapiFramer): []byte! {
+  let flight = []byte(0)
+  let guard = 0
+  while (guard < 8) {
+    guard = guard + 1
+    let rec = f.nextRecord()?
+    flight = tlsHsPutBytes(flight, rec)
+    if (tlsWireRecordType(rec) != tlsCcsType) {
+      return flight
+    }
+  }
+  fail newError("tls: too many change_cipher_spec records before the message")
+}
