@@ -1,0 +1,256 @@
+// Bit standard library — tls module, TLS 1.3 supported groups + key_share (#1203).
+//
+// A "named group" in TLS 1.3 (RFC 8446 §4.2.7) is the (EC)DHE / KEM parameter
+// set both peers agree on to derive the handshake's shared secret. This file is
+// the registry of the groups Bit supports and the per-group key_share plumbing:
+// how the initiator (client) generates its ephemeral share, how the responder
+// (server) answers a share, and how the initiator finishes the exchange — all
+// producing the raw shared secret that feeds the TLS key schedule (HKDF).
+//
+// Groups and their IANA codepoints (RFC 8446 registry / on-the-wire NamedGroup):
+//
+//   * x25519          0x001d — X25519 ECDHE (RFC 7748), the default classical MTI.
+//   * secp256r1       0x0017 — NIST P-256 ECDHE (RFC 8446 §4.2.7).
+//   * secp384r1       0x0018 — NIST P-384 ECDHE.
+//   * X25519MLKEM768  0x11ec — the post-quantum HYBRID of ML-KEM-768 and X25519
+//     (draft-ietf-tls-ecdhe-mlkem-05), codepoint assigned decimal 4588.
+//
+// Two shapes of exchange live behind one uniform API:
+//
+//   Classical DH (x25519 / secp256r1 / secp384r1) is symmetric — each side runs
+//   `tlsGroupGenerate` to make (private scalar, public share) and then
+//   `tlsGroupComputeShared` on the peer's public share; both derive the same
+//   secret. The responder helper `tlsGroupResponder` is just "generate + compute"
+//   folded into one call for the server's convenience.
+//
+//   The hybrid (X25519MLKEM768) is a KEM and is inherently ASYMMETRIC — there is
+//   exactly one ML-KEM keypair, the client's, and the server encapsulates to it
+//   rather than generating a second one. So the roles differ:
+//     - client:  `tlsGroupGenerate` -> ek ∥ x25519_pub, keeping dk ∥ x25519_priv
+//     - server:  `tlsGroupResponder(clientShare)` -> ct ∥ x25519_pub + the secret
+//     - client:  `tlsGroupComputeShared(state, serverShare)` -> the secret
+//
+// Hybrid byte layout (draft-ietf-tls-ecdhe-mlkem-05, the ordering is the #1
+// hybrid interop bug — X25519MLKEM768 deliberately puts ML-KEM FIRST, reversing
+// the generic hybrid naming convention; §4.1/§4.2/§4.3):
+//
+//   * client key_share  = ml-kem-768 encapsulation key (1184) ∥ x25519 pub (32)  = 1216
+//   * server key_share  = ml-kem-768 ciphertext        (1088) ∥ x25519 pub (32)  = 1120
+//   * combined secret   = ml-kem shared secret          (32)  ∥ x25519 shared (32) = 64
+//
+// This module reaches the `std/crypto` primitives it composes by importing them.
+// Every private free function is prefixed `tlsGroup` to keep the namespace clean.
+
+import {
+  Curve,
+  nistecP256,
+  nistecP384,
+  ecdhnistGenerateKeypair,
+  ecdhnistSharedSecret,
+  x25519GenerateKeypair,
+  x25519SharedSecret,
+  mlkemKeygen,
+  mlkemEncaps,
+  mlkemDecaps,
+} from "std/crypto"
+
+// ML-KEM-768 (FIPS 203) and X25519 (RFC 7748) fixed byte widths, as the hybrid
+// slices them. These are `int` (the slice-index type) and spec-fixed; they
+// mirror `std/crypto`'s `mlkem*Size` so the layout math reads in one place.
+const tlsMlkemEkSize: int = 1184 // ML-KEM-768 encapsulation (public) key
+const tlsMlkemCtSize: int = 1088 // ML-KEM-768 ciphertext
+const tlsMlkemDkSize: int = 2400 // ML-KEM-768 decapsulation (secret) key
+const tlsX25519Size: int = 32    // X25519 public key / private scalar / shared secret
+
+// The named groups this TLS implementation supports as key-exchange methods.
+// A value of this type is always one of the four below, so `tlsGroupGenerate`
+// cannot be handed an unknown group and needs no failure path.
+export enum TlsGroup {
+  X25519,
+  Secp256r1,
+  Secp384r1,
+  X25519MLKEM768,
+}
+
+// An initiator's (client's) ephemeral key-exchange state. `priv` is the secret
+// to keep — the private scalar for a classical group, or `dk ∥ x25519_priv` for
+// the hybrid — and `keyShare` is the public value to put on the wire. Tuples are
+// not yet lowerable, so the pair travels as a named struct.
+export struct GroupKeypair {
+  export priv: []byte
+  export keyShare: []byte
+}
+
+// A responder's (server's) answer to an initiator share: `keyShare` is the value
+// to send back, and `shared` is the derived raw shared secret. For a KEM the two
+// are produced together (encapsulation yields both), which is exactly why the
+// responder is one call rather than generate-then-compute.
+export struct GroupResponse {
+  export keyShare: []byte
+  export shared: []byte
+}
+
+// Concatenate two byte slices into a fresh slice `a ∥ b`. The hybrid key_shares
+// and shared secret are all such concatenations, and their ORDER is normative.
+function tlsGroupConcat(a: []byte, b: []byte): []byte {
+  let out = []byte(len(a) + len(b))
+  let i = 0
+  while (i < len(a)) {
+    out[i] = a[i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(b)) {
+    out[len(a) + j] = b[j]
+    j = j + 1
+  }
+  return out
+}
+
+// The IANA NamedGroup codepoint for `g`, as it appears on the wire (RFC 8446
+// registry). Returned as `u64` and built with `u64(0x..)` so the constant keeps
+// its declared width through the compiler (see #1231/#1232).
+export function tlsGroupCodepoint(g: TlsGroup): u64 {
+  match (g) {
+    X25519 => { return u64(0x001d) }
+    Secp256r1 => { return u64(0x0017) }
+    Secp384r1 => { return u64(0x0018) }
+    X25519MLKEM768 => { return u64(0x11ec) }
+  }
+  return u64(0)
+}
+
+// The `TlsGroup` for a wire codepoint `cp`, or a failure if it is not one this
+// implementation supports — the inverse of `tlsGroupCodepoint`, for parsing a
+// peer's supported_groups / key_share off the wire.
+export function tlsGroupFromCodepoint(cp: u64): TlsGroup! {
+  if (cp == u64(0x001d)) { return TlsGroup.X25519 }
+  if (cp == u64(0x0017)) { return TlsGroup.Secp256r1 }
+  if (cp == u64(0x0018)) { return TlsGroup.Secp384r1 }
+  if (cp == u64(0x11ec)) { return TlsGroup.X25519MLKEM768 }
+  fail newError("tlsGroupFromCodepoint: unsupported group ${int(cp)}")
+}
+
+// ---------------------------------------------------------------------------
+// Per-group key-share generation (initiator / client).
+
+// Generate an ECDHE keypair on `curve`, packaged as a group keypair: the private
+// scalar and the SEC 1 uncompressed public point (the wire key_share).
+function tlsGroupEcdhGenerate(curve: Curve): GroupKeypair {
+  let kp = ecdhnistGenerateKeypair(curve)
+  return GroupKeypair{ priv: kp.priv, keyShare: kp.pub }
+}
+
+// Generate the CLIENT half of an X25519MLKEM768 exchange: an ML-KEM-768 keypair
+// and an X25519 keypair. The wire key_share is `ek ∥ x25519_pub`; the retained
+// secret state is `dk ∥ x25519_priv`, sliced back apart in `tlsGroupHybridShared`.
+function tlsGroupHybridGenerate(): GroupKeypair {
+  let mk = mlkemKeygen()
+  let xk = x25519GenerateKeypair()
+  return GroupKeypair{
+    priv: tlsGroupConcat(mk.dk, xk.priv),
+    keyShare: tlsGroupConcat(mk.ek, xk.pub),
+  }
+}
+
+// Generate the initiator's ephemeral key_share for `g`. Never fails: every group
+// is a keygen with no peer input to reject.
+export function tlsGroupGenerate(g: TlsGroup): GroupKeypair {
+  match (g) {
+    X25519 => {
+      let xk = x25519GenerateKeypair()
+      return GroupKeypair{ priv: xk.priv, keyShare: xk.pub }
+    }
+    Secp256r1 => { return tlsGroupEcdhGenerate(nistecP256()) }
+    Secp384r1 => { return tlsGroupEcdhGenerate(nistecP384()) }
+    X25519MLKEM768 => { return tlsGroupHybridGenerate() }
+  }
+  return GroupKeypair{ priv: []byte(0), keyShare: []byte(0) }
+}
+
+// ---------------------------------------------------------------------------
+// Initiator's shared-secret computation.
+
+// The CLIENT side of the hybrid finish. `priv` is the retained `dk ∥ x25519_priv`
+// state; `serverShare` is the server's `ct ∥ x25519_pub`. ML-KEM decapsulation
+// recovers the KEM secret and X25519 the classical one; the combined secret is
+// `mlkem_ss ∥ x25519_ss` — ML-KEM first, per draft §4.3.
+function tlsGroupHybridShared(priv: []byte, serverShare: []byte): []byte! {
+  if (len(priv) != tlsMlkemDkSize + tlsX25519Size) {
+    fail newError("tlsGroupComputeShared: hybrid private state must be ${tlsMlkemDkSize + tlsX25519Size} bytes")
+  }
+  if (len(serverShare) != tlsMlkemCtSize + tlsX25519Size) {
+    fail newError("tlsGroupComputeShared: hybrid server share must be ${tlsMlkemCtSize + tlsX25519Size} bytes")
+  }
+  let dk = priv[0:tlsMlkemDkSize]
+  let xPriv = priv[tlsMlkemDkSize:tlsMlkemDkSize + tlsX25519Size]
+  let ct = serverShare[0:tlsMlkemCtSize]
+  let xPub = serverShare[tlsMlkemCtSize:tlsMlkemCtSize + tlsX25519Size]
+  let mlkemSs = mlkemDecaps(dk, ct)
+  let xSs = x25519SharedSecret(xPriv, xPub)?
+  return tlsGroupConcat(mlkemSs, xSs)
+}
+
+// The raw shared secret from the initiator's private state `priv` and the
+// responder's `peerKeyShare`. Fails if the peer share is malformed or, for a
+// contributory-behaviour reason, rejected (all-zero X25519 / invalid EC point).
+// Feed the returned bytes straight to the TLS key schedule as IKM.
+export function tlsGroupComputeShared(g: TlsGroup, priv: []byte, peerKeyShare: []byte): []byte! {
+  match (g) {
+    X25519 => { return x25519SharedSecret(priv, peerKeyShare)? }
+    Secp256r1 => { return ecdhnistSharedSecret(priv, peerKeyShare, nistecP256())? }
+    Secp384r1 => { return ecdhnistSharedSecret(priv, peerKeyShare, nistecP384())? }
+    X25519MLKEM768 => { return tlsGroupHybridShared(priv, peerKeyShare)? }
+  }
+  return []byte(0)
+}
+
+// ---------------------------------------------------------------------------
+// Responder's key-share + shared-secret (server).
+
+// The responder side of a classical DH group: generate our own ephemeral keypair
+// on `curve`, answer with our public point, and derive the shared secret against
+// the initiator's `peerShare`.
+function tlsGroupEcdhResponder(curve: Curve, peerShare: []byte): GroupResponse! {
+  let kp = ecdhnistGenerateKeypair(curve)
+  let shared = ecdhnistSharedSecret(kp.priv, peerShare, curve)?
+  return GroupResponse{ keyShare: kp.pub, shared: shared }
+}
+
+// The SERVER side of the hybrid. `clientShare` is the client's `ek ∥ x25519_pub`.
+// We ENCAPSULATE to the client's ML-KEM ek (yielding the ciphertext to send and
+// the KEM secret to keep) and generate our own X25519 ephemeral. The response
+// key_share is `ct ∥ x25519_pub`; the combined secret is `mlkem_ss ∥ x25519_ss`,
+// ML-KEM first, byte-identical to what the client derives (draft §4.2/§4.3).
+function tlsGroupHybridResponder(clientShare: []byte): GroupResponse! {
+  if (len(clientShare) != tlsMlkemEkSize + tlsX25519Size) {
+    fail newError("tlsGroupResponder: hybrid client share must be ${tlsMlkemEkSize + tlsX25519Size} bytes")
+  }
+  let ek = clientShare[0:tlsMlkemEkSize]
+  let clientXPub = clientShare[tlsMlkemEkSize:tlsMlkemEkSize + tlsX25519Size]
+  let enc = mlkemEncaps(ek)?
+  let xk = x25519GenerateKeypair()
+  let xSs = x25519SharedSecret(xk.priv, clientXPub)?
+  return GroupResponse{
+    keyShare: tlsGroupConcat(enc.ct, xk.pub),
+    shared: tlsGroupConcat(enc.ss, xSs),
+  }
+}
+
+// The responder's (server's) one-shot answer to an initiator `peerKeyShare` for
+// group `g`: the key_share to send back plus the derived shared secret. Fails if
+// the initiator's share is malformed or rejected. For classical groups this is
+// generate-then-compute; for the hybrid it is encapsulate-then-X25519.
+export function tlsGroupResponder(g: TlsGroup, peerKeyShare: []byte): GroupResponse! {
+  match (g) {
+    X25519 => {
+      let xk = x25519GenerateKeypair()
+      let shared = x25519SharedSecret(xk.priv, peerKeyShare)?
+      return GroupResponse{ keyShare: xk.pub, shared: shared }
+    }
+    Secp256r1 => { return tlsGroupEcdhResponder(nistecP256(), peerKeyShare)? }
+    Secp384r1 => { return tlsGroupEcdhResponder(nistecP384(), peerKeyShare)? }
+    X25519MLKEM768 => { return tlsGroupHybridResponder(peerKeyShare)? }
+  }
+  return GroupResponse{ keyShare: []byte(0), shared: []byte(0) }
+}

@@ -1,0 +1,231 @@
+// Bit standard library — TLS module, the TLS 1.3 key schedule (RFC 8446 §7.1).
+//
+// TLS 1.3 turns two inputs — an optional pre-shared key and the (EC)DHE shared
+// secret from the key exchange — into every symmetric key the connection needs,
+// through a fixed HKDF ladder. The ladder has three `HKDF-Extract` rungs, each
+// feeding a family of `Derive-Secret` outputs:
+//
+//   PSK  ->  Extract  ->  Early Secret     -> (binder / early-data / exporter)
+//                |
+//              Derive-Secret(., "derived", "")
+//                v
+//   ECDHE -> Extract  ->  Handshake Secret -> c/s hs traffic secrets
+//                |
+//              Derive-Secret(., "derived", "")
+//                v
+//   0     -> Extract  ->  Master Secret    -> c/s ap traffic, exporter, resumption
+//
+// Every arrow out of a rung is `Derive-Secret(Secret, Label, Messages)`, and the
+// two arrows *between* rungs are the same call with the fixed label "derived" and
+// an empty transcript — the value that binds each stage to the previous one. The
+// leaf traffic secrets are then unrolled into an AEAD `key` and `iv` and, for the
+// Finished message, a `finished_key` MAC key, all by `HKDF-Expand-Label`.
+//
+// The whole schedule is generic over the negotiated cipher suite's hash — SHA-256
+// for the AES-128/ChaCha suites, SHA-384 for AES-256 — so like the rest of the
+// crypto library every function takes a hash *constructor* (`() => Hash`) and asks
+// it for its own `size`, never hard-coding 32 or 48. `std/tls` is a flat module;
+// this file imports its HKDF and HMAC primitives from the separate `std/crypto`
+// module and prefixes its own private free functions with `tlsKs`.
+import { Hash, hkdfExtract, hkdfExpand, hmac, digest } from "std/crypto"
+
+// The transcript hash bound into "c hs traffic" and the Finished MACs is
+// `Transcript-Hash(ClientHello .. current message)` — the digest of every
+// handshake message seen so far, in order. Rather than re-hash the growing buffer
+// at each checkpoint, `TranscriptHash` keeps one running hasher: `update` absorbs
+// each message as it is sent or received, and `sum` reads the digest of the
+// messages so far without disturbing the stream (the `Hash` contract's `sum` is
+// non-destructive), so it can be read after ServerHello, after the server
+// Finished, and after the client Finished off the same accumulator.
+export struct TranscriptHash {
+  h: Hash
+}
+
+// A fresh transcript accumulator over the suite hash built by `newHash`. Its
+// digest before any `update` is `Hash("")`, exactly the empty transcript the
+// inter-stage "derived" secrets use.
+export function newTranscript(newHash: () => Hash): TranscriptHash {
+  return TranscriptHash{ h: newHash() }
+}
+
+// Absorb one handshake message (its full wire bytes, header included) into the
+// running transcript, in the order the messages appear on the wire.
+export function (t: TranscriptHash) update(data: []byte) {
+  t.h.write(data)
+}
+
+// `Transcript-Hash` of the messages absorbed so far. Non-destructive: further
+// `update`s extend the same transcript, so this may be read at every checkpoint
+// of the handshake.
+export function (t: TranscriptHash) sum(): []byte {
+  return t.h.sum()
+}
+
+// The `HkdfLabel` wire structure (RFC 8446 §7.1), the `info` fed to HKDF-Expand:
+//
+//   struct {
+//     uint16 length;                       // requested output length
+//     opaque label<7..255>  = "tls13 " ‖ label;   // 1-byte length prefix
+//     opaque context<0..255>;              // 1-byte length prefix
+//   }
+//
+// The "tls13 " prefix domain-separates these labels from any other HKDF user, and
+// baking `length` into the `info` binds each output to the size it was asked for.
+// Uses a distinct `length` parameter name so the builtin `len` stays reachable for
+// the string and slice sizes.
+function tlsKsLabelInfo(length: int, label: string, context: []byte): []byte {
+  let full = "tls13 ${label}"
+  let fullLen = len(full)
+  let ctxLen = len(context)
+  let out = []byte(2 + 1 + fullLen + 1 + ctxLen)
+  out[0] = byte(length >> 8)
+  out[1] = byte(length)
+  out[2] = byte(fullLen)
+  let at = 3
+  let i = 0
+  while (i < fullLen) {
+    out[at] = full[i]
+    at = at + 1
+    i = i + 1
+  }
+  out[at] = byte(ctxLen)
+  at = at + 1
+  i = 0
+  while (i < ctxLen) {
+    out[at] = context[i]
+    at = at + 1
+    i = i + 1
+  }
+  return out
+}
+
+// HKDF-Expand-Label (RFC 8446 §7.1): expand `secret` to `len` bytes bound to the
+// TLS-1.3-prefixed `label` and the `context` (usually a transcript hash, or empty
+// for `key`/`iv`). The output is capped by `HKDF-Expand` at `255*HashLen`; every
+// TLS use asks for a key, IV, or one digest, all far below that, so the underlying
+// expand cannot fail and the `catch` is unreachable — it returns a zero slice of
+// the requested size only to keep this function total.
+export function hkdfExpandLabel(newHash: () => Hash, secret: []byte, label: string, context: []byte, len: int): []byte {
+  let info = tlsKsLabelInfo(len, label, context)
+  return hkdfExpand(newHash, secret, info, len) catch e {
+    return []byte(len)
+  }
+}
+
+// Derive-Secret (RFC 8446 §7.1): `HKDF-Expand-Label(secret, label, Transcript-Hash,
+// Hash.length)` — a full-digest-length child secret bound to the handshake
+// transcript. The output is always one digest long, so it can re-enter the ladder
+// as the next stage's secret.
+export function deriveSecret(newHash: () => Hash, secret: []byte, label: string, transcriptHash: []byte): []byte {
+  return hkdfExpandLabel(newHash, secret, label, transcriptHash, newHash().size())
+}
+
+// `Derive-Secret(secret, "derived", "")`, the fixed inter-stage transition that
+// links one `HKDF-Extract` rung to the next: the transcript is the empty-message
+// hash `Hash("")`, so this value depends only on `secret`.
+function tlsKsDeriveForNext(newHash: () => Hash, secret: []byte): []byte {
+  return deriveSecret(newHash, secret, "derived", digest(newHash(), []byte(0)))
+}
+
+// A slice of `n` zero bytes — the all-zero PSK and the all-zero IKM the schedule
+// extracts when there is no pre-shared key and at the Master Secret rung. `[]byte(n)`
+// is zero-initialized, so this is just an intent-naming wrapper.
+function tlsKsZeros(n: int): []byte {
+  return []byte(n)
+}
+
+// Early Secret (RFC 8446 §7.1): `HKDF-Extract(0, PSK)`, the first rung. A caller
+// with no pre-shared key passes an empty `psk`, which becomes `HashLen` zero bytes
+// as the RFC requires; the salt is likewise the implicit zero salt of Extract.
+export function earlySecret(newHash: () => Hash, psk: []byte): []byte {
+  let ikm = psk
+  if (len(psk) == 0) {
+    ikm = tlsKsZeros(newHash().size())
+  }
+  return hkdfExtract(newHash, tlsKsZeros(0), ikm)
+}
+
+// Handshake Secret (RFC 8446 §7.1): `HKDF-Extract(Derive-Secret(earlySecret,
+// "derived", ""), ECDHE)`. Mixes the (EC)DHE shared secret into the ladder; the
+// handshake traffic secrets derive from it.
+export function handshakeSecret(newHash: () => Hash, early: []byte, ecdhe: []byte): []byte {
+  return hkdfExtract(newHash, tlsKsDeriveForNext(newHash, early), ecdhe)
+}
+
+// Master Secret (RFC 8446 §7.1): `HKDF-Extract(Derive-Secret(handshakeSecret,
+// "derived", ""), 0)`. The final rung; the application traffic, exporter, and
+// resumption secrets derive from it. Its IKM is `HashLen` zero bytes.
+export function masterSecret(newHash: () => Hash, handshake: []byte): []byte {
+  return hkdfExtract(newHash, tlsKsDeriveForNext(newHash, handshake), tlsKsZeros(newHash().size()))
+}
+
+// client_handshake_traffic_secret (RFC 8446 §7.1): `Derive-Secret(handshakeSecret,
+// "c hs traffic", ClientHello..ServerHello)` — the client's handshake-record
+// protection secret.
+export function clientHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte {
+  return deriveSecret(newHash, handshake, "c hs traffic", transcriptHash)
+}
+
+// server_handshake_traffic_secret (RFC 8446 §7.1): `Derive-Secret(handshakeSecret,
+// "s hs traffic", ClientHello..ServerHello)` — the server's handshake-record
+// protection secret.
+export function serverHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte {
+  return deriveSecret(newHash, handshake, "s hs traffic", transcriptHash)
+}
+
+// client_application_traffic_secret_0 (RFC 8446 §7.1): `Derive-Secret(masterSecret,
+// "c ap traffic", ClientHello..server Finished)` — the initial client
+// application-data secret, updated forward by `HKDF-Expand-Label(., "traffic upd", ..)`.
+export function clientApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte {
+  return deriveSecret(newHash, master, "c ap traffic", transcriptHash)
+}
+
+// server_application_traffic_secret_0 (RFC 8446 §7.1): `Derive-Secret(masterSecret,
+// "s ap traffic", ClientHello..server Finished)` — the initial server
+// application-data secret.
+export function serverApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte {
+  return deriveSecret(newHash, master, "s ap traffic", transcriptHash)
+}
+
+// exporter_master_secret (RFC 8446 §7.1, §7.5): `Derive-Secret(masterSecret,
+// "exp master", ClientHello..server Finished)`, the root of the exported-keying-
+// material interface.
+export function exporterMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte {
+  return deriveSecret(newHash, master, "exp master", transcriptHash)
+}
+
+// resumption_master_secret (RFC 8446 §7.1): `Derive-Secret(masterSecret,
+// "res master", ClientHello..client Finished)`, from which per-ticket PSKs for
+// session resumption are computed.
+export function resumptionMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte {
+  return deriveSecret(newHash, master, "res master", transcriptHash)
+}
+
+// The AEAD write key for a traffic secret (RFC 8446 §7.3): `HKDF-Expand-Label(secret,
+// "key", "", keyLen)`, where `keyLen` is the negotiated cipher's key size (16 for
+// AES-128, 32 for AES-256/ChaCha20). No transcript is bound — the secret already is.
+export function trafficKey(newHash: () => Hash, secret: []byte, keyLen: int): []byte {
+  return hkdfExpandLabel(newHash, secret, "key", tlsKsZeros(0), keyLen)
+}
+
+// The AEAD write nonce for a traffic secret (RFC 8446 §7.3): `HKDF-Expand-Label(secret,
+// "iv", "", ivLen)`, `ivLen` = 12 for all TLS 1.3 AEADs. XORed with the record
+// sequence number to form each record's nonce.
+export function trafficIV(newHash: () => Hash, secret: []byte, ivLen: int): []byte {
+  return hkdfExpandLabel(newHash, secret, "iv", tlsKsZeros(0), ivLen)
+}
+
+// The Finished MAC key for a handshake traffic secret (RFC 8446 §4.4.4):
+// `HKDF-Expand-Label(baseKey, "finished", "", Hash.length)`. `baseKey` is the
+// sender's handshake traffic secret; the key is one digest long.
+export function finishedKey(newHash: () => Hash, baseKey: []byte): []byte {
+  return hkdfExpandLabel(newHash, baseKey, "finished", tlsKsZeros(0), newHash().size())
+}
+
+// The Finished message's `verify_data` (RFC 8446 §4.4.4): `HMAC(finished_key,
+// Transcript-Hash(handshake so far))`, keyed by `finishedKey(baseKey)`. The
+// receiver recomputes it over its own transcript and compares in constant time to
+// authenticate the whole handshake.
+export function finishedMac(newHash: () => Hash, baseKey: []byte, transcriptHash: []byte): []byte {
+  return hmac(newHash, finishedKey(newHash, baseKey), transcriptHash)
+}
