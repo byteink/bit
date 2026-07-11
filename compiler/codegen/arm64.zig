@@ -2139,7 +2139,7 @@ fn newCtx(gpa: Allocator, module: *const ir.Module, f: *const ir.Function) Ctx {
         .result = undefined,
         .int_regs = &.{},
         .float_regs = &.{},
-        .frame = .{ .saved_gpr = &.{}, .saved_fpr = &.{}, .num_spill_slots = 0, .frame_size = 0 },
+        .frame = .{ .saved_gpr = &.{}, .saved_fpr = &.{}, .num_spill_slots = 0, .outgoing_bytes = 0, .frame_size = 0 },
         .block_offsets = &.{},
         .safepoint_positions = &.{},
     };
