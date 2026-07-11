@@ -3493,3 +3493,95 @@ a malformed hint — yields `false` rather than an error.
 Verify `sig` on `msg` under `pk` with context `ctx` (at most 255 bytes). The
 context must match the one used when signing. `mldsaVerify` is this with an empty
 context.
+## Trust store
+
+A `TrustStore` is the set of certificate-authority roots a caller treats as trust
+anchors — the roots a TLS client verifies a server's chain up to. It holds parsed
+`Certificate`s and verifies a leaf against them by delegating to `x509VerifyChain`;
+it owns the anchor set, it does not reimplement verification.
+
+There are three ways to obtain a store. `systemRoots()` reads the operating
+system's own trust store — on Linux the distribution CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`) or the hashed `/etc/ssl/certs` directory —
+so trust tracks the administrator's decisions; on macOS and Windows, whose trust
+lives behind Security.framework / CryptoAPI, it fails with a clear error until
+that native integration lands. `fromPem(pem)` builds a store from roots the caller
+supplies (a pinned corporate root, a private PKI, a test fixture), parsing every
+`CERTIFICATE` block strictly. `bundled()` returns a small curated set of well-known
+public roots compiled into the binary, a working default when no system store is
+available — a convenience floor, not a substitute for the system store.
+
+Verification is deterministic: `nowUnix` is injected, never read from a clock,
+exactly as `x509VerifyChain` requires.
+
+```bit
+import { TrustStore, fromPem, bundled, pemDecode, x509Parse, Certificate } from "std/crypto"
+
+// Parse the first CERTIFICATE block of `pem` into a certificate.
+function truststoreExampleCert(pem: string): Certificate! {
+  let blocks = pemDecode(pem)?
+  return x509Parse(blocks[0].der)?
+}
+
+// Whether `leafPem` chains to a root in `rootsPem` (through `interPem`) for
+// `host` at `nowUnix`. The caller's PEM roots become a TrustStore; any parse or
+// verification failure yields false. `nowUnix` is injected, so the decision
+// never depends on the wall clock.
+function truststoreTrusts(rootsPem: string, interPem: string, leafPem: string, host: string, nowUnix: int): bool {
+  let store = fromPem(rootsPem) catch e {
+    return false
+  }
+  let inter = truststoreExampleCert(interPem) catch e {
+    return false
+  }
+  let leaf = truststoreExampleCert(leafPem) catch e {
+    return false
+  }
+  let inters = append([]Certificate(0), inter)
+  store.verifyChain(leaf, inters, host, nowUnix) catch e {
+    return false
+  }
+  return true
+}
+
+// The number of public roots the compiled-in default set carries — a nonzero
+// fallback for when no system trust store is available.
+function truststoreBundledCount(): int {
+  return len(bundled().roots)
+}
+```
+
+### `TrustStore`
+
+A set of trust-anchor certificates. The `roots` field is exported so a caller can
+hand the anchors to a lower-level verifier or inspect them.
+
+### `fromPem(pem: string): TrustStore!`
+
+Build a store from a PEM bundle: every `CERTIFICATE` block in `pem`, in order,
+parsed into a root. Strict — a block whose DER is not a well-formed certificate
+fails the whole parse — and fails if the input carries no certificate at all.
+Non-CERTIFICATE blocks (a stray CRL or key) are ignored.
+
+### `systemRoots(): TrustStore!`
+
+The operating system's trust store. On Linux, the distribution CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`), else the hashed `/etc/ssl/certs`
+directory read tolerantly (an entry the parser cannot yet handle is skipped, so
+one odd certificate does not sink the store). On macOS and Windows it fails with a
+clear error — call `bundled()` there until native trust-store integration lands.
+
+### `TrustStore.verifyChain(leaf: Certificate, intermediates: []Certificate, hostname: string, nowUnix: int): ()!`
+
+Verify `leaf` up to one of the store's roots, through `intermediates`, for
+`hostname` at `nowUnix`. A thin delegation to `x509VerifyChain` with the store's
+anchors as the trusted roots: it fails with that function's specific error for the
+first problem found (hostname mismatch, expiry, a non-CA issuer, a broken
+signature, an unbuildable chain, a path-length violation).
+
+### `bundled(): TrustStore`
+
+A store of a small, curated set of well-known public CA roots compiled into the
+binary — a working default when no system store is available. The embedded PEM is
+vetted at commit time and parsed by CI, so a parse failure is a build-time
+invariant violation and panics rather than returning a silently empty store.
