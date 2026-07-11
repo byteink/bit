@@ -1005,12 +1005,28 @@ const FnCtx = struct {
         }
     }
 
+    /// Interface widening (§14.3): a concrete value stored into an
+    /// interface-typed slot carries the concrete struct as its IR value type
+    /// while the slot's declared type is the interface. The two share one
+    /// boxed-handle representation, so relabel the value to the interface type —
+    /// a no-op cast, not a data change. Without it a control-flow merge
+    /// (`if`/`catch`/loop join) creates its block param at the interface type
+    /// while the incoming arg keeps the concrete type, and the IR verifier
+    /// rejects the block-arg mismatch. The checker has already proven structural
+    /// conformance; this only mirrors the interface type onto the lowered value.
+    fn coerceToIface(self: *FnCtx, val: ir.ValueId, target: TypeId) Error!ir.ValueId {
+        if (self.ctx.typeOf(target) != .interface) return val;
+        if (self.b.valueType(val) == target) return val;
+        return self.b.convert(target, val);
+    }
+
     fn lowerLetConst(self: *FnCtx, node: ast.Index) Error!void {
         for (self.kids(node)) |bind| {
             const bk = self.kids(bind); // binding: [pattern, type_or_none, init_or_none]
             if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct; // tuple destructuring: deferred
             const ty = try self.nodeType(bk[0]);
-            const val = if (bk[2] != ast.none) try self.lowerExprH(bk[2], ty) else try self.zeroValue(ty);
+            const raw = if (bk[2] != ast.none) try self.lowerExprH(bk[2], ty) else try self.zeroValue(ty);
+            const val = try self.coerceToIface(raw, ty);
             try self.env.declare(self.gpa, self.identText(bk[0]), val, ty);
         }
     }
@@ -1066,7 +1082,11 @@ const FnCtx = struct {
     }
     fn writeLvalue(self: *FnCtx, lv: Lvalue, val: ir.ValueId) Error!void {
         switch (lv) {
-            .local => |i| self.env.bindings.items[i].value = val,
+            // Reassigning an interface-typed local widens the concrete value to
+            // the local's declared interface type so it stays merge-compatible
+            // across later joins (see `coerceToIface`).
+            .local => |i| self.env.bindings.items[i].value =
+                try self.coerceToIface(val, self.env.bindings.items[i].ty),
             .field => |f| try self.b.fieldSet(f.recv, f.offset, val),
             .elem => |e| if (e.is_slice) {
                 _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ e.recv, e.index, val });
@@ -1196,7 +1216,11 @@ const FnCtx = struct {
         const k = self.kids(node); // default: [expr, dflt]; bind: [expr, err_ident, block]
         const fdata = self.ctx.typeOf(try self.nodeType(k[0])).fallible;
         const is_void = fdata.ok == self.ctx.void_id;
-        const okv = try self.lowerExpr(k[0]);
+        // Both join edges feed the ok slot (`okv` on success, `handled` on the
+        // handled error), typed `fdata.ok`; widen a concrete value to an
+        // interface ok type so both agree with the join param (see
+        // `coerceToIface`).
+        const okv = try self.coerceToIface(try self.lowerExpr(k[0]), fdata.ok);
         const errv = try self.getErr(fdata.err);
         const is_err = try self.neNil(errv, fdata.err);
 
@@ -1227,7 +1251,8 @@ const FnCtx = struct {
         if (!self.terminated) {
             const err_vals = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(err_vals);
-            const args = try self.catchEdgeArgs(err_vals, handled.?, is_void);
+            const merged = try self.coerceToIface(handled.?, fdata.ok);
+            const args = try self.catchEdgeArgs(err_vals, merged, is_void);
             defer self.gpa.free(args);
             try self.emitJump(join, args);
         }
@@ -1632,7 +1657,10 @@ const FnCtx = struct {
             }
         }
         var val: ir.ValueId = undefined;
-        if (is_void) _ = try self.lowerExpr(ak[1]) else val = try self.lowerExprH(ak[1], result_ty);
+        // A match-as-expression merges each arm's value at the join, typed
+        // `result_ty`; widen a concrete arm value to an interface result so it
+        // agrees with the join param (see `coerceToIface`).
+        if (is_void) _ = try self.lowerExpr(ak[1]) else val = try self.coerceToIface(try self.lowerExprH(ak[1], result_ty), result_ty);
         self.env.restoreCount(mark);
         if (!self.terminated) {
             join_reachable.* = true;

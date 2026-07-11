@@ -660,6 +660,12 @@ pub const FunctionBuilder = struct {
         self.block_open = false;
     }
 
+    /// The recorded type of a value already emitted into this builder — the
+    /// mid-build counterpart of `Function.valueType`.
+    pub fn valueType(self: *const FunctionBuilder, v: ValueId) TypeId {
+        return self.insts.items(.ty)[@intFromEnum(v)];
+    }
+
     fn push(self: *FunctionBuilder, op: Op, ty: TypeId, extra_vals: []const u32) Allocator.Error!ValueId {
         std.debug.assert(self.block_open);
         const idx: u32 = @intCast(self.insts.len);
