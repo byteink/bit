@@ -2924,3 +2924,99 @@ the digest (e.g. `newSha1`, `newSha256`) and must return a fresh, empty hasher o
 each call; `iters` is the cost factor and must be at least 1. The result is
 deterministic in all five inputs. Panics if `iters < 1` or `outLen` exceeds the
 block counter's `(2^32 - 1) * hLen` ceiling.
+## ML-KEM-768
+
+ML-KEM (FIPS 203, formerly Kyber) is a post-quantum key-encapsulation mechanism:
+one side publishes an encapsulation key, the other encapsulates a fresh 32-byte
+shared secret to it, and only the holder of the decapsulation key can recover
+that secret. Its security rests on the hardness of module lattice problems, so
+it stays safe against an adversary with a large quantum computer — unlike RSA or
+elliptic-curve Diffie-Hellman.
+
+This module implements the **768** parameter set (NIST security category 3),
+with a 1184-byte encapsulation key, a 2400-byte decapsulation key, 1088-byte
+ciphertexts, and a 32-byte shared secret. Keys are raw byte slices in the FIPS
+203 encoding, so they interoperate with any conforming implementation.
+
+`mlkemKeygen` and `mlkemEncaps` draw their randomness from the operating system
+CSPRNG (`crypto/rand`). The `*Derand` variants take that randomness as an
+explicit argument; they exist for known-answer testing and deterministic
+protocols, and should not be fed anything but uniformly random 32-byte seeds.
+Decapsulation never fails: a tampered ciphertext yields a deterministic
+*implicit-rejection* secret rather than an error, denying an attacker a
+decryption-failure oracle. The whole implementation is constant-time with
+respect to secret data.
+
+```bit
+import { mlkemKeygen, mlkemEncaps, mlkemDecaps, ctEq } from "std/crypto"
+
+// A full key exchange: the two parties agree on 32 secret bytes, and the secret
+// itself never travels over the wire — only the public key and the ciphertext do.
+function exchange(): bool! {
+  // Alice generates a key pair, publishes `kp.ek`, and keeps `kp.dk` secret.
+  let kp = mlkemKeygen()
+
+  // Bob encapsulates to Alice's key: he sends `enc.ct` and keeps `enc.ss`.
+  let enc = mlkemEncaps(kp.ek)?
+
+  // Alice recovers the same shared secret from the ciphertext with her key.
+  let ss = mlkemDecaps(kp.dk, enc.ct)
+
+  // Both sides now hold identical key material (compared in constant time).
+  return ctEq(enc.ss, ss)
+}
+```
+
+### `MlkemKeypair`
+
+A generated key pair. `ek` is the public encapsulation key (1184 bytes); `dk` is
+the secret decapsulation key (2400 bytes) and must never be shared.
+
+### `MlkemEncapsulated`
+
+The result of encapsulation: the `ct` ciphertext (1088 bytes) to send to the key
+holder, and the `ss` shared secret (32 bytes) to keep.
+
+### `mlkemKeygen(): MlkemKeypair`
+
+Generate a fresh ML-KEM-768 key pair, drawing both seeds from the system CSPRNG.
+
+### `mlkemKeygenDerand(d: []byte, z: []byte): MlkemKeypair`
+
+Derandomized key generation (FIPS 203 `ML-KEM.KeyGen_internal`): derive the key
+pair from the two 32-byte seeds `d` and `z`. For known-answer tests and
+deterministic protocols; pass only uniformly random seeds.
+
+### `mlkemEncaps(ek: []byte): MlkemEncapsulated!`
+
+Encapsulate to `ek`: draw a random message and produce a ciphertext plus the
+shared secret. Fails if `ek` is not a valid encapsulation key (wrong length, or a
+coefficient not reduced mod q).
+
+### `mlkemEncapsDerand(ek: []byte, m: []byte): MlkemEncapsulated!`
+
+Derandomized encapsulation (FIPS 203 `ML-KEM.Encaps_internal`): use the given
+32-byte message `m` in place of fresh randomness. Same validation and failure as
+`mlkemEncaps`. For known-answer tests; pass only a uniformly random `m`.
+
+### `mlkemDecaps(dk: []byte, ct: []byte): []byte`
+
+Decapsulate `ct` with the secret key `dk`, returning the 32-byte shared secret.
+Never fails: a ciphertext that fails re-encryption yields a deterministic
+implicit-rejection secret, indistinguishable from success without `dk`.
+
+### `mlkemEkSize: int`
+
+The encapsulation-key length in bytes (1184).
+
+### `mlkemDkSize: int`
+
+The decapsulation-key length in bytes (2400).
+
+### `mlkemCtSize: int`
+
+The ciphertext length in bytes (1088).
+
+### `mlkemSsSize: int`
+
+The shared-secret length in bytes (32).

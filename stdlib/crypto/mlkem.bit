@@ -1,0 +1,720 @@
+// Bit standard library — crypto module, ML-KEM-768 (FIPS 203).
+//
+// ML-KEM is the NIST-standardized post-quantum key-encapsulation mechanism
+// (Module-Lattice KEM, formerly Kyber). This file implements the 768 parameter
+// set: security category 3, with public keys of 1184 bytes, secret keys of 2400
+// bytes, ciphertexts of 1088 bytes, and a 32-byte shared secret.
+//
+// The math lives in the ring R_q = Z_q[X]/(X^256 + 1) with q = 3329. Polynomials
+// are multiplied through the number-theoretic transform (NTT): a length-256
+// transform whose base cases are the 128 degree-1 products in Z_q[X]/(X^2 - z),
+// with z = 17^(2·BitRev7(i)+1). Matrix expansion, noise sampling, and all hashes
+// ride on the SHA-3 family already in this module (SHAKE128 as the matrix XOF,
+// SHAKE256 as the PRF/J, SHA3-256/512 as H/G).
+//
+// Constant time: every operation that touches secret data has data-independent
+// control flow and memory access. Reductions mod q are branchless (multiply +
+// shift + one masked conditional subtract); the NTT and CBD sampling walk fixed
+// index patterns; the decapsulation ciphertext comparison OR-accumulates the
+// full length; and implicit rejection selects the real vs. the rejection secret
+// with a bit-mask, never a branch. SampleNTT's rejection loop is variable-time,
+// but only over the *public* seed rho, so it leaks nothing about secrets.
+//
+// The known-answer tests in tests/imports/cryptomlkem are the real conformance
+// check: a wrong NTT twiddle, a swapped ByteEncode nibble, or a mis-ordered hash
+// input would still typecheck but would miss the NIST ACVP vectors by every byte.
+
+// ---------------------------------------------------------------------------
+// Parameters (ML-KEM-768, FIPS 203 Table 2).
+
+const mlkemK: int = 3 // module rank
+const mlkemEta: int = 2 // CBD parameter (eta1 = eta2 = 2)
+const mlkemDu: int = 10 // ciphertext compression, u component
+const mlkemDv: int = 4 // ciphertext compression, v component
+
+// Public byte sizes, exported so callers can allocate and validate buffers.
+export const mlkemEkSize: int = 1184 // encapsulation (public) key
+export const mlkemDkSize: int = 2400 // decapsulation (secret) key
+export const mlkemCtSize: int = 1088 // ciphertext
+export const mlkemSsSize: int = 32 // shared secret
+
+// ByteEncode_12 of one polynomial is 384 bytes; the whole secret vector is 1152.
+const mlkemPolyBytes: int = 384
+const mlkemVecBytes: int = 1152 // 384 * k
+
+// ---------------------------------------------------------------------------
+// Grouped return values. Tuples are not yet a lowerable value in the seed
+// compiler, so — like `QuotRem` in bigint.bit — the two halves ride in a struct
+// with exported fields.
+
+// A freshly generated ML-KEM key pair.
+export struct MlkemKeypair {
+  export ek: []byte, // encapsulation key (public), 1184 bytes
+  export dk: []byte, // decapsulation key (secret), 2400 bytes
+}
+
+// The output of encapsulation: a ciphertext to send and the shared secret to keep.
+export struct MlkemEncapsulated {
+  export ct: []byte, // ciphertext, 1088 bytes
+  export ss: []byte, // shared secret, 32 bytes
+}
+
+// ---------------------------------------------------------------------------
+// Modular arithmetic in Z_q, branchless and in [0, q).
+
+// Reduce `r`, known to be in [0, 2q), to [0, q) with one masked conditional
+// subtraction — never a branch on the (secret) value of `r`. `r - q` underflows
+// in u32 exactly when `r < q`; its top bit then flags "do not subtract".
+function mlkemCsub(r: u32): u16 {
+  let sub: u32 = r - 3329
+  let ge: u32 = u32(1) - sub >> 31 // 1 when r >= q, else 0
+  let mask: u32 = u32(0) - ge
+  return u16(sub & mask | r & ~mask)
+}
+
+// Reduce a full product `x` in [0, (q-1)^2] to [0, q) by Barrett's method:
+// t ≈ x/q via the fixed multiplier floor(2^32 / q) = 1290167, then subtract t·q.
+// The remainder lands in [0, 2q), so one `mlkemCsub` finishes the job.
+function mlkemBarrett(x: u32): u16 {
+  let t: u32 = u32(u64(x) * 1290167 >> 32)
+  return mlkemCsub(x - t * 3329)
+}
+
+// (a·b) mod q for a, b in [0, q).
+function mlkemFqMul(a: u16, b: u16): u16 { return mlkemBarrett(u32(a) * u32(b)) }
+
+// (a + b) mod q for a, b in [0, q).
+function mlkemAddMod(a: u16, b: u16): u16 { return mlkemCsub(u32(a) + u32(b)) }
+
+// (a - b) mod q for a, b in [0, q). Adding q first keeps the subtraction in u32.
+function mlkemSubMod(a: u16, b: u16): u16 { return mlkemCsub(u32(a) + 3329 - u32(b)) }
+
+// ---------------------------------------------------------------------------
+// NTT twiddle tables. Top-level `const` is scalar-only in the seed compiler, so
+// (as in sha3.bit) the tables are built once per call inside these accessors.
+
+// zetas[i] = 17^BitRev7(i) mod q — the layer twiddles for the forward/inverse NTT.
+function mlkemZetas(): []u16 {
+  const z: []u16 = []u16{
+    1, 1729, 2580, 3289, 2642, 630, 1897, 848, 1062, 1919, 193, 797, 2786, 3260, 569, 1746,
+    296, 2447, 1339, 1476, 3046, 56, 2240, 1333, 1426, 2094, 535, 2882, 2393, 2879, 1974, 821,
+    289, 331, 3253, 1756, 1197, 2304, 2277, 2055, 650, 1977, 2513, 632, 2865, 33, 1320, 1915,
+    2319, 1435, 807, 452, 1438, 2868, 1534, 2402, 2647, 2617, 1481, 648, 2474, 3110, 1227, 910,
+    17, 2761, 583, 2649, 1637, 723, 2288, 1100, 1409, 2662, 3281, 233, 756, 2156, 3015, 3050,
+    1703, 1651, 2789, 1789, 1847, 952, 1461, 2687, 939, 2308, 2437, 2388, 733, 2337, 268, 641,
+    1584, 2298, 2037, 3220, 375, 2549, 2090, 1645, 1063, 319, 2773, 757, 2099, 561, 2466, 2594,
+    2804, 1092, 403, 1026, 1143, 2150, 2775, 886, 1722, 1212, 1874, 1029, 2110, 2935, 885, 2154,
+  }
+  return z
+}
+
+// gammas[i] = 17^(2·BitRev7(i)+1) mod q — the base-case moduli X^2 - gammas[i].
+function mlkemGammas(): []u16 {
+  const g: []u16 = []u16{
+    17, 3312, 2761, 568, 583, 2746, 2649, 680, 1637, 1692, 723, 2606, 2288, 1041, 1100, 2229,
+    1409, 1920, 2662, 667, 3281, 48, 233, 3096, 756, 2573, 2156, 1173, 3015, 314, 3050, 279,
+    1703, 1626, 1651, 1678, 2789, 540, 1789, 1540, 1847, 1482, 952, 2377, 1461, 1868, 2687, 642,
+    939, 2390, 2308, 1021, 2437, 892, 2388, 941, 733, 2596, 2337, 992, 268, 3061, 641, 2688,
+    1584, 1745, 2298, 1031, 2037, 1292, 3220, 109, 375, 2954, 2549, 780, 2090, 1239, 1645, 1684,
+    1063, 2266, 319, 3010, 2773, 556, 757, 2572, 2099, 1230, 561, 2768, 2466, 863, 2594, 735,
+    2804, 525, 1092, 2237, 403, 2926, 1026, 2303, 1143, 2186, 2150, 1179, 2775, 554, 886, 2443,
+    1722, 1607, 1212, 2117, 1874, 1455, 1029, 2300, 2110, 1219, 2935, 394, 885, 2444, 2154, 1175,
+  }
+  return g
+}
+
+// Forward NTT (FIPS 203 Algorithm 9), in place over the 256 coefficients of `f`.
+// Seven layers of Cooley-Tukey butterflies with halving stride.
+function mlkemNtt(f: []u16) {
+  let zetas = mlkemZetas()
+  let i = 1
+  let step = 128
+  while (step >= 2) {
+    let start = 0
+    while (start < 256) {
+      let zeta = zetas[i]
+      i = i + 1
+      let j = start
+      while (j < start + step) {
+        let t = mlkemFqMul(zeta, f[j + step])
+        f[j + step] = mlkemSubMod(f[j], t)
+        f[j] = mlkemAddMod(f[j], t)
+        j = j + 1
+      }
+      start = start + 2 * step
+    }
+    step = step / 2
+  }
+}
+
+// Inverse NTT (FIPS 203 Algorithm 10), in place, followed by the 128^-1 = 3303
+// scaling. Gentleman-Sande butterflies with doubling stride, twiddles reversed.
+function mlkemInvNtt(f: []u16) {
+  let zetas = mlkemZetas()
+  let i = 127
+  let step = 2
+  while (step <= 128) {
+    let start = 0
+    while (start < 256) {
+      let zeta = zetas[i]
+      i = i - 1
+      let j = start
+      while (j < start + step) {
+        let t = f[j]
+        f[j] = mlkemAddMod(t, f[j + step])
+        f[j + step] = mlkemFqMul(zeta, mlkemSubMod(f[j + step], t))
+        j = j + 1
+      }
+      start = start + 2 * step
+    }
+    step = step * 2
+  }
+  let k = 0
+  while (k < 256) {
+    f[k] = mlkemFqMul(f[k], 3303)
+    k = k + 1
+  }
+}
+
+// Pointwise product of two NTT-domain polynomials (FIPS 203 Algorithms 11/12):
+// 128 independent 2x2 base-case multiplies in Z_q[X]/(X^2 - gammas[i]).
+function mlkemMulNtt(f: []u16, g: []u16): []u16 {
+  let gammas = mlkemGammas()
+  let h = []u16(256)
+  let i = 0
+  while (i < 128) {
+    let a0 = f[2 * i]
+    let a1 = f[2 * i + 1]
+    let b0 = g[2 * i]
+    let b1 = g[2 * i + 1]
+    // c0 = a0·b0 + a1·b1·gamma ; c1 = a0·b1 + a1·b0
+    let a1b1 = mlkemFqMul(mlkemFqMul(a1, b1), gammas[i])
+    h[2 * i] = mlkemAddMod(mlkemFqMul(a0, b0), a1b1)
+    h[2 * i + 1] = mlkemAddMod(mlkemFqMul(a0, b1), mlkemFqMul(a1, b0))
+    i = i + 1
+  }
+  return h
+}
+
+// Coefficient-wise (a + b) mod q, into a fresh polynomial.
+function mlkemPolyAdd(a: []u16, b: []u16): []u16 {
+  let r = []u16(256)
+  let i = 0
+  while (i < 256) {
+    r[i] = mlkemAddMod(a[i], b[i])
+    i = i + 1
+  }
+  return r
+}
+
+// Coefficient-wise (a - b) mod q, into a fresh polynomial.
+function mlkemPolySub(a: []u16, b: []u16): []u16 {
+  let r = []u16(256)
+  let i = 0
+  while (i < 256) {
+    r[i] = mlkemSubMod(a[i], b[i])
+    i = i + 1
+  }
+  return r
+}
+
+// ---------------------------------------------------------------------------
+// Compression and byte (de)serialization.
+
+// Compress each coefficient to `d` bits: round(2^d · x / q) mod 2^d, done with
+// the same multiply-shift as the reference so it is exact and branchless.
+function mlkemCompress(f: []u16, d: int): []u16 {
+  let r = []u16(256)
+  let mask: u32 = u32(1 << u32(d) - 1)
+  let i = 0
+  while (i < 256) {
+    let t: u64 = u64(f[i]) << u64(d) + 1665
+    t = t * 1290167 >> 32
+    r[i] = u16(u32(t) & mask)
+    i = i + 1
+  }
+  return r
+}
+
+// Decompress each `d`-bit value back toward Z_q: round(q · y / 2^d), exact.
+function mlkemDecompress(f: []u16, d: int): []u16 {
+  let r = []u16(256)
+  let add: u32 = u32(1) << u32(d - 1)
+  let i = 0
+  while (i < 256) {
+    r[i] = u16((3329 * u32(f[i]) + add) >> u32(d))
+    i = i + 1
+  }
+  return r
+}
+
+// ByteEncode_d (FIPS 203 Algorithm 5): pack 256 d-bit coefficients, low bit
+// first, into 32·d bytes through a small bit accumulator.
+function mlkemByteEncode(f: []u16, d: int): []byte {
+  let out = []byte(32 * d)
+  let acc: u32 = 0
+  let bits = 0
+  let oi = 0
+  let i = 0
+  while (i < 256) {
+    acc = acc | u32(f[i]) << u32(bits)
+    bits = bits + d
+    while (bits >= 8) {
+      out[oi] = u8(acc & 0xff)
+      oi = oi + 1
+      acc = acc >> 8
+      bits = bits - 8
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// ByteDecode_d (FIPS 203 Algorithm 6): the inverse of `mlkemByteEncode`. For the
+// 12-bit form the value can exceed q, so `mlkemCsub` folds it into [0, q); for
+// smaller `d` every value is already below q and the reduction is a no-op.
+function mlkemByteDecode(b: []byte, d: int): []u16 {
+  let f = []u16(256)
+  let mask: u32 = u32(1 << u32(d) - 1)
+  let acc: u32 = 0
+  let bits = 0
+  let bi = 0
+  let i = 0
+  while (i < 256) {
+    while (bits < d) {
+      acc = acc | u32(b[bi]) << u32(bits)
+      bi = bi + 1
+      bits = bits + 8
+    }
+    f[i] = mlkemCsub(acc & mask)
+    acc = acc >> u32(d)
+    bits = bits - d
+    i = i + 1
+  }
+  return f
+}
+
+// Encode a k-vector of polynomials as `d`-bit words, concatenated.
+function mlkemEncodeVec(v: [][]u16, d: int): []byte {
+  let out = []byte(32 * d * len(v))
+  let off = 0
+  let i = 0
+  while (i < len(v)) {
+    let enc = mlkemByteEncode(v[i], d)
+    let j = 0
+    while (j < len(enc)) {
+      out[off + j] = enc[j]
+      j = j + 1
+    }
+    off = off + len(enc)
+    i = i + 1
+  }
+  return out
+}
+
+// Decode `k` polynomials of `d`-bit words from a byte slice.
+function mlkemDecodeVec(b: []byte, d: int, k: int): [][]u16 {
+  let v = [][]u16(k)
+  let sz = 32 * d
+  let i = 0
+  while (i < k) {
+    v[i] = mlkemByteDecode(b[i * sz:(i + 1) * sz], d)
+    i = i + 1
+  }
+  return v
+}
+
+// ---------------------------------------------------------------------------
+// Sampling and the hash surface.
+
+// SampleNTT (FIPS 203 Algorithm 7): rejection-sample a uniform NTT-domain
+// polynomial from SHAKE128(seed). `seed` is rho ∥ i ∥ j (34 bytes); its content
+// is public, so the variable iteration count leaks nothing secret.
+function mlkemSampleNtt(seed: []byte): []u16 {
+  let xof = newShake128()
+  xof.absorb(seed)
+  let a = []u16(256)
+  let j = 0
+  while (j < 256) {
+    let buf = xof.squeeze(3)
+    let d1: u32 = u32(buf[0]) | u32(buf[1]) & 0xf << 8
+    let d2: u32 = u32(buf[1]) >> 4 | u32(buf[2]) << 4
+    if (d1 < 3329) {
+      a[j] = u16(d1)
+      j = j + 1
+    }
+    if (j < 256 && d2 < 3329) {
+      a[j] = u16(d2)
+      j = j + 1
+    }
+  }
+  return a
+}
+
+// SamplePolyCBD_2 (FIPS 203 Algorithm 8) for eta = 2: each byte yields two
+// coefficients, each the signed difference of two 1-bit counts, reduced mod q.
+function mlkemCbd(bytes: []byte): []u16 {
+  let f = []u16(256)
+  let i = 0
+  while (i < 128) {
+    let b = u32(bytes[i])
+    let x0 = b >> 0 & 1 + b >> 1 & 1
+    let y0 = b >> 2 & 1 + b >> 3 & 1
+    f[2 * i] = mlkemCsub(x0 + 3329 - y0)
+    let x1 = b >> 4 & 1 + b >> 5 & 1
+    let y1 = b >> 6 & 1 + b >> 7 & 1
+    f[2 * i + 1] = mlkemCsub(x1 + 3329 - y1)
+    i = i + 1
+  }
+  return f
+}
+
+// PRF_eta (FIPS 203 §4.1): SHAKE256(s ∥ b) truncated to 64·eta = 128 bytes.
+function mlkemPrf(s: []byte, b: u8): []byte {
+  let inp = []byte(len(s) + 1)
+  let i = 0
+  while (i < len(s)) {
+    inp[i] = s[i]
+    i = i + 1
+  }
+  inp[len(s)] = b
+  let sh = newShake256()
+  sh.absorb(inp)
+  return sh.squeeze(64 * mlkemEta)
+}
+
+// G (FIPS 203 §4.1): SHA3-512, a 64-byte digest split by the caller into two
+// 32-byte halves.
+function mlkemG(input: []byte): []byte {
+  let h = newSha3_512()
+  h.write(input)
+  return h.sum()
+}
+
+// H (FIPS 203 §4.1): SHA3-256, a 32-byte digest.
+function mlkemH(input: []byte): []byte {
+  let h = newSha3_256()
+  h.write(input)
+  return h.sum()
+}
+
+// J (FIPS 203 §4.1): SHAKE256 truncated to 32 bytes, used for implicit rejection.
+function mlkemJ(input: []byte): []byte {
+  let s = newShake256()
+  s.absorb(input)
+  return s.squeeze(32)
+}
+
+// ---------------------------------------------------------------------------
+// Small byte-buffer helpers.
+
+// Copy `src` into `dst` starting at `off`; return the offset just past it, so
+// concatenations chain: off = copy(dst, off, part).
+function mlkemCopy(dst: []byte, off: int, src: []byte): int {
+  let i = 0
+  while (i < len(src)) {
+    dst[off + i] = src[i]
+    i = i + 1
+  }
+  return off + len(src)
+}
+
+// The 34-byte XOF seed for matrix entry Â[i,j]. Per FIPS 203 the column index is
+// absorbed before the row index — rho ∥ j ∥ i — so the byte order here is the one
+// the ACVP vectors were generated with; swapping it silently transposes Â.
+function mlkemMatrixSeed(rho: []byte, i: int, j: int): []byte {
+  let s = []byte(34)
+  let k = 0
+  while (k < 32) {
+    s[k] = rho[k]
+    k = k + 1
+  }
+  s[32] = u8(j)
+  s[33] = u8(i)
+  return s
+}
+
+// Expand the public matrix Â (FIPS 203): entry Â[i,j] = SampleNTT(rho ∥ j ∥ i),
+// stored row-major so caller indexes `a[i*k + j]` (or `a[j*k + i]` for Âᵀ).
+function mlkemGenMatrix(rho: []byte): [][]u16 {
+  let a = [][]u16(mlkemK * mlkemK)
+  let i = 0
+  while (i < mlkemK) {
+    let j = 0
+    while (j < mlkemK) {
+      a[i * mlkemK + j] = mlkemSampleNtt(mlkemMatrixSeed(rho, i, j))
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return a
+}
+
+// ---------------------------------------------------------------------------
+// K-PKE: the IND-CPA public-key scheme underneath ML-KEM.
+
+// K-PKE.KeyGen (FIPS 203 Algorithm 13). Returns ek = ByteEncode12(t̂) ∥ rho
+// (1184 bytes) and dk = ByteEncode12(ŝ) (1152 bytes).
+function mlkemPkeKeygen(d: []byte): MlkemKeypair {
+  let gin = []byte(len(d) + 1)
+  mlkemCopy(gin, 0, d)
+  gin[len(d)] = u8(mlkemK) // domain separation by module rank
+  let g = mlkemG(gin)
+  let rho = g[0:32]
+  let sigma = g[32:64]
+
+  let a = mlkemGenMatrix(rho)
+  let nn: u8 = 0
+
+  let shat = [][]u16(mlkemK)
+  let i = 0
+  while (i < mlkemK) {
+    let s = mlkemCbd(mlkemPrf(sigma, nn))
+    nn = nn + 1
+    mlkemNtt(s)
+    shat[i] = s
+    i = i + 1
+  }
+  let ehat = [][]u16(mlkemK)
+  i = 0
+  while (i < mlkemK) {
+    let e = mlkemCbd(mlkemPrf(sigma, nn))
+    nn = nn + 1
+    mlkemNtt(e)
+    ehat[i] = e
+    i = i + 1
+  }
+
+  // t̂[i] = sum_j Â[i,j] ∘ ŝ[j] + ê[i]
+  let that = [][]u16(mlkemK)
+  i = 0
+  while (i < mlkemK) {
+    let acc = []u16(256)
+    let j = 0
+    while (j < mlkemK) {
+      acc = mlkemPolyAdd(acc, mlkemMulNtt(a[i * mlkemK + j], shat[j]))
+      j = j + 1
+    }
+    that[i] = mlkemPolyAdd(acc, ehat[i])
+    i = i + 1
+  }
+
+  let ek = []byte(mlkemEkSize)
+  let off = mlkemCopy(ek, 0, mlkemEncodeVec(that, 12))
+  mlkemCopy(ek, off, rho)
+  let dk = mlkemEncodeVec(shat, 12)
+  return MlkemKeypair{ ek: ek, dk: dk }
+}
+
+// K-PKE.Encrypt (FIPS 203 Algorithm 14). `rnd` is the 32-byte coin; the returned
+// ciphertext is c1 ∥ c2 (960 + 128 = 1088 bytes).
+function mlkemPkeEncrypt(ekPke: []byte, m: []byte, rnd: []byte): []byte {
+  let that = mlkemDecodeVec(ekPke[0:mlkemVecBytes], 12, mlkemK)
+  let rho = ekPke[mlkemVecBytes:mlkemEkSize]
+  let a = mlkemGenMatrix(rho)
+  let nn: u8 = 0
+
+  let rhat = [][]u16(mlkemK)
+  let i = 0
+  while (i < mlkemK) {
+    let rr = mlkemCbd(mlkemPrf(rnd, nn))
+    nn = nn + 1
+    mlkemNtt(rr)
+    rhat[i] = rr
+    i = i + 1
+  }
+  let e1 = [][]u16(mlkemK)
+  i = 0
+  while (i < mlkemK) {
+    e1[i] = mlkemCbd(mlkemPrf(rnd, nn))
+    nn = nn + 1
+    i = i + 1
+  }
+  let e2 = mlkemCbd(mlkemPrf(rnd, nn))
+
+  // u = NTT^-1(Âᵀ ∘ r̂) + e1
+  let u = [][]u16(mlkemK)
+  i = 0
+  while (i < mlkemK) {
+    let acc = []u16(256)
+    let j = 0
+    while (j < mlkemK) {
+      acc = mlkemPolyAdd(acc, mlkemMulNtt(a[j * mlkemK + i], rhat[j]))
+      j = j + 1
+    }
+    mlkemInvNtt(acc)
+    u[i] = mlkemPolyAdd(acc, e1[i])
+    i = i + 1
+  }
+
+  // v = NTT^-1(t̂ᵀ ∘ r̂) + e2 + Decompress_1(Decode_1(m))
+  let acc = []u16(256)
+  i = 0
+  while (i < mlkemK) {
+    acc = mlkemPolyAdd(acc, mlkemMulNtt(that[i], rhat[i]))
+    i = i + 1
+  }
+  mlkemInvNtt(acc)
+  let mu = mlkemDecompress(mlkemByteDecode(m, 1), 1)
+  let v = mlkemPolyAdd(mlkemPolyAdd(acc, e2), mu)
+
+  let c1parts = [][]u16(mlkemK)
+  i = 0
+  while (i < mlkemK) {
+    c1parts[i] = mlkemCompress(u[i], mlkemDu)
+    i = i + 1
+  }
+  let c1 = mlkemEncodeVec(c1parts, mlkemDu)
+  let c2 = mlkemByteEncode(mlkemCompress(v, mlkemDv), mlkemDv)
+  let ct = []byte(mlkemCtSize)
+  let off = mlkemCopy(ct, 0, c1)
+  mlkemCopy(ct, off, c2)
+  return ct
+}
+
+// K-PKE.Decrypt (FIPS 203 Algorithm 15). Recovers the 32-byte message.
+function mlkemPkeDecrypt(dkPke: []byte, ct: []byte): []byte {
+  let c1len = 32 * mlkemDu * mlkemK
+  let c1 = ct[0:c1len]
+  let c2 = ct[c1len:mlkemCtSize]
+
+  let u = [][]u16(mlkemK)
+  let sz = 32 * mlkemDu
+  let i = 0
+  while (i < mlkemK) {
+    u[i] = mlkemDecompress(mlkemByteDecode(c1[i * sz:(i + 1) * sz], mlkemDu), mlkemDu)
+    i = i + 1
+  }
+  let v = mlkemDecompress(mlkemByteDecode(c2, mlkemDv), mlkemDv)
+  let shat = mlkemDecodeVec(dkPke, 12, mlkemK)
+
+  // w = v - NTT^-1(ŝᵀ ∘ NTT(u))
+  let acc = []u16(256)
+  i = 0
+  while (i < mlkemK) {
+    let un = u[i]
+    mlkemNtt(un)
+    acc = mlkemPolyAdd(acc, mlkemMulNtt(shat[i], un))
+    i = i + 1
+  }
+  mlkemInvNtt(acc)
+  let w = mlkemPolySub(v, acc)
+  return mlkemByteEncode(mlkemCompress(w, 1), 1)
+}
+
+// ---------------------------------------------------------------------------
+// ML-KEM: the KEM wrapper (Fujisaki-Okamoto with implicit rejection).
+
+// Validate an encapsulation key: correct length, and every 12-bit coefficient
+// already reduced mod q (the "modulus check"). Re-encoding the decode must
+// reproduce the input byte-for-byte. `ek` is public, so a mismatch may fail fast.
+function mlkemCheckEk(ek: []byte): ()! {
+  if (len(ek) != mlkemEkSize) {
+    fail newError("mlkem: encapsulation key must be ${mlkemEkSize} bytes")
+  }
+  let re = mlkemEncodeVec(mlkemDecodeVec(ek[0:mlkemVecBytes], 12, mlkemK), 12)
+  let i = 0
+  while (i < mlkemVecBytes) {
+    if (re[i] != ek[i]) {
+      fail newError("mlkem: encapsulation key not reduced mod q")
+    }
+    i = i + 1
+  }
+}
+
+// Constant-time implicit-rejection select: return `whenEqual` (the real secret)
+// if ciphertexts matched, else `whenDiff` (the rejection secret) — chosen by a
+// bit-mask over an OR-accumulated difference, with no branch on secret data.
+function mlkemSelectSecret(c: []byte, cprime: []byte, whenEqual: []byte, whenDiff: []byte): []byte {
+  let acc: u32 = 0
+  let i = 0
+  while (i < len(c)) {
+    acc = acc | u32(c[i] ^ cprime[i])
+    i = i + 1
+  }
+  // nz = 1 if any byte differed, else 0; mask = 0xff when equal, 0x00 otherwise.
+  let nz: u32 = (acc | (u32(0) - acc)) >> 31
+  let equal: u32 = u32(1) - nz // 1 when equal, 0 otherwise
+  let mask: u8 = u8(0) - u8(equal) // 0xff when equal, 0x00 otherwise
+  let out = []byte(mlkemSsSize)
+  i = 0
+  while (i < mlkemSsSize) {
+    out[i] = whenEqual[i] & mask | whenDiff[i] & ~mask
+    i = i + 1
+  }
+  return out
+}
+
+// Derandomized key generation (FIPS 203 Algorithm 16, ML-KEM.KeyGen_internal):
+// derive the whole key pair from the 32-byte seeds `d` (K-PKE key) and `z`
+// (implicit-rejection secret). Exposed for known-answer testing; production code
+// should prefer `mlkemKeygen`, which draws both seeds from the system CSPRNG.
+export function mlkemKeygenDerand(d: []byte, z: []byte): MlkemKeypair {
+  let kp = mlkemPkeKeygen(d)
+  let ek = kp.ek
+  let dk = []byte(mlkemDkSize)
+  let off = mlkemCopy(dk, 0, kp.dk) // dk_pke
+  off = mlkemCopy(dk, off, ek) // ek
+  off = mlkemCopy(dk, off, mlkemH(ek)) // H(ek)
+  mlkemCopy(dk, off, z) // z
+  return MlkemKeypair{ ek: ek, dk: dk }
+}
+
+// Generate a fresh ML-KEM-768 key pair from the operating system CSPRNG. The
+// encapsulation key is public; the decapsulation key must be kept secret.
+export function mlkemKeygen(): MlkemKeypair { return mlkemKeygenDerand(
+  randomBytes(32),
+  randomBytes(32),
+) }
+
+// Derandomized encapsulation (FIPS 203 Algorithm 17, ML-KEM.Encaps_internal):
+// use the caller-supplied 32-byte message `m` instead of fresh randomness. Fails
+// if `ek` is malformed (wrong length or not reduced mod q). Exposed for KAT;
+// production code should prefer `mlkemEncaps`.
+export function mlkemEncapsDerand(ek: []byte, m: []byte): MlkemEncapsulated! {
+  mlkemCheckEk(ek)?
+  let gin = []byte(64)
+  mlkemCopy(gin, 0, m)
+  mlkemCopy(gin, 32, mlkemH(ek))
+  let g = mlkemG(gin)
+  let k = g[0:32]
+  let r = g[32:64]
+  let ct = mlkemPkeEncrypt(ek, m, r)
+  return MlkemEncapsulated{ ct: ct, ss: k }
+}
+
+// Encapsulate to `ek`: draw a random message, produce a ciphertext to send and
+// the shared secret to keep. Fails if `ek` is not a valid encapsulation key.
+export function mlkemEncaps(ek: []byte): MlkemEncapsulated! { return mlkemEncapsDerand(
+  ek,
+  randomBytes(32),
+)? }
+
+// Decapsulate `ct` with the secret key `dk`, recovering the 32-byte shared
+// secret (FIPS 203 Algorithm 18, ML-KEM.Decaps_internal). Never fails: a
+// ciphertext that fails the re-encryption check yields a deterministic rejection
+// secret J(z ∥ ct) — indistinguishable from success without the secret key — so
+// there is no decryption-failure oracle for an attacker to probe.
+export function mlkemDecaps(dk: []byte, ct: []byte): []byte {
+  let dkPke = dk[0:mlkemVecBytes]
+  let ekPke = dk[mlkemVecBytes:mlkemVecBytes + mlkemEkSize]
+  let h = dk[mlkemVecBytes + mlkemEkSize:mlkemVecBytes + mlkemEkSize + 32]
+  let z = dk[mlkemVecBytes + mlkemEkSize + 32:mlkemDkSize]
+
+  let mprime = mlkemPkeDecrypt(dkPke, ct)
+  let gin = []byte(64)
+  mlkemCopy(gin, 0, mprime)
+  mlkemCopy(gin, 32, h)
+  let g = mlkemG(gin)
+  let kprime = g[0:32]
+  let rprime = g[32:64]
+
+  let jin = []byte(32 + len(ct))
+  mlkemCopy(jin, 0, z)
+  mlkemCopy(jin, 32, ct)
+  let kbar = mlkemJ(jin)
+
+  let cprime = mlkemPkeEncrypt(ekPke, mprime, rprime)
+  return mlkemSelectSecret(ct, cprime, kprime, kbar)
+}
+
