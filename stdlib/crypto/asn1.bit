@@ -1,0 +1,767 @@
+// Bit standard library — crypto module, ASN.1 Distinguished Encoding Rules.
+//
+// A strict DER (X.690) reader and writer. DER is the canonical form of ASN.1
+// used by X.509 certificates, PKCS#8 keys, and ECDSA/RSA signatures, so this is
+// the byte-level foundation the public-key modules build on.
+//
+// Everything is one flat `Element`: a tag (class + constructed flag + number)
+// carrying either raw content octets (`bytes`, for a primitive) or a list of
+// child elements (`children`, for a constructed type). `asn1Parse` turns bytes
+// into that tree; `asn1Encode` turns it back. Typed helpers on top read and
+// build the universal types (INTEGER, OID, SEQUENCE, ...).
+//
+// Strict means strict: malformed ASN.1 is a classic parser attack surface, so
+// decoding is fallible (`T!`) and *rejects* rather than best-efforts. A
+// non-minimal length, an indefinite-length marker, a non-minimal (redundantly
+// sign-extended) INTEGER, a non-minimal OID subidentifier, or trailing bytes
+// after the top-level element all fail the parse. There is exactly one valid
+// encoding of a given value, and only that encoding is accepted.
+
+// --- tag classes (identifier octet bits 8-7) -------------------------------
+
+// Universal class: the standard ASN.1 types (INTEGER, SEQUENCE, ...).
+export const classUniversal: int = 0
+// Application class: types specific to an application.
+export const classApplication: int = 1
+// Context-specific class: the `[n]` tags that disambiguate members of a
+// SEQUENCE or the alternatives of a CHOICE.
+export const classContext: int = 2
+// Private class: types specific to an enterprise.
+export const classPrivate: int = 3
+
+// --- universal tag numbers -------------------------------------------------
+
+// BOOLEAN (tag 1).
+export const tagBoolean: int = 1
+// INTEGER (tag 2).
+export const tagInteger: int = 2
+// BIT STRING (tag 3).
+export const tagBitString: int = 3
+// OCTET STRING (tag 4).
+export const tagOctetString: int = 4
+// NULL (tag 5).
+export const tagNull: int = 5
+// OBJECT IDENTIFIER (tag 6).
+export const tagOid: int = 6
+// UTF8String (tag 12).
+export const tagUtf8String: int = 12
+// SEQUENCE / SEQUENCE OF (tag 16, always constructed).
+export const tagSequence: int = 16
+// SET / SET OF (tag 17, always constructed).
+export const tagSet: int = 17
+// PrintableString (tag 19).
+export const tagPrintableString: int = 19
+// IA5String (tag 22).
+export const tagIA5String: int = 22
+// UTCTime (tag 23).
+export const tagUtcTime: int = 23
+// GeneralizedTime (tag 24).
+export const tagGeneralizedTime: int = 24
+
+// A safety cap on how many big-endian octets a length, a tag number, or an OID
+// subidentifier may span — keeps every parse loop provably bounded (Power of
+// 10). No real DER structure comes near any of them.
+const maxLengthBytes: int = 4
+const maxTagBytes: int = 8
+const maxOidSubidBytes: int = 9
+
+// A single parsed or to-be-encoded ASN.1 element. `constructed` selects which
+// content field is meaningful: a primitive carries `bytes` (its raw content
+// octets) and an empty `children`; a constructed type carries `children` (its
+// parsed members) and an empty `bytes`.
+export struct Element {
+  export cls: int,
+  export constructed: bool,
+  export tag: int,
+  export bytes: []byte,
+  export children: []Element,
+}
+
+// The decoded content of a BIT STRING: the trailing `unusedBits` (0..7) of the
+// final octet are padding and not part of the value.
+export struct BitString { export unusedBits: int, export bytes: []byte }
+
+// A read cursor over a byte buffer. A struct is a reference type (§13.3), so a
+// helper that advances `pos` advances it for its caller — that is what threads
+// one position through the recursive descent without an out-parameter.
+struct asn1Cursor { data: []byte, pos: int }
+
+// --- primitives for building elements --------------------------------------
+
+// A primitive element with class `cls`, tag number `tag`, and raw content.
+function asn1primitive(cls: int, tag: int, bytes: []byte): Element { return Element{
+  cls: cls,
+  constructed: false,
+  tag: tag,
+  bytes: bytes,
+  children: []Element(0),
+} }
+
+// A constructed element with class `cls`, tag number `tag`, and members.
+function asn1constructed(cls: int, tag: int, children: []Element): Element { return Element{
+  cls: cls,
+  constructed: true,
+  tag: tag,
+  bytes: []byte(0),
+  children: children,
+} }
+
+// A fresh copy of `src`, so an element never aliases a caller's mutable slice.
+function asn1copyBytes(src: []byte): []byte {
+  let out = []byte(len(src))
+  let i = 0
+  while (i < len(src)) {
+    out[i] = src[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Append every byte of `src` onto the (caller-owned, freshly built) `dst`.
+function asn1appendAll(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// --- encoder ----------------------------------------------------------------
+
+// The DER encoding of `e`: identifier octet(s), definite length, then content.
+// A constructed element's content is the concatenation of its encoded children;
+// a primitive's is its raw bytes. Total and deterministic — every value has one
+// encoding.
+export function asn1Encode(e: Element): []byte {
+  let content = asn1contentBytes(e)
+  let out = []byte(0)
+  out = asn1appendIdentifier(out, e)
+  out = asn1appendLength(out, len(content))
+  out = asn1appendAll(out, content)
+  return out
+}
+
+// The content octets of `e`: children encoded and concatenated when
+// constructed, else the raw primitive bytes.
+function asn1contentBytes(e: Element): []byte {
+  if (!e.constructed) {
+    return e.bytes
+  }
+  let out = []byte(0)
+  for k of e.children {
+    out = asn1appendAll(out, asn1Encode(k))
+  }
+  return out
+}
+
+// Append the identifier octet(s): class in bits 8-7, the constructed bit, and
+// the tag number — short form for tag < 31, else high-tag-number base-128 form.
+function asn1appendIdentifier(dst: []byte, e: Element): []byte {
+  let out = dst
+  let b0 = byte(e.cls << 6)
+  if (e.constructed) {
+    b0 = b0 | 0x20
+  }
+  if (e.tag < 0x1f) {
+    out = append(out, b0 | byte(e.tag))
+    return out
+  }
+  out = append(out, b0 | 0x1f)
+  return asn1appendBase128(out, e.tag)
+}
+
+// Append `v` as base-128, seven value bits per octet, big-endian, with the
+// continuation bit set on every octet but the last. `v >= 0`; `v == 0` is a
+// single 0x00 octet.
+function asn1appendBase128(dst: []byte, v: int): []byte {
+  let out = dst
+  let groups = []byte(0)
+  groups = append(groups, byte(v & 0x7f))
+  let x = v >> 7
+  let guard = 0
+  while (x > 0 && guard < maxTagBytes) {
+    groups = append(groups, byte(x & 0x7f))
+    x = x >> 7
+    guard = guard + 1
+  }
+  let i = len(groups) - 1
+  while (i >= 0) {
+    let g = groups[i]
+    if (i > 0) {
+      g = g | 0x80
+    }
+    out = append(out, g)
+    i = i - 1
+  }
+  return out
+}
+
+// Append the definite length `n`: short form for n < 128, else long form with
+// the minimal number of big-endian length octets.
+function asn1appendLength(dst: []byte, n: int): []byte {
+  let out = dst
+  if (n < 0x80) {
+    return append(out, byte(n))
+  }
+  let octets = []byte(0)
+  let x = n
+  let guard = 0
+  while (x > 0 && guard < 8) {
+    octets = append(octets, byte(x & 0xff))
+    x = x >> 8
+    guard = guard + 1
+  }
+  out = append(out, byte(0x80 | len(octets)))
+  let i = len(octets) - 1
+  while (i >= 0) {
+    out = append(out, octets[i])
+    i = i - 1
+  }
+  return out
+}
+
+// --- decoder ----------------------------------------------------------------
+
+// Read one octet, failing at end of input.
+function asn1nextByte(c: asn1Cursor): byte! {
+  if (c.pos >= len(c.data)) {
+    fail newError("asn1: unexpected end of input")
+  }
+  let b = c.data[c.pos]
+  c.pos = c.pos + 1
+  return b
+}
+
+// Take the next `n` octets as a view, failing if fewer remain.
+function asn1takeBytes(c: asn1Cursor, n: int): []byte! {
+  if (n < 0 || c.pos + n > len(c.data)) {
+    fail newError("asn1: declared length runs past end of input")
+  }
+  let out = c.data[c.pos:c.pos + n]
+  c.pos = c.pos + n
+  return out
+}
+
+// Decode a high-tag-number (base-128) tag, rejecting a non-minimal leading
+// 0x80 continuation octet and an over-long run.
+function asn1parseHighTag(c: asn1Cursor): int! {
+  let tag = 0
+  let first = true
+  let guard = 0
+  while (guard < maxTagBytes) {
+    let b = asn1nextByte(c)?
+    if (first && b == 0x80) {
+      fail newError("asn1: non-minimal high-tag number")
+    }
+    first = false
+    tag = tag << 7 | int(b & 0x7f)
+    if (b & 0x80 == 0) {
+      return tag
+    }
+    guard = guard + 1
+  }
+  fail newError("asn1: tag number too large")
+}
+
+// Decode a definite length, rejecting the indefinite form (0x80) and any
+// non-minimal long form (a leading zero octet, or the long form used for a
+// value that fits the short form).
+function asn1parseLength(c: asn1Cursor): int! {
+  let first = asn1nextByte(c)?
+  if (first == 0x80) {
+    fail newError("asn1: indefinite length is not valid DER")
+  }
+  if (first & 0x80 == 0) {
+    return int(first)
+  }
+  let n = int(first & 0x7f)
+  if (n > maxLengthBytes) {
+    fail newError("asn1: length field too large")
+  }
+  let length = 0
+  let i = 0
+  while (i < n) {
+    let b = asn1nextByte(c)?
+    if (i == 0 && b == 0) {
+      fail newError("asn1: non-minimal length (leading zero octet)")
+    }
+    length = length << 8 | int(b)
+    i = i + 1
+  }
+  if (length < 0x80) {
+    fail newError("asn1: non-minimal length (long form for a short value)")
+  }
+  return length
+}
+
+// Parse the members of a constructed element from its content, failing unless
+// they exactly fill it.
+function asn1parseChildren(content: []byte): []Element! {
+  let cc = asn1Cursor{ data: content, pos: 0 }
+  let kids = []Element(0)
+  let guard = 0
+  while (cc.pos < len(content) && guard < len(content) + 1) {
+    let k = asn1parseElement(cc)?
+    kids = append(kids, k)
+    guard = guard + 1
+  }
+  if (cc.pos != len(content)) {
+    fail newError("asn1: constructed content not fully consumed")
+  }
+  return kids
+}
+
+// Parse exactly one element at the cursor, recursing into constructed content.
+function asn1parseElement(c: asn1Cursor): Element! {
+  let id = asn1nextByte(c)?
+  let cls = int(id >> 6 & 3)
+  let constructed = id & 0x20 != 0
+  let tag = int(id & 0x1f)
+  if (tag == 0x1f) {
+    tag = asn1parseHighTag(c)?
+  }
+  let length = asn1parseLength(c)?
+  let content = asn1takeBytes(c, length)?
+
+  if (constructed) {
+    return asn1constructed(cls, tag, asn1parseChildren(content)?)
+  }
+  if (cls == classUniversal && (tag == tagSequence || tag == tagSet)) {
+    fail newError("asn1: SEQUENCE/SET must be constructed")
+  }
+  if (cls == classUniversal && tag == tagInteger) {
+    asn1checkIntegerMinimal(content)?
+  }
+  return asn1primitive(cls, tag, asn1copyBytes(content))
+}
+
+// Parse a single top-level DER element from `der`, failing on any malformed
+// structure or on octets left over after it.
+export function asn1Parse(der: []byte): Element! {
+  let c = asn1Cursor{ data: der, pos: 0 }
+  let e = asn1parseElement(c)?
+  if (c.pos != len(der)) {
+    fail newError("asn1: trailing bytes after top-level element")
+  }
+  return e
+}
+
+// --- shared validation ------------------------------------------------------
+
+// Reject a non-minimal two's-complement INTEGER: at least one octet, and the
+// first nine bits neither all-zero (a redundant 0x00) nor all-one (a redundant
+// 0xFF).
+function asn1checkIntegerMinimal(content: []byte): ()! {
+  if (len(content) == 0) {
+    fail newError("asn1: INTEGER must have at least one content octet")
+  }
+  if (len(content) >= 2) {
+    let b0 = content[0]
+    let b1 = content[1]
+    if (b0 == 0x00 && b1 & 0x80 == 0) {
+      fail newError("asn1: non-minimal INTEGER (redundant leading 0x00)")
+    }
+    if (b0 == 0xff && b1 & 0x80 != 0) {
+      fail newError("asn1: non-minimal INTEGER (redundant leading 0xff)")
+    }
+  }
+}
+
+// Fail unless `e` is a primitive of the given class and tag.
+function asn1expectPrimitive(e: Element, cls: int, tag: int): ()! {
+  if (e.cls != cls) {
+    fail newError("asn1: wrong class (want ${cls}, got ${e.cls})")
+  }
+  if (e.constructed) {
+    fail newError("asn1: expected a primitive, got a constructed element")
+  }
+  if (e.tag != tag) {
+    fail newError("asn1: wrong tag (want ${tag}, got ${e.tag})")
+  }
+}
+
+// --- typed constructors -----------------------------------------------------
+
+// A BOOLEAN. DER spells true as 0xFF and false as 0x00.
+export function asn1Boolean(v: bool): Element {
+  let b = []byte(1)
+  if (v) {
+    b[0] = 0xff
+  } else {
+    b[0] = 0x00
+  }
+  return asn1primitive(classUniversal, tagBoolean, b)
+}
+
+// A signed INTEGER from a 64-bit value, minimally two's-complement encoded.
+// For values wider than 64 bits (RSA moduli, ECDSA r/s) use `asn1BigInteger`.
+export function asn1Integer(v: int): Element { return asn1primitive(
+  classUniversal,
+  tagInteger,
+  asn1encodeIntBytes(v),
+) }
+
+// The minimal two's-complement big-endian octets of the signed value `v`.
+function asn1encodeIntBytes(v: int): []byte {
+  let u = uint(v)
+  let full = []byte(8)
+  let i = 7
+  while (i >= 0) {
+    full[i] = byte(u & 0xff)
+    u = u >> 8
+    i = i - 1
+  }
+  // Strip redundant leading sign octets, but never past the last octet.
+  let start = 0
+  let stop = false
+  while (start < 7 && !stop) {
+    let b0 = full[start]
+    let b1 = full[start + 1]
+    if (b0 == 0x00 && b1 & 0x80 == 0) {
+      start = start + 1
+    } else if (b0 == 0xff && b1 & 0x80 != 0) {
+      start = start + 1
+    } else {
+      stop = true
+    }
+  }
+  return full[start:8]
+}
+
+// A non-negative INTEGER from an unsigned big-endian magnitude. Leading zero
+// octets are dropped, and a 0x00 sign octet is prepended when the top bit would
+// otherwise read as negative — so it always produces the minimal DER form. This
+// is how RSA moduli and ECDSA `r`/`s` are encoded.
+export function asn1BigInteger(mag: []byte): Element {
+  let start = 0
+  while (start < len(mag) && mag[start] == 0x00) {
+    start = start + 1
+  }
+  let out = []byte(0)
+  if (start >= len(mag)) {
+    out = append(out, 0x00)
+    return asn1primitive(classUniversal, tagInteger, out)
+  }
+  if (mag[start] & 0x80 != 0) {
+    out = append(out, 0x00)
+  }
+  out = asn1appendAll(out, mag[start:len(mag)])
+  return asn1primitive(classUniversal, tagInteger, out)
+}
+
+// A BIT STRING whose final octet has `unusedBits` (0..7) of padding. `data` is
+// the value octets; the leading unused-bits count is added on encode.
+export function asn1BitString(unusedBits: int, data: []byte): Element {
+  let out = []byte(0)
+  out = append(out, byte(unusedBits))
+  out = asn1appendAll(out, data)
+  return asn1primitive(classUniversal, tagBitString, out)
+}
+
+// An OCTET STRING carrying `data` verbatim.
+export function asn1OctetString(data: []byte): Element { return asn1primitive(
+  classUniversal,
+  tagOctetString,
+  asn1copyBytes(data),
+) }
+
+// A NULL: empty content.
+export function asn1Null(): Element { return asn1primitive(classUniversal, tagNull, []byte(0)) }
+
+// An OBJECT IDENTIFIER from its dotted arcs, e.g. `[1, 2, 840, 113549, 1, 1,
+// 11]`. Fails unless there are at least two arcs, the first is 0/1/2, and the
+// second is < 40 when the first is 0 or 1 (the joint first-octet rule). The
+// first two arcs are packed into one subidentifier (`40*arc0 + arc1`).
+export function asn1Oid(arcs: []int): Element! {
+  if (len(arcs) < 2) {
+    fail newError("asn1: OID needs at least two arcs")
+  }
+  let a0 = arcs[0]
+  let a1 = arcs[1]
+  if (a0 < 0 || a0 > 2) {
+    fail newError("asn1: OID first arc must be 0, 1, or 2")
+  }
+  if (a1 < 0) {
+    fail newError("asn1: OID arc must be non-negative")
+  }
+  if (a0 < 2 && a1 > 39) {
+    fail newError("asn1: OID second arc must be < 40 when the first is 0 or 1")
+  }
+  let out = []byte(0)
+  out = asn1appendBase128(out, a0 * 40 + a1)
+  let i = 2
+  while (i < len(arcs)) {
+    if (arcs[i] < 0) {
+      fail newError("asn1: OID arc must be non-negative")
+    }
+    out = asn1appendBase128(out, arcs[i])
+    i = i + 1
+  }
+  return asn1primitive(classUniversal, tagOid, out)
+}
+
+// A UTF8String.
+export function asn1Utf8String(s: string): Element { return asn1primitive(
+  classUniversal,
+  tagUtf8String,
+  []byte(s),
+) }
+
+// A PrintableString. The caller is responsible for the restricted charset.
+export function asn1PrintableString(s: string): Element { return asn1primitive(
+  classUniversal,
+  tagPrintableString,
+  []byte(s),
+) }
+
+// An IA5String (ASCII).
+export function asn1IA5String(s: string): Element { return asn1primitive(
+  classUniversal,
+  tagIA5String,
+  []byte(s),
+) }
+
+// A UTCTime, e.g. "230607000000Z". The caller supplies the formatted string.
+export function asn1UtcTime(s: string): Element { return asn1primitive(
+  classUniversal,
+  tagUtcTime,
+  []byte(s),
+) }
+
+// A GeneralizedTime, e.g. "20230607000000Z".
+export function asn1GeneralizedTime(s: string): Element { return asn1primitive(
+  classUniversal,
+  tagGeneralizedTime,
+  []byte(s),
+) }
+
+// A SEQUENCE of the given members, in order.
+export function asn1Sequence(children: []Element): Element { return asn1constructed(
+  classUniversal,
+  tagSequence,
+  children,
+) }
+
+// A SET of the given members. DER requires SET OF members to be sorted by their
+// encoding; that ordering is the caller's responsibility.
+export function asn1Set(children: []Element): Element { return asn1constructed(
+  classUniversal,
+  tagSet,
+  children,
+) }
+
+// An explicit context tag `[tag]`: a constructed context-class element wrapping
+// `inner` whole, so `inner`'s own tag is preserved inside.
+export function asn1ExplicitTag(tag: int, inner: Element): Element {
+  let kids = []Element(0)
+  kids = append(kids, inner)
+  return asn1constructed(classContext, tag, kids)
+}
+
+// An implicit context tag `[tag]`: `inner` retagged to context class `tag`,
+// keeping its content and constructed-ness but replacing its tag. The original
+// universal tag is lost, so the reader must know the underlying type.
+export function asn1ImplicitTag(tag: int, inner: Element): Element { return Element{
+  cls: classContext,
+  constructed: inner.constructed,
+  tag: tag,
+  bytes: inner.bytes,
+  children: inner.children,
+} }
+
+// --- typed readers ----------------------------------------------------------
+
+// The bool of a BOOLEAN. Strict DER: content must be exactly 0x00 or 0xFF.
+export function asn1ReadBoolean(e: Element): bool! {
+  asn1expectPrimitive(e, classUniversal, tagBoolean)?
+  if (len(e.bytes) != 1) {
+    fail newError("asn1: BOOLEAN must have one content octet")
+  }
+  if (e.bytes[0] == 0x00) {
+    return false
+  }
+  if (e.bytes[0] == 0xff) {
+    return true
+  }
+  fail newError("asn1: DER BOOLEAN must be 0x00 or 0xFF")
+}
+
+// The signed value of an INTEGER that fits in 64 bits. Fails on a non-minimal
+// encoding or a value wider than eight octets — use `asn1ReadBigInteger` for
+// large integers.
+export function asn1ReadInteger(e: Element): int! {
+  asn1expectPrimitive(e, classUniversal, tagInteger)?
+  asn1checkIntegerMinimal(e.bytes)?
+  if (len(e.bytes) > 8) {
+    fail newError("asn1: INTEGER too large for a 64-bit int")
+  }
+  let u: uint = 0
+  let i = 0
+  while (i < len(e.bytes)) {
+    u = u << 8 | uint(e.bytes[i])
+    i = i + 1
+  }
+  let bits = len(e.bytes) * 8
+  if (bits < 64 && e.bytes[0] & 0x80 != 0) {
+    u = u | ~uint(0) << uint(bits)
+  }
+  return int(u)
+}
+
+// The unsigned big-endian magnitude of a non-negative INTEGER, with the sign
+// octet removed. Fails on a non-minimal encoding or a negative value. This is
+// the inverse of `asn1BigInteger` and how ECDSA `r`/`s` are read.
+export function asn1ReadBigInteger(e: Element): []byte! {
+  asn1expectPrimitive(e, classUniversal, tagInteger)?
+  asn1checkIntegerMinimal(e.bytes)?
+  if (e.bytes[0] & 0x80 != 0) {
+    fail newError("asn1: INTEGER is negative where an unsigned magnitude was expected")
+  }
+  if (len(e.bytes) >= 2 && e.bytes[0] == 0x00) {
+    return e.bytes[1:len(e.bytes)]
+  }
+  return e.bytes
+}
+
+// The decoded BIT STRING. Fails if the unused-bits octet is missing or > 7, if
+// an empty value claims unused bits, or (strict DER) if any of those trailing
+// bits is set.
+export function asn1ReadBitString(e: Element): BitString! {
+  asn1expectPrimitive(e, classUniversal, tagBitString)?
+  if (len(e.bytes) == 0) {
+    fail newError("asn1: BIT STRING is missing its unused-bits octet")
+  }
+  let unused = int(e.bytes[0])
+  if (unused > 7) {
+    fail newError("asn1: BIT STRING unused-bits count must be 0..7")
+  }
+  let data = e.bytes[1:len(e.bytes)]
+  if (len(data) == 0 && unused != 0) {
+    fail newError("asn1: empty BIT STRING must declare 0 unused bits")
+  }
+  if (len(data) > 0 && unused > 0) {
+    let mask = byte(1 << unused - 1)
+    if (data[len(data) - 1] & mask != 0) {
+      fail newError("asn1: BIT STRING trailing unused bits must be zero")
+    }
+  }
+  return BitString{ unusedBits: unused, bytes: data }
+}
+
+// The content of an OCTET STRING.
+export function asn1ReadOctetString(e: Element): []byte! {
+  asn1expectPrimitive(e, classUniversal, tagOctetString)?
+  return e.bytes
+}
+
+// Verify a NULL: fails unless the element is a NULL with empty content.
+export function asn1ReadNull(e: Element): ()! {
+  asn1expectPrimitive(e, classUniversal, tagNull)?
+  if (len(e.bytes) != 0) {
+    fail newError("asn1: NULL must have empty content")
+  }
+}
+
+// The dotted arcs of an OBJECT IDENTIFIER, e.g. `[1, 2, 840, 113549, 1, 1,
+// 11]`. The first subidentifier is unpacked back into the first two arcs. Fails
+// on an empty OID, a truncated subidentifier, a non-minimal (leading-0x80)
+// subidentifier, or one wider than the cap.
+export function asn1ReadOid(e: Element): []int! {
+  asn1expectPrimitive(e, classUniversal, tagOid)?
+  if (len(e.bytes) == 0) {
+    fail newError("asn1: OBJECT IDENTIFIER must not be empty")
+  }
+  let arcs = []int(0)
+  let i = 0
+  let first = true
+  while (i < len(e.bytes)) {
+    if (e.bytes[i] == 0x80) {
+      fail newError("asn1: non-minimal OID subidentifier")
+    }
+    let v = 0
+    let done = false
+    let guard = 0
+    while (i < len(e.bytes) && guard < maxOidSubidBytes) {
+      let b = e.bytes[i]
+      i = i + 1
+      v = v << 7 | int(b & 0x7f)
+      if (b & 0x80 == 0) {
+        done = true
+        break
+      }
+      guard = guard + 1
+    }
+    if (!done) {
+      fail newError("asn1: OID subidentifier truncated or too large")
+    }
+    if (first) {
+      let a0 = v / 40
+      if (a0 > 2) {
+        a0 = 2
+      }
+      arcs = append(arcs, a0)
+      arcs = append(arcs, v - a0 * 40)
+      first = false
+    } else {
+      arcs = append(arcs, v)
+    }
+  }
+  return arcs
+}
+
+// The dotted-decimal text of `arcs`, e.g. "1.2.840.113549.1.1.11". A rendering
+// helper — it does no validation.
+export function asn1OidString(arcs: []int): string {
+  let s = ""
+  let i = 0
+  while (i < len(arcs)) {
+    if (i > 0) {
+      s = s + "."
+    }
+    s = s + "${arcs[i]}"
+    i = i + 1
+  }
+  return s
+}
+
+// The text of a string- or time-valued element: UTF8String, PrintableString,
+// IA5String, UTCTime, or GeneralizedTime. Fails on any other type. The raw
+// octets are returned as-is; per-type charset validation is the caller's.
+export function asn1ReadString(e: Element): string! {
+  if (e.cls != classUniversal || e.constructed) {
+    fail newError("asn1: not a universal primitive string")
+  }
+  if (e.tag == tagUtf8String || e.tag == tagPrintableString || e.tag == tagIA5String || e.tag == tagUtcTime || e.tag == tagGeneralizedTime) {
+    return string(e.bytes)
+  }
+  fail newError("asn1: element is not a string type (tag ${e.tag})")
+}
+
+// The members of a SEQUENCE. Fails unless `e` is a universal constructed
+// SEQUENCE.
+export function asn1ReadSequence(e: Element): []Element! {
+  if (e.cls != classUniversal || !e.constructed || e.tag != tagSequence) {
+    fail newError("asn1: not a SEQUENCE")
+  }
+  return e.children
+}
+
+// The members of a SET. Fails unless `e` is a universal constructed SET.
+export function asn1ReadSet(e: Element): []Element! {
+  if (e.cls != classUniversal || !e.constructed || e.tag != tagSet) {
+    fail newError("asn1: not a SET")
+  }
+  return e.children
+}
+
+// The inner element of an explicit context tag `[tag]`. Fails unless `e` is a
+// constructed context tag with that number wrapping exactly one element.
+export function asn1ReadExplicit(e: Element, tag: int): Element! {
+  if (e.cls != classContext || !e.constructed || e.tag != tag) {
+    fail newError("asn1: not an explicit [${tag}] context tag")
+  }
+  if (len(e.children) != 1) {
+    fail newError("asn1: an explicit tag must wrap exactly one element")
+  }
+  return e.children[0]
+}
