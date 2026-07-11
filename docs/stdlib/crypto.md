@@ -2563,3 +2563,72 @@ step of the X25519 Montgomery ladder.
 Field inverse, `z^(-1) mod p`, computed as `z^(p-2)` by Fermat's little theorem
 using the standard Curve25519 addition chain (constant-time). The inverse of 0 is
 0.
+
+## X25519
+
+X25519 Diffie-Hellman over Curve25519 (RFC 7748). Given a 32-byte scalar and the
+32-byte little-endian x-coordinate of a point, it returns the x-coordinate of the
+scalar multiple — the ECDH primitive TLS 1.3 uses for key agreement. It is built
+on the `fe25519` field and runs a constant-time Montgomery ladder: the scalar is
+clamped (RFC 7748 §5), and the two data-dependent point selections per bit are
+done with a branchless masked swap, never an `if`, so no branch or memory access
+depends on a scalar bit.
+
+`x25519` is the raw primitive and returns an all-zero result for a small-order
+input point. `x25519SharedSecret` is the checked wrapper for key agreement: it
+rejects that all-zero output, which a protocol must treat as fatal (TLS 1.3
+aborts the handshake). Private keys are stored as the raw random bytes and
+clamped only when used, following the RFC / libsodium convention.
+
+```bit
+import {
+  x25519Base, x25519SharedSecret, x25519GenerateKeypair,
+} from "std/crypto"
+
+// A full X25519 exchange. Alice keeps a generated key pair; Bob derives his
+// public key from a private scalar with `x25519Base` (the base point u = 9).
+// Both sides reach the identical 32-byte secret — `x25519SharedSecret` rejects
+// the all-zero contributory case, so the returned bytes go straight to HKDF as
+// input keying material.
+function x25519Exchange(bobPriv: []byte): []byte! {
+  let alice = x25519GenerateKeypair()
+  let bobPub = x25519Base(bobPriv)
+  let secret = x25519SharedSecret(alice.priv, bobPub)?
+  return secret
+}
+```
+
+### `X25519Keypair`
+
+An X25519 key pair. `priv` is the 32 raw random private bytes (clamped only when
+used, never as stored); `pub` is `priv * basepoint`, the 32-byte value to hand to
+a peer. Both fields are exported.
+
+### `x25519(scalar: []byte, uCoord: []byte): []byte`
+
+X25519 scalar multiplication (RFC 7748 §5): the 32-byte x-coordinate of
+`scalar * point`, where `point` is given by its 32-byte little-endian
+x-coordinate `uCoord`. Clamps the scalar (on a private copy — the caller's slice
+is not mutated) and runs the constant-time Montgomery ladder. This is the raw
+primitive; a small-order input point yields an all-zero result. Both arguments
+must be at least 32 bytes.
+
+### `x25519Base(scalar: []byte): []byte`
+
+X25519 against the Curve25519 base point (u = 9): the public key for a private
+`scalar`. `scalar` must be at least 32 bytes.
+
+### `x25519SharedSecret(scalar: []byte, uCoord: []byte): []byte!`
+
+The X25519 shared secret between our private `scalar` and a peer's public point
+`uCoord`, with the contributory check applied: an all-zero output — produced when
+the peer point has small order — is rejected rather than returned. This is the
+function key agreement should call; the returned bytes are handed to HKDF
+directly as input keying material.
+
+### `x25519GenerateKeypair(): X25519Keypair`
+
+Generate a fresh X25519 key pair. The private key is 32 bytes from the OS CSPRNG
+stored raw (clamped only inside `x25519`), and the public key is
+`priv * basepoint`. The clamp guarantees the public key is never a small-order
+point.
