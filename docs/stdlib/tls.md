@@ -715,3 +715,105 @@ NamedGroup x25519 (0x001d).
 ### `groupX448: int`
 
 NamedGroup x448 (0x001e).
+## Record layer
+
+The record layer (RFC 8446 §5) is the frame every TLS message travels in. Once
+traffic keys exist, each record is an AEAD-protected `TLSCiphertext`: its outer
+`opaque_type` is always `application_data(23)` and the true content type moves
+inside the sealed body, `content ‖ real_content_type ‖ zero_padding`. Protection
+is deterministic — the per-record nonce is the fixed traffic IV XORed with the
+64-bit record sequence number, and the AEAD's additional data is exactly the
+five-byte record header. Sequence numbers are **per direction** and reset to zero
+on every key change, so a read context and a write context each keep their own
+counter.
+
+`RecordKeys` binds one direction's key, IV, sequence counter, and cipher suite.
+`seal` protects an outbound fragment (≤ 2^14 octets); `open` recovers an inbound
+one, rejecting any record whose ciphertext exceeds 2^14 + 256 octets or whose AEAD
+tag fails — a failed `open` is fatal (`bad_record_mac`) and is never retried.
+`keyUpdate` re-derives the direction's key and IV from the next
+application-traffic secret (RFC 8446 §7.2) and rewinds the counter to zero. Both
+sides are keyed from a traffic secret produced by the [key schedule](#key-schedule).
+
+```bit
+import { tlsSuiteById, TLS_AES_128_GCM_SHA256 } from "std/tls"
+import { newRecordKeys, recordApplicationData } from "std/tls"
+
+// Protect one outbound fragment and recover it, both contexts keyed from the
+// same application-traffic secret (one per direction in a real connection).
+function roundtrip(secret: []byte, msg: []byte): []byte! {
+  let suite = tlsSuiteById(TLS_AES_128_GCM_SHA256)?
+  let writer = newRecordKeys(suite, secret)?
+  let reader = newRecordKeys(suite, secret)?
+
+  let record = writer.seal(msg, recordApplicationData)?   // TLSCiphertext on the wire
+  let opened = reader.open(record)?                        // -> content + content type
+  writer.keyUpdate()?                                      // rotate key, reset sequence to 0
+  return opened.content
+}
+```
+
+### `RecordKeys`
+
+One direction's record-protection state: the negotiated suite, current traffic
+secret, keyed AEAD, fixed IV, and the monotonic sequence number. Its fields are
+private — build one with `newRecordKeys` and mutate it only through the methods,
+so the sequence number can never desynchronise from the nonce it feeds.
+
+### `RecordPlaintext`
+
+The result of `open`: the recovered `content: []byte` and the `contentType: int`
+that was hidden inside the protected record.
+
+### `newRecordKeys(suite: CipherSuite, secret: []byte): RecordKeys!`
+
+A record-protection context for one direction, from its traffic `secret` and the
+negotiated `suite`. Unrolls the secret into the AEAD key and fixed IV via
+HKDF-Expand-Label and keys the suite's AEAD; the sequence number starts at zero.
+Fails only if the suite rejects the derived key length.
+
+### `RecordKeys.seal(plaintext: []byte, contentType: int): []byte!`
+
+Protect `plaintext` as a `TLSCiphertext` record carrying inner `contentType`,
+returning the full on-the-wire record (five-byte header ‖ AEAD output) and
+advancing the sequence number. Fails if the fragment exceeds the 2^14 plaintext
+cap. No padding is added.
+
+### `RecordKeys.open(record: []byte): RecordPlaintext!`
+
+Recover the inner content of a protected `record` (full on-the-wire bytes, header
+included) and advance the sequence number. Fails — fatally, with no retry — on a
+truncated header, an over-long ciphertext (> 2^14 + 256), a header/length
+mismatch, or an AEAD authentication failure (`bad_record_mac`).
+
+### `RecordKeys.keyUpdate(): ()!`
+
+Advance this direction to its next traffic key (RFC 8446 §7.2): derive
+`application_traffic_secret_{N+1}` with `HKDF-Expand-Label(secret, "traffic upd",
+"", Hash.length)`, re-derive the key and IV from it, and reset the sequence number
+to zero. Fails only if the suite rejects the re-derived key length.
+
+### `RecordKeys.sequence(): int`
+
+This direction's current record sequence number — the counter the next `seal` or
+`open` will use, `0` on a fresh context or just after `keyUpdate`.
+
+### `RecordKeys.nonce(): []byte`
+
+The AEAD nonce the next `seal`/`open` will use: the fixed IV XORed with the
+current sequence number. Exposed for diagnostics and to observe nonce progression
+across records.
+
+### `recordAlert: int`
+
+Inner content type alert (21).
+
+### `recordHandshake: int`
+
+Inner content type handshake (22) — the type carried by protected handshake
+records such as EncryptedExtensions, Certificate, and Finished.
+
+### `recordApplicationData: int`
+
+Inner content type application_data (23), and the fixed outer `opaque_type` of
+every protected record.
