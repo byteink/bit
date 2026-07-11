@@ -1,0 +1,510 @@
+// Bit standard library — crypto module, BLAKE3 (the official specification).
+//
+// BLAKE3 hashes a message through a binary Merkle tree of 1024-byte chunks. Each
+// chunk and each interior (parent) node is reduced by one compression function:
+// seven rounds of the `g` quarter-round mixing a 16-word `u32` state, drawn from
+// the ChaCha permutation. Leaves are chunks, interior nodes combine two child
+// chaining values, and the single root node is an extendable-output function
+// (XOF) — `finalize(n)` draws any number of bytes from it. All arithmetic is
+// `u32`, so it wraps mod 2^32 exactly as the spec prescribes; every word is read
+// and written little-endian, so output is byte-identical on x86-64 and ARM64.
+//
+// Three keying modes share the machinery, differing only in the eight initial
+// key words and the base flag: the default hash keys from the IV; `keyed_hash`
+// keys from a caller's 32-byte key; `derive_key` keys from the chaining value of
+// a context string. `Blake3` is a streaming hasher — feed bytes with any number
+// of `write` calls, then read the digest with `sum` (the 32-byte default) or
+// `finalize(n)` (an arbitrary-length XOF draw). It conforms structurally to
+// `Hash` (§14.3), so it drops into `digest`, `hmac`, and `hkdf` unchanged.
+//
+// Tree hashing here is single-threaded; the chaining-value stack keeps only the
+// O(log n) subtree roots along the right edge, so memory is bounded regardless
+// of message length. `rotr32` is the shared 32-bit right rotation from the SHA-2
+// module (the whole `std/crypto` directory is one module).
+
+// Domain-separation flags (spec §2.1). Each marks the role a compression plays:
+// chunk boundaries, an interior node, the root, and the two keying modes. Held
+// as `int` and OR-combined as `int`; the compression function widens the
+// combined set to `u32` for the state word (§2.2).
+const B3_CHUNK_START: int = 1
+const B3_CHUNK_END: int = 2
+const B3_PARENT: int = 4
+const B3_ROOT: int = 8
+const B3_KEYED_HASH: int = 16
+const B3_DERIVE_KEY_CONTEXT: int = 32
+const B3_DERIVE_KEY_MATERIAL: int = 64
+
+// A compression block is 64 bytes; a chunk is 1024 bytes (16 blocks).
+const B3_BLOCK_LEN: int = 64
+const B3_CHUNK_LEN: int = 1024
+
+// The eight initial chaining words — the SHA-256 IV (first 32 bits of the
+// fractional parts of the square roots of the first eight primes). Returned by a
+// function because a top-level `const` initializer must be a scalar (§10.1).
+function blake3IV(): []u32 {
+  return []u32{
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  }
+}
+
+// Read `len(dst)` little-endian 32-bit words out of `src`. Used for the 16-word
+// message block (64 bytes) and for parsing a 32-byte key into eight words.
+function blake3WordsLE(src: []byte, dst: []u32) {
+  let i = 0
+  while (i < len(dst)) {
+    let j = i * 4
+    dst[i] = u32(src[j]) | (u32(src[j + 1]) << 8) | (u32(src[j + 2]) << 16) | (u32(src[j + 3]) << 24)
+    i = i + 1
+  }
+}
+
+// The `g` quarter-round (spec §2.3): mix message words `mx`, `my` into the four
+// state lanes `a,b,c,d`, with the four fixed right-rotations 16/12/8/7. All adds
+// are `u32` and wrap.
+function blake3G(st: []u32, a: int, b: int, c: int, d: int, mx: u32, my: u32) {
+  st[a] = st[a] + st[b] + mx
+  st[d] = rotr32(st[d] ^ st[a], 16)
+  st[c] = st[c] + st[d]
+  st[b] = rotr32(st[b] ^ st[c], 12)
+  st[a] = st[a] + st[b] + my
+  st[d] = rotr32(st[d] ^ st[a], 8)
+  st[c] = st[c] + st[d]
+  st[b] = rotr32(st[b] ^ st[c], 7)
+}
+
+// One round: four column mixes then four diagonal mixes over the 16-word state,
+// consuming the 16 message words `m` in the fixed schedule order (spec §2.3).
+function blake3Round(st: []u32, m: []u32) {
+  blake3G(st, 0, 4, 8, 12, m[0], m[1])
+  blake3G(st, 1, 5, 9, 13, m[2], m[3])
+  blake3G(st, 2, 6, 10, 14, m[4], m[5])
+  blake3G(st, 3, 7, 11, 15, m[6], m[7])
+  blake3G(st, 0, 5, 10, 15, m[8], m[9])
+  blake3G(st, 1, 6, 11, 12, m[10], m[11])
+  blake3G(st, 2, 7, 8, 13, m[12], m[13])
+  blake3G(st, 3, 4, 9, 14, m[14], m[15])
+}
+
+// Permute the message words between rounds (spec §2.3), in place: `m[i]` becomes
+// the word at the fixed schedule position for the next round.
+function blake3Permute(m: []u32) {
+  const perm: []int = []int{ 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8 }
+  let p = []u32(16)
+  let i = 0
+  while (i < 16) {
+    p[i] = m[perm[i]]
+    i = i + 1
+  }
+  i = 0
+  while (i < 16) {
+    m[i] = p[i]
+    i = i + 1
+  }
+}
+
+// The compression function (spec §2.2): fold the eight-word chaining value `cv`
+// and the 16-word message `blockWords` — with the 64-bit `counter`, the
+// `blockLen`, and the `flags` in the last four state lanes — through seven
+// rounds, then feed-forward. Returns the full 16-word state; callers take the
+// first eight words as a chaining value, or all 16 as XOF output.
+function blake3Compress(cv: []u32, blockWords: []u32, counter: u64, blockLen: u32, flags: int): []u32 {
+  let st = []u32(16)
+  st[0] = cv[0]
+  st[1] = cv[1]
+  st[2] = cv[2]
+  st[3] = cv[3]
+  st[4] = cv[4]
+  st[5] = cv[5]
+  st[6] = cv[6]
+  st[7] = cv[7]
+  st[8] = 0x6a09e667
+  st[9] = 0xbb67ae85
+  st[10] = 0x3c6ef372
+  st[11] = 0xa54ff53a
+  st[12] = u32(counter)
+  st[13] = u32(counter >> 32)
+  st[14] = blockLen
+  st[15] = u32(flags)
+
+  // Permute a private copy of the message across the rounds, leaving the
+  // caller's `blockWords` untouched.
+  let m = []u32(16)
+  let i = 0
+  while (i < 16) {
+    m[i] = blockWords[i]
+    i = i + 1
+  }
+
+  let r = 0
+  while (r < 7) {
+    blake3Round(st, m)
+    if (r < 6) {
+      blake3Permute(m)
+    }
+    r = r + 1
+  }
+
+  // Feed-forward: the lower half absorbs the upper half; the upper half absorbs
+  // the original chaining value. `st[i + 8]` on the right of both lines is its
+  // pre-update value, so the two assignments are order-independent.
+  i = 0
+  while (i < 8) {
+    st[i] = st[i] ^ st[i + 8]
+    st[i + 8] = st[i + 8] ^ cv[i]
+    i = i + 1
+  }
+  return st
+}
+
+// The eight-word chaining value of a node — the first half of its compression.
+function blake3ChainCv(cv: []u32, blockWords: []u32, counter: u64, blockLen: u32, flags: int): []u32 {
+  let full = blake3Compress(cv, blockWords, counter, blockLen, flags)
+  let out = []u32(8)
+  let i = 0
+  while (i < 8) {
+    out[i] = full[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Draw `n` XOF bytes from the root node (spec §2.6): compress it repeatedly with
+// the `ROOT` flag and an incrementing output-block counter, emitting 64 bytes
+// (16 little-endian words) per block until `n` bytes are produced. A tail that is
+// not a multiple of four or of 64 simply stops mid-word. `n <= 0` yields "".
+function blake3RootBytes(cv: []u32, blockWords: []u32, blockLen: u32, flags: int, n: int): []byte {
+  if (n <= 0) {
+    return []byte(0)
+  }
+  let out = []byte(n)
+  let counter: u64 = 0
+  let pos = 0
+  while (pos < n) {
+    let words = blake3Compress(cv, blockWords, counter, blockLen, flags | B3_ROOT)
+    let wi = 0
+    while (wi < 16 && pos < n) {
+      let word = words[wi]
+      let bi = 0
+      while (bi < 4 && pos < n) {
+        out[pos] = byte(word >> u32(bi * 8))
+        pos = pos + 1
+        bi = bi + 1
+      }
+      wi = wi + 1
+    }
+    counter = counter + 1
+  }
+  return out
+}
+
+// The chaining value of a parent (interior) node (spec §2.5): its two children's
+// chaining values are the 16-word message, keyed by `keyWords`, counter 0, block
+// length 64, with the `PARENT` flag.
+function blake3ParentCv(left: []u32, right: []u32, keyWords: []u32, flags: int): []u32 {
+  let bw = []u32(16)
+  let k = 0
+  while (k < 8) {
+    bw[k] = left[k]
+    bw[k + 8] = right[k]
+    k = k + 1
+  }
+  return blake3ChainCv(keyWords, bw, 0, u32(B3_BLOCK_LEN), B3_PARENT | flags)
+}
+
+// A fresh copy of an eight-word (or any-length) word slice, so a running
+// chaining value can be mutated without disturbing the key it started from.
+function blake3CopyWords(w: []u32): []u32 {
+  let out = []u32(len(w))
+  let i = 0
+  while (i < len(w)) {
+    out[i] = w[i]
+    i = i + 1
+  }
+  return out
+}
+
+// Zero every byte of `b` — used to clear the block buffer at each block and chunk
+// boundary so a partial final block is padded with zeros (spec §2.1).
+function blake3ZeroBytes(b: []byte) {
+  let i = 0
+  while (i < len(b)) {
+    b[i] = 0
+    i = i + 1
+  }
+}
+
+// A streaming BLAKE3 hasher. Conforms structurally to `Hash` (§14.3): `write`
+// absorbs, `sum` reads the 32-byte digest, `reset` rewinds. `finalize(n)` is the
+// extendable-output draw. Build one with `newBlake3`, `newBlake3Keyed`, or
+// `newBlake3DeriveKey`; do not construct it by field.
+//
+// The fields split into the current chunk (`cv`/`chunkCounter`/`block`/
+// `blockLen`/`blocksCompressed`) and the tree (`keyWords`/`flags` fix the mode;
+// `cvStack`/`cvStackLen` hold the right-edge subtree chaining values, eight words
+// each). The stack holds 54 entries — enough for a 2^64-byte message.
+export struct Blake3 {
+  cv: []u32           // running chaining value of the current chunk (8 words)
+  chunkCounter: u64   // index of the current chunk within the message
+  block: []byte       // 64-byte partial-block buffer
+  blockLen: int       // bytes currently buffered in `block`
+  blocksCompressed: int // full blocks folded into `cv` for this chunk
+  keyWords: []u32     // the eight key words fixing this hasher's mode (8 words)
+  flags: int          // base flags (0, KEYED_HASH, or DERIVE_KEY_MATERIAL)
+  cvStack: []u32      // right-edge subtree chaining values, 54 * 8 words
+  cvStackLen: int     // number of chaining values on the stack
+}
+
+// Build a hasher from its eight key words and base flags. `cv` starts as a copy
+// of the key words (the chunk's initial chaining value); `keyWords` keeps its own
+// copy so `reset` can restore it.
+function blake3NewInternal(keyWords: []u32, flags: int): Blake3 {
+  return Blake3{
+    cv: blake3CopyWords(keyWords),
+    chunkCounter: 0,
+    block: []byte(B3_BLOCK_LEN),
+    blockLen: 0,
+    blocksCompressed: 0,
+    keyWords: blake3CopyWords(keyWords),
+    flags: flags,
+    cvStack: []u32(54 * 8),
+    cvStackLen: 0,
+  }
+}
+
+// The bytes absorbed into the current chunk so far.
+function blake3ChunkLen(h: Blake3): int {
+  return B3_BLOCK_LEN * h.blocksCompressed + h.blockLen
+}
+
+// `CHUNK_START` on the chunk's first block, 0 thereafter (spec §2.1).
+function blake3StartFlag(blocksCompressed: int): int {
+  if (blocksCompressed == 0) {
+    return B3_CHUNK_START
+  }
+  return 0
+}
+
+// Absorb `data` into the current chunk, compressing each full 64-byte block into
+// the running chaining value `h.cv`. The final (possibly partial) block is left
+// buffered for `blake3ChunkOutputCv`/`finalize` to close with `CHUNK_END`.
+function blake3ChunkUpdate(h: Blake3, data: []byte) {
+  let pos = 0
+  while (pos < len(data)) {
+    if (h.blockLen == B3_BLOCK_LEN) {
+      let bw = []u32(16)
+      blake3WordsLE(h.block, bw)
+      let full = blake3Compress(h.cv, bw, h.chunkCounter, u32(B3_BLOCK_LEN), h.flags | blake3StartFlag(h.blocksCompressed))
+      let k = 0
+      while (k < 8) {
+        h.cv[k] = full[k]
+        k = k + 1
+      }
+      h.blocksCompressed = h.blocksCompressed + 1
+      blake3ZeroBytes(h.block)
+      h.blockLen = 0
+    }
+    let take = B3_BLOCK_LEN - h.blockLen
+    if (take > len(data) - pos) {
+      take = len(data) - pos
+    }
+    let i = 0
+    while (i < take) {
+      h.block[h.blockLen + i] = data[pos + i]
+      i = i + 1
+    }
+    h.blockLen = h.blockLen + take
+    pos = pos + take
+  }
+}
+
+// The chaining value of the current chunk as a completed leaf: compress its final
+// buffered block with `CHUNK_END` (and `CHUNK_START` too when it is the only
+// block).
+function blake3ChunkOutputCv(h: Blake3): []u32 {
+  let bw = []u32(16)
+  blake3WordsLE(h.block, bw)
+  let flags = h.flags | blake3StartFlag(h.blocksCompressed) | B3_CHUNK_END
+  return blake3ChainCv(h.cv, bw, h.chunkCounter, u32(h.blockLen), flags)
+}
+
+// Merge a completed chunk's chaining value into the subtree stack (spec §2.5).
+// The count of trailing zero bits in `totalChunks` is exactly how many subtrees
+// this chunk completes: pop each left sibling, combine into a parent, then push
+// the surviving value.
+function blake3AddChunkCv(h: Blake3, newCv: []u32, totalChunks: u64) {
+  let cv = newCv
+  let tc = totalChunks
+  while ((tc & 1) == 0) {
+    h.cvStackLen = h.cvStackLen - 1
+    let left = []u32(8)
+    let k = 0
+    while (k < 8) {
+      left[k] = h.cvStack[h.cvStackLen * 8 + k]
+      k = k + 1
+    }
+    cv = blake3ParentCv(left, cv, h.keyWords, h.flags)
+    tc = tc >> 1
+  }
+  let k = 0
+  while (k < 8) {
+    h.cvStack[h.cvStackLen * 8 + k] = cv[k]
+    k = k + 1
+  }
+  h.cvStackLen = h.cvStackLen + 1
+}
+
+// Absorb more input. Completed chunks are finalized into the subtree stack; the
+// last chunk stays open so `finalize`/`sum` can crown it as the root.
+export function (h: Blake3) write(data: []byte) {
+  let pos = 0
+  while (pos < len(data)) {
+    if (blake3ChunkLen(h) == B3_CHUNK_LEN) {
+      let chunkCv = blake3ChunkOutputCv(h)
+      let totalChunks = h.chunkCounter + 1
+      blake3AddChunkCv(h, chunkCv, totalChunks)
+      let i = 0
+      while (i < 8) {
+        h.cv[i] = h.keyWords[i]
+        i = i + 1
+      }
+      h.chunkCounter = totalChunks
+      blake3ZeroBytes(h.block)
+      h.blockLen = 0
+      h.blocksCompressed = 0
+    }
+    let take = B3_CHUNK_LEN - blake3ChunkLen(h)
+    if (take > len(data) - pos) {
+      take = len(data) - pos
+    }
+    blake3ChunkUpdate(h, data[pos : pos + take])
+    pos = pos + take
+  }
+}
+
+// Draw `n` output bytes (the XOF). Non-destructive: it walks the right edge of
+// the tree on locals, so the hasher can keep absorbing afterward. `n <= 0`
+// yields an empty slice. Same first `n` bytes for any larger `n`, so `sum` is
+// exactly `finalize(32)`.
+export function (h: Blake3) finalize(n: int): []byte {
+  // Start from the open chunk's output node.
+  let block16 = []u32(16)
+  blake3WordsLE(h.block, block16)
+  let outCv = h.cv
+  let outBlock = block16
+  let outCounter = h.chunkCounter
+  let outBlockLen = u32(h.blockLen)
+  let outFlags = h.flags | blake3StartFlag(h.blocksCompressed) | B3_CHUNK_END
+
+  // Fold each stacked left sibling into the node, climbing to the root. Each
+  // parent's message is the left sibling and the current node's chaining value.
+  let i = h.cvStackLen
+  while (i > 0) {
+    i = i - 1
+    let rightCv = blake3ChainCv(outCv, outBlock, outCounter, outBlockLen, outFlags)
+    let pb = []u32(16)
+    let k = 0
+    while (k < 8) {
+      pb[k] = h.cvStack[i * 8 + k]
+      pb[k + 8] = rightCv[k]
+      k = k + 1
+    }
+    outCv = h.keyWords
+    outBlock = pb
+    outCounter = 0
+    outBlockLen = u32(B3_BLOCK_LEN)
+    outFlags = h.flags | B3_PARENT
+  }
+  return blake3RootBytes(outCv, outBlock, outBlockLen, outFlags, n)
+}
+
+// The 32-byte default digest — `finalize(32)`. Non-destructive, so the hasher may
+// keep accepting input afterward.
+export function (h: Blake3) sum(): []byte {
+  return h.finalize(32)
+}
+
+// Rewind to the empty message, keeping the hasher's mode (key/derive-key words
+// and flags).
+export function (h: Blake3) reset() {
+  let i = 0
+  while (i < 8) {
+    h.cv[i] = h.keyWords[i]
+    i = i + 1
+  }
+  h.chunkCounter = 0
+  blake3ZeroBytes(h.block)
+  h.blockLen = 0
+  h.blocksCompressed = 0
+  h.cvStackLen = 0
+}
+
+// The default digest length in bytes (32).
+export function (h: Blake3) size(): int {
+  return 32
+}
+
+// The internal block size in bytes (64), for HMAC.
+export function (h: Blake3) blockSize(): int {
+  return 64
+}
+
+// A fresh unkeyed BLAKE3 hasher (the default hash function).
+export function newBlake3(): Blake3 {
+  return blake3NewInternal(blake3IV(), 0)
+}
+
+// A fresh keyed BLAKE3 hasher (BLAKE3's `keyed_hash`, a MAC). `key` must be
+// exactly 32 bytes; its little-endian words become the initial key words.
+export function newBlake3Keyed(key: []byte): Blake3! {
+  if (len(key) != 32) {
+    fail newError("blake3: key must be 32 bytes, got ${len(key)}")
+  }
+  let keyWords = []u32(8)
+  blake3WordsLE(key, keyWords)
+  return blake3NewInternal(keyWords, B3_KEYED_HASH)
+}
+
+// A fresh derive-key BLAKE3 hasher for the given context string (BLAKE3's
+// `derive_key`). The context is hashed once in `DERIVE_KEY_CONTEXT` mode; its
+// 32-byte chaining value becomes the key words for hashing key material in
+// `DERIVE_KEY_MATERIAL` mode. The context should be a hardcoded, globally unique
+// application string, not a runtime secret or variable.
+export function newBlake3DeriveKey(context: string): Blake3 {
+  let ctx = blake3NewInternal(blake3IV(), B3_DERIVE_KEY_CONTEXT)
+  ctx.write([]byte(context))
+  let contextKey = ctx.finalize(32)
+  let keyWords = []u32(8)
+  blake3WordsLE(contextKey, keyWords)
+  return blake3NewInternal(keyWords, B3_DERIVE_KEY_MATERIAL)
+}
+
+// One-shot BLAKE3: the 32-byte default digest of `data`.
+export function blake3Hash(data: []byte): []byte {
+  let h = newBlake3()
+  h.write(data)
+  return h.finalize(32)
+}
+
+// One-shot BLAKE3 keyed hash: the 32-byte MAC of `data` under the 32-byte `key`.
+// Fails if the key is not exactly 32 bytes.
+export function blake3KeyedHash(key: []byte, data: []byte): []byte! {
+  let h = newBlake3Keyed(key)?
+  h.write(data)
+  return h.finalize(32)
+}
+
+// One-shot BLAKE3 key derivation: a 32-byte key derived from `keyMaterial` under
+// the given `context` string.
+export function blake3DeriveKey(context: string, keyMaterial: []byte): []byte {
+  let h = newBlake3DeriveKey(context)
+  h.write(keyMaterial)
+  return h.finalize(32)
+}
+
+// One-shot BLAKE3 XOF: `n` output bytes of the default hash of `data`. For
+// `n == 32` this equals `blake3Hash(data)`.
+export function blake3Xof(data: []byte, n: int): []byte {
+  let h = newBlake3()
+  h.write(data)
+  return h.finalize(n)
+}
