@@ -3318,3 +3318,86 @@ Whether `hostname` matches `cert`'s SubjectAltName. An IPv4 literal is matched
 against the iPAddress entries; any other hostname is matched case-insensitively
 against the dNSName entries, honoring a single leftmost-label `*.` wildcard. The
 deprecated subject-CN fallback is not used.
+## Argon2
+
+Argon2 (RFC 9106) is the memory-hard password-hashing and key-derivation function
+that won the Password Hashing Competition. Unlike PBKDF2 and bcrypt, which cost
+only CPU time, Argon2 also forces the attacker to hold a large block of memory for
+the whole computation, so a massively parallel guesser (GPU/ASIC) gains far less
+per dollar. It is tuned by three parameters: `t` passes (time cost), `m` KiB of
+memory, and `p` lanes (parallelism), plus a salt and an optional secret key `K`
+and associated data `X` — all folded into the output.
+
+Three variants differ only in how each memory block chooses the block it mixes
+with. **Argon2id** is the RFC 9106 recommendation and what you should use unless
+you have a specific reason not to: it is data-independent for the first half of
+the first pass (side-channel resistant) and data-dependent afterwards
+(GPU-resistant). **Argon2i** is fully data-independent — its memory access reveals
+nothing about the password — for shared or observable hosts. **Argon2d** is fully
+data-dependent, fastest and most GPU-resistant, but its access pattern depends on
+the password, so use it only where a side channel is not a threat (e.g. deriving a
+key from a value already secret).
+
+Every variant is built on this module's BLAKE2b. `m` must be at least `8*p` KiB
+and the salt at least 8 bytes (16 recommended); an out-of-range parameter panics.
+The lanes are filled serially rather than on `p` threads — Argon2's four sync
+points make that byte-for-byte identical to the parallel schedule, just without
+the parallel speedup.
+
+### `argon2id(password: []byte, salt: []byte, secret: []byte, ad: []byte, t: int, m: int, p: int, outLen: int): []byte`
+
+The recommended hybrid variant: data-independent for the first half-pass,
+data-dependent after. Returns the raw `outLen`-byte tag. `secret` (the key `K`)
+and `ad` (associated data `X`) may be empty (`[]byte(0)`). Deterministic in all
+its inputs, so the same arguments always derive the same tag.
+
+### `argon2i(password: []byte, salt: []byte, secret: []byte, ad: []byte, t: int, m: int, p: int, outLen: int): []byte`
+
+The fully data-independent variant: its memory-access pattern is independent of
+the password, so it resists side channels. Needs more passes than Argon2d to match
+its GPU resistance. Same parameters and return as `argon2id`.
+
+### `argon2d(password: []byte, salt: []byte, secret: []byte, ad: []byte, t: int, m: int, p: int, outLen: int): []byte`
+
+The fully data-dependent variant: fastest and most GPU-resistant, but its memory
+access depends on the password. Use only where a side-channel leak of the access
+pattern is not a concern. Same parameters and return as `argon2id`.
+
+### `argon2Hash(password: []byte, salt: []byte, t: int, m: int, p: int, outLen: int): string`
+
+Hash `password` with Argon2id and `salt`, returning the PHC crypt string
+`$argon2id$v=19$m=<m>,t=<t>,p=<p>$<salt>$<tag>` (base64, unpadded) to store. `t`,
+`m` (KiB), `p`, and `outLen` are the cost and tag-length parameters. Pass a fresh
+`randomBytes(16)` salt per password, so identical passwords hash differently.
+Check a login with `argon2Verify`.
+
+### `argon2Verify(password: []byte, encoded: string): bool`
+
+Report whether `password` matches the PHC Argon2 string `encoded`, re-deriving the
+tag under the type, version, parameters, and salt parsed from `encoded` and
+comparing it in constant time. Accepts `$argon2d`, `$argon2i`, and `$argon2id`
+strings. It never panics: any malformed input — wrong field count, unknown type, a
+version other than 19, a non-numeric parameter, or an undecodable salt or tag —
+simply returns `false`.
+
+```bit
+import { argon2id, argon2Hash, argon2Verify, randomBytes } from "std/crypto"
+
+// Store a new user's password: Argon2id with a fresh 16-byte salt at the RFC 9106
+// "second recommended" profile (64 MiB, 3 passes, 4 lanes). The returned PHC
+// string carries the parameters and salt, so only it needs to be stored.
+function register(password: string): string {
+  return argon2Hash([]byte(password), randomBytes(16), 3, 65536, 4, 32)
+}
+
+// Check a login attempt against the stored PHC string.
+function login(password: string, stored: string): bool {
+  return argon2Verify([]byte(password), stored)
+}
+
+// Derive a 32-byte symmetric key from a password and salt with Argon2id, passing
+// no secret key or associated data.
+function deriveKey(password: []byte, salt: []byte): []byte {
+  return argon2id(password, salt, []byte(0), []byte(0), 3, 65536, 4, 32)
+}
+```
