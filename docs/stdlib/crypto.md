@@ -2164,3 +2164,61 @@ The raw ECDH shared secret: the fixed-width big-endian x-coordinate of
 that the peer point is on the curve and is not the identity before multiplying —
 closing the invalid-curve attack — and fails on any malformed, off-curve, or
 identity input.
+
+## PEM
+
+PEM (RFC 7468) is the textual wrapper that carries DER-encoded objects —
+certificates, public and private keys — as ASCII. Each object is one *block*:
+
+```
+-----BEGIN CERTIFICATE-----
+<base64 of the DER, wrapped at 64 columns>
+-----END CERTIFICATE-----
+```
+
+`pemEncode` builds one block from a label and its DER; `pemDecode` parses one or
+more concatenated blocks back into `PemBlock` values, so a file holding a
+certificate followed by its key parses in a single call. The two are inverse:
+`pemDecode(pemEncode(label, der))[0].der` is `der`.
+
+Decoding is strict — a lax PEM reader is a classic parser attack surface. The
+END label must match its BEGIN, a block with no END line is a truncation error,
+and the base64 body must be valid. Line endings are tolerant: CRLF, LF, and stray
+spaces or tabs inside the body are stripped before the base64 is decoded, so PEM
+produced on Windows or Unix parses the same.
+
+```bit
+import { pemEncode, pemDecode, PemBlock } from "std/crypto"
+
+// Wrap DER bytes as a PEM "CERTIFICATE" block — the text you would write to a
+// .pem or .crt file, base64 wrapped at 64 columns with the BEGIN/END framing.
+function certToPem(der: []byte): string {
+  return pemEncode("CERTIFICATE", der)
+}
+
+// The first block of a PEM file: its label and decoded DER. Fails on malformed
+// framing, a mismatched END label, or an invalid base64 body.
+function firstBlock(pem: string): PemBlock! {
+  let blocks = pemDecode(pem)?
+  return blocks[0]
+}
+```
+
+### `PemBlock`
+
+One decoded PEM block. `label` is the object type from its BEGIN/END markers
+(e.g. `"CERTIFICATE"`, `"PRIVATE KEY"`), and `der` is the raw DER its base64 body
+decoded to. Both fields are exported.
+
+### `pemEncode(label: string, der: []byte): string`
+
+Encodes `der` as one PEM block of type `label`: the `-----BEGIN label-----` /
+`-----END label-----` framing around the standard `=`-padded base64 of `der`,
+wrapped at 64 columns and LF-terminated.
+
+### `pemDecode(pem: string): []PemBlock!`
+
+Parses one or more concatenated PEM blocks from `pem`, in order; text before,
+between, or after blocks is ignored. Tolerates CRLF and LF line endings. Fails on
+a block whose END line is missing (truncated) or whose END label does not match
+its BEGIN label, and on a body that is not valid base64.
