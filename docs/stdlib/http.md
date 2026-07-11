@@ -223,3 +223,58 @@ function serveSecure(certPem: string, keyPem: string) {
   }
 }
 ```
+
+## HTTP/2
+
+Over TLS, the protocol is chosen by ALPN during the handshake — HTTP/2 (`h2`, RFC
+9113) when both ends support it, HTTP/1.1 otherwise. This is transparent: the same
+`get`/`request`/`serveTls` calls and the same `(Request) => Response` handler drive
+either protocol. Requests and responses map to HTTP/2 streams — the
+`:method`/`:scheme`/`:authority`/`:path` and `:status` pseudo-headers become the
+`Request`/`Response` fields, the rest become the raw header block — and HTTP/2
+multiplexing, HPACK, and flow control are handled by the `std/http2` engine
+underneath.
+
+- **Client**: `request`/`get`/`post` over an `https://` URL offer ALPN
+  `["h2","http/1.1"]`. If the server selects `h2`, the exchange runs over the
+  HTTP/2 engine; otherwise it falls back to HTTP/1.1. `requestTls`/`getTls`/`postTls`
+  do the same, and default `config.alpn` to `["h2","http/1.1"]` when it is empty —
+  set it to `["http/1.1"]` to force HTTP/1.1.
+- **Server**: `serveTls` advertises ALPN `["h2","http/1.1"]`. Each accepted
+  connection is served over HTTP/2 or HTTP/1.1 by what it negotiated; HTTP/2
+  streams are each dispatched to the handler on their own green thread.
+- **Cleartext** (`http://`, `listenAndServe`) is always HTTP/1.1 — HTTP/2 here
+  requires TLS ALPN.
+
+| API / URL | Transport | Protocol |
+|---|---|---|
+| `http://` — `get`/`request`/`listenAndServe` | cleartext TCP | HTTP/1.1 |
+| `https://` — `get`/`request`/`getTls` | TLS 1.3 + ALPN | HTTP/2 when the server picks `h2`, else HTTP/1.1 |
+| `serveTls` | TLS 1.3 + ALPN `["h2","http/1.1"]` | per client: HTTP/2 or HTTP/1.1 |
+
+```bit
+import { get, serveTls, ok, respond, Request, Response } from "std/http"
+
+// One transport-agnostic handler serves HTTP/1.1 and HTTP/2 alike.
+function route(req: Request): Response {
+  if (req.path == "/") {
+    return ok("hello over h1 or h2")
+  }
+  return respond(404, "not found")
+}
+
+// serveTls advertises ALPN ["h2","http/1.1"]; a client that negotiates h2 is
+// served over the HTTP/2 engine, any other over HTTP/1.1 — same handler.
+function serveSecure(certPem: string, keyPem: string) {
+  serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
+}
+
+// The client offers h2 then http/1.1 by default, so get()/request() transparently
+// use HTTP/2 when the server supports it.
+function fetchStatus(url: string): int! {
+  let res = get(url)?
+  return res.status
+}
+```
