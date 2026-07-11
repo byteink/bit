@@ -76,9 +76,10 @@
 //! `call`/`rt_call`, and at every loop back-edge (`jump`/`br` whose target
 //! block index is <= the branching block's), with a synthetic zero-arg
 //! `bl bit_rt_safepoint` inserted right before the back-edge branch. Whenever
-//! a function contains any safepoint, its allocatable register file is
-//! restricted to the callee-saved subset only (`hasCalls`), sidestepping
-//! caller-save spill/reload entirely.
+//! a function contains any safepoint — a real call/rt_call *or* a loop
+//! back-edge — its allocatable register file is restricted to the callee-saved
+//! subset only (`has_safepoints`, derived from the recorded safepoint list),
+//! sidestepping caller-save spill/reload entirely.
 //!
 //! ## Frame record
 //!
@@ -174,8 +175,8 @@ fn isCalleeSavedFloat(f: FReg) bool {
 /// Allocatable GPRs for one function: the full master list, or (whenever the
 /// function contains any safepoint) only its callee-saved subset — see the
 /// module doc comment. `buf` is caller-owned storage (bounded, `max_int_regs`).
-fn buildIntRegs(buf: *[max_int_regs]Reg, has_calls: bool) []const Reg {
-    if (!has_calls) return &master_gprs;
+fn buildIntRegs(buf: *[max_int_regs]Reg, has_safepoints: bool) []const Reg {
+    if (!has_safepoints) return &master_gprs;
     var n: usize = 0;
     for (master_gprs) |r| {
         if (isCalleeSavedInt(r)) {
@@ -187,8 +188,8 @@ fn buildIntRegs(buf: *[max_int_regs]Reg, has_calls: bool) []const Reg {
 }
 
 /// Allocatable FP registers for one function — see `buildIntRegs`.
-fn buildFloatRegs(buf: *[max_float_regs]FReg, has_calls: bool) []const FReg {
-    if (!has_calls) {
+fn buildFloatRegs(buf: *[max_float_regs]FReg, has_safepoints: bool) []const FReg {
+    if (!has_safepoints) {
         for (0..max_float_regs) |i| buf[i] = @enumFromInt(@as(u5, @intCast(i)));
         return buf[0..max_float_regs];
     }
@@ -1507,7 +1508,7 @@ fn recordSafepoint(self: *Ctx, ret_off: u32) CodegenError!void {
 
 /// `gc_alloc`: load the static `TypeInfo` blob's address into x0 and `bl
 /// bit_rt_gc_alloc`, which returns the zeroed body pointer in x0. A GC point,
-/// so it records a safepoint (buildIntervals/hasCalls count `gc_alloc` too).
+/// so it records a safepoint (buildIntervals counts `gc_alloc` too).
 fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) CodegenError!void {
     const disc: u32 = @intFromEnum(self.f.valueType(@enumFromInt(dst)));
     const name = try ir.typeInfoSymbol(self.gpa, disc, size, ptr_offsets);
@@ -1738,13 +1739,6 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
 // Top-level: interval building, register allocation, frame layout, emission
 // ============================================================================
 
-fn hasCalls(f: *const ir.Function) bool {
-    for (f.insts.items(.op)) |op| {
-        if (op == .call or op == .rt_call or op == .gc_alloc or op == .make_closure or op == .call_value or op == .call_iface) return true;
-    }
-    return false;
-}
-
 /// One `Interval` per instruction slot (dense `0..insts.len`, matching
 /// `regalloc.zig`'s dense-vreg contract exactly — see that file's module
 /// comment). Non-value instructions (terminators, `field_set`/`index_set`)
@@ -1869,11 +1863,19 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     const intervals = try buildIntervals(gpa, tctx, f, &safepoint_list);
     defer gpa.free(intervals);
 
-    const has_calls = hasCalls(f);
+    // Any emitted safepoint is a `bl` (a real call/rt_call/etc. OR the
+    // synthetic `bit_rt_safepoint` a loop back-edge inserts), and every `bl`
+    // clobbers the caller-saved GPRs — so a function with *any* safepoint must
+    // draw only from the callee-saved subset. `safepoint_list` is the exact set
+    // of `bl`s `buildIntervals` recorded (calls + back-edges), so it is the
+    // single source of truth; a bare `hasCalls` op-scan missed the back-edge
+    // case, leaving a loop-carried value in a caller-saved register that the
+    // back-edge safepoint then destroyed (#1236).
+    const has_safepoints = safepoint_list.items.len > 0;
     var int_buf: [max_int_regs]Reg = undefined;
     var float_buf: [max_float_regs]FReg = undefined;
-    const int_regs = buildIntRegs(&int_buf, has_calls);
-    const float_regs = buildFloatRegs(&float_buf, has_calls);
+    const int_regs = buildIntRegs(&int_buf, has_safepoints);
+    const float_regs = buildFloatRegs(&float_buf, has_safepoints);
 
     const target = regalloc.TargetRegs{
         .int = .{ .count = @intCast(int_regs.len) },
