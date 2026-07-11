@@ -3147,3 +3147,75 @@ scrypt (RFC 7914 §6): derive `outLen` bytes of key material from `password` and
 the block size `r`, and the parallelization `p`. The PRF is fixed to
 HMAC-SHA-256. The result is deterministic in all six inputs. Fails if `N` is not
 a power of two above one, or if `r`, `p`, or `outLen` is below one.
+
+## X448
+
+X448 Diffie-Hellman over Curve448 (RFC 7748), the higher-security sibling of
+X25519 (~224-bit security). Given a 56-byte scalar and the 56-byte little-endian
+x-coordinate of a point, it returns the x-coordinate of the scalar multiple. It
+runs the same x-only, constant-time Montgomery ladder as X25519, but over the
+Goldilocks field GF(2^448 - 2^224 - 1) — eight byte-aligned 56-bit limbs, so
+serialization is exact and the reduction folds any overflow past 2^448 back in at
+limbs 0 and 4 (2^448 = 2^224 + 1). The scalar is clamped (RFC 7748 §5: clear the
+low 2 bits, set bit 447), and the two data-dependent point selections per bit are
+done with a branchless masked swap, never an `if`, so no branch or memory access
+depends on a scalar bit.
+
+`x448` is the raw primitive and returns an all-zero result for a small-order
+input point. `x448SharedSecret` is the checked wrapper for key agreement: it
+rejects that all-zero output, which a protocol must treat as fatal. Private keys
+are stored as the raw random bytes and clamped only when used, following the
+RFC / libsodium convention.
+
+```bit
+import {
+  x448Base, x448SharedSecret, x448GenerateKeypair,
+} from "std/crypto"
+
+// A full X448 exchange. Alice keeps a generated key pair; Bob derives his public
+// key from a private scalar with `x448Base` (the base point u = 5). Both sides
+// reach the identical 56-byte secret — `x448SharedSecret` rejects the all-zero
+// contributory case, so the returned bytes go straight to HKDF as input keying
+// material.
+function x448Exchange(bobPriv: []byte): []byte! {
+  let alice = x448GenerateKeypair()
+  let bobPub = x448Base(bobPriv)
+  let secret = x448SharedSecret(alice.priv, bobPub)?
+  return secret
+}
+```
+
+### `X448Keypair`
+
+An X448 key pair. `priv` is the 56 raw random private bytes (clamped only when
+used, never as stored); `pub` is `priv * basepoint`, the 56-byte value to hand to
+a peer. Both fields are exported.
+
+### `x448(scalar: []byte, uCoord: []byte): []byte`
+
+X448 scalar multiplication (RFC 7748 §5): the 56-byte x-coordinate of
+`scalar * point`, where `point` is given by its 56-byte little-endian
+x-coordinate `uCoord`. Clamps the scalar (on a private copy — the caller's slice
+is not mutated) and runs the constant-time Montgomery ladder. This is the raw
+primitive; a small-order input point yields an all-zero result. Both arguments
+must be at least 56 bytes.
+
+### `x448Base(scalar: []byte): []byte`
+
+X448 against the Curve448 base point (u = 5): the public key for a private
+`scalar`. `scalar` must be at least 56 bytes.
+
+### `x448SharedSecret(scalar: []byte, uCoord: []byte): []byte!`
+
+The X448 shared secret between our private `scalar` and a peer's public point
+`uCoord`, with the contributory check applied: an all-zero output — produced when
+the peer point has small order — is rejected rather than returned. This is the
+function key agreement should call; the returned bytes are handed to HKDF directly
+as input keying material.
+
+### `x448GenerateKeypair(): X448Keypair`
+
+Generate a fresh X448 key pair. The private key is 56 bytes from the OS CSPRNG
+stored raw (clamped only inside `x448`), and the public key is
+`priv * basepoint`. The clamp guarantees the public key is never a small-order
+point.

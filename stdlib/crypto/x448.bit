@@ -1,0 +1,531 @@
+// Bit standard library — crypto module, X448 Diffie-Hellman (RFC 7748).
+//
+// X448 is the ECDH function on Curve448 ("Goldilocks"): given a 56-byte scalar
+// and the 56-byte little-endian x-coordinate ("u") of a point, it returns the
+// 56-byte x-coordinate of the scalar multiple. It is the higher-security sibling
+// of X25519 (#1190) — same x-only Montgomery-ladder shape, but over the larger
+// prime field GF(2^448 - 2^224 - 1), giving ~224-bit security. Each side owns a
+// scalar, publishes `scalar * basepoint`, and both derive the same
+// `scalarA * scalarB * basepoint` whose x-coordinate is the shared secret.
+//
+// Everything is x-only: no y-coordinate, no point encoding, no cofactor step —
+// the curve is engineered so the scalar clamp handles the cofactor (4 for
+// Curve448). The two data-dependent decisions the ladder makes each bit — which
+// running point to advance — are made with a branchless `cswap` (masked XOR
+// exchange), never an `if`, so no branch or memory index depends on a scalar
+// bit. The field layer below is likewise straight-line, so the whole primitive
+// is constant-time.
+//
+// Field representation (Goldilocks, radix 2^56): a field element is a `[]u64` of
+// length 8, holding the value as eight 56-bit limbs, little-endian (limb i
+// carries weight 2^(56*i), and 8*56 = 448). Limbs are only loosely reduced
+// (weakly reduced, < 2^57) between operations; full canonicalization to the
+// unique 0..p-1 representative happens once, in `x448ToBytes`. The clean radix
+// is what makes serialization trivial: 56 bits is exactly 7 bytes, so every limb
+// is byte-aligned on the wire — no bit-straddling like the 2^51 limbs of X25519.
+//
+// The reduction exploits the Goldilocks shape 2^448 = 2^224 + 1 (mod p): any
+// weight that carries past 2^448 re-enters at both limb 0 (the "+1") and limb 4
+// (the "2^224"). The schoolbook multiply forms all 15 product columns, folds the
+// seven high columns down by that rule (highest first, so a column that folds
+// into another high column is folded again), then carry-propagates to 56-bit
+// limbs. Bit has no u128, so each 64x64->128 partial product is split into
+// 32-bit halves and reassembled with exact carry math (`x448MulAddCol`), and the
+// columns are accumulated as (lo, hi) pairs.
+//
+// Clamping (RFC 7748 §5, Curve448): the scalar's low 2 bits are cleared
+// (multiply by the cofactor 4) and bit 447 is set (fix the leading 1 so the
+// ladder is a fixed 448 steps and the result is timing-flat). Clamping is done
+// on a private copy; the caller's scalar slice is never mutated, and the stored
+// private key stays the raw random bytes (the RFC / libsodium convention — clamp
+// on use, not on store).
+//
+// Ladder step formulation: the RFC 7748 §5 sequence directly, with the curve
+// constant a24 = (A - 2) / 4 = 39081 folded in as `AA + a24 * E` (E = AA - BB),
+// implemented by `x448Mul39081`.
+//
+// Being part of the flat `std/crypto` module, this file reaches `randomBytes`
+// and `encodeHex`/`decodeHex` without importing them, and names `newError` from
+// the prelude. Every private free function is prefixed `x448` to keep the
+// module's flat namespace clean.
+
+// An X448 key pair. `priv` is the 56 raw random private bytes (clamped only when
+// used, never as stored); `pub` is `priv * basepoint`, the 56-byte value to hand
+// to a peer. Bit tuples are not yet lowerable, so the two outputs travel as a
+// struct — which, unlike a tuple, also gets to name its halves.
+export struct X448Keypair {
+  export priv: []byte
+  export pub: []byte
+}
+
+// Low 56 bits of a limb (2^56 - 1). Also the per-limb value of p in the final
+// freeze (p's limbs are all 2^56-1 except limb 4, which is one less). A function,
+// not a top-level `const`: the seed compiler mis-lowers typed module-level
+// integer consts (#1231/#1232), so the crypto modules expose these as nullary
+// accessors instead. The `u64(...)` is load-bearing — without it the return
+// literal stays `untyped int`, and once the optimizer inlines the call it lands
+// as an untyped operand of a `u64` op, which the IR verifier rejects.
+function x448Mask(): u64 { return u64(0xffffffffffffff) }
+
+// Read seven bytes of `b` at `off` as a little-endian 56-bit value. One limb is
+// exactly seven bytes, so no masking is needed.
+function x448Load56(b: []byte, off: int): u64 {
+  return u64(b[off]) |
+    (u64(b[off + 1]) << 8) |
+    (u64(b[off + 2]) << 16) |
+    (u64(b[off + 3]) << 24) |
+    (u64(b[off + 4]) << 32) |
+    (u64(b[off + 5]) << 40) |
+    (u64(b[off + 6]) << 48)
+}
+
+// Fused multiply-accumulate of the 64x64->128 product `a * b` into the 128-bit
+// column `c` of (`tLo`, `tHi`), in place. No u128: the product is built from
+// 32-bit halves (`t2` folds the two cross terms so nothing overflows a u64), and
+// the low-word add propagates its carry with the branchless bit formula (the
+// carry out of `x+y` is bit 63 of `(x&y) | ((x|y) & ~sum)`).
+function x448MulAddCol(tLo: []u64, tHi: []u64, c: int, a: u64, b: u64) {
+  let aLo = a & 0xffffffff
+  let aHi = a >> 32
+  let bLo = b & 0xffffffff
+  let bHi = b >> 32
+  let t0 = aLo * bLo
+  let t1 = aHi * bLo + (t0 >> 32)
+  let t2 = aLo * bHi + (t1 & 0xffffffff)
+  let plo = (t0 & 0xffffffff) | (t2 << 32)
+  let phi = aHi * bHi + (t1 >> 32) + (t2 >> 32)
+  let nlo = tLo[c] + plo
+  let carry = ((tLo[c] & plo) | ((tLo[c] | plo) & ~nlo)) >> 63
+  tHi[c] = tHi[c] + phi + carry
+  tLo[c] = nlo
+}
+
+// Add the 128-bit value (`sLo`, `sHi`) into column `dst` of (`tLo`, `tHi`), in
+// place. Used to fold high product columns down and to inject the inter-column
+// carry (with `sHi` = 0).
+function x448AddCol(tLo: []u64, tHi: []u64, dst: int, sLo: u64, sHi: u64) {
+  let nlo = tLo[dst] + sLo
+  let carry = ((tLo[dst] & sLo) | ((tLo[dst] | sLo) & ~nlo)) >> 63
+  tHi[dst] = tHi[dst] + sHi + carry
+  tLo[dst] = nlo
+}
+
+// One carry pass over eight limbs, folding the top carry back through
+// 2^448 = 2^224 + 1 into limb 0 and limb 4, then rippling those two once. Leaves
+// the value weakly reduced (limbs < 2^57). Shared by `x448Add`, `x448Sub`.
+function x448WeakReduce(h: []u64) {
+  let c = h[0] >> 56
+  h[0] = h[0] & x448Mask()
+  h[1] = h[1] + c
+  c = h[1] >> 56
+  h[1] = h[1] & x448Mask()
+  h[2] = h[2] + c
+  c = h[2] >> 56
+  h[2] = h[2] & x448Mask()
+  h[3] = h[3] + c
+  c = h[3] >> 56
+  h[3] = h[3] & x448Mask()
+  h[4] = h[4] + c
+  c = h[4] >> 56
+  h[4] = h[4] & x448Mask()
+  h[5] = h[5] + c
+  c = h[5] >> 56
+  h[5] = h[5] & x448Mask()
+  h[6] = h[6] + c
+  c = h[6] >> 56
+  h[6] = h[6] & x448Mask()
+  h[7] = h[7] + c
+  c = h[7] >> 56
+  h[7] = h[7] & x448Mask()
+  h[0] = h[0] + c
+  h[4] = h[4] + c
+  c = h[0] >> 56
+  h[0] = h[0] & x448Mask()
+  h[1] = h[1] + c
+  c = h[4] >> 56
+  h[4] = h[4] & x448Mask()
+  h[5] = h[5] + c
+}
+
+// The schoolbook multiply h = f * g mod p, shared by `x448Mul` and `x448Sqr`.
+// Inputs must be weakly reduced (limbs < 2^57), as every field operation here
+// leaves them. All 15 product columns are formed as 128-bit (lo, hi) pairs; the
+// seven high columns are folded down highest-first by 2^448 = 2^224 + 1 (column
+// k re-enters at columns k-8 and k-4), then one carry chain brings the eight low
+// columns back to 56-bit limbs with the top carry folded to limb 0 and limb 4.
+function x448MulCore(f: []u64, g: []u64): []u64 {
+  let tLo = []u64(15)
+  let tHi = []u64(15)
+
+  // All 64 partial products, accumulated into their weight columns.
+  let i = 0
+  while (i < 8) {
+    let j = 0
+    while (j < 8) {
+      x448MulAddCol(tLo, tHi, i + j, f[i], g[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+
+  // Fold columns 14..8 down. Highest-first so a high column that folds into
+  // another high column (e.g. 14 -> 10) is itself folded when reached.
+  let k = 14
+  while (k >= 8) {
+    x448AddCol(tLo, tHi, k - 8, tLo[k], tHi[k])
+    x448AddCol(tLo, tHi, k - 4, tLo[k], tHi[k])
+    k = k - 1
+  }
+
+  // Carry the eight low columns down to 56-bit limbs. Each column's carry-out
+  // (up to ~2^61) is injected into the next column's 128-bit accumulator.
+  let h = []u64(8)
+  let carry: u64 = 0
+  i = 0
+  while (i < 8) {
+    x448AddCol(tLo, tHi, i, carry, 0)
+    h[i] = tLo[i] & x448Mask()
+    carry = (tLo[i] >> 56) | (tHi[i] << 8)
+    i = i + 1
+  }
+
+  // Top carry out of limb 7 re-enters at limb 0 and limb 4; ripple both once.
+  h[0] = h[0] + carry
+  h[4] = h[4] + carry
+  let c = h[0] >> 56
+  h[0] = h[0] & x448Mask()
+  h[1] = h[1] + c
+  c = h[4] >> 56
+  h[4] = h[4] & x448Mask()
+  h[5] = h[5] + c
+  return h
+}
+
+// Square `f` `n` times: f^(2^n) mod p.
+function x448SqN(f: []u64, n: int): []u64 {
+  let r = f
+  let i = 0
+  while (i < n) {
+    r = x448Sqr(r)
+    i = i + 1
+  }
+  return r
+}
+
+// Decode 56 little-endian bytes into a field element: eight byte-aligned 56-bit
+// limbs. All 448 bits are used (unlike X25519, no top bit is masked). `s` must
+// be at least 56 bytes.
+function x448FromBytes(s: []byte): []u64 {
+  let h = []u64(8)
+  let i = 0
+  while (i < 8) {
+    h[i] = x448Load56(s, i * 7)
+    i = i + 1
+  }
+  return h
+}
+
+// Fully reduce `f` mod p and serialize as 56 little-endian bytes — the unique
+// canonical encoding. Three carry-and-fold passes bring the value into
+// [0, 2^448) (each pass replaces a top carry c*2^448 with c*(2^224+1), i.e.
+// subtracts c*p), then a single constant-time conditional subtract of p maps the
+// residual [p, 2^448) window into [0, p). No branch depends on the value.
+function x448ToBytes(f: []u64): []byte {
+  let t = []u64(8)
+  let i = 0
+  while (i < 8) {
+    t[i] = f[i]
+    i = i + 1
+  }
+  x448FreezeCarry(t)
+  x448FreezeCarry(t)
+  x448FreezeCarry(t)
+
+  // Constant-time `t = t - p` with borrow. p's limbs are all 2^56-1 except limb
+  // 4, which is 2^56-2. `tmp = 2^56 + t[i] - p[i] - borrow` stays in [0, 2^57):
+  // its bit 56 is 1 exactly when the subtraction did not borrow, so the new
+  // borrow is `1 - (tmp >> 56)` and the limb is `tmp & mask`.
+  let d = []u64(8)
+  let borrow: u64 = 0
+  i = 0
+  while (i < 8) {
+    let pl = x448Mask()
+    if (i == 4) {
+      pl = x448Mask() - 1
+    }
+    let tmp = t[i] + u64(0x100000000000000) - pl - borrow
+    d[i] = tmp & x448Mask()
+    borrow = 1 - (tmp >> 56)
+    i = i + 1
+  }
+  // borrow == 1 means t < p (the subtract underflowed) -> keep t; borrow == 0
+  // means t >= p -> take t - p. Selected branch-free.
+  let sel: u64 = 0 - borrow
+  i = 0
+  while (i < 8) {
+    t[i] = d[i] ^ (sel & (d[i] ^ t[i]))
+    i = i + 1
+  }
+
+  // Repack eight 56-bit limbs as 56 little-endian bytes (seven bytes per limb).
+  let out = []byte(56)
+  i = 0
+  while (i < 8) {
+    let v = t[i]
+    let byteIdx = 0
+    while (byteIdx < 7) {
+      out[i * 7 + byteIdx] = byte(v)
+      v = v >> 8
+      byteIdx = byteIdx + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// One carry pass with the Goldilocks fold, used by the freeze. Propagates carries
+// left across the eight limbs, then folds the top carry into limb 0 and limb 4
+// (2^448 = 2^224 + 1). Three passes suffice to land any weakly-reduced input in
+// [0, 2^448).
+function x448FreezeCarry(t: []u64) {
+  let c: u64 = 0
+  let i = 0
+  while (i < 8) {
+    t[i] = t[i] + c
+    c = t[i] >> 56
+    t[i] = t[i] & x448Mask()
+    i = i + 1
+  }
+  t[0] = t[0] + c
+  t[4] = t[4] + c
+}
+
+// Field addition: (f + g) mod p, returned weakly reduced.
+function x448Add(f: []u64, g: []u64): []u64 {
+  let h = []u64(8)
+  let i = 0
+  while (i < 8) {
+    h[i] = f[i] + g[i]
+    i = i + 1
+  }
+  x448WeakReduce(h)
+  return h
+}
+
+// Field subtraction: (f - g) mod p, returned weakly reduced. Each limb of 2*p is
+// added before subtracting `g` so the u64 arithmetic never underflows; 2*p is a
+// multiple of p, so the result is unchanged mod p. 2*p's limbs are 2^57-2
+// everywhere except limb 4 (2^57-4), matching p = 2^448 - 2^224 - 1.
+function x448Sub(f: []u64, g: []u64): []u64 {
+  let h = []u64(8)
+  let i = 0
+  while (i < 8) {
+    let twoP = u64(0x1fffffffffffffe)
+    if (i == 4) {
+      twoP = u64(0x1fffffffffffffc)
+    }
+    h[i] = f[i] + twoP - g[i]
+    i = i + 1
+  }
+  x448WeakReduce(h)
+  return h
+}
+
+// Field multiplication: (f * g) mod p.
+function x448Mul(f: []u64, g: []u64): []u64 {
+  return x448MulCore(f, g)
+}
+
+// Field squaring: (f * f) mod p.
+function x448Sqr(f: []u64): []u64 {
+  return x448MulCore(f, f)
+}
+
+// Multiply by the Curve448 ladder constant a24 = (A - 2) / 4 = 39081:
+// (39081 * f) mod p. The scalar times a 56-bit limb is up to 72 bits, so each
+// step uses the 128-bit multiply-accumulate and carries in u64; the top carry
+// folds back through 2^448 = 2^224 + 1.
+function x448Mul39081(f: []u64): []u64 {
+  let h = []u64(8)
+  let tLo = []u64(1)
+  let tHi = []u64(1)
+  let carry: u64 = 0
+  let i = 0
+  while (i < 8) {
+    tLo[0] = carry
+    tHi[0] = 0
+    x448MulAddCol(tLo, tHi, 0, f[i], 39081)
+    h[i] = tLo[0] & x448Mask()
+    carry = (tLo[0] >> 56) | (tHi[0] << 8)
+    i = i + 1
+  }
+  h[0] = h[0] + carry
+  h[4] = h[4] + carry
+  let c = h[0] >> 56
+  h[0] = h[0] & x448Mask()
+  h[1] = h[1] + c
+  c = h[4] >> 56
+  h[4] = h[4] & x448Mask()
+  h[5] = h[5] + c
+  return h
+}
+
+// Field inverse: z^(-1) mod p, computed as z^(p-2) by Fermat's little theorem.
+// The exponent p-2 = 2^448 - 2^224 - 3 factors as (2^223-1)*2^225 + (2^222-1)*4
+// + 1 — a 223-bit run of ones at position 225, a 222-bit run at position 2, plus
+// the low bit. So build A = z^(2^222 - 1) and B = z^(2^223 - 1) = A^2 * z from
+// doubling blocks of all-ones exponents (z^(2^(a+b)-1) = SqN(z^(2^a-1), b) *
+// z^(2^b-1)), then z^(p-2) = SqN(B, 225) * SqN(A, 2) * z. `z` must be nonzero;
+// the inverse of 0 is 0 (there is no branch to reject it).
+function x448Invert(z: []u64): []u64 {
+  let d1 = z                             // 2^1 - 1
+  let d2 = x448Mul(x448SqN(d1, 1), d1)   // 2^2 - 1
+  let d4 = x448Mul(x448SqN(d2, 2), d2)   // 2^4 - 1
+  let d8 = x448Mul(x448SqN(d4, 4), d4)   // 2^8 - 1
+  let d16 = x448Mul(x448SqN(d8, 8), d8)  // 2^16 - 1
+  let d32 = x448Mul(x448SqN(d16, 16), d16) // 2^32 - 1
+  let d64 = x448Mul(x448SqN(d32, 32), d32) // 2^64 - 1
+  let d128 = x448Mul(x448SqN(d64, 64), d64) // 2^128 - 1
+
+  let a = x448Mul(x448SqN(d128, 64), d64) // 2^192 - 1
+  a = x448Mul(x448SqN(a, 16), d16)        // 2^208 - 1
+  a = x448Mul(x448SqN(a, 8), d8)          // 2^216 - 1
+  a = x448Mul(x448SqN(a, 4), d4)          // 2^220 - 1
+  a = x448Mul(x448SqN(a, 2), d2)          // 2^222 - 1  (= A)
+  let b = x448Mul(x448SqN(a, 1), d1)      // 2^223 - 1  (= B)
+
+  let r = x448SqN(b, 225)                 // B << 225
+  r = x448Mul(r, x448SqN(a, 2))           // * (A << 2)
+  return x448Mul(r, d1)                   // * z  = z^(p-2)
+}
+
+// Constant-time conditional swap of two field elements. `swap` is 0 or 1; the
+// mask is all-ones exactly when `swap == 1` (unsigned `0 - 1` wraps to the full
+// word), so `a` and `b` exchange limbs when `swap == 1` and are untouched when
+// `swap == 0`, with no branch on the scalar bit that produced `swap`.
+function x448Cswap(swap: u64, a: []u64, b: []u64) {
+  let mask: u64 = 0 - swap
+  let i = 0
+  while (i < 8) {
+    let t = mask & (a[i] ^ b[i])
+    a[i] = a[i] ^ t
+    b[i] = b[i] ^ t
+    i = i + 1
+  }
+}
+
+// Whether every byte of `b` is zero, folded branch-free so the check does not
+// leak where the first nonzero byte sits.
+function x448IsAllZero(b: []byte): bool {
+  let acc: byte = 0
+  let i = 0
+  while (i < len(b)) {
+    acc = acc | b[i]
+    i = i + 1
+  }
+  return acc == 0
+}
+
+// X448 scalar multiplication (RFC 7748 §5): the 56-byte x-coordinate of
+// `scalar * point`, where `point` is given by its 56-byte little-endian
+// x-coordinate `uCoord`. Both `scalar` and `uCoord` must be at least 56 bytes.
+//
+// This is the raw primitive: it clamps the scalar, runs the constant-time
+// Montgomery ladder, and returns the canonical encoding of the resulting
+// x-coordinate. A small-order input point yields an all-zero result (the
+// RFC-defined output); `x448SharedSecret` is the checked wrapper that rejects
+// that case for key agreement.
+export function x448(scalar: []byte, uCoord: []byte): []byte {
+  // Clamp a private copy; never mutate the caller's scalar.
+  let e = []byte(56)
+  let i = 0
+  while (i < 56) {
+    e[i] = scalar[i]
+    i = i + 1
+  }
+  e[0] = e[0] & 252
+  e[55] = e[55] | 128
+
+  // x1 = u (kept constant); (x2, z2) = point at infinity = (1, 0);
+  // (x3, z3) = the input point = (u, 1).
+  let x1 = x448FromBytes(uCoord)
+  let x2 = []u64(8)
+  x2[0] = 1
+  let z2 = []u64(8)
+  let x3 = x448FromBytes(uCoord)
+  let z3 = []u64(8)
+  z3[0] = 1
+  let swap: u64 = 0
+
+  // Fixed 448 steps over scalar bits 447..0. `swap` tracks whether the running
+  // pair is currently exchanged, so a single cswap per bit suffices.
+  let pos = 447
+  while (pos >= 0) {
+    let kt = (u64(e[pos >> 3]) >> u64(pos & 7)) & 1
+    swap = swap ^ kt
+    x448Cswap(swap, x2, x3)
+    x448Cswap(swap, z2, z3)
+    swap = kt
+
+    // RFC 7748 §5 differential-addition-and-doubling step.
+    let a = x448Add(x2, z2)       // A  = x2 + z2
+    let aa = x448Sqr(a)           // AA = A^2
+    let b = x448Sub(x2, z2)       // B  = x2 - z2
+    let bb = x448Sqr(b)           // BB = B^2
+    let e2 = x448Sub(aa, bb)      // E  = AA - BB
+    let c = x448Add(x3, z3)       // C  = x3 + z3
+    let d = x448Sub(x3, z3)       // D  = x3 - z3
+    let da = x448Mul(d, a)        // DA
+    let cb = x448Mul(c, b)        // CB
+    let t0 = x448Add(da, cb)      // DA + CB
+    x3 = x448Sqr(t0)              // x3' = (DA + CB)^2
+    let t1 = x448Sub(da, cb)      // DA - CB
+    t1 = x448Sqr(t1)             // (DA - CB)^2
+    z3 = x448Mul(x1, t1)          // z3' = u * (DA - CB)^2
+    x2 = x448Mul(aa, bb)          // x2' = AA * BB
+    let t2 = x448Mul39081(e2)     // a24 * E
+    t2 = x448Add(aa, t2)          // AA + a24*E
+    z2 = x448Mul(e2, t2)          // z2' = E * (AA + a24*E)
+
+    pos = pos - 1
+  }
+
+  // Undo any pending swap, then recover the affine x-coordinate x2 / z2.
+  x448Cswap(swap, x2, x3)
+  x448Cswap(swap, z2, z3)
+  z2 = x448Invert(z2)
+  x2 = x448Mul(x2, z2)
+  return x448ToBytes(x2)
+}
+
+// X448 against the Curve448 base point (u = 5): the public key for a private
+// `scalar`. `scalar` must be at least 56 bytes.
+export function x448Base(scalar: []byte): []byte {
+  let base = []byte(56)
+  base[0] = 5
+  return x448(scalar, base)
+}
+
+// The X448 shared secret between our private `scalar` and a peer's public point
+// `uCoord`, with the contributory-behaviour check applied: an all-zero output —
+// produced when the peer point has small order — is rejected rather than
+// returned. A key-agreement protocol must treat that as fatal, so this is the
+// function key exchange should call; feed the returned bytes to HKDF directly as
+// input keying material.
+export function x448SharedSecret(scalar: []byte, uCoord: []byte): []byte! {
+  let out = x448(scalar, uCoord)
+  if (x448IsAllZero(out)) {
+    fail newError("x448SharedSecret: all-zero output (small-order peer point)")
+  }
+  return out
+}
+
+// Generate a fresh X448 key pair. The private key is 56 bytes from the OS CSPRNG
+// stored raw (clamped only inside `x448`), and the public key is
+// `priv * basepoint`. The clamp guarantees the public key is never a small-order
+// point, so it needs no all-zero check here.
+export function x448GenerateKeypair(): X448Keypair {
+  let priv = randomBytes(56)
+  let pub = x448Base(priv)
+  return X448Keypair{ priv: priv, pub: pub }
+}
