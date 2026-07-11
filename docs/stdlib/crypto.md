@@ -2563,3 +2563,54 @@ step of the X25519 Montgomery ladder.
 Field inverse, `z^(-1) mod p`, computed as `z^(p-2)` by Fermat's little theorem
 using the standard Curve25519 addition chain (constant-time). The inverse of 0 is
 0.
+
+## Ed25519
+
+EdDSA signatures over the edwards25519 curve (RFC 8032, PureEdDSA), built on the
+Curve25519 field arithmetic above and SHA-512. Keys and signatures are the RFC
+8032 byte strings, so they interoperate with any other Ed25519 implementation: a
+private key is a 32-byte seed, a public key is 32 bytes, a signature is 64 bytes.
+
+Signing is deterministic — the per-signature nonce is derived from the private
+key and message, so no random number generator is involved and the same key and
+message always produce the same signature. Verification rejects malformed inputs:
+a wrong-length key or signature, a non-canonically encoded point, and a scalar `S`
+that is not fully reduced mod the group order (`S >= L`) all fail rather than
+being accepted. The secret-dependent scalar multiplication is constant-time.
+
+```bit
+import { ed25519PublicKey, ed25519Sign, ed25519Verify } from "std/crypto"
+
+// Derive the public key, sign a message, and confirm the signature verifies.
+function signAndVerify(seed: []byte, msg: []byte): bool {
+  let pub = ed25519PublicKey(seed)
+  let sig = ed25519Sign(seed, msg)
+  return ed25519Verify(pub, msg, sig)
+}
+
+// A single flipped bit in the signature must make verification fail.
+function rejectsTamperedSignature(seed: []byte, msg: []byte): bool {
+  let pub = ed25519PublicKey(seed)
+  let sig = ed25519Sign(seed, msg)
+  sig[0] = sig[0] ^ 0x01
+  return !ed25519Verify(pub, msg, sig)
+}
+```
+
+### `ed25519PublicKey(priv: []byte): []byte`
+
+The 32-byte public key for the 32-byte private seed `priv`. The key is `[a]B`,
+where `B` is the curve base point and `a` is the clamped lower half of
+`SHA-512(priv)`.
+
+### `ed25519Sign(priv: []byte, msg: []byte): []byte`
+
+Sign `msg` with the 32-byte private seed `priv`, returning the 64-byte signature
+`R || S`. Deterministic: the nonce is `H(prefix || msg)` for the key's secret
+prefix, so signing needs no randomness and is reproducible.
+
+### `ed25519Verify(pub: []byte, msg: []byte, sig: []byte): bool`
+
+Verify the 64-byte signature `sig` on `msg` under the 32-byte public key `pub`.
+Returns `false` for a wrong-length input, a non-canonical point encoding, a
+non-canonical scalar (`S >= L`), or a signature that fails the group equation.

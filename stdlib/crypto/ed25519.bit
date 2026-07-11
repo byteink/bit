@@ -1,0 +1,466 @@
+// Bit standard library — crypto module, Ed25519 signatures (RFC 8032, PureEdDSA).
+//
+// EdDSA over the twisted Edwards curve edwards25519 (-x^2 + y^2 = 1 + d*x^2*y^2,
+// d = -121665/121666), built on the GF(2^255-19) field arithmetic in
+// `field25519.bit` and SHA-512 in `sha512.bit`. Group elements live in extended
+// homogeneous coordinates (X:Y:Z:T) with x = X/Z, y = Y/Z, x*y = T/Z; the point
+// formulas are the complete "hwcd" addition and doubling, so scalar
+// multiplication needs no special-casing of the identity or a point with itself.
+//
+// Two arithmetics meet here. Field elements (mod p = 2^255-19) use the fast 5x51
+// radix from `field25519.bit`. Scalars (mod the prime group order L = 2^252 +
+// 27742317777372353535851937790883648493) use the variable-width `Nat` bignum
+// from `bigint.bit` — clearer and less error-prone than a bespoke 21-bit-limb
+// reducer, at the cost of not being constant-time. The secret-dependent *point*
+// multiplication is constant-time (double-and-add-always with a masked select),
+// which is where the private scalar would otherwise leak through timing.
+//
+// Being part of the flat `std/crypto` module, this file names `fe25519*`,
+// `bigint*`, `newSha512`, `digest`, and `newError` from its sibling files with no
+// import. Every private helper is prefixed `ed25519` to keep the namespace clean.
+//
+// Public surface: `ed25519PublicKey`, `ed25519Sign`, `ed25519Verify`. Keys and
+// signatures are the RFC 8032 byte strings (32-byte seed, 32-byte public key,
+// 64-byte signature), so they interoperate directly with other implementations
+// and feed the X.509 (#1197) and TLS layers above.
+
+// A curve point in extended coordinates (X:Y:Z:T), x = X/Z, y = Y/Z, T = X*Y/Z.
+// Each coordinate is a `field25519.bit` element (a `[]u64` of five 51-bit limbs).
+struct ed25519Point { X: []u64, Y: []u64, Z: []u64, T: []u64 }
+
+// ---------------------------------------------------------------------------
+// Field constants (radix 2^51, five little-endian limbs). Generated offline and
+// pinned; each is the unique representative in [0, p). Returned from functions,
+// not top-level `const`s, for the same reason the field masks are (#1231).
+// ---------------------------------------------------------------------------
+
+// The additive identity 0 and the multiplicative identity 1 as field elements.
+function ed25519FeZero(): []u64 { return []u64{ 0, 0, 0, 0, 0 } }
+function ed25519FeOne(): []u64 { return []u64{ 1, 0, 0, 0, 0 } }
+
+// The curve constant d = -121665/121666 mod p.
+function ed25519D(): []u64 { return []u64{ 0x34dca135978a3, 0x1a8283b156ebd, 0x5e7a26001c029, 0x739c663a03cbb, 0x52036cee2b6ff } }
+
+// 2*d mod p, the multiplier the extended-coordinate addition folds into T.
+function ed25519D2(): []u64 { return []u64{ 0x69b9426b2f159, 0x35050762add7a, 0x3cf44c0038052, 0x6738cc7407977, 0x2406d9dc56dff } }
+
+// sqrt(-1) = 2^((p-1)/4) mod p, used to pick the other square root in x-recovery.
+function ed25519SqrtM1(): []u64 { return []u64{ 0x61b274a0ea0b0, 0x0d5a5fc8f189d, 0x7ef5e9cbd0c60, 0x78595a6804c9e, 0x2b8324804fc1d } }
+
+// The base point B = (Bx, By): the standard generator of the prime-order subgroup.
+function ed25519BaseX(): []u64 { return []u64{ 0x62d608f25d51a, 0x412a4b4f6592a, 0x75b7171a4b31d, 0x1ff60527118fe, 0x216936d3cd6e5 } }
+function ed25519BaseY(): []u64 { return []u64{ 0x6666666666658, 0x4cccccccccccc, 0x1999999999999, 0x3333333333333, 0x6666666666666 } }
+
+// The group order L = 2^252 + 27742317777372353535851937790883648493, as a `Nat`
+// (its 32-byte big-endian encoding). All scalars are reduced modulo L.
+function ed25519L(): Nat {
+  return bigintFromBytes([]byte{
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x14, 0xde, 0xf9, 0xde, 0xa2, 0xf7, 0x9c, 0xd6,
+    0x58, 0x12, 0x63, 0x1a, 0x5c, 0xf5, 0xd3, 0xed,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Field-element helpers layered on `field25519.bit`
+// ---------------------------------------------------------------------------
+
+// Whether two byte slices are equal in length and content.
+function ed25519BytesEqual(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether two field elements are equal, compared through the canonical encoding
+// so differently-reduced representatives of the same value still match.
+function ed25519FeEqual(a: []u64, b: []u64): bool {
+  return ed25519BytesEqual(fe25519ToBytes(a), fe25519ToBytes(b))
+}
+
+// Whether a field element is zero (canonically).
+function ed25519FeIsZero(a: []u64): bool {
+  let b = fe25519ToBytes(a)
+  let i = 0
+  while (i < 32) {
+    if (b[i] != 0) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// -a mod p.
+function ed25519FeNeg(a: []u64): []u64 {
+  return fe25519Sub(ed25519FeZero(), a)
+}
+
+// Branchless per-limb select: return `b` when every bit of `mask` is set, `a`
+// when `mask` is zero. Callers pass an all-ones or all-zero mask.
+function ed25519FeSelect(a: []u64, b: []u64, mask: u64): []u64 {
+  let out = []u64(5)
+  let i = 0
+  while (i < 5) {
+    out[i] = (a[i] & ~mask) | (b[i] & mask)
+    i = i + 1
+  }
+  return out
+}
+
+// z^((p-5)/8) = z^(2^252 - 3) mod p, the field power that x-recovery needs to
+// take a square root. The standard edwards25519 addition chain: 250 squarings
+// and 11 multiplications reach the exponent 2^252 - 3.
+function ed25519Pow2523(z: []u64): []u64 {
+  let t0 = fe25519Sqr(z)
+  let t1 = fe25519Sqr(t0)
+  t1 = fe25519Sqr(t1)
+  t1 = fe25519Mul(z, t1)
+  t0 = fe25519Mul(t0, t1)
+  t0 = fe25519Sqr(t0)
+  t0 = fe25519Mul(t1, t0)     // 2^5 - 1
+  t1 = fe25519Sqr(t0)
+  t1 = fe25519SqN(t1, 4)      // 2^10 - 2^5
+  t0 = fe25519Mul(t1, t0)     // 2^10 - 1
+  t1 = fe25519Sqr(t0)
+  t1 = fe25519SqN(t1, 9)      // 2^20 - 2^10
+  t1 = fe25519Mul(t1, t0)     // 2^20 - 1
+  let t2 = fe25519Sqr(t1)
+  t2 = fe25519SqN(t2, 19)     // 2^40 - 2^20
+  t1 = fe25519Mul(t2, t1)     // 2^40 - 1
+  t1 = fe25519Sqr(t1)
+  t1 = fe25519SqN(t1, 9)      // 2^50 - 2^10
+  t0 = fe25519Mul(t1, t0)     // 2^50 - 1
+  t1 = fe25519Sqr(t0)
+  t1 = fe25519SqN(t1, 49)     // 2^100 - 2^50
+  t1 = fe25519Mul(t1, t0)     // 2^100 - 1
+  t2 = fe25519Sqr(t1)
+  t2 = fe25519SqN(t2, 99)     // 2^200 - 2^100
+  t1 = fe25519Mul(t2, t1)     // 2^200 - 1
+  t1 = fe25519Sqr(t1)
+  t1 = fe25519SqN(t1, 49)     // 2^250 - 2^50
+  t0 = fe25519Mul(t1, t0)     // 2^250 - 1
+  t0 = fe25519SqN(t0, 2)      // 2^252 - 2^2
+  return fe25519Mul(t0, z)    // 2^252 - 3
+}
+
+// ---------------------------------------------------------------------------
+// Point arithmetic (complete twisted-Edwards formulas, a = -1)
+// ---------------------------------------------------------------------------
+
+// The neutral element (0, 1) in extended coordinates.
+function ed25519Identity(): ed25519Point {
+  return ed25519Point{ X: ed25519FeZero(), Y: ed25519FeOne(), Z: ed25519FeOne(), T: ed25519FeZero() }
+}
+
+// The generator B in extended coordinates (Z = 1, so T = Bx*By).
+function ed25519BasePoint(): ed25519Point {
+  let x = ed25519BaseX()
+  let y = ed25519BaseY()
+  return ed25519Point{ X: x, Y: y, Z: ed25519FeOne(), T: fe25519Mul(x, y) }
+}
+
+// p + q via the complete "add-2008-hwcd-3" formula. Complete for a = -1 with a
+// non-square d, so it is also correct when p == q or either is the identity.
+function ed25519Add(p: ed25519Point, q: ed25519Point): ed25519Point {
+  let a = fe25519Mul(fe25519Sub(p.Y, p.X), fe25519Sub(q.Y, q.X))
+  let b = fe25519Mul(fe25519Add(p.Y, p.X), fe25519Add(q.Y, q.X))
+  let c = fe25519Mul(fe25519Mul(p.T, ed25519D2()), q.T)
+  let zz = fe25519Mul(p.Z, q.Z)
+  let d = fe25519Add(zz, zz)
+  let e = fe25519Sub(b, a)
+  let f = fe25519Sub(d, c)
+  let g = fe25519Add(d, c)
+  let h = fe25519Add(b, a)
+  return ed25519Point{
+    X: fe25519Mul(e, f),
+    Y: fe25519Mul(g, h),
+    Z: fe25519Mul(f, g),
+    T: fe25519Mul(e, h),
+  }
+}
+
+// 2*p via the "dbl-2008-hwcd" formula (a = -1, so the a*X^2 term is just -X^2).
+function ed25519Double(p: ed25519Point): ed25519Point {
+  let a = fe25519Sqr(p.X)
+  let b = fe25519Sqr(p.Y)
+  let zz = fe25519Sqr(p.Z)
+  let c = fe25519Add(zz, zz)
+  let d = ed25519FeNeg(a)
+  let xy = fe25519Add(p.X, p.Y)
+  let e = fe25519Sub(fe25519Sub(fe25519Sqr(xy), a), b)
+  let g = fe25519Add(d, b)
+  let f = fe25519Sub(g, c)
+  let h = fe25519Sub(d, b)
+  return ed25519Point{
+    X: fe25519Mul(e, f),
+    Y: fe25519Mul(g, h),
+    Z: fe25519Mul(f, g),
+    T: fe25519Mul(e, h),
+  }
+}
+
+// Branchless select of a whole point, coordinate by coordinate.
+function ed25519PointSelect(a: ed25519Point, b: ed25519Point, mask: u64): ed25519Point {
+  return ed25519Point{
+    X: ed25519FeSelect(a.X, b.X, mask),
+    Y: ed25519FeSelect(a.Y, b.Y, mask),
+    Z: ed25519FeSelect(a.Z, b.Z, mask),
+    T: ed25519FeSelect(a.T, b.T, mask),
+  }
+}
+
+// scalar * p, scanning 256 bits of the little-endian scalar high to low. This is
+// double-and-add-*always*: every bit performs one double and one add, and the
+// bit only drives a masked select between keeping the double and taking the sum,
+// so the field-operation sequence is independent of the (possibly secret) scalar.
+function ed25519ScalarMul(p: ed25519Point, scalarLe: []byte): ed25519Point {
+  let r = ed25519Identity()
+  let i = 255
+  while (i >= 0) {
+    r = ed25519Double(r)
+    let added = ed25519Add(r, p)
+    let bit = (u64(scalarLe[i / 8]) >> u64(i % 8)) & 1
+    r = ed25519PointSelect(r, added, u64(0) - bit)
+    i = i - 1
+  }
+  return r
+}
+
+// scalar * B for the fixed generator.
+function ed25519ScalarMulBase(scalarLe: []byte): ed25519Point {
+  return ed25519ScalarMul(ed25519BasePoint(), scalarLe)
+}
+
+// ---------------------------------------------------------------------------
+// Point encoding and decoding (RFC 8032 §5.1.2 / §5.1.3)
+// ---------------------------------------------------------------------------
+
+// Encode a point as 32 bytes: little-endian y with the low bit of x folded into
+// bit 255. The z-coordinate is inverted once to reach affine (x, y).
+function ed25519Encode(p: ed25519Point): []byte {
+  let zinv = fe25519Invert(p.Z)
+  let x = fe25519Mul(p.X, zinv)
+  let y = fe25519Mul(p.Y, zinv)
+  let out = fe25519ToBytes(y)
+  let xb = fe25519ToBytes(x)
+  out[31] = out[31] | ((xb[0] & 1) << 7)
+  return out
+}
+
+// Decode a 32-byte encoding back to a point, recovering x from y. Fails on a
+// non-canonical y (>= p), a y with no matching x (not on the curve), or the
+// forbidden encoding x = 0 with the sign bit set. `enc` is not mutated.
+function ed25519Decode(enc: []byte): ed25519Point! {
+  if (len(enc) != 32) {
+    fail newError("ed25519: point must be 32 bytes")
+  }
+  let sign = u8((enc[31] >> 7) & 1)
+
+  // Strip the sign bit and require the remaining y to be a canonical field
+  // element: re-encoding must reproduce the input exactly, else y >= p.
+  let yb = []byte(32)
+  let i = 0
+  while (i < 32) {
+    yb[i] = enc[i]
+    i = i + 1
+  }
+  yb[31] = yb[31] & 0x7f
+  let y = fe25519FromBytes(yb)
+  if (!ed25519BytesEqual(fe25519ToBytes(y), yb)) {
+    fail newError("ed25519: non-canonical point")
+  }
+
+  // x^2 = (y^2 - 1) / (d*y^2 + 1); candidate x = u*v^3 * (u*v^7)^((p-5)/8).
+  let y2 = fe25519Sqr(y)
+  let u = fe25519Sub(y2, ed25519FeOne())
+  let v = fe25519Add(fe25519Mul(ed25519D(), y2), ed25519FeOne())
+  let v3 = fe25519Mul(fe25519Sqr(v), v)
+  let v7 = fe25519Mul(fe25519Sqr(v3), v)
+  let x = fe25519Mul(fe25519Mul(u, v3), ed25519Pow2523(fe25519Mul(u, v7)))
+
+  // Correct the root: if v*x^2 == u it is right; if v*x^2 == -u multiply by
+  // sqrt(-1); otherwise there is no square root and the point is off-curve.
+  let vxx = fe25519Mul(v, fe25519Sqr(x))
+  if (!ed25519FeEqual(vxx, u)) {
+    if (ed25519FeEqual(vxx, ed25519FeNeg(u))) {
+      x = fe25519Mul(x, ed25519SqrtM1())
+    } else {
+      fail newError("ed25519: point not on curve")
+    }
+  }
+
+  // x = 0 admits only the positive sign; reject the non-canonical negative zero.
+  if (ed25519FeIsZero(x) && sign == 1) {
+    fail newError("ed25519: non-canonical point")
+  }
+  // Flip to the requested sign (parity of x).
+  if ((fe25519ToBytes(x)[0] & 1) != sign) {
+    x = ed25519FeNeg(x)
+  }
+  return ed25519Point{ X: x, Y: y, Z: ed25519FeOne(), T: fe25519Mul(x, y) }
+}
+
+// ---------------------------------------------------------------------------
+// Scalar arithmetic modulo L (via the `bigint.bit` bignum)
+// ---------------------------------------------------------------------------
+
+// A little-endian byte scalar as a `Nat` (bignum is big-endian, so reverse).
+function ed25519LeToNat(le: []byte): Nat {
+  let n = len(le)
+  let be = []byte(n)
+  let i = 0
+  while (i < n) {
+    be[i] = le[n - 1 - i]
+    i = i + 1
+  }
+  return bigintFromBytes(be)
+}
+
+// A `Nat` (known < 2^256) as exactly 32 little-endian bytes.
+function ed25519NatToLe(n: Nat): []byte {
+  let be = bigintToBytes(n, 32) catch e {
+    return []byte(32)
+  }
+  let le = []byte(32)
+  let i = 0
+  while (i < 32) {
+    le[i] = be[31 - i]
+    i = i + 1
+  }
+  return le
+}
+
+// Reduce a 64-byte little-endian hash to a 32-byte little-endian scalar mod L.
+function ed25519ScalarReduce64(h: []byte): []byte {
+  let be = []byte(64)
+  let i = 0
+  while (i < 64) {
+    be[i] = h[63 - i]
+    i = i + 1
+  }
+  return ed25519NatToLe(bigintModNZ(bigintFromBytes(be), ed25519L()))
+}
+
+// s = (r + k*a) mod L, all operands little-endian scalars.
+function ed25519ScalarMulAdd(r: []byte, k: []byte, a: []byte): []byte {
+  let prod = bigintMul(ed25519LeToNat(k), ed25519LeToNat(a))
+  let sum = bigintAdd(ed25519LeToNat(r), prod)
+  return ed25519NatToLe(bigintModNZ(sum, ed25519L()))
+}
+
+// Whether a little-endian 32-byte scalar is a canonical signature scalar (< L).
+function ed25519ScalarLtL(le: []byte): bool {
+  return bigintCmp(ed25519LeToNat(le), ed25519L()) < 0
+}
+
+// The clamped secret scalar from the first 32 bytes of the expanded key: clear
+// the low 3 bits and bit 255, set bit 254 (RFC 8032 §5.1.5).
+function ed25519Clamp(h: []byte): []byte {
+  let a = []byte(32)
+  let i = 0
+  while (i < 32) {
+    a[i] = h[i]
+    i = i + 1
+  }
+  a[0] = a[0] & 248
+  a[31] = a[31] & 127
+  a[31] = a[31] | 64
+  return a
+}
+
+// Assemble the 64-byte signature from its halves, R || S. Kept a separate
+// function on purpose: its loop makes it multi-block and thus not inline-
+// eligible, so this byte-copy loop never lands *inside* `ed25519Sign`. That
+// avoids a seed-compiler inliner bug (opt.zig `inlineCalls`) that emits a
+// malformed jump — `error.BlockArgMismatch` under the debug IR verifier — when
+// one function carries both many spliced single-block callees and a loop with
+// loop-carried values. `ed25519Sign` triggers exactly that shape inline.
+function ed25519JoinSig(encR: []byte, s: []byte): []byte {
+  let sig = []byte(64)
+  let i = 0
+  while (i < 32) {
+    sig[i] = encR[i]
+    sig[32 + i] = s[i]
+    i = i + 1
+  }
+  return sig
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// The 32-byte Ed25519 public key A for a 32-byte private seed `priv`: A = [a]B,
+// where a is the clamped low half of SHA-512(priv).
+export function ed25519PublicKey(priv: []byte): []byte {
+  let a = ed25519Clamp(digest(newSha512(), priv))
+  return ed25519Encode(ed25519ScalarMulBase(a))
+}
+
+// Sign `msg` with the 32-byte private seed `priv`, returning the 64-byte
+// signature R || S (RFC 8032 §5.1.6). The nonce r = H(prefix || msg) is
+// deterministic, so signing is reproducible and needs no RNG.
+export function ed25519Sign(priv: []byte, msg: []byte): []byte {
+  let h = digest(newSha512(), priv)
+  let a = ed25519Clamp(h)
+  let prefix = h[32:64]
+  let encA = ed25519Encode(ed25519ScalarMulBase(a))
+
+  // r = H(prefix || msg) mod L, then R = [r]B.
+  let hr = newSha512()
+  hr.write(prefix)
+  hr.write(msg)
+  let r = ed25519ScalarReduce64(hr.sum())
+  let encR = ed25519Encode(ed25519ScalarMulBase(r))
+
+  // k = H(R || A || msg) mod L, then S = (r + k*a) mod L.
+  let hk = newSha512()
+  hk.write(encR)
+  hk.write(encA)
+  hk.write(msg)
+  let k = ed25519ScalarReduce64(hk.sum())
+  let s = ed25519ScalarMulAdd(r, k, a)
+  return ed25519JoinSig(encR, s)
+}
+
+// Verify a 64-byte signature `sig` on `msg` under the 32-byte public key `pub`.
+// Rejects a wrong length, a non-canonical point, or a non-canonical S (S >= L),
+// then checks the group equation [S]B == R + [k]A with k = H(R || A || msg).
+export function ed25519Verify(pub: []byte, msg: []byte, sig: []byte): bool {
+  if (len(pub) != 32 || len(sig) != 64) {
+    return false
+  }
+  let encR = sig[0:32]
+  let s = sig[32:64]
+  if (!ed25519ScalarLtL(s)) {
+    return false
+  }
+
+  let a = ed25519Decode(pub) catch e {
+    return false
+  }
+  let rPoint = ed25519Decode(encR) catch e {
+    return false
+  }
+
+  let hk = newSha512()
+  hk.write(encR)
+  hk.write(pub)
+  hk.write(msg)
+  let k = ed25519ScalarReduce64(hk.sum())
+
+  // [S]B and R + [k]A must encode to the same point.
+  let lhs = ed25519ScalarMulBase(s)
+  let rhs = ed25519Add(rPoint, ed25519ScalarMul(a, k))
+  return ed25519BytesEqual(ed25519Encode(lhs), ed25519Encode(rhs))
+}
