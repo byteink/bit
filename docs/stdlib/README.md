@@ -19,7 +19,10 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [net](net.md) | `"std/net"` | TCP, UDP, and DNS over green threads |
 | [http](http.md) | `"std/http"` | HTTP/1.1 server and client |
 | [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract |
-| [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake |
+| [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake, record |
+| [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
+| [http2](http2.md) | `"std/http2"` | HPACK + HTTP/2 frame layer |
+| [quic](quic.md) | `"std/quic"` | QUIC v1 packet protection + frames |
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
 
 ## Conventions

@@ -1,0 +1,522 @@
+// Bit standard library — quic module, QUIC v1 packet protection (RFC 9001).
+//
+// This file protects and unprotects QUIC packets: it derives the Initial keys, seals
+// the payload with an AEAD, and masks the header. It is the cryptographic half of
+// QUIC — the transport state machine that decides *which* packet to send is a layer
+// above and lives elsewhere. Everything here composes the verified `std/crypto`
+// primitives (HKDF, AES-GCM, AES-ECB, ChaCha20) rather than carrying a second copy.
+//
+// Three layers, mirroring RFC 9001 §5:
+//
+//   * **Key derivation (§5.2).** The Initial secret is `HKDF-Extract(initial_salt,
+//     client_dcid)`; from it, HKDF-Expand-Label ("client in"/"server in", then
+//     "quic key"/"quic iv"/"quic hp") yields the per-direction key, IV, and header-
+//     protection key. QUIC uses the TLS 1.3 HKDF-Expand-Label verbatim — labels are
+//     prefixed "tls13 " — so this is the same construction `std/tls` derives its keys
+//     from, kept here so packet protection does not depend on the handshake layer.
+//
+//   * **Payload protection (§5.3).** The nonce is the IV XOR'd with the packet number
+//     (big-endian, right-aligned); the AAD is the packet header through the packet
+//     number; AES-128-GCM seals. Sealing appends the 16-byte tag; opening verifies it
+//     in constant time and fails without leaking plaintext.
+//
+//   * **Header protection (§5.4).** A 16-byte sample of the ciphertext (taken 4 bytes
+//     past the packet-number field) is encrypted — AES-ECB for the AES suites, a raw
+//     ChaCha20 block for ChaCha20-Poly1305 — into a 5-byte mask that hides the first
+//     byte's low bits and the packet number. The mask is applied by XOR only, with no
+//     secret-dependent branch, so it is constant-time.
+//
+// The Retry integrity tag (§5.8) and Version Negotiation packet (§17.2.1) round out
+// what a QUIC endpoint needs before the transport layer takes over.
+
+import { Hash, hkdfExtract, hkdfExpand, newSha256, newAes, newGcm, chacha20, ctEq } from "std/crypto"
+
+// QUIC version 1 (RFC 9000 §15). The version field of every Initial/Handshake/0-RTT
+// packet this module protects.
+export const quicVersion1: int = 0x00000001
+
+// Long-header packet types (RFC 9000 §17.2), the two bits at mask 0x30 of byte 0.
+export const longInitial: int = 0
+export const longZeroRtt: int = 1
+export const longHandshake: int = 2
+export const longRetry: int = 3
+
+// The AES-128-GCM key (16 bytes), IV (12 bytes), and header-protection key (16 bytes)
+// for one direction of one encryption level. Built by `deriveKeys` from a traffic
+// secret, or directly from a client DCID by `clientInitialKeys`/`serverInitialKeys`.
+export struct PacketKeys {
+  export key: []byte
+  export iv: []byte
+  export hp: []byte
+}
+
+// `newSha256` as a `() => Hash` value: QUIC v1 keys the Initial secrets under
+// SHA-256, the hash of TLS_AES_128_GCM_SHA256.
+function quicpktSha256(): Hash {
+  return newSha256()
+}
+
+// The QUIC v1 Initial salt (RFC 9001 §5.2), a fixed, non-secret value mixed into the
+// Initial-secret extraction. It is version-specific: this is the value for v1.
+function quicpktInitialSalt(): []byte {
+  return []byte{
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+  }
+}
+
+// The QUIC v1 Initial salt (RFC 9001 §5.2). Exposed so a caller can reproduce or
+// audit the Initial-secret derivation; it is a public constant, not a secret.
+export function initialSalt(): []byte {
+  return quicpktInitialSalt()
+}
+
+// TLS 1.3 HKDF-Expand-Label (RFC 8446 §7.1) as QUIC uses it (RFC 9001 §5.1): expand
+// `secret` to `length` bytes bound to "tls13 "+`label` with an empty context. The
+// HkdfLabel is `uint16 length ‖ opaque label<1> ‖ opaque context<1>`. This is the
+// KDF QUIC keys everything through; a caller deriving keys for a non-Initial suite
+// (e.g. the 32-byte ChaCha20-Poly1305 key and hp) uses it directly. Every QUIC use
+// asks for at most 32 bytes, far under HKDF-Expand's cap, so the `catch` is
+// unreachable and returns a zero slice only to keep the function total.
+export function expandLabel(secret: []byte, label: string, length: int): []byte {
+  let full = "tls13 ${label}"
+  let fullLen = len(full)
+  let info = []byte(2 + 1 + fullLen + 1)
+  info[0] = byte(length >> 8)
+  info[1] = byte(length)
+  info[2] = byte(fullLen)
+  let at = 3
+  let i = 0
+  while (i < fullLen) {
+    info[at] = byte(full[i])
+    at = at + 1
+    i = i + 1
+  }
+  info[at] = 0
+  return hkdfExpand(quicpktSha256, secret, info, length) catch e {
+    return []byte(length)
+  }
+}
+
+// The Initial secret common to both directions (RFC 9001 §5.2): `HKDF-Extract(
+// initial_salt, dcid)` over the client's Destination Connection ID. The client and
+// server secrets both descend from this.
+export function deriveInitialSecret(dcid: []byte): []byte {
+  return hkdfExtract(quicpktSha256, quicpktInitialSalt(), dcid)
+}
+
+// The client Initial traffic secret (RFC 9001 §5.2): `HKDF-Expand-Label(initial,
+// "client in", "", 32)`. Feed it to `deriveKeys` for the keys that protect client
+// Initial packets.
+export function clientInitialSecret(dcid: []byte): []byte {
+  return expandLabel(deriveInitialSecret(dcid), "client in", 32)
+}
+
+// The server Initial traffic secret (RFC 9001 §5.2): `HKDF-Expand-Label(initial,
+// "server in", "", 32)`.
+export function serverInitialSecret(dcid: []byte): []byte {
+  return expandLabel(deriveInitialSecret(dcid), "server in", 32)
+}
+
+// The AES-128-GCM key/iv/hp derived from a traffic `secret` (RFC 9001 §5.1): "quic
+// key" (16 bytes), "quic iv" (12), and "quic hp" (16). The Initial suite is always
+// AES-128-GCM, so the sizes are fixed here.
+export function deriveKeys(secret: []byte): PacketKeys {
+  return PacketKeys{
+    key: expandLabel(secret, "quic key", 16),
+    iv: expandLabel(secret, "quic iv", 12),
+    hp: expandLabel(secret, "quic hp", 16),
+  }
+}
+
+// The keys that protect the client's Initial packets, derived end to end from the
+// client-chosen `dcid` (RFC 9001 §5.2 then §5.1).
+export function clientInitialKeys(dcid: []byte): PacketKeys {
+  return deriveKeys(clientInitialSecret(dcid))
+}
+
+// The keys that protect the server's Initial packets, derived from the same client
+// `dcid` (RFC 9001 §5.2 then §5.1).
+export function serverInitialKeys(dcid: []byte): PacketKeys {
+  return deriveKeys(serverInitialSecret(dcid))
+}
+
+// The smallest packet-number encoding length (1..4 bytes) for `pn` given the peer's
+// `largestAcked` (RFC 9000 §17.1, Appendix A.2). Pass a negative `largestAcked` when
+// nothing has been acknowledged yet. The length is one byte more than the base-2 log
+// of the number of unacknowledged packets, rounded up — enough to disambiguate the
+// number against reordering, clamped to the 4-byte maximum.
+export function packetNumberLength(pn: u64, largestAcked: int): int {
+  let numUnacked = pn + 1
+  if (largestAcked >= 0) {
+    numUnacked = pn - u64(largestAcked)
+  }
+  let bits = 0
+  let tmp = numUnacked
+  while (tmp > 0) {
+    bits = bits + 1
+    tmp = tmp >> 1
+  }
+  let numBytes = (bits + 7) / 8
+  if (numBytes < 1) {
+    numBytes = 1
+  }
+  if (numBytes > 4) {
+    numBytes = 4
+  }
+  return numBytes
+}
+
+// The `pnLength`-byte big-endian truncation of packet number `pn` (RFC 9000 §17.1) —
+// the encoded Packet Number field. `pnLength` must be 1..4.
+export function encodePacketNumber(pn: u64, pnLength: int): []byte {
+  assert(pnLength >= 1 && pnLength <= 4, "encodePacketNumber: length must be 1..4")
+  let out = []byte(pnLength)
+  let i = 0
+  while (i < pnLength) {
+    out[pnLength - 1 - i] = byte(pn >> u64(8 * i))
+    i = i + 1
+  }
+  return out
+}
+
+// The AEAD nonce for packet number `pn` (RFC 9001 §5.3): the IV with `pn` (big-
+// endian, right-aligned) XOR'd into its low bytes. `iv` is the 12-byte packet IV.
+export function packetNonce(iv: []byte, pn: u64): []byte {
+  assert(len(iv) >= 8, "packetNonce: iv must be at least 8 bytes")
+  let nonce = []byte(len(iv))
+  let i = 0
+  while (i < len(iv)) {
+    nonce[i] = iv[i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < 8) {
+    let idx = len(iv) - 1 - j
+    nonce[idx] = nonce[idx] ^ byte(pn >> u64(8 * j))
+    j = j + 1
+  }
+  return nonce
+}
+
+// Seal `payload` under `keys` for packet number `pn` (RFC 9001 §5.3): AES-128-GCM
+// with nonce `IV ^ pn` and `header` (the packet bytes through the packet number) as
+// additional data. Returns the protected payload with the 16-byte tag appended.
+export function protectPayload(keys: PacketKeys, pn: u64, header: []byte, payload: []byte): []byte! {
+  let nonce = packetNonce(keys.iv, pn)
+  let g = newGcm(keys.key)?
+  return g.seal(nonce, payload, header)
+}
+
+// Open the protected `ciphertext` (payload ‖ tag) under `keys` for packet number
+// `pn` (RFC 9001 §5.3), authenticating `header` as additional data. Fails without
+// returning plaintext if the tag does not verify.
+export function unprotectPayload(keys: PacketKeys, pn: u64, header: []byte, ciphertext: []byte): []byte! {
+  let nonce = packetNonce(keys.iv, pn)
+  let g = newGcm(keys.key)?
+  return g.open(nonce, ciphertext, header)?
+}
+
+// The little-endian u32 at byte offset `off` of `b` (needs `off + 4 <= len(b)`).
+function quicpktLeU32(b: []byte, off: int): u32 {
+  return u32(b[off]) | (u32(b[off + 1]) << 8) | (u32(b[off + 2]) << 16) | (u32(b[off + 3]) << 24)
+}
+
+// The 16-byte header-protection sample from a protected payload (RFC 9001 §5.4.2).
+// The sample always begins 4 bytes into the packet number field, so within the
+// payload it starts at offset `4 - pnLength`; a shorter packet number skips more of
+// the leading ciphertext. Fails if the payload is too short for a full sample.
+export function headerSample(protectedPayload: []byte, pnLength: int): []byte! {
+  assert(pnLength >= 1 && pnLength <= 4, "headerSample: pnLength must be 1..4")
+  let off = 4 - pnLength
+  if (off + 16 > len(protectedPayload)) {
+    fail newError("headerSample: payload too short for a 16-byte sample")
+  }
+  return protectedPayload[off:off + 16]
+}
+
+// The 5-byte AES header-protection mask (RFC 9001 §5.4.3): the AES-ECB encryption of
+// the 16-byte `sample` under `hpKey`, truncated to 5 bytes. Used with AES-GCM suites.
+export function aesHeaderMask(hpKey: []byte, sample: []byte): []byte! {
+  if (len(sample) < 16) {
+    fail newError("aesHeaderMask: sample must be 16 bytes")
+  }
+  let c = newAes(hpKey)?
+  let block = c.encryptBlock(sample[0:16])
+  return block[0:5]
+}
+
+// The 5-byte ChaCha20 header-protection mask (RFC 9001 §5.4.4): the first 5 bytes of
+// the ChaCha20 block keyed by `hpKey`, with the counter taken from `sample[0..4]`
+// (little-endian) and the nonce from `sample[4..16]`. Used with ChaCha20-Poly1305.
+export function chachaHeaderMask(hpKey: []byte, sample: []byte): []byte! {
+  if (len(sample) < 16) {
+    fail newError("chachaHeaderMask: sample must be 16 bytes")
+  }
+  let counter = quicpktLeU32(sample, 0)
+  let nonce = sample[4:16]
+  let ks = chacha20(hpKey, nonce, counter, []byte(5))
+  return ks[0:5]
+}
+
+// Apply header protection to a full packet buffer in place (RFC 9001 §5.4.1), for
+// sending. `pnOffset` is the start of the (unprotected) packet number; `mask` is the
+// 5-byte mask. The packet-number length is read from the still-clear low bits of
+// byte 0; a long header masks 4 low bits of byte 0, a short header 5. `mask[1..]`
+// hides the packet number. Fails if the mask is short or the packet number runs past
+// the buffer.
+export function applyHeaderProtection(packet: []byte, pnOffset: int, mask: []byte): ()! {
+  if (len(mask) < 5) {
+    fail newError("applyHeaderProtection: mask must be at least 5 bytes")
+  }
+  let pnLength = int(packet[0] & 0x03) + 1
+  if (pnOffset + pnLength > len(packet)) {
+    fail newError("applyHeaderProtection: packet number runs past end of packet")
+  }
+  if ((packet[0] & 0x80) != 0) {
+    packet[0] = packet[0] ^ (mask[0] & 0x0f)
+  } else {
+    packet[0] = packet[0] ^ (mask[0] & 0x1f)
+  }
+  let i = 0
+  while (i < pnLength) {
+    packet[pnOffset + i] = packet[pnOffset + i] ^ mask[1 + i]
+    i = i + 1
+  }
+}
+
+// Remove header protection from a full packet buffer in place (RFC 9001 §5.4.1), for
+// receiving, and return the recovered packet-number length. Byte 0 is unmasked first
+// (revealing the packet-number length in its low bits), then `mask[1..]` unmasks the
+// packet number. Fails if the mask is short or the packet number runs past the buffer.
+export function removeHeaderProtection(packet: []byte, pnOffset: int, mask: []byte): int! {
+  if (len(mask) < 5) {
+    fail newError("removeHeaderProtection: mask must be at least 5 bytes")
+  }
+  if ((packet[0] & 0x80) != 0) {
+    packet[0] = packet[0] ^ (mask[0] & 0x0f)
+  } else {
+    packet[0] = packet[0] ^ (mask[0] & 0x1f)
+  }
+  let pnLength = int(packet[0] & 0x03) + 1
+  if (pnOffset + pnLength > len(packet)) {
+    fail newError("removeHeaderProtection: packet number runs past end of packet")
+  }
+  let i = 0
+  while (i < pnLength) {
+    packet[pnOffset + i] = packet[pnOffset + i] ^ mask[1 + i]
+    i = i + 1
+  }
+  return pnLength
+}
+
+// --- header serialization ---------------------------------------------------
+
+// The invariant long-header fields (RFC 9000 §17.2): the packet `typ` (0..3), the
+// `version`, and the Destination and Source Connection IDs. The type-specific fields
+// (token, length, packet number, payload) are handled by the protection layer.
+export struct LongHeader {
+  export typ: int
+  export version: int
+  export dcid: []byte
+  export scid: []byte
+}
+
+// The short-header (1-RTT) fields recovered after header protection is removed (RFC
+// 9000 §17.3): the spin and key-phase bits, the Destination Connection ID, and the
+// packet-number length.
+export struct ShortHeader {
+  export spinBit: bool
+  export keyPhase: bool
+  export dcid: []byte
+  export pnLength: int
+}
+
+// Append `v` as four big-endian bytes.
+function quicpktPutU32(dst: []byte, v: int): []byte {
+  let out = append(dst, byte((v >> 24) & 0xff))
+  out = append(out, byte((v >> 16) & 0xff))
+  out = append(out, byte((v >> 8) & 0xff))
+  return append(out, byte(v & 0xff))
+}
+
+// Append every byte of `src`.
+function quicpktPutBytes(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// The unprotected Initial-packet header through the packet number (RFC 9000 §17.2.2),
+// which is exactly the AEAD additional data for `protectPayload`. `length` is the
+// QUIC Length field: the packet-number length plus the protected payload length
+// (payload + 16-byte tag). `pnLength` must be 1..4.
+export function encodeInitialHeader(version: int, dcid: []byte, scid: []byte, token: []byte, length: u64, pn: u64, pnLength: int): []byte {
+  assert(pnLength >= 1 && pnLength <= 4, "encodeInitialHeader: pnLength must be 1..4")
+  // 0x80 long-form ‖ 0x40 fixed ‖ type Initial (0x00) ‖ reserved 0 ‖ pn-length bits.
+  let first = 0xc0 | ((pnLength - 1) & 0x03)
+  let out = []byte(0)
+  out = append(out, byte(first))
+  out = quicpktPutU32(out, version)
+  out = append(out, byte(len(dcid)))
+  out = quicpktPutBytes(out, dcid)
+  out = append(out, byte(len(scid)))
+  out = quicpktPutBytes(out, scid)
+  out = quicpktPutBytes(out, encodeVarint(u64(len(token))))
+  out = quicpktPutBytes(out, token)
+  out = quicpktPutBytes(out, encodeVarint(length))
+  return quicpktPutBytes(out, encodePacketNumber(pn, pnLength))
+}
+
+// The invariant long-header fields of `packet` (RFC 9000 §17.2). Reads byte 0 (which
+// must have the long-header form bit set), the version, and the two length-prefixed
+// connection IDs; it stops before the type-specific fields. Fails on a short header
+// or a connection-id length that runs past the buffer.
+export function parseLongHeader(packet: []byte): LongHeader! {
+  if (len(packet) < 7) {
+    fail newError("parseLongHeader: too short for a long header")
+  }
+  if ((packet[0] & 0x80) == 0) {
+    fail newError("parseLongHeader: not a long header")
+  }
+  let typ = int((packet[0] >> 4) & 0x03)
+  let version = (int(packet[1]) << 24) | (int(packet[2]) << 16) | (int(packet[3]) << 8) | int(packet[4])
+  let pos = 5
+  let dcidLen = int(packet[pos])
+  pos = pos + 1
+  if (pos + dcidLen + 1 > len(packet)) {
+    fail newError("parseLongHeader: DCID runs past end of packet")
+  }
+  let dcid = packet[pos:pos + dcidLen]
+  pos = pos + dcidLen
+  let scidLen = int(packet[pos])
+  pos = pos + 1
+  if (pos + scidLen > len(packet)) {
+    fail newError("parseLongHeader: SCID runs past end of packet")
+  }
+  let scid = packet[pos:pos + scidLen]
+  return LongHeader{ typ: typ, version: version, dcid: dcid, scid: scid }
+}
+
+// The unprotected short-header (1-RTT) bytes through the packet number (RFC 9000
+// §17.3), the AEAD additional data for a 1-RTT packet. Byte 0 carries the fixed bit,
+// the optional spin and key-phase bits, and the packet-number length; the connection
+// ID has no length prefix on the wire. `pnLength` must be 1..4.
+export function encodeShortHeader(dcid: []byte, pn: u64, pnLength: int, spinBit: bool, keyPhase: bool): []byte {
+  assert(pnLength >= 1 && pnLength <= 4, "encodeShortHeader: pnLength must be 1..4")
+  // 0x40 fixed bit ‖ form 0 ‖ pn-length bits, plus the optional spin and key-phase.
+  let first = 0x40 | ((pnLength - 1) & 0x03)
+  if (spinBit) {
+    first = first | 0x20
+  }
+  if (keyPhase) {
+    first = first | 0x04
+  }
+  let out = []byte(0)
+  out = append(out, byte(first))
+  out = quicpktPutBytes(out, dcid)
+  return quicpktPutBytes(out, encodePacketNumber(pn, pnLength))
+}
+
+// The short-header fields of `packet` given the connection's `dcidLen` (RFC 9000
+// §17.3). A short header does not carry its DCID length on the wire, so the caller
+// supplies the length it issued. Call after `removeHeaderProtection`, so the packet-
+// number length in byte 0 is meaningful. Fails on a long header or a truncated DCID.
+export function parseShortHeader(packet: []byte, dcidLen: int): ShortHeader! {
+  if (dcidLen < 0 || len(packet) < 1 + dcidLen) {
+    fail newError("parseShortHeader: packet too short for the connection id")
+  }
+  if ((packet[0] & 0x80) != 0) {
+    fail newError("parseShortHeader: not a short header")
+  }
+  let spin = (packet[0] & 0x20) != 0
+  let keyPhase = (packet[0] & 0x04) != 0
+  let pnLength = int(packet[0] & 0x03) + 1
+  let dcid = packet[1:1 + dcidLen]
+  return ShortHeader{ spinBit: spin, keyPhase: keyPhase, dcid: dcid, pnLength: pnLength }
+}
+
+// --- Retry integrity (RFC 9001 §5.8) ----------------------------------------
+
+// The fixed AES-128-GCM key for the v1 Retry integrity tag (RFC 9001 §5.8).
+function quicpktRetryKey(): []byte {
+  return []byte{
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+    0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+  }
+}
+
+// The fixed 12-byte nonce for the v1 Retry integrity tag (RFC 9001 §5.8).
+function quicpktRetryNonce(): []byte {
+  return []byte{
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+  }
+}
+
+// The Retry Pseudo-Packet (RFC 9001 §5.8): the 1-byte ODCID length, the Original
+// Destination Connection ID, then the Retry packet up to (not including) the tag.
+// This is the additional data the integrity tag authenticates.
+function quicpktRetryPseudo(odcid: []byte, retryWithoutTag: []byte): []byte {
+  let aad = []byte(0)
+  aad = append(aad, byte(len(odcid)))
+  aad = quicpktPutBytes(aad, odcid)
+  return quicpktPutBytes(aad, retryWithoutTag)
+}
+
+// The 16-byte Retry integrity tag (RFC 9001 §5.8): AES-128-GCM over an empty
+// plaintext with the fixed Retry key and nonce, authenticating the Retry Pseudo-
+// Packet built from `odcid` (the Original Destination Connection ID) and
+// `retryWithoutTag` (the Retry packet with its trailing 16-byte tag removed).
+export function retryIntegrityTag(odcid: []byte, retryWithoutTag: []byte): []byte! {
+  let aad = quicpktRetryPseudo(odcid, retryWithoutTag)
+  let g = newGcm(quicpktRetryKey())?
+  return g.seal(quicpktRetryNonce(), []byte(0), aad)
+}
+
+// Whether the trailing integrity tag of `fullRetry` is valid for `odcid` (RFC 9001
+// §5.8). Recomputes the tag over the pseudo-packet and compares it to the last 16
+// bytes in constant time. Fails if the packet is shorter than the 16-byte tag.
+export function verifyRetry(odcid: []byte, fullRetry: []byte): bool! {
+  if (len(fullRetry) < 16) {
+    fail newError("verifyRetry: packet shorter than the 16-byte integrity tag")
+  }
+  let n = len(fullRetry) - 16
+  let body = fullRetry[0:n]
+  let tag = fullRetry[n:len(fullRetry)]
+  let want = retryIntegrityTag(odcid, body)?
+  return ctEq(want, tag)
+}
+
+// --- Version Negotiation (RFC 9000 §17.2.1) ---------------------------------
+
+// A Version Negotiation packet (RFC 9000 §17.2.1): a long header with version 0 that
+// lists the server's `versions`. Byte 0 sets the long-form bit (0x80) and, as
+// recommended, the fixed-bit position (0x40); the remaining bits are unused. The DCID
+// and SCID are echoed from the client packet that triggered it.
+export function encodeVersionNegotiation(dcid: []byte, scid: []byte, versions: []int): []byte {
+  let out = []byte(0)
+  out = append(out, 0xc0)
+  out = quicpktPutU32(out, 0)
+  out = append(out, byte(len(dcid)))
+  out = quicpktPutBytes(out, dcid)
+  out = append(out, byte(len(scid)))
+  out = quicpktPutBytes(out, scid)
+  for v of versions {
+    out = quicpktPutU32(out, v)
+  }
+  return out
+}
+
+// Whether `packet` is a Version Negotiation packet (RFC 9000 §17.2.1): a long header
+// whose 32-bit version field is zero.
+export function isVersionNegotiation(packet: []byte): bool {
+  if (len(packet) < 5) {
+    return false
+  }
+  if ((packet[0] & 0x80) == 0) {
+    return false
+  }
+  return packet[1] == 0 && packet[2] == 0 && packet[3] == 0 && packet[4] == 0
+}

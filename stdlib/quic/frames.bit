@@ -1,0 +1,587 @@
+// Bit standard library — quic module, the QUIC v1 frame codec (RFC 9000 §16, §19).
+//
+// A QUIC packet payload is a sequence of frames; this file is the wire codec for
+// them. Two layers:
+//
+//   * The **variable-length integer** (§16) — QUIC's universal number encoding.
+//     The top two bits of the first byte give the length (1, 2, 4, or 8 bytes);
+//     the remaining bits are the value, big-endian. So one encoding spans 6-, 14-,
+//     30-, and 62-bit ranges, and every length, offset, stream id, and error code
+//     in the protocol is one of these. `encodeVarint` always picks the shortest
+//     form; `decodeVarint` accepts any form (a value MAY be encoded non-minimally,
+//     §16), so 37 decodes from both `0x25` and `0x4025`.
+//
+//   * The **frames** (§19) — each a one-byte-ish type varint followed by
+//     type-specific fields. `Frame` is a sum type over every v1 frame; `encodeFrame`
+//     serializes one and `parseFrames` reads a whole payload back. Decoding is
+//     strict, because a frame parser faces hostile input: a declared length that
+//     runs past the buffer, a truncated field, or an unknown frame type all `fail`
+//     rather than being guessed at.
+//
+// This is a pure codec: it has no transport state, no flow-control accounting, and
+// makes no judgement about whether a frame is allowed in a given packet type — that
+// is the connection layer's job. Byte layout is the whole contract here.
+
+// A read cursor over a frame buffer. A struct is a reference type (§13.3), so a
+// helper that advances `pos` advances it for its caller — that threads one position
+// through a field-by-field decode without an out-parameter.
+struct quicfrReader {
+  data: []byte
+  pos: int
+}
+
+// The encoded length in bytes of a varint whose first byte is `first`: 1 << the top
+// two bits (RFC 9000 §16 / Figure 45).
+function quicfrVarintLen(first: byte): int {
+  return 1 << int(first >> 6)
+}
+
+// Read one variable-length integer at the cursor, advancing past it. Fails at end
+// of input or if the declared length runs past the buffer.
+function quicfrReadVarint(r: quicfrReader): u64! {
+  if (r.pos >= len(r.data)) {
+    fail newError("quic: varint at end of input")
+  }
+  let first = r.data[r.pos]
+  let n = quicfrVarintLen(first)
+  if (r.pos + n > len(r.data)) {
+    fail newError("quic: varint runs past end of input")
+  }
+  let v: u64 = u64(first & 0x3f)
+  let i = 1
+  while (i < n) {
+    v = (v << 8) | u64(r.data[r.pos + i])
+    i = i + 1
+  }
+  r.pos = r.pos + n
+  return v
+}
+
+// Read one octet at the cursor, advancing. Fails at end of input.
+function quicfrReadU8(r: quicfrReader): int! {
+  if (r.pos >= len(r.data)) {
+    fail newError("quic: unexpected end of input")
+  }
+  let b = r.data[r.pos]
+  r.pos = r.pos + 1
+  return int(b)
+}
+
+// Take the next `n` octets as a view, failing if fewer remain or `n` is negative.
+function quicfrReadBytes(r: quicfrReader, n: int): []byte! {
+  if (n < 0 || r.pos + n > len(r.data)) {
+    fail newError("quic: declared length runs past end of input")
+  }
+  let out = r.data[r.pos:r.pos + n]
+  r.pos = r.pos + n
+  return out
+}
+
+// The shortest varint length (bytes) that can hold `v`. The four ranges are the
+// 6-, 14-, 30-, and 62-bit maxima (RFC 9000 §16).
+function quicfrVarintSizeFor(v: u64): int {
+  if (v <= 0x3f) {
+    return 1
+  }
+  if (v <= 0x3fff) {
+    return 2
+  }
+  if (v <= 0x3fffffff) {
+    return 4
+  }
+  return 8
+}
+
+// The shortest number of bytes `encodeVarint` will use for `v`. Exposed so a caller
+// sizing a buffer up front can account for a varint without encoding it twice.
+export function varintSize(v: u64): int {
+  return quicfrVarintSizeFor(v)
+}
+
+// Encode `v` as the shortest QUIC variable-length integer (RFC 9000 §16): the value
+// big-endian, with the 2-bit length tag OR'd into the top byte. `v` must fit in 62
+// bits (the largest representable QUIC integer); a larger value is a programming
+// error and trips the assert.
+export function encodeVarint(v: u64): []byte {
+  assert(v <= 0x3fffffffffffffff, "encodeVarint: value exceeds 2^62-1")
+  let n = quicfrVarintSizeFor(v)
+  let out = []byte(n)
+  let i = 0
+  while (i < n) {
+    out[n - 1 - i] = byte(v >> u64(8 * i))
+    i = i + 1
+  }
+  // Length tag: 00 for 1 byte, 01 for 2, 10 for 4, 11 for 8, in the top two bits.
+  let tag: byte = 0
+  if (n == 2) {
+    tag = 0x40
+  } else if (n == 4) {
+    tag = 0x80
+  } else if (n == 8) {
+    tag = 0xc0
+  }
+  out[0] = out[0] | tag
+  return out
+}
+
+// Decode the QUIC variable-length integer at the start of `data` (RFC 9000 §16),
+// returning its value; any trailing bytes are ignored. Fails on an empty slice or a
+// declared length that runs past the end. Accepts non-minimal encodings, so `0x25`
+// and `0x4025` both decode to 37.
+export function decodeVarint(data: []byte): u64! {
+  let r = quicfrReader{ data: data, pos: 0 }
+  return quicfrReadVarint(r)?
+}
+
+// Append the shortest encoding of the varint `v` to `dst`.
+function quicfrPutVarint(dst: []byte, v: u64): []byte {
+  let out = dst
+  for x of encodeVarint(v) {
+    out = append(out, x)
+  }
+  return out
+}
+
+// Append every byte of `src` to `dst`.
+function quicfrPutBytes(dst: []byte, src: []byte): []byte {
+  let out = dst
+  for x of src {
+    out = append(out, x)
+  }
+  return out
+}
+
+// One ACK Range (RFC 9000 §19.3.1): a `gap` of unacknowledged packets and a
+// `rangeLength` of acknowledged ones, both relative varints in descending order.
+export struct AckRange {
+  export gap: u64
+  export rangeLength: u64
+}
+
+// An ACK frame (RFC 9000 §19.3). `largest` is the largest acknowledged packet
+// number, `delay` the encoded ack delay, `firstRange` the count of packets below
+// `largest` in the first range, and `ranges` the additional gap/range pairs. When
+// `ecn` is set the frame is type 0x03 and carries the three ECN counters.
+export struct AckFrame {
+  export largest: u64
+  export delay: u64
+  export firstRange: u64
+  export ranges: []AckRange
+  export ecn: bool
+  export ect0: u64
+  export ect1: u64
+  export ce: u64
+}
+
+// A STREAM frame (RFC 9000 §19.8). The three low bits of the type select which
+// fields are on the wire: `hasOffset` (OFF, 0x04) adds `offset`, `hasLength` (LEN,
+// 0x02) prefixes `data` with its length — otherwise `data` runs to the end of the
+// packet — and `fin` (FIN, 0x01) marks the end of the stream.
+export struct StreamFrame {
+  export id: u64
+  export offset: u64
+  export data: []byte
+  export hasOffset: bool
+  export hasLength: bool
+  export fin: bool
+}
+
+// One QUIC v1 frame (RFC 9000 §19), a sum over every frame type this version
+// defines. `Padding(n)` is a run of `n` PADDING bytes coalesced into one value.
+// `ConnectionClose` is the transport variant (type 0x1c, with a triggering frame
+// type); `ApplicationClose` is the application variant (type 0x1d, without one).
+export enum Frame {
+  Padding(int)
+  Ping
+  Ack(AckFrame)
+  ResetStream(u64, u64, u64)
+  StopSending(u64, u64)
+  Crypto(u64, []byte)
+  NewToken([]byte)
+  Stream(StreamFrame)
+  MaxData(u64)
+  MaxStreamData(u64, u64)
+  MaxStreams(bool, u64)
+  DataBlocked(u64)
+  StreamDataBlocked(u64, u64)
+  StreamsBlocked(bool, u64)
+  NewConnectionId(u64, u64, []byte, []byte)
+  RetireConnectionId(u64)
+  PathChallenge([]byte)
+  PathResponse([]byte)
+  ConnectionClose(u64, u64, []byte)
+  ApplicationClose(u64, []byte)
+  HandshakeDone
+}
+
+// Serialize the ACK frame `a` (RFC 9000 §19.3): type, Largest Acknowledged, ACK
+// Delay, ACK Range Count, First ACK Range, the gap/length ranges, then the three
+// ECN counts when `a.ecn` is set.
+function quicfrEncodeAck(a: AckFrame): []byte {
+  let out = []byte(0)
+  if (a.ecn) {
+    out = append(out, 0x03)
+  } else {
+    out = append(out, 0x02)
+  }
+  out = quicfrPutVarint(out, a.largest)
+  out = quicfrPutVarint(out, a.delay)
+  out = quicfrPutVarint(out, u64(len(a.ranges)))
+  out = quicfrPutVarint(out, a.firstRange)
+  for rg of a.ranges {
+    out = quicfrPutVarint(out, rg.gap)
+    out = quicfrPutVarint(out, rg.rangeLength)
+  }
+  if (a.ecn) {
+    out = quicfrPutVarint(out, a.ect0)
+    out = quicfrPutVarint(out, a.ect1)
+    out = quicfrPutVarint(out, a.ce)
+  }
+  return out
+}
+
+// Serialize the STREAM frame `s` (RFC 9000 §19.8): the 0x08-based type with its
+// OFF/LEN/FIN bits, the stream id, the optional offset and length, then the data.
+function quicfrEncodeStream(s: StreamFrame): []byte {
+  let typ = 0x08
+  if (s.hasOffset) {
+    typ = typ | 0x04
+  }
+  if (s.hasLength) {
+    typ = typ | 0x02
+  }
+  if (s.fin) {
+    typ = typ | 0x01
+  }
+  let out = []byte(0)
+  out = append(out, byte(typ))
+  out = quicfrPutVarint(out, s.id)
+  if (s.hasOffset) {
+    out = quicfrPutVarint(out, s.offset)
+  }
+  if (s.hasLength) {
+    out = quicfrPutVarint(out, u64(len(s.data)))
+  }
+  return quicfrPutBytes(out, s.data)
+}
+
+// Serialize the NEW_CONNECTION_ID frame (RFC 9000 §19.15): sequence number, retire
+// prior to, the 1-byte connection-id length, the id, then the 16-byte stateless
+// reset token. The id must be 1..20 bytes and the token exactly 16.
+function quicfrEncodeNewConnId(seq: u64, retire: u64, cid: []byte, token: []byte): []byte {
+  assert(len(cid) >= 1 && len(cid) <= 20, "encodeFrame: NEW_CONNECTION_ID length must be 1..20")
+  assert(len(token) == 16, "encodeFrame: stateless reset token must be 16 bytes")
+  let out = []byte(0)
+  out = append(out, 0x18)
+  out = quicfrPutVarint(out, seq)
+  out = quicfrPutVarint(out, retire)
+  out = append(out, byte(len(cid)))
+  out = quicfrPutBytes(out, cid)
+  return quicfrPutBytes(out, token)
+}
+
+// Serialize the CONNECTION_CLOSE transport variant (RFC 9000 §19.19, type 0x1c):
+// error code, the triggering frame type, then the length-prefixed reason phrase.
+function quicfrEncodeConnClose(code: u64, frameType: u64, reason: []byte): []byte {
+  let out = []byte(0)
+  out = append(out, 0x1c)
+  out = quicfrPutVarint(out, code)
+  out = quicfrPutVarint(out, frameType)
+  out = quicfrPutVarint(out, u64(len(reason)))
+  return quicfrPutBytes(out, reason)
+}
+
+// Serialize the CONNECTION_CLOSE application variant (RFC 9000 §19.19, type 0x1d):
+// error code then the length-prefixed reason phrase, with no triggering frame type.
+function quicfrEncodeAppClose(code: u64, reason: []byte): []byte {
+  let out = []byte(0)
+  out = append(out, 0x1d)
+  out = quicfrPutVarint(out, code)
+  out = quicfrPutVarint(out, u64(len(reason)))
+  return quicfrPutBytes(out, reason)
+}
+
+// Append a type byte then a single varint field — the shape shared by MAX_DATA,
+// DATA_BLOCKED, RETIRE_CONNECTION_ID, and the type-selected MAX_STREAMS /
+// STREAMS_BLOCKED frames.
+function quicfrTypeVarint(typ: int, v: u64): []byte {
+  let out = []byte(0)
+  out = append(out, byte(typ))
+  return quicfrPutVarint(out, v)
+}
+
+// Append a type byte then two varint fields — the shape shared by STOP_SENDING,
+// MAX_STREAM_DATA, and STREAM_DATA_BLOCKED.
+function quicfrTypeVarint2(typ: int, a: u64, b: u64): []byte {
+  let out = []byte(0)
+  out = append(out, byte(typ))
+  out = quicfrPutVarint(out, a)
+  return quicfrPutVarint(out, b)
+}
+
+// The wire encoding of a single frame (RFC 9000 §19). `Padding(n)` becomes `n` zero
+// bytes; every other frame is its type byte followed by its type-specific fields.
+export function encodeFrame(f: Frame): []byte {
+  match (f) {
+    Padding(n) => { return []byte(n) }
+    Ping => { return []byte{ 0x01 } }
+    Ack(a) => { return quicfrEncodeAck(a) }
+    ResetStream(id, code, finalSize) => {
+      let out = []byte(0)
+      out = append(out, 0x04)
+      out = quicfrPutVarint(out, id)
+      out = quicfrPutVarint(out, code)
+      return quicfrPutVarint(out, finalSize)
+    }
+    StopSending(id, code) => { return quicfrTypeVarint2(0x05, id, code) }
+    Crypto(offset, data) => {
+      let out = []byte(0)
+      out = append(out, 0x06)
+      out = quicfrPutVarint(out, offset)
+      out = quicfrPutVarint(out, u64(len(data)))
+      return quicfrPutBytes(out, data)
+    }
+    NewToken(token) => {
+      let out = []byte(0)
+      out = append(out, 0x07)
+      out = quicfrPutVarint(out, u64(len(token)))
+      return quicfrPutBytes(out, token)
+    }
+    Stream(s) => { return quicfrEncodeStream(s) }
+    MaxData(max) => { return quicfrTypeVarint(0x10, max) }
+    MaxStreamData(id, max) => { return quicfrTypeVarint2(0x11, id, max) }
+    MaxStreams(bidi, max) => {
+      if (bidi) {
+        return quicfrTypeVarint(0x12, max)
+      }
+      return quicfrTypeVarint(0x13, max)
+    }
+    DataBlocked(max) => { return quicfrTypeVarint(0x14, max) }
+    StreamDataBlocked(id, max) => { return quicfrTypeVarint2(0x15, id, max) }
+    StreamsBlocked(bidi, max) => {
+      if (bidi) {
+        return quicfrTypeVarint(0x16, max)
+      }
+      return quicfrTypeVarint(0x17, max)
+    }
+    NewConnectionId(seq, retire, cid, token) => { return quicfrEncodeNewConnId(seq, retire, cid, token) }
+    RetireConnectionId(seq) => { return quicfrTypeVarint(0x19, seq) }
+    PathChallenge(data) => {
+      let out = []byte(0)
+      out = append(out, 0x1a)
+      return quicfrPutBytes(out, data)
+    }
+    PathResponse(data) => {
+      let out = []byte(0)
+      out = append(out, 0x1b)
+      return quicfrPutBytes(out, data)
+    }
+    ConnectionClose(code, frameType, reason) => { return quicfrEncodeConnClose(code, frameType, reason) }
+    ApplicationClose(code, reason) => { return quicfrEncodeAppClose(code, reason) }
+    HandshakeDone => { return []byte{ 0x1e } }
+  }
+}
+
+// The concatenated wire encoding of `frames`, in order.
+export function encodeFrames(frames: []Frame): []byte {
+  let out = []byte(0)
+  for f of frames {
+    out = quicfrPutBytes(out, encodeFrame(f))
+  }
+  return out
+}
+
+// Coalesce a run of PADDING (RFC 9000 §19.1): the leading 0x00 is already consumed,
+// so start the count at one and swallow every further zero byte.
+function quicfrParsePadding(r: quicfrReader): Frame {
+  let count = 1
+  while (r.pos < len(r.data) && r.data[r.pos] == 0) {
+    count = count + 1
+    r.pos = r.pos + 1
+  }
+  return Frame.Padding(count)
+}
+
+// Parse the body of an ACK frame after its type; `ecn` says whether the ECN counts
+// follow (type 0x03). Fails if any declared length runs past the buffer.
+function quicfrParseAck(r: quicfrReader, ecn: bool): Frame! {
+  let largest = quicfrReadVarint(r)?
+  let delay = quicfrReadVarint(r)?
+  let count = quicfrReadVarint(r)?
+  let firstRange = quicfrReadVarint(r)?
+  let ranges = []AckRange(0)
+  let i: u64 = 0
+  while (i < count) {
+    let gap = quicfrReadVarint(r)?
+    let rangeLength = quicfrReadVarint(r)?
+    ranges = append(ranges, AckRange{ gap: gap, rangeLength: rangeLength })
+    i = i + 1
+  }
+  let ect0: u64 = 0
+  let ect1: u64 = 0
+  let ce: u64 = 0
+  if (ecn) {
+    ect0 = quicfrReadVarint(r)?
+    ect1 = quicfrReadVarint(r)?
+    ce = quicfrReadVarint(r)?
+  }
+  return Frame.Ack(AckFrame{
+    largest: largest,
+    delay: delay,
+    firstRange: firstRange,
+    ranges: ranges,
+    ecn: ecn,
+    ect0: ect0,
+    ect1: ect1,
+    ce: ce,
+  })
+}
+
+// Parse the body of a STREAM frame whose type low bits are already decoded into the
+// OFF/LEN/FIN flags. With LEN clear, the data runs to the end of the buffer.
+function quicfrParseStream(r: quicfrReader, hasOffset: bool, hasLength: bool, fin: bool): Frame! {
+  let id = quicfrReadVarint(r)?
+  let offset: u64 = 0
+  if (hasOffset) {
+    offset = quicfrReadVarint(r)?
+  }
+  let data = []byte(0)
+  if (hasLength) {
+    let n = quicfrReadVarint(r)?
+    data = quicfrReadBytes(r, int(n))?
+  } else {
+    data = quicfrReadBytes(r, len(r.data) - r.pos)?
+  }
+  return Frame.Stream(StreamFrame{
+    id: id,
+    offset: offset,
+    data: data,
+    hasOffset: hasOffset,
+    hasLength: hasLength,
+    fin: fin,
+  })
+}
+
+// Parse a NEW_CONNECTION_ID frame body (RFC 9000 §19.15). Rejects a connection-id
+// length outside 1..20, as the spec requires.
+function quicfrParseNewConnId(r: quicfrReader): Frame! {
+  let seq = quicfrReadVarint(r)?
+  let retire = quicfrReadVarint(r)?
+  let cidLen = quicfrReadU8(r)?
+  if (cidLen < 1 || cidLen > 20) {
+    fail newError("quic: NEW_CONNECTION_ID length must be 1..20")
+  }
+  let cid = quicfrReadBytes(r, cidLen)?
+  let token = quicfrReadBytes(r, 16)?
+  return Frame.NewConnectionId(seq, retire, cid, token)
+}
+
+// Parse one frame at the cursor (RFC 9000 §19), dispatching on the type varint.
+// Fails on an unknown type or any truncated field.
+function quicfrParseOne(r: quicfrReader): Frame! {
+  let t = quicfrReadVarint(r)?
+  let ty = int(t)
+  if (ty == 0x00) {
+    return quicfrParsePadding(r)
+  }
+  if (ty == 0x01) {
+    return Frame.Ping
+  }
+  if (ty == 0x02 || ty == 0x03) {
+    return quicfrParseAck(r, ty == 0x03)?
+  }
+  if (ty == 0x04) {
+    let id = quicfrReadVarint(r)?
+    let code = quicfrReadVarint(r)?
+    let finalSize = quicfrReadVarint(r)?
+    return Frame.ResetStream(id, code, finalSize)
+  }
+  if (ty == 0x05) {
+    let id = quicfrReadVarint(r)?
+    let code = quicfrReadVarint(r)?
+    return Frame.StopSending(id, code)
+  }
+  if (ty == 0x06) {
+    let offset = quicfrReadVarint(r)?
+    let n = quicfrReadVarint(r)?
+    let data = quicfrReadBytes(r, int(n))?
+    return Frame.Crypto(offset, data)
+  }
+  if (ty == 0x07) {
+    let n = quicfrReadVarint(r)?
+    let token = quicfrReadBytes(r, int(n))?
+    return Frame.NewToken(token)
+  }
+  if (ty >= 0x08 && ty <= 0x0f) {
+    return quicfrParseStream(r, (ty & 0x04) != 0, (ty & 0x02) != 0, (ty & 0x01) != 0)?
+  }
+  if (ty == 0x10) {
+    return Frame.MaxData(quicfrReadVarint(r)?)
+  }
+  if (ty == 0x11) {
+    let id = quicfrReadVarint(r)?
+    let max = quicfrReadVarint(r)?
+    return Frame.MaxStreamData(id, max)
+  }
+  if (ty == 0x12 || ty == 0x13) {
+    return Frame.MaxStreams(ty == 0x12, quicfrReadVarint(r)?)
+  }
+  if (ty == 0x14) {
+    return Frame.DataBlocked(quicfrReadVarint(r)?)
+  }
+  if (ty == 0x15) {
+    let id = quicfrReadVarint(r)?
+    let max = quicfrReadVarint(r)?
+    return Frame.StreamDataBlocked(id, max)
+  }
+  if (ty == 0x16 || ty == 0x17) {
+    return Frame.StreamsBlocked(ty == 0x16, quicfrReadVarint(r)?)
+  }
+  if (ty == 0x18) {
+    return quicfrParseNewConnId(r)?
+  }
+  if (ty == 0x19) {
+    return Frame.RetireConnectionId(quicfrReadVarint(r)?)
+  }
+  if (ty == 0x1a) {
+    return Frame.PathChallenge(quicfrReadBytes(r, 8)?)
+  }
+  if (ty == 0x1b) {
+    return Frame.PathResponse(quicfrReadBytes(r, 8)?)
+  }
+  if (ty == 0x1c) {
+    let code = quicfrReadVarint(r)?
+    let frameType = quicfrReadVarint(r)?
+    let n = quicfrReadVarint(r)?
+    let reason = quicfrReadBytes(r, int(n))?
+    return Frame.ConnectionClose(code, frameType, reason)
+  }
+  if (ty == 0x1d) {
+    let code = quicfrReadVarint(r)?
+    let n = quicfrReadVarint(r)?
+    let reason = quicfrReadBytes(r, int(n))?
+    return Frame.ApplicationClose(code, reason)
+  }
+  if (ty == 0x1e) {
+    return Frame.HandshakeDone
+  }
+  fail newError("quic: unknown frame type ${ty}")
+}
+
+// Parse every frame in `data` in order (RFC 9000 §19), until the buffer is exactly
+// consumed. Fails on an unknown frame type or any field that runs past the end. The
+// loop is bounded: each frame consumes at least one byte, so at most `len(data)`
+// iterations run.
+export function parseFrames(data: []byte): []Frame! {
+  let r = quicfrReader{ data: data, pos: 0 }
+  let out = []Frame(0)
+  let guard = 0
+  while (r.pos < len(data) && guard <= len(data)) {
+    out = append(out, quicfrParseOne(r)?)
+    guard = guard + 1
+  }
+  if (r.pos != len(data)) {
+    fail newError("quic: frames did not consume the whole buffer")
+  }
+  return out
+}
