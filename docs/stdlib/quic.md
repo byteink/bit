@@ -624,3 +624,165 @@ function example(packet: []byte): bool {
   return isVersionNegotiation(packet)
 }
 ```
+## QUIC-TLS
+
+QUIC does not run TLS 1.3 over a TLS record layer (RFC 9001). Instead it carries
+the raw handshake *messages* inside CRYPTO frames and derives its own packet-
+protection keys from the TLS traffic secrets under QUIC-specific HKDF labels. This
+section is that seam: the `quic_transport_parameters` TLS extension codec, the
+per-encryption-level key derivation and key update, and CRYPTO-frame carriage. It
+builds on the [key schedule](tls.md) in `std/tls` (it reuses that module's
+`hkdfExpandLabel`) but touches no TLS record.
+
+Carrying a full handshake to completion additionally needs a `std/tls` hook that
+yields plaintext handshake messages and the traffic secrets as they are derived
+(bypassing record encryption); until then these primitives are complete and
+independently usable, and the QUIC endpoint can already send its own ClientHello
+by stripping the 5-byte record header off `tlsClientStart`'s `hello`.
+
+```bit
+import {
+  defaultTransportParameters,
+  encodeTransportParameters,
+  levelKeys,
+  updateSecret,
+  cryptoFrames,
+  reassembleCryptoFrames,
+  PacketKeys,
+} from "std/quic"
+import { Hash, newSha256 } from "std/crypto"
+
+// The negotiated suite's hash as a `() => Hash`.
+function sha256(): Hash { return newSha256() }
+
+// Our transport parameters, as the quic_transport_parameters extension body.
+function myParameters(): []byte {
+  let tp = defaultTransportParameters()
+  tp.initialMaxData = 1048576
+  tp.initialMaxStreamsBidi = 100
+  return encodeTransportParameters(tp)
+}
+
+// The 1-RTT packet keys for one direction from its application traffic secret,
+// and the next secret after a key update (re-derive the key/iv, keep the hp).
+function oneRttKeys(secret: []byte): PacketKeys {
+  return levelKeys(sha256, secret, 16)
+}
+
+function rollForward(secret: []byte): []byte {
+  return updateSecret(sha256, secret)
+}
+
+// Carry a handshake message in CRYPTO frames and reassemble it in order.
+function carry(handshake: []byte): []byte! {
+  let frames = cryptoFrames(handshake, 0, 1000)
+  return reassembleCryptoFrames(frames, 65536)?
+}
+```
+
+### `quicTransportParametersExtension: int`
+
+The TLS 1.3 extension codepoint (0x0039) carrying the QUIC transport parameters
+(RFC 9001 §8.2). Its extension_data is exactly what `encodeTransportParameters`
+produces.
+
+### `TransportParameters`
+
+The QUIC transport parameters an endpoint sends its peer (RFC 9000 §18.2): the
+flow-control limits, timeouts, and connection ids. Integer parameters hold their
+RFC default (see `defaultTransportParameters`); the byte-string parameters are
+empty when absent, and `disableActiveMigration` is a present-means-true flag.
+
+### `defaultTransportParameters(): TransportParameters`
+
+A `TransportParameters` filled with the RFC 9000 §18.2 defaults (the non-zero
+defaults for `maxUdpPayloadSize`, `ackDelayExponent`, `maxAckDelay`, and
+`activeConnectionIdLimit`, everything else zero or empty). Start here, set the
+parameters that differ, and encode: the codec omits anything left at its default.
+
+### `encodeTransportParameters(tp: TransportParameters): []byte`
+
+Encode `tp` as the `quic_transport_parameters` extension body (RFC 9000 §18.2):
+the id/len/value list in ascending-id order, omitting every parameter equal to
+its default so the wire form is minimal and canonical.
+
+### `decodeTransportParameters(data: []byte): TransportParameters!`
+
+Decode a `quic_transport_parameters` extension body (RFC 9000 §18.2) into a
+`TransportParameters` seeded with the RFC defaults, so an omitted parameter keeps
+its default. Unknown parameter ids are skipped. Fails on a length past the buffer,
+a malformed integer value, or trailing bytes.
+
+### `EncryptionLevel`
+
+The three packet-protection encryption levels of a QUIC connection (RFC 9001 §2):
+`Initial`, `Handshake`, and `OneRtt` — the last being the only level subject to
+key update.
+
+### `levelPacketType(level: EncryptionLevel): int`
+
+The long-header packet type that carries `level` (RFC 9000 §17.2): 0 for Initial,
+2 for Handshake. `OneRtt` is carried in a short-header packet, which has no
+long-header type, so it returns -1.
+
+### `levelKeys(newHash: () => Hash, secret: []byte, keyLen: int): PacketKeys`
+
+The packet-protection key/iv/hp for a Handshake or 1-RTT level, derived from a TLS
+traffic `secret` (RFC 9001 §5.1) with the QUIC labels "quic key", "quic iv" (12
+bytes), and "quic hp". `keyLen` is the AEAD key length (16 for AES-128-GCM, 32 for
+AES-256-GCM and ChaCha20-Poly1305), and the hp key is the same length. `newHash`
+is the negotiated suite's hash. Initial keys instead come from `clientInitialKeys`.
+
+### `updateSecret(newHash: () => Hash, secret: []byte): []byte`
+
+The next-generation 1-RTT secret for a key update (RFC 9001 §6.1):
+`HKDF-Expand-Label(secret, "quic ku", "", Hash.length)`. Re-derive the AEAD key
+and iv from the result with `levelKeys`; the header-protection key is not updated.
+
+### `nextKeyPhase(keyPhase: bool): bool`
+
+The key-phase bit after a key update (RFC 9001 §6.3) — it toggles, so a peer can
+tell which key generation protected a packet. The bit itself is carried in the
+short header (`encodeShortHeader`).
+
+### `cryptoFrames(data: []byte, startOffset: u64, maxChunk: int): []Frame`
+
+Chunk a handshake byte stream into CRYPTO frames (RFC 9000 §19.6), each at most
+`maxChunk` bytes, the first at `startOffset` and each subsequent one at the
+running offset. Ready to place in a packet payload with `encodeFrame`.
+
+### `CryptoAssembler`
+
+A reassembler for the CRYPTO stream (RFC 9000 §19.6): it accepts received CRYPTO
+fragments in any order, with gaps and overlapping retransmits, and yields the
+contiguous ordered byte stream. Build one with `newCryptoAssembler`.
+
+### `newCryptoAssembler(maxLen: int): CryptoAssembler`
+
+A fresh `CryptoAssembler` that accepts data up to `maxLen` bytes total — a bound
+on offset + length across all fragments, so a hostile offset cannot force an
+unbounded allocation.
+
+### `CryptoAssembler.insert(offset: u64, fragment: []byte): ()!`
+
+Insert one CRYPTO fragment: `fragment` bytes at stream `offset` (RFC 9000 §19.6).
+Records the bytes and extends the readable prefix. Overlapping retransmits are
+allowed only if they carry identical bytes; a mismatch, or a fragment past
+`maxLen`, fails.
+
+### `CryptoAssembler.contiguous(): []byte`
+
+The contiguous handshake bytes reassembled so far — the ordered stream from offset
+0 up to the first gap. Grows as later `insert`s fill earlier gaps.
+
+### `CryptoAssembler.contiguousLen(): int`
+
+The length of the contiguous reassembled prefix — `len(contiguous())` without
+materializing the slice.
+
+### `reassembleCryptoFrames(frames: []Frame, maxLen: int): []byte!`
+
+Reassemble the CRYPTO frames in `frames` into the contiguous handshake byte stream
+(RFC 9000 §19.6), ignoring non-CRYPTO frames. Frames may be in any order and may
+overlap; the result is the ordered prefix up to the first gap. `maxLen` bounds the
+buffer. Fails on an over-limit offset or a conflicting overlap.

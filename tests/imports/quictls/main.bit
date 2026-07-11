@@ -1,0 +1,216 @@
+// std/quic QUIC-TLS integration (#1219): transport parameters (RFC 9000 §18.2),
+// encryption-level key derivation and key update (RFC 9001 §5.1/§6.1), and
+// CRYPTO-frame carriage (RFC 9000 §19.6). The transport-parameter encoding is
+// pinned byte-exact; the Handshake/1-RTT key derivation is checked against the
+// RFC 9001 Appendix A.1 sample secret and cross-checked against the Initial-key
+// path; the CRYPTO carriage is round-tripped in order, out of order, with gaps,
+// with overlapping retransmits, and over the real wire codec. All of that is
+// deterministic, so the golden `expected` is stable across targets.
+//
+// The full end-to-end handshake is blocked on a std/tls hook (a record-layer
+// bypass exposing plaintext handshake messages + traffic secrets); what is
+// unblocked — carrying a *real* ClientHello, produced by `tlsClientStart`, in
+// CRYPTO frames — is exercised here, and the blocked piece is marked, not faked.
+import {
+  TransportParameters,
+  defaultTransportParameters,
+  encodeTransportParameters,
+  decodeTransportParameters,
+  EncryptionLevel,
+  levelPacketType,
+  levelKeys,
+  updateSecret,
+  nextKeyPhase,
+  cryptoFrames,
+  reassembleCryptoFrames,
+  newCryptoAssembler,
+  clientInitialKeys,
+  expandLabel,
+  protectPayload,
+  unprotectPayload,
+  Frame,
+  encodeFrame,
+  parseFrames,
+} from "std/quic"
+import { Hash, newSha256, encodeHex, decodeHex, ctEq } from "std/crypto"
+import { tlsClientStart, TlsClientConfig, TlsGroup, GroupKeypair, emptyTrustStore } from "std/tls"
+
+// The suite hash (SHA-256 for the AES-128 / ChaCha20 suites) as a `() => Hash`.
+function sha256(): Hash { return newSha256() }
+
+// The bytes a hex string spells; every input here is valid hex, so the `catch`
+// is unreachable.
+function hx(s: string): []byte {
+  return decodeHex(s) catch e {
+    return []byte(0)
+  }
+}
+
+// "ok"/"bad" for an assertion, so a wrong result flips the golden line, not just
+// the raw hex.
+function okbad(cond: bool): string {
+  if (cond) {
+    return "ok"
+  }
+  return "bad"
+}
+
+// A conflicting overlap (byte 1 is 0x01 in one fragment, 0xff in the other) must
+// be rejected, not silently merged (RFC 9000 §19.6).
+function tryConflict(): string {
+  let frames = [Frame.Crypto(0, hx("0001")), Frame.Crypto(1, hx("ff"))]
+  let r = reassembleCryptoFrames(frames, 1024) catch e {
+    return "rejected"
+  }
+  return "accepted"
+}
+
+// A fragment past the reassembly limit must be rejected (bounded allocation).
+function tryLimit(): string {
+  let frames = [Frame.Crypto(0, hx("00010203"))]
+  let r = reassembleCryptoFrames(frames, 2) catch e {
+    return "rejected"
+  }
+  return "accepted"
+}
+
+// Carry a real ClientHello (from `tlsClientStart`) through CRYPTO frames and
+// back. `hello` is a TLS record; its handshake message is the bytes after the
+// 5-byte record header. The message content is random, so only the round-trip
+// equality is asserted — a stable outcome.
+function clientHelloCarriage(): string! {
+  let cfg = TlsClientConfig{
+    serverName: "example.com",
+    alpn: []string(0),
+    trust: emptyTrustStore(),
+    insecureSkipVerify: true,
+    nowUnix: 0,
+    groups: [TlsGroup.X25519],
+    keyShareGroups: [TlsGroup.X25519],
+    suites: []int(0),
+    clientHelloOverride: []byte(0),
+    ephemeralOverride: []GroupKeypair(0),
+  }
+  let h = tlsClientStart(cfg)?
+  let rec = h.hello
+  let chMsg = rec[5:len(rec)]
+  let frames = cryptoFrames(chMsg, 0, 1000)
+  let back = reassembleCryptoFrames(frames, 100000)?
+  return okbad(len(chMsg) > 0 && ctEq(back, chMsg))
+}
+
+function run(): ()! {
+  // --- Transport parameters (RFC 9000 §18.2), byte-exact ---
+  let tp = defaultTransportParameters()
+  tp.maxIdleTimeout = 5000
+  tp.initialMaxData = 4660
+  tp.initialMaxStreamsBidi = 3
+  tp.initialSourceConnectionId = hx("cafe")
+  let enc = encodeTransportParameters(tp)
+  println("tp_enc=${encodeHex(enc)}")
+  println("tp_kat=${okbad(ctEq(enc, hx("01025388040252340801030f02cafe")))}")
+
+  let dec = decodeTransportParameters(enc)?
+  println("tp_idle=${int(dec.maxIdleTimeout)}")
+  println("tp_data=${int(dec.initialMaxData)}")
+  println("tp_streams=${int(dec.initialMaxStreamsBidi)}")
+  println("tp_scid=${encodeHex(dec.initialSourceConnectionId)}")
+  println("tp_rt=${okbad(ctEq(encodeTransportParameters(dec), enc))}")
+
+  // Defaults are omitted on the wire and refilled on decode.
+  println("tp_defbytes=${len(encodeTransportParameters(defaultTransportParameters()))}")
+  let d = decodeTransportParameters([]byte(0))?
+  println("tp_defudp=${int(d.maxUdpPayloadSize)}")
+  println("tp_defackexp=${int(d.ackDelayExponent)}")
+  println("tp_defackdelay=${int(d.maxAckDelay)}")
+  println("tp_defcidlimit=${int(d.activeConnectionIdLimit)}")
+
+  // An unknown parameter (id 0x21) is skipped, and the rest still parses.
+  let combined = hx("2102beef")
+  for x of enc {
+    combined = append(combined, x)
+  }
+  let du = decodeTransportParameters(combined)?
+  println("tp_unknown=${okbad(du.maxIdleTimeout == 5000 && du.initialMaxData == 4660)}")
+
+  // --- Encryption-level keys (RFC 9001 §5.1) vs the A.1 sample secret ---
+  let csecret = hx("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
+  let lk = levelKeys(sha256, csecret, 16)
+  println("lvl_key=${encodeHex(lk.key)}")
+  println("lvl_iv=${encodeHex(lk.iv)}")
+  println("lvl_hp=${encodeHex(lk.hp)}")
+  // The A.1 client Initial secret is exactly `csecret`, so the generic level
+  // derivation must match the Initial-key path over the A.1 DCID.
+  let ck = clientInitialKeys(hx("8394c8f03e515708"))
+  println("lvl_matches_initial=${okbad(ctEq(lk.key, ck.key) && ctEq(lk.iv, ck.iv) && ctEq(lk.hp, ck.hp))}")
+
+  // --- Encryption-level packet types (RFC 9000 §17.2) ---
+  println("pt_initial=${levelPacketType(EncryptionLevel.Initial)}")
+  println("pt_handshake=${levelPacketType(EncryptionLevel.Handshake)}")
+  println("pt_onertt=${levelPacketType(EncryptionLevel.OneRtt)}")
+
+  // --- Key update (RFC 9001 §6.1) ---
+  let ku = updateSecret(sha256, csecret)
+  println("ku=${encodeHex(ku)}")
+  // Label wiring: `updateSecret` must agree with the independent SHA-256
+  // HKDF-Expand-Label in packet.bit for the "quic ku" label.
+  println("ku_label=${okbad(ctEq(ku, expandLabel(csecret, "quic ku", 32)))}")
+  // The updated secret keys a working AEAD (seal then open round-trips).
+  let kk = levelKeys(sha256, ku, 16)
+  let header = hx("c0000000010800")
+  let msg = hx("48656c6c6f")
+  let sealed = protectPayload(kk, 0, header, msg)?
+  let opened = unprotectPayload(kk, 0, header, sealed)?
+  println("ku_aead=${okbad(ctEq(opened, msg))}")
+  println("kp=${okbad(nextKeyPhase(false) && !nextKeyPhase(true))}")
+
+  // --- CRYPTO-frame carriage (RFC 9000 §19.6) ---
+  let stream = hx("00010203040506070809")
+  let frames = cryptoFrames(stream, 0, 4)
+  println("crypto_chunks=${len(frames)}")
+  println("crypto_inorder=${encodeHex(reassembleCryptoFrames(frames, 1024)?)}")
+
+  let ooo = [Frame.Crypto(8, hx("0809")), Frame.Crypto(0, hx("00010203")), Frame.Crypto(4, hx("04050607"))]
+  println("crypto_ooo=${encodeHex(reassembleCryptoFrames(ooo, 1024)?)}")
+
+  let gap = [Frame.Crypto(0, hx("00010203")), Frame.Crypto(8, hx("0809"))]
+  let ga = reassembleCryptoFrames(gap, 1024)?
+  println("crypto_gap_len=${len(ga)}")
+  println("crypto_gap=${encodeHex(ga)}")
+
+  // Round-trip over the real wire codec: chunk, encode a payload of frames,
+  // parse it back, reassemble.
+  let payload = []byte(0)
+  for f of frames {
+    for b of encodeFrame(f) {
+      payload = append(payload, b)
+    }
+  }
+  let parsed = parseFrames(payload)?
+  println("crypto_wire=${encodeHex(reassembleCryptoFrames(parsed, 1024)?)}")
+
+  // Overlapping retransmits carrying identical bytes reassemble cleanly.
+  let ov = [Frame.Crypto(0, hx("0001020304")), Frame.Crypto(3, hx("0304050607")), Frame.Crypto(8, hx("0809"))]
+  println("crypto_overlap=${encodeHex(reassembleCryptoFrames(ov, 1024)?)}")
+
+  println("crypto_conflict=${tryConflict()}")
+  println("crypto_limit=${tryLimit()}")
+
+  // Direct assembler use: a fragment at offset 4 leaves nothing readable until
+  // the 0..4 gap is filled.
+  let asm = newCryptoAssembler(64)
+  asm.insert(4, hx("aabb"))?
+  println("asm_gap=${asm.contiguousLen()}")
+  asm.insert(0, hx("00010203"))?
+  println("asm_full=${encodeHex(asm.contiguous())}")
+
+  // --- Real ClientHello carriage (partial loopback), then the blocked e2e ---
+  println("clienthello_carriage=${clientHelloCarriage()?}")
+  println("e2e=blocked-on-tls-hook")
+}
+
+function main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
+}

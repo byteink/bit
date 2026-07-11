@@ -1,0 +1,507 @@
+// Bit standard library — quic module, QUIC-TLS integration (RFC 9001, #1219).
+//
+// This file is the seam between the TLS 1.3 handshake (`std/tls`) and the QUIC
+// packet/frame layer (`packet.bit` + `frames.bit`, the same flat module). QUIC
+// does not run TLS over a TLS record layer; instead it (RFC 9001):
+//
+//   * carries the raw handshake *messages* — ClientHello, EncryptedExtensions,
+//     Certificate, … — inside CRYPTO frames rather than TLS records (§4), and
+//   * derives its own packet-protection keys from the TLS traffic secrets with
+//     HKDF-Expand-Label under QUIC-specific labels ("quic key"/"quic iv"/"quic
+//     hp", and "quic ku" for a key update) instead of "key"/"iv" (§5.1, §6.1).
+//
+// Four pieces live here, none of which touch the TLS record layer:
+//
+//   * **Transport parameters** (RFC 9000 §18.2) — the `quic_transport_parameters`
+//     TLS extension (codepoint 0x0039) whose body is a varint-prefixed id/len/
+//     value list. `encodeTransportParameters`/`decodeTransportParameters` are a
+//     pure codec over `TransportParameters`, emitting a parameter only when it
+//     differs from its RFC default and refilling defaults on decode, so a
+//     round-trip is exact and the wire form is minimal.
+//
+//   * **Encryption-level keys** (§5.1). `EncryptionLevel` models Initial /
+//     Handshake / 1-RTT. Initial keys come from `packet.bit`'s DCID path;
+//     Handshake and 1-RTT keys come from a TLS traffic secret via `levelKeys`,
+//     which is HKDF-Expand-Label with the QUIC labels and is generic over the
+//     negotiated suite's hash (SHA-256 or SHA-384), reusing `std/tls`'s
+//     `hkdfExpandLabel` so there is exactly one implementation of that KDF.
+//
+//   * **Key update** (§6.1). `updateSecret` rolls a 1-RTT secret forward under
+//     "quic ku"; `nextKeyPhase` flips the key-phase bit that signals it on the
+//     wire (the bit itself is read/written by `packet.bit`'s short header).
+//
+//   * **CRYPTO-frame carriage** (§4, RFC 9000 §19.6). `cryptoFrames` chunks a
+//     handshake byte stream into CRYPTO frames at a given offset;
+//     `CryptoAssembler` reassembles received CRYPTO frames — in any order, with
+//     gaps and overlapping retransmits — back into the contiguous ordered stream.
+//
+// std/quic is one flat module, so this file calls `packet.bit` (`PacketKeys`,
+// `clientInitialKeys`, …) and `frames.bit` (`Frame`, `encodeVarint`, the
+// `quicfr*` cursor helpers) directly; its own private free functions are
+// prefixed `quictls`. The one cross-module import is `std/tls`'s
+// `hkdfExpandLabel`; `Hash`/`newSha256` are already imported by `packet.bit`
+// into this module's shared namespace.
+//
+// What still needs a std/tls hook. Carrying a *real* handshake to completion
+// needs the plaintext handshake *messages* and the traffic secrets as std/tls
+// derives them. Today `tlsClientStart`/`tlsServerStart` emit record-framed,
+// AEAD-encrypted flights and keep `clientHandshakeTrafficSecret` /
+// `serverHandshakeTrafficSecret` / the application secrets private, so QUIC can
+// send its own ClientHello (strip the 5-byte record header off `hello`) but
+// cannot yet consume a server flight or key the Handshake/1-RTT levels. The
+// missing hook is a record-layer-bypassing handshake variant — see the module
+// docs — after which these primitives complete an end-to-end QUIC handshake.
+
+import { hkdfExpandLabel } from "std/tls"
+
+// ---------------------------------------------------------------------------
+// Transport parameters (RFC 9000 §18.2)
+// ---------------------------------------------------------------------------
+
+// The TLS 1.3 extension codepoint carrying the QUIC transport parameters (RFC
+// 9001 §8.2): `quic_transport_parameters`. Its extension_data is exactly the
+// byte string `encodeTransportParameters` produces.
+export const quicTransportParametersExtension: int = 0x0039
+
+// Transport-parameter ids (RFC 9000 §18.2). Only the codec-relevant ones are
+// modeled; preferred_address (0x0d) and any unknown id are passed over on decode
+// as the RFC requires.
+const quictlsTpOriginalDcid: int = 0x00
+const quictlsTpMaxIdleTimeout: int = 0x01
+const quictlsTpStatelessResetToken: int = 0x02
+const quictlsTpMaxUdpPayloadSize: int = 0x03
+const quictlsTpInitialMaxData: int = 0x04
+const quictlsTpInitialMaxStreamDataBidiLocal: int = 0x05
+const quictlsTpInitialMaxStreamDataBidiRemote: int = 0x06
+const quictlsTpInitialMaxStreamDataUni: int = 0x07
+const quictlsTpInitialMaxStreamsBidi: int = 0x08
+const quictlsTpInitialMaxStreamsUni: int = 0x09
+const quictlsTpAckDelayExponent: int = 0x0a
+const quictlsTpMaxAckDelay: int = 0x0b
+const quictlsTpDisableActiveMigration: int = 0x0c
+const quictlsTpActiveConnectionIdLimit: int = 0x0e
+const quictlsTpInitialSourceConnectionId: int = 0x0f
+const quictlsTpRetrySourceConnectionId: int = 0x10
+
+// The RFC 9000 §18.2 defaults for the parameters whose default is not zero. A
+// peer that omits one of these means "use this value", so the codec omits a
+// parameter equal to its default and refills it on decode. Declared `int` and
+// widened with `u64(...)` at each use: a `u64`-typed constant is currently
+// miscompiled in a comparison (its literal keeps i64 in the IR), so the widen
+// is load-bearing, not cosmetic.
+const quictlsDefaultMaxUdpPayloadSize: int = 65527
+const quictlsDefaultAckDelayExponent: int = 3
+const quictlsDefaultMaxAckDelay: int = 25
+const quictlsDefaultActiveConnectionIdLimit: int = 2
+
+// The QUIC transport parameters an endpoint sends its peer (RFC 9000 §18.2).
+// Integer parameters carry their RFC default (see `defaultTransportParameters`);
+// the byte-string parameters are empty when absent. `disableActiveMigration` is
+// a bare flag: present-means-true.
+export struct TransportParameters {
+  export originalDestinationConnectionId: []byte,
+  export maxIdleTimeout: u64,
+  export statelessResetToken: []byte,
+  export maxUdpPayloadSize: u64,
+  export initialMaxData: u64,
+  export initialMaxStreamDataBidiLocal: u64,
+  export initialMaxStreamDataBidiRemote: u64,
+  export initialMaxStreamDataUni: u64,
+  export initialMaxStreamsBidi: u64,
+  export initialMaxStreamsUni: u64,
+  export ackDelayExponent: u64,
+  export maxAckDelay: u64,
+  export disableActiveMigration: bool,
+  export activeConnectionIdLimit: u64,
+  export initialSourceConnectionId: []byte,
+  export retrySourceConnectionId: []byte,
+}
+
+// A `TransportParameters` filled with the RFC 9000 §18.2 default values: the
+// non-zero defaults for `maxUdpPayloadSize`, `ackDelayExponent`, `maxAckDelay`,
+// and `activeConnectionIdLimit`, everything else zero or empty. Start here and
+// set the parameters that differ; `encodeTransportParameters` then emits only
+// those, and `decodeTransportParameters` returns this refilled with what it read.
+export function defaultTransportParameters(): TransportParameters {
+  return TransportParameters{
+    originalDestinationConnectionId: []byte(0),
+    maxIdleTimeout: 0,
+    statelessResetToken: []byte(0),
+    maxUdpPayloadSize: u64(quictlsDefaultMaxUdpPayloadSize),
+    initialMaxData: 0,
+    initialMaxStreamDataBidiLocal: 0,
+    initialMaxStreamDataBidiRemote: 0,
+    initialMaxStreamDataUni: 0,
+    initialMaxStreamsBidi: 0,
+    initialMaxStreamsUni: 0,
+    ackDelayExponent: u64(quictlsDefaultAckDelayExponent),
+    maxAckDelay: u64(quictlsDefaultMaxAckDelay),
+    disableActiveMigration: false,
+    activeConnectionIdLimit: u64(quictlsDefaultActiveConnectionIdLimit),
+    initialSourceConnectionId: []byte(0),
+    retrySourceConnectionId: []byte(0),
+  }
+}
+
+// Append one integer transport parameter (RFC 9000 §18.1): the id, then the
+// length of the value's varint encoding, then the value as a varint.
+function quictlsPutIntParam(dst: []byte, id: int, value: u64): []byte {
+  let out = quicfrPutVarint(dst, u64(id))
+  out = quicfrPutVarint(out, u64(varintSize(value)))
+  return quicfrPutVarint(out, value)
+}
+
+// Append one byte-string transport parameter (RFC 9000 §18.1): the id, the byte
+// length, then the raw bytes (a connection id or the stateless reset token).
+function quictlsPutBytesParam(dst: []byte, id: int, value: []byte): []byte {
+  let out = quicfrPutVarint(dst, u64(id))
+  out = quicfrPutVarint(out, u64(len(value)))
+  return quicfrPutBytes(out, value)
+}
+
+// Append one zero-length flag parameter (RFC 9000 §18.2): the id then a zero
+// length — used only by `disable_active_migration`, whose mere presence is the
+// value.
+function quictlsPutFlagParam(dst: []byte, id: int): []byte {
+  let out = quicfrPutVarint(dst, u64(id))
+  return quicfrPutVarint(out, 0)
+}
+
+// Encode `tp` as the `quic_transport_parameters` extension body (RFC 9000
+// §18.2): the id/len/value list, in ascending-id order, omitting every parameter
+// equal to its default so the encoding is minimal and canonical. The result is
+// the extension_data a TLS ClientHello/EncryptedExtensions carries under
+// codepoint `quicTransportParametersExtension`.
+export function encodeTransportParameters(tp: TransportParameters): []byte {
+  let out = []byte(0)
+  if (len(tp.originalDestinationConnectionId) > 0) {
+    out = quictlsPutBytesParam(out, quictlsTpOriginalDcid, tp.originalDestinationConnectionId)
+  }
+  if (tp.maxIdleTimeout != 0) {
+    out = quictlsPutIntParam(out, quictlsTpMaxIdleTimeout, tp.maxIdleTimeout)
+  }
+  if (len(tp.statelessResetToken) > 0) {
+    out = quictlsPutBytesParam(out, quictlsTpStatelessResetToken, tp.statelessResetToken)
+  }
+  if (tp.maxUdpPayloadSize != u64(quictlsDefaultMaxUdpPayloadSize)) {
+    out = quictlsPutIntParam(out, quictlsTpMaxUdpPayloadSize, tp.maxUdpPayloadSize)
+  }
+  if (tp.initialMaxData != 0) {
+    out = quictlsPutIntParam(out, quictlsTpInitialMaxData, tp.initialMaxData)
+  }
+  if (tp.initialMaxStreamDataBidiLocal != 0) {
+    out = quictlsPutIntParam(out, quictlsTpInitialMaxStreamDataBidiLocal, tp.initialMaxStreamDataBidiLocal)
+  }
+  if (tp.initialMaxStreamDataBidiRemote != 0) {
+    out = quictlsPutIntParam(out, quictlsTpInitialMaxStreamDataBidiRemote, tp.initialMaxStreamDataBidiRemote)
+  }
+  if (tp.initialMaxStreamDataUni != 0) {
+    out = quictlsPutIntParam(out, quictlsTpInitialMaxStreamDataUni, tp.initialMaxStreamDataUni)
+  }
+  if (tp.initialMaxStreamsBidi != 0) {
+    out = quictlsPutIntParam(out, quictlsTpInitialMaxStreamsBidi, tp.initialMaxStreamsBidi)
+  }
+  if (tp.initialMaxStreamsUni != 0) {
+    out = quictlsPutIntParam(out, quictlsTpInitialMaxStreamsUni, tp.initialMaxStreamsUni)
+  }
+  if (tp.ackDelayExponent != u64(quictlsDefaultAckDelayExponent)) {
+    out = quictlsPutIntParam(out, quictlsTpAckDelayExponent, tp.ackDelayExponent)
+  }
+  if (tp.maxAckDelay != u64(quictlsDefaultMaxAckDelay)) {
+    out = quictlsPutIntParam(out, quictlsTpMaxAckDelay, tp.maxAckDelay)
+  }
+  if (tp.disableActiveMigration) {
+    out = quictlsPutFlagParam(out, quictlsTpDisableActiveMigration)
+  }
+  if (tp.activeConnectionIdLimit != u64(quictlsDefaultActiveConnectionIdLimit)) {
+    out = quictlsPutIntParam(out, quictlsTpActiveConnectionIdLimit, tp.activeConnectionIdLimit)
+  }
+  if (len(tp.initialSourceConnectionId) > 0) {
+    out = quictlsPutBytesParam(out, quictlsTpInitialSourceConnectionId, tp.initialSourceConnectionId)
+  }
+  if (len(tp.retrySourceConnectionId) > 0) {
+    out = quictlsPutBytesParam(out, quictlsTpRetrySourceConnectionId, tp.retrySourceConnectionId)
+  }
+  return out
+}
+
+// Set the parameter with id `id` on `tp` from its `value` bytes (RFC 9000
+// §18.2). Integer parameters decode their value as a varint; byte-string
+// parameters keep the raw bytes; `disable_active_migration` sets the flag. An
+// unknown id is ignored (`value` is already consumed by the caller), as an
+// endpoint must (RFC 9000 §7.4.2). `tp` is a struct — a reference — so the
+// assignment is seen by the caller.
+function quictlsApplyParam(tp: TransportParameters, id: int, value: []byte): ()! {
+  if (id == quictlsTpOriginalDcid) {
+    tp.originalDestinationConnectionId = value
+  } else if (id == quictlsTpMaxIdleTimeout) {
+    tp.maxIdleTimeout = decodeVarint(value)?
+  } else if (id == quictlsTpStatelessResetToken) {
+    tp.statelessResetToken = value
+  } else if (id == quictlsTpMaxUdpPayloadSize) {
+    tp.maxUdpPayloadSize = decodeVarint(value)?
+  } else if (id == quictlsTpInitialMaxData) {
+    tp.initialMaxData = decodeVarint(value)?
+  } else if (id == quictlsTpInitialMaxStreamDataBidiLocal) {
+    tp.initialMaxStreamDataBidiLocal = decodeVarint(value)?
+  } else if (id == quictlsTpInitialMaxStreamDataBidiRemote) {
+    tp.initialMaxStreamDataBidiRemote = decodeVarint(value)?
+  } else if (id == quictlsTpInitialMaxStreamDataUni) {
+    tp.initialMaxStreamDataUni = decodeVarint(value)?
+  } else if (id == quictlsTpInitialMaxStreamsBidi) {
+    tp.initialMaxStreamsBidi = decodeVarint(value)?
+  } else if (id == quictlsTpInitialMaxStreamsUni) {
+    tp.initialMaxStreamsUni = decodeVarint(value)?
+  } else if (id == quictlsTpAckDelayExponent) {
+    tp.ackDelayExponent = decodeVarint(value)?
+  } else if (id == quictlsTpMaxAckDelay) {
+    tp.maxAckDelay = decodeVarint(value)?
+  } else if (id == quictlsTpDisableActiveMigration) {
+    tp.disableActiveMigration = true
+  } else if (id == quictlsTpActiveConnectionIdLimit) {
+    tp.activeConnectionIdLimit = decodeVarint(value)?
+  } else if (id == quictlsTpInitialSourceConnectionId) {
+    tp.initialSourceConnectionId = value
+  } else if (id == quictlsTpRetrySourceConnectionId) {
+    tp.retrySourceConnectionId = value
+  }
+}
+
+// Decode a `quic_transport_parameters` extension body (RFC 9000 §18.2) into a
+// `TransportParameters` seeded with the RFC defaults, so any parameter the peer
+// omitted keeps its default. Reads the id/len/value list to the end; unknown
+// parameters are skipped. Fails on a length that runs past the buffer, a
+// malformed integer value, or trailing bytes — a parameter parser faces hostile
+// input, so it is strict. Bounded: every entry consumes at least two bytes, so
+// at most `len(data)` iterations run.
+export function decodeTransportParameters(data: []byte): TransportParameters! {
+  let tp = defaultTransportParameters()
+  let r = quicfrReader{ data: data, pos: 0 }
+  let guard = 0
+  while (r.pos < len(data) && guard <= len(data)) {
+    guard = guard + 1
+    let id = quicfrReadVarint(r)?
+    let length = quicfrReadVarint(r)?
+    let value = quicfrReadBytes(r, int(length))?
+    quictlsApplyParam(tp, int(id), value)?
+  }
+  if (r.pos != len(data)) {
+    fail newError("quic: transport parameters did not consume the whole buffer")
+  }
+  return tp
+}
+
+// ---------------------------------------------------------------------------
+// Encryption levels and key derivation (RFC 9001 §5.1, §6.1)
+// ---------------------------------------------------------------------------
+
+// The three packet-protection encryption levels of a QUIC connection (RFC 9001
+// §2): `Initial` (keyed from the client DCID), `Handshake` (keyed from the TLS
+// handshake traffic secrets), and `OneRtt` (keyed from the TLS application
+// traffic secrets, and the only level subject to key update).
+export enum EncryptionLevel {
+  Initial
+  Handshake
+  OneRtt
+}
+
+// The long-header packet type that carries `level` (RFC 9000 §17.2): Initial is
+// type 0 and Handshake is type 2. `OneRtt` is carried in a short-header (1-RTT)
+// packet, which has no long-header type, so this returns -1 for it.
+export function levelPacketType(level: EncryptionLevel): int {
+  match (level) {
+    Initial => { return longInitial }
+    Handshake => { return longHandshake }
+    OneRtt => { return -1 }
+  }
+}
+
+// The packet-protection key/iv/hp for a non-Initial level, derived from a TLS
+// traffic `secret` (RFC 9001 §5.1): HKDF-Expand-Label with the QUIC labels "quic
+// key", "quic iv" (always 12 bytes), and "quic hp". `keyLen` is the AEAD key
+// length — 16 for AES-128-GCM, 32 for AES-256-GCM and ChaCha20-Poly1305 — and
+// the header-protection key is the same length. `newHash` is the negotiated
+// suite's hash constructor (SHA-256 or SHA-384), so this is correct for every
+// v1 suite. Initial keys instead come from `clientInitialKeys`/`serverInitialKeys`.
+export function levelKeys(newHash: () => Hash, secret: []byte, keyLen: int): PacketKeys {
+  return PacketKeys{
+    key: hkdfExpandLabel(newHash, secret, "quic key", []byte(0), keyLen),
+    iv: hkdfExpandLabel(newHash, secret, "quic iv", []byte(0), 12),
+    hp: hkdfExpandLabel(newHash, secret, "quic hp", []byte(0), keyLen),
+  }
+}
+
+// The next-generation 1-RTT secret for a key update (RFC 9001 §6.1):
+// `HKDF-Expand-Label(secret, "quic ku", "", Hash.length)`. The header-protection
+// key is *not* updated, so re-derive only the AEAD key and iv from the result
+// (with `levelKeys`, keeping the previous hp). `newHash` is the suite hash; the
+// output is one digest long, matching the input secret's length.
+export function updateSecret(newHash: () => Hash, secret: []byte): []byte {
+  return hkdfExpandLabel(newHash, secret, "quic ku", []byte(0), len(secret))
+}
+
+// The key phase after a key update (RFC 9001 §6.3): the single bit that toggles
+// so a peer can tell which generation of 1-RTT keys protected a packet. The bit
+// itself is carried in the short header (see `encodeShortHeader`); this just
+// flips it.
+export function nextKeyPhase(keyPhase: bool): bool {
+  return !keyPhase
+}
+
+// ---------------------------------------------------------------------------
+// CRYPTO-frame carriage (RFC 9001 §4, RFC 9000 §19.6)
+// ---------------------------------------------------------------------------
+
+// Chunk a handshake byte stream into CRYPTO frames (RFC 9000 §19.6), each at
+// most `maxChunk` bytes, the first at `startOffset` and each subsequent one at
+// the running offset. Returns the frames in order, ready to place in a packet
+// payload with `encodeFrame`/`encodeFrames`. An empty `data` yields no frames.
+// `maxChunk` must be at least 1; the loop is then bounded by `len(data)`.
+export function cryptoFrames(data: []byte, startOffset: u64, maxChunk: int): []Frame {
+  assert(maxChunk >= 1, "cryptoFrames: maxChunk must be at least 1")
+  let out = []Frame(0)
+  let pos = 0
+  let guard = 0
+  while (pos < len(data) && guard <= len(data)) {
+    guard = guard + 1
+    let end = pos + maxChunk
+    if (end > len(data)) {
+      end = len(data)
+    }
+    out = append(out, Frame.Crypto(startOffset + u64(pos), data[pos:end]))
+    pos = end
+  }
+  return out
+}
+
+// Reassembles the CRYPTO stream from received CRYPTO frames (RFC 9000 §19.6):
+// fragments may arrive out of order, with gaps, or as overlapping retransmits.
+// `data` holds the bytes received so far (grown to the highest offset seen),
+// `have` marks which of those bytes have arrived (0 = missing, 1 = present),
+// `readable` is the length of the contiguous prefix from offset 0, and `maxLen`
+// caps the buffer so a hostile offset cannot force an unbounded allocation.
+// Build one with `newCryptoAssembler`.
+export struct CryptoAssembler {
+  data: []byte,
+  have: []byte,
+  readable: int,
+  maxLen: int,
+}
+
+// A fresh CRYPTO reassembler that accepts data up to `maxLen` bytes total (a
+// bound on offset + length across all fragments). Size it to the handshake
+// budget an endpoint will accept; a fragment beyond it fails `insert`.
+export function newCryptoAssembler(maxLen: int): CryptoAssembler {
+  return CryptoAssembler{ data: []byte(0), have: []byte(0), readable: 0, maxLen: maxLen }
+}
+
+// Grow the backing buffers so index `n-1` is addressable, preserving the bytes
+// and presence flags already recorded. A no-op when they are already large
+// enough.
+function (a: CryptoAssembler) quictlsGrowTo(n: int) {
+  if (n <= len(a.data)) {
+    return
+  }
+  let nd = []byte(n)
+  let nh = []byte(n)
+  let i = 0
+  while (i < len(a.data)) {
+    nd[i] = a.data[i]
+    nh[i] = a.have[i]
+    i = i + 1
+  }
+  a.data = nd
+  a.have = nh
+}
+
+// Advance `readable` over every contiguous present byte from where it stands.
+// Bounded by the buffer length, since `readable` only increases.
+function (a: CryptoAssembler) quictlsAdvance() {
+  let guard = 0
+  while (a.readable < len(a.have) && a.have[a.readable] != 0 && guard <= len(a.have)) {
+    a.readable = a.readable + 1
+    guard = guard + 1
+  }
+}
+
+// Insert one CRYPTO fragment: `fragment` bytes at stream `offset` (RFC 9000
+// §19.6). Records the bytes, marks them present, and extends the readable
+// prefix. Overlapping retransmits are allowed only if they carry identical bytes
+// (as the spec guarantees); a mismatch fails. Fails if the fragment would exceed
+// `maxLen` or its offset overflows.
+export function (a: CryptoAssembler) insert(offset: u64, fragment: []byte): ()! {
+  let start = int(offset)
+  let end = start + len(fragment)
+  if (start < 0 || end < start) {
+    fail newError("quic: CRYPTO fragment offset out of range")
+  }
+  if (end > a.maxLen) {
+    fail newError("quic: CRYPTO fragment exceeds the reassembly limit")
+  }
+  a.quictlsGrowTo(end)
+  let i = 0
+  while (i < len(fragment)) {
+    let idx = start + i
+    if (a.have[idx] != 0 && a.data[idx] != fragment[i]) {
+      fail newError("quic: overlapping CRYPTO data does not match")
+    }
+    a.data[idx] = fragment[i]
+    a.have[idx] = 1
+    i = i + 1
+  }
+  a.quictlsAdvance()
+}
+
+// The contiguous handshake bytes reassembled so far — the ordered stream from
+// offset 0 up to the first gap. Grows as later `insert`s fill earlier gaps.
+export function (a: CryptoAssembler) contiguous(): []byte {
+  return a.data[0:a.readable]
+}
+
+// The length of the contiguous reassembled prefix — `len(contiguous())` without
+// materializing the slice.
+export function (a: CryptoAssembler) contiguousLen(): int {
+  return a.readable
+}
+
+// Feed one parsed frame into `a`, inserting it when it is a CRYPTO frame and
+// ignoring every other frame type. The match is exhaustive so a new frame type
+// cannot be silently dropped.
+function (a: CryptoAssembler) quictlsFeed(f: Frame): ()! {
+  match (f) {
+    Padding(n) => {}
+    Ping => {}
+    Ack(ack) => {}
+    ResetStream(id, code, finalSize) => {}
+    StopSending(id, code) => {}
+    Crypto(offset, data) => { a.insert(offset, data)? }
+    NewToken(token) => {}
+    Stream(s) => {}
+    MaxData(m) => {}
+    MaxStreamData(id, m) => {}
+    MaxStreams(bidi, m) => {}
+    DataBlocked(m) => {}
+    StreamDataBlocked(id, m) => {}
+    StreamsBlocked(bidi, m) => {}
+    NewConnectionId(seq, retire, cid, token) => {}
+    RetireConnectionId(seq) => {}
+    PathChallenge(d) => {}
+    PathResponse(d) => {}
+    ConnectionClose(code, ft, reason) => {}
+    ApplicationClose(code, reason) => {}
+    HandshakeDone => {}
+  }
+}
+
+// Reassemble the CRYPTO frames in `frames` into the contiguous handshake byte
+// stream (RFC 9000 §19.6), ignoring any non-CRYPTO frames. Frames may be in any
+// order and may overlap; the result is the ordered prefix up to the first gap
+// (the whole stream when there is none). `maxLen` bounds the reassembly buffer.
+// Fails on an over-limit offset or a conflicting overlap.
+export function reassembleCryptoFrames(frames: []Frame, maxLen: int): []byte! {
+  let a = newCryptoAssembler(maxLen)
+  for f of frames {
+    a.quictlsFeed(f)?
+  }
+  return a.contiguous()
+}
