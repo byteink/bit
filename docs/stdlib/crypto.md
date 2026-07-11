@@ -2468,3 +2468,98 @@ given `context` string.
 
 One-shot BLAKE3 XOF: `n` output bytes of the default hash of `data`. For `n == 32`
 this equals `blake3Hash(data)`.
+
+## Curve25519 field
+
+Arithmetic in the prime field GF(2^255 - 19), the field underneath Curve25519.
+A field element is a `[]u64` of length 5 — the value in radix 2^51, five 51-bit
+limbs, little-endian. The representation is redundant between operations (limbs
+carry a few spare bits); `fe25519ToBytes` performs the one canonical reduction to
+the unique 0..p-1 representative. All operations are constant-time: no branch or
+memory access depends on a field value. These primitives are the building blocks
+for X25519 and Ed25519.
+
+Elements are decoded from 32 little-endian bytes with `fe25519FromBytes` and
+re-encoded canonically with `fe25519ToBytes`; the arithmetic operations consume
+and produce the 5-limb form.
+
+```bit
+import {
+  fe25519FromBytes, fe25519ToBytes, fe25519Add, fe25519Sub,
+  fe25519Mul, fe25519Sqr, fe25519Mul121666, fe25519Invert,
+} from "std/crypto"
+
+// a * a^-1 == 1, checked by comparing canonical encodings: 1 is the byte 0x01
+// followed by 31 zero bytes.
+function isInverse(scalar: []byte): bool {
+  let a = fe25519FromBytes(scalar)
+  let one = fe25519ToBytes(fe25519Mul(a, fe25519Invert(a)))
+  if (one[0] != 1) {
+    return false
+  }
+  let i = 1
+  while (i < 32) {
+    if (one[i] != 0) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// (a + b)(a - b) + 121666 * a^2, exercising the remaining operations.
+function combine(xBytes: []byte, yBytes: []byte): []byte {
+  let a = fe25519FromBytes(xBytes)
+  let b = fe25519FromBytes(yBytes)
+  let diffProd = fe25519Mul(fe25519Add(a, b), fe25519Sub(a, b))
+  let scaled = fe25519Mul121666(fe25519Sqr(a))
+  return fe25519ToBytes(fe25519Add(diffProd, scaled))
+}
+```
+
+### `fe25519FromBytes(s: []byte): []u64`
+
+Decode 32 little-endian bytes into a field element (five 51-bit limbs). Bit 255
+of the input is ignored, matching the Curve25519 wire convention; the value is
+taken mod 2^255 and later reduced mod p by `fe25519ToBytes`. `s` must be at least
+32 bytes.
+
+### `fe25519ToBytes(f: []u64): []byte`
+
+Fully reduce `f` mod p = 2^255 - 19 and serialize it as 32 little-endian bytes —
+the unique canonical encoding, with bit 255 always clear. The reduction is
+constant-time; two representations of the same field element always encode to the
+same bytes.
+
+### `fe25519Add(f: []u64, g: []u64): []u64`
+
+Field addition, `(f + g) mod p`. The result is loosely reduced and safe to feed
+straight into any other field operation.
+
+### `fe25519Sub(f: []u64, g: []u64): []u64`
+
+Field subtraction, `(f - g) mod p`. A multiple of p is added before subtracting
+so the unsigned limb arithmetic never underflows; the result is loosely reduced.
+
+### `fe25519Mul(f: []u64, g: []u64): []u64`
+
+Field multiplication, `(f * g) mod p`. Schoolbook 5×5 limb products with the
+2^255 = 19 wrap-around fold, accumulated in 128-bit columns and carried back to
+51-bit limbs.
+
+### `fe25519Sqr(f: []u64): []u64`
+
+Field squaring, `(f * f) mod p`. Equivalent to `fe25519Mul(f, f)`; provided
+separately because inversion and the Montgomery ladder square far more often than
+they multiply.
+
+### `fe25519Mul121666(f: []u64): []u64`
+
+Multiply by the curve constant 121666, `(121666 * f) mod p`. This is the scalar
+step of the X25519 Montgomery ladder.
+
+### `fe25519Invert(z: []u64): []u64`
+
+Field inverse, `z^(-1) mod p`, computed as `z^(p-2)` by Fermat's little theorem
+using the standard Curve25519 addition chain (constant-time). The inverse of 0 is
+0.
