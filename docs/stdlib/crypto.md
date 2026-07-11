@@ -3091,3 +3091,59 @@ The required nonce length in bytes: `12` (96-bit), fixed by RFC 8452.
 ### `AesGcmSiv.overhead(): int`
 
 The number of bytes `seal` appends: `16`, the authentication tag length.
+
+## scrypt
+
+scrypt (RFC 7914) is the memory-hard password-based key derivation function.
+Like PBKDF2 it stretches a password into a derived key of any length, but it is
+deliberately *memory*-hard as well as CPU-hard: the cost parameter `N` forces the
+derivation to fill and then randomly re-read an `N * 128 * r`-byte table, so a
+brute-force attacker cannot trade that memory away for the cheap, massively
+parallel hardware that defeats PBKDF2. Prefer it over PBKDF2 for password storage
+where the extra memory cost is affordable.
+
+The derivation nests four layers (RFC 7914 §2–§6):
+
+- PBKDF2-HMAC-SHA256 (one iteration) expands the password and salt into `p`
+  blocks of `128 * r` bytes each.
+- Each block is run through **ROMix**: it fills an `N`-entry table with successive
+  **BlockMix** states, then does `N` more BlockMix passes, each mixing in the
+  table entry at a data-dependent index. Those random reads over the whole table
+  are the memory-hard step.
+- **BlockMix** is `2r` invocations of the **Salsa20/8** core, shuffled into the
+  mixing order.
+- A final PBKDF2-HMAC-SHA256 pass over the mixed blocks yields the derived key.
+
+`N` must be a power of two greater than one; `r` (block size), `p`
+(parallelization), and `outLen` must each be at least one. The PRF is fixed to
+HMAC-SHA-256, so unlike `pbkdf2`/`hkdf` there is no hash-constructor argument.
+Output is checked against the RFC 7914 §12 known-answer vectors. Note the cost is
+real: `N = 16384, r = 8, p = 1` (a common interactive-login setting) touches
+16 MiB per call, so size these to your latency and memory budget.
+
+```bit
+import { scrypt, encodeHex } from "std/crypto"
+
+// Derive a 32-byte encryption key from a password and a per-user random salt.
+// N is the memory/CPU cost and must be a power of two; r and p tune the block
+// size and parallelism. RFC 7914 §2 suggests N=16384, r=8, p=1 for interactive
+// logins — raise N as your hardware allows.
+function deriveKey(password: []byte, salt: []byte): []byte! {
+  return scrypt(password, salt, 16384, 8, 1, 32)?
+}
+
+// A password verifier for storage: keep the salt and the derived key, then on
+// login re-derive with the same salt and compare the results in constant time
+// via `ctEq`. A unique random salt per user is mandatory.
+function passwordHash(password: string, salt: []byte): string! {
+  return encodeHex(scrypt([]byte(password), salt, 16384, 8, 1, 32)?)
+}
+```
+
+### `scrypt(password: []byte, salt: []byte, N: int, r: int, p: int, outLen: int): []byte!`
+
+scrypt (RFC 7914 §6): derive `outLen` bytes of key material from `password` and
+`salt`, memory-hard in the cost parameters `N` (a power of two greater than one),
+the block size `r`, and the parallelization `p`. The PRF is fixed to
+HMAC-SHA-256. The result is deterministic in all six inputs. Fails if `N` is not
+a power of two above one, or if `r`, `p`, or `outLen` is below one.
