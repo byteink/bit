@@ -1,0 +1,638 @@
+// Bit standard library — crypto module, RSA (PKCS#1 v2.2 / RFC 8017).
+//
+// The public-key primitives (RSAEP/RSADP/RSASP1/RSAVP1) and the four schemes
+// layered on them: EMSA-PKCS1-v1_5 and EMSA-PSS signatures, RSAES-OAEP and
+// RSAES-PKCS1-v1_5 encryption. All the modular arithmetic lives in `bigint.bit`
+// (`Nat`, `bigintModExp`, ...) and all the key-serialization structure in
+// `asn1.bit`; this file is the RFC 8017 glue over both. Being part of the flat
+// `std/crypto` module it names `Nat`, `Hash`, `digest`, `ctEq`, `randomBytes`,
+// the `asn1*`/`bigint*` helpers, and `newError` without importing them, and every
+// private free function is prefixed `rsa` to keep the flat namespace clean.
+//
+// Two secret-dependent code paths get constant-time care:
+//
+//   * The private-key operation (RSADP/RSASP1) uses the constant-time Montgomery
+//     ladder `bigintModExp`, and wraps it in *base blinding* — a fresh random `r`
+//     turns `m^d` into `(m·r^e)^d · r^-1 mod n`, so the exponentiation runs on a
+//     value uncorrelated with the ciphertext and its timing cannot be correlated
+//     back (RFC 8017 §10, and the classic Kocher timing defence).
+//
+//   * The two *decryption* padding checks (OAEP / v1.5) are the Manger and
+//     Bleichenbacher oracle surfaces. Both decode branchlessly: every check folds
+//     into one running mask over the whole buffer, there is no early return on a
+//     bad byte, and success or failure is decided once at the end so a malformed
+//     padding is rejected with a single uniform error and a data-independent
+//     control flow.
+//
+// CRT (the p/q/dp/dq/qInv fast path) is deliberately deferred in v1: the plain
+// `c^d mod n` on the constant-time ladder is simpler to argue correct and to keep
+// constant-time, and key parsing still validates the CRT fields are present. The
+// public API is stable; CRT is a later internal optimization behind `RsaPrivateKey`.
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+// An RSA public key: modulus `n` and public exponent `e`. Build one with a
+// parser (`rsaParsePublicKey` / `rsaParsePkcs1PublicKey`) or the struct literal.
+export struct RsaPublicKey {
+  export n: Nat,
+  export e: Nat,
+}
+
+// An RSA private key: modulus `n`, public exponent `e` (needed for blinding),
+// and private exponent `d`. The CRT parameters are not retained in v1 (see the
+// file header); `rsaParsePkcs1PrivateKey` still requires them to be present and
+// well-formed in the DER.
+export struct RsaPrivateKey {
+  export n: Nat,
+  export e: Nat,
+  export d: Nat,
+}
+
+// The byte length `k` of the modulus, i.e. the size of every ciphertext and
+// signature this key produces (RFC 8017's `k`).
+function rsaModulusBytes(n: Nat): int {
+  return (bigintBitLen(n) + 7) / 8
+}
+
+// ---------------------------------------------------------------------------
+// Small branchless helpers for the constant-time decoders
+// ---------------------------------------------------------------------------
+
+// All-ones (0xFFFFFFFF) when `a == b`, else 0, with no branch on the values.
+// `x` is zero exactly when equal; `(x | -x) >> 31` is the sign bit, 1 for any
+// non-zero `x`; subtracting one flips {0,1} into the {all-ones, 0} mask.
+function rsaEqMask32(a: u32, b: u32): u32 {
+  let x = a ^ b
+  let nz = (x | (u32(0) - x)) >> 31
+  return nz - u32(1)
+}
+
+// All-ones (0xFFFFFFFF) when `a >= b`, else 0, for small non-negative ints
+// (`0 <= a, b < 2^30`, which every length/index here satisfies). Biasing by
+// 2^30 keeps `a - b` positive, and bit 30 is set exactly when `a >= b`.
+function rsaGeMask32(a: int, b: int): u32 {
+  let d = u32(a - b + 0x40000000)
+  return u32(0) - ((d >> 30) & u32(1))
+}
+
+// `a` where `mask` is all-ones, `b` where `mask` is zero — a branchless select.
+function rsaSelect32(mask: u32, a: u32, b: u32): u32 {
+  return (a & mask) | (b & ~mask)
+}
+
+// All-ones when the equal-length slices are byte-for-byte equal, else 0. The
+// length check is on public lengths; the content scan is constant-time.
+function rsaBytesEqMask(a: []byte, b: []byte): u32 {
+  if (len(a) != len(b)) {
+    return u32(0)
+  }
+  let diff: u32 = 0
+  let i = 0
+  while (i < len(a)) {
+    diff = diff | (u32(a[i]) ^ u32(b[i]))
+    i = i + 1
+  }
+  return rsaEqMask32(diff, u32(0))
+}
+
+// The all-ones mask, i.e. every branchless check passed.
+function rsaMaskAll(): u32 {
+  return u32(0xffffffff)
+}
+
+// ---------------------------------------------------------------------------
+// Byte-slice plumbing
+// ---------------------------------------------------------------------------
+
+// `a || b`, a fresh slice.
+function rsaConcat(a: []byte, b: []byte): []byte {
+  let out = []byte(len(a) + len(b))
+  let i = 0
+  while (i < len(a)) {
+    out[i] = a[i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(b)) {
+    out[len(a) + j] = b[j]
+    j = j + 1
+  }
+  return out
+}
+
+// `a XOR b` for equal-length slices, a fresh slice.
+function rsaXor(a: []byte, b: []byte): []byte {
+  let out = []byte(len(a))
+  let i = 0
+  while (i < len(a)) {
+    out[i] = a[i] ^ b[i]
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// MGF1 (RFC 8017 Appendix B.2.1)
+// ---------------------------------------------------------------------------
+
+// The MGF1 mask of `maskLen` bytes seeded by `seed`, using the hash built by
+// `newHash`. Concatenates `Hash(seed || I2OSP(counter, 4))` for counter = 0, 1,
+// ... until at least `maskLen` bytes are produced, then truncates.
+function rsaMgf1(newHash: () => Hash, seed: []byte, maskLen: int): []byte {
+  let h = newHash()
+  let out = []byte(0)
+  let counter = 0
+  while (len(out) < maskLen) {
+    let c = []byte(4)
+    c[0] = byte((counter >> 24) & 0xff)
+    c[1] = byte((counter >> 16) & 0xff)
+    c[2] = byte((counter >> 8) & 0xff)
+    c[3] = byte(counter & 0xff)
+    out = rsaConcat(out, digest(h, rsaConcat(seed, c)))
+    counter = counter + 1
+  }
+  return out[0:maskLen]
+}
+
+// ---------------------------------------------------------------------------
+// Core primitives (RFC 8017 §5)
+// ---------------------------------------------------------------------------
+
+// RSAEP / RSAVP1: `m^e mod n`. The message/signature representative must be in
+// `[0, n)`. The exponent `e` is public, so the variable-time ladder is used.
+function rsaPublicOp(pub: RsaPublicKey, m: Nat): Nat! {
+  if (bigintCmp(m, pub.n) >= 0) {
+    fail newError("rsa: representative out of range")
+  }
+  return bigintModExpPublic(m, pub.e, pub.n)?
+}
+
+// RSADP / RSASP1: `c^d mod n` under base blinding. A fresh random `r` coprime to
+// `n` blinds the input (`c·r^e`), the constant-time ladder exponentiates the
+// blinded value, and multiplying by `r^-1` removes the blind — so the secret
+// exponentiation never runs on the attacker-chosen `c` directly.
+function rsaPrivateOp(priv: RsaPrivateKey, c: Nat): Nat! {
+  if (bigintCmp(c, priv.n) >= 0) {
+    fail newError("rsa: representative out of range")
+  }
+  let n = priv.n
+  let one = bigintFromU64(1)
+  let k = rsaModulusBytes(n)
+  let r = bigintZero()
+  let rInv = bigintZero()
+  let ok = false
+  let tries = 0
+  while (!ok && tries < 256) {
+    let cand = bigintMod(bigintFromBytes(randomBytes(k)), n)?
+    if (!bigintIsZero(cand) && bigintCmp(bigintGcd(cand, n), one) == 0) {
+      rInv = bigintModInverse(cand, n)?
+      r = cand
+      ok = true
+    }
+    tries = tries + 1
+  }
+  if (!ok) {
+    fail newError("rsa: base blinding could not find an invertible factor")
+  }
+  let re = bigintModExpPublic(r, priv.e, n)?
+  let blinded = bigintMod(bigintMul(c, re), n)?
+  let md = bigintModExp(blinded, priv.d, n)?
+  return bigintMod(bigintMul(md, rInv), n)?
+}
+
+// ---------------------------------------------------------------------------
+// DigestInfo prefixes for EMSA-PKCS1-v1_5 (RFC 8017 §9.2, Note 1)
+// ---------------------------------------------------------------------------
+
+// The DER of `DigestInfo` with an empty digest for SHA-256 — prepend to the
+// 32-byte hash to form `T`. Pass to `rsaSignPkcs1v15` / `rsaVerifyPkcs1v15`.
+export function rsaDigestInfoSha256(): []byte {
+  return []byte{
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+  }
+}
+
+// The `DigestInfo` prefix for SHA-384 (48-byte hash).
+export function rsaDigestInfoSha384(): []byte {
+  return []byte{
+    0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+  }
+}
+
+// The `DigestInfo` prefix for SHA-512 (64-byte hash).
+export function rsaDigestInfoSha512(): []byte {
+  return []byte{
+    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EMSA-PKCS1-v1_5 signatures (RFC 8017 §8.2)
+// ---------------------------------------------------------------------------
+
+// EMSA-PKCS1-v1_5-ENCODE: `00 01 FF..FF 00 || T`, where `T` is the DigestInfo
+// prefix followed by `Hash(message)`, padded to exactly `emLen` bytes. Fails if
+// the modulus is too small to hold the encoding.
+function rsaEmsaPkcs1Encode(newHash: () => Hash, prefix: []byte, message: []byte, emLen: int): []byte! {
+  let t = rsaConcat(prefix, digest(newHash(), message))
+  if (emLen < len(t) + 11) {
+    fail newError("rsa: intended encoded message length too short")
+  }
+  let psLen = emLen - len(t) - 3
+  let em = []byte(emLen)
+  em[1] = 0x01
+  let i = 0
+  while (i < psLen) {
+    em[2 + i] = 0xff
+    i = i + 1
+  }
+  let j = 0
+  while (j < len(t)) {
+    em[3 + psLen + j] = t[j]
+    j = j + 1
+  }
+  return em
+}
+
+// An EMSA-PKCS1-v1_5 signature over `message`, hashed by `newHash` with the
+// matching `digestInfoPrefix` (`rsaDigestInfoSha256`, ...). The signature is `k`
+// bytes, `k` the modulus length.
+export function rsaSignPkcs1v15(priv: RsaPrivateKey, newHash: () => Hash, digestInfoPrefix: []byte, message: []byte): []byte! {
+  let k = rsaModulusBytes(priv.n)
+  let em = rsaEmsaPkcs1Encode(newHash, digestInfoPrefix, message, k)?
+  let s = rsaPrivateOp(priv, bigintFromBytes(em))?
+  return bigintToBytes(s, k)?
+}
+
+// Whether `sig` is a valid EMSA-PKCS1-v1_5 signature over `message` under `pub`.
+// Recomputes the expected encoded message and compares it to the recovered one
+// (`sig^e mod n`); any structural problem returns false rather than raising.
+export function rsaVerifyPkcs1v15(pub: RsaPublicKey, newHash: () => Hash, digestInfoPrefix: []byte, message: []byte, sig: []byte): bool {
+  let k = rsaModulusBytes(pub.n)
+  if (len(sig) != k) {
+    return false
+  }
+  let s = bigintFromBytes(sig)
+  if (bigintCmp(s, pub.n) >= 0) {
+    return false
+  }
+  let m = rsaPublicOp(pub, s) catch e {
+    return false
+  }
+  let em = bigintToBytes(m, k) catch e {
+    return false
+  }
+  let want = rsaEmsaPkcs1Encode(newHash, digestInfoPrefix, message, k) catch e {
+    return false
+  }
+  return ctEq(em, want)
+}
+
+// ---------------------------------------------------------------------------
+// EMSA-PSS signatures (RFC 8017 §8.1 / §9.1)
+// ---------------------------------------------------------------------------
+
+// EMSA-PSS-ENCODE: hash the message, prepend the eight zero octets and a fresh
+// `saltLen`-byte salt, hash again to `H`, MGF1-mask a `PS || 01 || salt` data
+// block, clear the top unused bits, and append `H || bc`. `emBits` is the
+// modulus bit length minus one.
+function rsaEmsaPssEncode(newHash: () => Hash, message: []byte, emBits: int, saltLen: int): []byte! {
+  if (saltLen < 0) {
+    fail newError("rsa: negative salt length")
+  }
+  let hLen = newHash().size()
+  let emLen = (emBits + 7) / 8
+  if (emLen < hLen + saltLen + 2) {
+    fail newError("rsa: encoding error (modulus too small for PSS salt)")
+  }
+  let mHash = digest(newHash(), message)
+  let salt = randomBytes(saltLen)
+  let mp = rsaConcat(rsaConcat([]byte(8), mHash), salt)
+  let h = digest(newHash(), mp)
+  let dbLen = emLen - hLen - 1
+  let db = []byte(dbLen)
+  let psLen = dbLen - saltLen - 1
+  db[psLen] = 0x01
+  let i = 0
+  while (i < saltLen) {
+    db[psLen + 1 + i] = salt[i]
+    i = i + 1
+  }
+  let maskedDB = rsaXor(db, rsaMgf1(newHash, h, dbLen))
+  let zeroBits = 8 * emLen - emBits
+  maskedDB[0] = maskedDB[0] & byte(0xff >> zeroBits)
+  return append(rsaConcat(maskedDB, h), 0xbc)
+}
+
+// EMSA-PSS-VERIFY over public data (message and signature), so ordinary
+// branching is fine. Recovers the salt-bearing data block, checks the padding,
+// and confirms the recomputed `H'` equals `H`.
+function rsaEmsaPssVerify(newHash: () => Hash, message: []byte, em: []byte, emBits: int, saltLen: int): bool {
+  let hLen = newHash().size()
+  let emLen = (emBits + 7) / 8
+  if (saltLen < 0 || emLen < hLen + saltLen + 2 || len(em) != emLen) {
+    return false
+  }
+  if (em[emLen - 1] != 0xbc) {
+    return false
+  }
+  let dbLen = emLen - hLen - 1
+  let maskedDB = em[0:dbLen]
+  let h = em[dbLen:emLen - 1]
+  let zeroBits = 8 * emLen - emBits
+  if (zeroBits > 0 && maskedDB[0] & byte((0xff << (8 - zeroBits)) & 0xff) != 0) {
+    return false
+  }
+  let db = rsaXor(maskedDB, rsaMgf1(newHash, h, dbLen))
+  db[0] = db[0] & byte(0xff >> zeroBits)
+  let psLen = dbLen - saltLen - 1
+  let i = 0
+  while (i < psLen) {
+    if (db[i] != 0x00) {
+      return false
+    }
+    i = i + 1
+  }
+  if (db[psLen] != 0x01) {
+    return false
+  }
+  let salt = db[psLen + 1:dbLen]
+  let mp = rsaConcat(rsaConcat([]byte(8), digest(newHash(), message)), salt)
+  return ctEq(digest(newHash(), mp), h)
+}
+
+// An EMSA-PSS (MGF1) signature over `message`, hashed by `newHash`, with a fresh
+// `saltLen`-byte salt (the common choice is `saltLen == hash size`). `k` bytes.
+export function rsaSignPss(priv: RsaPrivateKey, newHash: () => Hash, message: []byte, saltLen: int): []byte! {
+  let k = rsaModulusBytes(priv.n)
+  let emBits = bigintBitLen(priv.n) - 1
+  let em = rsaEmsaPssEncode(newHash, message, emBits, saltLen)?
+  let s = rsaPrivateOp(priv, bigintFromBytes(em))?
+  return bigintToBytes(s, k)?
+}
+
+// Whether `sig` is a valid EMSA-PSS signature over `message` under `pub`,
+// expecting a salt of exactly `saltLen` bytes.
+export function rsaVerifyPss(pub: RsaPublicKey, newHash: () => Hash, message: []byte, sig: []byte, saltLen: int): bool {
+  let k = rsaModulusBytes(pub.n)
+  if (len(sig) != k) {
+    return false
+  }
+  let s = bigintFromBytes(sig)
+  if (bigintCmp(s, pub.n) >= 0) {
+    return false
+  }
+  let m = rsaPublicOp(pub, s) catch e {
+    return false
+  }
+  let emBits = bigintBitLen(pub.n) - 1
+  let em = bigintToBytes(m, (emBits + 7) / 8) catch e {
+    return false
+  }
+  return rsaEmsaPssVerify(newHash, message, em, emBits, saltLen)
+}
+
+// ---------------------------------------------------------------------------
+// RSAES-OAEP encryption (RFC 8017 §7.1)
+// ---------------------------------------------------------------------------
+
+// RSAES-OAEP-ENCRYPT with MGF1 over `newHash` and the (usually empty) `label`.
+// Fails if `message` exceeds `k - 2*hLen - 2` bytes.
+export function rsaEncryptOaep(pub: RsaPublicKey, newHash: () => Hash, message: []byte, label: []byte): []byte! {
+  let k = rsaModulusBytes(pub.n)
+  let hLen = newHash().size()
+  if (len(message) > k - 2 * hLen - 2) {
+    fail newError("rsa: message too long for OAEP")
+  }
+  let lHash = digest(newHash(), label)
+  let dbLen = k - hLen - 1
+  let db = []byte(dbLen)
+  let i = 0
+  while (i < hLen) {
+    db[i] = lHash[i]
+    i = i + 1
+  }
+  let psLen = dbLen - len(message) - hLen - 1
+  db[hLen + psLen] = 0x01
+  let j = 0
+  while (j < len(message)) {
+    db[hLen + psLen + 1 + j] = message[j]
+    j = j + 1
+  }
+  let seed = randomBytes(hLen)
+  let maskedDB = rsaXor(db, rsaMgf1(newHash, seed, dbLen))
+  let maskedSeed = rsaXor(seed, rsaMgf1(newHash, maskedDB, hLen))
+  let em = rsaConcat(rsaConcat([]byte(1), maskedSeed), maskedDB)
+  let c = rsaPublicOp(pub, bigintFromBytes(em))?
+  return bigintToBytes(c, k)?
+}
+
+// RSAES-OAEP-DECRYPT. The padding decode is constant-time (Manger): the leading
+// byte, the label-hash match, and the `PS || 01` separator all fold into one
+// running mask, decided once at the end, so a malformed ciphertext yields a
+// single uniform "decryption error" with data-independent control flow.
+export function rsaDecryptOaep(priv: RsaPrivateKey, newHash: () => Hash, ciphertext: []byte, label: []byte): []byte! {
+  let k = rsaModulusBytes(priv.n)
+  let hLen = newHash().size()
+  if (len(ciphertext) != k || k < 2 * hLen + 2) {
+    fail newError("rsa: decryption error")
+  }
+  let m = rsaPrivateOp(priv, bigintFromBytes(ciphertext))?
+  let em = bigintToBytes(m, k)?
+
+  let dbLen = k - hLen - 1
+  let maskedSeed = em[1:1 + hLen]
+  let maskedDB = em[1 + hLen:k]
+  let seed = rsaXor(maskedSeed, rsaMgf1(newHash, maskedDB, hLen))
+  let db = rsaXor(maskedDB, rsaMgf1(newHash, seed, dbLen))
+  let lHash = digest(newHash(), label)
+
+  let good = rsaEqMask32(u32(em[0]), u32(0x00))
+  good = good & rsaBytesEqMask(db[0:hLen], lHash)
+  let foundOne: u32 = 0
+  let oneIndex: u32 = 0
+  let badPad: u32 = 0
+  let i = hLen
+  while (i < dbLen) {
+    let isOne = rsaEqMask32(u32(db[i]), u32(0x01))
+    let isZero = rsaEqMask32(u32(db[i]), u32(0x00))
+    let beforeOne = ~foundOne
+    oneIndex = rsaSelect32(isOne & beforeOne, u32(i), oneIndex)
+    badPad = badPad | (beforeOne & ~isZero & ~isOne)
+    foundOne = foundOne | isOne
+    i = i + 1
+  }
+  good = good & foundOne & ~badPad
+  if (good != rsaMaskAll()) {
+    fail newError("rsa: decryption error")
+  }
+  return db[int(oneIndex) + 1:dbLen]
+}
+
+// ---------------------------------------------------------------------------
+// RSAES-PKCS1-v1_5 encryption (RFC 8017 §7.2)
+// ---------------------------------------------------------------------------
+
+// `n` non-zero random padding octets (the `PS` of a v1.5 encryption block):
+// draw secure random bytes and keep only the non-zero ones, redrawing to fill.
+function rsaNonZeroPadding(n: int): []byte {
+  let out = []byte(n)
+  let filled = 0
+  while (filled < n) {
+    let chunk = randomBytes(n - filled)
+    let i = 0
+    while (i < len(chunk)) {
+      if (chunk[i] != 0x00) {
+        out[filled] = chunk[i]
+        filled = filled + 1
+      }
+      i = i + 1
+    }
+  }
+  return out
+}
+
+// RSAES-PKCS1-v1_5-ENCRYPT: `00 02 || PS || 00 || M` with non-zero random `PS`.
+// Fails if `message` exceeds `k - 11` bytes. Prefer OAEP for new protocols.
+export function rsaEncryptPkcs1v15(pub: RsaPublicKey, message: []byte): []byte! {
+  let k = rsaModulusBytes(pub.n)
+  if (len(message) > k - 11) {
+    fail newError("rsa: message too long for PKCS#1 v1.5")
+  }
+  let em = []byte(2)
+  em[1] = 0x02
+  em = rsaConcat(em, rsaNonZeroPadding(k - len(message) - 3))
+  em = rsaConcat(append(em, 0x00), message)
+  let c = rsaPublicOp(pub, bigintFromBytes(em))?
+  return bigintToBytes(c, k)?
+}
+
+// RSAES-PKCS1-v1_5-DECRYPT. Constant-time (Bleichenbacher): the `00 02` prefix,
+// the eight-octet minimum on `PS`, and the `00` separator are checked with a
+// single running mask over the whole block and one uniform failure, so a padding
+// oracle cannot distinguish *why* a ciphertext was rejected.
+export function rsaDecryptPkcs1v15(priv: RsaPrivateKey, ciphertext: []byte): []byte! {
+  let k = rsaModulusBytes(priv.n)
+  if (len(ciphertext) != k || k < 11) {
+    fail newError("rsa: decryption error")
+  }
+  let m = rsaPrivateOp(priv, bigintFromBytes(ciphertext))?
+  let em = bigintToBytes(m, k)?
+
+  let good = rsaEqMask32(u32(em[0]), u32(0x00))
+  good = good & rsaEqMask32(u32(em[1]), u32(0x02))
+  let foundZero: u32 = 0
+  let zeroIndex: u32 = 0
+  let i = 2
+  while (i < k) {
+    let isZero = rsaEqMask32(u32(em[i]), u32(0x00))
+    zeroIndex = rsaSelect32(isZero & ~foundZero, u32(i), zeroIndex)
+    foundZero = foundZero | isZero
+    i = i + 1
+  }
+  // A separator must exist (`foundZero`) and leave at least eight `PS` octets,
+  // i.e. its index is >= 10.
+  good = good & foundZero & rsaGeMask32(int(zeroIndex), 10)
+  if (good != rsaMaskAll()) {
+    fail newError("rsa: decryption error")
+  }
+  return em[int(zeroIndex) + 1:k]
+}
+
+// ---------------------------------------------------------------------------
+// Key parsing (RFC 8017 Appendix A, PKCS#8 RFC 5958)
+// ---------------------------------------------------------------------------
+
+// The arcs of the rsaEncryption algorithm identifier, 1.2.840.113549.1.1.1.
+function rsaEncryptionOid(): []int {
+  return []int{ 1, 2, 840, 113549, 1, 1, 1 }
+}
+
+// Whether the dotted arcs equal `rsaEncryption`.
+function rsaIsRsaEncryptionOid(oid: []int): bool {
+  let want = rsaEncryptionOid()
+  if (len(oid) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(oid)) {
+    if (oid[i] != want[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The `RsaPublicKey` from a PKCS#1 `RSAPublicKey` DER: `SEQUENCE { n, e }`.
+export function rsaParsePkcs1PublicKey(der: []byte): RsaPublicKey! {
+  let seq = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(seq) != 2) {
+    fail newError("rsa: RSAPublicKey must have exactly two fields")
+  }
+  return RsaPublicKey{
+    n: bigintFromBytes(asn1ReadBigInteger(seq[0])?),
+    e: bigintFromBytes(asn1ReadBigInteger(seq[1])?),
+  }
+}
+
+// The `RsaPublicKey` from a `SubjectPublicKeyInfo` DER (the X.509 / SPKI form):
+// `SEQUENCE { AlgorithmIdentifier, BIT STRING }`, where the bit string wraps the
+// PKCS#1 `RSAPublicKey`. Fails unless the algorithm is rsaEncryption.
+export function rsaParsePublicKey(der: []byte): RsaPublicKey! {
+  let seq = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(seq) != 2) {
+    fail newError("rsa: SubjectPublicKeyInfo must have two fields")
+  }
+  let alg = asn1ReadSequence(seq[0])?
+  if (len(alg) < 1 || !rsaIsRsaEncryptionOid(asn1ReadOid(alg[0])?)) {
+    fail newError("rsa: not an rsaEncryption public key")
+  }
+  let bits = asn1ReadBitString(seq[1])?
+  if (bits.unusedBits != 0) {
+    fail newError("rsa: subjectPublicKey has unused bits")
+  }
+  return rsaParsePkcs1PublicKey(bits.bytes)?
+}
+
+// The `RsaPrivateKey` from a PKCS#1 `RSAPrivateKey` DER: `SEQUENCE { version, n,
+// e, d, p, q, dP, dQ, qInv }`. The CRT fields must be present (well-formed key)
+// but are not retained; only `n`, `e`, `d` are used in v1.
+export function rsaParsePkcs1PrivateKey(der: []byte): RsaPrivateKey! {
+  let seq = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(seq) < 9) {
+    fail newError("rsa: RSAPrivateKey must have at least nine fields")
+  }
+  let version = asn1ReadInteger(seq[0])?
+  if (version != 0 && version != 1) {
+    fail newError("rsa: unsupported RSAPrivateKey version")
+  }
+  return RsaPrivateKey{
+    n: bigintFromBytes(asn1ReadBigInteger(seq[1])?),
+    e: bigintFromBytes(asn1ReadBigInteger(seq[2])?),
+    d: bigintFromBytes(asn1ReadBigInteger(seq[3])?),
+  }
+}
+
+// The `RsaPrivateKey` from a PKCS#8 `PrivateKeyInfo` DER: `SEQUENCE { version,
+// AlgorithmIdentifier, OCTET STRING }`, where the octet string wraps the PKCS#1
+// `RSAPrivateKey`. Fails unless the algorithm is rsaEncryption.
+export function rsaParsePrivateKey(der: []byte): RsaPrivateKey! {
+  let seq = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(seq) < 3) {
+    fail newError("rsa: PrivateKeyInfo must have at least three fields")
+  }
+  if (asn1ReadInteger(seq[0])? != 0) {
+    fail newError("rsa: unsupported PrivateKeyInfo version")
+  }
+  let alg = asn1ReadSequence(seq[1])?
+  if (len(alg) < 1 || !rsaIsRsaEncryptionOid(asn1ReadOid(alg[0])?)) {
+    fail newError("rsa: not an rsaEncryption private key")
+  }
+  return rsaParsePkcs1PrivateKey(asn1ReadOctetString(seq[2])?)?
+}

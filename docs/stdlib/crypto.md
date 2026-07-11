@@ -1775,3 +1775,191 @@ Decode a SEC 1 octet string (infinity, uncompressed, or compressed) into a
 validated affine point; compressed input recovers `y` by a modular square root.
 Fails on a bad length, an out-of-range coordinate, an unknown prefix, or a point
 that is not on the curve.
+## RSA
+
+RSA (PKCS#1 v2.2 / RFC 8017) over the big-integer and ASN.1 layers: the four
+schemes — EMSA-PKCS1-v1_5 and EMSA-PSS signatures, RSAES-OAEP and
+RSAES-PKCS1-v1_5 encryption — plus parsers for the standard key encodings. Keys
+are `RsaPublicKey` / `RsaPrivateKey`; construct them from DER with the parsers,
+or from `Nat` fields directly.
+
+Two secret-dependent paths get constant-time care. The private-key operation runs
+on the constant-time Montgomery ladder and is **base-blinded** (a fresh random `r`
+turns `m^d` into `(m·r^e)^d · r^-1 mod n`), so its timing does not correlate with
+the ciphertext. The two **decrypt** padding checks are the Manger (OAEP) and
+Bleichenbacher (v1.5) oracle surfaces: both decode branchlessly, fold every check
+into one running mask, and reject a malformed ciphertext with a single uniform
+`"rsa: decryption error"` — never an early or check-specific failure. CRT (the
+p/q fast path) is deferred in v1; the plain `c^d mod n` is used.
+
+The signature and OAEP schemes take a hash *constructor* (`() => Hash`, e.g.
+`newSha256` — wrap it as `newSha256` returns the concrete `Sha256`) so one
+implementation serves the whole SHA-2 family; the PKCS#1 v1.5 signer additionally
+takes the matching `DigestInfo` prefix (`rsaDigestInfoSha256`, ...).
+
+```bit
+import {
+  RsaPrivateKey, RsaPublicKey, Hash, newSha256,
+  rsaSignPkcs1v15, rsaVerifyPkcs1v15, rsaDigestInfoSha256,
+} from "std/crypto"
+
+// SHA-256 as a `() => Hash` value (newSha256 returns the concrete Sha256).
+function sha256Hash(): Hash { return newSha256() }
+
+// EMSA-PKCS1-v1_5 sign over SHA-256, then verify the signature.
+function signAndVerify(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
+  let sig = rsaSignPkcs1v15(priv, sha256Hash, rsaDigestInfoSha256(), msg)?
+  return rsaVerifyPkcs1v15(pub, sha256Hash, rsaDigestInfoSha256(), msg, sig)
+}
+```
+
+### `RsaPublicKey`
+
+An RSA public key: the exported `Nat` fields `n` (modulus) and `e` (public
+exponent). Build one with `rsaParsePublicKey` / `rsaParsePkcs1PublicKey`, or the
+struct literal.
+
+### `RsaPrivateKey`
+
+An RSA private key: the exported `Nat` fields `n` (modulus), `e` (public
+exponent, used for blinding), and `d` (private exponent). The CRT parameters are
+not retained in v1.
+
+### `rsaParsePublicKey(der: []byte): RsaPublicKey!`
+
+Parse a `SubjectPublicKeyInfo` (X.509 / SPKI) DER public key — a `SEQUENCE` of an
+`rsaEncryption` `AlgorithmIdentifier` and a `BIT STRING` wrapping the PKCS#1
+`RSAPublicKey`. Fails on any structural problem or a non-RSA algorithm.
+
+```bit
+import { RsaPublicKey, rsaParsePublicKey } from "std/crypto"
+
+// Load an SPKI (X.509) public key from its DER bytes.
+function loadPublicKey(der: []byte): RsaPublicKey! {
+  return rsaParsePublicKey(der)?
+}
+```
+
+### `rsaParsePkcs1PublicKey(der: []byte): RsaPublicKey!`
+
+Parse a PKCS#1 `RSAPublicKey` DER — `SEQUENCE { modulus INTEGER, publicExponent
+INTEGER }`. This is the inner structure `rsaParsePublicKey` unwraps.
+
+### `rsaParsePrivateKey(der: []byte): RsaPrivateKey!`
+
+Parse a PKCS#8 `PrivateKeyInfo` (RFC 5958) DER private key — a `SEQUENCE` of a
+version, an `rsaEncryption` `AlgorithmIdentifier`, and an `OCTET STRING` wrapping
+the PKCS#1 `RSAPrivateKey`. Fails on any structural problem or a non-RSA
+algorithm.
+
+```bit
+import { RsaPrivateKey, rsaParsePrivateKey } from "std/crypto"
+
+// Load a PKCS#8 private key from its DER bytes.
+function loadPrivateKey(der: []byte): RsaPrivateKey! {
+  return rsaParsePrivateKey(der)?
+}
+```
+
+### `rsaParsePkcs1PrivateKey(der: []byte): RsaPrivateKey!`
+
+Parse a PKCS#1 `RSAPrivateKey` DER — `SEQUENCE { version, n, e, d, p, q, dP, dQ,
+qInv }`. The CRT fields must be present and well-formed but are not retained; only
+`n`, `e`, `d` are kept. This is the inner structure `rsaParsePrivateKey` unwraps.
+
+### `rsaSignPkcs1v15(priv: RsaPrivateKey, newHash: () => Hash, digestInfoPrefix: []byte, message: []byte): []byte!`
+
+An EMSA-PKCS1-v1_5 signature over `message`, hashed by `newHash` with the matching
+`digestInfoPrefix` (one of `rsaDigestInfoSha256/384/512`). The signature is `k`
+bytes, `k` the modulus length. The private-key operation is constant-time and
+base-blinded.
+
+### `rsaVerifyPkcs1v15(pub: RsaPublicKey, newHash: () => Hash, digestInfoPrefix: []byte, message: []byte, sig: []byte): bool`
+
+Whether `sig` is a valid EMSA-PKCS1-v1_5 signature over `message` under `pub`.
+Recomputes the expected encoded message and compares; any structural problem
+returns false rather than raising.
+
+### `rsaSignPss(priv: RsaPrivateKey, newHash: () => Hash, message: []byte, saltLen: int): []byte!`
+
+An EMSA-PSS (MGF1) signature over `message`, hashed by `newHash`, with a fresh
+`saltLen`-byte random salt (the common choice is `saltLen == hash size`). The
+signature is `k` bytes.
+
+```bit
+import { RsaPrivateKey, RsaPublicKey, Hash, newSha256, rsaSignPss, rsaVerifyPss } from "std/crypto"
+
+function sha256Hash(): Hash { return newSha256() }
+
+// EMSA-PSS sign and verify with a 32-byte salt.
+function pssRoundTrip(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
+  let sig = rsaSignPss(priv, sha256Hash, msg, 32)?
+  return rsaVerifyPss(pub, sha256Hash, msg, sig, 32)
+}
+```
+
+### `rsaVerifyPss(pub: RsaPublicKey, newHash: () => Hash, message: []byte, sig: []byte, saltLen: int): bool`
+
+Whether `sig` is a valid EMSA-PSS signature over `message` under `pub`, expecting
+a salt of exactly `saltLen` bytes.
+
+### `rsaEncryptOaep(pub: RsaPublicKey, newHash: () => Hash, message: []byte, label: []byte): []byte!`
+
+RSAES-OAEP encryption with MGF1 over `newHash` and the (usually empty) `label`.
+Fails if `message` exceeds `k - 2*hLen - 2` bytes. Prefer OAEP over v1.5 for new
+protocols.
+
+```bit
+import { RsaPrivateKey, RsaPublicKey, Hash, newSha256, rsaEncryptOaep, rsaDecryptOaep } from "std/crypto"
+
+function sha256Hash(): Hash { return newSha256() }
+
+// RSAES-OAEP encrypt then decrypt with an empty label.
+function oaepRoundTrip(pub: RsaPublicKey, priv: RsaPrivateKey, msg: []byte): []byte! {
+  let ct = rsaEncryptOaep(pub, sha256Hash, msg, []byte(0))?
+  return rsaDecryptOaep(priv, sha256Hash, ct, []byte(0))?
+}
+```
+
+### `rsaDecryptOaep(priv: RsaPrivateKey, newHash: () => Hash, ciphertext: []byte, label: []byte): []byte!`
+
+RSAES-OAEP decryption. The padding decode is constant-time (Manger): the leading
+byte, the label-hash match, and the `PS || 01` separator all fold into one mask
+decided once at the end, so a malformed ciphertext yields a single uniform
+`"rsa: decryption error"` with data-independent control flow.
+
+### `rsaEncryptPkcs1v15(pub: RsaPublicKey, message: []byte): []byte!`
+
+RSAES-PKCS1-v1_5 encryption: `00 02 || PS || 00 || M` with non-zero random `PS`.
+Fails if `message` exceeds `k - 11` bytes. Prefer OAEP for new protocols.
+
+```bit
+import { RsaPrivateKey, RsaPublicKey, rsaEncryptPkcs1v15, rsaDecryptPkcs1v15 } from "std/crypto"
+
+// RSAES-PKCS1-v1_5 encrypt then decrypt.
+function v15RoundTrip(pub: RsaPublicKey, priv: RsaPrivateKey, msg: []byte): []byte! {
+  let ct = rsaEncryptPkcs1v15(pub, msg)?
+  return rsaDecryptPkcs1v15(priv, ct)?
+}
+```
+
+### `rsaDecryptPkcs1v15(priv: RsaPrivateKey, ciphertext: []byte): []byte!`
+
+RSAES-PKCS1-v1_5 decryption. Constant-time (Bleichenbacher): the `00 02` prefix,
+the eight-octet minimum on `PS`, and the `00` separator are checked with a single
+running mask and one uniform failure, so a padding oracle cannot distinguish
+*why* a ciphertext was rejected.
+
+### `rsaDigestInfoSha256(): []byte`
+
+The DER `DigestInfo` prefix for SHA-256 — prepend to a 32-byte digest to form the
+`T` of an EMSA-PKCS1-v1_5 encoding. Pass to `rsaSignPkcs1v15` /
+`rsaVerifyPkcs1v15`.
+
+### `rsaDigestInfoSha384(): []byte`
+
+The DER `DigestInfo` prefix for SHA-384 (48-byte digest).
+
+### `rsaDigestInfoSha512(): []byte`
+
+The DER `DigestInfo` prefix for SHA-512 (64-byte digest).
