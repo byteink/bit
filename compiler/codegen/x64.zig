@@ -77,7 +77,8 @@
 //!
 //! Register pressure: whenever a function contains any safepoint, its
 //! allocatable register file is restricted to the callee-saved subset only
-//! (`hasCalls` in `compileFunction`) — this sidesteps caller-save
+//! (`scanFuncFlags`' `has_safepoints`, which counts both real calls and
+//! back-edges) — this sidesteps caller-save
 //! spill/reload entirely (no vreg can ever land in a call-clobbered
 //! register) at the cost of using fewer registers in such functions.
 //! `// ponytail: callee-saved-only register file across calls, add
