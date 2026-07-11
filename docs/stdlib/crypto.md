@@ -371,6 +371,47 @@ function sha1Stream(head: []byte, tail: []byte): []byte {
 A fresh SHA-1 hasher in the empty state, typed as the streaming `Hash` interface
 — digest size 20 bytes, block size 64. Legacy: interop only, not
 collision-resistant; never use it for new signatures or MACs.
+
+## MD5 (legacy)
+
+MD5 (RFC 1321) produces a 128-bit (16-byte) digest. It is **broken** and provided
+for **interoperability only**: collisions are trivial to produce (seconds on a
+laptop) and chosen-prefix collisions have forged real CA certificates. It must
+**never** back integrity checks, signatures, MACs, password hashing, or any
+security decision. Use it solely to read or reproduce legacy formats that still
+mandate it — old checksums, ETags, and pre-existing protocol fields. For anything
+new, use SHA-256.
+
+MD5 is little-endian throughout (message words and the length pad), unlike the
+big-endian SHA family. The hasher satisfies the streaming `Hash` interface, so it
+works one-shot through `digest` or incrementally through `write`/`sum`.
+
+```bit
+import { newMd5, digest, encodeHex } from "std/crypto"
+
+// One-shot: the lowercase hex digest of a buffer. Legacy interop only — e.g.
+// reproducing an old checksum or ETag, never an integrity check or signature.
+function md5Hex(data: []byte): string {
+  return encodeHex(digest(newMd5(), data))
+}
+
+// Streaming: reset, feed the bytes across as many writes as you like, then read
+// the 16-byte digest with `sum`.
+function md5Stream(head: []byte, tail: []byte): []byte {
+  let h = newMd5()
+  h.reset()
+  h.write(head)
+  h.write(tail)
+  return h.sum()
+}
+```
+
+### `newMd5(): Hash`
+
+A fresh MD5 hasher in the empty state, typed as the streaming `Hash` interface —
+digest size 16 bytes, block size 64. Broken: interop only, not
+collision-resistant; never use it for integrity, signatures, or MACs.
+
 ## SHA-512 family
 
 The 64-bit SHA-2 hashes from FIPS 180-4: SHA-512, SHA-384, and SHA-512/256. All
