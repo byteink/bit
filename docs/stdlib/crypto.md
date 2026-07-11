@@ -2869,3 +2869,58 @@ The internal block size in bytes: 64.
 
 The 64-byte unkeyed BLAKE2b digest of `data` — the common one-shot case, a
 shorthand for `digest(newBlake2b(64, []byte(0)), data)`.
+
+## PBKDF2
+
+PBKDF2 (RFC 8018 §5.2) is the password-based key derivation function: it
+stretches a low-entropy password into a derived key of any length, using HMAC as
+its pseudo-random function. Its defining property is deliberate slowness — the
+iteration count `iters` is a cost knob that an attacker must pay in full for
+*every* password guess, while a legitimate caller pays it once. Use it to turn a
+password into an encryption key, or (with a per-user random salt and a high
+count) to store a password verifier.
+
+The derived key is the concatenation of blocks, each one hash-digest long and
+the last truncated to `outLen`:
+
+- `T(i) = U(1) ^ U(2) ^ ... ^ U(iters)` is one output block, where
+  `U(1) = HMAC(password, salt || INT_32_BE(i))` folds in the salt and the
+  one-based block index, and each later `U(j) = HMAC(password, U(j-1))`.
+- Blocks `T(1), T(2), ...` are concatenated and truncated to `outLen` bytes.
+
+`pbkdf2` is generic over the digest: it takes a hash *constructor* (`() => Hash`)
+and uses the hash's own `size` as the block length, so the same code derives keys
+under SHA-1, SHA-256, or SHA-512. `newSha1` passes directly; `newSha256` returns
+the concrete `Sha256` and is wrapped as a `() => Hash`. Choose `iters` as high as
+your latency budget allows — hundreds of thousands for SHA-256 is typical — and
+use a unique random salt per key. Output is checked against the RFC 6070
+(HMAC-SHA-1) and RFC 7914 §11 (HMAC-SHA-256) known-answer vectors.
+
+```bit
+import { Hash, pbkdf2, newSha256, encodeHex } from "std/crypto"
+
+// SHA-256 returns the concrete `Sha256`, so expose its constructor as a
+// `() => Hash` value.
+function sha256Hash(): Hash { return newSha256() }
+
+// Derive a 32-byte encryption key from a password and a per-user random salt.
+// The high iteration count is the brute-force cost; raise it as hardware allows.
+function deriveKey(password: []byte, salt: []byte): []byte {
+  return pbkdf2(sha256Hash, password, salt, 600000, 32)
+}
+
+// A password verifier for storage: keep the salt and the derived key, then on
+// login re-derive with the same salt and compare in constant time via `ctEq`.
+function passwordHash(password: string, salt: []byte): string {
+  return encodeHex(pbkdf2(sha256Hash, []byte(password), salt, 600000, 32))
+}
+```
+
+### `pbkdf2(newHash: () => Hash, password: []byte, salt: []byte, iters: int, outLen: int): []byte`
+
+PBKDF2 (RFC 8018 §5.2): derive `outLen` bytes of key material from `password` and
+`salt`, running the HMAC PRF `iters` times per output block. `newHash` selects
+the digest (e.g. `newSha1`, `newSha256`) and must return a fresh, empty hasher on
+each call; `iters` is the cost factor and must be at least 1. The result is
+deterministic in all five inputs. Panics if `iters < 1` or `outLen` exceeds the
+block counter's `(2^32 - 1) * hLen` ceiling.
