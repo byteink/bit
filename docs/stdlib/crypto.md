@@ -1963,3 +1963,56 @@ The DER `DigestInfo` prefix for SHA-384 (48-byte digest).
 ### `rsaDigestInfoSha512(): []byte`
 
 The DER `DigestInfo` prefix for SHA-512 (64-byte digest).
+
+## NIST ECDH
+
+Elliptic-Curve Diffie-Hellman over the NIST curves P-256 and P-384, layered on
+the `nistec` point arithmetic. Each side generates a key pair, exchanges its
+SEC 1 public point, and derives the same shared secret — the x-coordinate of the
+joint point `d_A * d_B * G`, fixed-width big-endian. Both curves have cofactor 1,
+so that x is the raw ECDH secret TLS 1.3 feeds directly to HKDF as input keying
+material (no hashing, no cofactor multiplication).
+
+The peer's public point is validated before every use: an off-curve or malformed
+SEC 1 encoding, or the identity point, is rejected — the invalid-curve attack
+defense. The private scalar is drawn from the OS CSPRNG and reduced into
+`[1, n-1]` with the FIPS 186-4 extra-bits method, so it is never zero and never
+`>= n`.
+
+```bit
+import {
+  nistecP256,
+  ecdhnistGenerateKeypair, ecdhnistSharedSecret,
+} from "std/crypto"
+
+// A full ECDH exchange on P-256. Both sides derive the identical secret; here
+// Alice combines her private key with Bob's public key. The returned bytes are
+// the raw shared x-coordinate — hand them straight to HKDF as input keying
+// material.
+function ecdhExchangeP256(): []byte! {
+  let c = nistecP256()
+  let alice = ecdhnistGenerateKeypair(c)
+  let bob = ecdhnistGenerateKeypair(c)
+  return ecdhnistSharedSecret(alice.priv, bob.pub, c)?
+}
+```
+
+### `EcdhKeypair`
+
+An ECDH key pair. `priv` is the private scalar as exactly `curve.size` big-endian
+bytes; `pub` is the SEC 1 *uncompressed* public point `0x04 || X || Y` of
+`priv * G`. Both fields are exported.
+
+### `ecdhnistGenerateKeypair(curve: Curve): EcdhKeypair`
+
+Generate a fresh key pair on `curve`. The private scalar comes from the OS CSPRNG
+reduced into `[1, n-1]` (FIPS 186-4 extra-bits), and the public key is the SEC 1
+uncompressed encoding of `priv * G`.
+
+### `ecdhnistSharedSecret(priv: []byte, peerPub: []byte, curve: Curve): []byte!`
+
+The raw ECDH shared secret: the fixed-width big-endian x-coordinate of
+`priv * peerPoint`, where `peerPub` is the peer's SEC 1 public point. Validates
+that the peer point is on the curve and is not the identity before multiplying —
+closing the invalid-curve attack — and fails on any malformed, off-curve, or
+identity input.
