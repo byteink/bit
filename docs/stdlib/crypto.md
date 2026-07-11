@@ -3401,3 +3401,95 @@ function deriveKey(password: []byte, salt: []byte): []byte {
   return argon2id(password, salt, []byte(0), []byte(0), 3, 65536, 4, 32)
 }
 ```
+## ML-DSA-65
+
+ML-DSA (FIPS 204), the lattice-based signature scheme formerly named CRYSTALS-
+Dilithium, in its category-3 parameter set **ML-DSA-65**. Its security rests on
+the hardness of Module-LWE / Module-SIS lattice problems, which no known quantum
+algorithm solves — so unlike Ed25519 and ECDSA it stays secure against a
+cryptographically-relevant quantum computer. Use it where signatures must outlive
+the arrival of such a machine, or alongside a classical scheme in a hybrid.
+
+Keys and signatures are the FIPS 204 byte strings and interoperate with any
+conforming implementation: the public (verification) key is 1952 bytes, the
+secret (signing) key is 4032 bytes, and a signature is 3309 bytes. Internally the
+scheme works over the ring `Z_q[X]/(X^256+1)` with `q = 8380417`, using the
+number-theoretic transform for fast polynomial multiplication, SHAKE128/256 for
+all sampling and hashing, and a rejection-sampling loop in signing.
+
+Signing is **deterministic**: the FIPS 204 per-signature randomizer is fixed to
+zero, so the signature is a pure function of `(sk, msg, ctx)` and the same inputs
+always produce the same bytes. This makes signatures reproducible and testable
+byte-for-byte against the NIST ACVP known-answer vectors, at the cost of the
+side-channel hardening a random nonce would add. An optional context string
+`ctx` (at most 255 bytes, empty by default) binds a signature to an application
+domain, exactly as it does in the FIPS 204 external interface. Verification
+returns `false` for any malformed input — a wrong-length key or signature, an
+out-of-bounds `z`, or a hint that violates its encoding rules — rather than
+raising. The generated key material comes from the OS CSPRNG via `mldsaKeygen`;
+`mldsaKeygenSeed` derives a key pair deterministically from a stored 32-byte seed.
+
+```bit
+import {
+  MldsaKeypair, mldsaKeygenSeed, mldsaSign, mldsaSignCtx, mldsaVerify, mldsaVerifyCtx,
+} from "std/crypto"
+
+// Derive a key pair from a stored 32-byte seed, sign a message, and verify it.
+function signAndVerify(seed: []byte, msg: []byte): bool {
+  let kp = mldsaKeygenSeed(seed)
+  let sig = mldsaSign(kp.sk, msg)
+  return mldsaVerify(kp.pk, msg, sig)
+}
+
+// A context string binds the signature to an application domain; verification
+// must use the same context, and a single flipped signature bit must fail.
+function contextRoundTrip(kp: MldsaKeypair, msg: []byte, ctx: []byte): bool {
+  let sig = mldsaSignCtx(kp.sk, msg, ctx)
+  sig[0] = sig[0] ^ 0x01
+  return mldsaVerifyCtx(kp.pk, msg, sig, ctx) == false
+}
+```
+
+### `MldsaKeypair`
+
+An ML-DSA-65 key pair: the 1952-byte public key `pk` and the 4032-byte secret key
+`sk`, both FIPS 204 encodings. Returned by `mldsaKeygen` and `mldsaKeygenSeed`.
+
+### `mldsaKeygen(): MldsaKeypair`
+
+Generate a fresh key pair (FIPS 204 Algorithm 1) from 32 bytes of OS
+cryptographic randomness. The seed is not retained; keep the returned `sk` to
+sign.
+
+### `mldsaKeygenSeed(seed: []byte): MldsaKeypair`
+
+Derive a key pair deterministically from the 32-byte `seed` (the FIPS 204 `ξ`
+value), via KeyGen_internal. The same seed always yields the same keys, so a
+caller may store the 32-byte seed instead of the 4032-byte secret key. Panics if
+`seed` is not exactly 32 bytes.
+
+### `mldsaSign(sk: []byte, msg: []byte): []byte`
+
+Sign `msg` under signing key `sk` with an empty context (FIPS 204 Algorithm 2),
+returning the 3309-byte signature. Deterministic: the signature is a pure function
+of `(sk, msg)`. Panics if `sk` is not 4032 bytes.
+
+### `mldsaSignCtx(sk: []byte, msg: []byte, ctx: []byte): []byte`
+
+Sign `msg` under `sk` with an application context string `ctx`, which must be at
+most 255 bytes. Verification must supply the same `ctx`. Otherwise identical to
+`mldsaSign`, which is `mldsaSignCtx` with an empty context. Panics on a
+wrong-length `sk` or an over-long `ctx`.
+
+### `mldsaVerify(pk: []byte, msg: []byte, sig: []byte): bool`
+
+Verify signature `sig` on `msg` under verification key `pk` with an empty context
+(FIPS 204 Algorithm 3). Returns `true` only if the signature is well formed and
+valid; any malformed input — wrong-length key or signature, out-of-bounds `z`, or
+a malformed hint — yields `false` rather than an error.
+
+### `mldsaVerifyCtx(pk: []byte, msg: []byte, sig: []byte, ctx: []byte): bool`
+
+Verify `sig` on `msg` under `pk` with context `ctx` (at most 255 bytes). The
+context must match the one used when signing. `mldsaVerify` is this with an empty
+context.
