@@ -213,6 +213,25 @@ fn argReg(class: regalloc.Class, class_ordinal: u32) ?u5 {
     };
 }
 
+/// How many of `args` overflow the AAPCS64 argument registers — the count of
+/// 8-byte outgoing stack slots this call needs. `base_int_ord`/`base_float_ord`
+/// pre-charge the banks exactly as the matching `marshalArgs` call does (arg0
+/// is reserved for a closure env / interface receiver at the `call_value` /
+/// `call_iface` sites). Free function (not a `Ctx` method) so the frame layout
+/// can size the outgoing area before `Ctx` exists.
+fn stackArgSlots(tctx: *const TypeContext, f: *const ir.Function, args: []const u32, base_int_ord: u32, base_float_ord: u32) u32 {
+    var int_ord = base_int_ord;
+    var float_ord = base_float_ord;
+    var slots: u32 = 0;
+    for (args) |a| {
+        const class = common.classOf(tctx, f.valueType(@enumFromInt(a)));
+        const ord = if (class == .int) int_ord else float_ord;
+        if (ord >= max_arg_regs) slots += 1;
+        if (class == .int) int_ord += 1 else float_ord += 1;
+    }
+    return slots;
+}
+
 fn retRegNum(class: regalloc.Class) u5 {
     _ = class;
     return 0; // x0 or d0, both register #0 in their file
@@ -805,35 +824,59 @@ const JumpFixup = struct { patch_offset: u32, cond: ?u4, target: ir.BlockId };
 // moves except once at entry and once before `ret` — no per-spill `rbp`
 // indirection needed the way `x64.zig` uses it, though the encoder would
 // happily take any base register). Layout, low to high address:
-//   [0, spill_bytes)                         spill slots, 8 bytes each
-//   [spill_bytes, +gpr_bytes)                saved callee-saved GPRs
+//   [0, outgoing_bytes)                      outgoing stack-argument area
+//   [outgoing_bytes, +spill_bytes)           spill slots, 8 bytes each
+//   [+spill_bytes, +gpr_bytes)               saved callee-saved GPRs
 //   [+gpr_bytes, +fpr_bytes)                  saved callee-saved FP regs
 //   [frame_size-16, frame_size-8)             saved x29 (frame record)
 //   [frame_size-8, frame_size)                saved x30 (frame record)
 // `frame_size` is always a multiple of 16 (AAPCS64 requires SP 16-aligned at
 // all times, not just at call boundaries).
+//
+// The outgoing-argument area holds the 9th+ integer/reference or float
+// argument of any call this function makes (AAPCS64 passes the first eight of
+// each class in x0–x7 / v0–v7; the rest spill to the caller's stack). Sized to
+// the widest call (`outgoing_bytes`) and reserved at the bottom of the frame —
+// rather than a transient `sub sp` per call the way `x64.zig` does — precisely
+// because everything here is SP-relative: a mid-body SP shift would move every
+// spill/save offset. The callee finds these same words just above its own
+// frame at `[sp + frame_size + 8*k]` (its caller stored them at its own
+// `[sp + 8*k]`, and the prologue lowered SP by `frame_size`).
 // ============================================================================
 
 const FrameInfo = struct {
     saved_gpr: []const Reg,
     saved_fpr: []const FReg,
     num_spill_slots: u32,
+    /// Bytes reserved at the bottom of the frame for outgoing stack arguments
+    /// (0 if every call this function makes fits in registers). A multiple of 8.
+    outgoing_bytes: u32,
     frame_size: u32,
 
-    fn spillOffset(_: FrameInfo, slot: u32) u32 {
-        return slot * 8;
+    fn spillOffset(self: FrameInfo, slot: u32) u32 {
+        return self.outgoing_bytes + slot * 8;
     }
     fn gprSaveOffset(self: FrameInfo, i: usize) u32 {
-        return self.num_spill_slots * 8 + @as(u32, @intCast(i)) * 8;
+        return self.outgoing_bytes + self.num_spill_slots * 8 + @as(u32, @intCast(i)) * 8;
     }
     fn fprSaveOffset(self: FrameInfo, i: usize) u32 {
-        return self.num_spill_slots * 8 + @as(u32, @intCast(self.saved_gpr.len)) * 8 + @as(u32, @intCast(i)) * 8;
+        return self.outgoing_bytes + self.num_spill_slots * 8 + @as(u32, @intCast(self.saved_gpr.len)) * 8 + @as(u32, @intCast(i)) * 8;
     }
     fn fpOffset(self: FrameInfo) u32 {
         return self.frame_size - 16;
     }
     fn lrOffset(self: FrameInfo) u32 {
         return self.frame_size - 8;
+    }
+    /// SP-relative byte offset of the k-th outgoing stack argument (the caller
+    /// side stores here just before a `bl`).
+    fn outgoingArgOffset(_: FrameInfo, k: u32) u32 {
+        return k * 8;
+    }
+    /// SP-relative byte offset of the k-th incoming stack argument — the words
+    /// the caller placed just above this frame (see the layout note above).
+    fn incomingArgOffset(self: FrameInfo, k: u32) u32 {
+        return self.frame_size + k * 8;
     }
 };
 
@@ -1436,6 +1479,33 @@ const safepoint_symbol = "bit_rt_safepoint";
 /// integer/float register banks already `base_int_ord`/`base_float_ord` deep.
 /// `emitCall` passes zeros (a plain call); `emitCallValue` passes `1,0` to
 /// reserve x0 for the closure's environment pointer.
+/// Stores one overflow argument to its outgoing stack slot `[sp + off]` in the
+/// reserved area at the bottom of this frame. `src` is sp-relative (a spill) or
+/// a physical register; the frame never moves, so both the slot and every spill
+/// source stay put — the mem staging temp (scratch1/fscratch1) is free here
+/// because these run before the register parallel moves.
+fn emitOutgoingStackArg(self: *Ctx, src: PLoc, class: regalloc.Class, off: u32) !void {
+    switch (class) {
+        .int => switch (src) {
+            .reg => |r| try self.storeImm(@enumFromInt(r), reg_sp, off, 8),
+            .mem => |m| {
+                try self.loadImm(scratch1, reg_sp, m, 8, false);
+                try self.storeImm(scratch1, reg_sp, off, 8);
+            },
+        },
+        .float => switch (src) {
+            .reg => |r| try self.storeImmF(@enumFromInt(r), reg_sp, off, 8),
+            .mem => |m| {
+                try self.loadImmF(fscratch1, reg_sp, m, 8);
+                try self.storeImmF(fscratch1, reg_sp, off, 8);
+            },
+        },
+    }
+}
+
+/// Arguments past x0–x7 / v0–v7 overflow to the outgoing stack-argument area at
+/// the bottom of the frame (`FrameInfo` layout note): each is stored at
+/// `[sp + 8*k]` in argument order, before the register parallel moves run.
 fn marshalArgs(self: *Ctx, args: []const u32, base_int_ord: u32, base_float_ord: u32) CodegenError!void {
     var int_ord: u32 = base_int_ord;
     var float_ord: u32 = base_float_ord;
@@ -1444,14 +1514,19 @@ fn marshalArgs(self: *Ctx, args: []const u32, base_int_ord: u32, base_float_ord:
     var float_moves = try std.ArrayList(PMove).initCapacity(self.gpa, args.len);
     defer float_moves.deinit(self.gpa);
 
+    var stack_index: u32 = 0;
     for (args) |a| {
         const v: ir.ValueId = @enumFromInt(a);
         const class = common.classOf(self.tctx(), self.f.valueType(v));
         const ord = if (class == .int) int_ord else float_ord;
-        const reg = argReg(class, ord) orelse return error.TooManyArguments;
-        if (class == .int) int_ord += 1 else float_ord += 1;
         const from = plocOf(self, vregOf(self, v), class);
-        try (if (class == .int) &int_moves else &float_moves).append(self.gpa, .{ .from = from, .to = .{ .reg = reg } });
+        if (argReg(class, ord)) |reg| {
+            try (if (class == .int) &int_moves else &float_moves).append(self.gpa, .{ .from = from, .to = .{ .reg = reg } });
+        } else {
+            try emitOutgoingStackArg(self, from, class, self.frame.outgoingArgOffset(stack_index));
+            stack_index += 1;
+        }
+        if (class == .int) int_ord += 1 else float_ord += 1;
     }
     try sequentializeAndEmit(self, int_moves.items, .int);
     try sequentializeAndEmit(self, float_moves.items, .float);
@@ -1916,7 +1991,24 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         }
     }
 
-    const raw_size: u32 = 16 + @as(u32, @intCast(saved_gpr_len)) * 8 + @as(u32, @intCast(saved_fpr_len)) * 8 + result.num_spill_slots * 8;
+    // Size the outgoing stack-argument area to the widest call this function
+    // makes (see the `FrameInfo` layout note): the 9th+ argument of any class
+    // spills to the stack. Only real `bl`s carry user args — the synthetic
+    // back-edge safepoint, `gc_alloc`, and `make_closure` never overflow.
+    var outgoing_slots: u32 = 0;
+    for (0..intervals.len) |vi| {
+        const need: u32 = switch (f.decode(@enumFromInt(vi))) {
+            .call => |c| stackArgSlots(tctx, f, c.args, 0, 0),
+            .rt_call => |rc| stackArgSlots(tctx, f, rc.args, 0, 0),
+            .call_value => |c| stackArgSlots(tctx, f, c.args, 1, 0), // arg0 = env
+            .call_iface => |c| stackArgSlots(tctx, f, c.args, 1, 0), // arg0 = receiver
+            else => 0,
+        };
+        if (need > outgoing_slots) outgoing_slots = need;
+    }
+    const outgoing_bytes: u32 = outgoing_slots * 8;
+
+    const raw_size: u32 = outgoing_bytes + 16 + @as(u32, @intCast(saved_gpr_len)) * 8 + @as(u32, @intCast(saved_fpr_len)) * 8 + result.num_spill_slots * 8;
     const frame_size = alignFrame16(raw_size);
     // Every access this backend emits into the frame uses the unsigned-imm12
     // form when possible: 4095*8 bytes reaches any realistic function frame;
@@ -1928,6 +2020,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         .saved_gpr = saved_gpr_buf[0..saved_gpr_len],
         .saved_fpr = saved_fpr_buf[0..saved_fpr_len],
         .num_spill_slots = result.num_spill_slots,
+        .outgoing_bytes = outgoing_bytes,
         .frame_size = frame_size,
     };
 
@@ -1974,14 +2067,22 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         defer int_moves.deinit(gpa);
         var float_moves = try std.ArrayList(PMove).initCapacity(gpa, f.param_types.len);
         defer float_moves.deinit(gpa);
+        var stack_index: u32 = 0;
         for (f.param_types, 0..) |pt, pi| {
             const class = common.classOf(tctx, pt);
             const ord = if (class == .int) int_ord else float_ord;
-            const reg = argReg(class, ord) orelse return error.TooManyArguments;
-            if (class == .int) int_ord += 1 else float_ord += 1;
             const param_v = entry_blk.paramValue(@intCast(pi));
             const to = plocOf(&ctx, @intFromEnum(param_v), class);
-            try (if (class == .int) &int_moves else &float_moves).append(gpa, .{ .from = .{ .reg = reg }, .to = to });
+            // Mirror of `marshalArgs`: params 1–8 int / 1–8 float arrive in the
+            // ABI registers; the rest sit just above this frame at
+            // `[sp + frame_size + 8*k]` (the caller's outgoing area).
+            const from: PLoc = if (argReg(class, ord)) |reg| .{ .reg = reg } else blk: {
+                const off = frame.incomingArgOffset(stack_index);
+                stack_index += 1;
+                break :blk .{ .mem = off };
+            };
+            if (class == .int) int_ord += 1 else float_ord += 1;
+            try (if (class == .int) &int_moves else &float_moves).append(gpa, .{ .from = from, .to = to });
         }
         try sequentializeAndEmit(&ctx, int_moves.items, .int);
         try sequentializeAndEmit(&ctx, float_moves.items, .float);
