@@ -1,0 +1,242 @@
+// Bit standard library — crypto module, scrypt (RFC 7914).
+//
+// scrypt is the memory-hard password-based key derivation function: like PBKDF2
+// it stretches a low-entropy password into a derived key of any length, but it
+// is deliberately *memory*-hard as well as CPU-hard. The cost parameter `N`
+// forces the derivation to fill and randomly re-read an `N * 128 * r`-byte table,
+// so a brute-force attacker cannot trade the memory away for cheap parallel
+// hardware the way they can with PBKDF2. Use it to turn a password into an
+// encryption key, or (with a per-user random salt) to store a password verifier.
+//
+// The construction has four nested layers (RFC 7914 §2–§6):
+//
+//   scrypt   = PBKDF2-HMAC-SHA256 expand -> p * ROMix -> PBKDF2-HMAC-SHA256
+//   ROMix    = fill an N-entry table, then N random-indexed BlockMix passes
+//   BlockMix = 2r Salsa20/8 invocations, shuffled into the mixing order
+//   Salsa20/8 = the 8-round Salsa20 core on a 64-byte block
+//
+// PBKDF2 (with a single iteration) does the initial and final expansion, so the
+// digest-specific work is shared with `pbkdf2`/`hmac`; the memory-hard middle is
+// all integer arithmetic on little-endian `u32` words. This file is part of the
+// flat `std/crypto` module, so it names `pbkdf2`, `newSha256`, `Hash`, and
+// `newError` from its siblings and the prelude without importing them. Every
+// output is deterministic in the six inputs and checked against the RFC 7914 §12
+// known-answer vectors.
+
+// A `() => Hash` view of the concrete SHA-256 constructor, so `pbkdf2` (which
+// takes a hash constructor) can drive HMAC-SHA-256 — scrypt's fixed PRF.
+function scryptSha256(): Hash { return newSha256() }
+
+// Rotate the 32-bit word `x` left by `n` bits, `1 <= n <= 31`. The two shifted
+// halves cover disjoint bit positions, so the `|` reassembles the rotation.
+function scryptRotl32(x: u32, n: u32): u32 {
+  return (x << n) | (x >> (32 - n))
+}
+
+// One Salsa20 quarter-round on words `a`, `b`, `c`, `d` of `x`, in place: the
+// add-rotate-xor chain that diffuses each word into the next (RFC 7914 §3, the
+// four-line group repeated across the column and row rounds).
+function scryptQuarter(x: []u32, a: int, b: int, c: int, d: int) {
+  x[b] = x[b] ^ scryptRotl32(x[a] + x[d], 7)
+  x[c] = x[c] ^ scryptRotl32(x[b] + x[a], 9)
+  x[d] = x[d] ^ scryptRotl32(x[c] + x[b], 13)
+  x[a] = x[a] ^ scryptRotl32(x[d] + x[c], 18)
+}
+
+// The Salsa20/8 core (RFC 7914 §3) on the 16-word block `b`, in place: run four
+// double-rounds (eight rounds — four column quarter-rounds then four row ones)
+// on a working copy, then add the original block back word-wise.
+function scryptSalsa8(b: []u32) {
+  let x = []u32(16)
+  let i = 0
+  while (i < 16) {
+    x[i] = b[i]
+    i = i + 1
+  }
+  let r = 0
+  while (r < 4) {
+    scryptQuarter(x, 0, 4, 8, 12)
+    scryptQuarter(x, 5, 9, 13, 1)
+    scryptQuarter(x, 10, 14, 2, 6)
+    scryptQuarter(x, 15, 3, 7, 11)
+    scryptQuarter(x, 0, 1, 2, 3)
+    scryptQuarter(x, 5, 6, 7, 4)
+    scryptQuarter(x, 10, 11, 8, 9)
+    scryptQuarter(x, 15, 12, 13, 14)
+    r = r + 1
+  }
+  i = 0
+  while (i < 16) {
+    b[i] = b[i] + x[i]
+    i = i + 1
+  }
+}
+
+// BlockMix (RFC 7914 §4): map the `2r` 64-byte sub-blocks of `bIn` (32r words) to
+// `bOut`. Chain X = Salsa20/8(X ^ B[j]) across every sub-block, writing the
+// even-indexed results to the first half of `bOut` and the odd-indexed ones to
+// the second, which is the shuffle that scrypt's ROMix relies on. `bIn` and
+// `bOut` must be distinct buffers.
+function scryptBlockMix(bIn: []u32, bOut: []u32, r: int) {
+  let x = []u32(16)
+  let last = (2 * r - 1) * 16
+  let i = 0
+  while (i < 16) {
+    x[i] = bIn[last + i]
+    i = i + 1
+  }
+  let j = 0
+  while (j < 2 * r) {
+    let off = j * 16
+    i = 0
+    while (i < 16) {
+      x[i] = x[i] ^ bIn[off + i]
+      i = i + 1
+    }
+    scryptSalsa8(x)
+    let dst = (j / 2) * 16
+    if (j % 2 != 0) {
+      dst = (r + j / 2) * 16
+    }
+    i = 0
+    while (i < 16) {
+      bOut[dst + i] = x[i]
+      i = i + 1
+    }
+    j = j + 1
+  }
+}
+
+// Integerify (RFC 7914 §5): the low 64 bits of the final 64-byte sub-block of the
+// 32r-word block at `off`, taken as a little-endian integer and reduced modulo
+// the power-of-two `n` — the random table index for the next ROMix pass. `n` is a
+// power of two, so the reduction is a mask.
+function scryptIntegerify(b: []u32, off: int, r: int, n: int): int {
+  let base = off + (2 * r - 1) * 16
+  let val = u64(b[base]) | (u64(b[base + 1]) << 32)
+  return int(val & u64(n - 1))
+}
+
+// ROMix (RFC 7914 §5, the SMix_r function) on the 32r-word block at `off` of `b`,
+// in place. First fill an `n`-entry table `v` with the successive BlockMix
+// states; then run `n` more BlockMix passes, each XORing in the table entry at a
+// data-dependent index before mixing. The data-dependent reads over the whole
+// `n * 128 * r`-byte table are what make scrypt memory-hard.
+function scryptRomix(b: []u32, off: int, n: int, r: int) {
+  let words = 32 * r
+  let v = []u32(n * words)
+  let x = []u32(words)
+  let y = []u32(words)
+  let i = 0
+  while (i < words) {
+    x[i] = b[off + i]
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    let vbase = i * words
+    let k = 0
+    while (k < words) {
+      v[vbase + k] = x[k]
+      k = k + 1
+    }
+    scryptBlockMix(x, y, r)
+    k = 0
+    while (k < words) {
+      x[k] = y[k]
+      k = k + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    let jbase = scryptIntegerify(x, 0, r, n) * words
+    let k = 0
+    while (k < words) {
+      x[k] = x[k] ^ v[jbase + k]
+      k = k + 1
+    }
+    scryptBlockMix(x, y, r)
+    k = 0
+    while (k < words) {
+      x[k] = y[k]
+      k = k + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < words) {
+    b[off + i] = x[i]
+    i = i + 1
+  }
+}
+
+// Read `words` little-endian `u32`s from `b` at byte offset `boff` into `w` at
+// `woff` — the byte->word view PBKDF2's output feeds into the mixing core.
+function scryptLoadWords(b: []byte, boff: int, w: []u32, woff: int, words: int) {
+  let i = 0
+  while (i < words) {
+    let o = boff + i * 4
+    w[woff + i] = u32(b[o]) | (u32(b[o + 1]) << 8) | (u32(b[o + 2]) << 16) | (u32(b[o + 3]) << 24)
+    i = i + 1
+  }
+}
+
+// Write `words` `u32`s from `w` at `woff` little-endian into `b` at byte offset
+// `boff` — the inverse of `scryptLoadWords`, serializing the mixed block back for
+// the final PBKDF2 expansion.
+function scryptStoreWords(w: []u32, woff: int, b: []byte, boff: int, words: int) {
+  let i = 0
+  while (i < words) {
+    let v = w[woff + i]
+    let o = boff + i * 4
+    b[o] = byte(v)
+    b[o + 1] = byte(v >> 8)
+    b[o + 2] = byte(v >> 16)
+    b[o + 3] = byte(v >> 24)
+    i = i + 1
+  }
+}
+
+// True when `n` is a power of two strictly greater than one — scrypt requires
+// `N` to be a power of two so Integerify's modulo is an exact bit mask.
+function scryptIsPow2(n: int): bool {
+  return n > 1 && (n & (n - 1)) == 0
+}
+
+// scrypt (RFC 7914 §6): derive `outLen` bytes of key material from `password` and
+// `salt`, memory-hard in the cost parameters `N` (a power of two > 1), the block
+// size `r`, and the parallelization `p`. PBKDF2-HMAC-SHA256 expands the password
+// into `p` blocks, each block is run through ROMix, and a final PBKDF2 pass over
+// the mixed blocks yields the derived key. The result is deterministic in all six
+// inputs. Fails if `N` is not a power of two above one, or if `r`, `p`, or
+// `outLen` is below one.
+export function scrypt(password: []byte, salt: []byte, N: int, r: int, p: int, outLen: int): []byte! {
+  if (!scryptIsPow2(N)) {
+    fail newError("scrypt: N must be a power of two greater than 1")
+  }
+  if (r < 1) {
+    fail newError("scrypt: r must be >= 1")
+  }
+  if (p < 1) {
+    fail newError("scrypt: p must be >= 1")
+  }
+  if (outLen < 1) {
+    fail newError("scrypt: outLen must be >= 1")
+  }
+
+  let mfLen = 128 * r
+  let words = 32 * r
+  let b = pbkdf2(scryptSha256, password, salt, 1, p * mfLen)
+
+  let bw = []u32(p * words)
+  scryptLoadWords(b, 0, bw, 0, p * words)
+  let i = 0
+  while (i < p) {
+    scryptRomix(bw, i * words, N, r)
+    i = i + 1
+  }
+  scryptStoreWords(bw, 0, b, 0, p * words)
+
+  return pbkdf2(scryptSha256, password, b, 1, outLen)
+}
