@@ -1676,3 +1676,102 @@ zero. This is the OS2IP direction (RFC 8017).
 `n` as exactly `outLen` big-endian bytes, left-padded with zeros. Fails if `n`
 does not fit in `outLen` bytes rather than silently truncating — the safe I2OSP
 policy, so a key or point that overflows its field width is caught.
+
+## NIST curves (P-256/P-384)
+
+Elliptic-curve point arithmetic over the two prime-field NIST curves, secp256r1
+(P-256) and secp384r1 (P-384), the building block for ECDSA and ECDH. Both curves
+have `a = -3` and a prime group order, so a single set of *complete* addition
+formulas (Renes–Costello–Batina, 2016) covers every case — the identity, a
+doubling, and `P + (-P)` — with no exceptional inputs. Scalar multiplication is a
+Montgomery ladder whose accumulators are exchanged by a branchless masked select,
+so it has no secret-dependent branch or table index and runs a fixed number of
+iterations per curve.
+
+Constant-time scope: the ladder is branch-safe by construction, but the
+underlying field arithmetic is the variable-width `Nat` bigint, whose timing
+still depends on operand limb counts. Machine-level timing-flat field arithmetic
+awaits the fixed-width Montgomery reduction noted for the bigint module; until
+then this code resists the classic branch/index side channels but is not a
+defense against a limb-timing adversary. Scalars are taken as a `Nat`; a private
+key in bytes becomes one with `bigintFromBytes`, and a decoded point is always
+validated to lie on the curve before it is multiplied.
+
+```bit
+import {
+  Point,
+  nistecP256, nistecP384, nistecScalarBaseMult, nistecScalarMult,
+  nistecPointEncode, nistecPointDecode, nistecIsOnCurve,
+  bigintFromBytes,
+} from "std/crypto"
+
+// The SEC 1 uncompressed public key for a P-256 private scalar.
+function p256PublicKey(privateKey: []byte): []byte! {
+  let c = nistecP256()
+  let pub = nistecScalarBaseMult(c, bigintFromBytes(privateKey))
+  return nistecPointEncode(c, pub, false)?
+}
+
+// The ECDH shared secret: decode and validate the peer's point, multiply it by
+// our scalar, and return the compressed result.
+function p256Ecdh(privateKey: []byte, peerPublic: []byte): []byte! {
+  let c = nistecP256()
+  let peer = nistecPointDecode(c, peerPublic)?
+  let shared = nistecScalarMult(c, peer, bigintFromBytes(privateKey))?
+  return nistecPointEncode(c, shared, true)?
+}
+
+// P-384 goes through the same API; only the curve constructor changes.
+function p384OnCurve(point: Point): bool {
+  return nistecIsOnCurve(nistecP384(), point)
+}
+```
+
+### `Curve`
+
+A curve's domain parameters (field prime, order, coefficients, and base point)
+plus the values derived once at construction. The fields are module-private; a
+`Curve` is obtained from `nistecP256` / `nistecP384` and passed opaquely to the
+point routines.
+
+### `Point`
+
+An affine curve point with exported `Nat` coordinates `x` and `y`, or the point
+at infinity when the `infinity` field is set.
+
+### `nistecP256(): Curve`
+
+The NIST P-256 curve (secp256r1 / prime256v1), a 256-bit prime-order curve.
+
+### `nistecP384(): Curve`
+
+The NIST P-384 curve (secp384r1), a 384-bit prime-order curve.
+
+### `nistecScalarBaseMult(curve: Curve, scalar: Nat): Point`
+
+`scalar * G`, the base-point multiplication that derives a public key from a
+private scalar. `G` is always valid, so this cannot fail.
+
+### `nistecScalarMult(curve: Curve, point: Point, scalar: Nat): Point!`
+
+`scalar * point`. Rejects an off-curve `point` before multiplying, closing the
+invalid-curve attack; the point at infinity maps to itself.
+
+### `nistecIsOnCurve(curve: Curve, point: Point): bool`
+
+Whether `point` satisfies `y^2 = x^3 + a*x + b (mod p)` with both coordinates in
+`[0, p)`. The point at infinity is on the curve.
+
+### `nistecPointEncode(curve: Curve, point: Point, compressed: bool): []byte!`
+
+The SEC 1 octet encoding of `point`: a single `0x00` for infinity, the
+`0x04 || X || Y` uncompressed form, or — when `compressed` is set — the
+`0x02|0x03 || X` compressed form whose prefix carries `y`'s low bit. Fails if a
+coordinate does not fit the field width.
+
+### `nistecPointDecode(curve: Curve, data: []byte): Point!`
+
+Decode a SEC 1 octet string (infinity, uncompressed, or compressed) into a
+validated affine point; compressed input recovers `y` by a modular square root.
+Fails on a bad length, an out-of-range coordinate, an unknown prefix, or a point
+that is not on the curve.
