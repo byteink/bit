@@ -3219,3 +3219,102 @@ Generate a fresh X448 key pair. The private key is 56 bytes from the OS CSPRNG
 stored raw (clamped only inside `x448`), and the public key is
 `priv * basepoint`. The clamp guarantees the public key is never a small-order
 point.
+## X.509 certificates
+
+X.509 v3 certificate parsing and chain verification (RFC 5280) — the identity
+layer a TLS client and a trust store are built from. A DER certificate is parsed
+into a `Certificate` with the fields a caller acts on (subject and issuer
+distinguished names, validity window, public key, SubjectAltName, BasicConstraints,
+KeyUsage, ExtendedKeyUsage). One certificate's signature is verified under an
+issuer's public key, dispatching on the signature algorithm across RSA PKCS#1
+v1.5, RSA-PSS, ECDSA (P-256/P-384), and Ed25519. A leaf is verified up a chain to
+a trusted root, enforcing every issuer's CA basic constraint and path length, each
+certificate's validity window, key-usage and extended-key-usage sanity, and the
+hostname against the SubjectAltName.
+
+Verification is deterministic: the current time is passed in as `nowUnix` (Unix
+seconds) rather than read from a clock, so the same inputs always reach the same
+decision and tests need no time control. Parsing is strict DER (a malformed
+certificate is rejected, not best-guessed), and hostname matching follows RFC 6125
+— a single leftmost-label `*.` wildcard, case-insensitive DNS comparison, and IPv4
+literals matched against iPAddress entries, with no deprecated subject-CN fallback.
+
+```bit
+import { x509Parse, x509VerifySignature, x509VerifyChain, x509MatchHostname, Certificate } from "std/crypto"
+
+// Whether `leafDer` chains to one of `roots` (through `intermediates`) for `host`
+// at `nowUnix`. Any parse or verification failure returns false. `nowUnix` is
+// injected, so the decision never depends on the wall clock.
+function trusts(leafDer: []byte, intermediates: []Certificate, roots: []Certificate, host: string, nowUnix: int): bool {
+  let leaf = x509Parse(leafDer) catch e {
+    return false
+  }
+  x509VerifyChain(leaf, intermediates, roots, host, nowUnix) catch e {
+    return false
+  }
+  return true
+}
+
+// Whether `cert` was directly signed by `issuer` and is valid for `host` — the
+// building block `x509VerifyChain` applies at each step of a path.
+function signedBy(cert: Certificate, issuer: Certificate, host: string): bool {
+  return x509MatchHostname(cert, host) && x509VerifySignature(cert, issuer)
+}
+```
+
+### `Certificate`
+
+A parsed X.509 v3 certificate. All fields are exported. `tbs` is the exact DER of
+the `tbsCertificate` the signature covers and `signature` is the raw signatureValue.
+`pubKeyAlg` is one of the `x509Key*` discriminants and selects how `pubKeyBytes`
+(the subjectPublicKey) is read; `ecCurveOid` names the curve for an EC key.
+`notBefore`/`notAfter` are Unix seconds. `dnsNames` and `ipAddresses` come from the
+SubjectAltName; `isCa`, `maxPathLen`/`hasPathLen` from BasicConstraints; `keyUsage`
+is a bitmask (`1 << n` for DER KeyUsage bit `n`); `extKeyUsageOids` lists the
+ExtendedKeyUsage purposes.
+
+### `x509KeyRSA: int`
+
+The `pubKeyAlg` discriminant for an RSA (rsaEncryption) key: `pubKeyBytes` holds the
+PKCS#1 `RSAPublicKey` DER.
+
+### `x509KeyECDSA: int`
+
+The `pubKeyAlg` discriminant for an elliptic-curve (id-ecPublicKey) key:
+`pubKeyBytes` holds the SEC 1 point and `ecCurveOid` names the curve.
+
+### `x509KeyEd25519: int`
+
+The `pubKeyAlg` discriminant for an Ed25519 key: `pubKeyBytes` holds the 32-byte
+public key.
+
+### `x509Parse(der: []byte): Certificate!`
+
+Parse a DER `Certificate`. Fails on any structurally malformed input (strict DER).
+The returned `Certificate` exposes the identity, validity, public key, and the
+extensions the verifier acts on.
+
+### `x509VerifySignature(cert: Certificate, issuer: Certificate): bool`
+
+Whether `cert`'s signature is valid under `issuer`'s public key. Dispatches on the
+signature algorithm: RSA PKCS#1 v1.5 and RSA-PSS (SHA-256/384/512), ECDSA over
+P-256/P-384, and Ed25519. An issuer key of the wrong type, a malformed signature,
+or an unknown algorithm returns false rather than raising.
+
+### `x509VerifyChain(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, hostname: string, nowUnix: int): ()!`
+
+Verify `leaf` up to a trusted root, failing with a specific error for the first
+problem found: a hostname that does not match the SubjectAltName, a certificate
+outside its validity window at `nowUnix`, a leaf whose ExtendedKeyUsage forbids
+server authentication, an issuer that is not a CA (or whose key usage forbids
+certificate signing), a broken signature, an unbuildable chain, or a violated
+path-length constraint. A path is built by matching each certificate's issuer
+distinguished name against a candidate subject, preferring the trusted `roots`
+over the untrusted `intermediates`.
+
+### `x509MatchHostname(cert: Certificate, hostname: string): bool`
+
+Whether `hostname` matches `cert`'s SubjectAltName. An IPv4 literal is matched
+against the iPAddress entries; any other hostname is matched case-insensitively
+against the dNSName entries, honoring a single leftmost-label `*.` wildcard. The
+deprecated subject-CN fallback is not used.

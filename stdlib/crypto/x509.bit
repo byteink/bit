@@ -1,0 +1,920 @@
+// Bit standard library — crypto module, X.509 v3 certificates (RFC 5280).
+//
+// Parse a DER `Certificate`, verify one certificate's signature under an
+// issuer's public key, and verify a leaf certificate up a chain to a trusted
+// root — the pieces a TLS client (#1206/#1207) and a trust store (#1200) build
+// on. Being part of the flat `std/crypto` module, this file names the `asn1*`
+// DER codec, `rsa*` / `ecdsa*` / `ed25519*` verifiers, the `Curve` /
+// `nistecP256` / `nistecP384` parameters, `newSha256` / `newSha384` /
+// `newSha512`, `digest`, and `newError` from its siblings with no import. Every
+// private free function is prefixed `x509` to keep the namespace clean.
+//
+// Parsing is strict-DER (inherited from `asn1.bit`) and rejects rather than
+// best-efforts; a certificate is a classic parser attack surface. Time is never
+// read from a clock: `x509VerifyChain` takes the current time as an explicit
+// `nowUnix`, so verification is deterministic and testable. Signature
+// verification recomputes over the exact `tbsCertificate` DER, and the chain
+// walk enforces the CA basic constraint, the path-length constraint, each
+// certificate's validity window, key-usage / extended-key-usage sanity, and the
+// hostname against the SubjectAltName (leftmost-label wildcards and IP match).
+
+// ---------------------------------------------------------------------------
+// Public-key algorithm discriminants (the `pubKeyAlg` field of `Certificate`)
+// ---------------------------------------------------------------------------
+
+// An RSA public key (rsaEncryption): `pubKeyBytes` is the PKCS#1 `RSAPublicKey`.
+export const x509KeyRSA: int = 1
+// An elliptic-curve public key (id-ecPublicKey): `pubKeyBytes` is the SEC 1
+// point and `ecCurveOid` names the curve.
+export const x509KeyECDSA: int = 2
+// An Ed25519 public key: `pubKeyBytes` is the 32-byte key.
+export const x509KeyEd25519: int = 3
+
+// The keyCertSign KeyUsage bit (RFC 5280 §4.2.1.3), as a mask into the
+// `keyUsage` field: DER BIT STRING bit `n` maps to `1 << n` here, and
+// keyCertSign is bit 5.
+const x509KuKeyCertSign: int = 1 << 5
+
+// ---------------------------------------------------------------------------
+// Object identifiers (dotted form, compared as strings)
+// ---------------------------------------------------------------------------
+
+// Public-key algorithm identifiers.
+const x509OidRsaEncryption: string = "1.2.840.113549.1.1.1"
+const x509OidEcPublicKey: string = "1.2.840.10045.2.1"
+const x509OidEd25519: string = "1.3.101.112"
+
+// Named-curve identifiers for EC keys.
+const x509OidP256: string = "1.2.840.10045.3.1.7"
+const x509OidP384: string = "1.3.132.0.34"
+
+// Signature algorithm identifiers.
+const x509OidSha256Rsa: string = "1.2.840.113549.1.1.11"
+const x509OidSha384Rsa: string = "1.2.840.113549.1.1.12"
+const x509OidSha512Rsa: string = "1.2.840.113549.1.1.13"
+const x509OidRsaPss: string = "1.2.840.113549.1.1.10"
+const x509OidEcdsaSha256: string = "1.2.840.10045.4.3.2"
+const x509OidEcdsaSha384: string = "1.2.840.10045.4.3.3"
+
+// The three RSA-PSS hash OIDs the params may name.
+const x509OidSha256: string = "2.16.840.1.101.3.4.2.1"
+const x509OidSha384: string = "2.16.840.1.101.3.4.2.2"
+const x509OidSha512: string = "2.16.840.1.101.3.4.2.3"
+
+// Extension identifiers.
+const x509OidSubjectAltName: string = "2.5.29.17"
+const x509OidBasicConstraints: string = "2.5.29.19"
+const x509OidKeyUsage: string = "2.5.29.15"
+const x509OidExtKeyUsage: string = "2.5.29.37"
+const x509OidSubjectKeyId: string = "2.5.29.14"
+const x509OidAuthorityKeyId: string = "2.5.29.35"
+
+// Extended-key-usage purposes.
+const x509OidServerAuth: string = "1.3.6.1.5.5.7.3.1"
+const x509OidAnyExtKeyUsage: string = "2.5.29.37.0"
+
+// A safety cap on the chain depth the walk will follow (Power of 10).
+const x509MaxChainDepth: int = 16
+
+// ---------------------------------------------------------------------------
+// The parsed certificate
+// ---------------------------------------------------------------------------
+
+// A parsed X.509 v3 certificate. All fields are exported so a TLS or trust-store
+// caller can read the identity and constraints directly. `tbs` is the exact DER
+// of the `tbsCertificate` the signature covers; `signature` is the raw
+// signatureValue. `pubKeyAlg` is one of the `x509Key*` discriminants and selects
+// how `pubKeyBytes` (the subjectPublicKey) is interpreted. `keyUsage` is a
+// bitmask (`1 << n` for DER KeyUsage bit `n`); `maxPathLen` is meaningful only
+// when `hasPathLen`. Times are Unix seconds.
+export struct Certificate {
+  export raw: []byte,
+  export tbs: []byte,
+  export version: int,
+  export serial: []byte,
+  export sigAlgOid: string,
+  export sigAlgParams: []byte,
+  export issuer: string,
+  export subject: string,
+  export notBefore: int,
+  export notAfter: int,
+  export pubKeyAlg: int,
+  export pubKeyBytes: []byte,
+  export ecCurveOid: string,
+  export signature: []byte,
+  export dnsNames: []string,
+  export ipAddresses: [][]byte,
+  export isCa: bool,
+  export hasBasicConstraints: bool,
+  export maxPathLen: int,
+  export hasPathLen: bool,
+  export keyUsage: int,
+  export hasKeyUsage: bool,
+  export extKeyUsageOids: []string,
+  export hasExtKeyUsage: bool,
+  export subjectKeyId: []byte,
+  export authorityKeyId: []byte,
+}
+
+// The mutable accumulator the extension parser fills. A struct is a reference
+// type (§13.3), so `x509ParseExtensions` mutates the caller's value in place.
+struct x509Exts {
+  dnsNames: []string,
+  ipAddresses: [][]byte,
+  isCa: bool,
+  hasBasicConstraints: bool,
+  maxPathLen: int,
+  hasPathLen: bool,
+  keyUsage: int,
+  hasKeyUsage: bool,
+  extKeyUsageOids: []string,
+  hasExtKeyUsage: bool,
+  subjectKeyId: []byte,
+  authorityKeyId: []byte,
+}
+
+// A fresh accumulator with every field at its RFC 5280 default.
+function x509NewExts(): x509Exts { return x509Exts{
+  dnsNames: []string(0),
+  ipAddresses: [][]byte(0),
+  isCa: false,
+  hasBasicConstraints: false,
+  maxPathLen: -1,
+  hasPathLen: false,
+  keyUsage: 0,
+  hasKeyUsage: false,
+  extKeyUsageOids: []string(0),
+  hasExtKeyUsage: false,
+  subjectKeyId: []byte(0),
+  authorityKeyId: []byte(0),
+} }
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+// Parse a DER `Certificate` (RFC 5280 §4.1):
+//   Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+// Fails on any structurally malformed certificate. The returned `tbs` is the
+// re-encoded tbsCertificate — canonical DER round-trips byte-for-byte, and a
+// mismatch would surface as a signature failure downstream.
+export function x509Parse(der: []byte): Certificate! {
+  let top = asn1ReadSequence(asn1Parse(der)?)?
+  if (len(top) != 3) {
+    fail newError("x509: Certificate must have three fields")
+  }
+  let tbsEl = top[0]
+  let tbsDer = asn1Encode(tbsEl)
+
+  // signatureAlgorithm: OID plus optional parameters (kept for RSA-PSS).
+  let sigAlg = asn1ReadSequence(top[1])?
+  if (len(sigAlg) < 1) {
+    fail newError("x509: signatureAlgorithm is empty")
+  }
+  let sigAlgOid = asn1OidString(asn1ReadOid(sigAlg[0])?)
+  let sigAlgParams = []byte(0)
+  if (len(sigAlg) >= 2) {
+    sigAlgParams = asn1Encode(sigAlg[1])
+  }
+
+  // signatureValue: the BIT STRING must be whole octets (no unused bits).
+  let sigBits = asn1ReadBitString(top[2])?
+  if (sigBits.unusedBits != 0) {
+    fail newError("x509: signatureValue has unused bits")
+  }
+
+  let tbs = asn1ReadSequence(tbsEl)?
+  if (len(tbs) < 6) {
+    fail newError("x509: tbsCertificate has too few fields")
+  }
+
+  // [0] EXPLICIT version DEFAULT v1 — present iff the first element is context [0].
+  let idx = 0
+  let version = 0
+  if (len(tbs) > 0 && tbs[0].cls == classContext && tbs[0].constructed && tbs[0].tag == 0) {
+    version = asn1ReadInteger(asn1ReadExplicit(tbs[0], 0)?)?
+    idx = 1
+  }
+  if (idx + 6 > len(tbs)) {
+    fail newError("x509: tbsCertificate is truncated")
+  }
+
+  let serial = asn1ReadBigInteger(tbs[idx])?
+  idx = idx + 1
+  // tbs[idx] is the inner signature AlgorithmIdentifier; skip it (the outer one
+  // is authoritative for dispatch and MUST match per RFC 5280 §4.1.1.2).
+  idx = idx + 1
+  let issuer = x509ParseName(tbs[idx])?
+  idx = idx + 1
+  let validity = asn1ReadSequence(tbs[idx])?
+  idx = idx + 1
+  if (len(validity) != 2) {
+    fail newError("x509: Validity must have notBefore and notAfter")
+  }
+  let notBefore = x509ParseTime(validity[0])?
+  let notAfter = x509ParseTime(validity[1])?
+  let subject = x509ParseName(tbs[idx])?
+  idx = idx + 1
+  let spki = x509ParseSpki(tbs[idx])?
+  idx = idx + 1
+
+  // Optional [1] issuerUniqueID, [2] subjectUniqueID, [3] EXPLICIT extensions.
+  let exts = x509NewExts()
+  let j = idx
+  let guard = 0
+  while (j < len(tbs) && guard < len(tbs)) {
+    let e = tbs[j]
+    if (e.cls == classContext && e.constructed && e.tag == 3) {
+      x509ParseExtensions(exts, asn1ReadExplicit(e, 3)?)?
+    }
+    j = j + 1
+    guard = guard + 1
+  }
+
+  return Certificate{
+    raw: der,
+    tbs: tbsDer,
+    version: version,
+    serial: serial,
+    sigAlgOid: sigAlgOid,
+    sigAlgParams: sigAlgParams,
+    issuer: issuer,
+    subject: subject,
+    notBefore: notBefore,
+    notAfter: notAfter,
+    pubKeyAlg: spki.alg,
+    pubKeyBytes: spki.bytes,
+    ecCurveOid: spki.curveOid,
+    signature: sigBits.bytes,
+    dnsNames: exts.dnsNames,
+    ipAddresses: exts.ipAddresses,
+    isCa: exts.isCa,
+    hasBasicConstraints: exts.hasBasicConstraints,
+    maxPathLen: exts.maxPathLen,
+    hasPathLen: exts.hasPathLen,
+    keyUsage: exts.keyUsage,
+    hasKeyUsage: exts.hasKeyUsage,
+    extKeyUsageOids: exts.extKeyUsageOids,
+    hasExtKeyUsage: exts.hasExtKeyUsage,
+    subjectKeyId: exts.subjectKeyId,
+    authorityKeyId: exts.authorityKeyId,
+  }
+}
+
+// A parsed SubjectPublicKeyInfo: the algorithm discriminant, the subjectPublicKey
+// octets, and (for EC) the named-curve OID.
+struct x509Spki { alg: int, bytes: []byte, curveOid: string }
+
+// Parse SubjectPublicKeyInfo (RFC 5280 §4.1.2.7):
+//   SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+// Recognizes rsaEncryption, id-ecPublicKey (with its named-curve parameter), and
+// Ed25519; any other algorithm fails.
+function x509ParseSpki(el: Element): x509Spki! {
+  let seq = asn1ReadSequence(el)?
+  if (len(seq) != 2) {
+    fail newError("x509: SubjectPublicKeyInfo must have two fields")
+  }
+  let alg = asn1ReadSequence(seq[0])?
+  if (len(alg) < 1) {
+    fail newError("x509: public-key AlgorithmIdentifier is empty")
+  }
+  let oid = asn1OidString(asn1ReadOid(alg[0])?)
+  let bits = asn1ReadBitString(seq[1])?
+  if (bits.unusedBits != 0) {
+    fail newError("x509: subjectPublicKey has unused bits")
+  }
+  if (oid == x509OidRsaEncryption) {
+    return x509Spki{ alg: x509KeyRSA, bytes: bits.bytes, curveOid: "" }
+  }
+  if (oid == x509OidEd25519) {
+    return x509Spki{ alg: x509KeyEd25519, bytes: bits.bytes, curveOid: "" }
+  }
+  if (oid == x509OidEcPublicKey) {
+    if (len(alg) < 2) {
+      fail newError("x509: EC public key is missing its named curve")
+    }
+    let curveOid = asn1OidString(asn1ReadOid(alg[1])?)
+    return x509Spki{ alg: x509KeyECDSA, bytes: bits.bytes, curveOid: curveOid }
+  }
+  fail newError("x509: unsupported public-key algorithm ${oid}")
+}
+
+// Render a Name (RFC 5280 §4.1.2.4) as a comma-joined DN string, e.g.
+// "CN=example.com,O=Bit Test PKI". Attributes within one RDN join with "+".
+// The rendering is stable, so two certificates whose issuer/subject encode the
+// same Name produce equal strings — which is how the chain walk links them.
+function x509ParseName(el: Element): string! {
+  let rdns = asn1ReadSequence(el)?
+  let out = ""
+  let i = 0
+  while (i < len(rdns)) {
+    let atvs = asn1ReadSet(rdns[i])?
+    let part = ""
+    let k = 0
+    while (k < len(atvs)) {
+      let atv = asn1ReadSequence(atvs[k])?
+      if (len(atv) != 2) {
+        fail newError("x509: AttributeTypeAndValue must have a type and value")
+      }
+      let key = x509AttrShortName(asn1OidString(asn1ReadOid(atv[0])?))
+      let val = asn1ReadString(atv[1])?
+      if (k > 0) {
+        part = part + "+"
+      }
+      part = part + key + "=" + val
+      k = k + 1
+    }
+    if (i > 0) {
+      out = out + ","
+    }
+    out = out + part
+    i = i + 1
+  }
+  return out
+}
+
+// The short label for a common attribute-type OID, else the dotted OID itself.
+function x509AttrShortName(oid: string): string {
+  if (oid == "2.5.4.3") { return "CN" }
+  if (oid == "2.5.4.6") { return "C" }
+  if (oid == "2.5.4.7") { return "L" }
+  if (oid == "2.5.4.8") { return "ST" }
+  if (oid == "2.5.4.10") { return "O" }
+  if (oid == "2.5.4.11") { return "OU" }
+  return oid
+}
+
+// ---------------------------------------------------------------------------
+// Time (RFC 5280 §4.1.2.5): UTCTime and GeneralizedTime -> Unix seconds
+// ---------------------------------------------------------------------------
+
+// Parse a Validity time to Unix seconds. UTCTime is "YYMMDDHHMMSSZ" (a two-digit
+// year, pivoted at 2050 per RFC 5280); GeneralizedTime is "YYYYMMDDHHMMSSZ".
+// Both must be UTC ("Z") with seconds present, as RFC 5280 requires.
+function x509ParseTime(el: Element): int! {
+  let s = []byte(asn1ReadString(el)?)
+  if (el.tag == tagUtcTime) {
+    if (len(s) != 13 || s[12] != 90) {
+      fail newError("x509: malformed UTCTime")
+    }
+    let yy = x509Num(s, 0, 2)?
+    let year = 2000 + yy
+    if (yy >= 50) {
+      year = 1900 + yy
+    }
+    return x509MakeTime(year, x509Num(s, 2, 2)?, x509Num(s, 4, 2)?, x509Num(s, 6, 2)?, x509Num(s, 8, 2)?, x509Num(s, 10, 2)?)?
+  }
+  if (el.tag == tagGeneralizedTime) {
+    if (len(s) != 15 || s[14] != 90) {
+      fail newError("x509: malformed GeneralizedTime")
+    }
+    return x509MakeTime(x509Num(s, 0, 4)?, x509Num(s, 4, 2)?, x509Num(s, 6, 2)?, x509Num(s, 8, 2)?, x509Num(s, 10, 2)?, x509Num(s, 12, 2)?)?
+  }
+  fail newError("x509: Validity time is neither UTCTime nor GeneralizedTime")
+}
+
+// The `n`-digit decimal at offset `off` of `s`, as an int. Fails on a non-digit.
+function x509Num(s: []byte, off: int, n: int): int! {
+  let v = 0
+  let i = 0
+  while (i < n) {
+    let c = s[off + i]
+    if (c < 48 || c > 57) {
+      fail newError("x509: non-digit in a time field")
+    }
+    v = v * 10 + int(c - 48)
+    i = i + 1
+  }
+  return v
+}
+
+// The Unix timestamp for a UTC calendar date-time. Days are counted with the
+// standard days-from-civil algorithm (valid for any Gregorian date), which makes
+// the conversion exact and independent of any library. Fails on an out-of-range
+// month or day.
+function x509MakeTime(year: int, month: int, day: int, hour: int, min: int, sec: int): int! {
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    fail newError("x509: month or day out of range")
+  }
+  if (hour > 23 || min > 59 || sec > 60) {
+    fail newError("x509: time-of-day out of range")
+  }
+  let y = year
+  if (month <= 2) {
+    y = y - 1
+  }
+  let era = y / 400
+  if (y < 0) {
+    era = (y - 399) / 400
+  }
+  let yoe = y - era * 400
+  let mp = month + 9
+  if (month > 2) {
+    mp = month - 3
+  }
+  let doy = (153 * mp + 2) / 5 + day - 1
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  let days = era * 146097 + doe - 719468
+  return days * 86400 + hour * 3600 + min * 60 + sec
+}
+
+// ---------------------------------------------------------------------------
+// Extensions (RFC 5280 §4.2)
+// ---------------------------------------------------------------------------
+
+// Parse the Extensions SEQUENCE into `out`. Each Extension is
+// SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING };
+// the octet string wraps the DER of the extension value. Only the extensions the
+// verifier acts on are decoded; the rest are ignored (a non-critical unknown is
+// harmless, and this verifier does not yet enforce unknown-critical rejection).
+function x509ParseExtensions(out: x509Exts, el: Element): ()! {
+  let exts = asn1ReadSequence(el)?
+  let i = 0
+  while (i < len(exts)) {
+    let parts = asn1ReadSequence(exts[i])?
+    if (len(parts) < 2) {
+      fail newError("x509: Extension must have an id and value")
+    }
+    let oid = asn1OidString(asn1ReadOid(parts[0])?)
+    let valIdx = 1
+    if (len(parts) >= 3) {
+      valIdx = 2
+    }
+    let value = asn1ReadOctetString(parts[valIdx])?
+    let inner = asn1Parse(value)?
+    if (oid == x509OidSubjectAltName) {
+      x509ParseSan(out, inner)?
+    } else if (oid == x509OidBasicConstraints) {
+      x509ParseBasicConstraints(out, inner)?
+    } else if (oid == x509OidKeyUsage) {
+      x509ParseKeyUsage(out, inner)?
+    } else if (oid == x509OidExtKeyUsage) {
+      x509ParseExtKeyUsage(out, inner)?
+    } else if (oid == x509OidSubjectKeyId) {
+      out.subjectKeyId = asn1ReadOctetString(inner)?
+    } else if (oid == x509OidAuthorityKeyId) {
+      x509ParseAuthorityKeyId(out, inner)?
+    }
+    i = i + 1
+  }
+}
+
+// SubjectAltName: GeneralNames ::= SEQUENCE OF GeneralName. Only the dNSName [2]
+// (an IA5String) and iPAddress [7] (an OCTET STRING, 4 bytes for IPv4 or 16 for
+// IPv6) choices are collected; other name forms are skipped.
+function x509ParseSan(out: x509Exts, el: Element): ()! {
+  let names = asn1ReadSequence(el)?
+  let i = 0
+  while (i < len(names)) {
+    let g = names[i]
+    if (g.cls == classContext && !g.constructed && g.tag == 2) {
+      out.dnsNames = append(out.dnsNames, string(g.bytes))
+    } else if (g.cls == classContext && !g.constructed && g.tag == 7) {
+      out.ipAddresses = append(out.ipAddresses, g.bytes)
+    }
+    i = i + 1
+  }
+}
+
+// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint
+// INTEGER OPTIONAL }. A DER encoder omits `cA` when false, so an empty SEQUENCE
+// means a non-CA; the mere presence of the extension is recorded either way.
+function x509ParseBasicConstraints(out: x509Exts, el: Element): ()! {
+  let bc = asn1ReadSequence(el)?
+  out.hasBasicConstraints = true
+  let i = 0
+  if (i < len(bc) && bc[i].cls == classUniversal && !bc[i].constructed && bc[i].tag == tagBoolean) {
+    out.isCa = asn1ReadBoolean(bc[i])?
+    i = i + 1
+  }
+  if (i < len(bc) && bc[i].cls == classUniversal && !bc[i].constructed && bc[i].tag == tagInteger) {
+    out.maxPathLen = asn1ReadInteger(bc[i])?
+    out.hasPathLen = true
+  }
+}
+
+// KeyUsage ::= BIT STRING. DER BIT-STRING bit `n` (most-significant first) maps
+// to `1 << n` in the `keyUsage` mask; trailing unused bits are zero (the strict
+// reader guarantees it), so scanning whole octets is safe.
+function x509ParseKeyUsage(out: x509Exts, el: Element): ()! {
+  let bs = asn1ReadBitString(el)?
+  out.hasKeyUsage = true
+  let mask = 0
+  let n = 0
+  let total = len(bs.bytes) * 8
+  while (n < total && n < 32) {
+    let b = int(bs.bytes[n / 8])
+    let bitPos = 7 - n % 8
+    if (((b >> bitPos) & 1) == 1) {
+      mask = mask | (1 << n)
+    }
+    n = n + 1
+  }
+  out.keyUsage = mask
+}
+
+// ExtKeyUsage ::= SEQUENCE OF KeyPurposeId (OBJECT IDENTIFIER).
+function x509ParseExtKeyUsage(out: x509Exts, el: Element): ()! {
+  let purposes = asn1ReadSequence(el)?
+  out.hasExtKeyUsage = true
+  let i = 0
+  while (i < len(purposes)) {
+    out.extKeyUsageOids = append(out.extKeyUsageOids, asn1OidString(asn1ReadOid(purposes[i])?))
+    i = i + 1
+  }
+}
+
+// AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier [0] OCTET STRING OPTIONAL,
+// ... }. Only the [0] keyIdentifier is kept.
+function x509ParseAuthorityKeyId(out: x509Exts, el: Element): ()! {
+  let seq = asn1ReadSequence(el)?
+  let i = 0
+  while (i < len(seq)) {
+    let c = seq[i]
+    if (c.cls == classContext && !c.constructed && c.tag == 0) {
+      out.authorityKeyId = c.bytes
+    }
+    i = i + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Signature verification
+// ---------------------------------------------------------------------------
+
+// Whether `cert`'s signature is valid under `issuer`'s public key. Dispatches on
+// `cert.sigAlgOid`: RSA PKCS#1 v1.5 and RSA-PSS (SHA-256/384/512), ECDSA over
+// P-256/P-384 (DER signature), and Ed25519. The digest and public-key type must
+// match the algorithm — an issuer key of the wrong type, a malformed signature,
+// or an unknown algorithm all return false rather than raising.
+export function x509VerifySignature(cert: Certificate, issuer: Certificate): bool {
+  let oid = cert.sigAlgOid
+  let msg = cert.tbs
+  let sig = cert.signature
+
+  if (oid == x509OidSha256Rsa) {
+    return x509VerifyRsaPkcs1(issuer, x509NewSha256, rsaDigestInfoSha256(), msg, sig)
+  }
+  if (oid == x509OidSha384Rsa) {
+    return x509VerifyRsaPkcs1(issuer, newSha384, rsaDigestInfoSha384(), msg, sig)
+  }
+  if (oid == x509OidSha512Rsa) {
+    return x509VerifyRsaPkcs1(issuer, newSha512, rsaDigestInfoSha512(), msg, sig)
+  }
+  if (oid == x509OidRsaPss) {
+    return x509VerifyRsaPss(cert, issuer, msg, sig)
+  }
+  if (oid == x509OidEcdsaSha256) {
+    return x509VerifyEcdsa(issuer, digest(newSha256(), msg), sig)
+  }
+  if (oid == x509OidEcdsaSha384) {
+    return x509VerifyEcdsa(issuer, digest(newSha384(), msg), sig)
+  }
+  if (oid == x509OidEd25519) {
+    if (issuer.pubKeyAlg != x509KeyEd25519) {
+      return false
+    }
+    return ed25519Verify(issuer.pubKeyBytes, msg, sig)
+  }
+  return false
+}
+
+// SHA-256 exposed as a `() => Hash` value: `newSha256` returns the concrete
+// `Sha256`, which is not directly a `() => Hash`, so it is wrapped here.
+function x509NewSha256(): Hash { return newSha256() }
+
+// RSA PKCS#1 v1.5 verification: parse the issuer's RSAPublicKey and check the
+// signature over `msg` with the given hash and DigestInfo prefix.
+function x509VerifyRsaPkcs1(issuer: Certificate, newHash: () => Hash, prefix: []byte, msg: []byte, sig: []byte): bool {
+  if (issuer.pubKeyAlg != x509KeyRSA) {
+    return false
+  }
+  let pub = rsaParsePkcs1PublicKey(issuer.pubKeyBytes) catch e {
+    return false
+  }
+  return rsaVerifyPkcs1v15(pub, newHash, prefix, msg, sig)
+}
+
+// RSA-PSS verification (RFC 4055). The hash and salt length come from the
+// signature algorithm parameters; MGF1 is assumed over the same hash (the only
+// form in use). Only SHA-256/384/512 are supported — a SHA-1 PSS signature (the
+// ASN.1 default when the hash field is absent) is rejected.
+function x509VerifyRsaPss(cert: Certificate, issuer: Certificate, msg: []byte, sig: []byte): bool {
+  if (issuer.pubKeyAlg != x509KeyRSA) {
+    return false
+  }
+  let pub = rsaParsePkcs1PublicKey(issuer.pubKeyBytes) catch e {
+    return false
+  }
+  let cfg = x509PssCfg{ hashId: 1, saltLen: 20 }
+  x509ReadPssParams(cfg, cert.sigAlgParams) catch e {
+    return false
+  }
+  if (cfg.hashId == 256) {
+    return rsaVerifyPss(pub, x509NewSha256, msg, sig, cfg.saltLen)
+  }
+  if (cfg.hashId == 384) {
+    return rsaVerifyPss(pub, newSha384, msg, sig, cfg.saltLen)
+  }
+  if (cfg.hashId == 512) {
+    return rsaVerifyPss(pub, newSha512, msg, sig, cfg.saltLen)
+  }
+  return false
+}
+
+// The hash choice (`hashId` in bits, or 1 for the unsupported SHA-1 default) and
+// salt length recovered from RSASSA-PSS-params. A reference-type struct so
+// `x509ReadPssParams` fills it in place.
+struct x509PssCfg { hashId: int, saltLen: int }
+
+// Parse RSASSA-PSS-params (RFC 4055 §3.1) into `cfg`: the [0] hashAlgorithm OID
+// and the [2] saltLength, each optional with its default.
+function x509ReadPssParams(cfg: x509PssCfg, der: []byte): ()! {
+  if (len(der) == 0) {
+    return
+  }
+  let seq = asn1ReadSequence(asn1Parse(der)?)?
+  let i = 0
+  while (i < len(seq)) {
+    let f = seq[i]
+    if (f.cls == classContext && f.constructed && f.tag == 0) {
+      let ha = asn1ReadSequence(asn1ReadExplicit(f, 0)?)?
+      cfg.hashId = x509PssHashId(asn1OidString(asn1ReadOid(ha[0])?))
+    } else if (f.cls == classContext && f.constructed && f.tag == 2) {
+      cfg.saltLen = asn1ReadInteger(asn1ReadExplicit(f, 2)?)?
+    }
+    i = i + 1
+  }
+}
+
+// The digest size in bits for a PSS hash-algorithm OID, or 1 for anything other
+// than SHA-256/384/512.
+function x509PssHashId(oid: string): int {
+  if (oid == x509OidSha256) { return 256 }
+  if (oid == x509OidSha384) { return 384 }
+  if (oid == x509OidSha512) { return 512 }
+  return 1
+}
+
+// ECDSA verification: select the issuer's curve from its named-curve OID, decode
+// the SEC 1 public point, parse the DER signature, and verify over `hash`.
+function x509VerifyEcdsa(issuer: Certificate, hash: []byte, sig: []byte): bool {
+  if (issuer.pubKeyAlg != x509KeyECDSA) {
+    return false
+  }
+  let curve = x509CurveForOid(issuer.ecCurveOid) catch e {
+    return false
+  }
+  let pub = ecdsaPublicKey(curve, issuer.pubKeyBytes) catch e {
+    return false
+  }
+  let parsed = ecdsaSignatureFromDer(sig) catch e {
+    return false
+  }
+  return ecdsaVerify(pub, hash, parsed)
+}
+
+// The `Curve` named by an EC named-curve OID (P-256 or P-384).
+function x509CurveForOid(oid: string): Curve! {
+  if (oid == x509OidP256) { return nistecP256() }
+  if (oid == x509OidP384) { return nistecP384() }
+  fail newError("x509: unsupported EC curve ${oid}")
+}
+
+// ---------------------------------------------------------------------------
+// Chain building and verification
+// ---------------------------------------------------------------------------
+
+// Verify `leaf` up to a trusted root, returning on success and failing with a
+// specific error for the first problem found. In order: the hostname must match
+// the leaf's SubjectAltName; the leaf must be within its validity window and, if
+// it declares an ExtendedKeyUsage, must permit server authentication; then a path
+// is built by matching each certificate's issuer DN to a candidate subject —
+// preferring the trusted `roots`, else the untrusted `intermediates` — verifying
+// every signature and requiring every issuer to be a CA whose key usage permits
+// certificate signing and whose validity window contains `nowUnix`. Finally the
+// path-length constraints are enforced. `nowUnix` is injected (never read from a
+// clock) so verification is deterministic.
+export function x509VerifyChain(leaf: Certificate, intermediates: []Certificate, roots: []Certificate, hostname: string, nowUnix: int): ()! {
+  if (!x509MatchHostname(leaf, hostname)) {
+    fail newError("x509: certificate is not valid for hostname ${hostname}")
+  }
+  x509CheckValidity(leaf, nowUnix)?
+  if (leaf.hasExtKeyUsage && !x509AllowsServerAuth(leaf)) {
+    fail newError("x509: leaf certificate is not valid for server authentication")
+  }
+
+  let chain = []Certificate(0)
+  chain = append(chain, leaf)
+  let current = leaf
+  let reachedRoot = false
+  let depth = 0
+  while (depth < x509MaxChainDepth && !reachedRoot) {
+    let ri = x509FindIssuer(current, roots)
+    if (ri >= 0) {
+      let issuer = roots[ri]
+      x509CheckIssuer(issuer, nowUnix)?
+      if (!x509VerifySignature(current, issuer)) {
+        fail newError("x509: signature verification failed")
+      }
+      chain = append(chain, issuer)
+      reachedRoot = true
+    } else {
+      let ii = x509FindIssuer(current, intermediates)
+      if (ii < 0) {
+        fail newError("x509: unable to build chain to a trusted root")
+      }
+      let issuer = intermediates[ii]
+      x509CheckIssuer(issuer, nowUnix)?
+      if (!x509VerifySignature(current, issuer)) {
+        fail newError("x509: signature verification failed")
+      }
+      chain = append(chain, issuer)
+      current = issuer
+      depth = depth + 1
+    }
+  }
+  if (!reachedRoot) {
+    fail newError("x509: certificate chain is too long")
+  }
+  x509CheckPathLen(chain)?
+}
+
+// The index in `pool` of the first certificate whose subject DN equals `cert`'s
+// issuer DN, or -1 if none. DN equality is the linking rule; the signature is
+// verified separately by the caller.
+function x509FindIssuer(cert: Certificate, pool: []Certificate): int {
+  let i = 0
+  while (i < len(pool)) {
+    if (pool[i].subject == cert.issuer) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Fail unless `nowUnix` is within `[notBefore, notAfter]`.
+function x509CheckValidity(cert: Certificate, nowUnix: int): ()! {
+  if (nowUnix < cert.notBefore) {
+    fail newError("x509: certificate is not yet valid")
+  }
+  if (nowUnix > cert.notAfter) {
+    fail newError("x509: certificate has expired")
+  }
+}
+
+// Fail unless `cert` is a usable CA at `nowUnix`: valid, marked as a CA by
+// BasicConstraints, and (if it declares KeyUsage) permitting keyCertSign.
+function x509CheckIssuer(cert: Certificate, nowUnix: int): ()! {
+  x509CheckValidity(cert, nowUnix)?
+  if (!cert.hasBasicConstraints || !cert.isCa) {
+    fail newError("x509: issuer is not a CA")
+  }
+  if (cert.hasKeyUsage && (cert.keyUsage & x509KuKeyCertSign) == 0) {
+    fail newError("x509: issuer key usage does not permit certificate signing")
+  }
+}
+
+// Enforce every CA's pathLenConstraint: a CA at position `i` (0 = leaf) has `i-1`
+// intermediate CAs beneath it toward the leaf, which must not exceed its declared
+// maximum.
+function x509CheckPathLen(chain: []Certificate): ()! {
+  let i = 1
+  while (i < len(chain)) {
+    if (chain[i].hasPathLen && (i - 1) > chain[i].maxPathLen) {
+      fail newError("x509: path length constraint exceeded")
+    }
+    i = i + 1
+  }
+}
+
+// Whether `cert`'s ExtendedKeyUsage permits TLS server authentication — either
+// id-kp-serverAuth or anyExtendedKeyUsage is present.
+function x509AllowsServerAuth(cert: Certificate): bool {
+  for oid of cert.extKeyUsageOids {
+    if (oid == x509OidServerAuth || oid == x509OidAnyExtKeyUsage) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Hostname matching (RFC 6125)
+// ---------------------------------------------------------------------------
+
+// Whether `hostname` matches `cert`'s SubjectAltName. A hostname that parses as
+// an IPv4 address is matched against the iPAddress entries; otherwise it is
+// matched (case-insensitively) against the dNSName entries, honoring a single
+// leftmost-label `*.` wildcard. The deprecated subject-CN fallback is not used.
+export function x509MatchHostname(cert: Certificate, hostname: string): bool {
+  let ip = x509ParseIpv4(hostname)
+  if (len(ip) == 4) {
+    for a of cert.ipAddresses {
+      if (x509BytesEqual(a, ip)) {
+        return true
+      }
+    }
+    return false
+  }
+  let host = x509ToLower(hostname)
+  for name of cert.dnsNames {
+    if (x509MatchDnsName(x509ToLower(name), host)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether the (already lower-cased) `pattern` matches `host`. A leading "*."
+// matches exactly one non-empty leftmost label; otherwise the match is exact.
+function x509MatchDnsName(pattern: string, host: string): bool {
+  if (len(pattern) >= 2 && pattern[0] == 42 && pattern[1] == 46) {
+    let dot = x509IndexByte(host, 46)
+    if (dot <= 0) {
+      return false
+    }
+    return host[dot:len(host)] == pattern[1:len(pattern)]
+  }
+  return pattern == host
+}
+
+// The byte index of the first `c` in `s`, or -1.
+function x509IndexByte(s: string, c: byte): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == c) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// `s` with every ASCII 'A'..'Z' folded to lower case.
+function x509ToLower(s: string): string {
+  let out = []byte(len(s))
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c >= 65 && c <= 90) {
+      c = c + 32
+    }
+    out[i] = c
+    i = i + 1
+  }
+  return string(out)
+}
+
+// Whether two byte slices are equal in length and content.
+function x509BytesEqual(a: []byte, b: []byte): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Parse a dotted IPv4 string into its 4 octets, or an empty slice if `s` is not a
+// well-formed IPv4 address (four decimal octets 0..255). IPv6 text is not parsed;
+// such a hostname simply falls through to the (non-matching) DNS path.
+function x509ParseIpv4(s: string): []byte {
+  let out = []byte(0)
+  let octet = 0
+  let digits = 0
+  let count = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == 46) {
+      if (digits == 0) {
+        return []byte(0)
+      }
+      out = append(out, byte(octet))
+      count = count + 1
+      octet = 0
+      digits = 0
+    } else if (c >= 48 && c <= 57) {
+      octet = octet * 10 + int(c - 48)
+      digits = digits + 1
+      if (digits > 3 || octet > 255) {
+        return []byte(0)
+      }
+    } else {
+      return []byte(0)
+    }
+    i = i + 1
+  }
+  if (digits == 0 || count != 3) {
+    return []byte(0)
+  }
+  out = append(out, byte(octet))
+  return out
+}
