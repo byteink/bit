@@ -372,7 +372,12 @@ pub fn build(b: *std.Build) void {
     imports_mod.addOptions("build_options", imports_opts);
 
     const imports_tests = b.addTest(.{ .root_module = imports_mod });
-    test_step.dependOn(&b.addRunArtifact(imports_tests).step);
+    const imports_run = b.addRunArtifact(imports_tests);
+    // The `tests/imports/*` projects and `stdlib/*` sources are read at runtime,
+    // so a new KAT dir or an edited stdlib file is invisible to the build cache;
+    // without this the run is cache-skipped and new tests silently never execute.
+    imports_run.has_side_effects = true;
+    test_step.dependOn(&imports_run.step);
 
     // Fuzz harness (task #334): lexer+parser must never crash/hang on
     // arbitrary bytes. Two separate compilations of fuzz.zig, because
