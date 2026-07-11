@@ -1370,7 +1370,7 @@ fn emitCallValue(self: *Ctx, dst: u32, ty: TypeId, callee: ir.ValueId, args: []c
     const cell = try getInt(self, vregOf(self, callee), scratch1);
     try self.movLoad(scratch2, cell, null, 1, 8, 8, false); // r10 = env
     try self.movLoad(scratch3, cell, null, 1, 0, 8, false); // r12 = code
-    try marshalArgs(self, args, 1, 1, 0);
+    const arg_reserve = try marshalArgs(self, args, 1, 1, 0);
     const arg0: Reg = if (self.cc == .win64) .rcx else .rdi;
     try self.movRR(arg0, scratch2);
     if (self.cc == .win64) try self.rspAddSub(true, 32);
@@ -1378,6 +1378,7 @@ fn emitCallValue(self: *Ctx, dst: u32, ty: TypeId, callee: ir.ValueId, args: []c
     self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
     self.next_safepoint_idx += 1;
     if (self.cc == .win64) try self.rspAddSub(false, 32);
+    if (arg_reserve > 0) try self.rspAddSub(false, arg_reserve); // reclaim SysV stack args
     if (self.tctx().typeOf(ty) != .void) switch (classOf(self.tctx(), ty)) {
         .int => try putInt(self, dst, .rax),
         .float => try putFloat(self, dst, .xmm0),
@@ -1402,7 +1403,7 @@ fn emitCallIface(self: *Ctx, dst: u32, ty: TypeId, iface_val: ir.ValueId, method
     try self.emitCallReloc("bit_rt_iface_lookup"); // rax = method code address
     if (self.cc == .win64) try self.rspAddSub(false, 32);
     try self.movRR(scratch3, .rax); // r12 = fn, survives arg marshaling (like emitCallValue)
-    try marshalArgs(self, args, 1, 1, 0);
+    const arg_reserve = try marshalArgs(self, args, 1, 1, 0);
     const recv2 = try getInt(self, vregOf(self, iface_val), scratch1);
     try self.movRR(arg0, recv2);
     if (self.cc == .win64) try self.rspAddSub(true, 32);
@@ -1410,6 +1411,7 @@ fn emitCallIface(self: *Ctx, dst: u32, ty: TypeId, iface_val: ir.ValueId, method
     self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
     self.next_safepoint_idx += 1;
     if (self.cc == .win64) try self.rspAddSub(false, 32);
+    if (arg_reserve > 0) try self.rspAddSub(false, arg_reserve); // reclaim SysV stack args
     if (self.tctx().typeOf(ty) != .void) switch (classOf(self.tctx(), ty)) {
         .int => try putInt(self, dst, .rax),
         .float => try putFloat(self, dst, .xmm0),
@@ -1576,16 +1578,28 @@ fn bindIncomingArgs(self: *Ctx) !void {
 
     var int_ordinal: u32 = 0;
     var float_ordinal: u32 = 0;
+    var stack_index: u32 = 0;
     var p: u32 = 0;
     while (p < entry.param_count) : (p += 1) {
         const param_val = entry.paramValue(p);
         const class = classOf(self.tctx(), self.f.valueType(param_val));
         const ordinal = if (class == .int) int_ordinal else float_ordinal;
-        const reg = argReg(self.cc, class, p, ordinal) orelse return error.TooManyArguments;
-        if (class == .int) int_ordinal += 1 else float_ordinal += 1;
         const to = plocOf(self, vregOf(self, param_val), class);
         const list = if (class == .int) &int_moves else &float_moves;
-        try list.append(self.gpa, .{ .from = .{ .reg = reg }, .to = to });
+        // The mirror of `marshalArgs`: params 1–6 int / 1–8 float arrive in the
+        // ABI registers; the rest were pushed by the caller and now sit just
+        // above the saved rbp/return address at `[rbp+16]`, `[rbp+24]`, … in
+        // argument order (a `.mem` source `emitMove` reads rbp-relative).
+        const from: PLoc = if (argReg(self.cc, class, p, ordinal)) |reg|
+            .{ .reg = reg }
+        else blk: {
+            if (self.cc != .sysv) return error.TooManyArguments; // Win64 overflow unimplemented
+            const off: i32 = 16 + 8 * @as(i32, @intCast(stack_index));
+            stack_index += 1;
+            break :blk .{ .mem = off };
+        };
+        if (class == .int) int_ordinal += 1 else float_ordinal += 1;
+        try list.append(self.gpa, .{ .from = from, .to = to });
     }
     try sequentializeAndEmit(self, int_moves.items, .int);
     try sequentializeAndEmit(self, float_moves.items, .float);
@@ -1739,34 +1753,94 @@ const CallReturn = struct { dst: u32, ty: TypeId };
 /// module doc comment: a function containing any safepoint restricts its
 /// whole allocatable file to the callee-saved subset), so these parallel
 /// moves can never collide with the argument registers they target.
+/// One argument that overflowed its ABI registers and must be passed on the
+/// stack: its source location and the byte offset (from the post-`sub` `rsp`)
+/// of its outgoing slot.
+const StackArg = struct { src: PLoc, class: regalloc.Class, offset: i32 };
+
+/// Stores one overflow argument to its outgoing stack slot `[rsp + offset]`.
+/// `src` is rbp-relative (a spill) or a physical register — both survive the
+/// `sub rsp` that precedes this (rbp is never the argument stack base), so the
+/// value is fetched from wherever the allocator left it and written straight
+/// down to the outgoing area.
+fn emitStackArgStore(self: *Ctx, sa: StackArg) !void {
+    switch (sa.class) {
+        .int => switch (sa.src) {
+            .reg => |r| try self.movStore(.rsp, null, 1, sa.offset, @enumFromInt(r), 8),
+            .mem => |m| {
+                try self.movLoad(scratch1, .rbp, null, 1, m, 8, false);
+                try self.movStore(.rsp, null, 1, sa.offset, scratch1, 8);
+            },
+        },
+        .float => switch (sa.src) {
+            .reg => |r| try self.movFStore(.rsp, null, 1, sa.offset, @enumFromInt(r), 8),
+            .mem => |m| {
+                try self.movFLoad(fscratch1, .rbp, null, 1, m, 8);
+                try self.movFStore(.rsp, null, 1, sa.offset, fscratch1, 8);
+            },
+        },
+    }
+}
+
 /// Marshals `args` into argument registers via parallel moves, starting at
 /// positional slot `base_position` with the integer/float register banks
 /// already `base_int_ord`/`base_float_ord` deep. `emitCallLike` passes all
 /// zeros (a plain call); `emitCallValue` passes `1,1,0` to reserve arg0 for
 /// the closure's environment pointer (which it moves in after marshaling).
-fn marshalArgs(self: *Ctx, args: []const u32, base_position: u32, base_int_ord: u32, base_float_ord: u32) CodegenError!void {
+///
+/// Arguments past the ABI register banks (SysV: the 7th+ integer/reference or
+/// 9th+ float) overflow to the stack. This lowers them per SysV: reserve a
+/// 16-byte-aligned outgoing area with `sub rsp`, store each overflow arg at
+/// `[rsp + 8*k]` in argument order (so the callee reads them contiguously just
+/// above its return address), then the register moves as usual. Returns the
+/// reserved byte count so the caller reclaims it with `add rsp` right after the
+/// call — rsp is 16-aligned in the body (`alignFrame`) and the reserve is a
+/// multiple of 16, so the call boundary stays 16-aligned. (Win64 stack args are
+/// unimplemented — the only x64 target wired up is SysV; the Win64 overflow
+/// path still errors cleanly.)
+fn marshalArgs(self: *Ctx, args: []const u32, base_position: u32, base_int_ord: u32, base_float_ord: u32) CodegenError!u32 {
     var int_moves: std.ArrayList(PMove) = .empty;
     defer int_moves.deinit(self.gpa);
     var float_moves: std.ArrayList(PMove) = .empty;
     defer float_moves.deinit(self.gpa);
+    var stack_args: std.ArrayList(StackArg) = .empty;
+    defer stack_args.deinit(self.gpa);
 
     var int_ordinal: u32 = base_int_ord;
     var float_ordinal: u32 = base_float_ord;
+    var stack_index: u32 = 0;
     for (args, 0..) |raw, position| {
         const class = classOf(self.tctx(), self.f.valueType(@enumFromInt(raw)));
         const ordinal = if (class == .int) int_ordinal else float_ordinal;
-        const reg = argReg(self.cc, class, @intCast(base_position + position), ordinal) orelse return error.TooManyArguments;
-        if (class == .int) int_ordinal += 1 else float_ordinal += 1;
         const from = plocOf(self, self.inst_to_vreg[raw], class);
-        const list = if (class == .int) &int_moves else &float_moves;
-        try list.append(self.gpa, .{ .from = from, .to = .{ .reg = reg } });
+        if (argReg(self.cc, class, @intCast(base_position + position), ordinal)) |reg| {
+            const list = if (class == .int) &int_moves else &float_moves;
+            try list.append(self.gpa, .{ .from = from, .to = .{ .reg = reg } });
+        } else {
+            if (self.cc != .sysv) return error.TooManyArguments; // Win64 overflow unimplemented
+            try stack_args.append(self.gpa, .{ .src = from, .class = class, .offset = 8 * @as(i32, @intCast(stack_index)) });
+            stack_index += 1;
+        }
+        if (class == .int) int_ordinal += 1 else float_ordinal += 1;
+    }
+
+    var reserve: u32 = 0;
+    if (stack_index > 0) {
+        reserve = @intCast(std.mem.alignForward(usize, 8 * @as(usize, stack_index), 16));
+        try self.rspAddSub(true, reserve);
+        // Ordered before the register moves: those may recycle scratch1/scratch2
+        // (the parallel-move temps), whereas each stack store only reads a
+        // source and writes the outgoing area, so doing them first can never
+        // clobber a pending register-move source.
+        for (stack_args.items) |sa| try emitStackArgStore(self, sa);
     }
     try sequentializeAndEmit(self, int_moves.items, .int);
     try sequentializeAndEmit(self, float_moves.items, .float);
+    return reserve;
 }
 
 fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallReturn) CodegenError!void {
-    try marshalArgs(self, args, 0, 0, 0);
+    const arg_reserve = try marshalArgs(self, args, 0, 0, 0);
 
     // Win64 requires the caller to reserve 32 bytes of "home space" right
     // below the call; done dynamically around just this call site (not
@@ -1777,12 +1851,13 @@ fn emitCallLike(self: *Ctx, symbol: []const u8, args: []const u32, ret: ?CallRet
     if (self.cc == .win64) try self.rspAddSub(true, 32);
     try self.emitCallReloc(symbol);
     // The safepoint's code offset is the return address — the byte right
-    // after the call, before any home-space teardown. Recording it after the
-    // Win64 `add rsp,32` would push it 7 bytes past the real return address
-    // and corrupt stack-map lookups during a GC triggered by the callee.
+    // after the call, before any home-space or outgoing-arg teardown. Recording
+    // it after an `add rsp` would push it past the real return address and
+    // corrupt stack-map lookups during a GC triggered by the callee.
     self.safepoint_code_offsets[self.next_safepoint_idx] = @intCast(self.code.items.len);
     self.next_safepoint_idx += 1;
     if (self.cc == .win64) try self.rspAddSub(false, 32);
+    if (arg_reserve > 0) try self.rspAddSub(false, arg_reserve); // reclaim SysV stack args
 
     if (ret) |r| {
         switch (classOf(self.tctx(), r.ty)) {
