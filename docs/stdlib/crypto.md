@@ -193,3 +193,111 @@ Like `encodeHex`, but with uppercase digits (`0-9A-F`).
 The bytes `s` spells in hex, high nibble first. Case-insensitive. Fails if `s`
 has an odd length or contains any character outside `[0-9a-fA-F]`, so it is the
 exact inverse of `encodeHex`/`encodeHexUpper` on well-formed input.
+
+## SHA-3 and SHAKE
+
+The FIPS 202 hash family, built on the Keccak-f[1600] sponge. Two shapes share
+one permutation: the fixed-output hashes SHA3-224/256/384/512, which conform to
+`Hash`, and the extendable-output functions SHAKE128/256, which absorb a message
+and then squeeze an arbitrary number of output bytes. All are verified against
+the NIST known-answer vectors.
+
+The state is addressed as little-endian bytes, so output is byte-identical on
+x86-64 and ARM64. Every value is fresh from its constructor — reuse one hash for
+many messages by calling `reset` between them.
+
+```bit
+import { Hash, digest, encodeHex, newSha3_256, newShake128 } from "std/crypto"
+
+// One-shot SHA3-256, rendered as a lowercase hex string.
+function sha3Hex(data: []byte): string {
+  return encodeHex(digest(newSha3_256(), data))
+}
+
+// Streaming: feed input across as many `write` calls as convenient, read `sum`.
+function streamed(): []byte {
+  let h = newSha3_256()
+  h.write([]byte("Keccak "))
+  h.write([]byte("sponge"))
+  return h.sum()
+}
+
+// SHAKE128 as an XOF: absorb the seed once, then squeeze a 64-byte key stream.
+function derive(seed: []byte): []byte {
+  let x = newShake128()
+  x.absorb(seed)
+  return x.squeeze(64)
+}
+
+// Hashing against the `Hash` interface — the algorithm is a parameter.
+function tag(h: Hash, msg: []byte): string {
+  return encodeHex(digest(h, msg))
+}
+```
+
+### `Sha3`
+
+A fixed-output SHA-3 hash: a streaming Keccak sponge conforming to `Hash`. Build
+one with a `newSha3_*` constructor; do not construct it by field.
+
+### `Sha3.write(data: []byte)`
+
+Absorbs more input into the running hash.
+
+### `Sha3.sum(): []byte`
+
+The digest of everything written since the last `reset`. Non-destructive — it
+finalizes a copy, so the hash may keep accepting input afterward.
+
+### `Sha3.reset()`
+
+Returns the hash to the empty state, ready for a new message.
+
+### `Sha3.size(): int`
+
+The digest length in bytes (28, 32, 48, or 64).
+
+### `Sha3.blockSize(): int`
+
+The sponge rate in bytes — the algorithm's internal block size, which HMAC needs.
+
+### `newSha3_224(): Sha3`
+
+A SHA3-224 hash: 28-byte digest, 144-byte rate.
+
+### `newSha3_256(): Sha3`
+
+A SHA3-256 hash: 32-byte digest, 136-byte rate.
+
+### `newSha3_384(): Sha3`
+
+A SHA3-384 hash: 48-byte digest, 104-byte rate.
+
+### `newSha3_512(): Sha3`
+
+A SHA3-512 hash: 64-byte digest, 72-byte rate.
+
+### `Shake`
+
+A SHAKE extendable-output function (XOF): absorb a message, then squeeze any
+number of output bytes. Build one with `newShake128`/`newShake256`.
+
+### `Shake.absorb(data: []byte)`
+
+Absorbs more input. Panics if called after squeezing has begun — the sponge has
+already switched to producing output.
+
+### `Shake.squeeze(n: int): []byte`
+
+The next `n` output bytes of the stream. The first call closes absorption;
+further calls continue where the last left off, so `squeeze(a)` then `squeeze(b)`
+yields the same bytes as a single `squeeze(a + b)`. A non-positive `n` yields an
+empty slice.
+
+### `newShake128(): Shake`
+
+A SHAKE128 XOF: 128-bit security strength, 168-byte rate.
+
+### `newShake256(): Shake`
+
+A SHAKE256 XOF: 256-bit security strength, 136-byte rate.
