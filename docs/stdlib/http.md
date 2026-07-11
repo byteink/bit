@@ -1,13 +1,14 @@
 # std/http
 
-HTTP/1.1 over `std/net`, built entirely in Bit. A server accepts connections and
-handles each on its own green thread; a client dials, sends one request, and
-reads the response. Fallible calls return `T!` — propagate with `?` or handle
-with `catch`.
+HTTP/1.1 over `std/net` (cleartext) or `std/tls` (TLS 1.3), built entirely in
+Bit. A server accepts connections and handles each on its own green thread; a
+client dials, sends one request, and reads the response. The wire protocol is the
+same on either transport — an `https://` URL or `serveTls` just swaps the socket.
+Fallible calls return `T!` — propagate with `?` or handle with `catch`.
 
-Scope: plain HTTP (no TLS), one request per connection (`Connection: close`), no
-chunked transfer encoding, no redirects. Headers are carried as a raw block and
-read with `header()`.
+Scope: HTTP/1.1 over cleartext or TLS, one request per connection
+(`Connection: close`), no chunked transfer encoding, no redirects. Headers are
+carried as a raw block and read with `header()`.
 
 <!-- doctest: per-block -->
 
@@ -133,7 +134,9 @@ function runServer(s: Server, n: int): ()! {
 ### `request(method: string, url: string, body: string): Response!`
 
 Sends `method url` with an optional body and returns the response. The request
-asks the server to close the connection, so the whole response is read to EOF.
+asks the server to close the connection, so the whole response is read to EOF. An
+`https://` URL runs over TLS 1.3, verifying the server's certificate chain and
+hostname against the default roots; an `http://` URL runs over cleartext TCP.
 
 ### `get(url: string): Response!`
 
@@ -158,5 +161,65 @@ function submit(url: string, payload: string): string! {
 
 function head(url: string): Response! {
   return request("HEAD", url, "")?
+}
+```
+
+## TLS (HTTPS)
+
+An `https://` URL transparently runs the same request over TLS 1.3, verifying the
+server against the operating-system trust store (falling back to a small bundled
+root set) — no extra arguments to `request` / `get` / `post`. For a custom trust
+configuration — a pinned private CA, a fixed `serverName`, or `insecureSkipVerify`
+in a test — pass a `std/tls` `TlsConfig` to the https-only variants.
+
+### `requestTls(method: string, url: string, body: string, config: TlsConfig): Response!`
+
+As `request`, but over https with an explicit `std/tls` `TlsConfig` — pinned
+roots, a fixed `serverName`, or `insecureSkipVerify`. `config.alpn` defaults to
+`http/1.1` when empty; a non-`https://` URL fails.
+
+### `getTls(url: string, config: TlsConfig): Response!`
+
+GET an https `url` with an explicit `std/tls` `TlsConfig`.
+
+### `postTls(url: string, body: string, config: TlsConfig): Response!`
+
+POST `body` to an https `url` with an explicit `std/tls` `TlsConfig`.
+
+### `serveTls(host, port, certPem, keyPem, handler): ()!`
+
+The TLS mirror of `listenAndServe`: serves HTTPS on `host:port` forever with the
+certificate chain `certPem` and matching private key `keyPem` (both PEM),
+dispatching each request to `handler` on its own green thread. Offers ALPN
+`http/1.1`. Returns only on a bind, accept, or handshake error.
+
+```bit
+import { get, getTls, serveTls, ok, respond, Request, Response } from "std/http"
+import { newTlsConfig, newTrustStore } from "std/tls"
+
+// An https GET verified against the default (system/bundled) roots.
+function fetchStatus(url: string): int! {
+  let res = get(url)?
+  return res.status
+}
+
+// An https GET pinned to a private CA (PEM) — a test fixture or corporate root.
+function fetchPinned(url: string, caPem: string): Response! {
+  let cfg = newTlsConfig(newTrustStore(caPem)?)
+  return getTls(url, cfg)?
+}
+
+// Serve HTTPS with a PEM certificate chain and key.
+function route(req: Request): Response {
+  if (req.path == "/health") {
+    return ok("ok")
+  }
+  return respond(404, "not found")
+}
+
+function serveSecure(certPem: string, keyPem: string) {
+  serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
+    print("server failed: ${e.message()}\n")
+  }
 }
 ```

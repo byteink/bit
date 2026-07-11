@@ -1,15 +1,23 @@
 // Bit standard library — http module.
 //
-// HTTP/1.1 over std/net TCP, built entirely in Bit: the flagship of the
-// concurrency model. A server accepts connections and handles each on its own
-// green thread; a client dials, sends one request, and reads the response.
+// HTTP/1.1 over std/net TCP — or, for `https://` URLs and `serveTls`, over
+// std/tls (TLS 1.3) — built entirely in Bit: the flagship of the concurrency
+// model. A server accepts connections and handles each on its own green thread;
+// a client dials, sends one request, and reads the response. The wire protocol is
+// identical on either transport; only the socket swaps, behind a small
+// `byteStream` interface (`netStream` for cleartext, `tlsStream` for TLS).
 //
-// Scope for v1: plain HTTP (no TLS), one request per connection
+// Scope for v1: HTTP/1.1 over cleartext or TLS, one request per connection
 // (`Connection: close`), no chunked transfer encoding, no redirects. Headers are
 // carried as a raw block and read with `header()` — case-insensitively, by name.
 
 import { listen, dial, Listener, Conn } from "std/net"
 import { indexOf, hasPrefix, toLower } from "std/strings"
+import {
+  dial as tlsDial, listen as tlsListen, TlsConn, TlsConfig,
+  newTlsConfig, emptyTrustStore, TrustStore as TlsTrustStore,
+} from "std/tls"
+import { systemRoots, bundled } from "std/crypto"
 
 // ---------------------------------------------------------------------------
 // Small parsing helpers
@@ -156,16 +164,59 @@ function serializeResponse(res: Response): string {
 }
 
 // ---------------------------------------------------------------------------
+// Transport: the byte stream a message is read from and written to
+// ---------------------------------------------------------------------------
+
+// The transport an HTTP/1.1 exchange runs over: read up to `n` bytes (empty at
+// end of stream), write a whole string, and close. `netStream` wraps a cleartext
+// std/net socket; `tlsStream` wraps a std/tls connection. The wire logic
+// (`readMessage`, `serializeResponse`, `readAllStream`) speaks only this
+// interface, so http:// and https:// share one code path and differ only in which
+// stream they carry.
+interface byteStream {
+  readUp(n: int): string!,
+  writeStr(s: string): ()!,
+  shut(),
+}
+
+// A cleartext transport over a std/net TCP connection.
+struct netStream { conn: Conn }
+function (s: netStream) readUp(n: int): string! { return s.conn.read(n) }
+function (s: netStream) writeStr(data: string): ()! { s.conn.write(data)? }
+function (s: netStream) shut() { s.conn.close() }
+
+// A TLS transport over a std/tls connection; strings cross the byte-oriented
+// record API as raw bytes, no reinterpretation.
+struct tlsStream { conn: TlsConn }
+function (s: tlsStream) readUp(n: int): string! { return string(s.conn.read(n)?) }
+function (s: tlsStream) writeStr(data: string): ()! { s.conn.write([]byte(data))? }
+function (s: tlsStream) shut() { s.conn.close() }
+
+// Read `s` to end of stream (an empty read). Only safe against a peer that
+// closes — `Connection: close` guarantees it here.
+function readAllStream(s: byteStream): string! {
+  let out = ""
+  while (true) {
+    let chunk = s.readUp(65536)?
+    if (len(chunk) == 0) {
+      return out
+    }
+    out = out + chunk
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Reading a message off a connection
 // ---------------------------------------------------------------------------
 
 // Reads a full HTTP message (headers, then a Content-Length body if any) from
-// `c`. Returns the header block and body separately. An empty header block means
+// `s`. Returns the header block and body separately. An empty header block means
 // the peer closed before sending a complete message.
-function readMessage(c: Conn): Request {
+function readMessage(s: byteStream): Request! {
   let buf = ""
   while (indexOf(buf, "\r\n\r\n") < 0) {
-    let chunk = c.read(4096)
+    let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
       // Peer closed mid-headers: return an empty request, the caller stops.
       return Request{ method: "", path: "", headers: "", body: "" }
@@ -201,7 +252,7 @@ function readMessage(c: Conn): Request {
   // Read the rest of a declared body, if it did not all arrive with the headers.
   let cl = atoi(header(headers, "content-length"))
   while (cl > 0 && len(body) < cl) {
-    let chunk = c.read(4096)
+    let chunk = s.readUp(4096)?
     if (len(chunk) == 0) {
       break
     }
@@ -242,7 +293,7 @@ export function (s: Server) port(): int! {
 // arrives; the returned `Exchange` carries the connection to respond on.
 export function (s: Server) accept(): Exchange! {
   let c = s.listener.accept()?
-  let req = readMessage(c)
+  let req = readMessage(netStream{ conn: c })?
   return Exchange{ conn: c, request: req }
 }
 
@@ -278,20 +329,59 @@ export function listenAndServe(host: string, port: int, handler: (Request) => Re
   }
 }
 
+// Read one request off `s`, answer it with `handler`, and close. On the calling
+// green thread; a read or write failure just drops the connection.
+function serveOne(s: byteStream, handler: (Request) => Response) {
+  answer(s, handler) catch e {
+    return
+  }
+}
+
+function answer(s: byteStream, handler: (Request) => Response): ()! {
+  let req = readMessage(s)?
+  s.writeStr(serializeResponse(handler(req)))?
+  s.shut()
+}
+
+// Serve HTTPS on `host:port` forever with the certificate chain `certPem` and
+// matching private key `keyPem` (both PEM), dispatching every request to
+// `handler` on its own green thread — the TLS mirror of `listenAndServe`. ALPN
+// offers `http/1.1`. Returns only on a bind, accept, or handshake error.
+export function serveTls(host: string, port: int, certPem: string, keyPem: string, handler: (Request) => Response): ()! {
+  let cfg = newTlsConfig(emptyTrustStore())
+  cfg.certPem = certPem
+  cfg.keyPem = keyPem
+  cfg.alpn = ["http/1.1"]
+  let l = tlsListen(host, port, cfg)?
+  while (true) {
+    let conn = l.accept()?
+    spawn serveOne(tlsStream{ conn: conn }, handler)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
-// A parsed http:// URL. Port defaults to 80, path to "/".
+// A parsed http:// or https:// URL. Port defaults to 80 (http) or 443 (https),
+// path to "/". `https` selects the TLS transport.
 struct Url {
   host: string
   port: int
   path: string
+  https: bool
 }
 
 function parseUrl(url: string): Url! {
   let rest = url
-  if (hasPrefix(toLower(rest), "http://")) {
+  let https = false
+  let port = 80
+  let lower = toLower(rest)
+  if (hasPrefix(lower, "https://")) {
+    https = true
+    port = 443
+    rest = rest[8:len(rest)]
+  } else if (hasPrefix(lower, "http://")) {
     rest = rest[7:len(rest)]
   }
   // Split authority from path at the first '/'.
@@ -302,9 +392,8 @@ function parseUrl(url: string): Url! {
     authority = rest[0:slash]
     path = rest[slash:len(rest)]
   }
-  // Split host from an optional :port.
+  // Split host from an optional :port, which overrides the scheme default.
   let host = authority
-  let port = 80
   let colon = indexOf(authority, ":")
   if (colon >= 0) {
     host = authority[0:colon]
@@ -317,7 +406,7 @@ function parseUrl(url: string): Url! {
   if (len(host) == 0) {
     fail newError("no host in ${url}")
   }
-  return Url{ host: host, port: port, path: path }
+  return Url{ host: host, port: port, path: path, https: https }
 }
 
 // Parse a response off a fully-read connection: status line, headers, body.
@@ -354,30 +443,90 @@ function parseResponse(raw: string): Response! {
   return Response{ status: code, contentType: header(headers, "content-type"), headers: headers, body: body }
 }
 
-// Send `method url` with an optional body and return the response. The server is
-// asked to close the connection, so the whole response is read to EOF.
-export function request(method: string, url: string, body: string): Response! {
-  let u = parseUrl(url)?
-  let c = dial(u.host, u.port)?
+// The HTTP/1.1 request text for `method u.path` with `body`, asking the server to
+// close the connection so the whole response can be read to EOF.
+function buildRequest(method: string, u: Url, body: string): string {
   let req = "${method} ${u.path} HTTP/1.1\r\n"
   req = req + "Host: ${u.host}\r\n"
   req = req + "Connection: close\r\n"
   if (len(body) > 0) {
     req = req + "Content-Length: ${itoa(len(body))}\r\n"
   }
-  req = req + "\r\n" + body
-  c.write(req)?
-  let raw = c.readAll()
-  c.close()
+  return req + "\r\n" + body
+}
+
+// Send `reqText` over `s`, read the whole response to EOF, close, and parse it.
+function exchangeOn(s: byteStream, reqText: string): Response! {
+  s.writeStr(reqText)?
+  let raw = readAllStream(s)?
+  s.shut()
   return parseResponse(raw)?
 }
 
-// GET `url`.
+// Default trust anchors for verifying servers: the operating-system store when
+// available, else the small bundled root set. Rewrapped as a std/tls trust store
+// — both stores hold the same parsed X.509 roots, so no PEM round-trip is needed.
+function defaultRoots(): TlsTrustStore {
+  let sys = systemRoots() catch e {
+    return TlsTrustStore{ roots: bundled().roots }
+  }
+  return TlsTrustStore{ roots: sys.roots }
+}
+
+// A secure-by-default client TLS config: verification on, default roots, ALPN
+// `http/1.1`. SNI defaults to the request host inside `tls.dial`.
+function defaultClientConfig(): TlsConfig {
+  let cfg = newTlsConfig(defaultRoots())
+  cfg.alpn = ["http/1.1"]
+  return cfg
+}
+
+// Send `method url` with an optional body and return the response. An `https://`
+// URL runs over TLS 1.3, verifying the server against the system/bundled roots;
+// an `http://` URL runs over cleartext TCP. The server is asked to close the
+// connection, so the whole response is read to EOF. For a custom TLS config
+// (pinned roots, a fixed `serverName`, `insecureSkipVerify`), use `requestTls`.
+export function request(method: string, url: string, body: string): Response! {
+  let u = parseUrl(url)?
+  let reqText = buildRequest(method, u, body)
+  if (u.https) {
+    return exchangeOn(tlsStream{ conn: tlsDial(u.host, u.port, defaultClientConfig())? }, reqText)?
+  }
+  return exchangeOn(netStream{ conn: dial(u.host, u.port)? }, reqText)?
+}
+
+// As `request`, but over https with an explicit TLS `config` (custom roots, a
+// pinned `serverName`, `insecureSkipVerify` for tests). Fails if `url` is not
+// https. `config.alpn` defaults to `http/1.1` when empty.
+export function requestTls(method: string, url: string, body: string, config: TlsConfig): Response! {
+  let u = parseUrl(url)?
+  if (!u.https) {
+    fail newError("requestTls: ${url} is not an https URL")
+  }
+  let cfg = config
+  if (len(cfg.alpn) == 0) {
+    cfg.alpn = ["http/1.1"]
+  }
+  let reqText = buildRequest(method, u, body)
+  return exchangeOn(tlsStream{ conn: tlsDial(u.host, u.port, cfg)? }, reqText)?
+}
+
+// GET `url` (http or https).
 export function get(url: string): Response! {
   return request("GET", url, "")?
 }
 
-// POST `body` to `url`.
+// POST `body` to `url` (http or https).
 export function post(url: string, body: string): Response! {
   return request("POST", url, body)?
+}
+
+// GET an https `url` with an explicit TLS `config`.
+export function getTls(url: string, config: TlsConfig): Response! {
+  return requestTls("GET", url, "", config)?
+}
+
+// POST `body` to an https `url` with an explicit TLS `config`.
+export function postTls(url: string, body: string, config: TlsConfig): Response! {
+  return requestTls("POST", url, body, config)?
 }
