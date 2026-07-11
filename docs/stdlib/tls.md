@@ -1148,6 +1148,173 @@ function respond(conn: TlsServerConn, incoming: []byte): []byte! {
   return conn.sealApp(request.content)?
 }
 ```
+
+## QUIC handshake mode
+
+QUIC does not run TLS over the TLS record layer (RFC 9001 §4): it carries the
+plaintext handshake **messages** inside its own CRYPTO frames and protects them
+with QUIC packet protection instead. This mode drives the very same client and
+server state machines at the handshake-message level — no `RecordKeys.seal`/`open`
+and no five-byte record framing — and exposes the traffic secrets so
+[`std/quic`](quic.md) can key each encryption level. It is purely additive: the
+record-mode entrypoints and every record-mode behaviour are untouched.
+
+Server authentication is **not** relaxed here. The client still verifies the
+certificate chain and hostname against its [`TrustStore`](#-truststore-) (unless
+`insecureSkipVerify`), the CertificateVerify signature, and the server Finished
+MAC in constant time; the server still verifies the client Finished MAC. The
+`Exts` entrypoints add extensions to the ClientHello / EncryptedExtensions — QUIC
+uses this to carry the `quic_transport_parameters` extension (RFC 9001 §8.2).
+
+```bit
+import { tlsClientStartExts, TlsClientConfig, Extension } from "std/tls"
+
+// Drive the client half of a QUIC handshake at the message level (RFC 9001). `tp`
+// is the quic_transport_parameters extension. The ClientHello (from
+// `clientHelloMessage`) goes in Initial-level CRYPTO frames; after the server's
+// ServerHello and Handshake flight, the returned client Finished goes in
+// Handshake-level CRYPTO frames. The secrets exposed on `h` key the QUIC levels.
+function quicClientHandshake(config: TlsClientConfig, tp: Extension, serverHello: []byte, serverFlight: []byte): []byte! {
+  let h = tlsClientStartExts(config, [tp])?
+  let retry = h.processServerHelloMessage(serverHello)?
+  if (len(retry) > 0) {
+    fail newError("HelloRetryRequest: resend the ClientHello, then read the next ServerHello")
+  }
+  return h.clientReadHandshake(serverFlight)?
+}
+```
+
+### `tlsClientStartExts(config: TlsClientConfig, extraExts: []Extension): TlsClientHandshake!`
+
+Start a client handshake exactly like `tlsClientStart`, but add `extraExts` to the
+ClientHello's extension list. QUIC passes the `quic_transport_parameters`
+extension here; with an empty `extraExts` it is byte-for-byte `tlsClientStart`.
+The `clientHelloOverride` path ignores `extraExts`.
+
+### `TlsClientHandshake.clientHelloMessage(): []byte`
+
+The ClientHello handshake **message** (RFC 8446 §4.1.2) — the plaintext bytes for
+Initial-level CRYPTO frames, exactly what `hello` wraps in a record without the
+five-byte record header.
+
+### `TlsClientHandshake.processServerHelloMessage(shMsg: []byte): []byte!`
+
+Feed the server's ServerHello message (plaintext, from Initial-level CRYPTO
+frames). On a HelloRetryRequest it returns the resent ClientHello message to
+carry in a new Initial flight; otherwise it derives the handshake-traffic secrets
+and returns an empty slice. Fails on a parse error, an unoffered suite/group, or a
+second HelloRetryRequest.
+
+### `TlsClientHandshake.clientReadHandshake(stream: []byte): []byte!`
+
+Consume the server's Handshake-level messages — EncryptedExtensions, Certificate,
+CertificateVerify, Finished — as one plaintext `stream` (reassembled from
+Handshake-level CRYPTO frames), and return the client Finished **message** to
+carry in a Handshake-level CRYPTO frame. Runs the full security core: it verifies
+the certificate chain + hostname (unless `insecureSkipVerify`), the
+CertificateVerify signature, and the server Finished MAC, then derives the
+application-traffic secrets. Fails fatally on any parse or authentication failure.
+
+### `TlsClientHandshake.peerEncryptedExtensions(): []Extension`
+
+The server's EncryptedExtensions, as parsed during `clientReadHandshake` — QUIC
+reads the peer's `quic_transport_parameters` (codepoint `0x0039`) from here. Empty
+until the auth flight has been consumed.
+
+### `TlsClientHandshake.cipherSuiteId(): int`
+
+The negotiated cipher suite's IANA code point, valid once a (non-HRR) ServerHello
+has been processed. Used to pick the suite hash and key length when deriving each
+QUIC encryption level's keys.
+
+### `TlsClientHandshake.clientHandshakeSecret(): []byte`
+
+The client_handshake_traffic_secret (RFC 8446 §7.1), derived after the
+ServerHello. `std/quic` keys the client's Handshake-level packets from it.
+
+### `TlsClientHandshake.serverHandshakeSecret(): []byte`
+
+The server_handshake_traffic_secret (RFC 8446 §7.1), derived after the
+ServerHello. `std/quic` keys the server's Handshake-level packets from it.
+
+### `TlsClientHandshake.clientApplicationSecret(): []byte`
+
+The client_application_traffic_secret_0 (RFC 8446 §7.1), derived after the server
+Finished by `clientReadHandshake`. `std/quic` keys the client's 1-RTT packets from
+it.
+
+### `TlsClientHandshake.serverApplicationSecret(): []byte`
+
+The server_application_traffic_secret_0 (RFC 8446 §7.1), derived after the server
+Finished by `clientReadHandshake`. `std/quic` keys the server's 1-RTT packets from
+it.
+
+### `TlsClientHandshake.exporterSecret(): []byte`
+
+The exporter_master_secret (RFC 8446 §7.5), derived by `clientReadHandshake` — the
+root of exported keying material bound to this handshake.
+
+### `tlsServerStartExts(config: TlsServerConfig, extraExts: []Extension): TlsServerHandshake!`
+
+Start a server handshake exactly like `tlsServerStart`, but add `extraExts` to the
+EncryptedExtensions the server sends. QUIC answers with its
+`quic_transport_parameters` extension here; with an empty `extraExts` it is
+byte-for-byte `tlsServerStart`.
+
+### `TlsServerQuicFlight`
+
+One QUIC server output flight from `processClientHelloMessage`. `retry` means a
+HelloRetryRequest was produced: `serverHello` is the HRR message (Initial-level
+CRYPTO) and `handshake` is empty. Otherwise `serverHello` is the ServerHello
+message (Initial-level CRYPTO) and `handshake` is the concatenated
+EncryptedExtensions ‖ Certificate ‖ CertificateVerify ‖ Finished (Handshake-level
+CRYPTO), all plaintext messages.
+
+### `TlsServerHandshake.processClientHelloMessage(chMsg: []byte): TlsServerQuicFlight!`
+
+Process the client's ClientHello message (plaintext, from Initial-level CRYPTO
+frames). Negotiates the suite and group; on success it derives the handshake- and
+application-traffic secrets and returns the ServerHello plus the plaintext
+authentication flight, and on an unshareable group it returns a HelloRetryRequest.
+Fails on a parse error, an absent common suite/group, or a signing failure.
+
+### `TlsServerHandshake.processClientFinishedMessage(finMsg: []byte): TlsServerConn!`
+
+Verify the client Finished message (plaintext, from a Handshake-level CRYPTO
+frame) and complete the handshake, returning the application connection. Runs the
+same constant-time MAC check as record mode. Fails on a parse error or a Finished
+MAC that does not match.
+
+### `TlsServerHandshake.cipherSuiteId(): int`
+
+The negotiated cipher suite's IANA code point, valid once a ClientHello has been
+processed.
+
+### `TlsServerHandshake.clientHandshakeSecret(): []byte`
+
+The client_handshake_traffic_secret (RFC 8446 §7.1), derived once the server
+flight is produced.
+
+### `TlsServerHandshake.serverHandshakeSecret(): []byte`
+
+The server_handshake_traffic_secret (RFC 8446 §7.1), derived once the server
+flight is produced.
+
+### `TlsServerHandshake.clientApplicationSecret(): []byte`
+
+The client_application_traffic_secret_0 (RFC 8446 §7.1), derived once the server
+flight is produced.
+
+### `TlsServerHandshake.serverApplicationSecret(): []byte`
+
+The server_application_traffic_secret_0 (RFC 8446 §7.1), derived once the server
+flight is produced.
+
+### `TlsServerHandshake.exporterSecret(): []byte`
+
+The exporter_master_secret (RFC 8446 §7.5), derived once the server flight is
+produced.
+
 ## Public API
 
 The high-level, socket-driving API most callers reach for: `dial` for a client,

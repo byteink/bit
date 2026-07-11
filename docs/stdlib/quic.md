@@ -634,11 +634,13 @@ per-encryption-level key derivation and key update, and CRYPTO-frame carriage. I
 builds on the [key schedule](tls.md) in `std/tls` (it reuses that module's
 `hkdfExpandLabel`) but touches no TLS record.
 
-Carrying a full handshake to completion additionally needs a `std/tls` hook that
-yields plaintext handshake messages and the traffic secrets as they are derived
-(bypassing record encryption); until then these primitives are complete and
-independently usable, and the QUIC endpoint can already send its own ClientHello
-by stripping the 5-byte record header off `tlsClientStart`'s `hello`.
+A full client↔server handshake runs on `std/tls`'s record-bypass handshake mode
+(its `tlsClientStartExts` / `tlsServerStartExts` entrypoints and message-level
+drivers, in [std/tls › QUIC handshake mode](tls.md#quic-handshake-mode)): carry
+each handshake message in CRYPTO frames across the Initial and Handshake levels,
+key each level from the exposed traffic secrets with `levelKeys` (or `levelKeyPair`
+for both directions at once), and reach 1-RTT on both sides — with the TLS
+certificate, CertificateVerify, and Finished verification all still enforced.
 
 ```bit
 import {
@@ -732,6 +734,35 @@ traffic `secret` (RFC 9001 §5.1) with the QUIC labels "quic key", "quic iv" (12
 bytes), and "quic hp". `keyLen` is the AEAD key length (16 for AES-128-GCM, 32 for
 AES-256-GCM and ChaCha20-Poly1305), and the hp key is the same length. `newHash`
 is the negotiated suite's hash. Initial keys instead come from `clientInitialKeys`.
+
+### `LevelKeyPair`
+
+Both directions' packet-protection keys for one non-Initial encryption level (RFC
+9001 §5.1) — the unit an endpoint installs for the Handshake or 1-RTT level.
+`client` protects the client's packets, `server` the server's.
+
+### `levelKeyPair(newHash: () => Hash, clientSecret: []byte, serverSecret: []byte, keyLen: int): LevelKeyPair`
+
+Derive both directions' keys for a non-Initial level from the endpoint TLS traffic
+secrets (RFC 9001 §5.1): `clientSecret` is the client's handshake- or
+application-traffic secret and `serverSecret` the server's, as exposed by the
+`std/tls` record-bypass handshake. Both peers, deriving from the same pair of
+secrets, obtain byte-identical keys — the check that a QUIC-TLS handshake reached
+a level.
+
+```bit
+import { levelKeyPair, LevelKeyPair } from "std/quic"
+import { Hash, newSha256 } from "std/crypto"
+
+// The negotiated suite's hash as a `() => Hash`.
+function suite(): Hash { return newSha256() }
+
+// Both directions' 1-RTT keys from the client and server application secrets that
+// the std/tls record-bypass handshake exposed.
+function oneRtt(clientSecret: []byte, serverSecret: []byte): LevelKeyPair {
+  return levelKeyPair(suite, clientSecret, serverSecret, 16)
+}
+```
 
 ### `updateSecret(newHash: () => Hash, secret: []byte): []byte`
 
