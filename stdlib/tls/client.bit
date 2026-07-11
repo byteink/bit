@@ -1,0 +1,821 @@
+// Bit standard library — std/tls, the TLS 1.3 client handshake (RFC 8446, #1206).
+//
+// A sans-I/O 1-RTT client handshake state machine. It owns no sockets: the
+// caller drives it by shuttling flights of raw record bytes, which makes it
+// equally at home over a TCP stream, an in-memory pipe, or a recorded trace.
+//
+//   let h = tlsClientStart(config)?      // build ClientHello, seed the transcript
+//   send(h.hello)                        // flight 1: the ClientHello record
+//   let step = h.processServerFlight(recv())?
+//   while (step.retry) {                 // HelloRetryRequest -> resend
+//     send(step.outbound)
+//     step = h.processServerFlight(recv())?
+//   }
+//   send(step.outbound)                  // flight 3: the client Finished
+//   let conn = h.connection()?           // application-data channel
+//
+// The handshake composes the rest of std/tls: `groups` for the (EC)DHE / hybrid
+// key exchange, `ciphersuites` for the AEAD + hash, `keyschedule` for the HKDF
+// ladder, `handshake` for the wire messages, and `record` for AEAD record
+// protection. Server authentication is the security core and is never skipped
+// beyond `insecureSkipVerify` (which drops only chain + hostname, never the
+// CertificateVerify signature or the Finished MAC): the certificate chain is
+// verified with std/crypto's X.509 verifier against a caller-supplied
+// `TrustStore` and the SNI hostname, the server's CertificateVerify signature is
+// checked over the RFC 8446 §4.4.3 signed content, and the server Finished MAC
+// is checked in constant time. Any failure is a fatal handshake error.
+//
+// std/tls is one flat module, so this file calls its siblings (`tlsSuite*`,
+// `tlsGroup*`, the key schedule, the `encode*`/`parse*` handshake codecs, and the
+// `tlsHsPutBytes` / `tlsHsWrap` framing helpers) directly. It imports from
+// std/crypto only the verification primitives no sibling already imports; the
+// `Certificate` message struct from `handshake.bit` would collide with x509's
+// `Certificate`, so the parsed-certificate type is imported under the alias
+// `X509Certificate`. Every private free function is prefixed `client`; the record
+// framing shared with the server is prefixed `tlsWire`.
+
+import { Certificate as X509Certificate, x509Parse, x509VerifyChain } from "std/crypto"
+import { x509KeyRSA, x509KeyECDSA, x509KeyEd25519 } from "std/crypto"
+import { ecdsaPublicKey, ecdsaVerify, ecdsaSignatureFromDer } from "std/crypto"
+import { ed25519Verify, rsaVerifyPss, rsaParsePkcs1PublicKey } from "std/crypto"
+import { newSha512, randomBytes, ctEq } from "std/crypto"
+import { pemDecode } from "std/crypto"
+
+// ---------------------------------------------------------------------------
+// Shared record framing (client + server), prefixed `tlsWire`
+// ---------------------------------------------------------------------------
+
+// change_cipher_spec (RFC 8446 §5) — a TLS 1.3 peer sends it only for middlebox
+// compatibility and the receiver ignores it. This module never emits one but
+// skips any it sees, so a trace or peer that includes it still interoperates.
+const tlsCcsType: int = 20
+
+// Frame `msg` as one cleartext TLS record of `contentType`: the type, the frozen
+// TLS 1.2 legacy version, the two-byte length, then the body. Used for the
+// ClientHello / ServerHello / HelloRetryRequest, which travel before record keys
+// exist; every later record is AEAD-sealed by `RecordKeys.seal` instead.
+function tlsWirePlaintextRecord(contentType: int, msg: []byte): []byte {
+  let out = []byte(0)
+  out = append(out, byte(contentType))
+  out = append(out, byte(0x03))
+  out = append(out, byte(0x03))
+  out = append(out, byte(len(msg) >> 8 & 0xff))
+  out = append(out, byte(len(msg) & 0xff))
+  return tlsHsPutBytes(out, msg)
+}
+
+// The outer content type of a record (its first byte). The caller guarantees the
+// record is non-empty (`tlsWireSplitRecords` never yields a short one).
+function tlsWireRecordType(rec: []byte): int { return int(rec[0]) }
+
+// The fragment of a cleartext record — everything after the five-byte header.
+function tlsWireRecordBody(rec: []byte): []byte { return rec[5:len(rec)] }
+
+// Split a buffer of concatenated TLS records into whole records by their
+// two-byte length fields. Fails on a truncated header or a length that runs past
+// the buffer, and on trailing bytes — a handshake parser faces hostile input, so
+// a partial record is rejected rather than best-guessed.
+function tlsWireSplitRecords(buf: []byte): [][]byte! {
+  let out = [][]byte(0)
+  let pos = 0
+  let guard = 0
+  while (pos < len(buf) && guard <= len(buf)) {
+    guard = guard + 1
+    if (pos + 5 > len(buf)) {
+      fail newError("tls: truncated record header")
+    }
+    let n = int(buf[pos + 3]) << 8 | int(buf[pos + 4])
+    let total = 5 + n
+    if (pos + total > len(buf)) {
+      fail newError("tls: record length runs past the buffer")
+    }
+    out = append(out, buf[pos:pos + total])
+    pos = pos + total
+  }
+  if (pos != len(buf)) {
+    fail newError("tls: trailing bytes after the last record")
+  }
+  return out
+}
+
+// Split a buffer of concatenated Handshake messages (each a one-byte type, a
+// three-byte length, then its body) into whole messages. One decrypted record
+// may carry several coalesced handshake messages, so the flight processor splits
+// them here. Fails on a truncated header, an over-long body, or trailing bytes.
+function tlsWireSplitHandshakes(buf: []byte): [][]byte! {
+  let out = [][]byte(0)
+  let pos = 0
+  let guard = 0
+  while (pos < len(buf) && guard <= len(buf)) {
+    guard = guard + 1
+    if (pos + 4 > len(buf)) {
+      fail newError("tls: truncated handshake header")
+    }
+    let n = int(buf[pos + 1]) << 16 | int(buf[pos + 2]) << 8 | int(buf[pos + 3])
+    let total = 4 + n
+    if (pos + total > len(buf)) {
+      fail newError("tls: handshake message runs past the buffer")
+    }
+    out = append(out, buf[pos:pos + total])
+    pos = pos + total
+  }
+  if (pos != len(buf)) {
+    fail newError("tls: trailing bytes after the last handshake message")
+  }
+  return out
+}
+
+// The RFC 8446 §4.4.3 CertificateVerify signed content for the server's
+// signature: 64 octets of 0x20, the context string, a 0x00 separator, then the
+// transcript hash through the Certificate message. Shared with the server, which
+// signs exactly this; hence the `tlsWire` prefix.
+function tlsWireCertVerifyContent(context: string, transcriptHash: []byte): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < 64) {
+    out = append(out, byte(0x20))
+    i = i + 1
+  }
+  out = tlsHsPutBytes(out, []byte(context))
+  out = append(out, byte(0x00))
+  return tlsHsPutBytes(out, transcriptHash)
+}
+
+// The context string a server signs and a client verifies (RFC 8446 §4.4.3).
+const tlsWireServerCertVerifyContext: string = "TLS 1.3, server CertificateVerify"
+
+// message_hash (RFC 8446 §4.4.1): when a HelloRetryRequest intervenes, the first
+// ClientHello is replaced in the transcript by a synthetic handshake message
+// `Handshake(message_hash, Hash(ClientHello1))`. Shared with the server so both
+// sides compute the identical post-HRR transcript.
+function tlsWireSyntheticHash(newHash: () => Hash, clientHello1: []byte): []byte {
+  return tlsHsWrap(254, digest(newHash(), clientHello1))
+}
+
+// ---------------------------------------------------------------------------
+// Trust store and configuration
+// ---------------------------------------------------------------------------
+
+// A set of trusted root certificates the client verifies a server chain up to
+// (RFC 8446 §4.4.2). Build one from PEM with `newTrustStore`, or from
+// already-parsed roots via the struct literal.
+export struct TrustStore {
+  export roots: []X509Certificate,
+}
+
+// A `TrustStore` from a PEM bundle of one or more `CERTIFICATE` blocks (the usual
+// system-roots format). Fails on malformed PEM or a certificate this X.509 parser
+// rejects. Non-CERTIFICATE blocks are ignored.
+export function newTrustStore(rootsPem: string): TrustStore! {
+  let blocks = pemDecode(rootsPem)?
+  let roots = []X509Certificate(0)
+  for b of blocks {
+    if (b.label == "CERTIFICATE") {
+      roots = append(roots, x509Parse(b.der)?)
+    }
+  }
+  if (len(roots) == 0) {
+    fail newError("tls client: trust store has no CERTIFICATE blocks")
+  }
+  return TrustStore{ roots: roots }
+}
+
+// A client handshake configuration.
+//
+//   serverName          the SNI host and the name the certificate must match
+//   alpn                ALPN protocols offered, most-preferred first (empty = none)
+//   trust               the roots a server chain is verified against
+//   insecureSkipVerify  skip chain + hostname verification (still verifies the
+//                       CertificateVerify signature and the Finished MAC); for
+//                       testing and trace replay only
+//   nowUnix             the current time (Unix seconds) for certificate validity
+//   groups              named groups offered in supported_groups, preferred first
+//   keyShareGroups      the subset of `groups` to send an actual key_share for
+//                       (empty = all of `groups`); a group offered here but not
+//                       shared is what lets a server request it via HRR
+//   suites              cipher suites offered (empty = all three mandatory suites)
+//   clientHelloOverride advanced: exact ClientHello handshake bytes to send in
+//                       place of the built one (empty = build). For deterministic
+//                       replay and callers crafting their own ClientHello.
+//   ephemeralOverride   advanced: ephemeral keypairs to use instead of freshly
+//                       generated ones, parallel to `keyShareGroups`/`groups`.
+export struct TlsClientConfig {
+  export serverName: string,
+  export alpn: []string,
+  export trust: TrustStore,
+  export insecureSkipVerify: bool,
+  export nowUnix: int,
+  export groups: []TlsGroup,
+  export keyShareGroups: []TlsGroup,
+  export suites: []int,
+  export clientHelloOverride: []byte,
+  export ephemeralOverride: []GroupKeypair,
+}
+
+// One key_share the client offered: the group, its wire codepoint, and the
+// ephemeral keypair whose public half is on the wire and private half derives
+// the shared secret when the server selects this group.
+struct clientOffer {
+  group: TlsGroup,
+  cp: int,
+  kp: GroupKeypair,
+}
+
+// One step of the client handshake produced by `processServerFlight`.
+//
+//   retry     the server sent a HelloRetryRequest; send `outbound` and feed the
+//             next server flight back into `processServerFlight`
+//   done      the handshake completed; `outbound` is the client Finished to send,
+//             after which `connection()` yields the application channel
+//   outbound  the record(s) to send now
+export struct TlsClientStep {
+  export retry: bool,
+  export done: bool,
+  export outbound: []byte,
+}
+
+// A completed client connection: the negotiated parameters and the two
+// application-data record contexts. Obtain it from `TlsClientHandshake.connection`
+// once the handshake is done.
+export struct TlsClientConn {
+  suite: CipherSuite,
+  alpn: string,
+  peerCerts: [][]byte,
+  appWrite: RecordKeys,
+  appRead: RecordKeys,
+  exporter: []byte,
+  resumption: []byte,
+}
+
+// The in-progress client handshake state. Its only public surface is `hello`
+// (the ClientHello record to send first) and the methods below; everything else
+// is derived as the handshake advances.
+export struct TlsClientHandshake {
+  config: TlsClientConfig,
+  offers: []clientOffer,
+  clientRandom: []byte,
+  sessionId: []byte,
+  ch1: []byte,
+  transcript: []byte,
+  suite: CipherSuite,
+  shared: []byte,
+  hsSec: []byte,
+  chs: []byte,
+  shs: []byte,
+  serverHsKeys: RecordKeys,
+  clientHsKeys: RecordKeys,
+  usedHrr: bool,
+  peerCerts: [][]byte,
+  alpn: string,
+  capSecret: []byte,
+  sapSecret: []byte,
+  exporterSec: []byte,
+  resumptionSec: []byte,
+  connected: bool,
+  export hello: []byte,
+}
+
+// ---------------------------------------------------------------------------
+// Small hash-constructor wrappers (`() => Hash`)
+// ---------------------------------------------------------------------------
+
+// The concrete SHA constructors expose as `() => Hash` values — a `newShaN`
+// returns its concrete type, which is not itself a `() => Hash`, so the signature
+// verifiers that take a hash constructor are handed these wrappers.
+function clientSha256(): Hash { return newSha256() }
+function clientSha384(): Hash { return newSha384() }
+function clientSha512(): Hash { return newSha512() }
+
+// ---------------------------------------------------------------------------
+// Start: build the ClientHello
+// ---------------------------------------------------------------------------
+
+// The mandatory TLS 1.3 cipher suites, offered when a config names none.
+function clientDefaultSuites(): []int {
+  return [TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_GCM_SHA256]
+}
+
+// The signature schemes the client advertises it will accept in the server's
+// CertificateVerify (RFC 8446 §4.2.3) — the ECDSA, RSA-PSS, and Ed25519 schemes
+// this client can verify.
+function clientSigAlgs(): []int {
+  return [
+    sigEcdsaSecp256r1Sha256,
+    sigRsaPssRsaeSha256,
+    sigEcdsaSecp384r1Sha384,
+    sigRsaPssRsaeSha384,
+    sigRsaPssRsaeSha512,
+    sigEd25519,
+  ]
+}
+
+// Build the key_share offers for `shareGroups`, using `overrides[i]` as the
+// ephemeral keypair when present (parallel index) and generating a fresh one
+// otherwise. The private halves are retained in the offers to finish the exchange.
+function clientMakeOffers(shareGroups: []TlsGroup, overrides: []GroupKeypair): []clientOffer {
+  let out = []clientOffer(0)
+  let i = 0
+  while (i < len(shareGroups)) {
+    let g = shareGroups[i]
+    let kp = tlsGroupGenerate(g)
+    if (i < len(overrides)) {
+      kp = overrides[i]
+    }
+    out = append(out, clientOffer{ group: g, cp: int(tlsGroupCodepoint(g)), kp: kp })
+    i = i + 1
+  }
+  return out
+}
+
+// Encode a ClientHello carrying `offers` as its key_share, this handshake's fixed
+// random and legacy session id, the configured supported groups / suites / ALPN /
+// SNI, and supported_versions = TLS 1.3.
+function (h: TlsClientHandshake) clientBuildHello(offers: []clientOffer): []byte {
+  let exts = []Extension(0)
+  if (len(h.config.serverName) > 0) {
+    exts = append(exts, extServerName(h.config.serverName))
+  }
+  exts = append(exts, extSupportedVersionsClient([versionTls13]))
+  let gcps = []int(0)
+  for g of h.config.groups {
+    gcps = append(gcps, int(tlsGroupCodepoint(g)))
+  }
+  exts = append(exts, extSupportedGroups(gcps))
+  exts = append(exts, extSignatureAlgorithms(clientSigAlgs()))
+  let entries = []KeyShareEntry(0)
+  for o of offers {
+    entries = append(entries, KeyShareEntry{ group: o.cp, keyExchange: o.kp.keyShare })
+  }
+  exts = append(exts, extKeyShareClient(entries))
+  if (len(h.config.alpn) > 0) {
+    exts = append(exts, extALPN(h.config.alpn))
+  }
+  let suites = h.config.suites
+  if (len(suites) == 0) {
+    suites = clientDefaultSuites()
+  }
+  return encodeClientHello(ClientHello{
+    legacyVersion: versionTls12,
+    random: h.clientRandom,
+    sessionId: h.sessionId,
+    cipherSuites: suites,
+    extensions: exts,
+  })
+}
+
+// Start a client handshake: build the ClientHello (or adopt
+// `config.clientHelloOverride`), seed the transcript with it, and expose it as
+// the `hello` record to send. Fails only if the default record context cannot be
+// built. The returned handshake is then driven by `processServerFlight`.
+export function tlsClientStart(config: TlsClientConfig): TlsClientHandshake! {
+  let aes128 = tlsSuiteById(TLS_AES_128_GCM_SHA256)?
+  let dummy = newRecordKeys(aes128, []byte(32))?
+  let h = TlsClientHandshake{
+    config: config,
+    offers: []clientOffer(0),
+    clientRandom: []byte(0),
+    sessionId: []byte(0),
+    ch1: []byte(0),
+    transcript: []byte(0),
+    suite: aes128,
+    shared: []byte(0),
+    hsSec: []byte(0),
+    chs: []byte(0),
+    shs: []byte(0),
+    serverHsKeys: dummy,
+    clientHsKeys: dummy,
+    usedHrr: false,
+    peerCerts: [][]byte(0),
+    alpn: "",
+    capSecret: []byte(0),
+    sapSecret: []byte(0),
+    exporterSec: []byte(0),
+    resumptionSec: []byte(0),
+    connected: false,
+    hello: []byte(0),
+  }
+
+  let shareGroups = config.keyShareGroups
+  if (len(shareGroups) == 0) {
+    shareGroups = config.groups
+  }
+
+  if (len(config.clientHelloOverride) > 0) {
+    // Adopt the caller's ClientHello verbatim; the ephemeral offers must be
+    // supplied so the shared secret can be finished when the server replies.
+    h.offers = clientMakeOffersForGroups(config.groups, config.ephemeralOverride)
+    h.ch1 = config.clientHelloOverride
+  } else {
+    h.clientRandom = randomBytes(32)
+    h.sessionId = randomBytes(32)
+    h.offers = clientMakeOffers(shareGroups, config.ephemeralOverride)
+    h.ch1 = h.clientBuildHello(h.offers)
+  }
+  h.transcript = h.ch1
+  h.hello = tlsWirePlaintextRecord(recordHandshake, h.ch1)
+  return h
+}
+
+// The override path's offers: each configured group paired with the parallel
+// pinned ephemeral keypair (`overrides[i]`). A group with no pinned keypair is
+// still generated so the offers stay total.
+function clientMakeOffersForGroups(groups: []TlsGroup, overrides: []GroupKeypair): []clientOffer {
+  return clientMakeOffers(groups, overrides)
+}
+
+// ---------------------------------------------------------------------------
+// Drive: process a server flight
+// ---------------------------------------------------------------------------
+
+// The suite hash as a `() => Hash` for the key schedule and transcript.
+function (h: TlsClientHandshake) clientNewHash(): Hash { return tlsSuiteNewHash(h.suite) }
+
+// The transcript hash of the messages absorbed so far, under the negotiated suite
+// hash.
+function (h: TlsClientHandshake) clientTh(): []byte {
+  return digest(tlsSuiteNewHash(h.suite), h.transcript)
+}
+
+// Process one server flight of raw record bytes. Returns a `retry` step on a
+// HelloRetryRequest (resend `outbound`, then feed the next flight) or a `done`
+// step carrying the client Finished to send. Fails — fatally — on any parse
+// error or authentication failure (bad certificate chain, CertificateVerify
+// signature, or server Finished MAC).
+export function (h: TlsClientHandshake) processServerFlight(flight: []byte): TlsClientStep! {
+  let records = tlsWireSplitRecords(flight)?
+  let idx = 0
+  while (idx < len(records) && tlsWireRecordType(records[idx]) == tlsCcsType) {
+    idx = idx + 1
+  }
+  if (idx >= len(records)) {
+    fail newError("tls client: server flight has no ServerHello")
+  }
+  let shRec = records[idx]
+  idx = idx + 1
+  if (tlsWireRecordType(shRec) != recordHandshake) {
+    fail newError("tls client: expected a plaintext handshake record for ServerHello")
+  }
+  let shMsg = tlsWireRecordBody(shRec)
+  let sh = parseServerHello(shMsg)?
+  if (isHelloRetryRequest(sh)) {
+    return h.clientHandleHrr(sh, shMsg)?
+  }
+
+  h.clientProcessServerHello(sh, shMsg)?
+
+  // The remaining records are AEAD-sealed handshake records; decrypt each and
+  // concatenate the recovered handshake messages into one stream to parse.
+  let stream = []byte(0)
+  while (idx < len(records)) {
+    let rec = records[idx]
+    idx = idx + 1
+    if (tlsWireRecordType(rec) == tlsCcsType) {
+      continue
+    }
+    let pt = h.serverHsKeys.open(rec)?
+    if (pt.contentType == recordAlert) {
+      fail newError("tls client: server sent an alert during the handshake")
+    }
+    if (pt.contentType != recordHandshake) {
+      fail newError("tls client: unexpected content type ${pt.contentType} in the handshake flight")
+    }
+    stream = tlsHsPutBytes(stream, pt.content)
+  }
+  return h.clientProcessAuthFlight(stream)?
+}
+
+// Handle a HelloRetryRequest: adopt the HRR's suite, rebuild the transcript
+// around the synthetic message_hash (RFC 8446 §4.4.1), and resend a ClientHello
+// whose only change is a key_share for the group the server requested.
+function (h: TlsClientHandshake) clientHandleHrr(sh: ServerHello, shMsg: []byte): TlsClientStep! {
+  if (h.usedHrr) {
+    fail newError("tls client: server sent a second HelloRetryRequest")
+  }
+  h.usedHrr = true
+  h.suite = tlsSuiteById(sh.cipherSuite)?
+  if (!h.clientOfferedSuite(sh.cipherSuite)) {
+    fail newError("tls client: HelloRetryRequest chose an unoffered cipher suite")
+  }
+  let ksExt = h.clientFindExt(sh.extensions, extTypeKeyShare)?
+  if (len(ksExt.data) < 2) {
+    fail newError("tls client: HelloRetryRequest key_share has no selected group")
+  }
+  let cp = int(ksExt.data[0]) << 8 | int(ksExt.data[1])
+  if (!h.clientSupportsGroup(cp)) {
+    fail newError("tls client: HelloRetryRequest requested an unoffered group")
+  }
+  let g = tlsGroupFromCodepoint(u64(cp))?
+
+  let synthetic = tlsWireSyntheticHash(h.clientNewHash, h.ch1)
+  h.transcript = tlsHsPutBytes(synthetic, shMsg)
+  h.offers = clientMakeOffers([g], []GroupKeypair(0))
+  let ch2 = h.clientBuildHello(h.offers)
+  h.transcript = tlsHsPutBytes(h.transcript, ch2)
+  h.hello = tlsWirePlaintextRecord(recordHandshake, ch2)
+  return TlsClientStep{ retry: true, done: false, outbound: h.hello }
+}
+
+// Process the ServerHello: confirm TLS 1.3 and a suite we offered, finish the
+// key exchange from the server's key_share, extend the transcript, and derive the
+// handshake-traffic secrets and their record contexts.
+function (h: TlsClientHandshake) clientProcessServerHello(sh: ServerHello, shMsg: []byte): ()! {
+  let svExt = h.clientFindExt(sh.extensions, extTypeSupportedVersions)?
+  if (parseSupportedVersionsServer(svExt)? != versionTls13) {
+    fail newError("tls client: server did not select TLS 1.3")
+  }
+  if (!h.clientOfferedSuite(sh.cipherSuite)) {
+    fail newError("tls client: server chose an unoffered cipher suite")
+  }
+  h.suite = tlsSuiteById(sh.cipherSuite)?
+
+  let ksExt = h.clientFindExt(sh.extensions, extTypeKeyShare)?
+  let entry = parseKeyShareServer(ksExt)?
+  let offer = h.clientOfferForCp(entry.group)?
+  h.shared = tlsGroupComputeShared(offer.group, offer.kp.priv, entry.keyExchange)?
+
+  h.transcript = tlsHsPutBytes(h.transcript, shMsg)
+
+  let mk = h.clientNewHash
+  let early = earlySecret(mk, []byte(0))
+  h.hsSec = handshakeSecret(mk, early, h.shared)
+  let thSH = h.clientTh()
+  h.chs = clientHandshakeTrafficSecret(mk, h.hsSec, thSH)
+  h.shs = serverHandshakeTrafficSecret(mk, h.hsSec, thSH)
+  h.serverHsKeys = newRecordKeys(h.suite, h.shs)?
+  h.clientHsKeys = newRecordKeys(h.suite, h.chs)?
+}
+
+// Parse and authenticate the encrypted server flight — EncryptedExtensions,
+// Certificate, CertificateVerify, Finished — in order, then produce the client
+// Finished and the application-traffic material.
+function (h: TlsClientHandshake) clientProcessAuthFlight(stream: []byte): TlsClientStep! {
+  let msgs = tlsWireSplitHandshakes(stream)?
+  for msg of msgs {
+    let t = handshakeType(msg)?
+    if (t == hsEncryptedExtensions) {
+      let ee = parseEncryptedExtensions(msg)?
+      h.alpn = h.clientPickAlpn(ee.extensions)
+      h.transcript = tlsHsPutBytes(h.transcript, msg)
+    } else if (t == hsCertificate) {
+      let cert = parseCertificate(msg)?
+      h.peerCerts = clientCertDers(cert)
+      if (len(h.peerCerts) == 0) {
+        fail newError("tls client: server sent an empty certificate chain")
+      }
+      h.transcript = tlsHsPutBytes(h.transcript, msg)
+      if (!h.config.insecureSkipVerify) {
+        h.clientVerifyChain()?
+      }
+    } else if (t == hsCertificateVerify) {
+      let cv = parseCertificateVerify(msg)?
+      h.clientVerifyCertVerify(cv)?
+      h.transcript = tlsHsPutBytes(h.transcript, msg)
+    } else if (t == hsFinished) {
+      let fin = parseFinished(msg)?
+      h.clientVerifyServerFinished(fin)?
+      h.transcript = tlsHsPutBytes(h.transcript, msg)
+      return h.clientFinish()?
+    } else {
+      fail newError("tls client: unexpected handshake message type ${t}")
+    }
+  }
+  fail newError("tls client: server flight ended before the Finished message")
+}
+
+// Verify the peer certificate chain up to a trusted root and against the SNI
+// hostname (RFC 8446 §4.4.2), delegating to the std/crypto X.509 verifier. Any
+// failure aborts the handshake.
+function (h: TlsClientHandshake) clientVerifyChain(): ()! {
+  let leaf = x509Parse(h.peerCerts[0])?
+  let inter = []X509Certificate(0)
+  let i = 1
+  while (i < len(h.peerCerts)) {
+    inter = append(inter, x509Parse(h.peerCerts[i])?)
+    i = i + 1
+  }
+  x509VerifyChain(leaf, inter, h.config.trust.roots, h.config.serverName, h.config.nowUnix)?
+}
+
+// Verify the server's CertificateVerify signature over the RFC 8446 §4.4.3 signed
+// content with the leaf certificate's public key. Fails on a bad signature.
+function (h: TlsClientHandshake) clientVerifyCertVerify(cv: CertificateVerify): ()! {
+  let leaf = x509Parse(h.peerCerts[0])?
+  let signed = tlsWireCertVerifyContent(tlsWireServerCertVerifyContext, h.clientTh())
+  if (!clientCheckSignature(cv.algorithm, leaf, signed, cv.signature)) {
+    fail newError("tls client: server CertificateVerify signature is invalid")
+  }
+}
+
+// Whether `sig` is a valid signature of `signed` under `leaf`'s public key for
+// SignatureScheme `alg`. Dispatches on the scheme, pins the expected public-key
+// type, and treats any malformed key or signature as an invalid signature rather
+// than raising — a verification predicate must not fail open.
+function clientCheckSignature(alg: int, leaf: X509Certificate, signed: []byte, sig: []byte): bool {
+  if (alg == sigEcdsaSecp256r1Sha256) {
+    return clientVerifyEcdsa(leaf, nistecP256(), digest(newSha256(), signed), sig)
+  }
+  if (alg == sigEcdsaSecp384r1Sha384) {
+    return clientVerifyEcdsa(leaf, nistecP384(), digest(newSha384(), signed), sig)
+  }
+  if (alg == sigRsaPssRsaeSha256) {
+    return clientVerifyRsaPss(leaf, clientSha256, signed, sig, 32)
+  }
+  if (alg == sigRsaPssRsaeSha384) {
+    return clientVerifyRsaPss(leaf, clientSha384, signed, sig, 48)
+  }
+  if (alg == sigRsaPssRsaeSha512) {
+    return clientVerifyRsaPss(leaf, clientSha512, signed, sig, 64)
+  }
+  if (alg == sigEd25519) {
+    if (leaf.pubKeyAlg != x509KeyEd25519) {
+      return false
+    }
+    return ed25519Verify(leaf.pubKeyBytes, signed, sig)
+  }
+  return false
+}
+
+// ECDSA CertificateVerify: decode the leaf's SEC 1 point on `curve`, parse the
+// DER signature, and verify over the pre-hashed message. False on any mismatch.
+function clientVerifyEcdsa(leaf: X509Certificate, curve: Curve, hash: []byte, sig: []byte): bool {
+  if (leaf.pubKeyAlg != x509KeyECDSA) {
+    return false
+  }
+  let pub = ecdsaPublicKey(curve, leaf.pubKeyBytes) catch e {
+    return false
+  }
+  let parsed = ecdsaSignatureFromDer(sig) catch e {
+    return false
+  }
+  return ecdsaVerify(pub, hash, parsed)
+}
+
+// RSASSA-PSS CertificateVerify: parse the leaf's PKCS#1 public key and verify the
+// signature over `signed` with `newHash`/`saltLen` (MGF1 over the same hash).
+function clientVerifyRsaPss(leaf: X509Certificate, newHash: () => Hash, signed: []byte, sig: []byte, saltLen: int): bool {
+  if (leaf.pubKeyAlg != x509KeyRSA) {
+    return false
+  }
+  let pub = rsaParsePkcs1PublicKey(leaf.pubKeyBytes) catch e {
+    return false
+  }
+  return rsaVerifyPss(pub, newHash, signed, sig, saltLen)
+}
+
+// Verify the server Finished MAC in constant time (RFC 8446 §4.4.4): recompute
+// HMAC(server_finished_key, Transcript-Hash(.. up to CertificateVerify)) and
+// compare it to the received verify_data.
+function (h: TlsClientHandshake) clientVerifyServerFinished(fin: Finished): ()! {
+  let expected = finishedMac(h.clientNewHash, h.shs, h.clientTh())
+  if (!ctEq(fin.verifyData, expected)) {
+    fail newError("tls client: server Finished MAC is invalid")
+  }
+}
+
+// Produce the client Finished and derive the application-traffic material. The
+// transcript already includes the server Finished, so its hash `thSF` seeds both
+// the client Finished MAC and the application secrets (RFC 8446 §7.1).
+function (h: TlsClientHandshake) clientFinish(): TlsClientStep! {
+  let mk = h.clientNewHash
+  let thSF = h.clientTh()
+  let master = masterSecret(mk, h.hsSec)
+  h.capSecret = clientApplicationTrafficSecret(mk, master, thSF)
+  h.sapSecret = serverApplicationTrafficSecret(mk, master, thSF)
+  h.exporterSec = exporterMasterSecret(mk, master, thSF)
+
+  let verify = finishedMac(mk, h.chs, thSF)
+  let finMsg = encodeFinished(Finished{ verifyData: verify })
+  let record = h.clientHsKeys.seal(finMsg, recordHandshake)?
+
+  h.transcript = tlsHsPutBytes(h.transcript, finMsg)
+  h.resumptionSec = resumptionMasterSecret(mk, master, h.clientTh())
+  h.connected = true
+  return TlsClientStep{ retry: false, done: true, outbound: record }
+}
+
+// The completed connection, valid once `processServerFlight` returned a `done`
+// step. Fails if called before the handshake has finished.
+export function (h: TlsClientHandshake) connection(): TlsClientConn! {
+  if (!h.connected) {
+    fail newError("tls client: handshake is not complete")
+  }
+  return TlsClientConn{
+    suite: h.suite,
+    alpn: h.alpn,
+    peerCerts: h.peerCerts,
+    appWrite: newRecordKeys(h.suite, h.capSecret)?,
+    appRead: newRecordKeys(h.suite, h.sapSecret)?,
+    exporter: h.exporterSec,
+    resumption: h.resumptionSec,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Small lookups over the handshake state
+// ---------------------------------------------------------------------------
+
+// The first extension of `exts` with type `t`, or a failure — the server omitting
+// a required extension (supported_versions, key_share) is a fatal handshake error.
+function (h: TlsClientHandshake) clientFindExt(exts: []Extension, t: int): Extension! {
+  for e of exts {
+    if (e.extType == t) {
+      return e
+    }
+  }
+  fail newError("tls client: server response is missing extension ${t}")
+}
+
+// Whether the client offered cipher suite `id`.
+function (h: TlsClientHandshake) clientOfferedSuite(id: int): bool {
+  let suites = h.config.suites
+  if (len(suites) == 0) {
+    suites = clientDefaultSuites()
+  }
+  for s of suites {
+    if (s == id) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether the client advertised group codepoint `cp` in supported_groups.
+function (h: TlsClientHandshake) clientSupportsGroup(cp: int): bool {
+  for g of h.config.groups {
+    if (int(tlsGroupCodepoint(g)) == cp) {
+      return true
+    }
+  }
+  return false
+}
+
+// The offer whose group matches wire codepoint `cp`, or a failure if the server
+// selected a group the client never shared.
+function (h: TlsClientHandshake) clientOfferForCp(cp: int): clientOffer! {
+  for o of h.offers {
+    if (o.cp == cp) {
+      return o
+    }
+  }
+  fail newError("tls client: server selected a group the client did not offer")
+}
+
+// The server's chosen ALPN protocol from EncryptedExtensions, or "" if none.
+function (h: TlsClientHandshake) clientPickAlpn(exts: []Extension): string {
+  for e of exts {
+    if (e.extType == extTypeALPN) {
+      let names = parseALPN(e) catch err {
+        return ""
+      }
+      if (len(names) > 0) {
+        return names[0]
+      }
+    }
+  }
+  return ""
+}
+
+// The raw DER of each certificate in a Certificate message, end-entity first.
+function clientCertDers(cert: Certificate): [][]byte {
+  let out = [][]byte(0)
+  for e of cert.entries {
+    out = append(out, e.cert)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// TlsClientConn: application data
+// ---------------------------------------------------------------------------
+
+// The negotiated cipher suite's IANA code point.
+export function (c: TlsClientConn) cipherSuiteId(): int { return c.suite.id }
+
+// The ALPN protocol the server selected, or "" if none was negotiated.
+export function (c: TlsClientConn) alpnProtocol(): string { return c.alpn }
+
+// The server's certificate chain as raw DER, end-entity certificate first.
+export function (c: TlsClientConn) peerCertificates(): [][]byte { return c.peerCerts }
+
+// The exporter_master_secret (RFC 8446 §7.5), the root for exported keying
+// material bound to this handshake.
+export function (c: TlsClientConn) exporterSecret(): []byte { return c.exporter }
+
+// The resumption_master_secret (RFC 8446 §7.1), from which a server-issued
+// ticket's PSK is computed.
+export function (c: TlsClientConn) resumptionSecret(): []byte { return c.resumption }
+
+// Seal `plaintext` as one outbound application_data record under the client's
+// application-traffic key, advancing its sequence number. Fails if the fragment
+// exceeds the 2^14 record limit.
+export function (c: TlsClientConn) sealApp(plaintext: []byte): []byte! {
+  return c.appWrite.seal(plaintext, recordApplicationData)?
+}
+
+// Open one inbound protected record under the server's application-traffic key,
+// returning the recovered content and its inner type. A `recordHandshake` type is
+// a post-handshake message (NewSessionTicket / KeyUpdate); `recordApplicationData`
+// is caller data. Fails fatally on an authentication failure.
+export function (c: TlsClientConn) openApp(record: []byte): RecordPlaintext! {
+  return c.appRead.open(record)?
+}

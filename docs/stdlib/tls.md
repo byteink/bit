@@ -817,3 +817,334 @@ records such as EncryptedExtensions, Certificate, and Finished.
 
 Inner content type application_data (23), and the fixed outer `opaque_type` of
 every protected record.
+## Client handshake
+
+The 1-RTT client half of the protocol (RFC 8446), assembled from the pieces
+above. It is **sans-I/O**: the handshake owns no sockets, so the caller drives it
+by shuttling flights of raw record bytes, over a TCP stream, an in-memory pipe, or
+a recorded trace alike. Server authentication is the security core and is always
+enforced — the certificate chain is verified against a caller-supplied
+[`TrustStore`](#-truststore-) and the SNI hostname, the server's CertificateVerify
+signature is checked over the RFC 8446 §4.4.3 signed content, and the server
+Finished MAC is checked in constant time; any failure aborts the handshake.
+`insecureSkipVerify` drops only the chain + hostname checks (for pinned-key or
+trace-replay callers), never the signature or the MAC.
+
+```bit
+import { TlsClientConfig, tlsClientStart, TlsClientConn } from "std/tls"
+
+// A complete client handshake over a caller-provided record transport: `send`
+// writes one of our flights, `recv` yields the server's next flight. The retry
+// loop resends after a HelloRetryRequest; the returned connection carries the
+// application-traffic keys.
+function handshake(config: TlsClientConfig, send: ([]byte) => ()!, recv: () => []byte!): TlsClientConn! {
+  let h = tlsClientStart(config)?
+  send(h.hello)?
+  let step = h.processServerFlight(recv()?)?
+  while (step.retry) {
+    send(step.outbound)?
+    step = h.processServerFlight(recv()?)?
+  }
+  send(step.outbound)?
+  return h.connection()?
+}
+```
+
+### `TrustStore`
+
+The set of trusted root certificates a server chain is verified up to (RFC 8446
+§4.4.2). Its `roots` are parsed X.509 certificates (`std/crypto`'s `Certificate`);
+build one from a PEM bundle with `newTrustStore`, or from already-parsed roots via
+the struct literal.
+
+### `newTrustStore(rootsPem: string): TrustStore!`
+
+A `TrustStore` from a PEM bundle of one or more `CERTIFICATE` blocks — the usual
+system-roots format. Fails on malformed PEM, a certificate the X.509 parser
+rejects, or a bundle with no `CERTIFICATE` block.
+
+```bit
+import { newTrustStore, TrustStore } from "std/tls"
+
+// Parse a PEM roots bundle into a trust store for a client config.
+function roots(pem: string): TrustStore! {
+  return newTrustStore(pem)?
+}
+```
+
+### `TlsClientConfig`
+
+A client handshake configuration: `serverName` (the SNI host and the name the
+certificate must match), `alpn` (protocols offered, preferred first), `trust` (the
+roots to verify against), `insecureSkipVerify` (skip chain + hostname only),
+`nowUnix` (the time for certificate validity), `groups` (named groups offered,
+preferred first), `keyShareGroups` (the subset of `groups` to actually send a
+key_share for — empty means all; a group offered but not shared is what a server
+requests via HelloRetryRequest), `suites` (cipher suites offered — empty means all
+three mandatory suites), and the advanced `clientHelloOverride` /
+`ephemeralOverride` (an exact ClientHello and pinned ephemeral keypairs, for
+deterministic replay).
+
+### `tlsClientStart(config: TlsClientConfig): TlsClientHandshake!`
+
+Start a handshake: build the ClientHello (or adopt `config.clientHelloOverride`),
+seed the transcript, and expose the ClientHello record to send as `hello`. Fails
+only if the default record context cannot be built.
+
+```bit
+import { newTrustStore, TlsClientConfig, tlsClientStart, TlsGroup, GroupKeypair } from "std/tls"
+
+// Configure a client that authenticates against a PEM root bundle and offers the
+// post-quantum hybrid plus X25519, then start the handshake. `h.hello` is the
+// first flight to send.
+function begin(rootsPem: string): []byte! {
+  let config = TlsClientConfig{
+    serverName: "example.com",
+    alpn: ["h2", "http/1.1"],
+    trust: newTrustStore(rootsPem)?,
+    insecureSkipVerify: false,
+    nowUnix: 1700000000,
+    groups: [TlsGroup.X25519MLKEM768, TlsGroup.X25519],
+    keyShareGroups: []TlsGroup(0),
+    suites: []int(0),
+    clientHelloOverride: []byte(0),
+    ephemeralOverride: []GroupKeypair(0),
+  }
+  let h = tlsClientStart(config)?
+  return h.hello
+}
+```
+
+### `TlsClientHandshake`
+
+The in-progress client handshake. Its only public surface is `hello` (the
+ClientHello record to send first) and the two methods below; everything else is
+derived as the handshake advances.
+
+### `TlsClientHandshake.processServerFlight(flight: []byte): TlsClientStep!`
+
+Process one server flight of raw record bytes. Returns a `retry` step on a
+HelloRetryRequest (resend `outbound`, then feed the next flight) or a `done` step
+carrying the client Finished to send. Fails — fatally — on any parse error or
+authentication failure (bad certificate chain, CertificateVerify signature, or
+server Finished MAC).
+
+### `TlsClientHandshake.connection(): TlsClientConn!`
+
+The completed connection, valid once `processServerFlight` returned a `done` step.
+Fails if called before the handshake has finished.
+
+```bit
+import { TlsClientHandshake, TlsClientConn } from "std/tls"
+
+// Feed the server's flight to a started handshake and, once it reports done,
+// take the application connection.
+function finish(h: TlsClientHandshake, serverFlight: []byte): TlsClientConn! {
+  let step = h.processServerFlight(serverFlight)?
+  if (!step.done) {
+    fail newError("handshake needs another round")
+  }
+  return h.connection()?
+}
+```
+
+### `TlsClientStep`
+
+One step of the client handshake from `processServerFlight`: `retry` (a
+HelloRetryRequest was received — resend `outbound`), `done` (the handshake
+completed — `outbound` is the client Finished to send), and `outbound` (the
+record(s) to send now).
+
+### `TlsClientConn`
+
+A completed client connection: the negotiated parameters and the two
+application-data record contexts. Obtain it from `TlsClientHandshake.connection`.
+
+### `TlsClientConn.cipherSuiteId(): int`
+
+The negotiated cipher suite's IANA code point.
+
+### `TlsClientConn.alpnProtocol(): string`
+
+The ALPN protocol the server selected, or "" if none was negotiated.
+
+### `TlsClientConn.peerCertificates(): [][]byte`
+
+The server's certificate chain as raw DER, end-entity certificate first.
+
+### `TlsClientConn.exporterSecret(): []byte`
+
+The exporter_master_secret (RFC 8446 §7.5), the root for exported keying material
+bound to this handshake.
+
+### `TlsClientConn.resumptionSecret(): []byte`
+
+The resumption_master_secret (RFC 8446 §7.1), from which a server-issued ticket's
+PSK is computed.
+
+### `TlsClientConn.sealApp(plaintext: []byte): []byte!`
+
+Seal `plaintext` as one outbound application_data record under the client's
+application-traffic key, advancing its sequence number. Fails if the fragment
+exceeds the 2^14 record limit.
+
+### `TlsClientConn.openApp(record: []byte): RecordPlaintext!`
+
+Open one inbound protected record under the server's application-traffic key,
+returning the recovered content and its inner type — `recordHandshake` for a
+post-handshake message (NewSessionTicket / KeyUpdate), `recordApplicationData` for
+caller data. Fails fatally on an authentication failure.
+
+```bit
+import { TlsClientConn } from "std/tls"
+
+// Send a request and read the response over a live connection.
+function roundtrip(conn: TlsClientConn, request: []byte): []byte! {
+  let record = conn.sealApp(request)?
+  let reply = conn.openApp(record)?
+  return reply.content
+}
+```
+
+## Server handshake
+
+The 1-RTT server half — the mirror of the client. It negotiates a cipher suite and
+a named group from the ClientHello, answers with a ServerHello key_share (or a
+HelloRetryRequest when the client shared no acceptable group), sends its
+authentication flight (EncryptedExtensions, its Certificate chain, a
+CertificateVerify signed with the server's private key, and Finished) under the
+handshake-traffic key, then verifies the client Finished MAC in constant time
+before switching to application-traffic keys. The certificate chain and RSA key
+are loaded from PEM by `newTlsServerConfig`; CertificateVerify is signed with
+RSA-PSS (`rsa_pss_rsae_sha256`).
+
+```bit
+import { TlsServerConfig, tlsServerStart, TlsServerConn } from "std/tls"
+
+// A complete server handshake over a caller-provided record transport: `send`
+// writes one of our flights, `recv` yields the client's next flight. The retry
+// loop follows a HelloRetryRequest; the returned connection carries the
+// application-traffic keys.
+function serve(config: TlsServerConfig, send: ([]byte) => ()!, recv: () => []byte!): TlsServerConn! {
+  let s = tlsServerStart(config)?
+  let step = s.processClientHello(recv()?)?
+  while (step.retry) {
+    send(step.outbound)?
+    step = s.processClientHello(recv()?)?
+  }
+  send(step.outbound)?
+  return s.processClientFinished(recv()?)?
+}
+```
+
+### `TlsServerConfig`
+
+A server handshake configuration: the certificate `chain` (raw DER, end-entity
+certificate first), the RSA private `key` matching the leaf, the supported `alpn`
+protocols (preference order), the acceptable key-exchange `groups` (preference
+order), and the acceptable cipher `suites` (preference order). Build one from PEM
+with `newTlsServerConfig`.
+
+### `newTlsServerConfig(certChainPem: string, keyPem: string, alpn: []string): TlsServerConfig!`
+
+A `TlsServerConfig` from PEM: `certChainPem` is one or more concatenated
+`CERTIFICATE` blocks (end-entity first), `keyPem` is the leaf's RSA private key as
+a `PRIVATE KEY` (PKCS#8) or `RSA PRIVATE KEY` (PKCS#1) block, and `alpn` is the
+supported protocol list. Groups and suites default to the full supported sets.
+Fails on malformed PEM, an empty chain, or an unreadable key.
+
+```bit
+import { newTlsServerConfig, TlsServerConfig } from "std/tls"
+
+// Load a server's leaf certificate and RSA key from PEM, offering HTTP/2 + 1.1.
+function configure(certPem: string, keyPem: string): TlsServerConfig! {
+  return newTlsServerConfig(certPem, keyPem, ["h2", "http/1.1"])?
+}
+```
+
+### `tlsServerStart(config: TlsServerConfig): TlsServerHandshake!`
+
+Start a server handshake. The returned state produces no output until the first
+ClientHello is fed to `processClientHello`.
+
+### `TlsServerHandshake`
+
+The in-progress server handshake. Drive it with `processClientHello` then
+`processClientFinished`.
+
+### `TlsServerHandshake.processClientHello(flight: []byte): TlsServerStep!`
+
+Process a ClientHello flight. Returns a `retry` step carrying a HelloRetryRequest
+when the client shared no acceptable group, or a step whose `outbound` is the
+ServerHello followed by the encrypted authentication flight. Fails on any parse
+error, an absent common suite or group, or a signing failure.
+
+### `TlsServerHandshake.processClientFinished(flight: []byte): TlsServerConn!`
+
+Verify the client Finished and complete the handshake, returning the application
+connection. Fails on a parse error or a Finished MAC that does not match in
+constant time.
+
+```bit
+import { tlsServerStart, TlsServerConfig, TlsServerConn } from "std/tls"
+
+// Complete a handshake with no HelloRetryRequest: one ClientHello, then the
+// client Finished.
+function accept(config: TlsServerConfig, clientHello: []byte, clientFinished: []byte): TlsServerConn! {
+  let s = tlsServerStart(config)?
+  let step = s.processClientHello(clientHello)?
+  if (step.retry) {
+    fail newError("client needs a HelloRetryRequest")
+  }
+  return s.processClientFinished(clientFinished)?
+}
+```
+
+### `TlsServerStep`
+
+One step from `processClientHello`: `retry` (a HelloRetryRequest was produced —
+send `outbound` and feed the next ClientHello) and `outbound` (the record(s) to
+send now — the HelloRetryRequest, or the ServerHello plus the encrypted flight).
+
+### `TlsServerConn`
+
+A completed server connection: the negotiated parameters and the two
+application-data record contexts. Obtain it from `processClientFinished`.
+
+### `TlsServerConn.cipherSuiteId(): int`
+
+The negotiated cipher suite's IANA code point.
+
+### `TlsServerConn.alpnProtocol(): string`
+
+The ALPN protocol negotiated with the client, or "" if none.
+
+### `TlsServerConn.exporterSecret(): []byte`
+
+The exporter_master_secret (RFC 8446 §7.5) for exported keying material.
+
+### `TlsServerConn.resumptionSecret(): []byte`
+
+The resumption_master_secret (RFC 8446 §7.1) for issuing session tickets.
+
+### `TlsServerConn.sealApp(plaintext: []byte): []byte!`
+
+Seal `plaintext` as one outbound application_data record under the server's
+application-traffic key, advancing its sequence number. Fails if the fragment
+exceeds the 2^14 record limit.
+
+### `TlsServerConn.openApp(record: []byte): RecordPlaintext!`
+
+Open one inbound protected record under the client's application-traffic key,
+returning the recovered content and its inner type. Fails fatally on an
+authentication failure.
+
+```bit
+import { TlsServerConn } from "std/tls"
+
+// Read one client request and reply over a live connection.
+function respond(conn: TlsServerConn, incoming: []byte): []byte! {
+  let request = conn.openApp(incoming)?
+  return conn.sealApp(request.content)?
+}
+```
