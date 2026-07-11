@@ -1081,3 +1081,141 @@ The required nonce length in bytes: 24.
 ### `XChaChaPoly.overhead(): int`
 
 The number of bytes `seal` adds — the 16-byte tag length.
+
+## BLAKE2
+
+BLAKE2 (RFC 7693), in both official widths: **BLAKE2b** over 64-bit words and a
+128-byte block, digest up to 64 bytes; **BLAKE2s** over 32-bit words and a
+64-byte block, digest up to 32. Both run the same design — a 12-round (2b) or
+10-round (2s) compression that mixes the message in with the `G` function over
+the fixed `sigma` schedule — and both satisfy the streaming `Hash` interface, so
+they stream with `write`/`sum`, run one-shot through `digest`, and slot into
+anything written against `Hash`. `sum` finalizes on a copy of the state, so it is
+non-destructive: read the digest and keep writing.
+
+Two features set BLAKE2 apart from SHA-2. The **output length is a parameter**
+(1..64 for 2b, 1..32 for 2s): a shorter length is not a truncation of the full
+digest but a distinct function, because the length is folded into the initial
+state. And a non-empty **key turns it into a MAC** directly — no HMAC wrapper —
+by absorbing the key as a leading zero-padded block; the key may be up to 64
+bytes (2b) or 32 (2s). Both parameters live in the first word of the parameter
+block, XORed into the initial state at construction. Outputs are verified against
+the RFC 7693 / reference `blake2-kat.json` vectors — BLAKE2b of `"abc"` is
+`ba80a53f…d4009923`, and keyed BLAKE2b of the empty message under the canonical
+`00..3f` key is `10ebb677…3fc51568`.
+
+Constant-time by construction: every loop bound is a public length and the
+message-schedule indices come from the fixed `sigma` table, so no branch or
+memory access depends on a key or message byte.
+
+```bit
+import { newBlake2b, newBlake2s, blake2b, digest, encodeHex } from "std/crypto"
+
+// One-shot BLAKE2b — the full 64-byte digest as lowercase hex. `blake2b` is the
+// unkeyed convenience; `digest` drives any Hash the same way.
+function blake2bHex(data: []byte): string {
+  return encodeHex(blake2b(data))
+}
+
+// One-shot BLAKE2s — the full 32-byte digest. An empty key is unkeyed.
+function blake2sHex(data: []byte): string {
+  return encodeHex(digest(newBlake2s(32, []byte(0)), data))
+}
+
+// Keyed BLAKE2 is a MAC on its own — no HMAC. A non-empty key selects keyed
+// mode; the tag is `size` bytes (32 here).
+function mac(key: []byte, msg: []byte): []byte {
+  return digest(newBlake2b(32, key), msg)
+}
+
+// A parameterized shorter digest: pass the wanted output length (1..64 for 2b)
+// to the constructor. It is a distinct function, not a truncation.
+function shortHash(data: []byte): []byte {
+  return digest(newBlake2b(20, []byte(0)), data)
+}
+
+// Streaming: absorb across as many `write`s as you like, then read once with
+// `sum`; `size`/`blockSize` report 64 and 128 for BLAKE2b, and `reset` rewinds.
+function streamed(head: []byte, tail: []byte): int {
+  let h = newBlake2b(64, []byte(0))
+  h.write(head)
+  h.write(tail)
+  let n = len(h.sum()) + h.size() + h.blockSize()
+  h.reset()
+  return n
+}
+```
+
+### `Blake2b`
+
+The streaming state for BLAKE2b. Build one with `newBlake2b` rather than a struct
+literal — the constructor installs the initial state for the chosen output length
+and key. It satisfies `Hash`, so it carries the five streaming methods below.
+
+### `newBlake2b(outLen: int, key: []byte): Blake2b`
+
+A fresh BLAKE2b hasher emitting `outLen` bytes (1..64), keyed by `key` for a MAC
+or given an empty `key` (e.g. `[]byte(0)`) for a plain hash; `key` may be up to 64
+bytes. Panics on an out-of-range output length or an over-long key — a caller
+error, like a wrong-sized cipher key.
+
+### `Blake2b.write(data: []byte)`
+
+Absorb `data`, buffering internally into 128-byte blocks. Call it any number of
+times; the digest is of everything written since the last `reset`.
+
+### `Blake2b.sum(): []byte`
+
+The digest of everything written so far — `size` bytes. Finalizes on a copy of
+the state, so it is non-destructive: call it repeatedly and keep writing after.
+
+### `Blake2b.reset()`
+
+Rewind to the empty message, restoring the initial state and re-absorbing the key
+(when keyed) as the leading block, so one value can hash many messages.
+
+### `Blake2b.size(): int`
+
+The digest length in bytes, as configured at construction (1..64).
+
+### `Blake2b.blockSize(): int`
+
+The internal block size in bytes: 128.
+
+### `Blake2s`
+
+The streaming state for BLAKE2s — the 32-bit sibling of `Blake2b` over a 64-byte
+block, digest up to 32 bytes. Build one with `newBlake2s`. It satisfies `Hash`.
+
+### `newBlake2s(outLen: int, key: []byte): Blake2s`
+
+A fresh BLAKE2s hasher emitting `outLen` bytes (1..32), keyed by `key` (up to 32
+bytes) or unkeyed with an empty `key`. Panics on an out-of-range length.
+
+### `Blake2s.write(data: []byte)`
+
+Absorb `data`, buffering internally into 64-byte blocks. Call it any number of
+times; the digest is of everything written since the last `reset`.
+
+### `Blake2s.sum(): []byte`
+
+The digest of everything written so far — `size` bytes — finalized
+non-destructively on a copy of the state.
+
+### `Blake2s.reset()`
+
+Rewind to the empty message, re-absorbing the key (when keyed) as the leading
+block.
+
+### `Blake2s.size(): int`
+
+The digest length in bytes, as configured at construction (1..32).
+
+### `Blake2s.blockSize(): int`
+
+The internal block size in bytes: 64.
+
+### `blake2b(data: []byte): []byte`
+
+The 64-byte unkeyed BLAKE2b digest of `data` — the common one-shot case, a
+shorthand for `digest(newBlake2b(64, []byte(0)), data)`.

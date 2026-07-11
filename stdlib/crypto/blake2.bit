@@ -1,0 +1,464 @@
+// Bit standard library — crypto module, BLAKE2b and BLAKE2s (RFC 7693).
+//
+// Two hashes from one design. BLAKE2b works over 64-bit words in a 128-byte
+// block and emits up to 64 digest bytes; BLAKE2s works over 32-bit words in a
+// 64-byte block and emits up to 32. Both run the same structure — a compression
+// that seeds sixteen working words from the chained state and the IV, mixes the
+// message in with the `G` function over the `sigma` permutation schedule
+// (12 rounds for 2b, 10 for 2s), then folds the halves back into the state.
+// They differ only in word width, block size, round count, and the four rotation
+// distances baked into `G`.
+//
+// Both support a parameterized digest length and an optional key (keyed BLAKE2 is
+// a MAC, replacing HMAC): the first parameter word carries `digest_length` and
+// `key_length` and is XORed into the initial state, and a non-empty key is
+// absorbed as a leading zero-padded block before any message bytes. The concrete
+// `Blake2b`/`Blake2s` values satisfy the streaming `Hash` interface (§14.3), so
+// they stream through `write`/`sum`, one-shot through `digest`, and key HMAC-style
+// constructions — `sum` finalizes on a copy of the state, so it is
+// non-destructive and writing may continue after it.
+//
+// Constant-time by construction: every loop bound is a public length, and the
+// message-schedule indices come from the fixed `sigma` table, never from key or
+// message bytes — no branch or memory access depends on a secret. All arithmetic
+// is `u64`/`u32`, so additions wrap mod 2^64 / 2^32 exactly as RFC 7693 requires.
+
+// Rotate the 64-bit word `x` right by `n` bits, `0 < n < 64`. The two shifted
+// halves cover disjoint bit positions, so the `|` reassembles the rotation.
+function blake2Rotr64(x: u64, n: u64): u64 { return (x >> n) | (x << (64 - n)) }
+
+// Rotate the 32-bit word `x` right by `n` bits, `0 < n < 32`.
+function blake2Rotr32(x: u32, n: u32): u32 { return (x >> n) | (x << (32 - n)) }
+
+// BLAKE2b initial state: the SHA-512 IV — the first 64 bits of the fractional
+// parts of the square roots of the first eight primes (RFC 7693 §2.6).
+function blake2bIv(): []u64 {
+  return []u64{
+    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+  }
+}
+
+// BLAKE2s initial state: the SHA-256 IV — the first 32 bits of the same
+// fractional parts (RFC 7693 §2.6).
+function blake2sIv(): []u32 {
+  return []u32{
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  }
+}
+
+// The message-permutation schedule sigma, ten rows of sixteen indices, flattened
+// row-major (RFC 7693 §2.7). Round `r` selects the message words through row
+// `r % 10`; BLAKE2b's rounds 10 and 11 reuse rows 0 and 1.
+function blake2Sigma(): []int {
+  return []int{
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3,
+    11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4,
+     7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8,
+     9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13,
+     2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9,
+    12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11,
+    13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10,
+     6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5,
+    10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0,
+  }
+}
+
+// The BLAKE2b mixing function G on the four working words `v[a], v[b], v[c], v[d]`,
+// folding message words `x` and `y` in with rotations 32, 24, 16, 63
+// (RFC 7693 §3.1). Mutates `v` in place.
+function blake2bG(v: []u64, a: int, b: int, c: int, d: int, x: u64, y: u64) {
+  v[a] = v[a] + v[b] + x
+  v[d] = blake2Rotr64(v[d] ^ v[a], 32)
+  v[c] = v[c] + v[d]
+  v[b] = blake2Rotr64(v[b] ^ v[c], 24)
+  v[a] = v[a] + v[b] + y
+  v[d] = blake2Rotr64(v[d] ^ v[a], 16)
+  v[c] = v[c] + v[d]
+  v[b] = blake2Rotr64(v[b] ^ v[c], 63)
+}
+
+// The BLAKE2s mixing function G, the 32-bit analogue with rotations 16, 12, 8, 7.
+function blake2sG(v: []u32, a: int, b: int, c: int, d: int, x: u32, y: u32) {
+  v[a] = v[a] + v[b] + x
+  v[d] = blake2Rotr32(v[d] ^ v[a], 16)
+  v[c] = v[c] + v[d]
+  v[b] = blake2Rotr32(v[b] ^ v[c], 12)
+  v[a] = v[a] + v[b] + y
+  v[d] = blake2Rotr32(v[d] ^ v[a], 8)
+  v[c] = v[c] + v[d]
+  v[b] = blake2Rotr32(v[b] ^ v[c], 7)
+}
+
+// The BLAKE2b compression F (RFC 7693 §3.2): fold the 128-byte `block` into the
+// eight-word state `h` in place, given the byte counter `t0`/`t1` (low/high 64
+// bits) and whether this is the final block. Mutates only `h`.
+function blake2bCompress(h: []u64, block: []byte, t0: u64, t1: u64, last: bool) {
+  let iv = blake2bIv()
+  let sig = blake2Sigma()
+  let v = []u64(16)
+  let m = []u64(16)
+
+  let i = 0
+  while (i < 8) {
+    v[i] = h[i]
+    v[i + 8] = iv[i]
+    i = i + 1
+  }
+  v[12] = v[12] ^ t0
+  v[13] = v[13] ^ t1
+  if (last) { v[14] = ~v[14] }
+
+  // The sixteen message words, each read little-endian (RFC 7693 §3.2). The two
+  // 32-bit halves are assembled separately to keep each line self-contained.
+  i = 0
+  while (i < 16) {
+    let j = i * 8
+    let lo = u64(block[j]) | (u64(block[j + 1]) << 8) | (u64(block[j + 2]) << 16) | (u64(block[j + 3]) << 24)
+    let hi = u64(block[j + 4]) | (u64(block[j + 5]) << 8) | (u64(block[j + 6]) << 16) | (u64(block[j + 7]) << 24)
+    m[i] = lo | (hi << 32)
+    i = i + 1
+  }
+
+  let r = 0
+  while (r < 12) {
+    let s = (r % 10) * 16
+    blake2bG(v, 0, 4, 8, 12, m[sig[s + 0]], m[sig[s + 1]])
+    blake2bG(v, 1, 5, 9, 13, m[sig[s + 2]], m[sig[s + 3]])
+    blake2bG(v, 2, 6, 10, 14, m[sig[s + 4]], m[sig[s + 5]])
+    blake2bG(v, 3, 7, 11, 15, m[sig[s + 6]], m[sig[s + 7]])
+    blake2bG(v, 0, 5, 10, 15, m[sig[s + 8]], m[sig[s + 9]])
+    blake2bG(v, 1, 6, 11, 12, m[sig[s + 10]], m[sig[s + 11]])
+    blake2bG(v, 2, 7, 8, 13, m[sig[s + 12]], m[sig[s + 13]])
+    blake2bG(v, 3, 4, 9, 14, m[sig[s + 14]], m[sig[s + 15]])
+    r = r + 1
+  }
+
+  i = 0
+  while (i < 8) {
+    h[i] = h[i] ^ v[i] ^ v[i + 8]
+    i = i + 1
+  }
+}
+
+// The BLAKE2s compression F: fold the 64-byte `block` into the eight-word state
+// `h`, with the 32-bit byte counter `t0`/`t1`, over 10 rounds.
+function blake2sCompress(h: []u32, block: []byte, t0: u32, t1: u32, last: bool) {
+  let iv = blake2sIv()
+  let sig = blake2Sigma()
+  let v = []u32(16)
+  let m = []u32(16)
+
+  let i = 0
+  while (i < 8) {
+    v[i] = h[i]
+    v[i + 8] = iv[i]
+    i = i + 1
+  }
+  v[12] = v[12] ^ t0
+  v[13] = v[13] ^ t1
+  if (last) { v[14] = ~v[14] }
+
+  i = 0
+  while (i < 16) {
+    let j = i * 4
+    m[i] = u32(block[j]) | (u32(block[j + 1]) << 8) | (u32(block[j + 2]) << 16) | (u32(block[j + 3]) << 24)
+    i = i + 1
+  }
+
+  let r = 0
+  while (r < 10) {
+    let s = r * 16
+    blake2sG(v, 0, 4, 8, 12, m[sig[s + 0]], m[sig[s + 1]])
+    blake2sG(v, 1, 5, 9, 13, m[sig[s + 2]], m[sig[s + 3]])
+    blake2sG(v, 2, 6, 10, 14, m[sig[s + 4]], m[sig[s + 5]])
+    blake2sG(v, 3, 7, 11, 15, m[sig[s + 6]], m[sig[s + 7]])
+    blake2sG(v, 0, 5, 10, 15, m[sig[s + 8]], m[sig[s + 9]])
+    blake2sG(v, 1, 6, 11, 12, m[sig[s + 10]], m[sig[s + 11]])
+    blake2sG(v, 2, 7, 8, 13, m[sig[s + 12]], m[sig[s + 13]])
+    blake2sG(v, 3, 4, 9, 14, m[sig[s + 14]], m[sig[s + 15]])
+    r = r + 1
+  }
+
+  i = 0
+  while (i < 8) {
+    h[i] = h[i] ^ v[i] ^ v[i + 8]
+    i = i + 1
+  }
+}
+
+// Streaming BLAKE2b state (RFC 7693 §2.5). `h` is the eight running words; `h0`
+// is the post-parameter initial state, kept so `reset` can restore it; `t0`/`t1`
+// count the bytes compressed so far; `buf`/`c` accumulate a partial 128-byte
+// block; `outLen` is the digest length; `key` is the MAC key (empty when
+// unkeyed), retained so `reset` can re-absorb it as the leading block.
+export struct Blake2b {
+  h: []u64
+  h0: []u64
+  t0: u64
+  t1: u64
+  buf: []byte
+  c: int
+  outLen: int
+  key: []byte
+}
+
+// A fresh BLAKE2b hasher emitting `outLen` bytes (1..64), keyed by `key` (0..64
+// bytes; empty for an unkeyed hash). Panics on an out-of-range length — a caller
+// error, like a wrong-sized cipher key.
+export function newBlake2b(outLen: int, key: []byte): Blake2b {
+  if (outLen < 1 || outLen > 64) { panic("newBlake2b: outLen must be 1..64") }
+  if (len(key) > 64) { panic("newBlake2b: key must be at most 64 bytes") }
+
+  let iv = blake2bIv()
+  let h0 = []u64(8)
+  let i = 0
+  while (i < 8) {
+    h0[i] = iv[i]
+    i = i + 1
+  }
+  h0[0] = h0[0] ^ (0x01010000 ^ (u64(len(key)) << 8) ^ u64(outLen))
+
+  let k = []byte(len(key))
+  i = 0
+  while (i < len(key)) {
+    k[i] = key[i]
+    i = i + 1
+  }
+
+  let s = Blake2b{ h: []u64(8), h0: h0, t0: 0, t1: 0, buf: []byte(128), c: 0, outLen: outLen, key: k }
+  s.reset()
+  return s
+}
+
+// Add `n` to the 128-bit byte counter, carrying into the high word on wrap.
+function (s: Blake2b) increment(n: u64) {
+  s.t0 = s.t0 + n
+  if (s.t0 < n) { s.t1 = s.t1 + 1 }
+}
+
+// Absorb `data`. A full buffer is compressed only when the next byte arrives, so
+// the final block is never compressed early — BLAKE2 needs the last block flagged.
+export function (s: Blake2b) write(data: []byte) {
+  let i = 0
+  while (i < len(data)) {
+    if (s.c == 128) {
+      s.increment(128)
+      blake2bCompress(s.h, s.buf, s.t0, s.t1, false)
+      s.c = 0
+    }
+    s.buf[s.c] = data[i]
+    s.c = s.c + 1
+    i = i + 1
+  }
+}
+
+// The digest of everything written since the last reset. Finalizes on a copy of
+// the state and counter, so it neither consumes the hasher nor blocks further
+// writes: the final partial block is padded with zeros and compressed as last.
+export function (s: Blake2b) sum(): []byte {
+  let hh = []u64(8)
+  let i = 0
+  while (i < 8) {
+    hh[i] = s.h[i]
+    i = i + 1
+  }
+
+  // Copy the partial block; bytes past `c` are already zero (padding).
+  let b = []byte(128)
+  i = 0
+  while (i < s.c) {
+    b[i] = s.buf[i]
+    i = i + 1
+  }
+
+  let t0 = s.t0 + u64(s.c)
+  let t1 = s.t1
+  if (t0 < u64(s.c)) { t1 = t1 + 1 }
+  blake2bCompress(hh, b, t0, t1, true)
+
+  // Serialize the state little-endian, one word (8 bytes) at a time, to `outLen`.
+  let out = []byte(s.outLen)
+  let idx = 0
+  let w = 0
+  while (w < 8 && idx < s.outLen) {
+    let val = hh[w]
+    let bp = 0
+    while (bp < 8 && idx < s.outLen) {
+      out[idx] = byte(val)
+      val = val >> 8
+      bp = bp + 1
+      idx = idx + 1
+    }
+    w = w + 1
+  }
+  return out
+}
+
+// Rewind to the empty message: restore the initial state, clear the counter and
+// buffer, and re-absorb the key as the leading zero-padded block when keyed.
+export function (s: Blake2b) reset() {
+  let i = 0
+  while (i < 8) {
+    s.h[i] = s.h0[i]
+    i = i + 1
+  }
+  s.t0 = 0
+  s.t1 = 0
+  i = 0
+  while (i < 128) {
+    s.buf[i] = 0
+    i = i + 1
+  }
+  s.c = 0
+  if (len(s.key) > 0) {
+    i = 0
+    while (i < len(s.key)) {
+      s.buf[i] = s.key[i]
+      i = i + 1
+    }
+    s.c = 128
+  }
+}
+
+// The digest length in bytes (1..64), as configured at construction.
+export function (s: Blake2b) size(): int { return s.outLen }
+
+// The internal block size in bytes: 128.
+export function (s: Blake2b) blockSize(): int { return 128 }
+
+// Streaming BLAKE2s state — the 32-bit sibling of `Blake2b` over a 64-byte block.
+// Fields mirror `Blake2b`; `t0`/`t1` are the 64-bit byte counter's halves.
+export struct Blake2s {
+  h: []u32
+  h0: []u32
+  t0: u32
+  t1: u32
+  buf: []byte
+  c: int
+  outLen: int
+  key: []byte
+}
+
+// A fresh BLAKE2s hasher emitting `outLen` bytes (1..32), keyed by `key` (0..32
+// bytes; empty for unkeyed). Panics on an out-of-range length.
+export function newBlake2s(outLen: int, key: []byte): Blake2s {
+  if (outLen < 1 || outLen > 32) { panic("newBlake2s: outLen must be 1..32") }
+  if (len(key) > 32) { panic("newBlake2s: key must be at most 32 bytes") }
+
+  let iv = blake2sIv()
+  let h0 = []u32(8)
+  let i = 0
+  while (i < 8) {
+    h0[i] = iv[i]
+    i = i + 1
+  }
+  h0[0] = h0[0] ^ (0x01010000 ^ (u32(len(key)) << 8) ^ u32(outLen))
+
+  let k = []byte(len(key))
+  i = 0
+  while (i < len(key)) {
+    k[i] = key[i]
+    i = i + 1
+  }
+
+  let s = Blake2s{ h: []u32(8), h0: h0, t0: 0, t1: 0, buf: []byte(64), c: 0, outLen: outLen, key: k }
+  s.reset()
+  return s
+}
+
+// Add `n` to the 64-bit byte counter, carrying into the high word on wrap.
+function (s: Blake2s) increment(n: u32) {
+  s.t0 = s.t0 + n
+  if (s.t0 < n) { s.t1 = s.t1 + 1 }
+}
+
+// Absorb `data`, deferring the last block exactly as `Blake2b.write` does.
+export function (s: Blake2s) write(data: []byte) {
+  let i = 0
+  while (i < len(data)) {
+    if (s.c == 64) {
+      s.increment(64)
+      blake2sCompress(s.h, s.buf, s.t0, s.t1, false)
+      s.c = 0
+    }
+    s.buf[s.c] = data[i]
+    s.c = s.c + 1
+    i = i + 1
+  }
+}
+
+// The digest of everything written so far, finalized non-destructively on a copy.
+export function (s: Blake2s) sum(): []byte {
+  let hh = []u32(8)
+  let i = 0
+  while (i < 8) {
+    hh[i] = s.h[i]
+    i = i + 1
+  }
+
+  let b = []byte(64)
+  i = 0
+  while (i < s.c) {
+    b[i] = s.buf[i]
+    i = i + 1
+  }
+
+  let t0 = s.t0 + u32(s.c)
+  let t1 = s.t1
+  if (t0 < u32(s.c)) { t1 = t1 + 1 }
+  blake2sCompress(hh, b, t0, t1, true)
+
+  let out = []byte(s.outLen)
+  let idx = 0
+  let w = 0
+  while (w < 8 && idx < s.outLen) {
+    let val = hh[w]
+    let bp = 0
+    while (bp < 4 && idx < s.outLen) {
+      out[idx] = byte(val)
+      val = val >> 8
+      bp = bp + 1
+      idx = idx + 1
+    }
+    w = w + 1
+  }
+  return out
+}
+
+// Rewind to the empty message, re-absorbing the key as the leading block if keyed.
+export function (s: Blake2s) reset() {
+  let i = 0
+  while (i < 8) {
+    s.h[i] = s.h0[i]
+    i = i + 1
+  }
+  s.t0 = 0
+  s.t1 = 0
+  i = 0
+  while (i < 64) {
+    s.buf[i] = 0
+    i = i + 1
+  }
+  s.c = 0
+  if (len(s.key) > 0) {
+    i = 0
+    while (i < len(s.key)) {
+      s.buf[i] = s.key[i]
+      i = i + 1
+    }
+    s.c = 64
+  }
+}
+
+// The digest length in bytes (1..32), as configured at construction.
+export function (s: Blake2s) size(): int { return s.outLen }
+
+// The internal block size in bytes: 64.
+export function (s: Blake2s) blockSize(): int { return 64 }
+
+// The 64-byte unkeyed BLAKE2b digest of `data` — the common one-shot case.
+export function blake2b(data: []byte): []byte {
+  return digest(newBlake2b(64, []byte(0)), data)
+}
