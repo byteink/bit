@@ -973,3 +973,333 @@ HKDF (RFC 5869 §2): extract then expand in one call — derive `outLen` bytes o
 output keying material from `ikm`, salted by `salt` and bound to the context
 `info`. Equivalent to `hkdfExpand(newHash, hkdfExtract(newHash, salt, ikm),
 info, outLen)`, and fails on the same over-long `outLen` as `hkdfExpand`.
+
+## ASN.1 / DER
+
+The Distinguished Encoding Rules (X.690) — the canonical binary form of ASN.1
+behind X.509 certificates, PKCS keys, and ECDSA/RSA signatures. Everything is one
+flat `Element`: a tag (class + constructed flag + number) carrying either raw
+content octets (a primitive) or a list of child elements (a constructed type).
+`asn1Parse` turns bytes into that tree; `asn1Encode` turns it back. Typed
+constructors and readers on top build and interpret the universal types.
+
+Decoding is **strict**: malformed ASN.1 is a classic parser attack surface, so
+`asn1Parse` and every reader are fallible (`T!`) and *reject* rather than
+best-effort. A non-minimal length, an indefinite-length marker, a non-minimal
+(redundantly sign-extended) INTEGER, a non-minimal OID subidentifier, or trailing
+bytes after the top-level element all fail the parse — there is exactly one valid
+encoding of a value, and only that encoding is accepted.
+
+```bit
+import {
+  Element, asn1Encode, asn1Parse, asn1Sequence, asn1Integer,
+  asn1ReadSequence, asn1ReadInteger,
+} from "std/crypto"
+
+// Build SEQUENCE { INTEGER, INTEGER }, encode it, parse it back, and sum the two.
+function seqSum(a: int, b: int): int! {
+  let seq = asn1Sequence([]Element{ asn1Integer(a), asn1Integer(b) })
+  let parts = asn1ReadSequence(asn1Parse(asn1Encode(seq))?)?
+  return asn1ReadInteger(parts[0])? + asn1ReadInteger(parts[1])?
+}
+```
+
+### `Element`
+
+A parsed or to-be-encoded ASN.1 element. Its exported fields are `cls` (the tag
+class, one of the `class*` constants), `constructed` (whether it holds child
+elements rather than raw octets), `tag` (the tag number), `bytes` (the primitive
+content octets), and `children` (the members of a constructed type). Build one
+with a typed constructor; branch on `cls`/`tag` to interpret a parsed one.
+
+### `BitString`
+
+The decoded content of a BIT STRING: `unusedBits` (0..7) trailing bits of the
+final octet are padding, and `bytes` are the value octets.
+
+```bit
+import { asn1Encode, asn1Parse, asn1BitString, asn1ReadBitString } from "std/crypto"
+
+// Round-trip a BIT STRING (no unused bits) and return its value octets.
+function bitOctets(data: []byte): []byte! {
+  let bs = asn1ReadBitString(asn1Parse(asn1Encode(asn1BitString(0, data)))?)?
+  return bs.bytes
+}
+```
+
+### `asn1Parse(der: []byte): Element!`
+
+Parse a single top-level DER element from `der`, recursing into constructed
+content. Fails on any malformed structure (non-minimal length, indefinite length,
+non-minimal INTEGER, a SEQUENCE/SET that is not constructed) or on octets left
+over after the element.
+
+### `asn1Encode(e: Element): []byte`
+
+The DER encoding of `e`: identifier octet(s), definite length, then content — a
+constructed element's content is the concatenation of its encoded children, a
+primitive's is its raw bytes. Total and deterministic: every value has exactly one
+encoding, so `asn1Encode(asn1Parse(der)?)` reproduces valid DER byte-for-byte.
+
+### `asn1Boolean(v: bool): Element`
+
+A BOOLEAN. DER spells true as `0xFF` and false as `0x00`.
+
+### `asn1ReadBoolean(e: Element): bool!`
+
+The bool of a BOOLEAN. Strict DER: content must be exactly `0x00` or `0xFF`.
+
+### `asn1Integer(v: int): Element`
+
+A signed INTEGER from a 64-bit value, minimally two's-complement encoded. For
+values wider than 64 bits use `asn1BigInteger`.
+
+### `asn1ReadInteger(e: Element): int!`
+
+The signed value of an INTEGER that fits in 64 bits. Fails on a non-minimal
+encoding or a value wider than eight octets.
+
+### `asn1BigInteger(mag: []byte): Element`
+
+A non-negative INTEGER from an unsigned big-endian magnitude. Leading zero octets
+are dropped and a `0x00` sign octet is prepended when the top bit would otherwise
+read as negative, so the result is always minimal DER. This is how RSA moduli and
+ECDSA `r`/`s` are encoded.
+
+### `asn1ReadBigInteger(e: Element): []byte!`
+
+The unsigned big-endian magnitude of a non-negative INTEGER, with the sign octet
+removed — the inverse of `asn1BigInteger`. Fails on a non-minimal encoding or a
+negative value.
+
+```bit
+import {
+  Element, asn1Encode, asn1Parse, asn1Sequence, asn1BigInteger,
+  asn1ReadSequence, asn1ReadBigInteger,
+} from "std/crypto"
+
+// Encode an ECDSA signature SEQUENCE { INTEGER r, INTEGER s } from raw magnitudes.
+function encodeSig(r: []byte, s: []byte): []byte {
+  return asn1Encode(asn1Sequence([]Element{ asn1BigInteger(r), asn1BigInteger(s) }))
+}
+
+// Read `r` back out of a DER signature.
+function sigR(der: []byte): []byte! {
+  let parts = asn1ReadSequence(asn1Parse(der)?)?
+  return asn1ReadBigInteger(parts[0])?
+}
+```
+
+### `asn1BitString(unusedBits: int, data: []byte): Element`
+
+A BIT STRING whose final octet has `unusedBits` (0..7) of padding; `data` is the
+value octets.
+
+### `asn1ReadBitString(e: Element): BitString!`
+
+The decoded BIT STRING. Fails if the unused-bits octet is missing or > 7, if an
+empty value claims unused bits, or (strict DER) if any trailing unused bit is set.
+
+### `asn1OctetString(data: []byte): Element`
+
+An OCTET STRING carrying `data` verbatim.
+
+### `asn1ReadOctetString(e: Element): []byte!`
+
+The content octets of an OCTET STRING.
+
+### `asn1Null(): Element`
+
+A NULL: empty content.
+
+### `asn1ReadNull(e: Element): ()!`
+
+Verify a NULL: fails unless the element is a NULL with empty content.
+
+### `asn1Oid(arcs: []int): Element!`
+
+An OBJECT IDENTIFIER from its dotted arcs, e.g. `[1, 2, 840, 113549, 1, 1, 11]`.
+Fails unless there are at least two arcs, the first is 0/1/2, and the second is
+< 40 when the first is 0 or 1. The first two arcs are packed into one
+subidentifier (`40*arc0 + arc1`).
+
+### `asn1ReadOid(e: Element): []int!`
+
+The dotted arcs of an OBJECT IDENTIFIER, with the first subidentifier unpacked
+back into the first two arcs. Fails on an empty OID, a truncated subidentifier, or
+a non-minimal (leading-`0x80`) subidentifier.
+
+### `asn1OidString(arcs: []int): string`
+
+The dotted-decimal text of `arcs`, e.g. `"1.2.840.113549.1.1.11"`. A rendering
+helper — it does no validation.
+
+```bit
+import { asn1Encode, asn1Parse, asn1Oid, asn1ReadOid, asn1OidString } from "std/crypto"
+
+// The dotted form of an OID after a build/parse round-trip (e.g. ecdsa-with-SHA256).
+function oidText(arcs: []int): string! {
+  let oid = asn1Oid(arcs)?
+  return asn1OidString(asn1ReadOid(asn1Parse(asn1Encode(oid))?)?)
+}
+```
+
+### `asn1Utf8String(s: string): Element`
+
+A UTF8String.
+
+### `asn1PrintableString(s: string): Element`
+
+A PrintableString. The caller is responsible for the restricted charset.
+
+### `asn1IA5String(s: string): Element`
+
+An IA5String (ASCII).
+
+### `asn1UtcTime(s: string): Element`
+
+A UTCTime, e.g. `"230607000000Z"`. The caller supplies the formatted string.
+
+### `asn1GeneralizedTime(s: string): Element`
+
+A GeneralizedTime, e.g. `"20230607000000Z"`.
+
+### `asn1ReadString(e: Element): string!`
+
+The text of a string- or time-valued element: UTF8String, PrintableString,
+IA5String, UTCTime, or GeneralizedTime. Fails on any other type. The raw octets
+are returned as-is; per-type charset validation is the caller's.
+
+```bit
+import { asn1Encode, asn1Parse, asn1Utf8String, asn1ReadString } from "std/crypto"
+
+// Round-trip a UTF8String through DER.
+function utf8RoundTrip(s: string): string! {
+  return asn1ReadString(asn1Parse(asn1Encode(asn1Utf8String(s)))?)?
+}
+```
+
+### `asn1Sequence(children: []Element): Element`
+
+A SEQUENCE of the given members, in order.
+
+### `asn1ReadSequence(e: Element): []Element!`
+
+The members of a SEQUENCE. Fails unless `e` is a universal constructed SEQUENCE.
+
+### `asn1Set(children: []Element): Element`
+
+A SET of the given members. DER requires SET OF members to be sorted by their
+encoding; that ordering is the caller's responsibility.
+
+### `asn1ReadSet(e: Element): []Element!`
+
+The members of a SET. Fails unless `e` is a universal constructed SET.
+
+### `asn1ExplicitTag(tag: int, inner: Element): Element`
+
+An explicit context tag `[tag]`: a constructed context-class element wrapping
+`inner` whole, so `inner`'s own tag is preserved inside.
+
+### `asn1ImplicitTag(tag: int, inner: Element): Element`
+
+An implicit context tag `[tag]`: `inner` retagged to context class `tag`, keeping
+its content and constructed-ness but replacing its tag. The original universal tag
+is lost, so the reader must know the underlying type.
+
+### `asn1ReadExplicit(e: Element, tag: int): Element!`
+
+The inner element of an explicit context tag `[tag]`. Fails unless `e` is a
+constructed context tag with that number wrapping exactly one element.
+
+```bit
+import {
+  Element, asn1Encode, asn1Parse, asn1ExplicitTag, asn1OctetString,
+  asn1ReadExplicit, asn1ReadOctetString,
+} from "std/crypto"
+
+// Wrap an OCTET STRING in an explicit [0] tag, then unwrap it after a round-trip.
+function unwrapZero(data: []byte): []byte! {
+  let tagged = asn1ExplicitTag(0, asn1OctetString(data))
+  let inner = asn1ReadExplicit(asn1Parse(asn1Encode(tagged))?, 0)?
+  return asn1ReadOctetString(inner)?
+}
+```
+
+### `classUniversal: int`
+
+Tag class 0: the standard ASN.1 types (INTEGER, SEQUENCE, ...).
+
+### `classApplication: int`
+
+Tag class 1: types specific to an application.
+
+### `classContext: int`
+
+Tag class 2: the `[n]` context-specific tags that disambiguate SEQUENCE members
+or CHOICE alternatives.
+
+### `classPrivate: int`
+
+Tag class 3: types specific to an enterprise.
+
+### `tagBoolean: int`
+
+Universal tag number 1, BOOLEAN.
+
+### `tagInteger: int`
+
+Universal tag number 2, INTEGER.
+
+### `tagBitString: int`
+
+Universal tag number 3, BIT STRING.
+
+### `tagOctetString: int`
+
+Universal tag number 4, OCTET STRING.
+
+### `tagNull: int`
+
+Universal tag number 5, NULL.
+
+### `tagOid: int`
+
+Universal tag number 6, OBJECT IDENTIFIER.
+
+### `tagUtf8String: int`
+
+Universal tag number 12, UTF8String.
+
+### `tagSequence: int`
+
+Universal tag number 16, SEQUENCE (always constructed).
+
+### `tagSet: int`
+
+Universal tag number 17, SET (always constructed).
+
+### `tagPrintableString: int`
+
+Universal tag number 19, PrintableString.
+
+### `tagIA5String: int`
+
+Universal tag number 22, IA5String.
+
+### `tagUtcTime: int`
+
+Universal tag number 23, UTCTime.
+
+### `tagGeneralizedTime: int`
+
+Universal tag number 24, GeneralizedTime.
+
+```bit
+import { Element, asn1Parse, asn1ReadSequence, classUniversal, tagSequence } from "std/crypto"
+
+// Whether a parsed element is a universal SEQUENCE by inspecting its tag directly.
+function isSequence(e: Element): bool {
+  return e.cls == classUniversal && e.constructed && e.tag == tagSequence
+}
+```
