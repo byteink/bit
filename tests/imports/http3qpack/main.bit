@@ -1,0 +1,223 @@
+// std/http3 QPACK known-answer tests (RFC 9204 Appendix B).
+//
+// Appendix B is one continuous exchange between a single encoder and a single
+// decoder, exercising every QPACK instruction: set capacity, insert with static
+// and dynamic name references, insert with a literal name, duplicate, and the
+// three decoder-stream acknowledgements — plus field sections that index the
+// static table, index the dynamic table both relative to and after the Base, and
+// spell a name out literally. Every wire byte here is transcribed from the RFC's
+// printed hex and the dynamic-table state (size, entry count, insert count) it
+// prints after each step; the static table itself was cross-checked against
+// ls-qpack. Each encoder output is asserted byte-exact and then fed to the
+// decoder, so encoder and decoder tables are proven to evolve in lock-step.
+//
+// The tail adds three round-trips that reach representations Appendix B does not:
+// a Huffman-coded adaptive section, a post-base literal name reference, and a
+// sensitive (never-index) field. Each check prints one `PASS` line; the golden
+// `expected` file is that list.
+import {
+  Encoder,
+  Decoder,
+  HeaderField,
+  newEncoder,
+  newEncoderConfig,
+  newDecoder,
+  newDecoderConfig,
+} from "std/http3"
+
+const hexDigits: string = "0123456789abcdef"
+
+function toHex(b: []byte): string {
+  let out = []byte(len(b) * 2)
+  let i = 0
+  while (i < len(b)) {
+    out[i * 2] = hexDigits[int(b[i] >> 4)]
+    out[i * 2 + 1] = hexDigits[int(b[i] & 0x0f)]
+    i = i + 1
+  }
+  return string(out)
+}
+
+function itoa(n: int): string {
+  if (n == 0) {
+    return "0"
+  }
+  let v = n
+  let tmp = []byte(0)
+  while (v > 0) {
+    tmp = append(tmp, byte(48 + v % 10))
+    v = v / 10
+  }
+  let out = []byte(0)
+  let i = len(tmp) - 1
+  while (i >= 0) {
+    out = append(out, tmp[i])
+    i = i - 1
+  }
+  return string(out)
+}
+
+function hf(name: string, value: string): HeaderField {
+  return HeaderField{ name: name, value: value, sensitive: false }
+}
+
+function hfSensitive(name: string, value: string): HeaderField {
+  return HeaderField{ name: name, value: value, sensitive: true }
+}
+
+// Render a decoded header list as "name=value|..." with a trailing "!" on any
+// sensitive field, so one string compares the whole result.
+function fieldsStr(fs: []HeaderField): string {
+  let out = ""
+  let i = 0
+  while (i < len(fs)) {
+    if (i > 0) {
+      out = out + "|"
+    }
+    out = out + fs[i].name + "=" + fs[i].value
+    if (fs[i].sensitive) {
+      out = out + "!"
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Encoder table state as "insertCount/size/count".
+function encState(e: Encoder): string {
+  return itoa(e.insertCount()) + "/" + itoa(e.tableSize()) + "/" + itoa(e.tableCount())
+}
+
+// Decoder table state as "insertCount/size/count".
+function decState(d: Decoder): string {
+  return itoa(d.insertCount()) + "/" + itoa(d.tableSize()) + "/" + itoa(d.tableCount())
+}
+
+// One assertion: prints "tag PASS", or "tag FAIL got=<got> want=<want>".
+function eq(tag: string, got: string, want: string) {
+  if (got == want) {
+    println(tag + " PASS")
+    return
+  }
+  println(tag + " FAIL got=" + got + " want=" + want)
+}
+
+// The Appendix B exchange, threaded through one encoder and one decoder.
+function scenario(): ()! {
+  let e = newEncoderConfig(0, false)
+  let d = newDecoderConfig(4096)
+
+  // B.1: literal field line with a static name reference, no dynamic table.
+  let b1 = e.encodeFieldSection(0, 0, []HeaderField{ hf(":path", "/index.html") })
+  eq("B.1.enc", toHex(b1), "0000510b2f696e6465782e68746d6c")
+  eq("B.1.dec", fieldsStr(d.decodeFieldSection(b1)?), ":path=/index.html")
+
+  // B.2: set capacity, insert two static-name-referenced entries, then a field
+  // section that indexes them post-base (Base 0), acknowledged by the decoder.
+  let s1 = e.setCapacity(220)
+  let s2 = e.insertNameRef(true, 0, "www.example.com")?
+  let s3 = e.insertNameRef(true, 1, "/sample/path")?
+  let encB2 = appendAll(appendAll(s1, s2), s3)
+  eq("B.2.ins", toHex(encB2), "3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468")
+  eq("B.2.encstate", encState(e) + "/" + itoa(e.capacity()), "2/106/2/220")
+  d.applyEncoderStream(encB2)?
+  eq("B.2.dapply", decState(d) + "/" + itoa(d.capacity()), "2/106/2/220")
+  let b2 = e.encodeFieldSection(4, 0, []HeaderField{ hf(":authority", "www.example.com"), hf(":path", "/sample/path") })
+  eq("B.2.sec", toHex(b2), "03811011")
+  eq("B.2.decsec", fieldsStr(d.decodeFieldSection(b2)?), ":authority=www.example.com|:path=/sample/path")
+  e.applyDecoderStream(d.sectionAck(4))?
+  eq("B.2.ack", itoa(e.knownReceivedCount()), "2")
+
+  // B.3: insert with a literal name; decoder acknowledges with insert-count
+  // increment.
+  let s4 = e.insertLiteral("custom-key", "custom-value")?
+  eq("B.3.ins", toHex(s4), "4a637573746f6d2d6b65790c637573746f6d2d76616c7565")
+  eq("B.3.encstate", encState(e), "3/160/3")
+  d.applyEncoderStream(s4)?
+  eq("B.3.dapply", decState(d), "3/160/3")
+  e.applyDecoderStream(d.insertCountIncrement(1))?
+  eq("B.3.inc", itoa(e.knownReceivedCount()), "3")
+
+  // B.4: duplicate the oldest entry, then a field section using relative dynamic
+  // indexing and a static index (Base 4); the decoder cancels the stream.
+  let s5 = e.duplicate(2)?
+  eq("B.4.dup", toHex(s5), "02")
+  eq("B.4.encstate", encState(e), "4/217/4")
+  d.applyEncoderStream(s5)?
+  eq("B.4.dapply", decState(d), "4/217/4")
+  let b4 = e.encodeFieldSection(8, 4, []HeaderField{ hf(":authority", "www.example.com"), hf(":path", "/"), hf("custom-key", "custom-value") })
+  eq("B.4.sec", toHex(b4), "050080c181")
+  eq("B.4.decsec", fieldsStr(d.decodeFieldSection(b4)?), ":authority=www.example.com|:path=/|custom-key=custom-value")
+  e.applyDecoderStream(d.streamCancel(8))?
+  eq("B.4.cancel", itoa(e.knownReceivedCount()), "3")
+
+  // B.5: insert with a dynamic name reference, evicting the oldest entry.
+  let s6 = e.insertNameRef(false, 1, "custom-value2")?
+  eq("B.5.ins", toHex(s6), "810d637573746f6d2d76616c756532")
+  eq("B.5.encstate", encState(e), "5/215/4")
+  d.applyEncoderStream(s6)?
+  eq("B.5.dapply", decState(d), "5/215/4")
+
+  // Post-B.5 the oldest entry (Abs=0) is gone; a section referencing the two
+  // ends of the surviving window (Abs=4 and Abs=1) still round-trips, proving
+  // survivors kept their absolute indices across eviction.
+  let b5 = e.encodeFieldSection(12, 5, []HeaderField{ hf("custom-key", "custom-value2"), hf(":path", "/sample/path") })
+  eq("B.5.evict", toHex(b5) + " " + fieldsStr(d.decodeFieldSection(b5)?), "06008083 custom-key=custom-value2|:path=/sample/path")
+}
+
+// A Huffman-coded adaptive round-trip: static full match, dynamic full match
+// (relative), a static name reference, and a literal name — all decoded back.
+function roundTrip(): ()! {
+  let e = newEncoder()
+  let d = newDecoderConfig(4096)
+  d.applyEncoderStream(e.setCapacity(4096))?
+  d.applyEncoderStream(e.insertLiteral("x-custom", "hello")?)?
+  let fields = []HeaderField{ hf(":method", "GET"), hf("x-custom", "hello"), hf("user-agent", "BitHTTP/3"), hf("x-brand-new", "v1") }
+  let block = e.encodeFieldSection(0, e.insertCount(), fields)
+  eq("rt.dec", fieldsStr(d.decodeFieldSection(block)?), ":method=GET|x-custom=hello|user-agent=BitHTTP/3|x-brand-new=v1")
+}
+
+// A post-base literal name reference (§4.5.5): Base 0 with a name-only match on
+// a dynamic entry at Abs=0.
+function postBase(): ()! {
+  let e = newEncoderConfig(4096, false)
+  let d = newDecoderConfig(4096)
+  d.applyEncoderStream(e.setCapacity(4096))?
+  d.applyEncoderStream(e.insertLiteral("x-token", "aaa")?)?
+  let block = e.encodeFieldSection(20, 0, []HeaderField{ hf("x-token", "bbb") })
+  eq("pb.enc", toHex(block), "0280" + "0803626262")
+  eq("pb.dec", fieldsStr(d.decodeFieldSection(block)?), "x-token=bbb")
+}
+
+// A sensitive field is emitted as a never-index literal and reported sensitive.
+function sensitive(): ()! {
+  let e = newEncoderConfig(4096, false)
+  let d = newDecoderConfig(4096)
+  let block = e.encodeFieldSection(24, 0, []HeaderField{ hfSensitive("authorization", "secret") })
+  eq("sens.enc", toHex(block), "0000" + "7f45" + "06736563726574")
+  eq("sens.dec", fieldsStr(d.decodeFieldSection(block)?), "authorization=secret!")
+}
+
+// Concatenate two byte slices.
+function appendAll(a: []byte, b: []byte): []byte {
+  let out = a
+  for x of b {
+    out = append(out, x)
+  }
+  return out
+}
+
+function main() {
+  scenario() catch e {
+    println("scenario FAIL " + e.message())
+  }
+  roundTrip() catch e {
+    println("roundTrip FAIL " + e.message())
+  }
+  postBase() catch e {
+    println("postBase FAIL " + e.message())
+  }
+  sensitive() catch e {
+    println("sensitive FAIL " + e.message())
+  }
+}

@@ -23,6 +23,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
 | [http2](http2.md) | `"std/http2"` | HPACK + HTTP/2 frame layer |
 | [quic](quic.md) | `"std/quic"` | QUIC v1 packet protection + frames |
+| [http3](http3.md) | `"std/http3"` | QPACK field compression |
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
 
 ## Conventions
