@@ -24,6 +24,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const heap_mod = @import("alloc.zig");
 const Heap = heap_mod.Heap;
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// Per-type layout descriptor emitted by the compiler, one static instance per
 /// distinct (monomorphized) type. See `runtime/ABI.md` §2 for the binary
@@ -172,6 +173,11 @@ comptime {
 
 pub const Gc = struct {
     heap: *Heap,
+    /// Guards the all-objects list and its counters during concurrent allocation
+    /// from multiple OS workers (`alloc`/`allocRaw`). `sweep` runs world-stopped
+    /// under the safepoint barrier, so it needs no lock — nothing allocates while
+    /// it walks the list.
+    list_lock: SpinLock = .{},
     /// Head of the intrusive all-objects list.
     all: ?*GcHeader = null,
     /// Number of live (allocated, not yet swept) objects.
@@ -236,14 +242,26 @@ pub const Gc = struct {
         const total = header_size + info.size;
         const raw = self.heap.alloc(total, gc_align) orelse return null;
         const h: *GcHeader = @ptrCast(@alignCast(raw));
+        const body = raw + header_size;
+        self.linkObject(h, info, total, @intFromPtr(body));
+        @memset(body[0..info.size], 0);
+        return body;
+    }
+
+    /// Thread a freshly-allocated header onto the all-objects list and bump the
+    /// counters and address bounds under `list_lock`, so concurrent allocators on
+    /// different workers cannot corrupt the list. The caller zeroes the body after
+    /// this returns: a collection cannot observe the object in between, because the
+    /// safepoint barrier waits for every worker to reach a safepoint and the
+    /// allocating worker only polls one once it has finished initializing.
+    fn linkObject(self: *Gc, h: *GcHeader, info: *const TypeInfo, total: usize, body_addr: usize) void {
+        self.list_lock.acquire();
+        defer self.list_lock.release();
         h.* = .{ .info = info, .next = self.all, .size = total, .marked = false };
         self.all = h;
         self.num_objects += 1;
         self.stats.total_allocated += 1;
-        const body = raw + header_size;
-        self.noteBody(@intFromPtr(body));
-        @memset(body[0..info.size], 0);
-        return body;
+        self.noteBody(body_addr);
     }
 
     /// Like `alloc`, but for objects whose body size is not fixed by their
@@ -255,12 +273,8 @@ pub const Gc = struct {
         const total = header_size + body_size;
         const raw = self.heap.alloc(total, gc_align) orelse return null;
         const h: *GcHeader = @ptrCast(@alignCast(raw));
-        h.* = .{ .info = info, .next = self.all, .size = total, .marked = false };
-        self.all = h;
-        self.num_objects += 1;
-        self.stats.total_allocated += 1;
         const body = raw + header_size;
-        self.noteBody(@intFromPtr(body));
+        self.linkObject(h, info, total, @intFromPtr(body));
         @memset(body[0..body_size], 0);
         return body;
     }
@@ -613,6 +627,45 @@ test "mark overflow recovery: wide graph fully retained with a tiny worklist" {
         try testing.expect(gc.owns(mids[i]));
         try testing.expect(gc.owns(leaves[i]));
     }
+}
+
+test "concurrent stress: N threads allocate through one Gc without list corruption" {
+    if (builtin.single_threaded) return;
+
+    var heap = Heap.init();
+    var gc = try Gc.init(&heap, .{ .enabled = false });
+    defer gc.deinit();
+
+    // No collection runs (enabled=false, no safepoint call), so this isolates the
+    // all-objects-list lock: many workers thread objects onto the shared list at
+    // once and the count plus the list length must both stay exact.
+    const per_thread: usize = 50_000;
+    const Worker = struct {
+        fn run(g: *Gc, n: usize) void {
+            var i: usize = 0;
+            while (i < n) : (i += 1) { // statically bounded
+                const p = g.alloc(&node_info) orelse @panic("Gc exhausted in concurrent stress");
+                const first: *const ?[*]u8 = @ptrCast(@alignCast(p));
+                std.debug.assert(first.* == null); // body zeroed, uncorrupted by concurrent allocs
+            }
+        }
+    };
+
+    const nthreads = @min(@as(usize, 4), std.Thread.getCpuCount() catch 2);
+    var threads: [4]std.Thread = undefined;
+    var t: usize = 0;
+    while (t < nthreads) : (t += 1) {
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{ &gc, per_thread });
+    }
+    for (threads[0..nthreads]) |th| th.join();
+
+    // Every allocation is counted exactly once and the intrusive list is intact.
+    const expected = nthreads * per_thread;
+    try testing.expectEqual(expected, gc.num_objects);
+    var count: usize = 0;
+    var o = gc.all;
+    while (o) |h| : (o = h.next) count += 1; // bounded by num_objects
+    try testing.expectEqual(expected, count);
 }
 
 test "configFromEnv: empty env gives defaults, set vars override" {
