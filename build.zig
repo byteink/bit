@@ -359,9 +359,11 @@ pub fn build(b: *std.Build) void {
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is
     // where `std/*` resolves; `imports_dir` holds the programs.
+    const imports_filter = b.option([]const u8, "imports-filter", "run only the named tests/imports/* project") orelse "";
     const imports_opts = b.addOptions();
     imports_opts.addOption([]const u8, "imports_dir", b.pathFromRoot("tests/imports"));
     imports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    imports_opts.addOption([]const u8, "imports_filter", imports_filter);
 
     const imports_mod = b.createModule(.{
         .root_source_file = b.path("tests/imports.zig"),
@@ -378,6 +380,13 @@ pub fn build(b: *std.Build) void {
     // without this the run is cache-skipped and new tests silently never execute.
     imports_run.has_side_effects = true;
     test_step.dependOn(&imports_run.step);
+
+    // Scoped runner: `zig build test-imports` runs only the imports harness
+    // (the always-rerun, largest chunk of `zig build test`); add
+    // `-Dimports-filter=<name>` to gate a single KAT in seconds during a
+    // per-task edit loop, without the 200+ golden/example/unit runs.
+    const test_imports_step = b.step("test-imports", "run the tests/imports/* harness only (see -Dimports-filter)");
+    test_imports_step.dependOn(&imports_run.step);
 
     // Fuzz harness (task #334): lexer+parser must never crash/hang on
     // arbitrary bytes. Two separate compilations of fuzz.zig, because
