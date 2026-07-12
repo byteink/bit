@@ -1276,11 +1276,21 @@ const SelectCaseDesc = extern struct {
     ok: u64,
 };
 
-/// `bit_rt_select_alloc`: a zeroed `n`-case descriptor buffer (a leaf GC
-/// object). Codegen populates `dir`/`chan` (and, for a send, `word`) per case,
-/// then calls `bit_rt_select`.
+/// `bit_rt_select_alloc`: a zeroed `n`-case descriptor buffer. Codegen populates
+/// `dir`/`chan` (and, for a send, `word`) per case, then calls `bit_rt_select`.
+///
+/// The buffer is a **traced** (`ref_array_info`) object, not a leaf: a `word`
+/// slot can hold a live GC reference — a send case's value, or the value a recv
+/// case just received (`bit_rt_select` writes it there for codegen to read
+/// back) — for a `chan<T>` whose `T` is a reference type. That reference lives
+/// *only* in this buffer across `bit_rt_select` (which may park and let a
+/// collection run) and in the window before codegen loads it into a rooted
+/// slot, so leaving the buffer untraced would sweep a still-live received value.
+/// Every-word conservative tracing is exact here: `dir`/`ok` are 0/1 and the
+/// `chan` handle is a process-lifetime page allocation, so `markRoot` skips all
+/// three (none is a live object base); only a real `word` reference is marked.
 export fn bit_rt_select_alloc(n: usize) callconv(.c) [*]SelectCaseDesc {
-    const body = g_gc.allocRaw(n * @sizeOf(SelectCaseDesc), &slicebuf_info) orelse fatal("out of memory");
+    const body = g_gc.allocRaw(n * @sizeOf(SelectCaseDesc), &gc_mod.ref_array_info) orelse fatal("out of memory");
     return @ptrCast(@alignCast(body));
 }
 

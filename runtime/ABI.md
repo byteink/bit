@@ -563,10 +563,16 @@ Codegen evaluates each comm clause's channel (and a send case's value) once,
 **in/out**: for a recv case the runtime writes the received value there, so
 codegen reads it back from `descs[fired].word` after the call. `bit_rt_select`
 returns the fired case index, or `n` to signal the `default` clause ran. The
-descriptor buffer is a leaf GC object; its channel pointers are also held by the
-caller's live channel values, so nothing is lost before collection is wired
-(#1106). Nil-channel cases are the caller's responsibility to omit (a nil case
-is never ready).
+descriptor buffer is a **traced** GC object (allocated with `ref_array_info`, so
+every word is scanned): for a `chan<T>` where `T` is a reference type, a `word`
+slot holds a live reference — a send case's value, or the value a recv case just
+received — and that reference lives *only* in this buffer across `bit_rt_select`
+(which may park while a collection runs) and until codegen loads it into a rooted
+slot, so a leaf buffer would let the collector sweep a still-live received value.
+Tracing every word is exact: `dir`/`ok` are 0/1 and each `chan` is a
+process-lifetime page allocation, so the collector's base-pointer check skips
+all three and marks only a real `word` reference. Nil-channel cases are the
+caller's responsibility to omit (a nil case is never ready).
 
 ### Root scanning integration
 
