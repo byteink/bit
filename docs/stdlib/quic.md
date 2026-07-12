@@ -847,6 +847,26 @@ Accept a QUIC connection on the already-bound UDP socket `sock`, using the PEM
 certificate chain (end-entity first) and private key, and complete the handshake.
 Serves exactly one connection. Fails if the handshake does not complete.
 
+### `listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Listener!`
+
+Bind a server listener to the already-bound UDP socket `sock`, using the PEM
+certificate chain (end-entity first) and private key. Unlike `acceptQuic`, the
+listener owns the socket and demultiplexes every incoming datagram to the matching
+connection by Destination Connection ID (RFC 9000 §5.1), so one socket serves many
+concurrent clients. Returns immediately; established connections arrive via
+`accept`.
+
+### `Listener`
+
+A QUIC server listener owning one bound UDP socket. It routes each datagram to the
+right connection and opens a new one on an Initial packet with an unknown
+connection id (up to an internal cap). Obtain one from `listenQuic`.
+
+### `Listener.accept(): Conn!`
+
+Accept the next established connection, blocking until a client completes its
+handshake. Each returned `Conn` is independent, multiplexed over the shared socket.
+
 ### `Conn`
 
 An established QUIC connection. Its methods marshal to the owning loop thread over

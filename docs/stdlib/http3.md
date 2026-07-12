@@ -358,7 +358,26 @@ complete the QUIC handshake, and set up the control and QPACK streams. The retur
 Accept one HTTP/3 connection on the bound UDP socket `sock`, using the PEM
 certificate chain and private key for the QUIC-TLS handshake, and set up the
 control and QPACK streams. The returned `H3Conn` is ready for `accept`. Fails if the
-handshake fails.
+handshake fails. Serves a single connection; use `h3Listen` for a multi-connection
+server.
+
+### `h3Listen(sock: UdpSocket, certChainPem: string, keyPem: string): H3Listener!`
+
+Start an HTTP/3 listener on the bound UDP socket `sock`, using the PEM certificate
+chain and private key. The underlying QUIC listener demultiplexes many client
+connections on the one socket by connection id. Returns immediately; each
+established connection is handed back by `accept`.
+
+### `H3Listener`
+
+An HTTP/3 server listener over a QUIC `Listener`: many client connections on one
+bound UDP socket. Obtain one from `h3Listen`.
+
+### `H3Listener.accept(): H3Conn!`
+
+Accept the next HTTP/3 connection, blocking until a client completes its handshake,
+and set up its control and QPACK streams. Run each returned `H3Conn` on its own
+green thread.
 
 ### `H3Conn.request(req: H3Request): H3Response!`
 

@@ -45,12 +45,14 @@
 // import into this module's shared namespace.
 //
 // ponytail: NewReno only (no CUBIC/BBR); connection migration is CID basics only
-// (fixed 8-byte ids, no path validation); a single connection per socket (no
-// server demux); AES-128-GCM + X25519 only, matching `packet.bit`'s AEAD. The
-// upgrade paths are noted at each `// ponytail:` below.
+// (fixed 8-byte ids, no path validation); AES-128-GCM + X25519 only, matching
+// `packet.bit`'s AEAD. A server accepts many connections per socket via
+// `listenQuic` (DCID demultiplexing); `acceptQuic` remains for the single
+// connection case. The upgrade paths are noted at each `// ponytail:` below.
 
 import { udpBind, UdpSocket } from "std/net"
 import { monotonic, sleep } from "std/time"
+import { randomBytes } from "std/crypto"
 import {
   TlsClientConfig,
   TlsClientHandshake,
@@ -121,9 +123,8 @@ const quicconnCmdWrite: int = 3
 const quicconnCmdFinish: int = 4
 const quicconnCmdClose: int = 5
 
-// Connection-id length this endpoint issues. ponytail: fixed, non-random ids
-// (mixed from the clock); a real endpoint uses cryptographically random ids and
-// a NEW_CONNECTION_ID pool.
+// Connection-id length this endpoint issues (RFC 9000 §5.1). ponytail: no
+// NEW_CONNECTION_ID pool (one id per direction for the connection's life).
 const quicconnCidLen: int = 8
 
 // ---------------------------------------------------------------------------
@@ -179,18 +180,12 @@ function quicconnCopyRange(data: []byte, lo: int, hi: int): []byte {
   return out
 }
 
-// An 8-byte connection id derived from `seed` with a splitmix64 step, so two
-// ids from different seeds differ. Not a secret; see the CID ponytail note.
-function quicconnMakeCid(seed: int): []byte {
-  let out = []byte(quicconnCidLen)
-  let x = u64(seed) + u64(0x9e3779b97f4a7c15)
-  let i = 0
-  while (i < quicconnCidLen) {
-    x = (x ^ (x >> u64(30))) * u64(0xbf58476d1ce4e5b9)
-    out[i] = byte(x >> u64(24))
-    i = i + 1
-  }
-  return out
+// A fresh, cryptographically random connection id (RFC 9000 §5.1). Random ids
+// make a collision between two concurrent connections astronomically unlikely,
+// which the server demultiplexer relies on to tell peers apart — a clock-seeded
+// id collides whenever two connections start within one (coarse) clock tick.
+function quicconnMakeCid(): []byte {
+  return randomBytes(quicconnCidLen)
 }
 
 // Zero packet keys, a placeholder until a level's keys are installed.
@@ -697,6 +692,8 @@ struct quicconnState {
   readyCh: chan<int>,
   running: bool,
   closeSent: bool,
+  doneCh: chan<int>,
+  serverHsTimeout: bool,
 }
 
 function quicconnNewState(isClient: bool, sock: UdpSocket, host: string, port: int, scid: []byte, dcid: []byte): quicconnState {
@@ -753,6 +750,8 @@ function quicconnNewState(isClient: bool, sock: UdpSocket, host: string, port: i
     readyCh: chan<int>(1),
     running: true,
     closeSent: false,
+    doneCh: chan<int>(1),
+    serverHsTimeout: false,
   }
 }
 
@@ -828,7 +827,6 @@ function quicconnTicker(st: quicconnState) {
 function quicconnLoop(st: quicconnState) {
   quicconnKickoff(st) catch e {
     quicconnFail(st)
-    return
   }
   while (st.running) {
     select {
@@ -845,6 +843,14 @@ function quicconnLoop(st: quicconnState) {
           quicconnFail(st)
         }
     }
+  }
+  // Signal loop exit so a server listener can reap this connection's demux
+  // entries. Non-blocking: nothing reads `doneCh` on the dial path.
+  select {
+    case st.doneCh <- 1:
+      {}
+    default:
+      {}
   }
 }
 
@@ -904,9 +910,12 @@ function quicconnOnDgram(st: quicconnState, ev: quicconnDgram): ()! {
 
 function quicconnOnTick(st: quicconnState): ()! {
   // A client whose handshake has stalled past the deadline gives up, so a dial
-  // to an absent/silent server returns an error rather than hanging. Servers
-  // wait indefinitely for a peer, so this is client-only.
-  if (st.isClient && !st.established && monotonic() - st.handshakeStart > quicconnHandshakeTimeout) {
+  // to an absent/silent server returns an error rather than hanging. A listener-
+  // created server connection (`serverHsTimeout`) applies the same deadline: it
+  // is born mid-handshake when an Initial arrives, so a peer that never finishes
+  // is reaped instead of leaking a slot. The `acceptQuic` server, which binds
+  // before any peer exists, keeps waiting indefinitely.
+  if ((st.isClient || st.serverHsTimeout) && !st.established && monotonic() - st.handshakeStart > quicconnHandshakeTimeout) {
     quicconnFail(st)
     return
   }
@@ -1962,8 +1971,8 @@ function quicconnClientTlsConfig(serverName: string): TlsClientConfig {
 // only; no name resolution or IPv6.
 export function dialQuic(host: string, port: int, serverName: string): Conn! {
   let sock = udpBind("127.0.0.1", 0)?
-  let scid = quicconnMakeCid(monotonic())
-  let dcid = quicconnMakeCid(monotonic() + 1)
+  let scid = quicconnMakeCid()
+  let dcid = quicconnMakeCid()
   let tp = quicconnLocalParams(scid)
   let ext = Extension{ extType: quicTransportParametersExtension, data: encodeTransportParameters(tp) }
   let h = tlsClientStartExts(quicconnClientTlsConfig(serverName), [ext])?
@@ -1995,7 +2004,7 @@ export function acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string
   let cfg = newTlsServerConfig(certChainPem, keyPem, []string(0))?
   cfg.suites = [TLS_AES_128_GCM_SHA256]
   cfg.groups = [TlsGroup.X25519]
-  let scid = quicconnMakeCid(monotonic() + 2)
+  let scid = quicconnMakeCid()
   let tp = quicconnLocalParams(scid)
   let ext = Extension{ extType: quicTransportParametersExtension, data: encodeTransportParameters(tp) }
   let s = tlsServerStartExts(cfg, [ext])?
@@ -2009,6 +2018,213 @@ export function acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string
     fail newError("quic: server handshake failed")
   }
   return Conn{ cmdCh: st.cmdCh, sock: sock }
+}
+
+// ---------------------------------------------------------------------------
+// Server listener — connection demultiplexing (RFC 9000 §5.1)
+// ---------------------------------------------------------------------------
+//
+// A single bound UDP socket carries many client connections, told apart by the
+// Destination Connection ID in each packet header. `acceptQuic` above drives one
+// connection per socket; `listenQuic` owns the socket instead and routes every
+// datagram to the matching connection, spawning a new one on an Initial whose
+// DCID it has not seen. Each connection keeps its own reader-less loop fed by the
+// listener rather than parking on the shared socket itself.
+//
+// The demux table (`conns`/`present`) is touched only by the single listener
+// loop and the per-connection reaper threads; on the current single-worker
+// scheduler those never run concurrently across a heap mutation, so no lock is
+// needed. ponytail: the M:N epic (a multi-worker scheduler) must guard this map.
+
+// A hard ceiling on concurrently-tracked connections, bounding the demux table
+// and the per-connection green threads. Half-open handshakes free their slot via
+// the 5s server handshake timeout (`quicconnOnTick`), so the count recovers.
+// ponytail: no aging-out of idle *established* connections yet.
+const quicListenerMaxConns: int = 1024
+
+// The listener's private state: the shared socket, the reusable TLS server
+// config, the DCID→connection table (`present` shadows key existence, since the
+// map has no comma-ok probe), the queue of established connections `accept`
+// drains, and a live-connection count for the connection cap.
+struct quicListenerState {
+  sock: UdpSocket,
+  cfg: TlsServerConfig,
+  conns: map<string, quicconnState>,
+  present: map<string, int>,
+  acceptCh: chan<Conn>,
+  count: int,
+}
+
+// A QUIC server listener owning one bound UDP socket and demultiplexing all
+// incoming datagrams to per-client connections by Destination Connection ID.
+export struct Listener {
+  acceptCh: chan<Conn>,
+  sock: UdpSocket,
+}
+
+// Bind a listener to the already-bound UDP socket `sock`: build the shared TLS
+// server config once and start the demultiplexing loop. Returns immediately;
+// established connections arrive via `accept`.
+export function listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Listener! {
+  let cfg = newTlsServerConfig(certChainPem, keyPem, []string(0))?
+  cfg.suites = [TLS_AES_128_GCM_SHA256]
+  cfg.groups = [TlsGroup.X25519]
+  let lst = quicListenerState{
+    sock: sock,
+    cfg: cfg,
+    conns: map<string, quicconnState>(),
+    present: map<string, int>(),
+    acceptCh: chan<Conn>(64),
+    count: 0,
+  }
+  spawn quicListenerLoop(lst)
+  return Listener{ acceptCh: lst.acceptCh, sock: sock }
+}
+
+// Accept the next established connection, blocking until a client completes its
+// handshake. Each `Conn` is independent, multiplexed over the shared socket.
+export function (l: Listener) accept(): Conn! {
+  return <- l.acceptCh
+}
+
+// The listener loop: the sole owner of the socket's recv. Park on each datagram
+// and dispatch it; a socket error (close) ends the loop. A malformed datagram or
+// a failed connection setup is swallowed so one bad packet never kills the
+// listener.
+function quicListenerLoop(lst: quicListenerState) {
+  while (true) {
+    let d = lst.sock.recv(2048) catch e {
+      return
+    }
+    quicListenerDispatch(lst, []byte(d.data), d.host, d.port) catch e {
+      continue
+    }
+  }
+}
+
+// Route one datagram: look its DCID up in the table and forward it; on an unknown
+// DCID, create a new connection only for a client Initial (and only under the
+// connection cap), otherwise drop it (RFC 9000 §5.2 — a stray short-header packet
+// with no matching connection is discarded).
+function quicListenerDispatch(lst: quicListenerState, data: []byte, host: string, port: int): ()! {
+  let dcid = quicDemuxDcid(data)
+  if (len(dcid) == 0) {
+    return
+  }
+  let key = string(dcid)
+  if (lst.present[key] != 0) {
+    quicListenerFeed(lst.conns[key], data, host, port)
+    return
+  }
+  if (!quicDemuxIsInitial(data)) {
+    return
+  }
+  if (lst.count >= quicListenerMaxConns) {
+    return
+  }
+  let st = quicListenerNewConn(lst, key)?
+  quicListenerFeed(st, data, host, port)
+}
+
+// Hand a datagram to a connection's inbound channel without blocking: if the
+// connection is backed up, drop the datagram — QUIC treats it as loss and the
+// peer retransmits, and a stalled connection must not stall the whole listener.
+function quicListenerFeed(st: quicconnState, data: []byte, host: string, port: int) {
+  select {
+    case st.inCh <- quicconnDgram{ data: data, host: host, port: port, eof: false }:
+      {}
+    default:
+      {}
+  }
+}
+
+// Create a server connection for a new client, keyed under both the client's
+// original DCID (used until the client adopts our SCID) and our own SCID (used
+// for 1-RTT). Spawns its ticker, loop, and a reaper that delivers it to `accept`
+// and frees its table entries when it ends.
+function quicListenerNewConn(lst: quicListenerState, clientKey: string): quicconnState! {
+  let scid = quicconnMakeCid()
+  let tp = quicconnLocalParams(scid)
+  let ext = Extension{ extType: quicTransportParametersExtension, data: encodeTransportParameters(tp) }
+  let s = tlsServerStartExts(lst.cfg, [ext])?
+  let st = quicconnNewState(false, lst.sock, "", 0, scid, []byte(0))
+  st.shOpt = Option.Some(s)
+  st.serverHsTimeout = true
+  let scidKey = string(scid)
+  lst.conns[clientKey] = st
+  lst.present[clientKey] = 1
+  lst.conns[scidKey] = st
+  lst.present[scidKey] = 1
+  lst.count = lst.count + 1
+  spawn quicconnTicker(st)
+  spawn quicconnLoop(st)
+  spawn quicListenerReap(lst, st, clientKey, scidKey)
+  return st
+}
+
+// Per-connection reaper: publish the connection to `accept` once established,
+// then wait for its loop to end and release its demux entries so the table and
+// green-thread count stay bounded.
+function quicListenerReap(lst: quicListenerState, st: quicconnState, k1: string, k2: string) {
+  let r = <- st.readyCh
+  if (r > 0) {
+    lst.acceptCh <- Conn{ cmdCh: st.cmdCh, sock: lst.sock }
+  }
+  <- st.doneCh
+  quicListenerDrop(lst, k1)
+  if (k2 != k1) {
+    quicListenerDrop(lst, k2)
+  }
+  lst.count = lst.count - 1
+}
+
+// Remove one demux key if present.
+function quicListenerDrop(lst: quicListenerState, key: string) {
+  if (lst.present[key] != 0) {
+    lst.present[key] = 0
+    delete(lst.conns, key)
+  }
+}
+
+// Extract the Destination Connection ID from the first packet in a datagram. A
+// long header carries an explicit DCID-length byte (RFC 9000 §17.2); a short
+// header omits it (§17.3), so the DCID is our own fixed issued length. Returns an
+// empty slice on a datagram too short to hold a header, which the caller drops.
+function quicDemuxDcid(data: []byte): []byte {
+  if (len(data) < 1) {
+    return []byte(0)
+  }
+  let first = data[0]
+  if ((first & 0x80) != 0) {
+    if (len(data) < 6) {
+      return []byte(0)
+    }
+    let dcidLen = int(data[5])
+    if (6 + dcidLen > len(data)) {
+      return []byte(0)
+    }
+    return quicconnCopyRange(data, 6, 6 + dcidLen)
+  }
+  if ((first & 0x40) != 0) {
+    if (1 + quicconnCidLen > len(data)) {
+      return []byte(0)
+    }
+    return quicconnCopyRange(data, 1, 1 + quicconnCidLen)
+  }
+  return []byte(0)
+}
+
+// Whether a datagram's first packet is a long-header Initial — the only packet
+// that may open a new connection at the listener (RFC 9000 §17.2.2).
+function quicDemuxIsInitial(data: []byte): bool {
+  if (len(data) < 1) {
+    return false
+  }
+  let first = data[0]
+  if ((first & 0x80) == 0) {
+    return false
+  }
+  return int((first >> 4) & 0x03) == longInitial
 }
 
 // Open a new client-initiated bidirectional stream.
