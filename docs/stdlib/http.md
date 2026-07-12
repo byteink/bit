@@ -1,7 +1,7 @@
 # std/http
 
-HTTP/1.1 over `std/net` (cleartext) or `std/tls` (TLS 1.3), built entirely in
-Bit. A server accepts connections and handles each on its own green thread; a
+HTTP/1.1, HTTP/2, and HTTP/3 — built entirely in Bit over `std/net` (cleartext),
+`std/tls` (TLS 1.3), and `std/quic` (QUIC). A server accepts connections and handles each on its own green thread; a
 client dials, sends one request, and reads the response. The wire protocol is the
 same on either transport — an `https://` URL or `serveTls` just swaps the socket.
 Fallible calls return `T!` — propagate with `?` or handle with `catch`.
@@ -11,6 +11,17 @@ Scope: HTTP/1.1 over cleartext or TLS, one request per connection
 carried as a raw block and read with `header()`.
 
 <!-- doctest: per-block -->
+
+## Transports
+
+The `Request`/`Response` types and the `(Request) => Response` handler are the
+same across all three protocols — only the socket underneath changes.
+
+| Protocol | How to use | Transport | Notes |
+| --- | --- | --- | --- |
+| HTTP/1.1 | `serve` / `listenAndServe`; `get`/`request` on `http://` or `https://` | TCP, cleartext or TLS 1.3 | Always available; the fallback for the other two. |
+| HTTP/2 | ALPN `h2`, negotiated by `serveTls` and `getTls`/`requestTls` over TLS | TCP + TLS 1.3 | Selected automatically when both peers offer `h2`; falls back to HTTP/1.1. |
+| HTTP/3 | `serveH3`; client via `https+h3://` or Alt-Svc discovery | QUIC (UDP) + TLS 1.3 | Opt-in — see [HTTP/3](#http3). |
 
 ## Messages
 
