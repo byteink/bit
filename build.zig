@@ -270,7 +270,12 @@ pub fn build(b: *std.Build) void {
     examples_mod.addOptions("build_options", examples_opts);
 
     const examples_tests = b.addTest(.{ .root_module = examples_mod });
-    test_step.dependOn(&b.addRunArtifact(examples_tests).step);
+    const examples_run = b.addRunArtifact(examples_tests);
+    // examples/* and stdlib/* are read at runtime (like the imports harness), so
+    // a new or edited example is invisible to the build cache; without this the
+    // run is cache-skipped and a broken example passes silently.
+    examples_run.has_side_effects = true;
+    test_step.dependOn(&examples_run.step);
 
     // Concurrency + GC stress suite (task #350): compiles + runs each
     // tests/stress/* program twice — default policy and BIT_GC=stress (collect
