@@ -278,3 +278,140 @@ function fetchStatus(url: string): int! {
   return res.status
 }
 ```
+
+## HTTP/3
+
+HTTP/3 (RFC 9114) runs over QUIC — a TLS 1.3 transport on UDP, not TCP — so unlike
+the HTTP/1.1 ↔ HTTP/2 choice it is **opt-in**, never negotiated behind a plain
+`https://` request: QUIC needs UDP and is heavier to set up, so the same
+`https://` URL always stays on TLS-over-TCP. A client reaches HTTP/3 one of two
+ways:
+
+- **Explicit scheme** — an `https+h3://` URL dials QUIC and speaks HTTP/3 directly.
+- **Alt-Svc discovery** — a `serveTls` server advertises `Alt-Svc: h3=":<port>"`
+  (RFC 7838) on every response, naming an HTTP/3 endpoint on the same port number
+  over UDP. A `Client` remembers that advertisement and upgrades a later request to
+  the same authority to HTTP/3 automatically.
+
+The `Request`/`Response` types and the `(Request) => Response` handler are the
+same across all three transports; only the socket underneath changes. HTTP/3
+streams carry the `:method`/`:scheme`/`:authority`/`:path` and `:status`
+pseudo-headers as the `Request`/`Response` fields, the rest as the raw header
+block, and QPACK + QUIC framing are handled by the `std/http3` engine.
+
+The QUIC transport is one connection per UDP socket in this build, so `serveH3`
+serves one client connection's requests — run it on its own green thread, and pair
+it with a `serveTls` on the same port for discovery. The h3 client is one request
+per connection, like the rest of this module. (The QUIC layer does not yet verify
+server certificates, so the h3 client leg is unauthenticated — treat `https+h3://`
+and the Alt-Svc upgrade as experimental until QUIC certificate verification lands.)
+
+| API / URL | Transport | Protocol |
+|---|---|---|
+| `http://` — `get`/`request`/`listenAndServe` | cleartext TCP | HTTP/1.1 |
+| `https://` — `get`/`request`/`getTls` | TLS 1.3 + ALPN | HTTP/2 when the server picks `h2`, else HTTP/1.1 |
+| `serveTls` | TLS 1.3 + ALPN `["h2","http/1.1"]` | per client: HTTP/2 or HTTP/1.1; advertises h3 via Alt-Svc |
+| `https+h3://` — `get`/`request` | QUIC (UDP) | HTTP/3 |
+| `Client` — after an Alt-Svc upgrade | QUIC (UDP) | HTTP/3 |
+| `serveH3` | QUIC (UDP) | HTTP/3 |
+
+### `serveH3(host, port, certPem, keyPem, handler): ()!`
+
+Serves HTTP/3 over QUIC on `host:port` (UDP) with the certificate chain `certPem`
+and matching private key `keyPem` (both PEM), dispatching each request to the same
+`(Request) => Response` handler `serve`/`serveTls` use. Run it on its own green
+thread; pair it with a `serveTls` on the same port so `https://` clients discover
+it through the Alt-Svc header.
+
+```bit
+import { serveH3, serveTls, get, ok, respond, Request, Response } from "std/http"
+
+// One transport-agnostic handler serves HTTP/1.1, HTTP/2, and HTTP/3 alike.
+function route(req: Request): Response {
+  if (req.path == "/") {
+    return ok("hello over h1, h2, or h3")
+  }
+  return respond(404, "not found")
+}
+
+// serveH3 binds a UDP socket; pair it with serveTls on the same port number so
+// https:// clients can discover the h3 endpoint via the Alt-Svc header. Each is a
+// void function value the caller can `spawn` onto its own green thread.
+function serveH3Secure(certPem: string, keyPem: string) {
+  serveH3("127.0.0.1", 8443, certPem, keyPem, route) catch e {
+    print("h3 server failed: ${e.message()}\n")
+  }
+}
+
+function serveTlsSecure(certPem: string, keyPem: string) {
+  serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
+    print("tls server failed: ${e.message()}\n")
+  }
+}
+
+// A direct HTTP/3 fetch via the explicit, opt-in https+h3:// scheme.
+function fetchH3(url: string): int! {
+  let res = get(url)?
+  return res.status
+}
+```
+
+### `Client`
+
+An HTTP client that remembers the HTTP/3 endpoints servers advertise via Alt-Svc,
+so a later request to the same authority upgrades to HTTP/3. It carries its own TLS
+config and Alt-Svc cache — there is **no global state**: hold one `Client` across
+requests to reuse the cache.
+
+### `newClient(): Client`
+
+A `Client` with secure-by-default TLS (verification on, system/bundled roots, ALPN
+`h2` then `http/1.1`) and an empty Alt-Svc cache.
+
+### `newClientTls(config: TlsConfig): Client`
+
+A `Client` with an explicit `std/tls` config for its `https://` leg — pinned roots,
+a fixed `serverName`, or `insecureSkipVerify` — and an empty Alt-Svc cache.
+
+### `Client.request(method: string, url: string, body: string): Response!`
+
+Sends `method url` with an optional body. An `https+h3://` URL always uses HTTP/3;
+an `https://` URL upgrades to HTTP/3 when this client has cached an Alt-Svc endpoint
+for the authority (otherwise it runs over TLS and learns any Alt-Svc the response
+advertises); an `http://` URL runs over cleartext HTTP/1.1.
+
+### `Client.get(url: string): Response!`
+
+GETs `url` through this client (HTTP/3 when discovered, else TLS or cleartext).
+
+### `Client.post(url: string, body: string): Response!`
+
+POSTs `body` to `url` through this client.
+
+```bit
+import { newClient, newClientTls, Client, Response } from "std/http"
+import { newTlsConfig, newTrustStore } from "std/tls"
+
+// A client that auto-upgrades to HTTP/3 once a server advertises it via Alt-Svc.
+// Hold one across requests so its Alt-Svc cache persists (no global state).
+function browse(): Response! {
+  let c = newClient()
+  // First request runs over HTTPS (HTTP/2 or HTTP/1.1) and learns any Alt-Svc.
+  let first = c.get("https://example.com/")?
+  if (first.status != 200) {
+    return first
+  }
+  // A later request to the same authority upgrades to HTTP/3 automatically.
+  return c.get("https://example.com/")?
+}
+
+// A client pinned to a private CA for its https leg (a test or corporate root).
+function browsePinned(caPem: string): Response! {
+  let c = newClientTls(newTlsConfig(newTrustStore(caPem)?))
+  return fetchWith(c, "https://internal.example/")?
+}
+
+function fetchWith(c: Client, url: string): Response! {
+  return c.get(url)?
+}
+```

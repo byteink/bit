@@ -11,7 +11,7 @@
 // (`Connection: close`), no chunked transfer encoding, no redirects. Headers are
 // carried as a raw block and read with `header()` — case-insensitively, by name.
 
-import { listen, dial, Listener, Conn } from "std/net"
+import { listen, dial, udpBind, Listener, Conn } from "std/net"
 import { indexOf, hasPrefix, toLower } from "std/strings"
 import {
   dial as tlsDial, listen as tlsListen, TlsConn, TlsConfig,
@@ -23,6 +23,9 @@ import {
   Transport as H2Transport, newTransport as h2newTransport,
   Request as H2Request, Response as H2Response, HeaderField as H2HeaderField,
 } from "std/http2"
+import {
+  h3Dial, h3Accept, H3Conn, H3Request, H3Response, H3ServerRequest, HeaderField,
+} from "std/http3"
 
 // ---------------------------------------------------------------------------
 // Small parsing helpers
@@ -335,16 +338,21 @@ export function listenAndServe(host: string, port: int, handler: (Request) => Re
 }
 
 // Read one request off `s`, answer it with `handler`, and close. On the calling
-// green thread; a read or write failure just drops the connection.
-function serveOne(s: byteStream, handler: (Request) => Response) {
-  answer(s, handler) catch e {
+// green thread; a read or write failure just drops the connection. `altPort` is
+// advertised in the response's Alt-Svc header (0 to advertise nothing).
+function serveOne(s: byteStream, handler: (Request) => Response, altPort: int) {
+  answer(s, handler, altPort) catch e {
     return
   }
 }
 
-function answer(s: byteStream, handler: (Request) => Response): ()! {
+function answer(s: byteStream, handler: (Request) => Response, altPort: int): ()! {
   let req = readMessage(s)?
-  s.writeStr(serializeResponse(handler(req)))?
+  let res = handler(req)
+  if (altPort > 0) {
+    res.headers = res.headers + altSvcHeader(altPort)
+  }
+  s.writeStr(serializeResponse(res))?
   s.shut()
 }
 
@@ -353,7 +361,10 @@ function answer(s: byteStream, handler: (Request) => Response): ()! {
 // `handler` on its own green thread — the TLS mirror of `listenAndServe`. ALPN
 // offers `h2` then `http/1.1`, so a client that negotiates HTTP/2 is served over
 // the `std/http2` engine and any other over HTTP/1.1; `handler` is the same either
-// way. Returns only on a bind, accept, or handshake error.
+// way. Every response also carries an `Alt-Svc: h3=":<port>"` header (RFC 7838)
+// advertising an HTTP/3 endpoint on the same port number over UDP, so a client can
+// discover it and upgrade a later request — pair `serveTls` with `serveH3` on the
+// same `port`. Returns only on a bind, accept, or handshake error.
 export function serveTls(host: string, port: int, certPem: string, keyPem: string, handler: (Request) => Response): ()! {
   let cfg = newTlsConfig(emptyTrustStore())
   cfg.certPem = certPem
@@ -362,39 +373,54 @@ export function serveTls(host: string, port: int, certPem: string, keyPem: strin
   let l = tlsListen(host, port, cfg)?
   while (true) {
     let conn = l.accept()?
-    spawn serveTlsConn(conn, handler)
+    spawn serveTlsConn(conn, handler, port)
   }
+}
+
+// The Alt-Svc advertisement (RFC 7838) a TLS server appends to every response:
+// HTTP/3 is reachable at the same port number, over UDP.
+function altSvcHeader(port: int): string {
+  return "Alt-Svc: h3=\":${itoa(port)}\"\r\n"
 }
 
 // Dispatch one accepted TLS connection to the HTTP/2 or HTTP/1.1 server path by
 // its negotiated ALPN protocol. Runs on the spawned per-connection green thread.
-function serveTlsConn(conn: TlsConn, handler: (Request) => Response) {
+// `altPort` is the HTTP/3 port advertised in each response's Alt-Svc header.
+function serveTlsConn(conn: TlsConn, handler: (Request) => Response, altPort: int) {
   if (conn.alpnProtocol() == "h2") {
-    h2glueServe(conn, handler)
+    h2glueServe(conn, handler, altPort)
     return
   }
-  serveOne(tlsStream{ conn: conn }, handler)
+  serveOne(tlsStream{ conn: conn }, handler, altPort)
 }
 
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
-// A parsed http:// or https:// URL. Port defaults to 80 (http) or 443 (https),
-// path to "/". `https` selects the TLS transport.
+// A parsed http://, https:// or https+h3:// URL. Port defaults to 80 (http) or
+// 443 (https), path to "/". `https` selects the TLS transport; `h3` selects the
+// HTTP/3 (QUIC) transport — an opt-in `https+h3://` scheme, never inferred.
 struct Url {
   host: string
   port: int
   path: string
   https: bool
+  h3: bool
 }
 
 function parseUrl(url: string): Url! {
   let rest = url
   let https = false
+  let h3 = false
   let port = 80
   let lower = toLower(rest)
-  if (hasPrefix(lower, "https://")) {
+  if (hasPrefix(lower, "https+h3://")) {
+    https = true
+    h3 = true
+    port = 443
+    rest = rest[11:len(rest)]
+  } else if (hasPrefix(lower, "https://")) {
     https = true
     port = 443
     rest = rest[8:len(rest)]
@@ -423,7 +449,7 @@ function parseUrl(url: string): Url! {
   if (len(host) == 0) {
     fail newError("no host in ${url}")
   }
-  return Url{ host: host, port: port, path: path, https: https }
+  return Url{ host: host, port: port, path: path, https: https, h3: h3 }
 }
 
 // Parse a response off a fully-read connection: status line, headers, body.
@@ -508,6 +534,9 @@ function defaultClientConfig(): TlsConfig {
 // `insecureSkipVerify`), use `requestTls`.
 export function request(method: string, url: string, body: string): Response! {
   let u = parseUrl(url)?
+  if (u.h3) {
+    return h3Exchange(u, method, body)?
+  }
   if (u.https) {
     return httpsExchange(tlsDial(u.host, u.port, defaultClientConfig())?, method, u, body)?
   }
@@ -619,15 +648,26 @@ function h2clientExchange(conn: TlsConn, method: string, u: Url, body: string): 
 
 // Serve one h2-negotiated connection: run the http2 server engine and dispatch
 // each stream to the transport-agnostic `handler`, mapping the http2 request and
-// response to this module's types on the way in and out.
-function h2glueServe(conn: TlsConn, handler: (Request) => Response) {
+// response to this module's types on the way in and out. Each response advertises
+// the HTTP/3 endpoint on `altPort` via an Alt-Svc header.
+function h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int) {
   let hc = h2accept(h2glueTransport(conn), h2defaultConfig()) catch e {
     conn.close()
     return
   }
-  hc.serve((r) => h2glueResponseOut(handler(h2glueRequestIn(r)))) catch e2 {
+  hc.serve((r) => h2glueResponseOutAlt(handler(h2glueRequestIn(r)), altPort)) catch e2 {
     return
   }
+}
+
+// Map this module's `Response` to an http2 response, first appending the Alt-Svc
+// advertisement (when `altPort > 0`) so an HTTP/2 client learns the h3 endpoint.
+function h2glueResponseOutAlt(res: Response, altPort: int): H2Response {
+  let out = res
+  if (altPort > 0) {
+    out.headers = out.headers + altSvcHeader(altPort)
+  }
+  return h2glueResponseOut(out)
 }
 
 // The HTTP/2 `:authority`: the host, with the port appended only when it is not
@@ -722,4 +762,252 @@ function h2glueResponseOut(res: Response): H2Response {
   }
   fields = h2glueFields(fields, res.headers)
   return H2Response{ status: res.status, headers: fields, body: []byte(res.body) }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 over QUIC
+// ---------------------------------------------------------------------------
+//
+// HTTP/3 (RFC 9114) runs over QUIC (UDP), not TLS-over-TCP, so it is opt-in: a
+// server binds a UDP socket with `serveH3`, and a client reaches it either with an
+// explicit `https+h3://` URL or by upgrading after reading an `Alt-Svc` header a
+// TLS server advertised. The `std/http3` engine does the QUIC streams, QPACK, and
+// framing; this module maps between its `H3Request`/`H3Response` (pseudo-headers +
+// a `[]HeaderField` list) and the transport-agnostic `Request`/`Response`, exactly
+// as the `h2glue*` helpers do for HTTP/2. Every helper here is prefixed `h3glue`.
+//
+// The QUIC transport underneath is single-connection-per-socket, so `serveH3`
+// serves one QUIC connection's requests; run it on its own green thread. The h3
+// client is one request per connection, matching the rest of this module.
+
+// Connection-specific header fields forbidden on an HTTP/3 message (RFC 9114
+// §4.2), plus Content-Length (the framing supplies the body length).
+function h3glueHopByHop(name: string): bool {
+  return name == "connection" || name == "keep-alive" ||
+    name == "proxy-connection" || name == "transfer-encoding" ||
+    name == "upgrade" || name == "content-length"
+}
+
+// Serialize an h3 header-field list into this module's raw "Name: value\r\n" block.
+function h3glueBlock(fields: []HeaderField): string {
+  let block = ""
+  for f of fields {
+    block = block + "${f.name}: ${f.value}\r\n"
+  }
+  return block
+}
+
+// Parse a raw "Name: value\r\n" block into h3 header fields, lower-casing each name
+// (HTTP/3 requires it) and dropping connection-specific headers. Appends to `dst`.
+// Bounded: each turn consumes at least one line from `rest`.
+function h3glueFields(dst: []HeaderField, block: string): []HeaderField {
+  let out = dst
+  let rest = block
+  while (len(rest) > 0) {
+    let eol = indexOf(rest, "\r\n")
+    let line = rest
+    if (eol >= 0) {
+      line = rest[0:eol]
+      rest = rest[eol + 2:len(rest)]
+    } else {
+      rest = ""
+    }
+    let colon = indexOf(line, ":")
+    if (colon < 0) {
+      continue
+    }
+    let name = toLower(trimSpace(line[0:colon]))
+    if (len(name) == 0 || h3glueHopByHop(name)) {
+      continue
+    }
+    out = append(out, HeaderField{ name: name, value: trimSpace(line[colon + 1:len(line)]), sensitive: false })
+  }
+  return out
+}
+
+// Build an h3 request for `method u.path` with `body` over scheme https.
+function h3glueRequestOf(method: string, u: Url, body: string): H3Request {
+  return H3Request{
+    method: method,
+    scheme: "https",
+    authority: h2glueAuthority(u),
+    path: u.path,
+    headers: []HeaderField(0),
+    body: []byte(body),
+  }
+}
+
+// Map an h3 response to this module's `Response`: `:status` is the status, the
+// remaining fields become the raw header block, Content-Type is read from it.
+function h3glueResponse(res: H3Response): Response {
+  let block = h3glueBlock(res.headers)
+  return Response{ status: res.status, contentType: header(block, "content-type"), headers: block, body: string(res.body) }
+}
+
+// Map an h3 request to this module's `Request`, flattening the header fields.
+function h3glueRequestIn(req: H3Request): Request {
+  return Request{ method: req.method, path: req.path, headers: h3glueBlock(req.headers), body: string(req.body) }
+}
+
+// Map this module's `Response` to an h3 response: Content-Type becomes a header
+// field, the raw header block is parsed into fields, and the body carries over.
+function h3glueResponseOut(res: Response): H3Response {
+  let fields = []HeaderField(0)
+  if (len(res.contentType) > 0) {
+    fields = append(fields, HeaderField{ name: "content-type", value: res.contentType, sensitive: false })
+  }
+  fields = h3glueFields(fields, res.headers)
+  return H3Response{ status: res.status, headers: fields, body: []byte(res.body) }
+}
+
+// Run one request/response over HTTP/3: dial QUIC at `u.host:u.port`, send the
+// request on a fresh stream, read the response, and close the connection (one
+// request per connection, as elsewhere in this module).
+function h3Exchange(u: Url, method: string, body: string): Response! {
+  let conn = h3Dial(u.host, u.port, u.host)?
+  let res = conn.request(h3glueRequestOf(method, u, body)) catch e {
+    conn.close()
+    fail e
+  }
+  conn.close()
+  return h3glueResponse(res)
+}
+
+// Serve one accepted HTTP/3 connection: accept each request, dispatch it through
+// the transport-agnostic `handler`, and answer on the same stream. Bounded so the
+// loop is provably finite; returns (closing the connection) when the peer stops.
+function serveH3Conn(conn: H3Conn, handler: (Request) => Response) {
+  let guard = 0
+  while (guard < 1048576) {
+    guard = guard + 1
+    let sr = conn.accept() catch e {
+      conn.close()
+      return
+    }
+    conn.respond(sr, h3glueResponseOut(handler(h3glueRequestIn(sr.req)))) catch e2 {
+      conn.close()
+      return
+    }
+  }
+  conn.close()
+}
+
+// Serve HTTP/3 on `host:port` (UDP) with the certificate chain `certPem` and
+// matching private key `keyPem` (both PEM), dispatching every request to the same
+// `(Request) => Response` handler `serve`/`serveTls` use. Run it on its own green
+// thread — the QUIC transport is one connection per socket, so this serves a single
+// client connection's requests. Advertise it from a `serveTls` server on the same
+// port (its Alt-Svc header) so `https://` clients can discover and upgrade to it.
+export function serveH3(host: string, port: int, certPem: string, keyPem: string, handler: (Request) => Response): ()! {
+  let sock = udpBind(host, port)?
+  let conn = h3Accept(sock, certPem, keyPem)?
+  serveH3Conn(conn, handler)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 client with Alt-Svc discovery
+// ---------------------------------------------------------------------------
+//
+// A `Client` holds the two pieces of state a self-upgrading client needs, so no
+// module-global mutable state is required: the TLS config for its `https://` leg,
+// and an Alt-Svc cache mapping an authority (`host:port`) to the HTTP/3 UDP port a
+// server advertised. The cache is a `map` (a reference type), so a method updates
+// the same table the caller's `Client` holds. Hold one `Client` across requests to
+// let a later request to a known authority upgrade to HTTP/3 automatically.
+
+// The h3 port advertised for the `h3=` alternative in an Alt-Svc header value
+// (RFC 7838), or -1 if there is none. Accepts `h3=":443"` and `h3="host:443"` —
+// the port is the digits after the last colon inside the quoted authority.
+function parseAltSvcH3Port(av: string): int {
+  let at = indexOf(av, "h3=")
+  if (at < 0) {
+    return 0 - 1
+  }
+  let rest = av[at + 3:len(av)]
+  if (len(rest) > 0 && rest[0] == '"') {
+    rest = rest[1:len(rest)]
+  }
+  let q = indexOf(rest, "\"")
+  let val = rest
+  if (q >= 0) {
+    val = rest[0:q]
+  }
+  let colon = 0 - 1
+  let i = 0
+  while (i < len(val)) {
+    if (val[i] == ':') {
+      colon = i
+    }
+    i = i + 1
+  }
+  if (colon < 0) {
+    return 0 - 1
+  }
+  return atoi(val[colon + 1:len(val)])
+}
+
+// An HTTP client that remembers the HTTP/3 endpoints servers advertise via
+// Alt-Svc, so a later request to the same authority upgrades to HTTP/3. It has no
+// global state: hold one across requests to reuse its cache.
+export struct Client {
+  tls: TlsConfig
+  h3Ports: map<string, int>
+}
+
+// A `Client` with secure-by-default TLS (verification on, system/bundled roots,
+// ALPN `h2` then `http/1.1`) and an empty Alt-Svc cache.
+export function newClient(): Client {
+  return Client{ tls: defaultClientConfig(), h3Ports: map<string, int>() }
+}
+
+// A `Client` with an explicit `std/tls` config for its `https://` leg (pinned
+// roots, a fixed `serverName`, `insecureSkipVerify`) and an empty Alt-Svc cache.
+export function newClientTls(config: TlsConfig): Client {
+  return Client{ tls: config, h3Ports: map<string, int>() }
+}
+
+// Record any `h3=` Alt-Svc advertisement `res` carried for `authority`.
+function (c: Client) learnAltSvc(authority: string, res: Response) {
+  let av = header(res.headers, "alt-svc")
+  if (len(av) == 0) {
+    return
+  }
+  let p = parseAltSvcH3Port(av)
+  if (p > 0) {
+    c.h3Ports[authority] = p
+  }
+}
+
+// Send `method url` with an optional body. An `https+h3://` URL always uses
+// HTTP/3. An `https://` URL upgrades to HTTP/3 when this client has cached an
+// Alt-Svc endpoint for the authority from an earlier response; otherwise it runs
+// over TLS (HTTP/2 or HTTP/1.1 by ALPN) and learns any Alt-Svc the response
+// advertises. An `http://` URL runs over cleartext HTTP/1.1.
+export function (c: Client) request(method: string, url: string, body: string): Response! {
+  let u = parseUrl(url)?
+  if (u.h3) {
+    return h3Exchange(u, method, body)?
+  }
+  if (!u.https) {
+    return request(method, url, body)?
+  }
+  let key = h2glueAuthority(u)
+  let cached = c.h3Ports[key]
+  if (cached != 0) {
+    let hu = Url{ host: u.host, port: cached, path: u.path, https: true, h3: true }
+    return h3Exchange(hu, method, body)?
+  }
+  let res = requestTls(method, url, body, c.tls)?
+  c.learnAltSvc(key, res)
+  return res
+}
+
+// GET `url` through this client (HTTP/3 when discovered, else TLS or cleartext).
+export function (c: Client) get(url: string): Response! {
+  return c.request("GET", url, "")?
+}
+
+// POST `body` to `url` through this client.
+export function (c: Client) post(url: string, body: string): Response! {
+  return c.request("POST", url, body)?
 }
