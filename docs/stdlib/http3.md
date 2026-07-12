@@ -256,3 +256,130 @@ The number of live entries in the decoder's dynamic table.
 ### `Decoder.capacity(): int`
 
 The current dynamic-table capacity in bytes.
+
+## HTTP/3 core
+
+The request/response layer (RFC 9114), built on the QPACK compressor above and the
+`std/quic` transport. It maps HTTP semantics onto QUIC streams: each peer opens a
+**control** stream and the two **QPACK** streams (encoder and decoder) and sends
+SETTINGS first; a **request** is one client-initiated bidirectional stream carrying
+a HEADERS frame (a QPACK field section of the `:method` / `:scheme` / `:authority`
+/ `:path` pseudo-headers plus regular headers) and DATA frame(s) for the body; a
+**response** is symmetric, with a `:status` pseudo-header. Frames are length-
+prefixed (a type varint, a length varint, then the payload), so unknown and
+reserved (grease) types are skipped rather than rejected.
+
+Because `std/quic` exposes only bidirectional streams, an HTTP/3 unidirectional
+stream is modeled as a bidi stream the opener only writes to; the peer tells a uni
+stream from a request stream by the stream-type byte a uni stream sends first. This
+core runs a **zero-capacity** QPACK dynamic table, so every field line is literal
+or a static-table reference, no field section ever blocks, and the QPACK streams
+carry only their type byte — while the encoder/decoder stream plumbing stays wired
+for a future nonzero capacity.
+
+A client dials, then issues requests, each a single call that returns the response:
+
+```bit
+import { h3Dial, H3Request, H3Response, HeaderField } from "std/http3"
+
+// Dial an HTTP/3 server and GET "/". h3Dial completes the QUIC handshake and opens
+// the control + QPACK streams; `request` sends a HEADERS frame (QPACK-encoded
+// pseudo-headers) then reads the response HEADERS + DATA off the same stream.
+function getIndex(): H3Response! {
+  let conn = h3Dial("127.0.0.1", 443, "example.com")?
+  let req = H3Request{
+    method: "GET",
+    scheme: "https",
+    authority: "example.com",
+    path: "/",
+    headers: []HeaderField(0),
+    body: []byte(0),
+  }
+  return conn.request(req)?
+}
+```
+
+A server accepts a connection on a bound UDP socket, reads the next request, and
+answers it on the same stream:
+
+```bit
+import { h3Accept, H3Response, HeaderField } from "std/http3"
+import { udpBind } from "std/net"
+
+// Accept one HTTP/3 connection, read a request, and reply 200 with a short body.
+// `accept` skips the peer's control and QPACK streams and returns the first
+// request; `respond` writes the response HEADERS + DATA back on that stream.
+function serve(certChainPem: string, keyPem: string): ()! {
+  let sock = udpBind("127.0.0.1", 8443)?
+  let conn = h3Accept(sock, certChainPem, keyPem)?
+  let sr = conn.accept()?
+  let resp = H3Response{
+    status: 200,
+    headers: []HeaderField(0),
+    body: []byte("ok"),
+  }
+  conn.respond(sr, resp)?
+  conn.close()
+}
+```
+
+### `H3Request`
+
+An HTTP/3 request. `method`, `scheme`, `authority`, and `path` become the four
+pseudo-headers; `headers` are the regular (lower-case) header fields; `body` is the
+entity carried in DATA frames. All six fields are exported.
+
+### `H3Response`
+
+An HTTP/3 response. `status` is the `:status` pseudo-header as an integer; `headers`
+are the regular header fields; `body` is the DATA payload. All three fields are
+exported.
+
+### `H3Conn`
+
+An established HTTP/3 connection over one QUIC connection. It owns the per-
+connection QPACK `Encoder`/`Decoder` and the local control and QPACK unidirectional
+streams. Issue every request and response through the one `H3Conn` so the QPACK
+tables track the peer.
+
+### `H3ServerRequest`
+
+A received request paired with the stream it arrived on. The exported `req` is the
+decoded `H3Request`; `respond` answers on the stream it carries.
+
+### `h3Dial(host: string, port: int, serverName: string): H3Conn!`
+
+Dial an HTTP/3 server at `host:port` (validating its certificate for `serverName`),
+complete the QUIC handshake, and set up the control and QPACK streams. The returned
+`H3Conn` is ready for `request`. Fails if the connection or handshake fails.
+
+### `h3Accept(sock: UdpSocket, certChainPem: string, keyPem: string): H3Conn!`
+
+Accept one HTTP/3 connection on the bound UDP socket `sock`, using the PEM
+certificate chain and private key for the QUIC-TLS handshake, and set up the
+control and QPACK streams. The returned `H3Conn` is ready for `accept`. Fails if the
+handshake fails.
+
+### `H3Conn.request(req: H3Request): H3Response!`
+
+Send `req` and read the response. Opens a client-initiated bidirectional stream,
+writes a HEADERS frame then a DATA frame for the body if any, finishes the send
+half, and reads the response back off the same stream. Fails on a transport or
+decode error.
+
+### `H3Conn.accept(): H3ServerRequest!`
+
+Accept the next request, blocking until one opens. Peer control and QPACK streams
+are consumed into the QPACK state and skipped; the first stream that is a request
+stream is read to completion and decoded. Fails on a transport or decode error.
+
+### `H3Conn.respond(sr: H3ServerRequest, resp: H3Response): ()!`
+
+Answer the request in `sr` with `resp` on its stream: a HEADERS frame carrying the
+`:status` field section, then a DATA frame for the body if any, then FIN. Fails on a
+transport error.
+
+### `H3Conn.close()`
+
+Close the connection: send a GOAWAY on the control stream (best effort), then tear
+down the underlying QUIC connection and its socket.
