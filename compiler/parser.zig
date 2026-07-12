@@ -173,6 +173,16 @@ const Parser = struct {
         try self.diags.report(.expected_token, self.tok.span, msg, null);
     }
 
+    /// A guarded loop hit its element cap: the construct holds more elements
+    /// than the parser admits (`max_*` bounds, §Power-of-10 rule 2). Report it
+    /// rather than asserting — large or adversarial input (2^14 case clauses,
+    /// 2^16 statements) must never crash the compiler (fuzz #334).
+    fn tooMany(self: *Parser, what: []const u8) ParseError!void {
+        var buf: [80]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "too many {s}", .{what}) catch what;
+        try self.diags.report(.expected_token, self.tok.span, msg, null);
+    }
+
     /// Builds a leaf node from the current token's span and consumes it.
     fn leaf(self: *Parser, tag: ast.Tag) ParseError!Index {
         const tok_span = self.tok.span;
@@ -264,7 +274,7 @@ const Parser = struct {
                 self.synchronizeTopLevel();
             }
         }
-        std.debug.assert(guard < max_top_decls);
+        if (guard >= max_top_decls) try self.tooMany("top-level declarations");
         return self.tree.add(.program, .{ .file = self.tok.span.file, .start = 0, .end = self.tok.span.end }, 0, decls.items);
     }
 
@@ -704,7 +714,7 @@ const Parser = struct {
                 self.synchronizeStatement();
             }
         }
-        std.debug.assert(guard < max_block_stmts);
+        if (guard >= max_block_stmts) try self.tooMany("statements in a block");
         const end = try self.expect(.r_brace, "'}'");
         return self.tree.add(.block, join(start, end), 0, stmts.items);
     }
@@ -917,10 +927,14 @@ const Parser = struct {
                 try cases.append(self.gpa, try self.tree.add(.switch_default, dstart, 0, &.{slist}));
             } else {
                 try self.fail("'case' or 'default'");
+                // synchronizeStatement stops at a statement keyword without
+                // consuming it; in a clause body that would spin this loop, so
+                // step past the offending token first to guarantee progress.
+                try self.advance();
                 self.synchronizeStatement();
             }
         }
-        std.debug.assert(guard < max_case_clauses);
+        if (guard >= max_case_clauses) try self.tooMany("case clauses");
         const end = try self.expect(.r_brace, "'}'");
         const clist = try self.tree.add(.case_list, join(start, end), 0, cases.items);
         return self.tree.add(.switch_stmt, join(start, end), 0, &.{ subject, clist });
@@ -971,7 +985,7 @@ const Parser = struct {
                 self.synchronizeStatement();
             }
         }
-        std.debug.assert(guard < max_case_clauses);
+        if (guard >= max_case_clauses) try self.tooMany("match arms");
         const end = try self.expect(.r_brace, "'}'");
         const arm_list = try self.tree.add(.arm_list, join(start, end), 0, arms.items);
         return self.tree.add(.match_stmt, join(start, end), 0, &.{ subject, arm_list });
@@ -1035,10 +1049,13 @@ const Parser = struct {
                 try clauses.append(self.gpa, try self.tree.add(.comm_default, dstart, 0, &.{slist}));
             } else {
                 try self.fail("'case' or 'default'");
+                // Guarantee progress (see parseSwitchStmt): synchronizeStatement
+                // does not consume a leading statement keyword.
+                try self.advance();
                 self.synchronizeStatement();
             }
         }
-        std.debug.assert(guard < max_case_clauses);
+        if (guard >= max_case_clauses) try self.tooMany("select clauses");
         const end = try self.expect(.r_brace, "'}'");
         return self.tree.add(.select_stmt, join(start, end), 0, clauses.items);
     }
@@ -1282,7 +1299,7 @@ const Parser = struct {
                 else => break,
             }
         }
-        std.debug.assert(guard < max_postfix_ops);
+        if (guard >= max_postfix_ops) try self.tooMany("postfix operators");
         return expr;
     }
 
