@@ -16,7 +16,19 @@ fn wireLibbitrt(opts: *std.Build.Step.Options, bin: ?std.Build.LazyPath) void {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseSafe, not Debug. In Debug, std's DebugAllocator captures
+    // a DWARF stack trace on every allocation for leak detection; the compiler
+    // allocates heavily, so a plain `zig build` compiler spent ~38s on the crypto
+    // tree almost entirely in stack unwinding. ReleaseSafe keeps every safety
+    // check (bounds, overflow, unreachable) but drops the per-alloc capture,
+    // cutting that same compile to <1s. Pass `-Doptimize=Debug` for leak checks.
+    // (standardOptimizeOption's preferred_optimize_mode only rebinds -Drelease and
+    // still defaults to Debug, so bind -Doptimize directly with a ReleaseSafe default.)
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
+    ) orelse .ReleaseSafe;
 
     const exe = b.addExecutable(.{
         .name = "bitc",
