@@ -62,7 +62,9 @@ function gcmLoadBlock(data: []byte, off: int): []u64 {
 }
 
 // Bit `i` of the field element `y` in GCM's bit order: bit 0 is the most
-// significant bit of word 0, bit 127 the least significant bit of word 1.
+// significant bit of word 0, bit 127 the least significant bit of word 1. Used by
+// the two-word GF helpers that back AES-GCM-SIV's POLYVAL (aesgcmsiv.bit); the
+// AES-GCM hot path uses the allocation-free `gcmMulHWords` below.
 function gcmBitAt(y: []u64, i: int): u64 {
   if (i < 64) {
     return (y[0] >> u64(63 - i)) & 1
@@ -70,14 +72,9 @@ function gcmBitAt(y: []u64, i: int): u64 {
   return (y[1] >> u64(127 - i)) & 1
 }
 
-// Multiply the 128-bit big-endian value `v` by the field generator x: shift the
-// whole block right by one bit and, when a 1 fell off the low end, fold in the
-// reduction constant. In place. Branchless: the fold is masked, not conditional.
+// Multiply the 128-bit big-endian value `v` by the field generator x, in place:
+// shift right one bit and fold the reduction constant when a 1 fell off. Branchless.
 function gcmShiftReduce(v: []u64) {
-  // R = 11100001 ‖ 0^120: 0xe1 in the top byte of word 0. Held as a local literal
-  // rather than a top-level `const`, because a top-level `const` of a sized
-  // integer type currently miscompiles when used in a bitwise/arithmetic op (its
-  // IR value carries the default `int` type, tripping the operand-type check).
   let r: u64 = 0xe100000000000000
   let lsb = v[1] & 1
   v[1] = (v[1] >> 1) | (v[0] << 63)
@@ -86,10 +83,8 @@ function gcmShiftReduce(v: []u64) {
   v[0] = v[0] ^ (r & rmask)
 }
 
-// The GF(2^128) product x · y under GCM's reversed polynomial. Runs the full 128
-// bit-iterations every call, accumulating a masked copy of the running V wherever
-// a bit of y is set — no branch on, or memory index by, any operand bit — so the
-// timing is data-independent. Returns a fresh two-word element.
+// The GF(2^128) product x · y under GCM's reversed polynomial, as a fresh two-word
+// element. Full 128 branchless bit-iterations, data-independent timing.
 function gcmGfMul(x: []u64, y: []u64): []u64 {
   let z = []u64(2)
   let v = []u64(2)
@@ -106,8 +101,8 @@ function gcmGfMul(x: []u64, y: []u64): []u64 {
   return z
 }
 
-// Absorb one block into the GHASH accumulator: acc = (acc XOR block) · H. Mutates
-// `acc` in place; `block` and `h` are read-only two-word elements.
+// Absorb one two-word block into an accumulator: acc = (acc XOR block) · H. Mutates
+// `acc`. Backs AES-GCM-SIV; the GCM hot path uses `gcmMulHWords`.
 function gcmMulH(acc: []u64, block: []u64, h: []u64) {
   acc[0] = acc[0] ^ block[0]
   acc[1] = acc[1] ^ block[1]
@@ -116,13 +111,52 @@ function gcmMulH(acc: []u64, block: []u64, h: []u64) {
   acc[1] = p[1]
 }
 
+// Absorb one block `(b0,b1)` into the GHASH accumulator: acc = (acc XOR block) · H,
+// where H = `(h0,h1)`. The GF(2^128) product under GCM's reversed polynomial runs
+// the full 128 bit-iterations every call, accumulating a masked copy of the
+// running V wherever a bit of H is set — no branch on, or memory index by, any
+// operand bit, so the timing is data-independent (the `i < 64` split is on the
+// public loop counter). Operates entirely on `u64` locals — no per-block heap
+// allocation, the previous two-word-array formulation's dominant cost — and
+// writes the result back into the caller's two-word `acc`.
+function gcmMulHWords(acc: []u64, b0: u64, b1: u64, h0: u64, h1: u64) {
+  // R = 11100001 ‖ 0^120: 0xe1 in the top byte of word 0, the fold applied when a
+  // 1 falls off the low end of V during the ×x shift.
+  let r: u64 = 0xe100000000000000
+  let v0 = acc[0] ^ b0
+  let v1 = acc[1] ^ b1
+  let z0: u64 = 0
+  let z1: u64 = 0
+  let i = 0
+  while (i < 128) {
+    let bit: u64 = 0
+    if (i < 64) {
+      bit = (h0 >> u64(63 - i)) & 1
+    } else {
+      bit = (h1 >> u64(127 - i)) & 1
+    }
+    let mask = u64(0) - bit
+    z0 = z0 ^ (v0 & mask)
+    z1 = z1 ^ (v1 & mask)
+    // V *= x: shift the 128-bit V right one bit, fold R when a 1 fell off.
+    let lsb = v1 & 1
+    v1 = (v1 >> 1) | (v0 << 63)
+    v0 = v0 >> 1
+    let rmask = u64(0) - lsb
+    v0 = v0 ^ (r & rmask)
+    i = i + 1
+  }
+  acc[0] = z0
+  acc[1] = z1
+}
+
 // Fold every 16-byte block of `data` (zero-padded final block) into `acc` under
-// subkey `h`. Mutates `acc`.
-function gcmAbsorb(acc: []u64, h: []u64, data: []byte) {
+// subkey `(h0,h1)`. Mutates `acc`. Words are loaded straight into `u64` locals, so
+// no per-block block element is allocated.
+function gcmAbsorb(acc: []u64, h0: u64, h1: u64, data: []byte) {
   let off = 0
   while (off < len(data)) {
-    let blk = gcmLoadBlock(data, off)
-    gcmMulH(acc, blk, h)
+    gcmMulHWords(acc, gcmLoadWord(data, off), gcmLoadWord(data, off + 8), h0, h1)
     off = off + 16
   }
 }
@@ -132,12 +166,11 @@ function gcmAbsorb(acc: []u64, h: []u64, data: []byte) {
 // two-word element. This is GCM's authenticator input before the J0 mask.
 function gcmGhash(h: []u64, aad: []byte, ct: []byte): []u64 {
   let acc = []u64(2)
-  gcmAbsorb(acc, h, aad)
-  gcmAbsorb(acc, h, ct)
-  let lenBlk = []u64(2)
-  lenBlk[0] = u64(len(aad)) * 8
-  lenBlk[1] = u64(len(ct)) * 8
-  gcmMulH(acc, lenBlk, h)
+  let h0 = h[0]
+  let h1 = h[1]
+  gcmAbsorb(acc, h0, h1, aad)
+  gcmAbsorb(acc, h0, h1, ct)
+  gcmMulHWords(acc, u64(len(aad)) * 8, u64(len(ct)) * 8, h0, h1)
   return acc
 }
 
@@ -186,9 +219,10 @@ function gcmCopyBlock(src: []byte): []byte {
 function gcmGctr(cipher: AesCipher, icb: []byte, data: []byte): []byte {
   let out = []byte(len(data))
   let counter = gcmCopyBlock(icb)
+  let ks = []byte(16)
   let off = 0
   while (off < len(data)) {
-    let ks = cipher.encryptBlock(counter)
+    cipher.encryptBlockInto(ks, counter)
     let n = len(data) - off
     if (n > 16) {
       n = 16

@@ -756,6 +756,13 @@ Enciphers one 16-byte `block`, returning a fresh 16-byte ciphertext block.
 `block` must be exactly 16 bytes. This is the bare block permutation with no
 chaining — use a mode of operation for multi-block messages.
 
+### `AesCipher.encryptBlockInto(dst: []byte, block: []byte)`
+
+Enciphers `block` into the caller-owned 16-byte `dst`, in place — identical to
+`encryptBlock` but reusing `dst` so a hot loop (e.g. GCTR keystream) enciphers
+many blocks with no per-block allocation. Both `dst` and `block` must be exactly
+16 bytes and must not alias.
+
 ### `AesCipher.decryptBlock(block: []byte): []byte`
 
 Deciphers one 16-byte `block`, returning a fresh 16-byte plaintext block — the
