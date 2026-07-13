@@ -161,6 +161,11 @@ const GcHeader = struct {
 const gc_align = @alignOf(GcHeader);
 const header_size = @sizeOf(GcHeader);
 
+/// Allocator for the address→object index — runtime bookkeeping that lives
+/// outside the managed heap, so it never appears as a GC object. Mirrors how
+/// `chan.zig`/`sched.zig` take their fixed structures straight from the OS.
+const index_alloc = std.heap.page_allocator;
+
 comptime {
     // Body must be pointer-aligned: base is `gc_align`-aligned and the body sits
     // exactly `header_size` past it, so `header_size` must be a multiple of the
@@ -182,6 +187,18 @@ pub const Gc = struct {
     all: ?*GcHeader = null,
     /// Number of live (allocated, not yet swept) objects.
     num_objects: usize = 0,
+
+    /// Address→object membership index: the set of every live object's body
+    /// base. `owns` (the mark hot path) is a single hash probe against this
+    /// instead of an O(objects) list walk, so tracing a large live graph is
+    /// O(n) rather than O(n²). Maintained under `list_lock` on alloc and during
+    /// world-stopped sweep on free — the same points that mutate `all`, so it
+    /// stays exactly in step with the object list.
+    addr_index: std.AutoHashMapUnmanaged(usize, void) = .{},
+    /// Cleared to false if the index ever fails to grow (OOM): `owns` then falls
+    /// back to `ownsLinear` permanently. Correctness never depends on the index —
+    /// it is a pure speed structure over the authoritative all-objects list.
+    index_ok: bool = true,
 
     /// Fixed-capacity mark worklist and its top-of-stack index.
     stack: []*GcHeader,
@@ -220,6 +237,11 @@ pub const Gc = struct {
     /// Free every remaining object and the mark worklist. The collector is
     /// unusable afterwards.
     pub fn deinit(self: *Gc) void {
+        // Drop the whole index up front and disable it, so the per-object
+        // `freeObject` removals below become no-ops instead of O(n) probes.
+        self.addr_index.deinit(index_alloc);
+        self.addr_index = .{};
+        self.index_ok = false;
         var o = self.all;
         while (o) |h| { // bounded: at most `num_objects` links
             const next = h.next;
@@ -262,6 +284,19 @@ pub const Gc = struct {
         self.num_objects += 1;
         self.stats.total_allocated += 1;
         self.noteBody(body_addr);
+        self.indexInsert(body_addr);
+    }
+
+    /// Record `body_addr` in the membership index. On OOM the index is dropped
+    /// and disabled: `owns` reverts to the exact `ownsLinear` scan, so a failure
+    /// costs speed, never correctness.
+    fn indexInsert(self: *Gc, body_addr: usize) void {
+        if (!self.index_ok) return;
+        self.addr_index.put(index_alloc, body_addr, {}) catch {
+            self.index_ok = false;
+            self.addr_index.deinit(index_alloc);
+            self.addr_index = .{};
+        };
     }
 
     /// Like `alloc`, but for objects whose body size is not fixed by their
@@ -342,11 +377,6 @@ pub const Gc = struct {
     /// `ptr - header` as a bogus `GcHeader` and corrupt or crash. The O(1)
     /// address-bounds gate rejects the common foreign pointer; `owns` is the
     /// exact backstop.
-    ///
-    /// ponytail: `owns` is an O(objects) list scan, so tracing a large *live*
-    /// graph is O(n^2). Fine for v1's small heaps and the correctness goldens;
-    /// the upgrade when it bites (a stress workload, #350) is an address->object
-    /// index (hash set of live body pointers) making this O(1).
     pub fn markRoot(self: *Gc, ref: ?[*]u8) void {
         const p = ref orelse return;
         const word = @intFromPtr(p);
@@ -358,10 +388,18 @@ pub const Gc = struct {
     /// foreign pointers return false — the contract requires references to point
     /// at an object base, and this is how that is checked.
     ///
-    /// ponytail: linear scan of the all-objects list, O(n). A debug/validation
-    /// aid, not on the mark hot path (precise roots already give base pointers).
-    /// Add an address->object index if this ever needs to run hot.
+    /// A single hash probe against `addr_index` on the mark hot path, so tracing
+    /// stays O(n) in the live graph. Falls back to the exact list scan only if
+    /// the index was disabled by an earlier OOM.
     pub fn owns(self: *const Gc, ptr: [*]u8) bool {
+        if (self.index_ok) return self.addr_index.contains(@intFromPtr(ptr));
+        return self.ownsLinear(ptr);
+    }
+
+    /// The authoritative O(objects) membership scan the index mirrors. Used as
+    /// the fallback when the index is unavailable, and as the oracle the index is
+    /// tested against.
+    pub fn ownsLinear(self: *const Gc, ptr: [*]u8) bool {
         const target = @intFromPtr(ptr);
         var o = self.all;
         while (o) |h| : (o = h.next) { // bounded: at most `num_objects` links
@@ -457,6 +495,7 @@ pub const Gc = struct {
     }
 
     fn freeObject(self: *Gc, h: *GcHeader) void {
+        if (self.index_ok) _ = self.addr_index.remove(@intFromPtr(bodyFromHeader(h)));
         const raw: [*]u8 = @ptrCast(h);
         self.heap.free(raw, h.size, gc_align);
     }
@@ -590,6 +629,37 @@ test "contract: interior and foreign pointers are not owned" {
 
     const foreign: [*]u8 = @ptrFromInt(0x1000);
     try testing.expect(!gc.owns(foreign));
+}
+
+test "address index agrees with the linear oracle across alloc, free, and reuse" {
+    var heap = Heap.init();
+    var gc = try Gc.init(&heap, .{ .enabled = false });
+    defer gc.deinit();
+
+    // Allocate a batch; the fast index and the O(n) oracle must agree on every
+    // base pointer, and both must reject interior/foreign words.
+    var objs: [64][*]u8 = undefined;
+    for (&objs) |*o| o.* = gc.alloc(&node_info).?;
+    for (objs) |o| {
+        try testing.expect(gc.owns(o));
+        try testing.expectEqual(gc.ownsLinear(o), gc.owns(o));
+        try testing.expect(!gc.owns(o + 8)); // interior
+    }
+    try testing.expect(!gc.owns(@ptrFromInt(0x1000))); // foreign
+
+    // Free half via a collection rooted at the even entries; the freed odd ones
+    // must drop out of the index in lockstep with the list.
+    var roots: [32][*]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) roots[i] = objs[i * 2];
+    var rs = RootArray{ .roots = &roots };
+    gc.collect(rs.scanner());
+
+    for (objs, 0..) |o, idx| {
+        const expected = idx % 2 == 0; // even survived, odd swept
+        try testing.expectEqual(expected, gc.owns(o));
+        try testing.expectEqual(gc.ownsLinear(o), gc.owns(o));
+    }
 }
 
 test "mark overflow recovery: wide graph fully retained with a tiny worklist" {
