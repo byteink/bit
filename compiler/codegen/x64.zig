@@ -634,6 +634,16 @@ const Ctx = struct {
         try self.memModRM(@intFromEnum(dst), base, index, scale, disp);
     }
 
+    /// `lea dst, [base + disp]` (`REX.W 8D /r`) — computes an address without
+    /// dereferencing. Used to form the interior pointer of an inline aggregate
+    /// field (a fixed-size array `[N]T` field lives inline in its struct body).
+    fn lea(self: *Ctx, dst: Reg, base: Reg, disp: i32) !void {
+        const bits = regBits(@intFromEnum(dst), base, null);
+        try self.maybeRex(true, bits.r, bits.x, bits.b);
+        try self.emitByte(0x8D);
+        try self.memModRM(@intFromEnum(dst), base, null, 1, disp);
+    }
+
     /// Stores the low `width` bytes of `src` to `[base + index*scale + disp]`.
     fn movStore(self: *Ctx, base: Reg, index: ?Reg, scale: u8, disp: i32, src: Reg, width: u8) !void {
         const bits = regBits(@intFromEnum(src), base, index);
@@ -1452,6 +1462,13 @@ fn emitConstFloat(self: *Ctx, dst: u32, val: f64, width: u8) !void {
 /// instruction's result type), which picks load width/signedness/class.
 fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId) !void {
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
+    // A fixed-size array field is inline storage: its value is the interior
+    // address `base + offset`, formed with `lea`, not a loaded word.
+    if (self.tctx().typeOf(ty) == .array) {
+        try self.lea(scratch1, base_reg, @intCast(offset));
+        try putInt(self, dst, scratch1);
+        return;
+    }
     const w = widthOf(self.tctx(), ty);
     switch (w.class) {
         .int => {

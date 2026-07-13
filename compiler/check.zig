@@ -1117,6 +1117,20 @@ const Checker = struct {
         return self.checkType(file_idx, node, env);
     }
 
+    /// Whether `ty` is a scalar value type: an integer, `bool`, or float
+    /// (`string` is a prim but a reference type, so it is excluded). Used to
+    /// gate fixed-size array element types — a scalar array holds no GC
+    /// references. An unbound generic parameter is treated permissively (true)
+    /// so a generic template body still type-checks; a concrete reference-typed
+    /// instantiation is caught where the array type is spelled with that type.
+    fn isScalarValueType(self: *const Checker, ty: TypeId) bool {
+        return switch (self.ctx.typeOf(ty)) {
+            .prim => |p| p != .string,
+            .type_param => true,
+            else => false,
+        };
+    }
+
     /// Evaluates any type-position AST node to its `TypeId` (§11's grammar).
     fn checkType(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv) Error!TypeId {
         if (node == ast.none) return self.ctx.void_id;
@@ -1135,6 +1149,15 @@ const Checker = struct {
                 const len_i128 = parseIntLiteral(size_text);
                 const len: u64 = if (len_i128 < 0) 0 else @intCast(len_i128);
                 const elem = try self.checkType(file_idx, k[1], env);
+                // A fixed-size array `[N]T` is a value type with inline storage
+                // (SPEC §11.2). Only scalar value-typed elements are supported for
+                // now: a scalar array box holds no GC references, so it needs no
+                // element tracing. A reference-typed element (string/slice/map/
+                // struct/…) would need per-element GC tracing that is not yet
+                // implemented — reject it rather than silently miscompile.
+                if (elem != .invalid and !self.isScalarValueType(elem)) {
+                    try self.emit(mf, k[1], .invalid_array_element, "fixed-size arrays of reference-typed elements are not yet supported; the element type must be a scalar value type (integer, bool, or float)", .{}, null);
+                }
                 return self.ctx.types.intern(.{ .array = .{ .len = len, .elem = elem } });
             },
             .map_type => {

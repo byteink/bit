@@ -1312,8 +1312,15 @@ fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
 }
 
 fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId) !void {
-    const w = common.widthOf(self.tctx(), ty);
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
+    // A fixed-size array field is inline storage: its value is the interior
+    // address `base + offset` (an ADD-immediate), not a loaded word.
+    if (self.tctx().typeOf(ty) == .array) {
+        try self.addSubImmWide(false, @intFromEnum(scratch1), @intFromEnum(base_reg), offset);
+        try putInt(self, dst, scratch1);
+        return;
+    }
+    const w = common.widthOf(self.tctx(), ty);
     switch (w.class) {
         .int => {
             try self.loadImm(scratch1, @intFromEnum(base_reg), offset, w.bytes, w.signed);
