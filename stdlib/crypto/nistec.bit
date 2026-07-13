@@ -24,7 +24,7 @@
 //
 // Constant-time scope. The ladder is constant-time *by construction* at the
 // algorithm level. The underlying field arithmetic, however, is the variable-
-// width `Nat` code (schoolbook multiply, Knuth division inside `bigintModNZ`),
+// width `Nat` code (schoolbook multiply, then Solinas special-prime reduction),
 // whose running time still depends on operand limb counts. Machine-level
 // constant-time field arithmetic needs the fixed-width Montgomery reduction that
 // the bigint module documents as a later optimization; until then this module,
@@ -154,32 +154,206 @@ export function nistecP384(): Curve {
 // Field arithmetic modulo p
 // ---------------------------------------------------------------------------
 //
-// Every field element is kept reduced in `[0, p)`. `bigintModNZ` is the non-
-// fallible reducer (`p` is a fixed non-zero prime), so these helpers never fail.
+// Every field element is kept reduced in `[0, p)`. Multiplication reduces with
+// Solinas (special-prime) reduction — word recombination driven by the sparse
+// shape of each NIST prime — instead of Knuth long division, which allocated ~10
+// heap objects per field multiply. Add and subtract of already-reduced operands
+// finish with a single conditional subtraction of `p`. Only an unrecognized curve
+// width falls back to the generic `bigintModNZ` divider.
 
-// `(a + b) mod p`.
-function nistecFeAdd(c: Curve, a: Nat, b: Nat): Nat {
-  return bigintModNZ(bigintAdd(a, b), c.p)
+// Whether the little-endian word slice `a` is `>= p`, where `p` is `L` words. `a`
+// carries up to `L + 2` words after reduction (its value is a small multiple of
+// `p`), so any non-zero word above index `L - 1` already proves `a >= p`.
+function nistecWordGE(a: []u32, p: []u32, L: int): bool {
+  let i = len(a) - 1
+  while (i >= L) {
+    if (a[i] != 0) {
+      return true
+    }
+    i = i - 1
+  }
+  i = L - 1
+  while (i >= 0) {
+    if (a[i] != p[i]) {
+      return a[i] > p[i]
+    }
+    i = i - 1
+  }
+  return true
 }
 
-// `(a - b) mod p`. For reduced `a, b` the value `a + p - b` lies in `(0, 2p)`, so
-// the unsigned subtraction never underflows and one reduction finishes the job;
-// the `catch` is unreachable.
+// Subtract the `L`-word prime `p` (zero-extended to `len(a)`) from the little-
+// endian `a` in place. The caller has established `a >= p`, so the running borrow
+// always cancels by the top word.
+function nistecWordSubP(a: []u32, p: []u32, L: int) {
+  let borrow: u64 = 0
+  let i = 0
+  while (i < len(a)) {
+    let pv: u64 = 0
+    if (i < L) {
+      pv = u64(p[i])
+    }
+    let d = u64(a[i]) + 0x100000000 - pv - borrow
+    a[i] = u32(d & 0xffffffff)
+    borrow = 1 - (d >> 32)
+    i = i + 1
+  }
+}
+
+// Finish a Solinas reduction. `col` holds the signed per-word coefficients of a
+// value congruent to the product, with every word at index `>= L` already folded
+// to zero. Bias by `k*p` so the value is non-negative, carry-propagate it into
+// words, then subtract `p` at most `bound` times to land in `[0, p)`. `k` and
+// `bound` are sized per curve from the worst-case column magnitudes, so both loops
+// are statically bounded and exactly one result `Nat` is built. `int` is i64 in
+// two's complement with an arithmetic `>>`, so the signed carry chain is exact.
+function nistecSolinasFinish(col: []int, p: []u32, L: int, k: int, bound: int): Nat {
+  let j = 0
+  while (j < L) {
+    col[j] = col[j] + k * int(p[j])
+    j = j + 1
+  }
+  let W = L + 2
+  let out = []u32(W)
+  let carry = 0
+  j = 0
+  while (j < W) {
+    let s = col[j] + carry
+    out[j] = u32(s & 0xffffffff)
+    carry = s >> 32
+    j = j + 1
+  }
+  let n = 0
+  while (n < bound && nistecWordGE(out, p, L)) {
+    nistecWordSubP(out, p, L)
+    n = n + 1
+  }
+  return bigintMake(out)
+}
+
+// Load the little-endian product `prod` (<= `2L` words) into a signed `2L`-word
+// column array; absent high words are zero.
+function nistecLoadCols(prod: []u32, L: int): []int {
+  let col = []int(2 * L)
+  let n = len(prod)
+  let i = 0
+  while (i < 2 * L) {
+    if (i < n) {
+      col[i] = int(prod[i])
+    }
+    i = i + 1
+  }
+  return col
+}
+
+// `prod mod p256` by Solinas reduction. Because `p256 = 2^256 - 2^224 + 2^192 +
+// 2^96 - 1`, in 32-bit words (`t = 2^32`) the reduction relation is
+// `t^8 == t^7 - t^6 - t^3 + 1 (mod p)`. Folding each word at index `>= 8` down by
+// that relation — top-down, so a fold's own deposits into still-higher columns are
+// folded in turn — clears every high word into signed columns 0..7. `k = 5` covers
+// the negative terms (which sum to `< 4p`); the result reduces in at most a handful
+// of subtractions (bound 16, worst case 10).
+function nistecReduceP256(prod: []u32): Nat {
+  let col = nistecLoadCols(prod, 8)
+  let i = 15
+  while (i >= 8) {
+    let x = col[i]
+    col[i] = 0
+    let base = i - 8
+    col[base] = col[base] + x
+    col[base + 3] = col[base + 3] - x
+    col[base + 6] = col[base + 6] - x
+    col[base + 7] = col[base + 7] + x
+    i = i - 1
+  }
+  return nistecSolinasFinish(col, nistecP256Prime(), 8, 5, 16)
+}
+
+// `prod mod p384` by Solinas reduction. Because `p384 = 2^384 - 2^128 - 2^96 +
+// 2^32 - 1`, with `t = 2^32` the relation is `t^12 == t^4 + t^3 - t + 1 (mod p)`.
+// The same top-down fold clears words at index `>= 12` into signed columns 0..11.
+// `k = 2` covers the negative terms (`< p`); the result reduces in at most a few
+// subtractions (bound 16, worst case 6).
+function nistecReduceP384(prod: []u32): Nat {
+  let col = nistecLoadCols(prod, 12)
+  let i = 23
+  while (i >= 12) {
+    let x = col[i]
+    col[i] = 0
+    let base = i - 12
+    col[base] = col[base] + x
+    col[base + 1] = col[base + 1] - x
+    col[base + 3] = col[base + 3] + x
+    col[base + 4] = col[base + 4] + x
+    i = i - 1
+  }
+  return nistecSolinasFinish(col, nistecP384Prime(), 12, 2, 16)
+}
+
+// The P-256 prime as exactly 8 little-endian words. The divider-free reducers need
+// `p` in fixed-width word form; the KATs cross-check it against the curve's `p`.
+function nistecP256Prime(): []u32 {
+  return []u32{
+    0xffffffff, 0xffffffff, 0xffffffff, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001, 0xffffffff,
+  }
+}
+
+// The P-384 prime as exactly 12 little-endian words.
+function nistecP384Prime(): []u32 {
+  return []u32{
+    0xffffffff, 0x00000000, 0x00000000, 0xffffffff,
+    0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff,
+    0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+  }
+}
+
+// Reduce a product to `[0, p)` for curve `c`: Solinas reduction for the two NIST
+// primes (selected by field-byte width), else the generic divider.
+function nistecFeReduce(c: Curve, prod: Nat): Nat {
+  if (c.size == 32) {
+    return nistecReduceP256(prod.limbs)
+  }
+  if (c.size == 48) {
+    return nistecReduceP384(prod.limbs)
+  }
+  return bigintModNZ(prod, c.p)
+}
+
+// `(a + b) mod p`. Reduced operands give `a + b < 2p`, so a single conditional
+// subtraction of `p` reduces the sum; the `catch` is unreachable (`s >= p`).
+function nistecFeAdd(c: Curve, a: Nat, b: Nat): Nat {
+  let s = bigintAdd(a, b)
+  if (bigintCmp(s, c.p) >= 0) {
+    return bigintSub(s, c.p) catch e {
+      return bigintZero()
+    }
+  }
+  return s
+}
+
+// `(a - b) mod p`. For reduced `a, b`: when `a >= b` the difference is already in
+// `[0, p)`; otherwise `a + p - b` lies in `(0, p)`. No division; the `catch`es are
+// unreachable.
 function nistecFeSub(c: Curve, a: Nat, b: Nat): Nat {
-  let t = bigintSub(bigintAdd(a, c.p), b) catch e {
+  if (bigintCmp(a, b) >= 0) {
+    return bigintSub(a, b) catch e {
+      return bigintZero()
+    }
+  }
+  return bigintSub(bigintAdd(a, c.p), b) catch e {
     return bigintZero()
   }
-  return bigintModNZ(t, c.p)
 }
 
 // `(a * b) mod p`.
 function nistecFeMul(c: Curve, a: Nat, b: Nat): Nat {
-  return bigintModNZ(bigintMul(a, b), c.p)
+  return nistecFeReduce(c, bigintMul(a, b))
 }
 
 // `(a * a) mod p`.
 function nistecFeSqr(c: Curve, a: Nat): Nat {
-  return bigintModNZ(bigintSqr(a), c.p)
+  return nistecFeReduce(c, bigintSqr(a))
 }
 
 // `a^(-1) mod p` by Fermat's little theorem `a^(p-2)`. `bigintModExp` takes the
