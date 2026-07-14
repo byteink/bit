@@ -286,6 +286,87 @@ function quicconnFrameStreamId(f: Frame): int {
   }
 }
 
+// The send-side byte range `f` carries, as `[lo, hi]` inclusive, or `lo > hi`
+// when it carries no stream bytes. Paired with `quicconnFrameStreamId` to record
+// what a newly-acknowledged packet actually delivered.
+function quicconnFrameStreamLo(f: Frame): int {
+  match (f) {
+    Padding(n) => { return 0 }
+    Ping => { return 0 }
+    Ack(a) => { return 0 }
+    ResetStream(id, code, size) => { return 0 }
+    StopSending(id, code) => { return 0 }
+    Crypto(offset, data) => { return 0 }
+    NewToken(token) => { return 0 }
+    Stream(s) => { return int(s.offset) }
+    MaxData(m) => { return 0 }
+    MaxStreamData(id, m) => { return 0 }
+    MaxStreams(bidi, m) => { return 0 }
+    DataBlocked(m) => { return 0 }
+    StreamDataBlocked(id, m) => { return 0 }
+    StreamsBlocked(bidi, m) => { return 0 }
+    NewConnectionId(seq, retire, cid, token) => { return 0 }
+    RetireConnectionId(seq) => { return 0 }
+    PathChallenge(d) => { return 0 }
+    PathResponse(d) => { return 0 }
+    ConnectionClose(code, ft, reason) => { return 0 }
+    ApplicationClose(code, reason) => { return 0 }
+    HandshakeDone => { return 0 }
+  }
+}
+
+function quicconnFrameStreamLen(f: Frame): int {
+  match (f) {
+    Padding(n) => { return -1 }
+    Ping => { return -1 }
+    Ack(a) => { return -1 }
+    ResetStream(id, code, size) => { return -1 }
+    StopSending(id, code) => { return -1 }
+    Crypto(offset, data) => { return -1 }
+    NewToken(token) => { return -1 }
+    Stream(s) => { return len(s.data) }
+    MaxData(m) => { return -1 }
+    MaxStreamData(id, m) => { return -1 }
+    MaxStreams(bidi, m) => { return -1 }
+    DataBlocked(m) => { return -1 }
+    StreamDataBlocked(id, m) => { return -1 }
+    StreamsBlocked(bidi, m) => { return -1 }
+    NewConnectionId(seq, retire, cid, token) => { return -1 }
+    RetireConnectionId(seq) => { return -1 }
+    PathChallenge(d) => { return -1 }
+    PathResponse(d) => { return -1 }
+    ConnectionClose(code, ft, reason) => { return -1 }
+    ApplicationClose(code, reason) => { return -1 }
+    HandshakeDone => { return -1 }
+  }
+}
+
+function quicconnFrameStreamFin(f: Frame): bool {
+  match (f) {
+    Padding(n) => { return false }
+    Ping => { return false }
+    Ack(a) => { return false }
+    ResetStream(id, code, size) => { return false }
+    StopSending(id, code) => { return false }
+    Crypto(offset, data) => { return false }
+    NewToken(token) => { return false }
+    Stream(s) => { return s.fin }
+    MaxData(m) => { return false }
+    MaxStreamData(id, m) => { return false }
+    MaxStreams(bidi, m) => { return false }
+    DataBlocked(m) => { return false }
+    StreamDataBlocked(id, m) => { return false }
+    StreamsBlocked(bidi, m) => { return false }
+    NewConnectionId(seq, retire, cid, token) => { return false }
+    RetireConnectionId(seq) => { return false }
+    PathChallenge(d) => { return false }
+    PathResponse(d) => { return false }
+    ConnectionClose(code, ft, reason) => { return false }
+    ApplicationClose(code, reason) => { return false }
+    HandshakeDone => { return false }
+  }
+}
+
 // Whether `f` is a CRYPTO frame — used to decide whether a client Initial packet
 // must be padded to the 1200-byte floor.
 function quicconnIsCrypto(f: Frame): bool {
@@ -542,6 +623,14 @@ struct quicconnStream {
   sendLen: int,
   finQueued: bool,
   finSent: bool,
+  /// Send-side byte ranges the peer has acknowledged, and whether the FIN was
+  /// acknowledged. Delivery is tracked per *byte*, not per packet: when a packet
+  /// is lost its bytes are retransmitted in a new one, so "no packet of mine is
+  /// outstanding" is strictly stronger than "every byte reached the peer" — and
+  /// once the peer closes, the stronger condition can never be met even though
+  /// the data did arrive (RFC 9000 §3.3 drains on data, not on packets).
+  ackedRanges: []quicconnRange,
+  finAcked: bool,
   peerMaxStreamData: int,
   blockedSignaled: bool,
   delivered: bool,
@@ -565,6 +654,8 @@ function quicconnNewStream(st: quicconnState, id: int, isPeer: bool): quicconnSt
     sendLen: 0,
     finQueued: false,
     finSent: false,
+    ackedRanges: []quicconnRange(0),
+    finAcked: false,
     peerMaxStreamData: st.peerInitStreamData,
     blockedSignaled: false,
     delivered: false,
@@ -844,6 +935,7 @@ function quicconnLoop(st: quicconnState) {
         }
     }
   }
+  quicconnReleaseWaiters(st)
   // Signal loop exit so a server listener can reap this connection's demux
   // entries. Non-blocking: nothing reads `doneCh` on the dial path.
   select {
@@ -851,6 +943,51 @@ function quicconnLoop(st: quicconnState) {
       {}
     default:
       {}
+  }
+}
+
+// Fail one command whose reply nobody will ever produce, so its caller unparks.
+// Both reply channels are buffered (capacity 1, created per call), so neither
+// send can block. `Write`/`Close` carry no reply.
+function quicconnFailCmd(c: quicconnCmd) {
+  if (c.kind == quicconnCmdOpen || c.kind == quicconnCmdAccept) {
+    c.replyOpen <- quicconnOpenReply{ id: -1, recvCh: chan<StreamChunk>(1) }
+  }
+  if (c.kind == quicconnCmdFinish) {
+    c.replyInt <- -1
+  }
+}
+
+// Release every application green thread parked on this connection, once the
+// loop has stopped. The loop is the sole producer for all of these, so once it
+// exits nothing else ever will: without this, a peer close (or any error) mid
+// `read`/`finish`/`acceptStream` parks the caller forever. Runs exactly once,
+// after the loop, so the `close` calls here cannot race a send or double-close.
+function quicconnReleaseWaiters(st: quicconnState) {
+  // Commands still queued in the buffered channel: their senders are parked on
+  // a reply channel the loop will never read.
+  let draining = true
+  let guard = 0
+  while (draining && guard < 100000) {
+    guard = guard + 1
+    select {
+      case c = <- st.cmdCh:
+        quicconnFailCmd(c)
+      default:
+        draining = false
+    }
+  }
+  for (id, s) of st.streams {
+    if (s.hasDrain) {
+      s.hasDrain = false
+      s.drainCh <- -1 // unblocks `finish`, which reports the failure
+    }
+    // A blocked `read` drains whatever is still buffered, then sees the close.
+    close(s.recvCh)
+  }
+  if (st.hasAcceptWaiter) {
+    st.hasAcceptWaiter = false
+    st.acceptWaiter <- quicconnOpenReply{ id: -1, recvCh: chan<StreamChunk>(1) }
   }
 }
 
@@ -1006,6 +1143,14 @@ function quicconnDoFinish(st: quicconnState, cmd: quicconnCmd): ()! {
 
 function quicconnDoClose(st: quicconnState, cmd: quicconnCmd): ()! {
   if (st.established && !st.closeSent) {
+    // Re-arm the ACK so the closing packet carries one (RFC 9000 §10.2 permits
+    // other frames alongside CONNECTION_CLOSE, and `quicconnFlushApp` emits the
+    // ACK ahead of the pending close). After this we stop responding entirely,
+    // so a peer still waiting on an ACK whose earlier datagram was lost would
+    // otherwise never learn its data arrived — and, blocked in `finish`, would
+    // wait forever. Bundling makes delivery of the close also confirm delivery
+    // of everything we received.
+    st.aLevel.ackPending = true
     st.aLevel.pending = append(st.aLevel.pending, Frame.ApplicationClose(0, []byte(0)))
     st.closeSent = true
     quicconnFlush(st)?
@@ -1726,6 +1871,7 @@ function quicconnProcessAck(st: quicconnState, levelIdx: int, a: AckFrame) {
       if (sp.ackEliciting) {
         st.bytesInFlight = st.bytesInFlight - sp.size
       }
+      quicconnNoteAckedFrames(st, sp)
       quicconnOnPacketAcked(st, sp)
       ackedAny = true
       if (sp.pn == largest && sp.ackEliciting) {
@@ -1917,7 +2063,7 @@ function quicconnSendProbe(st: quicconnState) {
 function quicconnCheckDelivered(st: quicconnState) {
   for (id, s) of st.streams {
     if (s.hasDrain && !s.delivered) {
-      if (s.finSent && s.sendOff == s.sendLen && !quicconnStreamOutstanding(st, id)) {
+      if (s.finSent && s.sendOff == s.sendLen && quicconnStreamFullyAcked(s)) {
         s.delivered = true
         s.hasDrain = false
         s.drainCh <- 1
@@ -1927,21 +2073,44 @@ function quicconnCheckDelivered(st: quicconnState) {
 }
 
 // Whether any STREAM data for `id` is still in flight or queued for (re)send.
-function quicconnStreamOutstanding(st: quicconnState, id: int): bool {
-  for sp of st.aLevel.sent {
-    for f of sp.frames {
-      if (quicconnFrameStreamId(f) == id) {
-        return true
+// Record what a newly-acknowledged packet actually delivered: the send-side byte
+// ranges of its STREAM frames, and the FIN if it carried one.
+function quicconnNoteAckedFrames(st: quicconnState, sp: quicconnSent) {
+  for f of sp.frames {
+    let id = quicconnFrameStreamId(f)
+    if (id >= 0 && st.present[id] != 0) {
+      let s = st.streams[id]
+      let n = quicconnFrameStreamLen(f)
+      if (n > 0) {
+        let lo = quicconnFrameStreamLo(f)
+        s.ackedRanges = quicconnMergeRanges(append(s.ackedRanges, quicconnRange{ lo: lo, hi: lo + n - 1 }))
+      }
+      if (quicconnFrameStreamFin(f)) {
+        s.finAcked = true
       }
     }
   }
-  for f of st.aLevel.pending {
-    if (quicconnFrameStreamId(f) == id) {
+}
+
+// Whether every byte the application queued on `s` has been acknowledged. Bytes,
+// not packets: a lost packet's bytes are retransmitted in a new one, so an
+// already-delivered byte must not keep the stream "undrained" just because the
+// packet that first carried it was never acked.
+function quicconnStreamFullyAcked(s: quicconnStream): bool {
+  if (!s.finAcked) {
+    return false
+  }
+  if (s.sendLen == 0) {
+    return true
+  }
+  for r of s.ackedRanges {
+    if (r.lo <= 0 && r.hi >= s.sendLen - 1) {
       return true
     }
   }
   return false
 }
+
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -2238,14 +2407,21 @@ export function (c: Conn) openStream(): Stream! {
   let reply = chan<quicconnOpenReply>(1)
   c.cmdCh <- quicconnCmd{ kind: quicconnCmdOpen, id: 0, data: []byte(0), replyOpen: reply, replyInt: chan<int>(1) }
   let r = <- reply
+  if (r.id < 0) {
+    fail newError("quic: connection closed")
+  }
   return Stream{ streamId: r.id, cmdCh: c.cmdCh, recvCh: r.recvCh }
 }
 
 // Accept the next peer-initiated bidirectional stream, blocking until one opens.
+// Fails if the connection ends first.
 export function (c: Conn) acceptStream(): Stream! {
   let reply = chan<quicconnOpenReply>(1)
   c.cmdCh <- quicconnCmd{ kind: quicconnCmdAccept, id: 0, data: []byte(0), replyOpen: reply, replyInt: chan<int>(1) }
   let r = <- reply
+  if (r.id < 0) {
+    fail newError("quic: connection closed")
+  }
   return Stream{ streamId: r.id, cmdCh: c.cmdCh, recvCh: r.recvCh }
 }
 
@@ -2262,18 +2438,28 @@ export function (s: Stream) write(data: []byte): ()! {
 }
 
 // Mark the send half finished (FIN) and block until every queued byte has been
-// acknowledged by the peer.
+// acknowledged by the peer. Fails if the connection ends before the stream
+// drains — the data may or may not have arrived, so the caller must not assume
+// delivery.
 export function (s: Stream) finish(): ()! {
   let done = chan<int>(1)
   s.cmdCh <- quicconnCmd{ kind: quicconnCmdFinish, id: s.streamId, data: []byte(0), replyOpen: chan<quicconnOpenReply>(1), replyInt: done }
-  <- done
+  let r = <- done
+  if (r < 0) {
+    fail newError("quic: connection closed before the stream drained")
+  }
 }
 
 // Read the next reassembled inbound chunk, blocking until data or the FIN
 // arrives. The final chunk carries `fin = true`; read until then to consume the
-// whole stream.
+// whole stream. Fails once the connection has ended and every chunk already
+// received has been drained.
 export function (s: Stream) read(): StreamChunk! {
-  return <- s.recvCh
+  let (c, ok) = <- s.recvCh
+  if (!ok) {
+    fail newError("quic: connection closed")
+  }
+  return c
 }
 
 // The stream's id (RFC 9000 §2.1).
