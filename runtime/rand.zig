@@ -110,7 +110,7 @@ fn fillWindows(buf: []u8) Error!void {
 /// which forbids that. Backs `cryptoSecureZero`, for wiping key material.
 pub fn secureZero(bytes: []u8) void {
     @memset(bytes, 0);
-    asm volatile ("" : : : .{ .memory = true });
+    asm volatile ("" ::: .{ .memory = true });
 }
 
 // ---------------------------------------------------------------------------

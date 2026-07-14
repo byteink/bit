@@ -29,11 +29,11 @@ const page_align = std.heap.page_size_min;
 /// no larger than `max_small`) is itself a class, so a satisfying slot always
 /// exists. Requests above the last class are direct-mapped from the OS.
 const class_sizes = [_]usize{
-    8,     16,    32,    48,    64,    80,    96,    112,
-    128,   160,   192,   224,   256,   320,   384,   448,
-    512,   640,   768,   896,   1024,  1280,  1536,  1792,
-    2048,  2560,  3072,  3584,  4096,  5120,  6144,  7168,
-    8192,  10240, 12288, 14336, 16384,
+    8,    16,    32,    48,    64,    80,   96,   112,
+    128,  160,   192,   224,   256,   320,  384,  448,
+    512,  640,   768,   896,   1024,  1280, 1536, 1792,
+    2048, 2560,  3072,  3584,  4096,  5120, 6144, 7168,
+    8192, 10240, 12288, 14336, 16384,
 };
 const num_classes = class_sizes.len;
 const max_small = class_sizes[num_classes - 1];

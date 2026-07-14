@@ -289,6 +289,22 @@ pub fn build(b: *std.Build) void {
     examples_run.has_side_effects = true;
     test_step.dependOn(&examples_run.step);
 
+    // Format gate for the Zig sources. A formatter nothing enforces is a
+    // suggestion: six files had already drifted before this landed. `--check`
+    // (never a rewrite) is the point — a gate that reformatted its own checkout
+    // would report success and enforce nothing.
+    //
+    // The Bit sources are NOT gated yet. `bit fmt` and the committed .bit tree
+    // disagree on 73 of 122 files, and the disagreements are formatter bugs, not
+    // drift (it explodes hand-grouped constant tables to one element per line,
+    // and mangles a body whose single statement is a multi-line `match`).
+    // Gating that would enshrine bad output. See the tracking task.
+    const fmt_check = b.addFmt(.{
+        .paths = &.{ "build.zig", "compiler", "runtime", "tests" },
+        .check = true,
+    });
+    test_step.dependOn(&fmt_check.step);
+
     // Concurrency + GC stress suite (task #350): compiles + runs each
     // tests/stress/* program twice — default policy and BIT_GC=stress (collect
     // every safepoint) — and diffs stdout against its `.expected`. The

@@ -166,30 +166,31 @@ pub const Module = struct {
 // ============================================================================
 
 const predeclared_types = [_][]const u8{
-    "i8",  "i16", "i32",  "i64",
-    "u8",  "u16", "u32",  "u64",
-    "f32", "f64", "int",  "uint",
-    "byte", "rune", "bool", "string", "error",
+    "i8",    "i16",  "i32",  "i64",
+    "u8",    "u16",  "u32",  "u64",
+    "f32",   "f64",  "int",  "uint",
+    "byte",  "rune", "bool", "string",
+    "error",
 };
 const predeclared_funcs = [_][]const u8{
-    "len",    "cap",       "append",  "delete",  "close", "panic", "assert", "print",
+    "len",               "cap",              "append",     "delete",      "close",            "panic",            "assert",     "print",
     // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
     // readFile layer wraps these in std/fs.
-    "fsOpen", "fsReadAll", "fsWrite", "fsClose",
-    "fsAppend", "fsRead", "fsExists", "fsIsDir", "fsMkdir", "fsRemove", "fsListDir",
+    "fsOpen",            "fsReadAll",        "fsWrite",    "fsClose",     "fsAppend",         "fsRead",           "fsExists",   "fsIsDir",
+    "fsMkdir",           "fsRemove",         "fsListDir",
     // Non-blocking TCP primitives (ABI.md §20); std/net wraps these. Any of them
     // may park the calling green thread on the netpoller. `fsClose` closes a
     // socket too, so there is no `netClose`.
-    "netListen", "netLocalPort", "netAccept", "netDial", "netRead", "netWrite",
-    "netUdpBind", "netUdpSend", "netUdpRecv", "netUdpSenderHost", "netUdpSenderPort",
-    "netResolve",
+     "netListen",   "netLocalPort",     "netAccept",        "netDial",    "netRead",
+    "netWrite",          "netUdpBind",       "netUdpSend", "netUdpRecv",  "netUdpSenderHost", "netUdpSenderPort", "netResolve",
     // Float primitives (ABI.md §17); std/math re-exports them under plain names.
-    "fsqrt",   "ffloor",     "fceil",   "fround",  "ftrunc",
-    "fpow",    "fatan2",     "flog",    "flog2",   "flog10",
+    "fsqrt",
+    "ffloor",            "fceil",            "fround",     "ftrunc",      "fpow",             "fatan2",           "flog",       "flog2",
+    "flog10",
     // Clock + green-thread sleep (ABI.md §18); std/time wraps these.
-    "timeMonoNs", "timeUnixNs", "timeSleepNs",
+               "timeMonoNs",       "timeUnixNs", "timeSleepNs",
     // Process environment (ABI.md §19); std/os wraps these.
-    "osArgc", "osArgAt", "osEnv", "osExit",
+    "osArgc",           "osArgAt",          "osEnv",      "osExit",
     // Crypto boundary primitives (ABI.md §21); std/crypto wraps these.
     "cryptoRandomBytes", "cryptoSecureZero",
 };

@@ -473,8 +473,7 @@ fn safepointEntry() callconv(.naked) void {
             :
             : [fr] "{rax}" (&g_safepoint_frame),
               [impl] "{rcx}" (&safepointImpl),
-            : .{ .r8 = true, .memory = true }
-        ),
+            : .{ .r8 = true, .memory = true }),
         // x19..x28 -> regs[n] at 16+8n = 168..240. x30 (link register) is the
         // caller's return address; x29 the caller's frame pointer. Operands are
         // pinned to caller-saved x0/x1. x30 is preserved across the call by the
@@ -494,8 +493,7 @@ fn safepointEntry() callconv(.naked) void {
             :
             : [fr] "{x0}" (&g_safepoint_frame),
               [impl] "{x1}" (&safepointImpl),
-            : .{ .memory = true }
-        ),
+            : .{ .memory = true }),
         else => unreachable, // gated by the comptime arch check at file top
     }
 }

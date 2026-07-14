@@ -4670,7 +4670,6 @@ fn editDistance(a: []const u8, b: []const u8) usize {
     return prev[b.len];
 }
 
-
 // ============================================================================
 // Literal decoding (§5.4–§5.6) — bounded, trusts the lexer already validated
 // digit/escape shape; used for untyped-constant representability (§15.4).
@@ -4951,8 +4950,6 @@ test "collectDecls builds a struct's field types" {
     try testing.expectEqual(ctx.prim_ids.get(.f64), shape.@"struct"[0].ty);
 }
 
-
-
 test "constEval folds literals, unary, binary, and const references" {
     const gpa = testing.allocator;
     var sm = diagnostics.SourceManager.init(gpa);
@@ -4974,8 +4971,14 @@ test "constEval folds literals, unary, binary, and const references" {
     var ctx = try TypeContext.init(gpa);
     defer ctx.deinit();
     var checker = Checker{
-        .gpa = gpa, .diags = &diags, .ctx = &ctx, .files = &files, .module = &module,
-        .module_id = @enumFromInt(0), .all_modules = &.{}, .node_types = try gpa.alloc([]TypeId, 1),
+        .gpa = gpa,
+        .diags = &diags,
+        .ctx = &ctx,
+        .files = &files,
+        .module = &module,
+        .module_id = @enumFromInt(0),
+        .all_modules = &.{},
+        .node_types = try gpa.alloc([]TypeId, 1),
     };
     checker.node_types[0] = try gpa.alloc(TypeId, mf.tree.nodes.len);
     @memset(checker.node_types[0], .invalid);

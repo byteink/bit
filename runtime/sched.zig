@@ -101,32 +101,55 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
             \\0:
             : [received_message] "={x1}" (-> *const Switch),
             : [message_to_send] "{x1}" (s),
-            // `x30` is deliberately NOT clobbered: the switch saves and restores
-            // it (offset 24 in `Context`), so it is genuinely preserved across
-            // the switch — declaring it clobbered instead is what previously
-            // let LLVM stash a live `Worker*` there and lose it on resume.
-            //
-            // `x18` MUST be clobbered, and this is Linux-specific. AArch64 calls
-            // it the platform register: Darwin reserves it (so LLVM never
-            // allocates it and the omission was harmless there), but Linux
-            // leaves it general-purpose, so LLVM will keep a live value in it
-            // across this asm unless told the block destroys it. The switch does
-            // not save/restore x18, and a task can park on one worker and resume
-            // on another whose x18 differs — a stale value then faults on the
-            // first `str [x18, …]` after resume. Clobbering it (it is otherwise
-            // call-clobbered on Linux) forces a reload, exactly like x0–x17.
+              // `x30` is deliberately NOT clobbered: the switch saves and restores
+              // it (offset 24 in `Context`), so it is genuinely preserved across
+              // the switch — declaring it clobbered instead is what previously
+              // let LLVM stash a live `Worker*` there and lose it on resume.
+              //
+              // `x18` MUST be clobbered, and this is Linux-specific. AArch64 calls
+              // it the platform register: Darwin reserves it (so LLVM never
+              // allocates it and the omission was harmless there), but Linux
+              // leaves it general-purpose, so LLVM will keep a live value in it
+              // across this asm unless told the block destroys it. The switch does
+              // not save/restore x18, and a task can park on one worker and resume
+              // on another whose x18 differs — a stale value then faults on the
+              // first `str [x18, …]` after resume. Clobbering it (it is otherwise
+              // call-clobbered on Linux) forces a reload, exactly like x0–x17.
             : .{
-                .x0 = true,  .x2 = true,  .x3 = true,  .x4 = true,  .x5 = true,
-                .x6 = true,  .x7 = true,  .x8 = true,  .x9 = true,  .x10 = true,
-                .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                // Only clobber x18 where it is general-purpose. On Darwin it is
-                // a reserved platform register — listing it there is an LLVM
-                // "reserved register in clobber list" warning (and unnecessary,
-                // since LLVM never allocates it), so gate on the OS.
-                .x16 = true, .x17 = true, .x18 = builtin.os.tag == .linux,
-                .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-                .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-                .x29 = true, .memory = true,
+              .x0 = true,
+              .x2 = true,
+              .x3 = true,
+              .x4 = true,
+              .x5 = true,
+              .x6 = true,
+              .x7 = true,
+              .x8 = true,
+              .x9 = true,
+              .x10 = true,
+              .x11 = true,
+              .x12 = true,
+              .x13 = true,
+              .x14 = true,
+              .x15 = true,
+              // Only clobber x18 where it is general-purpose. On Darwin it is
+              // a reserved platform register — listing it there is an LLVM
+              // "reserved register in clobber list" warning (and unnecessary,
+              // since LLVM never allocates it), so gate on the OS.
+              .x16 = true,
+              .x17 = true,
+              .x18 = builtin.os.tag == .linux,
+              .x19 = true,
+              .x20 = true,
+              .x21 = true,
+              .x22 = true,
+              .x23 = true,
+              .x24 = true,
+              .x25 = true,
+              .x26 = true,
+              .x27 = true,
+              .x28 = true,
+              .x29 = true,
+              .memory = true,
             }),
         .x86_64 => asm volatile (
             \\ movq 0(%%rsi), %%rax
@@ -142,9 +165,21 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
             : [received_message] "={rsi}" (-> *const Switch),
             : [message_to_send] "{rsi}" (s),
             : .{
-                .rax = true, .rcx = true, .rdx = true, .rbx = true, .rdi = true,
-                .r8 = true,  .r9 = true,  .r10 = true, .r11 = true, .r12 = true,
-                .r13 = true, .r14 = true, .r15 = true, .rbp = true, .memory = true,
+              .rax = true,
+              .rcx = true,
+              .rdx = true,
+              .rbx = true,
+              .rdi = true,
+              .r8 = true,
+              .r9 = true,
+              .r10 = true,
+              .r11 = true,
+              .r12 = true,
+              .r13 = true,
+              .r14 = true,
+              .r15 = true,
+              .rbp = true,
+              .memory = true,
             }),
         else => unreachable,
     };

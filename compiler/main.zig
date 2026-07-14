@@ -15,7 +15,7 @@ pub const doc = @import("doc.zig");
 const emit = @import("emit.zig");
 const link = @import("link.zig");
 const macho = @import("link/macho.zig");
-const fmt = @import("fmt.zig");
+pub const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 
 /// Seed compiler version. Kept in sync with `build.zig.zon`.
@@ -707,15 +707,27 @@ fn renderFail(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, err_out: 
     return null;
 }
 
-/// `bitc fmt <path>...`: reformats each file to Bit's one canonical style,
-/// rewriting it in place only when the canonical text differs (idempotent:
+/// `bitc fmt [--check] <path>...`: reformats each file to Bit's one canonical
+/// style, rewriting it in place only when the canonical text differs (idempotent:
 /// an already-canonical file is never touched). A file that fails to parse
 /// is left untouched and its diagnostics are rendered to `err_out`; returns
 /// `true` iff any file failed, so the caller can pick a nonzero exit code —
 /// every remaining path is still attempted, matching gofmt's per-file
 /// independence.
-fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, paths: []const [:0]const u8) !bool {
+///
+/// `--check` writes nothing and instead names every file that is not already
+/// canonical, failing if any is. Without it there is no way to *gate* on format:
+/// a CI step that ran the rewriting form would quietly reformat its checkout and
+/// then report success, which is the opposite of enforcement (cf. `gofmt -l`,
+/// `zig fmt --check`).
+fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, args: []const [:0]const u8) !bool {
     var any_failed = false;
+    var check_only = false;
+    var paths = args;
+    if (paths.len > 0 and std.mem.eql(u8, paths[0], "--check")) {
+        check_only = true;
+        paths = paths[1..];
+    }
     for (paths) |path| {
         const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
             try err_out.print("bitc fmt: {s}: {s}\n", .{ path, @errorName(e) });
@@ -733,6 +745,11 @@ fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, paths: []const [:
             continue;
         }
         if (std.mem.eql(u8, source, result.text)) continue;
+        if (check_only) {
+            try err_out.print("{s}\n", .{path});
+            any_failed = true;
+            continue;
+        }
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = result.text });
     }
     return any_failed;
