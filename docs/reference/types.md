@@ -50,6 +50,11 @@ An interpreted string embeds expressions with `${ ... }`; the value is converted
 to `string`. Any type implementing `interface Show { show(): string }` works, as
 do all primitives. Write `\$` for a literal dollar sign.
 
+There is no universal `toString`: interpolating anything else — a slice, a map, a
+channel, a function value, an `error`, or a struct/interface without `show` — is a
+compile error (`E0073`). Interpolate a field, an element, or the result of a
+method instead, or give the type a `show(): string` method.
+
 ```bit
 function greet(name: string, n: int) {
   println("hi ${name}, you have ${n} messages")
