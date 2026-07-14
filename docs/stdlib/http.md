@@ -187,7 +187,9 @@ in a test — pass a `std/tls` `TlsConfig` to the https-only variants.
 
 As `request`, but over https with an explicit `std/tls` `TlsConfig` — pinned
 roots, a fixed `serverName`, or `insecureSkipVerify`. `config.alpn` defaults to
-`http/1.1` when empty; a non-`https://` URL fails.
+`["h2","http/1.1"]` when empty, so the request runs over HTTP/2 whenever the
+server selects `h2`; set it to `["http/1.1"]` to force HTTP/1.1. A non-`https://`
+URL fails.
 
 ### `getTls(url: string, config: TlsConfig): Response!`
 
@@ -201,8 +203,14 @@ POST `body` to an https `url` with an explicit `std/tls` `TlsConfig`.
 
 The TLS mirror of `listenAndServe`: serves HTTPS on `host:port` forever with the
 certificate chain `certPem` and matching private key `keyPem` (both PEM),
-dispatching each request to `handler` on its own green thread. Offers ALPN
-`http/1.1`. Returns only on a bind, accept, or handshake error.
+dispatching each request to `handler` on its own green thread. Returns only on a
+bind, accept, or handshake error.
+
+This is also the HTTP/2 server: `serveTls` offers ALPN `["h2","http/1.1"]`, so a
+client that negotiates `h2` is served over HTTP/2 and everything else over
+HTTP/1.1 — the same `handler` serves both, and you write nothing extra to get
+HTTP/2. There is no `serveH2` because there is nothing for it to do. See
+[HTTP/2](#http2) below and `examples/http2server`.
 
 ```bit
 import { get, getTls, serveTls, ok, respond, Request, Response } from "std/http"
@@ -256,6 +264,12 @@ underneath.
   streams are each dispatched to the handler on their own green thread.
 - **Cleartext** (`http://`, `listenAndServe`) is always HTTP/1.1 — HTTP/2 here
   requires TLS ALPN.
+
+There is deliberately no `serveH2` entry point: HTTP/2 is not a separate server,
+it is what `serveTls` already speaks whenever ALPN selects it. `serveH3` is
+separate only because HTTP/3 is a different *transport* — QUIC over UDP, a socket
+`serveTls` does not own — not because HTTP/2 is missing. `examples/http2server`
+is a runnable HTTP/2 server that proves the negotiated protocol is `h2`.
 
 | API / URL | Transport | Protocol |
 |---|---|---|
