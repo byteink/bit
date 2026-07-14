@@ -3098,6 +3098,27 @@ const Checker = struct {
             const n = try self.typeName(recv_ty);
             defer self.gpa.free(n);
             try self.emit(mf, k[0], .type_mismatch, "type assertion requires an interface value, found '{s}'", .{n}, null);
+            return target;
+        }
+        // Only a struct can carry methods (§10.4), so only a struct can be the
+        // dynamic type behind an interface value — and the assertion narrows to
+        // exactly that. Rejecting anything else keeps the target's `TypeInfo`
+        // (which the narrowing compares against) always well-defined.
+        if (target != .invalid and self.ctx.typeOf(target) != .@"struct") {
+            const t = try self.typeName(target);
+            defer self.gpa.free(t);
+            try self.emit(mf, k[1], .type_mismatch, "type assertion target must be a struct type, found '{s}'", .{t}, null);
+            return target;
+        }
+        // A target that cannot satisfy the interface can never be the dynamic
+        // type of a value stored in it, so the assertion is dead on arrival —
+        // report it here rather than let it fail at run time forever.
+        if (recv_ty != .invalid and target != .invalid and !self.satisfies(target, recv_ty, env)) {
+            const t = try self.typeName(target);
+            defer self.gpa.free(t);
+            const i = try self.typeName(recv_ty);
+            defer self.gpa.free(i);
+            try self.emit(mf, node, .type_mismatch, "impossible type assertion: '{s}' does not satisfy '{s}'", .{ t, i }, null);
         }
         return target;
     }
@@ -3580,6 +3601,12 @@ const Checker = struct {
             self.setType(file_idx, node, elem);
             return .{ elem, self.ctx.prim_ids.get(.bool) };
         }
+        // `let (v, ok) = iface.(T)` (§14.4): unlike the map/chan forms, the node's
+        // own type already *is* the value type, so `checkExpr` records it.
+        if (n.tag == .type_assert) {
+            const target = try self.checkExpr(file_idx, node, fctx.env, fctx, .invalid);
+            return .{ target, self.ctx.prim_ids.get(.bool) };
+        }
         return null;
     }
 
@@ -3800,7 +3827,7 @@ const Checker = struct {
             return;
         }
 
-        // `(v, ok) = m[k]` / `(v, ok) = <-c` (§12.6/§16.2): a 2-entry lhs
+        // `v, ok = m[k]` / `<- c` / `iface.(T)` (§12.6/§14.4/§16.2): a 2-entry lhs
         // list where the single rhs is a two-result form.
         if (lhs_items.len == 2 and rhs_items.len == 1) {
             if (try self.twoResultOf(file_idx, rhs_items[0], fctx)) |two| {
@@ -3808,6 +3835,23 @@ const Checker = struct {
                 try self.assignTo(file_idx, lhs_items[1], two[1], fctx);
                 return;
             }
+        }
+
+        // The same thing parenthesized — `(v, ok) = m[k]`. The parser folds a
+        // parenthesized target list into one `tuple_pat`, so both targets arrive
+        // as a single lhs item and the arity check below would wave it through
+        // untyped.
+        if (lhs_items.len == 1 and rhs_items.len == 1 and mf.tree.get(lhs_items[0]).tag == .tuple_pat) {
+            const targets = mf.tree.kids(lhs_items[0]);
+            if (targets.len == 2) {
+                if (try self.twoResultOf(file_idx, rhs_items[0], fctx)) |two| {
+                    try self.assignTo(file_idx, targets[0], two[0], fctx);
+                    try self.assignTo(file_idx, targets[1], two[1], fctx);
+                    return;
+                }
+            }
+            try self.emit(mf, node, .type_mismatch, "destructuring assignment needs a two-result form on the right: 'm[k]', '<- c', or 'iface.(T)'", .{}, null);
+            return;
         }
 
         if (lhs_items.len != rhs_items.len) {

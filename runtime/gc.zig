@@ -505,6 +505,13 @@ fn headerFromBody(body: [*]u8) *GcHeader {
     return @ptrCast(@alignCast(body - header_size));
 }
 
+/// The dynamic type of a managed object, from its body pointer (ABI.md §2).
+/// `body` must be one this `Gc` owns — `owns()` is the caller's guard, since a
+/// header read on any other address is undefined (see `markRoot`).
+pub fn infoOf(body: [*]u8) *const TypeInfo {
+    return headerFromBody(body).info;
+}
+
 fn bodyFromHeader(h: *GcHeader) [*]u8 {
     const raw: [*]u8 = @ptrCast(h);
     return raw + header_size;

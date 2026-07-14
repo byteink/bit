@@ -86,6 +86,14 @@ function mustCircle(s: Shape): Circle {
 The two-result form is valid only as the sole right-hand side of a declaration
 or assignment.
 
+The target must be a struct type — only structs carry methods, so only a struct
+can be the concrete type behind an interface value. Asserting a type that could
+never satisfy the interface is a compile-time error rather than a check that
+always fails.
+
+On a mismatch the two-result form gives back `nil`, not the original value, so
+code that ignores `ok` cannot read one concrete type as another.
+
 ## Comparing interface values
 
 Interface values compare with `==`/`!=`: two are equal when their dynamic types

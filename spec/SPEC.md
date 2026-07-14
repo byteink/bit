@@ -1014,6 +1014,17 @@ type_assert = postfix "." "(" type ")" .
 The two-result form is valid only as the sole right-hand side of a declaration or
 assignment (like the map/channel two-result forms).
 
+- The target must be a **struct** type. Only structs carry methods (§10.4), so
+  only a struct can be the dynamic type behind an interface value.
+- A target that cannot satisfy the interface is a **compile-time error**: the
+  assertion could never succeed, so it is rejected rather than left to report
+  `false` forever.
+- On a mismatch the two-result form yields `(nil, false)` — `nil`, not the
+  un-narrowed receiver. The value is typed as the target, so returning the
+  receiver would let a caller that ignores `ok` read one concrete type as
+  another. This is the same reason `ok` guards a reference-element channel
+  receive (§16.2).
+
 ### 14.5 Constants and Untyped Literals
 
 See §15.4.

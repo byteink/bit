@@ -373,6 +373,68 @@ export fn bit_rt_iface_lookup(info: *const gc_mod.TypeInfo, id: u64) callconv(.c
     fatal("interface method not found");
 }
 
+/// The dynamic type of an interface value, or null if it does not name a live
+/// managed object. An interface value *is* its receiver pointer (ABI.md §2.1),
+/// so its dynamic type is the `TypeInfo` in that object's GC header — but a nil
+/// interface is a null word, and a reference-typed value need not be a GC object
+/// at all (a `chan` is not), so the header is only safe to read once `owns()`
+/// confirms this address is exactly a live object's body.
+fn dynTypeOf(recv: ?*anyopaque) ?*const gc_mod.TypeInfo {
+    const p = recv orelse return null;
+    const body: [*]u8 = @ptrCast(p);
+    if (!g_gc.owns(body)) return null;
+    return gc_mod.infoOf(body);
+}
+
+/// `bit_rt_iface_as` (ABI.md §2.2): the two-result type assertion
+/// `let (v, ok) = iface.(T)` (SPEC §14.4). `TypeInfo`s are per concrete type, so
+/// descriptor identity *is* type identity. Returns the receiver narrowed to `T`
+/// on a match, else null — the caller reads `ok` from `bit_rt_iface_as_ok`.
+///
+/// Null on a mismatch is load-bearing, not tidiness: the result is typed `T`, so
+/// handing back the un-narrowed receiver would let a caller that ignores `ok`
+/// read a `Square` as a `Circle`. Null is `T`'s zero value, and the same reason
+/// `ok` exists for a reference-element channel receive.
+export fn bit_rt_iface_as(recv: ?*anyopaque, want: usize) callconv(.c) ?*anyopaque {
+    const info = dynTypeOf(recv) orelse {
+        last_iface_ok = false;
+        return null;
+    };
+    last_iface_ok = @intFromPtr(info) == want;
+    return if (last_iface_ok) recv else null;
+}
+
+threadlocal var last_iface_ok: bool = false;
+
+/// `bit_rt_iface_as_ok` (ABI.md §2.2): the `ok` of the `bit_rt_iface_as`
+/// immediately preceding it. Same adjacency contract as `bit_rt_chan_recv_ok`
+/// (§11) — lowering emits the two back to back, so no other assertion can land
+/// in between.
+export fn bit_rt_iface_as_ok() callconv(.c) bool {
+    return last_iface_ok;
+}
+
+/// `bit_rt_iface_assert` (ABI.md §2.2): the one-result type assertion
+/// `let v = iface.(T)` (SPEC §14.4), which panics on a mismatch (§18.4). Both
+/// type names are already in the descriptors, so the message can name them.
+export fn bit_rt_iface_assert(recv: ?*anyopaque, want: usize) callconv(.c) ?*anyopaque {
+    const info = dynTypeOf(recv);
+    if (info) |i| {
+        if (@intFromPtr(i) == want) return recv;
+    }
+    const target: *const gc_mod.TypeInfo = @ptrFromInt(want);
+    const got: []const u8 = if (info) |i| i.typeName() else "nil";
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "type assertion failed: ", got, " is not ", target.typeName() }) |part| {
+        const room = buf.len - n;
+        const take = @min(part.len, room);
+        @memcpy(buf[n..][0..take], part[0..take]);
+        n += take;
+    }
+    fatal(buf[0..n]);
+}
+
 /// The real safepoint poll, called by the `bit_rt_safepoint` shim below after
 /// the caller's registers are safely snapshotted. `noinline` so the shim's
 /// `call`/`bl` is a real ABI boundary (the snapshot must reflect the caller's

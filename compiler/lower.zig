@@ -1134,26 +1134,81 @@ const FnCtx = struct {
         return self.b.convert(target, val);
     }
 
-    /// `let (v, ok) = <- c` (SPEC.md §16.2). `bit_rt_chan_recv_ok` reports the
-    /// `ok` of the receive *immediately* before it (ABI.md §11), so the two
-    /// calls are emitted back to back with nothing in between.
-    fn lowerChanRecvOkLet(self: *FnCtx, bk: []const ast.Index) Error!void {
+    /// The address of `ty`'s static `TypeInfo` (ABI.md §2). Typed `u64`, not a
+    /// reference: the descriptor is a `.rodata` constant, so a reference type
+    /// would hand it to the collector as a root at the next safepoint.
+    fn typeInfoOf(self: *FnCtx, ty: TypeId) Error!ir.ValueId {
+        const layout = try self.l.structLayout(ty); // checker restricts assertion targets to structs
+        return self.b.typeInfoAddr(self.ctx.prim_ids.get(.u64), @intFromEnum(ty), layout.size, layout.ptr_offsets);
+    }
+
+    /// The two-result forms: `<- c` (SPEC §16.2), `m[k]` (§12.6), `iface.(T)`
+    /// (§14.4). Null if `node` is none of them — the caller then has a plain
+    /// single-value initializer and a tuple pattern it cannot destructure.
+    ///
+    /// The chan and interface forms read their `ok` from a runtime call that
+    /// reports the *immediately preceding* one (ABI.md §2.2/§11), so each pair is
+    /// emitted back to back with nothing in between.
+    fn lowerTwoResult(self: *FnCtx, node: ast.Index) Error!?[2]ir.ValueId {
+        const n = self.tree().get(node);
+        const k = self.kids(node);
+        // In every form the node's own type is the *value* type (the checker
+        // records the map's value / the channel's element / the assertion's
+        // target there), and the second result is always `bool`.
+        const val_ty = try self.nodeType(node);
+        const ok_ty = self.ctx.prim_ids.get(.bool);
+        switch (n.tag) {
+            .unary => {
+                const op: lexer.Kind = @enumFromInt(n.main);
+                if (op != .arrow_left) return null;
+                const ch = try self.lowerExpr(k[0]);
+                const v = try self.b.rtCall(val_ty, .chan_recv, &.{ch});
+                const ok = try self.b.rtCall(ok_ty, .chan_recv_ok, &.{});
+                return .{ v, ok };
+            },
+            // A map lookup and its presence test are two independent probes of a
+            // table that cannot change between them (no safepoint, no yield), so
+            // no `ok` slot is needed — unlike the chan/interface forms.
+            .index => {
+                const recv_ty = try self.nodeType(k[0]);
+                const recv_data = self.ctx.typeOf(recv_ty);
+                if (recv_data != .map) return null;
+                const m = try self.lowerExpr(k[0]);
+                const key = try self.lowerExprH(k[1], recv_data.map.key);
+                const v = try self.b.rtCall(val_ty, .map_get, &.{ m, key });
+                const ok = try self.b.rtCall(ok_ty, .map_has, &.{ m, key });
+                return .{ v, ok };
+            },
+            .type_assert => {
+                const recv = try self.lowerExpr(k[0]);
+                const info = try self.typeInfoOf(val_ty);
+                const v = try self.b.rtCall(val_ty, .iface_as, &.{ recv, info });
+                const ok = try self.b.rtCall(ok_ty, .iface_as_ok, &.{});
+                return .{ v, ok };
+            },
+            else => return null,
+        }
+    }
+
+    /// `let (v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2).
+    fn lowerTwoResultLet(self: *FnCtx, bk: []const ast.Index) Error!void {
         const pats = self.kids(bk[0]);
         if (pats.len != 2 or bk[2] == ast.none) return error.UnsupportedConstruct;
         for (pats) |p| if (self.tree().get(p).tag != .ident) return error.UnsupportedConstruct;
-        const init_node = bk[2];
-        const init = self.tree().get(init_node);
-        if (init.tag != .unary) return error.UnsupportedConstruct;
-        const op: lexer.Kind = @enumFromInt(init.main);
-        if (op != .arrow_left) return error.UnsupportedConstruct; // only the recv form so far
+        const two = try self.lowerTwoResult(bk[2]) orelse return error.UnsupportedConstruct;
+        try self.declareUnlessBlank(pats[0], two[0], try self.nodeType(bk[2]));
+        try self.declareUnlessBlank(pats[1], two[1], self.ctx.prim_ids.get(.bool));
+    }
 
-        const val_ty = try self.nodeType(pats[0]);
-        const ok_ty = try self.nodeType(pats[1]);
-        const ch = try self.lowerExpr(self.kids(init_node)[0]);
-        const v = try self.b.rtCall(val_ty, .chan_recv, &.{ch});
-        const ok = try self.b.rtCall(ok_ty, .chan_recv_ok, &.{});
-        try self.declareUnlessBlank(pats[0], v, val_ty);
-        try self.declareUnlessBlank(pats[1], ok, ok_ty);
+    /// `(v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2) — as above, but the
+    /// two targets are existing lvalues rather than fresh bindings. Both are
+    /// resolved before the right-hand side runs, matching plain `=`.
+    fn lowerTwoResultAssign(self: *FnCtx, targets: []const ast.Index, init_node: ast.Index) Error!void {
+        if (targets.len != 2) return error.UnsupportedConstruct;
+        var lvs: [2]Lvalue = undefined;
+        for (targets, 0..) |t, i| lvs[i] = try self.resolveLvalue(t);
+        const two = try self.lowerTwoResult(init_node) orelse return error.UnsupportedConstruct;
+        for (lvs, two) |lv, v| try self.writeLvalue(lv, v);
     }
 
     /// `_` discards its value (SPEC.md §5) — binding it would shadow the next `_`.
@@ -1167,7 +1222,7 @@ const FnCtx = struct {
         for (self.kids(node)) |bind| {
             const bk = self.kids(bind); // binding: [pattern, type_or_none, init_or_none]
             if (self.tree().get(bk[0]).tag == .tuple_pat) {
-                try self.lowerChanRecvOkLet(bk);
+                try self.lowerTwoResultLet(bk);
                 continue;
             }
             if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct;
@@ -1267,6 +1322,18 @@ const FnCtx = struct {
             const iop = try binOpFor(compoundBase(op), self.ctx.typeOf(ty));
             const result = try self.b.binary(iop, ty, cur, rhs_val);
             try self.writeLvalue(lv, result);
+            return;
+        }
+        // `(v, ok) = <two-result>` (§12.6/§14.4/§16.2): the parser folds the
+        // parenthesized target list into one `tuple_pat`.
+        if (lhs_items.len == 1 and rhs_items.len == 1 and self.tree().get(lhs_items[0]).tag == .tuple_pat) {
+            try self.lowerTwoResultAssign(self.kids(lhs_items[0]), rhs_items[0]);
+            return;
+        }
+        // The same, unparenthesized (`v, ok = m[k]`). Any *other* 2-target,
+        // 1-value assignment is an arity error the checker already rejected.
+        if (lhs_items.len == 2 and rhs_items.len == 1) {
+            try self.lowerTwoResultAssign(lhs_items, rhs_items[0]);
             return;
         }
         // Plain `=`: resolve every lvalue and evaluate every rhs before any
@@ -2871,7 +2938,17 @@ const FnCtx = struct {
             .catch_default => self.lowerCatch(node, false),
             .catch_bind => self.lowerCatch(node, true),
             .match_stmt => self.lowerMatchExpr(node),
-            else => error.UnsupportedConstruct, // type_assert/tuple_index/map literals
+            // The one-result assertion `iface.(T)` (SPEC §14.4): panics on a
+            // mismatch. The two-result form never reaches here — a `tuple_pat`
+            // target routes it through `lowerTwoResult` instead.
+            .type_assert => blk: {
+                const k = self.kids(node);
+                const ty = try self.nodeType(node);
+                const recv = try self.lowerExpr(k[0]);
+                const info = try self.typeInfoOf(ty);
+                break :blk self.b.rtCall(ty, .iface_assert, &.{ recv, info });
+            },
+            else => error.UnsupportedConstruct, // tuple_index/map literals
         };
     }
 
