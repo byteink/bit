@@ -153,6 +153,37 @@ body as a root — so objects reachable only through a slice survive collection.
 A non-ref buffer stays a leaf. The header keeps the buffer itself alive via its
 `ptr_offsets = [0]`.
 
+### 2.2 Type assertions
+
+Because an interface value *is* the receiver pointer, its dynamic type is the
+`TypeInfo` in that object's header — and descriptors are **per concrete type**
+(§2), so descriptor identity is type identity. A type assertion (SPEC §14.4) is
+therefore a pointer comparison against the target type's descriptor, whose
+address codegen materializes from the `type_info` IR op (the same
+`__bittype_<disc>_<size>_<offsets>` symbol `gc_alloc` references).
+
+```
+bit_rt_iface_as(recv: ref, want: usize) -> ref        // recv on match, else null
+bit_rt_iface_as_ok() -> bool                          // ok of the iface_as just before it
+bit_rt_iface_assert(recv: ref, want: usize) -> ref    // panics on mismatch
+```
+
+- `want` is a `*const TypeInfo` passed as a plain integer: the descriptor lives
+  in `.rodata`, so it must **not** be reference-typed, or a stack map would offer
+  it to the collector as a root (§4).
+- `recv` is only dereferenced once `owns()` confirms it is exactly a live
+  object's body: a nil interface is a null word, and a reference-typed value need
+  not be a GC object at all (§3). Neither case matches, so both yield `ok=false`.
+- The mismatch result is **null**, not the un-narrowed receiver. The result is
+  typed `T`, so returning the receiver would let a caller that ignores `ok` read
+  one concrete type as another. Null is `T`'s zero value.
+- `bit_rt_iface_as_ok` reports the `ok` of the `bit_rt_iface_as` **immediately
+  preceding it**, from a per-thread slot — the same adjacency contract as
+  `bit_rt_chan_recv_ok` (§11) and the fallible-call error slot (§13). Lowering
+  emits the pair back to back with nothing between them.
+- `bit_rt_iface_assert` names both types in its panic message; the descriptors
+  already carry them.
+
 ---
 
 ## 3. Reference contract
@@ -525,10 +556,21 @@ a program declares, with no per-`T` archive content.
 bit_rt_chan_make(capacity: usize, is_ref: bool) -> *anyopaque
 bit_rt_chan_send(ch: ?*anyopaque, value: u64)    -> void
 bit_rt_chan_recv(ch: ?*anyopaque)                -> ChanRecvResult
+bit_rt_chan_recv_ok()                            -> bool
 bit_rt_chan_close(ch: ?*anyopaque)                -> void
 
 ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
 ```
+
+- `bit_rt_chan_recv_ok` returns the `ok` of the receive *just* performed by this
+  goroutine. `rt_call` threads only a single value word back through the IR, so
+  the two-result form `let (v, ok) = <- c` (SPEC.md §16.2) lowers as
+  `bit_rt_chan_recv` immediately followed by `bit_rt_chan_recv_ok`, with no
+  yield between them — the same adjacency the fallible-call error slot relies on
+  (§13), which makes a per-worker threadlocal goroutine-correct. This matters
+  because a *reference* element's zero word on a closed channel is a null
+  pointer: a receiver must be able to distinguish "closed" from "a real value"
+  before dereferencing it.
 
 - `capacity == 0` is unbuffered (synchronous rendezvous); `capacity > 0` is a
   bounded ring buffer (SPEC.md §16.2).

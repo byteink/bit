@@ -634,6 +634,16 @@ const Ctx = struct {
         try self.memModRM(@intFromEnum(dst), base, index, scale, disp);
     }
 
+    /// `lea dst, [base + disp]` (`REX.W 8D /r`) — computes an address without
+    /// dereferencing. Used to form the interior pointer of an inline aggregate
+    /// field (a fixed-size array `[N]T` field lives inline in its struct body).
+    fn lea(self: *Ctx, dst: Reg, base: Reg, disp: i32) !void {
+        const bits = regBits(@intFromEnum(dst), base, null);
+        try self.maybeRex(true, bits.r, bits.x, bits.b);
+        try self.emitByte(0x8D);
+        try self.memModRM(@intFromEnum(dst), base, null, 1, disp);
+    }
+
     /// Stores the low `width` bytes of `src` to `[base + index*scale + disp]`.
     fn movStore(self: *Ctx, base: Reg, index: ?Reg, scale: u8, disp: i32, src: Reg, width: u8) !void {
         const bits = regBits(@intFromEnum(src), base, index);
@@ -1323,6 +1333,16 @@ fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) !void 
     try putInt(self, dst, .rax);
 }
 
+/// `type_info`: materialize the address of a named type's static `TypeInfo`
+/// blob. Not a call and not a GC point — the descriptor is a `.rodata` constant
+/// (its non-reference result type keeps it out of the stack map).
+fn emitTypeInfo(self: *Ctx, dst: u32, disc: u32, size: u32, ptr_offsets: []const u32) !void {
+    const name = try ir.typeInfoSymbol(self.gpa, disc, size, ptr_offsets);
+    try self.owned_syms.append(self.gpa, name);
+    try self.movAbsReloc(.rax, name);
+    try putInt(self, dst, .rax);
+}
+
 /// A closure value is a pointer to a 16-byte GC cell `{ code_ptr, env_ptr }`:
 /// the code pointer at +0 (into `.text`, never a GC ref) and the captured
 /// environment at +8 (the cell's one GC field). This keeps a closure a single
@@ -1452,6 +1472,13 @@ fn emitConstFloat(self: *Ctx, dst: u32, val: f64, width: u8) !void {
 /// instruction's result type), which picks load width/signedness/class.
 fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId) !void {
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
+    // A fixed-size array field is inline storage: its value is the interior
+    // address `base + offset`, formed with `lea`, not a loaded word.
+    if (self.tctx().typeOf(ty) == .array) {
+        try self.lea(scratch1, base_reg, @intCast(offset));
+        try putInt(self, dst, scratch1);
+        return;
+    }
     const w = widthOf(self.tctx(), ty);
     switch (w.class) {
         .int => {
@@ -1680,6 +1707,10 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .chan_make = "bit_rt_chan_make",
     .chan_send = "bit_rt_chan_send",
     .chan_recv = "bit_rt_chan_recv",
+    .chan_recv_ok = "bit_rt_chan_recv_ok",
+    .iface_as = "bit_rt_iface_as",
+    .iface_as_ok = "bit_rt_iface_as_ok",
+    .iface_assert = "bit_rt_iface_assert",
     .chan_close = "bit_rt_chan_close",
     .spawn = "bit_rt_spawn",
     .map_new = "bit_rt_map_new",
@@ -1959,7 +1990,7 @@ fn markUse(intervals: []regalloc.Interval, v: u32, pos: u32) void {
 /// posture).
 fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
     switch (d) {
-        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc => {},
+        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc, .type_info => {},
         .bin => |b| {
             markUse(intervals, @intFromEnum(b.lhs), pos);
             markUse(intervals, @intFromEnum(b.rhs), pos);
@@ -2205,6 +2236,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .index_get => try emitIndexGet(self, dst, d.index_get.base, d.index_get.index, ty),
         .index_set => try emitIndexSet(self, d.index_set.base, d.index_set.index, d.index_set.value, self.f.valueType(d.index_set.value)),
         .gc_alloc => try emitGcAlloc(self, dst, d.gc_alloc.size, d.gc_alloc.ptr_offsets),
+        .type_info => try emitTypeInfo(self, dst, d.type_info.disc, d.type_info.size, d.type_info.ptr_offsets),
         .make_closure => try emitMakeClosure(self, dst, d.make_closure.func, d.make_closure.env),
         .func_addr => try emitFuncAddr(self, dst, d.func_addr.func),
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),

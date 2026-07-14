@@ -1312,8 +1312,15 @@ fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
 }
 
 fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId) !void {
-    const w = common.widthOf(self.tctx(), ty);
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
+    // A fixed-size array field is inline storage: its value is the interior
+    // address `base + offset` (an ADD-immediate), not a loaded word.
+    if (self.tctx().typeOf(ty) == .array) {
+        try self.addSubImmWide(false, @intFromEnum(scratch1), @intFromEnum(base_reg), offset);
+        try putInt(self, dst, scratch1);
+        return;
+    }
+    const w = common.widthOf(self.tctx(), ty);
     switch (w.class) {
         .int => {
             try self.loadImm(scratch1, @intFromEnum(base_reg), offset, w.bytes, w.signed);
@@ -1406,6 +1413,10 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .chan_make => "bit_rt_chan_make",
         .chan_send => "bit_rt_chan_send",
         .chan_recv => "bit_rt_chan_recv",
+        .chan_recv_ok => "bit_rt_chan_recv_ok",
+        .iface_as => "bit_rt_iface_as",
+        .iface_as_ok => "bit_rt_iface_as_ok",
+        .iface_assert => "bit_rt_iface_assert",
         .chan_close => "bit_rt_chan_close",
         .spawn => "bit_rt_spawn",
         .map_new => "bit_rt_map_new",
@@ -1593,6 +1604,16 @@ fn emitGcAlloc(self: *Ctx, dst: u32, size: u32, ptr_offsets: []const u32) Codege
     const ret_off: u32 = @intCast(self.code.items.len);
     try recordSafepoint(self, ret_off);
     try putInt(self, dst, @enumFromInt(retRegNum(.int)));
+}
+
+/// `type_info`: materialize the address of a named type's static `TypeInfo`
+/// blob. Not a call and not a GC point — the descriptor is a `.rodata` constant
+/// (its non-reference result type keeps it out of the stack map).
+fn emitTypeInfo(self: *Ctx, dst: u32, disc: u32, size: u32, ptr_offsets: []const u32) CodegenError!void {
+    const name = try ir.typeInfoSymbol(self.gpa, disc, size, ptr_offsets);
+    try self.owned_syms.append(self.gpa, name);
+    try self.emitAddrOf(scratch1, name);
+    try putInt(self, dst, scratch1);
 }
 
 /// A closure value is a pointer to a 16-byte GC cell `{ code_ptr, env_ptr }`:
@@ -1799,6 +1820,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .call_value => |c| try emitCallValue(self, if (ty != .invalid) i else null, ty, c.callee, c.args),
         .call_iface => |c| try emitCallIface(self, if (ty != .invalid) i else null, ty, c.iface, c.method_index, c.args),
         .gc_alloc => |g| try emitGcAlloc(self, i, g.size, g.ptr_offsets),
+        .type_info => |t| try emitTypeInfo(self, i, t.disc, t.size, t.ptr_offsets),
         .field_get => |fg| try emitFieldGet(self, i, fg.base, fg.offset, ty),
         .field_set => |fs| try emitFieldSet(self, fs.base, fs.offset, fs.value, self.f.valueType(fs.value)),
         .index_get => |ig| try emitIndexGet(self, i, ig.base, ig.index, ty),
@@ -1907,7 +1929,7 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
             extendOne(intervals, use_pos, @intFromEnum(c.iface));
             for (c.args) |a| extendOne(intervals, use_pos, a);
         },
-        .gc_alloc => {},
+        .gc_alloc, .type_info => {}, // no value operands
         .field_get => |fg| extendOne(intervals, use_pos, @intFromEnum(fg.base)),
         .field_set => |fs| {
             extendOne(intervals, use_pos, @intFromEnum(fs.base));

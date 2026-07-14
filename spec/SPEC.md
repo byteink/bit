@@ -992,9 +992,21 @@ Method sets:
 - The method set of a struct/alias type is the set of methods declared with a
   receiver of that type in its home module.
 - Interfaces may not declare fields; only method signatures.
+- `S` must be a **struct** type (or another interface, or `nil`). An interface
+  value *is* the receiver's object pointer — there is no boxed scalar — so only a
+  type that is already a reference (§13.3) can sit behind one. Storing anything
+  else would leave a non-pointer in a word the collector traces as a root and a
+  type assertion (§14.4) reads as an object header. This is a rule about the
+  value's representation, not its method set: a method may be declared on a type
+  alias (§10.4), and an alias to a scalar is transparently that scalar (§14.1),
+  so a scalar can carry methods yet still not be storable in an interface.
+- `nil` is assignable to *any* interface, empty or not, and satisfaction is never
+  consulted for it: `nil` has no method set, so testing it against `I`'s methods
+  would reject it out of every non-empty interface and leave such a location's
+  zero value (§13.4) unspellable.
 - Satisfaction is checked at assignment/passing sites; there is no declaration of
-  intent. Assigning a satisfying `S` into an `I`-typed location boxes `S` into an
-  interface value carrying `S`'s dynamic type and method table.
+  intent. Assigning a satisfying `S` into an `I`-typed location carries `S`'s
+  dynamic type and method table with the pointer (its `TypeInfo`).
 
 ### 14.4 Type Assertions
 
@@ -1013,6 +1025,17 @@ type_assert = postfix "." "(" type ")" .
 
 The two-result form is valid only as the sole right-hand side of a declaration or
 assignment (like the map/channel two-result forms).
+
+- The target must be a **struct** type. Only structs carry methods (§10.4), so
+  only a struct can be the dynamic type behind an interface value.
+- A target that cannot satisfy the interface is a **compile-time error**: the
+  assertion could never succeed, so it is rejected rather than left to report
+  `false` forever.
+- On a mismatch the two-result form yields `(nil, false)` — `nil`, not the
+  un-narrowed receiver. The value is typed as the target, so returning the
+  receiver would let a caller that ignores `ok` read one concrete type as
+  another. This is the same reason `ok` guards a reference-element channel
+  receive (§16.2).
 
 ### 14.5 Constants and Untyped Literals
 

@@ -652,23 +652,10 @@ const Deque = struct {
 };
 
 /// Minimal spinlock for rare, O(1)-ish critical sections (the global run queue
-/// here; channel send/recv/close in `chan.zig`). Never held across a blocking
-/// call or a context switch, so spinning (rather than a futex/condvar) is both
-/// simple and correct. `pub` so other runtime modules share one implementation
-/// instead of hand-rolling their own.
-pub const SpinLock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
-
-    pub fn acquire(self: *SpinLock) void {
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn release(self: *SpinLock) void {
-        self.locked.store(false, .release);
-    }
-};
+/// here; channel send/recv/close in `chan.zig`; the allocator free lists in
+/// `alloc.zig`). Re-exported from its own file so the lowest runtime layer can
+/// share one implementation without importing the scheduler.
+pub const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// Overflow queue shared by all workers: spilled local-queue pushes, tasks
 /// unparked from another thread, and tasks woken by the netpoller all land

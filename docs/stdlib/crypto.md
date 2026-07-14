@@ -8,6 +8,27 @@ section for the guarantees and the known-answer vectors behind them.
 
 <!-- doctest: per-block -->
 
+## Choosing an algorithm
+
+If you are not sure which primitive to reach for, start here. The defaults are
+the modern, safe choice; the alternatives exist for interop or legacy.
+
+| Task | Use | Notes |
+| --- | --- | --- |
+| Hash data | `Sha256` | `Blake2b`/`Sha512` are faster on 64-bit; `Blake3` for very large inputs. |
+| Authenticate with a shared key | HMAC-`Sha256` | Or Poly1305 inside an AEAD — don't hand-roll "hash the key + message". |
+| Encrypt **and** authenticate | AEAD: `Aes256Gcm`, or `ChaCha20Poly1305` where AES has no hardware | Never a raw cipher without a MAC. `AesGcmSiv` if nonce reuse is a real risk. |
+| Store a password | `argon2id` | Or `scrypt`/`bcrypt`. Never a plain or fast hash — those are brute-forceable. |
+| Derive keys from a shared secret | `hkdf` over `Sha256` | For a password, derive with `argon2id` first, not HKDF. |
+| Sign (new protocol) | `ed25519` | `ecdsa` P-256 for interop; RSA-PSS only for legacy peers. |
+| Key agreement | `x25519` | `x448` for a higher security margin; NIST P-curves for interop. |
+| Post-quantum | `mlkem` (key encapsulation), `mldsa` (signatures) | Pair ML-KEM with X25519 as a hybrid until PQ is proven in the field. |
+| Encode bytes as text | `encodeHex` / `base64Encode` | Not encryption — just a wire representation. |
+
+Rules of thumb: prefer an AEAD over a bare cipher; never use MD5 or SHA-1 for
+anything security-relevant (they are here only to read legacy data); and compare
+secrets with the [Constant-time](#constant-time) helpers, never `==`.
+
 ## Hashing
 
 The cryptographic hash contract. `Hash` is the streaming interface every digest
@@ -734,6 +755,13 @@ AES-128, 24 is AES-192, 32 is AES-256. Fails on any other length.
 Enciphers one 16-byte `block`, returning a fresh 16-byte ciphertext block.
 `block` must be exactly 16 bytes. This is the bare block permutation with no
 chaining — use a mode of operation for multi-block messages.
+
+### `AesCipher.encryptBlockInto(dst: []byte, block: []byte)`
+
+Enciphers `block` into the caller-owned 16-byte `dst`, in place — identical to
+`encryptBlock` but reusing `dst` so a hot loop (e.g. GCTR keystream) enciphers
+many blocks with no per-block allocation. Both `dst` and `block` must be exactly
+16 bytes and must not alias.
 
 ### `AesCipher.decryptBlock(block: []byte): []byte`
 

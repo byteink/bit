@@ -10,12 +10,15 @@
 //! how the GC will call it (object sizes live in GC headers), so we need no
 //! per-object headers and no address→span lookup table.
 //!
-//! ponytail: not thread-safe yet. Per-thread caches and locking land with the
-//! scheduler (green threads); today's callers and the verify tests are
-//! single-threaded. Upgrade path: front each `Heap` with a per-thread cache.
+//! Thread safety: a single `SpinLock` guards the free lists and the byte
+//! counters, so the scheduler's green-thread workers can allocate concurrently on
+//! different OS threads. ponytail: one coarse lock — a span map (`mapPages`) runs
+//! under it, so refills briefly serialize all allocators; the upgrade when
+//! contention bites is a per-worker cache in front of the shared lists.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// Compile-time lower bound on the OS page size; used only for pointer types.
 /// The real page size is read at runtime via `std.heap.pageSize()`.
@@ -49,12 +52,18 @@ comptime {
 const Slot = struct { next: ?*Slot };
 
 pub const Heap = struct {
+    /// Guards the free lists and the byte counters against concurrent allocation
+    /// from multiple OS worker threads. The critical section is a few list-pointer
+    /// swaps (plus an occasional `mapPages` on refill), never a blocking wait.
+    lock: SpinLock = .{},
     free_lists: [num_classes]?*Slot = [_]?*Slot{null} ** num_classes,
     /// Bytes handed out to callers and not yet freed. Returns to 0 when every
     /// allocation is freed — the leak metric the verify stress test checks.
-    live_bytes: usize = 0,
+    /// Atomic so the GC's off-lock `liveBytes` trigger read never tears; every
+    /// write happens under `lock`.
+    live_bytes: std.atomic.Value(usize) = .init(0),
     /// Total bytes currently mapped from the OS (spans + large allocations).
-    mapped_bytes: usize = 0,
+    mapped_bytes: std.atomic.Value(usize) = .init(0),
 
     pub fn init() Heap {
         return .{};
@@ -64,6 +73,8 @@ pub const Heap = struct {
     /// than the OS page size). Returns null only when the OS refuses more pages.
     pub fn alloc(self: *Heap, size: usize, alignment: usize) ?[*]u8 {
         std.debug.assert(alignment != 0 and std.math.isPowerOfTwo(alignment));
+        self.lock.acquire();
+        defer self.lock.release();
         if (classify(size, alignment)) |idx| return self.allocSmall(idx, size);
         return self.allocLarge(size, alignment);
     }
@@ -71,6 +82,8 @@ pub const Heap = struct {
     /// Free a block previously returned by `alloc`. `size` and `alignment` must
     /// match the original request.
     pub fn free(self: *Heap, ptr: [*]u8, size: usize, alignment: usize) void {
+        self.lock.acquire();
+        defer self.lock.release();
         if (classify(size, alignment)) |idx| {
             self.freeSmall(ptr, idx, size);
         } else {
@@ -79,18 +92,18 @@ pub const Heap = struct {
     }
 
     pub fn liveBytes(self: *const Heap) usize {
-        return self.live_bytes;
+        return self.live_bytes.load(.monotonic);
     }
 
     pub fn mappedBytes(self: *const Heap) usize {
-        return self.mapped_bytes;
+        return self.mapped_bytes.load(.monotonic);
     }
 
     fn allocSmall(self: *Heap, idx: usize, size: usize) ?[*]u8 {
         if (self.free_lists[idx] == null and !self.refill(idx)) return null;
         const slot = self.free_lists[idx].?;
         self.free_lists[idx] = slot.next;
-        self.live_bytes += size;
+        _ = self.live_bytes.fetchAdd(size, .monotonic);
         return @ptrCast(slot);
     }
 
@@ -98,14 +111,14 @@ pub const Heap = struct {
         const slot: *Slot = @ptrCast(@alignCast(ptr));
         slot.next = self.free_lists[idx];
         self.free_lists[idx] = slot;
-        self.live_bytes -= size;
+        _ = self.live_bytes.fetchSub(size, .monotonic);
     }
 
     /// Carve one fresh span into slots and push them onto class `idx`.
     fn refill(self: *Heap, idx: usize) bool {
         const cs = class_sizes[idx];
         const span = mapPages(span_bytes) orelse return false;
-        self.mapped_bytes += span_bytes;
+        _ = self.mapped_bytes.fetchAdd(span_bytes, .monotonic);
         const count = span_bytes / cs; // >= 1 by the span_bytes >= max_small invariant
         std.debug.assert(count >= 1);
         var i: usize = 0;
@@ -125,8 +138,8 @@ pub const Heap = struct {
         std.debug.assert(alignment <= ps);
         const len = alignUp(nonZero(size), ps);
         const mem = mapPages(len) orelse return null;
-        self.mapped_bytes += len;
-        self.live_bytes += size;
+        _ = self.mapped_bytes.fetchAdd(len, .monotonic);
+        _ = self.live_bytes.fetchAdd(size, .monotonic);
         return mem;
     }
 
@@ -135,8 +148,8 @@ pub const Heap = struct {
         std.debug.assert(alignment <= ps);
         const len = alignUp(nonZero(size), ps);
         unmapPages(ptr, len);
-        self.mapped_bytes -= len;
-        self.live_bytes -= size;
+        _ = self.mapped_bytes.fetchSub(len, .monotonic);
+        _ = self.live_bytes.fetchSub(size, .monotonic);
     }
 };
 
@@ -272,5 +285,60 @@ test "stress: 1M allocations churn without leaking live bytes" {
     for (&ring) |*e| {
         if (e.ptr) |p| heap.free(p, e.size, e.alignment);
     }
+    try testing.expectEqual(@as(usize, 0), heap.liveBytes());
+}
+
+test "concurrent stress: N threads share one heap without corruption or leak" {
+    if (builtin.single_threaded) return;
+
+    var heap = Heap.init();
+
+    // Each worker churns its own ring of live allocations against the shared heap.
+    // A per-thread sentinel byte written into every allocation must survive until
+    // that thread frees it: if the lock ever handed the same slot to two threads,
+    // one thread's write would clobber the other's sentinel and the assert fires.
+    const Worker = struct {
+        fn run(h: *Heap, seed: usize) void {
+            const iterations: usize = 200_000;
+            const ring_len: usize = 256;
+            const Entry = struct { ptr: ?[*]u8 = null, size: usize = 0, alignment: usize = 0, tag: u8 = 0 };
+            var ring = [_]Entry{.{}} ** ring_len;
+
+            var i: usize = 0;
+            while (i < iterations) : (i += 1) { // statically bounded
+                const e = &ring[i % ring_len];
+                if (e.ptr) |old| {
+                    std.debug.assert(old[0] == e.tag); // sentinel intact -> no cross-thread overlap
+                    h.free(old, e.size, e.alignment);
+                    e.ptr = null;
+                }
+                const mix = (i +% seed) *% 2654435761;
+                const size = 1 + mix % 20000; // spans the small and large paths
+                const alignment = @as(usize, 8) << @as(u6, @intCast(mix % 4)); // 8,16,32,64
+                const p = h.alloc(size, alignment) orelse @panic("heap exhausted in concurrent stress");
+                std.debug.assert(@intFromPtr(p) % alignment == 0);
+                const tag: u8 = @truncate(seed *% 131 +% i);
+                p[0] = tag;
+                e.* = .{ .ptr = p, .size = size, .alignment = alignment, .tag = tag };
+            }
+            for (&ring) |*e| {
+                if (e.ptr) |p| {
+                    std.debug.assert(p[0] == e.tag);
+                    h.free(p, e.size, e.alignment);
+                }
+            }
+        }
+    };
+
+    const nthreads = @min(@as(usize, 4), std.Thread.getCpuCount() catch 2);
+    var threads: [4]std.Thread = undefined;
+    var t: usize = 0;
+    while (t < nthreads) : (t += 1) {
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{ &heap, t + 1 });
+    }
+    for (threads[0..nthreads]) |th| th.join();
+
+    // Every allocation was freed by its owning thread: a clean liveBytes proves the
+    // atomic counter neither lost nor double-counted an update across the threads.
     try testing.expectEqual(@as(usize, 0), heap.liveBytes());
 }

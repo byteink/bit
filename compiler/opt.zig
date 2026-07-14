@@ -486,6 +486,7 @@ fn emitTranslated(
             remap[idx] = try bldr.callIface(ty, tr(remap, @intFromEnum(c.iface)), c.method_index, args);
         },
         .gc_alloc => |g| remap[idx] = try bldr.gcAlloc(ty, g.size, g.ptr_offsets),
+        .type_info => |t| remap[idx] = try bldr.typeInfoAddr(ty, t.disc, t.size, t.ptr_offsets),
         .field_get => |fg| remap[idx] = try bldr.fieldGet(ty, tr(remap, @intFromEnum(fg.base)), fg.offset),
         .field_set => |fs| try bldr.fieldSet(tr(remap, @intFromEnum(fs.base)), fs.offset, tr(remap, @intFromEnum(fs.value))),
         .index_get => |ig| remap[idx] = try bldr.indexGet(ty, tr(remap, @intFromEnum(ig.base)), tr(remap, @intFromEnum(ig.index))),
@@ -590,7 +591,7 @@ fn isSideEffecting(op: ir.Op) bool {
 
 fn markOperandsLive(f: *const ir.Function, live: []bool, id: ir.ValueId) void {
     switch (f.decode(id)) {
-        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc, .func_addr => {},
+        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc, .type_info, .func_addr => {},
         .bin => |b| {
             live[@intFromEnum(b.lhs)] = true;
             live[@intFromEnum(b.rhs)] = true;

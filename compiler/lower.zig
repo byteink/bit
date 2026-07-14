@@ -156,7 +156,21 @@ fn layoutFields(gpa: Allocator, ctx: *TypeContext, fields: []const check.Field) 
     errdefer ptrs.deinit(gpa);
     var cur: u32 = 0;
     for (fields, 0..) |f, i| {
-        const fl = fieldLayout(ctx.typeOf(f.ty));
+        const fd = ctx.typeOf(f.ty);
+        // A fixed-size array `[N]T` field is stored INLINE (value semantics,
+        // SPEC §11.2): `N` contiguous elements right in this struct's body, not
+        // a boxed handle. The element type is a scalar (checker-enforced), so
+        // its size is a power of two — a valid alignment — and the inline
+        // elements hold no GC references, so the field contributes no
+        // `ptr_offsets`.
+        if (fd == .array) {
+            const el = fieldLayout(ctx.typeOf(fd.array.elem));
+            cur = alignUp(cur, el.size);
+            offsets[i] = cur;
+            cur += @intCast(fd.array.len * el.size);
+            continue;
+        }
+        const fl = fieldLayout(fd);
         cur = alignUp(cur, fl.size);
         offsets[i] = cur;
         if (fl.is_ptr) try ptrs.append(gpa, cur);
@@ -960,7 +974,107 @@ const FnCtx = struct {
                 else => self.b.constInt(ty, 0),
             };
         }
+        // A fixed-size array zero-value (`let a: [N]T`) is a fresh inline storage
+        // block; `gc_alloc` hands back a zeroed body, so every element reads 0.
+        if (data == .array) return self.newArray(ty);
+        // A struct zero-value (`let s: S`) is a live, zeroed instance, not `nil`
+        // (SPEC §13.4): allocate its body — the zeroed memory gives every scalar
+        // field 0, every reference field null, and every inline array field a
+        // zeroed block. This is what makes `let s: S; s.w[0] = …` well-defined.
+        if (data == .@"struct") {
+            const layout = try self.l.structLayout(ty);
+            return self.b.gcAlloc(ty, layout.size, layout.ptr_offsets);
+        }
         return self.b.constNil(ty);
+    }
+
+    // ---- fixed-size arrays (`[N]T`, SPEC §11.2) -----------------------------
+    // An array value is a pointer to `N` inline, contiguous scalar elements
+    // (the element type is checker-restricted to a scalar value type, so the
+    // block holds no GC references). A standalone array is its own `gc_alloc`
+    // body; as a struct field it lives inline in the parent's body. Value
+    // semantics (deep copy on bind) are realized by cloning at each bind site.
+
+    const ArrayShape = struct { len: u64, elem: TypeId, elem_size: u32, bytes: u32 };
+
+    fn arrayShape(self: *const FnCtx, ty: TypeId) ArrayShape {
+        const a = self.ctx.typeOf(ty).array;
+        const es = fieldLayout(self.ctx.typeOf(a.elem)).size;
+        return .{ .len = a.len, .elem = a.elem, .elem_size = es, .bytes = @intCast(a.len * es) };
+    }
+
+    /// A fresh, zeroed inline storage block for an `[N]T` value.
+    fn newArray(self: *FnCtx, ty: TypeId) Error!ir.ValueId {
+        const sh = self.arrayShape(ty);
+        return self.b.gcAlloc(ty, sh.bytes, &.{});
+    }
+
+    /// Copy every element of the `[N]T` at `src` into the storage at `dst`
+    /// (both are element-base pointers). Unrolled — `N` is a compile-time
+    /// constant, and arrays are small; this keeps the copy branch-free with no
+    /// extra basic blocks. Elements are scalars, so a plain load+store suffices.
+    fn copyArrayElems(self: *FnCtx, dst: ir.ValueId, src: ir.ValueId, sh: ArrayShape) Error!void {
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        var i: u64 = 0;
+        while (i < sh.len) : (i += 1) {
+            const idx = try self.b.constInt(i64ty, @intCast(i));
+            const e = try self.b.indexGet(sh.elem, src, idx);
+            try self.b.indexSet(dst, idx, e);
+        }
+    }
+
+    /// An independent copy of the `[N]T` value `src`.
+    ///
+    /// Every source element is read *before* the destination is allocated:
+    /// `src` may be an interior pointer into a struct whose last use was the
+    /// field access that produced it, and `gc_alloc` is a safepoint — reading
+    /// first keeps the loads off the far side of a collection that could free
+    /// the parent. The elements are scalars, so holding them across the
+    /// allocation is safe (they carry no references the GC must trace).
+    fn cloneArray(self: *FnCtx, src: ir.ValueId, ty: TypeId) Error!ir.ValueId {
+        const sh = self.arrayShape(ty);
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const elems = try self.gpa.alloc(ir.ValueId, @intCast(sh.len));
+        defer self.gpa.free(elems);
+        for (elems, 0..) |*e, i| {
+            const idx = try self.b.constInt(i64ty, @intCast(i));
+            e.* = try self.b.indexGet(sh.elem, src, idx);
+        }
+        const dst = try self.b.gcAlloc(ty, sh.bytes, &.{});
+        for (elems, 0..) |e, i| {
+            const idx = try self.b.constInt(i64ty, @intCast(i));
+            try self.b.indexSet(dst, idx, e);
+        }
+        return dst;
+    }
+
+    /// The value to bind when an `[N]T`-typed expression is captured into a new
+    /// location (let/assign to a local, call argument, return). A reference
+    /// expression (identifier, field, index) names existing storage, so it must
+    /// be cloned to honor value semantics; a fresh producer (array literal,
+    /// call result) already owns distinct storage and is bound as-is. Non-array
+    /// values pass through untouched.
+    fn arrayValueForBind(self: *FnCtx, node: ast.Index, val: ir.ValueId, ty: TypeId) Error!ir.ValueId {
+        if (self.ctx.typeOf(ty) != .array) return val;
+        return switch (self.tree().get(node).tag) {
+            .ident, .member, .index => try self.cloneArray(val, ty),
+            else => val,
+        };
+    }
+
+    /// Lower an array literal `[N]T{ e0, e1, ... }` into a fresh inline block,
+    /// storing each (scalar) element in turn.
+    fn lowerArrayElems(self: *FnCtx, array_ty: TypeId, items: []const ast.Index) Error!ir.ValueId {
+        const sh = self.arrayShape(array_ty);
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const dst = try self.b.gcAlloc(array_ty, sh.bytes, &.{});
+        for (items, 0..) |a, i| {
+            const inner = self.kids(a)[0];
+            const v = try self.lowerExprH(inner, sh.elem);
+            const idx = try self.b.constInt(i64ty, @intCast(i));
+            try self.b.indexSet(dst, idx, v);
+        }
+        return dst;
     }
 
     // ---- statements ---------------------------------------------------------
@@ -1017,15 +1131,117 @@ const FnCtx = struct {
     fn coerceToIface(self: *FnCtx, val: ir.ValueId, target: TypeId) Error!ir.ValueId {
         if (self.ctx.typeOf(target) != .interface) return val;
         if (self.b.valueType(val) == target) return val;
+        // The relabel is only sound because the incoming value is *already* an
+        // object pointer (a struct, another interface, or the null word); a
+        // scalar here would put a non-pointer in a word the GC traces as a root
+        // (SPEC §14.3). The checker rejects that — hold it.
+        std.debug.assert(switch (self.ctx.typeOf(self.b.valueType(val))) {
+            .@"struct", .interface, .untyped_nil => true,
+            else => false,
+        });
         return self.b.convert(target, val);
+    }
+
+    /// The address of `ty`'s static `TypeInfo` (ABI.md §2). Typed `u64`, not a
+    /// reference: the descriptor is a `.rodata` constant, so a reference type
+    /// would hand it to the collector as a root at the next safepoint.
+    fn typeInfoOf(self: *FnCtx, ty: TypeId) Error!ir.ValueId {
+        const layout = try self.l.structLayout(ty); // checker restricts assertion targets to structs
+        return self.b.typeInfoAddr(self.ctx.prim_ids.get(.u64), @intFromEnum(ty), layout.size, layout.ptr_offsets);
+    }
+
+    /// The two-result forms: `<- c` (SPEC §16.2), `m[k]` (§12.6), `iface.(T)`
+    /// (§14.4). Null if `node` is none of them — the caller then has a plain
+    /// single-value initializer and a tuple pattern it cannot destructure.
+    ///
+    /// The chan and interface forms read their `ok` from a runtime call that
+    /// reports the *immediately preceding* one (ABI.md §2.2/§11), so each pair is
+    /// emitted back to back with nothing in between.
+    fn lowerTwoResult(self: *FnCtx, node: ast.Index) Error!?[2]ir.ValueId {
+        const n = self.tree().get(node);
+        const k = self.kids(node);
+        // In every form the node's own type is the *value* type (the checker
+        // records the map's value / the channel's element / the assertion's
+        // target there), and the second result is always `bool`.
+        const val_ty = try self.nodeType(node);
+        const ok_ty = self.ctx.prim_ids.get(.bool);
+        switch (n.tag) {
+            .unary => {
+                const op: lexer.Kind = @enumFromInt(n.main);
+                if (op != .arrow_left) return null;
+                const ch = try self.lowerExpr(k[0]);
+                const v = try self.b.rtCall(val_ty, .chan_recv, &.{ch});
+                const ok = try self.b.rtCall(ok_ty, .chan_recv_ok, &.{});
+                return .{ v, ok };
+            },
+            // A map lookup and its presence test are two independent probes of a
+            // table that cannot change between them (no safepoint, no yield), so
+            // no `ok` slot is needed — unlike the chan/interface forms.
+            .index => {
+                const recv_ty = try self.nodeType(k[0]);
+                const recv_data = self.ctx.typeOf(recv_ty);
+                if (recv_data != .map) return null;
+                const m = try self.lowerExpr(k[0]);
+                const key = try self.lowerExprH(k[1], recv_data.map.key);
+                const v = try self.b.rtCall(val_ty, .map_get, &.{ m, key });
+                const ok = try self.b.rtCall(ok_ty, .map_has, &.{ m, key });
+                return .{ v, ok };
+            },
+            .type_assert => {
+                const recv = try self.lowerExpr(k[0]);
+                const info = try self.typeInfoOf(val_ty);
+                const v = try self.b.rtCall(val_ty, .iface_as, &.{ recv, info });
+                const ok = try self.b.rtCall(ok_ty, .iface_as_ok, &.{});
+                return .{ v, ok };
+            },
+            else => return null,
+        }
+    }
+
+    /// `let (v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2).
+    fn lowerTwoResultLet(self: *FnCtx, bk: []const ast.Index) Error!void {
+        const pats = self.kids(bk[0]);
+        if (pats.len != 2 or bk[2] == ast.none) return error.UnsupportedConstruct;
+        for (pats) |p| if (self.tree().get(p).tag != .ident) return error.UnsupportedConstruct;
+        const two = try self.lowerTwoResult(bk[2]) orelse return error.UnsupportedConstruct;
+        try self.declareUnlessBlank(pats[0], two[0], try self.nodeType(bk[2]));
+        try self.declareUnlessBlank(pats[1], two[1], self.ctx.prim_ids.get(.bool));
+    }
+
+    /// `(v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2) — as above, but the
+    /// two targets are existing lvalues rather than fresh bindings. Both are
+    /// resolved before the right-hand side runs, matching plain `=`.
+    fn lowerTwoResultAssign(self: *FnCtx, targets: []const ast.Index, init_node: ast.Index) Error!void {
+        if (targets.len != 2) return error.UnsupportedConstruct;
+        var lvs: [2]Lvalue = undefined;
+        for (targets, 0..) |t, i| lvs[i] = try self.resolveLvalue(t);
+        const two = try self.lowerTwoResult(init_node) orelse return error.UnsupportedConstruct;
+        for (lvs, two) |lv, v| try self.writeLvalue(lv, v);
+    }
+
+    /// `_` discards its value (SPEC.md §5) — binding it would shadow the next `_`.
+    fn declareUnlessBlank(self: *FnCtx, pat: ast.Index, val: ir.ValueId, ty: TypeId) Error!void {
+        const name = self.identText(pat);
+        if (std.mem.eql(u8, name, "_")) return;
+        try self.env.declare(self.gpa, name, val, ty);
     }
 
     fn lowerLetConst(self: *FnCtx, node: ast.Index) Error!void {
         for (self.kids(node)) |bind| {
             const bk = self.kids(bind); // binding: [pattern, type_or_none, init_or_none]
-            if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct; // tuple destructuring: deferred
+            if (self.tree().get(bk[0]).tag == .tuple_pat) {
+                try self.lowerTwoResultLet(bk);
+                continue;
+            }
+            if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct;
             const ty = try self.nodeType(bk[0]);
-            const raw = if (bk[2] != ast.none) try self.lowerExprH(bk[2], ty) else try self.zeroValue(ty);
+            const raw = if (bk[2] != ast.none) blk: {
+                const r = try self.lowerExprH(bk[2], ty);
+                // Value semantics: binding an array from an existing location
+                // takes an independent copy (a zero-init or fresh literal
+                // already owns its storage).
+                break :blk try self.arrayValueForBind(bk[2], r, ty);
+            } else try self.zeroValue(ty);
             const val = try self.coerceToIface(raw, ty);
             try self.env.declare(self.gpa, self.identText(bk[0]), val, ty);
         }
@@ -1087,7 +1303,12 @@ const FnCtx = struct {
             // across later joins (see `coerceToIface`).
             .local => |i| self.env.bindings.items[i].value =
                 try self.coerceToIface(val, self.env.bindings.items[i].ty),
-            .field => |f| try self.b.fieldSet(f.recv, f.offset, val),
+            // An inline array field is written by copying the source elements
+            // into its storage, not by storing a handle.
+            .field => |f| if (self.ctx.typeOf(f.ty) == .array) {
+                const dst = try self.b.fieldGet(f.ty, f.recv, f.offset);
+                try self.copyArrayElems(dst, val, self.arrayShape(f.ty));
+            } else try self.b.fieldSet(f.recv, f.offset, val),
             .elem => |e| if (e.is_slice) {
                 _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ e.recv, e.index, val });
             } else try self.b.indexSet(e.recv, e.index, val),
@@ -1111,6 +1332,18 @@ const FnCtx = struct {
             try self.writeLvalue(lv, result);
             return;
         }
+        // `(v, ok) = <two-result>` (§12.6/§14.4/§16.2): the parser folds the
+        // parenthesized target list into one `tuple_pat`.
+        if (lhs_items.len == 1 and rhs_items.len == 1 and self.tree().get(lhs_items[0]).tag == .tuple_pat) {
+            try self.lowerTwoResultAssign(self.kids(lhs_items[0]), rhs_items[0]);
+            return;
+        }
+        // The same, unparenthesized (`v, ok = m[k]`). Any *other* 2-target,
+        // 1-value assignment is an arity error the checker already rejected.
+        if (lhs_items.len == 2 and rhs_items.len == 1) {
+            try self.lowerTwoResultAssign(lhs_items, rhs_items[0]);
+            return;
+        }
         // Plain `=`: resolve every lvalue and evaluate every rhs before any
         // write, so `a, b = b, a` swaps rather than aliasing.
         const lvs = try self.gpa.alloc(Lvalue, lhs_items.len);
@@ -1118,7 +1351,11 @@ const FnCtx = struct {
         for (lhs_items, 0..) |ln, i| lvs[i] = try self.resolveLvalue(ln);
         const vals = try self.gpa.alloc(ir.ValueId, rhs_items.len);
         defer self.gpa.free(vals);
-        for (rhs_items, 0..) |rn, i| vals[i] = try self.lowerExprH(rn, try self.nodeType(lhs_items[i]));
+        for (rhs_items, 0..) |rn, i| {
+            const ty = try self.nodeType(lhs_items[i]);
+            const raw = try self.lowerExprH(rn, ty);
+            vals[i] = try self.arrayValueForBind(rn, raw, ty);
+        }
         std.debug.assert(lvs.len == vals.len);
         for (lvs, vals) |lv, v| try self.writeLvalue(lv, v);
     }
@@ -1142,7 +1379,10 @@ const FnCtx = struct {
         const exprs = self.kids(node);
         const vals = try self.gpa.alloc(ir.ValueId, exprs.len);
         defer self.gpa.free(vals);
-        for (exprs, 0..) |e, i| vals[i] = try self.lowerExpr(e);
+        // Value semantics: returning an array from an existing location yields
+        // an independent copy, so a caller cannot observe later mutation of a
+        // local (and a returned local's storage is never aliased).
+        for (exprs, 0..) |e, i| vals[i] = try self.arrayValueForBind(e, try self.lowerExpr(e), try self.nodeType(e));
         try self.runDefers();
         // A fallible function's ok return must leave the error slot null; clear
         // it after defers (a deferred fallible call may have set it — §18.5).
@@ -2232,6 +2472,13 @@ const FnCtx = struct {
             const kv = try self.lowerExprH(self.kids(arg_nodes[1])[0], key_ty);
             return self.b.rtCall(void_ty, .map_delete, &.{ mv, kv });
         }
+        if (std.mem.eql(u8, name, "close")) {
+            // SPEC §16.2: `close(c)` marks the channel closed — pending and
+            // subsequent receives drain, then yield `(zero, false)`. The checker
+            // already proved the operand is a channel.
+            const cv = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+            return self.b.rtCall(void_ty, .chan_close, &.{cv});
+        }
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
         // Runtime primitives (fs §14, math §17, time §18, os §19): each maps 1:1
         // to a runtime call whose result the checker already typed. The arity and
@@ -2394,7 +2641,11 @@ const FnCtx = struct {
         for (self.kids(k[2]), 0..) |an, i| {
             if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct;
             const hint: ?TypeId = if (i < params.len) params[i] else null;
-            try args.append(self.gpa, try self.lowerExprH(self.kids(an)[0], hint));
+            const arg_expr = self.kids(an)[0];
+            const av = try self.lowerExprH(arg_expr, hint);
+            // Value semantics: an array argument is passed by copy, so the
+            // callee cannot mutate the caller's storage.
+            try args.append(self.gpa, try self.arrayValueForBind(arg_expr, av, try self.nodeType(arg_expr)));
         }
         // A fallible callee delivers its ok value in the normal return register
         // (the error rides the runtime slot — §18), so the call instruction's
@@ -2695,7 +2946,17 @@ const FnCtx = struct {
             .catch_default => self.lowerCatch(node, false),
             .catch_bind => self.lowerCatch(node, true),
             .match_stmt => self.lowerMatchExpr(node),
-            else => error.UnsupportedConstruct, // type_assert/tuple_index/map literals
+            // The one-result assertion `iface.(T)` (SPEC §14.4): panics on a
+            // mismatch. The two-result form never reaches here — a `tuple_pat`
+            // target routes it through `lowerTwoResult` instead.
+            .type_assert => blk: {
+                const k = self.kids(node);
+                const ty = try self.nodeType(node);
+                const recv = try self.lowerExpr(k[0]);
+                const info = try self.typeInfoOf(ty);
+                break :blk self.b.rtCall(ty, .iface_assert, &.{ recv, info });
+            },
+            else => error.UnsupportedConstruct, // tuple_index/map literals
         };
     }
 
@@ -2990,6 +3251,7 @@ const FnCtx = struct {
         const ty = try self.nodeType(node);
         const data = self.ctx.typeOf(ty);
         if (data == .slice) return self.lowerSliceElems(ty, self.kids(k[1])); // []T{...}
+        if (data == .array) return self.lowerArrayElems(ty, self.kids(k[1])); // [N]T{...}
         if (data == .map) return self.lowerMapLit(node, k[1]); // map<K,V>{...}
         if (data != .@"struct") return error.UnsupportedConstruct;
         const init_node = k[1];
@@ -3003,7 +3265,15 @@ const FnCtx = struct {
             var found = false;
             for (data.@"struct", 0..) |f, i| {
                 if (!std.mem.eql(u8, f.name, name)) continue;
-                try self.b.fieldSet(obj, layout.field_offsets[i], val);
+                // A fixed-size array field lives inline: copy the source
+                // elements into the field's storage rather than storing a
+                // handle. Omitted array fields stay zero (the body is zeroed).
+                if (self.ctx.typeOf(f.ty) == .array) {
+                    const dst = try self.b.fieldGet(f.ty, obj, layout.field_offsets[i]);
+                    try self.copyArrayElems(dst, val, self.arrayShape(f.ty));
+                } else {
+                    try self.b.fieldSet(obj, layout.field_offsets[i], val);
+                }
                 found = true;
             }
             if (!found) return error.UnsupportedConstruct;
@@ -3027,7 +3297,7 @@ const FnCtx = struct {
             };
         }
         // Everything else needs `show(): string` (§5.7). The checker enforces
-        // it — signature included — through this same predicate (E0072), so a
+        // it — signature included — through this same predicate (E0073), so a
         // wrong-shaped `show` can never be called here, and reaching the final
         // return means the checker let an unconvertible operand through.
         if (self.ctx.showMethod(ty) != null) {

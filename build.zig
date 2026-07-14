@@ -16,7 +16,19 @@ fn wireLibbitrt(opts: *std.Build.Step.Options, bin: ?std.Build.LazyPath) void {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseSafe, not Debug. In Debug, std's DebugAllocator captures
+    // a DWARF stack trace on every allocation for leak detection; the compiler
+    // allocates heavily, so a plain `zig build` compiler spent ~38s on the crypto
+    // tree almost entirely in stack unwinding. ReleaseSafe keeps every safety
+    // check (bounds, overflow, unreachable) but drops the per-alloc capture,
+    // cutting that same compile to <1s. Pass `-Doptimize=Debug` for leak checks.
+    // (standardOptimizeOption's preferred_optimize_mode only rebinds -Drelease and
+    // still defaults to Debug, so bind -Doptimize directly with a ReleaseSafe default.)
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
+    ) orelse .ReleaseSafe;
 
     const exe = b.addExecutable(.{
         .name = "bitc",
@@ -270,7 +282,12 @@ pub fn build(b: *std.Build) void {
     examples_mod.addOptions("build_options", examples_opts);
 
     const examples_tests = b.addTest(.{ .root_module = examples_mod });
-    test_step.dependOn(&b.addRunArtifact(examples_tests).step);
+    const examples_run = b.addRunArtifact(examples_tests);
+    // examples/* and stdlib/* are read at runtime (like the imports harness), so
+    // a new or edited example is invisible to the build cache; without this the
+    // run is cache-skipped and a broken example passes silently.
+    examples_run.has_side_effects = true;
+    test_step.dependOn(&examples_run.step);
 
     // Concurrency + GC stress suite (task #350): compiles + runs each
     // tests/stress/* program twice — default policy and BIT_GC=stress (collect

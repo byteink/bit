@@ -1,0 +1,420 @@
+// Bit standard library — crypto module, bitsliced constant-time AES (the CTR
+// keystream engine AES-GCM's bulk path runs on).
+//
+// The byte-oriented `AesCipher` in aes.bit is constant-time but slow: its S-box
+// computes a GF(2^8) inverse per byte (~13 field multiplies), ~224 times a block.
+// This module is the fast constant-time alternative for the one place that
+// dominates AES-GCM's cost — the CTR keystream. It is a port of Thomas Pornin's
+// BearSSL `aes_ct64` design: the state is held *bitsliced* across eight 64-bit
+// words, four AES blocks are enciphered in parallel, and the S-box is the
+// Boyar-Peralta boolean circuit (a straight-line sequence of AND/XOR/NOT gates,
+// ~113 of them). No table is indexed by a data byte and no branch depends on
+// data, so — exactly like the byte cipher — timing is independent of key and
+// plaintext, but each S-box costs a fixed handful of logic ops rather than a
+// full field inversion.
+//
+// BITSLICE LAYOUT. `interleave_in` packs four AES blocks' bytes into the eight
+// `q` words, `ortho` transposes the bit-matrix so that each `q` word holds one
+// bit-plane of every state byte, and the inverses undo it. All of AddRoundKey,
+// ShiftRows, MixColumns and the S-box then act on the whole 4-block group with
+// plain 64-bit word logic. Bytes are decoded little-endian into 32-bit column
+// words, matching BearSSL's convention; because the round keys are bitsliced
+// through the very same path (see `aesctExpandSkey`), AddRoundKey stays aligned
+// regardless of that convention.
+//
+// SCOPE. Only the forward keystream is here — GCM CTR never needs decryption or
+// InvMixColumns (XOR of the keystream is its own inverse). The byte cipher in
+// aes.bit still handles single blocks (J0, the GHASH subkey H) and the key
+// schedule; this module reuses those FIPS-197 round-key bytes as-is.
+
+// Decode 4 bytes of `data` at `off` as a little-endian u64 (value in the low 32
+// bits) — one AES state column, in BearSSL's word convention.
+function aesctLoadLe(data: []byte, off: int): u64 {
+  return u64(data[off]) | (u64(data[off + 1]) << 8) | (u64(data[off + 2]) << 16) | (u64(data[off + 3]) << 24)
+}
+
+// Store the low 32 bits of `w` as 4 little-endian bytes into `out` at `off`.
+function aesctStoreLe(out: []byte, off: int, w: u64) {
+  out[off] = byte(w)
+  out[off + 1] = byte(w >> 8)
+  out[off + 2] = byte(w >> 16)
+  out[off + 3] = byte(w >> 24)
+}
+
+// Pack one AES block's four column words into the bitslice pair (q[idx], q[idx+4]).
+// This is BearSSL's `interleave_in`: it spreads the block's 16 bytes so a later
+// `ortho` can transpose them into bit-planes.
+function aesctInterleaveIn(q: []u64, idx: int, w0: u64, w1: u64, w2: u64, w3: u64) {
+  let mA: u64 = 0x0000FFFF0000FFFF
+  let mB: u64 = 0x00FF00FF00FF00FF
+  let x0 = w0 | (w0 << 16)
+  let x1 = w1 | (w1 << 16)
+  let x2 = w2 | (w2 << 16)
+  let x3 = w3 | (w3 << 16)
+  x0 = x0 & mA
+  x1 = x1 & mA
+  x2 = x2 & mA
+  x3 = x3 & mA
+  x0 = x0 | (x0 << 8)
+  x1 = x1 | (x1 << 8)
+  x2 = x2 | (x2 << 8)
+  x3 = x3 | (x3 << 8)
+  x0 = x0 & mB
+  x1 = x1 & mB
+  x2 = x2 & mB
+  x3 = x3 & mB
+  q[idx] = x0 | (x2 << 8)
+  q[idx + 4] = x1 | (x3 << 8)
+}
+
+// Unpack the bitslice pair (q0, q1) back into one AES block's four column words
+// and store them little-endian at `out[off..off+16)`. BearSSL's `interleave_out`.
+function aesctInterleaveOut(out: []byte, off: int, q0: u64, q1: u64) {
+  let mB: u64 = 0x00FF00FF00FF00FF
+  let mA: u64 = 0x0000FFFF0000FFFF
+  let x0 = q0 & mB
+  let x1 = q1 & mB
+  let x2 = (q0 >> 8) & mB
+  let x3 = (q1 >> 8) & mB
+  x0 = x0 | (x0 >> 8)
+  x1 = x1 | (x1 >> 8)
+  x2 = x2 | (x2 >> 8)
+  x3 = x3 | (x3 >> 8)
+  x0 = x0 & mA
+  x1 = x1 & mA
+  x2 = x2 & mA
+  x3 = x3 & mA
+  aesctStoreLe(out, off + 0, x0 | (x0 >> 16))
+  aesctStoreLe(out, off + 4, x1 | (x1 >> 16))
+  aesctStoreLe(out, off + 8, x2 | (x2 >> 16))
+  aesctStoreLe(out, off + 12, x3 | (x3 >> 16))
+}
+
+// One SWAPN step of BearSSL's `ortho`: exchange the bit groups selected by the
+// low/high masks between q[i] and q[j], shifting by `s`. Half of a bit-matrix
+// transpose.
+function aesctSwap(q: []u64, i: int, j: int, cl: u64, ch: u64, s: u64) {
+  let a = q[i]
+  let b = q[j]
+  q[i] = (a & cl) | ((b & cl) << s)
+  q[j] = ((a & ch) >> s) | (b & ch)
+}
+
+// Transpose the eight `q` words between the packed and bit-plane representations
+// (its own inverse). BearSSL's `ortho`: three passes of paired swaps at stride
+// 1, 2, and 4.
+function aesctOrtho(q: []u64) {
+  let cl2: u64 = 0x5555555555555555
+  let ch2: u64 = 0xAAAAAAAAAAAAAAAA
+  let cl4: u64 = 0x3333333333333333
+  let ch4: u64 = 0xCCCCCCCCCCCCCCCC
+  let cl8: u64 = 0x0F0F0F0F0F0F0F0F
+  let ch8: u64 = 0xF0F0F0F0F0F0F0F0
+  aesctSwap(q, 0, 1, cl2, ch2, 1)
+  aesctSwap(q, 2, 3, cl2, ch2, 1)
+  aesctSwap(q, 4, 5, cl2, ch2, 1)
+  aesctSwap(q, 6, 7, cl2, ch2, 1)
+  aesctSwap(q, 0, 2, cl4, ch4, 2)
+  aesctSwap(q, 1, 3, cl4, ch4, 2)
+  aesctSwap(q, 4, 6, cl4, ch4, 2)
+  aesctSwap(q, 5, 7, cl4, ch4, 2)
+  aesctSwap(q, 0, 4, cl8, ch8, 4)
+  aesctSwap(q, 1, 5, cl8, ch8, 4)
+  aesctSwap(q, 2, 6, cl8, ch8, 4)
+  aesctSwap(q, 3, 7, cl8, ch8, 4)
+}
+
+// The AES S-box as the Boyar-Peralta boolean circuit, applied to all four blocks
+// at once over the eight bitslice words (Boyar & Peralta 2009, eprint 2009/191,
+// as implemented in BearSSL). A fixed straight-line net of AND/XOR/NOT — no
+// table, no branch — so it is constant-time by construction. Inputs read from
+// q[7..0] (q[7] is the most significant bit-plane); outputs written back the same
+// way.
+function aesctSbox(q: []u64) {
+  let x0 = q[7]
+  let x1 = q[6]
+  let x2 = q[5]
+  let x3 = q[4]
+  let x4 = q[3]
+  let x5 = q[2]
+  let x6 = q[1]
+  let x7 = q[0]
+
+  // Top linear transformation.
+  let y14 = x3 ^ x5
+  let y13 = x0 ^ x6
+  let y9 = x0 ^ x3
+  let y8 = x0 ^ x5
+  let t0 = x1 ^ x2
+  let y1 = t0 ^ x7
+  let y4 = y1 ^ x3
+  let y12 = y13 ^ y14
+  let y2 = y1 ^ x0
+  let y5 = y1 ^ x6
+  let y3 = y5 ^ y8
+  let t1 = x4 ^ y12
+  let y15 = t1 ^ x5
+  let y20 = t1 ^ x1
+  let y6 = y15 ^ x7
+  let y10 = y15 ^ t0
+  let y11 = y20 ^ y9
+  let y7 = x7 ^ y11
+  let y17 = y10 ^ y11
+  let y19 = y10 ^ y8
+  let y16 = t0 ^ y11
+  let y21 = y13 ^ y16
+  let y18 = x0 ^ y16
+
+  // Non-linear section.
+  let t2 = y12 & y15
+  let t3 = y3 & y6
+  let t4 = t3 ^ t2
+  let t5 = y4 & x7
+  let t6 = t5 ^ t2
+  let t7 = y13 & y16
+  let t8 = y5 & y1
+  let t9 = t8 ^ t7
+  let t10 = y2 & y7
+  let t11 = t10 ^ t7
+  let t12 = y9 & y11
+  let t13 = y14 & y17
+  let t14 = t13 ^ t12
+  let t15 = y8 & y10
+  let t16 = t15 ^ t12
+  let t17 = t4 ^ t14
+  let t18 = t6 ^ t16
+  let t19 = t9 ^ t14
+  let t20 = t11 ^ t16
+  let t21 = t17 ^ y20
+  let t22 = t18 ^ y19
+  let t23 = t19 ^ y21
+  let t24 = t20 ^ y18
+
+  let t25 = t21 ^ t22
+  let t26 = t21 & t23
+  let t27 = t24 ^ t26
+  let t28 = t25 & t27
+  let t29 = t28 ^ t22
+  let t30 = t23 ^ t24
+  let t31 = t22 ^ t26
+  let t32 = t31 & t30
+  let t33 = t32 ^ t24
+  let t34 = t23 ^ t33
+  let t35 = t27 ^ t33
+  let t36 = t24 & t35
+  let t37 = t36 ^ t34
+  let t38 = t27 ^ t36
+  let t39 = t29 & t38
+  let t40 = t25 ^ t39
+
+  let t41 = t40 ^ t37
+  let t42 = t29 ^ t33
+  let t43 = t29 ^ t40
+  let t44 = t33 ^ t37
+  let t45 = t42 ^ t41
+  let z0 = t44 & y15
+  let z1 = t37 & y6
+  let z2 = t33 & x7
+  let z3 = t43 & y16
+  let z4 = t40 & y1
+  let z5 = t29 & y7
+  let z6 = t42 & y11
+  let z7 = t45 & y17
+  let z8 = t41 & y10
+  let z9 = t44 & y12
+  let z10 = t37 & y3
+  let z11 = t33 & y4
+  let z12 = t43 & y13
+  let z13 = t40 & y5
+  let z14 = t29 & y2
+  let z15 = t42 & y9
+  let z16 = t45 & y14
+  let z17 = t41 & y8
+
+  // Bottom linear transformation.
+  let t46 = z15 ^ z16
+  let t47 = z10 ^ z11
+  let t48 = z5 ^ z13
+  let t49 = z9 ^ z10
+  let t50 = z2 ^ z12
+  let t51 = z2 ^ z5
+  let t52 = z7 ^ z8
+  let t53 = z0 ^ z3
+  let t54 = z6 ^ z7
+  let t55 = z16 ^ z17
+  let t56 = z12 ^ t48
+  let t57 = t50 ^ t53
+  let t58 = z4 ^ t46
+  let t59 = z3 ^ t54
+  let t60 = t46 ^ t57
+  let t61 = z14 ^ t57
+  let t62 = t52 ^ t58
+  let t63 = t49 ^ t58
+  let t64 = z4 ^ t59
+  let t65 = t61 ^ t62
+  let t66 = z1 ^ t63
+  let s0 = t59 ^ t63
+  let s6 = t56 ^ ~t62
+  let s7 = t48 ^ ~t60
+  let t67 = t64 ^ t65
+  let s3 = t53 ^ t66
+  let s4 = t51 ^ t66
+  let s5 = t47 ^ t65
+  let s1 = t64 ^ ~s3
+  let s2 = t55 ^ ~t67
+
+  q[7] = s0
+  q[6] = s1
+  q[5] = s2
+  q[4] = s3
+  q[3] = s4
+  q[2] = s5
+  q[1] = s6
+  q[0] = s7
+}
+
+// ShiftRows over the bitslice words: each `q` word carries one bit-plane laid out
+// as a 4x4 byte grid, and the cyclic row shifts become the fixed nibble-lane
+// moves below (BearSSL's `shift_rows`). Row 0 is untouched.
+function aesctShiftRows(q: []u64) {
+  let m0: u64 = 0x000000000000FFFF
+  let m1: u64 = 0x00000000FFF00000
+  let m2: u64 = 0x00000000000F0000
+  let m3: u64 = 0x0000FF0000000000
+  let m4: u64 = 0x000000FF00000000
+  let m5: u64 = 0xF000000000000000
+  let m6: u64 = 0x0FFF000000000000
+  let i = 0
+  while (i < 8) {
+    let x = q[i]
+    q[i] = (x & m0) |
+      ((x & m1) >> 4) |
+      ((x & m2) << 12) |
+      ((x & m3) >> 8) |
+      ((x & m4) << 8) |
+      ((x & m5) >> 12) |
+      ((x & m6) << 4)
+    i = i + 1
+  }
+}
+
+// Rotate a bitslice word by 32 bits — swaps the two block-column halves, the
+// column rotation MixColumns needs.
+function aesctRotr32(x: u64): u64 {
+  return (x << 32) | (x >> 32)
+}
+
+// MixColumns over the bitslice words (BearSSL's `mix_columns`). `rN` is `qN`
+// rotated one byte within each column; the fixed XOR pattern below is the
+// {2,3,1,1} matrix product expressed as GF(2) plane arithmetic.
+function aesctMixColumns(q: []u64) {
+  let q0 = q[0]
+  let q1 = q[1]
+  let q2 = q[2]
+  let q3 = q[3]
+  let q4 = q[4]
+  let q5 = q[5]
+  let q6 = q[6]
+  let q7 = q[7]
+  let r0 = (q0 >> 16) | (q0 << 48)
+  let r1 = (q1 >> 16) | (q1 << 48)
+  let r2 = (q2 >> 16) | (q2 << 48)
+  let r3 = (q3 >> 16) | (q3 << 48)
+  let r4 = (q4 >> 16) | (q4 << 48)
+  let r5 = (q5 >> 16) | (q5 << 48)
+  let r6 = (q6 >> 16) | (q6 << 48)
+  let r7 = (q7 >> 16) | (q7 << 48)
+  q[0] = q7 ^ r7 ^ r0 ^ aesctRotr32(q0 ^ r0)
+  q[1] = q0 ^ r0 ^ q7 ^ r7 ^ r1 ^ aesctRotr32(q1 ^ r1)
+  q[2] = q1 ^ r1 ^ r2 ^ aesctRotr32(q2 ^ r2)
+  q[3] = q2 ^ r2 ^ q7 ^ r7 ^ r3 ^ aesctRotr32(q3 ^ r3)
+  q[4] = q3 ^ r3 ^ q7 ^ r7 ^ r4 ^ aesctRotr32(q4 ^ r4)
+  q[5] = q4 ^ r4 ^ r5 ^ aesctRotr32(q5 ^ r5)
+  q[6] = q5 ^ r5 ^ r6 ^ aesctRotr32(q6 ^ r6)
+  q[7] = q6 ^ r6 ^ r7 ^ aesctRotr32(q7 ^ r7)
+}
+
+// AddRoundKey: XOR round `round`'s bitsliced subkey (8 words at sk[round*8..]) into
+// the state.
+function aesctAddRoundKey(q: []u64, sk: []u64, round: int) {
+  let off = round * 8
+  let i = 0
+  while (i < 8) {
+    q[i] = q[i] ^ sk[off + i]
+    i = i + 1
+  }
+}
+
+// Bitslice the FIPS-197 round-key bytes `rk` (16*(nr+1) bytes, as `expandKey`
+// lays them out) into the subkey schedule the bitsliced core consumes: 8 u64 per
+// round, at sk[round*8..]. Each 16-byte round key is decoded little-endian, spread
+// with `interleave_in`, broadcast into all four block lanes, then transposed with
+// `ortho` — the same packing blocks go through, so AddRoundKey lines up exactly.
+function aesctExpandSkey(rk: []byte, nr: int): []u64 {
+  let sk = []u64(8 * (nr + 1))
+  let q = []u64(8)
+  let r = 0
+  while (r <= nr) {
+    let base = r * 16
+    aesctInterleaveIn(q, 0,
+      aesctLoadLe(rk, base + 0),
+      aesctLoadLe(rk, base + 4),
+      aesctLoadLe(rk, base + 8),
+      aesctLoadLe(rk, base + 12))
+    // interleave_in filled q[0] and q[4] from the single round key; replicate it
+    // into the other three block lanes so it is added to all four blocks.
+    q[1] = q[0]
+    q[2] = q[0]
+    q[3] = q[0]
+    q[5] = q[4]
+    q[6] = q[4]
+    q[7] = q[4]
+    aesctOrtho(q)
+    let k = 0
+    while (k < 8) {
+      sk[r * 8 + k] = q[k]
+      k = k + 1
+    }
+    r = r + 1
+  }
+  return sk
+}
+
+// Encipher four counter blocks in parallel and write the 64-byte keystream to
+// `out`. `blocks` holds the four 16-byte counter blocks back to back; `sk` is the
+// bitsliced schedule from `aesctExpandSkey` and `nr` the round count. Block j's
+// keystream lands at out[j*16..j*16+16).
+function aesctKeystream4(sk: []u64, nr: int, blocks: []byte, out: []byte) {
+  let q = []u64(8)
+  let i = 0
+  while (i < 4) {
+    let base = i * 16
+    aesctInterleaveIn(q, i,
+      aesctLoadLe(blocks, base + 0),
+      aesctLoadLe(blocks, base + 4),
+      aesctLoadLe(blocks, base + 8),
+      aesctLoadLe(blocks, base + 12))
+    i = i + 1
+  }
+  aesctOrtho(q)
+
+  aesctAddRoundKey(q, sk, 0)
+  let r = 1
+  while (r < nr) {
+    aesctSbox(q)
+    aesctShiftRows(q)
+    aesctMixColumns(q)
+    aesctAddRoundKey(q, sk, r)
+    r = r + 1
+  }
+  aesctSbox(q)
+  aesctShiftRows(q)
+  aesctAddRoundKey(q, sk, nr)
+
+  aesctOrtho(q)
+  i = 0
+  while (i < 4) {
+    aesctInterleaveOut(out, i * 16, q[i], q[i + 4])
+    i = i + 1
+  }
+}

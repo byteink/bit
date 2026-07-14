@@ -99,6 +99,10 @@ pub const RtFn = enum {
     chan_make,
     chan_send,
     chan_recv,
+    /// `ok` of the `chan_recv` immediately preceding it — the two-result form
+    /// `let (v, ok) = <- c` (ABI.md §11). Must be emitted directly after its
+    /// `chan_recv`, with no yield between.
+    chan_recv_ok,
     chan_close,
     spawn,
     /// Hash map primitives (ABI.md §15), backing `map<K,V>` (§11.2, §13.5).
@@ -134,6 +138,18 @@ pub const RtFn = enum {
     slice_get,
     slice_set,
     slice_slice,
+    /// Type assertions (SPEC §14.4, ABI.md §2.2). An interface value *is* the
+    /// receiver pointer, so its dynamic type is the `TypeInfo` in its GC header
+    /// and an assertion is a descriptor-identity test against the target type's
+    /// `TypeInfo` (a `type_info` op supplies its address).
+    /// `iface_as(recv, info) -> recv` on a match, else null — the two-result form
+    /// `let (v, ok) = iface.(T)`; `iface_as_ok() -> bool` reports the `ok` of the
+    /// `iface_as` immediately preceding it (same adjacency rule as
+    /// `chan_recv_ok`). `iface_assert(recv, info) -> recv` is the one-result form
+    /// and panics on a mismatch, naming both types.
+    iface_as,
+    iface_as_ok,
+    iface_assert,
     /// Filesystem primitives (ABI.md §14), the low-level layer under std/fs.
     /// `fs_open(path, write) -> i64` fd or -1; `fs_read_all(fd) -> string`;
     /// `fs_write(fd, s) -> i64` bytes or -1; `fs_close(fd) -> i64` (always 0).
@@ -296,6 +312,12 @@ pub const Op = enum {
 
     // ---- GC / memory (see runtime/ABI.md §1-3) ----------------------------
     gc_alloc, // extra = [size, offc, ptr_offsets...]
+    // The address of a *named* type's static `TypeInfo` (ABI.md §2), as a plain
+    // integer. `gc_alloc` derives its descriptor from the allocation's own result
+    // type; this op names an unrelated type, so it carries the discriminator
+    // itself. Result must stay a non-reference type — the descriptor lives in
+    // `.rodata`, not the heap, so a stack map must never offer it as a GC root.
+    type_info, // extra = [disc, size, offc, ptr_offsets...]
     field_get, // extra = [base, offset]
     field_set, // extra = [base, offset, value]  (codegen inserts the write barrier here later)
     index_get, // extra = [base, index]
@@ -445,6 +467,7 @@ pub const Function = struct {
             .call_value => .{ .call_value = .{ .callee = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
             .call_iface => .{ .call_iface = .{ .iface = @enumFromInt(raw[0]), .method_index = raw[1], .args = raw[3 .. 3 + raw[2]] } },
             .gc_alloc => .{ .gc_alloc = .{ .size = raw[0], .ptr_offsets = raw[2 .. 2 + raw[1]] } },
+            .type_info => .{ .type_info = .{ .disc = raw[0], .size = raw[1], .ptr_offsets = raw[3 .. 3 + raw[2]] } },
             .field_get => .{ .field_get = .{ .base = @enumFromInt(raw[0]), .offset = raw[1] } },
             .field_set => .{ .field_set = .{ .base = @enumFromInt(raw[0]), .offset = raw[1], .value = @enumFromInt(raw[2]) } },
             .index_get => .{ .index_get = .{ .base = @enumFromInt(raw[0]), .index = @enumFromInt(raw[1]) } },
@@ -484,6 +507,7 @@ pub const Decoded = union(enum) {
     call_value: struct { callee: ValueId, args: []const u32 },
     call_iface: struct { iface: ValueId, method_index: u32, args: []const u32 },
     gc_alloc: struct { size: u32, ptr_offsets: []const u32 },
+    type_info: struct { disc: u32, size: u32, ptr_offsets: []const u32 },
     field_get: struct { base: ValueId, offset: u32 },
     field_set: struct { base: ValueId, offset: u32, value: ValueId },
     index_get: struct { base: ValueId, index: ValueId },
@@ -809,6 +833,19 @@ pub const FunctionBuilder = struct {
         return self.push(.gc_alloc, ty, buf);
     }
 
+    /// The address of the static `TypeInfo` for the type `disc` (whose body
+    /// layout is `size`/`ptr_offsets`), for `iface_as`/`iface_assert`. `ty` must
+    /// be a non-reference type — see the `type_info` op.
+    pub fn typeInfoAddr(self: *FunctionBuilder, ty: TypeId, disc: u32, size: u32, ptr_offsets: []const u32) Allocator.Error!ValueId {
+        var buf = try self.gpa.alloc(u32, 3 + ptr_offsets.len);
+        defer self.gpa.free(buf);
+        buf[0] = disc;
+        buf[1] = size;
+        buf[2] = @intCast(ptr_offsets.len);
+        @memcpy(buf[3..], ptr_offsets);
+        return self.push(.type_info, ty, buf);
+    }
+
     pub fn fieldGet(self: *FunctionBuilder, ty: TypeId, base: ValueId, offset: u32) Allocator.Error!ValueId {
         return self.push(.field_get, ty, &.{ vid(base), offset });
     }
@@ -1080,6 +1117,13 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
             try writeTypeName(w, module.ctx, ty, 0);
             try w.writeAll("\n");
         },
+        .type_info => |t| {
+            try w.print("  %{d} = type_info disc={d} size={d} ptrs=[", .{ i, t.disc, t.size });
+            try dumpValList(w, t.ptr_offsets);
+            try w.writeAll("] ");
+            try writeTypeName(w, module.ctx, ty, 0);
+            try w.writeAll("\n");
+        },
         .field_get => |fg| {
             try w.print("  %{d} = field_get %{d}[{d}] ", .{ i, @intFromEnum(fg.base), fg.offset });
             try writeTypeName(w, module.ctx, ty, 0);
@@ -1243,7 +1287,7 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
             try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(c.iface));
             for (c.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a);
         },
-        .gc_alloc => {},
+        .gc_alloc, .type_info => {}, // no value operands
         .field_get => |fg| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(fg.base)),
         .field_set => |fs| {
             try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(fs.base));

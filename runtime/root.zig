@@ -373,6 +373,68 @@ export fn bit_rt_iface_lookup(info: *const gc_mod.TypeInfo, id: u64) callconv(.c
     fatal("interface method not found");
 }
 
+/// The dynamic type of an interface value, or null if it does not name a live
+/// managed object. An interface value *is* its receiver pointer (ABI.md §2.1),
+/// so its dynamic type is the `TypeInfo` in that object's GC header — but a nil
+/// interface is a null word, and a reference-typed value need not be a GC object
+/// at all (a `chan` is not), so the header is only safe to read once `owns()`
+/// confirms this address is exactly a live object's body.
+fn dynTypeOf(recv: ?*anyopaque) ?*const gc_mod.TypeInfo {
+    const p = recv orelse return null;
+    const body: [*]u8 = @ptrCast(p);
+    if (!g_gc.owns(body)) return null;
+    return gc_mod.infoOf(body);
+}
+
+/// `bit_rt_iface_as` (ABI.md §2.2): the two-result type assertion
+/// `let (v, ok) = iface.(T)` (SPEC §14.4). `TypeInfo`s are per concrete type, so
+/// descriptor identity *is* type identity. Returns the receiver narrowed to `T`
+/// on a match, else null — the caller reads `ok` from `bit_rt_iface_as_ok`.
+///
+/// Null on a mismatch is load-bearing, not tidiness: the result is typed `T`, so
+/// handing back the un-narrowed receiver would let a caller that ignores `ok`
+/// read a `Square` as a `Circle`. Null is `T`'s zero value, and the same reason
+/// `ok` exists for a reference-element channel receive.
+export fn bit_rt_iface_as(recv: ?*anyopaque, want: usize) callconv(.c) ?*anyopaque {
+    const info = dynTypeOf(recv) orelse {
+        last_iface_ok = false;
+        return null;
+    };
+    last_iface_ok = @intFromPtr(info) == want;
+    return if (last_iface_ok) recv else null;
+}
+
+threadlocal var last_iface_ok: bool = false;
+
+/// `bit_rt_iface_as_ok` (ABI.md §2.2): the `ok` of the `bit_rt_iface_as`
+/// immediately preceding it. Same adjacency contract as `bit_rt_chan_recv_ok`
+/// (§11) — lowering emits the two back to back, so no other assertion can land
+/// in between.
+export fn bit_rt_iface_as_ok() callconv(.c) bool {
+    return last_iface_ok;
+}
+
+/// `bit_rt_iface_assert` (ABI.md §2.2): the one-result type assertion
+/// `let v = iface.(T)` (SPEC §14.4), which panics on a mismatch (§18.4). Both
+/// type names are already in the descriptors, so the message can name them.
+export fn bit_rt_iface_assert(recv: ?*anyopaque, want: usize) callconv(.c) ?*anyopaque {
+    const info = dynTypeOf(recv);
+    if (info) |i| {
+        if (@intFromPtr(i) == want) return recv;
+    }
+    const target: *const gc_mod.TypeInfo = @ptrFromInt(want);
+    const got: []const u8 = if (info) |i| i.typeName() else "nil";
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "type assertion failed: ", got, " is not ", target.typeName() }) |part| {
+        const room = buf.len - n;
+        const take = @min(part.len, room);
+        @memcpy(buf[n..][0..take], part[0..take]);
+        n += take;
+    }
+    fatal(buf[0..n]);
+}
+
 /// The real safepoint poll, called by the `bit_rt_safepoint` shim below after
 /// the caller's registers are safely snapshotted. `noinline` so the shim's
 /// `call`/`bl` is a real ABI boundary (the snapshot must reflect the caller's
@@ -1246,17 +1308,33 @@ export fn bit_rt_chan_send(ch: ?*anyopaque, value: u64) callconv(.c) void {
     chan.WordChan.sendNilable(c, &g_sched, value);
 }
 
-/// Two-word return `(value, ok)` — the same tuple-return shape `ir.zig`
-/// already uses for `make_closure` (`(fn_ptr, env_ref)`), so codegen's
-/// existing 2-register-return handling covers this without inventing a
-/// second convention. `ok=false` means the channel was closed and drained
-/// (SPEC.md §16.2); `value` is then the zero word.
+/// Two-word return `(value, ok)`. `ok=false` means the channel was closed and
+/// drained (SPEC.md §16.2); `value` is then the zero word.
 pub const ChanRecvResult = extern struct { value: u64, ok: bool };
+
+/// The `ok` flag of the most recent `bit_rt_chan_recv` on this goroutine, for
+/// the two-result form `let (v, ok) = <- c` (ABI.md §11).
+///
+/// Codegen lowers that form as `bit_rt_chan_recv` immediately followed by
+/// `bit_rt_chan_recv_ok`, with no yield in between — exactly the discipline the
+/// fallible-call error slot already relies on (§13): a green thread cannot
+/// migrate between a call's return and the caller's immediate read of it, so a
+/// per-worker threadlocal is goroutine-correct. This exists because the single
+/// value word is all `rt_call` can thread back through the IR, and a reference
+/// element's zero word on a closed channel is a null pointer — so a receiver
+/// *must* be able to tell "closed" from "a real value" before dereferencing.
+threadlocal var last_recv_ok: bool = false;
 
 export fn bit_rt_chan_recv(ch: ?*anyopaque) callconv(.c) ChanRecvResult {
     const c: ?*chan.WordChan = @ptrCast(@alignCast(ch));
     const r = chan.WordChan.recvNilable(c, &g_sched);
+    last_recv_ok = r.ok;
     return .{ .value = r.value, .ok = r.ok };
+}
+
+/// `bit_rt_chan_recv_ok` (ABI.md §11): the `ok` of the receive just performed.
+export fn bit_rt_chan_recv_ok() callconv(.c) bool {
+    return last_recv_ok;
 }
 
 export fn bit_rt_chan_close(ch: ?*anyopaque) callconv(.c) void {

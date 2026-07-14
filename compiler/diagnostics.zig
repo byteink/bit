@@ -90,7 +90,8 @@ pub const Code = enum(u16) {
     not_an_enum = 69,
     unknown_variant = 70,
     non_exhaustive_match = 71,
-    not_stringable = 72,
+    invalid_array_element = 72,
+    not_stringable = 73,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {

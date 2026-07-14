@@ -65,6 +65,13 @@ fn collectTypeInfos(a: Allocator, module: *const ir.Module) Allocator.Error![]Ty
                     break :blk .{ .disc = @intFromEnum(f.valueType(@enumFromInt(i))), .size = g.size, .ptr_offsets = g.ptr_offsets };
                 },
                 .make_closure => .{ .disc = @intFromEnum(f.valueType(@enumFromInt(i))), .size = 16, .ptr_offsets = &.{8} },
+                // A type assertion references a descriptor without allocating
+                // one, so its target's blob must be emitted here too — the
+                // target may never be `gc_alloc`ed in this module.
+                .type_info => blk: {
+                    const t = f.decode(@enumFromInt(i)).type_info;
+                    break :blk .{ .disc = t.disc, .size = t.size, .ptr_offsets = t.ptr_offsets };
+                },
                 else => continue,
             };
             const name = try ir.typeInfoSymbol(a, layout.disc, layout.size, layout.ptr_offsets);
@@ -228,6 +235,15 @@ fn emitElfBlobs(
             try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local, .kind = .object });
             try defined.put(a, offs_name, {});
         }
+        const tname = module.ctx.display_names.get(ti.disc) orelse "";
+        var name_sym: []const u8 = "";
+        if (tname.len > 0) {
+            const nm_off: u64 = rodata.items.len;
+            try rodata.appendSlice(a, tname);
+            name_sym = try std.fmt.allocPrint(a, "{s}_name", .{name});
+            try symbols.append(a, .{ .name = name_sym, .section = .rodata, .offset = nm_off, .size = tname.len, .binding = .local, .kind = .object });
+            try defined.put(a, name_sym, {});
+        }
         const methods = try emitMethodTable(a, module, rodata, ti.disc, name);
         if (methods.sym.len > 0) {
             try symbols.append(a, .{ .name = methods.sym, .section = .rodata, .offset = methods.off, .size = methods.size, .binding = .local, .kind = .object });
@@ -241,8 +257,9 @@ fn emitElfBlobs(
         try rodata.appendSlice(a, &(.{0} ** 8)); // ptr_offsets_ptr (reloc below if any)
         std.mem.writeInt(u64, &field, ti.ptr_offsets.len, .little);
         try rodata.appendSlice(a, &field); // ptr_offsets_len
-        try rodata.appendSlice(a, &(.{0} ** 8)); // name_ptr = null
-        try rodata.appendSlice(a, &(.{0} ** 8)); // name_len = 0
+        try rodata.appendSlice(a, &(.{0} ** 8)); // name_ptr (reloc below if any)
+        std.mem.writeInt(u64, &field, tname.len, .little);
+        try rodata.appendSlice(a, &field); // name_len
         try rodata.appendSlice(a, &(.{0} ** 8)); // methods_ptr (reloc below if any)
         std.mem.writeInt(u64, &field, methods.size / 16, .little);
         try rodata.appendSlice(a, &field); // methods_len
@@ -250,6 +267,8 @@ fn emitElfBlobs(
         try defined.put(a, name, {});
         if (ti.ptr_offsets.len > 0)
             try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 8, .symbol = offs_name, .kind = .abs64, .addend = 0 });
+        if (name_sym.len > 0)
+            try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 24, .symbol = name_sym, .kind = .abs64, .addend = 0 });
         if (methods.sym.len > 0)
             try relocs.append(a, .{ .section = .rodata, .offset = ti_off + 40, .symbol = methods.sym, .kind = .abs64, .addend = 0 });
         for (methods.relocs) |r|
@@ -461,6 +480,15 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             try symbols.append(a, .{ .name = offs_name, .section = .rodata, .offset = offs_off, .size = ti.ptr_offsets.len * 8, .binding = .local });
             try defined.put(a, offs_name, {});
         }
+        const tname = module.ctx.display_names.get(ti.disc) orelse "";
+        var name_sym: []const u8 = "";
+        if (tname.len > 0) {
+            const nm_off: u64 = rodata.items.len;
+            try rodata.appendSlice(a, tname);
+            name_sym = try mac(a, try std.fmt.allocPrint(a, "{s}_name", .{name}));
+            try symbols.append(a, .{ .name = name_sym, .section = .rodata, .offset = nm_off, .size = tname.len, .binding = .local });
+            try defined.put(a, name_sym, {});
+        }
         // Method table (ABI.md §2.1) holds absolute fn pointers, so it also lives
         // in writable `.data` (dyld rebases). `emitMethodTable` writes the bytes;
         // symbol + fn relocs are mangled/tagged here for the Mach-O format.
@@ -481,8 +509,9 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try data.appendSlice(a, &(.{0} ** 8)); // ptr_offsets_ptr (rebased by dyld if any)
         std.mem.writeInt(u64, &field, ti.ptr_offsets.len, .little);
         try data.appendSlice(a, &field); // ptr_offsets_len
-        try data.appendSlice(a, &(.{0} ** 8)); // name_ptr = null
-        try data.appendSlice(a, &(.{0} ** 8)); // name_len = 0
+        try data.appendSlice(a, &(.{0} ** 8)); // name_ptr (rebased by dyld if any)
+        std.mem.writeInt(u64, &field, tname.len, .little);
+        try data.appendSlice(a, &field); // name_len
         try data.appendSlice(a, &(.{0} ** 8)); // methods_ptr (rebased by dyld if any)
         std.mem.writeInt(u64, &field, methods.size / 16, .little);
         try data.appendSlice(a, &field); // methods_len
@@ -491,6 +520,8 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         try defined.put(a, ti_name, {});
         if (ti.ptr_offsets.len > 0)
             try relocs.append(a, .{ .section = .data, .offset = ti_off + 8, .symbol = offs_name, .kind = .unsigned64 });
+        if (name_sym.len > 0)
+            try relocs.append(a, .{ .section = .data, .offset = ti_off + 24, .symbol = name_sym, .kind = .unsigned64 });
         if (methods.sym.len > 0)
             try relocs.append(a, .{ .section = .data, .offset = ti_off + 40, .symbol = methods_name, .kind = .unsigned64 });
     }
