@@ -1808,13 +1808,17 @@ const Checker = struct {
     }
 
     /// Structural assignability (§14.2) with no source-literal awareness:
-    /// identity, interface satisfaction, `nil` into a nilable type, or an
+    /// identity, `nil` into a nilable type, interface satisfaction, or an
     /// untyped constant whose *default* type matches `to` exactly.
     fn assignable(self: *Checker, from: TypeId, to: TypeId) bool {
         if (from == .invalid or to == .invalid) return true;
         if (from == to) return true;
-        if (self.ctx.typeOf(to) == .interface) return self.storableInInterface(from) and self.satisfies(from, to, &.{});
+        // `nil` is answered before the interface branch: an interface is a
+        // reference type, so `nil` is its zero value (§13.4), but `nil` has no
+        // method set and would fail the satisfaction test below against any
+        // non-empty interface.
         if (from == self.ctx.untyped_nil_id) return self.isNilable(to);
+        if (self.ctx.typeOf(to) == .interface) return self.storableInInterface(from) and self.satisfies(from, to, &.{});
         if (self.isUntyped(from)) {
             const def = self.defaultType(from);
             if (def == to) return true;

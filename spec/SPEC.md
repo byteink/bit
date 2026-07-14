@@ -1000,6 +1000,10 @@ Method sets:
   value's representation, not its method set: a method may be declared on a type
   alias (§10.4), and an alias to a scalar is transparently that scalar (§14.1),
   so a scalar can carry methods yet still not be storable in an interface.
+- `nil` is assignable to *any* interface, empty or not, and satisfaction is never
+  consulted for it: `nil` has no method set, so testing it against `I`'s methods
+  would reject it out of every non-empty interface and leave such a location's
+  zero value (§13.4) unspellable.
 - Satisfaction is checked at assignment/passing sites; there is no declaration of
   intent. Assigning a satisfying `S` into an `I`-typed location carries `S`'s
   dynamic type and method table with the pointer (its `TypeInfo`).
