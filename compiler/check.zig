@@ -499,10 +499,10 @@ pub const TypeContext = struct {
     /// Project-lifetime like the rest of `TypeContext`: the module that
     /// instantiates an upstream generic is usually not the one that declared it.
     open_interps: std.ArrayList(OpenInterp) = .empty,
-    /// (`open_interps` index, substituted `TypeId`) pairs already reported, so
-    /// the pass — which every module runs over these shared ledgers — reports
-    /// each bad monomorphization exactly once.
-    reported_interps: std.AutoHashMapUnmanaged(u64, void) = .{},
+    /// (`open_interps` index, substituted `TypeId`) pairs already judged, so the
+    /// pass — which every module runs over these shared ledgers — judges each
+    /// monomorphization once and reports a bad one exactly once.
+    judged_interps: std.AutoHashMapUnmanaged(u64, void) = .{},
 
     pub fn init(gpa: Allocator) Error!TypeContext {
         var self = TypeContext{ .gpa = gpa, .types = TypeTable.init(gpa) };
@@ -543,7 +543,7 @@ pub const TypeContext = struct {
         self.generic_bounds.deinit(self.gpa);
         self.iface_self.deinit(self.gpa);
         self.open_interps.deinit(self.gpa);
-        self.reported_interps.deinit(self.gpa);
+        self.judged_interps.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -3600,7 +3600,7 @@ const Checker = struct {
                 const ty = try self.subst(open.ty, env, 0);
                 if (self.ctx.hasTypeParam(ty, 0)) continue; // another generic's operand
                 const key = (@as(u64, oi) << 32) | @intFromEnum(ty);
-                if ((try self.ctx.reported_interps.getOrPut(self.gpa, key)).found_existing) continue;
+                if ((try self.ctx.judged_interps.getOrPut(self.gpa, key)).found_existing) continue;
                 if (self.ctx.stringConvertible(self.defaultType(ty))) continue;
                 try self.notStringable(open.span, ty, "this generic is instantiated with a type that has no 'show(): string' method");
             }

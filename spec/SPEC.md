@@ -207,7 +207,9 @@ INTERP     = "${" expression "}" .
 
 Interpolation embeds an expression whose value is converted to `string` (the
 value's type must have a `string` conversion; all primitives do, and any type
-implementing `interface Show { show(): string }` does). `${` and `}` nest
+implementing `interface Show { show(): string }` does — anything else, a slice,
+map, channel, function value, or a type without `show`, is a compile error,
+`E0073`). `${` and `}` nest
 correctly: the lexer tracks brace depth inside an interpolation, and string
 literals inside the embedded expression are lexed recursively. To emit a literal
 `$`, write `\$`; `${` without a matching `}` on the same logical token is an
