@@ -417,6 +417,13 @@ pub const Instantiation = struct {
     result: TypeId,
 };
 
+/// One string-interpolation operand (§5.7) whose type is still open — it names
+/// a `type_param` — plus where it is written. See `TypeContext.open_interps`.
+pub const OpenInterp = struct {
+    ty: TypeId,
+    span: diagnostics.Span,
+};
+
 const MethodBucket = std.StringHashMapUnmanaged(Method);
 
 pub const TypeContext = struct {
@@ -483,6 +490,20 @@ pub const TypeContext = struct {
     /// The predeclared `error` interface (§10.6): `{ message(): string }`.
     error_id: TypeId = undefined,
 
+    /// Interpolation operands (§5.7) sitting inside a *generic* body, whose
+    /// type still names a `type_param` and so cannot be judged where they are
+    /// written: a generic body is checked once, against its own rigid params.
+    /// `Checker.checkInterpolations` re-judges each one against every recorded
+    /// instantiation — the same bodies lowering monomorphizes — so a bad
+    /// monomorphization is a located error instead of a lowering failure.
+    /// Project-lifetime like the rest of `TypeContext`: the module that
+    /// instantiates an upstream generic is usually not the one that declared it.
+    open_interps: std.ArrayList(OpenInterp) = .empty,
+    /// (`open_interps` index, substituted `TypeId`) pairs already judged, so the
+    /// pass — which every module runs over these shared ledgers — judges each
+    /// monomorphization once and reports a bad one exactly once.
+    judged_interps: std.AutoHashMapUnmanaged(u64, void) = .{},
+
     pub fn init(gpa: Allocator) Error!TypeContext {
         var self = TypeContext{ .gpa = gpa, .types = TypeTable.init(gpa) };
         std.debug.assert((try self.types.intern(.invalid)) == .invalid);
@@ -521,11 +542,81 @@ pub const TypeContext = struct {
         self.decl_generics.deinit(self.gpa);
         self.generic_bounds.deinit(self.gpa);
         self.iface_self.deinit(self.gpa);
+        self.open_interps.deinit(self.gpa);
+        self.judged_interps.deinit(self.gpa);
         self.* = undefined;
     }
 
     pub fn typeOf(self: *const TypeContext, id: TypeId) TypeData {
         return self.types.get(id);
+    }
+
+    /// The `show(): string` method (§5.7) that gives `ty` a string conversion,
+    /// or `null` when it has none. Bit has no universal `toString` and no
+    /// printf-style formatter: a value converts to `string` iff it is a
+    /// primitive or its method set — a concrete type's, or an interface's own —
+    /// declares exactly `show(): string`. `pub` because both sides of the
+    /// front end must agree on it: `check.zig` rejects everything else (E0073),
+    /// `lower.zig` uses it to pick the conversion, so the two cannot drift and
+    /// a wrong-shaped `show` cannot reach codegen.
+    pub fn showMethod(self: *TypeContext, ty: TypeId) ?Method {
+        const data = self.typeOf(ty);
+        if (data == .interface) {
+            for (data.interface) |m| {
+                if (self.isShowShape(m)) return m;
+            }
+            return null;
+        }
+        const bucket = self.methodsOf(ty) orelse return null;
+        const m = bucket.get("show") orelse return null;
+        return if (self.isShowShape(m)) m else null;
+    }
+
+    fn isShowShape(self: *const TypeContext, m: Method) bool {
+        return std.mem.eql(u8, m.name, "show") and m.params.len == 0 and
+            !m.variadic and m.result == self.prim_ids.get(.string);
+    }
+
+    /// Does `ty` convert to `string` for interpolation (§5.7)? Callers pass an
+    /// already-defaulted type — an untyped constant adopts its default first.
+    pub fn stringConvertible(self: *TypeContext, ty: TypeId) bool {
+        return self.typeOf(ty) == .prim or self.showMethod(ty) != null;
+    }
+
+    /// Does `ty` still name a rigid `type_param` (§13.5)? Nominal types are
+    /// asked through their instantiation args rather than by walking fields —
+    /// a struct may name itself (§13.3), and the args carry every open param
+    /// a generic instantiation has. Conservative at the depth cap ("yes"), so
+    /// a deferred check is skipped rather than judged on a half-substituted type.
+    pub fn hasTypeParam(self: *TypeContext, ty: TypeId, depth: u32) bool {
+        if (depth >= max_type_depth) return true;
+        switch (self.typeOf(ty)) {
+            .type_param => return true,
+            .slice, .chan => |e| return self.hasTypeParam(e, depth + 1),
+            .array => |a| return self.hasTypeParam(a.elem, depth + 1),
+            .map => |m| return self.hasTypeParam(m.key, depth + 1) or self.hasTypeParam(m.val, depth + 1),
+            .fallible => |f| return self.hasTypeParam(f.ok, depth + 1) or self.hasTypeParam(f.err, depth + 1),
+            .tuple => |ts| {
+                for (ts) |t| {
+                    if (self.hasTypeParam(t, depth + 1)) return true;
+                }
+                return false;
+            },
+            .func => |f| {
+                for (f.params) |p| {
+                    if (self.hasTypeParam(p, depth + 1)) return true;
+                }
+                return self.hasTypeParam(f.result, depth + 1);
+            },
+            .@"struct", .interface, .@"enum" => {
+                const idx = self.inst_by_result.get(@intFromEnum(ty)) orelse return false;
+                for (self.instantiations.items[idx].args) |a| {
+                    if (self.hasTypeParam(a, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     /// Interns the fixed-length array type `elem[len]`. A thin public wrapper
@@ -3451,13 +3542,69 @@ const Checker = struct {
         }
     }
 
+    /// §5.7: every interpolated operand must convert to `string`. Lowering has
+    /// no diagnostics, so the judgment belongs here — an operand it cannot
+    /// convert must be rejected with a span, never left to fail unlocated in
+    /// `lower.zig`'s `lowerToString`. An operand whose type is still open
+    /// (inside a generic body) is deferred to `checkInterpolations`.
     fn checkStrInterp(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
         const mf = self.files[file_idx];
         for (mf.tree.kids(node)) |part| {
             if (mf.tree.get(part).tag == .str_part) continue;
-            _ = try self.checkExpr(file_idx, part, env, fctx, .invalid);
+            const raw = try self.checkExpr(file_idx, part, env, fctx, .invalid);
+            if (raw == .invalid) continue; // already diagnosed
+            const ty = self.defaultType(raw);
+            if (self.ctx.hasTypeParam(ty, 0)) {
+                try self.ctx.open_interps.append(self.gpa, .{ .ty = ty, .span = mf.tree.get(part).span });
+                continue;
+            }
+            if (self.ctx.stringConvertible(ty)) continue;
+            try self.notStringable(mf.tree.get(part).span, ty, null);
         }
         return self.ctx.prim_ids.get(.string);
+    }
+
+    fn notStringable(self: *Checker, span: diagnostics.Span, ty: TypeId, hint: ?[]const u8) Error!void {
+        const name = try self.typeName(ty);
+        defer self.gpa.free(name);
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "cannot interpolate a value of type '{s}'", .{name}) catch "cannot interpolate this value";
+        try self.diags.report(.not_stringable, span, msg, hint orelse "only primitives and types with a 'show(): string' method convert to string");
+    }
+
+    /// Re-judges every deferred interpolation operand (§5.7, `open_interps`)
+    /// against the instantiations recorded so far. Only *function*
+    /// instantiations are considered: they are recorded at call sites and are
+    /// exactly the bodies lowering monomorphizes, so this reports precisely the
+    /// monomorphizations that would otherwise die in `lowerToString` (methods
+    /// on generic types are not lowered at all yet). Runs at the end of every
+    /// module's check because both ledgers are project-wide — the module that
+    /// instantiates a generic is usually not the one that declared it.
+    fn checkInterpolations(self: *Checker) Error!void {
+        // Snapshot the count: `subst` below can intern a nested nominal type and
+        // append its instantiation, which would invalidate a held slice. Those
+        // late arrivals are type (not function) instantiations, so skipping them
+        // costs nothing.
+        const count = self.ctx.instantiations.items.len;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const inst = self.ctx.instantiations.items[i];
+            if (self.ctx.typeOf(inst.result) != .func) continue; // a type instantiation: no body to lower
+            const gparams = self.ctx.decl_generics.get(inst.generic.pack()) orelse continue;
+            if (gparams.len != inst.args.len) continue; // arity mismatch: already diagnosed
+            const env = try self.gpa.alloc(GenericBinding, gparams.len);
+            defer self.gpa.free(env);
+            for (gparams, inst.args, 0..) |gp, arg, gi| env[gi] = .{ .sym = gp, .to = arg };
+
+            for (self.ctx.open_interps.items, 0..) |open, oi| {
+                const ty = try self.subst(open.ty, env, 0);
+                if (self.ctx.hasTypeParam(ty, 0)) continue; // another generic's operand
+                const key = (@as(u64, oi) << 32) | @intFromEnum(ty);
+                if ((try self.ctx.judged_interps.getOrPut(self.gpa, key)).found_existing) continue;
+                if (self.ctx.stringConvertible(self.defaultType(ty))) continue;
+                try self.notStringable(open.span, ty, "this generic is instantiated with a type that has no 'show(): string' method");
+            }
+        }
     }
 
     fn checkBinary(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
@@ -4748,6 +4895,7 @@ pub fn checkModule(
     };
     try checker.collectDecls();
     try checker.checkBodies();
+    try checker.checkInterpolations();
     const dump = if (dump_types) try checker.dumpTypesText() else null;
     // `call_insts`/`const_inits` are moved out (not freed by `deinitLocal`,
     // which only ever owned the checking-time-only tables) into the returned
