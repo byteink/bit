@@ -1131,6 +1131,14 @@ const FnCtx = struct {
     fn coerceToIface(self: *FnCtx, val: ir.ValueId, target: TypeId) Error!ir.ValueId {
         if (self.ctx.typeOf(target) != .interface) return val;
         if (self.b.valueType(val) == target) return val;
+        // The relabel is only sound because the incoming value is *already* an
+        // object pointer (a struct, another interface, or the null word); a
+        // scalar here would put a non-pointer in a word the GC traces as a root
+        // (SPEC §14.3). The checker rejects that — hold it.
+        std.debug.assert(switch (self.ctx.typeOf(self.b.valueType(val))) {
+            .@"struct", .interface, .untyped_nil => true,
+            else => false,
+        });
         return self.b.convert(target, val);
     }
 

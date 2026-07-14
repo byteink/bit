@@ -1787,13 +1787,33 @@ const Checker = struct {
         return self.assignable(from, to);
     }
 
+    /// May a value of type `from` occupy an interface-typed slot at all (§14.3)?
+    ///
+    /// An interface value *is* the receiver's object pointer (ABI.md §2.1) —
+    /// there is no fat pointer and no boxing step, so the slot must already
+    /// hold one. A struct does (structs are reference types, §13.3), `nil` is
+    /// the null word, and another interface is itself a receiver pointer.
+    /// Everything else would put a non-pointer in a word that the GC traces as
+    /// a root and that `iface.(T)` reads as an object header — a scalar equal
+    /// to a live object's address would then be traced, and asserted, as that
+    /// object. Method sets alone do not gate this: §10.4 lets a method be
+    /// declared on a *type alias*, and an alias to a scalar is transparently
+    /// that scalar (§14.1), so a scalar can carry methods and satisfy even a
+    /// non-empty interface.
+    fn storableInInterface(self: *Checker, from: TypeId) bool {
+        return switch (self.ctx.typeOf(from)) {
+            .@"struct", .interface, .untyped_nil, .invalid => true,
+            else => false,
+        };
+    }
+
     /// Structural assignability (§14.2) with no source-literal awareness:
     /// identity, interface satisfaction, `nil` into a nilable type, or an
     /// untyped constant whose *default* type matches `to` exactly.
     fn assignable(self: *Checker, from: TypeId, to: TypeId) bool {
         if (from == .invalid or to == .invalid) return true;
         if (from == to) return true;
-        if (self.ctx.typeOf(to) == .interface) return self.satisfies(from, to, &.{});
+        if (self.ctx.typeOf(to) == .interface) return self.storableInInterface(from) and self.satisfies(from, to, &.{});
         if (from == self.ctx.untyped_nil_id) return self.isNilable(to);
         if (self.isUntyped(from)) {
             const def = self.defaultType(from);
@@ -1985,6 +2005,14 @@ const Checker = struct {
         defer self.gpa.free(en);
         const fnd = try self.typeName(found);
         defer self.gpa.free(fnd);
+        // Every assignability failure funnels through here, so this is the one
+        // place that has to explain the struct-only rule (`storableInInterface`)
+        // — "expected 'Any', found 'i64'" reads as a nonsense diagnostic when
+        // the interface is empty and the value structurally "fits".
+        if (self.ctx.typeOf(expected) == .interface and !self.storableInInterface(found)) {
+            try self.emit(mf, node, .type_mismatch, "cannot store '{s}' in interface '{s}': only a struct can be the concrete type behind an interface value", .{ fnd, en }, "an interface value is the receiver's object pointer, so a non-struct has nothing to point to (§14.3)");
+            return;
+        }
         try self.emit(mf, node, .type_mismatch, "expected '{s}', found '{s}'", .{ en, fnd }, null);
     }
 
