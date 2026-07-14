@@ -3026,13 +3026,13 @@ const FnCtx = struct {
                 else => self.b.rtCall(string_ty, .string_from_int, &.{v}),
             };
         }
-        if (self.l.lookupMethod(ty, "show")) |entry| {
-            return self.b.call(string_ty, entry.fid, &.{v});
-        }
-        if (data == .interface) {
-            for (data.interface) |m| {
-                if (std.mem.eql(u8, m.name, "show")) return self.b.callIface(string_ty, v, try self.l.methodId(m.name), &.{});
-            }
+        // Everything else needs `show(): string` (§5.7). The checker enforces
+        // it — signature included — through this same predicate (E0072), so a
+        // wrong-shaped `show` can never be called here, and reaching the final
+        // return means the checker let an unconvertible operand through.
+        if (self.ctx.showMethod(ty) != null) {
+            if (data == .interface) return self.b.callIface(string_ty, v, try self.l.methodId("show"), &.{});
+            if (self.l.lookupMethod(ty, "show")) |entry| return self.b.call(string_ty, entry.fid, &.{v});
         }
         return error.UnsupportedConstruct;
     }
