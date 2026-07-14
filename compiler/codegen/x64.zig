@@ -1697,6 +1697,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .chan_make = "bit_rt_chan_make",
     .chan_send = "bit_rt_chan_send",
     .chan_recv = "bit_rt_chan_recv",
+    .chan_recv_ok = "bit_rt_chan_recv_ok",
     .chan_close = "bit_rt_chan_close",
     .spawn = "bit_rt_spawn",
     .map_new = "bit_rt_map_new",

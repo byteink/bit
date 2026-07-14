@@ -99,6 +99,10 @@ pub const RtFn = enum {
     chan_make,
     chan_send,
     chan_recv,
+    /// `ok` of the `chan_recv` immediately preceding it — the two-result form
+    /// `let (v, ok) = <- c` (ABI.md §11). Must be emitted directly after its
+    /// `chan_recv`, with no yield between.
+    chan_recv_ok,
     chan_close,
     spawn,
     /// Hash map primitives (ABI.md §15), backing `map<K,V>` (§11.2, §13.5).

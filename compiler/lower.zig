@@ -1134,10 +1134,43 @@ const FnCtx = struct {
         return self.b.convert(target, val);
     }
 
+    /// `let (v, ok) = <- c` (SPEC.md §16.2). `bit_rt_chan_recv_ok` reports the
+    /// `ok` of the receive *immediately* before it (ABI.md §11), so the two
+    /// calls are emitted back to back with nothing in between.
+    fn lowerChanRecvOkLet(self: *FnCtx, bk: []const ast.Index) Error!void {
+        const pats = self.kids(bk[0]);
+        if (pats.len != 2 or bk[2] == ast.none) return error.UnsupportedConstruct;
+        for (pats) |p| if (self.tree().get(p).tag != .ident) return error.UnsupportedConstruct;
+        const init_node = bk[2];
+        const init = self.tree().get(init_node);
+        if (init.tag != .unary) return error.UnsupportedConstruct;
+        const op: lexer.Kind = @enumFromInt(init.main);
+        if (op != .arrow_left) return error.UnsupportedConstruct; // only the recv form so far
+
+        const val_ty = try self.nodeType(pats[0]);
+        const ok_ty = try self.nodeType(pats[1]);
+        const ch = try self.lowerExpr(self.kids(init_node)[0]);
+        const v = try self.b.rtCall(val_ty, .chan_recv, &.{ch});
+        const ok = try self.b.rtCall(ok_ty, .chan_recv_ok, &.{});
+        try self.declareUnlessBlank(pats[0], v, val_ty);
+        try self.declareUnlessBlank(pats[1], ok, ok_ty);
+    }
+
+    /// `_` discards its value (SPEC.md §5) — binding it would shadow the next `_`.
+    fn declareUnlessBlank(self: *FnCtx, pat: ast.Index, val: ir.ValueId, ty: TypeId) Error!void {
+        const name = self.identText(pat);
+        if (std.mem.eql(u8, name, "_")) return;
+        try self.env.declare(self.gpa, name, val, ty);
+    }
+
     fn lowerLetConst(self: *FnCtx, node: ast.Index) Error!void {
         for (self.kids(node)) |bind| {
             const bk = self.kids(bind); // binding: [pattern, type_or_none, init_or_none]
-            if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct; // tuple destructuring: deferred
+            if (self.tree().get(bk[0]).tag == .tuple_pat) {
+                try self.lowerChanRecvOkLet(bk);
+                continue;
+            }
+            if (self.tree().get(bk[0]).tag != .ident) return error.UnsupportedConstruct;
             const ty = try self.nodeType(bk[0]);
             const raw = if (bk[2] != ast.none) blk: {
                 const r = try self.lowerExprH(bk[2], ty);
@@ -2363,6 +2396,13 @@ const FnCtx = struct {
             const key_ty = self.ctx.typeOf(try self.nodeType(self.kids(arg_nodes[0])[0])).map.key;
             const kv = try self.lowerExprH(self.kids(arg_nodes[1])[0], key_ty);
             return self.b.rtCall(void_ty, .map_delete, &.{ mv, kv });
+        }
+        if (std.mem.eql(u8, name, "close")) {
+            // SPEC §16.2: `close(c)` marks the channel closed — pending and
+            // subsequent receives drain, then yield `(zero, false)`. The checker
+            // already proved the operand is a channel.
+            const cv = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+            return self.b.rtCall(void_ty, .chan_close, &.{cv});
         }
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
         // Runtime primitives (fs §14, math §17, time §18, os §19): each maps 1:1

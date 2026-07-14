@@ -525,10 +525,21 @@ a program declares, with no per-`T` archive content.
 bit_rt_chan_make(capacity: usize, is_ref: bool) -> *anyopaque
 bit_rt_chan_send(ch: ?*anyopaque, value: u64)    -> void
 bit_rt_chan_recv(ch: ?*anyopaque)                -> ChanRecvResult
+bit_rt_chan_recv_ok()                            -> bool
 bit_rt_chan_close(ch: ?*anyopaque)                -> void
 
 ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
 ```
+
+- `bit_rt_chan_recv_ok` returns the `ok` of the receive *just* performed by this
+  goroutine. `rt_call` threads only a single value word back through the IR, so
+  the two-result form `let (v, ok) = <- c` (SPEC.md §16.2) lowers as
+  `bit_rt_chan_recv` immediately followed by `bit_rt_chan_recv_ok`, with no
+  yield between them — the same adjacency the fallible-call error slot relies on
+  (§13), which makes a per-worker threadlocal goroutine-correct. This matters
+  because a *reference* element's zero word on a closed channel is a null
+  pointer: a receiver must be able to distinguish "closed" from "a real value"
+  before dereferencing it.
 
 - `capacity == 0` is unbuffered (synchronous rendezvous); `capacity > 0` is a
   bounded ring buffer (SPEC.md §16.2).

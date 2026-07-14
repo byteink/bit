@@ -1246,17 +1246,33 @@ export fn bit_rt_chan_send(ch: ?*anyopaque, value: u64) callconv(.c) void {
     chan.WordChan.sendNilable(c, &g_sched, value);
 }
 
-/// Two-word return `(value, ok)` — the same tuple-return shape `ir.zig`
-/// already uses for `make_closure` (`(fn_ptr, env_ref)`), so codegen's
-/// existing 2-register-return handling covers this without inventing a
-/// second convention. `ok=false` means the channel was closed and drained
-/// (SPEC.md §16.2); `value` is then the zero word.
+/// Two-word return `(value, ok)`. `ok=false` means the channel was closed and
+/// drained (SPEC.md §16.2); `value` is then the zero word.
 pub const ChanRecvResult = extern struct { value: u64, ok: bool };
+
+/// The `ok` flag of the most recent `bit_rt_chan_recv` on this goroutine, for
+/// the two-result form `let (v, ok) = <- c` (ABI.md §11).
+///
+/// Codegen lowers that form as `bit_rt_chan_recv` immediately followed by
+/// `bit_rt_chan_recv_ok`, with no yield in between — exactly the discipline the
+/// fallible-call error slot already relies on (§13): a green thread cannot
+/// migrate between a call's return and the caller's immediate read of it, so a
+/// per-worker threadlocal is goroutine-correct. This exists because the single
+/// value word is all `rt_call` can thread back through the IR, and a reference
+/// element's zero word on a closed channel is a null pointer — so a receiver
+/// *must* be able to tell "closed" from "a real value" before dereferencing.
+threadlocal var last_recv_ok: bool = false;
 
 export fn bit_rt_chan_recv(ch: ?*anyopaque) callconv(.c) ChanRecvResult {
     const c: ?*chan.WordChan = @ptrCast(@alignCast(ch));
     const r = chan.WordChan.recvNilable(c, &g_sched);
+    last_recv_ok = r.ok;
     return .{ .value = r.value, .ok = r.ok };
+}
+
+/// `bit_rt_chan_recv_ok` (ABI.md §11): the `ok` of the receive just performed.
+export fn bit_rt_chan_recv_ok() callconv(.c) bool {
+    return last_recv_ok;
 }
 
 export fn bit_rt_chan_close(ch: ?*anyopaque) callconv(.c) void {
