@@ -2261,6 +2261,7 @@ const FnCtx = struct {
 
         const header = try self.b.newBlock();
         const body_blk = try self.b.newBlock();
+        const step_blk = try self.b.newBlock();
         const exit_blk = try self.b.newBlock();
 
         {
@@ -2293,7 +2294,11 @@ const FnCtx = struct {
             try self.emitBr(cmp, body_blk, &.{}, exit_blk, cur);
         }
 
-        try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = header, .pre_len = pre_len });
+        // `continue` targets `step_blk`, NOT `header`: the cursor advance lives
+        // in the step, so jumping straight to the header would re-test the same
+        // un-advanced index and spin forever (the #1243 infinite loop). This
+        // mirrors `lowerForC`'s post block.
+        try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = step_blk, .pre_len = pre_len });
         self.switchBlock(body_blk);
         const body_mark = self.env.mark();
         if (is_map) {
@@ -2315,10 +2320,24 @@ const FnCtx = struct {
         try self.lowerStmtList(k[2]);
         self.env.restoreCount(body_mark);
         _ = self.loop_stack.pop();
+        // Normal fall-through joins `continue` at `step_blk`, carrying the
+        // still-current (un-advanced) index.
         if (!self.terminated) {
+            const cur = try self.env.snapshotValues(self.gpa, pre_len);
+            defer self.gpa.free(cur);
+            try self.emitJump(step_blk, cur);
+        }
+
+        // `step_blk` advances the cursor, then re-tests via the header. Its
+        // predecessors (fall-through + every `continue`) pass their own carried
+        // values, so read the index/iterator from *this* block's params.
+        self.switchBlock(step_blk);
+        try self.addLoopParams(pre_len);
+        {
             const cur_idx = self.env.bindings.items[idx_slot].value;
+            const step_iter = self.env.bindings.items[iter_slot].value;
             const next_idx = if (is_map)
-                try self.b.rtCall(i64ty, .map_iter_next, &.{ iter_cur, cur_idx })
+                try self.b.rtCall(i64ty, .map_iter_next, &.{ step_iter, cur_idx })
             else
                 try self.b.binary(.add, i64ty, cur_idx, try self.b.constInt(i64ty, 1));
             self.env.bindings.items[idx_slot].value = next_idx;
