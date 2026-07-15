@@ -624,6 +624,21 @@ pub fn build(b: *std.Build) void {
     const bitc2 = selfhost_run.addOutputFileArg("bitc2");
     selfhost_run.step.dependOn(b.getInstallStep());
     if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
+    // The seed reads selfhost/*.bit at runtime, invisible to the build cache, so
+    // an edit to a ported module wouldn't re-trigger the build — force it.
+    selfhost_run.has_side_effects = true;
     const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bitc → bitc2");
     selfhost_step.dependOn(&b.addInstallBinFile(bitc2, "bitc2").step);
+
+    // Gate the self-host: `zig build test` (and the x86_64 gate) builds bitc2
+    // from the current selfhost/ sources and runs it. Its `main` runs the
+    // in-Bit self-checks (selfhost/selfcheck.bit) — a failed assert panics
+    // (exit 2) and fails the build, so a regression in a ported module is
+    // caught on both arm64 and x86_64. bitc2 targets the host, so it always
+    // execs here. `has_side_effects` keeps it from being cache-skipped.
+    const bitc2_selfcheck = std.Build.Step.Run.create(b, "run bitc2 self-checks");
+    bitc2_selfcheck.addFileArg(bitc2);
+    bitc2_selfcheck.has_side_effects = true;
+    bitc2_selfcheck.expectExitCode(0);
+    test_step.dependOn(&bitc2_selfcheck.step);
 }
