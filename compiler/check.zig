@@ -2442,6 +2442,9 @@ const Checker = struct {
                     .prim => |ap| p.isNumeric() and ap.isNumeric(),
                     .untyped_int, .untyped_float, .untyped_rune => p.isNumeric(),
                     .untyped_string => p == .string,
+                    // A C-like enum is an integer tag, so `int(tag)` yields it (a
+                    // payload enum has no integer value — use `match`). §12.9.
+                    .@"enum" => |e| p.isInteger() and !enumBoxed(e),
                     // `string([]u8)` copies bytes verbatim. A `[]rune`/`[]i32`
                     // source needs UTF-8 encoding (deferred with rune iteration,
                     // #348 unit D), so it's rejected here rather than silently

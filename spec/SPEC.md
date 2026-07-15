@@ -758,6 +758,7 @@ string(b)         // []byte -> string (copy)
 map<string,int>() // empty map
 chan<int>()       // unbuffered channel
 chan<int>(16)     // buffered channel, capacity 16
+int(tag)          // C-like enum -> its integer tag
 ```
 
 `string(b)` and `[]byte(s)` copy bytes verbatim: a `[]byte` is the raw byte
