@@ -1049,6 +1049,8 @@ See §15.4.
   strings) with ordering operators.
 - Arrays and tuples are comparable if their element types are; structs are
   comparable if all fields are comparable (field-wise).
+- A C-like enum (all variants payload-free) compares with `==`/`!=` by tag, and
+  may be a map key. A payload-carrying enum is not comparable — use `match`.
 - Slices, maps, and functions are **not** comparable except against `nil`.
 - Interface values are comparable; two are equal if their dynamic types are
   identical and their dynamic values are equal (panics if the dynamic type is not

@@ -1313,7 +1313,11 @@ const Checker = struct {
                 for (fields) |f| if (!self.comparable(f.ty)) break :blk false;
                 break :blk true;
             },
-            .slice, .map, .func, .chan, .void, .fallible, .@"enum" => false, // enums: use `match`, not `==` (Stage 1)
+            .slice, .map, .func, .chan, .void, .fallible => false,
+            // A C-like enum is an integer tag, so `==`/`!=` (and use as a map
+            // key) compare tags. A payload enum carries data, so structural
+            // equality is not yet defined — use `match` (§14.6).
+            .@"enum" => |e| !enumBoxed(e),
         };
     }
 
