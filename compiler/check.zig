@@ -4592,21 +4592,30 @@ const Checker = struct {
         }
     }
 
-    fn checkTopDecl(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
+    fn checkTopDecl(self: *Checker, file_idx: usize, idx: ast.Index, bindings: bool) Error!void {
         const mf = self.files[file_idx];
         const inner = if (mf.tree.get(idx).tag == .@"export") mf.tree.kids(idx)[0] else idx;
         switch (mf.tree.get(inner).tag) {
-            .func_decl => try self.checkFuncBody(file_idx, inner),
-            .let_decl, .const_decl => try self.checkTopBinding(file_idx, inner),
+            .func_decl => if (!bindings) try self.checkFuncBody(file_idx, inner),
+            .let_decl, .const_decl => if (bindings) try self.checkTopBinding(file_idx, inner),
             else => {}, // struct/interface/type_alias/import: nothing to body-check
         }
     }
 
     fn checkBodies(self: *Checker) Error!void {
-        for (self.files, 0..) |mf, file_idx| {
-            for (mf.tree.kids(mf.tree.root)) |decl_idx| {
-                if (decl_idx == ast.none) continue;
-                try self.checkTopDecl(file_idx, decl_idx);
+        // Two phases so a function body may reference a module-level `const`/`let`
+        // regardless of source order. Phase 1 types every top-level binding
+        // (recording its symbol in `var_types`/`const_types`); phase 2 checks
+        // function bodies, by which point every module const resolves. When the
+        // two were interleaved in source order, a forward reference typed as
+        // `.invalid`, silently poisoning downstream types and miscompiling —
+        // e.g. `print("${K}")` above `const K` (#1238).
+        for ([_]bool{ true, false }) |bindings| {
+            for (self.files, 0..) |mf, file_idx| {
+                for (mf.tree.kids(mf.tree.root)) |decl_idx| {
+                    if (decl_idx == ast.none) continue;
+                    try self.checkTopDecl(file_idx, decl_idx, bindings);
+                }
             }
         }
     }
