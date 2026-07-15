@@ -388,6 +388,26 @@ pub fn build(b: *std.Build) void {
     const stdlib_docs_tests = b.addTest(.{ .root_module = stdlib_docs_mod });
     test_step.dependOn(&b.addRunArtifact(stdlib_docs_tests).step);
 
+    // Format gate (#1266): every `.bit` source under stdlib/ and examples/ must
+    // already be `bit fmt`-canonical (tests/cases/ is excluded — see the file
+    // header). Front end only — needs no libbitrt.
+    const fmt_check_opts = b.addOptions();
+    fmt_check_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    fmt_check_opts.addOption([]const u8, "examples_dir", b.pathFromRoot("examples"));
+    const fmt_check_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fmt_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fmt_check_mod.addImport("bitc", exe.root_module);
+    fmt_check_mod.addOptions("build_options", fmt_check_opts);
+
+    const fmt_check_run = b.addRunArtifact(b.addTest(.{ .root_module = fmt_check_mod }));
+    // .bit sources are read at runtime, so an edit is invisible to the build
+    // cache; without this the run is cache-skipped and drift passes silently.
+    fmt_check_run.has_side_effects = true;
+    test_step.dependOn(&fmt_check_run.step);
+
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is
