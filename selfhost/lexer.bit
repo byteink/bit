@@ -110,10 +110,26 @@ struct Lexer {
   src: string,
   i: int,
   last: Kind,
+  // Interpolation plumbing (§5.7): a one-slot pending queue lets a string
+  // segment emit `StrPart` now and `InterpStart` next; `resumeString` marks that
+  // the token after an `InterpEnd` continues the string body; `interp` is the
+  // brace-nesting depth inside each active interpolation, innermost last.
+  hasPending: bool,
+  pending: Token,
+  resumeString: bool,
+  interp: []int,
 }
 
 function newLexer(src: string): Lexer {
-  return Lexer{ src: src, i: 0, last: Kind.Eof }
+  return Lexer{
+    src: src,
+    i: 0,
+    last: Kind.Eof,
+    hasPending: false,
+    pending: Token{ kind: Kind.Eof, start: 0, end: 0 },
+    resumeString: false,
+    interp: []int(0),
+  }
 }
 
 function isDigit(c: u8): bool {
@@ -405,30 +421,75 @@ function scanEscape(lx: Lexer) {
   }
 }
 
-// An interpreted string `"..."` → StringLit spanning both quotes. Escapes are
-// consumed so a `\"` does not close the string; a newline ends an (unterminated)
-// string, matching the seed's recovery span. Interpolation (`${...}`) is NOT yet
-// handled — a `$` is consumed as content, so bitc2 diverges from the seed on an
-// interpolated string until that lands (a follow-up in #1334).
-function scanString(lx: Lexer): Token {
+// Interpolation nesting cap (Power of 10): deeper nesting degrades to a literal
+// `$`, matching the seed's max_interp.
+const maxInterp: int = 32
+
+// One literal segment of an interpreted string (§5.7). `isHead` marks the
+// opening `"`. A string with no `${` yields a single StringLit; otherwise a
+// StrPart is emitted and an InterpStart is stashed as `pending`, and after the
+// interpolation's `}` (see scanRBrace) the next segment resumes here with
+// `isHead = false`. Escapes are consumed so `\"` doesn't close; a newline ends
+// an unterminated string with the seed's recovery span.
+function scanStringSegment(lx: Lexer, isHead: bool): Token {
   let open = lx.i
-  lx.i = lx.i + 1
+  if (isHead) {
+    lx.i = lx.i + 1
+  }
+  let content = lx.i
   while (lx.i < len(lx.src)) {
     let c = lx.src[lx.i]
     if (c == '"') {
+      let end = lx.i
       lx.i = lx.i + 1
-      return Token{ kind: Kind.StringLit, start: open, end: lx.i }
+      if (isHead) {
+        return Token{ kind: Kind.StringLit, start: open, end: lx.i }
+      }
+      return Token{ kind: Kind.StrPart, start: content, end: end }
     }
     if (c == '\n') {
-      return Token{ kind: Kind.StringLit, start: open, end: lx.i }
+      if (isHead) {
+        return Token{ kind: Kind.StringLit, start: open, end: lx.i }
+      }
+      return Token{ kind: Kind.StrPart, start: content, end: lx.i }
     }
     if (c == '\\') {
       scanEscape(lx)
+    } else if (c == '$' && peekAt(lx, 1) == '{' && len(lx.interp) < maxInterp) {
+      let dollar = lx.i
+      let end = lx.i
+      lx.i = lx.i + 2
+      lx.interp = append(lx.interp, 0)
+      lx.pending = Token{ kind: Kind.InterpStart, start: dollar, end: lx.i }
+      lx.hasPending = true
+      return Token{ kind: Kind.StrPart, start: content, end: end }
     } else {
       lx.i = lx.i + 1
     }
   }
-  return Token{ kind: Kind.StringLit, start: open, end: lx.i }
+  if (isHead) {
+    return Token{ kind: Kind.StringLit, start: open, end: lx.i }
+  }
+  return Token{ kind: Kind.StrPart, start: content, end: lx.i }
+}
+
+// A `}`: closes the innermost interpolation (→ InterpEnd, and the next token
+// resumes the string body) when that interpolation is at brace depth 0;
+// otherwise it is a plain RBrace that pops one nesting level.
+function scanRBrace(lx: Lexer): Token {
+  let start = lx.i
+  let n = len(lx.interp)
+  if (n > 0) {
+    if (lx.interp[n - 1] == 0) {
+      lx.i = lx.i + 1
+      lx.interp = lx.interp[0:n - 1]
+      lx.resumeString = true
+      return Token{ kind: Kind.InterpEnd, start: start, end: lx.i }
+    }
+    lx.interp[n - 1] = lx.interp[n - 1] - 1
+  }
+  lx.i = lx.i + 1
+  return Token{ kind: Kind.RBrace, start: start, end: lx.i }
 }
 
 // A raw string `` `...` `` → RawStringLit; no escapes, closes at the next
@@ -487,7 +548,7 @@ function scanToken(lx: Lexer): Token {
   if (isIdentStart(c)) { return scanIdent(lx) }
   if (isDigit(c)) { return scanNumber(lx) }
   if (c == '.' && isDigit(peekAt(lx, 1))) { return scanNumber(lx) }
-  if (c == '"') { return scanString(lx) }
+  if (c == '"') { return scanStringSegment(lx, true) }
   if (c == '`') { return scanRawString(lx) }
   if (c == '\'') { return scanRune(lx) }
 
@@ -558,8 +619,16 @@ function scanToken(lx: Lexer): Token {
   if (c == ')') { return emit(lx, start, 1, Kind.RParen) }
   if (c == '[') { return emit(lx, start, 1, Kind.LBracket) }
   if (c == ']') { return emit(lx, start, 1, Kind.RBracket) }
-  if (c == '{') { return emit(lx, start, 1, Kind.LBrace) }
-  if (c == '}') { return emit(lx, start, 1, Kind.RBrace) }
+  if (c == '{') {
+    // Track brace nesting inside the innermost interpolation so a `}` that
+    // belongs to a block (not the interpolation) is a plain RBrace.
+    let n = len(lx.interp)
+    if (n > 0) {
+      lx.interp[n - 1] = lx.interp[n - 1] + 1
+    }
+    return emit(lx, start, 1, Kind.LBrace)
+  }
+  if (c == '}') { return scanRBrace(lx) }
   if (c == ',') { return emit(lx, start, 1, Kind.Comma) }
   if (c == ';') { return emit(lx, start, 1, Kind.Semicolon) }
   if (c == ':') { return emit(lx, start, 1, Kind.Colon) }
@@ -641,9 +710,22 @@ function skipTriviaThenToken(lx: Lexer): Token {
   return atEof(lx)
 }
 
+// Dispatches the queued `InterpStart`, a resumed string body, or a fresh scan.
+function produce(lx: Lexer): Token {
+  if (lx.hasPending) {
+    lx.hasPending = false
+    return lx.pending
+  }
+  if (lx.resumeString) {
+    lx.resumeString = false
+    return scanStringSegment(lx, false)
+  }
+  return skipTriviaThenToken(lx)
+}
+
 // The next token; `Eof` at end. Advances the lexer and records `last` for ASI.
 function nextToken(lx: Lexer): Token {
-  let t = skipTriviaThenToken(lx)
+  let t = produce(lx)
   lx.last = t.kind
   return t
 }
