@@ -1435,10 +1435,28 @@ fn mainTrampoline(arg: ?*anyopaque) callconv(.c) void {
 ///
 /// Only ever called once per process; `g_booted` catches a second call
 /// (there is no such thing as rebooting this runtime).
+/// Ignore SIGPIPE process-wide. A `write` to a socket whose peer has closed its
+/// read end otherwise raises SIGPIPE, whose default disposition terminates the
+/// process with no output — so a single client that hangs up mid-response would
+/// kill the whole server (observed as an exit-141, empty-stderr crash under a
+/// port collision). Ignored, the `write` returns EPIPE instead and `net.zig`'s
+/// normal `Error` path handles it. Every networked runtime does this at startup
+/// (Go, libuv). `std.posix.sigaction` is the raw syscall on Linux (libc-free)
+/// and libc on Darwin — the same split the rest of this file uses.
+fn ignoreSigpipe() void {
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &act, null);
+}
+
 pub fn boot(main_fn: MainFn, environ: std.process.Environ) !i32 {
     std.debug.assert(!g_booted);
     g_booted = true;
     g_environ = environ;
+    ignoreSigpipe();
 
     g_heap = heap_mod.Heap.init();
     g_gc = try gc_mod.Gc.init(&g_heap, gc_mod.configFromEnv(environ));
