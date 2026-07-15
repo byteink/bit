@@ -715,6 +715,12 @@ pub fn isTerminator(k: Kind) bool {
         .plus_plus,
         .minus_minus,
         .question,
+        // A trailing `!` is the fallible-result marker (`T!`), a postfix closer
+        // like `?` — logical-not is prefix and `!=` is its own token, so a bare
+        // `.bang` never ends a line as an operator. Without this a fallible
+        // method in an interface body (`read(): []byte!`⏎`next()`) runs on into
+        // the next member.
+        .bang,
         => true,
         else => false,
     };
