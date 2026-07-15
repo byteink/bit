@@ -11,11 +11,20 @@
 //!     would NOT fire (e.g. a statement ending in a generic type's `>` or a
 //!     bare `!` result type). This matches the semicolon-free house style of
 //!     the sample corpus while keeping re-parsing byte-exact.
-//!   * A brace block whose sole content is one simple statement prints inline
-//!     as `{ stmt }` at the two spots the house style keeps compact — match-arm
-//!     bodies and function bodies — but never for control-flow bodies (if /
-//!     while / for always stack). A comment inside the braces forces the
-//!     multi-line form so it can't be swallowed.
+//!   * A brace block whose sole content is one simple statement can print
+//!     inline as `{ stmt }`. A match-arm body always does (the single
+//!     expression is the point). A *function* body inlines only when the author
+//!     wrote it inline — the corpus legitimately uses both a one-line
+//!     `{ return … }` and an ordinary stacked body, and no single always-inline
+//!     or always-stack rule fits both, so the source's own choice is preserved
+//!     (#1266). Control-flow bodies (if / while / for) always stack; a statement
+//!     containing a `match` never inlines (the arm list forces multi-line); a
+//!     comment inside the braces forces the multi-line form so it can't be
+//!     swallowed.
+//!   * A bracketed comma list that fits stays flat; when it must break, an
+//!     author-grouped list (already spanning lines in the source) keeps that
+//!     grouping — a hand-laid constant table stays N-per-line — while a list the
+//!     author wrote flat breaks one item per line.
 //!   * Struct/interface/import bodies always print with commas (the source
 //!     may use `;`, commaList accepts either) — one separator, not two.
 //!   * Arrow function parameters always print parenthesized, even when
@@ -383,10 +392,27 @@ const Printer = struct {
         }
 
         self.indent += 1;
-        for (items) |it| {
-            try self.gap(self.tree.get(it).span.start, false);
+        // Preserve the author's grouping. If the source already broke this list
+        // across lines, keep two items on the same output line exactly where the
+        // source kept them on the same source line (gofmt's rule) — so a hand-laid
+        // table (an S-box, a round-constant array written N-per-line to mirror a
+        // spec) is not exploded to one item per line. A list the author wrote flat
+        // has no grouping to keep, so it still breaks per item — which is the only
+        // reason we reach this path for such a list: it was too wide to stay flat.
+        const first_start = self.tree.get(items[0]).span.start;
+        const grouped = newlinesBetween(self.source, first_start, span_end) > 0;
+        var prev_end: u32 = first_start;
+        for (items, 0..) |it, i| {
+            const start = self.tree.get(it).span.start;
+            // A pending comment before this item must route through `gap` so it is
+            // placed, never through the bare same-line space.
+            const same_line = grouped and i > 0 and
+                newlinesBetween(self.source, prev_end, start) == 0 and
+                !self.hasCommentBefore(start);
+            if (same_line) try self.raw(" ") else try self.gap(start, false);
             try self.printNode(it);
             try self.raw(",");
+            prev_end = self.tree.get(it).span.end;
         }
         try self.gap(span_end, false);
         self.indent -= 1;
@@ -442,15 +468,36 @@ const Printer = struct {
         const items = self.kids(idx);
         if (items.len != 1) return false;
         if (self.endsInBlock(items[0])) return false;
+        // A `match` always renders multi-line (its arm list stacks), so a block
+        // whose single statement contains one — `{ return match (o) { … } }` —
+        // cannot inline without dangling the arms. `endsInBlock` misses it: the
+        // match sits inside a `return`/`let`, not at statement top level.
+        if (self.containsMatch(items[0])) return false;
         return !self.hasCommentBefore(self.tree.get(idx).span.end);
+    }
+
+    /// Whether `idx`'s subtree contains a `match` expression, which always
+    /// renders multi-line. Bounded by the (finite) node count of the subtree.
+    fn containsMatch(self: *const Printer, idx: Index) bool {
+        if (idx == none) return false;
+        if (self.tree.get(idx).tag == .match_stmt) return true;
+        for (self.tree.kids(idx)) |k| if (self.containsMatch(k)) return true;
+        return false;
     }
 
     /// Prints a body that is either a `.block` (collapsed to `{ stmt }` when
     /// `blockInlineable`, else stacked) or, for a braceless match arm, a bare
     /// statement. Used only at the match-arm and function-body sites.
-    fn printBodyBlock(self: *Printer, idx: Index) FmtError!void {
+    fn printBodyBlock(self: *Printer, idx: Index, preserve_source: bool) FmtError!void {
         const n = self.tree.get(idx);
-        if (n.tag == .block and self.blockInlineable(idx)) {
+        // `preserve_source` (function bodies): inline only what the author wrote
+        // inline — the tree legitimately uses both a one-line `{ return … }` and
+        // an ordinary stacked body, and no single always-collapse/always-stack
+        // rule fits both, so honour the source's own choice (#1266). Match arms
+        // pass `false`: there the single expression is the point, so a braced arm
+        // body always collapses.
+        const source_inline = !preserve_source or newlinesBetween(self.source, n.span.start, n.span.end) == 0;
+        if (n.tag == .block and self.blockInlineable(idx) and source_inline) {
             try self.raw("{ ");
             try self.printNode(self.kids(idx)[0]);
             try self.raw(" }");
@@ -611,7 +658,7 @@ const Printer = struct {
                     try self.raw(t);
                 }
                 try self.raw(" ");
-                try self.printBodyBlock(k[5]);
+                try self.printBodyBlock(k[5], true);
             },
             .receiver => {
                 const k = self.kids(idx);
@@ -905,7 +952,7 @@ const Printer = struct {
                 const k = self.kids(idx);
                 try self.printNode(k[0]);
                 try self.raw(" => ");
-                try self.printBodyBlock(k[1]);
+                try self.printBodyBlock(k[1], false);
             },
             .variant_pat => {
                 const k = self.kids(idx);
@@ -1250,15 +1297,21 @@ test "semicolons omitted after ASI terminators, kept where ASI would not fire" {
     );
 }
 
-test "single-statement match arm and function body inline; a match never gets a trailing ';'" {
+test "match-arm bodies inline; function bodies preserve the source inline/stacked choice (#1266)" {
+    // The match stacks (its arm list) and its braced arm bodies inline.
     try expectFmt(
         "enum Light { Red, Green }\nfunction next(l: Light): Light {\n  match (l) {\n    Red => { return Light.Green }\n    Green => { return Light.Red }\n  }\n}\n",
         "enum Light { Red, Green }\nfunction next(l: Light): Light {\n  match (l) {\n    Red => { return Light.Green }\n    Green => { return Light.Red }\n  }\n}\n",
     );
-    // A single-statement function body inlines too.
+    // A function body the author wrote inline stays inline.
+    try expectFmt(
+        "function area(r: f64): f64 { return 3 * r }\n",
+        "function area(r: f64): f64 { return 3 * r }\n",
+    );
+    // A function body the author wrote stacked stays stacked — no forced collapse.
     try expectFmt(
         "function area(r: f64): f64 {\n  return 3 * r\n}\n",
-        "function area(r: f64): f64 { return 3 * r }\n",
+        "function area(r: f64): f64 {\n  return 3 * r\n}\n",
     );
 }
 
