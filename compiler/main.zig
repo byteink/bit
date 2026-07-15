@@ -755,14 +755,40 @@ fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, args: []const [:0
     return any_failed;
 }
 
-/// `bitc check [--dump-types] <path>...`: type-checks each file independently
-/// (each is its own single-file module — matches `compileReport`'s scope).
-/// Diagnostics go to `err_out`; with `dump_types`, a clean file's inferred
-/// types print to `out` instead of producing no output. Returns `true` iff
-/// any file failed, mirroring `runFmt`'s per-file-independence contract.
+/// `bitc check [--dump-types] <path>...`: type-checks each path independently.
+/// A directory is a whole project (prelude + std imports, cross-module) via
+/// `checkHostProject`, matching `bit build <dir>`; a plain file is its own
+/// single-file module (matches `compileReport`'s scope). Diagnostics go to
+/// `err_out`; with `dump_types`, a clean file's inferred types print to `out`
+/// instead of producing no output — `--dump-types` is single-file only and is
+/// rejected on a directory. Returns `true` iff any path failed, mirroring
+/// `runFmt`'s per-path-independence contract.
 fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer, dump_types: bool, paths: []const [:0]const u8) !bool {
     var any_failed = false;
     for (paths) |path| {
+        // A directory is a project (prelude + std imports), so it takes the
+        // whole-project front-end like `bit build <dir>`; only a plain file
+        // goes through the single-file report path. `--dump-types` has no
+        // project form yet — it dumps single files only (see --help).
+        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |e| {
+            try err_out.print("bitc check: {s}: {s}\n", .{ path, @errorName(e) });
+            any_failed = true;
+            continue;
+        };
+        if (stat.kind == .directory) {
+            if (dump_types) {
+                try err_out.print("bitc check: {s}: --dump-types applies to single files, not projects\n", .{path});
+                any_failed = true;
+                continue;
+            }
+            const root_abs = try absFromCwd(gpa, io, path);
+            defer gpa.free(root_abs);
+            const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+            defer if (std_root) |s| gpa.free(s);
+            if (try checkHostProject(gpa, io, root_abs, std_root, err_out)) any_failed = true;
+            continue;
+        }
+
         const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
             try err_out.print("bitc check: {s}: {s}\n", .{ path, @errorName(e) });
             any_failed = true;
@@ -953,6 +979,42 @@ test "compileReport reports success on clean source" {
     defer gpa.free(report.text);
     try std.testing.expect(!report.failed);
     try std.testing.expectEqualStrings("", report.text);
+}
+
+test "check routes a directory to the project checker (#1156)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = Io.Dir.cwd();
+
+    // A directory used to fail with `IsDir` before it ever reached the checker.
+    const dir = "/tmp/bit-check-dir-test";
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir);
+    defer cwd.deleteTree(io, dir) catch {};
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+
+    // Clean project: exits ok, no diagnostics.
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/main.bit", .data = "function main() {\n  print(\"ok\")\n}\n" });
+    try std.testing.expect(!try runCheck(gpa, io, &out.writer, &err.writer, false, &.{dir}));
+    try std.testing.expectEqualStrings("", err.written());
+
+    // Same directory with a type error: fails with the located E-code, proving
+    // the directory reached the real checker rather than dying on `IsDir`.
+    err.clearRetainingCapacity();
+    try cwd.writeFile(io, .{ .sub_path = dir ++ "/main.bit", .data = "function main() {\n  let x: i64 = \"nope\"\n  print(x)\n}\n" });
+    try std.testing.expect(try runCheck(gpa, io, &out.writer, &err.writer, false, &.{dir}));
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "E0041") != null);
+
+    // --dump-types stays single-file only: a directory is rejected, not crashed.
+    err.clearRetainingCapacity();
+    try std.testing.expect(try runCheck(gpa, io, &out.writer, &err.writer, true, &.{dir}));
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "single files") != null);
 }
 
 test "build: a printing program compiles, links, and runs" {
