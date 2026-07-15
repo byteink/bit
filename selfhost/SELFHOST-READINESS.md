@@ -29,6 +29,7 @@ not need any of them.
 |-----|--------|---------------|
 | Interface method values `let f = x.m` (#1260) | **FIXED** (e985ad3) | use directly |
 | Cross-module methods (#1261) | **works** (verified stale) | use directly |
+| Enum `==`/`!=` (was E0053, a Stage-1 deferral) | **FIXED** (37959ff) | compare tags directly; surfaced porting the AST arena |
 | Methods on generic structs `function (s: Stack<T>) m()` (#1325) | open (doesn't parse) | free functions: `m(s)` — verified. This is how the Zig compiler is already written. |
 | Tuple values / grouped return (#1326) | open (types but doesn't lower) | 2-field structs — verified. |
 | Arg-spread `f(...args)` | not surveyed | avoid; enumerate args, or slice-forward |
