@@ -648,6 +648,48 @@ pub const Lowerer = struct {
         try self.fn_value_tramps.put(self.gpa, gsym.pack(), fid);
         return fid;
     }
+
+    /// An interface method taken as a *value* (`let f = shape.area`): a closure
+    /// whose env is the interface receiver and whose code dispatches dynamically.
+    /// Mirrors `funcValueTrampoline`, but the trampoline's first param is the
+    /// receiver (used, not ignored) and the body is a `call_iface` on it rather
+    /// than a static `call` — so the concrete method is resolved through the
+    /// receiver's vtable at each invocation, exactly as an immediate `shape.area()`
+    /// would (ABI.md §2.1). `make_closure(tramp, recv)` binds it.
+    fn ifaceMethodTrampoline(self: *Lowerer, iface_ty: TypeId, method_index: u32, shape: check.FuncShape) Error!ir.FuncId {
+        var b = ir.FunctionBuilder.init(self.gpa);
+        errdefer b.deinit(self.gpa);
+        const entry = try b.newBlock();
+        b.beginBlock(entry);
+
+        var param_types: std.ArrayList(TypeId) = .empty;
+        defer param_types.deinit(self.gpa);
+
+        // The env slot carries the interface receiver; it is the dispatch target.
+        const recv = try b.addParam(iface_ty);
+        try param_types.append(self.gpa, iface_ty);
+        var call_args: std.ArrayList(ir.ValueId) = .empty;
+        defer call_args.deinit(self.gpa);
+        for (shape.params) |pty| {
+            try param_types.append(self.gpa, pty);
+            try call_args.append(self.gpa, try b.addParam(pty));
+        }
+
+        const r = try b.callIface(shape.result, recv, method_index, call_args.items);
+        if (shape.result == self.ctx.void_id) {
+            try b.ret(&.{});
+        } else {
+            try b.ret(&.{r});
+        }
+        b.endBlock();
+
+        const fid: ir.FuncId = @enumFromInt(self.reserved_count + self.closure_funcs.items.len);
+        const name = try std.fmt.allocPrint(self.gpa, "ifacemethod$trampoline${d}", .{@intFromEnum(fid)});
+        defer self.gpa.free(name);
+        const f = try b.finish(name, param_types.items, shape.result, false, .invalid, entry);
+        try self.closure_funcs.append(self.gpa, f);
+        return fid;
+    }
 };
 
 /// Lowers one already-resolved, type-checked, single-module program.
@@ -3175,7 +3217,18 @@ const FnCtx = struct {
                 return self.b.makeClosure(fty, entry.fid, recv_val);
             }
         }
-        return error.UnsupportedConstruct; // interface method value (not called immediately): deferred
+        // An interface method taken as a value binds the receiver into a closure
+        // that dispatches through its vtable (the checker typed this member as the
+        // method's function type, so it is a real interface method here).
+        if (data == .interface) {
+            const fty = try self.nodeType(node);
+            const shape = self.ctx.typeOf(fty).func;
+            const method_index = try self.l.methodId(name);
+            const recv_val = try self.lowerExpr(k[0]);
+            const tramp = try self.l.ifaceMethodTrampoline(recv_ty, method_index, shape);
+            return self.b.makeClosure(fty, tramp, recv_val);
+        }
+        return error.UnsupportedConstruct;
     }
 
     /// True when a value of `ty` is a single-word GC reference (mirrors
