@@ -163,6 +163,15 @@ fn precedence(k: Kind) u8 {
     };
 }
 
+/// The bitwise-and-shift operator family, whose mixed expressions the formatter
+/// parenthesizes for clarity regardless of precedence (see `printBinarySide`).
+fn isBitwiseOrShift(k: Kind) bool {
+    return switch (k) {
+        .amp, .pipe, .caret, .shl, .shr => true,
+        else => false,
+    };
+}
+
 // =============================================================================
 // Printer
 // =============================================================================
@@ -380,9 +389,12 @@ const Printer = struct {
             self.col = col_before; // undo the trial's (scratch-target) mutation either way
             const text = scratch.written();
             const extra: usize = if (pad) 2 else 0;
-            if (std.mem.indexOfScalar(u8, text, '\n') == null and
-                @as(usize, col_before) + extra + text.len + close.len + tail <= max_width)
-            {
+            // A single-element list stays flat even when over-width: wrapping one
+            // item onto its own line never shortens the line meaningfully, it just
+            // dangles the lone argument (e.g. the last `u32(byte)` of a long
+            // shift-or chain). Multi-element lists still wrap at the width limit.
+            const fits = @as(usize, col_before) + extra + text.len + close.len + tail <= max_width;
+            if (std.mem.indexOfScalar(u8, text, '\n') == null and (items.len == 1 or fits)) {
                 if (pad) try self.raw(" ");
                 try self.raw(text);
                 if (pad) try self.raw(" ");
@@ -497,7 +509,14 @@ const Printer = struct {
         // pass `false`: there the single expression is the point, so a braced arm
         // body always collapses.
         const source_inline = !preserve_source or newlinesBetween(self.source, n.span.start, n.span.end) == 0;
-        if (n.tag == .block and self.blockInlineable(idx) and source_inline) {
+        // Inlining also requires that the body *stays* on one line: a body the
+        // author wrote inline can still wrap (a long slice literal, a `catch`
+        // block), and inlining a body that then wraps is not idempotent — the
+        // next pass sees the newline and stacks it. `inlineFits` trial-renders
+        // the statement to confirm it neither wraps nor overflows the width.
+        if (n.tag == .block and self.blockInlineable(idx) and source_inline and
+            try self.inlineFits(self.kids(idx)[0]))
+        {
             try self.raw("{ ");
             try self.printNode(self.kids(idx)[0]);
             try self.raw(" }");
@@ -505,6 +524,39 @@ const Printer = struct {
             return;
         }
         try self.printNode(idx);
+    }
+
+    /// Whether the sole statement of an inline body renders on one line within
+    /// the width, as `{ stmt }` at the current column. Trial-renders `stmt` to a
+    /// throwaway buffer and fully restores every mutable printer field, so it is
+    /// side-effect-free and the caller re-renders `stmt` for real. Keeps the
+    /// inline decision stable under re-formatting (idempotence).
+    fn inlineFits(self: *Printer, stmt: Index) FmtError!bool {
+        const col0 = self.col;
+        const s_bol = self.bol;
+        const s_indent = self.indent;
+        const s_src = self.src_pos;
+        const s_ci = self.ci;
+        const s_depth = self.depth;
+        const saved_w = self.w;
+        var scratch: Writer.Allocating = .init(self.gpa);
+        defer scratch.deinit();
+        self.w = &scratch.writer;
+        self.col = col0 + 2; // the statement starts after the opening `{ `
+        self.bol = false;
+        defer {
+            self.w = saved_w;
+            self.col = col0;
+            self.bol = s_bol;
+            self.indent = s_indent;
+            self.src_pos = s_src;
+            self.ci = s_ci;
+            self.depth = s_depth;
+        }
+        try self.printNode(stmt);
+        const text = scratch.written();
+        return std.mem.indexOfScalar(u8, text, '\n') == null and
+            @as(usize, col0) + 2 + text.len + 2 <= max_width; // `{ ` … ` }`
     }
 
     /// Like `printSeq`, but never keeps a blank line before the *first* item.
@@ -552,12 +604,24 @@ const Printer = struct {
         try self.raw("}");
     }
 
-    fn printBinarySide(self: *Printer, idx: Index, parent_prec: u8, is_rhs: bool) FmtError!void {
+    fn printBinarySide(self: *Printer, idx: Index, parent_op: Kind, is_rhs: bool) FmtError!void {
         const tag = self.tree.get(idx).tag;
         var wrap = tag == .catch_default or tag == .catch_bind or tag == .arrow_fn;
         if (!wrap and tag == .binary) {
-            const child_prec = precedence(@enumFromInt(self.tree.get(idx).main));
-            wrap = if (is_rhs) child_prec <= parent_prec else child_prec < parent_prec;
+            const child_op: Kind = @enumFromInt(self.tree.get(idx).main);
+            const parent_prec = precedence(parent_op);
+            const child_prec = precedence(child_op);
+            // Correctness: wrap when precedence (with left-associativity) would
+            // otherwise re-group the child differently.
+            const prec_wrap = if (is_rhs) child_prec <= parent_prec else child_prec < parent_prec;
+            // Style: a bitwise/shift expression mixing two different operators is
+            // always parenthesized for clarity — `(a & b) ^ (a & c)`, never
+            // `a & b ^ a & c` — even where Bit's precedence (§12) makes the parens
+            // redundant. Same-operator chains (`a | b | c`) and plain arithmetic
+            // stay bare. Matches how the crypto corpus is written by hand.
+            const style_wrap = child_op != parent_op and
+                (isBitwiseOrShift(parent_op) or isBitwiseOrShift(child_op));
+            wrap = prec_wrap or style_wrap;
         }
         if (wrap) {
             try self.raw("(");
@@ -998,18 +1062,21 @@ const Printer = struct {
 
             .binary => {
                 const op: Kind = @enumFromInt(n.main);
-                const prec = precedence(op);
                 const k = self.kids(idx);
-                try self.printBinarySide(k[0], prec, false);
+                try self.printBinarySide(k[0], op, false);
                 try self.raw(" ");
                 try self.raw(ast.opSymbol(op));
                 try self.raw(" ");
-                try self.printBinarySide(k[1], prec, true);
+                try self.printBinarySide(k[1], op, true);
             },
             .unary => {
                 const op: Kind = @enumFromInt(n.main);
                 const operand = self.kids(idx)[0];
                 try self.raw(ast.opSymbol(op));
+                // `<- ch` reads as a word and mirrors the `ch <- v` send's spacing;
+                // the other prefix operators (`-`, `!`, `~`) bind tight to their
+                // operand.
+                if (op == .arrow_left) try self.raw(" ");
                 const child = self.tree.get(operand);
                 const wrap = switch (child.tag) {
                     .binary, .catch_default, .catch_bind, .arrow_fn => true,
@@ -1269,6 +1336,26 @@ test "re-parenthesization preserves precedence and grouping" {
     try expectFmt("let x = (1 - 2) - 3", "let x = 1 - 2 - 3\n");
     try expectFmt("let x = -(a + b)", "let x = -(a + b)\n");
     try expectFmt("let x = (a + b).c", "let x = (a + b).c\n");
+}
+
+test "mixed bitwise/shift operands keep clarity parens even when precedence-redundant" {
+    // `&` binds tighter than `^` in Bit (§12), so these parens are redundant —
+    // but stripping them makes crypto unreadable, so the formatter keeps them.
+    try expectFmt("let x = (a & b) ^ (a & c)", "let x = (a & b) ^ (a & c)\n");
+    try expectFmt("let x = (a & b) ^ (a & c) ^ (b & c)", "let x = (a & b) ^ (a & c) ^ (b & c)\n");
+    try expectFmt("let x = (t >> 8) & m", "let x = (t >> 8) & m\n");
+    try expectFmt("let x = (u32(b) << 8) | c", "let x = (u32(b) << 8) | c\n");
+    // Same-operator chains and plain arithmetic stay bare.
+    try expectFmt("let x = a & b & c", "let x = a & b & c\n");
+    try expectFmt("let x = a + b + c", "let x = a + b + c\n");
+    // A written-redundant bitwise paren is re-derived by the style rule, so it
+    // round-trips identically (idempotent).
+    try expectFmt("let x = a & b ^ c & d", "let x = (a & b) ^ (c & d)\n");
+}
+
+test "prefix receive prints as `<- ch`, mirroring the `ch <- v` send" {
+    try expectFmt("let v = <-ch", "let v = <- ch\n");
+    try expectFmt("let v = <- ch", "let v = <- ch\n");
 }
 
 test "arrow params always canonicalize to parenthesized form" {
