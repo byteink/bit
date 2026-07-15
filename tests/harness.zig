@@ -18,6 +18,14 @@
 //!   `// types` — compilation must succeed; `bitc check --dump-types`'
 //!                inferred-type dump must byte-match `.expected` (task #335's
 //!                positive suite: nested lambdas, generic calls).
+//!   `// tokens`— the `bitc --dump-tokens` stream (kind + span, incl. ASI `;`)
+//!                must byte-match `.expected`.
+//!   `// ast`   — the `bitc --dump-ast` s-expression must byte-match `.expected`.
+//!   `// ir`    — the `bitc --dump-ir` (post-opt SSA) must byte-match `.expected`.
+//!                The last three are the deterministic, canonical dumps the
+//!                self-host differential harness diffs the Zig and Bit compilers
+//!                on (#1327/#1328/#1329); here they also guard the Zig dumps'
+//!                own stability.
 //!
 //! A mismatch fails the build with a readable diff (via `expectEqualStrings`).
 //!
@@ -41,7 +49,7 @@ const max_cases = 4096;
 /// Upper bound on any single case/expected file.
 const max_file_bytes = 1 << 20; // 1 MiB
 
-const Directive = enum { run, panic, err, fmt, types };
+const Directive = enum { run, panic, err, fmt, types, tokens, ast, ir };
 const Outcome = enum { checked, skipped };
 
 /// Exit code the runtime uses for every panic (`runtime/root.zig`'s `fatal`,
@@ -80,7 +88,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
     defer gpa.free(source);
 
     const directive = directiveOf(source) orelse {
-        std.debug.print("case '{s}': line 1 must be '// run', '// error', '// fmt', or '// types'\n", .{name});
+        std.debug.print("case '{s}': line 1 must be '// run', '// panic', '// error', '// fmt', '// types', '// tokens', '// ast', or '// ir'\n", .{name});
         return error.MissingDirective;
     };
 
@@ -190,6 +198,39 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
                 std.debug.print("case '{s}' type-dump mismatch:\n", .{name});
             try testing.expectEqualStrings(expected, report.text);
         },
+        .tokens => {
+            const report = try bitc.tokensReport(gpa, name, source);
+            defer gpa.free(report.text);
+            if (report.failed) {
+                std.debug.print("case '{s}': expected lexing to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
+                return error.TokensFailed;
+            }
+            if (!std.mem.eql(u8, expected, report.text))
+                std.debug.print("case '{s}' token-dump mismatch:\n", .{name});
+            try testing.expectEqualStrings(expected, report.text);
+        },
+        .ast => {
+            const report = try bitc.parseReport(gpa, name, source);
+            defer gpa.free(report.text);
+            if (report.failed) {
+                std.debug.print("case '{s}': expected parse to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
+                return error.AstParseFailed;
+            }
+            if (!std.mem.eql(u8, expected, report.text))
+                std.debug.print("case '{s}' AST-dump mismatch:\n", .{name});
+            try testing.expectEqualStrings(expected, report.text);
+        },
+        .ir => {
+            const report = try bitc.irReport(gpa, name, source, true);
+            defer gpa.free(report.text);
+            if (report.failed) {
+                std.debug.print("case '{s}': expected lowering to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
+                return error.IrLowerFailed;
+            }
+            if (!std.mem.eql(u8, expected, report.text))
+                std.debug.print("case '{s}' IR-dump mismatch:\n", .{name});
+            try testing.expectEqualStrings(expected, report.text);
+        },
     }
     return .checked;
 }
@@ -208,6 +249,9 @@ fn directiveOf(source: []const u8) ?Directive {
     if (std.mem.startsWith(u8, line, "// run")) return .run;
     if (std.mem.startsWith(u8, line, "// fmt")) return .fmt;
     if (std.mem.startsWith(u8, line, "// types")) return .types;
+    if (std.mem.startsWith(u8, line, "// tokens")) return .tokens;
+    if (std.mem.startsWith(u8, line, "// ast")) return .ast;
+    if (std.mem.startsWith(u8, line, "// ir")) return .ir;
     return null;
 }
 

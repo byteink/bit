@@ -9,6 +9,7 @@ const parser = @import("parser.zig");
 const resolve = @import("resolve.zig");
 const check = @import("check.zig");
 const lower = @import("lower.zig");
+const ir = @import("ir.zig");
 const opt = @import("opt.zig");
 pub const testgen = @import("testgen.zig");
 pub const doc = @import("doc.zig");
@@ -101,6 +102,21 @@ pub fn main(init: std.process.Init) !void {
         var err_buf: [4096]u8 = undefined;
         var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
         const failed = try runCheck(gpa, io, &stdout_w.interface, &stderr_w.interface, dump_types, rest);
+        try stdout_w.interface.flush();
+        try stderr_w.interface.flush();
+        if (failed) return error.CheckFailed;
+        return;
+    }
+
+    // Single-file front-end dumps (`--dump-tokens|-ast|-types|-ir|-ir-pre`): the
+    // deterministic, canonical surfaces the self-host differential harness diffs
+    // the Zig and Bit compilers on. Front end only; no libbitrt.
+    if (argv.len >= 2 and std.mem.startsWith(u8, argv[1], "--dump-")) {
+        var out_buf: [4096]u8 = undefined;
+        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        const failed = try runDump(gpa, io, &stdout_w.interface, &stderr_w.interface, argv[1], argv[2..]);
         try stdout_w.interface.flush();
         try stderr_w.interface.flush();
         if (failed) return error.CheckFailed;
@@ -809,6 +825,60 @@ fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer
     return any_failed;
 }
 
+/// `bitc --dump-<mode> <file.bit>`: prints one front-end dump to stdout, or the
+/// rendered diagnostics to stderr on a front-end error. Each mode is a
+/// deterministic, canonical rendering used by the self-host differential
+/// harness. Returns `true` on any failure (usage, I/O, or a front-end error).
+fn runDump(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer, mode: []const u8, paths: []const [:0]const u8) !bool {
+    if (paths.len == 0) {
+        try err_out.print("usage: bitc {s} <file.bit>\n", .{mode});
+        return true;
+    }
+    const source = Io.Dir.cwd().readFileAlloc(io, paths[0], gpa, .limited(max_fmt_file_bytes)) catch |e| {
+        try err_out.print("bitc {s}: {s}: {s}\n", .{ mode, paths[0], @errorName(e) });
+        return true;
+    };
+    defer gpa.free(source);
+
+    // `parseReport`/`tokensReport`/... each return a `{ text, failed }` of a
+    // distinct nominal type, so extract the two fields per branch rather than
+    // unify the type.
+    var text: []u8 = undefined;
+    var failed: bool = undefined;
+    if (std.mem.eql(u8, mode, "--dump-tokens")) {
+        const r = try tokensReport(gpa, paths[0], source);
+        text = r.text;
+        failed = r.failed;
+    } else if (std.mem.eql(u8, mode, "--dump-ast")) {
+        const r = try parseReport(gpa, paths[0], source);
+        text = r.text;
+        failed = r.failed;
+    } else if (std.mem.eql(u8, mode, "--dump-types")) {
+        const r = try typesReport(gpa, paths[0], source);
+        text = r.text;
+        failed = r.failed;
+    } else if (std.mem.eql(u8, mode, "--dump-ir")) {
+        const r = try irReport(gpa, paths[0], source, true);
+        text = r.text;
+        failed = r.failed;
+    } else if (std.mem.eql(u8, mode, "--dump-ir-pre")) {
+        const r = try irReport(gpa, paths[0], source, false);
+        text = r.text;
+        failed = r.failed;
+    } else {
+        try err_out.print("bitc: unknown dump mode '{s}' (--dump-tokens|--dump-ast|--dump-types|--dump-ir|--dump-ir-pre)\n", .{mode});
+        return true;
+    }
+    defer gpa.free(text);
+
+    if (failed) {
+        try err_out.writeAll(text);
+        return true;
+    }
+    try out.writeAll(text);
+    return false;
+}
+
 /// Outcome of driving the front-end over a single source buffer.
 pub const CompileReport = struct {
     /// Rendered diagnostics, human format, ANSI disabled (deterministic).
@@ -934,6 +1004,80 @@ pub fn parseReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8)
         return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = true };
     }
     return .{ .text = try ast.dump(gpa, &tree, source), .failed = false };
+}
+
+/// Lexes `source` and renders one token per line — `<kind> <start>..<end>` —
+/// including the lexer's ASI-synthesized `;` tokens (§7), so the dump is
+/// exactly the stream the parser consumes. Deterministic (kind + byte span
+/// only, no pointers), which is what the self-host differential harness diffs
+/// the Zig and Bit lexers on. `failed` is true iff the lexer emitted any
+/// error-severity diagnostic. `text` is owned by `gpa`.
+pub fn tokensReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    const file = try sm.addFile(path, source);
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var lx = lexer.Lexer.init(file, source, &diags);
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Bounded (Power of 10): every `next()` either advances past a source byte
+    // or is an ASI/eof synthesis; a semicolon can be inserted per line, so the
+    // token count cannot exceed twice the byte length plus the final eof.
+    const bound = source.len * 2 + 2;
+    var guard: usize = 0;
+    while (guard <= bound) : (guard += 1) {
+        const tok = try lx.next();
+        try out.writer.print("{s} {d}..{d}\n", .{ @tagName(tok.kind), tok.span.start, tok.span.end });
+        if (tok.kind == .eof) break;
+    }
+    return .{ .text = try gpa.dupe(u8, out.written()), .failed = diags.hasErrors() };
+}
+
+/// Drives the front-end through lowering (and, when `optimize`, the optimizer)
+/// and renders the SSA IR (`ir.dump`) — the self-host stage-2 differential
+/// surface. On any front-end diagnostic, returns the rendered diagnostics with
+/// `failed = true` instead. `text` is owned by `gpa`.
+pub fn irReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8, optimize: bool) !CompileReport {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    const file = try sm.addFile(path, source);
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree = try ast.Tree.init(gpa);
+    defer tree.deinit();
+    try parser.parse(gpa, &tree, &diags, file, source);
+
+    fail: {
+        if (diags.hasErrors()) break :fail;
+        const mf = resolve.ModuleFile{ .file = file, .source = source, .tree = &tree };
+        var no_imports: resolve.ImportTable = .{};
+        defer no_imports.deinit(gpa);
+        const files = [_]resolve.ModuleFile{mf};
+
+        var rmodule = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
+        defer rmodule.deinit();
+        if (diags.hasErrors()) break :fail;
+
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var checked = try check.checkModule(gpa, &diags, &ctx, &files, &rmodule, @enumFromInt(0), &.{}, false);
+        defer checked.deinit();
+        if (diags.hasErrors()) break :fail;
+
+        var module = try lower.lowerModule(gpa, &ctx, &files, &checked, &rmodule);
+        defer module.deinit();
+        if (optimize) try opt.optimizeModule(gpa, &module, .o1);
+        return .{ .text = try ir.dump(gpa, &module), .failed = false };
+    }
+
+    var rendered: Io.Writer.Allocating = .init(gpa);
+    defer rendered.deinit();
+    try diags.renderAll(&rendered.writer);
+    return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = true };
 }
 
 /// Outcome of formatting a single source buffer for golden fmt tests.
