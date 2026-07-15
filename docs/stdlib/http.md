@@ -204,13 +204,19 @@ POST `body` to an https `url` with an explicit `std/tls` `TlsConfig`.
 The TLS mirror of `listenAndServe`: serves HTTPS on `host:port` forever with the
 certificate chain `certPem` and matching private key `keyPem` (both PEM),
 dispatching each request to `handler` on its own green thread. Returns only on a
-bind, accept, or handshake error.
+bind error; a single connection's failed or rejected handshake drops that
+connection and the server keeps serving.
 
 This is also the HTTP/2 server: `serveTls` offers ALPN `["h2","http/1.1"]`, so a
 client that negotiates `h2` is served over HTTP/2 and everything else over
 HTTP/1.1 — the same `handler` serves both, and you write nothing extra to get
 HTTP/2. There is no `serveH2` because there is nothing for it to do. See
 [HTTP/2](#http2) below and `examples/http2server`.
+
+A client that offers ALPN but shares no protocol with the server has its
+handshake **aborted** (RFC 7301 §3.2 `no_application_protocol`), not silently
+downgraded to HTTP/1.1 — so a client that offers only `h2` is either served over
+HTTP/2 or refused, never quietly served over something it did not ask for.
 
 ```bit
 import { get, getTls, serveTls, ok, respond, Request, Response } from "std/http"
