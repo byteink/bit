@@ -612,4 +612,18 @@ pub fn build(b: *std.Build) void {
     // path — they link the emitted-bin archive above — so this is only for
     // those `zig-out`-reading tests.
     if (host_libbitrt_install) |inst| test_step.dependOn(inst);
+
+    // `zig build selfhost`: compile the bit-in-Bit compiler under `selfhost/`
+    // with the seed `bitc` and install the result as `bitc2` — the entry point
+    // for the bootstrap chain (BOOTSTRAP.md; epic #363-#365). A stub driver
+    // today; each self-host stage grows it, always differential-tested against
+    // the Zig compiler. Runs from the build root so `bitc` resolves both
+    // `selfhost/` and the host `zig-out/lib/<triple>/libbitrt.a`.
+    const selfhost_run = b.addRunArtifact(exe);
+    selfhost_run.addArgs(&.{ "build", "selfhost", "-o" });
+    const bitc2 = selfhost_run.addOutputFileArg("bitc2");
+    selfhost_run.step.dependOn(b.getInstallStep());
+    if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
+    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bitc → bitc2");
+    selfhost_step.dependOn(&b.addInstallBinFile(bitc2, "bitc2").step);
 }
