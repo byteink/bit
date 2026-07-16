@@ -61,9 +61,156 @@ function lowerParamTypes(c: Checker, decl: int): []int {
   return types
 }
 
-// Lowers one function declaration to an `IrFunc`. The signature is complete; the
-// body is not yet lowered, so the block ends in the fall-off `ret` (correct for
-// an empty void body). ponytail: body lowering lands construct-by-construct next.
+// Per-function lowering state: the checker (for types), the IR builder, the
+// name -> SSA value id environment, and flags. `failed` trips on any construct
+// not yet lowerable, so the function falls back to a signature-only stub rather
+// than emitting partial/garbage IR.
+struct FnCtx {
+  c: Checker,
+  b: IrBuilder,
+  env: map<string, int>,
+  failed: bool,
+  terminated: bool,
+}
+
+// name -> SSA value id from the function env, or -1 if unbound.
+function envValue(fc: FnCtx, name: string): int {
+  for (k, v) of fc.env {
+    if (k == name) {
+      return v
+    }
+  }
+  return -1
+}
+
+// The IR op for a binary operator kind, given whether its operands are floats.
+// Returns Op.BlockParam as a "not lowerable yet" sentinel (never a real binary).
+function binOpFor(op: int, isFloat: bool): Op {
+  if (op == int(Kind.Plus)) {
+    if (isFloat) {
+      return Op.FAdd
+    }
+    return Op.Add
+  }
+  if (op == int(Kind.Minus)) {
+    if (isFloat) {
+      return Op.FSub
+    }
+    return Op.Sub
+  }
+  if (op == int(Kind.Star)) {
+    if (isFloat) {
+      return Op.FMul
+    }
+    return Op.Mul
+  }
+  return Op.BlockParam
+}
+
+// Lowers an expression to its SSA value id, or trips `failed` (returning 0) for
+// a construct not yet handled. ponytail: literals/idents/(+,-,*) only — the
+// growth frontier for the IR differential.
+function lowerExpr(fc: FnCtx, node: int): int {
+  let n = getNode(fc.c.tree, node)
+  let tag = n.tag
+  if (tag == Tag.IntLit) {
+    let ins = mkInstr(Op.ConstInt, defaultType(fc.c, checkExprType(fc.c, node)))
+    ins.ival = parseIntText(fc.c.source[n.span.start:n.span.end])
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.BoolLit) {
+    let ins = mkInstr(Op.ConstBool, primType(fc.c.ctx, 10))
+    ins.bval = fc.c.source[n.span.start:n.span.end] == "true"
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.Ident) {
+    let v = envValue(fc, fc.c.source[n.span.start:n.span.end])
+    if (v == -1) {
+      fc.failed = true
+      return 0
+    }
+    return v
+  }
+  if (tag == Tag.Binary) {
+    let ty = defaultType(fc.c, checkExprType(fc.c, node))
+    let isFloat = fc.c.ctx.types[ty].kind == TypeKind.Prim &&
+      (fc.c.ctx.types[ty].prim == 8 || fc.c.ctx.types[ty].prim == 9)
+    let op = binOpFor(n.main, isFloat)
+    if (op == Op.BlockParam) {
+      fc.failed = true
+      return 0
+    }
+    let kids = kidsOf(fc.c.tree, node)
+    let lhs = lowerExpr(fc, kids[0])
+    let rhs = lowerExpr(fc, kids[1])
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(op, ty)
+    ins.lhs = lhs
+    ins.rhs = rhs
+    return builderEmit(fc.b, ins)
+  }
+  fc.failed = true
+  return 0
+}
+
+// Lowers one statement. Only `return [expr]` is handled; anything else trips
+// `failed`.
+function lowerStmt(fc: FnCtx, node: int) {
+  let n = getNode(fc.c.tree, node)
+  if (n.tag == Tag.ReturnStmt) {
+    let vals = kidsOf(fc.c.tree, node)
+    if (len(vals) == 0) {
+      builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+      fc.terminated = true
+      return
+    }
+    if (len(vals) != 1) {
+      fc.failed = true
+      return
+    }
+    let v = lowerExpr(fc, vals[0])
+    if (fc.failed) {
+      return
+    }
+    let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
+    r.args = [v]
+    builderEmit(fc.b, r)
+    fc.terminated = true
+    return
+  }
+  fc.failed = true
+}
+
+// Lowers a body block's statements in order, stopping at the first unlowerable
+// one (which sets `failed`).
+function lowerStmtList(fc: FnCtx, block: int) {
+  let stmts = kidsOf(fc.c.tree, block)
+  let i = 0
+  while (i < len(stmts) && !fc.failed) {
+    lowerStmt(fc, stmts[i])
+    i = i + 1
+  }
+}
+
+// A signature-only stub: params + the fall-off `ret`, for functions whose body
+// is not yet fully lowerable.
+function signatureOnlyFunc(c: Checker, name: string, paramTypes: []int, result: int): IrFunc {
+  let b = newBuilder()
+  builderNewBlock(b)
+  let i = 0
+  while (i < len(paramTypes)) {
+    builderAddParam(b, paramTypes[i])
+    i = i + 1
+  }
+  builderEmit(b, mkInstr(Op.Ret, c.ctx.voidId))
+  return IrFunc{ name: name, paramTypes: paramTypes, result: result,
+    blocks: b.blocks, instrs: b.instrs }
+}
+
+// Lowers one function declaration to an `IrFunc`: the full signature plus the
+// body if every statement lowers, else a signature-only stub.
 function lowerFunc(c: Checker, decl: int): IrFunc {
   let kids = kidsOf(c.tree, decl)
   let nm = getNode(c.tree, kids[1])
@@ -76,15 +223,43 @@ function lowerFunc(c: Checker, decl: int): IrFunc {
   }
   let b = newBuilder()
   builderNewBlock(b)
+  let fc = FnCtx{ c: c, b: b, env: map<string, int>{}, failed: false, terminated: false }
+  // Bind params (receiver first, if any) to their block-param value ids.
+  let names = paramNames(c, decl)
   let i = 0
   while (i < len(paramTypes)) {
-    builderAddParam(b, paramTypes[i])
+    let id = builderAddParam(b, paramTypes[i])
+    fc.env[names[i]] = id
     i = i + 1
   }
-  // ponytail: body not yet lowered — emit the fall-off void return.
-  builderEmit(b, mkInstr(Op.Ret, c.ctx.voidId))
+  lowerStmtList(fc, kids[5])
+  if (fc.failed) {
+    return signatureOnlyFunc(c, name, paramTypes, result)
+  }
+  if (!fc.terminated) {
+    builderEmit(fc.b, mkInstr(Op.Ret, c.ctx.voidId))
+  }
   return IrFunc{ name: name, paramTypes: paramTypes, result: result,
-    blocks: b.blocks, instrs: b.instrs }
+    blocks: fc.b.blocks, instrs: fc.b.instrs }
+}
+
+// The parameter names of a function declaration, in the same order as
+// lowerParamTypes (method receiver first).
+function paramNames(c: Checker, decl: int): []string {
+  let kids = kidsOf(c.tree, decl)
+  let names = []string(0)
+  if (kids[0] != 0) {
+    let rn = getNode(c.tree, kidsOf(c.tree, kids[0])[0])
+    names = append(names, c.source[rn.span.start:rn.span.end])
+  }
+  let params = kidsOf(c.tree, kids[3])
+  let i = 0
+  while (i < len(params)) {
+    let pn = getNode(c.tree, kidsOf(c.tree, params[i])[0])
+    names = append(names, c.source[pn.span.start:pn.span.end])
+    i = i + 1
+  }
+  return names
 }
 
 // Lowers every top-level function in declaration (arena) order into an
