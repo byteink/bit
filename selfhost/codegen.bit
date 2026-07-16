@@ -1,0 +1,202 @@
+// Self-host Stage 3 (#1340): backend-agnostic codegen core, ported from
+// compiler/codegen/common.zig. Kept deliberately tiny — only logic with zero
+// dependency on a physical register file or instruction encoding belongs here;
+// everything else (register lists, calling-convention argument mapping, the
+// instruction encoder, frame layout) is inherently per-ISA and stays in its own
+// backend file. Divergence between backends in code that COULD live here is a
+// design smell; extract more here only once a second concrete user demonstrates
+// the logic is truly identical, not merely similar.
+
+// One physical register file's class (the seed's regalloc.Class).
+enum RegClass {
+  Int,
+  Float,
+}
+
+// A scalar's storage width and class. Mirrors lower.bit's object-layout scheme:
+// every scalar prim is stored at its natural width; every other shape is one
+// boxed 8-byte handle.
+struct Width {
+  bytes: int,
+  class: RegClass,
+  signed: bool,
+}
+
+function mkWidth(bytes: int, class: RegClass, signed: bool): Width {
+  return Width{ bytes: bytes, class: class, signed: signed }
+}
+
+// Depends only on the TypeContext, never on a physical register — identical for
+// every backend. Prim indices: 0=i8 1=i16 2=i32 3=i64 4=u8 5=u16 6=u32 7=u64
+// 8=f32 9=f64 10=bool 11=string.
+function widthOf(ctx: TypeContext, ty: int): Width {
+  if (ctx.types[ty].kind != TypeKind.Prim) {
+    return mkWidth(8, RegClass.Int, false) // uniform boxed handle
+  }
+  let p = ctx.types[ty].prim
+  if (p == 0) { return mkWidth(1, RegClass.Int, true) }
+  if (p == 4) { return mkWidth(1, RegClass.Int, false) }
+  if (p == 1) { return mkWidth(2, RegClass.Int, true) }
+  if (p == 5) { return mkWidth(2, RegClass.Int, false) }
+  if (p == 2) { return mkWidth(4, RegClass.Int, true) }
+  if (p == 6) { return mkWidth(4, RegClass.Int, false) }
+  if (p == 3) { return mkWidth(8, RegClass.Int, true) }
+  if (p == 7) { return mkWidth(8, RegClass.Int, false) }
+  if (p == 8) { return mkWidth(4, RegClass.Float, false) }
+  if (p == 9) { return mkWidth(8, RegClass.Float, false) }
+  if (p == 10) { return mkWidth(1, RegClass.Int, false) }
+  return mkWidth(8, RegClass.Int, false) // string
+}
+
+function regClassOf(ctx: TypeContext, ty: int): RegClass {
+  return widthOf(ctx, ty).class
+}
+
+// Whether a value of type `ty` is a GC reference (lower.bit's fieldLayout
+// `isPtr`, re-derived here for codegen's own use).
+function isRefType(ctx: TypeContext, ty: int): bool {
+  let k = ctx.types[ty].kind
+  if (k == TypeKind.Prim) {
+    return ctx.types[ty].prim == 11 // string
+  }
+  if (k == TypeKind.Void || k == TypeKind.UntypedInt || k == TypeKind.UntypedFloat ||
+    k == TypeKind.UntypedRune || k == TypeKind.UntypedBool || k == TypeKind.UntypedString ||
+    k == TypeKind.UntypedNil || k == TypeKind.Invalid || k == TypeKind.TypeParam ||
+    k == TypeKind.Fallible) {
+    return false
+  }
+  if (k == TypeKind.Enum) {
+    // A bare tag word, or a boxed {tag, payloadPtr} if it has payloads.
+    return ctx.types[ty].enumBoxed
+  }
+  return true // slice/array/map/tuple/chan/struct/interface/func
+}
+
+// A call-site relocation: `offset` names the byte, within a function's code, of
+// the field an object writer must patch to point at `symbol` (a Bit function's
+// own name, or a runtime symbol). The width and meaning of that field is
+// architecture-specific (x86-64: a 4-byte `E8 rel32`; ARM64: a `BL`'s 26-bit
+// immediate) — the object writer is already relocation-type-aware per target, so
+// only the offset/symbol pairing is common.
+struct Reloc {
+  offset: int,
+  symbol: string,
+}
+
+// ===========================================================================
+// GC stack-map table (runtime/ABI.md §4)
+//
+// The precise collector walks each Bit frame at a safepoint and needs, per
+// return address, which stack slots and callee-saved registers hold a live GC
+// reference — plus, to unwind past a frame, where that frame stashed the
+// caller's callee-saved registers. Each backend computes this per function;
+// `writeStackMaps` serializes the whole module into one blob the runtime reads
+// at collection time via the `bit_stack_maps` symbol.
+//
+// All offsets are FRAME-POINTER-relative (rbp on x86-64, x29 on AArch64),
+// normalized by each backend so the runtime walker is arch-neutral. Both arches
+// chain frames identically: *(fp) is the caller's fp and *(fp+8) is the return
+// address.
+// ===========================================================================
+
+// One callee-saved register a function preserves in its prologue, and the
+// frame-relative slot where it stashed the CALLER's value. Unwinding past this
+// frame, the walker restores the register from *(fp + fpOff).
+struct SavedReg {
+  reg: int,
+  fpOff: int,
+}
+
+// The live-reference set at one safepoint (a call/back-edge return address).
+struct SafepointView {
+  // Return address = the function's code address + this offset.
+  retOffset: int,
+  // Frame-pointer-relative offsets of stack slots holding a live reference.
+  slots: []int,
+  // Physical register numbers holding a live reference at this point.
+  regs: []int,
+}
+
+// One function's contribution to the module stack-map table.
+struct FuncStackMap {
+  codeSize: int,
+  saved: []SavedReg,
+  safepoints: []SafepointView,
+}
+
+// A growable byte buffer (the seed passes a *std.ArrayList(u8)); structs are
+// reference types, so callees append in place.
+struct ByteBuf {
+  bytes: []u8,
+}
+
+function newByteBuf(): ByteBuf {
+  return ByteBuf{ bytes: []u8(0) }
+}
+
+// Little-endian appends. The runtime reads the table with unaligned reads, so
+// everything is tightly packed.
+function appendU16(out: ByteBuf, v: int) {
+  out.bytes = append(out.bytes, u8(v & 255))
+  out.bytes = append(out.bytes, u8((v >> 8) & 255))
+}
+
+function appendU32(out: ByteBuf, v: int) {
+  appendU16(out, v & 65535)
+  appendU16(out, (v >> 16) & 65535)
+}
+
+function appendU64(out: ByteBuf, v: int) {
+  appendU32(out, v & 4294967295)
+  appendU32(out, (v >> 32) & 4294967295)
+}
+
+// Serializes the module stack-map table (runtime/ABI.md §4) by appending its
+// blob to `out`. Returns, for each function in order, the byte offset within
+// `out` of that function's 8-byte code-address field — the object writer
+// relocates each to the function's own symbol so the runtime reads a real code
+// address. Offsets are section-relative because `out` already holds everything
+// emitted before the table.
+//
+// Layout (little-endian, tightly packed): `u32 numFuncs`, then per function
+// `u64 codeAddr`, `u32 codeSize`, `u16 numSaved` x `{u16 reg, i32 fpOff}`,
+// `u16 numSafepoints` x `{u32 retOffset, u16 numSlots x i32, u16 numRegs x u16}`.
+function writeStackMaps(out: ByteBuf, funcs: []FuncStackMap): []int {
+  let relocOffsets = []int(0)
+  appendU32(out, len(funcs))
+  let fi = 0
+  while (fi < len(funcs)) {
+    let fsm = funcs[fi]
+    relocOffsets = append(relocOffsets, len(out.bytes))
+    appendU64(out, 0) // codeAddr — filled by the reloc
+    appendU32(out, fsm.codeSize)
+    appendU16(out, len(fsm.saved))
+    let si = 0
+    while (si < len(fsm.saved)) {
+      appendU16(out, fsm.saved[si].reg)
+      appendU32(out, fsm.saved[si].fpOff)
+      si = si + 1
+    }
+    appendU16(out, len(fsm.safepoints))
+    let pi = 0
+    while (pi < len(fsm.safepoints)) {
+      let sp = fsm.safepoints[pi]
+      appendU32(out, sp.retOffset)
+      appendU16(out, len(sp.slots))
+      let i = 0
+      while (i < len(sp.slots)) {
+        appendU32(out, sp.slots[i])
+        i = i + 1
+      }
+      appendU16(out, len(sp.regs))
+      i = 0
+      while (i < len(sp.regs)) {
+        appendU16(out, sp.regs[i])
+        i = i + 1
+      }
+      pi = pi + 1
+    }
+    fi = fi + 1
+  }
+  return relocOffsets
+}
