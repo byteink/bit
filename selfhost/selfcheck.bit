@@ -2582,6 +2582,15 @@ function meAtom(name: string, kind: LoSectionKind, b: LoBinding, size: int, relo
     alignment: 1, weak: false, relocs: relocs }
 }
 
+// A text atom whose first word is a real instruction. Relocation only patches an
+// instruction's immediate field and preserves its opcode bits, so an all-zero
+// fixture would assert against a relocated NOP rather than a relocated branch.
+function meCodeAtom(name: string, b: LoBinding, insn: int, relocs: []LoReloc): LoAtom {
+  let a = meAtom(name, LoSectionKind.Text, b, 8, relocs)
+  loWrU32(a.data, 0, insn)
+  return a
+}
+
 function meRel(off: int, kind: LoRelocKind, target: LoSymbolRef): LoReloc {
   return LoReloc{ offset: off, kind: kind, target: target, addend: 0 }
 }
@@ -2717,6 +2726,219 @@ function checkMachoExecNoDataSeg() {
     meEmptyState()
   }
   assert(msg == "MissingEntry")
+}
+
+// Stage 3 (#1344 part 5c) address assignment, relocation application, and the
+// dyld info streams.
+
+// `panic` is void, not bottom, so a catch that must yield a MePatched needs a
+// real value beside the assert that actually fails.
+function meEmptyPatched(): MePatched {
+  return MePatched{ bytes: map<int, []u8>{}, dataBinds: []MeDataBind(0),
+    dataRebases: []int(0) }
+}
+
+function meAddrs(stubs: int, got: int, dataSeg: int, tlsBase: int): MeAddrs {
+  return MeAddrs{ stubsVaddr: stubs, gotVaddr: got, dataSegVaddr: dataSeg,
+    tlsTemplateBase: tlsBase }
+}
+
+function checkMachoExecSymtab() {
+  // Only imports get symbol-table entries; an internal symbol is resolved
+  // statically and nothing looks it up at runtime.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 12, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_exit")),
+      meRel(4, LoRelocKind.Aarch64AdrGotPage, loGlobalRef("_environ")),
+      meRel(8, LoRelocKind.Aarch64Call26, loLocalRef(1))]),
+    meAtom("helper", LoSectionKind.Text, LoBinding.Local, 4, []LoReloc(0))]}
+  let st = meAnalyze([m])
+  let sym = meBuildSymtab(st)
+
+  // strtab starts with the empty string at index 0, then each import NUL-
+  // terminated. "_exit" is seen first.
+  assert(sym.strtab.bytes[0] == u8(0))
+  assert(string(sym.strtab.bytes[1:6]) == "_exit")
+  assert(sym.strtab.bytes[6] == u8(0))
+  assert(string(sym.strtab.bytes[7:15]) == "_environ")
+  assert(len(sym.strtab.bytes) == 1 + 6 + 9)
+
+  // One 16-byte nlist_64 per import: N_UNDF|N_EXT, NO_SECT, no address.
+  assert(len(sym.nlists.bytes) == 2 * 16)
+  assert(leAt(sym.nlists.bytes, 0, 4) == 1)  // n_strx -> "_exit"
+  assert(int(sym.nlists.bytes[4]) == 0x01)   // N_UNDF | N_EXT
+  assert(int(sym.nlists.bytes[5]) == 0)      // NO_SECT
+  assert(leAt(sym.nlists.bytes, 8, 8) == 0)  // n_value
+  assert(leAt(sym.nlists.bytes, 16, 4) == 7) // n_strx -> "_environ"
+
+  // The indirect table is stubs first, then the GOT — the order the section
+  // headers' reserved1 indices assume.
+  let ind = meIndirectSymbols(st, sym.symIndex)
+  assert(len(ind) == len(st.stubList) + len(st.gotList))
+  assert(ind[0] == 0) // the one stub: _exit, symbol 0
+  // GOT order is _exit (from the branch) then _environ.
+  assert(ind[1] == 0 && ind[2] == 1)
+}
+
+function checkMachoExecStreams() {
+  // Rebase offsets are emitted in ASCENDING order regardless of discovery order,
+  // so the output stays deterministic.
+  let ops = meRebaseStream([0x2000, 0x8, 0x100], 2)
+  // SET_TYPE_IMM|POINTER, then (SET_SEG_AND_OFF|2, uleb, DO_REBASE|1) x3, DONE.
+  assert(ops.bytes[0] == u8(0x11))
+  assert(ops.bytes[1] == u8(0x22) && ops.bytes[2] == u8(0x08)) // 0x8 first
+  assert(ops.bytes[3] == u8(0x51))
+  assert(ops.bytes[4] == u8(0x22) && ops.bytes[5] == u8(0x80) && ops.bytes[6] == u8(0x02)) // uleb(0x100)
+  assert(ops.bytes[7] == u8(0x51))
+  assert(ops.bytes[8] == u8(0x22) && ops.bytes[9] == u8(0x80) && ops.bytes[10] == u8(0x40)) // uleb(0x2000)
+  assert(ops.bytes[11] == u8(0x51))
+  assert(ops.bytes[12] == u8(0x00)) // DONE
+  assert(len(ops.bytes) == 13)
+
+  // Nothing to slide: no stream at all, not an empty-but-present one.
+  assert(len(meRebaseStream([]int(0), 2).bytes) == 0)
+
+  // The bind stream names libSystem as dylib #1, then binds each import's GOT
+  // slot, then each absolute data pointer to an import.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Aarch64AdrGotPage, loGlobalRef("_environ"))])]}
+  let st = meAnalyze([m])
+  let b = meBindStream(st, [MeDataBind{ segOff: 0x40, name: "_malloc" }],
+    0x100008000, 0x100008000, 2)
+  assert(b.bytes[0] == u8(0x11)) // SET_DYLIB_ORDINAL_IMM | 1
+  // _environ's GOT slot is at offset 0 of __DATA.
+  assert(b.bytes[1] == u8(0x40))
+  assert(string(b.bytes[2:10]) == "_environ")
+  assert(b.bytes[10] == u8(0x00)) // NUL
+  assert(b.bytes[11] == u8(0x51)) // SET_TYPE_IMM | POINTER
+  assert(b.bytes[12] == u8(0x72)) // SET_SEGMENT_AND_OFFSET_ULEB | 2
+  assert(b.bytes[13] == u8(0x00)) // uleb(0)
+  assert(b.bytes[14] == u8(0x90)) // DO_BIND
+  assert(b.bytes[len(b.bytes) - 1] == u8(0x00)) // DONE
+}
+
+function checkMachoExecApply() {
+  // __start branches to an internal helper and holds an abs64 to it; `ptr` is a
+  // data atom whose abs64 must be rebased.
+  let m = LoModule{ name: "rt", atoms: [
+    meCodeAtom("__start", LoBinding.Global, 0x94000000, [
+      meRel(0, LoRelocKind.Aarch64Call26, loLocalRef(1))]),
+    meAtom("helper", LoSectionKind.Text, LoBinding.Global, 8, []LoReloc(0)),
+    meAtom("ptr", LoSectionKind.Data, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Abs64, loLocalRef(1))])]}
+  let g = resolveGlobals([m]) catch e { map<string, int>{} }
+  // `ptr` is data, unreachable from __start's code, so dead-strip would drop it.
+  // Force it kept to exercise the abs64/rebase path. (Reading a dropped atom out
+  // of pat.bytes returns the zero slice, and using it without checking the
+  // comma-ok flag crashes silently — which is exactly what the flag is for.)
+  let st0 = meDeadStripWithImports([m], g) catch e {
+    assert(false)
+    meEmptyState()
+  }
+  st0.kept[atomKey(0, 2)] = true
+  let st1 = mePartition([m], st0)
+  let st = meBuildGotAndStubs([m], g, st1) catch e {
+    assert(false)
+    meEmptyState()
+  }
+
+  // Place text at a known base; put the data atom in __DATA.
+  let addrOf = map<int, int>{}
+  addrOf[atomKey(0, 0)] = 0x100000000
+  addrOf[atomKey(0, 1)] = 0x100000010
+  addrOf[atomKey(0, 2)] = 0x100008000
+  let a = meAddrs(0x100004000, 0x100008100, 0x100008000, 0)
+  let pat = meApplyRelocs([m], g, st, addrOf, a) catch e {
+    assert(false)
+    meEmptyPatched()
+  }
+
+  // The internal branch resolves direct: bl +16 == the assembler's 0x94000004.
+  let (code, _) = pat.bytes[atomKey(0, 0)]
+  assert(loRdU32(code, 0) == 0x94000004)
+
+  // The data atom's abs64 holds helper's absolute address...
+  let (data, _) = pat.bytes[atomKey(0, 2)]
+  assert(loRdU64(data, 0) == 0x100000010)
+  // ...and is rebased, since __data is writable and dyld slides the image.
+  // The GOT is empty here, so the only rebase is the data pointer's.
+  assert(len(pat.dataRebases) == 1)
+  assert(pat.dataRebases[0] == 0) // 0x100008000 - dataSegVaddr
+  assert(len(pat.dataBinds) == 0)
+
+  // The atom's ORIGINAL bytes are untouched — only the patched copy carries the
+  // relocated value. Two atoms can share a backing slice.
+  assert(loRdU64(m.atoms[2].data, 0) == 0)
+}
+
+function checkMachoExecApplyImports() {
+  // A branch to an import is retargeted to its STUB, not to the symbol; an
+  // abs64 to an import is left zero for dyld to bind.
+  let m = LoModule{ name: "rt", atoms: [
+    meCodeAtom("__start", LoBinding.Global, 0x94000000, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_exit"))]),
+    meAtom("fnptr", LoSectionKind.Data, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Abs64, loGlobalRef("_malloc"))])]}
+  let g = resolveGlobals([m]) catch e { map<string, int>{} }
+  let st0 = meDeadStripWithImports([m], g) catch e { meEmptyState() }
+  // fnptr is not reachable from __start, so force it kept to exercise the path.
+  st0.kept[atomKey(0, 1)] = true
+  let st1 = mePartition([m], st0)
+  let st = meBuildGotAndStubs([m], g, st1) catch e { meEmptyState() }
+
+  let addrOf = map<int, int>{}
+  addrOf[atomKey(0, 0)] = 0x100000000
+  addrOf[atomKey(0, 1)] = 0x100008000
+  let a = meAddrs(0x100004000, 0x100008100, 0x100008000, 0)
+  let pat = meApplyRelocs([m], g, st, addrOf, a) catch e {
+    assert(false)
+    meEmptyPatched()
+  }
+
+  // The branch targets stub 0 at 0x100004000, from p = 0x100000000:
+  // disp = 0x4000, imm26 = 0x1000.
+  let (code, _) = pat.bytes[atomKey(0, 0)]
+  assert(loRdU32(code, 0) == 0x94001000)
+
+  // The import pointer stays zero in the file and is recorded as a bind.
+  let (data, _) = pat.bytes[atomKey(0, 1)]
+  assert(loRdU64(data, 0) == 0)
+  assert(len(pat.dataBinds) == 1)
+  assert(pat.dataBinds[0].name == "_malloc" && pat.dataBinds[0].segOff == 0)
+  // The import's GOT slot is NOT rebased — dyld binds it instead.
+  assert(len(pat.dataRebases) == 0)
+}
+
+function checkMachoExecTlsOffset() {
+  // A tlv_descriptor's data field points at the variable's storage, and must be
+  // stored as its constant OFFSET within the TLV template — not an absolute
+  // address, and never rebased. dyld reads the offset directly.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 4, [
+      meRel(0, LoRelocKind.Aarch64AdrPrelPgHi21, loLocalRef(1))]),
+    meAtom("desc", LoSectionKind.TlsVars, LoBinding.Global, 24, [
+      meRel(16, LoRelocKind.Abs64, loLocalRef(2))]),
+    meAtom("x$tlv$init", LoSectionKind.TlsData, LoBinding.Local, 8, []LoReloc(0))]}
+  let g = resolveGlobals([m]) catch e { map<string, int>{} }
+  let st = meAnalyze([m])
+
+  let addrOf = map<int, int>{}
+  addrOf[atomKey(0, 0)] = 0x100000000
+  addrOf[atomKey(0, 1)] = 0x100008000
+  addrOf[atomKey(0, 2)] = 0x100008040 // the TLV template base
+  let a = meAddrs(0x100004000, 0x100008100, 0x100008000, 0x100008040)
+  let pat = meApplyRelocs([m], g, st, addrOf, a) catch e {
+    assert(false)
+    meEmptyPatched()
+  }
+
+  // The variable sits at the template's base, so its offset is 0 — NOT
+  // 0x100008040.
+  let (desc, _) = pat.bytes[atomKey(0, 1)]
+  assert(loRdU64(desc, 16) == 0)
+  // A TLS offset is a constant dyld validates; rebasing it would corrupt it.
+  assert(len(pat.dataRebases) == 0)
 }
 
 function checkArm64MemFloat() {
@@ -2900,6 +3122,11 @@ function selfcheck() {
   checkMachoExecDeadStrip()
   checkMachoExecGot()
   checkMachoExecNoDataSeg()
+  checkMachoExecSymtab()
+  checkMachoExecStreams()
+  checkMachoExecApply()
+  checkMachoExecApplyImports()
+  checkMachoExecTlsOffset()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()

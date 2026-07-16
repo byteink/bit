@@ -406,3 +406,299 @@ function meHasDataSeg(st: MeLinkState): bool {
   return len(st.gotList) > 0 || len(st.data) > 0 || len(st.bss) > 0 ||
     len(st.tlsVars) > 0 || len(st.tlsData) > 0 || len(st.tlsBss) > 0
 }
+
+// ===========================================================================
+// Address assignment, relocation application, and the dyld info streams
+// ===========================================================================
+
+// An absolute pointer to an import: dyld binds it at load, so the field stays
+// zero in the file and this records where.
+struct MeDataBind {
+  segOff: int,
+  name: string,
+}
+
+// Everything the emission slice needs once addresses are fixed.
+struct MePatched {
+  // Packed AtomId -> the atom's relocated bytes.
+  bytes: map<int, []u8>,
+  dataBinds: []MeDataBind,
+  // __DATA segment offsets holding an absolute internal pointer dyld must slide.
+  dataRebases: []int,
+}
+
+// Packed AtomId -> final virtual address, over every placed group.
+function meAddrMap(st: MeLinkState): map<int, int> {
+  let m = map<int, int>{}
+  meAddrMapGroup(m, st.text)
+  meAddrMapGroup(m, st.rodata)
+  meAddrMapGroup(m, st.data)
+  meAddrMapGroup(m, st.bss)
+  meAddrMapGroup(m, st.tlsVars)
+  meAddrMapGroup(m, st.tlsData)
+  meAddrMapGroup(m, st.tlsBss)
+  return m
+}
+
+function meAddrMapGroup(m: map<int, int>, group: []MePlaced) {
+  let i = 0
+  while (i < len(group)) {
+    m[atomKey(group[i].module, group[i].atom)] = group[i].vaddr
+    i = i + 1
+  }
+}
+
+function meStubAddr(stubsVaddr: int, i: int): int {
+  return stubsVaddr + i * meStubSize()
+}
+
+function meGotAddr(gotVaddr: int, i: int): int {
+  return gotVaddr + i * mePtrSize()
+}
+
+// The addresses the reloc pass needs but that only layout knows.
+struct MeAddrs {
+  stubsVaddr: int,
+  gotVaddr: int,
+  dataSegVaddr: int,
+  // Base of the per-thread TLV template (__thread_data then __thread_bss). A
+  // tlv_descriptor's data field is the variable's OFFSET within this template (a
+  // constant dyld validates against the template size), not an absolute address —
+  // so an abs64 into TLS storage resolves relative to here.
+  tlsTemplateBase: int,
+}
+
+// Applies every relocation into per-atom mutable copies, collecting the data
+// binds and rebases the dyld streams need. The atom's own bytes are never
+// mutated: two atoms can share a backing slice, and the file needs the patched
+// copy only.
+function meApplyRelocs(modules: []LoModule, globals: map<string, int>, st: MeLinkState,
+  addrOf: map<int, int>, a: MeAddrs): MePatched! {
+  let out = MePatched{ bytes: map<int, []u8>{}, dataBinds: []MeDataBind(0),
+    dataRebases: []int(0) }
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let atom = atoms[ai]
+      let id = atomKey(mi, ai)
+      let (_, keep) = st.kept[id]
+      if (!keep || len(atom.data) == 0) {
+        ai = ai + 1
+        continue
+      }
+      let buf = []u8(len(atom.data))
+      let c = 0
+      while (c < len(atom.data)) {
+        buf[c] = atom.data[c]
+        c = c + 1
+      }
+      let (atomVaddr, _) = addrOf[id]
+      let r = 0
+      while (r < len(atom.relocs)) {
+        let rel = atom.relocs[r]
+        let p = atomVaddr + rel.offset
+        let isImport = false
+        if (rel.target.isGlobal) {
+          let (_, defined) = globals[rel.target.name]
+          isImport = !defined
+        }
+
+        if (meIsBranch(rel.kind) && isImport) {
+          // Retarget the branch to the import.s stub.
+          let (si, _) = st.stubOfImport[rel.target.name]
+          applyReloc(rel.kind, buf, rel.offset,
+            RelocValues{ s: meStubAddr(a.stubsVaddr, si), p: p, gotSlot: 0, tpOffset: 0 })?
+          r = r + 1
+          continue
+        }
+        if (needsGot(rel.kind) || needsTlvp(rel.kind)) {
+          let gi = 0
+          if (isImport) {
+            let (g, _) = st.gotOfImport[rel.target.name]
+            gi = g
+          } else {
+            let tid = resolveRef(globals, mi, rel.target)?
+            let (g, _) = st.gotOfInternal[tid]
+            gi = g
+          }
+          applyReloc(rel.kind, buf, rel.offset,
+            RelocValues{ s: 0, p: p, gotSlot: meGotAddr(a.gotVaddr, gi), tpOffset: 0 })?
+          r = r + 1
+          continue
+        }
+        if (rel.kind == LoRelocKind.Abs64 && isImport) {
+          // Absolute pointer to an import: dyld binds it, so leave the field zero.
+          // (Includes a tlv_descriptor's thunk field -> _tlv_bootstrap.)
+          out.dataBinds = append(out.dataBinds,
+            MeDataBind{ segOff: (atomVaddr + rel.offset) - a.dataSegVaddr,
+              name: rel.target.name })
+          r = r + 1
+          continue
+        }
+
+        let tid = resolveRef(globals, mi, rel.target)?
+        let (tgt, known) = addrOf[tid]
+        if (!known) {
+          fail newError("UndefinedSymbol")
+        }
+        let targetKind = modules[atomKeyModule(tid)].atoms[atomKeyAtom(tid)].kind
+
+        // A pointer into thread-local storage (a tlv_descriptor's data field ->
+        // x$tlv$init) is stored as the variable's constant OFFSET within the TLV
+        // template, which dyld reads directly — not an absolute address, and never
+        // rebased.
+        if (rel.kind == LoRelocKind.Abs64 &&
+          (targetKind == LoSectionKind.TlsData || targetKind == LoSectionKind.TlsBss)) {
+          applyReloc(LoRelocKind.Abs64, buf, rel.offset,
+            RelocValues{ s: tgt - a.tlsTemplateBase + rel.addend, p: 0, gotSlot: 0,
+              tpOffset: 0 })?
+          r = r + 1
+          continue
+        }
+
+        // Everything else resolves to a concrete address.
+        applyReloc(rel.kind, buf, rel.offset,
+          RelocValues{ s: tgt + rel.addend, p: p, gotSlot: 0, tpOffset: 0 })?
+        // An absolute internal pointer in a writable segment is rebased so dyld
+        // slides it.
+        if (rel.kind == LoRelocKind.Abs64 && meIsDataSeg(atom.kind)) {
+          out.dataRebases = append(out.dataRebases,
+            (atomVaddr + rel.offset) - a.dataSegVaddr)
+        }
+        r = r + 1
+      }
+      out.bytes[id] = buf
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+
+  // Internal GOT slots hold an absolute internal address -> rebase them too.
+  let g = 0
+  while (g < len(st.gotList)) {
+    if (!st.gotList[g].isImport) {
+      out.dataRebases = append(out.dataRebases,
+        meGotAddr(a.gotVaddr, g) - a.dataSegVaddr)
+    }
+    g = g + 1
+  }
+  return out
+}
+
+// Ascending sort of the rebase offsets. dyld replays them in stream order, and a
+// sorted stream is what every real linker emits — keeping the output
+// deterministic and diffable.
+function meSortOffsets(xs: []int): []int {
+  let i = 1
+  while (i < len(xs)) {
+    let v = xs[i]
+    let j = i - 1
+    while (j >= 0 && xs[j] > v) {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = v
+    i = i + 1
+  }
+  return xs
+}
+
+// The rebase opcode stream: one SET_TYPE, then a segment+offset and a
+// one-pointer rebase per slot. Empty when nothing needs sliding.
+function meRebaseStream(dataRebases: []int, dataSegIndex: int): ByteBuf {
+  let ops = newByteBuf()
+  if (len(dataRebases) == 0) {
+    return ops
+  }
+  let sorted = meSortOffsets(dataRebases)
+  ops.bytes = append(ops.bytes, u8(rebaseOpcodeSetTypeImm() | rebaseTypePointer()))
+  let i = 0
+  while (i < len(sorted)) {
+    ops.bytes = append(ops.bytes, u8(rebaseOpcodeSetSegmentAndOffsetUleb() | dataSegIndex))
+    meUleb(ops, sorted[i])
+    ops.bytes = append(ops.bytes, u8(rebaseOpcodeDoRebaseImmTimes() | 1))
+    i = i + 1
+  }
+  ops.bytes = append(ops.bytes, u8(rebaseOpcodeDone()))
+  return ops
+}
+
+// The bind opcode stream: every import's GOT slot, then every absolute data
+// pointer to an import. libSystem is dylib ordinal 1 — the only one loaded.
+function meBindStream(st: MeLinkState, dataBinds: []MeDataBind, gotVaddr: int,
+  dataSegVaddr: int, dataSegIndex: int): ByteBuf {
+  let ops = newByteBuf()
+  ops.bytes = append(ops.bytes, u8(bindOpcodeSetDylibOrdinalImm() | 1))
+  let i = 0
+  while (i < len(st.gotList)) {
+    if (st.gotList[i].isImport) {
+      meEmitBind(ops, st.gotList[i].name, dataSegIndex,
+        meGotAddr(gotVaddr, i) - dataSegVaddr)
+    }
+    i = i + 1
+  }
+  i = 0
+  while (i < len(dataBinds)) {
+    meEmitBind(ops, dataBinds[i].name, dataSegIndex, dataBinds[i].segOff)
+    i = i + 1
+  }
+  ops.bytes = append(ops.bytes, u8(bindOpcodeDone()))
+  return ops
+}
+
+// The symbol table: imports only. A statically resolved internal symbol needs no
+// entry — nothing at runtime looks it up.
+struct MeSymtab {
+  strtab: ByteBuf,
+  // One nlist_64 per import, in importOrder.
+  nlists: ByteBuf,
+  symIndex: map<string, int>,
+}
+
+function meBuildSymtab(st: MeLinkState): MeSymtab {
+  let strtab = newByteBuf()
+  strtab.bytes = append(strtab.bytes, u8(0)) // index 0 == ""
+  let nlists = newByteBuf()
+  let symIndex = map<string, int>{}
+  let i = 0
+  while (i < len(st.importOrder)) {
+    let nm = st.importOrder[i]
+    let strx = len(strtab.bytes)
+    appendBytes(strtab, []byte(nm))
+    strtab.bytes = append(strtab.bytes, u8(0))
+    symIndex[nm] = i
+    appendU32(nlists, strx)
+    nlists.bytes = append(nlists.bytes, u8(0x0 | 0x01)) // N_UNDF | N_EXT
+    nlists.bytes = append(nlists.bytes, u8(0))          // n_sect: NO_SECT
+    appendU16(nlists, 0)                                // n_desc
+    appendU64(nlists, 0)                                // n_value
+    i = i + 1
+  }
+  return MeSymtab{ strtab: strtab, nlists: nlists, symIndex: symIndex }
+}
+
+// The indirect symbol table: stubs first, then the GOT — the order the section
+// headers' reserved1 indices assume. An internal GOT slot has no symbol, so it
+// is marked LOCAL.
+function meIndirectSymbols(st: MeLinkState, symIndex: map<string, int>): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(st.stubList)) {
+    let (idx, _) = symIndex[st.stubList[i]]
+    out = append(out, idx)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(st.gotList)) {
+    if (st.gotList[i].isImport) {
+      let (idx, _) = symIndex[st.gotList[i].name]
+      out = append(out, idx)
+    } else {
+      out = append(out, indirectSymbolLocal())
+    }
+    i = i + 1
+  }
+  return out
+}
