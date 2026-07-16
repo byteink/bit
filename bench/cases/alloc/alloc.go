@@ -5,11 +5,16 @@ import "fmt"
 type Node struct{ x, y int64 }
 
 func main() {
-	var n int64 = 20000000
-	var sum int64 = 0
-	for i := int64(0); i < n; i++ {
-		p := &Node{x: i, y: i + 1}
-		sum += p.x + p.y
+	batches, per := 2000, 5000
+	var total int64 = 0
+	for b := 0; b < batches; b++ {
+		batch := make([]*Node, 0, per)
+		for k := 0; k < per; k++ {
+			batch = append(batch, &Node{x: int64(b + k), y: int64(k + 1)})
+		}
+		for _, nd := range batch {
+			total += nd.x + nd.y
+		}
 	}
-	fmt.Printf("%d\n", sum)
+	fmt.Printf("%d\n", total)
 }

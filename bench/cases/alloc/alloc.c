@@ -2,13 +2,20 @@
 #include <stdlib.h>
 typedef struct { long x, y; } Node;
 int main(void) {
-  long n = 20000000, sum = 0;
-  for (long i = 0; i < n; i++) {
-    Node *p = malloc(sizeof(Node));
-    p->x = i; p->y = i + 1;
-    sum += p->x + p->y;
-    free(p);
+  int batches = 2000, per = 5000;
+  long total = 0;
+  for (int b = 0; b < batches; b++) {
+    Node **batch = malloc(sizeof(Node *) * per);
+    for (int k = 0; k < per; k++) {
+      Node *p = malloc(sizeof(Node));
+      p->x = b + k;
+      p->y = k + 1;
+      batch[k] = p;
+    }
+    for (int k = 0; k < per; k++) total += batch[k]->x + batch[k]->y;
+    for (int k = 0; k < per; k++) free(batch[k]);
+    free(batch);
   }
-  printf("%ld\n", sum);
+  printf("%ld\n", total);
   return 0;
 }
