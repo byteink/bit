@@ -1,0 +1,151 @@
+// Self-host Stage 3 (#1344): ad-hoc Mach-O code signing, ported from
+// compiler/link/codesign.zig. Apple Silicon refuses to exec any arm64 binary
+// without a valid code signature — an unsigned image is SIGKILLed by AMFI
+// before its entry point runs. A locally built executable that ships no
+// certificate still needs a real, structurally valid AD-HOC signature (no CMS,
+// no identity, just page hashes the kernel recomputes), which is what this
+// module builds.
+//
+// The signature is an embedded CS_SuperBlob carrying one CS_CodeDirectory:
+//
+//   SuperBlob { magic, length, count=1 } [ BlobIndex{ CODEDIRECTORY, off } ]
+//   CodeDirectory { header ... identifier ... codeSlot[0..nCodeSlots] }
+//
+// Every code slot is the SHA-256 of one 4 KiB page of the file, from offset 0 up
+// to codeLimit (the offset where the signature blob itself begins — the
+// signature never hashes itself). The kernel walks the same pages, recomputes
+// the hashes, and compares; CS_ADHOC plus valid hashes is what makes an
+// identity-free binary launchable.
+//
+// All multi-byte fields are BIG-ENDIAN — the code-signing format is the one part
+// of Mach-O that is not host-endian. Struct layouts and constants come from
+// <Security/CSCommon.h> / dyld's CodeSigningTypes.h.
+
+import { newSha256 } from "std/crypto"
+
+function csMagicEmbeddedSignature(): int { return 0xfade0cc0 }
+function csMagicCodeDirectory(): int { return 0xfade0c02 }
+function csSlotCodeDirectory(): int { return 0 }
+function csAdhoc(): int { return 0x0002 }
+function csHashTypeSha256(): int { return 2 }
+
+// Latest CodeDirectory version this writer emits — includes the execSeg* fields
+// AMFI reads on arm64 to authorize the main binary's executable pages.
+function cdVersion(): int { return 0x20400 }
+function csExecsegMainBinary(): int { return 0x1 }
+
+function csPageSizeLog2(): int { return 12 }
+function csPageSize(): int { return 1 << 12 }
+function csHashSize(): int { return 32 } // SHA-256
+
+// Byte size of the CS_CodeDirectory fixed header up to execSegFlags (version
+// 0x20400): 9 u32 + 4 u8 + spare2 + scatter/team/spare3 + codeLimit64 +
+// execSegBase/Limit/Flags. Fields past this point are the identifier string and
+// the hash slots.
+function cdHeaderSize(): int { return 88 }
+
+// CS_SuperBlob header (magic, length, count) + one CS_BlobIndex (type, off).
+function superblobHeaderSize(): int { return 12 + 8 }
+
+function csNumCodeSlots(codeLimit: int): int {
+  return (codeLimit + csPageSize() - 1) / csPageSize()
+}
+
+// Big-endian writes. Everything else in this compiler is little-endian; the
+// code-signing blob is the exception, and mixing them up produces a signature
+// the kernel silently rejects at exec time.
+function csWrBE32(b: []u8, off: int, v: int) {
+  b[off] = u8((v >> 24) & 255)
+  b[off + 1] = u8((v >> 16) & 255)
+  b[off + 2] = u8((v >> 8) & 255)
+  b[off + 3] = u8(v & 255)
+}
+
+function csWrBE64(b: []u8, off: int, v: int) {
+  csWrBE32(b, off, (v >> 32) & 0xFFFFFFFF)
+  csWrBE32(b, off + 4, v & 0xFFFFFFFF)
+}
+
+// Total embedded-signature size for a file signed over [0, codeLimit). The
+// executable writer calls this FIRST to reserve __LINKEDIT space and set
+// LC_CODE_SIGNATURE.datasize before it can compute the final layout — so this
+// must agree with what buildCodeSignature actually emits, to the byte.
+function codeSignatureSize(codeLimit: int, identifier: string): int {
+  let cdLen = cdHeaderSize() + len([]byte(identifier)) + 1 +
+    csNumCodeSlots(codeLimit) * csHashSize()
+  return superblobHeaderSize() + cdLen
+}
+
+// Builds the ad-hoc embedded signature over `signed` (the final file bytes from
+// offset 0 up to codeLimit == len(signed) — headers already patched, signature
+// region not yet appended). `execSegLimit` is the __TEXT segment's file size
+// (execSegBase is 0: __TEXT starts at file offset 0).
+function buildCodeSignature(signed: []u8, identifier: string, execSegLimit: int): []u8 {
+  let codeLimit = len(signed)
+  let n = csNumCodeSlots(codeLimit)
+  let identBytes = []byte(identifier)
+  let identLen = len(identBytes) + 1
+  let cdLen = cdHeaderSize() + identLen + n * csHashSize()
+  let total = superblobHeaderSize() + cdLen
+  let out = []u8(total)
+
+  // ---- SuperBlob header + one index entry --------------------------------
+  csWrBE32(out, 0, csMagicEmbeddedSignature())
+  csWrBE32(out, 4, total)
+  csWrBE32(out, 8, 1) // count: one contained blob
+  csWrBE32(out, 12, csSlotCodeDirectory())
+  csWrBE32(out, 16, superblobHeaderSize()) // CD offset within the SuperBlob
+
+  // ---- CodeDirectory ------------------------------------------------------
+  let cd = superblobHeaderSize()
+  let hashOffset = cdHeaderSize() + identLen // slot[0]; no special slots
+  csWrBE32(out, cd + 0, csMagicCodeDirectory())
+  csWrBE32(out, cd + 4, cdLen)
+  csWrBE32(out, cd + 8, cdVersion())
+  csWrBE32(out, cd + 12, csAdhoc())
+  csWrBE32(out, cd + 16, hashOffset)
+  csWrBE32(out, cd + 20, cdHeaderSize()) // identOffset (the identifier follows the header)
+  csWrBE32(out, cd + 24, 0)              // nSpecialSlots (no requirements/entitlements)
+  csWrBE32(out, cd + 28, n)              // nCodeSlots
+  csWrBE32(out, cd + 32, codeLimit & 0xFFFFFFFF) // codeLimit (codeLimit64 covers >4 GiB)
+  out[cd + 36] = u8(csHashSize())
+  out[cd + 37] = u8(csHashTypeSha256())
+  out[cd + 38] = u8(0) // platform: not a platform binary
+  out[cd + 39] = u8(csPageSizeLog2())
+  // spare2 @40, scatterOffset @44, teamOffset @48, spare3 @52: all zero.
+  let cl64 = 0
+  if (codeLimit > 0xFFFFFFFF) {
+    cl64 = codeLimit
+  }
+  csWrBE64(out, cd + 56, cl64)                  // codeLimit64
+  csWrBE64(out, cd + 64, 0)                     // execSegBase: __TEXT begins at file offset 0
+  csWrBE64(out, cd + 72, execSegLimit)          // execSegLimit
+  csWrBE64(out, cd + 80, csExecsegMainBinary()) // execSegFlags
+
+  let i = 0
+  while (i < len(identBytes)) {
+    out[cd + cdHeaderSize() + i] = identBytes[i]
+    i = i + 1
+  }
+  out[cd + cdHeaderSize() + len(identBytes)] = u8(0)
+
+  // ---- per-page SHA-256 code slots ----------------------------------------
+  i = 0
+  while (i < n) {
+    let start = i * csPageSize()
+    let end = (i + 1) * csPageSize()
+    if (end > codeLimit) {
+      end = codeLimit // the last page is hashed over its REAL bytes, not padded
+    }
+    let h = newSha256()
+    h.write(signed[start:end])
+    let digest = h.sum()
+    let j = 0
+    while (j < csHashSize()) {
+      out[cd + hashOffset + i * csHashSize() + j] = digest[j]
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return out
+}
