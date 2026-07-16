@@ -426,3 +426,258 @@ function movImm64(code: ByteBuf, dst: int, val: int) {
     i = i + 1
   }
 }
+
+// ---- loads/stores ---------------------------------------------------------
+
+// The `size`/`opc` pair per AArch64's load/store table (Bit has no multi-return).
+struct SizeOpc {
+  size: int,
+  opc: int,
+}
+
+// size in {0=byte, 1=half, 2=word, 3=doubleword}; for loads, opc in
+// {1=zero-extend, 2=sign-extend-to-64} (irrelevant for size=3, always 1); for
+// stores, opc is always 0.
+function gpSizeOpc(width: int, signed: bool, isLoad: bool): SizeOpc {
+  let size = 3
+  if (width == 1) {
+    size = 0
+  } else if (width == 2) {
+    size = 1
+  } else if (width == 4) {
+    size = 2
+  }
+  if (!isLoad) {
+    return SizeOpc{ size: size, opc: 0 }
+  }
+  if (width != 8 && signed) {
+    return SizeOpc{ size: size, opc: 2 }
+  }
+  return SizeOpc{ size: size, opc: 1 }
+}
+
+// Load/store register, unsigned immediate offset (imm12, scaled by the access
+// width).
+function loadStoreUnsignedImm(code: ByteBuf, size: int, isFp: bool, opc: int, imm12: int, rn: int, rt: int) {
+  let fp = 0
+  if (isFp) {
+    fp = 1
+  }
+  emitWord(code, (size << 30) | (57 << 24) | (fp << 26) | (opc << 22) |
+    (imm12 << 10) | (rn << 5) | rt)
+}
+
+// Load/store register, register offset (base + Rm<<shift; `option` fixed to
+// 011 == plain 64-bit register, matching every index value this backend
+// produces). `scale` requests the implicit log2(width) shift baked into the ISA
+// (no separate shift-amount field exists); false performs an unshifted access.
+function loadStoreRegOffset(code: ByteBuf, size: int, isFp: bool, opc: int, rm: int, scale: bool, rn: int, rt: int) {
+  let fp = 0
+  if (isFp) {
+    fp = 1
+  }
+  let s = 0
+  if (scale) {
+    s = 1
+  }
+  emitWord(code, (size << 30) | (56 << 24) | (fp << 26) | (opc << 22) |
+    (1 << 21) | (rm << 16) | (3 << 13) | (s << 12) | (2 << 10) | (rn << 5) | rt)
+}
+
+// Fits `disp` as a scaled imm12 for `width`-byte unsigned-offset addressing, or
+// -1 if it doesn't (caller falls back to a materialized offset register).
+function fitsImm12(disp: int, width: int): int {
+  if (disp % width != 0) {
+    return -1
+  }
+  let scaled = disp / width
+  if (scaled > 4095) {
+    return -1
+  }
+  return scaled
+}
+
+function loadImm(code: ByteBuf, dst: int, baseReg: int, disp: int, width: int, signed: bool) {
+  let so = gpSizeOpc(width, signed, true)
+  let imm12 = fitsImm12(disp, width)
+  if (imm12 >= 0) {
+    loadStoreUnsignedImm(code, so.size, false, so.opc, imm12, baseReg, dst)
+    return
+  }
+  movImm64(code, scratch3(), disp)
+  loadStoreRegOffset(code, so.size, false, so.opc, scratch3(), false, baseReg, dst)
+}
+
+function storeImm(code: ByteBuf, src: int, baseReg: int, disp: int, width: int) {
+  let so = gpSizeOpc(width, false, false)
+  let imm12 = fitsImm12(disp, width)
+  if (imm12 >= 0) {
+    loadStoreUnsignedImm(code, so.size, false, so.opc, imm12, baseReg, src)
+    return
+  }
+  movImm64(code, scratch3(), disp)
+  loadStoreRegOffset(code, so.size, false, so.opc, scratch3(), false, baseReg, src)
+}
+
+// base + index<<log2(width), sign/zero-extending per width/signed — array
+// element load (index_get).
+function loadIndexed(code: ByteBuf, dst: int, baseReg: int, index: int, width: int, signed: bool) {
+  let so = gpSizeOpc(width, signed, true)
+  loadStoreRegOffset(code, so.size, false, so.opc, index, width != 1, baseReg, dst)
+}
+
+function storeIndexed(code: ByteBuf, src: int, baseReg: int, index: int, width: int) {
+  let so = gpSizeOpc(width, false, false)
+  loadStoreRegOffset(code, so.size, false, so.opc, index, width != 1, baseReg, src)
+}
+
+function fpSize(width: int): int {
+  if (width == 8) {
+    return 3
+  }
+  return 2
+}
+
+function loadImmF(code: ByteBuf, dst: int, baseReg: int, disp: int, width: int) {
+  let imm12 = fitsImm12(disp, width)
+  if (imm12 >= 0) {
+    loadStoreUnsignedImm(code, fpSize(width), true, 1, imm12, baseReg, dst)
+    return
+  }
+  movImm64(code, scratch3(), disp)
+  loadStoreRegOffset(code, fpSize(width), true, 1, scratch3(), false, baseReg, dst)
+}
+
+function storeImmF(code: ByteBuf, src: int, baseReg: int, disp: int, width: int) {
+  let imm12 = fitsImm12(disp, width)
+  if (imm12 >= 0) {
+    loadStoreUnsignedImm(code, fpSize(width), true, 0, imm12, baseReg, src)
+    return
+  }
+  movImm64(code, scratch3(), disp)
+  loadStoreRegOffset(code, fpSize(width), true, 0, scratch3(), false, baseReg, src)
+}
+
+// ---- scalar floating point ------------------------------------------------
+
+function fpType(width: int): int {
+  if (width == 8) {
+    return 1
+  }
+  return 0
+}
+
+// FADD/FSUB/FMUL/FDIV (floating-point, 2 source). Opcodes: mul=0 div=1 add=2
+// sub=3.
+function fArithRR(code: ByteBuf, opcode: int, dst: int, rn: int, rm: int, width: int) {
+  emitWord(code, (30 << 24) | (fpType(width) << 22) | (1 << 21) | (rm << 16) |
+    (opcode << 12) | (2 << 10) | (rn << 5) | dst)
+}
+
+// FMOV (register, scalar) / FNEG (floating-point, 1 source).
+function fp1Source(code: ByteBuf, opcode: int, width: int, dst: int, src: int) {
+  emitWord(code, (30 << 24) | (fpType(width) << 22) | (1 << 21) |
+    (opcode << 15) | (16 << 10) | (src << 5) | dst)
+}
+
+function fmovFF(code: ByteBuf, dst: int, src: int, width: int) {
+  if (dst == src) {
+    return
+  }
+  fp1Source(code, 0, width, dst, src)
+}
+
+function fnegF(code: ByteBuf, dst: int, src: int, width: int) {
+  fp1Source(code, 2, width, dst, src)
+}
+
+// FCMP Dn, Dm (floating-point compare, register form) — sets NZCV.
+function fcmp(code: ByteBuf, rn: int, rm: int, width: int) {
+  emitWord(code, (30 << 24) | (fpType(width) << 22) | (1 << 21) | (rm << 16) |
+    (8 << 10) | (rn << 5))
+}
+
+// FMOV (general <-> scalar): opcode=7 general->scalar (rn=GPR, rd=FP),
+// opcode=6 scalar->general (rn=FP, rd=GPR) — the bit-preserving transfer used
+// to materialize float constants via a GPR immediate and read them back.
+function fpConvertGpr(code: ByteBuf, sf: bool, width: int, opcode: int, rn: int, rd: int) {
+  let s = 0
+  if (sf) {
+    s = 1
+  }
+  emitWord(code, (s << 31) | (30 << 24) | (fpType(width) << 22) | (1 << 21) |
+    (opcode << 16) | (rn << 5) | rd)
+}
+
+function fmovToFp(code: ByteBuf, dst: int, src: int, width: int) {
+  fpConvertGpr(code, width == 8, width, 7, src, dst)
+}
+
+function fmovFromFp(code: ByteBuf, dst: int, src: int, width: int) {
+  fpConvertGpr(code, width == 8, width, 6, src, dst)
+}
+
+// FP<->int conversion (SCVTF/FCVTZS), the full form with the `rmode` field
+// fpConvertGpr hardcodes to 0. `sf` is the GPR width (true = 64-bit), `width`
+// the float precision.
+function fpIntConv(code: ByteBuf, sf: bool, width: int, rmode: int, opcode: int, rn: int, rd: int) {
+  let s = 0
+  if (sf) {
+    s = 1
+  }
+  emitWord(code, (s << 31) | (30 << 24) | (fpType(width) << 22) | (1 << 21) |
+    (rmode << 19) | (opcode << 16) | (rn << 5) | rd)
+}
+
+// ---- branches / calls / return --------------------------------------------
+
+function emitRet(code: ByteBuf) {
+  emitWord(code, 0xD65F0000 | (30 << 5)) // RET (implicit x30)
+}
+
+function emitUdf(code: ByteBuf) {
+  emitWord(code, 0)
+}
+
+// UXTB Wr, Wr — zero the register above its low byte. Encoded as
+// UBFM Wr, Wr, #0, #7, which also clears bits [63:32] because a 32-bit
+// destination write does.
+function uxtb(code: ByteBuf, r: int) {
+  emitWord(code, 0x53001C00 | (r << 5) | r)
+}
+
+// BLR Xn — indirect branch-with-link through a register. Used for call_value
+// (closure dispatch through a loaded code pointer).
+function blr(code: ByteBuf, reg: int) {
+  emitWord(code, 0xD63F0000 | (reg << 5))
+}
+
+// Reads/writes the little-endian 32-bit word at `off` in the code buffer — the
+// branch fixups patch an already-emitted placeholder in place.
+function readWordAt(code: ByteBuf, off: int): int {
+  return int(code.bytes[off]) | (int(code.bytes[off + 1]) << 8) |
+    (int(code.bytes[off + 2]) << 16) | (int(code.bytes[off + 3]) << 24)
+}
+
+function writeWordAt(code: ByteBuf, off: int, w: int) {
+  code.bytes[off] = u8(w & 255)
+  code.bytes[off + 1] = u8((w >> 8) & 255)
+  code.bytes[off + 2] = u8((w >> 16) & 255)
+  code.bytes[off + 3] = u8((w >> 24) & 255)
+}
+
+// Patches a B (imm26) or B.cond (imm19) placeholder at `patchOffset` to branch
+// to `targetOffset`. `cond` is -1 for an unconditional B. Both immediates are
+// word-scaled, signed, PC-relative to the branch itself.
+function patchBranchTo(code: ByteBuf, patchOffset: int, targetOffset: int, cond: int) {
+  let rel = targetOffset - patchOffset
+  assert(rel % 4 == 0)
+  let wordOff = rel / 4
+  let old = readWordAt(code, patchOffset)
+  if (cond < 0) {
+    writeWordAt(code, patchOffset, old | (wordOff & 0x3FFFFFF))
+    return
+  }
+  let cleared = old & ~(0x7FFFF << 5)
+  writeWordAt(code, patchOffset, cleared | ((wordOff & 0x7FFFF) << 5) | cond)
+}
