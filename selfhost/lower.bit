@@ -15,32 +15,49 @@ struct IrBuilder {
   instrs: []IrInstr,
   blocks: []IrBlock,
   cur: int,
+  blockStart: int,
+  blockParamCount: int,
 }
 
 function newBuilder(): IrBuilder {
-  return IrBuilder{ instrs: []IrInstr(0), blocks: []IrBlock(0), cur: -1 }
+  return IrBuilder{ instrs: []IrInstr(0), blocks: []IrBlock(0), cur: -1,
+    blockStart: 0, blockParamCount: 0 }
 }
 
-// Starts a fresh block, returns its id, and makes it current. Its instr range
-// begins at the current end of the flat array.
+// Reserves a fresh block id; its instruction range is recorded later at
+// endBlock. Blocks are created ahead of being filled (e.g. an if's then/join),
+// so the range is deferred, mirroring the seed's FunctionBuilder.
 function builderNewBlock(b: IrBuilder): int {
-  b.blocks = append(b.blocks, IrBlock{ instsStart: len(b.instrs), paramCount: 0, instsLen: 0 })
-  b.cur = len(b.blocks) - 1
-  return b.cur
+  b.blocks = append(b.blocks, IrBlock{ instsStart: 0, paramCount: 0, instsLen: 0 })
+  return len(b.blocks) - 1
+}
+
+// Opens a block for appending: its instructions start at the current end of the
+// flat array.
+function builderBeginBlock(b: IrBuilder, id: int) {
+  b.cur = id
+  b.blockStart = len(b.instrs)
+  b.blockParamCount = 0
+}
+
+// Records the current block's final [start, len, paramCount] range. The
+// terminator must already be emitted.
+function builderEndBlock(b: IrBuilder) {
+  b.blocks[b.cur] = IrBlock{ instsStart: b.blockStart, paramCount: b.blockParamCount,
+    instsLen: len(b.instrs) - b.blockStart }
 }
 
 // Appends one instruction to the current block, returning its SSA value id.
 function builderEmit(b: IrBuilder, ins: IrInstr): int {
   b.instrs = append(b.instrs, ins)
-  b.blocks[b.cur].instsLen = b.blocks[b.cur].instsLen + 1
   return len(b.instrs) - 1
 }
 
 // Adds a block parameter (phi result) to the current block. Params must precede
-// the block's body instructions, so this is called right after the block opens.
+// the block's body instructions, so this is called right after beginBlock.
 function builderAddParam(b: IrBuilder, ty: int): int {
   let id = builderEmit(b, mkInstr(Op.BlockParam, ty))
-  b.blocks[b.cur].paramCount = b.blocks[b.cur].paramCount + 1
+  b.blockParamCount = b.blockParamCount + 1
   return id
 }
 
@@ -61,26 +78,74 @@ function lowerParamTypes(c: Checker, decl: int): []int {
   return types
 }
 
+// One in-scope local: its name, current SSA value id, and type. The env is an
+// *ordered* list (not a map) so control-flow joins can snapshot/restore/rebind
+// live locals by position, matching the seed's Env.
+struct LocalBind {
+  name: string,
+  value: int,
+  ty: int,
+}
+
 // Per-function lowering state: the checker (for types), the IR builder, the
-// name -> SSA value id environment, and flags. `failed` trips on any construct
-// not yet lowerable, so the function falls back to a signature-only stub rather
-// than emitting partial/garbage IR.
+// ordered local environment, and flags. `failed` trips on any construct not yet
+// lowerable, so the function falls back to a signature-only stub rather than
+// emitting partial/garbage IR.
 struct FnCtx {
   c: Checker,
   b: IrBuilder,
-  env: map<string, int>,
+  env: []LocalBind,
   failed: bool,
   terminated: bool,
 }
 
-// name -> SSA value id from the function env, or -1 if unbound.
+// Binds a name to a value id + type, appending to the ordered env.
+function declareLocal(fc: FnCtx, name: string, value: int, ty: int) {
+  fc.env = append(fc.env, LocalBind{ name: name, value: value, ty: ty })
+}
+
+// The current value id of a name (most recent binding wins), or -1 if unbound.
 function envValue(fc: FnCtx, name: string): int {
-  for (k, v) of fc.env {
-    if (k == name) {
-      return v
+  let i = len(fc.env) - 1
+  while (i >= 0) {
+    if (fc.env[i].name == name) {
+      return fc.env[i].value
     }
+    i = i - 1
   }
   return -1
+}
+
+// The current value ids of the first `n` env locals (a control-flow snapshot).
+function snapshotValues(fc: FnCtx, n: int): []int {
+  let vals = []int(0)
+  let i = 0
+  while (i < n) {
+    vals = append(vals, fc.env[i].value)
+    i = i + 1
+  }
+  return vals
+}
+
+// Restores the first `len(vals)` locals' value ids from a snapshot (after a
+// branch that reassigned some of them).
+function restoreValues(fc: FnCtx, vals: []int) {
+  let i = 0
+  while (i < len(vals)) {
+    fc.env[i].value = vals[i]
+    i = i + 1
+  }
+}
+
+// At a reachable join, gives the current block one parameter per in-scope local
+// (the first `n`) and rebinds each local to its new block-param value — the
+// seed's addLoopParams. Params are added in env order.
+function addJoinParams(fc: FnCtx, n: int) {
+  let i = 0
+  while (i < n) {
+    fc.env[i].value = builderAddParam(fc.b, fc.env[i].ty)
+    i = i + 1
+  }
 }
 
 // The IR op for a binary operator kind, given whether its operands are floats.
@@ -103,6 +168,67 @@ function binOpFor(op: int, isFloat: bool): Op {
       return Op.FMul
     }
     return Op.Mul
+  }
+  return Op.BlockParam
+}
+
+// Whether an operator kind is a relational/equality comparison (not a logical
+// `&&`/`||`, which needs short-circuit block lowering).
+function isRelationalOp(op: int): bool {
+  return op == int(Kind.EqEq) || op == int(Kind.BangEq) || op == int(Kind.Lt) ||
+    op == int(Kind.Gt) || op == int(Kind.LtEq) || op == int(Kind.GtEq)
+}
+
+// The IR compare op for a relational operator over ints (signed/unsigned by
+// `signed`) or floats. Returns Op.BlockParam as a not-yet-lowerable sentinel.
+function cmpOpFor(op: int, isFloat: bool, signed: bool): Op {
+  if (op == int(Kind.EqEq)) {
+    if (isFloat) {
+      return Op.FCmpEq
+    }
+    return Op.ICmpEq
+  }
+  if (op == int(Kind.BangEq)) {
+    if (isFloat) {
+      return Op.FCmpNe
+    }
+    return Op.ICmpNe
+  }
+  if (op == int(Kind.Lt)) {
+    if (isFloat) {
+      return Op.FCmpLt
+    }
+    if (signed) {
+      return Op.ICmpSlt
+    }
+    return Op.ICmpUlt
+  }
+  if (op == int(Kind.LtEq)) {
+    if (isFloat) {
+      return Op.FCmpLe
+    }
+    if (signed) {
+      return Op.ICmpSle
+    }
+    return Op.ICmpUle
+  }
+  if (op == int(Kind.Gt)) {
+    if (isFloat) {
+      return Op.FCmpGt
+    }
+    if (signed) {
+      return Op.ICmpSgt
+    }
+    return Op.ICmpUgt
+  }
+  if (op == int(Kind.GtEq)) {
+    if (isFloat) {
+      return Op.FCmpGe
+    }
+    if (signed) {
+      return Op.ICmpSge
+    }
+    return Op.ICmpUge
   }
   return Op.BlockParam
 }
@@ -243,6 +369,9 @@ function lowerExpr(fc: FnCtx, node: int): int {
     return v
   }
   if (tag == Tag.Binary) {
+    if (isRelationalOp(n.main)) {
+      return lowerComparison(fc, node)
+    }
     let ty = defaultType(fc.c, checkExprType(fc.c, node))
     let isFloat = fc.c.ctx.types[ty].kind == TypeKind.Prim &&
       (fc.c.ctx.types[ty].prim == 8 || fc.c.ctx.types[ty].prim == 9)
@@ -266,6 +395,130 @@ function lowerExpr(fc: FnCtx, node: int): int {
   return 0
 }
 
+// Lowers a relational comparison to a bool: strings via `rt_call string_eq`
+// (only `==` for now), floats via `fcmp_*`, ints via signed/unsigned `icmp_*`
+// picked from the operand type.
+function lowerComparison(fc: FnCtx, node: int): int {
+  let kids = kidsOf(fc.c.tree, node)
+  let opKind = getNode(fc.c.tree, node).main
+  let operandTy = defaultType(fc.c, checkExprType(fc.c, kids[0]))
+  let td = fc.c.ctx.types[operandTy]
+  let boolTy = primType(fc.c.ctx, 10)
+  let lhs = lowerExpr(fc, kids[0])
+  let rhs = lowerExpr(fc, kids[1])
+  if (fc.failed) {
+    return 0
+  }
+  // A string equality dispatches to the runtime; other string comparisons fall
+  // back for now.
+  if (td.kind == TypeKind.Prim && td.prim == 11) {
+    if (opKind != int(Kind.EqEq)) {
+      fc.failed = true
+      return 0
+    }
+    let se = mkInstr(Op.RtCall, boolTy)
+    se.name = "string_eq"
+    se.args = [lhs, rhs]
+    return builderEmit(fc.b, se)
+  }
+  let isFloat = td.kind == TypeKind.Prim && (td.prim == 8 || td.prim == 9)
+  let signed = !(td.kind == TypeKind.Prim && td.prim >= 4 && td.prim <= 7)
+  let cop = cmpOpFor(opKind, isFloat, signed)
+  if (cop == Op.BlockParam) {
+    fc.failed = true
+    return 0
+  }
+  let ins = mkInstr(cop, boolTy)
+  ins.lhs = lhs
+  ins.rhs = rhs
+  return builderEmit(fc.b, ins)
+}
+
+// Emits a `jump target(args)` terminator.
+function emitJump(fc: FnCtx, target: int, args: []int) {
+  let ins = mkInstr(Op.Jump, fc.c.ctx.voidId)
+  ins.ival = target
+  ins.args = args
+  builderEmit(fc.b, ins)
+}
+
+// Lowers an `if (cond) then [else]` to br + then/else/join blocks, threading the
+// live locals (env[0..preLen]) as join-block parameters — the seed's lowerIf.
+// The join block is left open for the following statements.
+function lowerIf(fc: FnCtx, node: int) {
+  let k = kidsOf(fc.c.tree, node)
+  let cond = lowerExpr(fc, k[0])
+  if (fc.failed) {
+    return
+  }
+  let preLen = len(fc.env)
+  let orig = snapshotValues(fc, preLen)
+  let thenBlk = builderNewBlock(fc.b)
+  let join = builderNewBlock(fc.b)
+  let hasElse = k[2] != 0
+  let elseBlk = join
+  if (hasElse) {
+    elseBlk = builderNewBlock(fc.b)
+  }
+  // Branch: then edge carries no args; a missing else sends the fall-through
+  // edge to the join with the live locals.
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = thenBlk
+  br.thenArgs = []int(0)
+  br.ival2 = elseBlk
+  if (hasElse) {
+    br.elseArgs = []int(0)
+  } else {
+    br.elseArgs = orig
+  }
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, thenBlk)
+  fc.terminated = false
+  lowerStmtList(fc, k[1])
+  let joinReachable = !hasElse
+  if (!fc.terminated) {
+    joinReachable = true
+    emitJump(fc, join, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  truncateEnv(fc, preLen)
+  restoreValues(fc, orig)
+
+  if (hasElse) {
+    builderBeginBlock(fc.b, elseBlk)
+    fc.terminated = false
+    if (getNode(fc.c.tree, k[2]).tag == Tag.IfStmt) {
+      lowerIf(fc, k[2])
+    } else {
+      lowerStmtList(fc, k[2])
+    }
+    if (!fc.terminated) {
+      joinReachable = true
+      emitJump(fc, join, snapshotValues(fc, preLen))
+    }
+    builderEndBlock(fc.b)
+    truncateEnv(fc, preLen)
+    restoreValues(fc, orig)
+  }
+
+  builderBeginBlock(fc.b, join)
+  if (joinReachable) {
+    addJoinParams(fc, preLen)
+    fc.terminated = false
+  } else {
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    fc.terminated = true
+  }
+}
+
+// Drops env locals beyond `n` (a scope exit), keeping the first `n`.
+function truncateEnv(fc: FnCtx, n: int) {
+  fc.env = fc.env[0:n]
+}
+
 // Lowers one statement. Only `return [expr]` is handled; anything else trips
 // `failed`.
 // Lowers one `let`/`const` binding: a simple `name = init` binds the init's
@@ -282,7 +535,7 @@ function lowerBinding(fc: FnCtx, node: int) {
   if (fc.failed) {
     return
   }
-  fc.env[fc.c.source[pat.span.start:pat.span.end]] = v
+  declareLocal(fc, fc.c.source[pat.span.start:pat.span.end], v, fc.c.nodeTypes[kids[0]])
 }
 
 function lowerStmt(fc: FnCtx, node: int) {
@@ -322,15 +575,19 @@ function lowerStmt(fc: FnCtx, node: int) {
     fc.terminated = true
     return
   }
+  if (n.tag == Tag.IfStmt) {
+    lowerIf(fc, node)
+    return
+  }
   fc.failed = true
 }
 
 // Lowers a body block's statements in order, stopping at the first unlowerable
-// one (which sets `failed`).
+// one (`failed`) or once the block has terminated (dead code after it).
 function lowerStmtList(fc: FnCtx, block: int) {
   let stmts = kidsOf(fc.c.tree, block)
   let i = 0
-  while (i < len(stmts) && !fc.failed) {
+  while (i < len(stmts) && !fc.failed && !fc.terminated) {
     lowerStmt(fc, stmts[i])
     i = i + 1
   }
@@ -340,13 +597,14 @@ function lowerStmtList(fc: FnCtx, block: int) {
 // is not yet fully lowerable.
 function signatureOnlyFunc(c: Checker, name: string, paramTypes: []int, result: int): IrFunc {
   let b = newBuilder()
-  builderNewBlock(b)
+  builderBeginBlock(b, builderNewBlock(b))
   let i = 0
   while (i < len(paramTypes)) {
     builderAddParam(b, paramTypes[i])
     i = i + 1
   }
   builderEmit(b, mkInstr(Op.Ret, c.ctx.voidId))
+  builderEndBlock(b)
   return IrFunc{ name: name, paramTypes: paramTypes, result: result,
     blocks: b.blocks, instrs: b.instrs }
 }
@@ -364,14 +622,15 @@ function lowerFunc(c: Checker, decl: int): IrFunc {
     result = unwrapFallible(c, typeFromNode(c, kids[4]))
   }
   let b = newBuilder()
-  builderNewBlock(b)
-  let fc = FnCtx{ c: c, b: b, env: map<string, int>{}, failed: false, terminated: false }
+  let entry = builderNewBlock(b)
+  builderBeginBlock(b, entry)
+  let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false }
   // Bind params (receiver first, if any) to their block-param value ids.
   let names = paramNames(c, decl)
   let i = 0
   while (i < len(paramTypes)) {
     let id = builderAddParam(b, paramTypes[i])
-    fc.env[names[i]] = id
+    declareLocal(fc, names[i], id, paramTypes[i])
     i = i + 1
   }
   lowerStmtList(fc, kids[5])
@@ -381,6 +640,7 @@ function lowerFunc(c: Checker, decl: int): IrFunc {
   if (!fc.terminated) {
     builderEmit(fc.b, mkInstr(Op.Ret, c.ctx.voidId))
   }
+  builderEndBlock(fc.b)
   return IrFunc{ name: name, paramTypes: paramTypes, result: result,
     blocks: fc.b.blocks, instrs: fc.b.instrs }
 }
