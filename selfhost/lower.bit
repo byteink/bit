@@ -97,6 +97,16 @@ struct FnCtx {
   env: []LocalBind,
   failed: bool,
   terminated: bool,
+  // Enclosing loops (innermost last): break jumps to `exit`, continue to `cont`,
+  // both carrying the first `preLen` live locals.
+  loops: []LoopFrame,
+}
+
+// One enclosing loop's break/continue targets and its live-local count.
+struct LoopFrame {
+  exit: int,
+  cont: int,
+  preLen: int,
 }
 
 // Binds a name to a value id + type, appending to the ordered env.
@@ -777,6 +787,98 @@ function truncateEnv(fc: FnCtx, n: int) {
   fc.env = fc.env[0:n]
 }
 
+// The env index of a local (most recent binding), or -1 if unbound.
+function envIndex(fc: FnCtx, name: string): int {
+  let i = len(fc.env) - 1
+  while (i >= 0) {
+    if (fc.env[i].name == name) {
+      return i
+    }
+    i = i - 1
+  }
+  return -1
+}
+
+// Lowers a plain `x = e` to a local variable: SSA-reassigns the local's value id
+// to the rhs (materialized at the local's type), with no instruction — the
+// local simply refers to a new value from here on. ponytail: single simple-ident
+// target only; compound (`+=`) and field/index lvalues land next.
+function lowerAssign(fc: FnCtx, node: int) {
+  if (getNode(fc.c.tree, node).main != int(Kind.Eq)) {
+    fc.failed = true
+    return
+  }
+  let k = kidsOf(fc.c.tree, node)
+  let lhsItems = kidsOf(fc.c.tree, k[0])
+  let rhsItems = kidsOf(fc.c.tree, k[1])
+  if (len(lhsItems) != 1 || len(rhsItems) != 1) {
+    fc.failed = true
+    return
+  }
+  let ln = getNode(fc.c.tree, lhsItems[0])
+  if (ln.tag != Tag.Ident) {
+    fc.failed = true
+    return
+  }
+  let idx = envIndex(fc, fc.c.source[ln.span.start:ln.span.end])
+  if (idx == -1) {
+    fc.failed = true
+    return
+  }
+  let v = lowerExprH(fc, rhsItems[0], fc.env[idx].ty)
+  if (fc.failed) {
+    return
+  }
+  fc.env[idx].value = v
+}
+
+// Lowers a `while (cond) body`: jump to a header block (loop-carried live locals
+// as block params), test the condition, branch into the body or out to the
+// exit; the body back-jumps to the header. break/continue target exit/header via
+// the loop stack. Mirrors the seed's lowerWhile. Exit block left open.
+function lowerWhile(fc: FnCtx, node: int) {
+  let k = kidsOf(fc.c.tree, node)
+  let preLen = len(fc.env)
+  let header = builderNewBlock(fc.b)
+  let bodyBlk = builderNewBlock(fc.b)
+  let exitBlk = builderNewBlock(fc.b)
+  // Entry edge into the header.
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Header: loop-carried params, then the condition + branch.
+  builderBeginBlock(fc.b, header)
+  addJoinParams(fc, preLen)
+  let cond = lowerExpr(fc, k[0])
+  if (fc.failed) {
+    return
+  }
+  // The body is dominated by the header (single predecessor), so it takes no
+  // params; only the exit is a real merge (this edge + every break).
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = cond
+  br.ival = bodyBlk
+  br.thenArgs = []int(0)
+  br.ival2 = exitBlk
+  br.elseArgs = snapshotValues(fc, preLen)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  // Body.
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: header, preLen: preLen })
+  builderBeginBlock(fc.b, bodyBlk)
+  fc.terminated = false
+  lowerStmtList(fc, k[1])
+  if (!fc.terminated) {
+    emitJump(fc, header, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  truncateEnv(fc, preLen)
+  // Exit: merges the false-branch and every break.
+  builderBeginBlock(fc.b, exitBlk)
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+}
+
 // Lowers one statement. Only `return [expr]` is handled; anything else trips
 // `failed`.
 // Lowers one `let`/`const` binding: a simple `name = init` binds the init's
@@ -842,6 +944,28 @@ function lowerStmt(fc: FnCtx, node: int) {
     lowerIf(fc, node)
     return
   }
+  if (n.tag == Tag.WhileStmt) {
+    lowerWhile(fc, node)
+    return
+  }
+  if (n.tag == Tag.Assign) {
+    lowerAssign(fc, node)
+    return
+  }
+  if (n.tag == Tag.BreakStmt || n.tag == Tag.ContinueStmt) {
+    if (len(fc.loops) == 0) {
+      fc.failed = true
+      return
+    }
+    let frame = fc.loops[len(fc.loops) - 1]
+    let target = frame.exit
+    if (n.tag == Tag.ContinueStmt) {
+      target = frame.cont
+    }
+    emitJump(fc, target, snapshotValues(fc, frame.preLen))
+    fc.terminated = true
+    return
+  }
   fc.failed = true
 }
 
@@ -887,7 +1011,8 @@ function lowerFunc(c: Checker, decl: int): IrFunc {
   let b = newBuilder()
   let entry = builderNewBlock(b)
   builderBeginBlock(b, entry)
-  let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false }
+  let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false,
+    loops: []LoopFrame(0) }
   // Bind params (receiver first, if any) to their block-param value ids.
   let names = paramNames(c, decl)
   let i = 0
