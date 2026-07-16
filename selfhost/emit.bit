@@ -1,0 +1,368 @@
+// Self-host Stage 3 (#1345): IR module -> Mach-O relocatable object, ported from
+// compiler/emit.zig's emitMachoObject. The last link in the chain: everything
+// before this produces an IrModule; this turns it into an object the linker
+// (machoexec.bit) can consume.
+//
+// Layout decisions worth stating, because they are not arbitrary:
+//   __text   every function's machine code, plus the _bit_main trampoline.
+//   __const  string bytes, ptr_offsets arrays, type-name strings — read-only.
+//   __data   everything holding an ABSOLUTE pointer: the string {ptr,len}
+//            headers, the TypeInfo blobs, the method tables, the stack-map
+//            table. Under macOS's PIE model dyld only rebases a pointer that
+//            lives in a WRITABLE segment; in __const it would keep its unslid
+//            link-time value — a wild pointer into the unmapped pre-slide image.
+//
+// Every symbol is `_`-prefixed: the Mach-O C ABI mangling the runtime's own
+// exports use.
+
+// One distinct TypeInfo blob the runtime's bit_rt_gc_alloc reads (runtime/gc.zig).
+// `disc` is the type discriminator (the allocation's result type id) — descriptors
+// are per TYPE, not per layout, so each type's method table attaches to the right
+// one. `size` is the body size; `ptrOffsets` the byte offsets of pointer fields
+// the GC scans.
+struct TypeInfoLayout {
+  disc: int,
+  size: int,
+  ptrOffsets: []int,
+}
+
+// A function-pointer relocation site inside a method table: patch `off` to the
+// absolute address of the __text symbol `sym`.
+struct EmFnReloc {
+  off: int,
+  sym: string,
+}
+
+// A type's emitted method table (ABI.md §2.1): the local array symbol, its
+// placement, and the per-entry fn relocation sites. `sym` is empty for a type
+// with no methods.
+struct EmittedMethods {
+  sym: string,
+  off: int,
+  size: int,
+  relocs: []EmFnReloc,
+}
+
+function emStackmapsSymbol(): string {
+  return "bit_stack_maps"
+}
+
+// The Mach-O C ABI's leading underscore.
+function emMac(name: string): string {
+  return "_" + name
+}
+
+// The seed converts its arch-specific SafepointEntry into a common SafepointView
+// here; this port's compileFunction already produces SafepointViews, so this only
+// gathers them with the code size.
+function emStackMapOf(fc: FuncCode): FuncStackMap {
+  return FuncStackMap{ codeSize: len(fc.code), saved: fc.savedRegs,
+    safepoints: fc.safepoints }
+}
+
+// Every distinct TypeInfo in the module, deduped by its symbol name (so a type
+// allocated at many sites shares one blob).
+function collectTypeInfos(module: IrModule): []TypeInfoLayout {
+  let seen = map<string, bool>{}
+  let out = []TypeInfoLayout(0)
+  let fi = 0
+  while (fi < len(module.funcs)) {
+    let f = module.funcs[fi]
+    let i = 0
+    while (i < len(f.instrs)) {
+      let ins = f.instrs[i]
+      let has = true
+      let layout = TypeInfoLayout{ disc: 0, size: 0, ptrOffsets: []int(0) }
+      if (ins.op == Op.GcAlloc) {
+        layout = TypeInfoLayout{ disc: ins.ty, size: ins.ival, ptrOffsets: ins.offsets }
+      } else if (ins.op == Op.MakeClosure) {
+        // A make_closure allocates the fixed 16-byte {code, env} cell; its env
+        // pointer at +8 is the one GC field.
+        layout = TypeInfoLayout{ disc: ins.ty, size: 16, ptrOffsets: [8] }
+      } else if (ins.op == Op.TypeInfo) {
+        // A type assertion references a descriptor without allocating one, so its
+        // target's blob must be emitted here too — the target may never be
+        // gc_alloc'd in this module.
+        layout = TypeInfoLayout{ disc: ins.ival, size: ins.ival2, ptrOffsets: ins.offsets }
+      } else {
+        has = false
+      }
+      if (has) {
+        let name = typeInfoSymbol(layout.disc, layout.size, layout.ptrOffsets)
+        let (_, dup) = seen[name]
+        if (!dup) {
+          seen[name] = true
+          out = append(out, layout)
+        }
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  return out
+}
+
+function emPadTo8(buf: ByteBuf) {
+  while (len(buf.bytes) % 8 != 0) {
+    buf.bytes = append(buf.bytes, u8(0))
+  }
+}
+
+// Appends a type's method table as Method[] ({u64 id, u64 fn} each) and returns
+// its placement plus the fn reloc sites. The byte layout is format-neutral; the
+// caller turns `relocs` into its own format's records.
+function emitMethodTable(module: IrModule, data: ByteBuf, disc: int, tiSymbol: string): EmittedMethods {
+  let mt = methodTableOf(module, disc)
+  if (len(mt.methods) == 0) {
+    return EmittedMethods{ sym: "", off: 0, size: 0, relocs: []EmFnReloc(0) }
+  }
+  emPadTo8(data)
+  let base = len(data.bytes)
+  let relocs = []EmFnReloc(0)
+  let i = 0
+  while (i < len(mt.methods)) {
+    appendU64(data, mt.methods[i].id)
+    relocs = append(relocs, EmFnReloc{ off: len(data.bytes), sym: mt.methods[i].func })
+    appendU64(data, 0) // fn — filled by the reloc
+    i = i + 1
+  }
+  return EmittedMethods{ sym: tiSymbol + "_methods", off: base,
+    size: len(mt.methods) * 16, relocs: relocs }
+}
+
+// Emits `module` as an aarch64 Mach-O relocatable object. The module's `main`
+// becomes the runtime entry, via the _bit_main trampoline.
+function emitMachoObject(module: IrModule): []u8! {
+  let code = newByteBuf()
+  let rodata = newByteBuf()
+  let data = newByteBuf()
+  let symbols = []MachoSymbol(0)
+  let relocs = []MachoRelocation(0)
+  let defined = map<string, bool>{}
+  let stackmaps = []FuncStackMap(0)
+
+  // ---- every function -> one __text symbol + its relocations -------------
+  let mainVoid = false
+  let haveMain = false
+  let fi = 0
+  while (fi < len(module.funcs)) {
+    let f = module.funcs[fi]
+    let fc = compileFunction(module, f)
+    let off = len(code.bytes)
+    appendBytes(code, fc.code)
+    symbols = append(symbols, MachoSymbol{ name: emMac(f.name), hasSection: true,
+      section: MachoSectionKind.Text, offset: off, size: len(fc.code),
+      binding: MachoBinding.Global })
+    defined[emMac(f.name)] = true
+    let r = 0
+    while (r < len(fc.relocs)) {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Text,
+        offset: off + fc.relocs[r].offset, symbol: emMac(fc.relocs[r].symbol),
+        kind: emRelocKind(fc.relocs[r].kind) })
+      r = r + 1
+    }
+    stackmaps = append(stackmaps, emStackMapOf(fc))
+    if (f.name == "main") {
+      haveMain = true
+      mainVoid = module.ctx.types[f.result].kind == TypeKind.Void
+    }
+    fi = fi + 1
+  }
+  if (!haveMain) {
+    fail newError("NoMain")
+  }
+
+  // ---- _bit_main entry trampoline (AArch64) ------------------------------
+  // The runtime calls _bit_main (runtime/root.zig's boot runs it as a green
+  // thread); a void `main` still has to return an exit code, so the trampoline
+  // supplies 0.
+  let tramp = len(code.bytes)
+  emitWord(code, 0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+  let callField = len(code.bytes)
+  emitWord(code, 0x94000000) // bl _main (placeholder)
+  relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Text,
+    offset: callField, symbol: "_main", kind: MachoRelocKind.Branch })
+  if (mainVoid) {
+    emitWord(code, 0x52800000) // movz w0, #0
+  }
+  emitWord(code, 0xA8C17BFD) // ldp x29, x30, [sp], #16
+  emitWord(code, 0xD65F03C0) // ret
+  symbols = append(symbols, MachoSymbol{ name: "_bit_main", hasSection: true,
+    section: MachoSectionKind.Text, offset: tramp, size: len(code.bytes) - tramp,
+    binding: MachoBinding.Global })
+  defined["_bit_main"] = true
+
+  // ---- string pool -> read-only bytes + a writable {ptr,len} header ------
+  let si = 0
+  while (si < len(module.stringPool)) {
+    let s = module.stringPool[si]
+    let dataOff = len(rodata.bytes)
+    appendBytes(rodata, []byte(s))
+    let dataName = "___bitstr_${si}_data"
+    symbols = append(symbols, MachoSymbol{ name: dataName, hasSection: true,
+      section: MachoSectionKind.Rodata, offset: dataOff, size: len([]byte(s)),
+      binding: MachoBinding.Local })
+    defined[dataName] = true
+
+    emPadTo8(data)
+    let hdrOff = len(data.bytes)
+    appendU64(data, 0)             // ptr — filled by the reloc, rebased by dyld
+    appendU64(data, len([]byte(s))) // len
+    let hdrName = "___bitstr_${si}"
+    symbols = append(symbols, MachoSymbol{ name: hdrName, hasSection: true,
+      section: MachoSectionKind.Data, offset: hdrOff, size: 16,
+      binding: MachoBinding.Global })
+    defined[hdrName] = true
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+      offset: hdrOff, symbol: dataName, kind: MachoRelocKind.Unsigned64 })
+    si = si + 1
+  }
+
+  // ---- gc_alloc TypeInfo blobs -------------------------------------------
+  let tis = collectTypeInfos(module)
+  let ti = 0
+  while (ti < len(tis)) {
+    let t = tis[ti]
+    let name = typeInfoSymbol(t.disc, t.size, t.ptrOffsets)
+    let offsName = ""
+    if (len(t.ptrOffsets) > 0) {
+      emPadTo8(rodata)
+      let offsOff = len(rodata.bytes)
+      let k = 0
+      while (k < len(t.ptrOffsets)) {
+        appendU64(rodata, t.ptrOffsets[k])
+        k = k + 1
+      }
+      offsName = emMac(name + "_offs")
+      symbols = append(symbols, MachoSymbol{ name: offsName, hasSection: true,
+        section: MachoSectionKind.Rodata, offset: offsOff,
+        size: len(t.ptrOffsets) * 8, binding: MachoBinding.Local })
+      defined[offsName] = true
+    }
+    // The type's display name. The seed reads a display_names side table; this
+    // port keeps the name on the Type itself.
+    let tname = ""
+    if (module.ctx.types[t.disc].hasName) {
+      tname = module.ctx.types[t.disc].name
+    }
+    let nameSym = ""
+    if (len([]byte(tname)) > 0) {
+      let nmOff = len(rodata.bytes)
+      appendBytes(rodata, []byte(tname))
+      nameSym = emMac(name + "_name")
+      symbols = append(symbols, MachoSymbol{ name: nameSym, hasSection: true,
+        section: MachoSectionKind.Rodata, offset: nmOff, size: len([]byte(tname)),
+        binding: MachoBinding.Local })
+      defined[nameSym] = true
+    }
+    // The method table holds absolute fn pointers, so it lives in writable
+    // __data too.
+    let methods = emitMethodTable(module, data, t.disc, name)
+    let methodsName = ""
+    if (methods.sym != "") {
+      methodsName = emMac(methods.sym)
+      symbols = append(symbols, MachoSymbol{ name: methodsName, hasSection: true,
+        section: MachoSectionKind.Data, offset: methods.off, size: methods.size,
+        binding: MachoBinding.Local })
+      defined[methodsName] = true
+      let mr = 0
+      while (mr < len(methods.relocs)) {
+        relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+          offset: methods.relocs[mr].off, symbol: emMac(methods.relocs[mr].sym),
+          kind: MachoRelocKind.Unsigned64 })
+        mr = mr + 1
+      }
+    }
+
+    emPadTo8(data)
+    let tiOff = len(data.bytes)
+    appendU64(data, t.size)              // size
+    appendU64(data, 0)                   // ptr_offsets_ptr (rebased if any)
+    appendU64(data, len(t.ptrOffsets))   // ptr_offsets_len
+    appendU64(data, 0)                   // name_ptr (rebased if any)
+    appendU64(data, len([]byte(tname)))  // name_len
+    appendU64(data, 0)                   // methods_ptr (rebased if any)
+    appendU64(data, methods.size / 16)   // methods_len
+    let tiName = emMac(name)
+    symbols = append(symbols, MachoSymbol{ name: tiName, hasSection: true,
+      section: MachoSectionKind.Data, offset: tiOff, size: 56,
+      binding: MachoBinding.Global })
+    defined[tiName] = true
+    if (len(t.ptrOffsets) > 0) {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: tiOff + 8, symbol: offsName, kind: MachoRelocKind.Unsigned64 })
+    }
+    if (nameSym != "") {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: tiOff + 24, symbol: nameSym, kind: MachoRelocKind.Unsigned64 })
+    }
+    if (methods.sym != "") {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: tiOff + 40, symbol: methodsName, kind: MachoRelocKind.Unsigned64 })
+    }
+    ti = ti + 1
+  }
+
+  // ---- GC stack-map table (runtime/ABI.md §4) ----------------------------
+  // Each entry holds an absolute code pointer, so this lives in writable __data
+  // too; the runtime reads it via _bit_stack_maps.
+  let blobOff = len(data.bytes)
+  let codeRelocs = writeStackMaps(data, stackmaps)
+  let smSym = emMac(emStackmapsSymbol())
+  symbols = append(symbols, MachoSymbol{ name: smSym, hasSection: true,
+    section: MachoSectionKind.Data, offset: blobOff,
+    size: len(data.bytes) - blobOff, binding: MachoBinding.Global })
+  defined[smSym] = true
+  // writeStackMaps records offsets against `data` itself — already
+  // section-relative, so no blobOff adjustment.
+  let ci = 0
+  while (ci < len(codeRelocs)) {
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+      offset: codeRelocs[ci], symbol: emMac(module.funcs[ci].name),
+      kind: MachoRelocKind.Unsigned64 })
+    ci = ci + 1
+  }
+
+  // ---- undefined externals for runtime symbols ---------------------------
+  // Anything a relocation names that this object does not define is a runtime
+  // import the linker resolves.
+  let externs = map<string, bool>{}
+  let ri = 0
+  while (ri < len(relocs)) {
+    let sym = relocs[ri].symbol
+    let (_, isDef) = defined[sym]
+    let (_, isExt) = externs[sym]
+    if (!isDef && !isExt) {
+      externs[sym] = true
+      symbols = append(symbols, MachoSymbol{ name: sym, hasSection: false,
+        section: MachoSectionKind.Text, offset: 0, size: 0,
+        binding: MachoBinding.Global })
+    }
+    ri = ri + 1
+  }
+
+  let sections = [MachoSection{ kind: MachoSectionKind.Text, data: code.bytes,
+    size: 0, alignment: 4 }]
+  if (len(rodata.bytes) > 0) {
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.Rodata,
+      data: rodata.bytes, size: 0, alignment: 8 })
+  }
+  if (len(data.bytes) > 0) {
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.Data,
+      data: data.bytes, size: 0, alignment: 8 })
+  }
+  return writeMacho(MachoTarget.Aarch64, MachoObject{ sections: sections,
+    symbols: symbols, relocations: relocs })?
+}
+
+// codegen's Reloc kinds map 1:1 onto the object writer's.
+function emRelocKind(k: RelocKind): MachoRelocKind {
+  if (k == RelocKind.Branch) {
+    return MachoRelocKind.Branch
+  }
+  if (k == RelocKind.Page21) {
+    return MachoRelocKind.Page21
+  }
+  assert(k == RelocKind.PageOff12)
+  return MachoRelocKind.Pageoff12
+}
