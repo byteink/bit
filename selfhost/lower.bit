@@ -235,10 +235,11 @@ function cmpOpFor(op: int, isFloat: bool, signed: bool): Op {
 
 // Whether a string literal's body uses a `\x`/`\u{…}` byte/codepoint escape,
 // which the simple decoder below cannot yet build. Such a literal falls back.
-function stringNeedsByteEscape(src: string, start: int, endPos: int): bool {
-  let i = start + 1
-  let last = endPos - 1
-  while (i < last - 1) {
+// Whether the content range [cstart, cend) uses a `\x`/`\u` byte/codepoint
+// escape the simple decoder cannot build.
+function spanNeedsByteEscape(src: string, cstart: int, cend: int): bool {
+  let i = cstart
+  while (i < cend - 1) {
     if (src[i] == '\\' && (src[i + 1] == 'x' || src[i + 1] == 'u')) {
       return true
     }
@@ -247,15 +248,13 @@ function stringNeedsByteEscape(src: string, start: int, endPos: int): bool {
   return false
 }
 
-// Decodes a string literal's body (span includes the quotes), matching the
-// seed's unescapeInner for the escapes it handles: n/t/r/0 and the literal
-// `\\ " ' $`. ponytail: `\x`/`\u` are screened out by stringNeedsByteEscape
-// before this runs, so they never reach the else branch.
-function decodeStringContent(src: string, start: int, endPos: int): string {
+// Decodes the escape sequences in a content range [cstart, cend), matching the
+// seed's unescapeInner for n/t/r/0 and the literal `\\ " ' $`. ponytail: `\x`/
+// `\u` are screened out by spanNeedsByteEscape before this runs.
+function decodeEscapes(src: string, cstart: int, cend: int): string {
   let s = ""
-  let i = start + 1
-  let last = endPos - 1
-  while (i < last) {
+  let i = cstart
+  while (i < cend) {
     let c = src[i]
     if (c != '\\') {
       s = s + src[i:i + 1]
@@ -263,7 +262,7 @@ function decodeStringContent(src: string, start: int, endPos: int): string {
       continue
     }
     i = i + 1
-    if (i >= last) {
+    if (i >= cend) {
       break
     }
     let e = src[i]
@@ -281,6 +280,15 @@ function decodeStringContent(src: string, start: int, endPos: int): string {
     }
   }
   return s
+}
+
+// A string literal's body is its span minus the surrounding quotes.
+function stringNeedsByteEscape(src: string, start: int, endPos: int): bool {
+  return spanNeedsByteEscape(src, start + 1, endPos - 1)
+}
+
+function decodeStringContent(src: string, start: int, endPos: int): string {
+  return decodeEscapes(src, start + 1, endPos - 1)
 }
 
 // Lowers a call's argument expressions in order (unwrapping each `arg` node).
@@ -332,12 +340,80 @@ function lowerCall(fc: FnCtx, node: int): int {
   return 0
 }
 
+// Converts a lowered value to a string for interpolation (§5.7): a string is
+// itself; bool/float/int dispatch to their `string_from_*` runtime call. A
+// struct/interface `show()` operand falls back for now.
+function lowerToString(fc: FnCtx, v: int, node: int): int {
+  let ty = defaultType(fc.c, checkExprType(fc.c, node))
+  let td = fc.c.ctx.types[ty]
+  let stringTy = primType(fc.c.ctx, 11)
+  if (td.kind == TypeKind.Prim) {
+    if (td.prim == 11) {
+      return v
+    }
+    let rt = "string_from_int"
+    if (td.prim == 10) {
+      rt = "string_from_bool"
+    } else if (td.prim == 8 || td.prim == 9) {
+      rt = "string_from_float"
+    }
+    let ins = mkInstr(Op.RtCall, stringTy)
+    ins.name = rt
+    ins.args = [v]
+    return builderEmit(fc.b, ins)
+  }
+  fc.failed = true
+  return 0
+}
+
+// Lowers a string interpolation `"a${x}b"`: each literal segment -> const_string
+// (decoded), each interpolated expr -> lowerToString, then the parts fold left
+// with string_concat — matching the seed's lowerStrInterp.
+function lowerStrInterp(fc: FnCtx, node: int): int {
+  let parts = kidsOf(fc.c.tree, node)
+  let stringTy = primType(fc.c.ctx, 11)
+  let vals = []int(0)
+  let i = 0
+  while (i < len(parts) && !fc.failed) {
+    let p = parts[i]
+    let pn = getNode(fc.c.tree, p)
+    if (pn.tag == Tag.StrPart) {
+      if (spanNeedsByteEscape(fc.c.source, pn.span.start, pn.span.end)) {
+        fc.failed = true
+        return 0
+      }
+      let cs = mkInstr(Op.ConstString, stringTy)
+      cs.sval = decodeEscapes(fc.c.source, pn.span.start, pn.span.end)
+      vals = append(vals, builderEmit(fc.b, cs))
+    } else {
+      vals = append(vals, lowerToString(fc, lowerExpr(fc, p), p))
+    }
+    i = i + 1
+  }
+  if (fc.failed) {
+    return 0
+  }
+  let acc = vals[0]
+  let j = 1
+  while (j < len(vals)) {
+    let ins = mkInstr(Op.RtCall, stringTy)
+    ins.name = "string_concat"
+    ins.args = [acc, vals[j]]
+    acc = builderEmit(fc.b, ins)
+    j = j + 1
+  }
+  return acc
+}
+
 // Lowers an expression to its SSA value id, or trips `failed` (returning 0) for
 // a construct not yet handled. ponytail: literals/idents/(+,-,*)/print — the
 // growth frontier for the IR differential.
 function lowerExpr(fc: FnCtx, node: int): int {
   let n = getNode(fc.c.tree, node)
   let tag = n.tag
+  if (tag == Tag.StrInterp) {
+    return lowerStrInterp(fc, node)
+  }
   if (tag == Tag.IntLit) {
     let ins = mkInstr(Op.ConstInt, defaultType(fc.c, checkExprType(fc.c, node)))
     ins.ival = parseIntText(fc.c.source[n.span.start:n.span.end])
