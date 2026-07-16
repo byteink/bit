@@ -119,6 +119,14 @@ struct FnCtx {
 // index on first encounter (the seed's methodId), so call_iface indices match.
 struct Lowerer {
   methodIds: map<string, int>,
+  // FuncId scheme for closures: the number of regular funcs (free + instances +
+  // methods) reserved before any closure; synthesized func-value trampolines get
+  // ids reservedCount, reservedCount+1, ... and their name embeds that id.
+  reservedCount: int,
+  closureFuncs: []IrFunc,
+  // Function name -> its func-value trampoline's FuncId (deduped: one trampoline
+  // per referenced function).
+  fnValueTramps: map<string, int>,
 }
 
 // The dispatch index of an interface method name, assigned on first encounter.
@@ -658,6 +666,19 @@ function lowerCall(fc: FnCtx, node: int): int {
     // A primitive-named callee is a type conversion `T(x)`.
     if (primIndexByName(name) >= 0) {
       return lowerConvert(fc, node)
+    }
+    // A local/param of function type called directly (`f(x)`) dispatches through
+    // the closure via `call_value`.
+    let lvi = envIndex(fc, name)
+    if (lvi != -1 && fc.c.ctx.types[fc.env[lvi].ty].kind == TypeKind.Func) {
+      let a = lowerArgs(fc, node, fc.c.ctx.types[fc.env[lvi].ty].members)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, checkExprType(fc.c, node)))
+      ins.lhs = fc.env[lvi].value
+      ins.args = a
+      return builderEmit(fc.b, ins)
     }
     let decl = funcDeclLookup(fc.c, name)
     if (decl != 0) {
@@ -1773,6 +1794,17 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
       if (k == name) {
         return lowerExpr(fc, initNode)
       }
+    }
+    // A bare top-level function used as a first-class value: wrap it in a closure
+    // over a nil env and its trampoline.
+    if (funcDeclLookup(fc.c, name) != 0) {
+      let fnTy = funcSigLookup(fc.c, name)
+      let fid = fnValueTrampoline(fc, name)
+      let nl = mkInstr(Op.ConstNil, fnTy)
+      let mc = mkInstr(Op.MakeClosure, fnTy)
+      mc.name = "fnvalue\$trampoline\$${fid}"
+      mc.lhs = builderEmit(fc.b, nl)
+      return builderEmit(fc.b, mc)
     }
     fc.failed = true
     return 0
@@ -3788,6 +3820,51 @@ function paramNames(c: Checker, decl: int): []string {
 // Lowers every top-level function into an `IrModule`. FuncId order matches the
 // seed's passes: free functions first (Pass A), then struct methods (Pass A3),
 // each in declaration order — so the dump's `func` blocks line up.
+// The FuncId of the trampoline that wraps top-level function `funcName` as a
+// first-class value, synthesizing it on first use. The trampoline takes the
+// closure env (ignored) plus the target's parameters and tail-calls the target,
+// so a bare function value is call-compatible with arrow closures.
+function fnValueTrampoline(fc: FnCtx, funcName: string): int {
+  for (nm, existing) of fc.lowerer.fnValueTramps {
+    if (nm == funcName) {
+      return existing
+    }
+  }
+  let fid = fc.lowerer.reservedCount + len(fc.lowerer.closureFuncs)
+  let decl = funcDeclLookup(fc.c, funcName)
+  let paramTypes = lowerParamTypes(fc.c, decl)
+  let result = unwrapFallible(fc.c, funcResultLookup(fc.c, funcName))
+  let fnTy = funcSigLookup(fc.c, funcName)
+  let b = newBuilder()
+  let entry = builderNewBlock(b)
+  builderBeginBlock(b, entry)
+  // Leading env param (ignored), then one block param per target parameter.
+  builderAddParam(b, fnTy)
+  let callArgs = []int(0)
+  let allParams = [fnTy]
+  let i = 0
+  while (i < len(paramTypes)) {
+    callArgs = append(callArgs, builderAddParam(b, paramTypes[i]))
+    allParams = append(allParams, paramTypes[i])
+    i = i + 1
+  }
+  let call = mkInstr(Op.Call, result)
+  call.name = funcName
+  call.args = callArgs
+  let r = builderEmit(b, call)
+  if (result == fc.c.ctx.voidId) {
+    builderEmit(b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+  } else {
+    let rt = mkInstr(Op.Ret, fc.c.ctx.voidId)
+    rt.args = [r]
+    builderEmit(b, rt)
+  }
+  builderEndBlock(b)
+  fc.lowerer.closureFuncs = append(fc.lowerer.closureFuncs, IrFunc{ name: "fnvalue\$trampoline\$${fid}", paramTypes: allParams, result: result, blocks: b.blocks, instrs: b.instrs })
+  fc.lowerer.fnValueTramps[funcName] = fid
+  return fid
+}
+
 // Whether a func decl is a generic template (has a non-empty `<...>` list). Such
 // a template is not lowered directly — one instance per call-site type-arg combo
 // is emitted instead (monomorphization).
@@ -3798,7 +3875,22 @@ function isGenericFuncDecl(c: Checker, decl: int): bool {
 
 function lowerModuleIr(c: Checker): IrModule {
   let moduleConsts = collectModuleConsts(c)
-  let lowerer = Lowerer{ methodIds: map<string, int>{} }
+  // reservedCount = every regular func (free + instances + methods); closure
+  // trampolines take FuncIds after these, so it must be known before body
+  // lowering assigns them.
+  let reserved = len(c.instantiations)
+  let ri = 1
+  while (ri < len(c.tree.nodes)) {
+    let rn = getNode(c.tree, ri)
+    if (rn.tag == Tag.FuncDecl) {
+      if (kidsOf(c.tree, ri)[0] != 0 || !isGenericFuncDecl(c, ri)) {
+        reserved = reserved + 1
+      }
+    }
+    ri = ri + 1
+  }
+  let lowerer = Lowerer{ methodIds: map<string, int>{}, reservedCount: reserved,
+    closureFuncs: []IrFunc(0), fnValueTramps: map<string, int>{} }
   let funcs = []IrFunc(0)
   // Pass A: non-generic free functions in declaration order.
   let i = 1
@@ -3845,6 +3937,12 @@ function lowerModuleIr(c: Checker): IrModule {
       funcs = append(funcs, lowerFunc(c, m, moduleConsts, lowerer))
     }
     m = m + 1
+  }
+  // Pass A4: synthesized closure trampolines, at the FuncIds reserved for them.
+  let ci = 0
+  while (ci < len(lowerer.closureFuncs)) {
+    funcs = append(funcs, lowerer.closureFuncs[ci])
+    ci = ci + 1
   }
   return IrModule{ funcs: funcs, ctx: c.ctx }
 }
