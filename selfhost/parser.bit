@@ -1,0 +1,301 @@
+// Self-host Stage 1 (#1335): the parser, ported from compiler/parser.zig. This
+// first cut is a minimal-but-real recursive-descent slice — top-level `const`/
+// `let` bindings and `function` declarations, block bodies of let/return/
+// expression statements, and the full precedence-climbing expression grammar
+// (binary, unary, postfix call/member, primary literals/idents/parens). It
+// builds the same node tags + child order as the seed, so `bitc2 --dump-ast` is
+// byte-identical for programs in this subset. Structs/enums/interfaces/control
+// flow/generics/slices/maps and error recovery are follow-ups.
+//
+// The parser runs over a pre-lexed token array (lexAll), including the lexer's
+// ASI semicolons. Only leaf nodes need exact spans (the dump renders their
+// source text); interior-node spans are irrelevant to the dump, so they use a
+// dummy point span.
+
+struct Parser {
+  toks: []Token,
+  src: string,
+  pos: int,
+  tree: Tree,
+}
+
+function newParser(src: string): Parser {
+  return Parser{ toks: lexAll(src), src: src, pos: 0, tree: newTree() }
+}
+
+function peekTok(p: Parser): Token {
+  return p.toks[p.pos]
+}
+
+function peekKind(p: Parser): Kind {
+  return p.toks[p.pos].kind
+}
+
+function advance(p: Parser) {
+  if (p.pos + 1 < len(p.toks)) {
+    p.pos = p.pos + 1
+  }
+}
+
+function accept(p: Parser, k: Kind): bool {
+  if (peekKind(p) == k) {
+    advance(p)
+    return true
+  }
+  return false
+}
+
+// Consume `k` if present. This minimal parser assumes well-formed input; real
+// error recovery lands with the diagnostics renderer.
+function expect(p: Parser, k: Kind) {
+  if (peekKind(p) == k) {
+    advance(p)
+  }
+}
+
+function skipSemis(p: Parser) {
+  while (peekKind(p) == Kind.Semicolon) {
+    advance(p)
+  }
+}
+
+// A leaf node from the current token (with its exact span), then advance.
+function leaf(p: Parser, tag: Tag): int {
+  let t = peekTok(p)
+  let node = addLeaf(p.tree, tag, Span{ file: 0, start: t.start, end: t.end })
+  advance(p)
+  return node
+}
+
+// An interior node with a dummy span (the dump ignores interior spans).
+function mkNode(p: Parser, tag: Tag, main: int, kids: []int): int {
+  return addNode(p.tree, tag, pointSpan(0, 0), main, kids)
+}
+
+// ---- expressions -----------------------------------------------------------
+
+function precedenceOf(k: Kind): int {
+  if (k == Kind.Star || k == Kind.Slash || k == Kind.Percent || k == Kind.Shl ||
+    k == Kind.Shr || k == Kind.Amp) {
+    return 6
+  }
+  if (k == Kind.Plus || k == Kind.Minus || k == Kind.Pipe || k == Kind.Caret) {
+    return 5
+  }
+  if (k == Kind.EqEq || k == Kind.BangEq || k == Kind.Lt || k == Kind.LtEq ||
+    k == Kind.Gt || k == Kind.GtEq) {
+    return 4
+  }
+  if (k == Kind.AmpAmp) {
+    return 3
+  }
+  if (k == Kind.PipePipe) {
+    return 2
+  }
+  return 0
+}
+
+function parsePrimary(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.IntLit) { return leaf(p, Tag.IntLit) }
+  if (k == Kind.FloatLit) { return leaf(p, Tag.FloatLit) }
+  if (k == Kind.StringLit) { return leaf(p, Tag.StringLit) }
+  if (k == Kind.RawStringLit) { return leaf(p, Tag.RawStringLit) }
+  if (k == Kind.RuneLit) { return leaf(p, Tag.RuneLit) }
+  if (k == Kind.BoolLit) { return leaf(p, Tag.BoolLit) }
+  if (k == Kind.NilLit) { return leaf(p, Tag.NilLit) }
+  if (k == Kind.Ident) { return leaf(p, Tag.Ident) }
+  if (k == Kind.LParen) {
+    advance(p)
+    let inner = parseExpr(p)
+    expect(p, Kind.RParen)
+    return inner
+  }
+  // Poison: consume one token so parsing always advances.
+  return leaf(p, Tag.NilLit)
+}
+
+// Postfix chain: `f(a, b)` calls and `.name` member access. `call` is
+// `[callee, type_args_or_none, args]`; `args` holds `arg` nodes each `[expr]`;
+// `member` is `[recv, name]`.
+function parsePostfix(p: Parser): int {
+  let expr = parsePrimary(p)
+  let guard = 0
+  while (guard < 4096) {
+    let k = peekKind(p)
+    if (k == Kind.LParen) {
+      advance(p)
+      let argNodes = []int(0)
+      while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+        let a = mkNode(p, Tag.Arg, 0, [parseExpr(p)])
+        argNodes = append(argNodes, a)
+        if (!accept(p, Kind.Comma)) {
+          break
+        }
+      }
+      expect(p, Kind.RParen)
+      let args = mkNode(p, Tag.Args, 0, argNodes)
+      expr = mkNode(p, Tag.Call, 0, [expr, 0, args])
+    } else if (k == Kind.Dot) {
+      advance(p)
+      let name = leaf(p, Tag.Ident)
+      expr = mkNode(p, Tag.Member, 0, [expr, name])
+    } else {
+      break
+    }
+    guard = guard + 1
+  }
+  return expr
+}
+
+function parseUnary(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.Bang || k == Kind.Minus || k == Kind.Plus || k == Kind.Tilde ||
+    k == Kind.ArrowLeft) {
+    advance(p)
+    let operand = parseUnary(p)
+    return mkNode(p, Tag.Unary, int(k), [operand])
+  }
+  return parsePostfix(p)
+}
+
+// Left-associative precedence climbing (§12).
+function parseBinary(p: Parser, minPrec: int): int {
+  let lhs = parseUnary(p)
+  let guard = 0
+  while (guard < 4096) {
+    let k = peekKind(p)
+    let prec = precedenceOf(k)
+    if (prec == 0 || prec < minPrec) {
+      break
+    }
+    advance(p)
+    let rhs = parseBinary(p, prec + 1)
+    lhs = mkNode(p, Tag.Binary, int(k), [lhs, rhs])
+    guard = guard + 1
+  }
+  return lhs
+}
+
+function parseExpr(p: Parser): int {
+  return parseBinary(p, 1)
+}
+
+// ---- types, params, statements, declarations -------------------------------
+
+// Minimal: a bare type name is an ident leaf (generics/slices/maps deferred).
+function parseType(p: Parser): int {
+  return leaf(p, Tag.Ident)
+}
+
+function parseParam(p: Parser): int {
+  let name = leaf(p, Tag.Ident)
+  expect(p, Kind.Colon)
+  let ty = parseType(p)
+  return mkNode(p, Tag.Param, 0, [name, ty])
+}
+
+function parseParams(p: Parser): int {
+  expect(p, Kind.LParen)
+  let items = []int(0)
+  while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+    items = append(items, parseParam(p))
+    if (!accept(p, Kind.Comma)) {
+      break
+    }
+  }
+  expect(p, Kind.RParen)
+  return mkNode(p, Tag.Params, 0, items)
+}
+
+// `binding = [pattern, type_or_none, init_or_none]`; the decl wraps one binding.
+function parseBinding(p: Parser, declTag: Tag): int {
+  advance(p)
+  let name = leaf(p, Tag.Ident)
+  let ty = 0
+  if (accept(p, Kind.Colon)) {
+    ty = parseType(p)
+  }
+  let init = 0
+  if (accept(p, Kind.Eq)) {
+    init = parseExpr(p)
+  }
+  let binding = mkNode(p, Tag.Binding, 0, [name, ty, init])
+  return mkNode(p, declTag, 0, [binding])
+}
+
+function parseReturn(p: Parser): int {
+  advance(p)
+  let k = peekKind(p)
+  if (k == Kind.Semicolon || k == Kind.RBrace || k == Kind.Eof) {
+    return mkNode(p, Tag.ReturnStmt, 0, []int(0))
+  }
+  return mkNode(p, Tag.ReturnStmt, 0, [parseExpr(p)])
+}
+
+function parseStatement(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.KwReturn) { return parseReturn(p) }
+  if (k == Kind.KwLet) { return parseBinding(p, Tag.LetDecl) }
+  if (k == Kind.KwConst) { return parseBinding(p, Tag.ConstDecl) }
+  return mkNode(p, Tag.ExprStmt, 0, [parseExpr(p)])
+}
+
+function parseBlock(p: Parser): int {
+  expect(p, Kind.LBrace)
+  let stmts = []int(0)
+  skipSemis(p)
+  while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    stmts = append(stmts, parseStatement(p))
+    skipSemis(p)
+  }
+  expect(p, Kind.RBrace)
+  return mkNode(p, Tag.Block, 0, stmts)
+}
+
+// `func_decl = [recv_or_none, name, generics_or_none, params, result_or_none,
+// body]`. Receiver and generics are deferred (always none).
+function parseFuncDecl(p: Parser): int {
+  advance(p)
+  let name = leaf(p, Tag.Ident)
+  let params = parseParams(p)
+  let result = 0
+  if (accept(p, Kind.Colon)) {
+    result = parseType(p)
+  }
+  let body = parseBlock(p)
+  return mkNode(p, Tag.FuncDecl, 0, [0, name, 0, params, result, body])
+}
+
+function parseTopDecl(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.KwConst) { return parseBinding(p, Tag.ConstDecl) }
+  if (k == Kind.KwLet) { return parseBinding(p, Tag.LetDecl) }
+  if (k == Kind.KwFunction) { return parseFuncDecl(p) }
+  // Unhandled top-level construct (struct/enum/interface/export/...): consume
+  // one token so the loop advances. These land as the grammar grows.
+  advance(p)
+  return 0
+}
+
+function parseProgram(p: Parser): int {
+  let decls = []int(0)
+  skipSemis(p)
+  let guard = 0
+  while (peekKind(p) != Kind.Eof && guard < 100000) {
+    let d = parseTopDecl(p)
+    if (d != 0) {
+      decls = append(decls, d)
+    }
+    skipSemis(p)
+    guard = guard + 1
+  }
+  return mkNode(p, Tag.Program, 0, decls)
+}
+
+// Parses `src` into a Tree whose root is the `program` node.
+function parseSource(src: string): Tree {
+  let p = newParser(src)
+  p.tree.root = parseProgram(p)
+  return p.tree
+}
