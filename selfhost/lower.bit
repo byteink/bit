@@ -1859,6 +1859,9 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   if (tag == Tag.TypeAssert) {
     return lowerTypeAssert(fc, node)
   }
+  if (tag == Tag.ArrowFn) {
+    return lowerArrowFn(fc, node)
+  }
   if (tag == Tag.TryExpr) {
     return lowerTryExpr(fc, node)
   }
@@ -3820,6 +3823,153 @@ function paramNames(c: Checker, decl: int): []string {
 // Lowers every top-level function into an `IrModule`. FuncId order matches the
 // seed's passes: free functions first (Pass A), then struct methods (Pass A3),
 // each in declaration order — so the dump's `func` blocks line up.
+// Lays out a closure's captured fields (like structLayout, over arbitrary field
+// types) into offsets + GC pointer offsets + total size.
+function layoutFields(fc: FnCtx, fieldTypes: []int): StructLayout {
+  let offsets = []int(0)
+  let ptrOffsets = []int(0)
+  let cur = 0
+  let i = 0
+  while (i < len(fieldTypes)) {
+    let fl = fieldLayoutFor(fc, fieldTypes[i])
+    cur = alignUp(cur, fl.size)
+    offsets = append(offsets, cur)
+    if (fl.isPtr) {
+      ptrOffsets = append(ptrOffsets, cur)
+    }
+    cur = cur + fl.size
+    i = i + 1
+  }
+  return StructLayout{ size: alignUp(cur, 8), offsets: offsets, ptrOffsets: ptrOffsets }
+}
+
+// Synthesizes a closure function `closure$<fid>(env, params) { body }`: the body
+// reads its captures from the env object (word i) and its params from block
+// params. Returns the FuncId (post-order: nested closures get lower ids). Appends
+// the function to the shared closure list.
+function lowerClosureBody(fc: FnCtx, node: int, closureTy: int, capNames: []string, capTypes: []int, layout: StructLayout): int {
+  let k = kidsOf(fc.c.tree, node)
+  let ft = fc.c.ctx.types[closureTy]
+  let b = newBuilder()
+  let entry = builderNewBlock(b)
+  builderBeginBlock(b, entry)
+  let cfc = FnCtx{ c: fc.c, b: b, env: []LocalBind(0), failed: false, terminated: false,
+    loops: []LoopFrame(0), moduleConsts: fc.moduleConsts, lowerer: fc.lowerer, defers: []IrInstr(0),
+    fallibleOk: 0, fallibleErr: 0 }
+  let envParam = builderAddParam(b, closureTy)
+  let allParams = [closureTy]
+  let pnodes = kidsOf(fc.c.tree, k[0])
+  let i = 0
+  while (i < len(pnodes)) {
+    let pty = ft.members[i]
+    let p = builderAddParam(b, pty)
+    let pn = getNode(fc.c.tree, kidsOf(fc.c.tree, pnodes[i])[0])
+    let pname = fc.c.source[pn.span.start:pn.span.end]
+    declareLocal(cfc, pname, p, pty)
+    fc.c.env[pname] = pty
+    allParams = append(allParams, pty)
+    i = i + 1
+  }
+  // Unpack captures from the env object (field_get word i).
+  i = 0
+  while (i < len(capNames)) {
+    let fg = mkInstr(Op.FieldGet, capTypes[i])
+    fg.lhs = envParam
+    fg.ival = layout.offsets[i]
+    declareLocal(cfc, capNames[i], builderEmit(b, fg), capTypes[i])
+    fc.c.env[capNames[i]] = capTypes[i]
+    i = i + 1
+  }
+  let body = k[1]
+  if (getNode(fc.c.tree, body).tag == Tag.Block) {
+    lowerStmtList(cfc, body)
+    if (!cfc.terminated) {
+      builderEmit(b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+    }
+  } else {
+    let v = lowerExprH(cfc, body, ft.result)
+    let rt = mkInstr(Op.Ret, fc.c.ctx.voidId)
+    rt.args = [v]
+    builderEmit(b, rt)
+  }
+  builderEndBlock(b)
+  if (cfc.failed) {
+    fc.failed = true
+  }
+  let fid = fc.lowerer.reservedCount + len(fc.lowerer.closureFuncs)
+  fc.lowerer.closureFuncs = append(fc.lowerer.closureFuncs, IrFunc{ name: "closure\$${fid}", paramTypes: allParams, result: ft.result, blocks: b.blocks, instrs: b.instrs })
+  return fid
+}
+
+// Lowers an arrow function `(params) => body` to a closure: captures every
+// in-scope local not shadowed by its own params (innermost first, the seed's
+// order), packs them into a gc_alloc'd env (nil when none), synthesizes the
+// closure body, and wraps them with `make_closure`.
+function lowerArrowFn(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let closureTy = checkExprType(fc.c, node)
+  let ownNames = []string(0)
+  let pnodes = kidsOf(fc.c.tree, k[0])
+  let pi = 0
+  while (pi < len(pnodes)) {
+    let pn = getNode(fc.c.tree, kidsOf(fc.c.tree, pnodes[pi])[0])
+    ownNames = append(ownNames, fc.c.source[pn.span.start:pn.span.end])
+    pi = pi + 1
+  }
+  let capNames = []string(0)
+  let capTypes = []int(0)
+  let capValues = []int(0)
+  let i = len(fc.env) - 1
+  while (i >= 0) {
+    let bd = fc.env[i]
+    if (!stringInList(ownNames, bd.name) && !stringInList(capNames, bd.name)) {
+      capNames = append(capNames, bd.name)
+      capTypes = append(capTypes, bd.ty)
+      capValues = append(capValues, bd.value)
+    }
+    i = i - 1
+  }
+  let layout = layoutFields(fc, capTypes)
+  let envObj = 0
+  if (len(capNames) == 0) {
+    envObj = builderEmit(fc.b, mkInstr(Op.ConstNil, closureTy))
+  } else {
+    let ga = mkInstr(Op.GcAlloc, closureTy)
+    ga.ival = layout.size
+    ga.offsets = layout.ptrOffsets
+    envObj = builderEmit(fc.b, ga)
+    let ci = 0
+    while (ci < len(capNames)) {
+      let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+      fs.lhs = envObj
+      fs.ival = layout.offsets[ci]
+      fs.rhs = capValues[ci]
+      builderEmit(fc.b, fs)
+      ci = ci + 1
+    }
+  }
+  let fid = lowerClosureBody(fc, node, closureTy, capNames, capTypes, layout)
+  if (fc.failed) {
+    return 0
+  }
+  let mc = mkInstr(Op.MakeClosure, closureTy)
+  mc.name = "closure\$${fid}"
+  mc.lhs = envObj
+  return builderEmit(fc.b, mc)
+}
+
+// Whether `name` is in a string list.
+function stringInList(xs: []string, name: string): bool {
+  let i = 0
+  while (i < len(xs)) {
+    if (xs[i] == name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // The FuncId of the trampoline that wraps top-level function `funcName` as a
 // first-class value, synthesizing it on first use. The trampoline takes the
 // closure env (ignored) plus the target's parameters and tail-calls the target,
