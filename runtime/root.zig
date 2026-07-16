@@ -706,13 +706,10 @@ export fn bit_rt_fs_write(fd: i64, s: *const RtBytes) callconv(.c) i64 {
 /// success, -1 on any error. Needed because a compiler that writes an executable
 /// must mark it executable — `writeFile` alone leaves a 0o644 file the kernel
 /// refuses to exec.
-export fn bit_rt_fs_chmod(p: *const RtBytes, mode: i64) callconv(.c) i64 {
-    var buf: [4096]u8 = undefined;
-    if (p.len >= buf.len) return -1;
-    @memcpy(buf[0..p.len], p.ptr[0..p.len]);
-    buf[p.len] = 0;
-    const rc = std.c.chmod(@ptrCast(&buf), @intCast(mode));
-    return if (rc == 0) 0 else -1;
+export fn bit_rt_fs_chmod(path: *const RtBytes, mode: i64) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    return if (sched.chmodAt(p, @intCast(mode))) 0 else -1;
 }
 
 /// `bit_rt_fs_close`: close `fd`. Always reports success (the raw close wrapper

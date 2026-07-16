@@ -442,6 +442,16 @@ pub fn mkdirAt(path: [*:0]const u8) bool {
     }
 }
 
+/// Set `path`'s permission bits to `mode`. Returns false on any failure.
+/// Linux goes through the raw syscall: this runtime links no libc, so
+/// `std.c.chmod` is unavailable there (only Darwin has libSystem).
+pub fn chmodAt(path: [*:0]const u8, mode: u32) bool {
+    switch (builtin.os.tag) {
+        .linux => return std.posix.errno(std.os.linux.chmod(path, mode)) == .SUCCESS,
+        else => return std.c.chmod(path, @intCast(mode)) == 0,
+    }
+}
+
 /// Remove a file, or an empty directory. Returns whether it is now gone.
 pub fn removeAt(path: [*:0]const u8) bool {
     switch (builtin.os.tag) {
