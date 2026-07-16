@@ -1,0 +1,323 @@
+// Self-host Stage 2 (#1337): the SSA IR data model + text dumper, ported from
+// compiler/ir.zig's `Op`/`Module` + `dump`. This is the substrate the lowering
+// pass (AST -> IR) builds on next; landing the model + printer first (pinned by
+// selfcheck against a hand-built function) mirrors how types.bit's typeName
+// landed before the checker used it. `bitc2 --dump-ir` must byte-match the
+// seed's `bitc --dump-ir` over the corpus once lowering lands.
+//
+// SSA shape: a function is a flat `instrs` array whose index IS the value id
+// (`%N`); each block owns a contiguous range `[instsStart, instsStart+instsLen)`
+// whose first `paramCount` slots are its block parameters (phi results, printed
+// in the block header, never as body lines).
+
+// Every instruction opcode (compiler/ir.zig `Op`). The dumper prints arithmetic
+// and compare ops by their tag name (opName); the rest are literal in dumpInst.
+enum Op {
+  BlockParam,
+  ConstInt, ConstFloat, ConstBool, ConstString, ConstNil,
+  Add, Sub, Mul, SDiv, UDiv, SRem, URem,
+  FAdd, FSub, FMul, FDiv,
+  BAnd, BOr, BXor, Shl, AShr, LShr,
+  Neg, FNeg, BNot,
+  Convert,
+  ICmpEq, ICmpNe, ICmpSlt, ICmpSle, ICmpSgt, ICmpSge,
+  ICmpUlt, ICmpUle, ICmpUgt, ICmpUge,
+  FCmpEq, FCmpNe, FCmpLt, FCmpLe, FCmpGt, FCmpGe,
+  Jump, Br, Ret, Unreachable,
+  Call, CallValue, CallIface,
+  GcAlloc, TypeInfo, FieldGet, FieldSet, IndexGet, IndexSet, SliceLen,
+  MakeClosure, FuncAddr, RtCall,
+}
+
+// The tag-name spelling the seed's `@tagName(op)` yields (used for the bin/un/
+// convert/compare op mnemonics in the dump). Only the ops printed via opName
+// need a row; the rest are literal in dumpInst.
+function opName(op: Op): string {
+  if (op == Op.Add) { return "add" }
+  if (op == Op.Sub) { return "sub" }
+  if (op == Op.Mul) { return "mul" }
+  if (op == Op.SDiv) { return "sdiv" }
+  if (op == Op.UDiv) { return "udiv" }
+  if (op == Op.SRem) { return "srem" }
+  if (op == Op.URem) { return "urem" }
+  if (op == Op.FAdd) { return "fadd" }
+  if (op == Op.FSub) { return "fsub" }
+  if (op == Op.FMul) { return "fmul" }
+  if (op == Op.FDiv) { return "fdiv" }
+  if (op == Op.BAnd) { return "band" }
+  if (op == Op.BOr) { return "bor" }
+  if (op == Op.BXor) { return "bxor" }
+  if (op == Op.Shl) { return "shl" }
+  if (op == Op.AShr) { return "ashr" }
+  if (op == Op.LShr) { return "lshr" }
+  if (op == Op.Neg) { return "neg" }
+  if (op == Op.FNeg) { return "fneg" }
+  if (op == Op.BNot) { return "bnot" }
+  if (op == Op.Convert) { return "convert" }
+  if (op == Op.ICmpEq) { return "icmp_eq" }
+  if (op == Op.ICmpNe) { return "icmp_ne" }
+  if (op == Op.ICmpSlt) { return "icmp_slt" }
+  if (op == Op.ICmpSle) { return "icmp_sle" }
+  if (op == Op.ICmpSgt) { return "icmp_sgt" }
+  if (op == Op.ICmpSge) { return "icmp_sge" }
+  if (op == Op.ICmpUlt) { return "icmp_ult" }
+  if (op == Op.ICmpUle) { return "icmp_ule" }
+  if (op == Op.ICmpUgt) { return "icmp_ugt" }
+  if (op == Op.ICmpUge) { return "icmp_uge" }
+  if (op == Op.FCmpEq) { return "fcmp_eq" }
+  if (op == Op.FCmpNe) { return "fcmp_ne" }
+  if (op == Op.FCmpLt) { return "fcmp_lt" }
+  if (op == Op.FCmpLe) { return "fcmp_le" }
+  if (op == Op.FCmpGt) { return "fcmp_gt" }
+  if (op == Op.FCmpGe) { return "fcmp_ge" }
+  return "?"
+}
+
+// Whether an op is a two-operand arithmetic/bitwise/compare instruction printed
+// as `%d = <op> <type> %lhs, %rhs`.
+function opIsBinary(op: Op): bool {
+  return int(op) >= int(Op.Add) && int(op) <= int(Op.LShr) ||
+    int(op) >= int(Op.ICmpEq) && int(op) <= int(Op.FCmpGe)
+}
+
+// One SSA instruction. A tagged record: only the fields an op needs are set
+// (the seed packs these into an `extra` array; selfhost keeps them named). For
+// call-shaped ops the callee/runtime name is resolved into `name` so the dumper
+// stays self-contained.
+struct IrInstr {
+  op: Op,
+  ty: int,        // result type id (TypeContext); void for terminators/void ops
+  args: []int,    // call/rt_call/ret args, jump/br target args
+  lhs: int,       // bin lhs / un operand / field-or-index base / call callee
+  rhs: int,       // bin rhs / field-or-index value or index
+  ival: int,      // const_int, offset, method_index, gc size, type disc, block ids
+  ival2: int,     // second immediate (type_info size, br else block)
+  fval: f64,      // const_float
+  bval: bool,     // const_bool
+  sval: string,   // const_string text
+  name: string,   // call/make_closure/func_addr callee name, rt_call rt name
+  offsets: []int, // gc_alloc / type_info pointer offsets
+  thenArgs: []int, // br then-block args
+  elseArgs: []int, // br else-block args
+}
+
+// A basic block: a contiguous slice of the function's flat instr array; the
+// first `paramCount` slots are its block parameters.
+struct IrBlock {
+  instsStart: int,
+  paramCount: int,
+  instsLen: int,
+}
+
+// A lowered function: its signature, its blocks, and the flat SSA instr array
+// (index == value id).
+struct IrFunc {
+  name: string,
+  paramTypes: []int,
+  result: int,
+  blocks: []IrBlock,
+  instrs: []IrInstr,
+}
+
+// A whole module: the functions plus the shared type context for typeName.
+struct IrModule {
+  funcs: []IrFunc,
+  ctx: TypeContext,
+}
+
+// The IR dump's type spelling — compiler/ir.zig `writeTypeName`, which differs
+// from the checker's typeName: void is `void` (not `()`), a func is `fn(P) R`
+// (not `(P) => R`), a fallible always shows its error, a type param is `<T>`,
+// and any untyped/invalid/over-deep type is a placeholder.
+function irJoinNames(ctx: TypeContext, ids: []int, depth: int): string {
+  let s = ""
+  let i = 0
+  while (i < len(ids)) {
+    if (i > 0) {
+      s = s + ", "
+    }
+    s = s + irTypeNameDepth(ctx, ids[i], depth + 1)
+    i = i + 1
+  }
+  return s
+}
+
+function irTypeNameDepth(ctx: TypeContext, id: int, depth: int): string {
+  if (depth >= 64) {
+    return "<...>"
+  }
+  let t = ctx.types[id]
+  let k = t.kind
+  if (k == TypeKind.Invalid) { return "<invalid>" }
+  if (k == TypeKind.Void) { return "void" }
+  if (k == TypeKind.UntypedInt || k == TypeKind.UntypedFloat || k == TypeKind.UntypedRune ||
+    k == TypeKind.UntypedBool || k == TypeKind.UntypedString || k == TypeKind.UntypedNil) {
+    return "<untyped>"
+  }
+  if (k == TypeKind.Prim) { return primName(t.prim) }
+  if (k == TypeKind.Slice) { return "[]" + irTypeNameDepth(ctx, t.elem, depth + 1) }
+  if (k == TypeKind.Chan) { return "chan<" + irTypeNameDepth(ctx, t.elem, depth + 1) + ">" }
+  if (k == TypeKind.Array) { return "[${t.arrayLen}]" + irTypeNameDepth(ctx, t.elem, depth + 1) }
+  if (k == TypeKind.Map) {
+    return "map<" + irTypeNameDepth(ctx, t.mapKey, depth + 1) + ", " + irTypeNameDepth(ctx, t.mapVal, depth + 1) + ">"
+  }
+  if (k == TypeKind.Tuple) { return "(" + irJoinNames(ctx, t.members, depth) + ")" }
+  if (k == TypeKind.Func) {
+    return "fn(" + irJoinNames(ctx, t.members, depth) + ") " + irTypeNameDepth(ctx, t.result, depth + 1)
+  }
+  if (k == TypeKind.Fallible) {
+    return irTypeNameDepth(ctx, t.result, depth + 1) + "!" + irTypeNameDepth(ctx, t.errTy, depth + 1)
+  }
+  if (k == TypeKind.TypeParam) { return "<T>" }
+  if (t.hasName) { return t.name }
+  return "<anon>"
+}
+
+function irTypeName(ctx: TypeContext, id: int): string {
+  return irTypeNameDepth(ctx, id, 0)
+}
+
+// A zeroed instruction with only its op and result type set; callers fill the
+// operand fields the op needs (the lowering builder and the selfcheck pin).
+function mkInstr(op: Op, ty: int): IrInstr {
+  return IrInstr{ op: op, ty: ty, args: []int(0), lhs: 0, rhs: 0, ival: 0, ival2: 0,
+    fval: 0.0, bval: false, sval: "", name: "", offsets: []int(0),
+    thenArgs: []int(0), elseArgs: []int(0) }
+}
+
+// Renders a comma-separated `%v0, %v1, …` value list.
+function dumpValList(vals: []int): string {
+  let s = ""
+  let i = 0
+  while (i < len(vals)) {
+    if (i > 0) {
+      s = s + ", "
+    }
+    s = s + "%${vals[i]}"
+    i = i + 1
+  }
+  return s
+}
+
+// Renders one instruction line (with its trailing newline), matching
+// compiler/ir.zig's dumpInst byte-for-byte. `id` is the instruction's value id.
+function dumpInst(m: IrModule, ins: IrInstr, id: int): string {
+  let op = ins.op
+  let ty = irTypeName(m.ctx, ins.ty)
+  if (op == Op.ConstInt) { return "  %${id} = const_int ${ty} ${ins.ival}\n" }
+  if (op == Op.ConstFloat) { return "  %${id} = const_float ${ty} ${ins.fval}\n" }
+  if (op == Op.ConstBool) { return "  %${id} = const_bool ${ins.bval}\n" }
+  if (op == Op.ConstString) { return "  %${id} = const_string \"${ins.sval}\"\n" }
+  if (op == Op.ConstNil) { return "  %${id} = const_nil\n" }
+  if (opIsBinary(op)) {
+    return "  %${id} = ${opName(op)} ${ty} %${ins.lhs}, %${ins.rhs}\n"
+  }
+  if (op == Op.Neg || op == Op.FNeg || op == Op.BNot || op == Op.Convert) {
+    return "  %${id} = ${opName(op)} ${ty} %${ins.lhs}\n"
+  }
+  if (op == Op.Jump) {
+    return "  jump bb${ins.ival}(${dumpValList(ins.args)})\n"
+  }
+  if (op == Op.Br) {
+    return "  br %${ins.lhs}, bb${ins.ival}(${dumpValList(ins.thenArgs)}), bb${ins.ival2}(${dumpValList(ins.elseArgs)})\n"
+  }
+  if (op == Op.Ret) {
+    if (len(ins.args) > 0) {
+      return "  ret ${dumpValList(ins.args)}\n"
+    }
+    return "  ret\n"
+  }
+  if (op == Op.Unreachable) { return "  unreachable\n" }
+  if (op == Op.Call) {
+    return "  %${id} = call @${ins.name}(${dumpValList(ins.args)}) ${ty}\n"
+  }
+  if (op == Op.CallValue) {
+    return "  %${id} = call_value %${ins.lhs}(${dumpValList(ins.args)}) ${ty}\n"
+  }
+  if (op == Op.CallIface) {
+    return "  %${id} = call_iface %${ins.lhs}.${ins.ival}(${dumpValList(ins.args)}) ${ty}\n"
+  }
+  if (op == Op.GcAlloc) {
+    return "  %${id} = gc_alloc size=${ins.ival} ptrs=[${dumpValList(ins.offsets)}] ${ty}\n"
+  }
+  if (op == Op.TypeInfo) {
+    return "  %${id} = type_info disc=${ins.ival} size=${ins.ival2} ptrs=[${dumpValList(ins.offsets)}] ${ty}\n"
+  }
+  if (op == Op.FieldGet) {
+    return "  %${id} = field_get %${ins.lhs}[${ins.ival}] ${ty}\n"
+  }
+  if (op == Op.FieldSet) {
+    return "  field_set %${ins.lhs}[${ins.ival}] = %${ins.rhs}\n"
+  }
+  if (op == Op.IndexGet) {
+    return "  %${id} = index_get %${ins.lhs}[%${ins.rhs}] ${ty}\n"
+  }
+  if (op == Op.IndexSet) {
+    return "  index_set %${ins.lhs}[%${ins.rhs}] = %${ins.ival}\n"
+  }
+  if (op == Op.SliceLen) {
+    return "  %${id} = slice_len %${ins.lhs}\n"
+  }
+  if (op == Op.MakeClosure) {
+    return "  %${id} = make_closure @${ins.name}, %${ins.lhs}\n"
+  }
+  if (op == Op.FuncAddr) {
+    return "  %${id} = func_addr @${ins.name}\n"
+  }
+  if (op == Op.RtCall) {
+    return "  %${id} = rt_call ${ins.name}(${dumpValList(ins.args)}) ${ty}\n"
+  }
+  return ""
+}
+
+// Renders one `func …(…) … { … }` block, matching dumpFunction byte-for-byte.
+function dumpFunction(m: IrModule, f: IrFunc): string {
+  let s = "func ${f.name}("
+  let i = 0
+  while (i < len(f.paramTypes)) {
+    if (i > 0) {
+      s = s + ", "
+    }
+    s = s + "%${i}: " + irTypeName(m.ctx, f.paramTypes[i])
+    i = i + 1
+  }
+  s = s + ") " + irTypeName(m.ctx, f.result) + " {\n"
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    s = s + "bb${bi}("
+    let p = 0
+    while (p < b.paramCount) {
+      if (p > 0) {
+        s = s + ", "
+      }
+      let v = b.instsStart + p
+      s = s + "%${v}: " + irTypeName(m.ctx, f.instrs[v].ty)
+      p = p + 1
+    }
+    s = s + "):\n"
+    let k = b.instsStart + b.paramCount
+    let end = b.instsStart + b.instsLen
+    while (k < end) {
+      s = s + dumpInst(m, f.instrs[k], k)
+      k = k + 1
+    }
+    bi = bi + 1
+  }
+  return s + "}\n"
+}
+
+// Renders a module as deterministic IR text: one `func` block per function,
+// blank-line separated, matching compiler/ir.zig `dump`.
+function dumpIr(m: IrModule): string {
+  let s = ""
+  let i = 0
+  while (i < len(m.funcs)) {
+    if (i > 0) {
+      s = s + "\n"
+    }
+    s = s + dumpFunction(m, m.funcs[i])
+    i = i + 1
+  }
+  return s
+}
