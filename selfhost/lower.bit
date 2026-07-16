@@ -1840,12 +1840,18 @@ function lowerForOf(fc: FnCtx, node: int) {
   let k = kidsOf(fc.c.tree, node)
   let iterTy = defaultType(fc.c, checkExprType(fc.c, k[1]))
   let id = fc.c.ctx.types[iterTy]
-  if (id.kind != TypeKind.Slice && id.kind != TypeKind.Array) {
+  let isMap = id.kind == TypeKind.Map
+  if (id.kind != TypeKind.Slice && id.kind != TypeKind.Array && !isMap) {
     fc.failed = true
     return
   }
+  // A slice/array binds one element; a map binds a `(key, value)` pair.
   let binderNode = getNode(fc.c.tree, k[0])
-  if (binderNode.tag != Tag.Ident) {
+  if (isMap && binderNode.tag != Tag.TuplePat) {
+    fc.failed = true
+    return
+  }
+  if (!isMap && binderNode.tag != Tag.Ident) {
     fc.failed = true
     return
   }
@@ -1856,11 +1862,20 @@ function lowerForOf(fc: FnCtx, node: int) {
     return
   }
   // Carry the iterable + cursor as hidden locals so they thread through the
-  // loop's block params.
+  // loop's block params. A map's cursor starts at its first live slot (or -1);
+  // a slice/array counts up from 0.
   declareLocal(fc, "$iter", iterVal, iterTy)
-  let zero = mkInstr(Op.ConstInt, i64ty)
-  zero.ival = 0
-  declareLocal(fc, "$idx", builderEmit(fc.b, zero), i64ty)
+  let startV = 0
+  if (isMap) {
+    let mi = mkInstr(Op.RtCall, i64ty)
+    mi.name = "map_iter_init"
+    mi.args = [iterVal]
+    startV = builderEmit(fc.b, mi)
+  } else {
+    let zero = mkInstr(Op.ConstInt, i64ty)
+    startV = builderEmit(fc.b, zero)
+  }
+  declareLocal(fc, "$idx", startV, i64ty)
   let preLen = len(fc.env)
   let idxSlot = preLen - 1
   let iterSlot = preLen - 2
@@ -1870,24 +1885,32 @@ function lowerForOf(fc: FnCtx, node: int) {
   let exitBlk = builderNewBlock(fc.b)
   emitJump(fc, header, snapshotValues(fc, preLen))
   builderEndBlock(fc.b)
-  // Header: test the cursor against the length.
+  // Header: a map continues while the slot cursor is >= 0; a slice/array while
+  // the index is below the length.
   builderBeginBlock(fc.b, header)
   addJoinParams(fc, preLen)
   let idxVal = fc.env[idxSlot].value
   let iterCur = fc.env[iterSlot].value
-  let lenVal = 0
-  if (id.kind == TypeKind.Array) {
-    let ci = mkInstr(Op.ConstInt, i64ty)
-    ci.ival = id.arrayLen
-    lenVal = builderEmit(fc.b, ci)
+  let cmp = mkInstr(Op.ICmpSge, primType(fc.c.ctx, 10))
+  if (isMap) {
+    let z = mkInstr(Op.ConstInt, i64ty)
+    cmp.lhs = idxVal
+    cmp.rhs = builderEmit(fc.b, z)
   } else {
-    let sl = mkInstr(Op.SliceLen, i64ty)
-    sl.lhs = iterCur
-    lenVal = builderEmit(fc.b, sl)
+    let lenVal = 0
+    if (id.kind == TypeKind.Array) {
+      let ci = mkInstr(Op.ConstInt, i64ty)
+      ci.ival = id.arrayLen
+      lenVal = builderEmit(fc.b, ci)
+    } else {
+      let sl = mkInstr(Op.SliceLen, i64ty)
+      sl.lhs = iterCur
+      lenVal = builderEmit(fc.b, sl)
+    }
+    cmp = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
+    cmp.lhs = idxVal
+    cmp.rhs = lenVal
   }
-  let cmp = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
-  cmp.lhs = idxVal
-  cmp.rhs = lenVal
   let br = mkInstr(Op.Br, fc.c.ctx.voidId)
   br.lhs = builderEmit(fc.b, cmp)
   br.ival = bodyBlk
@@ -1896,24 +1919,40 @@ function lowerForOf(fc: FnCtx, node: int) {
   br.elseArgs = snapshotValues(fc, preLen)
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
-  // Body: bind the element, run the body, fall through to the step.
+  // Body: bind the element (or key/value pair), run the body, fall to the step.
   fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen })
   builderBeginBlock(fc.b, bodyBlk)
   fc.terminated = false
-  let elemV = 0
-  if (id.kind == TypeKind.Slice) {
-    let sg = mkInstr(Op.RtCall, elemTy)
-    sg.name = "slice_get"
-    sg.args = [iterCur, idxVal]
-    elemV = builderEmit(fc.b, sg)
-  } else {
-    let ig = mkInstr(Op.IndexGet, elemTy)
-    ig.lhs = iterCur
-    ig.rhs = idxVal
-    elemV = builderEmit(fc.b, ig)
-  }
   let bodyMark = len(fc.env)
-  declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
+  if (isMap) {
+    let subs = kidsOf(fc.c.tree, k[0])
+    let kv = mkInstr(Op.RtCall, id.mapKey)
+    kv.name = "map_key_at"
+    kv.args = [iterCur, idxVal]
+    let keyV = builderEmit(fc.b, kv)
+    let vv = mkInstr(Op.RtCall, id.mapVal)
+    vv.name = "map_val_at"
+    vv.args = [iterCur, idxVal]
+    let valV = builderEmit(fc.b, vv)
+    let kn = getNode(fc.c.tree, subs[0])
+    let vn = getNode(fc.c.tree, subs[1])
+    declareLocal(fc, fc.c.source[kn.span.start:kn.span.end], keyV, id.mapKey)
+    declareLocal(fc, fc.c.source[vn.span.start:vn.span.end], valV, id.mapVal)
+  } else {
+    let elemV = 0
+    if (id.kind == TypeKind.Slice) {
+      let sg = mkInstr(Op.RtCall, elemTy)
+      sg.name = "slice_get"
+      sg.args = [iterCur, idxVal]
+      elemV = builderEmit(fc.b, sg)
+    } else {
+      let ig = mkInstr(Op.IndexGet, elemTy)
+      ig.lhs = iterCur
+      ig.rhs = idxVal
+      elemV = builderEmit(fc.b, ig)
+    }
+    declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
+  }
   lowerStmtList(fc, k[2])
   truncateEnv(fc, bodyMark)
   fc.loops = fc.loops[0:len(fc.loops) - 1]
@@ -1921,15 +1960,23 @@ function lowerForOf(fc: FnCtx, node: int) {
     emitJump(fc, stepBlk, snapshotValues(fc, preLen))
   }
   builderEndBlock(fc.b)
-  // Step: advance the cursor, back to the header.
+  // Step: advance the cursor (map: next live slot; slice/array: +1), back to the
+  // header.
   builderBeginBlock(fc.b, stepBlk)
   addJoinParams(fc, preLen)
-  let one = mkInstr(Op.ConstInt, i64ty)
-  one.ival = 1
-  let add = mkInstr(Op.Add, i64ty)
-  add.lhs = fc.env[idxSlot].value
-  add.rhs = builderEmit(fc.b, one)
-  fc.env[idxSlot].value = builderEmit(fc.b, add)
+  if (isMap) {
+    let nx = mkInstr(Op.RtCall, i64ty)
+    nx.name = "map_iter_next"
+    nx.args = [fc.env[iterSlot].value, fc.env[idxSlot].value]
+    fc.env[idxSlot].value = builderEmit(fc.b, nx)
+  } else {
+    let one = mkInstr(Op.ConstInt, i64ty)
+    one.ival = 1
+    let add = mkInstr(Op.Add, i64ty)
+    add.lhs = fc.env[idxSlot].value
+    add.rhs = builderEmit(fc.b, one)
+    fc.env[idxSlot].value = builderEmit(fc.b, add)
+  }
   emitJump(fc, header, snapshotValues(fc, preLen))
   builderEndBlock(fc.b)
   // Exit.
