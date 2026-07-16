@@ -1226,6 +1226,142 @@ function checkArm64Safepoints() {
   assert(len(sp.slots) == 2 && sp.slots[0] == 0 - 32 && sp.slots[1] == 0 - 24)
 }
 
+// Stage 3 (#1342 slice 4c) the driver: interval building, frame layout, and
+// whole-function emission.
+function checkStringPool() {
+  // The pool dedups and numbers in intern order, and const_string carries its
+  // index. Interned during LOWERING (not codegen) so the optimizer deleting a
+  // literal cannot renumber every later one — nothing in the IR dump covers this,
+  // since the dump prints each literal's text inline.
+  let m = IrModule{ funcs: []IrFunc(0), ctx: newTypeContext(), stringPool: []string(0) }
+  assert(internString(m, "a") == 0)
+  assert(internString(m, "b") == 1)
+  assert(internString(m, "a") == 0) // identical literals share one header
+  assert(internString(m, "") == 2)
+  assert(len(m.stringPool) == 3)
+  assert(m.stringPool[0] == "a" && m.stringPool[1] == "b" && m.stringPool[2] == "")
+}
+
+function checkArm64Intervals() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let strt = primType(ctx, 11)
+
+  // A value's interval must reach its last READ, or the allocator hands its
+  // register away while it is still live. A string result is a GC reference; an
+  // i64 is not.
+  // Reads %0 twice, so the second param is read NOWHERE — exactly the case
+  // forceParamInterference exists for.
+  let add = mkInstr(Op.Add, i64t)
+  add.lhs = 0
+  add.rhs = 0
+  let f = IrFunc{ name: "f", paramTypes: [i64t, i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, strt), add],
+    isFallible: false }
+  let built = buildIntervals(ctx, f)
+  assert(len(built.intervals) == 3)
+  assert(built.intervals[0].end == 2) // read by the add at position 2
+  assert(built.intervals[0].isRef == false)
+  assert(built.intervals[1].isRef == true) // string is a GC reference
+  assert(built.intervals[2].start == 2 && built.intervals[2].end == 2)
+  assert(built.intervals[1].end == 1)
+  assert(len(built.safepoints) == 0)
+
+  // Both params are live at once at block entry, so they must interfere. A param
+  // read NOWHERE would otherwise keep its empty [i,i] interval, free to be
+  // coalesced onto a live sibling param's register — and then the predecessor
+  // edge's parallel move clobbers one param with the other (a returned value
+  // coming back as some other incoming argument). forceParamInterference
+  // stretches every param to its block's last param position. Here NEITHER param
+  // is read, so param 0's interval must still be widened past its own slot.
+  let ci = mkInstr(Op.ConstInt, i64t)
+  ci.ival = 7
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [2]
+  let fp = IrFunc{ name: "fp", paramTypes: [i64t, i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 4 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t), ci, ret],
+    isFallible: false }
+  let pb = buildIntervals(ctx, fp)
+  assert(pb.intervals[0].end == 1) // widened from [0,0] to reach the last param
+  assert(pb.intervals[1].end == 1)
+
+  // A call is a safepoint; so is a back-edge, and they are collected in the order
+  // emission will re-encounter them.
+  let call = mkInstr(Op.Call, i64t)
+  call.name = "g"
+  let jump = mkInstr(Op.Jump, ctx.voidId)
+  jump.ival = 0 // back-edge: block 0 does not advance past itself
+  let f2 = IrFunc{ name: "f2", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }],
+    instrs: [call, jump], isFallible: false }
+  let b2 = buildIntervals(ctx, f2)
+  assert(len(b2.safepoints) == 2 && b2.safepoints[0] == 0 && b2.safepoints[1] == 1)
+
+  // Stack overflow accounting mirrors marshalArgs: independent banks, and the
+  // reserved x0 on the indirect paths pushes one more argument out.
+  let instrs = []IrInstr(0)
+  let args = []int(0)
+  let i = 0
+  while (i < 9) {
+    instrs = append(instrs, mkInstr(Op.BlockParam, i64t))
+    args = append(args, i)
+    i = i + 1
+  }
+  let f3 = IrFunc{ name: "f3", paramTypes: []int(0), result: ctx.voidId,
+    blocks: []IrBlock(0), instrs: instrs, isFallible: false }
+  assert(stackArgSlots(ctx, f3, args, 0, 0) == 1)
+  assert(stackArgSlots(ctx, f3, args, 1, 0) == 2) // x0 reserved
+  assert(stackArgSlots(ctx, f3, [0, 1], 0, 0) == 0)
+}
+
+// The seed's own regression (arm64.zig): a real rt_call with no loop back-edge in
+// the same function used to record ZERO safepoints, even though buildIntervals
+// counted it and handed regalloc a stack map for it — a GC pausing at that call's
+// return address would find the table empty and scan nothing.
+function checkCompileFunction() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let strt = primType(ctx, 11)
+  let rt = mkInstr(Op.RtCall, strt)
+  rt.name = "string_from_int"
+  rt.args = [0]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [1]
+  let f = IrFunc{ name: "f", paramTypes: [i64t], result: strt,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), rt, ret], isFallible: false }
+  let m = IrModule{ funcs: [f], ctx: ctx, stringPool: []string(0) }
+
+  let fc = compileFunction(m, f)
+  assert(len(fc.safepoints) == 1)
+  assert(fc.name == "f")
+  // The rt_call resolves to its runtime symbol.
+  assert(len(fc.relocs) == 1 && fc.relocs[0].symbol == "bit_rt_string_from_int")
+  // This function has a safepoint, so every allocatable register is callee-saved
+  // — and whichever ones it used must be saved and reported frame-relative.
+  assert(len(fc.savedRegs) > 0)
+  assert(fc.savedRegs[0].reg >= 19 && fc.savedRegs[0].reg <= 28)
+  assert(fc.savedRegs[0].fpOff < 0) // below the frame record
+  // The frame is 16-byte aligned, and the code starts by lowering sp and ends in
+  // a ret.
+  assert(fc.frameSize % 16 == 0 && fc.frameSize > 0)
+  assert(len(fc.code) % 4 == 0 && len(fc.code) > 0)
+  assert(wordAt(ByteBuf{ bytes: fc.code }, len(fc.code) - 4) == 0xd65f03c0) // ret
+
+  // A leaf function with no safepoint draws from the full register file and needs
+  // no stack map at all.
+  let ret2 = mkInstr(Op.Ret, ctx.voidId)
+  ret2.args = [0]
+  let leaf = IrFunc{ name: "leaf", paramTypes: [i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 2 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), ret2], isFallible: false }
+  let lc = compileFunction(IrModule{ funcs: [leaf], ctx: ctx, stringPool: []string(0) }, leaf)
+  assert(len(lc.safepoints) == 0 && len(lc.relocs) == 0)
+  assert(len(lc.savedRegs) == 0) // nothing callee-saved was touched
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -1376,6 +1512,9 @@ function selfcheck() {
   checkArm64Marshal()
   checkArm64Calls()
   checkArm64Safepoints()
+  checkStringPool()
+  checkArm64Intervals()
+  checkCompileFunction()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
