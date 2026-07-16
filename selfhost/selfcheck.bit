@@ -872,6 +872,199 @@ function checkArm64Operands() {
   assert(vregOf(cx, 1) == 6)
 }
 
+// Stage 3 (#1342 slice 4a) instruction selectors. The seed has no unit tests
+// here — its selectors are covered end-to-end by tests/cases goldens, which need
+// an object writer this port does not have yet. So these assert the subtleties
+// directly: the scratch-aliasing rules, the width-canonical invariant, and the
+// two condition-code mappings.
+
+// A context where value N lives in vreg N lives in register xN/dN, so a
+// selector's operands and result are trivially predictable.
+function selCtx(): A64Ctx {
+  let cx = testA64Ctx()
+  cx.intRegs = [0, 1, 2, 3, 4, 5, 6, 7]
+  cx.floatRegs = [0, 1, 2, 3, 4, 5, 6, 7]
+  let locs = []RegLoc(0)
+  let ivs = []int(0)
+  let i = 0
+  while (i < 8) {
+    locs = append(locs, RegLoc{ isSpill: false, index: i })
+    ivs = append(ivs, i)
+    i = i + 1
+  }
+  cx.result = RegAllocResult{ locations: locs, numSpillSlots: 0, stackMaps: []StackMapEntry(0) }
+  cx.instToVreg = ivs
+  return cx
+}
+
+function w64(): Width { return mkWidth(8, RegClass.Int, true) }
+function w8s(): Width { return mkWidth(1, RegClass.Int, true) }
+
+function checkArm64Extend() {
+  // SBFM/UBFM with the immr/imms pairs that name the low 1/2/4 bytes.
+  let c = newByteBuf()
+  extendRegA(c, 5, 3, 1, true)
+  assert(wordAt(c, 0) == 0x93401c65) // sxtb x5, w3
+  c = newByteBuf()
+  extendRegA(c, 5, 3, 1, false)
+  assert(wordAt(c, 0) == 0xd3401c65) // uxtb x5, w3
+  c = newByteBuf()
+  extendRegA(c, 5, 3, 2, true)
+  assert(wordAt(c, 0) == 0x93403c65) // sxth x5, w3
+  c = newByteBuf()
+  extendRegA(c, 5, 3, 4, true)
+  assert(wordAt(c, 0) == 0x93407c65) // sxtw x5, w3
+  c = newByteBuf()
+  extendRegA(c, 5, 3, 4, false)
+  assert(wordAt(c, 0) == 0xd3407c65) // ubfx x5, x3, #0, #32
+  // Width 8 is a plain move, and a move to itself is nothing at all.
+  c = newByteBuf()
+  extendRegA(c, 5, 3, 8, true)
+  assert(len(c.bytes) == 4 && wordAt(c, 0) == 0xaa0303e5)
+  c = newByteBuf()
+  extendRegA(c, 5, 5, 8, true)
+  assert(len(c.bytes) == 0)
+
+  // canonNarrow restores the width-canonical invariant only where it can be lost:
+  // never for a full-width int, never for a float.
+  c = newByteBuf()
+  canonNarrow(c, 5, w64())
+  assert(len(c.bytes) == 0)
+  c = newByteBuf()
+  canonNarrow(c, 5, mkWidth(4, RegClass.Float, false))
+  assert(len(c.bytes) == 0)
+  c = newByteBuf()
+  canonNarrow(c, 5, w8s())
+  assert(wordAt(c, 0) == 0x93401ca5) // sxtb x5, w5
+}
+
+function checkArm64Selectors() {
+  // add x9, x1, x2 ; mov x0, x9 — operands read from their registers, the result
+  // computed in scratch1, then written out.
+  let cx = selCtx()
+  emitBinaryInt(cx, Op.Add, 0, 1, 2, w64())
+  let want = newByteBuf()
+  addRR(want, scratch1(), 1, 2)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // A narrow add can overflow its width, so it re-narrows; a narrow bitwise op
+  // takes canonical operands to a canonical result, so it must NOT.
+  cx = selCtx()
+  emitBinaryInt(cx, Op.Add, 0, 1, 2, w8s())
+  want = newByteBuf()
+  addRR(want, scratch1(), 1, 2)
+  extendRegA(want, scratch1(), scratch1(), 1, true)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  cx = selCtx()
+  emitBinaryInt(cx, Op.BAnd, 0, 1, 2, w8s())
+  want = newByteBuf()
+  logicalRR(want, logicalOpc(LogicOp.And), scratch1(), 1, 2)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // srem: the divide goes to scratch3, NOT scratch1 — msub still needs `l`, which
+  // aliases scratch1 whenever it was spilled and reloaded there. A quotient in
+  // scratch1 would clobber it and yield q*(1-r).
+  cx = selCtx()
+  emitDivInt(cx, Op.SRem, 0, 1, 2)
+  want = newByteBuf()
+  sdivRR(want, scratch3(), 1, 2)
+  msubRR(want, scratch1(), scratch3(), 2, 1)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // A plain divide has no later use of `l`, so it keeps its quotient in scratch1.
+  cx = selCtx()
+  emitDivInt(cx, Op.UDiv, 0, 1, 2)
+  want = newByteBuf()
+  udivRR(want, scratch1(), 1, 2)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // A const_int shift amount folds into the immediate form; anything else reads a
+  // register.
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, 0), mkInstr(Op.BlockParam, 0),
+    mkInstr(Op.ConstInt, 0)]
+  cx.f.instrs[2].ival = 5
+  emitShiftInt(cx, Op.Shl, 0, 1, 2, w64())
+  want = newByteBuf()
+  lslImm(want, scratch1(), 1, 5)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, 0), mkInstr(Op.BlockParam, 0),
+    mkInstr(Op.BlockParam, 0)]
+  emitShiftInt(cx, Op.AShr, 0, 1, 2, w64())
+  want = newByteBuf()
+  asrvRR(want, scratch1(), 1, 2)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // Only shl pushes bits past the width.
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, 0), mkInstr(Op.BlockParam, 0),
+    mkInstr(Op.BlockParam, 0)]
+  emitShiftInt(cx, Op.LShr, 0, 1, 2, w8s())
+  want = newByteBuf()
+  lsrvRR(want, scratch1(), 1, 2)
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // cmp + cset materializes a bool.
+  cx = selCtx()
+  emitIcmp(cx, Op.ICmpSlt, 0, 1, 2)
+  want = newByteBuf()
+  cmpRR(want, 1, 2)
+  cset(want, scratch1(), condLt())
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+
+  // A float compare produces an INT result (the bool) from FLOAT operands.
+  cx = selCtx()
+  emitFcmp(cx, Op.FCmpLt, 0, 1, 2, 8)
+  want = newByteBuf()
+  fcmp(want, 1, 2, 8)
+  cset(want, scratch1(), condMi())
+  movRR(want, 0, scratch1())
+  assertSameBytes(cx.code, want)
+}
+
+function checkArm64Conds() {
+  assert(constShiftAmountOf(Op.ConstInt, 5) == 5)
+  // A shift count is taken mod 64, and a non-constant operand has none at all.
+  assert(constShiftAmountOf(Op.ConstInt, 70) == 6)
+  assert(constShiftAmountOf(Op.BlockParam, 5) == -1)
+
+  assert(icmpCond(Op.ICmpEq) == condEq() && icmpCond(Op.ICmpNe) == condNe())
+  assert(icmpCond(Op.ICmpSlt) == condLt() && icmpCond(Op.ICmpSle) == condLe())
+  assert(icmpCond(Op.ICmpSgt) == condGt() && icmpCond(Op.ICmpSge) == condGe())
+  // Unsigned compares take the carry-flag conditions, not the signed ones.
+  assert(icmpCond(Op.ICmpUlt) == condCc() && icmpCond(Op.ICmpUle) == condLs())
+  assert(icmpCond(Op.ICmpUgt) == condHi() && icmpCond(Op.ICmpUge) == condCs())
+
+  // The IEEE-754 gotcha: FCMP's plain EQ/NE/GT/GE are already correct, but LT and
+  // LE must be MI and LS — LT/LE would read true on an unordered (NaN) compare.
+  assert(fcmpCond(Op.FCmpEq) == condEq() && fcmpCond(Op.FCmpNe) == condNe())
+  assert(fcmpCond(Op.FCmpGt) == condGt() && fcmpCond(Op.FCmpGe) == condGe())
+  assert(fcmpCond(Op.FCmpLt) == condMi())
+  assert(fcmpCond(Op.FCmpLe) == condLs())
+  assert(fcmpCond(Op.FCmpLt) != condLt() && fcmpCond(Op.FCmpLe) != condLe())
+}
+
+// constShiftAmount takes a whole IrFunc; this builds the one-instruction function
+// it needs.
+function constShiftAmountOf(op: Op, ival: int): int {
+  let ins = mkInstr(op, 0)
+  ins.ival = ival
+  return constShiftAmount(IrFunc{ name: "t", paramTypes: []int(0), result: 0,
+    blocks: []IrBlock(0), instrs: [ins], isFallible: false }, 0)
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -1015,6 +1208,9 @@ function selfcheck() {
   checkArm64Frame()
   checkArm64Moves()
   checkArm64Operands()
+  checkArm64Extend()
+  checkArm64Selectors()
+  checkArm64Conds()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
