@@ -97,7 +97,21 @@ for-of binders, and transparent type aliases. The **1** remaining mismatch
 (`run_generic_nested`) needs generic type-*argument* tracking through instances
 (`Pair<i64>` → substitute `T`=i64), which the checker currently discards
 (instances render by bare name) — a substantive feature deferred to its own
-change. Stage 3 (codegen/link → `--dump-ir`, then `stage2 == stage3`) follows.
+change.
+
+**Stage 2 — lowering, started.** `selfhost/{ir,lower}.bit` port the SSA IR
+model + text dumper (`ir.zig`) and AST→IR lowering (`lower.zig`), behind
+`bitc2 --dump-ir`, diffed by `scripts/selfhost-diffir.sh`:
+
+| Surface | Script | Result |
+|---------|--------|--------|
+| IR | `scripts/selfhost-diffir.sh` | 1/122 (205 lower/check-err skips) |
+
+Function signatures (params incl. method receiver, fallible-ok result) and
+`return [expr]` bodies over literals / idents / `(+,-,*)` lower byte-for-byte; a
+per-function fallback to a signature-only stub keeps partial IR from leaking as
+the frontier grows (const folding, strings/interp, `print`/`rt_call`, bindings,
+control flow, calls). Stage 3 (codegen/link, then `stage2 == stage3`) follows.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.
