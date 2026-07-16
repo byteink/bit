@@ -17,10 +17,13 @@ struct Parser {
   src: string,
   pos: int,
   tree: Tree,
+  // Suppresses a `T{...}` composite literal at the top of a `for..of`/`for..in`
+  // iterable, where the `{` opens the loop body (§13.1).
+  noComposite: bool,
 }
 
 function newParser(src: string): Parser {
-  return Parser{ toks: lexAll(src), src: src, pos: 0, tree: newTree() }
+  return Parser{ toks: lexAll(src), src: src, pos: 0, tree: newTree(), noComposite: false }
 }
 
 function peekTok(p: Parser): Token {
@@ -248,8 +251,9 @@ function parsePostfix(p: Parser): int {
       let args = mkNode(p, Tag.Args, 0, argNodes)
       expr = mkNode(p, Tag.Call, 0, [expr, 0, args])
       bareName = false
-    } else if (k == Kind.LBrace && bareName) {
-      // `T{...}` composite literal — only right after a bare type name.
+    } else if (k == Kind.LBrace && bareName && !p.noComposite) {
+      // `T{...}` composite literal — only right after a bare type name, and not
+      // when the `{` belongs to a for-loop body (noComposite).
       expr = parseCompositeLit(p, expr)
       bareName = false
     } else if (k == Kind.LBracket) {
@@ -659,21 +663,192 @@ function parseImportDecl(p: Parser): int {
   return mkNode(p, Tag.ImportDecl, 0, [body, path])
 }
 
+function canStartExpression(k: Kind): bool {
+  return k == Kind.Ident || k == Kind.IntLit || k == Kind.FloatLit ||
+    k == Kind.StringLit || k == Kind.StrPart || k == Kind.RawStringLit ||
+    k == Kind.RuneLit || k == Kind.BoolLit || k == Kind.NilLit ||
+    k == Kind.LParen || k == Kind.LBracket || k == Kind.KwMap ||
+    k == Kind.KwChan || k == Kind.KwMatch || k == Kind.Bang ||
+    k == Kind.Minus || k == Kind.Plus || k == Kind.Tilde || k == Kind.ArrowLeft
+}
+
+// `return [ expr { "," expr } ]` — a grouped return carries several exprs.
 function parseReturn(p: Parser): int {
   advance(p)
-  let k = peekKind(p)
-  if (k == Kind.Semicolon || k == Kind.RBrace || k == Kind.Eof) {
+  if (!canStartExpression(peekKind(p))) {
     return mkNode(p, Tag.ReturnStmt, 0, []int(0))
   }
-  return mkNode(p, Tag.ReturnStmt, 0, [parseExpr(p)])
+  let items = []int(0)
+  items = append(items, parseExpr(p))
+  while (accept(p, Kind.Comma)) {
+    items = append(items, parseExpr(p))
+  }
+  return mkNode(p, Tag.ReturnStmt, 0, items)
+}
+
+function isAssignOp(k: Kind): bool {
+  return k == Kind.Eq || k == Kind.PlusEq || k == Kind.MinusEq ||
+    k == Kind.StarEq || k == Kind.SlashEq || k == Kind.PercentEq ||
+    k == Kind.AmpEq || k == Kind.PipeEq || k == Kind.CaretEq ||
+    k == Kind.ShlEq || k == Kind.ShrEq
+}
+
+// `assign | inc | dec | send | expr` statement. The assign op (or `=`) is stored
+// in `Node.main`; lhs/rhs are comma lists (lhs_list / expr_list).
+function parseSimpleStmt(p: Parser): int {
+  let first = parseExpr(p)
+  let k = peekKind(p)
+  if (k == Kind.PlusPlus) {
+    advance(p)
+    return mkNode(p, Tag.IncStmt, 0, [first])
+  }
+  if (k == Kind.MinusMinus) {
+    advance(p)
+    return mkNode(p, Tag.DecStmt, 0, [first])
+  }
+  if (k == Kind.ArrowLeft) {
+    advance(p)
+    return mkNode(p, Tag.SendStmt, 0, [first, parseExpr(p)])
+  }
+  if (k == Kind.Comma || isAssignOp(k)) {
+    let lhss = []int(0)
+    lhss = append(lhss, first)
+    while (accept(p, Kind.Comma)) {
+      lhss = append(lhss, parseExpr(p))
+    }
+    if (!isAssignOp(peekKind(p))) {
+      return mkNode(p, Tag.ExprStmt, 0, [first])
+    }
+    let op = peekKind(p)
+    advance(p)
+    let rhss = []int(0)
+    rhss = append(rhss, parseExpr(p))
+    while (accept(p, Kind.Comma)) {
+      rhss = append(rhss, parseExpr(p))
+    }
+    let lhsList = mkNode(p, Tag.LhsList, 0, lhss)
+    let rhsList = mkNode(p, Tag.ExprList, 0, rhss)
+    return mkNode(p, Tag.Assign, int(op), [lhsList, rhsList])
+  }
+  return mkNode(p, Tag.ExprStmt, 0, [first])
+}
+
+function parseIfStmt(p: Parser): int {
+  advance(p)
+  expect(p, Kind.LParen)
+  let cond = parseExpr(p)
+  expect(p, Kind.RParen)
+  let thenBlk = parseBlock(p)
+  let elseBlk = 0
+  if (accept(p, Kind.KwElse)) {
+    if (peekKind(p) == Kind.KwIf) {
+      elseBlk = parseIfStmt(p)
+    } else {
+      elseBlk = parseBlock(p)
+    }
+  }
+  return mkNode(p, Tag.IfStmt, 0, [cond, thenBlk, elseBlk])
+}
+
+function parseWhileStmt(p: Parser): int {
+  advance(p)
+  expect(p, Kind.LParen)
+  let cond = parseExpr(p)
+  expect(p, Kind.RParen)
+  let body = parseBlock(p)
+  return mkNode(p, Tag.WhileStmt, 0, [cond, body])
+}
+
+// A `for..of`/`for..in` iterable has composite literals suppressed at its top
+// level (the `{` after it opens the loop body).
+function parseIterExpr(p: Parser): int {
+  let saved = p.noComposite
+  p.noComposite = true
+  let e = parseExpr(p)
+  p.noComposite = saved
+  return e
+}
+
+// `for ( init ; cond ; post ) block` — each clause optional.
+function parseForC(p: Parser): int {
+  expect(p, Kind.LParen)
+  let init = 0
+  let k = peekKind(p)
+  if (k == Kind.KwLet) {
+    init = parseValueDecl(p, Tag.LetDecl)
+  } else if (k == Kind.KwConst) {
+    init = parseValueDecl(p, Tag.ConstDecl)
+  } else if (k != Kind.Semicolon) {
+    init = parseSimpleStmt(p)
+  }
+  expect(p, Kind.Semicolon)
+  let cond = 0
+  if (peekKind(p) != Kind.Semicolon) {
+    cond = parseExpr(p)
+  }
+  expect(p, Kind.Semicolon)
+  let post = 0
+  if (peekKind(p) != Kind.RParen) {
+    post = parseSimpleStmt(p)
+  }
+  expect(p, Kind.RParen)
+  let body = parseBlock(p)
+  return mkNode(p, Tag.ForC, 0, [init, cond, post, body])
+}
+
+// `for x of iter`, `for x in iter`, `for (init; cond; post)`, or `for {}`. The
+// tuple binder form `for (k, v) of m` needs speculation and is a follow-up.
+function parseForStmt(p: Parser): int {
+  advance(p)
+  let k = peekKind(p)
+  if (k == Kind.LParen) {
+    return parseForC(p)
+  }
+  if (k == Kind.Ident) {
+    let name = leaf(p, Tag.Ident)
+    if (accept(p, Kind.KwOf)) {
+      let iter = parseIterExpr(p)
+      return mkNode(p, Tag.ForOf, 0, [name, iter, parseBlock(p)])
+    }
+    if (accept(p, Kind.KwIn)) {
+      let iter = parseIterExpr(p)
+      return mkNode(p, Tag.ForIn, 0, [name, iter, parseBlock(p)])
+    }
+    return mkNode(p, Tag.ForInf, 0, [parseBlock(p)])
+  }
+  return mkNode(p, Tag.ForInf, 0, [parseBlock(p)])
 }
 
 function parseStatement(p: Parser): int {
   let k = peekKind(p)
-  if (k == Kind.KwReturn) { return parseReturn(p) }
   if (k == Kind.KwLet) { return parseValueDecl(p, Tag.LetDecl) }
   if (k == Kind.KwConst) { return parseValueDecl(p, Tag.ConstDecl) }
-  return mkNode(p, Tag.ExprStmt, 0, [parseExpr(p)])
+  if (k == Kind.KwIf) { return parseIfStmt(p) }
+  if (k == Kind.KwWhile) { return parseWhileStmt(p) }
+  if (k == Kind.KwFor) { return parseForStmt(p) }
+  if (k == Kind.KwReturn) { return parseReturn(p) }
+  if (k == Kind.KwFail) {
+    advance(p)
+    return mkNode(p, Tag.FailStmt, 0, [parseExpr(p)])
+  }
+  if (k == Kind.KwBreak) {
+    advance(p)
+    return mkNode(p, Tag.BreakStmt, 0, []int(0))
+  }
+  if (k == Kind.KwContinue) {
+    advance(p)
+    return mkNode(p, Tag.ContinueStmt, 0, []int(0))
+  }
+  if (k == Kind.KwSpawn) {
+    advance(p)
+    return mkNode(p, Tag.SpawnStmt, 0, [parsePostfix(p)])
+  }
+  if (k == Kind.KwDefer) {
+    advance(p)
+    return mkNode(p, Tag.DeferStmt, 0, [parsePostfix(p)])
+  }
+  if (k == Kind.LBrace) { return parseBlock(p) }
+  return parseSimpleStmt(p)
 }
 
 function parseBlock(p: Parser): int {
