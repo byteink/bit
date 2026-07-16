@@ -64,6 +64,10 @@ struct Checker {
   // lowering), so a generic-enum scrutinee `o: Opt<i64>` can recover its type
   // arguments for match-binder substitution.
   declTypeNodes: map<string, int>,
+  // Named type -> its decl node, so a forward reference during declTypeOf can
+  // reserve+resolve it on first touch (the seed's declTypeOf recursion), giving
+  // type ids in source-order touch order (needed for method-name mangling).
+  typeDecls: map<string, int>,
 }
 
 // One generic-function instantiation: the generic's name and the concrete
@@ -85,7 +89,8 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     methodResults: map<string, int>{}, structFields: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
     typeParamConstraints: map<string, int>{}, methodSigs: map<string, int>{},
-    instantiations: []Instantiation(0), declTypeNodes: map<string, int>{} }
+    instantiations: []Instantiation(0), declTypeNodes: map<string, int>{},
+    typeDecls: map<string, int>{} }
 }
 
 // The enum type-args a variant construction `Enum.Variant(args)` binds, inferred
@@ -226,7 +231,8 @@ function methodSigLookup(c: Checker, key: string): int {
 
 // Builds a `(params) => result` func type from a params-list node (each kid a
 // `param[name, type]`), for a method value or a signature.
-function funcTypeFromParams(c: Checker, paramsNode: int, resultTy: int): int {
+// Interns a parameter list's types in source order, returning the id list.
+function paramTypeIds(c: Checker, paramsNode: int): []int {
   let ptypes = []int(0)
   let params = kidsOf(c.tree, paramsNode)
   let i = 0
@@ -234,7 +240,11 @@ function funcTypeFromParams(c: Checker, paramsNode: int, resultTy: int): int {
     ptypes = append(ptypes, typeFromNode(c, kidsOf(c.tree, params[i])[1]))
     i = i + 1
   }
-  return mkFunc(c.ctx, ptypes, false, resultTy)
+  return ptypes
+}
+
+function funcTypeFromParams(c: Checker, paramsNode: int, resultTy: int): int {
+  return mkFunc(c.ctx, paramTypeIds(c, paramsNode), false, resultTy)
 }
 
 // The type to resolve a method call against: a constrained type parameter `T`
@@ -551,7 +561,7 @@ function typeFromNode(c: Checker, node: int): int {
     if (name == "error") {
       return c.ctx.errorId
     }
-    return userTypeLookup(c, name)
+    return resolveNamed(c, name)
   }
   let kids = kidsOf(c.tree, node)
   if (tag == Tag.SliceType) {
@@ -573,7 +583,7 @@ function typeFromNode(c: Checker, node: int): int {
   // A generic instance `Name<...>` renders by its base name (the seed omits the
   // type arguments in --dump-types), so resolve to the base named type.
   if (tag == Tag.GenericInst) {
-    return userTypeLookup(c, typeNodeName(c, node))
+    return resolveNamed(c, typeNodeName(c, node))
   }
   // A fallible result `T!` / `T!E` — the error defaults to the `error` interface.
   if (tag == Tag.Fallible) {
@@ -1129,78 +1139,198 @@ function checkBinding(c: Checker, node: int) {
 
 // Walks every node and types the bindings. (arrow-param and call typing land
 // with expression inference; a flat arena walk catches bindings at any nesting.)
-function checkModule(c: Checker) {
-  // The predeclared `error` interface's method `message(): string` (§10.6), so
-  // `e.message()` on a caught error resolves like any interface method.
-  c.methodResults["error.message"] = primType(c.ctx, 11)
-  // Pre-pass 1: register every declared type, so later references (function
-  // results, annotations, composites) resolve regardless of order (§9). A
-  // generic type's parameters `<T>` are interned as distinct named types
-  // immediately after the type's own id — non-deduped, matching the seed's
-  // interning order so user-type ids line up (needed for method name mangling).
-  let t = 1
-  while (t < len(c.tree.nodes)) {
-    let n = getNode(c.tree, t)
-    let gen = 0
-    if (n.tag == Tag.StructDecl) {
-      registerNamedType(c, declName(c, t), TypeKind.Struct)
-      gen = kidsOf(c.tree, t)[1]
-    } else if (n.tag == Tag.EnumDecl) {
-      registerNamedType(c, declName(c, t), TypeKind.Enum)
-      gen = kidsOf(c.tree, t)[1]
+// Resolves a named-type reference, reserving+resolving it on first touch if it
+// is a not-yet-seen forward reference (the seed's declTypeOf recursion). After
+// the collect pass every named type is reserved, so this is a plain lookup.
+function resolveNamed(c: Checker, name: string): int {
+  let id = userTypeLookup(c, name)
+  if (id != 0) {
+    return id
+  }
+  if (c.typeDecls[name] != 0) {
+    return declTypeOf(c, name)
+  }
+  return 0
+}
+
+// Registers a `<T, U: Bound>` list: every param name first (each a distinct
+// named TypeParam), then each constraint interface — matching the seed's
+// buildOwnGenericEnv two-loop order so ids line up.
+function registerGenerics(c: Checker, genNode: int) {
+  if (genNode == 0) {
+    return
+  }
+  let ps = kidsOf(c.tree, genNode)
+  let i = 0
+  while (i < len(ps)) {
+    let nm = getNode(c.tree, kidsOf(c.tree, ps[i])[0])
+    // Each decl's type params are distinct ids (the seed's per-symbol
+    // typeParamId), even when two decls share a param name — reusing an id would
+    // undercount and shift a later named type. userTypes[name] is overwritten to
+    // this decl's param, which is correct: members resolve against the decl being
+    // built, and a template body's param id never reaches a dump (monomorphized).
+    registerNamedType(c, c.source[nm.span.start:nm.span.end], TypeKind.TypeParam)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(ps)) {
+    let gk = kidsOf(c.tree, ps[i])
+    if (gk[1] != 0) {
+      let cons = kidsOf(c.tree, gk[1])
+      if (len(cons) > 0) {
+        let nm = getNode(c.tree, gk[0])
+        c.typeParamConstraints[c.source[nm.span.start:nm.span.end]] = typeFromNode(c, cons[0])
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Resolves a struct's field types into `structFields` (interning each in field
+// order). An exported field is wrapped `export[field[name, type]]`.
+function resolveStructFields(c: Checker, node: int, sname: string) {
+  let fields = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let fi = 0
+  while (fi < len(fields)) {
+    let fld = fields[fi]
+    if (getNode(c.tree, fld).tag == Tag.Export) {
+      fld = kidsOf(c.tree, fld)[0]
+    }
+    let fk = kidsOf(c.tree, fld)
+    let fnn = getNode(c.tree, fk[0])
+    c.structFields[sname + "." + c.source[fnn.span.start:fnn.span.end]] = typeFromNode(c, fk[1])
+    fi = fi + 1
+  }
+}
+
+// Interns an enum's variant payload types (in variant then payload order) for
+// their id side effects — matching the seed's buildEnumTemplate. Variant info
+// itself is read from the decl node elsewhere, so nothing is recorded here.
+function resolveEnumPayloads(c: Checker, node: int) {
+  let vs = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let i = 0
+  while (i < len(vs)) {
+    let payload = kidsOf(c.tree, vs[i])[1]
+    if (payload != 0) {
+      let types = kidsOf(c.tree, payload)
+      let j = 0
+      while (j < len(types)) {
+        typeFromNode(c, types[j])
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Resolves an interface's method results into methodResults, interning each
+// sig's params (source order) then result — the seed's walk. The func-type sig
+// wrapper is deferred to buildSignatures (see collectFuncDecl).
+function resolveInterfaceSigs(c: Checker, node: int, iname: string) {
+  let sigs = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let mi = 0
+  while (mi < len(sigs)) {
+    let mk = kidsOf(c.tree, sigs[mi])
+    let mnn = getNode(c.tree, mk[0])
+    paramTypeIds(c, mk[1])
+    let mres = c.ctx.voidId
+    if (mk[2] != 0) {
+      mres = typeFromNode(c, mk[2])
+    }
+    c.methodResults[iname + "." + c.source[mnn.span.start:mnn.span.end]] = mres
+    mi = mi + 1
+  }
+}
+
+// The seed's declTypeOf: reserves `name`'s TypeId (memoized via userTypes
+// presence) BEFORE resolving its members, so members' composites/forward-named
+// refs intern after it (source touch order) and self/mutual references
+// terminate. An alias resolves transparently to its underlying (no reserved id).
+function declTypeOf(c: Checker, name: string): int {
+  let existing = userTypeLookup(c, name)
+  if (existing != 0) {
+    return existing
+  }
+  let node = c.typeDecls[name]
+  if (node == 0) {
+    return 0
+  }
+  let dn = getNode(c.tree, node)
+  let k = kidsOf(c.tree, node)
+  if (dn.tag == Tag.TypeAlias) {
+    let u = typeFromNode(c, k[2])
+    c.userTypes[name] = u
+    return u
+  }
+  let kind = TypeKind.Struct
+  if (dn.tag == Tag.EnumDecl) {
+    kind = TypeKind.Enum
+  } else if (dn.tag == Tag.InterfaceDecl) {
+    kind = TypeKind.Interface
+  }
+  registerNamedType(c, name, kind)
+  registerGenerics(c, k[1])
+  if (dn.tag == Tag.StructDecl) {
+    resolveStructFields(c, node, name)
+  } else if (dn.tag == Tag.EnumDecl) {
+    resolveEnumPayloads(c, node)
+  } else if (dn.tag == Tag.InterfaceDecl) {
+    resolveInterfaceSigs(c, node, name)
+  }
+  return userTypeLookup(c, name)
+}
+
+// The seed's collectFuncDecl: interns a function's signature composites in touch
+// order — generics, then params (source order), then result, then (for a method)
+// the receiver — and records its result + decl. The `(params)=>result` func-type
+// id itself is NOT minted here (the seed stores a FuncShape, not a TypeId, so a
+// sig wrapper would wrongly consume an id before later named types); it is built
+// afterward by buildSignatures.
+function collectFuncDecl(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [recv, name, generics, params, result, body]
+  registerGenerics(c, kids[2])
+  paramTypeIds(c, kids[3])
+  let rty = c.ctx.voidId
+  if (kids[4] != 0) {
+    rty = typeFromNode(c, kids[4])
+  }
+  let nm = getNode(c.tree, kids[1])
+  let fname = c.source[nm.span.start:nm.span.end]
+  if (kids[0] != 0) {
+    let recvType = typeNodeName(c, kidsOf(c.tree, kids[0])[1])
+    resolveNamed(c, recvType)
+    c.methodResults[recvType + "." + fname] = rty
+  } else {
+    c.funcResults[fname] = rty
+    c.funcDecls[fname] = node
+  }
+}
+
+// Builds the `(params)=>result` func-type id for every free function, method, and
+// interface method, filling funcSigs/methodSigs. Runs AFTER the collect pass so a
+// sig wrapper's id lands past every named type (the seed mints these lazily, at
+// the same relative position) — keeping named-type ids in touch order.
+function buildSignatures(c: Checker) {
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let n = getNode(c.tree, m)
+    if (n.tag == Tag.FuncDecl) {
+      let kids = kidsOf(c.tree, m)
+      let rty = c.ctx.voidId
+      if (kids[4] != 0) {
+        rty = typeFromNode(c, kids[4])
+      }
+      let sig = funcTypeFromParams(c, kids[3], rty)
+      let nm = getNode(c.tree, kids[1])
+      let fname = c.source[nm.span.start:nm.span.end]
+      if (kids[0] != 0) {
+        c.methodSigs[typeNodeName(c, kidsOf(c.tree, kids[0])[1]) + "." + fname] = sig
+      } else {
+        c.funcSigs[fname] = sig
+      }
     } else if (n.tag == Tag.InterfaceDecl) {
-      registerNamedType(c, declName(c, t), TypeKind.Interface)
-      gen = kidsOf(c.tree, t)[1]
-    }
-    if (gen != 0) {
-      let ps = kidsOf(c.tree, gen)
-      let pi = 0
-      while (pi < len(ps)) {
-        let pm = getNode(c.tree, kidsOf(c.tree, ps[pi])[0])
-        registerNamedType(c, c.source[pm.span.start:pm.span.end], TypeKind.TypeParam)
-        pi = pi + 1
-      }
-    }
-    t = t + 1
-  }
-  // Pre-pass 1a: a type alias `type Ids = map<string, int>` resolves
-  // transparently to its underlying type (rendered as the underlying, not the
-  // alias name), after struct/enum/interface names are registered so the
-  // aliased type resolves.
-  let ta = 1
-  while (ta < len(c.tree.nodes)) {
-    if (getNode(c.tree, ta).tag == Tag.TypeAlias) {
-      let ak = kidsOf(c.tree, ta)
-      let anm = getNode(c.tree, ak[0])
-      c.userTypes[c.source[anm.span.start:anm.span.end]] = typeFromNode(c, ak[2])
-    }
-    ta = ta + 1
-  }
-  // Pre-pass 1b: struct fields, now that every type name is registered (a field
-  // may reference a type declared later).
-  let s = 1
-  while (s < len(c.tree.nodes)) {
-    let sn = getNode(c.tree, s)
-    if (sn.tag == Tag.StructDecl) {
-      let sname = declName(c, s)
-      let fields = kidsOf(c.tree, kidsOf(c.tree, s)[2])
-      let fi = 0
-      while (fi < len(fields)) {
-        // An exported field is wrapped `export[field[name, type]]`; unwrap it.
-        let fld = fields[fi]
-        if (getNode(c.tree, fld).tag == Tag.Export) {
-          fld = kidsOf(c.tree, fld)[0]
-        }
-        let fk = kidsOf(c.tree, fld)
-        let fnn = getNode(c.tree, fk[0])
-        c.structFields[sname + "." + c.source[fnn.span.start:fnn.span.end]] = typeFromNode(c, fk[1])
-        fi = fi + 1
-      }
-    } else if (sn.tag == Tag.InterfaceDecl) {
-      // Interface method signatures share the method-result table, so a call on
-      // an interface value resolves like a concrete method.
-      let iname = declName(c, s)
-      let sigs = kidsOf(c.tree, kidsOf(c.tree, s)[2])
+      let iname = declName(c, m)
+      let sigs = kidsOf(c.tree, kidsOf(c.tree, m)[2])
       let mi = 0
       while (mi < len(sigs)) {
         let mk = kidsOf(c.tree, sigs[mi])
@@ -1209,72 +1339,49 @@ function checkModule(c: Checker) {
         if (mk[2] != 0) {
           mres = typeFromNode(c, mk[2])
         }
-        let mkey = iname + "." + c.source[mnn.span.start:mnn.span.end]
-        c.methodResults[mkey] = mres
-        c.methodSigs[mkey] = funcTypeFromParams(c, mk[1], mres)
+        c.methodSigs[iname + "." + c.source[mnn.span.start:mnn.span.end]] = funcTypeFromParams(c, mk[1], mres)
         mi = mi + 1
       }
     }
-    s = s + 1
+    m = m + 1
   }
-  // Pre-pass 1c: register every function's generic parameters `<T>` as named
-  // TypeParam types, so a `T` / `[]T` inside its body renders by that name
-  // (§10.5). Registered before pre-pass 2 so a `T` result resolves.
-  let g = 1
-  while (g < len(c.tree.nodes)) {
-    if (getNode(c.tree, g).tag == Tag.FuncDecl) {
-      let gp = kidsOf(c.tree, g)[2]
-      if (gp != 0) {
-        let ps = kidsOf(c.tree, gp)
-        let pi = 0
-        while (pi < len(ps)) {
-          let gk = kidsOf(c.tree, ps[pi])
-          let nm = getNode(c.tree, gk[0])
-          let tpname = c.source[nm.span.start:nm.span.end]
-          if (userTypeLookup(c, tpname) == 0) {
-            registerNamedType(c, tpname, TypeKind.TypeParam)
-          }
-          // Record the first constraint interface `T: Shape` for method lookup.
-          if (gk[1] != 0) {
-            let cons = kidsOf(c.tree, gk[1])
-            if (len(cons) > 0) {
-              c.typeParamConstraints[tpname] = typeFromNode(c, cons[0])
-            }
-          }
-          pi = pi + 1
-        }
-      }
+}
+
+function checkModule(c: Checker) {
+  // The predeclared `error` interface's method `message(): string` (§10.6), so
+  // `e.message()` on a caught error resolves like any interface method.
+  c.methodResults["error.message"] = primType(c.ctx, 11)
+  // Pre-scan: record every named type's decl node so a forward reference during
+  // the collect pass can reserve+resolve it on first touch (§9: order-independent
+  // top-level declarations).
+  let t = 1
+  while (t < len(c.tree.nodes)) {
+    let dt = getNode(c.tree, t).tag
+    if (dt == Tag.StructDecl || dt == Tag.EnumDecl || dt == Tag.InterfaceDecl || dt == Tag.TypeAlias) {
+      c.typeDecls[declName(c, t)] = t
     }
-    g = g + 1
+    t = t + 1
   }
-  // Pre-pass 2: every top-level function's declared result type (so a forward
-  // call resolves) and, for free functions, the full signature + decl node (for
-  // first-class references and generic substitution).
-  let f = 1
-  while (f < len(c.tree.nodes)) {
-    if (getNode(c.tree, f).tag == Tag.FuncDecl) {
-      let kids = kidsOf(c.tree, f)
-      let nm = getNode(c.tree, kids[1])
-      // An omitted result type is void `()` (§10.3).
-      let rty = c.ctx.voidId
-      if (kids[4] != 0) {
-        rty = typeFromNode(c, kids[4])
-      }
-      let fname = c.source[nm.span.start:nm.span.end]
-      // A method (non-none receiver) is keyed by its receiver type; a free
-      // function by its name.
-      if (kids[0] != 0) {
-        let recvType = typeNodeName(c, kidsOf(c.tree, kids[0])[1])
-        c.methodResults[recvType + "." + fname] = rty
-        c.methodSigs[recvType + "." + fname] = funcTypeFromParams(c, kids[3], rty)
-      } else {
-        c.funcResults[fname] = rty
-        c.funcDecls[fname] = f
-        c.funcSigs[fname] = funcTypeFromParams(c, kids[3], rty)
-      }
+  // Collect pass: assign type ids in the seed's source touch order. A top-level
+  // decl node's arena index falls between its own children and the next decl's,
+  // so ascending iteration visits decls in source order. A type decl reserves its
+  // id then resolves members inline (declTypeOf); a func decl interns its
+  // signature (collectFuncDecl). Composites dedup; forward-named refs reserve on
+  // first touch — reproducing the seed's declTypeOf/collectFuncDecl id order so
+  // method-name mangling `name$t{recvId}` lines up.
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let mt = getNode(c.tree, m).tag
+    if (mt == Tag.StructDecl || mt == Tag.EnumDecl || mt == Tag.InterfaceDecl || mt == Tag.TypeAlias) {
+      declTypeOf(c, declName(c, m))
+    } else if (mt == Tag.FuncDecl) {
+      collectFuncDecl(c, m)
     }
-    f = f + 1
+    m = m + 1
   }
+  // After every named/composite id is fixed, build the func-type sig wrappers
+  // (their ids land past all named types, so they never perturb touch order).
+  buildSignatures(c)
   // Pre-pass 3: type params and for-of loop binders into env before the main
   // sweep. A loop header sits *after* its body in arena order, so typing binders
   // in the main sweep would be too late; params precede their loops, so this
