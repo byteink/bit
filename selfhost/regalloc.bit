@@ -1,0 +1,384 @@
+// Self-host Stage 3 (#1340 support): linear-scan register allocator, ported from
+// compiler/regalloc.zig — shared by both arch backends. Classic Poletto & Sarkar
+// (1999) linear scan, chosen over graph coloring for its linear-time bound and
+// simplicity.
+//
+// ponytail: linear scan, graph coloring if generated code quality becomes the
+// bottleneck.
+//
+// The allocator is fully abstract: it knows nothing about x86-64 or ARM64, SysV
+// or AAPCS64, or the IR's instruction encoding. It consumes a target-supplied
+// register file description (TargetRegs) and a flat array of live intervals, and
+// produces a register/spill-slot assignment plus, for every safepoint the caller
+// names, the set of live GC references at that exact program point
+// (runtime/ABI.md §4's stack maps).
+//
+// ## Program points
+//
+// Callers number positions themselves — any monotonically increasing position
+// per instruction works (codegen typically reuses the IR's own instruction
+// index). An interval [start, end] is inclusive on both ends: `start` is the
+// defining position, `end` the last position the value is read at. A safepoint
+// is just a position in that same numbering (call sites, loop back-edges per
+// runtime/ABI.md §5); a value is live at a safepoint iff its interval contains
+// it.
+//
+// ## One interval per vreg, dense numbering
+//
+// `LiveInterval.vreg` values must be exactly 0..len(intervals), each appearing
+// once — one live range per SSA value, mirroring the IR's own "instruction index
+// == value id" house style. This lets the result array be indexed directly by
+// vreg, no lookup table. Violating this is a caller bug (asserted).
+//
+// ## GC stack maps
+//
+// Only Int-class values can be references (runtime/ABI.md §3: a reference is one
+// pointer-sized value; floats never hold one) — `isRef` on a Float interval is a
+// caller bug, asserted against. For each requested safepoint, `allocate` records
+// which physical registers and which spill slots hold a live reference at that
+// position; codegen turns that into the per-callsite table the GC's root scanner
+// walks.
+
+// One physical register file (e.g. the target's GPRs or FPRs), fully abstract —
+// the allocator never hardcodes a real machine register name.
+struct RegFile {
+  // Number of allocatable registers in this class, indices 0..count. Backends
+  // map indices to real registers and exclude any reserved register
+  // (stack/frame pointer, etc.) by leaving it out of `count` entirely.
+  count: int,
+  // Bit i set means register i is callee-saved. Informative only — this
+  // allocator runs no call-crossing preference pass; it is exposed so codegen
+  // can decide caller-save spill/reload policy around call sites independent of
+  // which vreg landed where.
+  calleeSaved: int,
+}
+
+struct TargetRegs {
+  intRegs: RegFile,
+  floatRegs: RegFile,
+}
+
+function regFileFor(t: TargetRegs, class: RegClass): RegFile {
+  if (class == RegClass.Int) {
+    return t.intRegs
+  }
+  return t.floatRegs
+}
+
+struct LiveInterval {
+  vreg: int,
+  class: RegClass,
+  start: int,
+  end: int,
+  // True if this vreg holds a live GC reference. Only valid on class == Int.
+  isRef: bool,
+}
+
+// Where a vreg lives. Bit has no tagged union: `isSpill` selects whether `index`
+// names a physical register or a spill slot.
+struct RegLoc {
+  isSpill: bool,
+  index: int,
+}
+
+struct StackMapEntry {
+  pos: int,
+  // Physical (int-class) register indices holding a live reference at `pos`.
+  regs: []int,
+  // Spill slot indices holding a live reference at `pos`.
+  slots: []int,
+}
+
+struct RegAllocResult {
+  // Indexed by vreg — see the dense-numbering note above.
+  locations: []RegLoc,
+  // Total distinct stack slots used; codegen sizes the spill area to
+  // numSpillSlots * slotWidth (slots are one flat, class-agnostic space).
+  numSpillSlots: int,
+  // One entry per input safepoint, in the order given to `allocate`.
+  stackMaps: []StackMapEntry,
+}
+
+struct ActiveEntry {
+  idx: int,
+  reg: int,
+}
+
+// Per-class linear-scan state: which registers are free, and the active set
+// (intervals currently holding a register), kept sorted ascending by end point
+// exactly as Poletto & Sarkar's algorithm requires. `active`'s backing buffer is
+// fixed at `count` slots — the active set can never exceed the register count,
+// since reaching `count` forces a spill instead of a new admission (Power of 10:
+// no unbounded growth after startup).
+struct ClassState {
+  regFile: RegFile,
+  active: []ActiveEntry,
+  len: int,
+  used: []bool,
+}
+
+function newClassState(f: RegFile): ClassState {
+  let active = []ActiveEntry(0)
+  let used = []bool(0)
+  let i = 0
+  while (i < f.count) {
+    active = append(active, ActiveEntry{ idx: 0, reg: 0 })
+    used = append(used, false)
+    i = i + 1
+  }
+  return ClassState{ regFile: f, active: active, len: 0, used: used }
+}
+
+// ExpireOldIntervals: frees the register of every active interval whose end
+// precedes `start`. active[0..len] is sorted ascending by end, so expired
+// entries are always a prefix — bounded by `len`.
+function expireClass(s: ClassState, intervals: []LiveInterval, start: int) {
+  let keepFrom = 0
+  while (keepFrom < s.len && intervals[s.active[keepFrom].idx].end < start) {
+    s.used[s.active[keepFrom].reg] = false
+    keepFrom = keepFrom + 1
+  }
+  if (keepFrom == 0) {
+    return
+  }
+  let remaining = s.len - keepFrom
+  let i = 0
+  while (i < remaining) {
+    s.active[i] = s.active[keepFrom + i]
+    i = i + 1
+  }
+  s.len = remaining
+}
+
+// Inserts `entry` keeping active[0..len] sorted ascending by end point (bounded:
+// at most `count` shifts).
+function insertActive(s: ClassState, intervals: []LiveInterval, entry: ActiveEntry) {
+  assert(s.len < len(s.active))
+  let end = intervals[entry.idx].end
+  let pos = s.len
+  while (pos > 0 && intervals[s.active[pos - 1].idx].end > end) {
+    s.active[pos] = s.active[pos - 1]
+    pos = pos - 1
+  }
+  s.active[pos] = entry
+  s.len = s.len + 1
+}
+
+// Only called when len < count, so a free register always exists — the scan is
+// bounded by `count`.
+function firstFreeReg(s: ClassState): int {
+  let r = 0
+  while (r < len(s.used)) {
+    if (!s.used[r]) {
+      return r
+    }
+    r = r + 1
+  }
+  assert(false) // unreachable: the caller checked len < count
+  return 0
+}
+
+struct SpillEntry {
+  idx: int,
+  slot: int,
+}
+
+// Spill slots are one flat, class-agnostic stack space (both Int and Float
+// spills draw from the same numbering) — codegen already sizes every slot
+// uniformly (8 bytes covers i64/u64/f64/pointers per runtime/ABI.md §1's
+// alignment rules), so splitting the space per class would only fragment the
+// frame for no benefit. Mirrors ClassState's expire/insert shape, but slots are
+// reused via a free list rather than a fixed-capacity buffer — the frame has no
+// fixed size to allocate against up front.
+struct SpillPool {
+  active: []SpillEntry,
+  freeSlots: []int,
+  next: int,
+}
+
+function newSpillPool(): SpillPool {
+  return SpillPool{ active: []SpillEntry(0), freeSlots: []int(0), next: 0 }
+}
+
+function expireSpills(p: SpillPool, intervals: []LiveInterval, start: int) {
+  let keepFrom = 0
+  while (keepFrom < len(p.active) && intervals[p.active[keepFrom].idx].end < start) {
+    p.freeSlots = append(p.freeSlots, p.active[keepFrom].slot)
+    keepFrom = keepFrom + 1
+  }
+  if (keepFrom == 0) {
+    return
+  }
+  p.active = p.active[keepFrom:len(p.active)]
+}
+
+// Assigns a stack slot to interval `idx`. `reuse` controls whether a recycled
+// slot (from the free list) may be handed out or a fresh one must be minted.
+//
+// Recycling is sound ONLY when intervals are assigned in nondecreasing start
+// order: a freed slot's last occupant ended before the current scan position
+// (expireSpills frees on end < start), so it cannot overlap an interval starting
+// at or after that position. The main-loop spill path satisfies this — it spills
+// the interval currently being processed, whose start IS the scan frontier — so
+// it passes reuse = true.
+//
+// The eviction path does NOT: it spills an interval that has been
+// register-resident since before the frontier, so in the single-location model
+// its slot is live for its whole [start, end], reaching back before the
+// frontier. A recycled slot may have been occupied during that backward span
+// (its occupant ended before the frontier yet still overlaps the evicted
+// interval), which is exactly the aliasing that corrupts a live value. So
+// eviction passes reuse = false to force a fresh slot, which is unused across
+// all time until it is itself freed post-end.
+function assignSpill(p: SpillPool, intervals: []LiveInterval, idx: int, reuse: bool): int {
+  let slot = -1
+  if (reuse && len(p.freeSlots) > 0) {
+    slot = p.freeSlots[len(p.freeSlots) - 1]
+    p.freeSlots = p.freeSlots[0:len(p.freeSlots) - 1]
+  } else {
+    slot = p.next
+    p.next = p.next + 1
+  }
+  let end = intervals[idx].end
+  let pos = 0
+  while (pos < len(p.active) && intervals[p.active[pos].idx].end <= end) {
+    pos = pos + 1
+  }
+  // Insert at `pos`, keeping the active list sorted ascending by end.
+  let out = []SpillEntry(0)
+  let i = 0
+  while (i < pos) {
+    out = append(out, p.active[i])
+    i = i + 1
+  }
+  out = append(out, SpillEntry{ idx: idx, slot: slot })
+  while (i < len(p.active)) {
+    out = append(out, p.active[i])
+    i = i + 1
+  }
+  p.active = out
+  return slot
+}
+
+// Interval scan order: ascending start, with the vreg as a deterministic
+// tiebreak. Insertion sort — a function's interval count is small and bounded.
+function orderByStart(intervals: []LiveInterval): []int {
+  let order = []int(0)
+  let i = 0
+  while (i < len(intervals)) {
+    let pos = len(order)
+    order = append(order, i)
+    while (pos > 0) {
+      let a = intervals[order[pos - 1]]
+      let b = intervals[i]
+      let after = a.start > b.start || a.start == b.start && a.vreg > b.vreg
+      if (!after) {
+        pos = 0
+        continue
+      }
+      order[pos] = order[pos - 1]
+      order[pos - 1] = i
+      pos = pos - 1
+    }
+    i = i + 1
+  }
+  return order
+}
+
+// Runs linear-scan register allocation over `intervals` for `target`, then
+// derives a GC stack map for each position in `safepoints`.
+function allocate(target: TargetRegs, intervals: []LiveInterval, safepoints: []int): RegAllocResult {
+  let n = len(intervals)
+  // Validate the caller's dense-vreg contract — an internal-caller invariant,
+  // asserted rather than surfaced as an error.
+  let seen = []bool(0)
+  let i = 0
+  while (i < n) {
+    seen = append(seen, false)
+    i = i + 1
+  }
+  i = 0
+  while (i < n) {
+    let iv = intervals[i]
+    assert(iv.vreg >= 0 && iv.vreg < n)
+    assert(!seen[iv.vreg])
+    seen[iv.vreg] = true
+    assert(iv.start <= iv.end)
+    assert(iv.class == RegClass.Int || !iv.isRef)
+    i = i + 1
+  }
+
+  let locations = []RegLoc(0)
+  i = 0
+  while (i < n) {
+    locations = append(locations, RegLoc{ isSpill: false, index: 0 })
+    i = i + 1
+  }
+
+  let intState = newClassState(target.intRegs)
+  let floatState = newClassState(target.floatRegs)
+  let spills = newSpillPool()
+  let order = orderByStart(intervals)
+
+  let oi = 0
+  while (oi < len(order)) {
+    let idx = order[oi]
+    let iv = intervals[idx]
+    let state = floatState
+    if (iv.class == RegClass.Int) {
+      state = intState
+    }
+    expireClass(state, intervals, iv.start)
+    expireSpills(spills, intervals, iv.start)
+
+    if (state.len < state.regFile.count) {
+      let reg = firstFreeReg(state)
+      state.used[reg] = true
+      locations[iv.vreg] = RegLoc{ isSpill: false, index: reg }
+      insertActive(state, intervals, ActiveEntry{ idx: idx, reg: reg })
+    } else if (state.len == 0 || intervals[state.active[state.len - 1].idx].end <= iv.end) {
+      // Nothing active is worth evicting (either the class has no registers at
+      // all, or `iv` itself has the furthest end) — Poletto & Sarkar's
+      // SpillAtInterval "else" branch. `iv` is the interval being processed, so
+      // its start is the scan frontier and recycling a freed slot is sound.
+      locations[iv.vreg] = RegLoc{ isSpill: true, index: assignSpill(spills, intervals, idx, true) }
+    } else {
+      // Evict the active interval with the furthest end and hand its register to
+      // `iv` — SpillAtInterval's "if" branch. The evicted interval started before
+      // the frontier, so it must get a fresh slot, never a recycled one.
+      let evicted = state.active[state.len - 1]
+      state.len = state.len - 1
+      let slot = assignSpill(spills, intervals, evicted.idx, false)
+      locations[intervals[evicted.idx].vreg] = RegLoc{ isSpill: true, index: slot }
+      locations[iv.vreg] = RegLoc{ isSpill: false, index: evicted.reg }
+      insertActive(state, intervals, ActiveEntry{ idx: idx, reg: evicted.reg })
+    }
+    oi = oi + 1
+  }
+
+  // Bounded by len(safepoints) * len(intervals) — both function-local, finite.
+  let stackMaps = []StackMapEntry(0)
+  let si = 0
+  while (si < len(safepoints)) {
+    let pos = safepoints[si]
+    let regs = []int(0)
+    let slots = []int(0)
+    i = 0
+    while (i < n) {
+      let iv = intervals[i]
+      if (iv.isRef && iv.start <= pos && iv.end >= pos) {
+        let loc = locations[iv.vreg]
+        if (loc.isSpill) {
+          slots = append(slots, loc.index)
+        } else {
+          regs = append(regs, loc.index)
+        }
+      }
+      i = i + 1
+    }
+    stackMaps = append(stackMaps, StackMapEntry{ pos: pos, regs: regs, slots: slots })
+    si = si + 1
+  }
+
+  return RegAllocResult{ locations: locations, numSpillSlots: spills.next, stackMaps: stackMaps }
+}

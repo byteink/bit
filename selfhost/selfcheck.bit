@@ -443,7 +443,122 @@ function checkCodegenCore() {
   assert(int(out.bytes[20]) == 248 && int(out.bytes[23]) == 255)
 }
 
+function mkIv(vreg: int, class: RegClass, start: int, end: int, isRef: bool): LiveInterval {
+  return LiveInterval{ vreg: vreg, class: class, start: start, end: end, isRef: isRef }
+}
+
+function mkRegs(intCount: int, floatCount: int): TargetRegs {
+  return TargetRegs{ intRegs: RegFile{ count: intCount, calleeSaved: 0 },
+    floatRegs: RegFile{ count: floatCount, calleeSaved: 0 } }
+}
+
+// The allocator's core correctness invariant: no two intervals whose ranges
+// overlap were assigned the same physical register within the same class.
+function assertNoOverlappingRegs(intervals: []LiveInterval, locations: []RegLoc) {
+  let i = 0
+  while (i < len(intervals)) {
+    let a = intervals[i]
+    let locA = locations[a.vreg]
+    if (locA.isSpill) {
+      i = i + 1
+      continue
+    }
+    let j = i + 1
+    while (j < len(intervals)) {
+      let b = intervals[j]
+      let locB = locations[b.vreg]
+      if (a.class == b.class && !locB.isSpill && locA.index == locB.index) {
+        assert(!(a.start <= b.end && b.start <= a.end))
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+// Stage 3 linear-scan register allocator — ports regalloc.zig's own tests.
+function checkRegalloc() {
+  // Non-overlapping intervals share a register (reused after expiry).
+  let ivs = [mkIv(0, RegClass.Int, 0, 2, false), mkIv(1, RegClass.Int, 3, 5, false)]
+  let r = allocate(mkRegs(2, 0), ivs, []int(0))
+  assert(!r.locations[0].isSpill && r.locations[0].index == 0)
+  assert(!r.locations[1].isSpill && r.locations[1].index == 0)
+  assert(r.numSpillSlots == 0)
+  assertNoOverlappingRegs(ivs, r.locations)
+
+  // Out of registers: the interval with the furthest end spills.
+  let ivs2 = [mkIv(0, RegClass.Int, 0, 4, false), mkIv(1, RegClass.Int, 1, 10, false)]
+  let r2 = allocate(mkRegs(1, 0), ivs2, []int(0))
+  assert(!r2.locations[0].isSpill && r2.locations[0].index == 0)
+  assert(r2.locations[1].isSpill && r2.locations[1].index == 0)
+  assert(r2.numSpillSlots == 1)
+  assertNoOverlappingRegs(ivs2, r2.locations)
+
+  // A freed spill slot is recycled: v1's slot frees at 6, so v3 (starting at 9)
+  // reuses it instead of growing the frame.
+  let ivs3 = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 1, 6, false),
+    mkIv(2, RegClass.Int, 7, 12, false), mkIv(3, RegClass.Int, 9, 15, false)]
+  let r3 = allocate(mkRegs(1, 0), ivs3, []int(0))
+  assert(!r3.locations[0].isSpill && r3.locations[0].index == 0)
+  assert(r3.locations[1].isSpill && r3.locations[1].index == 0)
+  assert(!r3.locations[2].isSpill && r3.locations[2].index == 0)
+  assert(r3.locations[3].isSpill && r3.locations[3].index == 0)
+  assert(r3.numSpillSlots == 1)
+  assertNoOverlappingRegs(ivs3, r3.locations)
+
+  // Int and float classes are independent register files.
+  let ivs4 = [mkIv(0, RegClass.Int, 0, 10, false), mkIv(1, RegClass.Float, 0, 10, false)]
+  let r4 = allocate(mkRegs(1, 1), ivs4, []int(0))
+  assert(!r4.locations[0].isSpill && r4.locations[0].index == 0)
+  assert(!r4.locations[1].isSpill && r4.locations[1].index == 0)
+  assert(r4.numSpillSlots == 0)
+
+  // A precise GC stack map: only v0 (a live ref spanning the safepoint) is
+  // reported — not v1 (not a ref) or v2 (dead by pos 5).
+  let ivs5 = [mkIv(0, RegClass.Int, 0, 10, true), mkIv(1, RegClass.Int, 0, 10, false),
+    mkIv(2, RegClass.Int, 0, 3, true)]
+  let r5 = allocate(mkRegs(2, 0), ivs5, [5])
+  assert(len(r5.stackMaps) == 1)
+  assert(r5.stackMaps[0].pos == 5)
+  assert(len(r5.stackMaps[0].slots) == 0)
+  assert(len(r5.stackMaps[0].regs) == 1)
+  assert(r5.stackMaps[0].regs[0] == r5.locations[0].index)
+
+  // A spilled reference is reported by slot, not register.
+  let ivs6 = [mkIv(0, RegClass.Int, 0, 5, false), mkIv(1, RegClass.Int, 1, 20, true)]
+  let r6 = allocate(mkRegs(1, 0), ivs6, [10])
+  assert(r6.locations[1].isSpill)
+  assert(len(r6.stackMaps[0].regs) == 0)
+  assert(len(r6.stackMaps[0].slots) == 1)
+  assert(r6.stackMaps[0].slots[0] == r6.locations[1].index)
+
+  // Forced register pressure (cap of 4): four long-lived loop-carried values
+  // already saturate the file, with 20 overlapping temporaries layered on top.
+  // Registers must never overlap and spills must happen.
+  let stress = []LiveInterval(0)
+  let v = 0
+  while (v < 4) {
+    stress = append(stress, mkIv(v, RegClass.Int, 0, 200, v == 0))
+    v = v + 1
+  }
+  let t = 0
+  while (t < 20) {
+    stress = append(stress, mkIv(v, RegClass.Int, t * 5, t * 5 + 40, false))
+    v = v + 1
+    t = t + 1
+  }
+  let r7 = allocate(mkRegs(4, 0), stress, [100, 150])
+  assertNoOverlappingRegs(stress, r7.locations)
+  assert(r7.numSpillSlots > 0)
+  let k = 0
+  while (k < len(r7.stackMaps)) {
+    assert(len(r7.stackMaps[k].regs) + len(r7.stackMaps[k].slots) <= 1)
+    k = k + 1
+  }
+}
+
 function selfcheck() {
+  checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
   checkIrDump()
