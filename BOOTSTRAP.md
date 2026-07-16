@@ -60,9 +60,25 @@ zig build selfhost     # seed bitc builds selfhost/ → zig-out/bin/bitc2
 
 ## Current state
 
-**Stage 0 — scaffold (this file + `selfhost/`).** `bitc2` is a stub driver that
-only proves the seed builds and runs a `selfhost/` project (multi-file module +
-prelude). The differential dump modes (`--dump-tokens/-ast/-types/-ir`) and their
-golden directives exist on the seed and are the substrate the ports diff against.
-The real subsystems land per the epic, each one filling in a `selfhost/` module
+**Stage 1 — front-end, in progress.** The lexer, AST arena, parser, and the
+diagnostic renderer are ported (`selfhost/{lexer,ast,parser,diagnostics}.bit`)
+and `bitc2` drives them via `--dump-tokens`, `--dump-ast`, and `--dump-diags`.
+Against the seed over the whole corpus:
+
+| Surface | Script | Result |
+|---------|--------|--------|
+| tokens | `scripts/selfhost-difftokens.sh` | 326/0 byte-identical (1 lex-error skip) |
+| AST | `scripts/selfhost-diffast.sh` | 325/0 byte-identical (2 front-end-error skips) |
+| diagnostics | `scripts/selfhost-diffdiags.sh` | 327/0 byte-identical (incl. the 2 `// error` cases) |
+
+Front-end `// error` parity holds for the corpus: E0001 (stray byte) and E0021
+(expected token) render byte-for-byte. **Remaining for the #363 gate:** fuzz
+accept/reject + codes/spans parity, which needs the formal differential harness
+(#1332) as its verification surface, and with it the lexer's E0002–E0006 and the
+parser's general `expect`-site diagnostics (with a speculation guard). Those are
+emitted against that harness rather than blind.
+
+The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
+the substrate every stage diffs against. Stage 2 (resolve/check/lower/opt) and
+Stage 3 (codegen/link) land per the epic, each filling in a `selfhost/` module
 and turning its gate green.
