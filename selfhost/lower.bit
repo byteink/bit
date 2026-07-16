@@ -684,6 +684,17 @@ function lowerCall(fc: FnCtx, node: int): int {
   if (cn.tag == Tag.ChanType) {
     return lowerChanMake(fc, node)
   }
+  // A call whose callee is `Enum.Variant` constructs a payload-carrying variant.
+  if (cn.tag == Tag.Member) {
+    let mk0 = kidsOf(fc.c.tree, callee)
+    let baseName = typeNodeName(fc.c, mk0[0])
+    if (baseName != "") {
+      let ut = userTypeLookup(fc.c, baseName)
+      if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum) {
+        return lowerVariantConstruction(fc, node)
+      }
+    }
+  }
   // A method call `recv.method(...)` on an interface value dispatches dynamically
   // via call_iface, using the method's stable dispatch index.
   if (cn.tag == Tag.Member) {
@@ -838,6 +849,112 @@ function enumIsBoxed(c: Checker, enumName: string): bool {
     i = i + 1
   }
   return false
+}
+
+// The resolved payload types of a variant (empty when it has none). The payload
+// is `enum_variant`'s kid 1, a `type_list` of type nodes.
+function variantPayloadTypes(c: Checker, enumName: string, variantName: string): []int {
+  let out = []int(0)
+  let decl = enumDeclByName(c, enumName)
+  if (decl == 0) {
+    return out
+  }
+  let vs = enumVariantNodes(c, decl)
+  let i = 0
+  while (i < len(vs)) {
+    let vn = getNode(c.tree, kidsOf(c.tree, vs[i])[0])
+    if (c.source[vn.span.start:vn.span.end] == variantName) {
+      let payload = kidsOf(c.tree, vs[i])[1]
+      if (payload == 0) {
+        return out
+      }
+      let types = kidsOf(c.tree, payload)
+      let j = 0
+      while (j < len(types)) {
+        out = append(out, typeFromNode(c, types[j]))
+        j = j + 1
+      }
+      return out
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Builds a boxed enum object `{ tag: i64 @0, payloadPtr @8 }` (16 bytes, the
+// payload pointer at offset 8 is the one GC-traced word; nil for a no-payload
+// variant). `payload` is 0 for none.
+function buildEnumObj(fc: FnCtx, enumTy: int, tag: int, payload: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let ga = mkInstr(Op.GcAlloc, enumTy)
+  ga.ival = 16
+  ga.offsets = [8]
+  let obj = builderEmit(fc.b, ga)
+  let tc = mkInstr(Op.ConstInt, i64ty)
+  tc.ival = tag
+  let fs0 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs0.lhs = obj
+  fs0.ival = 0
+  fs0.rhs = builderEmit(fc.b, tc)
+  builderEmit(fc.b, fs0)
+  let payV = payload
+  if (payload == 0) {
+    let z = mkInstr(Op.ConstInt, i64ty)
+    payV = builderEmit(fc.b, z)
+  }
+  let fs8 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs8.lhs = obj
+  fs8.ival = 8
+  fs8.rhs = payV
+  builderEmit(fc.b, fs8)
+  return obj
+}
+
+// Lowers `Enum.Variant(args)` for a boxed enum: allocate the payload box (word i
+// = arg i, GC-tracing its ref words), then wrap it in the enum object. A
+// no-payload variant construction is just the wrapped nil.
+function lowerVariantConstruction(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let enumTy = checkExprType(fc.c, k[0])
+  let enumName = typeName(fc.c.ctx, enumTy)
+  let mn = getNode(fc.c.tree, kidsOf(fc.c.tree, k[0])[1])
+  let vname = fc.c.source[mn.span.start:mn.span.end]
+  let tag = variantOrdinal(fc.c, enumName, vname)
+  let payloadTypes = variantPayloadTypes(fc.c, enumName, vname)
+  let box = 0
+  if (len(payloadTypes) > 0) {
+    let offs = []int(0)
+    let i = 0
+    while (i < len(payloadTypes)) {
+      if (fieldLayoutFor(fc, payloadTypes[i]).isPtr) {
+        offs = append(offs, 8 * i)
+      }
+      i = i + 1
+    }
+    let ga = mkInstr(Op.GcAlloc, enumTy)
+    ga.ival = 8 * len(payloadTypes)
+    ga.offsets = offs
+    box = builderEmit(fc.b, ga)
+    let args = kidsOf(fc.c.tree, k[2])
+    let j = 0
+    while (j < len(args) && !fc.failed) {
+      let a = args[j]
+      if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+        a = kidsOf(fc.c.tree, a)[0]
+      }
+      let av = lowerExprH(fc, a, payloadTypes[j])
+      if (fc.failed) {
+        return 0
+      }
+      let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+      fs.lhs = box
+      fs.ival = 8 * j
+      fs.rhs = av
+      builderEmit(fc.b, fs)
+      j = j + 1
+    }
+  }
+  return buildEnumObj(fc, enumTy, tag, box)
 }
 
 // A struct declaration's field nodes in order (unwrapping exported fields).
@@ -1220,15 +1337,19 @@ function lowerCompositeLit(fc: FnCtx, node: int): int {
 function lowerFieldAccess(fc: FnCtx, node: int): int {
   let kids = kidsOf(fc.c.tree, node)
   // `Enum.Variant` (receiver is an enum type name): a C-like enum's variant is
-  // its bare tag `const_int <Enum> <ordinal>`. ponytail: boxed (payload) enums
-  // deferred — `Enum.Variant(args)` construction routes through lowerCall.
+  // its bare tag `const_int <Enum> <ordinal>`; a boxed enum's no-payload variant
+  // wraps that tag in the `{tag, nil}` object.
   let baseName = typeNodeName(fc.c, kids[0])
   if (baseName != "") {
     let ut = userTypeLookup(fc.c, baseName)
-    if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum && !enumIsBoxed(fc.c, baseName)) {
+    if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum) {
       let mn0 = getNode(fc.c.tree, kids[1])
+      let ord = variantOrdinal(fc.c, baseName, fc.c.source[mn0.span.start:mn0.span.end])
+      if (enumIsBoxed(fc.c, baseName)) {
+        return buildEnumObj(fc, ut, ord, 0)
+      }
       let ci = mkInstr(Op.ConstInt, ut)
-      ci.ival = variantOrdinal(fc.c, baseName, fc.c.source[mn0.span.start:mn0.span.end])
+      ci.ival = ord
       return builderEmit(fc.b, ci)
     }
   }
@@ -1992,8 +2113,66 @@ function lowerArmBody(fc: FnCtx, body: int) {
 
 // Lowers one match-statement arm's body in the current block; on a non-diverging
 // arm, carries the live locals to `join`. Returns whether the join is reached.
-function lowerMatchArm(fc: FnCtx, arm: int, preLen: int, join: int): bool {
+// The scrutinee tag: a boxed enum's tag is word 0 of the object (i64); a C-like
+// enum's value IS its tag.
+function matchTag(fc: FnCtx, subject: int, subjectTy: int, boxed: bool): int {
+  if (!boxed) {
+    return subject
+  }
+  let fg = mkInstr(Op.FieldGet, primType(fc.c.ctx, 3))
+  fg.lhs = subject
+  fg.ival = 0
+  return builderEmit(fc.b, fg)
+}
+
+// The tag type used for the arm comparison: i64 for boxed, the enum type for
+// C-like (so the compare operands share a type).
+function tagType(fc: FnCtx, subjectTy: int, boxed: bool): int {
+  if (boxed) {
+    return primType(fc.c.ctx, 3)
+  }
+  return subjectTy
+}
+
+// Binds a boxed variant arm's payload `V(a, b) =>`: word i of the box (object
+// word 8) into binder i. No-op for a C-like enum or a no-binder arm.
+function bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumName: string, subject: int) {
+  if (!boxed) {
+    return
+  }
+  let vp = kidsOf(fc.c.tree, kidsOf(fc.c.tree, arm)[0])
+  if (vp[1] == 0) {
+    return
+  }
+  let vn = getNode(fc.c.tree, vp[0])
+  let ptypes = variantPayloadTypes(fc.c, enumName, fc.c.source[vn.span.start:vn.span.end])
+  let binders = kidsOf(fc.c.tree, vp[1])
+  let box = mkInstr(Op.FieldGet, primType(fc.c.ctx, 3))
+  box.lhs = subject
+  box.ival = 8
+  let boxV = builderEmit(fc.b, box)
+  let i = 0
+  while (i < len(binders)) {
+    let bty = primType(fc.c.ctx, 3)
+    if (i < len(ptypes)) {
+      bty = ptypes[i]
+    }
+    let fg = mkInstr(Op.FieldGet, bty)
+    fg.lhs = boxV
+    fg.ival = 8 * i
+    let bn = getNode(fc.c.tree, binders[i])
+    let bname = fc.c.source[bn.span.start:bn.span.end]
+    declareLocal(fc, bname, builderEmit(fc.b, fg), bty)
+    // Keep the checker env consistent so `checkExprType` types the binder during
+    // lowering (see lowerFunc).
+    fc.c.env[bname] = bty
+    i = i + 1
+  }
+}
+
+function lowerMatchArm(fc: FnCtx, arm: int, preLen: int, join: int, boxed: bool, enumName: string, subject: int): bool {
   let ak = kidsOf(fc.c.tree, arm)
+  bindArmPayload(fc, arm, boxed, enumName, subject)
   lowerArmBody(fc, ak[1])
   if (fc.failed) {
     return false
@@ -2005,11 +2184,11 @@ function lowerMatchArm(fc: FnCtx, arm: int, preLen: int, join: int): bool {
   return false
 }
 
-// Lowers a `match (subject) { V => body, ... }` statement over a C-like enum to a
-// decision tree: each arm but the last tests `subject == <tag>` and branches to
+// Lowers a `match (subject) { V => body, ... }` statement over an enum to a
+// decision tree: each arm but the last tests `tag == <ordinal>` and branches to
 // its body or the next test; the last arm is the exhaustive fallthrough. A `join`
-// block merges the non-diverging arms (unreachable if every arm diverges).
-// ponytail: boxed (payload) enums deferred.
+// block merges the non-diverging arms (unreachable if every arm diverges). A
+// boxed enum's tag is object word 0 and its arms bind the payload.
 function lowerMatch(fc: FnCtx, node: int) {
   let k = kidsOf(fc.c.tree, node)
   let subjectTy = defaultType(fc.c, checkExprType(fc.c, k[0]))
@@ -2018,10 +2197,7 @@ function lowerMatch(fc: FnCtx, node: int) {
     return
   }
   let enumName = typeName(fc.c.ctx, subjectTy)
-  if (enumIsBoxed(fc.c, enumName)) {
-    fc.failed = true
-    return
-  }
+  let boxed = enumIsBoxed(fc.c, enumName)
   let subject = lowerExprH(fc, k[0], subjectTy)
   if (fc.failed) {
     return
@@ -2031,6 +2207,8 @@ function lowerMatch(fc: FnCtx, node: int) {
     return
   }
   let boolTy = primType(fc.c.ctx, 10)
+  let tagTy = tagType(fc, subjectTy, boxed)
+  let tag = matchTag(fc, subject, subjectTy, boxed)
   let preLen = len(fc.env)
   let orig = snapshotValues(fc, preLen)
   let join = builderNewBlock(fc.b)
@@ -2042,10 +2220,10 @@ function lowerMatch(fc: FnCtx, node: int) {
     let armTag = variantOrdinal(fc.c, enumName, fc.c.source[vn.span.start:vn.span.end])
     let bodyBlk = builderNewBlock(fc.b)
     let nextBlk = builderNewBlock(fc.b)
-    let ci = mkInstr(Op.ConstInt, subjectTy)
+    let ci = mkInstr(Op.ConstInt, tagTy)
     ci.ival = armTag
     let eq = mkInstr(Op.ICmpEq, boolTy)
-    eq.lhs = subject
+    eq.lhs = tag
     eq.rhs = builderEmit(fc.b, ci)
     let br = mkInstr(Op.Br, fc.c.ctx.voidId)
     br.lhs = builderEmit(fc.b, eq)
@@ -2057,7 +2235,7 @@ function lowerMatch(fc: FnCtx, node: int) {
     builderEndBlock(fc.b)
     builderBeginBlock(fc.b, bodyBlk)
     fc.terminated = false
-    if (lowerMatchArm(fc, arm, preLen, join)) {
+    if (lowerMatchArm(fc, arm, preLen, join, boxed, enumName, subject)) {
       joinReachable = true
     }
     builderEndBlock(fc.b)
@@ -2069,7 +2247,7 @@ function lowerMatch(fc: FnCtx, node: int) {
   // Last arm: the exhaustive fallthrough, lowered in the current block with no
   // test.
   fc.terminated = false
-  if (lowerMatchArm(fc, arms[len(arms) - 1], preLen, join)) {
+  if (lowerMatchArm(fc, arms[len(arms) - 1], preLen, join, boxed, enumName, subject)) {
     joinReachable = true
   }
   builderEndBlock(fc.b)
@@ -2088,8 +2266,9 @@ function lowerMatch(fc: FnCtx, node: int) {
 // Lowers one match-expression arm: its body is an *expression* whose value is
 // carried to the join as the trailing block param. Returns whether the join is
 // reached.
-function lowerMatchExprArm(fc: FnCtx, arm: int, preLen: int, join: int, resultTy: int, isVoid: bool): bool {
+function lowerMatchExprArm(fc: FnCtx, arm: int, preLen: int, join: int, resultTy: int, isVoid: bool, boxed: bool, enumName: string, subject: int): bool {
   let ak = kidsOf(fc.c.tree, arm)
+  bindArmPayload(fc, arm, boxed, enumName, subject)
   let val = 0
   if (isVoid) {
     lowerExpr(fc, ak[1])
@@ -2118,10 +2297,7 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
     return 0
   }
   let enumName = typeName(fc.c.ctx, subjectTy)
-  if (enumIsBoxed(fc.c, enumName)) {
-    fc.failed = true
-    return 0
-  }
+  let boxed = enumIsBoxed(fc.c, enumName)
   let subject = lowerExprH(fc, k[0], subjectTy)
   if (fc.failed) {
     return 0
@@ -2133,6 +2309,8 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
   }
   let isVoid = resultTy == fc.c.ctx.voidId
   let boolTy = primType(fc.c.ctx, 10)
+  let tagTy = tagType(fc, subjectTy, boxed)
+  let tag = matchTag(fc, subject, subjectTy, boxed)
   let preLen = len(fc.env)
   let orig = snapshotValues(fc, preLen)
   let join = builderNewBlock(fc.b)
@@ -2144,10 +2322,10 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
     let armTag = variantOrdinal(fc.c, enumName, fc.c.source[vn.span.start:vn.span.end])
     let bodyBlk = builderNewBlock(fc.b)
     let nextBlk = builderNewBlock(fc.b)
-    let ci = mkInstr(Op.ConstInt, subjectTy)
+    let ci = mkInstr(Op.ConstInt, tagTy)
     ci.ival = armTag
     let eq = mkInstr(Op.ICmpEq, boolTy)
-    eq.lhs = subject
+    eq.lhs = tag
     eq.rhs = builderEmit(fc.b, ci)
     let br = mkInstr(Op.Br, fc.c.ctx.voidId)
     br.lhs = builderEmit(fc.b, eq)
@@ -2159,7 +2337,7 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
     builderEndBlock(fc.b)
     builderBeginBlock(fc.b, bodyBlk)
     fc.terminated = false
-    if (lowerMatchExprArm(fc, arm, preLen, join, resultTy, isVoid)) {
+    if (lowerMatchExprArm(fc, arm, preLen, join, resultTy, isVoid, boxed, enumName, subject)) {
       joinReachable = true
     }
     builderEndBlock(fc.b)
@@ -2169,7 +2347,7 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
     i = i + 1
   }
   fc.terminated = false
-  if (lowerMatchExprArm(fc, arms[len(arms) - 1], preLen, join, resultTy, isVoid)) {
+  if (lowerMatchExprArm(fc, arms[len(arms) - 1], preLen, join, resultTy, isVoid, boxed, enumName, subject)) {
     joinReachable = true
   }
   builderEndBlock(fc.b)
