@@ -80,38 +80,41 @@ diagnostic ordering that valid compiler source never reaches. Closing those to
 zero is bounded by the formal fuzz harness (#1332, not yet built; the fuzz crash
 corpus is empty), so it is deferred with that task rather than ground out blind.
 
-**Stage 2 — middle-end, type inference near-parity.** `selfhost/{resolve,types,
-check}.bit` port the resolve substrate + the type checker; `bitc2 --dump-types`
-diffs against the seed over the corpus:
+**Stage 2 — middle-end, COMPLETE.** `selfhost/{resolve,types,check,ir,lower,
+opt}.bit` port the resolve substrate, type checker, SSA IR model + text dumper,
+AST→IR lowering, and the optimizer. Against the seed over the whole corpus:
 
 | Surface | Script | Result |
 |---------|--------|--------|
-| types | `scripts/selfhost-difftypes.sh` | 124/125 (202 check-error skips) |
+| types | `scripts/selfhost-difftypes.sh` | **125/125** byte-identical (202 check-error skips) |
+| IR (pre-opt) | `scripts/selfhost-diffir.sh` | **121/122** (205 lower/check-err skips) |
+| IR (post-opt) | `scripts/selfhost-diffiropt.sh` | **121/122** |
 
 Inference covers literals + defaulting, idents/params/receivers, unary/binary
-merge, calls (free + generic-param substitution + runtime-primitive builtins),
+merge, calls (free + generic substitution + runtime-primitive builtins),
 composites, index/slice/member, struct fields, enum variants (incl. turbofish),
 interface + type-parameter method dispatch, arrow-fn and uncalled method values,
 comma-ok (`<-ch` / `m[k]` / `x.(T)`), try/catch unwrap, the `error` interface,
-for-of binders, and transparent type aliases. The **1** remaining mismatch
-(`run_generic_nested`) needs generic type-*argument* tracking through instances
-(`Pair<i64>` → substitute `T`=i64), which the checker currently discards
-(instances render by bare name) — a substantive feature deferred to its own
-change.
+for-of binders, and transparent type aliases. Lowering covers every construct:
+control flow (if/while/for-c/for-of/switch/match/select), enums (C-like, boxed
+payload, generic), the fallible error channel, generics (monomorphized per
+instantiation), closures (arrows + capture, spawn, first-class and interface
+method values), comma-ok, arrays, maps, channels, floats/runes, and `show()`
+interpolation. Type ids are assigned in the seed's lazy touch order (declTypeOf
+first-touch + composite dedup), which method mangling `name$t{recvId}` depends on.
+The optimizer mirrors `-O1` — fold, DCE, inline, fold, DCE — rebuilding each
+function rather than mutating it.
 
-**Stage 2 — lowering, started.** `selfhost/{ir,lower}.bit` port the SSA IR
-model + text dumper (`ir.zig`) and AST→IR lowering (`lower.zig`), behind
-`bitc2 --dump-ir`, diffed by `scripts/selfhost-diffir.sh`:
+The **1** remaining mismatch in both IR surfaces (`run_generic_nested`) is
+monomorphized-instance *index numbering*: the seed's `ctx.instantiations` is one
+global ledger holding generic **type** instantiations alongside function ones, so
+`Opt<i64>`/`Pair<i64>`/`Box<i64>` consume indices ahead of the function instances
+(`wrap$7` vs `wrap$0`). Its function bodies, result types, and every type already
+match; recording type instantiations in the seed's exact discovery order is a
+substantive feature deferred to its own change.
 
-| Surface | Script | Result |
-|---------|--------|--------|
-| IR | `scripts/selfhost-diffir.sh` | 1/122 (205 lower/check-err skips) |
-
-Function signatures (params incl. method receiver, fallible-ok result) and
-`return [expr]` bodies over literals / idents / `(+,-,*)` lower byte-for-byte; a
-per-function fallback to a signature-only stub keeps partial IR from leaking as
-the frontier grows (const folding, strings/interp, `print`/`rt_call`, bindings,
-control flow, calls). Stage 3 (codegen/link, then `stage2 == stage3`) follows.
+Stage 3 (codegen + object writers + linker + driver, then `stage2 == stage3`)
+follows.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.
