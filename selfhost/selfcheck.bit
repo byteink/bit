@@ -1632,6 +1632,171 @@ function checkMachoRejects() {
       symbol: "same", kind: MachoRelocKind.Branch }] }) == "")
 }
 
+// Stage 3 (#1344) the linker's object model. Ports every one of the seed's
+// atomizeModule tests, including its two silent-corruption regressions.
+
+function loSec(name: string, kind: LoSectionKind, data: []u8, size: int, align: int): LoRawSection {
+  return LoRawSection{ name: name, kind: kind, data: data, size: size, alignment: align }
+}
+
+function loSym(name: string, sec: int, off: int, size: int, b: LoBinding, align: int): LoRawSymbol {
+  return LoRawSymbol{ name: name, section: sec, offset: off, size: size,
+    binding: b, weak: false, alignment: align }
+}
+
+// atomizeModule is fallible; every check below passes a well-formed module, so a
+// failure is the check's own bug.
+function loAtomize(secs: []LoRawSection, syms: []LoRawSymbol, rels: []LoRawReloc): LoModule {
+  return atomizeModule("m", secs, syms, rels) catch e {
+    assert(false)
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+}
+
+function checkAtomizeSplit() {
+  // One atom per symbol, each spanning to the NEXT symbol — not to its own
+  // declared size (which is 0 here, as Mach-O always leaves it).
+  let text = [u8(0x11), u8(0x11), u8(0x22), u8(0x22), u8(0x22), u8(0x33)]
+  let m = loAtomize([loSec(".text", LoSectionKind.Text, text, 6, 1)],
+    [loSym("f1", 0, 0, 0, LoBinding.Global, 1),
+     loSym("f2", 0, 2, 0, LoBinding.Local, 1),
+     loSym("f3", 0, 5, 0, LoBinding.Global, 1)], []LoRawReloc(0))
+  assert(len(m.atoms) == 3)
+  assert(m.atoms[0].name == "f1" && m.atoms[0].size == 2)
+  assert(m.atoms[1].name == "f2" && m.atoms[1].size == 3)
+  assert(m.atoms[2].name == "f3" && m.atoms[2].size == 1)
+  assert(m.atoms[1].binding == LoBinding.Local)
+  // Each atom carries its own bytes.
+  assert(m.atoms[1].data[0] == u8(0x22) && len(m.atoms[1].data) == 3)
+}
+
+function checkAtomizeRelocs() {
+  // A cross-section local relocation with no named symbol (the STT_SECTION
+  // shape): .text+4 referencing .rodata+1. It must resolve to the msg atom with
+  // the addend rebased from section-relative to atom-relative.
+  let text = []u8(8)
+  let rodata = [u8(0xAA), u8(0xBB), u8(0xCC)]
+  let m = loAtomize(
+    [loSec(".text", LoSectionKind.Text, text, 8, 1),
+     loSec(".rodata", LoSectionKind.Rodata, rodata, 3, 1)],
+    [loSym("main", 0, 0, 8, LoBinding.Global, 1),
+     loSym("msg", 1, 0, 3, LoBinding.Local, 1)],
+    [LoRawReloc{ section: 0, offset: 4, kind: LoRelocKind.Pc32,
+      target: loTargetSectionOffset(1, 1), addend: 0 - 4 }])
+  assert(len(m.atoms[0].relocs) == 1)
+  let r = m.atoms[0].relocs[0]
+  assert(r.offset == 4)
+  assert(!r.target.isGlobal && r.target.local == 1)
+  assert(r.addend == 0 - 4 + 1)
+
+  // The rebase itself, with a NONZERO atom base — the case that actually proves
+  // it. Targeting .rodata+6 lands inside msg2 (which starts at 4), so the addend
+  // must become atom-relative: 6 - 4 == 2. Every base-0 target above passes
+  // whether or not the rebase happens at all.
+  let ro2 = [u8(0xAA), u8(0xBB), u8(0xCC), u8(0xDD), u8(0xEE), u8(0xFF), u8(0x01), u8(0x02)]
+  let m3 = loAtomize(
+    [loSec(".text", LoSectionKind.Text, []u8(8), 8, 1),
+     loSec(".rodata", LoSectionKind.Rodata, ro2, 8, 1)],
+    [loSym("main", 0, 0, 8, LoBinding.Global, 1),
+     loSym("msg1", 1, 0, 4, LoBinding.Local, 1),
+     loSym("msg2", 1, 4, 4, LoBinding.Local, 1)],
+    [LoRawReloc{ section: 0, offset: 0, kind: LoRelocKind.Abs64,
+      target: loTargetSectionOffset(1, 6), addend: 100 }])
+  let r3 = m3.atoms[0].relocs[0]
+  assert(m3.atoms[r3.target.local].name == "msg2")
+  assert(r3.addend == 102) // 100 + (6 - 4), NOT 100 + 6
+
+  // A global-bound reference stays a name, resolved at whole-link merge time.
+  let m2 = loAtomize([loSec(".text", LoSectionKind.Text, []u8(4), 4, 1)],
+    [loSym("caller", 0, 0, 4, LoBinding.Global, 1)],
+    [LoRawReloc{ section: 0, offset: 0, kind: LoRelocKind.Pc32,
+      target: loTargetGlobal("bit_rt_gc_alloc"), addend: 0 - 4 }])
+  assert(m2.atoms[0].relocs[0].target.isGlobal)
+  assert(m2.atoms[0].relocs[0].target.name == "bit_rt_gc_alloc")
+}
+
+function checkAtomizeAlignment() {
+  // A symbol-less section's anonymous atom takes the SECTION's alignment. It has
+  // no symbol to inherit one from, and an AArch64 literal pool loaded with
+  // `ldr q0` faults if under-aligned.
+  let m = loAtomize([loSec(".rodata.cst16", LoSectionKind.Rodata, []u8(32), 32, 16)],
+    []LoRawSymbol(0), []LoRawReloc(0))
+  assert(len(m.atoms) == 1 && m.atoms[0].alignment == 16)
+
+  // A symbol at offset 0 starts at the section base, so it can never be laid out
+  // looser than the section requires — even declaring alignment 1.
+  let m2 = loAtomize([loSec(".rodata", LoSectionKind.Rodata, []u8(16), 16, 16)],
+    [loSym("tbl", 0, 0, 16, LoBinding.Global, 1)], []LoRawReloc(0))
+  assert(m2.atoms[0].alignment == 16)
+}
+
+function checkAtomizeLeading() {
+  // Regression (#1157): AArch64 literal pools are .rodata.cst8/.cst16 sections
+  // whose mapping symbols are excluded, leaving a named constant PARTWAY IN as
+  // the first symbol. Atomizing only from that symbol silently dropped the pool
+  // entries ahead of it — including the lane-index vector indexOfScalar loads —
+  // and a relocation into them resolved against the first symbol's atom with a
+  // negative addend, reading whatever layout placed before it. Both symptoms are
+  // silent.
+  let pool = [u8(0), u8(1), u8(2), u8(3), u8(4), u8(5), u8(6), u8(7),
+    u8(0xAA), u8(0xAA), u8(0xAA), u8(0xAA), u8(0xAA), u8(0xAA), u8(0xAA), u8(0xAA)]
+  let m = loAtomize([loSec(".rodata.cst8", LoSectionKind.Rodata, pool, 16, 8)],
+    [loSym(".L__anon_1", 0, 8, 8, LoBinding.Local, 8)], []LoRawReloc(0))
+  assert(len(m.atoms) == 2)
+  assert(m.atoms[0].name == ".rodata.cst8")
+  assert(m.atoms[0].size == 8 && m.atoms[0].alignment == 8)
+  assert(len(m.atoms[0].data) == 8)
+  let i = 0
+  while (i < 8) {
+    assert(m.atoms[0].data[i] == pool[i]) // the lane vector, kept
+    i = i + 1
+  }
+  assert(m.atoms[1].name == ".L__anon_1")
+
+  // A reloc BELOW the first symbol resolves to that leading atom, with no
+  // negative addend folded against the wrong atom.
+  let m2 = loAtomize(
+    [loSec(".text", LoSectionKind.Text, []u8(8), 8, 1),
+     loSec(".rodata.cst8", LoSectionKind.Rodata, pool, 16, 8)],
+    [loSym("f", 0, 0, 8, LoBinding.Global, 1),
+     loSym(".L__anon_1", 1, 8, 8, LoBinding.Local, 8)],
+    [LoRawReloc{ section: 0, offset: 0, kind: LoRelocKind.Abs64,
+      target: loTargetSectionOffset(1, 0), addend: 0 }])
+  let r = m2.atoms[0].relocs[0]
+  assert(m2.atoms[r.target.local].name == ".rodata.cst8")
+  assert(r.addend == 0)
+}
+
+function checkAtomizeBssAndAliases() {
+  // A bss atom carries a size and no bytes.
+  let m = loAtomize([loSec(".bss", LoSectionKind.Bss, []u8(0), 64, 1)],
+    [loSym("buf", 0, 0, 64, LoBinding.Global, 1)], []LoRawReloc(0))
+  assert(len(m.atoms[0].data) == 0 && m.atoms[0].size == 64)
+
+  // A local section label aliasing a real global at the same offset — the exact
+  // shape compiler-rt emits. They collapse to ONE atom, and the global wins its
+  // identity; a reloc targeting the local alias resolves to that same atom.
+  let text = [u8(0xAA), u8(0xBB), u8(0xCC), u8(0xDD)]
+  let m2 = loAtomize([loSec(".text", LoSectionKind.Text, text, 4, 1)],
+    [loSym("local_label", 0, 0, 0, LoBinding.Local, 1),
+     loSym("real_fn", 0, 0, 0, LoBinding.Global, 1)],
+    [LoRawReloc{ section: 0, offset: 0, kind: LoRelocKind.Abs64,
+      target: loTargetSymbol(0), addend: 0 }])
+  assert(len(m2.atoms) == 1)
+  assert(m2.atoms[0].name == "real_fn") // the global wins the identity
+  assert(m2.atoms[0].binding == LoBinding.Global)
+  assert(m2.atoms[0].size == 4)
+  assert(m2.atoms[0].relocs[0].target.local == 0)
+
+  // A STRONG global beats a weak one for the identity.
+  let weak = LoRawSymbol{ name: "weak_fn", section: 0, offset: 0, size: 0,
+    binding: LoBinding.Global, weak: true, alignment: 1 }
+  let m3 = loAtomize([loSec(".text", LoSectionKind.Text, text, 4, 1)],
+    [weak, loSym("strong_fn", 0, 0, 0, LoBinding.Global, 1)], []LoRawReloc(0))
+  assert(len(m3.atoms) == 1)
+  assert(m3.atoms[0].name == "strong_fn" && !m3.atoms[0].weak)
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -1789,6 +1954,11 @@ function selfcheck() {
   checkMachoMinimal()
   checkMachoFull()
   checkMachoRejects()
+  checkAtomizeSplit()
+  checkAtomizeRelocs()
+  checkAtomizeAlignment()
+  checkAtomizeLeading()
+  checkAtomizeBssAndAliases()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()

@@ -1,0 +1,507 @@
+// Self-host Stage 3 (#1344): the linker's generic object model, ported from
+// compiler/link/object.zig. Every input the static linker consumes — this
+// compiler's own in-memory macho.bit objects, and real relocatable objects read
+// out of libbitrt.a — is normalized into this shape before merging. One
+// format-agnostic representation lets the executable writers share a single
+// symbol-resolution and dead-strip engine instead of duplicating it per format.
+//
+// Central idea: an Atom is the smallest unit the linker can keep or drop. Real
+// object files group many functions/globals into one big text/data section with
+// no per-symbol boundary; atomizeModule splits such a section back into one atom
+// per symbol (using each symbol's offset and, for ELF, its declared size — for
+// Mach-O, the NEXT symbol's offset, since Mach-O carries no per-symbol size).
+// This is what makes dead-stripping possible at symbol rather than
+// whole-section granularity, and it is REQUIRED for correctness, not just a size
+// win: libbitrt.a's single compilation unit pulls in far more of Zig's std lib
+// than any Bit program's bit_rt_* surface actually calls, and the unreachable
+// rest must be dropped or the final image drags in undefined symbols nothing
+// running code needs.
+//
+// Names carry a `Lo` (link-object) prefix where they would otherwise collide in
+// selfhost's flat namespace (Binding/RelocKind/Reloc/Section already exist).
+
+enum LoSectionKind {
+  Text,
+  Rodata,
+  Data,
+  Bss,
+  // macOS thread-local VARIABLE DESCRIPTORS (__thread_vars,
+  // S_THREAD_LOCAL_VARIABLES) — 24-byte tlv_descriptors dyld rewrites at load;
+  // distinct from the init image below because it carries a different output
+  // section flag. ELF has no equivalent and never produces it.
+  TlsVars,
+  // Thread-local initialized data (ELF .tdata, macOS __thread_data).
+  TlsData,
+  // Thread-local zero-fill (ELF .tbss, macOS __thread_bss).
+  TlsBss,
+}
+
+function loIsTls(k: LoSectionKind): bool {
+  return k == LoSectionKind.TlsVars || k == LoSectionKind.TlsData ||
+    k == LoSectionKind.TlsBss
+}
+
+function loIsBss(k: LoSectionKind): bool {
+  return k == LoSectionKind.Bss || k == LoSectionKind.TlsBss
+}
+
+// Every relocation kind the linker knows how to apply, normalized away from the
+// source format's own numbering (the ELF/Mach-O readers translate R_X86_64_*,
+// R_AARCH64_*, X86_64_RELOC_* and ARM64_RELOC_* into these at ingest). Every
+// variant carries an explicit addend in LoReloc regardless of whether the source
+// format stored it that way (ELF rela) or implicitly in the field bytes
+// (Mach-O) — the readers normalize once, so `apply` has one arithmetic rule per
+// kind, not one per (format, kind).
+enum LoRelocKind {
+  // word64 = S + A.
+  Abs64,
+  // word32 = S + A, truncated (no range check).
+  Abs32,
+  // word32 = S + A, must fit as a sign-extended 32-bit value.
+  Abs32Signed,
+  // word32 = S + A - P (x86-64 call/lea-style PC-relative; also backs Mach-O's
+  // BRANCH/SIGNED* kinds, whose stored implicit addend the reader already folded
+  // into A).
+  Pc32,
+  // word32 = addr(GOT slot for target) + A - P. Materializes a GOT entry rather
+  // than resolving to the symbol directly.
+  Got32,
+  // AArch64 ADRP immediate: page(S+A) - page(P), split into the instruction's
+  // immhi/immlo fields.
+  Aarch64AdrPrelPgHi21,
+  // AArch64 ADD (immediate) low 12 bits: (S+A) & 0xfff.
+  Aarch64AddAbsLo12Nc,
+  // AArch64 LDR/STR unsigned-immediate low 12 bits, scaled by the access size
+  // (1/2/4/8/16 bytes): ((S+A) & 0xfff) >> log2(size).
+  Aarch64Ldst8AbsLo12Nc,
+  Aarch64Ldst16AbsLo12Nc,
+  Aarch64Ldst32AbsLo12Nc,
+  Aarch64Ldst64AbsLo12Nc,
+  Aarch64Ldst128AbsLo12Nc,
+  // AArch64 BL/B immediate26: (S+A-P) >> 2, must fit in 26 signed bits.
+  Aarch64Call26,
+  Aarch64Jump26,
+  // AArch64 ADRP targeting a GOT slot: page(GOT slot) - page(P).
+  Aarch64AdrGotPage,
+  // AArch64 LDR low 12 bits addressing a GOT slot: (GOT slot & 0xfff) >> 3.
+  Aarch64Ld64GotLo12Nc,
+  // macOS thread-local ADRP/LDR pair (ARM64_RELOC_TLVP_LOAD_*): the same
+  // page/lo12 arithmetic as the GOT kinds, but the indirection slot lives in the
+  // thread-pointer table (__thread_ptr), each slot holding the address of a
+  // __thread_vars tlv_descriptor.
+  Aarch64TlvpAdrPage21,
+  Aarch64TlvpLd64Lo12,
+  // AArch64 local-exec TLS ADD high bits: (TPOFF(S)+A) bits [23:12].
+  TlsleAddTprelHi12,
+  // AArch64 local-exec TLS ADD low 12 bits: (TPOFF(S)+A) & 0xfff.
+  TlsleAddTprelLo12Nc,
+  // x86-64 local-exec TLS: word32 = TPOFF(S) + A (variant II: negative offset
+  // from the thread pointer).
+  Tpoff32,
+}
+
+// Where a relocation's target lives. Bit has no tagged union: `isGlobal`
+// selects whether `name` (resolved against the whole link's symbol table) or
+// `local` (an index into the SAME module's atoms) carries the answer. A local
+// symbol is never visible outside its defining object, so it needs no name and
+// no cross-module table.
+struct LoSymbolRef {
+  isGlobal: bool,
+  name: string,
+  local: int,
+}
+
+function loGlobalRef(name: string): LoSymbolRef {
+  return LoSymbolRef{ isGlobal: true, name: name, local: 0 }
+}
+
+function loLocalRef(atom: int): LoSymbolRef {
+  return LoSymbolRef{ isGlobal: false, name: "", local: atom }
+}
+
+struct LoReloc {
+  // Byte offset within the owning atom's data/size.
+  offset: int,
+  kind: LoRelocKind,
+  target: LoSymbolRef,
+  addend: int,
+}
+
+enum LoBinding {
+  Local,
+  Global,
+}
+
+struct LoAtom {
+  // For diagnostics and, when the binding is Global, the whole-link symbol
+  // table key.
+  name: string,
+  kind: LoSectionKind,
+  binding: LoBinding,
+  // Empty for bss/tls_bss — those atoms carry only `size`, contents implicitly
+  // zero.
+  data: []u8,
+  size: int,
+  // 1, or a power of two — the byte alignment this atom's final address must
+  // satisfy (from the source symbol/section's own alignment).
+  alignment: int,
+  // A weak global definition — a linker may override it with a strong one
+  // (compiler-rt provides weak memcpy/strlen/... the runtime overrides).
+  // Meaningless for local atoms.
+  weak: bool,
+  relocs: []LoReloc,
+}
+
+struct LoModule {
+  // The ar member name or the compiler module's own name — diagnostics only
+  // ("undefined symbol X, referenced from <name>").
+  name: string,
+  atoms: []LoAtom,
+}
+
+// One not-yet-atomized input section, addressed by its index in the slice passed
+// to atomizeModule.
+struct LoRawSection {
+  name: string,
+  kind: LoSectionKind,
+  // Empty for bss/tls_bss — those carry only `size`.
+  data: []u8,
+  size: int,
+  // The section's own required alignment. An atom carved out of this section can
+  // never be laid out looser than this — in particular a symbol-less section's
+  // single anonymous atom, which has no symbol to inherit an alignment from.
+  // AArch64 literal pools reached by `ldr q0` are 16-byte aligned, and
+  // under-aligning one faults the load.
+  alignment: int,
+}
+
+// One symbol as read from an object, before atomization has split its section
+// into per-symbol atoms. `size` is 0 for Mach-O (whose nlist carries no
+// per-symbol size) — atomizeModule then infers the atom's extent from the NEXT
+// symbol's offset instead of trusting it.
+struct LoRawSymbol {
+  name: string,
+  section: int,
+  // Byte offset within `section`.
+  offset: int,
+  // 0 means "unknown, infer from the next symbol".
+  size: int,
+  binding: LoBinding,
+  // STB_WEAK (ELF) — a weak global definition.
+  weak: bool,
+  alignment: int,
+}
+
+// Where a raw relocation points, before atomization. Bit has no tagged union, so
+// `kind` selects which field is live.
+enum LoRawTargetKind {
+  // Index into atomizeModule's `symbols` — a locally defined symbol, anywhere in
+  // the same module.
+  Symbol,
+  // A reference to some section at a raw byte offset with no named symbol (ELF
+  // STT_SECTION, or a Mach-O local relocation given as a bare section+offset) —
+  // resolved to whichever atom's range contains that offset. The offset is
+  // SIGNED: a PC-relative reference to a symbol near a section's start folds its
+  // instruction bias (e.g. -4) into the addend the source format carries here,
+  // so S + A can land a few bytes BEFORE the section base (e.g. ELF's .bss - 5).
+  // Such a reference attributes to the section's offset-0 atom with a negative
+  // intra-atom offset — S_final + A - P stays exact.
+  SectionOffset,
+  // An external name (ELF STB_GLOBAL / Mach-O N_EXT, defined or not) — always
+  // resolved at whole-link merge time, never locally.
+  Global,
+}
+
+struct LoRawTarget {
+  kind: LoRawTargetKind,
+  symbol: int,
+  section: int,
+  offset: int,
+  name: string,
+}
+
+function loTargetSymbol(idx: int): LoRawTarget {
+  return LoRawTarget{ kind: LoRawTargetKind.Symbol, symbol: idx, section: 0,
+    offset: 0, name: "" }
+}
+
+function loTargetSectionOffset(section: int, offset: int): LoRawTarget {
+  return LoRawTarget{ kind: LoRawTargetKind.SectionOffset, symbol: 0,
+    section: section, offset: offset, name: "" }
+}
+
+function loTargetGlobal(name: string): LoRawTarget {
+  return LoRawTarget{ kind: LoRawTargetKind.Global, symbol: 0, section: 0,
+    offset: 0, name: name }
+}
+
+// One relocation before atomization, still addressed relative to its whole
+// owning section rather than to whichever atom will end up owning it. The owning
+// section can differ from the target's section — e.g. text referencing a local
+// rodata literal — so both are named independently.
+struct LoRawReloc {
+  section: int,
+  // Byte offset within `section`.
+  offset: int,
+  kind: LoRelocKind,
+  target: LoRawTarget,
+  addend: int,
+}
+
+// Which atom owns a (section, byte-offset) pair, and that atom's own start
+// offset within the section (so the caller can rebase the offset into it).
+struct LoOwner {
+  atom: int,
+  base: int,
+}
+
+// The symbol whose offset most closely precedes (or equals) `offset`. The caller
+// has already excluded an offset below order[0], so a symbol always covers it.
+//
+// ponytail: linear scan. The symbol count per module is small (the
+// function/global count of one Bit module, or libbitrt's single translation
+// unit — bounded by the source program, not by anything the linker iterates
+// unboundedly) and this runs once per relocation at ingest. Sort + binary search
+// if a link ever gets slow enough to measure.
+function loFindSymbolCovering(symbols: []LoRawSymbol, order: []int, offset: int): int {
+  let best = order[0]
+  let i = 0
+  while (i < len(order)) {
+    let symOff = symbols[order[i]].offset
+    if (symOff <= offset && symOff > symbols[best].offset) {
+      best = order[i]
+    }
+    i = i + 1
+  }
+  return best
+}
+
+// Resolves a (section, byte-offset) pair to its owning atom. Handles both a
+// symbol-covered section (find the covering symbol's atom) and a symbol-less one
+// (its single anonymous atom, which spans the whole section from offset 0).
+// `anon` is -1 when the section has no leading anonymous atom.
+function loResolveSectionOffset(symbols: []LoRawSymbol, order: []int,
+  atomOfSymbol: []int, anon: int, offset: int): LoOwner! {
+  if (len(order) == 0) {
+    if (anon < 0) {
+      fail newError("NoCoveringSymbol")
+    }
+    return LoOwner{ atom: anon, base: 0 }
+  }
+  // Below the section's first symbol: the leading anonymous atom owns these
+  // bytes. With no such atom the first symbol sits at offset 0, so `offset` is
+  // negative — a PC-relative reference just before the section base — and belongs
+  // to the offset-0 atom with the difference folded into the addend.
+  if (offset < symbols[order[0]].offset) {
+    if (anon >= 0) {
+      return LoOwner{ atom: anon, base: 0 }
+    }
+    return LoOwner{ atom: atomOfSymbol[order[0]], base: 0 }
+  }
+  let sym = loFindSymbolCovering(symbols, order, offset)
+  return LoOwner{ atom: atomOfSymbol[sym], base: symbols[sym].offset }
+}
+
+// Symbol indices for one section, sorted by offset. Bit has no slice-of-slice
+// literal, so the per-section lists need a named wrapper.
+struct LoOrder {
+  items: []int,
+}
+
+// Insertion sort of `items` by the symbols' offsets. Stable, which matters: two
+// symbols at the same offset are aliases, and the group loop below picks the
+// primary among them by binding — a stable order keeps that choice deterministic
+// across runs, and a linked binary must be reproducible.
+function loSortByOffset(symbols: []LoRawSymbol, items: []int): []int {
+  let i = 1
+  while (i < len(items)) {
+    let v = items[i]
+    let j = i - 1
+    while (j >= 0 && symbols[items[j]].offset > symbols[v].offset) {
+      items[j + 1] = items[j]
+      j = j - 1
+    }
+    items[j + 1] = v
+    i = i + 1
+  }
+  return items
+}
+
+// Splits every section's raw bytes into atoms at each defined symbol's boundary,
+// and rebases every relocation from a section-wide offset to an (atom, intra-atom
+// offset) pair. This is the one place ELF and Mach-O object reading converge:
+// each reader translates its own format into LoRawSection/LoRawSymbol/LoRawReloc
+// and hands them here.
+//
+// Symbols need not be grouped or sorted by section; this builds sorted-by-offset
+// order per section internally. Several symbols sharing a (section, offset) are
+// aliases for one atom (common in real objects: a global memcpy plus its local
+// section label, or merged constant-pool labels all folded to the same bytes) —
+// they collapse to a single atom that every alias resolves to, preferring a
+// global among them for the atom's identity.
+function atomizeModule(name: string, sections: []LoRawSection,
+  symbols: []LoRawSymbol, relocs: []LoRawReloc): LoModule! {
+  let atoms = []LoAtom(0)
+
+  // Per section: symbol indices in that section, sorted by offset — used both to
+  // lay out atoms and, later, to find which atom a raw section+offset falls in.
+  let perSection = []LoOrder(0)
+  let i = 0
+  while (i < len(sections)) {
+    perSection = append(perSection, LoOrder{ items: []int(0) })
+    i = i + 1
+  }
+  i = 0
+  while (i < len(symbols)) {
+    let sec = symbols[i].section
+    perSection[sec].items = append(perSection[sec].items, i)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(perSection)) {
+    perSection[i].items = loSortByOffset(symbols, perSection[i].items)
+    i = i + 1
+  }
+
+  // atomOfSymbol[i] is only meaningful once that symbol's section has been
+  // atomized (every section is, in the loop below, before relocs are processed).
+  let atomOfSymbol = []int(len(symbols))
+  // The anonymous atom holding each section's LEADING symbol-less region — how a
+  // relocation owned by or targeting those bytes finds its atom, since no symbol
+  // covers them. Spans the whole section when it has no symbols at all; spans
+  // [0, first symbol offset) when the first symbol starts past the section base.
+  // -1 when a symbol already sits at offset 0, leaving no leading region.
+  let sectionAnon = []int(len(sections))
+  i = 0
+  while (i < len(sections)) {
+    sectionAnon[i] = -1
+    i = i + 1
+  }
+
+  let secIdx = 0
+  while (secIdx < len(sections)) {
+    let section = sections[secIdx]
+    let order = perSection[secIdx].items
+    // Bytes before the section's first symbol belong to no symbol, so the
+    // per-symbol loop below would drop them, and any relocation into them would
+    // resolve against the first symbol's atom with a NEGATIVE addend — pointing
+    // outside that atom, at whatever layout happened to place before it. An
+    // AArch64 literal pool is exactly this shape: the mapping symbols are
+    // excluded and the only real symbol is a named constant partway in. Give the
+    // region its own atom.
+    let leading = section.size
+    if (len(order) > 0) {
+      leading = symbols[order[0]].offset
+    }
+    if (len(order) == 0 || leading > 0) {
+      // Also covers a SIZE-0 section, e.g. AArch64's empty unreachable-bodied
+      // vtable stubs, whose address a vtable's abs64 pointer needs even though
+      // the body is empty. The atom dead-strips if nothing references it.
+      sectionAnon[secIdx] = len(atoms)
+      let d = []u8(0)
+      if (!loIsBss(section.kind)) {
+        let n = leading
+        if (n > len(section.data)) {
+          n = len(section.data)
+        }
+        d = section.data[0:n]
+      }
+      atoms = append(atoms, LoAtom{ name: section.name, kind: section.kind,
+        binding: LoBinding.Local, data: d, size: leading,
+        // The section's own alignment: there is no symbol to inherit one from,
+        // and an AArch64 literal pool loaded with `ldr q0` faults if it lands
+        // under-aligned.
+        alignment: section.alignment, weak: false, relocs: []LoReloc(0) })
+    }
+    if (len(order) > 0) {
+      // Walk `order` (sorted by offset) one offset-group at a time. Symbols
+      // sharing an offset are aliases -> one atom; the group spans until the next
+      // distinct offset, which also bounds the atom's extent.
+      let gi = 0
+      while (gi < len(order)) {
+        let off = symbols[order[gi]].offset
+        let gj = gi
+        let primary = order[gi] // prefer a global, and a strong one, for identity
+        // The first atom starts at the section's base, so it inherits the
+        // section's alignment; a later atom's is its symbols' own.
+        let maxAlign = 1
+        if (off == 0) {
+          maxAlign = section.alignment
+        }
+        while (gj < len(order) && symbols[order[gj]].offset == off) {
+          let s = symbols[order[gj]]
+          let p = symbols[primary]
+          let better = (s.binding == LoBinding.Global && p.binding != LoBinding.Global) ||
+            (s.binding == LoBinding.Global && p.binding == LoBinding.Global && !s.weak && p.weak)
+          if (better) {
+            primary = order[gj]
+          }
+          if (s.alignment > maxAlign) {
+            maxAlign = s.alignment
+          }
+          gj = gj + 1
+        }
+        let nextOffset = section.size
+        if (gj < len(order)) {
+          nextOffset = symbols[order[gj]].offset
+        }
+        assert(nextOffset >= off)
+        // Span to the next symbol, not the symbol's declared size: any
+        // padding/data between a symbol's size and the next symbol still carries
+        // bytes and relocations that must belong to some atom.
+        let size = nextOffset - off
+        let atomIdx = len(atoms)
+        let k = gi
+        while (k < gj) {
+          atomOfSymbol[order[k]] = atomIdx
+          k = k + 1
+        }
+        let psym = symbols[primary]
+        let d = []u8(0)
+        if (!loIsBss(section.kind)) {
+          // Clamp the data slice to what the section actually holds: a symbol's
+          // declared size can exceed its extent to the next symbol; the trailing
+          // bytes are then implicitly zero.
+          let n = size
+          if (n > len(section.data) - off) {
+            n = len(section.data) - off
+          }
+          d = section.data[off:off + n]
+        }
+        atoms = append(atoms, LoAtom{ name: psym.name, kind: section.kind,
+          binding: psym.binding, data: d, size: size, alignment: maxAlign,
+          weak: psym.weak, relocs: []LoReloc(0) })
+        gi = gj
+      }
+    }
+    secIdx = secIdx + 1
+  }
+
+  i = 0
+  while (i < len(relocs)) {
+    let r = relocs[i]
+    let owner = loResolveSectionOffset(symbols, perSection[r.section].items,
+      atomOfSymbol, sectionAnon[r.section], r.offset)?
+    let intraOffset = r.offset - owner.base
+
+    // Section-offset targets carry a raw section byte offset with no addend of
+    // their own; rebase that offset to be relative to the atom it falls in and
+    // fold the difference into the addend. Symbol and global targets keep the
+    // reloc's own addend untouched.
+    let addend = r.addend
+    let target = loGlobalRef(r.target.name)
+    if (r.target.kind == LoRawTargetKind.Symbol) {
+      target = loLocalRef(atomOfSymbol[r.target.symbol])
+    } else if (r.target.kind == LoRawTargetKind.SectionOffset) {
+      let t = loResolveSectionOffset(symbols, perSection[r.target.section].items,
+        atomOfSymbol, sectionAnon[r.target.section], r.target.offset)?
+      addend = addend + r.target.offset - t.base
+      target = loLocalRef(t.atom)
+    }
+    atoms[owner.atom].relocs = append(atoms[owner.atom].relocs,
+      LoReloc{ offset: intraOffset, kind: r.kind, target: target, addend: addend })
+    i = i + 1
+  }
+
+  return LoModule{ name: name, atoms: atoms }
+}
