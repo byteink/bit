@@ -1483,3 +1483,285 @@ function fpRegOffSize(width: int): int {
   }
   return 2
 }
+
+// ===========================================================================
+// Calls
+// ===========================================================================
+
+// Stores one overflow argument to its outgoing stack slot [sp + off] in the
+// reserved area at the bottom of this frame. `src` is sp-relative (a spill) or a
+// physical register; the frame never moves, so both the slot and every spill
+// source stay put — the mem staging temp (scratch1/fscratch1) is free here
+// because these run before the register parallel moves.
+function emitOutgoingStackArg(cx: A64Ctx, src: PLoc, class: RegClass, off: int) {
+  if (class == RegClass.Int) {
+    if (src.isReg) {
+      storeImm(cx.code, src.v, regSp(), off, 8)
+      return
+    }
+    loadImm(cx.code, scratch1(), regSp(), src.v, 8, false)
+    storeImm(cx.code, scratch1(), regSp(), off, 8)
+    return
+  }
+  if (src.isReg) {
+    storeImmF(cx.code, src.v, regSp(), off, 8)
+    return
+  }
+  loadImmF(cx.code, fscratch1(), regSp(), src.v, 8)
+  storeImmF(cx.code, fscratch1(), regSp(), off, 8)
+}
+
+// Marshals `args` into their ABI argument registers via the parallel-move
+// sequencer, with the integer/float register banks already baseIntOrd/
+// baseFloatOrd deep (emitCall passes 0,0 for a plain call; the closure and
+// interface paths pass 1,0 to reserve x0 for the environment/receiver).
+// Arguments past x0-x7 / v0-v7 overflow to the outgoing stack-argument area at
+// the bottom of the frame: each is stored at [sp + 8*k] in argument order,
+// before the register parallel moves run.
+function marshalArgs(cx: A64Ctx, args: []int, baseIntOrd: int, baseFloatOrd: int) {
+  let intOrd = baseIntOrd
+  let floatOrd = baseFloatOrd
+  let intMoves = []PMove(0)
+  let floatMoves = []PMove(0)
+  let stackIndex = 0
+  let i = 0
+  while (i < len(args)) {
+    let v = args[i]
+    let class = regClassOf(cx.module.ctx, cx.f.instrs[v].ty)
+    let ord = floatOrd
+    if (class == RegClass.Int) {
+      ord = intOrd
+    }
+    let src = plocOf(cx, vregOf(cx, v), class)
+    let reg = argReg(class, ord)
+    if (reg < 0) {
+      emitOutgoingStackArg(cx, src, class, outgoingArgOffset(stackIndex))
+      stackIndex = stackIndex + 1
+    } else if (class == RegClass.Int) {
+      intMoves = append(intMoves, PMove{ src: src, dst: plocReg(reg) })
+    } else {
+      floatMoves = append(floatMoves, PMove{ src: src, dst: plocReg(reg) })
+    }
+    if (class == RegClass.Int) {
+      intOrd = intOrd + 1
+    } else {
+      floatOrd = floatOrd + 1
+    }
+    i = i + 1
+  }
+  sequentializeAndEmit(cx, intMoves, RegClass.Int)
+  sequentializeAndEmit(cx, floatMoves, RegClass.Float)
+}
+
+// Whether `ty` is the bool primitive — the one integer-class type whose return
+// register a C callee may leave partially undefined.
+function isBoolTy(ctx: TypeContext, ty: int): bool {
+  return ctx.types[ty].kind == TypeKind.Prim && ctx.types[ty].prim == 10
+}
+
+// Binds one call's single result (if any) into `dst`.
+function bindCallResult(cx: A64Ctx, dst: int, dstTy: int, normalizeBool: bool) {
+  if (dst < 0) {
+    return
+  }
+  if (regClassOf(cx.module.ctx, dstTy) == RegClass.Float) {
+    putFloat(cx, dst, retRegNum())
+    return
+  }
+  // A C callee returns `bool` in w0, leaving x0's upper bits unspecified. A Bit
+  // bool is a full-width 0/1 — `!b` and the branch tests read the whole register
+  // — so normalize at this boundary, where a foreign convention meets ours (see
+  // ABI.md §2 on a narrow return leaving the register partly undefined).
+  if (normalizeBool && isBoolTy(cx.module.ctx, dstTy)) {
+    uxtb(cx.code, retRegNum())
+  }
+  putInt(cx, dst, retRegNum())
+}
+
+// `dst` is a vreg, or -1 when the call's result is discarded (no vreg is
+// negative, so the sentinel is unambiguous).
+function emitCall(cx: A64Ctx, dst: int, dstTy: int, symbol: string, args: []int, isSafepoint: bool) {
+  marshalArgs(cx, args, 0, 0)
+  emitCallReloc(cx, symbol)
+  if (isSafepoint) {
+    recordSafepoint(cx, codeLen(cx))
+  }
+  bindCallResult(cx, dst, dstTy, true)
+}
+
+// Records the stack map for the safepoint at `retOff` (a call return address)
+// from the register allocator's precomputed stackMaps, in the same first-seen
+// order buildIntervals collected them. Shared by every safepoint-bearing call
+// site (emitCall, emitGcAlloc, emitMakeClosure, the two indirect calls).
+function recordSafepoint(cx: A64Ctx, retOff: int) {
+  let sm = cx.result.stackMaps[cx.nextSafepointIdx]
+  assert(sm.pos == cx.safepointPositions[cx.nextSafepointIdx])
+  let regs = []int(0)
+  let i = 0
+  while (i < len(sm.regs)) {
+    regs = append(regs, cx.intRegs[sm.regs[i]])
+    i = i + 1
+  }
+  // Normalize to frame-pointer-relative (x29 = sp + frameSize - 16), so the
+  // runtime walker (runtime/ABI.md §4) is arch-neutral: *(x29 + off).
+  let fpBase = savedFpOffset(cx.frame)
+  let offs = []int(0)
+  i = 0
+  while (i < len(sm.slots)) {
+    offs = append(offs, spillOffset(cx.frame, sm.slots[i]) - fpBase)
+    i = i + 1
+  }
+  cx.safepoints = append(cx.safepoints, SafepointView{ retOffset: retOff, slots: offs, regs: regs })
+  cx.nextSafepointIdx = cx.nextSafepointIdx + 1
+}
+
+// gc_alloc: load the static TypeInfo blob's address into x0 and `bl
+// bit_rt_gc_alloc`, which returns the zeroed body pointer in x0. A GC point, so
+// it records a safepoint (buildIntervals counts gc_alloc too).
+function emitGcAlloc(cx: A64Ctx, dst: int, size: int, ptrOffsets: []int) {
+  let name = typeInfoSymbol(cx.f.instrs[dst].ty, size, ptrOffsets)
+  emitAddrOf(cx, argReg(RegClass.Int, 0), name) // arg0 = x0
+  emitCallReloc(cx, "bit_rt_gc_alloc")
+  recordSafepoint(cx, codeLen(cx))
+  putInt(cx, dst, retRegNum())
+}
+
+// type_info: materialize the address of a named type's static TypeInfo blob. Not
+// a call and not a GC point — the descriptor is a .rodata constant (its
+// non-reference result type keeps it out of the stack map).
+function emitTypeInfo(cx: A64Ctx, dst: int, disc: int, size: int, ptrOffsets: []int) {
+  emitAddrOf(cx, scratch1(), typeInfoSymbol(disc, size, ptrOffsets))
+  putInt(cx, dst, scratch1())
+}
+
+// A closure value is a pointer to a 16-byte GC cell {code_ptr, env_ptr}: the code
+// pointer at +0 (into .text, never a GC ref) and the captured environment at +8
+// (the cell's one GC field). Single-word, so it flows through the register
+// allocator like any other reference.
+function closureCellSize(): int {
+  return 16
+}
+
+function closureCellPtrOffsets(): []int {
+  return [8]
+}
+
+// make_closure: allocate the {code, env} cell (a GC point, like emitGcAlloc),
+// then store the target function's address at +0 and the already-materialized
+// environment pointer at +8.
+function emitMakeClosure(cx: A64Ctx, dst: int, funcName: string, env: int) {
+  let ti = typeInfoSymbol(cx.f.instrs[dst].ty, closureCellSize(), closureCellPtrOffsets())
+  emitAddrOf(cx, argReg(RegClass.Int, 0), ti) // x0 = &TypeInfo
+  emitCallReloc(cx, "bit_rt_gc_alloc")
+  recordSafepoint(cx, codeLen(cx))
+  // x0 = cell. Store code address at +0 and the env pointer at +8.
+  let cell = retRegNum()
+  emitAddrOf(cx, scratch1(), funcName) // x9 = &code
+  storeImm(cx.code, scratch1(), cell, 0, 8)
+  storeImm(cx.code, getInt(cx, vregOf(cx, env), scratch1()), cell, 8, 8)
+  putInt(cx, dst, cell)
+}
+
+// func_addr: materialize a function's code address into `dst` via a
+// page21/pageoff12 relocation pair to its own symbol (the same primitive
+// make_closure uses to fill a cell's code slot, minus the cell). No call.
+function emitFuncAddr(cx: A64Ctx, dst: int, funcName: string) {
+  emitAddrOf(cx, scratch1(), funcName)
+  putInt(cx, dst, scratch1())
+}
+
+// call_value: dispatch through a closure. Load the environment (+8) and code
+// pointer (+0) into reserved scratch regs argument marshaling never touches
+// (x10/x11 are not argument registers; x9 is the parallel-move cycle temp),
+// marshal the real arguments into x1.., place the environment in x0, then blr. A
+// call is a GC point, so it records a safepoint.
+function emitCallValue(cx: A64Ctx, dst: int, dstTy: int, callee: int, args: []int) {
+  let cell = getInt(cx, vregOf(cx, callee), scratch1())
+  loadImm(cx.code, scratch2(), cell, 8, 8, false) // x10 = env
+  loadImm(cx.code, scratch3(), cell, 0, 8, false) // x11 = code
+  marshalArgs(cx, args, 1, 0)
+  movRR(cx.code, argReg(RegClass.Int, 0), scratch2()) // x0 = env
+  blr(cx.code, scratch3())
+  recordSafepoint(cx, codeLen(cx))
+  bindCallResult(cx, dst, dstTy, false)
+}
+
+// call_iface: structural interface dispatch (ABI.md §2.1). Load the receiver
+// object's TypeInfo (*(recv - 32), the header's `info` field), resolve the method
+// id to a code address via bit_rt_iface_lookup, then blr it with the receiver in
+// x0. The lookup never collects, so only the final method call records a
+// safepoint (like emitCallValue); the receiver is reloaded from its vreg
+// afterward (its home survives the lookup call).
+function emitCallIface(cx: A64Ctx, dst: int, dstTy: int, ifaceVal: int, methodId: int, args: []int) {
+  let recv = getInt(cx, vregOf(cx, ifaceVal), scratch1())
+  addSubImmediate(cx.code, true, scratch2(), recv, 32, false) // x10 = recv - 32
+  loadImm(cx.code, scratch2(), scratch2(), 0, 8, false)       // x10 = info
+  movRR(cx.code, argReg(RegClass.Int, 0), scratch2())         // x0 = info
+  movImm64(cx.code, argReg(RegClass.Int, 1), methodId)        // x1 = id
+  emitCallReloc(cx, "bit_rt_iface_lookup")                    // x0 = method code address
+  movRR(cx.code, scratch3(), retRegNum())                     // x11 = fn, survives marshaling
+  marshalArgs(cx, args, 1, 0)
+  movRR(cx.code, argReg(RegClass.Int, 0), getInt(cx, vregOf(cx, ifaceVal), scratch1())) // x0 = recv
+  blr(cx.code, scratch3())
+  recordSafepoint(cx, codeLen(cx))
+  bindCallResult(cx, dst, dstTy, false)
+}
+
+// ===========================================================================
+// Block edges and the epilogue
+// ===========================================================================
+
+// True iff a jump/br targeting `target` is a loop back-edge. Block ids are
+// emitted in ascending order, so any edge that does not advance closes a loop —
+// the conservative test the safepoint contract (runtime/ABI.md §5) needs: a loop
+// with no call in it must still reach a safepoint, or a spinning thread would
+// never yield to the collector.
+function isBackEdge(curBlock: int, target: int): bool {
+  return target <= curBlock
+}
+
+function emitBackEdgeSafepointIfNeeded(cx: A64Ctx, curBlock: int, target: int) {
+  if (isBackEdge(curBlock, target)) {
+    emitCall(cx, -1, 0, safepointSymbol(), []int(0), true)
+  }
+}
+
+// Binds a jump's arguments to the target block's parameters. All of them at once
+// — a naive sequential emission would clobber a source another move still needs.
+function moveBlockArgs(cx: A64Ctx, target: int, args: []int) {
+  let tb = cx.f.blocks[target]
+  let intMoves = []PMove(0)
+  let floatMoves = []PMove(0)
+  let i = 0
+  while (i < len(args)) {
+    let paramV = tb.instsStart + i
+    let class = regClassOf(cx.module.ctx, cx.f.instrs[paramV].ty)
+    let m = PMove{ src: plocOf(cx, vregOf(cx, args[i]), class),
+      dst: plocOf(cx, vregOf(cx, paramV), class) }
+    if (class == RegClass.Int) {
+      intMoves = append(intMoves, m)
+    } else {
+      floatMoves = append(floatMoves, m)
+    }
+    i = i + 1
+  }
+  sequentializeAndEmit(cx, intMoves, RegClass.Int)
+  sequentializeAndEmit(cx, floatMoves, RegClass.Float)
+}
+
+function emitEpilogueAndRet(cx: A64Ctx) {
+  let i = 0
+  while (i < len(cx.frame.savedFpr)) {
+    loadImmF(cx.code, cx.frame.savedFpr[i], regSp(), fprSaveOffset(cx.frame, i), 8)
+    i = i + 1
+  }
+  i = 0
+  while (i < len(cx.frame.savedGpr)) {
+    loadImm(cx.code, cx.frame.savedGpr[i], regSp(), gprSaveOffset(cx.frame, i), 8, false)
+    i = i + 1
+  }
+  loadImm(cx.code, 29, regSp(), savedFpOffset(cx.frame), 8, false)
+  loadImm(cx.code, 30, regSp(), savedLrOffset(cx.frame), 8, false)
+  addSubImmWide(cx.code, false, regSp(), regSp(), cx.frame.frameSize)
+  emitRet(cx.code)
+}

@@ -882,12 +882,14 @@ function checkArm64Operands() {
 // selector's operands and result are trivially predictable.
 function selCtx(): A64Ctx {
   let cx = testA64Ctx()
-  cx.intRegs = [0, 1, 2, 3, 4, 5, 6, 7]
-  cx.floatRegs = [0, 1, 2, 3, 4, 5, 6, 7]
+  // x0..x7 / d0..d7 are the argument registers; the rest are callee-saved, so a
+  // value in one of them can only reach an argument register by a real move.
+  cx.intRegs = [0, 1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22]
+  cx.floatRegs = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
   let locs = []RegLoc(0)
   let ivs = []int(0)
   let i = 0
-  while (i < 8) {
+  while (i < 12) {
     locs = append(locs, RegLoc{ isSpill: false, index: i })
     ivs = append(ivs, i)
     i = i + 1
@@ -1065,6 +1067,165 @@ function constShiftAmountOf(op: Op, ival: int): int {
     blocks: []IrBlock(0), instrs: [ins], isFallible: false }, 0)
 }
 
+// Stage 3 (#1342 slice 4b) calls: AAPCS64 argument marshalling, the ABI
+// boundaries where a foreign convention meets ours, and safepoint recording.
+function checkRtSymbols() {
+  assert(rtSymbol("string_concat") == "bit_rt_string_concat")
+  assert(rtSymbol("map_len") == "bit_rt_map_len")
+  // The two runtime exports whose symbol is not the tag prefixed with bit_rt_.
+  assert(rtSymbol("err_set") == "bit_rt_set_err")
+  assert(rtSymbol("err_get") == "bit_rt_get_err")
+  assert(safepointSymbol() == "bit_rt_safepoint")
+
+  // The TypeInfo symbol encodes the shape, so identical layouts share one blob.
+  assert(typeInfoSymbol(7, 16, []int(0)) == "__bittype_7_16")
+  assert(typeInfoSymbol(7, 16, [8]) == "__bittype_7_16_8")
+  assert(typeInfoSymbol(3, 24, [0, 8, 16]) == "__bittype_3_24_0_8_16")
+}
+
+function checkArm64Marshal() {
+  // AAPCS64 counts int and float arguments INDEPENDENTLY: (i64, f64, i64) lands
+  // in x0, d0, x1 — not x0, d1, x2. Values live in xN/dN for vreg N, so the first
+  // argument is already home and only the other two move.
+  let cx = selCtx()
+  let ctx = cx.module.ctx
+  let i64t = primType(ctx, 3)
+  let f64t = primType(ctx, 9)
+  cx.f.instrs = [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, f64t),
+    mkInstr(Op.BlockParam, i64t)]
+  marshalArgs(cx, [0, 1, 2], 0, 0)
+  let want = newByteBuf()
+  movRR(want, 1, 2)      // x1 <- x2 (the second INT argument)
+  fmovFF(want, 0, 1, 8)  // d0 <- d1 (the first FLOAT argument)
+  assertSameBytes(cx.code, want)
+
+  // The closure/interface paths reserve x0, so their first int argument is x1.
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, i64t)]
+  marshalArgs(cx, [0], 1, 0)
+  want = newByteBuf()
+  movRR(want, 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // Past x0..x7 the rest overflow to the outgoing area at the bottom of the
+  // frame, at [sp + 8*k] in argument order. The first eight are already home.
+  cx = selCtx()
+  cx.frame = FrameInfo{ savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 0,
+    outgoingBytes: 16, frameSize: 64 }
+  let instrs = []IrInstr(0)
+  let args = []int(0)
+  let i = 0
+  while (i < 10) {
+    instrs = append(instrs, mkInstr(Op.BlockParam, i64t))
+    args = append(args, i)
+    i = i + 1
+  }
+  cx.f.instrs = instrs
+  marshalArgs(cx, args, 0, 0)
+  want = newByteBuf()
+  storeImm(want, 19, regSp(), 0, 8) // 9th argument -> [sp + 0]
+  storeImm(want, 20, regSp(), 8, 8) // 10th        -> [sp + 8]
+  assertSameBytes(cx.code, want)
+
+  // A spilled overflow argument stages through scratch1 rather than a second
+  // outgoing slot.
+  cx = selCtx()
+  emitOutgoingStackArg(cx, plocMem(24), RegClass.Int, 8)
+  want = newByteBuf()
+  loadImm(want, scratch1(), regSp(), 24, 8, false)
+  storeImm(want, scratch1(), regSp(), 8, 8)
+  assertSameBytes(cx.code, want)
+}
+
+function checkArm64Calls() {
+  let cx = selCtx()
+  let ctx = cx.module.ctx
+  let i64t = primType(ctx, 3)
+  let boolt = primType(ctx, 10)
+
+  // A C callee returns bool in w0 and leaves x0's upper bits unspecified, so an
+  // int-class bool result is normalized with uxtb at this boundary. Without it,
+  // `!b` and the branch tests — which read the whole register — read garbage.
+  cx.f.instrs = [mkInstr(Op.BlockParam, boolt)]
+  emitCall(cx, 1, boolt, "bit_rt_fs_exists", []int(0), false)
+  let want = newByteBuf()
+  emitWord(want, 0x94000000) // bl (placeholder)
+  uxtb(want, 0)
+  movRR(want, 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // A non-bool result needs no normalization.
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, i64t)]
+  emitCall(cx, 1, i64t, "bit_rt_time_mono_ns", []int(0), false)
+  want = newByteBuf()
+  emitWord(want, 0x94000000)
+  movRR(want, 1, 0)
+  assertSameBytes(cx.code, want)
+
+  // A discarded result binds nothing at all.
+  cx = selCtx()
+  emitCall(cx, -1, 0, "bit_rt_safepoint", []int(0), false)
+  assert(len(cx.code.bytes) == 4)
+
+  // call_value: env and code load into scratch regs that argument marshalling
+  // never touches, x0 takes the env, then blr. Not a bl — no relocation. The real
+  // argument must land in x1: it is passed with the int bank already one deep, so
+  // that `x0 = env` does not clobber it. (Hence a genuine argument here — with an
+  // empty list this would pass no matter which bank depth the call used.)
+  cx = selCtx()
+  cx.f.instrs = [mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t),
+    mkInstr(Op.BlockParam, i64t), mkInstr(Op.BlockParam, i64t)]
+  cx.result.stackMaps = [StackMapEntry{ pos: 0, regs: []int(0), slots: []int(0) }]
+  cx.safepointPositions = [0]
+  emitCallValue(cx, 3, i64t, 0, [2])
+  want = newByteBuf()
+  loadImm(want, scratch2(), 0, 8, 8, false) // x10 = env
+  loadImm(want, scratch3(), 0, 0, 8, false) // x11 = code
+  movRR(want, 1, 2)                         // x1 = arg (NOT x0)
+  movRR(want, 0, scratch2())                // x0 = env
+  blr(want, scratch3())
+  movRR(want, 3, 0)
+  assertSameBytes(cx.code, want)
+  assert(len(cx.relocs) == 0 && len(cx.safepoints) == 1)
+  // The safepoint's return address is the byte AFTER the blr.
+  assert(cx.safepoints[0].retOffset == 20)
+}
+
+function checkArm64Safepoints() {
+  // Block ids are emitted in ascending order, so any edge that does not advance
+  // closes a loop and needs a safepoint — a loop with no call in it must still
+  // yield to the collector.
+  assert(isBackEdge(3, 3) && isBackEdge(3, 1))
+  assert(!isBackEdge(3, 4))
+
+  let cx = selCtx()
+  cx.result.stackMaps = [StackMapEntry{ pos: 0, regs: []int(0), slots: []int(0) }]
+  cx.safepointPositions = [0]
+  emitBackEdgeSafepointIfNeeded(cx, 2, 5) // forward: nothing
+  assert(len(cx.code.bytes) == 0 && len(cx.safepoints) == 0)
+  emitBackEdgeSafepointIfNeeded(cx, 2, 1) // back-edge: bl bit_rt_safepoint
+  assert(len(cx.code.bytes) == 4 && len(cx.relocs) == 1)
+  assert(cx.relocs[0].symbol == "bit_rt_safepoint")
+  assert(len(cx.safepoints) == 1)
+
+  // A stack map's slot offsets are normalized to FRAME-POINTER-relative
+  // (x29 = sp + frameSize - 16) so the runtime's walker stays arch-neutral, and
+  // its register indices are resolved to physical register numbers.
+  cx = selCtx()
+  cx.frame = FrameInfo{ savedGpr: []int(0), savedFpr: []int(0), numSpillSlots: 2,
+    outgoingBytes: 16, frameSize: 64 }
+  cx.result.stackMaps = [StackMapEntry{ pos: 7, regs: [8], slots: [0, 1] }]
+  cx.safepointPositions = [7]
+  recordSafepoint(cx, 40)
+  assert(len(cx.safepoints) == 1 && cx.nextSafepointIdx == 1)
+  let sp = cx.safepoints[0]
+  assert(sp.retOffset == 40)
+  assert(len(sp.regs) == 1 && sp.regs[0] == 19) // intRegs[8] == x19, not index 8
+  // fpBase == 64-16 == 48; slot 0 sits at sp+16, slot 1 at sp+24.
+  assert(len(sp.slots) == 2 && sp.slots[0] == 0 - 32 && sp.slots[1] == 0 - 24)
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -1211,6 +1372,10 @@ function selfcheck() {
   checkArm64Extend()
   checkArm64Selectors()
   checkArm64Conds()
+  checkRtSymbols()
+  checkArm64Marshal()
+  checkArm64Calls()
+  checkArm64Safepoints()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
