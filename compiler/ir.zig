@@ -169,6 +169,9 @@ pub const RtFn = enum {
     fs_mkdir,
     fs_remove,
     fs_list_dir,
+    /// `fs_chmod(path, mode) -> i64`: set a file's permission bits (0 ok, -1
+    /// err). The self-hosted compiler needs it to mark its output executable.
+    fs_chmod,
     /// Non-blocking TCP (ABI.md §20), under `std/net`. Any of these may park the
     /// calling green thread on the netpoller; none blocks an OS thread.
     /// `net_listen(host, port) -> fd`; `net_local_port(fd) -> port` (recovers the

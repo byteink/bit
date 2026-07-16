@@ -1741,6 +1741,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .fs_mkdir = "bit_rt_fs_mkdir",
     .fs_remove = "bit_rt_fs_remove",
     .fs_list_dir = "bit_rt_fs_list_dir",
+    .fs_chmod = "bit_rt_fs_chmod",
     .net_listen = "bit_rt_net_listen",
     .net_local_port = "bit_rt_net_local_port",
     .net_accept = "bit_rt_net_accept",

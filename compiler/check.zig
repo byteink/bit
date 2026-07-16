@@ -2756,6 +2756,9 @@ const Checker = struct {
         .{ "parseFloat", PrimSig{ .params = &.{.string}, .ret = .f64 } },
         // Float bit patterns, for the self-hosted compiler's `const_float`
         // codegen: `floatBits(v: f64) -> u64`, `float32Bits(v: f32) -> u32`.
+        // `fsChmod(path: string, mode: i64) -> i64` (0 ok, -1 err) — the
+        // self-hosted compiler marks its own output executable.
+        .{ "fsChmod", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
         .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
         .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
     });
