@@ -706,6 +706,42 @@ function lowerFieldAccess(fc: FnCtx, node: int): int {
   return builderEmit(fc.b, ins)
 }
 
+// Lowers an index read `a[i]`: a slice via `rt_call slice_get`, a map via
+// `map_get`, a string via `string_byte`, a fixed array via the `index_get` op.
+function lowerIndex(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let recvTy = defaultType(fc.c, checkExprType(fc.c, k[0]))
+  let ty = defaultType(fc.c, checkExprType(fc.c, node))
+  let recv = lowerExpr(fc, k[0])
+  let idx = lowerExpr(fc, k[1])
+  if (fc.failed) {
+    return 0
+  }
+  let rd = fc.c.ctx.types[recvTy]
+  if (rd.kind == TypeKind.Slice) {
+    let ins = mkInstr(Op.RtCall, ty)
+    ins.name = "slice_get"
+    ins.args = [recv, idx]
+    return builderEmit(fc.b, ins)
+  }
+  if (rd.kind == TypeKind.Map) {
+    let ins = mkInstr(Op.RtCall, ty)
+    ins.name = "map_get"
+    ins.args = [recv, idx]
+    return builderEmit(fc.b, ins)
+  }
+  if (rd.kind == TypeKind.Prim && rd.prim == 11) {
+    let ins = mkInstr(Op.RtCall, ty)
+    ins.name = "string_byte"
+    ins.args = [recv, idx]
+    return builderEmit(fc.b, ins)
+  }
+  let ins = mkInstr(Op.IndexGet, ty)
+  ins.lhs = recv
+  ins.rhs = idx
+  return builderEmit(fc.b, ins)
+}
+
 // Converts a lowered value to a string for interpolation (§5.7): a string is
 // itself; bool/float/int dispatch to their `string_from_*` runtime call. A
 // struct/interface `show()` operand falls back for now.
@@ -822,6 +858,9 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   }
   if (tag == Tag.Member) {
     return lowerFieldAccess(fc, node)
+  }
+  if (tag == Tag.Index) {
+    return lowerIndex(fc, node)
   }
   if (tag == Tag.Ident) {
     let name = fc.c.source[n.span.start:n.span.end]
@@ -1137,6 +1176,78 @@ function arithOpFor(fc: FnCtx, base: int, ty: int): Op {
 // Lowers an assignment to a simple local `x`: `x = e` SSA-reassigns the local's
 // value; `x op= e` reads it, applies the base op, and reassigns. ponytail:
 // single simple-ident target only; field/index lvalues land next.
+// Lowers `s.f = v` to `field_set %s[offset] = %v` at the field's byte offset.
+// ponytail: inline-array fields (copy semantics) deferred.
+function lowerFieldStore(fc: FnCtx, lhs: int, rhs: int) {
+  let mk = kidsOf(fc.c.tree, lhs)
+  let recvTy = checkExprType(fc.c, mk[0])
+  if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
+    fc.failed = true
+    return
+  }
+  let decl = structDeclByName(fc.c, typeName(fc.c.ctx, recvTy))
+  if (decl == 0) {
+    fc.failed = true
+    return
+  }
+  let fields = structFieldNodes(fc.c, decl)
+  let mn = getNode(fc.c.tree, mk[1])
+  let fidx = fieldIndexByName(fc.c, fields, fc.c.source[mn.span.start:mn.span.end])
+  if (fidx == -1) {
+    fc.failed = true
+    return
+  }
+  let fty = typeFromNode(fc.c, kidsOf(fc.c.tree, fields[fidx])[1])
+  if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+    fc.failed = true
+    return
+  }
+  let recv = lowerExpr(fc, mk[0])
+  let v = lowerExprH(fc, rhs, fty)
+  if (fc.failed) {
+    return
+  }
+  let ins = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  ins.lhs = recv
+  ins.ival = structLayout(fc, decl).offsets[fidx]
+  ins.rhs = v
+  builderEmit(fc.b, ins)
+}
+
+// Lowers `a[i] = v`: a slice via `rt_call slice_set`, a map via `map_set`, a
+// fixed array via the `index_set` op.
+function lowerIndexStore(fc: FnCtx, lhs: int, rhs: int) {
+  let k = kidsOf(fc.c.tree, lhs)
+  let recvTy = defaultType(fc.c, checkExprType(fc.c, k[0]))
+  let rd = fc.c.ctx.types[recvTy]
+  let recv = lowerExpr(fc, k[0])
+  let idx = lowerExpr(fc, k[1])
+  let elemTy = defaultType(fc.c, checkExprType(fc.c, lhs))
+  let v = lowerExprH(fc, rhs, elemTy)
+  if (fc.failed) {
+    return
+  }
+  if (rd.kind == TypeKind.Slice) {
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = "slice_set"
+    ins.args = [recv, idx, v]
+    builderEmit(fc.b, ins)
+    return
+  }
+  if (rd.kind == TypeKind.Map) {
+    let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    ins.name = "map_set"
+    ins.args = [recv, idx, v]
+    builderEmit(fc.b, ins)
+    return
+  }
+  let ins = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+  ins.lhs = recv
+  ins.rhs = idx
+  ins.ival = v
+  builderEmit(fc.b, ins)
+}
+
 function lowerAssign(fc: FnCtx, node: int) {
   let opKind = getNode(fc.c.tree, node).main
   let k = kidsOf(fc.c.tree, node)
@@ -1147,6 +1258,15 @@ function lowerAssign(fc: FnCtx, node: int) {
     return
   }
   let ln = getNode(fc.c.tree, lhsItems[0])
+  // A plain assignment to a struct field or a collection element.
+  if (opKind == int(Kind.Eq) && ln.tag == Tag.Member) {
+    lowerFieldStore(fc, lhsItems[0], rhsItems[0])
+    return
+  }
+  if (opKind == int(Kind.Eq) && ln.tag == Tag.Index) {
+    lowerIndexStore(fc, lhsItems[0], rhsItems[0])
+    return
+  }
   if (ln.tag != Tag.Ident) {
     fc.failed = true
     return
