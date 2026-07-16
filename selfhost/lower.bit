@@ -510,6 +510,202 @@ function lowerCall(fc: FnCtx, node: int): int {
   return 0
 }
 
+// A struct field's byte size and whether it holds a GC reference (ABI: prims by
+// width, string/slice/map/chan/tuple/struct/interface/func are 8-byte handles).
+// ponytail: enums treated as ref handles; C-like-enum non-ptr fields deferred.
+struct FieldLayout {
+  size: int,
+  isPtr: bool,
+}
+
+function fieldLayoutFor(fc: FnCtx, ty: int): FieldLayout {
+  let t = fc.c.ctx.types[ty]
+  if (t.kind == TypeKind.Prim) {
+    let p = t.prim
+    if (p == 0 || p == 4 || p == 10) {
+      return FieldLayout{ size: 1, isPtr: false }
+    }
+    if (p == 1 || p == 5) {
+      return FieldLayout{ size: 2, isPtr: false }
+    }
+    if (p == 2 || p == 6 || p == 8) {
+      return FieldLayout{ size: 4, isPtr: false }
+    }
+    if (p == 3 || p == 7 || p == 9) {
+      return FieldLayout{ size: 8, isPtr: false }
+    }
+  }
+  return FieldLayout{ size: 8, isPtr: true }
+}
+
+// Rounds `x` up to a multiple of `a`.
+function alignUp(x: int, a: int): int {
+  if (a <= 1) {
+    return x
+  }
+  return ((x + a - 1) / a) * a
+}
+
+// A struct's total size (8-aligned), per-field byte offsets, and the offsets of
+// its reference fields (for the GC descriptor). Mirrors layoutFields.
+struct StructLayout {
+  size: int,
+  offsets: []int,
+  ptrOffsets: []int,
+}
+
+// The StructDecl node for a named struct, or 0.
+function structDeclByName(c: Checker, name: string): int {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (getNode(c.tree, i).tag == Tag.StructDecl && declName(c, i) == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// A struct declaration's field nodes in order (unwrapping exported fields).
+function structFieldNodes(c: Checker, decl: int): []int {
+  let raw = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  let out = []int(0)
+  let i = 0
+  while (i < len(raw)) {
+    let f = raw[i]
+    if (getNode(c.tree, f).tag == Tag.Export) {
+      f = kidsOf(c.tree, f)[0]
+    }
+    out = append(out, f)
+    i = i + 1
+  }
+  return out
+}
+
+// Computes a struct's layout from its declaration (field decl order).
+function structLayout(fc: FnCtx, decl: int): StructLayout {
+  let fields = structFieldNodes(fc.c, decl)
+  let offsets = []int(0)
+  let ptrOffsets = []int(0)
+  let cur = 0
+  let i = 0
+  while (i < len(fields)) {
+    let fty = typeFromNode(fc.c, kidsOf(fc.c.tree, fields[i])[1])
+    let ft = fc.c.ctx.types[fty]
+    if (ft.kind == TypeKind.Array) {
+      let el = fieldLayoutFor(fc, ft.elem)
+      cur = alignUp(cur, el.size)
+      offsets = append(offsets, cur)
+      cur = cur + ft.arrayLen * el.size
+    } else {
+      let fl = fieldLayoutFor(fc, fty)
+      cur = alignUp(cur, fl.size)
+      offsets = append(offsets, cur)
+      if (fl.isPtr) {
+        ptrOffsets = append(ptrOffsets, cur)
+      }
+      cur = cur + fl.size
+    }
+    i = i + 1
+  }
+  return StructLayout{ size: alignUp(cur, 8), offsets: offsets, ptrOffsets: ptrOffsets }
+}
+
+// The declared-order index of a field name in a struct, or -1.
+function fieldIndexByName(c: Checker, fields: []int, name: string): int {
+  let i = 0
+  while (i < len(fields)) {
+    let fn = getNode(c.tree, kidsOf(c.tree, fields[i])[0])
+    if (c.source[fn.span.start:fn.span.end] == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Lowers a struct composite literal `T{f: v, ...}` to a `gc_alloc` (its GC
+// descriptor is the ref-field offsets) followed by a `field_set` per field, in
+// the literal's source order. ponytail: struct bodies only — []T/[N]T/map<K,V>
+// composites and inline-array fields land next.
+function lowerCompositeLit(fc: FnCtx, node: int): int {
+  let kids = kidsOf(fc.c.tree, node)
+  let structTy = typeFromNode(fc.c, kids[0])
+  if (structTy == 0 || fc.c.ctx.types[structTy].kind != TypeKind.Struct) {
+    fc.failed = true
+    return 0
+  }
+  let decl = structDeclByName(fc.c, typeName(fc.c.ctx, structTy))
+  if (decl == 0) {
+    fc.failed = true
+    return 0
+  }
+  let layout = structLayout(fc, decl)
+  let fields = structFieldNodes(fc.c, decl)
+  let ga = mkInstr(Op.GcAlloc, structTy)
+  ga.ival = layout.size
+  ga.offsets = layout.ptrOffsets
+  let obj = builderEmit(fc.b, ga)
+  let inits = kidsOf(fc.c.tree, kids[1])
+  let i = 0
+  while (i < len(inits)) {
+    let fk = kidsOf(fc.c.tree, inits[i])
+    let fn = getNode(fc.c.tree, fk[0])
+    let idx = fieldIndexByName(fc.c, fields, fc.c.source[fn.span.start:fn.span.end])
+    if (idx == -1) {
+      fc.failed = true
+      return 0
+    }
+    let fty = typeFromNode(fc.c, kidsOf(fc.c.tree, fields[idx])[1])
+    if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+      fc.failed = true
+      return 0
+    }
+    let val = lowerExpr(fc, fk[1])
+    if (fc.failed) {
+      return 0
+    }
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = obj
+    fs.ival = layout.offsets[idx]
+    fs.rhs = val
+    builderEmit(fc.b, fs)
+    i = i + 1
+  }
+  return obj
+}
+
+// Lowers a struct field access `s.f` to `field_get %s[offset] fieldType`.
+function lowerFieldAccess(fc: FnCtx, node: int): int {
+  let kids = kidsOf(fc.c.tree, node)
+  let recvTy = checkExprType(fc.c, kids[0])
+  if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
+    fc.failed = true
+    return 0
+  }
+  let decl = structDeclByName(fc.c, typeName(fc.c.ctx, recvTy))
+  if (decl == 0) {
+    fc.failed = true
+    return 0
+  }
+  let fields = structFieldNodes(fc.c, decl)
+  let mn = getNode(fc.c.tree, kids[1])
+  let idx = fieldIndexByName(fc.c, fields, fc.c.source[mn.span.start:mn.span.end])
+  if (idx == -1) {
+    fc.failed = true
+    return 0
+  }
+  let layout = structLayout(fc, decl)
+  let recvV = lowerExpr(fc, kids[0])
+  if (fc.failed) {
+    return 0
+  }
+  let ins = mkInstr(Op.FieldGet, typeFromNode(fc.c, kidsOf(fc.c.tree, fields[idx])[1]))
+  ins.lhs = recvV
+  ins.ival = layout.offsets[idx]
+  return builderEmit(fc.b, ins)
+}
+
 // Converts a lowered value to a string for interpolation (§5.7): a string is
 // itself; bool/float/int dispatch to their `string_from_*` runtime call. A
 // struct/interface `show()` operand falls back for now.
@@ -620,6 +816,12 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   }
   if (tag == Tag.Call) {
     return lowerCall(fc, node)
+  }
+  if (tag == Tag.CompositeLit) {
+    return lowerCompositeLit(fc, node)
+  }
+  if (tag == Tag.Member) {
+    return lowerFieldAccess(fc, node)
   }
   if (tag == Tag.Ident) {
     let name = fc.c.source[n.span.start:n.span.end]
