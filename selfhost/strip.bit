@@ -1,0 +1,310 @@
+// Self-host Stage 3 (#1344): symbol resolution, dead-strip, and relocation
+// arithmetic over the generic object model, ported from compiler/link/strip.zig.
+// Shared by every executable writer — none of this depends on the output
+// container. Given a set of modules it builds the whole-link global symbol
+// table, walks the relocation graph from the entry roots to decide which atoms
+// survive (so libbitrt.a + compiler-rt do not drag their whole std-lib closure
+// into every image), and applies one relocation to its field bytes given the
+// resolved addresses.
+
+// ---- little-endian writes -------------------------------------------------
+
+function loWrU32(b: []u8, off: int, v: int) {
+  b[off] = u8(v & 255)
+  b[off + 1] = u8((v >> 8) & 255)
+  b[off + 2] = u8((v >> 16) & 255)
+  b[off + 3] = u8((v >> 24) & 255)
+}
+
+function loWrU64(b: []u8, off: int, v: int) {
+  loWrU32(b, off, v & 0xFFFFFFFF)
+  loWrU32(b, off + 4, (v >> 32) & 0xFFFFFFFF)
+}
+
+// ---- whole-link symbol table ----------------------------------------------
+
+// Identifies one atom across the whole link: which module, and its index in that
+// module's atoms. Packed into one int for map keys, exactly as the seed packs it
+// into a u64.
+function atomKey(module: int, atom: int): int {
+  return (module << 32) | atom
+}
+
+function atomKeyModule(k: int): int {
+  return k >> 32
+}
+
+function atomKeyAtom(k: int): int {
+  return k & 0xFFFFFFFF
+}
+
+// name -> packed AtomId, over every global-binding atom in every module.
+//
+// Strong overrides weak; two weak definitions keep the first; two strong
+// definitions are a real conflict (e.g. a runtime symbol a Bit program also
+// defined). compiler-rt supplies many weak defaults (memcpy, strlen, ...) that
+// the runtime may strong-override.
+function resolveGlobals(modules: []LoModule): map<string, int>! {
+  let table = map<string, int>{}
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let atom = atoms[ai]
+      if (atom.binding != LoBinding.Global) {
+        ai = ai + 1
+        continue
+      }
+      let (existingKey, found) = table[atom.name]
+      if (found) {
+        let ex = modules[atomKeyModule(existingKey)].atoms[atomKeyAtom(existingKey)]
+        if (ex.weak && !atom.weak) {
+          table[atom.name] = atomKey(mi, ai)
+        } else if (!ex.weak && !atom.weak) {
+          fail newError("DuplicateSymbol")
+        }
+        ai = ai + 1
+        continue
+      }
+      table[atom.name] = atomKey(mi, ai)
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return table
+}
+
+// Resolves one relocation target to the atom it names: a local target is an
+// index into moduleIdx's own atoms; a global target goes through the whole-link
+// table.
+function resolveRef(globals: map<string, int>, moduleIdx: int, ref: LoSymbolRef): int! {
+  if (!ref.isGlobal) {
+    return atomKey(moduleIdx, ref.local)
+  }
+  let (k, found) = globals[ref.name]
+  if (!found) {
+    fail newError("UndefinedSymbol")
+  }
+  return k
+}
+
+// Marks every atom reachable from `roots` (global symbol names — the entry
+// _start, plus anything the container must keep regardless) by walking each kept
+// atom's relocations transitively. Everything unmarked is dead and the driver
+// drops it. An explicit work stack (not recursion) keeps the traversal bounded
+// and stack-safe over libbitrt's large call graph.
+function deadStrip(modules: []LoModule, globals: map<string, int>, roots: []string): map<int, bool>! {
+  let kept = map<int, bool>{}
+  let stack = []int(0)
+  let i = 0
+  while (i < len(roots)) {
+    let (id, found) = globals[roots[i]]
+    if (!found) {
+      fail newError("UndefinedSymbol")
+    }
+    let (seen, already) = kept[id]
+    if (!already) {
+      kept[id] = true
+      stack = append(stack, id)
+    }
+    i = i + 1
+  }
+
+  while (len(stack) > 0) {
+    let id = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    let cur = modules[atomKeyModule(id)].atoms[atomKeyAtom(id)]
+    let r = 0
+    while (r < len(cur.relocs)) {
+      let target = resolveRef(globals, atomKeyModule(id), cur.relocs[r].target)?
+      let (seen, already) = kept[target]
+      if (!already) {
+        kept[target] = true
+        stack = append(stack, target)
+      }
+      r = r + 1
+    }
+  }
+  return kept
+}
+
+// ---- relocation arithmetic ------------------------------------------------
+
+// The values a single relocation's arithmetic can need — the driver fills in
+// whichever apply to the kind. `s` is the target atom's final address plus the
+// reloc addend already (S + A); `p` is the field's own final address; `gotSlot`
+// is the address of the target's GOT entry (GOT kinds only); `tpOffset` is the
+// target's offset from the thread pointer (TLS kinds only, negative under the
+// x86-64 variant-II local-exec model).
+struct RelocValues {
+  s: int,
+  p: int,
+  gotSlot: int,
+  tpOffset: int,
+}
+
+function noValues(): RelocValues {
+  return RelocValues{ s: 0, p: 0, gotSlot: 0, tpOffset: 0 }
+}
+
+// Applies one relocation into `data` at `off` (the reloc's bytes within its
+// atom's data). The seed passes an already-sliced field; passing base+offset
+// avoids depending on slice aliasing to write through.
+function applyReloc(kind: LoRelocKind, data: []u8, off: int, v: RelocValues): ()! {
+  if (kind == LoRelocKind.Abs64) {
+    loWrU64(data, off, v.s)
+    return
+  }
+  if (kind == LoRelocKind.Abs32) {
+    loWrU32(data, off, v.s & 0xFFFFFFFF)
+    return
+  }
+  if (kind == LoRelocKind.Abs32Signed) {
+    if (v.s < 0 - 2147483648 || v.s > 2147483647) {
+      fail newError("RelocationOutOfRange")
+    }
+    loWrU32(data, off, v.s & 0xFFFFFFFF)
+    return
+  }
+  if (kind == LoRelocKind.Pc32) {
+    writePcRel32(data, off, v.s, v.p)?
+    return
+  }
+  if (kind == LoRelocKind.Got32) {
+    writePcRel32(data, off, v.gotSlot, v.p)?
+    return
+  }
+  if (kind == LoRelocKind.Tpoff32) {
+    // Variant II local-exec: value = S's thread-pointer offset + A. `tpOffset`
+    // already folds the addend, so this writes it straight as a signed 32-bit
+    // displacement.
+    if (v.tpOffset < 0 - 2147483648 || v.tpOffset > 2147483647) {
+      fail newError("RelocationOutOfRange")
+    }
+    loWrU32(data, off, v.tpOffset & 0xFFFFFFFF)
+    return
+  }
+
+  // ---- AArch64 instruction-field kinds (Mach-O arm64 executable) ----------
+  // Each patches a 4-byte little-endian instruction word in place. `s` already
+  // folds the addend; GOT/TLVP kinds address their indirection slot via gotSlot.
+  if (kind == LoRelocKind.Aarch64Call26 || kind == LoRelocKind.Aarch64Jump26) {
+    writeBranch26(data, off, v.s, v.p)?
+    return
+  }
+  if (kind == LoRelocKind.Aarch64AdrPrelPgHi21) {
+    writeAdrp(data, off, v.s, v.p)?
+    return
+  }
+  if (kind == LoRelocKind.Aarch64AdrGotPage || kind == LoRelocKind.Aarch64TlvpAdrPage21) {
+    writeAdrp(data, off, v.gotSlot, v.p)?
+    return
+  }
+  if (kind == LoRelocKind.Aarch64AddAbsLo12Nc || kind == LoRelocKind.Aarch64Ldst8AbsLo12Nc) {
+    writeLo12(data, off, v.s, 0)
+    return
+  }
+  if (kind == LoRelocKind.Aarch64Ldst16AbsLo12Nc) {
+    writeLo12(data, off, v.s, 1)
+    return
+  }
+  if (kind == LoRelocKind.Aarch64Ldst32AbsLo12Nc) {
+    writeLo12(data, off, v.s, 2)
+    return
+  }
+  if (kind == LoRelocKind.Aarch64Ldst64AbsLo12Nc) {
+    writeLo12(data, off, v.s, 3)
+    return
+  }
+  if (kind == LoRelocKind.Aarch64Ldst128AbsLo12Nc) {
+    writeLo12(data, off, v.s, 4)
+    return
+  }
+  if (kind == LoRelocKind.Aarch64Ld64GotLo12Nc || kind == LoRelocKind.Aarch64TlvpLd64Lo12) {
+    writeLo12(data, off, v.gotSlot, 3)
+    return
+  }
+  // AArch64 local-exec TLS (Variant I): X = TPREL(S) + A, already folded into
+  // tpOffset by the driver. The pair sets an ADD immediate to bits [23:12]
+  // (HI12) and [11:0] (LO12) of X, together covering a 24-bit thread-pointer
+  // offset.
+  assert(kind == LoRelocKind.TlsleAddTprelHi12 || kind == LoRelocKind.TlsleAddTprelLo12Nc)
+  let x = v.tpOffset
+  if (x < 0 || x >= (1 << 24)) {
+    fail newError("RelocationOutOfRange")
+  }
+  let bits12 = x
+  if (kind == LoRelocKind.TlsleAddTprelHi12) {
+    bits12 = x >> 12
+  }
+  writeLo12(data, off, bits12, 0)
+}
+
+// BL/B imm26 = (target - P) >> 2, signed 26-bit, at instruction bits [25:0].
+function writeBranch26(data: []u8, off: int, target: int, p: int): ()! {
+  let disp = target - p
+  if (disp & 3 != 0) { // branch targets are 4-aligned
+    fail newError("UnsupportedRelocation")
+  }
+  let imm = disp >> 2
+  if (imm < 0 - (1 << 25) || imm >= (1 << 25)) {
+    fail newError("RelocationOutOfRange")
+  }
+  loWrU32(data, off, (loRdU32(data, off) & 0xFC000000) | (imm & 0x03FFFFFF))
+}
+
+// ADRP imm21 = (page(target) - page(P)) >> 12, split into immlo (bits [30:29])
+// and immhi (bits [23:5]). page(x) = x & ~0xfff.
+function writeAdrp(data: []u8, off: int, target: int, p: int): ()! {
+  let pageMask = ~0xFFF
+  let delta = (target & pageMask) - (p & pageMask)
+  let imm = delta >> 12
+  if (imm < 0 - (1 << 20) || imm >= (1 << 20)) {
+    fail newError("RelocationOutOfRange")
+  }
+  let uimm = imm & 0x1FFFFF
+  let immlo = uimm & 0x3
+  let immhi = (uimm >> 2) & 0x7FFFF
+  let insn = loRdU32(data, off)
+  insn = insn & ~((0x3 << 29) | (0x7FFFF << 5))
+  loWrU32(data, off, insn | (immlo << 29) | (immhi << 5))
+}
+
+// ADD/LDR/STR imm12 = (value & 0xfff) >> scale, at bits [21:10]. `scale` is the
+// access-size log2 (0 for ADD and byte access, 3 for a 64-bit load).
+function writeLo12(data: []u8, off: int, value: int, scale: int) {
+  let imm12 = (value & 0xFFF) >> scale
+  let insn = loRdU32(data, off)
+  insn = insn & ~(0xFFF << 10)
+  loWrU32(data, off, insn | (imm12 << 10))
+}
+
+function writePcRel32(data: []u8, off: int, target: int, p: int): ()! {
+  let disp = target - p
+  if (disp < 0 - 2147483648 || disp > 2147483647) {
+    fail newError("RelocationOutOfRange")
+  }
+  loWrU32(data, off, disp & 0xFFFFFFFF)
+}
+
+// True for a relocation kind that must materialize a GOT slot for its target
+// (the driver pre-scans kept atoms for these to size the GOT).
+function needsGot(kind: LoRelocKind): bool {
+  return kind == LoRelocKind.Got32 || kind == LoRelocKind.Aarch64AdrGotPage ||
+    kind == LoRelocKind.Aarch64Ld64GotLo12Nc
+}
+
+// True for a macOS thread-local kind that must materialize a __thread_ptr slot
+// for its target tlv_descriptor (the driver sizes that table like the GOT).
+function needsTlvp(kind: LoRelocKind): bool {
+  return kind == LoRelocKind.Aarch64TlvpAdrPage21 ||
+    kind == LoRelocKind.Aarch64TlvpLd64Lo12
+}
+
+// True for a TLS-relative kind (its target lives in the TLS segment and resolves
+// to a thread-pointer offset, not a virtual address).
+function isTlsKind(kind: LoRelocKind): bool {
+  return kind == LoRelocKind.Tpoff32 || kind == LoRelocKind.TlsleAddTprelHi12 ||
+    kind == LoRelocKind.TlsleAddTprelLo12Nc
+}

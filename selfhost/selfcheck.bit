@@ -2098,6 +2098,256 @@ function checkMachoReaderRejects() {
   assert(mrErr(b3.bytes) == "Malformed")
 }
 
+// Stage 3 (#1344) symbol resolution, dead-strip, and relocation arithmetic.
+// Ports the seed's four tests. Every expected instruction word below was
+// produced by the SYSTEM assembler (clang -arch arm64) for the shown mnemonic,
+// not derived from the same arithmetic under test:
+//   bl .+16          -> 0x94000004
+//   b  .-16          -> 0x17fffffc
+//   add x0, x0, #2748 -> 0x912af000
+//   ldr x1, [x0, #2744] -> 0xf9455c01
+
+function stAtom(name: string, b: LoBinding, relocs: []LoReloc): LoAtom {
+  return LoAtom{ name: name, kind: LoSectionKind.Text, binding: b, data: []u8(0),
+    size: 0, alignment: 1, weak: false, relocs: relocs }
+}
+
+function stWeakAtom(name: string): LoAtom {
+  return LoAtom{ name: name, kind: LoSectionKind.Text, binding: LoBinding.Global,
+    data: []u8(0), size: 0, alignment: 1, weak: true, relocs: []LoReloc(0) }
+}
+
+function stRel(target: LoSymbolRef): LoReloc {
+  return LoReloc{ offset: 0, kind: LoRelocKind.Abs64, target: target, addend: 0 }
+}
+
+function stGlobalsErr(mods: []LoModule): string {
+  let msg = ""
+  let t = resolveGlobals(mods) catch e {
+    msg = e.message()
+    map<string, int>{}
+  }
+  return msg
+}
+
+function checkResolveGlobals() {
+  let mods = [
+    LoModule{ name: "rt", atoms: [stAtom("_start", LoBinding.Global, []LoReloc(0)),
+      stAtom("helper", LoBinding.Local, []LoReloc(0))] },
+    LoModule{ name: "user", atoms: [stAtom("bit_main", LoBinding.Global, []LoReloc(0))] }]
+  let g = resolveGlobals(mods) catch e { map<string, int>{} }
+  // Only global-binding atoms enter the table; a local is invisible outside its
+  // own module.
+  let (startId, hasStart) = g["_start"]
+  let (mainId, hasMain) = g["bit_main"]
+  let (_, hasHelper) = g["helper"]
+  assert(hasStart && hasMain && !hasHelper)
+  assert(atomKeyModule(startId) == 0 && atomKeyAtom(startId) == 0)
+  assert(atomKeyModule(mainId) == 1 && atomKeyAtom(mainId) == 0)
+
+  // Two strong definitions of one name is a real conflict.
+  assert(stGlobalsErr([
+    LoModule{ name: "a", atoms: [stAtom("dup", LoBinding.Global, []LoReloc(0))] },
+    LoModule{ name: "b", atoms: [stAtom("dup", LoBinding.Global, []LoReloc(0))] }]) == "DuplicateSymbol")
+
+  // Strong overrides weak, whichever order they appear in — compiler-rt supplies
+  // weak memcpy/strlen defaults the runtime may override.
+  let wThenS = [LoModule{ name: "crt", atoms: [stWeakAtom("memcpy")] },
+    LoModule{ name: "rt", atoms: [stAtom("memcpy", LoBinding.Global, []LoReloc(0))] }]
+  assert(stGlobalsErr(wThenS) == "")
+  let g2 = resolveGlobals(wThenS) catch e { map<string, int>{} }
+  let (mc, _) = g2["memcpy"]
+  assert(atomKeyModule(mc) == 1) // the strong one wins
+
+  let sThenW = [LoModule{ name: "rt", atoms: [stAtom("memcpy", LoBinding.Global, []LoReloc(0))] },
+    LoModule{ name: "crt", atoms: [stWeakAtom("memcpy")] }]
+  let g3 = resolveGlobals(sThenW) catch e { map<string, int>{} }
+  let (mc2, _) = g3["memcpy"]
+  assert(atomKeyModule(mc2) == 0) // still the strong one
+
+  // Two weak definitions keep the first.
+  let g4 = resolveGlobals([LoModule{ name: "a", atoms: [stWeakAtom("w")] },
+    LoModule{ name: "b", atoms: [stWeakAtom("w")] }]) catch e { map<string, int>{} }
+  let (w, _) = g4["w"]
+  assert(atomKeyModule(w) == 0)
+}
+
+function checkDeadStrip() {
+  // _start -> used -> deep; unused and its callee are unreachable and must die.
+  // This is what keeps libbitrt.a's std-lib closure out of every image.
+  let rt = LoModule{ name: "rt", atoms: [
+    stAtom("_start", LoBinding.Global, [stRel(loGlobalRef("used"))]),   // 0
+    stAtom("used", LoBinding.Global, [stRel(loLocalRef(3))]),           // 1
+    stAtom("unused", LoBinding.Global, [stRel(loLocalRef(4))]),         // 2
+    stAtom("deep", LoBinding.Local, []LoReloc(0)),                      // 3
+    stAtom("unused_callee", LoBinding.Local, []LoReloc(0))]}            // 4
+  let g = resolveGlobals([rt]) catch e { map<string, int>{} }
+  let kept = deadStrip([rt], g, ["_start"]) catch e { map<int, bool>{} }
+  assert(len(kept) == 3)
+  let (_, k0) = kept[atomKey(0, 0)]
+  let (_, k1) = kept[atomKey(0, 1)]
+  let (_, k2) = kept[atomKey(0, 2)]
+  let (_, k3) = kept[atomKey(0, 3)]
+  let (_, k4) = kept[atomKey(0, 4)]
+  assert(k0 && k1 && k3)       // reachable from the root
+  assert(!k2 && !k4)           // dead
+
+  // A cycle must terminate, not spin: the kept-set check happens before the
+  // push, so each atom enters the stack once.
+  let cyc = LoModule{ name: "c", atoms: [
+    stAtom("_start", LoBinding.Global, [stRel(loLocalRef(1))]),
+    stAtom("b", LoBinding.Local, [stRel(loLocalRef(0))])]}
+  let gc = resolveGlobals([cyc]) catch e { map<string, int>{} }
+  let keptc = deadStrip([cyc], gc, ["_start"]) catch e { map<int, bool>{} }
+  assert(len(keptc) == 2)
+
+  // A root nothing defines, and a reference to an undefined name, both fail
+  // loudly rather than silently dropping code.
+  let msg = ""
+  let k = deadStrip([rt], g, ["nonexistent"]) catch e {
+    msg = e.message()
+    map<int, bool>{}
+  }
+  assert(msg == "UndefinedSymbol")
+
+  let bad = LoModule{ name: "b", atoms: [
+    stAtom("_start", LoBinding.Global, [stRel(loGlobalRef("missing"))])]}
+  let gb = resolveGlobals([bad]) catch e { map<string, int>{} }
+  let msg2 = ""
+  let kbad = deadStrip([bad], gb, ["_start"]) catch e {
+    msg2 = e.message()
+    map<int, bool>{}
+  }
+  assert(msg2 == "UndefinedSymbol")
+}
+
+function stApply(kind: LoRelocKind, insn: int, v: RelocValues): int {
+  let d = []u8(4)
+  loWrU32(d, 0, insn)
+  applyReloc(kind, d, 0, v) catch e {
+    panic("applyReloc rejected a valid relocation: ${e.message()}")
+  }
+  return loRdU32(d, 0)
+}
+
+// applyReloc returns ()!, and a catch block on a void-fallible cannot simply
+// handle-and-continue: its last statement must either BE an expression of the ok
+// type or divert. An assignment is neither. Wrapping it in a value-returning
+// fallible sidesteps that.
+function applyRelocOk(kind: LoRelocKind, data: []u8, off: int, v: RelocValues): int! {
+  applyReloc(kind, data, off, v)?
+  return 0
+}
+
+function stApplyErr(kind: LoRelocKind, insn: int, v: RelocValues): string {
+  let d = []u8(8)
+  loWrU32(d, 0, insn)
+  let msg = ""
+  let r = applyRelocOk(kind, d, 0, v) catch e {
+    msg = e.message()
+    1
+  }
+  return msg
+}
+
+function checkRelocApply() {
+  // abs64 / abs32 write S+A straight into the field.
+  let d = []u8(8)
+  applyReloc(LoRelocKind.Abs64, d, 0, RelocValues{ s: 0x1122334455667788, p: 0,
+    gotSlot: 0, tpOffset: 0 }) catch e { panic("abs64: ${e.message()}") }
+  assert(loRdU64(d, 0) == 0x1122334455667788)
+  assert(int(d[0]) == 0x88 && int(d[7]) == 0x11) // little-endian
+
+  // pc32 = S - P.
+  let d2 = []u8(4)
+  applyReloc(LoRelocKind.Pc32, d2, 0, RelocValues{ s: 0x1000, p: 0x1010,
+    gotSlot: 0, tpOffset: 0 }) catch e { panic("pc32: ${e.message()}") }
+  assert(loRdI32(d2, 0) == 0 - 16)
+
+  // BL forward 16 bytes == the system assembler's `bl .+16`.
+  assert(stApply(LoRelocKind.Aarch64Call26, 0x94000000,
+    RelocValues{ s: 0x100000010, p: 0x100000000, gotSlot: 0, tpOffset: 0 }) == 0x94000004)
+  // B backward 16 bytes == `b .-16`. The opcode bits above imm26 are preserved.
+  assert(stApply(LoRelocKind.Aarch64Jump26, 0x14000000,
+    RelocValues{ s: 0x100000000, p: 0x100000010, gotSlot: 0, tpOffset: 0 }) == 0x17fffffc)
+
+  // ADRP: (page(S) - page(P)) >> 12, immlo at [30:29] and immhi at [23:5].
+  assert(stApply(LoRelocKind.Aarch64AdrPrelPgHi21, 0x90000000,
+    RelocValues{ s: 0x100004000, p: 0x100000000, gotSlot: 0, tpOffset: 0 }) == 0x90000020)
+  // A negative page delta sign-extends through immhi.
+  assert(stApply(LoRelocKind.Aarch64AdrPrelPgHi21, 0x90000000,
+    RelocValues{ s: 0x100000000, p: 0x100004000, gotSlot: 0, tpOffset: 0 }) == 0x90ffffe0)
+  // Same page: zero immediate.
+  assert(stApply(LoRelocKind.Aarch64AdrPrelPgHi21, 0x90000000,
+    RelocValues{ s: 0x100000abc, p: 0x100000fff, gotSlot: 0, tpOffset: 0 }) == 0x90000000)
+
+  // add x0, x0, #2748 == `add x0, x0, #0xabc`.
+  assert(stApply(LoRelocKind.Aarch64AddAbsLo12Nc, 0x91000000,
+    RelocValues{ s: 0x100004abc, p: 0, gotSlot: 0, tpOffset: 0 }) == 0x912af000)
+  // ldr x1, [x0, #2744]: the imm12 is SCALED by the access size (>>3).
+  assert(stApply(LoRelocKind.Aarch64Ldst64AbsLo12Nc, 0xf9400001,
+    RelocValues{ s: 0x100004ab8, p: 0, gotSlot: 0, tpOffset: 0 }) == 0xf9455c01)
+  // The same low bits at a different scale land differently — that is the whole
+  // reason the reader decodes the instruction to recover the scale.
+  assert(stApply(LoRelocKind.Aarch64Ldst8AbsLo12Nc, 0x39400000,
+    RelocValues{ s: 0x100004ab8, p: 0, gotSlot: 0, tpOffset: 0 }) == 0x396ae000)
+
+  // The GOT/TLVP kinds address their indirection slot, NOT the symbol.
+  assert(stApply(LoRelocKind.Aarch64AdrGotPage, 0x90000000,
+    RelocValues{ s: 0xdeadbeef, p: 0x100000000, gotSlot: 0x100004000, tpOffset: 0 }) == 0x90000020)
+  assert(stApply(LoRelocKind.Aarch64Ld64GotLo12Nc, 0xf9400000,
+    RelocValues{ s: 0xdeadbeef, p: 0, gotSlot: 0x100004ab8, tpOffset: 0 }) == 0xf9455c00)
+
+  // AArch64 local-exec TLS: the pair splits a 24-bit thread-pointer offset into
+  // bits [23:12] and [11:0] of two ADD immediates.
+  assert(stApply(LoRelocKind.TlsleAddTprelHi12, 0x91000000,
+    RelocValues{ s: 0, p: 0, gotSlot: 0, tpOffset: 0x123456 }) == 0x91000000 | (0x123 << 10))
+  assert(stApply(LoRelocKind.TlsleAddTprelLo12Nc, 0x91000000,
+    RelocValues{ s: 0, p: 0, gotSlot: 0, tpOffset: 0x123456 }) == 0x91000000 | (0x456 << 10))
+}
+
+function checkRelocRanges() {
+  // A branch target must be 4-aligned.
+  assert(stApplyErr(LoRelocKind.Aarch64Call26, 0x94000000,
+    RelocValues{ s: 0x100000002, p: 0x100000000, gotSlot: 0, tpOffset: 0 }) == "UnsupportedRelocation")
+  // imm26 covers +/-128MB; beyond that the branch cannot encode and must not
+  // silently truncate.
+  assert(stApplyErr(LoRelocKind.Aarch64Call26, 0x94000000,
+    RelocValues{ s: 0x108000000, p: 0x100000000, gotSlot: 0, tpOffset: 0 }) == "RelocationOutOfRange")
+  // The largest in-range forward branch encodes fine.
+  assert(stApplyErr(LoRelocKind.Aarch64Call26, 0x94000000,
+    RelocValues{ s: 0x100000000 + (1 << 27) - 4, p: 0x100000000, gotSlot: 0, tpOffset: 0 }) == "")
+
+  // ADRP covers +/-4GB.
+  assert(stApplyErr(LoRelocKind.Aarch64AdrPrelPgHi21, 0x90000000,
+    RelocValues{ s: 0x300000000, p: 0x100000000, gotSlot: 0, tpOffset: 0 }) == "RelocationOutOfRange")
+  // pc32 must fit a signed 32-bit displacement.
+  assert(stApplyErr(LoRelocKind.Pc32, 0,
+    RelocValues{ s: 0x200000000, p: 0, gotSlot: 0, tpOffset: 0 }) == "RelocationOutOfRange")
+  // A local-exec TLS offset past 24 bits cannot encode.
+  assert(stApplyErr(LoRelocKind.TlsleAddTprelHi12, 0x91000000,
+    RelocValues{ s: 0, p: 0, gotSlot: 0, tpOffset: 1 << 24 }) == "RelocationOutOfRange")
+}
+
+function checkRelocPredicates() {
+  // The driver pre-scans kept atoms with these to size the GOT and the
+  // __thread_ptr table.
+  assert(needsGot(LoRelocKind.Got32) && needsGot(LoRelocKind.Aarch64AdrGotPage))
+  assert(needsGot(LoRelocKind.Aarch64Ld64GotLo12Nc))
+  assert(!needsGot(LoRelocKind.Abs64) && !needsGot(LoRelocKind.Aarch64Call26))
+  assert(!needsGot(LoRelocKind.Aarch64TlvpAdrPage21)) // TLVP is its own table
+
+  assert(needsTlvp(LoRelocKind.Aarch64TlvpAdrPage21))
+  assert(needsTlvp(LoRelocKind.Aarch64TlvpLd64Lo12))
+  assert(!needsTlvp(LoRelocKind.Aarch64AdrGotPage))
+
+  assert(isTlsKind(LoRelocKind.Tpoff32) && isTlsKind(LoRelocKind.TlsleAddTprelHi12))
+  assert(isTlsKind(LoRelocKind.TlsleAddTprelLo12Nc))
+  assert(!isTlsKind(LoRelocKind.Abs64))
+  // A TLVP kind resolves through a slot, not a thread-pointer offset.
+  assert(!isTlsKind(LoRelocKind.Aarch64TlvpAdrPage21))
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -2266,6 +2516,11 @@ function selfcheck() {
   checkMachoReaderRoundTrip()
   checkMachoReaderPageoff12()
   checkMachoReaderRejects()
+  checkResolveGlobals()
+  checkDeadStrip()
+  checkRelocApply()
+  checkRelocRanges()
+  checkRelocPredicates()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
