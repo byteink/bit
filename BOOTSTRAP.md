@@ -80,12 +80,24 @@ diagnostic ordering that valid compiler source never reaches. Closing those to
 zero is bounded by the formal fuzz harness (#1332, not yet built; the fuzz crash
 corpus is empty), so it is deferred with that task rather than ground out blind.
 
-**Stage 2 — middle-end, next.** Ports `compiler/resolve.zig` (1.5k lines) +
-`compiler/check.zig` (5k lines) to `selfhost/{resolve,check}.bit`, verified via
-`--dump-types` (`line:col: name: type` per decl) and the checker `// error`
-diagnostics. Resolve has no standalone dump, so resolve and a minimal checker
-land together on the simplest vertical slice (literal-typed consts) first, then
-grow. Stage 3 (codegen/link → `--dump-ir`, then `stage2 == stage3`) follows.
+**Stage 2 — middle-end, type inference near-parity.** `selfhost/{resolve,types,
+check}.bit` port the resolve substrate + the type checker; `bitc2 --dump-types`
+diffs against the seed over the corpus:
+
+| Surface | Script | Result |
+|---------|--------|--------|
+| types | `scripts/selfhost-difftypes.sh` | 124/125 (202 check-error skips) |
+
+Inference covers literals + defaulting, idents/params/receivers, unary/binary
+merge, calls (free + generic-param substitution + runtime-primitive builtins),
+composites, index/slice/member, struct fields, enum variants (incl. turbofish),
+interface + type-parameter method dispatch, arrow-fn and uncalled method values,
+comma-ok (`<-ch` / `m[k]` / `x.(T)`), try/catch unwrap, the `error` interface,
+for-of binders, and transparent type aliases. The **1** remaining mismatch
+(`run_generic_nested`) needs generic type-*argument* tracking through instances
+(`Pair<i64>` → substitute `T`=i64), which the checker currently discards
+(instances render by bare name) — a substantive feature deferred to its own
+change. Stage 3 (codegen/link → `--dump-ir`, then `stage2 == stage3`) follows.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.
