@@ -32,6 +32,12 @@ struct Checker {
   tree: Tree,
   source: string,
   nodeTypes: []int,
+  // name -> TypeId for the bindings/params in scope, and name -> result type for
+  // top-level functions (a pre-pass fills the latter so forward calls resolve).
+  // ponytail: one flat env, no per-function scoping yet — fine until two
+  // functions bind the same name to different types.
+  env: map<string, int>,
+  funcResults: map<string, int>,
 }
 
 function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
@@ -41,7 +47,54 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     nt = append(nt, 0)
     i = i + 1
   }
-  return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt }
+  return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
+    env: map<string, int>{}, funcResults: map<string, int>{} }
+}
+
+// name -> TypeId from the scope env, or 0 (invalid) if unbound. ponytail: linear
+// scan pending map comma-ok lowering. [[bit-maps]]
+function envLookup(c: Checker, name: string): int {
+  for (k, v) of c.env {
+    if (k == name) {
+      return v
+    }
+  }
+  return 0
+}
+
+function funcResultLookup(c: Checker, name: string): int {
+  for (k, v) of c.funcResults {
+    if (k == name) {
+      return v
+    }
+  }
+  return 0
+}
+
+function isUntyped(c: Checker, t: int): bool {
+  return t == c.ctx.untypedIntId || t == c.ctx.untypedFloatId || t == c.ctx.untypedRuneId ||
+    t == c.ctx.untypedBoolId || t == c.ctx.untypedStringId || t == c.ctx.untypedNilId
+}
+
+// The result type of a binary arithmetic/bitwise operator: an untyped operand
+// takes the other's concrete type; matching types stay; otherwise the left one.
+function mergeTypes(c: Checker, a: int, b: int): int {
+  if (a == b) {
+    return a
+  }
+  if (isUntyped(c, a) && !isUntyped(c, b)) {
+    return b
+  }
+  if (isUntyped(c, b) && !isUntyped(c, a)) {
+    return a
+  }
+  return a
+}
+
+function isComparisonOp(op: int): bool {
+  return op == int(Kind.EqEq) || op == int(Kind.BangEq) || op == int(Kind.Lt) ||
+    op == int(Kind.Gt) || op == int(Kind.LtEq) || op == int(Kind.GtEq) ||
+    op == int(Kind.AmpAmp) || op == int(Kind.PipePipe)
 }
 
 // The prim-enum index for a predeclared type name, or -1 if not a primitive.
@@ -113,12 +166,13 @@ function typeFromNode(c: Checker, node: int): int {
 // The predeclared builtins that return void `()` (spec §5.3). Their call
 // expressions type as the void id regardless of arguments.
 function builtinReturnsVoid(name: string): bool {
-  return name == "print" || name == "panic" || name == "assert"
+  return name == "print" || name == "panic" || name == "assert" ||
+    name == "close" || name == "delete"
 }
 
-// Infers a call expression's result type. A call to a void-returning builtin
-// (`print`/`panic`/`assert`) is `()`; other callees need signature resolution
-// and infer to invalid (0) until that lands.
+// Infers a call expression's result type: a void builtin is `()`; a top-level
+// function call is its declared result; `chan<T>(n)`/`map<K,V>{}`-style
+// constructors are the constructed type. Unknown callees infer to invalid (0).
 function checkCall(c: Checker, node: int): int {
   let callee = kidsOf(c.tree, node)[0]
   let cn = getNode(c.tree, callee)
@@ -127,8 +181,50 @@ function checkCall(c: Checker, node: int): int {
     if (builtinReturnsVoid(name)) {
       return c.ctx.voidId
     }
+    let r = funcResultLookup(c, name)
+    if (r != 0) {
+      return r
+    }
+    // A primitive name used as a call is a conversion: `f64(x)` -> f64.
+    let p = primIndexByName(name)
+    if (p >= 0) {
+      return primType(c.ctx, p)
+    }
+    return 0
+  }
+  // `chan<T>(n)` / `[]T(n)` / `map<K,V>()` — the callee is a type node, so the
+  // result is that type.
+  if (cn.tag == Tag.ChanType || cn.tag == Tag.SliceType || cn.tag == Tag.MapType || cn.tag == Tag.ArrayType) {
+    return typeFromNode(c, callee)
   }
   return 0
+}
+
+// A receive `<-ch` yields the channel's element type; other unary operators
+// (`-`/`+`/`~`) preserve the operand type, and `!` yields its (bool) operand.
+function checkUnary(c: Checker, node: int): int {
+  let n = getNode(c.tree, node)
+  let ot = checkExprType(c, kidsOf(c.tree, node)[0])
+  if (n.main == int(Kind.ArrowLeft)) {
+    if (ot != 0 && c.ctx.types[ot].kind == TypeKind.Chan) {
+      return c.ctx.types[ot].elem
+    }
+    return 0
+  }
+  return ot
+}
+
+// Arithmetic/bitwise binaries merge their operand types; comparisons and logical
+// operators yield an (untyped) boolean.
+function checkBinary(c: Checker, node: int): int {
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  let a = checkExprType(c, kids[0])
+  let b = checkExprType(c, kids[1])
+  if (isComparisonOp(n.main)) {
+    return c.ctx.untypedBoolId
+  }
+  return mergeTypes(c, a, b)
 }
 
 // Infers an expression's (possibly untyped) type. Literals and void-builtin
@@ -142,6 +238,12 @@ function checkExprType(c: Checker, node: int): int {
   if (tag == Tag.BoolLit) { return c.ctx.untypedBoolId }
   if (tag == Tag.StringLit || tag == Tag.RawStringLit) { return c.ctx.untypedStringId }
   if (tag == Tag.NilLit) { return c.ctx.untypedNilId }
+  if (tag == Tag.Ident) {
+    let sp = getNode(c.tree, node).span
+    return envLookup(c, c.source[sp.start:sp.end])
+  }
+  if (tag == Tag.Unary) { return checkUnary(c, node) }
+  if (tag == Tag.Binary) { return checkBinary(c, node) }
   if (tag == Tag.Call) { return checkCall(c, node) }
   return 0
 }
@@ -161,15 +263,42 @@ function checkBinding(c: Checker, node: int) {
     ty = defaultType(c, checkExprType(c, init))
   }
   c.nodeTypes[pat] = ty
+  // Record a simple-ident binding so later expressions resolve it.
+  let pn = getNode(c.tree, pat)
+  if (pn.tag == Tag.Ident) {
+    c.env[c.source[pn.span.start:pn.span.end]] = ty
+  }
 }
 
 // Walks every node and types the bindings. (arrow-param and call typing land
 // with expression inference; a flat arena walk catches bindings at any nesting.)
 function checkModule(c: Checker) {
+  // Pre-pass: every top-level function's declared result type, so a call to a
+  // function defined later still resolves (§9 order-independence).
+  let f = 1
+  while (f < len(c.tree.nodes)) {
+    if (getNode(c.tree, f).tag == Tag.FuncDecl) {
+      let kids = kidsOf(c.tree, f)
+      let nm = getNode(c.tree, kids[1])
+      // An omitted result type is void `()` (§10.3).
+      let rty = c.ctx.voidId
+      if (kids[4] != 0) {
+        rty = typeFromNode(c, kids[4])
+      }
+      c.funcResults[c.source[nm.span.start:nm.span.end]] = rty
+    }
+    f = f + 1
+  }
+  // Main pass, in arena (source) order so a param/binding is recorded before the
+  // expressions that reference it.
   let i = 1
   while (i < len(c.tree.nodes)) {
     let tag = getNode(c.tree, i).tag
-    if (tag == Tag.Binding) {
+    if (tag == Tag.Param) {
+      let kids = kidsOf(c.tree, i)
+      let nm = getNode(c.tree, kids[0])
+      c.env[c.source[nm.span.start:nm.span.end]] = typeFromNode(c, kids[1])
+    } else if (tag == Tag.Binding) {
       checkBinding(c, i)
     } else if (tag == Tag.Call) {
       c.nodeTypes[i] = checkCall(c, i)
