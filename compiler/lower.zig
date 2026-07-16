@@ -2604,6 +2604,8 @@ const FnCtx = struct {
         .{ "cryptoRandomBytes", ir.RtFn.random_bytes },
         .{ "cryptoSecureZero", ir.RtFn.secure_zero },
         .{ "parseFloat", ir.RtFn.parse_float },
+        .{ "floatBits", ir.RtFn.float_bits },
+        .{ "float32Bits", ir.RtFn.float32_bits },
     });
 
     /// `append(s, e1, e2, ...)`: folds each element through `slice_append`,

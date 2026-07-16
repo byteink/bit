@@ -231,6 +231,11 @@ pub const RtFn = enum {
     /// `parse_float(text) -> f64`: the value of a float literal (`_` stripped).
     /// Used by the self-hosted compiler to fold a `FloatLit` to `const_float`.
     parse_float,
+    /// `float_bits(v) -> u64` / `float32_bits(v) -> u32`: an IEEE-754 value's raw
+    /// bit pattern. Used by the self-hosted compiler's backends to materialize a
+    /// float constant — Bit has no bitcast, and its numeric conversions truncate.
+    float_bits,
+    float32_bits,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

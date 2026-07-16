@@ -1005,6 +1005,20 @@ export fn bit_rt_parse_float(s: *const RtBytes) callconv(.c) f64 {
     return std.fmt.parseFloat(f64, buf[0..n]) catch 0;
 }
 
+/// `floatBits(v) -> u64` / `float32Bits(v) -> u32`: an IEEE-754 value's raw bit
+/// pattern. Bit has no bitcast operator and its `u64(x)` conversion is numeric
+/// (it truncates), so a compiler written in Bit cannot otherwise materialize a
+/// float constant into a register — the backends need exactly these bits to emit
+/// `movz`/`movk` + `fmov`. Added for the self-hosted compiler's `const_float`
+/// selection, the same reason `parse_float` exists.
+export fn bit_rt_float_bits(v: f64) callconv(.c) u64 {
+    return @bitCast(v);
+}
+
+export fn bit_rt_float32_bits(v: f32) callconv(.c) u32 {
+    return @bitCast(v);
+}
+
 export fn bit_rt_string_from_bool(v: bool) callconv(.c) *const RtBytes {
     return stringFromBytes(if (v) "true" else "false");
 }

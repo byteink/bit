@@ -2754,6 +2754,10 @@ const Checker = struct {
         // Float-literal parsing, for the self-hosted compiler's `FloatLit`
         // lowering: `parseFloat(text: string) -> f64`.
         .{ "parseFloat", PrimSig{ .params = &.{.string}, .ret = .f64 } },
+        // Float bit patterns, for the self-hosted compiler's `const_float`
+        // codegen: `floatBits(v: f64) -> u64`, `float32Bits(v: f32) -> u32`.
+        .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
+        .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
     });
 
     fn primSig(name: []const u8) ?PrimSig {

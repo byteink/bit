@@ -195,6 +195,8 @@ const predeclared_funcs = [_][]const u8{
     "cryptoRandomBytes", "cryptoSecureZero",
     // Float-literal parsing, for the self-hosted compiler's `FloatLit` lowering.
     "parseFloat",
+    // Float bit patterns, for the self-hosted compiler's `const_float` codegen.
+    "floatBits",   "float32Bits",
 };
 
 // ============================================================================
