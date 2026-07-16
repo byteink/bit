@@ -2411,6 +2411,188 @@ function lowerSwitch(fc: FnCtx, node: int) {
   }
 }
 
+// `select { case <comm>: <body> ... default: <body> }` (SPEC §16.3): each comm
+// clause's channel operand (and a send's value) is evaluated once into a
+// select_alloc'd descriptor buffer of 32-byte entries {dir @0, chan @8, word @16,
+// ok @24}; the runtime `select` returns the fired case index (or n for default),
+// which then dispatches like a value switch, binding a recv case's received word
+// (field_get buf[off+16]) before its body. `nconst` is emitted once and shared by
+// select_alloc and select.
+function lowerSelect(fc: FnCtx, node: int) {
+  let i64ty = primType(fc.c.ctx, 3)
+  let boolTy = primType(fc.c.ctx, 10)
+  let cases = kidsOf(fc.c.tree, node)
+  // Count comm cases; find the default body.
+  let n = 0
+  let defaultStmts = 0
+  let ci = 0
+  while (ci < len(cases)) {
+    let t = getNode(fc.c.tree, cases[ci]).tag
+    if (t == Tag.CommCase) {
+      n = n + 1
+    } else if (t == Tag.CommDefault) {
+      defaultStmts = kidsOf(fc.c.tree, cases[ci])[0]
+    }
+    ci = ci + 1
+  }
+  let hasDefault = defaultStmts != 0
+  // Pass 1: allocate the descriptor buffer, evaluate every comm exactly once.
+  let nc = mkInstr(Op.ConstInt, i64ty)
+  nc.ival = n
+  let nconst = builderEmit(fc.b, nc)
+  let alloc = mkInstr(Op.RtCall, i64ty)
+  alloc.name = "select_alloc"
+  alloc.args = [nconst]
+  let buf = builderEmit(fc.b, alloc)
+  let idx = 0
+  ci = 0
+  while (ci < len(cases) && !fc.failed) {
+    if (getNode(fc.c.tree, cases[ci]).tag != Tag.CommCase) {
+      ci = ci + 1
+      continue
+    }
+    let comm = kidsOf(fc.c.tree, cases[ci])[0]
+    let off = idx * 32
+    if (getNode(fc.c.tree, comm).tag == Tag.SendStmt) {
+      let sk = kidsOf(fc.c.tree, comm)
+      let chanTy = defaultType(fc.c, checkExprType(fc.c, sk[0]))
+      let ch = lowerExpr(fc, sk[0])
+      let v = lowerExprH(fc, sk[1], fc.c.ctx.types[chanTy].elem)
+      let dc = mkInstr(Op.ConstInt, i64ty)
+      dc.ival = 1
+      selectSet(fc, buf, off + 0, builderEmit(fc.b, dc))
+      selectSet(fc, buf, off + 8, ch)
+      selectSet(fc, buf, off + 16, v)
+    } else {
+      // recv_bind: [binder_or_none, chan]
+      let ch = lowerExpr(fc, kidsOf(fc.c.tree, comm)[1])
+      let dc = mkInstr(Op.ConstInt, i64ty)
+      selectSet(fc, buf, off + 0, builderEmit(fc.b, dc))
+      selectSet(fc, buf, off + 8, ch)
+    }
+    idx = idx + 1
+    ci = ci + 1
+  }
+  if (fc.failed) {
+    return
+  }
+  let hd = mkInstr(Op.ConstInt, i64ty)
+  if (hasDefault) {
+    hd.ival = 1
+  }
+  let sel = mkInstr(Op.RtCall, i64ty)
+  sel.name = "select"
+  sel.args = [buf, nconst, builderEmit(fc.b, hd)]
+  let fired = builderEmit(fc.b, sel)
+
+  // Pass 2: dispatch on `fired` — a value switch, binding recv results.
+  let preLen = len(fc.env)
+  let orig = snapshotValues(fc, preLen)
+  let join = builderNewBlock(fc.b)
+  let dflt = builderNewBlock(fc.b)
+  fc.loops = append(fc.loops, LoopFrame{ exit: join, cont: join, preLen: preLen, isSwitch: true })
+  let joinReachable = false
+  let seen = 0
+  ci = 0
+  while (ci < len(cases) && !fc.failed) {
+    if (getNode(fc.c.tree, cases[ci]).tag != Tag.CommCase) {
+      ci = ci + 1
+      continue
+    }
+    let ck = kidsOf(fc.c.tree, cases[ci])
+    let comm = ck[0]
+    let off = seen * 32
+    let cst = mkInstr(Op.ConstInt, i64ty)
+    cst.ival = seen
+    let eq = mkInstr(Op.ICmpEq, boolTy)
+    eq.lhs = fired
+    eq.rhs = builderEmit(fc.b, cst)
+    let cond = builderEmit(fc.b, eq)
+    let bodyBlk = builderNewBlock(fc.b)
+    let nextBlk = dflt
+    if (seen != n - 1) {
+      nextBlk = builderNewBlock(fc.b)
+    }
+    let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+    br.lhs = cond
+    br.ival = bodyBlk
+    br.thenArgs = []int(0)
+    br.ival2 = nextBlk
+    br.elseArgs = []int(0)
+    builderEmit(fc.b, br)
+    builderEndBlock(fc.b)
+    builderBeginBlock(fc.b, bodyBlk)
+    fc.terminated = false
+    restoreValues(fc, orig)
+    let mark = len(fc.env)
+    // A recv case with a binder reads the received word from the descriptor.
+    if (getNode(fc.c.tree, comm).tag == Tag.RecvBind) {
+      let rk = kidsOf(fc.c.tree, comm)
+      if (rk[0] != 0) {
+        let bn = getNode(fc.c.tree, rk[0])
+        if (bn.tag != Tag.Ident) {
+          fc.failed = true
+          return
+        }
+        let elemTy = fc.c.ctx.types[defaultType(fc.c, checkExprType(fc.c, rk[1]))].elem
+        let fg = mkInstr(Op.FieldGet, elemTy)
+        fg.lhs = buf
+        fg.ival = off + 16
+        let rv = builderEmit(fc.b, fg)
+        let name = fc.c.source[bn.span.start:bn.span.end]
+        declareLocal(fc, name, rv, elemTy)
+        fc.c.env[name] = elemTy
+      }
+    }
+    lowerStmtList(fc, ck[1])
+    truncateEnv(fc, mark)
+    if (!fc.terminated) {
+      joinReachable = true
+      emitJump(fc, join, snapshotValues(fc, preLen))
+    }
+    builderEndBlock(fc.b)
+    restoreValues(fc, orig)
+    builderBeginBlock(fc.b, nextBlk)
+    seen = seen + 1
+    ci = ci + 1
+  }
+  if (fc.failed) {
+    return
+  }
+  // "no case matched" (dflt) block: run the default body, if any, then join.
+  fc.terminated = false
+  restoreValues(fc, orig)
+  if (hasDefault) {
+    let mark = len(fc.env)
+    lowerStmtList(fc, defaultStmts)
+    truncateEnv(fc, mark)
+  }
+  if (!fc.terminated) {
+    joinReachable = true
+    emitJump(fc, join, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  restoreValues(fc, orig)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  builderBeginBlock(fc.b, join)
+  if (joinReachable) {
+    addJoinParams(fc, preLen)
+    fc.terminated = false
+  } else {
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    fc.terminated = true
+  }
+}
+
+// Emits `field_set buf[off] = val` for a select descriptor word.
+function selectSet(fc: FnCtx, buf: int, off: int, val: int) {
+  let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs.lhs = buf
+  fs.ival = off
+  fs.rhs = val
+  builderEmit(fc.b, fs)
+}
+
 // Lowers a match arm's body — a `{ … }` block or a single statement.
 function lowerArmBody(fc: FnCtx, body: int) {
   if (getNode(fc.c.tree, body).tag == Tag.Block) {
@@ -3651,6 +3833,10 @@ function lowerStmt(fc: FnCtx, node: int) {
   }
   if (n.tag == Tag.SwitchStmt) {
     lowerSwitch(fc, node)
+    return
+  }
+  if (n.tag == Tag.SelectStmt) {
+    lowerSelect(fc, node)
     return
   }
   if (n.tag == Tag.Assign) {
