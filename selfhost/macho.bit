@@ -1,0 +1,588 @@
+// Self-host Stage 3 (#1343): Mach-O64 relocatable object writer, ported from
+// compiler/obj/macho.zig. Consumed by the static linker (#1344), which turns
+// .o files plus libbitrt.a into a standalone executable.
+//
+// Deliberately decoupled from the backends: this file knows nothing of the IR,
+// physical registers, or instruction encoding. Its types carry a `Macho` prefix
+// because selfhost is one flat namespace and names like Section/Symbol/Object
+// are far too generic to claim (the seed gets one module per object format).
+//
+// Emits the smallest layout `ld` accepts, not the layout `as` happens to
+// produce: one LC_SEGMENT_64 (Mach-O's MH_OBJECT convention — every section
+// lives in one nameless segment) plus one LC_SYMTAB. No LC_DYSYMTAB, no
+// LC_BUILD_VERSION, no chained fixups (LC_DYLD_CHAINED_FIXUPS is an
+// MH_EXECUTE/MH_DYLIB concept — never valid on a relocatable object). The seed
+// verified empirically that an object carrying only those two load commands
+// relinks clean via `ld -r` and links+runs via clang.
+//
+// Struct layouts and constants come from the Xcode SDK's <mach-o/loader.h>,
+// <mach-o/nlist.h>, <mach-o/reloc.h>, <mach-o/x86_64/reloc.h>,
+// <mach-o/arm64/reloc.h>, cross-checked byte-for-byte against as/otool output.
+
+enum MachoTarget {
+  X86_64,
+  Aarch64,
+}
+
+function machoCpuType(t: MachoTarget): int {
+  if (t == MachoTarget.X86_64) {
+    return 0x01000007 // CPU_TYPE_X86_64 (CPU_TYPE_X86 | CPU_ARCH_ABI64)
+  }
+  return 0x0100000C // CPU_TYPE_ARM64 (CPU_TYPE_ARM | CPU_ARCH_ABI64)
+}
+
+function machoCpuSubtype(t: MachoTarget): int {
+  if (t == MachoTarget.X86_64) {
+    return 3 // CPU_SUBTYPE_X86_64_ALL
+  }
+  return 0 // CPU_SUBTYPE_ARM64_ALL
+}
+
+enum MachoSectionKind {
+  Text,
+  Data,
+  Rodata,
+  Bss,
+  GcMeta,
+}
+
+function machoNumKinds(): int {
+  return 5
+}
+
+// Bit has no enum-to-ordinal cast, and every by-kind lookup below is an array
+// index — so the mapping is spelled out both ways.
+function machoKindIndex(k: MachoSectionKind): int {
+  if (k == MachoSectionKind.Text) { return 0 }
+  if (k == MachoSectionKind.Data) { return 1 }
+  if (k == MachoSectionKind.Rodata) { return 2 }
+  if (k == MachoSectionKind.Bss) { return 3 }
+  return 4 // GcMeta
+}
+
+// Fixed emission order, spelled out explicitly so reordering MachoSectionKind's
+// declaration can never silently reorder the file layout.
+function machoCanonicalOrder(): []MachoSectionKind {
+  return [MachoSectionKind.Text, MachoSectionKind.Data, MachoSectionKind.Rodata,
+    MachoSectionKind.Bss, MachoSectionKind.GcMeta]
+}
+
+function machoSegmentName(k: MachoSectionKind): string {
+  if (k == MachoSectionKind.Text || k == MachoSectionKind.Rodata) {
+    return "__TEXT"
+  }
+  return "__DATA" // data, bss, gc_meta
+}
+
+function machoSectionName(k: MachoSectionKind): string {
+  if (k == MachoSectionKind.Text) { return "__text" }
+  if (k == MachoSectionKind.Data) { return "__data" }
+  if (k == MachoSectionKind.Rodata) { return "__const" }
+  if (k == MachoSectionKind.Bss) { return "__bss" }
+  return "__bit_gc" // GcMeta
+}
+
+// Bss is the only kind with no file bytes (a Mach-O S_ZEROFILL section).
+function machoIsZerofill(k: MachoSectionKind): bool {
+  return k == MachoSectionKind.Bss
+}
+
+function machoSectionFlags(k: MachoSectionKind): int {
+  if (k == MachoSectionKind.Text) {
+    // S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    return 0x80000400
+  }
+  if (k == MachoSectionKind.Bss) {
+    return 0x1 // S_ZEROFILL
+  }
+  return 0x0 // S_REGULAR: data, rodata, gc_meta
+}
+
+// One section's content. Bss carries `size` and no data.
+struct MachoSection {
+  kind: MachoSectionKind,
+  data: []u8,
+  size: int,
+  // 0 or a power of two; 0 means "no constraint" and is normalized to 1.
+  alignment: int,
+}
+
+function machoSectionBytes(s: MachoSection): int {
+  if (s.kind == MachoSectionKind.Bss) {
+    return s.size
+  }
+  return len(s.data)
+}
+
+enum MachoBinding {
+  Local,
+  Global,
+}
+
+// `hasSection == false` names an external symbol (a runtime bit_rt_* export, or
+// another Bit module's function) that the linker must resolve — it carries no
+// offset and must be Global: nothing else can ever define an undefined local.
+struct MachoSymbol {
+  name: string,
+  hasSection: bool,
+  section: MachoSectionKind,
+  offset: int,
+  size: int,
+  binding: MachoBinding,
+}
+
+// Mirrors codegen.bit's Reloc (offset + symbol) plus the architecture-specific
+// "how the field's bytes are interpreted" the object writer needs. Mach-O gives
+// every target an equivalent encoding for all four kinds, so one enum covers
+// both architectures.
+enum MachoRelocKind {
+  // PC-relative call/branch operand: x86-64 CALL rel32's 4-byte immediate, or
+  // ARM64 BL's 26-bit immediate packed into its 4-byte instruction word.
+  Branch,
+  // Absolute pointer-sized reference, e.g. a __bit_gc TypeInfo pointer into
+  // __const.
+  Unsigned64,
+  // ARM64 ADRP page-of-symbol immediate (ARM64_RELOC_PAGE21) — the high half of
+  // an address-of sequence (a const_string's __bitstr_N).
+  Page21,
+  // ARM64 ADD/LDR low-12-bits immediate (ARM64_RELOC_PAGEOFF12) — the low half.
+  Pageoff12,
+}
+
+function machoRelocWidth(k: MachoRelocKind): int {
+  if (k == MachoRelocKind.Unsigned64) {
+    return 8
+  }
+  return 4
+}
+
+function machoRelocPcrel(k: MachoRelocKind): bool {
+  return k == MachoRelocKind.Branch || k == MachoRelocKind.Page21
+}
+
+function machoRelocLength(k: MachoRelocKind): int {
+  if (k == MachoRelocKind.Unsigned64) {
+    return 3 // 8 bytes
+  }
+  return 2 // 4 bytes
+}
+
+// Mach-O relocation type ordinal. X86_64_RELOC_BRANCH and ARM64_RELOC_BRANCH26
+// are both 2; X86_64_RELOC_UNSIGNED and ARM64_RELOC_UNSIGNED are both 0 —
+// spelled out per-target anyway (not collapsed to one constant) so a future
+// third target with a different ordinal is a one-line change, not a hidden
+// assumption. Page21/Pageoff12 are AArch64-only (x86-64 materializes a symbol
+// address as an absolute Unsigned64, never a PC-relative pair).
+function machoRelocType(k: MachoRelocKind, t: MachoTarget): int {
+  if (t == MachoTarget.X86_64) {
+    if (k == MachoRelocKind.Branch) { return 2 } // X86_64_RELOC_BRANCH
+    assert(k == MachoRelocKind.Unsigned64)       // page21/pageoff12 are AArch64-only
+    return 0 // X86_64_RELOC_UNSIGNED
+  }
+  if (k == MachoRelocKind.Branch) { return 2 }    // ARM64_RELOC_BRANCH26
+  if (k == MachoRelocKind.Unsigned64) { return 0 } // ARM64_RELOC_UNSIGNED
+  if (k == MachoRelocKind.Page21) { return 3 }    // ARM64_RELOC_PAGE21
+  return 4 // ARM64_RELOC_PAGEOFF12
+}
+
+struct MachoRelocation {
+  section: MachoSectionKind,
+  offset: int,
+  symbol: string,
+  kind: MachoRelocKind,
+}
+
+struct MachoObject {
+  sections: []MachoSection,
+  symbols: []MachoSymbol,
+  relocations: []MachoRelocation,
+}
+
+// ---- on-disk constants (<mach-o/loader.h>, <mach-o/nlist.h>) --------------
+
+function mhMagic64(): int { return 0xfeedfacf }
+function mhObject(): int { return 0x1 }
+function lcSegment64(): int { return 0x19 }
+function lcSymtab(): int { return 0x2 }
+function vmProtAll(): int { return 0x7 } // READ | WRITE | EXECUTE
+function nUndf(): int { return 0x0 }
+function nSect(): int { return 0xe }
+function nExt(): int { return 0x01 }
+
+// Struct sizes, from the SDK's field layouts.
+function sizeofMachHeader64(): int { return 32 }
+function sizeofSegmentCommand64(): int { return 72 }
+function sizeofSection64(): int { return 80 }
+function sizeofSymtabCommand(): int { return 24 }
+function sizeofNlist64(): int { return 16 }
+
+// ---- byte emission --------------------------------------------------------
+
+function appendBytes(out: ByteBuf, data: []u8) {
+  let i = 0
+  while (i < len(data)) {
+    out.bytes = append(out.bytes, data[i])
+    i = i + 1
+  }
+}
+
+function appendZeros(out: ByteBuf, n: int) {
+  let i = 0
+  while (i < n) {
+    out.bytes = append(out.bytes, u8(0))
+    i = i + 1
+  }
+}
+
+// A 16-byte NUL-padded section/segment name.
+function appendName16(out: ByteBuf, s: string) {
+  assert(len(s) <= 16)
+  let b = []byte(s)
+  appendBytes(out, b)
+  appendZeros(out, 16 - len(b))
+}
+
+function padTo(out: ByteBuf, alignment: int) {
+  let rem = len(out.bytes) % alignment
+  if (rem != 0) {
+    appendZeros(out, alignment - rem)
+  }
+}
+
+function alignForward(v: int, alignment: int): int {
+  let rem = v % alignment
+  if (rem == 0) {
+    return v
+  }
+  return v + alignment - rem
+}
+
+function isPowerOfTwo(v: int): bool {
+  return v > 0 && (v & (v - 1)) == 0
+}
+
+function log2Int(v: int): int {
+  let n = 0
+  let x = v
+  while (x > 1) {
+    x = x >> 1
+    n = n + 1
+  }
+  return n
+}
+
+// r_symbolnum:24, r_pcrel:1, r_length:2, r_extern:1, r_type:4 packed LSB-first —
+// the bit order the SDK headers document for the C bitfield.
+function machoRelocInfo(symbolnum: int, pcrel: bool, length: int, isExtern: bool, rtype: int): int {
+  let info = symbolnum
+  if (pcrel) {
+    info = info | (1 << 24)
+  }
+  info = info | (length << 25)
+  if (isExtern) {
+    info = info | (1 << 27)
+  }
+  return info | (rtype << 28)
+}
+
+// Appends a NUL-terminated string to a string table, returning its byte offset.
+// `buf` must already carry the leading NUL (offset 0 is the empty string,
+// matching every Mach-O string table as/ld produce).
+function machoInternString(buf: ByteBuf, s: string): int {
+  let off = len(buf.bytes)
+  appendBytes(buf, []byte(s))
+  buf.bytes = append(buf.bytes, u8(0))
+  return off
+}
+
+// ---- the writer -----------------------------------------------------------
+
+// Emits a complete Mach-O64 MH_OBJECT for `obj`, targeting the given
+// architecture.
+function writeMacho(target: MachoTarget, obj: MachoObject): []u8! {
+  // Section ordinals are a u8 with 0 reserved (nlist.h's MAX_SECT), and a
+  // relocation's symbol index is 24 bits — neither can be allowed to truncate
+  // silently, however unreachable a real compilation unit makes them.
+  if (len(obj.sections) > 255) {
+    fail newError("TooManySections")
+  }
+  if (len(obj.symbols) > (1 << 24) - 1) {
+    fail newError("TooManySymbols")
+  }
+
+  let n = machoNumKinds()
+  let hasKind = []bool(n)
+  let sectionOf = []MachoSection(n)
+  let i = 0
+  while (i < len(obj.sections)) {
+    let s = obj.sections[i]
+    let idx = machoKindIndex(s.kind)
+    if (hasKind[idx]) {
+      fail newError("DuplicateSection")
+    }
+    if (s.alignment != 0 && !isPowerOfTwo(s.alignment)) {
+      fail newError("InvalidSectionAlignment")
+    }
+    hasKind[idx] = true
+    sectionOf[idx] = s
+    i = i + 1
+  }
+
+  i = 0
+  while (i < len(obj.symbols)) {
+    let sym = obj.symbols[i]
+    if (!sym.hasSection && sym.binding == MachoBinding.Local) {
+      fail newError("UndefinedLocalSymbol")
+    }
+    if (sym.hasSection) {
+      let idx = machoKindIndex(sym.section)
+      if (!hasKind[idx]) {
+        fail newError("SectionNotPresent")
+      }
+      if (sym.offset + sym.size > machoSectionBytes(sectionOf[idx])) {
+        fail newError("SymbolOutOfBounds")
+      }
+    }
+    i = i + 1
+  }
+
+  let symIdxOf = map<string, int>{}
+  i = 0
+  while (i < len(obj.symbols)) {
+    if (machoHasSymbol(symIdxOf, obj.symbols[i].name)) {
+      fail newError("DuplicateSymbol")
+    }
+    symIdxOf[obj.symbols[i].name] = i
+    i = i + 1
+  }
+
+  // Relocations, bucketed by section and kept in their original order.
+  let relocBuckets = []MachoRelocList(0)
+  i = 0
+  while (i < n) {
+    relocBuckets = append(relocBuckets, MachoRelocList{ list: []MachoRelocation(0) })
+    i = i + 1
+  }
+  i = 0
+  while (i < len(obj.relocations)) {
+    let r = obj.relocations[i]
+    let idx = machoKindIndex(r.section)
+    if (!hasKind[idx]) {
+      fail newError("SectionNotPresent")
+    }
+    if (r.offset + machoRelocWidth(r.kind) > machoSectionBytes(sectionOf[idx])) {
+      fail newError("RelocOutOfBounds")
+    }
+    if (!machoHasSymbol(symIdxOf, r.symbol)) {
+      fail newError("UnknownSymbol")
+    }
+    relocBuckets[idx].list = append(relocBuckets[idx].list, r)
+    i = i + 1
+  }
+
+  let present = []MachoSectionKind(0)
+  let order = machoCanonicalOrder()
+  i = 0
+  while (i < len(order)) {
+    if (hasKind[machoKindIndex(order[i])]) {
+      present = append(present, order[i])
+    }
+    i = i + 1
+  }
+  let nsects = len(present)
+
+  let segCmdSize = sizeofSegmentCommand64() + nsects * sizeofSection64()
+  let sizeofcmds = segCmdSize + sizeofSymtabCommand()
+  let cmdsEnd = sizeofMachHeader64() + sizeofcmds
+
+  let out = newByteBuf()
+  // Header + load commands are patched in place once every offset below is
+  // known; reserve the space now so section/symbol/string data lands at the
+  // offsets those commands record.
+  appendZeros(out, cmdsEnd)
+
+  // Per-present-section header fields, filled as each section's bytes land.
+  let hdrs = []MachoSecHdr(0)
+  let addrOf = []int(n)
+  let ordinalOf = []int(n)
+  let addrCursor = 0
+  let segFileoff = 0
+  let segFileoffSet = false
+  i = 0
+  while (i < nsects) {
+    let kind = present[i]
+    let idx = machoKindIndex(kind)
+    let sec = sectionOf[idx]
+    let alignment = sec.alignment
+    if (alignment == 0) {
+      alignment = 1
+    }
+    addrCursor = alignForward(addrCursor, alignment)
+    addrOf[idx] = addrCursor
+    ordinalOf[idx] = i + 1 // section ordinals are 1-based
+    addrCursor = addrCursor + machoSectionBytes(sec)
+
+    let fileOff = 0
+    if (!machoIsZerofill(kind)) {
+      padTo(out, alignment)
+      fileOff = len(out.bytes)
+      if (!segFileoffSet) {
+        segFileoff = fileOff
+        segFileoffSet = true
+      }
+      appendBytes(out, sec.data)
+    }
+
+    hdrs = append(hdrs, MachoSecHdr{ kind: kind, addr: addrOf[idx],
+      size: machoSectionBytes(sec), offset: fileOff, align: log2Int(alignment),
+      reloff: 0, nreloc: len(relocBuckets[idx].list) })
+    i = i + 1
+  }
+  let vmsize = addrCursor
+  let filesize = len(out.bytes) - cmdsEnd
+
+  // Relocations, one contiguous run per section, in canonical order.
+  padTo(out, 4)
+  i = 0
+  while (i < nsects) {
+    let idx = machoKindIndex(present[i])
+    let rl = relocBuckets[idx].list
+    if (len(rl) > 0) {
+      hdrs[i].reloff = len(out.bytes)
+      let j = 0
+      while (j < len(rl)) {
+        let r = rl[j]
+        appendU32(out, r.offset)
+        // r_extern is always true: every relocation here targets a symtab entry,
+        // local or not.
+        appendU32(out, machoRelocInfo(symIdxOf[r.symbol], machoRelocPcrel(r.kind),
+          machoRelocLength(r.kind), true, machoRelocType(r.kind, target)))
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+
+  // The string table is built independently of `out` so every symbol's n_strx is
+  // known before the nlist_64 array (which lives in `out`) is written.
+  let strtab = newByteBuf()
+  strtab.bytes = append(strtab.bytes, u8(0)) // offset 0 == empty string
+  let nameOffs = []int(0)
+  i = 0
+  while (i < len(obj.symbols)) {
+    nameOffs = append(nameOffs, machoInternString(strtab, obj.symbols[i].name))
+    i = i + 1
+  }
+
+  padTo(out, 8)
+  let symoff = len(out.bytes)
+  i = 0
+  while (i < len(obj.symbols)) {
+    let sym = obj.symbols[i]
+    let ntype = nUndf()
+    let nsect = 0
+    let nvalue = 0
+    if (sym.hasSection) {
+      let idx = machoKindIndex(sym.section)
+      ntype = nSect()
+      nsect = ordinalOf[idx]
+      nvalue = addrOf[idx] + sym.offset
+    }
+    if (sym.binding == MachoBinding.Global) {
+      ntype = ntype | nExt()
+    }
+    appendU32(out, nameOffs[i])
+    out.bytes = append(out.bytes, u8(ntype))
+    out.bytes = append(out.bytes, u8(nsect))
+    appendU16(out, 0) // n_desc
+    appendU64(out, nvalue)
+    i = i + 1
+  }
+
+  let stroff = len(out.bytes)
+  appendBytes(out, strtab.bytes)
+
+  // Patch the header and load commands now that every offset is known.
+  let hdr = newByteBuf()
+  appendU32(hdr, mhMagic64())
+  appendU32(hdr, machoCpuType(target))
+  appendU32(hdr, machoCpuSubtype(target))
+  appendU32(hdr, mhObject())
+  appendU32(hdr, 2) // ncmds: LC_SEGMENT_64 + LC_SYMTAB
+  appendU32(hdr, sizeofcmds)
+  appendU32(hdr, 0) // flags
+  appendU32(hdr, 0) // reserved
+
+  appendU32(hdr, lcSegment64())
+  appendU32(hdr, segCmdSize)
+  appendName16(hdr, "") // MH_OBJECT convention: the one segment is nameless
+  appendU64(hdr, 0)     // vmaddr
+  appendU64(hdr, vmsize)
+  appendU64(hdr, segFileoff)
+  appendU64(hdr, filesize)
+  appendU32(hdr, vmProtAll()) // maxprot
+  appendU32(hdr, vmProtAll()) // initprot
+  appendU32(hdr, nsects)
+  appendU32(hdr, 0) // flags
+
+  i = 0
+  while (i < nsects) {
+    let h = hdrs[i]
+    appendName16(hdr, machoSectionName(h.kind))
+    appendName16(hdr, machoSegmentName(h.kind))
+    appendU64(hdr, h.addr)
+    appendU64(hdr, h.size)
+    appendU32(hdr, h.offset)
+    appendU32(hdr, h.align)
+    appendU32(hdr, h.reloff)
+    appendU32(hdr, h.nreloc)
+    appendU32(hdr, machoSectionFlags(h.kind))
+    appendU32(hdr, 0) // reserved1
+    appendU32(hdr, 0) // reserved2
+    appendU32(hdr, 0) // reserved3
+    i = i + 1
+  }
+
+  appendU32(hdr, lcSymtab())
+  appendU32(hdr, sizeofSymtabCommand())
+  appendU32(hdr, symoff)
+  appendU32(hdr, len(obj.symbols))
+  appendU32(hdr, stroff)
+  appendU32(hdr, len(strtab.bytes))
+
+  // The reserved prefix must be exactly what the commands filled — a mismatch
+  // means a struct size above is wrong and every recorded offset is a lie.
+  assert(len(hdr.bytes) == cmdsEnd)
+  i = 0
+  while (i < cmdsEnd) {
+    out.bytes[i] = hdr.bytes[i]
+    i = i + 1
+  }
+  return out.bytes
+}
+
+// A zerofill section contributes no file bytes, so its header's `offset` stays 0.
+struct MachoSecHdr {
+  kind: MachoSectionKind,
+  addr: int,
+  size: int,
+  offset: int,
+  align: int,
+  reloff: int,
+  nreloc: int,
+}
+
+// Bit has no slice-of-slice literal, so the per-section relocation buckets need
+// a named wrapper.
+struct MachoRelocList {
+  list: []MachoRelocation,
+}
+
+function machoHasSymbol(m: map<string, int>, name: string): bool {
+  for (k, v) of m {
+    if (k == name) {
+      return true
+    }
+  }
+  return false
+}
