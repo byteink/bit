@@ -778,6 +778,60 @@ function structDeclByName(c: Checker, name: string): int {
   return 0
 }
 
+// The `enum_decl` node with the given type name, or 0.
+function enumDeclByName(c: Checker, name: string): int {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (getNode(c.tree, i).tag == Tag.EnumDecl && declName(c, i) == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// An enum declaration's variant nodes in order (kid 2 is the variant_list).
+function enumVariantNodes(c: Checker, decl: int): []int {
+  return kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+}
+
+// The declaration-order tag of a variant name in `enumName`, or 0 if not found
+// (the checker has already validated the name).
+function variantOrdinal(c: Checker, enumName: string, variantName: string): int {
+  let decl = enumDeclByName(c, enumName)
+  if (decl == 0) {
+    return 0
+  }
+  let vs = enumVariantNodes(c, decl)
+  let i = 0
+  while (i < len(vs)) {
+    let vn = getNode(c.tree, kidsOf(c.tree, vs[i])[0])
+    if (c.source[vn.span.start:vn.span.end] == variantName) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether an enum carries payloads (any variant has a non-empty payload) — such
+// an enum's value is a boxed `{tag, payload...}` object, not a bare tag.
+function enumIsBoxed(c: Checker, enumName: string): bool {
+  let decl = enumDeclByName(c, enumName)
+  if (decl == 0) {
+    return false
+  }
+  let vs = enumVariantNodes(c, decl)
+  let i = 0
+  while (i < len(vs)) {
+    if (kidsOf(c.tree, vs[i])[1] != 0) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // A struct declaration's field nodes in order (unwrapping exported fields).
 function structFieldNodes(c: Checker, decl: int): []int {
   let raw = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
@@ -1153,9 +1207,23 @@ function lowerCompositeLit(fc: FnCtx, node: int): int {
   return obj
 }
 
-// Lowers a struct field access `s.f` to `field_get %s[offset] fieldType`.
+// Lowers a struct field access `s.f` to `field_get %s[offset] fieldType`, or an
+// enum variant reference `Enum.Variant` to its tag constant.
 function lowerFieldAccess(fc: FnCtx, node: int): int {
   let kids = kidsOf(fc.c.tree, node)
+  // `Enum.Variant` (receiver is an enum type name): a C-like enum's variant is
+  // its bare tag `const_int <Enum> <ordinal>`. ponytail: boxed (payload) enums
+  // deferred — `Enum.Variant(args)` construction routes through lowerCall.
+  let baseName = typeNodeName(fc.c, kids[0])
+  if (baseName != "") {
+    let ut = userTypeLookup(fc.c, baseName)
+    if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum && !enumIsBoxed(fc.c, baseName)) {
+      let mn0 = getNode(fc.c.tree, kids[1])
+      let ci = mkInstr(Op.ConstInt, ut)
+      ci.ival = variantOrdinal(fc.c, baseName, fc.c.source[mn0.span.start:mn0.span.end])
+      return builderEmit(fc.b, ci)
+    }
+  }
   let recvTy = checkExprType(fc.c, kids[0])
   if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
     fc.failed = true
@@ -1756,6 +1824,110 @@ function lowerIf(fc: FnCtx, node: int) {
     restoreValues(fc, orig)
   }
 
+  builderBeginBlock(fc.b, join)
+  if (joinReachable) {
+    addJoinParams(fc, preLen)
+    fc.terminated = false
+  } else {
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    fc.terminated = true
+  }
+}
+
+// Lowers a match arm's body — a `{ … }` block or a single statement.
+function lowerArmBody(fc: FnCtx, body: int) {
+  if (getNode(fc.c.tree, body).tag == Tag.Block) {
+    lowerStmtList(fc, body)
+  } else {
+    lowerStmt(fc, body)
+  }
+}
+
+// Lowers one match-statement arm's body in the current block; on a non-diverging
+// arm, carries the live locals to `join`. Returns whether the join is reached.
+function lowerMatchArm(fc: FnCtx, arm: int, preLen: int, join: int): bool {
+  let ak = kidsOf(fc.c.tree, arm)
+  lowerArmBody(fc, ak[1])
+  if (fc.failed) {
+    return false
+  }
+  if (!fc.terminated) {
+    emitJump(fc, join, snapshotValues(fc, preLen))
+    return true
+  }
+  return false
+}
+
+// Lowers a `match (subject) { V => body, ... }` statement over a C-like enum to a
+// decision tree: each arm but the last tests `subject == <tag>` and branches to
+// its body or the next test; the last arm is the exhaustive fallthrough. A `join`
+// block merges the non-diverging arms (unreachable if every arm diverges).
+// ponytail: boxed (payload) enums deferred.
+function lowerMatch(fc: FnCtx, node: int) {
+  let k = kidsOf(fc.c.tree, node)
+  let subjectTy = defaultType(fc.c, checkExprType(fc.c, k[0]))
+  if (fc.c.ctx.types[subjectTy].kind != TypeKind.Enum) {
+    fc.failed = true
+    return
+  }
+  let enumName = typeName(fc.c.ctx, subjectTy)
+  if (enumIsBoxed(fc.c, enumName)) {
+    fc.failed = true
+    return
+  }
+  let subject = lowerExprH(fc, k[0], subjectTy)
+  if (fc.failed) {
+    return
+  }
+  let arms = kidsOf(fc.c.tree, k[1])
+  if (len(arms) == 0) {
+    return
+  }
+  let boolTy = primType(fc.c.ctx, 10)
+  let preLen = len(fc.env)
+  let orig = snapshotValues(fc, preLen)
+  let join = builderNewBlock(fc.b)
+  let joinReachable = false
+  let i = 0
+  while (i < len(arms) - 1 && !fc.failed) {
+    let arm = arms[i]
+    let vn = getNode(fc.c.tree, kidsOf(fc.c.tree, kidsOf(fc.c.tree, arm)[0])[0])
+    let armTag = variantOrdinal(fc.c, enumName, fc.c.source[vn.span.start:vn.span.end])
+    let bodyBlk = builderNewBlock(fc.b)
+    let nextBlk = builderNewBlock(fc.b)
+    let ci = mkInstr(Op.ConstInt, subjectTy)
+    ci.ival = armTag
+    let eq = mkInstr(Op.ICmpEq, boolTy)
+    eq.lhs = subject
+    eq.rhs = builderEmit(fc.b, ci)
+    let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+    br.lhs = builderEmit(fc.b, eq)
+    br.ival = bodyBlk
+    br.thenArgs = []int(0)
+    br.ival2 = nextBlk
+    br.elseArgs = []int(0)
+    builderEmit(fc.b, br)
+    builderEndBlock(fc.b)
+    builderBeginBlock(fc.b, bodyBlk)
+    fc.terminated = false
+    if (lowerMatchArm(fc, arm, preLen, join)) {
+      joinReachable = true
+    }
+    builderEndBlock(fc.b)
+    truncateEnv(fc, preLen)
+    restoreValues(fc, orig)
+    builderBeginBlock(fc.b, nextBlk)
+    i = i + 1
+  }
+  // Last arm: the exhaustive fallthrough, lowered in the current block with no
+  // test.
+  fc.terminated = false
+  if (lowerMatchArm(fc, arms[len(arms) - 1], preLen, join)) {
+    joinReachable = true
+  }
+  builderEndBlock(fc.b)
+  truncateEnv(fc, preLen)
+  restoreValues(fc, orig)
   builderBeginBlock(fc.b, join)
   if (joinReachable) {
     addJoinParams(fc, preLen)
@@ -2405,6 +2577,10 @@ function lowerStmt(fc: FnCtx, node: int) {
   }
   if (n.tag == Tag.ForC) {
     lowerForC(fc, node)
+    return
+  }
+  if (n.tag == Tag.MatchStmt) {
+    lowerMatch(fc, node)
     return
   }
   if (n.tag == Tag.Assign) {
