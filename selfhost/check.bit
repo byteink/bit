@@ -1,0 +1,233 @@
+// Self-host Stage 2 (#1337): the type checker, ported from compiler/check.zig.
+// This first chunk is the inference skeleton + the `--dump-types` surface: it
+// assigns a TypeId to every node (`nodeTypes`), infers literal expressions and
+// their default types, resolves simple type annotations, and renders the
+// binding/arrow-param/call type dump the seed's `bitc --dump-types` emits. The
+// full inference (idents, calls, operators, generics — needs resolve + method
+// sets) grows on top, verified by the corpus `--dump-types` differential.
+
+// A 0-based source position (line, column) for the dump gutter.
+struct LineCol {
+  line: int,
+  col: int,
+}
+
+// Maps a byte offset to 0-based line/column. Bounded by the offset.
+function locateOffset(source: string, offset: int): LineCol {
+  let line = 0
+  let lineStart = 0
+  let i = 0
+  while (i < offset) {
+    if (source[i] == '\n') {
+      line = line + 1
+      lineStart = i + 1
+    }
+    i = i + 1
+  }
+  return LineCol{ line: line, col: offset - lineStart }
+}
+
+struct Checker {
+  ctx: TypeContext,
+  tree: Tree,
+  source: string,
+  nodeTypes: []int,
+}
+
+function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
+  let nt = []int(0)
+  let i = 0
+  while (i < len(tree.nodes)) {
+    nt = append(nt, 0)
+    i = i + 1
+  }
+  return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt }
+}
+
+// The prim-enum index for a predeclared type name, or -1 if not a primitive.
+// Includes the size aliases (`int`/`uint`/`byte`/`rune`) that map onto a prim.
+function primIndexByName(name: string): int {
+  if (name == "i8") { return 0 }
+  if (name == "i16") { return 1 }
+  if (name == "i32") { return 2 }
+  if (name == "i64") { return 3 }
+  if (name == "u8") { return 4 }
+  if (name == "u16") { return 5 }
+  if (name == "u32") { return 6 }
+  if (name == "u64") { return 7 }
+  if (name == "f32") { return 8 }
+  if (name == "f64") { return 9 }
+  if (name == "bool") { return 10 }
+  if (name == "string") { return 11 }
+  if (name == "int") { return 3 }
+  if (name == "uint") { return 7 }
+  if (name == "byte") { return 4 }
+  if (name == "rune") { return 2 }
+  return -1
+}
+
+// The default concrete type of an untyped value (spec §15.4): int→i64, float→f64,
+// rune→i32, bool→bool, string→string; anything else is unchanged.
+function defaultType(c: Checker, ty: int): int {
+  if (ty == c.ctx.untypedIntId) { return primType(c.ctx, 3) }
+  if (ty == c.ctx.untypedFloatId) { return primType(c.ctx, 9) }
+  if (ty == c.ctx.untypedRuneId) { return primType(c.ctx, 2) }
+  if (ty == c.ctx.untypedBoolId) { return primType(c.ctx, 10) }
+  if (ty == c.ctx.untypedStringId) { return primType(c.ctx, 11) }
+  return ty
+}
+
+// Infers a type-annotation node to a TypeId. Primitives and simple composites
+// (slice/array/map/chan) are handled here; named types need resolve and infer
+// to invalid (0) for now.
+function typeFromNode(c: Checker, node: int): int {
+  if (node == 0) {
+    return 0
+  }
+  let n = getNode(c.tree, node)
+  let tag = n.tag
+  if (tag == Tag.Ident) {
+    let name = c.source[n.span.start:n.span.end]
+    let p = primIndexByName(name)
+    if (p >= 0) {
+      return primType(c.ctx, p)
+    }
+    return 0
+  }
+  let kids = kidsOf(c.tree, node)
+  if (tag == Tag.SliceType) {
+    return mkSlice(c.ctx, typeFromNode(c, kids[0]))
+  }
+  if (tag == Tag.ChanType) {
+    return mkChan(c.ctx, typeFromNode(c, kids[0]))
+  }
+  if (tag == Tag.MapType) {
+    return mkMap(c.ctx, typeFromNode(c, kids[0]), typeFromNode(c, kids[1]))
+  }
+  if (tag == Tag.VoidType) {
+    return c.ctx.voidId
+  }
+  return 0
+}
+
+// Infers an expression's (possibly untyped) type. Literals only for now; every
+// other construct infers to invalid (0) until its inference lands.
+function checkExprType(c: Checker, node: int): int {
+  let tag = getNode(c.tree, node).tag
+  if (tag == Tag.IntLit) { return c.ctx.untypedIntId }
+  if (tag == Tag.FloatLit) { return c.ctx.untypedFloatId }
+  if (tag == Tag.RuneLit) { return c.ctx.untypedRuneId }
+  if (tag == Tag.BoolLit) { return c.ctx.untypedBoolId }
+  if (tag == Tag.StringLit || tag == Tag.RawStringLit) { return c.ctx.untypedStringId }
+  if (tag == Tag.NilLit) { return c.ctx.untypedNilId }
+  return 0
+}
+
+// Types one `binding` node ([pat, annotation, init]): an explicit annotation
+// wins; otherwise the initializer's type is defaulted to concrete. The pattern
+// node carries the result so the dump reads it back.
+function checkBinding(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  let pat = kids[0]
+  let ann = kids[1]
+  let init = kids[2]
+  let ty = 0
+  if (ann != 0) {
+    ty = typeFromNode(c, ann)
+  } else if (init != 0) {
+    ty = defaultType(c, checkExprType(c, init))
+  }
+  c.nodeTypes[pat] = ty
+}
+
+// Walks every node and types the bindings. (arrow-param and call typing land
+// with expression inference; a flat arena walk catches bindings at any nesting.)
+function checkModule(c: Checker) {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (getNode(c.tree, i).tag == Tag.Binding) {
+      checkBinding(c, i)
+    }
+    i = i + 1
+  }
+}
+
+// One `--dump-types` line's data: the name's start offset, its source text, type.
+struct TypeEntry {
+  start: int,
+  text: string,
+  ty: int,
+}
+
+// Appends a dump entry per name bound by `pat` (recursing tuple_pat), reading
+// the already-typed pattern node (the seed's collectBindingIdents).
+function collectBindingIdents(c: Checker, pat: int, entries: []TypeEntry): []TypeEntry {
+  let n = getNode(c.tree, pat)
+  if (n.tag == Tag.TuplePat) {
+    let subs = kidsOf(c.tree, pat)
+    let i = 0
+    while (i < len(subs)) {
+      entries = collectBindingIdents(c, subs[i], entries)
+      i = i + 1
+    }
+    return entries
+  }
+  return append(entries, TypeEntry{ start: n.span.start, text: c.source[n.span.start:n.span.end], ty: c.nodeTypes[pat] })
+}
+
+// Insertion-sort dump entries by source offset (the seed sorts (file, start);
+// one file here, so start alone). Bounded by the entry count.
+function sortEntries(entries: []TypeEntry): []TypeEntry {
+  let i = 1
+  while (i < len(entries)) {
+    let cur = entries[i]
+    let j = i - 1
+    while (j >= 0 && entries[j].start > cur.start) {
+      entries[j + 1] = entries[j]
+      j = j - 1
+    }
+    entries[j + 1] = cur
+    i = i + 1
+  }
+  return entries
+}
+
+// Renders `--dump-types`: one `line:col: text: typename` line per binding name,
+// arrow parameter, and call expression, sorted by source position — matching the
+// seed's dumpTypesText.
+function dumpTypesText(c: Checker): string {
+  let entries = []TypeEntry(0)
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    let n = getNode(c.tree, i)
+    if (n.tag == Tag.Binding) {
+      entries = collectBindingIdents(c, kidsOf(c.tree, i)[0], entries)
+    } else if (n.tag == Tag.ArrowP) {
+      let name = kidsOf(c.tree, i)[0]
+      let nn = getNode(c.tree, name)
+      entries = append(entries, TypeEntry{ start: nn.span.start, text: c.source[nn.span.start:nn.span.end], ty: c.nodeTypes[name] })
+    } else if (n.tag == Tag.Call) {
+      entries = append(entries, TypeEntry{ start: n.span.start, text: c.source[n.span.start:n.span.end], ty: c.nodeTypes[i] })
+    }
+    i = i + 1
+  }
+  entries = sortEntries(entries)
+  let out = ""
+  let k = 0
+  while (k < len(entries)) {
+    let e = entries[k]
+    let lc = locateOffset(c.source, e.start)
+    out = out + "${lc.line + 1}:${lc.col + 1}: " + e.text + ": " + typeName(c.ctx, e.ty) + "\n"
+    k = k + 1
+  }
+  return out
+}
+
+// Parses `src`, type-checks it, and returns the `--dump-types` text.
+function checkSourceDump(src: string): string {
+  let tree = parseSource(src)
+  let ctx = newTypeContext()
+  let c = newChecker(tree, src, ctx)
+  checkModule(c)
+  return dumpTypesText(c)
+}
