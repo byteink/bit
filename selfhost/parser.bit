@@ -183,9 +183,130 @@ function parseExpr(p: Parser): int {
 
 // ---- types, params, statements, declarations -------------------------------
 
-// Minimal: a bare type name is an ident leaf (generics/slices/maps deferred).
+// Closes a generic list, splitting the `>` hiding at the front of `>>`/`>>=`/
+// `>=` by rewriting the current token in place to the remainder (mirrors the
+// seed's expectGenericClose; slice element writes make this possible).
+function expectGenericClose(p: Parser) {
+  let k = peekKind(p)
+  if (k == Kind.Shr || k == Kind.ShrEq || k == Kind.GtEq) {
+    let t = peekTok(p)
+    let rest = Kind.Gt
+    if (k == Kind.ShrEq) { rest = Kind.GtEq }
+    if (k == Kind.GtEq) { rest = Kind.Eq }
+    p.toks[p.pos] = Token{ kind: rest, start: t.start + 1, end: t.end }
+    return
+  }
+  expect(p, Kind.Gt)
+}
+
+function parseSliceOrArrayType(p: Parser): int {
+  expect(p, Kind.LBracket)
+  if (accept(p, Kind.RBracket)) {
+    return mkNode(p, Tag.SliceType, 0, [parseType(p)])
+  }
+  let size = 0
+  if (peekKind(p) == Kind.IntLit) {
+    size = leaf(p, Tag.IntLit)
+  }
+  expect(p, Kind.RBracket)
+  return mkNode(p, Tag.ArrayType, 0, [size, parseType(p)])
+}
+
+function parseMapType(p: Parser): int {
+  advance(p)
+  expect(p, Kind.Lt)
+  let key = parseType(p)
+  expect(p, Kind.Comma)
+  let val = parseType(p)
+  expectGenericClose(p)
+  return mkNode(p, Tag.MapType, 0, [key, val])
+}
+
+function parseChanType(p: Parser): int {
+  advance(p)
+  expect(p, Kind.Lt)
+  let elem = parseType(p)
+  expectGenericClose(p)
+  return mkNode(p, Tag.ChanType, 0, [elem])
+}
+
+// A type (§11): a name (optionally a `T<A, B>` generic instantiation), a slice/
+// array `[]T`/`[N]T`, `map<K,V>`, or `chan<T>`. Tuple/function types are
+// follow-ups.
 function parseType(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.Ident) {
+    let name = leaf(p, Tag.Ident)
+    if (peekKind(p) != Kind.Lt) {
+      return name
+    }
+    advance(p)
+    let items = []int(0)
+    while (peekKind(p) != Kind.Eof) {
+      items = append(items, parseType(p))
+      if (!accept(p, Kind.Comma)) {
+        break
+      }
+    }
+    let targs = mkNode(p, Tag.TypeArgs, 0, items)
+    expectGenericClose(p)
+    return mkNode(p, Tag.GenericInst, 0, [name, targs])
+  }
+  if (k == Kind.LBracket) { return parseSliceOrArrayType(p) }
+  if (k == Kind.KwMap) { return parseMapType(p) }
+  if (k == Kind.KwChan) { return parseChanType(p) }
+  // Unsupported type form (tuple/func) — poison so parsing advances.
   return leaf(p, Tag.Ident)
+}
+
+// `T!` / `T!E` fallible result, else a plain type.
+function parseResultType(p: Parser): int {
+  let ty = parseType(p)
+  if (!accept(p, Kind.Bang)) {
+    return ty
+  }
+  let err = 0
+  let k = peekKind(p)
+  if (k == Kind.Ident || k == Kind.LBracket || k == Kind.KwMap || k == Kind.KwChan) {
+    err = parseType(p)
+  }
+  return mkNode(p, Tag.Fallible, 0, [ty, err])
+}
+
+// `constraint = type_name { "&" type_name }`.
+function parseConstraint(p: Parser): int {
+  let items = []int(0)
+  items = append(items, leaf(p, Tag.Ident))
+  while (accept(p, Kind.Amp)) {
+    items = append(items, leaf(p, Tag.Ident))
+  }
+  return mkNode(p, Tag.Constraint, 0, items)
+}
+
+function parseGenericParam(p: Parser): int {
+  let name = leaf(p, Tag.Ident)
+  let constraint = 0
+  if (accept(p, Kind.Colon)) {
+    constraint = parseConstraint(p)
+  }
+  return mkNode(p, Tag.GenericParam, 0, [name, constraint])
+}
+
+// Optional `<T, U: Bound>` after a type/function name; `0` (none) when absent.
+function maybeGenericParams(p: Parser): int {
+  if (peekKind(p) != Kind.Lt) {
+    return 0
+  }
+  advance(p)
+  let items = []int(0)
+  while (peekKind(p) != Kind.Gt && peekKind(p) != Kind.Eof) {
+    items = append(items, parseGenericParam(p))
+    if (!accept(p, Kind.Comma)) {
+      break
+    }
+  }
+  expect(p, Kind.Gt)
+  return mkNode(p, Tag.GenericParams, 0, items)
 }
 
 function parseParam(p: Parser): int {
@@ -208,9 +329,9 @@ function parseParams(p: Parser): int {
   return mkNode(p, Tag.Params, 0, items)
 }
 
-// `binding = [pattern, type_or_none, init_or_none]`; the decl wraps one binding.
-function parseBinding(p: Parser, declTag: Tag): int {
-  advance(p)
+// `binding = [pattern, type_or_none, init_or_none]` (simple ident pattern; a
+// tuple pattern is a follow-up).
+function parseOneBinding(p: Parser): int {
   let name = leaf(p, Tag.Ident)
   let ty = 0
   if (accept(p, Kind.Colon)) {
@@ -220,8 +341,169 @@ function parseBinding(p: Parser, declTag: Tag): int {
   if (accept(p, Kind.Eq)) {
     init = parseExpr(p)
   }
-  let binding = mkNode(p, Tag.Binding, 0, [name, ty, init])
-  return mkNode(p, declTag, 0, [binding])
+  return mkNode(p, Tag.Binding, 0, [name, ty, init])
+}
+
+// `const`/`let` — one or more comma-separated bindings.
+function parseValueDecl(p: Parser, declTag: Tag): int {
+  advance(p)
+  let items = []int(0)
+  items = append(items, parseOneBinding(p))
+  while (accept(p, Kind.Comma)) {
+    items = append(items, parseOneBinding(p))
+  }
+  return mkNode(p, declTag, 0, items)
+}
+
+// A struct field `[export] name: type` (export wraps the field node).
+function parseField(p: Parser): int {
+  let exported = accept(p, Kind.KwExport)
+  let name = leaf(p, Tag.Ident)
+  expect(p, Kind.Colon)
+  let ty = parseType(p)
+  let node = mkNode(p, Tag.Field, 0, [name, ty])
+  if (!exported) {
+    return node
+  }
+  return mkNode(p, Tag.Export, 0, [node])
+}
+
+function parseStructDecl(p: Parser): int {
+  advance(p)
+  let name = leaf(p, Tag.Ident)
+  let generics = maybeGenericParams(p)
+  expect(p, Kind.LBrace)
+  let items = []int(0)
+  skipSemis(p)
+  while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    items = append(items, parseField(p))
+    if (!accept(p, Kind.Comma)) {
+      skipSemis(p)
+    }
+    skipSemis(p)
+  }
+  expect(p, Kind.RBrace)
+  let fields = mkNode(p, Tag.FieldList, 0, items)
+  return mkNode(p, Tag.StructDecl, 0, [name, generics, fields])
+}
+
+// `V` or `V(T, U)` — a variant with an optional parenthesized payload type list.
+function parseVariant(p: Parser): int {
+  let name = leaf(p, Tag.Ident)
+  let payload = 0
+  if (accept(p, Kind.LParen)) {
+    let tys = []int(0)
+    while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+      tys = append(tys, parseType(p))
+      if (!accept(p, Kind.Comma)) {
+        break
+      }
+    }
+    expect(p, Kind.RParen)
+    payload = mkNode(p, Tag.TypeList, 0, tys)
+  }
+  return mkNode(p, Tag.EnumVariant, 0, [name, payload])
+}
+
+function parseEnumDecl(p: Parser): int {
+  advance(p)
+  let name = leaf(p, Tag.Ident)
+  let generics = maybeGenericParams(p)
+  expect(p, Kind.LBrace)
+  let items = []int(0)
+  skipSemis(p)
+  while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    items = append(items, parseVariant(p))
+    if (!accept(p, Kind.Comma)) {
+      skipSemis(p)
+    }
+    skipSemis(p)
+  }
+  expect(p, Kind.RBrace)
+  let variants = mkNode(p, Tag.VariantList, 0, items)
+  return mkNode(p, Tag.EnumDecl, 0, [name, generics, variants])
+}
+
+// `method_sig = [name, params, result_or_none]`.
+function parseMethodSig(p: Parser): int {
+  let name = leaf(p, Tag.Ident)
+  let params = parseParams(p)
+  let result = 0
+  if (accept(p, Kind.Colon)) {
+    result = parseResultType(p)
+  }
+  return mkNode(p, Tag.MethodSig, 0, [name, params, result])
+}
+
+function parseInterfaceDecl(p: Parser): int {
+  advance(p)
+  let name = leaf(p, Tag.Ident)
+  let generics = maybeGenericParams(p)
+  expect(p, Kind.LBrace)
+  let items = []int(0)
+  skipSemis(p)
+  while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    items = append(items, parseMethodSig(p))
+    if (!accept(p, Kind.Comma)) {
+      skipSemis(p)
+    }
+    skipSemis(p)
+  }
+  expect(p, Kind.RBrace)
+  let sigs = mkNode(p, Tag.MethodSigList, 0, items)
+  return mkNode(p, Tag.InterfaceDecl, 0, [name, generics, sigs])
+}
+
+function parseTypeAlias(p: Parser): int {
+  advance(p)
+  let name = leaf(p, Tag.Ident)
+  let generics = maybeGenericParams(p)
+  expect(p, Kind.Eq)
+  let ty = parseType(p)
+  return mkNode(p, Tag.TypeAlias, 0, [name, generics, ty])
+}
+
+function parseImportItem(p: Parser): int {
+  let name = leaf(p, Tag.Ident)
+  let alias = 0
+  if (accept(p, Kind.KwAs)) {
+    alias = leaf(p, Tag.Ident)
+  }
+  return mkNode(p, Tag.ImportItem, 0, [name, alias])
+}
+
+function parseImportBody(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.Ident) {
+    return mkNode(p, Tag.ImportNs, 0, [leaf(p, Tag.Ident)])
+  }
+  if (k == Kind.Star) {
+    advance(p)
+    expect(p, Kind.KwAs)
+    return mkNode(p, Tag.ImportStar, 0, [leaf(p, Tag.Ident)])
+  }
+  // `{ a, b as c }`
+  expect(p, Kind.LBrace)
+  let items = []int(0)
+  while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    items = append(items, parseImportItem(p))
+    if (!accept(p, Kind.Comma)) {
+      break
+    }
+  }
+  expect(p, Kind.RBrace)
+  return mkNode(p, Tag.ImportGroup, 0, items)
+}
+
+function parseImportDecl(p: Parser): int {
+  advance(p)
+  let body = parseImportBody(p)
+  expect(p, Kind.KwFrom)
+  let path = 0
+  if (peekKind(p) == Kind.StringLit) {
+    path = leaf(p, Tag.StringLit)
+  }
+  return mkNode(p, Tag.ImportDecl, 0, [body, path])
 }
 
 function parseReturn(p: Parser): int {
@@ -236,8 +518,8 @@ function parseReturn(p: Parser): int {
 function parseStatement(p: Parser): int {
   let k = peekKind(p)
   if (k == Kind.KwReturn) { return parseReturn(p) }
-  if (k == Kind.KwLet) { return parseBinding(p, Tag.LetDecl) }
-  if (k == Kind.KwConst) { return parseBinding(p, Tag.ConstDecl) }
+  if (k == Kind.KwLet) { return parseValueDecl(p, Tag.LetDecl) }
+  if (k == Kind.KwConst) { return parseValueDecl(p, Tag.ConstDecl) }
   return mkNode(p, Tag.ExprStmt, 0, [parseExpr(p)])
 }
 
@@ -254,28 +536,46 @@ function parseBlock(p: Parser): int {
 }
 
 // `func_decl = [recv_or_none, name, generics_or_none, params, result_or_none,
-// body]`. Receiver and generics are deferred (always none).
+// body]`. Receiver (method) support is a follow-up (always none here).
 function parseFuncDecl(p: Parser): int {
   advance(p)
   let name = leaf(p, Tag.Ident)
+  let generics = maybeGenericParams(p)
   let params = parseParams(p)
   let result = 0
   if (accept(p, Kind.Colon)) {
-    result = parseType(p)
+    result = parseResultType(p)
   }
   let body = parseBlock(p)
-  return mkNode(p, Tag.FuncDecl, 0, [0, name, 0, params, result, body])
+  return mkNode(p, Tag.FuncDecl, 0, [0, name, generics, params, result, body])
+}
+
+// Every non-import declaration that may follow `export`.
+function parseExportableDecl(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.KwConst) { return parseValueDecl(p, Tag.ConstDecl) }
+  if (k == Kind.KwLet) { return parseValueDecl(p, Tag.LetDecl) }
+  if (k == Kind.KwFunction) { return parseFuncDecl(p) }
+  if (k == Kind.KwStruct) { return parseStructDecl(p) }
+  if (k == Kind.KwInterface) { return parseInterfaceDecl(p) }
+  if (k == Kind.KwEnum) { return parseEnumDecl(p) }
+  if (k == Kind.KwType) { return parseTypeAlias(p) }
+  advance(p)
+  return 0
 }
 
 function parseTopDecl(p: Parser): int {
   let k = peekKind(p)
-  if (k == Kind.KwConst) { return parseBinding(p, Tag.ConstDecl) }
-  if (k == Kind.KwLet) { return parseBinding(p, Tag.LetDecl) }
-  if (k == Kind.KwFunction) { return parseFuncDecl(p) }
-  // Unhandled top-level construct (struct/enum/interface/export/...): consume
-  // one token so the loop advances. These land as the grammar grows.
-  advance(p)
-  return 0
+  if (k == Kind.KwImport) { return parseImportDecl(p) }
+  if (k == Kind.KwExport) {
+    advance(p)
+    let inner = parseExportableDecl(p)
+    if (inner == 0) {
+      return 0
+    }
+    return mkNode(p, Tag.Export, 0, [inner])
+  }
+  return parseExportableDecl(p)
 }
 
 function parseProgram(p: Parser): int {
