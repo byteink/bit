@@ -1560,6 +1560,14 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
     ins.bval = fc.c.source[n.span.start:n.span.end] == "true"
     return builderEmit(fc.b, ins)
   }
+  if (tag == Tag.NilLit) {
+    // `nil` adopts its context type (a ref/interface); the dump shows no type.
+    let ty = hint
+    if (ty == 0) {
+      ty = defaultType(fc.c, checkExprType(fc.c, node))
+    }
+    return builderEmit(fc.b, mkInstr(Op.ConstNil, ty))
+  }
   if (tag == Tag.FloatLit) {
     // An untyped float literal defaults to f64; an f32/f64 context adopts the
     // hint. `parseFloat` yields the same bits the seed does (both format via
@@ -1589,6 +1597,11 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   }
   if (tag == Tag.SliceLit) {
     let st = defaultType(fc.c, checkExprType(fc.c, node))
+    // A `[]Shape` context types `[nil]` as `[]Shape`, not the inferred
+    // `[]untyped_nil`; prefer the hint slice type.
+    if (hint != 0 && fc.c.ctx.types[hint].kind == TypeKind.Slice) {
+      st = hint
+    }
     if (fc.c.ctx.types[st].kind != TypeKind.Slice) {
       fc.failed = true
       return 0
@@ -1706,6 +1719,99 @@ function lowerTypeAssert(fc: FnCtx, node: int): int {
   return builderEmit(fc.b, ins)
 }
 
+// The two-result forms `<- c` / `m[k]` / `iface.(T)` (SPEC §12.6/§14.4/§16.2),
+// returning [value, ok] — or an empty list if `node` is none of them. The
+// chan/interface `ok` comes from a call reporting the immediately preceding one
+// (ABI.md §2.2/§11), so each pair is emitted back to back.
+function lowerTwoResult(fc: FnCtx, node: int): []int {
+  let n = getNode(fc.c.tree, node)
+  let k = kidsOf(fc.c.tree, node)
+  let valTy = checkExprType(fc.c, node)
+  let boolTy = primType(fc.c.ctx, 10)
+  if (n.tag == Tag.Unary && n.main == int(Kind.ArrowLeft)) {
+    let ch = lowerExpr(fc, k[0])
+    if (fc.failed) {
+      return []int(0)
+    }
+    let rv = mkInstr(Op.RtCall, valTy)
+    rv.name = "chan_recv"
+    rv.args = [ch]
+    let v = builderEmit(fc.b, rv)
+    let okI = mkInstr(Op.RtCall, boolTy)
+    okI.name = "chan_recv_ok"
+    return [v, builderEmit(fc.b, okI)]
+  }
+  if (n.tag == Tag.Index) {
+    let recvTy = defaultType(fc.c, checkExprType(fc.c, k[0]))
+    if (fc.c.ctx.types[recvTy].kind != TypeKind.Map) {
+      return []int(0)
+    }
+    let m = lowerExpr(fc, k[0])
+    let key = lowerExprH(fc, k[1], fc.c.ctx.types[recvTy].mapKey)
+    if (fc.failed) {
+      return []int(0)
+    }
+    let gv = mkInstr(Op.RtCall, valTy)
+    gv.name = "map_get"
+    gv.args = [m, key]
+    let v = builderEmit(fc.b, gv)
+    let hv = mkInstr(Op.RtCall, boolTy)
+    hv.name = "map_has"
+    hv.args = [m, key]
+    return [v, builderEmit(fc.b, hv)]
+  }
+  if (n.tag == Tag.TypeAssert) {
+    let recv = lowerExpr(fc, k[0])
+    if (fc.failed) {
+      return []int(0)
+    }
+    let info = lowerTypeInfo(fc, valTy)
+    if (fc.failed) {
+      return []int(0)
+    }
+    let av = mkInstr(Op.RtCall, valTy)
+    av.name = "iface_as"
+    av.args = [recv, info]
+    let v = builderEmit(fc.b, av)
+    let okI = mkInstr(Op.RtCall, boolTy)
+    okI.name = "iface_as_ok"
+    return [v, builderEmit(fc.b, okI)]
+  }
+  return []int(0)
+}
+
+// Binds a two-result binder unless it is the blank `_` (which discards).
+function declareUnlessBlank(fc: FnCtx, patNode: int, val: int, ty: int) {
+  let pn = getNode(fc.c.tree, patNode)
+  let name = fc.c.source[pn.span.start:pn.span.end]
+  if (name == "_") {
+    return
+  }
+  declareLocal(fc, name, val, ty)
+  fc.c.env[name] = ty
+}
+
+// `let (v, ok) = <two-result>`: destructure the value/ok pair into the two
+// binders (each `_`-aware).
+function lowerTwoResultLet(fc: FnCtx, binding: int) {
+  let bk = kidsOf(fc.c.tree, binding)
+  let pats = kidsOf(fc.c.tree, bk[0])
+  if (len(pats) != 2 || bk[2] == 0) {
+    fc.failed = true
+    return
+  }
+  let two = lowerTwoResult(fc, bk[2])
+  if (fc.failed) {
+    return
+  }
+  if (len(two) != 2) {
+    fc.failed = true
+    return
+  }
+  declareUnlessBlank(fc, pats[0], two[0], checkExprType(fc.c, bk[2]))
+  declareUnlessBlank(fc, pats[1], two[1], primType(fc.c.ctx, 10))
+}
+
 // Emits a `type_info` for struct type `ty`: `disc` is the type id, `size` and
 // `ptrs` its GC layout (ABI.md §2). Typed `u64` — it is a `.rodata` address, not
 // a traced reference. The checker restricts assertion targets to structs.
@@ -1730,8 +1836,11 @@ function coerceToIface(fc: FnCtx, val: int, valTy: int, targetTy: int): int {
   if (fc.c.ctx.types[targetTy].kind != TypeKind.Interface || valTy == targetTy) {
     return val
   }
+  // A concrete struct (or a different interface) needs the relabel. An untyped
+  // `nil` was lowered with the interface hint, so it is already that type — no
+  // convert (matches the seed, which checks the value's actual IR type).
   let k = fc.c.ctx.types[valTy].kind
-  if (k != TypeKind.Struct && k != TypeKind.Interface && k != TypeKind.UntypedNil) {
+  if (k != TypeKind.Struct && k != TypeKind.Interface) {
     return val
   }
   let cv = mkInstr(Op.Convert, targetTy)
@@ -2493,6 +2602,40 @@ function lowerAssign(fc: FnCtx, node: int) {
   let k = kidsOf(fc.c.tree, node)
   let lhsItems = kidsOf(fc.c.tree, k[0])
   let rhsItems = kidsOf(fc.c.tree, k[1])
+  // A two-result comma-ok assign to existing locals, either bare `v, ok = m[k]`
+  // (two lhs items) or parenthesized `(v, ok) = m[k]` (one tuple_pat item).
+  if (opKind == int(Kind.Eq) && len(rhsItems) == 1) {
+    let targets = []int(0)
+    if (len(lhsItems) == 2) {
+      targets = lhsItems
+    } else if (len(lhsItems) == 1 && getNode(fc.c.tree, lhsItems[0]).tag == Tag.TuplePat) {
+      targets = kidsOf(fc.c.tree, lhsItems[0])
+    }
+    if (len(targets) == 2) {
+      let two = lowerTwoResult(fc, rhsItems[0])
+      if (fc.failed) {
+        return
+      }
+      if (len(two) != 2) {
+        fc.failed = true
+        return
+      }
+      let t = 0
+      while (t < 2) {
+        let tn = getNode(fc.c.tree, targets[t])
+        if (tn.tag == Tag.Ident && fc.c.source[tn.span.start:tn.span.end] != "_") {
+          let ix = envIndex(fc, fc.c.source[tn.span.start:tn.span.end])
+          if (ix == -1) {
+            fc.failed = true
+            return
+          }
+          fc.env[ix].value = two[t]
+        }
+        t = t + 1
+      }
+      return
+    }
+  }
   if (len(lhsItems) != 1 || len(rhsItems) != 1) {
     fc.failed = true
     return
@@ -2518,11 +2661,13 @@ function lowerAssign(fc: FnCtx, node: int) {
   }
   let ty = fc.env[idx].ty
   if (opKind == int(Kind.Eq)) {
+    let rhsTy = defaultType(fc.c, checkExprType(fc.c, rhsItems[0]))
     let v = lowerExprH(fc, rhsItems[0], ty)
     if (fc.failed) {
       return
     }
-    fc.env[idx].value = v
+    // A concrete value assigned into an interface-typed local is relabelled.
+    fc.env[idx].value = coerceToIface(fc, v, rhsTy, ty)
     return
   }
   let base = compoundBase(opKind)
@@ -2855,6 +3000,11 @@ function lowerForC(fc: FnCtx, node: int) {
 function lowerBinding(fc: FnCtx, node: int) {
   let kids = kidsOf(fc.c.tree, node)
   let pat = getNode(fc.c.tree, kids[0])
+  // `let (v, ok) = <two-result>` destructures a comma-ok pair.
+  if (pat.tag == Tag.TuplePat) {
+    lowerTwoResultLet(fc, node)
+    return
+  }
   if (pat.tag != Tag.Ident) {
     fc.failed = true
     return
