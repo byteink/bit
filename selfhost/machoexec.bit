@@ -193,3 +193,216 @@ function mePlacedSize(modules: []LoModule, items: []MePlaced): int {
   let end = last.vaddr + modules[last.module].atoms[last.atom].size
   return end - items[0].vaddr
 }
+
+// ===========================================================================
+// Dead-strip with libSystem imports, output partitioning, GOT + stub synthesis
+// ===========================================================================
+
+// A GOT slot points at either an internal defined atom (rebased at load) or a
+// libSystem import (bound at load). Stubs and the indirect symbol table read
+// this. Bit has no tagged union; `isImport` selects which fields are live.
+struct MeGotSlot {
+  isImport: bool,
+  name: string,
+  module: int,
+  atom: int,
+}
+
+// Everything the layout and emission slices need from the analysis pass.
+struct MeLinkState {
+  // Packed AtomId -> kept. The reachable set from __start.
+  kept: map<int, bool>,
+  // Undefined globals, in first-seen order — these become libSystem imports and
+  // the symbol table's only entries. Order is load-bearing: the indirect symbol
+  // table indexes into it.
+  importOrder: []string,
+  // Imports that are branch targets and therefore need a __stubs entry.
+  branchImports: map<string, bool>,
+  // Kept atoms partitioned by output class, in module/atom order.
+  text: []MePlaced,
+  rodata: []MePlaced,
+  data: []MePlaced,
+  bss: []MePlaced,
+  tlsVars: []MePlaced,
+  tlsData: []MePlaced,
+  tlsBss: []MePlaced,
+  // The __got, in slot order, plus the two indices into it.
+  gotList: []MeGotSlot,
+  gotOfInternal: map<int, int>,
+  gotOfImport: map<string, int>,
+  // The __stubs, in slot order.
+  stubList: []string,
+  stubOfImport: map<string, int>,
+}
+
+// Walks the reachability graph from __start. Unlike the ELF path's deadStrip, an
+// undefined global here is NOT an error — it is a libSystem import, and a leaf:
+// nothing beyond it is reachable in this image.
+function meDeadStripWithImports(modules: []LoModule, globals: map<string, int>): MeLinkState! {
+  let st = MeLinkState{ kept: map<int, bool>{}, importOrder: []string(0),
+    branchImports: map<string, bool>{}, text: []MePlaced(0), rodata: []MePlaced(0),
+    data: []MePlaced(0), bss: []MePlaced(0), tlsVars: []MePlaced(0),
+    tlsData: []MePlaced(0), tlsBss: []MePlaced(0), gotList: []MeGotSlot(0),
+    gotOfInternal: map<int, int>{}, gotOfImport: map<string, int>{},
+    stubList: []string(0), stubOfImport: map<string, int>{} }
+
+  let (entry, hasEntry) = globals[meEntrySymbol()]
+  if (!hasEntry) {
+    fail newError("MissingEntry")
+  }
+  let importSet = map<string, bool>{}
+  st.kept[entry] = true
+  let stack = [entry]
+  while (len(stack) > 0) {
+    let id = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    let atom = modules[atomKeyModule(id)].atoms[atomKeyAtom(id)]
+    let r = 0
+    while (r < len(atom.relocs)) {
+      let rel = atom.relocs[r]
+      if (!rel.target.isGlobal) {
+        let tid = atomKey(atomKeyModule(id), rel.target.local)
+        let (_, seen) = st.kept[tid]
+        if (!seen) {
+          st.kept[tid] = true
+          stack = append(stack, tid)
+        }
+      } else {
+        let (tid, defined) = globals[rel.target.name]
+        if (defined) {
+          let (_, seen) = st.kept[tid]
+          if (!seen) {
+            st.kept[tid] = true
+            stack = append(stack, tid)
+          }
+        } else {
+          // Undefined: a dynamic import from libSystem.
+          let (_, known) = importSet[rel.target.name]
+          if (!known) {
+            importSet[rel.target.name] = true
+            st.importOrder = append(st.importOrder, rel.target.name)
+          }
+          if (meIsBranch(rel.kind)) {
+            st.branchImports[rel.target.name] = true
+          }
+        }
+      }
+      r = r + 1
+    }
+  }
+  return st
+}
+
+// Partitions the kept atoms by output class, in module/atom order — the order
+// the sections are laid out in, so it fixes the final address of everything.
+function mePartition(modules: []LoModule, st: MeLinkState): MeLinkState {
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let (_, keep) = st.kept[atomKey(mi, ai)]
+      if (!keep) {
+        ai = ai + 1
+        continue
+      }
+      let p = MePlaced{ module: mi, atom: ai, vaddr: 0, fileOff: 0 }
+      let k = atoms[ai].kind
+      if (k == LoSectionKind.Text) {
+        st.text = append(st.text, p)
+      } else if (k == LoSectionKind.Rodata) {
+        st.rodata = append(st.rodata, p)
+      } else if (k == LoSectionKind.Data) {
+        st.data = append(st.data, p)
+      } else if (k == LoSectionKind.Bss) {
+        st.bss = append(st.bss, p)
+      } else if (k == LoSectionKind.TlsVars) {
+        st.tlsVars = append(st.tlsVars, p)
+      } else if (k == LoSectionKind.TlsData) {
+        st.tlsData = append(st.tlsData, p)
+      } else {
+        assert(k == LoSectionKind.TlsBss)
+        st.tlsBss = append(st.tlsBss, p)
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return st
+}
+
+// The GOT slot for an import, appending it if new.
+function meGotForImport(st: MeLinkState, name: string): int {
+  let (i, found) = st.gotOfImport[name]
+  if (found) {
+    return i
+  }
+  let idx = len(st.gotList)
+  st.gotOfImport[name] = idx
+  st.gotList = append(st.gotList, MeGotSlot{ isImport: true, name: name,
+    module: 0, atom: 0 })
+  return idx
+}
+
+// Synthesizes the __got and __stubs from every kept atom's relocations.
+//
+// A TLVP slot is a GOT-like pointer to an internal tlv_descriptor (the access
+// site does adrp/ldr to load its address), so it uses the same internal-GOT
+// machinery as a plain GOT reference.
+function meBuildGotAndStubs(modules: []LoModule, globals: map<string, int>, st: MeLinkState): MeLinkState! {
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let (_, keep) = st.kept[atomKey(mi, ai)]
+      if (!keep) {
+        ai = ai + 1
+        continue
+      }
+      let relocs = atoms[ai].relocs
+      let r = 0
+      while (r < len(relocs)) {
+        let rel = relocs[r]
+        let isImport = false
+        if (rel.target.isGlobal) {
+          let (_, defined) = globals[rel.target.name]
+          isImport = !defined
+        }
+        if (needsGot(rel.kind) || needsTlvp(rel.kind)) {
+          if (isImport) {
+            meGotForImport(st, rel.target.name)
+          } else {
+            let tid = resolveRef(globals, mi, rel.target)?
+            let (_, have) = st.gotOfInternal[tid]
+            if (!have) {
+              st.gotOfInternal[tid] = len(st.gotList)
+              st.gotList = append(st.gotList, MeGotSlot{ isImport: false, name: "",
+                module: atomKeyModule(tid), atom: atomKeyAtom(tid) })
+            }
+          }
+        }
+        if (meIsBranch(rel.kind) && isImport) {
+          // A branch to an import goes through a stub, which loads the import's
+          // GOT slot — so the stub needs one too.
+          meGotForImport(st, rel.target.name)
+          let (_, haveStub) = st.stubOfImport[rel.target.name]
+          if (!haveStub) {
+            st.stubOfImport[rel.target.name] = len(st.stubList)
+            st.stubList = append(st.stubList, rel.target.name)
+          }
+        }
+        r = r + 1
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return st
+}
+
+// The __DATA segment's load command only exists if something lives in it.
+function meHasDataSeg(st: MeLinkState): bool {
+  return len(st.gotList) > 0 || len(st.data) > 0 || len(st.bss) > 0 ||
+    len(st.tlsVars) > 0 || len(st.tlsData) > 0 || len(st.tlsBss) > 0
+}

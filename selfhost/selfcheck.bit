@@ -2574,6 +2574,151 @@ function checkMachoExecLayout() {
   assert(mePlacedSize([mod], []MePlaced(0)) == 0)
 }
 
+// Stage 3 (#1344 part 5b) the executable writer's analysis pass: dead-strip with
+// libSystem imports as leaves, output partitioning, and GOT/stub synthesis.
+
+function meAtom(name: string, kind: LoSectionKind, b: LoBinding, size: int, relocs: []LoReloc): LoAtom {
+  return LoAtom{ name: name, kind: kind, binding: b, data: []u8(size), size: size,
+    alignment: 1, weak: false, relocs: relocs }
+}
+
+function meRel(off: int, kind: LoRelocKind, target: LoSymbolRef): LoReloc {
+  return LoReloc{ offset: off, kind: kind, target: target, addend: 0 }
+}
+
+// An empty state — the value a failing catch must produce, since `panic` is
+// typed void rather than bottom and so cannot BE the value of a catch block that
+// must yield a MeLinkState. The assert(false) beside it is what actually fails.
+function meEmptyState(): MeLinkState {
+  return MeLinkState{ kept: map<int, bool>{}, importOrder: []string(0),
+    branchImports: map<string, bool>{}, text: []MePlaced(0), rodata: []MePlaced(0),
+    data: []MePlaced(0), bss: []MePlaced(0), tlsVars: []MePlaced(0),
+    tlsData: []MePlaced(0), tlsBss: []MePlaced(0), gotList: []MeGotSlot(0),
+    gotOfInternal: map<int, int>{}, gotOfImport: map<string, int>{},
+    stubList: []string(0), stubOfImport: map<string, int>{} }
+}
+
+// The analysis pass, run end to end the way linkExecutable will.
+function meAnalyze(modules: []LoModule): MeLinkState {
+  let g = resolveGlobals(modules) catch e {
+    assert(false)
+    map<string, int>{}
+  }
+  let st = meDeadStripWithImports(modules, g) catch e {
+    assert(false)
+    meEmptyState()
+  }
+  let st2 = mePartition(modules, st)
+  return meBuildGotAndStubs(modules, g, st2) catch e {
+    assert(false)
+    meEmptyState()
+  }
+}
+
+function checkMachoExecDeadStrip() {
+  // __start branches to an undefined _malloc (a libSystem import), calls an
+  // internal helper, and references a rodata string. `dead` is unreachable.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 16, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_malloc")),
+      meRel(4, LoRelocKind.Aarch64Call26, loGlobalRef("helper")),
+      meRel(8, LoRelocKind.Aarch64AdrPrelPgHi21, loLocalRef(3))]),  // atom 0
+    meAtom("helper", LoSectionKind.Text, LoBinding.Global, 8, []LoReloc(0)), // 1
+    meAtom("dead", LoSectionKind.Text, LoBinding.Global, 8, []LoReloc(0)),   // 2
+    meAtom("msg", LoSectionKind.Rodata, LoBinding.Local, 4, []LoReloc(0))]}  // 3
+  let st = meAnalyze([m])
+
+  // An undefined global is an IMPORT, not an error — that is the whole
+  // difference from the ELF path, where it would fail the link.
+  assert(len(st.importOrder) == 1 && st.importOrder[0] == "_malloc")
+  let (_, isBranchImport) = st.branchImports["_malloc"]
+  assert(isBranchImport)
+
+  // Reachable: __start, helper, msg. Not `dead`.
+  assert(len(st.kept) == 3)
+  let (_, k2) = st.kept[atomKey(0, 2)]
+  assert(!k2)
+
+  // Partitioned by class, in module/atom order.
+  assert(len(st.text) == 2)
+  assert(st.text[0].atom == 0 && st.text[1].atom == 1)
+  assert(len(st.rodata) == 1 && st.rodata[0].atom == 3)
+  assert(len(st.data) == 0 && len(st.bss) == 0)
+
+  // A branch to an import needs both a stub and the GOT slot the stub loads.
+  assert(len(st.stubList) == 1 && st.stubList[0] == "_malloc")
+  assert(len(st.gotList) == 1 && st.gotList[0].isImport)
+  assert(st.gotList[0].name == "_malloc")
+  let (gi, _) = st.gotOfImport["_malloc"]
+  assert(gi == 0)
+  // A plain internal branch does NOT get a stub — it resolves direct.
+  let (_, helperStub) = st.stubOfImport["helper"]
+  assert(!helperStub)
+  // Nothing here needs a __DATA segment: no got-internal, data, or bss... but the
+  // import GOT slot does live in __DATA.
+  assert(meHasDataSeg(st))
+}
+
+function checkMachoExecGot() {
+  // A GOT-page reference to an internal symbol takes an internal slot (rebased);
+  // one to an undefined symbol takes an import slot (bound). A TLVP reference
+  // reuses the same internal-GOT machinery.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 32, [
+      meRel(0, LoRelocKind.Aarch64AdrGotPage, loGlobalRef("gvar")),
+      meRel(4, LoRelocKind.Aarch64Ld64GotLo12Nc, loGlobalRef("gvar")),
+      meRel(8, LoRelocKind.Aarch64AdrGotPage, loGlobalRef("_environ")),
+      meRel(12, LoRelocKind.Aarch64TlvpAdrPage21, loLocalRef(2)),
+      meRel(16, LoRelocKind.Aarch64Call26, loGlobalRef("_exit"))]),
+    meAtom("gvar", LoSectionKind.Data, LoBinding.Global, 8, []LoReloc(0)),
+    meAtom("tlvdesc", LoSectionKind.TlsVars, LoBinding.Local, 24, []LoReloc(0))]}
+  let st = meAnalyze([m])
+
+  // Two references to one internal symbol share ONE slot.
+  assert(len(st.gotList) == 4)
+  assert(!st.gotList[0].isImport && st.gotList[0].atom == 1) // gvar, once
+  assert(st.gotList[1].isImport && st.gotList[1].name == "_environ")
+  assert(!st.gotList[2].isImport && st.gotList[2].atom == 2) // the tlv_descriptor
+  assert(st.gotList[3].isImport && st.gotList[3].name == "_exit")
+
+  // _environ is imported but never branched to, so it needs no stub; _exit is.
+  assert(len(st.stubList) == 1 && st.stubList[0] == "_exit")
+  let (_, envIsBranch) = st.branchImports["_environ"]
+  assert(!envIsBranch)
+  // Import order is first-seen: the indirect symbol table indexes into it.
+  assert(len(st.importOrder) == 2)
+  assert(st.importOrder[0] == "_environ" && st.importOrder[1] == "_exit")
+
+  assert(len(st.data) == 1 && len(st.tlsVars) == 1)
+  assert(meHasDataSeg(st))
+}
+
+function checkMachoExecNoDataSeg() {
+  // A pure-text image with no GOT, data, bss or TLS needs no __DATA segment at
+  // all — and one fewer load command.
+  let m = LoModule{ name: "rt", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Aarch64Call26, loLocalRef(1))]),
+    meAtom("f", LoSectionKind.Text, LoBinding.Local, 4, []LoReloc(0))]}
+  let st = meAnalyze([m])
+  assert(!meHasDataSeg(st))
+  assert(len(st.gotList) == 0 && len(st.stubList) == 0)
+  assert(len(st.importOrder) == 0)
+  assert(meNcmds(meHasDataSeg(st)) == 11)
+
+  // A missing entry point is a hard error, not an import: nothing can define
+  // __start but the runtime.
+  let bad = LoModule{ name: "x", atoms: [
+    meAtom("notstart", LoSectionKind.Text, LoBinding.Global, 4, []LoReloc(0))]}
+  let g = resolveGlobals([bad]) catch e { map<string, int>{} }
+  let msg = ""
+  let st2 = meDeadStripWithImports([bad], g) catch e {
+    msg = e.message()
+    meEmptyState()
+  }
+  assert(msg == "MissingEntry")
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -2752,6 +2897,9 @@ function selfcheck() {
   checkMachoExecUleb()
   checkMachoExecOpcodes()
   checkMachoExecLayout()
+  checkMachoExecDeadStrip()
+  checkMachoExecGot()
+  checkMachoExecNoDataSeg()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
