@@ -1382,8 +1382,115 @@ function lowerWhile(fc: FnCtx, node: int) {
   fc.terminated = false
 }
 
-// Lowers one statement. Only `return [expr]` is handled; anything else trips
-// `failed`.
+// Lowers `for x of it` over a slice or array to the seed's counted-loop SSA:
+// hidden `$iter`/`$idx` locals thread through a header (test idx < len), a body
+// (bind the element, run the body), a step (advance idx, back to header), and an
+// exit. break -> exit, continue -> step. ponytail: slice/array only — map
+// iteration ($idx cursor via map_iter_*) deferred.
+function lowerForOf(fc: FnCtx, node: int) {
+  let k = kidsOf(fc.c.tree, node)
+  let iterTy = defaultType(fc.c, checkExprType(fc.c, k[1]))
+  let id = fc.c.ctx.types[iterTy]
+  if (id.kind != TypeKind.Slice && id.kind != TypeKind.Array) {
+    fc.failed = true
+    return
+  }
+  let binderNode = getNode(fc.c.tree, k[0])
+  if (binderNode.tag != Tag.Ident) {
+    fc.failed = true
+    return
+  }
+  let elemTy = id.elem
+  let i64ty = primType(fc.c.ctx, 3)
+  let iterVal = lowerExpr(fc, k[1])
+  if (fc.failed) {
+    return
+  }
+  // Carry the iterable + cursor as hidden locals so they thread through the
+  // loop's block params.
+  declareLocal(fc, "$iter", iterVal, iterTy)
+  let zero = mkInstr(Op.ConstInt, i64ty)
+  zero.ival = 0
+  declareLocal(fc, "$idx", builderEmit(fc.b, zero), i64ty)
+  let preLen = len(fc.env)
+  let idxSlot = preLen - 1
+  let iterSlot = preLen - 2
+  let header = builderNewBlock(fc.b)
+  let bodyBlk = builderNewBlock(fc.b)
+  let stepBlk = builderNewBlock(fc.b)
+  let exitBlk = builderNewBlock(fc.b)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Header: test the cursor against the length.
+  builderBeginBlock(fc.b, header)
+  addJoinParams(fc, preLen)
+  let idxVal = fc.env[idxSlot].value
+  let iterCur = fc.env[iterSlot].value
+  let lenVal = 0
+  if (id.kind == TypeKind.Array) {
+    let ci = mkInstr(Op.ConstInt, i64ty)
+    ci.ival = id.arrayLen
+    lenVal = builderEmit(fc.b, ci)
+  } else {
+    let sl = mkInstr(Op.SliceLen, i64ty)
+    sl.lhs = iterCur
+    lenVal = builderEmit(fc.b, sl)
+  }
+  let cmp = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
+  cmp.lhs = idxVal
+  cmp.rhs = lenVal
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, cmp)
+  br.ival = bodyBlk
+  br.thenArgs = []int(0)
+  br.ival2 = exitBlk
+  br.elseArgs = snapshotValues(fc, preLen)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  // Body: bind the element, run the body, fall through to the step.
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen })
+  builderBeginBlock(fc.b, bodyBlk)
+  fc.terminated = false
+  let elemV = 0
+  if (id.kind == TypeKind.Slice) {
+    let sg = mkInstr(Op.RtCall, elemTy)
+    sg.name = "slice_get"
+    sg.args = [iterCur, idxVal]
+    elemV = builderEmit(fc.b, sg)
+  } else {
+    let ig = mkInstr(Op.IndexGet, elemTy)
+    ig.lhs = iterCur
+    ig.rhs = idxVal
+    elemV = builderEmit(fc.b, ig)
+  }
+  let bodyMark = len(fc.env)
+  declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
+  lowerStmtList(fc, k[2])
+  truncateEnv(fc, bodyMark)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  if (!fc.terminated) {
+    emitJump(fc, stepBlk, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  // Step: advance the cursor, back to the header.
+  builderBeginBlock(fc.b, stepBlk)
+  addJoinParams(fc, preLen)
+  let one = mkInstr(Op.ConstInt, i64ty)
+  one.ival = 1
+  let add = mkInstr(Op.Add, i64ty)
+  add.lhs = fc.env[idxSlot].value
+  add.rhs = builderEmit(fc.b, one)
+  fc.env[idxSlot].value = builderEmit(fc.b, add)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Exit.
+  builderBeginBlock(fc.b, exitBlk)
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+  // Drop the hidden $iter/$idx locals.
+  truncateEnv(fc, preLen - 2)
+}
+
 // Lowers one `let`/`const` binding: a simple `name = init` binds the init's
 // value id in env (no instruction — the local IS its init value). tuple/zero-
 // init bindings fall back for now.
@@ -1500,6 +1607,10 @@ function lowerStmt(fc: FnCtx, node: int) {
   }
   if (n.tag == Tag.WhileStmt) {
     lowerWhile(fc, node)
+    return
+  }
+  if (n.tag == Tag.ForOf) {
+    lowerForOf(fc, node)
     return
   }
   if (n.tag == Tag.Assign) {
