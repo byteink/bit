@@ -1,0 +1,209 @@
+// Self-host Stage 3 (#1344): `ar` archive reader, ported from
+// compiler/link/archive.zig. Extracts the member object(s) out of libbitrt.a so
+// the object readers can parse them. Handles both formats `zig build libbitrt`
+// actually writes: GNU/System V for ELF targets (a `/` symbol-table member, a
+// `//` long-name table, GNU trailing-`/` short names) and BSD for Mach-O targets
+// (an `__.SYMDEF` symbol table and `#1/<len>` names carried as a null-padded
+// prefix of each member's own data).
+//
+// Both symbol tables are deliberately SKIPPED rather than parsed: the linker's
+// merge always needs every member's full symbol table anyway (to build the
+// whole-link global table for dead-strip reachability), so routing straight to
+// the member defining a wanted symbol would save nothing.
+
+struct ArMember {
+  name: string,
+  data: []u8,
+}
+
+function arMagic(): string {
+  return "!<arch>\n"
+}
+
+function arHeaderLen(): int {
+  return 60
+}
+
+// Where a member's name came from, and where its real content starts. The
+// data offset is nonzero only for BSD `#1/<len>`, whose name is a prefix of the
+// data itself.
+struct ArResolved {
+  name: string,
+  dataStart: int,
+}
+
+function arBytesEq(b: []u8, off: int, s: string): bool {
+  let t = []byte(s)
+  if (off + len(t) > len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(t)) {
+    if (b[off + i] != t[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Trailing `c` removed — `ar` pads its fixed-width header fields with spaces,
+// and a BSD name with NULs.
+function arTrimEnd(s: string, c: u8): string {
+  let b = []byte(s)
+  let n = len(b)
+  while (n > 0 && b[n - 1] == c) {
+    n = n - 1
+  }
+  return string(b[0:n])
+}
+
+function arIsAllDigits(s: string): bool {
+  let b = []byte(s)
+  if (len(b) == 0) {
+    return false
+  }
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] < u8(48) || b[i] > u8(57)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// A plain decimal field, or -1 if it is not one. `ar` sizes and long-name
+// offsets are unsigned decimal with space padding; nothing else is valid, and a
+// silent 0 would truncate a member.
+function arParseDecimal(s: string): int {
+  let t = arTrimEnd(s, u8(32))
+  if (!arIsAllDigits(t)) {
+    return -1
+  }
+  let b = []byte(t)
+  let v = 0
+  let i = 0
+  while (i < len(b)) {
+    v = v * 10 + (int(b[i]) - 48)
+    i = i + 1
+  }
+  return v
+}
+
+// `data` is needed only for the BSD `#1/<len>` case, where the name is a prefix
+// of the member's own data rather than a separate table lookup.
+function arResolveName(rawName: string, longNames: []u8, data: []u8): ArResolved! {
+  let raw = []byte(rawName)
+  // GNU: "name/" — a trailing slash marks the end of a short inline name.
+  if (len(raw) > 0 && raw[len(raw) - 1] == u8(47)) {
+    return ArResolved{ name: string(raw[0:len(raw) - 1]), dataStart: 0 }
+  }
+  // GNU: "/<decimal offset>" — the name lives in the `//` long-name table,
+  // terminated by a newline.
+  if (len(raw) > 1 && raw[0] == u8(47) && arIsAllDigits(string(raw[1:len(raw)]))) {
+    let off = arParseDecimal(string(raw[1:len(raw)]))
+    if (off < 0 || off >= len(longNames)) {
+      fail newError("BadLongName")
+    }
+    let end = off
+    while (end < len(longNames) && longNames[end] != u8(10)) {
+      end = end + 1
+    }
+    if (end >= len(longNames)) {
+      fail newError("BadLongName")
+    }
+    let nameEnd = end
+    if (nameEnd > off && longNames[nameEnd - 1] == u8(47)) {
+      nameEnd = nameEnd - 1
+    }
+    return ArResolved{ name: string(longNames[off:nameEnd]), dataStart: 0 }
+  }
+  // BSD: "#1/<len>" — the name is the first `len` (null-padded) bytes of the
+  // member's own data; the real content follows at data[len..].
+  if (len(raw) > 3 && raw[0] == u8(35) && raw[1] == u8(49) && raw[2] == u8(47)) {
+    let n = arParseDecimal(string(raw[3:len(raw)]))
+    if (n < 0 || n > len(data)) {
+      fail newError("BadLongName")
+    }
+    return ArResolved{ name: arTrimEnd(string(data[0:n]), u8(0)), dataStart: n }
+  }
+  return ArResolved{ name: rawName, dataStart: 0 }
+}
+
+// Parses a whole `.a` file into its real members, skipping the `/` (System V
+// symbol table), `//` (long-name table), and `__.SYMDEF*` (BSD symbol table)
+// special members.
+function parseArchive(bytes: []u8): []ArMember! {
+  if (len(bytes) < len([]byte(arMagic())) || !arBytesEq(bytes, 0, arMagic())) {
+    fail newError("BadMagic")
+  }
+
+  let longNames = []u8(0)
+  let members = []ArMember(0)
+  let pos = len([]byte(arMagic()))
+  while (pos < len(bytes)) {
+    // Archives pad each member to an even offset with one newline filler byte;
+    // skip it before reading the next header.
+    if (pos % 2 == 1) {
+      pos = pos + 1
+    }
+    if (pos == len(bytes)) {
+      break
+    }
+    if (pos + arHeaderLen() > len(bytes)) {
+      fail newError("TruncatedArchive")
+    }
+    if (!arBytesEq(bytes, pos + 58, "`\n")) {
+      fail newError("BadHeader")
+    }
+
+    let rawName = arTrimEnd(string(bytes[pos:pos + 16]), u8(32))
+    let size = arParseDecimal(string(bytes[pos + 48:pos + 58]))
+    if (size < 0) {
+      fail newError("BadHeader")
+    }
+
+    let dataStart = pos + arHeaderLen()
+    if (dataStart + size > len(bytes)) {
+      fail newError("TruncatedArchive")
+    }
+    let data = bytes[dataStart:dataStart + size]
+    pos = dataStart + size
+
+    if (rawName == "/") {
+      continue // System V symbol table — unused, see the file comment
+    }
+    if (rawName == "//") {
+      longNames = data // GNU long-filename table
+      continue
+    }
+
+    let resolved = arResolveName(rawName, longNames, data)?
+    // BSD symbol tables carry an __.SYMDEF / __.SYMDEF SORTED / __.SYMDEF_64
+    // name (the macOS form of the GNU `/` member) — the index deliberately not
+    // used, same as `/` above.
+    if (arHasPrefix(resolved.name, "__.SYMDEF")) {
+      continue
+    }
+    members = append(members, ArMember{ name: resolved.name,
+      data: data[resolved.dataStart:len(data)] })
+  }
+  return members
+}
+
+function arHasPrefix(s: string, prefix: string): bool {
+  let a = []byte(s)
+  let b = []byte(prefix)
+  if (len(b) > len(a)) {
+    return false
+  }
+  let i = 0
+  while (i < len(b)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
