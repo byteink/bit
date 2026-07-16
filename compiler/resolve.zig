@@ -193,6 +193,8 @@ const predeclared_funcs = [_][]const u8{
     "osArgc",           "osArgAt",          "osEnv",      "osExit",
     // Crypto boundary primitives (ABI.md §21); std/crypto wraps these.
     "cryptoRandomBytes", "cryptoSecureZero",
+    // Float-literal parsing, for the self-hosted compiler's `FloatLit` lowering.
+    "parseFloat",
 };
 
 // ============================================================================

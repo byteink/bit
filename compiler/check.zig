@@ -2751,6 +2751,9 @@ const Checker = struct {
         // is not here: its `[]byte` parameter is not a `Prim`, so it is
         // special-cased in `checkBuiltinCall`.
         .{ "cryptoRandomBytes", PrimSig{ .params = &.{.i64}, .ret = .string } },
+        // Float-literal parsing, for the self-hosted compiler's `FloatLit`
+        // lowering: `parseFloat(text: string) -> f64`.
+        .{ "parseFloat", PrimSig{ .params = &.{.string}, .ret = .f64 } },
     });
 
     fn primSig(name: []const u8) ?PrimSig {

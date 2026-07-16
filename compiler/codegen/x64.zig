@@ -1772,6 +1772,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .os_exit = "bit_rt_os_exit",
     .random_bytes = "bit_rt_random_bytes",
     .secure_zero = "bit_rt_secure_zero",
+    .parse_float = "bit_rt_parse_float",
 });
 
 const CallReturn = struct { dst: u32, ty: TypeId };

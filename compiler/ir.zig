@@ -228,6 +228,9 @@ pub const RtFn = enum {
     /// with an optimizer-proof barrier, for clearing key material.
     random_bytes,
     secure_zero,
+    /// `parse_float(text) -> f64`: the value of a float literal (`_` stripped).
+    /// Used by the self-hosted compiler to fold a `FloatLit` to `const_float`.
+    parse_float,
 };
 
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the

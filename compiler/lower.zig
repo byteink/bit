@@ -2603,6 +2603,7 @@ const FnCtx = struct {
         .{ "osExit", ir.RtFn.os_exit },
         .{ "cryptoRandomBytes", ir.RtFn.random_bytes },
         .{ "cryptoSecureZero", ir.RtFn.secure_zero },
+        .{ "parseFloat", ir.RtFn.parse_float },
     });
 
     /// `append(s, e1, e2, ...)`: folds each element through `slice_append`,

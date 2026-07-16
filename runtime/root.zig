@@ -988,6 +988,23 @@ export fn bit_rt_string_from_float(v: f64) callconv(.c) *const RtBytes {
     return stringFromBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
 }
 
+/// `parseFloat(text) -> f64`: the value of a float literal, `_` separators
+/// stripped (SPEC §5.4). Mirrors the seed checker's `parseFloatLiteral`, so the
+/// self-hosted compiler parses a float to the identical bits — a prerequisite for
+/// a byte-identical `const_float` IR dump (both format via `{d}`). Unparsable
+/// text yields 0 (the checker has already validated the literal's shape).
+export fn bit_rt_parse_float(s: *const RtBytes) callconv(.c) f64 {
+    var buf: [80]u8 = undefined;
+    if (s.len > buf.len) return 0;
+    var n: usize = 0;
+    for (s.ptr[0..s.len]) |c| {
+        if (c == '_') continue;
+        buf[n] = c;
+        n += 1;
+    }
+    return std.fmt.parseFloat(f64, buf[0..n]) catch 0;
+}
+
 export fn bit_rt_string_from_bool(v: bool) callconv(.c) *const RtBytes {
     return stringFromBytes(if (v) "true" else "false");
 }
