@@ -108,6 +108,10 @@ struct FnCtx {
   // Pending deferred calls (their args already lowered at the `defer` site);
   // emitted in reverse (LIFO) at every function exit.
   defers: []IrInstr,
+  // Fallible-function context (SPEC §18): the result's ok/err types when the
+  // enclosing function returns `T!E`, else 0. `fail`/`?`/ok-return use these.
+  fallibleOk: int,
+  fallibleErr: int,
 }
 
 // Module-wide lowering state shared across all functions (mutated as they lower
@@ -660,7 +664,8 @@ function lowerCall(fc: FnCtx, node: int): int {
       if (fc.failed) {
         return 0
       }
-      let ins = mkInstr(Op.Call, funcResultLookup(fc.c, name))
+      // A fallible callee's IR result is its ok type (the error rides the slot).
+      let ins = mkInstr(Op.Call, unwrapFallible(fc.c, funcResultLookup(fc.c, name)))
       ins.name = name
       ins.args = a
       return builderEmit(fc.b, ins)
@@ -715,7 +720,7 @@ function lowerCall(fc: FnCtx, node: int): int {
         all = append(all, a[j])
         j = j + 1
       }
-      let ins = mkInstr(Op.Call, methodResultLookup(fc.c, typeName(fc.c.ctx, recvTy) + "." + mname))
+      let ins = mkInstr(Op.Call, unwrapFallible(fc.c, methodResultLookup(fc.c, typeName(fc.c.ctx, recvTy) + "." + mname)))
       ins.name = mname + "\$t${recvTy}"
       ins.args = all
       return builderEmit(fc.b, ins)
@@ -1543,6 +1548,18 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   if (tag == Tag.TypeAssert) {
     return lowerTypeAssert(fc, node)
   }
+  if (tag == Tag.TryExpr) {
+    return lowerTryExpr(fc, node)
+  }
+  if (tag == Tag.CatchDefault) {
+    return lowerCatch(fc, node, false)
+  }
+  if (tag == Tag.CatchBind) {
+    return lowerCatch(fc, node, true)
+  }
+  if (tag == Tag.MatchStmt) {
+    return lowerMatchExpr(fc, node)
+  }
   fc.failed = true
   return 0
 }
@@ -2066,6 +2083,116 @@ function lowerMatch(fc: FnCtx, node: int) {
     builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
     fc.terminated = true
   }
+}
+
+// Lowers one match-expression arm: its body is an *expression* whose value is
+// carried to the join as the trailing block param. Returns whether the join is
+// reached.
+function lowerMatchExprArm(fc: FnCtx, arm: int, preLen: int, join: int, resultTy: int, isVoid: bool): bool {
+  let ak = kidsOf(fc.c.tree, arm)
+  let val = 0
+  if (isVoid) {
+    lowerExpr(fc, ak[1])
+  } else {
+    val = lowerExprH(fc, ak[1], resultTy)
+  }
+  if (fc.failed) {
+    return false
+  }
+  if (!fc.terminated) {
+    emitJump(fc, join, catchEdgeArgs(fc, snapshotValues(fc, preLen), val, isVoid))
+    return true
+  }
+  return false
+}
+
+// Lowers a `match (subject) { V => expr, ... }` in expression position over a
+// C-like enum: like the statement form, but each arm yields a value merged at the
+// join's trailing param — the whole match's value. ponytail: boxed enums deferred.
+function lowerMatchExpr(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let resultTy = defaultType(fc.c, checkExprType(fc.c, node))
+  let subjectTy = defaultType(fc.c, checkExprType(fc.c, k[0]))
+  if (fc.c.ctx.types[subjectTy].kind != TypeKind.Enum) {
+    fc.failed = true
+    return 0
+  }
+  let enumName = typeName(fc.c.ctx, subjectTy)
+  if (enumIsBoxed(fc.c, enumName)) {
+    fc.failed = true
+    return 0
+  }
+  let subject = lowerExprH(fc, k[0], subjectTy)
+  if (fc.failed) {
+    return 0
+  }
+  let arms = kidsOf(fc.c.tree, k[1])
+  if (len(arms) == 0) {
+    fc.failed = true
+    return 0
+  }
+  let isVoid = resultTy == fc.c.ctx.voidId
+  let boolTy = primType(fc.c.ctx, 10)
+  let preLen = len(fc.env)
+  let orig = snapshotValues(fc, preLen)
+  let join = builderNewBlock(fc.b)
+  let joinReachable = false
+  let i = 0
+  while (i < len(arms) - 1 && !fc.failed) {
+    let arm = arms[i]
+    let vn = getNode(fc.c.tree, kidsOf(fc.c.tree, kidsOf(fc.c.tree, arm)[0])[0])
+    let armTag = variantOrdinal(fc.c, enumName, fc.c.source[vn.span.start:vn.span.end])
+    let bodyBlk = builderNewBlock(fc.b)
+    let nextBlk = builderNewBlock(fc.b)
+    let ci = mkInstr(Op.ConstInt, subjectTy)
+    ci.ival = armTag
+    let eq = mkInstr(Op.ICmpEq, boolTy)
+    eq.lhs = subject
+    eq.rhs = builderEmit(fc.b, ci)
+    let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+    br.lhs = builderEmit(fc.b, eq)
+    br.ival = bodyBlk
+    br.thenArgs = []int(0)
+    br.ival2 = nextBlk
+    br.elseArgs = []int(0)
+    builderEmit(fc.b, br)
+    builderEndBlock(fc.b)
+    builderBeginBlock(fc.b, bodyBlk)
+    fc.terminated = false
+    if (lowerMatchExprArm(fc, arm, preLen, join, resultTy, isVoid)) {
+      joinReachable = true
+    }
+    builderEndBlock(fc.b)
+    truncateEnv(fc, preLen)
+    restoreValues(fc, orig)
+    builderBeginBlock(fc.b, nextBlk)
+    i = i + 1
+  }
+  fc.terminated = false
+  if (lowerMatchExprArm(fc, arms[len(arms) - 1], preLen, join, resultTy, isVoid)) {
+    joinReachable = true
+  }
+  builderEndBlock(fc.b)
+  truncateEnv(fc, preLen)
+  restoreValues(fc, orig)
+  builderBeginBlock(fc.b, join)
+  if (!joinReachable) {
+    let phTy = resultTy
+    if (isVoid) {
+      phTy = primType(fc.c.ctx, 3)
+    }
+    let ph = zeroValue(fc, phTy)
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    fc.terminated = true
+    return ph
+  }
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+  if (isVoid) {
+    let z = mkInstr(Op.ConstInt, primType(fc.c.ctx, 3))
+    return builderEmit(fc.b, z)
+  }
+  return builderAddParam(fc.b, resultTy)
 }
 
 // Drops env locals beyond `n` (a scope exit), keeping the first `n`.
@@ -2632,6 +2759,201 @@ function runDefers(fc: FnCtx) {
   }
 }
 
+// ---- fallible-result error channel (SPEC §18) -----------------------------
+
+// `err_set(e)` — publish the pending error for the caller's `?`/`catch`.
+function setErr(fc: FnCtx, val: int) {
+  let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  ins.name = "err_set"
+  ins.args = [val]
+  builderEmit(fc.b, ins)
+}
+
+// `err_set(nil)` — an ok return / handled `catch` clears the slot.
+function clearErr(fc: FnCtx) {
+  let nl = mkInstr(Op.ConstNil, fc.c.ctx.errorId)
+  setErr(fc, builderEmit(fc.b, nl))
+}
+
+// `err_get()` — read the pending error right after a fallible call.
+function getErr(fc: FnCtx, errTy: int): int {
+  let ins = mkInstr(Op.RtCall, errTy)
+  ins.name = "err_get"
+  return builderEmit(fc.b, ins)
+}
+
+// `err != nil` — the test that decides the `?`/`catch` error path.
+function neNil(fc: FnCtx, errv: int, errTy: int): int {
+  let nl = mkInstr(Op.ConstNil, errTy)
+  let ne = mkInstr(Op.ICmpNe, primType(fc.c.ctx, 10))
+  ne.lhs = errv
+  ne.rhs = builderEmit(fc.b, nl)
+  return builderEmit(fc.b, ne)
+}
+
+// Return from a fallible function on the err path: a zero ok value, or nothing
+// when the ok type is void (`()!`).
+function emitFallibleZeroRet(fc: FnCtx) {
+  if (fc.fallibleOk == fc.c.ctx.voidId) {
+    builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
+    fc.terminated = true
+    return
+  }
+  let zv = zeroValue(fc, fc.fallibleOk)
+  let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
+  r.args = [zv]
+  builderEmit(fc.b, r)
+  fc.terminated = true
+}
+
+// `fail e` (§18.3): evaluate the error, run defers, publish it, return zero ok.
+function lowerFail(fc: FnCtx, node: int) {
+  let errv = lowerExprH(fc, kidsOf(fc.c.tree, node)[0], fc.fallibleErr)
+  if (fc.failed) {
+    return
+  }
+  runDefers(fc)
+  setErr(fc, errv)
+  emitFallibleZeroRet(fc)
+}
+
+// `expr?` (§18.3): lower the fallible call (its ok value lands normally), then
+// branch on the error slot — on error propagate (defers, restore the error,
+// return zero ok); on ok the value is the call's ok result.
+function lowerTryExpr(fc: FnCtx, node: int): int {
+  let operand = kidsOf(fc.c.tree, node)[0]
+  let errTy = fc.c.ctx.types[checkExprType(fc.c, operand)].errTy
+  let okv = lowerExpr(fc, operand)
+  if (fc.failed) {
+    return 0
+  }
+  let errv = getErr(fc, errTy)
+  let isErr = neNil(fc, errv, errTy)
+  let prop = builderNewBlock(fc.b)
+  let cont = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = isErr
+  br.ival = prop
+  br.thenArgs = []int(0)
+  br.ival2 = cont
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, prop)
+  fc.terminated = false
+  runDefers(fc)
+  setErr(fc, errv)
+  emitFallibleZeroRet(fc)
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, cont)
+  fc.terminated = false
+  // `cont` has a single predecessor (dominated by the branch), so the ok value
+  // flows in directly — no block param.
+  return okv
+}
+
+// The block-param args for a catch/match-expr join edge: the live locals, plus
+// the merged value unless the ok type is void. Copies `locals` (append can grow
+// its input in place, and a caller reuses the snapshot for `restoreValues`).
+function catchEdgeArgs(fc: FnCtx, locals: []int, val: int, isVoid: bool): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(locals)) {
+    out = append(out, locals[i])
+    i = i + 1
+  }
+  if (!isVoid) {
+    out = append(out, val)
+  }
+  return out
+}
+
+// `expr catch d` / `expr catch e { … }` (§18.3): merge the ok value and the
+// handled value at a join. A void ok type carries no value (the catch is a
+// statement); the ok value stands in as the placeholder.
+function lowerCatch(fc: FnCtx, node: int, bind: bool): int {
+  let k = kidsOf(fc.c.tree, node)
+  let fty = checkExprType(fc.c, k[0])
+  let okTy = fc.c.ctx.types[fty].result
+  let errTy = fc.c.ctx.types[fty].errTy
+  let isVoid = okTy == fc.c.ctx.voidId
+  let okv = coerceToIface(fc, lowerExpr(fc, k[0]), fty, okTy)
+  if (fc.failed) {
+    return 0
+  }
+  let errv = getErr(fc, errTy)
+  let isErr = neNil(fc, errv, errTy)
+  let preLen = len(fc.env)
+  let orig = snapshotValues(fc, preLen)
+  let errBlk = builderNewBlock(fc.b)
+  let join = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = isErr
+  br.ival = errBlk
+  br.thenArgs = []int(0)
+  br.ival2 = join
+  br.elseArgs = catchEdgeArgs(fc, orig, okv, isVoid)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, errBlk)
+  fc.terminated = false
+  clearErr(fc)
+  let handled = 0
+  if (bind) {
+    let mark = len(fc.env)
+    let en = getNode(fc.c.tree, k[1])
+    declareLocal(fc, fc.c.source[en.span.start:en.span.end], errv, errTy)
+    fc.c.env[fc.c.source[en.span.start:en.span.end]] = errTy
+    handled = lowerCatchBlock(fc, k[2], okTy)
+    truncateEnv(fc, mark)
+  } else {
+    handled = lowerExprH(fc, k[1], okTy)
+  }
+  if (fc.failed) {
+    return 0
+  }
+  if (!fc.terminated) {
+    let merged = coerceToIface(fc, handled, okTy, okTy)
+    emitJump(fc, join, catchEdgeArgs(fc, snapshotValues(fc, preLen), merged, isVoid))
+  }
+  builderEndBlock(fc.b)
+  restoreValues(fc, orig)
+  builderBeginBlock(fc.b, join)
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+  if (isVoid) {
+    return okv
+  }
+  return builderAddParam(fc.b, okTy)
+}
+
+// The body of a `catch e { … }`: a block of statements whose final expression (if
+// the ok type is non-void) is the handled value. ponytail: a bind-catch body that
+// yields a value uses its trailing expression statement.
+function lowerCatchBlock(fc: FnCtx, block: int, okTy: int): int {
+  let stmts = kidsOf(fc.c.tree, block)
+  let i = 0
+  while (i < len(stmts) - 1 && !fc.failed && !fc.terminated) {
+    lowerStmt(fc, stmts[i])
+    i = i + 1
+  }
+  if (fc.failed || len(stmts) == 0) {
+    return 0
+  }
+  // The last statement yields the value for a non-void catch; a void catch runs
+  // it as a statement.
+  let last = stmts[len(stmts) - 1]
+  if (okTy == fc.c.ctx.voidId || fc.terminated) {
+    lowerStmt(fc, last)
+    return 0
+  }
+  if (getNode(fc.c.tree, last).tag == Tag.ExprStmt) {
+    return lowerExprH(fc, kidsOf(fc.c.tree, last)[0], okTy)
+  }
+  lowerStmt(fc, last)
+  return 0
+}
+
 function lowerStmt(fc: FnCtx, node: int) {
   let n = getNode(fc.c.tree, node)
   if (n.tag == Tag.ExprStmt) {
@@ -2678,6 +3000,10 @@ function lowerStmt(fc: FnCtx, node: int) {
     let vals = kidsOf(fc.c.tree, node)
     if (len(vals) == 0) {
       runDefers(fc)
+      // A fallible function's ok return must leave the error slot null (§18.5).
+      if (fc.fallibleErr != 0) {
+        clearErr(fc)
+      }
       builderEmit(fc.b, mkInstr(Op.Ret, fc.c.ctx.voidId))
       fc.terminated = true
       return
@@ -2694,10 +3020,17 @@ function lowerStmt(fc: FnCtx, node: int) {
       return
     }
     runDefers(fc)
+    if (fc.fallibleErr != 0) {
+      clearErr(fc)
+    }
     let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
     r.args = [v]
     builderEmit(fc.b, r)
     fc.terminated = true
+    return
+  }
+  if (n.tag == Tag.FailStmt) {
+    lowerFail(fc, node)
     return
   }
   if (n.tag == Tag.IfStmt) {
@@ -2828,16 +3161,25 @@ function lowerFunc(c: Checker, decl: int, moduleConsts: map<string, int>, lowere
     name = name + "\$t${recvId}"
   }
   let paramTypes = lowerParamTypes(c, decl)
-  // An omitted result is void; a fallible result shows its ok type in the header.
+  // An omitted result is void; a fallible result `T!E` shows its ok type in the
+  // header, and its ok/err feed the error channel (`fail`/`?`/ok-return).
   let result = c.ctx.voidId
+  let fallibleOk = 0
+  let fallibleErr = 0
   if (kids[4] != 0) {
-    result = unwrapFallible(c, typeFromNode(c, kids[4]))
+    let rawResult = typeFromNode(c, kids[4])
+    if (rawResult != 0 && c.ctx.types[rawResult].kind == TypeKind.Fallible) {
+      fallibleOk = c.ctx.types[rawResult].result
+      fallibleErr = c.ctx.types[rawResult].errTy
+    }
+    result = unwrapFallible(c, rawResult)
   }
   let b = newBuilder()
   let entry = builderNewBlock(b)
   builderBeginBlock(b, entry)
   let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false,
-    loops: []LoopFrame(0), moduleConsts: moduleConsts, lowerer: lowerer, defers: []IrInstr(0) }
+    loops: []LoopFrame(0), moduleConsts: moduleConsts, lowerer: lowerer, defers: []IrInstr(0),
+    fallibleOk: fallibleOk, fallibleErr: fallibleErr }
   // Bind params (receiver first, if any) to their block-param value ids. The
   // checker's env is flat across the whole module, so a later function's
   // same-named param can have overwritten this one's type; rebind ours here so
@@ -2857,6 +3199,11 @@ function lowerFunc(c: Checker, decl: int, moduleConsts: map<string, int>, lowere
   }
   if (!fc.terminated) {
     runDefers(fc)
+    // A void fallible function `()!` that falls off the end still clears the
+    // error slot on its ok path (§18.5).
+    if (fc.fallibleErr != 0) {
+      clearErr(fc)
+    }
     builderEmit(fc.b, mkInstr(Op.Ret, c.ctx.voidId))
   }
   builderEndBlock(fc.b)
