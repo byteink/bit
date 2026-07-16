@@ -865,8 +865,15 @@ fn runDump(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
         const r = try irReport(gpa, paths[0], source, false);
         text = r.text;
         failed = r.failed;
+    } else if (std.mem.eql(u8, mode, "--dump-diags")) {
+        // Front-end (lex + parse) diagnostics only — the payload, not a failure
+        // channel — so it always goes to stdout (exit 0) for the self-host error
+        // differential against `bitc2 --dump-diags`.
+        const r = try diagsReport(gpa, paths[0], source);
+        text = r.text;
+        failed = false;
     } else {
-        try err_out.print("bitc: unknown dump mode '{s}' (--dump-tokens|--dump-ast|--dump-types|--dump-ir|--dump-ir-pre)\n", .{mode});
+        try err_out.print("bitc: unknown dump mode '{s}' (--dump-tokens|--dump-ast|--dump-types|--dump-ir|--dump-ir-pre|--dump-diags)\n", .{mode});
         return true;
     }
     defer gpa.free(text);
@@ -877,6 +884,29 @@ fn runDump(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
     }
     try out.writeAll(text);
     return false;
+}
+
+/// Front-end (lexer + parser) diagnostics for a single source buffer, always
+/// rendered (empty on a clean file). Backs `--dump-diags` for the self-host
+/// Stage-1 error differential: `bitc2` implements only the front-end, so this
+/// deliberately stops before resolve/check (whose diagnostics `bitc2` cannot
+/// yet reproduce). `text` is owned by `gpa`.
+pub fn diagsReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    const file = try sm.addFile(path, source);
+
+    var diags = diagnostics.Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree = try ast.Tree.init(gpa);
+    defer tree.deinit();
+    try parser.parse(gpa, &tree, &diags, file, source);
+
+    var rendered: Io.Writer.Allocating = .init(gpa);
+    defer rendered.deinit();
+    try diags.renderAll(&rendered.writer);
+    return .{ .text = try gpa.dupe(u8, rendered.written()), .failed = diags.hasErrors() };
 }
 
 /// Outcome of driving the front-end over a single source buffer.
