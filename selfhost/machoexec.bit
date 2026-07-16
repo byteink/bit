@@ -1,0 +1,195 @@
+// Self-host Stage 3 (#1344): dynamic Mach-O executable writer, ported from
+// compiler/link/macho.zig. Lands in slices; this one carries the constants, the
+// dyld opcode-stream encoders, and the layout helpers — everything that is
+// verifiable on its own. The ~450-line linkExecutable core follows.
+//
+// Where the ELF path emits a fully static, zero-dependency image, macOS
+// fundamentally cannot: the runtime reaches threads, TLS, mmap, and every
+// syscall through /usr/lib/libSystem.B.dylib (Apple has forbidden static libc
+// since 10.6), so the output is a normal dynamically-linked MH_EXECUTE that dyld
+// loads and binds — exactly how Go, Zig, and Rust ship on macOS. "Own linker, no
+// system ld" still holds; "one file, nothing else installed" becomes "one file,
+// plus the libSystem every Mac already has".
+//
+// Pipeline: ingest generic modules, resolve + dead-strip from the entry root
+// __start (macOS mangles _start with a leading underscore), treat any
+// still-undefined global as a libSystem IMPORT (a leaf, not an error),
+// synthesize a __got of non-lazy pointers plus __stubs for the imports that are
+// branch targets, apply every relocation against the assigned addresses, and
+// emit the four segments (__PAGEZERO/__TEXT/__DATA/__LINKEDIT) with the load
+// commands dyld needs.
+//
+// PIE: the image is position-independent (dyld picks a random slide). Every
+// AArch64 relocation this backend applies is PC-relative (branch/ADRP/ADD/
+// LDR-off), hence slide-invariant, so link-time addresses stay correct under any
+// slide; only absolute pointers (data abs64, internal GOT slots) carry a rebase,
+// and imports carry a bind.
+
+function meEntrySymbol(): string { return "__start" } // macOS-mangled _start
+function meBaseVaddr(): int { return 0x100000000 }    // __TEXT load address, above __PAGEZERO
+function meSegAlign(): int { return 0x4000 }          // arm64 macOS segment alignment (16 KiB)
+function mePtrSize(): int { return 8 }
+function meStubSize(): int { return 12 }              // adrp x16 ; ldr x16,[x16] ; br x16
+
+function meDylinkerPath(): string { return "/usr/lib/dyld" }
+function meLibsystemPath(): string { return "/usr/lib/libSystem.B.dylib" }
+
+// ---- Mach-O load-command constants (<mach-o/loader.h>) --------------------
+
+function mhExecute(): int { return 0x2 }
+function mhDyldlink(): int { return 0x4 }
+function mhTwolevel(): int { return 0x80 }
+function mhPie(): int { return 0x200000 }
+// Tells dyld the image carries S_THREAD_LOCAL_VARIABLES descriptors it must
+// register (allocate a pthread key, replace each descriptor's _tlv_bootstrap
+// thunk with the real resolver). Without it dyld skips TLV setup and the first
+// thread-local access calls the placeholder thunk -> _tlv_bootstrap_error.
+function mhHasTlvDescriptors(): int { return 0x800000 }
+
+function lcReqDyld(): int { return 0x80000000 }
+function lcSymtabCmd(): int { return 0x2 }
+function lcDysymtab(): int { return 0xb }
+function lcLoadDylinker(): int { return 0xe }
+function lcLoadDylib(): int { return 0xc }
+function lcMain(): int { return 0x28 | 0x80000000 }
+function lcDyldInfoOnly(): int { return 0x22 | 0x80000000 }
+function lcBuildVersion(): int { return 0x32 }
+function lcCodeSignature(): int { return 0x1d }
+
+function sNonLazySymbolPointers(): int { return 0x6 }
+function sSymbolStubs(): int { return 0x8 }
+function sThreadLocalRegular(): int { return 0x11 }   // __thread_data (init image)
+function sThreadLocalZerofill(): int { return 0x12 }  // __thread_bss
+function sThreadLocalVariables(): int { return 0x13 } // __thread_vars (tlv_descriptors)
+
+function indirectSymbolLocal(): int { return 0x80000000 }
+function platformMacos(): int { return 1 }
+
+// Bind/rebase opcode bytecode (<mach-o/loader.h>).
+function bindOpcodeDone(): int { return 0x00 }
+function bindOpcodeSetDylibOrdinalImm(): int { return 0x10 }
+function bindOpcodeSetSymbolTrailingFlagsImm(): int { return 0x40 }
+function bindOpcodeSetTypeImm(): int { return 0x50 }
+function bindOpcodeSetSegmentAndOffsetUleb(): int { return 0x70 }
+function bindOpcodeDoBind(): int { return 0x90 }
+function bindTypePointer(): int { return 1 }
+function rebaseOpcodeDone(): int { return 0x00 }
+function rebaseOpcodeSetTypeImm(): int { return 0x10 }
+function rebaseOpcodeSetSegmentAndOffsetUleb(): int { return 0x20 }
+// 0x50 is DO_REBASE_IMM_TIMES (count in the low nibble); 0x60 would be the
+// _ULEB_TIMES form with a trailing count uleb. We rebase one pointer at a time.
+function rebaseOpcodeDoRebaseImmTimes(): int { return 0x50 }
+function rebaseTypePointer(): int { return 1 }
+
+// ---- helpers --------------------------------------------------------------
+
+function meAlignUp(v: int, a: int): int {
+  let rem = v % a
+  if (rem == 0) {
+    return v
+  }
+  return v + a - rem
+}
+
+// LEB128, unsigned: 7 bits per byte, little-end first, high bit marking
+// continuation. dyld's rebase/bind streams are encoded this way.
+function meUleb(out: ByteBuf, value: int) {
+  let v = value
+  while (true) {
+    let b = v & 0x7f
+    v = v >> 7
+    if (v != 0) {
+      b = b | 0x80
+    }
+    out.bytes = append(out.bytes, u8(b))
+    if (v == 0) {
+      break
+    }
+  }
+}
+
+// pagezero, text, [data], linkedit, dyld_info, symtab, dysymtab, dylinker,
+// dylib, build_version, main, code_signature.
+function meNcmds(hasDataSeg: bool): int {
+  if (hasDataSeg) {
+    return 12
+  }
+  return 11
+}
+
+function meIsBranch(kind: LoRelocKind): bool {
+  return kind == LoRelocKind.Aarch64Call26 || kind == LoRelocKind.Aarch64Jump26
+}
+
+// True for a writable, file-backed __DATA section kind that can hold a rebasable
+// absolute pointer (plain data, or a tlv_descriptor's fields).
+function meIsDataSeg(kind: LoSectionKind): bool {
+  return kind == LoSectionKind.Data || kind == LoSectionKind.TlsVars ||
+    kind == LoSectionKind.TlsData
+}
+
+// One bind: name the symbol, say it is a pointer, point at the segment+offset,
+// then do it. dyld replays this stream at load to fill each imported GOT slot.
+function meEmitBind(ops: ByteBuf, name: string, seg: int, off: int) {
+  ops.bytes = append(ops.bytes, u8(bindOpcodeSetSymbolTrailingFlagsImm() | 0))
+  appendBytes(ops, []byte(name))
+  ops.bytes = append(ops.bytes, u8(0))
+  ops.bytes = append(ops.bytes, u8(bindOpcodeSetTypeImm() | bindTypePointer()))
+  ops.bytes = append(ops.bytes, u8(bindOpcodeSetSegmentAndOffsetUleb() | seg))
+  meUleb(ops, off)
+  ops.bytes = append(ops.bytes, u8(bindOpcodeDoBind()))
+}
+
+// One rebase of a single pointer: dyld adds the image's slide to the word at
+// segment+offset.
+function meEmitRebase(ops: ByteBuf, seg: int, off: int) {
+  ops.bytes = append(ops.bytes, u8(rebaseOpcodeSetTypeImm() | rebaseTypePointer()))
+  ops.bytes = append(ops.bytes, u8(rebaseOpcodeSetSegmentAndOffsetUleb() | seg))
+  meUleb(ops, off)
+  ops.bytes = append(ops.bytes, u8(rebaseOpcodeDoRebaseImmTimes() | 1))
+}
+
+// Where one kept atom landed. The seed's Placed.
+struct MePlaced {
+  module: int,
+  atom: int,
+  vaddr: int,
+  fileOff: int,
+}
+
+// Lays each atom out at its required alignment, advancing the cursor. Returns
+// the new cursor; Bit has no out-parameter, so the caller threads it.
+struct MePlaceResult {
+  items: []MePlaced,
+  cursor: int,
+}
+
+function mePlaceAtoms(modules: []LoModule, items: []MePlaced, cursor: int): MePlaceResult {
+  let c = cursor
+  let i = 0
+  while (i < len(items)) {
+    let a = modules[items[i].module].atoms[items[i].atom]
+    let al = a.alignment
+    if (al < 1) {
+      al = 1
+    }
+    c = meAlignUp(c, al)
+    items[i].vaddr = c
+    items[i].fileOff = c - meBaseVaddr()
+    c = c + a.size
+    i = i + 1
+  }
+  return MePlaceResult{ items: items, cursor: c }
+}
+
+// Byte extent of a placed group: from its first atom's address to the end of its
+// last (a section's `size` in the output header). Not the sum of the atoms'
+// sizes — inter-atom alignment padding counts.
+function mePlacedSize(modules: []LoModule, items: []MePlaced): int {
+  if (len(items) == 0) {
+    return 0
+  }
+  let last = items[len(items) - 1]
+  let end = last.vaddr + modules[last.module].atoms[last.atom].size
+  return end - items[0].vaddr
+}

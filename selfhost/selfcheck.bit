@@ -2465,6 +2465,115 @@ function checkCodeSignatureSizing() {
   assert(codeSignatureSize(csPageSize(), "abc") - codeSignatureSize(csPageSize(), "a") == 2)
 }
 
+// Stage 3 (#1344 part 5a) the Mach-O executable writer's constants, dyld opcode
+// encoders, and layout helpers. Expected bytes were computed independently in
+// Python; uleb(624485) == e5 8e 26 is the canonical LEB128 example from the
+// DWARF spec, so the encoder is anchored to a published vector, not just to
+// itself.
+
+function meBytesAre(b: ByteBuf, want: []u8): bool {
+  if (len(b.bytes) != len(want)) {
+    return false
+  }
+  let i = 0
+  while (i < len(want)) {
+    if (b.bytes[i] != want[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+function meUlebOf(v: int): ByteBuf {
+  let b = newByteBuf()
+  meUleb(b, v)
+  return b
+}
+
+function checkMachoExecUleb() {
+  assert(meBytesAre(meUlebOf(0), [u8(0x00)]))
+  assert(meBytesAre(meUlebOf(1), [u8(0x01)]))
+  // 127 is the largest single-byte value; 128 is the first that continues.
+  assert(meBytesAre(meUlebOf(127), [u8(0x7f)]))
+  assert(meBytesAre(meUlebOf(128), [u8(0x80), u8(0x01)]))
+  assert(meBytesAre(meUlebOf(255), [u8(0xff), u8(0x01)]))
+  assert(meBytesAre(meUlebOf(300), [u8(0xac), u8(0x02)]))
+  // The DWARF spec's worked example.
+  assert(meBytesAre(meUlebOf(624485), [u8(0xe5), u8(0x8e), u8(0x26)]))
+  // A value whose low 7 bits are zero must still emit a continued byte, not
+  // stop early.
+  assert(meBytesAre(meUlebOf(0x4000), [u8(0x80), u8(0x80), u8(0x01)]))
+  assert(meBytesAre(meUlebOf(0x2000), [u8(0x80), u8(0x40)]))
+}
+
+function checkMachoExecOpcodes() {
+  // dyld replays this stream at load to fill an imported GOT slot: name the
+  // symbol, declare it a pointer, point at segment+offset, bind.
+  let b = newByteBuf()
+  meEmitBind(b, "_malloc", 2, 0x10)
+  assert(meBytesAre(b, [u8(0x40),
+    u8(0x5f), u8(0x6d), u8(0x61), u8(0x6c), u8(0x6c), u8(0x6f), u8(0x63), u8(0x00),
+    u8(0x51), u8(0x72), u8(0x10), u8(0x90)]))
+
+  // One rebase: dyld adds the image slide to the word at segment+offset.
+  let r = newByteBuf()
+  meEmitRebase(r, 2, 0x2000)
+  assert(meBytesAre(r, [u8(0x11), u8(0x22), u8(0x80), u8(0x40), u8(0x51)]))
+
+  // The opcode nibbles must not collide: each is an opcode ORed with an
+  // immediate, so a wrong constant silently changes the instruction.
+  assert(bindOpcodeSetTypeImm() | bindTypePointer() == 0x51)
+  assert(bindOpcodeSetSegmentAndOffsetUleb() | 2 == 0x72)
+  assert(rebaseOpcodeSetTypeImm() | rebaseTypePointer() == 0x11)
+  assert(rebaseOpcodeDoRebaseImmTimes() | 1 == 0x51)
+}
+
+function checkMachoExecLayout() {
+  assert(meAlignUp(0, 0x4000) == 0)
+  assert(meAlignUp(1, 0x4000) == 0x4000)
+  assert(meAlignUp(0x4000, 0x4000) == 0x4000)
+  assert(meAlignUp(0x4001, 0x4000) == 0x8000)
+
+  // A branch to an import needs a stub; a page/GOT reference does not.
+  assert(meIsBranch(LoRelocKind.Aarch64Call26))
+  assert(meIsBranch(LoRelocKind.Aarch64Jump26))
+  assert(!meIsBranch(LoRelocKind.Aarch64AdrPrelPgHi21))
+  assert(!meIsBranch(LoRelocKind.Abs64))
+
+  // Only writable, file-backed __DATA kinds can hold a rebasable pointer. bss
+  // has no file bytes to rebase; rodata is not writable.
+  assert(meIsDataSeg(LoSectionKind.Data))
+  assert(meIsDataSeg(LoSectionKind.TlsVars))
+  assert(meIsDataSeg(LoSectionKind.TlsData))
+  assert(!meIsDataSeg(LoSectionKind.Bss))
+  assert(!meIsDataSeg(LoSectionKind.TlsBss))
+  assert(!meIsDataSeg(LoSectionKind.Rodata))
+  assert(!meIsDataSeg(LoSectionKind.Text))
+
+  // The __DATA segment's load command only exists if something lives in it.
+  assert(meNcmds(true) == 12 && meNcmds(false) == 11)
+
+  // Atom placement honours each atom's alignment, and a placed group's size
+  // spans the padding between atoms — not the sum of their sizes.
+  let mod = LoModule{ name: "m", atoms: [
+    LoAtom{ name: "a", kind: LoSectionKind.Text, binding: LoBinding.Global,
+      data: []u8(0), size: 5, alignment: 4, weak: false, relocs: []LoReloc(0) },
+    LoAtom{ name: "b", kind: LoSectionKind.Text, binding: LoBinding.Global,
+      data: []u8(0), size: 8, alignment: 16, weak: false, relocs: []LoReloc(0) }]}
+  let items = [MePlaced{ module: 0, atom: 0, vaddr: 0, fileOff: 0 },
+    MePlaced{ module: 0, atom: 1, vaddr: 0, fileOff: 0 }]
+  let res = mePlaceAtoms([mod], items, meBaseVaddr())
+  assert(res.items[0].vaddr == meBaseVaddr())      // already 4-aligned
+  assert(res.items[0].fileOff == 0)                // __TEXT starts at file offset 0
+  assert(res.items[1].vaddr == meBaseVaddr() + 16) // 5 bytes in, rounded up to 16
+  assert(res.items[1].fileOff == 16)
+  assert(res.cursor == meBaseVaddr() + 24)
+  // 16 (padding included) + 8, not 5 + 8.
+  assert(mePlacedSize([mod], res.items) == 24)
+  assert(mePlacedSize([mod], []MePlaced(0)) == 0)
+}
+
 function checkArm64MemFloat() {
   // ldr/str x5, [x1] and the w/b/h load variants.
   let c = newByteBuf()
@@ -2640,6 +2749,9 @@ function selfcheck() {
   checkRelocPredicates()
   checkCodeSignature()
   checkCodeSignatureSizing()
+  checkMachoExecUleb()
+  checkMachoExecOpcodes()
+  checkMachoExecLayout()
   checkRegalloc()
   checkCodegenCore()
   checkInferTypes()
