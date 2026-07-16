@@ -929,3 +929,251 @@ function meWriteStub(file: []u8, off: int, stubVaddr: int, gotSlot: int): ()! {
   applyReloc(LoRelocKind.Aarch64Ld64GotLo12Nc, file, off + 4,
     RelocValues{ s: 0, p: 0, gotSlot: gotSlot, tpOffset: 0 })?
 }
+
+// ===========================================================================
+// linkExecutable — the driver
+// ===========================================================================
+
+// Links `modules` into an ad-hoc-signed, dynamically-linked arm64 Mach-O
+// executable, returned as owned bytes.
+//
+// The order below is forced: the load-command SIZES fix where __TEXT's content
+// starts, which fixes every atom's address, which fixes every relocation — so
+// sizeofcmds is computed from section COUNTS before a single address is
+// assigned, and the commands themselves are only emitted at the end, once every
+// offset they record is known.
+function linkExecutable(modules: []LoModule, identifier: string): []u8! {
+  let globals = resolveGlobals(modules)?
+  let st0 = meDeadStripWithImports(modules, globals)?
+  let st1 = mePartition(modules, st0)
+  let st = meBuildGotAndStubs(modules, globals, st1)?
+
+  let hasDataSeg = meHasDataSeg(st)
+  let sizeofcmds = meSizeofcmds(meTextNsects(st), meDataNsects(st), hasDataSeg)
+  let headersSize = mrSizeofHeader() + sizeofcmds
+
+  // ---- __TEXT layout: headers, text atoms, stubs, rodata -----------------
+  let cursor = meBaseVaddr() + headersSize
+  let textRes = mePlaceAtoms(modules, st.text, cursor)
+  st.text = textRes.items
+  let stubsVaddr = meAlignUp(textRes.cursor, 4)
+  cursor = stubsVaddr + len(st.stubList) * meStubSize()
+  let rodataVaddr = cursor
+  let rodataRes = mePlaceAtoms(modules, st.rodata, cursor)
+  st.rodata = rodataRes.items
+  let textSegFilesize = meAlignUp(rodataRes.cursor - meBaseVaddr(), meSegAlign())
+  let textSegVmsize = textSegFilesize
+
+  // ---- __DATA layout: got, data, TLS, then zero-fill last ----------------
+  // File-backed sections first, then the zero-fill ones. __thread_data and
+  // __thread_bss stay adjacent so they form one contiguous per-thread TLV
+  // template dyld can copy.
+  let dataSegVaddr = meBaseVaddr() + textSegVmsize
+  cursor = dataSegVaddr
+  let gotVaddr = cursor
+  cursor = cursor + len(st.gotList) * mePtrSize()
+  let dataRes = mePlaceAtoms(modules, st.data, cursor)
+  st.data = dataRes.items
+  let tvRes = mePlaceAtoms(modules, st.tlsVars, dataRes.cursor)
+  st.tlsVars = tvRes.items
+  let tdRes = mePlaceAtoms(modules, st.tlsData, tvRes.cursor)
+  st.tlsData = tdRes.items
+  let dataFileEnd = tdRes.cursor // the last file-backed byte in __DATA
+  let tbRes = mePlaceAtoms(modules, st.tlsBss, dataFileEnd)
+  st.tlsBss = tbRes.items
+  let bssRes = mePlaceAtoms(modules, st.bss, tbRes.cursor)
+  st.bss = bssRes.items
+  let dataSegFilesize = 0
+  let dataSegVmsize = 0
+  if (hasDataSeg) {
+    dataSegFilesize = meAlignUp(dataFileEnd - dataSegVaddr, meSegAlign())
+    dataSegVmsize = meAlignUp(bssRes.cursor - dataSegVaddr, meSegAlign())
+  }
+
+  // Base of the per-thread TLV template (__thread_data then __thread_bss).
+  let tlsTemplateBase = 0
+  if (len(st.tlsData) > 0) {
+    tlsTemplateBase = st.tlsData[0].vaddr
+  } else if (len(st.tlsBss) > 0) {
+    tlsTemplateBase = st.tlsBss[0].vaddr
+  }
+
+  let addrOf = meAddrMap(st)
+  let (entryId, _) = globals[meEntrySymbol()]
+  let (entryVaddr, haveEntry) = addrOf[entryId]
+  if (!haveEntry) {
+    fail newError("MissingEntry")
+  }
+
+  let addrs = MeAddrs{ stubsVaddr: stubsVaddr, gotVaddr: gotVaddr,
+    dataSegVaddr: dataSegVaddr, tlsTemplateBase: tlsTemplateBase }
+  let pat = meApplyRelocs(modules, globals, st, addrOf, addrs)?
+
+  // ---- dyld info streams -------------------------------------------------
+  let dataSegIndex = 0 // __PAGEZERO, __TEXT, __DATA
+  if (hasDataSeg) {
+    dataSegIndex = 2
+  }
+  let rebaseOps = meRebaseStream(pat.dataRebases, dataSegIndex)
+  let bindOps = meBindStream(st, pat.dataBinds, gotVaddr, dataSegVaddr, dataSegIndex)
+  let sym = meBuildSymtab(st)
+  let indirect = meIndirectSymbols(st, sym.symIndex)
+
+  // ---- __LINKEDIT layout -------------------------------------------------
+  let linkeditFileoff = textSegFilesize + dataSegFilesize
+  let leCursor = linkeditFileoff
+  let rebaseOff = leCursor
+  leCursor = leCursor + len(rebaseOps.bytes)
+  let bindOff = leCursor
+  leCursor = leCursor + len(bindOps.bytes)
+  leCursor = meAlignUp(leCursor, 8)
+  let symtabOff = leCursor
+  leCursor = leCursor + len(sym.nlists.bytes)
+  let indirectOff = leCursor
+  leCursor = leCursor + len(indirect) * 4
+  let strtabOff = leCursor
+  leCursor = leCursor + len(sym.strtab.bytes)
+  let sigOff = meAlignUp(leCursor, 16)
+  let sigSize = codeSignatureSize(sigOff, identifier)
+  let linkeditFileEnd = sigOff + sigSize
+  let linkeditFilesize = linkeditFileEnd - linkeditFileoff
+  let linkeditVaddr = meBaseVaddr() + textSegVmsize + dataSegVmsize
+
+  // ---- assemble the file -------------------------------------------------
+  let file = []u8(linkeditFileEnd)
+  meCopyGroup(file, modules, pat, st.text)
+  meCopyGroup(file, modules, pat, st.rodata)
+  meCopyGroup(file, modules, pat, st.data)
+  meCopyGroup(file, modules, pat, st.tlsVars)
+  meCopyGroup(file, modules, pat, st.tlsData)
+  // __thread_bss/__bss are zero-fill and carry no bytes.
+
+  let i = 0
+  while (i < len(st.stubList)) {
+    let (gi, _) = st.gotOfImport[st.stubList[i]]
+    let sv = meStubAddr(stubsVaddr, i)
+    meWriteStub(file, sv - meBaseVaddr(), sv, meGotAddr(gotVaddr, gi))?
+    i = i + 1
+  }
+  // Internal GOT slots hold their target's absolute address (dyld rebases them);
+  // import slots stay zero until dyld binds them.
+  i = 0
+  while (i < len(st.gotList)) {
+    if (!st.gotList[i].isImport) {
+      let (tgt, _) = addrOf[atomKey(st.gotList[i].module, st.gotList[i].atom)]
+      loWrU64(file, meGotAddr(gotVaddr, i) - meBaseVaddr(), tgt)
+    }
+    i = i + 1
+  }
+
+  meCopyBytes(file, rebaseOff, rebaseOps.bytes)
+  meCopyBytes(file, bindOff, bindOps.bytes)
+  meCopyBytes(file, symtabOff, sym.nlists.bytes)
+  i = 0
+  while (i < len(indirect)) {
+    loWrU32(file, indirectOff + i * 4, indirect[i])
+    i = i + 1
+  }
+  meCopyBytes(file, strtabOff, sym.strtab.bytes)
+
+  // ---- header + load commands --------------------------------------------
+  let lc = newByteBuf()
+  meAppendSeg(lc, "__PAGEZERO", 0, meBaseVaddr(), 0, 0, 0, 0, 0)
+  meAppendSeg(lc, "__TEXT", meBaseVaddr(), textSegVmsize, 0, textSegFilesize, 5, 5,
+    meTextNsects(st))
+  let textEnd = meBaseVaddr() + headersSize
+  if (len(st.text) > 0) {
+    let last = st.text[len(st.text) - 1]
+    textEnd = last.vaddr + modules[last.module].atoms[last.atom].size
+  }
+  meAppendSect(lc, "__text", "__TEXT", meBaseVaddr() + headersSize,
+    textEnd - (meBaseVaddr() + headersSize), headersSize, 2, 0x80000400, 0, 0)
+  if (len(st.stubList) > 0) {
+    meAppendSect(lc, "__stubs", "__TEXT", stubsVaddr, len(st.stubList) * meStubSize(),
+      stubsVaddr - meBaseVaddr(), 2, sSymbolStubs() | 0x80000400, 0, meStubSize())
+  }
+  if (len(st.rodata) > 0) {
+    meAppendSect(lc, "__const", "__TEXT", rodataVaddr, mePlacedSize(modules, st.rodata),
+      rodataVaddr - meBaseVaddr(), 0, 0x0, 0, 0)
+  }
+  if (hasDataSeg) {
+    meAppendSeg(lc, "__DATA", dataSegVaddr, dataSegVmsize, textSegFilesize,
+      dataSegFilesize, 3, 3, meDataNsects(st))
+    // The indirect table's stubs occupy [0, nstubs); the got starts at nstubs —
+    // which is what __got's reserved1 records.
+    if (len(st.gotList) > 0) {
+      meAppendSect(lc, "__got", "__DATA", gotVaddr, len(st.gotList) * mePtrSize(),
+        gotVaddr - meBaseVaddr(), 3, sNonLazySymbolPointers(), len(st.stubList), 0)
+    }
+    if (len(st.data) > 0) {
+      meAppendSect(lc, "__data", "__DATA", st.data[0].vaddr,
+        mePlacedSize(modules, st.data), st.data[0].vaddr - meBaseVaddr(), 3, 0x0, 0, 0)
+    }
+    if (len(st.tlsVars) > 0) {
+      meAppendSect(lc, "__thread_vars", "__DATA", st.tlsVars[0].vaddr,
+        mePlacedSize(modules, st.tlsVars), st.tlsVars[0].vaddr - meBaseVaddr(), 3,
+        sThreadLocalVariables(), 0, 0)
+    }
+    if (len(st.tlsData) > 0) {
+      meAppendSect(lc, "__thread_data", "__DATA", st.tlsData[0].vaddr,
+        mePlacedSize(modules, st.tlsData), st.tlsData[0].vaddr - meBaseVaddr(), 3,
+        sThreadLocalRegular(), 0, 0)
+    }
+    // The zero-fill sections carry no file offset.
+    if (len(st.tlsBss) > 0) {
+      meAppendSect(lc, "__thread_bss", "__DATA", st.tlsBss[0].vaddr,
+        mePlacedSize(modules, st.tlsBss), 0, 3, sThreadLocalZerofill(), 0, 0)
+    }
+    if (len(st.bss) > 0) {
+      meAppendSect(lc, "__bss", "__DATA", st.bss[0].vaddr,
+        mePlacedSize(modules, st.bss), 0, 3, 0x1, 0, 0)
+    }
+  }
+  meAppendSeg(lc, "__LINKEDIT", linkeditVaddr, meAlignUp(linkeditFilesize, meSegAlign()),
+    linkeditFileoff, linkeditFilesize, 1, 1, 0)
+  meAppendDyldInfo(lc, rebaseOff, len(rebaseOps.bytes), bindOff, len(bindOps.bytes))
+  meAppendSymtab(lc, symtabOff, len(st.importOrder), strtabOff, len(sym.strtab.bytes))
+  meAppendDysymtab(lc, len(st.importOrder), indirectOff, len(indirect))
+  meAppendDylinker(lc)
+  meAppendDylib(lc)
+  meAppendBuildVersion(lc)
+  meAppendMain(lc, entryVaddr - meBaseVaddr())
+  meAppendCodeSignature(lc, sigOff, sigSize)
+
+  // If this trips, a struct size above is wrong and every file offset recorded
+  // in a command is a lie.
+  assert(len(lc.bytes) == sizeofcmds)
+
+  let hdr = newByteBuf()
+  meAppendHeader(hdr, sizeofcmds, hasDataSeg, len(st.tlsVars) > 0)
+  meCopyBytes(file, 0, hdr.bytes)
+  meCopyBytes(file, mrSizeofHeader(), lc.bytes)
+
+  // ---- ad-hoc code signature over [0, sigOff) ----------------------------
+  let sig = buildCodeSignature(file[0:sigOff], identifier, textSegFilesize)
+  meCopyBytes(file, sigOff, sig)
+  return file
+}
+
+// Copies each placed atom's bytes (patched if it had relocations) to its file
+// offset.
+function meCopyGroup(file: []u8, modules: []LoModule, pat: MePatched, group: []MePlaced) {
+  let i = 0
+  while (i < len(group)) {
+    let id = atomKey(group[i].module, group[i].atom)
+    let (bytes, patched) = pat.bytes[id]
+    if (!patched) {
+      bytes = modules[group[i].module].atoms[group[i].atom].data
+    }
+    meCopyBytes(file, group[i].fileOff, bytes)
+    i = i + 1
+  }
+}
+
+function meCopyBytes(file: []u8, off: int, src: []u8) {
+  let i = 0
+  while (i < len(src)) {
+    file[off + i] = src[i]
+    i = i + 1
+  }
+}
