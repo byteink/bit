@@ -776,6 +776,66 @@ export fn bit_rt_os_run(path: *const RtBytes) callconv(.c) i64 {
     }
 }
 
+/// `bit_rt_os_run_test(path, idx)` (ABI.md §19): like `bit_rt_os_run`, but execs
+/// the child with `BIT_TEST_INDEX=<idx>` in front of the inherited environment so
+/// its synthetic `main` (see selfhost/testgen.bit) dispatches to test `idx`. The
+/// `bit test` runner calls this once per discovered test. `getPosix` returns the
+/// first match, so prepending the var makes it win over any inherited one.
+export fn bit_rt_os_run_test(path: *const RtBytes, idx: i64) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    const child_argv = [_:null]?[*:0]const u8{p};
+
+    var idx_buf: [40]u8 = undefined;
+    const idx_str = std.fmt.bufPrintZ(&idx_buf, "BIT_TEST_INDEX={d}", .{idx}) catch return -1;
+
+    // child env = BIT_TEST_INDEX :: inherited. Bounded copy (Power of 10); a
+    // process with more than max_env vars loses the overflow, never corrupts.
+    const max_env = 1024;
+    var envp: [max_env + 2]?[*:0]const u8 = undefined;
+    envp[0] = idx_str.ptr;
+    var n: usize = 0;
+    while (g_envp[n]) |e| : (n += 1) {
+        if (n + 1 >= max_env) break;
+        envp[n + 1] = e;
+    }
+    envp[n + 1] = null;
+    const child_envp: [*:null]?[*:0]const u8 = @ptrCast(&envp);
+
+    switch (builtin.os.tag) {
+        .linux => {
+            const forked: isize = @bitCast(std.os.linux.fork());
+            if (forked < 0) return -1;
+            if (forked == 0) {
+                _ = std.os.linux.execve(p, &child_argv, child_envp);
+                rawExit(127);
+            }
+            var status: u32 = 0;
+            var tries: usize = 0;
+            while (tries < 256) : (tries += 1) {
+                const w: isize = @bitCast(std.os.linux.waitpid(@intCast(forked), &status, 0));
+                if (w >= 0) break;
+                if (@as(usize, @intCast(-w)) != @intFromEnum(std.os.linux.E.INTR)) return -1;
+            }
+            if (std.os.linux.W.IFEXITED(status)) return @intCast(std.os.linux.W.EXITSTATUS(status));
+            return -1;
+        },
+        else => {
+            const pid = std.c.fork();
+            if (pid < 0) return -1;
+            if (pid == 0) {
+                _ = std.c.execve(p, &child_argv, child_envp);
+                rawExit(127);
+            }
+            var status: c_int = 0;
+            if (std.c.waitpid(pid, &status, 0) < 0) return -1;
+            const us: u32 = @bitCast(status);
+            if (std.c.W.IFEXITED(us)) return @intCast(std.c.W.EXITSTATUS(us));
+            return -1;
+        },
+    }
+}
+
 /// `bit_rt_fs_close`: close `fd`. Always reports success (the raw close wrapper
 /// swallows `EINTR`/`EBADF`); a caller that must know uses the fd's own errors.
 ///

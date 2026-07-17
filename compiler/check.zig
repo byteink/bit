@@ -2765,6 +2765,9 @@ const Checker = struct {
         // the environment, and return its exit code (-1 on failure) — the
         // self-hosted compiler's `bit run`/`bit test` launch their own output.
         .{ "osRun", PrimSig{ .params = &.{.string}, .ret = .i64 } },
+        // `osRunTest(path: string, idx: i64) -> i64`: run `path` with
+        // `BIT_TEST_INDEX=idx` set, for the `bit test` per-test exec loop.
+        .{ "osRunTest", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
         .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
         .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
     });

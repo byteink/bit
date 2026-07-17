@@ -180,6 +180,10 @@ pub const RtFn = enum {
     /// the environment, and return its exit code (-1 on failure). The self-hosted
     /// compiler's `bit run`/`bit test` launch their own output with it.
     os_run,
+    /// `os_run_test(path, idx) -> i64`: like `os_run`, but sets `BIT_TEST_INDEX`
+    /// in the child's environment so the test binary's synthetic `main` runs the
+    /// one test named by `idx`. The `bit test` runner calls it once per test.
+    os_run_test,
     /// Non-blocking TCP (ABI.md §20), under `std/net`. Any of these may park the
     /// calling green thread on the netpoller; none blocks an OS thread.
     /// `net_listen(host, port) -> fd`; `net_local_port(fd) -> port` (recovers the

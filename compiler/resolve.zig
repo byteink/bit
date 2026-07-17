@@ -173,30 +173,30 @@ const predeclared_types = [_][]const u8{
     "error",
 };
 const predeclared_funcs = [_][]const u8{
-    "len",         "cap",         "append",     "delete",           "close",            "panic",      "assert",            "print",            "eprint",
+    "len",         "cap",        "append",      "delete",           "close",            "panic",      "assert",    "print",             "eprint",
     // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
     // readFile layer wraps these in std/fs.
-    "fsOpen",      "fsReadAll",   "fsWrite",    "fsClose",          "fsAppend",         "fsRead",     "fsExists",          "fsIsDir",          "fsMkdir",
-    "fsRemove",    "fsListDir",   "fsChmod",
+    "fsOpen",      "fsReadAll",  "fsWrite",     "fsClose",          "fsAppend",         "fsRead",     "fsExists",  "fsIsDir",           "fsMkdir",
+    "fsRemove",    "fsListDir",  "fsChmod",
     // Non-blocking TCP primitives (ABI.md §20); std/net wraps these. Any of them
     // may park the calling green thread on the netpoller. `fsClose` closes a
     // socket too, so there is no `netClose`.
-       "netListen",        "netLocalPort",     "netAccept",  "netDial",           "netRead",          "netWrite",
-    "netUdpBind",  "netUdpSend",  "netUdpRecv", "netUdpSenderHost", "netUdpSenderPort", "netResolve",
+        "netListen",        "netLocalPort",     "netAccept",  "netDial",   "netRead",           "netWrite",
+    "netUdpBind",  "netUdpSend", "netUdpRecv",  "netUdpSenderHost", "netUdpSenderPort", "netResolve",
     // Float primitives (ABI.md §17); std/math re-exports them under plain names.
-    "fsqrt",             "ffloor",           "fceil",
-    "fround",      "ftrunc",      "fpow",       "fatan2",           "flog",             "flog2",      "flog10",
+    "fsqrt",     "ffloor",            "fceil",
+    "fround",      "ftrunc",     "fpow",        "fatan2",           "flog",             "flog2",      "flog10",
     // Clock + green-thread sleep (ABI.md §18); std/time wraps these.
-               "timeMonoNs",       "timeUnixNs",
+       "timeMonoNs",        "timeUnixNs",
     "timeSleepNs",
     // Process environment (ABI.md §19); std/os wraps these.
-    "osArgc",      "osArgAt",    "osEnv",            "osExit",           "osRun",
+    "osArgc",     "osArgAt",     "osEnv",            "osExit",           "osRun",      "osRunTest",
     // Crypto boundary primitives (ABI.md §21); std/crypto wraps these.
-         "cryptoRandomBytes", "cryptoSecureZero",
+    "cryptoRandomBytes", "cryptoSecureZero",
     // Float-literal parsing, for the self-hosted compiler's `FloatLit` lowering.
     "parseFloat",
     // Float bit patterns, for the self-hosted compiler's `const_float` codegen.
-    "floatBits",   "float32Bits",
+     "floatBits",  "float32Bits",
 };
 
 // ============================================================================

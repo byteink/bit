@@ -484,6 +484,7 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 | `bit_rt_os_run`       | `(path: *const RtBytes) -> i64` (§19)                  |
+| `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
 | `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
@@ -876,6 +877,7 @@ bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
 bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure
+bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i
 ```
 
 `argc`/`argv`/`envp` are captured by the process entry (§9) on both the raw-stack
@@ -887,6 +889,11 @@ captured `envp`, and returns its exit code (`-1` on any failure or abnormal
 termination). It is `bit run`/`bit test`'s launcher — `fork` + immediate `execve`
 (Linux: raw syscalls; Darwin: libSystem), the only work between fork and exec, so
 it is safe with scheduler worker threads live.
+
+`bit_rt_os_run_test` is the same fork+exec launcher with `BIT_TEST_INDEX=<idx>`
+prepended to the child's environment (first match wins, so it overrides any
+inherited value). `bit test` calls it once per discovered test so the test
+binary's synthetic `main` (selfhost/testgen.bit) dispatches to test `idx`.
 
 ---
 
