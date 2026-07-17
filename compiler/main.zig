@@ -229,33 +229,25 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     // `stem` yields both ("examples/countdown" -> "countdown", "a.bit" -> "a").
     const ident = std.fs.path.stem(src);
 
-    // A directory is a module that may import others (relative + std) and gets
-    // the prelude, so it goes through the whole-project pipeline; a lone file is
-    // a single self-contained module built directly.
+    // Both a directory and a lone file are modules (SPEC §17.1), so both take
+    // the same whole-project pipeline and both get the prelude and imports. A
+    // file differs only in which files the root module contains: exactly that
+    // one, never its siblings. Building a lone file "directly" instead is what
+    // made `bit run hello.bit` — the tutorial's first line — fail with
+    // "undefined name 'println'": the prelude only ever reached a directory.
     const stat = Io.Dir.cwd().statFile(io, src, .{}) catch |e| {
         try err_out.print("bit: {s}: {s}\n", .{ src, @errorName(e) });
         return 1;
     };
-    var exe: []u8 = undefined;
-    if (stat.kind == .directory) {
-        const root_abs = try absFromCwd(gpa, io, src);
-        defer gpa.free(root_abs);
-        // Best-effort: a build without a stdlib checkout still works (std/*
-        // imports then error cleanly); only a real stdlib dir enables them.
-        const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
-        defer if (std_root) |s| gpa.free(s);
-        exe = (try buildProject(gpa, io, root_abs, std_root, ident, lib, target, err_out, null)) orelse return 1;
-    } else {
-        const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
-        defer {
-            for (inputs) |f| {
-                gpa.free(f.path);
-                gpa.free(f.source);
-            }
-            gpa.free(inputs);
-        }
-        exe = (try buildModule(gpa, inputs, ident, lib, target, err_out, null)) orelse return 1;
-    }
+    const root_src = if (stat.kind == .directory) src else std.fs.path.dirname(src) orelse ".";
+    const root_only: ?[]const u8 = if (stat.kind == .directory) null else std.fs.path.basename(src);
+    const root_abs = try absFromCwd(gpa, io, root_src);
+    defer gpa.free(root_abs);
+    // Best-effort: a build without a stdlib checkout still works (std/*
+    // imports then error cleanly); only a real stdlib dir enables them.
+    const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+    defer if (std_root) |s| gpa.free(s);
+    const exe = (try buildProject(gpa, io, root_abs, root_only, std_root, ident, lib, target, err_out, null)) orelse return 1;
     defer gpa.free(exe);
 
     // `bit run` on a binary this host can exec runs it and throws it away, like
@@ -316,25 +308,17 @@ fn runTest(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
         return 1;
     };
 
+    // Same rule as `bit build` (SPEC §17.1): a lone file is a module of one
+    // file, so `bit test math.bit` — the tutorial's form — gets the prelude and
+    // `std/testing` like a directory does.
     var tests: []testgen.Test = &.{};
-    var exe: []u8 = undefined;
-    if (stat.kind == .directory) {
-        const root_abs = try absFromCwd(gpa, io, src);
-        defer gpa.free(root_abs);
-        const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
-        defer if (std_root) |s| gpa.free(s);
-        exe = (try buildProject(gpa, io, root_abs, std_root, ident, lib, host_target, err_out, &tests)) orelse return 1;
-    } else {
-        const inputs = (try gatherModule(gpa, io, src, err_out)) orelse return 1;
-        defer {
-            for (inputs) |f| {
-                gpa.free(f.path);
-                gpa.free(f.source);
-            }
-            gpa.free(inputs);
-        }
-        exe = (try buildModule(gpa, inputs, ident, lib, host_target, err_out, &tests)) orelse return 1;
-    }
+    const root_src = if (stat.kind == .directory) src else std.fs.path.dirname(src) orelse ".";
+    const root_only: ?[]const u8 = if (stat.kind == .directory) null else std.fs.path.basename(src);
+    const root_abs = try absFromCwd(gpa, io, root_src);
+    defer gpa.free(root_abs);
+    const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+    defer if (std_root) |s| gpa.free(s);
+    const exe = (try buildProject(gpa, io, root_abs, root_only, std_root, ident, lib, host_target, err_out, &tests)) orelse return 1;
     defer gpa.free(exe);
     defer testgen.freeTests(gpa, tests);
 
@@ -397,13 +381,13 @@ pub fn buildHostTestExecutable(gpa: std.mem.Allocator, path: []const u8, source:
 /// This is what the documentation doc-tests need: a snippet is a module, not a
 /// program, so it has no `main` to link — but it must still typecheck against
 /// the real prelude and the real `std/*`.
-pub fn checkHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, err_out: *Io.Writer) !bool {
+pub fn checkHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_only: ?[]const u8, std_root: ?[]const u8, err_out: *Io.Writer) !bool {
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
     defer diags.deinit();
 
-    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root, .{});
+    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, root_only, std_root, .{});
     defer project.deinit();
     if (diags.hasErrors()) {
         _ = try renderFail(gpa, &diags, err_out);
@@ -431,9 +415,10 @@ pub fn checkHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, st
 }
 
 /// `buildHostTestExecutable` for a directory module, so the tests can import
-/// `std/testing` and the rest of the stdlib (a single-file build has no prelude).
+/// `std/testing` and the rest of the stdlib. `null`: this harness always names a
+/// project directory, never a lone file (SPEC §17.1).
 pub fn buildHostTestProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer, tests_out: *[]testgen.Test) !?[]u8 {
-    return buildProject(gpa, io, root_abs, std_root, ident, libbitrt, host_target, err_out, tests_out);
+    return buildProject(gpa, io, root_abs, null, std_root, ident, libbitrt, host_target, err_out, tests_out);
 }
 
 /// One source file of the module being built: its path (for diagnostics and
@@ -538,7 +523,8 @@ pub fn buildHostModule(gpa: std.mem.Allocator, io: Io, path: []const u8, libbitr
 /// (`std_root` null for no stdlib). Returns `null` (diagnostics to `err_out`) on
 /// any front-end error.
 pub fn buildHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
-    return buildProject(gpa, io, root_abs, std_root, ident, libbitrt, host_target, err_out, null);
+    // `null`: this harness always names a project directory, never a lone file.
+    return buildProject(gpa, io, root_abs, null, std_root, ident, libbitrt, host_target, err_out, null);
 }
 
 /// Single-file convenience entry (the golden `// run` harness uses this): one
@@ -596,13 +582,13 @@ fn absFromCwd(gpa: std.mem.Allocator, io: Io, rel: []const u8) ![]u8 {
 /// `ir.Module` (`lower.lowerProject`), then codegens + links. `root_abs` and
 /// `std_root` must be absolute (or `std_root` null for no stdlib). Returns
 /// `null` (diagnostics rendered to `err_out`) on any front-end error.
-pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer, tests_out: ?*[]testgen.Test) !?[]u8 {
+pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_only: ?[]const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer, tests_out: ?*[]testgen.Test) !?[]u8 {
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
     defer diags.deinit();
 
-    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root, .{});
+    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, root_only, std_root, .{});
     defer project.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
@@ -810,10 +796,26 @@ fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer
             defer gpa.free(root_abs);
             const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
             defer if (std_root) |s| gpa.free(s);
-            if (try checkHostProject(gpa, io, root_abs, std_root, err_out)) any_failed = true;
+            if (try checkHostProject(gpa, io, root_abs, null, std_root, err_out)) any_failed = true;
             continue;
         }
 
+        // A lone file is a module too (SPEC §17.1), and `check` is `build`'s
+        // front end — so it takes the same path and sees the same prelude. If it
+        // did not, `bit check hello.bit` would reject the very program
+        // `bit build hello.bit` compiles.
+        if (!dump_types) {
+            const root_abs = try absFromCwd(gpa, io, std.fs.path.dirname(path) orelse ".");
+            defer gpa.free(root_abs);
+            const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+            defer if (std_root) |s| gpa.free(s);
+            if (try checkHostProject(gpa, io, root_abs, std.fs.path.basename(path), std_root, err_out)) any_failed = true;
+            continue;
+        }
+
+        // `--dump-types` stays a single-file, prelude-free front-end dump: it is
+        // a self-host differential surface (scripts/selfhost-difftypes.sh), not a
+        // user-facing check, and both compilers must render it identically.
         const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
             try err_out.print("bit check: {s}: {s}\n", .{ path, @errorName(e) });
             any_failed = true;
@@ -821,7 +823,7 @@ fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer
         };
         defer gpa.free(source);
 
-        const report = if (dump_types) try typesReport(gpa, path, source) else try compileReport(gpa, path, source);
+        const report = try typesReport(gpa, path, source);
         defer gpa.free(report.text);
 
         if (report.failed) {

@@ -634,7 +634,7 @@ fn buildSnapshot(gpa: Allocator, io: Io, dir_abs: []const u8, overlays: *const s
     const std_root = try findStdRoot(gpa, io, dir_abs);
     defer if (std_root) |s| gpa.free(s);
 
-    var project = try resolve.loadProject(gpa, io, &diags, sm, dir_abs, std_root, .{ .map = overlays, .one = override });
+    var project = try resolve.loadProject(gpa, io, &diags, sm, dir_abs, null, std_root, .{ .map = overlays, .one = override });
     errdefer project.deinit();
 
     // Owned absolute paths of the root module's files, for URI mapping.

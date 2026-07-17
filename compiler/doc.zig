@@ -86,7 +86,9 @@ pub fn moduleDoc(
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
     defer diags.deinit();
 
-    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, std_root, .{});
+    // `bit doc` documents a module directory; a lone-file root (SPEC §17.1) has
+    // no doc form yet, so the root is always the whole directory here.
+    var project = try resolve.loadProject(gpa, io, &diags, &sm, root_abs, null, std_root, .{});
     defer project.deinit();
     if (diags.hasErrors()) return try renderNull(&diags, err_out);
 

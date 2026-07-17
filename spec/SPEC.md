@@ -1226,6 +1226,11 @@ A module is a directory of `.bit` files sharing one declaration namespace. There
 no per-file `package` clause; membership is by directory. Circular imports between
 modules are an error.
 
+A single `.bit` file named directly on the command line (`bit run hello.bit`) is a
+module of exactly that one file. Its siblings in the same directory are *not* part
+of it — naming a file selects that file, naming a directory selects all of it. It
+is a module like any other: it gets the prelude (§17.5) and may import (§17.2).
+
 ### 17.2 Imports
 
 ```

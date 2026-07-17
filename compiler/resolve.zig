@@ -1122,7 +1122,14 @@ const Loader = struct {
     // and the parser's own inferred set — `anyerror` breaks the inference
     // cycle without hand-enumerating every OS error variant. Nothing here is
     // ever silently swallowed; every error still propagates via `try`.
-    fn loadModule(self: *Loader, dir_abs: []const u8) anyerror!LoadOutcome {
+    /// Loads the module rooted at `dir_abs`. `only` names the single `.bit` file
+    /// to take instead of scanning the directory — that is how a lone
+    /// `bit run hello.bit` becomes a module of exactly one file (SPEC §17.1).
+    /// It deliberately does NOT sweep in siblings: naming a file selects that
+    /// file, naming a directory selects all of it. Everything downstream — the
+    /// prelude, imports, checking — is identical either way, which is the whole
+    /// point: a lone file is a module like any other, not a lesser thing.
+    fn loadModule(self: *Loader, dir_abs: []const u8, only: ?[]const u8) anyerror!LoadOutcome {
         if (self.project.modules.items.len >= max_modules) return error.TooManyModules;
         const arena = self.project.path_arena.allocator();
         const canon = try std.fs.path.resolve(arena, &.{dir_abs});
@@ -1137,15 +1144,19 @@ const Loader = struct {
 
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(self.gpa);
-        var it = dir.iterate();
-        var guard: u32 = 0;
-        while (guard < max_files_per_module) : (guard += 1) {
-            const entry = (try it.next(self.io)) orelse break;
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bit")) continue;
-            try names.append(self.gpa, try arena.dupe(u8, entry.name));
+        if (only) |name| {
+            try names.append(self.gpa, try arena.dupe(u8, name));
+        } else {
+            var it = dir.iterate();
+            var guard: u32 = 0;
+            while (guard < max_files_per_module) : (guard += 1) {
+                const entry = (try it.next(self.io)) orelse break;
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bit")) continue;
+                try names.append(self.gpa, try arena.dupe(u8, entry.name));
+            }
+            std.debug.assert(guard < max_files_per_module);
+            insertionSort(names.items);
         }
-        std.debug.assert(guard < max_files_per_module);
-        insertionSort(names.items);
 
         var files: std.ArrayList(ModuleFile) = .empty;
         defer files.deinit(self.gpa);
@@ -1206,7 +1217,7 @@ const Loader = struct {
         } else {
             return .not_found;
         }
-        return switch (try self.loadModule(target_dir)) {
+        return switch (try self.loadModule(target_dir, null)) {
             .id => |m| .{ .ok = m },
             .cycle => .cycle,
             .not_found => .not_found,
@@ -1235,12 +1246,18 @@ fn insertionSort(items: [][]const u8) void {
 /// stdlib ships with this build (then `std/*` imports are `not_found`).
 /// `overrides` substitutes in-memory buffers for named files (the LSP's
 /// unsaved edits); pass `.{}` for a plain disk build.
+/// Loads the module at `root_dir_abs` and everything it imports, plus the
+/// prelude. `root_only` names the root's single `.bit` file when the CLI was
+/// handed a file rather than a directory (SPEC §17.1); null takes the whole
+/// directory. Only the ROOT can be a lone file — an imported module is always a
+/// directory, since an import names a module, not a file.
 pub fn loadProject(
     gpa: Allocator,
     io: Io,
     diags: *Diagnostics,
     sm: *diagnostics.SourceManager,
     root_dir_abs: []const u8,
+    root_only: ?[]const u8,
     std_root: ?[]const u8,
     overrides: SourceOverrides,
 ) !LoadedProject {
@@ -1255,13 +1272,13 @@ pub fn loadProject(
     // is not an error — programs then only see the builtins.
     if (std_root) |sr| {
         const core_dir = try std.fs.path.join(project.path_arena.allocator(), &.{ sr, "core" });
-        switch (try loader.loadModule(core_dir)) {
+        switch (try loader.loadModule(core_dir, null)) {
             .id => |m| loader.prelude = m,
             .cycle, .not_found => {},
         }
     }
 
-    switch (try loader.loadModule(root_dir_abs)) {
+    switch (try loader.loadModule(root_dir_abs, root_only)) {
         .id => |m| project.root = m,
         .cycle, .not_found => {}, // diagnostics already emitted; root stays 0
     }

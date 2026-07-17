@@ -82,7 +82,9 @@ fn checkSource(gpa: std.mem.Allocator, io: Io, scratch_dir: []const u8, source: 
 
     var report: Io.Writer.Allocating = .init(gpa);
     errdefer report.deinit();
-    const failed = try bit.checkHostProject(gpa, io, scratch_dir, build_options.stdlib_dir, &report.writer);
+    // `null`: the snippet is written into a scratch directory of its own, so the
+    // root module is that whole directory (not a lone file, SPEC §17.1).
+    const failed = try bit.checkHostProject(gpa, io, scratch_dir, null, build_options.stdlib_dir, &report.writer);
     if (!failed) {
         report.deinit();
         return null;
