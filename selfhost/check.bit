@@ -85,6 +85,29 @@ struct Checker {
   // Import path text ("std/fs") -> module id, filled by the loader before
   // checking. -1 marks a path that resolved to no module.
   importPaths: map<string, int>,
+  // A for-of / catch binder Ident node -> the type pre-pass 3 gave it; 0 for
+  // every other node. Parallel to `nodeTypes`, keyed the same way.
+  //
+  // Pre-pass 3 is the only place a binder's type is knowable (a loop header
+  // sits AFTER its body in arena order, so the main sweep would type the body
+  // before the binder). But `env` is flat and module-wide, so pre-pass 3's
+  // write for a name is then overwritten by every later same-named param —
+  // `for (k, v) of m` in one function ends up typed by another function's
+  // `(v: ConstVal)`. Recording the type per NODE lets the main sweep re-apply
+  // it as it passes the binder, which precedes its own body: right type, right
+  // body, immune to any other function's names.
+  binderTypes: []int,
+  // --- diagnostics --------------------------------------------------------
+  // Where validation (validate.bit) reports to. Every module in a project
+  // shares one sink, so `renderDiags` prints the whole build's errors in one
+  // pass and `hasErrors` is a single question.
+  diags: Diagnostics,
+  // This module's files, as SourceManager ids and as the module-global offset
+  // each one's text begins at — parallel arrays mirroring the SrcModule's
+  // fileNames/fileStarts. A module is its files concatenated, so a span is
+  // module-global and needs both to name a file and a line (see `vSpan`).
+  files: []int,
+  fileStarts: []int,
 }
 
 // Where an imported name comes from: the module that declares it, and the name
@@ -107,6 +130,10 @@ struct Instantiation {
   args: []int,
 }
 
+// A checker over one module's concatenated source. The diagnostics sink it comes
+// with is a private one over a single unnamed file — enough for the dump entry
+// points, which parse a bare source string. `checkProject` replaces it (and the
+// file map) with the project's shared sink, so real builds render real paths.
 function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
   let nt = []int(0)
   let i = 0
@@ -114,7 +141,17 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     nt = append(nt, 0)
     i = i + 1
   }
+  let bt = []int(0)
+  let b = 0
+  while (b < len(tree.nodes)) {
+    bt = append(bt, 0)
+    b = b + 1
+  }
+  let sm = newSourceManager()
+  let f = addFile(sm, "", source)
   return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
+    binderTypes: bt,
+    diags: newDiagnostics(sm), files: [f], fileStarts: [0],
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
     typeParamConstraints: map<string, int>{},
@@ -530,14 +567,56 @@ function importName(c: Checker, e: Checker, mid: int, name: string, alias: strin
 // module-id order — which the loader guarantees is dependency order, so each
 // module's imports are already checked (their type maps populated) by the time
 // it binds them. Returns the checkers, indexed by module id, for lowering.
+// A checker over one file, with diagnostics that render against its real path —
+// the single-file entry `check` and a single-file `build` share. The `--dump-*`
+// entries deliberately do not use it: they take a bare source string and print
+// their inference output whether or not the program is valid.
+function checkFile(path: string, src: string): Checker {
+  let sm = newSourceManager()
+  let f = addFile(sm, path, src)
+  let d = newDiagnostics(sm)
+  let tree = parseSourceD(src, f, d)
+  let c = newChecker(tree, src, newTypeContext())
+  c.diags = d
+  c.files = [f]
+  c.fileStarts = [0]
+  // A tree the parser rejected has holes the checker would read as real nodes,
+  // so its errors are noise on top of the parse errors that caused them. The
+  // seed stops here for the same reason.
+  if (hasErrors(d)) {
+    return c
+  }
+  checkModule(c)
+  return c
+}
+
+// Prints any check errors and reports whether the caller must stop. Lowering an
+// invalid program is exactly the silent miscompile the validator exists to
+// prevent, so `build` must not proceed past a true here.
+function reportCheckErrors(d: Diagnostics): bool {
+  if (!hasErrors(d)) {
+    return false
+  }
+  eprint(renderDiags(d))
+  return true
+}
+
 function checkProject(p: Project): []Checker {
   let ctx = newTypeContext()
+  // One sink and one source manager for the whole project: an error in an
+  // imported module is still this build's error, and renders against its own
+  // file.
+  let sm = newSourceManager()
+  let diags = newDiagnostics(sm)
   let mods = []Checker(0)
   let i = 0
   while (i < len(p.mods)) {
     let c = newChecker(p.mods[i].tree, p.mods[i].source, ctx)
     c.moduleId = i
     c.importPaths = p.mods[i].imports
+    c.diags = diags
+    c.files = registerModuleFiles(sm, p.mods[i])
+    c.fileStarts = p.mods[i].fileStarts
     mods = append(mods, c)
     i = i + 1
   }
@@ -1166,7 +1245,7 @@ function parseRuneText(s: string): int {
 // The predeclared builtins that return void `()` (spec §5.3). Their call
 // expressions type as the void id regardless of arguments.
 function builtinReturnsVoid(name: string): bool {
-  return name == "print" || name == "panic" || name == "assert" ||
+  return name == "print" || name == "eprint" || name == "panic" || name == "assert" ||
     name == "close" || name == "delete"
 }
 
@@ -1420,9 +1499,13 @@ function checkSliceExpr(c: Checker, node: int): int {
 }
 
 // Binds an identifier node's name to a type in the scope env.
+// Binds a for-of / catch binder. The type is recorded on the NODE as well as in
+// the flat env, so the main sweep can re-apply it when it reaches the binder —
+// see `Checker.binderTypes` for why the env write alone is not enough.
 function envBind(c: Checker, identNode: int, ty: int) {
   let n = getNode(c.tree, identNode)
   c.env[c.source[n.span.start:n.span.end]] = ty
+  c.binderTypes[identNode] = ty
 }
 
 // The element type yielded by iterating a value: a slice/array element, or a
@@ -1905,6 +1988,14 @@ function checkModule(c: Checker) {
   let i = 1
   while (i < len(c.tree.nodes)) {
     let tag = getNode(c.tree, i).tag
+    // Re-apply a for-of / catch binder's type at its own node. Pre-pass 3 typed
+    // it, but every same-named param bound since has overwritten the flat env;
+    // a binder node precedes its own body, so this is where the loop's own type
+    // must go back in scope.
+    if (c.binderTypes[i] != 0) {
+      let bn = getNode(c.tree, i)
+      c.env[c.source[bn.span.start:bn.span.end]] = c.binderTypes[i]
+    }
     if (tag == Tag.Param) {
       let kids = kidsOf(c.tree, i)
       let nm = getNode(c.tree, kids[0])
@@ -1940,6 +2031,13 @@ function checkModule(c: Checker) {
           recordInstantiation(c, cname, genericTypeArgs(c, cname, i))
         }
       }
+    } else if (tag == Tag.FuncDecl) {
+      // Validate this function's body (validate.bit) — everything above only
+      // INFERS types. Here and nowhere else: children precede parents in arena
+      // order, so at the FuncDecl node the body is fully swept and the flat
+      // `env` holds exactly this function's params and locals, with no later
+      // function's yet. See validate.bit's header.
+      vFuncDecl(c, i)
     }
     i = i + 1
   }

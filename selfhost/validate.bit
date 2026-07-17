@@ -1,0 +1,258 @@
+// Self-host: the checker's VALIDATION layer, ported from the parts of
+// compiler/check.zig that REJECT a program — as opposed to the parts in
+// check.bit that infer its types. Until this landed, bitc2 was a type
+// INFERENCER with no validator: it compiled `function f(): i32 { return "hi" }`
+// to a binary that prints the string's raw pointer.
+//
+// Why the entry point is a hook in `checkModule`'s sweep rather than a pass of
+// its own: `env` is flat (one map, no per-function scoping) and `nodeTypes` is
+// only cached for Binding/Call/ArrowP, so a validator that ran afterwards would
+// read whichever function bound a name LAST — typing `a`'s `return x` with
+// `b`'s `x`. Children precede parents in arena order, so when the sweep reaches
+// a FuncDecl node its whole body is already swept and `env` holds exactly that
+// function's params and locals, with no later function's yet. Validating there
+// gets the seed's scoping for free (§9). The one rule this owes the sweep: read
+// types, never reorder them — the arena's id order reproduces the seed's touch
+// order, which method-name mangling (`name$t{id}`) and the stage3==stage4 fixed
+// point both depend on.
+//
+// The safety rule throughout: a validator that misses an error leaves a gap, but
+// one that invents an error breaks a working build. Every predicate here is
+// permissive when it cannot decide — `invalid` (TypeId 0, which is also what an
+// un-inferred node holds) is assignable in both directions, and any construct
+// not yet walked reports nothing.
+
+// Diagnostic codes, matching compiler/diagnostics.zig's `Code` values — the
+// numbers `E%04d` renders. Named rather than inline (the parser writes its two
+// bare) because the checker's registry spans 40–73.
+const ecTypeMismatch = 41
+
+// A literal's value, or `ok: false` when the node is not one. Bit has no
+// optional and no tuple return; a two-field struct is the whole story.
+struct VLit {
+  ok: bool,
+  value: int,
+}
+
+// A node's span, mapped from module-global offsets back to the file the text
+// came from. A module is its files CONCATENATED, so every span the parser
+// produced is module-global and would otherwise render against the wrong file
+// and line.
+function vSpan(c: Checker, node: int): Span {
+  let sp = getNode(c.tree, node).span
+  let loc = fileOf(c.fileStarts, sp.start)
+  return Span{ file: c.files[loc.fileIdx], start: loc.offset, end: loc.offset + (sp.end - sp.start) }
+}
+
+// ---- prim predicates (compiler/check.zig's Prim methods) --------------------
+// Indexed by the seed's Prim order: 0..3 i8/i16/i32/i64, 4..7 u8/u16/u32/u64,
+// 8..9 f32/f64, 10 bool, 11 string.
+
+function vPrimIsInt(p: int): bool {
+  return p >= 0 && p <= 7
+}
+
+function vPrimIsFloat(p: int): bool {
+  return p == 8 || p == 9
+}
+
+// Inclusive representable range for an integer prim (§15.4). Callers must gate
+// on `vPrimIsInt` — a float/bool/string prim has no range (the seed's
+// `unreachable`).
+function vPrimMin(p: int): int {
+  if (p == 0) { return 0 - 128 }
+  if (p == 1) { return 0 - 32768 }
+  if (p == 2) { return 0 - 2147483648 }
+  if (p == 3) { return 0 - 9223372036854775807 - 1 }
+  return 0
+}
+
+function vPrimMax(p: int): int {
+  if (p == 0) { return 127 }
+  if (p == 1) { return 32767 }
+  if (p == 2) { return 2147483647 }
+  if (p == 4) { return 255 }
+  if (p == 5) { return 65535 }
+  if (p == 6) { return 4294967295 }
+  return 9223372036854775807
+}
+
+// ---- assignability (§14.2) -------------------------------------------------
+
+// May `nil` occupy a slot of type `ty` (§13.4)? A bare type parameter cannot:
+// only structs can satisfy a `<T: I>` bound (§10.4, methods attach to
+// structs/aliases), and a struct's zero value is never `nil`.
+function vIsNilable(c: Checker, ty: int): bool {
+  let k = c.ctx.types[ty].kind
+  return k == TypeKind.Slice || k == TypeKind.Map || k == TypeKind.Chan ||
+    k == TypeKind.Func || k == TypeKind.Interface
+}
+
+// Structural assignability with no source-literal awareness: identity, `nil`
+// into a nilable type, or an untyped constant whose DEFAULT type matches `dst`
+// exactly.
+function vAssignable(c: Checker, src: int, dst: int): bool {
+  // `invalid` suppresses cascades — and is the id an un-inferred node still
+  // holds, so this is also what keeps an inference gap from becoming a false
+  // error.
+  if (src == 0 || dst == 0) { return true }
+  if (src == dst) { return true }
+  // `nil` is answered before the interface branch: an interface is a reference
+  // type, so `nil` is its zero value, but `nil` has no method set and would fail
+  // a satisfaction test against any non-empty interface.
+  if (src == c.ctx.untypedNilId) { return vIsNilable(c, dst) }
+  // ponytail: an interface target is accepted unchecked. The seed gates it on
+  // `satisfies` (method-set matching) plus the struct-only rule (§14.3); neither
+  // is ported. Missing E0051 is a gap — guessing here would reject working code.
+  if (c.ctx.types[dst].kind == TypeKind.Interface) { return true }
+  // A type parameter on either side is accepted unchecked. Two decls that each
+  // declare `<T>` get two distinct TypeParam ids, and `userTypes` keys them by
+  // BARE NAME, so the last `<T>` in the module wins and an earlier decl's `T`
+  // resolves to the wrong id — `expected 'T', found 'T'` on
+  // tests/cases/run_generic_nested.bit, where `Opt<T>` and `Box<T>` coexist.
+  // Real fix is per-decl type-param scoping; until then the ids cannot be
+  // compared and the only sound answer is yes.
+  if (c.ctx.types[src].kind == TypeKind.TypeParam || c.ctx.types[dst].kind == TypeKind.TypeParam) {
+    return true
+  }
+  if (isUntyped(c, src)) {
+    if (defaultType(c, src) == dst) { return true }
+    // A float constant is representable in either float width. An int/rune
+    // constant is range-checked by `vAssignableNode` when the source literal is
+    // in hand; here, with no node, only exact-width float widening is safe.
+    if (src == c.ctx.untypedFloatId && c.ctx.types[dst].kind == TypeKind.Prim) {
+      return vPrimIsFloat(c.ctx.types[dst].prim)
+    }
+    return false
+  }
+  return false
+}
+
+// Is `value` representable in `dst` (§15.4)?
+function vRepresentable(c: Checker, value: int, dst: int): bool {
+  let t = c.ctx.types[dst]
+  if (t.kind != TypeKind.Prim) { return false }
+  if (vPrimIsFloat(t.prim)) { return true } // int constant widened to float
+  if (!vPrimIsInt(t.prim)) { return false }
+  // ponytail: u64 goes unchecked. `int` is i64 here, so a u64 literal above
+  // i64::max has already wrapped in `parseIntText` and would range-check as
+  // negative — rejecting the crypto tables' 0xFFFFFFFFFFFFFFFF masks. Costs the
+  // `let x: u64 = -1` diagnostic; needs an i128 literal path to do properly.
+  if (t.prim == 7) { return true }
+  return value >= vPrimMin(t.prim) && value <= vPrimMax(t.prim)
+}
+
+// Peels at most one leading unary `+`/`-` and reports the literal value beneath,
+// for range-checking a directly-written literal against a sized target (§15.4).
+// Not a constant folder: a compound constant expression default-types instead,
+// matching the seed's deliberately narrow `literalValue`.
+function vLiteralValue(c: Checker, node: int): VLit {
+  let n = node
+  let negate = false
+  if (getNode(c.tree, n).tag == Tag.Unary) {
+    let op = getNode(c.tree, n).main
+    if (op != int(Kind.Minus) && op != int(Kind.Plus)) { return VLit{ ok: false, value: 0 } }
+    negate = op == int(Kind.Minus)
+    n = kidsOf(c.tree, n)[0]
+  }
+  let nn = getNode(c.tree, n)
+  let tag = nn.tag
+  if (tag != Tag.IntLit && tag != Tag.RuneLit) { return VLit{ ok: false, value: 0 } }
+  let text = c.source[nn.span.start:nn.span.end]
+  let v = parseIntText(text)
+  if (tag == Tag.RuneLit) { v = parseRuneText(text) }
+  if (negate) { v = 0 - v }
+  return VLit{ ok: true, value: v }
+}
+
+// The real assignability entry point: `node` is the source expression being
+// assigned or returned, used to range-check a direct integer literal against a
+// sized target; falls back to `vAssignable` otherwise.
+function vAssignableNode(c: Checker, node: int, src: int, dst: int): bool {
+  if (src == 0 || dst == 0) { return true }
+  if (src == c.ctx.untypedIntId || src == c.ctx.untypedRuneId) {
+    if (c.ctx.types[dst].kind == TypeKind.Prim) {
+      let lit = vLiteralValue(c, node)
+      if (lit.ok) { return vRepresentable(c, lit.value, dst) }
+    }
+  }
+  return vAssignable(c, src, dst)
+}
+
+// Emits E0041 with rendered expected/found type names.
+function vMismatch(c: Checker, node: int, expected: int, found: int) {
+  let en = typeName(c.ctx, expected)
+  let fnd = typeName(c.ctx, found)
+  reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node), "expected '${en}', found '${fnd}'")
+}
+
+// Checks `node`'s type `ty` against `target`, emitting E0041 on failure.
+// `target == 0` (invalid) means "no expectation" and is always a no-op, matching
+// invalid's cascade-suppression contract.
+function vExpect(c: Checker, node: int, ty: int, target: int) {
+  if (target == 0) { return }
+  if (!vAssignableNode(c, node, ty, target)) {
+    vMismatch(c, node, target, ty)
+  }
+}
+
+// ---- the statement walk ----------------------------------------------------
+
+// `return` (§16.2) against the enclosing function's declared result.
+function vReturn(c: Checker, result: int, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0) {
+    if (result != c.ctx.voidId && result != 0) {
+      reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node),
+        "'return' needs a value: this function's result is not void")
+    }
+    return
+  }
+  if (len(kids) == 1) {
+    vExpect(c, kids[0], checkExprType(c, kids[0]), result)
+    return
+  }
+  // ponytail: `return a, b` builds a tuple result (§13.1), unvalidated. The seed
+  // interns the tuple to compare against; interning a type here would append ids
+  // the seed does not have at this point, and the id order is the fixed point's.
+}
+
+// Walks `node` for statements to validate, carrying the enclosing function's
+// declared result type. Descends every child: a node with nothing to check
+// simply falls through, so the walk needs no statement/expression census.
+function vStmt(c: Checker, result: int, node: int) {
+  if (node == 0) { return }
+  let t = getNode(c.tree, node).tag
+  // An arrow function has its own result type, so a `return` inside one belongs
+  // to the arrow, not to the enclosing function. ponytail: not descended into —
+  // that needs the arrow's own result threaded in. Skipping it under-reports;
+  // descending would check the arrow's returns against the WRONG function.
+  if (t == Tag.ArrowFn) { return }
+  // A match arm's payload binders (`Text(s) => …`) are never typed: check.bit
+  // does not know Tag.VariantPat at all, so `s` resolves through the flat env to
+  // whatever ELSE in the module bound that name — `area(s: Shape)` two functions
+  // up, giving `expected 'string', found 'Shape'` on run_enum_payload.bit. Until
+  // the checker binds arm payloads, every type inside an arm is untrustworthy,
+  // so no arm is walked. Costs return validation in any function that matches.
+  if (t == Tag.MatchStmt) { return }
+  if (t == Tag.ReturnStmt) { vReturn(c, result, node) }
+  for k of kidsOf(c.tree, node) {
+    vStmt(c, result, k)
+  }
+}
+
+// Validates one function's body. Called src `checkModule`'s sweep as it reaches
+// the FuncDecl node — see this file's header for why that is the only point
+// where `env` holds this function's bindings and no other's.
+function vFuncDecl(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [recv, name, generics, params, result, body]
+  assert(len(kids) == 6)
+  if (kids[5] == 0) { return }
+  // The declared result, unwrapped for a fallible function: `return x` in a
+  // `(): T!` produces the OK type, never the boxed `!` wrapper (§18.2).
+  let result = c.ctx.voidId
+  if (kids[4] != 0) {
+    result = unwrapFallible(c, typeFromNode(c, kids[4]))
+  }
+  vStmt(c, result, kids[5])
+}
