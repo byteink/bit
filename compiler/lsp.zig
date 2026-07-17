@@ -50,10 +50,16 @@ const Span = diagnostics.Span;
 // ============================================================================
 
 pub fn run(gpa: Allocator, io: Io) !void {
+    // Streaming, not the `.init` default: a `File.Reader`/`File.Writer` defaults
+    // to `.positional` and pread/pwrites from its OWN offset 0, ignoring the
+    // shared file offset. That is wrong for an inherited std stream — with the
+    // fd on a regular file (a redirect, a transcript) every writer restarts at
+    // byte 0 and overwrites the last. A tty or pipe is not seekable, so the mode
+    // silently falls back and the bug only appears once output is redirected.
     var in_buf: [1 << 16]u8 = undefined;
-    var stdin_reader: Io.File.Reader = .init(.stdin(), io, &in_buf);
+    var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &in_buf);
     var out_buf: [1 << 16]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
 
     var server = Server.init(gpa, io);
     defer server.deinit();

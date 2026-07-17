@@ -31,9 +31,18 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
+    // Every std-stream writer below is `.initStreaming`, never the `.init`
+    // default: `.init` selects `.positional` mode, which pwrites from the
+    // writer's OWN offset starting at 0 rather than the fd's shared offset. Two
+    // writers on one inherited stderr — ours, then the runtime's `error: X` —
+    // therefore both start at byte 0, and the second silently overwrites the
+    // first (a 19-byte "error: CheckFailed\n" ate the front of every rendered
+    // diagnostic). A tty or pipe is not seekable, so the mode falls back and the
+    // corruption appears only once output is redirected to a file: CI logs, and
+    // the self-host differentials.
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "fmt")) {
         var err_buf: [4096]u8 = undefined;
-        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
         const failed = try runFmt(gpa, io, &stderr_w.interface, argv[2..]);
         try stderr_w.interface.flush();
         if (failed) return error.FormatFailed;
@@ -47,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     if (argv.len >= 2 and (std.mem.eql(u8, argv[1], "build") or std.mem.eql(u8, argv[1], "run"))) {
         const is_run = std.mem.eql(u8, argv[1], "run");
         var err_buf: [4096]u8 = undefined;
-        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
         const code = runBuildOrRun(gpa, io, &stderr_w.interface, is_run, argv[2..]) catch |e| {
             try stderr_w.interface.print("bit {s}: {s}\n", .{ argv[1], @errorName(e) });
             try stderr_w.interface.flush();
@@ -60,9 +69,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "test")) {
         var out_buf: [4096]u8 = undefined;
-        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var stdout_w: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
         var err_buf: [4096]u8 = undefined;
-        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
         const code = runTest(gpa, io, &stdout_w.interface, &stderr_w.interface, init.environ_map, argv[2..]) catch |e| {
             try stderr_w.interface.print("bit test: {s}\n", .{@errorName(e)});
             try stderr_w.interface.flush();
@@ -76,9 +85,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "doc")) {
         var err_buf: [4096]u8 = undefined;
-        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
         var out_buf: [4096]u8 = undefined;
-        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var stdout_w: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
         const failed = runDoc(gpa, io, &stdout_w.interface, &stderr_w.interface, argv[2..]) catch |e| {
             try stderr_w.interface.print("bit doc: {s}\n", .{@errorName(e)});
             try stderr_w.interface.flush();
@@ -98,9 +107,9 @@ pub fn main(init: std.process.Init) !void {
             rest = rest[1..];
         }
         var out_buf: [4096]u8 = undefined;
-        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var stdout_w: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
         var err_buf: [4096]u8 = undefined;
-        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
         const failed = try runCheck(gpa, io, &stdout_w.interface, &stderr_w.interface, dump_types, rest);
         try stdout_w.interface.flush();
         try stderr_w.interface.flush();
@@ -113,9 +122,9 @@ pub fn main(init: std.process.Init) !void {
     // the Zig and Bit compilers on. Front end only; no libbitrt.
     if (argv.len >= 2 and std.mem.startsWith(u8, argv[1], "--dump-")) {
         var out_buf: [4096]u8 = undefined;
-        var stdout_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
+        var stdout_w: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
         var err_buf: [4096]u8 = undefined;
-        var stderr_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
         const failed = try runDump(gpa, io, &stdout_w.interface, &stderr_w.interface, argv[1], argv[2..]);
         try stdout_w.interface.flush();
         try stderr_w.interface.flush();
@@ -124,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var buf: [64]u8 = undefined;
-    var stdout: Io.File.Writer = .init(.stdout(), io, &buf);
+    var stdout: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     const out = &stdout.interface;
     try out.print("bitc {s}\n", .{version});
     try out.flush();

@@ -408,6 +408,26 @@ pub fn build(b: *std.Build) void {
     fmt_check_run.has_side_effects = true;
     test_step.dependOn(&fmt_check_run.step);
 
+    // Std-stream writer gate: `.init(.stderr())` builds a POSITIONAL handle that
+    // pwrites from offset 0, so a second writer on the same fd overwrites the
+    // first. Invisible on a tty or pipe, corrupts every diagnostic under a
+    // redirect — a static gate is the only thing that catches it.
+    const stdstream_opts = b.addOptions();
+    stdstream_opts.addOption([]const u8, "compiler_dir", b.pathFromRoot("compiler"));
+    stdstream_opts.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
+    stdstream_opts.addOption([]const u8, "runtime_dir", b.pathFromRoot("runtime"));
+    const stdstream_mod = b.createModule(.{
+        .root_source_file = b.path("tests/stdstream_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stdstream_mod.addOptions("build_options", stdstream_opts);
+
+    const stdstream_run = b.addRunArtifact(b.addTest(.{ .root_module = stdstream_mod }));
+    // Sources are read at runtime, invisible to the build cache (as above).
+    stdstream_run.has_side_effects = true;
+    test_step.dependOn(&stdstream_run.step);
+
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
     // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is

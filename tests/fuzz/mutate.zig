@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
         60;
 
     var buf: [256]u8 = undefined;
-    var stdout_w: Io.File.Writer = .init(.stdout(), io, &buf);
+    var stdout_w: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     const out = &stdout_w.interface;
 
     const seeds = try guard.readBitFiles(gpa, io, build_options.cases_dir);
