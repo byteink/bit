@@ -50,6 +50,25 @@ function xmmNum(x: XmmReg): int {
   return int(x)
 }
 
+// The inverse of xRegNum/xmmNum: the register with encoding number `n`. A table
+// rather than a cast, because Bit has no int->enum conversion. Needed where a
+// register arrives as a raw number — the register allocator's results and the
+// architecture-neutral PLoc both carry plain ints.
+function xRegOf(n: int): XReg64 {
+  assert(n >= 0 && n < 16)
+  return [XReg64.Rax, XReg64.Rcx, XReg64.Rdx, XReg64.Rbx, XReg64.Rsp, XReg64.Rbp,
+    XReg64.Rsi, XReg64.Rdi, XReg64.R8, XReg64.R9, XReg64.R10, XReg64.R11,
+    XReg64.R12, XReg64.R13, XReg64.R14, XReg64.R15][n]
+}
+
+function xXmmOf(n: int): XmmReg {
+  assert(n >= 0 && n < 16)
+  return [XmmReg.Xmm0, XmmReg.Xmm1, XmmReg.Xmm2, XmmReg.Xmm3, XmmReg.Xmm4,
+    XmmReg.Xmm5, XmmReg.Xmm6, XmmReg.Xmm7, XmmReg.Xmm8, XmmReg.Xmm9,
+    XmmReg.Xmm10, XmmReg.Xmm11, XmmReg.Xmm12, XmmReg.Xmm13, XmmReg.Xmm14,
+    XmmReg.Xmm15][n]
+}
+
 // Reserved codegen scratch — never allocatable, and never an argument or return
 // register in either convention, so a selector may clobber one at any point
 // without consulting the ABI.
@@ -850,4 +869,167 @@ function xRspAddSub(b: X64Buf, isSub: bool, imm: int) {
   }
   xEmitByte(b, xModrmReg(digit, xRegNum(XReg64.Rsp)))
   xEmitU32(b, imm)
+}
+
+// ---------------------------------------------------------------------------
+// Float moves
+// ---------------------------------------------------------------------------
+
+// `movsd`/`movss` register-to-register (`0F 10 /r`). A self-move encodes nothing.
+function xMovFRR(b: X64Buf, dst: XmmReg, src: XmmReg, width: int) {
+  if (dst == src) {
+    return
+  }
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x10)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
+}
+
+// Load: `0F 10` reads memory into the register.
+function xMovFLoad(b: X64Buf, dst: XmmReg, m: XMem, width: int) {
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xMemRexR(xmmNum(dst)), xMemRexX(m), xMemRexB(m))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x10)
+  xMemModRM(b, xmmNum(dst), m)
+}
+
+// Store: `0F 11` is the same instruction with the direction bit set — 0x10 here
+// would read the destination instead of writing it.
+function xMovFStore(b: X64Buf, m: XMem, src: XmmReg, width: int) {
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xMemRexR(xmmNum(src)), xMemRexX(m), xMemRexB(m))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x11)
+  xMemModRM(b, xmmNum(src), m)
+}
+
+// ---------------------------------------------------------------------------
+// Parallel moves
+// ---------------------------------------------------------------------------
+//
+// PLoc/PMove/plocEq/swapRemoveMove are architecture-neutral and already defined
+// by the arm64 backend; only the emitters below differ. A spill location is an
+// rbp-relative offset here, exactly as it is x29-relative there.
+
+// Emits one move. A mem->mem move has no single-instruction form, so it routes
+// through the PRIMARY scratch — which is why a move CYCLE must rotate through
+// the SECONDARY scratch instead (see xSequentializeAndEmit).
+function xEmitMove(cx: XCtx, src: PLoc, dst: PLoc, class: RegClass) {
+  if (class == RegClass.Int) {
+    if (src.isReg && dst.isReg) {
+      xMovRR(cx.buf, xRegOf(dst.v), xRegOf(src.v))
+      return
+    }
+    if (src.isReg) {
+      xMovStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xRegOf(src.v), 8)
+      return
+    }
+    if (dst.isReg) {
+      xMovLoad(cx.buf, xRegOf(dst.v), xMemB(XReg64.Rbp, src.v), 8, false)
+      return
+    }
+    xMovLoad(cx.buf, xScratch1(), xMemB(XReg64.Rbp, src.v), 8, false)
+    xMovStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xScratch1(), 8)
+    return
+  }
+  if (src.isReg && dst.isReg) {
+    xMovFRR(cx.buf, xXmmOf(dst.v), xXmmOf(src.v), 8)
+    return
+  }
+  if (src.isReg) {
+    xMovFStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xXmmOf(src.v), 8)
+    return
+  }
+  if (dst.isReg) {
+    xMovFLoad(cx.buf, xXmmOf(dst.v), xMemB(XReg64.Rbp, src.v), 8)
+    return
+  }
+  xMovFLoad(cx.buf, xFScratch1(), xMemB(XReg64.Rbp, src.v), 8)
+  xMovFStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xFScratch1(), 8)
+}
+
+// Emits `movesIn` so every destination receives the value it would under
+// true-parallel semantics, even when sources and destinations alias (register
+// swaps and rotations). Two phases: drain everything nothing else reads, then
+// break the remaining closed cycles through a scratch.
+function xSequentializeAndEmit(cx: XCtx, movesIn: []PMove, class: RegClass) {
+  let moves = []PMove(0)
+  let k = 0
+  while (k < len(movesIn)) {
+    if (!plocEq(movesIn[k].src, movesIn[k].dst)) {
+      moves = append(moves, movesIn[k])
+    }
+    k = k + 1
+  }
+
+  // Phase 1: emit every move whose destination no other pending move still
+  // reads. Each pass either emits one or stops, so this is bounded.
+  let changed = true
+  while (changed) {
+    changed = false
+    let i = 0
+    while (i < len(moves)) {
+      if (anyReads(moves, i, moves[i].dst)) {
+        i = i + 1
+      } else {
+        xEmitMove(cx, moves[i].src, moves[i].dst, class)
+        moves = swapRemoveMove(moves, i)
+        changed = true
+      }
+    }
+  }
+
+  // Phase 2: whatever remains forms closed cycles. Walk one backwards from an
+  // arbitrary destination (each location is written exactly once, so the
+  // predecessor is unique) and rotate it through a scratch register.
+  while (len(moves) > 0) {
+    let cycle = []PMove(0)
+    let start = moves[0].dst
+    let cur = start
+    let guard = 0
+    while (guard <= len(movesIn)) {
+      let found = -1
+      let j = 0
+      while (j < len(moves)) {
+        if (plocEq(moves[j].dst, cur)) {
+          found = j
+          j = len(moves)
+        } else {
+          j = j + 1
+        }
+      }
+      assert(found >= 0) // invariant: what is left forms closed cycles
+      let mv = moves[found]
+      cycle = append(cycle, mv)
+      moves = swapRemoveMove(moves, found)
+      cur = mv.src
+      if (plocEq(cur, start)) {
+        guard = len(movesIn) + 1
+      } else {
+        guard = guard + 1
+      }
+    }
+
+    // The cycle scratch holds one location's value across the WHOLE rotation,
+    // so it must be a register xEmitMove never uses as its own temporary. A
+    // mem->mem step inside the cycle routes through the PRIMARY scratch, so the
+    // cycle must use the SECONDARY one — otherwise the first mem->mem step
+    // overwrites the saved value and the cycle resolves to garbage. That is
+    // #1235: a spilled loop-carried value swapped on a back-edge, silently
+    // corrupted.
+    let scratch = plocReg(xRegNum(xScratch2()))
+    if (class == RegClass.Float) {
+      scratch = plocReg(xmmNum(xFScratch2()))
+    }
+    xEmitMove(cx, cycle[0].dst, scratch, class) // save what is about to be overwritten
+    let i = 0
+    while (i + 1 < len(cycle)) {
+      xEmitMove(cx, cycle[i].src, cycle[i].dst, class)
+      i = i + 1
+    }
+    xEmitMove(cx, scratch, cycle[len(cycle) - 1].dst, class)
+  }
 }

@@ -3991,6 +3991,95 @@ function checkX64FrameOffsets() {
   assert(xXmmSaveOffset(f3, 0) < xSpillOffset(f3, f3.numSpillSlots - 1))
 }
 
+function checkX64RegOf() {
+  // xRegOf/xXmmOf are the inverse of xRegNum/xmmNum. If they ever disagree,
+  // every register arriving as a raw number (regalloc's results, PLoc) lands on
+  // the wrong physical register — silently.
+  let i = 0
+  while (i < 16) {
+    assert(xRegNum(xRegOf(i)) == i)
+    assert(xmmNum(xXmmOf(i)) == i)
+    i = i + 1
+  }
+  assert(xRegOf(0) == XReg64.Rax && xRegOf(15) == XReg64.R15)
+  assert(xXmmOf(0) == XmmReg.Xmm0 && xXmmOf(15) == XmmReg.Xmm15)
+}
+
+function checkX64FloatMoves() {
+  // movsd %xmm1, %xmm0 -> f2 0f 10 c1 ; a self-move encodes nothing.
+  let b = newX64Buf()
+  xMovFRR(b, XmmReg.Xmm0, XmmReg.Xmm1, 8)
+  assert(xHex(b) == "f20f10c1")
+  let b2 = newX64Buf()
+  xMovFRR(b2, XmmReg.Xmm0, XmmReg.Xmm0, 8)
+  assert(len(b2.code) == 0)
+
+  // Load is 0F 10, store is 0F 11 — the same instruction with the direction bit
+  // flipped. Using 0x10 for a store READS the destination instead of writing
+  // it, which loses the value and leaves the slot untouched.
+  let b3 = newX64Buf()
+  xMovFLoad(b3, XmmReg.Xmm0, xMemB(XReg64.Rbp, -8), 8)
+  let b4 = newX64Buf()
+  xMovFStore(b4, xMemB(XReg64.Rbp, -8), XmmReg.Xmm0, 8)
+  assert(b3.code[2] == u8(0x10) && b4.code[2] == u8(0x11))
+  assert(xHex(b3) != xHex(b4))
+}
+
+function checkX64ParallelMoves() {
+  // A plain move nothing else reads: emitted directly, no scratch.
+  let cx = newXCtx(XCallConv.SysV)
+  xSequentializeAndEmit(cx, [PMove{ src: plocReg(0), dst: plocReg(1) }], RegClass.Int)
+  assert(xHex(cx.buf) == "4889c1") // mov %rax, %rcx
+
+  // A self-move is dropped entirely.
+  let cx2 = newXCtx(XCallConv.SysV)
+  xSequentializeAndEmit(cx2, [PMove{ src: plocReg(0), dst: plocReg(0) }], RegClass.Int)
+  assert(len(cx2.buf.code) == 0)
+
+  // A chain must be ordered so the value is read before it is overwritten:
+  // rax->rcx must be emitted BEFORE rdx->rax, or rax is clobbered first.
+  let cx3 = newXCtx(XCallConv.SysV)
+  xSequentializeAndEmit(cx3, [PMove{ src: plocReg(2), dst: plocReg(0) },
+    PMove{ src: plocReg(0), dst: plocReg(1) }], RegClass.Int)
+  // mov %rax, %rcx (48 89 c1) then mov %rdx, %rax (48 89 d0)
+  assert(xHex(cx3.buf) == "4889c14889d0")
+
+  // A two-cycle (a swap) cannot be ordered at all and must rotate through the
+  // scratch. The exact sequence, pinned: save rcx into the SECONDARY scratch
+  // (r10), move rax->rcx, then restore r10 into rax.
+  //   mov %rcx, %r10  -> 49 89 ca
+  //   mov %rax, %rcx  -> 48 89 c1
+  //   mov %r10, %rax  -> 4c 89 d0
+  // Rotating through the PRIMARY scratch (r11) would encode 49 89 cb / 4c 89 d8
+  // instead — which is the #1235 bug, and this is what catches it.
+  let cx4 = newXCtx(XCallConv.SysV)
+  xSequentializeAndEmit(cx4, [PMove{ src: plocReg(0), dst: plocReg(1) },
+    PMove{ src: plocReg(1), dst: plocReg(0) }], RegClass.Int)
+  assert(xHex(cx4.buf) == "4989ca4889c14c89d0")
+
+  // THE #1235 TRAP: a cycle whose members are SPILLED. A mem->mem move routes
+  // through the PRIMARY scratch, so a cycle rotating through the primary would
+  // have its saved value overwritten by the first mem->mem step and resolve to
+  // garbage — a spilled loop-carried value swapped on a back-edge, silently
+  // corrupted. The cycle must use the SECONDARY scratch.
+  let cx5 = newXCtx(XCallConv.SysV)
+  xSequentializeAndEmit(cx5, [PMove{ src: plocMem(-8), dst: plocMem(-16) },
+    PMove{ src: plocMem(-16), dst: plocMem(-8) }], RegClass.Int)
+  // The saved value must still be live when it is written back. Assert the
+  // scratch that holds it across the rotation is never the mem->mem temp:
+  assert(xScratch1() != xScratch2())
+  assert(xFScratch1() != xFScratch2())
+  // ...and that something was actually emitted (a dropped cycle is silent).
+  assert(len(cx5.buf.code) > 0)
+
+  // A float cycle rotates through the float scratch, not the int one.
+  let cx6 = newXCtx(XCallConv.SysV)
+  xSequentializeAndEmit(cx6, [PMove{ src: plocReg(0), dst: plocReg(1) },
+    PMove{ src: plocReg(1), dst: plocReg(0) }], RegClass.Float)
+  assert(len(cx6.buf.code) > 0)
+  assert(cx6.buf.code[0] == u8(0xF2)) // movsd, not a GPR mov
+}
+
 function checkProjectPaths() {
   // Bytewise order, and a prefix sorts before its extension.
   assert(strCompare("a", "b") < 0)
@@ -4253,6 +4342,9 @@ function selfcheck() {
   checkX64Jumps()
   checkX64Frame()
   checkX64FrameOffsets()
+  checkX64RegOf()
+  checkX64FloatMoves()
+  checkX64ParallelMoves()
   checkProjectPaths()
   checkProjectResolve()
   checkProjectImports()
