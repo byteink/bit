@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "bit",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/main.zig"),
+            .root_source_file = b.path("seed/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
 
     const diagnostics_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/diagnostics.zig"),
+            .root_source_file = b.path("seed/diagnostics.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -114,7 +114,7 @@ pub fn build(b: *std.Build) void {
 
     const lexer_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/lexer.zig"),
+            .root_source_file = b.path("seed/lexer.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -123,7 +123,7 @@ pub fn build(b: *std.Build) void {
 
     const ast_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/ast.zig"),
+            .root_source_file = b.path("seed/ast.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) void {
 
     const parser_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/parser.zig"),
+            .root_source_file = b.path("seed/parser.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -141,7 +141,7 @@ pub fn build(b: *std.Build) void {
 
     const resolve_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/resolve.zig"),
+            .root_source_file = b.path("seed/resolve.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -150,7 +150,7 @@ pub fn build(b: *std.Build) void {
 
     const fmt_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/fmt.zig"),
+            .root_source_file = b.path("seed/fmt.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -159,7 +159,7 @@ pub fn build(b: *std.Build) void {
 
     const regalloc_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/regalloc.zig"),
+            .root_source_file = b.path("seed/regalloc.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -168,33 +168,33 @@ pub fn build(b: *std.Build) void {
 
     const elf_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/obj/elf.zig"),
+            .root_source_file = b.path("seed/obj/elf.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
     test_step.dependOn(&b.addRunArtifact(elf_tests).step);
 
-    // Rooted at `compiler/` (not `compiler/codegen/`) via the anchor file, so
+    // Rooted at `seed/` (not `seed/codegen/`) via the anchor file, so
     // `arm64.zig`/`common.zig`'s `../ir.zig`-style imports resolve — see that
     // file's doc comment. Covers both files: `arm64.zig` imports `common.zig`.
     const arm64_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/codegen_arm64_test.zig"),
+            .root_source_file = b.path("seed/codegen_arm64_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
     test_step.dependOn(&b.addRunArtifact(arm64_tests).step);
 
-    // Rooted at `compiler/` (not `compiler/codegen/`) via the anchor file, so
+    // Rooted at `seed/` (not `seed/codegen/`) via the anchor file, so
     // `x64.zig`'s `../ir.zig`-style imports resolve — see that file's doc
     // comment. `compileFunction`'s native-execution tests self-skip off
     // x86-64 Linux (see `x64.zig`'s `can_exec_native`), so this is safe to
     // run on every CI host.
     const x64_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/codegen_x64_test.zig"),
+            .root_source_file = b.path("seed/codegen_x64_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -203,19 +203,19 @@ pub fn build(b: *std.Build) void {
 
     const opt_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/opt.zig"),
+            .root_source_file = b.path("seed/opt.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
     test_step.dependOn(&b.addRunArtifact(opt_tests).step);
 
-    // Rooted at `compiler/` (not `compiler/obj/`) via the anchor file, so
+    // Rooted at `seed/` (not `seed/obj/`) via the anchor file, so
     // `pe.zig`'s `../codegen/x64.zig` import resolves — see that file's doc
     // comment and `obj_pe_test.zig`'s.
     const pe_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/obj_pe_test.zig"),
+            .root_source_file = b.path("seed/obj_pe_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -229,7 +229,7 @@ pub fn build(b: *std.Build) void {
     // populated `zig-out/lib/`, or off x86-64 Linux where the ELF can't run.
     const link_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/link.zig"),
+            .root_source_file = b.path("seed/link.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -241,7 +241,7 @@ pub fn build(b: *std.Build) void {
     // hosts (those tools don't exist there), so this is safe on every CI host.
     const macho_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/obj/macho.zig"),
+            .root_source_file = b.path("seed/obj/macho.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -300,7 +300,7 @@ pub fn build(b: *std.Build) void {
     // and mangles a body whose single statement is a multi-line `match`).
     // Gating that would enshrine bad output. See the tracking task.
     const fmt_check = b.addFmt(.{
-        .paths = &.{ "build.zig", "compiler", "runtime", "tests" },
+        .paths = &.{ "build.zig", "seed", "runtime", "tests" },
         .check = true,
     });
     test_step.dependOn(&fmt_check.step);
@@ -413,7 +413,7 @@ pub fn build(b: *std.Build) void {
     // first. Invisible on a tty or pipe, corrupts every diagnostic under a
     // redirect — a static gate is the only thing that catches it.
     const stdstream_opts = b.addOptions();
-    stdstream_opts.addOption([]const u8, "compiler_dir", b.pathFromRoot("compiler"));
+    stdstream_opts.addOption([]const u8, "compiler_dir", b.pathFromRoot("seed"));
     stdstream_opts.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
     stdstream_opts.addOption([]const u8, "runtime_dir", b.pathFromRoot("runtime"));
     const stdstream_mod = b.createModule(.{

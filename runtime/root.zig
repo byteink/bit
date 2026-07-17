@@ -284,7 +284,7 @@ fn panicWrite(msg: []const u8) void {
 ///
 /// v1 does not attempt a symbolized (or even raw-address) stack trace: this
 /// runtime cannot assume codegen maintains a frame-pointer chain it hasn't
-/// committed to (`compiler/codegen/x64.zig`'s scratch-register scheme makes
+/// committed to (`seed/codegen/x64.zig`'s scratch-register scheme makes
 /// no such promise), and there is no debug-info format yet for symbolizing
 /// one if it did. A trace is future work once the object writers emit debug
 /// sections; today's message is deliberately just the message.
@@ -299,7 +299,7 @@ fn fatal(msg: []const u8) noreturn {
 /// one symbol with a message describing the specific failure.
 ///
 /// Takes a raw `RtBytes` view, not a `string` value: the heap-object layout
-/// for Bit's `string` type is undecided (`compiler/codegen/x64.zig` defers
+/// for Bit's `string` type is undecided (`seed/codegen/x64.zig` defers
 /// `const_string` for the same reason) and is this ticket's `RtBytes`-worth
 /// of scope, not the full string ABI's — see ABI.md §12's note.
 export fn bit_rt_panic(msg: *const RtBytes) callconv(.c) noreturn {
@@ -1724,7 +1724,7 @@ fn rtStartMain(sp: usize) callconv(.c) noreturn {
 /// Captures the real auxv (so `shims.getauxval` has real data to answer
 /// from) and installs this thread's TLS: reads this process's own `PT_TLS`
 /// program header (found via `AT_PHDR`/`AT_PHNUM`, standard ELF TLS ABI —
-/// see `compiler/link.zig`'s doc comment on the `PT_TLS` segment it emits)
+/// see `seed/link.zig`'s doc comment on the `PT_TLS` segment it emits)
 /// and hands it to `std.os.linux.tls.initStatic`, the exact routine Zig's
 /// own `std.start` uses for a normal Linux program's main thread. That one
 /// call both sets this (the process's first) thread's thread pointer AND
@@ -1740,7 +1740,7 @@ fn initLinuxTls(auxv_addr: usize) void {
     const at_phdr = shims.getauxval(std.elf.AT_PHDR);
     const at_phnum = shims.getauxval(std.elf.AT_PHNUM);
     const at_phent = shims.getauxval(std.elf.AT_PHENT);
-    // Our own linker (`compiler/link.zig`) always emits standard
+    // Our own linker (`seed/link.zig`) always emits standard
     // `Elf64_Phdr`-shaped entries; a mismatch here means the binary that's
     // running isn't one our linker produced, which this runtime cannot cope
     // with regardless (its whole TLS/entry contract assumes it).

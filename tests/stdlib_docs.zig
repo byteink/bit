@@ -1,7 +1,7 @@
 //! Every exported stdlib symbol is documented (#356).
 //!
 //! The list of what `std/strings` exports is not maintained by hand anywhere —
-//! it is derived from the resolver's `exports` table by `compiler/doc.zig`, the
+//! it is derived from the resolver's `exports` table by `seed/doc.zig`, the
 //! same code behind `bit doc`. This test walks `stdlib/*`, asks for that list,
 //! and fails the build if a symbol has no section in `docs/stdlib/<module>.md`.
 //!
