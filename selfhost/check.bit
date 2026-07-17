@@ -49,10 +49,6 @@ struct Checker {
   // Type-parameter name -> its constraint interface type, so a method call on a
   // constrained generic value `s.area()` (s: T, `T: Shape`) resolves via Shape.
   typeParamConstraints: map<string, int>,
-  // Generic-function instantiations discovered at call sites, in source order.
-  // Each concrete (name, type-args) combo is monomorphized to `name$index` in
-  // lowering; the index is this list position (the seed's ctx.instantiations).
-  instantiations: []Instantiation,
   // Local/param name -> its declared type NODE (rebound per function in
   // lowering), so a generic-enum scrutinee `o: Opt<i64>` can recover its type
   // arguments for match-binder substitution.
@@ -94,9 +90,12 @@ struct ImportOrigin {
   name: string,
 }
 
-// One generic-function instantiation: the generic's name and the concrete
-// argument types it was called with (one per parameter, in order).
+// One generic-function instantiation: the module that DECLARES the generic, the
+// generic's name there, and the concrete argument types it was called with (one
+// per parameter, in order). `module` is what makes an instantiation of an
+// imported generic resolve to one symbol from every caller.
 struct Instantiation {
+  module: int,
   name: string,
   args: []int,
 }
@@ -112,7 +111,7 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
     typeParamConstraints: map<string, int>{},
-    instantiations: []Instantiation(0), declTypeNodes: map<string, int>{},
+    declTypeNodes: map<string, int>{},
     typeDecls: map<string, int>{}, moduleId: 0, mods: []Checker(0),
     importedFrom: map<string, ImportOrigin>{}, exports: map<string, bool>{},
     importPaths: map<string, int>{} }
@@ -616,12 +615,6 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
   if (dk[2] == 0 || dk[4] == 0) {
     return -1 // not generic, or no declared result: the plain path handles it
   }
-  // A cross-module generic would need its type params (the callee's tree) bound
-  // from the call's arguments (ours). Not wired yet — lowerCall refuses these
-  // explicitly, so declining to infer here defers to that one error.
-  if (oc.moduleId != c.moduleId) {
-    return -1
-  }
   let rn = getNode(oc.tree, dk[4])
   if (rn.tag != Tag.Ident) {
     return -1
@@ -632,7 +625,7 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
   }
   // Bind the result type-param from a parameter mentioning it — bare (`x: T`) or
   // nested in a generic instance (`p: Pair<T>`).
-  let bound = bindTypeParamAtCall(c, callNode, kidsOf(oc.tree, dk[3]), rname)
+  let bound = bindTypeParamAtCall(oc, c, callNode, kidsOf(oc.tree, dk[3]), rname)
   if (bound != 0) {
     return bound
   }
@@ -656,10 +649,13 @@ function isGenericFunc(c: Checker, name: string): bool {
 // concrete argument type: a bare `T` binds directly; `[]T`/`[N]T`/`chan<T>`
 // recurse into the element, `map<K,V>` into key then value, `T!E` into the ok
 // type. Returns 0 when this parameter does not mention `tpname`.
-function bindTypeParamFromNode(c: Checker, paramNode: int, argType: int, tpname: string): int {
-  let pn = getNode(c.tree, paramNode)
+// `pc` owns `paramNode`'s tree — the module DECLARING the generic, which is not
+// the caller's when the generic was imported. `argType` is a TypeId, global to
+// the shared context, so it needs no module of its own.
+function bindTypeParamFromNode(pc: Checker, paramNode: int, argType: int, tpname: string): int {
+  let pn = getNode(pc.tree, paramNode)
   if (pn.tag == Tag.Ident) {
-    if (c.source[pn.span.start:pn.span.end] == tpname) {
+    if (pc.source[pn.span.start:pn.span.end] == tpname) {
       return argType
     }
     return 0
@@ -667,26 +663,26 @@ function bindTypeParamFromNode(c: Checker, paramNode: int, argType: int, tpname:
   if (argType == 0) {
     return 0
   }
-  let at = c.ctx.types[argType]
-  let pk = kidsOf(c.tree, paramNode)
+  let at = pc.ctx.types[argType]
+  let pk = kidsOf(pc.tree, paramNode)
   if (pn.tag == Tag.SliceType && at.kind == TypeKind.Slice) {
-    return bindTypeParamFromNode(c, pk[0], at.elem, tpname)
+    return bindTypeParamFromNode(pc, pk[0], at.elem, tpname)
   }
   if (pn.tag == Tag.ArrayType && at.kind == TypeKind.Array) {
-    return bindTypeParamFromNode(c, pk[1], at.elem, tpname)
+    return bindTypeParamFromNode(pc, pk[1], at.elem, tpname)
   }
   if (pn.tag == Tag.ChanType && at.kind == TypeKind.Chan) {
-    return bindTypeParamFromNode(c, pk[0], at.elem, tpname)
+    return bindTypeParamFromNode(pc, pk[0], at.elem, tpname)
   }
   if (pn.tag == Tag.MapType && at.kind == TypeKind.Map) {
-    let k = bindTypeParamFromNode(c, pk[0], at.mapKey, tpname)
+    let k = bindTypeParamFromNode(pc, pk[0], at.mapKey, tpname)
     if (k != 0) {
       return k
     }
-    return bindTypeParamFromNode(c, pk[1], at.mapVal, tpname)
+    return bindTypeParamFromNode(pc, pk[1], at.mapVal, tpname)
   }
   if (pn.tag == Tag.Fallible && at.kind == TypeKind.Fallible) {
-    return bindTypeParamFromNode(c, pk[0], at.result, tpname)
+    return bindTypeParamFromNode(pc, pk[0], at.result, tpname)
   }
   return 0
 }
@@ -731,23 +727,27 @@ function argTypeNode(c: Checker, argNode: int): int {
 // generic instance `Pair<T>` recurses into matching type-arg positions. Node-based
 // because a generic-struct instance TYPE does not carry its type-args (carrying
 // them would perturb the type-id parity). Returns 0 if unbound.
-function bindTypeParamNodeVsNode(c: Checker, pnode: int, anode: int, tpname: string): int {
+// `pnode` (the declared parameter) and `anode` (the call's argument) come from
+// DIFFERENT trees whenever the generic was imported, so each side carries its
+// own checker. Reading one against the other's tree is the whole bug class this
+// exists to avoid.
+function bindTypeParamNodeVsNode(pc: Checker, pnode: int, ac: Checker, anode: int, tpname: string): int {
   if (pnode == 0 || anode == 0) {
     return 0
   }
-  let pt = getNode(c.tree, pnode)
+  let pt = getNode(pc.tree, pnode)
   if (pt.tag == Tag.Ident) {
-    if (c.source[pt.span.start:pt.span.end] == tpname) {
-      return typeFromNode(c, anode)
+    if (pc.source[pt.span.start:pt.span.end] == tpname) {
+      return typeFromNode(ac, anode)
     }
     return 0
   }
-  if (pt.tag == Tag.GenericInst && getNode(c.tree, anode).tag == Tag.GenericInst) {
-    let pta = kidsOf(c.tree, kidsOf(c.tree, pnode)[1])
-    let ata = kidsOf(c.tree, kidsOf(c.tree, anode)[1])
+  if (pt.tag == Tag.GenericInst && getNode(ac.tree, anode).tag == Tag.GenericInst) {
+    let pta = kidsOf(pc.tree, kidsOf(pc.tree, pnode)[1])
+    let ata = kidsOf(ac.tree, kidsOf(ac.tree, anode)[1])
     let i = 0
     while (i < len(pta) && i < len(ata)) {
-      let b = bindTypeParamNodeVsNode(c, pta[i], ata[i], tpname)
+      let b = bindTypeParamNodeVsNode(pc, pta[i], ac, ata[i], tpname)
       if (b != 0) {
         return b
       }
@@ -761,13 +761,15 @@ function bindTypeParamNodeVsNode(c: Checker, pnode: int, anode: int, tpname: str
 // type-based structural match (`[]T`, `map<K,V>`, `T!`) or, for a generic-instance
 // param (`Pair<T>`) whose arg type carries no type-args, a node-vs-node match.
 // Returns 0 if no parameter binds it.
-function bindTypeParamAtCall(c: Checker, callNode: int, params: []int, tpname: string): int {
+// `pc` declares the generic (its tree holds `params`); `ac` is the caller (its
+// tree holds `callNode`). They are the same checker for a local generic.
+function bindTypeParamAtCall(pc: Checker, ac: Checker, callNode: int, params: []int, tpname: string): int {
   let pi = 0
   while (pi < len(params)) {
-    let pnode = kidsOf(c.tree, params[pi])[1]
-    let b = bindTypeParamFromNode(c, pnode, defaultType(c, checkArgType(c, callNode, pi)), tpname)
-    if (b == 0 && getNode(c.tree, pnode).tag == Tag.GenericInst) {
-      b = bindTypeParamNodeVsNode(c, pnode, argTypeNode(c, callArgNode(c, callNode, pi)), tpname)
+    let pnode = kidsOf(pc.tree, params[pi])[1]
+    let b = bindTypeParamFromNode(pc, pnode, defaultType(ac, checkArgType(ac, callNode, pi)), tpname)
+    if (b == 0 && getNode(pc.tree, pnode).tag == Tag.GenericInst) {
+      b = bindTypeParamNodeVsNode(pc, pnode, ac, argTypeNode(ac, callArgNode(ac, callNode, pi)), tpname)
     }
     if (b != 0) {
       return b
@@ -796,7 +798,7 @@ function genericTypeArgs(c: Checker, name: string, callNode: int): []int {
   while (ti < len(tps)) {
     let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[ti])[0])
     let tpname = oc.source[tpn.span.start:tpn.span.end]
-    let bound = bindTypeParamAtCall(c, callNode, params, tpname)
+    let bound = bindTypeParamAtCall(oc, c, callNode, params, tpname)
     if (bound == 0) {
       bound = c.ctx.voidId
     }
@@ -821,11 +823,14 @@ function typeArgsEqual(a: []int, b: []int): bool {
   return true
 }
 
-// The index of the (name, args) instantiation, or -1 if not recorded.
-function instantiationIndex(c: Checker, name: string, args: []int): int {
+// The project-wide index of the (defining module, name, args) instantiation, or
+// -1 if not recorded. The index IS the monomorphized suffix, so it must be the
+// same number for every module that calls this generic with these arguments.
+function instantiationIndexIn(ctx: TypeContext, mod: int, name: string, args: []int): int {
   let i = 0
-  while (i < len(c.instantiations)) {
-    if (c.instantiations[i].name == name && typeArgsEqual(c.instantiations[i].args, args)) {
+  while (i < len(ctx.instantiations)) {
+    let inst = ctx.instantiations[i]
+    if (inst.module == mod && inst.name == name && typeArgsEqual(inst.args, args)) {
       return i
     }
     i = i + 1
@@ -833,11 +838,18 @@ function instantiationIndex(c: Checker, name: string, args: []int): int {
   return -1
 }
 
-// Records a generic-function instantiation the first time its (name, args) combo
-// is seen, preserving discovery order (the monomorphized index).
+// The index of `name`'s (args) instantiation as seen from `c` — resolving where
+// the generic is actually declared, so a caller and the definer agree.
+function instantiationIndex(c: Checker, name: string, args: []int): int {
+  return instantiationIndexIn(c.ctx, declOwner(c, name).moduleId, declName2(c, name), args)
+}
+
+// Records a generic-function instantiation the first time its (module, name,
+// args) combo is seen, preserving discovery order (the monomorphized index).
 function recordInstantiation(c: Checker, name: string, args: []int) {
   if (instantiationIndex(c, name, args) == -1) {
-    c.instantiations = append(c.instantiations, Instantiation{ name: name, args: args })
+    c.ctx.instantiations = append(c.ctx.instantiations,
+      Instantiation{ module: declOwner(c, name).moduleId, name: declName2(c, name), args: args })
   }
 }
 
