@@ -1,0 +1,539 @@
+// Self-host: ELF64 relocatable object writer, ported from compiler/obj/elf.zig
+// (#342). Emits an `ET_REL` object: named sections, a symbol table, and
+// relocations against those symbols. Knows nothing of ir/registers/encoding —
+// building an ElfObject from a backend's FuncCode list is emit.bit's job.
+//
+// The seed leans on `std.elf`'s extern structs and writes them with the host's
+// native encoding; Bit has no such library, so every header field is appended
+// explicitly little-endian (both targets are LE, so this matches byte for byte).
+// Field ORDER and the padding between fields are the whole contract here — the
+// layout comments below are load-bearing, not decoration.
+
+enum ElfTarget {
+  X86_64,
+  Aarch64,
+}
+
+// e_machine (ELF spec): EM_X86_64 = 62, EM_AARCH64 = 183.
+function elfMachine(t: ElfTarget): int {
+  if (t == ElfTarget.X86_64) {
+    return 62
+  }
+  return 183
+}
+
+enum ElfSectionKind {
+  Text,
+  Data,
+  Rodata,
+  Bss,
+  GcMeta,
+}
+
+function elfNumKinds(): int {
+  return 5
+}
+
+function elfKindIndex(k: ElfSectionKind): int {
+  if (k == ElfSectionKind.Text) { return 0 }
+  if (k == ElfSectionKind.Data) { return 1 }
+  if (k == ElfSectionKind.Rodata) { return 2 }
+  if (k == ElfSectionKind.Bss) { return 3 }
+  return 4
+}
+
+// Fixed emission order, spelled out rather than derived from declaration order,
+// so reordering ElfSectionKind can never silently reorder the file layout.
+function elfCanonicalOrder(): []ElfSectionKind {
+  return [ElfSectionKind.Text, ElfSectionKind.Data, ElfSectionKind.Rodata,
+    ElfSectionKind.Bss, ElfSectionKind.GcMeta]
+}
+
+function elfSectionName(k: ElfSectionKind): string {
+  if (k == ElfSectionKind.Text) { return ".text" }
+  if (k == ElfSectionKind.Data) { return ".data" }
+  if (k == ElfSectionKind.Rodata) { return ".rodata" }
+  if (k == ElfSectionKind.Bss) { return ".bss" }
+  return ".bit_gc"
+}
+
+// sh_type: SHT_PROGBITS = 1, SHT_NOBITS = 8 (.bss has no file bytes).
+function elfShType(k: ElfSectionKind): int {
+  if (k == ElfSectionKind.Bss) {
+    return 8
+  }
+  return 1
+}
+
+// sh_flags: SHF_WRITE = 0x1, SHF_ALLOC = 0x2, SHF_EXECINSTR = 0x4.
+function elfShFlags(k: ElfSectionKind): int {
+  if (k == ElfSectionKind.Text) { return 6 }
+  if (k == ElfSectionKind.Data || k == ElfSectionKind.Bss) { return 3 }
+  return 2
+}
+
+// One section's content. Bss is the only kind with no file bytes: give it `size`
+// and leave `data` empty (its contents are implicitly zero). Every other kind
+// derives its size from len(data).
+struct ElfSection {
+  kind: ElfSectionKind,
+  data: []u8,
+  size: int,
+  // 0 or a power of two, per the sh_addralign contract; 0 normalizes to 1.
+  alignment: int,
+}
+
+function elfSectionBytes(s: ElfSection): int {
+  if (s.kind == ElfSectionKind.Bss) {
+    return s.size
+  }
+  return len(s.data)
+}
+
+enum ElfBinding {
+  Local,
+  Global,
+}
+
+enum ElfSymKind {
+  Notype,
+  Object,
+  Func,
+}
+
+// `hasSection == false` names an external symbol (a runtime `bit_rt_*` export,
+// or another Bit module's function) that the linker must resolve — it carries no
+// offset/size and must be Global: nothing else can ever define an undefined
+// local. (Bit has no optionals, so the seed's `section: ?SectionKind` is a
+// hasSection flag plus a section field that is meaningless when false.)
+struct ElfSymbol {
+  name: string,
+  hasSection: bool,
+  section: ElfSectionKind,
+  offset: int,
+  size: int,
+  binding: ElfBinding,
+  kind: ElfSymKind,
+}
+
+// Mirrors codegen.bit's Reloc (offset + symbol) plus the architecture-specific
+// "how the field's bytes are interpreted" that only the object writer needs.
+enum ElfRelocKind {
+  // x86-64 R_X86_64_PC32: a 4-byte field holding S + A - P (a `call rel32`'s
+  // immediate; codegen supplies addend = -4 so P names the immediate's own
+  // start, not the end of the instruction).
+  Pc32,
+  // R_X86_64_64 / R_AARCH64_ABS64: an 8-byte absolute pointer.
+  Abs64,
+  // ARM64 R_AARCH64_CALL26: a `bl`'s 26-bit PC-relative immediate.
+  Call26,
+  // ARM64 R_AARCH64_ADR_PREL_PG_HI21: an ADRP's ±4 GiB page immediate.
+  AdrPrelPgHi21,
+  // ARM64 R_AARCH64_ADD_ABS_LO12_NC: an ADD immediate's low 12 bits.
+  AddAbsLo12Nc,
+}
+
+function elfRelocWidth(k: ElfRelocKind): int {
+  if (k == ElfRelocKind.Abs64) {
+    return 8
+  }
+  return 4
+}
+
+// The r_info type field for this reloc on this target, or -1 when the kind has
+// no encoding there (the seed returns a null that `write` turns into
+// RelocKindUnsupportedForTarget).
+function elfRelocType(k: ElfRelocKind, t: ElfTarget): int {
+  if (t == ElfTarget.X86_64) {
+    if (k == ElfRelocKind.Pc32) { return 2 }   // R_X86_64_PC32
+    if (k == ElfRelocKind.Abs64) { return 1 }  // R_X86_64_64
+    return -1
+  }
+  if (k == ElfRelocKind.Abs64) { return 257 }        // R_AARCH64_ABS64
+  if (k == ElfRelocKind.Call26) { return 283 }       // R_AARCH64_CALL26
+  if (k == ElfRelocKind.AdrPrelPgHi21) { return 275 } // R_AARCH64_ADR_PREL_PG_HI21
+  if (k == ElfRelocKind.AddAbsLo12Nc) { return 277 }  // R_AARCH64_ADD_ABS_LO12_NC
+  return -1
+}
+
+struct ElfRelocation {
+  section: ElfSectionKind,
+  offset: int,
+  symbol: string,
+  kind: ElfRelocKind,
+  addend: int,
+}
+
+struct ElfObject {
+  sections: []ElfSection,
+  symbols: []ElfSymbol,
+  relocations: []ElfRelocation,
+}
+
+function sizeofElfEhdr(): int { return 64 }
+function sizeofElfShdr(): int { return 64 }
+function sizeofElfSym(): int { return 24 }
+function sizeofElfRela(): int { return 24 }
+
+// A section header, held until the whole table is emitted at the end (sh_link
+// for a `.rela.*` is only known once the symtab's index exists).
+struct ElfShdr {
+  name: int,
+  shtype: int,
+  flags: int,
+  addr: int,
+  offset: int,
+  size: int,
+  link: int,
+  info: int,
+  addralign: int,
+  entsize: int,
+}
+
+// Elf64_Shdr layout: name u32, type u32, flags u64, addr u64, offset u64,
+// size u64, link u32, info u32, addralign u64, entsize u64.
+function appendElfShdr(out: ByteBuf, s: ElfShdr) {
+  appendU32(out, s.name)
+  appendU32(out, s.shtype)
+  appendU64(out, s.flags)
+  appendU64(out, s.addr)
+  appendU64(out, s.offset)
+  appendU64(out, s.size)
+  appendU32(out, s.link)
+  appendU32(out, s.info)
+  appendU64(out, s.addralign)
+  appendU64(out, s.entsize)
+}
+
+// Elf64_Sym layout: name u32, info u8, other u8, shndx u16, value u64, size u64.
+// Note the info/other/shndx ordering — it differs from Elf32_Sym.
+function appendElfSym(out: ByteBuf, name: int, info: int, shndx: int, value: int, size: int) {
+  appendU32(out, name)
+  out.bytes = append(out.bytes, u8(info & 255))
+  out.bytes = append(out.bytes, u8(0)) // st_other: STV_DEFAULT
+  appendU16(out, shndx)
+  appendU64(out, value)
+  appendU64(out, size)
+}
+
+// st_info packs the binding in the high nibble and the type in the low nibble.
+function elfSymInfo(binding: ElfBinding, kind: ElfSymKind): int {
+  let b = 0 // STB_LOCAL
+  if (binding == ElfBinding.Global) {
+    b = 1 // STB_GLOBAL
+  }
+  let t = 0 // STT_NOTYPE
+  if (kind == ElfSymKind.Object) {
+    t = 1 // STT_OBJECT
+  } else if (kind == ElfSymKind.Func) {
+    t = 2 // STT_FUNC
+  }
+  return (b << 4) + (t & 15)
+}
+
+// Elf64_Rela: offset u64, info u64, addend i64. r_info is (sym << 32) | type.
+function appendElfRela(out: ByteBuf, offset: int, sym: int, rtype: int, addend: int) {
+  appendU64(out, offset)
+  appendU32(out, rtype)
+  appendU32(out, sym)
+  appendU64(out, addend)
+}
+
+// Appends a NUL-terminated string to a string table, returning its byte offset.
+// `buf` must already carry the ELF-mandated leading NUL, so offset 0 is "".
+function elfInternString(buf: ByteBuf, s: string): int {
+  let off = len(buf.bytes)
+  appendBytes(buf, []byte(s))
+  buf.bytes = append(buf.bytes, u8(0))
+  return off
+}
+
+function elfIsPowerOfTwo(v: int): bool {
+  return v > 0 && (v & (v - 1)) == 0
+}
+
+// The index into `syms` of the symbol named `name`, or -1.
+function elfSymIndexOf(syms: []ElfSymbol, name: string): int {
+  let i = 0
+  while (i < len(syms)) {
+    if (syms[i].name == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Emits a complete ELF64 ET_REL object for `obj`, targeting `target`.
+//
+// Every rejection the seed spells as a distinct error is a `fail` here with the
+// same meaning; the validation happens up front, before a byte is written, so a
+// malformed object can never produce a half-written file.
+function writeElfObject(target: ElfTarget, obj: ElfObject): []u8! {
+  // ---- validate sections: at most one per kind, sane alignment -----------
+  let present = []bool(0)
+  let byKind = []ElfSection(0)
+  let ki = 0
+  while (ki < elfNumKinds()) {
+    present = append(present, false)
+    byKind = append(byKind, ElfSection{ kind: ElfSectionKind.Text, data: []u8(0), size: 0, alignment: 1 })
+    ki = ki + 1
+  }
+  let si = 0
+  while (si < len(obj.sections)) {
+    let s = obj.sections[si]
+    let idx = elfKindIndex(s.kind)
+    if (present[idx]) {
+      fail newError("DuplicateSection")
+    }
+    if (s.alignment != 0 && !elfIsPowerOfTwo(s.alignment)) {
+      fail newError("InvalidSectionAlignment")
+    }
+    present[idx] = true
+    byKind[idx] = s
+    si = si + 1
+  }
+
+  // ---- symbol order: every STB_LOCAL before any STB_GLOBAL ---------------
+  // ELF's symtab contract: sh_info names the boundary as a single index, so the
+  // two groups must be contiguous. Each group keeps obj.symbols's own order.
+  // `order[i]` is the original index landing at final symtab slot i+1 (slot 0 is
+  // the mandatory null symbol).
+  let order = []int(0)
+  let yi = 0
+  while (yi < len(obj.symbols)) {
+    let sym = obj.symbols[yi]
+    if (!sym.hasSection && sym.binding == ElfBinding.Local) {
+      fail newError("UndefinedLocalSymbol")
+    }
+    if (sym.hasSection) {
+      let kidx = elfKindIndex(sym.section)
+      if (!present[kidx]) {
+        fail newError("SectionNotPresent")
+      }
+      if (sym.offset + sym.size > elfSectionBytes(byKind[kidx])) {
+        fail newError("SymbolOutOfBounds")
+      }
+    }
+    if (sym.binding == ElfBinding.Local) {
+      order = append(order, yi)
+    }
+    yi = yi + 1
+  }
+  let nLocal = len(order)
+  yi = 0
+  while (yi < len(obj.symbols)) {
+    if (obj.symbols[yi].binding != ElfBinding.Local) {
+      order = append(order, yi)
+    }
+    yi = yi + 1
+  }
+
+  // Final symtab slot of each symbol, by name (+1 past the null symbol).
+  let symIdx = map<string, int>{}
+  let oi = 0
+  while (oi < len(order)) {
+    let nm = obj.symbols[order[oi]].name
+    let (_, dup) = symIdx[nm]
+    if (dup) {
+      fail newError("DuplicateSymbol")
+    }
+    symIdx[nm] = oi + 1
+    oi = oi + 1
+  }
+
+  // ---- validate relocations, bucketed by target section ------------------
+  let ri = 0
+  while (ri < len(obj.relocations)) {
+    let r = obj.relocations[ri]
+    let kidx = elfKindIndex(r.section)
+    if (!present[kidx]) {
+      fail newError("SectionNotPresent")
+    }
+    if (r.offset + elfRelocWidth(r.kind) > elfSectionBytes(byKind[kidx])) {
+      fail newError("RelocOutOfBounds")
+    }
+    if (elfRelocType(r.kind, target) < 0) {
+      fail newError("RelocKindUnsupportedForTarget")
+    }
+    if (elfSymIndexOf(obj.symbols, r.symbol) < 0) {
+      fail newError("UnknownSymbol")
+    }
+    ri = ri + 1
+  }
+
+  let out = newByteBuf()
+  let shstrtab = newByteBuf()
+  shstrtab.bytes = append(shstrtab.bytes, u8(0)) // offset 0 == empty string
+  let shdrs = []ElfShdr(0)
+
+  appendZeros(out, sizeofElfEhdr()) // patched in at the end
+  shdrs = append(shdrs, ElfShdr{ name: 0, shtype: 0, flags: 0, addr: 0, offset: 0,
+    size: 0, link: 0, info: 0, addralign: 0, entsize: 0 }) // index 0: null section
+
+  // ---- real sections, in canonical order --------------------------------
+  let shIndexOf = []int(0)
+  ki = 0
+  while (ki < elfNumKinds()) {
+    shIndexOf = append(shIndexOf, 0)
+    ki = ki + 1
+  }
+  let ord = elfCanonicalOrder()
+  let ci = 0
+  while (ci < len(ord)) {
+    let kind = ord[ci]
+    let kidx = elfKindIndex(kind)
+    if (present[kidx]) {
+      let sec = byKind[kidx]
+      let nameOff = elfInternString(shstrtab, elfSectionName(kind))
+      let alignment = sec.alignment
+      if (alignment == 0) {
+        alignment = 1
+      }
+      padTo(out, alignment)
+      let fileOff = len(out.bytes)
+      if (kind != ElfSectionKind.Bss) {
+        appendBytes(out, sec.data)
+      }
+      shIndexOf[kidx] = len(shdrs)
+      shdrs = append(shdrs, ElfShdr{ name: nameOff, shtype: elfShType(kind),
+        flags: elfShFlags(kind), addr: 0, offset: fileOff, size: elfSectionBytes(sec),
+        link: 0, info: 0, addralign: alignment, entsize: 0 })
+    }
+    ci = ci + 1
+  }
+
+  // ---- .rela.<name> sections --------------------------------------------
+  // sh_link (the symtab's section index) isn't known until the symtab is
+  // emitted below, so it is patched afterwards; relaPositions remembers where.
+  let relaPositions = []int(0)
+  ci = 0
+  while (ci < len(ord)) {
+    let kind = ord[ci]
+    let kidx = elfKindIndex(kind)
+    // This section's relocations, in the caller's original relative order.
+    let mine = []ElfRelocation(0)
+    ri = 0
+    while (ri < len(obj.relocations)) {
+      if (elfKindIndex(obj.relocations[ri].section) == kidx) {
+        mine = append(mine, obj.relocations[ri])
+      }
+      ri = ri + 1
+    }
+    if (len(mine) > 0) {
+      let nameOff = elfInternString(shstrtab, ".rela${elfSectionName(kind)}")
+      padTo(out, 8)
+      let fileOff = len(out.bytes)
+      ri = 0
+      while (ri < len(mine)) {
+        let r = mine[ri]
+        let (sidx, ok) = symIdx[r.symbol]
+        if (!ok) {
+          fail newError("UnknownSymbol")
+        }
+        appendElfRela(out, r.offset, sidx, elfRelocType(r.kind, target), r.addend)
+        ri = ri + 1
+      }
+      relaPositions = append(relaPositions, len(shdrs))
+      shdrs = append(shdrs, ElfShdr{ name: nameOff, shtype: 4, // SHT_RELA
+        flags: 64, // SHF_INFO_LINK
+        addr: 0, offset: fileOff, size: len(mine) * sizeofElfRela(),
+        link: 0, // patched below
+        info: shIndexOf[kidx], addralign: 8, entsize: sizeofElfRela() })
+    }
+    ci = ci + 1
+  }
+
+  // ---- .strtab before .symtab -------------------------------------------
+  // .symtab's sh_link needs .strtab's section index, which only exists once
+  // .strtab itself has been emitted.
+  let strtab = newByteBuf()
+  strtab.bytes = append(strtab.bytes, u8(0))
+  let symNameOffs = []int(0)
+  oi = 0
+  while (oi < len(order)) {
+    symNameOffs = append(symNameOffs, elfInternString(strtab, obj.symbols[order[oi]].name))
+    oi = oi + 1
+  }
+
+  let strtabNameOff = elfInternString(shstrtab, ".strtab")
+  let strtabFileOff = len(out.bytes)
+  appendBytes(out, strtab.bytes)
+  let strtabIndex = len(shdrs)
+  shdrs = append(shdrs, ElfShdr{ name: strtabNameOff, shtype: 3, // SHT_STRTAB
+    flags: 0, addr: 0, offset: strtabFileOff, size: len(strtab.bytes),
+    link: 0, info: 0, addralign: 1, entsize: 0 })
+
+  let symtabNameOff = elfInternString(shstrtab, ".symtab")
+  padTo(out, 8)
+  let symtabFileOff = len(out.bytes)
+  appendElfSym(out, 0, 0, 0, 0, 0) // index 0: mandatory null symbol
+  oi = 0
+  while (oi < len(order)) {
+    let sym = obj.symbols[order[oi]]
+    let shndx = 0 // SHN_UNDEF
+    if (sym.hasSection) {
+      shndx = shIndexOf[elfKindIndex(sym.section)]
+    }
+    appendElfSym(out, symNameOffs[oi], elfSymInfo(sym.binding, sym.kind), shndx,
+      sym.offset, sym.size)
+    oi = oi + 1
+  }
+  shdrs = append(shdrs, ElfShdr{ name: symtabNameOff, shtype: 2, // SHT_SYMTAB
+    flags: 0, addr: 0, offset: symtabFileOff,
+    size: (len(obj.symbols) + 1) * sizeofElfSym(),
+    link: strtabIndex,
+    info: nLocal + 1, // one greater than the last local symbol's index
+    addralign: 8, entsize: sizeofElfSym() })
+  let symtabIndex = strtabIndex + 1
+  let pi = 0
+  while (pi < len(relaPositions)) {
+    shdrs[relaPositions[pi]].link = symtabIndex
+    pi = pi + 1
+  }
+
+  let shstrtabNameOff = elfInternString(shstrtab, ".shstrtab")
+  let shstrtabFileOff = len(out.bytes)
+  appendBytes(out, shstrtab.bytes)
+  let shstrtabIndex = len(shdrs)
+  shdrs = append(shdrs, ElfShdr{ name: shstrtabNameOff, shtype: 3, // SHT_STRTAB
+    flags: 0, addr: 0, offset: shstrtabFileOff, size: len(shstrtab.bytes),
+    link: 0, info: 0, addralign: 1, entsize: 0 })
+
+  padTo(out, 8)
+  let shoff = len(out.bytes)
+  let hi = 0
+  while (hi < len(shdrs)) {
+    appendElfShdr(out, shdrs[hi])
+    hi = hi + 1
+  }
+
+  // ---- the header, patched over the space reserved up front -------------
+  let hdr = newByteBuf()
+  hdr.bytes = append(hdr.bytes, u8(127)) // 0x7f 'E' 'L' 'F'
+  appendBytes(hdr, []byte("ELF"))
+  hdr.bytes = append(hdr.bytes, u8(2)) // EI_CLASS: ELFCLASS64
+  hdr.bytes = append(hdr.bytes, u8(1)) // EI_DATA: ELFDATA2LSB
+  hdr.bytes = append(hdr.bytes, u8(1)) // EI_VERSION
+  hdr.bytes = append(hdr.bytes, u8(0)) // EI_OSABI: ELFOSABI_NONE
+  appendZeros(hdr, 8)                  // EI_ABIVERSION + padding (to EI_NIDENT=16)
+  appendU16(hdr, 1)                    // e_type: ET_REL
+  appendU16(hdr, elfMachine(target))
+  appendU32(hdr, 1)                    // e_version
+  appendU64(hdr, 0)                    // e_entry
+  appendU64(hdr, 0)                    // e_phoff
+  appendU64(hdr, shoff)                // e_shoff
+  appendU32(hdr, 0)                    // e_flags
+  appendU16(hdr, sizeofElfEhdr())
+  appendU16(hdr, 0)                    // e_phentsize
+  appendU16(hdr, 0)                    // e_phnum
+  appendU16(hdr, sizeofElfShdr())
+  appendU16(hdr, len(shdrs))
+  appendU16(hdr, shstrtabIndex)
+  let bi = 0
+  while (bi < len(hdr.bytes)) {
+    out.bytes[bi] = hdr.bytes[bi]
+    bi = bi + 1
+  }
+  return out.bytes
+}
