@@ -1702,6 +1702,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .panic = "bit_rt_panic",
     .assert = "bit_rt_assert",
     .print = "bit_rt_print",
+    .eprint = "bit_rt_eprint",
     .err_set = "bit_rt_set_err",
     .err_get = "bit_rt_get_err",
     .chan_make = "bit_rt_chan_make",

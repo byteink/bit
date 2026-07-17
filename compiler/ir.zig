@@ -90,6 +90,10 @@ pub const RtFn = enum {
     /// Backs the `print` builtin (SPEC.md); `println` adds the newline in
     /// lowering. v1 takes the string heap-object `{ptr,len}` view directly.
     print,
+    /// `print` on fd 2 (ABI.md §12). Distinct primitive, not a flag on
+    /// `print`: the stream is fixed at the call site, and diagnostics must not
+    /// land in a program's piped stdout.
+    eprint,
     /// Fallible-result error channel (SPEC §18, ABI.md §13). `err_set(e)`
     /// stores the pending error (`fail`/`?`-propagate); a nil arg clears it
     /// (ok return / handled `catch`). `err_get() -> error` reads it right

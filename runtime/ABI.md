@@ -433,7 +433,8 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_select`       | `(descs: *SelectCaseDesc, n: usize, has_default: bool) -> usize` (§11) |
 | `bit_rt_panic`        | `(msg: *const RtBytes) -> noreturn` (§12)               |
 | `bit_rt_assert`       | `(cond: bool, msg: *const RtBytes) -> void` (§12)       |
-| `bit_rt_print`        | `(s: *const RtBytes) -> void` (§12)                     |
+| `bit_rt_print`        | `(s: *const RtBytes) -> void` (§12, fd 1)               |
+| `bit_rt_eprint`       | `(s: *const RtBytes) -> void` (§12, fd 2)               |
 | `bit_rt_string_concat`| `(a: *const RtBytes, b: *const RtBytes) -> *const RtBytes` (§2) |
 | `bit_rt_string_eq`    | `(a: *const RtBytes, b: *const RtBytes) -> bool` (§2)   |
 | `bit_rt_string_byte`  | `(s: *const RtBytes, index: usize) -> u64` (§2, `s[i]`; u64-widened) |
@@ -640,6 +641,8 @@ real the moment codegen starts inserting safepoint polls, and closing it
 ```
 bit_rt_panic(msg: *const RtBytes)          -> noreturn
 bit_rt_assert(cond: bool, msg: *const RtBytes) -> void
+bit_rt_print(s: *const RtBytes)            -> void   // fd 1
+bit_rt_eprint(s: *const RtBytes)           -> void   // fd 2
 
 RtBytes { ptr: *const u8, len: usize }   // extern struct — a transient,
                                           // non-owning byte view, never
@@ -657,6 +660,12 @@ RtBytes { ptr: *const u8, len: usize }   // extern struct — a transient,
   compiler-supplied default (e.g. `"assertion failed"`) — since this symbol
   has one frozen native signature regardless of which surface form the
   program used.
+- `bit_rt_print` / `bit_rt_eprint` back the `print` / `eprint` builtins: a
+  string's bytes verbatim, no trailing newline, to fd 1 and fd 2 respectively.
+  They are the only output primitives; `std/io`'s `println`/`printf` layer on
+  top. The pair exists because the two streams are not interchangeable —
+  diagnostics on stdout would mix into a program's real output the moment it is
+  piped, so anything a caller is not asking *for* goes to fd 2.
 - Both terminate the process the same way on failure: write `panic: <msg>\n`
   to fd 2, then exit immediately with code 2 (SPEC.md §18.4: "a non-zero exit
   code"). There is no `recover` (SPEC.md §18.4) and v1 emits no stack trace —

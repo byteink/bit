@@ -2491,9 +2491,10 @@ const FnCtx = struct {
             try self.emitUnreachable();
             return r;
         }
-        if (std.mem.eql(u8, name, "print")) {
+        if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "eprint")) {
             const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
-            return self.b.rtCall(void_ty, .print, &.{v});
+            const rt: ir.RtFn = if (std.mem.eql(u8, name, "print")) .print else .eprint;
+            return self.b.rtCall(void_ty, rt, &.{v});
         }
         if (std.mem.eql(u8, name, "assert")) {
             const vals = try self.lowerArgs(args_node);
@@ -2873,12 +2874,14 @@ const FnCtx = struct {
         try self.defers.append(self.gpa, entry);
     }
 
-    /// Records a deferred `print`/`assert`. `panic` is excluded (it terminates
-    /// control flow — deferring it is meaningless); value-returning builtins
-    /// (`len`/`cap`/`append`) have no side effect worth deferring.
+    /// Records a deferred `print`/`eprint`/`assert`. `panic` is excluded (it
+    /// terminates control flow — deferring it is meaningless); value-returning
+    /// builtins (`len`/`cap`/`append`) have no side effect worth deferring.
     fn lowerDeferBuiltin(self: *FnCtx, call_node: ast.Index, name: []const u8) Error!void {
         const rt: ir.RtFn = if (std.mem.eql(u8, name, "print"))
             .print
+        else if (std.mem.eql(u8, name, "eprint"))
+            .eprint
         else if (std.mem.eql(u8, name, "assert"))
             .assert
         else

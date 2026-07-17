@@ -325,6 +325,14 @@ export fn bit_rt_print(s: *const RtBytes) callconv(.c) void {
     writeAllFd(stdout_fd, s.ptr[0..s.len]);
 }
 
+/// `bit_rt_eprint` (ABI.md §12): `print`'s sibling on fd 2. Diagnostics,
+/// usage, and progress belong on stderr so a program's real output can be
+/// piped or redirected without them mixing in — a compiler written in Bit
+/// cannot report errors correctly without this.
+export fn bit_rt_eprint(s: *const RtBytes) callconv(.c) void {
+    writeAllFd(stderr_fd, s.ptr[0..s.len]);
+}
+
 // ---------------------------------------------------------------------------
 // Fallible-result error channel (ABI.md §13, SPEC §18)
 // ---------------------------------------------------------------------------

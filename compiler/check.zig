@@ -2654,9 +2654,11 @@ const Checker = struct {
             try self.checkArgsLoose(file_idx, arg_items, env, fctx);
             return self.ctx.void_id;
         }
-        if (std.mem.eql(u8, name, "print")) {
+        // `print` (fd 1) and `eprint` (fd 2) share one signature: exactly one
+        // `string`, void result (ABI.md §12).
+        if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "eprint")) {
             if (arg_items.len != 1) {
-                try self.emit(mf, node, .arg_count_mismatch, "'print' takes exactly 1 argument, found {d}", .{arg_items.len}, null);
+                try self.emit(mf, node, .arg_count_mismatch, "'{s}' takes exactly 1 argument, found {d}", .{ name, arg_items.len }, null);
             }
             if (arg_items.len >= 1) {
                 const inner = mf.tree.kids(arg_items[0])[0];
