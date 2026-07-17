@@ -2040,6 +2040,498 @@ function checkElfRejects() {
       symbol: "same", kind: ElfRelocKind.Pc32, addend: -4 }] }) == "")
 }
 
+// ---- elfreader.bit: the real ELF64 object reader (#345 ported) ------------
+//
+// These round-trip elf.bit's own writer, which covers the header/section/symbol/
+// rela decode paths but NOT STT_SECTION symbols, TLS sections, or the GOT/TLS
+// relocation kinds — the writer never emits those. Those paths are covered by
+// parsing the real Zig-built libbitrt.a (both Linux triples parse clean: 1673
+// and 1856 atoms), which is also what caught R_AARCH64_TLSLE_ADD_TPREL_LO12_NC
+// being 551 rather than 550.
+
+function erErr(t: ElfTarget, name: string, b: []u8): string {
+  let msg = ""
+  let m = readElf(t, name, b) catch e {
+    msg = e.message()
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  return msg
+}
+
+function erAtomNamed(m: LoModule, name: string): int {
+  let i = 0
+  while (i < len(m.atoms)) {
+    if (m.atoms[i].name == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+function checkElfReaderRoundTrip() {
+  // 24 bytes: main occupies [0,16) and helper [16,24). main needs 16 so its
+  // 8-byte abs64 field at offset 8 fits inside its own atom — the writer
+  // rejects a relocation whose field overruns its section, which is how this
+  // fixture was wrong the first time.
+  let code = []u8(24)
+  let rodata = []byte("hi")
+  let obj = ElfObject{
+    sections: [
+      ElfSection{ kind: ElfSectionKind.Text, data: code, size: 0, alignment: 4 },
+      ElfSection{ kind: ElfSectionKind.Rodata, data: rodata, size: 0, alignment: 1 },
+      ElfSection{ kind: ElfSectionKind.Bss, data: []u8(0), size: 16, alignment: 8 }],
+    symbols: [
+      ElfSymbol{ name: "main", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 16, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "helper", hasSection: true, section: ElfSectionKind.Text,
+        offset: 16, size: 8, binding: ElfBinding.Local, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "bit_rt_alloc", hasSection: false, section: ElfSectionKind.Text,
+        offset: 0, size: 0, binding: ElfBinding.Global, kind: ElfSymKind.Notype },
+      ElfSymbol{ name: "msg", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 0, size: len(rodata), binding: ElfBinding.Local, kind: ElfSymKind.Object }],
+    relocations: [
+      ElfRelocation{ section: ElfSectionKind.Text, offset: 0, symbol: "bit_rt_alloc",
+        kind: ElfRelocKind.Call26, addend: 0 },
+      ElfRelocation{ section: ElfSectionKind.Text, offset: 8, symbol: "msg",
+        kind: ElfRelocKind.Abs64, addend: 0 },
+      // In helper (which starts at 16), at section offset 20, targeting a
+      // DEFINED GLOBAL in this same object. Both halves matter: the offset must
+      // rebase to 4 within helper's atom, and a defined global must still be
+      // resolved BY NAME at whole-link merge (a strong definition elsewhere can
+      // override it) rather than short-circuited to this module's atom.
+      ElfRelocation{ section: ElfSectionKind.Text, offset: 20, symbol: "main",
+        kind: ElfRelocKind.Call26, addend: 0 }] }
+  let b = elfBytes(ElfTarget.Aarch64, obj)
+  assert(erErr(ElfTarget.Aarch64, "probe.o", b) == "")
+  let m = readElf(ElfTarget.Aarch64, "probe.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(m.name == "probe.o")
+
+  // .text carried two symbols, so it atomized into two; .rodata and .bss one each.
+  assert(len(m.atoms) == 4)
+  let mi = erAtomNamed(m, "main")
+  assert(mi >= 0)
+  assert(m.atoms[mi].kind == LoSectionKind.Text)
+  assert(m.atoms[mi].binding == LoBinding.Global)
+  assert(len(m.atoms[mi].data) == 16)
+  assert(erAtomNamed(m, "helper") >= 0)
+  assert(erAtomNamed(m, "msg") >= 0)
+  // An undefined symbol is not an atom — it is only ever a relocation target.
+  assert(erAtomNamed(m, "bit_rt_alloc") == -1)
+
+  // main's two relocations rebased into its atom: the external call by name,
+  // the rodata reference to a local atom.
+  assert(len(m.atoms[mi].relocs) == 2)
+  assert(m.atoms[mi].relocs[0].kind == LoRelocKind.Aarch64Call26)
+  assert(m.atoms[mi].relocs[0].target.isGlobal)
+  assert(m.atoms[mi].relocs[0].target.name == "bit_rt_alloc")
+  assert(m.atoms[mi].relocs[0].offset == 0)
+  assert(m.atoms[mi].relocs[1].offset == 8)
+
+  let hi = erAtomNamed(m, "helper")
+  assert(len(m.atoms[hi].relocs) == 1)
+  assert(m.atoms[hi].relocs[0].offset == 4) // section offset 20, atom base 16
+  assert(m.atoms[hi].relocs[0].target.isGlobal)
+  assert(m.atoms[hi].relocs[0].target.name == "main")
+
+  // .bss carried no symbol, so it stays one atom named after its own section;
+  // being NOBITS it keeps its size but carries no bytes.
+  let bi = erAtomNamed(m, ".bss")
+  assert(bi >= 0)
+  assert(m.atoms[bi].kind == LoSectionKind.Bss)
+  assert(m.atoms[bi].size == 16)
+  assert(len(m.atoms[bi].data) == 0)
+}
+
+// THE silent-corruption regression (see erIsMappingSymbol): AArch64 `$d`/`$x`
+// mapping symbols must never become atoms. Admitting them carves a literal pool
+// into `$d`-named slices; dead-strip then drops one and layout repacks the rest,
+// so a relocation into the pool reads shifted bytes — log/log2/log10 returning
+// garbage while log2(8.0) stays exact.
+function checkElfReaderMappingSymbols() {
+  let rodata = [u8(1), u8(2), u8(3), u8(4), u8(5), u8(6), u8(7), u8(8)]
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Rodata, data: rodata, size: 0,
+      alignment: 8 }],
+    symbols: [
+      // A real symbol at 0, then mapping symbols that must all be skipped.
+      ElfSymbol{ name: "pool", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 0, size: 8, binding: ElfBinding.Local, kind: ElfSymKind.Object },
+      ElfSymbol{ name: "$d", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 4, size: 0, binding: ElfBinding.Local, kind: ElfSymKind.Notype },
+      ElfSymbol{ name: "$x.1", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 6, size: 0, binding: ElfBinding.Local, kind: ElfSymKind.Notype }],
+    relocations: []ElfRelocation(0) }
+  let b = elfBytes(ElfTarget.Aarch64, obj)
+  let m = readElf(ElfTarget.Aarch64, "pool.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  // One atom, not three: the pool stays whole, so its interior offsets are
+  // immune to repacking.
+  assert(len(m.atoms) == 1)
+  assert(m.atoms[0].name == "pool")
+  assert(len(m.atoms[0].data) == 8)
+  assert(erAtomNamed(m, "$d") == -1)
+  assert(erAtomNamed(m, "$x.1") == -1)
+
+  // The guard is narrow: only STT_NOTYPE + STB_LOCAL + size 0 + `$[adtx]`
+  // (optionally `.suffix`) qualifies. A real symbol that merely starts with `$`
+  // must still atomize.
+  assert(!erIsMappingSymbol("$d", 0, 0, 4))    // sized: a real object
+  assert(!erIsMappingSymbol("$d", 1, 0, 0))    // STT_OBJECT
+  assert(!erIsMappingSymbol("$d", 0, 1, 0))    // STB_GLOBAL
+  assert(!erIsMappingSymbol("$z", 0, 0, 0))    // not a mapping letter
+  assert(!erIsMappingSymbol("$dx", 0, 0, 0))   // letter must end the name or be followed by '.'
+  assert(!erIsMappingSymbol("$", 0, 0, 0))
+  assert(!erIsMappingSymbol("real", 0, 0, 0))
+  assert(erIsMappingSymbol("$d", 0, 0, 0))
+  assert(erIsMappingSymbol("$x", 0, 0, 0))
+  assert(erIsMappingSymbol("$a", 0, 0, 0))
+  assert(erIsMappingSymbol("$t", 0, 0, 0))
+  assert(erIsMappingSymbol("$d.1", 0, 0, 0))
+}
+
+function checkElfReaderRejects() {
+  let code = [u8(0), u8(0), u8(0), u8(0)]
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: code, size: 0, alignment: 4 }],
+    symbols: [ElfSymbol{ name: "main", hasSection: true, section: ElfSectionKind.Text,
+      offset: 0, size: 4, binding: ElfBinding.Global, kind: ElfSymKind.Func }],
+    relocations: []ElfRelocation(0) }
+  let good = elfBytes(ElfTarget.X86_64, obj)
+  assert(erErr(ElfTarget.X86_64, "g.o", good) == "")
+
+  // Not an ELF at all.
+  assert(erErr(ElfTarget.X86_64, "x.o", []byte("not an elf file at all, but long")) == "NotElf")
+  // Too short to hold a header.
+  assert(erErr(ElfTarget.X86_64, "x.o", [u8(127), u8(69), u8(76), u8(70)]) == "Truncated")
+
+  // An object built for the other architecture must be refused, not linked.
+  assert(erErr(ElfTarget.Aarch64, "g.o", good) == "UnsupportedElf")
+
+  // ELFCLASS32 / big-endian.
+  let c32 = []u8(0)
+  let i = 0
+  while (i < len(good)) {
+    c32 = append(c32, good[i])
+    i = i + 1
+  }
+  c32[4] = u8(1) // ELFCLASS32
+  assert(erErr(ElfTarget.X86_64, "x.o", c32) == "UnsupportedElf")
+  let cbe = []u8(0)
+  i = 0
+  while (i < len(good)) {
+    cbe = append(cbe, good[i])
+    i = i + 1
+  }
+  cbe[5] = u8(2) // ELFDATA2MSB
+  assert(erErr(ElfTarget.X86_64, "x.o", cbe) == "UnsupportedElf")
+
+  // An executable is not a relocatable object.
+  let cex = []u8(0)
+  i = 0
+  while (i < len(good)) {
+    cex = append(cex, good[i])
+    i = i + 1
+  }
+  cex[16] = u8(2) // ET_EXEC
+  assert(erErr(ElfTarget.X86_64, "x.o", cex) == "UnsupportedElf")
+
+  // An unknown relocation type fails loudly rather than being applied as
+  // something else. R_X86_64_GOT32 (3) is real but not one this linker handles.
+  let ro = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: code, size: 0, alignment: 4 }],
+    symbols: [ElfSymbol{ name: "ext", hasSection: false, section: ElfSectionKind.Text,
+      offset: 0, size: 0, binding: ElfBinding.Global, kind: ElfSymKind.Notype }],
+    relocations: [ElfRelocation{ section: ElfSectionKind.Text, offset: 0,
+      symbol: "ext", kind: ElfRelocKind.Pc32, addend: -4 }] }
+  let rb = elfBytes(ElfTarget.X86_64, ro)
+  assert(erErr(ElfTarget.X86_64, "r.o", rb) == "")
+  // Rewrite the sole rela entry's r_type in place: PC32 (2) -> GOT32 (3).
+  let ri = elfFindSection(rb, ".rela.text")
+  assert(ri > 0)
+  let r0 = leAt(rb, elfShdrAt(rb, ri) + 24, 8)
+  assert(leAt(rb, r0 + 8, 4) == 2)
+  rb[r0 + 8] = u8(3)
+  assert(erErr(ElfTarget.X86_64, "r.o", rb) == "UnsupportedRelocation")
+}
+
+// AArch64 instruction fetch faults on a misaligned PC. A .text section whose own
+// sh_addralign is 1 must still yield 4-aligned atoms there, or dead-strip +
+// repack can land a function on an odd boundary; x86-64 has no such rule and
+// must NOT be inflated (that would pad every atom for nothing).
+function checkElfReaderTextAlign() {
+  // `g` sits at a NON-ZERO offset on purpose: atomize gives the offset-0 atom
+  // its section's alignment, but a later atom takes its own SYMBOL's — so only a
+  // second function proves the floor is applied to symbols too, not just to the
+  // section.
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: []u8(8), size: 0,
+      alignment: 1 }],
+    symbols: [
+      ElfSymbol{ name: "f", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 4, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "g", hasSection: true, section: ElfSectionKind.Text,
+        offset: 4, size: 4, binding: ElfBinding.Global, kind: ElfSymKind.Func }],
+    relocations: []ElfRelocation(0) }
+
+  let a64 = readElf(ElfTarget.Aarch64, "a.o", elfBytes(ElfTarget.Aarch64, obj)) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(len(a64.atoms) == 2)
+  assert(a64.atoms[erAtomNamed(a64, "f")].alignment == 4)
+  assert(a64.atoms[erAtomNamed(a64, "g")].alignment == 4)
+
+  let x64 = readElf(ElfTarget.X86_64, "x.o", elfBytes(ElfTarget.X86_64, obj)) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(len(x64.atoms) == 2)
+  assert(x64.atoms[erAtomNamed(x64, "f")].alignment == 1)
+  assert(x64.atoms[erAtomNamed(x64, "g")].alignment == 1)
+
+  // The floor never LOWERS a section's own stricter alignment, and it applies
+  // only to .text — a 1-aligned .rodata stays 1 on both targets.
+  let ro = ElfObject{
+    sections: [
+      ElfSection{ kind: ElfSectionKind.Text, data: []u8(16), size: 0, alignment: 16 },
+      ElfSection{ kind: ElfSectionKind.Rodata, data: []u8(2), size: 0, alignment: 1 }],
+    symbols: [
+      ElfSymbol{ name: "g", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 16, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "s", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 0, size: 2, binding: ElfBinding.Local, kind: ElfSymKind.Object }],
+    relocations: []ElfRelocation(0) }
+  let m = readElf(ElfTarget.Aarch64, "r.o", elfBytes(ElfTarget.Aarch64, ro)) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(m.atoms[erAtomNamed(m, "g")].alignment == 16)
+  assert(m.atoms[erAtomNamed(m, "s")].alignment == 1)
+}
+
+// STB_WEAK and the TLS relocations cannot be produced by elf.bit's writer (its
+// ElfBinding has no weak, its ElfRelocKind no TLS kinds) — yet both appear in a
+// real libbitrt.a: compiler-rt ships weak memcpy/strlen the runtime overrides,
+// and the runtime's thread-locals need TLSLE. So the writer's output is patched
+// byte-wise here, the same trick checkElfReaderRejects uses for r_type.
+function checkElfReaderWeakAndTls() {
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: []u8(8), size: 0,
+      alignment: 4 }],
+    symbols: [
+      ElfSymbol{ name: "memcpy", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 8, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "tlsvar", hasSection: false, section: ElfSectionKind.Text,
+        offset: 0, size: 0, binding: ElfBinding.Global, kind: ElfSymKind.Notype }],
+    relocations: [ElfRelocation{ section: ElfSectionKind.Text, offset: 0,
+      symbol: "tlsvar", kind: ElfRelocKind.AddAbsLo12Nc, addend: 0 }] }
+  let b = elfBytes(ElfTarget.Aarch64, obj)
+
+  // Baseline: a strong global.
+  let m0 = readElf(ElfTarget.Aarch64, "w.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(!m0.atoms[erAtomNamed(m0, "memcpy")].weak)
+
+  // memcpy is the only defined symbol, so it is symtab slot 1 (locals first, and
+  // there are none). Rewrite its st_info bind nibble GLOBAL (1) -> WEAK (2).
+  let syms = leAt(b, elfShdrAt(b, elfFindSection(b, ".symtab")) + 24, 8)
+  let s1 = syms + sizeofElfSym()
+  let strs = leAt(b, elfShdrAt(b, elfFindSection(b, ".strtab")) + 24, 8)
+  assert(elfStrAt(b, strs, leAt(b, s1, 4)) == "memcpy")
+  assert(leAt(b, s1 + 4, 1) == 18) // STB_GLOBAL<<4 | STT_FUNC
+  b[s1 + 4] = u8(34)               // STB_WEAK<<4  | STT_FUNC
+  let m1 = readElf(ElfTarget.Aarch64, "w.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  let wi = erAtomNamed(m1, "memcpy")
+  assert(wi >= 0)
+  assert(m1.atoms[wi].weak)
+  assert(m1.atoms[wi].binding == LoBinding.Global) // weak is a global, still
+
+  // TLSLE_ADD_TPREL_LO12_NC is 551. 550 is the range-CHECKED LO12 and must stay
+  // unsupported — reading real archives is what caught this pair being swapped.
+  let ri = elfFindSection(b, ".rela.text")
+  let r0 = leAt(b, elfShdrAt(b, ri) + 24, 8)
+  assert(leAt(b, r0 + 8, 4) == 277) // ADD_ABS_LO12_NC as written
+  b[r0 + 8] = u8(551 & 255)
+  b[r0 + 9] = u8((551 >> 8) & 255)
+  assert(erErr(ElfTarget.Aarch64, "t.o", b) == "")
+  let m2 = readElf(ElfTarget.Aarch64, "t.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(m2.atoms[erAtomNamed(m2, "memcpy")].relocs[0].kind == LoRelocKind.TlsleAddTprelLo12Nc)
+
+  b[r0 + 8] = u8(550 & 255)
+  b[r0 + 9] = u8((550 >> 8) & 255)
+  assert(erErr(ElfTarget.Aarch64, "t.o", b) == "UnsupportedRelocation")
+
+  b[r0 + 8] = u8(549 & 255)
+  b[r0 + 9] = u8((549 >> 8) & 255)
+  let m3 = readElf(ElfTarget.Aarch64, "t.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(m3.atoms[erAtomNamed(m3, "memcpy")].relocs[0].kind == LoRelocKind.TlsleAddTprelHi12)
+}
+
+// Real objects carry an STT_FILE symbol naming their source file, always at
+// SHN_ABS. It must be IGNORED — and the check must come BEFORE the SHN_ABS
+// rejection, or every real object fails to link. Neither shape is producible by
+// elf.bit's writer, so the symtab is patched byte-wise.
+function checkElfReaderAbsSymbols() {
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: []u8(8), size: 0,
+      alignment: 4 }],
+    symbols: [
+      ElfSymbol{ name: "x.c", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 0, binding: ElfBinding.Local, kind: ElfSymKind.Notype },
+      ElfSymbol{ name: "f", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 8, binding: ElfBinding.Global, kind: ElfSymKind.Func }],
+    relocations: []ElfRelocation(0) }
+  let b = elfBytes(ElfTarget.X86_64, obj)
+  let syms = leAt(b, elfShdrAt(b, elfFindSection(b, ".symtab")) + 24, 8)
+  let strs = leAt(b, elfShdrAt(b, elfFindSection(b, ".strtab")) + 24, 8)
+  // Locals first: slot 1 is "x.c", slot 2 is "f".
+  let s1 = syms + sizeofElfSym()
+  assert(elfStrAt(b, strs, leAt(b, s1, 4)) == "x.c")
+
+  // Make it STT_FILE at SHN_ABS, as a real compiler emits: ignored entirely.
+  // (Unpatched it shares offset 0 with `f`, so atomize would fold the two into
+  // one atom anyway — only the SHN_ABS form below distinguishes the paths.)
+  b[s1 + 4] = u8(4)      // STB_LOCAL<<4 | STT_FILE
+  b[s1 + 6] = u8(65521 & 255)
+  b[s1 + 7] = u8((65521 >> 8) & 255)
+  assert(erErr(ElfTarget.X86_64, "a.o", b) == "")
+  let m1 = readElf(ElfTarget.X86_64, "a.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(erAtomNamed(m1, "x.c") == -1) // not an atom
+  assert(erAtomNamed(m1, "f") >= 0)    // the real symbol still is
+
+  // A NON-STT_FILE symbol at SHN_ABS is refused rather than mis-placed: it
+  // belongs to no section, so nothing could give it an address.
+  b[s1 + 4] = u8(0) // STB_LOCAL<<4 | STT_NOTYPE, still SHN_ABS
+  assert(erErr(ElfTarget.X86_64, "a.o", b) == "UnsupportedSymbol")
+
+  // Same for SHN_COMMON (a tentative definition — this linker has no allocator
+  // for them).
+  b[s1 + 6] = u8(65522 & 255)
+  b[s1 + 7] = u8((65522 >> 8) & 255)
+  assert(erErr(ElfTarget.X86_64, "a.o", b) == "UnsupportedSymbol")
+}
+
+// Two more shapes elf.bit's writer cannot emit but every real object has: a
+// symbol defined in a section this linker DROPS (debug info, .comment), and an
+// STT_SECTION symbol (how a compiler names a literal pool with no symbol of its
+// own). Both are reached by patching flags/st_info on the writer's output.
+function checkElfReaderDroppedAndSectionSyms() {
+  let obj = ElfObject{
+    sections: [
+      ElfSection{ kind: ElfSectionKind.Text, data: []u8(8), size: 0, alignment: 4 },
+      ElfSection{ kind: ElfSectionKind.Rodata, data: []u8(8), size: 0, alignment: 8 }],
+    symbols: [
+      ElfSymbol{ name: "f", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 8, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "pool", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 0, size: 8, binding: ElfBinding.Local, kind: ElfSymKind.Object }],
+    relocations: [ElfRelocation{ section: ElfSectionKind.Text, offset: 0,
+      symbol: "pool", kind: ElfRelocKind.Abs64, addend: 0 }] }
+
+  // (a) STT_SECTION: retype `pool` so the relocation resolves through its
+  // SECTION at an offset rather than through a named symbol. The rela's addend
+  // carries the offset, and atomize folds it in — so the reloc must come back
+  // pointing at the atom covering .rodata+0, with the addend absorbed.
+  let b = elfBytes(ElfTarget.X86_64, obj)
+  let syms = leAt(b, elfShdrAt(b, elfFindSection(b, ".symtab")) + 24, 8)
+  let strs = leAt(b, elfShdrAt(b, elfFindSection(b, ".strtab")) + 24, 8)
+  let s1 = syms + sizeofElfSym() // locals first: `pool`
+  assert(elfStrAt(b, strs, leAt(b, s1, 4)) == "pool")
+  b[s1 + 4] = u8(3) // STB_LOCAL<<4 | STT_SECTION
+  assert(erErr(ElfTarget.X86_64, "s.o", b) == "")
+  let m = readElf(ElfTarget.X86_64, "s.o", b) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  // `pool` is no longer a symbol, so .rodata keeps one atom named for its section.
+  assert(erAtomNamed(m, "pool") == -1)
+  assert(erAtomNamed(m, ".rodata") >= 0)
+  let fi = erAtomNamed(m, "f")
+  assert(len(m.atoms[fi].relocs) == 1)
+  assert(!m.atoms[fi].relocs[0].target.isGlobal) // resolved locally, not by name
+
+  // The rela's ADDEND is the section offset the reference points at, and it must
+  // pick the atom covering THAT offset — not the section's first atom with the
+  // offset left in the addend. Splitting .rodata in two (a symbol at 4) is what
+  // makes the difference observable: `half` starts at 4, so a correct read
+  // attributes the reference to `half` with addend 0. Get it wrong and the
+  // reference stays pinned to the offset-0 atom with +4 — which reads the right
+  // bytes only until dead-strip repacks the two atoms apart.
+  let split = ElfObject{
+    sections: [
+      ElfSection{ kind: ElfSectionKind.Text, data: []u8(8), size: 0, alignment: 4 },
+      ElfSection{ kind: ElfSectionKind.Rodata, data: []u8(8), size: 0, alignment: 8 }],
+    symbols: [
+      ElfSymbol{ name: "f", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 8, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "pool", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 0, size: 4, binding: ElfBinding.Local, kind: ElfSymKind.Object },
+      ElfSymbol{ name: "half", hasSection: true, section: ElfSectionKind.Rodata,
+        offset: 4, size: 4, binding: ElfBinding.Local, kind: ElfSymKind.Object }],
+    relocations: [ElfRelocation{ section: ElfSectionKind.Text, offset: 0,
+      symbol: "pool", kind: ElfRelocKind.Abs64, addend: 4 }] }
+  let sb = elfBytes(ElfTarget.X86_64, split)
+  let ssyms = leAt(sb, elfShdrAt(sb, elfFindSection(sb, ".symtab")) + 24, 8)
+  let sstrs = leAt(sb, elfShdrAt(sb, elfFindSection(sb, ".strtab")) + 24, 8)
+  let p1 = ssyms + sizeofElfSym()
+  assert(elfStrAt(sb, sstrs, leAt(sb, p1, 4)) == "pool")
+  sb[p1 + 4] = u8(3) // STT_SECTION: the reference now goes via .rodata + 4
+  let sm = readElf(ElfTarget.X86_64, "sp.o", sb) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  let sfi = erAtomNamed(sm, "f")
+  let hi = erAtomNamed(sm, "half")
+  assert(hi >= 0)
+  assert(sm.atoms[sfi].relocs[0].target.local == hi)
+  assert(sm.atoms[sfi].relocs[0].addend == 0)
+
+  // (b) A symbol defined in a DROPPED section is ignored, and a relocation
+  // against it is then Malformed rather than silently misresolved. Clearing
+  // SHF_ALLOC on .rodata is what a debug/.comment section looks like here.
+  let b2 = elfBytes(ElfTarget.X86_64, obj)
+  let rh = elfShdrAt(b2, elfFindSection(b2, ".rodata"))
+  assert(leAt(b2, rh + 8, 8) == 2) // SHF_ALLOC
+  b2[rh + 8] = u8(0)
+  assert(erErr(ElfTarget.X86_64, "d.o", b2) == "Malformed")
+
+  // Without the relocation, the dropped section's symbol is simply gone — no
+  // atom, no error.
+  let obj2 = ElfObject{
+    sections: obj.sections, symbols: obj.symbols, relocations: []ElfRelocation(0) }
+  let b3 = elfBytes(ElfTarget.X86_64, obj2)
+  let rh3 = elfShdrAt(b3, elfFindSection(b3, ".rodata"))
+  b3[rh3 + 8] = u8(0)
+  assert(erErr(ElfTarget.X86_64, "d.o", b3) == "")
+  let m3 = readElf(ElfTarget.X86_64, "d.o", b3) catch e {
+    LoModule{ name: "", atoms: []LoAtom(0) }
+  }
+  assert(erAtomNamed(m3, "pool") == -1)
+  assert(erAtomNamed(m3, "f") >= 0)
+}
+
+// erClassify returns an ordinal because Bit has no int->enum cast; the two
+// halves must stay in step or a .text section silently reads back as .rodata.
+function checkElfLoKindRoundTrip() {
+  let all = [LoSectionKind.Text, LoSectionKind.Rodata, LoSectionKind.Data,
+    LoSectionKind.Bss, LoSectionKind.TlsVars, LoSectionKind.TlsData,
+    LoSectionKind.TlsBss]
+  let i = 0
+  while (i < len(all)) {
+    assert(elfLoKindOf(elfLoKindIndex(all[i])) == all[i])
+    assert(elfLoKindIndex(all[i]) == i)
+    i = i + 1
+  }
+}
+
 // Stage 3 (#1344) the linker's object model. Ports every one of the seed's
 // atomizeModule tests, including its two silent-corruption regressions.
 
@@ -6175,6 +6667,14 @@ function selfcheck() {
   checkElfFull()
   checkElfSymbolOrder()
   checkElfRejects()
+  checkElfLoKindRoundTrip()
+  checkElfReaderRoundTrip()
+  checkElfReaderMappingSymbols()
+  checkElfReaderTextAlign()
+  checkElfReaderWeakAndTls()
+  checkElfReaderAbsSymbols()
+  checkElfReaderDroppedAndSectionSyms()
+  checkElfReaderRejects()
   checkAtomizeSplit()
   checkAtomizeRelocs()
   checkAtomizeAlignment()

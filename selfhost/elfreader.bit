@@ -1,0 +1,465 @@
+// Self-host: real ELF64 relocatable object reader, ported from
+// compiler/link/elf_reader.zig (#345). Parses whatever libbitrt.a's members
+// actually contain (built by `zig build libbitrt` — a normal Zig compilation,
+// NOT elf.bit's writer) and normalizes them into linkobj.bit's LoModule/LoAtom
+// IR via atomizeModule.
+//
+// Scope is deliberately "whatever a real ReleaseSmall, stripped, no-PIC
+// x86-64/ARM64 Linux object contains" — every section kind and relocation type
+// switched on below was confirmed present in a real libbitrt.a before being
+// added. Anything else fails LOUDLY rather than silently mis-linking: this is a
+// real, if narrower-than-lld, linker, not a best-effort approximation.
+//
+// The seed builds on std.elf.Header's iterator; Bit has no such library, so the
+// header/section/symbol decoding here is explicit little-endian reads. Both
+// targets are LE, which is what makes that legal.
+
+// AArch64 instruction fetch faults on a misaligned PC; x86-64 has no such
+// requirement. Floor every .text atom's alignment at this so a dead-stripped,
+// repacked .text never places a function on a non-4-byte boundary, even if the
+// source section's own sh_addralign happened to be 1.
+function erMinTextAlign(t: ElfTarget): int {
+  if (t == ElfTarget.Aarch64) {
+    return 4
+  }
+  return 1
+}
+
+// A little-endian unsigned read of `n` bytes at `off`. Object bytes are only
+// 1-byte aligned (an ar member's data is 2-byte aligned at best), so every read
+// goes byte-by-byte rather than through any wider load.
+function erU(b: []u8, off: int, n: int): int {
+  let v = 0
+  let i = 0
+  while (i < n) {
+    v = v | (int(b[off + i]) << (i * 8))
+    i = i + 1
+  }
+  return v
+}
+
+// A signed 64-bit read (r_addend is signed: a PC-relative reference near a
+// section's start folds its instruction bias in, so S + A can land BEFORE the
+// section base).
+function erI64(b: []u8, off: int): int {
+  return erU(b, off, 8)
+}
+
+// The NUL-terminated string at `off` in a string table.
+function erCstr(b: []u8, strtabOff: int, strtabSize: int, off: int): string! {
+  if (off >= strtabSize) {
+    fail newError("Malformed")
+  }
+  let out = []u8(0)
+  let i = strtabOff + off
+  let end = strtabOff + strtabSize
+  while (i < end && b[i] != u8(0)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  if (i >= end) {
+    fail newError("Malformed") // unterminated
+  }
+  return string(out)
+}
+
+// ---- Elf64_Shdr field accessors (offsets per the layout in elf.bit) --------
+
+function erShName(b: []u8, sh: int): int { return erU(b, sh, 4) }
+function erShType(b: []u8, sh: int): int { return erU(b, sh + 4, 4) }
+function erShFlags(b: []u8, sh: int): int { return erU(b, sh + 8, 8) }
+function erShOffset(b: []u8, sh: int): int { return erU(b, sh + 24, 8) }
+function erShSize(b: []u8, sh: int): int { return erU(b, sh + 32, 8) }
+function erShLink(b: []u8, sh: int): int { return erU(b, sh + 40, 4) }
+function erShInfo(b: []u8, sh: int): int { return erU(b, sh + 44, 4) }
+function erShAddralign(b: []u8, sh: int): int { return erU(b, sh + 48, 8) }
+function erShEntsize(b: []u8, sh: int): int { return erU(b, sh + 56, 8) }
+
+// ---- Elf64_Sym field accessors --------------------------------------------
+
+function erSymName(b: []u8, s: int): int { return erU(b, s, 4) }
+function erSymBind(b: []u8, s: int): int { return erU(b, s + 4, 1) >> 4 }
+function erSymType(b: []u8, s: int): int { return erU(b, s + 4, 1) & 15 }
+function erSymShndx(b: []u8, s: int): int { return erU(b, s + 6, 2) }
+function erSymValue(b: []u8, s: int): int { return erU(b, s + 8, 8) }
+function erSymSize(b: []u8, s: int): int { return erU(b, s + 16, 8) }
+
+// Whether `name` is an ARM/AArch64 MAPPING SYMBOL (AAELF64 §5.5.5): `$x` starts
+// a run of A64 instructions, `$d` a run of data, and ARM32 adds `$a`/`$t`; each
+// may carry a `.suffix` (`$d.1`). They are STT_NOTYPE, STB_LOCAL, size 0, and
+// name no object — they only tell a disassembler where code turns into data.
+//
+// They must never become symbols here. atomizeModule splits a section into one
+// atom per symbol offset, so admitting them carves a .rodata literal pool into
+// arbitrary `$d`-named slices. A relocation into that pool then resolves against
+// whichever slice happens to cover its offset, with the remainder folded into
+// the addend — and once dead-strip drops an unreferenced slice and layout
+// repacks the survivors, that addend points at the wrong bytes. The symptom is
+// SILENT: compiler-rt's log/log2/log10 read their musl lookup tables at shifted
+// addresses and return garbage, while inputs that hit a table-free fast path
+// (log2(8.0)) stay exact. x86-64 objects have no mapping symbols, so this only
+// ever corrupted AArch64 links.
+//
+// Skipping them leaves such a pool as its section's single anonymous atom, whose
+// interior offsets are then immune to repacking.
+function erIsMappingSymbol(name: string, stt: int, stb: int, size: int): bool {
+  if (len(name) < 2 || name[0:1] != "$") {
+    return false
+  }
+  if (stt != 0 || stb != 0 || size != 0) { // STT_NOTYPE, STB_LOCAL
+    return false
+  }
+  let c = name[1:2]
+  if (c != "a" && c != "d" && c != "t" && c != "x") {
+    return false
+  }
+  return len(name) == 2 || name[2:3] == "."
+}
+
+// The LoSectionKind a section header maps to, or -1 to DROP it (debug info,
+// .comment, .note.*, the symbol/string tables themselves — anything not
+// SHF_ALLOC, and any type that is neither PROGBITS nor NOBITS).
+function erClassify(b: []u8, sh: int): int {
+  let flags = erShFlags(b, sh)
+  if ((flags & 2) == 0) { // SHF_ALLOC
+    return -1
+  }
+  let t = erShType(b, sh)
+  let isProgbits = t == 1
+  let isNobits = t == 8
+  if (!isProgbits && !isNobits) {
+    return -1
+  }
+  if ((flags & 1024) != 0) { // SHF_TLS
+    if (isNobits) {
+      return elfLoKindIndex(LoSectionKind.TlsBss)
+    }
+    return elfLoKindIndex(LoSectionKind.TlsData)
+  }
+  if (isNobits) {
+    return elfLoKindIndex(LoSectionKind.Bss)
+  }
+  if ((flags & 4) != 0) { // SHF_EXECINSTR
+    return elfLoKindIndex(LoSectionKind.Text)
+  }
+  if ((flags & 1) != 0) { // SHF_WRITE
+    return elfLoKindIndex(LoSectionKind.Data)
+  }
+  return elfLoKindIndex(LoSectionKind.Rodata)
+}
+
+// Bit has no int->enum cast, so erClassify returns an ordinal and this maps it
+// back. The two must stay in step; the round-trip is asserted in selfcheck.
+function elfLoKindIndex(k: LoSectionKind): int {
+  if (k == LoSectionKind.Text) { return 0 }
+  if (k == LoSectionKind.Rodata) { return 1 }
+  if (k == LoSectionKind.Data) { return 2 }
+  if (k == LoSectionKind.Bss) { return 3 }
+  if (k == LoSectionKind.TlsVars) { return 4 }
+  if (k == LoSectionKind.TlsData) { return 5 }
+  return 6
+}
+
+function elfLoKindOf(i: int): LoSectionKind {
+  if (i == 0) { return LoSectionKind.Text }
+  if (i == 1) { return LoSectionKind.Rodata }
+  if (i == 2) { return LoSectionKind.Data }
+  if (i == 3) { return LoSectionKind.Bss }
+  if (i == 4) { return LoSectionKind.TlsVars }
+  if (i == 5) { return LoSectionKind.TlsData }
+  return LoSectionKind.TlsBss
+}
+
+// The LoRelocKind for an ELF relocation type on this target. Every kind here was
+// observed in a real libbitrt.a; an unknown type fails rather than being guessed
+// at, because a mis-applied relocation is silent corruption.
+function erRelocKind(t: ElfTarget, rtype: int): LoRelocKind! {
+  if (t == ElfTarget.X86_64) {
+    if (rtype == 1) { return LoRelocKind.Abs64 }        // R_X86_64_64
+    if (rtype == 2) { return LoRelocKind.Pc32 }         // R_X86_64_PC32
+    if (rtype == 4) { return LoRelocKind.Pc32 }         // R_X86_64_PLT32: fully
+      // static, no interposition — no real PLT is ever needed.
+    if (rtype == 10) { return LoRelocKind.Abs32 }       // R_X86_64_32
+    if (rtype == 11) { return LoRelocKind.Abs32Signed } // R_X86_64_32S
+    if (rtype == 23) { return LoRelocKind.Tpoff32 }     // R_X86_64_TPOFF32
+    if (rtype == 41 || rtype == 42) { return LoRelocKind.Got32 } // GOTPCRELX, REX_GOTPCRELX
+    fail newError("UnsupportedRelocation")
+  }
+  if (rtype == 257) { return LoRelocKind.Abs64 }  // R_AARCH64_ABS64
+  if (rtype == 258) { return LoRelocKind.Abs32 }  // R_AARCH64_ABS32
+  if (rtype == 283) { return LoRelocKind.Aarch64Call26 }
+  if (rtype == 282) { return LoRelocKind.Aarch64Jump26 }
+  if (rtype == 275 || rtype == 276) { return LoRelocKind.Aarch64AdrPrelPgHi21 }
+  if (rtype == 277) { return LoRelocKind.Aarch64AddAbsLo12Nc }
+  if (rtype == 278) { return LoRelocKind.Aarch64Ldst8AbsLo12Nc }
+  if (rtype == 284) { return LoRelocKind.Aarch64Ldst16AbsLo12Nc }
+  if (rtype == 285) { return LoRelocKind.Aarch64Ldst32AbsLo12Nc }
+  if (rtype == 286) { return LoRelocKind.Aarch64Ldst64AbsLo12Nc }
+  if (rtype == 299) { return LoRelocKind.Aarch64Ldst128AbsLo12Nc }
+  if (rtype == 311) { return LoRelocKind.Aarch64AdrGotPage }
+  if (rtype == 312) { return LoRelocKind.Aarch64Ld64GotLo12Nc }
+  if (rtype == 549) { return LoRelocKind.TlsleAddTprelHi12 }
+  // 551 is TLSLE_ADD_TPREL_LO12_NC. 550 is the range-CHECKED LO12 variant and is
+  // deliberately absent: the seed does not accept it either, and admitting it
+  // here would silently apply _NC (truncating) arithmetic to a relocation whose
+  // whole point is that the value must fit.
+  if (rtype == 551) { return LoRelocKind.TlsleAddTprelLo12Nc }
+  fail newError("UnsupportedRelocation")
+}
+
+// How a symtab entry participates in relocation. Bit has no tagged union, so
+// `kind` selects the live field:
+//   0 Undefined — resolve by NAME at whole-link merge time.
+//   1 Section   — an STT_SECTION symbol; `idx` is our RawSection index.
+//   2 Raw       — `idx` indexes raw_symbols.
+//   3 Ignored   — STT_FILE, a mapping symbol, or defined in a dropped section.
+//                 NEVER a valid relocation target.
+struct ErSymInfo {
+  kind: int,
+  idx: int,
+  name: string,
+}
+
+// Reads one ELF64 ET_REL object into linkobj.bit's generic module IR.
+function readElf(target: ElfTarget, name: string, b: []u8): LoModule! {
+  // Magic before length (matching the seed, whose header read checks the ident
+  // first): a file that is not an ELF at all should say so whatever its size,
+  // and only a file that IS one can be meaningfully "truncated".
+  if (len(b) < 4) {
+    fail newError("Truncated")
+  }
+  if (b[0] != u8(127) || b[1] != u8(69) || b[2] != u8(76) || b[3] != u8(70)) {
+    fail newError("NotElf")
+  }
+  if (len(b) < sizeofElfEhdr()) {
+    fail newError("Truncated")
+  }
+  if (b[4] != u8(2) || b[5] != u8(1)) { // ELFCLASS64, ELFDATA2LSB
+    fail newError("UnsupportedElf")
+  }
+  if (erU(b, 16, 2) != 1) { // ET_REL
+    fail newError("UnsupportedElf")
+  }
+  if (erU(b, 18, 2) != elfMachine(target)) {
+    fail newError("UnsupportedElf")
+  }
+  let shoff = erU(b, 40, 8)
+  let shentsize = erU(b, 58, 2)
+  let shnum = erU(b, 60, 2)
+  let shstrndx = erU(b, 62, 2)
+  if (shnum == 0 || shstrndx >= shnum) {
+    fail newError("Malformed")
+  }
+  if (shentsize != sizeofElfShdr()) {
+    fail newError("Malformed")
+  }
+  if (shoff + shnum * shentsize > len(b)) {
+    fail newError("Truncated")
+  }
+
+  // Every section header's file offset, so the rest reads by index.
+  let shAt = []int(0)
+  let i = 0
+  while (i < shnum) {
+    let sh = shoff + i * sizeofElfShdr()
+    // A PROGBITS section's bytes must actually be in the file.
+    if (erShType(b, sh) != 8 && erShOffset(b, sh) + erShSize(b, sh) > len(b)) {
+      fail newError("Truncated")
+    }
+    shAt = append(shAt, sh)
+    i = i + 1
+  }
+
+  let shstrOff = erShOffset(b, shAt[shstrndx])
+  let shstrSize = erShSize(b, shAt[shstrndx])
+
+  // Exactly one symtab is assumed throughout.
+  let symtabIndex = -1
+  i = 0
+  while (i < shnum) {
+    if (erShType(b, shAt[i]) == 2) { // SHT_SYMTAB
+      if (symtabIndex >= 0) {
+        fail newError("UnsupportedElf")
+      }
+      symtabIndex = i
+    }
+    i = i + 1
+  }
+  if (symtabIndex < 0) {
+    fail newError("Malformed")
+  }
+  let symtabSh = shAt[symtabIndex]
+  if (erShEntsize(b, symtabSh) != sizeofElfSym()) {
+    fail newError("Malformed")
+  }
+  if (erShLink(b, symtabSh) >= shnum) {
+    fail newError("Malformed")
+  }
+  let strSh = shAt[erShLink(b, symtabSh)]
+  let strOff = erShOffset(b, strSh)
+  let strSize = erShSize(b, strSh)
+
+  // ---- classify + keep every SHF_ALLOC section --------------------------
+  // sectionMap[i] is this section's index into rawSections, or -1 if dropped.
+  let rawSections = []LoRawSection(0)
+  let sectionMap = []int(0)
+  i = 0
+  while (i < shnum) {
+    sectionMap = append(sectionMap, -1)
+    i = i + 1
+  }
+  i = 0
+  while (i < shnum) {
+    let sh = shAt[i]
+    let ki = erClassify(b, sh)
+    if (ki >= 0) {
+      let kind = elfLoKindOf(ki)
+      sectionMap[i] = len(rawSections)
+      let secAlign = erShAddralign(b, sh)
+      if (secAlign < 1) {
+        secAlign = 1
+      }
+      let alignment = secAlign
+      if (kind == LoSectionKind.Text && alignment < erMinTextAlign(target)) {
+        alignment = erMinTextAlign(target)
+      }
+      let data = []u8(0)
+      if (!loIsBss(kind)) {
+        let off = erShOffset(b, sh)
+        data = b[off:off + erShSize(b, sh)]
+      }
+      rawSections = append(rawSections, LoRawSection{
+        name: erCstr(b, shstrOff, shstrSize, erShName(b, sh))?,
+        kind: kind, data: data, size: erShSize(b, sh), alignment: alignment })
+    }
+    i = i + 1
+  }
+
+  // ---- one pass over the symbol table -----------------------------------
+  if (erShSize(b, symtabSh) % sizeofElfSym() != 0) {
+    fail newError("Malformed")
+  }
+  let symCount = erShSize(b, symtabSh) / sizeofElfSym()
+  if (symCount == 0) {
+    fail newError("Malformed")
+  }
+  let symtabOff = erShOffset(b, symtabSh)
+
+  let symInfos = []ErSymInfo(0)
+  symInfos = append(symInfos, ErSymInfo{ kind: 3, idx: 0, name: "" }) // slot 0: null
+  let rawSymbols = []LoRawSymbol(0)
+  i = 1 // index 0 is the mandatory null symbol
+  while (i < symCount) {
+    let s = symtabOff + i * sizeofElfSym()
+    let symName = erCstr(b, strOff, strSize, erSymName(b, s))?
+    let stt = erSymType(b, s)
+    let stb = erSymBind(b, s)
+    let shndx = erSymShndx(b, s)
+
+    if (shndx == 0) { // SHN_UNDEF
+      symInfos = append(symInfos, ErSymInfo{ kind: 0, idx: 0, name: symName })
+    } else if (stt == 4) { // STT_FILE
+      // A compiler-emitted source-file-name symbol — always SHN_ABS (no
+      // section), never a relocation target. Must be checked BEFORE the SHN_ABS
+      // rejection below.
+      symInfos = append(symInfos, ErSymInfo{ kind: 3, idx: 0, name: symName })
+    } else if (shndx == 65521 || shndx == 65522) { // SHN_ABS, SHN_COMMON
+      fail newError("UnsupportedSymbol")
+    } else if (stt == 10) { // STT_GNU_IFUNC
+      fail newError("UnsupportedSymbol")
+    } else if (shndx >= shnum) {
+      fail newError("Malformed")
+    } else if (sectionMap[shndx] < 0) {
+      symInfos = append(symInfos, ErSymInfo{ kind: 3, idx: 0, name: symName })
+    } else if (stt == 3) { // STT_SECTION
+      symInfos = append(symInfos, ErSymInfo{ kind: 1, idx: sectionMap[shndx], name: symName })
+    } else if (erIsMappingSymbol(symName, stt, stb, erSymSize(b, s))) {
+      symInfos = append(symInfos, ErSymInfo{ kind: 3, idx: 0, name: symName })
+    } else {
+      let mapped = sectionMap[shndx]
+      let sectionAlign = erShAddralign(b, shAt[shndx])
+      if (sectionAlign < 1) {
+        sectionAlign = 1
+      }
+      let alignment = sectionAlign
+      if (rawSections[mapped].kind == LoSectionKind.Text && alignment < erMinTextAlign(target)) {
+        alignment = erMinTextAlign(target)
+      }
+      let binding = LoBinding.Global
+      if (stb == 0) { // STB_LOCAL
+        binding = LoBinding.Local
+      }
+      symInfos = append(symInfos, ErSymInfo{ kind: 2, idx: len(rawSymbols), name: symName })
+      rawSymbols = append(rawSymbols, LoRawSymbol{ name: symName, section: mapped,
+        offset: erSymValue(b, s), size: erSymSize(b, s), binding: binding,
+        weak: stb == 2, alignment: alignment }) // STB_WEAK == 2
+    }
+    i = i + 1
+  }
+
+  // ---- relocations: one SHT_RELA per section it applies to ---------------
+  let rawRelocs = []LoRawReloc(0)
+  i = 0
+  while (i < shnum) {
+    let sh = shAt[i]
+    if (erShType(b, sh) == 4) { // SHT_RELA
+      if (erShEntsize(b, sh) != sizeofElfRela()) {
+        fail newError("Malformed")
+      }
+      if (erShInfo(b, sh) >= shnum) {
+        fail newError("Malformed")
+      }
+      // A dropped target section's relocations are moot.
+      let owner = sectionMap[erShInfo(b, sh)]
+      if (owner >= 0) {
+        if (erShLink(b, sh) >= shnum || erShType(b, shAt[erShLink(b, sh)]) != 2) {
+          fail newError("Malformed")
+        }
+        if (erShSize(b, sh) % sizeofElfRela() != 0) {
+          fail newError("Malformed")
+        }
+        let relaOff = erShOffset(b, sh)
+        let count = erShSize(b, sh) / sizeofElfRela()
+        let r = 0
+        while (r < count) {
+          let ro = relaOff + r * sizeofElfRela()
+          let rOffset = erU(b, ro, 8)
+          let rtype = erU(b, ro + 8, 4)
+          let symIndex = erU(b, ro + 12, 4)
+          let addend = erI64(b, ro + 16)
+          if (symIndex == 0 || symIndex >= symCount) {
+            fail newError("Malformed")
+          }
+          let kind = erRelocKind(target, rtype)?
+          let info = symInfos[symIndex]
+          if (info.kind == 3) {
+            fail newError("Malformed") // never a valid relocation target
+          }
+          if (info.kind == 0) {
+            rawRelocs = append(rawRelocs, LoRawReloc{ section: owner, offset: rOffset,
+              kind: kind, target: loTargetGlobal(info.name), addend: addend })
+          } else if (info.kind == 1) {
+            // r_addend is the signed section offset S + A points to (it can be
+            // negative near a section's start — see LoRawTargetKind.SectionOffset);
+            // atomize folds it in, so the reloc's own addend becomes 0.
+            rawRelocs = append(rawRelocs, LoRawReloc{ section: owner, offset: rOffset,
+              kind: kind, target: loTargetSectionOffset(info.idx, addend), addend: 0 })
+          } else {
+            // A global target is resolved by name against the whole link; a local
+            // one can only ever be defined here, so it keeps its module-local index.
+            let tgt = loTargetSymbol(info.idx)
+            if (rawSymbols[info.idx].binding == LoBinding.Global) {
+              tgt = loTargetGlobal(rawSymbols[info.idx].name)
+            }
+            rawRelocs = append(rawRelocs, LoRawReloc{ section: owner, offset: rOffset,
+              kind: kind, target: tgt, addend: addend })
+          }
+          r = r + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  return atomizeModule(name, rawSections, rawSymbols, rawRelocs)?
+}
