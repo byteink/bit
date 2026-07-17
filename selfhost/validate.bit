@@ -28,6 +28,7 @@
 const ecTypeMismatch = 41
 const ecArgCount = 50
 const ecInvalidOperand = 53
+const ecMissingReturn = 55
 const ecInvalidBreakContinue = 56
 const ecFailOutsideFallible = 60
 const ecTryOutsideFallible = 61
@@ -400,6 +401,133 @@ function vStmt(c: Checker, result: int, node: int, brk: int, loop: int, fallible
   }
 }
 
+// ---- E0055 missing-return: control-flow divergence (§10.3) -----------------
+// Ported from check.zig `diverges`. The rule: a non-void function whose body is
+// not proven to always divert control (return / fail / panic / infinite loop /
+// exhaustive all-arms-diverge) is missing a return. Conservative TOWARD NOT
+// EMITTING — any construct that cannot be proven to fall through is treated as
+// diverging — because a missed missing_return is a harmless gap (the seed still
+// gates) but a spurious one rejects a valid build. The corpus is code the seed
+// accepts, so every non-void body must read as diverging here or the diffcheck
+// FALSEPOS gate fires; that gate is what proves this port faithful.
+
+// The while-condition is the literal `true`. bit2 has no const-evaluator, so a
+// const that folds to true is not recognised (under-detects vs the seed's
+// constEval — but that only under-reports, never false-positives; `for {}` is
+// the idiomatic infinite loop and is handled exactly via ForInf).
+function vIsTrueLit(c: Checker, node: int): bool {
+  if (node == 0 || getNode(c.tree, node).tag != Tag.BoolLit) { return false }
+  let sp = getNode(c.tree, node).span
+  return c.source[sp.start:sp.end] == "true"
+}
+
+// A call to the builtin `panic` (diverges). Mirrors the seed's isPanicCall: the
+// callee is the bare name `panic`, shadowed by neither a local value nor a user
+// function (the same permissiveness vCall uses to identify a builtin).
+function vIsPanicCall(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Call) { return false }
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) { return false }
+  let cn = getNode(c.tree, callee)
+  let name = c.source[cn.span.start:cn.span.end]
+  return name == "panic" && envLookup(c, name) == 0 && funcDeclLookup(c, name) == 0
+}
+
+// Does `node` (a loop body) contain a `break` targeting THIS loop — i.e. one not
+// shadowed by a nested loop/switch/select? Bounded depth, mirrors the seed.
+function vContainsOwnBreak(c: Checker, node: int, depth: int): bool {
+  if (node == 0 || depth >= 64) { return false }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.BreakStmt) { return true }
+  if (t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn || t == Tag.ForInf ||
+      t == Tag.WhileStmt || t == Tag.SwitchStmt || t == Tag.SelectStmt) { return false }
+  if (t == Tag.Block || t == Tag.StmtList) {
+    for s of kidsOf(c.tree, node) {
+      if (vContainsOwnBreak(c, s, depth + 1)) { return true }
+    }
+    return false
+  }
+  if (t == Tag.IfStmt) {
+    let k = kidsOf(c.tree, node) // [cond, then, else]
+    if (vContainsOwnBreak(c, k[1], depth + 1)) { return true }
+    if (k[2] != 0) { return vContainsOwnBreak(c, k[2], depth + 1) }
+    return false
+  }
+  return false
+}
+
+// Any statement in a block/stmt-list diverges.
+function vBlockDiverges(c: Checker, node: int, countBrk: bool): bool {
+  for s of kidsOf(c.tree, node) {
+    if (vDiverges(c, s, countBrk)) { return true }
+  }
+  return false
+}
+
+// Does executing `node` guarantee control never falls through past it? (§10.3)
+function vDiverges(c: Checker, node: int, countBrk: bool): bool {
+  if (node == 0) { return false }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.ReturnStmt || t == Tag.FailStmt) { return true }
+  if (t == Tag.BreakStmt || t == Tag.ContinueStmt) { return countBrk }
+  if (t == Tag.Block) { return vBlockDiverges(c, node, countBrk) }
+  if (t == Tag.ExprStmt) { return vIsPanicCall(c, kidsOf(c.tree, node)[0]) }
+  if (t == Tag.IfStmt) {
+    let k = kidsOf(c.tree, node) // [cond, then, else]
+    if (k[2] == 0) { return false }
+    return vDiverges(c, k[1], countBrk) && vDiverges(c, k[2], countBrk)
+  }
+  if (t == Tag.WhileStmt) {
+    let k = kidsOf(c.tree, node) // [cond, body]
+    if (vIsTrueLit(c, k[0])) { return !vContainsOwnBreak(c, k[1], 0) }
+    return false
+  }
+  if (t == Tag.ForInf) { return !vContainsOwnBreak(c, kidsOf(c.tree, node)[0], 0) }
+  if (t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn) { return false }
+  if (t == Tag.SwitchStmt) {
+    let k = kidsOf(c.tree, node) // [subject, case_list]
+    let hasDefault = false
+    let all = true
+    for cse of kidsOf(c.tree, k[1]) {
+      let ct = getNode(c.tree, cse).tag
+      if (ct == Tag.SwitchCase) {
+        if (!vBlockDiverges(c, kidsOf(c.tree, cse)[1], countBrk)) { all = false }
+      } else if (ct == Tag.SwitchDefault) {
+        hasDefault = true
+        if (!vBlockDiverges(c, kidsOf(c.tree, cse)[0], countBrk)) { all = false }
+      }
+    }
+    return hasDefault && all
+  }
+  if (t == Tag.MatchStmt) {
+    let k = kidsOf(c.tree, node) // [subject, arm_list]
+    let arms = kidsOf(c.tree, k[1])
+    if (len(arms) == 0) { return false }
+    for arm of arms {
+      if (!vDiverges(c, kidsOf(c.tree, arm)[1], countBrk)) { return false }
+    }
+    return true
+  }
+  if (t == Tag.SelectStmt) {
+    let clauses = kidsOf(c.tree, node)
+    if (len(clauses) == 0) { return true } // `select {}` blocks forever
+    for cl of clauses {
+      let clt = getNode(c.tree, cl).tag
+      let body = 0
+      if (clt == Tag.CommCase) {
+        body = kidsOf(c.tree, cl)[1]
+      } else if (clt == Tag.CommDefault) {
+        body = kidsOf(c.tree, cl)[0]
+      } else {
+        continue
+      }
+      if (!vBlockDiverges(c, body, countBrk)) { return false }
+    }
+    return true
+  }
+  return false
+}
+
 // Validates one function's body. Called src `checkModule`'s sweep as it reaches
 // the FuncDecl node — see this file's header for why that is the only point
 // where `env` holds this function's bindings and no other's.
@@ -417,4 +545,11 @@ function vFuncDecl(c: Checker, node: int) {
     result = unwrapFallible(c, declared)
   }
   vStmt(c, result, kids[5], 0, 0, fallible)
+  // E0055 (§10.3): a non-void function must return on every path. `result` is
+  // already the unwrapped ok type; an unresolved result (0) is skipped so an
+  // inference gap never becomes a spurious diagnostic.
+  if (result != c.ctx.voidId && result != 0 && !vDiverges(c, kids[5], false)) {
+    reportNoHint(c.diags, ecMissingReturn, vSpan(c, kids[1]),
+      "missing return: not every path returns a value")
+  }
 }
