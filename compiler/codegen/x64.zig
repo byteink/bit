@@ -1774,6 +1774,7 @@ const rt_symbol = std.EnumArray(ir.RtFn, []const u8).init(.{
     .os_exit = "bit_rt_os_exit",
     .os_run = "bit_rt_os_run",
     .os_run_test = "bit_rt_os_run_test",
+    .host_target = "bit_rt_host_target",
     .random_bytes = "bit_rt_random_bytes",
     .secure_zero = "bit_rt_secure_zero",
     .parse_float = "bit_rt_parse_float",

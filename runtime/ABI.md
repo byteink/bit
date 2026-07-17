@@ -485,6 +485,7 @@ fallible surface form), so codegen never checks a return value.
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 | `bit_rt_os_run`       | `(path: *const RtBytes) -> i64` (§19)                  |
 | `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
+| `bit_rt_host_target`  | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
 | `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
@@ -878,6 +879,7 @@ bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure
 bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i
+bit_rt_host_target()       -> i64              // host BuildTarget ordinal (0/1/2)
 ```
 
 `argc`/`argv`/`envp` are captured by the process entry (§9) on both the raw-stack
@@ -889,6 +891,12 @@ captured `envp`, and returns its exit code (`-1` on any failure or abnormal
 termination). It is `bit run`/`bit test`'s launcher — `fork` + immediate `execve`
 (Linux: raw syscalls; Darwin: libSystem), the only work between fork and exec, so
 it is safe with scheduler worker threads live.
+
+`bit_rt_host_target` returns the ordinal of the `BuildTarget` this binary's own
+host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos`). The runtime
+archive is compiled once per target, so it answers from its own `builtin.target`
+— the compile-time host constant the self-hosted compiler has no other way to see.
+It is the default `bit build`/`bit run` target when `--target` is absent.
 
 `bit_rt_os_run_test` is the same fork+exec launcher with `BIT_TEST_INDEX=<idx>`
 prepended to the child's environment (first match wins, so it overrides any

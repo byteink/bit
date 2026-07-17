@@ -2768,6 +2768,9 @@ const Checker = struct {
         // `osRunTest(path: string, idx: i64) -> i64`: run `path` with
         // `BIT_TEST_INDEX=idx` set, for the `bit test` per-test exec loop.
         .{ "osRunTest", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        // `hostTarget() -> i64`: the host BuildTarget ordinal, for `bit build`'s
+        // default target (selfhost/main.bit's hostBuildTarget reads it).
+        .{ "hostTarget", PrimSig{ .params = &.{}, .ret = .i64 } },
         .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
         .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
     });

@@ -184,6 +184,10 @@ pub const RtFn = enum {
     /// in the child's environment so the test binary's synthetic `main` runs the
     /// one test named by `idx`. The `bit test` runner calls it once per test.
     os_run_test,
+    /// `host_target() -> i64`: the BuildTarget ordinal of the host this binary
+    /// runs on (0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos). The runtime
+    /// archive is per-target, so it answers from its own `builtin.target`.
+    host_target,
     /// Non-blocking TCP (ABI.md §20), under `std/net`. Any of these may park the
     /// calling green thread on the netpoller; none blocks an OS thread.
     /// `net_listen(host, port) -> fd`; `net_local_port(fd) -> port` (recovers the

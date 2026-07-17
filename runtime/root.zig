@@ -836,6 +836,21 @@ export fn bit_rt_os_run_test(path: *const RtBytes, idx: i64) callconv(.c) i64 {
     }
 }
 
+/// `bit_rt_host_target()` (ABI.md §19): the BuildTarget ordinal of the host this
+/// binary runs on — 0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos, matching
+/// selfhost/main.bit's BuildTarget enum. This archive is compiled once per
+/// target, so `builtin.target` here IS the host: bit2 has no compile-time
+/// `builtin`, so its `hostTarget()` default reads this instead of hard-coding.
+export fn bit_rt_host_target() callconv(.c) i64 {
+    return switch (builtin.target.os.tag) {
+        .macos => 2,
+        else => switch (builtin.target.cpu.arch) {
+            .aarch64 => 1,
+            else => 0,
+        },
+    };
+}
+
 /// `bit_rt_fs_close`: close `fd`. Always reports success (the raw close wrapper
 /// swallows `EINTR`/`EBADF`); a caller that must know uses the fd's own errors.
 ///

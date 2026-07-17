@@ -2608,6 +2608,7 @@ const FnCtx = struct {
         .{ "fsChmod", ir.RtFn.fs_chmod },
         .{ "osRun", ir.RtFn.os_run },
         .{ "osRunTest", ir.RtFn.os_run_test },
+        .{ "hostTarget", ir.RtFn.host_target },
         .{ "floatBits", ir.RtFn.float_bits },
         .{ "float32Bits", ir.RtFn.float32_bits },
     });
