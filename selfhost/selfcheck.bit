@@ -3327,6 +3327,24 @@ function xHexHas(b: X64Buf, hex: string): bool {
   return false
 }
 
+// How many times the hex sequence `hex` occurs in `b`. Presence alone cannot
+// distinguish "loaded once" from "reloaded after a clobbering call".
+function xHexCount(b: X64Buf, hex: string): int {
+  let h = xHex(b)
+  if (len(hex) == 0) {
+    return 0
+  }
+  let n = 0
+  let i = 0
+  while (i + len(hex) <= len(h)) {
+    if (h[i:i + len(hex)] == hex) {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
 // The bytes of `b`, as lowercase hex, for comparing against an objdump line.
 function xHex(b: X64Buf): string {
   let out = ""
@@ -4988,6 +5006,222 @@ function checkX64GcAlloc() {
   assert(len(cf.relocs) == 1 && cf.relocs[0].symbol == "target")
 }
 
+// A ctx carrying a real IrFunc, so the marshalling paths can classify values by
+// type. `types` gives one type per instruction slot, in value-id order.
+function xFnCtx(types: []int, blocks: []IrBlock): XCtx {
+  let cx = xCallTestCtx()
+  let instrs = []IrInstr(0)
+  for t of types {
+    instrs = append(instrs, mkInstr(Op.ConstInt, t))
+  }
+  cx.f = IrFunc{ name: "f", paramTypes: []int(0), result: 0, blocks: blocks,
+    instrs: instrs, isFallible: false }
+  cx.blockOffsets = [0, 0, 0]
+  return cx
+}
+
+// SysV passes the first six integer arguments in registers; the rest overflow to
+// an outgoing stack area the CALLER reserves and reclaims. The pieces
+// (xStackReserve/xEmitStackArgStore) are unit-tested separately; this pins that
+// xMarshalArgs actually wires them together.
+function checkX64MarshalStackArgs() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  // Seven args, every one spilled, so each source is an rbp-relative load.
+  let types = []int(0)
+  let locs = []RegLoc(0)
+  let args = []int(0)
+  let i = 0
+  while (i < 7) {
+    types = append(types, i64t)
+    locs = append(locs, RegLoc{ isSpill: true, index: i })
+    args = append(args, i)
+    i = i + 1
+  }
+  let cx = xFnCtx(types, [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 7 }])
+  cx.ctx = ctx
+  cx.alloc = RegAllocResult{ locations: locs, numSpillSlots: 8,
+    stackMaps: []StackMapEntry(0) }
+  cx.safepointCodeOffsets = [0]
+  xEmitCallLike(cx, "f7", args, false, 0, 0)
+
+  let h = xHex(cx.buf)
+  // The reserve comes FIRST — before any store into the area it carves, and
+  // before the register moves. 8 bytes of args round up to 16 to keep rsp
+  // 16-aligned at the call boundary.
+  assert(len(h) >= 14 && h[0:14] == "4881ec10000000") // sub $16, %rsp
+  assert(xHexHas(cx.buf, "4881c410000000"))           // add $16, %rsp (reclaimed)
+  assert(len(cx.relocs) == 1 && cx.relocs[0].symbol == "f7")
+  // Exactly one arg overflowed, so exactly one reserve/reclaim pair.
+  assert(xHexCount(cx.buf, "4881ec10000000") == 1)
+  assert(xHexCount(cx.buf, "4881c410000000") == 1)
+
+  // Six args fit entirely in registers: no outgoing area at all.
+  let six = []int(0)
+  let j = 0
+  while (j < 6) {
+    six = append(six, j)
+    j = j + 1
+  }
+  let c6 = xFnCtx(types, [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 7 }])
+  c6.ctx = ctx
+  c6.alloc = RegAllocResult{ locations: locs, numSpillSlots: 8,
+    stackMaps: []StackMapEntry(0) }
+  c6.safepointCodeOffsets = [0]
+  xEmitCallLike(c6, "f6", six, false, 0, 0)
+  assert(!xHexHas(c6.buf, "4881ec10000000"))
+  assert(!xHexHas(c6.buf, "4881c410000000"))
+}
+
+function checkX64CallLike() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let boolt = primType(ctx, 10)
+
+  // A void callee takes no result: nothing may be moved out of rax.
+  let cx = xFnCtx([i64t], [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }])
+  cx.ctx = ctx
+  cx.safepointCodeOffsets = [0]
+  xEmitCallLike(cx, "bit_rt_safepoint", []int(0), false, 0, 0)
+  assert(cx.nextSafepointIdx == 1)
+  assert(xHex(cx.buf) == "e800000000") // just the call — no marshalling, no result
+  assert(cx.safepointCodeOffsets[0] == 5)
+
+  // A bool return MUST be zero-extended: the C ABI returns it in `al` and leaves
+  // rax's upper bits unspecified. bit_rt_string_eq happened to zero eax,
+  // bit_rt_fs_exists did not, and `!fsExists(missing)` silently read false.
+  let cb = xFnCtx([boolt], [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }])
+  cb.ctx = ctx
+  cb.safepointCodeOffsets = [0]
+  xEmitCallLike(cb, "bit_rt_fs_exists", []int(0), true, 0, boolt)
+  assert(xHexHas(cb.buf, "480fb6c0")) // movzbq %al, %rax
+
+  // An i64 return must NOT be — narrowing a real 64-bit value to its low byte
+  // would be a silent truncation.
+  let ci = xFnCtx([i64t], [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }])
+  ci.ctx = ctx
+  ci.safepointCodeOffsets = [0]
+  xEmitCallLike(ci, "bit_rt_time_mono_ns", []int(0), true, 0, i64t)
+  assert(!xHexHas(ci.buf, "480fb6c0"))
+}
+
+// Goldens from clang + llvm-objdump. The indirect-call paths: a closure cell is
+// {code, env} and an interface receiver's TypeInfo is *(recv - 32).
+function checkX64IndirectCalls() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let voidt = ctx.voidId
+  let blocks = [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }]
+
+  // call_value: the cell's CODE is at +0 and its ENV at +8. Swapping them calls
+  // the environment as if it were code.
+  let cx = xFnCtx([i64t, i64t], blocks)
+  cx.ctx = ctx
+  cx.safepointCodeOffsets = [0]
+  xEmitCallValue(cx, 0, voidt, 0, []int(0))
+  assert(xHexHas(cx.buf, "4c8b930800000")) // mov 8(%rbx), %r10   env  at +8
+  assert(xHexHas(cx.buf, "4c8ba30000000")) // mov (%rbx),  %r12   code at +0
+  // env goes in arg0, and the call is INDIRECT through r12 — neither r10 nor r12
+  // is an argument register, so marshalling cannot disturb them.
+  assert(xHexHas(cx.buf, "4c89d7"))        // mov %r10, %rdi
+  assert(xHexHas(cx.buf, "41ffd4"))        // call *%r12
+  assert(cx.nextSafepointIdx == 1)
+  assert(len(cx.relocs) == 0) // an indirect call names no symbol
+
+  // An argument must land in arg1, NOT arg0 — arg0 is reserved for the
+  // environment, which is moved in after marshalling and would overwrite it.
+  let ca = xFnCtx([i64t, i64t], blocks)
+  ca.ctx = ctx
+  ca.safepointCodeOffsets = [0]
+  xEmitCallValue(ca, 0, voidt, 0, [1]) // vreg 1 is spilled
+  assert(xHexHas(ca.buf, "488bb5f0ffffff"))  // mov -16(%rbp), %rsi   -> arg1
+  assert(!xHexHas(ca.buf, "488bbdf0ffffff")) // NOT   ...    , %rdi
+
+  // call_iface: the receiver's TypeInfo lives at *(recv - 32) — the object
+  // header's info field sits BELOW the body pointer (ABI.md §2.1).
+  let ci = xFnCtx([i64t, i64t], blocks)
+  ci.ctx = ctx
+  ci.safepointCodeOffsets = [0]
+  xEmitCallIface(ci, 0, voidt, 0, 7, []int(0))
+  assert(xHexHas(ci.buf, "4c8b93e0ffffff")) // mov -32(%rbx), %r10
+  assert(xHexHas(ci.buf, "48c7c607000000")) // mov $7, %rsi        the method id
+  assert(ci.relocs[0].symbol == "bit_rt_iface_lookup")
+  assert(xHexHas(ci.buf, "4989c4"))         // mov %rax, %r12      stash the target
+  assert(xHexHas(ci.buf, "41ffd4"))         // call *%r12
+  // Only the METHOD call is a safepoint — the lookup itself never collects.
+  assert(ci.nextSafepointIdx == 1)
+
+  // A SPILLED receiver must be RELOADED after the lookup: xGetInt hands it back
+  // in scratch1 (r11), which the lookup call clobbers. With the receiver in a
+  // callee-saved register the reload is a no-op, so only the spilled case can
+  // tell a correct emitter from one that reuses the stale register.
+  let cs = xFnCtx([i64t, i64t], blocks)
+  cs.ctx = ctx
+  cs.safepointCodeOffsets = [0]
+  xEmitCallIface(cs, 0, voidt, 1, 7, []int(0)) // vreg 1 is spilled
+  assert(xHexCount(cs.buf, "4c8b9df0ffffff") == 2) // mov -16(%rbp), %r11  TWICE
+  assert(xHexHas(cs.buf, "4d8b93e0ffffff"))        // mov -32(%r11), %r10
+}
+
+function checkX64ControlFlow() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  // Two blocks: block 0 (one instr), block 1 (one param + one instr).
+  let blocks = [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 },
+    IrBlock{ instsStart: 1, paramCount: 1, instsLen: 2 }]
+
+  // A FORWARD jump polls nothing — only a back-edge needs the collector.
+  let cx = xFnCtx([i64t, i64t, i64t], blocks)
+  cx.ctx = ctx
+  cx.safepointCodeOffsets = [0]
+  cx.curBlock = 0
+  xEmitJump(cx, 1, [0])
+  assert(cx.nextSafepointIdx == 0)
+  assert(!xHexHas(cx.buf, "e8")) // no call at all
+
+  // A BACK-edge polls the collector before the edge moves, so an allocation-free
+  // loop still yields. The poll is a call: running it after the moves would
+  // observe a half-written param set.
+  let cb = xFnCtx([i64t, i64t, i64t], blocks)
+  cb.ctx = ctx
+  cb.safepointCodeOffsets = [0]
+  cb.curBlock = 1
+  xEmitJump(cb, 1, [0]) // target == curBlock: a self-loop
+  assert(cb.nextSafepointIdx == 1)
+  assert(cb.relocs[0].symbol == "bit_rt_safepoint")
+  // The poll precedes the jmp, and its safepoint sits at the call's return
+  // address (offset 5), not at the end of the emitted edge.
+  assert(cb.safepointCodeOffsets[0] == 5)
+
+  // A br tests the condition against ITSELF — `test r,r` sets ZF iff r is zero,
+  // which is the whole condition; comparing against an immediate would need an
+  // extra materialization.
+  let cr = xFnCtx([i64t, i64t, i64t], blocks)
+  cr.ctx = ctx
+  cr.safepointCodeOffsets = [0, 0]
+  cr.curBlock = 0
+  xEmitBr(cr, 0, 1, [0], 1, [0])
+  assert(xHexHas(cr.buf, "4885db")) // test %rbx, %rbx  (vreg 0 lives in rbx)
+  assert(cr.nextSafepointIdx == 0)  // both targets are forward
+
+  // ret moves the value into the ABI return register, then runs the epilogue —
+  // in that order. The epilogue pops the callee-saved registers, so computing the
+  // return value after it would read restored (caller-owned) values.
+  let cq = xFnCtx([i64t], [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }])
+  cq.ctx = ctx
+  assert(xEmitRet(cq, [0]))
+  assert(xHexHas(cq.buf, "4889d8")) // mov %rbx, %rax  BEFORE the pops
+  assert(xHexHas(cq.buf, "5b"))     // pop %rbx
+  assert(xHexHas(cq.buf, "c3"))     // ret
+  let hexq = xHex(cq.buf)
+  assert(len(hexq) >= 6 && hexq[0:6] == "4889d8") // the move is FIRST
+
+  // A multi-value ret has no settled packing: refuse rather than emit something.
+  let cm = xFnCtx([i64t, i64t], [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }])
+  cm.ctx = ctx
+  assert(!xEmitRet(cm, [0, 1]))
+}
+
 function checkX64CallHelpers() {
   // A safepoint is recorded at the RETURN ADDRESS — the offset AFTER the call —
   // because that is what the collector's stack walker looks a frame up by
@@ -5300,6 +5534,10 @@ function selfcheck() {
   checkX64FieldSel()
   checkX64Prologue()
   checkX64Epilogue()
+  checkX64MarshalStackArgs()
+  checkX64IndirectCalls()
+  checkX64CallLike()
+  checkX64ControlFlow()
   checkX64ValueSelectors()
   checkX64GcAlloc()
   checkX64CallHelpers()

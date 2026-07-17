@@ -742,9 +742,26 @@ struct XCtx {
   // threading a slice back out.
   safepointCodeOffsets: []int,
   nextSafepointIdx: int,
+  // The function being compiled, plus the shared type context and module.
+  // Marshalling and block-param moves classify each value by its TYPE (which
+  // bank it goes in) — something the width-carrying selectors never needed.
+  f: IrFunc,
+  ctx: TypeContext,
+  module: IrModule,
+}
+
+// The register class a value id belongs to — which bank marshals it.
+function xValueClass(cx: XCtx, v: int): RegClass {
+  return regClassOf(cx.ctx, cx.f.instrs[v].ty)
+}
+
+function xEmptyIrFunc(): IrFunc {
+  return IrFunc{ name: "", paramTypes: []int(0), result: 0, blocks: []IrBlock(0),
+    instrs: []IrInstr(0), isFallible: false }
 }
 
 function newXCtx(cc: XCallConv): XCtx {
+  let ctx = newTypeContext()
   return XCtx{ buf: newX64Buf(), cc: cc, relocs: []Reloc(0), fixups: []XJumpFixup(0),
     blockOffsets: []int(0),
     alloc: RegAllocResult{ locations: []RegLoc(0), numSpillSlots: 0,
@@ -752,7 +769,10 @@ function newXCtx(cc: XCallConv): XCtx {
     intRegs: []XReg64(0), floatRegs: []XmmReg(0),
     frame: XFrame{ savedGpr: []XReg64(0), savedXmm: []XmmReg(0), numSpillSlots: 0,
       frameSize: 0 },
-    curBlock: 0, safepointCodeOffsets: []int(0), nextSafepointIdx: 0 }
+    curBlock: 0, safepointCodeOffsets: []int(0), nextSafepointIdx: 0,
+    f: xEmptyIrFunc(), ctx: ctx,
+    module: IrModule{ funcs: []IrFunc(0), ctx: ctx, stringPool: []string(0),
+      methodTables: []MethodTable(0), stubbed: []string(0) } }
 }
 
 // `call <symbol>` — `E8 rel32` with a zero placeholder and a relocation naming
@@ -803,6 +823,17 @@ function xJmpRel32(cx: XCtx, target: int) {
 
 function xJccRel32(cx: XCtx, cc: int, target: int) {
   xJumpFixup(cx, [0x0F, 0x80 | cc & 0xF], target)
+}
+
+// A conditional jump whose destination is not a block but a point in this same
+// function (a br's skip-over). Returns the rel32 field's offset for
+// xPatchRel32Here; it takes no block target, so it registers no fixup.
+function xJccRel32Placeholder(cx: XCtx, cc: int): int {
+  xEmitByte(cx.buf, 0x0F)
+  xEmitByte(cx.buf, 0x80 | cc & 0xF)
+  let off = len(cx.buf.code)
+  xEmitU32(cx.buf, 0)
+  return off
 }
 
 // Writes a rel32 at `patchOffset` so control lands at `targetOff`. The
@@ -1752,6 +1783,15 @@ function xArg0(cc: XCallConv): XReg64 {
   return XReg64.Rdi
 }
 
+// The second argument register — needed by the interface path, which passes
+// (typeinfo, methodId) to bit_rt_iface_lookup.
+function xArg1(cc: XCallConv): XReg64 {
+  if (cc == XCallConv.Win64) {
+    return XReg64.Rdx
+  }
+  return XReg64.Rsi
+}
+
 // A closure value is a pointer to a 16-byte GC cell {code_ptr, env_ptr}: the
 // code pointer at +0 (into .text, never a GC reference) and the captured
 // environment at +8 (the cell's one GC field). Keeping a closure one word lets
@@ -1762,6 +1802,314 @@ function xClosureCellSize(): int {
 
 function xClosureCellPtrOffsets(): []int {
   return [8]
+}
+
+// ---------------------------------------------------------------------------
+// Argument marshalling, calls, and control flow
+// ---------------------------------------------------------------------------
+
+// Marshals `args` into the argument registers, starting at positional slot
+// `basePosition` with the banks already `baseIntOrd`/`baseFloatOrd` deep.
+// xEmitCallLike passes all zeros (a plain call); the closure/interface paths pass
+// 1,1,0 to reserve arg0 for the environment or receiver they move in afterwards.
+//
+// Arguments past the ABI banks (SysV: the 7th+ int/ref, 9th+ float) overflow to
+// the stack: reserve a 16-byte-aligned outgoing area with `sub rsp`, store each
+// at [rsp + 8*k] in argument order so the callee reads them contiguously above
+// its return address, then do the register moves. Returns the reserved byte count
+// for the caller to reclaim with `add rsp` right after the call.
+//
+// Every source is guaranteed callee-saved-or-spill — a function containing any
+// safepoint restricts its whole file to the callee-saved subset — so these
+// parallel moves can never collide with the argument registers they target.
+function xMarshalArgs(cx: XCtx, args: []int, basePosition: int, baseIntOrd: int,
+    baseFloatOrd: int): int {
+  let intMoves = []PMove(0)
+  let floatMoves = []PMove(0)
+  let stackArgs = []XStackArg(0)
+  let intOrdinal = baseIntOrd
+  let floatOrdinal = baseFloatOrd
+  let stackIndex = 0
+  let i = 0
+  while (i < len(args)) {
+    let class = xValueClass(cx, args[i])
+    let ordinal = intOrdinal
+    if (class == RegClass.Float) {
+      ordinal = floatOrdinal
+    }
+    let src = xPlocOf(cx, args[i], class)
+    let reg = xArgReg(cx.cc, class, basePosition + i, ordinal)
+    if (reg >= 0) {
+      if (class == RegClass.Int) {
+        intMoves = append(intMoves, PMove{ src: src, dst: plocReg(reg) })
+      } else {
+        floatMoves = append(floatMoves, PMove{ src: src, dst: plocReg(reg) })
+      }
+    } else {
+      stackArgs = append(stackArgs, XStackArg{ src: src, class: class, offset: 8 * stackIndex })
+      stackIndex = stackIndex + 1
+    }
+    if (class == RegClass.Int) {
+      intOrdinal = intOrdinal + 1
+    } else {
+      floatOrdinal = floatOrdinal + 1
+    }
+    i = i + 1
+  }
+
+  let reserve = 0
+  if (stackIndex > 0) {
+    reserve = xStackReserve(stackIndex)
+    xRspAddSub(cx.buf, true, reserve)
+    // Before the register moves: those recycle scratch1/scratch2 as parallel-move
+    // temps, while a stack store only reads a source and writes the outgoing
+    // area, so doing them first can never clobber a pending move's source.
+    for sa of stackArgs {
+      xEmitStackArgStore(cx, sa)
+    }
+  }
+  xSequentializeAndEmit(cx, intMoves, RegClass.Int)
+  xSequentializeAndEmit(cx, floatMoves, RegClass.Float)
+  return reserve
+}
+
+// Moves a call's return value out of rax/xmm0 into `dst`.
+function xTakeCallResult(cx: XCtx, dst: int, retTy: int) {
+  if (regClassOf(cx.ctx, retTy) == RegClass.Float) {
+    xPutFloat(cx, dst, XmmReg.Xmm0)
+    return
+  }
+  // The C ABI returns a bool in `al` and leaves rax's upper bits UNSPECIFIED —
+  // the same hazard ABI.md §2 records for a u8 return. A Bit bool is a full-width
+  // 0/1 because `!b` and the branch tests read the whole register, so normalize
+  // here, at the one boundary where a foreign callee's convention meets ours.
+  // Whether a given callee happens to zero eax is not something to rely on:
+  // bit_rt_string_eq did, bit_rt_fs_exists did not, and `!fsExists(missing)`
+  // silently evaluated to false.
+  if (xIsBoolTy(cx.ctx, retTy)) {
+    xMovzxb(cx.buf, XReg64.Rax, XReg64.Rax)
+  }
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// Whether `ty` is the bool primitive — the one integer-class type whose return
+// register a C callee may leave partially undefined.
+function xIsBoolTy(ctx: TypeContext, ty: int): bool {
+  return ctx.types[ty].kind == TypeKind.Prim && ctx.types[ty].prim == 10
+}
+
+// A direct `call`/`rt_call`: marshal, call, record the safepoint, reclaim, then
+// take the result. `hasRet` is false for a void callee (Bit has no optionals).
+function xEmitCallLike(cx: XCtx, symbol: string, args: []int, hasRet: bool, dst: int,
+    retTy: int) {
+  let argReserve = xMarshalArgs(cx, args, 0, 0, 0)
+  // Win64's 32-byte home space is reserved around just this call site rather than
+  // baked into the frame: every other stack slot codegen touches is rbp-relative,
+  // so a transient rsp shift never disturbs spill/local addressing. 32 is
+  // 16-aligned, so the frame's alignment survives.
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReloc(cx, symbol)
+  // The return address: the byte right after the call, BEFORE any home-space or
+  // outgoing-arg teardown. Recording it after an `add rsp` pushes it past the
+  // real return address and corrupts every stack-map lookup during a GC the
+  // callee triggers.
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  if (argReserve > 0) {
+    xRspAddSub(cx.buf, false, argReserve)
+  }
+  if (hasRet) {
+    xTakeCallResult(cx, dst, retTy)
+  }
+}
+
+// `call_value`: dispatch through a closure cell {code, env}. The env and code are
+// loaded into scratch2/scratch3 (r10/r12) — neither is an argument register, so
+// marshalling cannot disturb them, and r11 stays free as the move-cycle temp.
+function xEmitCallValue(cx: XCtx, dst: int, ty: int, callee: int, args: []int) {
+  let cell = xGetInt(cx, callee, xScratch1())
+  xMovLoad(cx.buf, xScratch2(), xMemB(cell, 8), 8, false) // r10 = env
+  xMovLoad(cx.buf, xScratch3(), xMemB(cell, 0), 8, false) // r12 = code
+  let argReserve = xMarshalArgs(cx, args, 1, 1, 0)        // arg0 reserved for env
+  xMovRR(cx.buf, xArg0(cx.cc), xScratch2())
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReg(cx, xScratch3())
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  if (argReserve > 0) {
+    xRspAddSub(cx.buf, false, argReserve)
+  }
+  if (cx.ctx.types[ty].kind != TypeKind.Void) {
+    xTakeCallResult(cx, dst, ty)
+  }
+}
+
+// `call_iface`: structural interface dispatch (ABI.md §2.1). Load the receiver's
+// TypeInfo (*(recv - 32), the header's info field), resolve the method id to a
+// code address via bit_rt_iface_lookup, then call it with the receiver as arg0.
+// The lookup never collects, so only the final indirect call records a safepoint.
+// The receiver is RELOADED after the lookup: its home is a callee-saved register
+// or a spill slot, both of which survive the call, but scratch1 does not.
+function xEmitCallIface(cx: XCtx, dst: int, ty: int, ifaceVal: int, methodId: int,
+    args: []int) {
+  let recv = xGetInt(cx, ifaceVal, xScratch1())
+  xMovLoad(cx.buf, xScratch2(), xMemB(recv, -32), 8, false) // r10 = *(recv - 32)
+  xMovRR(cx.buf, xArg0(cx.cc), xScratch2())
+  xMovRI(cx.buf, xArg1(cx.cc), methodId)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReloc(cx, "bit_rt_iface_lookup") // rax = the method's code address
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  xMovRR(cx.buf, xScratch3(), XReg64.Rax) // r12 = fn, survives marshalling
+  let argReserve = xMarshalArgs(cx, args, 1, 1, 0)
+  let recv2 = xGetInt(cx, ifaceVal, xScratch1())
+  xMovRR(cx.buf, xArg0(cx.cc), recv2)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReg(cx, xScratch3())
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  if (argReserve > 0) {
+    xRspAddSub(cx.buf, false, argReserve)
+  }
+  if (cx.ctx.types[ty].kind != TypeKind.Void) {
+    xTakeCallResult(cx, dst, ty)
+  }
+}
+
+// A block's params are written by each predecessor's edge move — all at once, as
+// one parallel move per class, because a param may still be READ as another
+// param's source in the same edge.
+function xEmitParamMoves(cx: XCtx, target: int, args: []int) {
+  let blk = cx.f.blocks[target]
+  let intMoves = []PMove(0)
+  let floatMoves = []PMove(0)
+  let p = 0
+  while (p < blk.paramCount) {
+    let paramVal = blk.instsStart + p
+    let class = xValueClass(cx, paramVal)
+    let mv = PMove{ src: xPlocOf(cx, args[p], class), dst: xPlocOf(cx, paramVal, class) }
+    if (class == RegClass.Int) {
+      intMoves = append(intMoves, mv)
+    } else {
+      floatMoves = append(floatMoves, mv)
+    }
+    p = p + 1
+  }
+  xSequentializeAndEmit(cx, intMoves, RegClass.Int)
+  xSequentializeAndEmit(cx, floatMoves, RegClass.Float)
+}
+
+// Binds the incoming argument registers into the entry block's param vregs — the
+// mirror of xEmitParamMoves, with the ABI argument registers as sources instead
+// of another block's values. Without it the entry params hold whatever the
+// allocator left in their registers, so every function that reads its own
+// parameters returns garbage. Emitted right after the prologue, whose only
+// register writes are callee-saved GPRs and rbp/rsp — never an argument register
+// — so the incoming values are still live.
+function xBindIncomingArgs(cx: XCtx) {
+  let entry = cx.f.blocks[0]
+  let intMoves = []PMove(0)
+  let floatMoves = []PMove(0)
+  let intOrdinal = 0
+  let floatOrdinal = 0
+  let stackIndex = 0
+  let p = 0
+  while (p < entry.paramCount) {
+    let paramVal = entry.instsStart + p
+    let class = xValueClass(cx, paramVal)
+    let ordinal = intOrdinal
+    if (class == RegClass.Float) {
+      ordinal = floatOrdinal
+    }
+    let dst = xPlocOf(cx, paramVal, class)
+    let reg = xArgReg(cx.cc, class, p, ordinal)
+    // The mirror of xMarshalArgs: the first six int / eight float params arrive in
+    // the ABI registers; the rest were pushed by the caller and now sit just above
+    // the saved rbp and return address, at [rbp+16], [rbp+24], … in argument
+    // order (a non-register PLoc reads rbp-relative).
+    let src = plocReg(reg)
+    if (reg < 0) {
+      src = plocMem(16 + 8 * stackIndex)
+      stackIndex = stackIndex + 1
+    }
+    let mv = PMove{ src: src, dst: dst }
+    if (class == RegClass.Int) {
+      intMoves = append(intMoves, mv)
+      intOrdinal = intOrdinal + 1
+    } else {
+      floatMoves = append(floatMoves, mv)
+      floatOrdinal = floatOrdinal + 1
+    }
+    p = p + 1
+  }
+  xSequentializeAndEmit(cx, intMoves, RegClass.Int)
+  xSequentializeAndEmit(cx, floatMoves, RegClass.Float)
+}
+
+// A back-edge polls the collector BEFORE the edge moves: the poll is a call, and
+// the moves may leave a param mid-write.
+function xEmitJump(cx: XCtx, target: int, args: []int) {
+  if (isBackEdge(cx.curBlock, target)) {
+    xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0)
+  }
+  xEmitParamMoves(cx, target, args)
+  xJmpRel32(cx, target)
+}
+
+function xEmitBr(cx: XCtx, cond: int, thenBlk: int, thenArgs: []int, elseBlk: int,
+    elseArgs: []int) {
+  let c = xGetInt(cx, cond, xScratch1())
+  xTestRR(cx.buf, c, c)
+  // Jump over the then-path when the condition is ZERO. The edge moves must sit
+  // on their own side of this branch — emitting them before it would run the
+  // then-edge's moves on the else path too.
+  let skipOff = xJccRel32Placeholder(cx, ccE())
+  if (isBackEdge(cx.curBlock, thenBlk)) {
+    xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0)
+  }
+  xEmitParamMoves(cx, thenBlk, thenArgs)
+  xJmpRel32(cx, thenBlk)
+  xPatchRel32Here(cx, skipOff)
+  if (isBackEdge(cx.curBlock, elseBlk)) {
+    xEmitCallLike(cx, safepointSymbol(), []int(0), false, 0, 0)
+  }
+  xEmitParamMoves(cx, elseBlk, elseArgs)
+  xJmpRel32(cx, elseBlk)
+}
+
+// A multi-value ret is out of scope — codegen has not settled a packing.
+function xEmitRet(cx: XCtx, vals: []int): bool {
+  if (len(vals) > 1) {
+    return false
+  }
+  if (len(vals) == 1) {
+    let v = vals[0]
+    if (xValueClass(cx, v) == RegClass.Float) {
+      let r = xGetFloat(cx, v, xFScratch1())
+      xMovFRR(cx.buf, XmmReg.Xmm0, r, widthOf(cx.ctx, cx.f.instrs[v].ty).bytes)
+    } else {
+      let r = xGetInt(cx, v, xScratch1())
+      xMovRR(cx.buf, XReg64.Rax, r)
+    }
+  }
+  xEmitEpilogue(cx)
+  xRet(cx.buf)
+  return true
 }
 
 // ---------------------------------------------------------------------------
