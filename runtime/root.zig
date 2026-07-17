@@ -57,6 +57,12 @@ var g_environ: std.process.Environ = .empty;
 var g_argc: usize = 0;
 var g_argv: [*]const ?[*:0]const u8 = undefined;
 
+/// The process's own `envp`, NUL-terminated, captured by `rtStartMain` so
+/// `bit_rt_os_run` can hand it to `execve` — a `bit run`/`bit test` child must
+/// inherit the environment (config-from-env, `BIT_TEST_INDEX`, ...). Set on the
+/// same line as `g_argv`, so it is live before any Bit code runs.
+var g_envp: [*:null]const ?[*:0]const u8 = undefined;
+
 /// Compiled `main`'s normalized ABI shape (ABI.md §10): codegen wraps
 /// whichever of the three surface `main` signatures (SPEC.md §17.4) the
 /// program declares into this one form, returning the process exit code.
@@ -718,6 +724,56 @@ export fn bit_rt_fs_chmod(path: *const RtBytes, mode: i64) callconv(.c) i64 {
     var buf: [max_path]u8 = undefined;
     const p = pathZ(path, &buf) orelse return -1;
     return if (sched.chmodAt(p, @intCast(mode))) 0 else -1;
+}
+
+/// `bit_rt_os_run`: run the executable at `path` as a child process — inheriting
+/// this process's environment — and return its exit code (or -1 on any failure
+/// or abnormal termination). `bit run`/`bit test`'s primitive: after writing the
+/// compiled binary it must launch it and report the status.
+///
+/// fork + immediate exec is the ONLY work between fork and exec, so it is safe
+/// even with scheduler worker threads live: the child touches only
+/// async-signal-safe syscalls and stack data computed before the fork (`pathZ`
+/// already copied the path). On failure to exec, the child `_exit`s 127 (the
+/// shell's "command not found"), never returning into forked runtime state.
+export fn bit_rt_os_run(path: *const RtBytes) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    const child_argv = [_:null]?[*:0]const u8{p};
+    // Linux is no-libc (raw syscalls); Darwin routes through libSystem — the same
+    // split `rawExit` makes. `std.posix` has no fork/execve/waitpid wrappers.
+    switch (builtin.os.tag) {
+        .linux => {
+            const forked: isize = @bitCast(std.os.linux.fork());
+            if (forked < 0) return -1;
+            if (forked == 0) {
+                _ = std.os.linux.execve(p, &child_argv, g_envp);
+                rawExit(127);
+            }
+            var status: u32 = 0;
+            var tries: usize = 0;
+            while (tries < 256) : (tries += 1) { // bounded EINTR retry (Power of 10)
+                const w: isize = @bitCast(std.os.linux.waitpid(@intCast(forked), &status, 0));
+                if (w >= 0) break;
+                if (@as(usize, @intCast(-w)) != @intFromEnum(std.os.linux.E.INTR)) return -1;
+            }
+            if (std.os.linux.W.IFEXITED(status)) return @intCast(std.os.linux.W.EXITSTATUS(status));
+            return -1;
+        },
+        else => {
+            const pid = std.c.fork();
+            if (pid < 0) return -1;
+            if (pid == 0) {
+                _ = std.c.execve(p, &child_argv, g_envp);
+                rawExit(127);
+            }
+            var status: c_int = 0;
+            if (std.c.waitpid(pid, &status, 0) < 0) return -1;
+            const us: u32 = @bitCast(status);
+            if (std.c.W.IFEXITED(us)) return @intCast(std.c.W.EXITSTATUS(us));
+            return -1;
+        },
+    }
 }
 
 /// `bit_rt_fs_close`: close `fd`. Always reports success (the raw close wrapper
@@ -1575,6 +1631,7 @@ fn rtStartMain(sp: usize) callconv(.c) noreturn {
 
     const envp_base = argv_base + (argc + 1) * @sizeOf(usize); // past argv[0..argc) and its NULL
     const envp_multi: [*:null]const ?[*:0]const u8 = @ptrFromInt(envp_base);
+    g_envp = envp_multi;
     const envp_slice = std.mem.span(envp_multi);
     const environ = std.process.Environ{ .block = .{ .slice = envp_slice } };
 
@@ -1673,6 +1730,7 @@ fn startEntry() callconv(.naked) noreturn {
 fn machoMain(argc: c_int, argv: [*]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) callconv(.c) c_int {
     g_argc = @intCast(argc);
     g_argv = argv;
+    g_envp = envp;
     const environ = std.process.Environ{ .block = .{ .slice = std.mem.span(envp) } };
     return boot(bit_main, environ) catch fatal("runtime boot failed");
 }
@@ -1714,6 +1772,22 @@ test "boot: propagates a non-zero exit code from main" {
     defer g_booted = false;
     const code = try boot(testMainCode, std.process.Environ.empty);
     try testing.expectEqual(@as(i32, 7), code);
+}
+
+test "os_run: launches a child and returns its exit code" {
+    // The process entry (`rtStartMain`/`machoMain`) that normally sets `g_envp`
+    // does not run in a test build; an empty environment suffices for
+    // `/usr/bin/true`|`/usr/bin/false` (POSIX-standard on Linux and Darwin).
+    const empty = [_:null]?[*:0]const u8{};
+    g_envp = &empty;
+    const yes = RtBytes{ .ptr = "/usr/bin/true".ptr, .len = "/usr/bin/true".len };
+    try testing.expectEqual(@as(i64, 0), bit_rt_os_run(&yes));
+    const no = RtBytes{ .ptr = "/usr/bin/false".ptr, .len = "/usr/bin/false".len };
+    try testing.expectEqual(@as(i64, 1), bit_rt_os_run(&no));
+    // A path that cannot exec fails cleanly (the child `_exit`s 127, reaped as
+    // the child's own "exit code"), never hanging or corrupting the parent.
+    const missing = RtBytes{ .ptr = "/nonexistent/bit-os-run".ptr, .len = "/nonexistent/bit-os-run".len };
+    try testing.expectEqual(@as(i64, 127), bit_rt_os_run(&missing));
 }
 
 test "boot: spawn and channel round-trip through the ABI's exported symbols" {

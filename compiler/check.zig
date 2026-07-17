@@ -2761,6 +2761,10 @@ const Checker = struct {
         // `fsChmod(path: string, mode: i64) -> i64` (0 ok, -1 err) — the
         // self-hosted compiler marks its own output executable.
         .{ "fsChmod", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        // `osRun(path: string) -> i64`: run the executable at `path`, inheriting
+        // the environment, and return its exit code (-1 on failure) — the
+        // self-hosted compiler's `bit run`/`bit test` launch their own output.
+        .{ "osRun", PrimSig{ .params = &.{.string}, .ret = .i64 } },
         .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
         .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
     });

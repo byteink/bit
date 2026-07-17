@@ -176,6 +176,10 @@ pub const RtFn = enum {
     /// `fs_chmod(path, mode) -> i64`: set a file's permission bits (0 ok, -1
     /// err). The self-hosted compiler needs it to mark its output executable.
     fs_chmod,
+    /// `os_run(path) -> i64`: run the executable at `path` as a child, inheriting
+    /// the environment, and return its exit code (-1 on failure). The self-hosted
+    /// compiler's `bit run`/`bit test` launch their own output with it.
+    os_run,
     /// Non-blocking TCP (ABI.md §20), under `std/net`. Any of these may park the
     /// calling green thread on the netpoller; none blocks an OS thread.
     /// `net_listen(host, port) -> fd`; `net_local_port(fd) -> port` (recovers the

@@ -2606,6 +2606,7 @@ const FnCtx = struct {
         .{ "cryptoSecureZero", ir.RtFn.secure_zero },
         .{ "parseFloat", ir.RtFn.parse_float },
         .{ "fsChmod", ir.RtFn.fs_chmod },
+        .{ "osRun", ir.RtFn.os_run },
         .{ "floatBits", ir.RtFn.float_bits },
         .{ "float32Bits", ir.RtFn.float32_bits },
     });
