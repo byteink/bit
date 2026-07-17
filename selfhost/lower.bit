@@ -120,7 +120,14 @@ struct FnCtx {
 // One method as Pass A3 discovers it, before the per-type tables are built.
 struct MethodEntry {
   recvTy: int,
+  // The method's RAW name. Its interface dispatch id is assigned from this, so
+  // two modules' `area` methods share one id and one interface call site can
+  // dispatch to either — the id is global, the symbol is not.
   name: string,
+  // The declaring module's link prefix ("" for the root, else "m<id>$"). The
+  // emitted symbol is prefix + name + "$t<recvType>"; keeping it separate from
+  // `name` is what lets the dispatch id stay module-blind.
+  prefix: string,
 }
 
 struct Lowerer {
@@ -139,6 +146,26 @@ struct Lowerer {
   // Function name -> its func-value trampoline's FuncId (deduped: one trampoline
   // per referenced function).
   fnValueTramps: map<string, int>,
+  // Functions whose bodies could not be lowered and were emitted signature-only.
+  // A stub RETURNS GARBAGE, so a build that produces one is not a build: `bitc2
+  // build` refuses rather than write a binary that silently computes the wrong
+  // answer. The dump surfaces still render stubs — that is how the differential
+  // marks a construct as not yet ported.
+  stubbed: []string,
+  // --- multi-module (#1345) -----------------------------------------------
+  // The link prefix for the module currently being lowered: "" for the root,
+  // else "m<id>$". Set before each module's pass; every emitted function name
+  // goes through it.
+  modPrefix: string,
+  // The root module's id — the module being built. Its names stay bare so
+  // `main` stays `main` and a single-module build is byte-identical to before.
+  root: int,
+  // Named TypeId -> the module that DECLARES it. A method's symbol is prefixed
+  // by its receiver type's module, not by whoever calls it: `s.area()` on an
+  // imported `Shape` must reach `m2$area$t87` from any module. Filled before any
+  // body is lowered, because a free function in Pass A can call a method whose
+  // own decl is not walked until Pass A3.
+  typeModule: map<int, int>,
 }
 
 // Interns a string literal into the module pool as it is emitted, so the pool's
@@ -346,24 +373,46 @@ function cmpOpFor(op: int, isFloat: bool, signed: bool): Op {
   return Op.BlockParam
 }
 
-// Whether a string literal's body uses a `\x`/`\u{…}` byte/codepoint escape,
-// which the simple decoder below cannot yet build. Such a literal falls back.
-// Whether the content range [cstart, cend) uses a `\x`/`\u` byte/codepoint
-// escape the simple decoder cannot build.
-function spanNeedsByteEscape(src: string, cstart: int, cend: int): bool {
-  let i = cstart
-  while (i < cend - 1) {
-    if (src[i] == '\\' && (src[i + 1] == 'x' || src[i + 1] == 'u')) {
-      return true
-    }
-    i = i + 1
+// The value of a hex digit, or -1.
+function hexDigitVal(c: byte): int {
+  if (c >= '0' && c <= '9') {
+    return int(c) - int('0')
   }
-  return false
+  if (c >= 'a' && c <= 'f') {
+    return int(c) - int('a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return int(c) - int('A') + 10
+  }
+  return -1
+}
+
+// Appends `cp` to `s` as UTF-8 — the seed's std.unicode.utf8Encode. A codepoint
+// above U+10FFFF, or a surrogate (U+D800..U+DFFF, which UTF-8 must not encode),
+// is rejected: the caller stops decoding, matching the seed's `catch break`.
+function utf8Append(s: string, cp: int): string {
+  if (cp < 0x80) {
+    return s + string([u8(cp)])
+  }
+  if (cp < 0x800) {
+    return s + string([u8(0xC0 | cp >> 6), u8(0x80 | cp & 0x3F)])
+  }
+  if (cp < 0x10000) {
+    return s + string([u8(0xE0 | cp >> 12), u8(0x80 | cp >> 6 & 0x3F), u8(0x80 | cp & 0x3F)])
+  }
+  return s + string([u8(0xF0 | cp >> 18), u8(0x80 | cp >> 12 & 0x3F),
+    u8(0x80 | cp >> 6 & 0x3F), u8(0x80 | cp & 0x3F)])
+}
+
+// Whether `cp` is encodable as UTF-8: in range, and not a UTF-16 surrogate half.
+function isEncodableCodepoint(cp: int): bool {
+  return cp >= 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)
 }
 
 // Decodes the escape sequences in a content range [cstart, cend), matching the
-// seed's unescapeInner for n/t/r/0 and the literal `\\ " ' $`. ponytail: `\x`/
-// `\u` are screened out by spanNeedsByteEscape before this runs.
+// seed's unescapeInner: `n t r 0`, the literal `\\ " ' $`, `\xNN` (one byte) and
+// `\u{...}` (a codepoint, UTF-8 encoded). A malformed escape stops the decode
+// where the seed's `catch break` does, so both compilers produce the same bytes.
 function decodeEscapes(src: string, cstart: int, cend: int): string {
   let s = ""
   let i = cstart
@@ -388,16 +437,53 @@ function decodeEscapes(src: string, cstart: int, cend: int): string {
       s = s + "\r"
     } else if (e == '0') {
       s = s + "\0"
+    } else if (e == 'x') {
+      // `\xNN`: exactly two hex digits, one raw byte — no UTF-8 encoding, so
+      // `"\xff"` is one 0xFF byte and NOT the two bytes of U+00FF.
+      if (i + 2 > cend) {
+        return s
+      }
+      let hi = hexDigitVal(src[i])
+      let lo = hexDigitVal(src[i + 1])
+      if (hi < 0 || lo < 0) {
+        return s
+      }
+      s = s + string([u8(hi * 16 + lo)])
+      i = i + 2
+    } else if (e == 'u') {
+      // `\u{...}`: hex digits to the closing brace, encoded as UTF-8.
+      if (i >= cend || src[i] != '{') {
+        return s
+      }
+      i = i + 1
+      let cp = 0
+      let digits = 0
+      while (i < cend && src[i] != '}') {
+        let d = hexDigitVal(src[i])
+        if (d < 0) {
+          return s
+        }
+        // Bounded: past U+10FFFF nothing is encodable, so stop rather than
+        // overflow on a long digit run.
+        if (cp > 0x10FFFF) {
+          return s
+        }
+        cp = cp * 16 + d
+        digits = digits + 1
+        i = i + 1
+      }
+      if (digits == 0 || !isEncodableCodepoint(cp)) {
+        return s
+      }
+      if (i < cend) {
+        i = i + 1 // consume '}'
+      }
+      s = utf8Append(s, cp)
     } else {
       s = s + src[i - 1:i]
     }
   }
   return s
-}
-
-// A string literal's body is its span minus the surrounding quotes.
-function stringNeedsByteEscape(src: string, start: int, endPos: int): bool {
-  return spanNeedsByteEscape(src, start + 1, endPos - 1)
 }
 
 function decodeStringContent(src: string, start: int, endPos: int): string {
@@ -713,11 +799,25 @@ function lowerCall(fc: FnCtx, node: int): int {
     }
     let decl = funcDeclLookup(fc.c, name)
     if (decl != 0) {
+      // An imported callee's decl lives in ITS module's tree — `decl` indexes
+      // that arena, so every read of it must go through the owning checker.
+      let oc = declOwner(fc.c, name)
       // A generic call resolves to its monomorphized instance `name$index`, with
       // the call's concrete (substituted) result type.
       if (isGenericFunc(fc.c, name)) {
+        // The instantiation ledger is per-module, so an instance is numbered and
+        // emitted by the module that DECLARES the generic. Calling an imported
+        // generic would number it here and emit it there, under two different
+        // names. Refused loudly rather than lowered to a symbol that does not
+        // exist — cross-module generics need the ledger moved into the shared
+        // TypeContext (the seed's ctx.instantiations).
+        if (oc.moduleId != fc.c.moduleId) {
+          print("bitc2: calling an imported generic function ('${name}') is not supported yet\n")
+          fc.failed = true
+          return 0
+        }
         let idx = instantiationIndex(fc.c, name, genericTypeArgs(fc.c, name, node))
-        let a = lowerArgs(fc, node, lowerParamTypes(fc.c, decl))
+        let a = lowerArgs(fc, node, lowerParamTypes(oc, decl))
         if (fc.failed || idx == -1) {
           fc.failed = true
           return 0
@@ -727,13 +827,14 @@ function lowerCall(fc: FnCtx, node: int): int {
         gi.args = a
         return builderEmit(fc.b, gi)
       }
-      let a = lowerArgs(fc, node, lowerParamTypes(fc.c, decl))
+      let a = lowerArgs(fc, node, lowerParamTypes(oc, decl))
       if (fc.failed) {
         return 0
       }
       // A fallible callee's IR result is its ok type (the error rides the slot).
       let ins = mkInstr(Op.Call, unwrapFallible(fc.c, funcResultLookup(fc.c, name)))
-      ins.name = name
+      // An imported callee lives in ITS module's symbol, not the caller's.
+      ins.name = callQualified(fc.c, fc.lowerer.root, name)
       ins.args = a
       return builderEmit(fc.b, ins)
     }
@@ -775,7 +876,7 @@ function lowerCall(fc: FnCtx, node: int): int {
       if (fc.failed) {
         return 0
       }
-      let ins = mkInstr(Op.CallIface, unwrapFallible(fc.c, methodResultLookup(fc.c, typeName(fc.c.ctx, recvTy) + "." + mname)))
+      let ins = mkInstr(Op.CallIface, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
       ins.lhs = recvV
       ins.ival = methodId(fc.lowerer, mname)
       ins.args = a
@@ -798,8 +899,8 @@ function lowerCall(fc: FnCtx, node: int): int {
         all = append(all, a[j])
         j = j + 1
       }
-      let ins = mkInstr(Op.Call, unwrapFallible(fc.c, methodResultLookup(fc.c, typeName(fc.c.ctx, recvTy) + "." + mname)))
-      ins.name = mname + "\$t${recvTy}"
+      let ins = mkInstr(Op.Call, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
+      ins.name = methodSymbol(fc.lowerer, mname, recvTy)
       ins.args = all
       return builderEmit(fc.b, ins)
     }
@@ -1684,9 +1785,9 @@ function lowerToString(fc: FnCtx, v: int, node: int): int {
     return builderEmit(fc.b, ins)
   }
   // A struct value with a `show()` method stringifies through it (static call).
-  if (td.kind == TypeKind.Struct && methodResultLookup(fc.c, typeName(fc.c.ctx, ty) + ".show") != 0) {
+  if (td.kind == TypeKind.Struct && methodResultLookup(fc.c, "${ty}.show") != 0) {
     let ins = mkInstr(Op.Call, stringTy)
-    ins.name = "show\$t${ty}"
+    ins.name = methodSymbol(fc.lowerer, "show", ty)
     ins.args = [v]
     return builderEmit(fc.b, ins)
   }
@@ -1706,10 +1807,6 @@ function lowerStrInterp(fc: FnCtx, node: int): int {
     let p = parts[i]
     let pn = getNode(fc.c.tree, p)
     if (pn.tag == Tag.StrPart) {
-      if (spanNeedsByteEscape(fc.c.source, pn.span.start, pn.span.end)) {
-        fc.failed = true
-        return 0
-      }
       let cs = mkInstr(Op.ConstString, stringTy)
       cs.sval = decodeEscapes(fc.c.source, pn.span.start, pn.span.end)
       cs.ival = internPoolString(fc, cs.sval)
@@ -1800,10 +1897,6 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
     return builderEmit(fc.b, ins)
   }
   if (tag == Tag.StringLit) {
-    if (stringNeedsByteEscape(fc.c.source, n.span.start, n.span.end)) {
-      fc.failed = true
-      return 0
-    }
     let ins = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
     ins.sval = decodeStringContent(fc.c.source, n.span.start, n.span.end)
     ins.ival = internPoolString(fc, ins.sval)
@@ -3523,7 +3616,46 @@ function lowerDefer(fc: FnCtx, node: int) {
     fc.failed = true
     return
   }
-  let cn = getNode(fc.c.tree, kidsOf(fc.c.tree, call)[0])
+  let callee = kidsOf(fc.c.tree, call)[0]
+  let cn = getNode(fc.c.tree, callee)
+  // `defer recv.method(...)` — the idiom every resource-releasing `defer` uses
+  // (`defer f.close()`). Receiver and arguments are evaluated HERE, at the defer
+  // site; only the call itself is held back to the exit.
+  if (cn.tag == Tag.Member) {
+    let mk = kidsOf(fc.c.tree, callee)
+    let recvTy = checkExprType(fc.c, mk[0])
+    if (recvTy == 0) {
+      fc.failed = true
+      return
+    }
+    let mn = getNode(fc.c.tree, mk[1])
+    let mname = fc.c.source[mn.span.start:mn.span.end]
+    let recvV = lowerExpr(fc, mk[0])
+    let a = lowerArgs(fc, call, []int(0))
+    if (fc.failed) {
+      return
+    }
+    let mi = mkInstr(Op.Call, fc.c.ctx.voidId)
+    if (fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
+      mi = mkInstr(Op.CallIface, fc.c.ctx.voidId)
+      mi.lhs = recvV
+      mi.ival = methodId(fc.lowerer, mname)
+      mi.args = a
+      fc.defers = append(fc.defers, mi)
+      return
+    }
+    // A concrete receiver leads the argument list, as in a direct method call.
+    let all = [recvV]
+    let j = 0
+    while (j < len(a)) {
+      all = append(all, a[j])
+      j = j + 1
+    }
+    mi.name = methodSymbol(fc.lowerer, mname, recvTy)
+    mi.args = all
+    fc.defers = append(fc.defers, mi)
+    return
+  }
   if (cn.tag != Tag.Ident) {
     fc.failed = true
     return
@@ -3540,8 +3672,9 @@ function lowerDefer(fc: FnCtx, node: int) {
       return
     }
     ins = mkInstr(Op.Call, funcResultLookup(fc.c, name))
-    ins.name = name
-    ins.args = lowerArgs(fc, call, lowerParamTypes(fc.c, decl))
+    // Same qualification a direct call gets: the callee's own module's symbol.
+    ins.name = callQualified(fc.c, fc.lowerer.root, name)
+    ins.args = lowerArgs(fc, call, lowerParamTypes(declOwner(fc.c, name), decl))
   }
   if (fc.failed) {
     return
@@ -3999,9 +4132,14 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
     // land, this fires loudly instead of silently emitting a duplicate slot.
     assert(nameOverride == "")
     lowerer.methodEntries = append(lowerer.methodEntries,
-      MethodEntry{ recvTy: recvId, name: c.source[nm.span.start:nm.span.end] })
-    name = name + "\$t${recvId}"
+      MethodEntry{ recvTy: recvId, name: c.source[nm.span.start:nm.span.end],
+        prefix: lowerer.modPrefix })
+    name = lowerer.modPrefix + name + "\$t${recvId}"
+  } else {
+    name = lowerer.modPrefix + name
   }
+  // An override (a monomorphized instance) is already module-qualified by the
+  // caller, so it is used verbatim — prefixing again would produce `m2$m2$f$0`.
   if (nameOverride != "") {
     name = nameOverride
   }
@@ -4049,6 +4187,7 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   }
   lowerStmtList(fc, kids[5])
   if (fc.failed) {
+    lowerer.stubbed = append(lowerer.stubbed, name)
     return signatureOnlyFunc(c, name, paramTypes, result)
   }
   if (!fc.terminated) {
@@ -4309,7 +4448,7 @@ function lowerIfaceMethodValue(fc: FnCtx, node: int, recvTy: int): int {
   if (fc.failed) {
     return 0
   }
-  let sigKey = typeName(fc.c.ctx, recvTy) + "." + mname
+  let sigKey = "${recvTy}.${mname}"
   let fnTy = methodSigLookup(fc.c, sigKey)
   let result = methodResultLookup(fc.c, sigKey)
   let mid = methodId(fc.lowerer, mname)
@@ -4371,7 +4510,8 @@ function fnValueTrampoline(fc: FnCtx, funcName: string): int {
   }
   let fid = fc.lowerer.reservedCount + len(fc.lowerer.closureFuncs)
   let decl = funcDeclLookup(fc.c, funcName)
-  let paramTypes = lowerParamTypes(fc.c, decl)
+  // An imported target's params are declared in ITS tree (see declOwner).
+  let paramTypes = lowerParamTypes(declOwner(fc.c, funcName), decl)
   let result = unwrapFallible(fc.c, funcResultLookup(fc.c, funcName))
   let fnTy = funcSigLookup(fc.c, funcName)
   let b = newBuilder()
@@ -4388,7 +4528,10 @@ function fnValueTrampoline(fc: FnCtx, funcName: string): int {
     i = i + 1
   }
   let call = mkInstr(Op.Call, result)
-  call.name = funcName
+  // The trampoline body calls the real function, so it needs the same qualified
+  // symbol a direct call would use — an imported target lives under its own
+  // module's name.
+  call.name = callQualified(fc.c, fc.lowerer.root, funcName)
   call.args = callArgs
   let r = builderEmit(b, call)
   if (result == fc.c.ctx.voidId) {
@@ -4412,11 +4555,9 @@ function isGenericFuncDecl(c: Checker, decl: int): bool {
   return gp != 0 && len(kidsOf(c.tree, gp)) > 0
 }
 
-function lowerModuleIr(c: Checker): IrModule {
-  let moduleConsts = collectModuleConsts(c)
-  // reservedCount = every regular func (free + instances + methods); closure
-  // trampolines take FuncIds after these, so it must be known before body
-  // lowering assigns them.
+// Every regular func a module contributes (free + instances + methods) — the
+// FuncId budget that must be reserved before any closure trampoline takes an id.
+function moduleReservedCount(c: Checker): int {
   let reserved = len(c.instantiations)
   let ri = 1
   while (ri < len(c.tree.nodes)) {
@@ -4428,64 +4569,162 @@ function lowerModuleIr(c: Checker): IrModule {
     }
     ri = ri + 1
   }
+  return reserved
+}
+
+// Lowers a whole checked project into ONE IrModule. Modules are walked in id
+// (dependency) order within each pass, matching the seed's module-major
+// Pass A/A2/A3 order, so the emitted function order is the seed's.
+//
+// The root module keeps bare names; every other module's functions are prefixed
+// `m<id>$`, so two modules that both declare `join` cannot collide in the
+// object's flat symbol namespace.
+function lowerProject(mods: []Checker, root: int): IrModule {
+  assert(len(mods) >= 1)
+  assert(root >= 0 && root < len(mods))
+  // The FuncId budget spans every module: closure trampolines are numbered after
+  // all of them, so a per-module count would hand two modules the same ids.
+  let reserved = 0
+  let ri = 0
+  while (ri < len(mods)) {
+    reserved = reserved + moduleReservedCount(mods[ri])
+    ri = ri + 1
+  }
+  // One Lowerer for the whole project: interface dispatch ids, the string pool
+  // and func-value trampolines are all program-wide, not per-module.
   let lowerer = Lowerer{ methodIds: map<string, int>{}, methodEntries: []MethodEntry(0),
     stringPool: []string(0), reservedCount: reserved, closureFuncs: []IrFunc(0),
-    fnValueTramps: map<string, int>{} }
-  let funcs = []IrFunc(0)
-  // Pass A: non-generic free functions in declaration order.
-  let i = 1
-  while (i < len(c.tree.nodes)) {
-    let n = getNode(c.tree, i)
-    if (n.tag == Tag.FuncDecl && kidsOf(c.tree, i)[0] == 0 && !isGenericFuncDecl(c, i)) {
-      funcs = append(funcs, lowerFunc(c, i, moduleConsts, lowerer))
-    }
-    i = i + 1
-  }
-  // Pass A2: one monomorphized instance per discovered instantiation, in the
-  // checker's discovery order — `name$index` with the type-params substituted to
-  // the concrete args (via `userTypes`, which typeFromNode consults).
-  let g = 0
-  while (g < len(c.instantiations)) {
-    let inst = c.instantiations[g]
-    let decl = funcDeclLookup(c, inst.name)
-    let tps = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
-    let saved = []int(0)
-    let j = 0
-    while (j < len(tps)) {
-      let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])
-      let tpname = c.source[tpn.span.start:tpn.span.end]
-      saved = append(saved, userTypeLookup(c, tpname))
-      if (j < len(inst.args)) {
-        c.userTypes[tpname] = inst.args[j]
+    fnValueTramps: map<string, int>{}, modPrefix: "", root: root,
+    typeModule: map<int, int>{}, stubbed: []string(0) }
+  // Every named type -> its declaring module, before any body is lowered: a
+  // method's symbol takes its receiver TYPE's prefix, and a Pass A body can call
+  // a method whose decl Pass A3 has not reached yet. `typeDecls` holds only the
+  // names a module declares itself, so an imported type is not claimed here.
+  let ti = 0
+  while (ti < len(mods)) {
+    for (nm, _) of mods[ti].typeDecls {
+      let id = userTypeLookup(mods[ti], nm)
+      if (id != 0) {
+        lowerer.typeModule[id] = ti
       }
-      j = j + 1
     }
-    funcs = append(funcs, lowerFuncNamed(c, decl, moduleConsts, lowerer, "${inst.name}\$${g}"))
-    j = 0
-    while (j < len(tps)) {
-      let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])
-      c.userTypes[c.source[tpn.span.start:tpn.span.end]] = saved[j]
-      j = j + 1
-    }
-    g = g + 1
+    ti = ti + 1
   }
-  // Pass A3: struct methods in declaration order.
-  let m = 1
-  while (m < len(c.tree.nodes)) {
-    let n = getNode(c.tree, m)
-    if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0) {
-      funcs = append(funcs, lowerFunc(c, m, moduleConsts, lowerer))
+  let funcs = []IrFunc(0)
+
+  // Pass A: every module's non-generic free functions, in declaration order.
+  let mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    lowerer.modPrefix = modulePrefix(mi, root)
+    let consts = collectModuleConsts(c)
+    let i = 1
+    while (i < len(c.tree.nodes)) {
+      let n = getNode(c.tree, i)
+      if (n.tag == Tag.FuncDecl && kidsOf(c.tree, i)[0] == 0 && !isGenericFuncDecl(c, i)) {
+        funcs = append(funcs, lowerFunc(c, i, consts, lowerer))
+      }
+      i = i + 1
     }
-    m = m + 1
+    mi = mi + 1
   }
+
+  // Pass A2: each module's monomorphized generic instances.
+  mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    lowerer.modPrefix = modulePrefix(mi, root)
+    let consts = collectModuleConsts(c)
+    let g = 0
+    while (g < len(c.instantiations)) {
+      funcs = append(funcs, lowerInstance(c, consts, lowerer, g, modulePrefix(mi, root)))
+      g = g + 1
+    }
+    mi = mi + 1
+  }
+
+  // Pass A3: each module's methods, in declaration order.
+  mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    lowerer.modPrefix = modulePrefix(mi, root)
+    let consts = collectModuleConsts(c)
+    let m = 1
+    while (m < len(c.tree.nodes)) {
+      let n = getNode(c.tree, m)
+      if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0) {
+        funcs = append(funcs, lowerFunc(c, m, consts, lowerer))
+      }
+      m = m + 1
+    }
+    mi = mi + 1
+  }
+
   // Pass A4: synthesized closure trampolines, at the FuncIds reserved for them.
   let ci = 0
   while (ci < len(lowerer.closureFuncs)) {
     funcs = append(funcs, lowerer.closureFuncs[ci])
     ci = ci + 1
   }
-  return IrModule{ funcs: funcs, ctx: c.ctx, stringPool: lowerer.stringPool,
-    methodTables: buildMethodTables(lowerer) }
+  return IrModule{ funcs: funcs, ctx: mods[root].ctx, stringPool: lowerer.stringPool,
+    methodTables: buildMethodTables(lowerer), stubbed: lowerer.stubbed }
+}
+
+// A method's link symbol: prefixed by the module that DECLARES the receiver
+// type, not by the caller's — `s.area()` on an imported Shape must reach the
+// same symbol from every module — then mangled by the receiver's type id so two
+// types can share a method name.
+function methodSymbol(lw: Lowerer, name: string, recvTy: int): string {
+  let (mod, known) = lw.typeModule[recvTy]
+  if (!known) {
+    return name + "\$t${recvTy}" // an unnamed receiver: not an importable decl
+  }
+  return modulePrefix(mod, lw.root) + name + "\$t${recvTy}"
+}
+
+// A module's link prefix: bare for the root, `m<id>$` otherwise.
+function modulePrefix(mod: int, root: int): string {
+  if (mod == root) {
+    return ""
+  }
+  return "m${mod}\$"
+}
+
+// Lowers generic instantiation `g` of module `c` — the type params bound to the
+// instantiation's concrete args for the duration, then restored.
+function lowerInstance(c: Checker, consts: map<string, int>, lowerer: Lowerer, g: int,
+    prefix: string): IrFunc {
+  let inst = c.instantiations[g]
+  let decl = funcDeclLookup(c, inst.name)
+  let tps = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  let saved = []int(0)
+  let j = 0
+  while (j < len(tps)) {
+    let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])
+    let tpname = c.source[tpn.span.start:tpn.span.end]
+    saved = append(saved, userTypeLookup(c, tpname))
+    if (j < len(inst.args)) {
+      c.userTypes[tpname] = inst.args[j]
+    }
+    j = j + 1
+  }
+  let f = lowerFuncNamed(c, decl, consts, lowerer, "${prefix}${inst.name}\$${g}")
+  j = 0
+  while (j < len(tps)) {
+    let tpn = getNode(c.tree, kidsOf(c.tree, tps[j])[0])
+    c.userTypes[c.source[tpn.span.start:tpn.span.end]] = saved[j]
+    j = j + 1
+  }
+  return f
+}
+
+// One module on its own — the single-file path (`--dump-ir`, `bitc2 build
+// <file.bit>`). Delegates to lowerProject so there is exactly ONE lowering
+// order: with a single module that IS the root, every prefix is empty and the
+// output is what it was before modules existed. This is also why the existing
+// single-file IR differential covers lowerProject.
+function lowerModuleIr(c: Checker): IrModule {
+  return lowerProject([c], 0)
 }
 
 // Parse -> check -> lower -> render IR text, the `bitc2 --dump-ir` pipeline.
@@ -4531,8 +4770,10 @@ function buildMethodTables(lw: Lowerer): []MethodTable {
     let j = 0
     while (j < len(lw.methodEntries)) {
       if (lw.methodEntries[j].recvTy == disc) {
+        // The id is assigned from the raw name (global across modules); the
+        // symbol carries the declaring module's prefix.
         methods = append(methods, MethodSlot{ id: methodId(lw, lw.methodEntries[j].name),
-          func: lw.methodEntries[j].name + "\$t${disc}" })
+          func: lw.methodEntries[j].prefix + lw.methodEntries[j].name + "\$t${disc}" })
       }
       j = j + 1
     }

@@ -40,10 +40,6 @@ struct Checker {
   funcResults: map<string, int>,
   // Declared struct/enum/alias name -> its named TypeId.
   userTypes: map<string, int>,
-  // "TypeName.method" -> the method's declared result type.
-  methodResults: map<string, int>,
-  // "StructName.field" -> the field's declared type.
-  structFields: map<string, int>,
   // Free-function name -> its full `(params) => result` func TypeId, so a bare
   // function reference (`let g = inc`) types as a first-class value.
   funcSigs: map<string, int>,
@@ -53,9 +49,6 @@ struct Checker {
   // Type-parameter name -> its constraint interface type, so a method call on a
   // constrained generic value `s.area()` (s: T, `T: Shape`) resolves via Shape.
   typeParamConstraints: map<string, int>,
-  // "TypeName.method" -> the method's `(params) => result` func type, so an
-  // uncalled method value `let g = a.addTo` types as a first-class function.
-  methodSigs: map<string, int>,
   // Generic-function instantiations discovered at call sites, in source order.
   // Each concrete (name, type-args) combo is monomorphized to `name$index` in
   // lowering; the index is this list position (the seed's ctx.instantiations).
@@ -68,6 +61,37 @@ struct Checker {
   // reserve+resolve it on first touch (the seed's declTypeOf recursion), giving
   // type ids in source-order touch order (needed for method-name mangling).
   typeDecls: map<string, int>,
+  // --- module identity (#1345) --------------------------------------------
+  // This module's id. The root is the module being built; lowering leaves the
+  // root's names bare (so `main` stays `main`) and prefixes every other
+  // module's with `m<id>$`.
+  moduleId: int,
+  // Every module's checker, indexed by module id. A name imported from another
+  // module has its DECLARATION in that module's tree, so reading the decl needs
+  // that module's `tree`/`source` — see `declOwner`. Type information does not:
+  // TypeIds are global to the shared TypeContext, so an import copies the
+  // exporting module's type entries straight into the maps above and the whole
+  // checker keeps working name-keyed and unchanged.
+  mods: []Checker,
+  // Local name -> where it was imported from. A name absent here is declared in
+  // this module.
+  importedFrom: map<string, ImportOrigin>,
+  // The names this module declares under `export` — the only ones another
+  // module may import, and the set the prelude auto-imports everywhere.
+  exports: map<string, bool>,
+  // Import path text ("std/fs") -> module id, filled by the loader before
+  // checking. -1 marks a path that resolved to no module.
+  importPaths: map<string, int>,
+}
+
+// Where an imported name comes from: the module that declares it, and the name
+// it is declared under THERE — which differs from the local name whenever the
+// import renames it (`import { readFile as slurp }`). Both are needed: the
+// declaration is looked up in the exporter under `name`, and the link symbol is
+// built from `name` too, so an alias never reaches the object file.
+struct ImportOrigin {
+  module: int,
+  name: string,
 }
 
 // One generic-function instantiation: the generic's name and the concrete
@@ -86,11 +110,97 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
   }
   return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
-    methodResults: map<string, int>{}, structFields: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
-    typeParamConstraints: map<string, int>{}, methodSigs: map<string, int>{},
+    typeParamConstraints: map<string, int>{},
     instantiations: []Instantiation(0), declTypeNodes: map<string, int>{},
-    typeDecls: map<string, int>{} }
+    typeDecls: map<string, int>{}, moduleId: 0, mods: []Checker(0),
+    importedFrom: map<string, ImportOrigin>{}, exports: map<string, bool>{},
+    importPaths: map<string, int>{} }
+}
+
+// The declared name of a top-level decl node. A FuncDecl carries its name at
+// kid 1 (kid 0 is the optional receiver); every other decl has it at kid 0.
+// Getting this wrong reads a receiver as a name and exports nothing.
+function topDeclName(c: Checker, node: int): string {
+  let n = getNode(c.tree, node)
+  if (n.tag == Tag.FuncDecl) {
+    let k = kidsOf(c.tree, node)
+    if (k[1] == 0) {
+      return ""
+    }
+    let nm = getNode(c.tree, k[1])
+    return c.source[nm.span.start:nm.span.end]
+  }
+  if (n.tag == Tag.StructDecl || n.tag == Tag.EnumDecl || n.tag == Tag.InterfaceDecl ||
+      n.tag == Tag.TypeAlias) {
+    return declName(c, node)
+  }
+  return ""
+}
+
+// Records every name declared under `export` — the decls this module makes
+// importable. `export` wraps its decl rather than replacing it, so the collect
+// pass already sees the inner node; this only records visibility.
+function collectExports(c: Checker) {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (getNode(c.tree, i).tag == Tag.Export) {
+      let inner = kidsOf(c.tree, i)[0]
+      if (inner != 0) {
+        let nm = topDeclName(c, inner)
+        if (nm != "") {
+          c.exports[nm] = true
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The checker whose tree holds `name`'s declaration: this one, unless `name` was
+// imported. Every site that reads a declaration NODE for a name must go through
+// this, because a node index only means anything inside its own tree — reading
+// an imported function's decl against the importing module's tree would land on
+// an unrelated node and silently miscompile.
+function declOwner(c: Checker, name: string): Checker {
+  let (o, ok) = c.importedFrom[name]
+  if (!ok || o.module < 0 || o.module >= len(c.mods)) {
+    return c
+  }
+  return c.mods[o.module]
+}
+
+// `name` as the module that declares it spells it — the same name, unless this
+// module imported it under an alias.
+function declName2(c: Checker, name: string): string {
+  let (o, ok) = c.importedFrom[name]
+  if (!ok) {
+    return name
+  }
+  return o.name
+}
+
+// The link-level name for a function `base` declared in module `mod`, given the
+// root module id. Mirrors the seed's `moduleQualified` exactly: the root keeps
+// bare names (so `main` stays `main`, and a single-module build stays
+// byte-identical), every other module gets an `m<id>$` prefix so two modules'
+// same-named functions cannot collide in the object's flat symbol namespace.
+function moduleQualified(mod: int, root: int, base: string): string {
+  if (mod == root) {
+    return base
+  }
+  return "m${mod}\$${base}"
+}
+
+// The link name for a call to `name` from `c`: an imported name resolves to its
+// DEFINING module's prefix under its ORIGINAL spelling, so neither the caller's
+// module nor a local alias reaches the object file.
+function callQualified(c: Checker, root: int, name: string): string {
+  let (o, ok) = c.importedFrom[name]
+  if (!ok) {
+    return moduleQualified(c.moduleId, root, name)
+  }
+  return moduleQualified(o.module, root, o.name)
 }
 
 // The enum type-args a variant construction `Enum.Variant(args)` binds, inferred
@@ -162,8 +272,12 @@ function scrutineeTypeArgs(c: Checker, node: int): []int {
     let ck = kidsOf(c.tree, node)
     let callee = getNode(c.tree, ck[0])
     if (callee.tag == Tag.Ident) {
-      let decl = funcDeclLookup(c, c.source[callee.span.start:callee.span.end])
-      if (decl != 0) {
+      let cname = c.source[callee.span.start:callee.span.end]
+      let decl = funcDeclLookup(c, cname)
+      // An imported decl's nodes index its own module's tree; a generic
+      // instance read from it would not be resolvable here anyway, so only a
+      // locally-declared callee contributes a result node.
+      if (decl != 0 && declOwner(c, cname).moduleId == c.moduleId) {
         tnode = kidsOf(c.tree, decl)[4]
       }
     } else if (callee.tag == Tag.Member) {
@@ -204,8 +318,12 @@ function scrutineeTypeArgNodes(c: Checker, node: int): []int {
     let ck = kidsOf(c.tree, node)
     let callee = getNode(c.tree, ck[0])
     if (callee.tag == Tag.Ident) {
-      let decl = funcDeclLookup(c, c.source[callee.span.start:callee.span.end])
-      if (decl != 0) {
+      let cname = c.source[callee.span.start:callee.span.end]
+      let decl = funcDeclLookup(c, cname)
+      // An imported decl's nodes index its own module's tree; a generic
+      // instance read from it would not be resolvable here anyway, so only a
+      // locally-declared callee contributes a result node.
+      if (decl != 0 && declOwner(c, cname).moduleId == c.moduleId) {
         tnode = kidsOf(c.tree, decl)[4]
       }
     }
@@ -223,7 +341,7 @@ function scrutineeTypeArgNodes(c: Checker, node: int): []int {
 }
 
 function structFieldLookup(c: Checker, key: string): int {
-  for (k, v) of c.structFields {
+  for (k, v) of c.ctx.structFields {
     if (k == key) {
       return v
     }
@@ -248,7 +366,7 @@ function typeNodeName(c: Checker, node: int): string {
 }
 
 function methodResultLookup(c: Checker, key: string): int {
-  for (k, v) of c.methodResults {
+  for (k, v) of c.ctx.methodResults {
     if (k == key) {
       return v
     }
@@ -258,7 +376,7 @@ function methodResultLookup(c: Checker, key: string): int {
 
 // "TypeName.method" -> the method's `(params) => result` func type, or 0.
 function methodSigLookup(c: Checker, key: string): int {
-  for (k, v) of c.methodSigs {
+  for (k, v) of c.ctx.methodSigs {
     if (k == key) {
       return v
     }
@@ -338,14 +456,127 @@ function funcSigLookup(c: Checker, name: string): int {
   return 0
 }
 
-// The FuncDecl node for a free function, or 0.
+// The FuncDecl node for a free function, or 0. An imported name's decl lives in
+// the exporting module's tree, so the lookup follows the import — callers that
+// then read the node MUST read it against `declOwner(c, name).tree`.
 function funcDeclLookup(c: Checker, name: string): int {
+  let (o, ok) = c.importedFrom[name]
+  if (ok && o.module >= 0 && o.module < len(c.mods)) {
+    let e = c.mods[o.module]
+    for (k, v) of e.funcDecls {
+      if (k == o.name) {
+        return v
+      }
+    }
+    return 0
+  }
   for (k, v) of c.funcDecls {
     if (k == name) {
       return v
     }
   }
   return 0
+}
+
+// Copies every entry whose key is exactly `orig`, or is prefixed `orig.` (a
+// type's fields and methods are keyed "Type.member"), rebinding the key's
+// leading name to `alias`. Named `orig`/`alias` because `from` is a keyword.
+function copyQualified(dst: map<string, int>, src: map<string, int>, orig: string, alias: string) {
+  for (k, v) of src {
+    if (k == orig) {
+      dst[alias] = v
+      continue
+    }
+    if (len(k) > len(orig) && k[0:len(orig)] == orig && k[len(orig)] == '.') {
+      dst[alias + k[len(orig):len(k)]] = v
+    }
+  }
+}
+
+// Binds `name` (as declared in module `mid`'s checker `e`) into `c` under
+// `alias`. TypeIds are global to the shared TypeContext, so the type side of an
+// import is a plain copy — which is what lets the rest of the checker stay
+// name-keyed and completely unaware that modules exist. Only the declaration
+// NODE cannot be copied; it stays in the exporter's tree, reached via declOwner.
+function importName(c: Checker, e: Checker, mid: int, name: string, alias: string) {
+  c.importedFrom[alias] = ImportOrigin{ module: mid, name: name }
+  copyQualified(c.funcResults, e.funcResults, name, alias)
+  copyQualified(c.funcSigs, e.funcSigs, name, alias)
+  copyQualified(c.userTypes, e.userTypes, name, alias)
+  // Fields and methods are NOT copied: they live on the type in the shared
+  // TypeContext, so they resolve from any module that can name the type at all.
+}
+
+// Type-checks every module of a loaded project into ONE shared TypeContext, in
+// module-id order — which the loader guarantees is dependency order, so each
+// module's imports are already checked (their type maps populated) by the time
+// it binds them. Returns the checkers, indexed by module id, for lowering.
+function checkProject(p: Project): []Checker {
+  let ctx = newTypeContext()
+  let mods = []Checker(0)
+  let i = 0
+  while (i < len(p.mods)) {
+    let c = newChecker(p.mods[i].tree, p.mods[i].source, ctx)
+    c.moduleId = i
+    c.importPaths = p.mods[i].imports
+    mods = append(mods, c)
+    i = i + 1
+  }
+  // Hand out the shared table only now: `append` may move the backing array, so
+  // a checker given the slice mid-build would hold a stale, short view of it.
+  i = 0
+  while (i < len(mods)) {
+    mods[i].mods = mods
+    i = i + 1
+  }
+  i = 0
+  while (i < len(mods)) {
+    collectExports(mods[i])
+    bindImports(mods[i], p.prelude)
+    checkModule(mods[i])
+    i = i + 1
+  }
+  return mods
+}
+
+// Binds every name a module imports, before its own declarations are collected —
+// an import is in scope for the whole module, including decls written above it.
+// The prelude's exports bind first so an explicit import of the same name wins.
+function bindImports(c: Checker, preludeId: int) {
+  if (preludeId >= 0 && preludeId < len(c.mods) && preludeId != c.moduleId) {
+    let p = c.mods[preludeId]
+    for (n, _) of p.exports {
+      importName(c, p, preludeId, n, n)
+    }
+  }
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0 || getNode(c.tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let dk = kidsOf(c.tree, d)
+    let pathNode = getNode(c.tree, dk[1])
+    let path = c.source[pathNode.span.start + 1:pathNode.span.end - 1]
+    let (mid, found) = c.importPaths[path]
+    if (!found || mid < 0 || mid >= len(c.mods)) {
+      continue // unresolved import: already reported by the loader
+    }
+    let e = c.mods[mid]
+    let body = getNode(c.tree, dk[0])
+    if (body.tag != Tag.ImportGroup) {
+      continue // namespace/star imports bind in bindNamespaceImports
+    }
+    for item of kidsOf(c.tree, dk[0]) {
+      let ik = kidsOf(c.tree, item)
+      let nn = getNode(c.tree, ik[0])
+      let name = c.source[nn.span.start:nn.span.end]
+      let alias = name
+      if (ik[1] != 0) {
+        let an = getNode(c.tree, ik[1])
+        alias = c.source[an.span.start:an.span.end]
+      }
+      importName(c, e, mid, name, alias)
+    }
+  }
 }
 
 // Whether `name` is one of the FuncDecl's declared generic type parameters.
@@ -377,21 +608,31 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
   if (decl == 0) {
     return -1
   }
-  let dk = kidsOf(c.tree, decl)
+  // An imported callee's decl indexes ITS module's node arena; reading it
+  // against this module's tree is an out-of-range panic at best and a silently
+  // unrelated node at worst.
+  let oc = declOwner(c, name)
+  let dk = kidsOf(oc.tree, decl)
   if (dk[2] == 0 || dk[4] == 0) {
+    return -1 // not generic, or no declared result: the plain path handles it
+  }
+  // A cross-module generic would need its type params (the callee's tree) bound
+  // from the call's arguments (ours). Not wired yet — lowerCall refuses these
+  // explicitly, so declining to infer here defers to that one error.
+  if (oc.moduleId != c.moduleId) {
     return -1
   }
-  let rn = getNode(c.tree, dk[4])
+  let rn = getNode(oc.tree, dk[4])
   if (rn.tag != Tag.Ident) {
     return -1
   }
-  let rname = c.source[rn.span.start:rn.span.end]
-  if (!isTypeParamName(c, decl, rname)) {
+  let rname = oc.source[rn.span.start:rn.span.end]
+  if (!isTypeParamName(oc, decl, rname)) {
     return -1
   }
   // Bind the result type-param from a parameter mentioning it — bare (`x: T`) or
   // nested in a generic instance (`p: Pair<T>`).
-  let bound = bindTypeParamAtCall(c, callNode, kidsOf(c.tree, dk[3]), rname)
+  let bound = bindTypeParamAtCall(c, callNode, kidsOf(oc.tree, dk[3]), rname)
   if (bound != 0) {
     return bound
   }
@@ -404,8 +645,11 @@ function isGenericFunc(c: Checker, name: string): bool {
   if (decl == 0) {
     return false
   }
-  let gp = kidsOf(c.tree, decl)[2]
-  return gp != 0 && len(kidsOf(c.tree, gp)) > 0
+  // The decl may belong to an imported module, whose node indices only mean
+  // anything in ITS tree.
+  let oc = declOwner(c, name)
+  let gp = kidsOf(oc.tree, decl)[2]
+  return gp != 0 && len(kidsOf(oc.tree, gp)) > 0
 }
 
 // Structurally binds type-param `tpname` from a parameter's type node against a
@@ -543,13 +787,15 @@ function genericTypeArgs(c: Checker, name: string, callNode: int): []int {
   if (decl == 0) {
     return out
   }
-  let dk = kidsOf(c.tree, decl)
-  let tps = kidsOf(c.tree, dk[2])
-  let params = kidsOf(c.tree, dk[3])
+  // The decl's nodes belong to its own module's tree (see declOwner).
+  let oc = declOwner(c, name)
+  let dk = kidsOf(oc.tree, decl)
+  let tps = kidsOf(oc.tree, dk[2])
+  let params = kidsOf(oc.tree, dk[3])
   let ti = 0
   while (ti < len(tps)) {
-    let tpn = getNode(c.tree, kidsOf(c.tree, tps[ti])[0])
-    let tpname = c.source[tpn.span.start:tpn.span.end]
+    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[ti])[0])
+    let tpname = oc.source[tpn.span.start:tpn.span.end]
     let bound = bindTypeParamAtCall(c, callNode, params, tpname)
     if (bound == 0) {
       bound = c.ctx.voidId
@@ -930,7 +1176,7 @@ function checkCall(c: Checker, node: int): int {
     let recvType = checkExprType(c, mk[0])
     if (recvType != 0) {
       let mn = getNode(c.tree, mk[1])
-      let key = typeName(c.ctx, methodRecvType(c, recvType)) + "." + c.source[mn.span.start:mn.span.end]
+      let key = "${methodRecvType(c, recvType)}." + c.source[mn.span.start:mn.span.end]
       return methodResultLookup(c, key)
     }
   }
@@ -1165,16 +1411,16 @@ function checkMember(c: Checker, node: int): int {
   if (rt != 0) {
     let mn = getNode(c.tree, kids[1])
     let mname = c.source[mn.span.start:mn.span.end]
-    let recvName = typeName(c.ctx, methodRecvType(c, rt))
+    let recvKey = "${methodRecvType(c, rt)}"
     // Struct field access `value.field`.
     if (c.ctx.types[rt].kind == TypeKind.Struct) {
-      let ft = structFieldLookup(c, recvName + "." + mname)
+      let ft = structFieldLookup(c, recvKey + "." + mname)
       if (ft != 0) {
         return ft
       }
     }
     // An uncalled method value `value.method` -> the method's func type.
-    return methodSigLookup(c, recvName + "." + mname)
+    return methodSigLookup(c, recvKey + "." + mname)
   }
   return 0
 }
@@ -1332,7 +1578,7 @@ function resolveStructFields(c: Checker, node: int, sname: string) {
     }
     let fk = kidsOf(c.tree, fld)
     let fnn = getNode(c.tree, fk[0])
-    c.structFields[sname + "." + c.source[fnn.span.start:fnn.span.end]] = typeFromNode(c, fk[1])
+    c.ctx.structFields["${userTypeLookup(c, sname)}." + c.source[fnn.span.start:fnn.span.end]] = typeFromNode(c, fk[1])
     fi = fi + 1
   }
 }
@@ -1374,7 +1620,7 @@ function resolveInterfaceSigs(c: Checker, node: int, iname: string) {
     if (mk[2] != 0) {
       mres = typeFromNode(c, mk[2])
     }
-    c.methodResults[iname + "." + c.source[mnn.span.start:mnn.span.end]] = mres
+    c.ctx.methodResults["${userTypeLookup(c, iname)}." + c.source[mnn.span.start:mnn.span.end]] = mres
     mi = mi + 1
   }
 }
@@ -1436,7 +1682,7 @@ function collectFuncDecl(c: Checker, node: int) {
   if (kids[0] != 0) {
     let recvType = typeNodeName(c, kidsOf(c.tree, kids[0])[1])
     resolveNamed(c, recvType)
-    c.methodResults[recvType + "." + fname] = rty
+    c.ctx.methodResults["${userTypeLookup(c, recvType)}.${fname}"] = rty
   } else {
     c.funcResults[fname] = rty
     c.funcDecls[fname] = node
@@ -1461,7 +1707,7 @@ function buildSignatures(c: Checker) {
       let nm = getNode(c.tree, kids[1])
       let fname = c.source[nm.span.start:nm.span.end]
       if (kids[0] != 0) {
-        c.methodSigs[typeNodeName(c, kidsOf(c.tree, kids[0])[1]) + "." + fname] = sig
+        c.ctx.methodSigs["${userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, kids[0])[1]))}.${fname}"] = sig
       } else {
         c.funcSigs[fname] = sig
       }
@@ -1476,7 +1722,7 @@ function buildSignatures(c: Checker) {
         if (mk[2] != 0) {
           mres = typeFromNode(c, mk[2])
         }
-        c.methodSigs[iname + "." + c.source[mnn.span.start:mnn.span.end]] = funcTypeFromParams(c, mk[1], mres)
+        c.ctx.methodSigs["${userTypeLookup(c, iname)}." + c.source[mnn.span.start:mnn.span.end]] = funcTypeFromParams(c, mk[1], mres)
         mi = mi + 1
       }
     }
@@ -1487,7 +1733,7 @@ function buildSignatures(c: Checker) {
 function checkModule(c: Checker) {
   // The predeclared `error` interface's method `message(): string` (§10.6), so
   // `e.message()` on a caught error resolves like any interface method.
-  c.methodResults["error.message"] = primType(c.ctx, 11)
+  c.ctx.methodResults["${c.ctx.errorId}.message"] = primType(c.ctx, 11)
   // Pre-scan: record every named type's decl node so a forward reference during
   // the collect pass can reserve+resolve it on first touch (§9: order-independent
   // top-level declarations).
