@@ -2532,6 +2532,179 @@ function checkElfLoKindRoundTrip() {
   }
 }
 
+// ---- elflink.bit: the static linker + ELF executable writer (#345) --------
+//
+// These are the structural checks. The real proof is execution, which needs a
+// Linux host: the seed's own tests self-skip off x86-64 Linux for the same
+// reason. Both targets have been run end to end — a self-contained _start and
+// bit_main linked against the REAL libbitrt.a, all four exiting 42 (x86-64 on
+// real hardware, aarch64 under a native linux/arm64 container).
+
+function elErr(t: ElfLinkTarget, inputs: []ElfLinkInput): string {
+  let msg = ""
+  let e = linkElfExecutable(t, inputs) catch err {
+    msg = err.message()
+    []u8(0)
+  }
+  return msg
+}
+
+// One relocatable object defining `sym` in .text, as the linker's input.
+function elProbeObj(t: ElfLinkTarget, code: []u8, sym: string): []u8 {
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: code, size: 0, alignment: 16 }],
+    symbols: [ElfSymbol{ name: sym, hasSection: true, section: ElfSectionKind.Text,
+      offset: 0, size: len(code), binding: ElfBinding.Global, kind: ElfSymKind.Func }],
+    relocations: []ElfRelocation(0) }
+  return writeElfObject(elReaderTarget(t), obj) catch e { []u8(0) }
+}
+
+// The nth program header's file offset.
+function elPhdrAt(n: int): int {
+  return sizeofElfEhdr() + n * sizeofElfPhdr()
+}
+
+function checkElfLinkRaw() {
+  // mov edi,42 ; mov eax,60 (SYS_exit) ; syscall — no runtime, no TLS, no GOT.
+  let code = [u8(0xBF), u8(0x2A), u8(0x00), u8(0x00), u8(0x00), u8(0xB8), u8(0x3C),
+    u8(0x00), u8(0x00), u8(0x00), u8(0x0F), u8(0x05)]
+  let inputs = [ElfLinkInput{ isArchive: false,
+    bytes: elProbeObj(ElfLinkTarget.X86_64Linux, code, "_start") }]
+  assert(elErr(ElfLinkTarget.X86_64Linux, inputs) == "")
+  let b = linkElfExecutable(ElfLinkTarget.X86_64Linux, inputs) catch e { []u8(0) }
+
+  assert(b[0] == u8(127) && b[1] == u8(69) && b[2] == u8(76) && b[3] == u8(70))
+  assert(leAt(b, 16, 2) == 2)  // ET_EXEC — not ET_REL, not ET_DYN
+  assert(leAt(b, 18, 2) == 62) // EM_X86_64
+  assert(leAt(b, 32, 8) == sizeofElfEhdr()) // e_phoff: phdrs follow the header
+  assert(leAt(b, 40, 8) == 0)  // e_shoff: an executable carries no section table
+  assert(leAt(b, 54, 2) == sizeofElfPhdr())
+  // No TLS in this link, so: 2 PT_LOAD + PT_GNU_STACK.
+  assert(leAt(b, 56, 2) == 3)
+
+  let entry = leAt(b, 24, 8)
+  assert(entry >= elLoadBase())
+
+  // The kernel maps each PT_LOAD at p_vaddr and jumps to e_entry, so the entry
+  // code must actually be at (entry - load_base) in the file.
+  let off = entry - elLoadBase()
+  let i = 0
+  while (i < len(code)) {
+    assert(b[off + i] == code[i])
+    i = i + 1
+  }
+
+  // PT_LOAD #0 is R-X and covers the headers from the load base: p_offset 0 so
+  // the ELF header itself is mapped.
+  assert(leAt(b, elPhdrAt(0), 4) == ptLoad())
+  assert(leAt(b, elPhdrAt(0) + 4, 4) == pfR() | pfX())
+  assert(leAt(b, elPhdrAt(0) + 8, 8) == 0)
+  assert(leAt(b, elPhdrAt(0) + 16, 8) == elLoadBase())
+  assert(leAt(b, elPhdrAt(0) + 32, 8) == leAt(b, elPhdrAt(0) + 40, 8)) // filesz == memsz
+  assert(leAt(b, elPhdrAt(0) + 48, 8) == elPage())
+  // The entry lands inside the R-X segment.
+  assert(entry >= elLoadBase() && entry < elLoadBase() + leAt(b, elPhdrAt(0) + 40, 8))
+
+  // PT_LOAD #1 is R-W and starts on a fresh page.
+  assert(leAt(b, elPhdrAt(1), 4) == ptLoad())
+  assert(leAt(b, elPhdrAt(1) + 4, 4) == pfR() | pfW())
+  assert(leAt(b, elPhdrAt(1) + 16, 8) % elPage() == 0)
+  // W and X are never granted to the same segment.
+  assert((leAt(b, elPhdrAt(1) + 4, 4) & pfX()) == 0)
+
+  // PT_GNU_STACK: present and NOT executable — its absence makes the kernel
+  // fall back to an executable stack.
+  assert(leAt(b, elPhdrAt(2), 4) == ptGnuStack())
+  assert((leAt(b, elPhdrAt(2) + 4, 4) & pfX()) == 0)
+
+  // Every byte-backed region's file offset equals vaddr - load_base, so the
+  // file is exactly as long as the R-W segment's file part reaches.
+  assert(len(b) == leAt(b, elPhdrAt(1) + 8, 8) + leAt(b, elPhdrAt(1) + 32, 8))
+
+  // The same object links for aarch64 with only the machine changing.
+  let a64 = [ElfLinkInput{ isArchive: false,
+    bytes: elProbeObj(ElfLinkTarget.Aarch64Linux, code, "_start") }]
+  let ab = linkElfExecutable(ElfLinkTarget.Aarch64Linux, a64) catch e { []u8(0) }
+  assert(leAt(ab, 18, 2) == 183) // EM_AARCH64
+  assert(leAt(ab, 16, 2) == 2)
+}
+
+// .bss occupies memory but no file bytes — the one place file and memory sizes
+// diverge. Getting memsz == filesz means the program's zero-initialized data
+// simply is not mapped.
+function checkElfLinkBss() {
+  let code = [u8(0xBF), u8(0x2A), u8(0x00), u8(0x00), u8(0x00), u8(0xB8), u8(0x3C),
+    u8(0x00), u8(0x00), u8(0x00), u8(0x0F), u8(0x05)]
+  let obj = ElfObject{
+    sections: [
+      ElfSection{ kind: ElfSectionKind.Text, data: code, size: 0, alignment: 16 },
+      ElfSection{ kind: ElfSectionKind.Data, data: []u8(8), size: 0, alignment: 8 },
+      ElfSection{ kind: ElfSectionKind.Bss, data: []u8(0), size: 4096, alignment: 8 }],
+    symbols: [
+      ElfSymbol{ name: "_start", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: len(code), binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "d", hasSection: true, section: ElfSectionKind.Data,
+        offset: 0, size: 8, binding: ElfBinding.Global, kind: ElfSymKind.Object },
+      ElfSymbol{ name: "z", hasSection: true, section: ElfSectionKind.Bss,
+        offset: 0, size: 4096, binding: ElfBinding.Global, kind: ElfSymKind.Object }],
+    relocations: []ElfRelocation(0) }
+  let bytes = writeElfObject(ElfTarget.X86_64, obj) catch e { []u8(0) }
+  let inputs = [ElfLinkInput{ isArchive: false, bytes: bytes }]
+  assert(elErr(ElfLinkTarget.X86_64Linux, inputs) == "")
+  let b = linkElfExecutable(ElfLinkTarget.X86_64Linux, inputs) catch e { []u8(0) }
+
+  let filesz = leAt(b, elPhdrAt(1) + 32, 8)
+  let memsz = leAt(b, elPhdrAt(1) + 40, 8)
+  assert(memsz >= filesz + 4096) // .bss is mapped but not stored
+  assert(len(b) == leAt(b, elPhdrAt(1) + 8, 8) + filesz)
+}
+
+function checkElfLinkRejects() {
+  // Nothing defines _start, so there is no entry to jump to.
+  let code = [u8(0xC3)]
+  let inputs = [ElfLinkInput{ isArchive: false,
+    bytes: elProbeObj(ElfLinkTarget.X86_64Linux, code, "bit_main") }]
+  assert(elErr(ElfLinkTarget.X86_64Linux, inputs) != "")
+
+  // An object built for the other architecture is refused by the reader rather
+  // than linked into a broken image.
+  let x = [ElfLinkInput{ isArchive: false,
+    bytes: elProbeObj(ElfLinkTarget.X86_64Linux, code, "_start") }]
+  assert(elErr(ElfLinkTarget.Aarch64Linux, x) == "UnsupportedElf")
+
+  // An undefined symbol is a link error, not a zero-filled call.
+  let obj = ElfObject{
+    sections: [ElfSection{ kind: ElfSectionKind.Text, data: []u8(8), size: 0, alignment: 16 }],
+    symbols: [
+      ElfSymbol{ name: "_start", hasSection: true, section: ElfSectionKind.Text,
+        offset: 0, size: 8, binding: ElfBinding.Global, kind: ElfSymKind.Func },
+      ElfSymbol{ name: "nowhere", hasSection: false, section: ElfSectionKind.Text,
+        offset: 0, size: 0, binding: ElfBinding.Global, kind: ElfSymKind.Notype }],
+    relocations: [ElfRelocation{ section: ElfSectionKind.Text, offset: 0,
+      symbol: "nowhere", kind: ElfRelocKind.Pc32, addend: -4 }] }
+  let ub = writeElfObject(ElfTarget.X86_64, obj) catch e { []u8(0) }
+  assert(elErr(ElfLinkTarget.X86_64Linux,
+    [ElfLinkInput{ isArchive: false, bytes: ub }]) != "")
+}
+
+// Variant I vs II: the two ABIs put the static TLS block on opposite sides of
+// the thread pointer, so the same block offset yields a negative offset on
+// x86-64 and a positive one (past a 16-byte TCB) on AArch64. Swapping them
+// silently reads the wrong memory.
+function checkElfTpOffset() {
+  let tls = ElTlsLayout{ vaddr: 0, filesz: 8, memsz: 24, alignment: 8 }
+  // x86-64: TP - alignUp(24, 8) + 0 == -24.
+  assert(elTpOffset(ElfLinkTarget.X86_64Linux, 0, tls) == -24)
+  assert(elTpOffset(ElfLinkTarget.X86_64Linux, 8, tls) == -16)
+  // aarch64: TP + alignUp(16, 8) + 0 == 16.
+  assert(elTpOffset(ElfLinkTarget.Aarch64Linux, 0, tls) == 16)
+  assert(elTpOffset(ElfLinkTarget.Aarch64Linux, 8, tls) == 24)
+  // A block alignment above 16 pushes the AArch64 TCB out to that alignment.
+  let big = ElTlsLayout{ vaddr: 0, filesz: 8, memsz: 24, alignment: 32 }
+  assert(elTpOffset(ElfLinkTarget.Aarch64Linux, 0, big) == 32)
+  assert(elTpOffset(ElfLinkTarget.X86_64Linux, 0, big) == -32)
+}
+
 // Stage 3 (#1344) the linker's object model. Ports every one of the seed's
 // atomizeModule tests, including its two silent-corruption regressions.
 
@@ -6674,6 +6847,10 @@ function selfcheck() {
   checkElfReaderWeakAndTls()
   checkElfReaderAbsSymbols()
   checkElfReaderDroppedAndSectionSyms()
+  checkElfLinkRaw()
+  checkElfLinkBss()
+  checkElfLinkRejects()
+  checkElfTpOffset()
   checkElfReaderRejects()
   checkAtomizeSplit()
   checkAtomizeRelocs()

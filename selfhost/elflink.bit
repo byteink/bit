@@ -1,0 +1,501 @@
+// Self-host: static linker driver + ELF executable writer, ported from
+// compiler/link.zig (#345). Turns the compiled Bit program's object plus
+// libbitrt.a into one standalone, zero-dynamic-linker, zero-libc ELF executable
+// — the "ship one binary like Go/Zig" promise, on Linux.
+//
+// Pipeline: read every input into linkobj.bit's generic object model (via
+// elfreader.bit / archive.bit), resolve the whole-link global symbol table and
+// dead-strip from the entry root `_start` (strip.bit), lay the surviving atoms
+// into two page-aligned PT_LOAD segments (R-X: headers/text/rodata; R-W:
+// data/GOT/TLS-init/bss) plus a PT_TLS describing the thread-local image, apply
+// every relocation against the assigned addresses, then emit Ehdr + Phdrs +
+// segment bytes.
+//
+// Non-PIE ET_EXEC at a fixed base: the kernel maps each PT_LOAD at its p_vaddr
+// and jumps to e_entry (= _start), which the runtime provides. FILE LAYOUT
+// MIRRORS MEMORY LAYOUT — a segment's file offset is its vaddr minus the load
+// base — so .bss/.tbss are the only file-vs-mem size gap, and one piece of
+// address arithmetic serves both the segment table and the byte copies.
+
+// Fixed non-PIE load base. The traditional x86-64 ET_EXEC value; well clear of
+// the kernel's mmap_min_addr and the zero page.
+function elLoadBase(): int { return 0x400000 }
+function elPage(): int { return 0x1000 }
+function elEntrySymbol(): string { return "_start" }
+function elGotEntrySize(): int { return 8 }
+function sizeofElfPhdr(): int { return 56 }
+
+// p_type
+function ptLoad(): int { return 1 }
+function ptTls(): int { return 7 }
+function ptGnuStack(): int { return 0x6474e551 }
+// p_flags
+function pfX(): int { return 1 }
+function pfW(): int { return 2 }
+function pfR(): int { return 4 }
+
+enum ElfLinkTarget {
+  X86_64Linux,
+  Aarch64Linux,
+}
+
+function elReaderTarget(t: ElfLinkTarget): ElfTarget {
+  if (t == ElfLinkTarget.X86_64Linux) {
+    return ElfTarget.X86_64
+  }
+  return ElfTarget.Aarch64
+}
+
+// One input to the link. Bit has no tagged union: `isArchive` selects whether
+// `bytes` is a single relocatable object (the compiled Bit program) or an ar
+// archive (libbitrt.a) whose every member is read as its own module.
+struct ElfLinkInput {
+  isArchive: bool,
+  bytes: []u8,
+}
+
+// An atom assigned an address. `tlsOffset` is meaningful only for tls_data /
+// tls_bss atoms, whose references resolve to thread-pointer offsets rather than
+// to vaddrs.
+struct ElPlaced {
+  id: int,
+  vaddr: int,
+  tlsOffset: int,
+}
+
+// Assigns each atom in `items` an address, honouring its own alignment, and
+// returns the cursor past the last one. Structs are reference types, so the
+// ElPlaced records are updated in place.
+function elPlaceAtoms(modules: []LoModule, items: []ElPlaced, cursor: int): int {
+  let c = cursor
+  let i = 0
+  while (i < len(items)) {
+    let a = modules[atomKeyModule(items[i].id)].atoms[atomKeyAtom(items[i].id)]
+    c = alignForward(c, a.alignment)
+    items[i].vaddr = c
+    c = c + a.size
+    i = i + 1
+  }
+  return c
+}
+
+// The atoms of one output class, in module then declaration order.
+function elCollect(modules: []LoModule, kept: map<int, bool>, kind: LoSectionKind): []ElPlaced {
+  let out = []ElPlaced(0)
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let id = atomKey(mi, ai)
+      let (_, keep) = kept[id]
+      if (keep && atoms[ai].kind == kind) {
+        out = append(out, ElPlaced{ id: id, vaddr: 0, tlsOffset: 0 })
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  return out
+}
+
+function elMaxAlign(modules: []LoModule, items: []ElPlaced, start: int): int {
+  let m = start
+  let i = 0
+  while (i < len(items)) {
+    let a = modules[atomKeyModule(items[i].id)].atoms[atomKeyAtom(items[i].id)]
+    if (a.alignment > m) {
+      m = a.alignment
+    }
+    i = i + 1
+  }
+  return m
+}
+
+// Lays out the TLS init image: tdata gets file bytes, tbss extends memsz only.
+// Returns the cursor past the block's FILE-backed part. Both lists are assigned
+// their block offsets and vaddrs in place.
+struct ElTlsLayout {
+  vaddr: int,
+  filesz: int,
+  memsz: int,
+  alignment: int,
+}
+
+function elLayoutTls(modules: []LoModule, tdata: []ElPlaced, tbss: []ElPlaced, cursor: int): ElTlsLayout {
+  let tlsAlign = elMaxAlign(modules, tdata, 1)
+  tlsAlign = elMaxAlign(modules, tbss, tlsAlign)
+  let vaddr = alignForward(cursor, tlsAlign)
+  let off = 0
+  let i = 0
+  while (i < len(tdata)) {
+    let a = modules[atomKeyModule(tdata[i].id)].atoms[atomKeyAtom(tdata[i].id)]
+    off = alignForward(off, a.alignment)
+    tdata[i].tlsOffset = off
+    tdata[i].vaddr = vaddr + off
+    off = off + a.size
+    i = i + 1
+  }
+  let filesz = off // only tdata has a file image
+  i = 0
+  while (i < len(tbss)) {
+    let a = modules[atomKeyModule(tbss[i].id)].atoms[atomKeyAtom(tbss[i].id)]
+    off = alignForward(off, a.alignment)
+    tbss[i].tlsOffset = off
+    tbss[i].vaddr = vaddr + off
+    off = off + a.size
+    i = i + 1
+  }
+  return ElTlsLayout{ vaddr: vaddr, filesz: filesz, memsz: off, alignment: tlsAlign }
+}
+
+// A symbol's offset from the thread pointer, which differs by ABI variant.
+//
+// Variant II (x86-64): the static TLS block sits BELOW the thread pointer, so a
+// symbol at block offset `o` is at TP - (aligned block size) + o.
+//
+// Variant I (AArch64): the block sits ABOVE the thread pointer, after a 16-byte
+// ABI TCB aligned to the block's own alignment (Zig's std.os.linux.tls layout,
+// @sizeOf(AbiTcb) == 16), so a symbol at block offset `o` is at
+// TP + alignUp(16, align) + o.
+function elTpOffset(t: ElfLinkTarget, blockOffset: int, tls: ElTlsLayout): int {
+  if (t == ElfLinkTarget.X86_64Linux) {
+    return blockOffset - alignForward(tls.memsz, tls.alignment)
+  }
+  return alignForward(16, tls.alignment) + blockOffset
+}
+
+// Appends one Elf64_Phdr. Layout: type u32, flags u32, offset u64, vaddr u64,
+// paddr u64, filesz u64, memsz u64, align u64. Note flags sits at offset 4 in
+// the 64-bit form (Elf32 puts it last) — getting that wrong makes the kernel
+// read the whole table as garbage.
+function appendElfPhdr(out: ByteBuf, ptype: int, flags: int, offset: int, vaddr: int,
+  filesz: int, memsz: int, palign: int) {
+  appendU32(out, ptype)
+  appendU32(out, flags)
+  appendU64(out, offset)
+  appendU64(out, vaddr)
+  appendU64(out, vaddr) // p_paddr: irrelevant for a hosted ET_EXEC, mirrors vaddr
+  appendU64(out, filesz)
+  appendU64(out, memsz)
+  appendU64(out, palign)
+}
+
+// Reads every input into the generic module model.
+function elIngest(target: ElfLinkTarget, inputs: []ElfLinkInput): []LoModule! {
+  let modules = []LoModule(0)
+  let rt = elReaderTarget(target)
+  let i = 0
+  while (i < len(inputs)) {
+    if (inputs[i].isArchive) {
+      let members = parseArchive(inputs[i].bytes)?
+      let m = 0
+      while (m < len(members)) {
+        modules = append(modules, readElf(rt, members[m].name, members[m].data)?)
+        m = m + 1
+      }
+    } else {
+      modules = append(modules, readElf(rt, "bit.o", inputs[i].bytes)?)
+    }
+    i = i + 1
+  }
+  return modules
+}
+
+// Links `inputs` into a standalone ELF executable.
+function linkElfExecutable(target: ElfLinkTarget, inputs: []ElfLinkInput): []u8! {
+  let modules = elIngest(target, inputs)?
+
+  // ---- resolve + dead-strip ---------------------------------------------
+  let globals = resolveGlobals(modules)?
+  let kept = deadStrip(modules, globals, [elEntrySymbol()])?
+
+  // `-fdata-sections` can emit ONE variable as several adjacent symbols in a
+  // single section (std's TLS `area_desc` splits into area_desc.0/.1/...).
+  // Dead-stripping the unreferenced pieces would repack the survivors and shift
+  // the variable's fields, corrupting it. Keep every mutable-data atom (.data,
+  // .bss, and the TLS init/bss) so their in-section layout is preserved; code
+  // (.text) and read-only constants (.rodata) are still granularly stripped.
+  let mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let k = atoms[ai].kind
+      if (k == LoSectionKind.Data || k == LoSectionKind.Bss ||
+          k == LoSectionKind.TlsData || k == LoSectionKind.TlsBss) {
+        kept[atomKey(mi, ai)] = true
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+
+  // ---- collect kept atoms, partitioned by output class -------------------
+  let text = elCollect(modules, kept, LoSectionKind.Text)
+  let rodata = elCollect(modules, kept, LoSectionKind.Rodata)
+  let data = elCollect(modules, kept, LoSectionKind.Data)
+  let bss = elCollect(modules, kept, LoSectionKind.Bss)
+  let tdata = elCollect(modules, kept, LoSectionKind.TlsData)
+  let tbss = elCollect(modules, kept, LoSectionKind.TlsBss)
+  // TlsVars is a macOS tlv_descriptor section; ELF has no equivalent and
+  // elfreader.bit never produces it.
+  if (len(elCollect(modules, kept, LoSectionKind.TlsVars)) > 0) {
+    fail newError("elf: tls_vars section in an ELF link")
+  }
+
+  // ---- lay out the two PT_LOAD segments ---------------------------------
+  // The headers occupy the very start of the R-X segment and are loaded too, so
+  // reserve their size before the first text atom. The phdr count is known up
+  // front: 2 PT_LOAD + PT_GNU_STACK, plus PT_TLS iff there is any TLS.
+  let hasTls = len(tdata) + len(tbss) > 0
+  let phnum = 3
+  if (hasTls) {
+    phnum = 4
+  }
+  let headersSize = sizeofElfEhdr() + phnum * sizeofElfPhdr()
+
+  let cursor = elLoadBase() + headersSize
+  cursor = elPlaceAtoms(modules, text, cursor)
+  cursor = elPlaceAtoms(modules, rodata, cursor)
+  let rxEnd = cursor
+
+  // The R-W segment starts on a fresh page: GOT, data, TLS init image, bss.
+  cursor = alignForward(cursor, elPage())
+  let rwStart = cursor
+
+  // GOT: one slot per distinct target of a GOT-relative relocation.
+  let gotIndex = map<int, int>{}
+  let gotTargets = []int(0)
+  mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let (_, keep) = kept[atomKey(mi, ai)]
+      if (keep) {
+        let relocs = atoms[ai].relocs
+        let r = 0
+        while (r < len(relocs)) {
+          if (needsGot(relocs[r].kind)) {
+            let tgt = resolveRef(globals, mi, relocs[r].target)?
+            let (_, seen) = gotIndex[tgt]
+            if (!seen) {
+              gotIndex[tgt] = len(gotTargets)
+              gotTargets = append(gotTargets, tgt)
+            }
+          }
+          r = r + 1
+        }
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+  let gotVaddr = cursor
+  cursor = cursor + len(gotTargets) * elGotEntrySize()
+
+  cursor = elPlaceAtoms(modules, data, cursor)
+
+  let tls = elLayoutTls(modules, tdata, tbss, cursor)
+  cursor = tls.vaddr + tls.filesz // only tdata occupies file bytes here
+
+  // .bss and .tbss carry no file bytes. .tbss's memory is already accounted for
+  // in tls.memsz; ordinary .bss is placed after the TLS init image.
+  let rwFileEnd = cursor // the last vaddr backed by file bytes in R-W
+  cursor = elPlaceAtoms(modules, bss, cursor) // extends memsz only
+  let rwMemEnd = cursor
+
+  // ---- address lookup for every placed atom ------------------------------
+  let addrOf = map<int, int>{}
+  let groups = [text, rodata, data, bss]
+  let gi = 0
+  while (gi < len(groups)) {
+    let g = groups[gi]
+    let i = 0
+    while (i < len(g)) {
+      addrOf[g[i].id] = g[i].vaddr
+      i = i + 1
+    }
+    gi = gi + 1
+  }
+  // TLS atoms resolve to thread-pointer offsets, not vaddrs; keyed separately.
+  let tpoffOf = map<int, int>{}
+  let tgroups = [tdata, tbss]
+  gi = 0
+  while (gi < len(tgroups)) {
+    let g = tgroups[gi]
+    let i = 0
+    while (i < len(g)) {
+      tpoffOf[g[i].id] = elTpOffset(target, g[i].tlsOffset, tls)
+      i = i + 1
+    }
+    gi = gi + 1
+  }
+
+  let (entryId, haveEntry) = globals[elEntrySymbol()]
+  if (!haveEntry) {
+    fail newError("elf: missing entry symbol ${elEntrySymbol()}")
+  }
+  let (entryVaddr, haveEntryAddr) = addrOf[entryId]
+  if (!haveEntryAddr) {
+    fail newError("elf: entry symbol ${elEntrySymbol()} was stripped")
+  }
+
+  // ---- apply relocations into per-atom mutable copies --------------------
+  // An atom's own bytes are never mutated: two atoms can share a backing slice,
+  // and only the patched copy reaches the file.
+  let patched = map<int, []u8>{}
+  mi = 0
+  while (mi < len(modules)) {
+    let atoms = modules[mi].atoms
+    let ai = 0
+    while (ai < len(atoms)) {
+      let id = atomKey(mi, ai)
+      let (_, keep) = kept[id]
+      if (keep && len(atoms[ai].data) > 0) {
+        let buf = []u8(0)
+        let b = 0
+        while (b < len(atoms[ai].data)) {
+          buf = append(buf, atoms[ai].data[b])
+          b = b + 1
+        }
+        // A TLS atom's own data is patched, but it is addressed by others via
+        // tpoff, so it has no vaddr of its own here.
+        let atomVaddr = 0
+        let (av, hasAv) = addrOf[id]
+        if (hasAv) {
+          atomVaddr = av
+        }
+        let relocs = atoms[ai].relocs
+        let r = 0
+        while (r < len(relocs)) {
+          let reloc = relocs[r]
+          let tgt = resolveRef(globals, mi, reloc.target)?
+          let v = noValues()
+          v.p = atomVaddr + reloc.offset
+          if (isTlsKind(reloc.kind)) {
+            let (tp, hasTp) = tpoffOf[tgt]
+            if (!hasTp) {
+              fail newError("elf: undefined TLS symbol")
+            }
+            v.tpOffset = tp + reloc.addend
+          } else if (needsGot(reloc.kind)) {
+            let (slot, hasSlot) = gotIndex[tgt]
+            if (!hasSlot) {
+              fail newError("elf: GOT slot missing")
+            }
+            // The addend (-4 for REX_GOTPCRELX) is part of the PC-relative
+            // arithmetic, exactly as for pc32; fold it into the GOT-slot address
+            // the field resolves against.
+            v.gotSlot = gotVaddr + slot * elGotEntrySize() + reloc.addend
+          } else {
+            let (ta, hasTa) = addrOf[tgt]
+            if (!hasTa) {
+              fail newError("elf: undefined symbol")
+            }
+            v.s = ta + reloc.addend
+          }
+          applyReloc(reloc.kind, buf, reloc.offset, v)?
+          r = r + 1
+        }
+        patched[id] = buf
+      }
+      ai = ai + 1
+    }
+    mi = mi + 1
+  }
+
+  // ---- emit the image ----------------------------------------------------
+  // File offset == vaddr - load_base for every byte-backed region.
+  let fileSize = rwFileEnd - elLoadBase()
+  let buf = []u8(fileSize)
+
+  // Copy every byte-backed atom to (vaddr - load_base). BSS/TBSS have no bytes;
+  // the TLS init bytes (tdata) do get written.
+  let wgroups = [text, rodata, data, tdata]
+  gi = 0
+  while (gi < len(wgroups)) {
+    let g = wgroups[gi]
+    let i = 0
+    while (i < len(g)) {
+      let atom = modules[atomKeyModule(g[i].id)].atoms[atomKeyAtom(g[i].id)]
+      let bytes = atom.data
+      let (pb, hasPb) = patched[g[i].id]
+      if (hasPb) {
+        bytes = pb
+      }
+      let off = g[i].vaddr - elLoadBase()
+      let b = 0
+      while (b < len(bytes)) {
+        buf[off + b] = bytes[b]
+        b = b + 1
+      }
+      i = i + 1
+    }
+    gi = gi + 1
+  }
+
+  // GOT slots: each holds its target's absolute address.
+  let gt = 0
+  while (gt < len(gotTargets)) {
+    let off = gotVaddr + gt * elGotEntrySize() - elLoadBase()
+    let (addr, hasAddr) = addrOf[gotTargets[gt]]
+    if (!hasAddr) {
+      fail newError("elf: undefined GOT target")
+    }
+    loWrU64(buf, off, addr)
+    gt = gt + 1
+  }
+
+  // Ehdr.
+  let hdr = newByteBuf()
+  hdr.bytes = append(hdr.bytes, u8(127))
+  appendBytes(hdr, []byte("ELF"))
+  hdr.bytes = append(hdr.bytes, u8(2)) // EI_CLASS: ELFCLASS64
+  hdr.bytes = append(hdr.bytes, u8(1)) // EI_DATA: ELFDATA2LSB
+  hdr.bytes = append(hdr.bytes, u8(1)) // EI_VERSION
+  hdr.bytes = append(hdr.bytes, u8(0)) // EI_OSABI: ELFOSABI_NONE
+  appendZeros(hdr, 8)
+  appendU16(hdr, 2) // e_type: ET_EXEC
+  appendU16(hdr, elfMachine(elReaderTarget(target)))
+  appendU32(hdr, 1)
+  appendU64(hdr, entryVaddr)
+  appendU64(hdr, sizeofElfEhdr()) // e_phoff: the phdrs follow the header
+  appendU64(hdr, 0)               // e_shoff: an executable needs no section table
+  appendU32(hdr, 0)
+  appendU16(hdr, sizeofElfEhdr())
+  appendU16(hdr, sizeofElfPhdr())
+  appendU16(hdr, phnum)
+  appendU16(hdr, 0) // e_shentsize
+  appendU16(hdr, 0) // e_shnum
+  appendU16(hdr, 0) // e_shstrndx
+  let h = 0
+  while (h < len(hdr.bytes)) {
+    buf[h] = hdr.bytes[h]
+    h = h + 1
+  }
+
+  // Phdrs.
+  let ph = newByteBuf()
+  // R-X: headers + text + rodata, from load_base to rxEnd.
+  appendElfPhdr(ph, ptLoad(), pfR() | pfX(), 0, elLoadBase(),
+    rxEnd - elLoadBase(), rxEnd - elLoadBase(), elPage())
+  // R-W: rwStart .. rwMemEnd (filesz stops at rwFileEnd; the rest is bss).
+  appendElfPhdr(ph, ptLoad(), pfR() | pfW(), rwStart - elLoadBase(), rwStart,
+    rwFileEnd - rwStart, rwMemEnd - rwStart, elPage())
+  if (hasTls) {
+    appendElfPhdr(ph, ptTls(), pfR(), tls.vaddr - elLoadBase(), tls.vaddr,
+      tls.filesz, tls.memsz, tls.alignment)
+  }
+  // PT_GNU_STACK: a non-executable stack, no mapped bytes.
+  appendElfPhdr(ph, ptGnuStack(), pfR() | pfW(), 0, 0, 0, 0, elPage())
+  assert(len(ph.bytes) == phnum * sizeofElfPhdr())
+  let p = 0
+  while (p < len(ph.bytes)) {
+    buf[sizeofElfEhdr() + p] = ph.bytes[p]
+    p = p + 1
+  }
+
+  return buf
+}
