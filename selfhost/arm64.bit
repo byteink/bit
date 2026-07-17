@@ -1732,10 +1732,6 @@ function emitCallIface(cx: A64Ctx, dst: int, dstTy: int, ifaceVal: int, methodId
 // the conservative test the safepoint contract (runtime/ABI.md §5) needs: a loop
 // with no call in it must still reach a safepoint, or a spinning thread would
 // never yield to the collector.
-function isBackEdge(curBlock: int, target: int): bool {
-  return target <= curBlock
-}
-
 function emitBackEdgeSafepointIfNeeded(cx: A64Ctx, curBlock: int, target: int) {
   if (isBackEdge(curBlock, target)) {
     emitCall(cx, -1, 0, safepointSymbol(), []int(0), true)
@@ -1912,155 +1908,11 @@ function isFcmp(op: Op): bool {
 }
 
 // ===========================================================================
-// Top-level: interval building, register allocation, frame layout, emission
+// Top-level: register allocation, frame layout, emission
+//
+// Live-interval construction is backend-agnostic and lives in codegen.bit
+// (`buildIntervals`), shared with x64.
 // ===========================================================================
-
-function extendOne(intervals: []LiveInterval, usePos: int, operand: int) {
-  if (intervals[operand].end < usePos) {
-    intervals[operand].end = usePos
-  }
-}
-
-function extendList(intervals: []LiveInterval, usePos: int, operands: []int) {
-  let i = 0
-  while (i < len(operands)) {
-    extendOne(intervals, usePos, operands[i])
-    i = i + 1
-  }
-}
-
-// Extends each operand's live interval to reach this instruction. Every op that
-// READS a value must be listed — an omission ends a value's interval early and
-// the allocator hands its register to someone else while it is still live.
-function extendUses(intervals: []LiveInterval, usePos: int, ins: IrInstr) {
-  let op = ins.op
-  if (op == Op.BlockParam || op == Op.ConstInt || op == Op.ConstFloat ||
-    op == Op.ConstBool || op == Op.ConstString || op == Op.ConstNil ||
-    op == Op.Unreachable || op == Op.GcAlloc || op == Op.TypeInfo ||
-    op == Op.FuncAddr) {
-    return // no value operands
-  }
-  if (op == Op.Jump || op == Op.Ret || op == Op.Call || op == Op.RtCall) {
-    extendList(intervals, usePos, ins.args)
-    return
-  }
-  if (op == Op.Br) {
-    extendOne(intervals, usePos, ins.lhs)
-    extendList(intervals, usePos, ins.thenArgs)
-    extendList(intervals, usePos, ins.elseArgs)
-    return
-  }
-  if (op == Op.CallValue || op == Op.CallIface) {
-    extendOne(intervals, usePos, ins.lhs) // callee / receiver
-    extendList(intervals, usePos, ins.args)
-    return
-  }
-  if (op == Op.FieldGet || op == Op.SliceLen || op == Op.MakeClosure ||
-    op == Op.Neg || op == Op.BNot || op == Op.Convert || op == Op.FNeg) {
-    extendOne(intervals, usePos, ins.lhs)
-    return
-  }
-  if (op == Op.FieldSet) {
-    extendOne(intervals, usePos, ins.lhs)
-    extendOne(intervals, usePos, ins.rhs)
-    return
-  }
-  if (op == Op.IndexSet) {
-    extendOne(intervals, usePos, ins.lhs)
-    extendOne(intervals, usePos, ins.rhs)
-    extendOne(intervals, usePos, ins.ival) // the value operand
-    return
-  }
-  // Everything else is a two-operand value op (bin/index_get).
-  extendOne(intervals, usePos, ins.lhs)
-  extendOne(intervals, usePos, ins.rhs)
-}
-
-// All of a block's params are live simultaneously at block entry — the
-// predecessor edge's parallel move writes every one before the jump. A param that
-// is never read afterward would otherwise keep its initial empty [i, i] interval
-// and could be coalesced onto a live sibling param's register, so the edge move
-// clobbers one param with another (a returned value coming back as some other
-// incoming argument). Extend every param's interval to its block's last param
-// position so all params of a block mutually interfere and land in distinct
-// registers.
-function forceParamInterference(intervals: []LiveInterval, f: IrFunc) {
-  let bi = 0
-  while (bi < len(f.blocks)) {
-    let blk = f.blocks[bi]
-    if (blk.paramCount > 0) {
-      let lastParam = blk.instsStart + blk.paramCount - 1
-      let p = blk.instsStart
-      while (p < blk.instsStart + blk.paramCount) {
-        if (intervals[p].end < lastParam) {
-          intervals[p].end = lastParam
-        }
-        p = p + 1
-      }
-    }
-    bi = bi + 1
-  }
-}
-
-function isSafepointOp(op: Op): bool {
-  return op == Op.Call || op == Op.RtCall || op == Op.GcAlloc ||
-    op == Op.MakeClosure || op == Op.CallValue || op == Op.CallIface
-}
-
-// One LiveInterval per instruction slot (dense 0..len(instrs), matching
-// regalloc.bit's dense-vreg contract). Non-value instructions (terminators,
-// field_set/index_set) get a trivial, never-referenced [i,i] interval; harmless
-// filler, never looked up. Also collects safepoint positions in the exact order
-// they will be re-encountered during emission (calls first-seen, then back-edge
-// terminators) so the emission pass can match each stack map back to its bl by
-// cursor position.
-// buildIntervals produces two things at once; a slice appended to inside a callee
-// does not grow the caller's, so both come back in one struct.
-struct IntervalBuild {
-  intervals: []LiveInterval,
-  safepoints: []int,
-}
-
-function buildIntervals(ctx: TypeContext, f: IrFunc): IntervalBuild {
-  let safepoints = []int(0)
-  let intervals = []LiveInterval(0)
-  let i = 0
-  while (i < len(f.instrs)) {
-    let w = widthOf(ctx, f.instrs[i].ty)
-    intervals = append(intervals, LiveInterval{ vreg: i, class: w.class, start: i, end: i,
-      isRef: w.class == RegClass.Int && isRefType(ctx, f.instrs[i].ty) })
-    i = i + 1
-  }
-
-  let bi = 0
-  while (bi < len(f.blocks)) {
-    let b = f.blocks[bi]
-    let idx = b.instsStart + b.paramCount
-    let end = b.instsStart + b.instsLen
-    while (idx < end) {
-      let ins = f.instrs[idx]
-      if (isSafepointOp(ins.op)) {
-        safepoints = append(safepoints, idx)
-      }
-      extendUses(intervals, idx, ins)
-      if (ins.op == Op.Jump && isBackEdge(bi, ins.ival)) {
-        safepoints = append(safepoints, idx)
-      }
-      if (ins.op == Op.Br) {
-        if (isBackEdge(bi, ins.ival)) {
-          safepoints = append(safepoints, idx)
-        }
-        if (isBackEdge(bi, ins.ival2)) {
-          safepoints = append(safepoints, idx)
-        }
-      }
-      idx = idx + 1
-    }
-    bi = bi + 1
-  }
-  forceParamInterference(intervals, f)
-  return IntervalBuild{ intervals: intervals, safepoints: safepoints }
-}
 
 // How many of `args` overflow past the argument registers to the stack.
 function stackArgSlots(ctx: TypeContext, f: IrFunc, args: []int, baseIntOrd: int, baseFloatOrd: int): int {

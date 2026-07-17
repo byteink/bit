@@ -1193,12 +1193,8 @@ function checkArm64Calls() {
 }
 
 function checkArm64Safepoints() {
-  // Block ids are emitted in ascending order, so any edge that does not advance
-  // closes a loop and needs a safepoint — a loop with no call in it must still
-  // yield to the collector.
-  assert(isBackEdge(3, 3) && isBackEdge(3, 1))
-  assert(!isBackEdge(3, 4))
-
+  // isBackEdge itself is shared and covered by checkBackEdge; this pins arm64's
+  // use of it — a loop with no call in it must still yield to the collector.
   let cx = selCtx()
   cx.result.stackMaps = [StackMapEntry{ pos: 0, regs: []int(0), slots: []int(0) }]
   cx.safepointPositions = [0]
@@ -1240,6 +1236,82 @@ function checkStringPool() {
   assert(internString(m, "") == 2)
   assert(len(m.stringPool) == 3)
   assert(m.stringPool[0] == "a" && m.stringPool[1] == "b" && m.stringPool[2] == "")
+}
+
+// A block param is physically written by each predecessor's edge move, which runs
+// at the PREDECESSOR'S TERMINATOR — under RPO that is well before the param's own
+// instruction index. Its interval must start there, else a value that dies in the
+// gap is handed the param's register and the edge move silently clobbers it.
+function checkIntervalParamsToPreds() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+
+  // Block 0: const %0, then `jump blk1(%0)` at position 1.
+  // Block 1: param %2 (written by that jump), then `ret %2`.
+  let ci = mkInstr(Op.ConstInt, i64t)
+  ci.ival = 7
+  let jump = mkInstr(Op.Jump, ctx.voidId)
+  jump.ival = 1 // forward edge to block 1
+  jump.args = [0]
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [2]
+  let f = IrFunc{ name: "f", paramTypes: []int(0), result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 },
+      IrBlock{ instsStart: 2, paramCount: 1, instsLen: 2 }],
+    instrs: [ci, jump, mkInstr(Op.BlockParam, i64t), ret],
+    isFallible: false }
+  let b = buildIntervals(ctx, f)
+
+  // The param's own index is 2, but the jump that writes it sits at 1.
+  assert(b.intervals[2].start == 1)
+  assert(b.intervals[2].end == 3) // read by the ret
+  // The const is live [0,1]; the param now reaches 1 too, so they OVERLAP and
+  // cannot share a register. This overlap IS the fix — without it the param is
+  // [2,3], disjoint from the const, and both land in one register.
+  assert(b.intervals[0].end == 1)
+  assert(b.intervals[0].end >= b.intervals[2].start)
+
+  // A Br writes the params of BOTH targets from the same terminator, so both must
+  // be extended — covering only the then-target leaves the else-target's params
+  // starting at their own index, disjoint from anything live across the branch.
+  let bv = mkInstr(Op.ConstInt, i64t)
+  bv.ival = 3
+  let cond = mkInstr(Op.ConstBool, primType(ctx, 10))
+  let br = mkInstr(Op.Br, ctx.voidId)
+  br.lhs = 1
+  br.ival = 1  // then -> block 1
+  br.ival2 = 2 // else -> block 2
+  br.thenArgs = [0]
+  br.elseArgs = [0]
+  let rt1 = mkInstr(Op.Ret, ctx.voidId)
+  rt1.args = [3]
+  let rt2 = mkInstr(Op.Ret, ctx.voidId)
+  rt2.args = [5]
+  let fbr = IrFunc{ name: "fbr", paramTypes: []int(0), result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 3 },
+      IrBlock{ instsStart: 3, paramCount: 1, instsLen: 2 },
+      IrBlock{ instsStart: 5, paramCount: 1, instsLen: 2 }],
+    instrs: [bv, cond, br, mkInstr(Op.BlockParam, i64t), rt1,
+      mkInstr(Op.BlockParam, i64t), rt2],
+    isFallible: false }
+  let bb = buildIntervals(ctx, fbr)
+  assert(bb.intervals[3].start == 2) // then-target param, written by the br at 2
+  assert(bb.intervals[5].start == 2) // else-target param, same terminator
+
+  // A BACK-edge predecessor sits at a higher position than the param it writes,
+  // so it must never lower the start (that would stretch the param backwards over
+  // the whole loop and force needless interference).
+  let ci2 = mkInstr(Op.ConstInt, i64t)
+  ci2.ival = 1
+  let back = mkInstr(Op.Jump, ctx.voidId)
+  back.ival = 0 // back-edge to block 0, whose param is at index 0
+  back.args = [1]
+  let f2 = IrFunc{ name: "f2", paramTypes: [i64t], result: ctx.voidId,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 3 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), ci2, back],
+    isFallible: false }
+  let b2 = buildIntervals(ctx, f2)
+  assert(b2.intervals[0].start == 0) // NOT lowered — the edge is at 2, already later
 }
 
 function checkArm64Intervals() {
@@ -4245,14 +4317,14 @@ function checkX64FloatRegFile() {
   assert(w[0] == XmmReg.Xmm6 && w[7] == XmmReg.Xmm13)
 }
 
-function checkX64BackEdge() {
+function checkBackEdge() {
   // A back-edge is a target at or before the branching block — the RPO shape.
   // It gets a safepoint poll so an allocation-free loop still lets the
-  // collector run (runtime/ABI.md §5).
-  assert(xIsBackEdge(3, 3))  // a self-loop IS a back-edge
-  assert(xIsBackEdge(5, 2))
-  assert(!xIsBackEdge(2, 5)) // a forward jump is not
-  assert(!xIsBackEdge(0, 1))
+  // collector run (runtime/ABI.md §5). Shared by both backends (codegen.bit).
+  assert(isBackEdge(3, 3))  // a self-loop IS a back-edge
+  assert(isBackEdge(5, 2))
+  assert(!isBackEdge(2, 5)) // a forward jump is not
+  assert(!isBackEdge(0, 1))
 }
 
 function checkX64Canon() {
@@ -5071,7 +5143,7 @@ function selfcheck() {
   checkX64StackArgs()
   checkX64RegFile()
   checkX64FloatRegFile()
-  checkX64BackEdge()
+  checkBackEdge()
   checkX64Canon()
   checkX64CanonNarrow()
   checkX64Operands()
@@ -5107,6 +5179,7 @@ function selfcheck() {
   checkArm64Calls()
   checkArm64Safepoints()
   checkStringPool()
+  checkIntervalParamsToPreds()
   checkArm64Intervals()
   checkCompileFunction()
   checkFloatBits()
