@@ -57,6 +57,13 @@ struct Checker {
   // reserve+resolve it on first touch (the seed's declTypeOf recursion), giving
   // type ids in source-order touch order (needed for method-name mangling).
   typeDecls: map<string, int>,
+  // A generic list node (`<T, U>`) -> that decl's OWN TypeParam ids, in
+  // declaration order. `userTypes[name]` cannot answer this: every generic
+  // registers its params under their bare names, so the last `<T>` declared in
+  // the module wins and an earlier decl's `T` becomes unreachable by name. The
+  // ids are what a template body's checked types actually mention, so
+  // monomorphization needs them exactly (see genericEnvOf).
+  genericParamIds: map<int, []int>,
   // --- module identity (#1345) --------------------------------------------
   // This module's id. The root is the module being built; lowering leaves the
   // root's names bare (so `main` stays `main`) and prefixes every other
@@ -112,7 +119,8 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
     typeParamConstraints: map<string, int>{},
     declTypeNodes: map<string, int>{},
-    typeDecls: map<string, int>{}, moduleId: 0, mods: []Checker(0),
+    typeDecls: map<string, int>{}, genericParamIds: map<int, []int>{},
+    moduleId: 0, mods: []Checker(0),
     importedFrom: map<string, ImportOrigin>{}, exports: map<string, bool>{},
     importPaths: map<string, int>{} }
 }
@@ -596,12 +604,16 @@ function isTypeParamName(c: Checker, decl: int, name: string): bool {
   return false
 }
 
-// If a call targets a generic function whose result is a bare type parameter
-// `T`, substitute it: find the parameter typed `T` and return that argument's
-// (defaulted) type. Returns -1 when the rule does not apply (concrete result,
-// non-generic, or `T` bound to no parameter) so the caller falls back.
-// ponytail: bare-`T` results only — a composite `[]T` result is rarer and the
-// default `funcResults` path already renders it structurally.
+// The concrete result type of a call to a generic function: bind every type
+// param from the arguments, then resolve the declared result node with those
+// bindings in force. Returns -1 when the rule does not apply (non-generic, or no
+// declared result) so the caller falls back.
+//
+// A bare `T` result and a composite `[]T` are the SAME operation — only the node
+// shape differs — so both go through typeFromNodeIn. Handling only the bare case
+// (as this did) left `[]T` resolving with `T` unsubstituted: `len()` still worked
+// (it ignores the element type) but indexing or iterating the result could not
+// compute an element width, and lowering silently stubbed the whole caller out.
 function genericResultAt(c: Checker, name: string, callNode: int): int {
   let decl = funcDeclLookup(c, name)
   if (decl == 0) {
@@ -615,21 +627,30 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
   if (dk[2] == 0 || dk[4] == 0) {
     return -1 // not generic, or no declared result: the plain path handles it
   }
-  let rn = getNode(oc.tree, dk[4])
-  if (rn.tag != Tag.Ident) {
+  let tps = kidsOf(oc.tree, dk[2])
+  let params = kidsOf(oc.tree, dk[3])
+  let sub = noSubst()
+  let ti = 0
+  while (ti < len(tps)) {
+    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[ti])[0])
+    let tpname = oc.source[tpn.span.start:tpn.span.end]
+    // A type param no parameter mentions (`function zero<T>(): T`) stays
+    // unbound and resolves as it always did — no worse than before.
+    let bound = bindTypeParamAtCall(oc, c, callNode, params, tpname)
+    if (bound != 0) {
+      sub.names = append(sub.names, tpname)
+      sub.types = append(sub.types, bound)
+    }
+    ti = ti + 1
+  }
+  if (len(sub.names) == 0) {
+    return -1 // nothing bound: the plain path renders it just as well
+  }
+  let r = typeFromNodeIn(oc, dk[4], sub)
+  if (r == 0) {
     return -1
   }
-  let rname = oc.source[rn.span.start:rn.span.end]
-  if (!isTypeParamName(oc, decl, rname)) {
-    return -1
-  }
-  // Bind the result type-param from a parameter mentioning it — bare (`x: T`) or
-  // nested in a generic instance (`p: Pair<T>`).
-  let bound = bindTypeParamAtCall(oc, c, callNode, kidsOf(oc.tree, dk[3]), rname)
-  if (bound != 0) {
-    return bound
-  }
-  return -1
+  return r
 }
 
 // Whether `name` is a generic free function (has a non-empty `<...>` list).
@@ -683,6 +704,22 @@ function bindTypeParamFromNode(pc: Checker, paramNode: int, argType: int, tpname
   }
   if (pn.tag == Tag.Fallible && at.kind == TypeKind.Fallible) {
     return bindTypeParamFromNode(pc, pk[0], at.result, tpname)
+  }
+  // `f: (T) => U` against a concrete `(i64) => i64`. Without this a type param
+  // reachable ONLY through a function-typed parameter — `U` in
+  // `mapped<T, U>(xs: []T, f: (T) => U): []U` — can never bind. Func params live
+  // in `members`; try each position, then the result.
+  if (pn.tag == Tag.FuncType && at.kind == TypeKind.Func) {
+    let plist = kidsOf(pc.tree, pk[0])
+    let i = 0
+    while (i < len(plist) && i < len(at.members)) {
+      let b = bindTypeParamFromNode(pc, plist[i], at.members[i], tpname)
+      if (b != 0) {
+        return b
+      }
+      i = i + 1
+    }
+    return bindTypeParamFromNode(pc, pk[1], at.result, tpname)
   }
   return 0
 }
@@ -915,7 +952,41 @@ function defaultType(c: Checker, ty: int): int {
 // Infers a type-annotation node to a TypeId. Primitives and simple composites
 // (slice/array/map/chan) are handled here; named types need resolve and infer
 // to invalid (0) for now.
+// A type-parameter substitution in force while resolving a type node: `names[i]`
+// resolves to `types[i]` rather than to whatever it names in scope. Parallel
+// slices, not a map — a generic declares a handful of type params, and a linear
+// scan of two beats hashing on typeFromNode's hot path.
+struct TypeSubst {
+  names: []string,
+  types: []int,
+}
+
+function noSubst(): TypeSubst {
+  return TypeSubst{ names: []string(0), types: []int(0) }
+}
+
+// The type bound to `name`, or 0 when `name` is not a substituted type param.
+// A type param can never legally bind to type id 0, so 0 is an unambiguous miss.
+function substLookup(sub: TypeSubst, name: string): int {
+  let i = 0
+  while (i < len(sub.names)) {
+    if (sub.names[i] == name) {
+      return sub.types[i]
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 function typeFromNode(c: Checker, node: int): int {
+  return typeFromNodeIn(c, node, noSubst())
+}
+
+// Resolves a type node to a TypeId with `sub`'s type-param bindings applied at
+// every depth. `[]T` under {T -> i64} is `[]i64`, and so on through every
+// composite — substitution is not a special case of the shape, it is a rule
+// about names, so it belongs in the one resolver rather than a parallel walker.
+function typeFromNodeIn(c: Checker, node: int, sub: TypeSubst): int {
   if (node == 0) {
     return 0
   }
@@ -923,6 +994,12 @@ function typeFromNode(c: Checker, node: int): int {
   let tag = n.tag
   if (tag == Tag.Ident) {
     let name = c.source[n.span.start:n.span.end]
+    // A bound type param wins outright: it cannot collide with a prim or with
+    // `error` (both reserved), so order costs nothing and states the intent.
+    let s = substLookup(sub, name)
+    if (s != 0) {
+      return s
+    }
     let p = primIndexByName(name)
     if (p >= 0) {
       return primType(c.ctx, p)
@@ -935,17 +1012,18 @@ function typeFromNode(c: Checker, node: int): int {
   }
   let kids = kidsOf(c.tree, node)
   if (tag == Tag.SliceType) {
-    return mkSlice(c.ctx, typeFromNode(c, kids[0]))
+    return mkSlice(c.ctx, typeFromNodeIn(c, kids[0], sub))
   }
   if (tag == Tag.ChanType) {
-    return mkChan(c.ctx, typeFromNode(c, kids[0]))
+    return mkChan(c.ctx, typeFromNodeIn(c, kids[0], sub))
   }
   if (tag == Tag.MapType) {
-    return mkMap(c.ctx, typeFromNode(c, kids[0]), typeFromNode(c, kids[1]))
+    return mkMap(c.ctx, typeFromNodeIn(c, kids[0], sub), typeFromNodeIn(c, kids[1], sub))
   }
   if (tag == Tag.ArrayType) {
     let sn = getNode(c.tree, kids[0])
-    return mkArray(c.ctx, parseIntText(c.source[sn.span.start:sn.span.end]), typeFromNode(c, kids[1]))
+    return mkArray(c.ctx, parseIntText(c.source[sn.span.start:sn.span.end]),
+      typeFromNodeIn(c, kids[1], sub))
   }
   if (tag == Tag.VoidType) {
     return c.ctx.voidId
@@ -959,9 +1037,9 @@ function typeFromNode(c: Checker, node: int): int {
   if (tag == Tag.Fallible) {
     let errT = c.ctx.errorId
     if (kids[1] != 0) {
-      errT = typeFromNode(c, kids[1])
+      errT = typeFromNodeIn(c, kids[1], sub)
     }
-    return mkFallible(c.ctx, typeFromNode(c, kids[0]), errT)
+    return mkFallible(c.ctx, typeFromNodeIn(c, kids[0], sub), errT)
   }
   // A function type `(P, Q) => R` (func_type `[type_list, result]`).
   if (tag == Tag.FuncType) {
@@ -969,10 +1047,10 @@ function typeFromNode(c: Checker, node: int): int {
     let plist = kidsOf(c.tree, kids[0])
     let pi = 0
     while (pi < len(plist)) {
-      params = append(params, typeFromNode(c, plist[pi]))
+      params = append(params, typeFromNodeIn(c, plist[pi], sub))
       pi = pi + 1
     }
-    return mkFunc(c.ctx, params, false, typeFromNode(c, kids[1]))
+    return mkFunc(c.ctx, params, false, typeFromNodeIn(c, kids[1], sub))
   }
   return 0
 }
@@ -1553,6 +1631,7 @@ function registerGenerics(c: Checker, genNode: int) {
     return
   }
   let ps = kidsOf(c.tree, genNode)
+  let ids = []int(0)
   let i = 0
   while (i < len(ps)) {
     let nm = getNode(c.tree, kidsOf(c.tree, ps[i])[0])
@@ -1561,9 +1640,15 @@ function registerGenerics(c: Checker, genNode: int) {
     // undercount and shift a later named type. userTypes[name] is overwritten to
     // this decl's param, which is correct: members resolve against the decl being
     // built, and a template body's param id never reaches a dump (monomorphized).
-    registerNamedType(c, c.source[nm.span.start:nm.span.end], TypeKind.TypeParam)
+    let pname = c.source[nm.span.start:nm.span.end]
+    registerNamedType(c, pname, TypeKind.TypeParam)
+    // Keep THIS decl's ids: the next generic to declare a `T` overwrites
+    // userTypes["T"], and monomorphizing this one then needs the id its body was
+    // actually checked against.
+    ids = append(ids, userTypeLookup(c, pname))
     i = i + 1
   }
+  c.genericParamIds[genNode] = ids
   i = 0
   while (i < len(ps)) {
     let gk = kidsOf(c.tree, ps[i])
