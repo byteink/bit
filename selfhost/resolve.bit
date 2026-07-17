@@ -71,13 +71,10 @@ function bindName(m: Module, name: string, id: int) {
 }
 
 // Looks up a top-level name; returns the symbol id or -1 if absent.
-// ponytail: linear scan sidesteps the not-yet-lowered map comma-ok; a direct
-// `m.allNames[name]` with presence-check replaces it once that lands.
 function lookupName(m: Module, name: string): int {
-  for (k, v) of m.allNames {
-    if (k == name) {
-      return v
-    }
+  let (id, ok) = m.allNames[name]
+  if (ok) {
+    return id
   }
   return -1
 }
@@ -129,4 +126,930 @@ function universeModule(): Module {
     j = j + 1
   }
   return m
+}
+
+// ============================================================================
+// The resolver proper — compiler/resolve.zig's `Resolver`, passes 1 and 2
+// ============================================================================
+//
+// ONE STRUCTURAL DIFFERENCE FROM THE SEED, and it simplifies everything: the
+// seed carries `files: []ModuleFile` and threads a `file_idx` through every
+// function, because it keeps one tree per file. bit2 CONCATENATES a module's
+// files into a single `source` + `tree` (see project.bit), so there is exactly
+// one tree here and no `file_idx` dimension at all. Spans are module-global;
+// `rSpan` remaps them back to the owning file the same way validate.bit's
+// `vSpan` does.
+//
+// Diagnostic codes (compiler/diagnostics.zig): 40 undefined_name,
+// 42 duplicate_declaration, 43 use_before_init, 44 import_cycle,
+// 45 import_not_found, 46 unexported_name, 47 type_cycle,
+// 48 shadows_predeclared.
+
+const ecUndefinedName = 40
+const ecDuplicateDeclaration = 42
+const ecUseBeforeInit = 43
+const ecImportCycle = 44
+const ecImportNotFound = 45
+const ecUnexportedName = 46
+const ecTypeCycle = 47
+const ecShadowsPredeclared = 48
+
+// A lexical scope. `parent` is -1 for the universe (the chain's root).
+// `pending` holds names this scope declares LATER in program order — a
+// reference that finds a name here rather than in `names` is a use-before-init,
+// not an undefined name. That distinction is the only reason `pending` exists.
+struct Scope {
+  parent: int,
+  names: map<string, int>,
+  pending: map<string, bool>,
+}
+
+// Resolver state for ONE module. Structs are references in Bit, so every helper
+// mutates in place and nothing is threaded back by return value.
+struct Resolver {
+  diags: Diagnostics,
+  // The module being resolved: its concatenated tree/source, and the file table
+  // spans remap against.
+  tree: Tree,
+  source: string,
+  fileStarts: []int,
+  files: []int,
+  // Import path text -> module id, and every module resolved so far (indexed by
+  // module id) so an import can be checked against its target's exports.
+  importPaths: map<string, int>,
+  allModules: []Module,
+  // The prelude module's id whose exports auto-import here, or -1 (this IS the
+  // prelude, or the build ships no stdlib).
+  prelude: int,
+  symbols: []Symbol,
+  scopes: []Scope,
+  exports: map<string, int>,
+  // node index -> symbol id (0 = none). Parallel to the tree's nodes.
+  nodeSymbols: []int,
+  universe: int,
+  moduleScope: int,
+}
+
+// ---- small helpers ---------------------------------------------------------
+
+function rIdentText(r: Resolver, node: int): string {
+  let sp = getNode(r.tree, node).span
+  return r.source[sp.start:sp.end]
+}
+
+// Strips the surrounding quotes from a string_lit leaf's raw source text.
+// Import paths are plain strings (the grammar requires `.string_lit`), so no
+// escape decoding is needed — same reasoning as the seed's `stringLitText`.
+function rStringLitText(r: Resolver, node: int): string {
+  let raw = rIdentText(r, node)
+  if (len(raw) >= 2 && raw[0:1] == "\"" && raw[len(raw) - 1:len(raw)] == "\"") {
+    return raw[1:len(raw) - 1]
+  }
+  return raw
+}
+
+// Module-global span -> the owning file's span. Same remap as validate.bit's
+// `vSpan`: bit2 concatenates a module's files, the renderer needs per-file
+// offsets.
+function rSpan(r: Resolver, node: int): Span {
+  let sp = getNode(r.tree, node).span
+  let loc = fileOf(r.fileStarts, sp.start)
+  return Span{ file: r.files[loc.fileIdx], start: loc.offset, end: loc.offset + (sp.end - sp.start) }
+}
+
+function rError(r: Resolver, node: int, code: int, message: string, hint: string) {
+  report(r.diags, code, rSpan(r, node), message, hint)
+}
+
+function rErrorNoHint(r: Resolver, node: int, code: int, message: string) {
+  reportNoHint(r.diags, code, rSpan(r, node), message)
+}
+
+function rWarn(r: Resolver, node: int, code: int, message: string, hint: string) {
+  warn(r.diags, code, rSpan(r, node), message, hint)
+}
+
+function rPushScope(r: Resolver, parent: int): int {
+  let id = len(r.scopes)
+  r.scopes = append(r.scopes, Scope{ parent: parent, names: map<string, int>{}, pending: map<string, bool>{} })
+  return id
+}
+
+function rNewSymbol(r: Resolver, s: Symbol): int {
+  let id = len(r.symbols)
+  r.symbols = append(r.symbols, s)
+  return id
+}
+
+function rSetNodeSymbol(r: Resolver, node: int, id: int) {
+  r.nodeSymbols[node] = id
+}
+
+// Looks a name up in one scope's active bindings; -1 when absent.
+function rScopeGet(r: Resolver, scopeId: int, name: string): int {
+  let (id, ok) = r.scopes[scopeId].names[name]
+  if (ok) {
+    return id
+  }
+  return -1
+}
+
+// A symbol with no declaration site: the predeclared identifiers, and the
+// implicit `Self` bound inside an interface body (§14.3).
+function rInjectImplicitSymbol(r: Resolver, scopeId: int, name: string, kind: SymbolKind) {
+  let id = rNewSymbol(r, builtinSymbol(name, kind))
+  r.scopes[scopeId].names[name] = id
+}
+
+function rUnwrapExport(r: Resolver, idx: int): int {
+  if (getNode(r.tree, idx).tag == Tag.Export) {
+    return kidsOf(r.tree, idx)[0]
+  }
+  return idx
+}
+
+function newResolver(diags: Diagnostics, m: SrcModule, allModules: []Module, prelude: int): Resolver {
+  let r = Resolver{
+    diags: diags, tree: m.tree, source: m.source, fileStarts: m.fileStarts, files: m.files,
+    importPaths: m.imports, allModules: allModules, prelude: prelude,
+    symbols: []Symbol(0), scopes: []Scope(0), exports: map<string, int>{},
+    nodeSymbols: []int(len(m.tree.nodes)), universe: 0, moduleScope: 0,
+  }
+  // Index 0 is the reserved `none` sentinel, matching the tree's node 0.
+  let sink = rNewSymbol(r, builtinSymbol("", SymbolKind.Poison))
+  r.universe = rPushScope(r, -1)
+  let types = predeclaredTypes()
+  let i = 0
+  while (i < len(types)) {
+    rInjectImplicitSymbol(r, r.universe, types[i], SymbolKind.BuiltinType)
+    i = i + 1
+  }
+  let funcs = predeclaredFuncs()
+  let j = 0
+  while (j < len(funcs)) {
+    rInjectImplicitSymbol(r, r.universe, funcs[j], SymbolKind.BuiltinFunc)
+    j = j + 1
+  }
+  r.moduleScope = rPushScope(r, r.universe)
+  return r
+}
+
+// ---- declaring names -------------------------------------------------------
+
+function rReportDuplicate(r: Resolver, node: int, name: string) {
+  rError(r, node, ecDuplicateDeclaration, "'${name}' is already declared in this scope",
+    "rename or remove one of the declarations")
+}
+
+function rCheckShadowsPredeclared(r: Resolver, node: int, name: string) {
+  if (rScopeGet(r, r.universe, name) >= 0) {
+    rWarn(r, node, ecShadowsPredeclared, "'${name}' shadows a predeclared identifier",
+      "shadowing predeclared names is discouraged")
+  }
+}
+
+// Declares `nameNode` in the module's flat top scope (top-level declarations and
+// import bindings). The blank identifier never binds.
+function rInsertModuleSymbol(r: Resolver, nameNode: int, s: Symbol): int {
+  if (s.name == "_") {
+    rSetNodeSymbol(r, nameNode, 0)
+    return 0
+  }
+  if (rScopeGet(r, r.moduleScope, s.name) >= 0) {
+    rReportDuplicate(r, nameNode, s.name)
+    rSetNodeSymbol(r, nameNode, 0)
+    return 0
+  }
+  let id = rNewSymbol(r, s)
+  r.scopes[r.moduleScope].names[s.name] = id
+  if (s.exported) {
+    r.exports[s.name] = id
+  }
+  rCheckShadowsPredeclared(r, nameNode, s.name)
+  rSetNodeSymbol(r, nameNode, id)
+  return id
+}
+
+// Declares a local (param, receiver, generic param, loop/catch binder, or a
+// block-local let/const being activated). Clears any pending (TDZ) entry so
+// later same-scope references resolve normally.
+function rActivateLocal(r: Resolver, nameNode: int, kind: SymbolKind, scopeId: int): int {
+  let name = rIdentText(r, nameNode)
+  if (name == "_") {
+    rSetNodeSymbol(r, nameNode, 0)
+    return 0
+  }
+  if (rScopeGet(r, scopeId, name) >= 0) {
+    rReportDuplicate(r, nameNode, name)
+    rSetNodeSymbol(r, nameNode, 0)
+    return 0
+  }
+  let id = rNewSymbol(r, Symbol{ name: name, kind: kind, decl: nameNode, fileIdx: 0, exported: false,
+    importedFromModule: -1, importedFromSymbol: -1, namespaceModule: -1 })
+  delete(r.scopes[scopeId].pending, name)
+  r.scopes[scopeId].names[name] = id
+  rCheckShadowsPredeclared(r, nameNode, name)
+  rSetNodeSymbol(r, nameNode, id)
+  return id
+}
+
+// Resolves an identifier reference: walks the parent chain, preferring an
+// already-active binding, falling back to a pending one to report
+// use_before_init instead of a misleading undefined_name. The blank identifier
+// never resolves and never errors (write-only, §5.1).
+function rResolveIdentRef(r: Resolver, node: int, scopeId: int) {
+  let name = rIdentText(r, node)
+  if (name == "_") {
+    rSetNodeSymbol(r, node, 0)
+    return
+  }
+  let cur = scopeId
+  while (cur >= 0) {
+    let found = rScopeGet(r, cur, name)
+    if (found >= 0) {
+      rSetNodeSymbol(r, node, found)
+      return
+    }
+    let (isPending, pendingOk) = r.scopes[cur].pending[name]
+    if (pendingOk && isPending) {
+      rError(r, node, ecUseBeforeInit, "'${name}' is used before it is declared",
+        "move this reference after the declaration")
+      rSetNodeSymbol(r, node, 0)
+      return
+    }
+    cur = r.scopes[cur].parent
+  }
+  rErrorNoHint(r, node, ecUndefinedName, "undefined name '${name}'")
+  rSetNodeSymbol(r, node, 0)
+}
+
+// Auto-imports the prelude's exports into this module's flat scope (SPEC §17),
+// as if each were an explicit `import { name } from "std/core"`. Runs AFTER the
+// module's own top-level declarations, so a user name shadows the prelude rather
+// than colliding with it — the injected binding is simply skipped.
+function rInjectPrelude(r: Resolver) {
+  if (r.prelude < 0 || r.prelude >= len(r.allModules)) {
+    return
+  }
+  for (name, sid) of r.allModules[r.prelude].exports {
+    if (rScopeGet(r, r.moduleScope, name) >= 0) {
+      continue // the user's own name wins
+    }
+    let id = rNewSymbol(r, Symbol{ name: name, kind: SymbolKind.ImportItem, decl: 0, fileIdx: 0,
+      exported: false, importedFromModule: r.prelude, importedFromSymbol: sid, namespaceModule: -1 })
+    r.scopes[r.moduleScope].names[name] = id
+  }
+}
+
+// ---- pass 1: collect top-level symbols (order-independent, §9) -------------
+
+function rCollectTopLevel(r: Resolver) {
+  let decls = kidsOf(r.tree, r.tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    if (decls[i] != 0) {
+      rCollectTopDecl(r, decls[i], false)
+    }
+    i = i + 1
+  }
+}
+
+function rNamedTopDecl(r: Resolver, idx: int, kind: SymbolKind, forcedExport: bool) {
+  let name = kidsOf(r.tree, idx)[0]
+  rInsertModuleSymbol(r, name, Symbol{ name: rIdentText(r, name), kind: kind, decl: idx, fileIdx: 0,
+    exported: forcedExport, importedFromModule: -1, importedFromSymbol: -1, namespaceModule: -1 })
+}
+
+function rCollectTopDecl(r: Resolver, idx: int, forcedExport: bool) {
+  let tag = getNode(r.tree, idx).tag
+  if (tag == Tag.Export) {
+    rCollectTopDecl(r, kidsOf(r.tree, idx)[0], true)
+  } else if (tag == Tag.ImportDecl) {
+    rCollectImport(r, idx)
+  } else if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+    let kind = SymbolKind.ConstBinding
+    if (tag == Tag.LetDecl) {
+      kind = SymbolKind.LetBinding
+    }
+    let bindings = kidsOf(r.tree, idx)
+    let i = 0
+    while (i < len(bindings)) {
+      rDeclarePattern(r, kidsOf(r.tree, bindings[i])[0], kind, forcedExport)
+      i = i + 1
+    }
+  } else if (tag == Tag.TypeAlias) {
+    rNamedTopDecl(r, idx, SymbolKind.TypeAlias, forcedExport)
+  } else if (tag == Tag.FuncDecl) {
+    // Methods (a receiver is present) do not join the flat namespace — different
+    // types may each declare a method with the same name (§10.4); they are
+    // reached via `recv.name(...)`, never a bare scope lookup.
+    let k = kidsOf(r.tree, idx) // [recv, name, generics, params, result, body]
+    if (k[0] == 0) {
+      rInsertModuleSymbol(r, k[1], Symbol{ name: rIdentText(r, k[1]), kind: SymbolKind.Func, decl: idx,
+        fileIdx: 0, exported: forcedExport, importedFromModule: -1, importedFromSymbol: -1,
+        namespaceModule: -1 })
+    }
+  } else if (tag == Tag.StructDecl) {
+    rNamedTopDecl(r, idx, SymbolKind.StructType, forcedExport)
+  } else if (tag == Tag.InterfaceDecl) {
+    rNamedTopDecl(r, idx, SymbolKind.InterfaceType, forcedExport)
+  } else if (tag == Tag.EnumDecl) {
+    rNamedTopDecl(r, idx, SymbolKind.EnumType, forcedExport)
+  }
+  // anything else: a poisoned decl from parser error recovery
+}
+
+function rDeclarePattern(r: Resolver, patIdx: int, kind: SymbolKind, exported: bool) {
+  if (getNode(r.tree, patIdx).tag == Tag.TuplePat) {
+    let subs = kidsOf(r.tree, patIdx)
+    let i = 0
+    while (i < len(subs)) {
+      rDeclarePattern(r, subs[i], kind, exported)
+      i = i + 1
+    }
+    return
+  }
+  rInsertModuleSymbol(r, patIdx, Symbol{ name: rIdentText(r, patIdx), kind: kind, decl: patIdx,
+    fileIdx: 0, exported: exported, importedFromModule: -1, importedFromSymbol: -1,
+    namespaceModule: -1 })
+}
+
+function rCollectImport(r: Resolver, idx: int) {
+  let k = kidsOf(r.tree, idx) // [body, path_string]
+  let body = k[0]
+  let pathNode = k[1]
+  let pathText = rStringLitText(r, pathNode)
+  // The loader already resolved every path it could; an absent entry is a path
+  // it could not find. Cycles are the loader's to detect (it owns the recursion
+  // stack), so bit2 has no separate `cycle` outcome to report here.
+  let (target, found) = r.importPaths[pathText]
+  if (!found) {
+    target = -1
+    rError(r, pathNode, ecImportNotFound, "cannot find module \"${pathText}\"",
+      "relative paths must start with './' or '../'; standard-library modules aren't available yet")
+  }
+
+  let bodyTag = getNode(r.tree, body).tag
+  if (bodyTag == Tag.ImportNs || bodyTag == Tag.ImportStar) {
+    let nameNode = kidsOf(r.tree, body)[0]
+    rInsertModuleSymbol(r, nameNode, Symbol{ name: rIdentText(r, nameNode),
+      kind: SymbolKind.ImportNamespace, decl: nameNode, fileIdx: 0, exported: false,
+      importedFromModule: -1, importedFromSymbol: -1, namespaceModule: target })
+  } else if (bodyTag == Tag.ImportGroup) {
+    let items = kidsOf(r.tree, body)
+    let i = 0
+    while (i < len(items)) {
+      let ik = kidsOf(r.tree, items[i]) // [name, alias_or_none]
+      let bindNode = ik[0]
+      if (ik[1] != 0) {
+        bindNode = ik[1]
+      }
+      rDeclareImportItem(r, ik[0], bindNode, target)
+      i = i + 1
+    }
+  }
+}
+
+function rDeclareImportItem(r: Resolver, srcNameNode: int, bindNameNode: int, target: int) {
+  let kind = SymbolKind.Poison
+  let fromSymbol = -1
+  let fromModule = -1
+  if (target >= 0 && target < len(r.allModules)) {
+    let srcName = rIdentText(r, srcNameNode)
+    let (targetId, exported) = r.allModules[target].exports[srcName]
+    if (exported) {
+      kind = SymbolKind.ImportItem
+      fromModule = target
+      fromSymbol = targetId
+    } else {
+      rError(r, srcNameNode, ecUnexportedName, "'${srcName}' is not exported by this module",
+        "add 'export' to its declaration in the source module, or check the spelling")
+    }
+  }
+  rInsertModuleSymbol(r, bindNameNode, Symbol{ name: rIdentText(r, bindNameNode), kind: kind,
+    decl: bindNameNode, fileIdx: 0, exported: false, importedFromModule: fromModule,
+    importedFromSymbol: fromSymbol, namespaceModule: -1 })
+}
+
+// ---- type-definition cycles (§17.1 mirrors the import-cycle check) ---------
+//
+// Only `type` alias substitution and array/tuple element types embed a value
+// directly (a fixed byte layout at every nesting level); struct/interface names,
+// slices, maps, and chans are reference types (§13.3) — a fixed-size handle
+// regardless of what they point to — so a reference through any of those breaks
+// the cycle and is safe.
+
+function rCheckTypeCycles(r: Resolver) {
+  if (len(r.symbols) <= 1) {
+    return
+  }
+  let i = 1
+  while (i < len(r.symbols)) {
+    let s = r.symbols[i]
+    if (s.kind == SymbolKind.TypeAlias) {
+      let visiting = []bool(len(r.symbols))
+      rEmbedsSelf(r, i, kidsOf(r.tree, s.decl)[2], visiting)
+    } else if (s.kind == SymbolKind.StructType) {
+      let visiting = []bool(len(r.symbols))
+      let fields = kidsOf(r.tree, kidsOf(r.tree, s.decl)[2])
+      let j = 0
+      while (j < len(fields)) {
+        let fieldIdx = rUnwrapExport(r, fields[j])
+        if (rEmbedsSelf(r, i, kidsOf(r.tree, fieldIdx)[1], visiting)) {
+          j = len(fields) // reported once per struct, like the seed's `break`
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+function rEmbedsSelf(r: Resolver, start: int, node: int, visiting: []bool): bool {
+  if (node == 0) {
+    return false
+  }
+  let tag = getNode(r.tree, node).tag
+  if (tag == Tag.ArrayType) {
+    return rEmbedsSelf(r, start, kidsOf(r.tree, node)[1], visiting)
+  }
+  if (tag == Tag.TupleType) {
+    let elems = kidsOf(r.tree, node)
+    let i = 0
+    while (i < len(elems)) {
+      if (rEmbedsSelf(r, start, elems[i], visiting)) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if (tag != Tag.Ident && tag != Tag.GenericInst) {
+    return false // slice/map/chan/func type: also a safe reference boundary
+  }
+  let nameNode = node
+  if (tag == Tag.GenericInst) {
+    nameNode = kidsOf(r.tree, node)[0]
+  }
+  let found = rScopeGet(r, r.moduleScope, rIdentText(r, nameNode))
+  if (found < 0) {
+    return false
+  }
+  if (found == start) {
+    rError(r, nameNode, ecTypeCycle, "'${r.symbols[start].name}' cannot embed itself without indirection",
+      "use a slice, map, or a struct/interface reference to break the cycle")
+    return true
+  }
+  if (r.symbols[found].kind != SymbolKind.TypeAlias) {
+    return false // struct/interface/builtin: a safe reference boundary
+  }
+  if (visiting[found]) {
+    return false // an unrelated cycle; reported when that alias is `start`
+  }
+  visiting[found] = true
+  let embeds = rEmbedsSelf(r, start, kidsOf(r.tree, r.symbols[found].decl)[2], visiting)
+  visiting[found] = false
+  return embeds
+}
+
+// ---- pass 2: resolve bodies, type expressions, and initializers ------------
+
+function rResolveBodies(r: Resolver) {
+  let decls = kidsOf(r.tree, r.tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    if (decls[i] != 0) {
+      rResolveTopDeclBody(r, rUnwrapExport(r, decls[i]))
+    }
+    i = i + 1
+  }
+}
+
+function rResolveTopDeclBody(r: Resolver, idx: int) {
+  let tag = getNode(r.tree, idx).tag
+  if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+    let bindings = kidsOf(r.tree, idx)
+    let i = 0
+    while (i < len(bindings)) {
+      let bk = kidsOf(r.tree, bindings[i]) // [pattern, type_or_none, init_or_none]
+      rResolveNode(r, bk[1], r.moduleScope)
+      rResolveNode(r, bk[2], r.moduleScope)
+      i = i + 1
+    }
+  } else if (tag == Tag.TypeAlias) {
+    let k = kidsOf(r.tree, idx) // [name, generics, ty]
+    rResolveNode(r, k[2], rPushGenericsScope(r, k[1], r.moduleScope))
+  } else if (tag == Tag.FuncDecl) {
+    rResolveFuncDecl(r, idx)
+  } else if (tag == Tag.StructDecl) {
+    rResolveStructDecl(r, idx)
+  } else if (tag == Tag.InterfaceDecl) {
+    rResolveInterfaceDecl(r, idx)
+  } else if (tag == Tag.EnumDecl) {
+    rResolveEnumDecl(r, idx)
+  }
+}
+
+// THE FIX FOR THE `<T>` COLLISION: each decl's type params get their OWN scope,
+// so two decls each declaring `<T>` bind two distinct symbols instead of
+// fighting over one bare name. This is what a scope tree buys.
+function rPushGenericsScope(r: Resolver, genericsIdx: int, parent: int): int {
+  if (genericsIdx == 0) {
+    return parent
+  }
+  let scopeId = rPushScope(r, parent)
+  let gps = kidsOf(r.tree, genericsIdx)
+  let i = 0
+  while (i < len(gps)) {
+    let gk = kidsOf(r.tree, gps[i]) // [name, constraint_or_none]
+    rActivateLocal(r, gk[0], SymbolKind.GenericParam, scopeId)
+    rResolveNode(r, gk[1], scopeId)
+    i = i + 1
+  }
+  return scopeId
+}
+
+function rResolveFuncDecl(r: Resolver, idx: int) {
+  let k = kidsOf(r.tree, idx) // [recv, name, generics, params, result, body]
+  let fnScope = rPushScope(r, rPushGenericsScope(r, k[2], r.moduleScope))
+
+  if (k[0] != 0) {
+    let rk = kidsOf(r.tree, k[0]) // receiver: [name, type_name]
+    rResolveNode(r, rk[1], fnScope)
+    rActivateLocal(r, rk[0], SymbolKind.Receiver, fnScope)
+  }
+  let params = kidsOf(r.tree, k[3])
+  let i = 0
+  while (i < len(params)) {
+    let pk = kidsOf(r.tree, params[i]) // param | param_rest: [name, type]
+    rResolveNode(r, pk[1], fnScope)
+    rActivateLocal(r, pk[0], SymbolKind.Param, fnScope)
+    i = i + 1
+  }
+  rResolveNode(r, k[4], fnScope)
+  rResolveNode(r, k[5], fnScope)
+}
+
+// Reports a duplicate for any name already in `seen`, else records it. Shared by
+// the struct-field / enum-variant / interface-method sibling checks.
+function rSeenDuplicate(r: Resolver, seen: map<string, bool>, nameNode: int): bool {
+  let name = rIdentText(r, nameNode)
+  let (_, dup) = seen[name]
+  if (dup) {
+    rReportDuplicate(r, nameNode, name)
+    return true
+  }
+  seen[name] = true
+  return false
+}
+
+function rResolveStructDecl(r: Resolver, idx: int) {
+  let k = kidsOf(r.tree, idx) // [name, generics, field_list]
+  let scopeId = rPushGenericsScope(r, k[1], r.moduleScope)
+  let seen = map<string, bool>{}
+  let fields = kidsOf(r.tree, k[2])
+  let i = 0
+  while (i < len(fields)) {
+    let fk = kidsOf(r.tree, rUnwrapExport(r, fields[i])) // [name, type]
+    rResolveNode(r, fk[1], scopeId)
+    rSeenDuplicate(r, seen, fk[0])
+    i = i + 1
+  }
+}
+
+function rResolveEnumDecl(r: Resolver, idx: int) {
+  let k = kidsOf(r.tree, idx) // [name, generics, variant_list]
+  let scopeId = rPushGenericsScope(r, k[1], r.moduleScope)
+  let seen = map<string, bool>{}
+  let variants = kidsOf(r.tree, k[2])
+  let i = 0
+  while (i < len(variants)) {
+    let vk = kidsOf(r.tree, variants[i]) // [name, payload_or_none]
+    if (vk[1] != 0) {
+      let tys = kidsOf(r.tree, vk[1])
+      let j = 0
+      while (j < len(tys)) {
+        rResolveNode(r, tys[j], scopeId)
+        j = j + 1
+      }
+    }
+    rSeenDuplicate(r, seen, vk[0])
+    i = i + 1
+  }
+}
+
+function rResolveInterfaceDecl(r: Resolver, idx: int) {
+  let k = kidsOf(r.tree, idx) // [name, generics, method_sig_list]
+  let scopeId = rPushScope(r, rPushGenericsScope(r, k[1], r.moduleScope))
+  // `Self` (§14.3) stands for whatever type ends up satisfying the interface;
+  // it is only meaningful inside method signatures.
+  rInjectImplicitSymbol(r, scopeId, "Self", SymbolKind.GenericParam)
+
+  let seen = map<string, bool>{}
+  let sigs = kidsOf(r.tree, k[2])
+  let i = 0
+  while (i < len(sigs)) {
+    let sk = kidsOf(r.tree, sigs[i]) // [name, params, result_or_none]
+    rSeenDuplicate(r, seen, sk[0])
+    let params = kidsOf(r.tree, sk[1])
+    let j = 0
+    while (j < len(params)) {
+      // [name, type] — no body, so the params themselves never need binding
+      rResolveNode(r, kidsOf(r.tree, params[j])[1], scopeId)
+      j = j + 1
+    }
+    rResolveNode(r, sk[2], scopeId)
+    i = i + 1
+  }
+}
+
+// ---- blocks: prescan for use-before-init, then resolve sequentially --------
+
+function rResolveBlockScope(r: Resolver, blockIdx: int, parent: int) {
+  let scopeId = rPushScope(r, parent)
+  let stmts = kidsOf(r.tree, blockIdx)
+  rPrescanBlockNames(r, stmts, scopeId)
+  let i = 0
+  while (i < len(stmts)) {
+    rResolveNode(r, stmts[i], scopeId)
+    i = i + 1
+  }
+}
+
+function rPrescanBlockNames(r: Resolver, stmts: []int, scopeId: int) {
+  let i = 0
+  while (i < len(stmts)) {
+    let tag = getNode(r.tree, stmts[i]).tag
+    if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+      let bindings = kidsOf(r.tree, stmts[i])
+      let j = 0
+      while (j < len(bindings)) {
+        rPrescanPattern(r, kidsOf(r.tree, bindings[j])[0], scopeId)
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+function rPrescanPattern(r: Resolver, patIdx: int, scopeId: int) {
+  if (getNode(r.tree, patIdx).tag == Tag.TuplePat) {
+    let subs = kidsOf(r.tree, patIdx)
+    let i = 0
+    while (i < len(subs)) {
+      rPrescanPattern(r, subs[i], scopeId)
+      i = i + 1
+    }
+    return
+  }
+  let name = rIdentText(r, patIdx)
+  if (name == "_") {
+    return
+  }
+  r.scopes[scopeId].pending[name] = true
+}
+
+function rActivatePattern(r: Resolver, patIdx: int, kind: SymbolKind, scopeId: int) {
+  if (getNode(r.tree, patIdx).tag == Tag.TuplePat) {
+    let subs = kidsOf(r.tree, patIdx)
+    let i = 0
+    while (i < len(subs)) {
+      rActivatePattern(r, subs[i], kind, scopeId)
+      i = i + 1
+    }
+    return
+  }
+  rActivateLocal(r, patIdx, kind, scopeId)
+}
+
+// Case/clause bodies share the enclosing scope rather than opening their own: a
+// case's own prescan still runs, so declarations inside one case are visible to
+// a later reference in the SAME case, and colliding with a sibling case's
+// declaration is a duplicate in the shared scope.
+function rResolveCaseBody(r: Resolver, stmtListIdx: int, scopeId: int) {
+  let stmts = kidsOf(r.tree, stmtListIdx)
+  rPrescanBlockNames(r, stmts, scopeId)
+  let i = 0
+  while (i < len(stmts)) {
+    rResolveNode(r, stmts[i], scopeId)
+    i = i + 1
+  }
+}
+
+function rResolveForC(r: Resolver, idx: int, scopeId: int) {
+  let k = kidsOf(r.tree, idx) // [init_or_none, cond_or_none, post_or_none, body]
+  let loopScope = rPushScope(r, scopeId)
+  rResolveNode(r, k[0], loopScope)
+  rResolveNode(r, k[1], loopScope)
+  rResolveNode(r, k[2], loopScope)
+  rResolveNode(r, k[3], loopScope)
+}
+
+function rResolveForOf(r: Resolver, idx: int, scopeId: int) {
+  let k = kidsOf(r.tree, idx) // [binder, iter_expr, body]
+  rResolveNode(r, k[1], scopeId) // the iterable cannot see the loop variable
+  let loopScope = rPushScope(r, scopeId)
+  rActivatePattern(r, k[0], SymbolKind.LetBinding, loopScope)
+  rResolveNode(r, k[2], loopScope)
+}
+
+function rResolveForIn(r: Resolver, idx: int, scopeId: int) {
+  let k = kidsOf(r.tree, idx) // [name_ident, iter_expr, body]
+  rResolveNode(r, k[1], scopeId)
+  let loopScope = rPushScope(r, scopeId)
+  rActivateLocal(r, k[0], SymbolKind.LetBinding, loopScope)
+  rResolveNode(r, k[2], loopScope)
+}
+
+function rResolveSwitch(r: Resolver, idx: int, scopeId: int) {
+  let k = kidsOf(r.tree, idx) // [subject_or_none, case_list]
+  rResolveNode(r, k[0], scopeId)
+  let cases = kidsOf(r.tree, k[1])
+  let i = 0
+  while (i < len(cases)) {
+    let tag = getNode(r.tree, cases[i]).tag
+    if (tag == Tag.SwitchCase) {
+      let ck = kidsOf(r.tree, cases[i]) // [expr_list, stmt_list]
+      let exprs = kidsOf(r.tree, ck[0])
+      let j = 0
+      while (j < len(exprs)) {
+        rResolveNode(r, exprs[j], scopeId)
+        j = j + 1
+      }
+      rResolveCaseBody(r, ck[1], scopeId)
+    } else if (tag == Tag.SwitchDefault) {
+      rResolveCaseBody(r, kidsOf(r.tree, cases[i])[0], scopeId)
+    }
+    i = i + 1
+  }
+}
+
+// A `match`: the subject, then each arm's body in its own scope. A variant
+// pattern's NAME is not a scope lookup — the checker resolves it against the
+// subject's enum type — so only its payload binders activate here.
+function rResolveMatch(r: Resolver, idx: int, scopeId: int) {
+  let k = kidsOf(r.tree, idx) // [subject, arm_list]
+  rResolveNode(r, k[0], scopeId)
+  let arms = kidsOf(r.tree, k[1])
+  let i = 0
+  while (i < len(arms)) {
+    let ak = kidsOf(r.tree, arms[i]) // [variant_pat, body]
+    let armScope = rPushScope(r, scopeId)
+    let vk = kidsOf(r.tree, ak[0]) // variant_pat: [name, binders_or_none]
+    if (vk[1] != 0) {
+      let binders = kidsOf(r.tree, vk[1])
+      let j = 0
+      while (j < len(binders)) {
+        rActivateLocal(r, binders[j], SymbolKind.LetBinding, armScope)
+        j = j + 1
+      }
+    }
+    rResolveNode(r, ak[1], armScope)
+    i = i + 1
+  }
+}
+
+function rResolveSelect(r: Resolver, idx: int, scopeId: int) {
+  let clauses = kidsOf(r.tree, idx)
+  let i = 0
+  while (i < len(clauses)) {
+    let tag = getNode(r.tree, clauses[i]).tag
+    if (tag == Tag.CommCase) {
+      let ck = kidsOf(r.tree, clauses[i]) // [comm, stmt_list]
+      let commScope = rPushScope(r, scopeId)
+      rResolveComm(r, ck[0], commScope)
+      rResolveCaseBody(r, ck[1], commScope)
+    } else if (tag == Tag.CommDefault) {
+      rResolveCaseBody(r, kidsOf(r.tree, clauses[i])[0], scopeId)
+    }
+    i = i + 1
+  }
+}
+
+function rResolveComm(r: Resolver, idx: int, scopeId: int) {
+  let tag = getNode(r.tree, idx).tag
+  if (tag == Tag.SendStmt) {
+    let k = kidsOf(r.tree, idx)
+    rResolveNode(r, k[0], scopeId)
+    rResolveNode(r, k[1], scopeId)
+  } else if (tag == Tag.RecvBind) {
+    let k = kidsOf(r.tree, idx) // [binder_or_none, chan_expr]
+    rResolveNode(r, k[1], scopeId)
+    if (k[0] != 0) {
+      rActivatePattern(r, k[0], SymbolKind.LetBinding, scopeId)
+    }
+  }
+}
+
+// The unified expression/statement/type walker. Because value and type names
+// share one flat namespace, a type-shaped node (GenericInst, ArrayType, ...)
+// resolves through the exact same recursion as an expression: leaves have no
+// kids (a no-op), and the only positions that must NOT recurse as plain
+// references are member/field names, handled below. Scope-opening and
+// name-declaring constructs get their own case; everything else falls through
+// to the default "resolve every child".
+function rResolveNode(r: Resolver, idx: int, scopeId: int) {
+  if (idx == 0) {
+    return
+  }
+  let tag = getNode(r.tree, idx).tag
+  if (tag == Tag.Ident) {
+    rResolveIdentRef(r, idx, scopeId)
+    return
+  }
+  // `.name` is a member/field name, resolved later against a type, not a scope
+  // lookup — only the receiver/base is a reference.
+  if (tag == Tag.Member) {
+    rResolveNode(r, kidsOf(r.tree, idx)[0], scopeId)
+    return
+  }
+  if (tag == Tag.FieldInit) {
+    rResolveNode(r, kidsOf(r.tree, idx)[1], scopeId)
+    return
+  }
+  if (tag == Tag.Block) {
+    rResolveBlockScope(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+    let kind = SymbolKind.ConstBinding
+    if (tag == Tag.LetDecl) {
+      kind = SymbolKind.LetBinding
+    }
+    let bindings = kidsOf(r.tree, idx)
+    let i = 0
+    while (i < len(bindings)) {
+      let bk = kidsOf(r.tree, bindings[i]) // [pattern, type_or_none, init_or_none]
+      rResolveNode(r, bk[1], scopeId)
+      rResolveNode(r, bk[2], scopeId)
+      rActivatePattern(r, bk[0], kind, scopeId)
+      i = i + 1
+    }
+    return
+  }
+  if (tag == Tag.ForC) {
+    rResolveForC(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.ForOf) {
+    rResolveForOf(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.ForIn) {
+    rResolveForIn(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.SwitchStmt) {
+    rResolveSwitch(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.MatchStmt) {
+    rResolveMatch(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.SelectStmt) {
+    rResolveSelect(r, idx, scopeId)
+    return
+  }
+  if (tag == Tag.CatchBind) {
+    let k = kidsOf(r.tree, idx) // [expr, err_ident, block]
+    rResolveNode(r, k[0], scopeId)
+    let catchScope = rPushScope(r, scopeId)
+    rActivateLocal(r, k[1], SymbolKind.LetBinding, catchScope)
+    rResolveNode(r, k[2], catchScope)
+    return
+  }
+  if (tag == Tag.ArrowFn) {
+    let k = kidsOf(r.tree, idx) // [arrow_params, body]
+    let arrowScope = rPushScope(r, scopeId)
+    let params = kidsOf(r.tree, k[0])
+    let i = 0
+    while (i < len(params)) {
+      let pk = kidsOf(r.tree, params[i]) // [name, type_or_none]
+      rResolveNode(r, pk[1], arrowScope)
+      rActivateLocal(r, pk[0], SymbolKind.Param, arrowScope)
+      i = i + 1
+    }
+    rResolveNode(r, k[1], arrowScope)
+    return
+  }
+  let kids = kidsOf(r.tree, idx)
+  let i = 0
+  while (i < len(kids)) {
+    rResolveNode(r, kids[i], scopeId)
+    i = i + 1
+  }
+}
+
+// Resolves one module. `allModules` is every module resolved so far (indexed by
+// module id) so imports can be checked against their target's exports; the
+// loader loads dependencies first, so they are always present by the time a
+// dependent resolves.
+function resolveModule(diags: Diagnostics, m: SrcModule, allModules: []Module, prelude: int): Module {
+  let r = newResolver(diags, m, allModules, prelude)
+  rCollectTopLevel(r)
+  rInjectPrelude(r) // after the module's own decls, so user names shadow it
+  rCheckTypeCycles(r)
+  rResolveBodies(r)
+  return Module{ symbols: r.symbols, allNames: r.scopes[r.moduleScope].names, exports: r.exports }
 }
