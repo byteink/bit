@@ -123,11 +123,34 @@ function main() {
     return
   }
   if (len(a) >= 3 && a[1] == "build") {
-    let out = pathStem(a[2])
-    if (len(a) >= 5 && a[3] == "-o") {
-      out = a[4]
+    // Parse: one positional <src>, plus `-o <out>` and `--target <t>` in any
+    // order after it.
+    let out = ""
+    let target = hostBuildTarget()
+    let ai = 3
+    while (ai < len(a)) {
+      if (a[ai] == "-o" && ai + 1 < len(a)) {
+        out = a[ai + 1]
+        ai = ai + 2
+      } else if ((a[ai] == "--target" || a[ai] == "-t") && ai + 1 < len(a)) {
+        let ti = parseBuildTarget(a[ai + 1])
+        if (ti < 0) {
+          print("bitc2: unknown target '${a[ai + 1]}' (x86_64-linux | aarch64-linux | aarch64-macos)\n")
+          exit(1)
+          return
+        }
+        target = buildTargetOf(ti)
+        ai = ai + 2
+      } else {
+        print("bitc2: unexpected argument '${a[ai]}'\n")
+        exit(1)
+        return
+      }
     }
-    if (buildCmd(a[2], out)) {
+    if (out == "") {
+      out = pathStem(a[2])
+    }
+    if (buildCmd(a[2], out, target)) {
       return
     }
     exit(1)
@@ -162,6 +185,70 @@ function pathStem(path: string): string {
   return string(b[start:end])
 }
 
+// The native binary target `build` produces. `--target` cross-produces the
+// others, which only their own host can execute.
+enum BuildTarget {
+  X86_64Linux,
+  Aarch64Linux,
+  Aarch64Macos,
+}
+
+// The BuildTarget named by a triple, or -1. Bit has no int->enum cast, so this
+// returns an ordinal that buildTargetOf maps back (see elfLoKindIndex for the
+// same shape); the round-trip is asserted in selfcheck.
+function parseBuildTarget(s: string): int {
+  if (s == "x86_64-linux") { return 0 }
+  if (s == "aarch64-linux" || s == "arm64-linux") { return 1 }
+  if (s == "aarch64-macos" || s == "arm64-macos") { return 2 }
+  return -1
+}
+
+function buildTargetOf(i: int): BuildTarget {
+  if (i == 0) { return BuildTarget.X86_64Linux }
+  if (i == 1) { return BuildTarget.Aarch64Linux }
+  return BuildTarget.Aarch64Macos
+}
+
+function buildTargetIndex(t: BuildTarget): int {
+  if (t == BuildTarget.X86_64Linux) { return 0 }
+  if (t == BuildTarget.Aarch64Linux) { return 1 }
+  return 2
+}
+
+// The default `build` target. ponytail: hard-coded to what this compiler is
+// itself built as today — the seed derives it from `builtin.target`, which Bit
+// has no equivalent of. Correct while bitc2 is only ever built on macOS/arm64;
+// the upgrade is a `hostTarget()` runtime primitive, needed the moment bitc2 is
+// built for a Linux host (i.e. when #365 flips CI over).
+function hostBuildTarget(): BuildTarget {
+  return BuildTarget.Aarch64Macos
+}
+
+function isMachoTarget(t: BuildTarget): bool {
+  return t == BuildTarget.Aarch64Macos
+}
+
+// The ELF target for a Linux BuildTarget. Only ever called for one.
+function elfTargetOf(t: BuildTarget): ElfTarget {
+  if (t == BuildTarget.X86_64Linux) {
+    return ElfTarget.X86_64
+  }
+  return ElfTarget.Aarch64
+}
+
+function elfLinkTargetOf(t: BuildTarget): ElfLinkTarget {
+  if (t == BuildTarget.X86_64Linux) {
+    return ElfLinkTarget.X86_64Linux
+  }
+  return ElfLinkTarget.Aarch64Linux
+}
+
+function buildTargetName(t: BuildTarget): string {
+  if (t == BuildTarget.X86_64Linux) { return "x86_64-linux" }
+  if (t == BuildTarget.Aarch64Linux) { return "aarch64-linux" }
+  return "aarch64-macos"
+}
+
 // Builds `src`'s IR: a directory is a multi-module project (loaded with the
 // stdlib and its prelude attached), a single file is one module on its own.
 function buildIr(src: string): IrModule! {
@@ -177,9 +264,9 @@ function buildIr(src: string): IrModule! {
 
 // Compiles `src` (a file or a project directory) to a native executable at
 // `out`. Returns false on any failure (already reported).
-function buildCmd(src: string, out: string): bool {
-  let rt = readFile(libbitrtPath()) catch e {
-    print("bitc2: runtime archive ${libbitrtPath()}: ${e.message()}\n")
+function buildCmd(src: string, out: string, target: BuildTarget): bool {
+  let rt = readFile(libbitrtPath(target)) catch e {
+    print("bitc2: runtime archive ${libbitrtPath(target)}: ${e.message()}\n")
     return false
   }
   let module = buildIr(src) catch e {
@@ -196,14 +283,32 @@ function buildCmd(src: string, out: string): bool {
     }
     return false
   }
-  let obj = emitMachoObject(module) catch e {
-    print("bitc2: ${src}: ${e.message()}\n")
-    return false
-  }
-  let exe = linkMacho([meObjectInput(obj), meArchiveInput([]byte(rt))],
-    pathStem(out)) catch e {
-    print("bitc2: link ${out}: ${e.message()}\n")
-    return false
+  // Mach-O and ELF differ in every layer below here: the object format, the
+  // static-data placement (dyld-rebased __data vs read-only .rodata), and the
+  // linker's image. The backend follows the target too — an ELF x86_64-linux
+  // build is what drives x64.bit.
+  let exe = []u8(0)
+  if (isMachoTarget(target)) {
+    let obj = emitMachoObject(module) catch e {
+      print("bitc2: ${src}: ${e.message()}\n")
+      return false
+    }
+    exe = linkMacho([meObjectInput(obj), meArchiveInput([]byte(rt))],
+      pathStem(out)) catch e {
+      print("bitc2: link ${out}: ${e.message()}\n")
+      return false
+    }
+  } else {
+    let obj = emitElfObject(module, elfTargetOf(target)) catch e {
+      print("bitc2: ${src}: ${e.message()}\n")
+      return false
+    }
+    exe = linkElfExecutable(elfLinkTargetOf(target),
+      [ElfLinkInput{ isArchive: false, bytes: obj },
+       ElfLinkInput{ isArchive: true, bytes: []byte(rt) }]) catch e {
+      print("bitc2: link ${out}: ${e.message()}\n")
+      return false
+    }
   }
   writeFile(out, string(exe)) catch e {
     print("bitc2: cannot write ${out}: ${e.message()}\n")
@@ -217,10 +322,12 @@ function buildCmd(src: string, out: string): bool {
   return true
 }
 
-// The runtime archive this compiler links against. Overridable so a build tree
-// that keeps it elsewhere still works, matching the seed's BIT_LIBBITRT.
-function libbitrtPath(): string {
-  return envOr("BIT_LIBBITRT", "zig-out/lib/aarch64-macos/libbitrt.a")
+// The runtime archive this compiler links against, per target. Overridable so a
+// build tree that keeps it elsewhere still works, matching the seed's
+// BIT_LIBBITRT — though an override names ONE archive, so it only makes sense
+// alongside a matching --target.
+function libbitrtPath(target: BuildTarget): string {
+  return envOr("BIT_LIBBITRT", "zig-out/lib/${buildTargetName(target)}/libbitrt.a")
 }
 
 // Where `std/*` imports resolve. ponytail: cwd-relative dev-build path, the same

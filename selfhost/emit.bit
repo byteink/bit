@@ -366,3 +366,305 @@ function emRelocKind(k: RelocKind): MachoRelocKind {
   assert(k == RelocKind.PageOff12)
   return MachoRelocKind.Pageoff12
 }
+
+// ---- ELF object emission (#345: the Linux path) ---------------------------
+
+// Emits the arch-independent ELF data — string-pool headers, gc_alloc TypeInfo
+// blobs (ABI.md §2.1), and the GC stack-map table — all into `.rodata` with
+// abs64 pointer relocations, then declares an undefined extern for every
+// referenced-but-undefined symbol (the runtime's bit_rt_* calls). Shared by both
+// ELF targets; their only differences (codegen, the entry trampoline, the code
+// relocation kinds) are handled by the caller before this runs.
+//
+// Note the contrast with emitMachoObject above, which puts these blobs in
+// WRITABLE __data: Mach-O output is PIE and dyld rebases each pointer at load.
+// An ELF link here is non-PIE and static, so the addresses are known at link
+// time and the blobs are read-only.
+struct EmElfBlobs {
+  symbols: []ElfSymbol,
+  relocs: []ElfRelocation,
+}
+
+function emElfSym(name: string, kind: ElfSectionKind, off: int, size: int,
+  binding: ElfBinding, sk: ElfSymKind): ElfSymbol {
+  return ElfSymbol{ name: name, hasSection: true, section: kind, offset: off,
+    size: size, binding: binding, kind: sk }
+}
+
+function emElfAbs64(off: int, sym: string): ElfRelocation {
+  return ElfRelocation{ section: ElfSectionKind.Rodata, offset: off, symbol: sym,
+    kind: ElfRelocKind.Abs64, addend: 0 }
+}
+
+function emitElfBlobs(module: IrModule, rodata: ByteBuf, symbols: []ElfSymbol,
+  relocs: []ElfRelocation, defined: map<string, bool>,
+  stackmaps: []FuncStackMap): EmElfBlobs {
+  // ---- string pool -> .rodata bytes + a {ptr,len} header -----------------
+  let si = 0
+  while (si < len(module.stringPool)) {
+    let s = module.stringPool[si]
+    let dataOff = len(rodata.bytes)
+    appendBytes(rodata, []byte(s))
+    let dataName = "__bitstr_${si}_data"
+    symbols = append(symbols, emElfSym(dataName, ElfSectionKind.Rodata, dataOff,
+      len([]byte(s)), ElfBinding.Local, ElfSymKind.Object))
+    defined[dataName] = true
+
+    emPadTo8(rodata)
+    let hdrOff = len(rodata.bytes)
+    appendU64(rodata, 0)              // ptr — filled by the reloc below
+    appendU64(rodata, len([]byte(s))) // len
+    let hdrName = "__bitstr_${si}"
+    symbols = append(symbols, emElfSym(hdrName, ElfSectionKind.Rodata, hdrOff, 16,
+      ElfBinding.Global, ElfSymKind.Object))
+    defined[hdrName] = true
+    relocs = append(relocs, emElfAbs64(hdrOff, dataName))
+    si = si + 1
+  }
+
+  // ---- gc_alloc TypeInfo blobs -> .rodata --------------------------------
+  let tis = collectTypeInfos(module)
+  let ti = 0
+  while (ti < len(tis)) {
+    let t = tis[ti]
+    let name = typeInfoSymbol(t.disc, t.size, t.ptrOffsets)
+    let offsName = ""
+    if (len(t.ptrOffsets) > 0) {
+      emPadTo8(rodata)
+      let offsOff = len(rodata.bytes)
+      let k = 0
+      while (k < len(t.ptrOffsets)) {
+        appendU64(rodata, t.ptrOffsets[k])
+        k = k + 1
+      }
+      offsName = name + "_offs"
+      symbols = append(symbols, emElfSym(offsName, ElfSectionKind.Rodata, offsOff,
+        len(t.ptrOffsets) * 8, ElfBinding.Local, ElfSymKind.Object))
+      defined[offsName] = true
+    }
+    let tname = ""
+    if (module.ctx.types[t.disc].hasName) {
+      tname = module.ctx.types[t.disc].name
+    }
+    let nameSym = ""
+    if (len([]byte(tname)) > 0) {
+      let nmOff = len(rodata.bytes)
+      appendBytes(rodata, []byte(tname))
+      nameSym = name + "_name"
+      symbols = append(symbols, emElfSym(nameSym, ElfSectionKind.Rodata, nmOff,
+        len([]byte(tname)), ElfBinding.Local, ElfSymKind.Object))
+      defined[nameSym] = true
+    }
+    let methods = emitMethodTable(module, rodata, t.disc, name)
+    if (methods.sym != "") {
+      symbols = append(symbols, emElfSym(methods.sym, ElfSectionKind.Rodata,
+        methods.off, methods.size, ElfBinding.Local, ElfSymKind.Object))
+      defined[methods.sym] = true
+    }
+
+    emPadTo8(rodata)
+    let tiOff = len(rodata.bytes)
+    appendU64(rodata, t.size)             // size
+    appendU64(rodata, 0)                  // ptr_offsets_ptr (reloc below if any)
+    appendU64(rodata, len(t.ptrOffsets))  // ptr_offsets_len
+    appendU64(rodata, 0)                  // name_ptr (reloc below if any)
+    appendU64(rodata, len([]byte(tname))) // name_len
+    appendU64(rodata, 0)                  // methods_ptr (reloc below if any)
+    appendU64(rodata, methods.size / 16)  // methods_len
+    symbols = append(symbols, emElfSym(name, ElfSectionKind.Rodata, tiOff, 56,
+      ElfBinding.Global, ElfSymKind.Object))
+    defined[name] = true
+    if (len(t.ptrOffsets) > 0) {
+      relocs = append(relocs, emElfAbs64(tiOff + 8, offsName))
+    }
+    if (nameSym != "") {
+      relocs = append(relocs, emElfAbs64(tiOff + 24, nameSym))
+    }
+    if (methods.sym != "") {
+      relocs = append(relocs, emElfAbs64(tiOff + 40, methods.sym))
+      let mr = 0
+      while (mr < len(methods.relocs)) {
+        relocs = append(relocs, emElfAbs64(methods.relocs[mr].off, methods.relocs[mr].sym))
+        mr = mr + 1
+      }
+    }
+    ti = ti + 1
+  }
+
+  // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata -----------------
+  let blobOff = len(rodata.bytes)
+  let codeRelocs = writeStackMaps(rodata, stackmaps)
+  symbols = append(symbols, emElfSym(emStackmapsSymbol(), ElfSectionKind.Rodata,
+    blobOff, len(rodata.bytes) - blobOff, ElfBinding.Global, ElfSymKind.Object))
+  defined[emStackmapsSymbol()] = true
+  // writeStackMaps records offsets against `rodata` itself — already
+  // section-relative, so no blobOff adjustment.
+  let ci = 0
+  while (ci < len(codeRelocs)) {
+    relocs = append(relocs, emElfAbs64(codeRelocs[ci], module.funcs[ci].name))
+    ci = ci + 1
+  }
+
+  // ---- undefined externals (the runtime's bit_rt_* symbols) --------------
+  let externs = map<string, bool>{}
+  let ri = 0
+  while (ri < len(relocs)) {
+    let sym = relocs[ri].symbol
+    let (_, isDef) = defined[sym]
+    let (_, isExt) = externs[sym]
+    if (!isDef && !isExt) {
+      externs[sym] = true
+      symbols = append(symbols, ElfSymbol{ name: sym, hasSection: false,
+        section: ElfSectionKind.Text, offset: 0, size: 0,
+        binding: ElfBinding.Global, kind: ElfSymKind.Notype })
+    }
+    ri = ri + 1
+  }
+  return EmElfBlobs{ symbols: symbols, relocs: relocs }
+}
+
+// x86-64 codegen's Reloc kinds mapped onto the ELF writer's. A `call rel32`'s
+// field is measured from its own start, so the -4 bias the encoder assumes is
+// carried as the relocation's addend (the seed does exactly this).
+function emElfRelocX64(k: RelocKind): ElfRelocKind {
+  if (k == RelocKind.Abs64) {
+    return ElfRelocKind.Abs64
+  }
+  assert(k == RelocKind.Branch)
+  return ElfRelocKind.Pc32
+}
+
+function emElfAddendX64(k: RelocKind): int {
+  if (k == RelocKind.Branch) {
+    return -4
+  }
+  return 0
+}
+
+// Each per-arch mapper below asserts its OWN arch's kind set, so the dispatch
+// has to happen before the call — evaluating both sides would trip the other
+// arch's assert on a kind it never emits.
+function emCompileFor(module: IrModule, f: IrFunc, isX64: bool): FuncCode {
+  if (isX64) {
+    return xCompileFunction(module, f, XCallConv.SysV)
+  }
+  return compileFunction(module, f)
+}
+
+function emElfRelocFor(k: RelocKind, isX64: bool): ElfRelocKind {
+  if (isX64) {
+    return emElfRelocX64(k)
+  }
+  return emElfRelocArm64(k)
+}
+
+function emElfAddendFor(k: RelocKind, isX64: bool): int {
+  if (isX64) {
+    return emElfAddendX64(k)
+  }
+  return 0
+}
+
+function emElfRelocArm64(k: RelocKind): ElfRelocKind {
+  if (k == RelocKind.Branch) {
+    return ElfRelocKind.Call26
+  }
+  if (k == RelocKind.Page21) {
+    return ElfRelocKind.AdrPrelPgHi21
+  }
+  assert(k == RelocKind.PageOff12)
+  return ElfRelocKind.AddAbsLo12Nc
+}
+
+// Emits `module` as a relocatable ELF object for `target`. One entry point for
+// both architectures: the arch-specific parts are the backend, the code
+// relocation kinds, and the bit_main trampoline's encoding.
+function emitElfObject(module: IrModule, target: ElfTarget): []u8! {
+  let code = newByteBuf()
+  let rodata = newByteBuf()
+  let symbols = []ElfSymbol(0)
+  let relocs = []ElfRelocation(0)
+  let defined = map<string, bool>{}
+  let stackmaps = []FuncStackMap(0)
+  let isX64 = target == ElfTarget.X86_64
+
+  // ---- every function -> one .text symbol + its relocations --------------
+  let mainVoid = false
+  let haveMain = false
+  let fi = 0
+  while (fi < len(module.funcs)) {
+    let f = module.funcs[fi]
+    let fc = emCompileFor(module, f, isX64)
+    let off = len(code.bytes)
+    appendBytes(code, fc.code)
+    symbols = append(symbols, emElfSym(f.name, ElfSectionKind.Text, off,
+      len(fc.code), ElfBinding.Global, ElfSymKind.Func))
+    defined[f.name] = true
+    let r = 0
+    while (r < len(fc.relocs)) {
+      relocs = append(relocs, ElfRelocation{ section: ElfSectionKind.Text,
+        offset: off + fc.relocs[r].offset, symbol: fc.relocs[r].symbol,
+        kind: emElfRelocFor(fc.relocs[r].kind, isX64),
+        addend: emElfAddendFor(fc.relocs[r].kind, isX64) })
+      r = r + 1
+    }
+    stackmaps = append(stackmaps, emStackMapOf(fc))
+    if (f.name == "main") {
+      haveMain = true
+      mainVoid = module.ctx.types[f.result].kind == TypeKind.Void
+    }
+    fi = fi + 1
+  }
+  if (!haveMain) {
+    fail newError("NoMain")
+  }
+
+  // ---- bit_main entry trampoline -----------------------------------------
+  // The runtime calls bit_main (runtime/root.zig's boot runs it as a green
+  // thread); a void `main` still owes an exit code, so the trampoline supplies 0.
+  let tramp = len(code.bytes)
+  let callField = 0
+  if (isX64) {
+    // On entry rsp%16==8 (the call into bit_main pushed a return address); a
+    // single `sub rsp,8` re-aligns it so the SysV call below is 16-aligned.
+    //   sub rsp,8 ; call main ; [xor eax,eax if void] ; add rsp,8 ; ret
+    appendBytes(code, [u8(0x48), u8(0x83), u8(0xEC), u8(0x08)])
+    code.bytes = append(code.bytes, u8(0xE8))
+    callField = len(code.bytes)
+    appendZeros(code, 4)
+    relocs = append(relocs, ElfRelocation{ section: ElfSectionKind.Text,
+      offset: callField, symbol: "main", kind: ElfRelocKind.Pc32, addend: -4 })
+    if (mainVoid) {
+      appendBytes(code, [u8(0x31), u8(0xC0)]) // xor eax, eax
+    }
+    appendBytes(code, [u8(0x48), u8(0x83), u8(0xC4), u8(0x08), u8(0xC3)])
+  } else {
+    //   stp x29,x30,[sp,#-16]! ; bl main ; [movz w0,#0 if void] ; ldp ; ret
+    emitWord(code, 0xA9BF7BFD)
+    callField = len(code.bytes)
+    emitWord(code, 0x94000000) // bl main (placeholder)
+    relocs = append(relocs, ElfRelocation{ section: ElfSectionKind.Text,
+      offset: callField, symbol: "main", kind: ElfRelocKind.Call26, addend: 0 })
+    if (mainVoid) {
+      emitWord(code, 0x52800000) // movz w0, #0
+    }
+    emitWord(code, 0xA8C17BFD) // ldp x29, x30, [sp], #16
+    emitWord(code, 0xD65F03C0) // ret
+  }
+  symbols = append(symbols, emElfSym("bit_main", ElfSectionKind.Text, tramp,
+    len(code.bytes) - tramp, ElfBinding.Global, ElfSymKind.Func))
+  defined["bit_main"] = true
+
+  let blobs = emitElfBlobs(module, rodata, symbols, relocs, defined, stackmaps)
+  symbols = blobs.symbols
+  relocs = blobs.relocs
+
+  let sections = [ElfSection{ kind: ElfSectionKind.Text, data: code.bytes,
+    size: 0, alignment: 16 }]
+  if (len(rodata.bytes) > 0) {
+    sections = append(sections, ElfSection{ kind: ElfSectionKind.Rodata,
+      data: rodata.bytes, size: 0, alignment: 8 })
+  }
+  return writeElfObject(target, ElfObject{ sections: sections, symbols: symbols,
+    relocations: relocs })?
+}
