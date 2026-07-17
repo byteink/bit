@@ -11,8 +11,8 @@
 #
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-difftests.sh
 set -u
-SEED=zig-out/bin/bit
-BIT2=${BIT2:-zig-out/bin/bit2}
+SEED=zig-out/bin/bit-seed
+BIT2=${BIT2:-zig-out/bin/bit}
 PROJ=${1:-tests/testproj}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

@@ -34,8 +34,8 @@
 #
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
-SEED=zig-out/bin/bit
-BIT2=zig-out/bin/bit2
+SEED=zig-out/bin/bit-seed
+BIT2=zig-out/bin/bit
 ROOT="$(pwd)/"
 match=0 missing=0 falsepos=0 diff=0 firstfp="" firstdiff=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do

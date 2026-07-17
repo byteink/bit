@@ -15,8 +15,8 @@
 #
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffexamples.sh
 set -u
-SEED=zig-out/bin/bit
-BIT2=${BIT2:-zig-out/bin/bit2}
+SEED=zig-out/bin/bit-seed
+BIT2=${BIT2:-zig-out/bin/bit}
 # Network-dependent examples: they talk to the outside world, so their output is
 # not a function of the compiler alone.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"

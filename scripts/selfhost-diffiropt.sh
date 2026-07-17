@@ -4,8 +4,8 @@
 # coverage — MATCH grows as fold/DCE/inline passes land. Mirror of
 # selfhost-diffir.sh but for the post-optimizer surface.
 set -u
-SEED=zig-out/bin/bit
-BIT2=zig-out/bin/bit2
+SEED=zig-out/bin/bit-seed
+BIT2=zig-out/bin/bit
 match=0 mismatch=0 skip=0 firstbad=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
   seed=$("$SEED" --dump-ir "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }

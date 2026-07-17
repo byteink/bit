@@ -20,7 +20,12 @@ echo "==> Building native arm64 bit (compiler + LSP) ..."
 docker run --rm --platform linux/amd64 -v "$repo":/w -w /w "$zig_image" \
   zig build -Dtarget=aarch64-macos
 mkdir -p "$HOME/.local/bin"
-cp zig-out/bin/bit "$bin"
+# The editor compiler must serve `bit lsp` / `bit fmt`. Those subcommands are not
+# self-hosted yet (epic #1345), so the LSP-capable binary is the bootstrap seed,
+# `bit-seed`. Install it AS `bit` for the editor. This cross-build also produces
+# only `bit-seed` anyway (the self-hosted `bit` needs a native build — see
+# build.zig). Switch this to zig-out/bin/bit once lsp/fmt land in selfhost/.
+cp zig-out/bin/bit-seed "$bin"
 # Re-sign ad-hoc: copying a cross-signed arm64 Mach-O to a new path invalidates
 # its signature, and macOS SIGKILLs an invalidly-signed binary on exec.
 codesign --force --sign - "$bin"

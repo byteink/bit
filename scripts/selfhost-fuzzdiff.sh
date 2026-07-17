@@ -12,8 +12,8 @@
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-fuzzdiff.sh
 # Prints MATCH/MISMATCH/TIMEOUT totals and the first divergence.
 set -u
-SEED=zig-out/bin/bit
-BIT2=zig-out/bin/bit2
+SEED=zig-out/bin/bit-seed
+BIT2=zig-out/bin/bit
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 # Alarm-guarded run: kills a hung child after 5s (macOS has no `timeout`).

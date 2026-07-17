@@ -8,8 +8,8 @@
 # Needs an x86-64 Linux host reachable over ssh (BITX64_HOST, default hl-master).
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffexamples-x64.sh
 set -u
-SEED=zig-out/bin/bit
-BIT2=${BIT2:-zig-out/bin/bit2}
+SEED=zig-out/bin/bit-seed
+BIT2=${BIT2:-zig-out/bin/bit}
 HOST=${BITX64_HOST:-hl-master}
 REMOTE=/tmp/bitdiff-x64
 TMP=$(mktemp -d)

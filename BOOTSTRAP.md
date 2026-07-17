@@ -54,9 +54,15 @@ the self-hosted compiler.
 
 ```
 zig build libbitrt     # the runtime archive the linker consumes (once)
-zig build selfhost     # seed bit builds selfhost/ → zig-out/bin/bit2
-./zig-out/bin/bit2     # run it
+zig build               # native: builds the seed (bit-seed) AND the self-hosted bit
+./zig-out/bin/bit       # the canonical self-hosted compiler
+./zig-out/bin/bit-seed  # the bootstrap seed (differential oracle; retired to seed/)
 ```
+
+The seed compiler now lives in `seed/` and installs as `bit-seed`; the canonical
+`bit` is the self-hosted compiler built from `selfhost/`. A native `zig build`
+produces both; a cross build (`-Dtarget=`) produces only `bit-seed` (execing the
+seed to build the self-hosted bit needs a native host).
 
 ## Current state
 

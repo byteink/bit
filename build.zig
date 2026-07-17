@@ -30,15 +30,20 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
     ) orelse .ReleaseSafe;
 
+    // The seed compiler, now retired to `seed/` and installed as `bit-seed`: a
+    // bootstrap-only artifact that compiles the self-hosted `bit` (below) and
+    // serves as the differential oracle. The canonical `bit` is the self-hosted
+    // compiler under `selfhost/`.
     const exe = b.addExecutable(.{
-        .name = "bit",
+        .name = "bit-seed",
         .root_module = b.createModule(.{
             .root_source_file = b.path("seed/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    b.installArtifact(exe);
+    const seed_install = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&seed_install.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -633,32 +638,43 @@ pub fn build(b: *std.Build) void {
     // those `zig-out`-reading tests.
     if (host_libbitrt_install) |inst| test_step.dependOn(inst);
 
-    // `zig build selfhost`: compile the bit-in-Bit compiler under `selfhost/`
-    // with the seed `bit` and install the result as `bit2` — the entry point
-    // for the bootstrap chain (BOOTSTRAP.md; epic #363-#365). A stub driver
-    // today; each self-host stage grows it, always differential-tested against
-    // the Zig compiler. Runs from the build root so `bit` resolves both
-    // `selfhost/` and the host `zig-out/lib/<triple>/libbitrt.a`.
+    // The canonical `bit`: the self-hosted bit-in-Bit compiler under `selfhost/`,
+    // compiled by the bootstrap seed (`bit-seed`) and installed as `bit`. This is
+    // the compiler that retires the seed (epic #363-#365). Building it means
+    // RUNNING the seed to compile selfhost/, so it only works when the seed
+    // targets the build host — a cross-compile (`-Dtarget=` for another machine)
+    // cannot exec it. So a NATIVE `zig build` produces `bit` in the default
+    // install; a cross build produces only `bit-seed` (use `bit-seed build
+    // selfhost --target <t>` to cross-produce a self-hosted bit). The seed is
+    // always kept alongside as `bit-seed` for bootstrap + the differentials.
+    // Runs from the build root so the seed resolves both `selfhost/` and the host
+    // `zig-out/lib/<triple>/libbitrt.a`. Depends on the seed's install
+    // specifically (not the whole install step) to stay cycle-free.
+    const native = target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.os.tag == b.graph.host.result.os.tag;
     const selfhost_run = b.addRunArtifact(exe);
     selfhost_run.addArgs(&.{ "build", "selfhost", "-o" });
-    const bit2 = selfhost_run.addOutputFileArg("bit2");
-    selfhost_run.step.dependOn(b.getInstallStep());
+    const selfhosted = selfhost_run.addOutputFileArg("bit");
+    selfhost_run.step.dependOn(&seed_install.step);
     if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
     // The seed reads selfhost/*.bit at runtime, invisible to the build cache, so
     // an edit to a ported module wouldn't re-trigger the build — force it.
     selfhost_run.has_side_effects = true;
-    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bit → bit2");
-    selfhost_step.dependOn(&b.addInstallBinFile(bit2, "bit2").step);
+    const install_bit = b.addInstallBinFile(selfhosted, "bit");
+    // Only pull `bit` into the default install on a native build (see above).
+    if (native) b.getInstallStep().dependOn(&install_bit.step);
+    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bit-seed → bit");
+    selfhost_step.dependOn(&install_bit.step);
 
-    // Gate the self-host: `zig build test` (and the x86_64 gate) builds bit2
-    // from the current selfhost/ sources and runs it. Its `main` runs the
-    // in-Bit self-checks (selfhost/selfcheck.bit) — a failed assert panics
-    // (exit 2) and fails the build, so a regression in a ported module is
-    // caught on both arm64 and x86_64. bit2 targets the host, so it always
-    // execs here. `has_side_effects` keeps it from being cache-skipped.
-    const bit2_selfcheck = std.Build.Step.Run.create(b, "run bit2 self-checks");
-    bit2_selfcheck.addFileArg(bit2);
-    bit2_selfcheck.has_side_effects = true;
-    bit2_selfcheck.expectExitCode(0);
-    test_step.dependOn(&bit2_selfcheck.step);
+    // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
+    // self-hosted `bit` from the current selfhost/ sources and runs it. Its
+    // `main` runs the in-Bit self-checks (selfhost/selfcheck.bit) — a failed
+    // assert panics (exit 2) and fails the build, so a regression in a ported
+    // module is caught on both arm64 and x86_64. `bit` targets the host, so it
+    // always execs here. `has_side_effects` keeps it from being cache-skipped.
+    const selfhost_selfcheck = std.Build.Step.Run.create(b, "run self-hosted bit self-checks");
+    selfhost_selfcheck.addFileArg(selfhosted);
+    selfhost_selfcheck.has_side_effects = true;
+    selfhost_selfcheck.expectExitCode(0);
+    test_step.dependOn(&selfhost_selfcheck.step);
 }
