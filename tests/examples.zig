@@ -12,7 +12,7 @@
 //! `// run` cases.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -70,7 +70,7 @@ test "examples compile and run" {
 fn runExample(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const u8, libbitrt: []const u8) !void {
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
-    const exe = (try bitc.buildHostProject(gpa, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
+    const exe = (try bit.buildHostProject(gpa, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
         std.debug.print("example '{s}': expected compile to succeed, got diagnostics:\n{s}\n", .{ name, discard.written() });
         return error.ExampleCompileFailed;
     };

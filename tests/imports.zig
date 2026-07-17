@@ -18,7 +18,7 @@
 //! the golden `// run` cases and the other guards.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -225,7 +225,7 @@ fn buildProgram(
 
     var discard: Io.Writer.Allocating = .init(arena);
     defer discard.deinit();
-    const exe = (try bitc.buildHostProject(arena, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
+    const exe = (try bit.buildHostProject(arena, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
         std.debug.print("imports '{s}': compile failed:\n{s}\n", .{ name, discard.written() });
         return error.ImportsCompileFailed;
     };

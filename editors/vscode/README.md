@@ -7,12 +7,12 @@ TypeScript-flavored syntax and Go-like semantics.
 
 - Syntax highlighting and bracket/indent rules for `.bit` files.
 - Diagnostics, hover, goto-definition, completions, and document symbols via
-  the `bitc lsp` language server.
-- Format-on-save using `bitc fmt`.
+  the `bit lsp` language server.
+- Format-on-save using `bit fmt`.
 
 ## Requirements
 
-`bitc` must be installed and either on your `PATH` or pointed to via the
+`bit` must be installed and either on your `PATH` or pointed to via the
 `bit.serverPath` setting. See the [Bit installation
 docs](https://github.com/byteink/bit#build).
 
@@ -20,13 +20,13 @@ docs](https://github.com/byteink/bit#build).
 
 | Setting              | Default | Description                                    |
 |-----------------------|---------|-------------------------------------------------|
-| `bit.serverPath`      | `""`    | Path to `bitc`. Empty auto-discovers it on PATH. |
-| `bit.formatOnSave`    | `true`  | Run `bitc fmt` after saving a `.bit` file.       |
+| `bit.serverPath`      | `""`    | Path to `bit`. Empty auto-discovers it on PATH. |
+| `bit.formatOnSave`    | `true`  | Run `bit fmt` after saving a `.bit` file.       |
 | `bit.trace.server`    | `off`   | Trace LSP traffic for debugging.                 |
 
 ## Commands
 
-- **Bit: Restart Language Server** — restarts `bitc lsp` without reloading the window.
+- **Bit: Restart Language Server** — restarts `bit lsp` without reloading the window.
 
 ## License
 

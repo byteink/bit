@@ -19,7 +19,7 @@
 //! The examples in those pages are compiled separately, by `tests/docs.zig`.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -87,7 +87,7 @@ test "every exported stdlib symbol has a docs/stdlib section" {
 
         var report: Io.Writer.Allocating = .init(gpa);
         defer report.deinit();
-        var d = (try bitc.doc.moduleDoc(gpa, io, mod_abs, build_options.stdlib_dir, &report.writer)) orelse {
+        var d = (try bit.doc.moduleDoc(gpa, io, mod_abs, build_options.stdlib_dir, &report.writer)) orelse {
             std.debug.print("stdlib/{s} does not compile:\n{s}\n", .{ entry.name, report.written() });
             return error.StdlibModuleFailed;
         };

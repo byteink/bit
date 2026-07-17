@@ -1,6 +1,6 @@
 //! Crash/hang capture for fuzz targets (task #334).
 //!
-//! `call` drives `bitc.parseReport` over one input and guarantees that any
+//! `call` drives `bit.parseReport` over one input and guarantees that any
 //! fault — segfault, illegal instruction, trap, abort, or a hang — leaves the
 //! triggering input on disk under `tests/fuzz/crashes/` before the process
 //! dies, so it becomes a permanent regression case (see `fuzz.zig`).
@@ -23,7 +23,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const bitc = @import("bitc");
+const bit = @import("bit");
 
 const Io = std.Io;
 
@@ -82,7 +82,7 @@ var crash_buf: [max_input_len]u8 = undefined;
 var crash_len: usize = 0;
 var handlers_installed = false;
 
-/// Runs `bitc.parseReport` over `input` under the crash/hang guard.
+/// Runs `bit.parseReport` over `input` under the crash/hang guard.
 pub fn call(gpa: std.mem.Allocator, input: []const u8) anyerror!void {
     if (input.len > max_input_len) return;
 
@@ -101,7 +101,7 @@ pub fn call(gpa: std.mem.Allocator, input: []const u8) anyerror!void {
         watchdog.join();
     }
 
-    const report = bitc.parseReport(gpa, "fuzz.bit", input) catch |err| {
+    const report = bit.parseReport(gpa, "fuzz.bit", input) catch |err| {
         saveCrash("err");
         return err;
     };

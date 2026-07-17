@@ -11,7 +11,7 @@
 //! be cache-skipped into a false pass.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -40,7 +40,7 @@ fn checkTree(gpa: std.mem.Allocator, io: Io, root: []const u8, seen: *u32, failu
         const src = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(max_file_bytes));
         defer gpa.free(src);
 
-        const res = try bitc.fmt.format(gpa, entry.path, src);
+        const res = try bit.fmt.format(gpa, entry.path, src);
         defer gpa.free(res.text);
         seen.* += 1;
 

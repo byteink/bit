@@ -17,7 +17,7 @@ Two independent proofs:
    enum, a `Token` struct, byte-level scanning over `s[i]`, char-literal
    comparisons (`c >= '0'`), string slicing, a growable `[]Token` via `append`,
    whitespace + `//`-comment skipping, and a `match` dispatch. It compiles and
-   runs under the seed `bitc` and produces byte-correct output. **Zero language
+   runs under the seed `bit` and produces byte-correct output. **Zero language
    gaps were hit** writing idiomatic lexer code. Gated by the imports harness.
 
 ## Language gaps and their status

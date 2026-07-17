@@ -2029,7 +2029,7 @@ const Checker = struct {
         }, ty);
     }
 
-    // ---- `bitc check --dump-types` (task #335 positive suite) --------------
+    // ---- `bit check --dump-types` (task #335 positive suite) --------------
 
     const TypeDumpEntry = struct { file_idx: usize, start: u32, text: []const u8, ty: TypeId };
 
@@ -4821,7 +4821,7 @@ pub const CheckedModule = struct {
     gpa: Allocator,
     node_types: [][]TypeId,
     /// Set only when `checkModule` is called with `dump_types = true`: the
-    /// `bitc check --dump-types` positive-suite surface (task #335's Verify
+    /// `bit check --dump-types` positive-suite surface (task #335's Verify
     /// section) — one line per `let`/`const` binding, lambda parameter, and
     /// call expression, sorted by source position. `null` otherwise so the
     /// normal compile path pays nothing for it.

@@ -14,7 +14,7 @@
 //! against), mirroring the golden `// run` cases and the examples guard.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -62,7 +62,7 @@ test "stress programs pass under default and BIT_GC=stress" {
 fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const u8, libbitrt: []const u8) !void {
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
-    const exe = (try bitc.buildHostModule(gpa, io, dir_abs, libbitrt, &discard.writer)) orelse {
+    const exe = (try bit.buildHostModule(gpa, io, dir_abs, libbitrt, &discard.writer)) orelse {
         std.debug.print("stress '{s}': compile failed:\n{s}\n", .{ name, discard.written() });
         return error.StressCompileFailed;
     };

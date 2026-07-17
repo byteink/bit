@@ -11,10 +11,10 @@ self-host epic (#363–#365).
   zig build            (Zig toolchain)
       │  builds
       ▼
-  bitc                 seed compiler — compiler/*.zig, ~34k lines of Zig
+  bit                 seed compiler — compiler/*.zig, ~34k lines of Zig
       │  builds  selfhost/*.bit
       ▼
-  bitc2 = stage1       the Bit compiler, built by the seed
+  bit2 = stage1       the Bit compiler, built by the seed
       │  builds  selfhost/*.bit  (itself)
       ▼
   stage2               the Bit compiler, built by the Bit compiler
@@ -37,7 +37,7 @@ the *compiler* is ported.
 
 Each stage ports one third of the pipeline and is signed off by a differential
 gate: the Zig and Bit compilers must produce **byte-identical** dumps over the
-whole test corpus. The dumps are the canonical `bitc --dump-*` surfaces, diffed
+whole test corpus. The dumps are the canonical `bit --dump-*` surfaces, diffed
 by the harness (#1332).
 
 | Stage | Ports | Gate (#) | Differential surface |
@@ -54,15 +54,15 @@ the self-hosted compiler.
 
 ```
 zig build libbitrt     # the runtime archive the linker consumes (once)
-zig build selfhost     # seed bitc builds selfhost/ → zig-out/bin/bitc2
-./zig-out/bin/bitc2     # run it
+zig build selfhost     # seed bit builds selfhost/ → zig-out/bin/bit2
+./zig-out/bin/bit2     # run it
 ```
 
 ## Current state
 
 **Stage 1 — front-end, valid-input parity complete.** The lexer, AST arena,
 parser, and diagnostic renderer are ported (`selfhost/{lexer,ast,parser,
-diagnostics}.bit`); `bitc2` drives them via `--dump-tokens`, `--dump-ast`, and
+diagnostics}.bit`); `bit2` drives them via `--dump-tokens`, `--dump-ast`, and
 `--dump-diags`. Against the seed over the whole corpus:
 
 | Surface | Script | Result |

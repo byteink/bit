@@ -5,7 +5,7 @@
 //! process environment rather than a snapshot taken before `main`.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -43,7 +43,7 @@ test "std/os: args and environment round-trip" {
 
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
-    const exe = (try bitc.buildHostProject(gpa, io, build_options.osenv_dir, build_options.stdlib_dir, "osenv", libbitrt, &discard.writer)) orelse {
+    const exe = (try bit.buildHostProject(gpa, io, build_options.osenv_dir, build_options.stdlib_dir, "osenv", libbitrt, &discard.writer)) orelse {
         std.debug.print("osenv fixture: compile failed:\n{s}\n", .{discard.written()});
         return error.OsEnvCompileFailed;
     };

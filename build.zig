@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
     ) orelse .ReleaseSafe;
 
     const exe = b.addExecutable(.{
-        .name = "bitc",
+        .name = "bit",
         .root_module = b.createModule(.{
             .root_source_file = b.path("compiler/main.zig"),
             .target = target,
@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Build and run bitc");
+    const run_step = b.step("run", "Build and run bit");
     run_step.dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{ .root_module = exe.root_module });
@@ -259,7 +259,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    golden_mod.addImport("bitc", exe.root_module);
+    golden_mod.addImport("bit", exe.root_module);
     golden_mod.addOptions("build_options", golden_opts);
 
     const golden_tests = b.addTest(.{ .root_module = golden_mod });
@@ -278,7 +278,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    examples_mod.addImport("bitc", exe.root_module);
+    examples_mod.addImport("bit", exe.root_module);
     examples_mod.addOptions("build_options", examples_opts);
 
     const examples_tests = b.addTest(.{ .root_module = examples_mod });
@@ -318,7 +318,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    stress_mod.addImport("bitc", exe.root_module);
+    stress_mod.addImport("bit", exe.root_module);
     stress_mod.addOptions("build_options", stress_opts);
 
     const stress_tests = b.addTest(.{ .root_module = stress_mod });
@@ -335,7 +335,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    testcmd_mod.addImport("bitc", exe.root_module);
+    testcmd_mod.addImport("bit", exe.root_module);
     testcmd_mod.addOptions("build_options", testcmd_opts);
 
     const testcmd_tests = b.addTest(.{ .root_module = testcmd_mod });
@@ -351,7 +351,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    osenv_mod.addImport("bitc", exe.root_module);
+    osenv_mod.addImport("bit", exe.root_module);
     osenv_mod.addOptions("build_options", osenv_opts);
 
     const osenv_tests = b.addTest(.{ .root_module = osenv_mod });
@@ -368,7 +368,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    docs_mod.addImport("bitc", exe.root_module);
+    docs_mod.addImport("bit", exe.root_module);
     docs_mod.addOptions("build_options", docs_opts);
 
     const docs_tests = b.addTest(.{ .root_module = docs_mod });
@@ -382,7 +382,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    stdlib_docs_mod.addImport("bitc", exe.root_module);
+    stdlib_docs_mod.addImport("bit", exe.root_module);
     stdlib_docs_mod.addOptions("build_options", docs_opts);
 
     const stdlib_docs_tests = b.addTest(.{ .root_module = stdlib_docs_mod });
@@ -399,7 +399,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    fmt_check_mod.addImport("bitc", exe.root_module);
+    fmt_check_mod.addImport("bit", exe.root_module);
     fmt_check_mod.addOptions("build_options", fmt_check_opts);
 
     const fmt_check_run = b.addRunArtifact(b.addTest(.{ .root_module = fmt_check_mod }));
@@ -443,7 +443,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    imports_mod.addImport("bitc", exe.root_module);
+    imports_mod.addImport("bit", exe.root_module);
     imports_mod.addOptions("build_options", imports_opts);
 
     const imports_tests = b.addTest(.{ .root_module = imports_mod });
@@ -482,7 +482,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true, // guard.zig's signal handler needs raw libc calls
         }),
     });
-    fuzz_tests.root_module.addImport("bitc", exe.root_module);
+    fuzz_tests.root_module.addImport("bit", exe.root_module);
     fuzz_tests.root_module.addOptions("build_options", fuzz_opts);
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
@@ -499,7 +499,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    crash_regression_tests.root_module.addImport("bitc", exe.root_module);
+    crash_regression_tests.root_module.addImport("bit", exe.root_module);
     crash_regression_tests.root_module.addOptions("build_options", fuzz_opts);
     test_step.dependOn(&b.addRunArtifact(crash_regression_tests).step);
 
@@ -516,7 +516,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    fuzz_exe.root_module.addImport("bitc", exe.root_module);
+    fuzz_exe.root_module.addImport("bit", exe.root_module);
     fuzz_exe.root_module.addOptions("build_options", fuzz_opts);
 
     const run_fuzz = b.addRunArtifact(fuzz_exe);
@@ -634,31 +634,31 @@ pub fn build(b: *std.Build) void {
     if (host_libbitrt_install) |inst| test_step.dependOn(inst);
 
     // `zig build selfhost`: compile the bit-in-Bit compiler under `selfhost/`
-    // with the seed `bitc` and install the result as `bitc2` — the entry point
+    // with the seed `bit` and install the result as `bit2` — the entry point
     // for the bootstrap chain (BOOTSTRAP.md; epic #363-#365). A stub driver
     // today; each self-host stage grows it, always differential-tested against
-    // the Zig compiler. Runs from the build root so `bitc` resolves both
+    // the Zig compiler. Runs from the build root so `bit` resolves both
     // `selfhost/` and the host `zig-out/lib/<triple>/libbitrt.a`.
     const selfhost_run = b.addRunArtifact(exe);
     selfhost_run.addArgs(&.{ "build", "selfhost", "-o" });
-    const bitc2 = selfhost_run.addOutputFileArg("bitc2");
+    const bit2 = selfhost_run.addOutputFileArg("bit2");
     selfhost_run.step.dependOn(b.getInstallStep());
     if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
     // The seed reads selfhost/*.bit at runtime, invisible to the build cache, so
     // an edit to a ported module wouldn't re-trigger the build — force it.
     selfhost_run.has_side_effects = true;
-    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bitc → bitc2");
-    selfhost_step.dependOn(&b.addInstallBinFile(bitc2, "bitc2").step);
+    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bit → bit2");
+    selfhost_step.dependOn(&b.addInstallBinFile(bit2, "bit2").step);
 
-    // Gate the self-host: `zig build test` (and the x86_64 gate) builds bitc2
+    // Gate the self-host: `zig build test` (and the x86_64 gate) builds bit2
     // from the current selfhost/ sources and runs it. Its `main` runs the
     // in-Bit self-checks (selfhost/selfcheck.bit) — a failed assert panics
     // (exit 2) and fails the build, so a regression in a ported module is
-    // caught on both arm64 and x86_64. bitc2 targets the host, so it always
+    // caught on both arm64 and x86_64. bit2 targets the host, so it always
     // execs here. `has_side_effects` keeps it from being cache-skipped.
-    const bitc2_selfcheck = std.Build.Step.Run.create(b, "run bitc2 self-checks");
-    bitc2_selfcheck.addFileArg(bitc2);
-    bitc2_selfcheck.has_side_effects = true;
-    bitc2_selfcheck.expectExitCode(0);
-    test_step.dependOn(&bitc2_selfcheck.step);
+    const bit2_selfcheck = std.Build.Step.Run.create(b, "run bit2 self-checks");
+    bit2_selfcheck.addFileArg(bit2);
+    bit2_selfcheck.has_side_effects = true;
+    bit2_selfcheck.expectExitCode(0);
+    test_step.dependOn(&bit2_selfcheck.step);
 }

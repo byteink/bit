@@ -7,7 +7,7 @@
 //! is exactly why the runner spawns one process per test.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -60,13 +60,13 @@ test "bit test: discovers test_ functions and reports pass/fail per test" {
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
 
-    var tests: []bitc.testgen.Test = &.{};
-    const exe = (try bitc.buildHostTestExecutable(gpa, "testcmd.bit", source, libbitrt, &discard.writer, &tests)) orelse {
+    var tests: []bit.testgen.Test = &.{};
+    const exe = (try bit.buildHostTestExecutable(gpa, "testcmd.bit", source, libbitrt, &discard.writer, &tests)) orelse {
         std.debug.print("bit test fixture: compile failed:\n{s}\n", .{discard.written()});
         return error.TestCompileFailed;
     };
     defer gpa.free(exe);
-    defer bitc.testgen.freeTests(gpa, tests);
+    defer bit.testgen.freeTests(gpa, tests);
 
     // Discovery: only the three `test_` functions, in source order. `helper` and
     // the synthetic `main` are not tests.
@@ -107,13 +107,13 @@ test "bit test: a directory module's tests can import std/testing" {
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
 
-    var tests: []bitc.testgen.Test = &.{};
-    const exe = (try bitc.buildHostTestProject(gpa, io, build_options.testproj_dir, build_options.stdlib_dir, "testproj", libbitrt, &discard.writer, &tests)) orelse {
+    var tests: []bit.testgen.Test = &.{};
+    const exe = (try bit.buildHostTestProject(gpa, io, build_options.testproj_dir, build_options.stdlib_dir, "testproj", libbitrt, &discard.writer, &tests)) orelse {
         std.debug.print("testproj fixture: compile failed:\n{s}\n", .{discard.written()});
         return error.TestCompileFailed;
     };
     defer gpa.free(exe);
-    defer bitc.testgen.freeTests(gpa, tests);
+    defer bit.testgen.freeTests(gpa, tests);
 
     // Only the root module's tests, never std/testing's own helpers.
     try testing.expectEqual(@as(usize, 4), tests.len);

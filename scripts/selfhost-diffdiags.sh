@@ -10,12 +10,12 @@
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffdiags.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 set -u
-SEED=zig-out/bin/bitc
-BITC2=zig-out/bin/bitc2
+SEED=zig-out/bin/bit
+BIT2=zig-out/bin/bit2
 match=0 mismatch=0 firstbad=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
   seed=$("$SEED" --dump-diags "$f" 2>/dev/null)
-  b2=$("$BITC2" --dump-diags "$f" 2>/dev/null)
+  b2=$("$BIT2" --dump-diags "$f" 2>/dev/null)
   if [ "$seed" = "$b2" ]; then
     match=$((match + 1))
   else
@@ -26,6 +26,6 @@ done
 echo "diag differential: MATCH=$match MISMATCH=$mismatch"
 if [ -n "$firstbad" ]; then
   echo "first divergence: $firstbad"
-  diff <("$SEED" --dump-diags "$firstbad" 2>/dev/null) <("$BITC2" --dump-diags "$firstbad" 2>/dev/null) | head -20
+  diff <("$SEED" --dump-diags "$firstbad" 2>/dev/null) <("$BIT2" --dump-diags "$firstbad" 2>/dev/null) | head -20
   exit 1
 fi

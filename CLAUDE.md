@@ -30,7 +30,7 @@ The compiler↔runtime contract lives in `runtime/ABI.md` (object headers, stack
 Nothing is scaffolded yet. Once #321 lands, the intended commands are:
 
 ```
-zig build              # build seed compiler bitc
+zig build              # build seed compiler bit
 zig build test         # unit + golden tests
 zig build fuzz         # fuzzing harness (after #334)
 ```

@@ -22,7 +22,7 @@ const lsp = @import("lsp.zig");
 /// Seed compiler version. Kept in sync with `build.zig.zon`.
 pub const version = "0.0.0";
 
-/// Upper bound on a single source file `bitc fmt` will read. Matches the
+/// Upper bound on a single source file `bit fmt` will read. Matches the
 /// golden harness's own cap (tests/harness.zig max_file_bytes).
 const max_fmt_file_bytes = 1 << 20; // 1 MiB
 
@@ -135,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
     var buf: [64]u8 = undefined;
     var stdout: Io.File.Writer = .initStreaming(.stdout(), io, &buf);
     const out = &stdout.interface;
-    try out.print("bitc {s}\n", .{version});
+    try out.print("bit {s}\n", .{version});
     try out.flush();
 }
 
@@ -732,7 +732,7 @@ fn renderFail(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, err_out: 
     return null;
 }
 
-/// `bitc fmt [--check] <path>...`: reformats each file to Bit's one canonical
+/// `bit fmt [--check] <path>...`: reformats each file to Bit's one canonical
 /// style, rewriting it in place only when the canonical text differs (idempotent:
 /// an already-canonical file is never touched). A file that fails to parse
 /// is left untouched and its diagnostics are rendered to `err_out`; returns
@@ -755,7 +755,7 @@ fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, args: []const [:0
     }
     for (paths) |path| {
         const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
-            try err_out.print("bitc fmt: {s}: {s}\n", .{ path, @errorName(e) });
+            try err_out.print("bit fmt: {s}: {s}\n", .{ path, @errorName(e) });
             any_failed = true;
             continue;
         };
@@ -780,7 +780,7 @@ fn runFmt(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, args: []const [:0
     return any_failed;
 }
 
-/// `bitc check [--dump-types] <path>...`: type-checks each path independently.
+/// `bit check [--dump-types] <path>...`: type-checks each path independently.
 /// A directory is a whole project (prelude + std imports, cross-module) via
 /// `checkHostProject`, matching `bit build <dir>`; a plain file is its own
 /// single-file module (matches `compileReport`'s scope). Diagnostics go to
@@ -796,13 +796,13 @@ fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer
         // goes through the single-file report path. `--dump-types` has no
         // project form yet — it dumps single files only (see --help).
         const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |e| {
-            try err_out.print("bitc check: {s}: {s}\n", .{ path, @errorName(e) });
+            try err_out.print("bit check: {s}: {s}\n", .{ path, @errorName(e) });
             any_failed = true;
             continue;
         };
         if (stat.kind == .directory) {
             if (dump_types) {
-                try err_out.print("bitc check: {s}: --dump-types applies to single files, not projects\n", .{path});
+                try err_out.print("bit check: {s}: --dump-types applies to single files, not projects\n", .{path});
                 any_failed = true;
                 continue;
             }
@@ -815,7 +815,7 @@ fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer
         }
 
         const source = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_fmt_file_bytes)) catch |e| {
-            try err_out.print("bitc check: {s}: {s}\n", .{ path, @errorName(e) });
+            try err_out.print("bit check: {s}: {s}\n", .{ path, @errorName(e) });
             any_failed = true;
             continue;
         };
@@ -834,17 +834,17 @@ fn runCheck(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer
     return any_failed;
 }
 
-/// `bitc --dump-<mode> <file.bit>`: prints one front-end dump to stdout, or the
+/// `bit --dump-<mode> <file.bit>`: prints one front-end dump to stdout, or the
 /// rendered diagnostics to stderr on a front-end error. Each mode is a
 /// deterministic, canonical rendering used by the self-host differential
 /// harness. Returns `true` on any failure (usage, I/O, or a front-end error).
 fn runDump(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer, mode: []const u8, paths: []const [:0]const u8) !bool {
     if (paths.len == 0) {
-        try err_out.print("usage: bitc {s} <file.bit>\n", .{mode});
+        try err_out.print("usage: bit {s} <file.bit>\n", .{mode});
         return true;
     }
     const source = Io.Dir.cwd().readFileAlloc(io, paths[0], gpa, .limited(max_fmt_file_bytes)) catch |e| {
-        try err_out.print("bitc {s}: {s}: {s}\n", .{ mode, paths[0], @errorName(e) });
+        try err_out.print("bit {s}: {s}: {s}\n", .{ mode, paths[0], @errorName(e) });
         return true;
     };
     defer gpa.free(source);
@@ -877,12 +877,12 @@ fn runDump(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
     } else if (std.mem.eql(u8, mode, "--dump-diags")) {
         // Front-end (lex + parse) diagnostics only — the payload, not a failure
         // channel — so it always goes to stdout (exit 0) for the self-host error
-        // differential against `bitc2 --dump-diags`.
+        // differential against `bit2 --dump-diags`.
         const r = try diagsReport(gpa, paths[0], source);
         text = r.text;
         failed = false;
     } else {
-        try err_out.print("bitc: unknown dump mode '{s}' (--dump-tokens|--dump-ast|--dump-types|--dump-ir|--dump-ir-pre|--dump-diags)\n", .{mode});
+        try err_out.print("bit: unknown dump mode '{s}' (--dump-tokens|--dump-ast|--dump-types|--dump-ir|--dump-ir-pre|--dump-diags)\n", .{mode});
         return true;
     }
     defer gpa.free(text);
@@ -897,8 +897,8 @@ fn runDump(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
 
 /// Front-end (lexer + parser) diagnostics for a single source buffer, always
 /// rendered (empty on a clean file). Backs `--dump-diags` for the self-host
-/// Stage-1 error differential: `bitc2` implements only the front-end, so this
-/// deliberately stops before resolve/check (whose diagnostics `bitc2` cannot
+/// Stage-1 error differential: `bit2` implements only the front-end, so this
+/// deliberately stops before resolve/check (whose diagnostics `bit2` cannot
 /// yet reproduce). `text` is owned by `gpa`.
 pub fn diagsReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
     var sm = diagnostics.SourceManager.init(gpa);
@@ -974,7 +974,7 @@ pub fn compileReport(gpa: std.mem.Allocator, path: []const u8, source: []const u
 
 /// Drives the front-end through the type checker with `dump_types = true`
 /// and renders either its diagnostics (on failure) or its type dump (on
-/// success) — the `bitc check --dump-types` positive-suite surface named by
+/// success) — the `bit check --dump-types` positive-suite surface named by
 /// task #335's Verify section. `text` is owned by `gpa`.
 pub fn typesReport(gpa: std.mem.Allocator, path: []const u8, source: []const u8) !CompileReport {
     var sm = diagnostics.SourceManager.init(gpa);

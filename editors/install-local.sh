@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Rebuild the native `bitc` (compiler + LSP server) and the VS Code extension,
+# Rebuild the native `bit` (compiler + LSP server) and the VS Code extension,
 # then install both locally so the latest language and tooling changes can be
 # tested in the editor. Run this after landing any language feature to keep the
 # extension, the language server, and the installed compiler in sync.
@@ -14,13 +14,13 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
 zig_image="bit-zig-0.16.0-amd64:latest"
-bin="$HOME/.local/bin/bitc"
+bin="$HOME/.local/bin/bit"
 
-echo "==> Building native arm64 bitc (compiler + LSP) ..."
+echo "==> Building native arm64 bit (compiler + LSP) ..."
 docker run --rm --platform linux/amd64 -v "$repo":/w -w /w "$zig_image" \
   zig build -Dtarget=aarch64-macos
 mkdir -p "$HOME/.local/bin"
-cp zig-out/bin/bitc "$bin"
+cp zig-out/bin/bit "$bin"
 # Re-sign ad-hoc: copying a cross-signed arm64 Mach-O to a new path invalidates
 # its signature, and macOS SIGKILLs an invalidly-signed binary on exec.
 codesign --force --sign - "$bin"

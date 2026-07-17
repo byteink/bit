@@ -13,15 +13,15 @@
 //!                only mode that can observe a panic *message*, so it is how the
 //!                runtime's failure paths — failed `assert`, index out of range,
 //!                divide by zero — are held to the text they promise.
-//!   `// fmt`   — `bitc fmt` canonicalization must byte-match `.expected`
+//!   `// fmt`   — `bit fmt` canonicalization must byte-match `.expected`
 //!                (task #333's golden pairs: messy input -> canonical output).
-//!   `// types` — compilation must succeed; `bitc check --dump-types`'
+//!   `// types` — compilation must succeed; `bit check --dump-types`'
 //!                inferred-type dump must byte-match `.expected` (task #335's
 //!                positive suite: nested lambdas, generic calls).
-//!   `// tokens`— the `bitc --dump-tokens` stream (kind + span, incl. ASI `;`)
+//!   `// tokens`— the `bit --dump-tokens` stream (kind + span, incl. ASI `;`)
 //!                must byte-match `.expected`.
-//!   `// ast`   — the `bitc --dump-ast` s-expression must byte-match `.expected`.
-//!   `// ir`    — the `bitc --dump-ir` (post-opt SSA) must byte-match `.expected`.
+//!   `// ast`   — the `bit --dump-ast` s-expression must byte-match `.expected`.
+//!   `// ir`    — the `bit --dump-ir` (post-opt SSA) must byte-match `.expected`.
 //!                The last three are the deterministic, canonical dumps the
 //!                self-host differential harness diffs the Zig and Bit compilers
 //!                on (#1327/#1328/#1329); here they also guard the Zig dumps'
@@ -35,7 +35,7 @@
 //! below) — `// error` cases are deliberately malformed and out of scope.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -124,7 +124,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
 
             var discard: Io.Writer.Allocating = .init(gpa);
             defer discard.deinit();
-            const exe = (try bitc.buildHostExecutable(gpa, name, source, libbitrt, &discard.writer)) orelse {
+            const exe = (try bit.buildHostExecutable(gpa, name, source, libbitrt, &discard.writer)) orelse {
                 std.debug.print("case '{s}': expected compile to succeed, got diagnostics:\n{s}\n", .{ name, discard.written() });
                 return error.RunCompileFailed;
             };
@@ -166,7 +166,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             try testing.expectEqualStrings(expected, result.stdout);
         },
         .err => {
-            const report = try bitc.compileReport(gpa, name, source);
+            const report = try bit.compileReport(gpa, name, source);
             defer gpa.free(report.text);
             if (!report.failed) {
                 std.debug.print("case '{s}': expected compilation to fail, but no errors were produced\n", .{name});
@@ -177,7 +177,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             try testing.expectEqualStrings(expected, report.text);
         },
         .fmt => {
-            const report = try bitc.formatReport(gpa, name, source);
+            const report = try bit.formatReport(gpa, name, source);
             defer gpa.free(report.text);
             if (report.failed) {
                 std.debug.print("case '{s}': expected fmt to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
@@ -188,7 +188,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             try testing.expectEqualStrings(expected, report.text);
         },
         .types => {
-            const report = try bitc.typesReport(gpa, name, source);
+            const report = try bit.typesReport(gpa, name, source);
             defer gpa.free(report.text);
             if (report.failed) {
                 std.debug.print("case '{s}': expected type-check to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
@@ -199,7 +199,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             try testing.expectEqualStrings(expected, report.text);
         },
         .tokens => {
-            const report = try bitc.tokensReport(gpa, name, source);
+            const report = try bit.tokensReport(gpa, name, source);
             defer gpa.free(report.text);
             if (report.failed) {
                 std.debug.print("case '{s}': expected lexing to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
@@ -210,7 +210,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             try testing.expectEqualStrings(expected, report.text);
         },
         .ast => {
-            const report = try bitc.parseReport(gpa, name, source);
+            const report = try bit.parseReport(gpa, name, source);
             defer gpa.free(report.text);
             if (report.failed) {
                 std.debug.print("case '{s}': expected parse to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
@@ -221,7 +221,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             try testing.expectEqualStrings(expected, report.text);
         },
         .ir => {
-            const report = try bitc.irReport(gpa, name, source, true);
+            const report = try bit.irReport(gpa, name, source, true);
             defer gpa.free(report.text);
             if (report.failed) {
                 std.debug.print("case '{s}': expected lowering to succeed, got diagnostics:\n{s}\n", .{ name, report.text });
@@ -296,22 +296,22 @@ test "fmt corpus properties: idempotent, preserves every comment" {
         const directive = directiveOf(source) orelse return error.MissingDirective;
         if (directive == .err) continue;
 
-        const once = try bitc.formatReport(gpa, name, source);
+        const once = try bit.formatReport(gpa, name, source);
         defer gpa.free(once.text);
         if (once.failed) {
             std.debug.print("case '{s}': fmt failed on a case whose directive claims valid Bit source:\n{s}\n", .{ name, once.text });
             return error.FmtUnexpectedFailure;
         }
 
-        const twice = try bitc.formatReport(gpa, name, once.text);
+        const twice = try bit.formatReport(gpa, name, once.text);
         defer gpa.free(twice.text);
         try testing.expect(!twice.failed);
         if (!std.mem.eql(u8, once.text, twice.text))
             std.debug.print("case '{s}': fmt is not idempotent\n", .{name});
         try testing.expectEqualStrings(once.text, twice.text);
 
-        const in_comments = try bitc.commentCount(gpa, source);
-        const out_comments = try bitc.commentCount(gpa, once.text);
+        const in_comments = try bit.commentCount(gpa, source);
+        const out_comments = try bit.commentCount(gpa, once.text);
         if (in_comments != out_comments)
             std.debug.print("case '{s}': comment count in={d} out={d}\n", .{ name, in_comments, out_comments });
         try testing.expectEqual(in_comments, out_comments);

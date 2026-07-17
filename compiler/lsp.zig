@@ -1,5 +1,5 @@
 //! `bit lsp` — the Bit language server (task #337). Speaks LSP over stdio,
-//! reusing the lexer/parser/checker exactly as `bitc check` does: a directory
+//! reusing the lexer/parser/checker exactly as `bit check` does: a directory
 //! of `.bit` files is one module (spec/SPEC.md §17.1, `resolve.zig`'s own
 //! docs), so "goto-definition crosses files" for free — no import statement
 //! needed to reference a sibling file's declaration.

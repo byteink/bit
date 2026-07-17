@@ -1,4 +1,4 @@
-//! Canonical formatter (`bitc fmt`): AST -> source text, gofmt philosophy —
+//! Canonical formatter (`bit fmt`): AST -> source text, gofmt philosophy —
 //! one true style, zero configuration, idempotent (spec/SPEC.md §9-§18 is the
 //! grammar this mirrors; see ast.zig's Tag doc comments for child order).
 //!

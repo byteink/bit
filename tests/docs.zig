@@ -25,7 +25,7 @@
 //! point of this harness is that documentation which claims to be Bit *is* Bit.
 
 const std = @import("std");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const build_options = @import("build_options");
 
 const testing = std.testing;
@@ -82,7 +82,7 @@ fn checkSource(gpa: std.mem.Allocator, io: Io, scratch_dir: []const u8, source: 
 
     var report: Io.Writer.Allocating = .init(gpa);
     errdefer report.deinit();
-    const failed = try bitc.checkHostProject(gpa, io, scratch_dir, build_options.stdlib_dir, &report.writer);
+    const failed = try bit.checkHostProject(gpa, io, scratch_dir, build_options.stdlib_dir, &report.writer);
     if (!failed) {
         report.deinit();
         return null;

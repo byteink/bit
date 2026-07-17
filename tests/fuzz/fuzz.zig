@@ -1,6 +1,6 @@
 //! Fuzz target declaration for the lexer + parser (task #334).
 //!
-//! Invariant under test: `bitc.parseReport` never crashes and never hangs on
+//! Invariant under test: `bit.parseReport` never crashes and never hangs on
 //! arbitrary bytes — it always returns either an AST dump or diagnostics
 //! (`guard.call` enforces this; see its doc comment for how).
 //!
@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const bitc = @import("bitc");
+const bit = @import("bit");
 const guard = @import("guard.zig");
 
 const Io = std.Io;

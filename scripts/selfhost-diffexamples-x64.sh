@@ -8,8 +8,8 @@
 # Needs an x86-64 Linux host reachable over ssh (BITX64_HOST, default hl-master).
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffexamples-x64.sh
 set -u
-SEED=zig-out/bin/bitc
-BITC2=${BITC2:-zig-out/bin/bitc2}
+SEED=zig-out/bin/bit
+BIT2=${BIT2:-zig-out/bin/bit2}
 HOST=${BITX64_HOST:-hl-master}
 REMOTE=/tmp/bitdiff-x64
 TMP=$(mktemp -d)
@@ -17,7 +17,7 @@ trap 'rm -rf "$TMP"; ssh "$HOST" "rm -rf $REMOTE" >/dev/null 2>&1' EXIT
 
 ssh "$HOST" "rm -rf $REMOTE && mkdir -p $REMOTE" || { echo "cannot reach $HOST"; exit 1; }
 
-# The same list selfhost-diffexamples.sh skips: these need constructs bitc2
+# The same list selfhost-diffexamples.sh skips: these need constructs bit2
 # cannot lower yet (closures/spawn), so they refuse on EVERY target — they are
 # not an x64 gap, and counting them here would just mask a real one appearing.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"
@@ -29,7 +29,7 @@ for d in examples/*/; do
   if ! "$SEED" build "$d" -o "$TMP/seed_$n" --target x86_64-linux >"$TMP/serr_$n" 2>&1; then
     seedfail=$((seedfail + 1)); echo "SEED-FAIL $n"; continue
   fi
-  if ! "$BITC2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1; then
+  if ! "$BIT2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1; then
     refused=$((refused + 1)); echo "REFUSED $n: $(head -1 "$TMP/berr_$n")"; continue
   fi
   scp -q "$TMP/seed_$n" "$TMP/b2_$n" "$HOST:$REMOTE/" || { echo "SCP-FAIL $n"; continue; }
@@ -41,7 +41,7 @@ for d in examples/*/; do
     diff=$((diff + 1))
     echo "DIFF $n"
     echo "--- seed: $so" | head -5
-    echo "--- bitc2: $bo" | head -5
+    echo "--- bit2: $bo" | head -5
   fi
 done
 echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused SEED-FAIL=$seedfail SKIP(unported)=$skipped"
