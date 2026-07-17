@@ -19,20 +19,31 @@
 #   DIFF     both reject, different text        — usually a cascade: bit2 report
 #            a downstream error because the root site is not ported.
 #
-# Diagnostics go to stderr (both compilers), so stdout is discarded. The seed
-# renders the path it was handed; both get the same path, so no rewriting.
+# Diagnostics go to stderr (both compilers), so stdout is discarded.
+#
+# PATH NORMALIZATION: the seed's file-check CLI absolutizes the display path (it
+# routes a lone file through `checkHostProject(absFromCwd(dirname), basename)`,
+# introduced when a lone .bit file became a module in 83b511f), so it renders
+# `--> /abs/repo/stdlib/x.bit`. bit2 renders the path AS GIVEN — `--> stdlib/x.bit`
+# — which is what gcc/clang/rustc/zig do and what the `.expected` goldens encode,
+# so bit2 is the correct one. Rather than do loader surgery on the about-to-retire
+# seed, strip the repo-root prefix from the seed's output before comparing: the
+# diff then reflects only REAL diagnostic differences, and this script retires
+# with the seed. Verified exact (stripping the prefix collapsed all 44 path-diffs
+# to MATCH, 0 real).
 #
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
 SEED=zig-out/bin/bit
 BIT2=zig-out/bin/bit2
+ROOT="$(pwd)/"
 match=0 missing=0 falsepos=0 diff=0 firstfp="" firstdiff=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
   seed=$("$SEED" check "$f" 2>&1 >/dev/null)
   # The seed appends its own `error: CheckFailed` trace line; that is the Zig
-  # runtime reporting main's error return, not a diagnostic. Drop it so the two
-  # rendered diagnostic streams are comparable.
-  seed=$(printf '%s\n' "$seed" | grep -v '^error: CheckFailed$')
+  # runtime reporting main's error return, not a diagnostic. Drop it, and strip
+  # the absolute repo-root prefix so the two rendered streams are comparable.
+  seed=$(printf '%s\n' "$seed" | grep -v '^error: CheckFailed$' | sed "s#--> ${ROOT}#--> #")
   b2=$(perl -e 'alarm 20; exec @ARGV' "$BIT2" check "$f" 2>&1 >/dev/null)
   if [ "$seed" = "$b2" ]; then
     match=$((match + 1))
