@@ -734,6 +734,14 @@ struct XCtx {
   // The block currently being emitted — a jump target at or before it is a
   // back-edge and needs a safepoint poll.
   curBlock: int,
+  // One code offset per safepoint, in the order buildIntervals collected them
+  // (calls first-seen, then back-edge terminators) — emission re-encounters them
+  // in exactly that order, so `nextSafepointIdx` walks the two lists in lockstep
+  // and each stack map lands on its own return address. Preallocated to the
+  // safepoint count so an emitter deep in the call tree can record without
+  // threading a slice back out.
+  safepointCodeOffsets: []int,
+  nextSafepointIdx: int,
 }
 
 function newXCtx(cc: XCallConv): XCtx {
@@ -744,7 +752,7 @@ function newXCtx(cc: XCallConv): XCtx {
     intRegs: []XReg64(0), floatRegs: []XmmReg(0),
     frame: XFrame{ savedGpr: []XReg64(0), savedXmm: []XmmReg(0), numSpillSlots: 0,
       frameSize: 0 },
-    curBlock: 0 }
+    curBlock: 0, safepointCodeOffsets: []int(0), nextSafepointIdx: 0 }
 }
 
 // `call <symbol>` — `E8 rel32` with a zero placeholder and a relocation naming
@@ -1726,8 +1734,13 @@ function xEmitEpilogue(cx: XCtx) {
 // call instruction, so the offset is the RETURN ADDRESS — which is what the
 // collector's stack walker looks a frame up by (runtime/ABI.md §5). Recording
 // the call's own offset instead would leave every lookup missing.
-function xRecordSafepoint(cx: XCtx, offsets: []int): []int {
-  return append(offsets, len(cx.buf.code))
+// Records the CURRENT code offset as the next safepoint's return address. Call
+// it immediately AFTER the call instruction: the collector's stack walker looks a
+// frame up by its return address (runtime/ABI.md §5), so recording the call's own
+// offset leaves every lookup missing and the frame's live pointers invisible.
+function xRecordSafepoint(cx: XCtx) {
+  cx.safepointCodeOffsets[cx.nextSafepointIdx] = len(cx.buf.code)
+  cx.nextSafepointIdx = cx.nextSafepointIdx + 1
 }
 
 // The register a call's first argument goes in — the one place the two
@@ -1749,4 +1762,100 @@ function xClosureCellSize(): int {
 
 function xClosureCellPtrOffsets(): []int {
   return [8]
+}
+
+// ---------------------------------------------------------------------------
+// Value selectors: constants, fneg, allocation, closures
+// ---------------------------------------------------------------------------
+
+// `fneg`: x86-64 has no scalar float negate, so subtract from +0.0. Zeroing with
+// xorps and subtracting is the whole trick — note 0.0 - x, NOT x - 0.0, which is
+// the identity and would silently leave the value unchanged.
+function xEmitFneg(cx: XCtx, dst: int, operand: int, width: int) {
+  let v = xGetFloat(cx, operand, xFScratch2())
+  xXorp(cx.buf, xFScratch1(), xFScratch1(), width)
+  xFArithRR(cx.buf, XFArith.FSub, xFScratch1(), v, width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `const_string` loads the address of its static string header (`__bitstr_N`,
+// N = the string-pool index) — the driver emits that header ({ptr,len} + the
+// bytes) into .rodata under the same name. v1 string literals are static, so the
+// value is a plain pointer and never a GC reference.
+function xEmitConstString(cx: XCtx, dst: int, poolIdx: int) {
+  xMovAbsSymbol(cx, xScratch1(), "__bitstr_${poolIdx}")
+  xPutInt(cx, dst, xScratch1())
+}
+
+function xEmitConstBool(cx: XCtx, dst: int, val: bool) {
+  let v = 0
+  if (val) {
+    v = 1
+  }
+  xMovRI(cx.buf, xScratch1(), v)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `nil` is the null pointer. Zeroing via `xor r32, r32` is 2 bytes shorter than
+// a mov of 0 and clears the full 64-bit register (a 32-bit write zero-extends).
+function xEmitConstNil(cx: XCtx, dst: int) {
+  xZero32(cx.buf, xScratch1())
+  xPutInt(cx, dst, xScratch1())
+}
+
+// Calls `bit_rt_gc_alloc(typeinfo)` -> zeroed body pointer in rax. A real call
+// and a GC point, so it records a safepoint at the RETURN address: a collection
+// triggered by this very allocation must find the caller's live pointers in the
+// stack map. buildIntervals counts gc_alloc as a safepoint site, so the slot
+// exists to record into.
+function xEmitGcAlloc(cx: XCtx, dst: int, disc: int, size: int, ptrOffsets: []int) {
+  xMovAbsSymbol(cx, xArg0(cx.cc), typeInfoSymbol(disc, size, ptrOffsets))
+  // Win64 requires 32 bytes of shadow space the callee may write, above the
+  // return address; SysV has none.
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReloc(cx, "bit_rt_gc_alloc")
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// `type_info`: materialize a named type's static TypeInfo address. NOT a call
+// and NOT a GC point — the descriptor is a .rodata constant, and its non-
+// reference result type keeps it out of the stack map.
+function xEmitTypeInfo(cx: XCtx, dst: int, disc: int, size: int, ptrOffsets: []int) {
+  xMovAbsSymbol(cx, XReg64.Rax, typeInfoSymbol(disc, size, ptrOffsets))
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// `make_closure`: allocate the {code, env} cell (a GC point, like gc_alloc), then
+// store the target's address at +0 and the already-materialized environment at
+// +8. The env load happens AFTER the call — rax holds the cell, and a value read
+// before the call could have been in a caller-saved register the call clobbered.
+function xEmitMakeClosure(cx: XCtx, dst: int, funcName: string, env: int, disc: int) {
+  xMovAbsSymbol(cx, xArg0(cx.cc), typeInfoSymbol(disc, xClosureCellSize(), xClosureCellPtrOffsets()))
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReloc(cx, "bit_rt_gc_alloc")
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  xMovAbsSymbol(cx, xScratch1(), funcName)
+  xMovStore(cx.buf, xMemB(XReg64.Rax, 0), xScratch1(), 8)
+  let envReg = xGetInt(cx, env, xScratch1())
+  xMovStore(cx.buf, xMemB(XReg64.Rax, 8), envReg, 8)
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// `func_addr`: a function's code address via an absolute relocation to its own
+// symbol — the same primitive make_closure fills a cell's code slot with, minus
+// the cell. No call, no safepoint.
+function xEmitFuncAddr(cx: XCtx, dst: int, funcName: string) {
+  xMovAbsSymbol(cx, xScratch1(), funcName)
+  xPutInt(cx, dst, xScratch1())
 }
