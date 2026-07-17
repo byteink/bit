@@ -1553,3 +1553,129 @@ function xEmitConvert(cx: XCtx, dst: int, src: int, sw: Width, dw: Width) {
   }
   xPutFloat(cx, dst, xFScratch1())
 }
+
+// ---------------------------------------------------------------------------
+// Constants, shifts, and memory selectors
+// ---------------------------------------------------------------------------
+
+// `movq/movd xmm, r64/r32` — moves raw BITS from a GPR into an xmm, no
+// conversion. REX.W is the whole difference between movq (64) and movd (32).
+// This is how a float constant is materialized: build its bit pattern in a GPR,
+// then move the bits across.
+function xMovXG(b: X64Buf, dst: XmmReg, src: XReg64, width: int) {
+  xEmitByte(b, 0x66)
+  xMaybeRex(b, width == 8, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xRegNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x6E)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xRegNum(src)))
+}
+
+function xEmitConstInt(cx: XCtx, dst: int, val: int) {
+  xMovRI(cx.buf, xScratch1(), val)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// A float constant is materialized by its BITS, not by any conversion — the
+// literal's exact IEEE encoding goes into a GPR and then across to an xmm.
+function xEmitConstFloat(cx: XCtx, dst: int, bits: int, width: int) {
+  xMovRI(cx.buf, xScratch1(), bits)
+  xMovXG(cx.buf, xFScratch1(), xScratch1(), width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `dst = lhs << rhs` / `>> rhs`. `constAmt >= 0` selects the immediate form;
+// otherwise the count goes through cl, x86-64's only variable shift count —
+// which is why a function with a variable shift excludes rcx from allocation.
+function xEmitShiftInt(cx: XCtx, op: XShift, dst: int, lhs: int, rhs: int, constAmt: int, w: Width) {
+  let l = xGetInt(cx, lhs, xScratch1())
+  xMovRR(cx.buf, xScratch1(), l)
+  if (constAmt >= 0) {
+    xShiftImm(cx.buf, op, xScratch1(), constAmt)
+  } else {
+    let r = xGetInt(cx, rhs, xScratch2())
+    xMovRR(cx.buf, XReg64.Rcx, r)
+    xShiftCl(cx.buf, op, xScratch1())
+  }
+  // Only a LEFT shift pushes bits past the type width. The right shifts carry a
+  // canonical operand to a canonical result, so they need no re-narrowing —
+  // and that is exactly why the canonical invariant is worth maintaining.
+  if (op == XShift.Shl) {
+    xCanonNarrow(cx.buf, xScratch1(), w)
+  }
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `dst = base.field`. `base` is already the GC body pointer (runtime/ABI.md §1:
+// codegen never sees the header), so `offset` is a plain byte offset with no
+// header adjustment.
+//
+// `isArray` marks a fixed-size array field, which is INLINE storage: its value
+// is the interior address `base + offset`, formed with lea — loading a word
+// there would read the array's first element as if it were the array itself.
+function xEmitFieldGet(cx: XCtx, dst: int, base: int, offset: int, w: Width, isArray: bool) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  if (isArray) {
+    xLea(cx.buf, xScratch1(), baseReg, offset)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  if (w.class == RegClass.Int) {
+    xMovLoad(cx.buf, xScratch1(), xMemB(baseReg, offset), w.bytes, w.signed)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  xMovFLoad(cx.buf, xFScratch1(), xMemB(baseReg, offset), w.bytes)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `base.field = value`. The base is fetched into the SECONDARY scratch so the
+// primary stays free for the value — fetching both into the same scratch would
+// have the second overwrite the first.
+function xEmitFieldSet(cx: XCtx, base: int, offset: int, value: int, w: Width) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  if (w.class == RegClass.Int) {
+    let v = xGetInt(cx, value, xScratch1())
+    xMovStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
+    return
+  }
+  let v = xGetFloat(cx, value, xFScratch1())
+  xMovFStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
+}
+
+// `dst = len(slice)` — the `len` word at offset 8 of a slice or string header
+// (runtime/ABI.md §2). Shared by both, which is why one selector covers them.
+function xEmitSliceLen(cx: XCtx, dst: int, base: int) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  xMovLoad(cx.buf, xScratch1(), xMemB(baseReg, 8), 8, false)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `dst = base[index]` for a STATIC array only. A dynamic slice carries a
+// header and goes through the bounds-checked slice_get runtime call instead, so
+// lower.bit never emits index_get against one. The address is
+// `base + index*width` — no header, a static length (lower.bit's array scheme).
+function xEmitIndexGet(cx: XCtx, dst: int, base: int, index: int, w: Width) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  let idxReg = xGetInt(cx, index, xScratch3())
+  let m = xMemBI(baseReg, idxReg, w.bytes, 0)
+  if (w.class == RegClass.Int) {
+    xMovLoad(cx.buf, xScratch1(), m, w.bytes, w.signed)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  xMovFLoad(cx.buf, xFScratch1(), m, w.bytes)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+function xEmitIndexSet(cx: XCtx, base: int, index: int, value: int, w: Width) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  let idxReg = xGetInt(cx, index, xScratch3())
+  let m = xMemBI(baseReg, idxReg, w.bytes, 0)
+  if (w.class == RegClass.Int) {
+    let v = xGetInt(cx, value, xScratch1())
+    xMovStore(cx.buf, m, v, w.bytes)
+    return
+  }
+  let v = xGetFloat(cx, value, xFScratch1())
+  xMovFStore(cx.buf, m, v, w.bytes)
+}
