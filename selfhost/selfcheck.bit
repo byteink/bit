@@ -3308,12 +3308,19 @@ function xEmitContains(b: X64Buf, v: int): bool {
   return false
 }
 
-// True when `b`'s bytes contain the hex SEQUENCE `hex`. Byte presence
-// (xEmitContains) is too weak for a multi-byte encoding — an opcode byte often
-// doubles as some other instruction's ModRM — and comparing the whole buffer is
-// too strict when the surrounding moves are not what the test is pinning.
-function xHexHas(b: X64Buf, hex: string): bool {
-  let h = xHex(b)
+// The lowercase hex of a raw byte slice — FuncCode carries `code: []u8`, not a
+// buffer, so the byte-level helpers take the bytes and xHex/xHexHas wrap them.
+function hexOfBytes(code: []u8): string {
+  let out = ""
+  let d = "0123456789abcdef"
+  for by of code {
+    out = out + d[int(by) >> 4:(int(by) >> 4) + 1] + d[int(by) & 15:(int(by) & 15) + 1]
+  }
+  return out
+}
+
+// True when the hex string `h` contains the SEQUENCE `hex`.
+function hexHasIn(h: string, hex: string): bool {
   if (len(hex) == 0) {
     return true
   }
@@ -3325,6 +3332,14 @@ function xHexHas(b: X64Buf, hex: string): bool {
     i = i + 1
   }
   return false
+}
+
+// True when `b`'s bytes contain the hex SEQUENCE `hex`. Byte presence
+// (xEmitContains) is too weak for a multi-byte encoding — an opcode byte often
+// doubles as some other instruction's ModRM — and comparing the whole buffer is
+// too strict when the surrounding moves are not what the test is pinning.
+function xHexHas(b: X64Buf, hex: string): bool {
+  return hexHasIn(xHex(b), hex)
 }
 
 // How many times the hex sequence `hex` occurs in `b`. Presence alone cannot
@@ -3347,12 +3362,7 @@ function xHexCount(b: X64Buf, hex: string): int {
 
 // The bytes of `b`, as lowercase hex, for comparing against an objdump line.
 function xHex(b: X64Buf): string {
-  let out = ""
-  let d = "0123456789abcdef"
-  for by of b.code {
-    out = out + d[int(by) >> 4:(int(by) >> 4) + 1] + d[int(by) & 15:(int(by) & 15) + 1]
-  }
-  return out
+  return hexOfBytes(b.code)
 }
 
 function checkX64Regs() {
@@ -5008,14 +5018,31 @@ function checkX64GcAlloc() {
 
 // A ctx carrying a real IrFunc, so the marshalling paths can classify values by
 // type. `types` gives one type per instruction slot, in value-id order.
+//
+// EVERY slot gets a location — an emitter binds its own result, so a function
+// with N instructions needs N locations, not just one per operand. Slot 0 stays
+// in a register and slot 1 stays spilled (the two shapes the tests lean on);
+// the rest share a second register, which is enough to exercise a dispatch.
 function xFnCtx(types: []int, blocks: []IrBlock): XCtx {
   let cx = xCallTestCtx()
   let instrs = []IrInstr(0)
-  for t of types {
-    instrs = append(instrs, mkInstr(Op.ConstInt, t))
+  let locs = []RegLoc(0)
+  let i = 0
+  while (i < len(types)) {
+    instrs = append(instrs, mkInstr(Op.ConstInt, types[i]))
+    if (i == 1) {
+      locs = append(locs, RegLoc{ isSpill: true, index: 0 })
+    } else if (i == 0) {
+      locs = append(locs, RegLoc{ isSpill: false, index: 0 })
+    } else {
+      locs = append(locs, RegLoc{ isSpill: false, index: 1 })
+    }
+    i = i + 1
   }
   cx.f = IrFunc{ name: "f", paramTypes: []int(0), result: 0, blocks: blocks,
     instrs: instrs, isFallible: false }
+  cx.alloc = RegAllocResult{ locations: locs, numSpillSlots: 2,
+    stackMaps: []StackMapEntry(0) }
   cx.blockOffsets = [0, 0, 0]
   return cx
 }
@@ -5024,6 +5051,240 @@ function xFnCtx(types: []int, blocks: []IrBlock): XCtx {
 // an outgoing stack area the CALLER reserves and reclaims. The pieces
 // (xStackReserve/xEmitStackArgStore) are unit-tested separately; this pins that
 // xMarshalArgs actually wires them together.
+// Which registers a function's body forbids the allocator from handing out.
+function checkX64ScanFlags() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let one = IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }
+
+  // A self-loop is a back-edge, whose safepoint POLL is a real call — so it
+  // restricts the file to callee-saved exactly as a user call does. Scanning only
+  // for call ops missed this and left a loop-carried value in a caller-saved
+  // register that the poll then destroyed (#1236).
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 0
+  let loop = IrFunc{ name: "l", paramTypes: []int(0), result: ctx.voidId, blocks: [one],
+    instrs: [jmp], isFallible: false }
+  assert(xScanFuncFlags(loop).hasSafepoints)
+
+  // A FORWARD jump is not a back-edge and forces nothing.
+  let fwd = mkInstr(Op.Jump, ctx.voidId)
+  fwd.ival = 1
+  let two = IrFunc{ name: "f", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [one, IrBlock{ instsStart: 1, paramCount: 0, instsLen: 1 }],
+    instrs: [fwd, mkInstr(Op.Ret, ctx.voidId)], isFallible: false }
+  assert(!xScanFuncFlags(two).hasSafepoints)
+
+  // Division fixes rax/rdx as idiv's operands.
+  let dv = mkInstr(Op.SDiv, i64t)
+  let dvf = IrFunc{ name: "d", paramTypes: []int(0), result: i64t, blocks: [one],
+    instrs: [dv], isFallible: false }
+  assert(xScanFuncFlags(dvf).needsRaxRdx)
+  assert(!xScanFuncFlags(loop).needsRaxRdx)
+
+  // cl is x86-64's ONLY variable shift count, so a non-constant amount reserves
+  // rcx — but a CONSTANT amount uses the immediate form and reserves nothing.
+  let amt = mkInstr(Op.ConstInt, i64t)
+  amt.ival = 3
+  let shC = mkInstr(Op.Shl, i64t)
+  shC.lhs = 0
+  shC.rhs = 0 // points at the const_int: an immediate shift
+  let shConst = IrFunc{ name: "sc", paramTypes: []int(0), result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 2 }],
+    instrs: [amt, shC], isFallible: false }
+  assert(!xScanFuncFlags(shConst).needsRcx)
+
+  let dyn = mkInstr(Op.BlockParam, i64t)
+  let shV = mkInstr(Op.Shl, i64t)
+  shV.lhs = 0
+  shV.rhs = 0 // points at the block param: a variable shift
+  let shVar = IrFunc{ name: "sv", paramTypes: [i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 2 }],
+    instrs: [dyn, shV], isFallible: false }
+  assert(xScanFuncFlags(shVar).needsRcx)
+}
+
+// Signed and unsigned compares are DIFFERENT condition codes for the same
+// relation. Reading a signed compare with an unsigned code silently reorders
+// every negative value — no crash, just wrong answers.
+function checkX64IcmpCc() {
+  assert(xCcForIcmp(Op.ICmpEq) == ccE())
+  assert(xCcForIcmp(Op.ICmpNe) == ccNe())
+  assert(xCcForIcmp(Op.ICmpSlt) == ccL() && xCcForIcmp(Op.ICmpUlt) == ccB())
+  assert(xCcForIcmp(Op.ICmpSle) == ccLe() && xCcForIcmp(Op.ICmpUle) == ccBe())
+  assert(xCcForIcmp(Op.ICmpSgt) == ccG() && xCcForIcmp(Op.ICmpUgt) == ccA())
+  assert(xCcForIcmp(Op.ICmpSge) == ccGe() && xCcForIcmp(Op.ICmpUge) == ccAe())
+  // The pairs must not collide — that is the whole point.
+  assert(ccL() != ccB() && ccLe() != ccBe() && ccG() != ccA() && ccGe() != ccAe())
+}
+
+// Every IR op must map to its OWN machine operation. A swap in these tables is
+// pure silent wrongness — the code encodes fine and computes something else.
+function checkX64DispatchMaps() {
+  assert(xArithForOp(Op.Add) == XArith.Add)
+  assert(xArithForOp(Op.Sub) == XArith.Sub)
+  assert(xArithForOp(Op.BAnd) == XArith.And)
+  assert(xArithForOp(Op.BOr) == XArith.Or)
+  assert(xArithForOp(Op.BXor) == XArith.Xor)
+
+  assert(xShiftForOp(Op.Shl) == XShift.Shl)
+  assert(xShiftForOp(Op.LShr) == XShift.Shr) // LOGICAL: zero-fills
+  assert(xShiftForOp(Op.AShr) == XShift.Sar) // ARITHMETIC: sign-fills
+  // shr and sar differ only in whether the sign propagates — mixing them is
+  // invisible on positive values and wrong on every negative one.
+  assert(XShift.Shr != XShift.Sar)
+
+  assert(xDivOpForOp(Op.SDiv) == XDivOp.SDiv)
+  assert(xDivOpForOp(Op.UDiv) == XDivOp.UDiv)
+  assert(xDivOpForOp(Op.SRem) == XDivOp.SRem)
+  assert(xDivOpForOp(Op.URem) == XDivOp.URem)
+
+  assert(xFArithForOp(Op.FAdd) == XFArith.FAdd)
+  assert(xFArithForOp(Op.FSub) == XFArith.FSub)
+  assert(xFArithForOp(Op.FMul) == XFArith.FMul)
+  assert(xFArithForOp(Op.FDiv) == XFArith.FDiv)
+
+  assert(xFCmpForOp(Op.FCmpEq) == XFCmp.FEq)
+  assert(xFCmpForOp(Op.FCmpNe) == XFCmp.FNe)
+  assert(xFCmpForOp(Op.FCmpLt) == XFCmp.FLt)
+  assert(xFCmpForOp(Op.FCmpLe) == XFCmp.FLe)
+  assert(xFCmpForOp(Op.FCmpGt) == XFCmp.FGt)
+  assert(xFCmpForOp(Op.FCmpGe) == XFCmp.FGe)
+}
+
+// A float compare's operand width comes from its OPERANDS, never from its own
+// result — the result is a bool (1 byte), which would select the single-precision
+// compare for a pair of doubles and read half of each value.
+function checkX64DispatchFcmpWidth() {
+  let ctx = newTypeContext()
+  let f64t = primType(ctx, 9)
+  let boolt = primType(ctx, 10)
+  let cmp = mkInstr(Op.FCmpLt, boolt)
+  cmp.lhs = 0
+  cmp.rhs = 1
+  let cx = xFnCtx([f64t, f64t, boolt], [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 3 }])
+  cx.ctx = ctx
+  cx.f.instrs[0] = mkInstr(Op.BlockParam, f64t)
+  cx.f.instrs[1] = mkInstr(Op.BlockParam, f64t)
+  cx.f.instrs[2] = cmp
+  assert(xEmitInst(cx, 2))
+  // ucomisd %xmm0, %xmm15 — note the REX (44) sits BETWEEN the 0x66 prefix and
+  // the 0f opcode, so a "660f2e" probe never matches. Taking the width from the
+  // bool result drops the 0x66, emitting ucomiss and comparing the low halves.
+  assert(xHexHas(cx.buf, "66440f2ef8"))
+}
+
+// The dispatch must consult xConstShiftAmount per instruction: a CONSTANT amount
+// takes the immediate form, a variable one must route through cl. Hard-wiring
+// either way silently shifts by the wrong amount.
+function checkX64DispatchShift() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+
+  // Variable: the amount is a block param, so it goes through cl (opcode d3).
+  let shV = mkInstr(Op.Shl, i64t)
+  shV.lhs = 0
+  shV.rhs = 1
+  let cv = xFnCtx([i64t, i64t, i64t], [IrBlock{ instsStart: 0, paramCount: 2, instsLen: 3 }])
+  cv.ctx = ctx
+  // xFnCtx fills every slot with a const_int, so the amount must be made a real
+  // block param — otherwise xConstShiftAmount reads it as the constant 0 and this
+  // "variable" case is not variable at all.
+  cv.f.instrs[1] = mkInstr(Op.BlockParam, i64t)
+  cv.f.instrs[2] = shV
+  assert(xEmitInst(cv, 2))
+  assert(xHexHas(cv.buf, "49d3e3"))   // shl %cl, %r11
+  assert(!xHexHas(cv.buf, "49c1e3"))  // NOT the immediate form
+
+  // Constant: the amount is a const_int, so it takes the immediate form (c1).
+  let amt = mkInstr(Op.ConstInt, i64t)
+  amt.ival = 3
+  let shC = mkInstr(Op.Shl, i64t)
+  shC.lhs = 1
+  shC.rhs = 0
+  let cc = xFnCtx([i64t, i64t, i64t], [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 3 }])
+  cc.ctx = ctx
+  cc.f.instrs[0] = amt
+  cc.f.instrs[2] = shC
+  assert(xEmitInst(cc, 2))
+  assert(xHexHas(cc.buf, "49c1e303")) // shl $3, %r11
+  assert(!xHexHas(cc.buf, "49d3e3"))  // NOT the cl form
+}
+
+// An f32 constant must be narrowed and its 32-bit pattern used; handing the f64
+// bits to a 4-byte movd loads the wrong half of the value.
+function checkX64FloatConstBits() {
+  assert(xFloatConstBits(1.0, 8) == 4607182418800017408) // 0x3FF0000000000000
+  assert(xFloatConstBits(1.0, 4) == 1065353216)          // 0x3F800000
+  assert(xFloatConstBits(1.0, 4) != xFloatConstBits(1.0, 8))
+  assert(xFloatConstBits(0.0, 8) == 0 && xFloatConstBits(0.0, 4) == 0)
+}
+
+// End-to-end on a self-loop: the back-edge poll, the safepoint's return address,
+// and the jump patched back to the block's real offset.
+function checkX64CompileLoop() {
+  let ctx = newTypeContext()
+  let jmp = mkInstr(Op.Jump, ctx.voidId)
+  jmp.ival = 0
+  let f = IrFunc{ name: "loop", paramTypes: []int(0), result: ctx.voidId,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 0, instsLen: 1 }],
+    instrs: [jmp], isFallible: false }
+  let m = IrModule{ funcs: [f], ctx: ctx, stringPool: []string(0),
+    methodTables: []MethodTable(0), stubbed: []string(0) }
+  let fc = xCompileFunction(m, f, XCallConv.SysV)
+
+  // push rbp; mov rsp,rbp; push rbx/r13/r14/r15 — the file is the callee-saved
+  // subset because the poll is a call, so all four are preserved. 11 bytes, so
+  // block 0 starts at 11.
+  assert(hexOfBytes(fc.code) == "554889e553415541564157" + "e800000000" + "e9f6ffffff")
+  // The poll is a real call to the runtime.
+  assert(len(fc.relocs) == 1 && fc.relocs[0].symbol == "bit_rt_safepoint")
+  // Its safepoint is the RETURN address (16), not the call's own offset (11).
+  assert(len(fc.safepoints) == 1 && fc.safepoints[0].retOffset == 16)
+  // The jmp's rel32 is measured from the END of its 4-byte field, so it must
+  // resolve to block 0's real offset: -10 + (17 + 4) == 11. A blockOffsets table
+  // left at zero would encode -21 here and jump into the prologue.
+  assert(fc.frameSize == 0) // nothing spilled and no xmm saves to make room for
+}
+
+// End-to-end: the whole driver on the identity function `f(a: i64): i64 { a }`.
+// IR: bb0(%0: i64) { ret %0 }.
+function checkX64CompileFunction() {
+  let ctx = newTypeContext()
+  let i64t = primType(ctx, 3)
+  let ret = mkInstr(Op.Ret, ctx.voidId)
+  ret.args = [0]
+  let f = IrFunc{ name: "ident", paramTypes: [i64t], result: i64t,
+    blocks: [IrBlock{ instsStart: 0, paramCount: 1, instsLen: 2 }],
+    instrs: [mkInstr(Op.BlockParam, i64t), ret], isFallible: false }
+  let m = IrModule{ funcs: [f], ctx: ctx, stringPool: []string(0),
+    methodTables: []MethodTable(0), stubbed: []string(0) }
+
+  let fc = xCompileFunction(m, f, XCallConv.SysV)
+  assert(fc.name == "ident")
+  let h = hexOfBytes(fc.code)
+  // Frame chain first: push rbp; mov rsp,rbp. The runtime stack walker reads
+  // *(fp) as the caller's fp and *(fp+8) as the return address, so this pair is
+  // not optional even for a leaf.
+  assert(len(h) >= 8 && h[0:8] == "554889e5")
+  // The incoming argument is bound out of rdi — without this the entry param
+  // holds whatever the allocator left in its register and the function returns
+  // garbage.
+  assert(hexHasIn(h, "4889f8")) // mov %rdi, %rax
+  // ...and it ends with the frame teardown.
+  assert(h[len(h) - 4:len(h)] == "5dc3") // pop %rbp; ret
+  // No safepoints: a leaf with no calls and no back-edge polls nothing.
+  assert(len(fc.safepoints) == 0)
+  assert(len(fc.relocs) == 0)
+  // The callee-saved registers it preserved are reported frame-relative, so the
+  // walker can restore them when unwinding past this frame.
+  let si = 0
+  while (si < len(fc.savedRegs)) {
+    assert(fc.savedRegs[si].fpOff == -8 * (si + 1))
+    si = si + 1
+  }
+}
+
 function checkX64MarshalStackArgs() {
   let ctx = newTypeContext()
   let i64t = primType(ctx, 3)
@@ -5534,6 +5795,14 @@ function selfcheck() {
   checkX64FieldSel()
   checkX64Prologue()
   checkX64Epilogue()
+  checkX64ScanFlags()
+  checkX64IcmpCc()
+  checkX64DispatchMaps()
+  checkX64DispatchFcmpWidth()
+  checkX64DispatchShift()
+  checkX64FloatConstBits()
+  checkX64CompileLoop()
+  checkX64CompileFunction()
   checkX64MarshalStackArgs()
   checkX64IndirectCalls()
   checkX64CallLike()

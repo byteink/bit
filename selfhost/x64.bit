@@ -1804,6 +1804,109 @@ function xClosureCellPtrOffsets(): []int {
   return [8]
 }
 
+// The constant shift amount of `v`, or -1 when the amount is not a constant.
+// x86-64's only variable shift count is cl, so a non-constant amount forces rcx
+// out of the allocatable file (see xScanFuncFlags).
+function xConstShiftAmount(f: IrFunc, v: int): int {
+  if (f.instrs[v].op != Op.ConstInt) {
+    return -1
+  }
+  return f.instrs[v].ival & 63
+}
+
+// One pass over the body deciding which registers the allocator may NOT hand
+// out. Every flag exists because some instruction hard-wires a register:
+// division fixes rax/rdx, a variable shift fixes cl, and any safepoint restricts
+// the whole file to callee-saved (a call destroys everything else).
+function xScanFuncFlags(f: IrFunc): XFuncFlags {
+  let flags = XFuncFlags{ hasSafepoints: false, needsRaxRdx: false, needsRcx: false }
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    let b = f.blocks[bi]
+    let i = b.instsStart + b.paramCount
+    let end = b.instsStart + b.instsLen
+    while (i < end) {
+      let ins = f.instrs[i]
+      if (isSafepointOp(ins.op)) {
+        flags.hasSafepoints = true
+      }
+      if (ins.op == Op.SDiv || ins.op == Op.UDiv || ins.op == Op.SRem || ins.op == Op.URem) {
+        flags.needsRaxRdx = true
+      }
+      if (ins.op == Op.Shl || ins.op == Op.AShr || ins.op == Op.LShr) {
+        if (xConstShiftAmount(f, ins.rhs) < 0) {
+          flags.needsRcx = true
+        }
+      }
+      // A back-edge's safepoint poll is a real call, so it restricts the file
+      // exactly as a user call does. Scanning only for call ops missed this and
+      // left a loop-carried value in a caller-saved register that the poll then
+      // destroyed (#1236).
+      if (ins.op == Op.Jump && isBackEdge(bi, ins.ival)) {
+        flags.hasSafepoints = true
+      }
+      if (ins.op == Op.Br) {
+        if (isBackEdge(bi, ins.ival) || isBackEdge(bi, ins.ival2)) {
+          flags.hasSafepoints = true
+        }
+      }
+      i = i + 1
+    }
+    bi = bi + 1
+  }
+  return flags
+}
+
+// Which callee-saved registers the prologue must preserve. Every callee-saved
+// register IN THE FILE is saved, not just the ones the allocation touched: when
+// the function has safepoints the file IS the callee-saved subset, so this is
+// the set the allocator could have used.
+function xBuildSavedGpr(cc: XCallConv, regs: []XReg64): []XReg64 {
+  let out = []XReg64(0)
+  for r of regs {
+    if (xIsCalleeSavedInt(cc, r)) {
+      out = append(out, r)
+    }
+  }
+  return out
+}
+
+function xBuildSavedXmm(cc: XCallConv, regs: []XmmReg): []XmmReg {
+  let out = []XmmReg(0)
+  for x of regs {
+    if (xIsCalleeSavedFloat(cc, x)) {
+      out = append(out, x)
+    }
+  }
+  return out
+}
+
+// Bit i set means file register i is callee-saved. regalloc takes this as
+// informative only, but it is part of its TargetRegs contract.
+function xCalleeSavedIntMask(cc: XCallConv, regs: []XReg64): int {
+  let mask = 0
+  let i = 0
+  while (i < len(regs)) {
+    if (xIsCalleeSavedInt(cc, regs[i])) {
+      mask = mask | 1 << i
+    }
+    i = i + 1
+  }
+  return mask
+}
+
+function xCalleeSavedFloatMask(cc: XCallConv, regs: []XmmReg): int {
+  let mask = 0
+  let i = 0
+  while (i < len(regs)) {
+    if (xIsCalleeSavedFloat(cc, regs[i])) {
+      mask = mask | 1 << i
+    }
+    i = i + 1
+  }
+  return mask
+}
+
 // ---------------------------------------------------------------------------
 // Argument marshalling, calls, and control flow
 // ---------------------------------------------------------------------------
@@ -2206,4 +2309,283 @@ function xEmitMakeClosure(cx: XCtx, dst: int, funcName: string, env: int, disc: 
 function xEmitFuncAddr(cx: XCtx, dst: int, funcName: string) {
   xMovAbsSymbol(cx, xScratch1(), funcName)
   xPutInt(cx, dst, xScratch1())
+}
+
+// ---------------------------------------------------------------------------
+// Instruction dispatch
+// ---------------------------------------------------------------------------
+
+// The x86 condition code an integer compare sets its result from. Signed and
+// unsigned are DIFFERENT codes for the same relation (l/ge vs b/ae): reading a
+// signed compare with an unsigned code silently reorders negative values.
+function xCcForIcmp(op: Op): int {
+  if (op == Op.ICmpEq) { return ccE() }
+  if (op == Op.ICmpNe) { return ccNe() }
+  if (op == Op.ICmpSlt) { return ccL() }
+  if (op == Op.ICmpSle) { return ccLe() }
+  if (op == Op.ICmpSgt) { return ccG() }
+  if (op == Op.ICmpSge) { return ccGe() }
+  if (op == Op.ICmpUlt) { return ccB() }
+  if (op == Op.ICmpUle) { return ccBe() }
+  if (op == Op.ICmpUgt) { return ccA() }
+  assert(op == Op.ICmpUge)
+  return ccAe()
+}
+
+function xArithForOp(op: Op): XArith {
+  if (op == Op.Sub) { return XArith.Sub }
+  if (op == Op.BAnd) { return XArith.And }
+  if (op == Op.BOr) { return XArith.Or }
+  if (op == Op.BXor) { return XArith.Xor }
+  assert(op == Op.Add)
+  return XArith.Add
+}
+
+function xDivOpForOp(op: Op): XDivOp {
+  if (op == Op.UDiv) { return XDivOp.UDiv }
+  if (op == Op.SRem) { return XDivOp.SRem }
+  if (op == Op.URem) { return XDivOp.URem }
+  assert(op == Op.SDiv)
+  return XDivOp.SDiv
+}
+
+function xShiftForOp(op: Op): XShift {
+  if (op == Op.LShr) { return XShift.Shr }
+  if (op == Op.AShr) { return XShift.Sar }
+  assert(op == Op.Shl)
+  return XShift.Shl
+}
+
+function xFArithForOp(op: Op): XFArith {
+  if (op == Op.FSub) { return XFArith.FSub }
+  if (op == Op.FMul) { return XFArith.FMul }
+  if (op == Op.FDiv) { return XFArith.FDiv }
+  assert(op == Op.FAdd)
+  return XFArith.FAdd
+}
+
+function xFCmpForOp(op: Op): XFCmp {
+  if (op == Op.FCmpNe) { return XFCmp.FNe }
+  if (op == Op.FCmpLt) { return XFCmp.FLt }
+  if (op == Op.FCmpLe) { return XFCmp.FLe }
+  if (op == Op.FCmpGt) { return XFCmp.FGt }
+  if (op == Op.FCmpGe) { return XFCmp.FGe }
+  assert(op == Op.FCmpEq)
+  return XFCmp.FEq
+}
+
+// The bit pattern a float constant is materialized from. An f32 constant must be
+// NARROWED first and its 32-bit pattern used — feeding the f64 bits to a 4-byte
+// movd loads the wrong half of the value.
+function xFloatConstBits(val: f64, width: int): int {
+  if (width == 4) {
+    return i64(u64(float32Bits(f32(val))))
+  }
+  return i64(floatBits(val))
+}
+
+// A void-typed instruction has no result to bind; -1 says so.
+function xDstOrNone(cx: XCtx, i: int, ty: int): int {
+  if (ty == cx.ctx.voidId) {
+    return -1
+  }
+  return i
+}
+
+// Emits one instruction. Returns false when the construct is unsupported (a
+// multi-value ret), which fails the whole compile rather than emitting something
+// that computes the wrong thing.
+function xEmitInst(cx: XCtx, i: int): bool {
+  let ins = cx.f.instrs[i]
+  let op = ins.op
+  let ty = ins.ty
+  // The RESULT width — it drives narrow re-canonicalization. A compare's own
+  // result is a bool, so the float path re-reads its OPERAND width below.
+  let iw = widthOf(cx.ctx, ty)
+
+  if (op == Op.ConstInt) { xEmitConstInt(cx, i, ins.ival); return true }
+  if (op == Op.ConstBool) { xEmitConstBool(cx, i, ins.bval); return true }
+  if (op == Op.ConstNil) { xEmitConstNil(cx, i); return true }
+  if (op == Op.ConstFloat) { xEmitConstFloat(cx, i, xFloatConstBits(ins.fval, iw.bytes), iw.bytes); return true }
+  if (op == Op.ConstString) { xEmitConstString(cx, i, ins.ival); return true }
+  if (op == Op.Add || op == Op.Sub || op == Op.BAnd || op == Op.BOr || op == Op.BXor) {
+    xEmitBinaryInt(cx, xArithForOp(op), i, ins.lhs, ins.rhs, iw)
+    return true
+  }
+  if (op == Op.Mul) { xEmitMulInt(cx, i, ins.lhs, ins.rhs, iw); return true }
+  if (op == Op.SDiv || op == Op.UDiv || op == Op.SRem || op == Op.URem) {
+    xEmitDivInt(cx, xDivOpForOp(op), i, ins.lhs, ins.rhs)
+    return true
+  }
+  if (op == Op.Shl || op == Op.LShr || op == Op.AShr) {
+    xEmitShiftInt(cx, xShiftForOp(op), i, ins.lhs, ins.rhs, xConstShiftAmount(cx.f, ins.rhs), iw)
+    return true
+  }
+  if (isIcmp(op)) { xEmitIcmp(cx, xCcForIcmp(op), i, ins.lhs, ins.rhs); return true }
+  if (op == Op.FAdd || op == Op.FSub || op == Op.FMul || op == Op.FDiv) {
+    xEmitBinaryFloat(cx, xFArithForOp(op), i, ins.lhs, ins.rhs, iw.bytes)
+    return true
+  }
+  if (isFcmp(op)) {
+    // A float compare's operand width comes from the OPERANDS — its own result is
+    // a bool, so `iw` would say 1 and compare the wrong half of the register.
+    xEmitFcmp(cx, xFCmpForOp(op), i, ins.lhs, ins.rhs, widthOf(cx.ctx, cx.f.instrs[ins.lhs].ty).bytes)
+    return true
+  }
+  if (op == Op.Neg || op == Op.BNot) { xEmitUnaryInt(cx, op == Op.Neg, i, ins.lhs, iw); return true }
+  if (op == Op.Convert) {
+    xEmitConvert(cx, i, ins.lhs, widthOf(cx.ctx, cx.f.instrs[ins.lhs].ty), iw)
+    return true
+  }
+  if (op == Op.FNeg) {
+    xEmitFneg(cx, i, ins.lhs, widthOf(cx.ctx, cx.f.instrs[ins.lhs].ty).bytes)
+    return true
+  }
+  if (op == Op.Jump) { xEmitJump(cx, ins.ival, ins.args); return true }
+  if (op == Op.Br) { xEmitBr(cx, ins.lhs, ins.ival, ins.thenArgs, ins.ival2, ins.elseArgs); return true }
+  if (op == Op.Ret) { return xEmitRet(cx, ins.args) }
+  if (op == Op.Unreachable) { xUd2(cx.buf); return true }
+  if (op == Op.Call) {
+    xEmitCallLike(cx, ins.name, ins.args, ty != cx.ctx.voidId, i, ty)
+    return true
+  }
+  if (op == Op.RtCall) {
+    xEmitCallLike(cx, rtSymbol(ins.name), ins.args, ty != cx.ctx.voidId, i, ty)
+    return true
+  }
+  if (op == Op.CallValue) { xEmitCallValue(cx, xDstOrNone(cx, i, ty), ty, ins.lhs, ins.args); return true }
+  if (op == Op.CallIface) {
+    xEmitCallIface(cx, xDstOrNone(cx, i, ty), ty, ins.lhs, ins.ival, ins.args)
+    return true
+  }
+  if (op == Op.GcAlloc) { xEmitGcAlloc(cx, i, ty, ins.ival, ins.offsets); return true }
+  if (op == Op.TypeInfo) { xEmitTypeInfo(cx, i, ins.ival, ins.ival2, ins.offsets); return true }
+  if (op == Op.MakeClosure) { xEmitMakeClosure(cx, i, ins.name, ins.lhs, ty); return true }
+  if (op == Op.FuncAddr) { xEmitFuncAddr(cx, i, ins.name); return true }
+  if (op == Op.FieldGet) {
+    xEmitFieldGet(cx, i, ins.lhs, ins.ival, iw, cx.ctx.types[ty].kind == TypeKind.Array)
+    return true
+  }
+  if (op == Op.FieldSet) {
+    xEmitFieldSet(cx, ins.lhs, ins.ival, ins.rhs, widthOf(cx.ctx, cx.f.instrs[ins.rhs].ty))
+    return true
+  }
+  if (op == Op.IndexGet) { xEmitIndexGet(cx, i, ins.lhs, ins.rhs, iw); return true }
+  if (op == Op.IndexSet) {
+    // index_set keeps its VALUE operand in ival — rhs is the INDEX.
+    xEmitIndexSet(cx, ins.lhs, ins.rhs, ins.ival, widthOf(cx.ctx, cx.f.instrs[ins.ival].ty))
+    return true
+  }
+  if (op == Op.SliceLen) { xEmitSliceLen(cx, i, ins.lhs); return true }
+  // block_param is never reached: every emission loop starts past a block's
+  // params.
+  assert(op != Op.BlockParam)
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Top-level driver
+// ---------------------------------------------------------------------------
+
+// Compiles one function to x86-64 machine code for `cc`. Runs register
+// allocation itself (intervals and safepoints come from the shared
+// buildIntervals), lays out the frame, then emits the prologue, every block in
+// f.blocks order — which back-edge detection assumes is the original builder/RPO
+// order (see isBackEdge) — and finally patches the jump targets.
+//
+// Returns a FuncCode with an empty name when the function contains a construct
+// this backend refuses (a multi-value ret): the caller must not emit a binary.
+function xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv): FuncCode {
+  let ctx = module.ctx
+  let flags = xScanFuncFlags(f)
+  let intRegs = xBuildIntRegs(cc, flags)
+  let floatRegs = xBuildFloatRegs(cc, flags.hasSafepoints)
+
+  let built = buildIntervals(ctx, f)
+  let result = allocate(TargetRegs{
+    intRegs: RegFile{ count: len(intRegs), calleeSaved: xCalleeSavedIntMask(cc, intRegs) },
+    floatRegs: RegFile{ count: len(floatRegs), calleeSaved: xCalleeSavedFloatMask(cc, floatRegs) },
+  }, built.intervals, built.safepoints)
+
+  let savedGpr = xBuildSavedGpr(cc, intRegs)
+  let savedXmm = xBuildSavedXmm(cc, floatRegs)
+  // The XMMs live inside the carved frame alongside the spill slots; the GPRs are
+  // pushed, so they are NOT part of frameSize — only its alignment (an odd number
+  // of pushes leaves rsp 8 off).
+  let rawFrame = 8 * (result.numSpillSlots + len(savedXmm))
+  let frame = XFrame{ savedGpr: savedGpr, savedXmm: savedXmm,
+    numSpillSlots: result.numSpillSlots, frameSize: xAlignFrame(rawFrame, len(savedGpr)) }
+
+  let cx = newXCtx(cc)
+  cx.module = module
+  cx.ctx = ctx
+  cx.f = f
+  cx.alloc = result
+  cx.intRegs = intRegs
+  cx.floatRegs = floatRegs
+  cx.frame = frame
+  cx.blockOffsets = []int(len(f.blocks))
+  cx.safepointCodeOffsets = []int(len(built.safepoints))
+
+  xEmitPrologue(cx)
+  xBindIncomingArgs(cx)
+
+  let ok = true
+  let bi = 0
+  while (bi < len(f.blocks)) {
+    cx.curBlock = bi
+    cx.blockOffsets[bi] = len(cx.buf.code)
+    let b = f.blocks[bi]
+    let i = b.instsStart + b.paramCount
+    let end = b.instsStart + b.instsLen
+    while (i < end) {
+      if (!xEmitInst(cx, i)) {
+        ok = false
+      }
+      i = i + 1
+    }
+    bi = bi + 1
+  }
+  xPatchJumpFixups(cx)
+
+  if (!ok) {
+    return FuncCode{ name: "", code: []u8(0), relocs: []Reloc(0),
+      safepoints: []SafepointView(0), savedRegs: []SavedReg(0), frameSize: 0 }
+  }
+
+  // Every safepoint the interval builder predicted must have been reached during
+  // emission, or the stack maps below pair with the wrong return addresses.
+  assert(cx.nextSafepointIdx == len(built.safepoints))
+
+  // Pair each allocator stack map with the code offset emission recorded for it —
+  // the two lists are in the same order by construction.
+  let safepoints = []SafepointView(0)
+  let si = 0
+  while (si < len(result.stackMaps)) {
+    let sm = result.stackMaps[si]
+    let regs = []int(0)
+    for r of sm.regs {
+      regs = append(regs, xRegNum(intRegs[r]))
+    }
+    let slots = []int(0)
+    for s of sm.slots {
+      slots = append(slots, xSpillOffset(frame, s))
+    }
+    safepoints = append(safepoints, SafepointView{ retOffset: cx.safepointCodeOffsets[si],
+      slots: slots, regs: regs })
+    si = si + 1
+  }
+
+  // Register-recovery slots: the prologue does `push rbp; mov rbp,rsp; push
+  // savedGpr[i]...`, so the caller's savedGpr[i] lands at rbp - 8*(i+1) —
+  // frame-pointer-relative, matching SafepointView's own offsets.
+  let savedRegs = []SavedReg(0)
+  let gi = 0
+  while (gi < len(savedGpr)) {
+    savedRegs = append(savedRegs, SavedReg{ reg: xRegNum(savedGpr[gi]), fpOff: -8 * (gi + 1) })
+    gi = gi + 1
+  }
+
+  return FuncCode{ name: f.name, code: cx.buf.code, relocs: cx.relocs,
+    safepoints: safepoints, savedRegs: savedRegs, frameSize: frame.frameSize }
 }
