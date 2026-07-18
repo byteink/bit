@@ -1,0 +1,282 @@
+// Linux OS-thread provider for the Stage-2 port of runtime/sched.zig's worker
+// pool (#1403). See ../thread.bit for the shared contract, the seam against
+// #1364, and — importantly — the three rules a child thread's body must obey.
+//
+// Raw `clone(2)` (§11.8) rather than `pthread_create`, for the reason the whole
+// runtime uses syscalls: the ELF output is fully static, with no libc to call
+// into. `extern function` is rejected outright on both Linux targets (E0078),
+// so there is no other path even in principle.
+//
+// EVERY CONSTANT BELOW WAS READ OUT OF THE PINNED ZIG STDLIB, NOT FROM MEMORY —
+// syscall numbers from std/os/linux/syscalls.zig (`X64`/`Arm64` enums), the
+// clone flags from std/os/linux.zig's `CLONE`, and the per-architecture
+// argument ORDER from the hand-written `clone` in std/os/linux/{x86_64,
+// aarch64}.zig. A wrong number here is a silent wrong-syscall, not a compile
+// error; tests/stress/threadlinux issues every one of them against the real
+// kernel.
+//
+// This module is a LEAF with no imports, exactly as runtime/alloc's,
+// runtime/rand's and runtime/park's providers are — so the two status literals
+// it shares with ../thread.bit are duplicated here rather than imported.
+// tests/stress/thread/props pins the two spellings against each other so the
+// duplication cannot drift.
+
+// Syscall numbers are per-architecture and Bit has no arch-conditional
+// compilation, so the number is selected at run time (§11.8). `hostTarget()` is
+// 0 for x86_64-linux and 1 for aarch64-linux; this module is only ever built
+// for a Linux target, so the two cases are exhaustive. Same shape as
+// runtime/alloc/linux/pages.bit.
+function nr(x64: int, arm64: int): int {
+  if (hostTarget() == 0) {
+    return x64
+  }
+  return arm64
+}
+
+function nrClone(): int { return nr(56, 220) }
+function nrMmap(): int { return nr(9, 222) }
+function nrMunmap(): int { return nr(11, 215) }
+function nrMprotect(): int { return nr(10, 226) }
+
+// PROT_NONE (0) for the whole reservation, then PROT_READ|PROT_WRITE (3) for
+// everything above the guard page.
+function protNone(): int { return 0 }
+function protReadWrite(): int { return 3 }
+
+// MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20). Anonymous mappings ignore the fd,
+// which is passed as -1 by convention.
+function mapPrivateAnon(): int { return 34 }
+
+// 4096 on both x86_64 and aarch64 Linux, the same value and the same
+// justification as runtime/alloc/linux/pages.bit's `pageSize`. Used here only
+// as the size of the guard page, where being too small is the only thing that
+// could matter — and it is not, because a guard is a lower bound on protection,
+// not an exact requirement.
+function pageSize(): int { return 4096 }
+
+// See ../thread.bit's `threadRunning`. Duplicated, not imported, because a
+// provider is a leaf.
+function runningSentinel(): int { return 1 }
+
+// ../thread.bit's `threadStackBytes` (16MiB — Zig's `default_stack_size`, which
+// is what `sched.zig`'s `std.Thread.spawn(.{}, ...)` takes by default).
+// Duplicated for the same leaf reason; tests/stress/thread/props pins the two
+// spellings against each other so they cannot drift.
+function stackBytes(): int { return 16777216 }
+
+// The whole reservation: one leading guard page plus the usable stack. Named
+// once because `threadStart` and `threadRelease` MUST agree on it — an munmap
+// length that disagreed with the mmap length would unmap the wrong extent.
+function reservationBytes(): int { return pageSize() + stackBytes() }
+
+// The clone flags for a THREAD (as opposed to a process): one address space,
+// one file-descriptor table, one signal-handler table, one thread group.
+//
+//   CLONE_VM        0x00000100   share the address space
+//   CLONE_FS        0x00000200   share cwd / umask / root
+//   CLONE_FILES     0x00000400   share the fd table
+//   CLONE_SIGHAND   0x00000800   share signal handlers (requires VM)
+//   CLONE_THREAD    0x00010000   same thread group (requires SIGHAND)
+//   CLONE_SYSVSEM   0x00040000   share SysV semaphore undo state
+//   CLONE_CHILD_CLEARTID 0x00200000  clear+wake the ctid word at thread exit
+//
+// = 0x250F00 = 2428672.
+//
+// TWO OF ZIG'S FLAGS ARE DELIBERATELY ABSENT, and neither omission is an
+// oversight:
+//
+//   CLONE_PARENT_SETTID is dropped because `clone` already RETURNS the child's
+//   tid to the parent. Zig wants the tid in a fixed field of its `Instance`;
+//   this contract hands back an opaque handle instead, so there is nothing for
+//   the kernel to write and no word to allocate for it.
+//
+//   CLONE_SETTLS is dropped because this module does not implement thread-local
+//   storage — #1402 owns TLS and is a separate change; inventing a second
+//   layout here would collide with it. Without the flag the child INHERITS the
+//   parent's thread pointer, so the two share one TLS block. That is why
+//   ../thread.bit forbids a child from using `!`/`fail`/`?`, which lower to a
+//   thread-local error slot. THE SHAPE #1402 MUST PROVIDE to lift that
+//   restriction: a per-thread block of the runtime's TLS area size, and its
+//   address passed here as the `tls` clone argument — one extra input to
+//   `cloneChild` below and this flag ORed in. Nothing else about this file
+//   changes.
+//
+// CLONE_DETACHED is also absent: modern kernels ignore it entirely (it was
+// removed in 2.6), and Zig passes it only as inherited habit.
+function cloneThreadFlags(): int { return 2428672 }
+
+// Reserve a guarded stack and return its base, or 0 if the kernel refuses.
+//
+// This is `sched.zig`'s `mapGuardedStack`: reserve `guard + usable` as
+// PROT_NONE, then make everything above the guard page readable and writable.
+// The guard page is the whole point — without it a stack overflow silently
+// walks into whatever mapping happens to sit below, which on a thread that the
+// collector does not know about would be corruption with no symptom. With it,
+// the same overflow is an immediate SIGSEGV at a known address.
+//
+// The reservation is mapped PROT_NONE first and opened up second, rather than
+// mapped RW and then closed off, so there is never a window in which the guard
+// page is writable.
+function mapStack(usable: int): int {
+  let total = pageSize() + usable
+  let base = int(syscall(nrMmap(), 0, i64(total), i64(protNone()),
+                         i64(mapPrivateAnon()), 0 - 1, 0))
+  if (base <= 0) {
+    return 0
+  }
+  let rc = int(syscall(nrMprotect(), i64(base + pageSize()), i64(usable),
+                       i64(protReadWrite())))
+  if (rc != 0) {
+    // The reservation exists but is unusable; hand it straight back rather
+    // than leaking address space on a path that is about to report failure.
+    let dead = int(syscall(nrMunmap(), i64(base), i64(total)))
+    return 0
+  }
+  return base
+}
+
+// `clone(2)` with a child that branches to `entry` instead of returning.
+//
+// WHY THIS MUST BE `asm` AND CANNOT BE A `syscall` EXPRESSION. The child of a
+// raw `clone` resumes with the stack pointer set to `stackTop` — a fresh
+// mapping that holds none of this function's frame. It therefore cannot return
+// to its caller, and it cannot execute any Bit code that addresses a local,
+// because every one of those addresses belongs to the parent's stack. The
+// child's very first action has to be a branch to somewhere that expects a bare
+// stack. `syscall` is an expression whose value flows back into the enclosing
+// frame, so it cannot express that; a single `asm` block that tests the return
+// value and diverges can.
+//
+// It needs no relocation and therefore nothing §11.6 lacks: the branch target
+// arrives in a REGISTER (`entryOf`, §11.10), so this is a register-indirect
+// `blr`/`call`, not a symbolic one. That was the open question when #1403's
+// first half stopped here, and it is settled — `tests/stress/entryof` proved
+// the identical "load an address, branch to it" pattern on all three targets
+// before this file was written.
+//
+// THE PER-ARCHITECTURE ARGUMENT ORDER IS THE TRAP IN THIS FUNCTION. The kernel
+// swaps clone's 4th and 5th arguments between the two architectures — x86_64
+// selects CONFIG_CLONE_BACKWARDS, arm64 does not:
+//
+//   x86_64:  clone(flags, stack, ptid, CTID, TLS)   rdi rsi rdx r10 r8
+//   aarch64: clone(flags, stack, ptid, TLS, CTID)   x0  x1  x2  x3  x4
+//
+// Read out of the hand-written asm in std/os/linux/x86_64.zig and
+// std/os/linux/aarch64.zig, whose register shuffles state it unambiguously.
+// The `input` lines below pair registers BY MEANING rather than by position,
+// which is what absorbs the swap: the `ctid` line names r10 on x64 and x4 on
+// arm64, and the `tls` line names r8 and x3. Getting this backwards would pass
+// a pointer where the kernel expects a TLS base — a silently wrong thread
+// rather than a failed call.
+//
+// Registers the CHILD destroys (the frame pointer it zeroes, the link register
+// `blr` overwrites) are deliberately NOT in the clobber list. A clobber is a
+// statement about the code path that CONTINUES, and only the parent does: the
+// parent executes the syscall, sees a nonzero result, and jumps clear of the
+// child block without touching either register. The child never returns to Bit
+// code at all, so what it destroys is unobservable. Declaring the frame pointer
+// clobbered would instead evict it from the enclosing function for no reason.
+//
+// The child zeroes its frame pointer for the same reason Zig's `clone` does: it
+// terminates any stack walk cleanly at the thread's base rather than letting a
+// walker follow an inherited pointer into the parent's stack.
+//
+// Returns the child's tid (> 0) in the parent, or a negative errno.
+function cloneChild(flags: int, stackTop: int, ctid: *i32,
+                    entry: *byte, arg: *byte): int {
+  return asm {
+    // arm64, one 32-bit word per instruction:
+    //   svc  #0            issue clone
+    //   cbnz x0, +7        parent (x0 = child tid) -> skip the 6 child words
+    //   mov  x29, #0       child: terminate the frame-pointer chain
+    //   mov  x0, x6        child: arg -> first C argument
+    //   blr  x5            child: enter the body
+    //   mov  x8, #93       child: SYS_exit
+    //   mov  x0, #0        child: status 0
+    //   svc  #0            child: never returns
+    arm64 { 0xD4000001, 0xB50000E0, 0xD280001D, 0xAA0603E0, 0xD63F00A0,
+            0xD2800BA8, 0xD2800000, 0xD4000001 }
+    // x64, one byte per element:
+    //   0F 05              syscall
+    //   48 85 C0           test rax, rax
+    //   75 11              jnz +17 (parent -> skip the 17 child bytes)
+    //   31 ED              xor ebp, ebp
+    //   4C 89 EF           mov rdi, r13     (arg -> first C argument)
+    //   41 FF D4           call r12         (enter the body)
+    //   B8 3C 00 00 00     mov eax, 60      (SYS_exit)
+    //   31 FF              xor edi, edi
+    //   0F 05              syscall
+    x64 { 0x0F, 0x05, 0x48, 0x85, 0xC0, 0x75, 0x11,
+          0x31, 0xED, 0x4C, 0x89, 0xEF, 0x41, 0xFF, 0xD4,
+          0xB8, 0x3C, 0x00, 0x00, 0x00, 0x31, 0xFF, 0x0F, 0x05 }
+    result arm64 x0 x64 rax : int
+    input arm64 x8 x64 rax = nrClone()
+    input arm64 x0 x64 rdi = flags
+    input arm64 x1 x64 rsi = stackTop
+    input arm64 x2 x64 rdx = 0
+    // ctid: clone argument 4 on x86_64, argument 5 on aarch64.
+    input arm64 x4 x64 r10 = int(ctid)
+    // tls: clone argument 5 on x86_64, argument 4 on aarch64. Zero because
+    // CLONE_SETTLS is not set — see `cloneThreadFlags`.
+    input arm64 x3 x64 r8 = 0
+    // Carried across the syscall for the child's use only. The kernel copies
+    // the parent's registers into the child, so these survive into it.
+    input arm64 x5 x64 r12 = int(entry)
+    input arm64 x6 x64 r13 = int(arg)
+    // The x86_64 `syscall` instruction destroys rcx and r11 architecturally.
+    // `memory` is a compiler barrier, not a register: the child writes through
+    // `ctid` and `arg` behind the optimiser's back.
+    clobber x64 { rcx, r11, memory }
+    clobber arm64 { memory }
+  }
+}
+
+// Start an OS thread running `entry(arg)`. Returns an opaque handle (> 0) for
+// `threadRelease`, or 0 on failure.
+//
+// `entry` must be `entryOf(f)` for a named `function f(arg: *byte): *byte`
+// obeying the child rules in ../thread.bit. `done` is a caller-owned word this
+// function arms; the KERNEL clears it at thread exit, via CLONE_CHILD_CLEARTID.
+//
+// The handle is the stack mapping's base address. That is what actually has to
+// be released on this platform, and the caller never needs the tid — see
+// ../thread.bit on why the handle is opaque.
+export function threadStart(entry: *byte, arg: *byte, done: *i32): int {
+  let base = mapStack(stackBytes())
+  if (base == 0) {
+    return 0
+  }
+  // The top of the usable region, which is where the child's stack pointer
+  // starts and grows DOWN from. Page-aligned by construction, so it satisfies
+  // both ABIs' 16-byte alignment requirement at a function entry.
+  let top = base + reservationBytes()
+
+  // Armed BEFORE the clone, not after: the child can exit and the kernel can
+  // clear this word before `clone` has even returned in the parent. Arming it
+  // afterwards would overwrite the kernel's 0 with 1 and strand every joiner
+  // until its deadline.
+  atomicStore(done, i32(runningSentinel()))
+
+  let tid = cloneChild(cloneThreadFlags(), top, done, entry, arg)
+  if (tid <= 0) {
+    // No thread exists, so nothing will ever clear `done`. Disarm it so a
+    // caller that joins anyway gets `threadJoinDone` immediately instead of
+    // waiting out a full deadline for a thread that was never created.
+    atomicStore(done, i32(0))
+    let dead = int(syscall(nrMunmap(), i64(base), i64(reservationBytes())))
+    return 0
+  }
+  return base
+}
+
+// Release a finished thread's resources. Call only after `threadJoin` has
+// reported `threadJoinDone` — on this platform that word is cleared by the
+// kernel during teardown, after the child has left user space, so the stack is
+// provably idle and unmapping it cannot pull the ground from under a running
+// thread.
+export function threadRelease(handle: int): bool {
+  if (handle <= 0) {
+    return false
+  }
+  return int(syscall(nrMunmap(), i64(handle), i64(reservationBytes()))) == 0
+}

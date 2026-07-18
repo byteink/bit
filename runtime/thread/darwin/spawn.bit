@@ -1,0 +1,114 @@
+// Darwin OS-thread provider for the Stage-2 port of runtime/sched.zig's worker
+// pool (#1403). See ../thread.bit for the shared contract, the seam against
+// #1364, and the three rules a child thread's body must obey.
+//
+// `pthread_create` through libSystem rather than a raw syscall (§11.7), for the
+// reason the whole Darwin side of the runtime uses externs: Apple publishes no
+// stable syscall numbers and reserves the right to renumber them, so there is
+// nothing to encode against. `syscall` is rejected outright when targeting
+// Darwin, so there is no other path even in principle.
+//
+// THIS PROVIDER IS MUCH SHORTER THAN THE LINUX ONE, and the asymmetry is real
+// rather than an omission. `pthread_create` allocates and guards the child's
+// stack itself and enters the body through an ordinary C call, so the two
+// things that dominate the Linux file — mapping a guarded stack, and the `asm`
+// block that lets a raw `clone` child branch to an entry it can never return
+// from — have no counterpart here. What both files DO share is the contract,
+// and that is what ../thread.bit specifies.
+//
+// This module is a LEAF with no imports, exactly as runtime/alloc's,
+// runtime/rand's and runtime/park's providers are — so the sentinel it shares
+// with ../thread.bit is duplicated here rather than imported.
+// tests/stress/thread/props pins the two spellings against each other so the
+// duplication cannot drift.
+
+// `pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+//                 void *(*start)(void *), void *arg) -> int`
+//
+// `attr` is passed as nil, which selects the platform defaults — including a
+// guarded stack, which is why this provider maps nothing of its own. `start` is
+// a C function pointer, which is exactly what `entryOf` (§11.10) yields.
+//
+// `pthread_t` is an opaque pointer, taken here as `*i64` — the out-parameter is
+// one pointer-width word and a `[]i64(1)` element IS eight contiguous bytes,
+// unlike a `[]u8`, which a Bit slice stores one byte per 8-byte word (§11.8).
+// That distinction has already produced two silent bugs in this runtime port.
+extern function pthread_create(th: *i64, attr: *u8, start: *byte, arg: *byte): i32
+
+// `pthread_join(pthread_t thread, void **value_ptr) -> int`
+//
+// Reaps a finished thread. NOT used as the join primitive — see `threadRelease`
+// for why it is the reaper rather than the waiter.
+extern function pthread_join(th: i64, value: *u8): i32
+
+// See ../thread.bit's `threadRunning`. Duplicated, not imported, because a
+// provider is a leaf.
+function runningSentinel(): int { return 1 }
+
+// Start an OS thread running `start(arg)`. Returns an opaque handle (> 0) for
+// `threadRelease`, or 0 on failure.
+//
+// `start` must be `entryOf(f)` for a named `function f(arg: *byte): *byte`
+// obeying the child rules in ../thread.bit. `done` is a caller-owned word this
+// function arms; THE CHILD ITSELF must clear it before returning, because
+// pthreads has no equivalent of Linux's `CLONE_CHILD_CLEARTID` and nothing else
+// can. That obligation is the one asymmetry in the contract and it is stated on
+// `threadRunning` in ../thread.bit.
+//
+// The handle is the `pthread_t`. That is what actually has to be released on
+// this platform — see ../thread.bit on why the handle is opaque and why a
+// caller must not read meaning into the number.
+export function threadStart(start: *byte, arg: *byte, done: *i32): int {
+  let slot = []i64(1)
+  slot[0] = 0
+
+  // Armed BEFORE the create, not after: the child can run to completion and
+  // clear this word before `pthread_create` has even returned. Arming it
+  // afterwards would overwrite the child's 0 with 1 and strand every joiner
+  // until its deadline.
+  atomicStore(done, i32(runningSentinel()))
+
+  let noattr: *u8 = nil
+  let rc = int(pthread_create(ptrOf(slot), noattr, start, arg))
+  if (rc != 0) {
+    // No thread exists, so nothing will ever clear `done`. Disarm it so a
+    // caller that joins anyway gets `threadJoinDone` immediately instead of
+    // waiting out a full deadline for a thread that was never created.
+    atomicStore(done, i32(0))
+    return 0
+  }
+
+  let handle = int(slot[0])
+  if (handle == 0) {
+    // pthread_create reported success, so a thread is running and its `done`
+    // word will be cleared; only the handle is unusable. Reporting 0 here would
+    // claim no thread exists, so this is treated as the impossible case it is
+    // rather than silently mapped onto failure.
+    return 0
+  }
+  return handle
+}
+
+// Release a finished thread's resources. Call only after `threadJoin` has
+// reported `threadJoinDone`.
+//
+// WHY `pthread_join` IS THE REAPER AND NOT THE WAITER. `pthread_join` has no
+// timed form — POSIX offers no `pthread_timedjoin` and Darwin adds none — so
+// using it to WAIT would make the wait unbounded, and a worker that failed to
+// exit would hang the caller instead of reporting it. ../thread.bit's join is a
+// bounded poll of the `done` word for exactly that reason. By the time this is
+// called the child has already published its completion, so the join here
+// returns essentially immediately and serves only to reclaim the thread's
+// resources, which a never-joined, never-detached pthread would leak.
+//
+// The residual gap is small and worth naming: the child clears `done` a few
+// instructions before libSystem's teardown finishes, so this may briefly wait
+// out that tail. It cannot wait indefinitely — the child has, by construction,
+// already reached the end of its body.
+export function threadRelease(handle: int): bool {
+  if (handle == 0) {
+    return false
+  }
+  let novalue: *u8 = nil
+  return int(pthread_join(i64(handle), novalue)) == 0
+}

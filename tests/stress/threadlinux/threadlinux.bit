@@ -1,0 +1,100 @@
+// The Linux OS-thread provider (runtime/thread/linux, #1403) against the real
+// kernel: `clone(2)` onto a guarded stack, a child entered through a
+// register-indirect branch, and a bounded join.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker file: the
+// provider issues raw `syscall`s (SPEC §11.8), which the compiler rejects when
+// targeting Darwin — even for an uncalled declaration.
+//
+// The six shared properties, their timing bounds, and the discrimination
+// argument behind each are documented in ./../thread/props. This file adds the
+// two pieces that cannot be shared: the waker child, which must call THIS
+// platform's `parkWake`, and P7, which tests a kernel mechanism Darwin has no
+// equivalent of.
+
+import { threadProps, threadTotal, threadWakeDelayNs, i32At, i64At, byteAt } from "../thread/props"
+import { threadJoin, threadJoinDone } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkWait, parkWake, parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+
+const JOIN_NS: int = 10000000000        // 10s
+
+// P4's child: sleep long enough that the parent is genuinely blocked in
+// `parkWait`, then wake it, then report done.
+//
+// THIS BODY IS NOT `@nosplit`, AND THAT IS ONLY SAFE BECAUSE IT HAS NO LOOP.
+// Codegen emits `bl bit_rt_safepoint` at loop back-edges (and nowhere else), so
+// a loop-free body reaches no safepoint poll even without the attribute — which
+// matters because a child thread is not a registered runtime worker and must
+// never run the collector. `@nosplit` is not an option here: it forbids calls to
+// anything that is not itself `@nosplit`, and this body has to call `parkWake`.
+// Both callees below are loop-free by inspection for the same reason.
+// `parkCpuCount` is NOT, and must never be called from a child.
+//
+// It deliberately does not touch the word it wakes: leaving the value alone is
+// what makes the parent's three outcomes distinguishable (see P4).
+function wakeChild(arg: *byte): *byte {
+  let base = int(arg)
+  let done = i32At(int(*i64At(base)))
+  let word = i32At(int(*i64At(base + 8)))
+
+  parkSleepNs(threadWakeDelayNs)
+  let woke = parkWake(word, true)
+  atomicStore(done, i32(0))
+  return nil
+}
+
+// P7's child: it does NOTHING, and that is the entire point. It never clears its
+// own done word, so the only thing that can clear it is the KERNEL.
+@nosplit function silentChild(arg: *byte): *byte {
+  return nil
+}
+
+// ---- P7: CLONE_CHILD_CLEARTID really clears the word --------------------
+//
+// THIS PROPERTY EXISTS BECAUSE ITS ABSENCE MADE A GUARD VACUOUS. The six shared
+// properties all pass with the `ctid` and `tls` clone arguments SWAPPED — the
+// exact per-architecture ordering trap the provider warns about — because the
+// shared child clears its own done word (it must, since Darwin's pthreads has
+// no equivalent), leaving the kernel's clear redundant and therefore untested.
+// Mutation-testing the swap is what exposed that: it changed nothing.
+//
+// It is not a cosmetic gap. `threadRelease` UNMAPS THE CHILD'S STACK, and its
+// safety argument is precisely that the kernel clears this word during teardown
+// after the child has left user space — so a cleared word proves the stack is
+// idle. A child clearing the word itself proves no such thing: it is still on
+// that stack for several more instructions. If `ctid` were never actually
+// reaching the kernel, `threadRelease` would be unmapping memory a live thread
+// might still touch, and nothing else here would notice.
+//
+// So this child clears nothing and the join must still report done. That makes
+// the `ctid` argument load-bearing, and with it the whole per-architecture
+// argument order.
+function ctidProp(): int {
+  let done = []i32(1)
+  let region = []i64(2)
+  let base = int(ptrOf(done))
+  region[0] = i64(base)
+  region[1] = i64(base)
+
+  let h = threadStart(entryOf(silentChild), byteAt(int(ptrOf(region))), ptrOf(done))
+  if (h == 0) {
+    return 0
+  }
+  let rc = threadJoin(ptrOf(done), JOIN_NS, parkSleepNs, parkMonoNs)
+  if (rc != threadJoinDone) {
+    return 0
+  }
+  if (!threadRelease(h)) {
+    return 0
+  }
+  return 1
+}
+
+function main() {
+  let props = threadProps(threadStart, threadRelease, parkWait, parkSleepNs,
+                          parkMonoNs, entryOf(wakeChild))
+  let ctid = ctidProp()
+  let ok = props == threadTotal() && ctid == 1
+  print("${ok} ${props} ${ctid}\n")
+}
