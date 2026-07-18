@@ -125,6 +125,110 @@ fn isAllDigits(s: []const u8) bool {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Writer (task #1398) — the inverse of `parse`, so a `libbitrt.a` can be
+// *produced* from Bit-compiled objects rather than only consumed.
+// ---------------------------------------------------------------------------
+
+/// Which name encoding to write. Matches what each platform's own `ar` (and
+/// `zig build libbitrt`) produces, and what `parse` above already reads back:
+/// GNU/System V for ELF targets, BSD for Mach-O.
+pub const Format = enum { gnu, bsd };
+
+/// Deliberately writes NO symbol-table member (`/` or `__.SYMDEF`). `parse`
+/// skips both by design — `link.zig`'s merge builds the whole-link global table
+/// from every member's own symbols for dead-strip anyway — so an index would be
+/// bytes this toolchain never reads. Every other byte matches what `ar` writes,
+/// so a member's header and payload are byte-comparable with `zig build
+/// libbitrt`'s output for the same input.
+///
+/// mtime/uid/gid are always `0` (reproducible output). `mode` follows each
+/// platform's own convention so the result is byte-comparable with that
+/// platform's tooling: `644` for GNU members, `0` for BSD ones, and blank on the
+/// `//` table — exactly what `zig build libbitrt` writes for each.
+pub fn write(gpa: Allocator, format: Format, members: []const Member) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, magic);
+
+    // GNU carries names longer than 15 bytes in a `//` table, referenced by
+    // byte offset; BSD carries every name inline, so it needs no table.
+    var long_names: std.ArrayList(u8) = .empty;
+    defer long_names.deinit(gpa);
+    const long_offsets = try gpa.alloc(usize, members.len);
+    defer gpa.free(long_offsets);
+    @memset(long_offsets, 0);
+    if (format == .gnu) {
+        for (members, 0..) |m, i| {
+            if (m.name.len <= 15) continue;
+            long_offsets[i] = long_names.items.len;
+            try long_names.appendSlice(gpa, m.name);
+            try long_names.appendSlice(gpa, "/\n"); // real GNU ar slash-terminates
+        }
+        if (long_names.items.len > 0) {
+            try writeHeader(gpa, &out, "//", long_names.items.len, null);
+            try out.appendSlice(gpa, long_names.items);
+            try padEven(gpa, &out);
+        }
+    }
+
+    for (members, 0..) |m, i| {
+        switch (format) {
+            .gnu => {
+                var buf: [24]u8 = undefined;
+                const field = if (m.name.len <= 15)
+                    std.fmt.bufPrint(&buf, "{s}/", .{m.name}) catch unreachable
+                else
+                    std.fmt.bufPrint(&buf, "/{d}", .{long_offsets[i]}) catch unreachable;
+                try writeHeader(gpa, &out, field, m.data.len, "644");
+                try out.appendSlice(gpa, m.data);
+            },
+            .bsd => {
+                // The name is a NUL-padded prefix of the member's own data, its
+                // padded length declared in the name field. Aligned to 4, which
+                // is what macOS `ar` and Zig both produce.
+                const padded = std.mem.alignForward(usize, m.name.len, 4);
+                var buf: [24]u8 = undefined;
+                const field = std.fmt.bufPrint(&buf, "#1/{d}", .{padded}) catch unreachable;
+                try writeHeader(gpa, &out, field, padded + m.data.len, "0");
+                try out.appendSlice(gpa, m.name);
+                try out.appendNTimes(gpa, 0, padded - m.name.len);
+                try out.appendSlice(gpa, m.data);
+            },
+        }
+        try padEven(gpa, &out);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// One 60-byte header: a 16-byte name, then mtime/uid/gid/mode/size in
+/// fixed-width space-padded decimal, then the "`\n" magic at offset 58. A null
+/// `mode` leaves every numeric field but `size` blank, which is how `ar` writes
+/// the `//` long-name table's own header.
+fn writeHeader(gpa: Allocator, out: *std.ArrayList(u8), name_field: []const u8, size: usize, mode: ?[]const u8) Allocator.Error!void {
+    std.debug.assert(name_field.len <= 16);
+    const start = out.items.len;
+    try out.appendNTimes(gpa, ' ', header_len);
+    const h = out.items[start..][0..header_len];
+    @memcpy(h[0..name_field.len], name_field);
+    if (mode) |md| {
+        h[16] = '0'; // mtime
+        h[28] = '0'; // uid
+        h[34] = '0'; // gid
+        @memcpy(h[40..][0..md.len], md);
+    }
+    // Left-aligned in its fixed-width field; the tail it does not reach stays
+    // the space fill written above, which is exactly how `ar` pads.
+    _ = std.fmt.bufPrint(h[48..58], "{d}", .{size}) catch unreachable;
+    h[58] = '`';
+    h[59] = '\n';
+}
+
+/// `ar` starts every header at an even offset, padding with one `\n`.
+fn padEven(gpa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
+    if (out.items.len % 2 == 1) try out.append(gpa, '\n');
+}
+
 const testing = std.testing;
 
 test "parses a hand-built System V archive with a long-name member" {
@@ -209,4 +313,73 @@ fn appendBsdMember(gpa: Allocator, buf: *std.ArrayList(u8), name: []const u8, co
     try buf.appendNTimes(gpa, 0, name_field - name.len);
     try buf.appendSlice(gpa, content);
     if (buf.items.len % 2 == 1) try buf.append(gpa, '\n');
+}
+
+/// The writer's contract with `parse` (#1398): whatever goes in comes back out,
+/// names and payloads byte-identical, in both name encodings. A long name, an
+/// odd-length payload (which forces the `\n` even-offset padding) and an empty
+/// member are each present because each is a distinct failure mode.
+fn expectRoundTrip(format: Format, members: []const Member) !void {
+    const gpa = testing.allocator;
+    const bytes = try write(gpa, format, members);
+    defer gpa.free(bytes);
+
+    const back = try parse(gpa, bytes);
+    defer gpa.free(back);
+
+    try testing.expectEqual(members.len, back.len);
+    for (members, back) |want, got| {
+        try testing.expectEqualStrings(want.name, got.name);
+        try testing.expectEqualStrings(want.data, got.data);
+    }
+}
+
+test "writer round-trips through the reader in both name encodings" {
+    const members = [_]Member{
+        .{ .name = "short.o", .data = "abc" }, // odd length -> padding
+        .{ .name = "a_very_long_member_name_over_15_bytes.o", .data = "hello" },
+        .{ .name = "empty.o", .data = "" },
+        .{ .name = "exactly_15chars", .data = "\x00\x01\xfe\xff" }, // the inline/table boundary
+    };
+    try expectRoundTrip(.gnu, &members);
+    try expectRoundTrip(.bsd, &members);
+}
+
+test "writer emits the magic and no symbol-table member" {
+    const gpa = testing.allocator;
+    const bytes = try write(gpa, .gnu, &.{.{ .name = "a.o", .data = "x" }});
+    defer gpa.free(bytes);
+    try testing.expectEqualStrings(magic, bytes[0..magic.len]);
+    // No `/` index and no `//` table (no long names here): the first header is
+    // the real member's.
+    try testing.expectEqualStrings("a.o/", std.mem.trimEnd(u8, bytes[magic.len..][0..16], " "));
+}
+
+test "writer's headers match the field layout ar writes" {
+    const gpa = testing.allocator;
+    const bytes = try write(gpa, .bsd, &.{.{ .name = "libbitrt_zcu.o", .data = "MACHO" }});
+    defer gpa.free(bytes);
+    const h = bytes[magic.len..][0..header_len];
+    // Name padded to 4 (14 -> 16), as macOS ar and `zig build libbitrt` produce.
+    try testing.expectEqualStrings("#1/16", std.mem.trimEnd(u8, h[0..16], " "));
+    try testing.expectEqualStrings("0", std.mem.trimEnd(u8, h[16..28], " ")); // mtime
+    try testing.expectEqualStrings("0", std.mem.trimEnd(u8, h[28..34], " ")); // uid
+    try testing.expectEqualStrings("0", std.mem.trimEnd(u8, h[34..40], " ")); // gid
+    try testing.expectEqualStrings("0", std.mem.trimEnd(u8, h[40..48], " ")); // mode (BSD)
+    try testing.expectEqualStrings("21", std.mem.trimEnd(u8, h[48..58], " ")); // 16 name + 5 data
+    try testing.expectEqualStrings("`\n", h[58..60]);
+}
+
+test "every header starts at an even offset" {
+    const gpa = testing.allocator;
+    const bytes = try write(gpa, .gnu, &.{
+        .{ .name = "odd.o", .data = "abc" },
+        .{ .name = "next.o", .data = "de" },
+    });
+    defer gpa.free(bytes);
+    // The second member's header follows the first's odd payload, so it can
+    // only be even if the `\n` filler was written.
+    const second = magic.len + header_len + 3 + 1;
+    try testing.expect(second % 2 == 0);
+    try testing.expectEqualStrings("next.o/", std.mem.trimEnd(u8, bytes[second..][0..16], " "));
 }

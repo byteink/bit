@@ -15,6 +15,7 @@ pub const testgen = @import("testgen.zig");
 pub const doc = @import("doc.zig");
 const emit = @import("emit.zig");
 const link = @import("link.zig");
+const archive = @import("link/archive.zig");
 const macho = @import("link/macho.zig");
 pub const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
@@ -61,6 +62,19 @@ pub fn main(init: std.process.Init) !void {
             try stderr_w.interface.print("bit {s}: {s}\n", .{ argv[1], @errorName(e) });
             try stderr_w.interface.flush();
             return error.BuildFailed;
+        };
+        try stderr_w.interface.flush();
+        if (code != 0) std.process.exit(code);
+        return;
+    }
+
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "ar")) {
+        var err_buf: [4096]u8 = undefined;
+        var stderr_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
+        const code = runAr(gpa, io, &stderr_w.interface, argv[2..]) catch |e| {
+            try stderr_w.interface.print("bit ar: {s}\n", .{@errorName(e)});
+            try stderr_w.interface.flush();
+            return error.ArchiveFailed;
         };
         try stderr_w.interface.flush();
         if (code != 0) std.process.exit(code);
@@ -307,6 +321,58 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
         .data = exe,
         .flags = .{ .permissions = .executable_file },
     });
+    return 0;
+}
+
+/// `bit ar <out.a> <obj...> [--target t]`: bundles already-emitted relocatable
+/// objects into an `ar` archive (#1398), the `ar rcs` half of the toolchain that
+/// `bit build --emit-obj` feeds. The name encoding follows the target's own
+/// convention — BSD for Mach-O, GNU for ELF — which is what `link.zig`'s reader
+/// and every platform `ar` expect. Each member is named by its file's basename.
+fn runAr(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, args: []const [:0]const u8) !u8 {
+    var out_path: ?[]const u8 = null;
+    var target: BuildTarget = host_target;
+    var inputs: std.ArrayList([]const u8) = .empty;
+    defer inputs.deinit(gpa);
+    var ai: usize = 0;
+    while (ai < args.len) {
+        if ((std.mem.eql(u8, args[ai], "--target") or std.mem.eql(u8, args[ai], "-t")) and ai + 1 < args.len) {
+            target = BuildTarget.parse(args[ai + 1]) orelse {
+                try err_out.print("bit ar: unknown target '{s}'\n", .{args[ai + 1]});
+                return 2;
+            };
+            ai += 2;
+            continue;
+        }
+        if (out_path == null) out_path = args[ai] else try inputs.append(gpa, args[ai]);
+        ai += 1;
+    }
+    const out = out_path orelse {
+        try err_out.writeAll("usage: bit ar <out.a> <obj.o...> [--target x86_64-linux|aarch64-linux|aarch64-macos]\n");
+        return 2;
+    };
+    if (inputs.items.len == 0) {
+        try err_out.writeAll("bit ar: no input objects\n");
+        return 2;
+    }
+
+    var members: std.ArrayList(archive.Member) = .empty;
+    defer {
+        for (members.items) |m| gpa.free(m.data);
+        members.deinit(gpa);
+    }
+    for (inputs.items) |path| {
+        const data = Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |e| {
+            try err_out.print("bit ar: {s}: {s}\n", .{ path, @errorName(e) });
+            return 1;
+        };
+        try members.append(gpa, .{ .name = std.fs.path.basename(path), .data = data });
+    }
+
+    const format: archive.Format = if (target == .aarch64_macos) .bsd else .gnu;
+    const bytes = try archive.write(gpa, format, members.items);
+    defer gpa.free(bytes);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
     return 0;
 }
 
