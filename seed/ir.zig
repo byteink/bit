@@ -1495,6 +1495,7 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
         .make_closure => |mc| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a),
+        .asm_stmt => |a| for (a.args) |x| try checkOperandDominance(f, dom, use_block, use_idx, x),
     }
 }
 
