@@ -124,6 +124,9 @@ fn fieldLayout(data: TypeData) FieldLayout {
             .string => .{ .size = 8, .is_ptr = true },
         };
     }
+    // A raw pointer `*T` (§11.4) is a single word the GC must never follow:
+    // 8 bytes, but is_ptr=false so its offset stays out of the pointer map.
+    if (data == .ptr) return .{ .size = 8, .is_ptr = false };
     // A no-payload enum is a bare tag word; a payload-carrying one is a boxed
     // `{tag, payloadPtr}` handle (a GC ref).
     if (data == .@"enum") return .{ .size = 8, .is_ptr = check.enumBoxed(data.@"enum") };
@@ -1323,6 +1326,15 @@ const FnCtx = struct {
                 const idx_val = try self.lowerExpr(k[1]);
                 const elem_ty = try self.nodeType(node);
                 return .{ .elem = .{ .recv = recv_val, .index = idx_val, .ty = elem_ty, .is_slice = is_slice } };
+            },
+            // `*p = x` (§11.4): store one word at the pointed-at address. The
+            // `.field` lvalue at offset 0 already writes via `field_set`.
+            .unary => {
+                const op: lexer.Kind = @enumFromInt(self.tree().get(node).main);
+                if (op != .star) return error.UnsupportedConstruct;
+                const p = try self.lowerExpr(self.kids(node)[0]);
+                const elem_ty = try self.nodeType(node);
+                return .{ .field = .{ .recv = p, .ty = elem_ty, .offset = 0 } };
             },
             else => return error.UnsupportedConstruct,
         }
@@ -3120,6 +3132,25 @@ const FnCtx = struct {
         else
             self.defaultTy(lty);
         const cdata = self.ctx.typeOf(common);
+        // Pointer arithmetic (§11.4): `p ± n` scales `n` by sizeOf(T) and offsets
+        // the raw address. A `*T` is an int-classed word (is_ref=0), so this is a
+        // plain integer add/sub. The scaled byte offset is retyped to the pointer
+        // type with a no-op `convert` (both are one int word) so add/sub's operands
+        // and result share a type, as the IR verifier requires.
+        if (cdata == .ptr and (op == .plus or op == .minus)) {
+            const elem_ty = cdata.ptr;
+            const scale = fieldLayout(self.ctx.typeOf(elem_ty)).size;
+            const base_val = try self.lowerExprH(k[0], common);
+            const i64_ty = self.ctx.prim_ids.get(.i64);
+            var off = try self.lowerExprH(k[1], i64_ty);
+            if (scale != 1) {
+                const sc = try self.b.constInt(i64_ty, @intCast(scale));
+                off = try self.b.binary(.mul, i64_ty, off, sc);
+            }
+            const off_ptr = try self.b.convert(common, off);
+            const iop: ir.Op = if (op == .plus) .add else .sub;
+            return self.b.binary(iop, common, base_val, off_ptr);
+        }
         if (cdata == .prim and cdata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus)) {
             const sl = try self.lowerExprH(k[0], common);
             const sr = try self.lowerExprH(k[1], common);
@@ -3153,6 +3184,13 @@ const FnCtx = struct {
             const elem_ty = try self.nodeType(node);
             const ch = try self.lowerExpr(operand);
             return self.b.rtCall(elem_ty, .chan_recv, &.{ch});
+        }
+        if (op == .star) {
+            // `*p` (§11.4): load one word from the pointed-at address. Reuses the
+            // `field_get` op at offset 0 — a plain `base + 0` load, no GC barrier.
+            const elem_ty = try self.nodeType(node);
+            const p = try self.lowerExpr(operand);
+            return self.b.fieldGet(elem_ty, p, 0);
         }
         const ty = try self.materializeType(node, hint);
         const val = try self.lowerExprH(operand, ty);
@@ -3248,7 +3286,8 @@ const FnCtx = struct {
     fn elemIsRef(self: *const FnCtx, ty: TypeId) bool {
         return switch (self.ctx.typeOf(ty)) {
             .prim => |p| p == .string,
-            .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible => false,
+            // A raw pointer `*T` (§11.4) is not a GC reference — never traced.
+            .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible, .ptr => false,
             else => true, // slice/array/map/tuple/chan/struct/interface/func
         };
     }

@@ -609,6 +609,7 @@ const Parser = struct {
                 const targs = try self.tree.add(.type_args, join(self.span(name), end), 0, items);
                 return self.tree.add(.generic_inst, join(self.span(name), end), 0, &.{ name, targs });
             },
+            .star => return self.parsePtrType(),
             .l_bracket => return self.parseSliceOrArrayType(),
             .kw_map => return self.parseMapType(),
             .kw_chan => return self.parseChanType(),
@@ -618,6 +619,12 @@ const Parser = struct {
                 return none;
             },
         }
+    }
+
+    fn parsePtrType(self: *Parser) ParseError!Index {
+        const start = try self.expect(.star, "'*'");
+        const elem = try self.parseType();
+        return self.tree.add(.ptr_type, join(start, self.span(elem)), 0, &.{elem});
     }
 
     fn parseSliceOrArrayType(self: *Parser) ParseError!Index {
@@ -1222,7 +1229,9 @@ const Parser = struct {
 
     fn parseUnary(self: *Parser) ParseError!Index {
         switch (self.tok.kind) {
-            .bang, .minus, .plus, .tilde, .arrow_left => {
+            // `*` is the pointer dereference prefix (`*p`, load/store); `<-` is
+            // channel receive. Both ride the `.unary` node (main = the operator).
+            .bang, .minus, .plus, .tilde, .arrow_left, .star => {
                 const start = self.tok.span;
                 const op = self.tok.kind;
                 try self.advance();

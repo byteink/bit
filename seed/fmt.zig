@@ -821,6 +821,10 @@ const Printer = struct {
                 try self.raw("[]");
                 try self.printNode(self.kids(idx)[0]);
             },
+            .ptr_type => {
+                try self.raw("*");
+                try self.printNode(self.kids(idx)[0]);
+            },
             .array_type => {
                 const k = self.kids(idx);
                 try self.raw("[");

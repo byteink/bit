@@ -55,7 +55,8 @@ pub fn classOf(tctx: *const TypeContext, ty: TypeId) Class {
 pub fn isRefType(tctx: *const TypeContext, ty: TypeId) bool {
     return switch (tctx.typeOf(ty)) {
         .prim => |p| p == .string,
-        .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible => false,
+        // A raw pointer `*T` (§11.4) is a word the GC must never follow.
+        .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil, .invalid, .type_param, .fallible, .ptr => false,
         .@"enum" => |e| check.enumBoxed(e), // bare tag word, or boxed {tag,payloadPtr} if it has payloads
         else => true, // slice/array/map/tuple/chan/struct/interface/func
     };

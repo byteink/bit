@@ -589,6 +589,35 @@ function max<T: Ord>(a: T, b: T): T {
 `Self` is a predeclared type name inside an interface body denoting the concrete
 implementing type; it may appear in method signatures only.
 
+### 11.4 Raw Pointers (unmanaged subset)
+
+- **Raw pointer** `*T`: a single machine word holding the address of a `T`. It is
+  a **reference type** (nilable; its zero value is the null pointer `nil`), but
+  unlike every other reference type it is **not traced by the garbage collector** —
+  the collector never follows a `*T`, and a `*T`-typed struct field or slice
+  element is omitted from the object's pointer map. This is what makes it *unsafe*:
+  the pointee's lifetime is not tracked, and dereferencing a dangling or
+  fabricated pointer is undefined behavior.
+- `*T` exists for the **unmanaged subset** — the low-level code (the runtime,
+  including the garbage collector's own metadata) that must manage memory it
+  deliberately keeps outside the managed heap, so the collector must not walk it.
+  It is not needed by, and should be avoided in, ordinary code: slices, maps, and
+  structs are the safe, traced references (§11.2).
+- Operations:
+  - **Dereference** `*p` — loads the pointee (`T`). `*p = x` stores `x` through it.
+    The operand must be a `*T`.
+  - **Pointer arithmetic** `p + n` / `p - n` (`n` an integer) — advances the
+    address by `n * sizeOf(T)` bytes and yields a `*T`.
+  - **Address as integer** `int(p)` (or any integer conversion) — the raw address
+    as an integer; the inverse of pointer arithmetic off the null pointer.
+  - **Comparison** `p == q` / `p == nil` — pointer identity by address.
+
+```
+let p: *i64 = nil          // the null pointer
+let q = p + 8              // address 8 * sizeOf(i64)
+let addr: int = int(q)     // 64 — the raw address
+```
+
 ---
 
 ## 12. Expressions
@@ -1503,7 +1532,9 @@ Intentionally **not** in v0.1, to keep the surface minimal:
 
 - General union and optional types; `null` (absence is modeled by `nil` zero
   values and the Result model).
-- Pointers, `&`/`*`, value-vs-pointer receivers.
+- The address-of operator `&` and value-vs-pointer receivers. (The raw untraced
+  pointer type `*T` and its dereference `*p` *are* specified — see §11.4 — for the
+  unmanaged subset; only taking the address of a value with `&` remains reserved.)
 - Operator overloading; user-defined implicit conversions.
 - `recover`; catchable panics.
 - Mutexes, atomics, `sync`-style primitives (channels only in v0.1).

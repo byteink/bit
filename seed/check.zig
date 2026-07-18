@@ -215,6 +215,11 @@ pub const TypeData = union(enum) {
     /// constructed except via `return`/`fail`, only produced by calling a
     /// fallible function and consumed by `?`/`catch`.
     fallible: struct { ok: TypeId, err: TypeId },
+    /// A raw, untraced pointer `*T` (§11.4): a single machine word that the GC
+    /// never follows (is_ref=false, unlike every other reference type). Used by
+    /// the unmanaged subset (Stage 2) so the collector's own metadata is not
+    /// itself walked by the collector.
+    ptr: TypeId,
 };
 
 fn hashTypeData(data: TypeData) u64 {
@@ -224,6 +229,7 @@ fn hashTypeData(data: TypeData) u64 {
         .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil => {},
         .prim => |p| h.update(std.mem.asBytes(&p)),
         .slice => |e| h.update(std.mem.asBytes(&e)),
+        .ptr => |e| h.update(std.mem.asBytes(&e)),
         .chan => |e| h.update(std.mem.asBytes(&e)),
         .array => |a| {
             h.update(std.mem.asBytes(&a.len));
@@ -266,6 +272,7 @@ fn eqlTypeData(a: TypeData, b: TypeData) bool {
         .invalid, .void, .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil => true,
         .prim => |p| p == b.prim,
         .slice => |e| e == b.slice,
+        .ptr => |e| e == b.ptr,
         .chan => |e| e == b.chan,
         .array => |ar| ar.len == b.array.len and ar.elem == b.array.elem,
         .map => |m| m.key == b.map.key and m.val == b.map.val,
@@ -738,6 +745,11 @@ pub const TypeContext = struct {
                 if (ne == e) return ty;
                 return self.types.intern(.{ .chan = ne });
             },
+            .ptr => |e| {
+                const ne = try self.subst(e, env, depth + 1);
+                if (ne == e) return ty;
+                return self.types.intern(.{ .ptr = ne });
+            },
             .array => |a| {
                 const ne = try self.subst(a.elem, env, depth + 1);
                 if (ne == a.elem) return ty;
@@ -967,6 +979,10 @@ fn appendTypeName(nc: NameCtx, buf: *std.ArrayList(u8), ty: TypeId, depth: u32) 
         .prim => |p| try buf.appendSlice(nc.gpa, @tagName(p)),
         .slice => |e| {
             try buf.appendSlice(nc.gpa, "[]");
+            try appendTypeName(nc, buf, e, depth + 1);
+        },
+        .ptr => |e| {
+            try buf.appendSlice(nc.gpa, "*");
             try appendTypeName(nc, buf, e, depth + 1);
         },
         .chan => |e| {
@@ -1234,6 +1250,10 @@ const Checker = struct {
                 const elem = try self.checkType(file_idx, mf.tree.kids(node)[0], env);
                 return self.ctx.types.intern(.{ .slice = elem });
             },
+            .ptr_type => {
+                const elem = try self.checkType(file_idx, mf.tree.kids(node)[0], env);
+                return self.ctx.types.intern(.{ .ptr = elem });
+            },
             .array_type => {
                 const k = mf.tree.kids(node); // [size_int, elem]
                 const size_text = Checker.identText(mf, k[0]);
@@ -1293,7 +1313,9 @@ const Checker = struct {
         // (§10.4, methods only attach to structs/aliases), and a struct's
         // zero value is never `nil` (§13.4) — so `T` itself never is either.
         return switch (self.ctx.typeOf(ty)) {
-            .slice, .map, .chan, .func, .interface => true,
+            // A raw pointer's zero value is the null pointer (§11.4), so `nil`
+            // seeds it — the only literal that produces a `*T` value.
+            .slice, .map, .chan, .func, .interface, .ptr => true,
             else => false,
         };
     }
@@ -1304,6 +1326,8 @@ const Checker = struct {
             .prim => true, // numeric, bool, and string are all comparable (§14.6)
             .untyped_int, .untyped_float, .untyped_rune, .untyped_bool, .untyped_string, .untyped_nil => true,
             .interface, .type_param => true,
+            // Raw pointers compare by address (§11.4): identity and `== nil`.
+            .ptr => true,
             .array => |a| self.comparable(a.elem),
             .tuple => |ts| blk: {
                 for (ts) |t| if (!self.comparable(t)) break :blk false;
@@ -2442,6 +2466,9 @@ const Checker = struct {
                     .prim => |ap| p.isNumeric() and ap.isNumeric(),
                     .untyped_int, .untyped_float, .untyped_rune => p.isNumeric(),
                     .untyped_string => p == .string,
+                    // `int(p)` (§11.4): a raw pointer's address, as an integer.
+                    // Both are one word; codegen's `convert` is the identity.
+                    .ptr => p.isInteger(),
                     // A C-like enum is an integer tag, so `int(tag)` yields it (a
                     // payload enum has no integer value — use `match`). §12.9.
                     .@"enum" => |e| p.isInteger() and !enumBoxed(e),
@@ -3661,13 +3688,31 @@ const Checker = struct {
                 return self.ctx.prim_ids.get(.bool);
             },
             .amp, .pipe, .caret, .shl, .shr => return self.checkNumericBinary(file_idx, node, k, lty, rty, true),
+            // Pointer arithmetic (§11.4): `p + n` / `p - n` advance a `*T` by
+            // `n * sizeOf(T)` bytes and yield a `*T`. Carved out before the
+            // numeric path, exactly as string concatenation is above.
             .plus => {
+                if (self.ctx.typeOf(lty) == .ptr and self.isIntegerOperand(rty)) return lty;
                 if (self.stringish(lty) and self.stringish(rty)) return self.ctx.prim_ids.get(.string);
                 return self.checkNumericBinary(file_idx, node, k, lty, rty, false);
             },
-            .minus, .star, .slash, .percent => return self.checkNumericBinary(file_idx, node, k, lty, rty, false),
+            .minus => {
+                if (self.ctx.typeOf(lty) == .ptr and self.isIntegerOperand(rty)) return lty;
+                return self.checkNumericBinary(file_idx, node, k, lty, rty, false);
+            },
+            .star, .slash, .percent => return self.checkNumericBinary(file_idx, node, k, lty, rty, false),
             else => return .invalid,
         }
+    }
+
+    /// Whether `ty` is an integer operand for pointer arithmetic — a concrete
+    /// integer prim or an untyped int/rune constant (never a float).
+    fn isIntegerOperand(self: *Checker, ty: TypeId) bool {
+        return switch (self.ctx.typeOf(ty)) {
+            .prim => |p| p.isInteger(),
+            .untyped_int, .untyped_rune => true,
+            else => false,
+        };
     }
 
     fn checkUnary(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
@@ -3706,6 +3751,17 @@ const Checker = struct {
                     return .invalid;
                 }
                 return ty;
+            },
+            // `*p` (§11.4): load the pointee. The operand must be a `*T`; the
+            // result is `T`. `*p = x` reuses this node as an lvalue (lowering).
+            .star => {
+                if (self.ctx.typeOf(ty) != .ptr) {
+                    const n = try self.typeName(ty);
+                    defer self.gpa.free(n);
+                    try self.emit(mf, operand, .invalid_operand, "dereference requires a pointer operand, found '{s}'", .{n}, null);
+                    return .invalid;
+                }
+                return self.ctx.typeOf(ty).ptr;
             },
             else => return .invalid,
         }

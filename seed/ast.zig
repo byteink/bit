@@ -87,6 +87,7 @@ pub const Tag = enum {
     fallible, // [type, err_or_none]       result carrying `!`
 
     // ---- types -----------------------------------------------------------
+    ptr_type, // [elem_type]                 the raw untraced pointer `*T` (§11.4)
     slice_type, // [elem_type]
     array_type, // [size_int, elem_type]
     map_type, // [key_type, val_type]

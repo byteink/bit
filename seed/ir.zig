@@ -969,6 +969,10 @@ fn writeTypeName(w: *Writer, ctx: *const TypeContext, ty: TypeId, depth: u32) !v
             try w.writeAll("[]");
             try writeTypeName(w, ctx, e, depth + 1);
         },
+        .ptr => |e| {
+            try w.writeAll("*");
+            try writeTypeName(w, ctx, e, depth + 1);
+        },
         .array => |a| {
             try w.print("[{d}]", .{a.len});
             try writeTypeName(w, ctx, a.elem, depth + 1);
