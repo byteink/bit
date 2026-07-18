@@ -1,0 +1,261 @@
+// The Bit garbage collector (runtime/gc/gc.bit, #1363) driven through a
+// scripted allocation/mutation/collection sequence, as a real linked binary.
+//
+// THIS FILE IS ONE HALF OF A DIFFERENTIAL. `tests/gcdiff.zig` drives
+// `runtime/gc.zig` — the Zig collector this is a port of — through the byte-for
+// byte SAME script and asserts its table equals `gcbit.expected`, the same file
+// the stress harness compares this program's stdout against. So the golden file
+// is a shared oracle: every record in it is produced independently by both
+// collectors, and any behavioural divergence between them fails one side or the
+// other. Neither table is derived from the other.
+//
+// The recorded quantities are exactly the ones that must not drift, and are all
+// implementation-independent (no addresses appear, because the two use
+// different allocators — see runtime/gc/region.bit):
+//
+//   numObjects   the live object count after the step
+//   liveBytes    heap bytes handed out and not freed — the growth-trigger input
+//   collections  how many times the collector has run, which is the TRIGGER
+//                SCHEDULE: it only matches if the growth policy matches
+//   totalSwept   cumulative objects reclaimed
+//   survivors    objects that survived the most recent collection
+//   indexEntries live entries in the address->object index
+//
+// `indexEntries` is the one that catches an index drifting out of step with the
+// authoritative all-objects list: it must equal `numObjects` at every single
+// record, which the final summary line asserts across the whole run.
+//
+// The script is driven by splitmix64 so both sides generate an identical
+// operation stream from the same seed, and every step draws exactly four values
+// regardless of which operation it picks — a variable draw count would let the
+// two streams diverge silently.
+//
+// The mark worklist is deliberately tiny (MARK_STACK = 64) while the wide
+// object fans out 8 ways, so the worklist OVERFLOWS and the bounded-rescan
+// recovery path runs for real rather than being dead code.
+//
+// Under BIT_GC=stress the REAL (Zig) collector in libbitrt fires at every
+// safepoint. That does not collect the Bit collector's heap — which lives in
+// raw memory carved out of the `[]i64` slices below — but it does prove those
+// slices stay rooted through `main` while only raw, untraced pointers reach the
+// collector, and that the `@nosplit` collector bodies take no safepoint.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcAlloc, gcOwns, gcOwnsLinear, gcCollectRoots, gcSafepointRoots, gcNumObjects, gcLiveBytes, gcStatCollections, gcStatTotalSwept, gcStatSurvivorsLast, gcStatTotalAllocated, gcStatBadOffsets, gcIndexEntries, gcIndexEnabled, gcWords, gcBindMemory, gcMarkBegin, gcMarkConservative, gcCollectFinish, gcHeaderSize, storeWord } from "../../../runtime/gc"
+
+const ROOTS = 16
+const STEPS = 600
+const RECORD_EVERY = 8
+// Four entries, against a live set that reaches ~30 objects and a `Wide` that
+// fans out 8 ways: the worklist overflows constantly, so the bounded-rescan
+// recovery is exercised on nearly every collection rather than being dead code.
+// Verified by mutation — see the task report; breaking `recoverOverflow`
+// changes the table.
+const MARK_STACK = 4
+const MIN_TRIGGER = 4096
+const GROWTH_PCT = 200
+
+// Arena sizes in i64 words. 1 MiB of object heap and 64 KiB of index region are
+// far more than the script needs; the point is that neither ever runs out, so a
+// short table can never be an allocation failure in disguise.
+const ARENA_WORDS = 131072
+const INDEX_WORDS = 8192
+
+// Metadata block layout, in words. Two `TypeInfo`s (ABI.md §2, 7 words each),
+// the `ref_array_info` sentinel, and the two pointer-offset arrays.
+const MI_NODE = 0
+const MI_WIDE = 7
+const MI_REFARR = 14
+const MI_NODE_OFFS = 21
+const MI_WIDE_OFFS = 23
+const META_WORDS = 31
+
+// splitmix64. Computed in u64 for defined modular arithmetic; the Zig side uses
+// the identical constants and the identical `+%`/`*%` wrapping ops.
+function nextRand(state: []u64): int {
+  state[0] = state[0] + 11400714819323198485
+  let z = state[0]
+  z = (z ^ (z >> 30)) * 13787848793156543929
+  z = (z ^ (z >> 27)) * 10723151780598845931
+  z = z ^ (z >> 31)
+  // Mask to 62 bits so the value is a non-negative `int` on both sides.
+  return int(z & 4611686018427387903)
+}
+
+// Write one `TypeInfo` (ABI.md §2) at word `at` of the metadata block.
+function writeInfo(meta: []i64, at: int, size: int, offsAddr: int, offsLen: int) {
+  meta[at + 0] = size
+  meta[at + 1] = offsAddr
+  meta[at + 2] = offsLen
+  meta[at + 3] = 0
+  meta[at + 4] = 0
+  meta[at + 5] = 0
+  meta[at + 6] = 0
+}
+
+function main() {
+  // Every backing slice is held in `main` for the whole program: only raw,
+  // untraced pointers into them reach the collector, so these bindings are what
+  // keeps them alive under BIT_GC=stress.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let state = []i64(gcWords)
+  let roots = []i64(ROOTS)
+  let meta = []i64(META_WORDS)
+  let lock = []i32(1)
+  let rng = []u64(1)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[MI_NODE_OFFS + 0] = 0
+  meta[MI_NODE_OFFS + 1] = 8
+  let w = 0
+  while (w < 8) {
+    meta[MI_WIDE_OFFS + w] = w * 8
+    w = w + 1
+  }
+  // Node: 16-byte body, GC references at 0 and 8.
+  writeInfo(meta, MI_NODE, 16, metaAddr + MI_NODE_OFFS * 8, 2)
+  // Wide: 64-byte body, 8 references — wide enough to overflow the worklist.
+  writeInfo(meta, MI_WIDE, 64, metaAddr + MI_WIDE_OFFS * 8, 8)
+  // The `ref_array_info` sentinel: matched by ADDRESS, never by content.
+  writeInfo(meta, MI_REFARR, 0, 0, 0)
+
+  let nodeInfo = metaAddr + MI_NODE * 8
+  let wideInfo = metaAddr + MI_WIDE * 8
+  let refArrInfo = metaAddr + MI_REFARR * 8
+
+  // The REAL allocator (runtime/alloc, #1362) is the collector's heap. Its
+  // pages would normally come from mmap; a stress program is not a place to
+  // bind a platform module, and the collector takes memory rather than a
+  // mapping callback anyway (see runtime/gc/mem.bit), so the reserve is an
+  // ordinary slice held live in `main`.
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), refArrInfo, MARK_STACK)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, false, MIN_TRIGGER, GROWTH_PCT, false)
+
+  rng[0] = u64(88172645463325252)
+
+  // Invariants accumulated across the whole run, reported on the final line.
+  // `indexAgree` is the strong one: the fast index and the live object count
+  // must agree at every record, which is what proves the index never drifts
+  // from the authoritative all-objects list.
+  let indexAgree = 1
+  let ownsAgree = 1
+
+  let step = 0
+  // Bounded: exactly STEPS iterations.
+  while (step < STEPS) {
+    gcSafepointRoots(g, rootsAddr, ROOTS)
+
+    let a = nextRand(rng)
+    let b = nextRand(rng)
+    let c = nextRand(rng)
+    let d = nextRand(rng)
+    let op = a % 16
+    let slot = b % ROOTS
+    let slot2 = c % ROOTS
+    let field = (d % 2) * 8
+
+    if (op < 8) {
+      roots[slot] = gcAlloc(g, nodeInfo)
+    } else if (op < 10) {
+      roots[slot] = gcAlloc(g, wideInfo)
+    } else if (op < 12) {
+      // Build an edge between two live roots. Offsets 0 and 8 are valid
+      // reference fields of BOTH shapes, so this never needs to know which.
+      if (roots[slot] != 0 && roots[slot2] != 0) {
+        storeWord(roots[slot] + field, roots[slot2])
+      }
+    } else if (op == 12) {
+      roots[slot] = 0
+    } else if (op == 13) {
+      gcCollectRoots(g, rootsAddr, ROOTS)
+    }
+
+    step = step + 1
+
+    if (step % RECORD_EVERY == 0) {
+      let n = gcNumObjects(g)
+      if (gcIndexEntries(g) != n) {
+        indexAgree = 0
+      }
+      print("${step} ${n} ${gcLiveBytes(g)} ${gcStatCollections(g)} ${gcStatTotalSwept(g)} ${gcStatSurvivorsLast(g)} ${gcIndexEntries(g)}\n")
+    }
+  }
+
+  // The index and the authoritative linear scan must give the same answer for
+  // every root, for an interior pointer, and for a foreign address — the
+  // membership contract of ABI.md §3. This is the property the fast path exists
+  // to preserve, so it is checked against the oracle rather than assumed.
+  let i = 0
+  while (i < ROOTS) {
+    let r = roots[i]
+    if (r != 0) {
+      if (gcOwns(g, r) != gcOwnsLinear(g, r)) {
+        ownsAgree = 0
+      }
+      if (!gcOwns(g, r)) {
+        ownsAgree = 0
+      }
+      // An interior pointer is not an object base and must be rejected by both.
+      if (gcOwns(g, r + 8) != gcOwnsLinear(g, r + 8)) {
+        ownsAgree = 0
+      }
+    }
+    i = i + 1
+  }
+  if (gcOwns(g, 4096) || gcOwnsLinear(g, 4096)) {
+    ownsAgree = 0
+  }
+
+  // CONSERVATIVE ROOT PROBING (ABI.md §5) — and the reason `gcMarkRoot`
+  // validates at all.
+  //
+  // A conservative stack scan hands the collector raw machine words, and the
+  // type system additionally calls several single-word values "references" that
+  // are NOT GC objects: a `chan` handle is page-allocated and process-lifetime,
+  // a bare function value is a code address. Both the stack maps (§4) and object
+  // pointer maps (§2) legitimately list them. A blind mark would decode
+  // `word - 32` as a `GcHeader` and corrupt the heap.
+  //
+  // So this collection seeds NO real roots — only words that are inside the
+  // collector's address window but are not object bases: the interior of every
+  // live object, and every live object's HEADER address. Every one must be
+  // rejected, so the outcome is identical to a collection with an empty root
+  // set: the entire heap goes. That is what makes the `owns` check in
+  // `gcMarkRoot` load-bearing rather than decorative — without it these words
+  // mark garbage and the table diverges.
+  gcMarkBegin(g)
+  let c = 0
+  while (c < ROOTS) {
+    let r = roots[c]
+    if (r != 0) {
+      gcMarkConservative(g, r + 8)               // interior pointer
+      gcMarkConservative(g, r - gcHeaderSize)    // the header, not the body
+    }
+    c = c + 1
+  }
+  gcCollectFinish(g)
+
+  let idxOk = 0
+  if (gcIndexEnabled(g)) {
+    idxOk = 1
+  }
+  print("done ${gcNumObjects(g)} ${gcStatTotalAllocated(g)} ${gcStatTotalSwept(g)} ${gcStatBadOffsets(g)} ${indexAgree} ${ownsAgree} ${idxOk} ${gcIndexEntries(g)}\n")
+}

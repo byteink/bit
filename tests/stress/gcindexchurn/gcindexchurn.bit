@@ -1,0 +1,176 @@
+// The address->object index under sustained alloc/free churn
+// (runtime/gc/gc.bit, #1363).
+//
+// WHY THIS EXISTS. `owns` runs once per traced reference and is the mark hot
+// path. Backing it with the all-objects list makes tracing O(objects^2) — a
+// real, measured regression in this codebase, fixed for the Zig in 3dc87a3
+// (~9x on the h2 download path). The Bit port keeps the index, so the port must
+// also keep the index ALIVE; an index that quietly switches itself off
+// reintroduces the same O(n^2) trace with no visible symptom but a slow program.
+//
+// The failure mode this pins down is specific and was found by inspection, not
+// by the differential (which is too short to hit it). Removals leave TOMBSTONES,
+// and tombstones count toward the load factor, so a long alloc/free workload
+// triggers a rehash at an UNCHANGED capacity over and over just to clear them.
+// The Zig hands the old table back to `page_allocator` and reuses the memory.
+// The Bit port draws from a caller-supplied bump reserve that cannot free, so
+// without the one-slot spare-table cache in `idxGrow` each rehash consumes fresh
+// reserve until it runs out — at which point `idxDisable` fires and `owns`
+// silently reverts to the linear scan forever.
+//
+// So the assertions are:
+//   (a) the index is STILL ENABLED after the churn;
+//   (b) STEADY-STATE CHURN CONSUMES NOTHING. The churn runs in two identical
+//       phases and the reserve headroom is sampled after each. The second phase
+//       must consume exactly ZERO bytes. That is the airtight form of the
+//       property: a fixed threshold could be passed by a slow leak, but "the
+//       same work a second time costs nothing" cannot. (Reaching steady-state
+//       capacity in phase 1 legitimately costs a bounded one-off — measured at
+//       1024 bytes, and constant as CYCLES varies from 500 to 8000.)
+//   (c) the index still agrees with the authoritative linear scan;
+//   (d) live entries equal the live object count;
+//   (e) `gcDeinit` (ABI.md §6) returns EVERY byte. `gcLiveBytes` is the sum of
+//       live allocation sizes, so after tearing the collector down it must read
+//       exactly 0 — the same leak metric alloc.zig's own stress test uses. That
+//       one number exercises the whole alloc/link/sweep/free path at once: a
+//       header freed with the wrong size, an object dropped from the list, or
+//       the mark worklist never returned all show up as a non-zero residue.
+//
+// CYCLES is set high enough that, without the cache, the 32 KiB reserve is
+// exhausted and (a) and (b) both fail. Verified by mutation — see the task
+// report.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcBindMemory, gcAlloc, gcCollectRoots, gcOwns, gcOwnsLinear, gcNumObjects, gcIndexEnabled, gcIndexEntries, gcIndexReserveLeft, gcLiveBytes, gcDeinit, gcWords } from "../../../runtime/gc"
+
+const ROOTS = 24
+const CYCLES = 4000
+const ARENA_WORDS = 262144
+// Deliberately small: 32 KiB. A drain shows up as exhaustion rather than as a
+// number that merely drifts.
+const INDEX_WORDS = 4096
+const META_WORDS = 8
+
+function main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let roots = []i64(ROOTS)
+  let meta = []i64(META_WORDS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = 16   // body size
+  meta[1] = 0    // no pointer fields: a leaf, so churn is pure index traffic
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, false, 4096, 200, false)
+
+  // Fill the roots once so the index has real entries before the churn starts.
+  let i = 0
+  while (i < ROOTS) {
+    roots[i] = gcAlloc(g, metaAddr)
+    i = i + 1
+  }
+  gcCollectRoots(g, rootsAddr, ROOTS)
+
+  // Churn, phase 1: replace every root, then collect. Each cycle inserts ROOTS
+  // entries and tombstones ROOTS entries, which is exactly the pattern that
+  // forces repeated same-capacity rehashing.
+  let allocFailed = 0
+  let c = 0
+  while (c < CYCLES) {
+    let j = 0
+    while (j < ROOTS) {
+      let p = gcAlloc(g, metaAddr)
+      if (p == 0) {
+        allocFailed = 1
+      }
+      roots[j] = p
+      j = j + 1
+    }
+    gcCollectRoots(g, rootsAddr, ROOTS)
+    c = c + 1
+  }
+  let mid = gcIndexReserveLeft(g)
+
+  // Phase 2: identical work again. By now the index is at its steady-state
+  // capacity, so this phase must consume NOTHING.
+  c = 0
+  while (c < CYCLES) {
+    let j = 0
+    while (j < ROOTS) {
+      let p = gcAlloc(g, metaAddr)
+      if (p == 0) {
+        allocFailed = 1
+      }
+      roots[j] = p
+      j = j + 1
+    }
+    gcCollectRoots(g, rootsAddr, ROOTS)
+    c = c + 1
+  }
+  let after = gcIndexReserveLeft(g)
+
+  // (c) the index still agrees with the oracle for live roots, interior
+  // pointers and a foreign address.
+  let agree = 1
+  let k = 0
+  while (k < ROOTS) {
+    let r = roots[k]
+    if (r != 0) {
+      if (!gcOwns(g, r) || gcOwns(g, r) != gcOwnsLinear(g, r)) {
+        agree = 0
+      }
+      if (gcOwns(g, r + 8) != gcOwnsLinear(g, r + 8)) {
+        agree = 0
+      }
+    }
+    k = k + 1
+  }
+  if (gcOwns(g, 4096) != gcOwnsLinear(g, 4096)) {
+    agree = 0
+  }
+
+  let enabled = 0
+  if (gcIndexEnabled(g)) {
+    enabled = 1
+  }
+  // The one-off cost of reaching steady state is allowed; a second phase of the
+  // same work must cost nothing at all.
+  let steady = 0
+  if (after == mid) {
+    steady = 1
+  }
+  let entriesOk = 0
+  if (gcIndexEntries(g) == gcNumObjects(g)) {
+    entriesOk = 1
+  }
+
+  // (e) tear down and prove every byte came back.
+  gcDeinit(g)
+  let leaked = gcLiveBytes(g)
+
+  print("indexchurn ${enabled} ${steady} ${agree} ${entriesOk} ${allocFailed} ${leaked}\n")
+}

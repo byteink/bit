@@ -346,6 +346,28 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.addTest(.{ .root_module = stress_mod });
     test_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
+    // GC differential (#1363): drives runtime/gc.zig through the same scripted
+    // sequence tests/stress/gcbit drives runtime/gc/gc.bit through, and asserts
+    // both render the same table. The golden file is a shared oracle — the
+    // stress suite above checks the Bit collector against it, this checks the
+    // Zig collector against it, and neither is derived from the other. Front end
+    // only on this side: it links runtime/gc.zig directly, so it needs no
+    // libbitrt.
+    const gcdiff_mod = b.createModule(.{
+        .root_source_file = b.path("tests/gcdiff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gcdiff_mod.addImport("gc", b.createModule(.{
+        .root_source_file = b.path("runtime/gc.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    gcdiff_mod.addOptions("build_options", stress_opts);
+
+    const gcdiff_tests = b.addTest(.{ .root_module = gcdiff_mod });
+    test_step.dependOn(&b.addRunArtifact(gcdiff_tests).step);
+
     // `bit test` runner (#1105): discovers `test_` functions and runs each in
     // its own process (a failed `assert` panics). Shares the host libbitrt
     // archive wired in at the tail.

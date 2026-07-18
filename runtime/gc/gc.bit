@@ -1,0 +1,1058 @@
+// Stage-2 port of `runtime/gc.zig` (#1363): the precise stop-the-world
+// mark-and-sweep collector. Both implementations exist during the port; #1400
+// swaps this one into `libbitrt.a` and #1369 retires the Zig original.
+//
+// The algorithm is unchanged and deliberately so. Header layout (ABI.md §1),
+// the pointer-map contract (§2), the intrusive all-objects list and therefore
+// the sweep ORDER, the mark-worklist overflow/rescan recovery, the
+// address->object membership index, and the growth trigger are all reproduced
+// exactly. A collector is the one component where a "cleaner" deviation is
+// silent heap corruption rather than a crash, so where this file differs from
+// the Zig it says so in a comment and says why.
+//
+// WHAT IS DIFFERENT, AND WHY (the complete list)
+// ----------------------------------------------
+// 1. STATE IS CALLER-OWNED. Zig's `Gc` is a struct the caller embeds. Bit has
+//    no mutable module-level state (#1402, in flight) and no way to return a
+//    struct that lives outside the managed heap, so the collector's state is a
+//    block of `gcWords` machine words the caller provides and every entry point
+//    takes as its first parameter. This is the shape #1361 (spinlock) and
+//    #1362 (allocator) both settled on; the process-wide instance belongs to
+//    `root.zig` (#1367). Field-for-field the block IS the Zig struct — see the
+//    `gc*` word-index constants below.
+//
+// 2. ROOT SCANNING IS PUSHED, NOT PULLED. Zig's `RootScanner` is a `ctx` plus a
+//    function pointer, and `collect` calls it. The unmanaged subset has no
+//    function pointers (a Bit function value is a GC object, which the
+//    collector cannot depend on), so the callback is inverted into an explicit
+//    phase API: `gcMarkBegin` / <caller marks its roots> / `gcCollectFinish`.
+//    `gcCollectRoots` wraps the two around a root ARRAY, which is exactly the
+//    `RootArray` scanner gc.zig's own tests use. The operation ORDER is
+//    identical — seed roots, drain, recover overflow, sweep, reschedule — only
+//    the direction of the call is reversed.
+//
+// 3. PAGES COME FROM A CALLER-SUPPLIED RESERVE. The heap itself is the REAL
+//    allocator — `runtime/alloc/alloc.bit` (#1362), the Bit port of the
+//    `alloc.zig` this collector's Zig original calls — so all size-class
+//    policy, the free-list shape and the byte counters are the allocator's, not
+//    reinvented here. But that port pushed the OS page fetch out to its caller
+//    (`syscall` is Linux-only, `extern function` Darwin-only, and both are
+//    rejected on the declaration), and with no function pointers in the
+//    unmanaged subset a platform-free `gc.bit` cannot be handed a mapping
+//    callback — only memory. So the caller maps pages and hands in a reserve,
+//    and `gcHeapAlloc` bumps spans out of it to refill classes. See
+//    `./mem.bit`. This is what keeps this file compiling for all three targets.
+//
+// 4. ADDRESSES ARE SIGNED. Zig uses `usize`; Bit's `int` is `i64` (§11.1). Every
+//    address comparison here (`lo_addr`/`hi_addr` bounds, index probing) is
+//    therefore signed. Userspace addresses on all three supported targets are
+//    far below 2^63, so the ordering is identical to the unsigned comparison.
+//    The one place this is visible is `gcAddrMax` standing in for
+//    `std.math.maxInt(usize)` as the initial `lo_addr`.
+//
+// 5. `std.debug.assert` BECOMES A COUNTER. Zig asserts that each pointer-map
+//    offset is 8-aligned and inside the body; those asserts compile OUT of the
+//    shipping ReleaseFast build. `@nosplit` cannot call `panic`, so this port
+//    counts a violating offset in `gcStatBadOffset` and SKIPS the slot rather
+//    than reading out of bounds. The stress test asserts the counter is zero, so
+//    on every input tested the traced-slot set is identical to Zig's — and
+//    unlike the Zig, a violation stays visible in a release build.
+//
+// 6. `verbose` IS STORED, NOT EMITTED. Zig's `collect` writes a line to stderr
+//    via `std.debug.print`. `@nosplit` cannot call `print`, and the freestanding
+//    Bit runtime has no stderr primitive of its own yet, so the flag is kept and
+//    readable and emitting the line belongs to the caller (#1367 owns I/O). The
+//    stats the line reports are all exposed as accessors.
+//
+// 7. `configFromEnv` SPLITS. The env READING is the caller's (#1367); the
+//    POLICY — the clamps that make a bad setting harmless — is ported here as
+//    `gcConfigure`. That is the part with behaviour worth preserving.
+//
+// 8. THE `ref_array_info` SENTINEL IS CALLER-PROVIDED. Zig compares
+//    `h.info == &ref_array_info`, the address of a module-level static. With no
+//    module-level state the sentinel's address is passed to `gcInit` and stored.
+//    It is address identity either way.
+//
+// Everything is `@nosplit` (§10.3): the collector must not allocate through the
+// managed heap and must not reach a safepoint, or it would re-enter itself.
+
+// `./mem.bit` is a SIBLING file, so it is the same module as this one and needs
+// no import — its functions are already in scope.
+import { spinAcquire, spinRelease } from "../"
+import { allocClassify, allocLargeLen, allocSpanBytes, heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked, heapLargeAllocLocked, heapLargeFreeLocked, heapLiveBytes } from "../alloc"
+
+// ---------------------------------------------------------------------------
+// ABI constants (runtime/ABI.md §1, §2) — frozen, shared with codegen.
+// ---------------------------------------------------------------------------
+
+// Object header size. The body begins at `base + gcHeaderSize` and the
+// reference the compiler works with is the BODY pointer (ABI.md §1).
+export const gcHeaderSize = 32
+
+// Header field offsets, in bytes from the object base.
+export const gcHdrInfo = 0
+export const gcHdrNext = 8
+export const gcHdrSize = 16
+// `marked` is a 1-byte bool at +24 followed by 7 bytes of padding. This port
+// writes the BYTE, not the whole word, so the header's bit pattern matches the
+// Zig's exactly and the padding stays untouched.
+export const gcHdrMarked = 24
+
+// `TypeInfo` field offsets, in bytes (ABI.md §2, 56 bytes total).
+export const gcTiSize = 0
+export const gcTiPtrOffsetsPtr = 8
+export const gcTiPtrOffsetsLen = 16
+export const gcTiNamePtr = 24
+export const gcTiNameLen = 32
+export const gcTiMethodsPtr = 40
+export const gcTiMethodsLen = 48
+
+// Largest i64 — stands in for `std.math.maxInt(usize)` as the initial
+// `lo_addr`, so the first `noteBody` always lowers it. See deviation 4.
+export const gcAddrMax = 9223372036854775807
+
+// ---------------------------------------------------------------------------
+// Collector state block layout, in words. Field-for-field the Zig `Gc` struct.
+// ---------------------------------------------------------------------------
+
+const gcHeapAddr = 0       // address of the allocator's heap block (Zig: heap: *Heap)
+const gcHeapLockAddr = 1   // address of the i32 word guarding that heap block
+const gcLockAddr = 2       // address of the i32 list-lock word (Zig: list_lock)
+const gcAll = 3            // head of the all-objects list, 0 = null
+const gcNumObjectsIdx = 4
+const gcStackAddr = 5      // mark worklist base address
+const gcStackLen = 6
+const gcStackTop = 7
+const gcOverflow = 8
+const gcCfgEnabled = 9
+const gcCfgStress = 10
+const gcCfgMinTrigger = 11
+const gcCfgGrowthPct = 12
+const gcCfgVerbose = 13
+const gcNextBytes = 14
+const gcLoAddr = 15
+const gcHiAddr = 16
+const gcStCollections = 17
+const gcStTotalAllocated = 18
+const gcStTotalSwept = 19
+const gcStSurvivorsLast = 20
+const gcIndexOk = 21
+const gcIndexAddr = 22
+const gcIndexCap = 23
+const gcIndexLive = 24
+const gcIndexUsed = 25      // live entries + tombstones, for the load factor
+const gcRefArrayInfo = 26   // address of the `ref_array_info` sentinel
+const gcStBadOffset = 27    // deviation 5
+const gcPageSize = 28       // for the direct-mapped (large) path only
+// Span reserve: pages the caller mapped, which `gcHeapAlloc` carves into size
+// classes. Three words (base/end/bump) inline, see ./mem.bit.
+const gcSpanRes = 29
+// A SEPARATE reserve for the address->object index, mirroring the Zig's
+// `index_alloc = std.heap.page_allocator`: index bytes must never count toward
+// the heap's `liveBytes`, or they would perturb the growth trigger.
+const gcIdxRes = 32
+// One-slot cache of the most recently abandoned index table, so a rehash at an
+// unchanged capacity reuses storage instead of draining the reserve. See
+// `idxGrow`.
+const gcIdxSpareAddr = 35
+const gcIdxSpareCap = 36
+
+// Words the caller must provide for the state block.
+export const gcWords = 37
+
+// Defaults, matching `Config`'s field defaults in gc.zig.
+export const gcDefaultMinTrigger = 4194304   // 4 * 1024 * 1024
+export const gcDefaultGrowthPct = 200
+export const gcDefaultMarkStack = 8192
+
+// Index slot sentinels. A body address is 8-aligned and never 0, so neither
+// value can collide with a real entry.
+const idxEmpty = 0
+const idxTombstone = 1
+const idxMinCap = 16
+const idxLoadPct = 80        // grow at 80% occupancy, matching Zig's AutoHashMap
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+@nosplit function bodyFromHeader(h: int): int {
+  return h + gcHeaderSize
+}
+
+@nosplit function headerFromBody(body: int): int {
+  return body - gcHeaderSize
+}
+
+// The list lock as a `*i32`. Stored as an address because the state block is a
+// word array; `*i32` arithmetic scales by 4, so the address must be 4-aligned
+// (it is: the caller's lock word comes from `ptrOf` on an `[]i32`).
+@nosplit function lockPtr(g: *i64): *i32 {
+  let n: *i32 = nil
+  let addr = *(g + gcLockAddr)
+  return n + (addr / 4)
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+// Create a collector over `heapRegion`. Allocates the fixed mark worklist up
+// front (startup allocation — never grows afterwards), from the OBJECT heap,
+// exactly as `Gc.init` does; that is deliberate, because it means the worklist
+// counts toward `liveBytes` in both implementations and the trigger schedules
+// identically.
+//
+// `markStackLen` of 0 becomes 1, matching Zig's `if (cfg.mark_stack_len == 0) 1`.
+// Returns false if the worklist could not be allocated (Zig's
+// `error{OutOfMemory}`).
+export @nosplit function gcInit(g: *i64, heapAddr: int, heapLockAddr: int, listLockAddr: int, refArrayInfoAddr: int, markStackLen: int): bool {
+  // `gcBindMemory` must have run first, because the mark worklist below is
+  // allocated through the heap and the heap draws its spans from the reserve.
+  // Checked rather than documented-and-hoped: an unbound reserve would other-
+  // wise hand out spans carved from whatever the caller's block happened to
+  // contain, which is silent heap corruption rather than a failure.
+  let spanBase = *(g + gcSpanRes)
+  if (spanBase == 0 || heapAddr == 0 || heapLockAddr == 0 || listLockAddr == 0) {
+    return false
+  }
+
+  let ncap = markStackLen
+  if (ncap == 0) {
+    ncap = 1
+  }
+  let bytes = ncap * 8
+
+  *(g + gcHeapAddr) = heapAddr
+  *(g + gcHeapLockAddr) = heapLockAddr
+  *(g + gcLockAddr) = listLockAddr
+  *(g + gcAll) = 0
+  *(g + gcNumObjectsIdx) = 0
+  *(g + gcStackAddr) = 0
+  *(g + gcStackLen) = ncap
+  *(g + gcStackTop) = 0
+  *(g + gcOverflow) = 0
+  *(g + gcCfgEnabled) = 1
+  *(g + gcCfgStress) = 0
+  *(g + gcCfgMinTrigger) = gcDefaultMinTrigger
+  *(g + gcCfgGrowthPct) = gcDefaultGrowthPct
+  *(g + gcCfgVerbose) = 0
+  *(g + gcNextBytes) = gcDefaultMinTrigger
+  *(g + gcLoAddr) = gcAddrMax
+  *(g + gcHiAddr) = 0
+  *(g + gcStCollections) = 0
+  *(g + gcStTotalAllocated) = 0
+  *(g + gcStTotalSwept) = 0
+  *(g + gcStSurvivorsLast) = 0
+  *(g + gcIndexOk) = 1
+  *(g + gcIndexAddr) = 0
+  *(g + gcIndexCap) = 0
+  *(g + gcIndexLive) = 0
+  *(g + gcIndexUsed) = 0
+  *(g + gcRefArrayInfo) = refArrayInfoAddr
+  *(g + gcStBadOffset) = 0
+  *(g + gcIdxSpareAddr) = 0
+  *(g + gcIdxSpareCap) = 0
+
+  // The mark worklist is allocated from the OBJECT heap, exactly as `Gc.init`
+  // does. That is deliberate rather than incidental: it means the worklist
+  // counts toward `liveBytes` in both implementations, so the growth trigger
+  // schedules identically. It is therefore allocated LAST, once the reserve and
+  // page size the allocator needs are in place.
+  let stack = gcHeapAlloc(g, bytes, 8)
+  if (stack == 0) {
+    return false
+  }
+  *(g + gcStackAddr) = stack
+  return true
+}
+
+// Bind the page reserve and page size. MUST be called before `gcInit`, because
+// `gcInit` allocates the mark worklist through the heap.
+//
+// `spanAddr`/`spanBytes` is memory the CALLER mapped from the OS — the
+// collector cannot map it itself and stay platform-free (see deviation 3).
+// `idxAddr`/`idxBytes` backs the address->object index and is kept separate so
+// index bytes never reach the heap's `liveBytes`.
+export @nosplit function gcBindMemory(g: *i64, spanAddr: int, spanBytes: int, idxAddr: int, idxBytes: int, pageSize: int) {
+  reserveInit(g + gcSpanRes, spanAddr, spanBytes)
+  reserveInit(g + gcIdxRes, idxAddr, idxBytes)
+  *(g + gcPageSize) = pageSize
+}
+
+// ---------------------------------------------------------------------------
+// The heap seam — `gc.zig`'s three calls into `alloc.zig`, composed here
+// ---------------------------------------------------------------------------
+//
+// `alloc.zig` exposes `alloc`/`free` directly; the Bit allocator exposes the
+// same policy as `...Locked` primitives plus a caller-supplied span, because it
+// cannot reach the OS itself. Composing them is therefore the CALLER's job, and
+// the collector is the allocator's only caller. The lock discipline is the
+// Zig's exactly: one critical section spans classification, the refill and the
+// take, so a span map still happens inside it and two workers cannot both
+// refill the same class.
+
+// The allocator's heap state block, as a `*i64`.
+@nosplit function heapBlock(g: *i64): *i64 {
+  return wordAt(*(g + gcHeapAddr))
+}
+
+@nosplit function heapLock(g: *i64): *i32 {
+  let n: *i32 = nil
+  let addr = *(g + gcHeapLockAddr)
+  return n + (addr / 4)
+}
+
+// `Heap.alloc(size, alignment)`: the address, or 0 when memory is exhausted.
+@nosplit function gcHeapAlloc(g: *i64, size: int, alignment: int): int {
+  spinAcquire(heapLock(g))
+  let idx = allocClassify(size, alignment)
+  if (idx >= 0) {
+    let addr = heapTakeSmallLocked(heapBlock(g), idx, size)
+    if (addr != 0) {
+      spinRelease(heapLock(g))
+      return addr
+    }
+    // Class empty: carve a fresh span out of the reserve and retry, which is
+    // `allocSmall`'s `refill` path.
+    let span = reserveTake(g + gcSpanRes, allocSpanBytes)
+    if (span == 0) {
+      spinRelease(heapLock(g))
+      return 0
+    }
+    heapRefillLocked(heapBlock(g), idx, span)
+    let got = heapTakeSmallLocked(heapBlock(g), idx, size)
+    spinRelease(heapLock(g))
+    return got
+  }
+  // Direct-mapped (large) path. The Zig maps pages for this; here it comes out
+  // of the same reserve, so it is never returned to the OS — see `gcHeapFree`.
+  let nbytes = allocLargeLen(size, *(g + gcPageSize))
+  let addr = reserveTake(g + gcSpanRes, nbytes)
+  if (addr == 0) {
+    spinRelease(heapLock(g))
+    return 0
+  }
+  heapLargeAllocLocked(heapBlock(g), size, nbytes)
+  spinRelease(heapLock(g))
+  return addr
+}
+
+// `Heap.free(ptr, size, alignment)`. `size` and `alignment` must match the
+// original request — the allocator's contract, and the reason there are no
+// per-object allocator headers: the size lives in the GC header.
+//
+// A large block's pages are accounted as released but not handed back to the
+// reserve. The Zig unmaps them; a reserve cannot. The collector never allocates
+// large objects (a managed object is header + body, far below the largest size
+// class), so this path costs nothing in practice — it exists so the accounting
+// stays exact if one ever does.
+@nosplit function gcHeapFree(g: *i64, addr: int, size: int, alignment: int) {
+  spinAcquire(heapLock(g))
+  let idx = allocClassify(size, alignment)
+  if (idx >= 0) {
+    heapGiveSmallLocked(heapBlock(g), addr, idx, size)
+  } else {
+    heapLargeFreeLocked(heapBlock(g), size, allocLargeLen(size, *(g + gcPageSize)))
+  }
+  spinRelease(heapLock(g))
+}
+
+// Free every remaining object and the mark worklist. The collector is unusable
+// afterwards. This is `Gc.deinit` (ABI.md §6), and it is what makes `liveBytes`
+// a LEAK METRIC: after it, every byte the collector took from the heap has been
+// given back, so `gcLiveBytes` returns to whatever it was before `gcInit` — 0
+// for a fresh heap. A test asserting that is checking the whole
+// alloc/link/sweep/free path at once.
+//
+// The Zig drops the index up front and disables it so the per-object
+// `freeObject` removals below become no-ops instead of O(n) probes; this does
+// the same. The reserve is NOT returned — it is the caller's memory, and the
+// caller (who mapped it) is the only party that can unmap it.
+export @nosplit function gcDeinit(g: *i64) {
+  idxDisable(g)
+  let o = *(g + gcAll)
+  // Bounded: at most `num_objects` links.
+  while (o != 0) {
+    let next = loadWord(o + gcHdrNext)
+    freeObject(g, o)
+    o = next
+  }
+  *(g + gcAll) = 0
+  *(g + gcNumObjectsIdx) = 0
+  let stack = *(g + gcStackAddr)
+  if (stack != 0) {
+    gcHeapFree(g, stack, *(g + gcStackLen) * 8, 8)
+    *(g + gcStackAddr) = 0
+  }
+}
+
+// Apply collector policy. The clamps are `configFromEnv`'s, ported verbatim:
+// a growth percent below 100 is IGNORED (the heap must be allowed to grow
+// between collections) and a mark-stack length of 0 is ignored. `minTrigger`
+// also reschedules `nextGcBytes`, because `Gc.init` seeds it from the config
+// and this port configures after init (deviation 7).
+export @nosplit function gcConfigure(g: *i64, enabled: bool, stress: bool, minTrigger: int, growthPct: int, verbose: bool) {
+  if (enabled) {
+    *(g + gcCfgEnabled) = 1
+  } else {
+    *(g + gcCfgEnabled) = 0
+  }
+  if (stress) {
+    *(g + gcCfgStress) = 1
+  } else {
+    *(g + gcCfgStress) = 0
+  }
+  if (minTrigger > 0) {
+    *(g + gcCfgMinTrigger) = minTrigger
+    *(g + gcNextBytes) = minTrigger
+  }
+  if (growthPct >= 100) {
+    *(g + gcCfgGrowthPct) = growthPct
+  }
+  if (verbose) {
+    *(g + gcCfgVerbose) = 1
+  } else {
+    *(g + gcCfgVerbose) = 0
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The address->object membership index
+// ---------------------------------------------------------------------------
+//
+// `owns` is the mark hot path: it runs once per traced reference. A linear walk
+// of the all-objects list there makes tracing O(objects^2) — that was a real,
+// measured regression in this codebase (fixed for the Zig in 3dc87a3, ~9x on
+// the h2 download path), so the index is ported, not skipped.
+//
+// Open addressing with linear probing over a power-of-two table of body
+// addresses. The Zig uses `std.AutoHashMapUnmanaged`; the internal layout is
+// NOT part of any contract (the index is a pure speed structure over the
+// authoritative all-objects list), so a simpler scheme is free to differ as
+// long as `owns` answers identically. It does: the index mirrors exactly the
+// insert/remove points that mutate `all`.
+//
+// Backed by its OWN reserve, never the object heap — mirroring Zig's
+// `index_alloc = std.heap.page_allocator`. Index bytes must not count toward
+// `liveBytes`, or they would perturb the growth trigger.
+
+// splitmix64's finalizer. Computed in `u64` because it relies on modular
+// multiplication; `i64` overflow traps in debug builds (§11.1).
+@nosplit function idxHash(addr: int, ncap: int): int {
+  let x = u64(addr)
+  x = x ^ (x >> 30)
+  x = x * 13787848793156543929
+  x = x ^ (x >> 27)
+  x = x * 10723151780598845931
+  x = x ^ (x >> 31)
+  let mask = u64(ncap - 1)
+  return int(x & mask)
+}
+
+@nosplit function idxSlotAddr(table: int, i: int): int {
+  return table + i * 8
+}
+
+// True if `addr` is present. Probes until an empty slot, which terminates
+// because the load factor is held below 100%. Bounded by `ncap` regardless.
+@nosplit function idxContains(g: *i64, addr: int): bool {
+  let ncap = *(g + gcIndexCap)
+  if (ncap == 0) {
+    return false
+  }
+  let table = *(g + gcIndexAddr)
+  let i = idxHash(addr, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let v = loadWord(idxSlotAddr(table, i))
+    if (v == idxEmpty) {
+      return false
+    }
+    if (v == addr) {
+      return true
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+  return false
+}
+
+// Place `addr` into `table` assuming capacity is available and `addr` is
+// absent. Used by both insert and rehash.
+@nosplit function idxPlace(table: int, ncap: int, addr: int): bool {
+  let i = idxHash(addr, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let slotAddr = idxSlotAddr(table, i)
+    let v = loadWord(slotAddr)
+    if (v == idxEmpty || v == idxTombstone) {
+      storeWord(slotAddr, addr)
+      return true
+    }
+    if (v == addr) {
+      return true
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+  return false
+}
+
+// Disable the index permanently and release its table. `owns` then reverts to
+// the exact `gcOwnsLinear` scan, so a failure costs speed, never correctness —
+// this is Zig's `catch { index_ok = false; ... }` path.
+@nosplit function idxDisable(g: *i64) {
+  *(g + gcIndexOk) = 0
+  *(g + gcIndexAddr) = 0
+  *(g + gcIndexCap) = 0
+  *(g + gcIndexLive) = 0
+  *(g + gcIndexUsed) = 0
+}
+
+// Grow (or first-allocate) the table so one more entry fits under the load
+// factor, rehashing the live entries and dropping tombstones.
+@nosplit function idxGrow(g: *i64): bool {
+  let oldTable = *(g + gcIndexAddr)
+  let oldCap = *(g + gcIndexCap)
+  let live = *(g + gcIndexLive)
+
+  let newCap = idxMinCap
+  // Bounded: doubles until the load factor admits `live + 1`; `live` is bounded
+  // by the number of live objects, so this terminates in <= 63 iterations.
+  let guard = 0
+  while (guard < 64) {
+    if ((live + 1) * 100 < newCap * idxLoadPct) {
+      break
+    }
+    newCap = newCap * 2
+    guard = guard + 1
+  }
+
+  // Reuse the spare when it is the right capacity. This is what keeps the
+  // index reserve from draining: removals leave TOMBSTONES, which count toward
+  // the load factor, so a long alloc/free workload rehashes repeatedly at an
+  // UNCHANGED capacity just to clear them. Taking fresh storage each time would
+  // exhaust any reserve and permanently disable the index — which would drop
+  // `owns` back to the O(objects) linear scan and make tracing O(n^2), the exact
+  // regression 3dc87a3 fixed for the Zig. The Zig avoids it by giving the table
+  // back to `page_allocator`; a bump reserve cannot, so one slot is cached.
+  // Capacity changes are O(log n) over a whole run, so at most that many tables
+  // are ever abandoned.
+  let newTable = 0
+  if (*(g + gcIdxSpareCap) == newCap) {
+    newTable = *(g + gcIdxSpareAddr)
+    *(g + gcIdxSpareAddr) = 0
+    *(g + gcIdxSpareCap) = 0
+  } else {
+    newTable = reserveTake(g + gcIdxRes, newCap * 8)
+  }
+  if (newTable == 0) {
+    idxDisable(g)
+    return false
+  }
+  // Zero the fresh table: every slot must read `idxEmpty`.
+  let i = 0
+  while (i < newCap) {
+    storeWord(idxSlotAddr(newTable, i), idxEmpty)
+    i = i + 1
+  }
+
+  // Rehash live entries. Bounded by `oldCap`.
+  let moved = 0
+  let j = 0
+  while (j < oldCap) {
+    let v = loadWord(idxSlotAddr(oldTable, j))
+    if (v != idxEmpty && v != idxTombstone) {
+      if (!idxPlace(newTable, newCap, v)) {
+        // Cannot happen: the new table was sized for `live + 1`. Treat as an
+        // index failure rather than silently losing a membership entry.
+        idxDisable(g)
+        return false
+      }
+      moved = moved + 1
+    }
+    j = j + 1
+  }
+
+  // Park the old table as the spare rather than abandoning it.
+  if (oldTable != 0) {
+    *(g + gcIdxSpareAddr) = oldTable
+    *(g + gcIdxSpareCap) = oldCap
+  }
+  *(g + gcIndexAddr) = newTable
+  *(g + gcIndexCap) = newCap
+  *(g + gcIndexLive) = moved
+  *(g + gcIndexUsed) = moved
+  return true
+}
+
+// Record `body` in the index, growing first if the load factor demands it.
+@nosplit function idxInsert(g: *i64, body: int) {
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  let ncap = *(g + gcIndexCap)
+  let used = *(g + gcIndexUsed)
+  if (ncap == 0 || (used + 1) * 100 >= ncap * idxLoadPct) {
+    if (!idxGrow(g)) {
+      return
+    }
+    ncap = *(g + gcIndexCap)
+  }
+  let table = *(g + gcIndexAddr)
+  if (!idxPlace(table, ncap, body)) {
+    idxDisable(g)
+    return
+  }
+  *(g + gcIndexLive) = *(g + gcIndexLive) + 1
+  *(g + gcIndexUsed) = *(g + gcIndexUsed) + 1
+}
+
+// Remove `body` from the index, leaving a tombstone so probe chains through
+// this slot keep working. Tombstones are reclaimed by the next `idxGrow`.
+@nosplit function idxRemove(g: *i64, body: int) {
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  let ncap = *(g + gcIndexCap)
+  if (ncap == 0) {
+    return
+  }
+  let table = *(g + gcIndexAddr)
+  let i = idxHash(body, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let slotAddr = idxSlotAddr(table, i)
+    let v = loadWord(slotAddr)
+    if (v == idxEmpty) {
+      return
+    }
+    if (v == body) {
+      storeWord(slotAddr, idxTombstone)
+      *(g + gcIndexLive) = *(g + gcIndexLive) - 1
+      return
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Allocation
+// ---------------------------------------------------------------------------
+
+// Widen the monotonic address window used by `gcMarkRoot`'s O(1) reject.
+// Never shrinks on sweep, exactly as in the Zig: that only widens the reject
+// window slightly and costs nothing in correctness.
+@nosplit function noteBody(g: *i64, addr: int) {
+  if (addr < *(g + gcLoAddr)) {
+    *(g + gcLoAddr) = addr
+  }
+  if (addr + 1 > *(g + gcHiAddr)) {
+    *(g + gcHiAddr) = addr + 1
+  }
+}
+
+// Thread a freshly-allocated header onto the all-objects list and bump the
+// counters and address bounds under the list lock, so concurrent allocators on
+// different workers cannot corrupt the list. Prepends, so the list is
+// newest-first — which is what fixes the SWEEP ORDER, and this port keeps it.
+@nosplit function linkObject(g: *i64, h: int, infoAddr: int, total: int, bodyAddr: int) {
+  spinAcquire(lockPtr(g))
+  storeWord(h + gcHdrInfo, infoAddr)
+  storeWord(h + gcHdrNext, *(g + gcAll))
+  storeWord(h + gcHdrSize, total)
+  storeByte(h + gcHdrMarked, 0)
+  *(g + gcAll) = h
+  *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) + 1
+  *(g + gcStTotalAllocated) = *(g + gcStTotalAllocated) + 1
+  noteBody(g, bodyAddr)
+  idxInsert(g, bodyAddr)
+  spinRelease(lockPtr(g))
+}
+
+// Zero `n` bytes at `addr`. `n` is always a multiple of 8 here (bodies are
+// whole words), but the tail is handled bytewise so a raw body size that is not
+// word-aligned still zeroes completely.
+@nosplit function zeroBytes(addr: int, n: int) {
+  let words = n / 8
+  let i = 0
+  while (i < words) {
+    storeWord(addr + i * 8, 0)
+    i = i + 1
+  }
+  let b = words * 8
+  while (b < n) {
+    storeByte(addr + b, 0)
+    b = b + 1
+  }
+}
+
+// Allocate a managed object of type `infoAddr`. Returns the address of the
+// ZEROED object body, or 0 if the heap is exhausted. Never auto-collects:
+// collection happens only at safepoints where the roots are known.
+//
+// The body is zeroed so pointer fields read as null until assigned — required
+// by ABI.md §1, because a collection between allocation and initialization must
+// never trace garbage.
+export @nosplit function gcAlloc(g: *i64, infoAddr: int): int {
+  let size = loadWord(infoAddr + gcTiSize)
+  let total = gcHeaderSize + size
+  let raw = gcHeapAlloc(g, total, 8)
+  if (raw == 0) {
+    return 0
+  }
+  let body = bodyFromHeader(raw)
+  linkObject(g, raw, infoAddr, total, body)
+  zeroBytes(body, size)
+  return body
+}
+
+// Like `gcAlloc`, but for objects whose body size is not fixed by their
+// `TypeInfo` (strings, byte buffers). `bodySize` is the real body length;
+// `infoAddr` must name a leaf descriptor (empty `ptr_offsets`), because
+// `scanObject` never reads `info.size` for one and the descriptor is shared
+// across lengths.
+export @nosplit function gcAllocRaw(g: *i64, bodySize: int, infoAddr: int): int {
+  let total = gcHeaderSize + bodySize
+  let raw = gcHeapAlloc(g, total, 8)
+  if (raw == 0) {
+    return 0
+  }
+  let body = bodyFromHeader(raw)
+  linkObject(g, raw, infoAddr, total, body)
+  zeroBytes(body, bodySize)
+  return body
+}
+
+// ---------------------------------------------------------------------------
+// Membership
+// ---------------------------------------------------------------------------
+
+// True iff `body` is the body base of a live managed object. Interior and
+// foreign pointers return false — the contract (ABI.md §3) requires references
+// to point at an object base, and this is how that is checked.
+export @nosplit function gcOwns(g: *i64, body: int): bool {
+  if (*(g + gcIndexOk) == 1) {
+    return idxContains(g, body)
+  }
+  return gcOwnsLinear(g, body)
+}
+
+// The authoritative O(objects) membership scan the index mirrors. The fallback
+// when the index is unavailable, and the oracle the index is tested against.
+export @nosplit function gcOwnsLinear(g: *i64, body: int): bool {
+  let o = *(g + gcAll)
+  // Bounded: at most `num_objects` links.
+  while (o != 0) {
+    if (bodyFromHeader(o) == body) {
+      return true
+    }
+    o = loadWord(o + gcHdrNext)
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Marking
+// ---------------------------------------------------------------------------
+
+@nosplit function markObject(g: *i64, h: int) {
+  if (loadByte(h + gcHdrMarked) != 0) {
+    return
+  }
+  storeByte(h + gcHdrMarked, 1)
+  let top = *(g + gcStackTop)
+  if (top < *(g + gcStackLen)) {
+    storeWord(*(g + gcStackAddr) + top * 8, h)
+    *(g + gcStackTop) = top + 1
+  } else {
+    // Worklist full: the object is marked (so it survives) but its children are
+    // not yet traced. A rescan pass will scan it.
+    *(g + gcOverflow) = 1
+  }
+}
+
+// Mark a single reference, marking it ONLY IF it is exactly the body base of a
+// live managed object. Null, interior pointers, and foreign pointers are
+// ignored.
+//
+// The validation is not defensive nicety. The type system calls several
+// single-word pointers "references" that are NOT GC objects — a `chan` handle is
+// page-allocated and process-lifetime, a bare function value is a code address —
+// and both the stack maps (ABI.md §4) and object pointer maps (§2) legitimately
+// list them. Feeding one to a blind mark would decode `ptr - 32` as a bogus
+// header and corrupt or crash. The O(1) address-bounds gate rejects the common
+// foreign pointer; `gcOwns` is the exact backstop.
+export @nosplit function gcMarkRoot(g: *i64, ref: int) {
+  if (ref == 0) {
+    return
+  }
+  if (ref < *(g + gcLoAddr) || ref >= *(g + gcHiAddr)) {
+    return
+  }
+  if (gcOwns(g, ref)) {
+    markObject(g, headerFromBody(ref))
+  }
+}
+
+// Mark one raw machine word from a conservative root source (a parked task's
+// stack scan, ABI.md §5). A front door for `gcMarkRoot`, which does the actual
+// validation — sound because the collector is non-moving, so a false positive
+// only retains garbage.
+export @nosplit function gcMarkConservative(g: *i64, word: int) {
+  if (word != 0) {
+    gcMarkRoot(g, word)
+  }
+}
+
+// Trace one object's reference fields.
+@nosplit function scanObject(g: *i64, h: int) {
+  let body = bodyFromHeader(h)
+  let infoAddr = loadWord(h + gcHdrInfo)
+
+  // A reference element buffer has no static pointer map: trace every word of
+  // the (dynamically sized) body as a potential root. Trailing/unset words read
+  // as null and are skipped by `gcMarkRoot`. Bounded by the buffer's word count.
+  if (infoAddr == *(g + gcRefArrayInfo)) {
+    let nwords = (loadWord(h + gcHdrSize) - gcHeaderSize) / 8
+    let w = 0
+    while (w < nwords) {
+      gcMarkRoot(g, loadWord(body + w * 8))
+      w = w + 1
+    }
+    return
+  }
+
+  let offs = loadWord(infoAddr + gcTiPtrOffsetsPtr)
+  let n = loadWord(infoAddr + gcTiPtrOffsetsLen)
+  let size = loadWord(infoAddr + gcTiSize)
+  let i = 0
+  // Bounded: the number of pointer fields this type declares.
+  while (i < n) {
+    let off = loadWord(offs + i * 8)
+    // Zig asserts these (deviation 5). A violating offset is counted and
+    // skipped rather than read out of bounds.
+    if (off % 8 != 0 || off + 8 > size) {
+      *(g + gcStBadOffset) = *(g + gcStBadOffset) + 1
+    } else {
+      gcMarkRoot(g, loadWord(body + off))
+    }
+    i = i + 1
+  }
+}
+
+// Trace every queued object's reference fields until the worklist drains.
+@nosplit function drain(g: *i64) {
+  // Bounded: each object is queued at most once (guarded by the mark bit), so
+  // total pops across the whole mark phase is <= num_objects.
+  while (*(g + gcStackTop) > 0) {
+    let top = *(g + gcStackTop) - 1
+    *(g + gcStackTop) = top
+    scanObject(g, loadWord(*(g + gcStackAddr) + top * 8))
+  }
+}
+
+// After a worklist overflow, some marked objects were never traced. Rescan all
+// marked objects, re-queueing their children, until no overflow remains.
+// Terminates because every overflow pass marks at least one new object and the
+// mark count is bounded by `num_objects`.
+@nosplit function recoverOverflow(g: *i64) {
+  let passes = 0
+  let maxPasses = *(g + gcNumObjectsIdx) + 1
+  while (*(g + gcOverflow) == 1 && passes < maxPasses) {
+    *(g + gcOverflow) = 0
+    let o = *(g + gcAll)
+    // Bounded: num_objects links.
+    while (o != 0) {
+      if (loadByte(o + gcHdrMarked) != 0) {
+        scanObject(g, o)
+      }
+      o = loadWord(o + gcHdrNext)
+    }
+    drain(g)
+    passes = passes + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sweep
+// ---------------------------------------------------------------------------
+
+@nosplit function freeObject(g: *i64, h: int) {
+  if (*(g + gcIndexOk) == 1) {
+    idxRemove(g, bodyFromHeader(h))
+  }
+  gcHeapFree(g, h, loadWord(h + gcHdrSize), 8)
+}
+
+// Free every unmarked object and clear the mark on survivors. Returns the
+// number of objects reclaimed.
+//
+// Zig walks with a pointer-to-pointer (`link: *?*GcHeader = &self.all`); Bit has
+// no `&`, so the equivalent is an explicit `prev` (0 meaning "the list head").
+// Same traversal, same order, same result.
+@nosplit function sweep(g: *i64): int {
+  let swept = 0
+  let prev = 0
+  let h = *(g + gcAll)
+  // Bounded: num_objects links.
+  while (h != 0) {
+    let next = loadWord(h + gcHdrNext)
+    if (loadByte(h + gcHdrMarked) != 0) {
+      storeByte(h + gcHdrMarked, 0)
+      prev = h
+    } else {
+      // Unlink before freeing.
+      if (prev == 0) {
+        *(g + gcAll) = next
+      } else {
+        storeWord(prev + gcHdrNext, next)
+      }
+      *(g + gcNumObjectsIdx) = *(g + gcNumObjectsIdx) - 1
+      swept = swept + 1
+      freeObject(g, h)
+    }
+    h = next
+  }
+  return swept
+}
+
+// ---------------------------------------------------------------------------
+// Collection
+// ---------------------------------------------------------------------------
+
+// Begin a collection: reset the mark worklist. The caller then marks its roots
+// (`gcMarkRoot` / `gcMarkConservative`) and calls `gcCollectFinish`. This pair
+// is Zig's `collect` with the root callback inverted — see deviation 2.
+export @nosplit function gcMarkBegin(g: *i64) {
+  *(g + gcStackTop) = 0
+  *(g + gcOverflow) = 0
+}
+
+// Finish a collection: drain the worklist, recover from any overflow, sweep,
+// and reschedule the next trigger relative to the surviving live set.
+export @nosplit function gcCollectFinish(g: *i64) {
+  drain(g)
+  recoverOverflow(g)
+
+  let swept = sweep(g)
+
+  let live = heapLiveBytes(heapBlock(g))
+  let pct = *(g + gcCfgGrowthPct)
+  // Zig saturates the multiply (`std.math.mul ... catch maxInt`). Guarding
+  // before the multiply is the same thing without relying on i64 overflow,
+  // which traps in debug builds (§11.1).
+  let grown = gcAddrMax
+  if (pct == 0 || live <= gcAddrMax / pct) {
+    grown = (live * pct) / 100
+  }
+  let next = *(g + gcCfgMinTrigger)
+  if (grown > next) {
+    next = grown
+  }
+  *(g + gcNextBytes) = next
+
+  *(g + gcStCollections) = *(g + gcStCollections) + 1
+  *(g + gcStTotalSwept) = *(g + gcStTotalSwept) + swept
+  *(g + gcStSurvivorsLast) = *(g + gcNumObjectsIdx)
+}
+
+// Run a full stop-the-world mark-sweep rooted at the `n` body addresses stored
+// contiguously at `rootsAddr`. This is the `RootArray` scanner gc.zig's own
+// tests use, and the form the differential drives both collectors through.
+export @nosplit function gcCollectRoots(g: *i64, rootsAddr: int, n: int) {
+  gcMarkBegin(g)
+  let i = 0
+  // Bounded: exactly `n` roots.
+  while (i < n) {
+    gcMarkRoot(g, loadWord(rootsAddr + i * 8))
+    i = i + 1
+  }
+  gcCollectFinish(g)
+}
+
+// Poll point for automatic collection. A mutator calls this where the stack
+// maps make the roots precise; if the live heap has crossed the trigger the
+// world stops and a collection runs.
+//
+// Under `stress` every safepoint collects, ignoring the byte trigger — which
+// turns the stress suite into a precise-rooting oracle: any root the caller
+// fails to report is swept on the very next poll.
+export @nosplit function gcSafepointRoots(g: *i64, rootsAddr: int, n: int) {
+  if (*(g + gcCfgEnabled) == 0) {
+    return
+  }
+  if (*(g + gcCfgStress) == 0) {
+    if (heapLiveBytes(heapBlock(g)) < *(g + gcNextBytes)) {
+      return
+    }
+  }
+  gcCollectRoots(g, rootsAddr, n)
+}
+
+// ---------------------------------------------------------------------------
+// Observability (Zig's `Stats`, plus the state a test needs to check invariants)
+// ---------------------------------------------------------------------------
+
+export @nosplit function gcNumObjects(g: *i64): int {
+  let v = *(g + gcNumObjectsIdx)
+  return v
+}
+
+export @nosplit function gcStatCollections(g: *i64): int {
+  let v = *(g + gcStCollections)
+  return v
+}
+
+export @nosplit function gcStatTotalAllocated(g: *i64): int {
+  let v = *(g + gcStTotalAllocated)
+  return v
+}
+
+export @nosplit function gcStatTotalSwept(g: *i64): int {
+  let v = *(g + gcStTotalSwept)
+  return v
+}
+
+export @nosplit function gcStatSurvivorsLast(g: *i64): int {
+  let v = *(g + gcStSurvivorsLast)
+  return v
+}
+
+// Non-zero only if a pointer map declared an offset that is misaligned or runs
+// past the body — the invariant Zig asserts in debug builds (deviation 5).
+export @nosplit function gcStatBadOffsets(g: *i64): int {
+  let v = *(g + gcStBadOffset)
+  return v
+}
+
+export @nosplit function gcLiveBytes(g: *i64): int {
+  return heapLiveBytes(heapBlock(g))
+}
+
+export @nosplit function gcNextTrigger(g: *i64): int {
+  let v = *(g + gcNextBytes)
+  return v
+}
+
+export @nosplit function gcIndexEnabled(g: *i64): bool {
+  let ok = *(g + gcIndexOk)
+  return ok == 1
+}
+
+// Live entries currently in the membership index. The stress test checks this
+// against `gcNumObjects` — they must agree exactly, which is what proves the
+// index stays in step with the all-objects list.
+// Bytes still unused in the index reserve. A long alloc/free workload must
+// leave this essentially flat: if it falls, tombstone-driven rehashing is
+// leaking storage and the index will eventually be disabled — see `idxGrow`.
+export @nosplit function gcIndexReserveLeft(g: *i64): int {
+  return reserveRemaining(g + gcIdxRes)
+}
+
+export @nosplit function gcIndexEntries(g: *i64): int {
+  let v = *(g + gcIndexLive)
+  return v
+}
