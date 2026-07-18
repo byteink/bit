@@ -97,6 +97,21 @@ struct Checker {
   // it as it passes the binder, which precedes its own body: right type, right
   // body, immune to any other function's names.
   binderTypes: []int,
+  // --- resolver handoff (#1370) -------------------------------------------
+  // The resolver's per-node symbol table for THIS module: `nodeSymbols[node]`
+  // is the symbol id an identifier reference resolves to (0 = none), and
+  // `symbols[id]` is that Symbol. Empty on the bare dump entry points (which
+  // never run the resolver); checkExprType falls back to the flat env there and
+  // whenever a reference has no resolved decl (imports, builtins).
+  symbols: []Symbol,
+  nodeSymbols: []int,
+  // A local decl's name-ident NODE -> its type, recorded where the flat env is
+  // written. Keyed by node, it is immune to the same-name-across-functions
+  // clobbering the flat env suffers, so an identifier typed via its resolved
+  // decl (nodeSymbols) is always this decl's type — inside a generic body it
+  // holds the template type, which lowering's `nodeType` substitutes exactly as
+  // it does the env's, so the two paths agree byte-for-byte.
+  declTypes: []int,
   // --- diagnostics --------------------------------------------------------
   // Where validation (validate.bit) reports to. Every module in a project
   // shares one sink, so `renderDiags` prints the whole build's errors in one
@@ -147,10 +162,16 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     bt = append(bt, 0)
     b = b + 1
   }
+  let dt = []int(0)
+  let d = 0
+  while (d < len(tree.nodes)) {
+    dt = append(dt, 0)
+    d = d + 1
+  }
   let sm = newSourceManager()
   let f = addFile(sm, "", source)
   return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
-    binderTypes: bt,
+    binderTypes: bt, symbols: []Symbol(0), nodeSymbols: []int(0), declTypes: dt,
     diags: newDiagnostics(sm), files: [f], fileStarts: [0],
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
@@ -658,7 +679,12 @@ function checkProject(p: Project): []Checker {
   let resolved = []Module(0)
   i = 0
   while (i < len(mods)) {
-    resolved = append(resolved, resolveModule(p.diags, p.mods[i], resolved, p.prelude))
+    let rm = resolveModule(p.diags, p.mods[i], resolved, p.prelude)
+    resolved = append(resolved, rm)
+    // Hand this module's symbol table to its checker so checkExprType can type an
+    // identifier from the decl it resolves to rather than the flat env.
+    mods[i].symbols = rm.symbols
+    mods[i].nodeSymbols = rm.nodeSymbols
     i = i + 1
   }
   i = 0
@@ -1524,6 +1550,31 @@ function checkBinary(c: Checker, node: int): int {
   return joined
 }
 
+// The type of an identifier reference from the DECL it resolves to (the
+// resolver's `nodeSymbols`), or 0 to let the caller fall back to the flat env.
+// This is the flat-env kill: a name is typed by the binding it actually
+// resolves to in its scope, never by whatever same-named binding another
+// function left in the module-wide env. Returns 0 (fall back) when there is no
+// resolved local decl to read a type from — an import, a builtin, a bare
+// function value, a not-yet-typed forward reference, or the bare dump entry
+// points that never run the resolver (`nodeSymbols` empty). A local decl holds
+// its TEMPLATE type inside a generic body, exactly as the env does, so lowering's
+// `nodeType` substitution yields the same concrete type on either path.
+function declRefType(c: Checker, node: int): int {
+  if (node < 0 || node >= len(c.nodeSymbols)) {
+    return 0
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return 0
+  }
+  let decl = c.symbols[sid].decl
+  if (decl <= 0 || decl >= len(c.declTypes)) {
+    return 0
+  }
+  return c.declTypes[decl]
+}
+
 // Infers an expression's (possibly untyped) type. Literals and void-builtin
 // calls for now; every other construct infers to invalid (0) until its
 // inference lands.
@@ -1538,6 +1589,13 @@ function checkExprType(c: Checker, node: int): int {
   // A string interpolation `"...${x}..."` is a concrete string.
   if (tag == Tag.StrInterp) { return primType(c.ctx, 11) }
   if (tag == Tag.Ident) {
+    // Type the name from the decl it resolves to (#1370). Falls back to the flat
+    // env only when there is no resolved local decl — imports, builtins, forward
+    // references, and the resolver-less dump entry points.
+    let d = declRefType(c, node)
+    if (d != 0) {
+      return d
+    }
     let sp = getNode(c.tree, node).span
     let name = c.source[sp.start:sp.end]
     let e = envLookup(c, name)
@@ -1618,10 +1676,18 @@ function checkSliceExpr(c: Checker, node: int): int {
   return 0
 }
 
-// Binds an identifier node's name to a type in the scope env.
-// Binds a for-of / catch binder. The type is recorded on the NODE as well as in
-// the flat env, so the main sweep can re-apply it when it reaches the binder —
-// see `Checker.binderTypes` for why the env write alone is not enough.
+// Binds a for-of / match-arm / catch / comma-ok binder. The type is recorded on
+// the NODE (`binderTypes`) as well as in the flat env, so the main sweep can
+// re-apply it when it reaches the binder — see `Checker.binderTypes` for why the
+// env write alone is not enough.
+//
+// Deliberately NOT recorded in `declTypes` (#1370): a binder is typed here at
+// pre-pass 3, BEFORE its iterable local is typed, so this value is best-effort
+// and can be stale. Lowering recomputes the real element type per scope/instance
+// and rebinds `env`; freezing the pre-pass value in `declTypes` would make a
+// decl-typed reference ignore that corrected env and mis-resolve. Params and
+// bindings ARE recorded (their annotation/initializer is always resolvable) —
+// that is where the flat-env receiver-type fix lives.
 function envBind(c: Checker, identNode: int, ty: int) {
   let n = getNode(c.tree, identNode)
   c.env[c.source[n.span.start:n.span.end]] = ty
@@ -1904,6 +1970,7 @@ function checkBinding(c: Checker, node: int) {
   if (pn.tag == Tag.Ident) {
     let bname = c.source[pn.span.start:pn.span.end]
     c.env[bname] = ty
+    c.declTypes[pat] = ty
     // Record the binding's declared type NODE (annotation, or a composite
     // literal's `Pair<i64>` type) so a generic call passing this binding can
     // recover its type-args (`firstOf(p)` binds T from p's `Pair<i64>`).
@@ -2186,7 +2253,9 @@ function checkModule(c: Checker) {
       let pk = kidsOf(c.tree, p3)
       let nm = getNode(c.tree, pk[0])
       let pname = c.source[nm.span.start:nm.span.end]
-      c.env[pname] = typeFromNode(c, pk[1])
+      let ptype = typeFromNode(c, pk[1])
+      c.env[pname] = ptype
+      c.declTypes[pk[0]] = ptype
       // Record the declared type NODE too. A generic scrutinee recovers its type
       // ARGUMENTS from this node — `match (xs)` with `xs: List<i64>` needs the
       // `<i64>` to bind `Cons(h, t)`'s payload at i64 rather than leaving it the
@@ -2237,6 +2306,7 @@ function checkModule(c: Checker) {
       c.nodeTypes[kids[0]] = pt
       if (pt != 0) {
         c.env[c.source[nm.span.start:nm.span.end]] = pt
+        c.declTypes[kids[0]] = pt
       }
     } else if (tag == Tag.Binding) {
       checkBinding(c, i)
