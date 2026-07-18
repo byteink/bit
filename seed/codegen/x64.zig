@@ -2464,7 +2464,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     var int_buf: [max_int_regs]Reg = undefined;
     var float_buf: [max_float_regs]XReg = undefined;
     const base_int_regs = buildIntRegs(&int_buf, cc, flags.has_safepoints, flags.needs_rax_rdx, flags.needs_rcx);
-    const float_regs = buildFloatRegs(&float_buf, cc, flags.has_safepoints);
+    const base_float_regs = buildFloatRegs(&float_buf, cc, flags.has_safepoints);
 
     // Registers an `asm` block pins (`input`/`result`/clobber) are removed from
     // the allocatable file for the whole function — the same exclusion the
@@ -2480,7 +2480,31 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
             asm_n += 1;
         }
     }
-    const int_regs = asm_buf[0..asm_n];
+    const asm_int_regs = asm_buf[0..asm_n];
+
+    // §10.3.1 @naked: the prologue never runs, so a callee-saved register would
+    // be clobbered without ever being saved. Restrict a naked function to the
+    // volatile file. If that is not enough registers, regalloc spills instead —
+    // and the frame assertion below rejects the function loudly rather than
+    // letting it silently corrupt its caller.
+    var naked_int_buf: [max_int_regs]Reg = undefined;
+    var naked_int_n: usize = 0;
+    for (asm_int_regs) |r| {
+        if (!isCalleeSavedInt(cc, r)) {
+            naked_int_buf[naked_int_n] = r;
+            naked_int_n += 1;
+        }
+    }
+    var naked_float_buf: [max_float_regs]XReg = undefined;
+    var naked_float_n: usize = 0;
+    for (base_float_regs) |x| {
+        if (!isCalleeSavedFloat(cc, x)) {
+            naked_float_buf[naked_float_n] = x;
+            naked_float_n += 1;
+        }
+    }
+    const int_regs = if (f.is_naked) naked_int_buf[0..naked_int_n] else asm_int_regs;
+    const float_regs = if (f.is_naked) naked_float_buf[0..naked_float_n] else base_float_regs;
 
     const intervals = try buildIntervals(gpa, tctx, f);
     defer gpa.free(intervals);
@@ -2509,7 +2533,13 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     // §10.3.1 @naked safety net: a naked function suppresses its prologue, so a
     // non-empty frame (spill slot or saved register) would silently corrupt the
     // caller. Rules 1+2 make this unreachable; fail loudly if that ever changes.
-    if (f.is_naked and (frame.frame_size != 0 or saved_gpr.len != 0 or saved_xmm.len != 0))
+    // A spill slot is the only *per-function* frame need a naked function can
+    // develop: `saved_gpr`/`saved_xmm` are derived from the allocatable pool,
+    // not from what this function used, so they are a constant of the target
+    // (all four SysV callee-saved GPRs) and say nothing about this function.
+    // Naked functions allocate out of the volatile file above, so reaching a
+    // spill here means the body outgrew what a prologue-less function can hold.
+    if (f.is_naked and result.num_spill_slots != 0)
         return error.UnsupportedConstruct;
 
     const inst_to_vreg = try gpa.alloc(u32, f.insts.len);
