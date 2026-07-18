@@ -225,6 +225,13 @@ pub const RtFn = enum {
     /// runs on (0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos). The runtime
     /// archive is per-target, so it answers from its own `builtin.target`.
     host_target,
+    /// `auxv() -> i64`: the address of this process's ELF auxiliary vector, or
+    /// 0 where there is none (Darwin, and any host that did not hand one over).
+    /// The kernel puts the table on the initial stack, so only the process
+    /// entry can find it; the runtime captures it there and this hands it back.
+    /// `runtime/auxv` scans it — that scan is `getauxval`, and the PT_TLS
+    /// geometry a spawned thread's TLS block is built from comes out of it.
+    auxv,
     /// Non-blocking TCP (ABI.md §20), under `std/net`. Any of these may park the
     /// calling green thread on the netpoller; none blocks an OS thread.
     /// `net_listen(host, port) -> fd`; `net_local_port(fd) -> port` (recovers the

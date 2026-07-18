@@ -517,6 +517,7 @@ defined exactly once).
 | `bit_rt_os_run`       | `(path: *const RtBytes) -> i64` (§19)                  |
 | `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
 | `bit_rt_host_target`  | `() -> i64` (§19)                                      |
+| `bit_rt_auxv`         | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
 | `bit_rt_net_local_port` | `(fd: i64) -> i64` (§20)                             |
 | `bit_rt_net_accept`   | `(fd: i64) -> i64` (§20)                               |
@@ -911,6 +912,7 @@ bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure
 bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i
 bit_rt_host_target()       -> i64              // host BuildTarget ordinal (0/1/2)
+bit_rt_auxv()              -> i64              // ELF auxv address; 0 when none
 ```
 
 `argc`/`argv`/`envp` are captured by the process entry (§9) on both the raw-stack
@@ -928,6 +930,14 @@ host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos`). The runti
 archive is compiled once per target, so it answers from its own `builtin.target`
 — the compile-time host constant the self-hosted compiler has no other way to see.
 It is the default `bit build`/`bit run` target when `--target` is absent.
+
+`bit_rt_auxv` returns the address of the ELF auxiliary vector the kernel placed
+on this process's initial stack, or 0 where there is none (Darwin, which has no
+auxv at all). The initial stack is unreachable once any Bit code is running, so
+the pointer has to come from the process entry (§9) — but the SCAN over it is
+Bit's own: `runtime/auxv` walks the `(a_type, a_un.a_val)` pairs to `AT_NULL`,
+which is `getauxval`. `runtime/thread/linux` reads `AT_PHDR`/`AT_PHNUM`/`AT_PHENT`
+through it to find `PT_TLS` and size a spawned thread's TLS block.
 
 `bit_rt_os_run_test` is the same fork+exec launcher with `BIT_TEST_INDEX=<idx>`
 prepended to the child's environment (first match wins, so it overrides any

@@ -1,0 +1,376 @@
+// The PRODUCER side of ELF thread-local storage (#1417): this image's `PT_TLS`
+// geometry, read at run time, turned into a TLS block for a thread that
+// `./spawn.bit` is about to `clone`. Sibling file, so the same module — no
+// import needed in either direction.
+//
+// #1411 landed the CONSUMER side (`@threadlocal`, SPEC §11.11): reaching a
+// per-thread cell is `mrs TPIDR_EL0` plus a tprel ADD pair on aarch64, and
+// `mov fs:[0]` plus a TPOFF32 ADD on x86-64. Both are pure arithmetic on a
+// thread pointer that something else must have installed. Until this file, on a
+// spawned thread nothing had — `CLONE_SETTLS` was omitted and the child
+// inherited its parent's thread pointer, so two threads shared one block. That
+// is why ../thread.bit forbade a child `!`/`fail`/`?`: the error slot is a
+// thread-local, and the child would have written the parent's.
+//
+// EVERY NUMBER IN THIS FILE IS DERIVED, NOT CHOSEN. A TLS block that is the
+// wrong SIZE does not crash — it silently overlaps whatever follows it, which is
+// the worst failure this runtime can have. So the geometry comes from the two
+// places that actually define it, and neither is memory:
+//
+//   1. The IMAGE, via its own `PT_TLS` program header — `p_vaddr` (the
+//      initializer image), `p_filesz` (how much of the block has one),
+//      `p_memsz` (the block's real size) and `p_align`. Found through
+//      `AT_PHDR`/`AT_PHNUM`/`AT_PHENT`, the standard ELF TLS ABI and exactly
+//      what `root.zig`'s `initLinuxTls` does for the MAIN thread. The auxv
+//      accessor that makes this reachable from Bit is ../../auxv (#1417's other
+//      half); the `Elf64_Phdr` field offsets and `PT_TLS` = 7 were read out of
+//      the pinned Zig stdlib's `std/elf.zig`, not recalled.
+//
+//   2. The LINKER, `seed/link.zig`, which bakes a thread-pointer-relative
+//      offset into every TLS relocation at link time. THAT is the contract this
+//      file has to satisfy exactly, because those offsets are already in the
+//      instruction stream and cannot adapt to whatever block we build:
+//
+//        x86-64  (variant II):  tpoff = p.tls_offset - alignUp(memsz, align)
+//        aarch64 (variant I) :  tpoff = alignUp(16, align) + p.tls_offset
+//
+//      Read straight off `link.zig`'s `tpoff_of` switch. Rearranged, a symbol
+//      at block offset `o` is at `TP - alignUp(memsz, align) + o` on x86-64 and
+//      at `TP + alignUp(16, align) + o` on aarch64 — which is precisely where
+//      `tlsPrepare` below puts it. The two layouts are checked against Zig's
+//      own `std/os/linux/tls.zig` (`computeAreaDesc`: aarch64 is `.I_original`,
+//      x86_64 is `.II`) and they agree: variant I puts the block ABOVE the
+//      thread pointer past a 16-byte ABI TCB, variant II puts it BELOW, with
+//      the thread pointer pointing at a TCB whose first word points at itself.
+//      That self-word is not decoration on x86-64 — `mov fs:[0]` LOADS the
+//      thread pointer from it, so a block without it reads as address 0.
+//
+// The main thread's block is still built by `root.zig` through Zig's
+// `tls.initStatic`. This file does NOT have to reproduce Zig's area layout, and
+// deliberately does not: Zig also carries a DTV and a `ZigTcb` that only its own
+// code reads. What both must agree on is the ONE thing the baked-in relocations
+// see — where TLS data sits relative to the thread pointer — and on that they
+// agree exactly. Nothing this runtime emits ever reads a DTV: our codegen emits
+// only local-exec sequences, and a static image never calls `__tls_get_addr`.
+//
+// WHERE THE BLOCK LIVES. Inside the thread's own stack mapping, above the stack
+// top, which is the same thing Zig's `LinuxThreadImpl.spawn` does (its
+// `tls_offset` is carved out of the one `mmap` that holds the guard page and the
+// stack). One mapping means `threadRelease` frees the TLS block by construction
+// rather than by remembering to, so a thread cannot leak its TLS. The stack
+// grows DOWN from the stack top and the block sits above it, so the two cannot
+// collide.
+
+import { getauxval, atPhdr, atPhent, atPhnum } from "../../auxv"
+
+// `PT_TLS` = 7 and `PT_PHDR` = 6, and the `Elf64_Phdr` field offsets below, are
+// from the pinned Zig stdlib's `std/elf.zig` (`PT` enum; `Elf64_Phdr` is
+// `p_type` u32, `p_flags` u32, `p_offset` u64, `p_vaddr` u64, `p_paddr` u64,
+// `p_filesz` u64, `p_memsz` u64, `p_align` u64 — 56 bytes).
+const PT_TLS: int = 7
+const PT_PHDR: int = 6
+const PHDR_SIZE: int = 56
+const PH_VADDR: int = 16
+const PH_FILESZ: int = 32
+const PH_MEMSZ: int = 40
+const PH_ALIGN: int = 48
+
+// The alignment a block gets when the image declares no TLS at all. Zig's
+// `computeAreaDesc` uses `@alignOf(usize)` in exactly that case; 8 is that value
+// on both 64-bit targets.
+const NO_TLS_ALIGN: int = 8
+
+// The largest static TLS image this will build a block for. A refusal ceiling,
+// not a guess: it gives the copy loop below a statically provable bound (Power
+// of 10) and turns an absurd `p_memsz` — the shape a corrupted or foreign binary
+// would have — into a refused spawn rather than a wild mapping length.
+//
+// TIED TO THE STACK SIZE RATHER THAN PICKED. A static TLS image larger than an
+// entire thread stack is pathological by construction, and `./spawn.bit`'s
+// `stackBytes` is the one number in this module that already says how big a
+// thread is. That also stops the two drifting.
+//
+// AN EARLIER VERSION OF THIS FILE GUESSED 64KiB, "orders of magnitude above any
+// real static TLS image", AND WAS WRONG BY 4x: this project's own binaries carry
+// a `p_memsz` of ~256KiB, because `libbitrt.a`'s Zig thread-locals — not the Bit
+// program's `@threadlocal` declarations — dominate the segment. The guess was
+// caught immediately only because exceeding this ceiling REFUSES loudly instead
+// of proceeding with a truncated block, which is the whole reason the ceiling
+// is a refusal and not a clamp.
+function maxTlsBytes(): int { return stackBytes() }
+
+// A sentinel distinct from both "no TLS" and any real size: the geometry could
+// not be derived, so no block may be built and the spawn must fail. See
+// `tlsAreaBytes`.
+export const tlsUnavailable: int = 0 - 1
+
+// ---- raw memory ----------------------------------------------------------
+//
+// Local rather than imported from `runtime/gc/mem.bit`, which has the same three
+// helpers. That module is the COLLECTOR's, and a thread provider pulling in the
+// collector to store a word would be a far worse dependency than three lines
+// duplicated — the same call ../spawn.bit makes when it duplicates its two
+// status literals instead of importing them.
+
+function loadWord(addr: int): int {
+  let z: *i64 = nil
+  return int(*(z + (addr / 8)))
+}
+
+function storeWord(addr: int, v: int) {
+  let z: *i64 = nil
+  *(z + (addr / 8)) = i64(v)
+}
+
+// The 32-bit `p_type` at a program header's offset 0. Read as a `*u32` rather
+// than masked out of the 64-bit word so this makes no endianness assumption.
+// Every phdr address is 8-aligned, so the divide-by-4 is exact.
+function loadU32(addr: int): int {
+  let z: *u32 = nil
+  return int(*(z + (addr / 4)))
+}
+
+function loadByte(addr: int): int {
+  let z: *u8 = nil
+  return int(*(z + addr))
+}
+
+function storeByte(addr: int, v: int) {
+  let z: *u8 = nil
+  *(z + addr) = u8(v)
+}
+
+// Round `v` up to the next multiple of `a`. `a` is always a power of two here
+// (an ELF alignment), but the division form works for any positive `a` and
+// needs no bit-complement operator.
+function alignUp(v: int, a: int): int {
+  if (a <= 1) {
+    return v
+  }
+  return ((v + a - 1) / a) * a
+}
+
+function isX64(): bool { return hostTarget() == 0 }
+
+// ---- the image's program headers -----------------------------------------
+
+// The program header table's mapped address, or 0 when it cannot be trusted.
+//
+// `AT_PHENT` is checked against the 56-byte `Elf64_Phdr` this runtime knows how
+// to read — the same assertion `root.zig`'s `initLinuxTls` makes, and for the
+// same reason: a different entry size means the running binary is not one our
+// linker produced, and this runtime's whole TLS contract assumes it is. A
+// mismatch REFUSES rather than striding the table by the wrong amount.
+function phdrTable(): int {
+  let base = getauxval(atPhdr)
+  let n = getauxval(atPhnum)
+  let ent = getauxval(atPhent)
+  if (base == 0 || n == 0 || ent != PHDR_SIZE) {
+    return 0
+  }
+  return base
+}
+
+// The offset between the image's link-time vaddrs and where it actually landed.
+//
+// Derived exactly as Zig's `computeAreaDesc` derives it: from `PT_PHDR`, whose
+// `p_vaddr` is the link-time address of the very table we already hold the real
+// address of, so the difference is the load bias. Our own linker emits no
+// `PT_PHDR` (`seed/link.zig` writes 2 `PT_LOAD` + `PT_GNU_STACK`, plus `PT_TLS`)
+// and lays the image out non-PIE at a fixed base, so this returns 0 for every
+// binary we produce. It is computed rather than assumed anyway: the assumption
+// would be invisible if the linker ever gained `PT_PHDR` or a PIE layout, and
+// getting it wrong would mean copying an initializer image from the wrong
+// address — silent, not loud.
+function imageBase(table: int, n: int): int {
+  let i = 0
+  while (i < n) {                        // bounded: AT_PHNUM entries
+    let ph = table + (i * PHDR_SIZE)
+    if (loadU32(ph) == PT_PHDR) {
+      return table - loadWord(ph + PH_VADDR)
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// This image's `PT_TLS` program header, or 0 when it declares none.
+//
+// No TLS is a perfectly ordinary answer, not a failure: a program with no
+// `@threadlocal` declaration has no `PT_TLS` segment, and its threads still get
+// a valid minimal thread pointer below. That is what Zig does too — `block_size`
+// 0 with `@alignOf(usize)` alignment.
+function tlsPhdr(table: int, n: int): int {
+  let i = 0
+  while (i < n) {                        // bounded: AT_PHNUM entries
+    let ph = table + (i * PHDR_SIZE)
+    if (loadU32(ph) == PT_TLS) {
+      return ph
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// ---- geometry ------------------------------------------------------------
+//
+// `p_memsz` and `p_align` for this image, as the two words a layout needs.
+// Split into two tiny walks rather than one returning a pair because the
+// unmanaged subset has no struct to return and the tables are a handful of
+// entries; correctness reads better than saving a loop that costs nothing.
+
+function tlsMemsz(): int {
+  let table = phdrTable()
+  if (table == 0) {
+    return 0
+  }
+  let ph = tlsPhdr(table, getauxval(atPhnum))
+  if (ph == 0) {
+    return 0
+  }
+  return loadWord(ph + PH_MEMSZ)
+}
+
+function tlsAlign(): int {
+  let table = phdrTable()
+  if (table == 0) {
+    return NO_TLS_ALIGN
+  }
+  let ph = tlsPhdr(table, getauxval(atPhnum))
+  if (ph == 0) {
+    return NO_TLS_ALIGN
+  }
+  let a = loadWord(ph + PH_ALIGN)
+  if (a < 1) {
+    return NO_TLS_ALIGN
+  }
+  return a
+}
+
+// The bytes `./spawn.bit` must reserve above the stack top for one thread's TLS
+// area, or `tlsUnavailable` when the geometry cannot be derived and no block may
+// be built.
+//
+// DETERMINISTIC, AND THAT IS LOAD-BEARING. `threadStart` adds this to its
+// mapping length and `threadRelease` adds it again to unmap the same extent; the
+// two never communicate. They agree because this is a pure function of the
+// running image, whose `PT_TLS` cannot change while the process lives — the same
+// invariant `reservationBytes` already relies on, just now derived rather than
+// constant. An `munmap` length that disagreed with the `mmap` length would unmap
+// the wrong extent.
+//
+// The `align` of slack is what lets `tlsPrepare` align the thread pointer inside
+// the area no matter where the page landed.
+export function tlsAreaBytes(): int {
+  if (phdrTable() == 0) {
+    return tlsUnavailable
+  }
+  let memsz = tlsMemsz()
+  if (memsz < 0 || memsz > maxTlsBytes()) {
+    return tlsUnavailable
+  }
+  let a = tlsAlign()
+  if (a > maxTlsBytes()) {
+    return tlsUnavailable
+  }
+  if (isX64()) {
+    // Variant II: the block sits below the thread pointer, and the ABI TCB's
+    // single self-referential word sits at it.
+    return alignUp(memsz, a) + 8 + a
+  }
+  // Variant I: a 16-byte ABI TCB at the thread pointer, the block above it.
+  return alignUp(16, a) + memsz + a
+}
+
+// Build a thread's TLS block inside `[areaBase, areaBase + tlsAreaBytes())` and
+// return the value to install as its thread pointer, or 0 if it cannot be built.
+//
+// The returned value is what `CLONE_SETTLS` takes: the kernel writes it to
+// `TPIDR_EL0` on aarch64 and to `FS_BASE` on x86-64, both of which are the
+// thread pointer the access sequences read. Zig passes the same thing —
+// `prepareArea` returns the TP and `LinuxThreadImpl` hands it straight to
+// `clone` as the tls argument.
+export function tlsPrepare(areaBase: int): int {
+  let table = phdrTable()
+  if (table == 0) {
+    return 0
+  }
+  let n = getauxval(atPhnum)
+  let ph = tlsPhdr(table, n)
+
+  let memsz = 0
+  let filesz = 0
+  let src = 0
+  let a = NO_TLS_ALIGN
+  if (ph != 0) {
+    memsz = loadWord(ph + PH_MEMSZ)
+    filesz = loadWord(ph + PH_FILESZ)
+    src = imageBase(table, n) + loadWord(ph + PH_VADDR)
+    let pa = loadWord(ph + PH_ALIGN)
+    if (pa >= 1) {
+      a = pa
+    }
+  }
+  // The same refusals `tlsAreaBytes` makes, repeated rather than assumed: this
+  // function must never write outside the area that call sized.
+  if (memsz < 0 || memsz > maxTlsBytes() || a > maxTlsBytes()) {
+    return 0
+  }
+  if (filesz < 0 || filesz > memsz) {
+    return 0
+  }
+
+  let dataStart = 0
+  let tp = 0
+  if (isX64()) {
+    // Variant II. The block is below the thread pointer, so the DATA start is
+    // what gets aligned and the thread pointer follows it.
+    dataStart = alignUp(areaBase, a)
+    tp = dataStart + alignUp(memsz, a)
+  } else {
+    // Variant I. The thread pointer is what gets aligned; the 16-byte ABI TCB
+    // sits at it and the block follows, past `alignUp(16, align)`.
+    tp = alignUp(areaBase, a)
+    dataStart = tp + alignUp(16, a)
+  }
+
+  // NOTHING IS ZEROED HERE, ON PURPOSE. Zig's `prepareArea` opens with
+  // `@memset(area, 0)` because its area may be a reused static buffer
+  // (`main_thread_area_buffer`); this one never is. The area is always a slice
+  // of the fresh anonymous mapping `./spawn.bit`'s `mapStack` just took, and
+  // Linux guarantees `MAP_ANONYMOUS` pages read as zero — that is the property
+  // the allocator's own spans already depend on. So the ABI TCB, the alignment
+  // padding, and the `.tbss` tail that has no file image are all zero before
+  // this function is entered.
+  //
+  // It is a real difference, not a micro-optimisation: this image's `p_memsz` is
+  // ~256KiB, so zeroing it byte-wise in Bit would add a quarter-million stores
+  // to EVERY thread spawn, on the exact path #1364's scheduler starts its
+  // workers from. The copy below is `p_filesz` bytes — 32 in this image.
+
+  // The initializer image: `p_filesz` bytes of `.tdata` from the mapped image.
+  // Byte-wise because a Bit slice is one 8-byte word per element and this is a
+  // packed region on both sides (§11.8) — a word copy here would be the exact
+  // trap ABI.md §9 warns about.
+  let j = 0
+  while (j < filesz) {                   // bounded: filesz <= memsz <= maxTlsBytes()
+    storeByte(dataStart + j, loadByte(src + j))
+    j = j + 1
+  }
+
+  if (isX64()) {
+    // Variant II's ABI TCB is one self-referential word, and it is REQUIRED, not
+    // cosmetic: the access sequence this compiler emits is `mov dst, fs:[0]`
+    // followed by an ADD of the link-time offset, so the thread pointer is read
+    // back out of the block's own first word. Leave it zero and every
+    // thread-local on this thread resolves against address 0.
+    storeWord(tp, tp)
+  }
+  // Variant I's 16-byte ABI TCB is a DTV pointer and one reserved word, both
+  // left zero on purpose: nothing in a static image reads them. Our codegen
+  // emits local-exec sequences only, which never consult a DTV, and
+  // `__tls_get_addr` — the one function that would — is never called because
+  // there is no dynamic loader.
+
+  return tp
+}

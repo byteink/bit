@@ -2803,6 +2803,7 @@ const FnCtx = struct {
         .{ "osRun", ir.RtFn.os_run },
         .{ "osRunTest", ir.RtFn.os_run_test },
         .{ "hostTarget", ir.RtFn.host_target },
+        .{ "auxv", ir.RtFn.auxv },
         .{ "floatBits", ir.RtFn.float_bits },
         .{ "float32Bits", ir.RtFn.float32_bits },
     });

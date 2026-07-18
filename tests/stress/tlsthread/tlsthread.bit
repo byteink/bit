@@ -1,0 +1,247 @@
+// `CLONE_SETTLS` against the real kernel (#1417): a spawned OS thread gets its
+// OWN TLS block, not a second name for its parent's.
+//
+// THIS TEST MEASURES CELL ADDRESSES, NOT CELL VALUES, AND THAT IS THE WHOLE
+// POINT. #1411 established the distinction the hard way: a `@threadlocal`
+// declaration whose per-thread storage has collapsed to ONE shared cell still
+// produces entirely plausible values. Each child here adds a DIFFERENT delta to
+// its own cell, so with one shared cell the reads would come back 8, 10, 13, 17
+// — four different numbers, every one of them "reasonable", and a test that
+// checked only values would pass. What cannot be faked is the ADDRESS: N threads
+// with N blocks report N distinct addresses, and N threads sharing one block
+// report the same address N times, whatever the values say. So the address is
+// the assertion and the values are corroboration.
+//
+// ../tlsstate is the sibling that proves the same declaration is correctly laid
+// out, initialized and addressed ON ONE THREAD. It says in its own header that
+// distinctness across OS threads could not live there as a regression guard,
+// because the shipped scheduler is pinned to a single worker (`root.zig`:
+// `Scheduler.init(1)`) and its evidence had to be gathered by temporarily
+// lifting that pin. This file is that gap closed, and it needs no pin lifted:
+// it creates the threads itself through `runtime/thread/linux`, which is
+// exactly the provider #1364 will use.
+//
+// LINUX ONLY, hence the sibling `linux-only` marker. `@threadlocal` is refused
+// for Mach-O altogether (§11.11), and the provider issues raw `syscall`s, which
+// the compiler rejects when targeting Darwin even for an uncalled declaration.
+//
+// WHAT THIS PROVES ABOUT `!`/`fail`/`?`, WHICH IT DOES NOT CALL. The runtime's
+// error slot is `root.zig`'s `threadlocal var pending_err`. That is an ordinary
+// ELF thread-local, so the linker folds it into the SAME `PT_TLS` image as the
+// `@threadlocal` below (`seed/link.zig` gathers `.tdata`/`.tbss` across every
+// module, `libbitrt.a`'s objects included) and it sits at a fixed offset inside
+// the very block whose distinctness is measured here. N distinct blocks are
+// therefore N distinct error slots, by construction rather than by coincidence.
+// It is not exercised directly because a child thread is still not a registered
+// runtime worker and so still MUST NOT ALLOCATE (../../../runtime/thread's rule
+// 1), while raising an error allocates the error object. That restriction is
+// the collector's, not TLS's, and it lifts for #1364's workers, which register.
+
+import { threadJoin, threadJoinDone } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+
+// Four threads. The property is "each block is its own", which four
+// demonstrates as convincingly as forty while keeping the resource use flat —
+// the same reasoning tests/stress/thread/props uses for its own NT.
+const NT: int = 4
+
+// Words per child in the shared argument region: its done word's address, where
+// to publish its cell ADDRESS, where to publish its cell VALUE, and its delta.
+const REGION_WORDS: int = 4
+
+// A child does microseconds of work; ten seconds of headroom covers the suite
+// running under load without ever approaching the failure. Bounded, so a thread
+// that never finishes makes this test FAIL rather than hang it.
+const JOIN_NS: int = 10000000000        // 10s
+
+// The initializer image every thread's block must receive a private copy of.
+// Nonzero on purpose: a block that was allocated but never initialized reads 0
+// here, which the value check below would catch as surely as a shared block.
+@threadlocal let cell: i64 = 7
+
+const SEED: int = 7
+
+@nosplit function i32At(addr: int): *i32 {
+  let z: *i32 = nil
+  return z + (addr / 4)
+}
+
+@nosplit function i64At(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + (addr / 8)
+}
+
+@nosplit function byteAt(addr: int): *byte {
+  let z: *byte = nil
+  return z + addr
+}
+
+// A BIT SLICE STORES ONE 8-BYTE WORD PER ELEMENT whatever its element type, so
+// element `i` begins at byte `8 * i` (§11.8).
+@nosplit function elemAddr(base: int, i: int): int {
+  return base + 8 * i
+}
+
+// The body every child runs.
+//
+// THIS BODY IS NOT `@nosplit`, AND THAT IS ONLY SAFE BECAUSE IT HAS NO LOOP —
+// the same argument, and the same wording, as tests/stress/threadlinux's
+// `wakeChild`. Codegen emits `bl bit_rt_safepoint` at loop back-edges and
+// nowhere else, so a loop-free body reaches no safepoint poll even without the
+// attribute, which matters because a child thread is not a registered runtime
+// worker and must never run the collector. Every callee below is `@nosplit` or
+// loop-free by inspection.
+//
+// The attribute is not merely unnecessary here, it is currently unavailable:
+// `ptrOf` is not itself marked `@nosplit`, so taking a cell's ADDRESS inside a
+// `@nosplit` body is rejected (E0075) even though the ELF access sequence it
+// compiles to is call-free arithmetic. ../tlsstate covers the `@nosplit`
+// reachability property with a body that reads and writes its cell without
+// taking its address, so nothing is lost by dropping the attribute here.
+//
+// It touches its cell TWICE — a read-modify-write, then a read for the address
+// — so a shared block would also show interleaved updates, not merely a shared
+// address.
+//
+// THE STORE ORDER IS THE CONTRACT: both results are published BEFORE the done
+// word is cleared, so a parent that observes done == 0 observes both.
+function tlsChild(arg: *byte): *byte {
+  let base = int(arg)
+  let done = i32At(int(*i64At(base)))
+  let outAddr = i64At(int(*i64At(elemAddr(base, 1))))
+  let outVal = i64At(int(*i64At(elemAddr(base, 2))))
+  let delta = int(*i64At(elemAddr(base, 3)))
+
+  cell = cell + i64(delta)
+
+  atomicStore(outAddr, i64(int(ptrOf(cell))))
+  atomicStore(outVal, cell)
+  atomicStore(done, i32(0))
+  return nil
+}
+
+// How many of `n` addresses in `all` are distinct, counting the main thread's.
+// O(n^2) over five entries, which is the clearest way to say "no two of these
+// are equal" and costs nothing at this size.
+function distinctCount(all: []i64, n: int): int {
+  let count = 0
+  let i = 0
+  while (i < n) {                        // bounded: n <= NT + 1
+    let seen = false
+    let j = 0
+    while (j < i) {                      // bounded: < i <= NT + 1
+      if (all[j] == all[i]) {
+        seen = true
+      }
+      j = j + 1
+    }
+    if (!seen) {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+function main() {
+  // Every atomic word the children touch lives in one of these slices, so one
+  // live local per slice keeps all of them reachable. Holding only raw
+  // addresses would not: a raw pointer is untraced (§11.4), so the collector
+  // could reclaim a word a running child still writes to.
+  let dones = []i32(NT)
+  let addrs = []i64(NT)
+  let vals = []i64(NT)
+  let regions = []i64(REGION_WORDS * NT)
+
+  let donesBase = int(ptrOf(dones))
+  let addrsBase = int(ptrOf(addrs))
+  let valsBase = int(ptrOf(vals))
+  let regionsBase = int(ptrOf(regions))
+
+  // Distinct deltas, so a shared cell would accumulate into values that are all
+  // different from each other AND all different from the per-thread answers —
+  // the failure mode a value-only test would wave through.
+  let t = 0
+  while (t < NT) {                       // bounded: NT iterations
+    dones[t] = i32(0)
+    addrs[t] = i64(0)
+    vals[t] = i64(0)
+    let r = REGION_WORDS * t
+    regions[r] = i64(elemAddr(donesBase, t))
+    regions[r + 1] = i64(elemAddr(addrsBase, t))
+    regions[r + 2] = i64(elemAddr(valsBase, t))
+    regions[r + 3] = i64(t + 1)
+    t = t + 1
+  }
+
+  // All started before any is joined, so they are genuinely concurrent rather
+  // than a sequence of one-at-a-time spawns — a provider that reused one block
+  // across sequential threads would otherwise be indistinguishable.
+  let handles = []int(NT)
+  let started = 0
+  let k = 0
+  while (k < NT) {                       // bounded: NT iterations
+    handles[k] = threadStart(entryOf(tlsChild),
+                             byteAt(elemAddr(regionsBase, REGION_WORDS * k)),
+                             i32At(elemAddr(donesBase, k)))
+    if (handles[k] != 0) {
+      started = started + 1
+    }
+    k = k + 1
+  }
+
+  let joined = 0
+  let released = 0
+  let j = 0
+  while (j < NT) {                       // bounded: NT iterations
+    if (handles[j] != 0) {
+      if (threadJoin(i32At(elemAddr(donesBase, j)), JOIN_NS,
+                     parkSleepNs, parkMonoNs) == threadJoinDone) {
+        joined = joined + 1
+        if (threadRelease(handles[j])) {
+          released = released + 1
+        }
+      }
+    }
+    j = j + 1
+  }
+
+  // ---- the assertion: N + 1 threads, N + 1 distinct cell addresses --------
+  //
+  // The main thread's own cell is included because sharing shows up between a
+  // child and its PARENT first: without `CLONE_SETTLS` a child inherits the
+  // parent's thread pointer exactly, so every child's address equals this one
+  // and the count collapses to 1.
+  let all = []i64(NT + 1)
+  all[0] = i64(int(ptrOf(cell)))
+  let m = 0
+  while (m < NT) {                       // bounded: NT iterations
+    all[m + 1] = addrs[m]
+    m = m + 1
+  }
+  let distinct = distinctCount(all, NT + 1)
+
+  // Corroboration, and an independent check that each block got its own COPY of
+  // the initializer image rather than a zeroed page: child `i` must read
+  // exactly SEED + (i + 1).
+  let initOk = 0
+  let v = 0
+  while (v < NT) {                       // bounded: NT iterations
+    if (int(vals[v]) == SEED + v + 1) {
+      initOk = initOk + 1
+    }
+    v = v + 1
+  }
+
+  // The main thread's own cell must be untouched by any child. This is the
+  // check that fails loudly if a child wrote through the parent's block.
+  let mainOk = 0
+  if (cell == i64(SEED)) {
+    mainOk = 1
+  }
+
+  let ok = started == NT && joined == NT && released == NT &&
+           distinct == NT + 1 && initOk == NT && mainOk == 1
+  print("${ok} ${distinct} ${initOk} ${mainOk}\n")
+}

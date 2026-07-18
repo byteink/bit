@@ -63,6 +63,14 @@ var g_argv: [*]const ?[*:0]const u8 = undefined;
 /// same line as `g_argv`, so it is live before any Bit code runs.
 var g_envp: [*:null]const ?[*:0]const u8 = undefined;
 
+/// This process's ELF auxiliary vector, captured by `rtStartMain` (Linux only —
+/// there is no auxv on Darwin, so it stays 0 there and `bit_rt_auxv` reports
+/// "none"). The kernel puts the table on the initial stack, past `envp`, so the
+/// process entry is the ONLY place it can be found; everything downstream has to
+/// be handed it. `shims.setTable` gets the same pointer for the Zig side, and
+/// `bit_rt_auxv` below hands it to the Bit side.
+var g_auxv: usize = 0;
+
 /// Compiled `main`'s normalized ABI shape (ABI.md §10): codegen wraps
 /// whichever of the three surface `main` signatures (SPEC.md §17.4) the
 /// program declares into this one form, returning the process exit code.
@@ -841,6 +849,19 @@ export fn bit_rt_os_run_test(path: *const RtBytes, idx: i64) callconv(.c) i64 {
 /// selfhost/main.bit's BuildTarget enum. This archive is compiled once per
 /// target, so `builtin.target` here IS the host: bit2 has no compile-time
 /// `builtin`, so its `hostTarget()` default reads this instead of hard-coding.
+/// `bit_rt_auxv()` (ABI.md §19): the address of this process's ELF auxiliary
+/// vector, or 0 when there is none — Darwin never sets it, and `initLinuxTls`
+/// is the only writer.
+///
+/// This is the Bit-side counterpart of `shims.setTable`: the auxv is initial-
+/// stack knowledge that only the process entry can recover, so a Bit module
+/// cannot find it for itself. It gets the POINTER from here and does the SCAN
+/// itself (`runtime/auxv`, which is the `getauxval` port). When #1367 ports this
+/// file, the capture moves to Bit and this accessor becomes module state.
+export fn bit_rt_auxv() callconv(.c) i64 {
+    return @bitCast(g_auxv);
+}
+
 export fn bit_rt_host_target() callconv(.c) i64 {
     return switch (builtin.target.os.tag) {
         .macos => 2,
@@ -1736,6 +1757,7 @@ fn rtStartMain(sp: usize) callconv(.c) noreturn {
 fn initLinuxTls(auxv_addr: usize) void {
     const auxv: [*]const std.elf.Auxv = @ptrFromInt(auxv_addr);
     shims.setTable(auxv);
+    g_auxv = auxv_addr;
 
     const at_phdr = shims.getauxval(std.elf.AT_PHDR);
     const at_phnum = shims.getauxval(std.elf.AT_PHNUM);

@@ -3187,6 +3187,9 @@ const Checker = struct {
         // `hostTarget() -> i64`: the host BuildTarget ordinal, for `bit build`'s
         // default target (selfhost/main.bit's hostBuildTarget reads it).
         .{ "hostTarget", PrimSig{ .params = &.{}, .ret = .i64 } },
+        // `auxv() -> i64`: this process's ELF auxiliary-vector address, 0 when
+        // there is none. `runtime/auxv`'s `getauxval` scans from it.
+        .{ "auxv", PrimSig{ .params = &.{}, .ret = .i64 } },
         .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
         .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
     });
