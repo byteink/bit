@@ -194,6 +194,12 @@ pub const Mutator = struct {
     /// Address of this thread's on-stack safepoint snapshot while `parked`,
     /// else 0. Opaque here; `root.zig` decodes it.
     frame: std.atomic.Value(usize) = .init(0),
+    /// The stop `epoch` this thread last parked *for*. `rendezvous` counts a
+    /// parked slot as stopped only when this equals the epoch it is collecting
+    /// for, which is what lets a thread tell "a stop that may already have
+    /// counted me" from "a stop that is still waiting for me". Epochs start at 1,
+    /// so the initial 0 acknowledges nothing.
+    acked: std.atomic.Value(u64) = .init(0),
 };
 
 /// Hard cap on concurrently registered mutator OS threads. Power-of-10: the
@@ -201,11 +207,28 @@ pub const Mutator = struct {
 /// path and every walk over it is statically bounded.
 pub const max_mutators = 256;
 
-/// Iterations the collector spins waiting for the world to stop, and a parked
-/// mutator spins waiting for it to restart. Tens of milliseconds on current
-/// hardware; the exact figure is deliberately not load-bearing, because
-/// expiry costs a skipped collection and nothing else.
-const stw_spin_bound: usize = 8_000_000;
+/// Iterations the collector spins waiting for the world to stop. Expiry costs a
+/// skipped collection and nothing else, so the exact figure is not load-bearing
+/// for correctness — but it IS load-bearing for throughput, and it CANNOT be one
+/// number across architectures.
+///
+/// `std.atomic.spinLoopHint` is `yield` on AArch64 and `pause` on x86-64, and
+/// those differ by about two orders of magnitude: `yield` is a couple of cycles,
+/// while `pause` on Skylake and later parks the pipeline for ~140. A single
+/// 8_000_000 bound is therefore ~5ms on arm64 and most of a SECOND on x86-64.
+///
+/// That is not theoretical. `tests/stress/gcthreads*` has a parent that sleeps
+/// inside its join without the `blocked` contract, so it reads as `running` and
+/// every collection its children attempt meanwhile runs the bound out in full.
+/// On a 6-core x86_64 box that made a program doing microseconds of arithmetic
+/// take 77 SECONDS and blow a 10s join deadline; with the bound below it is 2.5s.
+/// The same binary on arm64 was always about a second. Sized so the wait is tens
+/// of milliseconds on both, which is what the original comment claimed and only
+/// ever achieved on one of them.
+const stw_spin_bound: usize = switch (builtin.cpu.arch) {
+    .x86_64 => 200_000,
+    else => 8_000_000,
+};
 
 /// Iterations a *parked* mutator will wait for the stop to clear before
 /// declaring the runtime broken.
@@ -228,6 +251,10 @@ pub const World = struct {
     lock: SpinLock = .{},
     /// True from "stop requested" until the collection is over.
     stop: std.atomic.Value(bool) = .init(false),
+    /// Incremented by each `rendezvous`. Distinguishes successive stops so a
+    /// resuming thread can tell whether the pending one already counted it.
+    /// Only ever bumped under `lock`, so collectors cannot race each other.
+    epoch: std.atomic.Value(u64) = .init(0),
 
     /// Claim a slot for the calling thread, or null if all `max_mutators` are
     /// taken. Starts in `running`: a thread is assumed to be executing Bit code
@@ -251,7 +278,7 @@ pub const World = struct {
     }
 
     pub fn stopRequested(self: *World) bool {
-        return self.stop.load(.acquire);
+        return self.stop.load(.seq_cst);
     }
 
     /// Yield to an in-progress collection: publish `frame` (this thread's
@@ -260,19 +287,87 @@ pub const World = struct {
     /// pending, which is what makes it safe to call speculatively.
     pub fn park(self: *World, m: *Mutator, frame: usize) void {
         m.frame.store(frame, .release);
-        m.state.store(@intFromEnum(MutatorState.parked), .release);
-        self.awaitRestart();
-        m.state.store(@intFromEnum(MutatorState.running), .release);
+        self.resumeWhenClear(m, MutatorState.parked);
         m.frame.store(0, .release);
     }
 
-    /// Wait for the current stop to clear. Shared by `park` and `endBlocking`
-    /// so there is one copy of the "never resume while stopped" rule.
-    fn awaitRestart(self: *World) void {
-        var spins: usize = 0;
-        while (self.stop.load(.acquire)) : (spins += 1) {
-            if (spins >= stw_park_bound) @panic("gc: stop-the-world never cleared");
-            std.atomic.spinLoopHint();
+    /// Whether this thread must stay in `waiting` rather than run Bit code.
+    ///
+    /// A `blocked` thread is passed by `rendezvous` *without* acknowledging
+    /// anything, so any pending stop may already have counted it: it must stay
+    /// put until the stop clears outright.
+    ///
+    /// A `parked` thread may resume as soon as the pending stop is one it has
+    /// **not** acknowledged. That stop's `rendezvous` is still waiting for this
+    /// slot, so nothing has marked behind it, and it will park properly at its
+    /// next safepoint. WITHOUT THIS TEST THE THREAD STARVES: under `BIT_GC=stress`
+    /// the other thread collects at every safepoint, so a rule of "re-park
+    /// whenever any stop is pending" never lets this one run again — measured, it
+    /// turned the reproducer into a hang.
+    fn mustStayPut(self: *World, m: *Mutator, waiting: MutatorState) bool {
+        if (!self.stop.load(.seq_cst)) return false;
+        if (waiting == .blocked) return true;
+        return m.acked.load(.seq_cst) == self.epoch.load(.seq_cst);
+    }
+
+    /// Sit in `waiting_state` until this thread may run Bit code again.
+    ///
+    /// THE NAIVE VERSION ("wait for `stop` to clear, then store `running`") IS
+    /// UNSOUND, and it is the second half of #1431. A thread that saw
+    /// `stop == false` and was about to leave was still publishing
+    /// `parked`/`blocked`, so the *next* collector's `rendezvous` read it as
+    /// already stopped, passed it, and started marking — while this thread
+    /// resumed and mutated behind it. `park` then cleared `frame`, so that
+    /// collector scanned nothing for a thread holding live references and swept
+    /// them. Measured, not theorised: `tests/stress/gcthreads*` died on a
+    /// first-class function value recycled out from under `threadJoin`, jumping
+    /// to a null code address.
+    ///
+    /// WHICH MECHANISM CLOSES IT DEPENDS ON THE STATE, and mutation testing says
+    /// so rather than intuition:
+    ///
+    ///   - `parked` is closed by the **epoch**, in `stoppedFor`. A resuming
+    ///     thread's ack necessarily names an older stop, so the next collector
+    ///     waits for it instead of passing it. Deleting the epoch fails
+    ///     `gcthreadsdarwin` 30/30. The re-check below is consequently DEAD for
+    ///     `parked` — on leaving the wait, either `stop` is clear or the epoch has
+    ///     already moved — and deleting it alone changes nothing (0/30). It is
+    ///     kept because it is what makes the `blocked` case correct, and one loop
+    ///     is simpler than two functions.
+    ///
+    ///   - `blocked` has no ack — `rendezvous` passes it unconditionally, which
+    ///     is the whole point of the contract — so the re-check IS load-bearing
+    ///     there: publish `running`, re-read `stop`, and go back if one is
+    ///     pending. `runtime/sched.zig` brackets its idle wait with it, so this
+    ///     path is live, but `gcthreads*` does not exercise it; it is reasoned,
+    ///     not measured, and that distinction is deliberate here.
+    ///
+    /// **BOTH ACCESSES ARE `seq_cst`, AND SO ARE THEIR PARTNERS IN `rendezvous`.**
+    /// This is Dekker's pattern: each side stores its own flag then loads the
+    /// other's. Store-load is exactly the reordering acquire/release permits, and
+    /// on both arm64 and x86-64 it is the one the hardware actually performs — so
+    /// with weaker orderings the mutator can read a stale `stop == false` while
+    /// the collector reads a stale `parked`, and both proceed. Sequential
+    /// consistency on these accesses is what makes that interleaving impossible;
+    /// it costs one fence on a path that already spins.
+    fn resumeWhenClear(self: *World, m: *Mutator, waiting_state: MutatorState) void {
+        while (true) {
+            // Acknowledge the stop we are parking FOR, before publishing the
+            // state that lets `rendezvous` count us. Ordering matters: a
+            // collector that reads `parked` must also read our ack.
+            if (waiting_state == .parked) m.acked.store(self.epoch.load(.seq_cst), .seq_cst);
+            m.state.store(@intFromEnum(waiting_state), .seq_cst);
+
+            var spins: usize = 0;
+            while (self.mustStayPut(m, waiting_state)) : (spins += 1) {
+                if (spins >= stw_park_bound) @panic("gc: stop-the-world never cleared");
+                std.atomic.spinLoopHint();
+            }
+
+            m.state.store(@intFromEnum(MutatorState.running), .seq_cst);
+            if (!self.mustStayPut(m, waiting_state)) return;
+            // A stop that may already have counted us landed in the gap. Nothing
+            // above touches the heap, so going back is always safe.
         }
     }
 
@@ -287,8 +382,7 @@ pub const World = struct {
     /// mid-collection would put a running mutator behind the collector's back,
     /// and staying blocked longer is free because nothing waits on it.
     pub fn endBlocking(self: *World, m: *Mutator) void {
-        self.awaitRestart();
-        m.state.store(@intFromEnum(MutatorState.running), .release);
+        self.resumeWhenClear(m, MutatorState.blocked);
     }
 
     /// Request a stop and wait until a **whole pass** over the registry finds no
@@ -303,13 +397,15 @@ pub const World = struct {
     /// registration order irrelevant. `claim` parks a new mutator immediately
     /// when a stop is pending, so this converges instead of chasing arrivals.
     pub fn rendezvous(self: *World, self_m: *Mutator) bool {
-        self.stop.store(true, .release);
+        // seq_cst, paired with `resumeWhenClear` — see the ordering argument there.
+        const e = self.epoch.fetchAdd(1, .seq_cst) + 1;
+        self.stop.store(true, .seq_cst);
         var spins: usize = 0;
         while (spins < stw_spin_bound) : (spins += 1) {
             var still_running = false;
             for (&self.slots) |*m| {
                 if (m == self_m) continue;
-                if (m.state.load(.acquire) == @intFromEnum(MutatorState.running)) {
+                if (!stoppedFor(m, e)) {
                     still_running = true;
                     break;
                 }
@@ -320,9 +416,26 @@ pub const World = struct {
         return false;
     }
 
+    /// Whether slot `m` counts as stopped for the collection at epoch `e`.
+    ///
+    /// A `parked` slot counts only once it has acknowledged **this** epoch. A
+    /// slot parked for an earlier stop is one that is on its way out (see
+    /// `mustStayPut`), so treating it as stopped would be the very race this
+    /// pair exists to close.
+    fn stoppedFor(m: *Mutator, e: u64) bool {
+        return switch (m.state.load(.seq_cst)) {
+            @intFromEnum(MutatorState.free) => true,
+            // Holds no live Bit references by contract (ABI.md §5): neither
+            // waited for nor scanned, so no acknowledgement is required.
+            @intFromEnum(MutatorState.blocked) => true,
+            @intFromEnum(MutatorState.parked) => m.acked.load(.seq_cst) == e,
+            else => false,
+        };
+    }
+
     /// Let every parked mutator go.
     pub fn restart(self: *World) void {
-        self.stop.store(false, .release);
+        self.stop.store(false, .seq_cst);
     }
 
     /// Visit the published snapshot of every `parked` mutator except `self_m`.

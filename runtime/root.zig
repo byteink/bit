@@ -155,32 +155,62 @@ threadlocal var g_mutator: ?*gc_mod.Mutator = null;
 
 /// This thread's mutator slot, claiming one on first use.
 ///
-/// CALLED FROM BOTH DOORS INTO THE COLLECTOR — the safepoint poll *and*
-/// `bit_rt_gc_alloc` — and the allocation door is the one that matters. A thread
-/// registering only at its first safepoint is invisible for the whole window
-/// between starting and reaching a loop back edge, and it can allocate in that
-/// window: `let keep = []i64(16)` before the first loop is exactly that shape.
-/// Another thread collecting there would find no snapshot for this one and sweep
-/// a live object out from under it. Measured, not theorised — it is what made
-/// `tests/stress/gcthreads*` panic with `index out of range`.
+/// CALLED FROM EVERY DOOR INTO THE COLLECTOR — the safepoint poll and all eight
+/// allocation sites, via `gcAlloc`/`gcAllocRaw`. The allocation door is the one
+/// that matters: a thread registering only at its first safepoint is invisible
+/// for the whole window between starting and reaching a loop back edge, and it
+/// can allocate in that window — `let keep = []i64(16)` before the first loop is
+/// exactly that shape. Another thread collecting there finds no snapshot for
+/// this one and sweeps a live object out from under it. Measured, not theorised:
+/// it is what made `tests/stress/gcthreads*` panic with `index out of range`.
 ///
 /// A thread that claims a slot while a stop is already pending parks at once
-/// rather than running on into the mark phase. It publishes no frame because it
-/// has none: registration happens at this thread's first *touch* of the
-/// collector, before which it can hold nothing the collector allocated.
-fn currentMutator() ?*gc_mod.Mutator {
+/// rather than running on into the mark phase. `frame` is the snapshot to
+/// publish while parked, or 0 when the caller has none — which is the honest
+/// value for the allocation door, whose caller is runtime Zig code with no stack
+/// map. THE SAFEPOINT DOOR MUST PASS ITS REAL SNAPSHOT: a thread whose first
+/// touch of the collector is a poll already holds live references named by that
+/// poll's stack map, and parking it with 0 would hide exactly those.
+fn currentMutator(frame: usize) ?*gc_mod.Mutator {
     if (g_mutator) |m| return m;
     const m = g_world.claim() orelse return null;
     g_mutator = m;
-    if (g_world.stopRequested()) g_world.park(m, 0);
+    if (g_world.stopRequested()) g_world.park(m, frame);
     return m;
+}
+
+/// THE ONLY TWO WAYS THIS FILE MAY REACH THE COLLECTOR'S ALLOCATOR.
+///
+/// Registration is a precondition of allocating, not a courtesy: an
+/// *unregistered* thread is one `World.rendezvous` does not wait for and
+/// `forEachParkedFrame` cannot scan, so a collection that runs while it
+/// allocates sweeps its live objects out from under it — silent heap
+/// corruption, not a crash. `bit_rt_gc_alloc` used to be the only site that
+/// registered, and it is only one of eight allocation sites: strings, slice
+/// headers, slice buffers, slice growth, map control blocks, map headers and
+/// select-case buffers all reached `g_gc` directly. `let keep = []i64(16)` on a
+/// fresh OS thread therefore allocated before that thread existed as far as the
+/// collector was concerned, which is exactly what made `tests/stress/gcthreads*`
+/// panic with `index out of range` (#1431).
+///
+/// Routing every site through one pair of wrappers is what makes the invariant
+/// checkable by grep — `g_gc.alloc`/`g_gc.allocRaw` must appear nowhere else in
+/// this file — rather than something each new allocation site has to remember.
+fn gcAlloc(info: *const gc_mod.TypeInfo) [*]u8 {
+    _ = currentMutator(0);
+    return g_gc.alloc(info) orelse fatal("out of memory");
+}
+
+fn gcAllocRaw(size: usize, info: *const gc_mod.TypeInfo) [*]u8 {
+    _ = currentMutator(0);
+    return g_gc.allocRaw(size, info) orelse fatal("out of memory");
 }
 
 /// `bit_rt_gc_thread_enter` (ABI.md §5/§6): register the calling OS thread as a
 /// mutator. Idempotent. Callers that create threads should call it explicitly so
 /// registration is not left to whichever safepoint happens to fire first.
 export fn bit_rt_gc_thread_enter() callconv(.c) void {
-    _ = currentMutator();
+    _ = currentMutator(0);
 }
 
 /// `bit_rt_gc_thread_exit` (ABI.md §5/§6): release this thread's slot. **Not
@@ -197,7 +227,7 @@ export fn bit_rt_gc_thread_exit() callconv(.c) void {
 /// The collector neither waits for nor scans a blocked thread, so a reference
 /// held across this is invisible and will be swept.
 export fn bit_rt_gc_blocking_begin() callconv(.c) void {
-    const m = currentMutator() orelse return;
+    const m = currentMutator(0) orelse return;
     g_world.beginBlocking(m);
 }
 
@@ -494,13 +524,8 @@ export fn bit_rt_get_err() callconv(.c) ?*anyopaque {
 /// defines no fallible object-construction form), so exhaustion is fatal here
 /// rather than a null codegen would have to check at every allocation site.
 export fn bit_rt_gc_alloc(info: *const gc_mod.TypeInfo) callconv(.c) [*]u8 {
-    // Register before allocating, never after (ABI.md §5). This is the earlier
-    // of the two doors into the collector — a thread can allocate long before it
-    // reaches its first loop back edge, and an unregistered allocator is one the
-    // stop-the-world rendezvous does not wait for. In the common case this is a
-    // single thread-local load.
-    _ = currentMutator();
-    return g_gc.alloc(info) orelse fatal("out of memory");
+    // Registers before allocating, via `gcAlloc` — see the invariant there.
+    return gcAlloc(info);
 }
 
 /// `bit_rt_iface_lookup` (ABI.md §2.1): resolve an interface method call to a
@@ -595,7 +620,7 @@ export fn bit_rt_iface_assert(recv: ?*anyopaque, want: usize) callconv(.c) ?*any
 /// deadlock-freedom argument: a thread the collector is waiting for is never
 /// itself waiting for the collector.
 noinline fn safepointImpl(snap: *const SafepointFrame) callconv(.c) void {
-    const m = currentMutator();
+    const m = currentMutator(@intFromPtr(snap));
 
     if (g_world.stopRequested()) {
         if (m) |mm| g_world.park(mm, @intFromPtr(snap));
@@ -726,7 +751,7 @@ const string_hdr_size = @sizeOf(RtBytes); // {ptr, len} = 16 bytes
 /// Allocates a `len`-byte string body; returns the header and a writable view
 /// of its bytes for the caller to fill. OOM is fatal (no fallible string form).
 fn allocString(len: usize) struct { hdr: *RtBytes, bytes: []u8 } {
-    const body = g_gc.allocRaw(string_hdr_size + len, &string_info) orelse fatal("out of memory");
+    const body = gcAllocRaw(string_hdr_size + len, &string_info);
     const hdr: *RtBytes = @ptrCast(@alignCast(body));
     const bytes = (body + string_hdr_size)[0..len];
     hdr.* = .{ .ptr = bytes.ptr, .len = len };
@@ -1417,7 +1442,7 @@ const slicebuf_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "slicebuf"); // leaf (n
 /// reject it).
 fn allocSliceBuf(cap: usize, is_ref: bool) [*]u64 {
     const info = if (is_ref) &gc_mod.ref_array_info else &slicebuf_info;
-    const body = g_gc.allocRaw(cap * @sizeOf(u64), info) orelse fatal("out of memory");
+    const body = gcAllocRaw(cap * @sizeOf(u64), info);
     return @ptrCast(@alignCast(body));
 }
 
@@ -1425,7 +1450,7 @@ fn allocSliceBuf(cap: usize, is_ref: bool) [*]u64 {
 /// elements zeroed. Backs slice literals (`len == cap == N`) and `[]T(n[, m])`.
 export fn bit_rt_slice_new(len: usize, cap: usize, is_ref: usize) callconv(.c) *SliceHeader {
     const c = if (cap < len) len else cap;
-    const h: *SliceHeader = @ptrCast(@alignCast(g_gc.alloc(&slice_info) orelse fatal("out of memory")));
+    const h: *SliceHeader = @ptrCast(@alignCast(gcAlloc(&slice_info)));
     h.* = .{ .buf = allocSliceBuf(c, is_ref != 0), .len = len, .off = 0, .cap = c, .is_ref = is_ref };
     return h;
 }
@@ -1467,7 +1492,7 @@ export fn bit_rt_slice_set(h: *SliceHeader, index: usize, word: u64) callconv(.c
 /// (`cap - lo`, Go semantics). Panics unless `0 <= lo <= hi <= cap`.
 export fn bit_rt_slice_slice(h: *const SliceHeader, lo: usize, hi: usize) callconv(.c) *SliceHeader {
     if (!(lo <= hi and hi <= h.cap)) fatal("slice bounds out of range");
-    const nh: *SliceHeader = @ptrCast(@alignCast(g_gc.alloc(&slice_info) orelse fatal("out of memory")));
+    const nh: *SliceHeader = @ptrCast(@alignCast(gcAlloc(&slice_info)));
     nh.* = .{ .buf = h.buf, .len = hi - lo, .off = h.off + lo, .cap = h.cap - lo, .is_ref = h.is_ref };
     return nh;
 }
@@ -1506,7 +1531,7 @@ const map_info = gc_mod.TypeInfo.of(@sizeOf(MapHeader), &[_]usize{ 0, 8, 16 }, "
 const mapctrl_info = gc_mod.TypeInfo.of(0, &[_]usize{}, "mapctrl"); // leaf
 
 fn allocCtrl(cap: usize) [*]u8 {
-    const body = g_gc.allocRaw(cap, &mapctrl_info) orelse fatal("out of memory");
+    const body = gcAllocRaw(cap, &mapctrl_info);
     return @ptrCast(body); // zeroed by allocRaw => every slot CtrlEmpty
 }
 
@@ -1581,7 +1606,7 @@ fn mapGrow(m: *MapHeader) void {
 /// by K/V at the call site and decide hashing/equality and GC tracing.
 export fn bit_rt_map_new(key_is_string: usize, val_is_ref: usize) callconv(.c) *MapHeader {
     const cap: usize = 8;
-    const m: *MapHeader = @ptrCast(@alignCast(g_gc.alloc(&map_info) orelse fatal("out of memory")));
+    const m: *MapHeader = @ptrCast(@alignCast(gcAlloc(&map_info)));
     m.* = .{
         .keys = allocSliceBuf(cap, key_is_string != 0),
         .vals = allocSliceBuf(cap, val_is_ref != 0),
@@ -1755,7 +1780,7 @@ const SelectCaseDesc = extern struct {
 /// `chan` handle is a process-lifetime page allocation, so `markRoot` skips all
 /// three (none is a live object base); only a real `word` reference is marked.
 export fn bit_rt_select_alloc(n: usize) callconv(.c) [*]SelectCaseDesc {
-    const body = g_gc.allocRaw(n * @sizeOf(SelectCaseDesc), &gc_mod.ref_array_info) orelse fatal("out of memory");
+    const body = gcAllocRaw(n * @sizeOf(SelectCaseDesc), &gc_mod.ref_array_info);
     return @ptrCast(@alignCast(body));
 }
 

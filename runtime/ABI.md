@@ -312,6 +312,33 @@ parked    stopped at a safepoint, its snapshot published for the collector
 blocked   inside a call that holds NO live Bit references (see below)
 ```
 
+**REGISTRATION IS ALSO LAZY, AND THAT IS A GUARANTEE, NOT A FALLBACK.** A thread
+claims its slot on its **first touch of the collector by either door** — any
+allocation, or its first safepoint poll — so a thread that never calls
+`bit_rt_gc_thread_enter` is still never invisible. Calling it explicitly is still
+correct and still preferred (it keeps registration off the first allocation's
+path), but soundness does not depend on it.
+
+The allocation door is the one that matters, and it means *every* allocation
+entry point, not just `bit_rt_gc_alloc`: strings, slice headers, slice buffers,
+slice growth, map control blocks, map headers and select-case buffers all
+allocate, and a thread can reach any of them long before its first loop back
+edge. A runtime that registers at only some of them has threads that allocate
+while the rendezvous does not wait for them and the root scan cannot see them —
+their live objects are swept underneath them. (`root.zig` funnels all of these
+through two wrappers so the invariant is checkable by grep; #1431 is what
+happens when it is not.)
+
+**A parked slot counts as stopped only for the stop it acknowledged.** Each stop
+carries a monotonically increasing **epoch**, and a mutator records the epoch it
+parked *for*. `rendezvous` treats a `parked` slot as stopped only when its
+acknowledgement matches the epoch being collected for. Without this, a thread on
+its way out of a *previous* stop still reads as `parked`, so the next collector
+passes it and begins marking while it resumes and mutates — with its snapshot
+already cleared, so nothing is scanned for it. `blocked` slots are passed without
+acknowledging, which is exactly what the `blocked` contract below buys, so a
+thread leaving `blocked` must instead re-check the stop flag before it runs.
+
 At a safepoint poll each mutator does exactly one of:
 
 1. **A stop is already requested** — publish the snapshot, go `parked`, and wait
