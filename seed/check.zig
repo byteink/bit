@@ -5343,8 +5343,29 @@ const Checker = struct {
                     // atomics carve-out exists to avoid — the scheduler's
                     // `initialContext` is nosplit-by-nature and needs exactly
                     // this address to build a task's saved register state.
+                    //
+                    // `ptrOf` (§11.5) qualifies on the same proof, and the proof
+                    // covers BOTH of its forms — neither emits a call:
+                    //   - on module state (§11.11) it is `global_addr` plus a
+                    //     retype, a link-time constant address, exactly the
+                    //     shape `entryOf` is admitted for;
+                    //   - on a slice it is two `field_get`s and an add — field
+                    //     access on a value in hand plus arithmetic, both
+                    //     already on this allowlist in their own right.
+                    // The atomics are unusable inside `@nosplit` without it:
+                    // they take a `*T` and `ptrOf` is the only bridge to one,
+                    // so admitting the atomics while refusing `ptrOf` carved
+                    // out an operation that could never be reached. That is the
+                    // contradiction §11.11 names when it requires the allocator
+                    // lock word and the run queue to be addressable from here.
+                    // Widening stops at the address: the ARGUMENT is still
+                    // walked below, so `ptrOf` over an allocating expression
+                    // (a slice literal, say) stays E0075 — the same operand
+                    // discipline the `asm` carve-out keeps.
                     if (sym.kind == .builtin_func)
-                        break :blk atomicArity(sym.name) != null or std.mem.eql(u8, sym.name, "entryOf");
+                        break :blk atomicArity(sym.name) != null or
+                            std.mem.eql(u8, sym.name, "entryOf") or
+                            std.mem.eql(u8, sym.name, "ptrOf");
                     // A call whose callee names a builtin TYPE is a conversion
                     // (§12.9), not a call. A conversion between NUMERIC prims —
                     // including `int(p)`, a raw pointer's address (§11.4) — is

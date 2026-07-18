@@ -482,13 +482,27 @@ allocator and collector call it safely. A `@nosplit` body is restricted to
 provably non-allocating forms — arithmetic and comparison, name and literal
 reads, field access on a value in hand, `if`/`while`/`for`, assignment,
 `break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
-to the **atomic builtins** (§11.5), and **conversions between numeric prims**
-(§12.9), all of which lower to inline machine instructions rather than a call
+to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5) and **`entryOf`**
+(§11.10), and **conversions between numeric prims** (§12.9), all of which lower
+to inline machine instructions rather than a call
 and so can neither allocate nor reach a safepoint. A numeric conversion covers
 the integer and float prims and their aliases (`int`, `uint`, `byte`, `rune`),
 and includes `int(p)` — a raw pointer's address (§11.4), the one bridge the
 unmanaged subset has from a pointer back to an integer. A declared function
 shadows a builtin of the same name here as everywhere else.
+
+`ptrOf` is admitted in **both** its forms, on proof rather than assertion.
+On module state (§11.11) it is a link-time constant address materialized
+inline — the same shape as `entryOf`. On a slice it is two field reads and an
+add, and field access on a value in hand plus arithmetic are already admitted
+above in their own right. The atomics would otherwise be unreachable here:
+they take a `*T`, and `ptrOf` is the only bridge to one (Bit has no `&`), so
+admitting the atomics while refusing `ptrOf` would carve out an operation that
+could never be called. Admission covers the address computation only — the
+**argument expression is still checked** against this allowlist, exactly as an
+`asm` operand is, so `ptrOf` applied to an allocating expression such as a
+slice literal remains E0075.
+
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
 slice and map construction, indexing, `append`, `spawn`, closures, channel
 operations, string interpolation, every other builtin, and any call through a
@@ -1101,6 +1115,17 @@ these are the rules that make it sound:
    initializer at all.
 3. **The binding is a single name.** Destructuring has no meaning for a
    statically laid out cell.
+
+Every module-level cell is **16-byte aligned**, whatever its type. This is a
+guarantee, not an artifact of layout: rule 1 admits a fixed array `[N]U` so the
+runtime can carve its own memory out of one, and a green-thread stack is exactly
+that use. Both supported ABIs require a 16-byte-aligned stack pointer — AAPCS64
+faults on a misaligned `sp`, SysV x86-64 requires it at call boundaries — so
+aligning to the element type instead would place an array at `addr % 16 == 8`
+for some declaration orders and not others, making the fault depend on the order
+of unrelated declarations. That is the silent, order-dependent hazard rule 1
+exists to rule out, so the alignment is uniform rather than natural. The cost is
+at most 8 bytes of padding per cell.
 
 Rule 1 is what makes not scanning correct rather than merely cheap. The obvious
 alternative — trace module state as a GC root — is *actively wrong* for the first

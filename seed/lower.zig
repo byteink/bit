@@ -86,6 +86,23 @@ const check = @import("check.zig");
 const resolve = @import("resolve.zig");
 const ir = @import("ir.zig");
 
+/// Alignment of every module-level cell (§11.11).
+///
+/// 16, not the type's natural alignment, and the reason is the storage class's
+/// stated purpose. §11.11 admits a fixed array `[N]U` precisely so the runtime
+/// can carve its own memory out of one — and a green-thread stack is that use.
+/// Both supported ABIs require a 16-byte-aligned stack pointer (AAPCS64 faults
+/// on a misaligned `sp`; SysV x86-64 requires it at call boundaries), so an
+/// 8-aligned array lands at `addr % 16 == 8` half the time and the fault
+/// appears only for some declaration orders — a silent, order-dependent hazard
+/// of exactly the kind §11.11's rule 1 exists to rule out.
+///
+/// A uniform 16 is what makes the guarantee statable and testable rather than
+/// conditional on a cell's type or its neighbours. The cost is at most 8 bytes
+/// of padding per cell in `.data`/`.bss`, which is nothing against the class of
+/// fault it removes: module state is a handful of cells by construction.
+const module_state_align: u32 = 16;
+
 const Allocator = std.mem.Allocator;
 const TypeId = check.TypeId;
 const TypeContext = check.TypeContext;
@@ -431,7 +448,7 @@ pub const Lowerer = struct {
                         const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = sid };
                         const name = try std.fmt.allocPrint(gpa, "__bitg_{d}_{s}", .{ mi, identTextOf(mf, pat) });
                         const bytes = try globalImage(gpa, self.ctx, ty, init);
-                        const id = try self.out.addGlobal(name, bytes, 8, storage);
+                        const id = try self.out.addGlobal(name, bytes, module_state_align, storage);
                         try self.global_ids.put(gpa, gsym.pack(), id);
                     }
                 }
