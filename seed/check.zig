@@ -5134,6 +5134,23 @@ const Checker = struct {
                 const is_nosplit = if (self.nodeSymbol(file_idx, ck[0])) |gsym| blk: {
                     const sym = self.symbolOf(gsym);
                     if (sym.kind == .builtin_func) break :blk atomicArity(sym.name) != null;
+                    // A call whose callee names a builtin TYPE is a conversion
+                    // (§12.9), not a call. A conversion between NUMERIC prims —
+                    // including `int(p)`, a raw pointer's address (§11.4) — is
+                    // pure register work: a sign/zero-extend, a truncation, an
+                    // int<->float move, or nothing at all. It allocates nothing
+                    // and reaches no safepoint, so it is safe here for exactly
+                    // the reason the atomics above are. `string(x)` is NOT: it
+                    // copies into a fresh managed object, so it stays rejected,
+                    // as do the slice/map/chan constructors (whose callee is not
+                    // an `.ident` and never reaches this point).
+                    if (sym.kind == .builtin_type) {
+                        const tid = builtinTypeId(self.ctx, sym.name) orelse break :blk false;
+                        break :blk switch (self.ctx.typeOf(tid)) {
+                            .prim => |p| p.isNumeric(),
+                            else => false,
+                        };
+                    }
                     break :blk (self.ctx.func_attrs.get(gsym.pack()) orelse FuncAttrs{}).nosplit;
                 } else false;
                 if (!is_nosplit) {

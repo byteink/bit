@@ -481,14 +481,20 @@ collector can never run inside it. This is what lets code that *implements* the
 allocator and collector call it safely. A `@nosplit` body is restricted to
 provably non-allocating forms — arithmetic and comparison, name and literal
 reads, field access on a value in hand, `if`/`while`/`for`, assignment,
-`break`/`continue`, and `return` — plus calls to other `@nosplit` functions and
-to the **atomic builtins** (§11.5), which lower to inline machine instructions
-rather than a call and so can neither allocate nor reach a safepoint. A declared
-function shadows a builtin of the same name here as everywhere else.
+`break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
+to the **atomic builtins** (§11.5), and **conversions between numeric prims**
+(§12.9), all of which lower to inline machine instructions rather than a call
+and so can neither allocate nor reach a safepoint. A numeric conversion covers
+the integer and float prims and their aliases (`int`, `uint`, `byte`, `rune`),
+and includes `int(p)` — a raw pointer's address (§11.4), the one bridge the
+unmanaged subset has from a pointer back to an integer. A declared function
+shadows a builtin of the same name here as everywhere else.
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
 slice and map construction, indexing, `append`, `spawn`, closures, channel
 operations, string interpolation, every other builtin, and any call through a
-value or interface (whose target is not knowable statically).
+value or interface (whose target is not knowable statically). `string(x)` is
+**not** admitted by the conversion rule: it copies into a fresh managed object,
+so it allocates.
 
 An **`asm` block (§11.6) is permitted**, and is the one construct here admitted
 on assertion rather than on proof. Everything else on the allowlist is *proved*
