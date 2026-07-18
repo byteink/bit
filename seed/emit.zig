@@ -19,7 +19,7 @@ const common = @import("codegen/common.zig");
 const obj_elf = @import("obj/elf.zig");
 const obj_macho = @import("obj/macho.zig");
 
-pub const Error = error{ NoMain, FreestandingAlloc, FreestandingSafepoint } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
+pub const Error = error{ NoMain, FreestandingAlloc, FreestandingSafepoint, FreestandingUnpinned } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
 
 /// §17.6: may this function go into a freestanding object? A freestanding
 /// object carries no `bit_stack_maps`, so the collector could not scan the
@@ -61,6 +61,81 @@ fn emitsFunction(f: *const ir.Function, freestanding: bool) bool {
 /// function whose real problem is that it allocates.
 fn refuseManagedMetadata(a: Allocator, module: *const ir.Module) Error!void {
     if ((try collectTypeInfos(a, module, true)).len > 0) return error.FreestandingAlloc;
+}
+
+/// True if `name` is a §11.9 pinned symbol rather than a compiler-mangled one.
+///
+/// Exact, not a heuristic, because the two spellings are disjoint by
+/// construction: every name lowering synthesizes for a non-root function
+/// carries a `$` — an imported module's functions are qualified `m<id>$f`,
+/// generic instantiations and methods append `$<n>`/`$t<n>`, and closures and
+/// trampolines are `closure$<n>`-shaped — while E0079 restricts a pin to a C
+/// identifier, which cannot contain `$`. Asserted by the unit test below so a
+/// future mangling scheme that dropped the `$` would fail loudly here.
+fn isPinnedName(name: []const u8) bool {
+    return std.mem.indexOfScalar(u8, name, '$') == null;
+}
+
+/// True if this freestanding object defines `name` itself, so a reference to it
+/// resolves inside the object and never reaches the linker.
+fn definesName(module: *const ir.Module, name: []const u8) bool {
+    for (module.funcs.items) |*f| {
+        if (!emitsFunction(f, true)) continue;
+        if (std.mem.eql(u8, f.name, name)) return true;
+    }
+    return false;
+}
+
+/// §17.6 + §11.9: the first mangled symbol this object would reference without
+/// defining, or null when every outbound reference is resolvable.
+///
+/// The invariant is a property of the OBJECT, not of the call graph: a
+/// freestanding object may emit an undefined reference only under a name some
+/// sibling object can actually define. A cross-module call is emitted under the
+/// callee's LOWERED name, and for an unpinned import that is `m<id>$f` — where
+/// `<id>` is an ordinal THIS build assigned to the module. The sibling's own
+/// freestanding object emits the same function bare, because there it is the
+/// root, so the two spellings can never match and the reference stays undefined
+/// forever. A pin is the only name both builds agree on, which is what makes
+/// `@symbol` load-bearing for a multi-module runtime rather than decorative
+/// (#1396, ABI.md §9).
+///
+/// Stated over names rather than over `in_root_module` deliberately. The two
+/// agree on a correct lowering, but the name test also catches a *lowering* that
+/// emits a reference matching no definition at all — which is the shape a
+/// mis-pinned call site has, and it is silent wrongness the `in_root_module`
+/// form cannot see. A `bit_rt_*` runtime symbol and a §11.7 `extern` both pass
+/// for the same reason a pin does: their names carry no `$`.
+///
+/// This has to be refused at emit time, because neither later stage reports it
+/// anywhere near its cause: an undefined symbol in an archive member nothing
+/// references is dead-stripped rather than diagnosed, and on Darwin an
+/// unresolved reference falls through to a libSystem import and aborts at dyld
+/// load time. Both turn a naming mistake into a failure a reader cannot trace.
+///
+/// Only *referenced* imports are checked, not merely imported ones: after
+/// inlining, a module may import a sibling it no longer calls, and refusing
+/// that would be a false alarm about a symbol the object never names.
+pub fn firstUnpinnedImport(module: *const ir.Module) ?[]const u8 {
+    for (module.funcs.items) |*f| {
+        if (!emitsFunction(f, true)) continue;
+        var i: u32 = 0;
+        while (i < f.insts.len) : (i += 1) {
+            const name = switch (f.decode(@enumFromInt(i))) {
+                .call => |c| module.func(c.func).name,
+                .func_addr => |fa| module.func(fa.func).name,
+                else => continue,
+            };
+            if (isPinnedName(name)) continue;
+            if (definesName(module, name)) continue;
+            return name;
+        }
+    }
+    return null;
+}
+
+fn refuseUnpinnedImports(module: *const ir.Module) Error!void {
+    if (firstUnpinnedImport(module) != null) return error.FreestandingUnpinned;
 }
 
 /// Symbol naming the module's GC stack-map table (`runtime/ABI.md` §4); the
@@ -173,6 +248,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
     var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
     var emitted_names: std.ArrayList([]const u8) = .empty;
     if (freestanding) try refuseManagedMetadata(a, module);
+    if (freestanding) try refuseUnpinnedImports(module);
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -403,6 +479,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
     var emitted_names: std.ArrayList([]const u8) = .empty;
     if (freestanding) try refuseManagedMetadata(a, module);
+    if (freestanding) try refuseUnpinnedImports(module);
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -484,6 +561,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
     var emitted_names: std.ArrayList([]const u8) = .empty;
     if (freestanding) try refuseManagedMetadata(a, module);
+    if (freestanding) try refuseUnpinnedImports(module);
 
     const mac = struct {
         fn prefix(al: Allocator, name: []const u8) ![]u8 {
@@ -718,6 +796,23 @@ fn testAppendFunc(gpa: Allocator, module: *ir.Module, name: []const u8, in_root:
     try module.funcs.append(gpa, f);
 }
 
+/// Appends a root-module `@nosplit` function whose body calls `target`, the
+/// shape a runtime module has the moment it calls a sibling — the only shape
+/// that can produce an unresolvable cross-module reference.
+fn testAppendCaller(gpa: Allocator, module: *ir.Module, name: []const u8, target: ir.FuncId) !void {
+    const i64_ty = module.ctx.prim_ids.get(.i64);
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const r = try b.call(i64_ty, target, &.{});
+    try b.ret(&.{r});
+    b.endBlock();
+    var f = try b.finish(name, &.{}, i64_ty, false, .invalid, entry);
+    f.is_nosplit = true;
+    f.in_root_module = true;
+    try module.funcs.append(gpa, f);
+}
+
 /// True if the emitted object defines a `.text` symbol named `want`.
 fn testObjectDefines(gpa: Allocator, obj: []const u8, want: []const u8) !bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -777,4 +872,77 @@ test "emit: freestanding refuses a function that is neither @nosplit nor @naked"
     const obj = try emitObject(gpa, &module, false, false);
     defer gpa.free(obj);
     try testing.expect(try testObjectDefines(gpa, obj, "managedFn"));
+}
+
+test "emit: pinned and mangled names are disjoint sets" {
+    // The invariant `firstUnpinnedImport` decides on. §11.9 restricts a pin to
+    // a C identifier, and every name lowering synthesizes for a non-root
+    // function carries a `$`. If a future mangling scheme dropped the `$`, an
+    // unpinned import would masquerade as pinned and the refusal below would
+    // silently stop firing — so the two spellings are asserted here directly.
+    try testing.expect(isPinnedName("bit_rt_spin_acquire"));
+    try testing.expect(isPinnedName("_bit_rt_alloc0"));
+    try testing.expect(!isPinnedName("m0$libUnpinned")); // moduleQualified
+    try testing.expect(!isPinnedName("m2$grow$3")); // generic instantiation
+    try testing.expect(!isPinnedName("m1$reset$t26")); // method
+    try testing.expect(!isPinnedName("closure$7")); // synthesized body
+}
+
+test "emit: freestanding refuses an unpinned cross-module call" {
+    // #1408, the other half of §17.6's mechanism. Module scoping alone leaves a
+    // call into an imported module as an undefined reference to that callee's
+    // LOWERED name — `m<id>$f`, where `<id>` is an ordinal THIS build assigned.
+    // The sibling's own freestanding object emits the same function BARE, since
+    // there it is the root, so the two spellings can never match and the
+    // reference is undefined forever.
+    //
+    // It has to be refused here because nothing downstream reports it usefully:
+    // an undefined symbol in an archive member nothing references is
+    // dead-stripped rather than diagnosed, and on Darwin an unresolved
+    // reference falls through to a libSystem import and aborts at dyld load.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "m0$importedFn", false);
+    try testAppendCaller(gpa, &module, "rootFn", @enumFromInt(0));
+
+    try testing.expectEqualStrings("m0$importedFn", firstUnpinnedImport(&module).?);
+    try testing.expectError(error.FreestandingUnpinned, emitObject(gpa, &module, false, true));
+    try testing.expectError(error.FreestandingUnpinned, emitObjectArm64Elf(gpa, &module, false, true));
+    try testing.expectError(error.FreestandingUnpinned, emitMachoObject(gpa, &module, false, true));
+
+    // Pin that same import — nothing else changes — and it emits, leaving the
+    // call as an undefined reference the sibling's object can actually satisfy.
+    // This is what makes the refusal a statement about PINNING rather than
+    // about cross-module calls in general, which are the point of the mode.
+    gpa.free(module.funcs.items[0].name);
+    module.funcs.items[0].name = try gpa.dupe(u8, "bit_rt_imported");
+    try testing.expect(firstUnpinnedImport(&module) == null);
+    const obj = try emitObject(gpa, &module, false, true);
+    defer gpa.free(obj);
+    try testing.expect(try testObjectDefines(gpa, obj, "rootFn"));
+    try testing.expect(!try testObjectDefines(gpa, obj, "bit_rt_imported"));
+}
+
+test "emit: a whole-program emit is unaffected by pinning" {
+    // The refusal is scoped to §17.6. An ordinary build lowers every module
+    // into one object and resolves the call internally, so an unpinned import
+    // is not merely tolerated there — it is the normal case, and making the
+    // check unconditional would break every multi-module program.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "m0$importedFn", false);
+    try testAppendCaller(gpa, &module, "rootFn", @enumFromInt(0));
+
+    const obj = try emitObject(gpa, &module, false, false);
+    defer gpa.free(obj);
+    try testing.expect(try testObjectDefines(gpa, obj, "rootFn"));
+    try testing.expect(try testObjectDefines(gpa, obj, "m0$importedFn"));
 }

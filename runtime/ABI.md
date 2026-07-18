@@ -439,6 +439,12 @@ not link.
 definition nothing references. `export` and `@symbol` are independent and
 compose freely.
 
+The rule is **enforced by `--freestanding` itself** (SPEC §17.6), so forgetting
+a pin is a build failure naming the symbol rather than a link error, a
+dead-stripped reference, or a dyld abort at load. Both compilers refuse to emit
+a freestanding object that would reference a compiler-mangled name it does not
+define.
+
 Pins are validated by both compilers — E0079 `symbol_attr_invalid` (one
 string-literal argument, a C identifier, free non-generic functions only, C-ABI
 signature) and E0080 `duplicate_symbol` (project-wide: each pinned name must be

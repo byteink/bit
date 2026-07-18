@@ -1816,6 +1816,17 @@ module assigns, **every runtime function another module calls must pin its
 symbol with `@symbol` (§11.9)**. Without a pin the defining object and the
 referencing object spell the same function differently and never link.
 
+This is **enforced, not merely required**: a freestanding emit is refused if the
+object would reference any symbol it does not define whose name is not a valid
+pin — a compiler-mangled name (one containing `$`) can only have come from this
+build's own module numbering, so no sibling object can ever define it. The
+refusal names the offending symbol. It has to happen here because nothing
+downstream reports it near its cause: an undefined symbol in an archive member
+nothing references is dead-stripped rather than diagnosed, and on Darwin an
+unresolved reference falls through to a libSystem import and aborts at dynamic
+load. A `bit_rt_*` runtime symbol and a §11.7 `extern` both pass this test for
+the same reason a pin does — their names carry no `$`.
+
 A freestanding object also carries none of the whole-program tables a managed
 program's object does, since exactly one object per link may define each:
 

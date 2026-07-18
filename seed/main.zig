@@ -753,7 +753,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
     switch (target) {
         .x86_64_linux => {
             const object = emit.emitObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
-                error.FreestandingAlloc, error.FreestandingSafepoint => return try freestandingRefused(err_out, e),
+                error.FreestandingAlloc, error.FreestandingSafepoint, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -762,7 +762,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
         },
         .aarch64_linux => {
             const object = emit.emitObjectArm64Elf(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
-                error.FreestandingAlloc, error.FreestandingSafepoint => return try freestandingRefused(err_out, e),
+                error.FreestandingAlloc, error.FreestandingSafepoint, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -774,7 +774,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             // diagnostic (exit 1), not a raw propagated error.
             const object = emit.emitMachoObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
                 error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
-                error.FreestandingAlloc, error.FreestandingSafepoint => return try freestandingRefused(err_out, e),
+                error.FreestandingAlloc, error.FreestandingSafepoint, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -901,7 +901,15 @@ fn syscallUnsupported(err_out: *Io.Writer) !?[]u8 {
 /// need either is refused here rather than emitted without it, which would be
 /// silent wrongness: an allocation with no descriptor, or a frame the collector
 /// cannot scan.
-fn freestandingRefused(err_out: *Io.Writer, e: anyerror) !?[]u8 {
+fn freestandingRefused(err_out: *Io.Writer, e: anyerror, module: *const ir.Module) !?[]u8 {
+    // §11.9: naming the callee is what makes this one actionable — the fix is
+    // to add `@symbol` to THAT declaration, and a runtime module makes enough
+    // cross-module calls that "some import is unpinned" would not locate it.
+    if (e == error.FreestandingUnpinned) {
+        const name = emit.firstUnpinnedImport(module) orelse "?";
+        try err_out.print("bit: --freestanding: this module references '{s}', a mangled cross-module symbol no sibling object can define; every runtime function another module calls must be pinned with @symbol (SPEC \xc2\xa711.9, ABI.md \xc2\xa79)\n", .{name});
+        return null;
+    }
     const why = switch (e) {
         error.FreestandingAlloc => "allocates on the managed heap (a struct, slice, string or closure value)",
         else => "has a function that is neither @nosplit nor @naked; freestanding code carries no GC stack maps (SPEC \xc2\xa710.3)",
