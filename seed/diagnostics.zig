@@ -99,6 +99,7 @@ pub const Code = enum(u16) {
     extern_unsupported_target = 78,
     symbol_attr_invalid = 79,
     duplicate_symbol = 80,
+    entry_of_invalid = 81,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {

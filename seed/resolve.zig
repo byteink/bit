@@ -207,6 +207,11 @@ const predeclared_funcs = [_][]const u8{
     // traced memory to a raw `*T` (there is no `&`); lets atomics target a live,
     // GC-kept buffer.
              "ptrOf",
+    // `entryOf(f): *byte` (§11.10) — the code entry address of a named
+    // function, the one way to name machine code as data. `ptrOf`'s sibling:
+    // that one bridges traced memory to a raw pointer, this one bridges a
+    // function declaration to one.
+               "entryOf",
 };
 
 // ============================================================================

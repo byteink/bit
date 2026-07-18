@@ -2615,6 +2615,70 @@ const Checker = struct {
     /// with no expected type. Flags a bare spread outside a real variadic
     /// call site (constructors, generic-inference natural-typing) — a
     /// legitimate variadic spread is validated by `checkArgs` instead.
+    /// `entryOf(f): *byte` (§11.10) — the address of `f`'s first instruction,
+    /// the one construct that names machine code as data.
+    ///
+    /// The operand must reference a **named function declaration directly**, and
+    /// that restriction is the whole design rather than an implementation limit.
+    /// A bare entry address is only meaningful when it denotes one fixed body the
+    /// linker can relocate against, which is true of a declaration and of nothing
+    /// else that has a function type:
+    ///
+    /// - A **closure** is a `(code, env)` pair, and the captured environment is
+    ///   precisely what makes calling it mean anything. Handing back the code
+    ///   half alone yields an address that would run against somebody else's
+    ///   environment, or none — there is no honest answer, so this refuses to
+    ///   invent one. Nothing here is a lowering limitation: `make_closure` has
+    ///   the code pointer in hand. The value would simply be wrong.
+    /// - A **generic** function has no single body until it is instantiated, so
+    ///   there is no one address to name.
+    /// - An **`extern` function**'s body lives in another image; only a call to
+    ///   it is expressible, and only where §11.7 allows one at all.
+    ///
+    /// Rejecting HERE, in the checker, is deliberate: the alternative is a
+    /// program that passes `bit check` and fails during lowering, which the
+    /// top-level-`let` gap already demonstrates is a bad trade.
+    fn checkEntryOf(self: *Checker, file_idx: usize, node: ast.Index, arg_items: []const ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+        const mf = self.files[file_idx];
+        const byte_ptr = self.ctx.types.intern(.{ .ptr = self.ctx.prim_ids.get(.u8) });
+        if (arg_items.len != 1) {
+            try self.emit(mf, node, .arg_count_mismatch, "'entryOf' takes exactly 1 argument, found {d}", .{arg_items.len}, null);
+            try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+            return byte_ptr;
+        }
+        // Type the operand first so every node carries a type regardless of the
+        // verdict, exactly as `ptrOf` does.
+        const arg_ty = try self.checkArgExprType(file_idx, arg_items[0], env, fctx);
+        const inner = mf.tree.kids(arg_items[0])[0];
+        const gsym: ?GlobalSymbol = if (mf.tree.get(inner).tag == .ident) self.nodeSymbol(file_idx, inner) else null;
+        const sym_kind = if (gsym) |g| self.symbolOf(g).kind else null;
+
+        if (sym_kind != .func) {
+            // `arg_ty == .invalid` means the operand is already diagnosed; stay
+            // quiet rather than stacking a second complaint on it.
+            if (arg_ty != .invalid) {
+                const detail = if (self.ctx.typeOf(arg_ty) == .func)
+                    "a closure carries a captured environment, so its code address alone would not be callable"
+                else
+                    "the operand must name a function declaration, not a value";
+                try self.emit(mf, arg_items[0], .entry_of_invalid, "'entryOf' requires a named function", .{}, detail);
+            }
+            return byte_ptr;
+        }
+        const packed_sym = gsym.?.pack();
+        if (self.ctx.decl_generics.get(packed_sym)) |gs| {
+            if (gs.len != 0) {
+                try self.emit(mf, arg_items[0], .entry_of_invalid, "'entryOf' cannot take the address of generic function '{s}'", .{Checker.identText(mf, inner)}, "a generic has no single body until it is instantiated, so there is no one entry address");
+                return byte_ptr;
+            }
+        }
+        if (self.ctx.extern_fns.contains(packed_sym)) {
+            try self.emit(mf, arg_items[0], .entry_of_invalid, "'entryOf' cannot take the address of extern function '{s}'", .{Checker.identText(mf, inner)}, "an extern function's body lives in another image; only a call to it is expressible (§11.7)");
+            return byte_ptr;
+        }
+        return byte_ptr;
+    }
+
     fn checkArgExprType(self: *Checker, file_idx: usize, arg_node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
         const mf = self.files[file_idx];
         const inner = mf.tree.kids(arg_node)[0];
@@ -2871,6 +2935,10 @@ const Checker = struct {
                 return .invalid;
             }
             return self.ctx.types.intern(.{ .ptr = elem });
+        }
+        // `entryOf(f): *byte` (§11.10): the address of `f`'s first instruction.
+        if (std.mem.eql(u8, name, "entryOf")) {
+            return self.checkEntryOf(file_idx, node, arg_items, env, fctx);
         }
         // `cryptoSecureZero(b: []byte)`: special-cased rather than a `prim_sigs`
         // row because its `[]byte` parameter is not a `Prim` (ABI.md §21).
@@ -5133,7 +5201,16 @@ const Checker = struct {
                 // shadowing keeps working here as it does everywhere else.
                 const is_nosplit = if (self.nodeSymbol(file_idx, ck[0])) |gsym| blk: {
                     const sym = self.symbolOf(gsym);
-                    if (sym.kind == .builtin_func) break :blk atomicArity(sym.name) != null;
+                    // `entryOf` (§11.10) joins the atomics on the same footing,
+                    // and on proof rather than assertion: it lowers to a single
+                    // inline address materialization (`func_addr`) against a
+                    // link-time constant, so it cannot allocate or reach a
+                    // safepoint. Excluding it would repeat the contradiction the
+                    // atomics carve-out exists to avoid — the scheduler's
+                    // `initialContext` is nosplit-by-nature and needs exactly
+                    // this address to build a task's saved register state.
+                    if (sym.kind == .builtin_func)
+                        break :blk atomicArity(sym.name) != null or std.mem.eql(u8, sym.name, "entryOf");
                     // A call whose callee names a builtin TYPE is a conversion
                     // (§12.9), not a call. A conversion between NUMERIC prims —
                     // including `int(p)`, a raw pointer's address (§11.4) — is

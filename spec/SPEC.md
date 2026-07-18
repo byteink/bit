@@ -1011,6 +1011,69 @@ platform's convention for a C symbol (Mach-O prefixes a leading underscore, so
 executable's linker still dead-strips a definition nothing references; what is
 pinned is the name, not its retention.
 
+### 11.10 Function Entry Address (unmanaged subset)
+
+`entryOf(f): *byte` is the address of `f`'s first instruction. Like `*T`, the
+atomics, `asm`, and `syscall` it belongs to the **unmanaged subset**: it is the
+one construct that names machine code as data, and ordinary code has no use for
+it — a function is called, not addressed. It is `ptrOf`'s sibling (§11.5): that
+one bridges traced memory to a raw pointer, this one bridges a function
+declaration to one.
+
+It exists for the scheduler. Starting a green thread means building a task's
+saved register context and setting its `pc`, and there is otherwise no expression
+in the language that yields a code address. Converting a function *value* is not
+a substitute: a function value is a `(code, env)` pair on the heap, so `int(f)`
+yields that object's address — a different number on every run.
+
+```
+// The shape a context switch needs: the entry written into a saved pc slot.
+function initialContext(entry: *byte): []i64 {
+  let ctx = []i64(4)
+  ctx[0] = int(entry)
+  return ctx
+}
+
+let ctx = initialContext(entryOf(taskBody))
+```
+
+The result is a raw pointer (§11.4), so it is not traced by the collector and
+`int(...)` converts it to an integer by the ordinary rule. It addresses code, not
+data: dereferencing it is meaningless, and writing through it is undefined.
+
+**The operand must reference a named function declaration directly** — anything
+else is **E0081** `entry_of_invalid`, reported by the checker rather than left to
+fail during lowering. This is a restriction on what an entry address can *mean*,
+not on what the compiler could emit:
+
+- a **closure** is a `(code, env)` pair, and the captured environment is exactly
+  what makes calling it meaningful. Its code address alone would run against
+  somebody else's environment, or none, so there is no honest value to return.
+  This covers an arrow function, a binding holding a function value, a parameter
+  of function type, and a function-typed field;
+- a **generic** function has no single body until it is instantiated, so no one
+  address exists to name;
+- an **`extern` function**'s body lives in another image; only a call to it is
+  expressible, and only where §11.7 permits one;
+- a **method** is not nameable as a bare identifier, so it never reaches here.
+
+A local binding shadows a declaration as it does everywhere else, so `entryOf`
+applied to the shadowing name is rejected on the same footing as any other value.
+
+`entryOf` is permitted inside a `@nosplit` function (§10.3.1), on the same
+footing as the atomic builtins and for the same reason: it lowers to a single
+inline address materialization against a link-time constant, so it can neither
+allocate nor reach a safepoint. Unlike an `asm` block, which is admitted on the
+author's assertion, this one is admitted on proof. The rule matters because the
+caller it exists for — a scheduler's `initialContext` — is nosplit by nature.
+
+**Absolute stability depends on the output format, and the difference between two
+entries never does.** Bit's ELF output is a fully static, non-relocated image, so
+an address there is identical on every run. The Mach-O output is position
+independent, so the loader slides the whole image and absolute addresses differ
+between runs. In both, `entryOf(f)` is invariant *within* a run and
+`int(entryOf(g)) - int(entryOf(f))` is invariant *across* runs.
+
 ---
 
 ## 12. Expressions

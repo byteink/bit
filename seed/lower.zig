@@ -2634,6 +2634,7 @@ const FnCtx = struct {
             return self.lowerAtomic(node, name);
         }
         if (std.mem.eql(u8, name, "ptrOf")) return self.lowerPtrOf(node);
+        if (std.mem.eql(u8, name, "entryOf")) return self.lowerEntryOf(node);
         // `syscall` (§11.8) is the one builtin with no `bit_rt_*` symbol behind
         // it — the backends emit the kernel trap inline — so it takes its own
         // op and deliberately never reaches `primRtFn` below.
@@ -2757,6 +2758,26 @@ const FnCtx = struct {
         const byteoff = try self.b.binary(.mul, i64ty, off, eight);
         const addr = try self.b.binary(.add, i64ty, buf, byteoff);
         return self.b.convert(try self.nodeType(node), addr);
+    }
+
+    /// `entryOf(f)` (§11.10): `f`'s code address as a `*byte`, via the existing
+    /// `func_addr` op — the same one `spawn` already uses to hand the runtime a
+    /// trampoline, so the relocation and every backend's emission of it are
+    /// unchanged and were already exercised on all three targets. This adds a
+    /// source-level spelling, not a new mechanism.
+    ///
+    /// The checker (`checkEntryOf`) has already proved the operand is a direct
+    /// reference to a non-generic, non-extern function declaration, so the symbol
+    /// lookup here cannot legitimately fail; `UnsupportedConstruct` mirrors
+    /// `resolveCallTarget`'s handling of the same impossible case rather than
+    /// silently emitting a wrong address.
+    fn lowerEntryOf(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const arg_nodes = self.kids(self.kids(node)[2]);
+        const inner = self.kids(arg_nodes[0])[0];
+        const gsym = self.nodeSymbol(inner) orelse return error.UnsupportedConstruct;
+        if (self.l.symbolOf(gsym).kind != .func) return error.UnsupportedConstruct;
+        const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
+        return self.b.funcAddr(try self.nodeType(node), fid);
     }
 
     /// Lowers an atomic builtin (§11.5) to its dedicated inline IR op. The
