@@ -81,6 +81,11 @@ pub const Reloc = struct {
 pub const CodegenError = error{
     UnsupportedConstruct,
     TooManyArguments,
+    /// A `syscall()` reached a Darwin target (§11.8). Darwin publishes no
+    /// stable syscall numbers — the supported path there is a libSystem call —
+    /// so this is rejected at emission time rather than silently encoding a
+    /// trap against numbers Apple is free to renumber.
+    SyscallUnsupportedTarget,
 } || Allocator.Error;
 
 // ============================================================================

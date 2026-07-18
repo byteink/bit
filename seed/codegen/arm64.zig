@@ -166,6 +166,12 @@ const max_float_regs = 30; // d0..d29 (d30/d31 are scratch)
 const arg_int_regs = [_]Reg{ .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
 const max_arg_regs = arg_int_regs.len; // int and float each get 8 slots
 
+/// Linux AArch64 syscall registers (§11.8): arguments in `x0`..`x5` (the first
+/// six AAPCS64 argument registers, so `arg_int_regs`' own prefix), the syscall
+/// number in `x8`, the kernel's return value back in `x0`.
+const syscall_arg_regs = arg_int_regs[0..6];
+const syscall_nr_reg: Reg = .x8;
+
 fn isCalleeSavedInt(r: Reg) bool {
     return switch (r) {
         .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28 => true,
@@ -1975,6 +1981,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .func_addr => |fa| try emitFuncAddr(self, i, fa.func),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
         .asm_stmt => |a| try emitAsm(self, if (ty != .invalid) i else null, a.block, a.args),
+        .syscall => |s| try emitSyscall(self, i, s.nr, s.args),
     }
 }
 
@@ -1992,6 +1999,23 @@ fn emitAsm(self: *Ctx, dst: ?u32, block: u32, in_vals: []const u32) !void {
     }
     for (blk.arm64_words) |w| try self.emitWord(w);
     if (dst) |d| try putInt(self, d, @enumFromInt(blk.result_arm64));
+}
+
+/// Raw Linux syscall (§11.8): move each argument into `x0`..`x5`, the number
+/// into `x8`, trap into the kernel with `svc #0`, then read the return value
+/// out of `x0`. Every register involved is excluded from the allocatable file
+/// for the whole function (`collectReservedArm64`), so the moves cannot clobber
+/// a live value and can run in plain sequence. `emitWord` is the same primitive
+/// `emitCallReloc` uses for its own fixed opcodes.
+fn emitSyscall(self: *Ctx, dst: u32, nr: ir.ValueId, args: []const u32) !void {
+    for (args, syscall_arg_regs[0..args.len]) |v, reg| {
+        const src = try getInt(self, vregOf(self, @enumFromInt(v)), scratch1);
+        try self.movRR(reg, src);
+    }
+    const nr_src = try getInt(self, vregOf(self, nr), scratch1);
+    try self.movRR(syscall_nr_reg, nr_src);
+    try self.emitWord(0xD4000001); // svc #0
+    try putInt(self, dst, .x0);
 }
 
 // ============================================================================
@@ -2128,26 +2152,42 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| extendOne(intervals, use_pos, a),
         .asm_stmt => |a| for (a.args) |arg| extendOne(intervals, use_pos, arg),
+        .syscall => |s| {
+            extendOne(intervals, use_pos, @intFromEnum(s.nr));
+            for (s.args) |a| extendOne(intervals, use_pos, a);
+        },
     }
 }
 
-/// Marks every arm64 register an `asm` block in `f` pins (`input`/`result`/
-/// clobber) in `reserved` (indexed by register number 0..30). The `memory`
-/// sentinel (254) and `sp`/`xzr` (31) fall outside the array and are skipped —
-/// neither is ever allocatable.
-fn collectAsmReservedArm64(module: *const ir.Module, f: *const ir.Function, reserved: *[32]bool) void {
+/// Marks every arm64 register pinned by an `asm` block (`input`/`result`/
+/// clobber) or by a `syscall` in `f` in `reserved` (indexed by register number
+/// 0..30). The `memory` sentinel (254) and `sp`/`xzr` (31) fall outside the
+/// array and are skipped — neither is ever allocatable.
+fn collectReservedArm64(module: *const ir.Module, f: *const ir.Function, reserved: *[32]bool) void {
     const ops = f.insts.items(.op);
     for (0..f.insts.len) |i| {
-        if (ops[i] != .asm_stmt) continue;
-        const a = f.decode(@enumFromInt(i)).asm_stmt;
-        const blk = module.asmBlock(a.block);
-        if (blk.has_result and blk.result_arm64 < 32) reserved[blk.result_arm64] = true;
-        for (blk.in_arm64) |c| if (c < 32) {
-            reserved[c] = true;
-        };
-        for (blk.clob_arm64) |c| if (c < 32) {
-            reserved[c] = true;
-        };
+        switch (ops[i]) {
+            .asm_stmt => {
+                const a = f.decode(@enumFromInt(i)).asm_stmt;
+                const blk = module.asmBlock(a.block);
+                if (blk.has_result and blk.result_arm64 < 32) reserved[blk.result_arm64] = true;
+                for (blk.in_arm64) |c| if (c < 32) {
+                    reserved[c] = true;
+                };
+                for (blk.clob_arm64) |c| if (c < 32) {
+                    reserved[c] = true;
+                };
+            },
+            // §11.8: `x8` holds the syscall number, `x0`..`x5` the arguments,
+            // `x0` the kernel's return value. `svc` is a trap, not a `bl` —
+            // the Linux arm64 kernel ABI preserves every other register, so
+            // unlike x64 there is nothing further to exclude.
+            .syscall => {
+                reserved[@intFromEnum(syscall_nr_reg)] = true;
+                for (syscall_arg_regs) |r| reserved[@intFromEnum(r)] = true;
+            },
+            else => {},
+        }
     }
 }
 
@@ -2175,21 +2215,22 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     const float_regs = buildFloatRegs(&float_buf, has_safepoints);
 
     // Any physical register named by an `asm` block's `input`/`result`/clobber
-    // list is removed from the allocatable file for the whole function, so no
-    // vreg can land in a register the inline sequence overwrites (§11.6) — the
-    // same exclusion mechanism division/shift/atomics use, generalized to an
-    // arbitrary set. No `asm` → all-false → identical to `base_int_regs`.
-    var asm_reserved = [_]bool{false} ** 32;
-    collectAsmReservedArm64(module, f, &asm_reserved);
-    var asm_buf: [max_int_regs]Reg = undefined;
-    var asm_n: usize = 0;
+    // list (§11.6) or pinned by a `syscall`'s kernel ABI (§11.8) is removed
+    // from the allocatable file for the whole function, so no vreg can land in
+    // a register the inline sequence overwrites — the same exclusion mechanism
+    // division/shift/atomics use, generalized to an arbitrary set. Neither
+    // construct present → all-false → identical to `base_int_regs`.
+    var reserved = [_]bool{false} ** 32;
+    collectReservedArm64(module, f, &reserved);
+    var avail_buf: [max_int_regs]Reg = undefined;
+    var avail_n: usize = 0;
     for (base_int_regs) |r| {
-        if (!asm_reserved[@intFromEnum(r)]) {
-            asm_buf[asm_n] = r;
-            asm_n += 1;
+        if (!reserved[@intFromEnum(r)]) {
+            avail_buf[avail_n] = r;
+            avail_n += 1;
         }
     }
-    const int_regs = asm_buf[0..asm_n];
+    const int_regs = avail_buf[0..avail_n];
 
     const target = regalloc.TargetRegs{
         .int = .{ .count = @intCast(int_regs.len) },

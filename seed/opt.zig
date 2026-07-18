@@ -508,6 +508,11 @@ fn emitTranslated(
             defer gpa.free(args);
             remap[idx] = try bldr.asmStmt(ty, a.block, args);
         },
+        .syscall => |s| {
+            const args = try trList(gpa, remap, s.args);
+            defer gpa.free(args);
+            remap[idx] = try bldr.syscall(ty, tr(remap, @intFromEnum(s.nr)), args);
+        },
     }
 }
 
@@ -610,6 +615,9 @@ fn isSideEffecting(op: ir.Op) bool {
         // Inline assembly has arbitrary machine effects — never drop, hoist,
         // or deduplicate it, even when its result is unused (a barrier).
         .asm_stmt => true,
+        // A syscall's effect is the kernel's, entirely outside this module's
+        // view — never drop or deduplicate it, even with the result unused.
+        .syscall => true,
         else => op.isTerminator(),
     };
 }
@@ -679,6 +687,10 @@ fn markOperandsLive(f: *const ir.Function, live: []bool, id: ir.ValueId) void {
         },
         .asm_stmt => |a| for (a.args) |v| {
             live[v] = true;
+        },
+        .syscall => |s| {
+            live[@intFromEnum(s.nr)] = true;
+            for (s.args) |v| live[v] = true;
         },
     }
 }

@@ -650,7 +650,12 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
         .aarch64_macos => {
-            const object = try emit.emitMachoObject(gpa, &module);
+            // §11.8: `syscall()` has no Darwin encoding — report it as a
+            // diagnostic (exit 1), not a raw propagated error.
+            const object = emit.emitMachoObject(gpa, &module) catch |e| switch (e) {
+                error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
+                else => return e,
+            };
             defer gpa.free(object);
             return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
         },
@@ -722,7 +727,12 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
             return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
         .aarch64_macos => {
-            const object = try emit.emitMachoObject(gpa, &module);
+            // §11.8: `syscall()` has no Darwin encoding — report it as a
+            // diagnostic (exit 1), not a raw propagated error.
+            const object = emit.emitMachoObject(gpa, &module) catch |e| switch (e) {
+                error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
+                else => return e,
+            };
             defer gpa.free(object);
             return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
         },
@@ -754,6 +764,13 @@ fn rejectExternForTarget(diags: *diagnostics.Diagnostics, files: []const resolve
         }
     }
     return found;
+}
+
+/// The §11.8 Darwin rejection, rendered like any other build failure: a
+/// message plus a `null` result, which the caller maps to exit code 1.
+fn syscallUnsupported(err_out: *Io.Writer) !?[]u8 {
+    try err_out.writeAll("bit: 'syscall' is not supported on aarch64-macos: Darwin publishes no stable syscall numbers (SPEC \xc2\xa711.8)\n");
+    return null;
 }
 
 fn renderFail(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, err_out: *Io.Writer) !?[]u8 {

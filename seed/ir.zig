@@ -385,6 +385,14 @@ pub const Op = enum {
     // `ty` is the `result` operand's type, or `.invalid` when it has none.
     asm_stmt,
 
+    // ---- raw OS syscall: extra = [nr, argc, args...] ----------------------
+    // §11.8, Linux only. Unlike every other builtin this does NOT become an
+    // `rt_call`: there is no `bit_rt_syscall` symbol to relocate against — the
+    // backends emit the kernel trap (`syscall` / `svc #0`) inline, so this
+    // needs its own op to bypass symbol-call codegen entirely. Result is the
+    // raw kernel return value (`i64`, negative errno included).
+    syscall,
+
     /// Terminators must be the last (and only trailing) instruction of a
     /// block — see `verifyFunction`.
     pub fn isTerminator(self: Op) bool {
@@ -542,6 +550,7 @@ pub const Function = struct {
             .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
             .rt_call => .{ .rt_call = .{ .rt = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
             .asm_stmt => .{ .asm_stmt = .{ .block = raw[0], .args = raw[2 .. 2 + raw[1]] } },
+            .syscall => .{ .syscall = .{ .nr = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
             else => if (op.isBinary())
                 .{ .bin = .{ .lhs = @enumFromInt(raw[0]), .rhs = @enumFromInt(raw[1]) } }
             else if (op.isUnary())
@@ -590,6 +599,8 @@ pub const Decoded = union(enum) {
     // `block` indexes `Module.asm_blocks`; `args` are the `input` operand
     // values, in declaration order (parallel to the block's `in_*` reg lists).
     asm_stmt: struct { block: u32, args: []const u32 },
+    // §11.8: `nr` is the syscall number, `args` its 0..6 arguments in order.
+    syscall: struct { nr: ValueId, args: []const u32 },
 };
 
 /// A compiled unit: every lowered function plus the deduped string-literal
@@ -1043,6 +1054,17 @@ pub const FunctionBuilder = struct {
         return self.push(.asm_stmt, ty, buf);
     }
 
+    /// Raw OS syscall (§11.8). `nr` is the syscall number, `args` its 0..6
+    /// arguments in order; `ty` is always `i64` (the raw kernel return value).
+    pub fn syscall(self: *FunctionBuilder, ty: TypeId, nr: ValueId, args: []const ValueId) Allocator.Error!ValueId {
+        var buf = try self.gpa.alloc(u32, 2 + args.len);
+        defer self.gpa.free(buf);
+        buf[0] = vid(nr);
+        buf[1] = @intCast(args.len);
+        for (args, 0..) |a, i| buf[2 + i] = vid(a);
+        return self.push(.syscall, ty, buf);
+    }
+
     /// Finalizes the function. Every reserved block must have been
     /// begun+ended exactly once (asserted via each block's `insts_len > 0`,
     /// since `endBlock` always emits at least a terminator).
@@ -1327,6 +1349,13 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
             try dumpValList(w, a.args);
             try w.writeAll(")\n");
         },
+        .syscall => |s| {
+            try w.print("  %{d} = syscall %{d}(", .{ i, @intFromEnum(s.nr) });
+            try dumpValList(w, s.args);
+            try w.writeAll(") ");
+            try writeTypeName(w, module.ctx, ty, 0);
+            try w.writeAll("\n");
+        },
     }
 }
 
@@ -1508,7 +1537,11 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
         .make_closure => |mc| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a),
-        .asm_stmt => |a| for (a.args) |x| try checkOperandDominance(f, dom, use_block, use_idx, x),
+        .asm_stmt => |a| for (a.args) |v| try checkOperandDominance(f, dom, use_block, use_idx, v),
+        .syscall => |s| {
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(s.nr));
+            for (s.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a);
+        },
     }
 }
 

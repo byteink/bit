@@ -832,6 +832,67 @@ no libc, where an undefined symbol is an unresolvable link failure. Declaring an
 Bit has no arch-conditional compilation, so a program that needs both paths uses
 `extern function` for Darwin and a raw syscall for Linux, not one source form.
 
+### 11.8 Raw Syscalls (unmanaged subset)
+
+`syscall` traps directly into the operating system kernel. Like `*T`, the
+atomics, and `asm`, it belongs to the **unmanaged subset**: it exists so the
+runtime can reach the kernel without a C library, and has no place in ordinary
+code — the stdlib's `fs`, `net`, and `time` modules are the supported surface.
+
+```
+syscall(nr)                       // -> i64
+syscall(nr, a0)
+...
+syscall(nr, a0, a1, a2, a3, a4, a5)
+```
+
+- **Linux only.** Compiling a `syscall` for a Darwin target is an error: Apple
+  publishes no stable syscall numbers and reserves the right to renumber them,
+  so there is nothing to encode against. Darwin's supported path is a call into
+  libSystem. The diagnostic is raised at object-emission time, since the
+  checker and lowering run once for every target.
+- **Variable arity**: the syscall number plus zero to six arguments, so 1 to 7
+  arguments in total. Every argument and the result are `i64`.
+- The result is the kernel's **raw return value**, including a negative errno
+  on failure. `syscall` never panics, never sets an error, and never
+  interprets what it returns — the caller does.
+- **Syscall numbers are per-architecture** and are not part of this
+  specification. Bit has no arch-conditional compilation, so a program that
+  targets both architectures selects the number itself at run time (see
+  `hostTarget()`).
+- A `syscall` is never dropped, hoisted, or deduplicated, even when its result
+  is unused: its effect belongs to the kernel, outside the compiler's view.
+- Pointer arguments are ordinary integers here. A raw pointer (§11.4) reaches
+  one via `i64(p)`; `ptrOf` (§11.5) is the bridge from a slice to such a
+  pointer. Note that a slice stores one **8-byte word per element**, so
+  `ptrOf` on a `[]u8` does not address packed bytes.
+
+The compiler emits the kernel trap inline — never a call to a runtime symbol —
+using each platform's kernel ABI, which is **not** its C ABI:
+
+| Target        | Number | Arguments        | Result | Trap             |
+| ------------- | ------ | ---------------- | ------ | ---------------- |
+| x86-64 Linux  | `rax`  | `rdi rsi rdx r10 r8 r9` | `rax` | `syscall` (`0F 05`) |
+| AArch64 Linux | `x8`   | `x0`–`x5`        | `x0`   | `svc #0` (`0xD4000001`) |
+
+On x86-64 the fourth argument travels in `r10`, not the C ABI's `rcx`, because
+the `syscall` instruction overwrites `rcx` with the return address (and `r11`
+with the saved flags). Every register named above is excluded from the register
+allocator for the whole enclosing function, exactly as an `asm` block's operands
+are (§11.6).
+
+```
+// write(1, buf, 6) on either Linux architecture.
+function sysWrite(): int {
+  if (hostTarget() == 0) { return 1 }  // x86_64-linux
+  return 64                            // aarch64-linux
+}
+
+function writeLine(buf: []int, n: int): int {
+  return syscall(sysWrite(), 1, i64(ptrOf(buf)), n)
+}
+```
+
 ---
 
 ## 12. Expressions

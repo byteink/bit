@@ -127,6 +127,11 @@ const max_float_regs = 14; // xmm0..xmm13
 const sysv_int_args = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 const win64_int_args = [_]Reg{ .rcx, .rdx, .r8, .r9 };
 
+/// Linux x86-64 syscall argument registers (§11.8). Deliberately NOT
+/// `sysv_int_args`: the kernel ABI's 4th argument is `r10`, because the
+/// `syscall` instruction itself overwrites `rcx` with the return address.
+const syscall_arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .r10, .r8, .r9 };
+
 fn isCalleeSavedInt(cc: CallConv, r: Reg) bool {
     return switch (cc) {
         .sysv => switch (r) {
@@ -316,10 +321,7 @@ pub const FuncCode = struct {
     }
 };
 
-pub const CodegenError = error{
-    UnsupportedConstruct,
-    TooManyArguments,
-} || Allocator.Error;
+pub const CodegenError = common.CodegenError;
 
 // ============================================================================
 // Low-level x86-64 encoder
@@ -2112,6 +2114,10 @@ fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| markUse(intervals, a, pos),
         .asm_stmt => |a| for (a.args) |arg| markUse(intervals, arg, pos),
+        .syscall => |s| {
+            markUse(intervals, @intFromEnum(s.nr), pos);
+            for (s.args) |a| markUse(intervals, a, pos);
+        },
     }
 }
 
@@ -2410,6 +2416,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
         .call_iface => try emitCallIface(self, dst, ty, d.call_iface.iface, d.call_iface.method_index, d.call_iface.args),
         .asm_stmt => try emitAsm(self, if (ty != .invalid) dst else null, d.asm_stmt.block, d.asm_stmt.args),
+        .syscall => try emitSyscall(self, dst, d.syscall.nr, d.syscall.args),
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
     }
 }
@@ -2429,22 +2436,55 @@ fn emitAsm(self: *Ctx, dst: ?u32, block: u32, in_vals: []const u32) !void {
     if (dst) |dd| try putInt(self, dd, @enumFromInt(blk.result_x64));
 }
 
-/// Marks every x64 register an `asm` block in `f` pins (`input`/`result`/
-/// clobber) in `reserved` (indexed by ModRM register number 0..15). The
-/// `memory` sentinel (254) falls outside the array and is skipped.
-fn collectAsmReservedX64(module: *const ir.Module, f: *const ir.Function, reserved: *[16]bool) void {
+/// Raw Linux syscall (§11.8): move each argument into its kernel-ABI register,
+/// the number into `rax`, emit the two-byte `syscall` opcode, then read the
+/// kernel's return value out of `rax`. Every register involved is excluded
+/// from the allocatable file for the whole function (`collectReservedX64`), so
+/// the moves cannot clobber a live value and can run in plain sequence.
+fn emitSyscall(self: *Ctx, dst: u32, nr: ir.ValueId, args: []const u32) !void {
+    for (args, syscall_arg_regs[0..args.len]) |v, reg| {
+        const src = try getInt(self, vregOf(self, @enumFromInt(v)), scratch1);
+        try self.movRR(reg, src);
+    }
+    const nr_src = try getInt(self, vregOf(self, nr), scratch1);
+    try self.movRR(.rax, nr_src);
+    try self.emitByte(0x0F); // syscall
+    try self.emitByte(0x05);
+    try putInt(self, dst, .rax);
+}
+
+/// Marks every x64 register pinned by an `asm` block (`input`/`result`/
+/// clobber) or by a `syscall` in `f` in `reserved` (indexed by ModRM register
+/// number 0..15). The `memory` sentinel (254) falls outside the array and is
+/// skipped.
+fn collectReservedX64(module: *const ir.Module, f: *const ir.Function, reserved: *[16]bool) void {
     const ops = f.insts.items(.op);
     for (0..f.insts.len) |i| {
-        if (ops[i] != .asm_stmt) continue;
-        const a = f.decode(@enumFromInt(i)).asm_stmt;
-        const blk = module.asmBlock(a.block);
-        if (blk.has_result and blk.result_x64 < 16) reserved[blk.result_x64] = true;
-        for (blk.in_x64) |c| if (c < 16) {
-            reserved[c] = true;
-        };
-        for (blk.clob_x64) |c| if (c < 16) {
-            reserved[c] = true;
-        };
+        switch (ops[i]) {
+            .asm_stmt => {
+                const a = f.decode(@enumFromInt(i)).asm_stmt;
+                const blk = module.asmBlock(a.block);
+                if (blk.has_result and blk.result_x64 < 16) reserved[blk.result_x64] = true;
+                for (blk.in_x64) |c| if (c < 16) {
+                    reserved[c] = true;
+                };
+                for (blk.clob_x64) |c| if (c < 16) {
+                    reserved[c] = true;
+                };
+            },
+            // §11.8: the number/return register, the six kernel argument
+            // registers, and `rcx`/`r11` — which the `syscall` instruction
+            // itself overwrites with the return address and saved rflags.
+            // `r10`/`r11` are codegen scratch and never allocatable anyway;
+            // marking them is harmless and keeps the set self-documenting.
+            .syscall => {
+                reserved[@intFromEnum(Reg.rax)] = true;
+                reserved[@intFromEnum(Reg.rcx)] = true;
+                reserved[@intFromEnum(Reg.r11)] = true;
+                for (syscall_arg_regs) |r| reserved[@intFromEnum(r)] = true;
+            },
+            else => {},
+        }
     }
 }
 
@@ -2466,21 +2506,22 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     const base_int_regs = buildIntRegs(&int_buf, cc, flags.has_safepoints, flags.needs_rax_rdx, flags.needs_rcx);
     const base_float_regs = buildFloatRegs(&float_buf, cc, flags.has_safepoints);
 
-    // Registers an `asm` block pins (`input`/`result`/clobber) are removed from
-    // the allocatable file for the whole function — the same exclusion the
+    // Registers an `asm` block pins (`input`/`result`/clobber, §11.6) or a
+    // `syscall` pins (number/argument/clobber, §11.8) are removed from the
+    // allocatable file for the whole function — the same exclusion the
     // `needs_rax_rdx`/`needs_rcx` flags apply for div/shift, generalized to an
-    // arbitrary set (§11.6). No `asm` → identical to `base_int_regs`.
-    var asm_reserved = [_]bool{false} ** 16;
-    collectAsmReservedX64(module, f, &asm_reserved);
-    var asm_buf: [max_int_regs]Reg = undefined;
-    var asm_n: usize = 0;
+    // arbitrary set. Neither construct present → identical to `base_int_regs`.
+    var reserved = [_]bool{false} ** 16;
+    collectReservedX64(module, f, &reserved);
+    var avail_buf: [max_int_regs]Reg = undefined;
+    var avail_n: usize = 0;
     for (base_int_regs) |r| {
-        if (!asm_reserved[@intFromEnum(r)]) {
-            asm_buf[asm_n] = r;
-            asm_n += 1;
+        if (!reserved[@intFromEnum(r)]) {
+            avail_buf[avail_n] = r;
+            avail_n += 1;
         }
     }
-    const asm_int_regs = asm_buf[0..asm_n];
+    const avail_int_regs = avail_buf[0..avail_n];
 
     // §10.3.1 @naked: the prologue never runs, so a callee-saved register would
     // be clobbered without ever being saved. Restrict a naked function to the
@@ -2489,7 +2530,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     // letting it silently corrupt its caller.
     var naked_int_buf: [max_int_regs]Reg = undefined;
     var naked_int_n: usize = 0;
-    for (asm_int_regs) |r| {
+    for (avail_int_regs) |r| {
         if (!isCalleeSavedInt(cc, r)) {
             naked_int_buf[naked_int_n] = r;
             naked_int_n += 1;
@@ -2503,7 +2544,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
             naked_float_n += 1;
         }
     }
-    const int_regs = if (f.is_naked) naked_int_buf[0..naked_int_n] else asm_int_regs;
+    const int_regs = if (f.is_naked) naked_int_buf[0..naked_int_n] else avail_int_regs;
     const float_regs = if (f.is_naked) naked_float_buf[0..naked_float_n] else base_float_regs;
 
     const intervals = try buildIntervals(gpa, tctx, f);

@@ -53,6 +53,15 @@ function fscratch2(): int { return 31 } // secondary float operand
 // (base, operand(s), old, computed, status). x16/x17 (IP0/IP1) are never
 // allocatable and never scratch elsewhere, and no call occurs inside an atomic
 // sequence, so they are safe as transient atomic temporaries.
+// Linux AArch64 syscall registers (§11.8): arguments in x0..x5 (the first six
+// AAPCS64 argument registers), the syscall number in x8, the kernel's return
+// value back in x0.
+function syscallArgRegs(): []int {
+  return [0, 1, 2, 3, 4, 5]
+}
+
+function syscallNrReg(): int { return 8 }
+
 function ascratch1(): int { return 16 } // atomic: base-address holder
 function ascratch2(): int { return 17 } // atomic: operand / expected holder
 
@@ -2019,6 +2028,10 @@ function compileInst(cx: A64Ctx, curBlock: int, i: int) {
   }
   if (op == Op.MakeClosure) { emitMakeClosure(cx, i, ins.name, ins.lhs); return }
   if (op == Op.FuncAddr) { emitFuncAddr(cx, i, ins.name); return }
+  if (op == Op.Syscall) {
+    emitSyscall(cx, i, ins.lhs, ins.args)
+    return
+  }
   if (op == Op.Asm) {
     emitAsm(cx, dstOrNone(cx, i, ty), ins.ival, ins.args)
     return
@@ -2053,14 +2066,48 @@ function emitAsm(cx: A64Ctx, dst: int, block: int, inVals: []int) {
   }
 }
 
-// Every arm64 register an `asm` block in `f` pins (`input`/`result`/clobber),
-// indexed by register number 0..31. The `memory` sentinel (254) falls outside
-// the array and is skipped; `sp`/`xzr` (31) is never allocatable anyway.
-function collectAsmReservedArm64(module: IrModule, f: IrFunc): []bool {
+// Raw Linux syscall (§11.8): move each argument into x0..x5, the number into
+// x8, trap into the kernel with `svc #0`, then read the return value out of x0.
+// Every register involved is excluded from the allocatable file for the whole
+// function (collectReservedArm64), so the moves cannot clobber a live value and
+// can run in plain sequence. emitWord is the same primitive emitCallReloc uses
+// for its own fixed opcodes.
+function emitSyscall(cx: A64Ctx, dst: int, nr: int, args: []int) {
+  let regs = syscallArgRegs()
+  let i = 0
+  while (i < len(args)) {
+    let src = getInt(cx, vregOf(cx, args[i]), scratch1())
+    movRR(cx.code, regs[i], src)
+    i = i + 1
+  }
+  let nrSrc = getInt(cx, vregOf(cx, nr), scratch1())
+  movRR(cx.code, syscallNrReg(), nrSrc)
+  emitWord(cx.code, 0xD4000001) // svc #0
+  putInt(cx, dst, 0)
+}
+
+// Every arm64 register pinned by an `asm` block (`input`/`result`/clobber) or by
+// a `syscall` in `f`, indexed by register number 0..31. The `memory` sentinel
+// (254) falls outside the array and is skipped; `sp`/`xzr` (31) is never
+// allocatable anyway.
+function collectReservedArm64(module: IrModule, f: IrFunc): []bool {
   let reserved = []bool(32)
   let i = 0
   while (i < len(f.instrs)) {
     let ins = f.instrs[i]
+    // §11.8: x8 holds the syscall number, x0..x5 the arguments, x0 the kernel's
+    // return value. `svc` is a trap, not a `bl` — the Linux arm64 kernel ABI
+    // preserves every other register, so unlike x64 there is nothing more to
+    // exclude.
+    if (ins.op == Op.Syscall) {
+      reserved[syscallNrReg()] = true
+      let regs = syscallArgRegs()
+      let k = 0
+      while (k < len(regs)) {
+        reserved[regs[k]] = true
+        k = k + 1
+      }
+    }
     if (ins.op == Op.Asm) {
       let blk = module.asmBlocks[ins.ival]
       if (blk.hasResult && blk.resultArm64 < 32) {
@@ -2169,13 +2216,14 @@ function compileFunction(module: IrModule, f: IrFunc): FuncCode {
   // Any physical register an `asm` block names (`input`/`result`/clobber) leaves
   // the allocatable file for the whole function, so no vreg can land in a
   // register the inline sequence overwrites (§11.6) — the same exclusion
-  // div/shift/atomics use, generalized to an arbitrary set. No `asm` in this
-  // function leaves `intRegs` exactly as `buildIntRegs` returned it.
-  let asmReserved = collectAsmReservedArm64(module, f)
+  // div/shift/atomics use, generalized to an arbitrary set. Neither an `asm`
+  // nor a `syscall` (§11.8) in this function leaves `intRegs` exactly as
+  // `buildIntRegs` returned it.
+  let reserved = collectReservedArm64(module, f)
   let allocRegs = []int(0)
   let ri = 0
   while (ri < len(intRegs)) {
-    if (!asmReserved[intRegs[ri]]) {
+    if (!reserved[intRegs[ri]]) {
       allocRegs = append(allocRegs, intRegs[ri])
     }
     ri = ri + 1

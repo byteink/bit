@@ -2845,6 +2845,22 @@ const Checker = struct {
             if (arg_items.len >= 2) _ = try self.checkArgExprType(file_idx, arg_items[1], env, fctx);
             return self.ctx.void_id;
         }
+        // `syscall(nr, a0..a5): i64` (§11.8) — variable arity (1..7 total), so
+        // it cannot be a `prim_sigs` row; hand-written like `assert` above.
+        // Every operand and the result are `i64`: the raw kernel return value,
+        // negative errno included, is the caller's to interpret.
+        if (std.mem.eql(u8, name, "syscall")) {
+            const i64ty = self.ctx.prim_ids.get(.i64);
+            if (arg_items.len < 1 or arg_items.len > 7) {
+                try self.emit(mf, node, .arg_count_mismatch, "'syscall' takes a number and up to 6 arguments, found {d} argument(s)", .{arg_items.len}, null);
+            }
+            for (arg_items) |a| {
+                const inner = mf.tree.kids(a)[0];
+                const t = try self.checkExpr(file_idx, inner, env, fctx, i64ty);
+                try self.expect(file_idx, inner, t, i64ty);
+            }
+            return i64ty;
+        }
         // Runtime primitives: filesystem (ABI.md §14), math (§17), time (§18),
         // os (§19). Fixed arities over prim types, table-driven so a new
         // primitive is one row in `prim_sigs` and one in `lower.zig`'s matching

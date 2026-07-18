@@ -67,10 +67,19 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     // extern symbol has nothing to resolve against and the compiler rejects it
     // outright — the program is not merely expected to fail, it cannot compile.
     if (builtin.target.os.tag != .macos) {
-        const marker = try std.fmt.allocPrint(gpa, "{s}/darwin-only", .{dir_abs});
-        defer gpa.free(marker);
-        if (Dir.cwd().access(io, marker, .{})) |_| return else |_| {}
+        const darwin_marker = try std.fmt.allocPrint(gpa, "{s}/darwin-only", .{dir_abs});
+        defer gpa.free(darwin_marker);
+        if (Dir.cwd().access(io, darwin_marker, .{})) |_| return else |_| {}
     }
+
+    // The mirror case: a program exercising an OS-specific primitive (§11.8
+    // `syscall`) marks itself with a `linux-only` file. It neither compiles nor
+    // runs elsewhere, so a non-Linux host skips it rather than failing. Same
+    // spirit as the suite-level `libbitrt_path` guard above, one level finer.
+    const linux_marker = try std.fmt.allocPrint(gpa, "{s}/linux-only", .{dir_abs});
+    defer gpa.free(linux_marker);
+    const linux_only = if (Dir.cwd().statFile(io, linux_marker, .{})) |_| true else |_| false;
+    if (linux_only and builtin.target.os.tag != .linux) return;
 
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();

@@ -72,6 +72,13 @@ function xXmmOf(n: int): XmmReg {
 // Reserved codegen scratch — never allocatable, and never an argument or return
 // register in either convention, so a selector may clobber one at any point
 // without consulting the ABI.
+// Linux x86-64 syscall argument registers (§11.8). Deliberately NOT the SysV C
+// argument list: the kernel ABI's 4th argument is r10, because the `syscall`
+// instruction itself overwrites rcx with the return address.
+function xSyscallArgRegs(): []XReg64 {
+  return [XReg64.Rdi, XReg64.Rsi, XReg64.Rdx, XReg64.R10, XReg64.R8, XReg64.R9]
+}
+
 function xScratch1(): XReg64 { return XReg64.R11 } // accumulator / setcc target / move-cycle temp
 function xScratch2(): XReg64 { return XReg64.R10 } // rhs operand / base pointer
 function xScratch3(): XReg64 { return XReg64.R12 } // index register (array indexing only)
@@ -2556,14 +2563,49 @@ function xEmitAsm(cx: XCtx, dst: int, block: int, inVals: []int) {
   }
 }
 
-// Every x64 register an `asm` block in `f` pins (`input`/`result`/clobber),
-// indexed by ModRM register number 0..15. The `memory` sentinel (254) falls
-// outside the array and is skipped.
-function xCollectAsmReserved(module: IrModule, f: IrFunc): []bool {
+// Raw Linux syscall (§11.8): move each argument into its kernel-ABI register,
+// the number into rax, emit the two-byte `syscall` opcode, then read the
+// kernel's return value out of rax. Every register involved is excluded from
+// the allocatable file for the whole function (xCollectReserved), so the moves
+// cannot clobber a live value and can run in plain sequence.
+function xEmitSyscall(cx: XCtx, dst: int, nr: int, args: []int) {
+  let regs = xSyscallArgRegs()
+  let i = 0
+  while (i < len(args)) {
+    let src = xGetInt(cx, args[i], xScratch1())
+    xMovRR(cx.buf, regs[i], src)
+    i = i + 1
+  }
+  let nrSrc = xGetInt(cx, nr, xScratch1())
+  xMovRR(cx.buf, XReg64.Rax, nrSrc)
+  xEmitByte(cx.buf, 0x0F) // syscall
+  xEmitByte(cx.buf, 0x05)
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// Every x64 register pinned by an `asm` block (`input`/`result`/clobber) or by
+// a `syscall` in `f`, indexed by ModRM register number 0..15. The `memory`
+// sentinel (254) falls outside the array and is skipped.
+function xCollectReserved(module: IrModule, f: IrFunc): []bool {
   let reserved = []bool(16)
   let i = 0
   while (i < len(f.instrs)) {
     let ins = f.instrs[i]
+    // §11.8: the number/return register, the six kernel argument registers, and
+    // rcx/r11 — which the `syscall` instruction itself overwrites with the
+    // return address and saved rflags. r10/r11 are codegen scratch and never
+    // allocatable anyway; marking them keeps the set self-documenting.
+    if (ins.op == Op.Syscall) {
+      reserved[xRegNum(XReg64.Rax)] = true
+      reserved[xRegNum(XReg64.Rcx)] = true
+      reserved[xRegNum(XReg64.R11)] = true
+      let regs = xSyscallArgRegs()
+      let k = 0
+      while (k < len(regs)) {
+        reserved[xRegNum(regs[k])] = true
+        k = k + 1
+      }
+    }
     if (ins.op == Op.Asm) {
       let blk = module.asmBlocks[ins.ival]
       if (blk.hasResult && blk.resultX64 < 16) {
@@ -2670,6 +2712,10 @@ function xEmitInst(cx: XCtx, i: int): bool {
     xEmitAsm(cx, xDstOrNone(cx, i, ty), ins.ival, ins.args)
     return true
   }
+  if (op == Op.Syscall) {
+    xEmitSyscall(cx, i, ins.lhs, ins.args)
+    return true
+  }
   if (op == Op.FieldGet) {
     xEmitFieldGet(cx, i, ins.lhs, ins.ival, iw, cx.ctx.types[ty].kind == TypeKind.Array)
     return true
@@ -2722,15 +2768,16 @@ function xCompileFunction(module: IrModule, f: IrFunc, cc: XCallConv): FuncCode 
   let intRegs = xBuildIntRegs(cc, flags)
   let floatRegs = xBuildFloatRegs(cc, flags.hasSafepoints)
 
-  // Registers an `asm` block pins (`input`/`result`/clobber) leave the
-  // allocatable file for the whole function — the same exclusion the
-  // needsRaxRdx/needsRcx flags apply for div/shift, generalized to an arbitrary
-  // set (§11.6). No `asm` leaves `intRegs` exactly as `xBuildIntRegs` returned.
-  let asmReserved = xCollectAsmReserved(module, f)
+  // Registers an `asm` block pins (`input`/`result`/clobber, §11.6) or a
+  // `syscall` pins (number/argument/clobber, §11.8) leave the allocatable file
+  // for the whole function — the same exclusion the needsRaxRdx/needsRcx flags
+  // apply for div/shift, generalized to an arbitrary set. Neither construct
+  // leaves `intRegs` exactly as `xBuildIntRegs` returned.
+  let reserved = xCollectReserved(module, f)
   let allocRegs = []XReg64(0)
   let ri = 0
   while (ri < len(intRegs)) {
-    if (!asmReserved[xRegNum(intRegs[ri])]) {
+    if (!reserved[xRegNum(intRegs[ri])]) {
       allocRegs = append(allocRegs, intRegs[ri])
     }
     ri = ri + 1

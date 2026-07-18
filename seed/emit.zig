@@ -403,6 +403,17 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
         }
     }.prefix;
 
+    // §11.8: `syscall()` is Linux-only. The arm64 backend is shared with
+    // aarch64-linux, so the target-specific rejection belongs here, on the
+    // Mach-O path — the one place that knows the OS. Rejecting before any code
+    // is emitted keeps the failure a clean diagnostic rather than a partly
+    // written object.
+    for (module.funcs.items) |*f| {
+        for (f.insts.items(.op)) |op| {
+            if (op == .syscall) return error.SyscallUnsupportedTarget;
+        }
+    }
+
     // ---- every function -> one __text symbol + its relocations ------------
     var main_void = false;
     var have_main = false;

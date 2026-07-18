@@ -2601,6 +2601,15 @@ const FnCtx = struct {
             return self.lowerAtomic(node, name);
         }
         if (std.mem.eql(u8, name, "ptrOf")) return self.lowerPtrOf(node);
+        // `syscall` (§11.8) is the one builtin with no `bit_rt_*` symbol behind
+        // it — the backends emit the kernel trap inline — so it takes its own
+        // op and deliberately never reaches `primRtFn` below.
+        if (std.mem.eql(u8, name, "syscall")) {
+            const vals = try self.lowerArgs(args_node);
+            defer self.gpa.free(vals);
+            const i64ty = self.ctx.prim_ids.get(.i64);
+            return self.b.syscall(i64ty, vals[0], vals[1..]);
+        }
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
         // Runtime primitives (fs §14, math §17, time §18, os §19): each maps 1:1
         // to a runtime call whose result the checker already typed. The arity and
