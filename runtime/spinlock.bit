@@ -1,0 +1,89 @@
+// Minimal spinlock for rare, O(1)-ish critical sections shared across the
+// freestanding runtime (the scheduler's global run queue and registry, channel
+// send/recv/close, the allocator's free lists). Never held across a blocking
+// call or a green-thread context switch, so spinning (rather than a
+// futex/condvar) is both simple and correct — and keeps the runtime free of
+// libc threading primitives. One implementation so no module hand-rolls its
+// own; it lives in its own file so even the lowest layer (the allocator) can
+// use it without importing the scheduler.
+//
+// Stage-2 port of runtime/spinlock.zig (#1361). Both exist during the port;
+// #1369 retires the Zig original.
+//
+// SHAPE. Zig models the lock as a type with methods over an embedded
+// `std.atomic.Value(bool)` field. Bit's atomics (§11.5) address an integer
+// through a raw `*T`, and `ptrOf` is the one bridge from traced memory to a
+// raw pointer, so the Bit port is a set of free functions over a caller-owned
+// lock **word** rather than a struct with methods. That is the shape the rest
+// of the runtime port needs anyway: a lock lives as a word inside a larger
+// runtime structure (the scheduler, an allocator arena) and is reached by
+// offset, not as a value passed around.
+//
+// Every function here is `@nosplit` (§10.3): they are the mutual-exclusion
+// machinery the allocator and collector are built on, so they must not
+// allocate and must not reach a safepoint — a collection that ran while a
+// worker held the allocator's lock would deadlock against the very lock it
+// needs.
+
+// Lock word states. `spinUnlocked` is also the zero value, so a lock word
+// carved out of zeroed memory starts unlocked with no initialization step —
+// matching the Zig original's `.init(false)` field default.
+//
+// The word is `i32` where Zig used a 1-byte `bool`: Bit's atomics require an
+// integer prim (§11.5), and a 32-bit word is the conventional lock width (Go's
+// runtime mutex is a `uint32`) with well-defined atomic support on both
+// targets. The lock is runtime-internal — it appears nowhere in ABI.md — so the
+// width is free to differ from the Zig original.
+export const spinUnlocked: i32 = 0
+export const spinLocked: i32 = 1
+
+// Attempt the lock at `p` once, without spinning: true if it was free and is
+// now held by the caller, false if another holder owns it.
+//
+// `atomicCmpxchg` succeeds only when it observed `spinUnlocked` and installed
+// `spinLocked`, which is exactly the one-shot acquire. The Zig original has no
+// `tryAcquire` — this is a deliberate addition, for two reasons. It is the
+// operation `spinAcquire` is built from, so defining acquire in terms of it
+// keeps one copy of the exclusion rule; and it makes exclusion
+// DETERMINISTICALLY TESTABLE. A spin loop cannot be probed from a single
+// thread (the probe would never return), and the v1 scheduler cannot produce
+// true contention inside a critical section, so without this a test cannot
+// tell a real lock from one that never excludes anything at all.
+export @nosplit function spinTryAcquire(p: *i32): bool {
+  return atomicCmpxchg(p, spinUnlocked, spinLocked)
+}
+
+// Acquire the lock at `p`, spinning until it is won.
+//
+// The loop retries for exactly as long as another holder owns the word. This
+// is the Go-style sense of the Zig original's
+// `cmpxchgWeak(false, true, ...) != null` test, which spins while the swap
+// FAILS (Zig returns null on success, the current value on failure).
+//
+// The Zig original calls `std.atomic.spinLoopHint()` in the retry body. Bit
+// cannot express it today: the hint is an `asm` block, and `@nosplit` rejects
+// `asm` (E0075, §10.3). The hint is a scheduling/power advisory with no
+// semantic content — it changes neither the memory ordering nor the outcome —
+// so omitting it preserves correctness exactly, and it can be restored the
+// moment `@nosplit` admits `asm`.
+//
+// DEADLOCK HAZARD (v1 scheduler). `@nosplit` removes the safepoint poll, so a
+// thread spinning here can never yield. Under the current cooperative,
+// single-worker scheduler that means any thread descheduled while HOLDING the
+// lock deadlocks every spinner permanently. Today's callers are safe only
+// because their critical sections contain no safepoint. This resolves itself
+// when the scheduler becomes genuinely M:N (#1364) and a spinner is a real OS
+// thread making progress in parallel with the holder — which is the regime the
+// Zig original already assumes.
+export @nosplit function spinAcquire(p: *i32) {
+  let won = false
+  while (!won) {
+    won = spinTryAcquire(p)
+  }
+}
+
+// Release the lock at `p`. Unconditional: only the holder calls this, so there
+// is nothing to compare against — the same plain store the Zig original does.
+export @nosplit function spinRelease(p: *i32) {
+  atomicStore(p, spinUnlocked)
+}

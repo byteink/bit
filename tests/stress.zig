@@ -83,7 +83,11 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
 
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
-    const exe = (try bit.buildHostModule(gpa, io, dir_abs, libbitrt, &discard.writer)) orelse {
+    // Whole-project build, not the single-module entry: a stress program is a
+    // directory, so it gets the prelude and may import another module — which
+    // `spinlock` does, pulling the lock under test straight out of `runtime/`
+    // instead of testing a stale copy of it.
+    const exe = (try bit.buildHostProject(gpa, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
         std.debug.print("stress '{s}': compile failed:\n{s}\n", .{ name, discard.written() });
         return error.StressCompileFailed;
     };

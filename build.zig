@@ -317,6 +317,10 @@ pub fn build(b: *std.Build) void {
     // the host libbitrt archive wired in at the tail.
     const stress_opts = b.addOptions();
     stress_opts.addOption([]const u8, "stress_dir", b.pathFromRoot("tests/stress"));
+    // Stress programs build through the whole-project pipeline (like examples
+    // and imports), so one may `import` another module — `tests/stress/spinlock`
+    // pulls in the Bit runtime lock from `runtime/` rather than copying it.
+    stress_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
 
     const stress_mod = b.createModule(.{
         .root_source_file = b.path("tests/stress.zig"),

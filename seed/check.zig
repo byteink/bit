@@ -5026,10 +5026,23 @@ const Checker = struct {
                     try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' may not allocate or call indirectly here", .{caller}, "nosplit bodies allow only calls to other nosplit functions");
                     return;
                 }
-                const is_nosplit = if (self.nodeSymbol(file_idx, ck[0])) |sym|
-                    (self.ctx.func_attrs.get(sym.pack()) orelse FuncAttrs{}).nosplit
-                else
-                    false;
+                // The resolver injects every predeclared builtin as a real
+                // `.builtin_func` symbol, so a builtin call resolves like any
+                // other and carries no `func_attrs` entry. Of that set only the
+                // atomics (§11.5) are safe here: they lower to inline machine
+                // instructions rather than a call, so they can neither allocate
+                // nor reach a safepoint. Every other builtin may do both and
+                // stays rejected. Without this carve-out the unmanaged subset
+                // contradicts itself — a lock is precisely the machinery
+                // `@nosplit` exists to protect, yet could not be written with
+                // `@nosplit`. A user function of the same name resolves to its
+                // own `.func` symbol and is judged on its own attribute, so
+                // shadowing keeps working here as it does everywhere else.
+                const is_nosplit = if (self.nodeSymbol(file_idx, ck[0])) |gsym| blk: {
+                    const sym = self.symbolOf(gsym);
+                    if (sym.kind == .builtin_func) break :blk atomicArity(sym.name) != null;
+                    break :blk (self.ctx.func_attrs.get(gsym.pack()) orelse FuncAttrs{}).nosplit;
+                } else false;
                 if (!is_nosplit) {
                     try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' calls '{s}', which is not marked nosplit", .{ caller, Checker.identText(mf, ck[0]) }, "mark the callee @nosplit or inline it");
                     return;

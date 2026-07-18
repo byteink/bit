@@ -1,0 +1,133 @@
+// The Bit spinlock (runtime/spinlock.bit, #1361) — the first Stage-2 runtime
+// port, exercised as a real linked binary.
+//
+// This is the pathfinder port: the lock is the mutual-exclusion primitive the
+// allocator, collector and scheduler are all built on, so it is the smallest
+// piece of runtime that still proves the unmanaged subset works end to end —
+// `@nosplit` (§10.3) over atomics (§11.5) over a raw `*T` (§11.4).
+//
+// The module under test is imported from `../../../runtime`, so this test
+// compiles the SAME source the runtime will ship rather than a copy. That is
+// also the first half of the build-pipeline answer: a Bit runtime module is a
+// module like any other, and today's compiler can already pull it into a
+// program by source. Compiling it separately into `libbitrt.a` needs an
+// emit-object mode and an archive writer that do not exist yet (see #1361).
+//
+// Three properties, all deterministic:
+//
+//   (a) Raw acquire/release KAT — single-threaded, observing the lock word
+//       directly through `atomicLoad`. After `spinAcquire` the word reads
+//       `spinLocked`; after `spinRelease` it reads `spinUnlocked`. A lock that
+//       never wrote the word (or wrote the wrong value) fails here before any
+//       concurrency is involved.
+//
+//   (b) Exclusion, deterministically — while the lock is held,
+//       `spinTryAcquire` must FAIL; once released it must SUCCEED. This is the
+//       property that actually distinguishes a lock from a no-op, and it is
+//       checked from a single thread because it cannot be checked from many
+//       (see the note on (c)). Re-acquiring after release also proves the lock
+//       is reusable: a release that failed to publish `spinUnlocked` would
+//       deadlock the following `spinAcquire`, so that is enforced by the test
+//       completing at all.
+//
+//   (c) Mutual exclusion under contention — WORKERS green threads each perform
+//       ITERS non-atomic read-modify-writes of one shared counter, with the
+//       whole read-modify-write inside the critical section. The counter is a
+//       PLAIN `[]i64` element (`counter[0] = counter[0] + 1`), NOT an atomic
+//       op: that is the point. Only real mutual exclusion can make a plain
+//       increment come out exact, so a broken lock shows up as a lost update —
+//       a total short of WORKERS*ITERS — rather than as a crash. A second
+//       counter tracks the maximum number of threads seen inside the critical
+//       section at once; it must stay exactly 1, which catches a lock that
+//       hands out concurrent ownership even in a run where the increments
+//       happened to interleave harmlessly.
+//
+// The v1 scheduler pins to a single worker, so the threads interleave
+// cooperatively rather than in true parallel; the same test becomes a genuine
+// data-race probe unchanged once the scheduler unpins to M:N. Under
+// BIT_GC=stress the collector fires at every safepoint, which also proves the
+// lock word's backing slice stays rooted through `main` while only a raw,
+// untraced `*i32` reaches the workers — and that the `@nosplit` lock bodies
+// themselves take no safepoint.
+//
+// WORKERS*ITERS = 8 * 2000 = 16000.
+
+import { spinAcquire, spinTryAcquire, spinRelease, spinUnlocked, spinLocked } from "../../../runtime"
+
+const WORKERS = 8
+const ITERS = 2000
+
+// One worker: ITERS plain (non-atomic) increments, each under the lock.
+//
+// `inside` is incremented on entry and decremented on exit, and `maxInside`
+// keeps the high-water mark. Both are touched only while the lock is held, so
+// under a correct lock `inside` is never observed above 1.
+function worker(lock: *i32, counter: []i64, inside: []i64, maxInside: []i64,
+                iters: i64, done: chan<i64>) {
+  let k = 0
+  while (k < iters) {
+    spinAcquire(lock)
+    inside[0] = inside[0] + 1
+    if (inside[0] > maxInside[0]) {
+      maxInside[0] = inside[0]
+    }
+    counter[0] = counter[0] + 1        // plain RMW: exact only under real exclusion
+    inside[0] = inside[0] - 1
+    spinRelease(lock)
+    k = k + 1
+  }
+  done <- 1
+}
+
+function main() {
+  let lbuf = []i32(1)
+  let lock = ptrOf(lbuf)
+  atomicStore(lock, spinUnlocked)
+
+  // (a) raw acquire/release KAT.
+  spinAcquire(lock)
+  let heldWhenLocked = atomicLoad(lock) == spinLocked
+  spinRelease(lock)
+  let freeWhenReleased = atomicLoad(lock) == spinUnlocked
+
+  // (b) exclusion: a try must fail while held and succeed once free. This is
+  // what separates a real lock from one that hands ownership to everyone.
+  spinAcquire(lock)
+  let tryFailsWhileHeld = !spinTryAcquire(lock)
+  spinRelease(lock)
+  let trySucceedsWhenFree = spinTryAcquire(lock)
+  spinRelease(lock)                       // drop the lock the try just took
+
+  // The lock is reusable: take and drop it once more through the spinning path.
+  spinAcquire(lock)
+  spinRelease(lock)
+  let kat = 0
+  if (heldWhenLocked && freeWhenReleased && tryFailsWhileHeld && trySucceedsWhenFree) {
+    kat = 1
+  }
+
+  // (c) contention.
+  let counter = []i64(1)
+  let inside = []i64(1)
+  let maxInside = []i64(1)
+  let done = chan<i64>(WORKERS)
+  let w = 0
+  while (w < WORKERS) {
+    spawn worker(lock, counter, inside, maxInside, ITERS, done)
+    w = w + 1
+  }
+  let j = 0
+  while (j < WORKERS) {
+    let sig = <- done
+    j = j + 1
+  }
+
+  // The lock must be free again once every worker has finished. `lbuf` is
+  // reached here so it stays rooted across the join.
+  let freeAtEnd = 0
+  if (atomicLoad(lock) == spinUnlocked) {
+    freeAtEnd = 1
+  }
+
+  print("${kat} ${counter[0]} ${maxInside[0]} ${freeAtEnd}\n")
+}

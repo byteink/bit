@@ -475,11 +475,14 @@ collector can never run inside it. This is what lets code that *implements* the
 allocator and collector call it safely. A `@nosplit` body is restricted to
 provably non-allocating forms — arithmetic and comparison, name and literal
 reads, field access on a value in hand, `if`/`while`/`for`, assignment,
-`break`/`continue`, and `return` — plus calls to other `@nosplit` functions.
+`break`/`continue`, and `return` — plus calls to other `@nosplit` functions and
+to the **atomic builtins** (§11.5), which lower to inline machine instructions
+rather than a call and so can neither allocate nor reach a safepoint. A declared
+function shadows a builtin of the same name here as everywhere else.
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
 slice and map construction, indexing, `append`, `spawn`, closures, channel
-operations, string interpolation, and any call through a value or interface
-(whose target is not knowable statically).
+operations, string interpolation, `asm` blocks, every other builtin, and any
+call through a value or interface (whose target is not knowable statically).
 
 Safety is transitive by induction rather than by whole-program analysis: each
 call site requires only that its own callee is `@nosplit`, and the same rule
