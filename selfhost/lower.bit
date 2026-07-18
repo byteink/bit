@@ -67,6 +67,25 @@ function lowerParamTypes(c: Checker, decl: int): []int {
   return lowerParamTypesIn(c, decl, noSubst())
 }
 
+// The IR parameter SLOTS for `decl`. Identical to `lowerParamTypes` except that
+// a trailing `...xs: T` occupies one slot of type `[]T`: the declared type node
+// holds the element type T, but the body binds — and the call ABI passes — the
+// slice (§10.3). A signature built from the declared types alone would declare
+// a scalar that the body then reads a slice header off of, so this is the
+// callee-side half of variadic lowering; `lowerArgsRest` is the caller side.
+function lowerParamSlotTypes(c: Checker, decl: int): []int {
+  let types = lowerParamTypes(c, decl)
+  // An extern decl is [name, params, result] — no kid 3 — and cannot be
+  // variadic anyway (E0077), so it is never rewritten here.
+  if (len(types) == 0 || isExternDecl(c.tree, decl)) {
+    return types
+  }
+  if (paramsAreVariadic(c, kidsOf(c.tree, decl)[3])) {
+    types[len(types) - 1] = mkSlice(c.ctx, types[len(types) - 1])
+  }
+  return types
+}
+
 // `sub` binds the decl's type params (by name, which is unambiguous WITHIN one
 // decl) so a generic's parameter types come out concrete for one call.
 function lowerParamTypesIn(c: Checker, decl: int, sub: TypeSubst): []int {
@@ -544,10 +563,24 @@ function decodeStringContent(src: string, start: int, endPos: int): string {
 // an untyped literal argument materializes at the parameter's width); an empty
 // `paramTypes` gives no hints.
 function lowerArgs(fc: FnCtx, node: int, paramTypes: []int): []int {
+  return lowerArgsRest(fc, node, paramTypes, -1, 0)
+}
+
+// `lowerArgs` plus §10.3 variadic collection: the arguments from index `fixed`
+// onward are gathered into ONE `[]elemTy` value, because that single slice is
+// what the callee binds. Passing them as separate scalars instead leaves the
+// callee reading a slice header off an integer — an immediate segfault, not a
+// wrong answer. `fixed < 0` means the callee is not variadic and every argument
+// keeps its own slot, which is what plain `lowerArgs` asks for.
+function lowerArgsRest(fc: FnCtx, node: int, paramTypes: []int, fixed: int, elemTy: int): []int {
   let args = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])
   let vals = []int(0)
+  let stop = len(args)
+  if (fixed >= 0 && fixed < stop) {
+    stop = fixed
+  }
   let i = 0
-  while (i < len(args) && !fc.failed) {
+  while (i < stop && !fc.failed) {
     let a = args[i]
     if (getNode(fc.c.tree, a).tag == Tag.Arg) {
       a = kidsOf(fc.c.tree, a)[0]
@@ -560,7 +593,47 @@ function lowerArgs(fc: FnCtx, node: int, paramTypes: []int): []int {
     vals = append(vals, arrayValueForBind(fc, a, lowerExprH(fc, a, hint), defaultType(fc.c, nodeType(fc, a))))
     i = i + 1
   }
-  return vals
+  if (fixed < 0 || fc.failed) {
+    return vals
+  }
+  return append(vals, lowerVariadicTail(fc, elemTy, args[stop:len(args)]))
+}
+
+// `lowerArgs` for a call to `decl`, collecting the tail when that signature is
+// variadic. `paramTypes` is supplied by the caller rather than derived here
+// because a generic call substitutes its type params first.
+function lowerArgsFor(fc: FnCtx, node: int, oc: Checker, decl: int, paramTypes: []int): []int {
+  // An extern decl has no kid 3 and cannot be variadic (E0077).
+  if (len(paramTypes) == 0 || isExternDecl(oc.tree, decl)) {
+    return lowerArgs(fc, node, paramTypes)
+  }
+  if (!paramsAreVariadic(oc, kidsOf(oc.tree, decl)[3])) {
+    return lowerArgs(fc, node, paramTypes)
+  }
+  let fixed = len(paramTypes) - 1
+  return lowerArgsRest(fc, node, paramTypes, fixed, paramTypes[fixed])
+}
+
+// Materializes a variadic call's trailing arguments as the single `[]T` value
+// the callee binds (§10.3). A lone `...s` spread (§12.4) forwards `s` itself
+// rather than rebuilding it, which is what makes the pass-through form
+// aliasing-free. The checker restricts `...` to the final argument (E0063), so
+// a spread anywhere else in the tail means the tree disagrees with what was
+// checked — refuse rather than emit something plausible.
+function lowerVariadicTail(fc: FnCtx, elemTy: int, items: []int): int {
+  let sliceTy = mkSlice(fc.c.ctx, elemTy)
+  if (len(items) == 1 && getNode(fc.c.tree, items[0]).tag == Tag.ArgSpread) {
+    return lowerExprH(fc, kidsOf(fc.c.tree, items[0])[0], sliceTy)
+  }
+  let i = 0
+  while (i < len(items)) {
+    if (getNode(fc.c.tree, items[i]).tag == Tag.ArgSpread) {
+      fc.failed = true
+      return 0
+    }
+    i = i + 1
+  }
+  return lowerSliceElems(fc, sliceTy, items)
 }
 
 // Lowers `len(x)` / `cap(x)`: an array is its static length (const_int, len==cap),
@@ -1017,7 +1090,14 @@ function lowerCall(fc: FnCtx, node: int): int {
     // the closure via `call_value`.
     let lvi = envIndex(fc, name)
     if (lvi != -1 && fc.c.ctx.types[fc.env[lvi].ty].kind == TypeKind.Func) {
-      let a = lowerArgs(fc, node, fc.c.ctx.types[fc.env[lvi].ty].members)
+      let members = fc.c.ctx.types[fc.env[lvi].ty].members
+      let vfixed = -1
+      let velem = 0
+      if (fc.c.ctx.types[fc.env[lvi].ty].variadic && len(members) > 0) {
+        vfixed = len(members) - 1
+        velem = members[vfixed]
+      }
+      let a = lowerArgsRest(fc, node, members, vfixed, velem)
       if (fc.failed) {
         return 0
       }
@@ -1042,7 +1122,7 @@ function lowerCall(fc: FnCtx, node: int): int {
         // Hint each argument with the CONCRETE parameter type this call binds:
         // the template's `[]T` would build a slice literal argument as a slice of
         // a type param (a GC reference), not as `[]i64`.
-        let a = lowerArgs(fc, node, genericParamTypes(oc, decl, targs))
+        let a = lowerArgsFor(fc, node, oc, decl, genericParamTypes(oc, decl, targs))
         if (fc.failed || idx == -1) {
           fc.failed = true
           return 0
@@ -1052,7 +1132,7 @@ function lowerCall(fc: FnCtx, node: int): int {
         gi.args = a
         return builderEmit(fc.b, gi)
       }
-      let a = lowerArgs(fc, node, lowerParamTypes(oc, decl))
+      let a = lowerArgsFor(fc, node, oc, decl, lowerParamTypes(oc, decl))
       if (fc.failed) {
         return 0
       }
@@ -4193,7 +4273,7 @@ function lowerDefer(fc: FnCtx, node: int) {
     ins = mkInstr(Op.Call, funcResultLookup(fc.c, name))
     // Same qualification a direct call gets: the callee's own module's symbol.
     ins.name = callQualified(fc.c, fc.lowerer.root, name)
-    ins.args = lowerArgs(fc, call, lowerParamTypes(declOwner(fc.c, name), decl))
+    ins.args = lowerArgsFor(fc, call, declOwner(fc.c, name), decl, lowerParamTypes(declOwner(fc.c, name), decl))
   }
   if (fc.failed) {
     return
@@ -4716,7 +4796,7 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   if (pinned != "") {
     name = pinned
   }
-  let paramTypes = lowerParamTypes(c, decl)
+  let paramTypes = lowerParamSlotTypes(c, decl)
   // An omitted result is void; a fallible result `T!E` shows its ok type in the
   // header, and its ok/err feed the error channel (`fail`/`?`/ok-return).
   let result = c.ctx.voidId
@@ -4987,6 +5067,14 @@ function lowerSpawn(fc: FnCtx, node: int) {
     fc.failed = true
     return
   }
+  // `spawn` packs one thunk slot per declared parameter, so a variadic callee
+  // would need its tail collected into a `[]T` first. Refuse explicitly: an
+  // arity-only guard would let `spawn f(x)` against `...xs: T` through, and the
+  // thunk would then hand the callee a scalar where it binds a slice.
+  if (fc.c.ctx.types[fty].variadic) {
+    fc.failed = true
+    return
+  }
   let paramTypes = fc.c.ctx.types[fty].members
   let result = fc.c.ctx.types[fty].result
   let argVals = lowerArgs(fc, call, paramTypes)
@@ -5091,7 +5179,7 @@ function fnValueTrampoline(fc: FnCtx, funcName: string): int {
   let fid = fc.lowerer.reservedCount + len(fc.lowerer.closureFuncs)
   let decl = funcDeclLookup(fc.c, funcName)
   // An imported target's params are declared in ITS tree (see declOwner).
-  let paramTypes = lowerParamTypes(declOwner(fc.c, funcName), decl)
+  let paramTypes = lowerParamSlotTypes(declOwner(fc.c, funcName), decl)
   let result = unwrapFallible(fc.c, funcResultLookup(fc.c, funcName))
   let fnTy = funcSigLookup(fc.c, funcName)
   let b = newBuilder()

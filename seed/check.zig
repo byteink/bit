@@ -588,6 +588,17 @@ pub const TypeContext = struct {
         return self.types.get(id);
     }
 
+    /// The `[]T` for element type `T`. `pub` for one narrow reason: a variadic
+    /// signature stores its *element* type, but both the body binding and the
+    /// call ABI use `[]T` (§10.3), so lowering must name that type too. This
+    /// deliberately exposes `sliceOf` and not `intern` — lowering minting
+    /// arbitrary new types would perturb the interning order the `--dump-types`
+    /// differential pins. For a checked variadic the slice is already interned
+    /// (see the `param_rest` bind in `checkFuncBody`), so this hits the table.
+    pub fn sliceOf(self: *TypeContext, elem: TypeId) Error!TypeId {
+        return self.types.intern(.{ .slice = elem });
+    }
+
     /// The `show(): string` method (§5.7) that gives `ty` a string conversion,
     /// or `null` when it has none. Bit has no universal `toString` and no
     /// printf-style formatter: a value converts to `string` iff it is a

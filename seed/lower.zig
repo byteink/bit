@@ -295,16 +295,20 @@ const DeferredCall = union(enum) {
 /// materializes at the parameter's type rather than its own default — see
 /// `lowerSpawn` for the same reasoning; without it the inliner fuses a
 /// mistyped argument into the callee's body and IR verification rejects it.
+/// `params` is the callee's *declared* parameter list. For a variadic callee
+/// the final entry is the element type `T`, not the `[]T` the callee actually
+/// binds (§10.3) — `variadic` says so, and the call site is responsible for
+/// collecting the trailing arguments into one slice before the call.
 const CallTarget = union(enum) {
-    direct: struct { func: ir.FuncId, result: TypeId, params: []const TypeId },
+    direct: struct { func: ir.FuncId, result: TypeId, params: []const TypeId, variadic: bool },
     /// A struct method (static dispatch): `recv` is prepended to the user
     /// args as the callee's own leading parameter.
-    direct_method: struct { func: ir.FuncId, recv: ir.ValueId, result: TypeId, params: []const TypeId },
-    iface: struct { recv: ir.ValueId, method_index: u32, result: TypeId, params: []const TypeId },
-    value: struct { callee: ir.ValueId, result: TypeId, params: []const TypeId },
+    direct_method: struct { func: ir.FuncId, recv: ir.ValueId, result: TypeId, params: []const TypeId, variadic: bool },
+    iface: struct { recv: ir.ValueId, method_index: u32, result: TypeId, params: []const TypeId, variadic: bool },
+    value: struct { callee: ir.ValueId, result: TypeId, params: []const TypeId, variadic: bool },
 };
 
-const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, result: TypeId, params: []const TypeId };
+const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, result: TypeId, params: []const TypeId, variadic: bool };
 
 // ============================================================================
 // Lowerer — module-level driver and shared tables
@@ -559,12 +563,21 @@ pub const Lowerer = struct {
         }
 
         const param_nodes = mf.tree.kids(k[3]);
-        if (param_nodes.len != shape.params.len) return error.UnsupportedConstruct; // variadic mismatch guard
+        if (param_nodes.len != shape.params.len) return error.UnsupportedConstruct; // arity mismatch guard
         for (param_nodes, shape.params) |pn, pty| {
             const pk = mf.tree.kids(pn); // param: [name_ident, type]
-            try param_types.append(self.gpa, pty);
-            const p = try b.addParam(pty);
-            try env.declare(self.gpa, identTextOf(mf, pk[0]), p, pty);
+            // `shape.params` holds a variadic param's *element* type T, but the
+            // body binds it — and the ABI passes it — as `[]T` (§10.3), which
+            // is what the checker bound the name to. Lowering the parameter as
+            // T instead would declare a scalar the callee then reads a slice
+            // header off of.
+            const bind_ty = if (mf.tree.get(pn).tag == .param_rest)
+                try self.ctx.sliceOf(pty)
+            else
+                pty;
+            try param_types.append(self.gpa, bind_ty);
+            const p = try b.addParam(bind_ty);
+            try env.declare(self.gpa, identTextOf(mf, pk[0]), p, bind_ty);
         }
 
         var is_fallible = false;
@@ -926,7 +939,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
                 const bucket = ctx.methodsOf(recv_ty) orelse continue;
                 const method = bucket.get(name) orelse continue;
                 const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
-                try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result, .params = method.params });
+                try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result, .params = method.params, .variadic = method.variadic });
                 try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .ty = recv_ty, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
             }
         }
@@ -2580,7 +2593,7 @@ const FnCtx = struct {
             const inst = self.ctx.instantiations.items[idx];
             const shape = self.ctx.typeOf(inst.result).func;
             const fid = self.l.inst_ids.get(idx).?;
-            return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params } };
+            return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params, .variadic = shape.variadic } };
         }
 
         const callee_tag = self.tree().get(callee).tag;
@@ -2590,7 +2603,7 @@ const FnCtx = struct {
                 if (sym.kind == .func) {
                     const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
                     const shape = self.ctx.func_sigs.get(gsym.pack()).?;
-                    return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params } };
+                    return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params, .variadic = shape.variadic } };
                 }
             }
         }
@@ -2602,7 +2615,7 @@ const FnCtx = struct {
                 if (self.l.symbolOf(gsym).kind == .func) {
                     const fid = self.l.func_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
                     const shape = self.ctx.func_sigs.get(gsym.pack()).?;
-                    return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params } };
+                    return .{ .direct = .{ .func = fid, .result = shape.result, .params = shape.params, .variadic = shape.variadic } };
                 }
             }
             const k = self.kids(callee); // [recv, name]
@@ -2613,7 +2626,7 @@ const FnCtx = struct {
                 for (data.interface) |m| {
                     if (!std.mem.eql(u8, m.name, name)) continue;
                     const recv_val = try self.lowerExpr(k[0]);
-                    return .{ .iface = .{ .recv = recv_val, .method_index = try self.l.methodId(m.name), .result = m.result, .params = m.params } };
+                    return .{ .iface = .{ .recv = recv_val, .method_index = try self.l.methodId(m.name), .result = m.result, .params = m.params, .variadic = m.variadic } };
                 }
                 return error.UnsupportedConstruct;
             }
@@ -2628,11 +2641,11 @@ const FnCtx = struct {
                     };
                     const fv = try self.b.fieldGet(f.ty, recv_val, off);
                     const fshape = self.ctx.typeOf(f.ty).func;
-                    return .{ .value = .{ .callee = fv, .result = fshape.result, .params = fshape.params } };
+                    return .{ .value = .{ .callee = fv, .result = fshape.result, .params = fshape.params, .variadic = fshape.variadic } };
                 }
                 if (self.l.lookupMethod(recv_ty, name)) |entry| {
                     const recv_val = try self.lowerExpr(k[0]);
-                    return .{ .direct_method = .{ .func = entry.fid, .recv = recv_val, .result = entry.result, .params = entry.params } };
+                    return .{ .direct_method = .{ .func = entry.fid, .recv = recv_val, .result = entry.result, .params = entry.params, .variadic = entry.variadic } };
                 }
             }
             return error.UnsupportedConstruct;
@@ -2641,7 +2654,7 @@ const FnCtx = struct {
         const callee_val = try self.lowerExpr(callee);
         const callee_ty = try self.nodeType(callee);
         const shape = self.ctx.typeOf(callee_ty).func;
-        return .{ .value = .{ .callee = callee_val, .result = shape.result, .params = shape.params } };
+        return .{ .value = .{ .callee = callee_val, .result = shape.result, .params = shape.params, .variadic = shape.variadic } };
     }
 
     fn lowerArgs(self: *FnCtx, args_node: ast.Index) Error![]ir.ValueId {
@@ -2978,22 +2991,29 @@ const FnCtx = struct {
         const params: []const TypeId = switch (target) {
             inline else => |t| t.params,
         };
+        const variadic: bool = switch (target) {
+            inline else => |t| t.variadic,
+        };
+        // A variadic callee binds one `[]T`, so only the leading `fixed` params
+        // take an argument each; everything after is collected into that slice.
+        const fixed = if (variadic) params.len - 1 else params.len;
+        const arg_nodes = self.kids(k[2]);
+        if (arg_nodes.len < fixed) return error.UnsupportedConstruct; // arity already checked
         var args: std.ArrayList(ir.ValueId) = .empty;
         defer args.deinit(self.gpa);
         if (target == .direct_method) try args.append(self.gpa, target.direct_method.recv);
         // Hint each explicit argument with its parameter type so an untyped
         // literal materializes at the callee's declared type, not its own
-        // default (see `CallTarget.params`). A variadic tail runs past the
-        // declared params and is lowered unhinted.
-        for (self.kids(k[2]), 0..) |an, i| {
+        // default (see `CallTarget.params`).
+        for (arg_nodes[0..fixed], 0..) |an, i| {
             if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct;
-            const hint: ?TypeId = if (i < params.len) params[i] else null;
             const arg_expr = self.kids(an)[0];
-            const av = try self.lowerExprH(arg_expr, hint);
+            const av = try self.lowerExprH(arg_expr, params[i]);
             // Value semantics: an array argument is passed by copy, so the
             // callee cannot mutate the caller's storage.
             try args.append(self.gpa, try self.arrayValueForBind(arg_expr, av, try self.nodeType(arg_expr)));
         }
+        if (variadic) try args.append(self.gpa, try self.lowerVariadicTail(params[params.len - 1], arg_nodes[fixed..]));
         // A fallible callee delivers its ok value in the normal return register
         // (the error rides the runtime slot — §18), so the call instruction's
         // result type is the ok type, never the boxed `T!`.
@@ -3003,6 +3023,23 @@ const FnCtx = struct {
             .iface => |x| self.b.callIface(self.okResult(x.result), x.recv, x.method_index, args.items),
             .value => |x| self.b.callValue(self.okResult(x.result), x.callee, args.items),
         };
+    }
+
+    /// Materializes a variadic call's trailing arguments as the single `[]T`
+    /// value the callee binds (§10.3): `f(a, b, c)` against `...xs: T` passes
+    /// one slice, never three scalars. A final `...s` spread (§12.4) forwards
+    /// an existing slice unchanged rather than rebuilding it, which is also
+    /// what makes the pass-through form aliasing-free.
+    fn lowerVariadicTail(self: *FnCtx, elem_ty: TypeId, items: []const ast.Index) Error!ir.ValueId {
+        const slice_ty = try self.ctx.sliceOf(elem_ty);
+        if (items.len == 1 and self.tree().get(items[0]).tag == .arg_spread) {
+            return self.lowerExprH(self.kids(items[0])[0], slice_ty);
+        }
+        // The checker restricts `...` to the final argument of a variadic call
+        // (E0031 invalid_spread), so a spread anywhere in the collected tail
+        // means the tree disagrees with what was checked.
+        for (items) |it| if (self.tree().get(it).tag != .arg) return error.UnsupportedConstruct;
+        return self.lowerSliceElems(slice_ty, items);
     }
 
     /// The ok half of a `T!` result, or `ty` unchanged when not fallible.
@@ -3078,7 +3115,12 @@ const FnCtx = struct {
         // order, before allocating the thunk.
         const shape = self.ctx.typeOf(fty).func;
         const arg_nodes = self.kids(k[2]);
-        if (arg_nodes.len != shape.params.len) return error.UnsupportedConstruct; // variadic spawn out of scope
+        // `spawn` packs one thunk slot per declared param, so a variadic callee
+        // would need its tail collected first. Refuse explicitly: an arity-only
+        // guard lets `spawn f(x)` against `...xs: T` through, and the thunk
+        // would then hand the callee a scalar where it binds a `[]T`.
+        if (shape.variadic) return error.UnsupportedConstruct; // variadic spawn out of scope
+        if (arg_nodes.len != shape.params.len) return error.UnsupportedConstruct;
         var arg_vals: std.ArrayList(ir.ValueId) = .empty;
         defer arg_vals.deinit(self.gpa);
         var arg_tys: std.ArrayList(TypeId) = .empty;
