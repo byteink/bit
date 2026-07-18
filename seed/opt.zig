@@ -498,6 +498,7 @@ fn emitTranslated(
         .atomic_rmw => |a| remap[idx] = try bldr.atomicRmw(op, ty, tr(remap, @intFromEnum(a.ptr)), tr(remap, @intFromEnum(a.operand))),
         .make_closure => |mc| remap[idx] = try bldr.makeClosure(ty, mc.func, tr(remap, @intFromEnum(mc.env))),
         .func_addr => |fa| remap[idx] = try bldr.funcAddr(ty, fa.func),
+        .global_addr => |ga| remap[idx] = try bldr.globalAddr(ty, ga.global),
         .rt_call => |rc| {
             const args = try trList(gpa, remap, rc.args);
             defer gpa.free(args);
@@ -630,7 +631,7 @@ fn isSideEffecting(op: ir.Op) bool {
 
 fn markOperandsLive(f: *const ir.Function, live: []bool, id: ir.ValueId) void {
     switch (f.decode(id)) {
-        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc, .type_info, .func_addr => {},
+        .block_param, .const_int, .const_float, .const_bool, .const_string, .const_nil, .unreachable_, .gc_alloc, .type_info, .func_addr, .global_addr => {},
         .bin => |b| {
             live[@intFromEnum(b.lhs)] = true;
             live[@intFromEnum(b.rhs)] = true;

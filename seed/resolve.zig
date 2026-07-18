@@ -87,6 +87,12 @@ pub const Symbol = struct {
     /// Index into the `files` slice `decl` belongs to; meaningless if `decl == ast.none`.
     file_idx: u32 = 0,
     exported: bool = false,
+    /// True for symbols declared in the module scope itself, as opposed to any
+    /// nested block/function scope. Only `insertModuleSymbol` sets it. The
+    /// distinction matters for `let_binding`, which is the kind of *both* a
+    /// module-level `let` (§11.11, a static cell) and every local `let` (an SSA
+    /// value) — nothing else in the symbol table separates the two.
+    module_scoped: bool = false,
     /// Set for `.import_item`: the concrete symbol it aliases in another module.
     imported_from: ?struct { module: ModuleId, symbol: SymbolId } = null,
     /// Set for `.import_namespace`: the module it namespaces (null if the
@@ -408,7 +414,9 @@ const Resolver = struct {
             self.setNodeSymbol(file_idx, name_node, .none);
             return .none;
         }
-        const id = try self.newSymbol(sym);
+        var msym = sym;
+        msym.module_scoped = true;
+        const id = try self.newSymbol(msym);
         try self.scope(self.module_scope).names.put(self.gpa, sym.name, id);
         if (sym.exported) try self.exports.put(self.gpa, sym.name, id);
         try self.checkShadowsPredeclared(mf, name_node, sym.name);

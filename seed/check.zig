@@ -1090,6 +1090,12 @@ const Checker = struct {
     /// top-level `const`'s initializer — including one imported from another
     /// module — after this `Checker` goes out of scope.
     const_inits: std.AutoHashMapUnmanaged(SymbolId, ast.Index) = .{},
+    /// SymbolId -> the validated initial value of a module-level `let`
+    /// (§11.11). Populated by `checkModuleState`, which has already proved the
+    /// type is untraced and the initializer constant, so lowering can render
+    /// the static byte image without re-running the constant evaluator (and
+    /// without the two evaluators ever drifting apart).
+    module_state: std.AutoHashMapUnmanaged(SymbolId, ModuleStateInit) = .{},
     /// SymbolId (this module only) -> resolved `TypeId`, for every
     /// `let`/`const`/`param`/`receiver` binding and every loop/catch/arrow
     /// binder. Populated by body-checking as each binding statement/binder is
@@ -2918,11 +2924,25 @@ const Checker = struct {
                 return .invalid;
             }
             const slice_ty = try self.checkArgExprType(file_idx, arg_items[0], env, fctx);
+            // `ptrOf(g)` on module-level state (§11.11): its cell has a static
+            // address, so this is the addressability the atomic builtins need.
+            // Restricted to module scope on purpose — a local has no stable
+            // address to hand out, which is exactly why `&` stays reserved.
+            if (self.moduleStateArg(file_idx, arg_items[0])) {
+                const elem = if (self.ctx.typeOf(slice_ty) == .array) self.ctx.typeOf(slice_ty).array.elem else slice_ty;
+                if (self.ctx.typeOf(elem) != .prim or !self.ctx.typeOf(elem).prim.isInteger()) {
+                    const n = try self.typeName(elem);
+                    defer self.gpa.free(n);
+                    try self.emit(mf, arg_items[0], .invalid_operand, "'ptrOf' requires an integer element, found '{s}'", .{n}, null);
+                    return .invalid;
+                }
+                return self.ctx.types.intern(.{ .ptr = elem });
+            }
             if (self.ctx.typeOf(slice_ty) != .slice) {
                 if (slice_ty != .invalid) {
                     const n = try self.typeName(slice_ty);
                     defer self.gpa.free(n);
-                    try self.emit(mf, arg_items[0], .invalid_operand, "'ptrOf' requires a slice '[]T', found '{s}'", .{n}, null);
+                    try self.emit(mf, arg_items[0], .invalid_operand, "'ptrOf' requires a slice '[]T' or module-level state, found '{s}'", .{n}, null);
                 }
                 return .invalid;
             }
@@ -3949,10 +3969,22 @@ const Checker = struct {
             .let_binding, .const_binding, .param, .receiver => {
                 // A cross-module reference can only be to a top-level `const`
                 // (imports expose nothing else that lives in `var_types`), and
-                // its type is memoized project-wide in `ctx.const_types`; a
-                // mutable cross-module `let` has no such entry and stays
-                // `.invalid`. Same-module bindings read `var_types` directly.
-                if (gsym.module != self.module_id) return self.ctx.const_types.get(gsym.pack()) orelse .invalid;
+                // its type is memoized project-wide in `ctx.const_types`.
+                // Same-module bindings read `var_types` directly.
+                if (gsym.module != self.module_id) {
+                    // §11.11: module state is private to its module. A `const`
+                    // has a cross-module form because it is a value inlined at
+                    // each use; a mutable cell does not — there is one cell,
+                    // and an `import_item` symbol does not name it. Diagnose it
+                    // here: this used to fall through as `.invalid`, which read
+                    // as "already diagnosed", so the program checked clean and
+                    // then failed at lowering with a bare UnsupportedConstruct.
+                    if (sym.kind == .let_binding and sym.module_scoped) {
+                        try self.emit(mf, node, .module_state_invalid, "cannot reference module-level state '{s}' from another module", .{sym.name}, "module state is private to the module that declares it; expose it through exported functions instead (§11.11)");
+                        return .invalid;
+                    }
+                    return self.ctx.const_types.get(gsym.pack()) orelse .invalid;
+                }
                 return self.var_types.get(gsym.id) orelse .invalid;
             },
             .func => {
@@ -4296,11 +4328,99 @@ const Checker = struct {
         }
     }
 
+    /// True iff `node` is a bare reference to a module-level `let` (§11.11) —
+    /// the one thing besides a slice that `ptrOf` accepts. `module_scoped`
+    /// separates it from a local `let`, which shares the same symbol kind.
+    fn moduleStateArg(self: *Checker, file_idx: usize, node: ast.Index) bool {
+        const mf = self.files[file_idx];
+        const inner = if (mf.tree.get(node).tag == .arg) mf.tree.kids(node)[0] else node;
+        if (mf.tree.get(inner).tag != .ident) return false;
+        const gsym = self.nodeSymbol(file_idx, inner) orelse return false;
+        const sym = self.symbolOf(gsym);
+        return sym.kind == .let_binding and sym.module_scoped;
+    }
+
     fn checkTopBinding(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
         const mf = self.files[file_idx];
         const is_const = mf.tree.get(idx).tag == .const_decl;
         const top_fctx = FnCtx{ .env = &.{}, .result_ty = self.ctx.void_id };
-        for (mf.tree.kids(idx)) |binding_idx| try self.checkBinding(file_idx, binding_idx, is_const, true, top_fctx);
+        for (mf.tree.kids(idx)) |binding_idx| {
+            try self.checkBinding(file_idx, binding_idx, is_const, true, top_fctx);
+            if (!is_const) try self.checkModuleState(file_idx, binding_idx);
+        }
+    }
+
+    /// True iff a value of `ty` is *untraced* — a word (or block of words) the
+    /// collector never follows: integers, floats, bools, raw `*T` (§11.4), and
+    /// fixed `[N]U` arrays of those. This is deliberately a whitelist, not the
+    /// negation of `isRefType`: a type the checker does not recognize must fall
+    /// on the safe side (rejected), because the cost of a wrong "yes" here is a
+    /// GC reference living in memory the collector never scans — a silently
+    /// dangling pointer, not a compile error.
+    fn untracedType(self: *const Checker, ty: TypeId, depth: u32) bool {
+        if (depth > 8) return false; // bounded: refuse rather than recurse forever
+        return switch (self.ctx.typeOf(ty)) {
+            .prim => |p| p != .string,
+            .ptr => true,
+            .array => |a| self.untracedType(a.elem, depth + 1),
+            else => false,
+        };
+    }
+
+    /// Module-level mutable state (§11.11). Three rules, all enforced *here* in
+    /// the checker rather than at lowering, so an invalid program gets a real
+    /// diagnostic instead of a late `UnsupportedConstruct` build failure:
+    ///
+    ///   1. The type must be untraced. Module state is emitted as a static
+    ///      `.data` cell that no root scanner walks, so a reference stored in
+    ///      one would be invisible to the collector and freed while still
+    ///      reachable. See SPEC §11.11 for the full reasoning.
+    ///   2. The initializer must be a compile-time constant. The cell ships as
+    ///      a byte image in the object file; there is no run-time init pass, so
+    ///      there is also no initialization-order question to get wrong.
+    ///   3. The pattern must be a single name — destructuring a module-level
+    ///      `let` has no meaning for a statically laid out cell.
+    fn checkModuleState(self: *Checker, file_idx: usize, binding_idx: ast.Index) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(binding_idx); // [pattern, type_or_none, init_or_none]
+        const pat = k[0];
+        if (mf.tree.get(pat).tag != .ident) {
+            try self.emit(mf, pat, .module_state_invalid, "module-level 'let' must bind a single name", .{}, "destructuring is not available at module scope");
+            return;
+        }
+        const gs = self.nodeSymbol(file_idx, pat) orelse return;
+        const ty = self.var_types.get(gs.id) orelse return;
+        if (ty == .invalid) return; // already diagnosed upstream; don't pile on
+
+        if (!self.untracedType(ty, 0)) {
+            const n = try self.typeName(ty);
+            defer self.gpa.free(n);
+            try self.emit(mf, pat, .module_state_invalid, "module-level 'let' cannot hold '{s}': only untraced types may live at module scope", .{n}, "module state is not scanned by the collector, so it may hold integers, floats, bools, raw '*T' pointers, or fixed arrays of those — but never a reference (§11.11)");
+            return;
+        }
+        if (k[2] == ast.none) {
+            try self.module_state.put(self.gpa, gs.id, .zero);
+            return;
+        }
+        // An array global is zero-valued only: rendering `[N]T{...}` into a
+        // static image needs a per-element constant evaluator that does not
+        // exist, and no consumer wants one (§11.11).
+        if (self.ctx.typeOf(ty) == .array) {
+            try self.emit(mf, pat, .module_state_invalid, "module-level array 'let' cannot have an initializer", .{}, "a module-level array is zero-valued; assign its elements at run time");
+            return;
+        }
+        const cv = self.constEval(file_idx, k[2], 0) orelse {
+            try self.emit(mf, k[2], .non_constant_expr, "module-level 'let' initializer must be a compile-time constant expression", .{}, "module state is emitted as a static byte image, so there is no run-time initializer");
+            return;
+        };
+        try self.module_state.put(self.gpa, gs.id, switch (cv) {
+            .int => |v| .{ .int = v },
+            .float => |v| .{ .float = v },
+            .boolean => |v| .{ .boolean = v },
+            // Unreachable in practice: `untracedType` already rejected `string`
+            // above, and it is the only type a `.string` ConstVal can bind to.
+            .string => .zero,
+        });
     }
 
     // ---- statements (§13.1) --------------------------------------------------
@@ -5492,6 +5612,12 @@ fn unwrapExport(mf: ModuleFile, idx: ast.Index) ast.Index {
 /// node with no type (a statement, a poisoned expression, ...). Outlives the
 /// `TypeContext` it references only until `ctx.deinit()` — the two are always
 /// freed together by convention (mirrors `SourceManager`/`Diagnostics`).
+/// The validated initial value of a module-level `let` (§11.11) — what
+/// `checkModuleState` proved, in the form `lower.zig` renders into the static
+/// byte image. `.zero` covers both `let x: T` with no initializer and every
+/// array-typed module global (which may not carry one — see §11.11).
+pub const ModuleStateInit = union(enum) { zero, int: i128, float: f64, boolean: bool };
+
 pub const CheckedModule = struct {
     gpa: Allocator,
     node_types: [][]TypeId,
@@ -5508,6 +5634,9 @@ pub const CheckedModule = struct {
     /// inlines a top-level `const`'s initializer by re-lowering the node this
     /// maps its symbol to.
     const_inits: std.AutoHashMapUnmanaged(SymbolId, ast.Index) = .{},
+    /// Moved out of `Checker.module_state` — lowering reads it to emit each
+    /// module-level `let` as a static `.data` cell (§11.11).
+    module_state: std.AutoHashMapUnmanaged(SymbolId, ModuleStateInit) = .{},
 
     pub fn deinit(self: *CheckedModule) void {
         for (self.node_types) |nt| self.gpa.free(nt);
@@ -5515,7 +5644,14 @@ pub const CheckedModule = struct {
         if (self.type_dump) |d| self.gpa.free(d);
         self.call_insts.deinit(self.gpa);
         self.const_inits.deinit(self.gpa);
+        self.module_state.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// The validated initial value of the module-level `let` bound to `sym`,
+    /// or `null` if `sym` is not module state — see `Checker.module_state`.
+    pub fn moduleStateOf(self: *const CheckedModule, sym: SymbolId) ?ModuleStateInit {
+        return self.module_state.get(sym);
     }
 
     pub fn typeOf(self: *const CheckedModule, file_idx: usize, node: ast.Index) TypeId {
@@ -5599,13 +5735,14 @@ pub fn checkModule(
     try checker.checkBodies();
     try checker.checkInterpolations();
     const dump = if (dump_types) try checker.dumpTypesText() else null;
-    // `call_insts`/`const_inits` are moved out (not freed by `deinitLocal`,
-    // which only ever owned the checking-time-only tables) into the returned
-    // `CheckedModule`.
+    // `call_insts`/`const_inits`/`module_state` are moved out (not freed by
+    // `deinitLocal`, which only ever owned the checking-time-only tables) into
+    // the returned `CheckedModule`.
     const call_insts = checker.call_insts;
     const const_inits = checker.const_inits;
+    const module_state = checker.module_state;
     checker.deinitLocal();
-    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts, .const_inits = const_inits };
+    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts, .const_inits = const_inits, .module_state = module_state };
 }
 
 const testing = std.testing;

@@ -1721,6 +1721,15 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) CodegenError!void {
     try putInt(self, dst, scratch1);
 }
 
+/// `global_addr` (§11.11): the static address of a module-level variable, via
+/// the same ADRP/ADD symbol relocation pair `func_addr` uses. Pure address
+/// arithmetic — no load, no call, no safepoint — so it is legal inside a
+/// `@nosplit` body.
+fn emitGlobalAddr(self: *Ctx, dst: u32, g: ir.GlobalId) CodegenError!void {
+    try self.emitAddrOf(scratch1, self.module.global(g).name);
+    try putInt(self, dst, scratch1);
+}
+
 /// `call_value`: dispatch through a closure. Load the environment (+8) and
 /// code pointer (+0) into reserved scratch regs argument marshaling never
 /// touches (x10/x11 are not argument registers; x9 is the parallel-move cycle
@@ -1979,6 +1988,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .slice_len => |sl| try emitSliceLen(self, i, sl.base),
         .make_closure => |mc| try emitMakeClosure(self, i, mc.func, mc.env),
         .func_addr => |fa| try emitFuncAddr(self, i, fa.func),
+        .global_addr => |ga| try emitGlobalAddr(self, i, ga.global),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
         .asm_stmt => |a| try emitAsm(self, if (ty != .invalid) i else null, a.block, a.args),
         .syscall => |s| try emitSyscall(self, i, s.nr, s.args),
@@ -2150,6 +2160,7 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
         },
         .make_closure => |mc| extendOne(intervals, use_pos, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
+        .global_addr => {}, // references a GlobalId, no value operands
         .rt_call => |rc| for (rc.args) |a| extendOne(intervals, use_pos, a),
         .asm_stmt => |a| for (a.args) |arg| extendOne(intervals, use_pos, arg),
         .syscall => |s| {

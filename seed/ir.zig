@@ -46,6 +46,38 @@ pub const ValueId = enum(u32) { _ };
 pub const BlockId = enum(u32) { _ };
 /// A function, indexing `Module.funcs`.
 pub const FuncId = enum(u32) { _ };
+/// A module-level mutable variable (§11.11), indexing `Module.globals`.
+pub const GlobalId = enum(u32) { _ };
+
+/// Which copy of a module-level variable a reference names (§11.11). Module
+/// state is a *storage class*, not a single feature: `process` is one cell for
+/// the whole program, `thread` is one cell per OS thread.
+///
+/// `thread` is specified and carried through the IR, but no backend emits it
+/// yet — it needs thread-local sections and relocations on all three targets,
+/// and the Mach-O side of that is its own tracked sub-feature (`link/macho.zig`
+/// returns `error.UnsupportedTls` for any TLV atom today). The variant exists
+/// here so the emission path is a switch with one arm left to fill in, rather
+/// than a shape change, when the scheduler's per-worker slot needs it.
+pub const GlobalStorage = enum { process, thread };
+
+/// One module-level mutable variable: a statically allocated cell (§11.11).
+/// `bytes` is its complete initial image, already laid out in target byte
+/// order, so emission is a straight blob copy and there is no run-time
+/// initialization pass at all.
+///
+/// The type is guaranteed untraced by `check.zig` (scalars, raw `*T`, and
+/// fixed arrays of those), which is *why* this can be a plain byte image: no
+/// field here is ever a GC reference, so the collector never needs to walk it
+/// and the cell needs no `TypeInfo` and no root registration. That holds for
+/// both storage classes. See SPEC §11.11.
+pub const Global = struct {
+    /// The emitted symbol name, already mangled by `lower.zig`.
+    name: []const u8,
+    bytes: []const u8,
+    alignment: u32,
+    storage: GlobalStorage = .process,
+};
 
 /// Opaque runtime entry points lowering calls into `runtime/*.zig` symbols by
 /// name (task's "until #346 nails the ABI further"). The `map_*` tags back
@@ -369,6 +401,20 @@ pub const Op = enum {
     // ---- closures: extra = [FuncId, env] ----------------------------------
     make_closure,
 
+    // ---- module-global address: extra = [GlobalId] ------------------------
+    // Materializes a module-level variable's static address as a raw `*T`
+    // (§11.11). Codegen emits a relocation to the global's own symbol, exactly
+    // like `func_addr` does for a function — so this is a pure address
+    // computation: no load, no allocation, and no safepoint, which is what
+    // makes module state reachable from `@nosplit` bodies (§10.3.1).
+    //
+    // Every read/write of a global goes through this op plus the ordinary
+    // `field_get`/`field_set` (offset 0) or `index_get`/`index_set` the raw
+    // pointer path already uses, so no new load/store ops are needed. The
+    // result is a raw pointer (is_ref=0), so a stack map never offers it as a
+    // GC root — see `Global` and SPEC §11.11 for why that is sound.
+    global_addr,
+
     // ---- raw function address: extra = [FuncId] ---------------------------
     // Materializes a function's code address as a plain pointer value (no env
     // cell, unlike `make_closure`). Codegen emits an absolute relocation to the
@@ -559,6 +605,7 @@ pub const Function = struct {
             .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_and, .atomic_rmw_or, .atomic_rmw_xchg => .{ .atomic_rmw = .{ .ptr = @enumFromInt(raw[0]), .operand = @enumFromInt(raw[1]) } },
             .convert => .{ .un = .{ .operand = @enumFromInt(raw[0]) } },
             .make_closure => .{ .make_closure = .{ .func = @enumFromInt(raw[0]), .env = @enumFromInt(raw[1]) } },
+            .global_addr => .{ .global_addr = .{ .global = @enumFromInt(raw[0]) } },
             .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
             .rt_call => .{ .rt_call = .{ .rt = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
             .asm_stmt => .{ .asm_stmt = .{ .block = raw[0], .args = raw[2 .. 2 + raw[1]] } },
@@ -607,6 +654,7 @@ pub const Decoded = union(enum) {
     atomic_rmw: struct { ptr: ValueId, operand: ValueId },
     make_closure: struct { func: FuncId, env: ValueId },
     func_addr: struct { func: FuncId },
+    global_addr: struct { global: GlobalId },
     rt_call: struct { rt: RtFn, args: []const u32 },
     // `block` indexes `Module.asm_blocks`; `args` are the `input` operand
     // values, in declaration order (parallel to the block's `in_*` reg lists).
@@ -669,6 +717,9 @@ pub const Module = struct {
     /// Per-type method tables (ABI.md §2.1), owned by the module. Empty for
     /// programs with no methods.
     method_tables: []const MethodTable = &.{},
+    /// Module-level mutable variables (§11.11), referenced by
+    /// `Op.global_addr.global`. Empty for programs with no module state.
+    globals: std.ArrayList(Global) = .empty,
 
     pub fn init(gpa: Allocator, ctx: *TypeContext) Module {
         return .{ .gpa = gpa, .ctx = ctx };
@@ -683,7 +734,25 @@ pub const Module = struct {
         self.asm_blocks.deinit(self.gpa);
         for (self.method_tables) |mt| self.gpa.free(mt.methods);
         self.gpa.free(self.method_tables);
+        for (self.globals.items) |g| {
+            self.gpa.free(g.name);
+            self.gpa.free(g.bytes);
+        }
+        self.globals.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// The module-level variable `id` names.
+    pub fn global(self: *const Module, id: GlobalId) Global {
+        return self.globals.items[@intFromEnum(id)];
+    }
+
+    /// Appends a module-level variable, taking ownership of `name` and
+    /// `bytes`. Returns its id.
+    pub fn addGlobal(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage) Allocator.Error!GlobalId {
+        const id: u32 = @intCast(self.globals.items.len);
+        try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage });
+        return @enumFromInt(id);
     }
 
     /// The method table for `type_disc`, or null if the type has no methods.
@@ -1040,6 +1109,12 @@ pub const FunctionBuilder = struct {
 
     /// Materializes `target`'s raw code address as a pointer value (no env
     /// cell) — the trampoline pointer handed to `bit_rt_spawn` (§9).
+    /// Materializes module-level variable `target`'s static address as a raw
+    /// `*T` (§11.11). Every read and write of module state starts here.
+    pub fn globalAddr(self: *FunctionBuilder, ty: TypeId, target: GlobalId) Allocator.Error!ValueId {
+        return self.push(.global_addr, ty, &.{@intFromEnum(target)});
+    }
+
     pub fn funcAddr(self: *FunctionBuilder, ty: TypeId, target: FuncId) Allocator.Error!ValueId {
         return self.push(.func_addr, ty, &.{@intFromEnum(target)});
     }
@@ -1345,6 +1420,7 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
         },
         .make_closure => |mc| try w.print("  %{d} = make_closure @{s}, %{d}\n", .{ i, module.func(mc.func).name, @intFromEnum(mc.env) }),
         .func_addr => |fa| try w.print("  %{d} = func_addr @{s}\n", .{ i, module.func(fa.func).name }),
+        .global_addr => |ga| try w.print("  %{d} = global_addr @{s}\n", .{ i, module.global(ga.global).name }),
         .rt_call => |rc| {
             try w.print("  %{d} = rt_call {s}(", .{ i, @tagName(rc.rt) });
             try dumpValList(w, rc.args);
@@ -1548,6 +1624,7 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
         },
         .make_closure => |mc| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
+        .global_addr => {}, // references a GlobalId, no value operands
         .rt_call => |rc| for (rc.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a),
         .asm_stmt => |a| for (a.args) |v| try checkOperandDominance(f, dom, use_block, use_idx, v),
         .syscall => |s| {

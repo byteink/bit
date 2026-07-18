@@ -48,6 +48,8 @@ const ecExternUnsupportedTarget = 78
 const ecSymbolAttrInvalid = 79
 const ecDuplicateSymbol = 80
 const ecEntryOfInvalid = 81
+const ecNonConstantExpr = 64
+const ecModuleStateInvalid = 82
 
 // A literal's value, or `ok: false` when the node is not one. Bit has no
 // optional and no tuple return; a two-field struct is the whole story.
@@ -1548,6 +1550,89 @@ function vAtomicCall(c: Checker, node: int, name: string, arity: int, args: []in
   }
 }
 
+// True iff a value of `ty` is UNTRACED — a word (or block of words) the
+// collector never follows: integers, floats, bools, raw `*T` (§11.4), and fixed
+// `[N]U` arrays of those. Mirrors the seed's `untracedType`.
+//
+// Deliberately a whitelist, not the negation of "is a reference": a type this
+// does not recognize must fall on the safe side (rejected), because the cost of
+// a wrong "yes" is a GC reference living in memory the collector never scans — a
+// silently dangling pointer, not a compile error.
+function vUntracedType(c: Checker, ty: int, depth: int): bool {
+  if (depth > 8) { return false }   // bounded: refuse rather than recurse forever
+  let t = c.ctx.types[ty]
+  if (t.kind == TypeKind.Prim) { return t.prim != 11 }   // 11 = string
+  if (t.kind == TypeKind.Ptr) { return true }
+  if (t.kind == TypeKind.Array) { return vUntracedType(c, t.elem, depth + 1) }
+  return false
+}
+
+// True only for node shapes that can NEVER be a compile-time constant.
+//
+// Deliberately a blacklist of the definitely-dynamic forms rather than a full
+// constant evaluator: this file's standing rule is to stay permissive whenever
+// it cannot decide (see the header), because reporting a VALID program is the
+// one failure mode that breaks builds. The seed runs a real evaluator and so
+// rejects strictly more; anything this misses is a MISSING in the differential,
+// which is harmless, never a FALSEPOS.
+function vDefinitelyNotConst(c: Checker, node: int): bool {
+  let t = getNode(c.tree, node).tag
+  return t == Tag.Call || t == Tag.Index || t == Tag.Member ||
+    t == Tag.StrInterp || t == Tag.SliceLit || t == Tag.ArrowFn
+}
+
+// Module-level mutable state (§11.11). Three rules, enforced HERE in the
+// checker rather than at lowering, so an invalid program gets a real diagnostic
+// instead of a late `cannot lower` build failure:
+//
+//   1. The type must be untraced. Module state is emitted as a static `.data`
+//      cell that no root scanner walks, so a reference stored in one would be
+//      invisible to the collector and freed while still reachable.
+//   2. The initializer must be a compile-time constant. The cell ships as a byte
+//      image in the object file; there is no run-time init pass, so there is
+//      also no initialization-order question to get wrong.
+//   3. The pattern must be a single name — destructuring a module-level `let`
+//      has no meaning for a statically laid out cell.
+function vModuleState(c: Checker, binding: int) {
+  if (c.resolveFailed) { return }
+  let k = kidsOf(c.tree, binding)   // [pattern, type_or_none, init_or_none]
+  let pat = k[0]
+  if (getNode(c.tree, pat).tag != Tag.Ident) {
+    report(c.diags, ecModuleStateInvalid, vSpan(c, pat),
+      "module-level 'let' must bind a single name",
+      "destructuring is not available at module scope")
+    return
+  }
+  let ty = c.nodeTypes[pat]
+  if (ty == 0) { return }   // already diagnosed upstream; don't pile on
+  // A type that mentions `invalid` anywhere is a guess built on an earlier
+  // error (an un-inferrable arrow parameter, say). Reporting against it invents
+  // an error the seed does not raise — stay permissive, per this file's header.
+  if (vMentionsInvalid(c, ty, 0)) { return }
+  if (!vUntracedType(c, ty, 0)) {
+    let n = typeName(c.ctx, ty)
+    report(c.diags, ecModuleStateInvalid, vSpan(c, pat),
+      "module-level 'let' cannot hold '${n}': only untraced types may live at module scope",
+      "module state is not scanned by the collector, so it may hold integers, floats, bools, raw '*T' pointers, or fixed arrays of those — but never a reference (§11.11)")
+    return
+  }
+  if (k[2] == 0) { return }
+  // An array global is zero-valued only: rendering `[N]T{...}` into a static
+  // image needs a per-element constant evaluator that does not exist, and no
+  // consumer wants one (§11.11).
+  if (c.ctx.types[ty].kind == TypeKind.Array) {
+    report(c.diags, ecModuleStateInvalid, vSpan(c, pat),
+      "module-level array 'let' cannot have an initializer",
+      "a module-level array is zero-valued; assign its elements at run time")
+    return
+  }
+  if (vDefinitelyNotConst(c, k[2])) {
+    report(c.diags, ecNonConstantExpr, vSpan(c, k[2]),
+      "module-level 'let' initializer must be a compile-time constant expression",
+      "module state is emitted as a static byte image, so there is no run-time initializer")
+  }
+}
+
 // `ptrOf(s: []T): *T` (§11.5): the address of `s`'s element 0, the only bridge
 // from a traced slice to a raw `*T` (Bit has no `&`). `T` must be an integer
 // prim — the same targets the atomics accept.
@@ -1557,12 +1642,29 @@ function vPtrOfCall(c: Checker, node: int, args: []int) {
       "'ptrOf' takes exactly 1 argument, found ${len(args)}")
     return
   }
-  let sliceTy = checkExprType(c, kidsOf(c.tree, args[0])[0])
+  let inner = kidsOf(c.tree, args[0])[0]
+  let sliceTy = checkExprType(c, inner)
+  // Module-level state (§11.11) is addressable: its cell has a static address,
+  // so this is the addressability the atomic builtins need. Restricted to
+  // module scope on purpose — a local has no stable address to hand out, which
+  // is exactly why `&` stays reserved.
+  if (vIsModuleStateRef(c, inner)) {
+    let mel = sliceTy
+    if (mel != 0 && c.ctx.types[mel].kind == TypeKind.Array) {
+      mel = c.ctx.types[mel].elem
+    }
+    if (!vIsIntegerPrim(c, mel)) {
+      let mn = typeName(c.ctx, mel)
+      reportNoHint(c.diags, ecInvalidOperand, vSpan(c, args[0]),
+        "'ptrOf' requires an integer element, found '${mn}'")
+    }
+    return
+  }
   if (sliceTy == 0 || c.ctx.types[sliceTy].kind != TypeKind.Slice) {
     if (sliceTy != 0) {
       let sn = typeName(c.ctx, sliceTy)
       reportNoHint(c.diags, ecInvalidOperand, vSpan(c, args[0]),
-        "'ptrOf' requires a slice '[]T', found '${sn}'")
+        "'ptrOf' requires a slice '[]T' or module-level state, found '${sn}'")
     }
     return
   }
@@ -1631,6 +1733,17 @@ function vEntryOfCall(c: Checker, node: int, args: []int) {
       "'entryOf' cannot take the address of extern function '${name}'",
       "an extern function's body lives in another image; only a call to it is expressible (§11.7)")
   }
+}
+
+// True iff `node` is a bare reference to a module-level `let` (§11.11) — the
+// one thing besides a slice that `ptrOf` accepts.
+function vIsModuleStateRef(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Ident) { return false }
+  if (node < 0 || node >= len(c.nodeSymbols)) { return false }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) { return false }
+  let sym = c.symbols[sid]
+  return sym.kind == SymbolKind.LetBinding && sym.moduleScoped
 }
 
 // Dispatches the §11.5 builtins. Separate from vCall, which returns early on a

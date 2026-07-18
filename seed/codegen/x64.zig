@@ -1432,6 +1432,15 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) !void {
     try putInt(self, dst, scratch1);
 }
 
+/// `global_addr` (§11.11): the static address of a module-level variable, via
+/// the same absolute symbol relocation `func_addr` uses. Pure address
+/// materialization — no load, no call, no safepoint — so it is legal inside a
+/// `@nosplit` body.
+fn emitGlobalAddr(self: *Ctx, dst: u32, g: ir.GlobalId) !void {
+    try self.movAbsReloc(scratch1, self.module.global(g).name);
+    try putInt(self, dst, scratch1);
+}
+
 /// `call_value`: dispatch through a closure. Load the environment (+8) and
 /// code pointer (+0) into reserved scratch regs that argument marshaling never
 /// disturbs (r10/r12 are not argument registers; r11 is the parallel-move
@@ -1564,8 +1573,22 @@ fn emitFieldSet(self: *Ctx, base: ir.ValueId, offset: u32, value: ir.ValueId, ty
 /// comment's "Deliberately NOT covered" section (slice/string have no
 /// defined runtime-length storage yet, and `lower.zig` never emits this op
 /// against them). `ty` is the element type (`index_get`'s result type).
+/// True iff `base` is something the element ops can address directly: an
+/// `[N]T` array object, or a plain (non-reference) address word — the latter is
+/// how a module-level array's static cell arrives (§11.11), where `global_addr`
+/// yields the base as an untraced integer address rather than an array object.
+///
+/// A slice, map or string base is still rejected: those carry a header and go
+/// through the runtime, never these ops. (The ARM64 backend has no equivalent
+/// guard — it accepts any base — so this is the stricter of the two.)
+fn indexableBase(self: *Ctx, base: ir.ValueId) bool {
+    const bt = self.f.valueType(base);
+    if (self.tctx().typeOf(bt) == .array) return true;
+    return !common.isRefType(self.tctx(), bt);
+}
+
 fn emitIndexGet(self: *Ctx, dst: u32, base: ir.ValueId, index: ir.ValueId, ty: TypeId) CodegenError!void {
-    if (self.tctx().typeOf(self.f.valueType(base)) != .array) return error.UnsupportedConstruct;
+    if (!indexableBase(self, base)) return error.UnsupportedConstruct;
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
     const idx_reg = try getInt(self, vregOf(self, index), scratch3);
     const w = widthOf(self.tctx(), ty);
@@ -1595,7 +1618,7 @@ fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
 
 /// `ty` is `value`'s own type (the array's element type) — see `emitIndexGet`.
 fn emitIndexSet(self: *Ctx, base: ir.ValueId, index: ir.ValueId, value: ir.ValueId, ty: TypeId) CodegenError!void {
-    if (self.tctx().typeOf(self.f.valueType(base)) != .array) return error.UnsupportedConstruct;
+    if (!indexableBase(self, base)) return error.UnsupportedConstruct;
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
     const idx_reg = try getInt(self, vregOf(self, index), scratch3);
     const w = widthOf(self.tctx(), ty);
@@ -2112,6 +2135,7 @@ fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
         .slice_len => |sl| markUse(intervals, @intFromEnum(sl.base), pos),
         .make_closure => |mc| markUse(intervals, @intFromEnum(mc.env), pos),
         .func_addr => {}, // references a FuncId, no value operands
+        .global_addr => {}, // references a GlobalId, no value operands
         .rt_call => |rc| for (rc.args) |a| markUse(intervals, a, pos),
         .asm_stmt => |a| for (a.args) |arg| markUse(intervals, arg, pos),
         .syscall => |s| {
@@ -2412,6 +2436,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .type_info => try emitTypeInfo(self, dst, d.type_info.disc, d.type_info.size, d.type_info.ptr_offsets),
         .make_closure => try emitMakeClosure(self, dst, d.make_closure.func, d.make_closure.env),
         .func_addr => try emitFuncAddr(self, dst, d.func_addr.func),
+        .global_addr => try emitGlobalAddr(self, dst, d.global_addr.global),
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
         .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
         .call_iface => try emitCallIface(self, dst, ty, d.call_iface.iface, d.call_iface.method_index, d.call_iface.args),
@@ -3131,7 +3156,39 @@ test "compileFunction: index_get on a static array base loads the element" {
     try testing.expectEqual(@as(i64, 30), fn_ptr(&backing[0], 2));
 }
 
-test "compileFunction: index_get on a non-array base is unsupported" {
+test "compileFunction: index_get on a reference base is unsupported" {
+    const gpa = testing.allocator;
+    var tctx = try TypeContext.init(gpa);
+    defer tctx.deinit();
+    const i64_ty = tctx.prim_ids.get(.i64);
+    // A `string` carries a `{ptr,len}` header and is read through the runtime,
+    // never these ops — so a reference base must still be rejected.
+    const ref_ty = tctx.prim_ids.get(.string);
+
+    var module = ir.Module.init(gpa, &tctx);
+    defer module.deinit();
+
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const base = try b.addParam(ref_ty);
+    const idx = try b.addParam(i64_ty);
+    const v = try b.indexGet(i64_ty, base, idx);
+    try b.ret(&.{v});
+    b.endBlock();
+    var f = try b.finish("bad", &.{ ref_ty, i64_ty }, i64_ty, false, .invalid, entry);
+    defer f.deinit(gpa);
+
+    try testing.expectError(error.UnsupportedConstruct, compileFunction(gpa, &module, &f, .sysv));
+}
+
+test "compileFunction: index_get on a plain address word is supported (module state)" {
+    // The §11.11 shape: a module-level `[N]T` cell arrives as an untraced
+    // address word from `global_addr`, not as an array object, and the element
+    // ops must address it directly. ARM64 has never guarded this; x86-64 used
+    // to reject any non-`.array` base, which made module-level arrays a
+    // build failure on x86-64 alone.
+    if (!can_exec_native) return error.SkipZigTest;
     const gpa = testing.allocator;
     var tctx = try TypeContext.init(gpa);
     defer tctx.deinit();
@@ -3143,15 +3200,24 @@ test "compileFunction: index_get on a non-array base is unsupported" {
     var b = ir.FunctionBuilder.init(gpa);
     const entry = try b.newBlock();
     b.beginBlock(entry);
-    const base = try b.addParam(i64_ty); // not `.array` — index_get must reject it
+    const base = try b.addParam(i64_ty); // the cell's address, as global_addr yields it
     const idx = try b.addParam(i64_ty);
     const v = try b.indexGet(i64_ty, base, idx);
     try b.ret(&.{v});
     b.endBlock();
-    var f = try b.finish("bad", &.{ i64_ty, i64_ty }, i64_ty, false, .invalid, entry);
+    var f = try b.finish("addr_index", &.{ i64_ty, i64_ty }, i64_ty, false, .invalid, entry);
     defer f.deinit(gpa);
 
-    try testing.expectError(error.UnsupportedConstruct, compileFunction(gpa, &module, &f, .sysv));
+    var code = try compileFunction(gpa, &module, &f, .sysv);
+    defer code.deinit();
+
+    const mem = try mmapExec(code.code);
+    defer std.posix.munmap(mem);
+    const fn_ptr: *const fn (*const i64, i64) callconv(.c) i64 = @ptrCast(mem.ptr);
+
+    const cell = [_]i64{ 11, 22, 33 };
+    try testing.expectEqual(@as(i64, 11), fn_ptr(&cell[0], 0));
+    try testing.expectEqual(@as(i64, 33), fn_ptr(&cell[0], 2));
 }
 
 test "compileFunction: a multi-value ret is unsupported" {

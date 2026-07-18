@@ -1074,6 +1074,94 @@ independent, so the loader slides the whole image and absolute addresses differ
 between runs. In both, `entryOf(f)` is invariant *within* a run and
 `int(entryOf(g)) - int(entryOf(f))` is invariant *across* runs.
 
+### 11.11 Module-Level State (unmanaged subset)
+
+A `let` at module scope declares **mutable state that outlives every call**:
+
+```
+let liveBytes: i64 = 0        // one cell for the whole program
+let freeHeads: [37]*u8        // zero-valued; an inline array of raw pointers
+let lockWord: i32 = 0         // addressable: ptrOf(lockWord) is a *i32
+```
+
+This is the storage the runtime is built out of — the collector's heap counters,
+the allocator's free-list heads, the scheduler's run queue. `const` at module
+scope is unrelated: a `const` is a compile-time value inlined at each use and has
+no address, whereas a `let` is a real cell with a stable address.
+
+**The collector never scans module state.** That is the central decision, and
+these are the rules that make it sound:
+
+1. **The type must be untraced**: an integer, float, or bool; a raw pointer `*T`
+   (§11.4); or a fixed array `[N]U` of those. Anything the collector would trace
+   — `string`, `[]T`, `map`, `chan`, a struct, an interface, a payload-carrying
+   enum, a function value — is a **compile error**, not a silent hazard.
+2. **The initializer must be a compile-time constant** (§15.4), or absent, in
+   which case the cell is zero-valued (§13.4). An array-typed `let` takes no
+   initializer at all.
+3. **The binding is a single name.** Destructuring has no meaning for a
+   statically laid out cell.
+
+Rule 1 is what makes not scanning correct rather than merely cheap. The obvious
+alternative — trace module state as a GC root — is *actively wrong* for the first
+real consumers: the allocator's free-list heads point into unmanaged `mmap` span
+memory that carries no object header, and the scheduler's run queue holds
+runtime-owned `Task` pointers. Walking either as an object reference would decode
+arbitrary bytes as a header. The collector's own bookkeeping cannot be traced by
+the collector either, without circularity. So module state is defined as the
+place references *cannot* go, and the checker enforces it.
+
+Loosening rule 1 later is a pure relaxation: any program valid today stays valid
+if a traced module-state form is ever added. It would have to be **explicitly**
+marked as traced, never traced by default, for the reason above.
+
+Module state is **private to the module that declares it**, even when `export`ed:
+a `const` has a cross-module form because it is a value inlined at each use, but
+a `let` is one cell, and another module cannot name it. Referencing one from
+outside its module is a compile error. Expose it through exported functions
+instead — which is how the runtime is structured anyway, and works today:
+
+```
+// counters.bit
+let hits: i64 = 0
+export function recordHit(): i64 {
+  hits = hits + 1
+  return hits
+}
+```
+
+Because the initial value is a constant, each cell ships as a static byte image
+in the object file. There is **no run-time initialization pass**, and therefore no
+initialization-order question: every cell holds its declared value before `main`
+begins, whatever order the declarations appear in, across modules. Initializers
+cannot call functions or run arbitrary code — that is what makes this true.
+
+Reaching module state is **pure address arithmetic** — no load of a descriptor, no
+allocation, no safepoint — so it is legal inside a `@nosplit` body (§10.3.1), and
+`ptrOf` (§11.5) yields its address for the atomic builtins. Those two properties
+are what the free lists and the run queue actually require.
+
+#### Storage classes
+
+Module state is a *storage class*, not a single feature. Two are specified:
+
+| Form                  | Copies                | Status                        |
+| --------------------- | --------------------- | ----------------------------- |
+| `let x: T = c`        | one per **process**   | implemented                   |
+| `@threadlocal let x: T` | one per **OS thread** | specified; not yet emitted    |
+
+Rules 1–3 apply identically to both — the type and initializer restrictions come
+from "the collector does not scan this cell", which is equally true per-thread.
+The two differ only in how many cells exist and how the address is materialized:
+process-wide state is a plain data symbol, per-thread state needs a thread-local
+section and TLS relocations.
+
+`@threadlocal` is specified here so the surface is settled, but no backend emits
+it yet: it requires thread-local sections and relocations on all three targets,
+and the Mach-O half of that (TLV descriptors and a `_tlv_bootstrap` resolver) is
+a separate sub-feature the static linker currently rejects outright. A per-thread
+slot must therefore stay in the Zig runtime until that lands.
+
 ---
 
 ## 12. Expressions

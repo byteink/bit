@@ -31,6 +31,14 @@ struct Checker {
   ctx: TypeContext,
   tree: Tree,
   source: string,
+  // True when RESOLUTION already failed before this module was checked. The
+  // seed's CLI short-circuits the checker entirely on a resolver error (an
+  // undefined name makes every downstream type a guess), so any check-stage
+  // diagnostic it would have produced never appears. Module-state validation
+  // (§11.11) honours the same rule rather than reporting into a broken tree —
+  // otherwise bit2 reports where the seed is silent, which is the one
+  // divergence direction that breaks builds.
+  resolveFailed: bool,
   nodeTypes: []int,
   // name -> TypeId for the bindings/params in scope, and name -> result type for
   // top-level functions (a pre-pass fills the latter so forward calls resolve).
@@ -1503,9 +1511,16 @@ function checkCall(c: Checker, node: int): int {
     if (name == "atomicCmpxchg") {
       return primType(c.ctx, 10)
     }
-    // `ptrOf(s: []T): *T` — a raw pointer to the slice's element 0.
+    // `ptrOf(s: []T): *T` — a raw pointer to the slice's element 0. Module
+    // state (§11.11) is also addressable: its cell has a static address, which
+    // is the addressability the atomic builtins need. A scalar cell yields
+    // `*T`; an array cell yields a pointer to its element 0, like a slice.
     if (name == "ptrOf") {
-      return mkPtr(c.ctx, c.ctx.types[checkArgType(c, node, 0)].elem)
+      let at = checkArgType(c, node, 0)
+      if (at != 0 && c.ctx.types[at].kind == TypeKind.Prim) {
+        return mkPtr(c.ctx, at)
+      }
+      return mkPtr(c.ctx, c.ctx.types[at].elem)
     }
     // `entryOf(f): *byte` (§11.10) — a named function's code entry address. The
     // result never depends on the operand: it is one machine address whatever
@@ -2111,6 +2126,50 @@ function checkCommaOk(c: Checker, pat: int, init: int) {
   envBind(c, binders[1], primType(c.ctx, 10))
 }
 
+// True iff `binding` is a module-level `let` binding (§11.11) — a static cell
+// — as opposed to any local `let`, which is an ordinary SSA value. Both carry
+// SymbolKind.LetBinding; only the resolver's `moduleScoped` separates them.
+function isModuleStateBinding(c: Checker, binding: int): bool {
+  let pat = kidsOf(c.tree, binding)[0]
+  if (pat >= 0 && pat < len(c.nodeSymbols)) {
+    let sid = c.nodeSymbols[pat]
+    if (sid > 0 && sid < len(c.symbols)) {
+      let sym = c.symbols[sid]
+      return sym.kind == SymbolKind.LetBinding && sym.moduleScoped
+    }
+  }
+  // The dump entry points (`--dump-ir`, `--dump-types`) never run the resolver,
+  // so `nodeSymbols` is empty there — see declRefType's note. Fall back to the
+  // structural fact the resolver would have recorded: a module-level `let` is a
+  // binding of a LetDecl that is a DIRECT child of the tree root. Any deeper
+  // LetDecl is a local.
+  return isTopLevelLetBinding(c, binding)
+}
+
+// True iff `binding` belongs to a `let` declared at module scope, determined
+// structurally rather than through the resolver. Bounded by the top-level decl
+// count.
+function isTopLevelLetBinding(c: Checker, binding: int): bool {
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let inner = d
+    if (getNode(c.tree, inner).tag == Tag.Export) {
+      inner = kidsOf(c.tree, inner)[0]
+    }
+    if (getNode(c.tree, inner).tag != Tag.LetDecl) {
+      continue
+    }
+    for b of kidsOf(c.tree, inner) {
+      if (b == binding) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 function checkBinding(c: Checker, node: int) {
   let kids = kidsOf(c.tree, node)
   let pat = kids[0]
@@ -2436,6 +2495,9 @@ function buildSignatures(c: Checker) {
 }
 
 function checkModule(c: Checker) {
+  // Snapshot BEFORE any check-stage diagnostic: anything already recorded came
+  // from parsing or resolution (see `Checker.resolveFailed`).
+  c.resolveFailed = c.diags.errorCount > 0
   // The predeclared `error` interface's method `message(): string` (§10.6), so
   // `e.message()` on a caught error resolves like any interface method.
   c.ctx.methodResults["${c.ctx.errorId}.message"] = primType(c.ctx, 11)
@@ -2553,6 +2615,14 @@ function checkModule(c: Checker) {
       }
     } else if (tag == Tag.Binding) {
       checkBinding(c, i)
+      // §11.11: a module-level `let` is mutable state with a static address,
+      // not an SSA value. Validate it HERE (the checker), so an invalid form is
+      // a real diagnostic rather than a late `cannot lower` refusal. The
+      // resolver's `moduleScoped` is what separates it from a local `let` —
+      // both are LetBinding.
+      if (isModuleStateBinding(c, i)) {
+        vModuleState(c, i)
+      }
     } else if (tag == Tag.Call) {
       c.nodeTypes[i] = checkCall(c, i)
       // Record a generic-function call's instantiation in source order (its

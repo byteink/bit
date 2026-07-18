@@ -19,7 +19,7 @@ const common = @import("codegen/common.zig");
 const obj_elf = @import("obj/elf.zig");
 const obj_macho = @import("obj/macho.zig");
 
-pub const Error = error{ NoMain, FreestandingAlloc, FreestandingSafepoint, FreestandingUnpinned } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
+pub const Error = error{ NoMain, FreestandingAlloc, FreestandingSafepoint, FreestandingUnpinned, UnsupportedTlsStorage } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
 
 /// §17.6: may this function go into a freestanding object? A freestanding
 /// object carries no `bit_stack_maps`, so the collector could not scan the
@@ -231,6 +231,36 @@ fn emitMethodTable(a: Allocator, module: *const ir.Module, rodata: *std.ArrayLis
     return .{ .sym = name, .off = base, .size = mt.methods.len * 16, .relocs = try relocs.toOwnedSlice(a) };
 }
 
+/// Where one module-level variable (§11.11) landed in the `.data` blob.
+const GlobalPlacement = struct { name: []const u8, offset: u64, size: u64 };
+
+/// Appends every module-level variable's static image to `data`, honouring each
+/// one's alignment, and returns where each landed. The caller turns these into
+/// its own object format's symbols — the two formats' `Symbol` types differ by
+/// one field, which is not worth a comptime-generic indirection here.
+///
+/// These cells are writable and **never scanned by the collector**: the checker
+/// has proved each one's type untraced, so `.data` needs no pointer map and no
+/// root registration. See SPEC §11.11.
+fn placeGlobals(a: Allocator, module: *const ir.Module, data: *std.ArrayList(u8)) Error![]const GlobalPlacement {
+    const out = try a.alloc(GlobalPlacement, module.globals.items.len);
+    for (module.globals.items, 0..) |g, i| {
+        switch (g.storage) {
+            // Per-thread storage needs a thread-local section and TLS
+            // relocations rather than a plain `.data` blob (§11.11). Nothing
+            // constructs a `.thread` global yet, so this is unreachable today —
+            // it is a named seam, not dead weight.
+            .thread => return error.UnsupportedTlsStorage,
+            .process => {},
+        }
+        while (data.items.len % g.alignment != 0) try data.append(a, 0);
+        const off: u64 = data.items.len;
+        try data.appendSlice(a, g.bytes);
+        out[i] = .{ .name = try a.dupe(u8, g.name), .offset = off, .size = g.bytes.len };
+    }
+    return out;
+}
+
 /// Emits `module` as an x86-64 ELF relocatable object. The returned bytes are
 /// owned by `gpa`; with `with_entry` the module's `main` becomes the runtime
 /// entry, otherwise no `main` is required and no trampoline is emitted (#1397 —
@@ -305,11 +335,19 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
         try defined.put(a, "bit_main", {});
     }
 
+    // ---- module-level state (§11.11) -> writable .data --------------------
+    var data: std.ArrayList(u8) = .empty;
+    for (try placeGlobals(a, module, &data)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+        try defined.put(a, g.name, {});
+    }
+
     try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
 
     return obj_elf.write(gpa, .x86_64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -532,11 +570,19 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         try defined.put(a, "bit_main", {});
     }
 
+    // ---- module-level state (§11.11) -> writable .data --------------------
+    var data: std.ArrayList(u8) = .empty;
+    for (try placeGlobals(a, module, &data)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+        try defined.put(a, g.name, {});
+    }
+
     try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
 
     return obj_elf.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -747,6 +793,13 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
             .symbol = try mac(a, emitted_names.items[fi]),
             .kind = .unsigned64,
         });
+    }
+
+    // ---- module-level state (§11.11) -> the same writable .data -----------
+    for (try placeGlobals(a, module, &data)) |g| {
+        const sym = try mac(a, g.name);
+        try symbols.append(a, .{ .name = sym, .section = .data, .offset = g.offset, .size = g.size, .binding = .global });
+        try defined.put(a, sym, {});
     }
 
     // ---- undefined externals for runtime symbols --------------------------

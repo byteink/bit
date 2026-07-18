@@ -188,6 +188,12 @@ struct Lowerer {
   // answer. The dump surfaces still render stubs — that is how the differential
   // marks a construct as not yet ported.
   stubbed: []string,
+  // Module-level state (§11.11). `globals` is the emitted cell list; `globalSyms`
+  // maps "<ownerModuleId>$<name>" to that cell's symbol, which is how a
+  // reference site recognizes a module global (as opposed to a const or a
+  // function) and finds its symbol without re-walking the owner's tree.
+  globals: []IrGlobal,
+  globalSyms: map<string, string>,
   // --- multi-module (#1345) -----------------------------------------------
   // The link prefix for the module currently being lowered: "" for the root,
   // else "m<id>$". Set before each module's pass; every emitted function name
@@ -743,6 +749,17 @@ function lowerPtrOf(fc: FnCtx, node: int): int {
   let sn = args[0]
   if (getNode(fc.c.tree, sn).tag == Tag.Arg) {
     sn = kidsOf(fc.c.tree, sn)[0]
+  }
+  // Module-level state (§11.11) has a static address: GlobalAddr IS the answer,
+  // with no slice header to walk.
+  let pn = getNode(fc.c.tree, sn)
+  if (pn.tag == Tag.Ident) {
+    let psym = moduleGlobalSym(fc, fc.c.source[pn.span.start:pn.span.end])
+    if (psym != "") {
+      let cv = mkInstr(Op.Convert, nodeType(fc, node))
+      cv.lhs = emitGlobalAddrVal(fc, psym)
+      return builderEmit(fc.b, cv)
+    }
   }
   let s = lowerExpr(fc, sn)
   if (fc.failed) {
@@ -2278,6 +2295,23 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
     if (v != -1) {
       return v
     }
+    // Not a local: a module-level `let` (§11.11) is a static cell. An `[N]T`
+    // array IS its base address in this IR (IndexGet/IndexSet take an
+    // element-base pointer), so the address is the value; every other
+    // admissible type is one word in the cell, so it takes one load — FieldGet
+    // at offset 0, the same op `*p` lowers to.
+    let gsym = moduleGlobalSym(fc, name)
+    if (gsym != "") {
+      let addr = emitGlobalAddrVal(fc, gsym)
+      let gty = nodeType(fc, node)
+      if (fc.c.ctx.types[gty].kind == TypeKind.Array) {
+        return addr
+      }
+      let ld = mkInstr(Op.FieldGet, gty)
+      ld.lhs = addr
+      ld.ival = 0
+      return builderEmit(fc.b, ld)
+    }
     // Not a local: a module-level const inlines its initializer at the use site.
     // An IMPORTED const's initializer node indexes its OWN module's arena, so it
     // must be lowered against that module's checker — reading the node against
@@ -3642,8 +3676,29 @@ function lowerAssign(fc: FnCtx, node: int) {
     fc.failed = true
     return
   }
-  let idx = envIndex(fc, fc.c.source[ln.span.start:ln.span.end])
+  let lname = fc.c.source[ln.span.start:ln.span.end]
+  let idx = envIndex(fc, lname)
   if (idx == -1) {
+    // Not a local: a module-level `let` (§11.11). Its cell is written through
+    // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
+    let wsym = moduleGlobalSym(fc, lname)
+    if (wsym != "" && opKind == int(Kind.Eq)) {
+      // The lvalue's address is materialized BEFORE the right-hand side, which
+      // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
+      // two compilers' IR byte-identical.
+      let waddr = emitGlobalAddrVal(fc, wsym)
+      let wty = nodeType(fc, lhsItems[0])
+      let wv = lowerExprH(fc, rhsItems[0], wty)
+      if (fc.failed) {
+        return
+      }
+      let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+      st.lhs = waddr
+      st.ival = 0
+      st.rhs = wv
+      builderEmit(fc.b, st)
+      return
+    }
     fc.failed = true
     return
   }
@@ -3687,9 +3742,38 @@ function lowerIncDec(fc: FnCtx, node: int, base: int) {
     fc.failed = true
     return
   }
-  let idx = envIndex(fc, fc.c.source[ln.span.start:ln.span.end])
+  let iname = fc.c.source[ln.span.start:ln.span.end]
+  let idx = envIndex(fc, iname)
   if (idx == -1) {
-    fc.failed = true
+    // A module-level `let` (§11.11): read the cell, add/sub one, store it back.
+    let isym = moduleGlobalSym(fc, iname)
+    if (isym == "") {
+      fc.failed = true
+      return
+    }
+    let ity = nodeType(fc, kidsOf(fc.c.tree, node)[0])
+    let iop = arithOpFor(fc, base, ity)
+    if (iop == Op.BlockParam) {
+      fc.failed = true
+      return
+    }
+    let iaddr = emitGlobalAddrVal(fc, isym)
+    let ld = mkInstr(Op.FieldGet, ity)
+    ld.lhs = iaddr
+    ld.ival = 0
+    let curv = builderEmit(fc.b, ld)
+    let onei = mkInstr(Op.ConstInt, ity)
+    onei.ival = 1
+    let onev = builderEmit(fc.b, onei)
+    let ar = mkInstr(iop, ity)
+    ar.lhs = curv
+    ar.rhs = onev
+    let nv = builderEmit(fc.b, ar)
+    let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    st.lhs = iaddr
+    st.ival = 0
+    st.rhs = nv
+    builderEmit(fc.b, st)
     return
   }
   let ty = fc.env[idx].ty
@@ -5086,6 +5170,128 @@ function moduleReservedCount(c: Checker): int {
 // The root module keeps bare names; every other module's functions are prefixed
 // `m<id>$`, so two modules that both declare `join` cannot collide in the
 // object's flat symbol namespace.
+// The in-memory size of a module-level `let`'s type (§11.11). Only the untraced
+// shapes the checker admits reach here: a scalar or raw `*T` is one field slot,
+// and `[N]U` is N elements at their natural width — the same stride
+// IndexGet/IndexSet use, which is what lets a static cell stand in for a heap
+// array without touching either op.
+function moduleGlobalSize(ctx: TypeContext, ty: int): int {
+  let t = ctx.types[ty]
+  if (t.kind == TypeKind.Array) {
+    return t.arrayLen * moduleGlobalScalarSize(ctx, t.elem)
+  }
+  return moduleGlobalScalarSize(ctx, ty)
+}
+
+function moduleGlobalScalarSize(ctx: TypeContext, ty: int): int {
+  let t = ctx.types[ty]
+  if (t.kind == TypeKind.Prim) {
+    let p = t.prim
+    if (p == 0 || p == 4 || p == 10) { return 1 }
+    if (p == 1 || p == 5) { return 2 }
+    if (p == 2 || p == 6 || p == 8) { return 4 }
+  }
+  return 8
+}
+
+// A module global's rendered static image. `ok: false` means the initializer is
+// a shape this cannot evaluate EXACTLY — the caller must then refuse (stub)
+// rather than emit a cell holding the wrong value. Silent wrongness is the one
+// outcome worth failing the build over.
+struct GlobalImage {
+  ok: bool,
+  bytes: []int,
+}
+
+// Renders a module-level `let`'s initial value into its static byte image
+// (§11.11). Little-endian: every target Bit emits for.
+function moduleGlobalImage(c: Checker, ty: int, initNode: int): GlobalImage {
+  let size = moduleGlobalSize(c.ctx, ty)
+  let bytes = []int(size)
+  if (initNode == 0) {
+    return GlobalImage{ ok: true, bytes: bytes }   // zero-valued
+  }
+  let n = getNode(c.tree, initNode)
+  if (n.tag == Tag.BoolLit) {
+    if (c.source[n.span.start:n.span.end] == "true") { bytes[0] = 1 }
+    return GlobalImage{ ok: true, bytes: bytes }
+  }
+  let lit = vLiteralValue(c, initNode)
+  if (!lit.ok) {
+    return GlobalImage{ ok: false, bytes: bytes }
+  }
+  let v = lit.value
+  let i = 0
+  while (i < size) {
+    bytes[i] = (v >> (i * 8)) & 255
+    i = i + 1
+  }
+  return GlobalImage{ ok: true, bytes: bytes }
+}
+
+// Pass A0: walk every module's top-level `let` declarations (§11.11) and give
+// each one an `IrGlobal` — a symbol name and the complete static image of its
+// initial value.
+//
+// The checker has already proved each is a single-name binding of an untraced
+// type, so this never diagnoses. A global whose initializer cannot be rendered
+// exactly is simply not registered; every reference to it then fails its
+// function, which `bit build` refuses — never a cell holding a wrong value.
+function registerGlobals(mods: []Checker, lowerer: Lowerer) {
+  let mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    let i = 1
+    while (i < len(c.tree.nodes)) {
+      if (getNode(c.tree, i).tag == Tag.LetDecl) {
+        let binds = kidsOf(c.tree, i)
+        let j = 0
+        while (j < len(binds)) {
+          let bk = kidsOf(c.tree, binds[j])
+          let pat = getNode(c.tree, bk[0])
+          if (pat.tag == Tag.Ident && isModuleStateBinding(c, binds[j])) {
+            let nm = c.source[pat.span.start:pat.span.end]
+            let ty = c.nodeTypes[bk[0]]
+            if (ty != 0) {
+              let img = moduleGlobalImage(c, ty, bk[2])
+              if (img.ok) {
+                let sym = "__bitg_${c.moduleId}_${nm}"
+                lowerer.globals = append(lowerer.globals, IrGlobal{ name: sym,
+                  bytes: img.bytes, align: 8, storage: 0 })
+                lowerer.globalSyms["${c.moduleId}\$${nm}"] = sym
+              }
+            }
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    mi = mi + 1
+  }
+}
+
+// The symbol of the module global `name` refers to at this use site, or "" when
+// `name` is not module state. The owner lookup is the declOwner rule: a name
+// imported from another module resolves against THAT module's id.
+function moduleGlobalSym(fc: FnCtx, name: string): string {
+  let owner = declOwner(fc.c, name)
+  let (sym, ok) = fc.lowerer.globalSyms["${owner.moduleId}\$${name}"]
+  if (!ok) {
+    return ""
+  }
+  return sym
+}
+
+// The address of a module-level `let`'s static cell (§11.11), as a raw pointer
+// value. GlobalAddr is pure address arithmetic — no load, no call, no safepoint
+// — which is what makes module state reachable from a `@nosplit` body.
+function emitGlobalAddrVal(fc: FnCtx, sym: string): int {
+  let ga = mkInstr(Op.GlobalAddr, primType(fc.c.ctx, 3))
+  ga.name = sym
+  return builderEmit(fc.b, ga)
+}
+
 function lowerProject(mods: []Checker, root: int): IrModule {
   assert(len(mods) >= 1)
   assert(root >= 0 && root < len(mods))
@@ -5102,7 +5308,12 @@ function lowerProject(mods: []Checker, root: int): IrModule {
   let lowerer = Lowerer{ methodIds: map<string, int>{}, methodEntries: []MethodEntry(0),
     stringPool: []string(0), asmBlocks: []AsmBlock(0), reservedCount: reserved, closureFuncs: []IrFunc(0),
     fnValueTramps: map<string, int>{}, modPrefix: "", root: root, curModule: root,
-    typeModule: map<int, int>{}, stubbed: []string(0) }
+    typeModule: map<int, int>{}, stubbed: []string(0),
+    globals: []IrGlobal(0), globalSyms: map<string, string>{} }
+  // Pass A0: every module-level `let` (§11.11) gets a static cell before any
+  // function body is lowered, so a reference from a function declared above the
+  // `let` resolves just as well as one below it.
+  registerGlobals(mods, lowerer)
   // Every named type -> its declaring module, before any body is lowered: a
   // method's symbol takes its receiver TYPE's prefix, and a Pass A body can call
   // a method whose decl Pass A3 has not reached yet. `typeDecls` holds only the
@@ -5177,7 +5388,8 @@ function lowerProject(mods: []Checker, root: int): IrModule {
     ci = ci + 1
   }
   return IrModule{ funcs: funcs, ctx: mods[root].ctx, stringPool: lowerer.stringPool,
-    asmBlocks: lowerer.asmBlocks, methodTables: buildMethodTables(lowerer), stubbed: lowerer.stubbed }
+    asmBlocks: lowerer.asmBlocks, methodTables: buildMethodTables(lowerer), stubbed: lowerer.stubbed,
+    globals: lowerer.globals }
 }
 
 // A method's link symbol: prefixed by the module that DECLARES the receiver

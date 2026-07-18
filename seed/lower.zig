@@ -114,6 +114,35 @@ fn identTextOf(mf: ModuleFile, node: ast.Index) []const u8 {
 
 const FieldLayout = struct { size: u32, is_ptr: bool };
 
+/// The in-memory size of a module-level `let`'s type (§11.11). Only the
+/// untraced shapes the checker admits reach here: a scalar or raw `*T` is one
+/// `fieldLayout` slot, and `[N]U` is `N` elements laid out at their natural
+/// width — the same stride `index_get`/`index_set` use, which is what lets a
+/// static cell stand in for a heap array without touching either op.
+fn globalSize(ctx: *const TypeContext, ty: TypeId) u32 {
+    const data = ctx.typeOf(ty);
+    if (data == .array) return @intCast(data.array.len * fieldLayout(ctx.typeOf(data.array.elem)).size);
+    return fieldLayout(data).size;
+}
+
+/// Renders a module-level `let`'s initial value into its static byte image
+/// (§11.11). Little-endian: every target Bit emits for is.
+fn globalImage(gpa: Allocator, ctx: *const TypeContext, ty: TypeId, init: check.ModuleStateInit) Error![]const u8 {
+    const size = globalSize(ctx, ty);
+    const buf = try gpa.alloc(u8, size);
+    @memset(buf, 0);
+    switch (init) {
+        .zero => {},
+        .boolean => |v| buf[0] = @intFromBool(v),
+        .int => |v| std.mem.writeVarPackedInt(buf, 0, size * 8, @as(i64, @truncate(v)), .little),
+        .float => |v| switch (size) {
+            4 => std.mem.writeInt(u32, buf[0..4], @bitCast(@as(f32, @floatCast(v))), .little),
+            else => std.mem.writeInt(u64, buf[0..8], @bitCast(v), .little),
+        },
+    }
+    return buf;
+}
+
 fn fieldLayout(data: TypeData) FieldLayout {
     if (data == .prim) {
         return switch (data.prim) {
@@ -315,6 +344,11 @@ pub const Lowerer = struct {
     func_ids: std.AutoHashMapUnmanaged(u64, ir.FuncId) = .{},
     /// Index into `ctx.instantiations` -> its lowered `ir.FuncId`.
     inst_ids: std.AutoHashMapUnmanaged(u32, ir.FuncId) = .{},
+    /// Module-level `let` `GlobalSymbol.pack()` -> its `ir.GlobalId` (§11.11).
+    /// Filled by `registerGlobals` before any body is lowered, so a reference
+    /// from a function declared above the `let` resolves just as well as one
+    /// below it.
+    global_ids: std.AutoHashMapUnmanaged(u64, ir.GlobalId) = .{},
     /// (struct TypeId, method name) -> declaring func_decl's `GlobalSymbol`.
     /// Linear-scanned (bounded by the program's total method count — see
     /// `lookupMethod`); built once by `buildMethodTable`.
@@ -354,6 +388,44 @@ pub const Lowerer = struct {
         var tagged = f;
         tagged.in_root_module = self.inRoot();
         try self.closure_funcs.append(self.gpa, tagged);
+    }
+
+    /// Pass A0: walk every module's top-level `let` declarations (§11.11) and
+    /// give each one an `ir.Global` — a name, and the complete static byte
+    /// image of its initial value.
+    ///
+    /// The checker has already proved (`checkModuleState`) that each of these
+    /// is a single-name binding of an untraced type with a constant
+    /// initializer, so this pass never has to diagnose: anything it cannot
+    /// render would have been rejected upstream. Walking the AST rather than
+    /// `rmodule.symbols` is deliberate — `let_binding` is also the kind of
+    /// every *local* `let`, and only the top-level decl list distinguishes them.
+    fn registerGlobals(self: *Lowerer, gpa: Allocator) Error!void {
+        for (self.modules, 0..) |mod, mi| {
+            for (mod.files, 0..) |mf, file_idx| {
+                for (mf.tree.kids(mf.tree.root)) |decl_idx| {
+                    if (decl_idx == ast.none) continue;
+                    const inner = if (mf.tree.get(decl_idx).tag == .@"export") mf.tree.kids(decl_idx)[0] else decl_idx;
+                    if (mf.tree.get(inner).tag != .let_decl) continue;
+                    for (mf.tree.kids(inner)) |bind| {
+                        const pat = mf.tree.kids(bind)[0];
+                        if (mf.tree.get(pat).tag != .ident) continue; // diagnosed by the checker
+                        const sid = mod.rmodule.node_symbols[file_idx][pat];
+                        if (sid == .none) continue;
+                        const init = mod.checked.moduleStateOf(sid) orelse continue; // ditto
+                        const ty = mod.checked.typeOf(file_idx, pat);
+                        const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = sid };
+                        const name = try std.fmt.allocPrint(gpa, "__bitg_{d}_{s}", .{ mi, identTextOf(mf, pat) });
+                        const bytes = try globalImage(gpa, self.ctx, ty, init);
+                        // Only the process-wide class has a surface today
+                        // (§11.11); `@threadlocal` is specified but not yet
+                        // parsed or emitted.
+                        const id = try self.out.addGlobal(name, bytes, 8, .process);
+                        try self.global_ids.put(gpa, gsym.pack(), id);
+                    }
+                }
+            }
+        }
     }
 
     /// Re-point the per-module cursors at `m` before lowering one of its
@@ -771,6 +843,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     };
     errdefer l.out.deinit();
     defer l.func_ids.deinit(gpa);
+    defer l.global_ids.deinit(gpa);
     defer l.fn_value_tramps.deinit(gpa);
     defer l.inst_ids.deinit(gpa);
     defer l.method_table.deinit(gpa);
@@ -780,6 +853,10 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
         while (it.next()) |lay| lay.deinit(gpa);
         l.layouts.deinit(gpa);
     }
+
+    // Pass A0: every module-level `let` (§11.11) gets a `GlobalId` and a
+    // static byte image, before any function body is lowered.
+    try l.registerGlobals(gpa);
 
     // Pass A: every non-generic func in every module gets a `FuncId` up front
     // (stable module-then-symbol order), so forward/mutually-recursive and
@@ -1370,8 +1447,15 @@ const FnCtx = struct {
     fn resolveLvalue(self: *FnCtx, node: ast.Index) Error!Lvalue {
         switch (self.tree().get(node).tag) {
             .ident => {
-                const idx = self.env.lookup(self.identText(node)) orelse return error.UnsupportedConstruct;
-                return .{ .local = idx };
+                if (self.env.lookup(self.identText(node))) |idx| return .{ .local = idx };
+                // Not a local: a module-level `let` (§11.11). Its cell is
+                // written through the ordinary `field_set` at offset 0, the
+                // same lvalue shape `*p = x` already uses.
+                const gsym = self.nodeSymbol(node) orelse return error.UnsupportedConstruct;
+                const sym = self.l.symbolOf(gsym);
+                if (sym.kind != .let_binding or !sym.module_scoped) return error.UnsupportedConstruct;
+                const addr = try self.globalAddrOf(gsym);
+                return .{ .field = .{ .recv = addr, .ty = try self.nodeType(node), .offset = 0 } };
             },
             .member => {
                 const k = self.kids(node);
@@ -2750,7 +2834,18 @@ const FnCtx = struct {
     /// address word from `i64` to `*T` — both are one int word (is_ref=0).
     fn lowerPtrOf(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const arg_nodes = self.kids(self.kids(node)[2]);
-        const s = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+        const arg = self.kids(arg_nodes[0])[0];
+        // Module-level state (§11.11) has a static address: `global_addr` *is*
+        // the answer, with no slice header to walk.
+        if (self.tree().get(arg).tag == .ident) {
+            if (self.nodeSymbol(arg)) |gsym| {
+                const sym = self.l.symbolOf(gsym);
+                if (sym.kind == .let_binding and sym.module_scoped) {
+                    return self.b.convert(try self.nodeType(node), try self.globalAddrOf(gsym));
+                }
+            }
+        }
+        const s = try self.lowerExpr(arg);
         const i64ty = self.ctx.prim_ids.get(.i64);
         const buf = try self.b.fieldGet(i64ty, s, 0);
         const off = try self.b.fieldGet(i64ty, s, 16);
@@ -3289,8 +3384,30 @@ const FnCtx = struct {
         const gsym = self.nodeSymbol(node) orelse return error.UnsupportedConstruct;
         const sym = self.l.symbolOf(gsym);
         if (sym.kind == .func) return self.lowerFuncValue(node, gsym); // a named function used as a value
-        if (sym.kind != .const_binding) return error.UnsupportedConstruct; // top-level mutable `let`: no IR global-variable op exists yet
+        if (sym.kind == .let_binding and sym.module_scoped) return self.lowerGlobalRead(node, gsym);
+        if (sym.kind != .const_binding) return error.UnsupportedConstruct;
         return self.lowerTopConst(gsym, sym.file_idx);
+    }
+
+    /// The address of a module-level `let`'s static cell (§11.11), as a raw
+    /// pointer value. `global_addr` is pure address arithmetic — no load, no
+    /// call, no safepoint — which is what makes module state reachable from a
+    /// `@nosplit` body (§10.3.1).
+    fn globalAddrOf(self: *FnCtx, gsym: GlobalSymbol) Error!ir.ValueId {
+        const gid = self.l.global_ids.get(gsym.pack()) orelse return error.UnsupportedConstruct;
+        return self.b.globalAddr(self.ctx.prim_ids.get(.i64), gid);
+    }
+
+    /// Reading a module-level `let`. An `[N]T` array *is* its base address in
+    /// this IR (`index_get`/`index_set` take an element-base pointer), so the
+    /// address is the value; every other admissible type is a single word held
+    /// in the cell, so it takes one load — `field_get` at offset 0, the same op
+    /// `*p` already lowers to.
+    fn lowerGlobalRead(self: *FnCtx, node: ast.Index, gsym: GlobalSymbol) Error!ir.ValueId {
+        const addr = try self.globalAddrOf(gsym);
+        const ty = try self.nodeType(node);
+        if (self.ctx.typeOf(ty) == .array) return addr;
+        return self.b.fieldGet(ty, addr, 0);
     }
 
     /// A named top-level function referenced as a first-class value: wrap it in a
