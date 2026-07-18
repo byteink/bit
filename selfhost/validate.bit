@@ -60,6 +60,17 @@ struct VLit {
   value: int,
 }
 
+// A folded compile-time constant (§15.4). `kind` is one of `vcInt`/`vcFloat`/
+// `vcBool` and selects which payload is live — the seed's `ConstVal` union in
+// the form Bit spells it. `ok: false` means "not a constant expression", which
+// is the only signal §11.11 needs.
+struct VConst {
+  ok: bool,
+  kind: int,
+  ival: int,
+  fval: f64,
+}
+
 // A node's span, mapped from module-global offsets back to the file the text
 // came from. A module is its files CONCATENATED, so every span the parser
 // produced is module-global and would otherwise render against the wrong file
@@ -250,6 +261,145 @@ function vLiteralValue(c: Checker, node: int): VLit {
   if (tag == Tag.RuneLit) { v = parseRuneText(text) }
   if (negate) { v = 0 - v }
   return VLit{ ok: true, value: v }
+}
+
+// ---- module-state constant folding (§15.4) --------------------------------
+//
+// A faithful port of seed/check.zig's `constEval`, and it must STAY faithful:
+// this decides both what §11.11 accepts and what byte image lowering renders,
+// so any expression the seed folds and this does not becomes a `bit check`
+// pass followed by a `bit build` failure (#1430).
+//
+// Deliberately NOT `vLiteralValue`, which peels one sign off a literal for
+// range-checking and nothing more. That narrowness is right there and wrong
+// here: `let x: i64 = 0 - 1` is a constant expression by §15.4 ("constant
+// expressions are evaluated at compile time"), so refusing to fold it rejects a
+// legal program rather than an illegal one.
+
+const vcInt = 0
+const vcFloat = 1
+const vcBool = 2
+const vConstMaxDepth = 64
+
+function vConstNone(): VConst {
+  return VConst{ ok: false, kind: vcInt, ival: 0, fval: 0.0 }
+}
+
+// The initializer node of the module-level `const` named `name` in THIS module,
+// or 0 when there is none. Single-module by design: the seed's `constEval`
+// refuses cross-module folding outright ("out of scope" there), so resolving an
+// imported `const` here would fold what the seed leaves alone and put the two
+// compilers' images out of step. Bounded by the node arena, per Power-of-10.
+function vConstInitNode(c: Checker, name: string): int {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (getNode(c.tree, i).tag == Tag.ConstDecl) {
+      let binds = kidsOf(c.tree, i)
+      let j = 0
+      while (j < len(binds)) {
+        let bk = kidsOf(c.tree, binds[j])
+        let pat = getNode(c.tree, bk[0])
+        if (pat.tag == Tag.Ident && bk[2] != 0 &&
+            c.source[pat.span.start:pat.span.end] == name) {
+          return bk[2]
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Folds `node` to a compile-time value, or `ok: false` when it is not constant.
+function vConstEval(c: Checker, node: int, depth: int): VConst {
+  if (node == 0 || depth >= vConstMaxDepth) { return vConstNone() }
+  let n = getNode(c.tree, node)
+  let tag = n.tag
+  let text = c.source[n.span.start:n.span.end]
+
+  if (tag == Tag.IntLit) {
+    return VConst{ ok: true, kind: vcInt, ival: parseIntText(text), fval: 0.0 }
+  }
+  if (tag == Tag.RuneLit) {
+    return VConst{ ok: true, kind: vcInt, ival: parseRuneText(text), fval: 0.0 }
+  }
+  if (tag == Tag.FloatLit) {
+    return VConst{ ok: true, kind: vcFloat, ival: 0, fval: parseFloat(text) }
+  }
+  if (tag == Tag.BoolLit) {
+    let b = 0
+    if (text == "true") { b = 1 }
+    return VConst{ ok: true, kind: vcBool, ival: b, fval: 0.0 }
+  }
+
+  if (tag == Tag.Unary) {
+    let v = vConstEval(c, kidsOf(c.tree, node)[0], depth + 1)
+    if (!v.ok) { return vConstNone() }
+    let op = n.main
+    if (op == int(Kind.Plus)) { return v }
+    if (op == int(Kind.Minus)) {
+      if (v.kind == vcInt) { return VConst{ ok: true, kind: vcInt, ival: 0 - v.ival, fval: 0.0 } }
+      if (v.kind == vcFloat) { return VConst{ ok: true, kind: vcFloat, ival: 0, fval: 0.0 - v.fval } }
+      return vConstNone()
+    }
+    if (op == int(Kind.Bang)) {
+      if (v.kind != vcBool) { return vConstNone() }
+      let b = 1
+      if (v.ival != 0) { b = 0 }
+      return VConst{ ok: true, kind: vcBool, ival: b, fval: 0.0 }
+    }
+    return vConstNone()
+  }
+
+  if (tag == Tag.Binary) {
+    let k = kidsOf(c.tree, node)
+    let a = vConstEval(c, k[0], depth + 1)
+    if (!a.ok) { return vConstNone() }
+    let b = vConstEval(c, k[1], depth + 1)
+    if (!b.ok) { return vConstNone() }
+    // Integer operands only — the seed folds no float binary either, and
+    // matching it matters more than folding more.
+    if (a.kind != vcInt || b.kind != vcInt) { return vConstNone() }
+    let op = n.main
+    let x = a.ival
+    let y = b.ival
+    if (op == int(Kind.Plus)) { return vConstInt(x + y) }
+    if (op == int(Kind.Minus)) { return vConstInt(x - y) }
+    if (op == int(Kind.Star)) { return vConstInt(x * y) }
+    if (op == int(Kind.Slash)) {
+      if (y == 0) { return vConstNone() }
+      return vConstInt(x / y)
+    }
+    if (op == int(Kind.Percent)) {
+      if (y == 0) { return vConstNone() }
+      return vConstInt(x % y)
+    }
+    if (op == int(Kind.Amp)) { return vConstInt(x & y) }
+    if (op == int(Kind.Pipe)) { return vConstInt(x | y) }
+    if (op == int(Kind.Caret)) { return vConstInt(x ^ y) }
+    if (op == int(Kind.Shl)) {
+      if (y < 0 || y > 127) { return vConstNone() }
+      return vConstInt(x << y)
+    }
+    if (op == int(Kind.Shr)) {
+      if (y < 0 || y > 127) { return vConstNone() }
+      return vConstInt(x >> y)
+    }
+    return vConstNone()
+  }
+
+  if (tag == Tag.Ident) {
+    let init = vConstInitNode(c, text)
+    if (init == 0) { return vConstNone() }
+    return vConstEval(c, init, depth + 1)
+  }
+
+  return vConstNone()
+}
+
+function vConstInt(v: int): VConst {
+  return VConst{ ok: true, kind: vcInt, ival: v, fval: 0.0 }
 }
 
 // The real assignability entry point: `node` is the source expression being
@@ -1638,20 +1788,6 @@ function vUntracedType(c: Checker, ty: int, depth: int): bool {
   return false
 }
 
-// True only for node shapes that can NEVER be a compile-time constant.
-//
-// Deliberately a blacklist of the definitely-dynamic forms rather than a full
-// constant evaluator: this file's standing rule is to stay permissive whenever
-// it cannot decide (see the header), because reporting a VALID program is the
-// one failure mode that breaks builds. The seed runs a real evaluator and so
-// rejects strictly more; anything this misses is a MISSING in the differential,
-// which is harmless, never a FALSEPOS.
-function vDefinitelyNotConst(c: Checker, node: int): bool {
-  let t = getNode(c.tree, node).tag
-  return t == Tag.Call || t == Tag.Index || t == Tag.Member ||
-    t == Tag.StrInterp || t == Tag.SliceLit || t == Tag.ArrowFn
-}
-
 // Module-level mutable state (§11.11). Three rules, enforced HERE in the
 // checker rather than at lowering, so an invalid program gets a real diagnostic
 // instead of a late `cannot lower` build failure:
@@ -1697,7 +1833,16 @@ function vModuleState(c: Checker, binding: int) {
       "a module-level array is zero-valued; assign its elements at run time")
     return
   }
-  if (vDefinitelyNotConst(c, k[2])) {
+  // Decided by the SAME folder lowering renders the byte image with, so the two
+  // stages cannot disagree (#1430). The old test was a tag blacklist: it caught
+  // `foo()` but passed `0 - 1`, which lowering then could not render, so the
+  // build failed naming whichever FUNCTION referenced the cell rather than the
+  // declaration that was actually at fault.
+  //
+  // Rejecting on a failed fold rather than on a syntactic guess stays within
+  // this file's permissive rule because the folder is a faithful port of the
+  // seed's `constEval`: what it refuses, the seed refuses too.
+  if (!vConstEval(c, k[2], 0).ok) {
     report(c.diags, ecNonConstantExpr, vSpan(c, k[2]),
       "module-level 'let' initializer must be a compile-time constant expression",
       "module state is emitted as a static byte image, so there is no run-time initializer")

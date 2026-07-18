@@ -171,7 +171,26 @@ const Parser = struct {
         if (self.tok.kind == .invalid) return;
         var buf: [96]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "expected {s}, found {s}", .{ what, describe(self.tok.kind) }) catch what;
-        try self.diags.report(.expected_token, self.tok.span, msg, null);
+        try self.diags.report(.expected_token, self.tok.span, msg, self.asiHint());
+    }
+
+    /// The hint for a parse error whose unexpected token is a semicolon §7
+    /// SYNTHESIZED rather than one the author wrote.
+    ///
+    /// That case is worth calling out because the source shows no `;` at all, so
+    /// "found ';'" names a token the reader cannot see, and the line it points
+    /// at usually looks perfectly well formed. It is the whole reported symptom
+    /// behind both wrapped `import` (#1412) and a condition broken before its
+    /// operator (#1430) — the parse is behaving exactly as §7 specifies, and the
+    /// only thing missing is saying so.
+    ///
+    /// A synthesized semicolon is the one token the lexer emits as a POINT span
+    /// (`Span.point`, zero width at the newline); a written `;` covers its byte.
+    /// This changes no grammar — the same programs parse and fail as before.
+    fn asiHint(self: *const Parser) ?[]const u8 {
+        if (self.tok.kind != .semicolon) return null;
+        if (self.tok.span.start != self.tok.span.end) return null; // an author's ';'
+        return "a line break after a value ends the statement (§7); to continue an expression, end the line with the operator instead of starting the next line with it";
     }
 
     /// A guarded loop hit its element cap: the construct holds more elements

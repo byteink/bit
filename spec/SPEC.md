@@ -344,6 +344,36 @@ if (cond)        // WRONG: ';' inserted after ')', 'if' has empty body,
 }
 ```
 
+**Wrapping a long condition.** Insertion depends only on the last token of the
+line, and **being inside an unclosed `(` does not suppress it**. A wrapped `if`,
+`while`, or call argument list therefore obeys this section unchanged — there is
+no bracket-depth rule. These two forms are **rejected**:
+
+```
+if (a == 1
+    && b == 2) { ... }     // ';' inserted after '1' -> "expected ')'"
+
+if (a == 1 && b == 2
+   ) { ... }               // ';' inserted after '2' -> "expected ')'"
+```
+
+The spellings that work end every broken line on a non-terminator — the operator
+trailing, or the `(` itself:
+
+```
+if (a == 1 &&
+    b == 2) { ... }
+
+if (
+  a == 1 && b == 2) { ... }
+```
+
+Suppressing insertion inside brackets would require the lexer to track bracket
+depth, which is exactly the newline-sensitivity this section rules out — so the
+restriction is deliberate, and identical to the one §17.2 documents for a wrapped
+`import`. A parse error on a synthesized `";"` carries a hint naming this rule,
+since the offending token appears nowhere in the source.
+
 A conforming lexer implements this with one token of state (the previously emitted
 token kind) and a per-line "saw newline" flag. No lookahead beyond the current
 character is required.
