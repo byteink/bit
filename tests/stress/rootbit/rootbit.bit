@@ -30,6 +30,11 @@
 //
 //   L  Slices: new, append (across the doubling boundary), get, set, reslice.
 //
+//   I  Interfaces: method lookup and both type-assertion forms, against
+//      hand-built descriptors. Kept as its own phase because it is the only
+//      part of the port whose input is a TYPE DESCRIPTOR rather than a value,
+//      so it needs a metadata block the other phases have no use for.
+//
 //   M  Maps: a scripted insert/lookup/delete/overwrite stream on a port map and
 //      a native map in lockstep. The strong assertion is the LAST one: the two
 //      maps must iterate in the SAME SLOT ORDER. Order is a function of the
@@ -38,7 +43,11 @@
 //      the key SET would be. It is what makes a one-bit error in `mulHi` or an
 //      off-by-one in the 7/8 load factor visible.
 
-import { loadWord, storeWord } from "../../../runtime/gc"
+import {
+  loadWord, storeWord,
+  gcTiSize, gcTiPtrOffsetsPtr, gcTiPtrOffsetsLen, gcTiNamePtr, gcTiNameLen,
+  gcTiMethodsPtr, gcTiMethodsLen,
+} from "../../../runtime/gc"
 import {
   rootBindMemory, rootInit, rootConfigure, rootStatOom,
   rtStringConcat, rtStringEq, rtStringByte, rtStringSlice, rtStringFromInt,
@@ -48,6 +57,8 @@ import {
   rtMapNew, rtMapSet, rtMapGet, rtMapHas, rtMapDelete, rtMapLen,
   rtMapIterInit, rtMapIterNext, rtMapKeyAt, rtMapValAt,
   rtWyhashString,
+  rtGcAlloc, rtIfaceLookup, rtIfaceAs, rtIfaceAsOk, rtIfaceAssert,
+  rtIfaceAssertFailed, rtTypeName,
   strLen, strPtr,
 } from "../../../runtime/root"
 
@@ -333,6 +344,107 @@ function phaseL(): int {
 }
 
 // ---------------------------------------------------------------------------
+// I — interfaces
+// ---------------------------------------------------------------------------
+
+// Metadata block layout, in words: two `TypeInfo`s (ABI.md §2, 7 words each)
+// and a two-entry method table (2 words per entry).
+const MI_A = 0
+const MI_B = 7
+const MI_METHODS = 14
+// One word holding a copy of `infoA`, positioned so that a crafted "receiver"
+// 32 bytes above it reads that word as its GC header's descriptor slot. See the
+// `gcOwns` property in `phaseI` for why this exists.
+const MI_FAKEHDR = 18
+const META_WORDS = 19
+
+// Two arbitrary, distinctive code addresses. They are never CALLED — the port
+// only ever returns them — so any non-zero value distinguishable from the other
+// serves, and a recognisable one makes a wrong answer obvious.
+const FN_AREA = 0x515A
+const FN_PERIM = 0x9E71
+
+// One `TypeInfo` at word `at` of the metadata block.
+function writeTi(base: int, at: int, size: int, nameAddr: int, nameLen: int, mtAddr: int, mtLen: int) {
+  let w = base + at * 8
+  storeWord(w + gcTiSize, size)
+  storeWord(w + gcTiPtrOffsetsPtr, 0)
+  storeWord(w + gcTiPtrOffsetsLen, 0)
+  storeWord(w + gcTiNamePtr, nameAddr)
+  storeWord(w + gcTiNameLen, nameLen)
+  storeWord(w + gcTiMethodsPtr, mtAddr)
+  storeWord(w + gcTiMethodsLen, mtLen)
+}
+
+function phaseI(meta: []i64): int {
+  let ok = 0
+  let base = int(ptrOf(meta))
+
+  // Descriptor names come from port-heap strings, so `rtTypeName` has real
+  // bytes to copy and the name round-trip is a genuine comparison.
+  let nameA = mine("Square")
+  let nameB = mine("Circle")
+
+  let mt = base + MI_METHODS * 8
+  storeWord(mt + 0, 100)
+  storeWord(mt + 8, FN_AREA)
+  storeWord(mt + 16, 200)
+  storeWord(mt + 24, FN_PERIM)
+
+  let infoA = base + MI_A * 8
+  let infoB = base + MI_B * 8
+  writeTi(base, MI_A, 16, loadWord(nameA + strPtr), loadWord(nameA + strLen), mt, 2)
+  writeTi(base, MI_B, 16, loadWord(nameB + strPtr), loadWord(nameB + strLen), 0, 0)
+
+  // Method lookup scans linearly, so both positions and a miss all matter.
+  if (rtIfaceLookup(infoA, 100) == FN_AREA) { ok = ok + 1 }
+  if (rtIfaceLookup(infoA, 200) == FN_PERIM) { ok = ok + 1 }
+  if (rtIfaceLookup(infoA, 999) == 0) { ok = ok + 1 }
+  // A descriptor with no methods must not read past its (null) table.
+  if (rtIfaceLookup(infoB, 100) == 0) { ok = ok + 1 }
+
+  let obj = rtGcAlloc(infoA)
+  if (obj != 0) { ok = ok + 1 }
+
+  // The two-result assertion. Descriptor identity IS type identity.
+  if (rtIfaceAs(obj, infoA) == obj && rtIfaceAsOk()) { ok = ok + 1 }
+  // A MISMATCH MUST RETURN NULL, not the un-narrowed receiver: the result is
+  // typed T, so handing back `obj` would let a caller that ignores `ok` read a
+  // Circle as a Square.
+  if (rtIfaceAs(obj, infoB) == 0 && !rtIfaceAsOk()) { ok = ok + 1 }
+  // A nil interface is a null word, not an object.
+  if (rtIfaceAs(0, infoA) == 0 && !rtIfaceAsOk()) { ok = ok + 1 }
+
+  // THE `gcOwns` GUARD, on a receiver BUILT TO DEFEAT IT. A reference-typed
+  // value need not be a GC object at all (a `chan` is not), so a type assertion
+  // on one must not decode whatever sits 32 bytes below it as a descriptor.
+  //
+  // Pointing at an arbitrary non-owned address does NOT test this: the word
+  // below it is unlikely to equal the wanted descriptor, so the assertion fails
+  // for the wrong reason and the guard could be deleted (measured: mutation I2
+  // survived exactly that check). So the word below this receiver is set to
+  // `infoA` deliberately. Without `gcOwns`, the assertion SUCCEEDS and hands
+  // back a pointer into a native slice buffer typed as a Square.
+  storeWord(base + MI_FAKEHDR * 8, infoA)
+  let forged = base + MI_FAKEHDR * 8 + 32
+  if (rtIfaceAs(forged, infoA) == 0 && !rtIfaceAsOk()) { ok = ok + 1 }
+  if (rtIfaceAssert(forged, infoA) == 0 && rtIfaceAssertFailed(forged, infoA)) { ok = ok + 1 }
+
+  // The one-result form, and the predicate that decides whether it panics.
+  if (rtIfaceAssert(obj, infoA) == obj) { ok = ok + 1 }
+  if (rtIfaceAssert(obj, infoB) == 0) { ok = ok + 1 }
+  if (!rtIfaceAssertFailed(obj, infoA)) { ok = ok + 1 }
+  if (rtIfaceAssertFailed(obj, infoB)) { ok = ok + 1 }
+  if (rtIfaceAssertFailed(0, infoA)) { ok = ok + 1 }
+
+  // The name a failed assertion's message would interpolate.
+  if (sameStr(rtTypeName(infoA), "Square")) { ok = ok + 1 }
+  if (sameStr(rtTypeName(infoB), "Circle")) { ok = ok + 1 }
+
+  return ok
+}
+
+// ---------------------------------------------------------------------------
 // M — maps
 // ---------------------------------------------------------------------------
 
@@ -531,6 +643,7 @@ function main() {
   let arena = []i64(ARENA_WORDS)
   let indexArena = []i64(INDEX_WORDS)
   let rng = []u64(1)
+  let meta = []i64(META_WORDS)
 
   rootBindMemory(int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
   if (!rootInit(MARK_STACK)) {
@@ -551,16 +664,17 @@ function main() {
   let w = phaseW()
   let s = phaseS()
   let l = phaseL()
+  let ifc = phaseI(meta)
   let m = phaseM(rng)
 
   // Extends `arena`/`indexArena` past every safepoint above (see their comment)
   // and, by allocating from the port's heap AFTER all the churn, proves that
   // heap is still intact rather than merely still addressable.
   let stillWorks = rtStringEq(mine("live"), mine("live"))
-  let rooted = len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && stillWorks
+  let rooted = len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && len(meta) == META_WORDS && stillWorks
 
   // `oom` is part of the line, not a side check: every phase above assumes it
   // never ran out of arena, and a non-zero value would mean some "0" result was
   // an allocation failure rather than the behaviour under test.
-  print("wy=${w}/7 str=${s}/26 slc=${l}/11 map=${m}/8 reboot=${reboot} rooted=${rooted} oom=${rootStatOom()}\n")
+  print("wy=${w}/7 str=${s}/26 slc=${l}/11 ifc=${ifc}/17 map=${m}/8 reboot=${reboot} rooted=${rooted} oom=${rootStatOom()}\n")
 }
