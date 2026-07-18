@@ -236,8 +236,19 @@ unwinding, call-clobbered ones would be lost.
 
 **Snapshot.** Collection only ever runs from `bit_rt_safepoint` (below), which is
 a naked shim that records the caller's return address, frame pointer, and
-callee-saved registers *before* any runtime code can overwrite them, into a
-process-global frame. The walk starts there.
+callee-saved registers *before* any runtime code can overwrite them. The frame is
+built **on the polling thread's own stack** — the shim reserves it below the
+caller's `sp`/`rsp` and passes its address to the poll body as the first C
+argument — so every thread that polls has its own snapshot with no thread-local
+storage, no registration, and no shared global. The walk starts there.
+
+The snapshot's `regs` array is **not** zeroed (the shim runs at every loop
+back-edge; clearing 32 words per poll is not free). Only the callee-saved file is
+written. That is sound in both directions: the register file restriction above
+means a stack map can only ever name a register the shim *did* save, and every
+word the walk reads is routed through `markRoot`, which marks it only if it is
+exactly a live object base. An unwritten slot can therefore neither be read as a
+root nor be mis-decoded if it were.
 
 **Frame chain.** Both backends establish an identical frame record: `*(fp)` is
 the caller's frame pointer and `*(fp+8)` is the return address (`fp` = `rbp` on
@@ -283,20 +294,69 @@ entries to recover the caller's registers; then step to `*(fp)` / `*(fp+8)`.
 - A **safepoint** is a program point where the stack maps are valid and the
   mutator may yield to the collector. Codegen inserts safepoint polls (at least at
   loop back-edges and function entry/allocation) so collection cannot be starved.
-- v1 has a single mutator **OS thread**, so "stop the world" is "run the
-  collector synchronously at the safepoint". Green threads exist and run
-  concurrently with each other (`runtime/sched.zig`'s M:N scheduler), but
-  `rt_boot` (§9) pins the worker pool to exactly one OS thread — see §9's note
-  — specifically so this remains true: only one green thread is ever actually
-  executing at a time, and a safepoint reached by that thread really does see
-  a quiescent heap. `Gc.safepoint(scanner)` is that poll. Running the worker
-  pool at `nthreads > 1` is a real correctness hazard today: nothing pauses
-  the other OS threads before `collect` marks, so a second mutator can mutate
-  the heap mid-trace. Lifting the pin requires a real pause-all-workers
-  barrier (each worker parks itself at its own next safepoint poll before the
-  collecting thread proceeds) — future ticket, not built here.
 - The collector never moves objects (non-moving mark-sweep), so references are
   stable across a collection and no pointer fix-up is required.
+
+**The stop-the-world handshake.** "Stop the world" is a real rendezvous, not an
+assumption about there being one thread. Any number of OS threads may execute Bit
+code concurrently and reach safepoints concurrently.
+
+Every OS thread that runs Bit code is a **mutator**, holding one slot in a fixed,
+statically sized registry (no allocation after startup; a slot is claimed by
+`bit_rt_gc_thread_enter` and released by `bit_rt_gc_thread_exit`). A slot is in
+one of three states:
+
+```
+running   executing Bit code; may reach a safepoint at any moment
+parked    stopped at a safepoint, its snapshot published for the collector
+blocked   inside a call that holds NO live Bit references (see below)
+```
+
+At a safepoint poll each mutator does exactly one of:
+
+1. **A stop is already requested** — publish the snapshot, go `parked`, and wait
+   until the stop clears. This is how a thread yields to someone else's
+   collection.
+2. **No stop is requested and the allocation trigger is not crossed** — return.
+   This is the overwhelmingly common path and costs one atomic load.
+3. **The trigger is crossed** — try to become the collector: take the
+   world lock, request the stop, wait for every *other* `running` mutator to
+   reach `parked`, collect, then clear the stop and release. A thread that
+   fails to take the lock parks instead of spinning, so it can never hold the
+   lock's winner hostage.
+
+**A collection that cannot achieve a full stop is abandoned, never forced.** The
+rendezvous wait is bounded (Power-of-10: every loop is); on expiry the collector
+clears the stop request, releases every parked thread, and returns *without*
+collecting. Skipping a collection is always safe — the heap simply grows to the
+next trigger — so correctness never depends on the rendezvous succeeding, and no
+blocking mutator can deadlock the collector. Abandonments are counted and
+reported by `BIT_GC_STATS=1`.
+
+**Roots under the handshake.** The collecting thread walks its own stack
+precisely from its own snapshot (§4); every *other* `parked` mutator is walked
+precisely from the snapshot it published; parked green tasks are scanned
+conservatively from the registry as described below. `blocked` mutators are
+neither waited for nor scanned.
+
+**The `blocked` contract, and its one precondition.** `bit_rt_gc_blocking_begin`
+/ `_end` bracket a region in which the calling thread **holds no live Bit
+references in any of its frames**. The collector then neither waits for that
+thread nor scans it. This exists for one shape: a scheduler worker that has no
+task on it and is about to sleep on an idle backoff. Without it, an idle sleeping
+worker would hold up every collection for the length of its sleep. Calling it
+around a region that *does* hold references is a collector bug — the references
+are invisible and will be swept.
+
+**Known limitation, stated rather than hidden.** Blocking runtime calls made
+*from* Bit code (`bit_rt_print` on a full pipe, `bit_rt_fs_read` on stdin,
+`bit_rt_os_run`'s `waitpid`, `bit_rt_net_resolve`'s DNS timeout) do **not** use
+the `blocked` contract, because their frames legitimately hold live references
+(the string being printed, the buffer being filled). Such a thread stays
+`running`, so a concurrent collection waits for it and abandons if it exceeds the
+rendezvous bound. That is safe but wastes a collection. Closing it requires those
+call sites to publish a conservative stack range at entry — a later refinement,
+not required for the handshake to be sound.
 
 **Live-task registry and parked stacks.** The scheduler keeps every task on an
 all-tasks registry (`Scheduler.registerTask`, from `spawn` until the task's
@@ -336,10 +396,34 @@ symbols `runtime/root.zig` wires to it:
 
 ```
 bit_rt_gc_alloc(info: *const TypeInfo) -> *u8   // Gc.alloc, fatal (not null) on OOM
-bit_rt_safepoint()                    -> void   // Gc.safepoint, with root.zig's scanner
+bit_rt_safepoint()                    -> void   // poll + §5 stop-the-world handshake
 ```
 
-Both are plain `callconv(.c)` functions with C linkage names — ordinary
+`bit_rt_safepoint` takes no arguments and returns nothing **as seen by its
+caller**; the on-stack snapshot of §4 is built and passed on entirely inside the
+shim, so codegen is unaffected by it. The shim reserves ~300 bytes below the
+caller's stack pointer, which is why a function containing a safepoint may not
+rely on the x86-64 red zone (it is non-leaf by construction, so it already may
+not).
+
+Threads that run Bit code participate in the §5 handshake through four more
+exports, none of which codegen emits — they are called by whatever creates the
+thread (`runtime/sched.zig`'s worker pool, `runtime/sched/`'s Bit port, or user
+code that starts a raw OS thread via `runtime/thread`):
+
+```
+bit_rt_gc_thread_enter()   -> void   // claim a mutator slot for this OS thread
+bit_rt_gc_thread_exit()    -> void   // release it; MUST precede thread exit
+bit_rt_gc_blocking_begin() -> void   // enter a no-live-references blocking region
+bit_rt_gc_blocking_end()   -> void   // leave it
+```
+
+`_enter` is idempotent per thread and is also performed lazily by the first
+safepoint poll, so a thread can never be invisible to the collector. `_exit` is
+not optional: a leaked slot stays `running` forever, which does not corrupt
+anything but does make every later rendezvous time out, i.e. collection stops.
+
+All are plain `callconv(.c)` functions with C linkage names — ordinary
 external symbols to the linker (§9's export table lists every `bit_rt_*`
 symbol together).
 
@@ -391,8 +475,11 @@ calls `boot`, and exits the process with `boot`'s returned code.
 1. Init the heap (`alloc.zig`) and collector (`gc.zig`, config from
    `configFromEnv(environ)` — §7).
 2. Init and start the scheduler (`sched.zig`) with **exactly one** worker OS
-   thread. Fixed at `nthreads = 1` — see §5's note on why v1's collector
-   requires this and what lifting it needs.
+   thread (`nthreads = 1`). This is no longer a *collector* requirement — §5's
+   handshake makes concurrent mutators safe, and each worker registers as a
+   mutator for the life of its run loop. It is now only a scheduler-maturity
+   choice: work stealing across several `sched.zig` workers has no test that
+   exercises it. Raising it is a scheduler ticket, not a GC one.
 3. Spawn `main_fn` (§10) as the first green thread.
 4. Poll (bounded exponential backoff) until that task reports done, then shut
    the scheduler down, tear down the collector, and return the task's exit

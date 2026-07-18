@@ -702,6 +702,35 @@ const Deque = struct {
 /// share one implementation without importing the scheduler.
 pub const SpinLock = @import("spinlock.zig").SpinLock;
 
+/// The collector's mutator-registration hooks (ABI.md §5), reached by C symbol
+/// rather than by import: `root.zig` imports *this* file, so importing it back
+/// would be a cycle. Resolved at link time in a real runtime build. A unit-test
+/// build compiles this file alone, with no `root.zig` and so no such symbol —
+/// and needs no registration either, because it never runs Bit code.
+const gc_hooks = if (builtin.is_test) struct {
+    fn threadEnter() void {}
+    fn threadExit() void {}
+    fn blockingBegin() void {}
+    fn blockingEnd() void {}
+} else struct {
+    extern fn bit_rt_gc_thread_enter() callconv(.c) void;
+    extern fn bit_rt_gc_thread_exit() callconv(.c) void;
+    extern fn bit_rt_gc_blocking_begin() callconv(.c) void;
+    extern fn bit_rt_gc_blocking_end() callconv(.c) void;
+    fn threadEnter() void {
+        bit_rt_gc_thread_enter();
+    }
+    fn threadExit() void {
+        bit_rt_gc_thread_exit();
+    }
+    fn blockingBegin() void {
+        bit_rt_gc_blocking_begin();
+    }
+    fn blockingEnd() void {
+        bit_rt_gc_blocking_end();
+    }
+};
+
 /// Overflow queue shared by all workers: spilled local-queue pushes, tasks
 /// unparked from another thread, and tasks woken by the netpoller all land
 /// here since the target worker isn't known (or isn't a worker at all).
@@ -901,11 +930,23 @@ const Worker = struct {
 
     fn run(self: *Worker) void {
         tls = self;
+        // ABI.md §5: this OS thread runs Bit code, so it is a mutator for its
+        // whole service life and the collector must be able to stop it.
+        gc_hooks.threadEnter();
+        defer gc_hooks.threadExit();
         var backoff: u64 = min_backoff_ns;
         while (true) {
             const t = self.findWork() orelse {
                 if (self.sched.stopping.load(.acquire)) return;
+                // The idle sleep is exactly the `blocked` contract's use case:
+                // no task is on this thread, so no frame here holds a live Bit
+                // reference. Without this the collector would wait for a
+                // sleeping worker to reach a safepoint it will not reach until
+                // work arrives — and every collection would be abandoned while
+                // the program's only task is parked on a channel.
+                gc_hooks.blockingBegin();
                 sleepNs(backoff);
+                gc_hooks.blockingEnd();
                 backoff = @min(backoff * 2, max_backoff_ns);
                 continue;
             };

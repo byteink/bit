@@ -15,10 +15,13 @@
 //! times matter. The header, the pointer-map contract, and the root-scan
 //! interface are the stable parts; the algorithm behind them can change freely.
 //!
-//! ponytail: single mutator thread. Real STW (park every green thread at a
-//! safepoint before marking) lands with the scheduler; today "stop the world" is
-//! just "run synchronously on the one thread". `safepoint()` is the poll point
-//! that grows into that barrier.
+//! Stop-the-world is a real rendezvous, not an assumption about thread count:
+//! `World` below is the mutator registry and the handshake (ABI.md §5). Any
+//! number of OS threads may run Bit code and poll concurrently; a collector
+//! requests a stop, waits for the others to park at their own next safepoint,
+//! and **abandons the collection rather than forcing it** if that bounded wait
+//! expires. `Gc.safepoint` remains the direct single-mutator poll used by this
+//! file's tests; `root.zig`'s `bit_rt_safepoint` is the real one.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -142,6 +145,201 @@ pub const Stats = struct {
     total_swept: usize = 0,
     /// Objects that survived the most recent collection.
     survivors_last: usize = 0,
+    /// Collections given up because the stop-the-world rendezvous expired
+    /// (ABI.md §5). Always safe — the heap just grows to the next trigger — but
+    /// a non-zero count means some mutator is blocking without using the
+    /// `blocked` contract, so it is worth surfacing.
+    stw_abandoned: usize = 0,
+};
+
+// ---------------------------------------------------------------------------
+// Stop-the-world rendezvous (ABI.md §5)
+//
+// Any number of OS threads may run Bit code and reach safepoints concurrently.
+// The collector therefore cannot assume quiescence; it has to ask for it and
+// wait. `World` is the registry and the handshake, and it is deliberately free
+// of both `SafepointFrame` (whose layout belongs to `root.zig`, which owns the
+// stack maps) and the scheduler (`gc.zig` sits *below* `sched.zig`; adding an
+// import for a sleep would invert that).
+//
+// THE INVARIANT THAT MAKES THIS DEADLOCK-FREE: a mutator in `running` never
+// blocks waiting on the collector except through `park`, which publishes
+// `parked` *before* it waits. So a thread the collector is waiting for can
+// never itself be waiting for the collector.
+//
+// THE INVARIANT THAT MAKES THIS SOUND: `rendezvous` is bounded, and a
+// collection that fails to stop the world is abandoned rather than forced.
+// Skipping a collection is always safe; collecting while a mutator runs is not.
+// Correctness therefore never depends on the wait succeeding.
+// ---------------------------------------------------------------------------
+
+pub const MutatorState = enum(u32) {
+    /// Slot unused.
+    free = 0,
+    /// Executing Bit code; may reach a safepoint at any moment. The collector
+    /// waits for this state to leave before it marks.
+    running = 1,
+    /// Stopped at a safepoint with a snapshot published. Scanned precisely.
+    parked = 2,
+    /// Inside a region holding no live Bit references (ABI.md §5). Neither
+    /// waited for nor scanned.
+    blocked = 3,
+};
+
+/// One OS thread's participation record. Slots live in a fixed array inside
+/// `World`, never individually allocated, so a slot address is stable for the
+/// life of the process and a thread that leaks its slot can never dangle.
+pub const Mutator = struct {
+    state: std.atomic.Value(u32) = .init(@intFromEnum(MutatorState.free)),
+    /// Address of this thread's on-stack safepoint snapshot while `parked`,
+    /// else 0. Opaque here; `root.zig` decodes it.
+    frame: std.atomic.Value(usize) = .init(0),
+};
+
+/// Hard cap on concurrently registered mutator OS threads. Power-of-10: the
+/// registry is fixed at startup, so no allocation happens on the safepoint
+/// path and every walk over it is statically bounded.
+pub const max_mutators = 256;
+
+/// Iterations the collector spins waiting for the world to stop, and a parked
+/// mutator spins waiting for it to restart. Tens of milliseconds on current
+/// hardware; the exact figure is deliberately not load-bearing, because
+/// expiry costs a skipped collection and nothing else.
+const stw_spin_bound: usize = 8_000_000;
+
+/// Iterations a *parked* mutator will wait for the stop to clear before
+/// declaring the runtime broken.
+///
+/// THIS BOUND MUST NOT BE A TIMEOUT, and that is the whole reason it is a
+/// separate, far larger constant. A collector that expires its rendezvous
+/// abandons and clears the stop; a collector that succeeds clears it when the
+/// collection ends. Either way the stop *always* clears, so a parked thread
+/// reaching this bound means neither happened — a runtime bug, not a slow
+/// collection. Resuming would put a mutator behind the collector's back and
+/// silently corrupt the heap; crashing is the only honest option, and the bound
+/// exists to turn a hang into a diagnosable one (Power-of-10: the loop is still
+/// statically bounded). Sized so a legitimately long mark/sweep on a large heap
+/// cannot reach it.
+const stw_park_bound: usize = 1 << 32;
+
+pub const World = struct {
+    slots: [max_mutators]Mutator = [_]Mutator{.{}} ** max_mutators,
+    /// Held for the whole stop-the-world window, so only one collector runs.
+    lock: SpinLock = .{},
+    /// True from "stop requested" until the collection is over.
+    stop: std.atomic.Value(bool) = .init(false),
+
+    /// Claim a slot for the calling thread, or null if all `max_mutators` are
+    /// taken. Starts in `running`: a thread is assumed to be executing Bit code
+    /// from the moment it registers, which is the conservative direction.
+    pub fn claim(self: *World) ?*Mutator {
+        for (&self.slots) |*m| {
+            if (m.state.cmpxchgStrong(
+                @intFromEnum(MutatorState.free),
+                @intFromEnum(MutatorState.running),
+                .acq_rel,
+                .monotonic,
+            ) == null) return m;
+        }
+        return null;
+    }
+
+    /// Release a slot. The thread must not touch Bit objects afterwards.
+    pub fn release(_: *World, m: *Mutator) void {
+        m.frame.store(0, .release);
+        m.state.store(@intFromEnum(MutatorState.free), .release);
+    }
+
+    pub fn stopRequested(self: *World) bool {
+        return self.stop.load(.acquire);
+    }
+
+    /// Yield to an in-progress collection: publish `frame` (this thread's
+    /// snapshot, so the collector can walk this stack precisely), go `parked`,
+    /// and wait for the stop to clear. Returns immediately if no stop is
+    /// pending, which is what makes it safe to call speculatively.
+    pub fn park(self: *World, m: *Mutator, frame: usize) void {
+        m.frame.store(frame, .release);
+        m.state.store(@intFromEnum(MutatorState.parked), .release);
+        self.awaitRestart();
+        m.state.store(@intFromEnum(MutatorState.running), .release);
+        m.frame.store(0, .release);
+    }
+
+    /// Wait for the current stop to clear. Shared by `park` and `endBlocking`
+    /// so there is one copy of the "never resume while stopped" rule.
+    fn awaitRestart(self: *World) void {
+        var spins: usize = 0;
+        while (self.stop.load(.acquire)) : (spins += 1) {
+            if (spins >= stw_park_bound) @panic("gc: stop-the-world never cleared");
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Enter a region that holds no live Bit references (ABI.md §5). The
+    /// collector stops waiting for this thread and stops scanning it.
+    pub fn beginBlocking(_: *World, m: *Mutator) void {
+        m.frame.store(0, .release);
+        m.state.store(@intFromEnum(MutatorState.blocked), .release);
+    }
+
+    /// Leave that region. Stays `blocked` while a stop is pending — resuming
+    /// mid-collection would put a running mutator behind the collector's back,
+    /// and staying blocked longer is free because nothing waits on it.
+    pub fn endBlocking(self: *World, m: *Mutator) void {
+        self.awaitRestart();
+        m.state.store(@intFromEnum(MutatorState.running), .release);
+    }
+
+    /// Request a stop and wait until a **whole pass** over the registry finds no
+    /// other mutator still `running`. Returns false if the bounded wait expired,
+    /// in which case the caller must abandon the collection. Caller holds `lock`.
+    ///
+    /// RE-SCANNING FROM THE TOP EACH TIME IS LOAD-BEARING, not defensive. A
+    /// thread claims its slot on its first allocation or first poll, which can
+    /// land *after* this walk has already passed that slot — checking each slot
+    /// once would then leave a freshly registered mutator running through the
+    /// mark phase, holding roots nothing scans. Requiring one clean sweep makes
+    /// registration order irrelevant. `claim` parks a new mutator immediately
+    /// when a stop is pending, so this converges instead of chasing arrivals.
+    pub fn rendezvous(self: *World, self_m: *Mutator) bool {
+        self.stop.store(true, .release);
+        var spins: usize = 0;
+        while (spins < stw_spin_bound) : (spins += 1) {
+            var still_running = false;
+            for (&self.slots) |*m| {
+                if (m == self_m) continue;
+                if (m.state.load(.acquire) == @intFromEnum(MutatorState.running)) {
+                    still_running = true;
+                    break;
+                }
+            }
+            if (!still_running) return true;
+            std.atomic.spinLoopHint();
+        }
+        return false;
+    }
+
+    /// Let every parked mutator go.
+    pub fn restart(self: *World) void {
+        self.stop.store(false, .release);
+    }
+
+    /// Visit the published snapshot of every `parked` mutator except `self_m`.
+    /// Used by the root scan to walk other stopped threads precisely.
+    pub fn forEachParkedFrame(
+        self: *World,
+        self_m: *Mutator,
+        ctx: *anyopaque,
+        cb: *const fn (ctx: *anyopaque, frame: usize) void,
+    ) void {
+        for (&self.slots) |*m| {
+            if (m == self_m) continue;
+            if (m.state.load(.acquire) != @intFromEnum(MutatorState.parked)) continue;
+            const f = m.frame.load(.acquire);
+            if (f != 0) cb(ctx, f);
+        }
+    }
 };
 
 /// Object header prepended to every managed allocation. Implementation detail;
@@ -327,13 +525,39 @@ pub const Gc = struct {
         if (word != 0) self.markRoot(@ptrFromInt(word));
     }
 
-    /// Poll point for automatic collection. A mutator calls this where the stack
-    /// maps make the roots precise; if the live heap has crossed the trigger the
-    /// world stops and a collection runs.
+    /// Whether a poll right now should collect: the collector is enabled and
+    /// either stress mode is on or the live heap has crossed the trigger.
+    ///
+    /// Split out from `safepoint` so the multi-threaded poll in `root.zig` can
+    /// test the trigger *before* paying for the stop-the-world handshake, and
+    /// again after taking the world lock (another thread may have collected in
+    /// between). One copy of the policy, two call sites.
+    pub fn shouldCollect(self: *Gc) bool {
+        if (!self.cfg.enabled) return false;
+        return self.cfg.stress or self.heap.liveBytes() >= self.next_gc_bytes;
+    }
+
+    /// Record a collection given up because the stop-the-world rendezvous
+    /// expired (ABI.md §5). Counted and, under `BIT_GC_STATS`, reported — an
+    /// abandoned collection is safe but is evidence that some thread blocks
+    /// without the `blocked` contract, which is worth being able to see.
+    pub fn noteAbandoned(self: *Gc) void {
+        self.stats.stw_abandoned += 1;
+        if (self.cfg.verbose) {
+            std.debug.print(
+                "[bit-gc] stop-the-world rendezvous expired; collection abandoned (total {d})\n",
+                .{self.stats.stw_abandoned},
+            );
+        }
+    }
+
+    /// Poll point for automatic collection on a **single-mutator** program: if
+    /// the trigger is crossed, collect right here. This is the direct path used
+    /// by `gc.zig`'s own unit tests. The runtime's real poll is
+    /// `bit_rt_safepoint` in `root.zig`, which wraps `shouldCollect`/`collect`
+    /// in the §5 rendezvous because it can have several mutator threads.
     pub fn safepoint(self: *Gc, scanner: RootScanner) void {
-        if (!self.cfg.enabled) return;
-        if (!self.cfg.stress and self.heap.liveBytes() < self.next_gc_bytes) return;
-        self.collect(scanner);
+        if (self.shouldCollect()) self.collect(scanner);
     }
 
     /// Run a full stop-the-world mark-sweep against `scanner`'s roots.

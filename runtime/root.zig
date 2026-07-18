@@ -101,20 +101,112 @@ extern fn bit_main() callconv(.c) i32;
 /// `!builtin.is_test` exactly so that reference never forces resolution.
 extern const bit_stack_maps: u8;
 
-/// The running task's register+frame state at the safepoint poll, captured by
+/// A thread's register+frame state at a safepoint poll, captured by
 /// `bit_rt_safepoint` before any runtime code could clobber it (ABI.md §4).
 /// `regs[n]` is physical register `n`'s live value; `ret`/`fp` locate the
-/// innermost Bit frame. A single global is correct under the single-worker pin
-/// (only one task ever collects at a time); it becomes per-worker when the pin
-/// lifts. `ret == 0` means "never captured" — the walk then roots nothing from
-/// the current stack, which is inert-safe (collection only ever runs *from*
-/// `bit_rt_safepoint`, which always sets it first).
+/// innermost Bit frame.
+///
+/// **This lives on the polling thread's own stack**, built by the naked shim
+/// below and passed to `safepointImpl` as an argument. That is what makes the
+/// snapshot per-thread without thread-local storage, registration, or a shared
+/// global — two workers polling at the same moment write two different frames.
+/// It used to be one process-wide global, which raced (#1429).
+///
+/// `regs` is deliberately **not** zeroed: the shim runs at every loop back-edge
+/// and clearing 32 words per poll is not free. Sound because §4 restricts the
+/// registers a stack map may name at a safepoint to exactly the callee-saved
+/// file the shim saves, and because every word the walk reads goes through
+/// `markRoot`, which marks only exact live object bases. `ret == 0` means "not
+/// captured" and roots nothing.
 const SafepointFrame = extern struct {
-    ret: usize = 0,
-    fp: usize = 0,
-    regs: [32]usize = [_]usize{0} ** 32,
+    ret: usize,
+    fp: usize,
+    regs: [32]usize,
 };
-var g_safepoint_frame: SafepointFrame = .{};
+
+/// Byte size the shim reserves. Rounded up to a 16-byte multiple so the stack
+/// stays ABI-aligned across the reservation on both targets.
+const safepoint_frame_size = std.mem.alignForward(usize, @sizeOf(SafepointFrame), 16);
+
+comptime {
+    // The shim's hand-written offsets below are literals; if the struct ever
+    // grows a field they must move with it.
+    std.debug.assert(@offsetOf(SafepointFrame, "ret") == 0);
+    std.debug.assert(@offsetOf(SafepointFrame, "fp") == 8);
+    std.debug.assert(@offsetOf(SafepointFrame, "regs") == 16);
+    std.debug.assert(@sizeOf(SafepointFrame) == 272);
+    std.debug.assert(safepoint_frame_size == 272);
+}
+
+// ---------------------------------------------------------------------------
+// Mutator registration (ABI.md §5)
+//
+// `World` holds the slots and the handshake; this is just the per-thread
+// binding to one of them. Zig `threadlocal` is fine here — this is Zig code
+// compiled by Zig, so Darwin's TLV thunk is the compiler's problem, not ours.
+// It is *not* reachable from the naked shim (which must not call anything
+// before it snapshots), which is exactly why the snapshot is on the stack
+// instead of hanging off this record.
+// ---------------------------------------------------------------------------
+
+var g_world: gc_mod.World = .{};
+
+threadlocal var g_mutator: ?*gc_mod.Mutator = null;
+
+/// This thread's mutator slot, claiming one on first use.
+///
+/// CALLED FROM BOTH DOORS INTO THE COLLECTOR — the safepoint poll *and*
+/// `bit_rt_gc_alloc` — and the allocation door is the one that matters. A thread
+/// registering only at its first safepoint is invisible for the whole window
+/// between starting and reaching a loop back edge, and it can allocate in that
+/// window: `let keep = []i64(16)` before the first loop is exactly that shape.
+/// Another thread collecting there would find no snapshot for this one and sweep
+/// a live object out from under it. Measured, not theorised — it is what made
+/// `tests/stress/gcthreads*` panic with `index out of range`.
+///
+/// A thread that claims a slot while a stop is already pending parks at once
+/// rather than running on into the mark phase. It publishes no frame because it
+/// has none: registration happens at this thread's first *touch* of the
+/// collector, before which it can hold nothing the collector allocated.
+fn currentMutator() ?*gc_mod.Mutator {
+    if (g_mutator) |m| return m;
+    const m = g_world.claim() orelse return null;
+    g_mutator = m;
+    if (g_world.stopRequested()) g_world.park(m, 0);
+    return m;
+}
+
+/// `bit_rt_gc_thread_enter` (ABI.md §5/§6): register the calling OS thread as a
+/// mutator. Idempotent. Callers that create threads should call it explicitly so
+/// registration is not left to whichever safepoint happens to fire first.
+export fn bit_rt_gc_thread_enter() callconv(.c) void {
+    _ = currentMutator();
+}
+
+/// `bit_rt_gc_thread_exit` (ABI.md §5/§6): release this thread's slot. **Not
+/// optional** — a leaked slot stays `running` forever, which corrupts nothing
+/// but makes every later rendezvous expire, i.e. collection quietly stops.
+export fn bit_rt_gc_thread_exit() callconv(.c) void {
+    const m = g_mutator orelse return;
+    g_mutator = null;
+    g_world.release(m);
+}
+
+/// `bit_rt_gc_blocking_begin` (ABI.md §5/§6). PRECONDITION: the calling thread
+/// holds **no live Bit references in any frame** for the whole bracketed region.
+/// The collector neither waits for nor scans a blocked thread, so a reference
+/// held across this is invisible and will be swept.
+export fn bit_rt_gc_blocking_begin() callconv(.c) void {
+    const m = currentMutator() orelse return;
+    g_world.beginBlocking(m);
+}
+
+/// `bit_rt_gc_blocking_end` (ABI.md §5/§6). Blocks while a stop is pending
+/// rather than resuming behind the collector's back.
+export fn bit_rt_gc_blocking_end() callconv(.c) void {
+    const m = g_mutator orelse return;
+    g_world.endBlocking(m);
+}
 
 /// Marks one root candidate from a stack slot or register named by a stack map
 /// (§4). Routed through the validating `markRoot` (via `markConservative`'s
@@ -216,15 +308,17 @@ fn scanFrame(base: [*]const u8, pc: usize, fp: usize, regs: *[32]usize) bool {
     return false;
 }
 
-/// Precisely walks the running task's Bit frames from the safepoint snapshot,
-/// marking every live reference each frame's stack map names (ABI.md §4).
-fn scanCurrentTask() void {
+/// Precisely walks one thread's Bit frames from its safepoint snapshot, marking
+/// every live reference each frame's stack map names (ABI.md §4). Called once
+/// for the collecting thread's own snapshot and once per *parked* mutator's
+/// published snapshot — the walk is identical, only the starting frame differs.
+fn scanSnapshot(snap: *const SafepointFrame) void {
     if (builtin.is_test) return; // no stack-map table is linked into unit-test binaries
-    if (g_safepoint_frame.ret == 0) return;
+    if (snap.ret == 0) return;
     const base: [*]const u8 = @ptrCast(&bit_stack_maps);
-    var regs = g_safepoint_frame.regs;
-    var pc = g_safepoint_frame.ret;
-    var fp = g_safepoint_frame.fp;
+    var regs = snap.regs;
+    var pc = snap.ret;
+    var fp = snap.fp;
     var frame: usize = 0;
     while (frame < max_walk_frames) : (frame += 1) {
         if (!scanFrame(base, pc, fp, &regs)) break; // pc left the Bit call graph
@@ -249,20 +343,40 @@ fn markTaskArg(_: *anyopaque, arg: usize) void {
     g_gc.markConservative(arg);
 }
 
-fn scanRoots(_: *anyopaque, g: *gc_mod.Gc) void {
+/// Walks one *other* stopped mutator's published snapshot. Its frame lives on
+/// that thread's stack, which is valid for as long as it stays parked — which is
+/// until this collection ends.
+fn scanParkedFrame(_: *anyopaque, frame: usize) void {
+    scanSnapshot(@ptrFromInt(frame));
+}
+
+/// What `scanRoots` needs that is not global: which snapshot is the collecting
+/// thread's own, and which mutator slot to skip when visiting the others.
+const ScanCtx = struct {
+    snap: *const SafepointFrame,
+    self_m: ?*gc_mod.Mutator,
+};
+
+fn scanRoots(ctx: *anyopaque, g: *gc_mod.Gc) void {
     _ = g;
+    const sc: *const ScanCtx = @ptrCast(@alignCast(ctx));
     chan.WordChan.scanRegistryRoots(markChanWord);
-    scanCurrentTask();
+    // This thread, precisely (ABI.md §4).
+    scanSnapshot(sc.snap);
+    // Every other OS thread stopped at its own safepoint, also precisely — the
+    // world is stopped, so each has published a frame that is not moving.
+    if (sc.self_m) |m| g_world.forEachParkedFrame(m, @ptrCast(&scan_ctx), scanParkedFrame);
+    // Parked green tasks, conservatively (ABI.md §5).
     g_sched.forEachOtherStack(sched.currentTask(), @ptrCast(&scan_ctx), conservativeStack);
     g_sched.forEachTaskArg(@ptrCast(&scan_ctx), markTaskArg);
 }
 
-/// `ctx` is unused by `scanRoots` — any live, non-null pointer satisfies the
-/// `RootScanner` contract without reading through it.
+/// A live, non-null pointer for callbacks that ignore their `ctx`. The
+/// `RootScanner` contract only requires it be valid, never that it be read.
 var scan_ctx: u8 = 0;
 
-fn scanner() gc_mod.RootScanner {
-    return .{ .ctx = @ptrCast(&scan_ctx), .scan = scanRoots };
+fn scanner(sc: *const ScanCtx) gc_mod.RootScanner {
+    return .{ .ctx = @ptrCast(@constCast(sc)), .scan = scanRoots };
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +494,12 @@ export fn bit_rt_get_err() callconv(.c) ?*anyopaque {
 /// defines no fallible object-construction form), so exhaustion is fatal here
 /// rather than a null codegen would have to check at every allocation site.
 export fn bit_rt_gc_alloc(info: *const gc_mod.TypeInfo) callconv(.c) [*]u8 {
+    // Register before allocating, never after (ABI.md §5). This is the earlier
+    // of the two doors into the collector — a thread can allocate long before it
+    // reaches its first loop back edge, and an unregistered allocator is one the
+    // stop-the-world rendezvous does not wait for. In the common case this is a
+    // single thread-local load.
+    _ = currentMutator();
     return g_gc.alloc(info) orelse fatal("out of memory");
 }
 
@@ -458,64 +578,132 @@ export fn bit_rt_iface_assert(recv: ?*anyopaque, want: usize) callconv(.c) ?*any
 }
 
 /// The real safepoint poll, called by the `bit_rt_safepoint` shim below after
-/// the caller's registers are safely snapshotted. `noinline` so the shim's
+/// the caller's registers are snapshotted into `snap` — which sits on *this
+/// thread's* stack, just below the shim's frame. `noinline` so the shim's
 /// `call`/`bl` is a real ABI boundary (the snapshot must reflect the caller's
-/// state, not this function's). Collects iff the allocation trigger was crossed.
-noinline fn safepointImpl() callconv(.c) void {
-    g_gc.safepoint(scanner());
+/// state, not this function's).
+///
+/// This is the ABI.md §5 handshake. Exactly one of three things happens:
+///
+///  1. Someone else is collecting -> park here until they finish. A mutator
+///     that ignored this would run behind the collector's back.
+///  2. Nobody is collecting and the trigger is not crossed -> return. The hot
+///     path, one atomic load plus the trigger test.
+///  3. The trigger is crossed -> try to become the collector.
+///
+/// The `tryLock` loser parks rather than spinning on the lock. That is the
+/// deadlock-freedom argument: a thread the collector is waiting for is never
+/// itself waiting for the collector.
+noinline fn safepointImpl(snap: *const SafepointFrame) callconv(.c) void {
+    const m = currentMutator();
+
+    if (g_world.stopRequested()) {
+        if (m) |mm| g_world.park(mm, @intFromPtr(snap));
+        return;
+    }
+    if (!g_gc.shouldCollect()) return;
+
+    // A thread with no slot (registry full) must not collect: it cannot be
+    // skipped by `rendezvous`, so it would wait for itself forever.
+    const self_m = m orelse return;
+
+    if (!g_world.lock.tryAcquire()) {
+        // Another thread is collecting, or is about to. Park speculatively —
+        // a no-op if it turns out no stop is pending.
+        g_world.park(self_m, @intFromPtr(snap));
+        return;
+    }
+    defer g_world.lock.release();
+
+    // Re-test under the lock: the thread that just released it may have
+    // collected everything we were about to collect for.
+    if (!g_gc.shouldCollect()) return;
+
+    if (!g_world.rendezvous(self_m)) {
+        // Could not stop the world within the bound. ABANDON — never force.
+        // Skipping a collection only costs heap growth; collecting while a
+        // mutator runs costs correctness.
+        g_gc.noteAbandoned();
+        g_world.restart();
+        return;
+    }
+    defer g_world.restart();
+
+    var sc = ScanCtx{ .snap = snap, .self_m = self_m };
+    g_gc.collect(scanner(&sc));
 }
 
 /// `bit_rt_safepoint` (ABI.md §4/§5): the zero-arg poll codegen emits at loop
 /// back-edges. Naked so it runs with *no* prologue — it captures the caller's
-/// return address, frame pointer, and callee-saved registers (the ones that
-/// may hold a live GC reference, per each backend's callee-saved-only register
-/// file) into `g_safepoint_frame` before any Zig code could overwrite them,
-/// then calls `safepointImpl`. The precise stack walk (`scanCurrentTask`)
-/// starts from that snapshot. Register/offset layout matches `SafepointFrame`:
-/// `ret` at +0, `fp` at +8, `regs[n]` at +16+8n.
+/// return address, frame pointer, and callee-saved registers (the ones that may
+/// hold a live GC reference, per each backend's callee-saved-only register file)
+/// before any Zig code could overwrite them, then hands the snapshot to
+/// `safepointImpl` as its first C argument.
+///
+/// **The snapshot is built on this thread's own stack**, in the space the shim
+/// reserves below the caller's stack pointer. That is the whole fix for #1429:
+/// the frame used to be one process-wide global, so two workers polling at once
+/// overwrote each other's registers and then both collected. Reserving it here
+/// is per-thread by construction — no TLS (which the naked body could not reach
+/// anyway without calling Darwin's TLV thunk), no registration, no ordering.
+///
+/// Layout matches `SafepointFrame`: `ret` at +0, `fp` at +8, `regs[n]` at
+/// +16+8n. The reservation is 8 bytes larger than the 272-byte struct on x86-64
+/// and 16 larger on AArch64, purely to keep the stack ABI-aligned at the call.
+///
+/// A function containing a safepoint is non-leaf by construction (it calls
+/// this), so it may not rely on the x86-64 red zone, and the reservation
+/// overlapping that zone costs nothing.
 fn safepointEntry() callconv(.naked) void {
     switch (builtin.cpu.arch) {
         // rbx=3, r13=13, r14=14, r15=15 -> regs[n] at 16+8n = 40,120,128,136.
-        // The caller's `call` left its return address at (%rsp); rbp is still
-        // the caller's frame pointer (no prologue ran). Operands are pinned to
-        // caller-saved rax/rcx so materializing them cannot clobber a
-        // callee-saved register before it is snapshotted.
+        // At entry rsp % 16 == 8 (the caller's `call` pushed the return
+        // address); subtracting 280 restores rsp % 16 == 0 for the call while
+        // leaving the return address at 280(%rsp). rbp is still the caller's
+        // frame pointer — no prologue ran. rdi is the SysV first argument;
+        // rcx/r8 are caller-saved scratch, so materializing them cannot destroy
+        // a callee-saved value before it is saved.
         .x86_64 => asm volatile (
-            \\ movq (%%rsp), %%r8
-            \\ movq %%r8, 0(%%rax)
-            \\ movq %%rbp, 8(%%rax)
-            \\ movq %%rbx, 40(%%rax)
-            \\ movq %%r13, 120(%%rax)
-            \\ movq %%r14, 128(%%rax)
-            \\ movq %%r15, 136(%%rax)
-            \\ subq $8, %%rsp
+            \\ subq $280, %%rsp
+            \\ movq 280(%%rsp), %%r8
+            \\ movq %%r8, 0(%%rsp)
+            \\ movq %%rbp, 8(%%rsp)
+            \\ movq %%rbx, 40(%%rsp)
+            \\ movq %%r13, 120(%%rsp)
+            \\ movq %%r14, 128(%%rsp)
+            \\ movq %%r15, 136(%%rsp)
+            \\ movq %%rsp, %%rdi
             \\ call *%%rcx
-            \\ addq $8, %%rsp
+            \\ addq $280, %%rsp
             \\ ret
             :
-            : [fr] "{rax}" (&g_safepoint_frame),
-              [impl] "{rcx}" (&safepointImpl),
-            : .{ .r8 = true, .memory = true }),
+            : [impl] "{rcx}" (&safepointImpl),
+            : .{ .rdi = true, .r8 = true, .memory = true }),
         // x19..x28 -> regs[n] at 16+8n = 168..240. x30 (link register) is the
-        // caller's return address; x29 the caller's frame pointer. Operands are
-        // pinned to caller-saved x0/x1. x30 is preserved across the call by the
-        // stack save/restore below.
+        // caller's return address; x29 the caller's frame pointer. 288 keeps sp
+        // 16-aligned (the hardware enforces it). x0 is the first argument and
+        // x1 caller-saved scratch, so neither disturbs the saved file. x30 is
+        // preserved across the call by its own push, not by the frame copy, so
+        // the return path does not depend on the callee leaving the frame
+        // untouched.
         .aarch64 => asm volatile (
-            \\ str x30, [x0, #0]
-            \\ str x29, [x0, #8]
-            \\ stp x19, x20, [x0, #168]
-            \\ stp x21, x22, [x0, #184]
-            \\ stp x23, x24, [x0, #200]
-            \\ stp x25, x26, [x0, #216]
-            \\ stp x27, x28, [x0, #232]
+            \\ sub sp, sp, #288
+            \\ str x30, [sp, #0]
+            \\ str x29, [sp, #8]
+            \\ stp x19, x20, [sp, #168]
+            \\ stp x21, x22, [sp, #184]
+            \\ stp x23, x24, [sp, #200]
+            \\ stp x25, x26, [sp, #216]
+            \\ stp x27, x28, [sp, #232]
+            \\ mov x0, sp
             \\ str x30, [sp, #-16]!
             \\ blr x1
             \\ ldr x30, [sp], #16
+            \\ add sp, sp, #288
             \\ ret
             :
-            : [fr] "{x0}" (&g_safepoint_frame),
-              [impl] "{x1}" (&safepointImpl),
-            : .{ .memory = true }),
+            : [impl] "{x1}" (&safepointImpl),
+            : .{ .x0 = true, .memory = true }),
         else => unreachable, // gated by the comptime arch check at file top
     }
 }

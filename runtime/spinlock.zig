@@ -18,6 +18,14 @@ pub const SpinLock = struct {
         }
     }
 
+    /// One attempt, no spinning: true if this call took the lock. For callers
+    /// that have something better to do than wait — the GC's stop-the-world
+    /// entry (ABI.md §5) parks itself instead of spinning here, because a
+    /// thread spinning for the lock is a thread the lock's winner is waiting on.
+    pub fn tryAcquire(self: *SpinLock) bool {
+        return self.locked.cmpxchgStrong(false, true, .acquire, .monotonic) == null;
+    }
+
     pub fn release(self: *SpinLock) void {
         self.locked.store(false, .release);
     }
