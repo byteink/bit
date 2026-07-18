@@ -1,0 +1,91 @@
+// The worker pool (#1364) on TWO REAL OS THREADS, Linux.
+//
+// This is the program the migration test exists for. Its sibling
+// ../schedpool runs the same property with both workers on one thread, which
+// proves the scheduler bookkeeping but shares a register file and so cannot
+// catch a context switch that fails to save or restore one. Here the two
+// workers are genuinely different OS threads, so the resuming thread's
+// callee-saved registers hold ITS OWN loop state, and a switch that drops a
+// slot hands the task that state instead of its sentinels.
+//
+// That is exactly the shape of the `x18` bug this project already paid for: a
+// missing clobber that was invisible while a task resumed where it parked and
+// corrupted only across workers. See ../schedpool/props for the full argument
+// and for why the migration is forced rather than sampled.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/thread/linux and runtime/park/linux, which reach the kernel through
+// `syscall` (SPEC §11.8) — rejected on Darwin even for an uncalled declaration.
+// Kept identical in shape to its Darwin twin so that a divergence between the
+// two means a real platform difference rather than a spelling one.
+
+import { poolInit, poolWorkerAddr, poolWaitParked, poolWaitFinished } from "../schedpool/props"
+import { poolShutdown, poolRestart, poolWake, poolVerdict, poolTotal, poolWorkerEntry, poolQueueStealTask } from "../schedpool/props"
+import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+
+// Per-worker argument blocks: {worker address, done-word address}, the shape
+// `poolWorkerEntry` unpacks.
+let argBlocks: [4]i64
+let doneWords: [2]i32
+
+// Generous relative to the real timings (a park is microseconds away, a worker
+// exits as soon as it finds no work) and small enough that a wedge fails the
+// suite in seconds rather than hanging it.
+const WAIT_NS: int = 5000000000
+
+function doneAt(i: int): *i32 {
+  return ptrOf(doneWords) + i
+}
+
+// Start worker `i` on its own OS thread.
+function startWorker(i: int): int {
+  let blocks: *i64 = ptrOf(argBlocks)
+  *(blocks + i * 2) = poolWorkerAddr(i)
+  *(blocks + i * 2 + 1) = int(doneAt(i))
+
+  atomicStore(doneAt(i), i32(threadRunning))
+  let bp: *byte = nil
+  return threadStart(entryOf(poolWorkerEntry), bp + int(blocks + i * 2), doneAt(i))
+}
+
+function main() {
+  if (!poolInit()) {
+    print("init-failed\n")
+    return
+  }
+
+  // ---- Phase 1: the task runs on worker 0 and parks there -----------------
+  let h0 = startWorker(0)
+  let parked = poolWaitParked(parkSleepNs, parkMonoNs, WAIT_NS)
+
+  // ---- Phase 2: retire worker 0 COMPLETELY --------------------------------
+  //
+  // Joining rather than merely idling is what makes the migration certain: a
+  // live worker 0 could steal the task straight back out of worker 1's ring,
+  // and then the run that mattered would be the run that did not happen.
+  poolShutdown()
+  let joined0 = threadJoin(doneAt(0), WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
+  let rel0 = threadRelease(h0)
+
+  // ---- Phase 3: place the task on worker 1 and run it there ---------------
+  poolRestart()
+  let placed = poolWake()
+
+  // Also leave a task on retired worker 0's local ring: worker 1 can only run it
+  // by stealing. See ../schedpool/props for why that case needed its own task.
+  let queued = poolQueueStealTask()
+
+  let h1 = startWorker(1)
+  let finished = poolWaitFinished(parkSleepNs, parkMonoNs, WAIT_NS)
+
+  poolShutdown()
+  let joined1 = threadJoin(doneAt(1), WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
+  let rel1 = threadRelease(h1)
+
+  // The verdict is read only after BOTH threads are joined, so the registry
+  // count it checks cannot race a worker still tearing the task down.
+  let staged = parked && joined0 && rel0 && placed && queued && finished && joined1 && rel1
+  print("${staged} ${h0 != 0 && h1 != 0} ${poolVerdict()} ${poolTotal}\n")
+}
