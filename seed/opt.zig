@@ -575,6 +575,12 @@ fn rebuild(gpa: Allocator, f: *const ir.Function, known: []const ?ConstVal, bloc
     // this is belt-and-braces — but the field defaults to false, so dropping it
     // here would silently turn a declaration back into an empty definition.
     out.is_extern = f.is_extern;
+    // §17.6: and likewise for the freestanding module tag. This one defaults to
+    // `false`, so dropping it here would empty a freestanding object rather than
+    // quietly widen it — but carry it explicitly all the same; the `is_naked`
+    // precedent is that a rebuild silently zeroing a flag is dead code nobody
+    // notices. `test "opt: the freestanding module tag survives -O1"` gates it.
+    out.in_root_module = f.in_root_module;
     return out;
 }
 
@@ -839,6 +845,12 @@ fn inlineCalls(gpa: Allocator, module: *const ir.Module, fid: ir.FuncId) !ir.Fun
     // this is belt-and-braces — but the field defaults to false, so dropping it
     // here would silently turn a declaration back into an empty definition.
     out.is_extern = f.is_extern;
+    // §17.6: and likewise for the freestanding module tag. This one defaults to
+    // `false`, so dropping it here would empty a freestanding object rather than
+    // quietly widen it — but carry it explicitly all the same; the `is_naked`
+    // precedent is that a rebuild silently zeroing a flag is dead code nobody
+    // notices. `test "opt: the freestanding module tag survives -O1"` gates it.
+    out.in_root_module = f.in_root_module;
     return out;
 }
 
@@ -1169,6 +1181,55 @@ test "optimizeModule at O1 folds a constant expression end to end" {
     try optimizeModule(gpa, &module, .o1);
     try ir.verify(gpa, &module);
     try testing.expectEqual(@as(usize, 2), module.funcs.items[0].insts.len);
+}
+
+test "opt: the freestanding module tag survives -O1" {
+    // §17.6 regression guard. Every pass here REBUILDS the function through a
+    // fresh `FunctionBuilder`, and `finish` cannot know a decl-only flag — so a
+    // pass that forgets to copy one silently resets it. That is not
+    // hypothetical: `is_naked`/`is_nosplit` were dead code in codegen for
+    // exactly this reason. `in_root_module` decides whether a function is
+    // emitted at all, so a reset here would empty a freestanding object.
+    //
+    // The shape (caller + callee, one call) is chosen so the pipeline's THREE
+    // rebuilding passes all run for real: fold/DCE (`rebuild`) and the inliner
+    // (`inlineCalls`, which needs an eligible callee to splice).
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+
+    var gb = ir.FunctionBuilder.init(gpa);
+    const g_entry = try gb.newBlock();
+    gb.beginBlock(g_entry);
+    const ga = try gb.addParam(i64_ty);
+    const gsum = try gb.binary(.add, i64_ty, ga, ga);
+    try gb.ret(&.{gsum});
+    gb.endBlock();
+    var g = try gb.finish("callee", &.{i64_ty}, i64_ty, false, .invalid, g_entry);
+    g.in_root_module = true;
+    try module.funcs.append(gpa, g);
+
+    var fb = ir.FunctionBuilder.init(gpa);
+    const f_entry = try fb.newBlock();
+    fb.beginBlock(f_entry);
+    const arg = try fb.constInt(i64_ty, 7);
+    const call = try fb.call(i64_ty, @enumFromInt(0), &.{arg});
+    try fb.ret(&.{call});
+    fb.endBlock();
+    var f = try fb.finish("caller", &.{}, i64_ty, false, .invalid, f_entry);
+    // Deliberately opposite values: a pass that dropped the flag would leave
+    // both `false`, which the `caller` half alone could not distinguish from a
+    // correct copy. One of each makes the assertion two-sided.
+    f.in_root_module = false;
+    try module.funcs.append(gpa, f);
+
+    try optimizeModule(gpa, &module, .o1);
+    try testing.expect(module.funcs.items[0].in_root_module);
+    try testing.expect(!module.funcs.items[1].in_root_module);
 }
 
 test "optimizeModule at O1 inlines a call across the full pipeline" {

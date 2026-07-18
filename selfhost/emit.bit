@@ -60,14 +60,57 @@ function emStackMapOf(fc: FuncCode): FuncStackMap {
     safepoints: fc.safepoints }
 }
 
+// §17.6: does this function belong in a freestanding object? A freestanding
+// emit keeps only the ROOT module's own code, so an imported module's functions
+// are left out and calls into them stay undefined relocations the linker
+// resolves against that module's own object. Mirrors the seed's emitsFunction;
+// selfhost emits no IrFunc at all for an `extern` decl, so there is no
+// is_extern arm to mirror here.
+function emitsFunction(f: IrFunc, freestanding: bool): bool {
+  return f.inRootModule || !freestanding
+}
+
+// §17.6: may this function go into a freestanding object? A freestanding object
+// carries no bit_stack_maps, so the collector could not scan the frame of a
+// function it holds — sound only for one that can never be on the stack when a
+// collection starts.
+//
+// The test is the DECLARATION, not the emitted safepoint list. Codegen records
+// a safepoint at every surviving call (a callee may collect in general);
+// @nosplit suppresses only the back-edge one. So "has no safepoints" is true of
+// almost nothing that calls anything, and testing it would reject a runtime
+// module the moment it called a sibling — the entire case this mode exists for.
+// What makes the missing stack map sound is §10.3's standing obligation on
+// @nosplit: it may not allocate and may not reach a safepoint.
+function freestandingEligible(f: IrFunc): bool {
+  return f.isNosplit || f.isNaked
+}
+
+// §17.6: refuses a module needing the managed runtime's whole-program tables,
+// which a freestanding object cannot carry — a TypeInfo descriptor is a global
+// symbol every sibling member describing the same layout would also define, and
+// there is exactly one bit_stack_maps per link. Runs before codegen so that
+// allocating is diagnosed as allocating, rather than as the @nosplit violation
+// it usually also causes.
+function refuseManagedMetadata(module: IrModule): ()! {
+  if (len(collectTypeInfos(module, true)) > 0) {
+    fail newError("--freestanding: this module allocates on the managed heap (a struct, slice, string or closure value)")
+  }
+}
+
 // Every distinct TypeInfo in the module, deduped by its symbol name (so a type
 // allocated at many sites shares one blob).
-function collectTypeInfos(module: IrModule): []TypeInfoLayout {
+function collectTypeInfos(module: IrModule, freestanding: bool): []TypeInfoLayout {
   let seen = map<string, bool>{}
   let out = []TypeInfoLayout(0)
   let fi = 0
   while (fi < len(module.funcs)) {
     let f = module.funcs[fi]
+    // §17.6: a descriptor is only needed for code this object emits.
+    if (!emitsFunction(f, freestanding)) {
+      fi = fi + 1
+      continue
+    }
     let i = 0
     while (i < len(f.instrs)) {
       let ins = f.instrs[i]
@@ -134,7 +177,7 @@ function emitMethodTable(module: IrModule, data: ByteBuf, disc: int, tiSymbol: s
 // module's `main` becomes the runtime entry, via the _bit_main trampoline;
 // otherwise no `main` is required and no trampoline is emitted (#1397 — the
 // plain relocatable an archive member is made of).
-function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
+function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool): []u8! {
   let code = newByteBuf()
   let rodata = newByteBuf()
   let data = newByteBuf()
@@ -142,6 +185,10 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
   let relocs = []MachoRelocation(0)
   let defined = map<string, bool>{}
   let stackmaps = []FuncStackMap(0)
+  let emittedNames = []string(0)
+  if (freestanding) {
+    refuseManagedMetadata(module)?
+  }
 
   // §11.8: `syscall()` is Linux-only. The arm64 backend is shared with
   // aarch64-linux, so the target-specific rejection belongs here, on the Mach-O
@@ -151,6 +198,13 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
   let sf = 0
   while (sf < len(module.funcs)) {
     let sfn = module.funcs[sf]
+    // §17.6: only code this object emits can carry the instruction — rejecting
+    // on a module not being emitted would fail a valid freestanding build over
+    // a sibling's Linux-only code.
+    if (!emitsFunction(sfn, freestanding)) {
+      sf = sf + 1
+      continue
+    }
     let si = 0
     while (si < len(sfn.instrs)) {
       if (sfn.instrs[si].op == Op.Syscall) {
@@ -167,6 +221,14 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
   let fi = 0
   while (fi < len(module.funcs)) {
     let f = module.funcs[fi]
+    // §17.6: an imported module's function belongs to its own object.
+    if (!emitsFunction(f, freestanding)) {
+      fi = fi + 1
+      continue
+    }
+    if (freestanding && !freestandingEligible(f)) {
+      fail newError("--freestanding: '${f.name}' is neither @nosplit nor @naked; freestanding code carries no GC stack maps (SPEC §10.3)")
+    }
     let fc = compileFunction(module, f)
     let off = len(code.bytes)
     appendBytes(code, fc.code)
@@ -182,6 +244,7 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
       r = r + 1
     }
     stackmaps = append(stackmaps, emStackMapOf(fc))
+    emittedNames = append(emittedNames, f.name)
     if (f.name == "main") {
       haveMain = true
       mainVoid = module.ctx.types[f.result].kind == TypeKind.Void
@@ -231,9 +294,14 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
     appendU64(data, 0)             // ptr — filled by the reloc, rebased by dyld
     appendU64(data, len([]byte(s))) // len
     let hdrName = "___bitstr_${si}"
+    // §17.6: local in a freestanding object — see emitElfBlobs.
+    let hdrBinding = MachoBinding.Global
+    if (freestanding) {
+      hdrBinding = MachoBinding.Local
+    }
     symbols = append(symbols, MachoSymbol{ name: hdrName, hasSection: true,
       section: MachoSectionKind.Data, offset: hdrOff, size: 16,
-      binding: MachoBinding.Global })
+      binding: hdrBinding })
     defined[hdrName] = true
     relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
       offset: hdrOff, symbol: dataName, kind: MachoRelocKind.Unsigned64 })
@@ -241,7 +309,8 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
   }
 
   // ---- gc_alloc TypeInfo blobs -------------------------------------------
-  let tis = collectTypeInfos(module)
+  // §17.6: empty on the freestanding path — see refuseManagedMetadata.
+  let tis = collectTypeInfos(module, freestanding)
   let ti = 0
   while (ti < len(tis)) {
     let t = tis[ti]
@@ -328,21 +397,26 @@ function emitMachoObject(module: IrModule, withEntry: bool): []u8! {
   // ---- GC stack-map table (runtime/ABI.md §4) ----------------------------
   // Each entry holds an absolute code pointer, so this lives in writable __data
   // too; the runtime reads it via _bit_stack_maps.
-  let blobOff = len(data.bytes)
-  let codeRelocs = writeStackMaps(data, stackmaps)
-  let smSym = emMac(emStackmapsSymbol())
-  symbols = append(symbols, MachoSymbol{ name: smSym, hasSection: true,
-    section: MachoSectionKind.Data, offset: blobOff,
-    size: len(data.bytes) - blobOff, binding: MachoBinding.Global })
-  defined[smSym] = true
-  // writeStackMaps records offsets against `data` itself — already
-  // section-relative, so no blobOff adjustment.
-  let ci = 0
-  while (ci < len(codeRelocs)) {
-    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
-      offset: codeRelocs[ci], symbol: emMac(module.funcs[ci].name),
-      kind: MachoRelocKind.Unsigned64 })
-    ci = ci + 1
+  // §17.6: a whole-program table under a fixed name — never an archive
+  // member's to define. See emitElfBlobs.
+  assert(len(emittedNames) == len(stackmaps))
+  if (!freestanding) {
+    let blobOff = len(data.bytes)
+    let codeRelocs = writeStackMaps(data, stackmaps)
+    let smSym = emMac(emStackmapsSymbol())
+    symbols = append(symbols, MachoSymbol{ name: smSym, hasSection: true,
+      section: MachoSectionKind.Data, offset: blobOff,
+      size: len(data.bytes) - blobOff, binding: MachoBinding.Global })
+    defined[smSym] = true
+    // writeStackMaps records offsets against `data` itself — already
+    // section-relative, so no blobOff adjustment.
+    let ci = 0
+    while (ci < len(codeRelocs)) {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: codeRelocs[ci], symbol: emMac(emittedNames[ci]),
+        kind: MachoRelocKind.Unsigned64 })
+      ci = ci + 1
+    }
   }
 
   // ---- undefined externals for runtime symbols ---------------------------
@@ -420,7 +494,24 @@ function emElfAbs64(off: int, sym: string): ElfRelocation {
 
 function emitElfBlobs(module: IrModule, rodata: ByteBuf, symbols: []ElfSymbol,
   relocs: []ElfRelocation, defined: map<string, bool>,
-  stackmaps: []FuncStackMap): EmElfBlobs {
+  stackmaps: []FuncStackMap, emittedNames: []string,
+  freestanding: bool): EmElfBlobs {
+  assert(len(emittedNames) == len(stackmaps))
+  // §17.6: a freestanding object is one archive member among many, so every
+  // symbol it defines globally is one a sibling member may define too. A string
+  // literal has no external linkage — nothing outside this object ever names
+  // __bitstr_N — so the header goes local and two members' literals stop
+  // colliding at link.
+  //
+  // NOT REACHABLE TODAY, and deliberately kept: §10.3's @nosplit whitelist
+  // admits no string operation, so a freestanding module's string pool is always
+  // empty. Kept because that whitelist must widen for #1363/#1364, and the day a
+  // literal becomes reachable a global binding would surface as a __bitstr_0
+  // duplicate between two members.
+  let blobBinding = ElfBinding.Global
+  if (freestanding) {
+    blobBinding = ElfBinding.Local
+  }
   // ---- string pool -> .rodata bytes + a {ptr,len} header -----------------
   let si = 0
   while (si < len(module.stringPool)) {
@@ -438,14 +529,15 @@ function emitElfBlobs(module: IrModule, rodata: ByteBuf, symbols: []ElfSymbol,
     appendU64(rodata, len([]byte(s))) // len
     let hdrName = "__bitstr_${si}"
     symbols = append(symbols, emElfSym(hdrName, ElfSectionKind.Rodata, hdrOff, 16,
-      ElfBinding.Global, ElfSymKind.Object))
+      blobBinding, ElfSymKind.Object))
     defined[hdrName] = true
     relocs = append(relocs, emElfAbs64(hdrOff, dataName))
     si = si + 1
   }
 
   // ---- gc_alloc TypeInfo blobs -> .rodata --------------------------------
-  let tis = collectTypeInfos(module)
+  // §17.6: empty on the freestanding path — see refuseManagedMetadata.
+  let tis = collectTypeInfos(module, freestanding)
   let ti = 0
   while (ti < len(tis)) {
     let t = tis[ti]
@@ -514,17 +606,24 @@ function emitElfBlobs(module: IrModule, rodata: ByteBuf, symbols: []ElfSymbol,
   }
 
   // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata -----------------
-  let blobOff = len(rodata.bytes)
-  let codeRelocs = writeStackMaps(rodata, stackmaps)
-  symbols = append(symbols, emElfSym(emStackmapsSymbol(), ElfSectionKind.Rodata,
-    blobOff, len(rodata.bytes) - blobOff, ElfBinding.Global, ElfSymKind.Object))
-  defined[emStackmapsSymbol()] = true
-  // writeStackMaps records offsets against `rodata` itself — already
-  // section-relative, so no blobOff adjustment.
-  let ci = 0
-  while (ci < len(codeRelocs)) {
-    relocs = append(relocs, emElfAbs64(codeRelocs[ci], module.funcs[ci].name))
-    ci = ci + 1
+  // §17.6: bit_stack_maps is a whole-PROGRAM table under one fixed name the
+  // runtime reads, so exactly one object in a link may define it — never an
+  // archive member. A freestanding object emits none, and refuses any function
+  // that would need an entry, so nothing is silently lost.
+  if (!freestanding) {
+    let blobOff = len(rodata.bytes)
+    let codeRelocs = writeStackMaps(rodata, stackmaps)
+    symbols = append(symbols, emElfSym(emStackmapsSymbol(), ElfSectionKind.Rodata,
+      blobOff, len(rodata.bytes) - blobOff, ElfBinding.Global, ElfSymKind.Object))
+    defined[emStackmapsSymbol()] = true
+    // writeStackMaps records offsets against `rodata` itself — already
+    // section-relative, so no blobOff adjustment. `emittedNames` is indexed in
+    // stackmap order, which is NOT module.funcs order once anything is skipped.
+    let ci = 0
+    while (ci < len(codeRelocs)) {
+      relocs = append(relocs, emElfAbs64(codeRelocs[ci], emittedNames[ci]))
+      ci = ci + 1
+    }
   }
 
   // ---- undefined externals (the runtime's bit_rt_* symbols) --------------
@@ -601,14 +700,18 @@ function emElfRelocArm64(k: RelocKind): ElfRelocKind {
 // Emits `module` as a relocatable ELF object for `target`. One entry point for
 // both architectures: the arch-specific parts are the backend, the code
 // relocation kinds, and the bit_main trampoline's encoding.
-function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool): []u8! {
+function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, freestanding: bool): []u8! {
   let code = newByteBuf()
   let rodata = newByteBuf()
   let symbols = []ElfSymbol(0)
   let relocs = []ElfRelocation(0)
   let defined = map<string, bool>{}
   let stackmaps = []FuncStackMap(0)
+  let emittedNames = []string(0)
   let isX64 = target == ElfTarget.X86_64
+  if (freestanding) {
+    refuseManagedMetadata(module)?
+  }
 
   // ---- every function -> one .text symbol + its relocations --------------
   let mainVoid = false
@@ -616,6 +719,14 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool): []
   let fi = 0
   while (fi < len(module.funcs)) {
     let f = module.funcs[fi]
+    // §17.6: an imported module's function belongs to its own object.
+    if (!emitsFunction(f, freestanding)) {
+      fi = fi + 1
+      continue
+    }
+    if (freestanding && !freestandingEligible(f)) {
+      fail newError("--freestanding: '${f.name}' is neither @nosplit nor @naked; freestanding code carries no GC stack maps (SPEC §10.3)")
+    }
     let fc = emCompileFor(module, f, isX64)
     let off = len(code.bytes)
     appendBytes(code, fc.code)
@@ -631,6 +742,7 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool): []
       r = r + 1
     }
     stackmaps = append(stackmaps, emStackMapOf(fc))
+    emittedNames = append(emittedNames, f.name)
     if (f.name == "main") {
       haveMain = true
       mainVoid = module.ctx.types[f.result].kind == TypeKind.Void
@@ -680,7 +792,8 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool): []
     defined["bit_main"] = true
   }
 
-  let blobs = emitElfBlobs(module, rodata, symbols, relocs, defined, stackmaps)
+  let blobs = emitElfBlobs(module, rodata, symbols, relocs, defined, stackmaps,
+    emittedNames, freestanding)
   symbols = blobs.symbols
   relocs = blobs.relocs
 

@@ -80,7 +80,11 @@ pub fn injectTestMain(gpa: std.mem.Allocator, module: *ir.Module) ![]Test {
         break;
     }
 
-    const entry_fn = try buildDispatch(gpa, module.ctx, tests.items);
+    var entry_fn = try buildDispatch(gpa, module.ctx, tests.items);
+    // §17.6: the synthesized entry belongs to the module being built. `bit test`
+    // never emits freestanding, so nothing reads this today — but leaving the
+    // default would quietly mark the program's own entry "not mine".
+    entry_fn.in_root_module = true;
     try module.funcs.append(gpa, entry_fn);
     return tests.toOwnedSlice(gpa);
 }

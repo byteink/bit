@@ -303,6 +303,10 @@ pub const Lowerer = struct {
     /// each function so the per-function `FnCtx` code reads the right module
     /// without threading a module id through every call.
     cur_module: ModuleId = @enumFromInt(0),
+    /// The build's root module (§17.6). Every lowered function is tagged
+    /// `in_root_module = (cur_module == root)` so a freestanding emit can keep
+    /// this module's own code and drop its imports'.
+    root: ModuleId = @enumFromInt(0),
     files: []const ModuleFile,
     checked: *const check.CheckedModule,
     rmodule: *const resolve.Module,
@@ -333,6 +337,24 @@ pub const Lowerer = struct {
     /// keyed by the function's packed `GlobalSymbol` so repeated references to
     /// the same function share one trampoline (see `funcValueTrampoline`).
     fn_value_tramps: std.AutoHashMapUnmanaged(u64, ir.FuncId) = .{},
+
+    /// §17.6: does the function being lowered right now belong to the root
+    /// module? Read straight off the cursor `setModule` maintains, so it is
+    /// correct for a closure synthesized mid-body as well as for a top-level
+    /// decl — a closure belongs to whichever module's code wrote it.
+    fn inRoot(self: *const Lowerer) bool {
+        return self.cur_module == self.root;
+    }
+
+    /// Appends a synthesized function (closure body or trampoline) to the
+    /// pending closure list, tagged with the module that produced it. Every
+    /// such function goes through here rather than touching `closure_funcs`
+    /// directly, so a new trampoline kind cannot forget the tag.
+    fn appendClosure(self: *Lowerer, f: ir.Function) Allocator.Error!void {
+        var tagged = f;
+        tagged.in_root_module = self.inRoot();
+        try self.closure_funcs.append(self.gpa, tagged);
+    }
 
     /// Re-point the per-module cursors at `m` before lowering one of its
     /// functions, so `FnCtx` (which reads `self.l.files/checked/rmodule`) sees
@@ -502,6 +524,7 @@ pub const Lowerer = struct {
         var f = try b.finish(name, param_types.items, result_ty, is_fallible, err_ty, entry);
         f.is_naked = is_naked;
         f.is_nosplit = is_nosplit;
+        f.in_root_module = self.inRoot();
         return f;
     }
 
@@ -568,7 +591,7 @@ pub const Lowerer = struct {
         const name = try std.fmt.allocPrint(self.gpa, "closure${d}", .{@intFromEnum(fid)});
         defer self.gpa.free(name);
         const f = try b.finish(name, param_types.items, shape.result, false, .invalid, entry);
-        try self.closure_funcs.append(self.gpa, f);
+        try self.appendClosure(f);
         return fid;
     }
 
@@ -624,7 +647,7 @@ pub const Lowerer = struct {
         defer self.gpa.free(name);
         const param_types = [_]TypeId{fn_ty};
         const f = try b.finish(name, &param_types, self.ctx.void_id, false, .invalid, entry);
-        try self.closure_funcs.append(self.gpa, f);
+        try self.appendClosure(f);
         return fid;
     }
 
@@ -670,7 +693,7 @@ pub const Lowerer = struct {
         const name = try std.fmt.allocPrint(self.gpa, "fnvalue$trampoline${d}", .{@intFromEnum(fid)});
         defer self.gpa.free(name);
         const f = try b.finish(name, param_types.items, shape.result, false, .invalid, entry);
-        try self.closure_funcs.append(self.gpa, f);
+        try self.appendClosure(f);
         try self.fn_value_tramps.put(self.gpa, gsym.pack(), fid);
         return fid;
     }
@@ -713,7 +736,7 @@ pub const Lowerer = struct {
         const name = try std.fmt.allocPrint(self.gpa, "ifacemethod$trampoline${d}", .{@intFromEnum(fid)});
         defer self.gpa.free(name);
         const f = try b.finish(name, param_types.items, shape.result, false, .invalid, entry);
-        try self.closure_funcs.append(self.gpa, f);
+        try self.appendClosure(f);
         return fid;
     }
 };
@@ -740,6 +763,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
         .gpa = gpa,
         .ctx = ctx,
         .modules = modules,
+        .root = root,
         .files = modules[0].files,
         .checked = modules[0].checked,
         .rmodule = modules[0].rmodule,
@@ -876,6 +900,10 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
                 .result = shape.result,
                 .is_fallible = false,
                 .is_extern = true,
+                // §17.6: tagged like any other function, though the emitters
+                // skip an extern declaration on the `is_extern` test first —
+                // the tag has to be right regardless of which test wins.
+                .in_root_module = gsym.module == root,
                 .err_ty = ctx.void_id,
                 .blocks = &.{},
                 .entry = @enumFromInt(0),

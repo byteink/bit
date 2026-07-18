@@ -215,6 +215,19 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(opt_tests).step);
 
+    // §17.6 module-scoped emission. Needs its own entry like every unit-test
+    // file above: `unit_tests` is rooted at `main.zig`, and a test in a file
+    // that root merely imports is NOT collected — a test added to `emit.zig`
+    // without this silently never runs.
+    const emit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("seed/emit.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(emit_tests).step);
+
     // Rooted at `seed/` (not `seed/obj/`) via the anchor file, so
     // `pe.zig`'s `../codegen/x64.zig` import resolves — see that file's doc
     // comment and `obj_pe_test.zig`'s.

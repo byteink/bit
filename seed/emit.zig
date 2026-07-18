@@ -19,7 +19,49 @@ const common = @import("codegen/common.zig");
 const obj_elf = @import("obj/elf.zig");
 const obj_macho = @import("obj/macho.zig");
 
-pub const Error = error{NoMain} || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
+pub const Error = error{ NoMain, FreestandingAlloc, FreestandingSafepoint } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
+
+/// §17.6: may this function go into a freestanding object? A freestanding
+/// object carries no `bit_stack_maps`, so the collector could not scan the
+/// frame of a function it contains — which is sound only for a function that
+/// can never be on the stack when a collection begins.
+///
+/// The test is the DECLARATION (`@nosplit`/`@naked`), not the emitted safepoint
+/// list, and the difference matters. Codegen records a safepoint at every
+/// surviving call, because in general a callee may collect; `@nosplit`
+/// suppresses only the back-edge one. So "has no safepoints" is true of almost
+/// nothing that calls anything — it would reject a runtime module the moment it
+/// called a sibling, which is the entire case this mode exists for. What
+/// actually makes the missing stack map sound is §10.3's standing obligation on
+/// `@nosplit`: it may not allocate and may not reach a safepoint, so no
+/// collection can begin beneath it. Requiring the attribute makes that
+/// obligation explicit in the source and checkable by reading it.
+fn freestandingEligible(f: *const ir.Function) bool {
+    return f.is_nosplit or f.is_naked;
+}
+
+/// §17.6: does this function belong in a freestanding object? A freestanding
+/// emit keeps only the ROOT module's own code, so an imported module's
+/// functions are left out and calls into them stay undefined relocations the
+/// linker resolves against that module's own object. `is_extern` is skipped on
+/// both paths: a declaration defines nothing either way.
+fn emitsFunction(f: *const ir.Function, freestanding: bool) bool {
+    if (f.is_extern) return false;
+    return f.in_root_module or !freestanding;
+}
+
+/// §17.6: refuses a module that needs the managed runtime's whole-program
+/// tables, which a freestanding object cannot carry — a `TypeInfo` descriptor
+/// is a global symbol every sibling member describing the same layout would
+/// also define, and there is exactly one `bit_stack_maps` per link.
+///
+/// Runs BEFORE codegen, ahead of the per-function safepoint check, because
+/// allocating is the cause and reaching a safepoint is usually its consequence:
+/// diagnosing the consequence would send the reader off to add `@nosplit` to a
+/// function whose real problem is that it allocates.
+fn refuseManagedMetadata(a: Allocator, module: *const ir.Module) Error!void {
+    if ((try collectTypeInfos(a, module, true)).len > 0) return error.FreestandingAlloc;
+}
 
 /// Symbol naming the module's GC stack-map table (`runtime/ABI.md` §4); the
 /// runtime reads it via a `bit_stack_maps` extern to walk Bit frames at a
@@ -51,10 +93,12 @@ const TypeInfoLayout = struct { disc: u32, size: u32, ptr_offsets: []const u32 }
 
 /// Every distinct `TypeInfo` in the module, deduped by its symbol name (so a
 /// type used at many allocation sites shares one blob). Bytes owned by `a`.
-fn collectTypeInfos(a: Allocator, module: *const ir.Module) Allocator.Error![]TypeInfoLayout {
+fn collectTypeInfos(a: Allocator, module: *const ir.Module, freestanding: bool) Allocator.Error![]TypeInfoLayout {
     var seen = std.StringHashMapUnmanaged(void){};
     var out: std.ArrayList(TypeInfoLayout) = .empty;
     for (module.funcs.items) |*f| {
+        // §17.6: a descriptor is only needed for code this object emits.
+        if (!emitsFunction(f, freestanding)) continue;
         var i: u32 = 0;
         while (i < f.insts.len) : (i += 1) {
             // A `make_closure` allocates the fixed 16-byte `{code, env}` cell
@@ -116,7 +160,7 @@ fn emitMethodTable(a: Allocator, module: *const ir.Module, rodata: *std.ArrayLis
 /// owned by `gpa`; with `with_entry` the module's `main` becomes the runtime
 /// entry, otherwise no `main` is required and no trampoline is emitted (#1397 —
 /// the plain relocatable an archive member is made of).
-pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Error![]u8 {
+pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, freestanding: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -127,6 +171,8 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Er
     var relocs: std.ArrayList(obj_elf.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
     var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
+    var emitted_names: std.ArrayList([]const u8) = .empty;
+    if (freestanding) try refuseManagedMetadata(a, module);
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -135,7 +181,9 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Er
         // §11.7: a declaration, not a definition — emit no code and, decisively,
         // leave it OUT of `defined` so every call to it stays an undefined
         // symbol the linker resolves (Mach-O: a libSystem import).
-        if (f.is_extern) continue;
+        // §17.6: an imported module's function is skipped the same way.
+        if (!emitsFunction(f, freestanding)) continue;
+        if (freestanding and !freestandingEligible(f)) return error.FreestandingSafepoint;
         var fc = try x64.compileFunction(gpa, module, f, .sysv);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -156,6 +204,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Er
             },
         });
         try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, x64.SafepointEntry, fc.safepoints));
+        try emitted_names.append(a, f.name);
         if (std.mem.eql(u8, f.name, "main")) {
             have_main = true;
             main_void = module.ctx.typeOf(f.result) == .void;
@@ -180,7 +229,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Er
         try defined.put(a, "bit_main", {});
     }
 
-    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items);
+    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
@@ -206,7 +255,27 @@ fn emitElfBlobs(
     relocs: *std.ArrayList(obj_elf.Relocation),
     defined: *std.StringHashMapUnmanaged(void),
     stackmaps: []const common.FuncStackMap,
+    /// The `.text` symbol names, in `stackmaps` order — NOT `module.funcs`
+    /// order, which skips declarations and (freestanding) imported modules.
+    emitted_names: []const []const u8,
+    freestanding: bool,
 ) !void {
+    std.debug.assert(emitted_names.len == stackmaps.len);
+    // §17.6: a freestanding object is one archive member among many, so every
+    // symbol it defines globally is a symbol some sibling member may define
+    // too. A string literal has no external linkage — nothing outside this
+    // object ever names `__bitstr_N` — so the header goes local and two
+    // members' literals stop colliding at link.
+    //
+    // NOT REACHABLE TODAY, and deliberately kept: §10.3's `@nosplit` whitelist
+    // admits no string operation, so a freestanding module's string pool is
+    // always empty and this branch never fires. It is here because the whitelist
+    // has to widen for #1363/#1364 (gc/sched need `asm`), and the day a literal
+    // becomes reachable the global binding would surface as a `__bitstr_0`
+    // duplicate between two members — a failure whose symptom points nowhere
+    // near its cause.
+    const blob_binding: obj_elf.Binding = if (freestanding) .local else .global;
+
     // ---- string pool -> .rodata headers + bytes ---------------------------
     for (module.string_pool.items, 0..) |s, i| {
         const data_off: u64 = rodata.items.len;
@@ -222,13 +291,15 @@ fn emitElfBlobs(
         std.mem.writeInt(u64, &lenbuf, s.len, .little);
         try rodata.appendSlice(a, &lenbuf); // len
         const hdr_name = try std.fmt.allocPrint(a, "__bitstr_{d}", .{i});
-        try symbols.append(a, .{ .name = hdr_name, .section = .rodata, .offset = hdr_off, .size = 16, .binding = .global, .kind = .object });
+        try symbols.append(a, .{ .name = hdr_name, .section = .rodata, .offset = hdr_off, .size = 16, .binding = blob_binding, .kind = .object });
         try defined.put(a, hdr_name, {});
         try relocs.append(a, .{ .section = .rodata, .offset = hdr_off, .symbol = data_name, .kind = .abs64, .addend = 0 });
     }
 
     // ---- gc_alloc TypeInfo blobs -> .rodata -------------------------------
-    for (try collectTypeInfos(a, module)) |ti| {
+    // §17.6: `refuseManagedMetadata` already rejected a freestanding module
+    // that needs any of these, so this list is empty on that path.
+    for (try collectTypeInfos(a, module, freestanding)) |ti| {
         const name = try ir.typeInfoSymbol(a, ti.disc, ti.size, ti.ptr_offsets);
         var offs_name: []const u8 = "";
         if (ti.ptr_offsets.len > 0) {
@@ -284,7 +355,11 @@ fn emitElfBlobs(
     }
 
     // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata ----------------
-    {
+    // §17.6: `bit_stack_maps` is a whole-PROGRAM table under one fixed name the
+    // runtime reads, so exactly one object in a link may define it — never an
+    // archive member. A freestanding object emits none and instead refuses any
+    // function that would need an entry (below), so nothing is silently lost.
+    if (!freestanding) {
         const blob_off: u64 = rodata.items.len;
         const code_relocs = try common.writeStackMaps(a, rodata, stackmaps);
         try symbols.append(a, .{ .name = stackmaps_symbol, .section = .rodata, .offset = blob_off, .size = rodata.items.len - blob_off, .binding = .global, .kind = .object });
@@ -294,7 +369,7 @@ fn emitElfBlobs(
         for (code_relocs, 0..) |ro, fi| try relocs.append(a, .{
             .section = .rodata,
             .offset = ro,
-            .symbol = try a.dupe(u8, module.funcs.items[fi].name),
+            .symbol = try a.dupe(u8, emitted_names[fi]),
             .kind = .abs64,
             .addend = 0,
         });
@@ -315,7 +390,7 @@ fn emitElfBlobs(
 /// `emitElfBlobs`), but the function bodies and the `bit_main` entry trampoline
 /// use AArch64 encodings, and code relocations are the ADRP/ADD/BL kinds arm64
 /// codegen emits.
-pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: bool) Error![]u8 {
+pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: bool, freestanding: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -326,6 +401,8 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     var relocs: std.ArrayList(obj_elf.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
     var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
+    var emitted_names: std.ArrayList([]const u8) = .empty;
+    if (freestanding) try refuseManagedMetadata(a, module);
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -334,7 +411,9 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         // §11.7: a declaration, not a definition — emit no code and, decisively,
         // leave it OUT of `defined` so every call to it stays an undefined
         // symbol the linker resolves (Mach-O: a libSystem import).
-        if (f.is_extern) continue;
+        // §17.6: an imported module's function is skipped the same way.
+        if (!emitsFunction(f, freestanding)) continue;
+        if (freestanding and !freestandingEligible(f)) return error.FreestandingSafepoint;
         var fc = try arm64.compileFunction(gpa, module, f);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -353,6 +432,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
             .addend = 0,
         });
         try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, arm64.SafepointEntry, fc.safepoints));
+        try emitted_names.append(a, f.name);
         if (std.mem.eql(u8, f.name, "main")) {
             have_main = true;
             main_void = module.ctx.typeOf(f.result) == .void;
@@ -375,7 +455,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         try defined.put(a, "bit_main", {});
     }
 
-    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items);
+    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
@@ -390,7 +470,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
 /// the entry trampoline and address-of use AArch64 encodings, and a
 /// `const_string` header address is materialized by a PC-relative `ADRP`/`ADD`
 /// pair (`page21`/`pageoff12`) rather than x86-64's absolute `movabs`.
-pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Error![]u8 {
+pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, freestanding: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -402,6 +482,8 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     var relocs: std.ArrayList(obj_macho.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
     var stackmaps: std.ArrayList(common.FuncStackMap) = .empty;
+    var emitted_names: std.ArrayList([]const u8) = .empty;
+    if (freestanding) try refuseManagedMetadata(a, module);
 
     const mac = struct {
         fn prefix(al: Allocator, name: []const u8) ![]u8 {
@@ -415,6 +497,10 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     // is emitted keeps the failure a clean diagnostic rather than a partly
     // written object.
     for (module.funcs.items) |*f| {
+        // §17.6: only code this object actually emits can carry the instruction
+        // — rejecting on a module that is not even being emitted would fail a
+        // perfectly valid freestanding build for a sibling's Linux-only code.
+        if (!emitsFunction(f, freestanding)) continue;
         for (f.insts.items(.op)) |op| {
             if (op == .syscall) return error.SyscallUnsupportedTarget;
         }
@@ -427,7 +513,9 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
         // §11.7: a declaration, not a definition — emit no code and, decisively,
         // leave it OUT of `defined` so every call to it stays an undefined
         // symbol the linker resolves (Mach-O: a libSystem import).
-        if (f.is_extern) continue;
+        // §17.6: an imported module's function is skipped the same way.
+        if (!emitsFunction(f, freestanding)) continue;
+        if (freestanding and !freestandingEligible(f)) return error.FreestandingSafepoint;
         var fc = try arm64.compileFunction(gpa, module, f);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -445,6 +533,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
             },
         });
         try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, arm64.SafepointEntry, fc.safepoints));
+        try emitted_names.append(a, f.name);
         if (std.mem.eql(u8, f.name, "main")) {
             have_main = true;
             main_void = module.ctx.typeOf(f.result) == .void;
@@ -487,7 +576,8 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
         std.mem.writeInt(u64, &lenbuf, s.len, .little);
         try data.appendSlice(a, &lenbuf); // len
         const hdr_name = try std.fmt.allocPrint(a, "___bitstr_{d}", .{i});
-        try symbols.append(a, .{ .name = hdr_name, .section = .data, .offset = hdr_off, .size = 16, .binding = .global });
+        // §17.6: local in a freestanding object — see `emitElfBlobs`.
+        try symbols.append(a, .{ .name = hdr_name, .section = .data, .offset = hdr_off, .size = 16, .binding = if (freestanding) .local else .global });
         try defined.put(a, hdr_name, {});
         try relocs.append(a, .{ .section = .data, .offset = hdr_off, .symbol = data_name, .kind = .unsigned64 });
     }
@@ -496,7 +586,8 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     // The TypeInfo holds an absolute ptr_offsets pointer, so — like the string
     // headers — it lives in writable `.data` (dyld only rebases writable
     // segments under PIE); the plain offsets array stays in read-only `.rodata`.
-    for (try collectTypeInfos(a, module)) |ti| {
+    // §17.6: empty on the freestanding path — see `refuseManagedMetadata`.
+    for (try collectTypeInfos(a, module, freestanding)) |ti| {
         const name = try ir.typeInfoSymbol(a, ti.disc, ti.size, ti.ptr_offsets);
         var offs_name: []const u8 = "";
         if (ti.ptr_offsets.len > 0) {
@@ -561,7 +652,10 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     // Like the string/TypeInfo blobs, each entry holds an absolute code
     // pointer, so the table lives in writable `.data` (dyld only rebases
     // writable segments under PIE); the runtime reads it via `_bit_stack_maps`.
-    {
+    std.debug.assert(emitted_names.items.len == stackmaps.items.len);
+    // §17.6: a whole-program table under a fixed name — never an archive
+    // member's to define. See `emitElfBlobs`.
+    if (!freestanding) {
         const blob_off: u64 = data.items.len;
         const code_relocs = try common.writeStackMaps(a, &data, stackmaps.items);
         const sym = try mac(a, stackmaps_symbol);
@@ -572,7 +666,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
         for (code_relocs, 0..) |ro, fi| try relocs.append(a, .{
             .section = .data,
             .offset = ro,
-            .symbol = try mac(a, module.funcs.items[fi].name),
+            .symbol = try mac(a, emitted_names.items[fi]),
             .kind = .unsigned64,
         });
     }
@@ -597,4 +691,90 @@ fn appendWord(list: *std.ArrayList(u8), gpa: Allocator, w: u32) !void {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, w, .little);
     try list.appendSlice(gpa, &b);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+const check = @import("check.zig");
+const elf_reader = @import("link/elf_reader.zig");
+
+/// Appends a trivial `@nosplit` function named `name`, tagged as belonging (or
+/// not) to the root module — the two-module shape `lowerProject` produces when
+/// the root imports something, reduced to the one field the emitter reads.
+fn testAppendFunc(gpa: Allocator, module: *ir.Module, name: []const u8, in_root: bool) !void {
+    const i64_ty = module.ctx.prim_ids.get(.i64);
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const one = try b.constInt(i64_ty, 1);
+    try b.ret(&.{one});
+    b.endBlock();
+    var f = try b.finish(name, &.{}, i64_ty, false, .invalid, entry);
+    f.is_nosplit = true; // §17.6 requires it of every emitted function
+    f.in_root_module = in_root;
+    try module.funcs.append(gpa, f);
+}
+
+/// True if the emitted object defines a `.text` symbol named `want`.
+fn testObjectDefines(gpa: Allocator, obj: []const u8, want: []const u8) !bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const mod = try elf_reader.read(arena_state.allocator(), .x86_64, "t.o", obj);
+    for (mod.atoms) |atom| {
+        if (atom.kind == .text and std.mem.eql(u8, atom.name, want)) return true;
+    }
+    return false;
+}
+
+test "emit: a freestanding object holds only the root module's functions" {
+    // §17.6, the invariant a Bit-sourced libbitrt.a rests on. Two modules'
+    // functions share one `ir.Module` after `lowerProject`, so without the
+    // filter BOTH objects define BOTH functions and archiving them is an
+    // immediate DuplicateSymbol — the exact failure #1397/#1398 hit.
+    //
+    // Asserted through the project's own ELF reader rather than by scanning
+    // bytes, so this checks what the LINKER will see: a defined `.text` atom.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "rootFn", true);
+    try testAppendFunc(gpa, &module, "importedFn", false);
+
+    const free_obj = try emitObject(gpa, &module, false, true);
+    defer gpa.free(free_obj);
+    try testing.expect(try testObjectDefines(gpa, free_obj, "rootFn"));
+    try testing.expect(!try testObjectDefines(gpa, free_obj, "importedFn"));
+
+    // The same module emitted normally keeps both — so the assertion above is
+    // about the freestanding flag, not about the function being unemittable.
+    const whole_obj = try emitObject(gpa, &module, false, false);
+    defer gpa.free(whole_obj);
+    try testing.expect(try testObjectDefines(gpa, whole_obj, "rootFn"));
+    try testing.expect(try testObjectDefines(gpa, whole_obj, "importedFn"));
+}
+
+test "emit: freestanding refuses a function that is neither @nosplit nor @naked" {
+    // §17.6: such a function needs a stack map, and a freestanding object has
+    // no `bit_stack_maps` to put one in. Emitting it anyway would leave a frame
+    // the collector cannot scan — silent wrongness, so it is a refusal.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "managedFn", true);
+    module.funcs.items[0].is_nosplit = false;
+
+    try testing.expectError(error.FreestandingSafepoint, emitObject(gpa, &module, false, true));
+    // Not freestanding: the very same module emits fine.
+    const obj = try emitObject(gpa, &module, false, false);
+    defer gpa.free(obj);
+    try testing.expect(try testObjectDefines(gpa, obj, "managedFn"));
 }

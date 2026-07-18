@@ -1677,7 +1677,8 @@ executable. An object is not a program, so it requires no `main` and gets no
 entry trampoline; a module without one is built this way. `bit ar <out.a>
 <obj...>` bundles such objects into an `ar` archive, using the target's own name
 encoding (BSD for Mach-O, GNU/System V for ELF). Neither command reads the
-runtime archive, and neither links.
+runtime archive, and neither links. An object destined for an archive is
+normally emitted `--freestanding` (§17.6).
 
 ### 17.5 Prelude
 
@@ -1689,6 +1690,51 @@ handful of names a program is expected to reach for unqualified: `println`,
 helpers — `unwrap`/`unwrapOr`/`isSome`/`isNone` for `Option`, and
 `unwrapOk`/`okOr`/`isOk`/`isErr` for `Result` (the `unwrap*` forms panic on the
 empty case). A build without a standard-library checkout simply has no prelude.
+
+### 17.6 Freestanding Objects
+
+`bit build <src> --emit-obj --freestanding` compiles a module as a **member of a
+runtime archive** rather than as part of a program. It is the mode a Bit-sourced
+`libbitrt.a` is built in, and it is only meaningful with `--emit-obj` (there is
+no freestanding executable — nothing would boot it), so the two are required
+together.
+
+It makes exactly two guarantees, both about what the object does *not* contain.
+
+**No prelude.** The stdlib root is withheld, so §17.5's implicit `std/core`
+import does not happen and no `std/*` import resolves. A module that reaches for
+`println` fails with the ordinary undefined-name diagnostic (**E0040**), because
+the name genuinely is not in scope. The managed/unmanaged boundary is therefore
+enforced by absence, not by a list of forbidden names — a runtime module cannot
+depend on managed code by accident, only by writing an import that fails.
+
+**Module-scoped emission.** An ordinary build lowers the root module *and every
+module it imports* into one object. Two such objects share every imported
+module's code, so archiving them is an immediate duplicate-symbol error. A
+freestanding object holds only the functions the **root module itself**
+declares; a call into an imported module stays an undefined relocation, resolved
+at link against that module's own object, exactly as a call to an `extern
+function` (§11.7) is.
+
+Because a cross-module reference now has to survive as a *name*, and an
+unpinned name carries the `m<id>$` prefix that whichever build imports the
+module assigns, **every runtime function another module calls must pin its
+symbol with `@symbol` (§11.9)**. Without a pin the defining object and the
+referencing object spell the same function differently and never link.
+
+A freestanding object also carries none of the whole-program tables a managed
+program's object does, since exactly one object per link may define each:
+
+- **no GC type descriptors.** Needing one means the module allocates on the
+  managed heap, which the runtime — the code that *implements* that heap —
+  must not do. Refused, rather than emitted without the descriptor.
+- **no `bit_stack_maps`.** Every function in the object must therefore be
+  `@nosplit` or `@naked` (§10.3), which is refused otherwise. The attribute is
+  what makes the absent stack map sound: `@nosplit` already carries the
+  obligation not to allocate and not to reach a safepoint, so no collection can
+  begin beneath such a frame and none of them ever needs scanning.
+- **string literals are local**, not global. Nothing outside the object names
+  them, so two members' literals cannot collide.
 
 ---
 

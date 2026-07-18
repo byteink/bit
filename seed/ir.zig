@@ -471,6 +471,18 @@ pub const Function = struct {
     /// it as a relocation against a symbol this object does not define, which is
     /// exactly what makes the Mach-O linker bind it as a libSystem import.
     is_extern: bool = false,
+    /// §17.6 freestanding: true iff this function was lowered from the build's
+    /// ROOT module. `lowerProject` pulls in every imported module, so an object
+    /// emitted from the whole thing carries their functions too — archive two
+    /// such objects and they collide on every shared symbol. A freestanding
+    /// emit keeps only the functions tagged here and leaves calls into the rest
+    /// as undefined relocations, exactly as it already does for `is_extern`.
+    ///
+    /// Defaults to FALSE — "not mine, do not emit" — deliberately: a rebuild
+    /// that forgets to carry this flag drops functions out of the object, which
+    /// fails the link loudly, rather than silently re-admitting the collision
+    /// the flag exists to prevent. See `opt.zig`'s `rebuild`/`inlineCalls`.
+    in_root_module: bool = false,
     err_ty: TypeId,
     blocks: []const BasicBlock,
     entry: BlockId,

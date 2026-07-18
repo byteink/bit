@@ -219,6 +219,7 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     var src_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
     var emit_obj = false;
+    var freestanding = false;
     var target: BuildTarget = host_target;
     var ai: usize = 0;
     while (ai < args.len) {
@@ -228,6 +229,9 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
             ai += 2;
         } else if (std.mem.eql(u8, arg, "--emit-obj") or std.mem.eql(u8, arg, "-c")) {
             emit_obj = true;
+            ai += 1;
+        } else if (std.mem.eql(u8, arg, "--freestanding")) {
+            freestanding = true;
             ai += 1;
         } else if ((std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "-t")) and ai + 1 < args.len) {
             target = BuildTarget.parse(args[ai + 1]) orelse {
@@ -241,11 +245,20 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
         }
     }
     const src = src_path orelse {
-        try err_out.writeAll("usage: bit build|run <file.bit> [-o out] [--emit-obj] [--target x86_64-linux|aarch64-linux|aarch64-macos]\n");
+        try err_out.writeAll("usage: bit build|run <file.bit> [-o out] [--emit-obj [--freestanding]] [--target x86_64-linux|aarch64-linux|aarch64-macos]\n");
         return 2;
     };
     if (emit_obj and is_run) {
         try err_out.writeAll("bit: --emit-obj produces an object, not a program: use `bit build`\n");
+        return 2;
+    }
+    // §17.6: freestanding describes an archive MEMBER — a module compiled with
+    // no prelude and emitted alone. There is no such thing as a freestanding
+    // executable today (nothing would boot it), so rather than quietly implying
+    // `--emit-obj`, require it: the combination the user meant is the only one
+    // that means anything.
+    if (freestanding and !emit_obj) {
+        try err_out.writeAll("bit: --freestanding emits an archive member: pass --emit-obj\n");
         return 2;
     }
 
@@ -279,9 +292,18 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     defer gpa.free(root_abs);
     // Best-effort: a build without a stdlib checkout still works (std/*
     // imports then error cleanly); only a real stdlib dir enables them.
-    const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
+    //
+    // §17.6: freestanding withholds the stdlib root entirely, which is the
+    // whole mechanism — `loadProject` loads the prelude FROM that root, so a
+    // null root means no prelude is loaded and no `std/*` import resolves. A
+    // module that reaches for `println` (or imports `std/io`) then fails in the
+    // resolver with an ordinary undefined-name diagnostic, because the name
+    // genuinely is not in scope. That is the point: the managed/unmanaged
+    // boundary is enforced by absence, not by a list of forbidden names the
+    // checker would have to keep in sync with the prelude.
+    const std_root: ?[]u8 = if (freestanding) null else absFromCwd(gpa, io, stdlib_dir) catch null;
     defer if (std_root) |s| gpa.free(s);
-    const exe = (try buildProject(gpa, io, root_abs, root_only, std_root, ident, lib, target, err_out, null, emit_obj)) orelse return 1;
+    const exe = (try buildProject(gpa, io, root_abs, root_only, std_root, ident, lib, target, err_out, null, emit_obj, freestanding)) orelse return 1;
     defer gpa.free(exe);
 
     // An object is not executable: write it plain, defaulting to `<stem>.o`.
@@ -412,7 +434,7 @@ fn runTest(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
     defer gpa.free(root_abs);
     const std_root: ?[]u8 = absFromCwd(gpa, io, stdlib_dir) catch null;
     defer if (std_root) |s| gpa.free(s);
-    const exe = (try buildProject(gpa, io, root_abs, root_only, std_root, ident, lib, host_target, err_out, &tests, false)) orelse return 1;
+    const exe = (try buildProject(gpa, io, root_abs, root_only, std_root, ident, lib, host_target, err_out, &tests, false, false)) orelse return 1;
     defer gpa.free(exe);
     defer testgen.freeTests(gpa, tests);
 
@@ -512,7 +534,7 @@ pub fn checkHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, ro
 /// `std/testing` and the rest of the stdlib. `null`: this harness always names a
 /// project directory, never a lone file (SPEC §17.1).
 pub fn buildHostTestProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer, tests_out: *[]testgen.Test) !?[]u8 {
-    return buildProject(gpa, io, root_abs, null, std_root, ident, libbitrt, host_target, err_out, tests_out, false);
+    return buildProject(gpa, io, root_abs, null, std_root, ident, libbitrt, host_target, err_out, tests_out, false, false);
 }
 
 /// One source file of the module being built: its path (for diagnostics and
@@ -618,7 +640,7 @@ pub fn buildHostModule(gpa: std.mem.Allocator, io: Io, path: []const u8, libbitr
 /// any front-end error.
 pub fn buildHostProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, err_out: *Io.Writer) !?[]u8 {
     // `null`: this harness always names a project directory, never a lone file.
-    return buildProject(gpa, io, root_abs, null, std_root, ident, libbitrt, host_target, err_out, null, false);
+    return buildProject(gpa, io, root_abs, null, std_root, ident, libbitrt, host_target, err_out, null, false, false);
 }
 
 /// Single-file convenience entry (the golden `// run` harness uses this): one
@@ -679,7 +701,9 @@ fn absFromCwd(gpa: std.mem.Allocator, io: Io, rel: []const u8) ![]u8 {
 /// With `emit_obj`, stops one step short: returns the relocatable object itself
 /// instead of a linked executable, requires no `main`, and never touches
 /// `libbitrt` (#1397 — the archive-member path).
-pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_only: ?[]const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer, tests_out: ?*[]testgen.Test, emit_obj: bool) !?[]u8 {
+pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_only: ?[]const u8, std_root: ?[]const u8, ident: []const u8, libbitrt: []const u8, target: BuildTarget, err_out: *Io.Writer, tests_out: ?*[]testgen.Test, emit_obj: bool, freestanding: bool) !?[]u8 {
+    // §17.6 is an object-only mode; the caller rejects the other combination.
+    std.debug.assert(!freestanding or emit_obj);
     var sm = diagnostics.SourceManager.init(gpa);
     defer sm.deinit();
     var diags = diagnostics.Diagnostics.init(gpa, &sm);
@@ -728,13 +752,19 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
 
     switch (target) {
         .x86_64_linux => {
-            const object = try emit.emitObject(gpa, &module, !emit_obj);
+            const object = emit.emitObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
+                error.FreestandingAlloc, error.FreestandingSafepoint => return try freestandingRefused(err_out, e),
+                else => return e,
+            };
             if (emit_obj) return object;
             defer gpa.free(object);
             return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
         .aarch64_linux => {
-            const object = try emit.emitObjectArm64Elf(gpa, &module, !emit_obj);
+            const object = emit.emitObjectArm64Elf(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
+                error.FreestandingAlloc, error.FreestandingSafepoint => return try freestandingRefused(err_out, e),
+                else => return e,
+            };
             if (emit_obj) return object;
             defer gpa.free(object);
             return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
@@ -742,8 +772,9 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
         .aarch64_macos => {
             // §11.8: `syscall()` has no Darwin encoding — report it as a
             // diagnostic (exit 1), not a raw propagated error.
-            const object = emit.emitMachoObject(gpa, &module, !emit_obj) catch |e| switch (e) {
+            const object = emit.emitMachoObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
                 error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
+                error.FreestandingAlloc, error.FreestandingSafepoint => return try freestandingRefused(err_out, e),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -808,19 +839,19 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
 
     switch (target) {
         .x86_64_linux => {
-            const object = try emit.emitObject(gpa, &module, true);
+            const object = try emit.emitObject(gpa, &module, true, false);
             defer gpa.free(object);
             return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
         .aarch64_linux => {
-            const object = try emit.emitObjectArm64Elf(gpa, &module, true);
+            const object = try emit.emitObjectArm64Elf(gpa, &module, true, false);
             defer gpa.free(object);
             return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
         },
         .aarch64_macos => {
             // §11.8: `syscall()` has no Darwin encoding — report it as a
             // diagnostic (exit 1), not a raw propagated error.
-            const object = emit.emitMachoObject(gpa, &module, true) catch |e| switch (e) {
+            const object = emit.emitMachoObject(gpa, &module, true, false) catch |e| switch (e) {
                 error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
                 else => return e,
             };
@@ -861,6 +892,21 @@ fn rejectExternForTarget(diags: *diagnostics.Diagnostics, files: []const resolve
 /// message plus a `null` result, which the caller maps to exit code 1.
 fn syscallUnsupported(err_out: *Io.Writer) !?[]u8 {
     try err_out.writeAll("bit: 'syscall' is not supported on aarch64-macos: Darwin publishes no stable syscall numbers (SPEC \xc2\xa711.8)\n");
+    return null;
+}
+
+/// §17.6: a freestanding object contributes code and nothing else to a link —
+/// it carries no GC type descriptors and no stack-map table, because both are
+/// whole-program tables that exactly one object may define. Code that would
+/// need either is refused here rather than emitted without it, which would be
+/// silent wrongness: an allocation with no descriptor, or a frame the collector
+/// cannot scan.
+fn freestandingRefused(err_out: *Io.Writer, e: anyerror) !?[]u8 {
+    const why = switch (e) {
+        error.FreestandingAlloc => "allocates on the managed heap (a struct, slice, string or closure value)",
+        else => "has a function that is neither @nosplit nor @naked; freestanding code carries no GC stack maps (SPEC \xc2\xa710.3)",
+    };
+    try err_out.print("bit: --freestanding: this module {s}\n", .{why});
     return null;
 }
 
