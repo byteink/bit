@@ -1,0 +1,405 @@
+// The Bit port of `runtime/root.zig`'s managed-data surface (runtime/root,
+// #1367), driven as a real linked binary.
+//
+// THIS IS A DIFFERENTIAL, NOT A GOLDEN — and the oracle is unusually good here,
+// because the other side of it is ALREADY LINKED INTO THIS PROGRAM. Every
+// `string`, `[]T` and `map<K,V>` operation the language itself performs routes
+// through `runtime/root.zig`'s exported `bit_rt_*` symbols. So each phase below
+// runs the SAME operation twice — once through the Bit port's entry points and
+// once through ordinary Bit syntax — and asserts the two agree. The Zig side
+// needs no separate harness and cannot go stale: it is whatever the compiler
+// currently emits calls to.
+//
+// The two implementations do NOT share a heap. The port allocates from its own
+// collector over the arena carved out of the slices held in `main`; the language
+// side allocates from the process collector in `libbitrt.a`. Only raw, untraced
+// addresses cross between them, which is also why this program is meaningful
+// under `BIT_GC=stress`: the native collector runs at every back-edge and must
+// never disturb the port's objects, while the arena slices must stay rooted.
+//
+// WHAT EACH PHASE PROVES
+//
+//   W  Wyhash against the SEVEN OFFICIAL TEST VECTORS (wangyi-fudan's
+//      `test_vector.cpp`, the same set Zig's own unit test uses). This is the
+//      one oracle in the file that is independent of this codebase entirely.
+//      Their lengths — 0, 1, 3, 14, 26, 62, 80 — are chosen by upstream to
+//      cover every length class: the three smallKey branches, the 17..47
+//      final1-only path, and the >=48 round loop.
+//
+//   S  Strings: concat, eq, slice, byte, from_int, from_bytes/bytes_from.
+//
+//   L  Slices: new, append (across the doubling boundary), get, set, reslice.
+//
+//   M  Maps: a scripted insert/lookup/delete/overwrite stream on a port map and
+//      a native map in lockstep. The strong assertion is the LAST one: the two
+//      maps must iterate in the SAME SLOT ORDER. Order is a function of the
+//      hash, the probe sequence, the tombstone policy and the grow schedule all
+//      at once, so matching it end to end is a much sharper test than matching
+//      the key SET would be. It is what makes a one-bit error in `mulHi` or an
+//      off-by-one in the 7/8 load factor visible.
+
+import { loadWord, storeWord } from "../../../runtime/gc"
+import {
+  rootBindMemory, rootInit, rootConfigure, rootStatOom,
+  rtStringConcat, rtStringEq, rtStringByte, rtStringSlice, rtStringFromInt,
+  rtStringFromBool, rtStringFromBytes, rtBytesFromString,
+  rtSliceNew, rtSliceAppend, rtSliceGet, rtSliceSet, rtSliceSlice,
+  rtSliceInBounds,
+  rtMapNew, rtMapSet, rtMapGet, rtMapHas, rtMapDelete, rtMapLen,
+  rtMapIterInit, rtMapIterNext, rtMapKeyAt, rtMapValAt,
+  rtWyhashString,
+  strLen, strPtr,
+} from "../../../runtime/root"
+
+// 2 MiB of object heap and 128 KiB of index. Far more than the script needs:
+// the point is that neither can run out, so a short table is never an
+// allocation failure wearing a passing test's clothes. `rootStatOom` is
+// asserted zero on the final line for exactly that reason.
+const ARENA_WORDS = 262144
+const INDEX_WORDS = 16384
+const MARK_STACK = 4096
+const MIN_TRIGGER = 65536
+const GROWTH_PCT = 200
+
+// Map script length. Sized by measurement, not feel: the map starts at 8 slots
+// and grows at 7/8 load, so 400 distinct keys forces SIX growth events
+// (8->16->32->64->128->256->512) and therefore six full rehashes. A shorter
+// script that never grows would let `mapGrow` be deleted entirely — verified by
+// mutation, see the task report.
+const MAP_STEPS = 400
+
+// ---------------------------------------------------------------------------
+// Bridges between the two heaps
+// ---------------------------------------------------------------------------
+
+// A port-heap `string` holding the same bytes as the native string `s`.
+//
+// Goes through `rtSliceNew`/`rtSliceSet`/`rtStringFromBytes` rather than a
+// private constructor, so the bridge itself exercises three real entry points
+// and the word-per-byte slice model (ABI.md §2) they share.
+function mine(s: string): int {
+  let n = len(s)
+  let h = rtSliceNew(n, n, 0)
+  let i = 0
+  while (i < n) {
+    rtSliceSet(h, i, int(s[i]))
+    i = i + 1
+  }
+  return rtStringFromBytes(h)
+}
+
+// Whether the port-heap string at `m` holds exactly the native string `s`.
+// Compares LENGTH FIRST and then every byte — a prefix match is not a match.
+function sameStr(m: int, s: string): bool {
+  if (m == 0) {
+    return false
+  }
+  if (loadWord(m + strLen) != len(s)) {
+    return false
+  }
+  let i = 0
+  while (i < len(s)) {
+    if (rtStringByte(m, i) != int(s[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// splitmix64, the script driver. Identical shape to `tests/stress/gcbit`'s so
+// the two are comparable; masked to 62 bits so every draw is a non-negative
+// `int`.
+function nextRand(state: []u64): int {
+  state[0] = state[0] + 11400714819323198485
+  let z = state[0]
+  z = (z ^ (z >> 30)) * 13787848793156543929
+  z = (z ^ (z >> 27)) * 10723151780598845931
+  z = z ^ (z >> 31)
+  return int(z & 4611686018427387903)
+}
+
+// ---------------------------------------------------------------------------
+// W — Wyhash test vectors
+// ---------------------------------------------------------------------------
+
+// One vector. Returns 1 on a match so the caller can total them.
+function vec(s: string, seed: u64, want: u64): int {
+  let h = rtWyhashString(mine(s), seed)
+  if (h == want) {
+    return 1
+  }
+  return 0
+}
+
+function phaseW(): int {
+  let ok = 0
+  ok = ok + vec("", u64(0), 0x0409638ee2bde459)
+  ok = ok + vec("a", u64(1), 0xa8412d091b5fe0a9)
+  ok = ok + vec("abc", u64(2), 0x32dd92e4b2915153)
+  ok = ok + vec("message digest", u64(3), 0x8619124089a3a16b)
+  ok = ok + vec("abcdefghijklmnopqrstuvwxyz", u64(4), 0x7a43afb61d7f5f40)
+  ok = ok + vec("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", u64(5), 0xff42329b90e50d58)
+  ok = ok + vec("12345678901234567890123456789012345678901234567890123456789012345678901234567890", u64(6), 0xc39cab13b115aad3)
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// S — strings
+// ---------------------------------------------------------------------------
+
+function phaseS(): int {
+  let ok = 0
+
+  // concat, including both empty-operand edges.
+  if (sameStr(rtStringConcat(mine("foo"), mine("bar")), "foo" + "bar")) { ok = ok + 1 }
+  if (sameStr(rtStringConcat(mine(""), mine("x")), "x")) { ok = ok + 1 }
+  if (sameStr(rtStringConcat(mine("x"), mine("")), "x")) { ok = ok + 1 }
+
+  // eq: equal-but-distinct objects, differing length, and equal length with a
+  // differing byte (the case a length-only comparison would pass).
+  if (rtStringEq(mine("hello"), mine("hello"))) { ok = ok + 1 }
+  if (!rtStringEq(mine("hello"), mine("hell"))) { ok = ok + 1 }
+  if (!rtStringEq(mine("hello"), mine("hellp"))) { ok = ok + 1 }
+
+  // byte, at both ends and out of range.
+  if (rtStringByte(mine("abc"), 0) == int('a')) { ok = ok + 1 }
+  if (rtStringByte(mine("abc"), 2) == int('c')) { ok = ok + 1 }
+  if (rtStringByte(mine("abc"), 3) == -1) { ok = ok + 1 }
+  if (rtStringByte(mine("abc"), -1) == -1) { ok = ok + 1 }
+
+  // slice, against the language's own slicing.
+  if (sameStr(rtStringSlice(mine("abcdef"), 1, 4), "abcdef"[1:4])) { ok = ok + 1 }
+  if (sameStr(rtStringSlice(mine("abcdef"), 0, 6), "abcdef")) { ok = ok + 1 }
+  if (sameStr(rtStringSlice(mine("abcdef"), 3, 3), "")) { ok = ok + 1 }
+  if (rtStringSlice(mine("abcdef"), 4, 2) == 0) { ok = ok + 1 }
+  if (rtStringSlice(mine("abcdef"), 0, 7) == 0) { ok = ok + 1 }
+
+  // from_int, against the language's own integer interpolation. The two
+  // extremes matter: i64's most negative value has no positive counterpart, so
+  // a port that negates into `int` prints garbage for exactly that one input.
+  if (sameStr(rtStringFromInt(0), "${0}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(7), "${7}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(-7), "${-7}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(123456789), "${123456789}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(9223372036854775807), "${9223372036854775807}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromInt(-9223372036854775808), "${-9223372036854775808}")) { ok = ok + 1 }
+
+  if (sameStr(rtStringFromBool(true), "${true}")) { ok = ok + 1 }
+  if (sameStr(rtStringFromBool(false), "${false}")) { ok = ok + 1 }
+
+  // bytes_from_string round-trips through the word-per-byte slice model.
+  if (sameStr(rtStringFromBytes(rtBytesFromString(mine("round trip"))), "round trip")) { ok = ok + 1 }
+
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// L — slices
+// ---------------------------------------------------------------------------
+
+function phaseL(): int {
+  let ok = 0
+
+  // new: length, capacity and zeroing.
+  let a = rtSliceNew(3, 3, 0)
+  if (rtSliceGet(a, 0) == 0 && rtSliceGet(a, 1) == 0 && rtSliceGet(a, 2) == 0) { ok = ok + 1 }
+  if (!rtSliceInBounds(a, 3) && !rtSliceInBounds(a, -1) && rtSliceInBounds(a, 2)) { ok = ok + 1 }
+
+  // set/get.
+  rtSliceSet(a, 1, 42)
+  if (rtSliceGet(a, 1) == 42) { ok = ok + 1 }
+  // Out-of-range set is a no-op and must not corrupt a neighbour.
+  rtSliceSet(a, 3, 99)
+  if (rtSliceGet(a, 2) == 0) { ok = ok + 1 }
+
+  // append across the doubling boundary, checked against a native slice built
+  // by the same sequence. 33 elements crosses 1,2,4,8,16,32 — six grows.
+  let b = rtSliceNew(0, 0, 0)
+  let nat: []i64 = []i64(0)
+  let i = 0
+  while (i < 33) {
+    b = rtSliceAppend(b, i * 3)
+    nat = append(nat, i * 3)
+    i = i + 1
+  }
+  let agree = 1
+  i = 0
+  while (i < 33) {
+    if (rtSliceGet(b, i) != nat[i]) {
+      agree = 0
+    }
+    i = i + 1
+  }
+  if (agree == 1 && len(nat) == 33) { ok = ok + 1 }
+
+  // reslice shares the buffer: a write through the view is visible in the
+  // parent, which is what "shares" means and what a copying implementation
+  // would fail.
+  let v = rtSliceSlice(b, 4, 8)
+  if (rtSliceGet(v, 0) == rtSliceGet(b, 4)) { ok = ok + 1 }
+  rtSliceSet(v, 0, 777)
+  if (rtSliceGet(b, 4) == 777) { ok = ok + 1 }
+  // GO CAPACITY SEMANTICS: the reslice bound is `cap`, NOT `len` (SPEC §12.6).
+  // 33 appends from empty leave len=33 and cap=64 (doubling 1,2,4,8,16,32,64),
+  // so slicing to 34 is LEGAL — past the length, inside the capacity — while 65
+  // is not. This property was wrong on the first write (it asserted 34 must be
+  // rejected) and the port was right; recorded because a `len`-bounded reslice
+  // is the natural mistake here and this is the check that distinguishes it.
+  if (rtSliceSlice(b, 0, 34) != 0 && rtSliceSlice(b, 0, 65) == 0) { ok = ok + 1 }
+  // A reslice's capacity is the parent's minus `lo`, so an append into the view
+  // lands inside the shared buffer rather than reallocating.
+  let tail = rtSliceSlice(b, 4, 8)
+  if (rtSliceSlice(tail, 0, 60) != 0 && rtSliceSlice(tail, 0, 61) == 0) { ok = ok + 1 }
+  if (rtSliceSlice(b, 5, 4) == 0) { ok = ok + 1 }
+
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// M — maps
+// ---------------------------------------------------------------------------
+
+// Runs the same scripted stream against a port map and a native map, then
+// compares them. Returns the number of properties satisfied.
+function phaseM(rng: []u64): int {
+  let ok = 0
+  let m = rtMapNew(1, 0)          // string keys, scalar values
+  let nat = map<string, int>()
+
+  let lenAgree = 1
+  let getAgree = 1
+  let hasAgree = 1
+
+  let step = 0
+  // Bounded: exactly MAP_STEPS iterations.
+  while (step < MAP_STEPS) {
+    let a = nextRand(rng)
+    let b = nextRand(rng)
+    let op = a % 10
+    // Keys drawn from a space smaller than the step count, so overwrites and
+    // deletes of live keys both happen for real rather than by luck.
+    let k = "k${b % 250}"
+    let km = mine(k)
+    // EVERY STORED VALUE IS NON-ZERO. That is what makes the native map a
+    // presence oracle: an absent key reads as V's zero value (SPEC §11.2), so
+    // `nat[k] != 0` is exactly "k is live" — which `delete` then makes false.
+    // Without this, `has` could only be compared against the port's own answer,
+    // which is no test at all.
+    let val = b % 1000000 + 1
+
+    if (op < 6) {
+      rtMapSet(m, km, val)
+      nat[k] = val
+    } else if (op < 8) {
+      if (rtMapGet(m, km) != nat[k]) {
+        getAgree = 0
+      }
+      if (rtMapHas(m, km) != (nat[k] != 0)) {
+        hasAgree = 0
+      }
+    } else if (op < 9) {
+      rtMapDelete(m, km)
+      delete(nat, k)
+    } else {
+      if (rtMapLen(m) != len(nat)) {
+        lenAgree = 0
+      }
+    }
+    step = step + 1
+  }
+
+  if (lenAgree == 1) { ok = ok + 1 }
+  if (getAgree == 1) { ok = ok + 1 }
+  if (rtMapLen(m) == len(nat)) { ok = ok + 1 }
+
+  // THE STRONG ASSERTION: both maps must iterate in the same slot order, with
+  // the same keys and the same values. This is what pins the hash, the probe
+  // sequence, the tombstone policy and the grow schedule simultaneously.
+  let orderAgree = 1
+  let seen = 0
+  let slot = rtMapIterInit(m)
+  for (nk, nv) of nat {
+    if (slot < 0) {
+      orderAgree = 0
+    } else {
+      if (!sameStr(rtMapKeyAt(m, slot), nk)) {
+        orderAgree = 0
+      }
+      if (rtMapValAt(m, slot) != nv) {
+        orderAgree = 0
+      }
+      slot = rtMapIterNext(m, slot)
+      seen = seen + 1
+    }
+  }
+  // Both must be exhausted together: a port that stops early would otherwise
+  // agree on every element it did produce.
+  if (slot != -1) {
+    orderAgree = 0
+  }
+  if (orderAgree == 1 && seen == len(nat)) { ok = ok + 1 }
+
+  // A deleted key must read as absent and as the zero value, and must not
+  // resurrect after the tombstone is reclaimed by a later grow.
+  let gone = mine("k0")
+  rtMapDelete(m, gone)
+  if (!rtMapHas(m, gone) && rtMapGet(m, gone) == 0) { ok = ok + 1 }
+
+  // Scalar-keyed maps take the splitmix64 path instead of Wyhash.
+  let sm = rtMapNew(0, 0)
+  let snat = map<int, int>()
+  let i = 0
+  while (i < 200) {
+    rtMapSet(sm, i * 7, i)
+    snat[i * 7] = i
+    i = i + 1
+  }
+  let sAgree = 1
+  let sslot = rtMapIterInit(sm)
+  for (sk, sv) of snat {
+    if (sslot < 0 || rtMapKeyAt(sm, sslot) != sk || rtMapValAt(sm, sslot) != sv) {
+      sAgree = 0
+    } else {
+      sslot = rtMapIterNext(sm, sslot)
+    }
+  }
+  if (sAgree == 1 && sslot == -1 && rtMapLen(sm) == len(snat)) { ok = ok + 1 }
+
+  return ok
+}
+
+function main() {
+  // Held in `main` for the whole program: only raw, untraced addresses into
+  // these reach the port's collector, so these bindings are what keeps the
+  // arena alive under BIT_GC=stress.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let rng = []u64(1)
+
+  rootBindMemory(int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!rootInit(MARK_STACK)) {
+    print("rootInit failed\n")
+    return
+  }
+  rootConfigure(true, false, MIN_TRIGGER, GROWTH_PCT, false)
+
+  // A second boot must be refused — there is no such thing as rebooting this
+  // runtime, and Zig asserts the same thing.
+  let reboot = 0
+  if (!rootInit(MARK_STACK)) {
+    reboot = 1
+  }
+
+  rng[0] = u64(88172645463325252)
+
+  let w = phaseW()
+  let s = phaseS()
+  let l = phaseL()
+  let m = phaseM(rng)
+
+  // `oom` is part of the line, not a side check: every phase above assumes it
+  // never ran out of arena, and a non-zero value would mean some "0" result was
+  // an allocation failure rather than the behaviour under test.
+  print("wy=${w}/7 str=${s}/24 slc=${l}/10 map=${m}/6 reboot=${reboot} oom=${rootStatOom()}\n")
+}

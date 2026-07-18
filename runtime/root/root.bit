@@ -1,0 +1,1387 @@
+// Stage-2 port of `runtime/root.zig` (#1367): the ABI surface itself — the
+// `bit_rt_*` symbols codegen calls by fixed name, and the process-wide
+// singletons they run on. Both implementations exist during the port; #1369
+// swaps this one into `libbitrt.a` and retires the Zig original.
+//
+// THIS FILE IS A PARTIAL PORT, AND THE BOUNDARY IS DELIBERATE. What is here is
+// the whole of root's *managed-data* surface: the string, slice, map and
+// interface object models, which together are the layouts every compiled Bit
+// program manipulates on every line. What is NOT here is listed in "SEAMS"
+// below, each blocked on a named, still-unported dependency rather than on
+// effort. A half-built subsystem would be worse than a missing one: the ABI is
+// a contract, and a symbol that exists but is wrong is indistinguishable from a
+// correct one until a program miscompiles.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS DIFFERENT FROM THE ZIG, AND WHY (the complete list)
+// ---------------------------------------------------------------------------
+//
+// 1. STATE IS MODULE STATE, NOT A CALLER-OWNED BLOCK. This is the first port to
+//    use §11.11 module-level `let`, and it is the reason #1402 existed: root's
+//    singletons ARE the globalness that #1362/#1363/#1364 each pushed out to
+//    their caller. Every cell below is a scalar or a fixed array of scalars, so
+//    rule 1 (the collector never scans module state) holds by construction —
+//    and it must, because `heapBlock`'s free-list heads point into unmanaged
+//    span memory that carries no object header.
+//
+// 2. TYPE DESCRIPTORS ARE BUILT AT RUNTIME, NOT AT COMPTIME. Zig writes
+//    `TypeInfo.of(...)` as a comptime constant. A module-state initializer must
+//    be a compile-time constant and an array-typed `let` takes none (§11.11
+//    rule 2), so the six descriptors are filled once by `rootInit`. Their
+//    CONTENTS are identical field for field; only the moment of writing moves.
+//    `refArrayInfo` in particular is matched by ADDRESS by the collector, so it
+//    must be a stable cell — which module state is.
+//
+// 3. OUT-OF-MEMORY RETURNS 0 INSTEAD OF PANICKING. `@nosplit` cannot call
+//    `panic` (it is an out-of-line call that can allocate and reach a
+//    safepoint), the same constraint `runtime/chan` documents for send-on-closed
+//    and `runtime/alloc` for its dropped assertions. Every allocating entry
+//    point here returns 0 on exhaustion and bumps `statOom`, so exhaustion stays
+//    VISIBLE (unlike Zig's asserts, which compile out of the shipping build)
+//    rather than silent. Raising it as a real panic belongs to the boot layer
+//    that owns the write path — see SEAM 3.
+//
+// 4. PAGES COME FROM A CALLER-SUPPLIED RESERVE. Unchanged from #1362/#1363 and
+//    forced the same way: `syscall` is Linux-only, `extern function` is
+//    Darwin-only, and both are rejected on the DECLARATION even when never
+//    called, so a platform-free core cannot map its own pages. `rootBindMemory`
+//    takes the reserve; binding a platform provider to it is SEAM 3's job.
+//
+// 5. ADDRESSES ARE SIGNED `int`. Bit's `int` is i64 (§11.1), as in every other
+//    runtime module here. Userspace addresses on all three supported targets are
+//    far below 2^63, so every comparison orders identically to Zig's `usize`.
+//
+// 6. `bit_rt_iface_as_ok`'s FLAG IS PROCESS-WIDE, NOT PER-THREAD. Zig uses a
+//    `threadlocal`. `@threadlocal` is rejected for Mach-O at emission (§11.11),
+//    and aarch64-macos is a required target, so a per-thread cell cannot carry
+//    it portably. This is SOUND ONLY UNDER THE ADJACENCY CONTRACT the ABI
+//    already states for it (§2.2): lowering emits `iface_as` and `iface_as_ok`
+//    back to back with no yield between, so no second assertion can land in the
+//    window. It is nonetheless a WEAKER guarantee than the Zig's under real
+//    multi-threaded mutation, and the honest fix is per-task scratch — see
+//    SEAM 4. Flagged rather than hidden.
+//
+// ---------------------------------------------------------------------------
+// SEAMS — what this file deliberately does not define, and what blocks each
+// ---------------------------------------------------------------------------
+//
+// SEAM 1 — THE NETWORK (12 symbols: `bit_rt_net_listen/local_port/accept/dial/
+//   read/write/udp_bind/udp_send/udp_recv/udp_sender_host/udp_sender_port/
+//   resolve`). `runtime/net.zig` is UNPORTED (#1366). root's net wrappers are
+//   pure marshalling — every one is `net.<call>() catch return -1` — so they are
+//   a mechanical half-hour ONCE net exists and are unwritable before then. They
+//   also need the netpoller, which is itself blocked on #1431. Nothing here
+//   references net, so wiring them later adds symbols without touching a line
+//   of this file.
+//
+// SEAM 2 — THE STOP-THE-WORLD REGISTRY (`bit_rt_gc_thread_enter/thread_exit/
+//   blocking_begin/blocking_end`, and the safepoint handshake). `gc.zig`'s
+//   `World`/`Mutator` (gc.zig:176-350 — `claim`, `release`, `park`,
+//   `stopRequested`, `beginBlocking`, `rendezvous`, `restart`,
+//   `forEachParkedFrame`) is NOT part of the #1363 port: `runtime/gc/gc.bit`
+//   exports the collector core only, and mentions `World` nowhere outside
+//   comments. These four symbols are thin wrappers over exactly that registry,
+//   so they cannot be written before it exists. Porting `World` is a task-sized
+//   piece of work in its own right (it is the multi-thread rendezvous, the part
+//   #1429 just rebuilt), not a subroutine of this one.
+//
+// SEAM 3 — BOOT, PROCESS ENTRY, AND THE PANIC WRITE PATH (`_start`,
+//   `machoMain`, `boot`, `bit_rt_panic/assert/print/eprint`, `bit_rt_os_exit`,
+//   the fs/os/time primitives). All of these bottom out in a WRITE or an EXIT,
+//   which is a `syscall` on Linux and an `extern function` on Darwin — the
+//   platform split every runtime module here already carries, and the reason
+//   `runtime/root/{linux,darwin}/` will exist. They are not blocked on a missing
+//   dependency, only unbuilt: they are the natural second commit, and separating
+//   them keeps the platform-free core provable on all three targets at once,
+//   which is the property that made the same split pay off in #1362.
+//
+// SEAM 4 — PER-GOROUTINE SLOTS (`bit_rt_set_err`/`get_err`,
+//   `bit_rt_chan_recv_ok`). Zig carries these in `threadlocal`s, which Mach-O
+//   refuses. The right home is PER-TASK SCRATCH at the base of the running
+//   task's own stack — the mechanism `runtime/sched`'s `schedCurrentTask` and
+//   `runtime/chan`'s `scratchOf` already establish, and strictly stronger than a
+//   per-worker threadlocal because it survives task migration. Doing it means
+//   extending `chanScratchWords`' layout, which is a SHARED contract with
+//   `runtime/chan`; #1431 is editing that neighbourhood in parallel and a
+//   drive-by change to a shared layout is exactly how two agents produce a
+//   defect that exists only in the combination of their work. Deferred on
+//   purpose, with the mechanism already identified.
+//
+// SEAM 5 — FLOAT TEXT AND THE TRANSCENDENTALS (`bit_rt_string_from_float`,
+//   `bit_rt_parse_float`, `bit_rt_pow/atan2/log/log2/log10`). These are not
+//   marshalling: Zig's `{d}` is a shortest-round-trip (Ryu-class) formatter and
+//   `parseFloat` is a correctly-rounded decimal->binary conversion. A 1-ULP
+//   drift in either FLIPS THE PRINTED STRING, and byte-identical `const_float`
+//   IR dumps are a self-hosting gate — so an approximate port would fail the
+//   gates loudly at best and corrupt a compiler's float constants at worst.
+//   Porting them is a numerics task with its own test vectors. `floatBits`/
+//   `float32Bits` below are the parts that ARE pure bit manipulation.
+
+// SYMBOL PINS CARRY A `bit_rt_root_` PREFIX, NOT THE REAL ABI NAMES.
+//
+// `runtime/root.zig` is still linked into every binary and already defines
+// `bit_rt_map_new`, `bit_rt_slice_get` and the rest; pinning those names here
+// makes every link fail with `DuplicateSymbol` (measured, not predicted). The
+// pins still have to exist — `-O1` splices callee bodies into their callers, so
+// the freestanding emit (#1400) resolves by symbol and refuses on anything
+// unpinned — so they are prefixed instead of dropped.
+//
+// #1369 OWNS THE RENAME: when it retires `root.zig`, each pin below drops its
+// `_root` infix and claims the real ABI name. The prefix is a link-time
+// placeholder, not a second ABI, and no other module should call these by name.
+// `runtime/alloc` is pinned the same way for a different reason — its names
+// were never in the ABI to begin with (ABI.md names no allocator symbol).
+
+import { loadWord, storeWord, loadByte, storeByte, wordAt } from "../gc"
+import {
+  gcInit, gcBindMemory, gcConfigure, gcAlloc, gcAllocRaw, gcOwns, gcWords,
+  gcTiSize, gcTiPtrOffsetsPtr, gcTiPtrOffsetsLen, gcTiNamePtr, gcTiNameLen,
+  gcTiMethodsPtr, gcTiMethodsLen,
+} from "../gc"
+import { heapInit, heapWords } from "../alloc"
+import { spinUnlocked } from "../"
+
+// ---------------------------------------------------------------------------
+// Object layouts (ABI.md §2) — reproduced field for field from `root.zig`
+// ---------------------------------------------------------------------------
+
+// A `string` value: a GC object holding `{ptr, len}` immediately followed by its
+// bytes, with `ptr` addressing those inline bytes. The object is therefore a
+// LEAF — `ptr` is an interior pointer into the object itself, never a separate
+// reference — which is why `stringInfo` carries no pointer offsets. This is also
+// why `bit_rt_string_slice` COPIES instead of sharing: an interior pointer
+// cannot keep a backing object alive (ABI.md §3).
+export const strPtr: int = 0
+export const strLen: int = 8
+export const strHeaderSize: int = 16
+
+// A `[]T` value: `{buf, len, off, cap, is_ref}`. `buf` is a SEPARATE GC object
+// (the header's one traced reference, hence ptr_offsets = [0]) holding
+// `off + cap` words; the view is `buf[off .. off+len]`. A reslice shares `buf`
+// and only moves `off`/`len`/`cap`, so `buf` stays an object BASE and no
+// interior pointer is ever stored as a reference. `len` sits at +8, the same
+// offset as the string header's, so one `slice_len` serves both.
+export const slcBuf: int = 0
+export const slcLen: int = 8
+export const slcOff: int = 16
+export const slcCap: int = 24
+export const slcIsRef: int = 32
+export const slcHeaderSize: int = 40
+
+// A `map<K,V>`: three parallel `cap`-slot buffers plus the bookkeeping. `keys`,
+// `vals` and `ctrl` are all traced bases (ptr_offsets = [0, 8, 16]) — `ctrl` is
+// a leaf buffer but must still be KEPT ALIVE, which only a traced slot does.
+export const mapKeys: int = 0
+export const mapVals: int = 8
+export const mapCtrl: int = 16
+export const mapLen: int = 24
+export const mapCap: int = 32
+export const mapUsed: int = 40
+export const mapKeyIsString: int = 48
+export const mapValIsRef: int = 56
+export const mapHeaderSize: int = 64
+
+// Per-slot state. Linear probing with tombstones; the 7/8 load-factor grow
+// below guarantees an EMPTY slot always exists, which is what makes every probe
+// loop terminate in at most `cap` steps.
+const ctrlEmpty: int = 0
+const ctrlFull: int = 1
+const ctrlTomb: int = 2
+
+// The initial slot count. Power of two, so `& (cap - 1)` is the modulus.
+const mapInitCap: int = 8
+
+// ---------------------------------------------------------------------------
+// Process-wide singletons (§11.11) — root.zig's `g_*`
+// ---------------------------------------------------------------------------
+//
+// Every cell is a scalar or a fixed array of scalars: rule 1 holds, so the
+// collector never scans any of it. That is REQUIRED here, not merely allowed —
+// `heapBlock` holds 37 free-list heads pointing into unmanaged mmap span memory
+// with no object header, and walking one as a reference would decode arbitrary
+// bytes as a GC header.
+//
+// Sizes are literals because a module-state array's length must be a literal,
+// not a `const` (measured: `let a: [N]i64` is E0021). `rootInit` asserts each
+// against the exported width it stands for, so a drift in `gcWords`/`heapWords`
+// fails loudly at boot instead of corrupting memory.
+let gcState: [37]i64          // gcWords
+let heapBlock: [39]i64        // heapWords
+let heapLockCell: i32 = 0
+let listLockCell: i32 = 0
+
+// The six type descriptors, plus the two pointer-offset arrays they name.
+// See `rootInit` for the layout; 7 words is one `TypeInfo` (ABI.md §2).
+let infoBlock: [46]i64
+
+const riString: int = 0
+const riSlice: int = 7
+const riSliceBuf: int = 14
+const riMap: int = 21
+const riMapCtrl: int = 28
+const riRefArray: int = 35
+const riSliceOffs: int = 42   // [0]
+const riMapOffs: int = 43     // [0, 8, 16]
+const riWords: int = 46
+
+// The addresses of `gcState` and `infoBlock`, taken ONCE by `rootInit`.
+//
+// THIS INDIRECTION IS FORCED, and the reason matters. `ptrOf` is REJECTED in a
+// `@nosplit` body (E0075, measured) even on module state, which SPEC §11.11
+// explicitly says is legal there ("`ptrOf` yields its address for the atomic
+// builtins ... legal inside a `@nosplit` body"). Filed as a spec/implementation
+// mismatch rather than worked around silently.
+//
+// And `@nosplit` is NOT optional for the bodies below, it is the correctness
+// property: they hold live object addresses in plain `int` locals, which the
+// stack maps do NOT describe as references (ABI.md §4 names only reference-typed
+// slots). A safepoint firing inside `rtStringConcat` would therefore find no
+// root for the string it has just allocated and sweep it. `@nosplit` is what
+// guarantees no safepoint lands there — so the addresses must be reachable
+// WITHOUT `ptrOf`, i.e. as plain module-state reads plus `wordAt`.
+let gcAddr: i64 = 0
+let infoAddr: i64 = 0
+
+let booted: i64 = 0
+
+// The `ok` of the most recent `bit_rt_iface_as`. Process-wide — see deviation 6.
+let ifaceOk: i64 = 0
+
+// Allocation failures observed since boot. Zig makes OOM fatal; `@nosplit`
+// cannot, so it is counted instead and every allocating entry point returns 0.
+// A non-zero value means some caller got a null it may not have checked.
+let statOom: i64 = 0
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+// Writes one `TypeInfo` (ABI.md §2) at word `at` of `infoBlock`.
+//
+// `name` is carried as an address/length pair exactly as Zig's is; a descriptor
+// with no name passes 0/0. Names are only ever read by
+// `bit_rt_iface_assert`'s message, so a nameless descriptor degrades that
+// message rather than misbehaving.
+@nosplit function writeInfo(base: int, at: int, size: int, offsAddr: int, offsLen: int, nameAddr: int, nameLen: int) {
+  let w = base + at * 8
+  storeWord(w + gcTiSize, size)
+  storeWord(w + gcTiPtrOffsetsPtr, offsAddr)
+  storeWord(w + gcTiPtrOffsetsLen, offsLen)
+  storeWord(w + gcTiNamePtr, nameAddr)
+  storeWord(w + gcTiNameLen, nameLen)
+  storeWord(w + gcTiMethodsPtr, 0)
+  storeWord(w + gcTiMethodsLen, 0)
+}
+
+// Binds the memory the collector carves its heap out of. Separate from
+// `rootInit` for the same reason `gcBindMemory` is separate from `gcInit`: the
+// pages come from a platform provider this core cannot import (deviation 4).
+// MUST be called before `rootInit`.
+export @symbol("bit_rt_root_bind_memory")
+function rootBindMemory(spanAddr: int, spanBytes: int, idxAddr: int, idxBytes: int, pageSize: int) {
+  let g = ptrOf(gcState)
+  gcAddr = int(g)
+  infoAddr = int(ptrOf(infoBlock))
+  gcBindMemory(g, spanAddr, spanBytes, idxAddr, idxBytes, pageSize)
+}
+
+// Boots the allocator, the collector and the type descriptors, in that order.
+//
+// THE ORDER IS LOAD-BEARING AND MATCHES `boot()` EXACTLY: the heap is
+// initialized before the collector, because `gcInit` takes the heap's address
+// and its two lock cells; the descriptors are written before the first
+// allocation, because `gcAlloc` reads a descriptor's size to size the body.
+// A "cleaner" order — descriptors first, say — happens to work today and would
+// break the moment a descriptor is allocated rather than static. Reproduced
+// rather than improved, per the port's standing rule.
+//
+// Returns false if the collector could not start; true otherwise. Calling it
+// twice is refused (Zig asserts `!g_booted`; there is no such thing as
+// rebooting this runtime).
+export @symbol("bit_rt_root_init")
+function rootInit(markStackLen: int): bool {
+  if (booted != 0) {
+    return false
+  }
+  // A drift in either width would silently truncate the block these arrays
+  // stand in for. Literal lengths cannot reference the consts, so check them.
+  if (gcWords != 37 || heapWords != 39) {
+    return false
+  }
+
+  gcAddr = int(ptrOf(gcState))
+  infoAddr = int(ptrOf(infoBlock))
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLockCell)
+  atomicStore(hlk, spinUnlocked)
+  let llk = ptrOf(listLockCell)
+  atomicStore(llk, spinUnlocked)
+
+  let base = infoAddr
+
+  // Pointer-offset arrays, written before the descriptors that name them.
+  storeWord(base + riSliceOffs * 8, 0)
+  storeWord(base + riMapOffs * 8 + 0, 0)
+  storeWord(base + riMapOffs * 8 + 8, 8)
+  storeWord(base + riMapOffs * 8 + 16, 16)
+
+  // `string` and the two element buffers are LEAVES; the three headers carry
+  // the traced offsets. Sizes are the header sizes: a string's inline bytes and
+  // a buffer's words are sized per allocation via `gcAllocRaw`, exactly as the
+  // Zig does with its own 0-size leaf descriptors.
+  writeInfo(base, riString, 0, 0, 0, 0, 0)
+  writeInfo(base, riSlice, slcHeaderSize, base + riSliceOffs * 8, 1, 0, 0)
+  writeInfo(base, riSliceBuf, 0, 0, 0, 0, 0)
+  writeInfo(base, riMap, mapHeaderSize, base + riMapOffs * 8, 3, 0, 0)
+  writeInfo(base, riMapCtrl, 0, 0, 0, 0, 0)
+  // The `ref_array_info` sentinel: matched by ADDRESS by the collector, never
+  // by content, which is why it must be a stable module-state cell.
+  writeInfo(base, riRefArray, 0, 0, 0, 0, 0)
+
+  let g = ptrOf(gcState)
+  if (!gcInit(g, int(hp), int(hlk), int(llk), base + riRefArray * 8, markStackLen)) {
+    return false
+  }
+  booted = 1
+  return true
+}
+
+// `BIT_GC` / `BIT_GC_STATS` equivalents. Split out because reading the
+// environment needs the process entry (SEAM 3); the values are handed in.
+export @symbol("bit_rt_root_configure")
+function rootConfigure(enabled: bool, stress: bool, minTrigger: int, growthPct: int, verbose: bool) {
+  let g = ptrOf(gcState)
+  gcConfigure(g, enabled, stress, minTrigger, growthPct, verbose)
+}
+
+// Allocation failures since boot. Zero on any run that did not exhaust memory;
+// see deviation 3.
+export @nosplit @symbol("bit_rt_root_stat_oom")
+function rootStatOom(): int {
+  return statOom
+}
+
+// ---------------------------------------------------------------------------
+// Allocation
+// ---------------------------------------------------------------------------
+
+// `bit_rt_gc_alloc` (ABI.md §2/§6): a zeroed body of the type `infoAddr`
+// describes. 0 on exhaustion (deviation 3).
+//
+// Zig also registers the calling thread as a mutator here, because the
+// allocation door is reached long before the first safepoint and an
+// unregistered allocator is one the rendezvous does not wait for. That
+// registration is SEAM 2 — it needs `World`, which is unported. On a
+// single-worker runtime (ABI.md §5 pins nthreads to 1) there is exactly one
+// allocating thread, so nothing is lost TODAY; wiring `World` must restore this
+// call, and this comment is here so that is not forgotten.
+export @nosplit @symbol("bit_rt_root_gc_alloc")
+function rtGcAlloc(info: int): int {
+  let g = wordAt(gcAddr)
+  let body = gcAlloc(g, info)
+  if (body == 0) {
+    statOom = statOom + 1
+  }
+  return body
+}
+
+// A `len`-byte string body: the `{ptr, len}` header followed by the bytes, with
+// `ptr` addressing them. Returns the object address, or 0 on exhaustion.
+@nosplit function allocString(nbytes: int): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let body = gcAllocRaw(g, strHeaderSize + nbytes, base + riString * 8)
+  if (body == 0) {
+    statOom = statOom + 1
+    return 0
+  }
+  storeWord(body + strPtr, body + strHeaderSize)
+  storeWord(body + strLen, nbytes)
+  return body
+}
+
+// A `cap`-word element buffer. A ref buffer carries the `ref_array_info`
+// descriptor so the collector traces its words as roots (ABI.md §2); a non-ref
+// buffer is a leaf. `cap == 0` yields a valid zero-length body — never indexed,
+// because every bounds check rejects it.
+@nosplit function allocBuf(words: int, isRef: bool): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let info = base + riSliceBuf * 8
+  if (isRef) {
+    info = base + riRefArray * 8
+  }
+  let body = gcAllocRaw(g, words * 8, info)
+  if (body == 0) {
+    statOom = statOom + 1
+  }
+  return body
+}
+
+// ---------------------------------------------------------------------------
+// Strings (ABI.md §2)
+// ---------------------------------------------------------------------------
+
+// Copies `n` bytes from `src` to `dst`. Ascending, and the two regions here are
+// always disjoint (a fresh object and an existing one), so no overlap rule is
+// needed. Bounded by `n`.
+@nosplit function copyBytes(dst: int, src: int, n: int) {
+  let i = 0
+  while (i < n) {
+    let b = loadByte(src + i)
+    storeByte(dst + i, b)
+    i = i + 1
+  }
+}
+
+@nosplit function strBytes(s: int): int {
+  let p = loadWord(s + strPtr)
+  return p
+}
+
+@nosplit function strSize(s: int): int {
+  let n = loadWord(s + strLen)
+  return n
+}
+
+// `bit_rt_string_concat` (ABI.md §2): a fresh string holding `a` then `b`.
+// Binary — lowering folds an N-part interpolation into a chain of these.
+export @nosplit @symbol("bit_rt_root_string_concat")
+function rtStringConcat(a: int, b: int): int {
+  let an = strSize(a)
+  let bn = strSize(b)
+  let out = allocString(an + bn)
+  if (out == 0) {
+    return 0
+  }
+  let dst = strBytes(out)
+  copyBytes(dst, strBytes(a), an)
+  copyBytes(dst + an, strBytes(b), bn)
+  return out
+}
+
+// `bit_rt_string_eq` (ABI.md §2): byte-wise equality; backs string `==`/`!=`.
+export @nosplit @symbol("bit_rt_root_string_eq")
+function rtStringEq(a: int, b: int): bool {
+  let an = strSize(a)
+  let bn = strSize(b)
+  if (an != bn) {
+    return false
+  }
+  let pa = strBytes(a)
+  let pb = strBytes(b)
+  let i = 0
+  while (i < an) {
+    let x = loadByte(pa + i)
+    let y = loadByte(pb + i)
+    if (x != y) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// `bit_rt_string_byte` (ABI.md §2): the byte at `index`, backing `s[i]` (SPEC
+// §12.2 — result type `u8`). Out of range is a panic in Zig; `@nosplit` cannot
+// panic, so it returns -1, a value no byte can take. See deviation 3.
+export @nosplit @symbol("bit_rt_root_string_byte")
+function rtStringByte(s: int, index: int): int {
+  let n = strSize(s)
+  if (index < 0 || index >= n) {
+    return -1
+  }
+  let b = loadByte(strBytes(s) + index)
+  return b
+}
+
+// `bit_rt_string_slice` (ABI.md §2): `s[lo:hi]` (SPEC §12.6) — a fresh string
+// holding bytes `[lo, hi)`. COPIES rather than sharing `s`'s buffer: a string
+// header's `ptr` is an interior pointer into its own object, so a shared view
+// could not keep the backing alive. Returns 0 unless `0 <= lo <= hi <= len`.
+export @nosplit @symbol("bit_rt_root_string_slice")
+function rtStringSlice(s: int, lo: int, hi: int): int {
+  let n = strSize(s)
+  if (lo < 0 || lo > hi || hi > n) {
+    return 0
+  }
+  let out = allocString(hi - lo)
+  if (out == 0) {
+    return 0
+  }
+  copyBytes(strBytes(out), strBytes(s) + lo, hi - lo)
+  return out
+}
+
+// `bit_rt_string_from_int`: the decimal text of `v`.
+//
+// Digits are generated least-significant first into a scratch cell and reversed,
+// the standard shape. The negative branch NEGATES INTO u64 rather than into
+// `int`, because i64's most negative value has no positive counterpart —
+// `-(-9223372036854775808)` overflows and would print garbage for exactly one
+// input. Zig's formatter handles this internally; here it is explicit.
+export @nosplit @symbol("bit_rt_root_string_from_int")
+function rtStringFromInt(v: int): int {
+  let neg = v < 0
+  let mag: u64 = u64(v)
+  if (neg) {
+    mag = u64(0) - u64(v)
+  }
+
+  // Count the digits first, then write them into the string from the END
+  // backwards. Zig generates least-significant-first into a scratch buffer and
+  // reverses; that needs an addressable local array, which Bit does not have
+  // (`ptrOf` takes a slice or module state, E0053) — and a module-state scratch
+  // would make this entry point non-reentrant for the sake of a buffer. Two
+  // passes over at most 20 digits is the cheaper trade and needs no storage.
+  let ndigits = 1
+  let probe = mag / u64(10)
+  // Bounded: at most 20 decimal digits fit in a u64.
+  while (probe > u64(0)) {
+    ndigits = ndigits + 1
+    probe = probe / u64(10)
+  }
+  let total = ndigits
+  if (neg) {
+    total = total + 1
+  }
+
+  let out = allocString(total)
+  if (out == 0) {
+    return 0
+  }
+  let dst = strBytes(out)
+  if (neg) {
+    storeByte(dst, 45)
+  }
+  let at = total
+  let rest = mag
+  // Bounded by `ndigits`, computed above from the same value.
+  let k = 0
+  while (k < ndigits) {
+    let q = rest / u64(10)
+    let r = rest - q * u64(10)
+    at = at - 1
+    storeByte(dst + at, 48 + int(r))
+    rest = q
+    k = k + 1
+  }
+  return out
+}
+
+// `bit_rt_string_from_bool`.
+export @nosplit @symbol("bit_rt_root_string_from_bool")
+function rtStringFromBool(v: bool): int {
+  if (v) {
+    let t = allocString(4)
+    if (t == 0) {
+      return 0
+    }
+    let p = strBytes(t)
+    storeByte(p + 0, 116)
+    storeByte(p + 1, 114)
+    storeByte(p + 2, 117)
+    storeByte(p + 3, 101)
+    return t
+  }
+  let f = allocString(5)
+  if (f == 0) {
+    return 0
+  }
+  let q = strBytes(f)
+  storeByte(q + 0, 102)
+  storeByte(q + 1, 97)
+  storeByte(q + 2, 108)
+  storeByte(q + 3, 115)
+  storeByte(q + 4, 101)
+  return f
+}
+
+// `bit_rt_bytes_from_string` (ABI.md §2): `[]byte(s)` (SPEC §12.9) — a fresh
+// `[]u8` whose element `i` is `s[i]`. Slices are WORD-stored, so each byte
+// lands zero-extended in its own word and the buffer is a leaf.
+export @nosplit @symbol("bit_rt_root_bytes_from_string")
+function rtBytesFromString(s: int): int {
+  let n = strSize(s)
+  let h = rtSliceNew(n, n, 0)
+  if (h == 0) {
+    return 0
+  }
+  let buf = loadWord(h + slcBuf)
+  let src = strBytes(s)
+  let i = 0
+  while (i < n) {
+    let b = loadByte(src + i)
+    storeWord(buf + i * 8, b)
+    i = i + 1
+  }
+  return h
+}
+
+// `bit_rt_string_from_bytes` (ABI.md §2): `string(b)` for a `[]u8` (SPEC §12.9)
+// — a fresh string whose byte `i` is the LOW BYTE of element word `i`.
+export @nosplit @symbol("bit_rt_root_string_from_bytes")
+function rtStringFromBytes(h: int): int {
+  let n = loadWord(h + slcLen)
+  let off = loadWord(h + slcOff)
+  let buf = loadWord(h + slcBuf)
+  let out = allocString(n)
+  if (out == 0) {
+    return 0
+  }
+  let dst = strBytes(out)
+  let i = 0
+  while (i < n) {
+    let w = loadWord(buf + (off + i) * 8)
+    storeByte(dst + i, w & 255)
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Slices (ABI.md §2)
+// ---------------------------------------------------------------------------
+
+// `bit_rt_slice_new`: a fresh `[]T` of length `len`, capacity `max(len, cap)`,
+// elements zeroed. Backs slice literals (`len == cap == N`) and `[]T(n[, m])`.
+export @nosplit @symbol("bit_rt_root_slice_new")
+function rtSliceNew(want: int, capWant: int, isRef: int): int {
+  let c = capWant
+  if (c < want) {
+    c = want
+  }
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let h = gcAlloc(g, base + riSlice * 8)
+  if (h == 0) {
+    statOom = statOom + 1
+    return 0
+  }
+  let buf = allocBuf(c, isRef != 0)
+  if (buf == 0) {
+    return 0
+  }
+  storeWord(h + slcBuf, buf)
+  storeWord(h + slcLen, want)
+  storeWord(h + slcOff, 0)
+  storeWord(h + slcCap, c)
+  storeWord(h + slcIsRef, isRef)
+  return h
+}
+
+// `bit_rt_slice_append`: appends one word, DOUBLING FROM 1 when full. A grow
+// reallocates from the current view and resets `off` to 0. Mutates the header in
+// place and returns it, so `s = append(s, x)` observes the new length and buffer
+// through the same value — which is also why `append` aliases its argument's
+// backing, a documented hazard for callers.
+export @nosplit @symbol("bit_rt_root_slice_append")
+function rtSliceAppend(h: int, word: int): int {
+  let vlen = loadWord(h + slcLen)
+  let vcap = loadWord(h + slcCap)
+  let off = loadWord(h + slcOff)
+  if (vlen == vcap) {
+    let newcap = vcap * 2
+    if (vcap == 0) {
+      newcap = 1
+    }
+    let isRef = loadWord(h + slcIsRef)
+    let nb = allocBuf(newcap, isRef != 0)
+    if (nb == 0) {
+      return 0
+    }
+    let old = loadWord(h + slcBuf)
+    let i = 0
+    while (i < vlen) {
+      let w = loadWord(old + (off + i) * 8)
+      storeWord(nb + i * 8, w)
+      i = i + 1
+    }
+    storeWord(h + slcBuf, nb)
+    storeWord(h + slcOff, 0)
+    storeWord(h + slcCap, newcap)
+    off = 0
+  }
+  let buf = loadWord(h + slcBuf)
+  storeWord(buf + (off + vlen) * 8, word)
+  storeWord(h + slcLen, vlen + 1)
+  return h
+}
+
+// `bit_rt_slice_get`: bounds-checked element read. Zig panics out of range;
+// see deviation 3 — `ok` is reported through `rtSliceInBounds` for a caller that
+// must distinguish, and the value reads 0.
+export @nosplit @symbol("bit_rt_root_slice_get")
+function rtSliceGet(h: int, index: int): int {
+  let vlen = loadWord(h + slcLen)
+  if (index < 0 || index >= vlen) {
+    return 0
+  }
+  let off = loadWord(h + slcOff)
+  let buf = loadWord(h + slcBuf)
+  let w = loadWord(buf + (off + index) * 8)
+  return w
+}
+
+// Whether `index` is a legal element of `h`. The predicate Zig's bounds check
+// panics on, exposed so the panic can be raised by the layer that owns the
+// write path (SEAM 3) rather than swallowed here.
+export @nosplit @symbol("bit_rt_root_slice_in_bounds")
+function rtSliceInBounds(h: int, index: int): bool {
+  let vlen = loadWord(h + slcLen)
+  return index >= 0 && index < vlen
+}
+
+// `bit_rt_slice_set`: bounds-checked element write. Out of range is a no-op
+// (deviation 3); `rtSliceInBounds` is the check a caller raises on.
+export @nosplit @symbol("bit_rt_root_slice_set")
+function rtSliceSet(h: int, index: int, word: int) {
+  let vlen = loadWord(h + slcLen)
+  if (index < 0 || index >= vlen) {
+    return
+  }
+  let off = loadWord(h + slcOff)
+  let buf = loadWord(h + slcBuf)
+  storeWord(buf + (off + index) * 8, word)
+}
+
+// `bit_rt_slice_slice`: `s[lo:hi]` (SPEC §12.6). SHARES `s`'s buffer; the new
+// view is `buf[off+lo .. off+hi]` with capacity extending to the old end
+// (`cap - lo`, Go semantics). Returns 0 unless `0 <= lo <= hi <= cap`.
+export @nosplit @symbol("bit_rt_root_slice_slice")
+function rtSliceSlice(h: int, lo: int, hi: int): int {
+  let vcap = loadWord(h + slcCap)
+  if (lo < 0 || lo > hi || hi > vcap) {
+    return 0
+  }
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let nh = gcAlloc(g, base + riSlice * 8)
+  if (nh == 0) {
+    statOom = statOom + 1
+    return 0
+  }
+  let off = loadWord(h + slcOff)
+  storeWord(nh + slcBuf, loadWord(h + slcBuf))
+  storeWord(nh + slcLen, hi - lo)
+  storeWord(nh + slcOff, off + lo)
+  storeWord(nh + slcCap, vcap - lo)
+  storeWord(nh + slcIsRef, loadWord(h + slcIsRef))
+  return nh
+}
+
+// ---------------------------------------------------------------------------
+// Wyhash (final version 4) — the string-key hash
+// ---------------------------------------------------------------------------
+//
+// Ported from the pinned Zig stdlib's `std/hash/wyhash.zig`, which
+// `root.zig`'s `mapHash` calls, and NOT from memory of the upstream C: the two
+// have diverged across versions and only the exact routine the Zig calls
+// produces the same slot order. `tests/stress/rootmap` checks the port against
+// the SEVEN OFFICIAL TEST VECTORS from wangyi-fudan's `test_vector.cpp` that
+// Zig's own unit test uses, which is an oracle independent of this codebase.
+//
+// Only the one-shot `hash(seed, input)` path is ported. The streaming
+// `update`/`final` half exists for incremental hashing, which no map key needs.
+
+const wySecret0: u64 = 0xa0761d6478bd642f
+const wySecret1: u64 = 0xe7037ed1a0b428db
+const wySecret2: u64 = 0x8ebc6af09c88c6e3
+const wySecret3: u64 = 0x589965cc75374cc3
+
+// The high 64 bits of the 128-bit product `a * b`, via 32-bit limbs.
+//
+// Bit has no u128 and no widening multiply, so the schoolbook decomposition is
+// the only route. The carry out of the middle sum is the step that is easy to
+// drop — and dropping it is invisible on small inputs, which is exactly why the
+// test vectors (all four length classes) are the guard rather than a spot check.
+@nosplit function mulHi(a: u64, b: u64): u64 {
+  let lo32: u64 = 0xffffffff
+  let a0 = a & lo32
+  let a1 = a >> 32
+  let b0 = b & lo32
+  let b1 = b >> 32
+  let p00 = a0 * b0
+  let p01 = a0 * b1
+  let p10 = a1 * b0
+  let p11 = a1 * b1
+  let mid = (p00 >> 32) + (p01 & lo32) + (p10 & lo32)
+  return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
+}
+
+// Zig's `mix`: the low and high halves of the 128-bit product, xored.
+@nosplit function wyMix(a: u64, b: u64): u64 {
+  let lo = a * b
+  let hi = mulHi(a, b)
+  return lo ^ hi
+}
+
+// `n` little-endian bytes at `addr`, zero-extended. `n <= 8`.
+@nosplit function readLe(addr: int, n: int): u64 {
+  let v: u64 = 0
+  let i = 0
+  while (i < n) {
+    let b = loadByte(addr + i)
+    v = v | (u64(b) << u64(i * 8))
+    i = i + 1
+  }
+  return v
+}
+
+// Wyhash over the `len` bytes at `addr`, seed 0 — the exact call `root.zig`'s
+// `mapHash` makes.
+//
+// The state is three cells rather than a `[3]u64` because a local fixed array
+// is not addressable the way module state is; the round below is unrolled over
+// them, which is what Zig's `inline for (0..3)` compiles to anyway.
+@nosplit function wyhash(addr: int, vlen: int, seed: u64): u64 {
+  let s0 = seed ^ wyMix(seed ^ wySecret0, wySecret1)
+  let s1 = s0
+  let s2 = s0
+  let a: u64 = 0
+  let b: u64 = 0
+
+  if (vlen <= 16) {
+    // smallKey
+    if (vlen >= 4) {
+      let end = vlen - 4
+      let quarter = (vlen >> 3) << 2
+      a = (readLe(addr, 4) << 32) | readLe(addr + quarter, 4)
+      b = (readLe(addr + end, 4) << 32) | readLe(addr + end - quarter, 4)
+    } else if (vlen > 0) {
+      let c0 = loadByte(addr)
+      let c1 = loadByte(addr + (vlen >> 1))
+      let c2 = loadByte(addr + vlen - 1)
+      a = (u64(c0) << 16) | (u64(c1) << 8) | u64(c2)
+      b = 0
+    } else {
+      a = 0
+      b = 0
+    }
+  } else {
+    let i = 0
+    if (vlen >= 48) {
+      // round(): three independent lanes per 48-byte block.
+      while (i + 48 < vlen) {
+        let r0 = readLe(addr + i + 0, 8)
+        let r1 = readLe(addr + i + 8, 8)
+        s0 = wyMix(r0 ^ wySecret1, r1 ^ s0)
+        let r2 = readLe(addr + i + 16, 8)
+        let r3 = readLe(addr + i + 24, 8)
+        s1 = wyMix(r2 ^ wySecret2, r3 ^ s1)
+        let r4 = readLe(addr + i + 32, 8)
+        let r5 = readLe(addr + i + 40, 8)
+        s2 = wyMix(r4 ^ wySecret3, r5 ^ s2)
+        i = i + 48
+      }
+      // final0
+      s0 = s0 ^ (s1 ^ s2)
+    }
+    // final1, with `start_pos = i` over the whole input.
+    let j = i
+    while (j + 16 < vlen) {
+      let x = readLe(addr + j, 8)
+      let y = readLe(addr + j + 8, 8)
+      s0 = wyMix(x ^ wySecret1, y ^ s0)
+      j = j + 16
+    }
+    a = readLe(addr + vlen - 16, 8)
+    b = readLe(addr + vlen - 8, 8)
+  }
+
+  // final2
+  a = a ^ wySecret1
+  b = b ^ s0
+  let lo = a * b
+  let hi = mulHi(a, b)
+  a = lo
+  b = hi
+  return wyMix(a ^ wySecret0 ^ u64(vlen), b ^ wySecret1)
+}
+
+// ---------------------------------------------------------------------------
+// Maps (SPEC §11.2, §13.5; ABI.md §15)
+// ---------------------------------------------------------------------------
+
+// Wyhash over the bytes of a `string`, at an explicit seed. Exists so the
+// official test vectors can drive the exact routine `mapHash` uses, rather than
+// a copy of it that could drift.
+export @nosplit @symbol("bit_rt_root_wyhash_string")
+function rtWyhashString(s: int, seed: u64): u64 {
+  let p = strBytes(s)
+  let n = strSize(s)
+  return wyhash(p, n, seed)
+}
+
+// splitmix64's finalizer: cheap avalanche so low-entropy integer keys (0,1,2,…)
+// do not cluster in the low probe bins. Identical constants to the Zig.
+@nosplit function scalarHash(key: u64): u64 {
+  let x = key
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+  x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+  return x ^ (x >> 31)
+}
+
+// A key's hash: a `string` key hashes its BYTES (so two equal strings at
+// different addresses collide correctly), a scalar hashes by value.
+@nosplit function mapHash(m: int, key: int): u64 {
+  if (loadWord(m + mapKeyIsString) != 0) {
+    let p = strBytes(key)
+    let n = strSize(key)
+    return wyhash(p, n, u64(0))
+  }
+  return scalarHash(u64(key))
+}
+
+// Key equality, matching `mapHash`'s notion of identity.
+@nosplit function mapKeyEq(m: int, a: int, b: int): bool {
+  if (loadWord(m + mapKeyIsString) != 0) {
+    return rtStringEq(a, b)
+  }
+  return a == b
+}
+
+// Locates `key`'s slot. Returns the slot index; `mapProbeFound` reports whether
+// it holds the key. When it does not, the slot is where the key BELONGS — the
+// first tombstone seen, else the terminating EMPTY.
+//
+// Split into two calls rather than a two-result return because the pair is read
+// immediately and adjacently at every call site, and a struct return would be a
+// traced type this `@nosplit` body cannot hold. `probeFound` is written by
+// `mapProbe` and read by the very next statement, with no allocation, no
+// safepoint and no call in between — the same adjacency the ABI already relies
+// on for `iface_as_ok`.
+let probeFound: i64 = 0
+
+@nosplit function mapProbe(m: int, key: int): int {
+  let vcap = loadWord(m + mapCap)
+  let mask = vcap - 1
+  let ctrl = loadWord(m + mapCtrl)
+  let keys = loadWord(m + mapKeys)
+  let i = int(mapHash(m, key) & u64(mask))
+  let firstTomb = vcap    // sentinel: "none seen"
+  let steps = 0
+  // Bounded by `cap`: the 7/8 load factor guarantees an EMPTY slot exists.
+  while (steps < vcap) {
+    let c = loadByte(ctrl + i)
+    if (c == ctrlEmpty) {
+      probeFound = 0
+      if (firstTomb != vcap) {
+        return firstTomb
+      }
+      return i
+    }
+    if (c == ctrlTomb) {
+      if (firstTomb == vcap) {
+        firstTomb = i
+      }
+    } else {
+      let k = loadWord(keys + i * 8)
+      if (mapKeyEq(m, k, key)) {
+        probeFound = 1
+        return i
+      }
+    }
+    i = (i + 1) & mask
+    steps = steps + 1
+  }
+  // Unreachable: the load factor guarantees an EMPTY slot. Zig panics here;
+  // reporting "not found" at the last slot is the non-panicking equivalent and
+  // cannot corrupt — a caller inserting there overwrites one entry rather than
+  // running off the buffer.
+  probeFound = 0
+  return vcap - 1
+}
+
+@nosplit function allocCtrl(vcap: int): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let body = gcAllocRaw(g, vcap, base + riMapCtrl * 8)
+  if (body == 0) {
+    statOom = statOom + 1
+  }
+  // Zeroed by gcAllocRaw, so every slot starts CtrlEmpty.
+  return body
+}
+
+// Doubles `cap`, rehashes every FULL slot and drops tombstones.
+//
+// Reinsertion probes the NEW table linearly from the key's hash and stops at the
+// first non-FULL slot. It cannot encounter a tombstone (the new ctrl buffer is
+// freshly zeroed), which is why this loop is simpler than `mapProbe` and still
+// correct.
+@nosplit function mapGrow(m: int): bool {
+  let vcap = loadWord(m + mapCap)
+  let newcap = vcap * 2
+  let keyIsString = loadWord(m + mapKeyIsString)
+  let valIsRef = loadWord(m + mapValIsRef)
+  let nkeys = allocBuf(newcap, keyIsString != 0)
+  if (nkeys == 0) {
+    return false
+  }
+  let nvals = allocBuf(newcap, valIsRef != 0)
+  if (nvals == 0) {
+    return false
+  }
+  let nctrl = allocCtrl(newcap)
+  if (nctrl == 0) {
+    return false
+  }
+  let mask = newcap - 1
+  let keys = loadWord(m + mapKeys)
+  let vals = loadWord(m + mapVals)
+  let ctrl = loadWord(m + mapCtrl)
+  let i = 0
+  // Bounded by the old capacity.
+  while (i < vcap) {
+    let c = loadByte(ctrl + i)
+    if (c == ctrlFull) {
+      let key = loadWord(keys + i * 8)
+      let j = int(mapHash(m, key) & u64(mask))
+      // Bounded: the new table is half empty, so an open slot is always near.
+      while (loadByte(nctrl + j) == ctrlFull) {
+        j = (j + 1) & mask
+      }
+      storeWord(nkeys + j * 8, key)
+      storeWord(nvals + j * 8, loadWord(vals + i * 8))
+      storeByte(nctrl + j, ctrlFull)
+    }
+    i = i + 1
+  }
+  storeWord(m + mapKeys, nkeys)
+  storeWord(m + mapVals, nvals)
+  storeWord(m + mapCtrl, nctrl)
+  storeWord(m + mapCap, newcap)
+  // Tombstones reclaimed: `used` falls back to the live count.
+  storeWord(m + mapUsed, loadWord(m + mapLen))
+  return true
+}
+
+// `bit_rt_map_new`: an empty map. `keyIsString`/`valIsRef` (0/1) are fixed by
+// K/V at the call site and decide hashing, equality and GC tracing.
+export @nosplit @symbol("bit_rt_root_map_new")
+function rtMapNew(keyIsString: int, valIsRef: int): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let m = gcAlloc(g, base + riMap * 8)
+  if (m == 0) {
+    statOom = statOom + 1
+    return 0
+  }
+  let keys = allocBuf(mapInitCap, keyIsString != 0)
+  if (keys == 0) {
+    return 0
+  }
+  let vals = allocBuf(mapInitCap, valIsRef != 0)
+  if (vals == 0) {
+    return 0
+  }
+  let ctrl = allocCtrl(mapInitCap)
+  if (ctrl == 0) {
+    return 0
+  }
+  storeWord(m + mapKeys, keys)
+  storeWord(m + mapVals, vals)
+  storeWord(m + mapCtrl, ctrl)
+  storeWord(m + mapLen, 0)
+  storeWord(m + mapCap, mapInitCap)
+  storeWord(m + mapUsed, 0)
+  storeWord(m + mapKeyIsString, keyIsString)
+  storeWord(m + mapValIsRef, valIsRef)
+  return m
+}
+
+// `bit_rt_map_set`: insert or overwrite `m[key] = val`.
+//
+// THE GROW TEST RUNS BEFORE THE PROBE, exactly as the Zig's does, and the order
+// is observable: growing first means the slot the probe returns is a slot in the
+// NEW table. Probing first and then growing would insert at a stale index.
+// Reusing a TOMB keeps `used` unchanged — only an EMPTY slot is newly consumed,
+// which is what makes tombstones cost capacity until the next grow rather than
+// forever.
+export @nosplit @symbol("bit_rt_root_map_set")
+function rtMapSet(m: int, key: int, val: int) {
+  if (m == 0) {
+    return
+  }
+  let used = loadWord(m + mapUsed)
+  let vcap = loadWord(m + mapCap)
+  if ((used + 1) * 8 >= vcap * 7) {
+    if (!mapGrow(m)) {
+      return
+    }
+  }
+  let slot = mapProbe(m, key)
+  if (probeFound == 0) {
+    let ctrl = loadWord(m + mapCtrl)
+    if (loadByte(ctrl + slot) == ctrlEmpty) {
+      storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
+    }
+    storeByte(ctrl + slot, ctrlFull)
+    storeWord(m + mapLen, loadWord(m + mapLen) + 1)
+  }
+  storeWord(loadWord(m + mapKeys) + slot * 8, key)
+  storeWord(loadWord(m + mapVals) + slot * 8, val)
+}
+
+// `bit_rt_map_get`: `m[key]`, or the zero word when absent (SPEC §11.2 — an
+// absent key reads as V's zero value). A nil map reads as empty.
+export @nosplit @symbol("bit_rt_root_map_get")
+function rtMapGet(m: int, key: int): int {
+  if (m == 0) {
+    return 0
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return 0
+  }
+  let slot = mapProbe(m, key)
+  if (probeFound == 0) {
+    return 0
+  }
+  let v = loadWord(loadWord(m + mapVals) + slot * 8)
+  return v
+}
+
+// `bit_rt_map_has`: presence test (backs the two-result form and `delete`).
+export @nosplit @symbol("bit_rt_root_map_has")
+function rtMapHas(m: int, key: int): bool {
+  if (m == 0) {
+    return false
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return false
+  }
+  let slot = mapProbe(m, key)
+  return probeFound != 0
+}
+
+// `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
+//
+// Leaves a TOMBSTONE (reclaimed at the next grow) and DROPS THE SLOT'S KEY AND
+// VALUE WORDS. The drop is not tidiness: those words live in traced ref buffers,
+// so leaving them would keep a removed key or value reachable and unreclaimable
+// for the lifetime of the map.
+export @nosplit @symbol("bit_rt_root_map_delete")
+function rtMapDelete(m: int, key: int) {
+  if (m == 0) {
+    return
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return
+  }
+  let slot = mapProbe(m, key)
+  if (probeFound == 0) {
+    return
+  }
+  storeByte(loadWord(m + mapCtrl) + slot, ctrlTomb)
+  storeWord(loadWord(m + mapKeys) + slot * 8, 0)
+  storeWord(loadWord(m + mapVals) + slot * 8, 0)
+  storeWord(m + mapLen, loadWord(m + mapLen) - 1)
+}
+
+// `bit_rt_map_len`: `len(m)` — live entry count (nil map => 0).
+export @nosplit @symbol("bit_rt_root_map_len")
+function rtMapLen(m: int): int {
+  if (m == 0) {
+    return 0
+  }
+  let n = loadWord(m + mapLen)
+  return n
+}
+
+// Iteration (`for k of m`, §13.5): `iterInit` yields the first FULL slot or -1,
+// `iterNext` the next FULL slot after `prev` or -1. Slot order is unspecified
+// and a concurrent insert may rehash — iteration assumes no mutation, per spec.
+export @nosplit @symbol("bit_rt_root_map_iter_init")
+function rtMapIterInit(m: int): int {
+  return rtMapIterNext(m, -1)
+}
+
+export @nosplit @symbol("bit_rt_root_map_iter_next")
+function rtMapIterNext(m: int, prev: int): int {
+  if (m == 0) {
+    return -1
+  }
+  let vcap = loadWord(m + mapCap)
+  let ctrl = loadWord(m + mapCtrl)
+  let i = prev + 1
+  while (i < vcap) {
+    if (loadByte(ctrl + i) == ctrlFull) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+export @nosplit @symbol("bit_rt_root_map_key_at")
+function rtMapKeyAt(m: int, slot: int): int {
+  let k = loadWord(loadWord(m + mapKeys) + slot * 8)
+  return k
+}
+
+export @nosplit @symbol("bit_rt_root_map_val_at")
+function rtMapValAt(m: int, slot: int): int {
+  let v = loadWord(loadWord(m + mapVals) + slot * 8)
+  return v
+}
+
+// ---------------------------------------------------------------------------
+// Interfaces (ABI.md §2.1, §2.2)
+// ---------------------------------------------------------------------------
+
+// One method-table entry: `{id, fn_ptr}`.
+const miId: int = 0
+const miFn: int = 8
+const miStride: int = 16
+
+// `bit_rt_iface_lookup` (ABI.md §2.1): resolve an interface method call to a
+// concrete method's code address. LINEARLY scans the receiver type's method
+// table — types have few methods, so this is a short, allocation-free walk, and
+// the linear order is part of the contract (a table with duplicate ids resolves
+// to the first, on both implementations).
+//
+// The checker guarantees the receiver satisfies the interface, so a miss is a
+// COMPILER BUG. Zig makes it fatal; `@nosplit` cannot, so it returns 0 — which
+// faults immediately at the indirect call rather than dispatching to something
+// arbitrary. Loud either way, and never silently wrong.
+export @nosplit @symbol("bit_rt_root_iface_lookup")
+function rtIfaceLookup(infoAddr: int, id: int): int {
+  let base = loadWord(infoAddr + gcTiMethodsPtr)
+  let n = loadWord(infoAddr + gcTiMethodsLen)
+  let i = 0
+  while (i < n) {
+    let at = base + i * miStride
+    if (loadWord(at + miId) == id) {
+      let f = loadWord(at + miFn)
+      return f
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The dynamic type of an interface value, or 0 if it does not name a live
+// managed object.
+//
+// An interface value IS its receiver pointer (ABI.md §2.1), so its dynamic type
+// is the `TypeInfo` in that object's GC header. But a nil interface is a null
+// word, and a reference-typed value NEED NOT BE A GC OBJECT AT ALL — a `chan`
+// is not — so the header is only safe to read once `gcOwns` confirms this
+// address is exactly a live object's body. Skipping that check is the difference
+// between a type assertion and reading arbitrary memory as a descriptor.
+@nosplit function dynTypeOf(recv: int): int {
+  if (recv == 0) {
+    return 0
+  }
+  let g = wordAt(gcAddr)
+  if (!gcOwns(g, recv)) {
+    return 0
+  }
+  // ABI.md §1: the header sits immediately below the body, `info` at its base.
+  let info = loadWord(recv - 32)
+  return info
+}
+
+// `bit_rt_iface_as` (ABI.md §2.2): the two-result assertion
+// `let (v, ok) = iface.(T)` (SPEC §14.4). `TypeInfo`s are per concrete type, so
+// DESCRIPTOR IDENTITY IS TYPE IDENTITY.
+//
+// NULL ON A MISMATCH IS LOAD-BEARING, not tidiness: the result is typed `T`, so
+// handing back the un-narrowed receiver would let a caller that ignores `ok`
+// read a `Square` as a `Circle`. Null is `T`'s zero value.
+export @nosplit @symbol("bit_rt_root_iface_as")
+function rtIfaceAs(recv: int, want: int): int {
+  let info = dynTypeOf(recv)
+  if (info == 0) {
+    ifaceOk = 0
+    return 0
+  }
+  if (info == want) {
+    ifaceOk = 1
+    return recv
+  }
+  ifaceOk = 0
+  return 0
+}
+
+// `bit_rt_iface_as_ok` (ABI.md §2.2): the `ok` of the `bit_rt_iface_as`
+// immediately preceding it. Lowering emits the two back to back, so no other
+// assertion can land in between — see deviation 6 for why that adjacency is
+// carrying more weight here than in the Zig.
+export @nosplit @symbol("bit_rt_root_iface_as_ok")
+function rtIfaceAsOk(): bool {
+  return ifaceOk != 0
+}
+
+// `bit_rt_iface_assert` (ABI.md §2.2): the one-result assertion
+// `let v = iface.(T)` (SPEC §14.4), which panics on a mismatch (§18.4).
+//
+// Returns the narrowed receiver, or 0 on a mismatch. Zig formats and raises the
+// message here; that needs the write path (SEAM 3), so the SPLIT is: this
+// decides, `rtIfaceAssertFailed` reports, and the caller raises. Keeping the
+// decision here means the two implementations agree on WHAT fails even while
+// they differ on how it is announced.
+export @nosplit @symbol("bit_rt_root_iface_assert")
+function rtIfaceAssert(recv: int, want: int): int {
+  let info = dynTypeOf(recv)
+  if (info != 0 && info == want) {
+    return recv
+  }
+  return 0
+}
+
+// Whether the last `rtIfaceAssert` would have panicked. Same adjacency contract
+// as `rtIfaceAsOk`.
+export @nosplit @symbol("bit_rt_root_iface_assert_failed")
+function rtIfaceAssertFailed(recv: int, want: int): bool {
+  let info = dynTypeOf(recv)
+  return info == 0 || info != want
+}
+
+// The name a descriptor carries, as a fresh `string` — what
+// `bit_rt_iface_assert`'s message interpolates. 0 when the descriptor is
+// nameless.
+export @symbol("bit_rt_root_type_name")
+function rtTypeName(infoAddr: int): int {
+  if (infoAddr == 0) {
+    return 0
+  }
+  let p = loadWord(infoAddr + gcTiNamePtr)
+  let n = loadWord(infoAddr + gcTiNameLen)
+  let out = allocString(n)
+  if (out == 0) {
+    return 0
+  }
+  copyBytes(strBytes(out), p, n)
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Floats and host identity (ABI.md §14, §19)
+// ---------------------------------------------------------------------------
+
+// `bit_rt_float_bits` / `bit_rt_float32_bits` (ABI.md §14): an IEEE-754 value's
+// raw bit pattern. Bit has no bitcast operator and `u64(x)` is a NUMERIC
+// conversion (it truncates), so a compiler written in Bit cannot otherwise
+// materialize a float constant into a register — the backends need exactly these
+// bits to emit `movz`/`movk` + `fmov`.
+//
+// `floatBits` is already a runtime primitive, so these are the ABI's names for
+// it rather than a reimplementation: reimplementing a bitcast in terms of
+// arithmetic is precisely the 1-ULP hazard SEAM 5 exists to avoid.
+export @symbol("bit_rt_root_float_bits")
+function rtFloatBits(v: f64): u64 {
+  return floatBits(v)
+}
+
+// `bit_rt_host_target` (ABI.md §19): the BuildTarget ordinal of the host this
+// binary runs on — 0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos, matching
+// selfhost/main.bit's BuildTarget enum. The archive is compiled once per target,
+// so the host IS the target.
+export @symbol("bit_rt_root_host_target")
+function rtHostTarget(): int {
+  return hostTarget()
+}
