@@ -130,6 +130,7 @@ pub const Kind = enum {
     fat_arrow,
     question,
     arrow_left,
+    at,
 };
 
 const keywords = std.StaticStringMap(Kind).initComptime(.{
@@ -320,6 +321,7 @@ pub const Lexer = struct {
             '&' => return self.op1eq2(.amp, '&', .amp_amp, '=', .amp_eq),
             '|' => return self.op1eq2(.pipe, '|', .pipe_pipe, '=', .pipe_eq),
             '^' => return self.opEq(.caret, .caret_eq),
+            '@' => return self.op(1, .at),
             '~' => return self.op(1, .tilde),
             '!' => return self.opEq(.bang, .bang_eq),
             '=' => {
@@ -961,7 +963,8 @@ test "error: bad escape reported, lexing continues" {
 }
 
 test "error: stray byte reported, lexing continues" {
-    try lexErr("a @ b", .unexpected_character, 1);
+    // `#` is the stray byte here: `@` became a real token with §10.3.1 attributes.
+    try lexErr("a # b", .unexpected_character, 1);
 }
 
 test "error: invalid number (C-octal and bad separator)" {

@@ -452,6 +452,11 @@ pub const Function = struct {
     param_types: []const TypeId,
     result: TypeId,
     is_fallible: bool,
+    /// §10.3.1 @naked: codegen suppresses the prologue/epilogue and emits no
+    /// implicit `ret`. @nosplit: codegen omits the back-edge safepoint. Neither
+    /// is part of the IR dump, so an attr-less corpus stays byte-identical.
+    is_naked: bool = false,
+    is_nosplit: bool = false,
     err_ty: TypeId,
     blocks: []const BasicBlock,
     entry: BlockId,

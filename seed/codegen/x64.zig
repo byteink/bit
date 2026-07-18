@@ -1690,8 +1690,15 @@ fn isBackEdge(self: *const Ctx, target: ir.BlockId) bool {
     return @intFromEnum(target) <= self.cur_block_idx;
 }
 
+/// §10.3.1: a @naked or @nosplit function emits no back-edge safepoint. The
+/// recording side (`collectSafepoints`/`scanFuncFlags`) gates on the identical
+/// predicate so the safepoint-position array stays in lockstep with emission.
+fn needsNoSafepoints(f: *const ir.Function) bool {
+    return f.is_naked or f.is_nosplit;
+}
+
 fn emitJump(self: *Ctx, target: ir.BlockId, args: []const u32) !void {
-    if (isBackEdge(self, target)) try emitCallLike(self, "bit_rt_safepoint", &.{}, null);
+    if (isBackEdge(self, target) and !needsNoSafepoints(self.f)) try emitCallLike(self, "bit_rt_safepoint", &.{}, null);
     try emitParamMoves(self, target, args);
     try self.jmpRel32(target);
 }
@@ -1700,11 +1707,11 @@ fn emitBr(self: *Ctx, cond: ir.ValueId, then_blk: ir.BlockId, then_args: []const
     const c = try getInt(self, vregOf(self, cond), scratch1);
     try self.testRR(c, c);
     const skip_off = try self.emitCondJumpPlaceholder(CC.e);
-    if (isBackEdge(self, then_blk)) try emitCallLike(self, "bit_rt_safepoint", &.{}, null);
+    if (isBackEdge(self, then_blk) and !needsNoSafepoints(self.f)) try emitCallLike(self, "bit_rt_safepoint", &.{}, null);
     try emitParamMoves(self, then_blk, then_args);
     try self.jmpRel32(then_blk);
     self.patchRel32Here(skip_off);
-    if (isBackEdge(self, else_blk)) try emitCallLike(self, "bit_rt_safepoint", &.{}, null);
+    if (isBackEdge(self, else_blk) and !needsNoSafepoints(self.f)) try emitCallLike(self, "bit_rt_safepoint", &.{}, null);
     try emitParamMoves(self, else_blk, else_args);
     try self.jmpRel32(else_blk);
 }
@@ -1727,7 +1734,9 @@ fn emitRet(self: *Ctx, vals: []const u32) !void {
             },
         }
     }
-    try emitEpilogue(self);
+    // §10.3.1 @naked: no epilogue teardown — the value is already in rax/xmm0;
+    // emit only the raw `ret`.
+    if (!self.f.is_naked) try emitEpilogue(self);
     try self.ret();
 }
 
@@ -2206,14 +2215,17 @@ fn collectSafepoints(gpa: Allocator, f: *const ir.Function) Allocator.Error![]u3
         while (i < end) : (i += 1) {
             switch (f.insts.items(.op)[i]) {
                 .call, .rt_call, .gc_alloc, .make_closure, .call_value, .call_iface => try out.append(gpa, @intCast(i)),
+                // Back-edge safepoints are suppressed for @naked/@nosplit — gate
+                // recording on the same predicate as emission (emitJump/emitBr)
+                // so the position array and the emitted calls stay in lockstep.
                 .jump => {
                     const j = f.decode(@enumFromInt(i)).jump;
-                    if (@intFromEnum(j.target) <= bi) try out.append(gpa, @intCast(i));
+                    if (@intFromEnum(j.target) <= bi and !needsNoSafepoints(f)) try out.append(gpa, @intCast(i));
                 },
                 .br => {
                     const b = f.decode(@enumFromInt(i)).br;
-                    if (@intFromEnum(b.then_blk) <= bi) try out.append(gpa, @intCast(i));
-                    if (@intFromEnum(b.else_blk) <= bi) try out.append(gpa, @intCast(i));
+                    if (@intFromEnum(b.then_blk) <= bi and !needsNoSafepoints(f)) try out.append(gpa, @intCast(i));
+                    if (@intFromEnum(b.else_blk) <= bi and !needsNoSafepoints(f)) try out.append(gpa, @intCast(i));
                 },
                 else => {},
             }
@@ -2245,13 +2257,16 @@ fn scanFuncFlags(f: *const ir.Function) FuncFlags {
                     const b = f.decode(@enumFromInt(i)).bin;
                     if (constShiftAmount(f, b.rhs) == null) flags.needs_rcx = true;
                 },
+                // Same gate as `collectSafepoints`: a @naked/@nosplit function
+                // takes no back-edge safepoint, so it never forces the
+                // callee-saved-only register file (`buildIntRegs`).
                 .jump => {
                     const j = f.decode(@enumFromInt(i)).jump;
-                    if (@intFromEnum(j.target) <= bi) flags.has_safepoints = true;
+                    if (@intFromEnum(j.target) <= bi and !needsNoSafepoints(f)) flags.has_safepoints = true;
                 },
                 .br => {
                     const b = f.decode(@enumFromInt(i)).br;
-                    if (@intFromEnum(b.then_blk) <= bi or @intFromEnum(b.else_blk) <= bi) flags.has_safepoints = true;
+                    if ((@intFromEnum(b.then_blk) <= bi or @intFromEnum(b.else_blk) <= bi) and !needsNoSafepoints(f)) flags.has_safepoints = true;
                 },
                 else => {},
             }
@@ -2491,6 +2506,12 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         .frame_size = alignFrame(raw_frame, @intCast(saved_gpr.len)),
     };
 
+    // §10.3.1 @naked safety net: a naked function suppresses its prologue, so a
+    // non-empty frame (spill slot or saved register) would silently corrupt the
+    // caller. Rules 1+2 make this unreachable; fail loudly if that ever changes.
+    if (f.is_naked and (frame.frame_size != 0 or saved_gpr.len != 0 or saved_xmm.len != 0))
+        return error.UnsupportedConstruct;
+
     const inst_to_vreg = try gpa.alloc(u32, f.insts.len);
     errdefer gpa.free(inst_to_vreg);
     for (0..f.insts.len) |i| inst_to_vreg[i] = @intCast(i);
@@ -2521,7 +2542,7 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         ctx.owned_syms.deinit(gpa);
     }
 
-    try emitPrologue(&ctx);
+    if (!f.is_naked) try emitPrologue(&ctx);
     try bindIncomingArgs(&ctx);
     for (f.blocks, 0..) |blk, bi| {
         ctx.cur_block_idx = @intCast(bi);

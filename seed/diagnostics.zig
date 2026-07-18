@@ -92,6 +92,9 @@ pub const Code = enum(u16) {
     non_exhaustive_match = 71,
     invalid_array_element = 72,
     not_stringable = 73,
+    naked_fn_invalid = 74,
+    nosplit_calls_allocating = 75,
+    unknown_attribute = 76,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {
@@ -429,20 +432,20 @@ test "pretty output matches golden (colors off)" {
     const gpa = testing.allocator;
     var sm = SourceManager.init(gpa);
     defer sm.deinit();
-    const file = try sm.addFile("test.bit", "let x = @\n");
+    const file = try sm.addFile("test.bit", "let x = #\n");
 
     var diags = Diagnostics.init(gpa, &sm);
     defer diags.deinit();
-    // '@' is at byte offset 8; single-char span.
-    try diags.report(.unexpected_character, .{ .file = file, .start = 8, .end = 9 }, "unexpected character '@'", "expected an expression");
+    // '#' is at byte offset 8; single-char span.
+    try diags.report(.unexpected_character, .{ .file = file, .start = 8, .end = 9 }, "unexpected character '#'", "expected an expression");
 
     const out = try render(gpa, &diags);
     defer gpa.free(out);
     const expected =
-        "error[E0001]: unexpected character '@'\n" ++
+        "error[E0001]: unexpected character '#'\n" ++
         " --> test.bit:1:9\n" ++
         "  |\n" ++
-        "1 | let x = @\n" ++
+        "1 | let x = #\n" ++
         "  |         ^ expected an expression\n";
     try testing.expectEqualStrings(expected, out);
 }
@@ -451,8 +454,8 @@ test "caret aligns under tabs" {
     const gpa = testing.allocator;
     var sm = SourceManager.init(gpa);
     defer sm.deinit();
-    // A leading tab then "let x = @"; '@' is at byte offset 9.
-    const file = try sm.addFile("t.bit", "\tlet x = @\n");
+    // A leading tab then "let x = #"; '#' is at byte offset 9.
+    const file = try sm.addFile("t.bit", "\tlet x = #\n");
 
     var diags = Diagnostics.init(gpa, &sm);
     defer diags.deinit();
@@ -464,7 +467,7 @@ test "caret aligns under tabs" {
         "error[E0001]: bad\n" ++
         " --> t.bit:1:10\n" ++
         "  |\n" ++
-        "1 | \tlet x = @\n" ++
+        "1 | \tlet x = #\n" ++
         "  | \t        ^\n";
     try testing.expectEqualStrings(expected, out);
 }
@@ -488,7 +491,7 @@ test "JSON output is LSP-shaped with 0-based range" {
     const gpa = testing.allocator;
     var sm = SourceManager.init(gpa);
     defer sm.deinit();
-    const file = try sm.addFile("test.bit", "let x = @\n");
+    const file = try sm.addFile("test.bit", "let x = #\n");
 
     var diags = Diagnostics.init(gpa, &sm);
     defer diags.deinit();

@@ -561,7 +561,12 @@ fn rebuild(gpa: Allocator, f: *const ir.Function, known: []const ?ConstVal, bloc
         }
         bldr.endBlock();
     }
-    return bldr.finish(f.name, f.param_types, f.result, f.is_fallible, f.err_ty, block_map[@intFromEnum(f.entry)]);
+    var out = try bldr.finish(f.name, f.param_types, f.result, f.is_fallible, f.err_ty, block_map[@intFromEnum(f.entry)]);
+    // §10.3.1: carry the decl-only attribute flags across the rebuild — codegen
+    // reads them to gate the prologue/epilogue and back-edge safepoints.
+    out.is_naked = f.is_naked;
+    out.is_nosplit = f.is_nosplit;
+    return out;
 }
 
 // ============================================================================
@@ -809,7 +814,12 @@ fn inlineCalls(gpa: Allocator, module: *const ir.Module, fid: ir.FuncId) !ir.Fun
         }
         bldr.endBlock();
     }
-    return bldr.finish(f.name, f.param_types, f.result, f.is_fallible, f.err_ty, block_map[@intFromEnum(f.entry)]);
+    var out = try bldr.finish(f.name, f.param_types, f.result, f.is_fallible, f.err_ty, block_map[@intFromEnum(f.entry)]);
+    // §10.3.1: carry the decl-only attribute flags across the rebuild — codegen
+    // reads them to gate the prologue/epilogue and back-edge safepoints.
+    out.is_naked = f.is_naked;
+    out.is_nosplit = f.is_nosplit;
+    return out;
 }
 
 // ============================================================================

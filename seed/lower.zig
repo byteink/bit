@@ -415,9 +415,23 @@ pub const Lowerer = struct {
     /// it serves both free functions (via `lowerFunction`) and methods (whose
     /// signature comes from the receiver's method set, not `func_sigs`). Binds
     /// the receiver (if the decl has one) as the leading parameter.
+    /// §10.3.1: true if the func_decl carries `@want` in its trailing attr_list
+    /// (the 7th child, elided for attr-less functions).
+    fn funcHasAttr(mf: ModuleFile, decl: ast.Index, want: []const u8) bool {
+        const k = mf.tree.kids(decl);
+        if (k.len <= 6 or k[6] == ast.none) return false;
+        for (mf.tree.kids(k[6])) |a| {
+            const ak = mf.tree.kids(a); // [name_ident]
+            if (std.mem.eql(u8, identTextOf(mf, ak[0]), want)) return true;
+        }
+        return false;
+    }
+
     fn lowerFunctionDecl(self: *Lowerer, file_idx: usize, decl: ast.Index, shape: check.FuncShape, gen_env: GenericEnv, name: []const u8) Error!ir.Function {
         const mf = self.files[file_idx];
-        const k = mf.tree.kids(decl); // [recv_or_none, name, generics, params, result_or_none, body]
+        const k = mf.tree.kids(decl); // [recv_or_none, name, generics, params, result_or_none, body, attrs_or_none]
+        const is_naked = funcHasAttr(mf, decl, "naked");
+        const is_nosplit = funcHasAttr(mf, decl, "nosplit");
 
         var b = ir.FunctionBuilder.init(self.gpa);
         errdefer b.deinit(self.gpa); // freed here only if lowering errors before finish
@@ -471,6 +485,12 @@ pub const Lowerer = struct {
 
         try fc.lowerStmtList(k[5]);
         if (!fc.terminated) {
+            // A naked fn must end in `return` (checker E0074 rule 2 + E0055 rule
+            // 3), so this is unreachable for one — refuse rather than emit a
+            // frameless object with no `ret` at all (Power-of-10: assert, don't
+            // paper over). Lowering only runs on a clean check, so the invariant
+            // holds; the assert guards a future relaxation of the body rule.
+            std.debug.assert(!is_naked);
             // Falling off the end of a `()!` function is an ok-void return, so
             // clear the pending error before returning (§18: ok ⇒ slot null).
             try fc.runDefers();
@@ -479,7 +499,10 @@ pub const Lowerer = struct {
         }
         b.endBlock();
 
-        return b.finish(name, param_types.items, result_ty, is_fallible, err_ty, entry);
+        var f = try b.finish(name, param_types.items, result_ty, is_fallible, err_ty, entry);
+        f.is_naked = is_naked;
+        f.is_nosplit = is_nosplit;
+        return f;
     }
 
     /// Lowers one `arrow_fn`'s body as its own `ir.Function`, appended

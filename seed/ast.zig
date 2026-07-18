@@ -66,7 +66,9 @@ pub const Tag = enum {
     binding, // [pattern, type_or_none, init_or_none]
     tuple_pat, // [pat...]
     type_alias, // [name_ident, generics_or_none, type]
-    func_decl, // [recv_or_none, name_ident, generics_or_none, params, result_or_none, body]
+    func_decl, // [recv_or_none, name_ident, generics_or_none, params, result_or_none, body, attrs_or_none]
+    attr_list, // [attr...]
+    attr, // [name_ident]                   `@naked`, `@nosplit` (§10.3.1)
     receiver, // [name_ident, type]
     params, // [param...]
     param, // [name_ident, type]

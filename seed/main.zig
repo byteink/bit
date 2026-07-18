@@ -1145,14 +1145,15 @@ test "version string is non-empty" {
 
 test "compileReport flags an error and renders its diagnostic" {
     const gpa = std.testing.allocator;
-    const report = try compileReport(gpa, "t.bit", "let x = @\n");
+    // `#` is the stray byte here: `@` became a real token with §10.3.1 attributes.
+    const report = try compileReport(gpa, "t.bit", "let x = #\n");
     defer gpa.free(report.text);
     try std.testing.expect(report.failed);
     try std.testing.expectEqualStrings(
-        "error[E0001]: unexpected character '@'\n" ++
+        "error[E0001]: unexpected character '#'\n" ++
             " --> t.bit:1:9\n" ++
             "  |\n" ++
-            "1 | let x = @\n" ++
+            "1 | let x = #\n" ++
             "  |         ^ remove this character\n",
         report.text,
     );

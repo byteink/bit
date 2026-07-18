@@ -1767,8 +1767,15 @@ fn isBackEdge(cur_block: usize, target: ir.BlockId) bool {
     return @intFromEnum(target) <= cur_block;
 }
 
+/// §10.3.1: a @naked or @nosplit function emits no back-edge safepoint. The
+/// recording side (`buildIntervals`) gates on the identical predicate so the
+/// safepoint-position array stays in lockstep with emission.
+fn needsNoSafepoints(f: *const ir.Function) bool {
+    return f.is_naked or f.is_nosplit;
+}
+
 fn emitBackEdgeSafepointIfNeeded(self: *Ctx, cur_block: usize, target: ir.BlockId) !void {
-    if (!isBackEdge(cur_block, target)) return;
+    if (!isBackEdge(cur_block, target) or needsNoSafepoints(self.f)) return;
     try emitCall(self, null, .invalid, safepoint_symbol, &.{}, true);
 }
 
@@ -1790,11 +1797,15 @@ fn moveBlockArgs(self: *Ctx, target: ir.BlockId, args: []const u32) !void {
 }
 
 fn emitEpilogueAndRet(self: *Ctx) !void {
-    for (self.frame.saved_fpr, 0..) |r, i| try self.loadImmF(r, reg_sp, self.frame.fprSaveOffset(i), 8);
-    for (self.frame.saved_gpr, 0..) |r, i| try self.loadImm(r, reg_sp, self.frame.gprSaveOffset(i), 8, false);
-    try self.loadImm(.x29, reg_sp, self.frame.fpOffset(), 8, false);
-    try self.loadImm(.x30, reg_sp, self.frame.lrOffset(), 8, false);
-    try self.addSubImmWide(false, reg_sp, reg_sp, self.frame.frame_size);
+    // §10.3.1 @naked: no frame was set up, so restore nothing — emit only the
+    // raw `ret` (the return value is already in x0/v0).
+    if (!self.f.is_naked) {
+        for (self.frame.saved_fpr, 0..) |r, i| try self.loadImmF(r, reg_sp, self.frame.fprSaveOffset(i), 8);
+        for (self.frame.saved_gpr, 0..) |r, i| try self.loadImm(r, reg_sp, self.frame.gprSaveOffset(i), 8, false);
+        try self.loadImm(.x29, reg_sp, self.frame.fpOffset(), 8, false);
+        try self.loadImm(.x30, reg_sp, self.frame.lrOffset(), 8, false);
+        try self.addSubImmWide(false, reg_sp, reg_sp, self.frame.frame_size);
+    }
     try self.ret();
 }
 
@@ -2020,10 +2031,13 @@ fn buildIntervals(gpa: Allocator, tctx: *const TypeContext, f: *const ir.Functio
             const dd = f.decode(id);
             extendUses(intervals, idx, dd);
             switch (dd) {
-                .jump => |j| if (isBackEdge(bi, j.target)) try safepoints.append(gpa, idx),
+                // Back-edge safepoints are suppressed for @naked/@nosplit — gate
+                // recording on the same predicate as emission so the position
+                // array and the emitted `bl`s stay in lockstep (§10.3.1).
+                .jump => |j| if (isBackEdge(bi, j.target) and !needsNoSafepoints(f)) try safepoints.append(gpa, idx),
                 .br => |br_| {
-                    if (isBackEdge(bi, br_.then_blk)) try safepoints.append(gpa, idx);
-                    if (isBackEdge(bi, br_.else_blk)) try safepoints.append(gpa, idx);
+                    if (isBackEdge(bi, br_.then_blk) and !needsNoSafepoints(f)) try safepoints.append(gpa, idx);
+                    if (isBackEdge(bi, br_.else_blk) and !needsNoSafepoints(f)) try safepoints.append(gpa, idx);
                 },
                 else => {},
             }
@@ -2249,6 +2263,14 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
         .frame_size = frame_size,
     };
 
+    // §10.3.1 @naked safety net: a naked function suppresses its prologue, so a
+    // spill slot, saved register, or outgoing-arg area would silently corrupt the
+    // caller. (frame_size itself is never 0 here — arm64 always budgets the
+    // 16-byte frame record — but a naked fn allocates none of it.) Rules 1+2 make
+    // this unreachable; fail loudly if that ever changes.
+    if (f.is_naked and (result.num_spill_slots != 0 or saved_gpr_len != 0 or saved_fpr_len != 0 or outgoing_bytes != 0))
+        return error.UnsupportedConstruct;
+
     const inst_to_vreg = try gpa.alloc(u32, intervals.len);
     defer gpa.free(inst_to_vreg);
     for (0..intervals.len) |i| inst_to_vreg[i] = @intCast(i);
@@ -2276,12 +2298,16 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     defer ctx.safepoints.deinit(gpa);
 
     // ---- prologue: establish the frame record, save used registers -----
-    try ctx.addSubImmWide(true, reg_sp, reg_sp, frame_size);
-    try ctx.storeImm(.x30, reg_sp, frame.lrOffset(), 8);
-    try ctx.storeImm(.x29, reg_sp, frame.fpOffset(), 8);
-    try ctx.addSubImmWide(false, 29, reg_sp, frame.fpOffset());
-    for (frame.saved_gpr, 0..) |r, gi| try ctx.storeImm(r, reg_sp, frame.gprSaveOffset(gi), 8);
-    for (frame.saved_fpr, 0..) |r, fi| try ctx.storeImmF(r, reg_sp, frame.fprSaveOffset(fi), 8);
+    // §10.3.1 @naked: suppressed entirely — a naked function runs on its
+    // caller's frame and returns via a raw `ret`.
+    if (!f.is_naked) {
+        try ctx.addSubImmWide(true, reg_sp, reg_sp, frame_size);
+        try ctx.storeImm(.x30, reg_sp, frame.lrOffset(), 8);
+        try ctx.storeImm(.x29, reg_sp, frame.fpOffset(), 8);
+        try ctx.addSubImmWide(false, 29, reg_sp, frame.fpOffset());
+        for (frame.saved_gpr, 0..) |r, gi| try ctx.storeImm(r, reg_sp, frame.gprSaveOffset(gi), 8);
+        for (frame.saved_fpr, 0..) |r, fi| try ctx.storeImmF(r, reg_sp, frame.fprSaveOffset(fi), 8);
+    }
 
     // ---- bind incoming arguments into the entry block's params ---------
     {

@@ -698,6 +698,7 @@ const Printer = struct {
 
             .func_decl => {
                 const k = self.kids(idx);
+                if (k.len > 6 and k[6] != none) try self.printNode(k[6]);
                 try self.raw("function ");
                 if (k[0] != none) {
                     try self.raw("(");
@@ -808,6 +809,14 @@ const Printer = struct {
             .constraint => try self.printFlatList(self.kids(idx), " & "),
             .@"export" => {
                 try self.raw("export ");
+                try self.printNode(self.kids(idx)[0]);
+            },
+            .attr_list => for (self.kids(idx)) |a| {
+                try self.printNode(a);
+                try self.raw(" ");
+            },
+            .attr => {
+                try self.raw("@");
                 try self.printNode(self.kids(idx)[0]);
             },
             .fallible => {

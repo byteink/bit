@@ -180,6 +180,13 @@ pub const FuncShape = struct {
     result: TypeId,
 };
 
+/// Decl-only function attributes (§10.3.1). Kept separate from `FuncShape`
+/// since attributes are not part of a function's *type*.
+pub const FuncAttrs = struct {
+    naked: bool = false,
+    nosplit: bool = false,
+};
+
 pub const TypeData = union(enum) {
     invalid,
     /// The absent result type (§10.3: omitted result = "void"); never
@@ -442,6 +449,11 @@ pub const TypeContext = struct {
     /// GlobalSymbol.pack() -> signature, for every func_decl (free function or
     /// method) and every generic function's own template signature.
     func_sigs: std.AutoHashMapUnmanaged(u64, FuncShape) = .{},
+    /// GlobalSymbol.pack() -> `@naked`/`@nosplit` flags, for every free function
+    /// that carries an attribute. Kept off `FuncShape` (which also backs
+    /// structural closure types) so a decl-only flag never leaks into type
+    /// identity. Absent entry = no attributes (§10.3.1).
+    func_attrs: std.AutoHashMapUnmanaged(u64, FuncAttrs) = .{},
     /// GlobalSymbol.pack() -> resolved type, for every top-level `const`. The
     /// only value binding memoized project-wide (a module's per-binding
     /// `var_types` dies with its `Checker`), so a dependent module can type a
@@ -535,6 +547,7 @@ pub const TypeContext = struct {
         self.types.deinit();
         self.decl_memo.deinit(self.gpa);
         self.func_sigs.deinit(self.gpa);
+        self.func_attrs.deinit(self.gpa);
         self.const_types.deinit(self.gpa);
         var mit = self.method_sets.valueIterator();
         while (mit.next()) |bucket| bucket.deinit(self.gpa);
@@ -1760,9 +1773,28 @@ const Checker = struct {
         return dupe(self.ctx.arena(), GenericBinding, bindings);
     }
 
+    /// Resolves an `attr_list` node into flags, reporting E0076 for any name
+    /// other than `naked`/`nosplit` (§10.3.1). Neither v1 attribute takes args.
+    fn collectAttrs(self: *Checker, file_idx: usize, list_idx: ast.Index) Error!FuncAttrs {
+        const mf = self.files[file_idx];
+        var attrs: FuncAttrs = .{};
+        for (mf.tree.kids(list_idx)) |a_idx| {
+            const ak = mf.tree.kids(a_idx); // [name_ident]
+            const name = Checker.identText(mf, ak[0]);
+            if (std.mem.eql(u8, name, "naked")) {
+                attrs.naked = true;
+            } else if (std.mem.eql(u8, name, "nosplit")) {
+                attrs.nosplit = true;
+            } else {
+                try self.emit(mf, ak[0], .unknown_attribute, "unknown attribute '@{s}'", .{name}, "the recognized attributes are @naked and @nosplit");
+            }
+        }
+        return attrs;
+    }
+
     fn collectFuncDecl(self: *Checker, file_idx: usize, idx: ast.Index, exported: bool) Error!void {
         const mf = self.files[file_idx];
-        const k = mf.tree.kids(idx); // [recv, name, generics, params, result, body]
+        const k = mf.tree.kids(idx); // [recv, name, generics, params, result, body, attrs_or_none]
         const is_method = k[0] != ast.none;
         var gsym: ?GlobalSymbol = null;
         const env: GenericEnv = if (is_method)
@@ -1788,10 +1820,23 @@ const Checker = struct {
             .result = result,
         };
 
+        // §10.3.1: capture @naked/@nosplit off the trailing k[6] child into the
+        // side-table, before any body is checked so the nosplit one-hop callee
+        // lookup sees every function's flags regardless of source order.
+        var fattrs: FuncAttrs = .{};
+        if (k.len > 6 and k[6] != ast.none) fattrs = try self.collectAttrs(file_idx, k[6]);
+
         if (!is_method) {
+            if (fattrs.naked or fattrs.nosplit)
+                try self.ctx.func_attrs.put(self.gpa, gsym.?.pack(), fattrs);
             try self.ctx.func_sigs.put(self.gpa, gsym.?.pack(), shape);
             return;
         }
+        // v1: attributes attach to free functions only.
+        if (fattrs.naked)
+            try self.emit(mf, k[1], .naked_fn_invalid, "naked function '{s}' cannot be a method", .{Checker.identText(mf, k[1])}, null);
+        if (fattrs.nosplit)
+            try self.emit(mf, k[1], .nosplit_calls_allocating, "nosplit function '{s}' cannot be a method", .{Checker.identText(mf, k[1])}, null);
 
         const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
         const recv_ty = try self.checkType(file_idx, rk[1], env);
@@ -4783,6 +4828,7 @@ const Checker = struct {
         var env: GenericEnv = &.{};
         var params: []const TypeId = &.{};
         var result: TypeId = self.ctx.void_id;
+        var fattrs: FuncAttrs = .{};
 
         if (is_method) {
             const mc = self.method_ctx.get(packFileNode(file_idx, idx)) orelse return; // receiver type failed to resolve; already diagnosed
@@ -4801,6 +4847,7 @@ const Checker = struct {
             const shape = self.ctx.func_sigs.get(gsym.pack()) orelse return;
             params = shape.params;
             result = shape.result;
+            if (self.ctx.func_attrs.get(gsym.pack())) |fa| fattrs = fa;
         }
 
         const param_nodes = mf.tree.kids(k[3]);
@@ -4830,8 +4877,92 @@ const Checker = struct {
         const fctx = FnCtx{ .env = env, .result_ty = result_ty, .err_ty = err_ty };
         try self.checkBlock(file_idx, k[5], fctx);
 
-        if (result_ty != self.ctx.void_id and result_ty != .invalid and !self.diverges(file_idx, k[5], false)) {
+        // §10.3.1 @naked: also require a naked *void* fn to end in `return` —
+        // lowering emits no implicit `ret` for a naked fn, so falling off the
+        // end silently builds an object with no `ret` at all.
+        if ((result_ty != self.ctx.void_id or fattrs.naked) and result_ty != .invalid and !self.diverges(file_idx, k[5], false)) {
             try self.emit(mf, k[1], .missing_return, "missing return: not every path returns a value", .{}, null);
+        }
+
+        if (fattrs.naked) try self.checkNakedFn(file_idx, idx, result);
+        if (fattrs.nosplit) try self.checkNosplitFn(file_idx, idx);
+    }
+
+    /// §10.3.1 @naked: restricted signature (no receiver/generics/params, void
+    /// or scalar result) and a return-only body — there is no prologue, so any
+    /// local, spill, or control flow has nowhere to live.
+    fn checkNakedFn(self: *Checker, file_idx: usize, idx: ast.Index, result: TypeId) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [recv, name, generics, params, result, body, attrs]
+        const name = Checker.identText(mf, k[1]);
+        if (k[2] != ast.none)
+            try self.emit(mf, k[1], .naked_fn_invalid, "naked function '{s}' cannot be generic", .{name}, null);
+        if (mf.tree.kids(k[3]).len != 0)
+            try self.emit(mf, k[1], .naked_fn_invalid, "naked function '{s}' cannot take parameters", .{name}, null);
+        if (result != self.ctx.void_id and result != .invalid and !self.isScalarValueType(result))
+            try self.emit(mf, k[1], .naked_fn_invalid, "naked function '{s}' must return void or a scalar value", .{name}, null);
+        for (mf.tree.kids(k[5])) |stmt| {
+            if (mf.tree.get(stmt).tag != .return_stmt)
+                try self.emit(mf, stmt, .naked_fn_invalid, "a naked function body may contain only 'return' statements", .{}, null);
+        }
+    }
+
+    /// §10.3.1 @nosplit: a default-deny allowlist over the body. Every construct
+    /// that could allocate or reach a safepoint (composite/slice/map literals,
+    /// indexing, `append`, `spawn`, closures, string interpolation, channel ops,
+    /// and any call not to a nosplit function) is rejected with E0075.
+    fn checkNosplitFn(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx);
+        try self.nosplitWalk(file_idx, k[5], Checker.identText(mf, k[1]), 0);
+    }
+
+    const nosplit_max_depth: u32 = 256;
+
+    fn nosplitWalk(self: *Checker, file_idx: usize, node: ast.Index, caller: []const u8, depth: u32) Error!void {
+        if (node == ast.none) return;
+        if (depth >= nosplit_max_depth) return; // malformed/over-deep tree; already bounded by parser
+        const mf = self.files[file_idx];
+        const n = mf.tree.get(node);
+        switch (n.tag) {
+            // Safe leaves: names and literals read a register or a static const.
+            .ident, .int_lit, .float_lit, .string_lit, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .break_stmt, .continue_stmt => return,
+            // Pure operators / field access / control flow / statement wrappers:
+            // recurse into their value children (the guarded set only).
+            .binary, .unary, .expr_stmt, .return_stmt, .assign, .lhs_list, .expr_list, .args, .arg, .block, .if_stmt, .while_stmt, .for_c, .let_decl, .const_decl => {
+                for (mf.tree.kids(node)) |c| try self.nosplitWalk(file_idx, c, caller, depth + 1);
+            },
+            .binding => {
+                // [pattern, type_or_none, init_or_none]: only the initializer is
+                // an evaluated expression; the type annotation is not code.
+                const bk = mf.tree.kids(node);
+                if (bk.len >= 3) try self.nosplitWalk(file_idx, bk[2], caller, depth + 1);
+            },
+            .member => {
+                // Field access on a value in hand is safe; recurse only the base.
+                try self.nosplitWalk(file_idx, mf.tree.kids(node)[0], caller, depth + 1);
+            },
+            .call => {
+                // Allowed only when the callee is a named function marked nosplit
+                // (Power-of-10: indirection limited to what is statically known).
+                // A non-ident callee is a slice/map/type constructor (allocates)
+                // or a value/interface/method call (unknowable statically).
+                const ck = mf.tree.kids(node); // [callee, type_args, args]
+                if (mf.tree.get(ck[0]).tag != .ident) {
+                    try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' may not allocate or call indirectly here", .{caller}, "nosplit bodies allow only calls to other nosplit functions");
+                    return;
+                }
+                const is_nosplit = if (self.nodeSymbol(file_idx, ck[0])) |sym|
+                    (self.ctx.func_attrs.get(sym.pack()) orelse FuncAttrs{}).nosplit
+                else
+                    false;
+                if (!is_nosplit) {
+                    try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' calls '{s}', which is not marked nosplit", .{ caller, Checker.identText(mf, ck[0]) }, "mark the callee @nosplit or inline it");
+                    return;
+                }
+                try self.nosplitWalk(file_idx, ck[2], caller, depth + 1); // args
+            },
+            else => try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' may not allocate or reach a safepoint here", .{caller}, "nosplit bodies allow only non-allocating arithmetic, control flow, and calls to other nosplit functions"),
         }
     }
 
@@ -5283,4 +5414,184 @@ test "constEval folds literals, unary, binary, and const references" {
     try testing.expectEqual(@as(i128, 14), checker.constEval(0, b_init, 0).?.int);
     try testing.expect(checker.representable(14, ctx.prim_ids.get(.u8)));
     try testing.expect(!checker.representable(300, ctx.prim_ids.get(.u8)));
+}
+
+// ---- §10.3.1 function attributes (@naked / @nosplit) ----------------------
+//
+// These live here rather than in `tests/cases/` on purpose: the golden corpus is
+// also the seed-vs-selfhost `check` differential's input, and selfhost's
+// validator does not diagnose attributes yet (#1374), so an attribute `// error`
+// golden would register as a new MISSING in `scripts/selfhost-diffcheck.sh`.
+// The positive/runtime side is covered end to end by `tests/stress/attrs/`.
+
+/// Type-checks `src` as a lone module and reports whether `want` was diagnosed.
+/// Returns true when at least one diagnostic carries that code.
+fn diagnosedCode(gpa: Allocator, src: []const u8, want: Code) !bool {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    var diags = Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree: ast.Tree = undefined;
+    const mf = try parseOne(gpa, &diags, &sm, &tree, "t.bit", src);
+    defer tree.deinit();
+
+    var no_imports: resolve.ImportTable = .{};
+    defer no_imports.deinit(gpa);
+    const files = [_]ModuleFile{mf};
+    var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
+    defer module.deinit();
+
+    var ctx = try TypeContext.init(gpa);
+    defer ctx.deinit();
+    var checked = try checkModule(gpa, &diags, &ctx, &files, &module, @enumFromInt(0), &.{}, false);
+    defer checked.deinit();
+
+    for (diags.list.items) |d| if (d.code == want) return true;
+    return false;
+}
+
+/// True when `src` type-checks with no diagnostics at all.
+fn checksClean(gpa: Allocator, src: []const u8) !bool {
+    var sm = diagnostics.SourceManager.init(gpa);
+    defer sm.deinit();
+    var diags = Diagnostics.init(gpa, &sm);
+    defer diags.deinit();
+
+    var tree: ast.Tree = undefined;
+    const mf = try parseOne(gpa, &diags, &sm, &tree, "t.bit", src);
+    defer tree.deinit();
+
+    var no_imports: resolve.ImportTable = .{};
+    defer no_imports.deinit(gpa);
+    const files = [_]ModuleFile{mf};
+    var module = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
+    defer module.deinit();
+
+    var ctx = try TypeContext.init(gpa);
+    defer ctx.deinit();
+    var checked = try checkModule(gpa, &diags, &ctx, &files, &module, @enumFromInt(0), &.{}, false);
+    defer checked.deinit();
+
+    return diags.list.items.len == 0;
+}
+
+test "@nosplit rejects an allocating call and accepts an allocation-free leaf" {
+    const gpa = testing.allocator;
+
+    // The acceptance criterion (#1360): an allocating construct inside a nosplit
+    // body is a compile error, pointed at the construction itself.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@nosplit function bad() {
+        \\  let s = []int(1)
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+
+    // `append` reallocates — rejected as a non-nosplit callee, not by name.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@nosplit function bad(s: []int) {
+        \\  let t = append(s, 1)
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+
+    // A leaf of pure arithmetic and control flow is fine.
+    try testing.expect(try checksClean(gpa,
+        \\@nosplit function ok(n: int): int {
+        \\  let s = 0
+        \\  let i = 0
+        \\  while (i < n) {
+        \\    s = s + i
+        \\    i = i + 1
+        \\  }
+        \\  return s
+        \\}
+        \\function main() {}
+        \\
+    ));
+
+    // Mutual recursion between two nosplit functions type-checks in either
+    // declaration order — attributes are collected before any body is checked.
+    try testing.expect(try checksClean(gpa,
+        \\@nosplit function a(x: int): int {
+        \\  return b(x)
+        \\}
+        \\@nosplit function b(x: int): int {
+        \\  return a(x)
+        \\}
+        \\function main() {}
+        \\
+    ));
+
+    // Calling a function that is NOT nosplit breaks the chain.
+    try testing.expect(try diagnosedCode(gpa,
+        \\function helper(x: int): int { return x }
+        \\@nosplit function a(x: int): int {
+        \\  return helper(x)
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+}
+
+test "@naked restricts the signature and the body" {
+    const gpa = testing.allocator;
+
+    try testing.expect(try checksClean(gpa,
+        \\@naked function two(): int {
+        \\  return 2
+        \\}
+        \\function main() {}
+        \\
+    ));
+
+    // No parameters: there is no prologue to bind them into.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@naked function two(x: int): int {
+        \\  return 2
+        \\}
+        \\function main() {}
+        \\
+    , .naked_fn_invalid));
+
+    // Only `return` statements: a local has nowhere defined to live.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@naked function two(): int {
+        \\  let x = 1
+        \\  return x
+        \\}
+        \\function main() {}
+        \\
+    , .naked_fn_invalid));
+
+    // A reference result would need a walkable frame at the return.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@naked function s(): string {
+        \\  return "hi"
+        \\}
+        \\function main() {}
+        \\
+    , .naked_fn_invalid));
+
+    // Falling off the end of a naked void fn: lowering synthesizes no `ret`, so
+    // the object would carry none at all (rule 3, seed-only — selfhost has no
+    // missing_return yet).
+    try testing.expect(try diagnosedCode(gpa,
+        \\@naked function nothing() {
+        \\}
+        \\function main() {}
+        \\
+    , .missing_return));
+}
+
+test "an unrecognized attribute name is rejected" {
+    const gpa = testing.allocator;
+    try testing.expect(try diagnosedCode(gpa,
+        \\@bogus function f() {}
+        \\function main() {}
+        \\
+    , .unknown_attribute));
 }

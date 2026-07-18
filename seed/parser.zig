@@ -308,7 +308,8 @@ const Parser = struct {
                 return self.tree.add(.@"export", join(start, self.span(inner)), 0, &.{inner});
             },
             .kw_let, .kw_const => return self.parseValueDecl(),
-            .kw_function => return self.parseFuncDecl(),
+            .at => return self.parseAttrDecl(),
+            .kw_function => return self.parseFuncDecl(none),
             .kw_struct => return self.parseStructDecl(),
             .kw_interface => return self.parseInterfaceDecl(),
             .kw_enum => return self.parseEnumDecl(),
@@ -324,7 +325,8 @@ const Parser = struct {
     fn parseExportableDecl(self: *Parser) ParseError!Index {
         switch (self.tok.kind) {
             .kw_let, .kw_const => return self.parseValueDecl(),
-            .kw_function => return self.parseFuncDecl(),
+            .at => return self.parseAttrDecl(),
+            .kw_function => return self.parseFuncDecl(none),
             .kw_struct => return self.parseStructDecl(),
             .kw_interface => return self.parseInterfaceDecl(),
             .kw_enum => return self.parseEnumDecl(),
@@ -335,6 +337,38 @@ const Parser = struct {
                 return none;
             },
         }
+    }
+
+    // ---- function attributes (§10.3.1) --------------------------------------
+
+    /// Parses `@name @name ...` then requires a `function` — attributes attach to
+    /// function declarations only (v1). Non-function targets are a parse error.
+    fn parseAttrDecl(self: *Parser) ParseError!Index {
+        const attrs = try self.parseAttrList();
+        if (self.tok.kind != .kw_function) {
+            try self.fail("'function' after an attribute");
+            self.synchronizeTopLevel();
+            return none;
+        }
+        return self.parseFuncDecl(attrs);
+    }
+
+    /// `attr_list = attr { attr }`, `attr = "@" IDENT`. One or more `@name`.
+    fn parseAttrList(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        var items: std.ArrayList(Index) = .empty;
+        errdefer items.deinit(self.gpa);
+        // Bounded: every iteration consumes the `@`, so it cannot outlast input.
+        while (self.tok.kind == .at) {
+            const at_span = self.tok.span;
+            try self.advance(); // '@'
+            const name = try self.expectIdent();
+            try items.append(self.gpa, try self.tree.add(.attr, join(at_span, self.span(name)), 0, &.{name}));
+        }
+        const kids = try items.toOwnedSlice(self.gpa);
+        defer self.gpa.free(kids);
+        const end = if (kids.len == 0) start else self.span(kids[kids.len - 1]);
+        return self.tree.add(.attr_list, join(start, end), 0, kids);
     }
 
     // ---- imports (§17.2) ----------------------------------------------------
@@ -467,8 +501,8 @@ const Parser = struct {
 
     // ---- functions and methods (§10.3-4) -------------------------------------
 
-    fn parseFuncDecl(self: *Parser) ParseError!Index {
-        const start = self.tok.span;
+    fn parseFuncDecl(self: *Parser, attrs: Index) ParseError!Index {
+        const kw_span = self.tok.span;
         try self.advance(); // 'function'
         var recv: Index = none;
         if (self.tok.kind == .l_paren) {
@@ -482,7 +516,13 @@ const Parser = struct {
         var result: Index = none;
         if (try self.accept(.colon)) result = try self.parseResultType();
         const body = try self.parseBlock();
-        return self.tree.add(.func_decl, join(start, self.span(body)), 0, &.{ recv, name, generics, params, result, body });
+        // Attrs are elided (6-child form) when absent so the attr-less corpus'
+        // AST dumps stay byte-identical; the checker reads `k[6]` only when present.
+        const start = if (attrs == none) kw_span else self.span(attrs);
+        if (attrs == none) {
+            return self.tree.add(.func_decl, join(start, self.span(body)), 0, &.{ recv, name, generics, params, result, body });
+        }
+        return self.tree.add(.func_decl, join(start, self.span(body)), 0, &.{ recv, name, generics, params, result, body, attrs });
     }
 
     fn parseReceiver(self: *Parser) ParseError!Index {

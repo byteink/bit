@@ -424,7 +424,7 @@ are no nominal newtypes in v0.1.
 ### 10.3 Function Declarations
 
 ```
-func_decl     = "function" IDENT [ generic_params ] signature block .
+func_decl     = [ attr_list ] "function" IDENT [ generic_params ] signature block .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
@@ -440,6 +440,63 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
 - A variadic parameter (`...name: T`) must be last; inside the body it has type
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
+
+#### 10.3.1 Function Attributes
+
+An attribute constrains how a function is compiled. Attributes precede
+`function` and attach to function declarations only:
+
+```
+attr_list     = attr { attr } .
+attr          = "@" IDENT .
+```
+
+`export` stays outermost: `export @naked function f() {}`. Two attributes are
+recognized; any other name is an error (**E0076** `unknown_attribute`). Neither
+takes arguments. Both exist for the unmanaged subset the runtime is written
+against — ordinary Bit code should not need them.
+
+**`@naked`** — the function gets no prologue and no epilogue, and returns
+through a bare machine `ret`. It runs on its caller's frame, so it must need no
+frame of its own (**E0074** `naked_fn_invalid` otherwise):
+
+- no receiver, no generic parameters, and no parameters;
+- the result is void or a scalar (integer, float, or bool) — a reference result
+  would need a GC-walkable frame at the return;
+- the body contains only `return` statements. There is no prologue, so a local
+  or a spilled temporary has nowhere defined to live.
+
+A `@naked` function must return explicitly on every path, *including* a void
+one: no implicit `ret` is synthesized for it, so falling off the end would emit
+a function containing no `ret` at all (**E0055** `missing_return`).
+
+**`@nosplit`** — the function takes no safepoint and allocates nothing, so the
+collector can never run inside it. This is what lets code that *implements* the
+allocator and collector call it safely. A `@nosplit` body is restricted to
+provably non-allocating forms — arithmetic and comparison, name and literal
+reads, field access on a value in hand, `if`/`while`/`for`, assignment,
+`break`/`continue`, and `return` — plus calls to other `@nosplit` functions.
+Anything else is **E0075** `nosplit_calls_allocating`, including composite,
+slice and map construction, indexing, `append`, `spawn`, closures, channel
+operations, string interpolation, and any call through a value or interface
+(whose target is not knowable statically).
+
+Safety is transitive by induction rather than by whole-program analysis: each
+call site requires only that its own callee is `@nosplit`, and the same rule
+holds for that callee in turn. Attributes are collected before any body is
+checked, so mutual recursion between `@nosplit` functions is accepted in either
+declaration order. Green-thread stacks are fixed-size and guarded (§20), so
+`@nosplit` removes only the safepoint poll — there is no stack-growth check.
+
+```
+@naked function two(): int {
+  return 2
+}
+
+@nosplit function doubled(x: int): int {
+  return x + x
+}
+```
 
 ### 10.4 Method Declarations
 
@@ -1684,7 +1741,9 @@ pat           = IDENT | "_" | tuple_pat .
 
 type_alias    = "type" IDENT [ generic_params ] "=" type .
 
-func_decl     = "function" IDENT [ generic_params ] signature block .
+func_decl     = [ attr_list ] "function" IDENT [ generic_params ] signature block .
+attr_list     = attr { attr } .
+attr          = "@" IDENT .
 method_decl   = [ "export" ] "function" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
