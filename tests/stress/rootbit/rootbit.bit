@@ -51,11 +51,24 @@ import {
   strLen, strPtr,
 } from "../../../runtime/root"
 
-// 2 MiB of object heap and 128 KiB of index. Far more than the script needs:
-// the point is that neither can run out, so a short table is never an
+// 3 MiB of object heap and 128 KiB of index. Comfortably more than the script
+// needs — the point is that neither runs out, so a short table is never an
 // allocation failure wearing a passing test's clothes. `rootStatOom` is
-// asserted zero on the final line for exactly that reason.
-const ARENA_WORDS = 262144
+// asserted zero on the final line for exactly that reason. Nothing collects the
+// port's heap in this program (a real runtime collects at safepoints), so every
+// allocation here is permanent and the arena must cover the whole run.
+//
+// THERE IS A CEILING, AND IT IS NOT THIS PORT'S. Raising the arena to 4 MiB or
+// beyond makes this program fault — but only with the NATIVE collector enabled;
+// `BIT_GC=off` passes at 4 MiB, and a minimal program that binds a 16 MiB
+// reserve to `runtime/root` and allocates through it is fine at every size
+// tested. So the fault is an interaction with the process collector under this
+// program's allocation volume, not a limit in `runtime/root` or `runtime/gc`'s
+// reserve handling. It did not reproduce in a reduced case (a large `[]i64`
+// held live across 20k collections is fine), so it is recorded with the bounds
+// measured rather than diagnosed. Worth resolving before #1369, which will bind
+// a real mmap'd reserve of exactly this size class.
+const ARENA_WORDS = 393216
 const INDEX_WORDS = 16384
 const MARK_STACK = 4096
 const MIN_TRIGGER = 65536
@@ -67,6 +80,13 @@ const GROWTH_PCT = 200
 // script that never grows would let `mapGrow` be deleted entirely — verified by
 // mutation, see the task report.
 const MAP_STEPS = 400
+
+// Tombstone-flood sizes. See the phase's comment for the derivation; these are
+// set against the 7/8 load factor so that a missing `used = len` reset ends at
+// a DIFFERENT capacity, which the iteration-order assertion then catches.
+const FLOOD_A = 250
+const FLOOD_KEEP = 4
+const FLOOD_B = 900
 
 // ---------------------------------------------------------------------------
 // Bridges between the two heaps
@@ -191,6 +211,24 @@ function phaseS(): int {
   // bytes_from_string round-trips through the word-per-byte slice model.
   if (sameStr(rtStringFromBytes(rtBytesFromString(mine("round trip"))), "round trip")) { ok = ok + 1 }
 
+  // THE ROUND TRIP MUST PRESERVE ALL 256 BYTE VALUES, not just ASCII. Every
+  // string above is ASCII, so masking the transferred byte to 7 bits changed
+  // nothing and the conversion could silently corrupt any non-ASCII input
+  // (measured: mutation M24 survived). `[]byte(s)` is exactly the primitive
+  // UTF-8 and crypto code reaches for, where high bytes are the normal case.
+  let hb = rtSliceNew(4, 4, 0)
+  rtSliceSet(hb, 0, 0)
+  rtSliceSet(hb, 1, 127)
+  rtSliceSet(hb, 2, 128)
+  rtSliceSet(hb, 3, 255)
+  let hs = rtStringFromBytes(hb)
+  let back = rtBytesFromString(hs)
+  // One line: a leading `&&` on the next line ends the statement under ASI.
+  if (rtSliceGet(back, 0) == 0 && rtSliceGet(back, 1) == 127 && rtSliceGet(back, 2) == 128 && rtSliceGet(back, 3) == 255) { ok = ok + 1 }
+  // The same range read through `string_byte`, which must zero-extend rather
+  // than sign-extend a byte above 127.
+  if (rtStringByte(hs, 2) == 128 && rtStringByte(hs, 3) == 255) { ok = ok + 1 }
+
   return ok
 }
 
@@ -209,9 +247,17 @@ function phaseL(): int {
   // set/get.
   rtSliceSet(a, 1, 42)
   if (rtSliceGet(a, 1) == 42) { ok = ok + 1 }
-  // Out-of-range set is a no-op and must not corrupt a neighbour.
-  rtSliceSet(a, 3, 99)
-  if (rtSliceGet(a, 2) == 0) { ok = ok + 1 }
+
+  // AN OUT-OF-RANGE SET MUST NOT WRITE. Checking a neighbour INSIDE the view
+  // does not test this — the rejected write lands past the view, so `a[2]` is
+  // unchanged either way and the guard could be deleted (measured: mutation M18
+  // survived that check). The slice is therefore given spare CAPACITY and the
+  // rejected index aimed into it, then read back through a reslice that can see
+  // the capacity region. That distinguishes "refused" from "wrote out of view".
+  let room = rtSliceNew(3, 8, 0)
+  rtSliceSet(room, 5, 99)
+  let widened = rtSliceSlice(room, 0, 8)
+  if (rtSliceGet(widened, 5) == 0) { ok = ok + 1 }
 
   // append across the doubling boundary, checked against a native slice built
   // by the same sequence. 33 elements crosses 1,2,4,8,16,32 — six grows.
@@ -252,6 +298,35 @@ function phaseL(): int {
   let tail = rtSliceSlice(b, 4, 8)
   if (rtSliceSlice(tail, 0, 60) != 0 && rtSliceSlice(tail, 0, 61) == 0) { ok = ok + 1 }
   if (rtSliceSlice(b, 5, 4) == 0) { ok = ok + 1 }
+
+  // APPENDING INTO A VIEW WITH A NON-ZERO `off`, past its capacity, so the grow
+  // path runs on a RESLICED header. Every append above started at `off == 0`,
+  // which left the grow's `off = 0` reset untested — deleting it changed
+  // nothing (measured: mutation M12 survived). A grow reallocates from the
+  // current view, so the new buffer is 0-based and `off` MUST return to 0; a
+  // stale `off` reads the appended elements shifted by the old offset.
+  let view = rtSliceSlice(b, 30, 33)     // off=30, len=3, cap=34
+  let vnat: []i64 = []i64(0)
+  i = 0
+  while (i < 3) {
+    vnat = append(vnat, rtSliceGet(view, i))
+    i = i + 1
+  }
+  i = 0
+  while (i < 40) {                        // past cap=34, so the grow fires
+    view = rtSliceAppend(view, 1000 + i)
+    vnat = append(vnat, 1000 + i)
+    i = i + 1
+  }
+  let vAgree = 1
+  i = 0
+  while (i < 43) {
+    if (rtSliceGet(view, i) != vnat[i]) {
+      vAgree = 0
+    }
+    i = i + 1
+  }
+  if (vAgree == 1 && len(vnat) == 43) { ok = ok + 1 }
 
   return ok
 }
@@ -311,6 +386,11 @@ function phaseM(rng: []u64): int {
 
   if (lenAgree == 1) { ok = ok + 1 }
   if (getAgree == 1) { ok = ok + 1 }
+  // `hasAgree` was computed and never asserted on the first write of this file
+  // — a guard that runs, records a failure, and is then thrown away. Found by
+  // reading the property count back against the printed denominator, which is
+  // why the denominator is derived from the source rather than written by hand.
+  if (hasAgree == 1) { ok = ok + 1 }
   if (rtMapLen(m) == len(nat)) { ok = ok + 1 }
 
   // THE STRONG ASSERTION: both maps must iterate in the same slot order, with
@@ -345,6 +425,72 @@ function phaseM(rng: []u64): int {
   let gone = mine("k0")
   rtMapDelete(m, gone)
   if (!rtMapHas(m, gone) && rtMapGet(m, gone) == 0) { ok = ok + 1 }
+
+  // TOMBSTONE FLOOD — the one shape that makes `mapGrow`'s `used = len` reset
+  // (tombstones reclaimed) observable.
+  //
+  // A cycle of delete-then-reinsert does NOT do it, and that is the whole
+  // lesson: reusing a TOMB slot leaves `used` unchanged, so `used` plateaus and
+  // no further grow ever fires — the reset line is simply never reached again.
+  // Deleting the reset changed nothing under that script (measured: mutation M7
+  // survived a 12-round churn of 60 keys).
+  //
+  // What is required is a grow that happens WHILE the table is mostly
+  // tombstones, followed by enough NEW keys that the inflated `used` crosses
+  // the next threshold and the correct `used` does not. Then the two
+  // implementations end at different capacities, and the iteration order — the
+  // assertion below — diverges. Sizes are chosen against the 7/8 load factor,
+  // not by feel: FLOOD_A fills to a grow, FLOOD_KEEP survives the sweep, and
+  // FLOOD_B is sized to sit between the correct and inflated thresholds.
+  let cm = rtMapNew(1, 0)
+  let cnat = map<string, int>()
+  let ckeys: []i64 = []i64(0)
+  let ktexts: []string = []string(0)
+  // Key strings are built ONCE. `mine()` allocates a slice, a buffer and a
+  // string per call and nothing collects the port's heap in this program, so
+  // building keys inside the loops exhausted the arena and faulted on the
+  // resulting null. Hoisting them also sharpens the phase: what is under test
+  // is the grow schedule, not allocation volume.
+  let b0 = 0
+  while (b0 < FLOOD_A + FLOOD_B) {
+    let kt = "f${b0}"
+    ktexts = append(ktexts, kt)
+    ckeys = append(ckeys, mine(kt))
+    b0 = b0 + 1
+  }
+
+  let j = 0
+  while (j < FLOOD_A) {
+    rtMapSet(cm, ckeys[j], j + 1)
+    cnat[ktexts[j]] = j + 1
+    j = j + 1
+  }
+  // Sweep almost everything away, leaving a table that is nearly all tombstones.
+  j = 0
+  while (j < FLOOD_A - FLOOD_KEEP) {
+    rtMapDelete(cm, ckeys[j])
+    delete(cnat, ktexts[j])
+    j = j + 1
+  }
+  // Now insert a fresh, disjoint key range. These consume EMPTY slots, so
+  // `used` climbs from whatever the grow left it at.
+  j = FLOOD_A
+  while (j < FLOOD_A + FLOOD_B) {
+    rtMapSet(cm, ckeys[j], j + 1)
+    cnat[ktexts[j]] = j + 1
+    j = j + 1
+  }
+
+  let cAgree = 1
+  let cslot = rtMapIterInit(cm)
+  for (ck2, cv2) of cnat {
+    if (cslot < 0 || !sameStr(rtMapKeyAt(cm, cslot), ck2) || rtMapValAt(cm, cslot) != cv2) {
+      cAgree = 0
+    } else {
+      cslot = rtMapIterNext(cm, cslot)
+    }
+  }
+  if (cAgree == 1 && cslot == -1 && rtMapLen(cm) == len(cnat)) { ok = ok + 1 }
 
   // Scalar-keyed maps take the splitmix64 path instead of Wyhash.
   let sm = rtMapNew(0, 0)
@@ -401,5 +547,5 @@ function main() {
   // `oom` is part of the line, not a side check: every phase above assumes it
   // never ran out of arena, and a non-zero value would mean some "0" result was
   // an allocation failure rather than the behaviour under test.
-  print("wy=${w}/7 str=${s}/24 slc=${l}/10 map=${m}/6 reboot=${reboot} oom=${rootStatOom()}\n")
+  print("wy=${w}/7 str=${s}/26 slc=${l}/11 map=${m}/8 reboot=${reboot} oom=${rootStatOom()}\n")
 }
