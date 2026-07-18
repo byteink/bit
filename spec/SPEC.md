@@ -618,6 +618,42 @@ let q = p + 8              // address 8 * sizeOf(i64)
 let addr: int = int(q)     // 64 — the raw address
 ```
 
+### 11.5 Atomics (unmanaged subset)
+
+Predeclared builtin functions provide lock-free atomic operations on an integer
+memory location named by a raw pointer `*T` (§11.4). Like `*T`, they are for the
+**unmanaged subset** (the runtime's own run queue, channels, and refcounts) and
+should be avoided in ordinary code, where channels are the safe concurrency
+primitive. `T` must be an integer prim (`i8`…`u64`).
+
+- `atomicLoad(p: *T): T` — atomically read `*p`.
+- `atomicStore(p: *T, v: T)` — atomically write `v` to `*p`.
+- `atomicCmpxchg(p: *T, old: T, new: T): bool` — if `*p == old`, store `new` and
+  return `true`; otherwise leave `*p` unchanged and return `false` (Go-style).
+- `atomicAdd` / `atomicSub` / `atomicAnd` / `atomicOr` / `atomicXchg(p: *T, v: T): T`
+  — atomically apply the operation to `*p`, returning the **previous** value
+  (fetch-and-op; `atomicXchg` just swaps `v` in).
+
+All operations use the **strongest ordering** (sequential consistency); a weaker
+ordering is not yet exposed. Every operation lowers to inline machine
+instructions — a `lock`-prefixed op on x86-64, an `LDAXR`/`STLXR` retry loop on
+ARM64 — never an out-of-line call, so a spin/CAS loop stays call-free.
+
+A `*T` for these ops comes from `ptrOf(s: []T): *T` — the address of slice `s`'s
+first element — the one bridge from traced memory to a raw pointer (Bit has no
+`&`). The slice keeps its backing storage alive, so the pointer stays valid for
+as long as the slice is reachable.
+
+```
+let cell = []i64(1)                        // one shared word, kept alive here
+let p = ptrOf(cell)
+atomicStore(p, 0)
+let old = atomicAdd(p, 1)                   // old == 0, *p == 1
+if (atomicCmpxchg(p, 1, 42)) {              // *p was 1 -> now 42, true
+  // swapped
+}
+```
+
 ---
 
 ## 12. Expressions
@@ -1537,7 +1573,10 @@ Intentionally **not** in v0.1, to keep the surface minimal:
   unmanaged subset; only taking the address of a value with `&` remains reserved.)
 - Operator overloading; user-defined implicit conversions.
 - `recover`; catchable panics.
-- Mutexes, atomics, `sync`-style primitives (channels only in v0.1).
+- Mutexes and `sync`-style primitives (channels are the safe concurrency
+  primitive in v0.1). Lock-free **atomics** on a raw `*T` *are* specified — see
+  §11.5 — for the unmanaged subset; only their weaker memory orderings (a
+  seq-cst-only surface ships now) remain reserved.
 - Nominal newtypes (all `type` aliases are transparent in v0.1).
 - Thread handles / structured concurrency for `spawn`.
 - UTF-8 rune conversions (`string(rune)`, `string([]rune)`, `[]rune(s)`) and

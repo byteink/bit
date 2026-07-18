@@ -351,6 +351,21 @@ pub const Op = enum {
     index_set, // extra = [base, index, value]
     slice_len, // extra = [base]
 
+    // ---- atomics (§11.5): inline lock-free ops on a raw `*T` --------------
+    // Strongest ordering only (x86 `lock`-prefixed = seq-cst; arm64
+    // LDAXR/STLXR = acquire/release) — no ordering operand. Lowered straight
+    // to inline machine instructions, never an out-of-line `rt_call`, so a
+    // spin/CAS loop stays call-free. The `*T` target is a plain int word
+    // (is_ref=0), so no GC barrier is involved.
+    atomic_load, // extra = [ptr]                       -> result T
+    atomic_store, // extra = [ptr, value]               (no result)
+    atomic_cmpxchg, // extra = [ptr, expected, desired] -> result bool (swapped?)
+    atomic_rmw_add, // extra = [ptr, operand]           -> result T (pre-op value)
+    atomic_rmw_sub, // extra = [ptr, operand]           -> result T (pre-op value)
+    atomic_rmw_and, // extra = [ptr, operand]           -> result T (pre-op value)
+    atomic_rmw_or, // extra = [ptr, operand]            -> result T (pre-op value)
+    atomic_rmw_xchg, // extra = [ptr, operand]          -> result T (pre-op value)
+
     // ---- closures: extra = [FuncId, env] ----------------------------------
     make_closure,
 
@@ -500,6 +515,10 @@ pub const Function = struct {
             .index_get => .{ .index_get = .{ .base = @enumFromInt(raw[0]), .index = @enumFromInt(raw[1]) } },
             .index_set => .{ .index_set = .{ .base = @enumFromInt(raw[0]), .index = @enumFromInt(raw[1]), .value = @enumFromInt(raw[2]) } },
             .slice_len => .{ .slice_len = .{ .base = @enumFromInt(raw[0]) } },
+            .atomic_load => .{ .atomic_load = .{ .ptr = @enumFromInt(raw[0]) } },
+            .atomic_store => .{ .atomic_store = .{ .ptr = @enumFromInt(raw[0]), .value = @enumFromInt(raw[1]) } },
+            .atomic_cmpxchg => .{ .atomic_cmpxchg = .{ .ptr = @enumFromInt(raw[0]), .expected = @enumFromInt(raw[1]), .desired = @enumFromInt(raw[2]) } },
+            .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_and, .atomic_rmw_or, .atomic_rmw_xchg => .{ .atomic_rmw = .{ .ptr = @enumFromInt(raw[0]), .operand = @enumFromInt(raw[1]) } },
             .convert => .{ .un = .{ .operand = @enumFromInt(raw[0]) } },
             .make_closure => .{ .make_closure = .{ .func = @enumFromInt(raw[0]), .env = @enumFromInt(raw[1]) } },
             .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
@@ -540,6 +559,12 @@ pub const Decoded = union(enum) {
     index_get: struct { base: ValueId, index: ValueId },
     index_set: struct { base: ValueId, index: ValueId, value: ValueId },
     slice_len: struct { base: ValueId },
+    atomic_load: struct { ptr: ValueId },
+    atomic_store: struct { ptr: ValueId, value: ValueId },
+    atomic_cmpxchg: struct { ptr: ValueId, expected: ValueId, desired: ValueId },
+    // Shared by the five RMW ops (add/sub/and/or/xchg); the owning `Inst.op`
+    // distinguishes them at codegen (they never differ in operand shape).
+    atomic_rmw: struct { ptr: ValueId, operand: ValueId },
     make_closure: struct { func: FuncId, env: ValueId },
     func_addr: struct { func: FuncId },
     rt_call: struct { rt: RtFn, args: []const u32 },
@@ -895,6 +920,24 @@ pub const FunctionBuilder = struct {
         return self.push(.slice_len, ty, &.{vid(base)});
     }
 
+    // ---- atomics (§11.5) --------------------------------------------------
+    pub fn atomicLoad(self: *FunctionBuilder, ty: TypeId, ptr: ValueId) Allocator.Error!ValueId {
+        return self.push(.atomic_load, ty, &.{vid(ptr)});
+    }
+    /// Returns the (void-typed) instruction id so a bare `atomicStore(p, v)`
+    /// statement has a value to yield, exactly like `close`/`delete`'s rt_call.
+    pub fn atomicStore(self: *FunctionBuilder, ptr: ValueId, value: ValueId) Allocator.Error!ValueId {
+        return self.push(.atomic_store, .invalid, &.{ vid(ptr), vid(value) });
+    }
+    pub fn atomicCmpxchg(self: *FunctionBuilder, ty: TypeId, ptr: ValueId, expected: ValueId, desired: ValueId) Allocator.Error!ValueId {
+        return self.push(.atomic_cmpxchg, ty, &.{ vid(ptr), vid(expected), vid(desired) });
+    }
+    /// `op` is one of the five `atomic_rmw_*` ops; `ty` is the element type,
+    /// which is also the result (the pre-op value).
+    pub fn atomicRmw(self: *FunctionBuilder, op: Op, ty: TypeId, ptr: ValueId, operand: ValueId) Allocator.Error!ValueId {
+        return self.push(op, ty, &.{ vid(ptr), vid(operand) });
+    }
+
     /// Builds a closure value `(fn_ptr, env_ref)` — see the module doc
     /// comment in `lower.zig` on closure representation. `ty` is the
     /// 2-element `(func_type, env_type)` tuple `TypeId` `call_value` expects
@@ -1168,6 +1211,22 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
         },
         .index_set => |is_| try w.print("  index_set %{d}[%{d}] = %{d}\n", .{ @intFromEnum(is_.base), @intFromEnum(is_.index), @intFromEnum(is_.value) }),
         .slice_len => |sl| try w.print("  %{d} = slice_len %{d}\n", .{ i, @intFromEnum(sl.base) }),
+        .atomic_load => |a| {
+            try w.print("  %{d} = atomic_load %{d} ", .{ i, @intFromEnum(a.ptr) });
+            try writeTypeName(w, module.ctx, ty, 0);
+            try w.writeAll("\n");
+        },
+        .atomic_store => |a| try w.print("  atomic_store %{d} = %{d}\n", .{ @intFromEnum(a.ptr), @intFromEnum(a.value) }),
+        .atomic_cmpxchg => |a| {
+            try w.print("  %{d} = atomic_cmpxchg %{d}, %{d}, %{d} ", .{ i, @intFromEnum(a.ptr), @intFromEnum(a.expected), @intFromEnum(a.desired) });
+            try writeTypeName(w, module.ctx, ty, 0);
+            try w.writeAll("\n");
+        },
+        .atomic_rmw => |a| {
+            try w.print("  %{d} = {s} %{d}, %{d} ", .{ i, opName(op), @intFromEnum(a.ptr), @intFromEnum(a.operand) });
+            try writeTypeName(w, module.ctx, ty, 0);
+            try w.writeAll("\n");
+        },
         .make_closure => |mc| try w.print("  %{d} = make_closure @{s}, %{d}\n", .{ i, module.func(mc.func).name, @intFromEnum(mc.env) }),
         .func_addr => |fa| try w.print("  %{d} = func_addr @{s}\n", .{ i, module.func(fa.func).name }),
         .rt_call => |rc| {
@@ -1334,6 +1393,20 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
             try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(is_.value));
         },
         .slice_len => |sl| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(sl.base)),
+        .atomic_load => |a| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.ptr)),
+        .atomic_store => |a| {
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.ptr));
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.value));
+        },
+        .atomic_cmpxchg => |a| {
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.ptr));
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.expected));
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.desired));
+        },
+        .atomic_rmw => |a| {
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.ptr));
+            try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(a.operand));
+        },
         .make_closure => |mc| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a),

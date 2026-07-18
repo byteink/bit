@@ -148,6 +148,14 @@ const reg_zr: u5 = 31;
 const scratch1: Reg = .x9; // primary: binary/unary accumulator
 const scratch2: Reg = .x10; // secondary: rhs operand / index register
 const scratch3: Reg = .x11; // tertiary: address/offset materialization temp
+// Two extra scratch GPRs used ONLY inside an atomic op's inline sequence
+// (§11.5). An RMW/cmpxchg LL/SC loop needs up to five live registers at once
+// (base, operand(s), old, computed, status) — more than `scratch1..3`.
+// `x16`/`x17` (AAPCS64 IP0/IP1) are never allocatable and never scratch
+// elsewhere, and no call occurs inside an atomic sequence, so they are safe
+// as transient atomic temporaries.
+const ascratch1: Reg = .x16; // atomic: base-address holder
+const ascratch2: Reg = .x17; // atomic: operand / expected holder
 const fscratch1: FReg = .d30; // primary float accumulator / move-cycle temp
 const fscratch2: FReg = .d31; // secondary float operand
 
@@ -663,6 +671,54 @@ const Ctx = struct {
             try self.movImm64(scratch3, disp);
             try self.loadStoreRegOffset(fpSize(width), true, 0b00, scratch3, false, base_reg, @intFromEnum(src));
         }
+    }
+
+    // ---- atomics (§11.5) ----------------------------------------------
+    // Load/store-exclusive register family and its acquire/release
+    // non-exclusive siblings, plus CBNZ for the LL/SC retry loop. Encodings
+    // cross-checked against `as -arch arm64` (see the module-level note).
+
+    /// Load/store-exclusive-or-ordered register. Layout:
+    /// `size 001000 o2 L 0 Rs o0 (1)1111 Rn Rt`. `Rs`/`Rt2` default to `31`
+    /// for the load and non-exclusive forms; a store-exclusive names its
+    /// status register in `Rs`.
+    fn ldstExclusive(self: *Ctx, size: u2, o2: bool, l: bool, o0: bool, rs: u5, rn: u5, rt: u5) !void {
+        const word: u32 = (@as(u32, size) << 30) | (0b001000 << 24) | (@as(u32, @intFromBool(o2)) << 23) | (@as(u32, @intFromBool(l)) << 22) | (@as(u32, rs) << 16) | (@as(u32, @intFromBool(o0)) << 15) | (0b11111 << 10) | (@as(u32, rn) << 5) | rt;
+        try self.emitWord(word);
+    }
+    /// LDAXR Wt/Xt, [Xn] — load-exclusive-acquire.
+    fn ldaxr(self: *Ctx, size: u2, rn: u5, rt: u5) !void {
+        try self.ldstExclusive(size, false, true, true, 0b11111, rn, rt);
+    }
+    /// STLXR Ws, Wt/Xt, [Xn] — store-exclusive-release; `Ws` = 0 on success.
+    fn stlxr(self: *Ctx, size: u2, rs: u5, rn: u5, rt: u5) !void {
+        try self.ldstExclusive(size, false, false, true, rs, rn, rt);
+    }
+    /// LDAR Wt/Xt, [Xn] — plain load-acquire.
+    fn ldar(self: *Ctx, size: u2, rn: u5, rt: u5) !void {
+        try self.ldstExclusive(size, true, true, true, 0b11111, rn, rt);
+    }
+    /// STLR Wt/Xt, [Xn] — plain store-release.
+    fn stlr(self: *Ctx, size: u2, rn: u5, rt: u5) !void {
+        try self.ldstExclusive(size, true, false, true, 0b11111, rn, rt);
+    }
+    /// CBNZ Wt/Xt, #imm19*4 — branch if register nonzero. `imm19` is the
+    /// signed word (instruction) displacement.
+    fn cbnz(self: *Ctx, sf: bool, rt: u5, imm19: i32) !void {
+        const bits: u32 = @bitCast(imm19);
+        const word: u32 = (@as(u32, @intFromBool(sf)) << 31) | (0b0110101 << 24) | ((bits & 0x7FFFF) << 5) | rt;
+        try self.emitWord(word);
+    }
+    /// Access-width `size` field (00=byte,01=half,10=word,11=dword) for the
+    /// exclusive/ordered load-store family.
+    fn atomicSize(bytes: u8) u2 {
+        return switch (bytes) {
+            1 => 0b00,
+            2 => 0b01,
+            4 => 0b10,
+            8 => 0b11,
+            else => unreachable, // caller contract: integer prim width
+        };
     }
 
     // ---- scalar floating point ----------------------------------------
@@ -1742,6 +1798,72 @@ fn emitEpilogueAndRet(self: *Ctx) !void {
     try self.ret();
 }
 
+// ---- atomics (§11.5) ------------------------------------------------------
+// `*T` is an int-classed word; all sequences are call-free and use only the
+// codegen scratch GPRs plus `ascratch1`/`ascratch2` (never a safepoint).
+
+fn emitAtomicLoad(self: *Ctx, dst: u32, ptr: ir.ValueId, ty: TypeId) !void {
+    const w = common.widthOf(self.tctx(), ty);
+    const base = try getInt(self, vregOf(self, ptr), ascratch1);
+    try self.ldar(Ctx.atomicSize(w.bytes), @intFromEnum(base), @intFromEnum(scratch1));
+    try canonNarrow(self, scratch1, w);
+    try putInt(self, dst, scratch1);
+}
+
+fn emitAtomicStore(self: *Ctx, ptr: ir.ValueId, value: ir.ValueId, ty: TypeId) !void {
+    const w = common.widthOf(self.tctx(), ty);
+    const base = try getInt(self, vregOf(self, ptr), ascratch1);
+    const val = try getInt(self, vregOf(self, value), scratch1);
+    try self.stlr(Ctx.atomicSize(w.bytes), @intFromEnum(base), @intFromEnum(val));
+}
+
+/// LL/SC retry loop; returns the pre-op (old) value. `scratch1`=old,
+/// `scratch2`=computed, `scratch3`=STLXR status, `ascratch1`=base,
+/// `ascratch2`=operand.
+fn emitAtomicRmw(self: *Ctx, op: ir.Op, dst: u32, ptr: ir.ValueId, operand: ir.ValueId, ty: TypeId) !void {
+    const w = common.widthOf(self.tctx(), ty);
+    const size = Ctx.atomicSize(w.bytes);
+    const base = try getInt(self, vregOf(self, ptr), ascratch1);
+    const oper = try getInt(self, vregOf(self, operand), ascratch2);
+    const retry_off: u32 = @intCast(self.code.items.len);
+    try self.ldaxr(size, @intFromEnum(base), @intFromEnum(scratch1));
+    switch (op) {
+        .atomic_rmw_add => try self.addRR(scratch2, scratch1, oper),
+        .atomic_rmw_sub => try self.subRR(scratch2, scratch1, oper),
+        .atomic_rmw_and => try self.logicalRR(.and_, scratch2, scratch1, oper),
+        .atomic_rmw_or => try self.logicalRR(.orr, scratch2, scratch1, oper),
+        .atomic_rmw_xchg => try self.movRR(scratch2, oper),
+        else => unreachable,
+    }
+    try self.stlxr(size, @intFromEnum(scratch3), @intFromEnum(base), @intFromEnum(scratch2));
+    const cbnz_off: u32 = @intCast(self.code.items.len);
+    try self.cbnz(false, @intFromEnum(scratch3), @intCast(@divExact(@as(i64, retry_off) - @as(i64, cbnz_off), 4)));
+    try canonNarrow(self, scratch1, w);
+    try putInt(self, dst, scratch1);
+}
+
+/// Go-style CAS: swaps `desired` in iff `[ptr] == expected`, result is the
+/// bool "did it swap". `scratch1`=old, `scratch2`=desired, `scratch3`=status,
+/// `ascratch1`=base, `ascratch2`=expected.
+fn emitAtomicCmpxchg(self: *Ctx, dst: u32, ptr: ir.ValueId, expected: ir.ValueId, desired: ir.ValueId) !void {
+    const w = common.widthOf(self.tctx(), self.f.valueType(expected));
+    const size = Ctx.atomicSize(w.bytes);
+    const base = try getInt(self, vregOf(self, ptr), ascratch1);
+    const exp = try getInt(self, vregOf(self, expected), ascratch2);
+    const des = try getInt(self, vregOf(self, desired), scratch2);
+    const retry_off: u32 = @intCast(self.code.items.len);
+    try self.ldaxr(size, @intFromEnum(base), @intFromEnum(scratch1));
+    try canonNarrow(self, scratch1, w); // canonicalize old to match `expected` before the compare
+    try self.cmpRR(scratch1, exp);
+    const bne_fixup = try self.emitLocalCondBranch(Cond.ne);
+    try self.stlxr(size, @intFromEnum(scratch3), @intFromEnum(base), @intFromEnum(des));
+    const cbnz_off: u32 = @intCast(self.code.items.len);
+    try self.cbnz(false, @intFromEnum(scratch3), @intCast(@divExact(@as(i64, retry_off) - @as(i64, cbnz_off), 4)));
+    self.patchLocalCondBranch(bne_fixup); // success fall-through and mismatch converge here
+    try self.cset(scratch1, Cond.eq); // Z from the last CMP: set iff old == expected
+    try putInt(self, dst, scratch1);
+}
+
 fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
     const i: u32 = @intFromEnum(id);
     const op = self.f.insts.items(.op)[i];
@@ -1829,6 +1951,10 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .call_iface => |c| try emitCallIface(self, if (ty != .invalid) i else null, ty, c.iface, c.method_index, c.args),
         .gc_alloc => |g| try emitGcAlloc(self, i, g.size, g.ptr_offsets),
         .type_info => |t| try emitTypeInfo(self, i, t.disc, t.size, t.ptr_offsets),
+        .atomic_load => |a| try emitAtomicLoad(self, i, a.ptr, ty),
+        .atomic_store => |a| try emitAtomicStore(self, a.ptr, a.value, self.f.valueType(a.value)),
+        .atomic_cmpxchg => |a| try emitAtomicCmpxchg(self, i, a.ptr, a.expected, a.desired),
+        .atomic_rmw => |a| try emitAtomicRmw(self, op, i, a.ptr, a.operand, ty),
         .field_get => |fg| try emitFieldGet(self, i, fg.base, fg.offset, ty),
         .field_set => |fs| try emitFieldSet(self, fs.base, fs.offset, fs.value, self.f.valueType(fs.value)),
         .index_get => |ig| try emitIndexGet(self, i, ig.base, ig.index, ty),
@@ -1953,6 +2079,20 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
             extendOne(intervals, use_pos, @intFromEnum(is_.value));
         },
         .slice_len => |sl| extendOne(intervals, use_pos, @intFromEnum(sl.base)),
+        .atomic_load => |a| extendOne(intervals, use_pos, @intFromEnum(a.ptr)),
+        .atomic_store => |a| {
+            extendOne(intervals, use_pos, @intFromEnum(a.ptr));
+            extendOne(intervals, use_pos, @intFromEnum(a.value));
+        },
+        .atomic_cmpxchg => |a| {
+            extendOne(intervals, use_pos, @intFromEnum(a.ptr));
+            extendOne(intervals, use_pos, @intFromEnum(a.expected));
+            extendOne(intervals, use_pos, @intFromEnum(a.desired));
+        },
+        .atomic_rmw => |a| {
+            extendOne(intervals, use_pos, @intFromEnum(a.ptr));
+            extendOne(intervals, use_pos, @intFromEnum(a.operand));
+        },
         .make_closure => |mc| extendOne(intervals, use_pos, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| extendOne(intervals, use_pos, a),

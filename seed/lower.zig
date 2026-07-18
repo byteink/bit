@@ -2553,6 +2553,12 @@ const FnCtx = struct {
             const cv = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
             return self.b.rtCall(void_ty, .chan_close, &.{cv});
         }
+        if (atomicRmwOp(name) != null or std.mem.eql(u8, name, "atomicLoad") or
+            std.mem.eql(u8, name, "atomicStore") or std.mem.eql(u8, name, "atomicCmpxchg"))
+        {
+            return self.lowerAtomic(node, name);
+        }
+        if (std.mem.eql(u8, name, "ptrOf")) return self.lowerPtrOf(node);
         if (std.mem.eql(u8, name, "append")) return self.lowerAppend(node);
         // Runtime primitives (fs §14, math §17, time §18, os §19): each maps 1:1
         // to a runtime call whose result the checker already typed. The arity and
@@ -2639,6 +2645,58 @@ const FnCtx = struct {
             acc = try self.b.rtCall(slice_ty, .slice_append, &.{ acc, v });
         }
         return acc;
+    }
+
+    /// `atomicAdd`/`atomicSub`/`atomicAnd`/`atomicOr`/`atomicXchg` -> its IR op,
+    /// or `null` for a non-rmw name. Mirrors `check.zig`'s `atomicArity`.
+    fn atomicRmwOp(name: []const u8) ?ir.Op {
+        if (std.mem.eql(u8, name, "atomicAdd")) return .atomic_rmw_add;
+        if (std.mem.eql(u8, name, "atomicSub")) return .atomic_rmw_sub;
+        if (std.mem.eql(u8, name, "atomicAnd")) return .atomic_rmw_and;
+        if (std.mem.eql(u8, name, "atomicOr")) return .atomic_rmw_or;
+        if (std.mem.eql(u8, name, "atomicXchg")) return .atomic_rmw_xchg;
+        return null;
+    }
+
+    /// `ptrOf(s)` (§11.5): the byte address of `s`'s element 0, as a `*T`. The
+    /// slice header is `{buf@0, len@8, off@16, cap@24, is_ref@32}` and each
+    /// element occupies one 8-byte word, so element 0 sits at `buf + off*8`
+    /// (nonzero `off` only after reslicing). The trailing `convert` retypes the
+    /// address word from `i64` to `*T` — both are one int word (is_ref=0).
+    fn lowerPtrOf(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const arg_nodes = self.kids(self.kids(node)[2]);
+        const s = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const buf = try self.b.fieldGet(i64ty, s, 0);
+        const off = try self.b.fieldGet(i64ty, s, 16);
+        const eight = try self.b.constInt(i64ty, 8);
+        const byteoff = try self.b.binary(.mul, i64ty, off, eight);
+        const addr = try self.b.binary(.add, i64ty, buf, byteoff);
+        return self.b.convert(try self.nodeType(node), addr);
+    }
+
+    /// Lowers an atomic builtin (§11.5) to its dedicated inline IR op. The
+    /// element type `T` (an integer prim) is read straight off the `*T`
+    /// argument's type — the same source `check.zig` validated against — and
+    /// every value argument is lowered with `T` as its hint.
+    fn lowerAtomic(self: *FnCtx, node: ast.Index, name: []const u8) Error!ir.ValueId {
+        const arg_nodes = self.kids(self.kids(node)[2]);
+        const ptr_inner = self.kids(arg_nodes[0])[0];
+        const ptr = try self.lowerExpr(ptr_inner);
+        const elem = self.ctx.typeOf(try self.nodeType(ptr_inner)).ptr;
+        if (std.mem.eql(u8, name, "atomicLoad")) return self.b.atomicLoad(elem, ptr);
+        if (std.mem.eql(u8, name, "atomicStore")) {
+            const v = try self.lowerExprH(self.kids(arg_nodes[1])[0], elem);
+            return self.b.atomicStore(ptr, v);
+        }
+        if (std.mem.eql(u8, name, "atomicCmpxchg")) {
+            const old = try self.lowerExprH(self.kids(arg_nodes[1])[0], elem);
+            const new = try self.lowerExprH(self.kids(arg_nodes[2])[0], elem);
+            return self.b.atomicCmpxchg(self.ctx.prim_ids.get(.bool), ptr, old, new);
+        }
+        const op = atomicRmwOp(name).?;
+        const v = try self.lowerExprH(self.kids(arg_nodes[1])[0], elem);
+        return self.b.atomicRmw(op, elem, ptr, v);
     }
 
     /// `chan<T>()` / `chan<T>(n)`: construct a channel of capacity `n` (0 =

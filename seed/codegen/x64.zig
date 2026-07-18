@@ -674,6 +674,55 @@ const Ctx = struct {
         try self.memModRM(@intFromEnum(src), base, index, scale, disp);
     }
 
+    // ---- atomics (§11.5) ---------------------------------------------------
+    // Memory-destination RMW forms with the operand register in `reg` and the
+    // target at `[base]` (disp=0). `lock` prepends the `F0` prefix; width picks
+    // the operand size (0x66 for 2, REX.W for 8). XCHG-with-memory is
+    // implicitly locked, so it never needs the prefix.
+
+    /// `[lock] 0F <op8|op> [base], reg` — CMPXCHG (op8=B0, op=B1) and
+    /// XADD (op8=C0, op=C1); both are `0F`-prefixed at every width.
+    fn atomic0F(self: *Ctx, lock: bool, op8: u8, op: u8, reg: Reg, base: Reg, width: u8) !void {
+        if (lock) try self.emitByte(0xF0);
+        if (width == 2) try self.emitByte(0x66);
+        const bits = regBits(@intFromEnum(reg), base, null);
+        // width 1 forces a REX even when otherwise unneeded, so a src in
+        // {rsi,rdi,rbp,rsp} reads as the new low-byte encoding (as `movStore`).
+        if (width == 1) try self.emitByte(rex(false, bits.r, bits.x, bits.b)) else try self.maybeRex(width == 8, bits.r, bits.x, bits.b);
+        try self.emitByte(0x0F);
+        try self.emitByte(if (width == 1) op8 else op);
+        try self.memModRM(@intFromEnum(reg), base, null, 1, 0);
+    }
+    fn lockCmpxchgMem(self: *Ctx, reg: Reg, base: Reg, width: u8) !void {
+        try self.atomic0F(true, 0xB0, 0xB1, reg, base, width);
+    }
+    fn lockXaddMem(self: *Ctx, reg: Reg, base: Reg, width: u8) !void {
+        try self.atomic0F(true, 0xC0, 0xC1, reg, base, width);
+    }
+    /// `XCHG [base], reg` (`86`/`87`) — a memory operand makes it implicitly
+    /// locked, so no `F0` prefix is emitted.
+    fn xchgMem(self: *Ctx, reg: Reg, base: Reg, width: u8) !void {
+        if (width == 2) try self.emitByte(0x66);
+        const bits = regBits(@intFromEnum(reg), base, null);
+        if (width == 1) try self.emitByte(rex(false, bits.r, bits.x, bits.b)) else try self.maybeRex(width == 8, bits.r, bits.x, bits.b);
+        try self.emitByte(if (width == 1) 0x86 else 0x87);
+        try self.memModRM(@intFromEnum(reg), base, null, 1, 0);
+    }
+    /// `MFENCE` (`0F AE F0`) — full barrier after a seq-cst store.
+    fn mfence(self: *Ctx) !void {
+        try self.emitByte(0x0F);
+        try self.emitByte(0xAE);
+        try self.emitByte(0xF0);
+    }
+    /// `Jcc rel32` to an already-emitted local byte offset (the CAS retry
+    /// label) — a backward branch inside one instruction's own codegen.
+    fn jccToOffset(self: *Ctx, cc: u4, target_off: u32) !void {
+        try self.emitByte(0x0F);
+        try self.emitByte(0x80 | @as(u8, cc));
+        const next: i64 = @as(i64, @intCast(self.code.items.len)) + 4;
+        try self.emitI32(@intCast(@as(i64, target_off) - next));
+    }
+
     // ---- SSE2 scalar float --------------------------------------------------
 
     fn fPrefix(width: u8) u8 {
@@ -2021,6 +2070,20 @@ fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
             markUse(intervals, @intFromEnum(c.iface), pos);
             for (c.args) |a| markUse(intervals, a, pos);
         },
+        .atomic_load => |a| markUse(intervals, @intFromEnum(a.ptr), pos),
+        .atomic_store => |a| {
+            markUse(intervals, @intFromEnum(a.ptr), pos);
+            markUse(intervals, @intFromEnum(a.value), pos);
+        },
+        .atomic_cmpxchg => |a| {
+            markUse(intervals, @intFromEnum(a.ptr), pos);
+            markUse(intervals, @intFromEnum(a.expected), pos);
+            markUse(intervals, @intFromEnum(a.desired), pos);
+        },
+        .atomic_rmw => |a| {
+            markUse(intervals, @intFromEnum(a.ptr), pos);
+            markUse(intervals, @intFromEnum(a.operand), pos);
+        },
         .field_get => |fg| markUse(intervals, @intFromEnum(fg.base), pos),
         .field_set => |fs| {
             markUse(intervals, @intFromEnum(fs.base), pos);
@@ -2173,6 +2236,10 @@ fn scanFuncFlags(f: *const ir.Function) FuncFlags {
             switch (f.insts.items(.op)[i]) {
                 .call, .rt_call, .gc_alloc, .make_closure, .call_value, .call_iface => flags.has_safepoints = true,
                 .sdiv, .udiv, .srem, .urem => flags.needs_rax_rdx = true,
+                // CMPXCHG (and the AND/OR CAS-retry loops) commandeer `rax` as
+                // the implicit accumulator — reserve it (via the same rax/rdx
+                // exclusion) for the whole function, exactly like `idiv`.
+                .atomic_cmpxchg, .atomic_rmw_and, .atomic_rmw_or => flags.needs_rax_rdx = true,
                 .shl, .ashr, .lshr => {
                     const b = f.decode(@enumFromInt(i)).bin;
                     if (constShiftAmount(f, b.rhs) == null) flags.needs_rcx = true;
@@ -2195,6 +2262,77 @@ fn scanFuncFlags(f: *const ir.Function) FuncFlags {
 // ============================================================================
 // Instruction dispatch
 // ============================================================================
+
+// ---- atomics (§11.5) ------------------------------------------------------
+// `*T` is an int-classed word; every sequence is call-free (never a safepoint).
+// `lock`-prefixed forms are seq-cst regardless of the requested ordering.
+
+fn emitAtomicLoad(self: *Ctx, dst: u32, ptr: ir.ValueId, ty: TypeId) !void {
+    const w = widthOf(self.tctx(), ty);
+    const base = try getInt(self, vregOf(self, ptr), scratch2);
+    try self.movLoad(scratch1, base, null, 1, 0, w.bytes, w.signed); // plain load is acquire on x86-TSO
+    try putInt(self, dst, scratch1);
+}
+
+fn emitAtomicStore(self: *Ctx, ptr: ir.ValueId, value: ir.ValueId, ty: TypeId) !void {
+    const w = widthOf(self.tctx(), ty);
+    const base = try getInt(self, vregOf(self, ptr), scratch2);
+    const val = try getInt(self, vregOf(self, value), scratch1);
+    try self.movStore(base, null, 1, 0, val, w.bytes);
+    try self.mfence(); // a seq-cst store needs a trailing full barrier on x86
+}
+
+/// `rax` is pinned in this function (`scanFuncFlags` sets `needs_rax_rdx`), so
+/// CMPXCHG's implicit accumulator is free to clobber. Result is the Go-style
+/// bool "did it swap".
+fn emitAtomicCmpxchg(self: *Ctx, dst: u32, ptr: ir.ValueId, expected: ir.ValueId, desired: ir.ValueId) !void {
+    const w = widthOf(self.tctx(), self.f.valueType(expected));
+    const base = try getInt(self, vregOf(self, ptr), scratch2);
+    const des = try getInt(self, vregOf(self, desired), scratch3);
+    const exp = try getInt(self, vregOf(self, expected), scratch1);
+    try self.movRR(.rax, exp);
+    try self.lockCmpxchgMem(des, base, w.bytes);
+    try self.setcc(CC.e, scratch1); // ZF=1 => swapped
+    try self.movzxb(scratch1, scratch1);
+    try putInt(self, dst, scratch1);
+}
+
+/// Fetch-and-op; returns the pre-op value. add/sub/xchg map to single
+/// `lock`-implicit instructions; and/or have no native fetch form on x86 and
+/// use the standard CMPXCHG retry loop (`rax` pinned).
+fn emitAtomicRmw(self: *Ctx, op: ir.Op, dst: u32, ptr: ir.ValueId, operand: ir.ValueId, ty: TypeId) !void {
+    const w = widthOf(self.tctx(), ty);
+    const base = try getInt(self, vregOf(self, ptr), scratch2);
+    switch (op) {
+        .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_xchg => {
+            const oper = try getInt(self, vregOf(self, operand), scratch1);
+            try self.movRR(scratch1, oper); // reg holds the source and receives the old value
+            switch (op) {
+                .atomic_rmw_add => try self.lockXaddMem(scratch1, base, w.bytes),
+                .atomic_rmw_sub => {
+                    try self.negR(scratch1); // fetch-and-sub == fetch-and-add(-v)
+                    try self.lockXaddMem(scratch1, base, w.bytes);
+                },
+                .atomic_rmw_xchg => try self.xchgMem(scratch1, base, w.bytes),
+                else => unreachable,
+            }
+        },
+        .atomic_rmw_and, .atomic_rmw_or => {
+            const oper = try getInt(self, vregOf(self, operand), scratch3);
+            try self.movLoad(.rax, base, null, 1, 0, w.bytes, w.signed);
+            const retry_off: u32 = @intCast(self.code.items.len);
+            try canonNarrow(self, .rax, w); // keep the comparand canonical each iteration
+            try self.movRR(scratch1, .rax);
+            if (op == .atomic_rmw_and) try self.arithRR(.and_, scratch1, oper) else try self.arithRR(.or_, scratch1, oper);
+            try self.lockCmpxchgMem(scratch1, base, w.bytes);
+            try self.jccToOffset(CC.ne, retry_off); // JNZ retry: reservation lost, rax reloaded
+            try self.movRR(scratch1, .rax); // rax holds the old (pre-op) value
+        },
+        else => unreachable,
+    }
+    try canonNarrow(self, scratch1, w);
+    try putInt(self, dst, scratch1);
+}
 
 fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
     const i: u32 = @intFromEnum(id);
@@ -2240,6 +2378,10 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
             const ret: ?CallReturn = if (self.tctx().typeOf(ty) == .void) null else .{ .dst = dst, .ty = ty };
             try emitCallLike(self, rt_symbol.get(d.rt_call.rt), d.rt_call.args, ret);
         },
+        .atomic_load => try emitAtomicLoad(self, dst, d.atomic_load.ptr, ty),
+        .atomic_store => try emitAtomicStore(self, d.atomic_store.ptr, d.atomic_store.value, self.f.valueType(d.atomic_store.value)),
+        .atomic_cmpxchg => try emitAtomicCmpxchg(self, dst, d.atomic_cmpxchg.ptr, d.atomic_cmpxchg.expected, d.atomic_cmpxchg.desired),
+        .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_and, .atomic_rmw_or, .atomic_rmw_xchg => try emitAtomicRmw(self, op, dst, d.atomic_rmw.ptr, d.atomic_rmw.operand, ty),
         .field_get => try emitFieldGet(self, dst, d.field_get.base, d.field_get.offset, ty),
         .field_set => try emitFieldSet(self, d.field_set.base, d.field_set.offset, d.field_set.value, self.f.valueType(d.field_set.value)),
         .index_get => try emitIndexGet(self, dst, d.index_get.base, d.index_get.index, ty),

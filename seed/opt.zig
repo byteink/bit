@@ -492,6 +492,10 @@ fn emitTranslated(
         .index_get => |ig| remap[idx] = try bldr.indexGet(ty, tr(remap, @intFromEnum(ig.base)), tr(remap, @intFromEnum(ig.index))),
         .index_set => |is_| try bldr.indexSet(tr(remap, @intFromEnum(is_.base)), tr(remap, @intFromEnum(is_.index)), tr(remap, @intFromEnum(is_.value))),
         .slice_len => |sl| remap[idx] = try bldr.sliceLen(ty, tr(remap, @intFromEnum(sl.base))),
+        .atomic_load => |a| remap[idx] = try bldr.atomicLoad(ty, tr(remap, @intFromEnum(a.ptr))),
+        .atomic_store => |a| remap[idx] = try bldr.atomicStore(tr(remap, @intFromEnum(a.ptr)), tr(remap, @intFromEnum(a.value))),
+        .atomic_cmpxchg => |a| remap[idx] = try bldr.atomicCmpxchg(ty, tr(remap, @intFromEnum(a.ptr)), tr(remap, @intFromEnum(a.expected)), tr(remap, @intFromEnum(a.desired))),
+        .atomic_rmw => |a| remap[idx] = try bldr.atomicRmw(op, ty, tr(remap, @intFromEnum(a.ptr)), tr(remap, @intFromEnum(a.operand))),
         .make_closure => |mc| remap[idx] = try bldr.makeClosure(ty, mc.func, tr(remap, @intFromEnum(mc.env))),
         .func_addr => |fa| remap[idx] = try bldr.funcAddr(ty, fa.func),
         .rt_call => |rc| {
@@ -585,6 +589,10 @@ fn foldConstantsAndPrune(gpa: Allocator, ctx: *const check.TypeContext, f: *cons
 fn isSideEffecting(op: ir.Op) bool {
     return switch (op) {
         .call, .call_value, .call_iface, .rt_call, .field_set, .index_set, .index_get, .gc_alloc, .make_closure, .sdiv, .udiv, .srem, .urem => true,
+        // Atomics touch shared memory and must never be dropped, hoisted, or
+        // deduplicated even when their result is unused — a cross-thread
+        // observer depends on the access happening exactly here.
+        .atomic_load, .atomic_store, .atomic_cmpxchg, .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_and, .atomic_rmw_or, .atomic_rmw_xchg => true,
         else => op.isTerminator(),
     };
 }
@@ -634,6 +642,20 @@ fn markOperandsLive(f: *const ir.Function, live: []bool, id: ir.ValueId) void {
             live[@intFromEnum(is_.value)] = true;
         },
         .slice_len => |sl| live[@intFromEnum(sl.base)] = true,
+        .atomic_load => |a| live[@intFromEnum(a.ptr)] = true,
+        .atomic_store => |a| {
+            live[@intFromEnum(a.ptr)] = true;
+            live[@intFromEnum(a.value)] = true;
+        },
+        .atomic_cmpxchg => |a| {
+            live[@intFromEnum(a.ptr)] = true;
+            live[@intFromEnum(a.expected)] = true;
+            live[@intFromEnum(a.desired)] = true;
+        },
+        .atomic_rmw => |a| {
+            live[@intFromEnum(a.ptr)] = true;
+            live[@intFromEnum(a.operand)] = true;
+        },
         .make_closure => |mc| live[@intFromEnum(mc.env)] = true,
         .rt_call => |rc| for (rc.args) |a| {
             live[a] = true;

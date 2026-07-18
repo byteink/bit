@@ -198,6 +198,13 @@ const predeclared_funcs = [_][]const u8{
     "parseFloat",
     // Float bit patterns, for the self-hosted compiler's `const_float` codegen.
     "floatBits",  "float32Bits",
+    // Atomics (§11.5) — inline lock-free ops on a raw `*T` (Stage-2 subset).
+    "atomicLoad",       "atomicStore", "atomicCmpxchg", "atomicAdd", "atomicSub",
+    "atomicAnd",        "atomicOr",    "atomicXchg",
+    // `ptrOf(s: []T): *T` — address of a slice's element 0, the one bridge from
+    // traced memory to a raw `*T` (there is no `&`); lets atomics target a live,
+    // GC-kept buffer.
+    "ptrOf",
 };
 
 // ============================================================================

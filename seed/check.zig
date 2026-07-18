@@ -2642,6 +2642,42 @@ const Checker = struct {
             try self.expect(file_idx, inner, t, key);
             return self.ctx.void_id;
         }
+        // Atomics (§11.5): the first argument is a `*T` (T an integer prim);
+        // the pointer's element type drives the rest, exactly like `append`
+        // reads its element from the slice argument. Lowered to inline machine
+        // ops, never a `prim_sigs`/`rt_call` (a spin/CAS loop must stay
+        // call-free).
+        if (atomicArity(name)) |arity| {
+            return self.checkAtomicCall(file_idx, node, name, arity, arg_items, env, fctx);
+        }
+        // `ptrOf(s: []T): *T` (§11.5): the address of `s`'s first element, the
+        // only bridge from a traced slice to a raw `*T` (no `&` exists). `T`
+        // must be an integer prim — the same targets the atomics accept.
+        if (std.mem.eql(u8, name, "ptrOf")) {
+            if (arg_items.len != 1) {
+                try self.emit(mf, node, .arg_count_mismatch, "'ptrOf' takes exactly 1 argument, found {d}", .{arg_items.len}, null);
+                try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+                return .invalid;
+            }
+            const slice_ty = try self.checkArgExprType(file_idx, arg_items[0], env, fctx);
+            if (self.ctx.typeOf(slice_ty) != .slice) {
+                if (slice_ty != .invalid) {
+                    const n = try self.typeName(slice_ty);
+                    defer self.gpa.free(n);
+                    try self.emit(mf, arg_items[0], .invalid_operand, "'ptrOf' requires a slice '[]T', found '{s}'", .{n}, null);
+                }
+                return .invalid;
+            }
+            const elem = self.ctx.typeOf(slice_ty).slice;
+            const elem_ok = self.ctx.typeOf(elem) == .prim and self.ctx.typeOf(elem).prim.isInteger();
+            if (!elem_ok) {
+                const n = try self.typeName(elem);
+                defer self.gpa.free(n);
+                try self.emit(mf, arg_items[0], .invalid_operand, "'ptrOf' requires an integer element, found '[]{s}'", .{n}, null);
+                return .invalid;
+            }
+            return self.ctx.types.intern(.{ .ptr = elem });
+        }
         // `cryptoSecureZero(b: []byte)`: special-cased rather than a `prim_sigs`
         // row because its `[]byte` parameter is not a `Prim` (ABI.md §21).
         if (std.mem.eql(u8, name, "cryptoSecureZero")) {
@@ -2721,6 +2757,61 @@ const Checker = struct {
         }
         try self.checkArgsLoose(file_idx, arg_items, env, fctx);
         return .invalid;
+    }
+
+    /// Argument count for an atomic builtin (§11.5), or `null` if `name` is not
+    /// one: load takes `(p)`, store/rmw take `(p, v)`, cmpxchg takes
+    /// `(p, old, new)`. All take a `*T` first argument.
+    fn atomicArity(name: []const u8) ?usize {
+        if (std.mem.eql(u8, name, "atomicLoad")) return 1;
+        if (std.mem.eql(u8, name, "atomicStore")) return 2;
+        if (std.mem.eql(u8, name, "atomicCmpxchg")) return 3;
+        if (std.mem.eql(u8, name, "atomicAdd") or std.mem.eql(u8, name, "atomicSub") or
+            std.mem.eql(u8, name, "atomicAnd") or std.mem.eql(u8, name, "atomicOr") or
+            std.mem.eql(u8, name, "atomicXchg")) return 2;
+        return null;
+    }
+
+    /// Type-checks an atomic builtin. The first argument must be a `*T` whose
+    /// element `T` is an integer prim; every remaining argument is checked
+    /// against `T`. Result: `atomicStore` → `()`, `atomicCmpxchg` → `bool`,
+    /// everything else (load, the rmw family) → `T` (the pre-op value for rmw).
+    fn checkAtomicCall(self: *Checker, file_idx: usize, node: ast.Index, name: []const u8, arity: usize, arg_items: []const ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+        const mf = self.files[file_idx];
+        const ret_void = std.mem.eql(u8, name, "atomicStore");
+        const ret_bool = std.mem.eql(u8, name, "atomicCmpxchg");
+        const result: TypeId = if (ret_void) self.ctx.void_id else if (ret_bool) self.ctx.prim_ids.get(.bool) else .invalid;
+        if (arg_items.len == 0) {
+            try self.emit(mf, node, .arg_count_mismatch, "'{s}' takes a '*T' pointer as its first argument", .{name}, null);
+            return result;
+        }
+        const ptr_ty = try self.checkArgExprType(file_idx, arg_items[0], env, fctx);
+        if (self.ctx.typeOf(ptr_ty) != .ptr) {
+            if (ptr_ty != .invalid) {
+                const n = try self.typeName(ptr_ty);
+                defer self.gpa.free(n);
+                try self.emit(mf, arg_items[0], .invalid_operand, "'{s}' requires a '*T' pointer, found '{s}'", .{ name, n }, null);
+            }
+            try self.checkArgsLoose(file_idx, arg_items[1..], env, fctx);
+            return if (result == .invalid) self.ctx.void_id else result;
+        }
+        const elem = self.ctx.typeOf(ptr_ty).ptr;
+        const elem_ok = elem != .invalid and self.ctx.typeOf(elem) == .prim and self.ctx.typeOf(elem).prim.isInteger();
+        if (!elem_ok) {
+            const n = try self.typeName(elem);
+            defer self.gpa.free(n);
+            try self.emit(mf, arg_items[0], .invalid_operand, "'{s}' requires an integer target, found '*{s}'", .{ name, n }, null);
+        }
+        if (arg_items.len != arity) {
+            try self.emit(mf, node, .arg_count_mismatch, "'{s}' takes exactly {d} argument(s), found {d}", .{ name, arity, arg_items.len }, null);
+        }
+        // Every value argument (all but the pointer) is checked against `T`.
+        for (arg_items[1..]) |a| {
+            const inner = mf.tree.kids(a)[0];
+            const t = try self.checkExpr(file_idx, inner, env, fctx, elem);
+            if (elem_ok) try self.expect(file_idx, inner, t, elem);
+        }
+        return if (ret_void) self.ctx.void_id else if (ret_bool) self.ctx.prim_ids.get(.bool) else elem;
     }
 
     /// Checks a fixed-arity builtin call: exactly `want.len` arguments, each
