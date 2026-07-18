@@ -556,7 +556,12 @@ const Resolver = struct {
         const path_node = kids[1];
         const path_text = stringLitText(mf, path_node);
         const resolution = self.imports.get(path_text) orelse .not_found;
-        const target: ?ModuleId = switch (resolution) {
+        // A path the parser could not read is `none`, which carries no span. The
+        // parser already said "expected a string literal", so a second error here
+        // is a cascade — and one that renders against whatever file happens to
+        // hold offset 0 (the prelude, in a project build), blaming a file the user
+        // never touched. Bind the names as unresolved and stay quiet.
+        const target: ?ModuleId = if (path_node == ast.none) null else switch (resolution) {
             .ok => |m| m,
             .cycle => blk: {
                 try self.emit(.err, mf, path_node, .import_cycle, "import cycle: module \"{s}\" depends on itself", .{path_text}, null);

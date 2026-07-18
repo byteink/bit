@@ -1855,6 +1855,35 @@ modules, or a relative path `"./util"`, `"../shared"` for project-local modules.
 
 Only **exported** members (§17.3) are importable. Import cycles are rejected.
 
+**Wrapping a long import.** An `import` is an ordinary statement, so §7's semicolon
+insertion applies to it unchanged — there is no import-specific newline rule. A
+line break is therefore only legal where the line does **not** end in a terminator
+token. `}` and IDENT are terminators, so these two forms are **rejected**:
+
+```
+import { f, g }
+  from "./util"      // ';' inserted after '}' -> "expected 'from'"
+
+import {
+  f,
+  g                  // ';' inserted after 'g' -> "expected '}'"
+} from "./util"
+```
+
+The wrapped spelling that works ends every broken line on `{` or `,`, neither of
+which is a terminator — that is, the usual trailing-comma style:
+
+```
+import {
+  f,
+  g,
+} from "./util"
+```
+
+A single-line `import` needs no trailing comma. This is the same rule that governs
+every other statement, applied without exception; §7's line-continuation guidance
+is the general form of it.
+
 ### 17.3 Visibility
 
 Visibility is by the explicit `export` keyword, not by identifier casing:
