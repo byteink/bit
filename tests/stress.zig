@@ -3,12 +3,25 @@
 //! hammers spawn / channels / select / the collector under load and prints a
 //! single deterministic line encoding its own correctness (a checksum, a sum).
 //!
-//! Every program is run **twice** — once with the default collector policy, and
-//! once under `BIT_GC=stress`, which collects at every safepoint. The second run
-//! is a precise-rooting oracle: any root the compiler or runtime fails to report
-//! is swept the instant it stops being marked, so a rooting bug that a rare
-//! production collection would only occasionally hit becomes a deterministic
-//! wrong answer here. Both runs must reproduce the program's `.expected` output.
+//! Every program is built by **both compilers** — the bootstrap seed `bit-seed`
+//! (in-process, via `bit.buildHostProject`) and the self-hosted `bit` (as a
+//! subprocess, since it is a Bit-compiled binary and not a Zig module) — and
+//! each of the two binaries is then run **twice**: once with the default
+//! collector policy, and once under `BIT_GC=stress`, which collects at every
+//! safepoint. The stress run is a precise-rooting oracle: any root the compiler
+//! or runtime fails to report is swept the instant it stops being marked, so a
+//! rooting bug that a rare production collection would only occasionally hit
+//! becomes a deterministic wrong answer here. All four runs must reproduce the
+//! program's `.expected` output.
+//!
+//! THE SELF-HOSTED PASS IS THE POINT OF THE SUITE, NOT AN EXTRA (#1413). This
+//! harness drove only the seed until then — the retired compiler — so the
+//! production-readiness gate for the runtime said nothing whatsoever about the
+//! compiler the project exists to ship, and gate #1369 (self-hosted `bit` builds
+//! the runtime) rested on a suite that never asked. That was not theoretical:
+//! #1414 is two runtime modules the seed builds and self-hosted `bit` does not.
+//! Do not "fix" a failure here by skipping the program — a skip-list reads as
+//! coverage and is exactly the hole this pass was added to close.
 //!
 //! THE ORACLE IS ONLY AS DENSE AS THE SAFEPOINTS, and a program must earn it.
 //! Codegen emits `bit_rt_safepoint` at loop back-edges (runtime/ABI.md §4);
@@ -39,6 +52,13 @@ const max_programs = 256;
 
 test "stress programs pass under default and BIT_GC=stress" {
     if (build_options.libbitrt_path.len == 0) return; // host not a runtime target
+
+    // A host that can link libbitrt is a native build, and a native build always
+    // produces the self-hosted `bit`. Assert it rather than degrading to the
+    // seed-only pass: a self-hosted pass that quietly did not happen is exactly
+    // the shape of #1413, and a green suite must not be able to mean "half of
+    // what it claims to check was not wired up".
+    try testing.expect(build_options.selfhost_bit.len > 0);
 
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();
@@ -92,25 +112,15 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     const linux_only = if (Dir.cwd().statFile(io, linux_marker, .{})) |_| true else |_| false;
     if (linux_only and builtin.target.os.tag != .linux) return;
 
-    var discard: Io.Writer.Allocating = .init(gpa);
-    defer discard.deinit();
-    // Whole-project build, not the single-module entry: a stress program is a
-    // directory, so it gets the prelude and may import another module — which
-    // `spinlock` does, pulling the lock under test straight out of `runtime/`
-    // instead of testing a stale copy of it.
-    const exe = (try bit.buildHostProject(gpa, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
-        std.debug.print("stress '{s}': compile failed:\n{s}\n", .{ name, discard.written() });
-        return error.StressCompileFailed;
-    };
-    defer gpa.free(exe);
-
     const expected_path = try std.fmt.allocPrint(gpa, "{s}/{s}.expected", .{ dir_abs, name });
     defer gpa.free(expected_path);
     const expected = try Dir.cwd().readFileAlloc(io, expected_path, gpa, .limited(64 << 10));
     defer gpa.free(expected);
 
-    const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-stress-{s}-{x}", .{ name, testing.random_seed }, 0);
-    defer gpa.free(bin_path);
+    const seed_bin = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-stress-seed-{s}-{x}", .{ name, testing.random_seed }, 0);
+    defer gpa.free(seed_bin);
+    const self_bin = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-stress-self-{s}-{x}", .{ name, testing.random_seed }, 0);
+    defer gpa.free(self_bin);
 
     // Per-test io over `gpa` so `std.process.run`'s spawn arena does not trip
     // `testing.allocator`'s leak detector (same rationale as the examples guard).
@@ -118,19 +128,81 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     defer run_threaded.deinit();
     const run_io = run_threaded.io();
 
-    try Dir.cwd().writeFile(run_io, .{ .sub_path = bin_path, .data = exe, .flags = .{ .permissions = .executable_file } });
-    defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
+    // ---- Phase 1: compile, write, fork nothing that could inherit a write fd.
+    //
+    // `74811a3`'s discipline, kept as this suite gained a second compiler: never
+    // let a `fork` happen while this process holds a write fd to a binary it is
+    // about to `execve`, because `fork` copies the whole fd table and Linux
+    // refuses to exec an inode whose writecount is nonzero (ETXTBSY). Driving
+    // self-hosted `bit` means forking, so it goes FIRST — before this process
+    // opens anything for writing — and the seed's `writeFile` (which forks
+    // nothing) follows it. No exec of a stress binary happens until phase 2, by
+    // which point no write fd to either of them exists anywhere.
+    defer Dir.cwd().deleteFile(run_io, self_bin) catch {};
+    try buildWithSelfhost(gpa, run_io, name, dir_abs, self_bin);
 
-    try runOnce(gpa, run_io, name, bin_path, expected, null);
+    var discard: Io.Writer.Allocating = .init(gpa);
+    defer discard.deinit();
+    // Whole-project build, not the single-module entry: a stress program is a
+    // directory, so it gets the prelude and may import another module — which
+    // `spinlock` does, pulling the lock under test straight out of `runtime/`
+    // instead of testing a stale copy of it.
+    const exe = (try bit.buildHostProject(gpa, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
+        std.debug.print("stress '{s}' [seed]: compile failed:\n{s}\n", .{ name, discard.written() });
+        return error.StressCompileFailed;
+    };
+    defer gpa.free(exe);
+
+    defer Dir.cwd().deleteFile(run_io, seed_bin) catch {};
+    try Dir.cwd().writeFile(run_io, .{ .sub_path = seed_bin, .data = exe, .flags = .{ .permissions = .executable_file } });
+
+    // ---- Phase 2: exec only. Both compilers' output must satisfy `.expected`
+    // identically, under both collector policies.
+    try runBoth(gpa, run_io, name, "seed", seed_bin, expected);
+    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected);
+}
+
+/// Build `dir_abs` with the self-hosted `bit`. It is a Bit-compiled executable,
+/// not a Zig module this harness can import, so it is driven as a subprocess.
+/// `BIT_LIBBITRT`/`BIT_STDLIB` hand it the same archive and stdlib the seed pass
+/// is handed, which both puts the two compilers on identical inputs and keeps
+/// the harness independent of its working directory.
+fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: []const u8, out_path: [:0]const u8) !void {
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("BIT_LIBBITRT", build_options.libbitrt_path);
+    try env.put("BIT_STDLIB", build_options.stdlib_dir);
+
+    const result = try std.process.run(gpa, run_io, .{
+        .argv = &.{ build_options.selfhost_bit, "build", dir_abs, "-o", out_path },
+        .environ_map = &env,
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    const ok = switch (result.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (ok) return;
+    std.debug.print("stress '{s}' [selfhost]: compile failed:\n{s}{s}\n", .{ name, result.stdout, result.stderr });
+    return error.StressSelfhostCompileFailed;
+}
+
+/// Both collector policies for one compiler's binary.
+fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8) !void {
+    try runOnce(gpa, run_io, name, who, bin_path, expected, null);
 
     var stress_env = std.process.Environ.Map.init(gpa);
     defer stress_env.deinit();
     try stress_env.put("BIT_GC", "stress");
-    try runOnce(gpa, run_io, name, bin_path, expected, &stress_env);
+    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env);
 }
 
-fn runOnce(gpa: std.mem.Allocator, run_io: Io, name: []const u8, bin_path: [:0]const u8, expected: []const u8, env: ?*const std.process.Environ.Map) !void {
-    const mode = if (env == null) "default" else "BIT_GC=stress";
+fn runOnce(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, env: ?*const std.process.Environ.Map) !void {
+    const policy = if (env == null) "default" else "BIT_GC=stress";
+    const mode = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ who, policy });
+    defer gpa.free(mode);
     const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path}, .environ_map = env });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);

@@ -344,7 +344,21 @@ pub fn build(b: *std.Build) void {
     stress_mod.addOptions("build_options", stress_opts);
 
     const stress_tests = b.addTest(.{ .root_module = stress_mod });
-    test_step.dependOn(&b.addRunArtifact(stress_tests).step);
+    const stress_run = b.addRunArtifact(stress_tests);
+    // The `tests/stress/*` programs are read at runtime, so a new program is
+    // invisible to the build cache — same reason the imports harness sets this.
+    // It matters more now that the run also drives the self-hosted `bit`, whose
+    // sources are equally invisible: a cache-skipped run would quietly stop
+    // checking the compiler this pass exists to check.
+    stress_run.has_side_effects = true;
+    test_step.dependOn(&stress_run.step);
+
+    // Scoped runner, same rationale as `test-imports`: this corpus now builds
+    // every program with both compilers, making it the slowest harness here and
+    // the one most worth running alone while chasing a self-hosted build failure.
+    const test_stress_step = b.step("test-stress", "run the tests/stress/* harness only");
+    test_stress_step.dependOn(&stress_run.step);
+    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
     // GC differential (#1363): drives runtime/gc.zig through the same scripted
     // sequence tests/stress/gcbit drives runtime/gc/gc.bit through, and asserts
@@ -702,8 +716,26 @@ pub fn build(b: *std.Build) void {
     const install_bit = b.addInstallBinFile(selfhosted, "bit");
     // Only pull `bit` into the default install on a native build (see above).
     if (native) b.getInstallStep().dependOn(&install_bit.step);
+
     const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bit-seed → bit");
     selfhost_step.dependOn(&install_bit.step);
+
+    // Hand the stress harness the self-hosted compiler so it builds every stress
+    // program with BOTH compilers (#1413). Until this, the suite drove only the
+    // seed, so nothing in `zig build test` would have noticed if self-hosted
+    // `bit` could not build a runtime module at all — and #1414 is two runtime
+    // modules where it cannot. Passing the LazyPath (not a `zig-out` string)
+    // gives the harness a build-graph edge on the freshly-built `bit`, the same
+    // reason `wireLibbitrt` uses the emitted-bin path rather than the install
+    // path. Empty on a cross build: producing `bit` means EXECING the seed,
+    // which a cross-built seed cannot do, and the cross-built harness could not
+    // run either way — so the harness asserts non-empty once it knows it is a
+    // host it can actually run on, rather than degrading to a seed-only pass.
+    if (native) {
+        stress_opts.addOptionPath("selfhost_bit", selfhosted);
+    } else {
+        stress_opts.addOption([]const u8, "selfhost_bit", "");
+    }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
     // self-hosted `bit` from the current selfhost/ sources and runs it. Its
