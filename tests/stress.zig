@@ -10,6 +10,17 @@
 //! production collection would only occasionally hit becomes a deterministic
 //! wrong answer here. Both runs must reproduce the program's `.expected` output.
 //!
+//! THE ORACLE IS ONLY AS DENSE AS THE SAFEPOINTS, and a program must earn it.
+//! Codegen emits `bit_rt_safepoint` at loop back-edges (runtime/ABI.md §4);
+//! `bit_rt_alloc` does NOT poll, so allocating does not by itself collect. A
+//! straight-line program therefore runs ZERO collections under `BIT_GC=stress`
+//! no matter how much it allocates, and its second run verifies nothing about
+//! rooting — it is the same run twice. A program here that means to exercise the
+//! collector must own a loop at the point where the roots it cares about are
+//! live; `BIT_GC_STATS=1` reports the collection count and is the way to confirm
+//! that rather than assume it. #1409 was filed on the strength of the assumption
+//! and did not survive it.
+//!
 //! Skipped when the host is not a supported runtime target (no libbitrt to link
 //! against), mirroring the golden `// run` cases and the examples guard.
 
