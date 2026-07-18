@@ -1,0 +1,242 @@
+// Shared property checks for the Stage-2 port of runtime/rand.zig (#1368).
+//
+// WHY THESE PROPERTIES AND NOT A SEQUENCE KAT. `rand` is not a seeded PRNG —
+// it is a thin wrapper over the OS CSPRNG (`getrandom(2)` on Linux,
+// `arc4random_buf(3)` on Darwin). It takes no seed and has no reproducible
+// sequence, so "same seed, identical output stream" is not a property it has,
+// and any test claiming to check it would be checking nothing.
+//
+// What CAN be wrong in this port is the byte-region plumbing, and that is where
+// the checks aim. A Bit slice stores one 8-byte word per element while the
+// region being filled is packed bytes (§11.8), so a mis-scaled pointer walk is
+// the single likeliest defect — and it is exactly the class of bug that shows
+// up on one backend and not the other. Every property below is therefore about
+// WHICH BYTES were touched, not which values landed in them:
+//
+//   P1  EXACT BOUNDS (fully deterministic). The payload sits between two
+//       17-byte guard bands poisoned with a sentinel. After the call every
+//       guard byte must still hold the sentinel. A walk that scales by 8
+//       instead of 1, or runs one element long, lands in a guard and is caught
+//       with certainty — no probability involved. The guard width is 17, not
+//       16, so the payload starts UNALIGNED and a word-granular implementation
+//       cannot accidentally look correct.
+//
+//   P2  NO GAPS. Every payload byte must be written. A position the fill skips
+//       keeps the sentinel forever, so the check is: across R independent
+//       rounds, each payload position must differ from the sentinel at least
+//       once. A genuinely random byte matches the sentinel with probability
+//       1/256, so a correctly-filled position survives all R rounds unnoticed
+//       with probability 256^-R — 2^-64 at R = 8. That is the only
+//       probabilistic step here, and its false-negative rate is negligible and
+//       stated rather than hand-waved.
+//
+//   P3  LENGTH SWEEP. Both properties run at lengths straddling the 8-byte
+//       word boundary (1, 7, 8, 9, 15, 16, 17, 31, 33, 64), because a
+//       word-vs-byte confusion is invisible at a length that happens to be a
+//       clean multiple of 8.
+//
+//   P4  A non-positive length touches nothing at all.
+//
+// The same properties are applied to `secureZero`, where they are entirely
+// deterministic: the payload must be exactly zero and the guards untouched.
+
+import { secureZero } from "../../../../runtime/rand"
+
+// The one bridge from a Bit slice to the packed byte region it backs. A
+// `[]i64` of N elements is N*8 contiguous packed bytes; `ptrOf` gives its
+// address and the null-pointer offset idiom (§11.4) reinterprets that address
+// as a byte cursor.
+export function bytePtr(w: []i64): *u8 {
+  let nilb: *u8 = nil
+  return nilb + int(ptrOf(w))
+}
+
+// 0xA5 — an alternating bit pattern, so a half-written byte is still caught.
+function sentinel(): int { return 165 }
+
+// Guard width in bytes. Deliberately 17 (odd, and not a multiple of 8) so the
+// payload never starts word-aligned.
+function guard(): int { return 17 }
+
+function rounds(): int { return 8 }
+
+function poison(base: *u8, total: int) {
+  let i = 0
+  while (i < total) { // bounded by `total`
+    let q = base + i
+    *q = u8(sentinel())
+    i = i + 1
+  }
+}
+
+// P1: both guard bands still hold the sentinel.
+function guardsIntact(base: *u8, n: int): bool {
+  let g = 0
+  while (g < guard()) { // bounded by the fixed guard width
+    let lo = base + g
+    let hi = base + (guard() + n + g)
+    if (*lo != u8(sentinel())) {
+      return false
+    }
+    if (*hi != u8(sentinel())) {
+      return false
+    }
+    g = g + 1
+  }
+  return true
+}
+
+function backingWords(total: int): int {
+  return (total + 7) / 8
+}
+
+// P1 + P2 + P3 for one payload length, against any fill function.
+function checkFill(fill: (*u8, int) => bool, n: int): bool {
+  let total = guard() + n + guard()
+  let backing = []i64(backingWords(total))
+  let changed = []int(n)
+  let ci = 0
+  while (ci < n) { // bounded by `n`
+    changed[ci] = 0
+    ci = ci + 1
+  }
+
+  let r = 0
+  while (r < rounds()) { // bounded by the fixed round count
+    // Recomputed every round: the pointer is derived fresh from the live slice
+    // rather than cached across a call that may reach a safepoint.
+    let base = bytePtr(backing)
+    poison(base, total)
+    if (!fill(base + guard(), n)) {
+      return false // the OS CSPRNG failed; never a pass
+    }
+    if (!guardsIntact(base, n)) {
+      return false
+    }
+    let k = 0
+    while (k < n) { // bounded by `n`
+      let q = base + (guard() + k)
+      if (*q != u8(sentinel())) {
+        changed[k] = 1
+      }
+      k = k + 1
+    }
+    r = r + 1
+  }
+
+  let m = 0
+  while (m < n) { // bounded by `n`
+    if (changed[m] == 0) {
+      return false // this position was never written: a gap
+    }
+    m = m + 1
+  }
+  return true
+}
+
+// P4: a non-positive length must leave every byte of the buffer alone.
+function checkEmptyFill(fill: (*u8, int) => bool): bool {
+  let total = guard() + guard()
+  let backing = []i64(backingWords(total))
+  let base = bytePtr(backing)
+  poison(base, total)
+  if (!fill(base + guard(), 0)) {
+    return false
+  }
+  let i = 0
+  while (i < total) { // bounded by `total`
+    let q = base + i
+    if (*q != u8(sentinel())) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The lengths swept by P3.
+function lengths(): []int {
+  return []int{1, 7, 8, 9, 15, 16, 17, 31, 33, 64}
+}
+
+// Runs the whole entropy suite against one platform's `entropyFill`, returning
+// the number of checks that passed. The caller compares that against
+// `entropyTotal()`, so a check that fails to RUN is as visible as one that
+// fails outright.
+export function entropyProps(fill: (*u8, int) => bool): int {
+  let pass = 0
+  let li = 0
+  while (li < len(lengths())) { // bounded by the fixed sweep
+    if (checkFill(fill, lengths()[li])) {
+      pass = pass + 1
+    }
+    li = li + 1
+  }
+  if (checkEmptyFill(fill)) {
+    pass = pass + 1
+  }
+  return pass
+}
+
+export function entropyTotal(): int {
+  return len(lengths()) + 1
+}
+
+// `secureZero` under the same guard-band regime. Fully deterministic: the
+// payload must be exactly zero afterwards and both guards untouched.
+function checkZero(n: int): bool {
+  let total = guard() + n + guard()
+  let backing = []i64(backingWords(total))
+  let base = bytePtr(backing)
+  poison(base, total)
+  secureZero(base + guard(), n)
+  if (!guardsIntact(base, n)) {
+    return false
+  }
+  let k = 0
+  while (k < n) { // bounded by `n`
+    let q = base + (guard() + k)
+    if (*q != u8(0)) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// A non-positive length must wipe nothing.
+function checkZeroEmpty(): bool {
+  let total = guard() + guard()
+  let backing = []i64(backingWords(total))
+  let base = bytePtr(backing)
+  poison(base, total)
+  secureZero(base + guard(), 0)
+  let i = 0
+  while (i < total) { // bounded by `total`
+    let q = base + i
+    if (*q != u8(sentinel())) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+export function zeroProps(): int {
+  let pass = 0
+  let li = 0
+  while (li < len(lengths())) { // bounded by the fixed sweep
+    if (checkZero(lengths()[li])) {
+      pass = pass + 1
+    }
+    li = li + 1
+  }
+  if (checkZeroEmpty()) {
+    pass = pass + 1
+  }
+  return pass
+}
+
+export function zeroTotal(): int {
+  return len(lengths()) + 1
+}
