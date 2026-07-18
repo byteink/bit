@@ -86,6 +86,8 @@ let obsSelectDefault: i64 = -1
 let obsSelectBlocked: i64 = -1
 let obsSendAfterClose: i64 = -1
 let obsFull: i64 = 0
+let obsRecvAfterClose: i64 = -1
+let obsQueueOrder: i64 = 0
 
 // Addresses resolved once on an ordinary thread, because `ptrOf` is rejected
 // inside a `@nosplit` body (#1421) and every task body here is `@nosplit`.
@@ -357,8 +359,10 @@ const nBlockedSend: int = 2
 //
 // Two senders block on a full capacity-1 channel in a known order, then a
 // receiver drains three values. They must come out in send order.
-let fifoOrder: [4]i64
+let fifoOrder: [8]i64
 let addrFifoOrder: i64 = 0
+let queueOrder: [8]i64
+let addrQueueOrder: i64 = 0
 let fifoSeen: i64 = 0
 
 @nosplit function orderedSendBody() {
@@ -376,6 +380,38 @@ let fifoSeen: i64 = 0
   let out = taskAt(addrFifoOrder)
   let ok = chanRecv(ch, slot)
   *out = *slot
+  schedTaskExit()
+}
+
+// A receive that ARRIVES AFTER the channel is already closed and drained, which
+// is a different path from being woken by `close`: the blocked receivers in
+// phase 3 are completed by `chanClose` draining `recvq`, whereas this one takes
+// `attemptRecv`'s own closed branch. Deleting that branch left phase 3 passing
+// (measured), so it needs its own check.
+@nosplit function recvAfterCloseBody() {
+  let ch = taskAt(addrChanUnbuf)
+  let slot = taskAt(addrRecvSlot)
+  let ok = chanRecv(ch, slot)
+  if (!ok && *slot == 0) {
+    obsRecvAfterClose = 1
+  } else {
+    obsRecvAfterClose = 0
+  }
+  schedTaskExit()
+}
+
+// Drains four values into `fifoOrder`, for the wait-queue order check below.
+@nosplit function drainFourBody() {
+  let ch = taskAt(addrChanA)
+  let slot = taskAt(addrRecvSlot)
+  let out = taskAt(addrQueueOrder)
+  let i = 0
+  while (i < 4) {
+    let ok = chanRecv(ch, slot)
+    *(out + i) = *slot
+    i = i + 1
+  }
+  obsQueueOrder = 1
   schedTaskExit()
 }
 
@@ -402,6 +438,7 @@ export function propsInit(): bool {
   addrSched = propsSchedAddr()
   addrRecvSlot = int(ptrOf(recvSlot))
   addrFifoOrder = int(ptrOf(fifoOrder))
+  addrQueueOrder = int(ptrOf(queueOrder))
   addrCases = int(ptrOf(selCases))
   addrChanBuf = chanAddr(0)
   addrChanUnbuf = chanAddr(1)
@@ -480,7 +517,57 @@ export function phaseCloseRecv(): bool {
 
   // A second close must report failure rather than closing twice.
   let doubleClose = chanClose(taskAt(addrChanUnbuf))
+
+  // And a receive arriving on the already-closed channel, which takes
+  // `attemptRecv`'s closed branch rather than being woken by `close`.
+  if (!startTask(0, entryOf(recvAfterCloseBody), 0)) {
+    return false
+  }
+  runWorker()
   return closedOk && !doubleClose
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — wait-queue order across SIMULTANEOUS waiters
+// ---------------------------------------------------------------------------
+//
+// `wqPush` appends at the tail so a wait queue is FIFO, which is what makes a
+// channel fair between senders blocked on a full buffer. Nothing else in this
+// file pins it: every other phase has at most one waiter on a queue at a time,
+// so `wqPush` could push at the HEAD instead and every check still passed
+// (measured).
+//
+// Three senders are therefore blocked SIMULTANEOUSLY behind a full capacity-1
+// buffer, in a known order, and then drained. FIFO yields 1, 201, 202, 203;
+// a LIFO queue yields 1, 203, 202, 201.
+export function phaseQueueOrder(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+  if (!startTask(0, entryOf(fillOneBody), 0)) {
+    return false
+  }
+  runWorker()
+
+  // Each blocks and parks before the next is started, so the queue order is the
+  // start order rather than a race.
+  if (!startTask(1, entryOf(orderedSendBody), 201)) {
+    return false
+  }
+  runWorker()
+  if (!startTask(2, entryOf(orderedSendBody), 202)) {
+    return false
+  }
+  runWorker()
+  if (!startTask(3, entryOf(orderedSendBody), 203)) {
+    return false
+  }
+  runWorker()
+
+  if (!startTask(4, entryOf(drainFourBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
 }
 
 export function phaseCloseSend(): bool {
@@ -675,7 +762,9 @@ export function phaseRegistry(): int {
 //  256  a blocked select was woken by a peer and reported the right arm
 //  512  FIFO held across a full buffer (promoteQueuedSender)
 // 1024  the root-scanning cursor saw the traced channel and skipped the other
-export const propsTotal: int = 2047
+// 2048  a receive arriving on an already-closed channel got (zero, false)
+// 4096  a wait queue is FIFO across simultaneous waiters
+export const propsTotal: int = 8191
 
 export function propsVerdict(): int {
   let mask = 0
@@ -717,6 +806,13 @@ export function propsVerdict(): int {
   // prevent — and produces a different number, so the check discriminates.
   if (obsRegistry == 13107) {
     mask = mask | 1024
+  }
+  if (obsRecvAfterClose == 1) {
+    mask = mask | 2048
+  }
+  let q = ptrOf(queueOrder)
+  if (obsQueueOrder == 1 && *q == 1 && *(q + 1) == 201 && *(q + 2) == 202 && *(q + 3) == 203) {
+    mask = mask | 4096
   }
   return mask
 }
