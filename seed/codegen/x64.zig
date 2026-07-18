@@ -269,8 +269,10 @@ fn isRefType(tctx: *const TypeContext, ty: TypeId) bool {
 
 /// How the object writer patches a relocation's field. `.call` is the 4-byte
 /// PC-relative branch immediate (`E8 rel32`); `.abs64` is a full 64-bit
-/// absolute pointer, how a `const_string` loads its static header's address.
-pub const RelocKind = enum { call, abs64 };
+/// absolute pointer, how a `const_string` loads its static header's address;
+/// `.tpoff32` is the signed 32-bit thread-pointer displacement of an ELF
+/// local-exec thread-local (§11.11), meaningless on Mach-O.
+pub const RelocKind = enum { call, abs64, tpoff32 };
 
 pub const Reloc = struct {
     /// Byte offset in `FuncCode.code` of the field to patch.
@@ -430,6 +432,33 @@ const Ctx = struct {
         const off: u32 = @intCast(self.code.items.len);
         try self.emitU64(0);
         try self.relocs.append(self.gpa, .{ .offset = off, .symbol = symbol, .kind = .abs64 });
+    }
+
+    /// x86-64 ELF local-exec TLS (§11.11): the address of thread-local `symbol`
+    /// in the *calling* thread, as
+    ///
+    ///     mov dst, fs:[0]        ; the thread pointer itself
+    ///     add dst, symbol@tpoff  ; a negative 32-bit displacement
+    ///
+    /// No memory reference beyond the `%fs:0` self-load and no call, so the
+    /// sequence is legal in a `@nosplit` body and clobbers nothing but `dst`.
+    /// Variant II places the static TLS block *below* the thread pointer, so the
+    /// linker's offset is negative — `ADD r/m64, imm32` sign-extends its
+    /// immediate, which is exactly what that requires.
+    fn movTlsReloc(self: *Ctx, dst: Reg, symbol: []const u8) !void {
+        const d: u8 = @intFromEnum(dst);
+        try self.emitByte(0x64); // FS segment override
+        try self.maybeRex(true, d >= 8, false, false);
+        try self.emitByte(0x8B); // MOV r64, r/m64
+        try self.emitByte(((d & 7) << 3) | 0x04); // ModRM: mod=00, rm=100 (SIB)
+        try self.emitByte(0x25); // SIB: no base, no index -> disp32 follows
+        try self.emitU32(0); // absolute address 0 within %fs
+        try self.maybeRex(true, false, false, d >= 8);
+        try self.emitByte(0x81); // ADD r/m64, imm32
+        try self.emitByte(0xC0 | (d & 7)); // ModRM: mod=11, reg=/0 (add), rm=dst
+        const off: u32 = @intCast(self.code.items.len);
+        try self.emitU32(0);
+        try self.relocs.append(self.gpa, .{ .offset = off, .symbol = symbol, .kind = .tpoff32 });
     }
 
     const ArithOp = enum { add, or_, and_, sub, xor, cmp };
@@ -1436,8 +1465,16 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) !void {
 /// the same absolute symbol relocation `func_addr` uses. Pure address
 /// materialization — no load, no call, no safepoint — so it is legal inside a
 /// `@nosplit` body.
+///
+/// A `.thread` cell instead resolves against the thread pointer, so its address
+/// differs per OS thread; that path is equally call-free, which is what lets
+/// §11.11 promise `@nosplit` compatibility for both storage classes.
 fn emitGlobalAddr(self: *Ctx, dst: u32, g: ir.GlobalId) !void {
-    try self.movAbsReloc(scratch1, self.module.global(g).name);
+    const gl = self.module.global(g);
+    switch (gl.storage) {
+        .process => try self.movAbsReloc(scratch1, gl.name),
+        .thread => try self.movTlsReloc(scratch1, gl.name),
+    }
     try putInt(self, dst, scratch1);
 }
 

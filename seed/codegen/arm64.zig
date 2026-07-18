@@ -116,7 +116,10 @@ const TypeContext = check.TypeContext;
 /// How an object writer must patch a relocation's instruction field: a `BL`'s
 /// 26-bit branch immediate (calls), or the `ADRP`/`ADD` pair that materializes
 /// a static symbol's address (a `const_string`'s `__bitstr_N` header).
-pub const RelocKind = enum { branch, page21, pageoff12 };
+/// `tprel_hi12`/`tprel_lo12` are the AArch64 ELF local-exec TLS pair (§11.11);
+/// they are meaningless on Mach-O, whose thread-locals go through a TLV
+/// descriptor instead, so `emit.zig`'s Mach-O mapping rejects them.
+pub const RelocKind = enum { branch, page21, pageoff12, tprel_hi12, tprel_lo12 };
 pub const Reloc = struct { offset: u32, symbol: []const u8, kind: RelocKind = .branch };
 pub const CodegenError = common.CodegenError;
 
@@ -832,6 +835,28 @@ const Ctx = struct {
         const add_off: u32 = @intCast(self.code.items.len);
         try self.emitWord(0x91000000 | (d << 5) | d); // ADD dst, dst, #0
         try self.relocs.append(self.gpa, .{ .offset = add_off, .symbol = symbol, .kind = .pageoff12 });
+    }
+
+    /// AArch64 ELF local-exec TLS (§11.11): the address of thread-local `symbol`
+    /// in the *calling* thread, as
+    ///
+    ///     mrs dst, TPIDR_EL0
+    ///     add dst, dst, #:tprel_hi12:symbol, lsl #12
+    ///     add dst, dst, #:tprel_lo12_nc:symbol
+    ///
+    /// Three instructions, no memory reference and no call, so the sequence is
+    /// legal in a `@nosplit` body and clobbers nothing but `dst`. The linker
+    /// folds the variant-I `AbiTcb` header into the relocation's value, so the
+    /// two `ADD`s together carry a 24-bit thread-pointer offset.
+    fn emitTlsAddrOf(self: *Ctx, dst: Reg, symbol: []const u8) !void {
+        const d: u32 = @intFromEnum(dst);
+        try self.emitWord(0xD53BD040 | d); // MRS dst, TPIDR_EL0
+        const hi_off: u32 = @intCast(self.code.items.len);
+        try self.emitWord(0x91400000 | (d << 5) | d); // ADD dst, dst, #0, LSL #12
+        try self.relocs.append(self.gpa, .{ .offset = hi_off, .symbol = symbol, .kind = .tprel_hi12 });
+        const lo_off: u32 = @intCast(self.code.items.len);
+        try self.emitWord(0x91000000 | (d << 5) | d); // ADD dst, dst, #0
+        try self.relocs.append(self.gpa, .{ .offset = lo_off, .symbol = symbol, .kind = .tprel_lo12 });
     }
 
     fn emitJumpFixup(self: *Ctx, target: ir.BlockId) !void {
@@ -1725,8 +1750,16 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) CodegenError!void {
 /// the same ADRP/ADD symbol relocation pair `func_addr` uses. Pure address
 /// arithmetic — no load, no call, no safepoint — so it is legal inside a
 /// `@nosplit` body.
+///
+/// A `.thread` cell instead resolves against the thread pointer, so its address
+/// differs per OS thread; that path is equally call-free, which is what lets
+/// §11.11 promise `@nosplit` compatibility for both storage classes.
 fn emitGlobalAddr(self: *Ctx, dst: u32, g: ir.GlobalId) CodegenError!void {
-    try self.emitAddrOf(scratch1, self.module.global(g).name);
+    const gl = self.module.global(g);
+    switch (gl.storage) {
+        .process => try self.emitAddrOf(scratch1, gl.name),
+        .thread => try self.emitTlsAddrOf(scratch1, gl.name),
+    }
     try putInt(self, dst, scratch1);
 }
 
@@ -2922,4 +2955,54 @@ test "compileFunction records a safepoint at a real rt_call with no back-edge" {
     defer code.deinit();
 
     try testing.expectEqual(@as(usize, 1), code.safepoints.len);
+}
+
+test "global_addr on a .thread global emits the local-exec TLS sequence, not an ADRP pair" {
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    // `addGlobal` takes ownership of both slices, so they must be heap-owned.
+    const proc = try module.addGlobal(try gpa.dupe(u8, "p"), try gpa.dupe(u8, &[_]u8{0} ** 8), 8, .process);
+    const thr = try module.addGlobal(try gpa.dupe(u8, "t"), try gpa.dupe(u8, &[_]u8{0} ** 8), 8, .thread);
+
+    for ([_]struct { g: ir.GlobalId, tls: bool }{
+        .{ .g = proc, .tls = false },
+        .{ .g = thr, .tls = true },
+    }) |case| {
+        var b = ir.FunctionBuilder.init(gpa);
+        const entry = try b.newBlock();
+        b.beginBlock(entry);
+        const a = try b.globalAddr(i64_ty, case.g);
+        try b.ret(&.{a});
+        b.endBlock();
+        var f = try b.finish("f", &.{}, i64_ty, false, .invalid, entry);
+        defer f.deinit(gpa);
+
+        var code = try compileFunction(gpa, &module, &f);
+        defer code.deinit();
+
+        // The tell is `MRS Xt, TPIDR_EL0` (0xD53BD040 | Rt): only the
+        // thread-local path reads the thread pointer. Its absence on the
+        // process-wide path is what proves the two classes are distinguished
+        // rather than both compiling to the same address materialization.
+        var saw_mrs = false;
+        var i: usize = 0;
+        while (i + 4 <= code.code.len) : (i += 4) {
+            const w = std.mem.readInt(u32, code.code[i..][0..4], .little);
+            if (w & 0xFFFFFFE0 == 0xD53BD040) saw_mrs = true;
+        }
+        try testing.expectEqual(case.tls, saw_mrs);
+
+        // ...and the relocation pair must be the TLS one, so a wrong-but-present
+        // MRS cannot carry an ordinary page21/pageoff12 pair past this test.
+        var saw_tprel = false;
+        for (code.relocs) |r| {
+            if (r.kind == .tprel_hi12 or r.kind == .tprel_lo12) saw_tprel = true;
+        }
+        try testing.expectEqual(case.tls, saw_tprel);
+    }
 }

@@ -307,7 +307,7 @@ const Parser = struct {
                 if (inner == none) return none;
                 return self.tree.add(.@"export", join(start, self.span(inner)), 0, &.{inner});
             },
-            .kw_let, .kw_const => return self.parseValueDecl(),
+            .kw_let, .kw_const => return self.parseValueDecl(.process),
             .at => return self.parseAttrDecl(),
             .kw_function => return self.parseFuncDecl(none),
             .kw_struct => return self.parseStructDecl(),
@@ -330,7 +330,7 @@ const Parser = struct {
 
     fn parseExportableDecl(self: *Parser) ParseError!Index {
         switch (self.tok.kind) {
-            .kw_let, .kw_const => return self.parseValueDecl(),
+            .kw_let, .kw_const => return self.parseValueDecl(.process),
             .at => return self.parseAttrDecl(),
             .kw_function => return self.parseFuncDecl(none),
             .kw_struct => return self.parseStructDecl(),
@@ -353,16 +353,52 @@ const Parser = struct {
 
     // ---- function attributes (§10.3.1) --------------------------------------
 
-    /// Parses `@name @name ...` then requires a `function` — attributes attach to
-    /// function declarations only (v1). Non-function targets are a parse error.
+    /// Parses `@name @name ...` then requires a `function` or a `let` —
+    /// attributes attach to function declarations (§10.3.1) and to module-level
+    /// state (§11.11 `@threadlocal let`). Any other target is a parse error.
+    ///
+    /// A `let`'s storage class rides in the node's `main` scalar rather than as
+    /// an extra child, exactly as `asm_stmt` carries `volatile`. That choice is
+    /// load-bearing rather than cosmetic: a `let_decl`'s children ARE its
+    /// bindings, and a dozen sites across check/resolve/lower/fmt iterate them
+    /// expecting nothing else — an appended `attr_list` child would have to be
+    /// skipped correctly at every one of them, in BOTH compilers, with no
+    /// compile-time exhaustiveness check on the selfhost side to catch a miss.
+    /// `main` breaks none of them.
     fn parseAttrDecl(self: *Parser) ParseError!Index {
         const attrs = try self.parseAttrList();
-        if (self.tok.kind != .kw_function) {
-            try self.fail("'function' after an attribute");
-            self.synchronizeTopLevel();
-            return none;
+        switch (self.tok.kind) {
+            .kw_function => return self.parseFuncDecl(attrs),
+            .kw_let => {
+                // §11.11 defines exactly one attribute at this position, so the
+                // legal set here is a syntactic property of the position and is
+                // checked here. Function attributes keep their own E0076 path
+                // in the checker, which sees a richer decl.
+                if (!self.attrsAreThreadLocal(attrs)) {
+                    try self.fail("'@threadlocal', the only attribute a 'let' accepts");
+                    self.synchronizeTopLevel();
+                    return none;
+                }
+                return self.parseValueDecl(.thread);
+            },
+            else => {
+                try self.fail("'function' or 'let' after an attribute");
+                self.synchronizeTopLevel();
+                return none;
+            },
         }
-        return self.parseFuncDecl(attrs);
+    }
+
+    /// True iff `attrs` is exactly the single attribute `@threadlocal`, with no
+    /// argument. Anything else — a second attribute, an argument, a different
+    /// name — is rejected by the caller.
+    fn attrsAreThreadLocal(self: *Parser, attrs: Index) bool {
+        const list = self.tree.kids(attrs);
+        if (list.len != 1) return false;
+        const attr_kids = self.tree.kids(list[0]);
+        if (attr_kids.len != 1) return false; // an argument was supplied
+        const name_span = self.tree.get(attr_kids[0]).span;
+        return std.mem.eql(u8, self.lx.src[name_span.start..name_span.end], "threadlocal");
     }
 
     /// `attr_list = attr { attr }`, `attr = "@" IDENT [ "(" string_lit ")" ]`.
@@ -456,7 +492,10 @@ const Parser = struct {
     // Declarations (§10)
     // =========================================================================
 
-    fn parseValueDecl(self: *Parser) ParseError!Index {
+    /// `storage` is `.process` for every unattributed `let`/`const` — the
+    /// overwhelmingly common case, which keeps `main = 0` and so leaves the AST
+    /// shape and dump of existing declarations byte-identical.
+    fn parseValueDecl(self: *Parser, storage: ast.GlobalStorage) ParseError!Index {
         const start = self.tok.span;
         const is_const = self.tok.kind == .kw_const;
         try self.advance(); // 'let' | 'const'
@@ -465,7 +504,7 @@ const Parser = struct {
         try bindings.append(self.gpa, try self.parseBinding());
         while (try self.accept(.comma)) try bindings.append(self.gpa, try self.parseBinding());
         const end = self.span(bindings.items[bindings.items.len - 1]);
-        return self.tree.add(if (is_const) .const_decl else .let_decl, join(start, end), 0, bindings.items);
+        return self.tree.add(if (is_const) .const_decl else .let_decl, join(start, end), @intFromEnum(storage), bindings.items);
     }
 
     fn parseBinding(self: *Parser) ParseError!Index {
@@ -843,7 +882,7 @@ const Parser = struct {
 
     fn parseStatement(self: *Parser) ParseError!Index {
         switch (self.tok.kind) {
-            .kw_let, .kw_const => return self.parseValueDecl(),
+            .kw_let, .kw_const => return self.parseValueDecl(.process),
             .kw_if => return self.parseIfStmt(),
             .kw_while => return self.parseWhileStmt(),
             .kw_for => return self.parseForStmt(),
@@ -1111,7 +1150,7 @@ const Parser = struct {
         _ = try self.expect(.l_paren, "'('");
         var init_stmt: Index = none;
         if (self.tok.kind == .kw_let or self.tok.kind == .kw_const) {
-            init_stmt = try self.parseValueDecl();
+            init_stmt = try self.parseValueDecl(.process);
         } else if (self.tok.kind != .semicolon) {
             init_stmt = try self.parseSimpleStmtNoTerm();
         }

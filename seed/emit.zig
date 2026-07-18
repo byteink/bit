@@ -304,10 +304,13 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
             .kind = switch (r.kind) {
                 .call => .pc32,
                 .abs64 => .abs64,
+                .tpoff32 => .tpoff32,
             },
             .addend = switch (r.kind) {
                 .call => -4,
-                .abs64 => 0,
+                // The thread-pointer displacement is the symbol's own template
+                // offset, so it takes no addend (§11.11).
+                .abs64, .tpoff32 => 0,
             },
         });
         try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, x64.SafepointEntry, fc.safepoints));
@@ -559,6 +562,8 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
                 .branch => .aarch64_call26,
                 .page21 => .aarch64_adr_prel_pg_hi21,
                 .pageoff12 => .aarch64_add_abs_lo12_nc,
+                .tprel_hi12 => .aarch64_tlsle_add_tprel_hi12,
+                .tprel_lo12 => .aarch64_tlsle_add_tprel_lo12_nc,
             },
             .addend = 0,
         });
@@ -640,6 +645,22 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     if (freestanding) try refuseManagedMetadata(a, module);
     if (freestanding) try refuseUnpinnedImports(module);
 
+    // Per-thread state (§11.11) is not emitted on Mach-O yet: it reaches a
+    // thread-local through a `__thread_vars` `tlv_descriptor` and an indirect
+    // call to its resolver thunk, not through a link-time offset, so it needs
+    // both descriptor emission and call-clobber modelling in codegen. Refuse
+    // explicitly — a `.thread` cell silently placed in `.data` would be one
+    // process-wide cell wearing a per-thread name.
+    //
+    // This MUST precede function compilation, not merely global placement: the
+    // codegen below emits ELF local-exec relocations for a `.thread`
+    // `global_addr`, which the relocation mapping has no Mach-O spelling for
+    // and rejects as `unreachable`. Refusing first is what makes that
+    // `unreachable` sound.
+    for (module.globals.items) |g| {
+        if (g.storage == .thread) return error.UnsupportedTlsStorage;
+    }
+
     const mac = struct {
         fn prefix(al: Allocator, name: []const u8) ![]u8 {
             return std.fmt.allocPrint(al, "_{s}", .{name});
@@ -685,6 +706,12 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
                 .branch => .branch,
                 .page21 => .page21,
                 .pageoff12 => .pageoff12,
+                // Unreachable rather than dead: a `.thread` global is refused
+                // before any function is compiled on this path (see the
+                // `UnsupportedTlsStorage` guard below), so no ELF local-exec
+                // relocation can reach a Mach-O object. Mach-O thread-locals
+                // resolve through a TLV descriptor, not a tprel pair.
+                .tprel_hi12, .tprel_lo12 => unreachable,
             },
         });
         try stackmaps.append(a, try stackMapOf(a, fc.code.len, fc.saved_regs, arm64.SafepointEntry, fc.safepoints));
@@ -827,15 +854,6 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     }
 
     // ---- module-level state (§11.11) -> the same writable .data -----------
-    // Per-thread state is not emitted here yet: Mach-O reaches a thread-local
-    // through a `__thread_vars` `tlv_descriptor` and an indirect call to its
-    // resolver thunk, not through a link-time offset, so it needs both
-    // descriptor emission and call-clobber modelling in codegen. Refuse
-    // explicitly — a `.thread` cell silently placed in `.data` would be one
-    // process-wide cell wearing a per-thread name.
-    for (module.globals.items) |g| {
-        if (g.storage == .thread) return error.UnsupportedTlsStorage;
-    }
     for (try placeGlobals(a, module, .process, &data)) |g| {
         const sym = try mac(a, g.name);
         try symbols.append(a, .{ .name = sym, .section = .data, .offset = g.offset, .size = g.size, .binding = .global });

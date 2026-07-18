@@ -31,12 +31,23 @@ pub const Node = struct {
     tag: Tag,
     span: Span,
     /// Tag-specific scalar. For `binary`/`unary`/`assign` it holds the operator
-    /// `@intFromEnum(lexer.Kind)`; otherwise unused (0).
+    /// `@intFromEnum(lexer.Kind)`; for `let_decl`/`const_decl` a
+    /// `GlobalStorage`; for `asm_stmt` the `volatile` flag; otherwise 0.
     main: u32 = 0,
     /// First child index in `Tree.extra`.
     kids_start: u32 = 0,
     /// Child count.
     kids_len: u32 = 0,
+};
+
+/// Storage class of a module-level declaration (§11.11), carried in a
+/// `let_decl`/`const_decl`'s `main`. Mirrors `ir.GlobalStorage`; kept here so
+/// the parser needs no dependency on the IR.
+pub const GlobalStorage = enum(u32) {
+    /// One cell for the whole process — a plain module-level `let`.
+    process,
+    /// One cell per OS thread — `@threadlocal let`.
+    thread,
 };
 
 pub const Tag = enum {
@@ -61,6 +72,8 @@ pub const Tag = enum {
     import_star, // [name_ident]         `import * as io from ...`
     import_group, // [import_item...]     `import { a, b as c } from ...`
     import_item, // [name_ident, alias_or_none]
+    // main = the `GlobalStorage` of a MODULE-LEVEL declaration (§11.11); always
+    // `.process` (0) for a local, which has no storage class.
     let_decl, // [binding...]
     const_decl, // [binding...]
     binding, // [pattern, type_or_none, init_or_none]
@@ -266,6 +279,10 @@ fn dumpNode(w: *Writer, tree: *const Tree, source: []const u8, idx: Index, depth
     // Operator-bearing nodes print the glyph right after the tag.
     switch (n.tag) {
         .binary, .unary, .assign => try w.print(" {s}", .{opSymbol(@enumFromInt(n.main))}),
+        // Only a `@threadlocal` declaration prints anything, so every existing
+        // dump stays byte-identical while the storage class stays visible to
+        // the seed-vs-selfhost differential (§11.11).
+        .let_decl, .const_decl => if (n.main == @intFromEnum(GlobalStorage.thread)) try w.writeAll(" @threadlocal"),
         else => {},
     }
     for (tree.kids(idx)) |child| {

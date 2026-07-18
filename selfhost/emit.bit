@@ -98,6 +98,27 @@ function refuseManagedMetadata(module: IrModule): ()! {
   }
 }
 
+// Per-thread state (§11.11) is not emitted on Mach-O yet: it reaches a
+// thread-local through a `__thread_vars` tlv_descriptor and an INDIRECT CALL to
+// its resolver thunk, not through a link-time offset, so it needs both
+// descriptor emission and call-clobber modelling in codegen. Refuse explicitly
+// — a per-thread cell silently placed in `__data` would be one process-wide
+// cell wearing a per-thread name.
+//
+// This MUST run before any function is compiled, not merely before global
+// placement: codegen emits ELF local-exec relocations for a per-thread
+// `global_addr`, which the Mach-O relocation mapping has no spelling for.
+// Refusing first is what keeps that mapping total.
+function refuseThreadLocalStorage(module: IrModule): ()! {
+  let i = 0
+  while (i < len(module.globals)) {
+    if (module.globals[i].storage != 0) {
+      fail newError("Mach-O: per-thread module state (@threadlocal) is not emitted on this target")
+    }
+    i = i + 1
+  }
+}
+
 // True if `name` is a §11.9 pinned symbol rather than a compiler-mangled one.
 //
 // Exact, not a heuristic, because the two spellings are disjoint by
@@ -274,11 +295,24 @@ struct GlobalPlacement {
 // These cells are writable and NEVER scanned by the collector: the checker has
 // proved each one's type untraced, so the blob needs no pointer map and no root
 // registration. See SPEC §11.11.
-function placeGlobals(module: IrModule, buf: ByteBuf): []GlobalPlacement {
+// Filtering by class rather than emitting all of them is what keeps the two
+// §11.11 storage classes' blobs separate: process-wide cells go to `.data` (one
+// cell for the program), per-thread cells go to the `.tdata` TEMPLATE from
+// which each OS thread gets its own copy. A per-thread cell's offset is
+// therefore an offset WITHIN the template, never a link-time address.
+//
+// Both classes are writable and NEVER scanned by the collector: the checker has
+// proved each one's type untraced, so neither blob needs a pointer map or root
+// registration.
+function placeGlobals(module: IrModule, storage: int, buf: ByteBuf): []GlobalPlacement {
   let out = []GlobalPlacement(0)
   let i = 0
   while (i < len(module.globals)) {
     let g = module.globals[i]
+    if (g.storage != storage) {
+      i = i + 1
+      continue
+    }
     while (len(buf.bytes) % g.align != 0) {
       buf.bytes = append(buf.bytes, u8(0))
     }
@@ -307,6 +341,7 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
     refuseManagedMetadata(module)?
     refuseUnpinnedImports(module)?
   }
+  refuseThreadLocalStorage(module)?
 
   // §11.8: `syscall()` is Linux-only. The arm64 backend is shared with
   // aarch64-linux, so the target-specific rejection belongs here, on the Mach-O
@@ -538,7 +573,7 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
   }
 
   // ---- module-level state (§11.11) -> the same writable __data ----------
-  let mgs = placeGlobals(module, data)
+  let mgs = placeGlobals(module, 0, data)
   let gi = 0
   while (gi < len(mgs)) {
     let gsym = emMac(mgs[gi].name)
@@ -781,6 +816,9 @@ function emElfRelocX64(k: RelocKind): ElfRelocKind {
   if (k == RelocKind.Abs64) {
     return ElfRelocKind.Abs64
   }
+  if (k == RelocKind.Tpoff32) {
+    return ElfRelocKind.Tpoff32
+  }
   assert(k == RelocKind.Branch)
   return ElfRelocKind.Pc32
 }
@@ -822,6 +860,12 @@ function emElfRelocArm64(k: RelocKind): ElfRelocKind {
   }
   if (k == RelocKind.Page21) {
     return ElfRelocKind.AdrPrelPgHi21
+  }
+  if (k == RelocKind.TprelHi12) {
+    return ElfRelocKind.TlsleAddTprelHi12
+  }
+  if (k == RelocKind.TprelLo12) {
+    return ElfRelocKind.TlsleAddTprelLo12Nc
   }
   assert(k == RelocKind.PageOff12)
   return ElfRelocKind.AddAbsLo12Nc
@@ -931,13 +975,29 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, fre
   // once defined — and the ELF writer rejects that as DuplicateSymbol. The
   // seed's two ELF emitters place globals before the sweep for this reason.
   let gdata = newByteBuf()
-  let egs = placeGlobals(module, gdata)
+  let egs = placeGlobals(module, 0, gdata)
   let egi = 0
   while (egi < len(egs)) {
     symbols = append(symbols, emElfSym(egs[egi].name, ElfSectionKind.Data,
       egs[egi].offset, egs[egi].size, ElfBinding.Global, ElfSymKind.Object))
     defined[egs[egi].name] = true
     egi = egi + 1
+  }
+
+  // ---- per-thread state (§11.11) -> the `.tdata` template ----------------
+  // Every cell goes to `.tdata` even when its image is all zeros, rather than
+  // splitting zero-valued ones into `.tbss`: the linker merges both into one
+  // contiguous template anyway, and one section keeps the offsets trivially
+  // ordered. The symbol is STT_TLS, so its value reads as an offset within
+  // that template — relative to the thread pointer — not a link-time address.
+  let tdata = newByteBuf()
+  let tgs = placeGlobals(module, 1, tdata)
+  let tgi = 0
+  while (tgi < len(tgs)) {
+    symbols = append(symbols, emElfSym(tgs[tgi].name, ElfSectionKind.Tdata,
+      tgs[tgi].offset, tgs[tgi].size, ElfBinding.Global, ElfSymKind.Tls))
+    defined[tgs[tgi].name] = true
+    tgi = tgi + 1
   }
 
   let blobs = emitElfBlobs(module, rodata, symbols, relocs, defined, stackmaps,
@@ -954,6 +1014,10 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, fre
   if (len(gdata.bytes) > 0) {
     sections = append(sections, ElfSection{ kind: ElfSectionKind.Data,
       data: gdata.bytes, size: 0, alignment: 8 })
+  }
+  if (len(tdata.bytes) > 0) {
+    sections = append(sections, ElfSection{ kind: ElfSectionKind.Tdata,
+      data: tdata.bytes, size: 0, alignment: 8 })
   }
   return writeElfObject(target, ElfObject{ sections: sections, symbols: symbols,
     relocations: relocs })?

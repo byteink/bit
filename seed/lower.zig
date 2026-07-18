@@ -407,6 +407,16 @@ pub const Lowerer = struct {
                     if (decl_idx == ast.none) continue;
                     const inner = if (mf.tree.get(decl_idx).tag == .@"export") mf.tree.kids(decl_idx)[0] else decl_idx;
                     if (mf.tree.get(inner).tag != .let_decl) continue;
+                    // §11.11: the declaration's storage class, which the parser
+                    // recorded in `main` (`.process` for a plain `let`,
+                    // `.thread` for `@threadlocal let`). Both classes obey the
+                    // identical untraced-type/constant-initializer rules, so the
+                    // checker needs no knowledge of the distinction — only the
+                    // cell's placement differs, and that is decided right here.
+                    const storage: ir.GlobalStorage = switch (@as(ast.GlobalStorage, @enumFromInt(mf.tree.get(inner).main))) {
+                        .process => .process,
+                        .thread => .thread,
+                    };
                     for (mf.tree.kids(inner)) |bind| {
                         const pat = mf.tree.kids(bind)[0];
                         if (mf.tree.get(pat).tag != .ident) continue; // diagnosed by the checker
@@ -417,10 +427,7 @@ pub const Lowerer = struct {
                         const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = sid };
                         const name = try std.fmt.allocPrint(gpa, "__bitg_{d}_{s}", .{ mi, identTextOf(mf, pat) });
                         const bytes = try globalImage(gpa, self.ctx, ty, init);
-                        // Only the process-wide class has a surface today
-                        // (§11.11); `@threadlocal` is specified but not yet
-                        // parsed or emitted.
-                        const id = try self.out.addGlobal(name, bytes, 8, .process);
+                        const id = try self.out.addGlobal(name, bytes, 8, storage);
                         try self.global_ids.put(gpa, gsym.pack(), id);
                     }
                 }

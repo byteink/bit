@@ -1145,10 +1145,10 @@ are what the free lists and the run queue actually require.
 
 Module state is a *storage class*, not a single feature. Two are specified:
 
-| Form                  | Copies                | Status                        |
-| --------------------- | --------------------- | ----------------------------- |
-| `let x: T = c`        | one per **process**   | implemented                   |
-| `@threadlocal let x: T` | one per **OS thread** | specified; not yet emitted    |
+| Form                    | Copies                | Status                       |
+| ----------------------- | --------------------- | ---------------------------- |
+| `let x: T = c`          | one per **process**   | implemented, every target    |
+| `@threadlocal let x: T` | one per **OS thread** | implemented on ELF; Mach-O is rejected at emission |
 
 Rules 1–3 apply identically to both — the type and initializer restrictions come
 from "the collector does not scan this cell", which is equally true per-thread.
@@ -1156,23 +1156,41 @@ The two differ only in how many cells exist and how the address is materialized:
 process-wide state is a plain data symbol, per-thread state needs a thread-local
 section and TLS relocations.
 
-`@threadlocal` is specified here so the surface is settled, but it is not yet
-usable: the compiler has no surface syntax for it and emits no per-thread cell.
+`@threadlocal` attaches to a module-level `let` only. It is the sole attribute a
+`let` accepts, it takes no argument, and it is rejected on a local `let`, on a
+`const`, and on anything else.
+
+The access sequence is where the two classes stop being symmetric, and the
+difference is normative. Process-wide state is reached by pure address
+arithmetic. Per-thread state is reached by adding a link-time-known offset to the
+thread pointer:
+
+| target        | sequence                                              | call-free |
+| ------------- | ----------------------------------------------------- | --------- |
+| aarch64 ELF   | `mrs TPIDR_EL0` + a `tprel_hi12`/`tprel_lo12_nc` `ADD` pair | yes  |
+| x86-64 ELF    | `mov fs:[0]` + `ADD` of a `TPOFF32` displacement      | yes       |
+| Mach-O        | load a TLV descriptor and **call its resolver thunk** | **no**    |
+
+So a `@threadlocal` read is *not* guaranteed call-free on every target: the
+`@nosplit` guarantee above holds unconditionally for the process-wide class and,
+on ELF only, for the per-thread class. Mach-O per-thread state is therefore
+**rejected at emission** (`UnsupportedTlsStorage`) rather than silently placed in
+`__data`, which would be one process-wide cell wearing a per-thread name. That
+refusal is a deliberate seam, not an oversight — implementing it requires
+modelling the thunk call as clobbering caller-saved registers in both register
+allocators, which is a correctness change to codegen rather than an addition to
+it.
 
 The *linker* half is already done on every target — `PT_TLS` and local-exec
 relocations on both ELF arches, TLV descriptors on Mach-O — and the runtime
-already boots a thread pointer for the main thread and every spawned worker. The
-remaining work is producer-side: parsing the attribute, laying the cell into the
-per-thread template, and emitting the access sequence.
+boots a thread pointer for the main thread.
 
-That access sequence is where the two classes stop being symmetric, and the
-difference is normative. Process-wide state is reached by pure address
-arithmetic. Per-thread state is reached by adding a link-time-known offset to the
-thread pointer on ELF — still pure arithmetic, still `@nosplit`-legal — but on
-Mach-O it requires loading a TLV descriptor and **calling its resolver thunk**.
-A `@threadlocal` read is therefore not guaranteed call-free on every target, and
-the `@nosplit` guarantee above applies unconditionally only to the process-wide
-class. Until a per-thread slot is emitted, one must stay in the Zig runtime.
+A per-thread cell obeys rules 1–3 above, so it likewise ships as a static byte
+image: the image is the *template* every thread's copy is initialized from, which
+is why the initializer must still be a compile-time constant. A thread created
+outside the runtime's own spawn path gets a correct copy only if its thread
+pointer was installed; a raw `clone(2)` without `CLONE_SETTLS` inherits its
+parent's, and therefore shares — not copies — its parent's cells.
 
 ---
 
