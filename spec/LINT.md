@@ -91,10 +91,10 @@ shipped. Lint findings render through the existing path as
 
 ## 4. Rules
 
-### Phase 1 — size and shape
+### Phase 1 — size and shape (AST only)
 
 These need only the token stream and the AST. No resolver, no type
-information.
+information, so they can land first.
 
 | Code | Rule | Default | Rationale |
 |---|---|---|---|
@@ -102,6 +102,8 @@ information.
 | E0201 | `max-fn-lines` | 80 | A function that does not fit on a screen cannot be checked by eye. |
 | E0202 | `max-params` | 5 | Past five, the call site stops being readable and the arguments want to be a struct. |
 | E0203 | `max-nesting` | 4 | Deep nesting is nearly always a missing early return. |
+| E0204 | `max-complexity` | 10 | Independent paths through a function, the count a reader must hold at once. |
+| E0205 | `defer-in-loop` | — | Defers run at function exit, so one inside a loop holds every resource until the function returns. |
 
 Counting rules, so the numbers are reproducible:
 
@@ -114,16 +116,42 @@ Counting rules, so the numbers are reproducible:
 - `max-nesting` counts nested *blocks* inside a function body; the body itself
   is depth 0. `if`, `while`, `for`, `match` arms, and `catch` blocks each add
   one.
+- `max-complexity` is cyclomatic complexity: start at 1, add one for each `if`,
+  `while`, `for`, `match` arm, `catch`, `&&`, and `||`. Unlike `max-nesting` it
+  is flat-sensitive — a 300-line `match` with 60 one-line arms scores 61 while
+  nesting stays at 1.
+- `defer-in-loop` fires on a `defer` statement lexically inside any `while` or
+  `for` in the same function. A `defer` inside a function *called* from a loop
+  is fine and is not reported.
 
-### Phase 2 — dead weight
+`max-fn-lines` and `max-complexity` measure different things and both stay: a
+long flat function is readable, a short tangled one is not, and neither metric
+catches the other's case.
 
-These need resolver output and land after phase 1.
+### Phase 2 — dead weight and footguns (needs the resolver)
+
+These need scope and symbol information and land after phase 1.
 
 | Code | Rule | Rationale |
 |---|---|---|
 | E0210 | `unused-import` | Left behind by refactors; misleads the next reader about a module's dependencies. |
 | E0211 | `unused-local` | Same, at function scope. |
 | E0212 | `unreachable-code` | Statements after `return`/`fail`/`break` in the same block. |
+| E0213 | `shadowed-local` | A `let` that hides a name from an enclosing scope. Later edits to either binding silently change which one is read. |
+| E0214 | `append-aliasing` | `append` on a slice parameter grows it in place and aliases the caller's backing array, so the caller sees writes it never made. |
+
+`shadowed-local` closes a real gap: the resolver warns on shadowing a
+*predeclared* name ([resolve.zig:386](../seed/resolve.zig#L386)) but says
+nothing when an inner `let` hides an outer local. Prelude names are already
+covered, so this rule must not double-report them.
+
+`append-aliasing` has no equivalent in other languages' linters — it encodes a
+Bit-specific aliasing rule the type system does not express, and one this
+repository has already paid for once in the self-hosted compiler. It fires when
+`append`'s first argument resolves to a parameter of slice type, and the result
+is not assigned back to that same parameter. It is the rule most likely to need
+overriding, since appending to a locally-owned copy is legitimate and not
+always distinguishable from the AST.
 
 Note the tension, recorded rather than resolved: in Go these three are
 *compiler* errors, not vet findings. Making them hard errors in `bit check` is
@@ -139,6 +167,22 @@ embedded blob. A lint rule for it would fire on exactly the lines nobody can
 fix, and would immediately need a suppression form, which is the mechanism
 this spec is trying to avoid. So: fmt wraps what it can, leaves unbreakable
 tokens alone, and lint says nothing.
+
+### 4.2 Rules deliberately not included
+
+Recorded so they are not re-proposed.
+
+- **Discarded call result**, **empty or non-diverting `catch`.** Already errors
+  in `bit check` — E0065 and E0067 ([check.zig:3513](../seed/check.zig#L3513)).
+  In Go this is what `errcheck` exists for; here the checker got there first,
+  which removes what would otherwise be a linter's headline rule.
+- **`spawn` capturing a loop variable.** Go's classic bug. Bit closures capture
+  by value, so the bug cannot occur — no rule for a defect the semantics
+  already prevent.
+- **Anything requiring a proof** — lock discipline, index bounds, reachability
+  of an error path. That is checker or verifier work. Lint reports only what is
+  cheap and certain from the AST, because a rule that is occasionally wrong
+  becomes a rule everyone silences, and a silenced rule reports nothing.
 
 ## 5. Overrides
 
@@ -267,7 +311,11 @@ file and compares stderr against the sibling `.expected`, matching how
 
 Required coverage:
 
-- one case per rule, at the boundary: `limit` lines passes, `limit + 1` fails
+- one case per threshold rule, at the boundary: `limit` passes, `limit + 1` fails
+- one positive and one negative case per non-threshold rule — for
+  `append-aliasing` the negative case must include an append to a local slice,
+  and for `shadowed-local` an inner `let` of a prelude name, which
+  `shadows_predeclared` already reports and this rule must not duplicate
 - an override raising a limit
 - an override disabling a rule
 - a malformed directive, exit 2
