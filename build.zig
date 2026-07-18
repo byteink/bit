@@ -446,6 +446,36 @@ pub fn build(b: *std.Build) void {
     const stdlib_docs_tests = b.addTest(.{ .root_module = stdlib_docs_mod });
     test_step.dependOn(&b.addRunArtifact(stdlib_docs_tests).step);
 
+    // AST tag-set parity (#1420): seed and selfhost must declare the same node
+    // tags, each parser-reachable. #1418's `ParamRest` false positive — selfhost
+    // refusing a construct the seed accepts — was invisible to every existing
+    // differential because no corpus file used it. A NAME comparison only; see
+    // the file header for what it deliberately does not prove. Front end only.
+    const ast_tags_opts = b.addOptions();
+    ast_tags_opts.addOption([]const u8, "selfhost_ast", b.pathFromRoot("selfhost/ast.bit"));
+    ast_tags_opts.addOption([]const u8, "selfhost_parser", b.pathFromRoot("selfhost/parser.bit"));
+    ast_tags_opts.addOption([]const u8, "seed_parser", b.pathFromRoot("seed/parser.zig"));
+
+    const ast_tags_mod = b.createModule(.{
+        .root_source_file = b.path("tests/ast_tags.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_tags_mod.addImport("bit", exe.root_module);
+    ast_tags_mod.addOptions("build_options", ast_tags_opts);
+
+    const ast_tags_tests = b.addTest(.{ .root_module = ast_tags_mod });
+    const ast_tags_run = b.addRunArtifact(ast_tags_tests);
+    // The three sources are read at RUNTIME, so edits to them are invisible to
+    // the build cache; without this a stale pass survives a tag being removed —
+    // a gate that cannot fail is worse than no gate.
+    ast_tags_run.has_side_effects = true;
+    test_step.dependOn(&ast_tags_run.step);
+
+    // Scoped runner, same precedent as `test-stress` / `test-imports`.
+    const ast_tags_step = b.step("test-ast-tags", "run the AST tag-set parity gate only");
+    ast_tags_step.dependOn(&ast_tags_run.step);
+
     // Format gate (#1266): every `.bit` source under stdlib/ and examples/ must
     // already be `bit fmt`-canonical (tests/cases/ is excluded — see the file
     // header). Front end only — needs no libbitrt.

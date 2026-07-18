@@ -4,7 +4,10 @@ const Io = std.Io;
 
 const diagnostics = @import("diagnostics.zig");
 const lexer = @import("lexer.zig");
-const ast = @import("ast.zig");
+/// `pub` so the AST tag-set parity gate (tests/ast_tags.zig) can enumerate
+/// `Tag` by reflection instead of parsing ast.zig — a text scan of that file
+/// silently misses `@"export"`.
+pub const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const resolve = @import("resolve.zig");
 const check = @import("check.zig");
