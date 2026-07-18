@@ -271,6 +271,10 @@ pub fn build(b: *std.Build) void {
     // build option so the runner is independent of the process cwd.
     const golden_opts = b.addOptions();
     golden_opts.addOption([]const u8, "cases_dir", b.pathFromRoot("tests/cases"));
+    // The `run`/`panic` cases are also built by the self-hosted `bit` as a
+    // subprocess (#1424), which takes the whole-project path even for a lone
+    // file — so it needs the real stdlib to resolve the prelude from.
+    golden_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
 
     const golden_mod = b.createModule(.{
         .root_source_file = b.path("tests/harness.zig"),
@@ -281,7 +285,14 @@ pub fn build(b: *std.Build) void {
     golden_mod.addOptions("build_options", golden_opts);
 
     const golden_tests = b.addTest(.{ .root_module = golden_mod });
-    test_step.dependOn(&b.addRunArtifact(golden_tests).step);
+    const golden_run = b.addRunArtifact(golden_tests);
+    // `tests/cases/*` and the selfhost sources are read at runtime, so neither a
+    // new case nor an edit to a ported module is visible to the build cache;
+    // without this a cache skip could quietly retire the whole corpus — and now
+    // the second compiler with it.
+    golden_run.has_side_effects = true;
+    test_step.dependOn(&golden_run.step);
+    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
     // Examples guard: discovers examples/*.bit and compiles + runs each so the
     // showcase can never rot as the language grows. No .expected files — this
@@ -761,10 +772,17 @@ pub fn build(b: *std.Build) void {
     // which a cross-built seed cannot do, and the cross-built harness could not
     // run either way — so the harness asserts non-empty once it knows it is a
     // host it can actually run on, rather than degrading to a seed-only pass.
+    //
+    // The golden corpus takes the same wiring for the same reason (#1424): it
+    // is the largest corpus in the project and it drove only the seed, so
+    // reverting the selfhost half of #1419's variadic fix left `zig build test`
+    // green. Same LazyPath, same "empty only on a cross build" contract.
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
+        golden_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
+        golden_opts.addOption([]const u8, "selfhost_bit", "");
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the

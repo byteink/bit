@@ -29,6 +29,26 @@
 //!
 //! A mismatch fails the build with a readable diff (via `expectEqualStrings`).
 //!
+//! THE `run`/`panic` CASES ARE BUILT BY **BOTH** COMPILERS (#1424). Until then
+//! every case here was compiled by the bootstrap seed alone, so the largest
+//! corpus in the project — 86 behavioural cases — said nothing about the
+//! self-hosted `bit` the project exists to ship. That was not theoretical:
+//! #1419 reverted the selfhost half of its own variadic fix and this suite
+//! stayed green, because `tests/stress/*` (#1413) was the only corpus that had
+//! been taught to drive both compilers. Do not "fix" a failure here by skipping
+//! the case — a skip-list reads as coverage and is the hole this pass closes.
+//!
+//! The two compilers are driven differently on purpose. The seed is a Zig
+//! module, so it compiles in-process (`bit.buildHostExecutable`, single file,
+//! no prelude). Self-hosted `bit` is a Bit-compiled executable, so it is a
+//! subprocess — and a subprocess build of a lone file is a whole-project build
+//! of a one-file module (SPEC §17.1), which does get the prelude. The two
+//! therefore compile slightly different programs, and that is the stronger
+//! test: both must still reproduce the same `.expected`, and the self-hosted
+//! side takes the path a real user takes. `BIT_LIBBITRT`/`BIT_STDLIB` hand it
+//! the same archive the seed links, which also keeps the harness independent of
+//! its working directory.
+//!
 //! Every `run`/`fmt`/`types` case (i.e. every case that is valid Bit source,
 //! per its own directive) also feeds a corpus-wide property check: fmt must
 //! be idempotent and must never drop a comment (see "fmt corpus properties"
@@ -50,7 +70,11 @@ const max_cases = 4096;
 const max_file_bytes = 1 << 20; // 1 MiB
 
 const Directive = enum { run, panic, err, fmt, types, tokens, ast, ir };
-const Outcome = enum { checked, skipped };
+
+/// `ran_both` is reported only by a `run`/`panic` case that actually built and
+/// executed under BOTH compilers, so the suite can assert the self-hosted pass
+/// matched something rather than trusting that it did.
+const Outcome = enum { checked, ran_both, skipped };
 
 /// Exit code the runtime uses for every panic (`runtime/root.zig`'s `fatal`,
 /// SPEC.md §18.4). Matching it exactly — rather than merely "non-zero" — keeps
@@ -69,6 +93,7 @@ test "golden cases" {
 
     var it = dir.iterate();
     var scanned: u32 = 0;
+    var ran_both: u32 = 0;
     while (scanned < max_cases) : (scanned += 1) {
         const entry = (try it.next(io)) orelse break;
         if (entry.kind != .file) continue;
@@ -78,9 +103,16 @@ test "golden cases" {
         const name = try gpa.dupe(u8, entry.name);
         defer gpa.free(name);
 
-        _ = try checkCase(gpa, io, dir, name);
+        if (try checkCase(gpa, io, dir, name) == .ran_both) ran_both += 1;
     }
     try testing.expect(scanned < max_cases); // corpus stayed within bound
+
+    // On a host that can run binaries at all, the self-hosted pass must have
+    // matched at least one case. Without this a directive-matching bug (or a
+    // corpus that lost every `// run` case) would retire the whole second
+    // compiler while the suite still reported green — the precise failure mode
+    // #1424 was filed for.
+    if (build_options.libbitrt_path.len > 0) try testing.expect(ran_both > 0);
 }
 
 fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcome {
@@ -107,6 +139,13 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             // to link against — build.zig leaves `libbitrt_path` empty then).
             if (build_options.libbitrt_path.len == 0) return .skipped;
 
+            // A host that can link libbitrt is a native build, and a native
+            // build always produces the self-hosted `bit`. Assert it rather
+            // than degrading to the seed-only pass: a green suite must not be
+            // able to mean "half of what it claims to check was not wired up",
+            // which is precisely how #1419's selfhost revert went unnoticed.
+            try testing.expect(build_options.selfhost_bit.len > 0);
+
             // A dedicated `Io.Threaded` over `gpa` (not the shared global io):
             // `std.process.run`'s spawn arena is backed by the io's allocator,
             // and mixing the global io's allocator with the per-test
@@ -122,6 +161,26 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             };
             defer gpa.free(libbitrt);
 
+            const stem = name[0 .. name.len - ".bit".len];
+            const seed_bin = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-golden-seed-{s}-{x}", .{ stem, testing.random_seed }, 0);
+            defer gpa.free(seed_bin);
+            const self_bin = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-golden-self-{s}-{x}", .{ stem, testing.random_seed }, 0);
+            defer gpa.free(self_bin);
+
+            // ---- Phase 1: compile and write; nothing is exec'd yet.
+            //
+            // `74811a3`'s discipline, kept as this suite gained a second
+            // compiler: never let a `fork` happen while this process holds a
+            // write fd to a binary it is about to `execve`, because `fork`
+            // copies the whole fd table and Linux refuses to exec an inode
+            // whose writecount is nonzero (ETXTBSY). Driving self-hosted `bit`
+            // means forking, so it goes FIRST — before this process opens
+            // anything for writing — and the seed's `writeFile` (which forks
+            // nothing) follows it. Doubling the builds doubled the exposure;
+            // phase separation removes it by construction.
+            defer Dir.cwd().deleteFile(run_io, self_bin) catch {};
+            try buildWithSelfhost(gpa, run_io, name, self_bin);
+
             var discard: Io.Writer.Allocating = .init(gpa);
             defer discard.deinit();
             const exe = (try bit.buildHostExecutable(gpa, name, source, libbitrt, &discard.writer)) orelse {
@@ -130,40 +189,18 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             };
             defer gpa.free(exe);
 
-            const stem = name[0 .. name.len - ".bit".len];
-            const bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-golden-{s}-{x}", .{ stem, testing.random_seed }, 0);
-            defer gpa.free(bin_path);
+            defer Dir.cwd().deleteFile(run_io, seed_bin) catch {};
             try Dir.cwd().writeFile(run_io, .{
-                .sub_path = bin_path,
+                .sub_path = seed_bin,
                 .data = exe,
                 .flags = .{ .permissions = .executable_file },
             });
-            defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
 
-            const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path} });
-            defer gpa.free(result.stdout);
-            defer gpa.free(result.stderr);
-            const code: u8 = switch (result.term) {
-                .exited => |c| c,
-                else => 255,
-            };
-            if (directive == .panic) {
-                if (code != panic_exit_code) {
-                    std.debug.print("case '{s}': expected a panic (exit {d}), got exit {d}\nstderr: {s}\n", .{ name, panic_exit_code, code, result.stderr });
-                    return error.ExpectedPanic;
-                }
-                if (!std.mem.eql(u8, expected, result.stderr))
-                    std.debug.print("case '{s}' stderr mismatch:\n", .{name});
-                try testing.expectEqualStrings(expected, result.stderr);
-                return .checked;
-            }
-            if (code != 0) {
-                std.debug.print("case '{s}': binary exited with {d}\nstderr: {s}\n", .{ name, code, result.stderr });
-                return error.RunFailed;
-            }
-            if (!std.mem.eql(u8, expected, result.stdout))
-                std.debug.print("case '{s}' stdout mismatch:\n", .{name});
-            try testing.expectEqualStrings(expected, result.stdout);
+            // ---- Phase 2: exec only. Both compilers' output must satisfy the
+            // same `.expected`.
+            try runBinary(gpa, run_io, name, "seed", seed_bin, directive, expected);
+            try runBinary(gpa, run_io, name, "selfhost", self_bin, directive, expected);
+            return .ran_both;
         },
         .err => {
             const report = try bit.compileReport(gpa, name, source);
@@ -233,6 +270,75 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
         },
     }
     return .checked;
+}
+
+/// Build one golden case with the self-hosted `bit`. It is a Bit-compiled
+/// executable, not a Zig module this harness can import, so it is driven as a
+/// subprocess. `BIT_LIBBITRT`/`BIT_STDLIB` hand it the same archive the seed
+/// links and the real stdlib, which keeps the harness independent of its
+/// working directory (sidestepping the installed-`bit`-libbitrt-CWD bug rather
+/// than depending on it).
+fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, out_path: [:0]const u8) !void {
+    const case_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ build_options.cases_dir, name });
+    defer gpa.free(case_path);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("BIT_LIBBITRT", build_options.libbitrt_path);
+    try env.put("BIT_STDLIB", build_options.stdlib_dir);
+
+    const result = try std.process.run(gpa, run_io, .{
+        .argv = &.{ build_options.selfhost_bit, "build", case_path, "-o", out_path },
+        .environ_map = &env,
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    const ok = switch (result.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (ok) return;
+    std.debug.print("case '{s}' [selfhost]: expected compile to succeed, got:\n{s}{s}\n", .{ name, result.stdout, result.stderr });
+    return error.SelfhostCompileFailed;
+}
+
+/// Execute one compiler's binary for a `run`/`panic` case and hold it to the
+/// case's `.expected`. `who` names the compiler so a failure says which of the
+/// two produced it.
+fn runBinary(
+    gpa: std.mem.Allocator,
+    run_io: Io,
+    name: []const u8,
+    who: []const u8,
+    bin_path: [:0]const u8,
+    directive: Directive,
+    expected: []const u8,
+) !void {
+    const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path} });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    const code: u8 = switch (result.term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    if (directive == .panic) {
+        if (code != panic_exit_code) {
+            std.debug.print("case '{s}' [{s}]: expected a panic (exit {d}), got exit {d}\nstderr: {s}\n", .{ name, who, panic_exit_code, code, result.stderr });
+            return error.ExpectedPanic;
+        }
+        if (!std.mem.eql(u8, expected, result.stderr))
+            std.debug.print("case '{s}' [{s}] stderr mismatch:\n", .{ name, who });
+        try testing.expectEqualStrings(expected, result.stderr);
+        return;
+    }
+    if (code != 0) {
+        std.debug.print("case '{s}' [{s}]: binary exited with {d}\nstderr: {s}\n", .{ name, who, code, result.stderr });
+        return error.RunFailed;
+    }
+    if (!std.mem.eql(u8, expected, result.stdout))
+        std.debug.print("case '{s}' [{s}] stdout mismatch:\n", .{ name, who });
+    try testing.expectEqualStrings(expected, result.stdout);
 }
 
 /// Reads the line-1 directive. Matches the first line's leading token, ignoring a

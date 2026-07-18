@@ -10,13 +10,30 @@
 # running the output catches that class. This is the end-to-end guard.
 #
 # A REFUSED example is a known lowering gap (main.bit's stub guard declining to
-# emit a binary) and is reported but not fatal — the fatal ones are DIFF (bit2
-# built something that behaves differently from the seed) and SEED-FAIL.
+# emit a binary): an honest "not ported yet", not a miscompile. It is therefore
+# tolerated — but only up to a PINNED COUNT (#1424).
+#
+# Tolerating refusals unconditionally is what a mid-flight port relies on, and
+# is also how a real regression hides: #1419 reverted the selfhost half of its
+# own variadic fix and the only signal was PASS dropping 42->41 with the script
+# still exiting 0. That conflates "not ported yet" with "regressed", for every
+# example. So the count is pinned and compared EXACTLY:
+#
+#   - refusals ABOVE the pin  -> a construct that used to lower no longer does.
+#   - refusals BELOW the pin  -> good news, but the pin must be tightened in the
+#                                same commit, or it silently re-opens headroom
+#                                for a future regression to hide in.
+#
+# Landing a port that refuses mid-flight (as #1364 does) means raising the pin
+# deliberately, in the commit that causes it — which is the point: a refusal
+# becomes a reviewed decision instead of an unasserted number scrolling past.
 #
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffexamples.sh
 set -u
 SEED=zig-out/bin/bit-seed
 BIT2=${BIT2:-zig-out/bin/bit}
+# The pin. Override only to explore locally; the committed value is the gate.
+EXPECTED_REFUSED=${EXPECTED_REFUSED:-0}
 # Network-dependent examples: they talk to the outside world, so their output is
 # not a function of the compiler alone.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"
@@ -55,9 +72,20 @@ for d in examples/*/; do
   pass=$((pass + 1))
 done
 
-echo "example differential: PASS=$pass DIFF=$diff REFUSED=$refused SEED-FAIL=$seedfail SKIP(network)=$skipped"
-# A REFUSED example is an honest "not ported yet"; a DIFF is a miscompile.
+echo "example differential: PASS=$pass DIFF=$diff REFUSED=$refused (pinned $EXPECTED_REFUSED) SEED-FAIL=$seedfail SKIP(network)=$skipped"
+# A DIFF is a miscompile; a SEED-FAIL means the oracle itself did not build.
 if [ "$diff" -gt 0 ] || [ "$seedfail" -gt 0 ]; then
+  exit 1
+fi
+# A REFUSED example is an honest "not ported yet" only while it matches the pin.
+if [ "$refused" -gt "$EXPECTED_REFUSED" ]; then
+  echo "FAIL: REFUSED rose $EXPECTED_REFUSED -> $refused. A construct that used to lower no longer does."
+  echo "      Fix the regression, or raise EXPECTED_REFUSED in this script if the refusal is deliberate."
+  exit 1
+fi
+if [ "$refused" -lt "$EXPECTED_REFUSED" ]; then
+  echo "FAIL: REFUSED fell $EXPECTED_REFUSED -> $refused. Lower EXPECTED_REFUSED to $refused in this script,"
+  echo "      otherwise the pin leaves $((EXPECTED_REFUSED - refused)) refusals of slack for a regression to hide in."
   exit 1
 fi
 exit 0
