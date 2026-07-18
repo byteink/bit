@@ -1,0 +1,683 @@
+// The channel properties (#1365), shared by the platform-free driver next door
+// and the two real two-OS-thread drivers in ../../chanlinux and ../../chandarwin.
+//
+// ---------------------------------------------------------------------------
+// WHAT EACH DRIVER PROVES, AND WHY BOTH ARE NEEDED
+// ---------------------------------------------------------------------------
+//
+// The single-worker driver covers the SEMANTICS: buffer discipline and ring
+// wraparound, unbuffered rendezvous without loss or reorder, FIFO across a full
+// buffer, `close` releasing blocked receivers AND blocked senders, and select's
+// arm choice, default clause, and winner-take-all.
+//
+// It CANNOT cover the one place this port diverges from `chan.zig`. `chanWake`
+// waits for a registered-but-not-yet-parked task to finish parking, and with a
+// single worker that wait is never entered: only one task runs at a time, so a
+// waiter can only be observed by a peer that runs strictly after the waiter's
+// task has already switched away. The wait is dead code here — which is exactly
+// why the two-thread drivers exist, and why this file must not be mistaken for
+// full coverage of the park seam. ../../chanlinux and ../../chandarwin put a
+// sender and a receiver on two real OS threads so the race is live.
+//
+// ---------------------------------------------------------------------------
+// HOW A PHASE RUNS
+// ---------------------------------------------------------------------------
+//
+// `schedWorkerRun` returns when it finds no work and `stopping` is set, so a
+// phase is: initialize tasks, queue them, set stopping, run the worker. The
+// worker drives every task to completion — or to the point where they are all
+// parked and nothing is runnable, which is what the `close` phases need. The
+// driver then closes the channel from OUTSIDE any task (`chanClose` never
+// parks and reaches the scheduler through the channel's own field, so this is
+// legal), clears stopping, and runs the worker again to collect the woken tasks.
+//
+// Every phase re-initializes the task blocks it uses, so slots are reused across
+// phases rather than each phase needing its own stack.
+
+import { schedInit, schedWorkerAt, schedWorkerRun, schedShutdown, schedRegister } from "../../../../runtime/sched"
+import { schedTaskInit, schedTaskExit, schedCurrentTask, taskAt, taskArg } from "../../../../runtime/sched"
+import { schedStackBytes, schedStackAligned, dqPushBottom, wkDeque, workerWords } from "../../../../runtime/sched"
+import { scStopping, taskState, taskParked } from "../../../../runtime/sched"
+import { chanInit, chanSend, chanRecv, chanClose, chanClosed, chanCount } from "../../../../runtime/chan"
+import { chanSelect, chanWords, selCaseWords, chanDirRecv, chanDirSend } from "../../../../runtime/chan"
+import { chanRegInit, chanRegister, chanRegHead, chanRegNext, chanIsRef, chanBufferedAt } from "../../../../runtime/chan"
+
+// One worker: every phase here is about CHANNEL semantics, and a single worker
+// makes each phase deterministic rather than sampled. The two-thread drivers
+// carry the concurrency half.
+const nWorkers: int = 1
+
+// Five task slots, the most any one phase needs (three blocked receivers plus a
+// closer, and two blocked senders plus a select peer).
+const nTasks: int = 5
+
+// Five 64KiB stacks plus a 64KiB alignment slack, because a module-level array
+// is only 8-byte aligned (#1421) so an aligned base has to be taken rather than
+// assumed. 6 * 65536 / 8 = 49152 words.
+let stackArea: [49152]i64
+
+let taskBlocks: [160]i64
+let workerBlocks: [292]i64
+let schedBlock: [16]i64
+
+// Four channels: the buffered one, the unbuffered one, and two more for select.
+let chanBlocks: [52]i64
+let bufArea: [64]i64
+
+// Three select case descriptors, ABI.md §11's 4-word `SelectCaseDesc`.
+let selCases: [12]i64
+
+let regBlock: [2]i64
+
+// ---------------------------------------------------------------------------
+// Observations
+// ---------------------------------------------------------------------------
+//
+// Module state is untraced and statically allocated (§11.11), which is what
+// these must be: they are written from green threads and read from the driver.
+let obsFifo: i64 = 0
+let obsRendezvous: i64 = 0
+let obsOrdered: i64 = 1
+let obsClosedRecv: i64 = 0
+let obsClosedSend: i64 = 0
+let obsSelectArm: i64 = -1
+let obsSelectValue: i64 = -1
+let obsSelectDefault: i64 = -1
+let obsSelectBlocked: i64 = -1
+let obsSendAfterClose: i64 = -1
+let obsFull: i64 = 0
+
+// Addresses resolved once on an ordinary thread, because `ptrOf` is rejected
+// inside a `@nosplit` body (#1421) and every task body here is `@nosplit`.
+let addrSched: i64 = 0
+let addrChanBuf: i64 = 0
+let addrChanUnbuf: i64 = 0
+let addrChanA: i64 = 0
+let addrChanB: i64 = 0
+let addrCases: i64 = 0
+
+@nosplit function alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+export function propsSchedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+export function propsWorkerAddr(i: int): int {
+  return int(ptrOf(workerBlocks)) + i * workerWords * 8
+}
+
+function taskAddr(i: int): int {
+  return int(ptrOf(taskBlocks)) + i * 32 * 8
+}
+
+function stackBaseOf(i: int): int {
+  return alignUpStack(int(ptrOf(stackArea))) + i * schedStackBytes
+}
+
+function chanAddr(i: int): int {
+  return int(ptrOf(chanBlocks)) + i * chanWords * 8
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — buffered FIFO and ring wraparound
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s "buffered channel: FIFO order and ring-buffer wraparound" test,
+// unchanged in shape: fill a capacity-3 channel, drain it, and go round again
+// so the `head`/`count` modulo arithmetic wraps at least twice. Nine sends, and
+// every receive must return the value that was sent three sends earlier.
+//
+// This task never blocks — it drains whenever the buffer is full — so it is the
+// one phase that exercises the ring in isolation from the wait queues.
+// A value slot a `@nosplit` body can take the address of. `ptrOf` on a local is
+// rejected there (#1421), so the slot is module state and its address is
+// resolved on an ordinary thread — the same workaround every task body in this
+// tree uses for the same reason.
+let recvSlot: i64 = 0
+let addrRecvSlot: i64 = 0
+
+@nosplit function fifoBody() {
+  let ch = taskAt(addrChanBuf)
+  let slot = taskAt(addrRecvSlot)
+  let ok = 0
+  let sent = 0
+  while (sent < 9) {
+    chanSend(ch, sent)
+    if (sent % 3 == 2) {
+      // The buffer is full every third send: drain all three and check each is
+      // the value sent three sends ago, which is what pins FIFO order rather
+      // than merely "three values came out".
+      let i = 0
+      while (i < 3) {
+        let got = chanRecv(ch, slot)
+        if (got && *slot == sent - 2 + i) {
+          ok = ok + 1
+        }
+        i = i + 1
+      }
+    }
+    sent = sent + 1
+  }
+  obsFifo = ok
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — unbuffered rendezvous, no loss and no reorder
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s producer/consumer test, scaled to a count a single worker runs
+// quickly. Every one of these sends blocks until the consumer arrives (capacity
+// 0 means `count < cap` is `0 < 0`, so a value can only move by direct handoff),
+// so the pair park and wake each other `rendezvousCount` times.
+export const rendezvousCount: int = 200
+
+@nosplit function producerBody() {
+  let ch = taskAt(addrChanUnbuf)
+  let i = 0
+  while (i < rendezvousCount) {
+    chanSend(ch, i)
+    i = i + 1
+  }
+  schedTaskExit()
+}
+
+@nosplit function consumerBody() {
+  let ch = taskAt(addrChanUnbuf)
+  let slot = taskAt(addrRecvSlot)
+  let n = 0
+  while (n < rendezvousCount) {
+    let ok = chanRecv(ch, slot)
+    let v = *slot
+    if (!ok || v != n) {
+      obsOrdered = 0
+    }
+    n = n + 1
+  }
+  obsRendezvous = n
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — close releases every blocked RECEIVER
+// ---------------------------------------------------------------------------
+//
+// The teardown property, and the reason it is written as its own phase rather
+// than folded into a bigger one. This project has already paid for teardown that
+// strands waiters: a QUIC test hung because closing never released its
+// `read`/`finish`/`acceptStream` waiters, and because one of them drained on a
+// condition a departed peer could no longer satisfy.
+//
+// So this phase deliberately leaves NOBODY to satisfy the receivers: three tasks
+// block on an empty unbuffered channel with no sender in existence, the worker
+// runs dry and returns, and only then is the channel closed — from the driver
+// thread, which is not a task at all. Every receiver must wake with `ok` false
+// and the zero word. A `close` that woke only the queue head, or that left the
+// queue linked, hangs here rather than producing a wrong number.
+const nBlockedRecv: int = 3
+
+@nosplit function blockedRecvBody() {
+  let ch = taskAt(addrChanUnbuf)
+  let slot = taskAt(addrRecvSlot)
+  let ok = chanRecv(ch, slot)
+  let v = *slot
+
+  // Both halves matter: a closed-and-drained receive yields `(zero, false)`, and
+  // for a reference element that zero IS a null pointer, which is why the spec
+  // makes `ok` mandatory (ABI.md §11).
+  if (!ok && v == 0) {
+    obsClosedRecv = obsClosedRecv + 1
+  }
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — close releases every blocked SENDER
+// ---------------------------------------------------------------------------
+//
+// The mirror of phase 3, and the half that is easy to forget: `chan.zig`'s
+// `close` drains `sendq` as well as `recvq`, waking each blocked sender with the
+// `ok` that makes it report "send on closed channel". Two senders block on a
+// capacity-1 channel that is already full, so neither can complete.
+//
+// `chanSend` returns false rather than panicking — `panic` is not reachable from
+// a `@nosplit` body, so the runtime reports and the ABI wrapper raises (#1367).
+const nBlockedSend: int = 2
+
+@nosplit function blockedSendBody() {
+  let ch = taskAt(addrChanA)
+  let ok = chanSend(ch, 77)
+  if (!ok) {
+    obsClosedSend = obsClosedSend + 1
+  }
+  schedTaskExit()
+}
+
+// A send on an ALREADY-closed channel, which takes the early-return path rather
+// than the woken-from-the-queue path. Both must report the same thing.
+@nosplit function sendAfterCloseBody() {
+  let ch = taskAt(addrChanA)
+  let ok = chanSend(ch, 1)
+  if (ok) {
+    obsSendAfterClose = 1
+  } else {
+    obsSendAfterClose = 0
+  }
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — select
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s "one ready among three fires the correct arm", plus the two
+// clauses that test alone does not reach: the `default` clause when nothing is
+// ready, and a select that actually BLOCKS and is later woken by a peer.
+//
+// The arm test is a real discrimination rather than a coin flip: only channel B
+// holds a value, so a select that returned any other arm — or that returned the
+// first arm regardless of readiness — fails. The shuffle means the poll visits
+// the arms in a different order each run, so an implementation that only ever
+// checked position 0 would fail here intermittently rather than never.
+@nosplit function selectArmBody() {
+  let cases = taskAt(addrCases)
+  let chA = taskAt(addrChanA)
+  let chB = taskAt(addrChanB)
+
+  // Only B is ready.
+  chanSend(chB, 42)
+
+  *(cases + 0 * selCaseWords + 0) = chanDirRecv
+  *(cases + 0 * selCaseWords + 1) = addrChanA
+  *(cases + 0 * selCaseWords + 2) = 0
+  *(cases + 0 * selCaseWords + 3) = 0
+  *(cases + 1 * selCaseWords + 0) = chanDirRecv
+  *(cases + 1 * selCaseWords + 1) = addrChanB
+  *(cases + 1 * selCaseWords + 2) = 0
+  *(cases + 1 * selCaseWords + 3) = 0
+  *(cases + 2 * selCaseWords + 0) = chanDirRecv
+  *(cases + 2 * selCaseWords + 1) = addrChanUnbuf
+  *(cases + 2 * selCaseWords + 2) = 0
+  *(cases + 2 * selCaseWords + 3) = 0
+
+  let fired = chanSelect(cases, 3, false)
+  obsSelectArm = fired
+  obsSelectValue = *(cases + fired * selCaseWords + 2)
+
+  // Nothing is ready now (B was drained above), so the default clause must run:
+  // `chanSelect` returns `n`, which is ABI.md §11's encoding for "default".
+  let d = chanSelect(cases, 3, true)
+  obsSelectDefault = d
+
+  schedTaskExit()
+}
+
+// A select with no default and nothing ready, so it registers on all three
+// queues and parks. The peer below sends on channel A, which must claim this
+// select's waiter, wake it, and have it report arm 0 — with the two losing
+// registrations unlinked on the way out.
+@nosplit function selectBlockBody() {
+  let cases = taskAt(addrCases)
+  *(cases + 0 * selCaseWords + 0) = chanDirRecv
+  *(cases + 0 * selCaseWords + 1) = addrChanA
+  *(cases + 0 * selCaseWords + 2) = 0
+  *(cases + 0 * selCaseWords + 3) = 0
+  *(cases + 1 * selCaseWords + 0) = chanDirRecv
+  *(cases + 1 * selCaseWords + 1) = addrChanB
+  *(cases + 1 * selCaseWords + 2) = 0
+  *(cases + 1 * selCaseWords + 3) = 0
+  *(cases + 2 * selCaseWords + 0) = chanDirRecv
+  *(cases + 2 * selCaseWords + 1) = addrChanUnbuf
+  *(cases + 2 * selCaseWords + 2) = 0
+  *(cases + 2 * selCaseWords + 3) = 0
+
+  let fired = chanSelect(cases, 3, false)
+  obsSelectBlocked = fired * 1000 + *(cases + fired * selCaseWords + 2)
+  schedTaskExit()
+}
+
+@nosplit function selectPeerBody() {
+  let chA = taskAt(addrChanA)
+  chanSend(chA, 7)
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — FIFO across a full buffer
+// ---------------------------------------------------------------------------
+//
+// `promoteQueuedSender` is what preserves send order when a buffer fills: the
+// sender that blocked first must land in the slot freed by the next receive,
+// ahead of any sender that arrives later. Without it a blocked sender is
+// overtaken by every later sender that finds room, and the channel silently
+// reorders.
+//
+// Two senders block on a full capacity-1 channel in a known order, then a
+// receiver drains three values. They must come out in send order.
+let fifoOrder: [4]i64
+let addrFifoOrder: i64 = 0
+let fifoSeen: i64 = 0
+
+@nosplit function orderedSendBody() {
+  let ch = taskAt(addrChanA)
+  let me = *(taskAt(schedCurrentTask()) + taskArg)
+  chanSend(ch, me)
+  schedTaskExit()
+}
+
+@nosplit function orderedRecvBody() {
+  let ch = taskAt(addrChanA)
+  let slot = taskAt(addrRecvSlot)
+  let out = taskAt(addrFifoOrder)
+  let i = 0
+  while (i < 3) {
+    let ok = chanRecv(ch, slot)
+    *(out + i) = *slot
+    i = i + 1
+  }
+  fifoSeen = 1
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Setup and phase drivers
+// ---------------------------------------------------------------------------
+
+// Bring up the scheduler and resolve every address the `@nosplit` bodies need.
+export function propsInit(): bool {
+  addrSched = propsSchedAddr()
+  addrRecvSlot = int(ptrOf(recvSlot))
+  addrFifoOrder = int(ptrOf(fifoOrder))
+  addrCases = int(ptrOf(selCases))
+  addrChanBuf = chanAddr(0)
+  addrChanUnbuf = chanAddr(1)
+  addrChanA = chanAddr(2)
+  addrChanB = chanAddr(3)
+
+  let s = taskAt(addrSched)
+  schedInit(s, int(ptrOf(workerBlocks)), nWorkers)
+  chanRegInit(ptrOf(regBlock))
+
+  if (!schedStackAligned(stackBaseOf(0))) {
+    return false
+  }
+  return true
+}
+
+// Queue task `slot` on the single worker's local ring, running `entry`.
+function startTask(slot: int, entry: *byte, arg: int): bool {
+  let s = taskAt(addrSched)
+  let t = taskAt(taskAddr(slot))
+  schedTaskInit(t, stackBaseOf(slot), schedStackBytes, entry, arg)
+  schedRegister(s, taskAddr(slot))
+  return dqPushBottom(schedWorkerAt(s, 0) + wkDeque, taskAddr(slot))
+}
+
+// Run the worker until nothing is runnable. `stopping` is set first so the idle
+// path returns rather than spinning.
+function runWorker() {
+  let s = taskAt(addrSched)
+  schedShutdown(s)
+  schedWorkerRun(schedWorkerAt(s, 0))
+  atomicStore(s + scStopping, 0)
+}
+
+export function phaseFifo(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanBuf), int(ptrOf(bufArea)), 3, false, s)
+  if (!startTask(0, entryOf(fifoBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
+}
+
+export function phaseRendezvous(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanUnbuf), 0, 0, false, s)
+  if (!startTask(0, entryOf(producerBody), 0)) {
+    return false
+  }
+  if (!startTask(1, entryOf(consumerBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
+}
+
+// Phase 3. The worker returns with all three receivers parked and nothing
+// runnable — that is the state `close` must rescue them from.
+export function phaseCloseRecv(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanUnbuf), 0, 0, false, s)
+  let i = 0
+  while (i < nBlockedRecv) {
+    if (!startTask(i, entryOf(blockedRecvBody), i)) {
+      return false
+    }
+    i = i + 1
+  }
+  runWorker()
+
+  // Every receiver is now parked with no sender in existence. Close from the
+  // driver thread, which is not a task.
+  let closedOk = chanClose(taskAt(addrChanUnbuf))
+  runWorker()
+
+  // A second close must report failure rather than closing twice.
+  let doubleClose = chanClose(taskAt(addrChanUnbuf))
+  return closedOk && !doubleClose
+}
+
+export function phaseCloseSend(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+
+  // Fill the buffer so both senders must block.
+  if (!startTask(0, entryOf(fillOneBody), 0)) {
+    return false
+  }
+  runWorker()
+  obsFull = chanCount(taskAt(addrChanA))
+
+  let i = 0
+  while (i < nBlockedSend) {
+    if (!startTask(i, entryOf(blockedSendBody), i)) {
+      return false
+    }
+    i = i + 1
+  }
+  runWorker()
+
+  chanClose(taskAt(addrChanA))
+  runWorker()
+
+  // And a send that finds the channel already closed, which is the other path.
+  if (!startTask(0, entryOf(sendAfterCloseBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
+}
+
+@nosplit function fillOneBody() {
+  let ch = taskAt(addrChanA)
+  chanSend(ch, 1)
+  schedTaskExit()
+}
+
+export function phaseSelect(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+  chanInit(taskAt(addrChanB), int(ptrOf(bufArea)) + 8, 1, false, s)
+  chanInit(taskAt(addrChanUnbuf), 0, 0, false, s)
+  if (!startTask(0, entryOf(selectArmBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
+}
+
+export function phaseSelectBlocking(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+  chanInit(taskAt(addrChanB), int(ptrOf(bufArea)) + 8, 1, false, s)
+  chanInit(taskAt(addrChanUnbuf), 0, 0, false, s)
+
+  // The selecting task runs first and parks on all three queues; the peer then
+  // sends on A, which must claim the waiter and wake it.
+  if (!startTask(0, entryOf(selectBlockBody), 0)) {
+    return false
+  }
+  runWorker()
+  if (!startTask(1, entryOf(selectPeerBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
+}
+
+export function phaseFifoAcrossFull(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+  if (!startTask(0, entryOf(fillOneBody), 0)) {
+    return false
+  }
+  runWorker()
+
+  // Two senders block, in a known order, behind the full buffer.
+  if (!startTask(1, entryOf(orderedSendBody), 101)) {
+    return false
+  }
+  runWorker()
+  if (!startTask(2, entryOf(orderedSendBody), 102)) {
+    return false
+  }
+  runWorker()
+
+  if (!startTask(3, entryOf(orderedRecvBody), 0)) {
+    return false
+  }
+  runWorker()
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// The GC root-scanning cursor (ABI.md §11)
+// ---------------------------------------------------------------------------
+//
+// `chan.zig` exposes buffered roots as `scanRegistryRoots(mark)`; this port
+// exposes a cursor because `@nosplit` cannot call through a function value. The
+// check is that the cursor reaches a registered `is_ref` channel's buffered
+// words and skips a non-`is_ref` one — the discrimination the collector depends
+// on to be precise rather than merely safe.
+let obsRegistry: i64 = -1
+
+export function phaseRegistry(): int {
+  let s = taskAt(addrSched)
+  let reg = ptrOf(regBlock)
+  chanRegInit(reg)
+
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 2, true, s)
+  chanInit(taskAt(addrChanB), int(ptrOf(bufArea)) + 16, 2, false, s)
+  chanRegister(reg, taskAt(addrChanA))
+  chanRegister(reg, taskAt(addrChanB))
+
+  // Two words into the traced channel, one into the untraced one.
+  chanPut(taskAt(addrChanA), 0x1111)
+  chanPut(taskAt(addrChanA), 0x2222)
+  chanPut(taskAt(addrChanB), 0x3333)
+
+  // Walk the registry the way the collector would: every registered channel,
+  // marking only the `is_ref` ones' buffered words.
+  let sum = 0
+  let it = chanRegHead(reg)
+  let guard = 0
+  while (it != 0 && guard < 16) {
+    let ch = taskAt(it)
+    if (chanIsRef(ch)) {
+      let i = 0
+      while (i < chanCount(ch)) {
+        sum = sum + chanBufferedAt(ch, i)
+        i = i + 1
+      }
+    }
+    it = chanRegNext(ch)
+    guard = guard + 1
+  }
+  obsRegistry = sum
+  return sum
+}
+
+// Put a word straight into a channel's buffer without a task, for the registry
+// check above. Legal because a buffered send on a channel with room never parks.
+@nosplit function chanPut(ch: *i64, v: int) {
+  chanSend(ch, v)
+}
+
+// ---------------------------------------------------------------------------
+// The verdict
+// ---------------------------------------------------------------------------
+//
+// One bit per independent property, so a partial failure names which half broke
+// rather than just producing a wrong number.
+//
+//    1  buffered FIFO and ring wraparound
+//    2  unbuffered rendezvous moved every value
+//    4  ... in order, with none lost or duplicated
+//    8  close released every blocked receiver with (zero, false)
+//   16  close released every blocked sender, and a double close reported failure
+//   32  a send finding the channel already closed reported the same thing
+//   64  select fired the one ready arm, with the right value
+//  128  select's default clause ran when nothing was ready
+//  256  a blocked select was woken by a peer and reported the right arm
+//  512  FIFO held across a full buffer (promoteQueuedSender)
+// 1024  the root-scanning cursor saw the traced channel and skipped the other
+export const propsTotal: int = 2047
+
+export function propsVerdict(): int {
+  let mask = 0
+  if (obsFifo == 9) {
+    mask = mask | 1
+  }
+  if (obsRendezvous == rendezvousCount) {
+    mask = mask | 2
+  }
+  if (obsOrdered == 1) {
+    mask = mask | 4
+  }
+  if (obsClosedRecv == nBlockedRecv) {
+    mask = mask | 8
+  }
+  if (obsClosedSend == nBlockedSend) {
+    mask = mask | 16
+  }
+  if (obsSendAfterClose == 0) {
+    mask = mask | 32
+  }
+  if (obsSelectArm == 1 && obsSelectValue == 42) {
+    mask = mask | 64
+  }
+  if (obsSelectDefault == 3) {
+    mask = mask | 128
+  }
+  if (obsSelectBlocked == 7) {
+    mask = mask | 256
+  }
+  let o = ptrOf(fifoOrder)
+  if (fifoSeen == 1 && *o == 1 && *(o + 1) == 101 && *(o + 2) == 102) {
+    mask = mask | 512
+  }
+
+  // The cursor must sum ONLY the traced channel's two words (0x1111 + 0x2222 =
+  // 13107) and skip the untraced channel's 0x3333 entirely. Summing 0x3333 too
+  // would be "safe but imprecise" — the thing the `is_ref` flag exists to
+  // prevent — and produces a different number, so the check discriminates.
+  if (obsRegistry == 13107) {
+    mask = mask | 1024
+  }
+  return mask
+}

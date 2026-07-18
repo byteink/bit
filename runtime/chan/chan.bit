@@ -1,0 +1,1051 @@
+// Typed channels: a bounded ring buffer or an unbuffered rendezvous between
+// green threads, plus `select` for waiting on several at once.
+//
+// Stage-2 port of `runtime/chan.zig` (#1365). Both exist during the port;
+// #1367/#1369 retire the Zig original.
+//
+// Semantics are the Zig's, which are the spec's (SPEC §16.2-16.3, mirroring
+// Go): send on a closed channel is an error, receive on a closed-and-drained
+// channel yields `(zero, false)`, a nil channel blocks forever, `close` wakes
+// every blocked peer, and `select` picks uniformly at random among the cases
+// ready at the moment it runs. Buffer discipline, wait-queue order and the
+// select winner-take-all rule are unchanged — a channel that is "better" but
+// different would deadlock programs that work today.
+//
+// ---------------------------------------------------------------------------
+// THERE IS ONLY ONE CHANNEL TYPE HERE, AND THAT IS THE ABI'S CHOICE
+// ---------------------------------------------------------------------------
+//
+// `chan.zig` is generic (`Chan(T)`) and therefore needs `ChanVTable` — nine
+// function pointers per instantiation — so that `select` can drive cases whose
+// `T` differ. ABI.md §11 then collapses all of it: "every `chan<T>` a Bit
+// program declares is realized at the runtime boundary as a channel of one
+// 8-byte word (`WordChan = Chan(u64)`) — never a per-`T` instantiation".
+//
+// So the vtable's entire job is to bridge a genericity the ABI does not have.
+// This port is `WordChan` and calls its own operations directly. That removes
+// the indirection rather than reimplementing it, which matters twice over:
+// `@nosplit` REJECTS A CALL THROUGH A FUNCTION VALUE (E0075), so a vtable is
+// not merely unnecessary here but unexpressible — and `SelectNode`'s reason for
+// existing (a layout-compatible stand-in for a `Waiter` whose `T` select cannot
+// name) goes with it, along with the `comptime` assert that policed it. One
+// waiter shape, no cast, nothing to keep in sync.
+//
+// ---------------------------------------------------------------------------
+// WHY EVERY FUNCTION HERE IS `@nosplit`, AND WHAT THAT COSTS
+// ---------------------------------------------------------------------------
+//
+// Task bodies must be `@nosplit` today (see `schedWorkerRun`'s comment: a
+// safepoint snapshots registers into one process-wide frame and collects
+// unsynchronized, so no worker loop may reach one — #1429). A `@nosplit` body
+// may only call `@nosplit` functions, and channel operations are called FROM
+// task bodies, so this module inherits the attribute wholesale.
+//
+// Three consequences, none of them chosen:
+//
+//   1. NO PANIC. `chan.zig` panics on "send on closed channel" and "close of
+//      closed channel"; `panic` is not reachable from a `@nosplit` body. Both
+//      are reported as a `false` return instead, and the ABI wrapper that
+//      raises them as panics is #1367's half. This is the same trade
+//      `schedUnpark` already made, for the same reason.
+//   2. NO CALLBACKS. `scanRegistryRoots(mark)` and `forEachBuffered(visit)`
+//      take function pointers. Both are re-exposed as cursors the collector
+//      drives (`chanRegHead`/`chanRegNext`, `chanBufferedAt`) — exactly what
+//      `runtime/sched` did to `forEachOtherStack` for the same reason.
+//   3. NO CLOCK. `selectRandom` seeds from `monoNs()`; a clock is a syscall or
+//      an extern call. See `selectSeed` for what replaces it.
+//
+// ---------------------------------------------------------------------------
+// THE PARK RACE, WHICH IS THE ONE REAL DESIGN CHANGE IN THIS FILE
+// ---------------------------------------------------------------------------
+//
+// `chan.zig` links a waiter onto a channel's queue from inside `park`'s `setup`
+// callback — "never before, and never after". That timing is the whole
+// correctness argument: `setup` runs strictly after the task's context is saved
+// and its state is visibly `.parked`, so an unparker can never see a waiter
+// belonging to a task that is not yet parkable.
+//
+// THAT HOOK DOES NOT EXIST HERE. `schedPark` has no `ParkFn`, because passing
+// one is a call through a function value, which `@nosplit` rejects (E0075).
+// `runtime/sched`'s own comment names this as the seam "#1365 will need closed
+// properly", so it is the inherited problem rather than a new one.
+//
+// This port closes it from the other end. A waiter is registered BEFORE parking,
+// under the channel lock — which makes the waiter visible early rather than
+// late, so the lost-wakeup risk moves from "a waker cannot find the task" to "a
+// waker finds the task before it has finished parking". The second is
+// detectable and the first is not: `schedUnpark` compare-and-exchanges
+// `taskParked -> taskRunnable` and RETURNS FALSE when the task was not parked,
+// so a waker can see the case exactly. `chanWake` therefore waits for the
+// parking task to arrive before unparking it.
+//
+// WHY THAT WAIT TERMINATES, which is the only thing that makes this sound:
+// a task appears on a wait queue only while it is RUNNING (it pushed itself
+// there), and green threads here are not preemptible, so it holds its worker's
+// CPU continuously from the push to the context switch — a lock release and a
+// call. `taskParked` is stored by that worker immediately after the switch
+// saves the context. So the waited-for transition is already in flight on
+// another OS thread, with no lock in between that the waker could be holding.
+//
+// This is the SAME liveness assumption `runtime/spinlock` already makes of
+// every critical section in the runtime — that a thread holding a word another
+// thread spins on continues to be scheduled — not a new class of hazard. It is
+// bounded anyway (`WAKE_MAX_SPINS`) so that a wedged scheduler degrades into a
+// dropped wakeup rather than a hung process, and it spins on the same
+// architectural hint instructions `runtime/spinlock` and the scheduler's idle
+// backoff use.
+//
+// A WELCOME CONSEQUENCE: registering early removes the need for `setup`'s
+// recheck. `chan.zig` must re-test the channel condition inside the callback
+// because the gap between its own failed poll and registration is exactly when
+// another thread could have made the case ready. Registering under the same
+// lock acquisition that observed "not ready" closes that gap by construction,
+// so there is no window to recheck. The behaviour is identical; one of the two
+// mechanisms that produced it is simply no longer needed.
+//
+// ---------------------------------------------------------------------------
+// MEMORY: CALLER-OWNED BLOCKS, AND A PER-TASK SCRATCH AREA
+// ---------------------------------------------------------------------------
+//
+// A channel, a ring buffer and a select descriptor array are word-indexed
+// blocks the caller supplies, exactly as `runtime/sched`, `runtime/alloc` and
+// `runtime/gc` take theirs. Nothing here allocates.
+//
+// A waiter is different: `chan.zig` puts it on the blocking function's own
+// stack frame (`var w: Waiter`), which this port cannot do — `ptrOf` on a local
+// is rejected inside a `@nosplit` body (#1421), so a local's address cannot be
+// handed to a queue. And the ABI's entry points (`bit_rt_chan_send(ch, value)`)
+// have no spare parameter for scratch, so the caller cannot supply it either.
+//
+// So a waiter lives at the base of the parking task's OWN STACK, in the words
+// immediately above the self-pointer and tag `schedTaskInit` writes there. That
+// is the same "the running task's stack is the one piece of per-thread state
+// that needs no help from the operating system" trick `schedCurrentTask` rests
+// on, reused rather than reinvented. It has the lifetime a waiter needs exactly
+// — the scratch dies with the stack it belongs to, which is precisely when the
+// task that could be waiting on it is gone — and it costs no allocation.
+//
+// The area is the LOWEST `chanScratchWords` words of the stack, and a stack
+// grows down from its top, so the scratch is the last memory a deepening call
+// chain would reach. A task that overran it has already overflowed its stack.
+//
+// 264 words = 2112 bytes out of a 64KiB stack: the eight fixed words below,
+// `chanMaxSelect` waiter nodes, and two `chanMaxSelect`-entry index arrays.
+export const chanScratchWords: int = 264
+
+import { spinAcquire, spinRelease, spinCellAt } from "../"
+import { taskAt, taskState, taskParked, taskStackBase, schedUnpark, schedPark } from "../sched"
+import { schedCurrentTask } from "../sched"
+
+// ---------------------------------------------------------------------------
+// Channel block
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s `Chan(T)` fields, in declaration order, as a word-indexed block:
+//
+//   0   lock        an i32 cell, addressed via `spinCellAt`
+//   1   closed
+//   2   buf         base address of the caller-owned ring storage (0 when cap 0)
+//   3   cap
+//   4   head
+//   5   count
+//   6   sendq head        the two wait queues, each a singly-linked FIFO of
+//   7   sendq tail        waiter addresses under this channel's lock
+//   8   recvq head
+//   9   recvq tail
+//   10  isRef       whether a buffered word is itself a GC reference (ABI §11)
+//   11  regNext     intrusive link for the root-scanning registry
+//   12  sched       the scheduler this channel's wakeups go through
+//
+// `sched` is a field here where `chan.zig` threads `sp: *Scheduler` through
+// every call. Forced by the ABI: `bit_rt_chan_send(ch, value)` has no scheduler
+// parameter and its arity is fixed, so a channel must be able to reach one on
+// its own. Equivalent — there is one process-wide scheduler (ABI.md §9) — and
+// it also makes `chanClose` callable from a non-worker thread, which the Zig's
+// signature already allowed and this file's tests rely on.
+export const chanWords: int = 13
+
+const chLock: int = 0
+const chClosed: int = 1
+const chBuf: int = 2
+const chCap: int = 3
+const chHead: int = 4
+const chCount: int = 5
+const chSendHead: int = 6
+const chSendTail: int = 7
+const chRecvHead: int = 8
+const chRecvTail: int = 9
+const chIsRef: int = 10
+const chRegNext: int = 11
+const chSched: int = 12
+
+// ---------------------------------------------------------------------------
+// Waiter block
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s `Waiter`, field for field and in the same order. It kept that
+// order to stay layout-compatible with `SelectNode`; here there is only one
+// shape, so the order is preserved simply because there is no reason to disturb
+// a working structure.
+//
+//   0  task      the parked task's address
+//   1  elem      address of the value slot (in for a send, out for a receive)
+//   2  ok        address of the outcome slot
+//   3  select    address of the select-shared block, 0 for a plain waiter
+//   4  caseIdx   which select case this registration is
+//   5  next      queue link
+const wTask: int = 0
+const wElem: int = 1
+const wOk: int = 2
+const wSelect: int = 3
+const wCase: int = 4
+const wNext: int = 5
+const waiterWords: int = 6
+
+// ---------------------------------------------------------------------------
+// Per-task scratch, at the base of the task's own stack
+// ---------------------------------------------------------------------------
+//
+//   0        task self-pointer      written by `schedTaskInit`
+//   1        stack tag              written by `schedTaskInit`
+//   2        select seed counter
+//   3        select shared: done    the winner-take-all CAS word
+//   4        select shared: winner
+//   5        elem                   plain send/recv value slot
+//   6        ok                     plain send/recv outcome slot
+//   7        reserved
+//   8..199   waiter nodes           `chanMaxSelect` * `waiterWords`
+const scrCounter: int = 2
+const scrSelDone: int = 3
+const scrSelWinner: int = 4
+const scrElem: int = 5
+const scrOk: int = 6
+const scrNodes: int = 8
+
+// The two index arrays select needs, past the waiter nodes: `scrOrder` holds
+// the case indices sorted by channel address (the lock order) and `scrShuffled`
+// holds them in the random order the poll runs in. They are separate because the
+// two orders are answers to different questions — see `chanSelect`.
+const scrOrder: int = 200
+const scrShuffled: int = 232
+
+// `chan.zig`'s `max_select_cases`, unchanged: select's registrations are
+// fixed-size and preallocated (Power of 10 — no unbounded resource after
+// startup). Nobody writes a 32-way select; the constant is a bound, not a
+// budget.
+export const chanMaxSelect: int = 32
+
+// Select case direction, matching ABI.md §11's `SelectCaseDesc.dir` encoding
+// (0 recv / 1 send) — codegen writes these, so they are ABI and not free.
+export const chanDirRecv: int = 0
+export const chanDirSend: int = 1
+
+// `SelectCaseDesc { dir, chan, word, ok }`, ABI.md §11's 32-byte descriptor,
+// as word indices. `word` is IN/OUT: a send case's value on the way in, a recv
+// case's received value on the way out.
+export const selCaseWords: int = 4
+const scDir: int = 0
+const scChan: int = 1
+const scWord: int = 2
+const scOk: int = 3
+
+// The scratch area of the task at `task`.
+@nosplit function scratchOf(task: int): *i64 {
+  let base = *(taskAt(task) + taskStackBase)
+  return taskAt(base)
+}
+
+// Waiter node `i` of a task's scratch area.
+@nosplit function nodeAt(scr: *i64, i: int): *i64 {
+  return scr + scrNodes + i * waiterWords
+}
+
+// ---------------------------------------------------------------------------
+// Wait queues
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s `WaitQueue(W)`: a singly-linked FIFO of waiter addresses guarded
+// by the owning channel's lock. Two of them per channel, so each operation
+// takes the head/tail slot pair to work on rather than a queue object — the
+// same "a structure is a block plus an offset" shape the rest of the port uses.
+//
+// FIFO is the discipline, not an accident: it is what makes a channel fair
+// between senders blocked on a full buffer.
+
+@nosplit function wqPush(ch: *i64, headSlot: int, w: *i64) {
+  *(w + wNext) = 0
+  let tail = *(ch + headSlot + 1)
+  if (tail == 0) {
+    *(ch + headSlot) = int(w)
+  } else {
+    *(taskAt(tail) + wNext) = int(w)
+  }
+  *(ch + headSlot + 1) = int(w)
+}
+
+@nosplit function wqPop(ch: *i64, headSlot: int): int {
+  let head = *(ch + headSlot)
+  if (head == 0) {
+    return 0
+  }
+  let next = *(taskAt(head) + wNext)
+  *(ch + headSlot) = next
+  if (next == 0) {
+    *(ch + headSlot + 1) = 0
+  }
+  *(taskAt(head) + wNext) = 0
+  return head
+}
+
+// Unlink a specific waiter. Only ever used to cancel a losing select
+// registration, and a no-op when the target is absent — either a completer
+// already popped it, or it was never registered because the winner resolved
+// first. `chan.zig`'s `WaitQueue.remove`, including that tolerance.
+//
+// The walk is bounded by the queue's own length, which is bounded by the number
+// of live tasks; `chanMaxWaiters` is the runaway backstop, the same shape
+// `schedRegCount` uses on the task registry.
+const chanMaxWaiters: int = 16777216
+
+@nosplit function wqRemove(ch: *i64, headSlot: int, target: int) {
+  let prev = 0
+  let cur = *(ch + headSlot)
+  let n = 0
+  while (cur != 0 && n < chanMaxWaiters) {
+    let next = *(taskAt(cur) + wNext)
+    if (cur == target) {
+      if (prev == 0) {
+        *(ch + headSlot) = next
+      } else {
+        *(taskAt(prev) + wNext) = next
+      }
+      if (*(ch + headSlot + 1) == cur) {
+        *(ch + headSlot + 1) = prev
+      }
+      *(taskAt(cur) + wNext) = 0
+      return
+    }
+    prev = cur
+    cur = next
+    n = n + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Waking a parked peer
+// ---------------------------------------------------------------------------
+//
+// See the header for why this waits and why the wait terminates. The bound
+// exists so that termination is provable by READING the loop rather than by
+// trusting the scheduler, exactly as `schedWorkerRun`'s trip bound is.
+//
+// Exhausting it drops a wakeup, which is a hang for the peer — but the only way
+// to reach it is a scheduler that has already stopped running the parking task,
+// in which case the peer was never going to be resumed anyway. Spinning forever
+// would convert that into a hung waker as well.
+const WAKE_MAX_SPINS: int = 1000000000
+
+@nosplit function chanWake(s: *i64, task: int) {
+  let t = taskAt(task)
+  let n = 0
+  while (n < WAKE_MAX_SPINS) {
+    if (atomicLoad(t + taskState) == taskParked) {
+      schedUnpark(s, task)
+      return
+    }
+    asm {
+      arm64 { 0xD503203F }        // yield
+      x64   { 0xF3, 0x90 }        // pause
+    }
+    n = n + 1
+  }
+}
+
+// True if this waiter may be completed by the caller.
+//
+// `chan.zig`'s `claim`, unchanged in mechanism. A plain waiter always succeeds:
+// it sits on exactly one queue and nothing else contends for it. A select
+// registration claims by CAS on its shared `done` word, so exactly one of the
+// several channels a select is parked on can complete it; every other channel's
+// attempt loses the CAS and must treat the entry as if it had never been queued.
+// This is Go's `sudog.isSelect`/`selectDone` design, which is where `chan.zig`
+// took it from.
+@nosplit function claim(w: *i64): bool {
+  let sel = *(w + wSelect)
+  if (sel == 0) {
+    return true
+  }
+  return atomicCmpxchg(taskAt(sel), 0, 1)
+}
+
+// Record the winning case (select only) and wake the waiter's task.
+@nosplit function finish(s: *i64, w: *i64) {
+  let sel = *(w + wSelect)
+  if (sel != 0) {
+    *(taskAt(sel) + 1) = *(w + wCase)
+  }
+  chanWake(s, *(w + wTask))
+}
+
+// ---------------------------------------------------------------------------
+// Ring buffer — cap > 0 only
+// ---------------------------------------------------------------------------
+
+@nosplit function pushBuf(ch: *i64, value: int) {
+  let buf = taskAt(*(ch + chBuf))
+  let capacity = *(ch + chCap)
+  let count = *(ch + chCount)
+  *(buf + (*(ch + chHead) + count) % capacity) = value
+  *(ch + chCount) = count + 1
+}
+
+@nosplit function popBuf(ch: *i64): int {
+  let buf = taskAt(*(ch + chBuf))
+  let capacity = *(ch + chCap)
+  let head = *(ch + chHead)
+  let value = *(buf + head)
+  *(ch + chHead) = (head + 1) % capacity
+  *(ch + chCount) = *(ch + chCount) - 1
+  return value
+}
+
+// ---------------------------------------------------------------------------
+// Direct handoffs
+// ---------------------------------------------------------------------------
+//
+// These skip the buffer entirely, and are also how an unbuffered channel
+// (cap 0) always moves a value. `chan.zig`'s `tryHandoffToReceiver` /
+// `tryHandoffFromSender` / `promoteQueuedSender`, unchanged: each pops until it
+// finds a waiter it can claim, because an unclaimable one belongs to a select
+// that another channel already won and must be discarded rather than retried.
+
+@nosplit function tryHandoffToReceiver(ch: *i64, value: int, s: *i64): bool {
+  let n = 0
+  while (n < chanMaxWaiters) {
+    let addr = wqPop(ch, chRecvHead)
+    if (addr == 0) {
+      return false
+    }
+    let w = taskAt(addr)
+    if (claim(w)) {
+      *(taskAt(*(w + wElem))) = value
+      *(taskAt(*(w + wOk))) = 1
+      finish(s, w)
+      return true
+    }
+    n = n + 1
+  }
+  return false
+}
+
+@nosplit function tryHandoffFromSender(ch: *i64, valueOut: *i64, s: *i64): bool {
+  let n = 0
+  while (n < chanMaxWaiters) {
+    let addr = wqPop(ch, chSendHead)
+    if (addr == 0) {
+      return false
+    }
+    let w = taskAt(addr)
+    if (claim(w)) {
+      *valueOut = *(taskAt(*(w + wElem)))
+      *(taskAt(*(w + wOk))) = 1
+      finish(s, w)
+      return true
+    }
+    n = n + 1
+  }
+  return false
+}
+
+// After a value leaves the buffer, pull one blocked sender into the freed slot.
+// Only possible when the buffer had been full, and it is what preserves FIFO
+// order across buffered sends — without it a sender that blocked on a full
+// buffer would be overtaken by every later sender that found room.
+@nosplit function promoteQueuedSender(ch: *i64, s: *i64) {
+  let n = 0
+  while (n < chanMaxWaiters) {
+    let addr = wqPop(ch, chSendHead)
+    if (addr == 0) {
+      return
+    }
+    let w = taskAt(addr)
+    if (claim(w)) {
+      pushBuf(ch, *(taskAt(*(w + wElem))))
+      *(taskAt(*(w + wOk))) = 1
+      finish(s, w)
+      return
+    }
+    n = n + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Non-blocking attempts — the channel lock must be held
+// ---------------------------------------------------------------------------
+//
+// `chan.zig`'s `attemptSend`/`attemptRecv`, in the same order, because the order
+// IS the semantics: a waiting receiver takes precedence over the buffer (so an
+// unbuffered channel works at all, and so a rendezvous does not pointlessly
+// round-trip through storage), and on the receive side a buffered value takes
+// precedence over a waiting sender (so FIFO across the buffer holds).
+
+@nosplit function attemptSend(ch: *i64, value: int, s: *i64): bool {
+  if (tryHandoffToReceiver(ch, value, s)) {
+    return true
+  }
+  if (*(ch + chCount) < *(ch + chCap)) {
+    pushBuf(ch, value)
+    return true
+  }
+  return false
+}
+
+// `attemptRecv` reports through a status rather than an out-parameter `ok`.
+//
+// `chan.zig` writes `ok` through a pointer because its caller always has a
+// stack local to point at. This port's caller does not: a local's address is
+// unavailable inside a `@nosplit` body (#1421), so an out-parameter `ok` would
+// force every receive — including the non-blocking fast path — to reach for the
+// per-task scratch, and that would make `chanRecv` fault when called from a
+// thread that is not a task. A status return keeps the fast path task-free,
+// which is what lets a non-task thread drain a channel.
+const rcvNone: int = 0
+const rcvValue: int = 1
+const rcvClosed: int = 2
+
+@nosplit function attemptRecv(ch: *i64, valueOut: *i64, s: *i64): int {
+  if (*(ch + chCount) > 0) {
+    *valueOut = popBuf(ch)
+    promoteQueuedSender(ch, s)
+    return rcvValue
+  }
+  if (tryHandoffFromSender(ch, valueOut, s)) {
+    return rcvValue
+  }
+  if (*(ch + chClosed) != 0) {
+    // The zero word, and `ok` false to say so. For a reference element that
+    // zero IS a null pointer, which is the whole reason the two-result receive
+    // exists (ABI.md §11) — a receiver must be able to tell "closed" from "a
+    // real value" before dereferencing it.
+    *valueOut = 0
+    return rcvClosed
+  }
+  return rcvNone
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+// Prepare a channel over caller-owned storage. `bufAddr` addresses `cap` words
+// and is ignored when `cap` is 0 (the unbuffered case, where `count < cap` is
+// `0 < 0` and every value moves by direct handoff — `chan.zig` needs no special
+// case for it either).
+export @nosplit function chanInit(ch: *i64, bufAddr: int, capacity: int, isRef: bool, s: *i64) {
+  atomicStore(spinCellAt(ch, chLock), 0)
+  *(ch + chClosed) = 0
+  *(ch + chBuf) = bufAddr
+  *(ch + chCap) = capacity
+  *(ch + chHead) = 0
+  *(ch + chCount) = 0
+  *(ch + chSendHead) = 0
+  *(ch + chSendTail) = 0
+  *(ch + chRecvHead) = 0
+  *(ch + chRecvTail) = 0
+  if (isRef) {
+    *(ch + chIsRef) = 1
+  } else {
+    *(ch + chIsRef) = 0
+  }
+  *(ch + chRegNext) = 0
+  *(ch + chSched) = int(s)
+}
+
+// ---------------------------------------------------------------------------
+// Blocking send
+// ---------------------------------------------------------------------------
+//
+// Returns false for "send on a closed channel", which `chan.zig` reports by
+// panicking. See the header: `panic` is not reachable from a `@nosplit` body,
+// and the ABI wrapper raises it. Both of the Zig's two panic points are checked
+// here in the same two places — before attempting, and after being woken by a
+// `close` that found this sender queued.
+//
+// MUST BE CALLED FROM TASK CODE. Off a task `schedCurrentTask` returns 0 and
+// the scratch lookup faults, which is `runtime/sched`'s stated contract for
+// every function that can park and the honest equivalent of `chan.zig`'s
+// `sched.park` on a non-task thread.
+export @nosplit function chanSend(ch: *i64, value: int): bool {
+  let s = taskAt(*(ch + chSched))
+  spinAcquire(spinCellAt(ch, chLock))
+  if (*(ch + chClosed) != 0) {
+    spinRelease(spinCellAt(ch, chLock))
+    return false
+  }
+  if (attemptSend(ch, value, s)) {
+    spinRelease(spinCellAt(ch, chLock))
+    return true
+  }
+
+  // Blocked. Register under the SAME lock acquisition that just observed the
+  // channel unable to take the value — that adjacency is what removes the
+  // recheck `chan.zig` needs inside its park callback (see the header).
+  let task = schedCurrentTask()
+  let scr = scratchOf(task)
+  *(scr + scrElem) = value
+  *(scr + scrOk) = 0
+  let w = nodeAt(scr, 0)
+  *(w + wTask) = task
+  *(w + wElem) = int(scr + scrElem)
+  *(w + wOk) = int(scr + scrOk)
+  *(w + wSelect) = 0
+  *(w + wCase) = 0
+  wqPush(ch, chSendHead, w)
+
+  // Never hold a spinlock across the context switch: the holder stops running,
+  // and every spinner is `@nosplit` and so cannot yield.
+  spinRelease(spinCellAt(ch, chLock))
+  schedPark()
+
+  let ok = *(scr + scrOk)
+  return ok != 0
+}
+
+// ---------------------------------------------------------------------------
+// Blocking receive
+// ---------------------------------------------------------------------------
+//
+// Writes the received value through `valueOut` and returns `ok` — false meaning
+// the channel was closed and drained, with the zero word written. `chan.zig`
+// returns both in a `RecvResult` struct; a two-word return is the shape ABI.md
+// §11 gives `bit_rt_chan_recv`, and splitting it into an out-parameter plus a
+// bool is how that lands on a `@nosplit` Bit signature without a struct return.
+export @nosplit function chanRecv(ch: *i64, valueOut: *i64): bool {
+  let s = taskAt(*(ch + chSched))
+
+  spinAcquire(spinCellAt(ch, chLock))
+  let st = attemptRecv(ch, valueOut, s)
+  if (st != rcvNone) {
+    spinRelease(spinCellAt(ch, chLock))
+    return st == rcvValue
+  }
+
+  // Only the blocking path needs a task: the value slot moves to the per-task
+  // scratch so that the waker has somewhere stable to write it, `valueOut`
+  // being a caller frame that is about to be suspended.
+  let task = schedCurrentTask()
+  let scr = scratchOf(task)
+  let w = nodeAt(scr, 0)
+  *(w + wTask) = task
+  *(w + wElem) = int(scr + scrElem)
+  *(w + wOk) = int(scr + scrOk)
+  *(w + wSelect) = 0
+  *(w + wCase) = 0
+  wqPush(ch, chRecvHead, w)
+  spinRelease(spinCellAt(ch, chLock))
+  schedPark()
+
+  *valueOut = *(scr + scrElem)
+  let ok = *(scr + scrOk)
+  return ok != 0
+}
+
+// ---------------------------------------------------------------------------
+// Close
+// ---------------------------------------------------------------------------
+//
+// Wakes EVERY blocked peer — receivers with `(zero, false)`, senders with the
+// `ok` that makes them report "send on closed channel". Returns false for
+// "close of a closed channel", the Zig's second panic.
+//
+// TEARDOWN IS THE POINT OF THIS FUNCTION, and this project has already paid for
+// getting it wrong: a QUIC test hung because teardown never released its
+// `read`/`finish`/`acceptStream` waiters, and because `finish` drained on
+// packets rather than bytes — a condition a departed peer can never satisfy. So
+// both loops here drain their queue to empty rather than waking a bounded batch,
+// and neither waits on any condition another party must still supply. After
+// this returns, both queues are empty and every task that was on them is
+// runnable.
+//
+// Safe from a non-task thread: it never parks, and it reaches the scheduler
+// through the channel's own `sched` field rather than through the caller.
+export @nosplit function chanClose(ch: *i64): bool {
+  let s = taskAt(*(ch + chSched))
+  spinAcquire(spinCellAt(ch, chLock))
+  if (*(ch + chClosed) != 0) {
+    spinRelease(spinCellAt(ch, chLock))
+    return false
+  }
+  *(ch + chClosed) = 1
+
+  let n = 0
+  while (n < chanMaxWaiters) {
+    let addr = wqPop(ch, chRecvHead)
+    if (addr == 0) {
+      n = chanMaxWaiters
+    } else {
+      let w = taskAt(addr)
+      if (claim(w)) {
+        *(taskAt(*(w + wElem))) = 0
+        *(taskAt(*(w + wOk))) = 0
+        finish(s, w)
+      }
+      n = n + 1
+    }
+  }
+
+  let m = 0
+  while (m < chanMaxWaiters) {
+    let addr = wqPop(ch, chSendHead)
+    if (addr == 0) {
+      m = chanMaxWaiters
+    } else {
+      let w = taskAt(addr)
+      if (claim(w)) {
+        *(taskAt(*(w + wOk))) = 0
+        finish(s, w)
+      }
+      m = m + 1
+    }
+  }
+
+  spinRelease(spinCellAt(ch, chLock))
+  return true
+}
+
+// Whether the channel is closed. Not a `chan.zig` export — added because the
+// root-scanning cursor and the tests need to observe the flag without taking
+// the lock, and a plain load of a word that only ever goes 0 -> 1 is race-free
+// in the only direction that matters.
+export @nosplit function chanClosed(ch: *i64): bool {
+  return *(ch + chClosed) != 0
+}
+
+// How many values are currently buffered. `len(ch)` in spec terms.
+export @nosplit function chanCount(ch: *i64): int {
+  return *(ch + chCount)
+}
+
+// ---------------------------------------------------------------------------
+// Select
+// ---------------------------------------------------------------------------
+//
+// `cases` is `n` contiguous `SelectCaseDesc`s (ABI.md §11). Returns the index of
+// the case that fired, or `n` when `hasDefault` and nothing was ready — which is
+// the ABI's encoding of "the default clause ran", not an error.
+//
+// A send case on a closed channel is "ready" and reports its outcome through the
+// descriptor's `ok` word, mirroring a plain `chanSend` returning false rather
+// than the Zig's panic.
+
+// The select seed.
+//
+// `chan.zig` seeds xoshiro256 from `monoNs() ^ counter ^ &stack_marker`, and
+// says in its own header that fairness needs an UNBIASED shuffle, not an
+// unpredictable one. A clock is a syscall or an extern call, so `monoNs` is not
+// reachable from a `@nosplit` body — and the process-wide `select_seed_counter`
+// would need an atomic on module state, which needs `ptrOf` (#1421).
+//
+// Both are replaced by state that is per-task and therefore raced by nobody: the
+// task's own address, mixed with a counter living in that task's scratch. The
+// counter alone makes successive selects by one task differ; the address makes
+// two tasks at the same iteration differ. That is exactly the property the
+// shuffle needs. The mix is splitmix64's finalizer, the same one `runtime/rand`
+// uses for scalar keys.
+// The multiplier and increment are Knuth's 64-bit LCG constants, also used by
+// `shuffleOrder` below. Written in decimal because splitmix64's usual hex
+// constants (0x9E3779B97F4A7C15 and friends) do not fit a signed `int`.
+const mixMul: int = 6364136223846793005
+const mixInc: int = 1442695040888963407
+
+@nosplit function selectSeed(scr: *i64, task: int): int {
+  let c = *(scr + scrCounter) + 1
+  *(scr + scrCounter) = c
+  let x = task + c * mixMul
+  x = (x ^ (x >> 29)) * mixMul + mixInc
+  return x ^ (x >> 32)
+}
+
+// Fisher-Yates over the case order, so that "the first ready case wins" is a
+// uniform-random pick among the ready set. `chan.zig` shuffles the same array
+// for the same reason.
+@nosplit function shuffleOrder(order: *i64, n: int, seed: int) {
+  let state = seed
+  let i = n - 1
+  while (i > 0) {
+    state = state * 6364136223846793005 + 1442695040888963407
+    let r = (state >> 33) & 0x7FFFFFFF
+    let j = r % (i + 1)
+    let a = *(order + i)
+    *(order + i) = *(order + j)
+    *(order + j) = a
+    i = i - 1
+  }
+}
+
+// The address of case `i`'s channel.
+@nosplit function caseChan(cases: *i64, i: int): int {
+  return *(cases + i * selCaseWords + scChan)
+}
+
+// Sort `order` by channel address — insertion sort, `n <= chanMaxSelect`.
+//
+// THIS IS THE GLOBAL LOCK ORDER, and it is the only thing stopping two
+// concurrent selects that share two channels from deadlocking each other by
+// taking them in opposite orders. Sorting also puts duplicate channels adjacent,
+// which is what lets `lockAll` skip the second lock of a channel named by two
+// cases instead of self-deadlocking on it.
+@nosplit function sortByAddr(cases: *i64, order: *i64, n: int) {
+  let i = 1
+  while (i < n) {
+    let j = i
+    while (j > 0 && caseChan(cases, *(order + j - 1)) > caseChan(cases, *(order + j))) {
+      let a = *(order + j - 1)
+      *(order + j - 1) = *(order + j)
+      *(order + j) = a
+      j = j - 1
+    }
+    i = i + 1
+  }
+}
+
+@nosplit function lockAll(cases: *i64, order: *i64, n: int) {
+  let last = 0
+  let i = 0
+  while (i < n) {
+    let a = caseChan(cases, *(order + i))
+    if (a != last) {
+      spinAcquire(spinCellAt(taskAt(a), chLock))
+      last = a
+    }
+    i = i + 1
+  }
+}
+
+@nosplit function unlockAll(cases: *i64, order: *i64, n: int) {
+  let last = 0
+  let i = n
+  while (i > 0) {
+    i = i - 1
+    let a = caseChan(cases, *(order + i))
+    if (a != last) {
+      spinRelease(spinCellAt(taskAt(a), chLock))
+      last = a
+    }
+  }
+}
+
+// One non-blocking pass with every involved channel already locked. Returns the
+// firing case index, or `n` when nothing was ready. `chan.zig`'s `pollOnce`.
+@nosplit function pollOnce(cases: *i64, order: *i64, n: int, s: *i64): int {
+  let i = 0
+  while (i < n) {
+    let idx = *(order + i)
+    let c = cases + idx * selCaseWords
+    let ch = taskAt(*(c + scChan))
+    if (*(c + scDir) == chanDirRecv) {
+      let st = attemptRecv(ch, c + scWord, s)
+      if (st != rcvNone) {
+        if (st == rcvValue) {
+          *(c + scOk) = 1
+        } else {
+          *(c + scOk) = 0
+        }
+        return idx
+      }
+    } else {
+      if (*(ch + chClosed) != 0) {
+        // Ready, and it will report "send on closed channel" — exactly what a
+        // plain send does, rather than being skipped as not-ready.
+        *(c + scOk) = 0
+        return idx
+      }
+      if (attemptSend(ch, *(c + scWord), s)) {
+        *(c + scOk) = 1
+        return idx
+      }
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Block until exactly one of `n` cases can proceed, chosen uniformly at random
+// among those ready. `hasDefault` makes it a single non-blocking attempt.
+//
+// `n == 0` is `select {}`, which blocks forever — parking with nothing that can
+// ever wake it, matching the Zig.
+//
+// A nil-channel case is the caller's responsibility to omit, as in Go and as in
+// `chan.zig`: such a case is simply never ready and never wins.
+export @nosplit function chanSelect(cases: *i64, n: int, hasDefault: bool): int {
+  let task = schedCurrentTask()
+  let scr = scratchOf(task)
+
+  if (n == 0) {
+    schedPark()
+    return 0
+  }
+
+  // `order` and the shared block both live in this task's scratch, so no case
+  // of this select is reachable from any other task's memory.
+  let order = scr + scrOrder
+  let i = 0
+  while (i < n) {
+    *(order + i) = i
+    i = i + 1
+  }
+  sortByAddr(cases, order, n)
+
+  let s = taskAt(*(taskAt(caseChan(cases, 0)) + chSched))
+
+  // The poll runs in shuffled order; the LOCKS are taken in address order. The
+  // two orders are independent on purpose — fairness is about which ready case
+  // is chosen, deadlock-freedom is about the order the locks are taken in, and
+  // conflating them would sacrifice one for the other.
+  let shuffled = scr + scrShuffled
+  let k = 0
+  while (k < n) {
+    *(shuffled + k) = k
+    k = k + 1
+  }
+  shuffleOrder(shuffled, n, selectSeed(scr, task))
+
+  lockAll(cases, order, n)
+  let fired = pollOnce(cases, shuffled, n, s)
+  if (fired < n) {
+    unlockAll(cases, order, n)
+    return fired
+  }
+  if (hasDefault) {
+    unlockAll(cases, order, n)
+    return n
+  }
+
+  // Nothing ready and no default: register on every case, then park. As in the
+  // plain send/recv paths, registration happens under the SAME lock hold that
+  // observed nothing ready, so there is no gap for a waker to slip through and
+  // no recheck to perform.
+  *(scr + scrSelDone) = 0
+  *(scr + scrSelWinner) = 0
+  let sel = int(scr + scrSelDone)
+
+  let j = 0
+  while (j < n) {
+    let c = cases + j * selCaseWords
+    let ch = taskAt(*(c + scChan))
+    let w = nodeAt(scr, j)
+    *(w + wTask) = task
+    *(w + wElem) = int(c + scWord)
+    *(w + wOk) = int(c + scOk)
+    *(w + wSelect) = sel
+    *(w + wCase) = j
+    if (*(c + scDir) == chanDirRecv) {
+      wqPush(ch, chRecvHead, w)
+    } else {
+      wqPush(ch, chSendHead, w)
+    }
+    j = j + 1
+  }
+  unlockAll(cases, order, n)
+
+  schedPark()
+
+  // Woken by exactly one case. Every OTHER registration must come off its queue
+  // before this returns: the waiter nodes live in this task's scratch, and a
+  // stale queue entry pointing at one would be handed a value destined for a
+  // select that is no longer waiting. `chan.zig` unlinks here for the same
+  // reason — its nodes are on the returning stack frame.
+  //
+  // A case that was never registered is a harmless no-op, which is what makes
+  // `wqRemove` tolerant of an absent target.
+  let winner = *(scr + scrSelWinner)
+  lockAll(cases, order, n)
+  let m = 0
+  while (m < n) {
+    if (m != winner) {
+      let c = cases + m * selCaseWords
+      let ch = taskAt(*(c + scChan))
+      let w = nodeAt(scr, m)
+      if (*(c + scDir) == chanDirRecv) {
+        wqRemove(ch, chRecvHead, int(w))
+      } else {
+        wqRemove(ch, chSendHead, int(w))
+      }
+    }
+    m = m + 1
+  }
+  unlockAll(cases, order, n)
+  return winner
+}
+
+// ---------------------------------------------------------------------------
+// GC root scanning (ABI.md §11)
+// ---------------------------------------------------------------------------
+//
+// A buffered word is reachable ONLY through the ring buffer while it sits
+// unreceived — no stack and no register holds it — so the collector must treat
+// every `isRef` channel's buffered words as roots or sweep live values.
+//
+// `chan.zig` exposes this as `scanRegistryRoots(mark)` and `forEachBuffered
+// (visit)`, both taking a function pointer. `@nosplit` rejects a call through a
+// function value (E0075), so the traversal is inverted into a CURSOR the
+// collector drives — the same change `runtime/sched` made to
+// `forEachOtherStack` for the same reason, and the same one this file made to
+// the vtable.
+//
+// The registry itself is a caller-owned two-word block, so this module keeps no
+// mutable module state: registered channels are process-lifetime (v1 has no
+// channel-free primitive, ABI.md §11), so nothing is ever unlinked and a plain
+// head-insertion under a lock is the whole structure.
+//
+//   0  head channel address
+//   1  lock — an i32 cell
+export const chanRegWords: int = 2
+const crHead: int = 0
+const crLock: int = 1
+
+export @nosplit function chanRegInit(reg: *i64) {
+  *(reg + crHead) = 0
+  atomicStore(spinCellAt(reg, crLock), 0)
+}
+
+// Opt a channel into root scanning. `chan.zig`'s `register`, called only by the
+// ABI's channel constructor and only for `is_ref` channels.
+export @nosplit function chanRegister(reg: *i64, ch: *i64) {
+  spinAcquire(spinCellAt(reg, crLock))
+  *(ch + chRegNext) = *(reg + crHead)
+  *(reg + crHead) = int(ch)
+  spinRelease(spinCellAt(reg, crLock))
+}
+
+export @nosplit function chanRegHead(reg: *i64): int {
+  let h = *(reg + crHead)
+  return h
+}
+
+export @nosplit function chanRegNext(ch: *i64): int {
+  let nx = *(ch + chRegNext)
+  return nx
+}
+
+// Whether this channel's buffered words are GC references.
+export @nosplit function chanIsRef(ch: *i64): bool {
+  return *(ch + chIsRef) != 0
+}
+
+// The `i`th currently-buffered word, in queue order. The collector walks
+// `0 .. chanCount(ch)` under the channel's lock, which it takes with
+// `chanLockCell` — `chan.zig`'s `forEachBuffered` took the lock itself around
+// the whole visit, and a cursor cannot, so the lock is handed out instead of
+// being taken and released per element.
+export @nosplit function chanBufferedAt(ch: *i64, i: int): int {
+  let buf = taskAt(*(ch + chBuf))
+  let v = *(buf + (*(ch + chHead) + i) % *(ch + chCap))
+  return v
+}
+
+// This channel's lock cell, for a collector that must hold it across a walk.
+export @nosplit function chanLockCell(ch: *i64): *i32 {
+  return spinCellAt(ch, chLock)
+}
