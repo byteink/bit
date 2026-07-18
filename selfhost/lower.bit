@@ -163,6 +163,9 @@ struct Lowerer {
   // The module's string pool, interned here as each const_string is emitted so
   // __bitstr_N numbering follows lowering order (see IrModule.stringPool).
   stringPool: []string,
+  // Inline-assembly payloads (§11.6), appended as each `asm` block is lowered;
+  // referenced by an `Op.Asm`'s `ival`. Empty for programs with no `asm`.
+  asmBlocks: []AsmBlock,
   // FuncId scheme for closures: the number of regular funcs (free + instances +
   // methods) reserved before any closure; synthesized func-value trampolines get
   // ids reservedCount, reservedCount+1, ... and their name embeds that id.
@@ -2009,6 +2012,104 @@ function isNumericPrim(fc: FnCtx, ty: int): bool {
   return ty != 0 && fc.c.ctx.types[ty].kind == TypeKind.Prim && fc.c.ctx.types[ty].prim <= 9
 }
 
+// The register code (`check.asmRegX64`/`asmRegArm64`) for one `asm` operand's
+// register-name ident; an unknown name (validator's job, #1374) falls back to 0.
+function asmRegCode(fc: FnCtx, ident: int, isArm64: bool): int {
+  let sp = getNode(fc.c.tree, ident).span
+  let name = fc.c.source[sp.start:sp.end]
+  let code = -1
+  if (isArm64) {
+    code = asmRegArm64(name)
+  } else {
+    code = asmRegX64(name)
+  }
+  if (code < 0) {
+    return 0
+  }
+  return code
+}
+
+// The pre-encoded byte/word values of an `asm_code` block (empty if none).
+function asmCodeVals(fc: FnCtx, code: int): []int {
+  let out = []int(0)
+  if (code == 0) {
+    return out
+  }
+  let lits = kidsOf(fc.c.tree, code)
+  let i = 0
+  while (i < len(lits)) {
+    let sp = getNode(fc.c.tree, lits[i]).span
+    out = append(out, parseIntText(fc.c.source[sp.start:sp.end]))
+    i = i + 1
+  }
+  return out
+}
+
+// The register codes of an `asm_clobber` list (empty if none).
+function asmRegVals(fc: FnCtx, list: int, isArm64: bool): []int {
+  let out = []int(0)
+  if (list == 0) {
+    return out
+  }
+  let regs = kidsOf(fc.c.tree, list)
+  let i = 0
+  while (i < len(regs)) {
+    out = append(out, asmRegCode(fc, regs[i], isArm64))
+    i = i + 1
+  }
+  return out
+}
+
+// Lowers an `asm` block (§11.6) into an `IrModule.asmBlocks` entry plus the
+// `Op.Asm` that references it. Both target sub-blocks are pooled; the backend
+// reads only its own arch's. Result type is the checker's type for `result`, or
+// void when there is none.
+function lowerAsm(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node) // [x64_code, arm64_code, result?, clob_x64, clob_arm64, input...]
+  let inX64 = []int(0)
+  let inArm64 = []int(0)
+  let inVals = []int(0)
+  let i = 5
+  while (i < len(k)) {
+    let ik = kidsOf(fc.c.tree, k[i]) // [arm64_reg, x64_reg, value]
+    inArm64 = append(inArm64, asmRegCode(fc, ik[0], true))
+    inX64 = append(inX64, asmRegCode(fc, ik[1], false))
+    inVals = append(inVals, lowerExpr(fc, ik[2]))
+    i = i + 1
+  }
+  let hasResult = false
+  let resultX64 = 0
+  let resultArm64 = 0
+  let ty = fc.c.ctx.voidId
+  if (k[2] != 0) {
+    let rk = kidsOf(fc.c.tree, k[2]) // [arm64_reg, x64_reg, type]
+    hasResult = true
+    resultArm64 = asmRegCode(fc, rk[0], true)
+    resultX64 = asmRegCode(fc, rk[1], false)
+    ty = nodeType(fc, node)
+  }
+  let blk = AsmBlock{
+    x64Bytes: asmCodeVals(fc, k[0]),
+    arm64Words: asmCodeVals(fc, k[1]),
+    hasResult: hasResult,
+    resultX64: resultX64,
+    resultArm64: resultArm64,
+    inX64: inX64,
+    inArm64: inArm64,
+    clobX64: asmRegVals(fc, k[3], false),
+    clobArm64: asmRegVals(fc, k[4], true),
+  }
+  fc.lowerer.asmBlocks = append(fc.lowerer.asmBlocks, blk)
+  let blockIdx = len(fc.lowerer.asmBlocks) - 1
+  let ins = mkInstr(Op.Asm, ty)
+  ins.ival = blockIdx
+  ins.args = inVals
+  if (hasResult) {
+    ins.ival2 = 1
+  }
+  return builderEmit(fc.b, ins)
+}
+
 // Lowers an expression with no type context.
 function lowerExpr(fc: FnCtx, node: int): int {
   return lowerExprH(fc, node, 0)
@@ -2076,6 +2177,9 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   }
   if (tag == Tag.Call) {
     return lowerCall(fc, node)
+  }
+  if (tag == Tag.AsmStmt) {
+    return lowerAsm(fc, node)
   }
   if (tag == Tag.CompositeLit) {
     return lowerCompositeLit(fc, node)
@@ -4219,7 +4323,7 @@ function lowerStmt(fc: FnCtx, node: int) {
     let vals = kidsOf(fc.c.tree, node)
     if (len(vals) == 0) {
       runDefers(fc)
-      // A fallible function's ok return must leave the error slot null (§18.5).
+      // A fallible function's ok return must leave the error slot null (§11.6).
       if (fc.fallibleErr != 0) {
         clearErr(fc)
       }
@@ -4459,7 +4563,7 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   if (!fc.terminated) {
     runDefers(fc)
     // A void fallible function `()!` that falls off the end still clears the
-    // error slot on its ok path (§18.5).
+    // error slot on its ok path (§11.6).
     if (fc.fallibleErr != 0) {
       clearErr(fc)
     }
@@ -4861,7 +4965,7 @@ function lowerProject(mods: []Checker, root: int): IrModule {
   // One Lowerer for the whole project: interface dispatch ids, the string pool
   // and func-value trampolines are all program-wide, not per-module.
   let lowerer = Lowerer{ methodIds: map<string, int>{}, methodEntries: []MethodEntry(0),
-    stringPool: []string(0), reservedCount: reserved, closureFuncs: []IrFunc(0),
+    stringPool: []string(0), asmBlocks: []AsmBlock(0), reservedCount: reserved, closureFuncs: []IrFunc(0),
     fnValueTramps: map<string, int>{}, modPrefix: "", root: root,
     typeModule: map<int, int>{}, stubbed: []string(0) }
   // Every named type -> its declaring module, before any body is lowered: a
@@ -4935,7 +5039,7 @@ function lowerProject(mods: []Checker, root: int): IrModule {
     ci = ci + 1
   }
   return IrModule{ funcs: funcs, ctx: mods[root].ctx, stringPool: lowerer.stringPool,
-    methodTables: buildMethodTables(lowerer), stubbed: lowerer.stubbed }
+    asmBlocks: lowerer.asmBlocks, methodTables: buildMethodTables(lowerer), stubbed: lowerer.stubbed }
 }
 
 // A method's link symbol: prefixed by the module that DECLARES the receiver

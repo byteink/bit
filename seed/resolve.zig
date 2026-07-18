@@ -1007,8 +1007,21 @@ const Resolver = struct {
                 try self.resolveNode(file_idx, k[1], arrow_scope);
             },
 
+            .asm_stmt => try self.resolveAsm(file_idx, idx, scope_id),
+
             else => for (mf.tree.kids(idx)) |k| try self.resolveNode(file_idx, k, scope_id),
         }
+    }
+
+    /// `asm` (§11.6): register-name and byte/word leaves are literal payload,
+    /// never scope references — only the `result` type and each `input`'s value
+    /// expression resolve. The default "resolve every child" recursion would
+    /// wrongly look up `x0`/`rax` as variables, so `asm` needs its own walk.
+    fn resolveAsm(self: *Resolver, file_idx: usize, idx: ast.Index, scope_id: u32) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [x64_code, arm64_code, result?, clob_x64, clob_arm64, input...]
+        if (k[2] != ast.none) try self.resolveNode(file_idx, mf.tree.kids(k[2])[2], scope_id); // result type
+        for (k[5..]) |in_idx| try self.resolveNode(file_idx, mf.tree.kids(in_idx)[2], scope_id); // input value
     }
 };
 

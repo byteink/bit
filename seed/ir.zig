@@ -378,6 +378,13 @@ pub const Op = enum {
     // ---- opaque runtime call: extra = [RtFn, argc, args...] --------------
     rt_call,
 
+    // ---- inline assembly: extra = [asm_block, in_count, in_vals...] ------
+    // `asm_block` indexes `Module.asm_blocks` (the per-arch pre-encoded byte/
+    // word payload, register operands, and clobbers as static data — kept out
+    // of the hot `Decoded` union exactly like `const_string`'s pool index).
+    // `ty` is the `result` operand's type, or `.invalid` when it has none.
+    asm_stmt,
+
     /// Terminators must be the last (and only trailing) instruction of a
     /// block — see `verifyFunction`.
     pub fn isTerminator(self: Op) bool {
@@ -523,6 +530,7 @@ pub const Function = struct {
             .make_closure => .{ .make_closure = .{ .func = @enumFromInt(raw[0]), .env = @enumFromInt(raw[1]) } },
             .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
             .rt_call => .{ .rt_call = .{ .rt = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
+            .asm_stmt => .{ .asm_stmt = .{ .block = raw[0], .args = raw[2 .. 2 + raw[1]] } },
             else => if (op.isBinary())
                 .{ .bin = .{ .lhs = @enumFromInt(raw[0]), .rhs = @enumFromInt(raw[1]) } }
             else if (op.isUnary())
@@ -568,6 +576,9 @@ pub const Decoded = union(enum) {
     make_closure: struct { func: FuncId, env: ValueId },
     func_addr: struct { func: FuncId },
     rt_call: struct { rt: RtFn, args: []const u32 },
+    // `block` indexes `Module.asm_blocks`; `args` are the `input` operand
+    // values, in declaration order (parallel to the block's `in_*` reg lists).
+    asm_stmt: struct { block: u32, args: []const u32 },
 };
 
 /// A compiled unit: every lowered function plus the deduped string-literal
@@ -584,11 +595,43 @@ pub const MethodSlot = struct { id: u32, func: FuncId };
 /// descriptor.
 pub const MethodTable = struct { type_disc: u32, methods: []const MethodSlot };
 
+/// One inline-assembly block's static payload (ABI §11.6), pooled on the
+/// `Module` and referenced by an `Op.asm_stmt`'s `block` index — the bulky,
+/// non-SSA data (pre-encoded machine code, fixed register operands, clobbers)
+/// kept out of the instruction stream, exactly like the string-literal pool.
+/// Both target sub-blocks live here; each backend reads only its own arch's.
+/// Register codes follow `check.asmRegX64`/`asmRegArm64` (`254` = the `memory`
+/// clobber sentinel). `in_*` are parallel to the instruction's `args`. The
+/// `Module` owns every slice.
+pub const AsmBlock = struct {
+    x64_bytes: []const u8,
+    arm64_words: []const u32,
+    has_result: bool,
+    result_x64: u8,
+    result_arm64: u8,
+    in_x64: []const u8,
+    in_arm64: []const u8,
+    clob_x64: []const u8,
+    clob_arm64: []const u8,
+
+    pub fn deinit(self: *const AsmBlock, gpa: Allocator) void {
+        gpa.free(self.x64_bytes);
+        gpa.free(self.arm64_words);
+        gpa.free(self.in_x64);
+        gpa.free(self.in_arm64);
+        gpa.free(self.clob_x64);
+        gpa.free(self.clob_arm64);
+    }
+};
+
 pub const Module = struct {
     gpa: Allocator,
     ctx: *TypeContext,
     funcs: std.ArrayList(Function) = .empty,
     string_pool: std.ArrayList([]const u8) = .empty,
+    /// Inline-assembly payloads (§11.6), referenced by `Op.asm_stmt.block`.
+    /// Empty for programs with no `asm`.
+    asm_blocks: std.ArrayList(AsmBlock) = .empty,
     /// Per-type method tables (ABI.md §2.1), owned by the module. Empty for
     /// programs with no methods.
     method_tables: []const MethodTable = &.{},
@@ -602,6 +645,8 @@ pub const Module = struct {
         self.funcs.deinit(self.gpa);
         for (self.string_pool.items) |str| self.gpa.free(str);
         self.string_pool.deinit(self.gpa);
+        for (self.asm_blocks.items) |*blk| blk.deinit(self.gpa);
+        self.asm_blocks.deinit(self.gpa);
         for (self.method_tables) |mt| self.gpa.free(mt.methods);
         self.gpa.free(self.method_tables);
         self.* = undefined;
@@ -633,6 +678,19 @@ pub const Module = struct {
 
     pub fn func(self: *const Module, id: FuncId) *const Function {
         return &self.funcs.items[@intFromEnum(id)];
+    }
+
+    /// Appends an inline-assembly block (taking ownership of its slices) and
+    /// returns its pool index, for an `Op.asm_stmt` to reference. Not deduped:
+    /// each `asm` site is unique (distinct operand SSA values).
+    pub fn addAsmBlock(self: *Module, blk: AsmBlock) Allocator.Error!u32 {
+        const idx: u32 = @intCast(self.asm_blocks.items.len);
+        try self.asm_blocks.append(self.gpa, blk);
+        return idx;
+    }
+
+    pub fn asmBlock(self: *const Module, idx: u32) *const AsmBlock {
+        return &self.asm_blocks.items[idx];
     }
 };
 
@@ -961,6 +1019,19 @@ pub const FunctionBuilder = struct {
         return self.push(.rt_call, ty, buf);
     }
 
+    /// Inline assembly (§11.6). `block` indexes the `Module.asm_blocks` pool;
+    /// `in_vals` are the `input` operand values (parallel to that block's
+    /// `in_*` register lists). `ty` is the `result` operand's type, or
+    /// `.invalid` for a result-less block (a barrier / naked shim).
+    pub fn asmStmt(self: *FunctionBuilder, ty: TypeId, block: u32, in_vals: []const ValueId) Allocator.Error!ValueId {
+        var buf = try self.gpa.alloc(u32, 2 + in_vals.len);
+        defer self.gpa.free(buf);
+        buf[0] = block;
+        buf[1] = @intCast(in_vals.len);
+        for (in_vals, 0..) |a, i| buf[2 + i] = vid(a);
+        return self.push(.asm_stmt, ty, buf);
+    }
+
     /// Finalizes the function. Every reserved block must have been
     /// begun+ended exactly once (asserted via each block's `insts_len > 0`,
     /// since `endBlock` always emits at least a terminator).
@@ -1235,6 +1306,15 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
             try w.writeAll(") ");
             try writeTypeName(w, module.ctx, ty, 0);
             try w.writeAll("\n");
+        },
+        .asm_stmt => |a| {
+            if (module.asmBlock(a.block).has_result) {
+                try w.print("  %{d} = asm block={d}(", .{ i, a.block });
+            } else {
+                try w.print("  asm block={d}(", .{a.block});
+            }
+            try dumpValList(w, a.args);
+            try w.writeAll(")\n");
         },
     }
 }

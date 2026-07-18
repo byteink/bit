@@ -53,6 +53,7 @@ const max_top_decls = 1 << 16;
 const max_block_stmts = 1 << 16;
 const max_case_clauses = 1 << 14;
 const max_postfix_ops = 1 << 12;
+const max_asm_items = 1 << 8;
 /// Speculative attempts never nest more than a couple of levels deep in this
 /// grammar (see file header); a deeper nest means a logic bug, not real input.
 const max_speculate_depth = 16;
@@ -778,6 +779,135 @@ const Parser = struct {
         return self.tree.add(tag, join(start, self.span(call_expr)), 0, &.{call_expr});
     }
 
+    /// The current token's source text — used only to match the contextual
+    /// keywords inside an `asm` block (`x64`/`arm64`/`input`/`result`/`clobber`/
+    /// `volatile`), which lex as ordinary identifiers.
+    fn curText(self: *const Parser) []const u8 {
+        return self.lx.src[self.tok.span.start..self.tok.span.end];
+    }
+
+    /// Consumes an identifier that must read exactly `word`; reports otherwise.
+    fn expectWord(self: *Parser, word: []const u8) ParseError!void {
+        if (self.tok.kind == .ident and std.mem.eql(u8, self.curText(), word)) {
+            try self.advance();
+            return;
+        }
+        try self.fail(word);
+    }
+
+    /// `asm [volatile] { directive... }` (§11.6). An expression yielding its
+    /// `result` operand, or `()` when it declares none. Both target sub-blocks
+    /// live on the one node — codegen reads only its own arch's — because Bit
+    /// has no arch-conditional compilation and the runtime sites need none.
+    fn parseAsm(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        try self.advance(); // 'asm'
+        var is_volatile: u32 = 0;
+        if (self.tok.kind == .ident and std.mem.eql(u8, self.curText(), "volatile")) {
+            is_volatile = 1;
+            try self.advance();
+        }
+        _ = try self.expect(.l_brace, "'{'");
+
+        var x64_code: Index = none;
+        var arm64_code: Index = none;
+        var result: Index = none;
+        var clob_x64: Index = none;
+        var clob_arm64: Index = none;
+        var kids: std.ArrayList(Index) = .empty;
+        defer kids.deinit(self.gpa);
+
+        var guard: u32 = 0;
+        while (true) : (guard += 1) {
+            // Statements auto-terminate at newlines, so a `;` sits between
+            // directives (after each `}`); skip them.
+            while (self.tok.kind == .semicolon) try self.advance();
+            if (self.tok.kind == .r_brace or self.tok.kind == .eof) break;
+            if (guard >= max_asm_items) {
+                try self.tooMany("asm directives");
+                break;
+            }
+            if (self.tok.kind != .ident) {
+                try self.fail("an asm directive");
+                break;
+            }
+            const dir = self.curText();
+            if (std.mem.eql(u8, dir, "x64")) {
+                try self.advance();
+                x64_code = try self.parseAsmCode();
+            } else if (std.mem.eql(u8, dir, "arm64")) {
+                try self.advance();
+                arm64_code = try self.parseAsmCode();
+            } else if (std.mem.eql(u8, dir, "input")) {
+                try self.advance();
+                try kids.append(self.gpa, try self.parseAsmOperand(.asm_input));
+            } else if (std.mem.eql(u8, dir, "result")) {
+                try self.advance();
+                result = try self.parseAsmOperand(.asm_result);
+            } else if (std.mem.eql(u8, dir, "clobber")) {
+                try self.advance();
+                const is_x64 = self.tok.kind == .ident and std.mem.eql(u8, self.curText(), "x64");
+                _ = try self.expectIdent(); // arch marker (x64 | arm64)
+                const clob = try self.parseAsmClobber();
+                if (is_x64) clob_x64 = clob else clob_arm64 = clob;
+            } else {
+                try self.fail("an asm directive (x64, arm64, input, result, clobber)");
+                break;
+            }
+        }
+        const end = try self.expect(.r_brace, "'}'");
+
+        // Fixed-position header, then every `input` operand.
+        var all: std.ArrayList(Index) = .empty;
+        defer all.deinit(self.gpa);
+        try all.appendSlice(self.gpa, &.{ x64_code, arm64_code, result, clob_x64, clob_arm64 });
+        try all.appendSlice(self.gpa, kids.items);
+        return self.tree.add(.asm_stmt, join(start, end), is_volatile, all.items);
+    }
+
+    /// `{ int_lit, ... }` — one target's pre-encoded bytes (x64) / words (arm64).
+    fn parseAsmCode(self: *Parser) ParseError!Index {
+        const start = try self.expect(.l_brace, "'{'");
+        const items = try self.commaList(.r_brace, parseAsmInt, true);
+        defer self.gpa.free(items);
+        const end = try self.expect(.r_brace, "'}'");
+        return self.tree.add(.asm_code, join(start, end), 0, items);
+    }
+
+    fn parseAsmInt(self: *Parser) ParseError!Index {
+        if (self.tok.kind != .int_lit) {
+            try self.fail("an integer");
+            return none;
+        }
+        return self.leaf(.int_lit);
+    }
+
+    /// `arm64 <reg> x64 <reg> ( = expr | : type )`.
+    fn parseAsmOperand(self: *Parser, tag: ast.Tag) ParseError!Index {
+        const start = self.tok.span;
+        try self.expectWord("arm64");
+        const arm64_reg = try self.expectIdent();
+        try self.expectWord("x64");
+        const x64_reg = try self.expectIdent();
+        if (tag == .asm_input) {
+            _ = try self.expect(.eq, "'='");
+            const val = try self.parseExpression();
+            return self.tree.add(.asm_input, join(start, self.span(val)), 0, &.{ arm64_reg, x64_reg, val });
+        }
+        _ = try self.expect(.colon, "':'");
+        const ty = try self.parseType();
+        return self.tree.add(.asm_result, join(start, self.span(ty)), 0, &.{ arm64_reg, x64_reg, ty });
+    }
+
+    /// `{ reg_ident, ... }` — clobbered registers (may include `memory`).
+    fn parseAsmClobber(self: *Parser) ParseError!Index {
+        const start = try self.expect(.l_brace, "'{'");
+        const items = try self.commaList(.r_brace, expectIdentItem, true);
+        defer self.gpa.free(items);
+        const end = try self.expect(.r_brace, "'}'");
+        return self.tree.add(.asm_clobber, join(start, end), 0, items);
+    }
+
     fn parseReturnStmt(self: *Parser) ParseError!Index {
         const start = self.tok.span;
         try self.advance(); // 'return'
@@ -1155,7 +1285,7 @@ const Parser = struct {
 
     fn canStartExpression(k: Kind) bool {
         return switch (k) {
-            .ident, .int_lit, .float_lit, .string_lit, .str_part, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .l_paren, .l_bracket, .kw_map, .kw_chan, .kw_match, .bang, .minus, .plus, .tilde, .arrow_left => true,
+            .ident, .int_lit, .float_lit, .string_lit, .str_part, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .l_paren, .l_bracket, .kw_map, .kw_chan, .kw_match, .kw_asm, .bang, .minus, .plus, .tilde, .arrow_left => true,
             else => false,
         };
     }
@@ -1451,6 +1581,7 @@ const Parser = struct {
             .kw_map => return self.parseMapPrimary(),
             .kw_chan => return self.parseChanPrimary(),
             .kw_match => return self.parseMatch(true),
+            .kw_asm => return self.parseAsm(),
             else => {
                 try self.fail("an expression");
                 const bad = self.tok.span;

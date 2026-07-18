@@ -2102,6 +2102,7 @@ fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
         .make_closure => |mc| markUse(intervals, @intFromEnum(mc.env), pos),
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| markUse(intervals, a, pos),
+        .asm_stmt => |a| for (a.args) |arg| markUse(intervals, arg, pos),
     }
 }
 
@@ -2393,7 +2394,42 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
         .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
         .call_iface => try emitCallIface(self, dst, ty, d.call_iface.iface, d.call_iface.method_index, d.call_iface.args),
+        .asm_stmt => try emitAsm(self, if (ty != .invalid) dst else null, d.asm_stmt.block, d.asm_stmt.args),
         .block_param => unreachable, // dispatch loop skips a block's leading param_count instructions
+    }
+}
+
+/// Inline assembly (§11.6): move each `input` value into its fixed register
+/// (excluded from the allocatable file for the whole function), emit the x64
+/// sub-block's pre-encoded bytes verbatim, then read the `result` register (if
+/// any) into the instruction's result vreg. `check.asmRegX64`'s codes are the
+/// ModRM register numbers, so `@enumFromInt` maps them straight to `Reg`.
+fn emitAsm(self: *Ctx, dst: ?u32, block: u32, in_vals: []const u32) !void {
+    const blk = self.module.asmBlock(block);
+    for (in_vals, blk.in_x64) |v, reg_code| {
+        const src = try getInt(self, vregOf(self, @enumFromInt(v)), scratch1);
+        try self.movRR(@enumFromInt(reg_code), src);
+    }
+    for (blk.x64_bytes) |byte| try self.emitByte(byte);
+    if (dst) |dd| try putInt(self, dd, @enumFromInt(blk.result_x64));
+}
+
+/// Marks every x64 register an `asm` block in `f` pins (`input`/`result`/
+/// clobber) in `reserved` (indexed by ModRM register number 0..15). The
+/// `memory` sentinel (254) falls outside the array and is skipped.
+fn collectAsmReservedX64(module: *const ir.Module, f: *const ir.Function, reserved: *[16]bool) void {
+    const ops = f.insts.items(.op);
+    for (0..f.insts.len) |i| {
+        if (ops[i] != .asm_stmt) continue;
+        const a = f.decode(@enumFromInt(i)).asm_stmt;
+        const blk = module.asmBlock(a.block);
+        if (blk.has_result and blk.result_x64 < 16) reserved[blk.result_x64] = true;
+        for (blk.in_x64) |c| if (c < 16) {
+            reserved[c] = true;
+        };
+        for (blk.clob_x64) |c| if (c < 16) {
+            reserved[c] = true;
+        };
     }
 }
 
@@ -2412,8 +2448,24 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
 
     var int_buf: [max_int_regs]Reg = undefined;
     var float_buf: [max_float_regs]XReg = undefined;
-    const int_regs = buildIntRegs(&int_buf, cc, flags.has_safepoints, flags.needs_rax_rdx, flags.needs_rcx);
+    const base_int_regs = buildIntRegs(&int_buf, cc, flags.has_safepoints, flags.needs_rax_rdx, flags.needs_rcx);
     const float_regs = buildFloatRegs(&float_buf, cc, flags.has_safepoints);
+
+    // Registers an `asm` block pins (`input`/`result`/clobber) are removed from
+    // the allocatable file for the whole function — the same exclusion the
+    // `needs_rax_rdx`/`needs_rcx` flags apply for div/shift, generalized to an
+    // arbitrary set (§11.6). No `asm` → identical to `base_int_regs`.
+    var asm_reserved = [_]bool{false} ** 16;
+    collectAsmReservedX64(module, f, &asm_reserved);
+    var asm_buf: [max_int_regs]Reg = undefined;
+    var asm_n: usize = 0;
+    for (base_int_regs) |r| {
+        if (!asm_reserved[@intFromEnum(r)]) {
+            asm_buf[asm_n] = r;
+            asm_n += 1;
+        }
+    }
+    const int_regs = asm_buf[0..asm_n];
 
     const intervals = try buildIntervals(gpa, tctx, f);
     defer gpa.free(intervals);

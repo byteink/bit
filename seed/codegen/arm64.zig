@@ -1963,7 +1963,24 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .make_closure => |mc| try emitMakeClosure(self, i, mc.func, mc.env),
         .func_addr => |fa| try emitFuncAddr(self, i, fa.func),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
+        .asm_stmt => |a| try emitAsm(self, if (ty != .invalid) i else null, a.block, a.args),
     }
+}
+
+/// Inline assembly (§11.6): move each `input` value into its fixed register
+/// (excluded from the allocatable file for the whole function, so overwriting
+/// it is safe), emit the arm64 sub-block's pre-encoded words verbatim, then
+/// read the `result` register (if any) into the instruction's result vreg.
+/// The register-name → number mapping is `check.asmRegArm64`'s; `emitWord` is
+/// the same primitive `emitCallReloc` uses for its own fixed opcodes.
+fn emitAsm(self: *Ctx, dst: ?u32, block: u32, in_vals: []const u32) !void {
+    const blk = self.module.asmBlock(block);
+    for (in_vals, blk.in_arm64) |v, reg_code| {
+        const src = try getInt(self, vregOf(self, @enumFromInt(v)), scratch1);
+        try self.movRR(@enumFromInt(reg_code), src);
+    }
+    for (blk.arm64_words) |w| try self.emitWord(w);
+    if (dst) |d| try putInt(self, d, @enumFromInt(blk.result_arm64));
 }
 
 // ============================================================================
@@ -2096,6 +2113,27 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
         .make_closure => |mc| extendOne(intervals, use_pos, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .rt_call => |rc| for (rc.args) |a| extendOne(intervals, use_pos, a),
+        .asm_stmt => |a| for (a.args) |arg| extendOne(intervals, use_pos, arg),
+    }
+}
+
+/// Marks every arm64 register an `asm` block in `f` pins (`input`/`result`/
+/// clobber) in `reserved` (indexed by register number 0..30). The `memory`
+/// sentinel (254) and `sp`/`xzr` (31) fall outside the array and are skipped —
+/// neither is ever allocatable.
+fn collectAsmReservedArm64(module: *const ir.Module, f: *const ir.Function, reserved: *[32]bool) void {
+    const ops = f.insts.items(.op);
+    for (0..f.insts.len) |i| {
+        if (ops[i] != .asm_stmt) continue;
+        const a = f.decode(@enumFromInt(i)).asm_stmt;
+        const blk = module.asmBlock(a.block);
+        if (blk.has_result and blk.result_arm64 < 32) reserved[blk.result_arm64] = true;
+        for (blk.in_arm64) |c| if (c < 32) {
+            reserved[c] = true;
+        };
+        for (blk.clob_arm64) |c| if (c < 32) {
+            reserved[c] = true;
+        };
     }
 }
 
@@ -2119,8 +2157,25 @@ pub fn compileFunction(gpa: Allocator, module: *const ir.Module, f: *const ir.Fu
     const has_safepoints = safepoint_list.items.len > 0;
     var int_buf: [max_int_regs]Reg = undefined;
     var float_buf: [max_float_regs]FReg = undefined;
-    const int_regs = buildIntRegs(&int_buf, has_safepoints);
+    const base_int_regs = buildIntRegs(&int_buf, has_safepoints);
     const float_regs = buildFloatRegs(&float_buf, has_safepoints);
+
+    // Any physical register named by an `asm` block's `input`/`result`/clobber
+    // list is removed from the allocatable file for the whole function, so no
+    // vreg can land in a register the inline sequence overwrites (§11.6) — the
+    // same exclusion mechanism division/shift/atomics use, generalized to an
+    // arbitrary set. No `asm` → all-false → identical to `base_int_regs`.
+    var asm_reserved = [_]bool{false} ** 32;
+    collectAsmReservedArm64(module, f, &asm_reserved);
+    var asm_buf: [max_int_regs]Reg = undefined;
+    var asm_n: usize = 0;
+    for (base_int_regs) |r| {
+        if (!asm_reserved[@intFromEnum(r)]) {
+            asm_buf[asm_n] = r;
+            asm_n += 1;
+        }
+    }
+    const int_regs = asm_buf[0..asm_n];
 
     const target = regalloc.TargetRegs{
         .int = .{ .count = @intCast(int_regs.len) },

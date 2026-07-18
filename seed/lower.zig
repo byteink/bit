@@ -1439,7 +1439,7 @@ const FnCtx = struct {
         for (exprs, 0..) |e, i| vals[i] = try self.arrayValueForBind(e, try self.lowerExpr(e), try self.nodeType(e));
         try self.runDefers();
         // A fallible function's ok return must leave the error slot null; clear
-        // it after defers (a deferred fallible call may have set it — §18.5).
+        // it after defers (a deferred fallible call may have set it — §11.6).
         if (self.fallible_err != .invalid) try self.clearErr();
         try self.emitRet(vals);
     }
@@ -2982,6 +2982,82 @@ const FnCtx = struct {
         return self.lowerExprH(node, null);
     }
 
+    /// x64 pre-encoded bytes of an `asm_code` block (§11.6); an empty slice for
+    /// an absent (`none`) sub-block.
+    fn lowerAsmBytes(self: *FnCtx, code: ast.Index) Error![]u8 {
+        if (code == ast.none) return self.gpa.alloc(u8, 0);
+        const lits = self.kids(code);
+        const out = try self.gpa.alloc(u8, lits.len);
+        for (lits, 0..) |lit, i| out[i] = @intCast(check.parseIntLiteral(self.spanText(lit)) & 0xFF);
+        return out;
+    }
+
+    /// arm64 pre-encoded 32-bit instruction words of an `asm_code` block.
+    fn lowerAsmWords(self: *FnCtx, code: ast.Index) Error![]u32 {
+        if (code == ast.none) return self.gpa.alloc(u32, 0);
+        const lits = self.kids(code);
+        const out = try self.gpa.alloc(u32, lits.len);
+        for (lits, 0..) |lit, i| out[i] = @intCast(check.parseIntLiteral(self.spanText(lit)) & 0xFFFFFFFF);
+        return out;
+    }
+
+    /// Register codes of an `asm_clobber` list, per `check.asmReg*`.
+    fn lowerAsmRegs(self: *FnCtx, list: ast.Index, is_arm64: bool) Error![]u8 {
+        if (list == ast.none) return self.gpa.alloc(u8, 0);
+        const regs = self.kids(list);
+        const out = try self.gpa.alloc(u8, regs.len);
+        for (regs, 0..) |r, i| {
+            const name = self.spanText(r);
+            out[i] = (if (is_arm64) check.asmRegArm64(name) else check.asmRegX64(name)) orelse 0;
+        }
+        return out;
+    }
+
+    /// Lowers an `asm` block (§11.6) into a `Module.asm_blocks` entry plus the
+    /// `Op.asm_stmt` that references it. Both target sub-blocks are pooled; the
+    /// backend reads only its own arch's. The result type is the checker's
+    /// recorded type for the `result` operand, or `.invalid` when there is none.
+    fn lowerAsm(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
+        const k = self.kids(node); // [x64_code, arm64_code, result?, clob_x64, clob_arm64, input...]
+        const inputs = k[5..];
+
+        const in_x64 = try self.gpa.alloc(u8, inputs.len);
+        const in_arm64 = try self.gpa.alloc(u8, inputs.len);
+        const in_vals = try self.gpa.alloc(ir.ValueId, inputs.len);
+        defer self.gpa.free(in_vals);
+        for (inputs, 0..) |in_idx, i| {
+            const ik = self.kids(in_idx); // [arm64_reg, x64_reg, value]
+            in_arm64[i] = check.asmRegArm64(self.spanText(ik[0])) orelse 0;
+            in_x64[i] = check.asmRegX64(self.spanText(ik[1])) orelse 0;
+            in_vals[i] = try self.lowerExpr(ik[2]);
+        }
+
+        var has_result = false;
+        var result_x64: u8 = 0;
+        var result_arm64: u8 = 0;
+        var ty: TypeId = .invalid;
+        if (k[2] != ast.none) {
+            const rk = self.kids(k[2]); // [arm64_reg, x64_reg, type]
+            has_result = true;
+            result_arm64 = check.asmRegArm64(self.spanText(rk[0])) orelse 0;
+            result_x64 = check.asmRegX64(self.spanText(rk[1])) orelse 0;
+            ty = try self.nodeType(node);
+        }
+
+        const block = try self.l.out.addAsmBlock(.{
+            .x64_bytes = try self.lowerAsmBytes(k[0]),
+            .arm64_words = try self.lowerAsmWords(k[1]),
+            .has_result = has_result,
+            .result_x64 = result_x64,
+            .result_arm64 = result_arm64,
+            .in_x64 = in_x64,
+            .in_arm64 = in_arm64,
+            .clob_x64 = try self.lowerAsmRegs(k[3], false),
+            .clob_arm64 = try self.lowerAsmRegs(k[4], true),
+        });
+        return self.b.asmStmt(ty, block, in_vals);
+    }
+
     /// Whether `ty` is one of the checker's untyped-constant sentinels (§15.4)
     /// — a type an int/float/rune/bool/string/nil literal carries until it is
     /// committed to a concrete type by its surrounding context.
@@ -3059,6 +3135,7 @@ const FnCtx = struct {
             .ident => self.lowerIdent(node),
             .binary => self.lowerBinary(node, hint),
             .unary => self.lowerUnary(node, hint),
+            .asm_stmt => self.lowerAsm(node),
             .call => self.lowerCall(node),
             .member => self.lowerMember(node),
             .index => blk: {

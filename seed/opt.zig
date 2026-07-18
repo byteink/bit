@@ -503,6 +503,11 @@ fn emitTranslated(
             defer gpa.free(args);
             remap[idx] = try bldr.rtCall(ty, rc.rt, args);
         },
+        .asm_stmt => |a| {
+            const args = try trList(gpa, remap, a.args);
+            defer gpa.free(args);
+            remap[idx] = try bldr.asmStmt(ty, a.block, args);
+        },
     }
 }
 
@@ -593,6 +598,9 @@ fn isSideEffecting(op: ir.Op) bool {
         // deduplicated even when their result is unused — a cross-thread
         // observer depends on the access happening exactly here.
         .atomic_load, .atomic_store, .atomic_cmpxchg, .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_and, .atomic_rmw_or, .atomic_rmw_xchg => true,
+        // Inline assembly has arbitrary machine effects — never drop, hoist,
+        // or deduplicate it, even when its result is unused (a barrier).
+        .asm_stmt => true,
         else => op.isTerminator(),
     };
 }
@@ -659,6 +667,9 @@ fn markOperandsLive(f: *const ir.Function, live: []bool, id: ir.ValueId) void {
         .make_closure => |mc| live[@intFromEnum(mc.env)] = true,
         .rt_call => |rc| for (rc.args) |a| {
             live[a] = true;
+        },
+        .asm_stmt => |a| for (a.args) |v| {
+            live[v] = true;
         },
     }
 }

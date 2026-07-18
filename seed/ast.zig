@@ -115,6 +115,13 @@ pub const Tag = enum {
     continue_stmt, // []
     spawn_stmt, // [call_expr]
     defer_stmt, // [call_expr]
+    // Inline assembly (§11.6), an expression yielding its `result` operand (or
+    // `()` when it has none). main = 1 iff `volatile`.
+    asm_stmt, // [x64_code, arm64_code, result_or_none, clob_x64_or_none, clob_arm64_or_none, input...]
+    asm_code, // [int_lit...]                pre-encoded bytes (x64) / words (arm64)
+    asm_result, // [arm64_reg_ident, x64_reg_ident, type]
+    asm_input, // [arm64_reg_ident, x64_reg_ident, value_expr]
+    asm_clobber, // [reg_ident...]            clobbered registers (may include `memory`)
     if_stmt, // [cond, then_block, else_or_none]
     while_stmt, // [cond, body]
     for_c, // [init_or_none, cond_or_none, post_or_none, body]

@@ -654,6 +654,71 @@ if (atomicCmpxchg(p, 1, 42)) {              // *p was 1 -> now 42, true
 }
 ```
 
+### 11.6 Inline Assembly (unmanaged subset)
+
+`asm` embeds machine instructions directly in a function. Like `*T` and the
+atomics it exists only for the **unmanaged subset** — the handful of runtime
+sites (context switch, the GC's register snapshot, `_start`, a compiler barrier)
+that cannot be written in the language at all — and has no place in ordinary
+code.
+
+`asm` is an **expression**: it yields its `result` operand's value, or `()` when
+it declares none (so a bare `asm { … }` is a valid statement).
+
+```
+asm [volatile] {
+  x64     { <byte>, ... }              // pre-encoded machine code
+  arm64   { <word>, ... }
+  result  arm64 <reg> x64 <reg> : T    // at most one
+  input   arm64 <reg> x64 <reg> = expr // zero or more
+  clobber x64   { <reg>, ... }
+  clobber arm64 { <reg>, ... }
+}
+```
+
+Directives may appear in any order, each at most once except `input`.
+`x64`/`arm64`/`input`/`result`/`clobber`/`volatile` are **contextual** keywords —
+ordinary identifiers everywhere else. Only `asm` itself is reserved.
+
+- **Both targets live on the one block.** Bit has no arch-conditional
+  compilation, and the checker and lowering run once for every target, so a
+  single `asm` carries an `x64` sub-block *and* an `arm64` sub-block. Each
+  backend reads only its own arch's, so the same source compiles for either.
+- **The payload is pre-encoded bytes (x64) / 32-bit instruction words (arm64),
+  not mnemonic text.** The backends are instruction-selection only — there is no
+  text assembler anywhere in the compiler — so emission is a verbatim
+  passthrough. The author hand-encodes each instruction (verified against a
+  disassembler) exactly once.
+- **Operands pin literal physical registers.** `input` moves the value of `expr`
+  into the named register before the block; `result` reads the named register
+  out after it. There are no flexible "any register" classes.
+- **Register names** are the architecture's own: `rax`…`r15` (x64) and
+  `x0`…`x30`, `sp`, `xzr` (arm64). `memory` is accepted in a `clobber` list as a
+  compiler barrier; it names no register.
+- Every register named by `input`, `result`, or `clobber` is **excluded from the
+  register allocator for the whole enclosing function**, so no value can be
+  parked in a register the block overwrites.
+- `volatile` is accepted and documented for parity with the source being ported;
+  an `asm` block is never dropped, hoisted, or deduplicated regardless.
+- An `input` value must be a register-width integer or a raw pointer (§11.4).
+
+```
+// x0 = x1 + x2 on arm64; rax = rax + rcx on x64.
+function addAsm(a: int, b: int): int {
+  return asm {
+    arm64 { 0x8B020020 }              // add x0, x1, x2
+    x64   { 0x48, 0x01, 0xC8 }        // add rax, rcx
+    result arm64 x0 x64 rax : int
+    input  arm64 x1 x64 rax = a
+    input  arm64 x2 x64 rcx = b
+  }
+}
+```
+
+A block-local label (an intra-`asm` branch target, as a context switch needs) is
+**not yet supported**; it requires a relocation pass over the block's own code
+and is deliberately left out of this first cut.
+
 ---
 
 ## 12. Expressions

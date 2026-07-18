@@ -3884,6 +3884,7 @@ const Checker = struct {
             .composite_lit => try self.checkCompositeLit(file_idx, node, env, fctx),
             .slice_lit => try self.checkSliceLit(file_idx, node, env, fctx, expected),
             .match_stmt => try self.checkMatchExpr(file_idx, node, env, fctx, expected),
+            .asm_stmt => try self.checkAsm(file_idx, node, env, fctx),
             else => .invalid, // parser error-recovery poison node
         };
         self.setType(file_idx, node, ty);
@@ -4045,7 +4046,7 @@ const Checker = struct {
         // type is `void`), not an accidentally-unused expression — the same
         // reason a bare `call` is allowed. (§18.3)
         const legal = n.tag == .call or n.tag == .try_expr or
-            n.tag == .catch_default or n.tag == .catch_bind or
+            n.tag == .catch_default or n.tag == .catch_bind or n.tag == .asm_stmt or
             (n.tag == .unary and @as(lexer.Kind, @enumFromInt(n.main)) == .arrow_left);
         if (!legal) {
             try self.emit(mf, node, .invalid_expr_statement, "expression result unused; only a call, channel receive, '?' chain, or 'catch' is a valid statement", .{}, null);
@@ -4061,6 +4062,72 @@ const Checker = struct {
             try self.emit(mf, node, .expected_call_expr, "'{s}' requires a call expression", .{word}, null);
         }
         _ = try self.checkExpr(file_idx, inner, fctx.env, fctx, .invalid);
+    }
+
+    /// Whether `ty` may occupy an `asm` register operand (§11.6): a
+    /// register-width integer or a raw pointer.
+    fn isAsmOperandType(self: *Checker, ty: TypeId) bool {
+        return switch (self.ctx.typeOf(ty)) {
+            .prim => |p| p.isInteger(),
+            .untyped_int, .untyped_rune => true,
+            .ptr => true,
+            else => false,
+        };
+    }
+
+    /// Validates one `asm` register-name ident against the arch's static
+    /// register table (§11.6); reports an unknown name.
+    fn checkAsmReg(self: *Checker, mf: ModuleFile, ident: ast.Index, is_arm64: bool) Error!void {
+        const name = identText(mf, ident);
+        const known = if (is_arm64) asmRegArm64(name) != null else asmRegX64(name) != null;
+        if (!known) try self.emit(mf, ident, .invalid_operand, "unknown {s} register '{s}'", .{ if (is_arm64) "arm64" else "x64", name }, null);
+    }
+
+    fn checkAsmRegList(self: *Checker, mf: ModuleFile, list: ast.Index, is_arm64: bool) Error!void {
+        for (mf.tree.kids(list)) |r| try self.checkAsmReg(mf, r, is_arm64);
+    }
+
+    /// Validates one target's pre-encoded payload: x64 lines are single bytes
+    /// (0..255), arm64 lines are 32-bit instruction words.
+    fn checkAsmCode(self: *Checker, mf: ModuleFile, code: ast.Index, is_word: bool) Error!void {
+        for (mf.tree.kids(code)) |lit| {
+            const v = parseIntLiteral(identText(mf, lit));
+            const limit: i128 = if (is_word) 0xFFFFFFFF else 0xFF;
+            if (v < 0 or v > limit) {
+                try self.emit(mf, lit, .invalid_operand, "asm {s} literal out of range", .{if (is_word) "word" else "byte"}, null);
+            }
+        }
+    }
+
+    /// Inline assembly (§11.6). An expression yielding its `result` operand's
+    /// declared type, or `()` when it declares none. Validation is
+    /// target-independent: each arch's register names are checked against its
+    /// own static table, and every `input` value must be register-width.
+    fn checkAsm(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv, fctx: FnCtx) Error!TypeId {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(node); // [x64_code, arm64_code, result?, clob_x64, clob_arm64, input...]
+        if (k[0] != ast.none) try self.checkAsmCode(mf, k[0], false);
+        if (k[1] != ast.none) try self.checkAsmCode(mf, k[1], true);
+        if (k[3] != ast.none) try self.checkAsmRegList(mf, k[3], false);
+        if (k[4] != ast.none) try self.checkAsmRegList(mf, k[4], true);
+        for (k[5..]) |in_idx| {
+            const ik = mf.tree.kids(in_idx); // [arm64_reg, x64_reg, value]
+            try self.checkAsmReg(mf, ik[0], true);
+            try self.checkAsmReg(mf, ik[1], false);
+            const vty = try self.checkExpr(file_idx, ik[2], env, fctx, .invalid);
+            if (vty != .invalid and !self.isAsmOperandType(vty)) {
+                const n = try self.typeName(vty);
+                defer self.gpa.free(n);
+                try self.emit(mf, ik[2], .invalid_operand, "asm input must be an integer or pointer, found '{s}'", .{n}, null);
+            }
+        }
+        if (k[2] != ast.none) {
+            const rk = mf.tree.kids(k[2]); // [arm64_reg, x64_reg, type]
+            try self.checkAsmReg(mf, rk[0], true);
+            try self.checkAsmReg(mf, rk[1], false);
+            return try self.checkType(file_idx, rk[2], env);
+        }
+        return self.ctx.void_id;
     }
 
     fn checkSendStmt(self: *Checker, file_idx: usize, node: ast.Index, fctx: FnCtx) Error!void {
@@ -4870,6 +4937,39 @@ fn decodeDigit(c: u8) i128 {
 }
 
 /// Decodes an `INT_LIT` token's source text (§5.4) to its arbitrary-precision
+/// Codes for `asm` register operands (§11.6). x64 codes are the ModRM
+/// register number (`codegen/x64.zig`'s `Reg` enum order); arm64 codes are the
+/// physical register number (`x0`..`x30` = 0..30). `254` is the `memory`
+/// clobber sentinel (a compiler barrier only, never a real register); arm64
+/// `31` is `sp`/`xzr`. Both are shared by the checker (validation) and
+/// `lower.zig` (encoding) so the two never disagree. `null` = unknown name.
+pub fn asmRegX64(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "rax")) return 0;
+    if (std.mem.eql(u8, name, "rcx")) return 1;
+    if (std.mem.eql(u8, name, "rdx")) return 2;
+    if (std.mem.eql(u8, name, "rbx")) return 3;
+    if (std.mem.eql(u8, name, "rsp")) return 4;
+    if (std.mem.eql(u8, name, "rbp")) return 5;
+    if (std.mem.eql(u8, name, "rsi")) return 6;
+    if (std.mem.eql(u8, name, "rdi")) return 7;
+    if (std.mem.eql(u8, name, "memory")) return 254;
+    if (name.len >= 2 and name[0] == 'r') {
+        const num = std.fmt.parseInt(u8, name[1..], 10) catch return null;
+        if (num >= 8 and num <= 15) return num;
+    }
+    return null;
+}
+
+pub fn asmRegArm64(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "memory")) return 254;
+    if (std.mem.eql(u8, name, "sp") or std.mem.eql(u8, name, "xzr")) return 31;
+    if (name.len >= 2 and name[0] == 'x') {
+        const num = std.fmt.parseInt(u8, name[1..], 10) catch return null;
+        if (num <= 30) return num;
+    }
+    return null;
+}
+
 /// value. `_` separators are skipped; base prefixes select the radix.
 pub fn parseIntLiteral(text: []const u8) i128 {
     var base: i128 = 10;

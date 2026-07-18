@@ -910,6 +910,60 @@ const Printer = struct {
                 try self.raw("defer ");
                 try self.printAtomic(self.kids(idx)[0]);
             },
+            .asm_stmt => {
+                try self.raw("asm ");
+                if (n.main == 1) try self.raw("volatile ");
+                const k = self.kids(idx);
+                try self.raw("{ ");
+                if (k[0] != none) {
+                    try self.raw("x64 ");
+                    try self.printNode(k[0]);
+                    try self.raw(" ");
+                }
+                if (k[1] != none) {
+                    try self.raw("arm64 ");
+                    try self.printNode(k[1]);
+                    try self.raw(" ");
+                }
+                if (k[2] != none) {
+                    try self.printNode(k[2]);
+                    try self.raw(" ");
+                }
+                if (k[3] != none) {
+                    try self.raw("clobber x64 ");
+                    try self.printNode(k[3]);
+                    try self.raw(" ");
+                }
+                if (k[4] != none) {
+                    try self.raw("clobber arm64 ");
+                    try self.printNode(k[4]);
+                    try self.raw(" ");
+                }
+                for (k[5..]) |in_op| {
+                    try self.printNode(in_op);
+                    try self.raw(" ");
+                }
+                try self.raw("}");
+            },
+            .asm_code, .asm_clobber => try self.printCommaList(self.kids(idx), "{", "}", n.span.end),
+            .asm_result => {
+                const k = self.kids(idx);
+                try self.raw("result arm64 ");
+                try self.printNode(k[0]);
+                try self.raw(" x64 ");
+                try self.printNode(k[1]);
+                try self.raw(" : ");
+                try self.printNode(k[2]);
+            },
+            .asm_input => {
+                const k = self.kids(idx);
+                try self.raw("input arm64 ");
+                try self.printNode(k[0]);
+                try self.raw(" x64 ");
+                try self.printNode(k[1]);
+                try self.raw(" = ");
+                try self.printNode(k[2]);
+            },
 
             .if_stmt => {
                 const k = self.kids(idx);
