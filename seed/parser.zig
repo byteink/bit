@@ -1380,9 +1380,15 @@ const Parser = struct {
     // Expressions (§12)
     // =========================================================================
 
+    /// Whether `k` can begin an expression. `parseReturnStmt` is the only
+    /// caller: it decides a bare `return` from `return expr`. The prefix-operator
+    /// tail must therefore track `parseUnary`'s own set exactly — `.star`, the
+    /// §11.4 raw-pointer dereference, was missing here while `parseUnary`
+    /// accepted it, so `return *p` was rejected as a bare return followed by
+    /// stray input even though `let v = *p` parsed fine.
     fn canStartExpression(k: Kind) bool {
         return switch (k) {
-            .ident, .int_lit, .float_lit, .string_lit, .str_part, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .l_paren, .l_bracket, .kw_map, .kw_chan, .kw_match, .kw_asm, .bang, .minus, .plus, .tilde, .arrow_left => true,
+            .ident, .int_lit, .float_lit, .string_lit, .str_part, .raw_string_lit, .rune_lit, .bool_lit, .nil_lit, .l_paren, .l_bracket, .kw_map, .kw_chan, .kw_match, .kw_asm, .bang, .minus, .plus, .tilde, .arrow_left, .star => true,
             else => false,
         };
     }
