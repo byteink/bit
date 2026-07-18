@@ -5790,6 +5790,52 @@ test "@nosplit admits an asm block but still checks its operands" {
     , .nosplit_calls_allocating));
 }
 
+test "@nosplit default-deny catch-all rejects unlisted constructs" {
+    const gpa = testing.allocator;
+
+    // These exercise the `else` arm of nosplitWalk — the default-deny itself.
+    // Every other nosplit test reaches its rejection through the `.call` arm
+    // (`[]int(1)` and `append(...)` are both call nodes), so without these the
+    // catch-all is unexercised: turning it into an allow-all leaves the whole
+    // suite green. Mutation-verified — replacing the `else` arm with `{}` fails
+    // exactly this test and nothing else.
+    try testing.expect(try diagnosedCode(gpa,
+        \\function work() {}
+        \\@nosplit function bad() {
+        \\  spawn work()
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+
+    // String interpolation builds a new string.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@nosplit function bad(x: int) {
+        \\  let s = "v=${x}"
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+
+    // Map indexing may hash, probe, and fault in a missing entry.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@nosplit function bad(m: map<string, int>): int {
+        \\  return m["k"]
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+
+    // Slice indexing is bounds-checked and may panic.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@nosplit function bad(s: []int): int {
+        \\  return s[0]
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+}
+
 test "@naked restricts the signature and the body" {
     const gpa = testing.allocator;
 
