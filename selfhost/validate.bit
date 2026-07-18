@@ -40,6 +40,9 @@ const ecNotStringable = 73
 const ecMissingMethod = 51
 const ecCannotInfer = 68
 const ecUnknownMember = 57
+const ecNakedFnInvalid = 74
+const ecNosplitCallsAllocating = 75
+const ecUnknownAttribute = 76
 
 // A literal's value, or `ok: false` when the node is not one. Bit has no
 // optional and no tuple return; a two-field struct is the whole story.
@@ -1460,6 +1463,159 @@ function vSendIface(c: Checker, node: int) {
   vIfaceStore(c, k[1], c.ctx.types[chanTy].elem)
 }
 
+// ---- §10.3.1 function attributes -------------------------------------------
+
+// The source text of an identifier node, read from THIS module's source.
+function vIdentText(c: Checker, node: int): string {
+  let n = getNode(c.tree, node)
+  return c.source[n.span.start:n.span.end]
+}
+
+// A scalar value type (§10.3.1): any prim but `string` (prim 11), or a bare type
+// parameter. Exactly the results a naked function can hand back in a register.
+function vIsScalarValue(c: Checker, ty: int): bool {
+  let k = c.ctx.types[ty].kind
+  if (k == TypeKind.Prim) { return c.ctx.types[ty].prim != 11 }
+  return k == TypeKind.TypeParam
+}
+
+// The attr list of a FuncDecl, or 0 when the decl carries none. The 7th child is
+// elided when absent, so both kid widths are well-formed (parser.bit).
+function vAttrList(c: Checker, node: int): int {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) <= 6) { return 0 }
+  return kids[6]
+}
+
+// E0076 (§10.3.1): the only attributes are @naked and @nosplit. Mirrors the
+// seed's collectAttrs, which reports as it resolves the list.
+function vAttrNames(c: Checker, node: int) {
+  let list = vAttrList(c, node)
+  if (list == 0) { return }
+  let attrs = kidsOf(c.tree, list)
+  let i = 0
+  while (i < len(attrs)) {
+    let nameNode = kidsOf(c.tree, attrs[i])[0]
+    let name = vIdentText(c, nameNode)
+    if (name != "naked" && name != "nosplit") {
+      report(c.diags, ecUnknownAttribute, vSpan(c, nameNode),
+        "unknown attribute '@${name}'",
+        "the recognized attributes are @naked and @nosplit")
+    }
+    i = i + 1
+  }
+}
+
+// E0074 (§10.3.1) @naked: a restricted signature (no generics or parameters,
+// void or scalar result) and a return-only body — there is no prologue, so a
+// local, a spill, or control flow has nowhere to live.
+function vNakedFn(c: Checker, node: int, result: int) {
+  let k = kidsOf(c.tree, node)
+  let name = vIdentText(c, k[1])
+  if (k[2] != 0) {
+    reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, k[1]),
+      "naked function '${name}' cannot be generic")
+  }
+  if (len(kidsOf(c.tree, k[3])) != 0) {
+    reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, k[1]),
+      "naked function '${name}' cannot take parameters")
+  }
+  // An unresolved result (0) is skipped: an inference gap is bit2's, not the
+  // program's, and reporting it would be a false positive on code the seed takes.
+  if (result != c.ctx.voidId && result != 0 && !vIsScalarValue(c, result)) {
+    reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, k[1]),
+      "naked function '${name}' must return void or a scalar value")
+  }
+  let body = kidsOf(c.tree, k[5])
+  let i = 0
+  while (i < len(body)) {
+    if (getNode(c.tree, body[i]).tag != Tag.ReturnStmt) {
+      reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, body[i]),
+        "a naked function body may contain only 'return' statements")
+    }
+    i = i + 1
+  }
+}
+
+// Matches the seed's nosplit_max_depth: a malformed or over-deep tree stops here
+// rather than recursing without bound (Power of 10).
+const vNosplitMaxDepth = 256
+
+// The one-hop callee rule. A nosplit body may call only a named function that is
+// itself @nosplit — Power of 10: indirection limited to what is statically known.
+// A non-ident callee is a slice/map/type constructor (which allocates) or a
+// value/interface/method call (unknowable statically).
+function vNosplitCall(c: Checker, node: int, caller: string, depth: int) {
+  let ck = kidsOf(c.tree, node) // [callee, type_args, args]
+  if (getNode(c.tree, ck[0]).tag != Tag.Ident) {
+    report(c.diags, ecNosplitCallsAllocating, vSpan(c, node),
+      "nosplit function '${caller}' may not allocate or call indirectly here",
+      "nosplit bodies allow only calls to other nosplit functions")
+    return
+  }
+  let callee = vIdentText(c, ck[0])
+  let decl = funcDeclLookup(c, callee)
+  // A decl node index only means something inside its own tree, so the attr scan
+  // must read the OWNER's source — declOwner and funcDeclLookup agree on which
+  // tree that is. Reading `c` for an imported callee would slice the wrong file.
+  if (decl == 0 || !funcHasAttr(declOwner(c, callee), decl, "nosplit")) {
+    report(c.diags, ecNosplitCallsAllocating, vSpan(c, node),
+      "nosplit function '${caller}' calls '${callee}', which is not marked nosplit",
+      "mark the callee @nosplit or inline it")
+    return
+  }
+  vNosplitWalk(c, ck[2], caller, depth + 1) // args
+}
+
+// E0075 (§10.3.1) @nosplit: a default-deny allowlist over the body. Every
+// construct that could allocate or reach a safepoint (composite/slice/map
+// literals, indexing, `append`, `spawn`, closures, string interpolation, and
+// channel ops) falls through to the catch-all and is rejected.
+function vNosplitWalk(c: Checker, node: int, caller: string, depth: int) {
+  if (node == 0) { return }
+  if (depth >= vNosplitMaxDepth) { return }
+  let t = getNode(c.tree, node).tag
+  // Safe leaves: a name or a literal reads a register or a static const.
+  if (t == Tag.Ident || t == Tag.IntLit || t == Tag.FloatLit || t == Tag.StringLit ||
+      t == Tag.RawStringLit || t == Tag.RuneLit || t == Tag.BoolLit ||
+      t == Tag.NilLit || t == Tag.BreakStmt || t == Tag.ContinueStmt) {
+    return
+  }
+  // Pure operators, control flow, and statement wrappers: recurse into their
+  // value children (the guarded set only).
+  if (t == Tag.Binary || t == Tag.Unary || t == Tag.ExprStmt || t == Tag.ReturnStmt ||
+      t == Tag.Assign || t == Tag.LhsList || t == Tag.ExprList || t == Tag.Args ||
+      t == Tag.Arg || t == Tag.Block || t == Tag.IfStmt || t == Tag.WhileStmt ||
+      t == Tag.ForC || t == Tag.LetDecl || t == Tag.ConstDecl) {
+    let kids = kidsOf(c.tree, node)
+    let i = 0
+    while (i < len(kids)) {
+      vNosplitWalk(c, kids[i], caller, depth + 1)
+      i = i + 1
+    }
+    return
+  }
+  if (t == Tag.Binding) {
+    // [pattern, type_or_none, init_or_none]: only the initializer is an
+    // evaluated expression; the type annotation is not code.
+    let bk = kidsOf(c.tree, node)
+    if (len(bk) >= 3) { vNosplitWalk(c, bk[2], caller, depth + 1) }
+    return
+  }
+  if (t == Tag.Member) {
+    // Field access on a value already in hand is safe; recurse only the base.
+    vNosplitWalk(c, kidsOf(c.tree, node)[0], caller, depth + 1)
+    return
+  }
+  if (t == Tag.Call) {
+    vNosplitCall(c, node, caller, depth)
+    return
+  }
+  report(c.diags, ecNosplitCallsAllocating, vSpan(c, node),
+    "nosplit function '${caller}' may not allocate or reach a safepoint here",
+    "nosplit bodies allow only non-allocating arithmetic, control flow, and calls to other nosplit functions")
+}
+
 // Validates one function's body. Called src `checkModule`'s sweep as it reaches
 // the FuncDecl node — see this file's header for why that is the only point
 // where `env` holds this function's bindings and no other's.
@@ -1478,6 +1634,25 @@ function vFuncDecl(c: Checker, node: int) {
     let declared = typeFromNode(c, kids[4])
     fallible = c.ctx.types[declared].kind == TypeKind.Fallible
     result = unwrapFallible(c, declared)
+  }
+  // §10.3.1 attributes. E0076 first (an unknown name resolves to neither flag),
+  // then the two rule sets. v1 attaches attributes to free functions only, so a
+  // receiver is rejected outright and the body rules are skipped for a method.
+  vAttrNames(c, node)
+  let naked = funcHasAttr(c, node, "naked")
+  let nosplit = funcHasAttr(c, node, "nosplit")
+  if (kids[0] != 0) {
+    if (naked) {
+      reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, kids[1]),
+        "naked function '${vIdentText(c, kids[1])}' cannot be a method")
+    }
+    if (nosplit) {
+      reportNoHint(c.diags, ecNosplitCallsAllocating, vSpan(c, kids[1]),
+        "nosplit function '${vIdentText(c, kids[1])}' cannot be a method")
+    }
+  } else {
+    if (naked) { vNakedFn(c, node, result) }
+    if (nosplit) { vNosplitWalk(c, kids[5], vIdentText(c, kids[1]), 0) }
   }
   vStmt(c, result, kids[5], 0, 0, fallible)
   // E0055 (§10.3): a non-void function must return on every path. `result` is
