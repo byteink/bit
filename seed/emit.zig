@@ -231,34 +231,35 @@ fn emitMethodTable(a: Allocator, module: *const ir.Module, rodata: *std.ArrayLis
     return .{ .sym = name, .off = base, .size = mt.methods.len * 16, .relocs = try relocs.toOwnedSlice(a) };
 }
 
-/// Where one module-level variable (§11.11) landed in the `.data` blob.
+/// Where one module-level variable (§11.11) landed in its blob.
 const GlobalPlacement = struct { name: []const u8, offset: u64, size: u64 };
 
-/// Appends every module-level variable's static image to `data`, honouring each
-/// one's alignment, and returns where each landed. The caller turns these into
-/// its own object format's symbols — the two formats' `Symbol` types differ by
-/// one field, which is not worth a comptime-generic indirection here.
+/// Appends the static image of every module-level variable in one *storage
+/// class* to `data`, honouring each one's alignment, and returns where each
+/// landed. The caller turns these into its own object format's symbols — the
+/// two formats' `Symbol` types differ by one field, which is not worth a
+/// comptime-generic indirection here.
 ///
-/// These cells are writable and **never scanned by the collector**: the checker
-/// has proved each one's type untraced, so `.data` needs no pointer map and no
-/// root registration. See SPEC §11.11.
-fn placeGlobals(a: Allocator, module: *const ir.Module, data: *std.ArrayList(u8)) Error![]const GlobalPlacement {
-    const out = try a.alloc(GlobalPlacement, module.globals.items.len);
-    for (module.globals.items, 0..) |g, i| {
-        switch (g.storage) {
-            // Per-thread storage needs a thread-local section and TLS
-            // relocations rather than a plain `.data` blob (§11.11). Nothing
-            // constructs a `.thread` global yet, so this is unreachable today —
-            // it is a named seam, not dead weight.
-            .thread => return error.UnsupportedTlsStorage,
-            .process => {},
-        }
+/// Filtering by class rather than emitting all of them is what keeps the two
+/// classes' blobs separate: `.process` cells go to `.data` (one cell for the
+/// program), `.thread` cells go to the thread-local template (`.tdata` on ELF,
+/// `__thread_data` on Mach-O) from which each OS thread gets its own copy. A
+/// `.thread` cell's offset is therefore an offset *within the template*, never
+/// a link-time address.
+///
+/// These cells are writable and **never scanned by the collector**, in both
+/// classes: the checker has proved each one's type untraced, so neither blob
+/// needs a pointer map or root registration. See SPEC §11.11.
+fn placeGlobals(a: Allocator, module: *const ir.Module, storage: ir.GlobalStorage, data: *std.ArrayList(u8)) Error![]const GlobalPlacement {
+    var out: std.ArrayList(GlobalPlacement) = .empty;
+    for (module.globals.items) |g| {
+        if (g.storage != storage) continue;
         while (data.items.len % g.alignment != 0) try data.append(a, 0);
         const off: u64 = data.items.len;
         try data.appendSlice(a, g.bytes);
-        out[i] = .{ .name = try a.dupe(u8, g.name), .offset = off, .size = g.bytes.len };
+        try out.append(a, .{ .name = try a.dupe(u8, g.name), .offset = off, .size = g.bytes.len });
     }
-    return out;
+    return out.toOwnedSlice(a);
 }
 
 /// Emits `module` as an x86-64 ELF relocatable object. The returned bytes are
@@ -337,8 +338,22 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
 
     // ---- module-level state (§11.11) -> writable .data --------------------
     var data: std.ArrayList(u8) = .empty;
-    for (try placeGlobals(a, module, &data)) |g| {
+    for (try placeGlobals(a, module, .process, &data)) |g| {
         try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+        try defined.put(a, g.name, {});
+    }
+
+    // ---- per-thread state (§11.11) -> the `.tdata` template ---------------
+    // Every cell goes to `.tdata` even when its image is all zeros, rather
+    // than splitting zero-valued ones into `.tbss`: the linker merges both
+    // into one `PT_TLS` regardless, so the split would buy a little file size
+    // in exchange for a second section whose offsets must stay consistent with
+    // the first. `STT_TLS` is what makes each symbol's value an offset within
+    // the template — the quantity the local-exec relocations add to the
+    // thread pointer — rather than a link-time address.
+    var tdata: std.ArrayList(u8) = .empty;
+    for (try placeGlobals(a, module, .thread, &tdata)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .tdata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .tls });
         try defined.put(a, g.name, {});
     }
 
@@ -348,6 +363,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
+    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = 8 });
 
     return obj_elf.write(gpa, .x86_64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -572,8 +588,22 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
 
     // ---- module-level state (§11.11) -> writable .data --------------------
     var data: std.ArrayList(u8) = .empty;
-    for (try placeGlobals(a, module, &data)) |g| {
+    for (try placeGlobals(a, module, .process, &data)) |g| {
         try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+        try defined.put(a, g.name, {});
+    }
+
+    // ---- per-thread state (§11.11) -> the `.tdata` template ---------------
+    // Every cell goes to `.tdata` even when its image is all zeros, rather
+    // than splitting zero-valued ones into `.tbss`: the linker merges both
+    // into one `PT_TLS` regardless, so the split would buy a little file size
+    // in exchange for a second section whose offsets must stay consistent with
+    // the first. `STT_TLS` is what makes each symbol's value an offset within
+    // the template — the quantity the local-exec relocations add to the
+    // thread pointer — rather than a link-time address.
+    var tdata: std.ArrayList(u8) = .empty;
+    for (try placeGlobals(a, module, .thread, &tdata)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .tdata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .tls });
         try defined.put(a, g.name, {});
     }
 
@@ -583,6 +613,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
+    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = 8 });
 
     return obj_elf.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -796,7 +827,16 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     }
 
     // ---- module-level state (§11.11) -> the same writable .data -----------
-    for (try placeGlobals(a, module, &data)) |g| {
+    // Per-thread state is not emitted here yet: Mach-O reaches a thread-local
+    // through a `__thread_vars` `tlv_descriptor` and an indirect call to its
+    // resolver thunk, not through a link-time offset, so it needs both
+    // descriptor emission and call-clobber modelling in codegen. Refuse
+    // explicitly — a `.thread` cell silently placed in `.data` would be one
+    // process-wide cell wearing a per-thread name.
+    for (module.globals.items) |g| {
+        if (g.storage == .thread) return error.UnsupportedTlsStorage;
+    }
+    for (try placeGlobals(a, module, .process, &data)) |g| {
         const sym = try mac(a, g.name);
         try symbols.append(a, .{ .name = sym, .section = .data, .offset = g.offset, .size = g.size, .binding = .global });
         try defined.put(a, sym, {});

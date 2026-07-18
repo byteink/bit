@@ -1156,11 +1156,23 @@ The two differ only in how many cells exist and how the address is materialized:
 process-wide state is a plain data symbol, per-thread state needs a thread-local
 section and TLS relocations.
 
-`@threadlocal` is specified here so the surface is settled, but no backend emits
-it yet: it requires thread-local sections and relocations on all three targets,
-and the Mach-O half of that (TLV descriptors and a `_tlv_bootstrap` resolver) is
-a separate sub-feature the static linker currently rejects outright. A per-thread
-slot must therefore stay in the Zig runtime until that lands.
+`@threadlocal` is specified here so the surface is settled, but it is not yet
+usable: the compiler has no surface syntax for it and emits no per-thread cell.
+
+The *linker* half is already done on every target — `PT_TLS` and local-exec
+relocations on both ELF arches, TLV descriptors on Mach-O — and the runtime
+already boots a thread pointer for the main thread and every spawned worker. The
+remaining work is producer-side: parsing the attribute, laying the cell into the
+per-thread template, and emitting the access sequence.
+
+That access sequence is where the two classes stop being symmetric, and the
+difference is normative. Process-wide state is reached by pure address
+arithmetic. Per-thread state is reached by adding a link-time-known offset to the
+thread pointer on ELF — still pure arithmetic, still `@nosplit`-legal — but on
+Mach-O it requires loading a TLV descriptor and **calling its resolver thunk**.
+A `@threadlocal` read is therefore not guaranteed call-free on every target, and
+the `@nosplit` guarantee above applies unconditionally only to the process-wide
+class. Until a per-thread slot is emitted, one must stay in the Zig runtime.
 
 ---
 

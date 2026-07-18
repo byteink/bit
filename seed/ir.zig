@@ -53,12 +53,17 @@ pub const GlobalId = enum(u32) { _ };
 /// state is a *storage class*, not a single feature: `process` is one cell for
 /// the whole program, `thread` is one cell per OS thread.
 ///
-/// `thread` is specified and carried through the IR, but no backend emits it
-/// yet — it needs thread-local sections and relocations on all three targets,
-/// and the Mach-O side of that is its own tracked sub-feature (`link/macho.zig`
-/// returns `error.UnsupportedTls` for any TLV atom today). The variant exists
-/// here so the emission path is a switch with one arm left to fill in, rather
-/// than a shape change, when the scheduler's per-worker slot needs it.
+/// `thread` is carried through the IR and, on ELF, laid out by `emit.zig` into
+/// the `.tdata` per-thread template with `STT_TLS` symbols. What it still lacks
+/// is a front-end surface (`@threadlocal let` is spec'd but not parsed) and the
+/// per-target access sequence in codegen.
+///
+/// The linker half is NOT the gap, contrary to what this comment used to claim:
+/// `link.zig` emits `PT_TLS` and resolves local-exec relocations for both ELF
+/// arches, `link/macho.zig` links TLV descriptors, and `runtime/root.zig` boots
+/// the thread pointer from our own `PT_TLS` via `std.os.linux.tls.initStatic`,
+/// which also sets up TLS for every spawned worker. The remaining work is
+/// entirely producer-side.
 pub const GlobalStorage = enum { process, thread };
 
 /// One module-level mutable variable: a statically allocated cell (§11.11).

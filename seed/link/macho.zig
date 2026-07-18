@@ -24,9 +24,22 @@
 //! AArch64 relocation this backend applies is PC-relative (branch/ADRP/ADD/
 //! LDR-off), hence slide-invariant, so link-time addresses stay correct under
 //! any slide; only absolute pointers (data `abs64`, internal GOT slots) carry a
-//! rebase, and imports carry a bind. macOS TLV thread-locals are a separate
-//! sub-feature (task #345 cont.); a `.tls_*` atom or a TLVP relocation here is
-//! `error.UnsupportedTls` until that lands.
+//! rebase, and imports carry a bind.
+//!
+//! macOS TLV thread-locals ARE linked here: `.tls_vars`/`.tls_data`/`.tls_bss`
+//! atoms are placed into `__thread_vars`/`__thread_data`/`__thread_bss`, TLVP
+//! relocations get an indirection slot like a GOT entry, a descriptor's data
+//! field is rewritten to the variable's offset within the per-thread template,
+//! and `MH_HAS_TLV_DESCRIPTORS` is set so dyld runs TLV setup. Every Bit binary
+//! that touches error handling already exercises this path, because the
+//! runtime's `pending_err` is a Zig `threadlocal`.
+//!
+//! `error.UnsupportedTls` is vestigial — it is declared in `Error` but no code
+//! path returns it. It is kept only so callers' error sets do not shift; the
+//! header comment that once claimed TLV was refused outright was stale, and
+//! that staleness cost #1402 and #1411 real effort. What is NOT yet done is the
+//! *compiler* emitting its own TLV descriptors for a Bit `@threadlocal let`
+//! (§11.11) — a producer-side gap, not a linker one.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

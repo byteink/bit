@@ -47,6 +47,12 @@ pub const SectionKind = enum {
     rodata,
     bss,
     gc_meta,
+    /// Thread-local initialized image (`.tdata`, `SHF_TLS`) — the per-thread
+    /// template the loader copies, NOT a live cell. `@threadlocal let` with a
+    /// non-zero initial image lands here (§11.11).
+    tdata,
+    /// Thread-local zero-fill (`.tbss`, `SHF_TLS` + `SHT_NOBITS`).
+    tbss,
 
     fn sectionName(self: SectionKind) []const u8 {
         return switch (self) {
@@ -55,11 +61,13 @@ pub const SectionKind = enum {
             .rodata => ".rodata",
             .bss => ".bss",
             .gc_meta => ".bit_gc",
+            .tdata => ".tdata",
+            .tbss => ".tbss",
         };
     }
 
     fn shType(self: SectionKind) elf.SHT {
-        return if (self == .bss) .NOBITS else .PROGBITS;
+        return if (self == .bss or self == .tbss) .NOBITS else .PROGBITS;
     }
 
     fn shFlags(self: SectionKind) elf.SHF {
@@ -67,7 +75,18 @@ pub const SectionKind = enum {
             .text => .{ .ALLOC = true, .EXECINSTR = true },
             .data, .bss => .{ .ALLOC = true, .WRITE = true },
             .rodata, .gc_meta => .{ .ALLOC = true },
+            // TLS sections are ALLOC+WRITE like `.data`, plus `SHF_TLS`, which
+            // is what makes the loader treat them as a per-thread template
+            // rather than as ordinary program data.
+            .tdata, .tbss => .{ .ALLOC = true, .WRITE = true, .TLS = true },
         };
+    }
+
+    /// Whether this section's bytes live only in the per-thread template. A
+    /// symbol defined here gets `STT_TLS` and its `st_value` is an offset
+    /// within that template, not a link-time address (§11.11).
+    fn isTls(self: SectionKind) bool {
+        return self == .tdata or self == .tbss;
     }
 };
 
@@ -77,7 +96,7 @@ const num_kinds = @typeInfo(SectionKind).@"enum".fields.len;
 /// spelled out explicitly rather than derived from enum declaration order,
 /// so reordering `SectionKind`'s declaration can never silently reorder the
 /// file layout.
-const canonical_order = [_]SectionKind{ .text, .data, .rodata, .bss, .gc_meta };
+const canonical_order = [_]SectionKind{ .text, .data, .rodata, .bss, .gc_meta, .tdata, .tbss };
 
 /// One section's content. `.bss` is the only kind with no file bytes: give
 /// it `size` and leave `data` empty (its contents are implicitly zero).
@@ -91,12 +110,17 @@ pub const Section = struct {
     alignment: u32 = 1,
 
     fn byteSize(self: Section) u64 {
-        return if (self.kind == .bss) self.size else self.data.len;
+        return if (self.kind == .bss or self.kind == .tbss) self.size else self.data.len;
     }
 };
 
 pub const Binding = enum { local, global };
-pub const SymKind = enum { notype, object, func };
+/// `tls` marks a symbol defined in `.tdata`/`.tbss`: `STT_TLS`, whose
+/// `st_value` the linker reads as an offset within the per-thread template
+/// rather than as an address. Getting this wrong makes a local-exec
+/// relocation resolve against a link-time address and silently read the
+/// wrong memory, so the kind is explicit rather than inferred at emission.
+pub const SymKind = enum { notype, object, func, tls };
 
 /// `section == null` names an external symbol (a runtime `bit_rt_*` export,
 /// or another Bit module's function) that the linker must resolve — it
@@ -131,9 +155,29 @@ pub const RelocKind = enum {
     /// ((S+A) & 0xfff) — the low half paired with the `ADRP` above.
     aarch64_add_abs_lo12_nc,
 
+    /// ARM64 `R_AARCH64_TLSLE_ADD_TPREL_HI12`: an `ADD` immediate carrying
+    /// bits [23:12] of the symbol's offset from the thread pointer. The high
+    /// half of the local-exec pair (§11.11); `_NC` on the low half means only
+    /// this one range-checks.
+    aarch64_tlsle_add_tprel_hi12,
+    /// ARM64 `R_AARCH64_TLSLE_ADD_TPREL_LO12_NC`: the paired `ADD`'s low 12
+    /// bits of that same thread-pointer offset.
+    aarch64_tlsle_add_tprel_lo12_nc,
+    /// x86-64 `R_X86_64_TPOFF32`: a 4-byte field holding the symbol's offset
+    /// from the thread pointer. Variant II puts the TLS block *below* `%fs:0`,
+    /// so the resolved value is negative — the field is signed.
+    tpoff32,
+
     fn width(self: RelocKind) u64 {
         return switch (self) {
-            .pc32, .aarch64_call26, .aarch64_adr_prel_pg_hi21, .aarch64_add_abs_lo12_nc => 4,
+            .pc32,
+            .aarch64_call26,
+            .aarch64_adr_prel_pg_hi21,
+            .aarch64_add_abs_lo12_nc,
+            .aarch64_tlsle_add_tprel_hi12,
+            .aarch64_tlsle_add_tprel_lo12_nc,
+            .tpoff32,
+            => 4,
             .abs64 => 8,
         };
     }
@@ -148,6 +192,13 @@ pub const RelocKind = enum {
             .aarch64_call26 => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.CALL26) else null,
             .aarch64_adr_prel_pg_hi21 => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.ADR_PREL_PG_HI21) else null,
             .aarch64_add_abs_lo12_nc => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.ADD_ABS_LO12_NC) else null,
+            // Named through Zig's `std.elf` enums rather than transcribed:
+            // `TLSLE_ADD_TPREL_LO12_NC` is 551, not the 550 an off-by-one
+            // reading of the ABI table suggests, and that mistake has already
+            // cost this backend once.
+            .aarch64_tlsle_add_tprel_hi12 => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.TLSLE_ADD_TPREL_HI12) else null,
+            .aarch64_tlsle_add_tprel_lo12_nc => if (target == .aarch64) @intFromEnum(elf.R_AARCH64.TLSLE_ADD_TPREL_LO12_NC) else null,
+            .tpoff32 => if (target == .x86_64) @intFromEnum(elf.R_X86_64.TPOFF32) else null,
         };
     }
 };
@@ -384,6 +435,7 @@ pub fn write(gpa: Allocator, target: Target, object: Object) Error![]u8 {
                     .notype => .NOTYPE,
                     .object => .OBJECT,
                     .func => .FUNC,
+                    .tls => .TLS,
                 },
                 .bind = if (sym.binding == .local) .LOCAL else .GLOBAL,
             },
@@ -560,6 +612,67 @@ test "write: aarch64 object with data, bss, gc metadata, and both reloc kinds" {
     try testing.expect(p.findSection(".rela.text") != null);
     try testing.expect(p.findSection(".rela.bit_gc") != null);
     try testing.expect(p.findSection(".rela.rodata") == null); // no reloc targets .rodata
+}
+
+test "write: thread-local section carries SHF_TLS, STT_TLS symbols, and local-exec relocs" {
+    const gpa = testing.allocator;
+    const code = [_]u8{ 0xc0, 0x03, 0x5f, 0xd6 }; // ret
+    const tdata = [_]u8{0} ** 8; // one 8-byte @threadlocal cell's initial image
+
+    const bytes = try write(gpa, .aarch64, .{
+        .sections = &.{
+            .{ .kind = .text, .data = &code, .alignment = 4 },
+            .{ .kind = .tdata, .data = &tdata, .alignment = 8 },
+        },
+        .symbols = &.{
+            .{ .name = "slot", .section = .tdata, .offset = 0, .size = tdata.len, .binding = .global, .kind = .tls },
+        },
+        .relocations = &.{
+            .{ .section = .text, .offset = 0, .symbol = "slot", .kind = .aarch64_tlsle_add_tprel_hi12 },
+            .{ .section = .text, .offset = 0, .symbol = "slot", .kind = .aarch64_tlsle_add_tprel_lo12_nc },
+        },
+    });
+    defer gpa.free(bytes);
+
+    const p = try parse(bytes);
+    const td = p.findSection(".tdata") orelse return error.TestUnexpectedResult;
+    // SHF_TLS is what makes the loader treat these bytes as a per-thread
+    // template. Without it they would link as ordinary writable data — one
+    // process-wide cell, which is the exact silent failure this guards.
+    try testing.expect(td.sh_flags & elf.SHF_TLS != 0);
+    try testing.expect(td.sh_flags & elf.SHF_WRITE != 0);
+    try testing.expectEqual(@as(u64, @intFromEnum(elf.SHT.PROGBITS)), @as(u64, td.sh_type));
+
+    // The symbol must be STT_TLS, so its st_value reads as a template offset
+    // rather than an address.
+    const symtab = p.findSection(".symtab").?;
+    const syms = std.mem.bytesAsSlice(elf.Elf64_Sym, bytes[symtab.sh_offset..][0..symtab.sh_size]);
+    try testing.expectEqual(@as(usize, 2), syms.len); // null + slot
+    try testing.expectEqual(@as(u4, @intFromEnum(elf.STT.TLS)), syms[1].st_info & 0xf);
+
+    // Pin the two AArch64 local-exec ordinals. LO12_NC is 551, NOT 550 — an
+    // off-by-one here silently patches the wrong ADD immediate.
+    try testing.expectEqual(@as(u32, 549), @intFromEnum(elf.R_AARCH64.TLSLE_ADD_TPREL_HI12));
+    try testing.expectEqual(@as(u32, 551), @intFromEnum(elf.R_AARCH64.TLSLE_ADD_TPREL_LO12_NC));
+    try testing.expectEqual(@as(u32, 23), @intFromEnum(elf.R_X86_64.TPOFF32));
+}
+
+test "write: TLS relocation kinds are rejected on the wrong target" {
+    const gpa = testing.allocator;
+    const code = [_]u8{0} ** 4;
+    // TPOFF32 is variant-II/x86-64 only; the AArch64 pair is variant-I only.
+    // Emitting either on the other arch would encode a valid-looking but
+    // meaningless relocation type, so the writer refuses.
+    try testing.expectError(error.RelocKindUnsupportedForTarget, write(gpa, .aarch64, .{
+        .sections = &.{.{ .kind = .text, .data = &code, .alignment = 4 }},
+        .symbols = &.{.{ .name = "slot", .section = .text, .offset = 0, .binding = .global, .kind = .tls }},
+        .relocations = &.{.{ .section = .text, .offset = 0, .symbol = "slot", .kind = .tpoff32 }},
+    }));
+    try testing.expectError(error.RelocKindUnsupportedForTarget, write(gpa, .x86_64, .{
+        .sections = &.{.{ .kind = .text, .data = &code, .alignment = 4 }},
+        .symbols = &.{.{ .name = "slot", .section = .text, .offset = 0, .binding = .global, .kind = .tls }},
+        .relocations = &.{.{ .section = .text, .offset = 0, .symbol = "slot", .kind = .aarch64_tlsle_add_tprel_hi12 }},
+    }));
 }
 
 test "write: rejects a relocation kind unsupported on the target" {
