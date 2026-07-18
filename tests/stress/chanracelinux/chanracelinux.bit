@@ -1,0 +1,114 @@
+// Channel send/receive across TWO REAL OS THREADS (#1365), Linux.
+//
+// This is the program the channel port's park seam exists to be tested by. Its
+// sibling ../chan runs the semantics on one worker, which is deterministic but
+// structurally cannot reach `chanWake`'s wait: with one worker a waiter is only
+// ever seen after its task has already parked, so the wait is satisfied before
+// it is tested. Deleting the wait leaves ../chan passing. Here a sender on one
+// OS thread reaches into the wait queue while a receiver on the other is
+// genuinely mid-park, so the window is live.
+//
+// See ../chan/race for the full argument, including what a broken wait looks
+// like (a dropped `schedUnpark`, a task that never runs again, and a received
+// count that never reaches the total).
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/thread/linux and runtime/park/linux, which reach the kernel through
+// `syscall` (SPEC §11.8) — rejected on Darwin even for an uncalled declaration.
+// Kept identical in shape to its Darwin twin, so a divergence between the two
+// means a real platform difference rather than a spelling one.
+
+import { raceInit, raceWorkerAddr, raceWorkerEntry, raceShutdown } from "../chan/race"
+import { raceAllSent, raceReceiversDone, raceClose, raceVerdict, raceTotalMask } from "../chan/race"
+import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+
+let argBlocks: [4]i64
+let doneWords: [2]i32
+
+// Generous against the real timings (a thousand rendezvous take milliseconds)
+// and small enough that a wedged run fails the suite in seconds rather than
+// hanging it — the distinction that matters after this project's QUIC hang.
+const WAIT_NS: int = 10000000000
+
+// Every wait carries BOTH a deadline and a static trip bound. A deadline alone
+// is only as trustworthy as the clock enforcing it; the bound is what makes
+// termination provable by reading the loop.
+const WAIT_MAX_POLLS: int = 2000000
+
+function doneAt(i: int): *i32 {
+  return ptrOf(doneWords) + i
+}
+
+function startWorker(i: int): int {
+  let blocks: *i64 = ptrOf(argBlocks)
+  *(blocks + i * 2) = raceWorkerAddr(i)
+  *(blocks + i * 2 + 1) = int(doneAt(i))
+
+  atomicStore(doneAt(i), i32(threadRunning))
+  let bp: *byte = nil
+  return threadStart(entryOf(raceWorkerEntry), bp + int(blocks + i * 2), doneAt(i))
+}
+
+function waitAllSent(): bool {
+  let deadline = parkMonoNs() + WAIT_NS
+  let i = 0
+  while (i < WAIT_MAX_POLLS) {
+    if (raceAllSent()) {
+      return true
+    }
+    if (parkMonoNs() >= deadline) {
+      return false
+    }
+    parkSleepNs(1000)
+    i = i + 1
+  }
+  return false
+}
+
+function waitReceiversDone(): bool {
+  let deadline = parkMonoNs() + WAIT_NS
+  let i = 0
+  while (i < WAIT_MAX_POLLS) {
+    if (raceReceiversDone()) {
+      return true
+    }
+    if (parkMonoNs() >= deadline) {
+      return false
+    }
+    parkSleepNs(1000)
+    i = i + 1
+  }
+  return false
+}
+
+function main() {
+  if (!raceInit()) {
+    print("init-failed\n")
+    return
+  }
+
+  let h0 = startWorker(0)
+  let h1 = startWorker(1)
+
+  // Every sender has finished, so no sender is left that could satisfy a
+  // receiver. The close below is therefore the ONLY thing that can release them.
+  let sent = waitAllSent()
+
+  // Closed from this thread, which is not a task at all — `chanClose` never
+  // parks and reaches the scheduler through the channel's own field.
+  let closed = raceClose()
+  let drained = waitReceiversDone()
+
+  raceShutdown()
+  let joined0 = threadJoin(doneAt(0), WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
+  let joined1 = threadJoin(doneAt(1), WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
+  let rel0 = threadRelease(h0)
+  let rel1 = threadRelease(h1)
+
+  // The verdict is read only once BOTH threads are joined, so no counter it
+  // reads can still be racing a worker.
+  let staged = sent && closed && drained && joined0 && joined1 && rel0 && rel1
+  print("${staged} ${h0 != 0 && h1 != 0} ${raceVerdict()} ${raceTotalMask}\n")
+}

@@ -1,0 +1,299 @@
+// The channel park race on TWO REAL OS THREADS (#1365), shared by
+// ../../chanracelinux and ../../chanracedarwin.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS PROGRAM EXISTS
+// ---------------------------------------------------------------------------
+//
+// ../../chan covers channel SEMANTICS on one worker, deterministically. It
+// cannot cover the one place this port departs from `chan.zig`, and the gap is
+// structural rather than a matter of adding a case.
+//
+// `chan.zig` links a waiter onto a queue from inside `park`'s setup callback, so
+// a waiter is only ever visible once its task is already parkable. This port has
+// no such callback (`@nosplit` rejects a call through a function value), so it
+// registers the waiter BEFORE parking and `chanWake` waits for the parking task
+// to reach `taskParked` before unparking it.
+//
+// WITH ONE WORKER THAT WAIT IS DEAD CODE. Only one task runs at a time, so a
+// peer can only observe a waiter after the waiting task has already switched
+// away — the condition is satisfied before it is ever tested. Deleting the wait
+// entirely leaves ../../chan passing (measured, and recorded in this task's
+// report as a survivor). Two OS threads are what make the window real: a sender
+// on one thread reaches into the queue while the receiver on the other is
+// somewhere between pushing its waiter and completing its context switch.
+//
+// So this program runs an UNBUFFERED channel, where every single transfer is a
+// rendezvous and therefore a park and a wake. Nine tasks on two workers give
+// 120,000 chances per run to land in that window — a count chosen by measuring
+// how often the mutation is caught, not by feel; see the sizing note below.
+//
+// ---------------------------------------------------------------------------
+// WHAT A BROKEN WAIT LOOKS LIKE
+// ---------------------------------------------------------------------------
+//
+// `schedUnpark` compare-and-exchanges `taskParked -> taskRunnable` and returns
+// false if the task was not parked. Without the wait, that false is simply
+// dropped: the task is never requeued and never runs again. The count of
+// received values then never reaches the total, and the driver's BOUNDED wait
+// reports it. Nothing hangs — every wait in the driver carries both a deadline
+// and a static trip bound, so a wedged run fails the suite in seconds instead of
+// stalling it.
+//
+// ---------------------------------------------------------------------------
+// TEARDOWN IS PART OF THE PROPERTY, NOT A POSTSCRIPT
+// ---------------------------------------------------------------------------
+//
+// The receivers do not count to a total and stop; they drain until the channel
+// reports closed, which is the only shutdown that is correct when a receiver
+// cannot know whether more values are coming. The driver closes the channel from
+// a thread that is not a task at all, while receivers are blocked on it. Every
+// blocked receiver must come back with `ok` false and exit.
+//
+// That is deliberately the shape that has burned this project: a QUIC teardown
+// hung because closing never released its waiters, and because one of them
+// waited on a condition a departed peer could no longer satisfy. Here there is
+// no peer left by construction — the senders are finished and gone before the
+// close — so a `close` that fails to drain `recvq` cannot be rescued by anything.
+
+import { schedInit, schedWorkerAt, schedWorkerRun, schedShutdown, schedRegister } from "../../../../runtime/sched"
+import { schedTaskInit, schedTaskExit, schedCurrentTask, taskAt, taskArg } from "../../../../runtime/sched"
+import { schedStackBytes, schedStackAligned, dqPushBottom, wkDeque, workerWords } from "../../../../runtime/sched"
+import { chanInit, chanSend, chanRecv, chanClose } from "../../../../runtime/chan"
+
+export const raceWorkers: int = 2
+
+// SIZED BY MEASUREMENT, NOT BY FEEL. The window this program tests is narrow —
+// a waker has to reach into the queue during the few dozen instructions between
+// a receiver's lock release and its worker's `taskParked` store — so the run has
+// to be long enough that hitting it is a near-certainty rather than a lottery.
+//
+// Measured against the `chanWake`-does-not-wait mutation: at 4 senders x 250
+// values (1000 rendezvous) the mutant survived 38 of 40 runs, i.e. the test
+// detected a REAL defect only 5% of the time. That is a test that would have
+// passed this port with the bug in it. At the sizes below it fails every run.
+//
+// More tasks than workers is part of it, not incidental: the surplus forces
+// tasks to queue and resume repeatedly, which is what keeps wakers arriving at
+// the lock while a peer is still on its way into a park.
+const nSend: int = 6
+const nRecv: int = 3
+const perSender: int = 100000
+
+// 6 * 20000 values; each sender contributes 0+1+...+19999 = 199990000.
+export const raceTotal: int = 600000
+export const raceChecksum: int = 29999700000
+
+// Nine 64KiB stacks plus a 64KiB alignment slack: a module-level array is only
+// 8-byte aligned (#1421), so an aligned base is taken rather than assumed.
+let stackArea: [81920]i64
+
+let taskBlocks: [288]i64
+let workerBlocks: [584]i64
+let schedBlock: [16]i64
+let chanBlock: [13]i64
+
+// Counters written from green threads on BOTH OS threads, so every update is
+// atomic. Module state is untraced and statically allocated (§11.11), which is
+// required here: the collector must never walk them.
+let obsSent: i64 = 0
+let obsRecv: i64 = 0
+let obsSum: i64 = 0
+let obsClosedExits: i64 = 0
+
+// Addresses resolved once on an ordinary thread — `ptrOf` is rejected inside a
+// `@nosplit` body (#1421), and every task body here is `@nosplit`.
+let addrSched: i64 = 0
+let addrChan: i64 = 0
+let addrSent: i64 = 0
+let addrRecv: i64 = 0
+let addrSum: i64 = 0
+let addrClosedExits: i64 = 0
+
+// Each receiver needs a value slot whose address a `@nosplit` body can hold.
+// One per receiver, so two receivers never share a destination.
+let recvSlots: [8]i64
+let addrRecvSlots: i64 = 0
+
+@nosplit function alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+export function raceSchedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+export function raceWorkerAddr(i: int): int {
+  return int(ptrOf(workerBlocks)) + i * workerWords * 8
+}
+
+function taskAddrOf(i: int): int {
+  return int(ptrOf(taskBlocks)) + i * 32 * 8
+}
+
+function stackBaseOf(i: int): int {
+  return alignUpStack(int(ptrOf(stackArea))) + i * schedStackBytes
+}
+
+// ---------------------------------------------------------------------------
+// The tasks
+// ---------------------------------------------------------------------------
+
+@nosplit function senderBody() {
+  let ch = taskAt(addrChan)
+  let sent = taskAt(addrSent)
+  let i = 0
+  while (i < perSender) {
+    chanSend(ch, i)
+    atomicAdd(sent, 1)
+    i = i + 1
+  }
+  schedTaskExit()
+}
+
+// Drains until the channel reports closed. `ok` false is the ONLY exit — a
+// receiver that counted to a total instead would not be testing teardown at all,
+// and would leave the close path unexercised.
+@nosplit function receiverBody() {
+  let ch = taskAt(addrChan)
+  let me = *(taskAt(schedCurrentTask()) + taskArg)
+  let slot = taskAt(addrRecvSlots) + me
+  let count = taskAt(addrRecv)
+  let sum = taskAt(addrSum)
+
+  // Bounded by construction (Power of 10): at most every value plus one closing
+  // read can arrive here, so exceeding that means the channel is misbehaving.
+  let n = 0
+  while (n <= raceTotal) {
+    let ok = chanRecv(ch, slot)
+    if (!ok) {
+      atomicAdd(taskAt(addrClosedExits), 1)
+      schedTaskExit()
+      return
+    }
+    atomicAdd(sum, *slot)
+    atomicAdd(count, 1)
+    n = n + 1
+  }
+  schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+// Build the scheduler, the channel and every task, spreading the tasks across
+// both workers' local rings so the two OS threads start with work of their own
+// rather than both draining one queue.
+export function raceInit(): bool {
+  addrSched = raceSchedAddr()
+  addrChan = int(ptrOf(chanBlock))
+  addrSent = int(ptrOf(obsSent))
+  addrRecv = int(ptrOf(obsRecv))
+  addrSum = int(ptrOf(obsSum))
+  addrClosedExits = int(ptrOf(obsClosedExits))
+  addrRecvSlots = int(ptrOf(recvSlots))
+
+  obsSent = 0
+  obsRecv = 0
+  obsSum = 0
+  obsClosedExits = 0
+
+  let s = taskAt(addrSched)
+  schedInit(s, int(ptrOf(workerBlocks)), raceWorkers)
+
+  // Capacity 0: every transfer is a rendezvous, so every transfer parks and
+  // wakes. That is the maximum pressure on the seam this program exists to test.
+  chanInit(taskAt(addrChan), 0, 0, false, s)
+
+  if (!schedStackAligned(stackBaseOf(0))) {
+    return false
+  }
+
+  let i = 0
+  while (i < nSend) {
+    let t = taskAt(taskAddrOf(i))
+    schedTaskInit(t, stackBaseOf(i), schedStackBytes, entryOf(senderBody), i)
+    schedRegister(s, taskAddrOf(i))
+    if (!dqPushBottom(schedWorkerAt(s, i % raceWorkers) + wkDeque, taskAddrOf(i))) {
+      return false
+    }
+    i = i + 1
+  }
+
+  let j = 0
+  while (j < nRecv) {
+    let slot = nSend + j
+    let t = taskAt(taskAddrOf(slot))
+    schedTaskInit(t, stackBaseOf(slot), schedStackBytes, entryOf(receiverBody), j)
+    schedRegister(s, taskAddrOf(slot))
+    if (!dqPushBottom(schedWorkerAt(s, j % raceWorkers) + wkDeque, taskAddrOf(slot))) {
+      return false
+    }
+    j = j + 1
+  }
+  return true
+}
+
+export function raceShutdown() {
+  schedShutdown(taskAt(addrSched))
+}
+
+// Every sender has finished. The driver waits on this before closing, so the
+// close lands with the receivers blocked and no sender left in existence.
+export function raceAllSent(): bool {
+  return atomicLoad(ptrOf(obsSent)) == raceTotal
+}
+
+export function raceReceiversDone(): bool {
+  return atomicLoad(ptrOf(obsClosedExits)) == nRecv
+}
+
+export function raceClose(): bool {
+  return chanClose(taskAt(addrChan))
+}
+
+// The OS thread body for a worker. NOT `@nosplit`, which is safe only because it
+// contains no loop — `schedWorkerRun` owns the loop and is itself `@nosplit`, so
+// no safepoint is reached on this thread. The same argument runtime/thread's own
+// providers make for their children.
+//
+// `arg` points at a two-word block: the worker's address, then the `done` word
+// this thread must clear on the way out. Clearing it is mandatory on Darwin
+// (pthreads has no `CLONE_CHILD_CLEARTID`) and harmless on Linux.
+export function raceWorkerEntry(arg: *byte): *byte {
+  let block = taskAt(int(arg))
+  let workerAddr = *block
+  let doneAddr = *(block + 1)
+
+  schedWorkerRun(taskAt(workerAddr))
+
+  let z: *i32 = nil
+  atomicStore(z + doneAddr / 4, i32(0))
+  return nil
+}
+
+// ---------------------------------------------------------------------------
+// The verdict
+// ---------------------------------------------------------------------------
+//
+//   1  every value a sender sent was received — nothing was lost to a wakeup
+//      that arrived before its task had finished parking
+//   2  the values summed to what was sent, so nothing was duplicated or corrupted
+//   4  every receiver exited through `close` rather than by counting
+export const raceTotalMask: int = 7
+
+export function raceVerdict(): int {
+  let mask = 0
+  if (atomicLoad(ptrOf(obsRecv)) == raceTotal) {
+    mask = mask | 1
+  }
+  if (atomicLoad(ptrOf(obsSum)) == raceChecksum) {
+    mask = mask | 2
+  }
+  if (atomicLoad(ptrOf(obsClosedExits)) == nRecv) {
+    mask = mask | 4
+  }
+  return mask
+}
