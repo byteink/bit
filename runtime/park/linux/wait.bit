@@ -1,0 +1,235 @@
+// Linux parking provider for the Stage-2 port of runtime/sched.zig's idle path
+// (#1403). See ../park.bit for why the port is split by directory rather than
+// switching on the OS inside one file, and for what this module deliberately
+// does NOT contain (OS thread creation, blocked on #1404).
+//
+// Raw syscalls (§11.8) rather than a libc, for the reason the whole runtime uses
+// them: the ELF output is fully static with no libc to call into.
+//
+// EVERY CONSTANT BELOW WAS READ OUT OF THE PINNED ZIG STDLIB, NOT FROM MEMORY —
+// syscall numbers from std/os/linux/syscalls.zig (`X64`/`Arm64` enums), the
+// futex operation encoding from std/os/linux.zig's `FUTEX_OP`, which is a
+// `packed struct(u32) { cmd: u7, private: bool, ... }` — so the private flag is
+// bit 7, i.e. 128. A wrong number here is a silent wrong-syscall, not a compile
+// error; tests/stress/park issues each of these against the real kernel and
+// asserts the documented return code.
+
+// Syscall numbers are per-architecture and Bit has no arch-conditional
+// compilation, so the number is selected at run time (§11.8). `hostTarget()` is
+// 0 for x86_64-linux and 1 for aarch64-linux; this module is only ever built for
+// a Linux target, so the two cases are exhaustive. Same shape as
+// runtime/alloc/linux/pages.bit.
+function nr(x64: int, arm64: int): int {
+  if (hostTarget() == 0) {
+    return x64
+  }
+  return arm64
+}
+
+function nrFutex(): int { return nr(202, 98) }
+function nrClockGettime(): int { return nr(228, 113) }
+function nrNanosleep(): int { return nr(35, 101) }
+function nrSchedGetaffinity(): int { return nr(204, 123) }
+
+// FUTEX_WAIT (cmd 0) and FUTEX_WAKE (cmd 1), both with FUTEX_PRIVATE_FLAG
+// (bit 7 = 128).
+//
+// PRIVATE is not an optimisation detail — it is a correctness statement. It
+// tells the kernel the futex word is never shared with another process, which
+// lets it skip the mmap-semantics lookup and key the wait queue on the virtual
+// address alone. The scheduler's worker words live in the process's own
+// bookkeeping (allocated straight from the OS, never shared), so PRIVATE is
+// accurate. It also matches Darwin, where `__ulock` is process-private by
+// construction and has no shared mode at all — so the two providers implement
+// the same contract rather than merely similar ones.
+function futexWaitPrivate(): int { return 128 }
+function futexWakePrivate(): int { return 129 }
+
+// CLOCK_MONOTONIC.
+function clockMonotonic(): int { return 1 }
+
+// Errno values the futex path returns, negated (a raw syscall reports failure as
+// a small negative errno). Only the two that carry contract meaning are named.
+function eAgain(): int { return 11 }
+function eTimedOut(): int { return 110 }
+
+// Nanoseconds per second, and per microsecond — named because the timespec
+// split below is easy to get subtly wrong when spelled as a bare literal.
+function nsPerSec(): int { return 1000000000 }
+
+// Monotonic clock in nanoseconds.
+//
+// This is `sched.zig`'s `monoNs()`: `std.time.Timer` moved behind Zig 0.16's new
+// `Io` interface, so the Zig reads CLOCK_MONOTONIC directly too. A `timespec` is
+// two 64-bit words {sec, nsec}, built here as a `[]i64(2)` whose address is
+// handed over with `ptrOf` (§11.5).
+//
+// Returns 0 if the kernel refuses. The Zig ignores the return code entirely
+// (`_ = std.os.linux.clock_gettime(...)`); reporting 0 rather than reading back
+// an uninitialised buffer is the one deviation, and it is strictly safer — a
+// caller measuring an interval sees a nonsensical 0 rather than stack garbage.
+export function parkMonoNs(): int {
+  let ts = []i64(2)
+  let rc = int(syscall(nrClockGettime(), i64(clockMonotonic()), i64(int(ptrOf(ts)))))
+  if (rc != 0) {
+    return 0
+  }
+  return int(ts[0]) * nsPerSec() + int(ts[1])
+}
+
+// Sleep the calling OS thread for at least `ns` nanoseconds.
+//
+// THIS IS THE CURRENT PARK PRIMITIVE — `sched.zig`'s `sleepNs`, which
+// `Worker.run` calls with the backoff delay. Porting the idle loop against this
+// reproduces today's behaviour exactly.
+//
+// A non-positive request returns without a syscall: nanosleep rejects a negative
+// tv_nsec with EINVAL, and sleeping for zero is a pure waste of a trap. The Zig
+// is never called with one (its argument is always a clamped backoff), so this
+// only hardens a boundary the Zig does not have to defend.
+//
+// Short sleeps are NOT restarted on EINTR. Neither is the Zig's — it discards
+// the result (`_ = std.os.linux.nanosleep(&req, null)`). Restarting would be a
+// behaviour change: the idle loop's whole contract is "wait a bounded time, then
+// re-check", and an interrupted sleep that re-checks early is correct, merely
+// less patient.
+export function parkSleepNs(ns: int) {
+  if (ns <= 0) {
+    return
+  }
+  let req = []i64(2)
+  req[0] = i64(ns / nsPerSec())
+  req[1] = i64(ns % nsPerSec())
+  let rc = int(syscall(nrNanosleep(), i64(int(ptrOf(req))), 0))
+}
+
+// Block while the 32-bit word at `p` still holds `expected`, for at most
+// `timeoutNs` (0 means block indefinitely). Returns `parkWaitReady` or
+// `parkWaitTimedOut` (../park.bit).
+//
+// FUTEX_WAIT's compare-then-sleep is atomic with respect to FUTEX_WAKE: the
+// kernel re-reads the word under the futex queue lock, so a wake that lands
+// after the caller's own check but before the sleep is not lost — it makes the
+// compare fail and the call returns immediately. That atomicity is the entire
+// reason this is a kernel primitive rather than a check plus a sleep, and it is
+// what a hand-rolled "if (word == expected) sleep()" cannot reproduce.
+//
+// RETURN MAPPING. -EAGAIN means the word already differed (no wait happened) and
+// -EINTR means a signal cut the wait short; both, like a real wake, mean only
+// "re-read the word", so all three map to `parkWaitReady`. -ETIMEDOUT is the one
+// distinguishable outcome. Any other negative errno is a programming error
+// (EINVAL from a malformed timespec, EFAULT from a bad address) — reported as
+// `parkWaitReady` so the caller re-checks and makes progress rather than
+// treating a bug as a timeout and silently waiting again.
+//
+// The status codes are duplicated as literals here rather than imported from
+// ../park.bit so that a provider stays a leaf with no imports, exactly as
+// runtime/alloc's and runtime/rand's providers do. tests/stress/park pins the
+// two spellings against each other so the duplication cannot drift.
+export function parkWait(p: *i32, expected: i32, timeoutNs: int): int {
+  let rc = 0
+  if (timeoutNs <= 0) {
+    // A null timespec is futex's "wait forever".
+    rc = int(syscall(nrFutex(), i64(int(p)), i64(futexWaitPrivate()), i64(expected), 0))
+  } else {
+    let ts = []i64(2)
+    ts[0] = i64(timeoutNs / nsPerSec())
+    ts[1] = i64(timeoutNs % nsPerSec())
+    rc = int(syscall(nrFutex(), i64(int(p)), i64(futexWaitPrivate()), i64(expected),
+                     i64(int(ptrOf(ts)))))
+  }
+  if (rc == 0 - eTimedOut()) {
+    return 1                       // parkWaitTimedOut
+  }
+  return 0                         // parkWaitReady
+}
+
+// Wake waiters blocked in `parkWait` on the word at `p`. Wakes one waiter when
+// `all` is false, every waiter when true. Returns how many were woken (0 is
+// normal and not an error — it simply means nobody was waiting).
+//
+// Waking ONE is the scheduler's normal case: handing a single task to a single
+// idle worker. Waking all is for a state change every worker must observe, which
+// is what shutdown is — and a shutdown that woke only one worker while the rest
+// stayed blocked is precisely the "closing peer strands its waiters" deadlock
+// this project has already paid for once (the QUIC teardown hang). Both forms
+// exist here so that a caller never has to express "wake everyone" as a loop
+// whose bound it would have to invent.
+//
+// FUTEX_WAKE's count argument is the maximum number to wake; the all-waiters
+// spelling is INT32_MAX rather than a loop, which is the kernel's own idiom.
+export function parkWake(p: *i32, all: bool): int {
+  let n = 1
+  if (all) {
+    n = 2147483647
+  }
+  let rc = int(syscall(nrFutex(), i64(int(p)), i64(futexWakePrivate()), i64(n), 0))
+  if (rc < 0) {
+    return 0
+  }
+  return rc
+}
+
+// Number of CPUs available to this process — the value `Scheduler.init(0)` uses
+// to size the worker pool (`std.Thread.getCpuCount()`).
+//
+// sched_getaffinity, not the raw CPU count: it reports the cores this process is
+// actually PERMITTED to run on, so a container with a restricted cpuset or a
+// process under `taskset` sizes its pool to its real allowance instead of
+// oversubscribing the box. Zig's `getCpuCount` uses the same syscall for the
+// same reason.
+//
+// The kernel fills a bitmask and returns the number of BYTES written; the answer
+// is that many bytes' worth of set bits. 128 bytes covers 1024 CPUs, which is
+// also the upper bound `Scheduler.init` already asserts.
+//
+// RETURNS 0 — NOT 1 — WHEN THE QUERY FAILS. See the Darwin twin for why: the
+// Zig's `getCpuCount() catch 1` makes "1" both a plausible answer and the error
+// value, which renders the test of this function vacuous. Reporting 0 for
+// "unavailable" keeps failure distinguishable and leaves the `catch 1` default
+// to the consumer.
+export function parkCpuCount(): int {
+  // THE MASK MUST BE PACKED BYTES. A Bit slice stores one 8-BYTE word per
+  // element (§11.8), so a `[]u8(128)` is 1024 bytes read with an 8-byte stride —
+  // the bit walk would sample every eighth byte of the kernel's bitmask and
+  // count the wrong CPUs. The region is allocated as `[]i64` (whose elements ARE
+  // 8 contiguous bytes) and walked through a `*u8` cursor, the same bridge
+  // tests/stress/rand/props documents. 16 words = 128 bytes = 1024 CPUs, which
+  // is also the upper bound `Scheduler.init` asserts.
+  let words = 16
+  let setBytes = words * 8
+  let store = []i64(words)
+  let i = 0
+  while (i < words) {
+    store[i] = 0
+    i = i + 1
+  }
+  let nilb: *u8 = nil
+  let mask = nilb + int(ptrOf(store))
+
+  let rc = int(syscall(nrSchedGetaffinity(), 0, i64(setBytes), i64(int(ptrOf(store)))))
+  if (rc <= 0) {
+    return 0
+  }
+  // The walk is bounded by the buffer, not by the kernel's answer, so a bogus
+  // oversized `rc` cannot run off the end (Power of 10: statically bounded).
+  let limit = rc
+  if (limit > setBytes) {
+    limit = setBytes
+  }
+  let count = 0
+  let b = 0
+  while (b < limit) {
+    let p = mask + b
+    let bits = int(*p)
+    let bit = 0
+    while (bit < 8) {
+      if ((bits / (1 << bit)) % 2 == 1) {
+        count = count + 1
+      }
+      bit = bit + 1
+    }
+    b = b + 1
+  }
+  return count
+}

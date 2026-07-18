@@ -1,0 +1,263 @@
+// Darwin parking provider for the Stage-2 port of runtime/sched.zig's idle path
+// (#1403). See ../park.bit for why the port is split by directory rather than
+// switching on the OS inside one file, and for what this module deliberately
+// does NOT contain (OS thread creation, blocked on #1404).
+//
+// Everything here goes through libSystem (§11.7) rather than raw traps: Apple
+// publishes no stable syscall numbers and reserves the right to renumber them,
+// so a C call is the supported path — the same reason `extern function` exists
+// at all, and the same choice runtime/alloc/darwin and runtime/rand/darwin make.
+//
+// `__ulock_wait`/`__ulock_wake` ARE private libSystem symbols — they carry no
+// public header and Apple does not document them. They are used anyway, and the
+// reasoning is worth stating because "private" normally means "do not touch":
+// Darwin has no futex, and its public alternatives are all the wrong shape. A
+// pthread mutex/condvar pair cannot be used because it needs an initialized
+// pthread_cond_t whose layout this runtime would have to hardcode, and
+// `__psynch_cvwait` is equally private but strictly more complex. `__ulock_*` is
+// what Apple's own libc++, libdispatch and Swift runtime park on, and what Zig's
+// `std.Thread.Futex` uses on Darwin — so it is private-but-load-bearing, the
+// most stable unofficial ABI on the platform. Every value below is checked
+// against the real kernel by tests/stress/park rather than trusted.
+
+// int __ulock_wait(uint32_t operation, void *addr, uint64_t value,
+//                  uint32_t timeout_us);
+// int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+//
+// Only C-representable types cross the boundary (§11.7), so the futex word's
+// address travels as a `*u8`.
+extern function __ulock_wait(op: u32, addr: *u8, value: u64, timeout_us: u32): i32
+extern function __ulock_wake(op: u32, addr: *u8, wake_value: u64): i32
+
+// mach_absolute_time is the monotonic tick counter; mach_timebase_info converts
+// its ticks to nanoseconds. The ratio is NOT 1:1 on Apple Silicon (the timer
+// runs at ~24MHz), so ticks must be scaled or every duration this module
+// reports would be wrong by ~40x.
+extern function mach_absolute_time(): u64
+
+// `mach_timebase_info_data_t` is `struct { uint32_t numer; uint32_t denom; }` —
+// two PACKED 32-bit fields in one 8-byte word. It is declared here as `*i64`,
+// not `*u32`, because a Bit slice stores one 8-BYTE word per element (§11.8):
+// a `[]u32(2)` is 16 bytes, so the kernel's 8-byte write would land entirely
+// inside element 0 and `tb[1]` would read uninitialised memory. Taking the word
+// whole and splitting it below is the only spelling that matches the C layout.
+// (Measured: numer=125, denom=3 on Apple Silicon — the `[]u32(2)` form returned
+// a zero timebase, which silently disabled every timing check that used it.)
+extern function mach_timebase_info(info: *i64): i32
+
+// nanosleep(2) from libSystem, matching `sched.zig`'s `else => std.c.nanosleep`
+// branch. Takes a `struct timespec *` — two 64-bit words on 64-bit Darwin.
+extern function nanosleep(req: *i64, rem: *i64): i32
+
+// sysctlbyname("hw.logicalcpu", ...) is Darwin's CPU count, which is what Zig's
+// `getCpuCount` calls here.
+extern function sysctlbyname(name: *u8, oldp: *i32, oldlenp: *i64, newp: *u8, newlen: i64): i32
+
+// UL_COMPARE_AND_WAIT (1) — the operation whose semantics match futex's
+// compare-and-sleep — OR'd with ULF_NO_ERRNO (0x01000000), which makes the call
+// RETURN the negated errno instead of setting the thread's errno and returning
+// -1. That flag is not a convenience: reading `errno` from Bit would mean
+// reaching into libSystem's thread-local errno slot, which this runtime has no
+// way to address. 1 | 0x01000000 = 16777217.
+function ulCompareAndWait(): int { return 16777217 }
+
+// ULF_WAKE_ALL (0x00000100), OR'd into the wake operation to release every
+// waiter instead of one. 16777217 | 256 = 16777473.
+function ulCompareAndWaitAll(): int { return 16777473 }
+
+// -ETIMEDOUT as ULF_NO_ERRNO reports it. Darwin's ETIMEDOUT is 60, NOT Linux's
+// 110 — the two providers cannot share this constant, and a copied value would
+// silently turn every timeout into a spurious "ready".
+function eTimedOut(): int { return 60 }
+
+function nsPerSec(): int { return 1000000000 }
+
+// Monotonic clock in nanoseconds — `sched.zig`'s `monoNs()` on the Darwin
+// branch.
+//
+// mach_timebase_info yields a {numer, denom} pair; nanoseconds = ticks * numer /
+// denom. The multiply is done BEFORE the divide so the ratio does not truncate
+// to zero on Apple Silicon, where numer/denom is 125/3 — evaluating
+// `ticks * (numer / denom)` would compute `ticks * 41` and lose ~1.6% of every
+// interval. The intermediate cannot overflow in any realistic uptime: at 24MHz
+// with numer=125, a 64-bit product covers roughly 200 years.
+//
+// Returns 0 if the timebase cannot be read, matching the Linux provider's
+// failure report rather than handing back unscaled ticks that would look like a
+// plausible but wildly wrong duration.
+export function parkMonoNs(): int {
+  let tb = []i64(1)
+  tb[0] = 0
+  let rc = int(mach_timebase_info(ptrOf(tb)))
+  if (rc != 0) {
+    return 0
+  }
+  // Split the packed pair: numer is the low 32 bits, denom the high 32.
+  let word = int(tb[0])
+  let numer = word % 4294967296
+  let denom = word / 4294967296
+  if (numer <= 0 || denom <= 0) {
+    return 0
+  }
+  return int(mach_absolute_time()) * numer / denom
+}
+
+// Sleep the calling OS thread for at least `ns` nanoseconds.
+//
+// THIS IS THE CURRENT PARK PRIMITIVE — `sched.zig`'s `sleepNs`, which
+// `Worker.run` calls with the backoff delay. See the Linux provider's twin for
+// why a non-positive request is a no-op and why EINTR is not restarted.
+export function parkSleepNs(ns: int) {
+  if (ns <= 0) {
+    return
+  }
+  let req = []i64(2)
+  req[0] = i64(ns / nsPerSec())
+  req[1] = i64(ns % nsPerSec())
+  let none: *i64 = nil
+  let rc = int(nanosleep(ptrOf(req), none))
+}
+
+// Block while the 32-bit word at `p` still holds `expected`, for at most
+// `timeoutNs` (0 means block indefinitely). Returns `parkWaitReady` or
+// `parkWaitTimedOut` (../park.bit).
+//
+// UL_COMPARE_AND_WAIT compares the word at `addr` against `value` and sleeps
+// only if they are equal, atomically with respect to `__ulock_wake` — the same
+// guarantee FUTEX_WAIT gives, which is what lets the two providers present one
+// contract.
+//
+// TWO REAL DIFFERENCES FROM LINUX, both measured rather than assumed
+// (tests/stress/park records the numbers):
+//
+//   1. The compare-failed case returns 0 — INDISTINGUISHABLE from a real wake,
+//      where Linux returns -EAGAIN. This is the reason `parkWaitReady` is
+//      specified as "re-read the word" rather than "you were woken": the
+//      distinction cannot be honoured here, so the shared contract does not
+//      promise it. See ../park.bit.
+//   2. The timeout is MICROSECONDS in a u32, not a timespec. A sub-microsecond
+//      request would truncate to 0, which `__ulock_wait` reads as "wait
+//      forever" — turning the shortest possible park into a permanent one. That
+//      is a deadlock, so a positive request is floored at 1us rather than
+//      allowed to round down. The idle path's shortest wait is
+//      `parkMinBackoffNs` = 1000ns = exactly 1us, so this floor is the boundary
+//      the scheduler actually sits on, not a hypothetical.
+//
+// The status codes are duplicated as literals here rather than imported from
+// ../park.bit so that a provider stays a leaf with no imports, exactly as
+// runtime/alloc's and runtime/rand's providers do. tests/stress/park pins the
+// two spellings against each other so the duplication cannot drift.
+export function parkWait(p: *i32, expected: i32, timeoutNs: int): int {
+  let base: *u8 = nil
+  let addr = base + int(p)
+  let us = 0
+  if (timeoutNs > 0) {
+    us = timeoutNs / 1000
+    if (us <= 0) {
+      us = 1                       // never round a finite wait down to "forever"
+    }
+  }
+  let rc = int(__ulock_wait(u32(ulCompareAndWait()), addr, u64(int(expected)), u32(us)))
+  if (rc == 0 - eTimedOut()) {
+    return 1                       // parkWaitTimedOut
+  }
+  return 0                         // parkWaitReady
+}
+
+// Wake waiters blocked in `parkWait` on the word at `p`. Wakes one waiter when
+// `all` is false, every waiter when true. Returns how many were woken (0 is
+// normal and not an error — it simply means nobody was waiting).
+//
+// See the Linux twin for why both forms exist. Unlike futex, `__ulock_wake`
+// takes no count: waking all is a FLAG on the operation (ULF_WAKE_ALL), not an
+// argument, which is why the operation rather than the value changes here.
+//
+// `__ulock_wake` reports -ENOENT (-2) when no thread was waiting. That is the
+// expected, benign case — the scheduler wakes a worker word whenever it queues
+// work, whether or not anyone is parked on it — so it is normalised to 0 rather
+// than surfaced as an error. Any other negative code is also reported as 0
+// woken; there is nothing a caller could do differently, and a wake is
+// advisory by construction (the waiter re-checks the word regardless).
+export function parkWake(p: *i32, all: bool): int {
+  let base: *u8 = nil
+  let addr = base + int(p)
+  let op = ulCompareAndWait()
+  if (all) {
+    op = ulCompareAndWaitAll()
+  }
+  let rc = int(__ulock_wake(u32(op), addr, u64(0)))
+  if (rc < 0) {
+    return 0
+  }
+  return rc
+}
+
+// Number of CPUs available to this process — the value `Scheduler.init(0)` uses
+// to size the worker pool (`std.Thread.getCpuCount()`).
+//
+// "hw.logicalcpu" is the count INCLUDING SMT siblings and, unlike
+// "hw.logicalcpu_max", it reflects cores currently online. Darwin has no
+// affinity mask to consult (the Linux provider's `sched_getaffinity` has no
+// counterpart — Darwin deliberately does not support thread-to-core pinning),
+// so this is the whole of the platform's answer.
+//
+// RETURNS 0 — NOT 1 — WHEN THE QUERY FAILS. The Zig's `getCpuCount() catch 1`
+// folds the failure into a legitimate answer, and copying that here made the
+// test that checks this function VACUOUS: "1" is both a plausible CPU count and
+// the error value, so a completely broken query still produced an in-range
+// result and the property passed. (It did: the first version of this function
+// silently returned 1 on an 18-core machine, because of the packing bug fixed
+// below.) Reporting 0 for "unavailable" keeps failure distinguishable, so the
+// stress test's range check genuinely proves the sysctl worked; applying the
+// `catch 1` default is the consumer's job, matching how `entropyFill` reports a
+// bool and lets its caller set policy.
+export function parkCpuCount(): int {
+  // THE NAME MUST BE PACKED BYTES. A Bit slice stores one 8-BYTE word per
+  // element (§11.8), so a `[]u8` spells "hw.logicalcpu" with seven zero bytes
+  // between every character — the kernel reads that as the one-character name
+  // "h" and fails. The region is therefore allocated as `[]i64` (whose elements
+  // ARE 8 contiguous bytes) and written through a `*u8` cursor, the same bridge
+  // tests/stress/rand/props documents. 16 bytes covers the 14-byte name.
+  let store = []i64(2)
+  store[0] = 0
+  store[1] = 0
+  let nilb: *u8 = nil
+  let name = nilb + int(ptrOf(store))
+  writeByte(name, 0, 104)   // h
+  writeByte(name, 1, 119)   // w
+  writeByte(name, 2, 46)    // .
+  writeByte(name, 3, 108)   // l
+  writeByte(name, 4, 111)   // o
+  writeByte(name, 5, 103)   // g
+  writeByte(name, 6, 105)   // i
+  writeByte(name, 7, 99)    // c
+  writeByte(name, 8, 97)    // a
+  writeByte(name, 9, 108)   // l
+  writeByte(name, 10, 99)   // c
+  writeByte(name, 11, 112)  // p
+  writeByte(name, 12, 117)  // u
+  writeByte(name, 13, 0)    // NUL
+
+  let out = []i32(1)
+  out[0] = 0
+  let outLen = []i64(1)
+  outLen[0] = 4                  // sizeof(int)
+  let none: *u8 = nil
+  let rc = int(sysctlbyname(name, ptrOf(out), ptrOf(outLen), none, i64(0)))
+  if (rc != 0) {
+    return 0
+  }
+  let n = int(out[0])
+  if (n <= 0) {
+    return 0
+  }
+  return n
+}
+
+// Store one packed byte at `base + i`. Pointer arithmetic on a `*u8` advances by
+// `sizeOf(u8)` = 1 byte (§11.4), so this addresses the region byte-wise
+// regardless of how the backing slice's elements are strided.
+function writeByte(base: *u8, i: int, v: int) {
+  let p = base + i
+  *p = u8(v)
+}
