@@ -113,8 +113,10 @@ fn emitMethodTable(a: Allocator, module: *const ir.Module, rodata: *std.ArrayLis
 }
 
 /// Emits `module` as an x86-64 ELF relocatable object. The returned bytes are
-/// owned by `gpa`; the module's `main` becomes the runtime entry.
-pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
+/// owned by `gpa`; with `with_entry` the module's `main` becomes the runtime
+/// entry, otherwise no `main` is required and no trampoline is emitted (#1397 —
+/// the plain relocatable an archive member is made of).
+pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -159,22 +161,24 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             main_void = module.ctx.typeOf(f.result) == .void;
         }
     }
-    if (!have_main) return error.NoMain;
+    if (with_entry) {
+        if (!have_main) return error.NoMain;
 
-    // ---- bit_main entry trampoline ----------------------------------------
-    // On entry rsp%16==8 (the call into bit_main pushed a return address); a
-    // single `sub rsp,8` re-aligns it so the SysV call below is 16-aligned.
-    //   sub rsp,8 ; call main ; [xor eax,eax if void] ; add rsp,8 ; ret
-    const tramp: u64 = code.items.len;
-    try code.appendSlice(a, &.{ 0x48, 0x83, 0xEC, 0x08 });
-    try code.append(a, 0xE8);
-    const call_field: u64 = code.items.len;
-    try code.appendSlice(a, &.{ 0, 0, 0, 0 });
-    try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "main", .kind = .pc32, .addend = -4 });
-    if (main_void) try code.appendSlice(a, &.{ 0x31, 0xC0 }); // void main -> exit 0
-    try code.appendSlice(a, &.{ 0x48, 0x83, 0xC4, 0x08, 0xC3 });
-    try symbols.append(a, .{ .name = "bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global, .kind = .func });
-    try defined.put(a, "bit_main", {});
+        // ---- bit_main entry trampoline ------------------------------------
+        // On entry rsp%16==8 (the call into bit_main pushed a return address); a
+        // single `sub rsp,8` re-aligns it so the SysV call below is 16-aligned.
+        //   sub rsp,8 ; call main ; [xor eax,eax if void] ; add rsp,8 ; ret
+        const tramp: u64 = code.items.len;
+        try code.appendSlice(a, &.{ 0x48, 0x83, 0xEC, 0x08 });
+        try code.append(a, 0xE8);
+        const call_field: u64 = code.items.len;
+        try code.appendSlice(a, &.{ 0, 0, 0, 0 });
+        try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "main", .kind = .pc32, .addend = -4 });
+        if (main_void) try code.appendSlice(a, &.{ 0x31, 0xC0 }); // void main -> exit 0
+        try code.appendSlice(a, &.{ 0x48, 0x83, 0xC4, 0x08, 0xC3 });
+        try symbols.append(a, .{ .name = "bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global, .kind = .func });
+        try defined.put(a, "bit_main", {});
+    }
 
     try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items);
 
@@ -311,7 +315,7 @@ fn emitElfBlobs(
 /// `emitElfBlobs`), but the function bodies and the `bit_main` entry trampoline
 /// use AArch64 encodings, and code relocations are the ADRP/ADD/BL kinds arm64
 /// codegen emits.
-pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module) Error![]u8 {
+pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -354,20 +358,22 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             main_void = module.ctx.typeOf(f.result) == .void;
         }
     }
-    if (!have_main) return error.NoMain;
+    if (with_entry) {
+        if (!have_main) return error.NoMain;
 
-    // ---- bit_main entry trampoline (AArch64) ------------------------------
-    //   stp x29,x30,[sp,#-16]! ; bl main ; [movz w0,#0 if void] ; ldp ; ret
-    const tramp: u64 = code.items.len;
-    try appendWord(&code, a, 0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
-    const call_field: u64 = code.items.len;
-    try appendWord(&code, a, 0x94000000); // bl main (placeholder)
-    try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "main", .kind = .aarch64_call26, .addend = 0 });
-    if (main_void) try appendWord(&code, a, 0x52800000); // movz w0, #0
-    try appendWord(&code, a, 0xA8C17BFD); // ldp x29, x30, [sp], #16
-    try appendWord(&code, a, 0xD65F03C0); // ret
-    try symbols.append(a, .{ .name = "bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global, .kind = .func });
-    try defined.put(a, "bit_main", {});
+        // ---- bit_main entry trampoline (AArch64) --------------------------
+        //   stp x29,x30,[sp,#-16]! ; bl main ; [movz w0,#0 if void] ; ldp ; ret
+        const tramp: u64 = code.items.len;
+        try appendWord(&code, a, 0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+        const call_field: u64 = code.items.len;
+        try appendWord(&code, a, 0x94000000); // bl main (placeholder)
+        try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "main", .kind = .aarch64_call26, .addend = 0 });
+        if (main_void) try appendWord(&code, a, 0x52800000); // movz w0, #0
+        try appendWord(&code, a, 0xA8C17BFD); // ldp x29, x30, [sp], #16
+        try appendWord(&code, a, 0xD65F03C0); // ret
+        try symbols.append(a, .{ .name = "bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global, .kind = .func });
+        try defined.put(a, "bit_main", {});
+    }
 
     try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items);
 
@@ -384,7 +390,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module) Error![]u8 {
 /// the entry trampoline and address-of use AArch64 encodings, and a
 /// `const_string` header address is materialized by a PC-relative `ADRP`/`ADD`
 /// pair (`page21`/`pageoff12`) rather than x86-64's absolute `movabs`.
-pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
+pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -444,20 +450,22 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
             main_void = module.ctx.typeOf(f.result) == .void;
         }
     }
-    if (!have_main) return error.NoMain;
+    if (with_entry) {
+        if (!have_main) return error.NoMain;
 
-    // ---- _bit_main entry trampoline (AArch64) -----------------------------
-    //   stp x29,x30,[sp,#-16]! ; bl _main ; [mov w0,#0 if void] ; ldp ; ret
-    const tramp: u64 = code.items.len;
-    try appendWord(&code, a, 0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
-    const call_field: u64 = code.items.len;
-    try appendWord(&code, a, 0x94000000); // bl _main (placeholder)
-    try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "_main", .kind = .branch });
-    if (main_void) try appendWord(&code, a, 0x52800000); // movz w0, #0
-    try appendWord(&code, a, 0xA8C17BFD); // ldp x29, x30, [sp], #16
-    try appendWord(&code, a, 0xD65F03C0); // ret
-    try symbols.append(a, .{ .name = "_bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global });
-    try defined.put(a, "_bit_main", {});
+        // ---- _bit_main entry trampoline (AArch64) -------------------------
+        //   stp x29,x30,[sp,#-16]! ; bl _main ; [mov w0,#0 if void] ; ldp ; ret
+        const tramp: u64 = code.items.len;
+        try appendWord(&code, a, 0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+        const call_field: u64 = code.items.len;
+        try appendWord(&code, a, 0x94000000); // bl _main (placeholder)
+        try relocs.append(a, .{ .section = .text, .offset = call_field, .symbol = "_main", .kind = .branch });
+        if (main_void) try appendWord(&code, a, 0x52800000); // movz w0, #0
+        try appendWord(&code, a, 0xA8C17BFD); // ldp x29, x30, [sp], #16
+        try appendWord(&code, a, 0xD65F03C0); // ret
+        try symbols.append(a, .{ .name = "_bit_main", .section = .text, .offset = tramp, .size = code.items.len - tramp, .binding = .global });
+        try defined.put(a, "_bit_main", {});
+    }
 
     // ---- string pool -> read-only bytes + a writable {ptr,len} header -----
     // The bytes are read-only (`__const`), but the header holds an absolute

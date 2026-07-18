@@ -1641,6 +1641,13 @@ function main(): ()! { ... }     // a returned error prints to stderr, exit code
 `main` takes no parameters; command-line arguments and environment are read via
 the standard library (`std/os`). A non-executable (library) module has no `main`.
 
+`bit build --emit-obj` (`-c`) stops at a **relocatable object** instead of an
+executable. An object is not a program, so it requires no `main` and gets no
+entry trampoline; a module without one is built this way. `bit ar <out.a>
+<obj...>` bundles such objects into an `ar` archive, using the target's own name
+encoding (BSD for Mach-O, GNU/System V for ELF). Neither command reads the
+runtime archive, and neither links.
+
 ### 17.5 Prelude
 
 Every module implicitly imports the exports of `std/core` — the **prelude** — as
