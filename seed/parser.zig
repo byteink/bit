@@ -314,6 +314,12 @@ const Parser = struct {
             .kw_interface => return self.parseInterfaceDecl(),
             .kw_enum => return self.parseEnumDecl(),
             .kw_type => return self.parseTypeAlias(),
+            .ident => {
+                if (std.mem.eql(u8, self.curText(), "extern")) return self.parseExternFnDecl();
+                try self.fail("a top-level declaration");
+                self.synchronizeTopLevel();
+                return none;
+            },
             else => {
                 try self.fail("a top-level declaration");
                 self.synchronizeTopLevel();
@@ -331,6 +337,12 @@ const Parser = struct {
             .kw_interface => return self.parseInterfaceDecl(),
             .kw_enum => return self.parseEnumDecl(),
             .kw_type => return self.parseTypeAlias(),
+            .ident => {
+                if (std.mem.eql(u8, self.curText(), "extern")) return self.parseExternFnDecl();
+                try self.fail("a declaration after 'export'");
+                self.synchronizeTopLevel();
+                return none;
+            },
             else => {
                 try self.fail("a declaration after 'export'");
                 self.synchronizeTopLevel();
@@ -523,6 +535,31 @@ const Parser = struct {
             return self.tree.add(.func_decl, join(start, self.span(body)), 0, &.{ recv, name, generics, params, result, body });
         }
         return self.tree.add(.func_decl, join(start, self.span(body)), 0, &.{ recv, name, generics, params, result, body, attrs });
+    }
+
+    /// `extern_fn_decl = "extern" "function" IDENT signature` (§11.7). No body,
+    /// no receiver, no generics — a bare binding from a Bit name to an external
+    /// symbol the linker resolves from a dylib.
+    ///
+    /// `extern` is a *contextual* keyword: it lexes as an ordinary identifier and
+    /// stays usable as one everywhere else. That is unambiguous here because an
+    /// identifier can never begin a top-level declaration, so seeing one named
+    /// `extern` at declaration position commits with no lookahead.
+    fn parseExternFnDecl(self: *Parser) ParseError!Index {
+        const start = self.tok.span;
+        try self.advance(); // 'extern'
+        if (self.tok.kind != .kw_function) {
+            try self.fail("'function' after 'extern'");
+            self.synchronizeTopLevel();
+            return none;
+        }
+        try self.advance(); // 'function'
+        const name = try self.expectIdent();
+        const params = try self.parseParams();
+        var result: Index = none;
+        if (try self.accept(.colon)) result = try self.parseResultType();
+        const end = if (result == none) self.span(params) else self.span(result);
+        return self.tree.add(.extern_fn_decl, join(start, end), 0, &.{ name, params, result });
     }
 
     fn parseReceiver(self: *Parser) ParseError!Index {

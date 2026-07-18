@@ -69,6 +69,7 @@ pub const Tag = enum {
     func_decl, // [recv_or_none, name_ident, generics_or_none, params, result_or_none, body, attrs_or_none]
     attr_list, // [attr...]
     attr, // [name_ident]                   `@naked`, `@nosplit` (§10.3.1)
+    extern_fn_decl, // [name_ident, params, result_or_none]  `extern function` (§11.7)
     receiver, // [name_ident, type]
     params, // [param...]
     param, // [name_ident, type]

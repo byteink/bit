@@ -865,6 +865,25 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     for (direct_syms.items) |gsym| {
         l.setModule(gsym.module);
         const sym = l.rmodule.symbols.items[@intFromEnum(gsym.id)];
+        // §11.7: an `extern function` is a declaration. It keeps its FuncId (so
+        // `call` resolves normally) but carries the RAW symbol name — module
+        // qualification would rename the very symbol we mean to import.
+        if (ctx.extern_fns.get(gsym.pack())) |ext_name| {
+            const shape = ctx.func_sigs.get(gsym.pack()).?;
+            try l.out.funcs.append(gpa, .{
+                .name = try gpa.dupe(u8, ext_name),
+                .param_types = try gpa.dupe(TypeId, shape.params),
+                .result = shape.result,
+                .is_fallible = false,
+                .is_extern = true,
+                .err_ty = ctx.void_id,
+                .blocks = &.{},
+                .entry = @enumFromInt(0),
+                .insts = .{},
+                .extra = &.{},
+            });
+            continue;
+        }
         const nm = try moduleQualified(gpa, gsym.module, root, sym.name);
         defer gpa.free(nm);
         const f = try l.lowerFunction(gsym, &.{}, nm);

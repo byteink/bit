@@ -130,6 +130,10 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     var main_void = false;
     var have_main = false;
     for (module.funcs.items) |*f| {
+        // §11.7: a declaration, not a definition — emit no code and, decisively,
+        // leave it OUT of `defined` so every call to it stays an undefined
+        // symbol the linker resolves (Mach-O: a libSystem import).
+        if (f.is_extern) continue;
         var fc = try x64.compileFunction(gpa, module, f, .sysv);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -323,6 +327,10 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     var main_void = false;
     var have_main = false;
     for (module.funcs.items) |*f| {
+        // §11.7: a declaration, not a definition — emit no code and, decisively,
+        // leave it OUT of `defined` so every call to it stays an undefined
+        // symbol the linker resolves (Mach-O: a libSystem import).
+        if (f.is_extern) continue;
         var fc = try arm64.compileFunction(gpa, module, f);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -399,6 +407,10 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module) Error![]u8 {
     var main_void = false;
     var have_main = false;
     for (module.funcs.items) |*f| {
+        // §11.7: a declaration, not a definition — emit no code and, decisively,
+        // leave it OUT of `defined` so every call to it stays an undefined
+        // symbol the linker resolves (Mach-O: a libSystem import).
+        if (f.is_extern) continue;
         var fc = try arm64.compileFunction(gpa, module, f);
         defer fc.deinit();
         const off: u64 = code.items.len;

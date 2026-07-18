@@ -566,6 +566,10 @@ fn rebuild(gpa: Allocator, f: *const ir.Function, known: []const ?ConstVal, bloc
     // reads them to gate the prologue/epilogue and back-edge safepoints.
     out.is_naked = f.is_naked;
     out.is_nosplit = f.is_nosplit;
+    // §11.7: likewise. optimizeModule skips extern declarations outright, so
+    // this is belt-and-braces — but the field defaults to false, so dropping it
+    // here would silently turn a declaration back into an empty definition.
+    out.is_extern = f.is_extern;
     return out;
 }
 
@@ -819,6 +823,10 @@ fn inlineCalls(gpa: Allocator, module: *const ir.Module, fid: ir.FuncId) !ir.Fun
     // reads them to gate the prologue/epilogue and back-edge safepoints.
     out.is_naked = f.is_naked;
     out.is_nosplit = f.is_nosplit;
+    // §11.7: likewise. optimizeModule skips extern declarations outright, so
+    // this is belt-and-braces — but the field defaults to false, so dropping it
+    // here would silently turn a declaration back into an empty definition.
+    out.is_extern = f.is_extern;
     return out;
 }
 
@@ -851,6 +859,8 @@ pub fn optimizeModule(gpa: Allocator, module: *ir.Module, level: Level) !void {
     if (level == .o0) return;
     var i: usize = 0;
     while (i < module.funcs.items.len) : (i += 1) {
+        // §11.7: an extern declaration has no blocks to optimize.
+        if (module.funcs.items[i].is_extern) continue;
         try runPipeline(gpa, module, @enumFromInt(i));
     }
 }

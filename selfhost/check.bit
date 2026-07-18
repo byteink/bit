@@ -46,6 +46,10 @@ struct Checker {
   // Free-function name -> its FuncDecl node, so a generic call can substitute
   // its type parameters from the argument types at the call site.
   funcDecls: map<string, int>,
+  // SPEC 11.7: free-function name -> true when it is an `extern function`. This
+  // is what tells lowering to emit a declaration carrying the RAW symbol name
+  // instead of a module-qualified definition.
+  externFns: map<string, bool>,
   // Type-parameter name -> its constraint interface type, so a method call on a
   // constrained generic value `s.area()` (s: T, `T: Shape`) resolves via Shape.
   typeParamConstraints: map<string, int>,
@@ -175,6 +179,7 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     diags: newDiagnostics(sm), files: [f], fileStarts: [0],
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
+    externFns: map<string, bool>{},
     typeParamConstraints: map<string, int>{},
     declTypeNodes: map<string, int>{},
     typeDecls: map<string, int>{}, genericParamIds: map<int, []int>{},
@@ -195,6 +200,15 @@ function topDeclName(c: Checker, node: int): string {
     }
     let nm = getNode(c.tree, k[1])
     return c.source[nm.span.start:nm.span.end]
+  }
+  // SPEC 11.7: an extern decl carries its name at kid 0 (there is no receiver).
+  if (n.tag == Tag.ExternFnDecl) {
+    let k = kidsOf(c.tree, node)
+    if (k[0] == 0) {
+      return ""
+    }
+    let en = getNode(c.tree, k[0])
+    return c.source[en.span.start:en.span.end]
   }
   if (n.tag == Tag.StructDecl || n.tag == Tag.EnumDecl || n.tag == Tag.InterfaceDecl ||
       n.tag == Tag.TypeAlias) {
@@ -220,6 +234,15 @@ function collectExports(c: Checker) {
     }
     i = i + 1
   }
+}
+
+// SPEC 11.7: an `extern function` node is [name, params, result_or_none] — three
+// kids — where a FuncDecl is [recv, name, generics, params, result, body(, attrs)].
+// Every reader that indexes a FuncDecl's kid 2/3/4 must branch on the tag first
+// or it runs off the end of the kid list. An extern is never generic and never
+// has a receiver, so the generic paths simply bail on one.
+function isExternDecl(t: Tree, decl: int): bool {
+  return getNode(t, decl).tag == Tag.ExternFnDecl
 }
 
 // The checker whose tree holds `name`'s declaration: this one, unless `name` was
@@ -265,10 +288,44 @@ function moduleQualified(mod: int, root: int, base: string): string {
   return "m${mod}\$${base}"
 }
 
+// SPEC 11.7: the raw external symbol `name` binds to, or "" when `name` is not
+// an `extern function`. Mirrors declOwner's local-shadows-import rule so the
+// answer always comes from the module that actually declares the name.
+function externSymbolOf(c: Checker, name: string): string {
+  for (k, _) of c.funcDecls {
+    if (k == name) {
+      let (_, local) = c.externFns[name]
+      if (local) {
+        return name
+      }
+      return ""
+    }
+  }
+  let (o, ok) = c.importedFrom[name]
+  if (!ok || o.module < 0 || o.module >= len(c.mods)) {
+    let (_, here) = c.externFns[name]
+    if (here) {
+      return name
+    }
+    return ""
+  }
+  let (_, remote) = c.mods[o.module].externFns[o.name]
+  if (remote) {
+    return o.name
+  }
+  return ""
+}
+
 // The link name for a call to `name` from `c`: an imported name resolves to its
 // DEFINING module's prefix under its ORIGINAL spelling, so neither the caller's
 // module nor a local alias reaches the object file.
 function callQualified(c: Checker, root: int, name: string): string {
+  // SPEC 11.7: an extern symbol is NEVER module-qualified — the raw name is
+  // precisely the symbol the linker must import from the dylib.
+  let ext = externSymbolOf(c, name)
+  if (ext != "") {
+    return ext
+  }
   // A locally-declared function shadows a same-named prelude/import (§17.5), so
   // it links against THIS module's symbol — the same prefix its definition gets
   // (they share a module). Consulting the import first mis-qualifies a local
@@ -367,7 +424,7 @@ function scrutineeTypeArgs(c: Checker, node: int): []int {
       // An imported decl's nodes index its own module's tree; a generic
       // instance read from it would not be resolvable here anyway, so only a
       // locally-declared callee contributes a result node.
-      if (decl != 0 && declOwner(c, cname).moduleId == c.moduleId) {
+      if (decl != 0 && !isExternDecl(c.tree, decl) && declOwner(c, cname).moduleId == c.moduleId) {
         tnode = kidsOf(c.tree, decl)[4]
       }
     } else if (callee.tag == Tag.Member) {
@@ -413,7 +470,7 @@ function scrutineeTypeArgNodes(c: Checker, node: int): []int {
       // An imported decl's nodes index its own module's tree; a generic
       // instance read from it would not be resolvable here anyway, so only a
       // locally-declared callee contributes a result node.
-      if (decl != 0 && declOwner(c, cname).moduleId == c.moduleId) {
+      if (decl != 0 && !isExternDecl(c.tree, decl) && declOwner(c, cname).moduleId == c.moduleId) {
         tnode = kidsOf(c.tree, decl)[4]
       }
     }
@@ -774,6 +831,9 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
   // against this module's tree is an out-of-range panic at best and a silently
   // unrelated node at worst.
   let oc = declOwner(c, name)
+  if (isExternDecl(oc.tree, decl)) {
+    return -1 // SPEC 11.7: never generic
+  }
   let dk = kidsOf(oc.tree, decl)
   if (dk[2] == 0 || dk[4] == 0) {
     return -1 // not generic, or no declared result: the plain path handles it
@@ -813,6 +873,9 @@ function isGenericFunc(c: Checker, name: string): bool {
   // The decl may belong to an imported module, whose node indices only mean
   // anything in ITS tree.
   let oc = declOwner(c, name)
+  if (isExternDecl(oc.tree, decl)) {
+    return false // SPEC 11.7: never generic
+  }
   let gp = kidsOf(oc.tree, decl)[2]
   return gp != 0 && len(kidsOf(oc.tree, gp)) > 0
 }
@@ -979,6 +1042,9 @@ function genericTypeArgs(c: Checker, name: string, callNode: int): []int {
   }
   // The decl's nodes belong to its own module's tree (see declOwner).
   let oc = declOwner(c, name)
+  if (isExternDecl(oc.tree, decl)) {
+    return out // SPEC 11.7: never generic
+  }
   let dk = kidsOf(oc.tree, decl)
   let tps = kidsOf(oc.tree, dk[2])
   let params = kidsOf(oc.tree, dk[3])
@@ -2291,6 +2357,23 @@ function collectFuncDecl(c: Checker, node: int) {
   }
 }
 
+// SPEC 11.7: records an `extern function`'s signature exactly like a free
+// function's, so call sites type-check through the ordinary path, plus the
+// extern marker lowering reads. There is no body and no receiver.
+function collectExternFnDecl(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [name, params, result_or_none]
+  paramTypeIds(c, kids[1])
+  let rty = c.ctx.voidId
+  if (kids[2] != 0) {
+    rty = typeFromNode(c, kids[2])
+  }
+  let nm = getNode(c.tree, kids[0])
+  let fname = c.source[nm.span.start:nm.span.end]
+  c.funcResults[fname] = rty
+  c.funcDecls[fname] = node
+  c.externFns[fname] = true
+}
+
 // Builds the `(params)=>result` func-type id for every free function, method, and
 // interface method, filling funcSigs/methodSigs. Runs AFTER the collect pass so a
 // sig wrapper's id lands past every named type (the seed mints these lazily, at
@@ -2313,6 +2396,14 @@ function buildSignatures(c: Checker) {
       } else {
         c.funcSigs[fname] = sig
       }
+    } else if (n.tag == Tag.ExternFnDecl) {
+      let ek = kidsOf(c.tree, m) // [name, params, result_or_none]
+      let erty = c.ctx.voidId
+      if (ek[2] != 0) {
+        erty = typeFromNode(c, ek[2])
+      }
+      let enn = getNode(c.tree, ek[0])
+      c.funcSigs[c.source[enn.span.start:enn.span.end]] = funcTypeFromParams(c, ek[1], erty)
     } else if (n.tag == Tag.InterfaceDecl) {
       let iname = declName(c, m)
       let sigs = kidsOf(c.tree, kidsOf(c.tree, m)[2])
@@ -2361,6 +2452,8 @@ function checkModule(c: Checker) {
       declTypeOf(c, declName(c, m))
     } else if (mt == Tag.FuncDecl) {
       collectFuncDecl(c, m)
+    } else if (mt == Tag.ExternFnDecl) {
+      collectExternFnDecl(c, m)
     }
     m = m + 1
   }

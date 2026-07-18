@@ -457,6 +457,12 @@ pub const Function = struct {
     /// is part of the IR dump, so an attr-less corpus stays byte-identical.
     is_naked: bool = false,
     is_nosplit: bool = false,
+    /// §11.7 `extern function`: a declaration, not a definition. `name` is the
+    /// raw external symbol (never module-qualified) and there is no body, so the
+    /// optimizer, codegen and object emitter all skip it — leaving every call to
+    /// it as a relocation against a symbol this object does not define, which is
+    /// exactly what makes the Mach-O linker bind it as a libSystem import.
+    is_extern: bool = false,
     err_ty: TypeId,
     blocks: []const BasicBlock,
     entry: BlockId,
@@ -1330,9 +1336,16 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
 pub fn dump(gpa: Allocator, module: *const Module) ![]u8 {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
-    for (module.funcs.items, 0..) |*f, idx| {
-        if (idx > 0) try out.writer.writeAll("\n");
+    var printed: usize = 0;
+    for (module.funcs.items) |*f| {
+        // §11.7: an extern declaration has no body to render. The self-hosted
+        // compiler resolves direct calls by NAME and so materializes no function
+        // for one at all; skipping here keeps the two compilers' IR dumps
+        // byte-identical for a program that uses `extern function`.
+        if (f.is_extern) continue;
+        if (printed > 0) try out.writer.writeAll("\n");
         try dumpFunction(&out.writer, module, f);
+        printed += 1;
     }
     return gpa.dupe(u8, out.written());
 }

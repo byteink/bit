@@ -95,6 +95,8 @@ pub const Code = enum(u16) {
     naked_fn_invalid = 74,
     nosplit_calls_allocating = 75,
     unknown_attribute = 76,
+    extern_fn_invalid = 77,
+    extern_unsupported_target = 78,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {

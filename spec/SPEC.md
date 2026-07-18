@@ -436,7 +436,7 @@ result_type   = type .            (* may carry the fallible marker, §18 *)
 - Named `function` declarations **require** type annotations on every parameter
   and (unless void) on the result. This keeps checking modular and diagnostics
   precise. Type inference applies to `let`/`const` initializers and to arrow
-  function bodies (§11.7), not to named-function signatures.
+  function bodies (§12.8), not to named-function signatures.
 - A variadic parameter (`...name: T`) must be last; inside the body it has type
   `[]T`. At a call site the caller passes zero or more `T` arguments, or spreads a
   `[]T` with `...` (§12.4).
@@ -775,6 +775,62 @@ function addAsm(a: int, b: int): int {
 A block-local label (an intra-`asm` branch target, as a context switch needs) is
 **not yet supported**; it requires a relocation pass over the block's own code
 and is deliberately left out of this first cut.
+
+### 11.7 External Functions (unmanaged subset)
+
+`extern function` binds a Bit name to an external symbol resolved at **link
+time** from a dynamic library. Like `*T`, the atomics and `asm`, it exists for
+the **unmanaged subset** the runtime is written against — on macOS the runtime
+must reach the kernel through libSystem, because Apple does not guarantee stable
+syscall numbers and reserves the right to renumber them.
+
+```
+extern_fn_decl = "extern" "function" IDENT signature .
+```
+
+- `extern` is a **contextual** keyword — an ordinary identifier everywhere else.
+  It is unambiguous here because an identifier can never begin a declaration.
+- There is **no body**, no receiver, no generic parameters, and no variadic
+  parameter (a variadic C function needs per-call ABI classification this path
+  does not implement). **E0077** `extern_fn_invalid` otherwise.
+- The declaration may be `export`ed like any other, and calls to it type-check
+  against the declared signature exactly like a normal function's.
+
+```
+extern function getpid(): i32
+extern function getentropy(buf: *u8, n: i64): i32
+
+function main() {
+  print("${getpid()}\n")
+}
+```
+
+**The ABI is C.** These are plain `callconv(.c)` calls, emitted through the same
+path and the same argument marshalling as the runtime primitives in
+`runtime/ABI.md` — a Bit direct call and a runtime call already share one
+emitter, and an extern call is that same emitter given a raw symbol name.
+
+**Only C-representable types cross the boundary.** Every parameter and the
+result must be a scalar (integer, float, or bool) or a raw pointer (§11.4); the
+result may also be void. Every other Bit type is either GC-managed (`string`,
+slices, maps, interfaces, closures) or has a layout C does not share, and
+nothing on this path marshals — the value would be handed over raw and misread.
+**E0077** otherwise. `ptrOf` (§11.5) is the bridge from a slice to a `*T`.
+
+**The symbol is never module-qualified.** An ordinary function is emitted as
+`m<id>$name` so two modules cannot collide; an extern's name *is* the symbol the
+linker must find, so it is used verbatim (with the platform's own decoration —
+Mach-O's leading underscore, so `getpid` links against `_getpid`).
+
+**macOS only.** The Mach-O output is a normal dynamically-linked image and its
+linker already binds any still-undefined global as a libSystem import, so an
+extern needs no new linker machinery. The ELF output is deliberately the
+opposite: a fully static binary with no interpreter, no dynamic symbol table and
+no libc, where an undefined symbol is an unresolvable link failure. Declaring an
+`extern function` while targeting Linux is therefore rejected up front with
+**E0078** `extern_unsupported_target` rather than failing inside the linker.
+Bit has no arch-conditional compilation, so a program that needs both paths uses
+`extern function` for Darwin and a raw syscall for Linux, not one source form.
 
 ---
 

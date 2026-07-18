@@ -454,6 +454,11 @@ pub const TypeContext = struct {
     /// structural closure types) so a decl-only flag never leaks into type
     /// identity. Absent entry = no attributes (§10.3.1).
     func_attrs: std.AutoHashMapUnmanaged(u64, FuncAttrs) = .{},
+    /// GlobalSymbol.pack() -> the external symbol name, for every `extern
+    /// function` (§11.7). Membership is what tells lowering to emit a direct
+    /// call to that raw, unqualified symbol and no body at all. Kept off
+    /// `FuncShape` for the same reason as `func_attrs`.
+    extern_fns: std.AutoHashMapUnmanaged(u64, []const u8) = .{},
     /// GlobalSymbol.pack() -> resolved type, for every top-level `const`. The
     /// only value binding memoized project-wide (a module's per-binding
     /// `var_types` dies with its `Checker`), so a dependent module can type a
@@ -548,6 +553,7 @@ pub const TypeContext = struct {
         self.decl_memo.deinit(self.gpa);
         self.func_sigs.deinit(self.gpa);
         self.func_attrs.deinit(self.gpa);
+        self.extern_fns.deinit(self.gpa);
         self.const_types.deinit(self.gpa);
         var mit = self.method_sets.valueIterator();
         while (mit.next()) |bucket| bucket.deinit(self.gpa);
@@ -1852,6 +1858,57 @@ const Checker = struct {
         try self.method_ctx.put(self.gpa, packFileNode(file_idx, idx), .{ .recv_ty = recv_ty, .env = env });
     }
 
+    /// Whether `ty` may cross the C ABI boundary (§11.7). A scalar passes in a
+    /// register and a raw pointer is an opaque word; every other Bit type is
+    /// either GC-managed (`string`, slices, maps, interfaces, closures) or has a
+    /// layout the C side does not share, and there is no marshalling anywhere on
+    /// this path — the value would be handed over raw and misread.
+    fn isCAbiType(self: *const Checker, ty: TypeId) bool {
+        return switch (self.ctx.typeOf(ty)) {
+            .prim => |p| p != .string,
+            .ptr => true,
+            else => false,
+        };
+    }
+
+    /// §11.7: binds a Bit name to an external symbol. The signature is recorded
+    /// exactly like a normal function's, so call sites type-check through the
+    /// ordinary path; only the C-ABI restriction and the extern marker are new.
+    fn collectExternFnDecl(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [name, params, result_or_none]
+        const gsym = self.nodeSymbol(file_idx, k[0]) orelse return;
+        const name = Checker.identText(mf, k[0]);
+        const env: GenericEnv = &.{}; // §11.7: no generic parameters by grammar
+
+        const param_nodes = mf.tree.kids(k[1]);
+        var params = try self.gpa.alloc(TypeId, param_nodes.len);
+        defer self.gpa.free(params);
+        for (param_nodes, 0..) |p_idx, i| {
+            const pk = mf.tree.kids(p_idx); // [name, type]
+            params[i] = try self.checkType(file_idx, pk[1], env);
+            // A variadic C function (printf) needs per-call ABI classification
+            // this path does not implement; a Bit `...T` would silently pass a
+            // slice header instead.
+            if (mf.tree.get(p_idx).tag == .param_rest) {
+                try self.emit(mf, p_idx, .extern_fn_invalid, "extern function '{s}' cannot be variadic", .{name}, null);
+            } else if (params[i] != .invalid and !self.isCAbiType(params[i])) {
+                try self.emit(mf, pk[1], .extern_fn_invalid, "extern function '{s}' parameter must be a scalar or a raw pointer", .{name}, "the C ABI has no representation for a GC-managed Bit value");
+            }
+        }
+        const result = if (k[2] != ast.none) try self.checkResultTypeNode(file_idx, k[2], env) else self.ctx.void_id;
+        if (k[2] != ast.none and result != .invalid and !self.isCAbiType(result)) {
+            try self.emit(mf, k[2], .extern_fn_invalid, "extern function '{s}' must return void, a scalar, or a raw pointer", .{name}, null);
+        }
+
+        try self.ctx.func_sigs.put(self.gpa, gsym.pack(), .{
+            .params = try dupe(self.ctx.arena(), TypeId, params),
+            .variadic = false,
+            .result = result,
+        });
+        try self.ctx.extern_fns.put(self.gpa, gsym.pack(), name);
+    }
+
     fn collectTopDecl(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
         const mf = self.files[file_idx];
         const exported = mf.tree.get(idx).tag == .@"export";
@@ -1862,6 +1919,7 @@ const Checker = struct {
                 _ = try self.declTypeOf(gsym);
             },
             .func_decl => try self.collectFuncDecl(file_idx, inner, exported),
+            .extern_fn_decl => try self.collectExternFnDecl(file_idx, inner),
             .let_decl, .const_decl => {
                 for (mf.tree.kids(inner)) |binding_idx| {
                     const bk = mf.tree.kids(binding_idx); // [pattern, type_or_none, init_or_none]

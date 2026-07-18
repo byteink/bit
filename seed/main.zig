@@ -160,6 +160,15 @@ const BuildTarget = enum {
         if (std.mem.eql(u8, s, "aarch64-macos") or std.mem.eql(u8, s, "arm64-macos")) return .aarch64_macos;
         return null;
     }
+
+    /// The CLI spelling, for diagnostics that name a target back to the user.
+    fn name(self: BuildTarget) []const u8 {
+        return switch (self) {
+            .x86_64_linux => "x86_64-linux",
+            .aarch64_linux => "aarch64-linux",
+            .aarch64_macos => "aarch64-macos",
+        };
+    }
 };
 
 /// The target matching the host this `bit` binary itself runs on — the default
@@ -612,6 +621,14 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
         if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
     }
 
+    {
+        var rejected = false;
+        for (0..n) |i| {
+            if (try rejectExternForTarget(&diags, project.module_files.items[i], target)) rejected = true;
+        }
+        if (rejected) return try renderFail(gpa, &diags, err_out);
+    }
+
     const inputs = try gpa.alloc(lower.ModuleInput, n);
     defer gpa.free(inputs);
     for (0..n) |i| inputs[i] = .{ .files = project.module_files.items[i], .checked = &checked[i], .rmodule = &project.modules.items[i] };
@@ -686,6 +703,8 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
     defer checked.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
+    if (try rejectExternForTarget(&diags, files, target)) return try renderFail(gpa, &diags, err_out);
+
     var module = try lower.lowerModule(gpa, &ctx, files, &checked, &rmodule);
     defer module.deinit();
     if (tests_out) |out| out.* = try testgen.injectTestMain(gpa, &module);
@@ -708,6 +727,33 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
             return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
         },
     }
+}
+
+/// §11.7: `extern function` binds a name to a symbol resolved from a dylib at
+/// load time, which only the Mach-O output has. Bit's ELF output is a fully
+/// static binary with no interpreter, no dynamic symbol table and no libc — an
+/// undefined symbol there is an unresolvable link failure, so this is rejected
+/// up front with a real diagnostic instead of failing deep inside the linker.
+///
+/// The gate lives here, not in the checker, because the checker is deliberately
+/// target-independent (it runs once and its output feeds every backend); this
+/// is the first point where the selected target and the AST are both in hand.
+/// Returns true if anything was rejected.
+fn rejectExternForTarget(diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget) !bool {
+    if (target == .aarch64_macos) return false;
+    var found = false;
+    for (files) |mf| {
+        for (mf.tree.kids(mf.tree.root)) |top| {
+            if (top == ast.none) continue;
+            const inner = if (mf.tree.get(top).tag == .@"export") mf.tree.kids(top)[0] else top;
+            if (mf.tree.get(inner).tag != .extern_fn_decl) continue;
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "'extern function' is not supported for target {s}", .{target.name()}) catch "'extern function' is not supported for this target";
+            try diags.report(.extern_unsupported_target, mf.tree.get(inner).span, msg, "only aarch64-macos links against a dylib; the Linux output is fully static");
+            found = true;
+        }
+    }
+    return found;
 }
 
 fn renderFail(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, err_out: *Io.Writer) !?[]u8 {

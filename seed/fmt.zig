@@ -725,6 +725,20 @@ const Printer = struct {
                 try self.raw(" ");
                 try self.printBodyBlock(k[5], true);
             },
+            // §11.7: `extern function name(params): T` — signature only, no body.
+            .extern_fn_decl => {
+                const k = self.kids(idx);
+                try self.raw("extern function ");
+                try self.printNode(k[0]);
+                const ret_text: ?[]u8 = if (k[2] != none) try self.renderFlat(k[2]) else null;
+                defer if (ret_text) |t| self.gpa.free(t);
+                self.next_list_tail = if (ret_text) |t| @intCast(t.len + ": ".len) else 0;
+                try self.printNode(k[1]);
+                if (ret_text) |t| {
+                    try self.raw(": ");
+                    try self.raw(t);
+                }
+            },
             .receiver => {
                 const k = self.kids(idx);
                 try self.printNode(k[0]);

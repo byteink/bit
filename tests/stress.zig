@@ -14,6 +14,7 @@
 //! against), mirroring the golden `// run` cases and the examples guard.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bit = @import("bit");
 const build_options = @import("build_options");
 
@@ -60,6 +61,17 @@ test "stress programs pass under default and BIT_GC=stress" {
 }
 
 fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const u8, libbitrt: []const u8) !void {
+    // A program that can only run on Darwin marks itself with a `darwin-only`
+    // file. `extern function` (SPEC §11.7) is the case that needs this: Bit's
+    // ELF output is a fully static binary with no dynamic symbol table, so an
+    // extern symbol has nothing to resolve against and the compiler rejects it
+    // outright — the program is not merely expected to fail, it cannot compile.
+    if (builtin.target.os.tag != .macos) {
+        const marker = try std.fmt.allocPrint(gpa, "{s}/darwin-only", .{dir_abs});
+        defer gpa.free(marker);
+        if (Dir.cwd().access(io, marker, .{})) |_| return else |_| {}
+    }
+
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
     const exe = (try bit.buildHostModule(gpa, io, dir_abs, libbitrt, &discard.writer)) orelse {

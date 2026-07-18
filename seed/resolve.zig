@@ -504,6 +504,12 @@ const Resolver = struct {
                     _ = try self.insertModuleSymbol(file_idx, name, .{ .name = identText(mf, name), .kind = .func, .decl = idx, .file_idx = @intCast(file_idx), .exported = forced_export });
                 }
             },
+            // §11.7: an external symbol binding. It joins the flat namespace as
+            // an ordinary callable — only its lowering differs.
+            .extern_fn_decl => {
+                const name = mf.tree.kids(idx)[0];
+                _ = try self.insertModuleSymbol(file_idx, name, .{ .name = identText(mf, name), .kind = .func, .decl = idx, .file_idx = @intCast(file_idx), .exported = forced_export });
+            },
             .struct_decl => {
                 const name = mf.tree.kids(idx)[0];
                 _ = try self.insertModuleSymbol(file_idx, name, .{ .name = identText(mf, name), .kind = .struct_type, .decl = idx, .file_idx = @intCast(file_idx), .exported = forced_export });
@@ -697,6 +703,7 @@ const Resolver = struct {
                 try self.resolveNode(file_idx, k[2], scope_id);
             },
             .func_decl => try self.resolveFuncDecl(file_idx, idx),
+            .extern_fn_decl => try self.resolveExternFnDecl(file_idx, idx),
             .struct_decl => try self.resolveStructDecl(file_idx, idx),
             .interface_decl => try self.resolveInterfaceDecl(file_idx, idx),
             .enum_decl => try self.resolveEnumDecl(file_idx, idx),
@@ -734,6 +741,17 @@ const Resolver = struct {
         }
         if (k[4] != ast.none) try self.resolveNode(file_idx, k[4], fn_scope);
         try self.resolveNode(file_idx, k[5], fn_scope);
+    }
+
+    /// §11.7: only the signature's type nodes need resolving — there is no body,
+    /// and the parameter names are documentation, never referenced.
+    fn resolveExternFnDecl(self: *Resolver, file_idx: usize, idx: ast.Index) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [name, params, result_or_none]
+        for (mf.tree.kids(k[1])) |p_idx| {
+            try self.resolveNode(file_idx, mf.tree.kids(p_idx)[1], self.module_scope);
+        }
+        if (k[2] != ast.none) try self.resolveNode(file_idx, k[2], self.module_scope);
     }
 
     fn resolveStructDecl(self: *Resolver, file_idx: usize, idx: ast.Index) Error!void {
