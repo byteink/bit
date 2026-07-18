@@ -818,9 +818,34 @@ function addAsm(a: int, b: int): int {
 }
 ```
 
-A block-local label (an intra-`asm` branch target, as a context switch needs) is
-**not yet supported**; it requires a relocation pass over the block's own code
-and is deliberately left out of this first cut.
+There are **no block-local labels** — the payload is pre-encoded machine code, so
+there is no assembler holding a symbol table to resolve a symbolic branch target
+against. That is a gap in *notation*, not in capability. A backend emits a
+block's words (arm64) or bytes (x64) contiguously and unmodified, in source
+order, and no later pass reorders, relaxes, or pads them, so a branch **within
+one block** is expressible today: the author hand-computes its PC-relative
+displacement, exactly as every other instruction in the payload is hand-encoded.
+A context switch's internal loop needs nothing beyond this.
+
+```
+// Multiply by repeated addition — the back edge is a displacement, not a label.
+// arm64: add x2, x2, x1 ; subs x0, x0, #1 ; b.ne -8   (back two words)
+arm64 { 0x8B010042, 0xF1000400, 0x54FFFFC1 }
+// x64:   add rdx, rcx   ; dec rax         ; jne -8    (back eight bytes)
+x64   { 0x48, 0x01, 0xCA, 0x48, 0xFF, 0xC8, 0x75, 0xF8 }
+```
+
+The displacement is the author's responsibility and is **not checked**: nothing
+verifies that it lands on an instruction boundary, or that it stays inside the
+block at all. This is the same bargain the rest of `asm` already strikes — the
+payload is opaque to every compiler pass (§10.3.1), and an author hand-encoding
+instructions is necessarily reasoning about what they do.
+
+Branching *out* of a block is the part that genuinely does not work: a target in
+another block, in surrounding Bit code, or in another function would need a
+relocation the compiler does not emit, and there is no supported way to spell
+one. Reaching other code from `asm` is what a `call` to a pinned symbol (§11.9)
+or an `extern function` (§11.7) is for.
 
 ### 11.7 External Functions (unmanaged subset)
 
