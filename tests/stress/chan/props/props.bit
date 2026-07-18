@@ -88,6 +88,11 @@ let obsSendAfterClose: i64 = -1
 let obsFull: i64 = 0
 let obsRecvAfterClose: i64 = -1
 let obsQueueOrder: i64 = 0
+let obsRaceArm: i64 = -1
+let obsRaceValue: i64 = -1
+let obsRaceStrayB: i64 = -1
+let obsUnlinkArm: i64 = -1
+let obsUnlinkValue: i64 = -1
 
 // Addresses resolved once on an ordinary thread, because `ptrOf` is rejected
 // inside a `@nosplit` body (#1421) and every task body here is `@nosplit`.
@@ -345,6 +350,151 @@ const nBlockedSend: int = 2
   let chA = taskAt(addrChanA)
   chanSend(chA, 7)
   schedTaskExit()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 — two channels racing to complete ONE select
+// ---------------------------------------------------------------------------
+//
+// This is the phase that pins `claim`, and it needed building because a mutation
+// said so: making `claim` return true unconditionally — defeating select's
+// winner-take-all rule entirely — passed every other check in this file.
+//
+// The reason nothing else reaches it is that `claim` only matters when a SECOND
+// channel tries to complete a select that a first channel has already won, and
+// that window is between the winning send and the select task actually resuming.
+// A single worker can hit that window exactly, without any timing hope, because
+// `schedFindWork` prefers the LOCAL ring over the global queue while
+// `schedUnpark` routes to the GLOBAL queue. So queueing both senders locally
+// before running the worker forces this order:
+//
+//   1. sender A runs, completes the select, unparks it TO THE GLOBAL QUEUE
+//   2. sender B runs next — it is on the local ring, which wins — while the
+//      select task is runnable but has NOT yet resumed, so its registration is
+//      still linked on B
+//   3. only then does the select task resume
+//
+// At step 2 `claim` must fail on B: the select is already won, so B must treat
+// the entry as though it had never been queued and put its value in the buffer.
+// With `claim` defeated, B instead overwrites the winner and tries to wake a
+// task that is already runnable.
+@nosplit function selectRaceBody() {
+  let cases = taskAt(addrCases)
+  *(cases + 0 * selCaseWords + 0) = chanDirRecv
+  *(cases + 0 * selCaseWords + 1) = addrChanA
+  *(cases + 0 * selCaseWords + 2) = 0
+  *(cases + 0 * selCaseWords + 3) = 0
+  *(cases + 1 * selCaseWords + 0) = chanDirRecv
+  *(cases + 1 * selCaseWords + 1) = addrChanB
+  *(cases + 1 * selCaseWords + 2) = 0
+  *(cases + 1 * selCaseWords + 3) = 0
+
+  let fired = chanSelect(cases, 2, false)
+  obsRaceArm = fired
+  obsRaceValue = *(cases + fired * selCaseWords + 2)
+  schedTaskExit()
+}
+
+@nosplit function sendA7Body() {
+  chanSend(taskAt(addrChanA), 7)
+  schedTaskExit()
+}
+
+@nosplit function sendB9Body() {
+  chanSend(taskAt(addrChanB), 9)
+  schedTaskExit()
+}
+
+export function phaseSelectRace(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+  chanInit(taskAt(addrChanB), int(ptrOf(bufArea)) + 8, 1, false, s)
+
+  if (!startTask(0, entryOf(selectRaceBody), 0)) {
+    return false
+  }
+  runWorker()
+
+  // Both senders on the LOCAL ring, so B runs before the woken select resumes.
+  if (!startTask(1, entryOf(sendA7Body), 0)) {
+    return false
+  }
+  if (!startTask(2, entryOf(sendB9Body), 0)) {
+    return false
+  }
+  runWorker()
+
+  // B's value must be sitting in B's buffer: it was NOT delivered to the select,
+  // which A had already won.
+  obsRaceStrayB = chanCount(taskAt(addrChanB))
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 — a select must unlink its losing registrations
+// ---------------------------------------------------------------------------
+//
+// The other mutation that survived the first suite: deleting the unlink loop at
+// the end of `chanSelect` changed nothing, because no phase ever reused a
+// waiter node afterwards.
+//
+// Reuse is exactly what makes it matter here, and more so than in `chan.zig`.
+// There the nodes live on the returning stack frame, so a stale queue entry is a
+// dangling pointer. Here they live in the task's own stack scratch, which
+// SURVIVES — so a stale entry from select #1 still points at a real node, and
+// when select #2 reuses that node and resets the shared `done` word to 0, the
+// stale registration becomes claimable again. A channel select #2 never
+// mentioned can then complete it, and report an arm index that select #2 does
+// not even have.
+//
+// So: select #1 on {A, B} is won by A; select #2 then waits on B alone. A send
+// on B must complete select #2's own registration and report arm 0. With the
+// unlink gone, select #1's stale node for B sits ahead of it in the queue and
+// reports arm 1.
+@nosplit function selectTwiceBody() {
+  let cases = taskAt(addrCases)
+  *(cases + 0 * selCaseWords + 0) = chanDirRecv
+  *(cases + 0 * selCaseWords + 1) = addrChanA
+  *(cases + 0 * selCaseWords + 2) = 0
+  *(cases + 0 * selCaseWords + 3) = 0
+  *(cases + 1 * selCaseWords + 0) = chanDirRecv
+  *(cases + 1 * selCaseWords + 1) = addrChanB
+  *(cases + 1 * selCaseWords + 2) = 0
+  *(cases + 1 * selCaseWords + 3) = 0
+  chanSelect(cases, 2, false)
+
+  // Select #2: channel B only, so the only legal answer is arm 0.
+  *(cases + 0 * selCaseWords + 0) = chanDirRecv
+  *(cases + 0 * selCaseWords + 1) = addrChanB
+  *(cases + 0 * selCaseWords + 2) = 0
+  *(cases + 0 * selCaseWords + 3) = 0
+  let fired = chanSelect(cases, 1, false)
+  obsUnlinkArm = fired
+  obsUnlinkValue = *(cases + fired * selCaseWords + 2)
+  schedTaskExit()
+}
+
+export function phaseSelectUnlink(): bool {
+  let s = taskAt(addrSched)
+  chanInit(taskAt(addrChanA), int(ptrOf(bufArea)), 1, false, s)
+  chanInit(taskAt(addrChanB), int(ptrOf(bufArea)) + 8, 1, false, s)
+
+  if (!startTask(0, entryOf(selectTwiceBody), 0)) {
+    return false
+  }
+  runWorker()
+
+  // Wins select #1; the task then resumes and parks again inside select #2.
+  if (!startTask(1, entryOf(sendA7Body), 0)) {
+    return false
+  }
+  runWorker()
+
+  if (!startTask(2, entryOf(sendB9Body), 0)) {
+    return false
+  }
+  runWorker()
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +914,9 @@ export function phaseRegistry(): int {
 // 1024  the root-scanning cursor saw the traced channel and skipped the other
 // 2048  a receive arriving on an already-closed channel got (zero, false)
 // 4096  a wait queue is FIFO across simultaneous waiters
-export const propsTotal: int = 8191
+// 8192  a second channel could not complete a select another had already won
+//16384  a select unlinked its losing registrations before returning
+export const propsTotal: int = 32767
 
 export function propsVerdict(): int {
   let mask = 0
@@ -813,6 +965,15 @@ export function propsVerdict(): int {
   let q = ptrOf(queueOrder)
   if (obsQueueOrder == 1 && *q == 1 && *(q + 1) == 201 && *(q + 2) == 202 && *(q + 3) == 203) {
     mask = mask | 4096
+  }
+
+  // The loser of a two-channel race must not have been delivered: B's 9 is
+  // still in B's buffer, and the select reported A's 7 on arm 0.
+  if (obsRaceArm == 0 && obsRaceValue == 7 && obsRaceStrayB == 1) {
+    mask = mask | 8192
+  }
+  if (obsUnlinkArm == 0 && obsUnlinkValue == 9) {
+    mask = mask | 16384
   }
   return mask
 }
