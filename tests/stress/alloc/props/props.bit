@@ -1,0 +1,255 @@
+// Shared property checks for the page providers of the Stage-2 port of
+// runtime/alloc.zig (#1362).
+//
+// The portable half of the port is covered by `../alloc.bit`, which drives the
+// real allocator over a slice-backed arena and so runs on every target. What it
+// CANNOT cover is the piece that is genuinely per-platform: actually getting
+// pages from the kernel. `runtime/alloc/linux` does that with a raw 6-argument
+// `mmap` syscall (§11.8) and `runtime/alloc/darwin` with a libSystem `mmap`
+// call (§11.7), and those two cannot appear in one module — so the driver is
+// split into `../../alloclinux` and `../../allocdarwin`, and everything they
+// assert lives HERE, shared verbatim, so the two platforms are held to an
+// identical standard and cannot drift.
+//
+// The provider is taken as a function value rather than imported, which is what
+// lets one copy of the properties serve both platforms (the same shape
+// `../../rand/props` uses for its entropy source).
+//
+// Six properties. The first three are about the pages themselves; the last
+// three run the REAL allocator on REAL kernel memory, which is the end-to-end
+// path a shipped `libbitrt.a` will take and the only place a page-provider bug
+// and an allocator bug can interact.
+//
+//   P1  PAGE SIZE is a power of two and at least 4096. Not cosmetic: the
+//       allocator rounds every direct-mapped request up to it, and Darwin's
+//       16384 differs from Linux's 4096, so a provider that guessed would be
+//       caught here.
+//
+//   P2  A MAPPING IS REAL AND WRITABLE. The returned address is non-zero and
+//       page-aligned, and every 4096th byte across the whole span is written
+//       and read back. A provider that returned a plausible-looking address it
+//       never mapped (mis-tested errno, wrong flags) faults or mismatches here
+//       rather than corrupting the heap later.
+//
+//   P3  TWO MAPPINGS DO NOT OVERLAP, and the second survives writing the first.
+//       This is what makes span carving safe.
+//
+//   P4  THE ALLOCATOR RUNS ON REAL PAGES: a churn of allocate/write/verify/free
+//       against spans fetched from the kernel, with a unique sentinel per live
+//       allocation that must still be intact at free time. Identical in spirit
+//       to `../alloc.bit`'s churn, but every byte is kernel memory.
+//
+//   P5  COUNTERS ARE EXACT over that churn: `liveBytes` returns to 0 and
+//       `mappedBytes` equals exactly the spans that were mapped.
+//
+//   P6  UNMAP SUCCEEDS for every span taken, and is rejected for a null
+//       request. Returning the pages is what keeps a long-lived process from
+//       growing without bound, and a silent failure is invisible otherwise.
+
+import {
+  allocSpanBytes, heapWords, allocClassify, allocLargeLen,
+  heapInit, heapLiveBytes, heapMappedBytes,
+  heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked,
+  heapLargeAllocLocked, heapLargeFreeLocked,
+} from "../../../../runtime/alloc"
+import { spinAcquire, spinRelease, spinUnlocked } from "../../../../runtime"
+
+// One span is consumed per size class on that class's first allocation, and
+// the churn's size range (1..1500) spans 23 distinct classes, so the cap must
+// clear that with headroom or the churn starves and P4 fails.
+const MAX_SPANS = 32
+const RING = 64
+const CHURN = 4000
+
+// All six properties passed: P1|P2|P3|P4|P5|P6 = 1|2|4|8|16|32.
+// A bitmask rather than a count so a failure names the property that broke.
+export function pageTotal(): int { return 63 }
+
+// The `*i64` addressing the 8-aligned word at `addr`.
+function wordAt(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + (addr / 8)
+}
+
+// Is `n` a power of two?
+function isPow2(n: int): bool {
+  if (n <= 0) { return false }
+  return (n & (n - 1)) == 0
+}
+
+// Span bookkeeping: addresses of the spans handed to the heap, so P6 can give
+// every one of them back.
+function spanTake(mapFn: (int) => int, spans: []i64, count: []i64): int {
+  if (count[0] >= MAX_SPANS) { return 0 }
+  let s = mapFn(allocSpanBytes)
+  if (s == 0) { return 0 }
+  spans[count[0]] = s
+  count[0] = count[0] + 1
+  return s
+}
+
+// The composed allocator entry point over real kernel pages. The lock is held
+// across the whole operation including the page map, exactly as the Zig holds
+// it across its refill mmap.
+function heapAlloc(h: *i64, lk: *i32, mapFn: (int) => int, ps: int,
+                   spans: []i64, count: []i64, size: int, alignment: int): int {
+  spinAcquire(lk)
+  let addr = 0
+  let idx = allocClassify(size, alignment)
+  if (idx < 0) {
+    let m = mapFn(allocLargeLen(size, ps))
+    if (m != 0) {
+      heapLargeAllocLocked(h, size, allocLargeLen(size, ps))
+      addr = m
+    }
+  } else {
+    addr = heapTakeSmallLocked(h, idx, size)
+    if (addr == 0) {
+      let span = spanTake(mapFn, spans, count)
+      if (span != 0) {
+        heapRefillLocked(h, idx, span)
+        addr = heapTakeSmallLocked(h, idx, size)
+      }
+    }
+  }
+  spinRelease(lk)
+  return addr
+}
+
+function heapFree(h: *i64, lk: *i32, ps: int, addr: int, size: int, alignment: int) {
+  spinAcquire(lk)
+  let idx = allocClassify(size, alignment)
+  if (idx < 0) {
+    heapLargeFreeLocked(h, size, allocLargeLen(size, ps))
+  } else {
+    heapGiveSmallLocked(h, addr, idx, size)
+  }
+  spinRelease(lk)
+}
+
+// Runs every property against the supplied page provider; returns the number
+// that passed as a bitmask (compare against `pageTotal()`).
+export function pageProps(mapFn: (int) => int, unmapFn: (int, int) => bool,
+                          pagesize: () => int): int {
+  let mask = 0
+
+  // ---- P1: page size ------------------------------------------------------
+  let ps = pagesize()
+  if (ps >= 4096 && isPow2(ps)) { mask = mask | 1 }
+
+  // ---- P2: a mapping is real, aligned and writable -------------------------
+  let one = mapFn(allocSpanBytes)
+  let p2 = 0
+  if (one != 0 && one % ps == 0) {
+    // Touch every 4096th byte across the span and read it back.
+    let ok = 1
+    let off = 0
+    while (off < allocSpanBytes) {          // bounded: allocSpanBytes/4096 steps
+      let w = wordAt(one + off)
+      *w = off + 12345
+      off = off + 4096
+    }
+    off = 0
+    while (off < allocSpanBytes) {
+      let w = wordAt(one + off)
+      let got = *w
+      if (got != off + 12345) { ok = 0 }
+      off = off + 4096
+    }
+    p2 = ok
+  }
+  if (p2 == 1) { mask = mask | 2 }
+
+  // ---- P3: two mappings are disjoint --------------------------------------
+  let two = mapFn(allocSpanBytes)
+  let p3 = 0
+  if (two != 0 && one != 0) {
+    let disjoint = 0
+    if (two + allocSpanBytes <= one || one + allocSpanBytes <= two) { disjoint = 1 }
+    // The first span's pattern must survive mapping and writing the second.
+    let w2 = wordAt(two)
+    *w2 = 999
+    let w1 = wordAt(one)
+    let still = *w1
+    if (disjoint == 1 && still == 12345) { p3 = 1 }
+  }
+  if (p3 == 1) { mask = mask | 4 }
+  let probeOk = unmapFn(one, allocSpanBytes) && unmapFn(two, allocSpanBytes)
+
+  // ---- P4/P5: the real allocator over real pages ---------------------------
+  let hbuf = []i64(heapWords)
+  let h = ptrOf(hbuf)
+  let lbuf = []i32(1)
+  let lk = ptrOf(lbuf)
+  atomicStore(lk, spinUnlocked)
+  heapInit(h)
+
+  let spans = []i64(MAX_SPANS)
+  let count = []i64(1)
+  count[0] = 0
+
+  let ringAddr = []i64(RING)
+  let ringSize = []i64(RING)
+  let ringTag = []i64(RING)
+  let intact = 0
+  let checked = 0
+  let churnOk = 1
+
+  let n = 0
+  while (n < CHURN) {                       // bounded: CHURN iterations
+    let slot = n % RING
+    let old = ringAddr[slot]
+    if (old != 0) {
+      let w = wordAt(old)
+      let seen = *w
+      checked = checked + 1
+      if (seen == ringTag[slot]) { intact = intact + 1 }
+      heapFree(h, lk, ps, old, ringSize[slot], 8)
+      ringAddr[slot] = 0
+    }
+    let sz = 1 + (n * 37) % 1500
+    let addr = heapAlloc(h, lk, mapFn, ps, spans, count, sz, 8)
+    if (addr == 0) {
+      churnOk = 0                           // exhausted: never deref
+    } else {
+      if (addr % 8 != 0) { churnOk = 0 }
+      let tag = n * 2654435761 + 7
+      let w2 = wordAt(addr)
+      *w2 = tag
+      ringAddr[slot] = addr
+      ringSize[slot] = sz
+      ringTag[slot] = tag
+    }
+    n = n + 1
+  }
+  let d = 0
+  while (d < RING) {                        // bounded: RING iterations
+    let old = ringAddr[d]
+    if (old != 0) {
+      let w = wordAt(old)
+      let seen = *w
+      checked = checked + 1
+      if (seen == ringTag[d]) { intact = intact + 1 }
+      heapFree(h, lk, ps, old, ringSize[d], 8)
+      ringAddr[d] = 0
+    }
+    d = d + 1
+  }
+
+  if (churnOk == 1 && checked == CHURN && intact == CHURN) { mask = mask | 8 }
+  if (heapLiveBytes(h) == 0 && heapMappedBytes(h) == count[0] * allocSpanBytes) {
+    mask = mask | 16
+  }
+
+  // ---- P6: every span goes back, and a null request is refused -------------
+  let unmapOk = 1
+  let u = 0
+  while (u < count[0]) {                    // bounded: MAX_SPANS iterations
+    if (!unmapFn(spans[u], allocSpanBytes)) { unmapOk = 0 }
+    u = u + 1
+  }
+  if (unmapFn(0, allocSpanBytes)) { unmapOk = 0 }   // null must be refused
+  if (unmapOk == 1 && probeOk) { mask = mask | 32 }
+
+  return mask
+}

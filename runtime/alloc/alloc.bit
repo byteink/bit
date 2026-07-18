@@ -1,0 +1,303 @@
+// Runtime memory allocator: size-class segregated free lists over OS pages.
+//
+// Stage-2 port of runtime/alloc.zig (#1362). Both exist during the port; #1369
+// retires the Zig original. Every size class, the free-list shape, the carve
+// order and the byte counters match the Zig exactly — the collector is layered
+// directly on this heap (gc.zig calls `alloc`/`free`/`liveBytes`), so a "tidier"
+// layout the GC does not expect is silent heap corruption, not a style choice.
+//
+// Free contract, unchanged from the Zig: `free` receives the same `size` and
+// `alignment` that `alloc` was called with. That is how the GC calls it (object
+// sizes live in GC headers), so there are no per-object headers here and no
+// address->span lookup table.
+//
+// NOT PART OF THE ABI. `runtime/ABI.md` names no allocator symbol: the Zig
+// `Heap` is an internal type reached through `gc.zig` and `root.zig`'s `g_heap`,
+// and the only allocation symbol codegen emits is `bit_rt_gc_alloc`, which is
+// the collector's entry point (§6), not this one. Nothing here is therefore
+// `@symbol`-pinned, and nothing here changes ABI.md.
+//
+// ---------------------------------------------------------------------------
+// THE PLATFORM SEAM — the one structural deviation from the Zig, and why
+// ---------------------------------------------------------------------------
+//
+// `alloc.zig` calls `mapPages`/`unmapPages` (mmap/munmap) inline. This module
+// CANNOT, and the constraint is spec-level rather than a matter of taste:
+//
+//   - `syscall` (§11.8) is Linux-only; compiling one for a Darwin target is a
+//     hard error at object-emission time.
+//   - `extern function` (§11.7) is Darwin-only; declaring one while targeting
+//     Linux is E0078 at check time.
+//   - Both fire on the DECLARATION, even when the code is never called
+//     (verified both ways), so no `hostTarget()` branch can carry both paths.
+//   - SPEC §11.7 states the rule outright: "Bit has no arch-conditional
+//     compilation, so a program that needs both paths uses `extern function`
+//     for Darwin and a raw syscall for Linux, not one source form."
+//
+// A module is a DIRECTORY (§17.1), so the split is by directory — the same
+// shape `runtime/rand` uses for its entropy source (#1368):
+//
+//   runtime/alloc/          this file: the portable allocator, no platform code
+//   runtime/alloc/linux/    mapPages/unmapPages via raw mmap/munmap syscalls
+//   runtime/alloc/darwin/   mapPages/unmapPages via libSystem mmap/munmap
+//
+// The core does not import either one. The platform modules are independent
+// leaves, and the CONSUMER binds the pair it wants — so this file compiles
+// unchanged for every target, and a per-target `libbitrt.a` archives the core
+// plus exactly one page provider.
+//
+// PAGES ARE THEREFORE SUPPLIED BY THE CALLER, not fetched inline: `refill`
+// takes a span address rather than calling mmap itself. All the allocator's
+// policy — size classes, classification, alignment, the free-list shape, span
+// carving, the byte counters — lives here; only the page fetch crosses out.
+//
+// LOCK DISCIPLINE. Consequently every mutating function here is a `...Locked`
+// form: THE CALLER MUST HOLD THE HEAP LOCK. That is what keeps the port
+// faithful — the Zig holds its lock across the refill mmap (`acquire(); defer
+// release();` spans the whole of `alloc`), and the composed entry point does
+// exactly the same, so a page map still happens inside the critical section.
+// Splitting the lock instead would let two threads both find a class empty and
+// both map a span: benign for correctness, but it would silently double
+// `mappedBytes` under contention, and this port does not deviate on an
+// observable counter.
+//
+// THE LOCK ITSELF IS THE CALLER'S. The Zig embeds a `SpinLock` field in `Heap`
+// and default-initializes it; here the lock word is passed in as a `*i32`, the
+// shape `runtime/spinlock.bit` established. `heapInit` deliberately does NOT
+// touch it: a lock is owned by whoever can be holding it, and zeroing one from
+// the allocator would silently release a lock another worker holds. The caller
+// initializes its own lock word (`atomicStore(lk, spinUnlocked)`), which also
+// leaves this module with no imports at all.
+//
+// Everything is `@nosplit` (§10.3): the allocator must not allocate (it would
+// recurse into itself) and must not reach a safepoint (a collection triggered
+// while a worker holds the heap lock would deadlock against the very lock the
+// collector needs to sweep).
+//
+// ASSERTIONS ARE NOT PORTED, and that is forced rather than chosen. The Zig
+// checks four things the caller must honour:
+//
+//   alloc:      alignment != 0 and is a power of two
+//   allocLarge: alignment <= page size
+//   comptime:   spanBytes >= maxSmall  (every span holds >= 1 slot of every class)
+//   comptime:   classSizes[0] >= sizeof(Slot)  (a free slot holds the next-pointer)
+//
+// A `@nosplit` body cannot panic — `panic` is an out-of-line runtime call that
+// can allocate and reach a safepoint — so a failing check has nowhere to go,
+// and Bit has no compile-time assertion for the two comptime ones. They are
+// instead pinned as runtime properties by `tests/stress/alloc`: the power-of-two
+// class invariant (b) is what makes any supported alignment satisfiable, the
+// carve property (f) proves a span yields `spanBytes/classSize` >= 1 whole
+// slots, and class 0 being 8 bytes — exactly one machine word — is checked by
+// the same table properties. The GC is the only caller and always passes a
+// valid alignment, so nothing is lost beyond the debug aid.
+
+// --- Layout -----------------------------------------------------------------
+
+// Small-object size classes. Every power of two up to the largest class is
+// present, which guarantees any supported alignment (a power of two no larger
+// than `allocMaxSmall`) is itself a class, so a satisfying slot always exists.
+// Requests above the last class are direct-mapped by the caller.
+export const allocNumClasses: int = 37
+export const allocMaxSmall: int = 16384
+
+// Bytes pulled from the OS each time a size class runs dry. Kept >=
+// `allocMaxSmall` so every span holds at least one slot of every class.
+export const allocSpanBytes: int = 131072
+
+// The heap's state as a count of 8-byte words, so a caller can size the block:
+// two counters followed by one free-list head per class.
+export const heapWords: int = 39
+
+const heapLiveWord: int = 0
+const heapMappedWord: int = 1
+const heapListsWord: int = 2
+
+// Size of class `i`, the Bit form of the Zig's `class_sizes` table.
+//
+// The Zig is a literal array. Bit cannot index one here: a bracket literal is a
+// SLICE (a top-level `const` array is not a compile-time constant, E0064), and
+// slice indexing lowers to `bit_rt_slice_get`, which `@nosplit` rejects (E0075)
+// because it can allocate and reach a safepoint. So the table is computed.
+//
+// From index 4 up the table is four classes per octave — base, +1/4, +2/4, +3/4
+// — which is exactly `base + r * (base/4)` for `base = 64 << g`. The first four
+// entries predate that regular structure and are named outright.
+//
+// This is the one place the port replaces data with arithmetic, so it is the
+// one place a typo would be invisible: `scripts/alloc-difftable.sh` dumps all
+// 37 entries from BOTH implementations and diffs them, and the stress test
+// pins the same values independently.
+export @nosplit function allocClassSize(i: int): int {
+  if (i < 4) {
+    if (i == 0) { return 8 }
+    if (i == 1) { return 16 }
+    if (i == 2) { return 32 }
+    return 48
+  }
+  let g = (i - 4) / 4
+  let r = (i - 4) % 4
+  let base = 64 << g
+  return base + r * (base / 4)
+}
+
+// --- Pure helpers -----------------------------------------------------------
+
+// Round `n` up to a multiple of the power of two `a`. The Zig's mask form.
+export @nosplit function allocAlignUp(n: int, a: int): int {
+  return (n + a - 1) & ~(a - 1)
+}
+
+// A zero-byte request still consumes one page on the large path, as in the Zig.
+export @nosplit function allocNonZero(n: int): int {
+  if (n == 0) { return 1 }
+  return n
+}
+
+// Map a request to a size-class index, or -1 if it must be direct-mapped.
+// The Zig returns `?usize`; Bit has no optional int here, and -1 is not a valid
+// class index, so it carries "none" unambiguously.
+export @nosplit function allocClassify(size: int, alignment: int): int {
+  let needed = allocAlignUp(size, alignment)
+  if (needed > allocMaxSmall) { return -1 }
+  let i = 0
+  while (i < allocNumClasses) {          // bounded: <= allocNumClasses iterations
+    let cs = allocClassSize(i)
+    // `cs % alignment == 0` plus a page-aligned span base means every slot in
+    // the class is `alignment`-aligned.
+    if (cs >= needed && cs % alignment == 0) { return i }
+    i = i + 1
+  }
+  return -1                              // unreachable for alignment <= allocMaxSmall
+}
+
+// The `*i64` addressing the 8-aligned machine word at `addr`.
+//
+// `*i64` arithmetic scales by 8, so stepping that many elements off the null
+// pointer lands exactly on `addr` (§11.4). Every address this module fabricates
+// is a span base or a class-sized offset from one, and every class size is a
+// multiple of 8, so the division is always exact.
+@nosplit function allocWordAt(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + (addr / 8)
+}
+
+// --- Heap state -------------------------------------------------------------
+
+// Zero the heap block: null free lists and zeroed counters.
+//
+// The Zig gets this from field defaults (`Heap.init()` returns `.{}`). The
+// caller's block need not have started zeroed, so the stores are explicit.
+//
+// The lock word is NOT touched — see the header. It belongs to the caller, and
+// clearing a lock the allocator does not own would release it out from under a
+// holder.
+export @nosplit function heapInit(h: *i64) {
+  let i = 0
+  while (i < heapWords) {                // bounded: heapWords iterations
+    let w = h + i
+    *w = 0
+    i = i + 1
+  }
+}
+
+// Bytes handed to callers and not yet freed. Returns to 0 when every allocation
+// is freed — the leak metric the stress test checks.
+//
+// Read atomically and OFF the lock, matching the Zig: this is the collector's
+// growth trigger (`gc.zig` compares it against `next_gc_bytes` outside the
+// heap's critical section), so the read must never tear. Bit's atomics are
+// sequentially consistent where the Zig asks for `.monotonic` — strictly
+// stronger, never weaker, exactly as `runtime/spinlock.bit` already deviates.
+export @nosplit function heapLiveBytes(h: *i64): int {
+  let p = h + heapLiveWord
+  return atomicLoad(p)
+}
+
+// Total bytes currently mapped from the OS (spans + large allocations).
+export @nosplit function heapMappedBytes(h: *i64): int {
+  let p = h + heapMappedWord
+  return atomicLoad(p)
+}
+
+// --- Small path -------------------------------------------------------------
+
+// Pop one slot off class `idx`, or 0 when the class is empty and the caller
+// must map a span and call `heapRefillLocked`.
+//
+// CALLER MUST HOLD THE LOCK. The Zig's `allocSmall` refills inline; here the
+// empty case returns to the caller because only the caller can reach the OS.
+// `0` is safe as the empty sentinel: address 0 is the null page and can never
+// be a live slot.
+export @nosplit function heapTakeSmallLocked(h: *i64, idx: int, size: int): int {
+  let head = h + heapListsWord + idx
+  let addr = *head
+  if (addr == 0) { return 0 }
+  let slot = allocWordAt(addr)
+  *head = *slot                          // pop: head = slot.next
+  let live = h + heapLiveWord
+  let prev = atomicAdd(live, size)
+  return addr
+}
+
+// Push a slot back onto class `idx`. CALLER MUST HOLD THE LOCK.
+//
+// The intrusive next-pointer is written into the freed slot itself, which is
+// why `allocClassSize(0)` (8) must be >= one machine word — the Zig asserts
+// exactly this at comptime (`class_sizes[0] >= @sizeOf(Slot)`).
+export @nosplit function heapGiveSmallLocked(h: *i64, addr: int, idx: int, size: int) {
+  let head = h + heapListsWord + idx
+  let slot = allocWordAt(addr)
+  *slot = *head                          // push: slot.next = head
+  *head = addr
+  let live = h + heapLiveWord
+  let prev = atomicSub(live, size)
+}
+
+// Carve one fresh span of `allocSpanBytes` bytes at `spanAddr` into slots and
+// push them onto class `idx`. CALLER MUST HOLD THE LOCK.
+//
+// Slots are pushed in increasing address order, so the head ends on the HIGHEST
+// address — the Zig's order exactly. That is observable (it decides which
+// address the next `take` hands out), so it is preserved deliberately.
+export @nosplit function heapRefillLocked(h: *i64, idx: int, spanAddr: int) {
+  let cs = allocClassSize(idx)
+  let count = allocSpanBytes / cs        // >= 1 by the allocSpanBytes >= allocMaxSmall invariant
+  let head = h + heapListsWord + idx
+  let i = 0
+  while (i < count) {                    // bounded: <= allocSpanBytes / allocClassSize(0)
+    let addr = spanAddr + i * cs
+    let slot = allocWordAt(addr)
+    *slot = *head
+    *head = addr
+    i = i + 1
+  }
+  let mapped = h + heapMappedWord
+  let prev = atomicAdd(mapped, allocSpanBytes)
+}
+
+// --- Large path -------------------------------------------------------------
+
+// The mapped length a direct-mapped request of `size` occupies, given page size
+// `pageSize`. Split out from the accounting so the caller can map exactly this
+// many bytes and free exactly the same number back.
+export @nosplit function allocLargeLen(size: int, pageSize: int): int {
+  return allocAlignUp(allocNonZero(size), pageSize)
+}
+
+// Account a direct-mapped allocation of `size` bytes occupying `nbytes` mapped
+// bytes. CALLER MUST HOLD THE LOCK.
+export @nosplit function heapLargeAllocLocked(h: *i64, size: int, nbytes: int) {
+  let mapped = h + heapMappedWord
+  let pm = atomicAdd(mapped, nbytes)
+  let live = h + heapLiveWord
+  let pl = atomicAdd(live, size)
+}
+
+// Account the release of a direct-mapped allocation. CALLER MUST HOLD THE LOCK.
+export @nosplit function heapLargeFreeLocked(h: *i64, size: int, nbytes: int) {
+  let mapped = h + heapMappedWord
+  let pm = atomicSub(mapped, nbytes)
+  let live = h + heapLiveWord
+  let pl = atomicSub(live, size)
+}
