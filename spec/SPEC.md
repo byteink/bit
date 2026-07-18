@@ -487,8 +487,35 @@ rather than a call and so can neither allocate nor reach a safepoint. A declared
 function shadows a builtin of the same name here as everywhere else.
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
 slice and map construction, indexing, `append`, `spawn`, closures, channel
-operations, string interpolation, `asm` blocks, every other builtin, and any
-call through a value or interface (whose target is not knowable statically).
+operations, string interpolation, every other builtin, and any call through a
+value or interface (whose target is not knowable statically).
+
+An **`asm` block (§11.6) is permitted**, and is the one construct here admitted
+on assertion rather than on proof. Everything else on the allowlist is *proved*
+non-allocating by inspection — the atomics because they lower to inline
+instructions, a `@nosplit` callee because the same rule was enforced on its
+body. An `asm` payload is pre-encoded machine code, opaque to every compiler
+pass, so no such proof is possible: nothing stops the bytes from being a call
+into the allocator. The compiler accepts it because **the author has already
+asserted raw machine semantics by writing `asm` at all** — §11.6 exists solely
+for the handful of runtime sites that cannot be written in the language, and an
+author hand-encoding instructions is necessarily reasoning about what those
+instructions do. Requiring a *second* marker on the block would gate nothing the
+compiler can verify: an author willing to hide a call inside the payload would
+equally write the marker. It would be ceremony, not enforcement — so the rule is
+unconditional, with no per-block opt-in. This matches how Go admits assembly
+into `//go:nosplit` and how Rust admits `asm!` under `no_std`.
+
+The assertion is deliberately narrow. **Operand expressions are still checked**:
+an `input`'s value is ordinary Bit code the compiler *can* inspect, so it is
+subject to the same allowlist as any other expression, and an allocating call
+there is still E0075. Only the opaque payload is taken on trust — the trusted
+surface is exactly the part that cannot be reasoned about, and no larger.
+
+Without this rule the unmanaged subset would contradict itself: the GC's
+register snapshot and the scheduler's context switch are both `@nosplit` by
+nature *and* irreducibly `asm`, so the attribute could not be applied to the two
+functions it most exists for.
 
 Safety is transitive by induction rather than by whole-program analysis: each
 call site requires only that its own callee is `@nosplit`, and the same rule
@@ -767,6 +794,10 @@ ordinary identifiers everywhere else. Only `asm` itself is reserved.
 - `volatile` is accepted and documented for parity with the source being ported;
   an `asm` block is never dropped, hoisted, or deduplicated regardless.
 - An `input` value must be a register-width integer or a raw pointer (§11.4).
+- An `asm` block is permitted inside a `@nosplit` function (§10.3.1). Because
+  the payload is opaque, that admission rests on the author's assertion — the
+  block must genuinely neither allocate nor reach a safepoint. Its `input`
+  expressions remain subject to the `@nosplit` allowlist.
 
 ```
 // x0 = x1 + x2 on arm64; rax = rax + rcx on x64.

@@ -5075,7 +5075,9 @@ const Checker = struct {
     /// §10.3.1 @nosplit: a default-deny allowlist over the body. Every construct
     /// that could allocate or reach a safepoint (composite/slice/map literals,
     /// indexing, `append`, `spawn`, closures, string interpolation, channel ops,
-    /// and any call not to a nosplit function) is rejected with E0075.
+    /// and any call not to a nosplit function) is rejected with E0075. An `asm`
+    /// block is admitted on the author's assertion (§10.3.1), but its operand
+    /// expressions are still walked.
     fn checkNosplitFn(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(idx);
@@ -5139,6 +5141,19 @@ const Checker = struct {
                     return;
                 }
                 try self.nosplitWalk(file_idx, ck[2], caller, depth + 1); // args
+            },
+            .asm_stmt => {
+                // §10.3.1: an `asm` payload is pre-encoded machine code, opaque
+                // to every compiler pass. It is admitted on the author's
+                // assertion, not on proof — `asm` is already the unmanaged-subset
+                // marker (§11.6), so no second marker is required. The operand
+                // expressions, by contrast, are ordinary Bit code the compiler
+                // *can* inspect, so they stay subject to the allowlist: only the
+                // opaque part is taken on trust.
+                const ak = mf.tree.kids(node); // [x64, arm64, result?, clob_x64, clob_arm64, input...]
+                for (ak[5..]) |in_idx| {
+                    try self.nosplitWalk(file_idx, mf.tree.kids(in_idx)[2], caller, depth + 1);
+                }
             },
             else => try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' may not allocate or reach a safepoint here", .{caller}, "nosplit bodies allow only non-allocating arithmetic, control flow, and calls to other nosplit functions"),
         }
@@ -5709,6 +5724,66 @@ test "@nosplit rejects an allocating call and accepts an allocation-free leaf" {
         \\function helper(x: int): int { return x }
         \\@nosplit function a(x: int): int {
         \\  return helper(x)
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+}
+
+test "@nosplit admits an asm block but still checks its operands" {
+    const gpa = testing.allocator;
+
+    // §10.3.1: the payload is opaque, so it is admitted on the author's
+    // assertion. Without this the GC's register snapshot and the scheduler's
+    // context switch — both nosplit-by-nature and irreducibly asm — could not
+    // carry the attribute they most need.
+    try testing.expect(try checksClean(gpa,
+        \\@nosplit function addAsm(a: int, b: int): int {
+        \\  return asm {
+        \\    arm64 { 0x8B020020 }
+        \\    x64 { 0x48, 0x01, 0xC8 }
+        \\    result arm64 x0 x64 rax : int
+        \\    input arm64 x1 x64 rax = a
+        \\    input arm64 x2 x64 rcx = b
+        \\  }
+        \\}
+        \\function main() {}
+        \\
+    ));
+
+    // A bare asm statement (no result, no inputs) is equally fine.
+    try testing.expect(try checksClean(gpa,
+        \\@nosplit function barrier() {
+        \\  asm { arm64 { 0xD5033BBF } x64 { 0x90 } clobber x64 { memory } }
+        \\}
+        \\function main() {}
+        \\
+    ));
+
+    // The assertion is narrow: an `input` value is ordinary Bit code the
+    // compiler CAN inspect, so the allowlist still applies to it. An allocating
+    // call there is rejected exactly as it would be anywhere else in the body.
+    try testing.expect(try diagnosedCode(gpa,
+        \\function helper(): int { return 1 }
+        \\@nosplit function bad(): int {
+        \\  return asm {
+        \\    arm64 { 0x8B020020 }
+        \\    x64 { 0x48, 0x01, 0xC8 }
+        \\    result arm64 x0 x64 rax : int
+        \\    input arm64 x1 x64 rax = helper()
+        \\  }
+        \\}
+        \\function main() {}
+        \\
+    , .nosplit_calls_allocating));
+
+    // Mutation guard: admitting asm must not have turned the walk into an
+    // allow-all. The rejections the feature exists for still fire when an
+    // allocating construct sits beside a legal asm block.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@nosplit function bad() {
+        \\  asm { arm64 { 0xD503201F } x64 { 0x90 } }
+        \\  let s = []int(1)
         \\}
         \\function main() {}
         \\
