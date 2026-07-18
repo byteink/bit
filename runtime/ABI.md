@@ -419,6 +419,31 @@ fallible surface form), so codegen never checks a return value.
 
 ### Exported C symbols (all `bit_rt_*`, one process-wide runtime instance)
 
+**Standing rule for Bit-sourced runtime modules: every runtime function another
+module calls MUST be pinned with `@symbol("...")` (SPEC §11.9).** This is a
+structural requirement, not a style preference, and it is not optional for
+anything in the table below.
+
+The reason is `modulePrefix`: a non-root module's symbols are emitted as
+`m<id>$name`, where `<id>` is an ordinal the **importing** build assigns. The
+ordinal is therefore a property of the build that consumed the module, not of
+the module itself, so the same source compiled into two separately emitted
+objects gets two different names. `export` does not bypass this — it controls
+Bit-level visibility (may another module import the name), not the link-level
+symbol. Meanwhile code generation calls the runtime by fixed name (`bit_rt_alloc`,
+`bit_rt_safepoint`, ...). Without a pin, a Bit-sourced runtime module can never
+define the symbol the caller emits a reference to, and the archive members will
+not link.
+
+`@symbol` fixes the **name, not the retention**: a linker still dead-strips a
+definition nothing references. `export` and `@symbol` are independent and
+compose freely.
+
+Pins are validated by both compilers — E0079 `symbol_attr_invalid` (one
+string-literal argument, a C identifier, free non-generic functions only, C-ABI
+signature) and E0080 `duplicate_symbol` (project-wide: each pinned name must be
+defined exactly once).
+
 | Symbol               | Signature                                              |
 |-----------------------|--------------------------------------------------------|
 | `bit_rt_gc_alloc`     | `(info: *const TypeInfo) -> *u8` (§6)                  |
