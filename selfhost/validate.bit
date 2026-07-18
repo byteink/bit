@@ -170,10 +170,13 @@ function vAssignable(c: Checker, src: int, dst: int): bool {
   // type, so `nil` is its zero value, but `nil` has no method set and would fail
   // a satisfaction test against any non-empty interface.
   if (src == c.ctx.untypedNilId) { return vIsNilable(c, dst) }
-  // ponytail: an interface target is accepted unchecked. The seed gates it on
-  // `satisfies` (method-set matching) plus the struct-only rule (§14.3); neither
-  // is ported. Missing E0051 is a gap — guessing here would reject working code.
-  if (c.ctx.types[dst].kind == TypeKind.Interface) { return true }
+  // An interface target: the value must be storable behind an interface (a
+  // struct, another interface, or nil — §14.3) AND satisfy its method set.
+  // Mirrors check.zig's `assignable` interface branch. `nil` and `invalid` were
+  // already answered above, so this only decides real value types.
+  if (c.ctx.types[dst].kind == TypeKind.Interface) {
+    return vStorableInInterface(c, src) && vSatisfies(c, src, dst)
+  }
   // A type parameter on either side is accepted unchecked. Two decls that each
   // declare `<T>` get two distinct TypeParam ids, and `userTypes` keys them by
   // BARE NAME, so the last `<T>` in the module wins and an earlier decl's `T`
@@ -248,10 +251,32 @@ function vAssignableNode(c: Checker, node: int, src: int, dst: int): bool {
   return vAssignable(c, src, dst)
 }
 
-// Emits E0041 with rendered expected/found type names.
+// Only a struct (or another interface value, or nil) can be the concrete type
+// behind an interface — an interface value IS the receiver's object pointer
+// (ABI.md §2.1, §14.3), so a scalar has nothing to point to. Mirrors check.zig's
+// storableInInterface.
+function vStorableInInterface(c: Checker, src: int): bool {
+  if (src == 0 || src == c.ctx.untypedNilId) {
+    return true
+  }
+  let k = c.ctx.types[src].kind
+  return k == TypeKind.Struct || k == TypeKind.Interface || k == TypeKind.Invalid
+}
+
+// Emits E0041 with rendered expected/found type names. Every assignability
+// failure funnels through here, so this is the one place that explains the
+// struct-only interface rule (§14.3) — mirroring check.zig's `mismatch`, whose
+// generic "expected 'Any', found 'i64'" reads as nonsense for an empty interface
+// a scalar structurally "fits".
 function vMismatch(c: Checker, node: int, expected: int, found: int) {
   let en = typeName(c.ctx, expected)
   let fnd = typeName(c.ctx, found)
+  if (c.ctx.types[expected].kind == TypeKind.Interface && !vStorableInInterface(c, found)) {
+    report(c.diags, ecTypeMismatch, vSpan(c, node),
+      "cannot store '${fnd}' in interface '${en}': only a struct can be the concrete type behind an interface value",
+      "an interface value is the receiver's object pointer, so a non-struct has nothing to point to (§14.3)")
+    return
+  }
   reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node), "expected '${en}', found '${fnd}'")
 }
 
@@ -410,7 +435,12 @@ function vStmt(c: Checker, result: int, node: int, brk: int, loop: int, fallible
   if (t == Tag.Index) { vIndex(c, node) }
   if (t == Tag.TypeAssert) { vTypeAssert(c, node) }
   if (t == Tag.Assign) { vDestructure(c, node) }
+  if (t == Tag.Assign) { vAssignIface(c, node) }
   if (t == Tag.Binding) { vInferEnum(c, node) }
+  if (t == Tag.Binding) { vBindingIface(c, node) }
+  if (t == Tag.CompositeLit) { vCompositeIface(c, node) }
+  if (t == Tag.Call) { vCallArgIface(c, node) }
+  if (t == Tag.SendStmt) { vSendIface(c, node) }
   if (t == Tag.MatchStmt) { vMatch(c, node) }
   if (t == Tag.MatchStmt) { vMatchExpr(c, node) }
   if (t == Tag.BreakStmt && brk == 0) {
@@ -1054,6 +1084,173 @@ function vDestructure(c: Checker, node: int) {
   }
   reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node),
     "destructuring assignment needs a two-result form on the right: 'm[k]', '<- c', or 'iface.(T)'")
+}
+
+// ---- E0041 interface-scalar store: every path a value reaches an interface ---
+// slot (§14.3). The `return` site is already caught by vExpect (vAssignable now
+// gates an interface target on storable+satisfies); these walkers cover the
+// other slots the seed checks with the same `expect` — an annotated binding, a
+// plain assignment, a call argument, a struct/map/slice literal element, and a
+// channel send. Each stays NARROW: it fires only for a confidently-concrete,
+// non-storable (scalar) value against a confirmed interface target, emitting the
+// one special "cannot store" message. A storable-but-non-satisfying value is
+// left to vExpect's path, never re-judged here — porting general satisfaction
+// into every slot would risk the false positives vSatisfies edge cases invite.
+
+function vIfaceStore(c: Checker, valueNode: int, target: int) {
+  if (target == 0 || c.ctx.types[target].kind != TypeKind.Interface) {
+    return
+  }
+  let v = valueNode
+  if (getNode(c.tree, v).tag == Tag.Arg) {
+    v = kidsOf(c.tree, v)[0]
+  }
+  let ty = checkExprType(c, v)
+  if (ty == 0 || vMentionsInvalid(c, ty, 0) || vHasTypeParam(c, ty, 0)) {
+    return
+  }
+  if (!vStorableInInterface(c, ty)) {
+    report(c.diags, ecTypeMismatch, vSpan(c, v),
+      "cannot store '${typeName(c.ctx, ty)}' in interface '${typeName(c.ctx, target)}': only a struct can be the concrete type behind an interface value",
+      "an interface value is the receiver's object pointer, so a non-struct has nothing to point to (§14.3)")
+  }
+}
+
+// An annotated binding: a direct interface target `let a: Any = 5`, or a slice
+// literal's elements against a `[]Iface` annotation's element type.
+function vBindingIface(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pat, annotation, init]
+  let ann = kids[1]
+  let init = kids[2]
+  if (ann == 0 || init == 0 || getNode(c.tree, kids[0]).tag == Tag.TuplePat) {
+    return
+  }
+  let target = typeFromNode(c, ann)
+  if (target == 0) {
+    return
+  }
+  let tk = c.ctx.types[target].kind
+  if (tk == TypeKind.Interface) {
+    vIfaceStore(c, init, target)
+    return
+  }
+  if (tk == TypeKind.Slice && getNode(c.tree, init).tag == Tag.SliceLit) {
+    let elem = c.ctx.types[target].elem
+    for a of kidsOf(c.tree, init) {
+      vIfaceStore(c, a, elem)
+    }
+  }
+}
+
+// A composite literal `S{...}` / `map<K,V>{...}` / `[]T{...}`: each field / map
+// entry / element value against its declared slot type.
+function vCompositeIface(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0) {
+    return
+  }
+  let init = kids[1]
+  let tk = c.ctx.types[target].kind
+  if (tk == TypeKind.Struct) {
+    for fi of kidsOf(c.tree, init) {
+      if (getNode(c.tree, fi).tag != Tag.FieldInit) {
+        continue
+      }
+      let fk = kidsOf(c.tree, fi) // [name, expr]
+      let fnn = getNode(c.tree, fk[0])
+      let fname = c.source[fnn.span.start:fnn.span.end]
+      vIfaceStore(c, fk[1], structFieldLookup(c, "${target}." + fname))
+    }
+    return
+  }
+  if (tk == TypeKind.Map) {
+    let keyTy = c.ctx.types[target].mapKey
+    let valTy = c.ctx.types[target].mapVal
+    for me of kidsOf(c.tree, init) {
+      if (getNode(c.tree, me).tag != Tag.MapEntry) {
+        continue
+      }
+      let mk = kidsOf(c.tree, me) // [key, val]
+      vIfaceStore(c, mk[0], keyTy)
+      vIfaceStore(c, mk[1], valTy)
+    }
+    return
+  }
+  if (tk == TypeKind.Slice || tk == TypeKind.Array) {
+    let elem = c.ctx.types[target].elem
+    for a of kidsOf(c.tree, init) {
+      vIfaceStore(c, a, elem)
+    }
+  }
+}
+
+// A plain `=` assignment: each rhs against its lhs slot's type. Compound
+// assignments (`+=`, ...) are numeric and never store into an interface; the
+// two-result `(a, b) = ...` form is vDestructure's.
+function vAssignIface(c: Checker, node: int) {
+  if (getNode(c.tree, node).main != int(Kind.Eq)) {
+    return
+  }
+  let k = kidsOf(c.tree, node) // [lhs_list, rhs_list]
+  let lhs = kidsOf(c.tree, k[0])
+  let rhs = kidsOf(c.tree, k[1])
+  if (len(lhs) != len(rhs)) {
+    return
+  }
+  let i = 0
+  while (i < len(lhs)) {
+    if (getNode(c.tree, lhs[i]).tag != Tag.TuplePat) {
+      let lty = checkExprType(c, lhs[i])
+      if (lty != 0 && c.ctx.types[lty].kind == TypeKind.Interface) {
+        vIfaceStore(c, rhs[i], lty)
+      }
+    }
+    i = i + 1
+  }
+}
+
+// A free-function call's arguments against interface-typed parameters. Mirrors
+// vCall's resolution: a bare-ident, non-shadowed, non-generic user function
+// only — a generic's params carry bare `T` (skipped), and member/builtin callees
+// are the checker's own paths.
+function vCallArgIface(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let sp = getNode(c.tree, callee).span
+  let name = c.source[sp.start:sp.end]
+  if (envLookup(c, name) != 0) {
+    return
+  }
+  let decl = funcDeclLookup(c, name)
+  if (decl == 0) {
+    return
+  }
+  let owner = declOwner(c, name)
+  let dkids = kidsOf(owner.tree, decl) // [recv, name, generics, params, result, body]
+  if (dkids[2] != 0) {
+    return // generic: param types carry bare `T`
+  }
+  let params = kidsOf(owner.tree, dkids[3])
+  let args = kidsOf(c.tree, kids[2])
+  let i = 0
+  while (i < len(params) && i < len(args)) {
+    vIfaceStore(c, args[i], typeFromNode(owner, kidsOf(owner.tree, params[i])[1]))
+    i = i + 1
+  }
+}
+
+// A channel send `ch <- v`: the sent value against the channel's element type.
+function vSendIface(c: Checker, node: int) {
+  let k = kidsOf(c.tree, node) // [chan_expr, value_expr]
+  let chanTy = checkExprType(c, k[0])
+  if (chanTy == 0 || c.ctx.types[chanTy].kind != TypeKind.Chan) {
+    return
+  }
+  vIfaceStore(c, k[1], c.ctx.types[chanTy].elem)
 }
 
 // Validates one function's body. Called src `checkModule`'s sweep as it reaches
