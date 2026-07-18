@@ -884,7 +884,12 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
             });
             continue;
         }
-        const nm = try moduleQualified(gpa, gsym.module, root, sym.name);
+        // §11.9: `@symbol("name")` pins the link-level name. It bypasses module
+        // qualification entirely — the `m<id>$` ordinal is assigned by whichever
+        // build imports the module, so a qualified name is not stable enough to
+        // be the symbol codegen calls a runtime primitive by.
+        const pinned: ?[]const u8 = if (ctx.func_attrs.get(gsym.pack())) |fa| fa.symbol else null;
+        const nm = if (pinned) |p| try gpa.dupe(u8, p) else try moduleQualified(gpa, gsym.module, root, sym.name);
         defer gpa.free(nm);
         const f = try l.lowerFunction(gsym, &.{}, nm);
         try l.out.funcs.append(gpa, f);

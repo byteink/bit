@@ -365,7 +365,11 @@ const Parser = struct {
         return self.parseFuncDecl(attrs);
     }
 
-    /// `attr_list = attr { attr }`, `attr = "@" IDENT`. One or more `@name`.
+    /// `attr_list = attr { attr }`, `attr = "@" IDENT [ "(" string_lit ")" ]`.
+    /// One or more `@name`, each optionally carrying a single string argument
+    /// (§11.9 `@symbol("...")`). The argument child is ELIDED when absent, so a
+    /// bare `@naked`/`@nosplit` keeps the exact 1-child shape it had before
+    /// arguments existed and every attr-bearing dump stays byte-identical.
     fn parseAttrList(self: *Parser) ParseError!Index {
         const start = self.tok.span;
         var items: std.ArrayList(Index) = .empty;
@@ -375,7 +379,23 @@ const Parser = struct {
             const at_span = self.tok.span;
             try self.advance(); // '@'
             const name = try self.expectIdent();
-            try items.append(self.gpa, try self.tree.add(.attr, join(at_span, self.span(name)), 0, &.{name}));
+            if (self.tok.kind == .l_paren) {
+                try self.advance(); // '('
+                const arg = if (self.tok.kind == .string_lit) try self.leaf(.string_lit) else blk: {
+                    try self.fail("a string literal argument");
+                    break :blk none;
+                };
+                const close = try self.expect(.r_paren, "')'");
+                try items.append(self.gpa, try self.tree.add(.attr, join(at_span, close), 0, &.{ name, arg }));
+            } else {
+                try items.append(self.gpa, try self.tree.add(.attr, join(at_span, self.span(name)), 0, &.{name}));
+            }
+            // Both IDENT and `)` are ASI terminators (§7), so a newline after an
+            // attribute synthesizes a semicolon. An attribute list is only ever
+            // followed by another attribute or `function`, so a separator here
+            // can never be meaningful — drop it, which lets an attribute sit on
+            // its own line above the declaration it modifies.
+            while (self.tok.kind == .semicolon) try self.advance();
         }
         const kids = try items.toOwnedSlice(self.gpa);
         defer self.gpa.free(kids);

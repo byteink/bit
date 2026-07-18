@@ -185,6 +185,11 @@ pub const FuncShape = struct {
 pub const FuncAttrs = struct {
     naked: bool = false,
     nosplit: bool = false,
+    /// §11.9 `@symbol("name")`: the exact link-level symbol this function
+    /// defines. Non-null suppresses the `m<id>$` module prefix at lowering, so
+    /// the name is the same no matter which build imports the module — the
+    /// property a `bit_rt_*` runtime definition needs. Borrowed from source.
+    symbol: ?[]const u8 = null,
 };
 
 pub const TypeData = union(enum) {
@@ -454,6 +459,11 @@ pub const TypeContext = struct {
     /// structural closure types) so a decl-only flag never leaks into type
     /// identity. Absent entry = no attributes (§10.3.1).
     func_attrs: std.AutoHashMapUnmanaged(u64, FuncAttrs) = .{},
+    /// §11.9: pinned symbol name -> the GlobalSymbol that claimed it, project
+    /// wide. Two declarations pinning one name would emit two definitions of it
+    /// and the link would either fail or silently pick one, so the collision is
+    /// rejected here (E0080) where both declarations are still in view.
+    pinned_symbols: std.StringHashMapUnmanaged(u64) = .{},
     /// GlobalSymbol.pack() -> the external symbol name, for every `extern
     /// function` (§11.7). Membership is what tells lowering to emit a direct
     /// call to that raw, unqualified symbol and no body at all. Kept off
@@ -553,6 +563,7 @@ pub const TypeContext = struct {
         self.decl_memo.deinit(self.gpa);
         self.func_sigs.deinit(self.gpa);
         self.func_attrs.deinit(self.gpa);
+        self.pinned_symbols.deinit(self.gpa);
         self.extern_fns.deinit(self.gpa);
         self.const_types.deinit(self.gpa);
         var mit = self.method_sets.valueIterator();
@@ -1779,20 +1790,56 @@ const Checker = struct {
         return dupe(self.ctx.arena(), GenericBinding, bindings);
     }
 
+    /// Whether `s` spells a symbol name every supported object format can carry
+    /// verbatim (§11.9): the C identifier charset. Deliberately narrower than
+    /// what ELF/Mach-O technically permit — a name outside this set would still
+    /// assemble here but could not be named from C, which defeats the point,
+    /// and `$` in particular is how this compiler's own mangling is spelled.
+    fn isValidSymbolName(s: []const u8) bool {
+        if (s.len == 0) return false;
+        if (!std.ascii.isAlphabetic(s[0]) and s[0] != '_') return false;
+        for (s[1..]) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        }
+        return true;
+    }
+
     /// Resolves an `attr_list` node into flags, reporting E0076 for any name
-    /// other than `naked`/`nosplit` (§10.3.1). Neither v1 attribute takes args.
+    /// other than `naked`/`nosplit`/`symbol` (§10.3.1, §11.9). Only `@symbol`
+    /// takes an argument; the other two are rejected if given one.
     fn collectAttrs(self: *Checker, file_idx: usize, list_idx: ast.Index) Error!FuncAttrs {
         const mf = self.files[file_idx];
         var attrs: FuncAttrs = .{};
         for (mf.tree.kids(list_idx)) |a_idx| {
-            const ak = mf.tree.kids(a_idx); // [name_ident]
+            const ak = mf.tree.kids(a_idx); // [name_ident, arg_string_lit?]
             const name = Checker.identText(mf, ak[0]);
+            const arg: ast.Index = if (ak.len > 1) ak[1] else ast.none;
+            if (std.mem.eql(u8, name, "symbol")) {
+                if (arg == ast.none) {
+                    try self.emit(mf, ak[0], .symbol_attr_invalid, "attribute '@symbol' requires a string argument", .{}, "write @symbol(\"the_exported_name\")");
+                    continue;
+                }
+                // The raw literal minus its quotes. A symbol name has no use for
+                // escapes, and every escape introduces a `\`, which
+                // `isValidSymbolName` rejects — so no unescaping is needed.
+                const raw = Checker.identText(mf, arg);
+                const text = raw[1 .. raw.len - 1];
+                if (!isValidSymbolName(text)) {
+                    try self.emit(mf, arg, .symbol_attr_invalid, "'{s}' is not a valid symbol name", .{text}, "a symbol name must be a C identifier: a letter or '_' followed by letters, digits or '_'");
+                    continue;
+                }
+                attrs.symbol = text;
+                continue;
+            }
+            if (arg != ast.none) {
+                try self.emit(mf, arg, .symbol_attr_invalid, "attribute '@{s}' does not take an argument", .{name}, null);
+            }
             if (std.mem.eql(u8, name, "naked")) {
                 attrs.naked = true;
             } else if (std.mem.eql(u8, name, "nosplit")) {
                 attrs.nosplit = true;
             } else {
-                try self.emit(mf, ak[0], .unknown_attribute, "unknown attribute '@{s}'", .{name}, "the recognized attributes are @naked and @nosplit");
+                try self.emit(mf, ak[0], .unknown_attribute, "unknown attribute '@{s}'", .{name}, "the recognized attributes are @naked, @nosplit and @symbol");
             }
         }
         return attrs;
@@ -1833,7 +1880,9 @@ const Checker = struct {
         if (k.len > 6 and k[6] != ast.none) fattrs = try self.collectAttrs(file_idx, k[6]);
 
         if (!is_method) {
-            if (fattrs.naked or fattrs.nosplit)
+            if (fattrs.symbol) |sym|
+                try self.checkPinnedSymbol(file_idx, idx, gsym.?, sym, shape);
+            if (fattrs.naked or fattrs.nosplit or fattrs.symbol != null)
                 try self.ctx.func_attrs.put(self.gpa, gsym.?.pack(), fattrs);
             try self.ctx.func_sigs.put(self.gpa, gsym.?.pack(), shape);
             return;
@@ -1843,6 +1892,8 @@ const Checker = struct {
             try self.emit(mf, k[1], .naked_fn_invalid, "naked function '{s}' cannot be a method", .{Checker.identText(mf, k[1])}, null);
         if (fattrs.nosplit)
             try self.emit(mf, k[1], .nosplit_calls_allocating, "nosplit function '{s}' cannot be a method", .{Checker.identText(mf, k[1])}, null);
+        if (fattrs.symbol != null)
+            try self.emit(mf, k[1], .symbol_attr_invalid, "method '{s}' cannot pin a symbol name", .{Checker.identText(mf, k[1])}, "@symbol applies to free functions only");
 
         const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
         const recv_ty = try self.checkType(file_idx, rk[1], env);
@@ -1869,6 +1920,46 @@ const Checker = struct {
             .ptr => true,
             else => false,
         };
+    }
+
+    /// §11.9: validates a `@symbol("name")` pin and claims the name project
+    /// wide. A pinned function DEFINES the C symbol `name`, so its signature has
+    /// to be one the C ABI can actually carry — the same restriction
+    /// `extern function` (§11.7) applies to the consuming direction, since both
+    /// use the one shared C-ABI marshaller and neither marshals anything else.
+    fn checkPinnedSymbol(self: *Checker, file_idx: usize, idx: ast.Index, gsym: GlobalSymbol, sym: []const u8, shape: FuncShape) Error!void {
+        const mf = self.files[file_idx];
+        const k = mf.tree.kids(idx); // [recv, name, generics, params, result, body, attrs]
+        const name = Checker.identText(mf, k[1]);
+
+        // A generic function has no single body to give a single symbol: it is
+        // emitted once per instantiation, each needing a distinct name.
+        if (k[2] != ast.none) {
+            try self.emit(mf, k[1], .symbol_attr_invalid, "generic function '{s}' cannot pin a symbol name", .{name}, "each instantiation would need its own symbol");
+            return;
+        }
+        const param_nodes = mf.tree.kids(k[3]);
+        for (param_nodes, 0..) |p_idx, i| {
+            const pk = mf.tree.kids(p_idx); // [name, type]
+            if (mf.tree.get(p_idx).tag == .param_rest) {
+                try self.emit(mf, p_idx, .symbol_attr_invalid, "function '{s}' pinning a symbol cannot be variadic", .{name}, null);
+            } else if (shape.params[i] != .invalid and !self.isCAbiType(shape.params[i])) {
+                try self.emit(mf, pk[1], .symbol_attr_invalid, "parameter of '{s}' must be a scalar or a raw pointer to pin a symbol", .{name}, "the C ABI has no representation for a GC-managed Bit value");
+            }
+        }
+        // The raw result node is what is checked, so a fallible `T!E` (which
+        // returns through the thread-local error slot, not the C return
+        // register) fails this too — it is not a `prim` or a `ptr`.
+        if (k[4] != ast.none and shape.result != .invalid and !self.isCAbiType(shape.result)) {
+            try self.emit(mf, k[4], .symbol_attr_invalid, "'{s}' must return void, a scalar, or a raw pointer to pin a symbol", .{name}, null);
+        }
+
+        const gop = try self.ctx.pinned_symbols.getOrPut(self.gpa, sym);
+        if (gop.found_existing and gop.value_ptr.* != gsym.pack()) {
+            try self.emit(mf, k[6], .duplicate_symbol, "symbol '{s}' is already pinned by another declaration", .{sym}, "each pinned symbol name must be defined exactly once");
+            return;
+        }
+        gop.value_ptr.* = gsym.pack();
     }
 
     /// §11.7: binds a Bit name to an external symbol. The signature is recorded
@@ -5681,4 +5772,79 @@ test "an unrecognized attribute name is rejected" {
         \\function main() {}
         \\
     , .unknown_attribute));
+}
+
+test "@symbol pins a C-ABI free function and rejects everything else" {
+    const gpa = testing.allocator;
+
+    // Scalars and raw pointers cross the C ABI; an attribute may also sit on
+    // its own line above the declaration.
+    try testing.expect(try checksClean(gpa,
+        \\@symbol("bit_rt_demo")
+        \\function demo(a: i64, p: *byte): i64 {
+        \\  return a
+        \\}
+        \\function main() {}
+        \\
+    ));
+
+    // A pin needs its name, and the name must be a C identifier.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol function f() {}
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol("has-a-dash") function f() {}
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol("") function f() {}
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+
+    // A GC-managed parameter or result has no C representation, and there is no
+    // marshalling anywhere on this path.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol("bad_abi") function f(s: string) {}
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol("bad_abi") function f(): string { return "x" }
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+
+    // A generic function is emitted once per instantiation: no single name.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol("gen") function f<T>(x: T) {}
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+
+    // Free functions only.
+    try testing.expect(try diagnosedCode(gpa,
+        \\struct S { x: i64 }
+        \\@symbol("meth") function (s: S) m() {}
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+
+    // The attributes that take no argument say so.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@naked("x") function f(): int { return 1 }
+        \\function main() {}
+        \\
+    , .symbol_attr_invalid));
+
+    // One definition per pinned name.
+    try testing.expect(try diagnosedCode(gpa,
+        \\@symbol("dup_name") function f() {}
+        \\@symbol("dup_name") function g() {}
+        \\function main() {}
+        \\
+    , .duplicate_symbol));
 }

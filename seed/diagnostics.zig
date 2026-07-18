@@ -97,6 +97,8 @@ pub const Code = enum(u16) {
     unknown_attribute = 76,
     extern_fn_invalid = 77,
     extern_unsupported_target = 78,
+    symbol_attr_invalid = 79,
+    duplicate_symbol = 80,
 
     /// Numeric value used in `E%04d` rendering.
     pub fn number(self: Code) u16 {

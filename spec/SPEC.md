@@ -448,13 +448,19 @@ An attribute constrains how a function is compiled. Attributes precede
 
 ```
 attr_list     = attr { attr } .
-attr          = "@" IDENT .
+attr          = "@" IDENT [ "(" string_lit ")" ] .
 ```
 
-`export` stays outermost: `export @naked function f() {}`. Two attributes are
-recognized; any other name is an error (**E0076** `unknown_attribute`). Neither
-takes arguments. Both exist for the unmanaged subset the runtime is written
-against — ordinary Bit code should not need them.
+`export` stays outermost: `export @naked function f() {}`. An attribute list may
+also sit on its own line above the declaration it modifies; the semicolon
+automatic insertion would place there (§7) is not meaningful, because an
+attribute list is only ever followed by another attribute or `function`.
+
+Three attributes are recognized; any other name is an error (**E0076**
+`unknown_attribute`). Only `@symbol` (§11.9) takes an argument — giving one to
+`@naked` or `@nosplit` is **E0079** `symbol_attr_invalid`. All three exist for
+the unmanaged subset the runtime is written against — ordinary Bit code should
+not need them.
 
 **`@naked`** — the function gets no prologue and no epilogue, and returns
 through a bare machine `ret`. It runs on its caller's frame, so it must need no
@@ -895,6 +901,53 @@ function writeLine(buf: []int, n: int): int {
   return syscall(sysWrite(), 1, i64(ptrOf(buf)), n)
 }
 ```
+
+### 11.9 Pinned Symbols (unmanaged subset)
+
+The `@symbol("name")` attribute (§10.3.1) pins the exact link-level symbol a
+function definition emits, and constrains its signature to the C ABI. It is the
+mirror of `extern function` (§11.7): that one **consumes** an external symbol,
+this one **produces** one.
+
+```
+export @symbol("bit_rt_alloc")
+function alloc(size: i64): *byte { ... }
+```
+
+Ordinarily a function's emitted symbol carries its module's `m<id>$` prefix
+(§17), where `<id>` is an ordinal assigned by whichever build imports the module.
+That is fine for Bit-to-Bit calls, which resolve through the declaration, but it
+means an exported function has **no stable external name**. Code generation emits
+calls to the runtime by fixed name (`bit_rt_alloc`, `bit_rt_safepoint`, … — see
+`runtime/ABI.md`), so a runtime written in Bit could not define the symbols the
+compiler calls. A pinned symbol bypasses module qualification entirely and is
+emitted verbatim.
+
+Rules — **E0079** `symbol_attr_invalid` unless all hold:
+
+- the argument is a single string literal naming a **C identifier**: a letter or
+  `_` followed by letters, digits or `_`. Nothing else is portable across the
+  object formats, and `$` is how this compiler spells its own mangling;
+- it applies to a **free function** — not a method, not a type or a constant,
+  and not a generic function (each instantiation would need its own name);
+- the signature must cross the C ABI: every parameter and the result is a scalar
+  or a raw pointer (`*T`), and the function is not variadic. A fallible result
+  (`T!E`) returns through the thread-local error slot rather than the C return
+  register, so it is rejected too. This is the same restriction §11.7 applies in
+  the consuming direction, and for the same reason — one shared marshaller,
+  which marshals nothing else.
+
+Two declarations pinning the same name is **E0080** `duplicate_symbol`: both
+would define it, and the link would either fail or silently pick one.
+
+`@symbol` and `export` are independent and may be combined. `export` controls
+Bit-level visibility — whether another Bit module may import the name — while
+`@symbol` controls the link-level name; neither implies the other. The symbol is
+emitted with global binding into the object file either way, spelled per the
+platform's convention for a C symbol (Mach-O prefixes a leading underscore, so
+`@symbol("bit_rt_alloc")` appears as `_bit_rt_alloc`). As with any function, an
+executable's linker still dead-strips a definition nothing references; what is
+pinned is the name, not its retention.
 
 ---
 

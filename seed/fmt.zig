@@ -830,8 +830,16 @@ const Printer = struct {
                 try self.raw(" ");
             },
             .attr => {
+                const k = self.kids(idx);
                 try self.raw("@");
-                try self.printNode(self.kids(idx)[0]);
+                try self.printNode(k[0]);
+                // The argument child is elided when absent (§11.9), so a bare
+                // attribute prints exactly as it did before arguments existed.
+                if (k.len > 1) {
+                    try self.raw("(");
+                    try self.printNode(k[1]);
+                    try self.raw(")");
+                }
             },
             .fallible => {
                 const k = self.kids(idx);
