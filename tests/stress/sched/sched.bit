@@ -1,0 +1,326 @@
+// The green-thread context switch and the two run queues (#1364), exercised as
+// a real cooperative scheduler rather than as isolated unit assertions.
+//
+// WHAT THIS PROVES, AND WHY IT IS SHAPED THIS WAY. The switch is hand-encoded
+// machine code (SPEC §11.6) whose PC-relative displacements depend on the exact
+// instruction count of the block. Nothing in the compiler checks them: get one
+// wrong and the program branches into the middle of its own switch. So the
+// check that matters is not "does the encoding look right" but "do several
+// tasks, on separate stacks, actually run interleaved and come back with their
+// live registers intact". P1 is that end-to-end run; the rest pin the pieces.
+//
+//   P1  Round-robin interleave. Four tasks on four separate stacks each run
+//       three rounds, yielding between them. FIFO requeue means the trace must
+//       be 0123 0123 0123 — packed two bits per entry, so any reordering,
+//       dropped task or double-run changes the number.
+//
+//   P2  The callee-saved register file survives a switch. Sentinels are written
+//       into named physical registers, the task yields, and they are read back
+//       — 12 checks, one per yield. This is the property `sched.zig` gets from
+//       LLVM's clobber-driven spilling and this port must provide explicitly
+//       (see runtime/sched/sched.bit's header), so it is the one most likely to
+//       break silently. See `yieldTask` for why it cannot be written with
+//       ordinary locals.
+//
+//       MUTATION-TESTED, both architectures: dropping the x19 save/restore from
+//       the arm64 block, or the rbx save/restore from the x64 block, takes this
+//       count from 12 to 0 on the affected target (arm64 verified on
+//       aarch64-macos, x64 on real x86_64 hardware).
+//
+//       KNOWN LIMIT, measured rather than assumed. Perturbing the arm64 `adr`
+//       displacement BACKWARD by one instruction — so a resume lands on the
+//       block's own `br x3` — hangs, and is caught. Perturbing it FORWARD by
+//       one or two instructions is NOT caught, and the reason is structural:
+//       the resume point is followed by `ldr x29,[sp] ; ldr x30,[sp,#8] ; add
+//       sp,sp,#0x10 ; ret`, and the switch has ALREADY restored x29/x30 from
+//       the incoming context, so those two reloads are redundant and skipping
+//       them changes nothing. A forward slip that lands further out executes a
+//       neighbouring leaf and returns through the correctly restored x30. So
+//       the displacement is protected against undershoot but only weakly
+//       against overshoot; the encoding was verified by disassembly
+//       (`otool -tV`) rather than by this test alone.
+//
+//   P3  Deque ordering and edges — push/pop/steal all take from the oldest end,
+//       a full ring refuses, and a drained ring reports empty. `sched.zig`'s
+//       own `Deque` unit test, transcribed.
+//
+//   P4  Global queue FIFO, including the empty-queue answer and the
+//       tail-reset-on-drain that a naive unlink gets wrong.
+//
+// WHY THE TASK BODIES ARE `@nosplit`. Codegen emits a safepoint at every loop
+// back-edge, and a safepoint on a task stack would have the collector scan a
+// range it knows nothing about — these stacks are module-level arrays, not
+// mappings the runtime registered. Registering task stacks with the collector
+// is the scheduler REGISTRY's job (`sched.zig`'s `forEachOtherStack`), which is
+// not part of this commit, so until it lands a task body must reach no
+// safepoint. `@nosplit` is exactly that guarantee, checked at compile time
+// rather than hoped for. It is also why the bodies use pointer arithmetic
+// instead of indexing (§10.3 forbids indexing in a `@nosplit` body, E0075).
+//
+// Trace packing: 12 entries x 2 bits, first entry in the high bits.
+// 0123 0123 0123 base-4 = 0x1B1B1B = 1776411.
+
+import { schedSwitch, schedTaskInit, taskAt, taskArg } from "../../../runtime/sched"
+import { dqCapacity, dqInit, dqPushBottom, dqPopBottom, dqSteal } from "../../../runtime/sched"
+import { gqInit, gqPush, gqPop } from "../../../runtime/sched"
+
+const TASKS = 4
+const ROUNDS = 3
+const STACK_WORDS = 2048
+const STEP_LIMIT = 64
+
+// Task stacks, one contiguous block carved into `TASKS` slices. Module state is
+// statically allocated and untraced (§11.11), which is what a task stack must
+// be — the collector must never walk it as an object graph.
+let stacks: [8192]i64
+let tasks: [112]i64
+let queue: [258]i64
+let overflow: [3]i64
+let workerCtx: [22]i64
+
+// The task currently switched-to, and how it left the CPU. Both are read and
+// written only by the worker's own thread, so neither needs atomicity — the
+// same argument `sched.zig` makes for `Worker.next_disposition`.
+let current: i64 = 0
+let disposition: i64 = 0
+let trace: i64 = 0
+let checksum: i64 = 0
+
+// The worker context's address, resolved once in `main`.
+//
+// `ptrOf` is not on the `@nosplit` operand allowlist, so a task body cannot take
+// the address itself even though §11.11 says reaching module state is pure
+// arithmetic. Resolving it once outside and carrying the integer keeps the
+// bodies `@nosplit` — and it is what a real scheduler does anyway, since a task
+// reaches its worker through a stored pointer rather than a static name.
+let workerCtxAddr: i64 = 0
+
+const DISP_YIELD: int = 0
+const DISP_DONE: int = 1
+
+// Give the CPU back to the worker, staying runnable — and prove, across that
+// switch, that the callee-saved register file survived it.
+//
+// WHY THE SENTINELS ARE WRITTEN BY HAND. The first version of this test simply
+// held eight ordinary locals live across the yield and summed them afterwards.
+// That check was VACUOUS: mutation-testing it (dropping the x19 save/restore
+// from the switch) did not change the answer, because the allocator had spilled
+// those locals to the TASK'S OWN STACK, which the switch restores via `sp`
+// whether or not it preserves a single register. The test was measuring the
+// stack pointer, not the register file.
+//
+// So the sentinels go into named physical registers directly, and the seed, the
+// switch and the read-back all live in THIS ONE function — because §11.6's
+// exclusion is function-wide, naming x19/x20/x21 (rbx/r12/r13 on x64) here is
+// what stops this function's own allocator from using them. Nothing between the
+// two blocks can touch them, so the only code that can is the switch itself.
+//
+// Only three registers per architecture, not the whole file: a function
+// containing a call may allocate ONLY from the callee-saved subset
+// (seed/codegen/arm64.zig `buildIntRegs`), so excluding all of x19..x28 would
+// leave the allocator nothing to work with. Three is enough to catch a switch
+// that drops a slot, and this is now mutation-proven on both architectures.
+@nosplit function yieldTask(): int {
+  asm {
+    arm64 {
+      0xD2800273,                              // mov x19, #19
+      0xD2800294,                              // mov x20, #20
+      0xD28002B5                               // mov x21, #21
+    }
+    x64 {
+      0xBB, 0x03, 0x00, 0x00, 0x00,            // mov ebx, 3
+      0x41, 0xBC, 0x0C, 0x00, 0x00, 0x00,      // mov r12d, 12
+      0x41, 0xBD, 0x0D, 0x00, 0x00, 0x00       // mov r13d, 13
+    }
+    clobber arm64 { x19, x20, x21 }
+    clobber x64 { rbx, r12, r13 }
+  }
+
+  disposition = DISP_YIELD
+  schedSwitch(taskAt(current), taskAt(workerCtxAddr))
+
+  return asm {
+    arm64 {
+      0xAA1303E0,                              // mov x0, x19
+      0x8B140000,                              // add x0, x0, x20
+      0x8B150000                               // add x0, x0, x21
+    }
+    x64 {
+      0x48, 0x89, 0xD8,                        // mov rax, rbx
+      0x4C, 0x01, 0xE0,                        // add rax, r12
+      0x4C, 0x01, 0xE8                         // add rax, r13
+    }
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// What `yieldTask` must return if the switch preserved the sentinels:
+// 19+20+21 on arm64, 3+12+13 on x64.
+@nosplit function regsExpected(): int {
+  return asm {
+    arm64 { 0xD2800780 }                       // mov x0, #60
+    x64   { 0xB8, 0x1C, 0x00, 0x00, 0x00 }     // mov eax, 28
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// Leave for good. Never returns: the worker sees `DISP_DONE` and never queues
+// this task again, so nothing will ever switch back to it.
+@nosplit function finishTask() {
+  disposition = DISP_DONE
+  schedSwitch(taskAt(current), taskAt(workerCtxAddr))
+}
+
+// Every task runs this one body and recovers its identity from its own control
+// block, exactly as a real trampoline does — a task is entered by a plain
+// branch and so can take no arguments.
+@nosplit function taskEntry() {
+  let id = *(taskAt(current) + taskArg)
+  let r = 0
+  while (r < ROUNDS) {
+    trace = trace * 4 + id
+    // P2: one register-file check per yield, TASKS*ROUNDS = 12 in total.
+    if (yieldTask() == regsExpected()) {
+      checksum = checksum + 1
+    }
+    r = r + 1
+  }
+  finishTask()
+}
+
+// The worker loop: pop, run, requeue if still runnable. FIFO requeue (append at
+// the tail, take from the head) is what makes the interleave round-robin.
+//
+// Bounded by `STEP_LIMIT` rather than looping until the queue drains, so the
+// loop's termination is provable by reading it (Power of 10). TASKS*(ROUNDS+1)
+// = 16 switches are needed; the limit is comfortably above that, and a scheduler
+// that failed to retire its tasks would hit the bound and report a wrong trace
+// rather than hang.
+function runWorker() {
+  let q = ptrOf(queue)
+  let n = 0
+  while (n < STEP_LIMIT) {
+    let addr = dqPopBottom(q)
+    if (addr == 0) {
+      return
+    }
+    current = addr
+    schedSwitch(ptrOf(workerCtx), taskAt(addr))
+    if (disposition == DISP_YIELD) {
+      let requeued = dqPushBottom(q, addr)
+      if (!requeued) {
+        return
+      }
+    }
+    n = n + 1
+  }
+}
+
+// P3: `sched.zig`'s Deque test — ordering, the full edge, and the drained edge.
+function dequeProps(): int {
+  let q = ptrOf(queue)
+  dqInit(q)
+  let score = 0
+
+  if (dqPopBottom(q) == 0 && dqSteal(q) == 0) {
+    score = score + 1
+  }
+
+  // Addresses here are opaque non-zero tokens; the queue never dereferences
+  // them, so they need not be real task blocks. 0 is reserved for "empty",
+  // hence 8-byte-spaced tokens starting at 8.
+  let i = 0
+  let filled = 1
+  while (i < dqCapacity) {
+    if (!dqPushBottom(q, (i + 1) * 8)) {
+      filled = 0
+    }
+    i = i + 1
+  }
+  if (filled == 1 && !dqPushBottom(q, 999999)) {
+    score = score + 1
+  }
+
+  // Owner pop and steal both take the oldest entry.
+  if (dqPopBottom(q) == 8 && dqSteal(q) == 16) {
+    score = score + 1
+  }
+
+  let drained = 0
+  let k = 0
+  while (k <= dqCapacity) {
+    if (dqPopBottom(q) == 0) {
+      k = dqCapacity + 1
+    } else {
+      drained = drained + 1
+      k = k + 1
+    }
+  }
+  if (drained == dqCapacity - 2 && dqPopBottom(q) == 0) {
+    score = score + 1
+  }
+  return score
+}
+
+// P4: global-queue FIFO. Uses real task blocks because `gqPush`/`gqPop` link
+// through each task's own `next` word.
+function globalProps(): int {
+  let g = ptrOf(overflow)
+  gqInit(g)
+  let score = 0
+
+  if (gqPop(g) == 0) {
+    score = score + 1
+  }
+
+  let base = int(ptrOf(tasks))
+  let i = 0
+  while (i < 3) {
+    gqPush(g, base + i * 28 * 8)
+    i = i + 1
+  }
+
+  let inOrder = 1
+  let k = 0
+  while (k < 3) {
+    if (gqPop(g) != base + k * 28 * 8) {
+      inOrder = 0
+    }
+    k = k + 1
+  }
+  if (inOrder == 1) {
+    score = score + 1
+  }
+
+  // Draining must reset the tail, or the next push links onto a departed task.
+  if (gqPop(g) == 0) {
+    gqPush(g, base)
+    if (gqPop(g) == base && gqPop(g) == 0) {
+      score = score + 1
+    }
+  }
+  return score
+}
+
+function main() {
+  // P1/P2: build four tasks on four stacks and run them to completion.
+  let stackBase = int(ptrOf(stacks))
+  let taskBase = int(ptrOf(tasks))
+  workerCtxAddr = int(ptrOf(workerCtx))
+  let q = ptrOf(queue)
+  dqInit(q)
+
+  let i = 0
+  while (i < TASKS) {
+    let t = taskAt(taskBase + i * 28 * 8)
+    schedTaskInit(t, stackBase + i * STACK_WORDS * 8, STACK_WORDS * 8,
+                  entryOf(taskEntry), i)
+    let ok = dqPushBottom(q, taskBase + i * 28 * 8)
+    i = i + 1
+  }
+
+  runWorker()
+
+  // checksum: TASKS * ROUNDS = 12 register-file checks, all passing.
+  print("${trace} ${checksum} ${dequeProps()} ${globalProps()}\n")
+}
