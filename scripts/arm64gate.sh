@@ -37,7 +37,10 @@ IMAGE="bit-zig-0.16.0:latest"
 VOLUME="bit-zig-cache-arm64"
 # Wall-clock ceiling for one suite run. A hang must read as a failure, never as a
 # gate that sits forever looking busy.
-DEADLINE="${ARM64GATE_DEADLINE:-5400}"
+# 3h: a COLD run on a machine already loaded by other agents was measured at
+# >90min and still progressing, so a tighter ceiling kills good runs. The deadline
+# exists to catch a hang, not to enforce a performance budget.
+DEADLINE="${ARM64GATE_DEADLINE:-10800}"
 
 # macOS has no coreutils `timeout`; perl's alarm is the portable stand-in. A
 # missing tool must abort, never silently skip the deadline.
