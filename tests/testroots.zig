@@ -65,10 +65,20 @@ const swept_dirs = [_][]const u8{ "seed", "runtime" };
 /// #1438 audited the stress corpus on macOS and missed `tlsstate` because the
 /// host skipped it — an audit inherits its host's blind spot unless it says out
 /// loud what it did not look at.
+///
+/// "Out loud" is this table plus the failure report, not a line on every green
+/// build: printing it unconditionally made Zig tag a passing step `failed
+/// command:` (#1468). `unless_os` is mandatory so the disclosure is enforced
+/// rather than merely narrated.
 const Exception = struct {
     path: []const u8,
-    /// Only excused when the host is not this OS; empty means always excused.
-    unless_os: []const u8 = "",
+    /// The OS on which this file IS swept. Excused only on other hosts.
+    ///
+    /// Mandatory, and asserted below. An exception excused on every host is a
+    /// permanent coverage hole wearing the costume of a documented one — the
+    /// exact shape #1453 exists to prevent. Every excuse must name a host that
+    /// makes good on it.
+    unless_os: []const u8,
     why: []const u8,
 };
 const exceptions = [_]Exception{
@@ -154,7 +164,7 @@ fn hasTests(src: []const u8) bool {
 fn excusedReason(path: []const u8) ?[]const u8 {
     for (exceptions) |e| {
         if (!std.mem.eql(u8, e.path, path)) continue;
-        if (e.unless_os.len != 0 and std.mem.eql(u8, e.unless_os, build_options.host_os)) continue;
+        if (std.mem.eql(u8, e.unless_os, build_options.host_os)) continue;
         return e.why;
     }
     return null;
@@ -316,12 +326,19 @@ test "every test-bearing file under seed/ and runtime/ is collected by a wired r
 
     var orphans: std.ArrayList([]const u8) = .empty;
     defer orphans.deinit(gpa);
-    var excused: usize = 0;
+    // Excusals are recorded, not printed. A green build must write nothing to
+    // stderr: Zig's build runner tags any step that produced stderr with
+    // `failed command:`, so a chatty passing gate ends every green build with
+    // the word "failed" (#1468) and teaches the reader to skim past it. The
+    // disclosure #1438 asked for is preserved two ways that cost nothing when
+    // green — the excusals print inside the failure report below, and the
+    // "every excuse names a host that honours it" rule is asserted outright.
+    var excusals: std.ArrayList([]const u8) = .empty;
+    defer excusals.deinit(gpa);
 
     for (files.items) |file| {
         if (excusedReason(file)) |why| {
-            std.debug.print("testroots: not swept on this host: {s} ({s})\n", .{ file, why });
-            excused += 1;
+            try excusals.append(gpa, try std.fmt.allocPrint(gpa, "{s} ({s})", .{ file, why }));
             continue;
         }
         var covered = false;
@@ -339,20 +356,32 @@ test "every test-bearing file under seed/ and runtime/ is collected by a wired r
     if (orphans.items.len != 0) {
         std.debug.print(
             \\
-            \\testroots: {d} file(s) declare tests that NO wired test root collects.
-            \\Their tests pass standalone, read as coverage, and can never fail the
-            \\build. Wire each into build.zig's `test_roots` table — directly, or
-            \\via an anchor file if its relative imports need a wider module root.
+            \\testroots: {d} of {d} test-bearing file(s) declare tests that NO wired
+            \\test root collects. Their tests pass standalone, read as coverage, and
+            \\can never fail the build. Wire each into build.zig's `test_roots` table
+            \\— directly, or via an anchor file if its relative imports need a wider
+            \\module root.
             \\
-        , .{orphans.items.len});
+        , .{ orphans.items.len, files.items.len });
         for (orphans.items) |f| std.debug.print("  orphaned: {s}\n", .{f});
+        // What this host did NOT look at belongs in the failure report: an audit
+        // inherits its host's blind spot unless it says so out loud (#1438).
+        for (excusals.items) |e| std.debug.print("  not swept on this host: {s}\n", .{e});
+        std.debug.print("\n", .{});
         return error.OrphanedTestFile;
     }
+}
 
-    std.debug.print(
-        "testroots: {d} test-bearing file(s) all collected by {d} root(s); {d} excused.\n",
-        .{ files.items.len - excused, build_options.roots.len, excused },
-    );
+test "every excuse names a host that honours it" {
+    // An exception with no `unless_os` would be excused everywhere, covering
+    // nothing on every host while reading as a documented, bounded gap. The
+    // field is non-optional so this cannot be forgotten, and a blank one is
+    // rejected here rather than being quietly treated as "always excused".
+    for (exceptions) |e| {
+        try testing.expect(e.unless_os.len != 0);
+        try testing.expect(e.why.len != 0);
+        try testing.expect(e.path.len != 0);
+    }
 }
 
 test "namespaceFor maps a nested path to its dotted namespace" {
