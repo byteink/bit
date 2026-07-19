@@ -154,7 +154,11 @@ pub fn writeStackMaps(gpa: Allocator, out: *std.ArrayList(u8), funcs: []const Fu
     const reloc_offsets = try gpa.alloc(u32, funcs.len);
     errdefer gpa.free(reloc_offsets);
 
-    try appendU32(out, gpa, @intCast(funcs.len));
+    // ABI.md §4: NO leading count. Entries are a flat sequence bounded by the
+    // linker-defined `bit_stack_maps` .. `bit_stack_maps_end` extent, because a
+    // merged table spanning several archive members has no single count any one
+    // object could write. Each entry is self-delimiting, so the walk advances by
+    // decoding rather than by index.
     for (funcs, 0..) |fsm, fi| {
         reloc_offsets[fi] = @intCast(out.items.len);
         try out.appendSlice(gpa, &(.{0} ** 8)); // code_addr — filled by the reloc

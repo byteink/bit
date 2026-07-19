@@ -111,11 +111,12 @@ pub fn read(gpa: Allocator, target: Target, name: []const u8, bytes: []const u8)
     @memset(section_map, null);
 
     for (shdrs, 0..) |sh, i| {
-        const kind = classify(sh) orelse continue;
+        const sec_name = try cstr(shstrtab, sh.sh_name);
+        const kind = classify(sec_name, sh) orelse continue;
         section_map[i] = @intCast(raw_sections.items.len);
         const sec_align: u32 = @intCast(@max(sh.sh_addralign, 1));
         try raw_sections.append(gpa, .{
-            .name = try cstr(shstrtab, sh.sh_name),
+            .name = sec_name,
             .kind = kind,
             .data = if (kind.isBss()) &.{} else try sectionBytes(bytes, sh),
             .size = sh.sh_size,
@@ -293,7 +294,13 @@ fn isMappingSymbol(name: []const u8, stt: u8, stb: u8, size: u64) bool {
     };
 }
 
-fn classify(sh: elf.Elf64_Shdr) ?object.SectionKind {
+/// ABI.md §4: the GC stack-map section is ALLOC+PROGBITS, non-writable and
+/// non-executable, so the flag-based rules below would file it under `.rodata`
+/// and interleave its entries with unrelated read-only atoms — contiguity lost,
+/// no diagnostic. Name discrimination therefore runs AHEAD of the flag rules,
+/// and this is the only section whose kind depends on its name.
+fn classify(name: []const u8, sh: elf.Elf64_Shdr) ?object.SectionKind {
+    if (std.mem.eql(u8, name, ".bit_gc")) return .gc_meta;
     const flags = sh.sh_flags;
     if (flags & elf.SHF_ALLOC == 0) return null;
     const is_progbits = sh.sh_type == @intFromEnum(elf.SHT.PROGBITS);

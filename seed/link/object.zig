@@ -37,6 +37,15 @@ pub const SectionKind = enum {
     tls_data,
     /// Thread-local zero-fill (ELF `.tbss`, macOS `__thread_bss`).
     tls_bss,
+    /// GC stack-map entries (ELF `.bit_gc`, macOS `__DATA,__bit_gc`) —
+    /// ABI.md §4. Distinguished from `.rodata`/`.data` ONLY by section name:
+    /// both readers otherwise classify by flags/segment, which would file
+    /// `.bit_gc` under `.rodata` and `__DATA,__bit_gc` under `.data` and
+    /// scatter these atoms among unrelated ones. The merged table's whole
+    /// contract is that its atoms are laid out CONTIGUOUSLY between the
+    /// linker-defined `bit_stack_maps` and `bit_stack_maps_end`, so losing
+    /// that grouping is silent heap corruption, not a missing feature.
+    gc_meta,
 
     pub fn isTls(self: SectionKind) bool {
         return self == .tls_vars or self == .tls_data or self == .tls_bss;

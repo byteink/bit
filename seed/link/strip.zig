@@ -126,6 +126,92 @@ pub fn deadStrip(gpa: Allocator, modules: []const Module, globals: *const Global
     return kept;
 }
 
+// ---------------------------------------------------------------------------
+// GC stack-map merge (ABI.md §4)
+// ---------------------------------------------------------------------------
+
+/// The linker-defined bounds of the merged GC stack-map table. No object
+/// defines either: the table spans every archive member that carries entries,
+/// so a per-object definition would be a duplicate symbol, and a per-object
+/// terminator would stop the runtime's walk at the first member's last entry.
+/// The runtime `extern`s both and walks the half-open extent between them.
+pub const stackmaps_start_symbol = "bit_stack_maps";
+pub const stackmaps_end_symbol = "bit_stack_maps_end";
+
+/// Builds the synthetic module holding the two boundary atoms. Both are
+/// zero-size and 1-aligned so they contribute no bytes and force no padding —
+/// they exist only to be given addresses at the ends of the merged group.
+///
+/// `sym_prefix` is the container's C symbol mangling ("" on ELF, "_" on
+/// Mach-O). It is a parameter rather than a constant because these names must
+/// match the runtime's `extern` spelling exactly, and an unprefixed name on
+/// Mach-O does not fail at link — it falls through to a libSystem import and
+/// aborts at dyld load, far from its cause.
+///
+/// Always present, even when nothing carries stack maps: the runtime's `extern`
+/// references must resolve, and an empty extent (start == end) is the correct
+/// answer for a program with no Bit frames to walk.
+pub fn markerModule(gpa: Allocator, sym_prefix: []const u8) Allocator.Error!Module {
+    const atoms = try gpa.alloc(object.Atom, 2);
+    const start = try std.fmt.allocPrint(gpa, "{s}{s}", .{ sym_prefix, stackmaps_start_symbol });
+    const end = try std.fmt.allocPrint(gpa, "{s}{s}", .{ sym_prefix, stackmaps_end_symbol });
+    atoms[0] = .{ .name = start, .kind = .gc_meta, .binding = .global, .data = &.{}, .size = 0, .alignment = 1, .relocs = &.{} };
+    atoms[1] = .{ .name = end, .kind = .gc_meta, .binding = .global, .data = &.{}, .size = 0, .alignment = 1, .relocs = &.{} };
+    return .{ .name = "<gc stack maps>", .atoms = atoms };
+}
+
+/// Index of the boundary atoms within `markerModule`'s atom slice.
+pub const marker_start_atom: u32 = 0;
+pub const marker_end_atom: u32 = 1;
+
+/// The reverse-dependency rule for stack-map entries: an entry is retained
+/// exactly when the function it describes is retained.
+///
+/// It cannot be a dead-strip ROOT — an entry relocates to its function, so
+/// rooting the entries would retain every function of every runtime module in
+/// every image, defeating dead-strip entirely. Nor can it be left to ordinary
+/// reachability: nothing ever references an entry, so every entry would be
+/// dropped and the collector would see no frames at all. Hence a pass AFTER
+/// `deadStrip`, keyed on the target the entry already names.
+///
+/// One pass suffices with no fixpoint: an entry's only relocation targets its
+/// own function, which this rule has just established is already kept, so
+/// keeping an entry can never make a further atom reachable.
+pub fn keepLiveStackMaps(gpa: Allocator, modules: []const Module, globals: *const GlobalTable, kept: *KeptSet) Error!void {
+    for (modules, 0..) |mod, mi| {
+        for (mod.atoms, 0..) |atom, ai| {
+            if (atom.kind != .gc_meta) continue;
+            if (atom.binding == .global) continue; // the boundary markers, kept unconditionally
+            for (atom.relocs) |r| {
+                const target = try resolveRef(globals, @intCast(mi), r.target);
+                if (!kept.contains(target)) continue;
+                try kept.set.put(gpa, (AtomId{ .module = @intCast(mi), .atom = @intCast(ai) }).key(), {});
+                break;
+            }
+        }
+    }
+}
+
+/// Orders the merged group: the start marker, then every retained entry, then
+/// the end marker. The driver appends this run to one output group **without
+/// interruption**, which is what makes the runtime's linear walk valid — the
+/// entries carry no count and no terminator, only these two bounds.
+pub fn mergedStackMapAtoms(gpa: Allocator, modules: []const Module, kept: *const KeptSet, marker_module: u32) Allocator.Error![]AtomId {
+    var out: std.ArrayList(AtomId) = .empty;
+    try out.append(gpa, .{ .module = marker_module, .atom = marker_start_atom });
+    for (modules, 0..) |mod, mi| {
+        if (mi == marker_module) continue;
+        for (mod.atoms, 0..) |atom, ai| {
+            if (atom.kind != .gc_meta) continue;
+            const id = AtomId{ .module = @intCast(mi), .atom = @intCast(ai) };
+            if (!kept.contains(id)) continue;
+            try out.append(gpa, id);
+        }
+    }
+    try out.append(gpa, .{ .module = marker_module, .atom = marker_end_atom });
+    return out.toOwnedSlice(gpa);
+}
+
 /// The values a single relocation's arithmetic can need — the driver fills in
 /// whichever apply to the kind. `s` is the target atom's final address plus
 /// the reloc addend already (`S + A`); `p` is the field's own final address;

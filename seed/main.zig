@@ -756,7 +756,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
     switch (target) {
         .x86_64_linux => {
             const object = emit.emitObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
-                error.FreestandingAlloc, error.FreestandingSafepoint, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
+                error.FreestandingAlloc, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -765,7 +765,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
         },
         .aarch64_linux => {
             const object = emit.emitObjectArm64Elf(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
-                error.FreestandingAlloc, error.FreestandingSafepoint, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
+                error.FreestandingAlloc, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -777,7 +777,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             // diagnostic (exit 1), not a raw propagated error.
             const object = emit.emitMachoObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
                 error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
-                error.FreestandingAlloc, error.FreestandingSafepoint, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
+                error.FreestandingAlloc, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;

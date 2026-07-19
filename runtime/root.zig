@@ -93,13 +93,20 @@ extern fn bit_main() callconv(.c) i32;
 //   3. buffered `is_ref` channel elements (ABI.md §11).
 // ---------------------------------------------------------------------------
 
-/// The compiler-emitted stack-map table (ABI.md §4). One `extern const` so the
-/// platform's C symbol mangling matches how `emit.zig` defines it (plain on
-/// ELF, `_`-prefixed on Mach-O) — same mechanism as `bit_main`. Its address is
-/// only ever taken from non-test builds (a unit-test binary links no user
-/// object, so the symbol is undefined there); the reads below are gated on
-/// `!builtin.is_test` exactly so that reference never forces resolution.
+/// The compiler-emitted stack-map table (ABI.md §4), as a half-open extent.
+///
+/// Both bounds are defined by the LINKER, not by any object: entries come from
+/// every archive member that carries them, concatenated, so no single object
+/// can know the total and no object may claim the symbol without colliding with
+/// its siblings. That is also why there is no count and no terminator — a
+/// per-object terminator would stop this walk at the first member's last entry.
+/// `extern const` so the platform's C symbol mangling matches how the linker
+/// defines them (plain on ELF, `_`-prefixed on Mach-O), as with `bit_main`.
+/// Their addresses are only ever taken from non-test builds (a unit-test binary
+/// links no user object); the reads below are gated on `!builtin.is_test`
+/// exactly so those references never force resolution.
 extern const bit_stack_maps: u8;
+extern const bit_stack_maps_end: u8;
 
 /// A thread's register+frame state at a safepoint poll, captured by
 /// `bit_rt_safepoint` before any runtime code could clobber it (ABI.md §4).
@@ -278,18 +285,25 @@ fn fpSlot(fp: usize, off: i32) usize {
 /// above any real Bit call depth on a 64KB task stack.
 const max_walk_frames: usize = 1 << 16;
 
-/// Finds the `bit_stack_maps` function entry whose code range contains `pc`
-/// and, if found, (a) marks every live reference the safepoint at `pc` names —
-/// stack slots via `fp`, registers via `regs` — and (b) rewrites `regs` to the
-/// caller's callee-saved values this frame saved, so the next (outer) frame
-/// reads them correctly. Returns false when `pc` is not in any Bit function
-/// (the top of the Bit portion of the stack), which stops the walk.
-fn scanFrame(base: [*]const u8, pc: usize, fp: usize, regs: *[32]usize) bool {
+/// Statically bounded entry count for one merged stack-map scan (Power-of-10),
+/// far above any real program's function count.
+const max_stackmap_entries: usize = 1 << 22;
+
+/// Finds the stack-map entry whose code range contains `pc` and, if found, (a)
+/// marks every live reference the safepoint at `pc` names — stack slots via
+/// `fp`, registers via `regs` — and (b) rewrites `regs` to the caller's
+/// callee-saved values this frame saved, so the next (outer) frame reads them
+/// correctly. Returns false when `pc` is not in any Bit function (the top of
+/// the Bit portion of the stack), which stops the walk.
+///
+/// `len` bounds the merged table: entries are self-delimiting and carry no
+/// count, so the loop advances by decoding each entry and stops at the extent's
+/// end. `max_stackmap_entries` is a Power-of-10 backstop making the bound
+/// static as well — a corrupt length can then cost at most a bounded scan.
+fn scanFrame(base: [*]const u8, len: usize, pc: usize, fp: usize, regs: *[32]usize) bool {
     var off: usize = 0;
-    const num_funcs = blobU32(base, off);
-    off += 4;
     var fi: usize = 0;
-    while (fi < num_funcs) : (fi += 1) {
+    while (off < len and fi < max_stackmap_entries) : (fi += 1) {
         const code_addr: usize = @intCast(blobU64(base, off));
         off += 8;
         const code_size = blobU32(base, off);
@@ -346,12 +360,14 @@ fn scanSnapshot(snap: *const SafepointFrame) void {
     if (builtin.is_test) return; // no stack-map table is linked into unit-test binaries
     if (snap.ret == 0) return;
     const base: [*]const u8 = @ptrCast(&bit_stack_maps);
+    // The linker guarantees `end >= start`; the subtraction is the extent.
+    const len: usize = @intFromPtr(&bit_stack_maps_end) - @intFromPtr(&bit_stack_maps);
     var regs = snap.regs;
     var pc = snap.ret;
     var fp = snap.fp;
     var frame: usize = 0;
     while (frame < max_walk_frames) : (frame += 1) {
-        if (!scanFrame(base, pc, fp, &regs)) break; // pc left the Bit call graph
+        if (!scanFrame(base, len, pc, fp, &regs)) break; // pc left the Bit call graph
         const ret = stackWord(fp + 8);
         const next_fp = stackWord(fp);
         if (next_fp <= fp) break; // frame pointers grow toward higher addresses; anything else is the boundary

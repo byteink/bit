@@ -231,10 +231,20 @@ const Placed = struct { id: AtomId, vaddr: u64 = 0, file_off: u64 = 0 };
 
 /// Links `modules` into an ad-hoc-signed, dynamically-linked arm64 Mach-O
 /// executable, returned as owned bytes.
-pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Options) Error![]u8 {
+pub fn linkExecutable(gpa: Allocator, input_modules: []const object.Module, opts: Options) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // ABI.md §4: the merged GC stack-map table's bounds are linker-defined, so
+    // the boundary symbols enter the link as a synthetic module appended last
+    // (stable index) and BEFORE resolution, so the runtime's `extern`
+    // references resolve like any other global.
+    var all_modules: std.ArrayList(object.Module) = .empty;
+    try all_modules.appendSlice(arena, input_modules);
+    const marker_module: u32 = @intCast(all_modules.items.len);
+    try all_modules.append(arena, try strip.markerModule(arena, "_"));
+    const modules = all_modules.items;
 
     var globals = try strip.resolveGlobals(arena, modules);
 
@@ -248,6 +258,11 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
     const entry = globals.get(entry_symbol) orelse return error.MissingEntry;
     try kept.put(arena, entry.key(), {});
     try stack.append(arena, entry);
+    // The boundary markers are kept unconditionally: the runtime's `extern`s
+    // must resolve even for a program whose every stack-map entry was stripped,
+    // where an empty extent (start == end) is the right answer.
+    try kept.put(arena, (AtomId{ .module = marker_module, .atom = strip.marker_start_atom }).key(), {});
+    try kept.put(arena, (AtomId{ .module = marker_module, .atom = strip.marker_end_atom }).key(), {});
     while (stack.pop()) |id| {
         const atom = modules[id.module].atoms[id.atom];
         for (atom.relocs) |r| {
@@ -272,6 +287,16 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
         }
     }
 
+    // A stack-map entry survives iff its function did. Without this the entries
+    // — which nothing ever references — are all dead-stripped, the merged extent
+    // comes out EMPTY, and the collector silently loses every precise root.
+    // See `keepLiveStackMaps` for why it is neither a root nor reachability.
+    {
+        var kept_set = strip.KeptSet{ .set = kept };
+        try strip.keepLiveStackMaps(arena, modules, &globals, &kept_set);
+        kept = kept_set.set;
+    }
+
     // ---- partition kept atoms by output class ------------------------------
     var text: std.ArrayList(Placed) = .empty;
     var rodata: std.ArrayList(Placed) = .empty;
@@ -292,9 +317,20 @@ pub fn linkExecutable(gpa: Allocator, modules: []const object.Module, opts: Opti
                 .tls_vars => try tls_vars.append(arena, .{ .id = id }),
                 .tls_data => try tls_data.append(arena, .{ .id = id }),
                 .tls_bss => try tls_bss.append(arena, .{ .id = id }),
+                // Placed as one uninterrupted run below, not here: their order
+                // and adjacency are the merged table's whole contract.
+                .gc_meta => {},
             }
         }
     }
+
+    // ---- merged GC stack-map group (ABI.md §4) -----------------------------
+    // Appended to `__data` as one contiguous run bounded by the two markers,
+    // with nothing interleaved — the entries carry no count and no terminator,
+    // so those bounds are the only thing that delimits the runtime's walk.
+    // Appending last means no later atom can land inside the extent.
+    for (try strip.mergedStackMapAtoms(arena, modules, &.{ .set = kept }, marker_module)) |id|
+        try data.append(arena, .{ .id = id });
 
     // ---- GOT slots + stubs -------------------------------------------------
     var got_list: std.ArrayList(GotKind) = .empty;
@@ -698,7 +734,10 @@ fn isBranch(kind: RelocKind) bool {
 /// rebasable absolute pointer (plain data or a tlv_descriptor's fields).
 fn isDataSeg(kind: object.SectionKind) bool {
     return switch (kind) {
-        .data, .tls_vars, .tls_data => true,
+        // `.gc_meta` is in `__DATA` precisely so its absolute code pointers can
+        // be rebased: a stack-map entry that dyld did not slide would send the
+        // collector walking a stale code range under PIE.
+        .data, .tls_vars, .tls_data, .gc_meta => true,
         else => false,
     };
 }

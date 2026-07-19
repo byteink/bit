@@ -19,26 +19,7 @@ const common = @import("codegen/common.zig");
 const obj_elf = @import("obj/elf.zig");
 const obj_macho = @import("obj/macho.zig");
 
-pub const Error = error{ NoMain, FreestandingAlloc, FreestandingSafepoint, FreestandingUnpinned, UnsupportedTlsStorage } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
-
-/// §17.6: may this function go into a freestanding object? A freestanding
-/// object carries no `bit_stack_maps`, so the collector could not scan the
-/// frame of a function it contains — which is sound only for a function that
-/// can never be on the stack when a collection begins.
-///
-/// The test is the DECLARATION (`@nosplit`/`@naked`), not the emitted safepoint
-/// list, and the difference matters. Codegen records a safepoint at every
-/// surviving call, because in general a callee may collect; `@nosplit`
-/// suppresses only the back-edge one. So "has no safepoints" is true of almost
-/// nothing that calls anything — it would reject a runtime module the moment it
-/// called a sibling, which is the entire case this mode exists for. What
-/// actually makes the missing stack map sound is §10.3's standing obligation on
-/// `@nosplit`: it may not allocate and may not reach a safepoint, so no
-/// collection can begin beneath it. Requiring the attribute makes that
-/// obligation explicit in the source and checkable by reading it.
-fn freestandingEligible(f: *const ir.Function) bool {
-    return f.is_nosplit or f.is_naked;
-}
+pub const Error = error{ NoMain, FreestandingAlloc, FreestandingUnpinned, UnsupportedTlsStorage } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
 
 /// §17.6: does this function belong in a freestanding object? A freestanding
 /// emit keeps only the ROOT module's own code, so an imported module's
@@ -137,11 +118,6 @@ pub fn firstUnpinnedImport(module: *const ir.Module) ?[]const u8 {
 fn refuseUnpinnedImports(module: *const ir.Module) Error!void {
     if (firstUnpinnedImport(module) != null) return error.FreestandingUnpinned;
 }
-
-/// Symbol naming the module's GC stack-map table (`runtime/ABI.md` §4); the
-/// runtime reads it via a `bit_stack_maps` extern to walk Bit frames at a
-/// collection. Mach-O prefixes it `_` like every other symbol.
-const stackmaps_symbol = "bit_stack_maps";
 
 /// Builds one function's arch-neutral stack-map view (arena-owned) from its
 /// backend `FuncCode` records. `Sp` is the backend's `SafepointEntry` type;
@@ -295,6 +271,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
 
     var code: std.ArrayList(u8) = .empty;
     var rodata: std.ArrayList(u8) = .empty;
+    var gc: std.ArrayList(u8) = .empty;
     var symbols: std.ArrayList(obj_elf.Symbol) = .empty;
     var relocs: std.ArrayList(obj_elf.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
@@ -312,7 +289,6 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
         // symbol the linker resolves (Mach-O: a libSystem import).
         // §17.6: an imported module's function is skipped the same way.
         if (!emitsFunction(f, freestanding)) continue;
-        if (freestanding and !freestandingEligible(f)) return error.FreestandingSafepoint;
         var fc = try x64.compileFunction(gpa, module, f, .sysv);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -382,11 +358,12 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
         try defined.put(a, g.name, {});
     }
 
-    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
+    try emitElfBlobs(a, module, &rodata, &gc, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
     if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
 
@@ -406,6 +383,9 @@ fn emitElfBlobs(
     a: Allocator,
     module: *const ir.Module,
     rodata: *std.ArrayList(u8),
+    /// The `.bit_gc` GC stack-map section (ABI.md §4) — kept separate from
+    /// `.rodata` because the linker must lay its atoms out contiguously.
+    gc: *std.ArrayList(u8),
     symbols: *std.ArrayList(obj_elf.Symbol),
     relocs: *std.ArrayList(obj_elf.Relocation),
     defined: *std.StringHashMapUnmanaged(void),
@@ -509,25 +489,37 @@ fn emitElfBlobs(
             try relocs.append(a, .{ .section = .rodata, .offset = r.off, .symbol = r.sym, .kind = .abs64, .addend = 0 });
     }
 
-    // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata ----------------
-    // §17.6: `bit_stack_maps` is a whole-PROGRAM table under one fixed name the
-    // runtime reads, so exactly one object in a link may define it — never an
-    // archive member. A freestanding object emits none and instead refuses any
-    // function that would need an entry (below), so nothing is silently lost.
-    if (!freestanding) {
-        const blob_off: u64 = rodata.items.len;
-        const code_relocs = try common.writeStackMaps(a, rodata, stackmaps);
-        try symbols.append(a, .{ .name = stackmaps_symbol, .section = .rodata, .offset = blob_off, .size = rodata.items.len - blob_off, .binding = .global, .kind = .object });
-        try defined.put(a, stackmaps_symbol, {});
-        // `writeStackMaps` records offsets against `rodata` itself, so they are
-        // already section-relative — do not add `blob_off` again.
-        for (code_relocs, 0..) |ro, fi| try relocs.append(a, .{
-            .section = .rodata,
-            .offset = ro,
-            .symbol = try a.dupe(u8, emitted_names[fi]),
-            .kind = .abs64,
-            .addend = 0,
-        });
+    // ---- GC stack-map entries (runtime/ABI.md §4) -> .bit_gc --------------
+    // Per-MEMBER, not per-program: every object emits its own entries into the
+    // dedicated `.bit_gc` section and the linker concatenates them between the
+    // symbols it defines at the extent's ends. That is what lets an archive
+    // member carry stack maps at all, which in turn is what lets a runtime
+    // module reach a safepoint (ABI.md §4.1) — the whole point of the change.
+    // No object defines `bit_stack_maps`: one global name owned by several
+    // members would be a duplicate definition, so the linker owns it instead.
+    //
+    // One section, one LOCAL symbol per function — not one section per function,
+    // which both object writers reject as a duplicate `SectionKind`. The readers
+    // carve one atom per symbol offset, so per-function symbols are exactly what
+    // makes the linker able to drop an entry whose function it dropped.
+    {
+        const code_relocs = try common.writeStackMaps(a, gc, stackmaps);
+        for (code_relocs, 0..) |ro, fi| {
+            const end: u64 = if (fi + 1 < code_relocs.len) code_relocs[fi + 1] else gc.items.len;
+            const name = try std.fmt.allocPrint(a, "__bitsm_{d}", .{fi});
+            try symbols.append(a, .{ .name = name, .section = .gc_meta, .offset = ro, .size = end - ro, .binding = .local, .kind = .object });
+            try defined.put(a, name, {});
+            // `writeStackMaps` records offsets against `gc` itself, so they are
+            // already section-relative. The entry begins with its `code_addr`
+            // field, so the entry's own offset IS the relocation's offset.
+            try relocs.append(a, .{
+                .section = .gc_meta,
+                .offset = ro,
+                .symbol = try a.dupe(u8, emitted_names[fi]),
+                .kind = .abs64,
+                .addend = 0,
+            });
+        }
     }
 
     // ---- undefined externals (runtime `bit_rt_*` symbols) -----------------
@@ -552,6 +544,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
 
     var code: std.ArrayList(u8) = .empty;
     var rodata: std.ArrayList(u8) = .empty;
+    var gc: std.ArrayList(u8) = .empty;
     var symbols: std.ArrayList(obj_elf.Symbol) = .empty;
     var relocs: std.ArrayList(obj_elf.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
@@ -569,7 +562,6 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         // symbol the linker resolves (Mach-O: a libSystem import).
         // §17.6: an imported module's function is skipped the same way.
         if (!emitsFunction(f, freestanding)) continue;
-        if (freestanding and !freestandingEligible(f)) return error.FreestandingSafepoint;
         var fc = try arm64.compileFunction(gpa, module, f);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -634,11 +626,12 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         try defined.put(a, g.name, {});
     }
 
-    try emitElfBlobs(a, module, &rodata, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
+    try emitElfBlobs(a, module, &rodata, &gc, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
     if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
 
@@ -659,6 +652,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     var code: std.ArrayList(u8) = .empty;
     var rodata: std.ArrayList(u8) = .empty;
     var data: std.ArrayList(u8) = .empty;
+    var gc: std.ArrayList(u8) = .empty;
     var symbols: std.ArrayList(obj_macho.Symbol) = .empty;
     var relocs: std.ArrayList(obj_macho.Relocation) = .empty;
     var defined = std.StringHashMapUnmanaged(void){};
@@ -713,7 +707,6 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
         // symbol the linker resolves (Mach-O: a libSystem import).
         // §17.6: an imported module's function is skipped the same way.
         if (!emitsFunction(f, freestanding)) continue;
-        if (freestanding and !freestandingEligible(f)) return error.FreestandingSafepoint;
         var fc = try arm64.compileFunction(gpa, module, f);
         defer fc.deinit();
         const off: u64 = code.items.len;
@@ -852,27 +845,37 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
             try relocs.append(a, .{ .section = .data, .offset = ti_off + 40, .symbol = methods_name, .kind = .unsigned64 });
     }
 
-    // ---- GC stack-map table (runtime/ABI.md §4) ---------------------------
-    // Like the string/TypeInfo blobs, each entry holds an absolute code
-    // pointer, so the table lives in writable `.data` (dyld only rebases
-    // writable segments under PIE); the runtime reads it via `_bit_stack_maps`.
+    // ---- GC stack-map entries (runtime/ABI.md §4) -> __DATA,__bit_gc ------
+    // Per-MEMBER, not per-program (ABI.md §4.1): every object emits its own
+    // entries and the linker concatenates them between the symbols it defines
+    // at the extent's ends, so an archive member can carry stack maps and its
+    // functions are free to reach safepoints. No object defines
+    // `_bit_stack_maps` — one global name owned by several members would be a
+    // duplicate definition, so the linker owns it instead.
+    //
+    // Each entry holds an absolute code pointer, so like the string/TypeInfo
+    // blobs the section is in `__DATA` (dyld only rebases writable segments
+    // under PIE). One section with one LOCAL symbol per function: the writer
+    // rejects two sections of the same kind, and the reader carves one atom per
+    // symbol, which is what lets the linker drop an entry whose function it
+    // dropped.
     std.debug.assert(emitted_names.items.len == stackmaps.items.len);
-    // §17.6: a whole-program table under a fixed name — never an archive
-    // member's to define. See `emitElfBlobs`.
-    if (!freestanding) {
-        const blob_off: u64 = data.items.len;
-        const code_relocs = try common.writeStackMaps(a, &data, stackmaps.items);
-        const sym = try mac(a, stackmaps_symbol);
-        try symbols.append(a, .{ .name = sym, .section = .data, .offset = blob_off, .size = data.items.len - blob_off, .binding = .global });
-        try defined.put(a, sym, {});
-        // `writeStackMaps` records offsets against `data` itself — already
-        // section-relative, so no `blob_off` adjustment.
-        for (code_relocs, 0..) |ro, fi| try relocs.append(a, .{
-            .section = .data,
-            .offset = ro,
-            .symbol = try mac(a, emitted_names.items[fi]),
-            .kind = .unsigned64,
-        });
+    {
+        const code_relocs = try common.writeStackMaps(a, &gc, stackmaps.items);
+        for (code_relocs, 0..) |ro, fi| {
+            const end: u64 = if (fi + 1 < code_relocs.len) code_relocs[fi + 1] else gc.items.len;
+            const name = try mac(a, try std.fmt.allocPrint(a, "__bitsm_{d}", .{fi}));
+            try symbols.append(a, .{ .name = name, .section = .gc_meta, .offset = ro, .size = end - ro, .binding = .local });
+            try defined.put(a, name, {});
+            // Offsets are already section-relative, and an entry starts with
+            // its `code_addr` field — so the entry offset IS the reloc offset.
+            try relocs.append(a, .{
+                .section = .gc_meta,
+                .offset = ro,
+                .symbol = try mac(a, emitted_names.items[fi]),
+                .kind = .unsigned64,
+            });
+        }
     }
 
     // ---- module-level state (§11.11) -> the same writable .data -----------
@@ -893,6 +896,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     var sections: std.ArrayList(obj_macho.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 4 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
 
     return obj_macho.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });

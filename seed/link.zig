@@ -81,12 +81,22 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
             for (members) |m| try modules.append(arena, try elf_reader.read(arena, target.readerTarget(), m.name, m.data));
         },
     };
+    // ABI.md §4: the merged GC stack-map table's bounds are linker-defined, so
+    // the boundary symbols enter the link as a synthetic module. It goes in
+    // BEFORE `resolveGlobals` so the runtime's `extern` references resolve
+    // like any other global, and last so its index is stable.
+    const marker_module: u32 = @intCast(modules.items.len);
+    try modules.append(arena, try strip.markerModule(arena, ""));
     const mods = modules.items;
 
     // ---- resolve + dead-strip ---------------------------------------------
     var globals = try strip.resolveGlobals(arena, mods);
-    var kept = try strip.deadStrip(arena, mods, &globals, &.{entry_symbol});
+    var kept = try strip.deadStrip(arena, mods, &globals, &.{ entry_symbol, strip.stackmaps_start_symbol, strip.stackmaps_end_symbol });
     defer kept.deinit(arena);
+
+    // A stack-map entry survives iff its function did — see `keepLiveStackMaps`
+    // for why this is neither a root nor ordinary reachability.
+    try strip.keepLiveStackMaps(arena, mods, &globals, &kept);
 
     // `-fdata-sections` can emit one variable as several adjacent symbols in a
     // single section (std's TLS `area_desc` is split into `area_desc.0/.1/...`).
@@ -121,6 +131,9 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
                 .bss => &bss,
                 .tls_data => &tdata,
                 .tls_bss => &tbss,
+                // Placed as one uninterrupted run below, not here: their order
+                // and adjacency are the merged table's whole contract.
+                .gc_meta => continue,
                 // `.tls_vars` is a macOS `tlv_descriptor` section (§ link/macho.zig);
                 // ELF has no equivalent and `elf_reader.zig` never produces it.
                 .tls_vars => unreachable,
@@ -128,6 +141,14 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
             try list.append(arena, .{ .id = id });
         }
     }
+
+    // ---- merged GC stack-map group (ABI.md §4) ----------------------------
+    // Appended to `rodata` as one contiguous run: the entries are read-only,
+    // hold absolute code pointers this non-PIE image never rebases, and must
+    // sit between the two boundary markers with nothing interleaved. Appending
+    // last means no later atom can land inside the extent.
+    for (try strip.mergedStackMapAtoms(arena, mods, &kept, marker_module)) |id|
+        try rodata.append(arena, .{ .id = id });
 
     // ---- lay out the two PT_LOAD segments ---------------------------------
     // Headers occupy the very start of the R-X segment and are loaded too, so

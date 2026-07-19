@@ -325,6 +325,10 @@ fn classify(sh: *const Section64) ?object.SectionKind {
     }
     if (std.mem.eql(u8, seg, "__DATA") or std.mem.eql(u8, seg, "__DATA_CONST")) {
         if (std.mem.eql(u8, sect, "__compact_unwind")) return null;
+        // ABI.md §4: must be tested BEFORE the blanket `.data` below, which
+        // would otherwise scatter the GC stack-map entries among unrelated
+        // `__DATA` atoms and break the merged table's contiguity silently.
+        if (std.mem.eql(u8, sect, "__bit_gc")) return .gc_meta;
         return .data;
     }
     return null; // __LD and anything else: not needed
