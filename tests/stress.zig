@@ -51,7 +51,7 @@
 //! indistinguishable from a hang. Build first, run the binary second, which is
 //! exactly what this harness does.
 //!
-//! THERE IS NO QUIC/TLS PROGRAM HERE, AND THAT IS A DECLARED HOLE (#1475). The
+//! THE QUIC/TLS HOLE (#1475), AND WHY IT WAS SHAPED THE WAY IT IS. The
 //! networking stack is the largest and most concurrent part of the stdlib, so its
 //! absence from the precise-rooting oracle is exactly the kind of exemption that
 //! must be written down rather than inferred from an empty directory listing.
@@ -81,16 +81,23 @@
 //! two to three orders of magnitude here; QUIC merely does more of it than
 //! anything else in the tree.
 //!
-//! WHAT WOULD CLOSE THE HOLE is a stress program that exercises the QUIC
-//! transport's concurrency — the connection loop, its ticker, the listener demux,
-//! spawn/chan/select over UDP — without paying for a handshake per run. That is
-//! blocked today for a second, unrelated reason: self-hosted `bit` cannot build
-//! *any* program importing `std/quic` (it refuses to lower 10 functions, the
-//! generic `std/tls` handshake helpers among them). This suite requires the
-//! self-hosted pass and rightly forbids a skip-list, so such a program cannot be
-//! added until that gap closes. Do not "solve" this by lowering the payload or by
-//! running quicconn here with a longer timeout — neither buys any rooting
-//! coverage, and the first reads as if it did.
+//! THE HOLE IS NOW PART-CLOSED, AND THE REMAINDER IS STILL DECLARED (#1483).
+//! The second, unrelated blocker named here — self-hosted `bit` could not build
+//! *any* program importing `std/quic`, refusing to lower 10 functions — was two
+//! lowering defects (bound struct-method values; a generic-enum scrutinee read
+//! from a struct field), both fixed. `tests/stress/quicwire` followed: the QUIC
+//! packet and frame path — Initial keys, header codec, AEAD payload protection,
+//! header protection, frame encode/parse — with every intermediate a fresh
+//! `[]byte` moved between spawned tasks over an unbuffered channel and taken
+//! with `select`. Measured at 1,491,425 collections per stress run, so those
+//! buffers are genuinely under the oracle rather than nominally in the suite.
+//!
+//! WHAT REMAINS UNCOVERED is the handshake and the connection loop itself — its
+//! ticker and the listener demux. That part is not gated on a compiler defect
+//! any more; it is the arithmetic above, and it has no cheap form. Do not
+//! "solve" it by lowering quicconn's payload or by running quicconn here with a
+//! longer timeout — neither buys any rooting coverage, and the first reads as if
+//! it did.
 //!
 //! Skipped when the host is not a supported runtime target (no libbitrt to link
 //! against), mirroring the golden `// run` cases and the examples guard.

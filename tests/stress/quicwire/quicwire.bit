@@ -1,0 +1,229 @@
+// The QUIC transport's packet path, driven concurrently — the first QUIC program
+// in this suite (#1483, closing part of the hole #1475 declared).
+//
+// WHAT IT COVERS AND WHAT IT DOES NOT, stated up front because a program here
+// that overclaims is worse than an empty directory. This exercises the QUIC
+// PACKET AND FRAME PATH — Initial key derivation, header encode/parse, AEAD
+// payload protection, header protection, frame encode/parse — with every
+// intermediate a freshly allocated `[]byte`, handed between two spawned tasks
+// over channels and multiplexed with `select`. Those are exactly the values a
+// missed root sweeps: each one is live only in a local or in a channel's
+// in-flight slot across a loop back-edge, which under `BIT_GC=stress` is a
+// collection every single time.
+//
+// It does NOT cover the TLS handshake or the connection loop's ticker and
+// listener demux. That is not an oversight and not a shortcut: a handshake is
+// RSA-2048 plus X25519 plus the record path, and #1475 measured `quicconn` at
+// over 300s under `BIT_GC=stress` for that reason alone (596,630 collections in
+// the first 100s, `stw_abandoned` = 0 — arithmetic, not a defect). A program
+// that pays for a handshake cannot live in this suite at all, so the choice is
+// this coverage or none. The residual hole stays declared in tests/stress.zig.
+//
+// Platform-free by construction: no `syscall`, no `extern`, no sockets. The
+// datagrams move over channels rather than UDP, so this runs on every target and
+// carries no `linux-only`/`darwin-only` marker.
+//
+// The printed line is a checksum over every recovered frame, so a byte that
+// survives the round trip wrong — or a payload that is swept and re-read as
+// garbage — changes the answer rather than merely not erroring.
+
+import { clientInitialKeys, encodeInitialHeader, parseLongHeader, PacketKeys } from "std/quic"
+import { protectPayload, unprotectPayload, headerSample, aesHeaderMask } from "std/quic"
+import { applyHeaderProtection, removeHeaderProtection, varintSize } from "std/quic"
+import { Frame, StreamFrame, encodeFrames, parseFrames } from "std/quic"
+
+// Packets per run. Sized against the stress policy, not the default one: the
+// AEAD seal/open path is loop-dense, so the suite's `BIT_GC=stress` runs cost
+// three orders of magnitude more than the default ones, and every program here
+// runs four times. MEASURED at twelve, arm64-macOS: 0.03s by default, 43s under
+// stress with 1,491,425 collections and the packet buffers live throughout.
+// That saturates this path — raising the count buys repetition, not reach.
+const packetCount = 12
+
+// The connection id both sides key off. Fixed, so the run is deterministic.
+function connId(): []byte {
+  return []byte{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }
+}
+
+// The application bytes carried by packet `n`: a length that varies with `n` so
+// no two packets share a payload, filled with a value derived from both indices.
+function payloadFor(n: int): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < 16 + n % 24) {
+    out = append(out, byte((n * 7 + i * 31) % 256))
+    i = i + 1
+  }
+  return out
+}
+
+// The frames packet `n` carries: a STREAM frame over its payload, a PING, and a
+// PADDING run. Three shapes rather than one so the parse side has to walk a
+// heterogeneous buffer to reach the end.
+function framesFor(n: int): []Frame {
+  let sf = StreamFrame{
+    id: u64(n % 4),
+    offset: u64(n * 16),
+    data: payloadFor(n),
+    hasOffset: true,
+    hasLength: true,
+    fin: n % 8 == 7,
+  }
+  // The PADDING run is large enough to hold every packet's Length field in the
+  // 2-byte varint range (64..16383). `openPacket` reconstructs the packet-number
+  // offset from that fixed shape, and `sealPacket` asserts it rather than
+  // trusting it — a shorter payload would silently shift the offset by one and
+  // turn every packet into an AEAD failure.
+  return []Frame{ Frame.Stream(sf), Frame.Ping, Frame.Padding(40 + n % 5) }
+}
+
+// Build one protected Initial packet carrying `framesFor(n)`.
+//
+// Every step allocates, and the result of each is the only reference to it until
+// the next step consumes it — the header, the frame encoding, the sealed payload,
+// the sample and the mask. Under the stress policy a collection lands between
+// each pair, so all of them must be reported as roots.
+function sealPacket(keys: PacketKeys, n: int): []byte! {
+  let plain = encodeFrames(framesFor(n))
+  let pnLength = 2
+  // The QUIC Length field covers the packet number plus the sealed payload,
+  // which is the plaintext plus the 16-byte AEAD tag.
+  let length = u64(pnLength + len(plain) + 16)
+  assert(varintSize(length) == 2, "quicwire: Length must encode as a 2-byte varint")
+  let header = encodeInitialHeader(1, connId(), []byte(0), []byte(0), length, u64(n), pnLength)
+  let sealed = protectPayload(keys, u64(n), header, plain)?
+  let packet = []byte(0)
+  for b of header {
+    packet = append(packet, b)
+  }
+  for b of sealed {
+    packet = append(packet, b)
+  }
+  let pnOffset = len(header) - pnLength
+  let mask = aesHeaderMask(keys.hp, headerSample(sealed, pnLength)?)?
+  applyHeaderProtection(packet, pnOffset, mask)?
+  return packet
+}
+
+// Recover the frames from one protected packet and fold them into a checksum.
+//
+// Deliberately re-derives the packet-number offset from the parsed header rather
+// than trusting the sender's, so a header that round-tripped wrong is caught here
+// instead of cancelling out.
+function openPacket(keys: PacketKeys, packet: []byte, n: int): int! {
+  let hdr = parseLongHeader(packet)?
+  if (hdr.version != 1 || len(hdr.dcid) != 8) {
+    fail newError("quicwire: long header did not round trip")
+  }
+  // 1 (first byte) + 4 (version) + 1 + dcid + 1 + scid + 1 (token varint) + 2
+  // (length varint) — the fixed Initial shape this program emits.
+  let pnOffset = 1 + 4 + 1 + len(hdr.dcid) + 1 + len(hdr.scid) + 1 + 2
+  let sample = packet[pnOffset + 4:pnOffset + 20]
+  let mask = aesHeaderMask(keys.hp, sample)?
+  let pnLength = removeHeaderProtection(packet, pnOffset, mask)?
+  let header = packet[0:pnOffset + pnLength]
+  let sealed = packet[pnOffset + pnLength:len(packet)]
+  let plain = unprotectPayload(keys, u64(n), header, sealed)?
+  let sum = 0
+  for f of parseFrames(plain)? {
+    sum = sum + frameScore(f)
+  }
+  return sum
+}
+
+// A frame's contribution to the checksum. Enumerated over every variant because
+// a match must be exhaustive and Bit has no wildcard arm; only the three shapes
+// this program emits contribute, and every other variant scores 0 so a frame
+// that parsed as the wrong type shows up as a wrong total.
+function frameScore(f: Frame): int {
+  match (f) {
+    Padding(k) => { return k * 2 }
+    Ping => { return 1 }
+    Ack(a) => { return 0 }
+    ResetStream(id, code, size) => { return 0 }
+    StopSending(id, code) => { return 0 }
+    Crypto(offset, data) => { return 0 }
+    NewToken(token) => { return 0 }
+    Stream(sf) => {
+      let sum = int(sf.id) + int(sf.offset) + len(sf.data)
+      for b of sf.data {
+        sum = sum + int(b)
+      }
+      return sum
+    }
+    MaxData(m) => { return 0 }
+    MaxStreamData(id, m) => { return 0 }
+    MaxStreams(bidi, m) => { return 0 }
+    DataBlocked(m) => { return 0 }
+    StreamDataBlocked(id, m) => { return 0 }
+    StreamsBlocked(bidi, m) => { return 0 }
+    NewConnectionId(seq, retire, cid, tok) => { return 0 }
+    RetireConnectionId(seq) => { return 0 }
+    PathChallenge(d) => { return 0 }
+    PathResponse(d) => { return 0 }
+    ConnectionClose(code, frame, reason) => { return 0 }
+    ApplicationClose(code, reason) => { return 0 }
+    HandshakeDone => { return 0 }
+  }
+}
+
+// Error-free wrappers, so the concurrent driver below is straight-line. A
+// failure becomes an out-of-band value (an empty datagram, a negative score)
+// that the driver counts rather than swallows — a run that silently degraded to
+// zero successful packets must not print the same line as a healthy one.
+function sealOrEmpty(keys: PacketKeys, n: int): []byte {
+  let p = sealPacket(keys, n) catch e {
+    return []byte(0)
+  }
+  return p
+}
+
+function scorePacket(keys: PacketKeys, packet: []byte, n: int): int {
+  let s = openPacket(keys, packet, n) catch e {
+    return 0 - 1
+  }
+  return s
+}
+
+// The sender task: seal each packet and hand it over the channel in order.
+function sender(out: chan<[]byte>, keys: PacketKeys) {
+  let n = 0
+  while (n < packetCount) {
+    out <- sealOrEmpty(keys, n)
+    n = n + 1
+  }
+}
+
+function main() {
+  let keys = clientInitialKeys(connId())
+  // Unbuffered: every datagram is live ONLY in the channel's in-flight slot
+  // while the sender is parked on it, which is the slot a missed root loses.
+  let dg = chan<[]byte>(0)
+  let idle = chan<int>(1)
+  spawn sender(dg, keys)
+
+  let total = 0
+  let bad = 0
+  let got = 0
+  while (got < packetCount) {
+    // `select` rather than a bare receive so the received datagram lands in the
+    // case descriptor's word slot — the leaf buffer that must be traced.
+    select {
+      case p = <- dg:
+        let score = 0 - 1
+        if (len(p) != 0) {
+          score = scorePacket(keys, p, got)
+        }
+        if (score < 0) {
+          bad = bad + 1
+        } else {
+          total = total + score
+        }
+        got = got + 1
+      case x = <- idle:
+        bad = bad + 1
+    }
+  }
+  println("packets ${got} bad ${bad}")
+  println("checksum ${total}")
+}
