@@ -1,0 +1,197 @@
+// Correctly-rounded decimal text -> f64, returning the raw bit pattern.
+//
+// The candidate `bit_rt_parse_float` for SEAM 5 (#1369). Like the formatter it
+// works in exact rational arithmetic rather than with a fast path plus a
+// fallback: the decimal is held as an exact ratio and the quotient's bits are
+// produced by long division, so the round-to-nearest-even decision is made on
+// the true remainder and never on an approximation. There is no accuracy
+// shortcut to get wrong — which is the property this seam needs, since a 1-ULP
+// miss reads back as a different f64 and flips the printed shortest string.
+//
+// Returns bits rather than an `f64` because Bit has no bits->float primitive,
+// and because bit equality is exactly what the round-trip check asserts.
+
+// Most significant decimal digits any f64-bearing text needs; well past the 768
+// that the hardest denormal round-trip requires.
+function parseMaxDigits(): i64 { return 800 }
+
+// Parses `s` as a decimal float, returning the bit pattern of the nearest f64.
+// Underscore separators are stripped (SPEC 5.4). Unparsable text yields 0, which
+// matches the Zig implementation's contract.
+export function parseBits(s: string): u64 {
+  let b = []byte(s)
+  let i = 0
+  let n = len(b)
+
+  let neg = false
+  if (i < n && (b[i] == byte(45) || b[i] == byte(43))) {
+    neg = b[i] == byte(45)
+    i = i + 1
+  }
+
+  let num = bigNew()
+  let nn = 0
+  let nd = 0            // significant digits accumulated
+  let seenDigit = false
+  let fracDigits = 0
+  let inFrac = false
+  let leading = true    // still skipping leading zeros
+
+  // Nine digits at a time; `pend`/`pcount` hold the partial group.
+  let pend = u64(0)
+  let pcount = 0
+
+  while (i < n) {
+    let c = b[i]
+    if (c == byte(95)) { i = i + 1; continue }
+    if (c == byte(46)) {
+      if (inFrac) { return u64(0) }
+      inFrac = true
+      i = i + 1
+      continue
+    }
+    if (c < byte(48) || c > byte(57)) { break }
+    seenDigit = true
+    let d = i64(c) - 48
+    if (inFrac) { fracDigits = fracDigits + 1 }
+    if (leading && d == 0) {
+      // A leading zero contributes no significant digit, but a zero after the
+      // point still shifts the exponent, which `fracDigits` already counted.
+      i = i + 1
+      continue
+    }
+    leading = false
+    assert(nd < parseMaxDigits())
+    pend = pend * u64(10) + u64(d)
+    pcount = pcount + 1
+    nd = nd + 1
+    if (pcount == 9) {
+      nn = bigMulAddSmall(num, nn, u32(1000000000), u32(pend))
+      pend = u64(0)
+      pcount = 0
+    }
+    i = i + 1
+  }
+  if (pcount > 0) {
+    let m = u32(1)
+    let j = 0
+    while (j < pcount) { m = m * u32(10); j = j + 1 }
+    nn = bigMulAddSmall(num, nn, m, u32(pend))
+  }
+  if (!seenDigit) { return u64(0) }
+
+  let exp = 0
+  if (i < n && (b[i] == byte(101) || b[i] == byte(69))) {
+    i = i + 1
+    let esign = 1
+    if (i < n && (b[i] == byte(45) || b[i] == byte(43))) {
+      if (b[i] == byte(45)) { esign = -1 }
+      i = i + 1
+    }
+    let any = false
+    while (i < n && b[i] >= byte(48) && b[i] <= byte(57)) {
+      exp = exp * 10 + (i64(b[i]) - 48)
+      // Clamp rather than overflow: anything past this saturates to inf or zero
+      // and the exact magnitude no longer changes the result.
+      if (exp > 100000) { exp = 100000 }
+      any = true
+      i = i + 1
+    }
+    if (!any) { return u64(0) }
+    exp = exp * esign
+  }
+  if (i != n) { return u64(0) }
+
+  let sign = u64(0)
+  if (neg) { sign = u64(1) << u64(63) }
+  if (nn == 0) { return sign }
+
+  // value = num * 10^q, held exactly as num/den.
+  let q = exp - fracDigits
+  let den = bigNew()
+  let dn = bigSetU64(den, u64(1))
+  if (q > 0) {
+    if (q > 400) { return sign | infBits() }
+    nn = bigMulPow10(num, nn, q)
+  } else if (q < 0) {
+    if (-q > 400) { return sign }
+    dn = bigMulPow10(den, dn, -q)
+  }
+
+  // Line the operands up so the quotient lands in [2^53, 2^55): 54 or 55 bits,
+  // one or two more than the significand, which is what rounding needs.
+  let shift = 54 - (bigBitLen(num, nn) - bigBitLen(den, dn))
+  let e = -shift
+  if (shift > 0) {
+    nn = bigShl(num, nn, shift)
+  } else if (shift < 0) {
+    dn = bigShl(den, dn, -shift)
+  }
+
+  // Binary long division, most significant quotient bit first. Only ~55 steps
+  // run because the alignment above fixed the operands' bit-length gap.
+  let bs = bigNew()
+  let d = bigBitLen(num, nn) - bigBitLen(den, dn)
+  assert(d >= 0 && d < 64)
+  let bsn = bigCopy(bs, den, dn)
+  bsn = bigShl(bs, bsn, d)
+
+  let quo = u64(0)
+  let step = d
+  while (step >= 0) {
+    quo = quo << u64(1)
+    if (bigCmp(num, nn, bs, bsn) >= 0) {
+      nn = bigSub(num, nn, bs, bsn)
+      quo = quo | u64(1)
+    }
+    bsn = bigShr1(bs, bsn)
+    step = step - 1
+  }
+  let sticky = nn != 0
+
+  // Choose the target grid BEFORE rounding. Rounding to 53 bits and then
+  // re-rounding onto the subnormal grid is a double rounding, and double
+  // rounding is wrong by one ulp exactly on the half-way inputs this seam has
+  // to get right.
+  let bl = u64BitLen(quo)
+  assert(bl >= 54)
+  let dropNorm = bl - 53
+  let expIfNormal = e + dropNorm + 1075
+
+  if (expIfNormal < 1) {
+    // Subnormal: land on the fixed 2^-1074 grid in one rounding step. A carry
+    // out of the top bit lands in the exponent field, which is exactly the
+    // smallest normal — the encoding makes that transition for free.
+    let dsub = -e - 1074
+    if (dsub > 64) { return sign }
+    let mant = quo
+    if (dsub > 0) {
+      mant = roundShiftRight(quo, dsub, sticky)
+    } else if (dsub < 0) {
+      mant = quo << u64(-dsub)
+    }
+    return sign | mant
+  }
+
+  let mant = roundShiftRight(quo, dropNorm, sticky)
+  let expField = expIfNormal
+  if (mant == u64(9007199254740992)) { mant = mant >> u64(1); expField = expField + 1 }
+  if (expField >= 2047) { return sign | infBits() }
+  return sign | (u64(expField) << u64(52)) | (mant - u64(4503599627370496))
+}
+
+// `v >> k`, rounded to nearest with ties going to even. `sticky` reports that
+// nonzero bits were already discarded below `v`.
+function roundShiftRight(v: u64, k: i64, sticky: bool): u64 {
+  assert(k > 0 && k < 64)
+  let mask = (u64(1) << u64(k)) - u64(1)
+  let dropped = v & mask
+  let half = u64(1) << u64(k - 1)
+  let r = v >> u64(k)
+  if (dropped > half || (dropped == half && (sticky || (r & u64(1)) == u64(1)))) {
+    r = r + u64(1)
+  }
+  return r
+}
+
+function infBits(): u64 { return u64(2047) << u64(52) }

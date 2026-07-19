@@ -1,0 +1,255 @@
+// Shortest-round-trip f64 -> text, byte-for-byte compatible with Zig's `{d}`.
+//
+// This is the candidate `bit_rt_string_from_float` for SEAM 5 of the runtime
+// port (#1369), built standalone so it can be diffed against the Zig oracle
+// before anything depends on it.
+//
+// The algorithm is Steele & White / Burger & Dybvig "free-format" digit
+// generation on exact rational arithmetic (Dragon4). Unlike Ryu or Grisu it
+// carries no precomputed tables and needs no fallback path: every comparison is
+// exact, so the digits it emits are by construction the shortest that round-trip
+// and the nearest such string to the true value. It is slower than Ryu and that
+// is the deliberate trade — this seam is judged on parity, not throughput.
+//
+// The input is a raw bit pattern rather than an `f64` because Bit has no
+// bits->float primitive (only `floatBits` in the other direction), and because
+// the algorithm decomposes to sign/exponent/mantissa immediately anyway.
+
+// Zig renders `{d}` in positional decimal always, never scientific, so the
+// output for DBL_MAX is 309 characters and for the smallest denormal is 325.
+function fmtMaxDigits(): i64 { return 24 }
+
+// Formats the f64 with bit pattern `bits` exactly as Zig's `{d}` would.
+export function fmtBits(bits: u64): string {
+  let neg = (bits >> u64(63)) == u64(1)
+  let expField = i64((bits >> u64(52)) & u64(2047))
+  let mantField = bits & u64(4503599627370495)
+
+  if (expField == 2047) {
+    if (mantField != u64(0)) { return "nan" }
+    if (neg) { return "-inf" }
+    return "inf"
+  }
+
+  if (expField == 0 && mantField == u64(0)) {
+    if (neg) { return "-0" }
+    return "0"
+  }
+
+  // v = m * 2^e, exactly.
+  let m = mantField
+  let e = 0
+  if (expField == 0) {
+    e = -1074
+  } else {
+    m = m | u64(4503599627370496)
+    e = expField - 1075
+  }
+
+  let digits = []byte(fmtMaxDigits())
+  // `nd` and the decimal exponent come back through a 2-slot out-parameter
+  // because Bit has no tuple return on a slice-writing function.
+  let out = []i64(2)
+  dragon4(m, e, expField, mantField, digits, out)
+  let nd = out[0]
+  let k = out[1]
+
+  return render(neg, digits, nd, k)
+}
+
+// Emits the shortest round-tripping digits of `m * 2^e` into `digits`, writing
+// the digit count to `out[0]` and the decimal exponent to `out[1]`. The value is
+// `0.d1d2...dn * 10^out[1]`.
+function dragon4(m: u64, e: i64, expField: i64, mantField: u64, digits: []byte, out: []i64) {
+  let r = bigNew()
+  let s = bigNew()
+  let mp = bigNew()
+  let mm = bigNew()
+  let t = bigNew()
+
+  // The predecessor of a power of two is half an ulp closer than its successor,
+  // so the lower boundary tightens — except at the smallest normal, whose
+  // predecessor is the largest denormal and therefore evenly spaced.
+  let closer = mantField == u64(0) && expField > 1
+
+  let rn = 0
+  let sn = 0
+  let mpn = 0
+  let mmn = 0
+
+  if (e >= 0) {
+    rn = bigSetU64(r, m)
+    if (closer) {
+      rn = bigShl(r, rn, e + 2)
+      sn = bigSetU64(s, u64(4))
+      mpn = bigSetU64(mp, u64(1))
+      mpn = bigShl(mp, mpn, e + 1)
+      mmn = bigSetU64(mm, u64(1))
+      mmn = bigShl(mm, mmn, e)
+    } else {
+      rn = bigShl(r, rn, e + 1)
+      sn = bigSetU64(s, u64(2))
+      mpn = bigSetU64(mp, u64(1))
+      mpn = bigShl(mp, mpn, e)
+      mmn = bigCopy(mm, mp, mpn)
+    }
+  } else {
+    rn = bigSetU64(r, m)
+    sn = bigSetU64(s, u64(1))
+    if (closer) {
+      rn = bigShl(r, rn, 2)
+      sn = bigShl(s, sn, 2 - e)
+      mpn = bigSetU64(mp, u64(2))
+      mmn = bigSetU64(mm, u64(1))
+    } else {
+      rn = bigShl(r, rn, 1)
+      sn = bigShl(s, sn, 1 - e)
+      mpn = bigSetU64(mp, u64(1))
+      mmn = bigSetU64(mm, u64(1))
+    }
+  }
+
+  // Round-to-nearest-EVEN makes the representable boundaries inclusive when the
+  // mantissa is even: a decimal landing exactly on a boundary still reads back
+  // as this value. That single `>=` vs `>` is the whole tie-breaking rule.
+  let even = (m & u64(1)) == u64(0)
+
+  // Seed the decimal exponent from the binary one — log10(2) as 30103/100000 —
+  // then correct. The estimate is never more than one step off, so the fixup
+  // loops below are bounded rather than the O(324) scan an unseeded scale needs.
+  let bl = u64BitLen(m) + e
+  let k = floorDiv((bl - 1) * 30103, 100000) + 1
+  if (k > 0) {
+    sn = bigMulPow10(s, sn, k)
+  } else if (k < 0) {
+    rn = bigMulPow10(r, rn, -k)
+    mpn = bigMulPow10(mp, mpn, -k)
+    mmn = bigMulPow10(mm, mmn, -k)
+  }
+
+  // Establish 10^(k-1) <= v < 10^k, measured at the upper boundary so the first
+  // digit generated is the first digit printed.
+  let guard = 0
+  while (highTest(r, rn, mp, mpn, s, sn, t, even, 1)) {
+    sn = bigMulSmall(s, sn, u32(10))
+    k = k + 1
+    guard = guard + 1
+    assert(guard < 8)
+  }
+  guard = 0
+  while (!highTest(r, rn, mp, mpn, s, sn, t, even, 10)) {
+    rn = bigMulSmall(r, rn, u32(10))
+    mpn = bigMulSmall(mp, mpn, u32(10))
+    mmn = bigMulSmall(mm, mmn, u32(10))
+    k = k - 1
+    guard = guard + 1
+    assert(guard < 8)
+  }
+
+  let nd = 0
+  let done = false
+  while (!done) {
+    assert(nd < fmtMaxDigits())
+    rn = bigMulSmall(r, rn, u32(10))
+    mpn = bigMulSmall(mp, mpn, u32(10))
+    mmn = bigMulSmall(mm, mmn, u32(10))
+
+    let d = 0
+    while (bigCmp(r, rn, s, sn) >= 0) {
+      rn = bigSub(r, rn, s, sn)
+      d = d + 1
+      assert(d <= 9)
+    }
+
+    // Can we stop and round DOWN — is what remains already inside the lower
+    // boundary, so that truncating here still reads back as this f64?
+    let cl = bigCmp(r, rn, mm, mmn)
+    let low = cl < 0
+    if (even && cl == 0) { low = true }
+
+    // Can we stop and round UP — does adding the remaining distance reach the
+    // upper boundary?
+    let tn = bigCopy(t, r, rn)
+    tn = bigAdd(t, tn, mp, mpn)
+    let ch = bigCmp(t, tn, s, sn)
+    let high = ch > 0
+    if (even && ch == 0) { high = true }
+
+    if (!low && !high) {
+      digits[nd] = byte(48 + d)
+      nd = nd + 1
+    } else {
+      let up = false
+      if (low && high) {
+        // Both stopping rules fire: pick whichever of d and d+1 is nearer the
+        // true remaining value, and on an exact tie prefer the even digit.
+        let un = bigCopy(t, r, rn)
+        un = bigMulSmall(t, un, u32(2))
+        let c2 = bigCmp(t, un, s, sn)
+        if (c2 > 0) {
+          up = true
+        } else if (c2 == 0) {
+          up = (d & 1) == 1
+        }
+      } else if (high) {
+        up = true
+      }
+      if (up) { d = d + 1 }
+      digits[nd] = byte(48 + d)
+      nd = nd + 1
+      done = true
+    }
+  }
+
+  out[0] = nd
+  out[1] = k
+}
+
+// True when `r*scale + mp*scale` has reached the upper boundary `s`.
+function highTest(r: []u32, rn: i64, mp: []u32, mpn: i64, s: []u32, sn: i64, t: []u32, even: bool, scale: i64): bool {
+  let tn = bigCopy(t, r, rn)
+  tn = bigAdd(t, tn, mp, mpn)
+  if (scale != 1) { tn = bigMulSmall(t, tn, u32(scale)) }
+  let c = bigCmp(t, tn, s, sn)
+  if (even) { return c >= 0 }
+  return c > 0
+}
+
+// Lays the digits out positionally, which is the shape `{d}` always produces:
+// no exponent, no trailing ".0", zero-padded on whichever side is short.
+function render(neg: bool, digits: []byte, nd: i64, k: i64): string {
+  let sign = ""
+  if (neg) { sign = "-" }
+
+  if (k >= nd) {
+    return sign + string(digits[0:nd]) + zeros(k - nd)
+  }
+  if (k > 0) {
+    return sign + string(digits[0:k]) + "." + string(digits[k:nd])
+  }
+  return sign + "0." + zeros(-k) + string(digits[0:nd])
+}
+
+function zeros(n: i64): string {
+  if (n <= 0) { return "" }
+  let z = []byte(n)
+  let i = 0
+  while (i < n) { z[i] = byte(48); i = i + 1 }
+  return string(z)
+}
+
+// Significant bits of `v`; 0 for zero.
+export function u64BitLen(v: u64): i64 {
+  let n = 0
+  let x = v
+  while (x != u64(0)) { n = n + 1; x = x >> u64(1) }
+  return n
+}
+
+// Integer division rounding toward negative infinity, which `/` does not do.
+export function floorDiv(a: i64, b: i64): i64 {
+  assert(b > 0)
+  let q = a / b
+  if (a < 0 && q * b != a) { q = q - 1 }
+  return q
+}
