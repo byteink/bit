@@ -1,0 +1,435 @@
+// The socket half of the net port (#1366) against a REAL kernel, Linux.
+//
+// THIS IS THE HALF THAT CANNOT BE TESTED WITH A FAKE. ../netcore covers the
+// platform-free half — IPv4 literals and the DNS codec — where a wrong answer is
+// a wrong VALUE. Here the whole job is to agree with a kernel about a struct
+// layout, a set of option numbers and a set of errno numbers, and every one of
+// those is a value whose wrong guess reproduces as SILENCE: a `sockaddr_in` with
+// AF_INET in the wrong byte binds to nothing, a `SOL_SOCKET` copied from Linux
+// makes `setsockopt` a no-op, and an `EAGAIN` copied from Linux turns a
+// would-block into a fatal error. So this program uses real sockets on loopback
+// and asserts exact values, never "it did not error".
+//
+// EVERY BYTE COMPARISON IS A CONTENT COMPARISON, NOT A LENGTH. #1438's most
+// useful mutant left the length AND the exit status unchanged and still produced
+// wrong data; a case asserting `n == 5` would have passed it. So each transfer
+// here is checked byte for byte.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/net/linux, which reaches the kernel through `syscall` (SPEC §11.8) —
+// rejected on Darwin even for an uncalled declaration. Its twin
+// ../netsockdarwin runs the IDENTICAL properties against libSystem, so a
+// divergence between the two means a real platform difference rather than a
+// spelling one.
+//
+// THIS FILE IS A DELIBERATE NEAR-COPY OF ITS TWIN, not a shared body behind an
+// abstraction. The properties must be identical for the comparison to mean
+// anything, and the only way to share them would be a provider indirection —
+// which is precisely the layer whose per-platform correctness is under test.
+// Anything that diverges beyond the imports and this header is a bug.
+//
+// ---------------------------------------------------------------------------
+// MUTATION RECORD — WHAT THIS FILE PROVABLY GUARDS, AND WHAT IT DOES NOT
+// ---------------------------------------------------------------------------
+//
+// Nine mutants were run against the DARWIN provider (this twin's numbers are inherited, not independently measured — see below), plus a no-op control that must
+// (and does) SURVIVE. Five are CAUGHT: the cross-platform `EAGAIN`, `SOL_SOCKET`,
+// `SO_ERROR` and `sockaddr_in`-layout swaps (each provider's constants replaced
+// by the other platform's), and — in ../polloneshotlinux —
+// dropping `EV_ONESHOT`.
+//
+// TWO OF THOSE FIVE WERE ONLY CAUGHT AFTER THIS FILE WAS CHANGED, and the
+// original version of it missed both. `SO_ERROR` needed a second read against a
+// socket where SO_ERROR and SO_REUSEADDR DISAGREE (see `clean`), and the layout
+// needed `netSockAddrFamily` against a kernel-filled address (see `datagram`).
+// Both had read as covered and were not.
+//
+// FOUR MUTANTS SURVIVE. Two are equivalent and two are real gaps; none is
+// papered over:
+//
+//   1. `tv_usec` width swapped (64 vs 32 bits) — EQUIVALENT. The struct is
+//      zeroed before the call and the value fits in 32 bits, so the upper four
+//      bytes are zero either way. The Darwin/Linux `timeval` width difference
+//      is real but is not observable through a zero-filled buffer.
+//   2. `sin_zero` left uncleared — EQUIVALENT. The kernel ignores `sin_zero`,
+//      and all eight meaningful bytes are written explicitly on every call.
+//   3. `recvfrom`'s in/out `socklen_t` not re-armed per attempt — A REAL GAP.
+//      Only one `recvfrom` attempt ever happens here, because the datagram is
+//      already queued when it runs, so the retry path is never entered. Closing
+//      it needs a UDP would-block: a delayed sender, the same shape as the
+//      `blocked` property below. NOT DONE.
+//   4. `netDialTcp` skipping its `SO_ERROR` readback — A REAL GAP, and one that
+//      cannot be closed on loopback. Connecting to a port with no listener
+//      there fails SYNCHRONOUSLY with ECONNREFUSED rather than deferring via
+//      EINPROGRESS, so `netDialTcp` returns from its early error branch and the
+//      readback loop is never reached — `refusedDial` passes for the wrong
+//      reason. The option NUMBER is still pinned by `clean`; what is unproven is
+//      the dial path's USE of it. Exercising it needs a peer that accepts the
+//      SYN and then stalls, which loopback cannot provide.
+//
+//
+// THE MUTATION RUN ITSELF WAS PERFORMED ON DARWIN ONLY. The properties here are
+// textually identical to the twin's, so the SHAPE of the coverage carries over,
+// but no mutant has been applied to this file's provider on a Linux kernel.
+// Treat the four survivors as at least as bad here, never as better.
+//
+// NO GREEN THREADS HERE, AND THAT IS A STATED LIMIT RATHER THAN AN OVERSIGHT.
+// `netAwaitReady` needs a task to park; a task body must be `@nosplit` (a green
+// stack is reached conservatively, not through a published safepoint frame) and
+// `@nosplit` rejects both `extern` and `syscall` (E0075), so a green task in
+// THIS harness cannot make a socket call at all. The retry loops therefore take
+// their unscheduled branch and spin. What that leaves unexercised is the
+// composition of a socket retry with a park — the park protocol itself is
+// ../netpark's job, and the poller's kernel side is ../schedpolllinux's.
+
+import { netListenTcp, netLocalPort, netAcceptTcp, netDialTcp } from "../../../runtime/net/linux"
+import { netReadSock, netWriteSock, netClose, netSocketError } from "../../../runtime/net/linux"
+import { netBindUdp, netSendTo, netRecvFrom, netSockAddrLen } from "../../../runtime/net/linux"
+import { netFillSockAddr, netSockAddrPort, netSockAddrOctets } from "../../../runtime/net/linux"
+import { netSockAddrFamily } from "../../../runtime/net/linux"
+import { netDnsSocket, netRcvTimeoMs, netResolve } from "../../../runtime/net/linux"
+import { netDnsTimeoutMs } from "../../../runtime/net"
+import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
+import { threadStart, threadRelease } from "../../../runtime/thread/linux"
+import { parkSleepNs, parkMonoNs } from "../../../runtime/park/linux"
+
+// Scratch regions. `[N]i64` rather than `[N]byte` because a Bit array stores one
+// 8-BYTE WORD per element (§11.8): only an `[N]i64` walked through a `*u8` is a
+// genuinely contiguous byte region, which is what a kernel struct and a wire
+// message both are.
+let hostBuf: [4]i64
+let badHostBuf: [4]i64
+let sendBuf: [8]i64
+let recvBuf: [8]i64
+let echoBuf: [8]i64
+let peerBuf: [2]i64
+let saBuf: [2]i64
+let ipBuf: [1]i64
+let octBuf: [1]i64
+let lateBuf: [8]i64
+let doneWords: [1]i32
+let goWords: [1]i32
+
+// The responder thread's fd and its result. Untraced module state (§11.11):
+// written by one thread, read by the other after a join, never walked by the
+// collector.
+let respFd: i64 = 0
+let respWrote: i64 = 0
+
+function bytesAt(a: int): *u8 {
+  let z: *u8 = nil
+  return z + a
+}
+
+function hostBytes(): *u8 { return bytesAt(int(ptrOf(hostBuf))) }
+function badHostBytes(): *u8 { return bytesAt(int(ptrOf(badHostBuf))) }
+function sendBytes(): *u8 { return bytesAt(int(ptrOf(sendBuf))) }
+function recvBytes(): *u8 { return bytesAt(int(ptrOf(recvBuf))) }
+function echoBytes(): *u8 { return bytesAt(int(ptrOf(echoBuf))) }
+function peerBytes(): *u8 { return bytesAt(int(ptrOf(peerBuf))) }
+function saBytes(): *u8 { return bytesAt(int(ptrOf(saBuf))) }
+function ipBytes(): *u8 { return bytesAt(int(ptrOf(ipBuf))) }
+function octBytes(): *u8 { return bytesAt(int(ptrOf(octBuf))) }
+function lateBytes(): *u8 { return bytesAt(int(ptrOf(lateBuf))) }
+
+function putByte(base: *u8, off: int, v: int) {
+  let p = base + off
+  *p = u8(v % 256)
+}
+
+function getByte(base: *u8, off: int): int {
+  let p = base + off
+  return int(*p)
+}
+
+// "127.0.0.1", byte by byte — this module never holds a managed string, because
+// every buffer that reaches the kernel crosses as `*u8` plus a byte count.
+function writeLoopback(base: *u8): int {
+  putByte(base, 0, 49)
+  putByte(base, 1, 50)
+  putByte(base, 2, 55)
+  putByte(base, 3, 46)
+  putByte(base, 4, 48)
+  putByte(base, 5, 46)
+  putByte(base, 6, 48)
+  putByte(base, 7, 46)
+  putByte(base, 8, 49)
+  return 9
+}
+
+// "localhost" — a name `netParseIpv4` must REFUSE. The refusal is load-bearing
+// rather than fussy: every entry point here treats a parse failure as the signal
+// that the caller handed it a hostname, so a parser that accepted this would
+// bind to some arbitrary address instead of reporting the mistake.
+function writeHostname(base: *u8): int {
+  putByte(base, 0, 108)
+  putByte(base, 1, 111)
+  putByte(base, 2, 99)
+  putByte(base, 3, 97)
+  putByte(base, 4, 108)
+  putByte(base, 5, 104)
+  putByte(base, 6, 111)
+  putByte(base, 7, 115)
+  putByte(base, 8, 116)
+  return 9
+}
+
+// The payload: a run whose every byte differs, so a transfer that dropped,
+// duplicated or reordered one is visible. A run of identical bytes would hide
+// all three.
+const payloadLen: int = 24
+
+function fillPayload(base: *u8) {
+  let i = 0
+  while (i < payloadLen) {
+    putByte(base, i, 65 + i)
+    i = i + 1
+  }
+}
+
+function clear(base: *u8, n: int) {
+  let i = 0
+  while (i < n) {
+    putByte(base, i, 0)
+    i = i + 1
+  }
+}
+
+// Byte-for-byte equality. THE WHOLE POINT — see the header.
+function sameBytes(a: *u8, b: *u8, n: int): bool {
+  let i = 0
+  while (i < n) {
+    if (getByte(a, i) != getByte(b, i)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// THE ONE PROPERTY THAT NEEDS A SECOND THREAD, AND THE REASON IT IS WORTH ONE.
+//
+// Every other check here drives both ends in sequence, so no socket call ever
+// actually WOULD BLOCK — which means the EAGAIN branch of every retry loop went
+// completely unexercised, and a provider that used the OTHER platform's EAGAIN
+// (35 here instead of 11) passed the whole program. That was measured, not
+// feared: the first version of this file survived exactly that mutation. A
+// would-block is only observable if something later un-blocks it, and with one
+// thread there is nothing to do the un-blocking.
+//
+// So: this thread waits for the main thread to say it is about to read, lets it
+// get there, and then writes. The main thread calls `netReadSock` on a socket
+// that has nothing in it yet, takes EAGAIN, spins its unscheduled retry loop,
+// and succeeds when this write lands. Nothing is ASSERTED about the ordering: if
+// the write were to win the race the read succeeds immediately and the property
+// still holds. What cannot happen either way is a false pass, because the bytes
+// are compared.
+//
+// IT BUSY-WAITS RATHER THAN SLEEPING, AND THAT IS NOT A STYLE CHOICE. The first
+// version slept 20ms in `parkSleepNs`, and under `BIT_GC=stress` every single
+// collection then ABANDONED — 395 consecutive `stop-the-world rendezvous
+// expired` lines — because a thread asleep inside a syscall cannot answer the
+// collector's rendezvous. That is #1433's shape, reproduced by accident. A Bit
+// loop takes a safepoint at its back edge, so a busy wait answers normally and
+// the stress oracle stays live, which is the whole reason this program is in
+// this suite.
+//
+// NOT `@nosplit`, and it does contain loops. That is the same footing
+// ../chanracelinux's worker entry runs on — a thread this provider created
+// takes safepoints normally, which that program demonstrates across 599,415
+// collections under BIT_GC=stress.
+const respMaxWait: int = 100000000
+const respDelay: int = 200000
+
+export function responderEntry(arg: *byte): *byte {
+  let i = 0
+  let seen = false
+  // Bounded (Power of 10): a main thread that never raises the flag leaves this
+  // thread exiting rather than spinning forever, and the `blocked` property then
+  // fails with a verdict instead of the join timing out.
+  while (i < respMaxWait) {
+    if (atomicLoad(ptrOf(goWords)) != 0) {
+      seen = true
+      i = respMaxWait
+    } else {
+      i = i + 1
+    }
+  }
+  // A short, safepoint-bearing pause so the reader is actually inside its retry
+  // loop when the bytes arrive. Bounded, and load-bearing for nothing but the
+  // LIKELIHOOD of the would-block.
+  let d = 0
+  while (d < respDelay) {
+    d = d + 1
+  }
+  if (seen) {
+    respWrote = i64(netWriteSock(int(respFd), sendBytes(), payloadLen))
+  }
+  atomicStore(ptrOf(doneWords), i32(0))
+  let z: *byte = nil
+  return z
+}
+
+function main() {
+  let hostLen = writeLoopback(hostBytes())
+  let badLen = writeHostname(badHostBytes())
+  fillPayload(sendBytes())
+
+  // --- Address layout -------------------------------------------------------
+  //
+  // Built and read back through this platform's own `sockaddr_in`, so a port
+  // stored at the wrong offset or in the wrong byte order fails here rather
+  // than three syscalls later as "the connection went to port 0".
+  netFillSockAddr(saBytes(), ipBytes(), 0)
+  putByte(ipBytes(), 0, 10)
+  putByte(ipBytes(), 1, 1)
+  putByte(ipBytes(), 2, 2)
+  putByte(ipBytes(), 3, 3)
+  netFillSockAddr(saBytes(), ipBytes(), 40404)
+  clear(octBytes(), 4)
+  netSockAddrOctets(saBytes(), octBytes())
+  let addrOk = netSockAddrPort(saBytes()) == 40404 &&
+               getByte(octBytes(), 0) == 10 && getByte(octBytes(), 1) == 1 &&
+               getByte(octBytes(), 2) == 2 && getByte(octBytes(), 3) == 3 &&
+               netSockAddrLen() == 16
+
+  // --- A hostname must be refused, not guessed at ---------------------------
+  let refused = netListenTcp(badHostBytes(), badLen, 0, 16) < 0 &&
+                netBindUdp(badHostBytes(), badLen, 0) < 0 &&
+                netDialTcp(badHostBytes(), badLen, 1) < 0
+
+  // --- TCP ------------------------------------------------------------------
+  let lfd = netListenTcp(hostBytes(), hostLen, 0, 16)
+  let port = netLocalPort(lfd)
+  // Port 0 asked the kernel to choose, so a real ephemeral port coming back is
+  // the proof that `getsockname` parsed the address the same way `bind` wrote it.
+  let bound = lfd >= 0 && port > 0
+
+  // DIAL BEFORE ACCEPT. The connection then sits in the listener's backlog and
+  // the accept succeeds on its first attempt, so this does not depend on how
+  // fast the unscheduled retry loop spins.
+  let cfd = netDialTcp(hostBytes(), hostLen, port)
+  let afd = netAcceptTcp(lfd)
+  let paired = cfd >= 0 && afd >= 0
+
+  // A freshly connected socket has no pending error. This is the read that
+  // `netDialTcp` makes on the EINPROGRESS path and the one whose omission is the
+  // classic non-blocking-connect bug.
+  let clean = netSocketError(cfd) == 0
+
+  let sent = netWriteSock(cfd, sendBytes(), payloadLen)
+  clear(recvBytes(), payloadLen)
+  let got = netReadSock(afd, recvBytes(), payloadLen)
+  let delivered = sent == payloadLen && got == payloadLen &&
+                  sameBytes(sendBytes(), recvBytes(), payloadLen)
+
+  // Echo the other way, so both directions of the same pair are exercised.
+  let back = netWriteSock(afd, recvBytes(), payloadLen)
+  clear(echoBytes(), payloadLen)
+  let echoed = netReadSock(cfd, echoBytes(), payloadLen)
+  let roundTrip = back == payloadLen && echoed == payloadLen &&
+                  sameBytes(sendBytes(), echoBytes(), payloadLen)
+
+  // A closed peer is an ORDERLY END OF STREAM: 0, not an error. A caller's read
+  // loop terminates on that, and reporting -1 instead would turn every clean
+  // disconnect into a failure.
+  netClose(cfd)
+  let eof = netReadSock(afd, recvBytes(), payloadLen)
+  netClose(afd)
+  netClose(lfd)
+
+  // --- A refused connection must be reported, not deferred ------------------
+  //
+  // The listener is gone, so nothing is accepting on `port`. A non-blocking
+  // connect reports success immediately and fails in the background, so this
+  // fails ONLY IF SO_ERROR is read back — which is the one property that would
+  // otherwise surface as a mysterious `write` error much later.
+  let refusedDial = netDialTcp(hostBytes(), hostLen, port) < 0
+
+  // --- UDP ------------------------------------------------------------------
+  let rfd = netBindUdp(hostBytes(), hostLen, 0)
+  let sfd = netBindUdp(hostBytes(), hostLen, 0)
+  let rport = netLocalPort(rfd)
+  let sport = netLocalPort(sfd)
+  let udpBound = rfd >= 0 && sfd >= 0 && rport > 0 && sport > 0 && rport != sport
+
+  let dsent = netSendTo(sfd, hostBytes(), hostLen, rport, sendBytes(), payloadLen)
+  clear(recvBytes(), payloadLen)
+  clear(peerBytes(), netSockAddrLen())
+  let dgot = netRecvFrom(rfd, recvBytes(), payloadLen, peerBytes())
+  // THE SENDER'S ADDRESS IS ASSERTED, not just the payload. `recvfrom`'s
+  // `socklen_t` is in/out; a provider that failed to re-arm it, or that parsed
+  // the returned `sockaddr_in` with the other platform's offsets, would still
+  // deliver the right bytes and report the wrong sender — which is exactly the
+  // shape of bug that a payload-only check cannot see.
+  clear(octBytes(), 4)
+  netSockAddrOctets(peerBytes(), octBytes())
+  let datagram = dsent == payloadLen && dgot == payloadLen &&
+                 sameBytes(sendBytes(), recvBytes(), payloadLen) &&
+                 netSockAddrPort(peerBytes()) == sport &&
+                 getByte(octBytes(), 0) == 127 && getByte(octBytes(), 3) == 1
+
+  netClose(rfd)
+  netClose(sfd)
+
+  // --- DNS: the socket, and the layout its timeout depends on ---------------
+  //
+  // The receive timeout is read BACK rather than waited on. `struct timeval`
+  // differs between the two platforms (`tv_usec` is 32 bits here, 64 on Linux)
+  // and the only behavioural symptom of getting it wrong is that a lost DNS
+  // query HANGS instead of timing out — a failure mode that wedges the suite
+  // instead of reporting. See `netRcvTimeoMs`.
+  let dfd = netDnsSocket()
+  let timeo = netRcvTimeoMs(dfd)
+  let dns = dfd >= 0 && timeo == netDnsTimeoutMs
+  netClose(dfd)
+
+  // A dotted quad resolves to itself WITHOUT touching the network — the
+  // pass-through that makes `netResolve` safe to call on an address.
+  clear(ipBytes(), 4)
+  let literal = netResolve(hostBytes(), hostLen, ipBytes(), ipBytes()) &&
+                getByte(ipBytes(), 0) == 127 && getByte(ipBytes(), 1) == 0 &&
+                getByte(ipBytes(), 2) == 0 && getByte(ipBytes(), 3) == 1
+
+  // --- A read that really does block, and then does not ---------------------
+  //
+  // See `responderEntry`. This is the only place the EAGAIN branch of a retry
+  // loop is reached, so it is the only guard on this platform's `eAgain`.
+  //
+  // LAST, ON ITS OWN SOCKET PAIR, AND THAT PLACEMENT IS LOAD-BEARING. A thread
+  // this program starts and then releases leaves collections abandoning for the
+  // REST OF THE RUN — measured here as 3891 `stop-the-world rendezvous expired`
+  // against 274 completed when the property sat in the middle of the program.
+  // That is a runtime property of a released `runtime/thread` worker, not
+  // anything this port does, and ../chanracelinux does not show it only because
+  // its threads live until the last line. Running this property last gives the
+  // same shape, so the collections that matter all happen before it.
+  let blfd = netListenTcp(hostBytes(), hostLen, 0, 16)
+  let blport = netLocalPort(blfd)
+  let bcfd = netDialTcp(hostBytes(), hostLen, blport)
+  let bafd = netAcceptTcp(blfd)
+  respFd = i64(bafd)
+  respWrote = 0
+  atomicStore(ptrOf(goWords), i32(0))
+  atomicStore(ptrOf(doneWords), i32(threadRunning))
+  let bp: *byte = nil
+  let h = threadStart(entryOf(responderEntry), bp, ptrOf(doneWords))
+  clear(lateBytes(), payloadLen)
+  atomicStore(ptrOf(goWords), i32(1))
+  let late = netReadSock(bcfd, lateBytes(), payloadLen)
+  let joined = threadJoin(ptrOf(doneWords), 120000000000, parkSleepNs, parkMonoNs) == threadJoinDone
+  let released = threadRelease(h)
+  let blocked = blfd >= 0 && bcfd >= 0 && bafd >= 0 && h != 0 && joined && released &&
+                int(respWrote) == payloadLen && late == payloadLen &&
+                sameBytes(sendBytes(), lateBytes(), payloadLen)
+  netClose(bcfd)
+  netClose(bafd)
+  netClose(blfd)
+
+  println("addr ${addrOk} refused ${refused}")
+  println("tcp ${bound} ${paired} ${clean} ${delivered} ${roundTrip} eof ${eof}")
+  println("block ${blocked}")
+  println("dial ${refusedDial}")
+  println("udp ${udpBound} ${datagram}")
+  println("dns ${dns} ${literal}")
+}
