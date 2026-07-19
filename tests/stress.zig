@@ -51,6 +51,47 @@
 //! indistinguishable from a hang. Build first, run the binary second, which is
 //! exactly what this harness does.
 //!
+//! THERE IS NO QUIC/TLS PROGRAM HERE, AND THAT IS A DECLARED HOLE (#1475). The
+//! networking stack is the largest and most concurrent part of the stdlib, so its
+//! absence from the precise-rooting oracle is exactly the kind of exemption that
+//! must be written down rather than inferred from an empty directory listing.
+//!
+//! It was filed on the observation that `tests/imports/quicconn` exceeds 300s
+//! under `BIT_GC=stress`, with the #1462 precedent in mind — a thread that
+//! reaches no safepoint burns a full 8M-iteration rendezvous per collection. That
+//! is NOT what this is, and the measurements say so rather than intuition
+//! (arm64-macOS, all with the binary built first and the policy applied to THAT):
+//!
+//!   - `BIT_GC_STATS=1` over the first 100s: 596,630 collections, `stw_abandoned`
+//!     = 0. Not one rendezvous expired, so no thread is failing the `blocked`
+//!     contract. The process sits at 100% CPU with CPU time tracking elapsed
+//!     time — it is compute-bound and progressing, not wedged.
+//!   - Payload size is irrelevant. Shrinking the 96 KiB transfer to 1 byte leaves
+//!     a run that is 1.2s by default and still had not finished its first
+//!     handshake after 300s of stress. So the cost is not in the data path.
+//!   - It is not QUIC's, and not concurrency's. `tests/imports/cryptorsa` — no
+//!     sockets, no spawn, no channels — goes from 2.4s to over 120s under the
+//!     same policy.
+//!
+//! So the cause is plain arithmetic, not a defect: stress collects at EVERY
+//! safepoint, each collection is a full mark-sweep of the whole live heap
+//! (~0.17ms at quicconn's ~926 KB live set), and a QUIC-TLS handshake is
+//! RSA-2048 plus X25519 plus the record path — millions of loop back-edges, hence
+//! millions of collections. Any loop-dense compute workload in Bit costs the same
+//! two to three orders of magnitude here; QUIC merely does more of it than
+//! anything else in the tree.
+//!
+//! WHAT WOULD CLOSE THE HOLE is a stress program that exercises the QUIC
+//! transport's concurrency — the connection loop, its ticker, the listener demux,
+//! spawn/chan/select over UDP — without paying for a handshake per run. That is
+//! blocked today for a second, unrelated reason: self-hosted `bit` cannot build
+//! *any* program importing `std/quic` (it refuses to lower 10 functions, the
+//! generic `std/tls` handshake helpers among them). This suite requires the
+//! self-hosted pass and rightly forbids a skip-list, so such a program cannot be
+//! added until that gap closes. Do not "solve" this by lowering the payload or by
+//! running quicconn here with a longer timeout — neither buys any rooting
+//! coverage, and the first reads as if it did.
+//!
 //! Skipped when the host is not a supported runtime target (no libbitrt to link
 //! against), mirroring the golden `// run` cases and the examples guard.
 
