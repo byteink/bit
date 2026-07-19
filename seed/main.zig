@@ -167,6 +167,20 @@ pub fn main(init: std.process.Init) !void {
 /// Upper bound on a `.bit` source file `bit build`/`bit run` will read.
 const max_source_bytes = 8 << 20; // 8 MiB
 
+/// A per-invocation nonce for scratch paths that are WRITTEN and then EXEC'd
+/// (`bit run`, `bit test`). A fixed name lets two concurrent processes clobber
+/// one file while the other execs it — ETXTBSY, or worse a binary that is half
+/// one build and half another, surfacing as a hang rather than an error (#1459,
+/// #1463). Seeding from the wall clock is sufficient here: the collision window
+/// is one nanosecond between two independently launched processes, and the
+/// consequence of the astronomically unlikely tie is a retryable failure, not a
+/// wrong answer.
+fn scratchNonce(io: Io) u64 {
+    const ns: i96 = Io.Timestamp.now(io, .real).nanoseconds;
+    var prng = std.Random.DefaultPrng.init(@bitCast(@as(i64, @truncate(ns))));
+    return prng.random().int(u64);
+}
+
 /// Location of the runtime archive. // ponytail: fixed dev-build path;
 /// resolve relative to the `bit` binary's own install prefix, and honor an
 /// env override, once packaging (#358) lands.
@@ -276,6 +290,21 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
         return 2;
     }
 
+    // `bit run` of a foreign-target binary cannot exec here, so there is nothing
+    // to run. It used to build anyway and fall through to the build path, which
+    // writes the artifact into the CWD under the source stem — a silent
+    // multi-hundred-KB drop in the working tree from a command that only ever
+    // promised to run something and throw it away (#1463: `git add -A` nearly
+    // committed one). Refuse, unless `-o` says where the user actually wants it:
+    // an explicit destination is a request, the cwd stem is litter.
+    //
+    // Checked here rather than after linking so it costs nothing: there is no
+    // point compiling and linking a whole program in order to then decline it.
+    if (is_run and target != host_target and out_path == null) {
+        try err_out.print("bit: cannot run a {s} binary on this host: use `bit build` (add -o to choose where it lands)\n", .{@tagName(target)});
+        return 2;
+    }
+
     // An object is emitted, never linked, so it needs no runtime archive — and
     // must not demand one, since a Bit-sourced libbitrt.a is exactly what this
     // path exists to build (#1397).
@@ -329,13 +358,12 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
     }
 
     // `bit run` on a binary this host can exec runs it and throws it away, like
-    // `zig run` — it must never litter the cwd. A plain build, or a `run` of a
-    // foreign-target binary that can't exec here, instead keeps the artifact at
-    // `-o`/the source stem.
+    // `zig run` — it must never litter the cwd.
     if (is_run and target == host_target) {
-        // ponytail: fixed /tmp name keyed by the stem; two concurrent runs of
-        // the same-named file would collide — add a pid/nonce if that bites.
-        const tmp = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-run-{s}", .{std.fs.path.stem(src)}, 0);
+        // Unique per invocation: two concurrent `bit run`s of a same-named
+        // module otherwise write and exec ONE path, which is the ETXTBSY/
+        // clobber shape #1459 records for `seed/link.zig`.
+        const tmp = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-run-{s}-{x}", .{ std.fs.path.stem(src), scratchNonce(io) }, 0);
         defer gpa.free(tmp);
         try Io.Dir.cwd().writeFile(io, .{
             .sub_path = tmp,
@@ -457,7 +485,10 @@ fn runTest(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, err_out: *Io.Writer,
         return 0;
     }
 
-    const tmp = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-test-{s}", .{ident}, 0);
+    // Disambiguated for the same reason as `bit run`'s path above (#1459/#1463):
+    // two concurrent `bit test` runs of same-named modules must not write and
+    // exec one file.
+    const tmp = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-test-{s}-{x}", .{ ident, scratchNonce(io) }, 0);
     defer gpa.free(tmp);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = tmp,
@@ -1496,4 +1527,58 @@ test "build: a printing program compiles, links, and runs" {
         else => 1,
     });
     try std.testing.expectEqualStrings("hi from bit", result.stdout);
+}
+
+test "run of a foreign target refuses instead of dropping a binary in the cwd (#1463)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = Io.Dir.cwd();
+
+    // A cross target that is definitely not this host, whichever host this is.
+    const foreign: BuildTarget = if (host_target == .aarch64_macos) .x86_64_linux else .aarch64_macos;
+
+    // The stem is what the old code used as the cwd destination, so a
+    // regression drops a file at exactly this name next to the test runner.
+    // Unique per run so a leftover from another worktree cannot mask it.
+    const stem = try std.fmt.allocPrint(gpa, "bit-runlitter-{x}", .{std.testing.random_seed});
+    defer gpa.free(stem);
+    const dir = try std.fmt.allocPrint(gpa, "/tmp/{s}", .{stem});
+    defer gpa.free(dir);
+    const dir_z = try std.fmt.allocPrintSentinel(gpa, "{s}", .{dir}, 0);
+    defer gpa.free(dir_z);
+
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    const main_bit = try std.fmt.allocPrint(gpa, "{s}/main.bit", .{dir});
+    defer gpa.free(main_bit);
+    try cwd.writeFile(io, .{ .sub_path = main_bit, .data = "function main() {\n  print(\"x\")\n}\n" });
+
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+
+    const target_z = try std.fmt.allocPrintSentinel(gpa, "{s}", .{@tagName(foreign)}, 0);
+    defer gpa.free(target_z);
+    // `--target` takes the CLI spelling (dashes), not the enum tag.
+    const target_cli = try std.fmt.allocPrintSentinel(gpa, "{s}", .{switch (foreign) {
+        .x86_64_linux => "x86_64-linux",
+        .aarch64_linux => "aarch64-linux",
+        .aarch64_macos => "aarch64-macos",
+    }}, 0);
+    defer gpa.free(target_cli);
+
+    const rc = try runBuildOrRun(gpa, io, &err.writer, true, &.{ dir_z, "--target", target_cli });
+
+    // The actual point of the ticket FIRST: nothing was written to the cwd.
+    // The old code built the program and wrote it here under `stem`.
+    try std.testing.expectError(error.FileNotFound, cwd.statFile(io, stem, .{}));
+
+    // Refused, and said why. Kept as a second assertion because it holds even
+    // on a host with no cross-target libbitrt, where the mutated code would
+    // fail to build rather than litter — the refusal must be a decision, not an
+    // accident of a missing runtime archive.
+    try std.testing.expectEqual(@as(u8, 2), rc);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "bit build") != null);
 }
