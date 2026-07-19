@@ -56,230 +56,164 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    const runtime_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/alloc.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(runtime_tests).step);
+    // Every `seed/` and `runtime/` unit-test root, declared once.
+    //
+    // Single-sourced deliberately. `tests/testroots.zig` measures which test
+    // namespaces each of these roots actually collects, and fails the build if a
+    // test-bearing file under `seed/` or `runtime/` is collected by none of
+    // them. That gate is only as good as its idea of what the roots are, so the
+    // list it reads and the list `zig build test` runs have to be the same list
+    // — a hand-kept second copy sitting next to the real entries is precisely
+    // the kind of thing that looks authoritative and silently drifts. Adding a
+    // root here wires it and tells the gate about it in one edit.
+    const TestRoot = struct {
+        path: []const u8,
+        /// Restricts execution to test names starting with one of these.
+        /// Empty runs everything the root collects.
+        filters: []const []const u8 = &.{},
+        /// `runtime/shims.zig` `@compileError`s off Linux (see its module doc
+        /// comment), so it can't even be built for another host. Gated on the
+        /// resolved target rather than skipped at runtime, and dropped from the
+        /// gate's root set too so the two never disagree about what ran.
+        linux_only: bool = false,
+        /// Wired above rather than by the loop: the `main.zig` root reuses the
+        /// compiler's own module. Listed here so the gate still sees it.
+        wired_above: bool = false,
+    };
+    const test_roots = [_]TestRoot{
+        .{ .path = "seed/main.zig", .wired_above = true },
 
-    const sched_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/sched.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(sched_tests).step);
+        .{ .path = "runtime/alloc.zig" },
+        .{ .path = "runtime/sched.zig" },
+        .{ .path = "runtime/chan.zig" },
+        .{ .path = "runtime/root.zig" },
+        .{ .path = "runtime/shims.zig", .linux_only = true },
 
-    const chan_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/chan.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(chan_tests).step);
+        .{ .path = "seed/diagnostics.zig" },
+        .{ .path = "seed/lexer.zig" },
+        .{ .path = "seed/ast.zig" },
+        .{ .path = "seed/parser.zig" },
+        .{ .path = "seed/resolve.zig" },
+        .{ .path = "seed/fmt.zig" },
+        .{ .path = "seed/regalloc.zig" },
+        .{ .path = "seed/obj/elf.zig" },
+        .{ .path = "seed/opt.zig" },
 
-    const root_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(root_tests).step);
+        // §17.6 module-scoped emission. Needs its own entry like every other
+        // file here: `unit_tests` is rooted at `main.zig`, and a test in a file
+        // that root merely imports is not necessarily collected — a test added
+        // to `emit.zig` without this could silently never run.
+        .{ .path = "seed/emit.zig" },
 
-    // Linux-only (see runtime/shims.zig's module doc comment): gated on the
-    // resolved target's OS, not a runtime skip, since the file itself
-    // `@compileError`s off non-Linux and so cannot even be built for e.g. a
-    // macOS `-Dtarget`. Silently absent from `zig build test` on every other
-    // host, same as this project's other target-gated modules.
-    if (target.result.os.tag == .linux) {
-        const shims_tests = b.addTest(.{
+        // Rooted at `seed/` (not `seed/codegen/`) via anchor files, so
+        // `arm64.zig`/`x64.zig`/`common.zig`'s `../ir.zig`-style imports
+        // resolve — a module rooted at `seed/codegen/` would have them escape
+        // its root, which Zig rejects. `compileFunction`'s native-execution
+        // tests self-skip off x86-64 Linux (see `x64.zig`'s `can_exec_native`),
+        // so both are safe to run on every CI host.
+        .{ .path = "seed/codegen_arm64_test.zig" },
+        .{ .path = "seed/codegen_x64_test.zig" },
+
+        // Same anchor reason: `pe.zig`'s `../codegen/x64.zig` import.
+        .{ .path = "seed/obj_pe_test.zig" },
+
+        // The ELF linker driver, which imports the whole `link/` package
+        // (object/archive/elf_reader/strip) plus `obj/elf.zig`, so their tests
+        // come along. The end-to-end tests (link a real object against
+        // `libbitrt.a` and run it) self-skip when `zig build libbitrt` hasn't
+        // populated `zig-out/lib/`, or off x86-64 Linux where the ELF can't run.
+        .{ .path = "seed/link.zig" },
+
+        // The Mach-O linker driver needs its OWN entry: `link.zig` is the ELF
+        // driver and never imports `link/macho.zig`. Between that and the
+        // main.zig root not collecting it, this file's tests — including the
+        // end-to-end "boots on macOS" one — had never run at all (#1445).
+        // Anchored at `seed/` so `../obj/macho.zig` resolves.
+        .{ .path = "seed/link_macho_test.zig" },
+
+        // Standalone object writer (task #343): no imports outside `std`. Its
+        // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
+        // hosts (those tools don't exist there), so this is safe everywhere.
+        .{ .path = "seed/obj/macho.zig" },
+
+        // The lowering pass and the language server. Both fell through every
+        // other root — 23 tests that had never executed (#1453), 14 of them
+        // covering `lower.zig`, one of the largest modules in the seed.
+        //
+        // Filtered to those two namespaces on purpose. The anchor's module
+        // collects 100+ tests, but all but 23 are `lexer`/`parser`/`resolve`/
+        // `check`/`fmt`/`ir` tests already running under their own entries;
+        // unfiltered, this one root would add ~160 duplicate executions to an
+        // already-slow suite. If the filter ever stops matching — a rename, say
+        // — the gate reports `lower`/`lsp` as orphaned rather than going quiet.
+        .{ .path = "seed/lower_lsp_test.zig", .filters = &.{ "lower.test.", "lsp.test." } },
+    };
+
+    // The subset that applies to this host, shared by the loop below and the
+    // gate, so neither can believe a root ran that the other skipped.
+    var applicable_roots: std.ArrayList([]const u8) = .empty;
+    defer applicable_roots.deinit(b.allocator);
+    // Filters, newline-joined per root and positionally aligned with
+    // `applicable_roots` (empty string = unfiltered). The gate has to model the
+    // filter, not just the root: a filter that stops matching leaves an entry
+    // that builds fine and runs zero tests, which is the same vacuous guard
+    // this task was opened to remove.
+    var applicable_filters: std.ArrayList([]const u8) = .empty;
+    defer applicable_filters.deinit(b.allocator);
+
+    for (test_roots) |r| {
+        if (r.linux_only and target.result.os.tag != .linux) continue;
+        applicable_roots.append(b.allocator, r.path) catch @panic("OOM");
+        applicable_filters.append(
+            b.allocator,
+            std.mem.join(b.allocator, "\n", r.filters) catch @panic("OOM"),
+        ) catch @panic("OOM");
+        if (r.wired_above) continue;
+        const t = b.addTest(.{
             .root_module = b.createModule(.{
-                .root_source_file = b.path("runtime/shims.zig"),
+                .root_source_file = b.path(r.path),
                 .target = target,
                 .optimize = optimize,
             }),
+            .filters = r.filters,
         });
-        test_step.dependOn(&b.addRunArtifact(shims_tests).step);
+        test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    const diagnostics_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/diagnostics.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(diagnostics_tests).step);
+    // Orphaned-test-file gate (#1453): fails the build when a `.zig` file under
+    // `seed/` or `runtime/` contains tests that no wired root collects. Both
+    // #1445 and #1453 were exactly that, and both had shipped for months
+    // reading as coverage. Reachability is MEASURED, never derived from the
+    // import graph — see tests/testroots.zig and tests/list_test_runner.zig.
+    const testroots_opts = b.addOptions();
+    testroots_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    testroots_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    // The gate spawns `zig test` itself. A test runner's environment need not
+    // carry HOME, and without it the child cannot resolve its own cache
+    // directory (`AppDataDirUnavailable`), so hand it both roots explicitly
+    // rather than depending on inherited environment.
+    testroots_opts.addOption([]const u8, "global_cache_root", b.graph.global_cache_root.path orelse ".");
+    testroots_opts.addOption([]const u8, "local_cache_root", b.cache_root.path orelse ".");
+    testroots_opts.addOption([]const []const u8, "roots", applicable_roots.items);
+    testroots_opts.addOption([]const []const u8, "root_filters", applicable_filters.items);
+    testroots_opts.addOption([]const u8, "host_os", @tagName(target.result.os.tag));
+    testroots_opts.addOptionPath("list_runner", b.path("tests/list_test_runner.zig"));
 
-    const lexer_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/lexer.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const testroots_mod = b.createModule(.{
+        .root_source_file = b.path("tests/testroots.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    test_step.dependOn(&b.addRunArtifact(lexer_tests).step);
+    testroots_mod.addOptions("build_options", testroots_opts);
 
-    const ast_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/ast.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(ast_tests).step);
-
-    const parser_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/parser.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(parser_tests).step);
-
-    const resolve_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/resolve.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(resolve_tests).step);
-
-    const fmt_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/fmt.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(fmt_tests).step);
-
-    const regalloc_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/regalloc.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(regalloc_tests).step);
-
-    const elf_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/obj/elf.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(elf_tests).step);
-
-    // Rooted at `seed/` (not `seed/codegen/`) via the anchor file, so
-    // `arm64.zig`/`common.zig`'s `../ir.zig`-style imports resolve — see that
-    // file's doc comment. Covers both files: `arm64.zig` imports `common.zig`.
-    const arm64_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/codegen_arm64_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(arm64_tests).step);
-
-    // Rooted at `seed/` (not `seed/codegen/`) via the anchor file, so
-    // `x64.zig`'s `../ir.zig`-style imports resolve — see that file's doc
-    // comment. `compileFunction`'s native-execution tests self-skip off
-    // x86-64 Linux (see `x64.zig`'s `can_exec_native`), so this is safe to
-    // run on every CI host.
-    const x64_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/codegen_x64_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(x64_tests).step);
-
-    const opt_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/opt.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(opt_tests).step);
-
-    // §17.6 module-scoped emission. Needs its own entry like every unit-test
-    // file above: `unit_tests` is rooted at `main.zig`, and a test in a file
-    // that root merely imports is NOT collected — a test added to `emit.zig`
-    // without this silently never runs.
-    const emit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/emit.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(emit_tests).step);
-
-    // Rooted at `seed/` (not `seed/obj/`) via the anchor file, so
-    // `pe.zig`'s `../codegen/x64.zig` import resolves — see that file's doc
-    // comment and `obj_pe_test.zig`'s.
-    const pe_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/obj_pe_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(pe_tests).step);
-
-    // Rooted at the linker driver `link.zig`, which imports the whole `link/`
-    // package (object/archive/elf_reader/strip) plus `obj/elf.zig`, so their
-    // tests all come along. The end-to-end tests (link a real object against
-    // `libbitrt.a` and run it) self-skip when `zig build libbitrt` hasn't
-    // populated `zig-out/lib/`, or off x86-64 Linux where the ELF can't run.
-    const link_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/link.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(link_tests).step);
-
-    // The Mach-O linker driver. It needs its OWN entry: `link.zig` is the ELF
-    // driver and never imports `link/macho.zig`, and `unit_tests` is rooted at
-    // `main.zig`, which does not collect tests from files it merely imports.
-    // Between them this file's tests — including the end-to-end "boots on
-    // macOS" one — had never run under `zig build test` at all (#1445).
-    // Rooted at `seed/` via the anchor file so `../obj/macho.zig` resolves.
-    const macho_link_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/link_macho_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(macho_link_tests).step);
-
-    // Standalone object writer (task #343): no imports outside `std`. Its
-    // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
-    // hosts (those tools don't exist there), so this is safe on every CI host.
-    const macho_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/obj/macho.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(macho_tests).step);
+    const testroots_tests = b.addTest(.{ .root_module = testroots_mod });
+    const testroots_run = b.addRunArtifact(testroots_tests);
+    // Spawns `zig test` per root, so its result depends on the state of the
+    // source tree rather than on its own inputs alone — same reason rootpins
+    // below opts out of the build cache.
+    testroots_run.has_side_effects = true;
+    test_step.dependOn(&testroots_run.step);
+    b.step("testroots", "Orphaned-test-file gate (tests/testroots.zig)").dependOn(&testroots_run.step);
 
     // Golden-file harness: discovers tests/cases/*.bit and checks each against
     // its sibling .expected. The cases directory (absolute) is injected as a
