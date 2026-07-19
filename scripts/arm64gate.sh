@@ -142,7 +142,10 @@ mutant_stream() {
     printf '\nthis is not valid zig — arm64gate deliberate breakage\n' >> "${victim}"
   fi
   echo "arm64gate: mutating ${victim#"${tmp}"/}" >&2
-  tar c -C "${tmp}" .
+  # --no-xattrs: macOS bsdtar otherwise stamps every entry with a
+  # com.apple.provenance xattr that GNU tar in the container warns about once per
+  # file — ~100KB of noise that buries the actual result.
+  tar c --no-xattrs -C "${tmp}" .
   rm -rf "${tmp}"
 }
 
