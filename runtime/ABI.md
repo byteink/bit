@@ -761,6 +761,7 @@ defined exactly once).
 | `bit_rt_os_argc`      | `() -> i64` (§19)                                      |
 | `bit_rt_os_arg_at`    | `(i: i64) -> *const RtBytes` (§19)                     |
 | `bit_rt_os_env`       | `(name: *const RtBytes) -> *const RtBytes` (§19)       |
+| `bit_rt_os_self_exe`  | `() -> *const RtBytes` (§19)                           |
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 | `bit_rt_os_run`       | `(path: *const RtBytes) -> i64` (§19)                  |
 | `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
@@ -1156,6 +1157,7 @@ finish together, in ~50ms, on one OS thread.
 bit_rt_os_argc()           -> i64
 bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
 bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
+bit_rt_os_self_exe()       -> *const RtBytes   // own path, symlinks resolved; "" if unknown
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure
 bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i

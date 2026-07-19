@@ -1353,6 +1353,21 @@ export fn bit_rt_os_env(name: *const RtBytes) callconv(.c) *const RtBytes {
     return stringFromBytes(v);
 }
 
+/// `bit_rt_os_self_exe`: the running executable's own absolute path with
+/// symlinks resolved, or the empty string when the platform cannot report it
+/// (Bit has no nil string; `std/os` maps empty to "unknown", same convention as
+/// `os_env`). Callers must treat empty as "fall back", never as a valid path.
+///
+/// `argv[0]` is deliberately NOT a fallback: it is whatever the caller passed,
+/// so it can be a bare name, a relative path against a cwd that has since
+/// changed, or an outright lie. Resolving an install prefix from it would be
+/// worse than admitting we do not know.
+export fn bit_rt_os_self_exe() callconv(.c) *const RtBytes {
+    var buf: [max_path]u8 = undefined;
+    const p = sched.selfExePath(&buf) catch return stringFromBytes("");
+    return stringFromBytes(p);
+}
+
 /// `bit_rt_os_exit`: terminate the process immediately with `code`. Deferred
 /// calls do not run (SPEC §18.4's panic rules apply equally here).
 export fn bit_rt_os_exit(code: i64) callconv(.c) noreturn {

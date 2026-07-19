@@ -905,18 +905,36 @@ pub fn build(b: *std.Build) void {
     // is the largest corpus in the project and it drove only the seed, so
     // reverting the selfhost half of #1419's variadic fix left `zig build test`
     // green. Same LazyPath, same "empty only on a cross build" contract.
+    // Install-prefix path resolution (#1452): the shipped `bit` must find its
+    // stdlib and runtime archive from its OWN location, through a bare symlink,
+    // with no environment set — the property every installer depends on.
+    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
+    const pathresolve_opts = b.addOptions();
+    pathresolve_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    wireLibbitrt(pathresolve_opts, host_libbitrt_bin);
+    const pathresolve_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pathresolve.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pathresolve_mod.addOptions("build_options", pathresolve_opts);
+    const pathresolve_tests = b.addTest(.{ .root_module = pathresolve_mod });
+    test_step.dependOn(&b.addRunArtifact(pathresolve_tests).step);
+
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
         diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
         lintcmd_opts.addOptionPath("selfhost_bit", selfhosted);
         version_opts.addOptionPath("selfhost_bit", selfhosted);
+        pathresolve_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
         diffimports_opts.addOption([]const u8, "selfhost_bit", "");
         lintcmd_opts.addOption([]const u8, "selfhost_bit", "");
         version_opts.addOption([]const u8, "selfhost_bit", "");
+        pathresolve_opts.addOption([]const u8, "selfhost_bit", "");
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the

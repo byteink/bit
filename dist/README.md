@@ -57,35 +57,42 @@ bit-<version>-<os>-<arch>/
   ARTIFACT.md                          # this file
 ```
 
-## Required environment — read this before writing an installer
+## Path resolution — installers need no wrapper
 
-`bin/bit` resolves the standard library and the runtime archive from
-**cwd-relative default paths** (`stdlib` and `zig-out/lib/<triple>/libbitrt.a`),
-so an installed binary invoked from a user's own directory cannot find either.
-Both are overridable, and an installer **must** set them:
+`bin/bit` resolves the standard library and the runtime archive from **its own
+location**, not the current working directory. Unpack the artifact anywhere and
+symlink `bin/bit` into `PATH`; it works from any directory with no wrapper
+script and no environment variables:
 
 ```sh
-BIT_STDLIB=<prefix>/stdlib
-BIT_LIBBITRT=<prefix>/lib/<native-triple>/libbitrt.a
+tar xf bit-<version>-linux-x86_64.tar.xz -C /opt
+ln -s /opt/bit-<version>-linux-x86_64/bin/bit /usr/local/bin/bit
+cd ~/anywhere && bit run hello.bit      # just works
 ```
 
-Verified working: with both set, a `bit` binary outside the repo compiles and
-runs a program from an unrelated directory.
+The symlink is resolved before the prefix is computed, so the install root is
+the real unpacked directory rather than `/usr/local`. Resolution order for each
+of the two paths, independently:
 
-Two consequences installers must handle:
+1. the explicit override (`BIT_STDLIB`, `BIT_LIBBITRT`) when set,
+2. `<prefix>/stdlib` and `<prefix>/lib/<triple>/libbitrt.a`, where `<prefix>` is
+   the parent of the directory holding the binary (a flat unpack, everything
+   beside the binary, is tried second),
+3. the development-tree defaults, relative to the cwd.
 
-* `BIT_LIBBITRT` names **one** archive, so an install wired this way can only
-  build for its own host. Cross-compiling with `--target` needs the variable
-  re-pointed at the matching triple. Document it; do not hide it.
-* Because the variables are required, ship a wrapper or a profile export rather
-  than a bare symlink into `PATH`. Homebrew: `bin.env_script_all_files`.
-  `install.sh`: a `bin/bit` wrapper in `~/.bit/bin` that exports both and
-  `exec`s the real binary.
+Each path is answered on its own evidence — the prefix is probed, not assumed —
+so a build tree, a flat unpack and a shipped artifact all work without a special
+case.
 
-Resolving these paths against the binary's own install prefix is the real fix
-and belongs in the compiler (both `selfhost/main.bit` and `seed/main.zig` carry
-a `ponytail:` note saying so, deferred to this task). Until that lands, the env
-contract above is the supported install path.
+The two environment variables remain supported as overrides, and are the way to
+point a single install at a **cross-target** runtime archive: `BIT_LIBBITRT`
+names one archive, so building for a non-host `--target` needs it re-pointed at
+the matching triple. They are no longer required for normal use, and installers
+should not set them.
+
+Homebrew should use a plain `bin.install_symlink`, not
+`bin.env_script_all_files`; `install.sh` should symlink `bin/bit` rather than
+generate a wrapper.
 
 ## Checksums
 
@@ -111,8 +118,9 @@ yet, so this file is the only integrity check a downloader gets.
 ## How the pipeline is verified
 
 The `dist` job smoke-tests the **unpacked artifact**, not the staging tree: it
-untars into an unrelated directory, sets only the two variables above, and
-requires `bit` to compile and run a program. Testing the shipped bytes rather
+untars into an unrelated directory, symlinks `bin/bit` into `PATH` with **no**
+environment set, and requires `bit` to compile and run a program from an
+unrelated cwd. Testing the shipped bytes rather
 than the build tree is what caught macOS `bsdtar` writing an AppleDouble
 `._<name>.bit` beside every stdlib source — files the shipped compiler then
 globbed as real input, breaking every macOS artifact. A staging-tree test passed

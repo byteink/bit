@@ -3175,6 +3175,7 @@ const Checker = struct {
         .{ "osArgc", PrimSig{ .params = &.{}, .ret = .i64 } },
         .{ "osArgAt", PrimSig{ .params = &.{.i64}, .ret = .string } },
         .{ "osEnv", PrimSig{ .params = &.{.string}, .ret = .string } },
+        .{ "osSelfExe", PrimSig{ .params = &.{}, .ret = .string } },
         .{ "osExit", PrimSig{ .params = &.{.i64}, .ret = null } },
         // Crypto (ABI.md §21) — under std/crypto. `cryptoSecureZero(b: []byte)`
         // is not here: its `[]byte` parameter is not a `Prim`, so it is

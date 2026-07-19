@@ -3075,6 +3075,7 @@ const FnCtx = struct {
         .{ "osArgc", ir.RtFn.os_argc },
         .{ "osArgAt", ir.RtFn.os_arg_at },
         .{ "osEnv", ir.RtFn.os_env },
+        .{ "osSelfExe", ir.RtFn.os_self_exe },
         .{ "osExit", ir.RtFn.os_exit },
         .{ "cryptoRandomBytes", ir.RtFn.random_bytes },
         .{ "cryptoSecureZero", ir.RtFn.secure_zero },

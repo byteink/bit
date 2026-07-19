@@ -314,6 +314,8 @@ pub const RtFn = enum {
     os_argc,
     os_arg_at,
     os_env,
+    /// The running executable's own resolved path; empty when unknown.
+    os_self_exe,
     os_exit,
     /// Crypto boundary primitives under `std/crypto` (ABI.md §21): the parts
     /// crypto needs from the runtime but that cannot be pure Bit.

@@ -546,6 +546,43 @@ fn isDotEntry(name: []const u8) bool {
 /// and does it read as a directory". A directory answers `getdents64`; a
 /// regular file answers `ENOTDIR`. On Darwin `opendir` makes the same
 /// distinction directly.
+/// The running executable's own absolute path, written into `buf`.
+///
+/// Symlinks are RESOLVED, which is the whole point: `bit` is installed as a
+/// bare symlink into `PATH`, and an unresolved path would put the install
+/// prefix at the symlink's directory (`/usr/local/bin`) rather than at the real
+/// unpacked artifact. Linux gets that for free — `/proc/self/exe` is already
+/// fully resolved. Darwin does not: `_NSGetExecutablePath` reports the path
+/// used to exec, symlink and all, so it is run through `realpath`.
+pub fn selfExePath(buf: []u8) ![]const u8 {
+    switch (builtin.os.tag) {
+        .linux => {
+            const rc = std.os.linux.readlink("/proc/self/exe", buf.ptr, buf.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    // readlink does not NUL-terminate and does not report
+                    // truncation: a result that exactly fills the buffer may be
+                    // a silently cut path, so reject it rather than resolve
+                    // against a prefix that is a lie.
+                    if (rc >= buf.len) return error.NameTooLong;
+                    return buf[0..rc];
+                },
+                else => return error.SelfExeUnavailable,
+            }
+        },
+        else => {
+            var raw: [std.posix.PATH_MAX + 1]u8 = undefined;
+            var n: u32 = @intCast(raw.len);
+            if (std.c._NSGetExecutablePath(&raw, &n) != 0) return error.NameTooLong;
+            // `realpath` writes up to PATH_MAX; refuse a smaller buffer rather
+            // than hand libc something it will overrun.
+            if (buf.len < std.posix.PATH_MAX) return error.NameTooLong;
+            const resolved = std.c.realpath(@ptrCast(&raw), buf.ptr) orelse return error.SelfExeUnavailable;
+            return std.mem.sliceTo(resolved, 0);
+        },
+    }
+}
+
 pub fn statPath(path: [*:0]const u8) PathInfo {
     switch (builtin.os.tag) {
         .linux => {

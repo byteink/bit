@@ -214,9 +214,15 @@ fn scratchNonce(io: Io) u64 {
     return prng.random().int(u64);
 }
 
-/// Location of the runtime archive. // ponytail: fixed dev-build path;
-/// resolve relative to the `bit` binary's own install prefix, and honor an
-/// env override, once packaging (#358) lands.
+/// Location of the runtime archive, relative to the build root.
+///
+/// Deliberately still cwd-relative after #1452 gave the SHIPPED compiler
+/// install-prefix resolution. `bit-seed` is a bootstrap and differential-oracle
+/// artifact: it is never packaged, never installed, and is only ever run from
+/// the build root by `build.zig` and the harnesses. Teaching it to resolve
+/// against its own location would buy nothing and would change the paths every
+/// differential runs on. The self-hosted `bit` in `selfhost/main.bit` is the
+/// one users get, and it resolves properly there.
 /// The native binary target `bit build`/`run` produces. Defaults to whichever
 /// host is running this `bit` (so `bit run` on a Mac execs an arm64 binary, on
 /// Linux an x86-64 one); `--target` cross-produces the other, which only its
@@ -265,9 +271,8 @@ fn libbitrtPath(target: BuildTarget) []const u8 {
     };
 }
 
-/// Where `std/*` imports resolve, relative to the cwd. // ponytail: fixed
-/// dev-build path (matches `libbitrtPath`'s own note); resolve relative to the
-/// `bit` binary's install prefix + honor an env override once packaging lands.
+/// Where `std/*` imports resolve, relative to the cwd. Cwd-relative for the
+/// same reason as `libbitrtPath` above: the seed is never installed.
 const stdlib_dir = "stdlib";
 
 /// `bit build <file.bit> [-o out]` / `bit run <file.bit>`: the full pipeline to

@@ -1625,6 +1625,7 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .os_argc => "bit_rt_os_argc",
         .os_arg_at => "bit_rt_os_arg_at",
         .os_env => "bit_rt_os_env",
+        .os_self_exe => "bit_rt_os_self_exe",
         .os_exit => "bit_rt_os_exit",
         .os_run => "bit_rt_os_run",
         .os_run_test => "bit_rt_os_run_test",
