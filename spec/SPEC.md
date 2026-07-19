@@ -1341,6 +1341,22 @@ expected type or the join of element types (§15.2). Map and typed slice/array
 literals carry an explicit type prefix and are therefore unambiguous even in
 statement position.
 
+A bare element list is a slice literal **in every context, including where an
+array type is expected**. It is therefore ill-typed against an `[N]T`
+annotation, parameter, or result — `let a: [2]f32 = [4.5, 4.5]` is an error
+(E0041, `expected '[2]f32', found '[]f64'`), not an array literal. An array
+value is constructed only by the type-prefixed form `[N]T{...}`, whose element
+count must equal `N` (E0050), or left zero-valued by `let a: [N]T` (§11.2).
+There is no implicit slice-to-array conversion; §22 keeps arrays-as-values
+otherwise deferred for v0.1.
+
+This was previously left implicit, and the two compilers disagreed: the seed
+rejected the bare form while the self-hosted checker accepted it and
+miscompiled, storing an `f64` into an `f32`-wide element so that `a[0] == 4.5`
+was false, and admitting a length mismatch that read uninitialized memory. The
+rule is stated here so the two cannot drift again (see
+tests/cases/check_array_literal.bit and run_array_value.bit).
+
 ### 12.4 Calls, Variadics, Spread
 
 ```

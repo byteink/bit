@@ -460,6 +460,60 @@ function vExpect(c: Checker, node: int, ty: int, target: int) {
   }
 }
 
+// The expectation-aware entry point: validates `node` against `want` in every
+// context that has a declared target type (binding, return, argument).
+//
+// Why this exists rather than calling `vExpect` directly at each site: a bare
+// `[a, b]` slice literal has no self-evident type. check.bit's `checkSliceLit`
+// takes no expectation, so it always answers `[]E` with E defaulted from the
+// FIRST element — `[1, 2]` is `[]i64` even where `[]i32` is wanted. Comparing
+// that answer against the target rejects correct code (`function f(): []i32 {
+// return [1,2] }`). The seed avoids this by threading `expected` into its
+// checkSliceLit; the self-hosted split (inference in check.bit, diagnostics
+// here) can't do that without an `expected` parameter on all of checkExprType,
+// so the expectation is pushed into the literal's ELEMENTS here instead. Same
+// rule, applied at the only place that knows the target.
+//
+// The array case is the #1470 divergence. SPEC.md §12.3: a bare `[ ... ]`
+// element list IS a slice literal, and §22 defers "arrays are not yet
+// constructible as values" — so `[N]T` is built only by the typed composite form
+// `[N]T{...}` (§11.2). A bare list against an array annotation is therefore
+// ILL-TYPED, which is what the seed has always said. Accepting it produced a
+// silently wrong value (`arr[0] == 4.5` false, an f64 read through an f32 slot)
+// and, on a length mismatch, a read of uninitialized heap.
+function vExpectExpr(c: Checker, node: int, want: int) {
+  if (want == 0 || node == 0) { return }
+  // An interface target is NOT special-cased away: `vAssignable` already has the
+  // §14.3 branch and `vMismatch` already renders its wording, so vExpect answers
+  // it correctly AND also catches an unsatisfied method set, which `vIfaceStore`
+  // does not. Skipping interfaces here silently dropped the seed's diagnostic on
+  // `return 7` from an `Any` result (tests/cases/check_iface_scalar.bit) — the
+  // return path has no vIface* rule to fall back on.
+  if (getNode(c.tree, node).tag == Tag.SliceLit) {
+    let wk = c.ctx.types[want].kind
+    if (wk == TypeKind.Slice) {
+      // Push the expectation down: each element against the declared element
+      // type. Recursion handles `[][]i32` and a nested literal.
+      let elem = c.ctx.types[want].elem
+      for a of kidsOf(c.tree, node) {
+        let e = a
+        if (getNode(c.tree, e).tag == Tag.Arg) { e = kidsOf(c.tree, e)[0] }
+        vExpectExpr(c, e, elem)
+      }
+      return
+    }
+    // Slice literal against an array (or anything else): report with the
+    // literal's own inferred type, so the text matches the seed's
+    // `expected '[2]f32', found '[]f64'` exactly.
+    let got = checkExprType(c, node)
+    // THE SAFETY RULE: an inference gap is undecidable, not an error.
+    if (got == 0 || vMentionsInvalid(c, got, 0)) { return }
+    vMismatch(c, node, want, got)
+    return
+  }
+  vExpect(c, node, checkExprType(c, node), want)
+}
+
 // ---- expressions -----------------------------------------------------------
 
 // A binary operator whose operands do not admit it (§14.2, E0053).
@@ -513,7 +567,10 @@ function vReturn(c: Checker, result: int, node: int) {
     return
   }
   if (len(kids) == 1) {
-    vExpect(c, kids[0], checkExprType(c, kids[0]), result)
+    // vExpectExpr, not vExpect: `return [1,2]` from a `[]i32` result needs the
+    // declared element type pushed into the literal, or the defaulted `[]i64`
+    // is compared against `[]i32` and correct code is rejected.
+    vExpectExpr(c, kids[0], result)
     return
   }
   // ponytail: `return a, b` builds a tuple result (§13.1), unvalidated. The seed
@@ -627,6 +684,35 @@ function vCall(c: Checker, node: int) {
   if (want != got) {
     reportNoHint(c.diags, ecArgCount, vSpan(c, node),
       "expected ${want} argument(s), found ${got}")
+    return
+  }
+  // Argument TYPES, checked only here — at the one point this function has
+  // already proven the call decidable: a known, non-generic, non-variadic,
+  // non-spread free function whose arity matches. Every undecidable shape
+  // (builtin, conversion, constructor, method, function value, generic,
+  // variadic) returned above, which is what keeps FALSEPOS at 0.
+  //
+  // Part of the #1470 class: `f(p: [2]i32)` called with `1` was accepted, the
+  // same missing-vExpect hole as the annotated binding.
+  //
+  // The parameter's declared type is read from its OWNING module's tree
+  // (`owner`, via declOwner) — a cross-module call reads the exporter's nodes,
+  // never this module's. Type ids are interned in the shared ctx, so the id
+  // compared here is the same id either side would produce.
+  let i = 0
+  while (i < got) {
+    let a = args[i]
+    if (getNode(c.tree, a).tag == Tag.Arg) { a = kidsOf(c.tree, a)[0] }
+    let pty = typeFromNode(owner, kidsOf(owner.tree, params[i])[1])
+    // An interface parameter belongs to vCallArgIface, which — unlike this
+    // narrow free-call path — also covers method, builtin and value calls.
+    // Answering here as well double-reported `take(7)` for `take(p: Any)`.
+    // (Contrast the binding path, where vBinding could supersede its Iface twin
+    // outright because the two had identical guards.)
+    if (pty != 0 && c.ctx.types[pty].kind != TypeKind.Interface) {
+      vExpectExpr(c, a, pty)
+    }
+    i = i + 1
   }
 }
 
@@ -749,7 +835,12 @@ function vStmt(c: Checker, result: int, node: int, brk: int, loop: int, fallible
   if (t == Tag.Assign) { vDestructure(c, node) }
   if (t == Tag.Assign) { vAssignIface(c, node) }
   if (t == Tag.Binding) { vInferEnum(c, node) }
-  if (t == Tag.Binding) { vBindingIface(c, node) }
+  // vBinding SUPERSEDES the former vBindingIface: it carries the identical
+  // guards (annotation present, non-tuple pattern) and routes through vExpect,
+  // which reports the §14.3 not-storable case vIfaceStore covered AND the
+  // unsatisfied-method-set case it did not. Running both double-reported.
+  if (t == Tag.Binding) { vBinding(c, node) }
+  if (t == Tag.CompositeLit) { vCompositeArray(c, node) }
   if (t == Tag.CompositeLit) { vCompositeIface(c, node) }
   if (t == Tag.Call) { vCallArgIface(c, node) }
   if (t == Tag.SendStmt) { vSendIface(c, node) }
@@ -1671,34 +1762,63 @@ function vIfaceStore(c: Checker, valueNode: int, target: int) {
   }
 }
 
-// An annotated binding: a direct interface target `let a: Any = 5`, or a slice
-// literal's elements against a `[]Iface` annotation's element type.
-function vBindingIface(c: Checker, node: int) {
+// An annotated binding `let x: T = e` / `var x: T = e`, against its annotation.
+//
+// This is the #1470 hole, and it was not float-specific or array-specific: NO
+// annotated binding was assignability-checked at all. `vAssignable`/`vExpect`
+// were ported faithfully but had no Binding call site, so the self-hosted
+// compiler accepted `let x: string = 5` and `let x: i32 = "hello"` — every one
+// of which the seed rejects with E0041. A generated verdict sweep
+// (scripts/selfhost-diffverdict.sh) put the count at 132 constructs the seed
+// refuses and bit admitted.
+//
+// The assignment form `x = e` was already covered, which is why this stayed
+// hidden: the shape people grep for looked checked.
+function vBinding(c: Checker, node: int) {
   let kids = kidsOf(c.tree, node) // [pat, annotation, init]
   let ann = kids[1]
   let init = kids[2]
+  // No annotation means no expectation (the type IS the initializer's), and a
+  // tuple pattern is destructuring — arity and element types are vDestructure's.
   if (ann == 0 || init == 0 || getNode(c.tree, kids[0]).tag == Tag.TuplePat) {
     return
   }
-  let target = typeFromNode(c, ann)
-  if (target == 0) {
-    return
-  }
-  let tk = c.ctx.types[target].kind
-  if (tk == TypeKind.Interface) {
-    vIfaceStore(c, init, target)
-    return
-  }
-  if (tk == TypeKind.Slice && getNode(c.tree, init).tag == Tag.SliceLit) {
-    let elem = c.ctx.types[target].elem
-    for a of kidsOf(c.tree, init) {
-      vIfaceStore(c, a, elem)
-    }
-  }
+  vExpectExpr(c, init, typeFromNode(c, ann))
 }
+
 
 // A composite literal `S{...}` / `map<K,V>{...}` / `[]T{...}`: each field / map
 // entry / element value against its declared slot type.
+// The typed array literal `[N]T{...}` — the ONLY form SPEC.md admits for
+// constructing an array value (§11.2, §12.3). Its element count must equal N
+// (§12.3: "length must match"), and each element must be assignable to T.
+//
+// Last cell of the #1470 class. Unchecked, `let a: [2]f32 = [2]f32{4.5}` built
+// a 2-element array from one initializer and the second slot read uninitialized
+// heap — the same memory-safety shape as the bare-list length mismatch, just
+// reached through the form that IS legal.
+function vCompositeArray(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0 || c.ctx.types[target].kind != TypeKind.Array) {
+    return
+  }
+  let items = kidsOf(c.tree, kids[1])
+  let want = c.ctx.types[target].arrayLen
+  let got = len(items)
+  if (got != want) {
+    // E0050 at the whole literal, with the seed's exact text and span.
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "array literal has ${got} element(s), expected ${want}")
+  }
+  let elem = c.ctx.types[target].elem
+  for a of items {
+    let e = a
+    if (getNode(c.tree, e).tag == Tag.Arg) { e = kidsOf(c.tree, e)[0] }
+    vExpectExpr(c, e, elem)
+  }
+}
+
 function vCompositeIface(c: Checker, node: int) {
   let kids = kidsOf(c.tree, node) // [type, init]
   let target = typeFromNode(c, kids[0])
