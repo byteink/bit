@@ -1397,7 +1397,18 @@ fn emitFRound(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8, opcode: u6) 
     try putFloat(self, dst, fscratch1);
 }
 
-fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
+/// `bitcast`: a register-class transfer, in whichever direction the result type
+/// asks for. Float -> int is `floatBits` (SPEC §17); int -> float is the read
+/// half of the container word ABI (`ir.rtReturnsWord`), turning the `u64` a
+/// runtime primitive hands back in x0 into the `f64`/`f32` the element is.
+/// `width` is the float side's width in both directions.
+fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8, dst_class: regalloc.Class) !void {
+    if (dst_class == .float) {
+        const v = try getInt(self, vregOf(self, operand), scratch1);
+        try self.fmovToFp(fscratch1, v, width);
+        try putFloat(self, dst, fscratch1);
+        return;
+    }
     const v = try getFloat(self, vregOf(self, operand), fscratch1);
     try self.fmovFromFp(scratch1, v, width);
     try putInt(self, dst, scratch1);
@@ -2025,9 +2036,10 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
             .fceil => try emitFRound(self, i, u.operand, iw.bytes, 0b001001),
             .ftrunc => try emitFRound(self, i, u.operand, iw.bytes, 0b001011),
             .fround => try emitFRound(self, i, u.operand, iw.bytes, 0b001100),
-            // Operand width, not `iw`: this op's result is the integer view, so
-            // the result type carries no float width to read.
-            .bitcast => try emitBitcast(self, i, u.operand, common.widthOf(self.tctx(), self.f.valueType(u.operand)).bytes),
+            // The width always comes from the FLOAT side — the integer view of
+            // an f32 is 4 bytes wide whichever direction the transfer runs, and
+            // only one of the two types carries a float width to read.
+            .bitcast => try emitBitcast(self, i, u.operand, if (iw.class == .float) iw.bytes else common.widthOf(self.tctx(), self.f.valueType(u.operand)).bytes, iw.class),
             else => unreachable,
         },
         .jump => |j| {

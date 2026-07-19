@@ -1417,8 +1417,8 @@ const FnCtx = struct {
                 const op: lexer.Kind = @enumFromInt(n.main);
                 if (op != .arrow_left) return null;
                 const ch = try self.lowerExpr(k[0]);
-                const v = try self.b.rtCall(val_ty, .chan_recv, &.{ch});
-                const ok = try self.b.rtCall(ok_ty, .chan_recv_ok, &.{});
+                const v = try self.rtCall(val_ty, .chan_recv, &.{ch});
+                const ok = try self.rtCall(ok_ty, .chan_recv_ok, &.{});
                 return .{ v, ok };
             },
             // A map lookup and its presence test are two independent probes of a
@@ -1430,15 +1430,15 @@ const FnCtx = struct {
                 if (recv_data != .map) return null;
                 const m = try self.lowerExpr(k[0]);
                 const key = try self.lowerExprH(k[1], recv_data.map.key);
-                const v = try self.b.rtCall(val_ty, .map_get, &.{ m, key });
-                const ok = try self.b.rtCall(ok_ty, .map_has, &.{ m, key });
+                const v = try self.rtCall(val_ty, .map_get, &.{ m, key });
+                const ok = try self.rtCall(ok_ty, .map_has, &.{ m, key });
                 return .{ v, ok };
             },
             .type_assert => {
                 const recv = try self.lowerExpr(k[0]);
                 const info = try self.typeInfoOf(val_ty);
-                const v = try self.b.rtCall(val_ty, .iface_as, &.{ recv, info });
-                const ok = try self.b.rtCall(ok_ty, .iface_as_ok, &.{});
+                const v = try self.rtCall(val_ty, .iface_as, &.{ recv, info });
+                const ok = try self.rtCall(ok_ty, .iface_as_ok, &.{});
                 return .{ v, ok };
             },
             else => return null,
@@ -1548,15 +1548,61 @@ const FnCtx = struct {
             else => return error.UnsupportedConstruct,
         }
     }
+    /// The integer word type a float of type `ty` crosses the container word
+    /// ABI as, or null when `ty` is not a float. `f32` uses `u32` so the
+    /// `bitcast` on each side is a 32-bit transfer (`fmov s`/`movd`) — the
+    /// stored word is zero-extended, so the round trip is exact.
+    fn wordIntTy(self: *FnCtx, ty: TypeId) ?TypeId {
+        const d = self.ctx.typeOf(ty);
+        if (d == .untyped_float) return self.ctx.prim_ids.get(.u64);
+        if (d != .prim) return null;
+        return switch (d.prim) {
+            .f64 => self.ctx.prim_ids.get(.u64),
+            .f32 => self.ctx.prim_ids.get(.u32),
+            else => null,
+        };
+    }
+
+    /// The single lowering entry point for every `rt_call`. The container
+    /// primitives declare their element operands and results as an untyped
+    /// `u64` word (`ir.rtWordArgs`/`ir.rtReturnsWord`), so a float element must
+    /// cross that boundary as its bit pattern, in an integer register. Emitting
+    /// the `bitcast`s here — rather than letting codegen classify the operand
+    /// by its Bit type — keeps the IR honest about the callee's actual C
+    /// signature and fixes every backend at once. A non-word position, and any
+    /// non-float type, passes straight through.
+    fn rtCall(self: *FnCtx, ty: TypeId, rt: ir.RtFn, args: []const ir.ValueId) Error!ir.ValueId {
+        const word_args = ir.rtWordArgs(rt);
+        var buf: [8]ir.ValueId = undefined;
+        std.debug.assert(args.len <= buf.len);
+        var cast_args = args;
+        if (word_args != 0) {
+            @memcpy(buf[0..args.len], args);
+            for (args, 0..) |a, i| {
+                if (word_args & (@as(u32, 1) << @intCast(i)) == 0) continue;
+                const wt = self.wordIntTy(self.b.valueType(a)) orelse continue;
+                buf[i] = try self.b.unary(.bitcast, wt, a);
+            }
+            cast_args = buf[0..args.len];
+        }
+        if (ir.rtReturnsWord(rt)) {
+            if (self.wordIntTy(ty)) |wt| {
+                const word = try self.b.rtCall(wt, rt, cast_args);
+                return self.b.unary(.bitcast, ty, word);
+            }
+        }
+        return self.b.rtCall(ty, rt, cast_args);
+    }
+
     fn readLvalue(self: *FnCtx, lv: Lvalue) Error!ir.ValueId {
         return switch (lv) {
             .local => |i| self.env.bindings.items[i].value,
             .field => |f| self.b.fieldGet(f.ty, f.recv, f.offset),
             .elem => |e| if (e.is_slice)
-                self.b.rtCall(e.ty, .slice_get, &.{ e.recv, e.index })
+                self.rtCall(e.ty, .slice_get, &.{ e.recv, e.index })
             else
                 self.b.indexGet(e.ty, e.recv, e.index),
-            .map_elem => |e| self.b.rtCall(e.val_ty, .map_get, &.{ e.recv, e.key }),
+            .map_elem => |e| self.rtCall(e.val_ty, .map_get, &.{ e.recv, e.key }),
         };
     }
     fn writeLvalue(self: *FnCtx, lv: Lvalue, val: ir.ValueId) Error!void {
@@ -1573,9 +1619,9 @@ const FnCtx = struct {
                 try self.copyArrayElems(dst, val, self.arrayShape(f.ty));
             } else try self.b.fieldSet(f.recv, f.offset, val),
             .elem => |e| if (e.is_slice) {
-                _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ e.recv, e.index, val });
+                _ = try self.rtCall(self.ctx.void_id, .slice_set, &.{ e.recv, e.index, val });
             } else try self.b.indexSet(e.recv, e.index, val),
-            .map_elem => |e| _ = try self.b.rtCall(self.ctx.void_id, .map_set, &.{ e.recv, e.key, val }),
+            .map_elem => |e| _ = try self.rtCall(self.ctx.void_id, .map_set, &.{ e.recv, e.key, val }),
         }
     }
 
@@ -1657,7 +1703,7 @@ const FnCtx = struct {
 
     /// `err_set(e)` — record the pending error for the caller's `?`/`catch`.
     fn setErr(self: *FnCtx, val: ir.ValueId) Error!void {
-        _ = try self.b.rtCall(self.ctx.void_id, .err_set, &.{val});
+        _ = try self.rtCall(self.ctx.void_id, .err_set, &.{val});
     }
     /// `err_set(nil)` — an ok return / handled `catch` clears the slot.
     fn clearErr(self: *FnCtx) Error!void {
@@ -1666,7 +1712,7 @@ const FnCtx = struct {
     }
     /// `err_get()` — read the pending error right after a fallible call.
     fn getErr(self: *FnCtx, err_ty: TypeId) Error!ir.ValueId {
-        return self.b.rtCall(err_ty, .err_get, &.{});
+        return self.rtCall(err_ty, .err_get, &.{});
     }
     /// Return from a fallible function on the err path: a zero ok value, or no
     /// value at all when the ok type is `void` (`()!`, §18.2).
@@ -1900,7 +1946,7 @@ const FnCtx = struct {
     fn emitEq(self: *FnCtx, ty: TypeId, a: ir.ValueId, b: ir.ValueId) Error!ir.ValueId {
         const bool_ty = self.ctx.prim_ids.get(.bool);
         const data = self.ctx.typeOf(ty);
-        if (data == .prim and data.prim == .string) return self.b.rtCall(bool_ty, .string_eq, &.{ a, b });
+        if (data == .prim and data.prim == .string) return self.rtCall(bool_ty, .string_eq, &.{ a, b });
         const is_float = data == .prim and (data.prim == .f32 or data.prim == .f64);
         return self.b.binary(if (is_float) .fcmp_eq else .icmp_eq, bool_ty, a, b);
     }
@@ -2263,7 +2309,7 @@ const FnCtx = struct {
 
         // Pass 1: allocate the buffer and evaluate every comm exactly once.
         const nconst = try self.b.constInt(i64ty, @intCast(n));
-        const buf = try self.b.rtCall(i64ty, .select_alloc, &.{nconst});
+        const buf = try self.rtCall(i64ty, .select_alloc, &.{nconst});
         {
             var i: usize = 0;
             for (cases) |c| {
@@ -2287,7 +2333,7 @@ const FnCtx = struct {
             }
         }
         const hd = try self.b.constInt(i64ty, if (has_default) 1 else 0);
-        const fired = try self.b.rtCall(i64ty, .select, &.{ buf, nconst, hd });
+        const fired = try self.rtCall(i64ty, .select, &.{ buf, nconst, hd });
 
         // Pass 2: dispatch on `fired` (a value switch), binding recv results.
         const pre_len = self.env.bindings.items.len;
@@ -2514,7 +2560,7 @@ const FnCtx = struct {
         // local to a block param.
         try self.env.declare(self.gpa, "$iter", iter_val, iter_ty);
         const start = if (is_map)
-            try self.b.rtCall(i64ty, .map_iter_init, &.{iter_val})
+            try self.rtCall(i64ty, .map_iter_init, &.{iter_val})
         else
             try self.b.constInt(i64ty, 0);
         try self.env.declare(self.gpa, "$idx", start, i64ty);
@@ -2569,13 +2615,13 @@ const FnCtx = struct {
             // both from the current FULL slot; a `_` sub is bound and left unread.
             const m = data.map;
             const subs = self.kids(k[0]); // tuple_pat: [key_binder, val_binder]
-            const key_val = try self.b.rtCall(m.key, .map_key_at, &.{ iter_cur, idx_val });
-            const val_val = try self.b.rtCall(m.val, .map_val_at, &.{ iter_cur, idx_val });
+            const key_val = try self.rtCall(m.key, .map_key_at, &.{ iter_cur, idx_val });
+            const val_val = try self.rtCall(m.val, .map_val_at, &.{ iter_cur, idx_val });
             try self.declareBinder(subs[0], key_val, m.key);
             try self.declareBinder(subs[1], val_val, m.val);
         } else {
             const elem_val = if (data == .slice)
-                try self.b.rtCall(elem_ty, .slice_get, &.{ iter_cur, idx_val })
+                try self.rtCall(elem_ty, .slice_get, &.{ iter_cur, idx_val })
             else
                 try self.b.indexGet(elem_ty, iter_cur, idx_val);
             try self.declareBinder(k[0], elem_val, elem_ty);
@@ -2600,7 +2646,7 @@ const FnCtx = struct {
             const cur_idx = self.env.bindings.items[idx_slot].value;
             const step_iter = self.env.bindings.items[iter_slot].value;
             const next_idx = if (is_map)
-                try self.b.rtCall(i64ty, .map_iter_next, &.{ step_iter, cur_idx })
+                try self.rtCall(i64ty, .map_iter_next, &.{ step_iter, cur_idx })
             else
                 try self.b.binary(.add, i64ty, cur_idx, try self.b.constInt(i64ty, 1));
             self.env.bindings.items[idx_slot].value = next_idx;
@@ -2708,14 +2754,14 @@ const FnCtx = struct {
             // as the expression value rather than pushing a `const_nil` *after*
             // the `unreachable` terminator, which would leave a non-terminator
             // as the block's last instruction (endBlock asserts otherwise).
-            const r = try self.b.rtCall(void_ty, .panic, &.{v});
+            const r = try self.rtCall(void_ty, .panic, &.{v});
             try self.emitUnreachable();
             return r;
         }
         if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "eprint")) {
             const v = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
             const rt: ir.RtFn = if (std.mem.eql(u8, name, "print")) .print else .eprint;
-            return self.b.rtCall(void_ty, rt, &.{v});
+            return self.rtCall(void_ty, rt, &.{v});
         }
         if (std.mem.eql(u8, name, "assert")) {
             const vals = try self.lowerArgs(args_node);
@@ -2727,9 +2773,9 @@ const FnCtx = struct {
                 const string_ty = self.ctx.prim_ids.get(.string);
                 const idx = try self.l.out.internString("assertion failed");
                 const msg = try self.b.constString(string_ty, idx);
-                return self.b.rtCall(void_ty, .assert, &.{ vals[0], msg });
+                return self.rtCall(void_ty, .assert, &.{ vals[0], msg });
             }
-            return self.b.rtCall(void_ty, .assert, vals);
+            return self.rtCall(void_ty, .assert, vals);
         }
         if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "cap")) {
             const is_cap = std.mem.eql(u8, name, "cap");
@@ -2745,7 +2791,7 @@ const FnCtx = struct {
             // (`slice_len`, shared with `string`), `cap` at +24. `cap` is
             // slice-only.
             if (data == .slice) return if (is_cap) self.b.fieldGet(i64ty, v, 24) else self.b.sliceLen(i64ty, v);
-            if (!is_cap and data == .map) return self.b.rtCall(i64ty, .map_len, &.{v});
+            if (!is_cap and data == .map) return self.rtCall(i64ty, .map_len, &.{v});
             if (!is_cap and data == .prim and data.prim == .string) return self.b.sliceLen(i64ty, v);
             return error.UnsupportedConstruct;
         }
@@ -2753,14 +2799,14 @@ const FnCtx = struct {
             const mv = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
             const key_ty = self.ctx.typeOf(try self.nodeType(self.kids(arg_nodes[0])[0])).map.key;
             const kv = try self.lowerExprH(self.kids(arg_nodes[1])[0], key_ty);
-            return self.b.rtCall(void_ty, .map_delete, &.{ mv, kv });
+            return self.rtCall(void_ty, .map_delete, &.{ mv, kv });
         }
         if (std.mem.eql(u8, name, "close")) {
             // SPEC §16.2: `close(c)` marks the channel closed — pending and
             // subsequent receives drain, then yield `(zero, false)`. The checker
             // already proved the operand is a channel.
             const cv = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
-            return self.b.rtCall(void_ty, .chan_close, &.{cv});
+            return self.rtCall(void_ty, .chan_close, &.{cv});
         }
         if (atomicRmwOp(name) != null or std.mem.eql(u8, name, "atomicLoad") or
             std.mem.eql(u8, name, "atomicStore") or std.mem.eql(u8, name, "atomicCmpxchg"))
@@ -2795,7 +2841,7 @@ const FnCtx = struct {
         if (primRtFn(name)) |rt| {
             const vals = try self.lowerArgs(args_node);
             defer self.gpa.free(vals);
-            return self.b.rtCall(try self.nodeType(node), rt, vals);
+            return self.rtCall(try self.nodeType(node), rt, vals);
         }
         return error.UnsupportedConstruct; // close: deferred
     }
@@ -2893,7 +2939,7 @@ const FnCtx = struct {
         var acc = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
         for (arg_nodes[1..]) |an| {
             const v = try self.lowerExprH(self.kids(an)[0], elem_ty);
-            acc = try self.b.rtCall(slice_ty, .slice_append, &.{ acc, v });
+            acc = try self.rtCall(slice_ty, .slice_append, &.{ acc, v });
         }
         return acc;
     }
@@ -2995,7 +3041,7 @@ const FnCtx = struct {
         else
             try self.b.constInt(i64ty, 0);
         const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
-        return self.b.rtCall(chan_ty, .chan_make, &.{ cap, is_ref });
+        return self.rtCall(chan_ty, .chan_make, &.{ cap, is_ref });
     }
 
     /// `[]T(n)` / `[]T(n, m)`: allocate a length-`n`, capacity-`m` (default `n`)
@@ -3017,13 +3063,13 @@ const FnCtx = struct {
             const at = self.ctx.typeOf(self.defaultTy(try self.nodeType(arg)));
             if (at == .prim and at.prim == .string) {
                 const s = try self.lowerExprH(arg, self.ctx.prim_ids.get(.string));
-                return self.b.rtCall(slice_ty, .bytes_from_string, &.{s});
+                return self.rtCall(slice_ty, .bytes_from_string, &.{s});
             }
         }
         const len = try self.lowerExprH(self.kids(arg_nodes[0])[0], i64ty);
         const cap = if (arg_nodes.len >= 2) try self.lowerExprH(self.kids(arg_nodes[1])[0], i64ty) else len;
         const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
-        return self.b.rtCall(slice_ty, .slice_new, &.{ len, cap, is_ref });
+        return self.rtCall(slice_ty, .slice_new, &.{ len, cap, is_ref });
     }
 
     fn lowerCall(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
@@ -3125,7 +3171,7 @@ const FnCtx = struct {
         // numeric cast; the checker restricts the source to a byte slice.
         const dd = self.ctx.typeOf(dst_ty);
         if (dd == .prim and dd.prim == .string and self.ctx.typeOf(src_ty) == .slice) {
-            return self.b.rtCall(dst_ty, .string_from_bytes, &.{src});
+            return self.rtCall(dst_ty, .string_from_bytes, &.{src});
         }
         return self.b.convert(dst_ty, src);
     }
@@ -3137,7 +3183,7 @@ const FnCtx = struct {
         const elem_ty = self.ctx.typeOf(chan_ty).chan;
         const ch = try self.lowerExpr(k[0]);
         const v = try self.lowerExprH(k[1], elem_ty);
-        _ = try self.b.rtCall(self.ctx.void_id, .chan_send, &.{ ch, v });
+        _ = try self.rtCall(self.ctx.void_id, .chan_send, &.{ ch, v });
     }
 
     /// `spawn f(args)` (ABI.md §9). `bit_rt_spawn` has a fixed 2-arg shape
@@ -3229,7 +3275,7 @@ const FnCtx = struct {
         // Synthesize the trampoline, take its address, and spawn it.
         const tramp = try self.l.synthSpawnTrampoline(fty, direct_fn, arg_tys.items, shape.result, layout);
         const tramp_addr = try self.b.funcAddr(fty, tramp);
-        _ = try self.b.rtCall(self.ctx.void_id, .spawn, &.{ tramp_addr, thunk });
+        _ = try self.rtCall(self.ctx.void_id, .spawn, &.{ tramp_addr, thunk });
     }
 
     fn lowerDefer(self: *FnCtx, node: ast.Index) Error!void {
@@ -3288,7 +3334,7 @@ const FnCtx = struct {
                 .direct => |x| _ = try self.b.call(x.result, x.func, x.args),
                 .iface => |x| _ = try self.b.callIface(x.result, x.recv, x.method_index, x.args),
                 .value => |x| _ = try self.b.callValue(x.result, x.callee, x.args),
-                .builtin => |x| _ = try self.b.rtCall(x.result, x.rt, x.args),
+                .builtin => |x| _ = try self.rtCall(x.result, x.rt, x.args),
             }
         }
     }
@@ -3465,11 +3511,11 @@ const FnCtx = struct {
                 // header through the bounds-checked runtime; a static `[N]T`
                 // array is a direct data pointer (codegen op).
                 if (recv_data == .slice)
-                    break :blk self.b.rtCall(ty, .slice_get, &.{ recv, idxv });
+                    break :blk self.rtCall(ty, .slice_get, &.{ recv, idxv });
                 if (recv_data == .map)
-                    break :blk self.b.rtCall(ty, .map_get, &.{ recv, idxv });
+                    break :blk self.rtCall(ty, .map_get, &.{ recv, idxv });
                 if (recv_data == .prim and recv_data.prim == .string)
-                    break :blk self.b.rtCall(ty, .string_byte, &.{ recv, idxv });
+                    break :blk self.rtCall(ty, .string_byte, &.{ recv, idxv });
                 break :blk self.b.indexGet(ty, recv, idxv);
             },
             .str_interp => self.lowerStrInterp(node),
@@ -3489,7 +3535,7 @@ const FnCtx = struct {
                 const ty = try self.nodeType(node);
                 const recv = try self.lowerExpr(k[0]);
                 const info = try self.typeInfoOf(ty);
-                break :blk self.b.rtCall(ty, .iface_assert, &.{ recv, info });
+                break :blk self.rtCall(ty, .iface_assert, &.{ recv, info });
             },
             else => error.UnsupportedConstruct, // tuple_index/map literals
         };
@@ -3628,9 +3674,9 @@ const FnCtx = struct {
         if (cdata == .prim and cdata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus)) {
             const sl = try self.lowerExprH(k[0], common);
             const sr = try self.lowerExprH(k[1], common);
-            if (op == .plus) return self.b.rtCall(common, .string_concat, &.{ sl, sr });
+            if (op == .plus) return self.rtCall(common, .string_concat, &.{ sl, sr });
             const bool_ty = self.ctx.prim_ids.get(.bool);
-            const eq = try self.b.rtCall(bool_ty, .string_eq, &.{ sl, sr });
+            const eq = try self.rtCall(bool_ty, .string_eq, &.{ sl, sr });
             if (op == .eq_eq) return eq;
             const f = try self.b.constBool(bool_ty, false); // `!=` is `(a == b) == false`
             return self.b.binary(.icmp_eq, bool_ty, eq, f);
@@ -3657,7 +3703,7 @@ const FnCtx = struct {
             // `v, ok = <- ch` needs tuple-destructuring lowering (deferred).
             const elem_ty = try self.nodeType(node);
             const ch = try self.lowerExpr(operand);
-            return self.b.rtCall(elem_ty, .chan_recv, &.{ch});
+            return self.rtCall(elem_ty, .chan_recv, &.{ch});
         }
         if (op == .star) {
             // `*p` (§11.4): load one word from the pointed-at address. Reuses the
@@ -3783,7 +3829,7 @@ const FnCtx = struct {
         const i64ty = self.ctx.prim_ids.get(.i64);
         const kflag = try self.b.constInt(i64ty, if (self.keyIsString(m.key)) 1 else 0);
         const vflag = try self.b.constInt(i64ty, if (self.elemIsRef(m.val)) 1 else 0);
-        return self.b.rtCall(map_ty, .map_new, &.{ kflag, vflag });
+        return self.rtCall(map_ty, .map_new, &.{ kflag, vflag });
     }
 
     /// `map<K,V>{ k1: v1, ... }` (§12.3): build an empty map, then set each
@@ -3797,7 +3843,7 @@ const FnCtx = struct {
             const ek = self.kids(e); // map_entry: [key, val]
             const key = try self.lowerExprH(ek[0], m.key);
             const val = try self.lowerExprH(ek[1], m.val);
-            _ = try self.b.rtCall(self.ctx.void_id, .map_set, &.{ mv, key, val });
+            _ = try self.rtCall(self.ctx.void_id, .map_set, &.{ mv, key, val });
         }
         return mv;
     }
@@ -3812,12 +3858,12 @@ const FnCtx = struct {
         const n: i64 = @intCast(items.len);
         const len = try self.b.constInt(i64ty, n);
         const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
-        const s = try self.b.rtCall(slice_ty, .slice_new, &.{ len, len, is_ref });
+        const s = try self.rtCall(slice_ty, .slice_new, &.{ len, len, is_ref });
         for (items, 0..) |a, i| {
             const inner = self.kids(a)[0];
             const v = try self.lowerExprH(inner, elem_ty);
             const idx = try self.b.constInt(i64ty, @intCast(i));
-            _ = try self.b.rtCall(self.ctx.void_id, .slice_set, &.{ s, idx, v });
+            _ = try self.rtCall(self.ctx.void_id, .slice_set, &.{ s, idx, v });
         }
         return s;
     }
@@ -3838,7 +3884,7 @@ const FnCtx = struct {
         const lo = if (k[1] != ast.none) try self.lowerExprH(k[1], i64ty) else try self.b.constInt(i64ty, 0);
         const hi = if (k[2] != ast.none) try self.lowerExprH(k[2], i64ty) else try self.b.sliceLen(i64ty, recv);
         const rt: ir.RtFn = if (is_string) .string_slice else .slice_slice;
-        return self.b.rtCall(try self.nodeType(node), rt, &.{ recv, lo, hi });
+        return self.rtCall(try self.nodeType(node), rt, &.{ recv, lo, hi });
     }
 
     fn lowerCompositeLit(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
@@ -3886,9 +3932,9 @@ const FnCtx = struct {
         if (data == .prim) {
             return switch (data.prim) {
                 .string => v,
-                .bool => self.b.rtCall(string_ty, .string_from_bool, &.{v}),
-                .f32, .f64 => self.b.rtCall(string_ty, .string_from_float, &.{v}),
-                else => self.b.rtCall(string_ty, .string_from_int, &.{v}),
+                .bool => self.rtCall(string_ty, .string_from_bool, &.{v}),
+                .f32, .f64 => self.rtCall(string_ty, .string_from_float, &.{v}),
+                else => self.rtCall(string_ty, .string_from_int, &.{v}),
             };
         }
         // Everything else needs `show(): string` (§5.7). The checker enforces
@@ -3921,7 +3967,7 @@ const FnCtx = struct {
         }
         // `string_concat` is binary; fold the parts left-to-right.
         var acc = vals[0];
-        for (vals[1..]) |v| acc = try self.b.rtCall(string_ty, .string_concat, &.{ acc, v });
+        for (vals[1..]) |v| acc = try self.rtCall(string_ty, .string_concat, &.{ acc, v });
         return acc;
     }
 

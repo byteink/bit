@@ -301,6 +301,33 @@ pub const RtFn = enum {
     float32_bits,
 };
 
+/// Bit `i` is set when argument `i` of `rt` is an untyped 64-bit *word* — the
+/// container primitives (`slice_*`, `map_*`, `chan_*`, ABI.md §2/§11/§15) store
+/// one element per word and declare it `u64` in C, so it travels in an INTEGER
+/// register no matter what the Bit element type is. Lowering `bitcast`s a
+/// float operand into that word so the IR states the register class the
+/// callee's signature actually uses; without it codegen classifies by the Bit
+/// type and passes the element in `d0`/`xmm0`, which the callee never reads.
+pub fn rtWordArgs(rt: RtFn) u32 {
+    return switch (rt) {
+        .slice_append, .chan_send, .map_get, .map_has, .map_delete => 0b010,
+        .slice_set => 0b100,
+        // Both the key and the value of `map_set(m, key, val)` are words.
+        .map_set => 0b110,
+        else => 0,
+    };
+}
+
+/// Whether `rt` returns an untyped word rather than a value of its Bit result
+/// type — the read half of `rtWordArgs`. The result comes back in the integer
+/// return register and lowering `bitcast`s it into a float result.
+pub fn rtReturnsWord(rt: RtFn) bool {
+    return switch (rt) {
+        .slice_get, .map_get, .map_key_at, .map_val_at, .chan_recv => true,
+        else => false,
+    };
+}
+
 /// Every instruction opcode. Grouped by operand shape — see `Decoded` and the
 /// `push*` builder methods, which are the authority on each op's `extra`
 /// layout (documented per group below).

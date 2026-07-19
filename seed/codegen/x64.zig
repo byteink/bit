@@ -1547,7 +1547,18 @@ fn emitFRound(self: *Ctx, dst: u32, operand: ir.ValueId, mode: RoundMode) !void 
 /// `floatBits`/`float32Bits` — a register-class transfer, not a conversion.
 /// `width` is the OPERAND's float width (the result is the same-width unsigned
 /// integer view, so the result type carries no float width to read).
-fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
+/// `bitcast`: a register-class transfer, in whichever direction the result type
+/// asks for. Float -> int is `floatBits` (SPEC §17); int -> float is the read
+/// half of the container word ABI (`ir.rtReturnsWord`), turning the `u64` a
+/// runtime primitive hands back in rax into the `f64`/`f32` the element is.
+/// `width` is the float side's width in both directions.
+fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8, dst_class: regalloc.Class) !void {
+    if (dst_class == .float) {
+        const v = try getInt(self, vregOf(self, operand), scratch1);
+        try self.movXG(fscratch1, v, width);
+        try putFloat(self, dst, fscratch1);
+        return;
+    }
     const v = try getFloat(self, vregOf(self, operand), fscratch1);
     try self.movGX(scratch1, v, width);
     try putInt(self, dst, scratch1);
@@ -2619,7 +2630,10 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .convert => try emitConvert(self, dst, d.un.operand, ty),
         .fneg => try emitFneg(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
         .fsqrt => try emitFsqrt(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
-        .bitcast => try emitBitcast(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
+        // The width always comes from the FLOAT side — the integer view of an
+        // f32 is 4 bytes wide whichever direction the transfer runs, and only
+        // one of the two types carries a float width to read.
+        .bitcast => try emitBitcast(self, dst, d.un.operand, if (iw.class == .float) iw.bytes else widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes, iw.class),
         .ffloor => try emitFRound(self, dst, d.un.operand, .floor),
         .fceil => try emitFRound(self, dst, d.un.operand, .ceil),
         .ftrunc => try emitFRound(self, dst, d.un.operand, .trunc),
