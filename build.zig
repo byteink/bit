@@ -254,6 +254,21 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(link_tests).step);
 
+    // The Mach-O linker driver. It needs its OWN entry: `link.zig` is the ELF
+    // driver and never imports `link/macho.zig`, and `unit_tests` is rooted at
+    // `main.zig`, which does not collect tests from files it merely imports.
+    // Between them this file's tests — including the end-to-end "boots on
+    // macOS" one — had never run under `zig build test` at all (#1445).
+    // Rooted at `seed/` via the anchor file so `../obj/macho.zig` resolves.
+    const macho_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("seed/link_macho_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(macho_link_tests).step);
+
     // Standalone object writer (task #343): no imports outside `std`. Its
     // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
     // hosts (those tools don't exist there), so this is safe on every CI host.

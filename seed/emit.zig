@@ -44,6 +44,29 @@ fn refuseManagedMetadata(a: Allocator, module: *const ir.Module) Error!void {
     if ((try collectTypeInfos(a, module, true)).len > 0) return error.FreestandingAlloc;
 }
 
+/// The Mach-O-spelled names this module legitimately leaves undefined for dyld
+/// to bind — i.e. its §11.7 `extern function` declarations, which `lower.zig`
+/// records as `is_extern` functions carrying the raw source name.
+///
+/// The linker cannot derive this set itself: an `extern function` and a symbol
+/// the compiler simply misspelled are emitted identically (both are just
+/// `N_UNDF | N_EXT`), so `is_extern` has to be carried across the object
+/// boundary out of band. Without it the Mach-O linker has no way to tell a
+/// legal dylib import from #1428's `_idg`. Caller owns the returned slice and
+/// each name in it.
+pub fn externImportNames(gpa: Allocator, module: *const ir.Module) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |n| gpa.free(n);
+        out.deinit(gpa);
+    }
+    for (module.funcs.items) |*f| {
+        if (!f.is_extern) continue;
+        try out.append(gpa, try std.fmt.allocPrint(gpa, "_{s}", .{f.name}));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// True if `name` is a §11.9 pinned symbol rather than a compiler-mangled one.
 ///
 /// Exact, not a heuristic, because the two spellings are disjoint by

@@ -63,10 +63,60 @@ const stub_size: u64 = 12; // adrp x16 ; ldr x16,[x16] ; br x16
 const dylinker_path = "/usr/lib/dyld";
 const libsystem_path = "/usr/lib/libSystem.B.dylib";
 
+/// Filled in when a link fails with `error.UndefinedSymbol`, so the driver can
+/// render the message shape `object.zig`'s `Module.name` was always meant to
+/// serve: "undefined symbol X, referenced from <module>". Zig errors carry no
+/// payload, hence the out-parameter.
+pub const UndefinedRef = struct {
+    symbol: []const u8,
+    /// The `object.Module.name` of the module holding the referencing atom.
+    referenced_from: []const u8,
+};
+
 pub const Options = struct {
     /// Code-signing identifier (typically the output filename stem).
     identifier: []const u8,
+    /// Names the program may legitimately leave for dyld to bind — its §11.7
+    /// `extern function` declarations, Mach-O-spelled (see
+    /// `emit.externImportNames`). Anything else the program object leaves
+    /// undefined is a compiler bug, not an import.
+    allowed_imports: []const []const u8 = &.{},
+    /// How many leading modules came from `.object` inputs, i.e. are the
+    /// compiled Bit program rather than an archive member. See
+    /// `undefinedIsImport` for why the distinction is the whole rule.
+    program_modules: u32 = 0,
+    /// Set on `error.UndefinedSymbol`; borrowed from the inputs, valid as long
+    /// as they are.
+    undefined_out: ?*UndefinedRef = null,
 };
+
+/// Whether an undefined global referenced from module `mi` is a legitimate
+/// dynamic import rather than a link error.
+///
+/// Bit links against libSystem for its syscall surface, so "undefined" cannot
+/// mean "error" outright — but it must not mean "import" outright either, which
+/// is what it meant before #1445. The discriminator is provenance:
+///
+///   - An ARCHIVE member (`libbitrt.a`, compiler-rt) is Zig-compiled code whose
+///     undefined names ARE the libSystem surface (`_write`, `_mmap`, the ~96
+///     imports a normal binary carries). Those stay leaves. A bad name in there
+///     would be a Zig bug and is out of this linker's reach anyway.
+///   - The PROGRAM object is emitted by us. Every name it references is one we
+///     chose: a mangled `m{id}$f`, a §11.9 pin, or a `bit_rt_*` the archive
+///     defines — all of which must resolve. The single legal exception is a
+///     §11.7 `extern function`, which is exactly what `allowed_imports` lists.
+///
+/// So an unresolved name from the program object that no `extern function`
+/// declared is a compiler bug, and #1428 and #1410 are both instances: each
+/// emitted a definition under one name and a call under another, each linked
+/// clean, and each died at dyld load far from its cause.
+fn undefinedIsImport(opts: Options, mi: u32, name: []const u8) bool {
+    if (mi >= opts.program_modules) return true; // archive member: libSystem surface
+    for (opts.allowed_imports) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
+}
 
 pub const Input = union(enum) {
     /// A single relocatable Mach-O object — the compiled Bit program.
@@ -84,13 +134,24 @@ pub fn link(gpa: Allocator, inputs: []const Input, opts: Options) (Error || mach
     const arena = arena_state.allocator();
 
     var modules: std.ArrayList(object.Module) = .empty;
+    // `.object` inputs are the compiled Bit program; archive members follow.
+    // The undefined-symbol rule (#1445) keys off exactly this split, so count
+    // the program's modules here rather than assuming an ordering downstream.
+    var program_modules: u32 = 0;
     for (inputs) |input| switch (input) {
-        .object => |bytes| try modules.append(arena, try macho_reader.read(arena, "bit.o", bytes)),
+        .object => |bytes| {
+            try modules.append(arena, try macho_reader.read(arena, "bit.o", bytes));
+            program_modules += 1;
+        },
         .archive => |bytes| {
             for (try archive.parse(arena, bytes)) |m| try modules.append(arena, try macho_reader.read(arena, m.name, m.data));
         },
     };
-    return linkExecutable(gpa, modules.items, opts);
+    std.debug.assert(program_modules <= modules.items.len);
+
+    var o = opts;
+    o.program_modules = program_modules;
+    return linkExecutable(gpa, modules.items, o);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +338,16 @@ pub fn linkExecutable(gpa: Allocator, input_modules: []const object.Module, opts
                         if ((try kept.getOrPut(arena, tid.key())).found_existing) continue;
                         try stack.append(arena, tid);
                     } else {
-                        // Undefined: a dynamic import from libSystem.
+                        // Undefined. A libSystem import if provenance says so,
+                        // otherwise a compiler bug we refuse here rather than
+                        // hand to dyld (#1445).
+                        if (!undefinedIsImport(opts, id.module, nm)) {
+                            if (opts.undefined_out) |slot| slot.* = .{
+                                .symbol = nm,
+                                .referenced_from = modules[id.module].name,
+                            };
+                            return error.UndefinedSymbol;
+                        }
                         if ((try import_set.getOrPut(arena, nm)).found_existing == false)
                             try import_order.append(arena, nm);
                         if (isBranch(r.kind)) try branch_imports.put(arena, nm, {});
@@ -932,4 +1002,132 @@ test "links the real aarch64 runtime + a bit_main into a signed image that boots
     std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = "zig-out/bit-macho-runtime", .data = exe }) catch {};
 
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+}
+
+/// #1445's rule, exercised at the level it is decided: the dead-strip walk.
+///
+/// Asserting on program OUTPUT could not test this — the whole defect is that
+/// the bad image links and runs the linker's job to completion, then dies in
+/// dyld. So these build the module graph directly and assert on the linker's
+/// verdict.
+///
+/// Shape: `__start` (program module 0) calls `_helper`, which the archive
+/// module 1 defines; `_helper` in turn calls `_libsystem_fn`, which nothing
+/// defines. That is the legitimate arrangement — an archive member reaching
+/// libSystem — and it must keep linking. `__start` additionally calls
+/// `_maybe_bogus`, which is the name under test.
+fn buildImportCase(gpa: Allocator, opts: Options) Error![]u8 {
+    var start_code = [_]u8{0} ** 8;
+    const start_relocs = [_]object.Reloc{
+        .{ .offset = 0, .kind = .aarch64_call26, .target = .{ .global = "_helper" } },
+        .{ .offset = 4, .kind = .aarch64_call26, .target = .{ .global = "_maybe_bogus" } },
+    };
+    var prog_atoms = [_]object.Atom{
+        .{ .name = entry_symbol, .kind = .text, .binding = .global, .data = &start_code, .size = start_code.len, .alignment = 4, .relocs = &start_relocs },
+    };
+
+    var helper_code = [_]u8{0} ** 4;
+    const helper_relocs = [_]object.Reloc{
+        .{ .offset = 0, .kind = .aarch64_call26, .target = .{ .global = "_libsystem_fn" } },
+    };
+    var arch_atoms = [_]object.Atom{
+        .{ .name = "_helper", .kind = .text, .binding = .global, .data = &helper_code, .size = helper_code.len, .alignment = 4, .relocs = &helper_relocs },
+    };
+
+    const mods = [_]object.Module{
+        .{ .name = "bit.o", .atoms = &prog_atoms },
+        .{ .name = "libbitrt.a(rt.o)", .atoms = &arch_atoms },
+    };
+    return linkExecutable(gpa, &mods, opts);
+}
+
+test "an undefined symbol the program object references is a link error, not a dyld import" {
+    const gpa = testing.allocator;
+
+    // (1) Undeclared: refused, naming the symbol AND the referencing module.
+    var undef: UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    try testing.expectError(error.UndefinedSymbol, buildImportCase(gpa, .{
+        .identifier = "t",
+        .program_modules = 1,
+        .undefined_out = &undef,
+    }));
+    try testing.expectEqualStrings("_maybe_bogus", undef.symbol);
+    try testing.expectEqualStrings("bit.o", undef.referenced_from);
+
+    // (2) The same name declared `extern function`: a legal dylib import.
+    // Also proves `_libsystem_fn` — undefined, but referenced from the ARCHIVE
+    // module — stayed a leaf, since otherwise this link would fail too.
+    const ok = try buildImportCase(gpa, .{
+        .identifier = "t",
+        .program_modules = 1,
+        .allowed_imports = &.{"_maybe_bogus"},
+    });
+    defer gpa.free(ok);
+    try testing.expectEqual(MH_MAGIC_64, std.mem.readInt(u32, ok[0..4], .little));
+
+    // (3) An allowlist that names something else must not rescue it: the check
+    // has to compare the symbol, not merely count entries.
+    try testing.expectError(error.UndefinedSymbol, buildImportCase(gpa, .{
+        .identifier = "t",
+        .program_modules = 1,
+        .allowed_imports = &.{"_unrelated"},
+    }));
+}
+
+test "provenance is what distinguishes an import: the archive's libSystem surface stays a leaf" {
+    const gpa = testing.allocator;
+
+    // With BOTH modules counted as program objects, the archive's own
+    // `_libsystem_fn` is no longer exempt — which is the direction that proves
+    // the exemption in the test above is doing real work rather than the whole
+    // walk simply never reaching module 1.
+    var undef: UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    try testing.expectError(error.UndefinedSymbol, buildImportCase(gpa, .{
+        .identifier = "t",
+        .program_modules = 2,
+        .allowed_imports = &.{"_maybe_bogus"},
+        .undefined_out = &undef,
+    }));
+    try testing.expectEqualStrings("_libsystem_fn", undef.symbol);
+    try testing.expectEqualStrings("libbitrt.a(rt.o)", undef.referenced_from);
+}
+
+// The rule above is only live in production if `link()` actually counts the
+// program's modules — and it is `link()`, not `linkExecutable`, that the
+// driver calls. Testing only the latter left `program_modules` free to be
+// wrong (a mutation that never incremented it SURVIVED the tests above), so
+// this drives a real object through the real entry point.
+test "link() counts the program's own modules, so the undefined-symbol rule is live" {
+    const gpa = testing.allocator;
+    const obj_macho = @import("../obj/macho.zig");
+
+    // A minimal relocatable object: `__start` branching to an undefined
+    // `_bogus`. Written by our own object writer and read back by
+    // `macho_reader`, i.e. exactly the round trip every macOS build performs.
+    const code = [_]u8{ 0x00, 0x00, 0x00, 0x94 }; // bl _bogus
+    const bytes = try obj_macho.write(gpa, .aarch64, .{
+        .sections = &.{.{ .kind = .text, .data = &code, .alignment = 4 }},
+        .symbols = &.{
+            .{ .name = entry_symbol, .section = .text, .offset = 0, .size = code.len, .binding = .global },
+            .{ .name = "_bogus", .section = null, .binding = .global },
+        },
+        .relocations = &.{.{ .section = .text, .offset = 0, .symbol = "_bogus", .kind = .branch }},
+    });
+    defer gpa.free(bytes);
+
+    var undef: UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    try testing.expectError(error.UndefinedSymbol, link(gpa, &.{.{ .object = bytes }}, .{
+        .identifier = "t",
+        .undefined_out = &undef,
+    }));
+    try testing.expectEqualStrings("_bogus", undef.symbol);
+
+    // And the same object links once `_bogus` is a declared `extern function`,
+    // so the gate discriminates rather than rejecting the program outright.
+    const ok = try link(gpa, &.{.{ .object = bytes }}, .{
+        .identifier = "t",
+        .allowed_imports = &.{"_bogus"},
+    });
+    defer gpa.free(ok);
+    try testing.expectEqual(MH_MAGIC_64, std.mem.readInt(u32, ok[0..4], .little));
 }

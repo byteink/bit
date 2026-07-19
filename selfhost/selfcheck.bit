@@ -3741,7 +3741,7 @@ function meAnalyze(modules: []LoModule): MeLinkState {
     assert(false)
     map<string, int>{}
   }
-  let st = meDeadStripWithImports(modules, g) catch e {
+  let st = meDeadStripWithImports(modules, g, 0, []string(0)) catch e {
     assert(false)
     meEmptyState()
   }
@@ -3849,11 +3849,112 @@ function checkMachoExecNoDataSeg() {
     meAtom("notstart", LoSectionKind.Text, LoBinding.Global, 4, []LoReloc(0))]}
   let g = resolveGlobals([bad]) catch e { map<string, int>{} }
   let msg = ""
-  let st2 = meDeadStripWithImports([bad], g) catch e {
+  let st2 = meDeadStripWithImports([bad], g, 0, []string(0)) catch e {
     msg = e.message()
     meEmptyState()
   }
   assert(msg == "MissingEntry")
+}
+
+// #1445: an undefined symbol the PROGRAM object references is a link error, not
+// a dyld import. Mirrors the seed's macho.zig tests so the two linkers accept
+// and reject the same programs — the seed is the differential oracle, so a gate
+// only one of them enforces is worse than none.
+function checkMachoExecUndefinedSymbol() {
+  // __start (program module 0) calls _helper, which archive module 1 defines;
+  // _helper calls _libsystem_fn, which nothing defines. That is the legitimate
+  // arrangement — an archive member reaching libSystem — and must keep linking.
+  // __start additionally calls _maybe_bogus, the name under test.
+  let prog = LoModule{ name: "bit.o", atoms: [
+    meAtom("__start", LoSectionKind.Text, LoBinding.Global, 8, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_helper")),
+      meRel(4, LoRelocKind.Aarch64Call26, loGlobalRef("_maybe_bogus"))])]}
+  let arch = LoModule{ name: "libbitrt.a(rt.o)", atoms: [
+    meAtom("_helper", LoSectionKind.Text, LoBinding.Global, 4, [
+      meRel(0, LoRelocKind.Aarch64Call26, loGlobalRef("_libsystem_fn"))])]}
+  let mods = [prog, arch]
+  let g = resolveGlobals(mods) catch e { map<string, int>{} }
+
+  // (1) Undeclared: refused, naming the symbol AND the referencing module.
+  let msg = ""
+  let st = meDeadStripWithImports(mods, g, 1, []string(0)) catch e {
+    msg = e.message()
+    meEmptyState()
+  }
+  assert(msg == "undefined symbol '_maybe_bogus', referenced from bit.o")
+
+  // (2) The same name declared `extern function`: a legal dylib import. This
+  // also proves _libsystem_fn — undefined, but referenced from the ARCHIVE
+  // module — stayed a leaf, since otherwise this would fail too.
+  let ok = ""
+  let st2 = meDeadStripWithImports(mods, g, 1, ["_maybe_bogus"]) catch e {
+    ok = e.message()
+    meEmptyState()
+  }
+  assert(ok == "")
+  assert(len(st2.importOrder) == 2)
+
+  // (3) An allowlist naming something else must not rescue it: the check has to
+  // compare the symbol, not merely count entries.
+  let msg3 = ""
+  let st3 = meDeadStripWithImports(mods, g, 1, ["_unrelated"]) catch e {
+    msg3 = e.message()
+    meEmptyState()
+  }
+  assert(msg3 == "undefined symbol '_maybe_bogus', referenced from bit.o")
+
+  // (4) Provenance is what distinguishes an import: counting BOTH modules as
+  // program objects removes the archive's exemption. This is the direction that
+  // proves the exemption in (2) does real work rather than the walk simply
+  // never reaching module 1.
+  let msg4 = ""
+  let st4 = meDeadStripWithImports(mods, g, 2, ["_maybe_bogus"]) catch e {
+    msg4 = e.message()
+    meEmptyState()
+  }
+  assert(msg4 == "undefined symbol '_libsystem_fn', referenced from libbitrt.a(rt.o)")
+}
+
+// The rule above is only live in production if linkMacho actually counts the
+// program's modules — and it is linkMacho, not linkExecutable, that the driver
+// calls. Testing only the inner walk left programModules free to be wrong (a
+// mutation that never incremented it SURVIVED), so this drives a real object,
+// written by our own writer and read back by our own reader, through the real
+// entry point. Mirrors the seed's "link() counts the program's own modules".
+function checkMachoExecLinkCountsProgramModules() {
+  let code = [u8(0x00), u8(0x00), u8(0x00), u8(0x94)] // bl _bogus
+  let obj = writeMacho(MachoTarget.Aarch64, MachoObject{
+    sections: [MachoSection{ kind: MachoSectionKind.Text, data: code,
+      size: len(code), alignment: 4 }],
+    symbols: [
+      MachoSymbol{ name: "__start", hasSection: true,
+        section: MachoSectionKind.Text, offset: 0, size: len(code),
+        binding: MachoBinding.Global },
+      MachoSymbol{ name: "_bogus", hasSection: false,
+        section: MachoSectionKind.Text, offset: 0, size: 0,
+        binding: MachoBinding.Global }],
+    relocations: [MachoRelocation{ section: MachoSectionKind.Text, offset: 0,
+      symbol: "_bogus", kind: MachoRelocKind.Branch }]}) catch e {
+    panic("writeMacho: ${e.message()}")
+    []u8(0)
+  }
+
+  let msg = ""
+  let exe = linkMacho([meObjectInput(obj)], "t", []string(0)) catch e {
+    msg = e.message()
+    []u8(0)
+  }
+  assert(msg == "undefined symbol '_bogus', referenced from bit.o")
+
+  // The same object links once _bogus is a declared `extern function`, so the
+  // gate discriminates rather than rejecting the program outright.
+  let ok = ""
+  let exe2 = linkMacho([meObjectInput(obj)], "t", ["_bogus"]) catch e {
+    ok = e.message()
+    []u8(0)
+  }
+  assert(ok == "")
+  assert(len(exe2) > 0)
 }
 
 // Stage 3 (#1344 part 5c) address assignment, relocation application, and the
@@ -3960,7 +4061,7 @@ function checkMachoExecApply() {
   // Force it kept to exercise the abs64/rebase path. (Reading a dropped atom out
   // of pat.bytes returns the zero slice, and using it without checking the
   // comma-ok flag crashes silently — which is exactly what the flag is for.)
-  let st0 = meDeadStripWithImports([m], g) catch e {
+  let st0 = meDeadStripWithImports([m], g, 0, []string(0)) catch e {
     assert(false)
     meEmptyState()
   }
@@ -4009,7 +4110,7 @@ function checkMachoExecApplyImports() {
     meAtom("fnptr", LoSectionKind.Data, LoBinding.Global, 8, [
       meRel(0, LoRelocKind.Abs64, loGlobalRef("_malloc"))])]}
   let g = resolveGlobals([m]) catch e { map<string, int>{} }
-  let st0 = meDeadStripWithImports([m], g) catch e { meEmptyState() }
+  let st0 = meDeadStripWithImports([m], g, 0, []string(0)) catch e { meEmptyState() }
   // fnptr is not reachable from __start, so force it kept to exercise the path.
   st0.kept[atomKey(0, 1)] = true
   let st1 = mePartition([m], st0)
@@ -7114,6 +7215,8 @@ function selfcheck() {
   checkMachoExecDeadStrip()
   checkMachoExecGot()
   checkMachoExecNoDataSeg()
+  checkMachoExecUndefinedSymbol()
+  checkMachoExecLinkCountsProgramModules()
   checkMachoExecSymtab()
   checkMachoExecStreams()
   checkMachoExecApply()

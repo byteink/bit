@@ -793,7 +793,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             };
             if (emit_obj) return object;
             defer gpa.free(object);
-            return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
+            return try machoLink(gpa, err_out, &module, object, libbitrt, ident);
         },
     }
 }
@@ -870,7 +870,7 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
                 else => return e,
             };
             defer gpa.free(object);
-            return try macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{ .identifier = ident });
+            return try machoLink(gpa, err_out, &module, object, libbitrt, ident);
         },
     }
 }
@@ -904,6 +904,45 @@ fn rejectExternForTarget(diags: *diagnostics.Diagnostics, files: []const resolve
 
 /// The §11.8 Darwin rejection, rendered like any other build failure: a
 /// message plus a `null` result, which the caller maps to exit code 1.
+/// The Mach-O link, with #1445's undefined-symbol gate wired up: the program's
+/// §11.7 `extern function` declarations are the only names it may legitimately
+/// leave for dyld, and anything else it leaves undefined is refused here with
+/// the symbol and the referencing module named.
+///
+/// Returns `null` (having printed) when the link is refused, mirroring every
+/// other build failure in this file.
+fn machoLink(
+    gpa: std.mem.Allocator,
+    err_out: *Io.Writer,
+    module: *const ir.Module,
+    object: []const u8,
+    libbitrt: []const u8,
+    ident: []const u8,
+) !?[]u8 {
+    const allowed = try emit.externImportNames(gpa, module);
+    defer {
+        for (allowed) |n| gpa.free(n);
+        gpa.free(allowed);
+    }
+
+    var undef: macho.UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    return macho.link(gpa, &.{ .{ .object = object }, .{ .archive = libbitrt } }, .{
+        .identifier = ident,
+        .allowed_imports = allowed,
+        .undefined_out = &undef,
+    }) catch |e| switch (e) {
+        error.UndefinedSymbol => {
+            try err_out.print(
+                "bit: undefined symbol '{s}', referenced from {s}\n" ++
+                    "bit: nothing in the link set defines it and no 'extern function' declares it, so this is a compiler bug rather than a missing library (SPEC \xc2\xa711.7)\n",
+                .{ undef.symbol, undef.referenced_from },
+            );
+            return null;
+        },
+        else => return e,
+    };
+}
+
 fn syscallUnsupported(err_out: *Io.Writer) !?[]u8 {
     try err_out.writeAll("bit: 'syscall' is not supported on aarch64-macos: Darwin publishes no stable syscall numbers (SPEC \xc2\xa711.8)\n");
     return null;
