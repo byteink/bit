@@ -1,0 +1,423 @@
+// Stage-2 port of runtime/net.zig (#1366): the platform-free half.
+//
+// What lives here is everything in `net.zig` that touches no kernel: IPv4
+// literal parsing and formatting, and the DNS message codec. What does NOT live
+// here is every socket call, because a socket is a `syscall` on Linux and an
+// `extern` call on Darwin and §11.7/§11.8 reject even an uncalled declaration of
+// the wrong one — the same forced provider split the netpoller has, for the same
+// reason. See `runtime/net/{linux,darwin}` for that half.
+//
+// THE SPLIT IS NOT ARBITRARY, AND THE LINE IS "DOES THE KERNEL SEE THIS BYTE".
+// `sockaddr_in` is a kernel ABI struct and is therefore NOT here even though it
+// looks platform-free: its first two bytes differ between the two systems (Linux
+// has a 16-bit `sin_family`; Darwin has an 8-bit `sin_len` followed by an 8-bit
+// `sin_family`), so a single "portable" layout would be wrong on one of them.
+// The DNS message format, by contrast, is defined by RFC 1035 rather than by a
+// kernel, so it is identical everywhere and belongs here.
+//
+// EVERY BUFFER CROSSES AS `*u8` PLUS A BYTE COUNT, NEVER AS A SLICE. A Bit slice
+// or array stores one 8-BYTE WORD per element (§11.8), so `[]u8` is strided
+// rather than packed and cannot describe a wire-format message or a kernel
+// struct. This is the trap the brief records as having bitten five agents, and
+// DNS is exactly its shape.
+
+// ---------------------------------------------------------------------------
+// Byte access
+// ---------------------------------------------------------------------------
+
+// Read one byte as 0..255. `*p` on a `*u8` is already unsigned, but the result
+// is used in arithmetic throughout, so it is widened once here.
+function byteAt(base: *u8, off: int): int {
+  let p = base + off
+  return int(*p)
+}
+
+function putByte(base: *u8, off: int, v: int) {
+  let p = base + off
+  *p = u8(v % 256)
+}
+
+// DNS is big-endian on the wire ("network byte order"), and so is `sin_port`.
+// Written out byte-wise rather than through an `*i64` because these fields are
+// 16-bit and unaligned — the answer section puts a u16 at whatever offset the
+// preceding name ended on.
+export function netReadU16Be(base: *u8, off: int): int {
+  return byteAt(base, off) * 256 + byteAt(base, off + 1)
+}
+
+export function netWriteU16Be(base: *u8, off: int, v: int) {
+  putByte(base, off, v / 256 % 256)
+  putByte(base, off + 1, v % 256)
+}
+
+// ---------------------------------------------------------------------------
+// IPv4 literals
+// ---------------------------------------------------------------------------
+
+// Parses a dotted-quad IPv4 literal from `host[0..hostLen]`, writing the four
+// octets to `out`. Returns false — writing nothing — for anything else.
+//
+// DELIBERATELY STRICT, matching the Zig: no DNS, no IPv6, no shorthand. A caller
+// wanting a hostname resolves it first (`netResolve` is the layer above). The
+// strictness is load-bearing rather than fussy: `netResolve` uses THIS FUNCTION'S
+// REJECTION as the signal to fall through to a DNS query, so a parser that
+// accepted "localhost" as some address would silently skip resolution.
+//
+// Hand-rolled for the reason the Zig records: the obvious `split` + `parseInt`
+// spelling goes through SIMD `indexOfScalar`, whose vector constants this
+// project's own AArch64 linker mis-resolved (#1157) — `indexOfScalar` answered 0
+// instead of 3 for the first '.' in "127.0.0.1". Four fields and three digits do
+// not need SIMD, and a freestanding runtime is better off not depending on it.
+export function netParseIpv4(host: *u8, hostLen: int, out: *u8): bool {
+  if (hostLen <= 0) {
+    return false
+  }
+  // Four octets, each at most three digits plus a separator: a 15-byte upper
+  // bound on any input this can accept, which also bounds every loop below.
+  if (hostLen > 15) {
+    return false
+  }
+  let i = 0
+  let field = 0
+  while (field < 4) {
+    let v = 0
+    let digits = 0
+    // Bounded by `hostLen`, which is bounded above (Power of 10).
+    while (i < hostLen && byteAt(host, i) != 46) {
+      let c = byteAt(host, i)
+      if (c < 48 || c > 57) {
+        return false
+      }
+      v = v * 10 + (c - 48)
+      digits = digits + 1
+      // Checked INSIDE the loop, not after it, so `v` cannot run away on a long
+      // digit run before the range test sees it.
+      if (digits > 3 || v > 255) {
+        return false
+      }
+      i = i + 1
+    }
+    if (digits == 0) {
+      return false
+    }
+    putByte(out, field, v)
+    if (field < 3) {
+      // A separator must be present and is stepped over.
+      //
+      // DEFENSIVE DEPTH, NOT AN OBSERVABLE GUARD, and that was established by
+      // mutation rather than assumed: deleting this check changes no answer,
+      // because the two inputs that reach it are already rejected downstream.
+      // A non-'.' byte here is a non-digit, so the digit loop above returns
+      // false before this runs; and a name that ends early ("1.2.3") leaves the
+      // next field with `digits == 0`, which is rejected on the following pass.
+      // It stays because a parser reading untrusted network input should refuse
+      // on the first thing that is wrong rather than on a later consequence.
+      if (i >= hostLen || byteAt(host, i) != 46) {
+        return false
+      }
+      i = i + 1
+    }
+    field = field + 1
+  }
+  // Trailing junk, e.g. "1.2.3.4.5" or "1.2.3.4x". Without this the fourth
+  // field's loop would simply stop early and the remainder go unnoticed.
+  if (i != hostLen) {
+    return false
+  }
+  return true
+}
+
+// Writes the dotted quad for four octets into `buf`, returning the byte count.
+// `buf` must hold the longest form, "255.255.255.255" = 15 bytes.
+//
+// Hand-rolled for the same reason as `netParseIpv4`, and with no leading zeros:
+// `formatOctets` must round-trip through `netParseIpv4`, which rejects a
+// four-digit field, so "010" would not survive the trip.
+export function netFormatOctets(octets: *u8, buf: *u8): int {
+  let n = 0
+  let i = 0
+  while (i < 4) {
+    if (i != 0) {
+      putByte(buf, n, 46)
+      n = n + 1
+    }
+    let o = byteAt(octets, i)
+    if (o >= 100) {
+      putByte(buf, n, 48 + o / 100)
+      n = n + 1
+    }
+    if (o >= 10) {
+      putByte(buf, n, 48 + o / 10 % 10)
+      n = n + 1
+    }
+    putByte(buf, n, 48 + o % 10)
+    n = n + 1
+    i = i + 1
+  }
+  return n
+}
+
+// ---------------------------------------------------------------------------
+// DNS: the message codec
+// ---------------------------------------------------------------------------
+//
+// A minimal stub resolver's wire format, matching the Zig exactly: one A query
+// to one nameserver over UDP/53, first A record wins. No search domains, no
+// caching, no AAAA, no TCP fallback for a truncated reply. A hostname needing any
+// of those is out of scope for v1, and widening it here rather than in the Zig
+// would be an improvement dressed as a port.
+
+// The DNS transaction id the Zig uses. A FIXED id is sound here and the reason
+// is worth keeping: the socket is connectionless and used for exactly one
+// exchange, so there is no second reply to correlate against. `netParseAnswer`
+// still verifies it, because a stray datagram from an unrelated sender can
+// arrive on a bound UDP port and must not be mistaken for the answer.
+export const netDnsId: int = 6935
+
+// Writes a DNS A-record query for `host[0..hostLen]` into `out`, returning the
+// length, or -1 if the name does not fit the format.
+//
+// The QNAME is the host split on '.', each label length-prefixed, then a zero
+// root label. `outCap` bounds every write — the Zig checks the same bound inside
+// its label loop, and it must be checked there rather than up front because the
+// encoded length is not a function of `hostLen` alone.
+export function netBuildQuery(out: *u8, outCap: int, host: *u8, hostLen: int, id: int): int {
+  // 253 is the RFC 1035 limit on a domain name's presentation length.
+  if (hostLen <= 0 || hostLen > 253) {
+    return 0 - 1
+  }
+  if (outCap < 12) {
+    return 0 - 1
+  }
+  // Header: id, flags = RD (recursion desired), qdcount 1, the rest zero.
+  netWriteU16Be(out, 0, id)
+  netWriteU16Be(out, 2, 256)
+  netWriteU16Be(out, 4, 1)
+  let z = 6
+  while (z < 12) {
+    putByte(out, z, 0)
+    z = z + 1
+  }
+  let n = 12
+
+  // QNAME. `start` marks the current label's first byte; a '.' or the end of the
+  // host closes it. Bounded by `hostLen` (Power of 10).
+  let start = 0
+  let i = 0
+  while (i <= hostLen) {
+    let atEnd = i == hostLen
+    if (atEnd || byteAt(host, i) == 46) {
+      let labelLen = i - start
+      // Rejects both an empty label ("a..b", or a trailing dot) and an
+      // over-long one, exactly as the Zig does.
+      if (labelLen == 0 || labelLen > 63) {
+        return 0 - 1
+      }
+      // 1 length byte + the label + the root label + QTYPE + QCLASS.
+      if (n + 1 + labelLen + 5 > outCap) {
+        return 0 - 1
+      }
+      putByte(out, n, labelLen)
+      n = n + 1
+      let k = 0
+      while (k < labelLen) {
+        putByte(out, n + k, byteAt(host, start + k))
+        k = k + 1
+      }
+      n = n + labelLen
+      start = i + 1
+    }
+    i = i + 1
+  }
+  putByte(out, n, 0)
+  n = n + 1
+  netWriteU16Be(out, n, 1)
+  netWriteU16Be(out, n + 2, 1)
+  return n + 4
+}
+
+// Advances past the DNS name at `msg[off]`, returning the offset just past it,
+// or -1 if the name runs off the end of the message.
+//
+// COMPRESSION IS SKIPPED, NEVER FOLLOWED — and that is a correctness property,
+// not a shortcut. A caller here never needs the name's text, only its length, so
+// there is nothing to gain by following the pointer; and following it is how a
+// DNS parser gets a compression LOOP (a pointer to itself), which is a classic
+// hang in exactly the code that must not hang. A pointer is two bytes and always
+// ends the name, so this terminates by construction.
+export function netSkipName(msg: *u8, msgLen: int, off: int): int {
+  if (off < 0) {
+    return 0 - 1
+  }
+  let i = off
+  // `i` strictly increases every iteration, so `msgLen` bounds the trip count.
+  while (i < msgLen) {
+    let len = byteAt(msg, i)
+    if (len == 0) {
+      return i + 1
+    }
+    // 0xC0 in the top two bits marks a compression pointer.
+    if (len / 64 == 3) {
+      return i + 2
+    }
+    i = i + 1 + len
+  }
+  return 0 - 1
+}
+
+// Parses a DNS response, writing the first A record's four octets to `out`.
+// Returns false on a mismatched id, an error RCODE, a malformed message, or an
+// answer with no A record in it.
+//
+// The id and RCODE checks are the ones worth not dropping: a reply for a
+// different query, or a SERVFAIL, otherwise reaches the answer walk and is read
+// as though it carried an address.
+export function netParseAnswer(msg: *u8, msgLen: int, wantId: int, out: *u8): bool {
+  // A MEMORY-SAFETY GUARD, AND IT CANNOT BE OBSERVED FROM THE OUTSIDE — worth
+  // stating so the next reader does not delete it as untested. The four header
+  // reads below are the only ones in this function NOT bounded by `msgLen`, so
+  // without this a 4-byte datagram is read twelve bytes deep. Every later read
+  // is bounded, which is exactly why deleting this line still produces `false`
+  // for every input and why the mutation survives: what it prevents is an
+  // out-of-bounds read, not a wrong answer.
+  if (msgLen < 12) {
+    return false
+  }
+  if (netReadU16Be(msg, 0) != wantId) {
+    return false
+  }
+  let flags = netReadU16Be(msg, 2)
+  // RCODE is the low four bits: non-zero is NXDOMAIN, SERVFAIL, REFUSED, ...
+  if (flags % 16 != 0) {
+    return false
+  }
+  let qd = netReadU16Be(msg, 4)
+  let an = netReadU16Be(msg, 6)
+
+  let off = 12
+  // The question section is skipped, not parsed: its only use here is to find
+  // where the answers start.
+  let q = 0
+  while (q < qd) {
+    off = netSkipName(msg, msgLen, off)
+    if (off < 0) {
+      return false
+    }
+    // QTYPE + QCLASS.
+    off = off + 4
+    q = q + 1
+  }
+  let a = 0
+  while (a < an) {
+    off = netSkipName(msg, msgLen, off)
+    if (off < 0) {
+      return false
+    }
+    // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) — ten bytes of fixed record header
+    // that must be present before any of them is read.
+    if (off + 10 > msgLen) {
+      return false
+    }
+    let rtype = netReadU16Be(msg, off)
+    let rdlen = netReadU16Be(msg, off + 8)
+    off = off + 10
+    if (off + rdlen > msgLen) {
+      return false
+    }
+    // TYPE 1 is A, and an A record's RDATA is exactly the four address bytes.
+    // Both halves are checked: a CNAME or AAAA in the same answer set has a
+    // different length, and reading its RDATA as an address is the bug this
+    // guard exists for.
+    if (rtype == 1 && rdlen == 4) {
+      let k = 0
+      while (k < 4) {
+        putByte(out, k, byteAt(msg, off + k))
+        k = k + 1
+      }
+      return true
+    }
+    off = off + rdlen
+    a = a + 1
+  }
+  return false
+}
+
+// Finds the first `nameserver <dotted-quad>` line in a resolv.conf held in
+// `buf[0..bufLen]`, writing its address to `out`. Returns false when there is no
+// usable one.
+//
+// Split out from the file read so that the parsing half is testable without a
+// filesystem — the Zig's `firstNameserver` does both, and the read is a
+// platform call this module cannot make.
+export function netFirstNameserver(buf: *u8, bufLen: int, out: *u8): bool {
+  let lineStart = 0
+  let i = 0
+  // One pass over the file; `i` strictly increases (Power of 10).
+  while (i <= bufLen) {
+    if (i == bufLen || byteAt(buf, i) == 10) {
+      if (netNameserverLine(buf, lineStart, i, out)) {
+        return true
+      }
+      lineStart = i + 1
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// One resolv.conf line, `buf[lo..hi]`: true when it is a `nameserver` line
+// carrying an address this runtime can use.
+function netNameserverLine(buf: *u8, lo: int, hi: int, out: *u8): bool {
+  let s = lo
+  let e = hi
+  // Trim leading and trailing space, tab and CR. The CR matters: a file with
+  // CRLF endings otherwise leaves "\r" glued to the address and every line is
+  // rejected.
+  while (s < e && netIsSpace(byteAt(buf, s))) {
+    s = s + 1
+  }
+  while (e > s && netIsSpace(byteAt(buf, e - 1))) {
+    e = e - 1
+  }
+  // "nameserver" is ten bytes and must be followed by separating space —
+  // without that check a directive like "nameserverfoo" would match.
+  if (e - s < 11) {
+    return false
+  }
+  let key = 0
+  while (key < 10) {
+    if (byteAt(buf, s + key) != netNameserverByte(key)) {
+      return false
+    }
+    key = key + 1
+  }
+  let v = s + 10
+  if (!netIsSpace(byteAt(buf, v))) {
+    return false
+  }
+  while (v < e && netIsSpace(byteAt(buf, v))) {
+    v = v + 1
+  }
+  return netParseIpv4(buf + v, e - v, out)
+}
+
+function netIsSpace(c: int): bool {
+  // space, tab, CR.
+  return c == 32 || c == 9 || c == 13
+}
+
+// The bytes of "nameserver". Spelled as a function over an index rather than as
+// a string constant because this module is compared byte-wise against a `*u8`
+// cursor and never holds a managed string.
+function netNameserverByte(i: int): int {
+  if (i == 0) { return 110 }
+  if (i == 1) { return 97 }
+  if (i == 2) { return 109 }
+  if (i == 3) { return 101 }
+  if (i == 4) { return 115 }
+  if (i == 5) { return 101 }
+  if (i == 6) { return 114 }
+  if (i == 7) { return 118 }
+  if (i == 8) { return 101 }
+  return 114
+}

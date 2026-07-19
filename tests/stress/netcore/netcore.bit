@@ -1,0 +1,278 @@
+// The platform-free half of the net port (#1366): IPv4 literals and the DNS
+// message codec, against hand-built messages.
+//
+// THIS IS THE HALF WHERE A WRONG ANSWER IS SILENT. A socket call that fails
+// returns an error a caller can see; a DNS parser that reads RDLENGTH from the
+// wrong offset returns four bytes that LOOK like an address, and a resolver that
+// answers 300.0.1.0 for a real hostname fails somewhere else entirely. So every
+// property here asserts an exact value rather than "it did not error".
+//
+// Platform-free by construction — no `syscall`, no `extern` — so this runs on
+// every target and carries no `linux-only`/`darwin-only` marker. The socket half
+// is tested by its own per-platform programs.
+
+import { netParseIpv4, netFormatOctets, netReadU16Be } from "../../../runtime/net"
+import { netBuildQuery, netSkipName, netParseAnswer, netFirstNameserver } from "../../../runtime/net"
+
+// Scratch regions. `[N]i64` rather than `[N]byte` because a Bit array stores one
+// 8-BYTE WORD per element (§11.8): only an `[N]i64` walked through a `*u8` is a
+// genuinely contiguous byte region, which is what a wire-format message is.
+let hostBuf: [8]i64
+let outBuf: [2]i64
+let fmtBuf: [4]i64
+let queryBuf: [64]i64
+let msgBuf: [16]i64
+let confBuf: [32]i64
+
+function hostBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(hostBuf))
+}
+
+function outBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(outBuf))
+}
+
+function fmtBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(fmtBuf))
+}
+
+function queryBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(queryBuf))
+}
+
+function msgBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(msgBuf))
+}
+
+function confBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(confBuf))
+}
+
+// Copies a Bit string into a PACKED byte region and returns its length. The
+// bridge exists because `[]byte(s)` is one 8-byte word per element (§11.8) —
+// strided, not packed — so it can be read element-wise but never handed to code
+// that walks bytes.
+function fill(base: *u8, s: string): int {
+  let b = []byte(s)
+  let i = 0
+  while (i < len(b)) {
+    let p = base + i
+    *p = b[i]
+    i = i + 1
+  }
+  return len(b)
+}
+
+function putByte(base: *u8, off: int, v: int) {
+  let p = base + off
+  *p = u8(v % 256)
+}
+
+function byteAt(base: *u8, off: int): int {
+  let p = base + off
+  return int(*p)
+}
+
+// Parses `s` and returns its four octets packed into one int, or -1 on reject.
+// One comparable value per case keeps each assertion exact instead of "it
+// returned true".
+function parsed(s: string): int {
+  let n = fill(hostBytes(), s)
+  let ok = netParseIpv4(hostBytes(), n, outBytes())
+  if (!ok) {
+    return 0 - 1
+  }
+  let o = outBytes()
+  return byteAt(o, 0) * 16777216 + byteAt(o, 1) * 65536 + byteAt(o, 2) * 256 + byteAt(o, 3)
+}
+
+// True when `s` parses and formats back to exactly `s`. The round trip is what
+// makes the formatter's three-digit/two-digit branches load-bearing.
+function roundTrips(s: string): bool {
+  let n = fill(hostBytes(), s)
+  if (!netParseIpv4(hostBytes(), n, outBytes())) {
+    return false
+  }
+  let m = netFormatOctets(outBytes(), fmtBytes())
+  if (m != n) {
+    return false
+  }
+  let i = 0
+  while (i < n) {
+    if (byteAt(fmtBytes(), i) != byteAt(hostBytes(), i)) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Builds a response carrying TWO answer records — a CNAME and then an A — both
+// behind COMPRESSED names, and returns its length.
+//
+// THE SHAPE IS THE POINT. A single uncompressed A record would let three
+// separate mistakes pass: never skipping a compression pointer, never advancing
+// past a non-matching record's RDATA, and reading RDLENGTH from the wrong
+// offset. With a CNAME first, the walk has to skip its 3 RDATA bytes using a
+// correctly-read RDLENGTH to land on the A record at all.
+function buildResponse(id: int, an: int, rcode: int): int {
+  let m = msgBytes()
+  netWriteU16BeLocal(m, 0, id)
+  // QR=1, RD=1, RA=1, plus the caller's RCODE in the low four bits.
+  netWriteU16BeLocal(m, 2, 33152 + rcode)
+  netWriteU16BeLocal(m, 4, 1)
+  netWriteU16BeLocal(m, 6, an)
+  netWriteU16BeLocal(m, 8, 0)
+  netWriteU16BeLocal(m, 10, 0)
+
+  // Question at 12: the name "x", then QTYPE=A, QCLASS=IN.
+  putByte(m, 12, 1)
+  putByte(m, 13, 120)
+  putByte(m, 14, 0)
+  netWriteU16BeLocal(m, 15, 1)
+  netWriteU16BeLocal(m, 17, 1)
+
+  // Answer 1 at 19: a CNAME whose RDATA is three bytes that must be stepped over.
+  putByte(m, 19, 192)
+  putByte(m, 20, 12)
+  netWriteU16BeLocal(m, 21, 5)
+  netWriteU16BeLocal(m, 23, 1)
+  netWriteU16BeLocal(m, 25, 0)
+  netWriteU16BeLocal(m, 27, 300)
+  netWriteU16BeLocal(m, 29, 3)
+  // RDATA the walk must skip. Deliberately bytes that would read as a plausible
+  // address if the walk landed on them.
+  putByte(m, 31, 9)
+  putByte(m, 32, 9)
+  putByte(m, 33, 9)
+
+  // Answer 2 at 34: the A record, 1.2.3.4.
+  putByte(m, 34, 192)
+  putByte(m, 35, 12)
+  netWriteU16BeLocal(m, 36, 1)
+  netWriteU16BeLocal(m, 38, 1)
+  netWriteU16BeLocal(m, 40, 0)
+  netWriteU16BeLocal(m, 42, 300)
+  netWriteU16BeLocal(m, 44, 4)
+  putByte(m, 46, 1)
+  putByte(m, 47, 2)
+  putByte(m, 48, 3)
+  putByte(m, 49, 4)
+  return 50
+}
+
+function netWriteU16BeLocal(base: *u8, off: int, v: int) {
+  putByte(base, off, v / 256 % 256)
+  putByte(base, off + 1, v % 256)
+}
+
+function answerOctets(msgLen: int, wantId: int): int {
+  if (!netParseAnswer(msgBytes(), msgLen, wantId, outBytes())) {
+    return 0 - 1
+  }
+  let o = outBytes()
+  return byteAt(o, 0) * 16777216 + byteAt(o, 1) * 65536 + byteAt(o, 2) * 256 + byteAt(o, 3)
+}
+
+function main() {
+  // ---- IPv4 literals, accepted ----
+  // 127.0.0.1 = 0x7F000001, 0.0.0.0 = 0, 255.255.255.255 = 0xFFFFFFFF.
+  let a1 = parsed("127.0.0.1") == 2130706433
+  let a2 = parsed("0.0.0.0") == 0
+  let a3 = parsed("255.255.255.255") == 4294967295
+  let a4 = parsed("1.2.3.4") == 16909060
+  println("accept ${a1} ${a2} ${a3} ${a4}")
+
+  // ---- IPv4 literals, rejected ----
+  // Each case kills a specific guard: too few fields, trailing junk, an
+  // out-of-range octet, a non-digit, an empty field, a four-digit field, and a
+  // non-digit tail that a field loop alone would not notice.
+  let r1 = parsed("127.0.0") == 0 - 1
+  let r2 = parsed("127.0.0.1.1") == 0 - 1
+  let r3 = parsed("127.0.0.256") == 0 - 1
+  let r4 = parsed("localhost") == 0 - 1
+  let r5 = parsed("127.0..1") == 0 - 1
+  let r6 = parsed("1.2.3.0001") == 0 - 1
+  let r7 = parsed("1.2.3.4x") == 0 - 1
+  println("reject ${r1} ${r2} ${r3} ${r4} ${r5} ${r6} ${r7}")
+
+  // ---- format round trip ----
+  let f1 = roundTrips("127.0.0.1")
+  let f2 = roundTrips("0.0.0.0")
+  let f3 = roundTrips("255.255.255.255")
+  let f4 = roundTrips("10.0.0.255")
+  let f5 = roundTrips("1.2.3.4")
+  println("format ${f1} ${f2} ${f3} ${f4} ${f5}")
+
+  // ---- buildQuery ----
+  // "a.bc" encodes as 12 header + [1]'a'[2]'b''c'[0] + QTYPE + QCLASS = 22.
+  let hn = fill(hostBytes(), "a.bc")
+  let qlen = netBuildQuery(queryBytes(), 512, hostBytes(), hn, 4660)
+  let q = queryBytes()
+  let qLen = qlen == 22
+  let qId = netReadU16Be(q, 0) == 4660
+  let qFlags = netReadU16Be(q, 2) == 256
+  let qQd = netReadU16Be(q, 4) == 1
+  // The QNAME labels, byte for byte.
+  let qName = byteAt(q, 12) == 1 && byteAt(q, 13) == 97 && byteAt(q, 14) == 2 &&
+              byteAt(q, 15) == 98 && byteAt(q, 16) == 99 && byteAt(q, 17) == 0
+  let qType = netReadU16Be(q, 18) == 1 && netReadU16Be(q, 20) == 1
+  println("query ${qLen} ${qId} ${qFlags} ${qQd} ${qName} ${qType}")
+
+  // Rejected names: an empty label, a trailing dot, and a buffer too small to
+  // hold the encoding (checked inside the label loop, not up front).
+  let e1 = netBuildQuery(queryBytes(), 512, hostBytes(), fill(hostBytes(), "a..b"), 1) == 0 - 1
+  let e2 = netBuildQuery(queryBytes(), 512, hostBytes(), fill(hostBytes(), "a.b."), 1) == 0 - 1
+  let e3 = netBuildQuery(queryBytes(), 16, hostBytes(), fill(hostBytes(), "abcdef.gh"), 1) == 0 - 1
+  println("queryreject ${e1} ${e2} ${e3}")
+
+  // ---- skipName ----
+  // An uncompressed name "x" at 12 occupies three bytes; a compression pointer
+  // is two, whatever it points at.
+  let mlen = buildResponse(43981, 2, 0)
+  let s1 = netSkipName(msgBytes(), mlen, 12) == 15
+  let s2 = netSkipName(msgBytes(), mlen, 19) == 21
+  println("skip ${s1} ${s2}")
+
+  // ---- parseAnswer ----
+  // The A record is the SECOND answer, behind a CNAME: reaching it at all
+  // proves the RDLENGTH read and the RDATA skip are both right.
+  let p1 = answerOctets(mlen, 43981) == 16909060
+  // A wrong transaction id is a different query's reply.
+  let p2 = answerOctets(mlen, 43982) == 0 - 1
+  // SERVFAIL (RCODE 2) carries no usable answer even with an answer section.
+  let mfail = buildResponse(43981, 2, 2)
+  let p3 = answerOctets(mfail, 43981) == 0 - 1
+  // An answer section holding only the CNAME has no A record in it.
+  let mcname = buildResponse(43981, 1, 0)
+  let p4 = answerOctets(mcname, 43981) == 0 - 1
+  // A truncated message must be refused rather than read off the end.
+  let p5 = answerOctets(11, 43981) == 0 - 1
+  println("answer ${p1} ${p2} ${p3} ${p4} ${p5}")
+
+  // ---- resolv.conf ----
+  // Comments, a CRLF line ending, an unrelated directive, and leading space —
+  // the first usable nameserver line wins.
+  let cn = fill(confBytes(), "# comment\r\noptions ndots:1\r\n  nameserver\t8.8.4.4\r\nnameserver 1.1.1.1\r\n")
+  let c1 = netFirstNameserver(confBytes(), cn, outBytes())
+  let o = outBytes()
+  let c2 = byteAt(o, 0) == 8 && byteAt(o, 1) == 8 && byteAt(o, 2) == 4 && byteAt(o, 3) == 4
+  // A file with no nameserver line, and one whose directive merely starts with
+  // the keyword, both fail rather than matching.
+  let cn2 = fill(confBytes(), "search example.com\nnameserverfoo 1.2.3.4\n")
+  let c3 = !netFirstNameserver(confBytes(), cn2, outBytes())
+  // "nameserver1.2.3.4" — THE KEYWORD BOUNDARY, and it needs its own case.
+  // Mutation-testing found that dropping the boundary check survived every
+  // other line here: "nameserverfoo" is rejected anyway because "foo ..." is
+  // not a dotted quad, so only a run-on line whose tail IS a valid address can
+  // tell a bounded match from an unbounded one.
+  let cn3 = fill(confBytes(), "nameserver1.2.3.4\n")
+  let c4 = !netFirstNameserver(confBytes(), cn3, outBytes())
+  println("resolvconf ${c1} ${c2} ${c3} ${c4}")
+}
