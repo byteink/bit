@@ -706,6 +706,8 @@ pub const Lowerer = struct {
             try env.declare(self.gpa, c.name, fv, c.ty);
         }
 
+        // A closure body returns under the same hint a named function's does, so
+        // `(x: f32): f32 => 4.5` and its `return 4.5` block form agree (#1467).
         var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env, .result_ty = shape.result };
         defer fc.deinit();
 
@@ -717,7 +719,7 @@ pub const Lowerer = struct {
                 try fc.emitRet(&.{});
             }
         } else {
-            const v = try fc.lowerExpr(body);
+            const v = try fc.lowerExprH(body, shape.result);
             try fc.runDefers();
             try fc.emitRet(&.{v});
         }
@@ -1135,10 +1137,15 @@ const FnCtx = struct {
     fallible_ok: TypeId = .invalid,
     fallible_err: TypeId = .invalid,
     /// The enclosing function's declared result type, already generic-substituted
-    /// and with any `!` unwrapped. `return a, b` boxes against *this* (ABI.md
-    /// §1.1) rather than a tuple re-interned from the element expressions: an
-    /// element may have widened to its declared type (an untyped literal being
-    /// the common case), and the callee's promise is what callers destructure.
+    /// and with any `!` unwrapped to `T`. `.invalid` for a void function.
+    /// Two consumers:
+    ///   - `return a, b` boxes against *this* (ABI.md §1.1) rather than a tuple
+    ///     re-interned from the element expressions: an element may have widened
+    ///     to its declared type (an untyped literal being the common case), and
+    ///     the callee's promise is what callers destructure.
+    ///   - `lowerReturn` materializes the returned expression at it: `return 4.5`
+    ///     from an `f32!` otherwise lands at the untyped default f64 and the
+    ///     narrow return reads its zero low half (#1467).
     result_ty: TypeId = .invalid,
     loop_stack: std.ArrayList(LoopCtx) = .empty,
     defers: std.ArrayList(DeferredCall) = .empty,
@@ -1809,7 +1816,11 @@ const FnCtx = struct {
             try self.emitRet(&.{boxed});
             return;
         }
-        for (exprs, 0..) |e, i| vals[i] = try self.arrayValueForBind(e, try self.lowerExpr(e), try self.nodeType(e));
+        // The declared result type is the hint for what remains: the multi-value
+        // path above returns, so this runs only for a void or single-expression
+        // `return`, and only the latter can name `result_ty`.
+        const rhint: ?TypeId = if (exprs.len == 1 and self.result_ty != .invalid) self.result_ty else null;
+        for (exprs, 0..) |e, i| vals[i] = try self.arrayValueForBind(e, try self.lowerExprH(e, rhint), try self.nodeType(e));
         try self.runDefers();
         // A fallible function's ok return must leave the error slot null; clear
         // it after defers (a deferred fallible call may have set it — §11.6).
