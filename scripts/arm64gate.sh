@@ -44,6 +44,9 @@ VOLUME="bit-zig-cache-arm64"
 # >90min and still progressing, so a tighter ceiling kills good runs. The deadline
 # exists to catch a hang, not to enforce a performance budget.
 DEADLINE="${ARM64GATE_DEADLINE:-10800}"
+# Which `zig build` step to gate on. Override to narrow a run to one step, or to
+# `--help` for a green-path control that proves a zero exit really reports green.
+STEP="${ARM64GATE_STEP:-test}"
 
 command -v docker >/dev/null || { echo "arm64gate: docker not found" >&2; exit 127; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
@@ -93,12 +96,16 @@ run_suite() {
   # runtime swallows SIGALRM, so the alarm never lands. Measured 2026-07-19:
   # `perl -e 'alarm 3; exec @ARGV' docker run --rm alpine sleep 25` ran the full
   # 25s and exited 0. That defect let a genuinely hung run burn 2h of CPU.
-  ( sleep "${DEADLINE}"; docker rm -f "${name}" >/dev/null 2>&1 ) &
+  # Its stdout MUST be closed: `code=$(...)` below waits for every writer of the
+  # substitution pipe to exit, and a watchdog that inherits stdout is one — the
+  # gate would then sit idle until the full deadline elapsed even after the suite
+  # had finished, looking exactly like the hang it exists to catch.
+  ( sleep "${DEADLINE}"; docker rm -f "${name}" >/dev/null 2>&1 ) >/dev/null 2>&1 &
   local watchdog=$!
 
   code=$(docker run --rm -i --name "${name}" ${CACHE_ARGS} "${IMAGE}" bash -c '
       mkdir -p /work && cd /work && tar x &&
-      ZIG_GLOBAL_CACHE_DIR='"${CACHE_ENV}"' zig build test > /tmp/o 2>&1
+      ZIG_GLOBAL_CACHE_DIR='"${CACHE_ENV}"' zig build '"${STEP}"' > /tmp/o 2>&1
       e=$?
       if [ $e -eq 0 ]; then
         echo ===TAIL===
