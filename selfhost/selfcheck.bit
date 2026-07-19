@@ -7263,6 +7263,8 @@ function selfcheck() {
   checkMachoExecApplyImports()
   checkMachoExecTlsOffset()
   checkArchiveDefines()
+  checkReadonlyGlobals()
+  checkReadonlyGlobalRelocs()
   checkMachoExecStub()
   checkMachoExecCmdSizes()
   checkMachoExecHeaderAndCounts()
@@ -7350,4 +7352,124 @@ function checkArchiveDefines() {
   // response to "unknown" is to reject. `bit build-obj` reaches here empty.
   assert(!archiveDefines(lt, []u8(0), "bit_rt_probe"))
   assert(!archiveDefines(lt, []byte("not an ar archive at all"), "bit_rt_probe"))
+}
+
+// #1447: read-only static data. Mirrors the seed's `.rodata` emit tests.
+//
+// THIS AREA HAS SILENTLY BROKEN TWICE — AArch64 `$d`/`$x` mapping symbols once
+// corrupted a `.rodata` table so `log10` returned 5.6e31, and the linker once
+// dropped the section bytes ahead of the first symbol so a lane vector read as
+// zeros. Both LINKED CLEANLY and returned wrong numbers. So the assertions here
+// read the EMITTED BYTES back out through the object readers rather than
+// trusting that emission succeeded.
+//
+// The image is adversarial rather than zeros or a counting sequence: no byte
+// repeats a neighbour and no 8-byte window is all-zero, so a table that is
+// truncated, shifted, or has its leading run dropped cannot compare equal by
+// luck.
+function roImage(): []int {
+  return [222, 173, 190, 239, 202, 254, 186, 190,
+          1, 35, 69, 103, 137, 171, 205, 239,
+          240, 13, 250, 206, 209, 206, 94, 161]
+}
+
+function roTestModule(): IrModule {
+  let ctx = newTypeContext()
+  return IrModule{
+    funcs: []IrFunc(0), ctx: ctx, asmBlocks: []AsmBlock(0),
+    stubbed: []string(0), methodTables: []MethodTable(0),
+    stringPool: []string(0), externNames: []string(0),
+    globals: [IrGlobal{ name: "__bitro_table", bytes: roImage(), align: 16,
+      storage: storageReadonly(), relocs: []IrGlobalReloc(0) }] }
+}
+
+// The atom named `nm`, or -1. Separate from erAtomNamed (which asserts) because
+// absence is a case this test reports on rather than crashes over.
+function roAtomIndex(m: LoModule, nm: string): int {
+  let i = 0
+  while (i < len(m.atoms)) {
+    if (m.atoms[i].name == nm) { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+function checkReadonlyGlobals() {
+  let img = roImage()
+
+  // ---- both ELF arches --------------------------------------------------
+  for t of [ElfTarget.X86_64, ElfTarget.Aarch64] {
+    let obj = emitElfObject(roTestModule(), t, false, false) catch e { []u8(0) }
+    assert(len(obj) > 0)
+    let m = readElf(t, "t.o", obj) catch e { LoModule{ name: "", atoms: []LoAtom(0) } }
+    let ai = roAtomIndex(m, "__bitro_table")
+    // Anti-vacuity: without this, deleting the emission entirely would make
+    // every assertion below unreachable and the check pass.
+    assert(ai >= 0)
+    let atom = m.atoms[ai]
+    // (1) genuinely read-only, not merely "somewhere".
+    assert(atom.kind == LoSectionKind.Rodata)
+    // (2) the bytes, verbatim — the assertion both prior silent-wrongness bugs
+    //     would have failed.
+    assert(atom.size == len(img))
+    let k = 0
+    while (k < len(img)) {
+      assert(int(atom.data[k]) == img[k])
+      k = k + 1
+    }
+    // (3) alignment survived into the section (#1421): `.rodata` used to be
+    //     pinned at 8 while this cell asks for 16.
+    assert(atom.alignment >= 16)
+  }
+
+  // ---- Mach-O ------------------------------------------------------------
+  // Same claims, plus the `_` decoration, which is a whole separate way to get
+  // this wrong.
+  let mobj = emitMachoObject(roTestModule(), false, false) catch e { []u8(0) }
+  assert(len(mobj) > 0)
+  let mm = readMachoObject("t.o", mobj) catch e { LoModule{ name: "", atoms: []LoAtom(0) } }
+  let mi = roAtomIndex(mm, "___bitro_table")
+  assert(mi >= 0)
+  assert(mm.atoms[mi].kind == LoSectionKind.Rodata)
+  assert(mm.atoms[mi].size == len(img))
+  let j = 0
+  while (j < len(img)) {
+    assert(int(mm.atoms[mi].data[j]) == img[j])
+    j = j + 1
+  }
+  assert(mm.atoms[mi].alignment >= 16)
+}
+
+// The relocation half of #1447: a `[]T` slice header in `.rodata` needs its
+// `buf` word filled in with the payload's link-time address, which only the
+// linker knows. Asserted on the emitted relocation, so it holds on any host.
+function checkReadonlyGlobalRelocs() {
+  for t of [ElfTarget.X86_64, ElfTarget.Aarch64] {
+    let ctx = newTypeContext()
+    let mod = IrModule{
+      funcs: []IrFunc(0), ctx: ctx, asmBlocks: []AsmBlock(0),
+      stubbed: []string(0), methodTables: []MethodTable(0),
+      stringPool: []string(0), externNames: []string(0),
+      globals: [
+        IrGlobal{ name: "__bitro_buf", bytes: roImage(), align: 8,
+          storage: storageReadonly(), relocs: []IrGlobalReloc(0) },
+        IrGlobal{ name: "__bitro_hdr", bytes: []int(16), align: 8,
+          storage: storageReadonly(),
+          relocs: [IrGlobalReloc{ offset: 0, symbol: "__bitro_buf",
+            addend: 0 }] }] }
+
+    let obj = emitElfObject(mod, t, false, false) catch e { []u8(0) }
+    let m = readElf(t, "h.o", obj) catch e { LoModule{ name: "", atoms: []LoAtom(0) } }
+    let ai = roAtomIndex(m, "__bitro_hdr")
+    assert(ai >= 0)
+    let atom = m.atoms[ai]
+    assert(atom.kind == LoSectionKind.Rodata)
+    assert(len(atom.relocs) == 1)
+    // Rebased onto the ATOM, not left as a blob offset — the bug that would
+    // point the header at whatever else shares the section.
+    assert(atom.relocs[0].offset == 0)
+    assert(atom.relocs[0].kind == LoRelocKind.Abs64)
+    assert(atom.relocs[0].target.isGlobal)
+    assert(atom.relocs[0].target.name == "__bitro_buf")
+  }
 }

@@ -1819,7 +1819,12 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) CodegenError!void {
 fn emitGlobalAddr(self: *Ctx, dst: u32, g: ir.GlobalId) CodegenError!void {
     const gl = self.module.global(g);
     switch (gl.storage) {
-        .process => try self.emitAddrOf(scratch1, gl.name),
+        // `.readonly` differs from `.process` only in which section the symbol
+        // lands in (#1447) — both are ONE link-time address for the whole
+        // program, so both materialize identically. The read-only-ness is the
+        // loader's doing, enforced by the segment's page permissions, not
+        // something codegen can or should re-state here.
+        .process, .readonly => try self.emitAddrOf(scratch1, gl.name),
         .thread => try self.emitTlsAddrOf(scratch1, gl.name),
     }
     try putInt(self, dst, scratch1);

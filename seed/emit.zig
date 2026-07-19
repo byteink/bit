@@ -261,6 +261,49 @@ fn placeGlobals(a: Allocator, module: *const ir.Module, storage: ir.GlobalStorag
     return out.toOwnedSlice(a);
 }
 
+/// Appends every `.readonly` global's image to the object's `.rodata` blob and
+/// returns where each landed, alongside the fixups its `relocs` imply — already
+/// rebased from "offset within the global" to "offset within the blob", which is
+/// what both object writers address relocations by.
+///
+/// Read-only globals share `.rodata` with the string-pool headers, `TypeInfo`
+/// blobs and stack maps rather than getting a section of their own. That is
+/// deliberate: `link/strip.zig` atomizes `.rodata` per symbol and lays the
+/// survivors out by atom, so a separate section would buy nothing but one more
+/// place for the section's own alignment to be wrong. It does mean the caller
+/// must not pin the `.rodata` section's alignment at 8 any more — see
+/// `globalsAlign`, and #1421 for what happens when a section is looser than the
+/// cells it holds.
+///
+/// **Unlike the writable classes these are never GC-scanned and never need to
+/// be**: a `.readonly` image cannot be mutated, so it cannot come to hold a
+/// pointer to a moved object, and the only pointers it may contain are the
+/// link-time ones below — addresses of other static data, not of heap objects.
+fn placeReadonlyGlobals(
+    a: Allocator,
+    module: *const ir.Module,
+    rodata: *std.ArrayList(u8),
+    relocs: *std.ArrayList(GlobalFixup),
+) Error![]const GlobalPlacement {
+    var out: std.ArrayList(GlobalPlacement) = .empty;
+    for (module.globals.items) |g| {
+        if (g.storage != .readonly) continue;
+        while (rodata.items.len % g.alignment != 0) try rodata.append(a, 0);
+        const off: u64 = rodata.items.len;
+        try rodata.appendSlice(a, g.bytes);
+        for (g.relocs) |r| {
+            std.debug.assert(r.offset + 8 <= g.bytes.len);
+            try relocs.append(a, .{ .offset = off + r.offset, .symbol = r.symbol, .addend = r.addend });
+        }
+        try out.append(a, .{ .name = try a.dupe(u8, g.name), .offset = off, .size = g.bytes.len });
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// One `.rodata` pointer fixup, in the format-neutral form both object writers
+/// take: a blob offset, a target symbol, an addend. Always `abs64`.
+const GlobalFixup = struct { offset: u64, symbol: []const u8, addend: i64 };
+
 /// The alignment a globals section must carry for the per-cell padding
 /// `placeGlobals` inserts to survive into the loaded image.
 ///
@@ -381,11 +424,27 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
         try defined.put(a, g.name, {});
     }
 
+    // ---- read-only module state (§11.11) -> .rodata -----------------------
+    // Placed BEFORE the blobs so a table's own alignment padding is measured
+    // from the start of the section, not from wherever the string pool happened
+    // to end. `defined` gets each name so the undefined-externals pass below
+    // does not then declare the table an unresolved import.
+    var ro_fixups: std.ArrayList(GlobalFixup) = .empty;
+    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .rodata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+        try defined.put(a, g.name, {});
+    }
+    // ELF is RELA: the addend rides in the relocation and the field bytes are
+    // ignored, so the authored image is left exactly as written.
+    for (ro_fixups.items) |f| {
+        try relocs.append(a, .{ .section = .rodata, .offset = f.offset, .symbol = f.symbol, .kind = .abs64, .addend = f.addend });
+    }
+
     try emitElfBlobs(a, module, &rodata, &gc, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
-    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly) });
     if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
     if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
@@ -649,11 +708,27 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         try defined.put(a, g.name, {});
     }
 
+    // ---- read-only module state (§11.11) -> .rodata -----------------------
+    // Placed BEFORE the blobs so a table's own alignment padding is measured
+    // from the start of the section, not from wherever the string pool happened
+    // to end. `defined` gets each name so the undefined-externals pass below
+    // does not then declare the table an unresolved import.
+    var ro_fixups: std.ArrayList(GlobalFixup) = .empty;
+    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .rodata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+        try defined.put(a, g.name, {});
+    }
+    // ELF is RELA: the addend rides in the relocation and the field bytes are
+    // ignored, so the authored image is left exactly as written.
+    for (ro_fixups.items) |f| {
+        try relocs.append(a, .{ .section = .rodata, .offset = f.offset, .symbol = f.symbol, .kind = .abs64, .addend = f.addend });
+    }
+
     try emitElfBlobs(a, module, &rodata, &gc, &symbols, &relocs, &defined, stackmaps.items, emitted_names.items, freestanding);
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
-    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly) });
     if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
     if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
@@ -908,6 +983,27 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
         try defined.put(a, sym, {});
     }
 
+    // ---- read-only module state (§11.11) -> the same .rodata --------------
+    // Two format differences from the ELF path above, both of which are silent
+    // wrongness if missed:
+    //
+    //  1. Every symbol name is `_`-prefixed, on the reference as well as on the
+    //     definition — an unprefixed target would resolve against nothing.
+    //  2. Mach-O relocations carry NO addend field; the addend lives in the
+    //     field bytes and `link/macho_reader.zig` reads it back out from there.
+    //     So it is written into the image here, where ELF leaves the image
+    //     untouched and puts the addend in the RELA entry.
+    var ro_fixups: std.ArrayList(GlobalFixup) = .empty;
+    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups)) |g| {
+        const sym = try mac(a, g.name);
+        try symbols.append(a, .{ .name = sym, .section = .rodata, .offset = g.offset, .size = g.size, .binding = .global });
+        try defined.put(a, sym, {});
+    }
+    for (ro_fixups.items) |f| {
+        std.mem.writeInt(i64, rodata.items[@intCast(f.offset)..][0..8], f.addend, .little);
+        try relocs.append(a, .{ .section = .rodata, .offset = f.offset, .symbol = try mac(a, f.symbol), .kind = .unsigned64 });
+    }
+
     // ---- undefined externals for runtime symbols --------------------------
     var externs = std.StringHashMapUnmanaged(void){};
     for (relocs.items) |r| {
@@ -918,7 +1014,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
 
     var sections: std.ArrayList(obj_macho.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 4 });
-    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly) });
     if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
     if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
 
@@ -941,6 +1037,9 @@ const elf_reader = @import("link/elf_reader.zig");
 const macho_reader = @import("link/macho_reader.zig");
 const object = @import("link/object.zig");
 const strip = @import("link/strip.zig");
+const link = @import("link.zig");
+const builtin = @import("builtin");
+const elf = std.elf;
 
 /// Appends a trivial `@nosplit` function named `name`, tagged as belonging (or
 /// not) to the root module — the two-module shape `lowerProject` produces when
@@ -1304,4 +1403,339 @@ test "emit: a whole-program emit is unaffected by pinning" {
     defer gpa.free(obj);
     try testing.expect(try testObjectDefines(gpa, obj, "rootFn"));
     try testing.expect(try testObjectDefines(gpa, obj, "m0$importedFn"));
+}
+
+// ============================================================================
+// #1447: read-only static data (`.rodata`) — see SPEC §11.11.
+//
+// THIS AREA HAS SILENTLY BROKEN TWICE. AArch64 `$d`/`$x` mapping symbols once
+// corrupted a `.rodata` table so `log10` returned 5.6e31, and the linker once
+// dropped the section bytes ahead of the first symbol so a `.cst8` lane vector
+// read as zeros and `indexOfScalar` always returned 0. Both LINKED CLEANLY and
+// returned wrong numbers.
+//
+// So nothing below is satisfied by "it built". Every assertion reads the
+// EMITTED BYTES back out through the object reader and compares them to the
+// authored image, for all three targets, on any host.
+// ============================================================================
+
+/// The image used by every `.rodata` test below. Chosen adversarially rather
+/// than as zeros or a counting sequence: no byte repeats a neighbour, no 8-byte
+/// window is all-zero, and the first and last bytes are distinctive — so a table
+/// that is truncated, shifted by a few bytes, or has its leading run dropped
+/// (the exact prior bug) cannot compare equal by luck.
+const ro_image = [_]u8{
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+    0xF0, 0x0D, 0xFA, 0xCE, 0xD1, 0xCE, 0x5E, 0xA1,
+};
+
+fn testRoModule(gpa: Allocator, module: *ir.Module) !void {
+    try testAppendFunc(gpa, module, "rootFn", true);
+    _ = try module.addGlobal(
+        try gpa.dupe(u8, "__bitro_table"),
+        try gpa.dupe(u8, &ro_image),
+        16,
+        .readonly,
+    );
+}
+
+test "emit: a readonly global lands in .rodata with its bytes intact, on every target" {
+    // The core of #1447, asserted through the object readers so it is
+    // target-INDEPENDENT (#1421's rule) and fails on any host rather than only
+    // on the host whose layout happens to expose the bug.
+    //
+    // Three separate claims, and each one has been a real bug in some project:
+    //   1. the atom's section is `.rodata`, not `.data` — otherwise the whole
+    //      feature is a no-op that happens to work;
+    //   2. its bytes are EXACTLY the authored image — the two prior failures
+    //      were both silent corruption of correct-looking output;
+    //   3. the atom is at least as aligned as the cell asked for — #1421
+    //      exactly, and `.rodata` was pinned at 8 while this cell wants 16.
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Case = struct { name: []const u8, elf: ?elf_reader.Target };
+    for ([_]Case{
+        .{ .name = "x86_64-elf", .elf = .x86_64 },
+        .{ .name = "aarch64-elf", .elf = .aarch64 },
+        .{ .name = "aarch64-macho", .elf = null },
+    }) |case| {
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var module = ir.Module.init(gpa, &ctx);
+        defer module.deinit();
+        try testRoModule(gpa, &module);
+
+        const obj = if (case.elf) |t| switch (t) {
+            .x86_64 => try emitObject(gpa, &module, false, false),
+            .aarch64 => try emitObjectArm64Elf(gpa, &module, false, false),
+        } else try emitMachoObject(gpa, &module, false, false);
+        defer gpa.free(obj);
+
+        // Mach-O decorates the symbol; ELF does not.
+        const want_sym = if (case.elf == null) "___bitro_table" else "__bitro_table";
+        const mod = if (case.elf) |t|
+            try elf_reader.read(arena, t, "t.o", obj)
+        else
+            try macho_reader.read(arena, "t.o", obj);
+
+        var found = false;
+        for (mod.atoms) |atom| {
+            if (!std.mem.eql(u8, atom.name, want_sym)) continue;
+            found = true;
+            errdefer std.debug.print("target {s}\n", .{case.name});
+            // (1) genuinely read-only, not merely "somewhere".
+            try testing.expectEqual(object.SectionKind.rodata, atom.kind);
+            // (2) the bytes, verbatim. This is the assertion the two prior
+            //     silent-wrongness bugs would each have failed.
+            try testing.expectEqualSlices(u8, &ro_image, atom.data[0..atom.size]);
+            // (3) alignment survived into the section (#1421).
+            try testing.expect(atom.alignment >= 16);
+        }
+        // Anti-vacuity: without this, deleting the emission entirely would make
+        // the loop body never run and the test pass.
+        if (!found) {
+            std.debug.print("target {s}: no .rodata atom named {s} was emitted at all\n", .{ case.name, want_sym });
+            return error.ReadonlyGlobalNotEmitted;
+        }
+    }
+}
+
+test "emit: a readonly global's relocation targets the right symbol at the right offset" {
+    // The other half of #1447: a `[]T` slice header living in `.rodata` needs
+    // its `buf` word filled in with the payload's link-time address, which only
+    // the linker knows. Asserted on the emitted relocation rather than on a
+    // linked image so it holds for every target on every host.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_]elf_reader.Target{ .x86_64, .aarch64 }) |t| {
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var module = ir.Module.init(gpa, &ctx);
+        defer module.deinit();
+        try testAppendFunc(gpa, &module, "rootFn", true);
+
+        // The payload, then a 16-byte header whose first word points at it.
+        _ = try module.addGlobal(try gpa.dupe(u8, "__bitro_buf"), try gpa.dupe(u8, &ro_image), 8, .readonly);
+        const fixups = try gpa.alloc(ir.GlobalReloc, 1);
+        fixups[0] = .{ .offset = 0, .symbol = try gpa.dupe(u8, "__bitro_buf"), .addend = 0 };
+        _ = try module.addGlobalWithRelocs(
+            try gpa.dupe(u8, "__bitro_hdr"),
+            try gpa.dupe(u8, &[_]u8{0} ** 16),
+            8,
+            .readonly,
+            fixups,
+        );
+
+        const obj = switch (t) {
+            .x86_64 => try emitObject(gpa, &module, false, false),
+            .aarch64 => try emitObjectArm64Elf(gpa, &module, false, false),
+        };
+        defer gpa.free(obj);
+        const mod = try elf_reader.read(arena, t, "t.o", obj);
+
+        var checked = false;
+        for (mod.atoms) |atom| {
+            if (!std.mem.eql(u8, atom.name, "__bitro_hdr")) continue;
+            checked = true;
+            try testing.expectEqual(object.SectionKind.rodata, atom.kind);
+            try testing.expectEqual(@as(usize, 1), atom.relocs.len);
+            const r = atom.relocs[0];
+            // Rebased to the ATOM, not left as a blob offset — the bug that
+            // would point the header at whatever else shares the section.
+            try testing.expectEqual(@as(u32, 0), r.offset);
+            try testing.expectEqual(object.RelocKind.abs64, r.kind);
+            try testing.expectEqualStrings("__bitro_buf", r.target.global);
+        }
+        try testing.expect(checked);
+    }
+}
+
+/// A self-contained `_start` that reads the FIRST BYTE of `__bitro_table` and
+/// exits with it. No runtime, no libc, no archive — just enough to prove the
+/// value a running program sees is the value that was authored.
+///
+/// It also serves a second, non-obvious purpose: `link.zig` dead-strips
+/// `.rodata` at symbol granularity (only mutable-data atoms are kept
+/// unconditionally), so an UNREFERENCED read-only global is correctly dropped.
+/// Referencing it from the entry point is what makes it reachable, and is also
+/// how a real program would reach it.
+fn testRoEntryObject(gpa: Allocator, target: link.Target) ![]u8 {
+    switch (target) {
+        .x86_64_linux => {
+            // movabs rdi, __bitro_table ; movzx edi, byte [rdi]
+            // mov eax, 60 (SYS_exit)    ; syscall
+            const code = [_]u8{
+                0x48, 0xBF, 0,    0,    0,    0,    0,    0,    0,    0,
+                0x0F, 0xB6, 0x3F, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05,
+            };
+            const sections = [_]obj_elf.Section{.{ .kind = .text, .data = &code, .alignment = 16 }};
+            const symbols = [_]obj_elf.Symbol{
+                .{ .name = "_start", .section = .text, .offset = 0, .size = code.len, .binding = .global, .kind = .func },
+                // Undefined here; the compiled object defines it.
+                .{ .name = "__bitro_table", .section = null, .binding = .global },
+            };
+            const relocs = [_]obj_elf.Relocation{.{ .section = .text, .offset = 2, .symbol = "__bitro_table", .kind = .abs64, .addend = 0 }};
+            return obj_elf.write(gpa, .x86_64, .{ .sections = &sections, .symbols = &symbols, .relocations = &relocs });
+        },
+        .aarch64_linux => {
+            // adrp x0, table ; add x0, x0, :lo12:table ; ldrb w0, [x0]
+            // movz x8, #93 (SYS_exit)  ; svc #0
+            var code: [20]u8 = undefined;
+            for ([_]u32{ 0x90000000, 0x91000000, 0x39400000, 0xD2800BA8, 0xD4000001 }, 0..) |w, i| {
+                std.mem.writeInt(u32, code[i * 4 ..][0..4], w, .little);
+            }
+            const sections = [_]obj_elf.Section{.{ .kind = .text, .data = &code, .alignment = 16 }};
+            const symbols = [_]obj_elf.Symbol{
+                .{ .name = "_start", .section = .text, .offset = 0, .size = code.len, .binding = .global, .kind = .func },
+                // Undefined here; the compiled object defines it.
+                .{ .name = "__bitro_table", .section = null, .binding = .global },
+            };
+            const relocs = [_]obj_elf.Relocation{
+                .{ .section = .text, .offset = 0, .symbol = "__bitro_table", .kind = .aarch64_adr_prel_pg_hi21, .addend = 0 },
+                .{ .section = .text, .offset = 4, .symbol = "__bitro_table", .kind = .aarch64_add_abs_lo12_nc, .addend = 0 },
+            };
+            return obj_elf.write(gpa, .aarch64, .{ .sections = &sections, .symbols = &symbols, .relocations = &relocs });
+        },
+    }
+}
+
+test "link: a readonly global's bytes reach the executable in a NON-WRITABLE segment, and a program reads them back" {
+    // The prior failures were both link-stage, not emit-stage: the object was
+    // fine and the linked image was not. So the image itself is read back here,
+    // at the virtual address the symbol resolves to, and compared byte for byte
+    // — and then, where the host can execute it, the linked program is RUN and
+    // its exit code checked against the authored value.
+    //
+    // The permission assertion is the part a running program could never make:
+    // `.rodata` is only a real guarantee if the segment carries no `PF_W`.
+    const gpa = testing.allocator;
+
+    for ([_]link.Target{ .x86_64_linux, .aarch64_linux }) |target| {
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var module = ir.Module.init(gpa, &ctx);
+        defer module.deinit();
+        try testRoModule(gpa, &module);
+
+        const obj = switch (target) {
+            .x86_64_linux => try emitObject(gpa, &module, false, false),
+            .aarch64_linux => try emitObjectArm64Elf(gpa, &module, false, false),
+        };
+        defer gpa.free(obj);
+        const entry = try testRoEntryObject(gpa, target);
+        defer gpa.free(entry);
+
+        // No archive: the program is self-contained and needs no runtime, which
+        // also keeps this independent of whether `zig build libbitrt` has run.
+        const exe = try link.linkExecutable(gpa, target, &.{ .{ .object = obj }, .{ .object = entry } });
+        defer gpa.free(exe);
+
+        // Located by CONTENT, because our linker writes no symbol table into a
+        // finished executable — and locating it this way is the stronger claim
+        // anyway: it asserts the exact authored run is present, which is
+        // precisely what the "linker dropped the bytes ahead of the first
+        // symbol" bug destroyed. `ro_image` is 24 distinctive bytes, so an
+        // incidental match is not a real possibility; the count is asserted to
+        // be exactly one so a duplicated or partly-copied table also fails.
+        const where = try findImageBytes(exe, &ro_image) orelse {
+            std.debug.print("target {s}: the authored .rodata bytes are not in the linked image at all\n", .{@tagName(target)});
+            return error.ReadonlyGlobalLost;
+        };
+        // (2) 16-byte alignment held all the way into the loaded image (#1421).
+        try testing.expectEqual(@as(u64, 0), where.vaddr % 16);
+        // (3) and the page it lands on is not writable. Without this, `.rodata`
+        //     would be a section name rather than a guarantee.
+        try testing.expect(where.writable == false);
+
+        // (4) a real process reads the real value. Only possible natively; the
+        //     cross half is covered by the x64/arm64 Linux gates.
+        if (!hostRuns(target)) continue;
+        const rc = try testRunLinked(gpa, "bit-rodata", exe);
+        try testing.expectEqual(ro_image[0], rc);
+    }
+}
+
+/// Whether this host can execute a `target` binary directly.
+fn hostRuns(target: link.Target) bool {
+    if (builtin.os.tag != .linux) return false;
+    return switch (target) {
+        .x86_64_linux => builtin.cpu.arch == .x86_64,
+        .aarch64_linux => builtin.cpu.arch == .aarch64,
+    };
+}
+
+/// Writes `exe` somewhere unique, execs it, returns its exit code.
+///
+/// The path carries the test seed and is published by rename, for the reason
+/// recorded on `link.zig`'s `linkAndRun` (#1459): a fixed path that is written
+/// and then exec'd races `fork` in a sibling worker (ETXTBSY), and on macOS a
+/// reused path serves a CACHED code signature — which has already produced a
+/// false pass in this project.
+fn testRunLinked(gpa: Allocator, stem: []const u8, exe: []const u8) !u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const path = try std.fmt.allocPrintSentinel(gpa, "/tmp/{s}-{x}", .{ stem, testing.random_seed }, 0);
+    defer gpa.free(path);
+    const staging = try std.fmt.allocPrintSentinel(gpa, "{s}.staging", .{path}, 0);
+    defer gpa.free(staging);
+
+    try cwd.writeFile(io, .{ .sub_path = staging, .data = exe, .flags = .{ .permissions = .executable_file } });
+    try cwd.rename(staging, cwd, path, io);
+    defer cwd.deleteFile(io, path) catch {};
+
+    const r = try std.process.run(gpa, io, .{ .argv = &.{path} });
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return switch (r.term) {
+        .exited => |c| c,
+        else => error.AbnormalExit,
+    };
+}
+
+const ImageLocation = struct { vaddr: u64, file_off: usize, writable: bool };
+
+/// Finds `pattern` in a linked ELF executable and reports where the loader will
+/// map it: its virtual address and whether its `PT_LOAD` is writable. Returns
+/// null if it is absent; errors if it appears more than once.
+///
+/// Walks the real program headers rather than trusting anything the linker said
+/// in memory — the whole point of the caller is to check the linker's output
+/// against an independent reading of it. Content search rather than symbol
+/// lookup because a finished executable from this linker carries no `.symtab`.
+fn findImageBytes(exe: []const u8, pattern: []const u8) !?ImageLocation {
+    var file_off: ?usize = null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, exe, from, pattern)) |at| {
+        if (file_off != null) return error.ReadonlyGlobalDuplicated;
+        file_off = at;
+        from = at + 1;
+    }
+    const off = file_off orelse return null;
+
+    const ehdr = std.mem.bytesToValue(elf.Elf64_Ehdr, exe[0..@sizeOf(elf.Elf64_Ehdr)]);
+    var p: usize = 0;
+    while (p < ehdr.e_phnum) : (p += 1) {
+        const ph = std.mem.bytesToValue(elf.Elf64_Phdr, exe[@intCast(ehdr.e_phoff + p * ehdr.e_phentsize)..][0..@sizeOf(elf.Elf64_Phdr)]);
+        if (ph.p_type != elf.PT_LOAD) continue;
+        if (off < ph.p_offset or off >= ph.p_offset + ph.p_filesz) continue;
+        return .{
+            .vaddr = ph.p_vaddr + (off - ph.p_offset),
+            .file_off = off,
+            .writable = (ph.p_flags & elf.PF_W) != 0,
+        };
+    }
+    // Present in the file but in no loadable segment: it would not be in memory
+    // at all. That is a failure, not an absence.
+    return error.ReadonlyGlobalNotLoaded;
 }

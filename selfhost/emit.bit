@@ -109,7 +109,11 @@ function refuseManagedMetadata(module: IrModule): ()! {
 function refuseThreadLocalStorage(module: IrModule): ()! {
   let i = 0
   while (i < len(module.globals)) {
-    if (module.globals[i].storage != 0) {
+    // Tested against the THREAD class specifically, not `!= 0`. The loose form
+    // was correct only while `process` and `thread` were the whole enum; #1447
+    // added `readonly`, which Mach-O emits perfectly well, and `!= 0` refused
+    // it. Name the class you mean.
+    if (module.globals[i].storage == 1) {
       fail newError("Mach-O: per-thread module state (@threadlocal) is not emitted on this target")
     }
     i = i + 1
@@ -347,6 +351,68 @@ function placeGlobals(module: IrModule, storage: int, buf: ByteBuf): []GlobalPla
     i = i + 1
   }
   return out
+}
+
+// One `.rodata` pointer fixup, in the format-neutral form both object writers
+// take: a blob offset, a target symbol, an addend. Always abs64/unsigned64.
+struct GlobalFixup {
+  offset: int,
+  symbol: string,
+  addend: int,
+}
+
+struct ReadonlyPlacement {
+  placements: []GlobalPlacement,
+  fixups: []GlobalFixup,
+}
+
+// Appends every read-only global's image to the object's `.rodata` blob and
+// returns where each landed, alongside the fixups its `relocs` imply — already
+// rebased from "offset within the global" to "offset within the blob", which is
+// what both object writers address relocations by. Mirrors seed/emit.zig's
+// `placeReadonlyGlobals`.
+//
+// Read-only globals share `.rodata` with the string-pool headers, TypeInfo blobs
+// and stack maps rather than getting a section of their own. That is deliberate:
+// the linker atomizes `.rodata` per symbol and lays the survivors out by atom, so
+// a separate section would buy nothing but one more place for the section's own
+// alignment to be wrong. It does mean the caller must NOT pin the `.rodata`
+// section's alignment at 8 any more — see globalsAlign, and #1421 for what
+// happens when a section is looser than the cells it holds.
+//
+// These are never GC-scanned and never need to be: a read-only image cannot be
+// mutated, so it cannot come to hold a pointer to a moved object, and the only
+// pointers it may contain are the link-time ones below — addresses of other
+// static data, not of heap objects.
+function placeReadonlyGlobals(module: IrModule, buf: ByteBuf): ReadonlyPlacement {
+  let out = []GlobalPlacement(0)
+  let fixups = []GlobalFixup(0)
+  let i = 0
+  while (i < len(module.globals)) {
+    let g = module.globals[i]
+    if (g.storage != storageReadonly()) {
+      i = i + 1
+      continue
+    }
+    while (len(buf.bytes) % g.align != 0) {
+      buf.bytes = append(buf.bytes, u8(0))
+    }
+    let off = len(buf.bytes)
+    let j = 0
+    while (j < len(g.bytes)) {
+      buf.bytes = append(buf.bytes, u8(g.bytes[j]))
+      j = j + 1
+    }
+    for r of g.relocs {
+      assert(r.offset + 8 <= len(g.bytes))
+      fixups = append(fixups, GlobalFixup{ offset: off + r.offset,
+        symbol: r.symbol, addend: r.addend })
+    }
+    out = append(out, GlobalPlacement{ name: g.name, offset: off,
+      size: len(g.bytes) })
+    i = i + 1
+  }
+  return ReadonlyPlacement{ placements: out, fixups: fixups }
 }
 
 function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool): []u8! {
@@ -613,6 +679,28 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
     gi = gi + 1
   }
 
+  // ---- read-only module state (§11.11) -> the same __rodata --------------
+  // Two format differences from the ELF path, both silent wrongness if missed:
+  //   1. every symbol name is `_`-prefixed, on the REFERENCE as well as on the
+  //      definition — an unprefixed target would resolve against nothing;
+  //   2. Mach-O relocations carry NO addend field; the addend lives in the field
+  //      bytes and the reader takes it back out from there. So it is written
+  //      into the image here, where ELF leaves the image untouched.
+  let ro = placeReadonlyGlobals(module, rodata)
+  for rp of ro.placements {
+    let rsym = emMac(rp.name)
+    symbols = append(symbols, MachoSymbol{ name: rsym, hasSection: true,
+      section: MachoSectionKind.Rodata, offset: rp.offset, size: rp.size,
+      binding: MachoBinding.Global })
+    defined[rsym] = true
+  }
+  for f of ro.fixups {
+    patchU64Le(rodata.bytes, f.offset, f.addend)
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Rodata,
+      offset: f.offset, symbol: emMac(f.symbol),
+      kind: MachoRelocKind.Unsigned64 })
+  }
+
   // ---- undefined externals for runtime symbols ---------------------------
   // Anything a relocation names that this object does not define is a runtime
   // import the linker resolves.
@@ -641,7 +729,8 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
   }
   if (len(rodata.bytes) > 0) {
     sections = append(sections, MachoSection{ kind: MachoSectionKind.Rodata,
-      data: rodata.bytes, size: 0, alignment: 8 })
+      data: rodata.bytes, size: 0,
+      alignment: globalsAlign(module, storageReadonly()) })
   }
   if (len(data.bytes) > 0) {
     sections = append(sections, MachoSection{ kind: MachoSectionKind.Data,
@@ -1048,6 +1137,25 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, fre
     tgi = tgi + 1
   }
 
+  // ---- read-only module state (§11.11) -> .rodata ------------------------
+  // Placed BEFORE the blobs so a table's own alignment padding is measured from
+  // the start of the section, not from wherever the string pool happened to end.
+  // Each name enters `defined` so the undefined-externals sweep does not then
+  // declare the table an unresolved import.
+  let ro = placeReadonlyGlobals(module, rodata)
+  for rp of ro.placements {
+    symbols = append(symbols, emElfSym(rp.name, ElfSectionKind.Rodata,
+      rp.offset, rp.size, ElfBinding.Global, ElfSymKind.Object))
+    defined[rp.name] = true
+  }
+  // ELF is RELA: the addend rides in the relocation and the field bytes are
+  // ignored, so the authored image is left exactly as written.
+  for f of ro.fixups {
+    relocs = append(relocs, ElfRelocation{ section: ElfSectionKind.Rodata,
+      offset: f.offset, symbol: f.symbol, kind: ElfRelocKind.Abs64,
+      addend: f.addend })
+  }
+
   let blobs = emitElfBlobs(module, rodata, gc, symbols, relocs, defined, stackmaps,
     emittedNames, freestanding)
   symbols = blobs.symbols
@@ -1064,7 +1172,8 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, fre
   }
   if (len(rodata.bytes) > 0) {
     sections = append(sections, ElfSection{ kind: ElfSectionKind.Rodata,
-      data: rodata.bytes, size: 0, alignment: 8 })
+      data: rodata.bytes, size: 0,
+      alignment: globalsAlign(module, storageReadonly()) })
   }
   if (len(gdata.bytes) > 0) {
     sections = append(sections, ElfSection{ kind: ElfSectionKind.Data,

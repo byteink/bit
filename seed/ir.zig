@@ -64,7 +64,33 @@ pub const GlobalId = enum(u32) { _ };
 /// the thread pointer from our own `PT_TLS` via `std.os.linux.tls.initStatic`,
 /// which also sets up TLS for every spawned worker. The remaining work is
 /// entirely producer-side.
-pub const GlobalStorage = enum { process, thread };
+///
+/// `readonly` is the third class (#1447): one image for the program, placed in
+/// `.rodata`/`__TEXT,__const` instead of `.data`, so the loader maps it without
+/// write permission. It exists for **static tables** — SHA round constants, AES
+/// S-boxes — which today have to be spelled as a function returning a literal,
+/// costing one GC allocation per call. Unlike the two writable classes it may
+/// carry relocations (see `Global.relocs`), because a slice header's `buf` word
+/// is an address only the linker knows.
+pub const GlobalStorage = enum { process, thread, readonly };
+
+/// One 64-bit absolute pointer inside a `readonly` global's image, filled in at
+/// link time. `abs64` is the only kind needed and so the only kind offered: the
+/// single construct that needs a relocation here is a `[]T` slice header, whose
+/// `buf` word must hold the address of the payload bytes. A `[N]T` fixed array
+/// needs none at all — its value *is* its own base address in this IR.
+///
+/// Deliberately NOT a general relocation list: every extra kind is a new
+/// arithmetic rule in two object writers and two linkers, and read-only data is
+/// the area of this project with the worst record for silent wrongness.
+pub const GlobalReloc = struct {
+    /// Byte offset within the owning global's `bytes`. The 8 bytes at this
+    /// offset are overwritten with `symbol + addend`.
+    offset: u32,
+    /// The target symbol, resolved against the whole link's global table.
+    symbol: []const u8,
+    addend: i64 = 0,
+};
 
 /// One module-level mutable variable: a statically allocated cell (§11.11).
 /// `bytes` is its complete initial image, already laid out in target byte
@@ -82,6 +108,11 @@ pub const Global = struct {
     bytes: []const u8,
     alignment: u32,
     storage: GlobalStorage = .process,
+    /// Link-time pointer fixups into `bytes` (§11.11). Empty for every
+    /// `.process`/`.thread` cell — those are proven untraced *and* pointer-free
+    /// by the checker, so their image is final at compile time. A `.readonly`
+    /// global may carry them; see `GlobalReloc`.
+    relocs: []const GlobalReloc = &.{},
 };
 
 /// Opaque runtime entry points lowering calls into `runtime/*.zig` symbols by
@@ -809,6 +840,8 @@ pub const Module = struct {
         for (self.globals.items) |g| {
             self.gpa.free(g.name);
             self.gpa.free(g.bytes);
+            for (g.relocs) |r| self.gpa.free(r.symbol);
+            self.gpa.free(g.relocs);
         }
         self.globals.deinit(self.gpa);
         self.* = undefined;
@@ -824,6 +857,17 @@ pub const Module = struct {
     pub fn addGlobal(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage) Allocator.Error!GlobalId {
         const id: u32 = @intCast(self.globals.items.len);
         try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage });
+        return @enumFromInt(id);
+    }
+
+    /// `addGlobal` plus a link-time fixup list, taking ownership of `relocs` and
+    /// of every `symbol` name inside it. Only `.readonly` globals may carry one
+    /// (§11.11) — the writable classes are pointer-free by construction, and a
+    /// relocation on one would be a pointer the collector never scans.
+    pub fn addGlobalWithRelocs(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage, relocs: []const GlobalReloc) Allocator.Error!GlobalId {
+        std.debug.assert(relocs.len == 0 or storage == .readonly);
+        const id: u32 = @intCast(self.globals.items.len);
+        try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage, .relocs = relocs });
         return @enumFromInt(id);
     }
 

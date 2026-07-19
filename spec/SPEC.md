@@ -1231,18 +1231,40 @@ are what the free lists and the run queue actually require.
 
 #### Storage classes
 
-Module state is a *storage class*, not a single feature. Two are specified:
+Module state is a *storage class*, not a single feature. Three are specified:
 
-| Form                    | Copies                | Status                       |
-| ----------------------- | --------------------- | ---------------------------- |
-| `let x: T = c`          | one per **process**   | implemented, every target    |
-| `@threadlocal let x: T` | one per **OS thread** | implemented on ELF; Mach-O is rejected at emission |
+| Form                    | Copies                | Writable | Status                       |
+| ----------------------- | --------------------- | -------- | ---------------------------- |
+| `let x: T = c`          | one per **process**   | yes      | implemented, every target    |
+| `@threadlocal let x: T` | one per **OS thread** | yes      | implemented on ELF; Mach-O is rejected at emission |
+| read-only static data   | one per **process**   | **no**   | mechanism implemented, every target; no surface syntax yet |
 
-Rules 1–3 apply identically to both — the type and initializer restrictions come
-from "the collector does not scan this cell", which is equally true per-thread.
-The two differ only in how many cells exist and how the address is materialized:
-process-wide state is a plain data symbol, per-thread state needs a thread-local
-section and TLS relocations.
+Rules 1–3 apply identically to all three — the type and initializer restrictions
+come from "the collector does not scan this cell", which is equally true
+per-thread. They differ in how many cells exist, whether the loader maps them
+writable, and how the address is materialized: process-wide state is a plain data
+symbol, per-thread state needs a thread-local section and TLS relocations, and
+read-only state is a plain symbol in a non-writable section.
+
+**The read-only class** places one image for the program in `.rodata` (ELF) or
+`__TEXT,__const` (Mach-O), so the loader maps it without write permission. It
+exists for **static tables** — SHA round constants, AES S-boxes, SHA-3 round
+constants — which otherwise have to be spelled as a private function returning a
+literal, costing one GC allocation on every call, i.e. per hash block.
+
+Not scanning it is sound for a second, simpler reason than rules 1–3: a read-only
+image cannot be mutated, so it can never come to hold a pointer to a moved
+object. This is the one class that may carry **link-time relocations**, and only
+one kind: a 64-bit absolute pointer, which is what a `[]T` slice header's `buf`
+word needs, since the payload's address is known only to the linker. A `[N]T`
+fixed array needs none at all — its value *is* its own base address.
+
+The address is materialized exactly as for the process-wide class, by pure
+address arithmetic, so a read-only read is call-free and legal inside a
+`@nosplit` body. `ptrOf` on one yields a pointer into non-writable memory;
+storing through it faults. The class is currently reachable only from the
+compiler's own IR — there is no surface syntax yet, and adding one is a separate
+change.
 
 `@threadlocal` attaches to a module-level `let` only. It is the sole attribute a
 `let` accepts, it takes no argument, and it is rejected on a local `let`, on a
