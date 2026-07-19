@@ -126,6 +126,53 @@ function main() {
 done
 
 # ---------------------------------------------------------------------------
+# The other contexts that carry a DECLARED slot type. Each of these was a
+# separate instance of the same hole — a slot whose declared type nothing ever
+# compared the initializer against — and each was found by widening this matrix
+# rather than by reading any code.
+# ---------------------------------------------------------------------------
+for e in $EXPRS; do
+  # NOTE: struct-literal FIELD types are deliberately absent. They are the one
+  # slot in this family still unchecked by the self-hosted compiler, because
+  # validating them requires a checkExprType recompute on the field value that
+  # panics ("index out of range") on every multi-module file reaching
+  # stdlib/http. Adding these cells would redden the gate over a known, filed
+  # compiler bug rather than a new divergence — see the note in
+  # selfhost/validate.bit's vCompositeTypes. Restore them when that is fixed.
+  cell "map value map<string,f32> = $e" \
+"function main() {
+  let m = map<string, f32>{\"k\": $e}
+  print(\"ok\")
+}"
+  cell "map key map<i32,i32> = $e" \
+"function main() {
+  let m = map<i32, i32>{$e: 1}
+  print(\"ok\")
+}"
+  cell "typed slice []f32{$e}" \
+"function main() {
+  let s = []f32{$e}
+  print(\"ok\")
+}"
+  cell "module const c: f32 = $e" \
+"const c: f32 = $e
+function main() {
+  print(\"ok\")
+}"
+  cell "module let g: f32 = $e" \
+"let g: f32 = $e
+function main() {
+  print(\"ok\")
+}"
+  cell "chan send chan<f32> <- $e" \
+"function main() {
+  let c = chan<f32>(1)
+  c <- $e
+  print(\"ok\")
+}"
+done
+
+# ---------------------------------------------------------------------------
 # Array-specific shapes. #1470's worst cell is a LENGTH mismatch, which is a
 # memory-safety hole rather than a wrong value: the selfhost accepted
 # `let a: [4]i32 = [1,2]` and a[0] read uninitialized heap.
