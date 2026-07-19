@@ -3839,7 +3839,16 @@ const Checker = struct {
             if (result == .invalid) result = self.ctx.void_id;
         } else {
             result = try self.checkExpr(file_idx, k[1], env, inner_fctx, expected_result);
-            if (expected_result != .invalid) try self.expect(file_idx, k[1], result, expected_result);
+            if (expected_result != .invalid) {
+                try self.expect(file_idx, k[1], result, expected_result);
+            } else {
+                // With no expected type the body's untyped constant type must be
+                // DEFAULTED before it becomes the function's result (#1472): an
+                // untyped type is not storable, and leaving one here makes the
+                // call site and the callee disagree about the return's ABI slot,
+                // so `(x: f32) => 4.5` printed 4.5 but compared unequal to 4.5.
+                result = self.defaultType(result);
+            }
         }
 
         return self.ctx.types.intern(.{ .func = .{ .params = try dupe(self.ctx.arena(), TypeId, params), .variadic = false, .result = result } });
