@@ -149,6 +149,21 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .x27 = true,
               .x28 = true,
               .x29 = true,
+              // The condition flags MUST be clobbered. This block does not just
+              // fall through — it branches to another fiber, which runs arbitrary
+              // code before control comes back here. NZCV therefore cannot
+              // survive, and unlike `x30` there is nowhere to save it: `Context`
+              // holds no flags word, and restoring one would be meaningless
+              // across a switch anyway.
+              //
+              // Without this, LLVM happily straddles the switch with a
+              // compare/branch pair. It did exactly that in the round-trip test:
+              //     subs x30, x30, #1   // set NZCV
+              //     <context switch>    // other fiber runs, sets its own NZCV
+              //     b.ne .LBB512_11     // reads the OTHER fiber's flags
+              // The resumed fiber's `adds` never sets Z, so `b.ne` was always
+              // taken and the loop spun forever at 100% CPU (#1465).
+              .nzcv = true,
               .memory = true,
             }),
         .x86_64 => asm volatile (
@@ -179,6 +194,12 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .r14 = true,
               .r15 = true,
               .rbp = true,
+              // Same reasoning as `nzcv` on AArch64: the switch jumps to another
+              // fiber, so EFLAGS cannot survive it. This target happens not to
+              // have tripped over it yet — the register allocator has more GPRs
+              // here and did not place a live compare across the switch — but
+              // that is luck, not a guarantee, and the defect is identical.
+              .rflags = true,
               .memory = true,
             }),
         else => unreachable,
