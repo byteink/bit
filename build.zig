@@ -640,6 +640,10 @@ pub fn build(b: *std.Build) void {
     imports_opts.addOption([]const u8, "imports_dir", b.pathFromRoot("tests/imports"));
     imports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
     imports_opts.addOption([]const u8, "imports_filter", imports_filter);
+    // The checked-in set of projects the self-hosted `bit` is allowed to fail on
+    // (#1484). Gating on the SET, not a count, so a gap closing while another
+    // opens cannot cancel out — same contract as tests/selfhost-ir-gaps.txt.
+    imports_opts.addOption([]const u8, "selfhost_gaps", b.pathFromRoot("tests/selfhost-imports-gaps.txt"));
 
     const imports_mod = b.createModule(.{
         .root_source_file = b.path("tests/imports.zig"),
@@ -924,6 +928,10 @@ pub fn build(b: *std.Build) void {
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
+        // #1484: the imports harness drove the SEED only, so #1483 (an entire
+        // stdlib module the self-hosted `bit` could not lower) stayed green
+        // through every `zig build test` while tests/imports/quicconn built it.
+        imports_opts.addOptionPath("selfhost_bit", selfhosted);
         diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
         lintcmd_opts.addOptionPath("selfhost_bit", selfhosted);
         version_opts.addOptionPath("selfhost_bit", selfhosted);
@@ -931,6 +939,7 @@ pub fn build(b: *std.Build) void {
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
+        imports_opts.addOption([]const u8, "selfhost_bit", "");
         diffimports_opts.addOption([]const u8, "selfhost_bit", "");
         lintcmd_opts.addOption([]const u8, "selfhost_bit", "");
         version_opts.addOption([]const u8, "selfhost_bit", "");

@@ -30,13 +30,22 @@ const max_programs = 256;
 const Case = struct { name: []const u8, dir_abs: []const u8 };
 
 /// A case that phase 1 compiled and wrote to disk, ready for phase 2 to run.
-/// Outlives its per-case compile arena, so both fields come from the gpa.
+/// Outlives its per-case compile arena, so every field comes from the gpa.
+///
+/// TWO binaries per case (#1484): one from the seed (in-process `buildHostProject`)
+/// and one from the self-hosted `bit`. Phase 2 runs both and diffs both against
+/// the same `expected`.
 const Built = struct {
     bin_path: [:0]const u8,
+    /// Null when the self-hosted compiler refused the project. Recorded rather
+    /// than thrown, so the run can compare the whole self-hosted failure SET
+    /// against the checked-in expectations in one pass.
+    selfhost_bin_path: ?[:0]const u8,
     expected: []const u8,
 
     fn deinit(b: Built, gpa: std.mem.Allocator) void {
         gpa.free(b.bin_path);
+        if (b.selfhost_bin_path) |p| gpa.free(p);
         gpa.free(b.expected);
     }
 };
@@ -57,10 +66,22 @@ const Shared = struct {
     // (captured) failure message makes every failure self-describing. Each slot
     // is written by the single worker that claimed that index — no lock needed.
     failed_reason: []?[]const u8,
+    // The self-hosted half, kept apart from the seed's tally (#1484). A slot
+    // holds the error name if `bit` could not build or could not correctly run
+    // that project, else null. Judged against `tests/selfhost-imports-gaps.txt`
+    // after both phases, because the verdict is about the SET.
+    selfhost_reason: []?[]const u8,
 };
 
 test "imports + prelude programs run with the expected output" {
     if (build_options.libbitrt_path.len == 0) return; // host not a runtime target
+
+    // A host that can link libbitrt is a native build, and a native build always
+    // produces the self-hosted `bit`. Asserted rather than degraded to a
+    // seed-only pass: #1484 is precisely a harness that returned green while
+    // half of what it claimed to check never ran. Same contract as
+    // tests/stress.zig — an unwired selfhost path is a failure, not a skip.
+    try testing.expect(build_options.selfhost_bit.len > 0);
 
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();
@@ -109,6 +130,10 @@ test "imports + prelude programs run with the expected output" {
     defer gpa.free(failed_reason);
     @memset(failed_reason, null);
 
+    const selfhost_reason = try gpa.alloc(?[]const u8, cases.items.len);
+    defer gpa.free(selfhost_reason);
+    @memset(selfhost_reason, null);
+
     const built = try gpa.alloc(?Built, cases.items.len);
     defer gpa.free(built);
     @memset(built, null);
@@ -118,6 +143,7 @@ test "imports + prelude programs run with the expected output" {
         .libbitrt = libbitrt,
         .cases = cases.items,
         .failed_reason = failed_reason,
+        .selfhost_reason = selfhost_reason,
         .built = built,
     };
     defer for (built) |b| if (b) |x| x.deinit(gpa);
@@ -135,23 +161,99 @@ test "imports + prelude programs run with the expected output" {
     // collision — it is purely fd inheritance, and it needs a writer thread and a
     // forking thread to overlap.
     //
-    // Phase 1 compiles and writes every binary and forks nothing. Phase 2 runs
-    // them and writes nothing. Once phase 2 begins no write fd to any of these
-    // binaries exists anywhere in the process, so the race has no window left.
-    // Both phases stay fully parallel, so the harness keeps its speedup.
+    // Phase 1 compiles and writes every binary. Phase 2 runs them and writes
+    // nothing. Once phase 2 begins no write fd to any of these binaries exists
+    // anywhere in the process, so the race has no window left. Both phases stay
+    // fully parallel, so the harness keeps its speedup.
+    //
+    // Phase 1 does now fork, once per case, to drive the self-hosted `bit`
+    // (#1484) — and that is still safe, because the hazard is a LIVE child
+    // holding an inherited write fd at the moment of an `execve`. `process.run`
+    // reaps its child before returning and `runPool` joins every worker before
+    // phase 2 starts, so by the first `execve` of a built binary no phase-1
+    // child exists to hold anything open. What must not happen is a fork and an
+    // exec of these binaries overlapping, and the barrier still forbids that.
     try runPool(gpa, &shared, buildWorker);
     shared.next.store(0, .monotonic);
     try runPool(gpa, &shared, runWorker);
 
     const failed = shared.failures.load(.monotonic);
     if (failed != 0) {
-        std.debug.print("imports: {d}/{d} programs failed:", .{ failed, cases.items.len });
+        std.debug.print("imports [seed]: {d}/{d} programs failed:", .{ failed, cases.items.len });
         for (cases.items, failed_reason) |c, reason| {
             if (reason) |r| std.debug.print(" {s}({s})", .{ c.name, r });
         }
         std.debug.print("\n", .{});
         return error.ImportsFailed;
     }
+
+    try judgeSelfhost(gpa, io, cases.items, selfhost_reason, filter);
+}
+
+/// The self-hosted verdict (#1484): the set of projects `bit` failed on must
+/// equal the checked-in expectation exactly.
+///
+/// A count would not do. With eleven projects blocked on one lowering gap, a
+/// count stays put while a gap closes and a regression opens in its place, and
+/// the two runs read identically — the same defect #1469 fixed in
+/// `selfhost-diffir.sh`. So a name that ENTERS the failure set fails the gate,
+/// and a name that LEAVES it fails too, which is what forces the list to be
+/// pruned as the self-hosted compiler catches up.
+fn judgeSelfhost(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cases: []const Case,
+    reasons: []const ?[]const u8,
+    filter: []const u8,
+) !void {
+    const text = Dir.cwd().readFileAlloc(io, build_options.selfhost_gaps, gpa, .limited(64 << 10)) catch |e| {
+        std.debug.print("imports: cannot read expected-gap list '{s}': {s}\n", .{ build_options.selfhost_gaps, @errorName(e) });
+        return e;
+    };
+    defer gpa.free(text);
+
+    var entered: usize = 0;
+    var stale: usize = 0;
+    var held: usize = 0;
+
+    for (cases, reasons) |c, reason| {
+        const expected = gapListed(text, c.name);
+        if (reason) |r| {
+            if (expected) {
+                held += 1;
+                std.debug.print("imports [selfhost]: known gap still open: {s} ({s})\n", .{ c.name, r });
+            } else {
+                entered += 1;
+                std.debug.print("imports [selfhost]: REGRESSION {s} ({s}) — not in {s}\n", .{ c.name, r, build_options.selfhost_gaps });
+            }
+        } else if (expected) {
+            stale += 1;
+            std.debug.print("imports [selfhost]: STALE gap {s} now builds and runs — delete it from {s}\n", .{ c.name, build_options.selfhost_gaps });
+        }
+    }
+
+    std.debug.print(
+        "imports [selfhost]: {d}/{d} projects OK, {d} known gap(s) held, {d} regression(s), {d} stale\n",
+        .{ cases.len - held - entered, cases.len, held, entered, stale },
+    );
+
+    if (entered != 0) return error.ImportsSelfhostRegression;
+    // With `-Dimports-filter` the case list is a single project, so every OTHER
+    // listed gap is absent rather than closed; a stale verdict would be a lie.
+    if (stale != 0 and filter.len == 0) return error.ImportsSelfhostStaleGap;
+}
+
+/// Whether `name` appears in the gap list. Lines are `name  # reason`; blank
+/// lines and full-line comments are ignored.
+fn gapListed(text: []const u8, name: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const no_comment = if (std.mem.indexOfScalar(u8, raw, '#')) |h| raw[0..h] else raw;
+        const entry = std.mem.trim(u8, no_comment, " \t\r");
+        if (entry.len == 0) continue;
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
 }
 
 /// Runs `f` over the case list on a pool of `getCpuCount` workers, and does not
@@ -186,7 +288,7 @@ fn buildWorker(sh: *Shared) void {
         // two values phase 2 needs outlive it, so they come from the gpa.
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        sh.built[i] = buildProgram(arena.allocator(), sh.gpa, sh.libbitrt, c.name, c.dir_abs) catch |e| {
+        sh.built[i] = buildProgram(arena.allocator(), sh.gpa, sh.libbitrt, c.name, c.dir_abs, &sh.selfhost_reason[i]) catch |e| {
             _ = sh.failures.fetchAdd(1, .monotonic);
             sh.failed_reason[i] = @errorName(e);
             continue;
@@ -203,7 +305,7 @@ fn runWorker(sh: *Shared) void {
         const b = sh.built[i] orelse continue; // never built; phase 1 already counted it
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        runProgram(arena.allocator(), sh.cases[i].name, b) catch |e| {
+        runProgram(arena.allocator(), sh.cases[i].name, b, &sh.selfhost_reason[i]) catch |e| {
             _ = sh.failures.fetchAdd(1, .monotonic);
             sh.failed_reason[i] = @errorName(e);
         };
@@ -216,6 +318,7 @@ fn buildProgram(
     libbitrt: []const u8,
     name: []const u8,
     dir_abs: []const u8,
+    selfhost_reason: *?[]const u8,
 ) !Built {
     // Each worker gets its own Io: the shared single-threaded one is not
     // reentrant, and compile + run must not race across threads.
@@ -239,27 +342,86 @@ fn buildProgram(
     errdefer gpa.free(bin_path);
 
     try Dir.cwd().writeFile(io, .{ .sub_path = bin_path, .data = exe, .flags = .{ .permissions = .executable_file } });
-    return .{ .bin_path = bin_path, .expected = expected };
+
+    // The same project through the self-hosted compiler, to its own path. A
+    // failure here is a real failure: `bit` must build everything the seed can.
+    const selfhost_bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-imports-{s}-{x}-selfhost", .{ name, testing.random_seed }, 0);
+    errdefer gpa.free(selfhost_bin_path);
+    buildSelfhost(arena, io, name, dir_abs, selfhost_bin_path) catch |e| {
+        selfhost_reason.* = @errorName(e);
+        gpa.free(selfhost_bin_path);
+        return .{ .bin_path = bin_path, .selfhost_bin_path = null, .expected = expected };
+    };
+
+    return .{ .bin_path = bin_path, .selfhost_bin_path = selfhost_bin_path, .expected = expected };
 }
 
-fn runProgram(arena: std.mem.Allocator, name: []const u8, b: Built) !void {
+/// Compiles `dir_abs` with the self-hosted `bit` binary to `out_path`. It finds
+/// its stdlib and runtime archive from the environment, like tests/stress.zig.
+fn buildSelfhost(
+    arena: std.mem.Allocator,
+    io: Io,
+    name: []const u8,
+    dir_abs: []const u8,
+    out_path: [:0]const u8,
+) !void {
+    var env = std.process.Environ.Map.init(arena);
+    defer env.deinit();
+    try env.put("BIT_LIBBITRT", build_options.libbitrt_path);
+    try env.put("BIT_STDLIB", build_options.stdlib_dir);
+
+    const result = try std.process.run(arena, io, .{
+        .argv = &.{ build_options.selfhost_bit, "build", dir_abs, "-o", out_path },
+        .environ_map = &env,
+    });
+    const ok = switch (result.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (ok) return;
+    std.debug.print("imports '{s}' [selfhost]: compile failed:\n{s}{s}\n", .{ name, result.stdout, result.stderr });
+    return error.ImportsSelfhostCompileFailed;
+}
+
+fn runProgram(arena: std.mem.Allocator, name: []const u8, b: Built, selfhost_reason: *?[]const u8) !void {
     var threaded = Io.Threaded.init(arena, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     defer Dir.cwd().deleteFile(io, b.bin_path) catch {};
+    defer if (b.selfhost_bin_path) |p| Dir.cwd().deleteFile(io, p) catch {};
 
-    const result = try std.process.run(arena, io, .{ .argv = &.{b.bin_path} });
+    // The seed's verdict is unconditional. The self-hosted one is recorded and
+    // judged against the expected-gap set once every case has reported.
+    try runOne(arena, io, name, "seed", b.bin_path, b.expected);
+    if (b.selfhost_bin_path) |p| {
+        runOne(arena, io, name, "selfhost", p, b.expected) catch |e| {
+            selfhost_reason.* = @errorName(e);
+        };
+    }
+}
+
+/// One built binary against `expected`. `who` names the compiler that produced
+/// it, so a failure says which of the two is wrong without a second run.
+fn runOne(
+    arena: std.mem.Allocator,
+    io: Io,
+    name: []const u8,
+    who: []const u8,
+    bin_path: [:0]const u8,
+    expected: []const u8,
+) !void {
+    const result = try std.process.run(arena, io, .{ .argv = &.{bin_path} });
     const code: u8 = switch (result.term) {
         .exited => |c| c,
         else => 255,
     };
     if (code != 0) {
-        std.debug.print("imports '{s}': exited {d}\nstderr: {s}\n", .{ name, code, result.stderr });
+        std.debug.print("imports '{s}' [{s}]: exited {d}\nstderr: {s}\n", .{ name, who, code, result.stderr });
         return error.ImportsRunFailed;
     }
-    if (!std.mem.eql(u8, result.stdout, b.expected)) {
-        std.debug.print("imports '{s}': output mismatch\n  expected: {s}\n  got:      {s}\n", .{ name, b.expected, result.stdout });
+    if (!std.mem.eql(u8, result.stdout, expected)) {
+        std.debug.print("imports '{s}' [{s}]: output mismatch\n  expected: {s}\n  got:      {s}\n", .{ name, who, expected, result.stdout });
         return error.ImportsOutputMismatch;
     }
 }
