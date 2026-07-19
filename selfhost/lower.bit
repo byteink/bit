@@ -1358,6 +1358,27 @@ function lowerCall(fc: FnCtx, node: int): int {
   if (cn.tag == Tag.ChanType) {
     return lowerChanMake(fc, node)
   }
+  // `ns.fn(...)` — a direct call to a namespaced module's exported function. The
+  // dotted key resolves to the same CallTarget a plain import of that symbol
+  // would, so generic instantiation and module qualification are unchanged.
+  if (cn.tag == Tag.Member) {
+    let qn = nsQualifiedName(fc.c, callee)
+    if (qn != "" && funcDeclLookup(fc.c, qn) != 0) {
+      let t = resolveCallTarget(fc, qn, node)
+      if (!t.ok) {
+        fc.failed = true
+        return 0
+      }
+      let a = lowerArgsFor(fc, node, t.owner, t.decl, t.paramTypes)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.Call, t.result)
+      ins.name = t.symbol
+      ins.args = a
+      return builderEmit(fc.b, ins)
+    }
+  }
   // A call whose callee is `Enum.Variant` constructs a payload-carrying variant.
   if (cn.tag == Tag.Member) {
     let mk0 = kidsOf(fc.c.tree, callee)
@@ -2186,6 +2207,12 @@ function lowerCompositeLit(fc: FnCtx, node: int): int {
 // enum variant reference `Enum.Variant` to its tag constant.
 function lowerFieldAccess(fc: FnCtx, node: int): int {
   let kids = kidsOf(fc.c.tree, node)
+  // `ns.member` — an exported const/state/function of a namespaced module, not a
+  // field of a value. Its dotted key resolves through the ordinary name path.
+  let qn = nsQualifiedName(fc.c, node)
+  if (qn != "") {
+    return lowerNamedValue(fc, node, qn)
+  }
   // `Enum.Variant` (receiver is an enum type name): a C-like enum's variant is
   // its bare tag `const_int <Enum> <ordinal>`; a boxed enum's no-payload variant
   // wraps that tag in the `{tag, nil}` object.
@@ -2613,67 +2640,7 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
     return lowerSliceExpr(fc, node)
   }
   if (tag == Tag.Ident) {
-    let name = fc.c.source[n.span.start:n.span.end]
-    let v = envValue(fc, name)
-    if (v != -1) {
-      return v
-    }
-    // Not a local: a module-level `let` (§11.11) is a static cell. An `[N]T`
-    // array IS its base address in this IR (IndexGet/IndexSet take an
-    // element-base pointer), so the address is the value; every other
-    // admissible type is one word in the cell, so it takes one load — FieldGet
-    // at offset 0, the same op `*p` lowers to.
-    let gsym = moduleGlobalSym(fc, name)
-    if (gsym != "") {
-      let addr = emitGlobalAddrVal(fc, gsym)
-      let gty = nodeType(fc, node)
-      if (fc.c.ctx.types[gty].kind == TypeKind.Array) {
-        return addr
-      }
-      let ld = mkInstr(Op.FieldGet, gty)
-      ld.lhs = addr
-      ld.ival = 0
-      return builderEmit(fc.b, ld)
-    }
-    // Not a local: a module-level const inlines its initializer at the use site.
-    // An IMPORTED const's initializer node indexes its OWN module's arena, so it
-    // must be lowered against that module's checker — reading the node against
-    // this tree lands on an unrelated node (the declOwner rule). Both the tree
-    // and the const table are swapped for the duration, so an initializer that
-    // references another const of its own module resolves there too.
-    // ponytail: the owner's const table is rescanned per imported reference —
-    // consts are rare; cache it on the Lowerer if a project ever makes it hot.
-    let oc = declOwner(fc.c, name)
-    let ocName = declName2(fc.c, name)
-    let ocConsts = fc.moduleConsts
-    if (oc.moduleId != fc.c.moduleId) {
-      ocConsts = collectModuleConsts(oc)
-    }
-    for (k, initNode) of ocConsts {
-      if (k == ocName) {
-        let savedC = fc.c
-        let savedConsts = fc.moduleConsts
-        fc.c = oc
-        fc.moduleConsts = ocConsts
-        let cv = lowerExpr(fc, initNode)
-        fc.c = savedC
-        fc.moduleConsts = savedConsts
-        return cv
-      }
-    }
-    // A bare top-level function used as a first-class value: wrap it in a closure
-    // over a nil env and its trampoline.
-    if (funcDeclLookup(fc.c, name) != 0) {
-      let fnTy = funcSigLookup(fc.c, name)
-      let fid = fnValueTrampoline(fc, name)
-      let nl = mkInstr(Op.ConstNil, fnTy)
-      let mc = mkInstr(Op.MakeClosure, fnTy)
-      mc.name = "fnvalue\$trampoline\$${fid}"
-      mc.lhs = builderEmit(fc.b, nl)
-      return builderEmit(fc.b, mc)
-    }
-    fc.failed = true
-    return 0
+    return lowerNamedValue(fc, node, fc.c.source[n.span.start:n.span.end])
   }
   if (tag == Tag.Unary) {
     return lowerUnary(fc, node, hint)
@@ -6185,4 +6152,72 @@ function buildMethodTables(lw: Lowerer): []MethodTable {
     i = i + 1
   }
   return tables
+}
+
+// The value of a NAME that is not a local: a module-level `let` cell, a
+// module-level const (inlined at the use site), or a top-level function taken
+// as a first-class value. Every lookup here is name-keyed, so a namespace
+// member `ns.c` passes its DOTTED key and resolves exactly as a plain import
+// of the same symbol would (see check.bit `bindNamespaceImport`).
+function lowerNamedValue(fc: FnCtx, node: int, name: string): int {
+  let v = envValue(fc, name)
+  if (v != -1) {
+    return v
+  }
+  // Not a local: a module-level `let` (§11.11) is a static cell. An `[N]T`
+  // array IS its base address in this IR (IndexGet/IndexSet take an
+  // element-base pointer), so the address is the value; every other
+  // admissible type is one word in the cell, so it takes one load — FieldGet
+  // at offset 0, the same op `*p` lowers to.
+  let gsym = moduleGlobalSym(fc, name)
+  if (gsym != "") {
+    let addr = emitGlobalAddrVal(fc, gsym)
+    let gty = nodeType(fc, node)
+    if (fc.c.ctx.types[gty].kind == TypeKind.Array) {
+      return addr
+    }
+    let ld = mkInstr(Op.FieldGet, gty)
+    ld.lhs = addr
+    ld.ival = 0
+    return builderEmit(fc.b, ld)
+  }
+  // Not a local: a module-level const inlines its initializer at the use site.
+  // An IMPORTED const's initializer node indexes its OWN module's arena, so it
+  // must be lowered against that module's checker — reading the node against
+  // this tree lands on an unrelated node (the declOwner rule). Both the tree
+  // and the const table are swapped for the duration, so an initializer that
+  // references another const of its own module resolves there too.
+  // ponytail: the owner's const table is rescanned per imported reference —
+  // consts are rare; cache it on the Lowerer if a project ever makes it hot.
+  let oc = declOwner(fc.c, name)
+  let ocName = declName2(fc.c, name)
+  let ocConsts = fc.moduleConsts
+  if (oc.moduleId != fc.c.moduleId) {
+    ocConsts = collectModuleConsts(oc)
+  }
+  for (k, initNode) of ocConsts {
+    if (k == ocName) {
+      let savedC = fc.c
+      let savedConsts = fc.moduleConsts
+      fc.c = oc
+      fc.moduleConsts = ocConsts
+      let cv = lowerExpr(fc, initNode)
+      fc.c = savedC
+      fc.moduleConsts = savedConsts
+      return cv
+    }
+  }
+  // A bare top-level function used as a first-class value: wrap it in a closure
+  // over a nil env and its trampoline.
+  if (funcDeclLookup(fc.c, name) != 0) {
+    let fnTy = funcSigLookup(fc.c, name)
+    let fid = fnValueTrampoline(fc, name)
+    let nl = mkInstr(Op.ConstNil, fnTy)
+    let mc = mkInstr(Op.MakeClosure, fnTy)
+    mc.name = "fnvalue\$trampoline\$${fid}"
+    mc.lhs = builderEmit(fc.b, nl)
+    return builderEmit(fc.b, mc)
+  }
+  fc.failed = true
+  return 0
 }

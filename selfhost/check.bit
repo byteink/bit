@@ -97,6 +97,11 @@ struct Checker {
   // Import path text ("std/fs") -> module id, filled by the loader before
   // checking. -1 marks a path that resolved to no module.
   importPaths: map<string, int>,
+  // Namespace alias -> module id, from `import ns from "..."` / `import * as ns`.
+  // Every export of that module is ALSO bound in the maps above under the dotted
+  // key "ns.name", so `ns.member` resolves through the same name-keyed lookups a
+  // plain `import { member }` uses — see `bindNamespaceImports`.
+  namespaces: map<string, int>,
   // A for-of / catch binder Ident node -> the type pre-pass 3 gave it; 0 for
   // every other node. Parallel to `nodeTypes`, keyed the same way.
   //
@@ -193,7 +198,7 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     typeDecls: map<string, int>{}, genericParamIds: map<int, []int>{},
     moduleId: 0, mods: []Checker(0),
     importedFrom: map<string, ImportOrigin>{}, exports: map<string, bool>{},
-    importPaths: map<string, int>{} }
+    importPaths: map<string, int>{}, namespaces: map<string, int>{} }
 }
 
 // The declared name of a top-level decl node. A FuncDecl carries its name at
@@ -234,6 +239,20 @@ function collectExports(c: Checker) {
     if (getNode(c.tree, i).tag == Tag.Export) {
       let inner = kidsOf(c.tree, i)[0]
       if (inner != 0) {
+        // `export const A = 1, B = 2` / `export let s: int` declares one name per
+        // BINDING, so it has no single decl name. Omitting them left every
+        // exported constant and every piece of module state out of `exports` —
+        // invisible to a namespace import and to the prelude's auto-import,
+        // though a named `import { A }` still found it (that path never consults
+        // this table).
+        let it = getNode(c.tree, inner).tag
+        if (it == Tag.ConstDecl || it == Tag.LetDecl) {
+          for b of kidsOf(c.tree, inner) {
+            if (b != 0) {
+              c.exports[declName(c, b)] = true
+            }
+          }
+        }
         let nm = topDeclName(c, inner)
         if (nm != "") {
           c.exports[nm] = true
@@ -927,8 +946,12 @@ function bindImports(c: Checker, preludeId: int) {
     }
     let e = c.mods[mid]
     let body = getNode(c.tree, dk[0])
+    if (body.tag == Tag.ImportNs || body.tag == Tag.ImportStar) {
+      bindNamespaceImport(c, e, mid, dk[0])
+      continue
+    }
     if (body.tag != Tag.ImportGroup) {
-      continue // namespace/star imports bind in bindNamespaceImports
+      continue
     }
     for item of kidsOf(c.tree, dk[0]) {
       let ik = kidsOf(c.tree, item)
@@ -942,6 +965,38 @@ function bindImports(c: Checker, preludeId: int) {
       importName(c, e, mid, name, alias)
     }
   }
+}
+
+// `import ns from "..."` / `import * as ns from "..."` (#1154): binds every one
+// of the module's exports under the dotted key "ns.name", which is exactly what
+// `import { name } from "..."` would have bound under the bare name. Every
+// downstream lookup — funcResultLookup, declOwner, callQualified, the const
+// tables — is name-keyed, so nothing else has to learn what a namespace is.
+function bindNamespaceImport(c: Checker, e: Checker, mid: int, body: int) {
+  let nn = getNode(c.tree, kidsOf(c.tree, body)[0])
+  let alias = c.source[nn.span.start:nn.span.end]
+  c.namespaces[alias] = mid
+  for (n, _) of e.exports {
+    importName(c, e, mid, n, alias + "." + n)
+  }
+}
+
+// The dotted lookup key for `ns.member`, or "" when the member's receiver is not
+// a bound namespace (an ordinary field or method access). Only an Ident receiver
+// can name a namespace, so a shadowing local never reaches here as a Member.
+function nsQualifiedName(c: Checker, node: int): string {
+  let k = kidsOf(c.tree, node)
+  if (getNode(c.tree, k[0]).tag != Tag.Ident) {
+    return ""
+  }
+  let bn = getNode(c.tree, k[0]).span
+  let base = c.source[bn.start:bn.end]
+  let (_, ok) = c.namespaces[base]
+  if (!ok) {
+    return ""
+  }
+  let mn = getNode(c.tree, k[1]).span
+  return base + "." + c.source[mn.start:mn.end]
 }
 
 // Whether `name` is one of the FuncDecl's declared generic type parameters.
@@ -1788,6 +1843,16 @@ function checkCall(c: Checker, node: int): int {
     return typeFromNode(c, callee)
   }
   if (cn.tag == Tag.Member) {
+    // `ns.fn(...)` — the namespace binds the callee under a dotted key, so it
+    // resolves through the same two lookups the Ident branch uses.
+    let qn = nsQualifiedName(c, callee)
+    if (qn != "") {
+      let qg = genericResultAt(c, qn, node)
+      if (qg != -1) {
+        return qg
+      }
+      return funcResultLookup(c, qn)
+    }
     let mk = kidsOf(c.tree, callee)
     // Enum variant constructor `Enum.Variant(...)` / `Enum<T>.Variant(...)`.
     let baseName = typeNodeName(c, mk[0])
@@ -2290,6 +2355,17 @@ function checkMember(c: Checker, node: int): int {
     if (ut != 0 && c.ctx.types[ut].kind == TypeKind.Enum) {
       return ut
     }
+  }
+  // `ns.member` — an exported const, module state or function of the namespaced
+  // module, bound under the dotted key. Consulted before the receiver is typed:
+  // a namespace alias is not a value and has no type of its own.
+  let qn = nsQualifiedName(c, node)
+  if (qn != "") {
+    let qe = envLookup(c, qn)
+    if (qe != 0) {
+      return qe
+    }
+    return funcSigLookup(c, qn)
   }
   let rt = checkExprType(c, recv)
   if (rt != 0) {
