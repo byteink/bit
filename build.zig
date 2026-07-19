@@ -349,6 +349,50 @@ pub fn build(b: *std.Build) void {
     // minutes per mutation.
     b.step("rootpins", "Runtime-pin cycle gate (tests/rootpins.zig)").dependOn(&rootpins_run.step);
 
+    // Import-set differential (#1436): the two compilers must emit the same
+    // UNDEFINED symbols for the same source. `extern function close` built clean
+    // under both and SIGSEGV'd under self-hosted `bit` only, because its
+    // lowering dispatched builtins on the callee's SOURCE TEXT and sent the call
+    // to `bit_rt_chan_close` — so the `_close` import simply disappeared. No
+    // dump differential can see that (the AST and types are identical), and the
+    // golden corpus could not either, because nothing in it used `extern` in
+    // that shape. See tests/diffimports.zig's header.
+    const diffimports_opts = b.addOptions();
+    diffimports_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    diffimports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+
+    const diffimports_mod = b.createModule(.{
+        .root_source_file = b.path("tests/diffimports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    diffimports_mod.addImport("bit", exe.root_module);
+    diffimports_mod.addOptions("build_options", diffimports_opts);
+
+    const diffimports_tests = b.addTest(.{ .root_module = diffimports_mod });
+    const diffimports_run = b.addRunArtifact(diffimports_tests);
+    // The fixtures are .bit files read at run time, so an edit to one is
+    // invisible to the build cache — same reason as rootpins above.
+    diffimports_run.has_side_effects = true;
+    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
+    //
+    // DELIBERATELY NOT ON `test_step` YET. This gate is RED on the current tree
+    // because the defect it detects is still present: self-hosted `lowerCall`
+    // tests the predeclared builtins against the callee's source text before
+    // consulting the resolved declaration, so a user `extern function close`
+    // lowers to `bit_rt_chan_close`. Fixing that is a precedence restructure of
+    // `lowerCall` (local binding > user declaration > builtin, the order the
+    // seed gets from `env.lookup`/`nodeSymbol`), tracked on #1436.
+    //
+    // It is committed unwired rather than withheld so the gate is reviewable and
+    // runnable now, and so the divergence is recorded instead of remaining
+    // invisible. Adding `test_step.dependOn(&diffimports_run.step);` here is the
+    // LAST line of #1436's fix — the gate is green the moment the precedence is
+    // right, verified by applying the fix locally (see the task's mutation
+    // evidence). Wiring it before then would only turn the shared suite red for
+    // every other agent working in this tree.
+    b.step("diffimports", "Import-set differential gate (tests/diffimports.zig)").dependOn(&diffimports_run.step);
+
     // Format gate for the Zig sources. A formatter nothing enforces is a
     // suggestion: six files had already drifted before this landed. `--check`
     // (never a rewrite) is the point — a gate that reformatted its own checkout
@@ -811,9 +855,11 @@ pub fn build(b: *std.Build) void {
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
+        diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
+        diffimports_opts.addOption([]const u8, "selfhost_bit", "");
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
