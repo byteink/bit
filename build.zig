@@ -318,6 +318,37 @@ pub fn build(b: *std.Build) void {
     examples_run.has_side_effects = true;
     test_step.dependOn(&examples_run.step);
 
+    // Runtime-pin cycle gate (#1367): emits each ported runtime module as an
+    // ELF object and refuses any pinned ABI definition that references the very
+    // symbol #1369's rename will turn it into — i.e. a function that will become
+    // unbounded self-recursion the moment `runtime/root.zig` is retired. The
+    // trap is that a Bit primitive (`ffloor`, `floatBits`, `hostTarget`, ...) is
+    // NOT an instruction: it lowers to a call to the `bit_rt_*` symbol being
+    // ported, so "return ffloor(x)" reads as a one-line port and is a cycle.
+    // See tests/rootpins.zig's header for why no other gate can see this.
+    const rootpins_opts = b.addOptions();
+    rootpins_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    rootpins_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+
+    const rootpins_mod = b.createModule(.{
+        .root_source_file = b.path("tests/rootpins.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rootpins_mod.addImport("bit", exe.root_module);
+    rootpins_mod.addOptions("build_options", rootpins_opts);
+
+    const rootpins_tests = b.addTest(.{ .root_module = rootpins_mod });
+    const rootpins_run = b.addRunArtifact(rootpins_tests);
+    // runtime/**/*.bit is read at run time, so an edit there is invisible to the
+    // build cache — without this a newly-introduced cycle is cache-skipped.
+    rootpins_run.has_side_effects = true;
+    test_step.dependOn(&rootpins_run.step);
+    // Also its own step: this gate is the one a runtime port wants to re-run on
+    // every edit, and mutation-testing it through the full `test` step costs
+    // minutes per mutation.
+    b.step("rootpins", "Runtime-pin cycle gate (tests/rootpins.zig)").dependOn(&rootpins_run.step);
+
     // Format gate for the Zig sources. A formatter nothing enforces is a
     // suggestion: six files had already drifted before this landed. `--check`
     // (never a rewrite) is the point — a gate that reformatted its own checkout

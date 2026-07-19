@@ -20,6 +20,10 @@ const emit = @import("emit.zig");
 const link = @import("link.zig");
 const archive = @import("link/archive.zig");
 const macho = @import("link/macho.zig");
+/// `pub` for the runtime-pin cycle gate (tests/rootpins.zig): it reads back an
+/// object this compiler just emitted, which is the only way to see the symbol a
+/// call actually lands on rather than the name the source spells.
+pub const elf_reader = @import("link/elf_reader.zig");
 pub const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 
@@ -166,7 +170,10 @@ const max_source_bytes = 8 << 20; // 8 MiB
 /// host is running this `bit` (so `bit run` on a Mac execs an arm64 binary, on
 /// Linux an x86-64 one); `--target` cross-produces the other, which only its
 /// own host can execute (so `bit run` for a foreign target just builds).
-const BuildTarget = enum {
+/// `pub` so the runtime-pin cycle gate (tests/rootpins.zig) can ask for an ELF
+/// object on any host — the property it checks is target-independent, but only
+/// the ELF reader below can be pointed at an arbitrary target's output.
+pub const BuildTarget = enum {
     x86_64_linux,
     aarch64_linux,
     aarch64_macos,
