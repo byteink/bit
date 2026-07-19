@@ -21,6 +21,11 @@
 # the index entirely, so uncommitted edits are NOT tested. This has surprised
 # people; commit first, then gate.
 #
+# A cold run takes over an hour on a loaded machine and prints nothing until it
+# finishes (the container buffers into /tmp/o). To watch progress, find the
+# container with `docker ps --filter name=arm64gate` and
+# `docker exec <id> tail -f /tmp/o`. Raise the ceiling with ARM64GATE_DEADLINE.
+#
 # On success prints the log tail; on FAILURE prints the whole log, because the
 # tail alone routinely cuts off the one line that names the failing test — a gate
 # that cannot say what broke is not a gate. Always ends with `ARM64LINUX_EXIT=<code>`.
@@ -71,9 +76,15 @@ echo "ARM64GATE_LOAD=$(uptime | sed -n 's/.*load averages*: *//p' | awk '{print 
 # Run the suite over the tar stream on stdin. Echoes the container log and prints
 # ARM64LINUX_EXIT=<code>; returns that code as its own exit status.
 run_suite() {
-  local code
+  local code name
+  # Name the container so it can be reaped. `docker run` does NOT die with its
+  # driving shell: when this script is killed (harness timeout, Ctrl-C, the perl
+  # alarm), an unnamed container keeps burning every core on a result nobody will
+  # ever read. Observed exactly that on 2026-07-19.
+  name="arm64gate-$$-${RANDOM}"
+  trap 'docker rm -f "${name}" >/dev/null 2>&1 || true' EXIT INT TERM
   code=$(perl -e 'alarm shift; exec @ARGV' "${DEADLINE}" \
-    docker run --rm -i ${CACHE_ARGS} "${IMAGE}" bash -c '
+    docker run --rm -i --name "${name}" ${CACHE_ARGS} "${IMAGE}" bash -c '
       mkdir -p /work && cd /work && tar x &&
       ZIG_GLOBAL_CACHE_DIR='"${CACHE_ENV}"' zig build test > /tmp/o 2>&1
       e=$?
@@ -86,6 +97,8 @@ run_suite() {
       fi
       echo ARM64LINUX_EXIT=$e
     ' | tee /dev/stderr | sed -n 's/^ARM64LINUX_EXIT=//p')
+  docker rm -f "${name}" >/dev/null 2>&1 || true
+  trap - EXIT INT TERM
   # An empty code means the container died or the deadline fired — that is a
   # failure, not an unknown to be shrugged off.
   if [ -z "${code}" ]; then
