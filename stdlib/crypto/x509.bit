@@ -68,6 +68,7 @@ const x509OidKeyUsage: string = "2.5.29.15"
 const x509OidExtKeyUsage: string = "2.5.29.37"
 const x509OidSubjectKeyId: string = "2.5.29.14"
 const x509OidAuthorityKeyId: string = "2.5.29.35"
+const x509OidNameConstraints: string = "2.5.29.30"
 
 // Extended-key-usage purposes.
 const x509OidServerAuth: string = "1.3.6.1.5.5.7.3.1"
@@ -114,6 +115,11 @@ export struct Certificate {
   export hasExtKeyUsage: bool,
   export subjectKeyId: []byte,
   export authorityKeyId: []byte,
+  export unknownCriticalOids: []string,
+  export hasNameConstraints: bool,
+  export hasPermittedDns: bool,
+  export permittedDnsNames: []string,
+  export excludedDnsNames: []string,
 }
 
 // The mutable accumulator the extension parser fills. A struct is a reference
@@ -131,6 +137,11 @@ struct x509Exts {
   hasExtKeyUsage: bool,
   subjectKeyId: []byte,
   authorityKeyId: []byte,
+  unknownCriticalOids: []string,
+  hasNameConstraints: bool,
+  hasPermittedDns: bool,
+  permittedDnsNames: []string,
+  excludedDnsNames: []string,
 }
 
 // A fresh accumulator with every field at its RFC 5280 default.
@@ -148,6 +159,11 @@ function x509NewExts(): x509Exts {
     hasExtKeyUsage: false,
     subjectKeyId: []byte(0),
     authorityKeyId: []byte(0),
+    unknownCriticalOids: []string(0),
+    hasNameConstraints: false,
+    hasPermittedDns: false,
+    permittedDnsNames: []string(0),
+    excludedDnsNames: []string(0),
   }
 }
 
@@ -260,6 +276,11 @@ export function x509Parse(der: []byte): Certificate! {
     hasExtKeyUsage: exts.hasExtKeyUsage,
     subjectKeyId: exts.subjectKeyId,
     authorityKeyId: exts.authorityKeyId,
+    unknownCriticalOids: exts.unknownCriticalOids,
+    hasNameConstraints: exts.hasNameConstraints,
+    hasPermittedDns: exts.hasPermittedDns,
+    permittedDnsNames: exts.permittedDnsNames,
+    excludedDnsNames: exts.excludedDnsNames,
   }
 }
 
@@ -452,9 +473,19 @@ function x509MakeTime(year: int, month: int, day: int, hour: int, min: int, sec:
 
 // Parse the Extensions SEQUENCE into `out`. Each Extension is
 // SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING };
-// the octet string wraps the DER of the extension value. Only the extensions the
-// verifier acts on are decoded; the rest are ignored (a non-critical unknown is
-// harmless, and this verifier does not yet enforce unknown-critical rejection).
+// the octet string wraps the DER of the extension value.
+//
+// RFC 5280 §4.2 requires that "a certificate-using system MUST reject the
+// certificate if it encounters a critical extension it does not recognize or a
+// critical extension that contains information that it cannot process". The
+// `critical` BOOLEAN is therefore read here and the OID of every unrecognized
+// critical extension is recorded in `out.unknownCriticalOids`; `x509VerifyChain`
+// rejects any certificate in the path that carries one. A non-critical unknown
+// extension stays ignorable, exactly as the RFC allows.
+//
+// This is deliberately fail-closed: an extension this verifier has not learned
+// yet restricts the certificate in a way it cannot honour, so "not understood"
+// must mean "not allowed" rather than "waved through".
 function x509ParseExtensions(out: x509Exts, el: Element): ()! {
   let exts = asn1ReadSequence(el)?
   let i = 0
@@ -464,8 +495,12 @@ function x509ParseExtensions(out: x509Exts, el: Element): ()! {
       fail newError("x509: Extension must have an id and value")
     }
     let oid = asn1OidString(asn1ReadOid(parts[0])?)
+    // critical BOOLEAN DEFAULT FALSE — present only in the 3-field form, where
+    // it sits between the id and the value.
+    let critical = false
     let valIdx = 1
     if (len(parts) >= 3) {
+      critical = asn1ReadBoolean(parts[1])?
       valIdx = 2
     }
     let value = asn1ReadOctetString(parts[valIdx])?
@@ -482,6 +517,10 @@ function x509ParseExtensions(out: x509Exts, el: Element): ()! {
       out.subjectKeyId = asn1ReadOctetString(inner)?
     } else if (oid == x509OidAuthorityKeyId) {
       x509ParseAuthorityKeyId(out, inner)?
+    } else if (oid == x509OidNameConstraints) {
+      x509ParseNameConstraints(out, inner)?
+    } else if (critical) {
+      out.unknownCriticalOids = append(out.unknownCriticalOids, oid)
     }
     i = i + 1
   }
@@ -564,6 +603,75 @@ function x509ParseAuthorityKeyId(out: x509Exts, el: Element): ()! {
     }
     i = i + 1
   }
+}
+
+// NameConstraints (RFC 5280 §4.2.1.10):
+//   NameConstraints ::= SEQUENCE { permittedSubtrees [0] GeneralSubtrees OPTIONAL,
+//                                  excludedSubtrees  [1] GeneralSubtrees OPTIONAL }
+//   GeneralSubtree  ::= SEQUENCE { base GeneralName,
+//                                  minimum [0] BaseDistance DEFAULT 0,
+//                                  maximum [1] BaseDistance OPTIONAL }
+//
+// Only the dNSName [2] base is supported. Every other name form — iPAddress,
+// directoryName, rfc822Name, uniformResourceIdentifier — is REJECTED outright
+// rather than skipped: a constraint this verifier cannot evaluate is a
+// restriction it cannot honour, and silently dropping it is exactly the
+// fail-open behaviour this extension exists to prevent. The same reasoning
+// rejects a non-default `minimum`/`maximum` (which RFC 5280 forbids in this
+// profile anyway: "the minimum MUST be zero, and maximum MUST be absent") and an
+// empty dNSName base, which would otherwise constrain nothing while looking like
+// a constraint.
+//
+// `hasPermittedDns` records that a permitted set was PRESENT, separately from
+// its contents, so that a present-but-empty set correctly permits nothing —
+// distinct from an absent extension, which constrains nothing.
+function x509ParseNameConstraints(out: x509Exts, el: Element): ()! {
+  let nc = asn1ReadSequence(el)?
+  out.hasNameConstraints = true
+  let i = 0
+  while (i < len(nc)) {
+    let f = nc[i]
+    if (f.cls == classContext && f.constructed && f.tag == 0) {
+      out.hasPermittedDns = true
+      out.permittedDnsNames = x509ReadDnsSubtrees(f)?
+    } else if (f.cls == classContext && f.constructed && f.tag == 1) {
+      out.excludedDnsNames = x509ReadDnsSubtrees(f)?
+    } else {
+      fail newError("x509: malformed nameConstraints")
+    }
+    i = i + 1
+  }
+}
+
+// The dNSName bases of a GeneralSubtrees, failing on any subtree this verifier
+// cannot fully evaluate. `el` is the IMPLICITLY-tagged [0]/[1] SEQUENCE OF
+// GeneralSubtree — a context-class constructed element, not a universal
+// SEQUENCE, so `asn1ReadSequence` would reject it; its children are the
+// GeneralSubtrees and are read directly.
+function x509ReadDnsSubtrees(el: Element): []string! {
+  let out = []string(0)
+  let subtrees = el.children
+  let i = 0
+  while (i < len(subtrees)) {
+    let parts = asn1ReadSequence(subtrees[i])?
+    if (len(parts) < 1) {
+      fail newError("x509: nameConstraints subtree has no base")
+    }
+    // minimum/maximum must be absent (RFC 5280 §4.2.1.10 forbids both here).
+    if (len(parts) > 1) {
+      fail newError("x509: unsupported nameConstraints minimum/maximum")
+    }
+    let base = parts[0]
+    if (base.cls != classContext || base.constructed || base.tag != 2) {
+      fail newError("x509: unsupported nameConstraints name form")
+    }
+    if (len(base.bytes) == 0) {
+      fail newError("x509: empty nameConstraints dNSName")
+    }
+    out = append(out, x509ToLower(string(base.bytes)))
+    i = i + 1
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +895,97 @@ export function x509VerifyChain(
   if (!reachedRoot) {
     fail newError("x509: certificate chain is too long")
   }
+  x509CheckCriticalExts(chain)?
+  x509CheckNameConstraints(chain)?
   x509CheckPathLen(chain)?
+}
+
+// Enforce every CA's nameConstraints across the path (RFC 5280 §6.1.3(b)). A CA's
+// constraints bind every certificate BELOW it, never itself, so for each
+// constraining CA at index `i` (0 = leaf, ascending toward the root) the
+// certificates at 0..i-1 are checked against it. Applying each CA's set
+// independently is equivalent to the RFC's running intersection of permitted
+// subtrees and union of excluded ones, and avoids carrying mutable path state.
+//
+// Only SubjectAltName dNSName entries are matched; the deprecated subject-CN
+// fallback is not consulted, consistent with `x509MatchHostname`. A certificate
+// carrying no dNSName is not constrained by a dNSName subtree — the RFC applies
+// a constraint only to names of that form that are actually present.
+function x509CheckNameConstraints(chain: []Certificate): ()! {
+  let i = 1
+  while (i < len(chain)) {
+    let ca = chain[i]
+    if (ca.hasNameConstraints) {
+      let j = 0
+      while (j < i) {
+        x509CheckDnsAgainst(ca, chain[j])?
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Fail unless every dNSName in `cert`'s SubjectAltName satisfies `ca`'s permitted
+// subtrees and avoids its excluded ones. Excluded is checked first: RFC 5280
+// §4.2.1.10 gives exclusion precedence over permission.
+function x509CheckDnsAgainst(ca: Certificate, cert: Certificate): ()! {
+  for raw of cert.dnsNames {
+    let name = x509ToLower(raw)
+    for e of ca.excludedDnsNames {
+      if (x509DnsInSubtree(name, e)) {
+        fail newError("x509: ${raw} is excluded by a name constraint")
+      }
+    }
+    if (ca.hasPermittedDns && !x509DnsPermitted(name, ca.permittedDnsNames)) {
+      fail newError("x509: ${raw} is not permitted by a name constraint")
+    }
+  }
+}
+
+// Whether `name` sits inside at least one of the permitted `subtrees`.
+function x509DnsPermitted(name: string, subtrees: []string): bool {
+  for s of subtrees {
+    if (x509DnsInSubtree(name, s)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether the (lower-cased) DNS `name` lies within the (lower-cased) subtree
+// `base`, per RFC 5280 §4.2.1.10: a name satisfies the constraint when it equals
+// the base or extends it by whole labels on the left. So `example.com` covers
+// `example.com` and `www.host.example.com`, but NOT `notexample.com` — the label
+// boundary is required, which is what makes this a subtree test rather than a
+// suffix test.
+function x509DnsInSubtree(name: string, base: string): bool {
+  if (name == base) {
+    return true
+  }
+  if (len(name) <= len(base) + 1) {
+    return false
+  }
+  let cut = len(name) - len(base)
+  if (name[cut - 1] != 46) {
+    return false
+  }
+  return name[cut:len(name)] == base
+}
+
+// Enforce RFC 5280 §4.2 across the whole path: reject if any certificate carries
+// a critical extension this verifier does not recognize. Checked for every
+// certificate in the built path, not just the leaf — a critical extension on an
+// intermediate constrains everything beneath it just as much.
+function x509CheckCriticalExts(chain: []Certificate): ()! {
+  let i = 0
+  while (i < len(chain)) {
+    let oids = chain[i].unknownCriticalOids
+    if (len(oids) > 0) {
+      fail newError("x509: unrecognized critical extension ${oids[0]}")
+    }
+    i = i + 1
+  }
 }
 
 // The index in `pool` of the first certificate whose subject DN equals `cert`'s

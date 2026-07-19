@@ -3257,8 +3257,20 @@ KeyUsage, ExtendedKeyUsage). One certificate's signature is verified under an
 issuer's public key, dispatching on the signature algorithm across RSA PKCS#1
 v1.5, RSA-PSS, ECDSA (P-256/P-384), and Ed25519. A leaf is verified up a chain to
 a trusted root, enforcing every issuer's CA basic constraint and path length, each
-certificate's validity window, key-usage and extended-key-usage sanity, and the
-hostname against the SubjectAltName.
+certificate's validity window, key-usage and extended-key-usage sanity, the
+NameConstraints of every CA in the path, and the hostname against the
+SubjectAltName.
+
+Verification is **fail-closed**, as RFC 5280 §4.2 requires: a certificate carrying
+a critical extension this library does not recognize is rejected rather than
+accepted, so an extension that restricts a certificate can never be bypassed by
+using one the verifier has not learned yet. NameConstraints (§4.2.1.10) are
+enforced across the whole path — a CA's permitted and excluded subtrees bind every
+certificate beneath it, exclusion takes precedence over permission, and a present
+but empty permitted set permits nothing (which is not the same as the extension
+being absent). Only `dNSName` subtrees are evaluated; a constraint naming any other
+form, or carrying a `minimum`/`maximum`, is rejected rather than ignored, on the
+same principle that "not understood" must not mean "allowed".
 
 Verification is deterministic: the current time is passed in as `nowUnix` (Unix
 seconds) rather than read from a clock, so the same inputs always reach the same
