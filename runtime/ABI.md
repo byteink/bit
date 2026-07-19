@@ -255,15 +255,28 @@ the caller's frame pointer and `*(fp+8)` is the return address (`fp` = `rbp` on
 x86-64, `x29` on AArch64). All stack-map offsets are **frame-pointer-relative**,
 normalized by each backend, so the walker is arch-neutral.
 
-**Wire format (`bit_stack_maps`).** The compiler emits one table per program,
-defined as the symbol `bit_stack_maps` (Mach-O: `_bit_stack_maps`) in read-only
-data (ELF) or writable data (Mach-O, so dyld can rebase its absolute code
-pointers under PIE). The runtime reads it via an `extern` of that symbol.
+**Wire format (`bit_stack_maps`).** Every object emits its own entries into a
+dedicated section — ELF `.bit_gc`, Mach-O `__DATA,__bit_gc` — one entry per
+function, each its own atom carrying a local symbol. The **linker** lays every
+contributing object's entries out as one uninterrupted run and defines the two
+symbols that bound it, `bit_stack_maps` and `bit_stack_maps_end` (Mach-O:
+`_`-prefixed). The runtime `extern`s both and walks the half-open extent.
+
+There is deliberately **no count and no terminator**. A merged table spanning
+several archive members has no count any one object could write, and a
+per-object terminator is worse than useless: concatenation would give
+`[e1][T][e2][T]` and the walk would stop at the first `T`, silently losing every
+later member's frames. Entries are self-delimiting and the extent is the bound.
+
+Entry atoms are **1-aligned** so the linker inserts no padding between them —
+padding inside the extent would be decoded as an entry. On Mach-O the section is
+in `__DATA` so dyld rebases its absolute code pointers under PIE; on ELF it is
+read-only, since the image is non-PIE.
+
 Little-endian, tightly packed (read with unaligned loads):
 
 ```
-u32 num_funcs
-per function (num_funcs times):
+per function (repeated to the end of the extent):
   u64 code_addr        # abs reloc -> the function's code symbol
   u32 code_size        # bytes; the function spans [code_addr, code_addr+code_size)
   u16 num_saved
@@ -286,7 +299,16 @@ inner frames' `saved` entries as the walk unwinds); apply this frame's `saved`
 entries to recover the caller's registers; then step to `*(fp)` / `*(fp+8)`.
 `pc` leaving every function's range ends the Bit portion of the stack.
 
-### 4.1 The one-table assumption, and why it has to go
+**Retention.** A stack-map entry is kept exactly when the function it describes
+is kept. It cannot be a dead-strip root — each entry relocates to its function,
+so rooting the entries would retain every function of every runtime module in
+every image — and it cannot be left to ordinary reachability, because nothing
+references an entry, so all of them would be dropped and the collector would see
+no frames at all. The linker decides it after dead-strip, in the same pass that
+orders the merged group. Dead-stripping `libbitrt.a` is thereby *finer*-grained
+than a whole-program table allowed, not coarser.
+
+### 4.1 The one-table assumption, and why it had to go (RESOLVED)
 
 The format above assumes **one table per link**, under one fixed symbol, emitted
 by the single object that is the whole program. That assumption is what makes a
@@ -315,6 +337,9 @@ symbols, zero duplicates** — and **zero** of them carry a stack map. The pin
 scan (§9) is already fully satisfied for all ten. The stack-map table is the
 only remaining obstacle between here and a fully-Bit `libbitrt.a`.
 
+**This is now implemented; §4 above describes the landed format.** The record
+below is kept because it is the argument for the design, not a plan.
+
 **Resolution: the table becomes per-member and the linker merges it.** Each
 object emits its own stack-map entries into a dedicated section (ELF `.bit_gc`,
 Mach-O `__DATA,__bit_gc` — both section kinds already exist in the object
@@ -324,12 +349,12 @@ exactly when the function it describes is retained, so entries are per-function
 atoms rather than one blob per module — which also makes dead-stripping of
 `libbitrt.a` finer-grained than it is today, not coarser.
 
-Consequences for this document when that lands: the leading `u32 num_funcs`
-disappears (a merged table has no single count), entries become a flat sequence
-bounded by the linker-defined extent, and `bit_stack_maps` names the start of
-that extent rather than a blob one object owns. **§17.6's `@nosplit` requirement
-is then deleted, not relaxed** — a member carrying its own maps has no reason to
-restrict what its functions may do.
+Consequences for this document, all now applied in §4: the leading
+`u32 num_funcs` is gone (a merged table has no single count), entries are a flat
+sequence bounded by the linker-defined extent, and `bit_stack_maps` names the
+start of that extent rather than a blob one object owns. **§17.6's `@nosplit`
+requirement was deleted, not relaxed** — a member carrying its own maps has no
+reason to restrict what its functions may do.
 
 Two alternatives were weighed and rejected:
 

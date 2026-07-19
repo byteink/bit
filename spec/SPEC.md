@@ -2035,21 +2035,21 @@ program's object does, since exactly one object per link may define each:
 - **no GC type descriptors.** Needing one means the module allocates on the
   managed heap, which the runtime — the code that *implements* that heap —
   must not do. Refused, rather than emitted without the descriptor.
-- **no `bit_stack_maps`.** Every function in the object must therefore be
-  `@nosplit` or `@naked` (§10.3), which is refused otherwise. The attribute is
-  what makes the absent stack map sound: `@nosplit` already carries the
-  obligation not to allocate and not to reach a safepoint, so no collection can
-  begin beneath such a frame and none of them ever needs scanning.
+- **no whole-program `bit_stack_maps` table** — but this is *not* a restriction
+  on what the member's functions may do. Each member emits its **own** GC
+  stack-map entries into a dedicated section, and the linker concatenates every
+  member's entries into one table bounded by the two symbols it defines itself
+  (`runtime/ABI.md` §4). A member's frames are therefore fully scannable, so its
+  functions may allocate nothing but may otherwise reach safepoints freely.
 
-  **This requirement is scheduled for deletion, and the reason is a real
-  conflict rather than a preference.** A scheduler worker loop must reach
-  safepoints — that is how it yields to a stop-the-world rendezvous — so it
-  cannot be `@nosplit`, and a runtime module containing one therefore has no
-  representation as an archive member. The same is true of any member that
-  legitimately contains an `asm` barrier or an indirect call. The resolution is
-  a per-member stack-map table the linker merges (`runtime/ABI.md` §4.1); once a
-  member carries its own maps there is no reason to restrict what its functions
-  may do, and this bullet becomes "each member carries its own entries" instead.
+  Earlier drafts of this section required every function in a freestanding
+  object to be `@nosplit` or `@naked`, on the sound argument that an absent
+  stack map is only safe for a frame no collection can begin beneath. That
+  requirement is **deleted**, because it made the scheduler unrepresentable: a
+  worker loop must reach safepoints — that is how it yields to a stop-the-world
+  rendezvous — so it cannot be `@nosplit`, and neither can a member that
+  legitimately contains an `asm` barrier or an indirect call. Per-member tables
+  remove the premise rather than carve out exceptions to it.
 - **string literals are local**, not global. Nothing outside the object names
   them, so two members' literals cannot collide.
 
