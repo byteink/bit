@@ -16,6 +16,9 @@
 #   arm64gate.sh selftest # prove the gate can fail: a no-op control run that MUST
 #                         # be green, then a deliberately broken tree that MUST be
 #                         # red. A gate nobody has seen fail is not a gate.
+#   arm64gate.sh mutant [build|golden]
+#                         # the breakage half alone — for when HEAD is already red
+#                         # on this target and a control run cannot be green.
 #
 # IT ONLY SEES COMMITTED WORK. `git archive HEAD` ignores the working tree and
 # the index entirely, so uncommitted edits are NOT tested. This has surprised
@@ -42,9 +45,6 @@ VOLUME="bit-zig-cache-arm64"
 # exists to catch a hang, not to enforce a performance budget.
 DEADLINE="${ARM64GATE_DEADLINE:-10800}"
 
-# macOS has no coreutils `timeout`; perl's alarm is the portable stand-in. A
-# missing tool must abort, never silently skip the deadline.
-command -v perl  >/dev/null || { echo "arm64gate: perl not found (needed for the deadline)" >&2; exit 127; }
 command -v docker >/dev/null || { echo "arm64gate: docker not found" >&2; exit 127; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
   echo "arm64gate: image ${IMAGE} missing — build it (debian:bookworm arm64 + zig-aarch64-linux-0.16.0)" >&2; exit 127; }
@@ -86,8 +86,17 @@ run_suite() {
   # ever read. Observed exactly that on 2026-07-19.
   name="arm64gate-$$-${RANDOM}"
   trap 'docker rm -f "${name}" >/dev/null 2>&1 || true' EXIT INT TERM
-  code=$(perl -e 'alarm shift; exec @ARGV' "${DEADLINE}" \
-    docker run --rm -i --name "${name}" ${CACHE_ARGS} "${IMAGE}" bash -c '
+
+  # Enforce the deadline by REMOVING THE CONTAINER, not by signalling the client.
+  # `perl -e 'alarm N; exec docker run ...'` — the obvious portable idiom, and what
+  # this script shipped with — is VACUOUS: the docker CLI is a Go program and Go's
+  # runtime swallows SIGALRM, so the alarm never lands. Measured 2026-07-19:
+  # `perl -e 'alarm 3; exec @ARGV' docker run --rm alpine sleep 25` ran the full
+  # 25s and exited 0. That defect let a genuinely hung run burn 2h of CPU.
+  ( sleep "${DEADLINE}"; docker rm -f "${name}" >/dev/null 2>&1 ) &
+  local watchdog=$!
+
+  code=$(docker run --rm -i --name "${name}" ${CACHE_ARGS} "${IMAGE}" bash -c '
       mkdir -p /work && cd /work && tar x &&
       ZIG_GLOBAL_CACHE_DIR='"${CACHE_ENV}"' zig build test > /tmp/o 2>&1
       e=$?
@@ -100,6 +109,8 @@ run_suite() {
       fi
       echo ARM64LINUX_EXIT=$e
     ' | tee /dev/stderr | sed -n 's/^ARM64LINUX_EXIT=//p')
+  kill "${watchdog}" 2>/dev/null || true
+  wait "${watchdog}" 2>/dev/null || true
   docker rm -f "${name}" >/dev/null 2>&1 || true
   trap - EXIT INT TERM
   # An empty code means the container died or the deadline fired — that is a
@@ -111,6 +122,43 @@ run_suite() {
   return "${code}"
 }
 
+# Emit a tar of HEAD with one deliberate breakage applied, in a throwaway copy —
+# the repo itself is never touched. $1 selects what to break:
+#   golden — corrupt a `.expected` file. The STRONG proof: it shows the gate sees
+#            a real TEST failure, not merely a build error. Needs a full build.
+#   build  — corrupt build.zig. The CHEAP proof: fails in seconds, so it is usable
+#            even when the suite cannot run to completion on this target.
+mutant_stream() {
+  local kind="${1:-build}" tmp victim
+  tmp=$(mktemp -d)
+  git archive HEAD | tar x -C "${tmp}"
+  if [ "${kind}" = "golden" ]; then
+    victim=$(ls "${tmp}"/tests/cases/*.expected 2>/dev/null | head -1)
+    [ -n "${victim}" ] || { echo "arm64gate: no golden .expected to mutate" >&2; rm -rf "${tmp}"; exit 127; }
+    printf 'arm64gate-deliberate-breakage\n' >> "${victim}"
+  else
+    victim="${tmp}/build.zig"
+    [ -f "${victim}" ] || { echo "arm64gate: build.zig missing" >&2; rm -rf "${tmp}"; exit 127; }
+    printf '\nthis is not valid zig — arm64gate deliberate breakage\n' >> "${victim}"
+  fi
+  echo "arm64gate: mutating ${victim#"${tmp}"/}" >&2
+  tar c -C "${tmp}" .
+  rm -rf "${tmp}"
+}
+
+# `mutant [build|golden]` — run ONLY the deliberate-breakage half. Use this when
+# HEAD is already known-red on this target (as aarch64-linux is today), where a
+# control run cannot be green and `selftest` would correctly refuse to conclude.
+if [ "${MODE}" = "mutant" ]; then
+  echo "===MUTANT (deliberate breakage, must be RED)==="
+  if mutant_stream "${2:-build}" | run_suite; then
+    echo "ARM64GATE_MUTANT=BROKEN — the gate passed a deliberately broken tree" >&2
+    exit 1
+  fi
+  echo "ARM64GATE_MUTANT=ok (gate went red on a broken tree)"
+  exit 0
+fi
+
 if [ "${MODE}" = "selftest" ]; then
   # 1. Control: the unmodified committed tree MUST pass. If this is red the
   #    selftest proves nothing, so stop rather than report a meaningless red.
@@ -119,24 +167,12 @@ if [ "${MODE}" = "selftest" ]; then
     echo "SELFTEST_CONTROL=pass"
   else
     echo "SELFTEST_CONTROL=fail  — HEAD is already red; fix that before trusting a mutation result" >&2
-    echo "ARM64GATE_SELFTEST=inconclusive"
+    echo "ARM64GATE_SELFTEST=inconclusive  (use \`arm64gate.sh mutant\` to check the failure path alone)"
     exit 1
   fi
 
-  # 2. Mutant: corrupt one golden expectation in a THROWAWAY copy (the repo is
-  #    never touched) and require the gate to go red. Breaking an .expected file
-  #    rather than the compiler proves the gate sees a genuine TEST failure, not
-  #    just a build error.
-  tmp=$(mktemp -d)
-  trap 'rm -rf "${tmp}"' EXIT
-  git archive HEAD | tar x -C "${tmp}"
-  victim=$(ls "${tmp}"/tests/cases/*.expected | head -1)
-  [ -n "${victim}" ] || { echo "arm64gate: no golden .expected found to mutate" >&2; exit 127; }
-  echo "arm64gate: mutating $(basename "${victim}")"
-  printf 'arm64gate-deliberate-breakage\n' >> "${victim}"
-
   echo "===SELFTEST MUTANT (deliberate breakage, must be RED)==="
-  if tar c -C "${tmp}" . | run_suite; then
+  if mutant_stream golden | run_suite; then
     echo "ARM64GATE_SELFTEST=BROKEN — the gate passed a deliberately broken tree" >&2
     exit 1
   fi
