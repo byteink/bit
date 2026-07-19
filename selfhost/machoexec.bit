@@ -124,8 +124,11 @@ function meIsBranch(kind: LoRelocKind): bool {
 // True for a writable, file-backed __DATA section kind that can hold a rebasable
 // absolute pointer (plain data, or a tlv_descriptor's fields).
 function meIsDataSeg(kind: LoSectionKind): bool {
+  // GcMeta is in __DATA precisely so its absolute code pointers can be rebased:
+  // a stack-map entry that dyld did not slide would send the collector walking a
+  // stale code range under PIE.
   return kind == LoSectionKind.Data || kind == LoSectionKind.TlsVars ||
-    kind == LoSectionKind.TlsData
+    kind == LoSectionKind.TlsData || kind == LoSectionKind.GcMeta
 }
 
 // One bind: name the symbol, say it is a pointer, point at the segment+offset,
@@ -320,6 +323,10 @@ function mePartition(modules: []LoModule, st: MeLinkState): MeLinkState {
         st.tlsVars = append(st.tlsVars, p)
       } else if (k == LoSectionKind.TlsData) {
         st.tlsData = append(st.tlsData, p)
+      } else if (k == LoSectionKind.GcMeta) {
+        // Placed as one uninterrupted run by the caller, not here: their order
+        // and adjacency are the merged table's whole contract.
+        ai = ai
       } else {
         assert(k == LoSectionKind.TlsBss)
         st.tlsBss = append(st.tlsBss, p)
@@ -942,10 +949,43 @@ function meWriteStub(file: []u8, off: int, stubVaddr: int, gotSlot: int): ()! {
 // sizeofcmds is computed from section COUNTS before a single address is
 // assigned, and the commands themselves are only emitted at the end, once every
 // offset they record is known.
-function linkExecutable(modules: []LoModule, identifier: string): []u8! {
+function linkExecutable(inputModules: []LoModule, identifier: string): []u8! {
+  // ABI.md §4: the merged GC stack-map table's bounds are linker-defined, so the
+  // boundary symbols enter the link as a synthetic module appended last (stable
+  // index) and BEFORE resolution, so the runtime's extern references resolve
+  // like any other global.
+  let modules = inputModules
+  let markerModuleIdx = len(modules)
+  modules = append(modules, markerModule("_"))
+
   let globals = resolveGlobals(modules)?
   let st0 = meDeadStripWithImports(modules, globals)?
+  // The boundary markers are kept unconditionally: the runtime's externs must
+  // resolve even for a program whose every stack-map entry was stripped, where
+  // an empty extent (start == end) is the right answer.
+  st0.kept[atomKey(markerModuleIdx, markerStartAtom())] = true
+  st0.kept[atomKey(markerModuleIdx, markerEndAtom())] = true
+  // A stack-map entry survives iff its function did — see keepLiveStackMaps.
+  // Without it the entries, which nothing references, are all dead-stripped,
+  // the merged extent comes out EMPTY, and the collector silently loses every
+  // precise root.
+  keepLiveStackMaps(modules, globals, st0.kept)?
+
   let st1 = mePartition(modules, st0)
+
+  // ---- merged GC stack-map group (ABI.md §4) -----------------------------
+  // Appended to __data as one contiguous run bounded by the two markers, with
+  // nothing interleaved — the entries carry no count and no terminator, so those
+  // bounds are the only thing that delimits the runtime's walk. Appending last
+  // means no later atom can land inside the extent.
+  let gcGroup = mergedStackMapAtoms(modules, st0.kept, markerModuleIdx)
+  let gi = 0
+  while (gi < len(gcGroup)) {
+    st1.data = append(st1.data, MePlaced{ module: atomKeyModule(gcGroup[gi]),
+      atom: atomKeyAtom(gcGroup[gi]), vaddr: 0, fileOff: 0 })
+    gi = gi + 1
+  }
+
   let st = meBuildGotAndStubs(modules, globals, st1)?
 
   let hasDataSeg = meHasDataSeg(st)

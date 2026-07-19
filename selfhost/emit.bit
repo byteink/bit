@@ -43,10 +43,6 @@ struct EmittedMethods {
   relocs: []EmFnReloc,
 }
 
-function emStackmapsSymbol(): string {
-  return "bit_stack_maps"
-}
-
 // The Mach-O C ABI's leading underscore.
 function emMac(name: string): string {
   return "_" + name
@@ -68,22 +64,6 @@ function emStackMapOf(fc: FuncCode): FuncStackMap {
 // is_extern arm to mirror here.
 function emitsFunction(f: IrFunc, freestanding: bool): bool {
   return f.inRootModule || !freestanding
-}
-
-// §17.6: may this function go into a freestanding object? A freestanding object
-// carries no bit_stack_maps, so the collector could not scan the frame of a
-// function it holds — sound only for one that can never be on the stack when a
-// collection starts.
-//
-// The test is the DECLARATION, not the emitted safepoint list. Codegen records
-// a safepoint at every surviving call (a callee may collect in general);
-// @nosplit suppresses only the back-edge one. So "has no safepoints" is true of
-// almost nothing that calls anything, and testing it would reject a runtime
-// module the moment it called a sibling — the entire case this mode exists for.
-// What makes the missing stack map sound is §10.3's standing obligation on
-// @nosplit: it may not allocate and may not reach a safepoint.
-function freestandingEligible(f: IrFunc): bool {
-  return f.isNosplit || f.isNaked
 }
 
 // §17.6: refuses a module needing the managed runtime's whole-program tables,
@@ -356,6 +336,7 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
   let code = newByteBuf()
   let rodata = newByteBuf()
   let data = newByteBuf()
+  let gc = newByteBuf()
   let symbols = []MachoSymbol(0)
   let relocs = []MachoRelocation(0)
   let defined = map<string, bool>{}
@@ -402,9 +383,6 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
     if (!emitsFunction(f, freestanding)) {
       fi = fi + 1
       continue
-    }
-    if (freestanding && !freestandingEligible(f)) {
-      fail newError("--freestanding: '${f.name}' is neither @nosplit nor @naked; freestanding code carries no GC stack maps (SPEC §10.3)")
     }
     let fc = compileFunction(module, f)
     let off = len(code.bytes)
@@ -571,29 +549,39 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
     ti = ti + 1
   }
 
-  // ---- GC stack-map table (runtime/ABI.md §4) ----------------------------
-  // Each entry holds an absolute code pointer, so this lives in writable __data
-  // too; the runtime reads it via _bit_stack_maps.
-  // §17.6: a whole-program table under a fixed name — never an archive
-  // member's to define. See emitElfBlobs.
+  // ---- GC stack-map entries (runtime/ABI.md §4) -> __DATA,__bit_gc -------
+  // Per-MEMBER, not per-program (ABI.md §4.1): every object emits its own
+  // entries and the linker concatenates them between the symbols it defines at
+  // the extent's ends, so an archive member can carry stack maps and its
+  // functions are free to reach safepoints. No object defines _bit_stack_maps —
+  // one global name owned by several members would be a duplicate definition,
+  // so the linker owns it instead.
+  //
+  // Each entry holds an absolute code pointer, so like the string/TypeInfo blobs
+  // the section is in __DATA (dyld only rebases writable segments under PIE).
+  // One section with one LOCAL symbol per function: the writer rejects two
+  // sections of the same kind, and the reader carves one atom per symbol, which
+  // is what lets the linker drop an entry whose function it dropped.
   assert(len(emittedNames) == len(stackmaps))
-  if (!freestanding) {
-    let blobOff = len(data.bytes)
-    let codeRelocs = writeStackMaps(data, stackmaps)
-    let smSym = emMac(emStackmapsSymbol())
-    symbols = append(symbols, MachoSymbol{ name: smSym, hasSection: true,
-      section: MachoSectionKind.Data, offset: blobOff,
-      size: len(data.bytes) - blobOff, binding: MachoBinding.Global })
-    defined[smSym] = true
-    // writeStackMaps records offsets against `data` itself — already
-    // section-relative, so no blobOff adjustment.
-    let ci = 0
-    while (ci < len(codeRelocs)) {
-      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
-        offset: codeRelocs[ci], symbol: emMac(emittedNames[ci]),
-        kind: MachoRelocKind.Unsigned64 })
-      ci = ci + 1
+  let smCodeRelocs = writeStackMaps(gc, stackmaps)
+  let smi = 0
+  while (smi < len(smCodeRelocs)) {
+    let smOff = smCodeRelocs[smi]
+    let smEnd = len(gc.bytes)
+    if (smi + 1 < len(smCodeRelocs)) {
+      smEnd = smCodeRelocs[smi + 1]
     }
+    let smName = emMac("__bitsm_${smi}")
+    symbols = append(symbols, MachoSymbol{ name: smName, hasSection: true,
+      section: MachoSectionKind.GcMeta, offset: smOff, size: smEnd - smOff,
+      binding: MachoBinding.Local })
+    defined[smName] = true
+    // Offsets are already section-relative, and an entry starts with its
+    // codeAddr field — so the entry offset IS the reloc offset.
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.GcMeta,
+      offset: smOff, symbol: emMac(emittedNames[smi]),
+      kind: MachoRelocKind.Unsigned64 })
+    smi = smi + 1
   }
 
   // ---- module-level state (§11.11) -> the same writable __data ----------
@@ -628,6 +616,12 @@ function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool):
 
   let sections = [MachoSection{ kind: MachoSectionKind.Text, data: code.bytes,
     size: 0, alignment: 4 }]
+  if (len(gc.bytes) > 0) {
+    // 1-aligned — see the ELF path: padding inside the extent would be decoded
+    // as an entry.
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.GcMeta,
+      data: gc.bytes, size: 0, alignment: 1 })
+  }
   if (len(rodata.bytes) > 0) {
     sections = append(sections, MachoSection{ kind: MachoSectionKind.Rodata,
       data: rodata.bytes, size: 0, alignment: 8 })
@@ -681,8 +675,10 @@ function emElfAbs64(off: int, sym: string): ElfRelocation {
     kind: ElfRelocKind.Abs64, addend: 0 }
 }
 
-function emitElfBlobs(module: IrModule, rodata: ByteBuf, symbols: []ElfSymbol,
-  relocs: []ElfRelocation, defined: map<string, bool>,
+// `gc` is the .bit_gc GC stack-map section (ABI.md §4) — kept separate from
+// .rodata because the linker must lay its atoms out contiguously.
+function emitElfBlobs(module: IrModule, rodata: ByteBuf, gc: ByteBuf,
+  symbols: []ElfSymbol, relocs: []ElfRelocation, defined: map<string, bool>,
   stackmaps: []FuncStackMap, emittedNames: []string,
   freestanding: bool): EmElfBlobs {
   assert(len(emittedNames) == len(stackmaps))
@@ -794,25 +790,38 @@ function emitElfBlobs(module: IrModule, rodata: ByteBuf, symbols: []ElfSymbol,
     ti = ti + 1
   }
 
-  // ---- GC stack-map table (runtime/ABI.md §4) -> .rodata -----------------
-  // §17.6: bit_stack_maps is a whole-PROGRAM table under one fixed name the
-  // runtime reads, so exactly one object in a link may define it — never an
-  // archive member. A freestanding object emits none, and refuses any function
-  // that would need an entry, so nothing is silently lost.
-  if (!freestanding) {
-    let blobOff = len(rodata.bytes)
-    let codeRelocs = writeStackMaps(rodata, stackmaps)
-    symbols = append(symbols, emElfSym(emStackmapsSymbol(), ElfSectionKind.Rodata,
-      blobOff, len(rodata.bytes) - blobOff, ElfBinding.Global, ElfSymKind.Object))
-    defined[emStackmapsSymbol()] = true
-    // writeStackMaps records offsets against `rodata` itself — already
-    // section-relative, so no blobOff adjustment. `emittedNames` is indexed in
-    // stackmap order, which is NOT module.funcs order once anything is skipped.
-    let ci = 0
-    while (ci < len(codeRelocs)) {
-      relocs = append(relocs, emElfAbs64(codeRelocs[ci], emittedNames[ci]))
-      ci = ci + 1
+  // ---- GC stack-map entries (runtime/ABI.md §4) -> .bit_gc ---------------
+  // Per-MEMBER, not per-program: every object emits its own entries into the
+  // dedicated .bit_gc section and the linker concatenates them between the
+  // symbols it defines at the extent's ends. That is what lets an archive member
+  // carry stack maps at all, which in turn is what lets a runtime module reach a
+  // safepoint (ABI.md §4.1). No object defines bit_stack_maps: one global name
+  // owned by several members would be a duplicate definition, so the linker owns
+  // it instead.
+  //
+  // One section, one LOCAL symbol per function — not one section per function,
+  // which both object writers reject as a duplicate section kind. The readers
+  // carve one atom per symbol offset, so per-function symbols are exactly what
+  // makes the linker able to drop an entry whose function it dropped.
+  // `emittedNames` is indexed in stackmap order, which is NOT module.funcs order
+  // once anything is skipped.
+  let smCodeRelocs = writeStackMaps(gc, stackmaps)
+  let smi = 0
+  while (smi < len(smCodeRelocs)) {
+    let smOff = smCodeRelocs[smi]
+    let smEnd = len(gc.bytes)
+    if (smi + 1 < len(smCodeRelocs)) {
+      smEnd = smCodeRelocs[smi + 1]
     }
+    symbols = append(symbols, emElfSym("__bitsm_${smi}", ElfSectionKind.GcMeta,
+      smOff, smEnd - smOff, ElfBinding.Local, ElfSymKind.Object))
+    defined["__bitsm_${smi}"] = true
+    // Offsets are already section-relative, and an entry starts with its
+    // codeAddr field — so the entry offset IS the reloc offset.
+    relocs = append(relocs, ElfRelocation{ section: ElfSectionKind.GcMeta,
+      offset: smOff, symbol: emittedNames[smi], kind: ElfRelocKind.Abs64,
+      addend: 0 })
+    smi = smi + 1
   }
 
   // ---- undefined externals (the runtime's bit_rt_* symbols) --------------
@@ -901,6 +910,7 @@ function emElfRelocArm64(k: RelocKind): ElfRelocKind {
 function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, freestanding: bool): []u8! {
   let code = newByteBuf()
   let rodata = newByteBuf()
+  let gc = newByteBuf()
   let symbols = []ElfSymbol(0)
   let relocs = []ElfRelocation(0)
   let defined = map<string, bool>{}
@@ -922,9 +932,6 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, fre
     if (!emitsFunction(f, freestanding)) {
       fi = fi + 1
       continue
-    }
-    if (freestanding && !freestandingEligible(f)) {
-      fail newError("--freestanding: '${f.name}' is neither @nosplit nor @naked; freestanding code carries no GC stack maps (SPEC §10.3)")
     }
     let fc = emCompileFor(module, f, isX64)
     let off = len(code.bytes)
@@ -1024,13 +1031,20 @@ function emitElfObject(module: IrModule, target: ElfTarget, withEntry: bool, fre
     tgi = tgi + 1
   }
 
-  let blobs = emitElfBlobs(module, rodata, symbols, relocs, defined, stackmaps,
+  let blobs = emitElfBlobs(module, rodata, gc, symbols, relocs, defined, stackmaps,
     emittedNames, freestanding)
   symbols = blobs.symbols
   relocs = blobs.relocs
 
   let sections = [ElfSection{ kind: ElfSectionKind.Text, data: code.bytes,
     size: 0, alignment: 16 }]
+  if (len(gc.bytes) > 0) {
+    // 1-aligned: the entries are tightly packed and the walk decodes them back
+    // to back, so any inter-atom padding the linker inserted would be read as an
+    // entry.
+    sections = append(sections, ElfSection{ kind: ElfSectionKind.GcMeta,
+      data: gc.bytes, size: 0, alignment: 1 })
+  }
   if (len(rodata.bytes) > 0) {
     sections = append(sections, ElfSection{ kind: ElfSectionKind.Rodata,
       data: rodata.bytes, size: 0, alignment: 8 })

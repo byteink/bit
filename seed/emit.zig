@@ -915,6 +915,9 @@ fn appendWord(list: *std.ArrayList(u8), gpa: Allocator, w: u32) !void {
 const testing = std.testing;
 const check = @import("check.zig");
 const elf_reader = @import("link/elf_reader.zig");
+const macho_reader = @import("link/macho_reader.zig");
+const object = @import("link/object.zig");
+const strip = @import("link/strip.zig");
 
 /// Appends a trivial `@nosplit` function named `name`, tagged as belonging (or
 /// not) to the root module — the two-module shape `lowerProject` produces when
@@ -1035,10 +1038,15 @@ test "emit: a globals section is at least as aligned as the cells it holds" {
     try testing.expect(saw_data);
 }
 
-test "emit: freestanding refuses a function that is neither @nosplit nor @naked" {
-    // §17.6: such a function needs a stack map, and a freestanding object has
-    // no `bit_stack_maps` to put one in. Emitting it anyway would leave a frame
-    // the collector cannot scan — silent wrongness, so it is a refusal.
+test "emit: a freestanding member carries its own stack maps, @nosplit or not" {
+    // ABI.md §4.1, and the reason this mode stopped constraining the runtime.
+    // §17.6 used to REFUSE a function that was neither `@nosplit` nor `@naked`,
+    // because a freestanding object carried no stack map and an unscannable
+    // frame is silent wrongness. That rule made `sched` unrepresentable:
+    // #1429/#1431 removed `@nosplit` from `schedWorkerRun` precisely so
+    // stop-the-world is sound. Now the member carries its own entries, so the
+    // requirement is gone at its root — asserted as a POSITIVE property (the
+    // entries exist) rather than merely as the absence of the old refusal.
     const gpa = testing.allocator;
     var ctx = try check.TypeContext.init(gpa);
     defer ctx.deinit();
@@ -1048,11 +1056,160 @@ test "emit: freestanding refuses a function that is neither @nosplit nor @naked"
     try testAppendFunc(gpa, &module, "managedFn", true);
     module.funcs.items[0].is_nosplit = false;
 
-    try testing.expectError(error.FreestandingSafepoint, emitObject(gpa, &module, false, true));
-    // Not freestanding: the very same module emits fine.
-    const obj = try emitObject(gpa, &module, false, false);
+    const obj = try emitObject(gpa, &module, false, true);
     defer gpa.free(obj);
     try testing.expect(try testObjectDefines(gpa, obj, "managedFn"));
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const mod = try elf_reader.read(arena_state.allocator(), .x86_64, "t.o", obj);
+    var entries: usize = 0;
+    for (mod.atoms) |atom| {
+        if (atom.kind == .gc_meta) entries += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), entries);
+}
+
+test "emit: the ELF reader classifies .bit_gc by NAME, not by flags" {
+    // THE TRAP this change is most likely to fall into, asserted through the
+    // object reader so it is target-INDEPENDENT and fails on any host.
+    //
+    // `.bit_gc` is ALLOC+PROGBITS, non-writable and non-executable, so
+    // `classify`'s flag rules land it on `.rodata` unless the name is checked
+    // first. Nothing about that failure is visible in the emitted object, in
+    // the link, or in any golden: the entries simply get interleaved with
+    // unrelated read-only atoms, the merged extent stops being contiguous, and
+    // the collector walks garbage between real entries. That is #1421's exact
+    // shape — correct on one container, wrong on the other, goldens green
+    // throughout — and the whole golden suite runs host-native, so it could
+    // never have caught the ELF half on this machine.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "a", true);
+    try testAppendFunc(gpa, &module, "b", true);
+    try testAppendFunc(gpa, &module, "c", true);
+
+    const obj = try emitObject(gpa, &module, false, true);
+    defer gpa.free(obj);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const mod = try elf_reader.read(arena_state.allocator(), .x86_64, "t.o", obj);
+
+    // One atom per FUNCTION, not one per module: this is what lets the linker
+    // drop an entry whose function it dropped, instead of retaining every
+    // runtime module wholesale in every image.
+    var entries: usize = 0;
+    for (mod.atoms) |atom| {
+        if (atom.kind != .gc_meta) continue;
+        entries += 1;
+        // 1-aligned, or the linker would pad between entries and the runtime
+        // would decode the padding as an entry.
+        try testing.expectEqual(@as(u32, 1), atom.alignment);
+        // Every entry names its function — the relocation the retention rule
+        // and the runtime's code_addr both read.
+        try testing.expectEqual(@as(usize, 1), atom.relocs.len);
+        try testing.expectEqual(object.RelocKind.abs64, atom.relocs[0].kind);
+    }
+    try testing.expectEqual(@as(usize, 3), entries);
+}
+
+test "emit: the Mach-O reader classifies __bit_gc by NAME, not by segment" {
+    // The Mach-O half of the trap above, and the one this host CAN run
+    // natively — `macho_reader.classify` returns `.data` for anything in
+    // `__DATA` unless the section name is tested first. Same silent failure:
+    // entries scattered among unrelated `__DATA` atoms, no diagnostic.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "a", true);
+    try testAppendFunc(gpa, &module, "b", true);
+
+    const obj = try emitMachoObject(gpa, &module, false, true);
+    defer gpa.free(obj);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const mod = try macho_reader.read(arena_state.allocator(), "t.o", obj);
+    var entries: usize = 0;
+    for (mod.atoms) |atom| {
+        if (atom.kind != .gc_meta) continue;
+        entries += 1;
+        try testing.expectEqual(@as(usize, 1), atom.relocs.len);
+    }
+    try testing.expectEqual(@as(usize, 2), entries);
+}
+
+test "link: the merged table is bounded by linker-defined markers only" {
+    // The property the merge exists for, asserted on the generic object model
+    // so it holds for BOTH containers. Two separate "archive members" each
+    // carrying entries must merge into ONE run: start marker, every retained
+    // entry, end marker — with nothing interleaved and no per-member
+    // terminator, which would stop the runtime's walk at the first member.
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two members, each: one kept function + its entry, one DEAD function +
+    // its entry. The dead entries must not survive — that is the retention
+    // rule, and force-keeping entries instead would drag both dead functions
+    // back in.
+    var mods: std.ArrayList(object.Module) = .empty;
+    for ([_][]const u8{ "m0", "m1" }) |mname| {
+        const atoms = try arena.alloc(object.Atom, 4);
+        const live = try std.fmt.allocPrint(arena, "{s}_live", .{mname});
+        const dead = try std.fmt.allocPrint(arena, "{s}_dead", .{mname});
+        atoms[0] = .{ .name = live, .kind = .text, .binding = .global, .data = &.{}, .size = 0, .alignment = 1, .relocs = &.{} };
+        atoms[1] = .{ .name = dead, .kind = .text, .binding = .global, .data = &.{}, .size = 0, .alignment = 1, .relocs = &.{} };
+        atoms[2] = .{ .name = "__bitsm_0", .kind = .gc_meta, .binding = .local, .data = &.{}, .size = 0, .alignment = 1, .relocs = try arena.dupe(object.Reloc, &.{.{ .offset = 0, .kind = .abs64, .target = .{ .local = 0 } }}) };
+        atoms[3] = .{ .name = "__bitsm_1", .kind = .gc_meta, .binding = .local, .data = &.{}, .size = 0, .alignment = 1, .relocs = try arena.dupe(object.Reloc, &.{.{ .offset = 0, .kind = .abs64, .target = .{ .local = 1 } }}) };
+        try mods.append(arena, .{ .name = mname, .atoms = atoms });
+    }
+    // The entry root reaches only each member's `_live`.
+    const rt = try arena.alloc(object.Atom, 1);
+    rt[0] = .{ .name = "_start", .kind = .text, .binding = .global, .data = &.{}, .size = 0, .alignment = 1, .relocs = try arena.dupe(object.Reloc, &.{
+        .{ .offset = 0, .kind = .abs64, .target = .{ .global = "m0_live" } },
+        .{ .offset = 8, .kind = .abs64, .target = .{ .global = "m1_live" } },
+    }) };
+    try mods.append(arena, .{ .name = "rt", .atoms = rt });
+
+    const marker_module: u32 = @intCast(mods.items.len);
+    try mods.append(arena, try strip.markerModule(arena, ""));
+    const all = mods.items;
+
+    var globals = try strip.resolveGlobals(arena, all);
+    var kept = try strip.deadStrip(arena, all, &globals, &.{ "_start", strip.stackmaps_start_symbol, strip.stackmaps_end_symbol });
+    defer kept.deinit(arena);
+    try strip.keepLiveStackMaps(arena, all, &globals, &kept);
+
+    const group = try strip.mergedStackMapAtoms(arena, all, &kept, marker_module);
+
+    // start marker + one entry per LIVE function (2) + end marker.
+    try testing.expectEqual(@as(usize, 4), group.len);
+    try testing.expectEqualStrings(strip.stackmaps_start_symbol, all[group[0].module].atoms[group[0].atom].name);
+    try testing.expectEqualStrings(strip.stackmaps_end_symbol, all[group[3].module].atoms[group[3].atom].name);
+    // The interior is entries from BOTH members — the single-member case
+    // cannot distinguish a working merge from a table that stops early.
+    try testing.expect(group[1].module != group[2].module);
+    for (group[1..3]) |id| {
+        const atom = all[id.module].atoms[id.atom];
+        try testing.expectEqual(object.SectionKind.gc_meta, atom.kind);
+        // Each surviving entry describes a KEPT function...
+        try testing.expect(kept.contains(try strip.resolveRef(&globals, id.module, atom.relocs[0].target)));
+    }
+    // ...and the dead functions stayed dead: retaining entries unconditionally
+    // would have resurrected them through their own relocations.
+    try testing.expect(!kept.contains(.{ .module = 0, .atom = 1 }));
+    try testing.expect(!kept.contains(.{ .module = 1, .atom = 1 }));
 }
 
 test "emit: pinned and mangled names are disjoint sets" {
