@@ -675,6 +675,13 @@ result type; the one place it must be spelled is when it carries `!` and so
 cannot be omitted, written `()` — chiefly `()!`, "returns nothing or an error"
 (§18.2). A bare `()` is thus a valid type only in result position.
 
+There is deliberately **no tuple literal expression**. `(a, b)` in expression
+position is a syntax error, not a tuple — `"(" expression ")"` is grouping (§12),
+and making it conditionally a constructor would make the meaning of parentheses
+depend on their contents. A tuple value is produced by a multi-value `return`
+(§13.1), which is the use case tuples exist for; anything that wants a named,
+constructible, mutable aggregate wants a struct.
+
 ### 11.1 Primitive Types
 
 - Signed integers: `i8 i16 i32 i64` (two's complement, defined wrap on overflow in
@@ -1352,6 +1359,13 @@ compile error.
 elements by index (the index is an `INT_LIT`, checked against the tuple arity).
 Method values are closures bound to their receiver.
 
+**Tuple elements are read-only.** `t.0` may be read but never assigned, so `t.0 =
+x` (and `t.0++`, `t.0 += x`) is a compile error. A tuple is a fixed group of
+values produced whole — by a multi-value `return` (§13.1) — and read whole or by
+element; to vary a member, build a new tuple or use a struct, which is what
+structs are for. This restriction is what lets tuples be a value type (§13.3)
+while being represented as a shared box.
+
 ### 12.6 Index and Slice
 
 - `s[i]` indexes a slice/array (`i` must be an integer; out-of-range **panics**,
@@ -1491,7 +1505,15 @@ defer_stmt    = "defer" call_expression .
   or is `void`; §18.3). A bare `a + b` statement is a compile error (guards
   against mistakes).
 - `return` with multiple expressions constructs a tuple result matching the tuple
-  result type.
+  result type. The tuple is built as a single value and returned as one (see
+  `runtime/ABI.md` §1.1); the arity and element types must match the declared
+  result type exactly.
+- A `member` lhs must select a **struct field**. A tuple element (`t.0`) is
+  read-only (§12.5) and is not a valid assignment target.
+- A `tuple_pat` lhs destructures a tuple-typed right-hand side positionally, or
+  reads one of the two-result forms (`m[k]`, `<- c`, `iface.(T)`, §12.6/§16/§14.7).
+  Its arity must match: a two-result form binds exactly two names, and a
+  tuple-typed rhs binds exactly the tuple's arity. `_` discards an element.
 
 ### 13.2 Assignment vs Declaration
 
@@ -1509,6 +1531,11 @@ determines copy semantics and is fixed:
 | Reference  | `string`, `[]T` slices, `map<K,V>`, `struct`, `interface`, `chan<T>`, function values | copy of the reference (shared underlying data) |
 
 `string` is a reference type but is deeply immutable, so sharing is unobservable.
+The same argument covers tuples from the other side: a tuple is a value type, but
+because its elements are read-only (§12.5) an implementation may share one heap
+box between copies without that being observable. The reference implementation
+does exactly that — see `runtime/ABI.md` §1.1, which also fixes the multi-value
+return ABI: `return a, b` builds one boxed tuple and returns a single handle.
 Structs are reference types (like TypeScript objects): assigning a struct copies
 the handle, and mutations through either handle are visible to both. To obtain an
 independent copy, define and call a `clone()` method. The zero value of every

@@ -186,6 +186,11 @@ fn alignUp(v: u32, a: u32) u32 {
     return (v + a - 1) / a * a;
 }
 
+fn allIdents(tree: *const ast.Tree, nodes: []const ast.Index) bool {
+    for (nodes) |n| if (tree.get(n).tag != .ident) return false;
+    return true;
+}
+
 pub const StructLayout = struct {
     size: u32,
     field_offsets: []const u32,
@@ -518,12 +523,25 @@ pub const Lowerer = struct {
         return gop.value_ptr.*;
     }
 
+    /// Body layout of a boxed aggregate — a struct, or a tuple, which is laid
+    /// out by exactly the same rules (ABI.md §1.1). A tuple carries no field
+    /// names, so its elements are lifted into anonymous `check.Field`s purely to
+    /// reuse `layoutFields`; nothing downstream reads those names.
     fn structLayout(self: *Lowerer, ty: TypeId) Error!StructLayout {
         const key: u32 = @intFromEnum(ty);
         if (self.layouts.get(key)) |l| return l;
         const data = self.ctx.typeOf(ty);
-        std.debug.assert(data == .@"struct");
-        const l = try layoutFields(self.gpa, self.ctx, data.@"struct");
+        std.debug.assert(data == .@"struct" or data == .tuple);
+        const l = switch (data) {
+            .@"struct" => |fields| try layoutFields(self.gpa, self.ctx, fields),
+            .tuple => |elems| blk: {
+                const fields = try self.gpa.alloc(check.Field, elems.len);
+                defer self.gpa.free(fields);
+                for (elems, 0..) |e, i| fields[i] = .{ .name = "", .ty = e, .exported = false };
+                break :blk try layoutFields(self.gpa, self.ctx, fields);
+            },
+            else => unreachable,
+        };
         try self.layouts.put(self.gpa, key, l);
         return l;
     }
@@ -620,7 +638,7 @@ pub const Lowerer = struct {
             err_ty = rdata.fallible.err;
         }
 
-        var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env };
+        var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env, .result_ty = result_ty };
         if (is_fallible) {
             fc.fallible_ok = result_ty;
             fc.fallible_err = err_ty;
@@ -688,7 +706,7 @@ pub const Lowerer = struct {
             try env.declare(self.gpa, c.name, fv, c.ty);
         }
 
-        var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env };
+        var fc: FnCtx = .{ .l = self, .gpa = self.gpa, .ctx = self.ctx, .b = &b, .env = &env, .file_idx = file_idx, .gen_env = gen_env, .result_ty = shape.result };
         defer fc.deinit();
 
         const body = k[1];
@@ -1116,6 +1134,12 @@ const FnCtx = struct {
     /// propagation returns, the err type for `?`/`catch` null-checks.
     fallible_ok: TypeId = .invalid,
     fallible_err: TypeId = .invalid,
+    /// The enclosing function's declared result type, already generic-substituted
+    /// and with any `!` unwrapped. `return a, b` boxes against *this* (ABI.md
+    /// §1.1) rather than a tuple re-interned from the element expressions: an
+    /// element may have widened to its declared type (an untyped literal being
+    /// the common case), and the callee's promise is what callers destructure.
+    result_ty: TypeId = .invalid,
     loop_stack: std.ArrayList(LoopCtx) = .empty,
     defers: std.ArrayList(DeferredCall) = .empty,
 
@@ -1397,6 +1421,34 @@ const FnCtx = struct {
         return self.b.typeInfoAddr(self.ctx.prim_ids.get(.u64), @intFromEnum(ty), layout.size, layout.ptr_offsets);
     }
 
+    /// Boxes `vals` into a fresh tuple record of type `tup_ty` (ABI.md §1.1).
+    /// Same shape as a struct composite literal — `gc_alloc` of the laid-out body
+    /// then one store per element — because a tuple *is* a struct without names.
+    fn buildTuple(self: *FnCtx, tup_ty: TypeId, vals: []const ir.ValueId) Error!ir.ValueId {
+        const layout = try self.l.structLayout(tup_ty);
+        const elems = self.ctx.typeOf(tup_ty).tuple;
+        std.debug.assert(elems.len == vals.len);
+        const obj = try self.b.gcAlloc(tup_ty, layout.size, layout.ptr_offsets);
+        for (vals, elems, 0..) |v, ety, i| {
+            // An `[N]T` element lives inline in the body (§11.2), so it is
+            // copied into place rather than stored as a handle.
+            if (self.ctx.typeOf(ety) == .array) {
+                const dst = try self.b.fieldGet(ety, obj, layout.field_offsets[i]);
+                try self.copyArrayElems(dst, v, self.arrayShape(ety));
+            } else {
+                try self.b.fieldSet(obj, layout.field_offsets[i], v);
+            }
+        }
+        return obj;
+    }
+
+    /// Reads element `idx` out of the boxed tuple `recv` (ABI.md §1.1).
+    fn tupleElem(self: *FnCtx, tup_ty: TypeId, recv: ir.ValueId, idx: usize) Error!ir.ValueId {
+        const layout = try self.l.structLayout(tup_ty);
+        const elems = self.ctx.typeOf(tup_ty).tuple;
+        return self.b.fieldGet(elems[idx], recv, layout.field_offsets[idx]);
+    }
+
     /// The two-result forms: `<- c` (SPEC §16.2), `m[k]` (§12.6), `iface.(T)`
     /// (§14.4). Null if `node` is none of them — the caller then has a plain
     /// single-value initializer and a tuple pattern it cannot destructure.
@@ -1445,25 +1497,63 @@ const FnCtx = struct {
         }
     }
 
-    /// `let (v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2).
+    /// `let (v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2), or the general
+    /// `let (a, b, ...) = <tuple>` destructure (§10.1).
+    ///
+    /// The two-result forms are tried first and only at arity 2: `m[k]` and
+    /// `<- c` are *not* tuple-typed, they are a value plus a separate presence
+    /// flag, so they can never fall through to the tuple path — and a
+    /// tuple-valued expression can never be mistaken for one.
     fn lowerTwoResultLet(self: *FnCtx, bk: []const ast.Index) Error!void {
         const pats = self.kids(bk[0]);
-        if (pats.len != 2 or bk[2] == ast.none) return error.UnsupportedConstruct;
-        for (pats) |p| if (self.tree().get(p).tag != .ident) return error.UnsupportedConstruct;
-        const two = try self.lowerTwoResult(bk[2]) orelse return error.UnsupportedConstruct;
-        try self.declareUnlessBlank(pats[0], two[0], try self.nodeType(bk[2]));
-        try self.declareUnlessBlank(pats[1], two[1], self.ctx.prim_ids.get(.bool));
+        if (bk[2] == ast.none) return error.UnsupportedConstruct;
+        if (pats.len == 2 and allIdents(self.tree(), pats)) {
+            if (try self.lowerTwoResult(bk[2])) |two| {
+                try self.declareUnlessBlank(pats[0], two[0], try self.nodeType(bk[2]));
+                try self.declareUnlessBlank(pats[1], two[1], self.ctx.prim_ids.get(.bool));
+                return;
+            }
+        }
+        const tup_ty = try self.nodeType(bk[2]);
+        const val = try self.lowerExpr(bk[2]);
+        try self.destructureTuple(pats, tup_ty, val);
+    }
+
+    /// Binds each of `pats` to the corresponding element of the boxed tuple
+    /// `val`, recursing into nested patterns (SPEC.md §10.1 `pat = IDENT | "_" |
+    /// tuple_pat`). Arity is checker-enforced; a mismatch here is refused rather
+    /// than read past the end of the layout.
+    fn destructureTuple(self: *FnCtx, pats: []const ast.Index, tup_ty: TypeId, val: ir.ValueId) Error!void {
+        const tdata = self.ctx.typeOf(tup_ty);
+        if (tdata != .tuple or tdata.tuple.len != pats.len) return error.UnsupportedConstruct;
+        for (pats, tdata.tuple, 0..) |p, ety, i| {
+            // `_` discards: skip the load entirely rather than emit a dead one.
+            if (self.tree().get(p).tag == .ident and std.mem.eql(u8, self.identText(p), "_")) continue;
+            const ev = try self.tupleElem(tup_ty, val, i);
+            try self.declareBinder(p, ev, ety);
+        }
     }
 
     /// `(v, ok) = <two-result>` (SPEC.md §12.6/§14.4/§16.2) — as above, but the
     /// two targets are existing lvalues rather than fresh bindings. Both are
     /// resolved before the right-hand side runs, matching plain `=`.
     fn lowerTwoResultAssign(self: *FnCtx, targets: []const ast.Index, init_node: ast.Index) Error!void {
-        if (targets.len != 2) return error.UnsupportedConstruct;
-        var lvs: [2]Lvalue = undefined;
+        // Every target is resolved before the right-hand side runs, matching
+        // plain `=`, in both the two-result and the tuple case.
+        const lvs = try self.gpa.alloc(Lvalue, targets.len);
+        defer self.gpa.free(lvs);
         for (targets, 0..) |t, i| lvs[i] = try self.resolveLvalue(t);
-        const two = try self.lowerTwoResult(init_node) orelse return error.UnsupportedConstruct;
-        for (lvs, two) |lv, v| try self.writeLvalue(lv, v);
+        if (targets.len == 2) {
+            if (try self.lowerTwoResult(init_node)) |two| {
+                for (lvs, two) |lv, v| try self.writeLvalue(lv, v);
+                return;
+            }
+        }
+        const tup_ty = try self.nodeType(init_node);
+        const tdata = self.ctx.typeOf(tup_ty);
+        if (tdata != .tuple or tdata.tuple.len != targets.len) return error.UnsupportedConstruct;
+        const val = try self.lowerExpr(init_node);
+        for (lvs, 0..) |lv, i| try self.writeLvalue(lv, try self.tupleElem(tup_ty, val, i));
     }
 
     /// `_` discards its value (SPEC.md §5) — binding it would shadow the next `_`.
@@ -1680,8 +1770,12 @@ const FnCtx = struct {
     }
 
     fn declareBinder(self: *FnCtx, node: ast.Index, value: ir.ValueId, ty: TypeId) Error!void {
-        if (self.tree().get(node).tag != .ident) return error.UnsupportedConstruct; // tuple binder: deferred
-        try self.env.declare(self.gpa, self.identText(node), value, ty);
+        // A nested `(a, b)` binder destructures the element it was bound to
+        // (SPEC.md §10.1), so a tuple of tuples unpacks in one `let`.
+        if (self.tree().get(node).tag == .tuple_pat)
+            return self.destructureTuple(self.kids(node), ty, value);
+        if (self.tree().get(node).tag != .ident) return error.UnsupportedConstruct;
+        try self.declareUnlessBlank(node, value, ty);
     }
 
     fn lowerReturn(self: *FnCtx, node: ast.Index) Error!void {
@@ -1691,6 +1785,30 @@ const FnCtx = struct {
         // Value semantics: returning an array from an existing location yields
         // an independent copy, so a caller cannot observe later mutation of a
         // local (and a returned local's storage is never aliased).
+        // `return a, b` builds one boxed tuple and returns a single handle
+        // (ABI.md §1.1) — a `ret` carries at most one value. Elements are lowered
+        // against the *declared* element types, not their own inferred ones: an
+        // untyped literal must widen to the element's width before it is stored,
+        // and an element declared as an interface needs the same boxing a
+        // single-value return would give it.
+        if (exprs.len > 1) {
+            const tup_ty = self.result_ty;
+            const tdata = self.ctx.typeOf(tup_ty);
+            // The checker rejects a multi-value return whose arity or element
+            // types do not match the declared tuple result, so a mismatch here is
+            // a checker bug rather than a program error — refuse instead of
+            // emitting a box of the wrong shape.
+            if (tdata != .tuple or tdata.tuple.len != exprs.len) return error.UnsupportedConstruct;
+            for (exprs, tdata.tuple, 0..) |e, ety, i| {
+                const raw = try self.arrayValueForBind(e, try self.lowerExprH(e, ety), ety);
+                vals[i] = try self.coerceToIface(raw, ety);
+            }
+            const boxed = try self.buildTuple(tup_ty, vals);
+            try self.runDefers();
+            if (self.fallible_err != .invalid) try self.clearErr();
+            try self.emitRet(&.{boxed});
+            return;
+        }
         for (exprs, 0..) |e, i| vals[i] = try self.arrayValueForBind(e, try self.lowerExpr(e), try self.nodeType(e));
         try self.runDefers();
         // A fallible function's ok return must leave the error slot null; clear
@@ -3537,7 +3655,19 @@ const FnCtx = struct {
                 const info = try self.typeInfoOf(ty);
                 break :blk self.rtCall(ty, .iface_assert, &.{ recv, info });
             },
-            else => error.UnsupportedConstruct, // tuple_index/map literals
+            // `t.0` — a field read at the element's offset in the boxed tuple
+            // (ABI.md §1.1). The checker has already range-checked the index
+            // against the tuple's arity (E0059).
+            .tuple_index => blk: {
+                const k = self.kids(node);
+                const tup_ty = try self.nodeType(k[0]);
+                if (self.ctx.typeOf(tup_ty) != .tuple) break :blk error.UnsupportedConstruct;
+                const idx = check.parseIntLiteral(self.spanText(k[1]));
+                if (idx < 0 or idx >= self.ctx.typeOf(tup_ty).tuple.len) break :blk error.UnsupportedConstruct;
+                const recv = try self.lowerExpr(k[0]);
+                break :blk self.tupleElem(tup_ty, recv, @intCast(idx));
+            },
+            else => error.UnsupportedConstruct, // map literals
         };
     }
 

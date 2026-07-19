@@ -155,6 +155,11 @@ struct FnCtx {
   // enclosing function returns `T!E`, else 0. `fail`/`?`/ok-return use these.
   fallibleOk: int,
   fallibleErr: int,
+  // The enclosing function's declared result type, generic-substituted with `!`
+  // unwrapped. `return a, b` boxes against this (ABI.md §1.1) rather than a
+  // tuple re-interned from the element expressions: an element may widen to its
+  // declared type, and the callee's promise is what callers destructure.
+  resultTy: int,
   // When lowering one monomorphization of a generic, that instantiation's
   // (type param -> concrete arg) bindings; empty otherwise. The body was checked
   // once against the template's unbound type params, so every body node's cached
@@ -2702,6 +2707,27 @@ function lowerExprH(fc: FnCtx, node: int, hint: int): int {
   if (tag == Tag.MatchStmt) {
     return lowerMatchExpr(fc, node)
   }
+  // `t.0` — a field read at the element's offset in the boxed tuple (ABI.md
+  // §1.1). The checker has already range-checked the index against the arity.
+  if (tag == Tag.TupleIndex) {
+    let tk = kidsOf(fc.c.tree, node)
+    let tupTy = nodeType(fc, tk[0])
+    if (tupTy == 0 || fc.c.ctx.types[tupTy].kind != TypeKind.Tuple) {
+      fc.failed = true
+      return 0
+    }
+    let idxNode = getNode(fc.c.tree, tk[1])
+    let idx = parseIntText(fc.c.source[idxNode.span.start:idxNode.span.end])
+    if (idx < 0 || idx >= len(fc.c.ctx.types[tupTy].members)) {
+      fc.failed = true
+      return 0
+    }
+    let recv = lowerExpr(fc, tk[0])
+    if (fc.failed) {
+      return 0
+    }
+    return tupleElem(fc, tupTy, recv, idx)
+  }
   fc.failed = true
   return 0
 }
@@ -2799,25 +2825,138 @@ function declareUnlessBlank(fc: FnCtx, patNode: int, val: int, ty: int) {
   fc.c.env[name] = ty
 }
 
-// `let (v, ok) = <two-result>`: destructure the value/ok pair into the two
-// binders (each `_`-aware).
+// The body layout of a boxed tuple (ABI.md §1.1) — a tuple is laid out exactly
+// like a struct, so its element types go straight to `layoutFields`.
+function tupleLayout(fc: FnCtx, ty: int): StructLayout {
+  return layoutFields(fc, fc.c.ctx.types[ty].members)
+}
+
+// Boxes `vals` into a fresh tuple record of type `tupTy` (ABI.md §1.1): the same
+// `gc_alloc` + one store per element that a struct composite literal emits,
+// because a tuple is a struct without names.
+function buildTuple(fc: FnCtx, tupTy: int, vals: []int): int {
+  let layout = tupleLayout(fc, tupTy)
+  let ga = mkInstr(Op.GcAlloc, tupTy)
+  ga.ival = layout.size
+  ga.offsets = layout.ptrOffsets
+  let obj = builderEmit(fc.b, ga)
+  let i = 0
+  while (i < len(vals)) {
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = obj
+    fs.ival = layout.offsets[i]
+    fs.rhs = vals[i]
+    builderEmit(fc.b, fs)
+    i = i + 1
+  }
+  return obj
+}
+
+// Reads element `idx` out of the boxed tuple `recv` (ABI.md §1.1).
+function tupleElem(fc: FnCtx, tupTy: int, recv: int, idx: int): int {
+  let layout = tupleLayout(fc, tupTy)
+  let fg = mkInstr(Op.FieldGet, fc.c.ctx.types[tupTy].members[idx])
+  fg.lhs = recv
+  fg.ival = layout.offsets[idx]
+  return builderEmit(fc.b, fg)
+}
+
+// Binds each of `pats` to the corresponding element of the boxed tuple `val`,
+// recursing into nested patterns (SPEC §10.1 `pat = IDENT | "_" | tuple_pat`).
+// Arity is checker-enforced; a mismatch is refused rather than read past the end
+// of the layout.
+function destructureTuple(fc: FnCtx, pats: []int, tupTy: int, val: int) {
+  if (tupTy == 0 || fc.c.ctx.types[tupTy].kind != TypeKind.Tuple) {
+    fc.failed = true
+    return
+  }
+  let members = fc.c.ctx.types[tupTy].members
+  if (len(members) != len(pats)) {
+    fc.failed = true
+    return
+  }
+  let i = 0
+  while (i < len(pats)) {
+    let pn = getNode(fc.c.tree, pats[i])
+    if (pn.tag == Tag.TuplePat) {
+      destructureTuple(fc, kidsOf(fc.c.tree, pats[i]), members[i], tupleElem(fc, tupTy, val, i))
+      if (fc.failed) {
+        return
+      }
+    } else {
+      // `_` discards: skip the load entirely rather than emit a dead one.
+      if (fc.c.source[pn.span.start:pn.span.end] != "_") {
+        declareUnlessBlank(fc, pats[i], tupleElem(fc, tupTy, val, i), members[i])
+      }
+    }
+    i = i + 1
+  }
+}
+
+// `let (v, ok) = <two-result>` (SPEC §12.6/§14.4/§16.2), or the general
+// `let (a, b, ...) = <tuple>` destructure (§10.1).
+//
+// The two-result forms are tried first and only at arity 2: `m[k]` and `<- c`
+// are not tuple-typed — they are a value plus a separate presence flag — so they
+// can never fall through to the tuple path, and a tuple can never be mistaken
+// for one.
 function lowerTwoResultLet(fc: FnCtx, binding: int) {
   let bk = kidsOf(fc.c.tree, binding)
   let pats = kidsOf(fc.c.tree, bk[0])
-  if (len(pats) != 2 || bk[2] == 0) {
+  if (bk[2] == 0) {
     fc.failed = true
     return
   }
-  let two = lowerTwoResult(fc, bk[2])
+  if (len(pats) == 2 && allIdentPats(fc, pats)) {
+    let two = lowerTwoResult(fc, bk[2])
+    if (fc.failed) {
+      return
+    }
+    if (len(two) == 2) {
+      declareUnlessBlank(fc, pats[0], two[0], nodeType(fc, bk[2]))
+      declareUnlessBlank(fc, pats[1], two[1], primType(fc.c.ctx, 10))
+      return
+    }
+  }
+  let tupTy = nodeType(fc, bk[2])
+  let val = lowerExpr(fc, bk[2])
   if (fc.failed) {
     return
   }
-  if (len(two) != 2) {
+  destructureTuple(fc, pats, tupTy, val)
+}
+
+// Rebinds an existing local destructuring target to `val`. `_` discards, so it
+// names no slot to rebind.
+function assignEnvSlot(fc: FnCtx, target: int, val: int) {
+  let tn = getNode(fc.c.tree, target)
+  if (tn.tag != Tag.Ident) {
     fc.failed = true
     return
   }
-  declareUnlessBlank(fc, pats[0], two[0], nodeType(fc, bk[2]))
-  declareUnlessBlank(fc, pats[1], two[1], primType(fc.c.ctx, 10))
+  let name = fc.c.source[tn.span.start:tn.span.end]
+  if (name == "_") {
+    return
+  }
+  let ix = envIndex(fc, name)
+  if (ix == -1) {
+    fc.failed = true
+    return
+  }
+  fc.env[ix].value = val
+}
+
+// True when every pattern is a plain identifier (so the two-result shape, which
+// binds exactly two names, applies).
+function allIdentPats(fc: FnCtx, pats: []int): bool {
+  let i = 0
+  while (i < len(pats)) {
+    if (getNode(fc.c.tree, pats[i]).tag != Tag.Ident) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
 }
 
 // Emits a `type_info` for struct type `ty`: `disc` is the type id, `size` and
@@ -3883,23 +4022,39 @@ function lowerAssign(fc: FnCtx, node: int) {
       if (fc.failed) {
         return
       }
-      if (len(two) != 2) {
-        fc.failed = true
-        return
-      }
-      let t = 0
-      while (t < 2) {
-        let tn = getNode(fc.c.tree, targets[t])
-        if (tn.tag == Tag.Ident && fc.c.source[tn.span.start:tn.span.end] != "_") {
-          let ix = envIndex(fc, fc.c.source[tn.span.start:tn.span.end])
-          if (ix == -1) {
-            fc.failed = true
+      if (len(two) == 2) {
+        let t = 0
+        while (t < 2) {
+          assignEnvSlot(fc, targets[t], two[t])
+          if (fc.failed) {
             return
           }
-          fc.env[ix].value = two[t]
+          t = t + 1
         }
-        t = t + 1
+        return
       }
+    }
+    // `a, b = f()` / `(a, b) = f()` where `f` returns a tuple (SPEC §13.1): one
+    // value spread positionally over the targets.
+    if (len(targets) > 1) {
+      let tupTy = nodeType(fc, rhsItems[0])
+      if (tupTy != 0 && fc.c.ctx.types[tupTy].kind == TypeKind.Tuple &&
+          len(fc.c.ctx.types[tupTy].members) == len(targets)) {
+        let val = lowerExpr(fc, rhsItems[0])
+        if (fc.failed) {
+          return
+        }
+        let ti = 0
+        while (ti < len(targets)) {
+          assignEnvSlot(fc, targets[ti], tupleElem(fc, tupTy, val, ti))
+          if (fc.failed) {
+            return
+          }
+          ti = ti + 1
+        }
+        return
+      }
+      fc.failed = true
       return
     }
   }
@@ -4733,8 +4888,40 @@ function lowerStmt(fc: FnCtx, node: int) {
       fc.terminated = true
       return
     }
-    if (len(vals) != 1) {
-      fc.failed = true
+    // `return a, b` builds one boxed tuple and returns a single handle (ABI.md
+    // §1.1) — a `ret` carries at most one value. Elements are lowered against the
+    // DECLARED element types: an untyped literal must widen to the element's
+    // width before it is stored into the box, unlike a single-value return where
+    // the ret register absorbs the difference.
+    if (len(vals) > 1) {
+      let tupTy = fc.resultTy
+      if (tupTy == 0 || fc.c.ctx.types[tupTy].kind != TypeKind.Tuple) {
+        fc.failed = true
+        return
+      }
+      let members = fc.c.ctx.types[tupTy].members
+      if (len(members) != len(vals)) {
+        fc.failed = true
+        return
+      }
+      let elems = []int(0)
+      let ei = 0
+      while (ei < len(vals)) {
+        elems = append(elems, arrayValueForBind(fc, vals[ei], lowerExprH(fc, vals[ei], members[ei]), members[ei]))
+        if (fc.failed) {
+          return
+        }
+        ei = ei + 1
+      }
+      let boxed = buildTuple(fc, tupTy, elems)
+      runDefers(fc)
+      if (fc.fallibleErr != 0) {
+        clearErr(fc)
+      }
+      let rt = mkInstr(Op.Ret, fc.c.ctx.voidId)
+      rt.args = [boxed]
+      builderEmit(fc.b, rt)
+      fc.terminated = true
       return
     }
     // The seed materializes a returned literal at its default type (not the
@@ -4986,7 +5173,7 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   builderBeginBlock(b, entry)
   let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false,
     loops: []LoopFrame(0), moduleConsts: moduleConsts, lowerer: lowerer, defers: []IrInstr(0),
-    fallibleOk: fallibleOk, fallibleErr: fallibleErr, genEnv: genEnv }
+    fallibleOk: fallibleOk, fallibleErr: fallibleErr, genEnv: genEnv, resultTy: result }
   // Bind params (receiver first, if any) to their block-param value ids. The
   // checker's env is flat across the whole module, so a later function's
   // same-named param can have overwritten this one's type; rebind ours here so
@@ -5089,7 +5276,7 @@ function lowerClosureBody(fc: FnCtx, node: int, closureTy: int, capNames: []stri
   builderBeginBlock(b, entry)
   let cfc = FnCtx{ c: fc.c, b: b, env: []LocalBind(0), failed: false, terminated: false,
     loops: []LoopFrame(0), moduleConsts: fc.moduleConsts, lowerer: fc.lowerer, defers: []IrInstr(0),
-    fallibleOk: 0, fallibleErr: 0, genEnv: fc.genEnv }
+    fallibleOk: 0, fallibleErr: 0, genEnv: fc.genEnv, resultTy: ft.result }
   let envParam = builderAddParam(b, closureTy)
   let allParams = [closureTy]
   let pnodes = kidsOf(fc.c.tree, k[0])

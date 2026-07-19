@@ -51,6 +51,48 @@ offset  size  field
   any safepoint between allocation and field initialization, and tracing must
   never follow an uninitialized slot.
 
+### 1.1 Aggregates and multi-value returns
+
+A **tuple is a boxed managed record**, laid out by exactly the same rules as a
+struct: elements in declaration order, each aligned to its own size, `[N]T`
+elements inlined, body size rounded up to 8, and every element holding a GC
+reference listed in the type's `ptr_offsets` (§2). A tuple's `TypeInfo` is keyed
+by its `TypeId` like any other type, so two tuples with identical element types
+are the same type and share one descriptor. Codegen sees a tuple exactly as it
+sees a struct: one 8-byte traced handle.
+
+**A `ret` therefore carries at most one value.** `return a, b` in a function
+whose result type is `(A, B)` allocates a 2-element tuple record, stores the
+elements into it, and returns that single reference. Destructuring
+(`let (a, b) = f()`) and element access (`t.0`) read the elements back with
+ordinary field loads at the layout's offsets.
+
+**Why this and not a register pair or a hidden out-pointer.** Both alternatives
+would change the calling convention — the caller/callee register contract, the
+stack-map shape at call sites (§4), and every backend's prologue/epilogue — to
+buy nothing the boxed form does not already provide. The boxed form needs **zero
+calling-convention change**: it reuses `gc_alloc` + `field_set` / `field_get`,
+which are already exercised by every struct in the language, and it inherits
+correct GC tracing for free because the tuple's `ptr_offsets` describes its
+elements the same way a struct's does. A register pair would additionally need a
+rule for tuples wider than the return-register budget, reintroducing a spill path
+that the boxed form never has. The cost is one allocation per multi-value return;
+that is the same cost a struct return already pays, and it is the price of the
+uniform "every aggregate is one traced handle" model this ABI is built on.
+
+This is not a new constraint being imposed on codegen — it is the contract
+codegen already implements. All four backends refuse a multi-value `ret` today
+(`seed/codegen/x64.zig` `emitRet`, `seed/codegen/arm64.zig` `.ret`,
+`selfhost/x64.bit` `xEmitRet`, `selfhost/arm64.bit` `Op.Ret`). Boxing in the
+lowerer is what makes that refusal unreachable rather than what works around it.
+
+**Element mutability.** Tuple elements are **read-only** (SPEC §12.5): `t.0` may
+be read but not assigned. That is what keeps the boxed representation faithful to
+the value semantics SPEC §13.3 declares for tuples — with no way to mutate an
+element, a shared box is indistinguishable from a copy, the same argument the
+spec already makes for `string`. Boxing a *mutable* tuple would silently convert
+a declared value type into a reference type.
+
 ---
 
 ## 2. Per-type pointer maps (`TypeInfo`)

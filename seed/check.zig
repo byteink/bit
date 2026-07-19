@@ -4290,6 +4290,22 @@ const Checker = struct {
         return null;
     }
 
+    /// The element types of `node` if it is a tuple of exactly `arity` elements
+    /// (SPEC §13.1). Null otherwise — including a tuple of the wrong arity, which
+    /// the caller reports in its own terms rather than as "not a tuple".
+    ///
+    /// Checking runs here even when a preceding `twoResultOf` returned null, the
+    /// same fall-through `checkBinding` already performs for `let (a, b) = ...`.
+    /// Matching that path is deliberate: the two destructuring forms should agree
+    /// on how a right-hand side is typed, and diverging here would give `let` and
+    /// `=` different diagnostics for the same expression.
+    fn tupleElemsOf(self: *Checker, file_idx: usize, node: ast.Index, arity: usize, fctx: FnCtx) Error!?[]const TypeId {
+        const ty = try self.checkExpr(file_idx, node, fctx.env, fctx, .invalid);
+        const data = self.ctx.typeOf(ty);
+        if (data != .tuple or data.tuple.len != arity) return null;
+        return data.tuple;
+    }
+
     // ---- bindings (`let`/`const`, top-level and local, §10.1) ---------------
 
     fn checkBinding(self: *Checker, file_idx: usize, idx: ast.Index, is_const: bool, is_top: bool, fctx: FnCtx) Error!void {
@@ -4441,6 +4457,14 @@ const Checker = struct {
 
     fn checkAssignableLhs(self: *Checker, file_idx: usize, node: ast.Index) Error!void {
         const mf = self.files[file_idx];
+        // A tuple element is read-only (SPEC §12.5). That restriction is what
+        // lets a tuple be a value type (§13.3) while being represented as one
+        // shared box (ABI.md §1.1): with no way to mutate an element, the box is
+        // indistinguishable from a copy.
+        if (mf.tree.get(node).tag == .tuple_index) {
+            try self.emit(mf, node, .immutable_assignment, "cannot assign to a tuple element: tuple elements are read-only; use a struct for a mutable field", .{}, null);
+            return;
+        }
         if (mf.tree.get(node).tag != .ident) return; // index/member lvalues: mutability is the receiver's, not a binding
         const gsym = self.nodeSymbol(file_idx, node) orelse return;
         const sym = self.symbolOf(gsym);
@@ -4671,6 +4695,17 @@ const Checker = struct {
             }
         }
 
+        // `a, b = f()` where `f` returns a tuple (SPEC §13.1): one rhs value
+        // spread positionally over several targets. Distinct from the two-result
+        // forms above, which are not tuple-typed, and tried after them so an
+        // arity-2 `m[k]` keeps its `ok` meaning.
+        if (lhs_items.len > 1 and rhs_items.len == 1) {
+            if (try self.tupleElemsOf(file_idx, rhs_items[0], lhs_items.len, fctx)) |elems| {
+                for (lhs_items, elems) |t, ety| try self.assignTo(file_idx, t, ety, fctx);
+                return;
+            }
+        }
+
         // The same thing parenthesized — `(v, ok) = m[k]`. The parser folds a
         // parenthesized target list into one `tuple_pat`, so both targets arrive
         // as a single lhs item and the arity check below would wave it through
@@ -4684,7 +4719,11 @@ const Checker = struct {
                     return;
                 }
             }
-            try self.emit(mf, node, .type_mismatch, "destructuring assignment needs a two-result form on the right: 'm[k]', '<- c', or 'iface.(T)'", .{}, null);
+            if (try self.tupleElemsOf(file_idx, rhs_items[0], targets.len, fctx)) |elems| {
+                for (targets, elems) |t, ety| try self.assignTo(file_idx, t, ety, fctx);
+                return;
+            }
+            try self.emit(mf, node, .type_mismatch, "destructuring assignment needs a tuple or a two-result form on the right: a tuple-returning call, 'm[k]', '<- c', or 'iface.(T)'", .{}, null);
             return;
         }
 
