@@ -2770,6 +2770,15 @@ const FnCtx = struct {
         // to a runtime call whose result the checker already typed. The arity and
         // operand types were enforced there (`check.zig`'s `prim_sigs`), so the
         // args lower generically.
+        // Primitives that ARE a machine instruction rather than a runtime
+        // call. Checked first, and single-operand by construction, so they
+        // never reach `primRtFn`. See `primUnaryOp`.
+        if (primUnaryOp(name)) |uop| {
+            const vals = try self.lowerArgs(args_node);
+            defer self.gpa.free(vals);
+            std.debug.assert(vals.len == 1); // arity fixed by check.zig's `prim_sigs`
+            return self.b.unary(uop, try self.nodeType(node), vals[0]);
+        }
         if (primRtFn(name)) |rt| {
             const vals = try self.lowerArgs(args_node);
             defer self.gpa.free(vals);
@@ -2777,6 +2786,28 @@ const FnCtx = struct {
         }
         return error.UnsupportedConstruct; // close: deferred
     }
+
+    /// Name -> inline unary op for the primitives that are one hardware
+    /// instruction on every backend. These deliberately do NOT appear in
+    /// `prim_rt_fns`: an `rt_call` is a call, and a call is exactly what makes
+    /// the corresponding `bit_rt_*` function unimplementable in Bit — its body
+    /// would compile to a call to itself (`tests/rootpins.zig`). Being ops also
+    /// makes them pure (foldable, dead-code-eliminable) and safepoint-free,
+    /// which is what admits them inside `@nosplit` (see `check.zig`).
+    ///
+    /// `ffloor`/`fceil`/`ftrunc`/`fround` are NOT here: they are one instruction
+    /// on AArch64 (`frintm`/`frintp`/`frintz`/`frinta`) but the x86-64 baseline
+    /// this compiler emits for is plain `x86_64` — SSE2, with no `roundsd`
+    /// (SSE4.1). They stay runtime calls until that is resolved.
+    fn primUnaryOp(name: []const u8) ?ir.Op {
+        return prim_unary_ops.get(name);
+    }
+
+    const prim_unary_ops = std.StaticStringMap(ir.Op).initComptime(.{
+        .{ "fsqrt", ir.Op.fsqrt },
+        .{ "floatBits", ir.Op.bitcast },
+        .{ "float32Bits", ir.Op.bitcast },
+    });
 
     /// Name -> runtime call for the fixed-arity primitive builtins. Mirrors
     /// `check.zig`'s `prim_sigs`, which types them; a primitive missing from
@@ -2809,7 +2840,6 @@ const FnCtx = struct {
         .{ "netUdpSenderHost", ir.RtFn.net_udp_sender_host },
         .{ "netUdpSenderPort", ir.RtFn.net_udp_sender_port },
         .{ "netResolve", ir.RtFn.net_resolve },
-        .{ "fsqrt", ir.RtFn.sqrt },
         .{ "ffloor", ir.RtFn.floor },
         .{ "fceil", ir.RtFn.ceil },
         .{ "fround", ir.RtFn.round },
@@ -2834,8 +2864,6 @@ const FnCtx = struct {
         .{ "osRunTest", ir.RtFn.os_run_test },
         .{ "hostTarget", ir.RtFn.host_target },
         .{ "auxv", ir.RtFn.auxv },
-        .{ "floatBits", ir.RtFn.float_bits },
-        .{ "float32Bits", ir.RtFn.float32_bits },
     });
 
     /// `append(s, e1, e2, ...)`: folds each element through `slice_append`,

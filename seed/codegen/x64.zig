@@ -835,6 +835,31 @@ const Ctx = struct {
         try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
     }
 
+    /// `movq r64, xmm` (width 8) or `movd r32, xmm` (width 4) — the inverse
+    /// transfer, reading a float's raw bits back into a GPR (`floatBits`).
+    /// Opcode `0F 7E` with the `66` prefix; note the operand order is the
+    /// reverse of `movXG`'s — the XMM register is the ModRM *reg* field and the
+    /// GPR the *r/m* field, so the two arguments swap places in `modrmRegByte`.
+    /// `movd r32, xmm` writes the 32-bit register, which zero-extends to 64.
+    /// SSE2, like every other float instruction this backend emits.
+    fn movGX(self: *Ctx, dst: Reg, src: XReg, width: u8) !void {
+        try self.emitByte(0x66);
+        try self.maybeRex(width == 8, @intFromEnum(src) >= 8, false, @intFromEnum(dst) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x7E);
+        try self.emitByte(modrmRegByte(@intFromEnum(src), @intFromEnum(dst)));
+    }
+
+    /// `sqrtsd xmm, xmm` (width 8) / `sqrtss` (width 4) — SSE2, IEEE-exact and
+    /// correctly rounded, so no libm and no runtime call.
+    fn sqrtF(self: *Ctx, dst: XReg, src: XReg, width: u8) !void {
+        try self.emitByte(fPrefix(width));
+        try self.maybeRex(false, @intFromEnum(dst) >= 8, false, @intFromEnum(src) >= 8);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x51);
+        try self.emitByte(modrmRegByte(@intFromEnum(dst), @intFromEnum(src)));
+    }
+
     // ---- integer width conversion (movsx/movzx/movsxd) ----------------------
     // Each re-represents `reg`'s low `width` bytes as a full 64-bit value: sign-
     // extend (signed) or zero-extend (unsigned). Used by `emitConvert` (§12.9).
@@ -1381,6 +1406,22 @@ fn emitFneg(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
     try self.xorpX(fscratch1, fscratch1, width);
     try self.fArithRR(.sub, fscratch1, v, width);
     try putFloat(self, dst, fscratch1);
+}
+
+/// `fsqrt(x)` — one instruction, no call.
+fn emitFsqrt(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    try self.sqrtF(fscratch1, v, width);
+    try putFloat(self, dst, fscratch1);
+}
+
+/// `floatBits`/`float32Bits` — a register-class transfer, not a conversion.
+/// `width` is the OPERAND's float width (the result is the same-width unsigned
+/// integer view, so the result type carries no float width to read).
+fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    try self.movGX(scratch1, v, width);
+    try putInt(self, dst, scratch1);
 }
 
 /// `const_string` loads the address of its static string header (`__bitstr_N`,
@@ -2448,6 +2489,8 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .neg, .bnot => try emitUnaryInt(self, op, dst, d.un.operand, iw),
         .convert => try emitConvert(self, dst, d.un.operand, ty),
         .fneg => try emitFneg(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
+        .fsqrt => try emitFsqrt(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
+        .bitcast => try emitBitcast(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
         .icmp_eq, .icmp_ne, .icmp_slt, .icmp_sle, .icmp_sgt, .icmp_sge, .icmp_ult, .icmp_ule, .icmp_ugt, .icmp_uge => try emitIcmp(self, op, dst, d.bin.lhs, d.bin.rhs),
         .fcmp_eq, .fcmp_ne, .fcmp_lt, .fcmp_le, .fcmp_gt, .fcmp_ge => try emitFcmp(self, op, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), self.f.valueType(d.bin.lhs)).bytes),
         .jump => try emitJump(self, d.jump.target, d.jump.args),

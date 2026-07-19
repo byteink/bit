@@ -5365,7 +5365,23 @@ const Checker = struct {
                     if (sym.kind == .builtin_func)
                         break :blk atomicArity(sym.name) != null or
                             std.mem.eql(u8, sym.name, "entryOf") or
-                            std.mem.eql(u8, sym.name, "ptrOf");
+                            std.mem.eql(u8, sym.name, "ptrOf") or
+                            // `fsqrt`/`floatBits`/`float32Bits` join on the same
+                            // proof, and the proof is the reason rather than the
+                            // convenience: each lowers to a single inline machine
+                            // instruction (`ir.Op.fsqrt`/`ir.Op.bitcast`, never an
+                            // `rt_call`), so like the atomics it can neither
+                            // allocate nor reach a safepoint. Refusing them would
+                            // repeat the contradiction this carve-out exists to
+                            // avoid — the runtime's own float helpers are
+                            // nosplit-by-nature, and these primitives are exactly
+                            // what implements them. `ffloor`/`fceil`/`ftrunc`/
+                            // `fround` are deliberately absent: they are still
+                            // `rt_call`s on x86-64 (SSE2 baseline, no `roundsd`),
+                            // so the proof does not hold for them.
+                            std.mem.eql(u8, sym.name, "fsqrt") or
+                            std.mem.eql(u8, sym.name, "floatBits") or
+                            std.mem.eql(u8, sym.name, "float32Bits");
                     // A call whose callee names a builtin TYPE is a conversion
                     // (§12.9), not a call. A conversion between NUMERIC prims —
                     // including `int(p)`, a raw pointer's address (§11.4) — is

@@ -763,6 +763,12 @@ const Ctx = struct {
     fn fnegF(self: *Ctx, dst: FReg, src: FReg, width: u8) !void {
         try self.fp1Source(0b000010, width, dst, src);
     }
+    /// `FSQRT Dd, Dn` — the same "floating-point data-processing (1 source)"
+    /// group as FMOV/FNEG above, opcode `000011`. IEEE-exact and correctly
+    /// rounded in hardware, so it needs no libm and no runtime call.
+    fn fsqrtF(self: *Ctx, dst: FReg, src: FReg, width: u8) !void {
+        try self.fp1Source(0b000011, width, dst, src);
+    }
 
     /// `FCMP Dn, Dm` (floating-point compare, register form) — sets NZCV
     /// per the module doc comment's condition-code derivation.
@@ -1351,6 +1357,30 @@ fn emitFneg(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
     const v = try getFloat(self, vregOf(self, operand), fscratch1);
     try self.fnegF(fscratch1, v, width);
     try putFloat(self, dst, fscratch1);
+}
+
+/// `fsqrt(x)` — one instruction, no call. `width` is the float width, which is
+/// both the operand's and the result's.
+fn emitFsqrt(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    try self.fsqrtF(fscratch1, v, width);
+    try putFloat(self, dst, fscratch1);
+}
+
+/// `floatBits`/`float32Bits` — a register-class transfer, not a conversion:
+/// `FMOV Xd, Dn` (width 8) or `FMOV Wd, Sn` (width 4) moves the bits verbatim.
+/// The width comes from the OPERAND's float type. The result is `u64`/`u32` of
+/// the same width by construction (f64->u64, f32->u32), so today reading it
+/// from the result instead is exactly equivalent — mutation-tested, and it
+/// changes nothing. The operand is still the honest source: it is the value
+/// actually being moved, and it stays correct if a later primitive ever pairs
+/// widths differently. `FMOV Wd, Sn` writes the 32-bit W view, which
+/// zero-extends into X — the canonical form this backend keeps narrow unsigned
+/// values in.
+fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    try self.fmovFromFp(scratch1, v, width);
+    try putInt(self, dst, scratch1);
 }
 
 fn emitConstInt(self: *Ctx, dst: u32, val: i64) !void {
@@ -1968,6 +1998,10 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
             .neg, .bnot => try emitUnaryInt(self, op, i, u.operand, iw),
             .convert => try emitConvert(self, i, u.operand, ty),
             .fneg => try emitFneg(self, i, u.operand, iw.bytes),
+            .fsqrt => try emitFsqrt(self, i, u.operand, iw.bytes),
+            // Operand width, not `iw`: this op's result is the integer view, so
+            // the result type carries no float width to read.
+            .bitcast => try emitBitcast(self, i, u.operand, common.widthOf(self.tctx(), self.f.valueType(u.operand)).bytes),
             else => unreachable,
         },
         .jump => |j| {

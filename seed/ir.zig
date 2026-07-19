@@ -337,6 +337,21 @@ pub const Op = enum {
     neg,
     fneg,
     bnot,
+    /// `fsqrt(x)` (SPEC §17): IEEE square root. An *op*, not an `rt_call`, for
+    /// the reason the atomics are: it is one hardware instruction on every
+    /// backend (`fsqrt` on AArch64, `sqrtsd`/`sqrtss` — SSE2 — on x86-64), so
+    /// it can neither allocate nor reach a safepoint. That is not a peephole:
+    /// while it lowered to a call to `bit_rt_sqrt`, no Bit implementation of
+    /// `bit_rt_sqrt` could exist, because its body would be a call to itself
+    /// (see `tests/rootpins.zig`).
+    fsqrt,
+    /// `floatBits(f64) -> u64` / `float32Bits(f32) -> u32` (SPEC §17): reinterpret
+    /// a float's storage as an unsigned integer of the same width. Purely a
+    /// register-class transfer (`fmov` on AArch64, `movq`/`movd` on x86-64) —
+    /// no value is converted, unlike `convert`, which is numeric. Widths come
+    /// from the operand's and result's own recorded types, exactly as `convert`
+    /// derives its conversion.
+    bitcast,
 
     // ---- numeric conversion (unary shape: extra = [src]) -----------------
     // `T(x)` (SPEC §12.9): the result type is the target prim, the operand's
@@ -476,7 +491,7 @@ pub const Op = enum {
 
     pub fn isUnary(self: Op) bool {
         return switch (self) {
-            .neg, .fneg, .bnot => true,
+            .neg, .fneg, .bnot, .fsqrt, .bitcast => true,
             else => false,
         };
     }
