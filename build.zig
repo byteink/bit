@@ -376,22 +376,14 @@ pub fn build(b: *std.Build) void {
     diffimports_run.has_side_effects = true;
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
     //
-    // DELIBERATELY NOT ON `test_step` YET. This gate is RED on the current tree
-    // because the defect it detects is still present: self-hosted `lowerCall`
-    // tests the predeclared builtins against the callee's source text before
-    // consulting the resolved declaration, so a user `extern function close`
-    // lowers to `bit_rt_chan_close`. Fixing that is a precedence restructure of
-    // `lowerCall` (local binding > user declaration > builtin, the order the
-    // seed gets from `env.lookup`/`nodeSymbol`), tracked on #1436.
-    //
-    // It is committed unwired rather than withheld so the gate is reviewable and
-    // runnable now, and so the divergence is recorded instead of remaining
-    // invisible. Adding `test_step.dependOn(&diffimports_run.step);` here is the
-    // LAST line of #1436's fix — the gate is green the moment the precedence is
-    // right, verified by applying the fix locally (see the task's mutation
-    // evidence). Wiring it before then would only turn the shared suite red for
-    // every other agent working in this tree.
+    // Now WIRED (#1436 fixed). It was committed unwired because it was red while
+    // the defect was present — self-hosted `lowerCall`/`checkCall`/`vCall` tested
+    // the predeclared builtins against the callee's SOURCE TEXT before consulting
+    // the resolved declaration, so a user `extern function close` lowered to
+    // `bit_rt_chan_close`. All four sites now use the seed's precedence (local
+    // binding > user declaration > builtin), and the gate is green.
     b.step("diffimports", "Import-set differential gate (tests/diffimports.zig)").dependOn(&diffimports_run.step);
+    test_step.dependOn(&diffimports_run.step);
 
     // Format gate for the Zig sources. A formatter nothing enforces is a
     // suggestion: six files had already drifted before this landed. `--check`
