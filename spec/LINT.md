@@ -55,6 +55,14 @@ bit lint [flags] [paths...]
 | `--json` | machine-readable findings, same schema as `bit check --json` |
 | `--stats` | print override accounting only, report no findings |
 
+`--json` writes its array to **stdout**; the summary line (§2.2) and every
+rendered diagnostic go to **stderr**, so a consumer can pipe the JSON without
+filtering.
+
+`--stats` lists one line per override in force, `<path>: <rule>=<n>` or
+`<path>: disable <rule>`, then the summary. The count alone says overrides
+exist; the listing says which and where.
+
 ### 2.1 Exit codes
 
 | Code | Meaning |
@@ -62,6 +70,17 @@ bit lint [flags] [paths...]
 | 0 | no findings |
 | 1 | at least one finding |
 | 2 | usage error, unreadable path, or malformed override directive |
+
+Exit 2 covers an unknown flag, a path that does not exist or cannot be read,
+and any directive error from §5.2. A path the user named and lint could not
+read is a silent hole in the run, which is why it is a failure and not a
+warning.
+
+A run with a directive error reports the directive errors **instead of**
+findings, not alongside them: the overrides decide what the findings are, so
+reporting findings computed under a broken override set would report a result
+nobody asked for. Every bad directive in the walk is reported before exiting,
+so one run fixes them all.
 
 Lint findings are recorded at `severity=1` (warning) so they do not bump
 `errorCount` — `Diagnostics.warn` deliberately does not, and that semantic is
@@ -80,6 +99,20 @@ lint: 0 findings, 12 overrides active
 Any limit may be raised by editing the source (§5), so the count is what keeps
 that from happening quietly: raising a limit changes this number, and the
 change is visible in review even when the override line itself is skimmed past.
+
+What it counts, exactly:
+
+- **Distinct rules with a directive, not directive lines.** Two assignments to
+  the same rule are one override, because the line reports what is in *effect*
+  and only the last assignment is.
+- **Over every file walked, not only files with findings.** The number exists
+  to make a raised limit visible, and a raised limit is precisely a file that
+  no longer has a finding.
+- **A directive that restates the default counts.** It changes no behaviour,
+  but it is still a claim about this file and belongs in the accounting.
+
+It is printed unconditionally, on clean runs too, and there is no flag that
+suppresses it.
 
 ## 3. Diagnostic codes
 
@@ -240,7 +273,7 @@ Recorded so they are not re-proposed.
 LintDirective = "//" ws "bit:lint" ws ( Assignment | Disable ) ws "--" ws Reason .
 Assignment    = RuleName "=" Integer .
 Disable       = "disable" ws RuleName .
-RuleName      = { lower | "-" } .
+RuleName      = lower { lower | "-" } .
 Reason        = { any character } .          // to end of line, non-empty
 ```
 
@@ -250,6 +283,15 @@ Examples:
 // bit:lint max-file-lines=7100 -- bootstrap oracle, split tracked in #1376
 // bit:lint disable max-nesting -- generated dispatch table
 ```
+
+A `RuleName` must begin with a lowercase letter. Without that, `disable --
+reason` scans `--` as the rule name and is rejected as an *unknown rule* — a
+wrong diagnosis of a right rejection, and one that sends the reader looking for
+a rule they never wrote.
+
+An `Integer` is a plain run of decimal digits, at most 1,000,000,000. The cap is
+not policy; it is what keeps `max-file-lines=99999999999999999999` from wrapping
+into a small number and silently *tightening* the rule it was meant to relax.
 
 The reason is **mandatory**. A directive without one, or with only whitespace
 after the `--`, is an error (exit 2).
@@ -283,6 +325,16 @@ directive naming an unknown rule is likewise an error — otherwise a renamed
 rule turns every existing override into a silent no-op, and files that were
 green because of an override would start failing for reasons no one can see
 in the diff.
+
+**"Unknown" means not registered, which includes not yet implemented.** A rule
+enters the registry with its check function, so an override for a rule that has
+not landed is rejected. That is deliberate: accepting it would be the same
+silent no-op, only displaced from a typo to a future feature.
+
+The `bit:` prefix is a namespace claim for the whole toolchain, not a lint
+token. A directive for another tool (`// bit:fmt ...`) is skipped by the lint
+reader rather than rejected by it, so a second `bit:<tool>` can be added without
+reworking this.
 
 ### 5.3 Precedence
 
@@ -377,11 +429,18 @@ Required coverage:
 
 | File | Change |
 |---|---|
-| `selfhost/lint.bit` | new — rule passes over the AST |
+| `selfhost/lint.bit` | new — registry, directive reader, runner, rule passes |
+| `selfhost/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
 | `selfhost/main.bit` | `lint` subcommand dispatch |
+| `tests/lintcmd.zig` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
 | `tests/harness.zig` | `.lint` directive |
 | `tests/cases/lint_*.bit` | golden cases |
 | `docs/reference/` | user-facing rule reference |
+
+A rule is a **registry entry plus a check function**, and landing one touches
+nothing else — not the walk, not the renderer, not the exit-code logic. That
+constraint is the point of the split: eleven rules should cost eleven small
+diffs, not eleven edits to a growing runner.
 
 `seed/` is **not** touched. The seed compiler's remaining job is to be the
 differential oracle for AST, type, and IR dumps; lint changes none of those, so
@@ -391,6 +450,12 @@ lint is selfhost-only and the differential stays valid.
 
 1. **Phase 2 placement.** `unused-import` / `unused-local` as lint warnings, or
    as `bit check` errors in Go's style? Decide before 1.0 (§4).
-2. **Default values.** 800 / 80 / 5 / 4 are judgement calls, chosen to be
+2. **A file that does not parse.** The phase-1 rules that need an AST (§4) have
+   to decide what lint does with a file `bit check` would reject. Linting a
+   recovered tree invents findings; skipping the file silently is the no-op
+   this spec forbids elsewhere. Exit 2 with "does not parse, run `bit check`"
+   is the likely answer. Undecided because the only rule shipped so far reads
+   lines, not syntax — decide with the first AST rule (#1383).
+3. **Default values.** 800 / 80 / 5 / 4 are judgement calls, chosen to be
    restrictive enough to bite. Worth revisiting once the whole repo is under
    the limit and the real distribution is visible.
