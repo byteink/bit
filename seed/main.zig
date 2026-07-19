@@ -22,8 +22,12 @@ const archive = @import("link/archive.zig");
 const macho = @import("link/macho.zig");
 /// `pub` for the runtime-pin cycle gate (tests/rootpins.zig): it reads back an
 /// object this compiler just emitted, which is the only way to see the symbol a
-/// call actually lands on rather than the name the source spells.
+/// call actually lands on rather than the name the source spells. Both readers,
+/// because a `darwin/` provider cannot be emitted for a Linux target at all
+/// (the checker refuses `extern function` there, even uncalled), so covering
+/// both platform halves means reading both object formats.
 pub const elf_reader = @import("link/elf_reader.zig");
+pub const macho_reader = @import("link/macho_reader.zig");
 pub const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 

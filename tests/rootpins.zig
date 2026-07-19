@@ -51,18 +51,40 @@
 //! emitted object is the oracle, and it is the *same* oracle the linker uses.
 //!
 //! ---------------------------------------------------------------------------
-//! WHY IT EMITS FOR x86_64-linux ON EVERY HOST
+//! WHY IT PINS A TARGET PER MODULE INSTEAD OF USING THE HOST'S
 //! ---------------------------------------------------------------------------
 //!
 //! The property is target-independent — an `RtFn` becomes a call on every
-//! backend — but the *reader* is not: only ELF has one here. Emitting ELF
-//! regardless of host makes this gate fail identically on macOS and Linux,
-//! which is the pattern #1421 established after a module-state alignment bug
-//! that was correct on aarch64-macOS and wrong on ELF passed the entire
-//! host-native golden suite.
+//! backend — but the *modules* are not: a `linux/` provider cannot be emitted
+//! for Darwin nor a `darwin/` one for Linux (the checker refuses `syscall` and
+//! `extern function` respectively, even on an uncalled declaration). So each
+//! module names the target it can be built for and is read back with that
+//! format's reader.
+//!
+//! Fixing the target per module rather than following the host is also what
+//! makes this gate fail *identically everywhere*, the pattern #1421 established
+//! after a module-state alignment bug that was correct on aarch64-macOS and
+//! wrong on ELF passed the entire host-native golden suite.
 //!
 //! Nothing is linked or executed, so no `libbitrt.a` is needed and the gate has
 //! no skip path: it runs on every host, always.
+//!
+//! ---------------------------------------------------------------------------
+//! WHAT MUTATION TESTING CHANGED ABOUT THIS FILE
+//! ---------------------------------------------------------------------------
+//!
+//! Three defects, none visible by inspection, all found by mutating code the
+//! gate was supposed to protect:
+//!
+//!   - The Darwin half examined NOTHING. Mach-O spells symbols with a leading
+//!     underscore and `macho_reader` passes them through verbatim, so every
+//!     Darwin name failed the `bit_rt_root_` prefix test. Reading green the
+//!     whole time. (`Module.symPrefix`.)
+//!   - The vacuity check was GLOBAL ("at least one module contributed"), which
+//!     the two working modules satisfied while the third checked nothing. It is
+//!     per-module now.
+//!   - Emptying `modules` still passed, because a per-module check cannot fire
+//!     for a module that is never visited. Hence the comptime length assert.
 
 const std = @import("std");
 const bit = @import("bit");
@@ -78,18 +100,46 @@ const Io = std.Io;
 const placeholder = "bit_rt_root_";
 const real = "bit_rt_";
 
-/// Runtime modules built from Bit that define pinned ABI symbols. Each is a
-/// module directory (SPEC §17.1) emitted on its own, exactly as #1369 will
-/// assemble the archive.
+/// Runtime modules built from Bit that define pinned ABI symbols, each with the
+/// target it must be emitted for. Each is a module directory (SPEC §17.1)
+/// emitted on its own, exactly as #1369 will assemble the archive.
 ///
-/// The platform providers are listed explicitly rather than discovered: a
-/// `linux/` module cannot be emitted for a Darwin target and vice versa (the
-/// checker refuses `syscall` targeting Darwin and `extern function` targeting
-/// Linux, even on an uncalled declaration), so the set is a property of the
-/// chosen emit target, not of the directory tree.
-const modules = [_][]const u8{
-    "runtime/root",
-    "runtime/root/linux",
+/// The platform providers are listed explicitly rather than discovered, and
+/// carry their own target: a `linux/` module cannot be emitted for a Darwin
+/// target and vice versa (the checker refuses `syscall` targeting Darwin and
+/// `extern function` targeting Linux, even on an uncalled declaration). So the
+/// buildable set is a property of the chosen target, not of the directory tree,
+/// and covering both platform halves means emitting — and reading back — both
+/// object formats.
+///
+/// Only `runtime/root*` appears here, and that is the complete at-risk set
+/// rather than an arbitrary subset: the cycle is created by #1369's rename, and
+/// `bit_rt_root_` is the only prefix that rename touches. `runtime/alloc`'s
+/// `bit_rt_heap_*` and `runtime/gc`'s `bit_rt_port_*` pins are not ABI names
+/// (ABI.md names no allocator symbol), so no rename will ever collide them with
+/// an RtFn target. Add a module here the moment it starts pinning ABI names.
+const Module = struct {
+    path: []const u8,
+    target: bit.BuildTarget,
+
+    /// Mach-O carries the C leading underscore in the symbol table verbatim
+    /// (`_bit_rt_root_print`), ELF does not. `macho_reader` hands names through
+    /// unchanged, so the gate has to normalise or every Darwin name silently
+    /// fails the `bit_rt_root_` prefix test and the whole platform half becomes
+    /// a vacuous pass — which is exactly what it was until a Darwin-targeted
+    /// mutation SURVIVED and said so.
+    fn symPrefix(self: Module) []const u8 {
+        return switch (self.target) {
+            .aarch64_macos => "_",
+            else => "",
+        };
+    }
+};
+
+const modules = [_]Module{
+    .{ .path = "runtime/root", .target = .x86_64_linux },
+    .{ .path = "runtime/root/linux", .target = .x86_64_linux },
+    .{ .path = "runtime/root/darwin", .target = .aarch64_macos },
 };
 
 /// Upper bound on symbols in one object — keeps every walk below provably
@@ -97,6 +147,13 @@ const modules = [_][]const u8{
 const max_symbols = 16384;
 
 test "no ported runtime pin calls the ABI name it becomes" {
+    // An empty list makes the loop below a no-op and the whole gate a green
+    // no-op with it. Caught by mutation: emptying `modules` passed, because the
+    // per-module vacuity check can only fire for a module that is actually
+    // visited. Every "did this examine anything" guard needs its own outer
+    // guard at the level above.
+    comptime std.debug.assert(modules.len != 0);
+
     const io = Io.Threaded.global_single_threaded.io();
 
     // An arena for the reader's output, exactly as `link.zig` reads objects:
@@ -106,32 +163,51 @@ test "no ported runtime pin calls the ABI name it becomes" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
-    var found_any = false;
-    for (modules) |rel| {
-        const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, rel });
+    for (modules) |m| {
+        const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, m.path });
 
-        const obj = try emitElfObject(gpa, io, abs, rel);
+        const obj = try emitObject(gpa, io, abs, m);
 
-        const module = bit.elf_reader.read(gpa, .x86_64, rel, obj) catch |e| {
-            std.debug.print("rootpins: cannot read emitted object for '{s}': {s}\n", .{ rel, @errorName(e) });
+        const module = switch (m.target) {
+            .x86_64_linux => bit.elf_reader.read(gpa, .x86_64, m.path, obj),
+            .aarch64_linux => bit.elf_reader.read(gpa, .aarch64, m.path, obj),
+            .aarch64_macos => bit.macho_reader.read(gpa, m.path, obj),
+        } catch |e| {
+            std.debug.print("rootpins: cannot read emitted object for '{s}': {s}\n", .{ m.path, @errorName(e) });
             return e;
         };
 
-        found_any = try checkModule(gpa, rel, module) or found_any;
-    }
+        const examined = try checkModule(gpa, m, module);
 
-    // A vacuous pass is the failure mode this gate is most exposed to: if the
-    // emit path changed shape and produced objects with no pinned definitions
-    // at all, every check below would trivially hold. Require that at least one
-    // module actually contributed a pinned ABI definition to examine.
-    try testing.expect(found_any);
+        // PER MODULE, not once for the whole run — and that distinction is not
+        // theoretical. A vacuous pass is the failure mode this gate is most
+        // exposed to (nothing is asserted about a module whose names never match
+        // the prefix), and a global "at least one module contributed" check is
+        // satisfied by the other two while a third silently examines nothing.
+        // That is precisely what happened: `runtime/root/darwin` matched zero
+        // symbols for months of nothing, because Mach-O spells them with a
+        // leading underscore, and the global check stayed green throughout. A
+        // Darwin-targeted mutation SURVIVED and exposed it.
+        if (!examined) {
+            std.debug.print(
+                "rootpins: '{s}' contributed no pinned ABI definitions — the gate " ++
+                    "examined nothing. Either the module stopped pinning ABI names " ++
+                    "(remove it from `modules`) or symbol spelling changed and the " ++
+                    "prefix test no longer matches (see Module.symPrefix).\n",
+                .{m.path},
+            );
+            return error.VacuousModuleCheck;
+        }
+    }
 }
 
-/// Emits `dir_abs` as a relocatable ELF object for x86-64. Not freestanding:
-/// `--freestanding` additionally refuses unpinned imports and managed metadata,
-/// which several of these modules still trip (#1434, #1421) — and none of that
-/// is what this gate is about. An ordinary object carries the same relocations.
-fn emitElfObject(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, name: []const u8) ![]u8 {
+/// Emits `dir_abs` as a relocatable object for its module's target. Not
+/// freestanding: `--freestanding` additionally refuses unpinned imports and
+/// managed metadata, which several of these modules still trip (#1434, #1421) —
+/// and none of that is what this gate is about. An ordinary object carries the
+/// same relocations.
+fn emitObject(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, m: Module) ![]u8 {
+    const name = m.path;
     var diags: Io.Writer.Allocating = .init(gpa);
     defer diags.deinit();
 
@@ -143,7 +219,7 @@ fn emitElfObject(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, name: []co
         build_options.stdlib_dir,
         name,
         "", // no archive: emit_obj never links
-        .x86_64_linux,
+        m.target,
         &diags.writer,
         null,
         true, // emit_obj
@@ -167,7 +243,9 @@ fn emitElfObject(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, name: []co
 /// runtime function calling another (`bit_rt_map_set` -> `bit_rt_string_concat`).
 /// Only a definition reaching *itself* is unconditionally a defect, and
 /// narrowing to it took the finding from four symbols to the two that are real.
-fn checkModule(gpa: std.mem.Allocator, name: []const u8, module: anytype) !bool {
+fn checkModule(gpa: std.mem.Allocator, m: Module, module: anytype) !bool {
+    const name = m.path;
+    const sp = m.symPrefix();
     var pinned_abi: usize = 0;
     var failures: usize = 0;
     var scanned: usize = 0;
@@ -175,7 +253,9 @@ fn checkModule(gpa: std.mem.Allocator, name: []const u8, module: anytype) !bool 
         scanned += 1;
         if (scanned > max_symbols) return error.TooManySymbols;
         if (atom.binding != .global) continue;
-        if (!std.mem.startsWith(u8, atom.name, placeholder)) continue;
+        if (!std.mem.startsWith(u8, atom.name, sp)) continue;
+        const bare = atom.name[sp.len..];
+        if (!std.mem.startsWith(u8, bare, placeholder)) continue;
         pinned_abi += 1;
 
         // What this definition will be called after #1369 drops the `_root`
@@ -183,7 +263,9 @@ fn checkModule(gpa: std.mem.Allocator, name: []const u8, module: anytype) !bool 
         // Built, not sliced: `bit_rt_` and `float_bits` are not contiguous in
         // `bit_rt_root_float_bits`, and a slice that looked right on one prefix
         // pair would silently mis-derive on another.
-        const renamed = try renameOf(gpa, atom.name);
+        // Re-prefixed for the format being read, so it compares against the
+        // relocation targets in their own spelling.
+        const renamed = try renameOf(gpa, sp, bare);
 
         // `SymbolRef.global` is the linker's own view of the call target — the
         // name codegen actually emitted, not the name the source spelled —
@@ -216,8 +298,9 @@ fn checkModule(gpa: std.mem.Allocator, name: []const u8, module: anytype) !bool 
     return pinned_abi != 0;
 }
 
-/// `bit_rt_root_floor` -> `bit_rt_floor`; anything else unchanged.
-fn renameOf(gpa: std.mem.Allocator, sym: []const u8) ![]const u8 {
-    if (!std.mem.startsWith(u8, sym, placeholder)) return sym;
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ real, sym[placeholder.len..] });
+/// `bit_rt_root_floor` -> `<sp>bit_rt_floor`, where `sp` is the object format's
+/// symbol prefix (`_` on Mach-O). `bare` must already have that prefix stripped.
+fn renameOf(gpa: std.mem.Allocator, sp: []const u8, bare: []const u8) ![]const u8 {
+    std.debug.assert(std.mem.startsWith(u8, bare, placeholder));
+    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ sp, real, bare[placeholder.len..] });
 }
