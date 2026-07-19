@@ -34,6 +34,23 @@
 //! that rather than assume it. #1409 was filed on the strength of the assumption
 //! and did not survive it.
 //!
+//! SO THE STRESS RUN NOW ASSERTS ITS OWN ORACLE IS LIVE (#1438). Every
+//! `BIT_GC=stress` run sets `BIT_GC_STATS=1` and requires a non-zero collection
+//! count. The paragraph above stated that rule from the day this suite was
+//! written and nothing enforced it, so four programs sat here reading as
+//! stress-verified with the collector never once running. A program that is
+//! legitimately straight-line — one proving something about emission or linking
+//! rather than about rooting — declares that by carrying a `no-collect` file
+//! whose contents say why. The marker must be non-empty: the point is that
+//! inertness is DECLARED and argued, never inherited by accident.
+//!
+//! #1438 is also why the suite must never be replaced by `BIT_GC=stress bit run
+//! <dir>`. Self-hosted `bit` is itself a Bit program, so that command applies
+//! the policy to THE COMPILER, which then collects at every back-edge of its own
+//! compilation — hundreds of thousands of collections for a six-line input,
+//! indistinguishable from a hang. Build first, run the binary second, which is
+//! exactly what this harness does.
+//!
 //! Skipped when the host is not a supported runtime target (no libbitrt to link
 //! against), mirroring the golden `// run` cases and the examples guard.
 
@@ -156,10 +173,33 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     defer Dir.cwd().deleteFile(run_io, seed_bin) catch {};
     try Dir.cwd().writeFile(run_io, .{ .sub_path = seed_bin, .data = exe, .flags = .{ .permissions = .executable_file } });
 
+    // A program that cannot reach a safepoint where it matters says so in a
+    // `no-collect` file, and says why in its contents. Read here rather than in
+    // `runOnce` so a malformed marker fails once per program, not once per run.
+    const no_collect = try readNoCollect(gpa, run_io, name, dir_abs);
+    defer if (no_collect) |m| gpa.free(m);
+
     // ---- Phase 2: exec only. Both compilers' output must satisfy `.expected`
     // identically, under both collector policies.
-    try runBoth(gpa, run_io, name, "seed", seed_bin, expected);
-    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected);
+    try runBoth(gpa, run_io, name, "seed", seed_bin, expected, no_collect != null);
+    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected, no_collect != null);
+}
+
+/// The declared-inert marker: `null` when the program must collect, otherwise
+/// its stated reason. An empty marker is an error — a bare file would let a
+/// program opt out of the oracle without anyone having to justify it, which is
+/// the failure mode the marker exists to prevent.
+fn readNoCollect(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: []const u8) !?[]u8 {
+    const marker_path = try std.fmt.allocPrint(gpa, "{s}/no-collect", .{dir_abs});
+    defer gpa.free(marker_path);
+
+    const body = Dir.cwd().readFileAlloc(run_io, marker_path, gpa, .limited(4 << 10)) catch return null;
+    errdefer gpa.free(body);
+    if (std.mem.trim(u8, body, " \t\r\n").len == 0) {
+        std.debug.print("stress '{s}': 'no-collect' marker is empty — state why the collector cannot run\n", .{name});
+        return error.StressEmptyNoCollectMarker;
+    }
+    return body;
 }
 
 /// Build `dir_abs` with the self-hosted `bit`. It is a Bit-compiled executable,
@@ -189,18 +229,35 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_a
     return error.StressSelfhostCompileFailed;
 }
 
-/// Both collector policies for one compiler's binary.
-fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8) !void {
-    try runOnce(gpa, run_io, name, who, bin_path, expected, null);
+/// Both collector policies for one compiler's binary. The stress pass also
+/// carries `BIT_GC_STATS=1` so the run can prove the collector actually ran.
+fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, no_collect: bool) !void {
+    try runOnce(gpa, run_io, name, who, bin_path, expected, null, no_collect);
 
     var stress_env = std.process.Environ.Map.init(gpa);
     defer stress_env.deinit();
     try stress_env.put("BIT_GC", "stress");
-    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env);
+    try stress_env.put("BIT_GC_STATS", "1");
+    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env, no_collect);
 }
 
-fn runOnce(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, env: ?*const std.process.Environ.Map) !void {
-    const policy = if (env == null) "default" else "BIT_GC=stress";
+/// The prefix `gc.zig` writes per collection under `BIT_GC_STATS`. Counting
+/// these is what makes the stress pass an oracle rather than a second default
+/// run — see the header.
+const collection_line = "[bit-gc] collection ";
+
+fn runOnce(
+    gpa: std.mem.Allocator,
+    run_io: Io,
+    name: []const u8,
+    who: []const u8,
+    bin_path: [:0]const u8,
+    expected: []const u8,
+    env: ?*const std.process.Environ.Map,
+    no_collect: bool,
+) !void {
+    const stress = env != null;
+    const policy = if (stress) "BIT_GC=stress" else "default";
     const mode = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ who, policy });
     defer gpa.free(mode);
     const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path}, .environ_map = env });
@@ -218,5 +275,21 @@ fn runOnce(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8
     if (!std.mem.eql(u8, result.stdout, expected)) {
         std.debug.print("stress '{s}' [{s}]: output mismatch\n  expected: {s}\n  got:      {s}\n", .{ name, mode, expected, result.stdout });
         return error.StressOutputMismatch;
+    }
+    if (!stress or no_collect) return;
+
+    // The oracle check. A zero count means every root this program cares about
+    // was re-proven live exactly never, so the run above says nothing at all
+    // about rooting — regardless of how much it allocated.
+    const collections = std.mem.count(u8, result.stderr, collection_line);
+    if (collections == 0) {
+        std.debug.print(
+            "stress '{s}' [{s}]: the collector never ran, so this run verified nothing about rooting.\n" ++
+                "  Give the program a loop where the roots it cares about are live, or — if it is\n" ++
+                "  proving something about emission or linking rather than rooting — add a\n" ++
+                "  'no-collect' file to its directory stating why.\n",
+            .{ name, mode },
+        );
+        return error.StressCollectorInert;
     }
 }
