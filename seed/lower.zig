@@ -3902,7 +3902,19 @@ const FnCtx = struct {
         for (self.kids(init_node)) |fi| {
             const fk = self.kids(fi); // field_init: [name_ident, expr]
             const name = self.identText(fk[0]);
-            const val = try self.lowerExpr(fk[1]);
+            // The field's own type is the hint the initializer is lowered
+            // under. Without it an untyped literal materializes at its DEFAULT
+            // type — `4.5` as an `f64` — and the `field_set` then writes the
+            // field's width from it, storing the low half of an f64 into an
+            // `f32` field: a silent zero (#1457). The name lookup has no side
+            // effects, so hoisting it above the lowering keeps evaluation order.
+            const hint = blk: {
+                for (data.@"struct") |f| {
+                    if (std.mem.eql(u8, f.name, name)) break :blk f.ty;
+                }
+                break :blk null;
+            };
+            const val = if (hint) |h| try self.lowerExprH(fk[1], h) else try self.lowerExpr(fk[1]);
             var found = false;
             for (data.@"struct", 0..) |f, i| {
                 if (!std.mem.eql(u8, f.name, name)) continue;
@@ -3933,7 +3945,15 @@ const FnCtx = struct {
             return switch (data.prim) {
                 .string => v,
                 .bool => self.rtCall(string_ty, .string_from_bool, &.{v}),
-                .f32, .f64 => self.rtCall(string_ty, .string_from_float, &.{v}),
+                // `bit_rt_string_from_float` takes an `f64`, so an `f32` must be
+                // widened first: passing a single leaves the callee's `d0`/`xmm0`
+                // upper half undefined and it formats a denormal near zero (a
+                // long all-zero fractional tail — #1457). The seed's own
+                // conversion, not the callee's, because the C signature is `f64`.
+                .f64 => self.rtCall(string_ty, .string_from_float, &.{v}),
+                .f32 => self.rtCall(string_ty, .string_from_float, &.{
+                    try self.b.convert(self.ctx.prim_ids.get(.f64), v),
+                }),
                 else => self.rtCall(string_ty, .string_from_int, &.{v}),
             };
         }
