@@ -89,6 +89,54 @@ per-stage range convention and the rule that a code is never renumbered once
 shipped. Lint findings render through the existing path as
 `warning[E0200]: ...`, so neither `codeString` nor the JSON emitter changes.
 
+The range is allocated from both ends: **rules from E0200 upward**, and
+**directive-machinery codes from E0299 downward**, so a new rule never has to
+step over a meta-code.
+
+| Code | Meaning |
+|---|---|
+| E0200–E0289 | lint rules (§4) |
+| E0298 | override directive names an unknown rule |
+| E0299 | override directive is malformed, or its reason is missing or empty |
+
+### 3.1 Why the `E` registry and not a distinct `L%04d` (settled, #1378)
+
+Decided, and effectively **irreversible from the first release that ships a
+lint code** — the registry rule is that a code is never renumbered once shipped,
+and by then users have written overrides and CI filters against these strings.
+
+The case for a distinct `L` prefix is that a reader should be able to tell
+"your program is wrong" from "your program is untidy" at a glance, and that is
+the entire reason lint is a separate command. Three things already carry that
+distinction, and none of them is the code:
+
+1. **The severity word.** Findings render `warning[...]`, never `error[...]`.
+2. **The command.** A finding only appears because the user ran `bit lint`;
+   `bit build` and `bit check` never emit one.
+3. **The message.** "file is 1204 lines, limit is 800" is not mistakable for a
+   compile failure.
+
+A prefix letter would add a fourth signal, not a first one. Against that:
+
+- **One registry, one collision authority.** Two prefixes means the
+  never-renumber rule has to be enforced in two places, and "is E0213 taken?"
+  becomes two questions.
+- **`codeString` is shared with the frozen seed.** `selfhost/diagnostics.bit`
+  mirrors `seed/diagnostics.zig` byte for byte, and the seed is still the
+  differential oracle for the bootstrap (§9). A prefix parameter would make the
+  two diagnostic renderers structurally divergent, mid-bootstrap, for a
+  distinction the severity word already carries. This is the decisive argument
+  and it is specific to the project's current state, not a general preference.
+- **Greppability is a wash.** `grep -rn 'E02'` is exactly as clean as
+  `grep -rn 'L02'`.
+- **It is the cheaper mistake.** If consumers do report confusion, moving
+  E02xx → L02xx later costs one function signature and a JSON-emitter change.
+  Shipping `L` and wanting it back costs the same, plus a break in every
+  consumer that learned to parse two prefixes. Under uncertainty, take the
+  option that is cheaper to reverse.
+
+Revisit only if a real consumer reports real confusion, and only before 1.0.
+
 ## 4. Rules
 
 ### Phase 1 — size and shape (AST only)
@@ -343,11 +391,6 @@ lint is selfhost-only and the differential stays valid.
 
 1. **Phase 2 placement.** `unused-import` / `unused-local` as lint warnings, or
    as `bit check` errors in Go's style? Decide before 1.0 (§4).
-2. **Code prefix.** Lint reuses the `E` registry with a reserved range. A
-   distinct `L%04d` prefix would be more greppable and could never collide as
-   the error registry grows, at the cost of a change to `codeString` and the
-   JSON emitter. Reversible only before the first release that ships these
-   codes.
-3. **Default values.** 800 / 80 / 5 / 4 are judgement calls, chosen to be
+2. **Default values.** 800 / 80 / 5 / 4 are judgement calls, chosen to be
    restrictive enough to bite. Worth revisiting once the whole repo is under
    the limit and the real distribution is visible.
