@@ -4350,7 +4350,75 @@ fn binOpFor(op: lexer.Kind, data: TypeData) Error!ir.Op {
 
 const testing = std.testing;
 
-fn lowerSource(gpa: Allocator, source: []const u8) !struct { module: ir.Module, ctx: TypeContext } {
+// ---------------------------------------------------------------------------
+// Semantic assertions on the lowered IR (#1460)
+//
+// Every test in this file used to assert only `ir.verify(...)`. That is a
+// STRUCTURAL check — blocks terminated, operands in range, types consistent —
+// and a semantically wrong lowering satisfies it exactly as well as a correct
+// one. Lowering `defer` FIFO instead of LIFO, swapping the arms of an `if`, or
+// dropping a loop's back edge all produce perfectly well-formed IR, so all 14
+// tests passed through each of them.
+//
+// The fix is to assert what the IR MEANS. `ir.dump` renders the exact surface
+// `bit --dump-ir-pre` prints — instruction order, operand wiring, block
+// parameters, which block a value flows to — so pinning a function's dump pins
+// its semantics. A test that fails on a benign lowering improvement is the
+// intended cost: the alternative is a test that fails on nothing.
+// ---------------------------------------------------------------------------
+
+/// Extracts a single `func <name>(...) ... { ... }` block from a module dump.
+/// One function at a time keeps each expectation small enough to read, and
+/// keeps an unrelated function's churn out of this test's failure.
+fn funcDump(gpa: Allocator, module: *const ir.Module, name: []const u8) ![]u8 {
+    const text = try ir.dump(gpa, module);
+    defer gpa.free(text);
+
+    const head = try std.fmt.allocPrint(gpa, "func {s}(", .{name});
+    defer gpa.free(head);
+    const start = std.mem.indexOf(u8, text, head) orelse {
+        std.debug.print("no function '{s}' in dump:\n{s}\n", .{ name, text });
+        return error.NoSuchFunction;
+    };
+    // Functions end at a `}` in column 0; the dump indents every instruction.
+    const rel_end = std.mem.indexOf(u8, text[start..], "\n}") orelse return error.UnterminatedFunction;
+    return gpa.dupe(u8, text[start .. start + rel_end + 2]);
+}
+
+/// Asserts a function lowers to exactly `expected`.
+///
+/// A whole-function equality rather than a scatter of `indexOf` probes,
+/// deliberately: a probe asserts that something IS present and stays silent
+/// about everything around it, which is how a suite ends up proving less than
+/// it appears. Equality cannot be satisfied by a wrong lowering that happens to
+/// contain the right substring.
+fn expectFuncDump(gpa: Allocator, module: *const ir.Module, name: []const u8, expected: []const u8) !void {
+    const got = try funcDump(gpa, module, name);
+    defer gpa.free(got);
+    try testing.expectEqualStrings(expected, got);
+}
+
+/// A lowered module plus the type context it points INTO.
+///
+/// `ir.Module` holds `ctx: *TypeContext`, so the context must outlive the
+/// module. This helper used to return the context BY VALUE, which left
+/// `module.ctx` pointing at `lowerSource`'s dead stack frame in every one of
+/// these tests. Nothing caught it because nothing ever dereferenced it: type
+/// names are only read when rendering a dump, and no test rendered one. That is
+/// the same defect shape as #1460 itself — a suite that cannot fail for the
+/// reasons that matter also cannot notice that its own fixture is broken.
+const Lowered = struct {
+    module: ir.Module,
+    ctx: *TypeContext,
+
+    fn deinit(self: *Lowered, gpa: Allocator) void {
+        self.module.deinit();
+        self.ctx.deinit();
+        gpa.destroy(self.ctx);
+    }
+};
+
+fn lowerSource(gpa: Allocator, source: []const u8) !Lowered {
     const diagnostics = @import("diagnostics.zig");
     const parser = @import("parser.zig");
 
@@ -4374,9 +4442,11 @@ fn lowerSource(gpa: Allocator, source: []const u8) !struct { module: ir.Module, 
     defer rmodule.deinit();
     try testing.expect(!diags.hasErrors());
 
-    var ctx = try TypeContext.init(gpa);
+    const ctx = try gpa.create(TypeContext);
+    errdefer gpa.destroy(ctx);
+    ctx.* = try TypeContext.init(gpa);
     errdefer ctx.deinit();
-    var checked = try check.checkModule(gpa, &diags, &ctx, &files, &rmodule, @enumFromInt(0), &.{}, false);
+    var checked = try check.checkModule(gpa, &diags, ctx, &files, &rmodule, @enumFromInt(0), &.{}, false);
     defer checked.deinit();
     if (diags.hasErrors()) {
         var rendered: std.Io.Writer.Allocating = .init(gpa);
@@ -4386,7 +4456,7 @@ fn lowerSource(gpa: Allocator, source: []const u8) !struct { module: ir.Module, 
     }
     try testing.expect(!diags.hasErrors());
 
-    const module = try lowerModule(gpa, &ctx, &files, &checked, &rmodule);
+    const module = try lowerModule(gpa, ctx, &files, &checked, &rmodule);
     return .{ .module = module, .ctx = ctx };
 }
 
@@ -4398,8 +4468,7 @@ test "lowers arithmetic and a direct call, verifier accepts it" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
     try testing.expectEqual(@as(usize, 2), out.module.funcs.items.len);
 }
@@ -4419,9 +4488,29 @@ test "lowers if/else through a merge block" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // The behaviour: the condition selects between two arms that converge on a
+    // single merge block, and the merged value arrives as a BLOCK PARAMETER —
+    // the then-arm passing the negated value, the else-arm the original. Swap
+    // the arms, drop the negation, or return the wrong parameter and this
+    // fails; `ir.verify` accepts all three.
+    try expectFuncDump(gpa, &out.module, "abs",
+        \\func abs(%0: i64) i64 {
+        \\bb0(%0: i64):
+        \\  %1 = const_int i64 0
+        \\  %2 = icmp_slt bool %0, %1
+        \\  br %2, bb1(), bb3()
+        \\bb1():
+        \\  %4 = neg i64 %0
+        \\  jump bb2(%0, %4)
+        \\bb2(%7: i64, %8: i64):
+        \\  ret %8
+        \\bb3():
+        \\  jump bb2(%0, %0)
+        \\}
+    );
 }
 
 test "lowers a while loop with a loop-carried variable" {
@@ -4439,9 +4528,32 @@ test "lowers a while loop with a loop-carried variable" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // The behaviour: the loop is a BACK EDGE (bb2 jumps to bb1, an earlier
+    // block) carrying the induction variable and the accumulator as block
+    // parameters, with the guard evaluated on entry to bb1 so a zero-trip loop
+    // falls straight to bb3. Delete the back edge, hoist the guard, or carry the
+    // wrong parameter and this fails; the IR still verifies in every case.
+    try expectFuncDump(gpa, &out.module, "sum",
+        \\func sum(%0: i64) i64 {
+        \\bb0(%0: i64):
+        \\  %1 = const_int i64 0
+        \\  %2 = const_int i64 0
+        \\  jump bb1(%0, %1, %2)
+        \\bb1(%4: i64, %5: i64, %6: i64):
+        \\  %7 = icmp_slt bool %6, %4
+        \\  br %7, bb2(), bb3(%4, %5, %6)
+        \\bb2():
+        \\  %9 = add i64 %5, %6
+        \\  %10 = const_int i64 1
+        \\  %11 = add i64 %6, %10
+        \\  jump bb1(%4, %9, %11)
+        \\bb3(%13: i64, %14: i64, %15: i64):
+        \\  ret %14
+        \\}
+    );
 }
 
 test "lowers a for..of loop over a slice parameter" {
@@ -4457,9 +4569,36 @@ test "lowers a for..of loop over a slice parameter" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // The behaviour: the index starts at 0, the guard compares it against
+    // `slice_len` of the slice (not a cached length, and not `<=`), the element
+    // is fetched with `slice_get` at the CURRENT index, and the increment
+    // happens in the latch block after the body. An off-by-one in the guard or
+    // an increment before the body both verify fine.
+    try expectFuncDump(gpa, &out.module, "total",
+        \\func total(%0: []i64) i64 {
+        \\bb0(%0: []i64):
+        \\  %1 = const_int i64 0
+        \\  %2 = const_int i64 0
+        \\  jump bb1(%0, %1, %0, %2)
+        \\bb1(%4: []i64, %5: i64, %6: []i64, %7: i64):
+        \\  %8 = slice_len %6
+        \\  %9 = icmp_slt bool %7, %8
+        \\  br %9, bb2(), bb4(%4, %5, %6, %7)
+        \\bb2():
+        \\  %11 = rt_call slice_get(%6, %7) i64
+        \\  %12 = add i64 %5, %11
+        \\  jump bb3(%4, %12, %6, %7)
+        \\bb3(%14: []i64, %15: i64, %16: []i64, %17: i64):
+        \\  %18 = const_int i64 1
+        \\  %19 = add i64 %17, %18
+        \\  jump bb1(%14, %15, %16, %19)
+        \\bb4(%21: []i64, %22: i64, %23: []i64, %24: i64):
+        \\  ret %22
+        \\}
+    );
 }
 
 test "lowers struct construction, field access, and a method call" {
@@ -4474,8 +4613,7 @@ test "lowers struct construction, field access, and a method call" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
     try testing.expectEqual(@as(usize, 2), out.module.funcs.items.len);
 }
@@ -4493,8 +4631,7 @@ test "monomorphizes a generic function per call-site instantiation" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
     // main + 2 distinct instantiations of identity (i64, bool).
     try testing.expectEqual(@as(usize, 3), out.module.funcs.items.len);
@@ -4511,8 +4648,7 @@ test "lowers a closure that captures an outer variable" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
     try testing.expectEqual(@as(usize, 2), out.module.funcs.items.len); // main + the closure body
 }
@@ -4520,18 +4656,34 @@ test "lowers a closure that captures an outer variable" {
 test "lowers defer to a LIFO call sequence before return" {
     const gpa = testing.allocator;
     const src =
-        \\function noop(x: i64): i64 { return x }
+        \\function first(): i64 { return 1 }
+        \\function second(): i64 { return 2 }
         \\function main(): i64 {
-        \\  defer noop(1)
-        \\  defer noop(2)
+        \\  defer first()
+        \\  defer second()
         \\  return 0
         \\}
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // THE named mutation on #1460: `defer` must run LAST-registered FIRST.
+    // The two deferred calls now target DISTINCT functions, so the order is
+    // visible in the dump rather than hidden behind two calls to one callee
+    // distinguished only by an SSA operand number. `@second` before `@first`,
+    // and both before the `ret`. Lowering these FIFO produces IR that verifies
+    // perfectly and is simply wrong.
+    try expectFuncDump(gpa, &out.module, "main",
+        \\func main() i64 {
+        \\bb0():
+        \\  %0 = const_int i64 0
+        \\  %1 = call @second() i64
+        \\  %2 = call @first() i64
+        \\  ret %0
+        \\}
+    );
 }
 
 test "lowers string interpolation to a concat rt_call" {
@@ -4543,9 +4695,27 @@ test "lowers string interpolation to a concat rt_call" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // The behaviour: the parts concatenate LEFT TO RIGHT in source order, each
+    // `string_concat` consuming the previous result, and the non-string hole is
+    // converted with `string_from_int` first. Reverse the fold or drop the
+    // conversion and the IR still verifies — it just prints the wrong string.
+    try expectFuncDump(gpa, &out.module, "greet",
+        \\func greet(%0: string, %1: i64) string {
+        \\bb0(%0: string, %1: i64):
+        \\  %2 = const_string "hi "
+        \\  %3 = const_string ", age "
+        \\  %4 = rt_call string_from_int(%1) string
+        \\  %5 = const_string ""
+        \\  %6 = rt_call string_concat(%2, %0) string
+        \\  %7 = rt_call string_concat(%6, %3) string
+        \\  %8 = rt_call string_concat(%7, %4) string
+        \\  %9 = rt_call string_concat(%8, %5) string
+        \\  ret %9
+        \\}
+    );
 }
 
 test "lowers channel construction, send, and receive" {
@@ -4560,8 +4730,7 @@ test "lowers channel construction, send, and receive" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
 }
 
@@ -4583,8 +4752,7 @@ test "lowers a select with a recv case, a send case, and a default" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
 }
 
@@ -4601,8 +4769,7 @@ test "lowers a slice literal, append, indexed store, len, and reslice" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
 }
 
@@ -4621,9 +4788,41 @@ test "lowers a value switch with a multi-expression case and default" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // The behaviour: a multi-expression case is an OR of equality tests
+    // (`1 || 2`), the arms are tried in source order via a chain of branches,
+    // and the default is the fall-through of the last test — not a peer tried
+    // first. Reorder the chain, or make `case 1, 2` an AND, and the IR verifies
+    // while classifying the wrong inputs.
+    try expectFuncDump(gpa, &out.module, "classify",
+        \\func classify(%0: i64) i64 {
+        \\bb0(%0: i64):
+        \\  %1 = const_int i64 0
+        \\  %2 = const_int i64 1
+        \\  %3 = icmp_eq bool %0, %2
+        \\  %4 = const_int i64 2
+        \\  %5 = icmp_eq bool %0, %4
+        \\  %6 = bor bool %3, %5
+        \\  br %6, bb3(), bb4()
+        \\bb1(%17: i64, %18: i64):
+        \\  ret %18
+        \\bb2():
+        \\  %15 = const_int i64 30
+        \\  jump bb1(%0, %15)
+        \\bb3():
+        \\  %8 = const_int i64 10
+        \\  jump bb1(%0, %8)
+        \\bb4():
+        \\  %10 = const_int i64 3
+        \\  %11 = icmp_eq bool %0, %10
+        \\  br %11, bb5(), bb2()
+        \\bb5():
+        \\  %13 = const_int i64 20
+        \\  jump bb1(%0, %13)
+        \\}
+    );
 }
 
 test "lowers a switch whose every arm breaks (join reachable only via break)" {
@@ -4646,7 +4845,29 @@ test "lowers a switch whose every arm breaks (join reachable only via break)" {
         \\
     ;
     var out = try lowerSource(gpa, src);
-    defer out.module.deinit();
-    defer out.ctx.deinit();
+    defer out.deinit(gpa);
     try ir.verify(gpa, &out.module);
+
+    // The behaviour: when every arm `break`s, the join block is reachable ONLY
+    // through those breaks — it has no fall-through predecessor — and each arm
+    // still hands it the value that arm assigned. A join wired to the wrong
+    // predecessor, or an arm that skips the join, verifies fine and returns the
+    // other arm's answer.
+    try expectFuncDump(gpa, &out.module, "f",
+        \\func f(%0: i64) i64 {
+        \\bb0(%0: i64):
+        \\  %1 = const_int i64 0
+        \\  %2 = const_int i64 1
+        \\  %3 = icmp_eq bool %0, %2
+        \\  br %3, bb3(), bb2()
+        \\bb1(%9: i64, %10: i64):
+        \\  ret %10
+        \\bb2():
+        \\  %7 = const_int i64 2
+        \\  jump bb1(%0, %7)
+        \\bb3():
+        \\  %5 = const_int i64 1
+        \\  jump bb1(%0, %5)
+        \\}
+    );
 }
