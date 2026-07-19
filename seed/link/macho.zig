@@ -1066,11 +1066,16 @@ test "an undefined symbol the program object references is a link error, not a d
     try testing.expectEqual(MH_MAGIC_64, std.mem.readInt(u32, ok[0..4], .little));
 
     // (3) An allowlist that names something else must not rescue it: the check
-    // has to compare the symbol, not merely count entries.
+    // has to compare the symbol's CONTENT, not merely count entries or measure
+    // it. The decoy is deliberately the SAME LENGTH as `_maybe_bogus` and
+    // differs by one character — with a shorter decoy a length-only comparison
+    // reproduces correct behaviour on both arms and the mutant survives, which
+    // is exactly what happened before this line was tightened.
+    comptime std.debug.assert("_maybe_bogos".len == "_maybe_bogus".len);
     try testing.expectError(error.UndefinedSymbol, buildImportCase(gpa, .{
         .identifier = "t",
         .program_modules = 1,
-        .allowed_imports = &.{"_unrelated"},
+        .allowed_imports = &.{"_maybe_bogos"},
     }));
 }
 
@@ -1101,30 +1106,60 @@ test "link() counts the program's own modules, so the undefined-symbol rule is l
     const gpa = testing.allocator;
     const obj_macho = @import("../obj/macho.zig");
 
-    // A minimal relocatable object: `__start` branching to an undefined
-    // `_bogus`. Written by our own object writer and read back by
+    // Both inputs are written by our own object writer and read back by
     // `macho_reader`, i.e. exactly the round trip every macOS build performs.
-    const code = [_]u8{ 0x00, 0x00, 0x00, 0x94 }; // bl _bogus
-    const bytes = try obj_macho.write(gpa, .aarch64, .{
-        .sections = &.{.{ .kind = .text, .data = &code, .alignment = 4 }},
+    //
+    // The ARCHIVE is not decoration. `program_modules` counts a PREFIX, so a
+    // `link()` that appended archive members before object modules would still
+    // count 1 and still blame module 0 — with an object-only input the
+    // reordering is unobservable. With an archive present it flips which symbol
+    // is named, which is what makes the order a tested property rather than an
+    // assumed one.
+    const prog_code = [_]u8{ 0x00, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00, 0x94 }; // bl _helper ; bl _bogus
+    const prog = try obj_macho.write(gpa, .aarch64, .{
+        .sections = &.{.{ .kind = .text, .data = &prog_code, .alignment = 4 }},
         .symbols = &.{
-            .{ .name = entry_symbol, .section = .text, .offset = 0, .size = code.len, .binding = .global },
+            .{ .name = entry_symbol, .section = .text, .offset = 0, .size = prog_code.len, .binding = .global },
+            .{ .name = "_helper", .section = null, .binding = .global },
             .{ .name = "_bogus", .section = null, .binding = .global },
         },
-        .relocations = &.{.{ .section = .text, .offset = 0, .symbol = "_bogus", .kind = .branch }},
+        .relocations = &.{
+            .{ .section = .text, .offset = 0, .symbol = "_helper", .kind = .branch },
+            .{ .section = .text, .offset = 4, .symbol = "_bogus", .kind = .branch },
+        },
     });
-    defer gpa.free(bytes);
+    defer gpa.free(prog);
+
+    // The archive member: defines `_helper`, and reaches libSystem itself.
+    const rt_code = [_]u8{ 0x00, 0x00, 0x00, 0x94 }; // bl _libsystem_fn
+    const rt = try obj_macho.write(gpa, .aarch64, .{
+        .sections = &.{.{ .kind = .text, .data = &rt_code, .alignment = 4 }},
+        .symbols = &.{
+            .{ .name = "_helper", .section = .text, .offset = 0, .size = rt_code.len, .binding = .global },
+            .{ .name = "_libsystem_fn", .section = null, .binding = .global },
+        },
+        .relocations = &.{.{ .section = .text, .offset = 0, .symbol = "_libsystem_fn", .kind = .branch }},
+    });
+    defer gpa.free(rt);
+    const lib = try archive.write(gpa, .bsd, &.{.{ .name = "rt.o", .data = rt }});
+    defer gpa.free(lib);
+
+    const inputs = [_]Input{ .{ .object = prog }, .{ .archive = lib } };
 
     var undef: UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
-    try testing.expectError(error.UndefinedSymbol, link(gpa, &.{.{ .object = bytes }}, .{
+    try testing.expectError(error.UndefinedSymbol, link(gpa, &inputs, .{
         .identifier = "t",
         .undefined_out = &undef,
     }));
+    // Naming `_bogus` (not `_libsystem_fn`) is what proves the object module
+    // landed in the counted prefix and the archive member did not.
     try testing.expectEqualStrings("_bogus", undef.symbol);
+    try testing.expectEqualStrings("bit.o", undef.referenced_from);
 
-    // And the same object links once `_bogus` is a declared `extern function`,
+    // And the same inputs link once `_bogus` is a declared `extern function`,
     // so the gate discriminates rather than rejecting the program outright.
-    const ok = try link(gpa, &.{.{ .object = bytes }}, .{
+    // This also proves `_libsystem_fn` stayed a leaf.
+    const ok = try link(gpa, &inputs, .{
         .identifier = "t",
         .allowed_imports = &.{"_bogus"},
     });

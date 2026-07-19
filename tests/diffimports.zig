@@ -70,6 +70,7 @@
 //! lesson `rootpins` paid for.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bit = @import("bit");
 const build_options = @import("build_options");
 
@@ -300,4 +301,77 @@ fn emitWithSelfhost(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixt
         return error.SelfhostCompileFailed;
     }
     return Dir.cwd().readFileAlloc(io, out, gpa, .limited(64 << 20));
+}
+
+// The other half of "both linkers agree" (#1445).
+//
+// The test above compares what the two compilers EMIT. This one compares what
+// their two linkers ACCEPT, which is a separate question and the one #1445
+// changed: the Mach-O path now refuses an undefined symbol that no `extern
+// function` declared, so a bug in deriving that allowlist would turn every
+// legitimate extern program into a link error. The unit tests in
+// `seed/link/macho.zig` and `selfhost/selfcheck.bit` each cover the rejecting
+// direction for one compiler; nothing covered the accepting direction
+// end-to-end, under both, over the real fixtures.
+//
+// Skips off aarch64-macOS: the fixtures are pinned to that target (E0078
+// forbids `extern` elsewhere) and the wired archive is the HOST's, so linking
+// anywhere else would pair a Mach-O object with a Linux runtime.
+test "both linkers accept every legitimate extern program" {
+    comptime std.debug.assert(fixtures.len != 0);
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    if (build_options.libbitrt_path.len == 0) return error.SkipZigTest;
+    try testing.expect(build_options.selfhost_bit.len > 0);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var threaded = Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const libbitrt = try Dir.cwd().readFileAlloc(io, build_options.libbitrt_path, gpa, .limited(64 << 20));
+
+    for (fixtures) |f| {
+        const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, f.path });
+
+        // Selfhost first — same `fork`/ETXTBSY ordering rule as above.
+        const self_out = try std.fmt.allocPrint(gpa, "/tmp/bit-diflink-{s}-{x}", .{ std.fs.path.basename(abs), testing.random_seed });
+        defer Dir.cwd().deleteFile(io, self_out) catch {};
+        const r = try std.process.run(gpa, io, .{
+            .argv = &.{ build_options.selfhost_bit, "build", abs, "-o", self_out, "--target", targetFlag(target) },
+        });
+        if (r.term != .exited or r.term.exited != 0) {
+            std.debug.print(
+                "diffimports: selfhost REFUSED to link '{s}', which declares its imports with 'extern function' and must link:\n{s}{s}\n",
+                .{ f.path, r.stdout, r.stderr },
+            );
+            return error.SelfhostLinkRejected;
+        }
+
+        var diags: Io.Writer.Allocating = .init(gpa);
+        defer diags.deinit();
+        const seed_exe = (try bit.buildProject(
+            gpa,
+            io,
+            abs,
+            null,
+            build_options.stdlib_dir,
+            f.path,
+            libbitrt,
+            target,
+            &diags.writer,
+            null,
+            false, // link, do not stop at the object
+            false,
+        )) orelse {
+            std.debug.print(
+                "diffimports: seed REFUSED to link '{s}', which declares its imports with 'extern function' and must link:\n{s}\n",
+                .{ f.path, diags.written() },
+            );
+            return error.SeedLinkRejected;
+        };
+        try testing.expect(seed_exe.len > 0);
+    }
 }

@@ -806,6 +806,9 @@ pub fn build(b: *std.Build) void {
     wireLibbitrt(testcmd_opts, host_libbitrt_bin);
     wireLibbitrt(osenv_opts, host_libbitrt_bin);
     wireLibbitrt(imports_opts, host_libbitrt_bin);
+    // #1445's link-acceptance half needs a real archive: the import-set half
+    // only emits objects and never links.
+    wireLibbitrt(diffimports_opts, host_libbitrt_bin);
 
     // Still install the host archive under `zig build test` so the CLI-path
     // end-to-end tests (link.zig, main.zig) that read `zig-out/lib/<triple>/`
