@@ -1,0 +1,187 @@
+// #1364's SURVIVING MUTANT: that the poller registers ONE-SHOT and not merely
+// that it registers. Darwin/kqueue; ../polloneshotlinux is the epoll twin.
+//
+// ../schedpolldarwin proves a task WAKES on a ready fd. It cannot prove the
+// registration disarms, because it drains every pipe it makes ready and then
+// never parks on the same fd again — so dropping `EV_ONESHOT` from
+// `evAddOneshot()` (17 -> 1, i.e. EV_ADD alone) passes it, and dropping
+// `EPOLLONESHOT` passes its Linux twin. That is the #1364 survivor, and this
+// program is the guard for it.
+//
+// THE PROPERTY IS A NEGATIVE, AND THAT DICTATES THE WHOLE SHAPE. "The task is
+// not woken a second time" cannot be observed by waiting for something to
+// happen; it is observed by giving a bounded amount of opportunity for it to
+// happen and finding that it did not. So:
+//
+//   - The pipe is written once and NEVER READ. The fd therefore stays
+//     level-readable for the entire run — under a level-triggered registration
+//     the kernel would re-report it on every single drain, which is the loudest
+//     possible version of the bug.
+//   - The task parks a SECOND time WITHOUT RE-REGISTERING. With ONESHOT the
+//     first event consumed the registration, so nothing can wake it. Without
+//     ONESHOT the stale level report wakes it immediately.
+//   - The give-up is bounded and rides the CLOCK hook, never the poller hook.
+//     A negative property whose failure mode is a hang is not a guard: the
+//     harness would report a wedged suite rather than a verdict, which is the
+//     trap ../schedtimer's first draft fell into. `guardClock` shuts the
+//     scheduler down after a fixed number of idle passes, so the ONESHOT case
+//     terminates with an ANSWER and the non-ONESHOT case fails on the
+//     observation rather than on a timeout.
+//
+// WHY THE GIVE-UP CANNOT BE ON THE POLLER HOOK: the second park is waiting on
+// the poller, so a guard that counted drains would be counting the very thing
+// whose absence it is meant to detect — delete the poller and the guard dies
+// with it. Counting clock ticks is independent of the mechanism under test.
+//
+// Darwin-only by construction, hence the sibling `darwin-only` marker: it binds
+// runtime/sched/darwin, which reaches libSystem through `extern function`
+// (SPEC §11.7) — rejected on Linux even for an uncalled declaration.
+
+import { schedInit, schedWorkerAt, schedWorkerRun } from "../../../runtime/sched"
+import { schedSetPollFd, pollRead, schedTaskInit, schedRegister } from "../../../runtime/sched"
+import { schedSpawn, schedShutdown, schedTaskExit, schedPark } from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt } from "../../../runtime/sched"
+import { pollCreate, pollClose, pollRegister, pollDrain } from "../../../runtime/sched/darwin"
+
+// int pipe(int fds[2]); ssize_t write(int, const void *, size_t);
+// Only C-representable types cross the boundary (§11.7).
+extern function pipe(fds: *u8): i32
+extern function write(fd: i32, buf: *u8, n: i64): i64
+
+const pollWorkers: int = 1
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+// One 64KiB stack inside a 128KiB region, so a 64KiB-aligned base exists
+// whatever address the linker gives the array.
+let stackArea: [16384]i64
+let waiterTask: [32]i64
+
+// `int fds[2]` — TWO PACKED 32-BIT FIELDS IN ONE 8-BYTE WORD, so this is an
+// `[1]i64` read through a byte cursor rather than the `[2]i32` it looks like.
+// A Bit array stores one 8-BYTE WORD per element (§11.8), so `[2]i32` would be
+// SIXTEEN bytes and the kernel's 8-byte write would land entirely inside
+// element 0. Same bridge ../schedpolldarwin documents at length.
+let pipeFds: [1]i64
+let writeBuf: [1]i64
+
+// Observations. Untraced module state (§11.11): written from a green thread,
+// read by the driver, and never walked by the collector.
+//
+// TWO SEPARATE WORDS, NOT A COUNTER. A count would let a single wrong value
+// stand in for two different failures — "woken once" and "woken twice" must be
+// distinguishable in the output, because the first is the precondition and the
+// second is the defect.
+let obsWoke1: i64 = 0
+let obsWoke2: i64 = 0
+let addrWoke1: i64 = 0
+let addrWoke2: i64 = 0
+let addrSched: i64 = 0
+
+// The idle-pass budget before the program gives up and declares the second wake
+// absent — which, here, is the PASS condition.
+//
+// Rides the CLOCK hook while the poller is the thing under test. See the header.
+// `schedWorkerRun`'s own trip bound is a billion steps and would wedge the suite
+// for hours, so it cannot serve as the bound for a deliberately-never-satisfied
+// wait.
+const idleGiveUp: int = 200000
+let idlePasses: i64 = 0
+
+function guardClock(): int {
+  idlePasses = idlePasses + 1
+  if (int(idlePasses) > idleGiveUp) {
+    schedShutdown(taskAt(addrSched))
+  }
+  return int(idlePasses)
+}
+
+function schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+// THE TASK UNDER TEST. Park, record the first wake, then PARK AGAIN WITHOUT
+// RE-REGISTERING.
+//
+// The pipe still holds its unread byte at the second park, so a level-triggered
+// registration reports it ready again and this body reaches the second store.
+// A one-shot registration was consumed by the first event, so the second park
+// is permanent and `guardClock` ends the run with `obsWoke2` still zero.
+//
+// It NEVER calls `schedTaskExit` on the ONESHOT path, and that is correct
+// rather than a leak: the task is meant to still be parked when the program
+// ends. The exit call after the second store exists so that the FAILING path
+// unwinds normally and reports its verdict instead of tripping some unrelated
+// shutdown assertion — the failure must be legible.
+//
+// `@nosplit` because a green task's stack is reached by the conservative scan
+// rather than by a published safepoint frame — still true for every task body.
+@nosplit function waiterBody() {
+  schedPark()
+  atomicStore(taskAt(addrWoke1), 1)
+  schedPark()
+  atomicStore(taskAt(addrWoke2), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+function main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), pollWorkers)
+  addrWoke1 = int(ptrOf(obsWoke1))
+  addrWoke2 = int(ptrOf(obsWoke2))
+  addrSched = schedAddr()
+
+  let pfd = pollCreate()
+  let created = pfd >= 0
+  schedSetPollFd(s, pfd)
+
+  pipeFds[0] = 0
+  let zb: *u8 = nil
+  let piped = int(pipe(zb + int(ptrOf(pipeFds)))) == 0
+  // Split the packed pair: fds[0] is the low 32 bits, fds[1] the high 32.
+  let fdWord = int(pipeFds[0])
+  let readFd = fdWord % 4294967296
+  let writeFd = fdWord / 4294967296
+
+  let base = int(ptrOf(stackArea))
+  let bumped = base + schedStackBytes - 1
+  let stackBase = bumped - bumped % schedStackBytes
+  let aligned = schedStackAligned(stackBase)
+
+  let taskAddr = int(ptrOf(waiterTask))
+  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes, entryOf(waiterBody), 0)
+  schedRegister(s, taskAddr)
+
+  // Registered EXACTLY ONCE, before the task runs, and never again. That single
+  // registration is the whole subject of this program: everything after it asks
+  // how many wakes one registration is worth.
+  let registered = pollRegister(pfd, readFd, pollRead, taskAddr)
+
+  schedSpawn(s, taskAddr)
+
+  // Make the pipe readable and LEAVE IT READABLE. Nothing in this program ever
+  // reads `readFd`, so the level condition holds for the rest of the run.
+  writeBuf[0] = 0
+  let z: *u8 = nil
+  let wbuf = z + int(ptrOf(writeBuf))
+  let wrote = int(write(i32(writeFd), wbuf, i64(1))) == 1
+
+  schedWorkerRun(schedWorkerAt(s, 0), guardClock, pollDrain)
+
+  // The precondition: the single registration DID deliver one wake. Without
+  // this the program would "pass" on a poller that never fires at all, which is
+  // the vacuous form of a negative assertion.
+  let wokeOnce = int(obsWoke1) != 0
+  // THE PROPERTY: and only one. A second wake means the registration was not
+  // one-shot and the still-readable fd re-reported.
+  let stayedParked = int(obsWoke2) == 0
+  // The run ended through the give-up rather than by exhausting anything else,
+  // which is what makes `stayedParked` a bounded observation rather than luck.
+  let gaveUp = int(idlePasses) > idleGiveUp
+
+  pollClose(pfd)
+
+  println("poller ${created} ${piped} ${aligned} armed ${registered} wrote ${wrote}")
+  println("woke ${wokeOnce} oneshot ${stayedParked} gaveup ${gaveUp}")
+}
