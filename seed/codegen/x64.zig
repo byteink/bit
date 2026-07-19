@@ -1401,10 +1401,22 @@ fn emitBinaryFloat(self: *Ctx, op: Ctx.FArithOp, dst: u32, lhs: ir.ValueId, rhs:
 }
 
 /// `-x` via `0.0 - x` (no sign-mask constant needed — see module doc comment).
+/// `-x` — flip the sign BIT. Not `0.0 - x`, which this used to be and which is
+/// wrong twice: `0.0 - 0.0` is `+0.0`, so negating zero lost the sign, and
+/// subtraction returns a NaN operand with its sign bit *cleared*, so `-NaN`
+/// came back as `+NaN`. Both are invisible to `==` (`-0.0 == 0.0` is true,
+/// `NaN == NaN` is false either way) and to every arithmetic use, but they
+/// change the bits and so the printed string.
+///
+/// It stayed hidden because `lower.zig` constant-folds a negated float
+/// LITERAL, so only negating a runtime value ever reached here. AArch64 was
+/// unaffected throughout: `FNEG` is a real sign-bit flip.
 fn emitFneg(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
-    const v = try getFloat(self, vregOf(self, operand), fscratch2);
-    try self.xorpX(fscratch1, fscratch1, width);
-    try self.fArithRR(.sub, fscratch1, v, width);
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    if (v != fscratch1) try self.movFRR(fscratch1, v, width);
+    try self.movRI(scratch1, @bitCast(if (width == 8) f64_sign_mask else @as(u64, 0x8000_0000)));
+    try self.movXG(fscratch2, scratch1, width);
+    try self.xorpX(fscratch1, fscratch2, width);
     try putFloat(self, dst, fscratch1);
 }
 
@@ -1412,6 +1424,123 @@ fn emitFneg(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
 fn emitFsqrt(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
     const v = try getFloat(self, vregOf(self, operand), fscratch1);
     try self.sqrtF(fscratch1, v, width);
+    try putFloat(self, dst, fscratch1);
+}
+
+const RoundMode = enum { floor, ceil, trunc, round };
+
+/// Raw f64 bit patterns this expansion needs as immediates. Materialized into
+/// a GPR and moved across, exactly as `emitConstFloat` does — no `.rodata`
+/// constant pool and so no relocation.
+const f64_abs_mask: u64 = 0x7FFF_FFFF_FFFF_FFFF; // clear the sign bit
+const f64_sign_mask: u64 = 0x8000_0000_0000_0000; // keep only the sign bit
+const f64_two52: u64 = 0x4330_0000_0000_0000; // 2^52
+const f64_one: u64 = 0x3FF0_0000_0000_0000; // 1.0
+const f64_half: u64 = 0x3FE0_0000_0000_0000; // 0.5
+
+/// `ffloor`/`fceil`/`ftrunc`/`fround` on x86-64, where the one-instruction form
+/// (`roundsd`) is SSE4.1 and this backend emits nothing above SSE2. Raising the
+/// baseline would raise it for every binary the compiler produces — a much
+/// larger decision than this change — so the op is expanded instead.
+///
+/// The expansion is a `cvttsd2si`/`cvtsi2sd` round trip, which truncates toward
+/// zero, plus a correction. Three things make it correct rather than merely
+/// plausible, and each is the thing a naive version gets wrong:
+///
+///  1. **The magnitude guard comes first.** Every |x| >= 2^52 double is already
+///     an integer, so the result is `x` untouched. That is not just an
+///     optimization: it is also what keeps NaN and both infinities out of the
+///     round trip (`cvttsd2si` would turn them into `INT64_MIN`), and what
+///     keeps the conversion inside i64's range. NaN's and infinity's exponents
+///     put them above the threshold, so one unsigned compare covers all three.
+///  2. **The sign of zero is restored explicitly.** The round trip takes -0.5
+///     to +0.0, losing the sign — invisible to `==` (`-0.0 == 0.0` is true) but
+///     it flips the printed shortest string. The sign bit is carried over from
+///     the operand after the conversion.
+///  3. **The correction compares against the ORIGINAL x**, not against a
+///     reconstructed value. This is why `ceil(-1e-300)` is `-0.0` here and not
+///     `+0.0`: truncation gives `-0.0`, which is already >= x, so no `+1.0` is
+///     applied and the sign survives. The `(x + 2^52) - 2^52` identity — the
+///     other obvious SSE2 approach — gets exactly this case wrong, which is
+///     why it is not used.
+///
+/// `fround` is ties-AWAY-from-zero (`@round`), so the correction tests
+/// `|x - trunc(x)| >= 0.5` and adds `copysign(1.0, x)`. It is NOT `roundsd`
+/// mode 0, which is ties-to-even and disagrees on every halfway case.
+///
+/// The branches are local skip-overs patched immediately (`patchRel32Here`),
+/// not block edges — this stays a single IR instruction. It allocates nothing
+/// and reaches no safepoint, so it remains legal inside `@nosplit`.
+fn emitFRound(self: *Ctx, dst: u32, operand: ir.ValueId, mode: RoundMode) !void {
+    // `prim_sigs` types all four as `(f64) -> f64`; the expansion's constants
+    // are f64 bit patterns and would silently be wrong at any other width.
+    const width = widthOf(self.tctx(), self.f.valueType(operand)).bytes;
+    std.debug.assert(width == 8);
+
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    if (v != fscratch1) try self.movFRR(fscratch1, v, 8);
+
+    // scratch1 = bits(x), kept live to the end: it is the source of both the
+    // sign restore and the untouched result on the guard path.
+    try self.movGX(scratch1, fscratch1, 8);
+    try self.movRI(scratch2, @bitCast(f64_abs_mask));
+    try self.arithRR(.and_, scratch2, scratch1); // |x| bits
+    try self.movRI(scratch3, @bitCast(f64_two52));
+    try self.arithRR(.cmp, scratch2, scratch3);
+    // jae -> already integral (or inf/NaN): fscratch1 still holds x verbatim.
+    const guard = try self.emitCondJumpPlaceholder(0x3);
+
+    try self.cvtF2I(scratch2, fscratch1, 8); // (i64)x, truncated toward zero
+    try self.movXG(fscratch2, scratch1, 8); // keep the original x for the compare
+    try self.cvtI2F(fscratch1, scratch2, 8); // t = (f64)(i64)x
+
+    // t = copysign(|t|, x) — see (2) above.
+    try self.movGX(scratch2, fscratch1, 8);
+    try self.movRI(scratch3, @bitCast(f64_abs_mask));
+    try self.arithRR(.and_, scratch2, scratch3);
+    try self.movRI(scratch3, @bitCast(f64_sign_mask));
+    try self.arithRR(.and_, scratch3, scratch1);
+    try self.arithRR(.or_, scratch2, scratch3);
+    try self.movXG(fscratch1, scratch2, 8);
+
+    var skip: ?u32 = null;
+    switch (mode) {
+        // Truncation is what the round trip already did.
+        .trunc => {},
+        .floor => {
+            try self.ucomis(fscratch1, fscratch2, 8);
+            skip = try self.emitCondJumpPlaceholder(0x6); // jbe: t <= x, nothing to do
+            try self.movRI(scratch2, @bitCast(f64_one));
+            try self.movXG(fscratch2, scratch2, 8);
+            try self.fArithRR(.sub, fscratch1, fscratch2, 8);
+        },
+        .ceil => {
+            try self.ucomis(fscratch1, fscratch2, 8);
+            skip = try self.emitCondJumpPlaceholder(0x3); // jae: t >= x, nothing to do
+            try self.movRI(scratch2, @bitCast(f64_one));
+            try self.movXG(fscratch2, scratch2, 8);
+            try self.fArithRR(.add, fscratch1, fscratch2, 8);
+        },
+        .round => {
+            try self.fArithRR(.sub, fscratch2, fscratch1, 8); // d = x - t
+            try self.movGX(scratch2, fscratch2, 8);
+            try self.movRI(scratch3, @bitCast(f64_abs_mask));
+            try self.arithRR(.and_, scratch2, scratch3); // |d|
+            try self.movRI(scratch3, @bitCast(f64_half));
+            try self.arithRR(.cmp, scratch2, scratch3);
+            skip = try self.emitCondJumpPlaceholder(0x2); // jb: |d| < 0.5, ties-away does not fire
+            // copysign(1.0, x): away from zero, so the halfway case rounds up
+            // in magnitude in both directions.
+            try self.movRI(scratch2, @bitCast(f64_one));
+            try self.movRI(scratch3, @bitCast(f64_sign_mask));
+            try self.arithRR(.and_, scratch3, scratch1);
+            try self.arithRR(.or_, scratch2, scratch3);
+            try self.movXG(fscratch2, scratch2, 8);
+            try self.fArithRR(.add, fscratch1, fscratch2, 8);
+        },
+    }
+    if (skip) |s| self.patchRel32Here(s);
+    self.patchRel32Here(guard);
     try putFloat(self, dst, fscratch1);
 }
 
@@ -2491,6 +2620,10 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .fneg => try emitFneg(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
         .fsqrt => try emitFsqrt(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
         .bitcast => try emitBitcast(self, dst, d.un.operand, widthOf(self.tctx(), self.f.valueType(d.un.operand)).bytes),
+        .ffloor => try emitFRound(self, dst, d.un.operand, .floor),
+        .fceil => try emitFRound(self, dst, d.un.operand, .ceil),
+        .ftrunc => try emitFRound(self, dst, d.un.operand, .trunc),
+        .fround => try emitFRound(self, dst, d.un.operand, .round),
         .icmp_eq, .icmp_ne, .icmp_slt, .icmp_sle, .icmp_sgt, .icmp_sge, .icmp_ult, .icmp_ule, .icmp_ugt, .icmp_uge => try emitIcmp(self, op, dst, d.bin.lhs, d.bin.rhs),
         .fcmp_eq, .fcmp_ne, .fcmp_lt, .fcmp_le, .fcmp_gt, .fcmp_ge => try emitFcmp(self, op, dst, d.bin.lhs, d.bin.rhs, widthOf(self.tctx(), self.f.valueType(d.bin.lhs)).bytes),
         .jump => try emitJump(self, d.jump.target, d.jump.args),

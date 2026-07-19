@@ -769,6 +769,18 @@ const Ctx = struct {
     fn fsqrtF(self: *Ctx, dst: FReg, src: FReg, width: u8) !void {
         try self.fp1Source(0b000011, width, dst, src);
     }
+    /// `FRINTx Dd, Dn` — round to an integral value in the given direction,
+    /// same "floating-point data-processing (1 source)" group. Exact by
+    /// construction: the hardware handles signed zeros, subnormals, infinities
+    /// and NaN, so there is nothing for this backend to special-case.
+    ///
+    /// `FRINTA` (`001100`) is ties-AWAY-from-zero, which is what `fround`
+    /// means. `FRINTN` (`001000`) is ties-to-EVEN and is deliberately unused —
+    /// the two differ on exactly the halfway cases (`round(2.5)` is 3.0, not
+    /// 2.0), which is the one thing a careless port gets wrong here.
+    fn frintF(self: *Ctx, opcode: u6, dst: FReg, src: FReg, width: u8) !void {
+        try self.fp1Source(opcode, width, dst, src);
+    }
 
     /// `FCMP Dn, Dm` (floating-point compare, register form) — sets NZCV
     /// per the module doc comment's condition-code derivation.
@@ -1377,6 +1389,14 @@ fn emitFsqrt(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
 /// widths differently. `FMOV Wd, Sn` writes the 32-bit W view, which
 /// zero-extends into X — the canonical form this backend keeps narrow unsigned
 /// values in.
+/// `ffloor`/`fceil`/`ftrunc`/`fround` — one `FRINT` each. See `frintF` for why
+/// `fround` is `FRINTA` and not `FRINTN`.
+fn emitFRound(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8, opcode: u6) !void {
+    const v = try getFloat(self, vregOf(self, operand), fscratch1);
+    try self.frintF(opcode, fscratch1, v, width);
+    try putFloat(self, dst, fscratch1);
+}
+
 fn emitBitcast(self: *Ctx, dst: u32, operand: ir.ValueId, width: u8) !void {
     const v = try getFloat(self, vregOf(self, operand), fscratch1);
     try self.fmovFromFp(scratch1, v, width);
@@ -1999,6 +2019,12 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
             .convert => try emitConvert(self, i, u.operand, ty),
             .fneg => try emitFneg(self, i, u.operand, iw.bytes),
             .fsqrt => try emitFsqrt(self, i, u.operand, iw.bytes),
+            // FRINTM / FRINTP / FRINTZ / FRINTA — floor, ceil, truncate,
+            // round-half-away-from-zero.
+            .ffloor => try emitFRound(self, i, u.operand, iw.bytes, 0b001010),
+            .fceil => try emitFRound(self, i, u.operand, iw.bytes, 0b001001),
+            .ftrunc => try emitFRound(self, i, u.operand, iw.bytes, 0b001011),
+            .fround => try emitFRound(self, i, u.operand, iw.bytes, 0b001100),
             // Operand width, not `iw`: this op's result is the integer view, so
             // the result type carries no float width to read.
             .bitcast => try emitBitcast(self, i, u.operand, common.widthOf(self.tctx(), self.f.valueType(u.operand)).bytes),

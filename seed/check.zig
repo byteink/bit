@@ -5376,12 +5376,18 @@ const Checker = struct {
                             // avoid — the runtime's own float helpers are
                             // nosplit-by-nature, and these primitives are exactly
                             // what implements them. `ffloor`/`fceil`/`ftrunc`/
-                            // `fround` are deliberately absent: they are still
-                            // `rt_call`s on x86-64 (SSE2 baseline, no `roundsd`),
-                            // so the proof does not hold for them.
+                            // `fround` join on the same proof: on x86-64 they
+                            // expand to a short SSE2 sequence rather than one
+                            // `roundsd` (SSE4.1), but an expansion still neither
+                            // allocates nor reaches a safepoint, which is the
+                            // only property this carve-out rests on.
                             std.mem.eql(u8, sym.name, "fsqrt") or
                             std.mem.eql(u8, sym.name, "floatBits") or
-                            std.mem.eql(u8, sym.name, "float32Bits");
+                            std.mem.eql(u8, sym.name, "float32Bits") or
+                            std.mem.eql(u8, sym.name, "ffloor") or
+                            std.mem.eql(u8, sym.name, "fceil") or
+                            std.mem.eql(u8, sym.name, "ftrunc") or
+                            std.mem.eql(u8, sym.name, "fround");
                     // A call whose callee names a builtin TYPE is a conversion
                     // (§12.9), not a call. A conversion between NUMERIC prims —
                     // including `int(p)`, a raw pointer's address (§11.4) — is

@@ -2402,10 +2402,25 @@ function xEmitRet(cx: XCtx, vals: []int): bool {
 // `fneg`: x86-64 has no scalar float negate, so subtract from +0.0. Zeroing with
 // xorps and subtracting is the whole trick — note 0.0 - x, NOT x - 0.0, which is
 // the identity and would silently leave the value unchanged.
+// `-x` — flip the sign BIT. Not `0.0 - x`, which this used to be and which is
+// wrong twice: `0.0 - 0.0` is `+0.0`, so negating zero lost the sign, and
+// subtraction returns a NaN operand with its sign bit *cleared*, so `-NaN` came
+// back as `+NaN`. Both are invisible to `==` and to every arithmetic use, but
+// they change the bits and so the printed string. It stayed hidden because a
+// negated float LITERAL is constant-folded, so only negating a runtime value
+// ever reached here. AArch64 was unaffected: `FNEG` is a real sign-bit flip.
 function xEmitFneg(cx: XCtx, dst: int, operand: int, width: int) {
-  let v = xGetFloat(cx, operand, xFScratch2())
-  xXorp(cx.buf, xFScratch1(), xFScratch1(), width)
-  xFArithRR(cx.buf, XFArith.FSub, xFScratch1(), v, width)
+  let v = xGetFloat(cx, operand, xFScratch1())
+  if (v != xFScratch1()) {
+    xMovFRR(cx.buf, xFScratch1(), v, width)
+  }
+  let mask = xF64SignMask()
+  if (width != 8) {
+    mask = 1 << 31
+  }
+  xMovRI(cx.buf, xScratch1(), mask)
+  xMovXG(cx.buf, xFScratch2(), xScratch1(), width)
+  xXorp(cx.buf, xFScratch1(), xFScratch2(), width)
   xPutFloat(cx, dst, xFScratch1())
 }
 
@@ -2413,6 +2428,132 @@ function xEmitFneg(cx: XCtx, dst: int, operand: int, width: int) {
 function xEmitFsqrt(cx: XCtx, dst: int, operand: int, width: int) {
   let v = xGetFloat(cx, operand, xFScratch1())
   xSqrtF(cx.buf, xFScratch1(), v, width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+enum XRoundMode {
+  Floor,
+  Ceil,
+  Trunc,
+  Round,
+}
+
+// Raw f64 bit patterns this expansion needs as immediates. Materialized into a
+// GPR and moved across, exactly as xEmitConstFloat does — no .rodata constant
+// pool and so no relocation.
+function xF64AbsMask(): int { return 0x7FFFFFFFFFFFFFFF }  // clear the sign bit
+function xF64SignMask(): int { return 1 << 63 }            // keep only the sign bit
+function xF64Two52(): int { return 0x4330000000000000 }    // 2^52
+function xF64One(): int { return 0x3FF0000000000000 }      // 1.0
+function xF64Half(): int { return 0x3FE0000000000000 }     // 0.5
+
+// `ffloor`/`fceil`/`ftrunc`/`fround` on x86-64, where the one-instruction form
+// (`roundsd`) is SSE4.1 and this backend emits nothing above SSE2. Raising the
+// baseline would raise it for every binary the compiler produces — a much
+// larger decision than this change — so the op is expanded instead.
+//
+// The expansion is a cvttsd2si/cvtsi2sd round trip, which truncates toward
+// zero, plus a correction. Three things make it correct rather than merely
+// plausible, and each is the thing a naive version gets wrong:
+//
+//  1. The magnitude guard comes first. Every |x| >= 2^52 double is already an
+//     integer, so the result is x untouched. That is not just an optimization:
+//     it is also what keeps NaN and both infinities out of the round trip
+//     (cvttsd2si would turn them into INT64_MIN), and what keeps the conversion
+//     inside i64's range. NaN's and infinity's exponents put them above the
+//     threshold, so one unsigned compare covers all three.
+//  2. The sign of zero is restored explicitly. The round trip takes -0.5 to
+//     +0.0, losing the sign — invisible to `==` (`-0.0 == 0.0` is true) but it
+//     flips the printed shortest string. The sign bit is carried over from the
+//     operand after the conversion.
+//  3. The correction compares against the ORIGINAL x, not against a
+//     reconstructed value. This is why `ceil(-1e-300)` is -0.0 here and not
+//     +0.0: truncation gives -0.0, which is already >= x, so no +1.0 is applied
+//     and the sign survives. The `(x + 2^52) - 2^52` identity — the other
+//     obvious SSE2 approach — gets exactly this case wrong, which is why it is
+//     not used.
+//
+// `fround` is ties-AWAY-from-zero, so the correction tests |x - trunc(x)| >= 0.5
+// and adds copysign(1.0, x). It is NOT `roundsd` mode 0, which is ties-to-even
+// and disagrees on every halfway case.
+//
+// The branches are local skip-overs patched immediately (xPatchRel32Here), not
+// block edges — this stays a single IR instruction. It allocates nothing and
+// reaches no safepoint, so it remains legal inside `@nosplit`.
+function xEmitFRound(cx: XCtx, dst: int, operand: int, mode: XRoundMode) {
+  // `prim_sigs` types all four as (f64) -> f64; the expansion's constants are
+  // f64 bit patterns and would silently be wrong at any other width.
+  let width = widthOf(cx.ctx, cx.f.instrs[operand].ty).bytes
+  if (width != 8) {
+    panic("fround expansion requires an f64 operand")
+  }
+
+  let v = xGetFloat(cx, operand, xFScratch1())
+  if (v != xFScratch1()) {
+    xMovFRR(cx.buf, xFScratch1(), v, 8)
+  }
+
+  // xScratch1 = bits(x), kept live to the end: it is the source of both the
+  // sign restore and the untouched result on the guard path.
+  xMovGX(cx.buf, xScratch1(), xFScratch1(), 8)
+  xMovRI(cx.buf, xScratch2(), xF64AbsMask())
+  xArithRR(cx.buf, XArith.And, xScratch2(), xScratch1())  // |x| bits
+  xMovRI(cx.buf, xScratch3(), xF64Two52())
+  xArithRR(cx.buf, XArith.Cmp, xScratch2(), xScratch3())
+  // jae -> already integral (or inf/NaN): xFScratch1 still holds x verbatim.
+  let guard = xJccRel32Placeholder(cx, ccAe())
+
+  xCvtF2I(cx.buf, xScratch2(), xFScratch1(), 8)   // (i64)x, truncated toward zero
+  xMovXG(cx.buf, xFScratch2(), xScratch1(), 8)    // keep the original x for the compare
+  xCvtI2F(cx.buf, xFScratch1(), xScratch2(), 8)   // t = (f64)(i64)x
+
+  // t = copysign(|t|, x) — see (2) above.
+  xMovGX(cx.buf, xScratch2(), xFScratch1(), 8)
+  xMovRI(cx.buf, xScratch3(), xF64AbsMask())
+  xArithRR(cx.buf, XArith.And, xScratch2(), xScratch3())
+  xMovRI(cx.buf, xScratch3(), xF64SignMask())
+  xArithRR(cx.buf, XArith.And, xScratch3(), xScratch1())
+  xArithRR(cx.buf, XArith.Or, xScratch2(), xScratch3())
+  xMovXG(cx.buf, xFScratch1(), xScratch2(), 8)
+
+  let skip = -1
+  // Truncation is what the round trip already did, so XRoundMode.Trunc adds
+  // nothing here.
+  if (mode == XRoundMode.Floor) {
+    xUcomis(cx.buf, xFScratch1(), xFScratch2(), 8)
+    skip = xJccRel32Placeholder(cx, ccBe())  // jbe: t <= x, nothing to do
+    xMovRI(cx.buf, xScratch2(), xF64One())
+    xMovXG(cx.buf, xFScratch2(), xScratch2(), 8)
+    xFArithRR(cx.buf, XFArith.FSub, xFScratch1(), xFScratch2(), 8)
+  }
+  if (mode == XRoundMode.Ceil) {
+    xUcomis(cx.buf, xFScratch1(), xFScratch2(), 8)
+    skip = xJccRel32Placeholder(cx, ccAe())  // jae: t >= x, nothing to do
+    xMovRI(cx.buf, xScratch2(), xF64One())
+    xMovXG(cx.buf, xFScratch2(), xScratch2(), 8)
+    xFArithRR(cx.buf, XFArith.FAdd, xFScratch1(), xFScratch2(), 8)
+  }
+  if (mode == XRoundMode.Round) {
+    xFArithRR(cx.buf, XFArith.FSub, xFScratch2(), xFScratch1(), 8)  // d = x - t
+    xMovGX(cx.buf, xScratch2(), xFScratch2(), 8)
+    xMovRI(cx.buf, xScratch3(), xF64AbsMask())
+    xArithRR(cx.buf, XArith.And, xScratch2(), xScratch3())  // |d|
+    xMovRI(cx.buf, xScratch3(), xF64Half())
+    xArithRR(cx.buf, XArith.Cmp, xScratch2(), xScratch3())
+    skip = xJccRel32Placeholder(cx, ccB())  // jb: |d| < 0.5, ties-away does not fire
+    // copysign(1.0, x): away from zero, so the halfway case rounds up in
+    // magnitude in both directions.
+    xMovRI(cx.buf, xScratch2(), xF64One())
+    xMovRI(cx.buf, xScratch3(), xF64SignMask())
+    xArithRR(cx.buf, XArith.And, xScratch3(), xScratch1())
+    xArithRR(cx.buf, XArith.Or, xScratch2(), xScratch3())
+    xMovXG(cx.buf, xFScratch2(), xScratch2(), 8)
+    xFArithRR(cx.buf, XFArith.FAdd, xFScratch1(), xFScratch2(), 8)
+  }
+  if (skip >= 0) {
+    xPatchRel32Here(cx, skip)
+  }
+  xPatchRel32Here(cx, guard)
   xPutFloat(cx, dst, xFScratch1())
 }
 
@@ -2779,6 +2920,10 @@ function xEmitInst(cx: XCtx, i: int): bool {
     xEmitBitcast(cx, i, ins.lhs, widthOf(cx.ctx, cx.f.instrs[ins.lhs].ty).bytes)
     return true
   }
+  if (op == Op.FFloor) { xEmitFRound(cx, i, ins.lhs, XRoundMode.Floor); return true }
+  if (op == Op.FCeil) { xEmitFRound(cx, i, ins.lhs, XRoundMode.Ceil); return true }
+  if (op == Op.FTrunc) { xEmitFRound(cx, i, ins.lhs, XRoundMode.Trunc); return true }
+  if (op == Op.FRound) { xEmitFRound(cx, i, ins.lhs, XRoundMode.Round); return true }
   if (op == Op.Jump) { xEmitJump(cx, ins.ival, ins.args); return true }
   if (op == Op.Br) { xEmitBr(cx, ins.lhs, ins.ival, ins.thenArgs, ins.ival2, ins.elseArgs); return true }
   if (op == Op.Ret) { return xEmitRet(cx, ins.args) }

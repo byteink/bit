@@ -2808,10 +2808,13 @@ const FnCtx = struct {
     /// makes them pure (foldable, dead-code-eliminable) and safepoint-free,
     /// which is what admits them inside `@nosplit` (see `check.zig`).
     ///
-    /// `ffloor`/`fceil`/`ftrunc`/`fround` are NOT here: they are one instruction
-    /// on AArch64 (`frintm`/`frintp`/`frintz`/`frinta`) but the x86-64 baseline
-    /// this compiler emits for is plain `x86_64` — SSE2, with no `roundsd`
-    /// (SSE4.1). They stay runtime calls until that is resolved.
+    /// `ffloor`/`fceil`/`ftrunc`/`fround` are here too, though they are one
+    /// instruction only on AArch64 (`frintm`/`frintp`/`frintz`/`frinta`): the
+    /// x86-64 form is `roundsd`, which is SSE4.1, and this backend emits
+    /// nothing above SSE2. `x64.zig` expands them into a short SSE2 sequence
+    /// rather than raising the baseline of every binary the compiler produces.
+    /// An expansion is still not a call — no allocation, no safepoint — so the
+    /// property that admits these inside `@nosplit` is unaffected.
     fn primUnaryOp(name: []const u8) ?ir.Op {
         return prim_unary_ops.get(name);
     }
@@ -2820,6 +2823,10 @@ const FnCtx = struct {
         .{ "fsqrt", ir.Op.fsqrt },
         .{ "floatBits", ir.Op.bitcast },
         .{ "float32Bits", ir.Op.bitcast },
+        .{ "ffloor", ir.Op.ffloor },
+        .{ "fceil", ir.Op.fceil },
+        .{ "ftrunc", ir.Op.ftrunc },
+        .{ "fround", ir.Op.fround },
     });
 
     /// Name -> runtime call for the fixed-arity primitive builtins. Mirrors
@@ -2853,10 +2860,6 @@ const FnCtx = struct {
         .{ "netUdpSenderHost", ir.RtFn.net_udp_sender_host },
         .{ "netUdpSenderPort", ir.RtFn.net_udp_sender_port },
         .{ "netResolve", ir.RtFn.net_resolve },
-        .{ "ffloor", ir.RtFn.floor },
-        .{ "fceil", ir.RtFn.ceil },
-        .{ "fround", ir.RtFn.round },
-        .{ "ftrunc", ir.RtFn.trunc },
         .{ "fpow", ir.RtFn.pow },
         .{ "fatan2", ir.RtFn.atan2 },
         .{ "flog", ir.RtFn.log },

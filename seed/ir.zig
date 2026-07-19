@@ -352,6 +352,24 @@ pub const Op = enum {
     /// from the operand's and result's own recorded types, exactly as `convert`
     /// derives its conversion.
     bitcast,
+    /// `ffloor`/`fceil`/`ftrunc`/`fround` (SPEC §17): round an f64 to an
+    /// integral f64 under the four IEEE-754 directions. Ops rather than
+    /// `rt_call`s for the same reason as `fsqrt` — see `tests/rootpins.zig`
+    /// for what the call made impossible.
+    ///
+    /// One instruction on AArch64 (`FRINTM`/`FRINTP`/`FRINTZ`/`FRINTA`). On
+    /// x86-64 they would be one `roundsd`, but that is SSE4.1 and this backend
+    /// emits nothing above SSE2, so `x64.zig` expands each into a short SSE2
+    /// sequence instead. That is still not a call: it allocates nothing and
+    /// reaches no safepoint, which is the property that matters here.
+    ///
+    /// `fround` is ties-AWAY-from-zero, matching `@round`. It is therefore
+    /// `FRINTA` and specifically NOT `FRINTN`/`roundsd` mode 0, which are
+    /// ties-to-even and differ on exactly the halfway cases.
+    ffloor,
+    fceil,
+    ftrunc,
+    fround,
 
     // ---- numeric conversion (unary shape: extra = [src]) -----------------
     // `T(x)` (SPEC §12.9): the result type is the target prim, the operand's
@@ -491,7 +509,7 @@ pub const Op = enum {
 
     pub fn isUnary(self: Op) bool {
         return switch (self) {
-            .neg, .fneg, .bnot, .fsqrt, .bitcast => true,
+            .neg, .fneg, .bnot, .fsqrt, .bitcast, .ffloor, .fceil, .ftrunc, .fround => true,
             else => false,
         };
     }
