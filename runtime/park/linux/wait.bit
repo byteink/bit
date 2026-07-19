@@ -30,6 +30,20 @@ function nrFutex(): int { return nr(202, 98) }
 function nrClockGettime(): int { return nr(228, 113) }
 function nrNanosleep(): int { return nr(35, 101) }
 function nrSchedGetaffinity(): int { return nr(204, 123) }
+function nrPrctl(): int { return nr(157, 167) }
+
+// PR_SET_TIMERSLACK / PR_GET_TIMERSLACK, from std/os/linux.zig's `PR` enum —
+// read out of the pinned stdlib like every other constant in this file, not from
+// memory.
+function prSetTimerslack(): int { return 29 }
+function prGetTimerslack(): int { return 30 }
+
+// The slack to ask for, in nanoseconds. 1 is the smallest accepted non-zero
+// value (0 means "restore the inherited default", which is the opposite of what
+// is wanted here), so this asks the kernel for the finest granularity it will
+// give and lets the hardware timer decide the real floor — measured at ~9us on
+// aarch64, against a 50us default slack.
+function timerslackNs(): int { return 1 }
 
 // FUTEX_WAIT (cmd 0) and FUTEX_WAKE (cmd 1), both with FUTEX_PRIVATE_FLAG
 // (bit 7 = 128).
@@ -93,14 +107,75 @@ export function parkMonoNs(): int {
 // behaviour change: the idle loop's whole contract is "wait a bounded time, then
 // re-check", and an interrupted sleep that re-checks early is correct, merely
 // less patient.
+//
+// WHY THIS DROPS THE THREAD'S TIMER SLACK FIRST, WHICH LOOKS LIKE AN UNRELATED
+// SIDE EFFECT AND IS NOT (#1439).
+//
+// Linux rounds every `nanosleep` UP by the calling thread's timer slack, which
+// defaults to 50us. A caller asking for 1us therefore sleeps ~75us — MEASURED
+// on aarch64-linux, 10000 iterations: 74615ns mean for a 1000ns request. Darwin
+// has no such rounding, which is why the two providers had silently different
+// floors while claiming one contract.
+//
+// That 75x error is not cosmetic, and it is not merely "a slow sleep":
+//
+//   1. IT FALSIFIES THE BACKOFF POLICY THIS MODULE EXISTS TO SERVE. `sched.bit`
+//      doubles its idle backoff from 1us to 1ms, and `parkNextBackoff` is shared
+//      so there is one copy of that policy. On Linux the bottom SIX doublings
+//      were indistinguishable — every one of them slept ~75us — so the ported
+//      policy simply was not the policy on this platform.
+//   2. IT IS PAID BY EVERY CONCURRENT COLLECTION, NOT JUST BY THE SLEEPER. A
+//      thread inside `nanosleep` holds no `blocked` bracket (ABI.md §5: Bit
+//      cannot call `bit_rt_gc_blocking_begin` on Linux, E0078), so it reads as
+//      `running` and stop-the-world waits it out. Once #1431 took `@nosplit`
+//      off the worker loop, `tests/stress/chanracelinux` began attempting
+//      ~300000 collections under `BIT_GC=stress`, and each one waited out this
+//      slack: 23.3s of wall time against the program's own 10s deadline, versus
+//      3.6s for the identical work and the identical 300000 collections on
+//      Darwin. That is the whole of #1439 — nothing was lost or miscollected,
+//      the program was 11x too slow to finish and reported partial counts.
+//
+// Set unconditionally rather than once, because it is per-THREAD state and a
+// thread that sleeps may have been cloned before any other thread set it (the
+// kernel copies `timer_slack_ns` at clone time, so "set it once on the main
+// thread" is order-dependent and wrong). The extra syscall is already counted in
+// the 9us measured above, and it is idempotent.
+//
+// This narrows the residual GC tax; it does not remove it, and the difference
+// matters. A caller that sleeps for milliseconds still holds up every concurrent
+// collection for its whole sleep. Closing that needs the `blocked` contract or a
+// published conservative stack range (ABI.md §5), which is #1433, not this.
 export function parkSleepNs(ns: int) {
   if (ns <= 0) {
     return
   }
+  let slackRc = int(syscall(nrPrctl(), i64(prSetTimerslack()), i64(timerslackNs())))
   let req = []i64(2)
   req[0] = i64(ns / nsPerSec())
   req[1] = i64(ns % nsPerSec())
   let rc = int(syscall(nrNanosleep(), i64(int(ptrOf(req))), 0))
+}
+
+// This thread's current timer slack in nanoseconds, or -1 if the kernel refuses.
+//
+// EXISTS TO BE ASSERTED ON, and deliberately so. The behavioural guard for the
+// slack drop above is `tests/stress/chanracelinux` under `BIT_GC=stress`, which
+// is a whole-system test costing seconds; this is the direct one, and it is a
+// pure read with no timing in it. A timing assertion ("a 1us sleep returns in
+// under Nus") was the obvious alternative and was rejected: the margin between
+// broken (75us) and fixed (9us) is real but the ceiling would have to survive a
+// loaded CI box and an emulated container, and a guard that flakes is worse than
+// no guard. Reading the state back cannot flake.
+//
+// PR_GET_TIMERSLACK returns the value directly rather than through a pointer,
+// and it can never return 0 — the kernel treats a request of 0 as "restore the
+// default" — so a non-negative return is always the live value.
+export function parkTimerSlackNs(): int {
+  let rc = int(syscall(nrPrctl(), i64(prGetTimerslack()), 0))
+  if (rc < 0) {
+    return -1
+  }
+  return rc
 }
 
 // Block while the 32-bit word at `p` still holds `expected`, for at most

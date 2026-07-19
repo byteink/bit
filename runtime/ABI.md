@@ -469,6 +469,14 @@ rendezvous bound. That is safe but wastes a collection. Closing it requires thos
 call sites to publish a conservative stack range at entry — a later refinement,
 not required for the handshake to be sound.
 
+The same limitation covers a thread asleep in `parkSleepNs`, and there the cost
+is proportional to the sleep: every concurrent collection waits out whatever is
+left of it. The Linux provider therefore drops the calling thread's timer slack
+(#1439), because the kernel's 50us default rounded a 1us sleep to ~75us and made
+that wait two orders of magnitude larger than the sleep actually asked for. That
+narrows the tax; it does not remove it, and a caller that genuinely sleeps for
+milliseconds still holds up every collection for its whole sleep.
+
 **Live-task registry and parked stacks.** The scheduler keeps every task on an
 all-tasks registry (`Scheduler.registerTask`, from `spawn` until the task's
 `.done` teardown). At a collection the running task's stack is walked precisely

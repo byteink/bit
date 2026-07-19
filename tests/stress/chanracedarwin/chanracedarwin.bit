@@ -20,6 +20,7 @@
 
 import { raceInit, raceWorkerAddr, raceWorkerEntry, raceShutdown } from "../chan/race"
 import { raceAllSent, raceReceiversDone, raceClose, raceVerdict, raceTotalMask } from "../chan/race"
+import { raceSentCount, raceRecvCount } from "../chan/race"
 import { threadJoin, threadJoinDone, threadRunning } from "../../../runtime/thread"
 import { threadStart, threadRelease } from "../../../runtime/thread/darwin"
 import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
@@ -27,15 +28,51 @@ import { parkSleepNs, parkMonoNs } from "../../../runtime/park/darwin"
 let argBlocks: [4]i64
 let doneWords: [2]i32
 
-// Generous against the real timings (a thousand rendezvous take milliseconds)
-// and small enough that a wedged run fails the suite in seconds rather than
-// hanging it — the distinction that matters after this project's QUIC hang.
-const WAIT_NS: int = 10000000000
+// WHAT THESE WAITS BOUND IS A WEDGE, NOT A DURATION, AND THAT DISTINCTION IS
+// #1439 (they used to be a flat 10s wall-clock deadline).
+//
+// The old deadline was sized when this program collected a few thousand times
+// under `BIT_GC=stress`. #1431 then took `@nosplit` off the worker loop, which
+// is correct and wanted — it is what gives the scheduler real safepoint
+// coverage — but it also made the SAME work collect 300000 times (seed) and
+// 551472 times (self-hosted). Identical output, 80x the collector work. The run
+// then blew a deadline that had nothing to do with correctness and reported
+// partial counts, which reads exactly like lost sends and is not: given a
+// 15-minute deadline the unmodified program prints the correct `true true 7 7`
+// on both compilers, measured.
+//
+// A wall-clock deadline cannot serve both ends here. Short enough to catch a
+// wedge quickly, it fails correct runs whenever the collector gets denser or the
+// codegen gets slower; long enough to survive those, it turns a wedge into a
+// multi-minute stall. So the bound is on PROGRESS instead: a run may take as
+// long as it likes provided the counters keep moving, and a run whose counters
+// stop moving for `STALL_NS` has wedged and is failed at once. That is a
+// strictly better wedge detector than the deadline it replaces — the dropped
+// wakeup this program exists to catch freezes the counters permanently, so it is
+// still caught, and now in `STALL_NS` rather than in whatever the deadline was.
+//
+// 5s of ZERO progress, and that figure is MEASURED rather than felt. A probe
+// tracking the largest interval between two advances of the send counter across
+// a whole stress run reported 470us / 2986us / 504us over three runs on real
+// x86_64 hardware, so the bound clears the observed WORST case — 3ms, not the
+// best one — by about 1700x. That margin is the point: a stall bound sized close
+// to the observed maximum is a flaky test, and a flaky guard is worse than none.
+const STALL_NS: int = 5000000000
 
-// Every wait carries BOTH a deadline and a static trip bound. A deadline alone
-// is only as trustworthy as the clock enforcing it; the bound is what makes
-// termination provable by reading the loop.
-const WAIT_MAX_POLLS: int = 2000000
+// The static trip bound stays, and it is NOT a duration: it is what makes
+// termination provable by reading the loop (Power of 10), independently of the
+// clock the stall check trusts. It had to be raised with the stall bound, and
+// the reason is a trap worth stating — a poll costs one short sleep, and a short
+// sleep is only as short as the platform makes it, so this constant silently
+// encodes a duration that varies by target. At the ~9us a 1us request actually
+// costs, 2000000 polls was ~18s of patience, and the slowest stress run measured
+// for #1439 (14.9s, self-hosted aarch64-linux) was already inside that margin.
+// Sized so the STALL check is always what fails a wedged run, never this.
+const WAIT_MAX_POLLS: int = 2000000000
+
+// Only the joins still take a duration, because a joining thread has no counter
+// to watch. Generous against the measured worst case rather than tight.
+const JOIN_WAIT_NS: int = 120000000000
 
 function doneAt(i: int): *i32 {
   return ptrOf(doneWords) + i
@@ -52,13 +89,18 @@ function startWorker(i: int): int {
 }
 
 function waitAllSent(): bool {
-  let deadline = parkMonoNs() + WAIT_NS
+  let seen = raceSentCount()
+  let movedAt = parkMonoNs()
   let i = 0
   while (i < WAIT_MAX_POLLS) {
     if (raceAllSent()) {
       return true
     }
-    if (parkMonoNs() >= deadline) {
+    let now = raceSentCount()
+    if (now != seen) {
+      seen = now
+      movedAt = parkMonoNs()
+    } else if (parkMonoNs() - movedAt >= STALL_NS) {
       return false
     }
     parkSleepNs(1000)
@@ -67,14 +109,23 @@ function waitAllSent(): bool {
   return false
 }
 
+// Watches the RECEIVED count rather than the exit count, because the exit count
+// only ever takes three values: a receiver draining the last of 600000 values is
+// making progress that `raceReceiversDone` cannot see, and watching only the
+// coarse signal would call that a wedge.
 function waitReceiversDone(): bool {
-  let deadline = parkMonoNs() + WAIT_NS
+  let seen = raceRecvCount()
+  let movedAt = parkMonoNs()
   let i = 0
   while (i < WAIT_MAX_POLLS) {
     if (raceReceiversDone()) {
       return true
     }
-    if (parkMonoNs() >= deadline) {
+    let now = raceRecvCount()
+    if (now != seen) {
+      seen = now
+      movedAt = parkMonoNs()
+    } else if (parkMonoNs() - movedAt >= STALL_NS) {
       return false
     }
     parkSleepNs(1000)
@@ -102,8 +153,8 @@ function main() {
   let drained = waitReceiversDone()
 
   raceShutdown()
-  let joined0 = threadJoin(doneAt(0), WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
-  let joined1 = threadJoin(doneAt(1), WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
+  let joined0 = threadJoin(doneAt(0), JOIN_WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
+  let joined1 = threadJoin(doneAt(1), JOIN_WAIT_NS, parkSleepNs, parkMonoNs) == threadJoinDone
   let rel0 = threadRelease(h0)
   let rel1 = threadRelease(h1)
 
