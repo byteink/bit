@@ -977,6 +977,59 @@ function primRtName(name: string): string {
   return ""
 }
 
+// A directly-named callee, fully resolved: the symbol the linker will see, the
+// parameter types an argument list must be built against, and the IR result type.
+struct CallTarget {
+  ok: bool,
+  symbol: string,
+  paramTypes: []int,
+  result: int,
+  owner: Checker,
+  decl: int,
+}
+
+// Resolves the callee of `callNode` (a Tag.Call whose callee is a Tag.Ident) to
+// the symbol and signature to emit. `call`, `spawn` and `defer` ALL go through
+// here — the seed's shape (seed/lower.zig `resolveCallTarget`), and the reason
+// they cannot drift apart again. Deriving a name from the callee's source span
+// instead skips BOTH generic instantiation (`g` where `g$0` was emitted) and
+// module qualification (`work` where the definition is `m1$work`), producing an
+// object with a dangling reference that only fails at dyld load.
+function resolveCallTarget(fc: FnCtx, name: string, callNode: int): CallTarget {
+  let none = CallTarget{ ok: false, symbol: "", paramTypes: []int(0), result: 0, owner: fc.c, decl: 0 }
+  let decl = funcDeclLookup(fc.c, name)
+  if (decl == 0) {
+    return none
+  }
+  // An imported callee's decl lives in ITS module's tree — `decl` indexes that
+  // arena, so every read of it must go through the owning checker.
+  let oc = declOwner(fc.c, name)
+  if (isGenericFunc(fc.c, name)) {
+    // The instance is numbered in the project-wide ledger and emitted by the
+    // module that DECLARES the generic, so its symbol carries that module's
+    // prefix and its original name — identical from every caller.
+    let targs = genericTypeArgs(fc.c, name, callNode)
+    let idx = instantiationIndex(fc.c, name, targs)
+    if (idx == -1) {
+      return none
+    }
+    // SUBSTITUTED parameter types, never the template's. The template's `T` is a
+    // non-primitive and so classifies as a GC reference: an argument list built
+    // from it packs an `i64` into a slot the collector then walks as a pointer.
+    return CallTarget{ ok: true,
+      symbol: "${modulePrefix(oc.moduleId, fc.lowerer.root)}${declName2(fc.c, name)}\$${idx}",
+      paramTypes: genericParamTypes(oc, decl, targs),
+      result: unwrapFallible(fc.c, defaultType(fc.c, nodeType(fc, callNode))),
+      owner: oc, decl: decl }
+  }
+  // A fallible callee's IR result is its ok type (the error rides the slot).
+  return CallTarget{ ok: true,
+    symbol: callQualified(fc.c, fc.lowerer.root, name),
+    paramTypes: lowerParamTypes(oc, decl),
+    result: unwrapFallible(fc.c, funcResultLookup(fc.c, name)),
+    owner: oc, decl: decl }
+}
+
 function lowerCall(fc: FnCtx, node: int): int {
   let callee = kidsOf(fc.c.tree, node)[0]
   let cn = getNode(fc.c.tree, callee)
@@ -1145,40 +1198,19 @@ function lowerCall(fc: FnCtx, node: int): int {
       ins.args = a
       return builderEmit(fc.b, ins)
     }
-    let decl = funcDeclLookup(fc.c, name)
-    if (decl != 0) {
-      // An imported callee's decl lives in ITS module's tree — `decl` indexes
-      // that arena, so every read of it must go through the owning checker.
-      let oc = declOwner(fc.c, name)
-      // A generic call resolves to its monomorphized instance `name$index`, with
-      // the call's concrete (substituted) result type.
-      if (isGenericFunc(fc.c, name)) {
-        // The instance is numbered in the project-wide ledger and emitted by the
-        // module that DECLARES the generic, so its symbol carries that module's
-        // prefix and its original name — identical from every caller.
-        let targs = genericTypeArgs(fc.c, name, node)
-        let idx = instantiationIndex(fc.c, name, targs)
-        // Hint each argument with the CONCRETE parameter type this call binds:
-        // the template's `[]T` would build a slice literal argument as a slice of
-        // a type param (a GC reference), not as `[]i64`.
-        let a = lowerArgsFor(fc, node, oc, decl, genericParamTypes(oc, decl, targs))
-        if (fc.failed || idx == -1) {
-          fc.failed = true
-          return 0
-        }
-        let gi = mkInstr(Op.Call, unwrapFallible(fc.c, defaultType(fc.c, nodeType(fc, node))))
-        gi.name = "${modulePrefix(oc.moduleId, fc.lowerer.root)}${declName2(fc.c, name)}\$${idx}"
-        gi.args = a
-        return builderEmit(fc.b, gi)
+    if (funcDeclLookup(fc.c, name) != 0) {
+      let t = resolveCallTarget(fc, name, node)
+      if (!t.ok) {
+        fc.failed = true
+        return 0
       }
-      let a = lowerArgsFor(fc, node, oc, decl, lowerParamTypes(oc, decl))
+      // Hint each argument with the CONCRETE parameter type this call binds.
+      let a = lowerArgsFor(fc, node, t.owner, t.decl, t.paramTypes)
       if (fc.failed) {
         return 0
       }
-      // A fallible callee's IR result is its ok type (the error rides the slot).
-      let ins = mkInstr(Op.Call, unwrapFallible(fc.c, funcResultLookup(fc.c, name)))
-      // An imported callee lives in ITS module's symbol, not the caller's.
-      ins.name = callQualified(fc.c, fc.lowerer.root, name)
+      let ins = mkInstr(Op.Call, t.result)
+      ins.name = t.symbol
       ins.args = a
       return builderEmit(fc.b, ins)
     }
@@ -4304,15 +4336,17 @@ function lowerDefer(fc: FnCtx, node: int) {
     ins.name = name
     ins.args = lowerArgs(fc, call, []int(0))
   } else {
-    let decl = funcDeclLookup(fc.c, name)
-    if (decl == 0) {
+    // The same resolution a direct call gets — module qualification AND generic
+    // instantiation. Deriving the name from source text here emitted a bare `g`
+    // for a deferred generic whose only definition was `g$0`.
+    let t = resolveCallTarget(fc, name, call)
+    if (!t.ok) {
       fc.failed = true
       return
     }
-    ins = mkInstr(Op.Call, funcResultLookup(fc.c, name))
-    // Same qualification a direct call gets: the callee's own module's symbol.
-    ins.name = callQualified(fc.c, fc.lowerer.root, name)
-    ins.args = lowerArgsFor(fc, call, declOwner(fc.c, name), decl, lowerParamTypes(declOwner(fc.c, name), decl))
+    ins = mkInstr(Op.Call, t.result)
+    ins.name = t.symbol
+    ins.args = lowerArgsFor(fc, call, t.owner, t.decl, t.paramTypes)
   }
   if (fc.failed) {
     return
@@ -5114,14 +5148,28 @@ function lowerSpawn(fc: FnCtx, node: int) {
     fc.failed = true
     return
   }
-  let paramTypes = fc.c.ctx.types[fty].members
-  let result = fc.c.ctx.types[fty].result
+  // Resolve the callee the way a direct call does. Reading the signature off
+  // `fty` instead yields the TEMPLATE members for a generic callee, and the
+  // thunk layout below derives `ptr_offsets` from these types — an unsubstituted
+  // `T` is a GC reference, so the collector would walk a packed int as a pointer.
+  let t = resolveCallTarget(fc, targetName, call)
+  if (!t.ok) {
+    fc.failed = true
+    return
+  }
+  let paramTypes = t.paramTypes
+  let result = t.result
+  // The thunk object's type, and the trampoline's env parameter. Interned from
+  // the RESOLVED signature, not taken from `fty`: for a generic callee `fty` is
+  // the unbound template, so the emitted IR carried `fn(<T>, chan<<T>>)`. For
+  // every non-generic spawn this interns to precisely `fty` again.
+  let envTy = mkFunc(fc.c.ctx, paramTypes, false, result)
   let argVals = lowerArgs(fc, call, paramTypes)
   if (fc.failed) {
     return
   }
   let layout = layoutFields(fc, paramTypes)
-  let ga = mkInstr(Op.GcAlloc, fty)
+  let ga = mkInstr(Op.GcAlloc, envTy)
   ga.ival = layout.size
   ga.offsets = layout.ptrOffsets
   let thunk = builderEmit(fc.b, ga)
@@ -5134,8 +5182,8 @@ function lowerSpawn(fc: FnCtx, node: int) {
     builderEmit(fc.b, fs)
     i = i + 1
   }
-  let fid = synthSpawnTrampoline(fc, targetName, paramTypes, result, fty, layout)
-  let fa = mkInstr(Op.FuncAddr, fty)
+  let fid = synthSpawnTrampoline(fc, t.symbol, paramTypes, result, envTy, layout)
+  let fa = mkInstr(Op.FuncAddr, envTy)
   fa.name = "spawn\$trampoline\$${fid}"
   let faV = builderEmit(fc.b, fa)
   let sp = mkInstr(Op.RtCall, fc.c.ctx.voidId)

@@ -323,6 +323,19 @@ const CallTarget = union(enum) {
     direct_method: struct { func: ir.FuncId, recv: ir.ValueId, result: TypeId, params: []const TypeId, variadic: bool },
     iface: struct { recv: ir.ValueId, method_index: u32, result: TypeId, params: []const TypeId, variadic: bool },
     value: struct { callee: ir.ValueId, result: TypeId, params: []const TypeId, variadic: bool },
+
+    const Sig = struct { result: TypeId, params: []const TypeId, variadic: bool };
+
+    /// The resolved callee's signature. Every variant already carries it, and it
+    /// is the ONLY correct source: the callee expression's own type is the
+    /// unbound TEMPLATE for a generic instantiation (`ctx.typeOf(fty)` is
+    /// `.invalid` there, so reading it panics) and says nothing at all for a
+    /// method or interface callee.
+    fn sig(self: CallTarget) Sig {
+        return switch (self) {
+            inline else => |t| .{ .result = t.result, .params = t.params, .variadic = t.variadic },
+        };
+    }
 };
 
 const MethodEntry = struct { ty: TypeId, name: []const u8, fid: ir.FuncId, result: TypeId, params: []const TypeId, variadic: bool };
@@ -3134,7 +3147,6 @@ const FnCtx = struct {
         const call_node = self.kids(node)[0];
         const k = self.kids(call_node);
         const target = try self.resolveCallTarget(call_node, k[0]);
-        const fty = try self.nodeType(k[0]);
 
         // Two target shapes: a named function is called directly by the
         // trampoline (no env); a closure/fn-value is packed into the thunk and
@@ -3158,7 +3170,14 @@ const FnCtx = struct {
         // `i64`, and IR verification rejects the operand-type mismatch. The
         // parameter type is what the callee actually expects. Evaluate in source
         // order, before allocating the thunk.
-        const shape = self.ctx.typeOf(fty).func;
+        const shape = target.sig();
+        // The thunk object's type, and the trampoline's env parameter. Built
+        // from the RESOLVED signature rather than from the callee expression's
+        // own type: for a generic instantiation the latter is the unbound
+        // template, whose `typeOf` is `.invalid` — which is what the emitted IR
+        // then carried. Interning the resolved shape reproduces exactly the
+        // callee's own type for every non-generic spawn.
+        const fty = try self.ctx.funcType(.{ .params = shape.params, .variadic = shape.variadic, .result = shape.result });
         const arg_nodes = self.kids(k[2]);
         // `spawn` packs one thunk slot per declared param, so a variadic callee
         // would need its tail collected first. Refuse explicitly: an arity-only
