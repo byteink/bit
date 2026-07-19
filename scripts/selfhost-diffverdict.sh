@@ -132,13 +132,20 @@ done
 # rather than by reading any code.
 # ---------------------------------------------------------------------------
 for e in $EXPRS; do
-  # NOTE: struct-literal FIELD types are deliberately absent. They are the one
-  # slot in this family still unchecked by the self-hosted compiler, because
-  # validating them requires a checkExprType recompute on the field value that
-  # panics ("index out of range") on every multi-module file reaching
-  # stdlib/http. Adding these cells would redden the gate over a known, filed
-  # compiler bug rather than a new divergence — see the note in
-  # selfhost/validate.bit's vCompositeTypes. Restore them when that is fixed.
+  # Struct-literal FIELD types. Held out until #1476: validating them needs a
+  # checkExprType recompute on the field value, which panicked ("index out of
+  # range") on every multi-module file reaching stdlib/http. That was a real
+  # compiler bug (a cross-module decl node read against the wrong module's tree),
+  # it is fixed, and these cells are live again — this was the last unchecked
+  # declared-type slot in the language.
+  cell "struct field S{ v: f32 } = $e" \
+"struct S {
+  v: f32,
+}
+function main() {
+  let s = S{ v: $e }
+  print(\"ok\")
+}"
   cell "map value map<string,f32> = $e" \
 "function main() {
   let m = map<string, f32>{\"k\": $e}
