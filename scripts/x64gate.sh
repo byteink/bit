@@ -30,6 +30,15 @@ IMAGE="bit-zig-0.16.0-amd64:latest"
 # `athlon_xp`, which current Zig rejects for the musl crt1.o sub-compile that the
 # fuzz step's `link_libc` needs. That is a toolchain artifact of emulation, not a
 # Bit bug — and this mode is how you check that claim instead of inheriting it.
+#
+# SETTLED 2026-07-19 (#1258), measured both ways at tree ff9ac2e — do not re-chase:
+#   real x86_64 (hl-master):  `x64gate.sh fuzz` -> 10,970 iterations, 0 crashes,
+#                             X64LINUX_EXIT=0.
+#   emulated amd64 on the Mac: `zig build fuzz` never runs a single iteration. It
+#                             fails to COMPILE with exactly 2 errors — glibc
+#                             `libc_nonshared.a` and `Scrt1.o`, both
+#                             "unknown target CPU 'athlon-xp'".
+# Zero Bit code executes in the emulated failure, so it cannot be a Bit defect.
 STEP="test"
 if [ "${MODE}" = "fuzz" ]; then
   STEP="fuzz -- ${FUZZ_SECS:-60}"
