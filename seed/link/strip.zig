@@ -164,48 +164,46 @@ pub fn markerModule(gpa: Allocator, sym_prefix: []const u8) Allocator.Error!Modu
 pub const marker_start_atom: u32 = 0;
 pub const marker_end_atom: u32 = 1;
 
-/// The reverse-dependency rule for stack-map entries: an entry is retained
-/// exactly when the function it describes is retained.
-///
-/// It cannot be a dead-strip ROOT — an entry relocates to its function, so
-/// rooting the entries would retain every function of every runtime module in
-/// every image, defeating dead-strip entirely. Nor can it be left to ordinary
-/// reachability: nothing ever references an entry, so every entry would be
-/// dropped and the collector would see no frames at all. Hence a pass AFTER
-/// `deadStrip`, keyed on the target the entry already names.
-///
-/// One pass suffices with no fixpoint: an entry's only relocation targets its
-/// own function, which this rule has just established is already kept, so
-/// keeping an entry can never make a further atom reachable.
-pub fn keepLiveStackMaps(gpa: Allocator, modules: []const Module, globals: *const GlobalTable, kept: *KeptSet) Error!void {
-    for (modules, 0..) |mod, mi| {
-        for (mod.atoms, 0..) |atom, ai| {
-            if (atom.kind != .gc_meta) continue;
-            if (atom.binding == .global) continue; // the boundary markers, kept unconditionally
-            for (atom.relocs) |r| {
-                const target = try resolveRef(globals, @intCast(mi), r.target);
-                if (!kept.contains(target)) continue;
-                try kept.set.put(gpa, (AtomId{ .module = @intCast(mi), .atom = @intCast(ai) }).key(), {});
-                break;
-            }
-        }
-    }
-}
-
 /// Orders the merged group: the start marker, then every retained entry, then
 /// the end marker. The driver appends this run to one output group **without
 /// interruption**, which is what makes the runtime's linear walk valid — the
 /// entries carry no count and no terminator, only these two bounds.
-pub fn mergedStackMapAtoms(gpa: Allocator, modules: []const Module, kept: *const KeptSet, marker_module: u32) Allocator.Error![]AtomId {
+///
+/// Retention is decided HERE rather than by a separate pass the driver must
+/// remember to run, because getting that wrong is invisible: entries are not
+/// reachable from any root, so a driver that skipped the pass would emit an
+/// EMPTY extent, and the program would link, run, and silently collect live
+/// objects. That is not hypothetical — it happened on the Mach-O driver during
+/// this change, and a mutation test confirmed the host-native suite cannot see
+/// the same omission on the ELF driver at all. One call that cannot be
+/// half-applied removes the failure mode instead of guarding it.
+///
+/// The rule itself: an entry is retained exactly when the function it describes
+/// is retained. It cannot be a dead-strip ROOT — an entry relocates to its
+/// function, so rooting the entries would retain every function of every
+/// runtime module in every image, defeating dead-strip entirely. Nor can it be
+/// left to ordinary reachability, per above. Deciding it after `deadStrip` also
+/// needs no fixpoint: an entry's only relocation targets its own function,
+/// which is by then already kept, so keeping an entry can never make a further
+/// atom reachable.
+/// `kept` is updated in place with every entry selected. Both effects belong to
+/// this one call: an entry that is placed but not in `kept` never has its
+/// relocations applied, so its `code_addr` stays zero and the collector reads a
+/// code range at address 0 — live-looking table, dead contents.
+pub fn mergedStackMapAtoms(gpa: Allocator, modules: []const Module, globals: *const GlobalTable, kept: *KeptSet, marker_module: u32) Error![]AtomId {
     var out: std.ArrayList(AtomId) = .empty;
     try out.append(gpa, .{ .module = marker_module, .atom = marker_start_atom });
     for (modules, 0..) |mod, mi| {
         if (mi == marker_module) continue;
         for (mod.atoms, 0..) |atom, ai| {
             if (atom.kind != .gc_meta) continue;
-            const id = AtomId{ .module = @intCast(mi), .atom = @intCast(ai) };
-            if (!kept.contains(id)) continue;
-            try out.append(gpa, id);
+            for (atom.relocs) |r| {
+                if (!kept.contains(try resolveRef(globals, @intCast(mi), r.target))) continue;
+                const id = AtomId{ .module = @intCast(mi), .atom = @intCast(ai) };
+                try kept.set.put(gpa, id.key(), {});
+                try out.append(gpa, id);
+                break;
+            }
         }
     }
     try out.append(gpa, .{ .module = marker_module, .atom = marker_end_atom });

@@ -94,10 +94,6 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
     var kept = try strip.deadStrip(arena, mods, &globals, &.{ entry_symbol, strip.stackmaps_start_symbol, strip.stackmaps_end_symbol });
     defer kept.deinit(arena);
 
-    // A stack-map entry survives iff its function did — see `keepLiveStackMaps`
-    // for why this is neither a root nor ordinary reachability.
-    try strip.keepLiveStackMaps(arena, mods, &globals, &kept);
-
     // `-fdata-sections` can emit one variable as several adjacent symbols in a
     // single section (std's TLS `area_desc` is split into `area_desc.0/.1/...`).
     // Dead-stripping the unreferenced pieces would repack the survivors and shift
@@ -147,7 +143,7 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
     // hold absolute code pointers this non-PIE image never rebases, and must
     // sit between the two boundary markers with nothing interleaved. Appending
     // last means no later atom can land inside the extent.
-    for (try strip.mergedStackMapAtoms(arena, mods, &kept, marker_module)) |id|
+    for (try strip.mergedStackMapAtoms(arena, mods, &globals, &kept, marker_module)) |id|
         try rodata.append(arena, .{ .id = id });
 
     // ---- lay out the two PT_LOAD segments ---------------------------------

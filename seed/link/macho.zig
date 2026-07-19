@@ -287,16 +287,6 @@ pub fn linkExecutable(gpa: Allocator, input_modules: []const object.Module, opts
         }
     }
 
-    // A stack-map entry survives iff its function did. Without this the entries
-    // — which nothing ever references — are all dead-stripped, the merged extent
-    // comes out EMPTY, and the collector silently loses every precise root.
-    // See `keepLiveStackMaps` for why it is neither a root nor reachability.
-    {
-        var kept_set = strip.KeptSet{ .set = kept };
-        try strip.keepLiveStackMaps(arena, modules, &globals, &kept_set);
-        kept = kept_set.set;
-    }
-
     // ---- partition kept atoms by output class ------------------------------
     var text: std.ArrayList(Placed) = .empty;
     var rodata: std.ArrayList(Placed) = .empty;
@@ -329,8 +319,12 @@ pub fn linkExecutable(gpa: Allocator, input_modules: []const object.Module, opts
     // with nothing interleaved — the entries carry no count and no terminator,
     // so those bounds are the only thing that delimits the runtime's walk.
     // Appending last means no later atom can land inside the extent.
-    for (try strip.mergedStackMapAtoms(arena, modules, &.{ .set = kept }, marker_module)) |id|
-        try data.append(arena, .{ .id = id });
+    {
+        var kept_set = strip.KeptSet{ .set = kept };
+        for (try strip.mergedStackMapAtoms(arena, modules, &globals, &kept_set, marker_module)) |id|
+            try data.append(arena, .{ .id = id });
+        kept = kept_set.set;
+    }
 
     // ---- GOT slots + stubs -------------------------------------------------
     var got_list: std.ArrayList(GotKind) = .empty;

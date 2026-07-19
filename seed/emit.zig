@@ -1189,9 +1189,7 @@ test "link: the merged table is bounded by linker-defined markers only" {
     var globals = try strip.resolveGlobals(arena, all);
     var kept = try strip.deadStrip(arena, all, &globals, &.{ "_start", strip.stackmaps_start_symbol, strip.stackmaps_end_symbol });
     defer kept.deinit(arena);
-    try strip.keepLiveStackMaps(arena, all, &globals, &kept);
-
-    const group = try strip.mergedStackMapAtoms(arena, all, &kept, marker_module);
+    const group = try strip.mergedStackMapAtoms(arena, all, &globals, &kept, marker_module);
 
     // start marker + one entry per LIVE function (2) + end marker.
     try testing.expectEqual(@as(usize, 4), group.len);
