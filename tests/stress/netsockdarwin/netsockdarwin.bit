@@ -72,6 +72,7 @@
 
 import { netListenTcp, netLocalPort, netAcceptTcp, netDialTcp } from "../../../runtime/net/darwin"
 import { netReadSock, netWriteSock, netClose, netSocketError } from "../../../runtime/net/darwin"
+import { netIsNonBlock } from "../../../runtime/net/darwin"
 import { netBindUdp, netSendTo, netRecvFrom, netSockAddrLen } from "../../../runtime/net/darwin"
 import { netFillSockAddr, netSockAddrPort, netSockAddrOctets } from "../../../runtime/net/darwin"
 import { netSockAddrFamily } from "../../../runtime/net/darwin"
@@ -229,9 +230,35 @@ function sameBytes(a: *u8, b: *u8, n: int): bool {
 const respMaxWait: int = 100000000
 const respDelay: int = 200000
 
+// AN ITERATION BOUND IS NOT A TIME BOUND, AND #1462 IS WHAT THAT COSTS.
+//
+// Both loops below were already bounded, so both were "Power of 10 correct" on
+// paper — and the program still ran for 2h15m and 3h59m in the wild. The reason
+// is that an iteration bound only bounds RUNTIME if the cost of an iteration is
+// bounded, and here it was not: every back edge is a safepoint, under
+// `BIT_GC=stress` every safepoint attempts a collection, and while another
+// thread sat in a blocking syscall each of those collections ran the
+// stop-the-world spin bound out in full before abandoning. One iteration went
+// from nanoseconds to ~65ms. 200000 of them is over three hours.
+//
+// So each loop now carries a WALL-CLOCK backstop as well. The iteration bound
+// stays — it is what makes termination provable by reading the loop — and the
+// clock is what makes the termination TIME provable too. A test that fails must
+// fail promptly; one that merely finishes eventually wedges the suite exactly as
+// if it had hung, which is the failure this file is now the guard for.
+//
+// Checked every `respClockEvery` iterations rather than every iteration: the
+// clock read is a syscall, and at one per iteration it would dominate the very
+// delay it is bounding. 64 keeps the healthy case negligible (~3000 reads across
+// the whole delay) while capping the pathological case at 64 slow iterations.
+const respClockEvery: int = 64
+const respMaxWaitNs: int = 5000000000
+const respMaxDelayNs: int = 50000000
+
 export function responderEntry(arg: *byte): *byte {
   let i = 0
   let seen = false
+  let t0 = parkMonoNs()
   // Bounded (Power of 10): a main thread that never raises the flag leaves this
   // thread exiting rather than spinning forever, and the `blocked` property then
   // fails with a verdict instead of the join timing out.
@@ -241,14 +268,23 @@ export function responderEntry(arg: *byte): *byte {
       i = respMaxWait
     } else {
       i = i + 1
+      if (i % respClockEvery == 0 && parkMonoNs() - t0 > respMaxWaitNs) {
+        i = respMaxWait
+      }
     }
   }
   // A short, safepoint-bearing pause so the reader is actually inside its retry
   // loop when the bytes arrive. Bounded, and load-bearing for nothing but the
-  // LIKELIHOOD of the would-block.
+  // LIKELIHOOD of the would-block — so cutting it short costs only the chance of
+  // observing a would-block, never a wrong answer: the bytes are compared either
+  // way, and if the write wins the race the read simply succeeds immediately.
   let d = 0
+  let t1 = parkMonoNs()
   while (d < respDelay) {
     d = d + 1
+    if (d % respClockEvery == 0 && parkMonoNs() - t1 > respMaxDelayNs) {
+      d = respDelay
+    }
   }
   if (seen) {
     respWrote = i64(netWriteSock(int(respFd), sendBytes(), payloadLen))
@@ -313,6 +349,32 @@ function main() {
   // mutant reads REUSEADDR and returns 1. The two options are distinguishable
   // only on a socket where they DISAGREE, and this is one.
   let clean = netSocketError(cfd) == 0 && netSocketError(lfd) == 0
+
+  // EVERY SOCKET MUST ACTUALLY BE NON-BLOCKING, ASKED OF THE KERNEL RATHER THAN
+  // ASSUMED FROM A RETURN VALUE. This is the guard for #1462, and it is here
+  // because for the whole life of this file the answer was NO and nothing
+  // noticed: `fcntl` is variadic, Apple ARM64 passes variadic arguments on the
+  // stack, and the provider declared a fixed third parameter — so `F_SETFL`
+  // silently applied the wrong value, reported success, and left every socket
+  // BLOCKING.
+  //
+  // WHAT THAT COST, AND WHY A CHEAP FLAG CHECK IS WORTH A LINE OF OUTPUT: it is
+  // not that a blocking socket is slower. It is that a thread inside a blocking
+  // syscall never reaches a safepoint, so under `BIT_GC=stress` every collection
+  // the other thread attempted ran the stop-the-world spin bound out in full and
+  // ABANDONED (~65ms each). The `blocked` property below then took HOURS instead
+  // of milliseconds — measured at 200000+ abandoned collections and observed as
+  // orphaned binaries pinning a core for 2h15m and 3h59m — while the identical
+  // binary passed in under a second under the default collector. That is why
+  // this file looked intermittent and machine-dependent when it was neither: it
+  // fails 20 runs out of 20 under the stress policy and 0 out of 40 without it.
+  //
+  // Asserted on all three TCP sockets because they are made three different
+  // ways: `lfd` by `netListenTcp`, `cfd` by `netDialTcp` (both through
+  // `netSysSocket`), and `afd` by `netAcceptTcp`, which sets the flag on the
+  // descriptor `accept` returned — a SEPARATE call site that Darwin needs and
+  // that a `SOCK_NONBLOCK`-style platform would not.
+  let nonBlock = netIsNonBlock(lfd) && netIsNonBlock(cfd) && netIsNonBlock(afd)
 
   let sent = netWriteSock(cfd, sendBytes(), payloadLen)
   clear(recvBytes(), payloadLen)
@@ -436,6 +498,7 @@ function main() {
 
   println("addr ${addrOk} refused ${refused}")
   println("tcp ${bound} ${paired} ${clean} ${delivered} ${roundTrip} eof ${eof}")
+  println("nonblock ${nonBlock}")
   println("block ${blocked}")
   println("dial ${refusedDial}")
   println("udp ${udpBound} ${datagram}")

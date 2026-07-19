@@ -96,6 +96,11 @@ function eIntr(): int { return 4 }
 function eInProgress(): int { return 115 }
 function eConnAborted(): int { return 103 }
 function eConnReset(): int { return 104 }
+// The two answers a RE-ISSUED `connect` gives about a handshake already under
+// way: EALREADY "still running", EISCONN "finished, and it succeeded". See
+// `netDialTcp`, which needs them to know when SO_ERROR has become meaningful.
+function eAlready(): int { return 114 }
+function eIsConn(): int { return 106 }
 
 // `struct sockaddr_in` ON LINUX, from std/os/linux.zig — AND THIS IS THE STRUCT
 // THAT FORCED THE CORE/PROVIDER SPLIT:
@@ -524,24 +529,63 @@ export @symbol("bit_rt_port_net_dial_tcp") function netDialTcp(host: *u8, hostLe
   }
   let spins = 0
   // Bounded (Power of 10). One parked wait suffices when there is a scheduler;
-  // the loop exists for the unscheduled caller, which must poll SO_ERROR.
+  // the loop exists for the unscheduled caller, which must poll for completion.
+  //
+  // `SO_ERROR == 0` DOES NOT MEAN CONNECTED — it means "no error HAS BEEN
+  // RECORDED YET", and immediately after EINPROGRESS that is the state of every
+  // handshake, including the ones about to be refused. Reading it before the
+  // handshake finishes therefore reports success for a connection that has not
+  // happened, which is the very bug the comment above warns about, one step
+  // further in.
+  //
+  // FOUND ON THE DARWIN TWIN (#1462) AND FIXED HERE TOO, BUT THE TWO ARE NOT
+  // EQUALLY EXPOSED, so the same code was failing differently on each platform.
+  // Darwin's `fcntl` never actually applied `O_NONBLOCK` (a variadic-ABI bug),
+  // so `connect` completed synchronously there and this loop was DEAD CODE. This
+  // provider takes `SOCK_NONBLOCK` at creation and has always been genuinely
+  // non-blocking, so here the loop runs and the early read is LIVE — it is a
+  // race that loopback usually wins (a refused connect records ECONNREFUSED
+  // almost at once) and therefore usually looks correct. Same defect, opposite
+  // reasons for going unnoticed.
+  //
+  // So completion is established FIRST, by re-issuing `connect` — the way to ask
+  // a pending handshake how it went that needs no poller, which matters because
+  // the unscheduled caller has none:
+  //
+  //   EALREADY / EINPROGRESS   still running; keep waiting
+  //   EISCONN (or success)     finished and connected
+  //   anything else            the deferred failure, reported here
+  //
+  // SO_ERROR is then read on the completed socket, where it IS meaningful.
   while (spins < netMaxSpins) {
     if (netAwaitReady(fd, pollWrite)) {
       spins = netMaxSpins
     } else {
       spins = spins + 1
     }
-    let se = netSocketError(fd)
-    if (se < 0) {
+    // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`ipBytes()`
+    // are module scratch shared by every entry point here, and `netAwaitReady`
+    // above PARKS the calling green thread — so another task can run a
+    // `netListenTcp`/`netBindUdp`/`netDialTcp` of its own and leave its address
+    // in the buffer. Reconnecting to whatever it left would be a silent
+    // cross-connection.
+    if (!netParseIpv4(host, hostLen, ip)) {
       netClose(fd)
       return 0 - 1
     }
-    if (se == 0) {
+    netFillSockAddr(saBytes(), ip, port)
+    let rc2 = sysRc(int(syscall(nrConnect(), i64(fd), i64(int(saBytes())), i64(saLen))))
+    let ce = lastErr()
+    if (rc2 >= 0 || ce == eIsConn()) {
+      // Connected as far as the handshake is concerned; SO_ERROR is now the
+      // authority on whether it succeeded.
+      if (netSocketError(fd) != 0) {
+        netClose(fd)
+        return 0 - 1
+      }
       return fd
     }
-    // EINPROGRESS from SO_ERROR means the handshake is still running; anything
-    // else is the real failure the connect deferred (ECONNREFUSED, EHOSTUNREACH).
-    if (se != eInProgress() && se != eAgain()) {
+    if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
       netClose(fd)
       return 0 - 1
     }

@@ -51,7 +51,33 @@ extern function recvfrom(fd: i32, buf: *u8, n: i64, flags: i32, sa: *u8, salen: 
 extern function getsockname(fd: i32, sa: *u8, salen: *u8): i32
 extern function setsockopt(fd: i32, lvl: i32, name: i32, val: *u8, len: i32): i32
 extern function getsockopt(fd: i32, lvl: i32, name: i32, val: *u8, len: *u8): i32
-extern function fcntl(fd: i32, cmd: i32, arg: i32): i32
+// THE ONE VARIADIC C FUNCTION THIS MODULE CALLS, AND THE ONLY ONE IN THE WHOLE
+// BIT RUNTIME — `int fcntl(int fd, int cmd, ...)`. Declaring it with a plain
+// third parameter is SILENTLY WRONG ON APPLE ARM64, and that mistake is what
+// #1462 was: Apple's ARM64 ABI passes every VARIADIC argument on the STACK
+// (unlike AAPCS64, which puts the first eight in registers), so a fixed-arity
+// declaration leaves the value in `x2` where the callee never looks. `F_SETFL`
+// then received whatever the stack happened to hold, RETURNED 0 FOR SUCCESS,
+// and `O_NONBLOCK` was never set — so every socket this module produced was
+// BLOCKING while every retry loop below was written believing otherwise.
+//
+// SPEC §11.7 forbids a variadic `extern` outright ("a variadic C function needs
+// per-call ABI classification this path does not implement"), so the argument
+// has to be placed by hand. It is passed TWICE, and that is what makes this
+// correct on both Darwin architectures rather than only the one we test on:
+//
+//   - `argReg` occupies the third integer register (`x2` / `rdx`). SysV x86-64
+//     passes variadic integer arguments in registers, so this is the slot a
+//     future x86_64-macOS build's callee reads.
+//   - `pad3`..`pad7` consume the remaining argument registers so that
+//     `argStack` — the ninth parameter — lands in the FIRST STACK SLOT, which
+//     is where Apple ARM64's callee reads its first variadic argument.
+//
+// Callers pass the same value for both. A C variadic callee ignores arguments
+// past the ones it consumes, so the duplicate is inert on whichever platform
+// does not use it. `netSetNonBlock` verifies the result rather than trusting
+// this reasoning — see there.
+extern function fcntl(fd: i32, cmd: i32, argReg: i64, pad3: i64, pad4: i64, pad5: i64, pad6: i64, pad7: i64, argStack: i64): i32
 
 // THE ERRNO ACCESSOR, WHICH A RAW-SYSCALL PLATFORM DOES NOT NEED. A Linux
 // syscall returns `-errno` in its result register, so its provider reads the
@@ -115,6 +141,11 @@ function eIntr(): int { return 4 }
 function eInProgress(): int { return 36 }
 function eConnAborted(): int { return 53 }
 function eConnReset(): int { return 54 }
+// The two answers a RE-ISSUED `connect` gives about a handshake already under
+// way: EALREADY "still running", EISCONN "finished, and it succeeded". See
+// `netDialTcp`, which needs them to know when SO_ERROR has become meaningful.
+function eAlready(): int { return 37 }
+function eIsConn(): int { return 56 }
 
 // `struct sockaddr_in` ON DARWIN, from std/c.zig — AND THIS IS THE STRUCT THAT
 // FORCED THE CORE/PROVIDER SPLIT:
@@ -326,8 +357,19 @@ export @symbol("bit_rt_port_net_sys_socket") function netSysSocket(dgram: bool):
   return fd
 }
 
+// True when `fd`'s descriptor flags carry `O_NONBLOCK`. Split out because it is
+// needed twice: once to decide whether to set the bit, and once to CHECK that
+// setting it worked.
+export @symbol("bit_rt_port_net_is_non_block") function netIsNonBlock(fd: int): bool {
+  let flags = int(fcntl(i32(fd), i32(fGetFl()), 0, 0, 0, 0, 0, 0, 0))
+  if (flags < 0) {
+    return false
+  }
+  return flags / oNonBlock() % 2 != 0
+}
+
 export @symbol("bit_rt_port_net_set_non_block") function netSetNonBlock(fd: int): bool {
-  let flags = int(fcntl(i32(fd), i32(fGetFl()), i32(0)))
+  let flags = int(fcntl(i32(fd), i32(fGetFl()), 0, 0, 0, 0, 0, 0, 0))
   if (flags < 0) {
     return false
   }
@@ -337,7 +379,18 @@ export @symbol("bit_rt_port_net_set_non_block") function netSetNonBlock(fd: int)
   if (flags / oNonBlock() % 2 == 0) {
     want = flags + oNonBlock()
   }
-  return int(fcntl(i32(fd), i32(fSetFl()), i32(want))) >= 0
+  if (int(fcntl(i32(fd), i32(fSetFl()), i64(want), 0, 0, 0, 0, 0, i64(want))) < 0) {
+    return false
+  }
+  // THE RETURN VALUE OF `fcntl` IS NOT EVIDENCE THAT THE FLAG WAS SET, and this
+  // readback is the whole guard against #1462 recurring. A misplaced variadic
+  // argument makes `F_SETFL` apply some other value and still report success,
+  // which is precisely how every socket here came to be blocking while the code
+  // above read as correct. Reading the flags back is the only check that cannot
+  // be fooled by getting the ABI wrong, because it observes the KERNEL's state
+  // rather than our own call. Cost is one syscall per socket, paid once at
+  // creation; the failure it converts from silent to loud costs hours.
+  return netIsNonBlock(fd)
 }
 
 export @symbol("bit_rt_port_net_close") function netClose(fd: int) {
@@ -526,24 +579,59 @@ export @symbol("bit_rt_port_net_dial_tcp") function netDialTcp(host: *u8, hostLe
   }
   let spins = 0
   // Bounded (Power of 10). One parked wait suffices when there is a scheduler;
-  // the loop exists for the unscheduled caller, which must poll SO_ERROR.
+  // the loop exists for the unscheduled caller, which must poll for completion.
+  //
+  // `SO_ERROR == 0` DOES NOT MEAN CONNECTED — it means "no error HAS BEEN
+  // RECORDED YET", and immediately after EINPROGRESS that is the state of every
+  // handshake, including the ones about to be refused. Reading it before the
+  // handshake finishes therefore reports success for a connection that has not
+  // happened, which is the very bug the comment above warns about, one step
+  // further in. This was invisible until #1462: `fcntl`'s misplaced variadic
+  // argument left every socket BLOCKING, so `connect` completed synchronously
+  // and this loop was never entered at all — the test's own notes record
+  // `refusedDial` as "passing for the wrong reason" and the SO_ERROR readback as
+  // an unexercised gap. Both are now real.
+  //
+  // So completion is established FIRST, by re-issuing `connect` — the BSD way to
+  // ask a pending handshake how it went, and one that needs no poller, which
+  // matters because the unscheduled caller has none:
+  //
+  //   EALREADY / EINPROGRESS   still running; keep waiting
+  //   EISCONN (or success)     finished and connected
+  //   anything else            the deferred failure, reported here
+  //
+  // SO_ERROR is then read on the completed socket, where it IS meaningful, and
+  // is what turns a handshake that completed-but-failed into an error.
   while (spins < netMaxSpins) {
     if (netAwaitReady(fd, pollWrite)) {
       spins = netMaxSpins
     } else {
       spins = spins + 1
     }
-    let se = netSocketError(fd)
-    if (se < 0) {
+    // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`ipBytes()`
+    // are module scratch shared by every entry point here, and `netAwaitReady`
+    // above PARKS the calling green thread — so another task can run a
+    // `netListenTcp`/`netBindUdp`/`netDialTcp` of its own and leave its address
+    // in the buffer. Reconnecting to whatever it left would be a silent
+    // cross-connection. Re-deriving from the caller's own `host`/`port`, with no
+    // park between the fill and the call, is what makes this safe.
+    if (!netParseIpv4(host, hostLen, ip)) {
       netClose(fd)
       return 0 - 1
     }
-    if (se == 0) {
+    netFillSockAddr(saBytes(), ip, port)
+    let rc2 = int(connect(i32(fd), saBytes(), i32(saLen)))
+    let ce = lastErr()
+    if (rc2 >= 0 || ce == eIsConn()) {
+      // Connected as far as the handshake is concerned; SO_ERROR is now the
+      // authority on whether it succeeded.
+      if (netSocketError(fd) != 0) {
+        netClose(fd)
+        return 0 - 1
+      }
       return fd
     }
-    // EINPROGRESS from SO_ERROR means the handshake is still running; anything
-    // else is the real failure the connect deferred (ECONNREFUSED, EHOSTUNREACH).
-    if (se != eInProgress() && se != eAgain()) {
+    if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
       netClose(fd)
       return 0 - 1
     }
