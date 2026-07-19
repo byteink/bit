@@ -207,6 +207,58 @@ for n_ in 1 2 3; do
 done
 
 # ---------------------------------------------------------------------------
+# CONVERSIONS (§12.9). Added for #1490: `string(x)` on an i64 was accepted by the
+# selfhost and SIGSEGV'd at runtime while the seed rejected it with E0053. This
+# whole family was absent from the matrix above — every cell there carries a
+# DECLARED slot type, and a conversion has none, so widening the type/expr
+# product could never have reached it. That is the same lesson the header
+# records: the corpus only holds what someone thought to write down.
+#
+# Both operands vary: the TARGET prim, and the SOURCE as a typed local (so the
+# source is concrete, not untyped). The well-typed diagonal is included, so a
+# checker that rejects every conversion scores FALSEPOS instead of passing.
+# ---------------------------------------------------------------------------
+CONV_TARGETS='i32 i64 u8 u64 f32 f64 bool string'
+CONV_SOURCES='i32 i64 f64 bool string'
+
+conv_init() {
+  case "$1" in
+    bool)   echo 'true' ;;
+    string) echo '"s"' ;;
+    f32|f64) echo '1.5' ;;
+    *)      echo '1' ;;
+  esac
+}
+
+for tgt in $CONV_TARGETS; do
+  for src in $CONV_SOURCES; do
+    init=$(conv_init "$src")
+    cell "$tgt(x) where x: $src" \
+"function main() {
+  let x: $src = $init
+  let y = $tgt(x)
+  print(\"ok\")
+}"
+  done
+  # `string([]u8)` is a conversion; every other target must reject a slice.
+  cell "$tgt(x) where x: []u8" \
+"function main() {
+  let x: []u8 = []byte(\"s\")
+  let y = $tgt(x)
+  print(\"ok\")
+}"
+  # Untyped-literal sources take a different path in both checkers (§15.4) than
+  # the concrete locals above, so they are their own row rather than a repeat.
+  for lit in '1' '4.5' 'true' '"s"'; do
+    cell "$tgt($lit)  (untyped literal)" \
+"function main() {
+  let y = $tgt($lit)
+  print(\"ok\")
+}"
+  done
+done
+
+# ---------------------------------------------------------------------------
 echo "verdict differential over $n generated constructs"
 echo "  MATCH    $match"
 echo "  MISSING  $missing   (seed rejects, selfhost accepts)"
