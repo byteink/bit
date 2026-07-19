@@ -13,11 +13,28 @@
 #
 #   x64gate.sh <mode> N  # repeat N times, reporting each run — for chasing an
 #                        # intermittent, which a single green run cannot rule out.
+#   x64gate.sh fuzz      # run `zig build fuzz` (FUZZ_SECS=60 by default) instead
+#                        # of the test suite, on real x86_64 hardware.
+#
+# IT ONLY SEES COMMITTED WORK. `git archive HEAD` ignores the working tree and
+# the index, so uncommitted edits are NOT tested. Commit first, then gate.
 set -euo pipefail
 
 MODE="${1:-fast}"
 RUNS="${2:-1}"
 IMAGE="bit-zig-0.16.0-amd64:latest"
+
+# `fuzz` runs the mutation fuzzer instead of the test suite, on REAL x86_64.
+# This exists because the amd64 image reports 2 fuzz failures when it runs
+# EMULATED on an Apple-Silicon Mac: emulated Zig's native-CPU autodetect returns
+# `athlon_xp`, which current Zig rejects for the musl crt1.o sub-compile that the
+# fuzz step's `link_libc` needs. That is a toolchain artifact of emulation, not a
+# Bit bug — and this mode is how you check that claim instead of inheriting it.
+STEP="test"
+if [ "${MODE}" = "fuzz" ]; then
+  STEP="fuzz -- ${FUZZ_SECS:-60}"
+  MODE="fast"
+fi
 VOLUME="bit-zig-cache-amd64"
 
 if [ "$MODE" = "clean" ]; then
@@ -35,7 +52,7 @@ for i in $(seq 1 "${RUNS}"); do
   [ "${RUNS}" -gt 1 ] && echo "===RUN ${i}/${RUNS}==="
   code=$(git archive HEAD | ssh hl-master "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
     mkdir -p /work && cd /work && tar x &&
-    ZIG_GLOBAL_CACHE_DIR=${CACHE_ENV} zig build test > /tmp/o 2>&1
+    ZIG_GLOBAL_CACHE_DIR=${CACHE_ENV} zig build ${STEP} > /tmp/o 2>&1
     e=\$?
     if [ \$e -eq 0 ]; then
       echo ===TAIL===
