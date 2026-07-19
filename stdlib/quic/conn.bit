@@ -718,6 +718,14 @@ export struct Stream { export streamId: int, cmdCh: chan<quicconnCmd>, recvCh: c
 struct quicconnState {
   isClient: bool,
   sock: UdpSocket,
+  // Whether this connection is the socket's sole owner and may therefore close
+  // it. False for a listener-created connection, which shares `lst.sock` with
+  // the listener and every sibling connection (#1473). Every teardown path must
+  // go through `quicconnCloseOwnedSock` rather than touching `sock.close()`.
+  ownsSock: bool,
+  // Set once the owned socket has been closed, so the close is idempotent and no
+  // teardown ordering can double-close a descriptor the kernel may have recycled.
+  sockClosed: bool,
   peerHost: string,
   peerPort: int,
   havePeer: bool,
@@ -779,9 +787,14 @@ struct quicconnState {
   idleTimeout: int,
 }
 
+// `ownsSock` is a required parameter, not a default, so that every construction
+// site has to state whether this connection may close `sock` (#1473). Adding a
+// fourth way to make a connection therefore forces the same decision instead of
+// silently inheriting the wrong one.
 function quicconnNewState(
   isClient: bool,
   sock: UdpSocket,
+  ownsSock: bool,
   host: string,
   port: int,
   scid: []byte,
@@ -790,6 +803,8 @@ function quicconnNewState(
   return quicconnState{
     isClient: isClient,
     sock: sock,
+    ownsSock: ownsSock,
+    sockClosed: false,
     peerHost: host,
     peerPort: port,
     havePeer: isClient,
@@ -993,7 +1008,11 @@ function quicconnReleaseWaiters(st: quicconnState) {
 }
 
 // Abandon the connection on an unrecoverable error: unblock a waiting
-// dial/accept with a failure sentinel and stop the loop.
+// dial/accept with a failure sentinel, stop the loop, and release the socket if
+// this connection owns it — which also errors out the reader thread's blocked
+// `recv` so it exits instead of leaking alongside the socket. Before #1473 this
+// path had to stay socket-neutral by hand, because a listener-created connection
+// shares `lst.sock`; `quicconnCloseOwnedSock` now enforces that structurally.
 function quicconnFail(st: quicconnState) {
   if (!st.established) {
     select {
@@ -1004,6 +1023,7 @@ function quicconnFail(st: quicconnState) {
     }
   }
   st.running = false
+  quicconnCloseOwnedSock(st)
 }
 
 // Mark the connection established and release the waiting dial/accept once.
@@ -1179,8 +1199,22 @@ function quicconnDoClose(st: quicconnState, cmd: quicconnCmd): ()! {
     st.closeSent = true
     quicconnFlush(st)?
   }
-  st.sock.close()
+  quicconnCloseOwnedSock(st)
   st.running = false
+}
+
+// The single place a connection may close its socket. A connection that does not
+// own `sock` shares it with a listener and its sibling connections, so closing it
+// would kill the accept loop and every other connection on it — a use-after-close
+// on a descriptor other code still believes it owns (#1473). Every teardown path
+// (`quicconnDoClose`, `quicconnFail`, any future one) goes through here; no other
+// code in this file calls `sock.close()` on a connection's socket.
+function quicconnCloseOwnedSock(st: quicconnState) {
+  if (!st.ownsSock || st.sockClosed) {
+    return
+  }
+  st.sockClosed = true
+  st.sock.close()
 }
 
 // ---------------------------------------------------------------------------
@@ -2222,7 +2256,8 @@ export function dialQuic(host: string, port: int, serverName: string): Conn! {
     data: encodeTransportParameters(tp),
   }
   let h = tlsClientStartExts(quicconnClientTlsConfig(serverName), [ext])?
-  let st = quicconnNewState(true, sock, host, port, scid, dcid)
+  // Owns the socket: `dialQuic` bound it here, nothing else can reach it.
+  let st = quicconnNewState(true, sock, true, host, port, scid, dcid)
   st.chOpt = Option.Some(h)
   st.iLevel.ksend = clientInitialKeys(dcid)
   st.iLevel.krecv = serverInitialKeys(dcid)
@@ -2233,10 +2268,10 @@ export function dialQuic(host: string, port: int, serverName: string): Conn! {
   spawn quicconnLoop(st)
   let r = <- st.readyCh
   if (r < 0) {
-    // Close the socket so the reader thread's blocked recv() errors out and it
-    // exits; otherwise a failed or timed-out dial leaks the socket and the
-    // reader thread, and the retry loops this timeout enables leak one each.
-    sock.close()
+    // The socket is already closed: `readyCh <- -1` comes only from
+    // quicconnFail, which releases the owned socket (and so unblocks the reader
+    // thread's recv) itself. Closing again here would double-close a descriptor
+    // the kernel may have handed to someone else.
     fail newError("quic: handshake failed")
   }
   return Conn{ cmdCh: st.cmdCh, sock: sock }
@@ -2257,7 +2292,9 @@ export function acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string
     data: encodeTransportParameters(tp),
   }
   let s = tlsServerStartExts(cfg, [ext])?
-  let st = quicconnNewState(false, sock, "", 0, scid, []byte(0))
+  // Owns the socket: `acceptQuic` serves exactly one connection on `sock`, and
+  // its caller hands the socket over for that connection's lifetime.
+  let st = quicconnNewState(false, sock, true, "", 0, scid, []byte(0))
   st.shOpt = Option.Some(s)
   spawn quicconnReader(sock, st.inCh)
   spawn quicconnTicker(st)
@@ -2402,7 +2439,9 @@ function quicListenerNewConn(lst: quicListenerState, clientKey: string): quiccon
     data: encodeTransportParameters(tp),
   }
   let s = tlsServerStartExts(lst.cfg, [ext])?
-  let st = quicconnNewState(false, lst.sock, "", 0, scid, []byte(0))
+  // Does NOT own the socket: `lst.sock` is shared with the listener's recv loop
+  // and every sibling connection, so closing it here would destroy all of them.
+  let st = quicconnNewState(false, lst.sock, false, "", 0, scid, []byte(0))
   st.shOpt = Option.Some(s)
   st.serverHsTimeout = true
   let scidKey = string(scid)
@@ -2534,7 +2573,9 @@ export function (c: Conn) setIdleTimeout(ns: int) {
 }
 
 // Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
-// socket. ponytail: no draining timeout — best-effort close.
+// socket if this connection owns it (a listener-created connection shares the
+// listener's socket and leaves it alone). ponytail: no draining timeout —
+// best-effort close.
 export function (c: Conn) close() {
   c.cmdCh <- quicconnCmd{
     kind: quicconnCmdClose,

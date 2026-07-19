@@ -893,7 +893,9 @@ on the next tick and applies to a connection from either side.
 ### `Conn.close()`
 
 Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
-socket. Best-effort — there is no draining timeout.
+socket if this connection owns it. A connection accepted from a `Listener` shares
+the listener's socket with the listener and every sibling connection, so closing
+it leaves that socket alone. Best-effort — there is no draining timeout.
 
 ### `Stream`
 

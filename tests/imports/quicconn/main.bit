@@ -13,7 +13,7 @@
 //
 // Every printed line is a boolean, a byte count, or a content hash — nothing
 // timing-dependent — so the golden is stable across targets and schedules.
-import { dialQuic, acceptQuic, Conn, Stream, StreamChunk } from "std/quic"
+import { dialQuic, acceptQuic, listenQuic, Conn, Listener, Stream, StreamChunk } from "std/quic"
 import { udpBind, UdpSocket } from "std/net"
 import { monotonic } from "std/time"
 import { newSha256, encodeHex, decodeHex, pemEncode } from "std/crypto"
@@ -234,6 +234,102 @@ function idleScenario(chain: string, keyp: string): ()! {
   println("idle_bounded=${boolStr(elapsed < idleBoundNs)}")
 }
 
+// One listener client: dial, open a stream, then wait for `go` before sending, so
+// the driver controls exactly when traffic has to cross the shared socket.
+function listenerClient(port: int, msg: string, go: chan<int>, out: chan<string>) {
+  let conn = dialQuic("127.0.0.1", port, "localhost") catch e {
+    out <- "dial-failed"
+    return
+  }
+  let s = conn.openStream() catch e {
+    out <- "open-failed"
+    return
+  }
+  <- go
+  s.write([]byte(msg)) catch e {
+    out <- "write-failed"
+    return
+  }
+  s.finish() catch e {
+    out <- "finish-failed"
+    return
+  }
+  out <- "sent"
+}
+
+// Drain one accepted connection's first stream to FIN.
+function readStream(c: Conn): string {
+  let s = c.acceptStream() catch e {
+    return "accept-failed"
+  }
+  let got = []byte(0)
+  let done = false
+  let guard = 0
+  while (!done && guard < 1000000) {
+    guard = guard + 1
+    let chunk = s.read() catch e {
+      done = true
+      continue
+    }
+    for b of chunk.data {
+      got = append(got, b)
+    }
+    if (chunk.fin) {
+      done = true
+    }
+  }
+  return string(got)
+}
+
+const listenerIdleNs: int = 5000000000
+
+// #1473: closing ONE listener-created connection must not touch the socket it
+// shares with the listener and every sibling connection. Accept two, close the
+// first, then require a full round trip on the second and a brand-new third
+// connection — every one of which needs that socket alive, and none of which can
+// be satisfied from data already buffered, because the clients hold their
+// payload until told to send. The surviving connection gets a short idle timeout
+// so a regressed build answers wrongly within seconds instead of hanging.
+function listenerScenario(chain: string, keyp: string): ()! {
+  let lsock = udpBind("127.0.0.1", 0)?
+  let port = lsock.port()?
+  let lst = listenQuic(lsock, chain, keyp)?
+
+  let goA = chan<int>(1)
+  let outA = chan<string>(1)
+  spawn listenerClient(port, "alpha", goA, outA)
+  let c1 = lst.accept()?
+
+  let goB = chan<int>(1)
+  let outB = chan<string>(1)
+  spawn listenerClient(port, "beta", goB, outB)
+  let c2 = lst.accept()?
+  c2.setIdleTimeout(listenerIdleNs)
+
+  // The destructive act: before #1473 this closed `lsock` itself, taking the
+  // accept loop and every sibling connection with it.
+  c1.close()
+
+  goB <- 1
+  let got2 = readStream(c2)
+  println("listener_sibling_roundtrip=${boolStr(got2 == "beta")}")
+
+  let goC = chan<int>(1)
+  let outC = chan<string>(1)
+  goC <- 1
+  spawn listenerClient(port, "gamma", goC, outC)
+  // Read the client's own verdict first: it is bounded by the 5s dial handshake
+  // timeout, so a dead listener socket surfaces as a failure here rather than
+  // parking the accept below forever.
+  let rc = <- outC
+  let got3 = ""
+  if (rc == "sent") {
+    let c3 = lst.accept()?
+    got3 = readStream(c3)
+  }
+  println("listener_third_accept=${boolStr(got3 == "gamma")}")
+}
+
 function run(): ()! {
   let payload = makePayload(payloadBytes)
   let want = sha256Hex(payload)
@@ -264,6 +360,9 @@ function run(): ()! {
   println("loss_handshake=${boolStr(ok2)}")
   println("loss_match=${boolStr(got2 == "${want}:${payloadBytes}")}")
   println("loss_dropped_some=${boolStr(ctr.n > 0)}")
+
+  // --- listener: one connection's close must not kill its siblings (#1473) ---
+  listenerScenario(chainPem(), keyPem())?
 
   // --- idle: a vanished peer unparks `finish` in bounded time (#1449/#1474) ---
   idleScenario(chainPem(), keyPem())?
