@@ -2851,15 +2851,36 @@ const FnCtx = struct {
         return .{ .value = .{ .callee = callee_val, .result = shape.result, .params = shape.params, .variadic = shape.variadic } };
     }
 
-    fn lowerArgs(self: *FnCtx, args_node: ast.Index) Error![]ir.ValueId {
+    /// Lowers a call's argument list, materializing argument `i` at
+    /// `param_tys[i]`. A `null` slice — or one shorter than the argument list —
+    /// leaves the remaining arguments unhinted, which is only correct where the
+    /// parameter type IS the untyped default (`syscall`'s `i64` words).
+    ///
+    /// The hint is what makes an untyped literal land at the callee's declared
+    /// width. Without it `4.5` materializes at its default `f64` and a narrower
+    /// parameter reads the wrong half of it — `float32Bits(4.5)` returned the
+    /// f64 bit pattern (#1467). Same defect family as #1456/#1457: a literal
+    /// lowered with no type hint is silently wrong, never diagnosed.
+    fn lowerArgs(self: *FnCtx, args_node: ast.Index, param_tys: ?[]const TypeId) Error![]ir.ValueId {
         const arg_nodes = self.kids(args_node);
         const vals = try self.gpa.alloc(ir.ValueId, arg_nodes.len);
         errdefer self.gpa.free(vals);
         for (arg_nodes, 0..) |an, i| {
             if (self.tree().get(an).tag != .arg) return error.UnsupportedConstruct; // arg_spread: deferred
-            vals[i] = try self.lowerExpr(self.kids(an)[0]);
+            const hint: ?TypeId = if (param_tys) |p| (if (i < p.len) p[i] else null) else null;
+            vals[i] = try self.lowerExprH(self.kids(an)[0], hint);
         }
         return vals;
+    }
+
+    /// The declared parameter types of primitive builtin `name`, as TypeIds, for
+    /// `lowerArgs` to hint with. `null` when `name` is not in `check.zig`'s
+    /// `prim_sigs` — the caller then lowers unhinted.
+    fn primParamTypes(self: *FnCtx, name: []const u8) Error!?[]const TypeId {
+        const prims = check.primParams(name) orelse return null;
+        const tys = try self.gpa.alloc(TypeId, prims.len);
+        for (prims, 0..) |p, i| tys[i] = self.ctx.prim_ids.get(p);
+        return tys;
     }
 
     fn lowerBuiltinCall(self: *FnCtx, node: ast.Index, name: []const u8) Error!ir.ValueId {
@@ -2882,7 +2903,9 @@ const FnCtx = struct {
             return self.rtCall(void_ty, rt, &.{v});
         }
         if (std.mem.eql(u8, name, "assert")) {
-            const vals = try self.lowerArgs(args_node);
+            // `assert(cond)` / `assert(cond, msg)`: `bool` and `string`, neither
+            // of which an untyped literal defaults away from.
+            const vals = try self.lowerArgs(args_node, null);
             defer self.gpa.free(vals);
             // `bit_rt_assert` has one frozen 2-arg signature (ABI.md §12), so the
             // 1-arg source form must still pass a message — otherwise the failing
@@ -2937,7 +2960,9 @@ const FnCtx = struct {
         // it — the backends emit the kernel trap inline — so it takes its own
         // op and deliberately never reaches `primRtFn` below.
         if (std.mem.eql(u8, name, "syscall")) {
-            const vals = try self.lowerArgs(args_node);
+            // Unhinted deliberately: `syscall` is variadic over `i64` words,
+            // which is exactly what an untyped int literal already defaults to.
+            const vals = try self.lowerArgs(args_node, null);
             defer self.gpa.free(vals);
             const i64ty = self.ctx.prim_ids.get(.i64);
             return self.b.syscall(i64ty, vals[0], vals[1..]);
@@ -2951,13 +2976,17 @@ const FnCtx = struct {
         // call. Checked first, and single-operand by construction, so they
         // never reach `primRtFn`. See `primUnaryOp`.
         if (primUnaryOp(name)) |uop| {
-            const vals = try self.lowerArgs(args_node);
+            const ptys = try self.primParamTypes(name);
+            defer if (ptys) |p| self.gpa.free(p);
+            const vals = try self.lowerArgs(args_node, ptys);
             defer self.gpa.free(vals);
             std.debug.assert(vals.len == 1); // arity fixed by check.zig's `prim_sigs`
             return self.b.unary(uop, try self.nodeType(node), vals[0]);
         }
         if (primRtFn(name)) |rt| {
-            const vals = try self.lowerArgs(args_node);
+            const ptys = try self.primParamTypes(name);
+            defer if (ptys) |p| self.gpa.free(p);
+            const vals = try self.lowerArgs(args_node, ptys);
             defer self.gpa.free(vals);
             return self.rtCall(try self.nodeType(node), rt, vals);
         }
@@ -3411,12 +3440,20 @@ const FnCtx = struct {
         const target = try self.resolveCallTarget(call_node, k[0]);
         var args: std.ArrayList(ir.ValueId) = .empty;
         if (target == .direct_method) try args.append(self.gpa, target.direct_method.recv);
-        for (self.kids(k[2])) |an| {
+        // The callee's declared parameter types are the hints, exactly as the
+        // immediate-call and `spawn` paths do it. `defer` evaluates its
+        // arguments NOW (Go semantics) but stashes the values, so an untyped
+        // literal materialized at its default type here is handed to the callee
+        // unchanged at `runDefers` time: `defer f(4.5)` against `f(x: f32)`
+        // passed an f64 and the callee read its zero low half (#1467).
+        const params = target.sig().params;
+        for (self.kids(k[2]), 0..) |an, i| {
             if (self.tree().get(an).tag != .arg) {
                 args.deinit(self.gpa);
                 return error.UnsupportedConstruct;
             }
-            try args.append(self.gpa, try self.lowerExpr(self.kids(an)[0]));
+            const hint: ?TypeId = if (i < params.len) params[i] else null;
+            try args.append(self.gpa, try self.lowerExprH(self.kids(an)[0], hint));
         }
         const owned = try args.toOwnedSlice(self.gpa);
         const entry: DeferredCall = switch (target) {
@@ -3440,7 +3477,9 @@ const FnCtx = struct {
             .assert
         else
             return error.UnsupportedConstruct;
-        const args = try self.lowerArgs(self.kids(call_node)[2]);
+        // `print`/`eprint` take a `string` and `assert` a `bool`; neither is a
+        // type an untyped literal defaults away from, so no hint is needed.
+        const args = try self.lowerArgs(self.kids(call_node)[2], null);
         try self.defers.append(self.gpa, .{ .builtin = .{ .rt = rt, .args = args, .result = self.ctx.void_id } });
     }
 

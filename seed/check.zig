@@ -5594,6 +5594,18 @@ pub fn asmRegX64(name: []const u8) ?u8 {
     return null;
 }
 
+/// The declared parameter types of the primitive builtin `name`, or `null` for
+/// a non-primitive. `lower.zig` materializes each argument at its declared type:
+/// an untyped literal otherwise lands at its DEFAULT type and the operand
+/// carries the wrong width — `float32Bits(4.5)` handing an `f64` to a signature
+/// that says `f32`, so the narrow read takes the f64's low half, which is zero
+/// (#1467). Reads the same `prim_sigs` the checker types these calls against, so
+/// a signature can never be typed one way here and lowered another way there.
+pub fn primParams(name: []const u8) ?[]const Prim {
+    const sig = Checker.prim_sigs.get(name) orelse return null;
+    return sig.params;
+}
+
 pub fn asmRegArm64(name: []const u8) ?u8 {
     if (std.mem.eql(u8, name, "memory")) return 254;
     if (std.mem.eql(u8, name, "sp") or std.mem.eql(u8, name, "xzr")) return 31;
