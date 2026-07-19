@@ -46,6 +46,14 @@ if [ "${MODE}" = "fuzz" ]; then
 fi
 VOLUME="bit-zig-cache-amd64"
 
+# Which real-x86_64 box runs the gate. Default `mustafa-desktop`: 28 cores and
+# otherwise idle, against hl-master's 6 cores carrying load ~12 alongside seven
+# production service containers (ntfy/qdrant/searxng/tasktap/whisper-shim) —
+# measured, not assumed. Override to compare hosts or when one is unreachable;
+# both carry the same `bit-zig-0.16.0-amd64` image, copied with docker save|load
+# so the two are byte-identical rather than independently built (#1500).
+X64GATE_HOST="${X64GATE_HOST:-mustafa-desktop}"
+
 if [ "$MODE" = "clean" ]; then
   # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
   CACHE_ARGS=""
@@ -59,7 +67,7 @@ fi
 fails=0
 for i in $(seq 1 "${RUNS}"); do
   [ "${RUNS}" -gt 1 ] && echo "===RUN ${i}/${RUNS}==="
-  code=$(git archive HEAD | ssh hl-master "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
+  code=$(git archive HEAD | ssh "${X64GATE_HOST}" "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
     mkdir -p /work && cd /work && tar x &&
     ZIG_GLOBAL_CACHE_DIR=${CACHE_ENV} zig build ${STEP} > /tmp/o 2>&1
     e=\$?
