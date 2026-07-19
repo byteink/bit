@@ -2040,6 +2040,16 @@ program's object does, since exactly one object per link may define each:
   what makes the absent stack map sound: `@nosplit` already carries the
   obligation not to allocate and not to reach a safepoint, so no collection can
   begin beneath such a frame and none of them ever needs scanning.
+
+  **This requirement is scheduled for deletion, and the reason is a real
+  conflict rather than a preference.** A scheduler worker loop must reach
+  safepoints — that is how it yields to a stop-the-world rendezvous — so it
+  cannot be `@nosplit`, and a runtime module containing one therefore has no
+  representation as an archive member. The same is true of any member that
+  legitimately contains an `asm` barrier or an indirect call. The resolution is
+  a per-member stack-map table the linker merges (`runtime/ABI.md` §4.1); once a
+  member carries its own maps there is no reason to restrict what its functions
+  may do, and this bullet becomes "each member carries its own entries" instead.
 - **string literals are local**, not global. Nothing outside the object names
   them, so two members' literals cannot collide.
 

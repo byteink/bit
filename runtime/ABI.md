@@ -286,6 +286,65 @@ inner frames' `saved` entries as the walk unwinds); apply this frame's `saved`
 entries to recover the caller's registers; then step to `*(fp)` / `*(fp+8)`.
 `pc` leaving every function's range ends the Bit portion of the stack.
 
+### 4.1 The one-table assumption, and why it has to go
+
+The format above assumes **one table per link**, under one fixed symbol, emitted
+by the single object that is the whole program. That assumption is what makes a
+Bit-sourced `libbitrt.a` unreachable today, and resolving it is a contract
+change, so it is recorded here before the code moves.
+
+A freestanding archive member (SPEC §17.6) carries no `bit_stack_maps` — two
+members defining that symbol is a duplicate-definition error. §17.6 therefore
+requires every function in such a member to be `@nosplit` or `@naked`, which is
+sound for exactly the reason §10.3 gives: such a function may not allocate and
+may not reach a safepoint, so no collection can begin beneath its frame and the
+absent map is never consulted.
+
+**That requirement collides head-on with the scheduler.** `schedWorkerRun` must
+*not* be `@nosplit`: its safepoints are what let a worker yield to a stop-the-world
+rendezvous, and removing the attribute is what took `tests/stress/schedpool` from
+**zero** collections under `BIT_GC=stress` to a working count. Re-adding it to
+satisfy §17.6 would re-break the collector. Both rules are correct in isolation
+and cannot both hold, so a runtime module that must reach safepoints has **no
+representation as an archive member** under the current format.
+
+Measured, with the `@nosplit` emit gate removed and nothing else changed: **all
+ten** ported runtime modules (`spinlock alloc gc park chan sched rand thread
+auxv root`) emit freestanding and archive to **217 defined / 217 distinct
+symbols, zero duplicates** — and **zero** of them carry a stack map. The pin
+scan (§9) is already fully satisfied for all ten. The stack-map table is the
+only remaining obstacle between here and a fully-Bit `libbitrt.a`.
+
+**Resolution: the table becomes per-member and the linker merges it.** Each
+object emits its own stack-map entries into a dedicated section (ELF `.bit_gc`,
+Mach-O `__DATA,__bit_gc` — both section kinds already exist in the object
+writers); the linker lays that section's atoms contiguously and the runtime walks
+the merged extent instead of one blob. A stack-map entry must be retained
+exactly when the function it describes is retained, so entries are per-function
+atoms rather than one blob per module — which also makes dead-stripping of
+`libbitrt.a` finer-grained than it is today, not coarser.
+
+Consequences for this document when that lands: the leading `u32 num_funcs`
+disappears (a merged table has no single count), entries become a flat sequence
+bounded by the linker-defined extent, and `bit_stack_maps` names the start of
+that extent rather than a blob one object owns. **§17.6's `@nosplit` requirement
+is then deleted, not relaxed** — a member carrying its own maps has no reason to
+restrict what its functions may do.
+
+Two alternatives were weighed and rejected:
+
+- **A second "runtime member" kind** that carries stack maps and is not
+  `@nosplit`, kept distinct from today's freestanding. This is *dominated*: the
+  moment a member carries maps it needs the merge mechanism above, so this is
+  the same format change plus a second mode to maintain forever.
+- **Linking non-freestanding modules as a whole-project object** instead of an
+  archive member. Cheapest, but it re-opens the prelude-symbol collision that
+  module-scoped emission was introduced to solve, whose failure mode is an
+  unresolvable `m<id>$` reference that dies far from its cause (dead-stripped
+  when unreferenced, a dyld abort on Darwin). It also breaks the distribution
+  model: `bit` links a *prebuilt* `libbitrt.a`, and this would require the
+  runtime to be recompiled into every user program's object.
+
 ---
 
 ## 5. Safepoints and stop-the-world
