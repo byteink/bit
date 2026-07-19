@@ -556,10 +556,35 @@ fn linkAndRun(gpa: Allocator, name: []const u8, exe: []const u8) !u8 {
     // An absolute path under /tmp: always writable and isolated from the build
     // system's `zig-out/` (which it fails to write into under `zig build
     // test`), and `execve`-able directly.
-    const sub = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-{s}", .{name}, 0);
+    //
+    // `name` alone is a CONSTANT per test, so every concurrent build tree on
+    // this box wrote and exec'd one path — the latent twin recorded when the
+    // original ETXTBSY bug was fixed in 74811a3, and still live (#1459). The box
+    // routinely runs ~9 agent worktrees, so two reaching here together is not
+    // rare, and the failure surfaces as a HANG (the parent parked in
+    // `std.process.run` on a child that was clobbered mid-exec), which reads as
+    // "the box is loaded" rather than as a bug.
+    //
+    // Two independent defences, because either alone can be defeated:
+    //   1. `testing.random_seed` in the name — what every other harness in the
+    //      tree already does (tests/stress.zig, tests/harness.zig,
+    //      tests/diffimports.zig).
+    //   2. write-then-rename — the exec'd path is NEVER a write target, so even
+    //      a name collision cannot have one process writing an inode another is
+    //      exec'ing. This is the half that survives a future caller passing a
+    //      name that is unique-looking but is not.
+    const sub = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-{s}-{x}", .{ name, testing.random_seed }, 0);
     defer gpa.free(sub);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sub, .data = exe });
-    _ = std.os.linux.fchmodat(std.os.linux.AT.FDCWD, sub, 0o755); // exec bit; caller is x86-64 Linux
+    const staging = try std.fmt.allocPrintSentinel(gpa, "{s}.staging", .{sub}, 0);
+    defer gpa.free(staging);
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = staging, .data = exe });
+    _ = std.os.linux.fchmodat(std.os.linux.AT.FDCWD, staging, 0o755); // exec bit; caller is x86-64 Linux
+    // `writeFile` has closed its handle by here; the rename publishes a file
+    // that no writer can still be holding open.
+    try cwd.rename(staging, cwd, sub, io);
+    defer cwd.deleteFile(io, sub) catch {};
 
     var child = try std.process.spawn(io, .{ .argv = &.{sub} });
     return switch (try child.wait(io)) {

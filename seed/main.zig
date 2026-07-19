@@ -1467,10 +1467,21 @@ test "check routes a directory to the project checker (#1156)" {
     const cwd = Io.Dir.cwd();
 
     // A directory used to fail with `IsDir` before it ever reached the checker.
-    const dir = "/tmp/bit-check-dir-test";
+    //
+    // Disambiguated (#1459): two concurrent build trees otherwise share one
+    // directory, and each `deleteTree`s it out from under the other. The nonce
+    // is on TOP of `random_seed` because this is the one fixture where a seed
+    // collision is not merely unlikely-and-harmless: unlike the exec paths,
+    // which are additionally protected by write-then-rename, two runs here
+    // genuinely destroy each other's tree. Measured — with the seed alone this
+    // was the sole surviving casualty of a deliberately same-seeded pair.
+    const dir = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-check-dir-test-{x}-{x}", .{ std.testing.random_seed, scratchNonce(io) }, 0);
+    defer gpa.free(dir);
     cwd.deleteTree(io, dir) catch {};
     try cwd.createDirPath(io, dir);
     defer cwd.deleteTree(io, dir) catch {};
+    const main_path = try std.fmt.allocPrint(gpa, "{s}/main.bit", .{dir});
+    defer gpa.free(main_path);
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1478,14 +1489,14 @@ test "check routes a directory to the project checker (#1156)" {
     defer err.deinit();
 
     // Clean project: exits ok, no diagnostics.
-    try cwd.writeFile(io, .{ .sub_path = dir ++ "/main.bit", .data = "function main() {\n  print(\"ok\")\n}\n" });
+    try cwd.writeFile(io, .{ .sub_path = main_path, .data = "function main() {\n  print(\"ok\")\n}\n" });
     try std.testing.expect(!try runCheck(gpa, io, &out.writer, &err.writer, false, &.{dir}));
     try std.testing.expectEqualStrings("", err.written());
 
     // Same directory with a type error: fails with the located E-code, proving
     // the directory reached the real checker rather than dying on `IsDir`.
     err.clearRetainingCapacity();
-    try cwd.writeFile(io, .{ .sub_path = dir ++ "/main.bit", .data = "function main() {\n  let x: i64 = \"nope\"\n  print(x)\n}\n" });
+    try cwd.writeFile(io, .{ .sub_path = main_path, .data = "function main() {\n  let x: i64 = \"nope\"\n  print(x)\n}\n" });
     try std.testing.expect(try runCheck(gpa, io, &out.writer, &err.writer, false, &.{dir}));
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "E0041") != null);
 
@@ -1512,12 +1523,20 @@ test "build: a printing program compiles, links, and runs" {
     const exe = (try buildExecutable(gpa, "e2e.bit", src, lib, .x86_64_linux, &discard.writer)) orelse return error.CompileFailed;
     defer gpa.free(exe);
 
-    const path = "/tmp/bit-e2e-test";
+    // Disambiguated and published by rename, for the reasons on `linkAndRun`
+    // in seed/link.zig (#1459): a fixed name that is written and then exec'd is
+    // a clobber/ETXTBSY hazard between concurrent build trees.
+    const path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-e2e-test-{x}", .{std.testing.random_seed}, 0);
+    defer gpa.free(path);
+    const staging = try std.fmt.allocPrintSentinel(gpa, "{s}.staging", .{path}, 0);
+    defer gpa.free(staging);
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
+        .sub_path = staging,
         .data = exe,
         .flags = .{ .permissions = .executable_file },
     });
+    try Io.Dir.cwd().rename(staging, Io.Dir.cwd(), path, io);
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
     defer gpa.free(result.stdout);
