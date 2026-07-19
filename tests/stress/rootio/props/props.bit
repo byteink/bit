@@ -1,0 +1,210 @@
+// Shared property checks for the write/exit providers of the Stage-2 port of
+// runtime/root.zig (#1367) — SEAM 3's kernel-facing half.
+//
+// `runtime/root/linux/io.bit` reaches the kernel with a raw `write`/`exit_group`
+// syscall (§11.8) and `runtime/root/darwin/io.bit` with a libSystem
+// `write`/`_exit` call (§11.7), and those two cannot appear in one module — an
+// `extern function` is rejected outright when targeting Linux and a `syscall`
+// when targeting Darwin. So the driver is split into `../../rootiolinux` and
+// `../../rootiodarwin`, and everything they assert lives HERE, shared verbatim,
+// so the two platforms are held to an identical standard and cannot drift. Same
+// shape as `../../alloc/props` and `../../rand/props`.
+//
+// The provider is taken as function values rather than imported, which is what
+// lets one copy serve both platforms.
+//
+// ---------------------------------------------------------------------------
+// WHY THE GOLDEN FILE IS THE ORACLE HERE, AND WHAT THAT BUYS
+// ---------------------------------------------------------------------------
+//
+// Every other stress program in this tree computes a summary and prints it. This
+// one CANNOT, because what is under test IS the printing: a function that writes
+// the wrong bytes to the right fd, or the right bytes to the wrong fd, would
+// still return normally and still let a hand-computed mask come out full.
+//
+// So the assertions are made positionally, in the golden itself. The port's own
+// `rootPrint`/`panicWrite`/`rootWriteAll` emit bytes DIRECTLY into this
+// program's stdout, interleaved with ordinary `print` calls, and
+// `tests/stress.zig` compares the whole stream byte for byte. That makes the
+// golden a transcript rather than a summary: a swapped fd, an off-by-one length,
+// a dropped prefix or a reordered write all change it.
+//
+// Two properties are checked by ABSENCE, which is the only way to check them:
+//
+//   P2  `eprint` MUST NOT REACH STDOUT. It writes a loud marker to fd 2; the
+//       harness compares stdout only, so the marker appearing in the golden is
+//       the failure. This is what catches fd 1 and fd 2 being swapped — a bug no
+//       amount of checking `eprint`'s return value could see, since it has none.
+//
+//   P5  `rootExit` MUST ACTUALLY EXIT. A marker is printed immediately AFTER the
+//       call; reaching it means the exit fell through. The process must also end
+//       with status 0, which `tests/stress.zig` requires independently — so this
+//       one line checks both that the exit happens and that the code survives
+//       the low-8-bit mask.
+//
+// WHAT IS NOT COVERED, STATED PLAINLY: a NON-ZERO exit code. `rootExit(2)` is
+// what `rootPanic` uses, but observing it needs a parent to reap the child, and
+// the stress harness runs one process and requires status 0 from it. The mask
+// arithmetic is shared with the zero case and the Zig is a one-line
+// `exit_group`/`_exit` call, so the residual risk is a wrong syscall NUMBER —
+// which P5 would already catch, since a wrong number cannot exit 0 either.
+
+import { loadWord } from "../../../../runtime/gc"
+import {
+  rootBindMemory, rootInit, rootConfigure, rootStatOom,
+  rtSliceNew, rtSliceSet, rtStringFromBytes,
+  strPtr, strLen,
+} from "../../../../runtime/root"
+
+// 1 MiB of object heap and 16 KiB of index — far more than the handful of short
+// strings below need. Nothing collects the port's heap in this program, so every
+// allocation is permanent; `rootStatOom` is asserted zero on the last line so a
+// silent exhaustion cannot masquerade as a pass. Same sizing rationale as
+// ../../rootbit, one eighth the arena because there is no map churn here.
+const ARENA_WORDS = 131072
+const INDEX_WORDS = 2048
+const MARK_STACK = 4096
+const MIN_TRIGGER = 65536
+const GROWTH_PCT = 200
+
+// A port-heap `string` holding the same bytes as the native string `s`.
+// Identical to ../../rootbit's bridge and for the same reason: it goes through
+// three real entry points rather than a private constructor.
+function mine(s: string): int {
+  let n = len(s)
+  let h = rtSliceNew(n, n, 0)
+  let i = 0
+  while (i < n) {
+    rtSliceSet(h, i, int(s[i]))
+    i = i + 1
+  }
+  return rtStringFromBytes(h)
+}
+
+// The byte address of a port-heap string's payload (ABI.md §2: a `{ptr, len}`
+// header whose `ptr` addresses the object's own inline bytes).
+function bytesOf(s: int): int {
+  let p = loadWord(s + strPtr)
+  return p
+}
+
+function sizeOf(s: int): int {
+  let n = loadWord(s + strLen)
+  return n
+}
+
+// Drive every entry point of a write/exit provider, emitting a fixed transcript
+// on stdout.
+//
+// RETURNS NOTHING, because it does not return: `exitFn` is called last and ends
+// the process on success (P5). A result would be unreachable by construction, so
+// the arena-liveness witness is PRINTED here rather than handed back — see
+// `rooted` below.
+//
+// Every byte the port emits is BRACKETED by native `print` calls, so a write of
+// the wrong length shows up as displaced brackets rather than as text that still
+// happens to read plausibly.
+//
+// EVERY PARAMETER RETURNS `bool` AND EVERY RESULT IS DISCARDED, which needs
+// explaining because it looks like an oversight. The functions under test all
+// return void — that is their ABI (§12) and it does not change. But §5.3's
+// `func_type` grammar is `"(" [types] ")" "=>" result_type` with NO void form,
+// so a void-returning function CANNOT BE SPELLED AS A FUNCTION TYPE and cannot
+// be passed as a value at all. The drivers therefore wrap each one in a
+// three-line `: bool` shim and pass that. The shims are the only thing
+// duplicated between the two platforms; every assertion still lives here, which
+// is the property the split exists to preserve.
+//
+// (Worth a ticket in its own right: a first-class function value is useless for
+// the entire void-returning half of an API, and this is the second port to want
+// one. Not filed here — it is a language gap, not #1367's surface.)
+export function ioProps(writeAll: (int, int, int) => bool,
+                        printFn: (int) => bool, eprintFn: (int) => bool,
+                        panicWriteFn: (int, int) => bool,
+                        exitFn: (int) => bool) {
+  // Only raw, untraced addresses into these ever reach the port, so these
+  // bindings are the ONLY thing keeping the arena alive — AND A BINDING IS NOT
+  // ENOUGH, it must still be LIVE. Liveness is by LAST USE, not by scope: were
+  // `arena`'s last use the `ptrOf` below, the stack map would stop naming it and
+  // the first collection under `BIT_GC=stress` would sweep the port's entire
+  // heap out from under it. `rooted` at the bottom is what extends both slices
+  // across every safepoint in between; it is load-bearing, not a diagnostic,
+  // which is why the caller prints its result rather than discarding it.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+
+  rootBindMemory(int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!rootInit(MARK_STACK)) {
+    print("rootInit failed\n")
+    return
+  }
+  rootConfigure(true, false, MIN_TRIGGER, GROWTH_PCT, false)
+
+  // ---- P1: `print` puts EXACTLY these bytes on stdout ----------------------
+  //
+  // Emitted between two ordinary `print` calls, so the transcript pins the
+  // ORDER as well as the content: the port's writes and the native runtime's
+  // both go to fd 1 unbuffered, so a reordering would be visible. The marker
+  // deliberately contains no trailing newline of its own — the newline comes
+  // from the native `print` after it, which means a `rootPrint` that wrote one
+  // byte too many or too few shifts the rest of the line.
+  print("P1[")
+  printFn(mine("alpha"))
+  print("]\n")
+
+  // ---- P2: `eprint` goes to fd 2, NOT fd 1 ---------------------------------
+  //
+  // Checked by ABSENCE (see the header). If `rootEprint` wrote to stdout, this
+  // marker would land in the middle of the transcript and the golden would
+  // mismatch. The text is deliberately unmistakable so a failure diff reads as
+  // a diagnosis rather than a puzzle.
+  eprintFn(mine("P2-THIS-MUST-NOT-REACH-STDOUT"))
+
+  // ---- P3: the panic line's exact format -----------------------------------
+  //
+  // `panic: <msg>\n` — prefix, message, newline, in that order. Directed at fd 1
+  // rather than fd 2 purely so it lands in the compared stream; `rootPanic`
+  // fixes it to stderr. A dropped prefix, a missing newline, a truncated
+  // 6-or-8-byte prefix (it is packed into one word and its length is stated
+  // separately, so both are possible to get wrong independently) all show here.
+  print("P3[")
+  panicWriteFn(1, mine("boom"))
+  print("]\n")
+
+  // ---- P4: `writeAll`'s offset and length arithmetic -----------------------
+  //
+  // A three-byte window out of the MIDDLE of an eight-byte string: start at +2,
+  // run for 3, expect exactly "cde". Neither endpoint is at a boundary, so an
+  // off-by-one at either end changes the output rather than falling off a cliff,
+  // and reading from `addr + off` versus `addr` is distinguishable — which it
+  // would not be if the window started at 0.
+  print("P4[")
+  let s = mine("abcdefgh")
+  writeAll(1, bytesOf(s) + 2, 3)
+  print("]\n")
+
+  // A zero-length write must emit nothing rather than trapping or writing a
+  // stray byte; the loop's guard is `off < n`, which is only exercised as a
+  // FIRST-iteration test by this case.
+  print("P4z[")
+  writeAll(1, bytesOf(s), 0)
+  print("]\n")
+
+  // Extends `arena`/`indexArena` past every safepoint above (see their comment)
+  // and, by allocating from the port's heap AFTER all the writing, proves that
+  // heap is still intact rather than merely still addressable.
+  let stillWorks = sizeOf(mine("live")) == 4
+  let rooted = len(arena) == ARENA_WORDS && len(indexArena) == INDEX_WORDS && stillWorks
+
+  // `oom` is part of the verdict, not a side check: every property above assumes
+  // its allocations succeeded, and a silent exhaustion would make the strings
+  // empty rather than the writes wrong.
+  print("rootio rooted=${rooted} oom=${rootStatOom()}\n")
+
+  // ---- P5: `rootExit` actually exits, with status 0 -------------------------
+  //
+  // Nothing may follow but the failure marker. Reaching it means the exit fell
+  // through, and its presence in stdout fails the golden.
+  exitFn(0)
+  print("P5-EXIT-FELL-THROUGH\n")
+}

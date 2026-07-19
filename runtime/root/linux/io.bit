@@ -1,0 +1,251 @@
+// Linux write/exit provider for the Stage-2 port of runtime/root.zig (#1367):
+// SEAM 3's kernel-facing half — the bytes `panic`, `assert`, `print` and
+// `eprint` put on a file descriptor, and the exit that ends the process.
+//
+// See ../root.bit for why the port is split by directory rather than switching
+// on the OS inside one file. The split line #1366 sharpened is "does the kernel
+// see this byte": a `write` and an `exit_group` are definitionally kernel-facing
+// and cannot be core, while the shape of the panic line ("panic: " + msg + "\n")
+// is kernel-independent — and is therefore duplicated across the two providers
+// rather than shared, exactly as `mapPages`' error check is in runtime/alloc.
+// Three lines of formatting in two files beats a function-pointer indirection
+// through the core for something on the panic path.
+//
+// Raw syscalls (§11.8) rather than libc, for the reason the whole runtime uses
+// them: the ELF output is fully static with no libc to call into.
+//
+// EVERY NUMBER BELOW WAS READ OUT OF THE PINNED ZIG STDLIB
+// (std/os/linux/syscalls.zig), NOT from memory. A wrong number here is a silent
+// wrong-syscall, never a compile error.
+//
+// ---------------------------------------------------------------------------
+// WHY NOTHING HERE IS `@nosplit`, AND WHAT THAT COSTS
+// ---------------------------------------------------------------------------
+//
+// Every `@symbol` in ../root.bit is `@nosplit`. None here is, and that is not an
+// oversight: **`@nosplit` REJECTS `syscall`** (E0075, measured — `nosplit
+// function 'pw' calls 'syscall', which is not marked nosplit`), so a body that
+// traps into the kernel cannot carry the attribute at all. Every syscall-using
+// provider already in this tree is likewise a plain `export function`
+// (runtime/alloc/linux/pages.bit, runtime/park/linux/wait.bit,
+// runtime/sched/linux/poll.bit, runtime/rand/linux/entropy.bit,
+// runtime/thread/linux/spawn.bit), so this follows house precedent rather than
+// setting it.
+//
+// THE COST IS REAL AND BELONGS TO #1369: a freestanding archive member must be
+// `@nosplit` (§10.3, "freestanding code carries no GC stack maps"), so as long
+// as `syscall` is refused there, **the write path can never be a freestanding
+// member** and `libbitrt.a` cannot become fully Bit. This is the same SHAPE of
+// defect as `ptrOf`-in-`@nosplit` (#1421): §10.3.1 admits a form when it "lowers
+// to inline machine instructions rather than a call and so can neither allocate
+// nor reach a safepoint", and §11.8 states plainly that the backends emit the
+// kernel trap INLINE (`0F 05` / `svc #0`) rather than a relocated call — so
+// `syscall` satisfies §10.3.1's own stated criterion verbatim and is simply
+// absent from its allowlist. Recorded, not fixed here: a checker change in both
+// compilers landing as a side effect of a runtime port is precisely what breaks
+// the fixpoint gate.
+
+import { strPtr, strLen } from "../../root"
+import { loadWord } from "../../gc"
+
+// Syscall numbers are per-architecture and Bit has no arch-conditional
+// compilation, so the number is selected at run time (§11.8). `hostTarget()` is
+// 0 for x86_64-linux and 1 for aarch64-linux; this module is only ever built for
+// a Linux target, so the two cases are exhaustive. Same shape as
+// runtime/alloc/linux/pages.bit.
+function nr(x64: int, arm64: int): int {
+  if (hostTarget() == 0) {
+    return x64
+  }
+  return arm64
+}
+
+function nrWrite(): int { return nr(1, 64) }
+
+// exit_group(2), NOT exit(2) — and the difference is load-bearing rather than
+// stylistic. `exit` (60 / 93) terminates the CALLING THREAD only; `exit_group`
+// (231 / 94) terminates every thread in the process. The runtime is
+// multi-threaded by the time any of this can be reached (the scheduler has
+// started its workers), so `exit` would leave the remaining workers running and
+// the process alive after a panic. `root.zig`'s `rawExit` calls `exit_group` for
+// exactly this reason; both numbers are listed here so the near-miss is visible
+// at the point where picking the wrong one would be silent.
+function nrExitGroup(): int { return nr(231, 94) }
+
+// The two descriptors this module writes to. `print` goes to stdout so a
+// program's real output can be piped; everything diagnostic goes to stderr so it
+// does not mix in (root.zig's `bit_rt_eprint` doc comment).
+const stdoutFd: int = 1
+const stderrFd: int = 2
+
+// "panic: ", packed little-endian into one 8-byte word:
+//
+//     'p' 112 | 'a' 97 | 'n' 110 | 'i' 105 | 'c' 99 | ':' 58 | ' ' 32
+//
+// A Bit slice stores ONE 8-BYTE WORD PER ELEMENT, so `ptrOf([]int)` addresses
+// words and a `[]byte` would NOT give the kernel seven packed bytes — it would
+// give seven words. Packing the prefix into a single cell and writing its low
+// seven bytes is the same technique tests/stress/syscall uses for its own raw
+// `write`, and it is why the prefix is seven characters rather than eight: it
+// has to fit in one word.
+//
+// Computed, not hand-derived: 0x203a63696e6170.
+const panicPrefixWord: int = 9071397899755888
+const panicPrefixLen: int = 7
+
+// '\n', the byte a panic line ends with.
+const newlineWord: int = 10
+const newlineLen: int = 1
+
+// ---------------------------------------------------------------------------
+// The write path
+// ---------------------------------------------------------------------------
+
+// Write exactly `n` bytes from `addr` to `fd`, or give up. The Bit form of
+// `root.zig`'s `writeAllFd`.
+//
+// BEST-EFFORT BY CONTRACT, matching the Zig line for line: a short write is
+// retried from where it stopped, but an error gives up silently. There is
+// nowhere left to report a write failure to — this IS the reporting path — so
+// the Zig swallows it (`catch return`) and so does this.
+//
+// The Zig has two distinct give-up exits (`catch return` on error, and `if (n ==
+// 0) return` on a zero-byte write); a raw syscall returns a small NEGATIVE errno
+// where `writeFd` would have raised, so the single `wrote <= 0` test below is
+// exactly those two exits merged, not a weakened check.
+//
+// NOTE THERE IS NO EINTR RETRY, deliberately: `sched.writeFd` does not retry
+// either (it maps every non-SUCCESS errno to `error.WriteFailed`), and this port
+// is behavioural equivalence, not improvement.
+//
+// BOUNDED (Power of 10 rule 2): `off` starts at 0, strictly increases by at
+// least 1 per iteration (any `wrote <= 0` returns instead), and the loop exits
+// at `off >= n` — so it runs at most `n` times.
+//
+// The `bit_rt_port_root_io_` pin prefix marks a PORT-INTERNAL helper, as
+// distinct from the `bit_rt_root_` pins below, which are real ABI names waiting
+// on #1369's rename. This one is not an ABI symbol and never will be; it is
+// pinned because a sibling module (the stress program) calls it and `-O1`
+// splices bodies across the boundary. Same convention as
+// runtime/sched/linux/poll.bit's `bit_rt_port_sched_poll_*`.
+export @symbol("bit_rt_port_root_io_write_all")
+function rootWriteAll(fd: int, addr: int, n: int) {
+  let off = 0
+  while (off < n) {
+    let wrote = int(syscall(nrWrite(), i64(fd), i64(addr + off), i64(n - off)))
+    if (wrote <= 0) {
+      return
+    }
+    off = off + wrote
+  }
+}
+
+// Write `nbytes` low bytes of the packed constant `word` to `fd`.
+//
+// The buffer is READ BACK AFTER the write, and that is not decoration: liveness
+// is by LAST USE, not by scope. Were `buf`'s last use the `ptrOf` that binds its
+// address, the stack map would stop naming it there and a collection during
+// `rootWriteAll` could sweep the very buffer the kernel is being handed — the
+// exact bug that swept #1367's test arena. Returning a value derived from the
+// buffer extends its live range past the syscall by construction rather than by
+// a comment asking the reader to trust one, and the caller's use of the result
+// is what stops the read being dead code.
+//
+// Returns the byte actually resident at the buffer's base after the write.
+function writeConst(fd: int, word: int, nbytes: int): int {
+  let buf = []int(1)
+  buf[0] = word
+  rootWriteAll(fd, int(ptrOf(buf)), nbytes)
+  return buf[0] & 255
+}
+
+// The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
+// whose `ptr` addresses the object's own inline bytes).
+function strBytesOf(s: int): int {
+  let p = loadWord(s + strPtr)
+  return p
+}
+
+function strSizeOf(s: int): int {
+  let n = loadWord(s + strLen)
+  return n
+}
+
+// `panic: <msg>\n` on `fd`. `root.zig`'s `panicWrite`, three writes and all.
+//
+// Three syscalls rather than one assembled buffer, matching the Zig exactly:
+// assembling would mean allocating on the panic path, which is the one path that
+// must work when allocation is what failed.
+//
+// TAKES THE FD, where the Zig hardcodes stderr. That is the one deliberate
+// signature deviation in this file and it exists for testability: `rootPanic`
+// cannot be observed from a test because it exits the process, so the FORMAT and
+// the EXIT have to be separable to be checked at all. `root.zig` makes the same
+// concession — its own `panicWrite` test drives `writeAllFd(fds[1], ...)` down a
+// pipe rather than calling `panicWrite`. Exposing the fd is the smaller of the
+// two, since the one caller below still fixes it to stderr.
+export @symbol("bit_rt_port_root_io_panic_write")
+function panicWrite(fd: int, s: int) {
+  let a = writeConst(fd, panicPrefixWord, panicPrefixLen)
+  rootWriteAll(fd, strBytesOf(s), strSizeOf(s))
+  let b = writeConst(fd, newlineWord, newlineLen)
+  // Consumes both `writeConst` results so neither buffer read is dead — see
+  // `writeConst`'s own comment on why the read has to happen at all. The values
+  // are the constants' own low bytes ('p' and '\n'); nothing branches on them.
+  if (a == 0 && b == 0) {
+    return
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §12)
+// ---------------------------------------------------------------------------
+//
+// PINS CARRY THE `bit_rt_root_` PREFIX for the reason ../root.bit documents at
+// length: `runtime/root.zig` is still linked into every binary and already
+// defines `bit_rt_panic`, `bit_rt_print` and the rest, so claiming the real
+// names here fails every link with `DuplicateSymbol`. #1369 owns the rename —
+// each pin below drops its `_root` infix and nothing else changes.
+
+// Terminate the process immediately with `code`. `root.zig`'s `rawExit`.
+//
+// The code is masked to its low 8 bits, which is what `rawExit`'s
+// `@bitCast(@as(i8, @truncate(code)))` computes: a truncation to i8 keeps the
+// low byte and the bitcast to u8 reinterprets the same bits. Wait(2) only ever
+// reports 8 bits to the parent regardless, so this is the kernel's own rounding
+// made explicit rather than a choice.
+export @symbol("bit_rt_root_os_exit") function rootExit(code: int) {
+  syscall(nrExitGroup(), i64(code & 255))
+}
+
+// `bit_rt_panic` (ABI.md §12): prints `panic: <msg>` and exits 2 (SPEC §18.4).
+// Backs the `panic` builtin and every implicit panic source — index and slice
+// range, divide by zero, nil-channel misuse, a failed `assert`.
+//
+// No stack trace, matching the Zig: codegen makes no frame-pointer-chain
+// promise, and there is no debug-info format to symbolize one with yet.
+export @symbol("bit_rt_root_panic") function rootPanic(s: int) {
+  panicWrite(stderrFd, s)
+  rootExit(2)
+}
+
+// `bit_rt_assert` (ABI.md §12): backs `assert(cond)` / `assert(cond, msg)`.
+// Fixed 2-arg — lowering always supplies a message, since this symbol has one
+// frozen native signature whichever surface form the program used.
+export @symbol("bit_rt_root_assert") function rootAssert(cond: bool, s: int) {
+  if (cond) {
+    return
+  }
+  rootPanic(s)
+}
+
+// `bit_rt_print` (ABI.md §12): the `print` builtin — a string's bytes on
+// stdout, no trailing newline.
+export @symbol("bit_rt_root_print") function rootPrint(s: int) {
+  rootWriteAll(stdoutFd, strBytesOf(s), strSizeOf(s))
+}
+
+// `bit_rt_eprint` (ABI.md §12): `print`'s sibling on fd 2.
+export @symbol("bit_rt_root_eprint") function rootEprint(s: int) {
+  rootWriteAll(stderrFd, strBytesOf(s), strSizeOf(s))
+}

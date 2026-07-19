@@ -1,0 +1,230 @@
+// Darwin write/exit provider for the Stage-2 port of runtime/root.zig (#1367):
+// SEAM 3's kernel-facing half — the bytes `panic`, `assert`, `print` and
+// `eprint` put on a file descriptor, and the exit that ends the process.
+//
+// See ../root.bit for why the port is split by directory, and ../linux/io.bit
+// for the shared reasoning (why the panic line's shape is duplicated rather than
+// shared, why nothing here is `@nosplit`, and what that costs #1369). The one
+// difference is the mechanism: this side goes through libSystem (§11.7) rather
+// than raw traps, because Apple publishes no stable syscall numbers and reserves
+// the right to renumber them — the same reason `extern function` exists at all.
+//
+// ---------------------------------------------------------------------------
+// `write` AND `_exit` ARE REACHED DIRECTLY, AND THAT IS A MEASURED CLAIM
+// ---------------------------------------------------------------------------
+//
+// Both are POSIX CANCELLATION POINTS, so libSystem exports `_write$NOCANCEL`
+// alongside `_write` — the exact shape of the compiler bug #1436 records for
+// `close`, where the self-hosted compiler emits only the `$NOCANCEL` variant,
+// silently drops the plain import, and the call lands on an unbound stub that
+// SIGSEGVs at run time while building perfectly cleanly.
+//
+// This module was therefore checked against that bug rather than assumed clear:
+// tests/stress/rootiodarwin exercises every entry point here and is built and
+// run under BOTH compilers by `zig build test` (#1413/#1424), which is what
+// would catch a dropped import — the differential gates could not, since they
+// compare check and type dumps, not the linked image's import table.
+//
+// If a future selfhost regression does drop one of these, the documented
+// workaround is ../../sched/darwin/poll.bit's: route through a statically linked
+// `bit_rt_*` symbol from libbitrt, which does not go through Mach-O import
+// emission at all. That is a fallback, not the design — depending on `root.zig`
+// for the write path would defeat the point of porting it.
+
+import { strPtr, strLen } from "../../root"
+import { loadWord } from "../../gc"
+
+// write(2) and _exit(2) from libSystem. Only C-representable types cross the
+// boundary (§11.7), so the buffer travels as `*u8` and the count as `i64`.
+//
+// `_exit`, NOT `exit`: `exit(3)` runs atexit handlers and flushes stdio, which
+// on a panic path means running arbitrary registered code after the runtime has
+// already decided the process is unsound. `root.zig`'s `rawExit` calls
+// `std.c._exit` for exactly this reason. It is also the Darwin counterpart of
+// Linux's `exit_group` in the sense that matters here — it ends the whole
+// process, not just the calling thread.
+extern function write(fd: i32, buf: *u8, n: i64): i64
+extern function _exit(code: i32)
+
+// The two descriptors this module writes to. `print` goes to stdout so a
+// program's real output can be piped; everything diagnostic goes to stderr so it
+// does not mix in (root.zig's `bit_rt_eprint` doc comment).
+const stdoutFd: int = 1
+const stderrFd: int = 2
+
+// "panic: ", packed little-endian into one 8-byte word:
+//
+//     'p' 112 | 'a' 97 | 'n' 110 | 'i' 105 | 'c' 99 | ':' 58 | ' ' 32
+//
+// A Bit slice stores ONE 8-BYTE WORD PER ELEMENT, so `ptrOf([]int)` addresses
+// words and a `[]byte` would NOT give libSystem seven packed bytes — it would
+// give seven words. Packing the prefix into a single cell and writing its low
+// seven bytes is the same technique tests/stress/syscall uses for its own raw
+// `write`, and it is why the prefix is seven characters rather than eight: it
+// has to fit in one word.
+//
+// Computed, not hand-derived: 0x203a63696e6170.
+const panicPrefixWord: int = 9071397899755888
+const panicPrefixLen: int = 7
+
+// '\n', the byte a panic line ends with.
+const newlineWord: int = 10
+const newlineLen: int = 1
+
+// ---------------------------------------------------------------------------
+// The write path
+// ---------------------------------------------------------------------------
+
+// Write exactly `n` bytes from `addr` to `fd`, or give up. The Bit form of
+// `root.zig`'s `writeAllFd`.
+//
+// BEST-EFFORT BY CONTRACT, matching the Zig line for line: a short write is
+// retried from where it stopped, but an error gives up silently. There is
+// nowhere left to report a write failure to — this IS the reporting path — so
+// the Zig swallows it (`catch return`) and so does this.
+//
+// The Zig has two distinct give-up exits (`catch return` on error, and `if (n ==
+// 0) return` on a zero-byte write). libSystem's `write` reports failure as -1
+// with the detail in `errno` — unlike the Linux raw syscall, which returns the
+// negative errno itself — but since neither exit inspects the reason, the single
+// `wrote <= 0` test below is exactly those two exits merged on both platforms.
+// That the two error conventions differ and the check still coincides is worth
+// stating: it is why these two files can look alike here and must not in
+// `mapPages`, where the answer is an address rather than a count.
+//
+// NOTE THERE IS NO EINTR RETRY, deliberately: `sched.writeFd` does not retry
+// either (it treats any negative return as `error.WriteFailed`), and this port
+// is behavioural equivalence, not improvement.
+//
+// BOUNDED (Power of 10 rule 2): `off` starts at 0, strictly increases by at
+// least 1 per iteration (any `wrote <= 0` returns instead), and the loop exits
+// at `off >= n` — so it runs at most `n` times.
+//
+// The `bit_rt_port_root_io_` pin prefix marks a PORT-INTERNAL helper, as
+// distinct from the `bit_rt_root_` pins below, which are real ABI names waiting
+// on #1369's rename. This one is not an ABI symbol and never will be; it is
+// pinned because a sibling module (the stress program) calls it and `-O1`
+// splices bodies across the boundary. Same convention as
+// runtime/sched/linux/poll.bit's `bit_rt_port_sched_poll_*`.
+export @symbol("bit_rt_port_root_io_write_all")
+function rootWriteAll(fd: int, addr: int, n: int) {
+  let off = 0
+  while (off < n) {
+    let base: *u8 = nil
+    let wrote = int(write(i32(fd), base + addr + off, i64(n - off)))
+    if (wrote <= 0) {
+      return
+    }
+    off = off + wrote
+  }
+}
+
+// Write `nbytes` low bytes of the packed constant `word` to `fd`.
+//
+// The buffer is READ BACK AFTER the write, and that is not decoration: liveness
+// is by LAST USE, not by scope. Were `buf`'s last use the `ptrOf` that binds its
+// address, the stack map would stop naming it there and a collection during
+// `rootWriteAll` could sweep the very buffer libSystem is being handed — the
+// exact bug that swept #1367's test arena. Returning a value derived from the
+// buffer extends its live range past the call by construction rather than by a
+// comment asking the reader to trust one, and the caller's use of the result is
+// what stops the read being dead code.
+//
+// Returns the byte actually resident at the buffer's base after the write.
+function writeConst(fd: int, word: int, nbytes: int): int {
+  let buf = []int(1)
+  buf[0] = word
+  rootWriteAll(fd, int(ptrOf(buf)), nbytes)
+  return buf[0] & 255
+}
+
+// The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
+// whose `ptr` addresses the object's own inline bytes).
+function strBytesOf(s: int): int {
+  let p = loadWord(s + strPtr)
+  return p
+}
+
+function strSizeOf(s: int): int {
+  let n = loadWord(s + strLen)
+  return n
+}
+
+// `panic: <msg>\n` on `fd`. `root.zig`'s `panicWrite`, three writes and all.
+//
+// Three calls rather than one assembled buffer, matching the Zig exactly:
+// assembling would mean allocating on the panic path, which is the one path that
+// must work when allocation is what failed.
+//
+// TAKES THE FD, where the Zig hardcodes stderr. That is the one deliberate
+// signature deviation in this file and it exists for testability: `rootPanic`
+// cannot be observed from a test because it exits the process, so the FORMAT and
+// the EXIT have to be separable to be checked at all. `root.zig` makes the same
+// concession — its own `panicWrite` test drives `writeAllFd(fds[1], ...)` down a
+// pipe rather than calling `panicWrite`. Exposing the fd is the smaller of the
+// two, since the one caller below still fixes it to stderr.
+export @symbol("bit_rt_port_root_io_panic_write")
+function panicWrite(fd: int, s: int) {
+  let a = writeConst(fd, panicPrefixWord, panicPrefixLen)
+  rootWriteAll(fd, strBytesOf(s), strSizeOf(s))
+  let b = writeConst(fd, newlineWord, newlineLen)
+  // Consumes both `writeConst` results so neither buffer read is dead — see
+  // `writeConst`'s own comment on why the read has to happen at all. The values
+  // are the constants' own low bytes ('p' and '\n'); nothing branches on them.
+  if (a == 0 && b == 0) {
+    return
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §12)
+// ---------------------------------------------------------------------------
+//
+// PINS CARRY THE `bit_rt_root_` PREFIX for the reason ../root.bit documents at
+// length: `runtime/root.zig` is still linked into every binary and already
+// defines `bit_rt_panic`, `bit_rt_print` and the rest, so claiming the real
+// names here fails every link with `DuplicateSymbol`. #1369 owns the rename —
+// each pin below drops its `_root` infix and nothing else changes.
+
+// Terminate the process immediately with `code`. `root.zig`'s `rawExit`.
+//
+// The code is masked to its low 8 bits, which is what `rawExit`'s
+// `@bitCast(@as(i8, @truncate(code)))` computes: a truncation to i8 keeps the
+// low byte and the bitcast to u8 reinterprets the same bits. Wait(2) only ever
+// reports 8 bits to the parent regardless, so this is the kernel's own rounding
+// made explicit rather than a choice.
+export @symbol("bit_rt_root_os_exit") function rootExit(code: int) {
+  _exit(i32(code & 255))
+}
+
+// `bit_rt_panic` (ABI.md §12): prints `panic: <msg>` and exits 2 (SPEC §18.4).
+// Backs the `panic` builtin and every implicit panic source — index and slice
+// range, divide by zero, nil-channel misuse, a failed `assert`.
+//
+// No stack trace, matching the Zig: codegen makes no frame-pointer-chain
+// promise, and there is no debug-info format to symbolize one with yet.
+export @symbol("bit_rt_root_panic") function rootPanic(s: int) {
+  panicWrite(stderrFd, s)
+  rootExit(2)
+}
+
+// `bit_rt_assert` (ABI.md §12): backs `assert(cond)` / `assert(cond, msg)`.
+// Fixed 2-arg — lowering always supplies a message, since this symbol has one
+// frozen native signature whichever surface form the program used.
+export @symbol("bit_rt_root_assert") function rootAssert(cond: bool, s: int) {
+  if (cond) {
+    return
+  }
+  rootPanic(s)
+}
+
+// `bit_rt_print` (ABI.md §12): the `print` builtin — a string's bytes on
+// stdout, no trailing newline.
+export @symbol("bit_rt_root_print") function rootPrint(s: int) {
+  rootWriteAll(stdoutFd, strBytesOf(s), strSizeOf(s))
+}
+
+// `bit_rt_eprint` (ABI.md §12): `print`'s sibling on fd 2.
+export @symbol("bit_rt_root_eprint") function rootEprint(s: int) {
+  rootWriteAll(stderrFd, strBytesOf(s), strSizeOf(s))
+}
