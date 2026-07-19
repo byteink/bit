@@ -881,6 +881,15 @@ Open a new client-initiated bidirectional stream (RFC 9000 §2.1).
 
 Accept the next peer-initiated bidirectional stream, blocking until one opens.
 
+### `Conn.setIdleTimeout(ns: int)`
+
+Set how long this connection tolerates hearing nothing from its peer before it
+gives up (RFC 9000 §10.1), in nanoseconds. The default is 30s. Lower it when the
+application wants a vanished peer detected sooner than a PTO series would ever
+reveal it — without an idle timeout a thread parked in `read`, `finish`, or
+`acceptStream` waits forever. Values at or below zero are ignored. Takes effect
+on the next tick and applies to a connection from either side.
+
 ### `Conn.close()`
 
 Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
