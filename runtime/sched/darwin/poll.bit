@@ -1,0 +1,262 @@
+// Darwin netpoller provider for the Stage-2 port of runtime/sched.zig (#1364):
+// `NetPoller` on kqueue. See ../sched.bit's netpoller section for what stays in
+// core (the descriptor slot and the try-lock) and why the poller itself cannot.
+//
+// Everything here goes through libSystem (§11.7) rather than raw traps: Apple
+// publishes no stable syscall numbers and reserves the right to renumber them,
+// so a C call is the supported path — the same choice runtime/alloc/darwin,
+// runtime/rand/darwin and runtime/park/darwin all make.
+//
+// EVERY STRUCT OFFSET BELOW WAS READ OUT OF THE PINNED ZIG STDLIB, NOT FROM
+// MEMORY. `struct kevent` is `#pragma pack(4)` on macOS, so its fields do NOT
+// sit where natural alignment would put them; std/c.zig pins each one with a
+// `comptime assert(@offsetOf(...))` and those are the numbers used here.
+
+import { taskAt, schedUnpark, scPollFd, pollRead } from "../../sched"
+import { schedPollTryEnter, schedPollLeave } from "../../sched"
+
+// int kqueue(void);
+// int kevent(int kq, const struct kevent *changelist, int nchanges,
+//            struct kevent *eventlist, int nevents,
+//            const struct timespec *timeout);
+// int close(int fd);
+//
+// Only C-representable types cross the boundary (§11.7), so every struct
+// travels as a `*u8` over a region this module lays out by hand.
+extern function kqueue(): i32
+extern function kevent(kq: i32, changelist: *u8, nchanges: i32,
+                       eventlist: *u8, nevents: i32, timeout: *u8): i32
+
+// THE DESCRIPTOR IS CLOSED THROUGH THE RUNTIME, NOT THROUGH libSystem, AND THAT
+// IS A WORKAROUND FOR A COMPILER BUG — not a design preference.
+//
+// `extern function close(fd: i32): i32` builds cleanly and then SIGSEGVs when
+// called, under the SELF-HOSTED compiler only. The seed emits both `_close` and
+// libSystem's `_close$NOCANCEL` into the import table; the self-hosted compiler
+// emits only `_close$NOCANCEL` and silently drops the `_close` import, so the
+// call lands on an unbound stub. Reduced to six lines with no scheduler
+// involved, and it is NOT a general `$`-variant collision: `realpath` has the
+// same shape (`_realpath$DARWIN_EXTSN` is also imported) and works, with both
+// symbols present. `dup` works too, so it is not the signature.
+//
+// `bit_rt_fs_close` is a STATICALLY LINKED symbol from libbitrt rather than a
+// dylib import, so it does not go through the code path that is broken. Its
+// behaviour is identical — `root.zig`'s `bit_rt_fs_close` is a thin wrapper
+// over the same `close(2)`.
+//
+// Filed rather than fixed here: the defect is in Mach-O import emission, not in
+// the scheduler, and a linker change landing as a side effect of a runtime port
+// is how two agents produce a hole that exists only in the combination of their
+// work. Worth noting for whoever takes it that the existing differential gates
+// CANNOT see this class of bug — they compare check and type dumps, not the
+// linked image's import table.
+extern function bit_rt_fs_close(fd: i64): i64
+
+// EVFILT_READ / EVFILT_WRITE, from std/c.zig's macOS `EVFILT`. NEGATIVE, and
+// they are stored into an i16 field, so they are written as two's-complement
+// 16-bit patterns by `writeI16` below rather than as bare integers.
+function evfiltRead(): int { return 0 - 1 }
+function evfiltWrite(): int { return 0 - 2 }
+
+// EV_ADD (0x0001) | EV_ONESHOT (0x0010), from std/c.zig's macOS `EV`.
+//
+// Unlike epoll there is no ADD/MOD split: kqueue's EV_ADD re-arms an existing
+// registration in place, so re-registering the same fd is the same call. The
+// Linux twin's EEXIST path has no counterpart here, and that asymmetry is real
+// rather than an oversight in one of the two.
+function evAddOneshot(): int { return 17 }
+
+// `struct kevent` on macOS, from std/c.zig — which pins every one of these with
+// a comptime `@offsetOf` assertion because `sys/types.h` applies `#pragma
+// pack(4)` and the layout is therefore NOT what natural alignment would give:
+//
+//     ident:  0   (usize, 8)
+//     filter: 8   (i16)
+//     flags:  10  (u16)
+//     fflags: 12  (u32)
+//     data:   16  (isize, 8)
+//     udata:  24  (usize, 8)
+//
+// Total 32 bytes. Note `filter` and `flags` are packed into the 8..12 window —
+// a natural-alignment guess would put `flags` at 12 and the whole struct at 40,
+// which would misparse every event the kernel returned.
+const keventSize: int = 32
+const kqIdentOff: int = 0
+const kqFilterOff: int = 8
+const kqFlagsOff: int = 10
+const kqFflagsOff: int = 12
+const kqDataOff: int = 16
+const kqUdataOff: int = 24
+
+// Ready events drained per call. `sched.zig`'s `max_batch`; more ready events
+// wait for the next poll, which bounds the work one idle pass can do.
+const maxBatch: int = 64
+
+// The drain buffer, 64 * 32 = 2048 bytes = 256 words.
+//
+// MODULE-LEVEL, AND THAT IS SAFE ONLY BECAUSE OF THE TRY-LOCK — see the Linux
+// twin for the full argument. `pollDrain` runs on every idle pass of every
+// worker, so a per-call allocation would put the GC on the scheduler's idle
+// path; `schedPollTryEnter` admits exactly one worker at a time, which is what
+// makes one shared buffer sound.
+let evBuf: [256]i64
+
+// The timespec `kevent` takes for its timeout: two 64-bit words {sec, nsec}.
+// Separate from `evBuf` because both are live across the same call.
+let tsBuf: [2]i64
+
+function bufBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(evBuf))
+}
+
+function tsBytes(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(tsBuf))
+}
+
+// A Bit array stores one 8-BYTE WORD per element (§11.8), so the kernel's
+// packed structs are laid out through a `*u8` cursor over a region that really
+// is contiguous bytes. Reading `udata` at offset 24 happens to be 8-aligned,
+// but `filter` at 8 and `flags` at 10 are not, so the whole struct is handled
+// byte-wise for one consistent rule rather than a per-field special case.
+function readU64(base: *u8, off: int): int {
+  let v = 0
+  let k = 7
+  while (k >= 0) {
+    let p = base + off + k
+    v = v * 256 + int(*p)
+    k = k - 1
+  }
+  return v
+}
+
+function writeU64(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 8) {
+    let p = base + off + k
+    *p = u8(v / (1 << (8 * k)) % 256)
+    k = k + 1
+  }
+}
+
+function writeU32(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 4) {
+    let p = base + off + k
+    *p = u8(v / (1 << (8 * k)) % 256)
+    k = k + 1
+  }
+}
+
+// Store a 16-bit field. `filter` is negative (EVFILT_READ is -1), so the value
+// is reduced mod 2^16 first — writing a negative number's low bytes directly
+// would depend on how the division below rounds, which is exactly the kind of
+// detail that silently registers the wrong filter.
+function writeI16(base: *u8, off: int, v: int) {
+  let u = v % 65536
+  if (u < 0) {
+    u = u + 65536
+  }
+  let p0 = base + off
+  *p0 = u8(u % 256)
+  let p1 = base + off + 1
+  *p1 = u8(u / 256 % 256)
+}
+
+// Create the poll descriptor. `sched.zig`'s `createPollFd`. Returns a negative
+// value on failure, which the caller must check.
+export function pollCreate(): int {
+  return int(kqueue())
+}
+
+export function pollClose(pollFd: int) {
+  let rc = int(bit_rt_fs_close(i64(pollFd)))
+}
+
+// Register `task` to be woken when `fd` is ready for `interest`.
+//
+// ONESHOT, matching the Zig and the Linux twin: the registration fires once and
+// disarms, so a woken task must re-register before parking on the same fd
+// again. That is what makes the wake edge unambiguous.
+export function pollRegister(pollFd: int, fd: int, interest: int, task: int): bool {
+  let ev = []i64(4)
+  ev[0] = 0
+  ev[1] = 0
+  ev[2] = 0
+  ev[3] = 0
+  let z: *u8 = nil
+  let base = z + int(ptrOf(ev))
+
+  let filter = evfiltWrite()
+  if (interest == pollRead) {
+    filter = evfiltRead()
+  }
+  writeU64(base, kqIdentOff, fd)
+  writeI16(base, kqFilterOff, filter)
+  writeI16(base, kqFlagsOff, evAddOneshot())
+  writeU32(base, kqFflagsOff, 0)
+  writeU64(base, kqDataOff, 0)
+  writeU64(base, kqUdataOff, task)
+
+  // Submit one change, collect no events: `nevents` 0 with a null eventlist is
+  // kqueue's registration-only form.
+  let none: *u8 = nil
+  let rc = int(kevent(i32(pollFd), base, i32(1), none, i32(0), none))
+  return rc >= 0
+}
+
+// Drain ready events and unpark the waiting task for each. Returns how many
+// were woken. `sched.zig`'s `pollReady`.
+//
+// THE RUN LOOP CALLS THIS WITH `timeoutMs` 0 — a non-blocking drain, which is
+// what `sched.zig` passes too. That is what keeps the poller compatible with
+// stop-the-world: a worker never blocks inside `kevent`, so it is never sitting
+// in a syscall where it is neither `running` nor `parked` and cannot answer the
+// collector's rendezvous.
+export function pollDrain(schedAddr: int, timeoutMs: int): int {
+  let s = taskAt(schedAddr)
+  let pollFd = *(s + scPollFd)
+  if (pollFd == 0) {
+    return 0
+  }
+  if (!schedPollTryEnter(s)) {
+    return 0
+  }
+
+  let ts = tsBytes()
+  let secs = timeoutMs / 1000
+  if (secs < 0) {
+    secs = 0
+  }
+  let nsecs = timeoutMs % 1000 * 1000000
+  if (nsecs < 0) {
+    nsecs = 0
+  }
+  writeU64(ts, 0, secs)
+  writeU64(ts, 8, nsecs)
+
+  let base = bufBytes()
+  let none: *u8 = nil
+  let rc = int(kevent(i32(pollFd), none, i32(0), base, i32(maxBatch), ts))
+  let woken = 0
+  if (rc > 0) {
+    // Bounded by the batch, not by the kernel's answer (Power of 10).
+    let n = rc
+    if (n > maxBatch) {
+      n = maxBatch
+    }
+    let i = 0
+    while (i < n) {
+      let task = readU64(base, i * keventSize + kqUdataOff)
+      if (task != 0) {
+        if (schedUnpark(s, task)) {
+          woken = woken + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  schedPollLeave(s)
+  return woken
+}

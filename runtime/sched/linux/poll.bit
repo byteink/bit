@@ -1,0 +1,247 @@
+// Linux netpoller provider for the Stage-2 port of runtime/sched.zig (#1364):
+// `NetPoller` on epoll. See ../sched.bit's netpoller section for what stays in
+// core (the descriptor slot and the try-lock) and why the poller itself cannot.
+//
+// Raw syscalls (§11.8) rather than libc, for the reason the whole runtime uses
+// them: the ELF output is fully static with no libc to call into.
+//
+// EVERY CONSTANT AND EVERY STRUCT OFFSET BELOW WAS READ OUT OF THE PINNED ZIG
+// STDLIB, NOT FROM MEMORY. A wrong number here is a silent wrong-syscall or a
+// silently misparsed event, never a compile error. Two of them would have been
+// wrong from memory, and both are recorded at their definitions below:
+// `epoll_wait` DOES NOT EXIST on aarch64, and `struct epoll_event` is a
+// DIFFERENT SIZE on the two architectures.
+
+import { taskAt, schedUnpark, scPollFd, pollRead } from "../../sched"
+import { schedPollTryEnter, schedPollLeave } from "../../sched"
+
+// Syscall numbers are per-architecture and Bit has no arch-conditional
+// compilation, so the number is selected at run time (§11.8). `hostTarget()` is
+// 0 for x86_64-linux and 1 for aarch64-linux; this module is only ever built
+// for a Linux target, so the two cases are exhaustive. Same shape as
+// runtime/park/linux/wait.bit.
+function nr(x64: int, arm64: int): int {
+  if (hostTarget() == 0) {
+    return x64
+  }
+  return arm64
+}
+
+function nrEpollCreate1(): int { return nr(291, 20) }
+function nrEpollCtl(): int { return nr(233, 21) }
+function nrClose(): int { return nr(3, 57) }
+
+// EPOLL_PWAIT, NOT EPOLL_WAIT — and this is the trap this module exists to
+// avoid. `epoll_wait` has NO aarch64 syscall number at all: the arm64 table in
+// std/os/linux/syscalls.zig has `epoll_pwait = 22` and no `epoll_wait` entry,
+// because arm64 is a "new" architecture that only ever got the pwait form.
+// Number 22 on arm64 is a completely different call, so the obvious spelling
+// would not fail to build — it would trap into the wrong syscall at run time.
+// One form is used on both arches with a null signal mask, which is exactly
+// what glibc's `epoll_wait` is a wrapper for.
+function nrEpollPwait(): int { return nr(281, 22) }
+
+// EPOLL_CTL_ADD / EPOLL_CTL_MOD, from std/os/linux.zig's `EPOLL`.
+function ctlAdd(): int { return 1 }
+function ctlMod(): int { return 3 }
+
+// EPOLLIN / EPOLLOUT / EPOLLONESHOT (1 << 30). Same source.
+function epollIn(): int { return 1 }
+function epollOut(): int { return 4 }
+function epollOneshot(): int { return 1073741824 }
+
+// -EEXIST, the one errno with contract meaning here (see `pollRegister`).
+function eExist(): int { return 17 }
+
+// `struct epoll_event` IS NOT THE SAME SIZE ON THE TWO ARCHITECTURES, and
+// nothing about the source spelling reveals that. std/os/linux.zig declares it
+//
+//     pub const epoll_event = extern struct {
+//         events: u32,
+//         data: epoll_data align(switch (native_arch) { .x86_64 => 4, else => 8 }),
+//     };
+//
+// so x86-64 packs it to 12 bytes with `data` at offset 4 (the kernel's
+// `EPOLL_PACKED`, which exists so 32-bit and 64-bit x86 agree), while every
+// other architecture gets natural alignment: 16 bytes with `data` at offset 8.
+//
+// Getting this wrong is invisible in a single-architecture test — the stride is
+// only used to walk the kernel's answer, so a wrong one silently reads garbage
+// as task pointers and unparks whatever it finds. Both values are asserted
+// against the running kernel by tests/stress/schedpolllinux.
+function eventStride(): int {
+  if (hostTarget() == 0) {
+    return 12
+  }
+  return 16
+}
+
+function eventDataOff(): int {
+  if (hostTarget() == 0) {
+    return 4
+  }
+  return 8
+}
+
+// Ready events drained per call. `sched.zig`'s `max_batch`; more ready events
+// simply wait for the next poll, which bounds the work one idle pass can do
+// (Power of 10).
+const maxBatch: int = 64
+
+// The drain buffer, sized for the larger of the two strides (64 * 16 = 1024
+// bytes = 128 words).
+//
+// MODULE-LEVEL, AND THAT IS SAFE ONLY BECAUSE OF THE TRY-LOCK. `pollDrain` runs
+// on every idle pass of every worker, so allocating a fresh buffer per call
+// would put a GC allocation on the scheduler's idle path. A shared static
+// buffer is sound here precisely because `schedPollTryEnter` admits exactly one
+// worker at a time — the same exclusion that stops two workers double-waking a
+// task. If that try-lock is ever removed, this buffer must become per-worker in
+// the same change.
+let evBuf: [128]i64
+
+// A byte cursor over a word-aligned region. A Bit slice or array stores one
+// 8-BYTE WORD per element (§11.8), so an `[]u8` would be strided, not packed —
+// the kernel's structs must be read and written through a `*u8` walking a
+// region that really is contiguous bytes, which an `[N]i64` is.
+function bytesOf(): *u8 {
+  let z: *u8 = nil
+  return z + int(ptrOf(evBuf))
+}
+
+// Read a little-endian u64 at `off`. Done byte-wise rather than through an
+// `*i64` because `data` sits at offset 4 on x86-64 — a 4-byte-aligned address
+// that pointer arithmetic on a `*i64` (which scales by 8) cannot even name.
+//
+// The top byte is included for completeness; a user-space task address never
+// sets bit 63 on either target, so the reassembly cannot overflow `int`.
+function readU64(base: *u8, off: int): int {
+  let v = 0
+  let k = 7
+  while (k >= 0) {
+    let p = base + off + k
+    v = v * 256 + int(*p)
+    k = k - 1
+  }
+  return v
+}
+
+function writeU32(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 4) {
+    let p = base + off + k
+    *p = u8(v / (1 << (8 * k)) % 256)
+    k = k + 1
+  }
+}
+
+function writeU64(base: *u8, off: int, v: int) {
+  let k = 0
+  while (k < 8) {
+    let p = base + off + k
+    *p = u8(v / (1 << (8 * k)) % 256)
+    k = k + 1
+  }
+}
+
+// Create the poll descriptor. `sched.zig`'s `createPollFd`. Returns a negative
+// value on failure, which the caller must check — there is no errno to consult.
+export function pollCreate(): int {
+  return int(syscall(nrEpollCreate1(), 0))
+}
+
+export function pollClose(pollFd: int) {
+  let rc = int(syscall(nrClose(), i64(pollFd)))
+}
+
+// Register `task` to be woken when `fd` is ready for `interest`.
+//
+// ONESHOT, matching the Zig: the fd is disarmed on the first event, so a woken
+// task must re-register before parking on it again. That is what makes the
+// wake edge unambiguous — without it a level-triggered fd would re-report
+// readiness on every poll until the task got round to draining it, and every
+// one of those reports would try to unpark an already-running task.
+//
+// THE ADD/MOD SPLIT IS NOT AN OPTIMISATION. ONESHOT disarms the fd but leaves
+// it in the epoll set, so the NEXT registration of the same open fd must re-arm
+// with CTL_MOD — CTL_ADD returns EEXIST. kqueue's EV_ADD re-arms in place, so
+// this split is Linux-only and has no Darwin twin. It is also the common path,
+// not an edge case: a socket typically waits for `write` on connect and then
+// `read` on first use, which re-registers within one fd's lifetime. `sched.zig`
+// records this as a regression fix for a real epoll hang.
+export function pollRegister(pollFd: int, fd: int, interest: int, task: int): bool {
+  let ev = []i64(2)
+  ev[0] = 0
+  ev[1] = 0
+  let z: *u8 = nil
+  let base = z + int(ptrOf(ev))
+
+  let io = epollOut()
+  if (interest == pollRead) {
+    io = epollIn()
+  }
+  writeU32(base, 0, io + epollOneshot())
+  writeU64(base, eventDataOff(), task)
+
+  let evAddr = i64(int(ptrOf(ev)))
+  let add = int(syscall(nrEpollCtl(), i64(pollFd), i64(ctlAdd()), i64(fd), evAddr))
+  if (add == 0) {
+    return true
+  }
+  if (add != 0 - eExist()) {
+    return false
+  }
+  let mod = int(syscall(nrEpollCtl(), i64(pollFd), i64(ctlMod()), i64(fd), evAddr))
+  return mod == 0
+}
+
+// Drain ready events and unpark the waiting task for each. Returns how many
+// were woken. `sched.zig`'s `pollReady`.
+//
+// THE RUN LOOP CALLS THIS WITH `timeoutMs` 0 — a non-blocking drain, which is
+// what `sched.zig` passes too. That is what keeps the poller compatible with
+// stop-the-world: a worker never blocks in `epoll_pwait`, so it is never sitting
+// in a syscall where it is neither `running` nor `parked` and cannot answer the
+// collector's rendezvous. A blocking poll here would reintroduce exactly the
+// problem #1433 describes for `threadJoin`'s sleep. The parameter is kept
+// because the Zig has it and a non-worker caller may legitimately want to wait.
+export function pollDrain(schedAddr: int, timeoutMs: int): int {
+  let s = taskAt(schedAddr)
+  let pollFd = *(s + scPollFd)
+  if (pollFd == 0) {
+    return 0
+  }
+  // Losing this race is free — the loser looks for work elsewhere this pass and
+  // polls on the next one. See ../sched.bit for why it must not block.
+  if (!schedPollTryEnter(s)) {
+    return 0
+  }
+
+  // epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize). The
+  // null sigmask makes this exactly `epoll_wait`; `sigsetsize` is unread by the
+  // kernel when the mask is null, and 8 is the value a real sigset_t would have.
+  let rc = int(syscall(nrEpollPwait(), i64(pollFd), i64(int(ptrOf(evBuf))),
+                       i64(maxBatch), i64(timeoutMs), 0, 8))
+  let woken = 0
+  if (rc > 0) {
+    // Bounded by the batch, not by the kernel's answer, so a bogus oversized
+    // `rc` cannot walk off the buffer (Power of 10).
+    let n = rc
+    if (n > maxBatch) {
+      n = maxBatch
+    }
+    let base = bytesOf()
+    let i = 0
+    while (i < n) {
+      let task = readU64(base, i * eventStride() + eventDataOff())
+      if (task != 0) {
+        if (schedUnpark(s, task)) {
+          woken = woken + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  schedPollLeave(s)
+  return woken
+}

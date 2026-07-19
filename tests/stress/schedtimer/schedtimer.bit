@@ -1,0 +1,223 @@
+// The scheduler's timer queue (#1364): `sched.zig`'s `TimerQueue` in Bit.
+//
+// THE CLOCK IS FAKE ON PURPOSE, and that is the point of this program rather
+// than a shortcut. `schedTimerExpire` takes `now` as a parameter — the core
+// module holds no clock at all, because `clock_gettime` is a `syscall` on Linux
+// and an `extern` call on Darwin and a core module may contain neither. That
+// seam is what lets the wake ORDER be asserted exactly instead of sampled: a
+// test driven by the real monotonic clock could only check that a sleeper woke
+// "eventually", which is the kind of guard that passes whether or not the
+// partition works. Here the deadlines and the current time are both chosen, so
+// "the 100ns sleeper woke and the 200ns sleeper did not" is a hard assertion.
+//
+// It is also why this program is platform-neutral and has no `linux-only` /
+// `darwin-only` sibling: nothing here touches the kernel.
+
+import { schedInit, schedWorkerAt, schedWorkerRun } from "../../../runtime/sched"
+import { schedTimerPush, schedTimerExpire, schedTimerCount, schedSleepUntil } from "../../../runtime/sched"
+import { schedTaskInit, schedRegister, schedSpawn, schedShutdown, schedTaskExit } from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt, gqPop } from "../../../runtime/sched"
+import { taskState, taskDeadline, taskParked, taskRunning, scGlobal, workerWords } from "../../../runtime/sched"
+
+// One worker: the timer queue is scheduler-wide, not per-worker, so a second
+// worker would add an OS thread without adding a property.
+const timerWorkers: int = 1
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+
+// Three bare task blocks for the queue properties below. They are never
+// switched to, so they need no stacks — `schedTimerPush`/`schedTimerExpire`
+// touch only `taskDeadline`, `taskTimerNext` and `taskState`.
+let tA: [32]i64
+let tB: [32]i64
+let tC: [32]i64
+
+// A fourth for the not-yet-parked retention property, which needs a task that
+// is on the timer list while still `taskRunning`.
+let tD: [32]i64
+
+// The end-to-end task: this one really runs, so it really needs a stack.
+// 64KiB usable inside a 128KiB region, so a 64KiB-aligned base exists whatever
+// address the linker picks (module arrays are only 8-byte aligned, #1421).
+let stackArea: [16384]i64
+let liveTask: [32]i64
+
+// Written by the sleeping task, read by the driver. Untraced module state
+// (§11.11) because the collector must never walk it.
+let obsWoke: i64 = 0
+let addrWoke: i64 = 0
+let addrSched: i64 = 0
+
+// The deadline the live task sleeps until, on the fake clock below.
+const liveDeadline: int = 50
+
+// The fake monotonic clock: one tick per call. `schedWorkerRun` calls it once
+// per idle pass, so the live task's 50-tick deadline is reached after 50 idle
+// passes — bounded, and reached by the loop's own progress rather than by wall
+// time, so the program cannot be flaky on a loaded machine.
+let clockNow: i64 = 0
+
+function fakeClock(): int {
+  clockNow = clockNow + 1
+  return int(clockNow)
+}
+
+// A wake that never happens must FAIL, not hang. `schedWorkerRun`'s own trip
+// bound is a billion steps with a backoff that grows to 1ms, so a lost wakeup
+// would wedge the suite for hours and read as a timeout rather than as a
+// verdict — and a timeout is not a diagnosis. This gives up instead: past the
+// bound it shuts the scheduler down, the program prints `live ... false ...`,
+// and the golden diff fails with the reason visible.
+//
+// IT RIDES THE POLLER HOOK, NOT THE CLOCK, AND THAT IS THE WHOLE POINT.
+// The first version of this backstop lived in `fakeClock` — which is only ever
+// called from the timer probe it was meant to bound. Mutation-testing exposed
+// that directly: deleting the timer probe from the idle path also deleted the
+// give-up, and the program hung for the full 40s kill guard and reported
+// nothing instead of failing with a verdict. A termination guard must not share
+// a code path with the property under test, or it stops guarding exactly when
+// it is needed. `pollFn` is called on every idle pass regardless of what the
+// timer queue does, so it can still bound a scheduler whose timers are entirely
+// broken.
+const idleGiveUp: int = liveDeadline * 100
+let idlePasses: i64 = 0
+
+function idleGuard(schedAddr: int, timeoutMs: int): int {
+  idlePasses = idlePasses + 1
+  if (int(idlePasses) > idleGiveUp) {
+    schedShutdown(taskAt(schedAddr))
+  }
+  return 0
+}
+
+function schedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+// Put a bare task block on the timer list with `deadline`, in `state`.
+function armTimer(taskAddr: int, deadline: int, state: int) {
+  let t = taskAt(taskAddr)
+  *(t + taskDeadline) = deadline
+  atomicStore(t + taskState, state)
+  schedTimerPush(taskAt(schedAddr()), taskAddr)
+}
+
+// Pop whatever `expire` unparked. A woken sleeper goes onto the GLOBAL queue —
+// `schedUnpark`'s route, because the waker may not be a worker at all — so this
+// is how the test learns WHICH task woke, not merely how many.
+function tookFromGlobal(): int {
+  return gqPop(taskAt(schedAddr()) + scGlobal)
+}
+
+// The sleeping task. `@nosplit` because a green task's stack is reached by the
+// conservative scan rather than by a published safepoint frame — still true for
+// every task body in the tree.
+//
+// The store after the sleep is the whole point: it is reached ONLY if the timer
+// queue woke this task and a worker resumed it. `ptrOf` is rejected inside a
+// `@nosplit` body (#1421) even though §11.11 makes reaching module state pure
+// arithmetic, so the address is resolved once on an ordinary thread and carried
+// as an integer — the workaround every other scheduler stress program uses.
+// The shutdown is what TERMINATES the program, and it is done by the task
+// rather than by the driver on purpose. A driver that called `schedShutdown`
+// before starting the worker would race: the worker would find no runnable work
+// (the only task is asleep), see `stopping`, and exit while the sleeper was
+// still on the timer list — the loop would end without ever proving a wake.
+// Shutting down from the far side of the sleep makes termination depend on the
+// property under test, so a broken timer queue HANGS rather than passing.
+@nosplit function sleeperBody() {
+  schedSleepUntil(liveDeadline)
+  atomicStore(taskAt(addrWoke), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+function main() {
+  let s = taskAt(schedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), timerWorkers)
+  addrWoke = int(ptrOf(obsWoke))
+  addrSched = schedAddr()
+
+  // --- Partition and ordering -------------------------------------------
+  //
+  // Three sleepers, pushed newest-first onto an unsorted list, so list order is
+  // deliberately NOT deadline order: C, B, A go on, and A must still be the one
+  // that wakes first. An implementation that woke the list head instead of the
+  // due task would pass a test that pushed them in order.
+  armTimer(int(ptrOf(tC)), 300, taskParked)
+  armTimer(int(ptrOf(tB)), 200, taskParked)
+  armTimer(int(ptrOf(tA)), 100, taskParked)
+  let armed = schedTimerCount(s)
+
+  // Nothing is due yet at t=99.
+  let earlyWoke = schedTimerExpire(s, 99)
+
+  // A is due at t=150; B and C are not.
+  let wokeA = schedTimerExpire(s, 150)
+  let gotA = tookFromGlobal() == int(ptrOf(tA))
+  let leftAfterA = schedTimerCount(s)
+
+  // The boundary is `deadline <= now`, so t=200 wakes B exactly.
+  let wokeB = schedTimerExpire(s, 200)
+  let gotB = tookFromGlobal() == int(ptrOf(tB))
+
+  let wokeC = schedTimerExpire(s, 1000)
+  let gotC = tookFromGlobal() == int(ptrOf(tC))
+  let leftAtEnd = schedTimerCount(s)
+
+  // --- A due task that is not parked yet is RETAINED, not woken ---------
+  //
+  // This is the guard on the one deviation from `sched.zig`. The Zig links a
+  // sleeper onto the timer list from a `ParkFn`, i.e. strictly after the task's
+  // context is saved, so by the time `expire` can see it, it IS parked. That
+  // hook is a call through a function value, which `@nosplit` rejects (E0075),
+  // so `schedSleepUntil` links itself on BEFORE parking and `expire` closes the
+  // window at the other end: it wakes only through `schedUnpark`, whose CAS
+  // requires `taskParked`, and puts anything else back for the next pass.
+  //
+  // Without that retention the task would be dropped off the list entirely and
+  // would sleep forever — a lost wakeup, which is exactly the failure mode this
+  // project already paid for once when a QUIC teardown stranded its waiters.
+  armTimer(int(ptrOf(tD)), 100, taskRunning)
+  let notYetWoke = schedTimerExpire(s, 150)
+  let stillArmed = schedTimerCount(s)
+  let nothingQueued = tookFromGlobal() == 0
+
+  // Now let it be genuinely parked; the next pass must wake it.
+  atomicStore(taskAt(int(ptrOf(tD))) + taskState, taskParked)
+  let lateWoke = schedTimerExpire(s, 150)
+  let gotD = tookFromGlobal() == int(ptrOf(tD))
+
+  // --- End to end through the run loop ----------------------------------
+  //
+  // A real task sleeps on the timer queue and is woken by the worker's own idle
+  // path, proving the whole chain: `schedSleepUntil` -> timer list -> `expire`
+  // -> `schedUnpark` -> global queue -> resumed by a worker. The task shuts the
+  // scheduler down itself, so the loop terminates by the program's own progress.
+  let base = int(ptrOf(stackArea))
+  let bumped = base + schedStackBytes - 1
+  let stackBase = bumped - bumped % schedStackBytes
+  let aligned = schedStackAligned(stackBase)
+
+  let live = taskAt(int(ptrOf(liveTask)))
+  schedTaskInit(live, stackBase, schedStackBytes, entryOf(sleeperBody), 0)
+  schedRegister(s, int(ptrOf(liveTask)))
+  schedSpawn(s, int(ptrOf(liveTask)))
+  schedWorkerRun(schedWorkerAt(s, 0), fakeClock, idleGuard)
+
+  // `woke` is the load-bearing bit: the store it reports happens on the far
+  // side of `schedSleepUntil`, so it is set only if the task was genuinely
+  // resumed. `clockPassed` alone would prove nothing — the clock advances on
+  // every idle pass whether or not any sleeper is ever woken.
+  let woke = int(obsWoke) != 0
+  let clockPassed = int(clockNow) >= liveDeadline
+
+  println("armed ${armed} early ${earlyWoke}")
+  println("A ${wokeA} ${gotA} left ${leftAfterA}")
+  println("B ${wokeB} ${gotB}")
+  println("C ${wokeC} ${gotC} left ${leftAtEnd}")
+  println("retain ${notYetWoke} ${stillArmed} ${nothingQueued}")
+  println("late ${lateWoke} ${gotD}")
+  println("live ${aligned} ${woke} ${clockPassed}")
+}
