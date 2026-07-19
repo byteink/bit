@@ -426,6 +426,26 @@ pub fn build(b: *std.Build) void {
     const testcmd_tests = b.addTest(.{ .root_module = testcmd_mod });
     test_step.dependOn(&b.addRunArtifact(testcmd_tests).step);
 
+    // `bit lint` CLI contract (#1380): exit codes, path walk, summary line,
+    // `--json`, `--stats`. Execs the SELF-HOSTED `bit` (lint is selfhost-only),
+    // so `selfhost_bit` is wired in at the tail next to the artifact it names —
+    // empty on a cross build, where there is no runnable `bit` to drive.
+    const lintcmd_opts = b.addOptions();
+    const lintcmd_mod = b.createModule(.{
+        .root_source_file = b.path("tests/lintcmd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lintcmd_mod.addOptions("build_options", lintcmd_opts);
+
+    const lintcmd_tests = b.addTest(.{ .root_module = lintcmd_mod });
+    const lintcmd_run = b.addRunArtifact(lintcmd_tests);
+    // The fixtures are written to /tmp at run time, invisible to the build
+    // cache — same reason as rootpins and diffimports.
+    lintcmd_run.has_side_effects = true;
+    b.step("test-lint", "run the `bit lint` CLI contract only (tests/lintcmd.zig)").dependOn(&lintcmd_run.step);
+    test_step.dependOn(&lintcmd_run.step);
+
     // std/os args + environment round-trip (#354): one program run twice under
     // a controlled environment. Shares the host libbitrt archive.
     const osenv_opts = b.addOptions();
@@ -800,10 +820,12 @@ pub fn build(b: *std.Build) void {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
         diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
+        lintcmd_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
         diffimports_opts.addOption([]const u8, "selfhost_bit", "");
+        lintcmd_opts.addOption([]const u8, "selfhost_bit", "");
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
