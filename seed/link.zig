@@ -230,18 +230,7 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
     var tpoff_of = std.AutoHashMapUnmanaged(u64, i64){};
     for ([_][]const Placed{ tdata.items, tbss.items }) |group| {
         for (group) |p| {
-            const tpoff: i64 = switch (target) {
-                // Variant II (x86-64): the static TLS block sits below the thread
-                // pointer, so a symbol at block offset `o` is at TP - (aligned
-                // block size) + o.
-                .x86_64_linux => @as(i64, @intCast(p.tls_offset)) - @as(i64, @intCast(tls_size_aligned)),
-                // Variant I (AArch64): the block sits above the thread pointer,
-                // after a 16-byte ABI TCB aligned to the block's own alignment
-                // (Zig's `std.os.linux.tls` layout — @sizeOf(AbiTcb)=16), so a
-                // symbol at block offset `o` is at TP + alignUp(16, align) + o.
-                .aarch64_linux => @intCast(alignUp(16, tls_align) + p.tls_offset),
-            };
-            try tpoff_of.put(arena, p.id.key(), tpoff);
+            try tpoff_of.put(arena, p.id.key(), tpOffset(target, p.tls_offset, tls_align, tls_size_aligned));
         }
     }
 
@@ -303,6 +292,34 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
         .data = data.items,
         .tdata = tdata.items,
     }, mods, &patched);
+}
+
+/// Thread-pointer-relative address of a TLS symbol sitting at `tls_offset`
+/// within the PT_TLS template, for a block of alignment `tls_align` whose
+/// aligned size is `tls_size_aligned`.
+///
+/// This is THE quantity that diverges between the two ELF targets, and it is a
+/// contract with a consumer rather than a free choice: `runtime/root.zig` boots
+/// the thread pointer through `std.os.linux.tls.initStatic`, so these offsets
+/// are only correct if they agree with how *that* code lays the area out. The
+/// unit test below re-derives both from `initStatic`'s own arithmetic instead of
+/// restating the formulas, which is what makes it a check rather than an echo.
+///
+/// It is also the classic aarch64-vs-x86-64 trap: the two variants differ in
+/// SIGN, so a formula verified on one arch says nothing about the other, and
+/// the whole golden suite is host-native (see #1421).
+fn tpOffset(target: Target, tls_offset: u64, tls_align: u64, tls_size_aligned: u64) i64 {
+    return switch (target) {
+        // Variant II (x86-64): the static TLS block sits below the thread
+        // pointer, so a symbol at block offset `o` is at TP - (aligned block
+        // size) + o. Always <= 0.
+        .x86_64_linux => @as(i64, @intCast(tls_offset)) - @as(i64, @intCast(tls_size_aligned)),
+        // Variant I (AArch64): the block sits above the thread pointer, after a
+        // 16-byte ABI TCB aligned to the block's own alignment (Zig's
+        // `std.os.linux.tls` layout — @sizeOf(AbiTcb)=16), so a symbol at block
+        // offset `o` is at TP + alignUp(16, align) + o. Always > 0.
+        .aarch64_linux => @intCast(alignUp(16, tls_align) + tls_offset),
+    };
 }
 
 fn placeAtoms(mods: []const object.Module, items: anytype, cursor: *u64) void {
@@ -447,6 +464,85 @@ const can_exec_native = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux
 test {
     testing.refAllDecls(@This());
     _ = strip;
+}
+
+/// Re-derives a TLS symbol's thread-pointer-relative address the way
+/// `std.os.linux.tls.initStatic` actually lays the thread area out, for the ELF
+/// variant `target` uses. Deliberately expressed as area offsets — allocate a
+/// notional area, place the pieces, take the difference between the cell and
+/// the thread pointer — rather than as a closed form, so agreeing with
+/// `tpOffset` is evidence and not a restatement of the same expression.
+///
+/// Mirrors `std/os/linux/tls.zig`'s `area_size` switch: aarch64 is
+/// `.I_original` with a 16-byte `AbiTcb` (`dtv` + `_reserved`), x86-64 is
+/// `.II` with an 8-byte self-referential `AbiTcb`. Sizes are named here because
+/// the std constants are `native_arch`-dependent and this test must reason
+/// about the target we are LINKING for, not the host it runs on.
+fn tpOffsetPerInitStatic(target: Target, tls_offset: u64, tls_align: u64, block_size: u64) i64 {
+    const size_of_dtv = 16; // Dtv{ len: usize, tls_block: [*]u8 }
+    const size_of_zig_tcb = 8; // ZigTcb{ dummy: usize }
+
+    var l: u64 = 0;
+    var abi_tcb_offset: u64 = undefined;
+    var block_offset: u64 = undefined;
+
+    switch (target) {
+        .aarch64_linux => { // .I_original
+            l += size_of_dtv;
+            const delta = (l + size_of_zig_tcb) & (tls_align - 1);
+            if (delta > 0) l += tls_align - delta;
+            l += size_of_zig_tcb;
+            abi_tcb_offset = l;
+            l += alignUp(16, tls_align); // @sizeOf(AbiTcb) == 16
+            block_offset = l;
+        },
+        .x86_64_linux => { // .II
+            block_offset = l;
+            l += alignUp(block_size, tls_align);
+            abi_tcb_offset = l; // the TP
+        },
+    }
+
+    // The cell lives at `block_offset + tls_offset`; the thread pointer is at
+    // `abi_tcb_offset`. Everything the compiler emits is relative to the latter.
+    return @as(i64, @intCast(block_offset + tls_offset)) - @as(i64, @intCast(abi_tcb_offset));
+}
+
+test "TLS thread-pointer offsets match the runtime's own area layout, per ELF variant" {
+    // Covers the shapes that actually occur: offset 0 and a non-zero offset
+    // (the second `@threadlocal` declaration), a block whose size is already
+    // aligned and one that is not, and both the natural 8-byte alignment and an
+    // over-aligned block. `tls_size_aligned` is what `linkExecutable` passes.
+    const cases = [_]struct { off: u64, algn: u64, size: u64 }{
+        .{ .off = 0, .algn = 8, .size = 8 },
+        .{ .off = 8, .algn = 8, .size = 16 },
+        .{ .off = 16, .algn = 16, .size = 48 },
+        .{ .off = 0, .algn = 16, .size = 0x40068 }, // tests/stress/tlsstate's real geometry
+        .{ .off = 40, .algn = 32, .size = 100 }, // size not a multiple of align
+    };
+
+    for (cases) |c| {
+        const size_aligned = alignUp(c.size, c.algn);
+        for ([_]Target{ .x86_64_linux, .aarch64_linux }) |target| {
+            try testing.expectEqual(
+                tpOffsetPerInitStatic(target, c.off, c.algn, c.size),
+                tpOffset(target, c.off, c.algn, size_aligned),
+            );
+        }
+
+        // The sign IS the variant, and it is the half that a host-native suite
+        // can never observe: every golden runs on the host arch, so a formula
+        // that is right on aarch64 and wrong on x86-64 passes everything. Assert
+        // the direction explicitly in both directions.
+        try testing.expect(tpOffset(.x86_64_linux, c.off, c.algn, size_aligned) <= 0);
+        try testing.expect(tpOffset(.aarch64_linux, c.off, c.algn, size_aligned) > 0);
+    }
+
+    // A cell at the very top of the block is the last byte below the thread
+    // pointer on variant II — the boundary an off-by-one in the aligned size
+    // lands on, and the one that silently reads a neighbouring cell rather
+    // than faulting.
+    try testing.expectEqual(@as(i64, -8), tpOffset(.x86_64_linux, 8, 8, 16));
 }
 
 /// Writes `exe` under `zig-out/`, marks it executable, runs it, and returns
