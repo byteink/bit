@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Io = std.Io;
 
 const diagnostics = @import("diagnostics.zig");
@@ -31,8 +32,12 @@ pub const macho_reader = @import("link/macho_reader.zig");
 pub const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 
-/// Seed compiler version. Kept in sync with `build.zig.zon`.
-pub const version = "0.0.0";
+/// The toolchain version, parsed by `build.zig` out of `selfhost/version.bit` —
+/// the single source of truth both compilers share (#1451). It is NOT a second
+/// copy: this file no longer names a version at all, so the seed cannot drift
+/// from the self-hosted `bit` the way it had (seed "0.0.0" vs selfhost
+/// "0.1.0-stub"). Overridden for a release by `zig build -Dversion=X.Y.Z`.
+pub const version = build_options.version;
 
 /// Upper bound on a single source file `bit fmt` will read. Matches the
 /// golden harness's own cap (tests/harness.zig max_file_bytes).
@@ -155,6 +160,34 @@ pub fn main(init: std.process.Init) !void {
         try stderr_w.interface.flush();
         if (failed) return error.CheckFailed;
         return;
+    }
+
+    // A real `version` subcommand (#1451). It used to only APPEAR to work:
+    // every unrecognized argument fell through to the banner below, so
+    // `bit version` and `bit vresion` printed the same thing. The line is
+    // byte-identical to the self-hosted `bit`'s — both read the same
+    // `selfhost/version.bit` — so an installer or differential harness can
+    // compare the two compilers directly.
+    if (argv.len >= 2 and (std.mem.eql(u8, argv[1], "version") or
+        std.mem.eql(u8, argv[1], "--version") or std.mem.eql(u8, argv[1], "-V")))
+    {
+        var vbuf: [64]u8 = undefined;
+        var vout: Io.File.Writer = .initStreaming(.stdout(), io, &vbuf);
+        try vout.interface.print("bit {s}\n", .{version});
+        try vout.interface.flush();
+        return;
+    }
+
+    // Anything else with arguments is a usage error, not the banner.
+    if (argv.len >= 2) {
+        var ebuf: [256]u8 = undefined;
+        var eout: Io.File.Writer = .initStreaming(.stderr(), io, &ebuf);
+        try eout.interface.print(
+            "bit: unknown subcommand '{s}'\nusage: bit <build|run|check|test|fmt|doc|ar|lsp|version> ...\n",
+            .{argv[1]},
+        );
+        try eout.interface.flush();
+        std.process.exit(2);
     }
 
     var buf: [64]u8 = undefined;

@@ -201,11 +201,26 @@ fn collectedNamespaces(
     const abs_root = try std.fs.path.join(gpa, &.{ build_options.repo_root, root_file });
     defer gpa.free(abs_root);
 
+    // `seed/main.zig` imports `build_options` for the stamped version (#1451),
+    // so the gate has to build roots the way `build.zig` does — otherwise that
+    // root stops compiling here and the gate reports every file under it as
+    // orphaned. Declared for every root, not just main.zig: an unused module
+    // dependency costs nothing, and a per-root special case is one more thing
+    // to keep in sync. Naming the root with `-Mroot=` rather than positionally
+    // is what lets `--dep` attach to it.
+    const root_arg = try std.fmt.allocPrint(gpa, "-Mroot={s}", .{abs_root});
+    defer gpa.free(root_arg);
+    const opts_arg = try std.fmt.allocPrint(gpa, "-Mbuild_options={s}", .{build_options.build_options_zig});
+    defer gpa.free(opts_arg);
+
     const result = try std.process.run(gpa, io, .{
         .argv = &.{
             build_options.zig_exe,
             "test",
-            abs_root,
+            "--dep",
+            "build_options",
+            root_arg,
+            opts_arg,
             "--test-runner",
             build_options.list_runner,
             "--global-cache-dir",

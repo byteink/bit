@@ -123,18 +123,29 @@ no artifact is published without having executed at least once.
 
 ## Version reporting
 
-`bit` prints its version on a bare invocation:
+`bit version` is the supported way to ask, and installers may parse it. It
+prints exactly one line, and `bit --version` / `bit -V` are accepted spellings
+of the same thing:
 
 ```
-$ bit
-bit (self-host, seed-built) 0.1.0-stub — selfcheck OK
+$ bit version
+bit 1.2.3
 ```
 
-Two known gaps, both needing a compiler change and both tracked against #365:
+The Zig bootstrap compiler `bit-seed` prints the identical line — both read the
+same source of truth, so the two can never report different versions.
 
-* There is no real `version` subcommand — `bit version` only prints the same
-  banner because unrecognised arguments fall through to the default path.
-* The printed string is the hardcoded `selfhostVersion` in
-  `selfhost/version.bit`; it is **not** stamped from the release tag. Do not
-  parse it to determine the installed release. Installers should record the
-  version they downloaded.
+An unrecognised subcommand is a usage error on stderr with exit status 2; it
+does **not** fall through to the banner, so a typo cannot be mistaken for a
+successful version query.
+
+### How the version is stamped
+
+`selfhost/version.bit` is the single source of truth. `build.zig` parses the
+string out of it and hands the same bytes to both compilers, so:
+
+* A release build stamps the tag with `zig build -Dversion=X.Y.Z`. That option is
+  the **only** difference between a release build and a local one — CI never
+  patches a source file, and the working tree stays clean.
+* Nothing consults git, a tag, or the network at build time. A release tarball
+  with no `.git` in it builds and reports its own version correctly.
