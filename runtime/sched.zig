@@ -945,8 +945,30 @@ const Worker = struct {
 
     threadlocal var tls: ?*Worker = null;
 
+    /// The worker owning the calling OS thread, or null off a worker thread.
+    /// EVERY read of `tls` must go through here.
+    ///
+    /// `noinline` is load-bearing, not a code-size hint. A green thread can park
+    /// on one worker and resume on a *different* OS thread, but LLVM assumes the
+    /// thread pointer is invariant within a function: it hoists the
+    /// `mrs TPIDR_EL0` + `:tprel_*:` address computation out of loops and spills
+    /// the resulting address to the stack. That stack belongs to the green
+    /// thread and migrates with it, so after a resume the reload hands back the
+    /// address of the *previous* thread's TLS block — a stale `Worker` whose
+    /// `running` is null, which is the "attempt to use null value" in #1466.
+    ///
+    /// The context switch's clobber list cannot fix this. Clobbering the
+    /// register only forces a reload of the spilled address; it does not force a
+    /// fresh `mrs`, and no clobber can say "the thread identity may change
+    /// here". A real call boundary can: the callee has no way to receive a
+    /// cached thread pointer, so it must re-derive one on whatever thread is
+    /// actually executing.
+    noinline fn currentOrNull() ?*Worker {
+        return tls;
+    }
+
     fn current() *Worker {
-        return tls.?; // task code only ever runs on a worker OS thread
+        return currentOrNull().?; // task code only ever runs on a worker OS thread
     }
 
     fn run(self: *Worker) void {
@@ -1146,7 +1168,7 @@ pub const Scheduler = struct {
     pub fn spawn(self: *Scheduler, f: TaskFn, arg: ?*anyopaque) !void {
         const t = try Task.create(f, arg);
         self.registerTask(t);
-        if (Worker.tls) |w| {
+        if (Worker.currentOrNull()) |w| {
             if (!w.deque.pushBottom(t)) self.global.push(t);
         } else {
             self.global.push(t);
@@ -1240,7 +1262,7 @@ const max_registered_tasks: usize = 1 << 24;
 /// is not a worker thread (e.g. the boot thread). The GC excludes this task
 /// from the conservative parked-stack scan — it is walked precisely instead.
 pub fn currentTask() ?*Task {
-    const w = Worker.tls orelse return null;
+    const w = Worker.currentOrNull() orelse return null;
     return w.running;
 }
 
@@ -1248,7 +1270,7 @@ pub fn currentTask() ?*Task {
 /// so `net.zig`'s park callback can reach the netpoller without making `Worker`
 /// itself public.
 pub fn currentScheduler() ?*Scheduler {
-    const w = Worker.tls orelse return null;
+    const w = Worker.currentOrNull() orelse return null;
     return w.sched;
 }
 
