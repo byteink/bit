@@ -262,6 +262,28 @@ fn placeGlobals(a: Allocator, module: *const ir.Module, storage: ir.GlobalStorag
     return out.toOwnedSlice(a);
 }
 
+/// The alignment a globals section must carry for the per-cell padding
+/// `placeGlobals` inserts to survive into the loaded image.
+///
+/// Padding a cell to 16 *within* a section only lands it 16-aligned in memory if
+/// the section is at least as aligned; otherwise every cell inherits the
+/// section's own misalignment. That is precisely how §11.11's alignment
+/// guarantee held on aarch64-macOS and silently failed on ELF (#1421): with the
+/// section pinned at 8, every module cell sat at `addr % 16 == 8` on
+/// x86_64-linux while the native test run looked correct.
+///
+/// Derived from the cells actually present rather than hardcoded, so the
+/// section can never again be weaker than what `placeGlobals` assumed. The 8
+/// floor keeps a module with no globals byte-identical to before.
+fn globalsAlign(module: *const ir.Module, storage: ir.GlobalStorage) u32 {
+    var want: u32 = 8;
+    for (module.globals.items) |g| {
+        if (g.storage != storage) continue;
+        want = @max(want, g.alignment);
+    }
+    return want;
+}
+
 /// Emits `module` as an x86-64 ELF relocatable object. The returned bytes are
 /// owned by `gpa`; with `with_entry` the module's `main` becomes the runtime
 /// entry, otherwise no `main` is required and no trampoline is emitted (#1397 —
@@ -365,8 +387,8 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
-    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
-    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = 8 });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
+    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
 
     return obj_elf.write(gpa, .x86_64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -617,8 +639,8 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
-    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
-    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = 8 });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
+    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
 
     return obj_elf.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -871,7 +893,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     var sections: std.ArrayList(obj_macho.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 4 });
     if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = 8 });
-    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = 8 });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
 
     return obj_macho.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -963,6 +985,50 @@ test "emit: a freestanding object holds only the root module's functions" {
     defer gpa.free(whole_obj);
     try testing.expect(try testObjectDefines(gpa, whole_obj, "rootFn"));
     try testing.expect(try testObjectDefines(gpa, whole_obj, "importedFn"));
+}
+
+test "emit: a globals section is at least as aligned as the cells it holds" {
+    // §11.11 guarantees every module cell is 16-byte aligned, and `placeGlobals`
+    // pads each cell to its own alignment — but padding WITHIN a section only
+    // survives into the loaded image if the section is itself that aligned.
+    //
+    // This is asserted here, on the emitted object, rather than left to the
+    // `run_module_state_align` golden, because that golden CANNOT catch it: the
+    // suite runs host-native, and with the section pinned at 8 the guarantee
+    // still held on aarch64-macOS while every cell sat at `addr % 16 == 8` on
+    // x86_64-linux (#1421). A host-only guard would have been vacuous for the
+    // one target that was broken.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "rootFn", true);
+    // `addGlobal` takes ownership of both slices, so they must be heap-owned.
+    _ = try module.addGlobal(
+        try gpa.dupe(u8, "__bitg_0_cell"),
+        try gpa.dupe(u8, &[_]u8{0} ** 8),
+        16,
+        .process,
+    );
+
+    const obj = try emitObject(gpa, &module, false, false);
+    defer gpa.free(obj);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const mod = try elf_reader.read(arena_state.allocator(), .x86_64, "t.o", obj);
+
+    var saw_data = false;
+    for (mod.atoms) |atom| {
+        if (atom.kind != .data) continue;
+        saw_data = true;
+        try testing.expect(atom.alignment >= 16);
+    }
+    // Guards the guard: an assertion over an empty set would pass for the wrong
+    // reason if globals ever stopped landing in `.data`.
+    try testing.expect(saw_data);
 }
 
 test "emit: freestanding refuses a function that is neither @nosplit nor @naked" {
