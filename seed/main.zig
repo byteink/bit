@@ -781,7 +781,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
     {
         var rejected = false;
         for (0..n) |i| {
-            if (try rejectExternForTarget(&diags, project.module_files.items[i], target)) rejected = true;
+            if (try rejectExternForTarget(gpa, &diags, project.module_files.items[i], target, libbitrt)) rejected = true;
         }
         if (rejected) return try renderFail(gpa, &diags, err_out);
     }
@@ -875,7 +875,7 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
     defer checked.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
-    if (try rejectExternForTarget(&diags, files, target)) return try renderFail(gpa, &diags, err_out);
+    if (try rejectExternForTarget(gpa, &diags, files, target, libbitrt)) return try renderFail(gpa, &diags, err_out);
 
     var module = try lower.lowerModule(gpa, &ctx, files, &checked, &rmodule);
     defer module.deinit();
@@ -906,27 +906,50 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
     }
 }
 
-/// §11.7: `extern function` binds a name to a symbol resolved from a dylib at
-/// load time, which only the Mach-O output has. Bit's ELF output is a fully
-/// static binary with no interpreter, no dynamic symbol table and no libc — an
-/// undefined symbol there is an unresolvable link failure, so this is rejected
-/// up front with a real diagnostic instead of failing deep inside the linker.
+/// §11.7: `extern function` binds a Bit name to a raw external symbol. On
+/// Mach-O that symbol is bound by dyld at load time and anything is admissible.
+/// Bit's ELF output has no load-time resolution at all — no interpreter, no
+/// dynamic symbol table, no libc — but that is not the same as no resolution:
+/// the static link already merges `libbitrt.a`, and a symbol **defined inside
+/// that archive** resolves through the very same global symbol table as the
+/// runtime's own calls.
+///
+/// So the predicate is archive membership, not the platform. A symbol present
+/// in the archive is accepted; one that is absent is still rejected here, with
+/// a real diagnostic naming it, rather than failing deep inside the linker.
+/// `libbitrt` empty (`bit build-obj`, which reads no archive) means membership
+/// is undecidable, and an undecided case must REJECT — accepting on unknown
+/// would trade a compile error for a link error or a silent crash.
 ///
 /// The gate lives here, not in the checker, because the checker is deliberately
 /// target-independent (it runs once and its output feeds every backend); this
-/// is the first point where the selected target and the AST are both in hand.
-/// Returns true if anything was rejected.
-fn rejectExternForTarget(diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget) !bool {
+/// is the first point where the selected target and the AST are both in hand,
+/// and the archive path is a pure function of the target. Returns true if
+/// anything was rejected.
+fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget, libbitrt: []const u8) !bool {
     if (target == .aarch64_macos) return false;
+    const link_target: link.Target = switch (target) {
+        .x86_64_linux => .x86_64_linux,
+        .aarch64_linux => .aarch64_linux,
+        .aarch64_macos => unreachable,
+    };
     var found = false;
     for (files) |mf| {
         for (mf.tree.kids(mf.tree.root)) |top| {
             if (top == ast.none) continue;
             const inner = if (mf.tree.get(top).tag == .@"export") mf.tree.kids(top)[0] else top;
             if (mf.tree.get(inner).tag != .extern_fn_decl) continue;
+            // §11.7: an extern's Bit name IS the symbol, verbatim and never
+            // module-qualified, so the declaration's identifier is exactly what
+            // the linker will look for.
+            const name_node = mf.tree.kids(inner)[0];
+            const name_span = mf.tree.get(name_node).span;
+            const symbol = mf.source[name_span.start..name_span.end];
+            if (link.archiveDefines(gpa, link_target, libbitrt, symbol)) continue;
+
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "'extern function' is not supported for target {s}", .{target.name()}) catch "'extern function' is not supported for this target";
-            try diags.report(.extern_unsupported_target, mf.tree.get(inner).span, msg, "only aarch64-macos links against a dylib; the Linux output is fully static");
+            const msg = std.fmt.bufPrint(&buf, "'extern function' {s} is not defined in the runtime archive for target {s}", .{ symbol, target.name() }) catch "'extern function': undefined symbol for this target";
+            try diags.report(.extern_unsupported_target, mf.tree.get(inner).span, msg, "the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved");
             found = true;
         }
     }
@@ -1600,4 +1623,119 @@ test "run of a foreign target refuses instead of dropping a binary in the cwd (#
     // accident of a missing runtime archive.
     try std.testing.expectEqual(@as(u8, 2), rc);
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "bit build") != null);
+}
+
+/// A symbol no runtime will ever export, used as the negative pole of the
+/// §11.7 gate below. Deliberately `bit_rt_`-prefixed: if the predicate ever
+/// degraded into a prefix match rather than real archive membership, a name
+/// outside that namespace would still be rejected and the test would pass for
+/// the wrong reason.
+const absent_symbol = "bit_rt_no_such_symbol_exists_anywhere";
+
+test "E0078 admits a runtime-archive symbol on Linux and still rejects an absent one" {
+    // SPEC §11.7. The rule under test is ARCHIVE MEMBERSHIP, not the platform:
+    // a fully static ELF has no load-time resolution, but the static link does
+    // already merge `libbitrt.a`, and a symbol defined inside it resolves like
+    // any other cross-module reference.
+    //
+    // Both directions are asserted over the SAME target and the SAME archive,
+    // so neither can pass by accident: a gate that always rejected would fail
+    // the first half, and one that always accepted would fail the second. Run
+    // for both Linux triples, because the archive is read per-target and a
+    // reader bug on one arch is exactly the class this project keeps paying for.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var checked: usize = 0;
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux }) |target| {
+        const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch
+            continue; // `zig build libbitrt` not run for this target here
+        defer gpa.free(lib);
+        checked += 1;
+
+        // --- accepted: defined in libbitrt.a, so the link can resolve it -----
+        // Called, not merely declared: a declaration alone would prove the gate
+        // let it through, while the call proves the LINK really resolved the
+        // symbol. An undefined reference fails inside `linkExecutable`.
+        var ok_err: Io.Writer.Allocating = .init(gpa);
+        defer ok_err.deinit();
+        const ok_src =
+            \\extern function bit_rt_gc_blocking_begin()
+            \\extern function bit_rt_gc_blocking_end()
+            \\function main() {
+            \\  bit_rt_gc_blocking_begin()
+            \\  bit_rt_gc_blocking_end()
+            \\}
+            \\
+        ;
+        const exe = (try buildExecutable(gpa, "externok.bit", ok_src, lib, target, &ok_err.writer)) orelse {
+            std.debug.print("target {s}: rejected a symbol libbitrt.a defines:\n{s}\n", .{ target.name(), ok_err.written() });
+            return error.LegitimateExternRejected;
+        };
+        defer gpa.free(exe);
+        try std.testing.expect(exe.len > 0);
+
+        // --- rejected: absent from the archive ------------------------------
+        var bad_err: Io.Writer.Allocating = .init(gpa);
+        defer bad_err.deinit();
+        const bad_src = try std.fmt.allocPrint(gpa,
+            \\extern function {s}()
+            \\function main() {{
+            \\  {s}()
+            \\}}
+            \\
+        , .{ absent_symbol, absent_symbol });
+        defer gpa.free(bad_src);
+        try std.testing.expect(try buildExecutable(gpa, "externbad.bit", bad_src, lib, target, &bad_err.writer) == null);
+        // Scored on the REASON: it must be E0078 naming the symbol, not some
+        // unrelated failure that also happens to return null.
+        try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), "E0078") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), absent_symbol) != null);
+
+        // --- undecidable: no archive in the link must fall back to REJECTION --
+        // `bit build-obj` reads no archive. Accepting on unknown would trade a
+        // compile error for a link error or a silent crash, so the same source
+        // that was accepted above must be refused with an empty archive.
+        var none_err: Io.Writer.Allocating = .init(gpa);
+        defer none_err.deinit();
+        try std.testing.expect(try buildExecutable(gpa, "externok.bit", ok_src, "", target, &none_err.writer) == null);
+        try std.testing.expect(std.mem.indexOf(u8, none_err.written(), "E0078") != null);
+    }
+
+    // Anti-vacuity: a loop that ran zero times would pass while asserting
+    // nothing — the failure mode this codebase has hit eleven times.
+    if (checked == 0) return error.SkipZigTest;
+}
+
+test "archiveDefines answers membership, not mere reference" {
+    // The predicate itself, isolated from the diagnostic. `bit_rt_gc_blocking_begin`
+    // is DEFINED by the archive; `absent_symbol` is in neither. The third case is
+    // the one that makes this non-trivial: `strip.resolveGlobals` keys on defining
+    // ATOMS, so a member that only CALLS a symbol must not count as defining it.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var checked: usize = 0;
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux }) |target| {
+        const lt: link.Target = switch (target) {
+            .x86_64_linux => .x86_64_linux,
+            .aarch64_linux => .aarch64_linux,
+            .aarch64_macos => unreachable,
+        };
+        const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch continue;
+        defer gpa.free(lib);
+        checked += 1;
+
+        try std.testing.expect(link.archiveDefines(gpa, lt, lib, "bit_rt_gc_blocking_begin"));
+        try std.testing.expect(!link.archiveDefines(gpa, lt, lib, absent_symbol));
+        // Undecidable inputs answer false rather than erroring — the caller's
+        // only sound response to "unknown" is to reject.
+        try std.testing.expect(!link.archiveDefines(gpa, lt, "", "bit_rt_gc_blocking_begin"));
+        try std.testing.expect(!link.archiveDefines(gpa, lt, "not an ar archive at all", "bit_rt_gc_blocking_begin"));
+    }
+    if (checked == 0) return error.SkipZigTest;
 }

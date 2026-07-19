@@ -52,6 +52,42 @@ pub const Input = union(enum) {
     archive: []const u8,
 };
 
+/// True if `symbol` is **defined** by some member of the `ar` archive `bytes`
+/// when read for `target` — i.e. whether a static link against this archive
+/// would resolve a reference to it. Backs SPEC §11.7's E0078 predicate: an
+/// `extern function` on Linux is admissible exactly when the symbol is already
+/// inside the archive being linked.
+///
+/// "Defined" means a global-binding *atom*, which is what `strip.resolveGlobals`
+/// keys the whole-link symbol table on — the same notion the real link uses, not
+/// a parallel one. An undefined reference never becomes an atom, so a member
+/// that merely *calls* `symbol` does not count as defining it. Reading the
+/// members through `elf_reader` rather than through the archive's own `/` symbol
+/// index is deliberate: the index is a hint an archive is not obliged to carry
+/// (`archive.zig` skips it for both formats), whereas the atoms are the ground
+/// truth the linker itself acts on.
+///
+/// An empty or malformed archive answers **false**, never an error: the caller's
+/// only sound response to "undecidable" is to reject, so collapsing that into
+/// the negative keeps the decision in one place. `bit build-obj` reads no
+/// archive at all and reaches here with an empty slice.
+pub fn archiveDefines(gpa: Allocator, target: Target, bytes: []const u8, symbol: []const u8) bool {
+    if (bytes.len == 0) return false;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const members = archive.parse(arena, bytes) catch return false;
+    for (members) |m| {
+        const mod = elf_reader.read(arena, target.readerTarget(), m.name, m.data) catch continue;
+        for (mod.atoms) |atom| {
+            if (atom.binding != .global) continue;
+            if (std.mem.eql(u8, atom.name, symbol)) return true;
+        }
+    }
+    return false;
+}
+
 /// Fixed non-PIE load base. Traditional x86-64 `ET_EXEC` value; well clear of
 /// the kernel's `mmap_min_addr` and the zero page.
 const load_base: u64 = 0x400000;

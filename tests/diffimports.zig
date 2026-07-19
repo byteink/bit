@@ -51,10 +51,13 @@
 //! WHY THE TARGET IS PINNED TO DARWIN
 //! ---------------------------------------------------------------------------
 //!
-//! `extern function` is refused outright when targeting Linux (E0078: a fully
-//! static ELF has nothing to resolve an import against), and the checker refuses
-//! it even on an uncalled declaration. So an extern fixture can only be emitted
-//! for a Darwin target. Nothing is linked or executed, so this runs on any host.
+//! Since #1444, E0078 tests ARCHIVE MEMBERSHIP rather than the platform: an
+//! `extern function` is admissible on Linux exactly when the symbol is already
+//! defined in the linked `libbitrt.a`. Both fixtures here name libc symbols
+//! (`close`, `getpid`), which are NOT in that archive — Bit's ELF output has no
+//! libc at all — so they remain Linux-rejected and can still only be emitted for
+//! a Darwin target. The pin is unchanged; only its reason is narrower. Nothing
+//! is linked or executed, so this runs on any host.
 //!
 //! ---------------------------------------------------------------------------
 //! VACUITY
@@ -98,8 +101,8 @@ const fixtures = [_]Fixture{
     .{ .path = "tests/importsets/externplain", .probe = "_getpid" },
 };
 
-/// Every fixture is emitted for this target: `extern function` cannot be
-/// emitted for Linux at all (E0078).
+/// Every fixture is emitted for this target: these fixtures' libc symbols are
+/// absent from `libbitrt.a`, so E0078 still rejects them for Linux (#1444).
 const target: bit.BuildTarget = .aarch64_macos;
 
 /// The `--target` spelling self-hosted `bit` accepts on the command line.
@@ -314,8 +317,9 @@ fn emitWithSelfhost(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixt
 // direction for one compiler; nothing covered the accepting direction
 // end-to-end, under both, over the real fixtures.
 //
-// Skips off aarch64-macOS: the fixtures are pinned to that target (E0078
-// forbids `extern` elsewhere) and the wired archive is the HOST's, so linking
+// Skips off aarch64-macOS: the fixtures are pinned to that target (their libc
+// symbols are not in `libbitrt.a`, so E0078 still rejects them for Linux —
+// #1444) and the wired archive is the HOST's, so linking
 // anywhere else would pair a Mach-O object with a Linux runtime.
 test "both linkers accept every legitimate extern program" {
     comptime std.debug.assert(fixtures.len != 0);

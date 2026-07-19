@@ -944,15 +944,41 @@ nothing on this path marshals — the value would be handed over raw and misread
 linker must find, so it is used verbatim (with the platform's own decoration —
 Mach-O's leading underscore, so `getpid` links against `_getpid`).
 
-**macOS only.** The Mach-O output is a normal dynamically-linked image and its
-linker already binds any still-undefined global as a libSystem import, so an
-extern needs no new linker machinery. The ELF output is deliberately the
-opposite: a fully static binary with no interpreter, no dynamic symbol table and
-no libc, where an undefined symbol is an unresolvable link failure. Declaring an
-`extern function` while targeting Linux is therefore rejected up front with
-**E0078** `extern_unsupported_target` rather than failing inside the linker.
-Bit has no arch-conditional compilation, so a program that needs both paths uses
-`extern function` for Darwin and a raw syscall for Linux, not one source form.
+**macOS binds against a dylib; Linux binds against the linked archive.** The
+Mach-O output is a normal dynamically-linked image and its linker already binds
+any still-undefined global as a libSystem import, so an extern needs no new
+linker machinery and any symbol name is admissible there. The ELF output is
+deliberately the opposite: a fully static binary with no interpreter, no dynamic
+symbol table and no libc. There is no load-time resolution at all — but that is
+not the same as *no resolution*. The static link already merges the runtime
+archive (`libbitrt.a`), and a symbol **defined inside that archive** resolves
+exactly like any other cross-module reference, through the same global symbol
+table and the same dead-strip reachability the runtime's own calls use.
+
+The rule is therefore archive membership, not the platform:
+
+- Targeting `aarch64-macos`: always accepted.
+- Targeting a Linux triple, symbol **defined in the linked `libbitrt.a`**:
+  accepted. The reference is resolved statically at link time.
+- Targeting a Linux triple, symbol **absent** from that archive: rejected with
+  **E0078** `extern_unsupported_target`, naming the symbol. A fully static ELF
+  has nothing to resolve it against, so this would otherwise fail deep inside
+  the linker.
+- Targeting a Linux triple with **no archive in the link** (`bit build-obj`,
+  which emits a bare relocatable and reads no archive): rejected. Membership is
+  undecidable there, and an undecided case must fall back to rejection — an
+  accept-on-unknown would convert a compile error into a link error or a silent
+  crash.
+
+The decision is made where the target and the AST are both in hand, after
+checking and before lowering; the archive path is a pure function of the target,
+so the predicate is decidable exactly where the diagnostic already fired.
+
+Bit has no arch-conditional compilation, so a program needing a *libc* symbol on
+both platforms still uses `extern function` for Darwin and a raw syscall for
+Linux, not one source form. A **runtime** symbol (`bit_rt_*`) is the case this
+rule admits: it is present in the archive on every target, so one source form
+does work for it.
 
 ### 11.8 Raw Syscalls (unmanaged subset)
 
