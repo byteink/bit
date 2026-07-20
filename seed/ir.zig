@@ -1048,6 +1048,18 @@ pub const FunctionBuilder = struct {
         return self.push(.const_bool, ty, &.{@intFromBool(val)});
     }
 
+    /// True when `v` is literally `const_bool true`. Lets a loop's lowering see
+    /// that its condition never fails, which — with no `break` reaching the exit
+    /// — proves the exit unreachable (`lowerWhile`). Deliberately a structural
+    /// test on the already-lowered value, not a re-run of the checker's
+    /// `constEval`: it can only under-report, and under-reporting costs a dead
+    /// exit block, while over-reporting would strand live code behind a trap.
+    pub fn isConstTrue(self: *const FunctionBuilder, v: ValueId) bool {
+        const i = vid(v);
+        if (i >= self.insts.len or self.insts.items(.op)[i] != .const_bool) return false;
+        return self.extra.items[self.insts.items(.operands_start)[i]] != 0;
+    }
+
     pub fn constString(self: *FunctionBuilder, ty: TypeId, pool_idx: u32) Allocator.Error!ValueId {
         return self.push(.const_string, ty, &.{pool_idx});
     }

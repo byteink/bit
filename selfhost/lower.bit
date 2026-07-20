@@ -63,6 +63,19 @@ function builderEmit(b: IrBuilder, ins: IrInstr): int {
   return len(b.instrs) - 1
 }
 
+// True when `v` is literally `const_bool true`. Lets a loop's lowering see that
+// its condition never fails, which — with no `break` reaching the exit — proves
+// the exit unreachable (`lowerWhile`). Deliberately a structural test on the
+// already-lowered value, not a re-run of the validator's constant folding: it
+// can only under-report, and under-reporting costs a dead exit block, while
+// over-reporting would strand live code behind a trap.
+function isConstTrue(b: IrBuilder, v: int): bool {
+  if (v < 0 || v >= len(b.instrs)) {
+    return false
+  }
+  return b.instrs[v].op == Op.ConstBool && b.instrs[v].bval
+}
+
 // Adds a block parameter (phi result) to the current block. Params must precede
 // the block's body instructions, so this is called right after beginBlock.
 function builderAddParam(b: IrBuilder, ty: int): int {
@@ -294,6 +307,10 @@ struct LoopFrame {
   // A switch frame is a `break` target but not a `continue` target — a
   // `continue` inside a switch reaches the enclosing loop, skipping switches.
   isSwitch: bool,
+  // Set when a `break` actually jumped to `exit`. A loop whose condition is
+  // statically true and whose exit no `break` reaches cannot fall out, so the
+  // exit block is unreachable and the loop diverges (#1548).
+  exitUsed: bool,
 }
 
 // Binds a name to a value id + type, appending to the ordered env.
@@ -3410,7 +3427,7 @@ function lowerSwitch(fc: FnCtx, node: int) {
     dflt = builderNewBlock(fc.b)
   }
   // A switch is a `break` target (to the join) but not a `continue` target.
-  fc.loops = append(fc.loops, LoopFrame{ exit: join, cont: join, preLen: preLen, isSwitch: true })
+  fc.loops = append(fc.loops, LoopFrame{ exit: join, cont: join, preLen: preLen, isSwitch: true, exitUsed: false })
   let joinReachable = false
   let seen = 0
   ci = 0
@@ -3563,7 +3580,7 @@ function lowerSelect(fc: FnCtx, node: int) {
   let orig = snapshotValues(fc, preLen)
   let join = builderNewBlock(fc.b)
   let dflt = builderNewBlock(fc.b)
-  fc.loops = append(fc.loops, LoopFrame{ exit: join, cont: join, preLen: preLen, isSwitch: true })
+  fc.loops = append(fc.loops, LoopFrame{ exit: join, cont: join, preLen: preLen, isSwitch: true, exitUsed: false })
   let joinReachable = false
   let seen = 0
   ci = 0
@@ -4330,6 +4347,7 @@ function lowerWhile(fc: FnCtx, node: int) {
   if (fc.failed) {
     return
   }
+  let condAlways = isConstTrue(fc.b, cond)
   // The body is dominated by the header (single predecessor), so it takes no
   // params; only the exit is a real merge (this edge + every break).
   let br = mkInstr(Op.Br, fc.c.ctx.voidId)
@@ -4341,7 +4359,7 @@ function lowerWhile(fc: FnCtx, node: int) {
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
   // Body.
-  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: header, preLen: preLen, isSwitch: false })
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: header, preLen: preLen, isSwitch: false, exitUsed: false })
   builderBeginBlock(fc.b, bodyBlk)
   fc.terminated = false
   lowerStmtList(fc, k[1])
@@ -4349,12 +4367,24 @@ function lowerWhile(fc: FnCtx, node: int) {
     emitJump(fc, header, snapshotValues(fc, preLen))
   }
   builderEndBlock(fc.b)
+  let exitUsed = fc.loops[len(fc.loops) - 1].exitUsed
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   truncateEnv(fc, preLen)
-  // Exit: merges the false-branch and every break.
+  // Exit: merges the false-branch and every break. The false edge carries args
+  // whether or not it can be taken, so the exit always takes its params.
   builderBeginBlock(fc.b, exitBlk)
   addJoinParams(fc, preLen)
-  fc.terminated = false
+  // A statically-true condition never takes that false edge, so with no `break`
+  // reaching the exit nothing does, and the loop diverges — the same conclusion
+  // the validator's `diverges` reaches for `while (true)` with no own break.
+  // Recording it keeps `terminated` in step with that analysis; where the two
+  // disagreed, `lowerCatch` had to refuse the whole function (#1519, #1548).
+  if (condAlways && !exitUsed) {
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    fc.terminated = true
+  } else {
+    fc.terminated = false
+  }
 }
 
 // Lowers `for x of it` over a slice or array to the seed's counted-loop SSA:
@@ -4446,7 +4476,7 @@ function lowerForOf(fc: FnCtx, node: int) {
   builderEmit(fc.b, br)
   builderEndBlock(fc.b)
   // Body: bind the element (or key/value pair), run the body, fall to the step.
-  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen, isSwitch: false })
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen, isSwitch: false, exitUsed: false })
   builderBeginBlock(fc.b, bodyBlk)
   fc.terminated = false
   let bodyMark = len(fc.env)
@@ -4561,7 +4591,7 @@ function lowerForC(fc: FnCtx, node: int) {
   }
   builderEndBlock(fc.b)
   // Body: run it, fall through to the post block.
-  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: postBlk, preLen: preLen, isSwitch: false })
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: postBlk, preLen: preLen, isSwitch: false, exitUsed: false })
   builderBeginBlock(fc.b, bodyBlk)
   fc.terminated = false
   let bodyMark = len(fc.env)
@@ -5145,6 +5175,10 @@ function lowerStmt(fc: FnCtx, node: int) {
     let target = frame.exit
     if (n.tag == Tag.ContinueStmt) {
       target = frame.cont
+    } else {
+      // Records that this frame's exit really is reachable, so `lowerWhile` can
+      // tell a `while (true)` that breaks from one that diverges (#1548).
+      fc.loops[fi].exitUsed = true
     }
     emitJump(fc, target, snapshotValues(fc, frame.preLen))
     fc.terminated = true

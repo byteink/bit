@@ -2585,6 +2585,7 @@ const FnCtx = struct {
         try self.addLoopParams(pre_len);
 
         const cond = try self.lowerExpr(k[0]);
+        const cond_always = self.b.isConstTrue(cond);
         {
             // `body_blk` has this `br` as its only predecessor and is dominated
             // by `header`, so it takes no params and reads the loop-carried
@@ -2603,12 +2604,24 @@ const FnCtx = struct {
             defer self.gpa.free(back);
             try self.emitJump(header, back);
         }
-        _ = self.loop_stack.pop();
+        const frame = self.loop_stack.pop().?;
 
         self.b.endBlock();
         self.b.beginBlock(exit_blk);
+        // The header's else edge carries args whether or not it can be taken, so
+        // the exit always takes its params.
         try self.addLoopParams(pre_len);
-        self.terminated = false;
+        // A statically-true condition never takes that else edge, so with no
+        // `break` targeting this loop nothing reaches the exit and the loop
+        // diverges — the same conclusion the checker's `diverges` reaches for
+        // `while (true)` with no own break. Recording it keeps `terminated` in
+        // step with that analysis; where the two disagreed, `lowerCatch` had to
+        // refuse the whole function (#1519, #1548).
+        if (cond_always and !frame.exit_used) {
+            try self.emitUnreachable();
+        } else {
+            self.terminated = false;
+        }
     }
 
     fn lowerForInf(self: *FnCtx, node: ast.Index) Error!void {
@@ -2627,7 +2640,7 @@ const FnCtx = struct {
 
         try self.loop_stack.append(self.gpa, .{ .exit = exit_blk, .cont = header, .pre_len = pre_len });
         try self.lowerBlockScoped(body);
-        _ = self.loop_stack.pop();
+        const frame = self.loop_stack.pop().?;
         if (!self.terminated) {
             const back = try self.env.snapshotValues(self.gpa, pre_len);
             defer self.gpa.free(back);
@@ -2636,8 +2649,15 @@ const FnCtx = struct {
 
         self.b.endBlock();
         self.b.beginBlock(exit_blk);
-        try self.addLoopParams(pre_len);
-        self.terminated = false;
+        // `for { }` has no exit edge of its own, so `break` is the only way out;
+        // without one the loop diverges (the checker's `for_inf` rule) and the
+        // exit has no predecessors at all — hence no params, as in `lowerSwitch`.
+        if (frame.exit_used) {
+            try self.addLoopParams(pre_len);
+            self.terminated = false;
+        } else {
+            try self.emitUnreachable();
+        }
     }
 
     fn lowerForC(self: *FnCtx, node: ast.Index) Error!void {
