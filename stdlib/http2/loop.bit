@@ -1,0 +1,171 @@
+// Bit standard library — http2 module, the connection actor: the loop-owned
+// state, the channel message types, and the three green threads that run per
+// `Conn`. Split out of `conn.bit`; same flat `std/http2` module and namespace.
+
+// --- loop-owned state --------------------------------------------------------
+
+// Stream states (RFC 9113 §5.1). The reserved-for-push states are omitted.
+const h2stIdle: int = 0
+const h2stOpen: int = 1
+const h2stHCLocal: int = 2
+const h2stHCRemote: int = 3
+const h2stClosed: int = 4
+
+// One multiplexed stream. Only the loop thread touches this. `sendWindow` is how
+// many DATA bytes we may still send (the peer's receive window); `recvWindow` how
+// many the peer may still send us. `pendingData`/`pendingEnd`/`hasPending` hold
+// body bytes waiting on flow-control credit. `replyCh` is where a client stream's
+// completed `Response` (or error) is delivered to the waiting `roundTrip`.
+struct h2connStream {
+  id: int,
+  state: int,
+  sendWindow: int,
+  recvWindow: int,
+  recvHeaders: []HeaderField,
+  headersDone: bool,
+  recvBody: []byte,
+  recvEnded: bool,
+  pendingData: []byte,
+  pendingEnd: bool,
+  hasPending: bool,
+  replyCh: chan<h2connMsg>,
+  replied: bool,
+  delivered: bool,
+  reset: bool,
+  errorCode: int,
+}
+
+// The whole connection state, owned exclusively by the loop thread.
+struct h2connState {
+  isClient: bool,
+  inCh: chan<h2connEvent>,
+  cmdCh: chan<h2connCmd>,
+  writeCh: chan<h2connOut>,
+  acceptCh: chan<h2connAccept>,
+  readyCh: chan<int>,
+  settingsSeen: bool,
+  enc: Encoder,
+  dec: Decoder,
+  streams: map<int, h2connStream>,
+  present: map<int, int>,
+  nextStreamId: int,
+  lastPeerStreamId: int,
+  connSendWindow: int,
+  connRecvWindow: int,
+  peerInitialWindow: int,
+  ourInitialWindow: int,
+  peerMaxFrameSize: int,
+  ourMaxFrameSize: int,
+  lastStreamId: int,
+  contStream: int,
+  contBuf: []byte,
+  contEndStream: bool,
+  contNewStream: bool,
+  goawaySent: bool,
+  goawayReceived: bool,
+  running: bool,
+  activeStreams: int,
+}
+
+// A fresh stream in the idle state.
+function h2connNewStream(
+  id: int,
+  sendWindow: int,
+  recvWindow: int,
+  replyCh: chan<h2connMsg>,
+): h2connStream {
+  return h2connStream{
+    id: id,
+    state: h2stIdle,
+    sendWindow: sendWindow,
+    recvWindow: recvWindow,
+    recvHeaders: []HeaderField(0),
+    headersDone: false,
+    recvBody: []byte(0),
+    recvEnded: false,
+    pendingData: []byte(0),
+    pendingEnd: false,
+    hasPending: false,
+    replyCh: replyCh,
+    replied: false,
+    delivered: false,
+    reset: false,
+    errorCode: 0,
+  }
+}
+
+// --- channel message types ---------------------------------------------------
+
+// An inbound event from the reader thread: a whole `frame`, or `eof` when the
+// transport closed.
+struct h2connEvent { eof: bool, frame: Frame }
+
+// A byte buffer queued for the writer thread; `stop` tells it to close and exit.
+struct h2connOut { stop: bool, data: []byte }
+
+// Command kinds sent from the public API to the loop.
+const h2cmdOpen: int = 1
+const h2cmdRespond: int = 2
+const h2cmdGoaway: int = 3
+const h2cmdReset: int = 4
+
+// A command to the loop: open a client stream, answer a server stream, send a
+// GOAWAY, or reset a stream. Unused fields carry zero values.
+struct h2connCmd {
+  kind: int,
+  request: Request,
+  response: Response,
+  streamId: int,
+  errorCode: int,
+  replyCh: chan<h2connMsg>,
+}
+
+// The result delivered to a waiting `roundTrip`: `ok` with a `response`, or a
+// failure with `errMsg`.
+struct h2connMsg { ok: bool, response: Response, errMsg: string }
+
+// A fully-received request handed to the `serve` loop; `stop` ends the loop.
+struct h2connAccept { stop: bool, streamId: int, request: Request }
+
+// --- the three threads -------------------------------------------------------
+
+// Reader thread: read whole frames off the transport and forward them; on EOF or
+// a framing error, emit one final `eof` event and stop.
+function h2connReader(r: h2connFrameReader, inCh: chan<h2connEvent>, maxFrameSize: int) {
+  while (true) {
+    let fr = h2connNextFrame(r, maxFrameSize) catch e {
+      inCh <- h2connEvent{ eof: true, frame: h2connZeroFrame() }
+      return
+    }
+    inCh <- h2connEvent{ eof: false, frame: fr }
+  }
+}
+
+// Writer thread: drain queued frame bytes to the transport in order; a `stop`
+// message closes the transport and ends the thread.
+function h2connWriter(t: Transport, ch: chan<h2connOut>) {
+  while (true) {
+    let out = <- ch
+    if (out.stop) {
+      t.shutdown()
+      return
+    }
+    t.write(out.data) catch e {
+      return
+    }
+  }
+}
+
+// Loop thread: the sole owner of `st`. Serially fold in one inbound frame or one
+// command at a time until the transport closes.
+function h2connLoop(st: h2connState) {
+  while (st.running) {
+    select {
+      case ev = <- st.inCh:
+        h2connHandleEvent(st, ev)
+      case cmd = <- st.cmdCh:
+        h2connHandleCmd(st, cmd)
+    }
+  }
+}
+
