@@ -1,0 +1,255 @@
+// `select` — waiting on several channels at once (#1503).
+// Split out of `./chan.bit`; sibling file, so the same module — no import needed.
+
+// ---------------------------------------------------------------------------
+// Select
+// ---------------------------------------------------------------------------
+//
+// `cases` is `n` contiguous `SelectCaseDesc`s (ABI.md §11). Returns the index of
+// the case that fired, or `n` when `hasDefault` and nothing was ready — which is
+// the ABI's encoding of "the default clause ran", not an error.
+//
+// A send case on a closed channel is "ready" and reports its outcome through the
+// descriptor's `ok` word, mirroring a plain `chanSend` returning false rather
+// than the Zig's panic.
+
+// The select seed.
+//
+// `chan.zig` seeds xoshiro256 from `monoNs() ^ counter ^ &stack_marker`, and
+// says in its own header that fairness needs an UNBIASED shuffle, not an
+// unpredictable one. A clock is a syscall or an extern call, so `monoNs` is not
+// reachable from a `@nosplit` body — and the process-wide `select_seed_counter`
+// would need an atomic on module state, which needs `ptrOf` (#1421).
+//
+// Both are replaced by state that is per-task and therefore raced by nobody: the
+// task's own address, mixed with a counter living in that task's scratch. The
+// counter alone makes successive selects by one task differ; the address makes
+// two tasks at the same iteration differ. That is exactly the property the
+// shuffle needs. The mix is splitmix64's finalizer, the same one `runtime/rand`
+// uses for scalar keys.
+// The multiplier and increment are Knuth's 64-bit LCG constants, also used by
+// `shuffleOrder` below. Written in decimal because splitmix64's usual hex
+// constants (0x9E3779B97F4A7C15 and friends) do not fit a signed `int`.
+const mixMul: int = 6364136223846793005
+const mixInc: int = 1442695040888963407
+
+@nosplit function selectSeed(scr: *i64, task: int): int {
+  let c = *(scr + scrCounter) + 1
+  *(scr + scrCounter) = c
+  let x = task + c * mixMul
+  x = (x ^ (x >> 29)) * mixMul + mixInc
+  return x ^ (x >> 32)
+}
+
+// Fisher-Yates over the case order, so that "the first ready case wins" is a
+// uniform-random pick among the ready set. `chan.zig` shuffles the same array
+// for the same reason.
+@nosplit function shuffleOrder(order: *i64, n: int, seed: int) {
+  let state = seed
+  let i = n - 1
+  while (i > 0) {
+    state = state * 6364136223846793005 + 1442695040888963407
+    let r = (state >> 33) & 0x7FFFFFFF
+    let j = r % (i + 1)
+    let a = *(order + i)
+    *(order + i) = *(order + j)
+    *(order + j) = a
+    i = i - 1
+  }
+}
+
+// The address of case `i`'s channel.
+@nosplit function caseChan(cases: *i64, i: int): int {
+  return *(cases + i * selCaseWords + scChan)
+}
+
+// Sort `order` by channel address — insertion sort, `n <= chanMaxSelect`.
+//
+// THIS IS THE GLOBAL LOCK ORDER, and it is the only thing stopping two
+// concurrent selects that share two channels from deadlocking each other by
+// taking them in opposite orders. Sorting also puts duplicate channels adjacent,
+// which is what lets `lockAll` skip the second lock of a channel named by two
+// cases instead of self-deadlocking on it.
+@nosplit function sortByAddr(cases: *i64, order: *i64, n: int) {
+  let i = 1
+  while (i < n) {
+    let j = i
+    while (j > 0 && caseChan(cases, *(order + j - 1)) > caseChan(cases, *(order + j))) {
+      let a = *(order + j - 1)
+      *(order + j - 1) = *(order + j)
+      *(order + j) = a
+      j = j - 1
+    }
+    i = i + 1
+  }
+}
+
+@nosplit function lockAll(cases: *i64, order: *i64, n: int) {
+  let last = 0
+  let i = 0
+  while (i < n) {
+    let a = caseChan(cases, *(order + i))
+    if (a != last) {
+      spinAcquire(spinCellAt(taskAt(a), chLock))
+      last = a
+    }
+    i = i + 1
+  }
+}
+
+@nosplit function unlockAll(cases: *i64, order: *i64, n: int) {
+  let last = 0
+  let i = n
+  while (i > 0) {
+    i = i - 1
+    let a = caseChan(cases, *(order + i))
+    if (a != last) {
+      spinRelease(spinCellAt(taskAt(a), chLock))
+      last = a
+    }
+  }
+}
+
+// One non-blocking pass with every involved channel already locked. Returns the
+// firing case index, or `n` when nothing was ready. `chan.zig`'s `pollOnce`.
+@nosplit function pollOnce(cases: *i64, order: *i64, n: int, s: *i64): int {
+  let i = 0
+  while (i < n) {
+    let idx = *(order + i)
+    let c = cases + idx * selCaseWords
+    let ch = taskAt(*(c + scChan))
+    if (*(c + scDir) == chanDirRecv) {
+      let st = attemptRecv(ch, c + scWord, s)
+      if (st != rcvNone) {
+        if (st == rcvValue) {
+          *(c + scOk) = 1
+        } else {
+          *(c + scOk) = 0
+        }
+        return idx
+      }
+    } else {
+      if (*(ch + chClosed) != 0) {
+        // Ready, and it will report "send on closed channel" — exactly what a
+        // plain send does, rather than being skipped as not-ready.
+        *(c + scOk) = 0
+        return idx
+      }
+      if (attemptSend(ch, *(c + scWord), s)) {
+        *(c + scOk) = 1
+        return idx
+      }
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Block until exactly one of `n` cases can proceed, chosen uniformly at random
+// among those ready. `hasDefault` makes it a single non-blocking attempt.
+//
+// `n == 0` is `select {}`, which blocks forever — parking with nothing that can
+// ever wake it, matching the Zig.
+//
+// A nil-channel case is the caller's responsibility to omit, as in Go and as in
+// `chan.zig`: such a case is simply never ready and never wins.
+export @nosplit function chanSelect(cases: *i64, n: int, hasDefault: bool): int {
+  let task = schedCurrentTask()
+  let scr = scratchOf(task)
+
+  if (n == 0) {
+    schedPark()
+    return 0
+  }
+
+  // `order` and the shared block both live in this task's scratch, so no case
+  // of this select is reachable from any other task's memory.
+  let order = scr + scrOrder
+  let i = 0
+  while (i < n) {
+    *(order + i) = i
+    i = i + 1
+  }
+  sortByAddr(cases, order, n)
+
+  let s = taskAt(*(taskAt(caseChan(cases, 0)) + chSched))
+
+  // The poll runs in shuffled order; the LOCKS are taken in address order. The
+  // two orders are independent on purpose — fairness is about which ready case
+  // is chosen, deadlock-freedom is about the order the locks are taken in, and
+  // conflating them would sacrifice one for the other.
+  let shuffled = scr + scrShuffled
+  let k = 0
+  while (k < n) {
+    *(shuffled + k) = k
+    k = k + 1
+  }
+  shuffleOrder(shuffled, n, selectSeed(scr, task))
+
+  lockAll(cases, order, n)
+  let fired = pollOnce(cases, shuffled, n, s)
+  if (fired < n) {
+    unlockAll(cases, order, n)
+    return fired
+  }
+  if (hasDefault) {
+    unlockAll(cases, order, n)
+    return n
+  }
+
+  // Nothing ready and no default: register on every case, then park. As in the
+  // plain send/recv paths, registration happens under the SAME lock hold that
+  // observed nothing ready, so there is no gap for a waker to slip through and
+  // no recheck to perform.
+  *(scr + scrSelDone) = 0
+  *(scr + scrSelWinner) = 0
+  let sel = int(scr + scrSelDone)
+
+  let j = 0
+  while (j < n) {
+    let c = cases + j * selCaseWords
+    let ch = taskAt(*(c + scChan))
+    let w = nodeAt(scr, j)
+    *(w + wTask) = task
+    *(w + wElem) = int(c + scWord)
+    *(w + wOk) = int(c + scOk)
+    *(w + wSelect) = sel
+    *(w + wCase) = j
+    if (*(c + scDir) == chanDirRecv) {
+      wqPush(ch, chRecvHead, w)
+    } else {
+      wqPush(ch, chSendHead, w)
+    }
+    j = j + 1
+  }
+  unlockAll(cases, order, n)
+
+  schedPark()
+
+  // Woken by exactly one case. Every OTHER registration must come off its queue
+  // before this returns: the waiter nodes live in this task's scratch, and a
+  // stale queue entry pointing at one would be handed a value destined for a
+  // select that is no longer waiting. `chan.zig` unlinks here for the same
+  // reason — its nodes are on the returning stack frame.
+  //
+  // A case that was never registered is a harmless no-op, which is what makes
+  // `wqRemove` tolerant of an absent target.
+  let winner = *(scr + scrSelWinner)
+  lockAll(cases, order, n)
+  let m = 0
+  while (m < n) {
+    if (m != winner) {
+      let c = cases + m * selCaseWords
+      let ch = taskAt(*(c + scChan))
+      let w = nodeAt(scr, m)
+      if (*(c + scDir) == chanDirRecv) {
+        wqRemove(ch, chRecvHead, int(w))
+      } else {
+        wqRemove(ch, chSendHead, int(w))
+      }
+    }
+    m = m + 1
+  }
+  unlockAll(cases, order, n)
+  return winner
+}
