@@ -1405,6 +1405,24 @@ was false, and admitting a length mismatch that read uninitialized memory. The
 rule is stated here so the two cannot drift again (see
 tests/cases/check_array_literal.bit and run_array_value.bit).
 
+**Diagnostic order inside a composite literal is normative.** A literal is
+checked slot by slot in source order; the literal's own whole-literal rule (the
+E0050 length mismatch of `[N]T{...}`) is reported first, and for each slot the
+slot's *expression* is checked to completion — reporting everything nested
+inside it — before that slot's assignability to the declared slot type. A map
+entry interleaves at slot granularity: key expression, key assignability, value
+expression, value assignability. So in
+
+```
+Outer{ x: Inner{ a: "s" } }     // Outer.x is an int
+```
+
+the `a: "s"` mismatch is reported before the `x:` one, even though `x:` starts
+earlier in the source. Order is user-facing, and the two compilers must render
+byte-identical output, so it is fixed here rather than left to whichever
+traversal each implementation happens to use (#1489;
+tests/cases/check_composite_order.bit).
+
 ### 12.4 Calls, Variadics, Spread
 
 ```
