@@ -112,9 +112,10 @@ const real = "bit_rt_";
 /// and covering both platform halves means emitting — and reading back — both
 /// object formats.
 ///
-/// Only `runtime/root*` appears here, and that is the complete at-risk set
+/// `runtime/root*` and `runtime/net` appear here, the complete at-risk set
 /// rather than an arbitrary subset: the cycle is created by #1369's rename, and
-/// `bit_rt_root_` is the only prefix that rename touches. `runtime/alloc`'s
+/// `bit_rt_root_` is the only prefix that rename touches (SEAM 1 pins its net
+/// wrappers under it too, #1574). `runtime/alloc`'s
 /// `bit_rt_heap_*` and `runtime/gc`'s `bit_rt_port_*` pins are not ABI names
 /// (ABI.md names no allocator symbol), so no rename will ever collide them with
 /// an RtFn target. Add a module here the moment it starts pinning ABI names.
@@ -140,6 +141,16 @@ const modules = [_]Module{
     .{ .path = "runtime/root", .target = .x86_64_linux },
     .{ .path = "runtime/root/linux", .target = .x86_64_linux },
     .{ .path = "runtime/root/darwin", .target = .aarch64_macos },
+    // SEAM 1 (#1574): `runtime/net`'s `netabi.bit` pins the 12 `bit_rt_root_net_*`
+    // wrappers, so it joins the at-risk set. Its target is aarch64-macos, not a
+    // Linux triple: the wrappers reach the socket engine in `net/{linux,darwin}`
+    // by `extern function`, which §11.7 rejects on a Linux `--emit-obj` with no
+    // archive (E0078) but always accepts on Mach-O. The pin-cycle property is
+    // target-independent, so one target suffices. The `net/{linux,darwin}`
+    // providers are NOT listed: they pin only `bit_rt_port_net_*` (port-internal,
+    // never renamed), so the gate would find no `bit_rt_root_` symbol there and
+    // fail its own per-module vacuity check.
+    .{ .path = "runtime/net", .target = .aarch64_macos },
 };
 
 /// Upper bound on symbols in one object — keeps every walk below provably
