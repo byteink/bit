@@ -1,0 +1,593 @@
+// bit lsp (#1547) — the read-only queries: hover, goto-definition, document
+// symbols, and completion, ported from seed/lsp.zig. Sorts before lspserver.bit
+// so the dispatch there is lowered after these. Every query rebuilds the edited
+// directory's project (loadProjectOverlay -> resolveProject -> checkResolved)
+// through the shared `lspBuildProject` and reads the checker's own tables:
+// `nodeSymbols`/`symbols` (resolver handoff), `nodeTypes`, and `ctx`. There is no
+// snapshot cache — a whole-module recheck per request is correct and simple.
+// ponytail: cache the checked project per directory once round-trips show it
+// matters, exactly as the seed's `Server.snapshots` does.
+//
+// The re-model versus the seed: the seed keeps one AST tree per file and indexes
+// `node_symbols[file_idx][node]`; the selfhost concatenates a directory's files
+// into ONE tree, so a cursor's per-file (line,character) becomes a byte offset
+// within the file, then a module-global offset by adding `fileStarts[fileIdx]`.
+// `fileOf` maps a node span back to its file for the response URI/range.
+
+// A checked project for one directory: the loaded+resolved project, its per-module
+// checkers, and whether the type checker actually ran (no parse/resolve error).
+struct LspProject {
+  p: Project,
+  mods: []Checker,
+  checkedOk: bool,
+}
+
+// Loads, resolves, and (when clean) type-checks the module rooted at `dir` with
+// `overlays` substituted for open documents. `checkedOk` reports whether type
+// info is available, mirroring the seed's buildSnapshot gating.
+function lspBuildProject(overlays: map<string, string>, dir: string): LspProject {
+  let p = loadProjectOverlay(dir, "", stdRootPath(), overlays)
+  if (p.root < 0 || len(p.mods) == 0) {
+    return LspProject{ p: p, mods: []Checker(0), checkedOk: false }
+  }
+  let mods = resolveProject(p)
+  let ok = !hasErrors(p.diags)
+  if (ok) {
+    checkResolved(p, mods)
+  }
+  return LspProject{ p: p, mods: mods, checkedOk: ok }
+}
+
+// A located file within a built project's ROOT module: its index in the module's
+// file list, its own source text, and the module-global offset it begins at.
+struct LspFileLoc {
+  found: bool,
+  fileIdx: int,
+  fileSrc: string,
+  fileStart: int,
+}
+
+// Finds `path` among the root module's files. Matches on the full canonical path
+// first, then the basename (unique within a module directory).
+function lspLocateFile(lp: LspProject, path: string): LspFileLoc {
+  let m = lp.p.mods[lp.p.root]
+  let base = pathBase(path)
+  let fi = 0
+  while (fi < len(m.fileNames)) {
+    if (m.dir + "/" + m.fileNames[fi] == path || m.fileNames[fi] == base) {
+      return LspFileLoc{ found: true, fileIdx: fi,
+        fileSrc: fileSource(lp.p.sm, m.files[fi]), fileStart: m.fileStarts[fi] }
+    }
+    fi = fi + 1
+  }
+  return LspFileLoc{ found: false, fileIdx: 0, fileSrc: "", fileStart: 0 }
+}
+
+// The smallest tree node whose span contains `offset` ("touching" semantics: a
+// cursor at a token's end still matches it). Bounded walk (Power of 10).
+function lspNodeAt(tree: Tree, offset: int): int {
+  let current = tree.root
+  let depth = 0
+  while (depth < 256) {
+    let kids = kidsOf(tree, current)
+    let next = -1
+    let i = 0
+    while (i < len(kids)) {
+      let child = kids[i]
+      if (child != 0) {
+        let sp = getNode(tree, child).span
+        if (offset >= sp.start && offset <= sp.end) {
+          next = child
+          i = len(kids)
+        }
+      }
+      i = i + 1
+    }
+    if (next < 0) {
+      depth = 256
+    } else {
+      current = next
+      depth = depth + 1
+    }
+  }
+  return current
+}
+
+// The ancestor chain from the root down to the smallest node containing `offset`.
+// Dot-completion needs the spliced marker's immediate parent (the `member` node).
+function lspNodePath(tree: Tree, offset: int): []int {
+  let out = [tree.root]
+  let current = tree.root
+  let depth = 0
+  while (depth < 256) {
+    let kids = kidsOf(tree, current)
+    let next = -1
+    let i = 0
+    while (i < len(kids)) {
+      let child = kids[i]
+      if (child != 0) {
+        let sp = getNode(tree, child).span
+        if (offset >= sp.start && offset <= sp.end) {
+          next = child
+          i = len(kids)
+        }
+      }
+      i = i + 1
+    }
+    if (next < 0) {
+      depth = 256
+    } else {
+      out = append(out, next)
+      current = next
+      depth = depth + 1
+    }
+  }
+  return out
+}
+
+// ---- hover -----------------------------------------------------------------
+
+// The hover label for a symbol kind, matching seed/lsp.zig's symbolKindLabel.
+function lspSymbolKindLabel(k: SymbolKind): string {
+  if (k == SymbolKind.LetBinding) { return "let" }
+  if (k == SymbolKind.ConstBinding) { return "const" }
+  if (k == SymbolKind.Param) { return "param" }
+  if (k == SymbolKind.Receiver) { return "receiver" }
+  if (k == SymbolKind.GenericParam) { return "type param" }
+  if (k == SymbolKind.Func) { return "func" }
+  if (k == SymbolKind.TypeAlias) { return "type" }
+  if (k == SymbolKind.StructType) { return "struct" }
+  if (k == SymbolKind.InterfaceType) { return "interface" }
+  if (k == SymbolKind.EnumType) { return "enum" }
+  if (k == SymbolKind.ImportNamespace || k == SymbolKind.ImportItem) { return "import" }
+  if (k == SymbolKind.BuiltinType) { return "type" }
+  if (k == SymbolKind.BuiltinFunc) { return "func" }
+  return "?"
+}
+
+// Hover markdown for `node`: `kind name` from its resolved symbol, `: type` from
+// the checker's per-node type. "" when neither is available. Doc-comment hover is
+// deferred until fmt's comment collector ports (#1345).
+function lspHoverText(c: Checker, node: int): string {
+  let inner = ""
+  let sid = 0
+  if (node > 0 && node < len(c.nodeSymbols)) {
+    sid = c.nodeSymbols[node]
+  }
+  if (sid > 0 && sid < len(c.symbols)) {
+    let sym = c.symbols[sid]
+    inner = lspSymbolKindLabel(sym.kind) + " " + sym.name
+  }
+  let ty = 0
+  if (node > 0 && node < len(c.nodeTypes)) {
+    ty = c.nodeTypes[node]
+  }
+  // `nodeTypes` is only fully populated by the `--dump-types` walk (binders get
+  // an entry during the normal check, expression usages do not), so an
+  // identifier/member/call the user hovers on falls back to re-deriving its type
+  // the same way the checker does. Any diagnostics/instantiations this produces
+  // land in the throwaway per-request project and are discarded.
+  if (ty <= 0 && node > 0) {
+    let tag = getNode(c.tree, node).tag
+    if (isLeafTag(tag) || tag == Tag.Member || tag == Tag.Call) {
+      ty = checkExprType(c, node)
+    }
+  }
+  if (ty > 0) { // 0 == the Invalid type
+    if (inner == "") {
+      let sp = getNode(c.tree, node).span
+      inner = c.source[sp.start:sp.end]
+    }
+    inner = inner + ": " + typeName(c.ctx, ty)
+  }
+  if (inner == "") {
+    return ""
+  }
+  return "```bit\n" + inner + "\n```"
+}
+
+function lspOnHover(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+  let tdp = lspTextDocPosition(d, params)
+  if (!tdp.ok) {
+    lspRespond(idText, "null")
+    return
+  }
+  let path = lspUriToPath(tdp.uri)
+  if (path == "") {
+    lspRespond(idText, "null")
+    return
+  }
+  let lp = lspBuildProject(overlays, pathDir(path))
+  if (len(lp.mods) == 0 || !lp.checkedOk) {
+    lspRespond(idText, "null")
+    return
+  }
+  let loc = lspLocateFile(lp, path)
+  if (!loc.found) {
+    lspRespond(idText, "null")
+    return
+  }
+  let c = lp.mods[lp.p.root]
+  let offset = loc.fileStart + lspPosToByte(loc.fileSrc, tdp.pos)
+  let node = lspNodeAt(c.tree, offset)
+  if (node == 0) {
+    lspRespond(idText, "null")
+    return
+  }
+  let text = lspHoverText(c, node)
+  if (text == "") {
+    lspRespond(idText, "null")
+    return
+  }
+  lspRespond(idText, "{\"contents\":{\"kind\":\"markdown\",\"value\":" +
+    jsonEncodeString(text) + "}}")
+}
+
+// ---- definition ------------------------------------------------------------
+
+// The identifier span to highlight for a declaring node: a func's name is kid 1
+// (kid 0 is the optional receiver); struct/interface/enum/alias names are kid 0;
+// everything else already points at its own name. Matches seed/lsp.zig's
+// defNameSpan.
+function lspDefNameSpan(tree: Tree, decl: int): Span {
+  let n = getNode(tree, decl)
+  if (n.tag == Tag.FuncDecl) {
+    return getNode(tree, kidsOf(tree, decl)[1]).span
+  }
+  if (n.tag == Tag.StructDecl || n.tag == Tag.InterfaceDecl ||
+      n.tag == Tag.EnumDecl || n.tag == Tag.TypeAlias) {
+    return getNode(tree, kidsOf(tree, decl)[0]).span
+  }
+  return n.span
+}
+
+// A module-global span rendered as an LSP Location `{"uri":...,"range":...}`
+// against the file it falls in. `fileOf` maps the global offset to a file; the
+// range is computed against that file's own text with a per-file offset.
+function lspSpanLocationJson(p: Project, span: Span): string {
+  let m = p.mods[p.root]
+  let fl = fileOf(m.fileStarts, span.start)
+  let src = fileSource(p.sm, m.files[fl.fileIdx])
+  let start = fl.offset
+  let end = fl.offset + (span.end - span.start)
+  let uri = lspPathToUri(m.dir + "/" + m.fileNames[fl.fileIdx])
+  return "{\"uri\":" + jsonEncodeString(uri) + ",\"range\":" +
+    lspRangeJson(lspSpanToRange(src, start, end)) + "}"
+}
+
+function lspOnDefinition(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+  let tdp = lspTextDocPosition(d, params)
+  if (!tdp.ok) {
+    lspRespond(idText, "null")
+    return
+  }
+  let path = lspUriToPath(tdp.uri)
+  if (path == "") {
+    lspRespond(idText, "null")
+    return
+  }
+  let lp = lspBuildProject(overlays, pathDir(path))
+  if (len(lp.mods) == 0) {
+    lspRespond(idText, "null")
+    return
+  }
+  let loc = lspLocateFile(lp, path)
+  if (!loc.found) {
+    lspRespond(idText, "null")
+    return
+  }
+  let c = lp.mods[lp.p.root]
+  let offset = loc.fileStart + lspPosToByte(loc.fileSrc, tdp.pos)
+  let node = lspNodeAt(c.tree, offset)
+  let sid = 0
+  if (node > 0 && node < len(c.nodeSymbols)) {
+    sid = c.nodeSymbols[node]
+  }
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    lspRespond(idText, "null")
+    return
+  }
+  let sym = c.symbols[sid]
+  // A symbol with no declaration node (a builtin, or a name imported from another
+  // module) has nothing to jump to in this module's tree.
+  if (sym.decl == 0 || sym.importedFromModule >= 0) {
+    lspRespond(idText, "null")
+    return
+  }
+  lspRespond(idText, lspSpanLocationJson(lp.p, lspDefNameSpan(c.tree, sym.decl)))
+}
+
+// ---- document symbols ------------------------------------------------------
+
+// The LSP SymbolKind for a top-level decl, matching seed/lsp.zig's symbolInfoKind.
+function lspDocSymKind(tag: Tag, hasReceiver: bool): int {
+  if (tag == Tag.FuncDecl) {
+    if (hasReceiver) { return 6 } // Method
+    return 12 // Function
+  }
+  if (tag == Tag.StructDecl) { return 23 }
+  if (tag == Tag.InterfaceDecl) { return 11 }
+  if (tag == Tag.EnumDecl) { return 10 } // Enum
+  if (tag == Tag.TypeAlias) { return 5 } // Class
+  if (tag == Tag.ConstDecl) { return 14 } // Constant
+  return 13 // Variable
+}
+
+// Appends the SymbolInformation JSON for the name at `nameNode` (a module-global
+// span) to `items`, skipping the blank `_`. Returns the possibly-extended list.
+function lspAppendDocSym(items: []string, p: Project, nameNode: int, kind: int): []string {
+  if (nameNode == 0) {
+    return items
+  }
+  let m = p.mods[p.root]
+  let sp = getNode(m.tree, nameNode).span
+  let name = m.source[sp.start:sp.end]
+  if (name == "_") {
+    return items
+  }
+  let entry = "{\"name\":" + jsonEncodeString(name) + ",\"kind\":${kind},\"location\":" +
+    lspSpanLocationJson(p, sp) + "}"
+  return append(items, entry)
+}
+
+// Collects the document symbols for the decls that live in `fileIdx` of the root
+// module — filtered by file because the concatenated tree holds every file's
+// decls under one root.
+function lspDocumentSymbols(lp: LspProject, fileIdx: int): []string {
+  let p = lp.p
+  let m = p.mods[p.root]
+  let tree = m.tree
+  let items = []string(0)
+  let decls = kidsOf(tree, tree.root)
+  let di = 0
+  while (di < len(decls)) {
+    let node = decls[di]
+    di = di + 1
+    if (node == 0) {
+      continue
+    }
+    // Only decls whose text begins in the requested file.
+    if (fileOf(m.fileStarts, getNode(tree, node).span.start).fileIdx != fileIdx) {
+      continue
+    }
+    if (getNode(tree, node).tag == Tag.Export) {
+      node = kidsOf(tree, node)[0]
+      if (node == 0) {
+        continue
+      }
+    }
+    let tag = getNode(tree, node).tag
+    if (tag == Tag.FuncDecl) {
+      let k = kidsOf(tree, node)
+      items = lspAppendDocSym(items, p, k[1], lspDocSymKind(tag, k[0] != 0))
+    } else if (tag == Tag.StructDecl || tag == Tag.InterfaceDecl ||
+        tag == Tag.EnumDecl || tag == Tag.TypeAlias) {
+      items = lspAppendDocSym(items, p, kidsOf(tree, node)[0], lspDocSymKind(tag, false))
+    } else if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+      let kind = lspDocSymKind(tag, false)
+      for binding of kidsOf(tree, node) {
+        if (binding != 0) {
+          items = lspAppendDocSymPattern(items, p, kidsOf(tree, binding)[0], kind)
+        }
+      }
+    }
+  }
+  return items
+}
+
+// A binding pattern's names: a bare identifier, or every element of a tuple
+// pattern (a destructuring `let (a, b) = ...`).
+function lspAppendDocSymPattern(items: []string, p: Project, pat: int, kind: int): []string {
+  if (pat == 0) {
+    return items
+  }
+  if (getNode(p.mods[p.root].tree, pat).tag == Tag.TuplePat) {
+    let out = items
+    for sub of kidsOf(p.mods[p.root].tree, pat) {
+      out = lspAppendDocSymPattern(out, p, sub, kind)
+    }
+    return out
+  }
+  return lspAppendDocSym(items, p, pat, kind)
+}
+
+function lspOnDocumentSymbol(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+  let doc = jsonGet(d, params, "textDocument")
+  let uri = jsonStrOf(d, jsonGet(d, doc, "uri"))
+  if (uri == "") {
+    lspRespond(idText, "[]")
+    return
+  }
+  let path = lspUriToPath(uri)
+  if (path == "") {
+    lspRespond(idText, "[]")
+    return
+  }
+  let lp = lspBuildProject(overlays, pathDir(path))
+  if (len(lp.mods) == 0) {
+    lspRespond(idText, "[]")
+    return
+  }
+  let loc = lspLocateFile(lp, path)
+  if (!loc.found) {
+    lspRespond(idText, "[]")
+    return
+  }
+  let items = lspDocumentSymbols(lp, loc.fileIdx)
+  lspRespond(idText, "[" + lspJoinComma(items) + "]")
+}
+
+// ---- completion ------------------------------------------------------------
+
+// The LSP CompletionItemKind for a symbol kind, matching seed/lsp.zig's
+// completionKind.
+function lspCompletionKind(k: SymbolKind): int {
+  if (k == SymbolKind.Func || k == SymbolKind.BuiltinFunc) { return 3 } // Function
+  if (k == SymbolKind.StructType) { return 22 } // Struct
+  if (k == SymbolKind.InterfaceType) { return 8 } // Interface
+  if (k == SymbolKind.TypeAlias || k == SymbolKind.BuiltinType) { return 7 } // Class
+  if (k == SymbolKind.ConstBinding) { return 21 } // Constant
+  if (k == SymbolKind.ImportNamespace || k == SymbolKind.ImportItem) { return 9 } // Module
+  return 6 // Variable
+}
+
+function lspCompletionItemJson(label: string, kind: int, detail: string, hasDetail: bool): string {
+  let s = "{\"label\":" + jsonEncodeString(label) + ",\"kind\":${kind}"
+  if (hasDetail) {
+    s = s + ",\"detail\":" + jsonEncodeString(detail)
+  }
+  return s + "}"
+}
+
+function lspCompletionList(items: []string): string {
+  return "{\"isIncomplete\":false,\"items\":[" + lspJoinComma(items) + "]}"
+}
+
+// Module-scope completion: every top-level and imported name visible in the root
+// module. Reads the resolver's symbol table, keeping module-scoped decls,
+// namespace aliases, and imported names (including the auto-imported prelude);
+// locals and params are excluded, matching the seed's `all_names`.
+function lspScopeCompletion(c: Checker): string {
+  let items = []string(0)
+  let seen = map<string, bool>{}
+  let i = 1 // symbol 0 is the reserved none/poison sentinel
+  while (i < len(c.symbols)) {
+    let sym = c.symbols[i]
+    i = i + 1
+    let visible = sym.moduleScoped || sym.kind == SymbolKind.ImportItem ||
+      sym.kind == SymbolKind.ImportNamespace
+    if (!visible || sym.name == "" || sym.name == "_") {
+      continue
+    }
+    let (_, dup) = seen[sym.name]
+    if (dup) {
+      continue
+    }
+    seen[sym.name] = true
+    items = append(items, lspCompletionItemJson(sym.name, lspCompletionKind(sym.kind), "", false))
+  }
+  return lspCompletionList(items)
+}
+
+// The completion-item detail for a struct field / method: its type name.
+function lspTypeDetail(ctx: TypeContext, id: int): string {
+  return typeName(ctx, id)
+}
+
+// `.`-completion for a receiver of type `recvType`: its struct fields and its
+// methods (which, for an interface receiver, are the interface's methods). Reads
+// `ctx.structFields` (keyed "typeId.field") and `ctx.typeMethodNames` /
+// `ctx.methodSigs` (keyed "typeId" / "typeId.member").
+function lspMemberCompletion(ctx: TypeContext, recvType: int): string {
+  let items = []string(0)
+  let prefix = "${recvType}."
+  for (k, v) of ctx.structFields {
+    if (len(k) > len(prefix) && k[0:len(prefix)] == prefix) {
+      let field = k[len(prefix):len(k)]
+      items = append(items, lspCompletionItemJson(field, 5, lspTypeDetail(ctx, v), true))
+    }
+  }
+  let (names, ok) = ctx.typeMethodNames["${recvType}"]
+  if (ok) {
+    let mi = 0
+    while (mi < len(names)) {
+      let name = names[mi]
+      mi = mi + 1
+      let (sig, hasSig) = ctx.methodSigs["${recvType}.${name}"]
+      if (hasSig) {
+        items = append(items, lspCompletionItemJson(name, 2, lspTypeDetail(ctx, sig), true))
+      } else {
+        items = append(items, lspCompletionItemJson(name, 2, "", false))
+      }
+    }
+  }
+  return lspCompletionList(items)
+}
+
+function lspOnCompletion(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+  let empty = lspCompletionList([]string(0))
+  let tdp = lspTextDocPosition(d, params)
+  if (!tdp.ok) {
+    lspRespond(idText, empty)
+    return
+  }
+  let path = lspUriToPath(tdp.uri)
+  if (path == "") {
+    lspRespond(idText, empty)
+    return
+  }
+  let dir = pathDir(path)
+  let (text, isOpen) = overlays[path]
+  if (!isOpen) {
+    lspRespond(idText, empty)
+    return
+  }
+  let fileOffset = lspPosToByte(text, tdp.pos)
+  let dotBefore = fileOffset > 0 && text[fileOffset - 1] == u8('.')
+  if (!dotBefore) {
+    let lp = lspBuildProject(overlays, dir)
+    if (len(lp.mods) == 0 || !lp.checkedOk) {
+      lspRespond(idText, empty)
+      return
+    }
+    lspRespond(idText, lspScopeCompletion(lp.mods[lp.p.root]))
+    return
+  }
+  lspDotCompletion(overlays, dir, path, text, fileOffset, idText)
+}
+
+// Splices a throwaway identifier at the cursor so the receiver before the bare
+// `.` still parses, rebuilds against that overlay, and lists the receiver type's
+// members. The seed's "dummy identifier" technique — cheaper than teaching the
+// parser to accept an incomplete member expression.
+function lspDotCompletion(overlays: map<string, string>, dir: string, path: string,
+    text: string, fileOffset: int, idText: string) {
+  let empty = lspCompletionList([]string(0))
+  let marker = "zqx"
+  let spliced = text[0:fileOffset] + marker + text[fileOffset:len(text)]
+  // A fresh overlay map with the splice, so the server's real overlays are
+  // untouched (a struct/map is a reference in Bit).
+  let ov = map<string, string>{}
+  for (k, v) of overlays {
+    ov[k] = v
+  }
+  ov[path] = spliced
+  let lp = lspBuildProject(ov, dir)
+  if (len(lp.mods) == 0 || !lp.checkedOk) {
+    lspRespond(idText, empty)
+    return
+  }
+  let loc = lspLocateFile(lp, path)
+  if (!loc.found) {
+    lspRespond(idText, empty)
+    return
+  }
+  let c = lp.mods[lp.p.root]
+  let offset = loc.fileStart + fileOffset
+  let path2 = lspNodePath(c.tree, offset)
+  if (len(path2) < 2) {
+    lspRespond(idText, empty)
+    return
+  }
+  let markerNode = path2[len(path2) - 1]
+  let parent = path2[len(path2) - 2]
+  if (getNode(c.tree, parent).tag != Tag.Member) {
+    lspRespond(idText, empty)
+    return
+  }
+  let mk = kidsOf(c.tree, parent)
+  if (mk[1] != markerNode) {
+    lspRespond(idText, empty)
+    return
+  }
+  // The receiver's type is re-derived here rather than read from `nodeTypes`:
+  // that map is only fully populated by the `--dump-types` walk, not the normal
+  // check, so an expression receiver has no entry. `checkExprType` is what
+  // `checkMember` itself uses to type a receiver.
+  let recvType = checkExprType(c, mk[0])
+  if (recvType <= 0) {
+    lspRespond(idText, empty)
+    return
+  }
+  lspRespond(idText, lspMemberCompletion(c.ctx, recvType))
+}

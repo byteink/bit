@@ -1,0 +1,483 @@
+// bit lsp (#1547) — the server: JSON-RPC framing over stdio, message dispatch,
+// the document-sync lifecycle, and diagnostics publishing. Ported from
+// seed/lsp.zig. Sorts last among the `lsp*.bit` siblings so the query methods it
+// dispatches to (lspquery.bit) and the pure helpers (lspbase.bit) are lowered
+// first.
+//
+// Output goes through the `print` builtin, which writes straight to fd 1 with no
+// buffering (runtime/root.zig bit_rt_print), so every framed message is flushed
+// the moment it is written — what a long-running language server needs. Input is
+// read through a small buffered reader over the `fsRead` primitive rather than
+// std/io's Reader: the rest of selfhost is deliberately Option-free and imports
+// no stdlib, and rolling the reader here (returning plain strings, "" for EOF)
+// keeps the compiler self-contained. It implements the same read-a-line /
+// read-N-bytes contract std/io's readLine+readBytes (#1596) offer.
+
+// ---- input: a buffered reader over fsRead ---------------------------------
+
+// A reader over file descriptor `fd`, with `buf` holding bytes pulled but not yet
+// consumed. A negative `fd` is a SEALED reader whose `buf` is all the input there
+// will ever be — the in-memory form the framing self-check drives.
+struct LspReader {
+  fd: int,
+  buf: string,
+}
+
+function lspStdinReader(): LspReader {
+  return LspReader{ fd: 0, buf: "" }
+}
+
+// A reader whose entire input is `s`; it never touches a descriptor.
+function lspReaderOverString(s: string): LspReader {
+  return LspReader{ fd: -1, buf: s }
+}
+
+// Pulls the next chunk from the descriptor, or "" for a sealed reader / EOF.
+function lspReaderRefill(r: LspReader): string {
+  if (r.fd < 0) {
+    return ""
+  }
+  return fsRead(r.fd, 4096)
+}
+
+// The index of the first '\n' in `s`, or -1.
+function lspIndexNewline(s: string): int {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == u8('\n')) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// One line without its trailing '\n', mirroring std/io's readLine: a final
+// newline-less line is still returned. `ok` is false only at true end of input.
+struct LspLine {
+  ok: bool,
+  text: string,
+}
+
+function lspReadLine(r: LspReader): LspLine {
+  let line = ""
+  while (true) {
+    let nl = lspIndexNewline(r.buf)
+    if (nl >= 0) {
+      line = line + r.buf[0:nl]
+      r.buf = r.buf[nl + 1:len(r.buf)]
+      return LspLine{ ok: true, text: line }
+    }
+    line = line + r.buf
+    r.buf = ""
+    let chunk = lspReaderRefill(r)
+    if (len(chunk) == 0) {
+      if (len(line) == 0) {
+        return LspLine{ ok: false, text: "" }
+      }
+      return LspLine{ ok: true, text: line }
+    }
+    r.buf = chunk
+  }
+  return LspLine{ ok: false, text: "" }
+}
+
+// Exactly `n` bytes, or fewer only when input truly ends first — std/io's
+// readBytes contract. Consumes any bytes a prior readLine left buffered before
+// refilling, so header lines and the counted body come off one stream.
+function lspReadN(r: LspReader, n: int): string {
+  let out = ""
+  while (len(out) < n) {
+    if (len(r.buf) == 0) {
+      let chunk = lspReaderRefill(r)
+      if (len(chunk) == 0) {
+        return out
+      }
+      r.buf = chunk
+    }
+    let take = n - len(out)
+    if (take > len(r.buf)) {
+      take = len(r.buf)
+    }
+    out = out + r.buf[0:take]
+    r.buf = r.buf[take:len(r.buf)]
+  }
+  return out
+}
+
+// ---- JSON-RPC framing ------------------------------------------------------
+
+// `ok` is false at end of stream or on a header block missing Content-Length.
+struct LspMessage {
+  ok: bool,
+  body: string,
+}
+
+// Lowercases an ASCII byte, for the case-insensitive header-name compare.
+function lspLowerByte(b: u8): u8 {
+  if (b >= u8('A') && b <= u8('Z')) {
+    return u8(int(b) + 32)
+  }
+  return b
+}
+
+// True when `line` is a `Content-Length:` header (name compared case-insensitively).
+function lspIsContentLength(line: string): bool {
+  let key = "content-length:"
+  if (len(line) < len(key)) {
+    return false
+  }
+  let i = 0
+  while (i < len(key)) {
+    if (lspLowerByte(line[i]) != key[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// The integer after the colon of a header line (leading spaces/tabs skipped).
+function lspHeaderIntValue(line: string): int {
+  let i = 0
+  while (i < len(line) && line[i] != u8(':')) {
+    i = i + 1
+  }
+  i = i + 1
+  while (i < len(line) && (line[i] == u8(' ') || line[i] == u8('\t'))) {
+    i = i + 1
+  }
+  let n = 0
+  while (i < len(line) && line[i] >= u8('0') && line[i] <= u8('9')) {
+    n = n * 10 + (int(line[i]) - int(u8('0')))
+    i = i + 1
+  }
+  return n
+}
+
+// Reads one framed message: the header block (bounded at 32 lines), then exactly
+// Content-Length body bytes. `ok` false at EOF or on a malformed/absent length.
+function lspReadMessage(r: LspReader): LspMessage {
+  let contentLength = -1
+  let lines = 0
+  while (lines < 32) {
+    lines = lines + 1
+    let ln = lspReadLine(r)
+    if (!ln.ok) {
+      return LspMessage{ ok: false, body: "" }
+    }
+    let line = ln.text
+    if (len(line) > 0 && line[len(line) - 1] == u8('\r')) {
+      line = line[0:len(line) - 1]
+    }
+    if (len(line) == 0) {
+      lines = 32 // blank line ends the header block
+    } else if (lspIsContentLength(line)) {
+      contentLength = lspHeaderIntValue(line)
+    }
+  }
+  if (contentLength < 0) {
+    return LspMessage{ ok: false, body: "" }
+  }
+  let body = lspReadN(r, contentLength)
+  if (len(body) < contentLength) {
+    return LspMessage{ ok: false, body: "" }
+  }
+  return LspMessage{ ok: true, body: body }
+}
+
+// The `Content-Length: N\r\n\r\n<body>` wire form of `body`.
+function lspFrame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+// Writes a framed message to stdout, flushed immediately (print is unbuffered).
+function lspWrite(body: string) {
+  print(lspFrame(body))
+}
+
+// ---- output helpers --------------------------------------------------------
+
+// The JSON text of a single parsed node (an echoed request id).
+function lspNodeText(d: JsonDoc, id: int): string {
+  return string(jsonWriteNode([]u8(0), d, id))
+}
+
+// A JSON-RPC success response echoing `idText` with `resultJson` verbatim.
+function lspRespondRaw(idText: string, resultJson: string) {
+  lspWrite("{\"jsonrpc\":\"2.0\",\"id\":" + idText + ",\"result\":" + resultJson + "}")
+}
+
+// The name query methods call; the id text is threaded to them already rendered.
+function lspRespond(idText: string, resultJson: string) {
+  lspRespondRaw(idText, resultJson)
+}
+
+function lspRespondError(idText: string, code: int, message: string) {
+  lspWrite("{\"jsonrpc\":\"2.0\",\"id\":" + idText + ",\"error\":{\"code\":${code}," +
+    "\"message\":" + jsonEncodeString(message) + "}}")
+}
+
+function lspNotify(method: string, paramsJson: string) {
+  lspWrite("{\"jsonrpc\":\"2.0\",\"method\":" + jsonEncodeString(method) +
+    ",\"params\":" + paramsJson + "}")
+}
+
+// Joins `items` with commas — the array body for a document-symbol or completion
+// list already rendered element-by-element.
+function lspJoinComma(items: []string): string {
+  let out = ""
+  let i = 0
+  while (i < len(items)) {
+    if (i > 0) {
+      out = out + ","
+    }
+    out = out + items[i]
+    i = i + 1
+  }
+  return out
+}
+
+// ---- request-param decoding ------------------------------------------------
+
+// A `textDocument/position` request's URI and 0-based position.
+struct LspTdp {
+  ok: bool,
+  uri: string,
+  pos: LspPos,
+}
+
+function lspTextDocPosition(d: JsonDoc, params: int): LspTdp {
+  let doc = jsonGet(d, params, "textDocument")
+  let uri = jsonStrOf(d, jsonGet(d, doc, "uri"))
+  if (uri == "") {
+    return LspTdp{ ok: false, uri: "", pos: LspPos{ line: 0, character: 0 } }
+  }
+  let posNode = jsonGet(d, params, "position")
+  let line = jsonIntOf(d, jsonGet(d, posNode, "line"))
+  let character = jsonIntOf(d, jsonGet(d, posNode, "character"))
+  if (line < 0 || character < 0) {
+    return LspTdp{ ok: false, uri: "", pos: LspPos{ line: 0, character: 0 } }
+  }
+  return LspTdp{ ok: true, uri: uri, pos: LspPos{ line: line, character: character } }
+}
+
+// ---- server state ----------------------------------------------------------
+
+// The server's mutable state across messages: the open documents' unsaved buffers
+// (absolute path -> text), substituted for disk contents on every recheck.
+struct LspServer {
+  overlays: map<string, string>,
+  shuttingDown: bool,
+}
+
+function newLspServer(): LspServer {
+  return LspServer{ overlays: map<string, string>{}, shuttingDown: false }
+}
+
+// ---- dispatch --------------------------------------------------------------
+
+// Parses one message body and routes it: a message with an `id` is a request
+// (gets a reply), one without is a notification (never replied to). A malformed
+// body is dropped, matching the seed.
+function lspHandleMessage(server: LspServer, body: string) {
+  let d = jsonParse(body)
+  if (!d.ok) {
+    return
+  }
+  if (jsonKindOf(d, d.root) != JsonKind.Obj) {
+    return
+  }
+  let method = jsonStrOf(d, jsonGet(d, d.root, "method"))
+  if (method == "") {
+    return
+  }
+  let params = jsonGet(d, d.root, "params")
+  let idNode = jsonGet(d, d.root, "id")
+  if (idNode >= 0) {
+    lspHandleRequest(server, method, d, params, lspNodeText(d, idNode))
+  } else {
+    lspHandleNotification(server, method, d, params)
+  }
+}
+
+function lspInitializeResult(): string {
+  return "{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true," +
+    "\"definitionProvider\":true,\"documentSymbolProvider\":true," +
+    "\"completionProvider\":{\"triggerCharacters\":[\".\"]}}," +
+    "\"serverInfo\":{\"name\":\"bitls\",\"version\":\"0.0.0\"}}"
+}
+
+function lspHandleRequest(server: LspServer, method: string, d: JsonDoc, params: int, idText: string) {
+  if (method == "initialize") {
+    lspRespond(idText, lspInitializeResult())
+    return
+  }
+  if (method == "shutdown") {
+    server.shuttingDown = true
+    lspRespond(idText, "null")
+    return
+  }
+  if (method == "textDocument/hover") {
+    lspOnHover(server.overlays, d, params, idText)
+    return
+  }
+  if (method == "textDocument/definition") {
+    lspOnDefinition(server.overlays, d, params, idText)
+    return
+  }
+  if (method == "textDocument/completion") {
+    lspOnCompletion(server.overlays, d, params, idText)
+    return
+  }
+  if (method == "textDocument/documentSymbol") {
+    lspOnDocumentSymbol(server.overlays, d, params, idText)
+    return
+  }
+  lspRespondError(idText, -32601, "method not found")
+}
+
+function lspHandleNotification(server: LspServer, method: string, d: JsonDoc, params: int) {
+  if (method == "textDocument/didOpen") {
+    lspOnDidOpen(server, d, params)
+    return
+  }
+  if (method == "textDocument/didChange") {
+    lspOnDidChange(server, d, params)
+    return
+  }
+  if (method == "textDocument/didClose") {
+    lspOnDidClose(server, d, params)
+    return
+  }
+  // initialized, didSave, exit, $/cancelRequest, ...: no state to update.
+}
+
+// ---- document sync ---------------------------------------------------------
+
+function lspOnDidOpen(server: LspServer, d: JsonDoc, params: int) {
+  let doc = jsonGet(d, params, "textDocument")
+  let uri = jsonStrOf(d, jsonGet(d, doc, "uri"))
+  let text = jsonStrOf(d, jsonGet(d, doc, "text"))
+  if (uri == "") {
+    return
+  }
+  let path = lspUriToPath(uri)
+  if (path == "") {
+    return
+  }
+  server.overlays[path] = text
+  lspRecheckAndPublish(server, pathDir(path))
+}
+
+function lspOnDidChange(server: LspServer, d: JsonDoc, params: int) {
+  let doc = jsonGet(d, params, "textDocument")
+  let uri = jsonStrOf(d, jsonGet(d, doc, "uri"))
+  if (uri == "") {
+    return
+  }
+  let changes = jsonGet(d, params, "contentChanges")
+  let n = jsonLen(d, changes)
+  if (n == 0) {
+    return
+  }
+  // Full sync (textDocumentSync = 1): the last change's `text` is the whole doc.
+  let text = jsonStrOf(d, jsonGet(d, jsonAt(d, changes, n - 1), "text"))
+  let path = lspUriToPath(uri)
+  if (path == "") {
+    return
+  }
+  server.overlays[path] = text
+  lspRecheckAndPublish(server, pathDir(path))
+}
+
+function lspOnDidClose(server: LspServer, d: JsonDoc, params: int) {
+  let doc = jsonGet(d, params, "textDocument")
+  let uri = jsonStrOf(d, jsonGet(d, doc, "uri"))
+  if (uri == "") {
+    return
+  }
+  let path = lspUriToPath(uri)
+  if (path == "") {
+    return
+  }
+  delete(server.overlays, path)
+  lspRecheckAndPublish(server, pathDir(path))
+}
+
+// ---- diagnostics -----------------------------------------------------------
+
+// The LSP DiagnosticSeverity for a Bit severity (0 error / 1 warning / 2 note).
+function lspSeverity(s: int): int {
+  if (s == 1) {
+    return 2 // Warning
+  }
+  if (s == 2) {
+    return 4 // Hint
+  }
+  return 1 // Error
+}
+
+// One diagnostic as LSP JSON. `src` is the file's own text and the span is
+// already per-file (remapDiags rewrote it), so the range needs no fileStart.
+function lspDiagnosticJson(src: string, dg: Diagnostic): string {
+  return "{\"range\":" + lspRangeJson(lspSpanToRange(src, dg.span.start, dg.span.end)) +
+    ",\"severity\":${lspSeverity(dg.severity)},\"code\":" +
+    jsonEncodeString(codeString(dg.code)) + ",\"source\":\"bitls\",\"message\":" +
+    jsonEncodeString(dg.message) + "}"
+}
+
+// Rebuilds `dir`'s project against the overlays and publishes one
+// `publishDiagnostics` per root-module file. Errors from the rebuild would only
+// mean a vanished directory; there is nothing to publish then, so it is skipped.
+function lspRecheckAndPublish(server: LspServer, dir: string) {
+  let lp = lspBuildProject(server.overlays, dir)
+  if (len(lp.mods) == 0) {
+    return
+  }
+  lspPublishDiagnostics(lp.p)
+}
+
+// Publishes diagnostics for the ROOT module's files only — the prelude and
+// imported stdlib modules were loaded for name resolution but the user never
+// opened them. Diagnostics are keyed by SourceManager FileId, so each file gets
+// exactly the diagnostics whose span names it.
+function lspPublishDiagnostics(p: Project) {
+  let m = p.mods[p.root]
+  let fi = 0
+  while (fi < len(m.fileNames)) {
+    let fileId = m.files[fi]
+    let uri = lspPathToUri(m.dir + "/" + m.fileNames[fi])
+    let src = fileSource(p.sm, fileId)
+    let items = []string(0)
+    let i = 0
+    while (i < len(p.diags.list)) {
+      let dg = p.diags.list[i]
+      i = i + 1
+      if (dg.span.file == fileId) {
+        items = append(items, lspDiagnosticJson(src, dg))
+      }
+    }
+    lspNotify("textDocument/publishDiagnostics",
+      "{\"uri\":" + jsonEncodeString(uri) + ",\"diagnostics\":[" + lspJoinComma(items) + "]}")
+    fi = fi + 1
+  }
+}
+
+// ---- run loop --------------------------------------------------------------
+
+// The `bit lsp` entry: read framed messages from stdin and handle each until the
+// stream ends. Called from main's `lsp` arm.
+function lspRun() {
+  let server = newLspServer()
+  let r = lspStdinReader()
+  let guard = 0
+  while (guard < 1000000) {
+    let msg = lspReadMessage(r)
+    if (!msg.ok) {
+      return
+    }
+    lspHandleMessage(server, msg.body)
+    guard = guard + 1
+  }
+}
