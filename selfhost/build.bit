@@ -1,0 +1,465 @@
+// bit — the build half of the driver: the target selection, the IR pipeline,
+// and the `build` / `run` / `test` / `ar` subcommands. Split out of main.bit
+// (#1503); a sibling .bit file is the same module, so nothing else changes.
+
+// The native binary target `build` produces. `--target` cross-produces the
+// others, which only their own host can execute.
+enum BuildTarget {
+  X86_64Linux,
+  Aarch64Linux,
+  Aarch64Macos,
+}
+
+// The BuildTarget named by a triple, or -1. Bit has no int->enum cast, so this
+// returns an ordinal that buildTargetOf maps back (see elfLoKindIndex for the
+// same shape); the round-trip is asserted in selfcheck.
+function parseBuildTarget(s: string): int {
+  if (s == "x86_64-linux") { return 0 }
+  if (s == "aarch64-linux" || s == "arm64-linux") { return 1 }
+  if (s == "aarch64-macos" || s == "arm64-macos") { return 2 }
+  return -1
+}
+
+function buildTargetOf(i: int): BuildTarget {
+  if (i == 0) { return BuildTarget.X86_64Linux }
+  if (i == 1) { return BuildTarget.Aarch64Linux }
+  return BuildTarget.Aarch64Macos
+}
+
+function buildTargetIndex(t: BuildTarget): int {
+  if (t == BuildTarget.X86_64Linux) { return 0 }
+  if (t == BuildTarget.Aarch64Linux) { return 1 }
+  return 2
+}
+
+// The default `build` target: the host this bit binary runs on. Bit has no
+// compile-time `builtin.target` (the seed's source), so the ordinal comes from
+// `hostTarget()` — a runtime primitive baked into the per-target libbitrt this
+// binary is linked against. Correct on any host, so `bit build` needs no
+// `--target` on its native platform (the #365 requirement).
+function hostBuildTarget(): BuildTarget {
+  return buildTargetOf(hostTarget())
+}
+
+function isMachoTarget(t: BuildTarget): bool {
+  return t == BuildTarget.Aarch64Macos
+}
+
+// The ELF target for a Linux BuildTarget. Only ever called for one.
+function elfTargetOf(t: BuildTarget): ElfTarget {
+  if (t == BuildTarget.X86_64Linux) {
+    return ElfTarget.X86_64
+  }
+  return ElfTarget.Aarch64
+}
+
+function elfLinkTargetOf(t: BuildTarget): ElfLinkTarget {
+  if (t == BuildTarget.X86_64Linux) {
+    return ElfLinkTarget.X86_64Linux
+  }
+  return ElfLinkTarget.Aarch64Linux
+}
+
+function buildTargetName(t: BuildTarget): string {
+  if (t == BuildTarget.X86_64Linux) { return "x86_64-linux" }
+  if (t == BuildTarget.Aarch64Linux) { return "aarch64-linux" }
+  return "aarch64-macos"
+}
+
+// Builds `src`'s IR. A directory and a lone file are both modules (SPEC §17.1),
+// so both take the same project pipeline and both get the stdlib and its
+// prelude; a file differs only in that its module holds exactly that one file,
+// never its siblings. Mirrors the seed's `runBuild` — building a lone file as a
+// self-contained module instead is what made `println` undefined there.
+// E0078 (§11.7): an `extern function` binds a Bit name to a raw external symbol.
+// On Mach-O that symbol is bound by dyld at load time and anything is
+// admissible. Bit's ELF output has no load-time resolution at all — no
+// interpreter, no dynamic symbol table, no libc — but that is not the same as NO
+// resolution: the static link already merges libbitrt.a, and a symbol DEFINED
+// INSIDE THAT ARCHIVE resolves through the very same global symbol table as the
+// runtime's own calls.
+//
+// So the predicate is archive membership, not the platform. A symbol present in
+// the archive is accepted; one that is absent is still rejected here, with a
+// real diagnostic naming it, rather than failing deep inside the linker. An
+// empty `rtArchive` (`bit build-obj`, which reads no archive) means membership is
+// undecidable, and an undecided case must REJECT — accepting on unknown would
+// trade a compile error for a link error or a silent crash.
+//
+// The gate lives here rather than in the checker because the checker is
+// deliberately target-independent (it runs once and its output feeds every
+// backend); this is the first point where the selected target and the AST are
+// both in hand, and the archive path is a pure function of the target. Mirrors
+// the seed's rejectExternForTarget.
+function rejectExternForTarget(p: Project, target: BuildTarget, rtArchive: []u8): bool {
+  if (target == BuildTarget.Aarch64Macos) { return false }
+  let linkTarget = elfLinkTargetOf(target)
+  let found = false
+  let mi = 0
+  while (mi < len(p.mods)) {
+    let m = p.mods[mi]
+    // A module's files are concatenated, so every tree span is module-global.
+    // Mark the sink, report, then map this module's new spans back onto the file
+    // each one's text actually came from — exactly what the loader does.
+    let before = len(p.diags.list)
+    for top of kidsOf(m.tree, m.tree.root) {
+      if (top == 0) { continue }
+      let inner = top
+      if (getNode(m.tree, top).tag == Tag.Export) {
+        inner = kidsOf(m.tree, top)[0]
+      }
+      if (getNode(m.tree, inner).tag != Tag.ExternFnDecl) { continue }
+      // §11.7: an extern's Bit name IS the symbol, verbatim and never
+      // module-qualified, so the declaration's identifier is exactly what the
+      // linker will look for.
+      let nameNode = kidsOf(m.tree, inner)[0]
+      let nameSpan = getNode(m.tree, nameNode).span
+      let symbol = m.source[nameSpan.start:nameSpan.end]
+      if (archiveDefines(linkTarget, rtArchive, symbol)) { continue }
+      report(p.diags, ecExternUnsupportedTarget, getNode(m.tree, inner).span,
+        "'extern function' ${symbol} is not defined in the runtime archive for target ${buildTargetName(target)}",
+        "the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved")
+      found = true
+    }
+    remapDiags(p.diags, before, m.files, m.fileStarts)
+    mi = mi + 1
+  }
+  return found
+}
+
+function buildIr(src: string, target: BuildTarget, freestanding: bool, rtArchive: []u8): IrModule! {
+  let rootDir = src
+  let rootOnly = ""
+  if (!fsIsDir(src)) {
+    rootDir = pathDir(src)
+    rootOnly = pathBase(src)
+  }
+  // §17.6: freestanding withholds the stdlib root entirely, and that IS the
+  // mechanism — loadProject loads the prelude FROM that root, so an empty root
+  // means no prelude and no resolvable `std/*` import. A module reaching for
+  // `println` then fails in the resolver with an ordinary undefined-name
+  // diagnostic, because the name genuinely is not in scope. The managed/
+  // unmanaged boundary is enforced by absence, not by a list of banned names
+  // the checker would have to keep in sync with the prelude.
+  let stdRoot = stdRootPath()
+  if (freestanding) {
+    stdRoot = ""
+  }
+  let p = loadProject(rootDir, rootOnly, stdRoot)
+  if (p.root < 0 || len(p.mods) == 0) {
+    fail newError("not a module: ${src}")
+  }
+  // Lex/parse errors first and alone: a tree the parser recovered through has
+  // holes the checker reads as real nodes, so its errors would be noise on top
+  // of the ones that caused them. The seed stops here for the same reason.
+  if (reportCheckErrors(p.diags)) {
+    fail newError("check failed")
+  }
+  let mods = checkProject(p)
+  // The target gate reports into the same sink, so an E0078 renders beside any
+  // check error rather than after a second, separate failure.
+  rejectExternForTarget(p, target, rtArchive)
+  if (reportCheckErrors(p.diags)) {
+    fail newError("check failed")
+  }
+  return lowerProject(mods, p.root)
+}
+
+// Compiles `src` to a relocatable OBJECT at `out` (#1397): no `main` required,
+// no entry trampoline, no runtime archive read, nothing linked. This is the
+// half of the toolchain that feeds `bit ar`. Returns false on any failure
+// (already reported).
+function buildObjCmd(src: string, out: string, target: BuildTarget, freestanding: bool): bool {
+  let module = buildIr(src, target, freestanding, []u8(0)) catch e {
+    print("bit: ${src}: ${e.message()}\n")
+    return false
+  }
+  // -O1 (#1448): the seed runs this on every emit path and codegen depends on
+  // it — see writeModuleExe for why an unoptimized module is not merely slower.
+  optimizeModule(module)
+  // Same refusal as writeModuleExe: a signature-only stub computes nothing, so
+  // an object containing one would silently link into a wrong program.
+  if (len(module.stubbed) > 0) {
+    print("bit: ${src}: cannot lower ${len(module.stubbed)} function(s); refusing to emit an object\n")
+    for nm of module.stubbed {
+      print("  ${nm}\n")
+    }
+    return false
+  }
+  let obj = []u8(0)
+  if (isMachoTarget(target)) {
+    obj = emitMachoObject(module, false, freestanding) catch e {
+      print("bit: ${src}: ${e.message()}\n")
+      return false
+    }
+  } else {
+    obj = emitElfObject(module, elfTargetOf(target), false, freestanding) catch e {
+      print("bit: ${src}: ${e.message()}\n")
+      return false
+    }
+  }
+  writeFile(out, string(obj)) catch e {
+    print("bit: cannot write ${out}: ${e.message()}\n")
+    return false
+  }
+  return true
+}
+
+// Compiles `src` (a file or a project directory) to a native executable at
+// `out`. Returns false on any failure (already reported).
+function buildCmd(src: string, out: string, target: BuildTarget): bool {
+  // Read before the front end, not after it: the archive is what decides
+  // §11.7's E0078 (a symbol it defines is linkable, one it does not is not), so
+  // the gate inside `buildIr` needs it, and the link below needs the same bytes.
+  // One read, one source of truth. Mirrors the seed, which reads the archive in
+  // `main` ahead of `buildModule`.
+  let rt = readRtArchive(target) catch e {
+    print("bit: runtime archive ${libbitrtPath(target)}: ${e.message()}\n")
+    return false
+  }
+  let module = buildIr(src, target, false, rt) catch e {
+    print("bit: ${src}: ${e.message()}\n")
+    return false
+  }
+  return writeModuleExe(module, src, out, target, rt)
+}
+
+// The per-target runtime archive's bytes. Split out so the E0078 gate and the
+// link read it exactly once between them.
+function readRtArchive(target: BuildTarget): []u8! {
+  return []byte(readFile(libbitrtPath(target))?)
+}
+
+// Emits, links, and writes a lowered module to a native executable at `out`.
+// Split out of buildCmd so `bit test` can inject its synthetic `main` into the
+// module first. Returns false on any failure (already reported).
+function writeModuleExe(module: IrModule, src: string, out: string, target: BuildTarget, rt: []u8): bool {
+  // -O1 (#1448). `optimizeModule` was reachable ONLY from `--dump-ir`, so every
+  // binary the self-hosted compiler produced was built from raw lowering while
+  // the IR differentials compared optimized dumps — the gap was invisible to
+  // every gate by construction.
+  //
+  // This is not just a quality knob. `rebuild` renumbers blocks into the linear
+  // schedule (ascending `instsStart`), and TWO codegen passes assume block id ==
+  // position in that schedule: `isBackEdge` (`target <= curBlock`), which decides
+  // where a GC safepoint poll goes, and the x64 linear-scan interval numbering.
+  // Raw lowering IDs a loop's exit block BEFORE the body it is emitted after, so
+  // without this call the else arm of an `if/else` in a loop looked like a
+  // back-edge and got a spurious poll (~2x collector work, 81 corpus files).
+  //
+  // Called here rather than in `buildIr` so `bit test`'s injected `main` is
+  // optimized too — the seed orders it the same way (seed/main.zig, after
+  // `injectTestMain`).
+  optimizeModule(module)
+  // A signature-only stub computes nothing and returns garbage. Emitting one
+  // would hand back a binary that silently gives wrong answers, so refuse — the
+  // construct it choked on has to be reported, not shipped.
+  if (len(module.stubbed) > 0) {
+    print("bit: ${src}: cannot lower ${len(module.stubbed)} function(s); refusing to emit a binary\n")
+    for nm of module.stubbed {
+      print("  ${nm}\n")
+    }
+    return false
+  }
+  // Mach-O and ELF differ in every layer below here: the object format, the
+  // static-data placement (dyld-rebased __data vs read-only .rodata), and the
+  // linker's image. The backend follows the target too — an ELF x86_64-linux
+  // build is what drives x64.bit.
+  let exe = []u8(0)
+  if (isMachoTarget(target)) {
+    let obj = emitMachoObject(module, true, false) catch e {
+      print("bit: ${src}: ${e.message()}\n")
+      return false
+    }
+    // §11.7 externs are the only names this program may leave for dyld; the
+    // linker refuses anything else it left undefined rather than shipping a
+    // binary that dies at load (#1445).
+    exe = linkMacho([meObjectInput(obj), meArchiveInput(rt)],
+      pathStem(out), machoImportNames(module)) catch e {
+      print("bit: link ${out}: ${e.message()}\n")
+      return false
+    }
+  } else {
+    let obj = emitElfObject(module, elfTargetOf(target), true, false) catch e {
+      print("bit: ${src}: ${e.message()}\n")
+      return false
+    }
+    exe = linkElfExecutable(elfLinkTargetOf(target),
+      [ElfLinkInput{ isArchive: false, bytes: obj },
+       ElfLinkInput{ isArchive: true, bytes: rt }]) catch e {
+      print("bit: link ${out}: ${e.message()}\n")
+      return false
+    }
+  }
+  writeFile(out, string(exe)) catch e {
+    print("bit: cannot write ${out}: ${e.message()}\n")
+    return false
+  }
+  // A binary the kernel refuses to exec is not a build. writeFile leaves 0o644.
+  if (fsChmod(out, 493) != 0) { // 0o755
+    print("bit: cannot make ${out} executable\n")
+    return false
+  }
+  return true
+}
+
+// A per-invocation nonce for scratch paths that are WRITTEN and then EXEC'd
+// (`bit run`, `bit test`). A fixed name lets two concurrent processes clobber
+// one file while another execs it — ETXTBSY, or a binary that is half one build
+// and half another, surfacing as a hang rather than an error (#1459, #1463).
+//
+// Drawn from the OS entropy pool via the `cryptoRandomBytes` primitive rather
+// than `crypto/rand`'s `randomU64`: the compiler's own module can only import
+// `std/*`, and prelude primitives need no import at all.
+function scratchNonce(): uint {
+  let b = []byte(cryptoRandomBytes(8))
+  let x: uint = 0
+  let i = 0
+  while (i < 8) {
+    x = (x << 8) | uint(b[i])
+    i = i + 1
+  }
+  return x
+}
+
+// `bit run <src>`: build for the host, launch the binary, and exit with its
+// exit code. Builds to a /tmp path keyed by the source stem plus a random
+// nonce — a FIXED name is written and then exec'd, which is exactly the
+// clobber/ETXTBSY shape #1459 records, and two agents running `bit run` on
+// same-named modules is routine here. Returns the child's exit code, or 1 if
+// the build failed.
+function runCmd(src: string): int {
+  let tmp = "/tmp/bit-run-${pathStem(src)}-${scratchNonce()}"
+  if (!buildCmd(src, tmp, hostBuildTarget())) {
+    return 1
+  }
+  let code = osRun(tmp)
+  // Best-effort cleanup; a leftover temp binary is harmless, so ignore errors.
+  fsRemove(tmp)
+  if (code < 0) {
+    print("bit: could not run ${tmp}\n")
+    return 1
+  }
+  return code
+}
+
+// `bit test <file|dir>`: discover the root module's `test_*` functions, build a
+// single binary whose synthetic `main` dispatches by BIT_TEST_INDEX, then exec it
+// once per test (a failing `assert` panics and takes its process, so one process
+// per test keeps the failure attributable). Prints ok/FAIL per test + a summary;
+// exit 0 iff every test passed. Always builds for the host — a cross-compiled
+// test binary could not be run here. Output format matches the seed's runTest.
+function testCmd(src: string): int {
+  // Always the host target: a cross-compiled test binary could not be run here.
+  let rt = readRtArchive(hostBuildTarget()) catch e {
+    print("bit: runtime archive ${libbitrtPath(hostBuildTarget())}: ${e.message()}\n")
+    return 1
+  }
+  let module = buildIr(src, hostBuildTarget(), false, rt) catch e {
+    print("bit: ${src}: ${e.message()}\n")
+    return 1
+  }
+  if (len(module.stubbed) > 0) {
+    print("bit: ${src}: cannot lower ${len(module.stubbed)} function(s); refusing to run tests\n")
+    // Named, like the object/binary paths: a bare count says a gate is red
+    // without saying what to fix, which is how this one sat red and unread.
+    for nm of module.stubbed {
+      print("  ${nm}\n")
+    }
+    return 1
+  }
+  let names = injectTestMain(module)
+  if (len(names) == 0) {
+    print("no tests in ${src} (a test is a top-level `function test_<name>()`)\n")
+    return 0
+  }
+  // Disambiguated for the same reason as `runCmd`'s path above (#1459/#1463).
+  let tmp = "/tmp/bit-test-${pathStem(src)}-${scratchNonce()}"
+  if (!writeModuleExe(module, src, tmp, hostBuildTarget(), rt)) {
+    return 1
+  }
+  let passed = 0
+  let i = 0
+  while (i < len(names)) {
+    let code = osRunTest(tmp, i)
+    if (code == 0) {
+      passed = passed + 1
+      print("ok   ${names[i]}\n")
+    } else {
+      print("FAIL ${names[i]}\n")
+    }
+    i = i + 1
+  }
+  fsRemove(tmp)
+  let failed = len(names) - passed
+  let plural = "s"
+  if (len(names) == 1) {
+    plural = ""
+  }
+  print("\n${len(names)} test${plural}: ${passed} passed, ${failed} failed\n")
+  if (failed == 0) {
+    return 0
+  }
+  return 1
+}
+
+// `bit ar <out.a> <obj...> [--target t]`: bundles already-emitted relocatable
+// objects into an `ar` archive (#1398) — the `ar rcs` half of the toolchain
+// that `bit build --emit-obj` feeds. The name encoding follows the target's own
+// convention (BSD for Mach-O, GNU for ELF), which is what parseArchive and every
+// platform `ar` expect. Each member is named by its file's basename. `a` is the
+// whole argv, so a[2] is the output and a[3..] the inputs.
+function arCmd(a: []string): bool {
+  let out = a[2]
+  let members = []ArMember(0)
+  let target = hostBuildTarget()
+  let ai = 3
+  while (ai < len(a)) {
+    if ((a[ai] == "--target" || a[ai] == "-t") && ai + 1 < len(a)) {
+      let ti = parseBuildTarget(a[ai + 1])
+      if (ti < 0) {
+        print("bit ar: unknown target '${a[ai + 1]}'\n")
+        return false
+      }
+      target = buildTargetOf(ti)
+      ai = ai + 2
+      continue
+    }
+    let data = readFile(a[ai]) catch e {
+      print("bit ar: ${a[ai]}: ${e.message()}\n")
+      return false
+    }
+    members = append(members, ArMember{ name: pathBase(a[ai]), data: []byte(data) })
+    ai = ai + 1
+  }
+  if (len(members) == 0) {
+    print("bit ar: no input objects\n")
+    return false
+  }
+  let format = arFormatGnu()
+  if (isMachoTarget(target)) {
+    format = arFormatBsd()
+  }
+  writeFile(out, string(writeArchive(members, format))) catch e {
+    print("bit ar: cannot write ${out}: ${e.message()}\n")
+    return false
+  }
+  return true
+}
+
+// The runtime archive this compiler links against, per target. Overridable so a
+// build tree that keeps it elsewhere still works, matching the seed's
+// BIT_LIBBITRT — though an override names ONE archive, so it only makes sense
+// alongside a matching --target.
+function libbitrtPath(target: BuildTarget): string {
+  let name = buildTargetName(target)
+  let override = envOr("BIT_LIBBITRT", "")
+  if (len(override) > 0) {
+    return override
+  }
+  let near = resolveNearExe("lib/${name}/libbitrt.a")
+  if (len(near) > 0) {
+    return near
+  }
+  return "zig-out/lib/${name}/libbitrt.a"
+}
