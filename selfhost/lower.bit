@@ -183,7 +183,7 @@ struct FnCtx {
 // keeps the template's type, which classifies as a GC reference and corrupts
 // both the is_ref flag and the stack maps.
 function nodeType(fc: FnCtx, node: int): int {
-  return substType(fc.c.ctx, checkExprType(fc.c, node), fc.genEnv, 0)
+  return substType(fc.c, checkExprType(fc.c, node), fc.genEnv, 0)
 }
 
 // Module-wide lowering state shared across all functions (mutated as they lower
@@ -4609,7 +4609,7 @@ function lowerBinding(fc: FnCtx, node: int) {
   // instantiation. `nodeTypes` is the raw table — inside a generic body it still
   // holds the template's `[]T`, and a local typed that way becomes a loop block
   // param typed `[]<T>`, which classifies as a GC reference.
-  let declared = substType(fc.c.ctx, fc.c.nodeTypes[kids[0]], fc.genEnv, 0)
+  let declared = substType(fc.c, fc.c.nodeTypes[kids[0]], fc.genEnv, 0)
   let bname0 = fc.c.source[pat.span.start:pat.span.end]
   // An initializer-less typed binding (`let z: [4]u32` / `let s: S`) is its
   // type's zero value — a live, zeroed array/struct body, not nil (SPEC §13.4).
@@ -5267,11 +5267,11 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
     // BEFORE any body is lowered — see the ordering note there. Only the name
     // mangling happens here.
     //
-    // A monomorphized instance (nameOverride set) is always a FREE function
-    // today — generic-type methods do not parse — so it never reaches here.
-    // Asserted rather than guarded: if generic methods land, this fires loudly
-    // instead of silently emitting a method the pre-pass never saw.
-    assert(nameOverride == "")
+    // A generic receiver's method is emitted once per nominal instantiation
+    // (#1540), each with `nameOverride` already mangled by that INSTANCE's type
+    // id — `userTypeLookup` here would return the template's id and collapse
+    // every instantiation back onto one symbol. A free monomorphized instance
+    // also arrives with an override, and never has a receiver at all.
     name = lowerer.modPrefix + name + "\$t${recvId}"
   } else {
     name = lowerer.modPrefix + name
@@ -5291,7 +5291,7 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   if (pinned != "") {
     name = pinned
   }
-  let paramTypes = lowerParamSlotTypes(c, decl)
+  let paramTypes = substTypeList(c, lowerParamSlotTypes(c, decl), genEnv)
   // An omitted result is void; a fallible result `T!E` shows its ok type in the
   // header, and its ok/err feed the error channel (`fail`/`?`/ok-return).
   let result = c.ctx.voidId
@@ -5305,6 +5305,13 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
     }
     result = unwrapFallible(c, rawResult)
   }
+  // A generic instance's SIGNATURE is re-derived like every other type in its
+  // body (#1540): the annotations above resolve against the template, so `T`
+  // stays `T` here even though the body lowers concretely. Empty for an ordinary
+  // function, where `substType` returns its argument untouched.
+  result = substType(c, result, genEnv, 0)
+  fallibleOk = substType(c, fallibleOk, genEnv, 0)
+  fallibleErr = substType(c, fallibleErr, genEnv, 0)
   let b = newBuilder()
   let entry = builderNewBlock(b)
   builderBeginBlock(b, entry)
@@ -6047,7 +6054,16 @@ function lowerProject(mods: []Checker, root: int): IrModule {
     while (m < len(c.tree.nodes)) {
       let n = getNode(c.tree, m)
       if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0) {
-        funcs = append(funcs, lowerFunc(c, m, consts, lowerer))
+        let recvName = typeNodeName(c, kidsOf(c.tree, kidsOf(c.tree, m)[0])[1])
+        if (len(declTypeParamIds(c, recvName)) == 0) {
+          funcs = append(funcs, lowerFunc(c, m, consts, lowerer))
+        } else {
+          // A generic receiver has no single body: the seed emits one fully
+          // substituted method per nominal instantiation, and an UNinstantiated
+          // template emits nothing at all (there is no concrete type to lower
+          // its `T` slots against). #1540.
+          funcs = lowerMethodInstances(c, m, consts, lowerer, recvName, funcs)
+        }
       }
       m = m + 1
     }
@@ -6180,6 +6196,91 @@ function genericParamTypes(oc: Checker, decl: int, targs: []int): []int {
     j = j + 1
   }
   return lowerParamTypesIn(oc, decl, sub)
+}
+
+// Lowers method `decl` once per nominal instantiation of its generic receiver
+// `recvName`, appending each to `out` in the checker's instantiation order (the
+// seed's emission order). Returns `out` unchanged when the generic was never
+// instantiated — a template has no concrete slot types, so there is nothing to
+// emit and nothing that could call it.
+//
+// The receiver's type-argument NAMES are rebound positionally onto the concrete
+// args, exactly as `lowerInstance` does for a generic function: that fixes every
+// site which RE-RESOLVES a type node (the result annotation, the parameter slot
+// types), while `genEnv` fixes every site that reads a type the checker already
+// recorded against the template. Both are needed — see nodeType.
+function lowerMethodInstances(c: Checker, decl: int, consts: map<string, int>,
+    lowerer: Lowerer, recvName: string, out: []IrFunc): []IrFunc {
+  let params = declTypeParamIds(c, recvName)
+  let argNames = receiverTypeParamNames(c, decl)
+  let nm = getNode(c.tree, kidsOf(c.tree, decl)[1])
+  let fname = c.source[nm.span.start:nm.span.end]
+  let i = 0
+  while (i < len(c.ctx.typeInsts)) {
+    let inst = c.ctx.typeInsts[i]
+    if (inst.module != c.moduleId || inst.name != recvName || len(inst.args) != len(params)) {
+      i = i + 1
+      continue
+    }
+    let saved = []int(0)
+    let j = 0
+    while (j < len(argNames)) {
+      saved = append(saved, userTypeLookup(c, argNames[j]))
+      if (j < len(inst.args)) {
+        c.userTypes[argNames[j]] = inst.args[j]
+      }
+      j = j + 1
+    }
+    // Built from the METHOD's own generics list, not the struct's. The parser
+    // merges a receiver's `<T>` into the method's generic params (parserdecl:
+    // "those params are DECLARED here"), so the body was checked against ids the
+    // struct decl never saw — and `genericEnvOf` additionally binds whatever the
+    // name resolves to NOW, which the flat env can have moved (#1485).
+    // Both the method's own type-param ids AND the struct's are bound: the
+    // struct's `items: []T` was typed against the struct's `T`, the method's
+    // `v: T` against the method's, and a body mentions both. `genericEnvOf`
+    // supplies the method half (plus whatever the name resolves to now, #1485).
+    let genEnv = genericEnvOf(c, decl, inst.args)
+    let sids = declTypeParamIds(c, recvName)
+    let s = 0
+    while (s < len(sids) && s < len(inst.args)) {
+      if (sids[s] != 0) {
+        genEnv.params = append(genEnv.params, sids[s])
+        genEnv.args = append(genEnv.args, inst.args[s])
+      }
+      s = s + 1
+    }
+    out = append(out, lowerFuncNamed(c, decl, consts, lowerer,
+      lowerer.modPrefix + fname + "\$t${inst.result}", genEnv))
+    j = 0
+    while (j < len(argNames)) {
+      c.userTypes[argNames[j]] = saved[j]
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The type-parameter names a method declares, in order — the `A, B` of
+// `(p: Pair<A, B>) first()`. The parser merges a receiver's `<...>` in FRONT of
+// the method's own `<...>`, so this one list covers both, and position is what
+// lines it up with an instantiation's arguments (a method may name the
+// receiver's parameters differently from the struct declaration, #1325).
+function receiverTypeParamNames(c: Checker, decl: int): []string {
+  let out = []string(0)
+  let genNode = kidsOf(c.tree, decl)[2]
+  if (genNode == 0) {
+    return out
+  }
+  let tps = kidsOf(c.tree, genNode)
+  let i = 0
+  while (i < len(tps)) {
+    let n = getNode(c.tree, kidsOf(c.tree, tps[i])[0])
+    out = append(out, c.source[n.span.start:n.span.end])
+    i = i + 1
+  }
+  return out
 }
 
 // Lowers generic instantiation `g` of module `c` — the type params bound to the

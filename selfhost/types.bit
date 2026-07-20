@@ -74,6 +74,18 @@ struct Type {
   declModule: int,
 }
 
+// One nominal type instantiation: the module DECLARING the generic, its base
+// name, the concrete type arguments in order, and the reserved TypeId standing
+// for `Name<args>`. `result` doubles as the reverse map the seed keeps in
+// `inst_by_result` — a linear scan over a handful of entries, matching how
+// `instantiationIndexIn` already searches the function ledger.
+struct TypeInst {
+  module: int,
+  name: string,
+  args: []int,
+  result: int,
+}
+
 // The interned type table plus the well-known ids seeded at init.
 struct TypeContext {
   types: []Type,
@@ -102,6 +114,19 @@ struct TypeContext {
   // number an imported generic in the caller and emit it in the callee, under
   // two different names.
   instantiations: []Instantiation,
+  // Nominal TYPE instantiations — `Stack<i64>` and `Stack<string>` are two
+  // distinct named types, not one. The seed's `ctx.instantiations` +
+  // `inst_by_result` for struct/enum/interface, kept in its own ledger because
+  // bit's `instantiations` above records generic FUNCTIONS only (its index is a
+  // `$n` symbol suffix, so a type must not consume one). Each entry's `result`
+  // is a reserved TypeId carrying the BASE name, which is why `--dump-types`
+  // (name-keyed) is blind to this and stays byte-identical.
+  typeInsts: []TypeInst,
+  // A named type's method names in registration order, keyed by "<typeId>".
+  // `methodResults`/`methodSigs` are keyed "<typeId>.<member>" and a map cannot
+  // be asked which members a type has, so instantiating one needs this list to
+  // know what to copy.
+  typeMethodNames: map<string, []string>,
   // §11.9: pinned symbol name -> the packed identity of the decl that claimed
   // it. PROJECT-wide, like the seed's TypeContext.pinned_symbols: a pin names a
   // link-level symbol, and the linker sees every module at once, so two modules
@@ -191,7 +216,8 @@ function newTypeContext(): TypeContext {
     untypedRuneId: 0, untypedBoolId: 0, untypedStringId: 0, untypedNilId: 0,
     primIds: []int(0), errorId: 0, methodResults: map<string, int>{},
     methodSigs: map<string, int>{}, structFields: map<string, int>{},
-    instantiations: []Instantiation(0), pinnedSymbols: map<string, int>{} }
+    instantiations: []Instantiation(0), typeInsts: []TypeInst(0),
+    typeMethodNames: map<string, []string>{}, pinnedSymbols: map<string, int>{} }
   addType(ctx, leafType(TypeKind.Invalid))
   ctx.voidId = addType(ctx, leafType(TypeKind.Void))
   ctx.untypedIntId = addType(ctx, leafType(TypeKind.UntypedInt))
@@ -310,13 +336,21 @@ function maxTypeDepth(): int {
 // non-prim), so `slice_new` is handed is_ref=1 and the collector walks raw
 // integers as if they were pointers.
 //
-// A struct/enum/interface is returned unchanged: bit2 monomorphizes those
-// through the named-type machinery, so they arrive already concrete.
-function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
+// A struct/enum/interface is re-instantiated rather than returned unchanged
+// (#1540) — see `substNominal`. Only a NON-generic named type is inert.
+function substType(c: Checker, ty: int, env: TypeEnv, depth: int): int {
+  let ctx = c.ctx
   if (len(env.params) == 0 || depth >= maxTypeDepth()) {
     return ty
   }
   let k = ctx.types[ty].kind
+  // A named struct/enum/interface is NOT inert under substitution (#1540): a
+  // method's `Stack<T>` result must become `Stack<i64>` on the i64 instance, or
+  // the call site names a mangled symbol no body was emitted for. The seed does
+  // the same through `inst_by_result` -> `reinstantiate`.
+  if (k == TypeKind.Struct || k == TypeKind.Enum || k == TypeKind.Interface) {
+    return substNominal(c, ty, env, depth)
+  }
   if (k == TypeKind.TypeParam) {
     let b = typeEnvLookup(env, ty)
     if (b != 0) {
@@ -329,7 +363,7 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
   // one (see the append-aliasing rule).
   if (k == TypeKind.Slice) {
     let elem = ctx.types[ty].elem
-    let ne = substType(ctx, elem, env, depth + 1)
+    let ne = substType(c, elem, env, depth + 1)
     if (ne == elem) {
       return ty
     }
@@ -337,7 +371,7 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
   }
   if (k == TypeKind.Chan) {
     let elem = ctx.types[ty].elem
-    let ne = substType(ctx, elem, env, depth + 1)
+    let ne = substType(c, elem, env, depth + 1)
     if (ne == elem) {
       return ty
     }
@@ -345,7 +379,7 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
   }
   if (k == TypeKind.Ptr) {
     let elem = ctx.types[ty].elem
-    let ne = substType(ctx, elem, env, depth + 1)
+    let ne = substType(c, elem, env, depth + 1)
     if (ne == elem) {
       return ty
     }
@@ -354,7 +388,7 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
   if (k == TypeKind.Array) {
     let elem = ctx.types[ty].elem
     let n = ctx.types[ty].arrayLen
-    let ne = substType(ctx, elem, env, depth + 1)
+    let ne = substType(c, elem, env, depth + 1)
     if (ne == elem) {
       return ty
     }
@@ -363,8 +397,8 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
   if (k == TypeKind.Map) {
     let key = ctx.types[ty].mapKey
     let val = ctx.types[ty].mapVal
-    let nk = substType(ctx, key, env, depth + 1)
-    let nv = substType(ctx, val, env, depth + 1)
+    let nk = substType(c, key, env, depth + 1)
+    let nv = substType(c, val, env, depth + 1)
     if (nk == key && nv == val) {
       return ty
     }
@@ -373,8 +407,8 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
   if (k == TypeKind.Fallible) {
     let ok = ctx.types[ty].result
     let err = ctx.types[ty].errTy
-    let nok = substType(ctx, ok, env, depth + 1)
-    let nerr = substType(ctx, err, env, depth + 1)
+    let nok = substType(c, ok, env, depth + 1)
+    let nerr = substType(c, err, env, depth + 1)
     if (nok == ok && nerr == err) {
       return ty
     }
@@ -386,7 +420,7 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
     let buf = []int(0)
     let i = 0
     while (i < len(members)) {
-      let nm = substType(ctx, members[i], env, depth + 1)
+      let nm = substType(c, members[i], env, depth + 1)
       if (nm != members[i]) {
         changed = true
       }
@@ -406,14 +440,14 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
     let buf = []int(0)
     let i = 0
     while (i < len(params)) {
-      let np = substType(ctx, params[i], env, depth + 1)
+      let np = substType(c, params[i], env, depth + 1)
       if (np != params[i]) {
         changed = true
       }
       buf = append(buf, np)
       i = i + 1
     }
-    let nr = substType(ctx, result, env, depth + 1)
+    let nr = substType(c, result, env, depth + 1)
     if (nr != result) {
       changed = true
     }
@@ -423,6 +457,20 @@ function substType(ctx: TypeContext, ty: int, env: TypeEnv, depth: int): int {
     return mkFunc(ctx, buf, variadic, nr)
   }
   return ty
+}
+
+// `substType` over a list, element-wise.
+function substTypeList(c: Checker, tys: []int, env: TypeEnv): []int {
+  if (len(env.params) == 0) {
+    return tys
+  }
+  let out = []int(0)
+  let i = 0
+  while (i < len(tys)) {
+    out = append(out, substType(c, tys[i], env, 0))
+    i = i + 1
+  }
+  return out
 }
 
 function mkFallible(ctx: TypeContext, ok: int, err: int): int {

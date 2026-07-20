@@ -1,0 +1,405 @@
+// Per-instantiation NOMINAL type identity (#1540).
+//
+// `Stack<i64>` and `Stack<string>` are two distinct types, not one. Resolving a
+// `Name<...>` type node straight to its base named type — which is what this
+// checker did — collapses them onto a single TypeId, and since a method's link
+// symbol is literally `<name>$t<receiverTypeId>` the two instantiations then
+// share one mangled body. The seed emits one substituted body per receiver
+// instantiation; that difference was the whole of the remaining IR differential.
+//
+// The seed's shape, ported: `instantiateGeneric` -> `instantiateRecursive`
+// reserves a fresh TypeId, records `(generic, args) -> id` BEFORE filling its
+// members (so a self-referential `List<T>` terminates), substitutes the
+// template's fields/payloads/method signatures onto it, and gives it the BASE
+// display name. That last part is why `--dump-types` cannot see any of this: it
+// prints type NAMES, and an instantiation's name is `Stack`, same as its
+// template's.
+//
+// THE SAFETY RULE applies throughout: every case this cannot decide falls back
+// to the base template, which is exactly the id it returned before, so no
+// previously-accepted program can start failing.
+
+// The concrete type arguments written in a `Name<A, B>` node, resolved under
+// `sub`. Parallel to the node's type-argument list, in order.
+function genericInstArgs(c: Checker, node: int, sub: TypeSubst): []int {
+  let out = []int(0)
+  let targs = kidsOf(c.tree, kidsOf(c.tree, node)[1])
+  let i = 0
+  while (i < len(targs)) {
+    out = append(out, typeFromNodeIn(c, targs[i], sub))
+    i = i + 1
+  }
+  return out
+}
+
+// The ordered type-param ids of named type `name`'s own declaration, or empty
+// when it is not generic (or not declared in this module).
+function declTypeParamIds(c: Checker, name: string): []int {
+  let decl = c.typeDecls[name]
+  if (decl == 0) {
+    return []int(0)
+  }
+  return declGenericIds(c, kidsOf(c.tree, decl)[1])
+}
+
+// The index into `ctx.typeInsts` of `(module, name, args)`, or -1. Identity is
+// the declaring module plus the base name plus the argument list — the same key
+// `instantiationIndexIn` uses for generic functions.
+function typeInstIndex(ctx: TypeContext, mod: int, name: string, args: []int): int {
+  let i = 0
+  while (i < len(ctx.typeInsts)) {
+    let t = ctx.typeInsts[i]
+    if (t.module == mod && t.name == name && intListEq(t.args, args)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The `ctx.typeInsts` entry that produced TypeId `ty`, or -1 — the seed's
+// `inst_by_result`. Lets a nested generic recover the `(base, args)` behind an
+// instantiation it was handed.
+function typeInstOfResult(ctx: TypeContext, ty: int): int {
+  let i = 0
+  while (i < len(ctx.typeInsts)) {
+    if (ctx.typeInsts[i].result == ty) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// True when `args` is `name`'s own type parameters in order. `Stack<T>` written
+// INSIDE `Stack`'s own body — a self-referential field, a method's result
+// annotation — names the template itself, not a fresh instantiation:
+// substituting a declaration's own rigid params changes nothing. Without this
+// the two are distinct ids and `return s` fails against its own declared result
+// type (the seed's `isOwnParams`).
+//
+// Matched by NAME, not by id, and that is the whole subtlety. The parser merges
+// a receiver's `<T>` into the METHOD's generic list, so the `T` in `push`'s
+// `Stack<T>` result is a different TypeId from the `T` the struct declared —
+// comparing ids there mints a bogus `Stack<T_push>` instantiation, and lowering
+// then emits a whole extra method body against unbound type params. Two type
+// params spelled the same at the same position of the same declaration are the
+// same parameter, which is exactly what the seed's rigid-id rebinding encodes.
+function isOwnTypeParams(c: Checker, name: string, args: []int): bool {
+  let decl = c.typeDecls[name]
+  if (decl == 0) {
+    return false
+  }
+  let tps = kidsOf(c.tree, kidsOf(c.tree, decl)[1])
+  if (len(tps) == 0 || len(tps) != len(args)) {
+    return false
+  }
+  let i = 0
+  while (i < len(args)) {
+    if (c.ctx.types[args[i]].kind != TypeKind.TypeParam) {
+      return false
+    }
+    let pn = getNode(c.tree, kidsOf(c.tree, tps[i])[0])
+    if (c.ctx.types[args[i]].name != c.source[pn.span.start:pn.span.end]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Records `name` as having method `m`, so instantiating it knows what to copy.
+// Idempotent: `checkModule` runs more than once over the same tree on some
+// paths, and a duplicated name would copy the same signature twice.
+function noteTypeMethod(ctx: TypeContext, ty: int, m: string) {
+  if (ty == 0) {
+    return
+  }
+  let key = "${ty}"
+  let cur = []string(0)
+  for (k, v) of ctx.typeMethodNames {
+    if (k == key) {
+      cur = v
+    }
+  }
+  let i = 0
+  while (i < len(cur)) {
+    if (cur[i] == m) {
+      return
+    }
+    i = i + 1
+  }
+  ctx.typeMethodNames[key] = append(cur, m)
+}
+
+// The method names recorded for type `ty`, in registration order.
+function typeMethodNamesOf(ctx: TypeContext, ty: int): []string {
+  let key = "${ty}"
+  for (k, v) of ctx.typeMethodNames {
+    if (k == key) {
+      return v
+    }
+  }
+  return []string(0)
+}
+
+// Copies the template's members onto instantiation `inst`, substituting `env`
+// into each. Fields are walked off the DECL node so they land in source order
+// (the map they live in has none), and their template types are read back from
+// `structFields` rather than re-resolved from the type node: re-resolving would
+// intern composites in a different order than the seed's type-level `subst`.
+function fillInstMembers(c: Checker, base: int, inst: int, decl: int, env: TypeEnv) {
+  let dn = getNode(c.tree, decl)
+  if (dn.tag == Tag.StructDecl) {
+    let fields = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+    let fi = 0
+    while (fi < len(fields)) {
+      let fld = fields[fi]
+      if (getNode(c.tree, fld).tag == Tag.Export) {
+        fld = kidsOf(c.tree, fld)[0]
+      }
+      let fnn = getNode(c.tree, kidsOf(c.tree, fld)[0])
+      let fname = c.source[fnn.span.start:fnn.span.end]
+      let ft = structFieldLookup(c, "${base}.${fname}")
+      c.ctx.structFields["${inst}.${fname}"] = substType(c, ft, env, 0)
+      fi = fi + 1
+    }
+  }
+}
+
+// Copies one method's result type and signature onto instantiation `inst`,
+// substituted through `env`.
+function copyInstMethod(c: Checker, base: int, inst: int, m: string, env: TypeEnv) {
+  let mr = methodResultLookup(c, "${base}.${m}")
+  if (mr != 0) {
+    c.ctx.methodResults["${inst}.${m}"] = substType(c, mr, env, 0)
+  }
+  let sig = methodSigLookup(c, "${base}.${m}")
+  if (sig != 0) {
+    c.ctx.methodSigs["${inst}.${m}"] = substType(c, sig, env, 0)
+  }
+  noteTypeMethod(c.ctx, inst, m)
+}
+
+// Copies every method of generic type `name` onto each of its instantiations —
+// the seed's `copyMethodsToInstantiations`. Runs after signatures are built,
+// because a method is declared after the struct it hangs off and an
+// instantiation minted from a field or an annotation predates it.
+//
+// The substitution env is built PER METHOD DECL, not from the struct's type
+// parameters, and that is load-bearing. The parser merges a receiver's `<T>`
+// into the method's own generic list, so `get`'s `T` is a DIFFERENT TypeId from
+// the `T` the struct declared even though both are spelled `T`; an env keyed on
+// the struct's ids substitutes nothing and the method's result stays a bare type
+// param. Position is what lines the two up (#1325).
+function copyMethodsToInsts(c: Checker, name: string) {
+  let base = userTypeLookup(c, name)
+  if (base == 0 || len(declTypeParamIds(c, name)) == 0) {
+    return
+  }
+  let d = 1
+  while (d < len(c.tree.nodes)) {
+    let n = getNode(c.tree, d)
+    if (n.tag != Tag.FuncDecl || kidsOf(c.tree, d)[0] == 0) {
+      d = d + 1
+      continue
+    }
+    let kids = kidsOf(c.tree, d)
+    if (typeNodeName(c, kidsOf(c.tree, kids[0])[1]) != name) {
+      d = d + 1
+      continue
+    }
+    let mids = declGenericIds(c, kids[2])
+    let mnn = getNode(c.tree, kids[1])
+    let mname = c.source[mnn.span.start:mnn.span.end]
+    let i = 0
+    while (i < len(c.ctx.typeInsts)) {
+      let t = c.ctx.typeInsts[i]
+      if (t.module == c.moduleId && t.name == name && len(t.args) <= len(mids)) {
+        copyInstMethod(c, base, t.result, mname, bothParamIds(c, name, mids, t.args))
+      }
+      i = i + 1
+    }
+    d = d + 1
+  }
+}
+
+// An env binding `args` to BOTH the ids a method declared for its receiver's
+// type params and the ids the STRUCT declared, position by position.
+//
+// They are not the same ids. The struct's `items: []T` was typed against the
+// struct's `T`; the method's `Stack<T>` result and its `v: T` parameter were
+// typed against the method's own `T`, because the parser re-declares a
+// receiver's params on the method. Binding only one set leaves the other's
+// mentions as bare type params — which is how `push`'s `Stack<T>` result stayed
+// the template and produced a call to a symbol nothing emits. Same reasoning as
+// `genericEnvOf`'s double binding (#1485); a duplicate binding is a no-op.
+function bothParamIds(c: Checker, name: string, mids: []int, args: []int): TypeEnv {
+  let env = TypeEnv{ params: []int(0), args: []int(0) }
+  let sids = declTypeParamIds(c, name)
+  let i = 0
+  while (i < len(args)) {
+    if (i < len(mids) && mids[i] != 0) {
+      env.params = append(env.params, mids[i])
+      env.args = append(env.args, args[i])
+    }
+    if (i < len(sids) && sids[i] != 0) {
+      env.params = append(env.params, sids[i])
+      env.args = append(env.args, args[i])
+    }
+    i = i + 1
+  }
+  return env
+}
+
+// The ordered type-param ids recorded for a `<...>` generics node, or empty.
+function declGenericIds(c: Checker, genNode: int): []int {
+  if (genNode == 0) {
+    return []int(0)
+  }
+  for (k, v) of c.genericParamIds {
+    if (k == genNode) {
+      return v
+    }
+  }
+  return []int(0)
+}
+
+// Mints (or reuses) the nominal type for `name<args>`.
+//
+// Returns the BASE template — the pre-#1540 answer — for every shape this
+// cannot instantiate: an unknown or non-nominal name, an arity mismatch (which
+// E0058 reports separately; the type system stays permissive), an unresolved
+// argument, or the declaration's own parameters. Falling back is always safe
+// because the base is precisely the id every caller used to get.
+//
+// An IMPORTED generic type is one of those fallbacks today: `declTypeParamIds`
+// reads `c.typeDecls`, which holds only the names this module declares, so a
+// generic declared elsewhere keeps the single shared TypeId it always had. That
+// is the pre-existing behaviour, not a new limitation — extending this to
+// cross-module generics needs the declaring module's Checker, the same
+// resolution `typeOwner`/`declModule` already do for members.
+function instantiateNamed(c: Checker, name: string, args: []int): int {
+  let base = resolveNamed(c, name)
+  if (base == 0 || len(args) == 0) {
+    return base
+  }
+  let kind = c.ctx.types[base].kind
+  if (kind != TypeKind.Struct && kind != TypeKind.Enum && kind != TypeKind.Interface) {
+    return base // an alias is transparent: its target already absorbed the args
+  }
+  let params = declTypeParamIds(c, name)
+  if (len(params) != len(args)) {
+    return base
+  }
+  let ai = 0
+  while (ai < len(args)) {
+    if (args[ai] == 0) {
+      return base // an argument that did not resolve: undecided, so stay put
+    }
+    ai = ai + 1
+  }
+  if (isOwnTypeParams(c, name, args)) {
+    return base // the declaration's own rigid parameters — this IS the template
+  }
+  let found = typeInstIndex(c.ctx, c.moduleId, name, args)
+  if (found >= 0) {
+    return c.ctx.typeInsts[found].result
+  }
+  // Reserve before filling. A generic whose field mentions itself (`Node<T>`
+  // holding a `Node<T>`) re-enters here while its members are still being
+  // substituted; the ledger entry is what terminates that.
+  let t = leafType(kind)
+  t.name = name
+  t.hasName = true
+  t.declModule = c.ctx.types[base].declModule
+  t.enumBoxed = c.ctx.types[base].enumBoxed
+  let inst = addType(c.ctx, t)
+  c.ctx.typeInsts = append(c.ctx.typeInsts,
+    TypeInst{ module: c.moduleId, name: name, args: args, result: inst })
+  let decl = c.typeDecls[name]
+  if (decl != 0) {
+    fillInstMembers(c, base, inst, decl, TypeEnv{ params: params, args: args })
+  }
+  return inst
+}
+
+// The type arguments standing behind nominal type `ty`: an instantiation's
+// recorded args, or a TEMPLATE's own rigid parameters. Empty when `ty` is not
+// generic at all, which is the common case and the one that must cost nothing.
+function nominalArgsOf(c: Checker, ty: int): []int {
+  let idx = typeInstOfResult(c.ctx, ty)
+  if (idx >= 0) {
+    return c.ctx.typeInsts[idx].args
+  }
+  if (!c.ctx.types[ty].hasName) {
+    return []int(0)
+  }
+  return declTypeParamIds(c, c.ctx.types[ty].name)
+}
+
+// Substitutes `env` into a named struct/enum/interface by re-instantiating it at
+// substituted arguments — the seed's `reinstantiate`.
+//
+// `Stack<T>` inside `Stack`'s own method is the TEMPLATE, and its arguments are
+// the declaration's rigid params; binding `T -> i64` therefore yields
+// `Stack<i64>`, a different nominal type with its own `$t<id>`. Before this,
+// substitution returned the template untouched and a chained `s.push(1).size()`
+// emitted `call @size$t<template>` — a symbol no body is ever emitted for, since
+// only instantiations are lowered. A dangling call, not a type-printing nit.
+function substNominal(c: Checker, ty: int, env: TypeEnv, depth: int): int {
+  let args = nominalArgsOf(c, ty)
+  if (len(args) == 0) {
+    return ty // not generic: nominal identity is already concrete
+  }
+  let changed = false
+  let out = []int(0)
+  let i = 0
+  while (i < len(args)) {
+    let na = substType(c, args[i], env, depth + 1)
+    if (na != args[i]) {
+      changed = true
+    }
+    out = append(out, na)
+    i = i + 1
+  }
+  if (!changed) {
+    return ty
+  }
+  return instantiateNamed(c, c.ctx.types[ty].name, out)
+}
+
+// Two nominal types that instantiate the same declaration — and a template
+// against any of its own instantiations — are interchangeable for diagnostic
+// purposes.
+//
+// This is not a claim that `Stack<i64>` and `Stack<string>` are the same type.
+// It is THE SAFETY RULE made explicit: before per-instantiation identity every
+// one of these was literally the same TypeId, so treating them as assignable
+// preserves exactly the set of programs this checker accepted. Narrowing it to
+// compare arguments is a real diagnostic (the seed's `sameInstantiation` path)
+// and belongs with the rest of the generic-inference tail, not here — landing
+// it inside a renumbering change would make any new diagnostic indistinguishable
+// from a regression in the differential.
+function sameNominalDecl(ctx: TypeContext, a: int, b: int): bool {
+  let ta = ctx.types[a]
+  let tb = ctx.types[b]
+  if (!ta.hasName || !tb.hasName) {
+    return false
+  }
+  if (ta.kind != tb.kind) {
+    return false
+  }
+  return ta.name == tb.name && ta.declModule == tb.declModule
+}
+
+// The template `ty` instantiates, or `ty` itself when it is not an
+// instantiation. Lowering mangles a method by its RECEIVER's id, so it needs to
+// get from an instantiation back to the declaration that owns the body.
+function nominalTemplateOf(c: Checker, ty: int): int {
+  let idx = typeInstOfResult(c.ctx, ty)
+  if (idx < 0) {
+    return ty
+  }
+  return userTypeLookup(c, c.ctx.typeInsts[idx].name)
+}
