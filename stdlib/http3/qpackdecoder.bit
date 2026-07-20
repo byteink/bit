@@ -1,0 +1,200 @@
+// Bit standard library — http3 module, QPACK decoder (RFC 9204 §4.4, §4.5).
+
+// ---------------------------------------------------------------------------
+// Decoder
+// ---------------------------------------------------------------------------
+
+// A stateful QPACK decoder. It owns its dynamic table and enforces a `limit` —
+// the largest capacity it will accept from a Set Dynamic Table Capacity
+// instruction, i.e. the value it advertised. `applyEncoderStream` mutates the
+// table; `decodeFieldSection` reconstructs a header list (blocking if it needs
+// inserts not yet applied); `sectionAck`/`streamCancel`/`insertCountIncrement`
+// produce the decoder-stream bytes to send back. Reuse one decoder per
+// connection so its table tracks the peer encoder.
+export struct Decoder { table: qpackTable, limit: int }
+
+// A fresh decoder: no dynamic table yet, willing to accept a capacity up to the
+// 4096-byte default.
+export function newDecoder(): Decoder {
+  return Decoder{ table: qpackNewTable(0), limit: qpackDefaultCapacity }
+}
+
+// A decoder with an explicit capacity `limit`. A Set Dynamic Table Capacity
+// above this is rejected.
+export function newDecoderConfig(limit: int): Decoder {
+  return Decoder{ table: qpackNewTable(0), limit: limit }
+}
+
+// Apply the encoder-stream instructions in `data` (§4.3), mutating the dynamic
+// table, and return the resulting insert count. Fails on a malformed
+// instruction, a bad index, or a capacity over the decoder's limit.
+export function (d: Decoder) applyEncoderStream(data: []byte): int! {
+  let r = qpackReader{ data: data, pos: 0 }
+  let guard = 0
+  while (r.pos < len(data) && guard <= len(data)) {
+    let b = qpackReadByte(r)?
+    if ((b & 0x80) != 0) {
+      qpackDecodeInsertNameRef(d, r, b)?
+    } else if ((b & 0x40) != 0) {
+      let name = string(qpackGetNameLiteral(r, b, 5, 0x20)?)
+      let value = string(qpackGetString(r)?)
+      qpackTableInsert(d.table, name, value)?
+    } else if ((b & 0x20) != 0) {
+      let newCap = qpackGetInteger(r, 5, b)?
+      if (newCap > d.limit) {
+        fail newError("qpack: capacity ${newCap} exceeds limit ${d.limit}")
+      }
+      qpackTableSetCapacity(d.table, newCap)
+    } else {
+      let relIndex = qpackGetInteger(r, 5, b)?
+      let abs = d.table.insertCount - relIndex - 1
+      let en = qpackTableGetAbs(d.table, abs)?
+      qpackTableInsert(d.table, en.name, en.value)?
+    }
+    guard = guard + 1
+  }
+  return d.table.insertCount
+}
+
+// Apply one Insert With Name Reference instruction (§4.3.2). `first` is the
+// consumed instruction octet; the T bit selects static vs a dynamic index
+// relative to the current insert count.
+function qpackDecodeInsertNameRef(d: Decoder, r: qpackReader, first: int): ()! {
+  let isStatic = (first & 0x40) != 0
+  let index = qpackGetInteger(r, 6, first)?
+  let value = string(qpackGetString(r)?)
+  let name = ""
+  if (isStatic) {
+    if (index < 0 || index >= qpackStaticLen) {
+      fail newError("qpack: static name index ${index} out of range")
+    }
+    name = qpackStaticTable()[index].name
+  } else {
+    let abs = d.table.insertCount - index - 1
+    name = qpackTableGetAbs(d.table, abs)?.name
+  }
+  qpackTableInsert(d.table, name, value)?
+}
+
+// Decode one encoded field section (§4.5) into its header fields. Reads the
+// prefix to recover the Required Insert Count and Base, fails ("blocked") if the
+// section needs insertions not yet applied, then decodes each field line. Fails
+// on any malformed representation or out-of-range index.
+export function (d: Decoder) decodeFieldSection(data: []byte): []HeaderField! {
+  let r = qpackReader{ data: data, pos: 0 }
+  let firstRic = qpackReadByte(r)?
+  let enc = qpackGetInteger(r, 8, firstRic)?
+  let ric = qpackDecodeRIC(enc, d.table.insertCount, qpackMaxEntries(d.table.capacity))?
+  if (ric > d.table.insertCount) {
+    fail newError("qpack: section blocked, needs insert count ${ric}")
+  }
+  let firstBase = qpackReadByte(r)?
+  let negative = (firstBase & 0x80) != 0
+  let delta = qpackGetInteger(r, 7, firstBase)?
+  let base = ric + delta
+  if (negative) {
+    base = ric - delta - 1
+  }
+  if (base < 0) {
+    fail newError("qpack: negative base")
+  }
+  let out = []HeaderField(0)
+  let guard = 0
+  while (r.pos < len(data) && guard <= len(data)) {
+    out = append(out, qpackDecodeLine(d, r, base)?)
+    guard = guard + 1
+  }
+  return out
+}
+
+// Decode one field line at `r` against `base`.
+function qpackDecodeLine(d: Decoder, r: qpackReader, base: int): HeaderField! {
+  let b = qpackReadByte(r)?
+  if ((b & 0x80) != 0) {
+    // Indexed Field Line (§4.5.2): static, or dynamic relative to Base.
+    let isStatic = (b & 0x40) != 0
+    let index = qpackGetInteger(r, 6, b)?
+    let en = qpackResolveIndex(d, isStatic, index, base)?
+    return HeaderField{ name: en.name, value: en.value, sensitive: false }
+  }
+  if ((b & 0x40) != 0) {
+    // Literal Field Line With Name Reference (§4.5.4): static or dynamic name.
+    let sensitive = (b & 0x20) != 0
+    let isStatic = (b & 0x10) != 0
+    let index = qpackGetInteger(r, 4, b)?
+    let en = qpackResolveIndex(d, isStatic, index, base)?
+    let value = string(qpackGetString(r)?)
+    return HeaderField{ name: en.name, value: value, sensitive: sensitive }
+  }
+  if ((b & 0x20) != 0) {
+    // Literal Field Line With Literal Name (§4.5.6).
+    let sensitive = (b & 0x10) != 0
+    let name = string(qpackGetNameLiteral(r, b, 3, 0x08)?)
+    let value = string(qpackGetString(r)?)
+    return HeaderField{ name: name, value: value, sensitive: sensitive }
+  }
+  if ((b & 0x10) != 0) {
+    // Indexed Field Line With Post-Base Index (§4.5.3).
+    let index = qpackGetInteger(r, 4, b)?
+    let en = qpackTableGetAbs(d.table, base + index)?
+    return HeaderField{ name: en.name, value: en.value, sensitive: false }
+  }
+  if ((b & 0x08) != 0) {
+    // Literal Field Line With Post-Base Name Reference (§4.5.5).
+    let sensitive = (b & 0x04) != 0
+    let index = qpackGetInteger(r, 3, b)?
+    let en = qpackTableGetAbs(d.table, base + index)?
+    let value = string(qpackGetString(r)?)
+    return HeaderField{ name: en.name, value: value, sensitive: sensitive }
+  }
+  fail newError("qpack: unknown field line representation")
+}
+
+// Resolve a static or pre-base dynamic index to its entry. A dynamic `index` is
+// relative to `base`: absolute index = base - index - 1. Shared by the Indexed
+// Field Line and the Literal Field Line With Name Reference, which use the same
+// relative arithmetic.
+function qpackResolveIndex(d: Decoder, isStatic: bool, index: int, base: int): qpackEntry! {
+  if (isStatic) {
+    if (index < 0 || index >= qpackStaticLen) {
+      fail newError("qpack: static index ${index} out of range")
+    }
+    return qpackStaticTable()[index]
+  }
+  return qpackTableGetAbs(d.table, base - index - 1)?
+}
+
+// Emit a Section Acknowledgment for `streamId` (§4.4.1).
+export function (d: Decoder) sectionAck(streamId: int): []byte {
+  return qpackPutInteger([]byte(0), 7, 0x80, streamId)
+}
+
+// Emit a Stream Cancellation for `streamId` (§4.4.2).
+export function (d: Decoder) streamCancel(streamId: int): []byte {
+  return qpackPutInteger([]byte(0), 6, 0x40, streamId)
+}
+
+// Emit an Insert Count Increment of `n` (§4.4.3).
+export function (d: Decoder) insertCountIncrement(n: int): []byte {
+  return qpackPutInteger([]byte(0), 6, 0x00, n)
+}
+
+// The number of insertions the decoder has processed (the next absolute index).
+export function (d: Decoder) insertCount(): int {
+  return d.table.insertCount
+}
+
+// The current byte size of the decoder's dynamic table.
+export function (d: Decoder) tableSize(): int {
+  return d.table.size
+}
+
+// The number of live entries in the decoder's dynamic table.
+export function (d: Decoder) tableCount(): int {
+  return len(d.table.entries)
+}
+
+// The current dynamic-table capacity in bytes.
+export function (d: Decoder) capacity(): int {
+  return d.table.capacity
+}

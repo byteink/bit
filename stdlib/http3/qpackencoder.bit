@@ -1,0 +1,280 @@
+// Bit standard library — http3 module, QPACK encoder (RFC 9204 §4.3, §4.5).
+
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+// A stateful QPACK encoder. It owns its dynamic table and tracks its Known
+// Received Count (how far the decoder has acknowledged) and its outstanding
+// field sections. Its encoder-stream methods (`setCapacity`, `insertNameRef`,
+// `insertLiteral`, `duplicate`) each return the instruction's wire bytes and
+// mutate the table; `encodeFieldSection` produces a request/response-stream
+// section; `applyDecoderStream` consumes the decoder's acknowledgements. Reuse
+// one encoder per connection so its table tracks the peer decoder.
+export struct Encoder {
+  table: qpackTable,
+  huffman: bool,
+  knownReceived: int,
+  outstanding: []qpackSection,
+}
+
+// A fresh encoder: a 4096-byte dynamic table and Huffman string literals
+// enabled.
+export function newEncoder(): Encoder {
+  return Encoder{
+    table: qpackNewTable(qpackDefaultCapacity),
+    huffman: true,
+    knownReceived: 0,
+    outstanding: []qpackSection(0),
+  }
+}
+
+// An encoder with an explicit initial table `capacity` and `huffman` string
+// choice. Pass `capacity` 0 to start with no dynamic table (then raise it with
+// `setCapacity`), and `huffman` false to reproduce the raw RFC 9204 examples.
+export function newEncoderConfig(capacity: int, huffman: bool): Encoder {
+  return Encoder{
+    table: qpackNewTable(capacity),
+    huffman: huffman,
+    knownReceived: 0,
+    outstanding: []qpackSection(0),
+  }
+}
+
+// Emit a Set Dynamic Table Capacity instruction (§4.3.1) and resize the table.
+export function (e: Encoder) setCapacity(capacity: int): []byte {
+  qpackTableSetCapacity(e.table, capacity)
+  return qpackPutInteger([]byte(0), 5, 0x20, capacity)
+}
+
+// Emit an Insert With Name Reference instruction (§4.3.2) and add the entry.
+// When `isStatic`, `index` is a static absolute index; otherwise it is a
+// dynamic index relative to the current insert count. Fails on a bad index or
+// an entry too large for the table.
+export function (e: Encoder) insertNameRef(isStatic: bool, index: int, value: string): []byte! {
+  let name = ""
+  let out = []byte(0)
+  if (isStatic) {
+    if (index < 0 || index >= qpackStaticLen) {
+      fail newError("qpack: static name index ${index} out of range")
+    }
+    name = qpackStaticTable()[index].name
+    out = qpackPutInteger(out, 6, 0xc0, index)
+  } else {
+    let abs = e.table.insertCount - index - 1
+    name = qpackTableGetAbs(e.table, abs)?.name
+    out = qpackPutInteger(out, 6, 0x80, index)
+  }
+  out = qpackPutString(out, []byte(value), e.huffman)
+  qpackTableInsert(e.table, name, value)?
+  return out
+}
+
+// Emit an Insert With Literal Name instruction (§4.3.3) and add the entry.
+// Fails if the entry is too large for the table.
+export function (e: Encoder) insertLiteral(name: string, value: string): []byte! {
+  let out = qpackPutNameLiteral([]byte(0), []byte(name), e.huffman, 5, 0x40, 0x20)
+  out = qpackPutString(out, []byte(value), e.huffman)
+  qpackTableInsert(e.table, name, value)?
+  return out
+}
+
+// Emit a Duplicate instruction (§4.3.4) and re-insert an existing entry, given
+// as a dynamic index relative to the current insert count. Fails on a bad
+// index.
+export function (e: Encoder) duplicate(relIndex: int): []byte! {
+  let abs = e.table.insertCount - relIndex - 1
+  let en = qpackTableGetAbs(e.table, abs)?
+  let out = qpackPutInteger([]byte(0), 5, 0x00, relIndex)
+  qpackTableInsert(e.table, en.name, en.value)?
+  return out
+}
+
+// Encode `fields` into one field section on `streamId`, against the given
+// `base` (§4.5). Each field is emitted as, in preference order: an indexed
+// static line, an indexed dynamic line (relative or post-base per `base`), a
+// literal with a static/dynamic name reference, or a literal with a literal
+// name. A `sensitive` field is always a never-index literal, never an index. No
+// new dynamic entries are inserted here — pre-populate the table with the
+// encoder-stream methods; `base` is typically the current insert count but may
+// be lower to force post-base indexing. The section is recorded as outstanding
+// until acknowledged.
+export function (e: Encoder) encodeFieldSection(
+  streamId: int,
+  base: int,
+  fields: []HeaderField,
+): []byte {
+  let lines = []byte(0)
+  let ric = 0
+  for f of fields {
+    let usedAbs = qpackEncodeLine(e, f, base)
+    lines = qpackAppendBytes(lines, usedAbs.bytes)
+    if (usedAbs.abs + 1 > ric) {
+      ric = usedAbs.abs + 1
+    }
+  }
+  let out = qpackEncodePrefix(ric, base, qpackMaxEntries(e.table.capacity))
+  out = qpackAppendBytes(out, lines)
+  e.outstanding = append(e.outstanding, qpackSection{ stream: streamId, ric: ric })
+  return out
+}
+
+// The bytes of one encoded field line and the highest absolute dynamic index it
+// referenced (`abs` == -1 for none) — the caller folds `abs` into the section's
+// Required Insert Count.
+struct qpackLine { bytes: []byte, abs: int }
+
+// Encode one field line for `f` against `base`. Factored out of
+// `encodeFieldSection` so each representation choice is a small, testable unit.
+function qpackEncodeLine(e: Encoder, f: HeaderField, base: int): qpackLine {
+  if (!f.sensitive) {
+    let sidx = qpackFindStaticFull(f.name, f.value)
+    if (sidx >= 0) {
+      return qpackLine{ bytes: qpackPutInteger([]byte(0), 6, 0xc0, sidx), abs: -1 }
+    }
+    let dabs = qpackFindDynFull(e.table, f.name, f.value)
+    if (dabs >= 0) {
+      return qpackLine{ bytes: qpackIndexedDynamic(dabs, base), abs: dabs }
+    }
+  }
+  let snidx = qpackFindStaticName(f.name)
+  if (snidx >= 0) {
+    let flags = 0x50
+    if (f.sensitive) {
+      flags = 0x70
+    }
+    let out = qpackPutInteger([]byte(0), 4, flags, snidx)
+    out = qpackPutString(out, []byte(f.value), e.huffman)
+    return qpackLine{ bytes: out, abs: -1 }
+  }
+  let dnabs = qpackFindDynName(e.table, f.name)
+  if (dnabs >= 0) {
+    let out = qpackLiteralDynamicName(e, f, dnabs, base)
+    return qpackLine{ bytes: out, abs: dnabs }
+  }
+  let flags = 0x20
+  if (f.sensitive) {
+    flags = 0x30
+  }
+  let out = qpackPutNameLiteral([]byte(0), []byte(f.name), e.huffman, 3, flags, 0x08)
+  out = qpackPutString(out, []byte(f.value), e.huffman)
+  return qpackLine{ bytes: out, abs: -1 }
+}
+
+// An Indexed Field Line for a dynamic entry: relative to `base` when below it
+// (§4.5.2), post-base when at or above it (§4.5.3).
+function qpackIndexedDynamic(abs: int, base: int): []byte {
+  if (abs >= base) {
+    return qpackPutInteger([]byte(0), 4, 0x10, abs - base)
+  }
+  return qpackPutInteger([]byte(0), 6, 0x80, base - abs - 1)
+}
+
+// A Literal Field Line With Name Reference to a dynamic entry's name: relative
+// to `base` when below it (§4.5.4), post-base when at or above it (§4.5.5).
+function qpackLiteralDynamicName(e: Encoder, f: HeaderField, abs: int, base: int): []byte {
+  let out = []byte(0)
+  if (abs >= base) {
+    let flags = 0x08
+    if (f.sensitive) {
+      flags = 0x0c
+    }
+    out = qpackPutInteger(out, 3, flags, abs - base)
+  } else {
+    let flags = 0x40
+    if (f.sensitive) {
+      flags = 0x60
+    }
+    out = qpackPutInteger(out, 4, flags, base - abs - 1)
+  }
+  return qpackPutString(out, []byte(f.value), e.huffman)
+}
+
+// Process the decoder-stream bytes in `data` (§4.4): a Section Acknowledgment
+// raises the Known Received Count to the acked section's Required Insert Count
+// and retires it; a Stream Cancellation retires an outstanding section; an
+// Insert Count Increment advances the Known Received Count. Fails on a
+// malformed instruction, an ack for an unknown stream, or an increment past the
+// insert count.
+export function (e: Encoder) applyDecoderStream(data: []byte): ()! {
+  let r = qpackReader{ data: data, pos: 0 }
+  let guard = 0
+  while (r.pos < len(data) && guard <= len(data)) {
+    let b = qpackReadByte(r)?
+    if ((b & 0x80) != 0) {
+      let stream = qpackGetInteger(r, 7, b)?
+      qpackAckSection(e, stream)?
+    } else if ((b & 0x40) != 0) {
+      let stream = qpackGetInteger(r, 6, b)?
+      e.outstanding = qpackRetireSection(e.outstanding, stream)
+    } else {
+      let inc = qpackGetInteger(r, 6, b)?
+      e.knownReceived = e.knownReceived + inc
+      if (e.knownReceived > e.table.insertCount) {
+        fail newError("qpack: insert count increment past inserts")
+      }
+    }
+    guard = guard + 1
+  }
+}
+
+// Acknowledge the outstanding section on `stream`, raising Known Received Count
+// to its Required Insert Count. Fails if no such section is outstanding.
+function qpackAckSection(e: Encoder, stream: int): ()! {
+  let idx = -1
+  let i = 0
+  while (i < len(e.outstanding)) {
+    if (e.outstanding[i].stream == stream && idx < 0) {
+      idx = i
+    }
+    i = i + 1
+  }
+  if (idx < 0) {
+    fail newError("qpack: acknowledgment for unknown stream ${stream}")
+  }
+  if (e.outstanding[idx].ric > e.knownReceived) {
+    e.knownReceived = e.outstanding[idx].ric
+  }
+  e.outstanding = qpackRetireSection(e.outstanding, stream)
+}
+
+// The outstanding list with the first section on `stream` removed.
+function qpackRetireSection(arr: []qpackSection, stream: int): []qpackSection {
+  let out = []qpackSection(0)
+  let removed = false
+  let i = 0
+  while (i < len(arr)) {
+    if (arr[i].stream == stream && !removed) {
+      removed = true
+    } else {
+      out = append(out, arr[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The number of insertions the encoder has made (the next absolute index).
+export function (e: Encoder) insertCount(): int {
+  return e.table.insertCount
+}
+
+// The current byte size of the encoder's dynamic table.
+export function (e: Encoder) tableSize(): int {
+  return e.table.size
+}
+
+// The number of live entries in the encoder's dynamic table.
+export function (e: Encoder) tableCount(): int {
+  return len(e.table.entries)
+}
+
+// The current dynamic-table capacity in bytes.
+export function (e: Encoder) capacity(): int {
+  return e.table.capacity
+}
+
+// How many insertions the decoder has acknowledged (the Known Received Count).
+export function (e: Encoder) knownReceivedCount(): int {
+  return e.knownReceived
+}
