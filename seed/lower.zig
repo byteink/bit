@@ -1069,16 +1069,25 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
         const f = try l.lowerFunction(gsym, &.{}, nm);
         try l.out.funcs.append(gpa, f);
     }
-    for (ctx.instantiations.items, 0..) |inst, i| {
+    // The `$n` suffix counts *function* instantiations only, matching the dense
+    // `inst_ids` FuncId numbering above (#1530). `ctx.instantiations` also holds
+    // generic *type* instantiations, so its raw index leaves holes whose size
+    // depends on how many `Name<...>` types the checker happened to touch first
+    // — an artifact of the shared ledger, not part of the ordering. The relative
+    // order is what the name has to preserve, and this keeps it.
+    var inst_n: u32 = 0;
+    for (ctx.instantiations.items) |inst| {
         if (!ctx.func_sigs.contains(inst.generic.pack())) continue; // type instantiation: no code
+        const n = inst_n;
+        inst_n += 1;
         l.setModule(inst.generic.module);
         const env = try l.buildGenericEnv(inst);
         defer gpa.free(env);
         const sym = l.rmodule.symbols.items[@intFromEnum(inst.generic.id)];
         const nm = if (inst.generic.module == root)
-            try std.fmt.allocPrint(gpa, "{s}${d}", .{ sym.name, i })
+            try std.fmt.allocPrint(gpa, "{s}${d}", .{ sym.name, n })
         else
-            try std.fmt.allocPrint(gpa, "m{d}${s}${d}", .{ @intFromEnum(inst.generic.module), sym.name, i });
+            try std.fmt.allocPrint(gpa, "m{d}${s}${d}", .{ @intFromEnum(inst.generic.module), sym.name, n });
         defer gpa.free(nm);
         const f = try l.lowerFunction(inst.generic, env, nm);
         try l.out.funcs.append(gpa, f);
