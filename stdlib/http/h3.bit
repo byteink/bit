@@ -1,0 +1,171 @@
+// Bit standard library — http module: the HTTP/3-over-QUIC glue.
+
+// ---------------------------------------------------------------------------
+// HTTP/3 over QUIC
+// ---------------------------------------------------------------------------
+//
+// HTTP/3 (RFC 9114) runs over QUIC (UDP), not TLS-over-TCP, so it is opt-in: a
+// server binds a UDP socket with `serveH3`, and a client reaches it either with an
+// explicit `https+h3://` URL or by upgrading after reading an `Alt-Svc` header a
+// TLS server advertised. The `std/http3` engine does the QUIC streams, QPACK, and
+// framing; this module maps between its `H3Request`/`H3Response` (pseudo-headers +
+// a `[]HeaderField` list) and the transport-agnostic `Request`/`Response`, exactly
+// as the `h2glue*` helpers do for HTTP/2. Every helper here is prefixed `h3glue`.
+//
+// The QUIC transport demultiplexes many client connections on one socket, so
+// `serveH3` runs an accept loop and serves each connection on its own green
+// thread; run the call itself on its own green thread. The h3 client is still one
+// request per connection, matching the rest of this module.
+
+// Connection-specific header fields forbidden on an HTTP/3 message (RFC 9114
+// §4.2), plus Content-Length (the framing supplies the body length).
+function h3glueHopByHop(name: string): bool {
+  return name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" || name == "content-length"
+}
+
+// Serialize an h3 header-field list into this module's raw "Name: value\r\n" block.
+function h3glueBlock(fields: []HeaderField): string {
+  let block = ""
+  for f of fields {
+    block = block + "${f.name}: ${f.value}\r\n"
+  }
+  return block
+}
+
+// Parse a raw "Name: value\r\n" block into h3 header fields, lower-casing each name
+// (HTTP/3 requires it) and dropping connection-specific headers. Appends to `dst`.
+// Bounded: each turn consumes at least one line from `rest`.
+function h3glueFields(dst: []HeaderField, block: string): []HeaderField {
+  let out = dst
+  let rest = block
+  while (len(rest) > 0) {
+    let eol = indexOf(rest, "\r\n")
+    let line = rest
+    if (eol >= 0) {
+      line = rest[0:eol]
+      rest = rest[eol + 2:len(rest)]
+    } else {
+      rest = ""
+    }
+    let colon = indexOf(line, ":")
+    if (colon < 0) {
+      continue
+    }
+    let name = toLower(trimSpace(line[0:colon]))
+    if (len(name) == 0 || h3glueHopByHop(name)) {
+      continue
+    }
+    out = append(
+      out,
+      HeaderField{ name: name, value: trimSpace(line[colon + 1:len(line)]), sensitive: false },
+    )
+  }
+  return out
+}
+
+// Build an h3 request for `method u.path` with `body` over scheme https.
+function h3glueRequestOf(method: string, u: Url, body: string): H3Request {
+  return H3Request{
+    method: method,
+    scheme: "https",
+    authority: h2glueAuthority(u),
+    path: u.path,
+    headers: []HeaderField(0),
+    body: []byte(body),
+  }
+}
+
+// Map an h3 response to this module's `Response`: `:status` is the status, the
+// remaining fields become the raw header block, Content-Type is read from it.
+function h3glueResponse(res: H3Response): Response {
+  let block = h3glueBlock(res.headers)
+  return Response{
+    status: res.status,
+    contentType: header(block, "content-type"),
+    headers: block,
+    body: string(res.body),
+  }
+}
+
+// Map an h3 request to this module's `Request`, flattening the header fields.
+function h3glueRequestIn(req: H3Request): Request {
+  return Request{
+    method: req.method,
+    path: req.path,
+    headers: h3glueBlock(req.headers),
+    body: string(req.body),
+  }
+}
+
+// Map this module's `Response` to an h3 response: Content-Type becomes a header
+// field, the raw header block is parsed into fields, and the body carries over.
+function h3glueResponseOut(res: Response): H3Response {
+  let fields = []HeaderField(0)
+  if (len(res.contentType) > 0) {
+    fields = append(
+      fields,
+      HeaderField{ name: "content-type", value: res.contentType, sensitive: false },
+    )
+  }
+  fields = h3glueFields(fields, res.headers)
+  return H3Response{ status: res.status, headers: fields, body: []byte(res.body) }
+}
+
+// Run one request/response over HTTP/3: dial QUIC at `u.host:u.port`, send the
+// request on a fresh stream, read the response, and close the connection (one
+// request per connection, as elsewhere in this module).
+function h3Exchange(u: Url, method: string, body: string): Response! {
+  let conn = h3Dial(u.host, u.port, u.host)?
+  let res = conn.request(h3glueRequestOf(method, u, body)) catch e {
+    conn.close()
+    fail e
+  }
+  conn.close()
+  return h3glueResponse(res)
+}
+
+// Serve one accepted HTTP/3 connection: accept each request, dispatch it through
+// the transport-agnostic `handler`, and answer on the same stream. Bounded so the
+// loop is provably finite; returns (closing the connection) when the peer stops.
+function serveH3Conn(conn: H3Conn, handler: (Request) => Response) {
+  let guard = 0
+  while (guard < 1048576) {
+    guard = guard + 1
+    let sr = conn.accept() catch e {
+      conn.close()
+      return
+    }
+    conn.respond(sr, h3glueResponseOut(handler(h3glueRequestIn(sr.req)))) catch e2 {
+      conn.close()
+      return
+    }
+  }
+  conn.close()
+}
+
+// Serve HTTP/3 on `host:port` (UDP) with the certificate chain `certPem` and
+// matching private key `keyPem` (both PEM), dispatching every request to the same
+// `(Request) => Response` handler `serve`/`serveTls` use. The QUIC listener
+// demultiplexes many client connections on the one socket; each accepted
+// connection is served on its own green thread. Runs an accept loop (bounded, so
+// provably finite) until the socket closes; run the call itself on its own green
+// thread. Advertise it from a `serveTls` server on the same port (its Alt-Svc
+// header) so `https://` clients can discover and upgrade to it.
+export function serveH3(
+  host: string,
+  port: int,
+  certPem: string,
+  keyPem: string,
+  handler: (Request) => Response,
+): ()! {
+  let sock = udpBind(host, port)?
+  let lst = h3Listen(sock, certPem, keyPem)?
+  let guard = 0
+  while (guard < 1048576) {
+    guard = guard + 1
+    let conn = lst.accept() catch e {
+      return
+    }
+    spawn serveH3Conn(conn, handler)
+  }
+}

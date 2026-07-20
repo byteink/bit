@@ -1,0 +1,136 @@
+// Bit standard library — http module: the HTTP/1.1 and HTTPS server.
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+// A listening HTTP server. Drive it with an `accept()` loop, spawning a green
+// thread per exchange — a slow handler cannot delay the next accept.
+export struct Server { listener: Listener }
+
+// One accepted request and the connection to answer it on.
+export struct Exchange { conn: Conn, request: Request }
+
+// Bind and start listening for HTTP on `host:port`. `port` 0 lets the kernel
+// choose one; read it back with `port()`.
+export function serve(host: string, port: int): Server! {
+  let l = listen(host, port)?
+  return Server{ listener: l }
+}
+
+// The port the server is bound to.
+export function (s: Server) port(): int! {
+  return s.listener.port()?
+}
+
+// Accept the next connection and read its request. Parks until a client
+// arrives; the returned `Exchange` carries the connection to respond on.
+export function (s: Server) accept(): Exchange! {
+  let c = s.listener.accept()?
+  let req = readMessage(netStream{ conn: c })?
+  return Exchange{ conn: c, request: req }
+}
+
+// Write `res` to the exchange's connection and close it (one request per
+// connection in v1).
+export function (e: Exchange) respond(res: Response): ()! {
+  e.conn.write(serializeResponse(res))?
+  e.conn.close()
+}
+
+export function (s: Server) close() {
+  s.listener.close()
+}
+
+// Handle one exchange with `handler`, on the calling green thread. A write
+// failure just drops the connection — there is no client left to tell.
+function dispatch(ex: Exchange, handler: (Request) => Response) {
+  ex.respond(handler(ex.request)) catch e {
+    return
+  }
+}
+
+// Serve HTTP on `host:port` forever, dispatching every request to `handler` on
+// its own green thread — the idiomatic server. `handler` is an ordinary
+// function value: `listenAndServe("127.0.0.1", 8080, route)`. Returns only on a
+// bind or accept error. For a kernel-chosen port, or to serve a bounded number
+// of requests, drive the `Server`/`accept`/`respond` API yourself instead.
+export function listenAndServe(host: string, port: int, handler: (Request) => Response): ()! {
+  let s = serve(host, port)?
+  while (true) {
+    let ex = s.accept()?
+    spawn dispatch(ex, handler)
+  }
+}
+
+// Read one request off `s`, answer it with `handler`, and close. On the calling
+// green thread; a read or write failure just drops the connection. `altPort` is
+// advertised in the response's Alt-Svc header (0 to advertise nothing).
+function serveOne(s: byteStream, handler: (Request) => Response, altPort: int) {
+  answer(s, handler, altPort) catch e {
+    return
+  }
+}
+
+function answer(s: byteStream, handler: (Request) => Response, altPort: int): ()! {
+  let req = readMessage(s)?
+  let res = handler(req)
+  if (altPort > 0) {
+    res.headers = res.headers + altSvcHeader(altPort)
+  }
+  s.writeStr(serializeResponse(res))?
+  s.shut()
+}
+
+// Serve HTTPS on `host:port` forever with the certificate chain `certPem` and
+// matching private key `keyPem` (both PEM), dispatching every request to
+// `handler` on its own green thread — the TLS mirror of `listenAndServe`. ALPN
+// offers `h2` then `http/1.1`, so a client that negotiates HTTP/2 is served over
+// the `std/http2` engine and any other over HTTP/1.1; `handler` is the same either
+// way. Every response also carries an `Alt-Svc: h3=":<port>"` header (RFC 7838)
+// advertising an HTTP/3 endpoint on the same port number over UDP, so a client can
+// discover it and upgrade a later request — pair `serveTls` with `serveH3` on the
+// same `port`. Returns only on a bind, accept, or handshake error.
+export function serveTls(
+  host: string,
+  port: int,
+  certPem: string,
+  keyPem: string,
+  handler: (Request) => Response,
+): ()! {
+  let cfg = newTlsConfig(emptyTrustStore())
+  cfg.certPem = certPem
+  cfg.keyPem = keyPem
+  cfg.alpn = ["h2", "http/1.1"]
+  let l = tlsListen(host, port, cfg)?
+  while (true) {
+    // A per-connection failure (a bad or rejected TLS handshake — e.g. a client
+    // whose ALPN offer shares nothing with ours, which RFC 7301 §3.2 makes us
+    // abort) must drop THAT connection, never the listener: propagating it would
+    // let one malformed client take down the whole server. This does not hot-spin
+    // — the next iteration blocks in the TCP accept until a real connection
+    // arrives. A genuinely dead listener socket is the one case this can't tell
+    // apart; that is a fatal, rare condition, tracked separately.
+    let conn = l.accept() catch e {
+      continue
+    }
+    spawn serveTlsConn(conn, handler, port)
+  }
+}
+
+// The Alt-Svc advertisement (RFC 7838) a TLS server appends to every response:
+// HTTP/3 is reachable at the same port number, over UDP.
+function altSvcHeader(port: int): string {
+  return "Alt-Svc: h3=\":${itoa(port)}\"\r\n"
+}
+
+// Dispatch one accepted TLS connection to the HTTP/2 or HTTP/1.1 server path by
+// its negotiated ALPN protocol. Runs on the spawned per-connection green thread.
+// `altPort` is the HTTP/3 port advertised in each response's Alt-Svc header.
+function serveTlsConn(conn: TlsConn, handler: (Request) => Response, altPort: int) {
+  if (conn.alpnProtocol() == "h2") {
+    h2glueServe(conn, handler, altPort)
+    return
+  }
+  serveOne(tlsStream{ conn: conn }, handler, altPort)
+}

@@ -1,0 +1,295 @@
+// Bit standard library — http module: URL parsing and the HTTP client.
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+// A parsed http://, https:// or https+h3:// URL. Port defaults to 80 (http) or
+// 443 (https), path to "/". `https` selects the TLS transport; `h3` selects the
+// HTTP/3 (QUIC) transport — an opt-in `https+h3://` scheme, never inferred.
+struct Url { host: string, port: int, path: string, https: bool, h3: bool }
+
+function parseUrl(url: string): Url! {
+  let rest = url
+  let https = false
+  let h3 = false
+  let port = 80
+  let lower = toLower(rest)
+  if (hasPrefix(lower, "https+h3://")) {
+    https = true
+    h3 = true
+    port = 443
+    rest = rest[11:len(rest)]
+  } else if (hasPrefix(lower, "https://")) {
+    https = true
+    port = 443
+    rest = rest[8:len(rest)]
+  } else if (hasPrefix(lower, "http://")) {
+    rest = rest[7:len(rest)]
+  }
+  // Split authority from path at the first '/'.
+  let slash = indexOf(rest, "/")
+  let authority = rest
+  let path = "/"
+  if (slash >= 0) {
+    authority = rest[0:slash]
+    path = rest[slash:len(rest)]
+  }
+  // Split host from an optional :port, which overrides the scheme default.
+  let host = authority
+  let colon = indexOf(authority, ":")
+  if (colon >= 0) {
+    host = authority[0:colon]
+    let p = atoi(authority[colon + 1:len(authority)])
+    if (p < 0) {
+      fail newError("bad port in ${url}")
+    }
+    port = p
+  }
+  if (len(host) == 0) {
+    fail newError("no host in ${url}")
+  }
+  return Url{ host: host, port: port, path: path, https: https, h3: h3 }
+}
+
+// Parse a response off a fully-read connection: status line, headers, body.
+function parseResponse(raw: string): Response! {
+  let sep = indexOf(raw, "\r\n\r\n")
+  if (sep < 0) {
+    fail newError("malformed response")
+  }
+  let headBlock = raw[0:sep]
+  let body = raw[sep + 4:len(raw)]
+
+  let eol = indexOf(headBlock, "\r\n")
+  let statusLine = headBlock
+  let headers = ""
+  if (eol >= 0) {
+    statusLine = headBlock[0:eol]
+    headers = headBlock[eol + 2:len(headBlock)]
+  }
+  // "HTTP/1.1 200 OK" — the code is the token after the first space.
+  let sp1 = indexOf(statusLine, " ")
+  if (sp1 < 0) {
+    fail newError("malformed status line")
+  }
+  let afterVer = statusLine[sp1 + 1:len(statusLine)]
+  let sp2 = indexOf(afterVer, " ")
+  let codeText = afterVer
+  if (sp2 >= 0) {
+    codeText = afterVer[0:sp2]
+  }
+  let code = atoi(codeText)
+  if (code < 0) {
+    fail newError("bad status code")
+  }
+  return Response{
+    status: code,
+    contentType: header(headers, "content-type"),
+    headers: headers,
+    body: body,
+  }
+}
+
+// The HTTP/1.1 request text for `method u.path` with `body`, asking the server to
+// close the connection so the whole response can be read to EOF.
+function buildRequest(method: string, u: Url, body: string): string {
+  let req = "${method} ${u.path} HTTP/1.1\r\n"
+  req = req + "Host: ${u.host}\r\n"
+  req = req + "Connection: close\r\n"
+  if (len(body) > 0) {
+    req = req + "Content-Length: ${itoa(len(body))}\r\n"
+  }
+  return req + "\r\n" + body
+}
+
+// Send `reqText` over `s`, read the whole response to EOF, close, and parse it.
+function exchangeOn(s: byteStream, reqText: string): Response! {
+  s.writeStr(reqText)?
+  let raw = readAllStream(s)?
+  s.shut()
+  return parseResponse(raw)?
+}
+
+// Default trust anchors for verifying servers: the operating-system store when
+// available, else the small bundled root set. Rewrapped as a std/tls trust store
+// — both stores hold the same parsed X.509 roots, so no PEM round-trip is needed.
+function defaultRoots(): TlsTrustStore {
+  let sys = systemRoots() catch e {
+    return TlsTrustStore{ roots: bundled().roots }
+  }
+  return TlsTrustStore{ roots: sys.roots }
+}
+
+// A secure-by-default client TLS config: verification on, default roots, ALPN
+// `h2` then `http/1.1` (so the server may pick HTTP/2). SNI defaults to the
+// request host inside `tls.dial`.
+function defaultClientConfig(): TlsConfig {
+  let cfg = newTlsConfig(defaultRoots())
+  cfg.alpn = ["h2", "http/1.1"]
+  return cfg
+}
+
+// Send `method url` with an optional body and return the response. An `https://`
+// URL runs over TLS 1.3, verifying the server against the system/bundled roots;
+// if ALPN negotiates `h2` the exchange runs over the `std/http2` engine, else over
+// HTTP/1.1. An `http://` URL runs over cleartext TCP (HTTP/1.1). The server is
+// asked to close the connection, so the whole HTTP/1.1 response is read to EOF.
+// For a custom TLS config (pinned roots, a fixed `serverName`,
+// `insecureSkipVerify`), use `requestTls`.
+export function request(method: string, url: string, body: string): Response! {
+  let u = parseUrl(url)?
+  if (u.h3) {
+    return h3Exchange(u, method, body)?
+  }
+  if (u.https) {
+    return httpsExchange(tlsDial(u.host, u.port, defaultClientConfig())?, method, u, body)?
+  }
+  return exchangeOn(netStream{ conn: dial(u.host, u.port)? }, buildRequest(method, u, body))?
+}
+
+// As `request`, but over https with an explicit TLS `config` (custom roots, a
+// pinned `serverName`, `insecureSkipVerify` for tests). Fails if `url` is not
+// https. `config.alpn` defaults to `h2` then `http/1.1` when empty; the negotiated
+// protocol selects the HTTP/2 engine or the HTTP/1.1 path.
+export function requestTls(
+  method: string,
+  url: string,
+  body: string,
+  config: TlsConfig,
+): Response! {
+  let u = parseUrl(url)?
+  if (!u.https) {
+    fail newError("requestTls: ${url} is not an https URL")
+  }
+  let cfg = config
+  if (len(cfg.alpn) == 0) {
+    cfg.alpn = ["h2", "http/1.1"]
+  }
+  return httpsExchange(tlsDial(u.host, u.port, cfg)?, method, u, body)?
+}
+
+// GET `url` (http or https).
+export function get(url: string): Response! {
+  return request("GET", url, "")?
+}
+
+// POST `body` to `url` (http or https).
+export function post(url: string, body: string): Response! {
+  return request("POST", url, body)?
+}
+
+// GET an https `url` with an explicit TLS `config`.
+export function getTls(url: string, config: TlsConfig): Response! {
+  return requestTls("GET", url, "", config)?
+}
+
+// POST `body` to an https `url` with an explicit TLS `config`.
+export function postTls(url: string, body: string, config: TlsConfig): Response! {
+  return requestTls("POST", url, body, config)?
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 client with Alt-Svc discovery
+// ---------------------------------------------------------------------------
+//
+// A `Client` holds the two pieces of state a self-upgrading client needs, so no
+// module-global mutable state is required: the TLS config for its `https://` leg,
+// and an Alt-Svc cache mapping an authority (`host:port`) to the HTTP/3 UDP port a
+// server advertised. The cache is a `map` (a reference type), so a method updates
+// the same table the caller's `Client` holds. Hold one `Client` across requests to
+// let a later request to a known authority upgrade to HTTP/3 automatically.
+
+// The h3 port advertised for the `h3=` alternative in an Alt-Svc header value
+// (RFC 7838), or -1 if there is none. Accepts `h3=":443"` and `h3="host:443"` —
+// the port is the digits after the last colon inside the quoted authority.
+function parseAltSvcH3Port(av: string): int {
+  let at = indexOf(av, "h3=")
+  if (at < 0) {
+    return 0 - 1
+  }
+  let rest = av[at + 3:len(av)]
+  if (len(rest) > 0 && rest[0] == '"') {
+    rest = rest[1:len(rest)]
+  }
+  let q = indexOf(rest, "\"")
+  let val = rest
+  if (q >= 0) {
+    val = rest[0:q]
+  }
+  let colon = 0 - 1
+  let i = 0
+  while (i < len(val)) {
+    if (val[i] == ':') {
+      colon = i
+    }
+    i = i + 1
+  }
+  if (colon < 0) {
+    return 0 - 1
+  }
+  return atoi(val[colon + 1:len(val)])
+}
+
+// An HTTP client that remembers the HTTP/3 endpoints servers advertise via
+// Alt-Svc, so a later request to the same authority upgrades to HTTP/3. It has no
+// global state: hold one across requests to reuse its cache.
+export struct Client { tls: TlsConfig, h3Ports: map<string, int> }
+
+// A `Client` with secure-by-default TLS (verification on, system/bundled roots,
+// ALPN `h2` then `http/1.1`) and an empty Alt-Svc cache.
+export function newClient(): Client {
+  return Client{ tls: defaultClientConfig(), h3Ports: map<string, int>() }
+}
+
+// A `Client` with an explicit `std/tls` config for its `https://` leg (pinned
+// roots, a fixed `serverName`, `insecureSkipVerify`) and an empty Alt-Svc cache.
+export function newClientTls(config: TlsConfig): Client {
+  return Client{ tls: config, h3Ports: map<string, int>() }
+}
+
+// Record any `h3=` Alt-Svc advertisement `res` carried for `authority`.
+function (c: Client) learnAltSvc(authority: string, res: Response) {
+  let av = header(res.headers, "alt-svc")
+  if (len(av) == 0) {
+    return
+  }
+  let p = parseAltSvcH3Port(av)
+  if (p > 0) {
+    c.h3Ports[authority] = p
+  }
+}
+
+// Send `method url` with an optional body. An `https+h3://` URL always uses
+// HTTP/3. An `https://` URL upgrades to HTTP/3 when this client has cached an
+// Alt-Svc endpoint for the authority from an earlier response; otherwise it runs
+// over TLS (HTTP/2 or HTTP/1.1 by ALPN) and learns any Alt-Svc the response
+// advertises. An `http://` URL runs over cleartext HTTP/1.1.
+export function (c: Client) request(method: string, url: string, body: string): Response! {
+  let u = parseUrl(url)?
+  if (u.h3) {
+    return h3Exchange(u, method, body)?
+  }
+  if (!u.https) {
+    return request(method, url, body)?
+  }
+  let key = h2glueAuthority(u)
+  let cached = c.h3Ports[key]
+  if (cached != 0) {
+    let hu = Url{ host: u.host, port: cached, path: u.path, https: true, h3: true }
+    return h3Exchange(hu, method, body)?
+  }
+  let res = requestTls(method, url, body, c.tls)?
+  c.learnAltSvc(key, res)
+  return res
+}
+
+// GET `url` through this client (HTTP/3 when discovered, else TLS or cleartext).
+export function (c: Client) get(url: string): Response! {
+  return c.request("GET", url, "")?
+}
+
+// POST `body` to `url` through this client.
+export function (c: Client) post(url: string, body: string): Response! {
+  return c.request("POST", url, body)?
+}

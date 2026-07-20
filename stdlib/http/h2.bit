@@ -1,0 +1,204 @@
+// Bit standard library — http module: the HTTP/2-over-ALPN glue.
+
+// ---------------------------------------------------------------------------
+// HTTP/2 over ALPN
+// ---------------------------------------------------------------------------
+//
+// When a TLS handshake negotiates ALPN `h2`, the exchange runs over the
+// `std/http2` connection engine instead of the HTTP/1.1 wire path. That engine
+// drives its own reader/writer/loop green threads over an abstract byte
+// `Transport`; `h2glueTransport` adapts a `TlsConn` to it. This is safe without a
+// lock because TLS 1.3 keeps separate read (`appRead`) and write (`appWrite`)
+// record state, so the engine's concurrent reader and writer touch disjoint halves
+// of the connection. Requests and responses cross the http<->http2 boundary
+// through the `h2glue*` mappers: the `:method`/`:scheme`/`:authority`/`:path` and
+// `:status` pseudo-headers become the `Request`/`Response` fields, and the
+// remaining fields become the raw header block this module carries. Every helper
+// here is prefixed `h2glue`.
+
+// Run `method u.path` with `body` over an established `TlsConn`, using the HTTP/2
+// engine when ALPN negotiated `h2` and the HTTP/1.1 wire path otherwise.
+function httpsExchange(conn: TlsConn, method: string, u: Url, body: string): Response! {
+  if (conn.alpnProtocol() == "h2") {
+    return h2clientExchange(conn, method, u, body)?
+  }
+  return exchangeOn(tlsStream{ conn: conn }, buildRequest(method, u, body))?
+}
+
+// Adapt a `TlsConn` to the http2 engine's byte `Transport`. The engine's `read`
+// is not fallible — a read error is end-of-stream — so the shim maps any TLS read
+// failure to an empty slice, which the engine treats as a clean close.
+function h2glueTransport(conn: TlsConn): H2Transport {
+  return h2newTransport(
+    (n) => {
+      let b = conn.read(n) catch e {
+        return []byte(0)
+      }
+      return b
+    },
+    (b) => {
+      h2glueWrite(conn, b)
+    },
+    () => {
+      conn.close()
+    },
+  )
+}
+
+// Best-effort transport write for the http2 engine. A socket write failure is
+// swallowed: the engine's reader observes the same closed transport and winds the
+// connection down, and the writer thread is fire-and-forget, so propagating the
+// error adds nothing. A named helper because an arrow closure cannot be fallible.
+function h2glueWrite(conn: TlsConn, b: []byte) {
+  conn.write(b) catch e {
+    return
+  }
+}
+
+// Run one request/response over the HTTP/2 engine on an h2-negotiated `TlsConn`,
+// then tear the connection down (this module is one request per connection). A
+// setup or round-trip failure closes the socket and propagates.
+function h2clientExchange(conn: TlsConn, method: string, u: Url, body: string): Response! {
+  let hc = h2connect(h2glueTransport(conn), h2defaultConfig()) catch e {
+    conn.close()
+    fail e
+  }
+  let res = hc.roundTrip(h2glueRequestOf(method, u, body)) catch e {
+    conn.close()
+    fail e
+  }
+  conn.close()
+  return h2glueResponse(res)
+}
+
+// Serve one h2-negotiated connection: run the http2 server engine and dispatch
+// each stream to the transport-agnostic `handler`, mapping the http2 request and
+// response to this module's types on the way in and out. Each response advertises
+// the HTTP/3 endpoint on `altPort` via an Alt-Svc header.
+function h2glueServe(conn: TlsConn, handler: (Request) => Response, altPort: int) {
+  let hc = h2accept(h2glueTransport(conn), h2defaultConfig()) catch e {
+    conn.close()
+    return
+  }
+  hc.serve((r) => h2glueResponseOutAlt(handler(h2glueRequestIn(r)), altPort)) catch e2 {
+    return
+  }
+}
+
+// Map this module's `Response` to an http2 response, first appending the Alt-Svc
+// advertisement (when `altPort > 0`) so an HTTP/2 client learns the h3 endpoint.
+function h2glueResponseOutAlt(res: Response, altPort: int): H2Response {
+  let out = res
+  if (altPort > 0) {
+    out.headers = out.headers + altSvcHeader(altPort)
+  }
+  return h2glueResponseOut(out)
+}
+
+// The HTTP/2 `:authority`: the host, with the port appended only when it is not
+// the https default (443), matching how a client forms the pseudo-header.
+function h2glueAuthority(u: Url): string {
+  if (u.port == 443) {
+    return u.host
+  }
+  return "${u.host}:${itoa(u.port)}"
+}
+
+// Build an http2 request for `method u.path` with `body` over scheme https.
+function h2glueRequestOf(method: string, u: Url, body: string): H2Request {
+  return H2Request{
+    method: method,
+    scheme: "https",
+    authority: h2glueAuthority(u),
+    path: u.path,
+    headers: []H2HeaderField(0),
+    body: []byte(body),
+  }
+}
+
+// Whether a lower-case header `name` is a connection-specific field forbidden on
+// an HTTP/2 stream (RFC 9113 §8.2.2). Content-Length is dropped too — the engine
+// frames the body, so an explicit length is redundant.
+function h2glueHopByHop(name: string): bool {
+  return name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" || name == "content-length"
+}
+
+// Serialize an http2 header-field list into this module's raw "Name: value\r\n"
+// block, so `header()` reads it exactly as an HTTP/1.1 block.
+function h2glueBlock(fields: []H2HeaderField): string {
+  let block = ""
+  for f of fields {
+    block = block + "${f.name}: ${f.value}\r\n"
+  }
+  return block
+}
+
+// Parse a raw "Name: value\r\n" block into http2 header fields, lower-casing each
+// name (HTTP/2 requires it) and dropping connection-specific headers. Appends to
+// `dst`. Bounded: each turn consumes at least one line from `rest`.
+function h2glueFields(dst: []H2HeaderField, block: string): []H2HeaderField {
+  let out = dst
+  let rest = block
+  while (len(rest) > 0) {
+    let eol = indexOf(rest, "\r\n")
+    let line = rest
+    if (eol >= 0) {
+      line = rest[0:eol]
+      rest = rest[eol + 2:len(rest)]
+    } else {
+      rest = ""
+    }
+    let colon = indexOf(line, ":")
+    if (colon < 0) {
+      continue
+    }
+    let name = toLower(trimSpace(line[0:colon]))
+    if (len(name) == 0 || h2glueHopByHop(name)) {
+      continue
+    }
+    out = append(
+      out,
+      H2HeaderField{ name: name, value: trimSpace(line[colon + 1:len(line)]), sensitive: false },
+    )
+  }
+  return out
+}
+
+// Map an http2 response to this module's `Response`: `:status` is the status, the
+// remaining fields become the raw header block, and Content-Type is read from it
+// just as on the HTTP/1.1 path.
+function h2glueResponse(res: H2Response): Response {
+  let block = h2glueBlock(res.headers)
+  return Response{
+    status: res.status,
+    contentType: header(block, "content-type"),
+    headers: block,
+    body: string(res.body),
+  }
+}
+
+// Map an http2 request to this module's `Request`, flattening the header fields to
+// a raw header block.
+function h2glueRequestIn(req: H2Request): Request {
+  return Request{
+    method: req.method,
+    path: req.path,
+    headers: h2glueBlock(req.headers),
+    body: string(req.body),
+  }
+}
+
+// Map this module's `Response` to an http2 response: Content-Type becomes a header
+// field, the raw header block is parsed into fields, and the body carries over.
+// The engine adds `:status` and frames the body itself.
+function h2glueResponseOut(res: Response): H2Response {
+  let fields = []H2HeaderField(0)
+  if (len(res.contentType) > 0) {
+    fields = append(
+      fields,
+      H2HeaderField{ name: "content-type", value: res.contentType, sensitive: false },
+    )
+  }
+  fields = h2glueFields(fields, res.headers)
+  return H2Response{ status: res.status, headers: fields, body: []byte(res.body) }
+}
