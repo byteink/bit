@@ -1194,6 +1194,28 @@ prepended to the child's environment (first match wins, so it overrides any
 inherited value). `bit test` calls it once per discovered test so the test
 binary's synthetic `main` (selfhost/testgen.bit) dispatches to test `idx`.
 
+**`bit_rt_host_target` and `bit_rt_auxv` are permanently compiler-provided
+primitives — NOT ported to Bit (SEAM 6, #1580).** Both are entries in the seed's
+`prim_rt_fns`, so `hostTarget()`/`auxv()` lower to an `ir.RtFn` that codegen emits
+as a call to the symbol itself; a Bit body `return hostTarget()` would therefore
+become a call to itself once #1369 drops the `_root` infix (the pin cycle
+`tests/rootpins.zig` guards). Neither is expressible in Bit anyway:
+
+- `host_target` is a **property of the emit**, not a runtime computation. The
+  archive is compiled once per target, so its `builtin.target` *is* the build
+  target — each per-target `libbitrt.a` returns its own ordinal (verified by
+  disassembly: x86_64-linux → 0, aarch64-linux → 1, aarch64-macos → 2). Since the
+  seed selects the archive by `--target` (`libbitrtPath`), a cross-built binary
+  reports the target it was built FOR, not the host it was built ON. A running Bit
+  program has no compile-time `builtin` and thus no other way to know this.
+- `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**.
+  The kernel places the auxiliary vector on the initial stack, unreachable once any
+  Bit code runs, so only the entry (`rtStartMain` → `initLinuxTls`) can capture it —
+  a single writer, Linux-only; `machoMain` captures none. `bit_rt_auxv` merely hands
+  the captured pointer to Bit, whose own `runtime/auxv` does the scan. When SEAM 3
+  ports the entry to Bit the cell moves there; it must never be captured a second
+  time.
+
 ---
 
 ## 20. Networking (`runtime/net.zig` + `runtime/root.zig`)
