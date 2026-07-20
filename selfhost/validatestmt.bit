@@ -1,0 +1,502 @@
+// Self-host: validation of expressions and statements (#1503, split out of
+// validate.bit). Binary operands, the statement walk itself, expression
+// statements, and E0055 missing-return divergence.
+
+// ---- expressions -----------------------------------------------------------
+
+// A binary operator whose operands do not admit it (§14.2, E0053).
+//
+// Reported HERE and not in `checkBinary`, because `checkExprType` is a recompute
+// rather than a cache: the sweep runs it at every Binding/Call node and this walk
+// runs it again, so an emit down there would fire twice for one expression. The
+// seed can emit inline only because its single recursive walk visits each node
+// exactly once.
+//
+// The whole rule lives in check.bit (`joinOperandTypes` / `numericBinaryOk`) and
+// is asked, not restated — one operator rule, two callers: the type it yields and
+// the error it justifies must never disagree.
+function vBinary(c: Checker, node: int) {
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  let a = checkExprType(c, kids[0])
+  let b = checkExprType(c, kids[1])
+  // An operand that did not infer is bit2's gap, not the program's — and the
+  // seed suppresses here too (`if (lty == .invalid or rty == .invalid)`).
+  if (a == 0 || b == 0) { return }
+  if (vMentionsInvalid(c, a, 0) || vMentionsInvalid(c, b, 0)) { return }
+  // ponytail: comparisons (`==`, `<`, `&&`) are not checked yet — the seed gates
+  // them on `comparable`/`hasOrdering`/bool operands, none of which are ported.
+  // Arithmetic and bitwise are, and they are where E0053 actually fires.
+  if (isComparisonOp(n.main)) { return }
+  if (n.main == int(Kind.Plus) && stringish(c, a) && stringish(c, b)) { return }
+  // Pointer arithmetic (§11.4): `p + n` / `p - n` advance a `*T` by
+  // `n * sizeOf(T)` bytes and yield a `*T`. Carved out before the numeric path,
+  // exactly as string concatenation is above.
+  if ((n.main == int(Kind.Plus) || n.main == int(Kind.Minus)) &&
+      c.ctx.types[a].kind == TypeKind.Ptr && isIntegerOperand(c, b)) { return }
+  let joined = joinOperandTypes(c, kids[0], kids[1], a, b)
+  if (numericBinaryOk(c, joined, isBitwiseOp(n.main))) { return }
+  let ln = typeName(c.ctx, a)
+  let rn = typeName(c.ctx, b)
+  reportNoHint(c.diags, ecInvalidOperand, vSpan(c, node),
+    "operator not defined for '${ln}' and '${rn}'")
+}
+
+// ---- the statement walk ----------------------------------------------------
+
+// `return` (§16.2) against the enclosing function's declared result.
+function vReturn(c: Checker, result: int, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0) {
+    if (result != c.ctx.voidId && result != 0) {
+      reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node),
+        "'return' needs a value: this function's result is not void")
+    }
+    return
+  }
+  if (len(kids) == 1) {
+    // vExpectExpr, not vExpect: `return [1,2]` from a `[]i32` result needs the
+    // declared element type pushed into the literal, or the defaulted `[]i64`
+    // is compared against `[]i32` and correct code is rejected.
+    vExpectExpr(c, kids[0], result)
+    return
+  }
+  // ponytail: `return a, b` builds a tuple result (§13.1), unvalidated. The seed
+  // interns the tuple to compare against; interning a type here would append ids
+  // the seed does not have at this point, and the id order is the fixed point's.
+}
+
+// Validates a call's argument COUNT against a plain free function's declared
+// parameter count (E0050). Deliberately permissive — the seed's full call check
+// also covers builtins, conversions, type constructors, variadics, and generic
+// arity, each with its own rule; porting only the common fixed-arity free-call
+// case keeps FALSEPOS at 0 by SKIPPING everything undecidable here:
+//   - a non-identifier callee (method/member/computed call);
+//   - a name that is not a known free function (builtin, constructor, or a
+//     local variable holding a function value — a call_value, not a decl);
+//   - a name shadowed by a local binding (the call targets the value, not the
+//     free function of the same name);
+//   - a generic function (kids[2] present) — the seed resolves its arity
+//     through instantiation, not a bare parameter count.
+// `print` (fd 1) and `eprint` (fd 2) share one signature: exactly one `string`
+// argument, void result (seed check.zig ~2659, ABI.md §12). This is the one
+// builtin arg-type check bit needs — the rest of vCall punts on builtins on
+// purpose. Guards on a bit2 inference gap (arg type 0 / mentions-invalid) so it
+// never becomes a false positive; the assignability itself is vExpect's, so
+// `print("x")` (untyped string) and interpolations pass while `print(x)` for a
+// non-string x is E0041 with the seed's exact text.
+function vPrintCall(c: Checker, node: int, name: string) {
+  let args = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let got = len(args)
+  if (got != 1) {
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "'${name}' takes exactly 1 argument, found ${got}")
+  }
+  if (got >= 1) {
+    let a = args[0]
+    if (getNode(c.tree, a).tag == Tag.Arg) { a = kidsOf(c.tree, a)[0] }
+    let t = checkExprType(c, a)
+    if (t == 0 || vMentionsInvalid(c, t, 0)) { return }
+    vExpect(c, a, t, primType(c.ctx, 11))
+  }
+}
+
+function vCall(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) { return }
+  let sp = getNode(c.tree, callee).span
+  let name = c.source[sp.start:sp.end]
+  if (envLookup(c, name) != 0) { return } // a local shadows the free function
+  // PRECEDENCE: a user declaration shadows the predeclared name (SPEC 17.5), so
+  // the declaration is consulted BEFORE the `print`/`eprint` arity+type rule.
+  // Checked the other way round, a program declaring its own `print(x: int)` was
+  // validated against the BUILTIN's `(string)` signature and rejected with a
+  // spurious E0041. Matches the precedence checkCall and lowerCall now use.
+  let decl = funcDeclLookup(c, name)
+  if (decl == 0) {
+    if (name == "print" || name == "eprint") { vPrintCall(c, node, name); return }
+    return // builtin / constructor / not a free function
+  }
+  // The decl's params live in its OWNING module's tree (declOwner), which is
+  // `c` itself for a local function and the exporter for an imported one.
+  let owner = declOwner(c, name)
+  // Reads the param list through declParamListNode so a §11.7 extern — three
+  // kids, params at 1 — is measured against its own shape rather than a
+  // FuncDecl's.
+  let plist = declParamListNode(owner, decl)
+  if (plist < 0) { return } // generic: arity resolved by instantiation
+  let params = kidsOf(owner.tree, plist)
+  let want = len(params)
+  let args = kidsOf(c.tree, kids[2])
+  let got = len(args)
+  // A variadic `...xs: T` absorbs every argument past the fixed ones, so only
+  // the fixed prefix has an exact arity (§12.4). Mirrors the seed's three cases.
+  let variadic = want > 0 &&
+    getNode(owner.tree, params[want - 1]).tag == Tag.ParamRest
+  let fixed = want
+  if (variadic) {
+    fixed = want - 1
+  }
+  // `f(...xs)` spreads a slice into the variadic slot and must sit exactly after
+  // the fixed arguments; the spread itself is one argument, not a count of them.
+  // E0063 rejects a spread that is duplicated, aimed at a non-variadic callee,
+  // or not final — reported at the spread argument, as the seed does. A bad
+  // spread still falls through to the arity check below: the seed emits both.
+  let spreadAt = -1
+  let ai = 0
+  while (ai < got) {
+    if (getNode(c.tree, args[ai]).tag == Tag.ArgSpread) {
+      if (spreadAt >= 0 || !variadic || ai != got - 1) {
+        reportNoHint(c.diags, ecInvalidSpread, vSpan(c, args[ai]),
+          "'...' spread is only valid as the final argument of a variadic call")
+      }
+      spreadAt = ai
+    }
+    ai = ai + 1
+  }
+  if (spreadAt >= 0) {
+    if (spreadAt != fixed) {
+      reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+        "expected ${fixed} argument(s) before '...', found ${spreadAt}")
+    }
+    return
+  }
+  if (variadic) {
+    if (got < fixed) {
+      reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+        "expected at least ${fixed} argument(s), found ${got}")
+    }
+    return
+  }
+  if (want != got) {
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "expected ${want} argument(s), found ${got}")
+    return
+  }
+  // Argument TYPES, checked only here — at the one point this function has
+  // already proven the call decidable: a known, non-generic, non-variadic,
+  // non-spread free function whose arity matches. Every undecidable shape
+  // (builtin, conversion, constructor, method, function value, generic,
+  // variadic) returned above, which is what keeps FALSEPOS at 0.
+  //
+  // Part of the #1470 class: `f(p: [2]i32)` called with `1` was accepted, the
+  // same missing-vExpect hole as the annotated binding.
+  //
+  // The parameter's declared type is read from its OWNING module's tree
+  // (`owner`, via declOwner) — a cross-module call reads the exporter's nodes,
+  // never this module's. Type ids are interned in the shared ctx, so the id
+  // compared here is the same id either side would produce.
+  let i = 0
+  while (i < got) {
+    let a = args[i]
+    if (getNode(c.tree, a).tag == Tag.Arg) { a = kidsOf(c.tree, a)[0] }
+    let pty = typeFromNode(owner, kidsOf(owner.tree, params[i])[1])
+    // An interface parameter belongs to vCallArgIface, which — unlike this
+    // narrow free-call path — also covers method, builtin and value calls.
+    // Answering here as well double-reported `take(7)` for `take(p: Any)`.
+    // (Contrast the binding path, where vBinding could supersede its Iface twin
+    // outright because the two had identical guards.)
+    if (pty != 0 && c.ctx.types[pty].kind != TypeKind.Interface) {
+      vExpectExpr(c, a, pty)
+    }
+    i = i + 1
+  }
+}
+
+// Whether a node opens a `break`-able construct (for/while/switch/select) and,
+// separately, a `continue`-able one (for/while only) — the seed's two counters.
+// ---- E0065 invalid-expr-statement / E0066 expected-call-expr ---------------
+// Both are pure AST-SHAPE rules — they read only the statement's kid tag, never
+// a type — so neither can be confused by the flat env, and neither needs the
+// permissive escape hatch the type-directed checks carry.
+
+// A statement-position expression whose result may be discarded (§18.3).
+// `catch` is legal for the same reason a bare call is: at statement position it
+// is deliberate error handling, not an accidentally-unused value. Ported from
+// check.zig `checkExprStmt`; the list must stay in step with it.
+function vLegalExprStmt(c: Checker, inner: int): bool {
+  let n = getNode(c.tree, inner)
+  if (n.tag == Tag.Call || n.tag == Tag.TryExpr || n.tag == Tag.CatchDefault ||
+    n.tag == Tag.CatchBind || n.tag == Tag.AsmStmt) {
+    return true
+  }
+  // A channel receive `<-c` is a unary whose operator is `<-`.
+  return n.tag == Tag.Unary && n.main == int(Kind.ArrowLeft)
+}
+
+function vExprStmt(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0 || kids[0] == 0) { return }
+  if (vLegalExprStmt(c, kids[0])) { return }
+  reportNoHint(c.diags, ecInvalidExprStatement, vSpan(c, node),
+    "expression result unused; only a call, channel receive, '?' chain, or 'catch' is a valid statement")
+}
+
+// `spawn`/`defer` take a call and nothing else (check.zig `checkSpawnDefer`).
+// A `catch e { … }` block's LAST statement, when it is a bare expression, is
+// the block's VALUE — not a discarded result — so E0065 must not fire on it
+// (check.zig `checkCatchBlock` type-checks it against the ok type instead of
+// routing it through `checkExprStmt`). vStmt is a generic tag-dispatch walk, so
+// without this it visited that tail like any other statement: 80 FALSEPOS, all
+// of them working `catch` blocks.
+//
+// Handling the block here rather than through a shared exempt-set keeps the
+// exemption local to the one construct that has it. `catch <expr>` (CatchDefault)
+// has no block and needs nothing.
+//
+// E0067 rides along because the seed derives it from the same walk: a block that
+// neither ends in a value expression nor diverts control is incomplete.
+function vCatchBind(c: Checker, result: int, node: int, brk: int, loop: int, fallible: bool) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3) { return }
+  let block = kids[2]
+  vStmt(c, result, kids[0], brk, loop, fallible)
+  if (block == 0) { return }
+  let stmts = kidsOf(c.tree, block)
+  if (len(stmts) == 0) {
+    reportNoHint(c.diags, ecCatchBlockIncomplete, vSpan(c, block),
+      "'catch' block must produce a value or divert control (return/fail/panic/break/continue)")
+    return
+  }
+  let last = stmts[len(stmts) - 1]
+  let i = 0
+  while (i < len(stmts) - 1) {
+    vStmt(c, result, stmts[i], brk, loop, fallible)
+    i = i + 1
+  }
+  if (getNode(c.tree, last).tag == Tag.ExprStmt) {
+    // The value expression: validate what is INSIDE it, never the statement
+    // wrapper (that wrapper is what E0065 judges).
+    let inner = kidsOf(c.tree, last)
+    if (len(inner) > 0) {
+      vStmt(c, result, inner[0], brk, loop, fallible)
+    }
+    return
+  }
+  vStmt(c, result, last, brk, loop, fallible)
+  if (!vDiverges(c, last, true)) {
+    reportNoHint(c.diags, ecCatchBlockIncomplete, vSpan(c, block),
+      "'catch' block must produce a value or divert control (return/fail/panic/break/continue)")
+  }
+}
+
+function vSpawnDefer(c: Checker, node: int, word: string) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0 || kids[0] == 0) { return }
+  if (getNode(c.tree, kids[0]).tag == Tag.Call) { return }
+  reportNoHint(c.diags, ecExpectedCallExpr, vSpan(c, node),
+    "'${word}' requires a call expression")
+}
+
+function vIsLoop(t: Tag): bool {
+  return t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn || t == Tag.ForInf || t == Tag.WhileStmt
+}
+function vIsBreakable(t: Tag): bool {
+  return vIsLoop(t) || t == Tag.SwitchStmt || t == Tag.SelectStmt
+}
+
+// Walks `node` validating statements, carrying the enclosing function's declared
+// result type plus the loop/fallible context the seed tracks: `brk` counts
+// break-able constructs, `loop` counts for/while (continue targets those only),
+// and `fallible` is set inside a `T!` function. Descends every child; a node
+// with nothing to check falls through.
+function vStmt(c: Checker, result: int, node: int, brk: int, loop: int, fallible: bool) {
+  if (node == 0) { return }
+  let t = getNode(c.tree, node).tag
+  // An arrow function has its own result AND its own loop/fallible context, so
+  // nothing inside it is validated against THIS function. ponytail: skipping it
+  // under-reports; descending would judge it against the wrong context.
+  if (t == Tag.ArrowFn) { return }
+  if (t == Tag.Binary) { vBinary(c, node) }
+  if (t == Tag.ReturnStmt) { vReturn(c, result, node) }
+  if (t == Tag.Call) { vCall(c, node) }
+  if (t == Tag.Call) { vNotCallable(c, node) }
+  if (t == Tag.Call) { vVariantArity(c, node) }
+  if (t == Tag.Call) { vGenericBound(c, node) }
+  if (t == Tag.Call) { vUnmanagedBuiltin(c, node) }
+  if (t == Tag.Call) { vConversion(c, node) }
+  if (t == Tag.StrInterp) { vInterp(c, node) }
+  if (t == Tag.Index) { vIndex(c, node) }
+  if (t == Tag.TupleIndex) { vTupleIndex(c, node) }
+  if (t == Tag.Member) { vMember(c, node) }
+  if (t == Tag.TypeAssert) { vTypeAssert(c, node) }
+  if (t == Tag.Assign) { vDestructure(c, node) }
+  if (t == Tag.Assign) { vAssignIface(c, node) }
+  if (t == Tag.Binding) { vInferEnum(c, node) }
+  // vBinding SUPERSEDES the former vBindingIface: it carries the identical
+  // guards (annotation present, non-tuple pattern) and routes through vExpect,
+  // which reports the §14.3 not-storable case vIfaceStore covered AND the
+  // unsatisfied-method-set case it did not. Running both double-reported.
+  if (t == Tag.Binding) { vBinding(c, node) }
+  if (t == Tag.CompositeLit) { vCompositeTypes(c, node) }
+  if (t == Tag.CompositeLit) { vCompositeIface(c, node) }
+  if (t == Tag.Call) { vCallArgIface(c, node) }
+  if (t == Tag.SendStmt) { vSendIface(c, node) }
+  if (t == Tag.AsmStmt) { vAsm(c, node) }
+  if (t == Tag.MatchStmt) { vMatch(c, node) }
+  if (t == Tag.MatchStmt) { vMatchExpr(c, node) }
+  if (t == Tag.ExprStmt) { vExprStmt(c, node) }
+  if (t == Tag.SpawnStmt) { vSpawnDefer(c, node, "spawn") }
+  if (t == Tag.DeferStmt) { vSpawnDefer(c, node, "defer") }
+  // Owns its own kid recursion (its block's tail is a value, not a statement).
+  if (t == Tag.CatchBind) {
+    vCatchBind(c, result, node, brk, loop, fallible)
+    return
+  }
+  if (t == Tag.BreakStmt && brk == 0) {
+    reportNoHint(c.diags, ecInvalidBreakContinue, vSpan(c, node),
+      "'break' outside a for/while/switch/select")
+  }
+  if (t == Tag.ContinueStmt && loop == 0) {
+    reportNoHint(c.diags, ecInvalidBreakContinue, vSpan(c, node),
+      "'continue' outside a for/while loop")
+  }
+  if (t == Tag.FailStmt && !fallible) {
+    reportNoHint(c.diags, ecFailOutsideFallible, vSpan(c, node),
+      "'fail' is only valid inside a fallible function")
+  }
+  if (t == Tag.TryExpr && !fallible) {
+    reportNoHint(c.diags, ecTryOutsideFallible, vSpan(c, node),
+      "'?' is only valid inside a fallible function")
+  }
+  let cbrk = brk
+  let cloop = loop
+  if (vIsLoop(t)) {
+    cbrk = brk + 1
+    cloop = loop + 1
+  } else if (vIsBreakable(t)) {
+    cbrk = brk + 1
+  }
+  for k of kidsOf(c.tree, node) {
+    vStmt(c, result, k, cbrk, cloop, fallible)
+  }
+}
+
+// ---- E0055 missing-return: control-flow divergence (§10.3) -----------------
+// Ported from check.zig `diverges`. The rule: a non-void function whose body is
+// not proven to always divert control (return / fail / panic / infinite loop /
+// exhaustive all-arms-diverge) is missing a return. Conservative TOWARD NOT
+// EMITTING — any construct that cannot be proven to fall through is treated as
+// diverging — because a missed missing_return is a harmless gap (the seed still
+// gates) but a spurious one rejects a valid build. The corpus is code the seed
+// accepts, so every non-void body must read as diverging here or the diffcheck
+// FALSEPOS gate fires; that gate is what proves this port faithful.
+
+// The while-condition is the literal `true`. bit2 has no const-evaluator, so a
+// const that folds to true is not recognised (under-detects vs the seed's
+// constEval — but that only under-reports, never false-positives; `for {}` is
+// the idiomatic infinite loop and is handled exactly via ForInf).
+function vIsTrueLit(c: Checker, node: int): bool {
+  if (node == 0 || getNode(c.tree, node).tag != Tag.BoolLit) { return false }
+  let sp = getNode(c.tree, node).span
+  return c.source[sp.start:sp.end] == "true"
+}
+
+// A call to the builtin `panic` (diverges). Mirrors the seed's isPanicCall: the
+// callee is the bare name `panic`, shadowed by neither a local value nor a user
+// function (the same permissiveness vCall uses to identify a builtin).
+function vIsPanicCall(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Call) { return false }
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) { return false }
+  let cn = getNode(c.tree, callee)
+  let name = c.source[cn.span.start:cn.span.end]
+  return name == "panic" && envLookup(c, name) == 0 && funcDeclLookup(c, name) == 0
+}
+
+// Does `node` (a loop body) contain a `break` targeting THIS loop — i.e. one not
+// shadowed by a nested loop/switch/select? Bounded depth, mirrors the seed.
+function vContainsOwnBreak(c: Checker, node: int, depth: int): bool {
+  if (node == 0 || depth >= 64) { return false }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.BreakStmt) { return true }
+  if (t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn || t == Tag.ForInf ||
+      t == Tag.WhileStmt || t == Tag.SwitchStmt || t == Tag.SelectStmt) { return false }
+  if (t == Tag.Block || t == Tag.StmtList) {
+    for s of kidsOf(c.tree, node) {
+      if (vContainsOwnBreak(c, s, depth + 1)) { return true }
+    }
+    return false
+  }
+  if (t == Tag.IfStmt) {
+    let k = kidsOf(c.tree, node) // [cond, then, else]
+    if (vContainsOwnBreak(c, k[1], depth + 1)) { return true }
+    if (k[2] != 0) { return vContainsOwnBreak(c, k[2], depth + 1) }
+    return false
+  }
+  return false
+}
+
+// Any statement in a block/stmt-list diverges.
+function vBlockDiverges(c: Checker, node: int, countBrk: bool): bool {
+  for s of kidsOf(c.tree, node) {
+    if (vDiverges(c, s, countBrk)) { return true }
+  }
+  return false
+}
+
+// Does executing `node` guarantee control never falls through past it? (§10.3)
+function vDiverges(c: Checker, node: int, countBrk: bool): bool {
+  if (node == 0) { return false }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.ReturnStmt || t == Tag.FailStmt) { return true }
+  if (t == Tag.BreakStmt || t == Tag.ContinueStmt) { return countBrk }
+  if (t == Tag.Block) { return vBlockDiverges(c, node, countBrk) }
+  if (t == Tag.ExprStmt) { return vIsPanicCall(c, kidsOf(c.tree, node)[0]) }
+  if (t == Tag.IfStmt) {
+    let k = kidsOf(c.tree, node) // [cond, then, else]
+    if (k[2] == 0) { return false }
+    return vDiverges(c, k[1], countBrk) && vDiverges(c, k[2], countBrk)
+  }
+  if (t == Tag.WhileStmt) {
+    let k = kidsOf(c.tree, node) // [cond, body]
+    if (vIsTrueLit(c, k[0])) { return !vContainsOwnBreak(c, k[1], 0) }
+    return false
+  }
+  if (t == Tag.ForInf) { return !vContainsOwnBreak(c, kidsOf(c.tree, node)[0], 0) }
+  if (t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn) { return false }
+  if (t == Tag.SwitchStmt) {
+    let k = kidsOf(c.tree, node) // [subject, case_list]
+    let hasDefault = false
+    let all = true
+    for cse of kidsOf(c.tree, k[1]) {
+      let ct = getNode(c.tree, cse).tag
+      if (ct == Tag.SwitchCase) {
+        if (!vBlockDiverges(c, kidsOf(c.tree, cse)[1], countBrk)) { all = false }
+      } else if (ct == Tag.SwitchDefault) {
+        hasDefault = true
+        if (!vBlockDiverges(c, kidsOf(c.tree, cse)[0], countBrk)) { all = false }
+      }
+    }
+    return hasDefault && all
+  }
+  if (t == Tag.MatchStmt) {
+    let k = kidsOf(c.tree, node) // [subject, arm_list]
+    let arms = kidsOf(c.tree, k[1])
+    if (len(arms) == 0) { return false }
+    for arm of arms {
+      if (!vDiverges(c, kidsOf(c.tree, arm)[1], countBrk)) { return false }
+    }
+    return true
+  }
+  if (t == Tag.SelectStmt) {
+    let clauses = kidsOf(c.tree, node)
+    if (len(clauses) == 0) { return true } // `select {}` blocks forever
+    for cl of clauses {
+      let clt = getNode(c.tree, cl).tag
+      let body = 0
+      if (clt == Tag.CommCase) {
+        body = kidsOf(c.tree, cl)[1]
+      } else if (clt == Tag.CommDefault) {
+        body = kidsOf(c.tree, cl)[0]
+      } else {
+        continue
+      }
+      if (!vBlockDiverges(c, body, countBrk)) { return false }
+    }
+    return true
+  }
+  return false
+}
+

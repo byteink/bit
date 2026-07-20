@@ -1,0 +1,494 @@
+// Self-host: validation of function attributes (#1503, split out of
+// validate.bit). Symbol pinning, @naked, and the @nosplit call-graph walk.
+
+// ---- §10.3.1 function attributes -------------------------------------------
+
+// The source text of an identifier node, read from THIS module's source.
+function vIdentText(c: Checker, node: int): string {
+  let n = getNode(c.tree, node)
+  return c.source[n.span.start:n.span.end]
+}
+
+// A scalar value type (§10.3.1): any prim but `string` (prim 11), or a bare type
+// parameter. Exactly the results a naked function can hand back in a register.
+function vIsScalarValue(c: Checker, ty: int): bool {
+  let k = c.ctx.types[ty].kind
+  if (k == TypeKind.Prim) { return c.ctx.types[ty].prim != 11 }
+  return k == TypeKind.TypeParam
+}
+
+// §14.6 comparability, mirroring seed/check.zig `comparable`. Only the kinds
+// the seed calls out as NON-comparable answer false; everything else — prims,
+// untyped literals, interfaces, type params, raw pointers (compared by address,
+// §11.4) and `invalid` — is comparable, which is also THE SAFETY RULE: an
+// unresolved type must never manufacture a diagnostic.
+//
+// Struct is deliberately PERMISSIVE where the seed recurses its fields. A
+// struct's field types live in `ctx.structFields` keyed by name, and a
+// single-file check of a multi-file module resolves only part of that table, so
+// a field-walk here would judge on an incomplete set. Under-reporting E0052 on
+// struct keys costs MISSING; judging on a partial table would risk FALSEPOS.
+function vComparable(c: Checker, ty: int, depth: int): bool {
+  if (depth > 32) { return true }
+  let k = c.ctx.types[ty].kind
+  if (k == TypeKind.Slice || k == TypeKind.Map || k == TypeKind.Func ||
+      k == TypeKind.Chan || k == TypeKind.Void || k == TypeKind.Fallible) {
+    return false
+  }
+  if (k == TypeKind.Array) { return vComparable(c, c.ctx.types[ty].elem, depth + 1) }
+  if (k == TypeKind.Tuple) {
+    let ms = c.ctx.types[ty].members
+    let i = 0
+    while (i < len(ms)) {
+      if (!vComparable(c, ms[i], depth + 1)) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  // A C-like enum is an integer tag, so it compares by tag; a payload enum
+  // carries data and has no structural equality yet (§14.6).
+  if (k == TypeKind.Enum) { return !c.ctx.types[ty].enumBoxed }
+  return true
+}
+
+// Whether a resolved TypeId may be judged at all: id 0 and `Invalid` are what an
+// unresolved annotation holds, and the seed guards both emit sites with
+// `!= .invalid` for exactly that reason.
+function vTypeResolved(c: Checker, ty: int): bool {
+  if (ty == 0) { return false }
+  return c.ctx.types[ty].kind != TypeKind.Invalid
+}
+
+// E0052 / E0072 fire on pure TYPE-ANNOTATION nodes, which no statement walk
+// visits, so this walks a declaration's subtree for them. POST-order: the seed
+// evaluates a composite type's components before emitting on the composite
+// itself, so a nested `map<[]int, map<[]int, int>>` reports inner-first.
+//
+// Both predicates read only the annotation's own resolved type — never the flat
+// env, never a receiver — so this carries none of E0057's false-positive risk.
+function vTypeNodes(c: Checker, node: int, depth: int) {
+  if (node == 0 || depth > 128) { return }
+  let kids = kidsOf(c.tree, node)
+  let i = 0
+  while (i < len(kids)) {
+    vTypeNodes(c, kids[i], depth + 1)
+    i = i + 1
+  }
+  // A parse error can leave a type node short of its kids; judging nothing is
+  // the permissive answer.
+  let tag = getNode(c.tree, node).tag
+  if (len(kids) < 2) { return }
+  if (tag == Tag.MapType) {
+    let key = typeFromNode(c, kids[0])
+    if (vTypeResolved(c, key) && !vComparable(c, key, 0)) {
+      reportNoHint(c.diags, ecNotComparable, vSpan(c, kids[0]),
+        "map key type must be comparable")
+    }
+  } else if (tag == Tag.ArrayType) {
+    // §11.2: a `[N]T` box holds no GC references, so a reference-typed element
+    // would need per-element tracing that does not exist yet.
+    let elem = typeFromNode(c, kids[1])
+    if (vTypeResolved(c, elem) && !vIsScalarValue(c, elem)) {
+      reportNoHint(c.diags, ecInvalidArrayElement, vSpan(c, kids[1]),
+        "fixed-size arrays of reference-typed elements are not yet supported; the element type must be a scalar value type (integer, bool, or float)")
+    }
+  }
+}
+
+// The attr list of a FuncDecl, or 0 when the decl carries none. The 7th child is
+// elided when absent, so both kid widths are well-formed (parser.bit).
+function vAttrList(c: Checker, node: int): int {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) <= 6) { return 0 }
+  return kids[6]
+}
+
+// §11.9: a name C can actually refer to — a letter or '_', then letters, digits
+// or '_'. Deliberately narrower than what ELF/Mach-O permit: a name outside this
+// set assembles fine but cannot be spelled from C, which defeats the point of a
+// pin, and '$' in particular is how this compiler's own mangling is written.
+// Strict ASCII, so this cannot reuse the lexer's `isIdentStart` (which admits
+// every byte >= 0x80 to keep non-ASCII identifiers lexing).
+function vIsValidSymbolName(s: string): bool {
+  if (len(s) == 0) { return false }
+  let f = s[0]
+  if (!((f >= 'a' && f <= 'z') || (f >= 'A' && f <= 'Z') || f == '_')) { return false }
+  let i = 1
+  while (i < len(s)) {
+    let ch = s[i]
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+          (ch >= '0' && ch <= '9') || ch == '_')) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Resolves the attr list, reporting E0076 (§10.3.1) for any name other than
+// @naked/@nosplit/@symbol and E0079 (§11.9) for a malformed argument, and
+// returns the pinned symbol name ("" when the decl pins none). Mirrors the
+// seed's collectAttrs, which likewise reports as it resolves and yields the pin
+// only once the argument has passed both rules — so a malformed pin never also
+// draws the signature diagnostics below.
+function vAttrNames(c: Checker, node: int): string {
+  let list = vAttrList(c, node)
+  if (list == 0) { return "" }
+  let pin = ""
+  let attrs = kidsOf(c.tree, list)
+  let i = 0
+  while (i < len(attrs)) {
+    let ak = kidsOf(c.tree, attrs[i]) // [name_ident, arg_string_lit?]
+    let nameNode = ak[0]
+    let name = vIdentText(c, nameNode)
+    // The argument child is ELIDED when absent, so an attr-with-no-argument
+    // keeps the exact 1-kid shape it had before arguments existed (parser.bit).
+    let arg = 0
+    if (len(ak) > 1) { arg = ak[1] }
+    if (name == "symbol") {
+      if (arg == 0) {
+        report(c.diags, ecSymbolAttrInvalid, vSpan(c, nameNode),
+          "attribute '@symbol' requires a string argument",
+          "write @symbol(\"the_exported_name\")")
+      } else {
+        // The raw literal minus its quotes. A symbol name has no use for
+        // escapes, and every escape introduces a '\', which vIsValidSymbolName
+        // rejects — so no unescaping is needed.
+        let raw = vIdentText(c, arg)
+        let text = raw[1:len(raw) - 1]
+        if (!vIsValidSymbolName(text)) {
+          report(c.diags, ecSymbolAttrInvalid, vSpan(c, arg),
+            "'${text}' is not a valid symbol name",
+            "a symbol name must be a C identifier: a letter or '_' followed by letters, digits or '_'")
+        } else {
+          pin = text
+        }
+      }
+    } else {
+      if (arg != 0) {
+        reportNoHint(c.diags, ecSymbolAttrInvalid, vSpan(c, arg),
+          "attribute '@${name}' does not take an argument")
+      }
+      if (name != "naked" && name != "nosplit") {
+        report(c.diags, ecUnknownAttribute, vSpan(c, nameNode),
+          "unknown attribute '@${name}'",
+          "the recognized attributes are @naked, @nosplit and @symbol")
+      }
+    }
+    i = i + 1
+  }
+  return pin
+}
+
+// E0079/E0080 (§11.9): validates a `@symbol("name")` pin and claims the name
+// project-wide. A pinned function DEFINES the C symbol `name`, so its signature
+// has to be one the C ABI can actually carry — the same `vIsCAbiType` §11.7
+// applies in the consuming direction, since both use the one shared C-ABI
+// marshaller and neither marshals anything else.
+//
+// The `cannot be variadic` rule became reachable when parseParam learned
+// `...name: T` (#1418), for the same reason it did in vExternFnDecl.
+function vPinnedSymbol(c: Checker, node: int, sym: string) {
+  let k = kidsOf(c.tree, node) // [recv, name, generics, params, result, body, attrs]
+  let name = vIdentText(c, k[1])
+  // A generic function has no single body to give a single symbol: it is emitted
+  // once per instantiation, each needing a distinct name.
+  if (k[2] != 0) {
+    report(c.diags, ecSymbolAttrInvalid, vSpan(c, k[1]),
+      "generic function '${name}' cannot pin a symbol name",
+      "each instantiation would need its own symbol")
+    return
+  }
+  let params = kidsOf(c.tree, k[3])
+  let i = 0
+  while (i < len(params)) {
+    let pk = kidsOf(c.tree, params[i]) // [name, type]
+    let pt = typeFromNode(c, pk[1])
+    // A pinned symbol is called across the C ABI, which cannot carry a Bit
+    // variadic. Reported at the whole param node, and it replaces the C-ABI
+    // check for that parameter — the seed's else-if.
+    if (getNode(c.tree, params[i]).tag == Tag.ParamRest) {
+      reportNoHint(c.diags, ecSymbolAttrInvalid, vSpan(c, params[i]),
+        "function '${name}' pinning a symbol cannot be variadic")
+    } else if (pt != 0 && !vIsCAbiType(c, pt)) {
+      // An unresolved type (0) is bit2's inference gap, not the program's —
+      // reporting it would be a false positive on code the seed accepts.
+      report(c.diags, ecSymbolAttrInvalid, vSpan(c, pk[1]),
+        "parameter of '${name}' must be a scalar or a raw pointer to pin a symbol",
+        "the C ABI has no representation for a GC-managed Bit value")
+    }
+    i = i + 1
+  }
+  // The RAW result node is what is checked, so a fallible `T!E` fails this too —
+  // it returns through the thread-local error slot, not the C return register,
+  // and is neither a prim nor a ptr.
+  if (k[4] != 0) {
+    let rt = typeFromNode(c, k[4])
+    if (rt != 0 && !vIsCAbiType(c, rt)) {
+      reportNoHint(c.diags, ecSymbolAttrInvalid, vSpan(c, k[4]),
+        "'${name}' must return void, a scalar, or a raw pointer to pin a symbol")
+    }
+  }
+  // Claim the name. The identity packs the declaring module with the decl node:
+  // node indices only mean something inside their own tree, so the module id is
+  // what keeps two modules' node 7 apart. Re-registering the same decl is a
+  // no-op, which is what makes a repeated `checkModule` over one tree safe.
+  let owner = c.moduleId * 4294967296 + node
+  let (prev, seen) = c.ctx.pinnedSymbols[sym]
+  if (seen && prev != owner) {
+    report(c.diags, ecDuplicateSymbol, vSpan(c, k[6]),
+      "symbol '${sym}' is already pinned by another declaration",
+      "each pinned symbol name must be defined exactly once")
+    return
+  }
+  c.ctx.pinnedSymbols[sym] = owner
+}
+
+// E0074 (§10.3.1) @naked: a restricted signature (no generics or parameters,
+// void or scalar result) and a return-only body — there is no prologue, so a
+// local, a spill, or control flow has nowhere to live.
+function vNakedFn(c: Checker, node: int, result: int) {
+  let k = kidsOf(c.tree, node)
+  let name = vIdentText(c, k[1])
+  if (k[2] != 0) {
+    reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, k[1]),
+      "naked function '${name}' cannot be generic")
+  }
+  if (len(kidsOf(c.tree, k[3])) != 0) {
+    reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, k[1]),
+      "naked function '${name}' cannot take parameters")
+  }
+  // An unresolved result (0) is skipped: an inference gap is bit2's, not the
+  // program's, and reporting it would be a false positive on code the seed takes.
+  if (result != c.ctx.voidId && result != 0 && !vIsScalarValue(c, result)) {
+    reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, k[1]),
+      "naked function '${name}' must return void or a scalar value")
+  }
+  let body = kidsOf(c.tree, k[5])
+  let i = 0
+  while (i < len(body)) {
+    if (getNode(c.tree, body[i]).tag != Tag.ReturnStmt) {
+      reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, body[i]),
+        "a naked function body may contain only 'return' statements")
+    }
+    i = i + 1
+  }
+}
+
+// Matches the seed's nosplit_max_depth: a malformed or over-deep tree stops here
+// rather than recursing without bound (Power of 10).
+const vNosplitMaxDepth = 256
+
+// The one-hop callee rule. A nosplit body may call only a named function that is
+// itself @nosplit — Power of 10: indirection limited to what is statically known.
+// A non-ident callee is a slice/map/type constructor (which allocates) or a
+// value/interface/method call (unknowable statically).
+function vNosplitCall(c: Checker, node: int, caller: string, depth: int) {
+  let ck = kidsOf(c.tree, node) // [callee, type_args, args]
+  if (getNode(c.tree, ck[0]).tag != Tag.Ident) {
+    report(c.diags, ecNosplitCallsAllocating, vSpan(c, node),
+      "nosplit function '${caller}' may not allocate or call indirectly here",
+      "nosplit bodies allow only calls to other nosplit functions")
+    return
+  }
+  let callee = vIdentText(c, ck[0])
+  let decl = funcDeclLookup(c, callee)
+  let ok = false
+  if (decl != 0) {
+    // A decl node index only means something inside its own tree, so the attr
+    // scan must read the OWNER's source — declOwner and funcDeclLookup agree on
+    // which tree that is. Reading `c` for an imported callee would slice the
+    // wrong file. A user function shadowing a builtin lands here and is judged
+    // on its own attribute, exactly as it is everywhere else.
+    ok = funcHasAttr(declOwner(c, callee), decl, "nosplit")
+  } else {
+    // No declaration resolves, so this is a predeclared builtin. Of that set
+    // only the atomics (§11.5) are safe here: they lower to inline machine
+    // instructions rather than a call, so they can neither allocate nor reach a
+    // safepoint. Every other builtin may do both and stays rejected. Without
+    // this carve-out the unmanaged subset contradicts itself — a lock is
+    // precisely the machinery `@nosplit` exists to protect, yet could not be
+    // written with `@nosplit`.
+    //
+    // `entryOf` (§11.10) joins them on the same footing and on the same PROOF:
+    // it lowers to one inline address materialization (FuncAddr) against a
+    // link-time constant, so it can neither allocate nor reach a safepoint. The
+    // scheduler's `initialContext` is nosplit-by-nature and needs exactly this
+    // address to build a task's saved register state.
+    //
+    // `ptrOf` (§11.5) qualifies on the same proof, and the proof covers BOTH of
+    // its forms — neither emits a call: on module state (§11.11) it is
+    // `global_addr` plus a retype, a link-time constant address of exactly the
+    // shape `entryOf` is admitted for; on a slice it is two field reads and an
+    // add, both already on this allowlist in their own right. The atomics are
+    // unusable inside `@nosplit` without it — they take a `*T` and `ptrOf` is
+    // the only bridge to one. Widening stops at the address: the ARGUMENT is
+    // still walked below, so `ptrOf` over an allocating expression stays E0075.
+    //
+    // `fsqrt`/`floatBits`/`float32Bits` join on the same proof, and the proof
+    // is the reason rather than the convenience: each lowers to a single inline
+    // machine instruction (Op.FSqrt / Op.Bitcast, never an RtCall), so like the
+    // atomics it can neither allocate nor reach a safepoint. Refusing them
+    // would repeat the contradiction this carve-out exists to avoid — the
+    // runtime's own float helpers are nosplit-by-nature, and these primitives
+    // are exactly what implements them. `ffloor`/`fceil`/`ftrunc`/`fround`
+    // join on the same proof: on x86-64 they expand to a short SSE2 sequence
+    // rather than one `roundsd` (SSE4.1), but an expansion still neither
+    // allocates nor reaches a safepoint, which is the only property this
+    // carve-out rests on.
+    //
+    // A builtin TYPE name in callee position is a conversion (§12.9), not a
+    // call, and a NUMERIC prim conversion — including `int(p)`, a raw pointer's
+    // address (§11.4) — is pure register work that allocates nothing and
+    // reaches no safepoint. `string(x)` allocates and stays rejected.
+    ok = vAtomicArity(callee) >= 0 || callee == "entryOf" || callee == "ptrOf" ||
+      callee == "fsqrt" || callee == "floatBits" || callee == "float32Bits" ||
+      callee == "ffloor" || callee == "fceil" || callee == "ftrunc" ||
+      callee == "fround" ||
+      vIsNumericPrimName(callee)
+  }
+  if (!ok) {
+    report(c.diags, ecNosplitCallsAllocating, vSpan(c, node),
+      "nosplit function '${caller}' calls '${callee}', which is not marked nosplit",
+      "mark the callee @nosplit or inline it")
+    return
+  }
+  vNosplitWalk(c, ck[2], caller, depth + 1) // args
+}
+
+// E0075 (§10.3.1) @nosplit: a default-deny allowlist over the body. Every
+// construct that could allocate or reach a safepoint (composite/slice/map
+// literals, indexing, `append`, `spawn`, closures, string interpolation, and
+// channel ops) falls through to the catch-all and is rejected. An `asm` block is
+// admitted on the author's assertion (§10.3.1); its operands are still walked.
+function vNosplitWalk(c: Checker, node: int, caller: string, depth: int) {
+  if (node == 0) { return }
+  if (depth >= vNosplitMaxDepth) { return }
+  let t = getNode(c.tree, node).tag
+  // Safe leaves: a name or a literal reads a register or a static const.
+  if (t == Tag.Ident || t == Tag.IntLit || t == Tag.FloatLit || t == Tag.StringLit ||
+      t == Tag.RawStringLit || t == Tag.RuneLit || t == Tag.BoolLit ||
+      t == Tag.NilLit || t == Tag.BreakStmt || t == Tag.ContinueStmt) {
+    return
+  }
+  // Pure operators, control flow, and statement wrappers: recurse into their
+  // value children (the guarded set only).
+  if (t == Tag.Binary || t == Tag.Unary || t == Tag.ExprStmt || t == Tag.ReturnStmt ||
+      t == Tag.Assign || t == Tag.LhsList || t == Tag.ExprList || t == Tag.Args ||
+      t == Tag.Arg || t == Tag.Block || t == Tag.IfStmt || t == Tag.WhileStmt ||
+      t == Tag.ForC || t == Tag.LetDecl || t == Tag.ConstDecl) {
+    let kids = kidsOf(c.tree, node)
+    let i = 0
+    while (i < len(kids)) {
+      vNosplitWalk(c, kids[i], caller, depth + 1)
+      i = i + 1
+    }
+    return
+  }
+  if (t == Tag.Binding) {
+    // [pattern, type_or_none, init_or_none]: only the initializer is an
+    // evaluated expression; the type annotation is not code.
+    let bk = kidsOf(c.tree, node)
+    if (len(bk) >= 3) { vNosplitWalk(c, bk[2], caller, depth + 1) }
+    return
+  }
+  if (t == Tag.Member) {
+    // Field access on a value already in hand is safe; recurse only the base.
+    vNosplitWalk(c, kidsOf(c.tree, node)[0], caller, depth + 1)
+    return
+  }
+  if (t == Tag.Call) {
+    vNosplitCall(c, node, caller, depth)
+    return
+  }
+  if (t == Tag.AsmStmt) {
+    // §10.3.1: an `asm` payload is pre-encoded machine code, opaque to every
+    // compiler pass. It is admitted on the author's assertion, not on proof —
+    // `asm` is already the unmanaged-subset marker (§11.6), so no second marker
+    // is required. The operand expressions are ordinary Bit code the compiler
+    // *can* inspect, so they stay subject to the allowlist: only the opaque
+    // part is taken on trust.
+    let ak = kidsOf(c.tree, node) // [x64, arm64, result?, clob_x64, clob_arm64, input...]
+    let i = 5
+    while (i < len(ak)) {
+      vNosplitWalk(c, kidsOf(c.tree, ak[i])[2], caller, depth + 1)
+      i = i + 1
+    }
+    return
+  }
+  report(c.diags, ecNosplitCallsAllocating, vSpan(c, node),
+    "nosplit function '${caller}' may not allocate or reach a safepoint here",
+    "nosplit bodies allow only non-allocating arithmetic, control flow, and calls to other nosplit functions")
+}
+
+// Validates one function's body. Called src `checkModule`'s sweep as it reaches
+// the FuncDecl node — see this file's header for why that is the only point
+// where `env` holds this function's bindings and no other's.
+function vFuncDecl(c: Checker, node: int) {
+  // [recv, name, generics, params, result, body(, attrs)] — the 7th child is
+  // elided when the decl carries no `@attr` (parser.bit), so both widths are
+  // well-formed and every kid this function reads sits at a fixed index below 6.
+  let kids = kidsOf(c.tree, node)
+  assert(len(kids) == 6 || len(kids) == 7)
+  if (kids[5] == 0) { return }
+  // The declared result, unwrapped for a fallible function: `return x` in a
+  // `(): T!` produces the OK type, never the boxed `!` wrapper (§18.2).
+  let result = c.ctx.voidId
+  let fallible = false
+  if (kids[4] != 0) {
+    let declared = typeFromNode(c, kids[4])
+    fallible = c.ctx.types[declared].kind == TypeKind.Fallible
+    result = unwrapFallible(c, declared)
+  }
+  // §10.3.1/§11.9 attributes. E0076/E0079-argument first (an unknown name
+  // resolves to no flag, and a malformed pin yields no name), then the three
+  // rule sets. v1 attaches attributes to free functions only, so a receiver is
+  // rejected outright and the body rules are skipped for a method.
+  // Type-annotation rules (E0052/E0072) over the whole decl — signature and
+  // body alike. No statement walk visits a type node, so this is their only
+  // reachable hook from here.
+  vTypeNodes(c, node, 0)
+  let pin = vAttrNames(c, node)
+  let naked = funcHasAttr(c, node, "naked")
+  let nosplit = funcHasAttr(c, node, "nosplit")
+  if (kids[0] != 0) {
+    if (naked) {
+      reportNoHint(c.diags, ecNakedFnInvalid, vSpan(c, kids[1]),
+        "naked function '${vIdentText(c, kids[1])}' cannot be a method")
+    }
+    if (nosplit) {
+      reportNoHint(c.diags, ecNosplitCallsAllocating, vSpan(c, kids[1]),
+        "nosplit function '${vIdentText(c, kids[1])}' cannot be a method")
+    }
+    if (pin != "") {
+      report(c.diags, ecSymbolAttrInvalid, vSpan(c, kids[1]),
+        "method '${vIdentText(c, kids[1])}' cannot pin a symbol name",
+        "@symbol applies to free functions only")
+    }
+  } else {
+    // The pin is validated before the body rules, mirroring the seed, where it
+    // is collect-phase work and @naked/@nosplit body walks are not.
+    if (pin != "") { vPinnedSymbol(c, node, pin) }
+  }
+  vStmt(c, result, kids[5], 0, 0, fallible)
+  // v1 attaches attributes to free functions only: the seed's body-rule pass
+  // reads its attribute set from the free-function table, so a method's @naked
+  // is inert there (it is already rejected outright above).
+  let nakedFree = naked && kids[0] == 0
+  // E0055 (§10.3): a non-void function must return on every path. `result` is
+  // already the unwrapped ok type; an unresolved result (0) is skipped so an
+  // inference gap never becomes a spurious diagnostic. A @naked function is held
+  // to the rule even when void (§10.3.1): lowering emits no implicit `ret` for
+  // one, so falling off the end silently builds an object with no `ret` at all.
+  if ((result != c.ctx.voidId || nakedFree) && result != 0 && !vDiverges(c, kids[5], false)) {
+    reportNoHint(c.diags, ecMissingReturn, vSpan(c, kids[1]),
+      "missing return: not every path returns a value")
+  }
+  // The seed runs the @naked/@nosplit body rules after the body walk and E0055;
+  // diagnostics render in emission order, so a function tripping several of them
+  // must emit them in the seed's sequence.
+  if (kids[0] == 0) {
+    if (naked) { vNakedFn(c, node, result) }
+    if (nosplit) { vNosplitWalk(c, kids[5], vIdentText(c, kids[1]), 0) }
+  }
+}

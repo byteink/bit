@@ -1,0 +1,629 @@
+// Self-host: validation of expression forms (#1503, split out of validate.bit).
+// Interpolation, variant arity, generic bounds, enum inference and match arms,
+// call/index receivers, and member lookup.
+
+// ---- E0073 not-stringable: string interpolation operands (§5.7) ------------
+
+// Whether `ty` has a `show(): string` method. Struct and interface method sets
+// are keyed uniformly as `"${typeId}.method"`, so one lookup covers both; a
+// wrong-shaped `show` (any parameters, or a non-string result) does not count.
+function vHasShow(c: Checker, ty: int): bool {
+  let sig = methodSigLookup(c, "${ty}.show")
+  if (sig == 0) { return false }
+  let st = c.ctx.types[sig]
+  return len(st.members) == 0 && st.result == primType(c.ctx, 11)
+}
+
+// §5.7: a value interpolates iff it is a primitive or has a `show(): string`
+// method. The caller defaults untyped constants first (they adopt a prim), so
+// only untyped nil, void, composites, and show-less named types reach false.
+function vStringConvertible(c: Checker, ty: int): bool {
+  if (c.ctx.types[ty].kind == TypeKind.Prim) { return true }
+  return vHasShow(c, ty)
+}
+
+// Does `ty` still mention a rigid type parameter, at any depth? A generic body
+// is checked once against its own `T`, so an operand naming `T` cannot be judged
+// here — the seed defers it to each monomorphization (which bit2 does not
+// re-check). Skipping such operands leaves the generic interpolation MISSING
+// (safe) instead of judging it against the un-substituted `T`.
+function vHasTypeParam(c: Checker, ty: int, depth: int): bool {
+  if (depth >= 32) { return true } // undecided -> skip, never invent an error
+  let t = c.ctx.types[ty]
+  let k = t.kind
+  if (k == TypeKind.TypeParam) { return true }
+  if (k == TypeKind.Slice || k == TypeKind.Chan || k == TypeKind.Array) {
+    return vHasTypeParam(c, t.elem, depth + 1)
+  }
+  if (k == TypeKind.Map) {
+    return vHasTypeParam(c, t.mapKey, depth + 1) || vHasTypeParam(c, t.mapVal, depth + 1)
+  }
+  if (k == TypeKind.Fallible) {
+    return vHasTypeParam(c, t.result, depth + 1) || vHasTypeParam(c, t.errTy, depth + 1)
+  }
+  if (k == TypeKind.Tuple || k == TypeKind.Func) {
+    for m of t.members {
+      if (vHasTypeParam(c, m, depth + 1)) { return true }
+    }
+    if (k == TypeKind.Func) { return vHasTypeParam(c, t.result, depth + 1) }
+    return false
+  }
+  return false
+}
+
+// Validates a `"...${expr}..."` interpolation: every operand part must convert to
+// string. Parts alternate literal `StrPart` chunks and operand expressions.
+function vInterp(c: Checker, node: int) {
+  for p of kidsOf(c.tree, node) {
+    if (p == 0 || getNode(c.tree, p).tag == Tag.StrPart) { continue }
+    // Prefer the type the SWEEP already cached for this node: it is the
+    // authoritative one (it feeds --dump-types and matches the seed), and it is
+    // present because the operand's node precedes this FuncDecl in arena order.
+    // A fresh checkExprType recompute can diverge on a nested generic call —
+    // genericResultAt re-binds a type param the cached pass left unbound, so
+    // `unwrap(Opt<Opt<i64>>): i64` recomputes as 'Opt'. Fall back to a recompute
+    // only for operands the sweep does not cache (a bare ident use).
+    let ty = c.nodeTypes[p]
+    if (ty == 0) { ty = checkExprType(c, p) }
+    ty = defaultType(c, ty)
+    // Undecidable operands are skipped (the safety rule): an inference gap
+    // (`invalid`, bare or nested) or an open type param must never become a
+    // spurious diagnostic on code the seed accepts.
+    if (ty == 0 || vMentionsInvalid(c, ty, 0) || vHasTypeParam(c, ty, 0)) { continue }
+    if (!vStringConvertible(c, ty)) {
+      report(c.diags, ecNotStringable, vSpan(c, p),
+        "cannot interpolate a value of type '${typeName(c.ctx, ty)}'",
+        "only primitives and types with a 'show(): string' method convert to string")
+    }
+  }
+}
+
+// ---- E0050 variant-construction arity (§13.7) ------------------------------
+
+// Checks `Enum.Variant(args)` builds the variant with the right number of
+// payload values. Only a member callee whose base names an enum type and whose
+// variant exists is judged (unknown variants are E0070's concern elsewhere); the
+// span is the whole call, matching the seed. Method calls skip here — their base
+// is a value, not a type, so userTypeLookup misses.
+function vVariantArity(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Member) {
+    return
+  }
+  let mk = kidsOf(c.tree, callee) // [base, name]
+  let baseName = typeNodeName(c, mk[0])
+  if (baseName == "") {
+    return
+  }
+  let ut = userTypeLookup(c, baseName)
+  if (ut == 0 || c.ctx.types[ut].kind != TypeKind.Enum) {
+    return
+  }
+  let vn = getNode(c.tree, mk[1])
+  let vname = c.source[vn.span.start:vn.span.end]
+  if (vIndexOfName(vEnumVariantNames(c, ut), vname) < 0) {
+    return
+  }
+  let want = len(variantPayloadTypes(c, ut, vname))
+  let got = len(kidsOf(c.tree, kids[2]))
+  if (want != got) {
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "variant '${vname}' takes ${want} argument(s), found ${got}")
+  }
+}
+
+// ---- E0051 generic bound violation (§15.3) ---------------------------------
+
+// Checks a generic free-function call's inferred type arguments against each
+// type parameter's interface bound (E0051) — ported from check.zig's
+// `instantiateFunc`. The bound is read straight off the decl's type-param node
+// (not the flat `typeParamConstraints`, which the last `<T: I>` in the module
+// clobbers), and the arg comes from the same `genericTypeArgs` the sweep records
+// instantiations with, so the pairing matches the seed's env exactly. The safety
+// rule gates every judgement: only a confidently-concrete arg against a
+// concrete, non-generic interface bound is tested — an unbound (void) or
+// un-inferred arg is skipped so an inference gap never becomes a false positive
+// (the seed emits E0068 for those, elsewhere). Method-call / member callees are
+// left alone; only a bare-ident free generic reaches here.
+function vGenericBound(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let sp = getNode(c.tree, callee).span
+  let name = c.source[sp.start:sp.end]
+  if (envLookup(c, name) != 0) {
+    return // a local value shadows the free function
+  }
+  if (!isGenericFunc(c, name)) {
+    return
+  }
+  let decl = funcDeclLookup(c, name)
+  if (decl == 0) {
+    return
+  }
+  // The decl's type-param and constraint nodes live in its OWNING module's tree.
+  let oc = declOwner(c, name)
+  let dk = kidsOf(oc.tree, decl) // [recv, name, generics, params, result, body]
+  let tps = kidsOf(oc.tree, dk[2])
+  let args = genericTypeArgs(c, name, node)
+  if (len(args) != len(tps)) {
+    return
+  }
+  let i = 0
+  while (i < len(tps)) {
+    let gk = kidsOf(oc.tree, tps[i]) // [name, constraint_group?]
+    if (gk[1] != 0) {
+      let cons = kidsOf(oc.tree, gk[1])
+      if (len(cons) > 0) {
+        let boundIface = typeFromNode(oc, cons[0])
+        let arg = args[i]
+        if (arg != 0 && arg != c.ctx.voidId && !vMentionsInvalid(c, arg, 0) &&
+            !vHasTypeParam(c, arg, 0) && boundIface != 0 &&
+            !vMentionsInvalid(c, boundIface, 0) && !vHasTypeParam(c, boundIface, 0) &&
+            c.ctx.types[boundIface].kind == TypeKind.Interface &&
+            !vSatisfies(c, arg, boundIface)) {
+          report(c.diags, ecMissingMethod, vSpan(c, node),
+            "type argument ${i} does not satisfy its interface bound",
+            "check the interface's method set against this type")
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// ---- E0068 cannot-infer enum type arguments (§14.7) ------------------------
+
+// The number of `<...>` type parameters on an enum's declaration (0 for a plain
+// enum). The generics node is kid 1 of the EnumDecl, in the declaring module's
+// tree.
+function vEnumGenericArity(c: Checker, enumTy: int): int {
+  let oc = typeOwner(c, enumTy)
+  let decl = enumDeclOf(c, enumTy)
+  if (decl == 0) {
+    return 0
+  }
+  return len(kidsOf(oc.tree, kidsOf(oc.tree, decl)[1]))
+}
+
+// Emits E0068 for `let x = Enum.Variant` where `Enum` is GENERIC and `Variant`
+// carries no payload — ported from check.zig's `checkVariantRef`/`enumInstance`.
+// A bare no-payload variant reference carries no argument to solve the enum's
+// type parameters, so without an annotated target the instantiation is
+// unsolvable. Restricted to the un-annotated binding context precisely because
+// that is the one place `expected` is provably absent: an annotation, a return
+// target, or a call-argument slot all supply it, and check.bit does not thread
+// that expectation, so judging any other context risks a false positive. A
+// payload variant is a constructor CALL (handled elsewhere, and it can infer
+// from its args); an unknown variant name is E0070's concern; a plain (non-
+// generic) enum's variant is already concrete.
+function vInferEnum(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pat, annotation, init]
+  if (kids[1] != 0) {
+    return // annotated: the target type supplies the arguments
+  }
+  let init = kids[2]
+  if (init == 0 || getNode(c.tree, init).tag != Tag.Member) {
+    return
+  }
+  let mk = kidsOf(c.tree, init) // [base, name]
+  // A turbofish base `Opt<i64>.None` (a GenericInst) supplies the type arguments
+  // explicitly — the seed resolves it via `enumTurbofish` before ever reaching
+  // the cannot-infer path. Only a BARE enum name has nothing to solve `T` with.
+  if (getNode(c.tree, mk[0]).tag != Tag.Ident) {
+    return
+  }
+  let baseName = typeNodeName(c, mk[0])
+  if (baseName == "") {
+    return
+  }
+  let ut = userTypeLookup(c, baseName)
+  if (ut == 0 || c.ctx.types[ut].kind != TypeKind.Enum) {
+    return
+  }
+  if (vEnumGenericArity(c, ut) == 0) {
+    return // a plain enum's variant is already concrete
+  }
+  let vn = getNode(c.tree, mk[1])
+  let vname = c.source[vn.span.start:vn.span.end]
+  if (vIndexOfName(vEnumVariantNames(c, ut), vname) < 0) {
+    return // not a real variant — E0070's concern, elsewhere
+  }
+  if (len(variantPayloadTypes(c, ut, vname)) != 0) {
+    return // a payload variant is a constructor call, which infers from its args
+  }
+  reportNoHint(c.diags, ecCannotInfer, vSpan(c, mk[1]),
+    "cannot infer type arguments for '${baseName}'; annotate the target type")
+}
+
+// ---- E0070 / E0071: enum match arms (§13.8) --------------------------------
+
+// The declared variant names of an enum, in declaration order. Variant nodes and
+// their names live in the DECLARING module's tree, reached via typeOwner.
+function vEnumVariantNames(c: Checker, enumTy: int): []string {
+  let out = []string(0)
+  let oc = typeOwner(c, enumTy)
+  let decl = enumDeclOf(c, enumTy)
+  if (decl == 0) {
+    return out
+  }
+  for v of enumVariantNodes(oc, decl) {
+    let vn = getNode(oc.tree, kidsOf(oc.tree, v)[0])
+    out = append(out, oc.source[vn.span.start:vn.span.end])
+  }
+  return out
+}
+
+function vIndexOfName(names: []string, name: string): int {
+  let i = 0
+  while (i < len(names)) {
+    if (names[i] == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// E0041 (§13.8): in a `match` expression every arm's body must yield one common
+// type — the first arm fixes it (defaulted), the rest must be assignable. Runs
+// for every match: a statement match's arm bodies are `expr_stmt`/`block` nodes,
+// which `checkExprType` types as invalid (0), so `result` stays 0 and vExpect is
+// a no-op — only a value-yielding expression match is judged. No position
+// tracking needed.
+function vMatchExpr(c: Checker, node: int) {
+  let arms = kidsOf(c.tree, kidsOf(c.tree, node)[1])
+  let result = 0
+  let i = 0
+  while (i < len(arms)) {
+    let body = kidsOf(c.tree, arms[i])[1]
+    let got = checkExprType(c, body)
+    if (result == 0) {
+      result = defaultType(c, got)
+    } else {
+      vExpect(c, body, got, result)
+    }
+    i = i + 1
+  }
+}
+
+// Validates a `match` over an enum: every arm names a real variant (E0070) and
+// every variant is handled (E0071). The subject type is required to be a
+// confidently-known enum — an open type param or an un-inferred component is
+// skipped (safety rule). Every arm pattern is a VariantPat[name, binders], so the
+// name extraction is uniform. E0070 anchors on the arm pattern, E0071 on the
+// subject, and unhandled variants are reported in declaration order — matching
+// the seed's checkMatch.
+function vMatch(c: Checker, node: int) {
+  let k = kidsOf(c.tree, node) // [subject, arm_list]
+  let subjectTy = defaultType(c, checkExprType(c, k[0]))
+  if (subjectTy == 0 || vMentionsInvalid(c, subjectTy, 0) || vHasTypeParam(c, subjectTy, 0)) {
+    return
+  }
+  if (c.ctx.types[subjectTy].kind != TypeKind.Enum) {
+    return
+  }
+  let variants = vEnumVariantNames(c, subjectTy)
+  if (len(variants) == 0) {
+    return
+  }
+  let seen = []bool(len(variants))
+  for arm of kidsOf(c.tree, k[1]) {
+    let pat = kidsOf(c.tree, arm)[0]
+    if (getNode(c.tree, pat).tag != Tag.VariantPat) {
+      continue
+    }
+    let nameNode = getNode(c.tree, kidsOf(c.tree, pat)[0])
+    let vname = c.source[nameNode.span.start:nameNode.span.end]
+    let idx = vIndexOfName(variants, vname)
+    if (idx < 0) {
+      reportNoHint(c.diags, ecUnknownVariant, vSpan(c, pat), "no variant '${vname}' on this enum")
+    } else {
+      seen[idx] = true
+    }
+  }
+  let i = 0
+  while (i < len(variants)) {
+    if (!seen[i]) {
+      reportNoHint(c.diags, ecNonExhaustive, vSpan(c, k[0]),
+        "non-exhaustive 'match': variant '${variants[i]}' is not handled")
+    }
+    i = i + 1
+  }
+}
+
+// ---- E0049 not-callable: call target (§18.1) -------------------------------
+
+// A predeclared builtin function name (§5.3) — callable but not a user decl.
+function vIsBuiltinFunc(name: string): bool {
+  for f of predeclaredFuncs() {
+    if (f == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Emits E0049 when `x()` calls a value that is not a function. Only a bare-ident
+// callee is judged. Every callable SPELLING is checked before the env probe — a
+// user function, a first-class function value's name, a primitive conversion, a
+// type used as a constructor, or a builtin — because bit2's env is flat: a param
+// named `rounds` in one function would otherwise read back over a `function
+// rounds`, inventing an error. Only a name that is none of those AND binds to a
+// concrete non-func value reaches the emit. Member / type-node callees (method
+// calls, `Enum.Variant(..)`, `chan<T>(..)`) are left to the checker's own paths.
+function vNotCallable(c: Checker, node: int) {
+  let callee = kidsOf(c.tree, node)[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let cn = getNode(c.tree, callee)
+  let name = c.source[cn.span.start:cn.span.end]
+  if (funcDeclLookup(c, name) != 0 || funcSigLookup(c, name) != 0) {
+    return // a user function (possibly imported) or first-class function value
+  }
+  if (primIndexByName(name) >= 0 || userTypeLookup(c, name) != 0 || vIsBuiltinFunc(name)) {
+    return // a conversion `i64(x)`, a type constructor, or a builtin
+  }
+  let ev = envLookup(c, name)
+  if (ev == 0 || vMentionsInvalid(c, ev, 0) || vHasTypeParam(c, ev, 0)) {
+    return
+  }
+  if (c.ctx.types[ev].kind == TypeKind.Func) {
+    return // a func-typed local value is callable
+  }
+  reportNoHint(c.diags, ecNotCallable, vSpan(c, callee), "value is not callable")
+}
+
+// ---- E0054 not-indexable: index receiver (§16.1) ---------------------------
+
+// Only a slice, array, map, or string can be indexed (§16.1); the receiver type
+// is used AS-IS, never defaulted, so `1[0]` reads 'untyped int' just as the seed
+// renders it.
+function vIsIndexable(c: Checker, ty: int): bool {
+  let t = c.ctx.types[ty]
+  if (t.kind == TypeKind.Slice || t.kind == TypeKind.Array || t.kind == TypeKind.Map) {
+    return true
+  }
+  return t.kind == TypeKind.Prim && t.prim == 11
+}
+
+// Emits E0054 at the receiver when `recv[i]` indexes a non-indexable value. The
+// span is the receiver (kids[0]), matching the seed's one-caret anchor. An open
+// type param is skipped (permissive): a bare `T` receiver is undecidable here.
+function vIndex(c: Checker, node: int) {
+  let recv = kidsOf(c.tree, node)[0]
+  let rt = checkExprType(c, recv)
+  if (rt == 0 || vMentionsInvalid(c, rt, 0) || vHasTypeParam(c, rt, 0)) {
+    return
+  }
+  if (!vIsIndexable(c, rt)) {
+    reportNoHint(c.diags, ecNotIndexable, vSpan(c, recv), "'${typeName(c.ctx, rt)}' cannot be indexed")
+  }
+}
+
+// `t.N` (§13.4) needs a tuple receiver and an in-range index. Mirrors the seed's
+// checkTupleIndex, including its two anchors: the receiver for a non-tuple
+// (E0054, sharing vIndex's wording), the index leaf for out-of-range (E0059).
+// An un-inferred or type-param receiver is skipped — permissive when undecided.
+function vTupleIndex(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  let rt = checkExprType(c, kids[0])
+  if (rt == 0 || vMentionsInvalid(c, rt, 0) || vHasTypeParam(c, rt, 0)) {
+    return
+  }
+  let t = c.ctx.types[rt]
+  if (t.kind != TypeKind.Tuple) {
+    reportNoHint(c.diags, ecNotIndexable, vSpan(c, kids[0]),
+      "'${typeName(c.ctx, rt)}' cannot be indexed")
+    return
+  }
+  let n = getNode(c.tree, kids[1])
+  let i = parseIntText(c.source[n.span.start:n.span.end])
+  if (i < 0 || i >= len(t.members)) {
+    reportNoHint(c.diags, ecTupleIndexOutOfRange, vSpan(c, kids[1]),
+      "tuple index ${i} out of range for a ${len(t.members)}-element tuple")
+  }
+}
+
+// ---- E0057 unknown member (§13.4) ------------------------------------------
+
+// Levenshtein distance between two names, ported from check.zig `editDistance`.
+// The 64-byte cap is the seed's: longer names return the cap, which exceeds the
+// distance-3 hint threshold, so an over-long name simply yields no hint. Two
+// rolling rows rather than a full matrix, exactly as the seed does.
+function vEditDistance(a: string, b: string): int {
+  let maxLen = 64
+  if (len(a) > maxLen || len(b) > maxLen) {
+    return maxLen
+  }
+  let prev = []int(maxLen + 1)
+  let cur = []int(maxLen + 1)
+  let j = 0
+  while (j <= len(b)) {
+    prev[j] = j
+    j = j + 1
+  }
+  let i = 1
+  while (i <= len(a)) {
+    cur[0] = i
+    j = 1
+    while (j <= len(b)) {
+      let cost = 1
+      if (a[i - 1] == b[j - 1]) {
+        cost = 0
+      }
+      let best = cur[j - 1] + 1
+      if (prev[j] + 1 < best) {
+        best = prev[j] + 1
+      }
+      if (prev[j - 1] + cost < best) {
+        best = prev[j - 1] + cost
+      }
+      cur[j] = best
+      j = j + 1
+    }
+    // Swap the rows. Both are fully rewritten above before being read again, so
+    // sharing the backing arrays by reference is safe.
+    let tmp = prev
+    prev = cur
+    cur = tmp
+    i = i + 1
+  }
+  return prev[len(b)]
+}
+
+// Is `key` PRESENT in a member table, whatever type it maps to? The lookups in
+// check.bit answer "what type", conflating an absent member with one whose type
+// did not resolve; judging by absence needs the distinction.
+function vHasMember(table: map<string, int>, key: string): bool {
+  for (k, v) of table {
+    if (k == key) {
+      return true
+    }
+  }
+  return false
+}
+
+// The method name on `recvTy` closest to `wanted`, or "" when none is within
+// edit distance 3 (check.zig `closestMethodName`). Ties go to the first key
+// visited, matching the seed's strictly-less-than comparison over its method
+// bucket. `methodResults` is the complete method set for a type — it carries the
+// predeclared `error.message` that `methodSigs` omits.
+function vClosestMethodName(c: Checker, recvTy: int, wanted: string): string {
+  let prefix = "${recvTy}."
+  let best = ""
+  let bestDist = 64 + 1
+  for (k, v) of c.ctx.methodResults {
+    if (len(k) > len(prefix) && k[0:len(prefix)] == prefix) {
+      let name = k[len(prefix):len(k)]
+      let d = vEditDistance(name, wanted)
+      if (d < bestDist) {
+        bestDist = d
+        best = name
+      }
+    }
+  }
+  if (bestDist > 3) {
+    return "" // too far apart to be a useful hint
+  }
+  return best
+}
+
+// Emits E0057 when `recv.name` is neither a field of the receiver nor a method
+// on it (check.zig `checkMember`'s tail).
+//
+// The safety rule bites hard here — this validator judges by ABSENCE, so every
+// gap in the member tables reads as an error. It fires only when the receiver's
+// type is confidently concrete AND is a shape whose members are fully known:
+//   - an unresolved receiver (0), one mentioning `invalid`, or one carrying an
+//     unbound type param is skipped (the seed dispatches a type param through
+//     its constraint; a template body is re-checked per monomorphization);
+//   - a receiver that is a MODULE NAMESPACE or an enum TYPE name is not a value
+//     at all — `strings.trim` / `Color.Red` are resolved elsewhere and carry
+//     their own diagnostics (E0067 unexported_name, E0057 unknown variant);
+//   - only Struct and Interface receivers are judged. Every other kind (slice,
+//     map, prim, chan, fallible, func) reaches members exclusively through
+//     methods, and a builtin method the tables do not model would false-positive.
+function vMember(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [recv, name]
+  let recv = kids[0]
+  // `Enum.Variant` / a namespace member: the base names a TYPE or MODULE, not a
+  // value. `checkMember` resolves those separately.
+  if (typeNodeName(c, recv) != "" && userTypeLookup(c, typeNodeName(c, recv)) != 0) {
+    return
+  }
+  if (vIsNamespaceRef(c, recv)) {
+    return
+  }
+  if (!vDeclRooted(c, recv, 0)) {
+    return
+  }
+  let rt = checkExprType(c, recv)
+  if (rt == 0 || vMentionsInvalid(c, rt, 0) || vHasTypeParam(c, rt, 0)) {
+    return
+  }
+  let kind = c.ctx.types[rt].kind
+  if (kind != TypeKind.Struct && kind != TypeKind.Interface) {
+    return
+  }
+  let mn = getNode(c.tree, kids[1])
+  let mname = c.source[mn.span.start:mn.span.end]
+  let key = "${methodRecvType(c, rt)}." + mname
+  // PRESENCE, not a non-zero type. A member whose own type failed to resolve —
+  // `cipher: AesCipher` when the module declaring AesCipher is not loaded, which
+  // is every single-file check of a multi-file stdlib module — is recorded with
+  // type 0, which a `!= 0` lookup cannot tell apart from "no such member". That
+  // read turned a cascade into 13 invented E0057s across stdlib/crypto and tls.
+  if (vHasMember(c.ctx.structFields, key) || vHasMember(c.ctx.methodResults, key) ||
+    vHasMember(c.ctx.methodSigs, key)) {
+    return
+  }
+  let hint = vClosestMethodName(c, methodRecvType(c, rt), mname)
+  if (hint == "") {
+    reportNoHint(c.diags, ecUnknownMember, vSpan(c, kids[1]),
+      "no field or method '${mname}' on this type")
+    return
+  }
+  report(c.diags, ecUnknownMember, vSpan(c, kids[1]),
+    "no field or method '${mname}' on this type", "did you mean '${hint}'?")
+}
+
+// Does this expression's type trace back to a DECL the resolver resolved, rather
+// than to the module-wide flat `env`? Judging a member by ABSENCE is only sound
+// on a receiver whose type is trustworthy, and the flat-env fallback is not: a
+// name it cannot resolve reads back as whatever same-named local another
+// function left behind, so a perfectly valid `e.extType` gets judged against an
+// unrelated struct.
+//
+// Binder-bound names (for-of, match-arm payload, catch, comma-ok) are
+// deliberately absent from `declTypes` — they are typed best-effort in pre-pass 3
+// (see `envBind`) — so they read as not-decl-rooted and are skipped. That
+// under-reports E0057 inside loop and match-arm bodies, which is the correct
+// trade: the seed still gates, and this validator must never invent. Coverage
+// widens on its own once binders move onto the decl-path too.
+//
+// Depth-bounded: a receiver chain is walked to its base ident.
+function vDeclRooted(c: Checker, node: int, depth: int): bool {
+  if (node == 0 || depth > 16) {
+    return false
+  }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.Ident) {
+    return declRefType(c, node) != 0
+  }
+  // An explicit type node fixes the type outright.
+  if (t == Tag.CompositeLit || t == Tag.TypeAssert) {
+    return true
+  }
+  if (t == Tag.Member || t == Tag.Index || t == Tag.Call || t == Tag.TryExpr) {
+    return vDeclRooted(c, kidsOf(c.tree, node)[0], depth + 1)
+  }
+  return false
+}
+
+// Is `node` a bare reference to an imported MODULE namespace (`strings` in
+// `strings.trim(s)`)? A namespace is not a value, so its member access must not
+// be judged as a field/method lookup. Answered from the resolver's symbol table;
+// without a resolver (the bare dump entry points) this returns false and the
+// receiver's unresolved type (0) skips the check anyway.
+function vIsNamespaceRef(c: Checker, node: int): bool {
+  if (getNode(c.tree, node).tag != Tag.Ident) {
+    return false
+  }
+  if (node < 0 || node >= len(c.nodeSymbols)) {
+    return false
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return false
+  }
+  let k = c.symbols[sid].kind
+  return k == SymbolKind.ImportNamespace || k == SymbolKind.StructType ||
+    k == SymbolKind.EnumType || k == SymbolKind.InterfaceType ||
+    k == SymbolKind.TypeAlias || k == SymbolKind.BuiltinType
+}
+

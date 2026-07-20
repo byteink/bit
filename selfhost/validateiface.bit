@@ -1,0 +1,461 @@
+// Self-host: validation of type assertions, destructuring, interface boxing and
+// conversions (#1503, split out of validate.bit).
+
+// ---- E0041 impossible type assertion (§14.4) -------------------------------
+
+// Does candidate type `cand` satisfy interface `iface` — i.e. carry every one of
+// its methods with a matching signature (§14.3)? Both a struct method and an
+// interface method intern their `(params) => result` shape into methodSigs, and
+// interning dedups, so equal ids mean equal shapes. Non-generic interfaces only
+// (a Self-parameterised one is skipped by the type-param guard at the call site).
+function vSatisfies(c: Checker, cand: int, iface: int): bool {
+  if (cand == 0 || iface == 0) {
+    return true // cascade suppression
+  }
+  if (c.ctx.types[iface].kind != TypeKind.Interface) {
+    return cand == iface
+  }
+  let prefix = "${iface}."
+  for (k, sig) of c.ctx.methodSigs {
+    if (len(k) > len(prefix) && k[0:len(prefix)] == prefix) {
+      let name = k[len(prefix):len(k)]
+      let have = methodSigLookup(c, "${cand}." + name)
+      if (have == 0 || have != sig) {
+        return false
+      }
+    }
+  }
+  return true
+}
+
+// Emits E0041 when `iface.(T)` asserts a target that can never be the dynamic
+// type held in the interface — T does not satisfy the interface, so the assertion
+// is false forever (§14.4). Only fires for a confidently-known interface receiver
+// and concrete target; the span covers the whole `recv.(T)`.
+function vTypeAssert(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [recv, typeNode]
+  let recvTy = checkExprType(c, kids[0])
+  let target = typeFromNode(c, kids[1])
+  if (recvTy == 0 || target == 0) {
+    return
+  }
+  if (vMentionsInvalid(c, recvTy, 0) || vMentionsInvalid(c, target, 0)) {
+    return
+  }
+  if (vHasTypeParam(c, recvTy, 0) || vHasTypeParam(c, target, 0)) {
+    return
+  }
+  if (c.ctx.types[recvTy].kind != TypeKind.Interface) {
+    return
+  }
+  if (!vSatisfies(c, target, recvTy)) {
+    reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node),
+      "impossible type assertion: '${typeName(c.ctx, target)}' does not satisfy '${typeName(c.ctx, recvTy)}'")
+  }
+}
+
+// ---- E0041 destructuring assignment needs a two-result form (§12.6) --------
+
+// A parenthesized two-target assignment `(a, b) = rhs` only type-checks when the
+// right side is a two-result form — `m[k]`, `<- c`, or `iface.(T)` (§12.6/§14.4/
+// §16.2). The parser folds `(a, b)` into a single `tuple_pat` lhs item, so the
+// plain arity check waves it through; this catches an rhs that is none of those.
+// Conservative: any of the three two-result tags is skipped (a slice `m[k]` that
+// the seed would still reject stays MISSING, never a false positive).
+function vDestructure(c: Checker, node: int) {
+  let k = kidsOf(c.tree, node) // [lhs_list, rhs_list]
+  let lhsItems = kidsOf(c.tree, k[0])
+  let rhsItems = kidsOf(c.tree, k[1])
+  if (len(lhsItems) != 1 || len(rhsItems) != 1) {
+    return
+  }
+  let lhs0 = lhsItems[0]
+  if (getNode(c.tree, lhs0).tag != Tag.TuplePat) {
+    return
+  }
+  let targets = kidsOf(c.tree, lhs0)
+  let rhs = rhsItems[0]
+  let rn = getNode(c.tree, rhs)
+  // A tuple right-hand side spreads positionally over the targets (SPEC §13.1),
+  // so it is a valid destructure at any matching arity — not just the arity-2
+  // two-result forms.
+  let rt = checkExprType(c, rhs)
+  if (rt != 0 && c.ctx.types[rt].kind == TypeKind.Tuple &&
+      len(c.ctx.types[rt].members) == len(targets)) {
+    return
+  }
+  if (len(targets) != 2) {
+    return
+  }
+  if (rn.tag == Tag.Index || rn.tag == Tag.TypeAssert) {
+    return
+  }
+  if (rn.tag == Tag.Unary && rn.main == int(Kind.ArrowLeft)) {
+    return // `<- c` receive
+  }
+  reportNoHint(c.diags, ecTypeMismatch, vSpan(c, node),
+    "destructuring assignment needs a tuple or a two-result form on the right: a tuple-returning call, 'm[k]', '<- c', or 'iface.(T)'")
+}
+
+// ---- E0041 interface-scalar store: every path a value reaches an interface ---
+// slot (§14.3). The `return` site is already caught by vExpect (vAssignable now
+// gates an interface target on storable+satisfies); these walkers cover the
+// other slots the seed checks with the same `expect` — an annotated binding, a
+// plain assignment, a call argument, a struct/map/slice literal element, and a
+// channel send. Each stays NARROW: it fires only for a confidently-concrete,
+// non-storable (scalar) value against a confirmed interface target, emitting the
+// one special "cannot store" message. A storable-but-non-satisfying value is
+// left to vExpect's path, never re-judged here — porting general satisfaction
+// into every slot would risk the false positives vSatisfies edge cases invite.
+
+function vIfaceStore(c: Checker, valueNode: int, target: int) {
+  if (target == 0 || c.ctx.types[target].kind != TypeKind.Interface) {
+    return
+  }
+  let v = valueNode
+  if (getNode(c.tree, v).tag == Tag.Arg) {
+    v = kidsOf(c.tree, v)[0]
+  }
+  let ty = checkExprType(c, v)
+  if (ty == 0 || vMentionsInvalid(c, ty, 0) || vHasTypeParam(c, ty, 0)) {
+    return
+  }
+  if (!vStorableInInterface(c, ty)) {
+    report(c.diags, ecTypeMismatch, vSpan(c, v),
+      "cannot store '${typeName(c.ctx, ty)}' in interface '${typeName(c.ctx, target)}': only a struct can be the concrete type behind an interface value",
+      "an interface value is the receiver's object pointer, so a non-struct has nothing to point to (§14.3)")
+  }
+}
+
+// An annotated binding `let x: T = e` / `var x: T = e`, against its annotation.
+//
+// This is the #1470 hole, and it was not float-specific or array-specific: NO
+// annotated binding was assignability-checked at all. `vAssignable`/`vExpect`
+// were ported faithfully but had no Binding call site, so the self-hosted
+// compiler accepted `let x: string = 5` and `let x: i32 = "hello"` — every one
+// of which the seed rejects with E0041. A generated verdict sweep
+// (scripts/selfhost-diffverdict.sh) put the count at 132 constructs the seed
+// refuses and bit admitted.
+//
+// The assignment form `x = e` was already covered, which is why this stayed
+// hidden: the shape people grep for looked checked.
+function vBinding(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pat, annotation, init]
+  // Arity guard: this runs at MODULE level too (check.bit's top-level walk), and
+  // not every binding shape there carries all three kids. Indexing blind panicked
+  // the compiler on stdlib/http.
+  if (len(kids) < 3) {
+    return
+  }
+  let ann = kids[1]
+  let init = kids[2]
+  // No annotation means no expectation (the type IS the initializer's), and a
+  // tuple pattern is destructuring — arity and element types are vDestructure's.
+  if (ann == 0 || init == 0 || getNode(c.tree, kids[0]).tag == Tag.TuplePat) {
+    return
+  }
+  vExpectExpr(c, init, typeFromNode(c, ann))
+}
+
+
+// A composite literal `S{...}` / `map<K,V>{...}` / `[]T{...}`: each field / map
+// entry / element value against its declared slot type.
+// The typed array literal `[N]T{...}` — the ONLY form SPEC.md admits for
+// constructing an array value (§11.2, §12.3). Its element count must equal N
+// (§12.3: "length must match"), and each element must be assignable to T.
+//
+// Last cell of the #1470 class. Unchecked, `let a: [2]f32 = [2]f32{4.5}` built
+// a 2-element array from one initializer and the second slot read uninitialized
+// heap — the same memory-safety shape as the bare-list length mismatch, just
+// reached through the form that IS legal.
+// A typed composite literal `S{...}` / `map<K,V>{...}` / `[]T{...}` / `[N]T{...}`:
+// each field, entry and element against its declared slot type, plus the array
+// length rule (§12.3: "length must match").
+//
+// The slot types are the same #1470 hole as the annotated binding, reached
+// through a different syntax: before this, `S{ v: "s" }` for an `f32` field and
+// `map<i32,i32>{4.5: 1}` were both accepted by the self-hosted compiler and
+// rejected by the seed. Everything routes through vExpectExpr so the element of
+// a composite gets the identical treatment a binding's initializer gets.
+//
+// Interface-typed slots are left to vCompositeIface, which owns them and emits
+// the §14.3 wording — the same split the call path uses with vCallArgIface.
+function vCompositeTypes(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0) {
+    return
+  }
+  let tk = c.ctx.types[target].kind
+  let items = kidsOf(c.tree, kids[1])
+  if (tk == TypeKind.Struct) {
+    // Struct-literal FIELD types — the last declared-type slot in the language
+    // to get assignability checking (#1476, closing the #1470 class). This was
+    // held out because the recompute it needs panicked "index out of range" on
+    // all 10 corpus files reaching stdlib/http; that was a genuine cross-module
+    // bug in `scrutineeTypeArgs`, not a reason to skip the check, and it is now
+    // fixed at the source rather than avoided here.
+    for fi of items {
+      if (getNode(c.tree, fi).tag != Tag.FieldInit) {
+        continue
+      }
+      let fk = kidsOf(c.tree, fi) // [name, expr]
+      let fnn = getNode(c.tree, fk[0])
+      let fname = c.source[fnn.span.start:fnn.span.end]
+      vExpectExprNonIface(c, fk[1], structFieldLookup(c, "${target}." + fname))
+    }
+    return
+  }
+  if (tk == TypeKind.Map) {
+    for me of items {
+      if (getNode(c.tree, me).tag != Tag.MapEntry) {
+        continue
+      }
+      let mk = kidsOf(c.tree, me) // [key, val]
+      vExpectExprNonIface(c, mk[0], c.ctx.types[target].mapKey)
+      vExpectExprNonIface(c, mk[1], c.ctx.types[target].mapVal)
+    }
+    return
+  }
+  if (tk != TypeKind.Slice && tk != TypeKind.Array) {
+    return
+  }
+  if (tk == TypeKind.Array) {
+    // E0050 at the whole literal, with the seed's exact text and span. Only the
+    // ARRAY form has a length rule; a `[]T{...}` slice literal has no fixed len.
+    let want = c.ctx.types[target].arrayLen
+    let got = len(items)
+    if (got != want) {
+      reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+        "array literal has ${got} element(s), expected ${want}")
+    }
+  }
+  let elem = c.ctx.types[target].elem
+  for a of items {
+    let e = a
+    if (getNode(c.tree, e).tag == Tag.Arg) { e = kidsOf(c.tree, e)[0] }
+    vExpectExprNonIface(c, e, elem)
+  }
+}
+
+// vExpectExpr, but silent on an interface target — for the sites where a vIface*
+// rule already reports that case and answering twice would double-report.
+function vExpectExprNonIface(c: Checker, node: int, want: int) {
+  if (want == 0 || c.ctx.types[want].kind == TypeKind.Interface) {
+    return
+  }
+  vExpectExpr(c, node, want)
+}
+
+function vCompositeIface(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0) {
+    return
+  }
+  let init = kids[1]
+  let tk = c.ctx.types[target].kind
+  if (tk == TypeKind.Struct) {
+    for fi of kidsOf(c.tree, init) {
+      if (getNode(c.tree, fi).tag != Tag.FieldInit) {
+        continue
+      }
+      let fk = kidsOf(c.tree, fi) // [name, expr]
+      let fnn = getNode(c.tree, fk[0])
+      let fname = c.source[fnn.span.start:fnn.span.end]
+      vIfaceStore(c, fk[1], structFieldLookup(c, "${target}." + fname))
+    }
+    return
+  }
+  if (tk == TypeKind.Map) {
+    let keyTy = c.ctx.types[target].mapKey
+    let valTy = c.ctx.types[target].mapVal
+    for me of kidsOf(c.tree, init) {
+      if (getNode(c.tree, me).tag != Tag.MapEntry) {
+        continue
+      }
+      let mk = kidsOf(c.tree, me) // [key, val]
+      vIfaceStore(c, mk[0], keyTy)
+      vIfaceStore(c, mk[1], valTy)
+    }
+    return
+  }
+  if (tk == TypeKind.Slice || tk == TypeKind.Array) {
+    let elem = c.ctx.types[target].elem
+    for a of kidsOf(c.tree, init) {
+      vIfaceStore(c, a, elem)
+    }
+  }
+}
+
+// A plain `=` assignment: each rhs against its lhs slot's type. Compound
+// assignments (`+=`, ...) are numeric and never store into an interface; the
+// two-result `(a, b) = ...` form is vDestructure's.
+function vAssignIface(c: Checker, node: int) {
+  if (getNode(c.tree, node).main != int(Kind.Eq)) {
+    return
+  }
+  let k = kidsOf(c.tree, node) // [lhs_list, rhs_list]
+  let lhs = kidsOf(c.tree, k[0])
+  let rhs = kidsOf(c.tree, k[1])
+  if (len(lhs) != len(rhs)) {
+    return
+  }
+  let i = 0
+  while (i < len(lhs)) {
+    if (getNode(c.tree, lhs[i]).tag != Tag.TuplePat) {
+      let lty = checkExprType(c, lhs[i])
+      if (lty != 0 && c.ctx.types[lty].kind == TypeKind.Interface) {
+        vIfaceStore(c, rhs[i], lty)
+      }
+    }
+    i = i + 1
+  }
+}
+
+// A free-function call's arguments against interface-typed parameters. Mirrors
+// vCall's resolution: a bare-ident, non-shadowed, non-generic user function
+// only — a generic's params carry bare `T` (skipped), and member/builtin callees
+// are the checker's own paths.
+function vCallArgIface(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let sp = getNode(c.tree, callee).span
+  let name = c.source[sp.start:sp.end]
+  if (envLookup(c, name) != 0) {
+    return
+  }
+  let decl = funcDeclLookup(c, name)
+  if (decl == 0) {
+    return
+  }
+  let owner = declOwner(c, name)
+  let plist = declParamListNode(owner, decl)
+  if (plist < 0) {
+    return // generic: param types carry bare `T`
+  }
+  let params = kidsOf(owner.tree, plist)
+  let args = kidsOf(c.tree, kids[2])
+  let i = 0
+  while (i < len(params) && i < len(args)) {
+    vIfaceStore(c, args[i], typeFromNode(owner, kidsOf(owner.tree, params[i])[1]))
+    i = i + 1
+  }
+}
+
+// ---- E0053 conversions (§12.9) ---------------------------------------------
+
+// A numeric prim index (§11.1): the signed and unsigned integers plus the two
+// floats occupy 0..9 in `primIndexByName` order, `bool` and `string` follow.
+function vPrimIsNumeric(p: int): bool { return p >= 0 && p <= 9 }
+
+// An integer prim index — numeric minus the two floats.
+function vPrimIsInteger(p: int): bool { return p >= 0 && p <= 7 }
+
+// Emits E0053 for a conversion whose source type cannot reach its target
+// (§12.9). Mirrors the seed's `checkConstruction` prim branch in
+// seed/check.zig.
+//
+// This call site did not exist at all — the same shape as #1470, where
+// `vAssignable`/`vExpect` were faithfully ported but nothing invoked them for a
+// `Tag.Binding`. `vNotCallable` deliberately RETURNS on a primitive callee
+// ("a conversion `i64(x)`, a type constructor, or a builtin") because it is
+// judging callability, and no other pass looked at the argument. So
+// `string(someI64)` type-checked to `string`, lowered to a `string_from_*`
+// that never existed for that source, and SIGSEGV'd at runtime — the compiler
+// users get accepting a program the oracle rejects, with a crash rather than a
+// diagnostic as the consequence (#1490).
+//
+// The target name printed is the CANONICAL prim (`primName`), not the alias the
+// user wrote, so `int(x)` reports 'i64' exactly as the seed does.
+function vConversion(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let callee = kids[0]
+  if (getNode(c.tree, callee).tag != Tag.Ident) {
+    return
+  }
+  let sp = getNode(c.tree, callee).span
+  let name = c.source[sp.start:sp.end]
+
+  // Every callable spelling that could SHADOW a prim name is cleared first, for
+  // the same reason `vNotCallable` does it: bit2's env is flat, so a local or a
+  // user decl called `string` would otherwise be judged as the conversion.
+  if (funcDeclLookup(c, name) != 0 || funcSigLookup(c, name) != 0) {
+    return
+  }
+  if (userTypeLookup(c, name) != 0 || envLookup(c, name) != 0) {
+    return
+  }
+  let p = primIndexByName(name)
+  if (p < 0) {
+    return
+  }
+
+  // Arity is a separate diagnostic; judge only the well-formed one-argument
+  // shape so a malformed call reports once.
+  let args = kidsOf(c.tree, kids[2])
+  if (len(args) != 1) {
+    return
+  }
+  // Arguments arrive wrapped in an `Arg` node, which `checkExprType` has no case
+  // for and would silently type as 0 — reading as "did not infer" and taking
+  // the permissive path, which is how this check would appear to pass while
+  // never firing.
+  let arg = args[0]
+  if (getNode(c.tree, arg).tag == Tag.Arg) { arg = kidsOf(c.tree, arg)[0] }
+
+  let at = checkExprType(c, arg)
+  // THE SAFETY RULE: a type bit2 did not infer, or one still carrying a type
+  // param, is this compiler's gap and not the program's. Stay permissive.
+  if (at == 0 || vMentionsInvalid(c, at, 0) || vHasTypeParam(c, at, 0)) {
+    return
+  }
+
+  let k = c.ctx.types[at].kind
+  let ok = false
+  if (k == TypeKind.Prim) {
+    ok = vPrimIsNumeric(p) && vPrimIsNumeric(c.ctx.types[at].prim)
+  } else if (k == TypeKind.UntypedInt || k == TypeKind.UntypedFloat || k == TypeKind.UntypedRune) {
+    ok = vPrimIsNumeric(p)
+  } else if (k == TypeKind.UntypedString) {
+    ok = p == 11
+  } else if (k == TypeKind.Ptr) {
+    // `int(p)` (§11.4): a raw pointer's address as an integer. Both are one
+    // word and codegen's `convert` is the identity.
+    ok = vPrimIsInteger(p)
+  } else if (k == TypeKind.Enum) {
+    // A C-like enum is an integer tag, so `int(tag)` yields it. A payload enum
+    // is a boxed object with no integer value — use `match`.
+    ok = vPrimIsInteger(p) && !c.ctx.types[at].enumBoxed
+  } else if (k == TypeKind.Slice) {
+    // `string([]u8)` copies bytes verbatim. A `[]rune`/`[]i32` source would
+    // need UTF-8 encoding (deferred with rune iteration, #348 unit D), so it is
+    // rejected rather than silently narrowing each code point to a byte.
+    ok = p == 11 && c.ctx.types[at].elem == primType(c.ctx, 4)
+  }
+  if (ok) {
+    return
+  }
+
+  let an = typeName(c.ctx, at)
+  let tn = primName(p)
+  reportNoHint(c.diags, ecInvalidOperand, vSpan(c, node),
+    "cannot convert '${an}' to '${tn}'")
+}
+
+// A channel send `ch <- v`: the sent value against the channel's element type.
+function vSendIface(c: Checker, node: int) {
+  let k = kidsOf(c.tree, node) // [chan_expr, value_expr]
+  let chanTy = checkExprType(c, k[0])
+  if (chanTy == 0 || c.ctx.types[chanTy].kind != TypeKind.Chan) {
+    return
+  }
+  vIfaceStore(c, k[1], c.ctx.types[chanTy].elem)
+  // The sent value against the channel's element type — same #1470 hole, reached
+  // through `c <- v` (§16). vIfaceStore above owns an interface element type.
+  vExpectExprNonIface(c, k[1], c.ctx.types[chanTy].elem)
+}
+
