@@ -547,22 +547,22 @@ function scrutineeTypeArgs(c: Checker, node: int): []int {
     let callee = getNode(c.tree, ck[0])
     if (callee.tag == Tag.Ident) {
       let cname = c.source[callee.span.start:callee.span.end]
-      let decl = funcDeclLookup(c, cname)
+      let fr = funcRefAt(c, ck[0], cname)
       // An imported decl's nodes index its own module's tree; a generic
       // instance read from it would not be resolvable here anyway, so only a
       // locally-declared callee contributes a result node.
       //
       // OWNERSHIP IS CHECKED FIRST, and that order is load-bearing (#1476).
-      // `funcDeclLookup` follows imports, so `decl` may index the EXPORTING
-      // module's tree — its own doc comment requires callers to read it against
-      // `declOwner(...).tree`. Testing `isExternDecl(c.tree, decl)` ahead of the
-      // module check broke exactly that rule: it read a foreign node index
-      // against THIS tree, and when the index ran past this tree's node count it
-      // panicked "index out of range". Every corpus file reaching stdlib/http
-      // crashed on `TlsTrustStore{ roots: bundled().roots }` — a cross-module
-      // call whose result feeds a struct-literal field.
-      if (decl != 0 && declOwner(c, cname).moduleId == c.moduleId && !isExternDecl(c.tree, decl)) {
-        tnode = kidsOf(c.tree, decl)[4]
+      // The lookup follows imports, so `fr.decl` may index the EXPORTING
+      // module's tree — which is precisely why decl and owner are resolved as
+      // one `FuncRef`. Testing `isExternDecl(c.tree, decl)` ahead of the module
+      // check broke that pairing: it read a foreign node index against THIS
+      // tree, and when the index ran past this tree's node count it panicked
+      // "index out of range". Every corpus file reaching stdlib/http crashed on
+      // `TlsTrustStore{ roots: bundled().roots }` — a cross-module call whose
+      // result feeds a struct-literal field.
+      if (fr.decl != 0 && fr.owner.moduleId == c.moduleId && !isExternDecl(c.tree, fr.decl)) {
+        tnode = kidsOf(c.tree, fr.decl)[4]
       }
     } else if (callee.tag == Tag.Member) {
       // `Enum.Variant(args)` construction: infer the enum's type-args from the
@@ -609,18 +609,18 @@ function scrutineeTypeArgNodes(c: Checker, node: int): []int {
     let callee = getNode(c.tree, ck[0])
     if (callee.tag == Tag.Ident) {
       let cname = c.source[callee.span.start:callee.span.end]
-      let decl = funcDeclLookup(c, cname)
+      let fr = funcRefAt(c, ck[0], cname)
       // An imported decl's nodes index its own module's tree; a generic
       // instance read from it would not be resolvable here anyway, so only a
       // locally-declared callee contributes a result node.
       //
       // Ownership first, for the reason spelled out in `scrutineeTypeArgs`
-      // (#1476): `decl` may index the exporting module's tree, so it must not
+      // (#1476): `fr.decl` may index the exporting module's tree, so it must not
       // reach `isExternDecl(c.tree, ...)` until it is known to be local. This
       // twin had the identical latent bug; only the other one had a corpus file
       // that reached it.
-      if (decl != 0 && declOwner(c, cname).moduleId == c.moduleId && !isExternDecl(c.tree, decl)) {
-        tnode = kidsOf(c.tree, decl)[4]
+      if (fr.decl != 0 && fr.owner.moduleId == c.moduleId && !isExternDecl(c.tree, fr.decl)) {
+        tnode = kidsOf(c.tree, fr.decl)[4]
       }
     }
   }
@@ -799,6 +799,73 @@ function funcDeclLookup(c: Checker, name: string): int {
     }
   }
   return 0
+}
+
+// A free function's declaration, paired with the module that owns the tree the
+// decl node indexes. The two are inseparable — a node index only means anything
+// inside its own tree — so every site that needs one needs the other, and
+// resolving them together makes it impossible to pair a decl with the wrong
+// tree. `decl == 0` means "no free function", and `owner` is then `c`.
+struct FuncRef {
+  owner: Checker,
+  decl: int,
+}
+
+// The free function the identifier at `node` names, resolved through the
+// RESOLVER's per-node symbol table rather than by name (#1502).
+//
+// `funcDeclLookup`/`declOwner` answer from `name` alone, against a module-wide
+// map, with a hand-rolled "a local declaration beats an import" loop standing in
+// for scope. That is the flat-namespace hazard this codebase keeps paying for: a
+// name is not a binding, and only the node knows which binding it is. The
+// resolver already computed that — a `Func` symbol carries its own decl node,
+// and an `ImportItem` carries the module and symbol it aliases, which is exactly
+// the owner hop `declOwner` reconstructs by guessing.
+//
+// Falls back to the name path when the node resolves to no function symbol:
+// the resolver-less dump entry points (`nodeSymbols` empty), a qualified
+// `ns.member` callee (whose dotted key has no single ident node), and — for now
+// — a node the resolver bound to a VALUE of the same name. That last one is the
+// permissive choice on purpose: refusing to find the declaration there would
+// change lowering, which belongs with #1529, not here.
+function funcRefAt(c: Checker, node: int, name: string): FuncRef {
+  if (node > 0 && node < len(c.nodeSymbols)) {
+    let sid = c.nodeSymbols[node]
+    if (sid > 0 && sid < len(c.symbols)) {
+      let sym = c.symbols[sid]
+      if (sym.kind == SymbolKind.Func && sym.decl != 0) {
+        return FuncRef{ owner: c, decl: sym.decl }
+      }
+      if (sym.kind == SymbolKind.ImportItem) {
+        let m = sym.importedFromModule
+        if (m >= 0 && m < len(c.mods)) {
+          let e = c.mods[m]
+          let tid = sym.importedFromSymbol
+          if (tid > 0 && tid < len(e.symbols)) {
+            let tgt = e.symbols[tid]
+            if (tgt.kind == SymbolKind.Func && tgt.decl != 0) {
+              return FuncRef{ owner: e, decl: tgt.decl }
+            }
+          }
+        }
+      }
+    }
+  }
+  return FuncRef{ owner: declOwner(c, name), decl: funcDeclLookup(c, name) }
+}
+
+// The callee node of a Call, or 0 for anything else — the node `funcRefAt` keys
+// on. Guarded rather than assumed: several callers pass a `callNode` that is
+// only SOMETIMES a Call (see `explicitCallTypeArgs`), and reading kid 0 of a
+// non-Call would key the lookup on an unrelated node.
+function calleeNodeOf(c: Checker, callNode: int): int {
+  if (callNode <= 0 || callNode >= len(c.tree.nodes)) {
+    return 0
+  }
+  if (getNode(c.tree, callNode).tag != Tag.Call) {
+    return 0
+  }
+  return kidsOf(c.tree, callNode)[0]
 }
 
 // Copies every entry whose key is exactly `orig`, or is prefixed `orig.` (a
@@ -1081,14 +1148,15 @@ function explicitCallTypeArgs(c: Checker, callNode: int): []int {
 }
 
 function genericResultAt(c: Checker, name: string, callNode: int): int {
-  let decl = funcDeclLookup(c, name)
+  let fr = funcRefAt(c, calleeNodeOf(c, callNode), name)
+  let decl = fr.decl
   if (decl == 0) {
     return -1
   }
   // An imported callee's decl indexes ITS module's node arena; reading it
   // against this module's tree is an out-of-range panic at best and a silently
   // unrelated node at worst.
-  let oc = declOwner(c, name)
+  let oc = fr.owner
   if (isExternDecl(oc.tree, decl)) {
     return -1 // SPEC 11.7: never generic
   }
@@ -1289,13 +1357,14 @@ function callResultTypeArgs(c: Checker, callNode: int, wantName: string): []int 
   if (name == "") {
     return out
   }
-  let decl = funcDeclLookup(c, name)
+  let fr = funcRefAt(c, calleeNodeOf(c, callNode), name)
+  let decl = fr.decl
   if (decl == 0) {
     return out
   }
-  // The decl's nodes index its OWN module's tree (see declOwner); an extern is
+  // The decl's nodes index its OWN module's tree (see FuncRef); an extern is
   // never generic (SPEC 11.7).
-  let oc = declOwner(c, name)
+  let oc = fr.owner
   if (isExternDecl(oc.tree, decl)) {
     return out
   }
@@ -1428,12 +1497,13 @@ function bindTypeParamAtCall(pc: Checker, ac: Checker, callNode: int, params: []
 // resolves to void.
 function genericTypeArgs(c: Checker, name: string, callNode: int): []int {
   let out = []int(0)
-  let decl = funcDeclLookup(c, name)
+  let fr = funcRefAt(c, calleeNodeOf(c, callNode), name)
+  let decl = fr.decl
   if (decl == 0) {
     return out
   }
-  // The decl's nodes belong to its own module's tree (see declOwner).
-  let oc = declOwner(c, name)
+  // The decl's nodes belong to its own module's tree (see FuncRef).
+  let oc = fr.owner
   if (isExternDecl(oc.tree, decl)) {
     return out // SPEC 11.7: never generic
   }
@@ -2504,11 +2574,12 @@ function seedArrowExpectedCall(c: Checker, node: int) {
   if (shadowedByValue(c, kids[0], name)) {
     return // a local value shadows the free function
   }
-  let decl = funcDeclLookup(c, name)
+  let fr = funcRefAt(c, kids[0], name)
+  let decl = fr.decl
   if (decl == 0) {
     return
   }
-  let owner = declOwner(c, name)
+  let owner = fr.owner
   let plist = declParamListNode(owner, decl)
   if (plist < 0) {
     return // generic: the parameter type is not known until instantiation
