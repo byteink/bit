@@ -22,7 +22,7 @@ ssh "$HOST" "rm -rf $REMOTE && mkdir -p $REMOTE" || { echo "cannot reach $HOST";
 # not an x64 gap, and counting them here would just mask a real one appearing.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"
 
-pass=0 diff=0 refused=0 seedfail=0 skipped=0
+pass=0 diff=0 refused=0 seedfail=0 skipped=0 scpfail=0
 for d in examples/*/; do
   n=$(basename "$d")
   case " $SKIP " in *" $n "*) skipped=$((skipped + 1)); continue;; esac
@@ -32,7 +32,11 @@ for d in examples/*/; do
   if ! "$BIT2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1; then
     refused=$((refused + 1)); echo "REFUSED $n: $(head -1 "$TMP/berr_$n")"; continue
   fi
-  scp -q "$TMP/seed_$n" "$TMP/b2_$n" "$HOST:$REMOTE/" || { echo "SCP-FAIL $n"; continue; }
+  # A failed transfer is a failure, not a silent skip: it printed SCP-FAIL and
+  # then fell through to a verdict that never looked at it, so a run where EVERY
+  # example failed to reach the host still exited 0 (#1513). Nothing was compared;
+  # that cannot read as agreement.
+  scp -q "$TMP/seed_$n" "$TMP/b2_$n" "$HOST:$REMOTE/" || { echo "SCP-FAIL $n"; scpfail=$((scpfail + 1)); continue; }
   so=$(ssh "$HOST" "cd $REMOTE && chmod +x seed_$n b2_$n && timeout 30 ./seed_$n 2>&1; echo EXIT=\$?")
   bo=$(ssh "$HOST" "cd $REMOTE && timeout 30 ./b2_$n 2>&1; echo EXIT=\$?")
   if [ "$so" = "$bo" ]; then
@@ -44,5 +48,5 @@ for d in examples/*/; do
     echo "--- bit2: $bo" | head -5
   fi
 done
-echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused SEED-FAIL=$seedfail SKIP(unported)=$skipped"
-[ "$diff" -eq 0 ] && [ "$seedfail" -eq 0 ] && [ "$refused" -eq 0 ]
+echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused SEED-FAIL=$seedfail SCP-FAIL=$scpfail SKIP(unported)=$skipped"
+[ "$diff" -eq 0 ] && [ "$seedfail" -eq 0 ] && [ "$refused" -eq 0 ] && [ "$scpfail" -eq 0 ]

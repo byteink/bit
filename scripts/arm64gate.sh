@@ -156,17 +156,41 @@ mutant_stream() {
   rm -rf "${tmp}"
 }
 
+# Run the suite over a mutated tree and report ONLY on the gate's verdict.
+#
+# The status must come from the suite, not from the container's lifecycle (#1513).
+# `mutant_stream | run_suite` conflated the two: run_suite returns 124 when the
+# container was reaped by the deadline or died before printing a verdict, and
+# "any non-zero means the gate went red" scored that as a successful mutation
+# test — a run in which the mutant was never actually judged. Worse, a failure
+# inside mutant_stream (`exit 127`) only killed the pipeline subshell, so a
+# harness that could not even build the mutant also reported ok. The tar is
+# therefore materialized first, where its exit status is the script's.
+mutant_verdict() { # $1=kind -> 0 gate went red (good), 1 gate passed it, 2 no verdict
+  local tar rc=0
+  tar="$(mktemp)"
+  # Not a pipeline: mutant_stream's own `exit 127` must be the script's status.
+  mutant_stream "$1" > "${tar}"
+  run_suite < "${tar}" || rc=$?
+  rm -f "${tar}"
+  [ "${rc}" -eq 0 ] && return 1
+  [ "${rc}" -eq 124 ] && return 2
+  return 0
+}
+
 # `mutant [build|golden]` — run ONLY the deliberate-breakage half. Use this when
 # HEAD is already known-red on this target (as aarch64-linux is today), where a
 # control run cannot be green and `selftest` would correctly refuse to conclude.
 if [ "${MODE}" = "mutant" ]; then
   echo "===MUTANT (deliberate breakage, must be RED)==="
-  if mutant_stream "${2:-build}" | run_suite; then
-    echo "ARM64GATE_MUTANT=BROKEN — the gate passed a deliberately broken tree" >&2
-    exit 1
-  fi
-  echo "ARM64GATE_MUTANT=ok (gate went red on a broken tree)"
-  exit 0
+  mrc=0
+  mutant_verdict "${2:-build}" || mrc=$?
+  case "${mrc}" in
+    0) echo "ARM64GATE_MUTANT=ok (gate went red on a broken tree)"; exit 0 ;;
+    2) echo "ARM64GATE_MUTANT=inconclusive — no verdict (container died or deadline hit); the mutant was never judged" >&2 ;;
+    *) echo "ARM64GATE_MUTANT=BROKEN — the gate passed a deliberately broken tree" >&2 ;;
+  esac
+  exit 1
 fi
 
 if [ "${MODE}" = "selftest" ]; then
@@ -182,12 +206,14 @@ if [ "${MODE}" = "selftest" ]; then
   fi
 
   echo "===SELFTEST MUTANT (deliberate breakage, must be RED)==="
-  if mutant_stream golden | run_suite; then
-    echo "ARM64GATE_SELFTEST=BROKEN — the gate passed a deliberately broken tree" >&2
-    exit 1
-  fi
-  echo "ARM64GATE_SELFTEST=ok (control green, mutant red)"
-  exit 0
+  smrc=0
+  mutant_verdict golden || smrc=$?
+  case "${smrc}" in
+    0) echo "ARM64GATE_SELFTEST=ok (control green, mutant red)"; exit 0 ;;
+    2) echo "ARM64GATE_SELFTEST=inconclusive — the mutant run produced no verdict (container died or deadline hit)" >&2 ;;
+    *) echo "ARM64GATE_SELFTEST=BROKEN — the gate passed a deliberately broken tree" >&2 ;;
+  esac
+  exit 1
 fi
 
 fails=0
