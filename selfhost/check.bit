@@ -130,6 +130,14 @@ struct Checker {
   // it as it passes the binder, which precedes its own body: right type, right
   // body, immune to any other function's names.
   binderTypes: []int,
+  // An ArrowFn NODE -> the function type the arrow is written against, where
+  // the source supplies one (#1487). The seed threads an `expected` type down
+  // every checkExpr; this checker infers bottom-up and has no such parameter,
+  // so the two positions that can supply one — an annotated binding's
+  // initializer and a resolved free call's argument — record it here, keyed by
+  // node, before anything types an arrow. Sparse: arrows are rare, and only
+  // `checkArrowFn` ever reads it.
+  arrowExpected: map<int, int>,
   // --- resolver handoff (#1370) -------------------------------------------
   // The resolver's per-node symbol table for THIS module: `nodeSymbols[node]`
   // is the symbol id an identifier reference resolves to (0 = none), and
@@ -204,7 +212,8 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
   let sm = newSourceManager()
   let f = addFile(sm, "", source)
   return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
-    binderTypes: bt, symbols: []Symbol(0), nodeSymbols: []int(0), declTypes: dt,
+    binderTypes: bt, arrowExpected: map<int, int>{},
+    symbols: []Symbol(0), nodeSymbols: []int(0), declTypes: dt,
     diags: newDiagnostics(sm), files: [f], fileStarts: [0],
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
@@ -2258,22 +2267,46 @@ function checkArrowFn(c: Checker, node: int): int {
     params = append(params, pt)
     i = i + 1
   }
+  // The result the arrow is written AGAINST, if the source supplied one — see
+  // `Checker.arrowExpected`. 0 when there is no expectation to honour.
+  let want = 0
+  let (et, ok) = c.arrowExpected[node]
+  if (ok && et != 0 && c.ctx.types[et].kind == TypeKind.Func) {
+    want = c.ctx.types[et].result
+  }
   // A `=> { … }` body returns explicitly (SPEC 12.8), so its result comes from
-  // the first `return` (#1488) — falling through to `()` typed
-  // `(x: f32) => { return 4.5 }` as returning nothing, and every use of its
-  // value then failed against '()'.
+  // the expectation if there is one and from the first `return` otherwise
+  // (#1488) — falling through to `()` typed `(x: f32) => { return 4.5 }` as
+  // returning nothing, and every use of its value then failed against '()'.
   if (getNode(c.tree, kids[1]).tag == Tag.Block) {
-    let br = arrowBlockResult(c, kids[1])
+    let br = want
+    if (br == 0) {
+      br = arrowBlockResult(c, kids[1])
+    }
     if (br == 0) {
       br = c.ctx.voidId
     }
     return mkFunc(c.ctx, params, false, br)
   }
-  // The body's type must be DEFAULTED before it becomes the function's result
-  // (#1472): an untyped constant is not a storable type, and leaving one here
-  // makes the call site and the callee disagree about the return's ABI slot —
-  // `(x: f32) => 4.5` then printed 4.5 while comparing unequal to 4.5.
-  return mkFunc(c.ctx, params, false, defaultType(c, checkExprType(c, kids[1])))
+  let bt = checkExprType(c, kids[1])
+  // An UNTYPED constant body takes the expected result as the arrow's own
+  // (#1487): `(x: f32) => 4.5` otherwise interned as `(f32) => f64` and failed
+  // E0041 against the very `(f32) => f32` that supplied the expectation.
+  //
+  // Two guards keep this from SWALLOWING a real error. The body must be untyped
+  // — a body with a type of its own keeps it — and it must be assignable to the
+  // expected result, which is the same question the seed's `expect` asks at the
+  // body. Without the second guard `(x: f32) => 4.5` against `(f32) => i32`
+  // adopted i32, the arrow matched, and the seed's E0041 went missing.
+  if (want != 0 && defaultType(c, bt) != bt && vAssignableNode(c, kids[1], bt, want)) {
+    return mkFunc(c.ctx, params, false, want)
+  }
+  // Otherwise the body's type must be DEFAULTED before it becomes the
+  // function's result (#1472): an untyped constant is not a storable type, and
+  // leaving one here makes the call site and the callee disagree about the
+  // return's ABI slot — `(x: f32) => 4.5` then printed 4.5 while comparing
+  // unequal to 4.5.
+  return mkFunc(c.ctx, params, false, defaultType(c, bt))
 }
 
 // The result type a `=> { … }` arrow infers when no expected function type
@@ -2302,6 +2335,93 @@ function arrowBlockResult(c: Checker, node: int): int {
     i = i + 1
   }
   return 0
+}
+
+// `let f: (i32) => i32 = (x) => …` — the annotation is the initializer's
+// expected type. Only an ArrowFn initializer is recorded; nothing else reads
+// the table.
+function seedArrowExpectedBinding(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pattern, type_or_none, init_or_none]
+  if (kids[1] == 0 || kids[2] == 0) {
+    return
+  }
+  if (getNode(c.tree, kids[2]).tag != Tag.ArrowFn) {
+    return
+  }
+  let ty = typeFromNode(c, kids[1])
+  if (ty != 0 && c.ctx.types[ty].kind == TypeKind.Func) {
+    c.arrowExpected[kids[2]] = ty
+  }
+}
+
+// `apply((x: f32) => 4.5)` — the matching parameter's declared type is the
+// argument's expected type.
+//
+// Resolution is vCall's, guard for guard: a bare-ident callee that no local
+// shadows, naming a known non-generic free function whose arity matches. Every
+// undecidable shape (method, value call, builtin, generic, variadic, spread)
+// records nothing and leaves the arrow inferred exactly as before, which is
+// what keeps a wrong expectation — the only way this could manufacture a
+// diagnostic the seed does not have — out of reach.
+function seedArrowExpectedCall(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let args = kidsOf(c.tree, kids[2])
+  if (!hasArrowArg(c, args)) {
+    return
+  }
+  let cn = getNode(c.tree, kids[0])
+  if (cn.tag != Tag.Ident) {
+    return
+  }
+  let name = c.source[cn.span.start:cn.span.end]
+  if (envLookup(c, name) != 0) {
+    return // a local value shadows the free function
+  }
+  let decl = funcDeclLookup(c, name)
+  if (decl == 0) {
+    return
+  }
+  let owner = declOwner(c, name)
+  let plist = declParamListNode(owner, decl)
+  if (plist < 0) {
+    return // generic: the parameter type is not known until instantiation
+  }
+  let params = kidsOf(owner.tree, plist)
+  if (len(params) != len(args)) {
+    return // variadic, spread, or an arity error: which parameter is undecided
+  }
+  let i = 0
+  while (i < len(args)) {
+    let a = argInner(c, args[i])
+    if (getNode(c.tree, a).tag == Tag.ArrowFn) {
+      let pty = typeFromNode(owner, kidsOf(owner.tree, params[i])[1])
+      if (pty != 0 && c.ctx.types[pty].kind == TypeKind.Func) {
+        c.arrowExpected[a] = pty
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The expression an argument node wraps, unwrapping the `Arg` shell.
+function argInner(c: Checker, arg: int): int {
+  if (getNode(c.tree, arg).tag == Tag.Arg) {
+    return kidsOf(c.tree, arg)[0]
+  }
+  return arg
+}
+
+// Whether any argument is an arrow literal — the cheap guard that keeps the
+// seeding pass off every call in the program.
+function hasArrowArg(c: Checker, args: []int): bool {
+  let i = 0
+  while (i < len(args)) {
+    if (getNode(c.tree, argInner(c, args[i])).tag == Tag.ArrowFn) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 // `a[i:j]` preserves a slice/string type; slicing an array yields a slice of its
@@ -3153,6 +3273,20 @@ function checkModule(c: Checker) {
       envBind(c, kidsOf(c.tree, p3)[1], c.ctx.errorId)
     }
     p3 = p3 + 1
+  }
+  // Pre-pass 3b: the expected function type of every arrow literal written
+  // against one (#1487) — see `Checker.arrowExpected`. AFTER pre-pass 3, whose
+  // env is what `seedArrowExpectedCall` consults to see a local shadowing a
+  // free function, and BEFORE every pass that types an expression.
+  let ae = 1
+  while (ae < len(c.tree.nodes)) {
+    let at = getNode(c.tree, ae).tag
+    if (at == Tag.Binding) {
+      seedArrowExpectedBinding(c, ae)
+    } else if (at == Tag.Call) {
+      seedArrowExpectedCall(c, ae)
+    }
+    ae = ae + 1
   }
   // Pre-pass 4: annotated module-level `let`/`const` initializers against their
   // annotations. The statement sweep (vStmt) only walks function bodies, so

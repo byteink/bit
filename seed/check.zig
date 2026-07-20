@@ -3842,6 +3842,13 @@ const Checker = struct {
             result = try self.checkExpr(file_idx, k[1], env, inner_fctx, expected_result);
             if (expected_result != .invalid) {
                 try self.expect(file_idx, k[1], result, expected_result);
+                // An UNTYPED constant body takes the expected result as the
+                // arrow's own (#1487): `(x: f32) => 4.5` otherwise interned as
+                // `(f32) => untyped float`, which then failed E0041 against the
+                // very `(f32) => f32` that supplied the expectation. Restricted
+                // to untyped bodies so a genuinely mismatched body still yields
+                // its own type and stays a loud error.
+                if (self.defaultType(result) != result) result = expected_result;
             } else {
                 // With no expected type the body's untyped constant type must be
                 // DEFAULTED before it becomes the function's result (#1472): an
