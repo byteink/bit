@@ -1,0 +1,555 @@
+// Self-host Stage 3 (#1346): the x86-64 backend, per-value selectors.
+// Split out of selfhost/x64.bit; same module, so nothing here is imported.
+
+// ---------------------------------------------------------------------------
+// Width canonicalization
+// ---------------------------------------------------------------------------
+//
+// Every integer SSA value lives in a full 64-bit GPR held WIDTH-CANONICAL: the
+// bits above its type width always match the type — zero for an unsigned type,
+// a copy of the sign bit for a signed one. That is what lets every consumer
+// (logical vs arithmetic shift, signed vs unsigned compare, division) read the
+// register directly with no per-op masking.
+//
+// The invariant is restored at each definition site that can break it. Loads
+// extend to width; narrow constants are in range by construction; and the ops
+// that CAN push bits past the type width — add/sub/mul/shl, neg/bnot — re-narrow
+// their result here. Bitwise and/or/xor and the right shifts carry canonical
+// inputs to canonical outputs, so they add no mask. This is the SHA-256 /
+// ChaCha20 prerequisite (#1158): without it a narrow add followed by a rotate
+// leaks the overflow bits the add left above the type width.
+
+// `movsx`/`movzx` through the 0F escape, register to register.
+function xExt0F(b: X64Buf, opcode: int, dst: XReg64, src: XReg64) {
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(dst)), false, xNeedsRexBit(xRegNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, opcode)
+  xEmitByte(b, xModrmReg(xRegNum(dst), xRegNum(src)))
+}
+
+// Re-extends `reg` from `width` bytes to a canonical full 64 bits.
+function xExtendReg(b: X64Buf, reg: XReg64, width: int, signed: bool) {
+  if (width == 1) {
+    if (signed) {
+      xExt0F(b, 0xBE, reg, reg)
+    } else {
+      xExt0F(b, 0xB6, reg, reg)
+    }
+    return
+  }
+  if (width == 2) {
+    if (signed) {
+      xExt0F(b, 0xBF, reg, reg)
+    } else {
+      xExt0F(b, 0xB7, reg, reg)
+    }
+    return
+  }
+  if (width == 4) {
+    if (signed) {
+      xMaybeRex(b, true, xNeedsRexBit(xRegNum(reg)), false, xNeedsRexBit(xRegNum(reg)))
+      xEmitByte(b, 0x63) // movsxd r64, r/m32
+      xEmitByte(b, xModrmReg(xRegNum(reg), xRegNum(reg)))
+      return
+    }
+    // `mov r32, r/m32` zero-extends the low 32 bits into the full 64 for free —
+    // no movzx needed, and REX.W would defeat the point by keeping all 64.
+    xMaybeRex(b, false, xNeedsRexBit(xRegNum(reg)), false, xNeedsRexBit(xRegNum(reg)))
+    xEmitByte(b, 0x8B)
+    xEmitByte(b, xModrmReg(xRegNum(reg), xRegNum(reg)))
+    return
+  }
+  // 8 bytes: the register width already equals the type width.
+  assert(width == 8)
+}
+
+// Restores the width-canonical invariant for a freshly-computed result. A no-op
+// at 64 bits and for floats, where register width already equals type width.
+function xCanonNarrow(b: X64Buf, reg: XReg64, w: Width) {
+  if (w.class == RegClass.Int && w.bytes < 8) {
+    xExtendReg(b, reg, w.bytes, w.signed)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Operand fetch and store
+// ---------------------------------------------------------------------------
+//
+// Every selector materializes both operands into scratch registers, computes
+// there, and writes the result back through these. That is more `mov`s than
+// reusing an operand's own register would need, but it is uniform — and the
+// register file is already restricted enough (callee-saved-only across calls)
+// that the extra moves are not where the cost is.
+// ponytail: always route through scratch; tighten if a hot path measures.
+
+function xRegLocOf(cx: XCtx, vreg: int): RegLoc {
+  assert(vreg >= 0 && vreg < len(cx.alloc.locations))
+  return cx.alloc.locations[vreg]
+}
+
+// Reads `vreg` into a register: its own if it has one, else `scratch` after a
+// reload from its spill slot. Returns whichever register now holds it.
+function xGetInt(cx: XCtx, vreg: int, scratch: XReg64): XReg64 {
+  let loc = xRegLocOf(cx, vreg)
+  if (!loc.isSpill) {
+    return cx.intRegs[loc.index]
+  }
+  xMovLoad(cx.buf, scratch, xMemB(XReg64.Rbp, xSpillOffset(cx.frame, loc.index)), 8, false)
+  return scratch
+}
+
+// Writes `src` to wherever `vreg` lives.
+function xPutInt(cx: XCtx, vreg: int, src: XReg64) {
+  let loc = xRegLocOf(cx, vreg)
+  if (!loc.isSpill) {
+    xMovRR(cx.buf, cx.intRegs[loc.index], src)
+    return
+  }
+  xMovStore(cx.buf, xMemB(XReg64.Rbp, xSpillOffset(cx.frame, loc.index)), src, 8)
+}
+
+function xGetFloat(cx: XCtx, vreg: int, scratch: XmmReg): XmmReg {
+  let loc = xRegLocOf(cx, vreg)
+  if (!loc.isSpill) {
+    return cx.floatRegs[loc.index]
+  }
+  xMovFLoad(cx.buf, scratch, xMemB(XReg64.Rbp, xSpillOffset(cx.frame, loc.index)), 8)
+  return scratch
+}
+
+function xPutFloat(cx: XCtx, vreg: int, src: XmmReg) {
+  let loc = xRegLocOf(cx, vreg)
+  if (!loc.isSpill) {
+    xMovFRR(cx.buf, cx.floatRegs[loc.index], src, 8)
+    return
+  }
+  xMovFStore(cx.buf, xMemB(XReg64.Rbp, xSpillOffset(cx.frame, loc.index)), src, 8)
+}
+
+// Where `vreg` lives, as the architecture-neutral PLoc the parallel-move
+// sequencer works in. A spill becomes an rbp-relative offset.
+function xPlocOf(cx: XCtx, vreg: int, class: RegClass): PLoc {
+  let loc = xRegLocOf(cx, vreg)
+  if (loc.isSpill) {
+    return plocMem(xSpillOffset(cx.frame, loc.index))
+  }
+  if (class == RegClass.Int) {
+    return plocReg(xRegNum(cx.intRegs[loc.index]))
+  }
+  return plocReg(xmmNum(cx.floatRegs[loc.index]))
+}
+
+// ---------------------------------------------------------------------------
+// Integer selectors
+// ---------------------------------------------------------------------------
+
+// `dst = lhs <op> rhs` for the group-1 ALU ops.
+function xEmitBinaryInt(cx: XCtx, op: XArith, dst: int, lhs: int, rhs: int, w: Width) {
+  let l = xGetInt(cx, lhs, xScratch1())
+  let r = xGetInt(cx, rhs, xScratch2())
+  xMovRR(cx.buf, xScratch1(), l)
+  xArithRR(cx.buf, op, xScratch1(), r)
+  // add/sub can carry bits past the type width; the bitwise ops cannot — they
+  // map canonical inputs to a canonical output, so they need no re-narrowing.
+  if (op == XArith.Add || op == XArith.Sub) {
+    xCanonNarrow(cx.buf, xScratch1(), w)
+  }
+  xPutInt(cx, dst, xScratch1())
+}
+
+function xEmitMulInt(cx: XCtx, dst: int, lhs: int, rhs: int, w: Width) {
+  let l = xGetInt(cx, lhs, xScratch1())
+  let r = xGetInt(cx, rhs, xScratch2())
+  xMovRR(cx.buf, xScratch1(), l)
+  xImulRR(cx.buf, xScratch1(), r)
+  xCanonNarrow(cx.buf, xScratch1(), w) // a product overflows its width readily
+  xPutInt(cx, dst, xScratch1())
+}
+
+// Which of the four division ops this is.
+enum XDivOp {
+  SDiv,
+  UDiv,
+  SRem,
+  URem,
+}
+
+// `dst = lhs / rhs` or `lhs % rhs`.
+//
+// idiv/div are hardwired to rax (dividend low) and rdx (dividend high), and
+// write the quotient to rax and the remainder to rdx. The function containing
+// this was already forced to exclude rax/rdx from allocation (xBuildIntRegs'
+// needsRaxRdx), so neither operand's register can alias them and the moves
+// below cannot clobber a live value.
+//
+// The dividend's HIGH half must be primed correctly or the result is wildly
+// wrong rather than faulting: sign-extend rax into rdx:rax for signed, zero rdx
+// for unsigned.
+function xEmitDivInt(cx: XCtx, op: XDivOp, dst: int, lhs: int, rhs: int) {
+  let l = xGetInt(cx, lhs, xScratch1())
+  let r = xGetInt(cx, rhs, xScratch2())
+  xMovRR(cx.buf, XReg64.Rax, l)
+  let signed = op == XDivOp.SDiv || op == XDivOp.SRem
+  if (signed) {
+    xCqo(cx.buf)
+    xIdivR(cx.buf, r)
+  } else {
+    xZero32(cx.buf, XReg64.Rdx)
+    xDivR(cx.buf, r)
+  }
+  // Quotient in rax, remainder in rdx.
+  let result = XReg64.Rdx
+  if (op == XDivOp.SDiv || op == XDivOp.UDiv) {
+    result = XReg64.Rax
+  }
+  xPutInt(cx, dst, result)
+}
+
+// `dst = -operand` / `dst = ~operand`. Both set bits above the type width — neg
+// is a two's-complement negate and bnot flips every bit — so both re-narrow.
+function xEmitUnaryInt(cx: XCtx, isNeg: bool, dst: int, operand: int, w: Width) {
+  let v = xGetInt(cx, operand, xScratch1())
+  xMovRR(cx.buf, xScratch1(), v)
+  if (isNeg) {
+    xNegR(cx.buf, xScratch1())
+  } else {
+    xNotR(cx.buf, xScratch1())
+  }
+  xCanonNarrow(cx.buf, xScratch1(), w)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// ---------------------------------------------------------------------------
+// Compare selectors
+// ---------------------------------------------------------------------------
+
+// `dst = lhs <cc> rhs` for integers. setcc must read the flags the cmp just
+// set, so the destination is widened afterwards with movzx rather than zeroed
+// beforehand — a zeroing xor between the compare and the setcc would clobber
+// exactly the flags being read.
+function xEmitIcmp(cx: XCtx, cc: int, dst: int, lhs: int, rhs: int) {
+  let l = xGetInt(cx, lhs, xScratch1())
+  let r = xGetInt(cx, rhs, xScratch2())
+  xArithRR(cx.buf, XArith.Cmp, l, r)
+  xSetcc(cx.buf, cc, xScratch1())
+  xMovzxb(cx.buf, xScratch1(), xScratch1())
+  xPutInt(cx, dst, xScratch1())
+}
+
+enum XFCmp {
+  FEq,
+  FNe,
+  FLt,
+  FLe,
+  FGt,
+  FGe,
+}
+
+// `dst = lhs <cc> rhs` for floats — IEEE semantics, which is why this is not
+// just an icmp with different condition codes.
+//
+// ucomis sets ZF/PF/CF, and PF (parity) means UNORDERED — at least one operand
+// is NaN. Three consequences:
+//   - LT/LE cannot use the signed condition codes: those read TRUE on an
+//     unordered result. Instead the operands are SWAPPED and the unsigned
+//     above/above-equal codes used, which read false when unordered.
+//   - EQ must be "equal AND ordered": ucomis sets ZF for equal AND for
+//     unordered, so `sete` alone would make NaN == NaN true.
+//   - NE must be "not-equal OR unordered", so NaN != NaN stays true.
+function xEmitFcmp(cx: XCtx, op: XFCmp, dst: int, lhs: int, rhs: int, width: int) {
+  let l = xGetFloat(cx, lhs, xFScratch1())
+  let r = xGetFloat(cx, rhs, xFScratch2())
+  if (op == XFCmp.FGt || op == XFCmp.FGe) {
+    xUcomis(cx.buf, l, r, width)
+    if (op == XFCmp.FGt) {
+      xSetcc(cx.buf, ccA(), xScratch1())
+    } else {
+      xSetcc(cx.buf, ccAe(), xScratch1())
+    }
+  } else if (op == XFCmp.FLt || op == XFCmp.FLe) {
+    // Swapped: `lhs < rhs` is `rhs > lhs`, letting the unordered-false codes do
+    // the work.
+    xUcomis(cx.buf, r, l, width)
+    if (op == XFCmp.FLt) {
+      xSetcc(cx.buf, ccA(), xScratch1())
+    } else {
+      xSetcc(cx.buf, ccAe(), xScratch1())
+    }
+  } else if (op == XFCmp.FEq) {
+    xUcomis(cx.buf, l, r, width)
+    xSetcc(cx.buf, ccNp(), xScratch2()) // ordered
+    xSetcc(cx.buf, ccE(), xScratch1())  // equal
+    xAnd8(cx.buf, xScratch1(), xScratch2())
+  } else {
+    assert(op == XFCmp.FNe)
+    xUcomis(cx.buf, l, r, width)
+    xSetcc(cx.buf, ccP(), xScratch2())  // unordered
+    xSetcc(cx.buf, ccNe(), xScratch1()) // not equal
+    xOr8(cx.buf, xScratch1(), xScratch2())
+  }
+  xMovzxb(cx.buf, xScratch1(), xScratch1())
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `dst = lhs <op> rhs` for floats.
+function xEmitBinaryFloat(cx: XCtx, op: XFArith, dst: int, lhs: int, rhs: int, width: int) {
+  let l = xGetFloat(cx, lhs, xFScratch1())
+  let r = xGetFloat(cx, rhs, xFScratch2())
+  xMovFRR(cx.buf, xFScratch1(), l, width)
+  xFArithRR(cx.buf, op, xFScratch1(), r, width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `T(x)` numeric conversion (SPEC §12.9). An int operand is first canonicalized
+// from its SOURCE width — recovering its true value — then re-canonicalized to
+// the DESTINATION width. Doing both is what makes widening, narrowing, and
+// same-size conversions all correct through one path.
+function xEmitConvert(cx: XCtx, dst: int, src: int, sw: Width, dw: Width) {
+  if (sw.class == RegClass.Int && dw.class == RegClass.Int) {
+    let r = xGetInt(cx, src, xScratch1())
+    xMovRR(cx.buf, xScratch1(), r)
+    xExtendReg(cx.buf, xScratch1(), sw.bytes, sw.signed)
+    xExtendReg(cx.buf, xScratch1(), dw.bytes, dw.signed)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  if (sw.class == RegClass.Int && dw.class == RegClass.Float) {
+    let r = xGetInt(cx, src, xScratch1())
+    xMovRR(cx.buf, xScratch1(), r)
+    xExtendReg(cx.buf, xScratch1(), sw.bytes, sw.signed)
+    xCvtI2F(cx.buf, xFScratch1(), xScratch1(), dw.bytes)
+    xPutFloat(cx, dst, xFScratch1())
+    return
+  }
+  if (sw.class == RegClass.Float && dw.class == RegClass.Int) {
+    let x = xGetFloat(cx, src, xFScratch1())
+    xCvtF2I(cx.buf, xScratch1(), x, sw.bytes)
+    xExtendReg(cx.buf, xScratch1(), dw.bytes, dw.signed)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  let x = xGetFloat(cx, src, xFScratch1())
+  if (sw.bytes == dw.bytes) {
+    xMovFRR(cx.buf, xFScratch1(), x, sw.bytes)
+  } else {
+    xCvtF2F(cx.buf, xFScratch1(), x, sw.bytes)
+  }
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// ---------------------------------------------------------------------------
+// Constants, shifts, and memory selectors
+// ---------------------------------------------------------------------------
+
+// `movq/movd xmm, r64/r32` — moves raw BITS from a GPR into an xmm, no
+// conversion. REX.W is the whole difference between movq (64) and movd (32).
+// This is how a float constant is materialized: build its bit pattern in a GPR,
+// then move the bits across.
+function xMovXG(b: X64Buf, dst: XmmReg, src: XReg64, width: int) {
+  xEmitByte(b, 0x66)
+  xMaybeRex(b, width == 8, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xRegNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x6E)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xRegNum(src)))
+}
+
+// `movq r64, xmm` (width 8) / `movd r32, xmm` (width 4) — the inverse transfer,
+// reading a float's raw bits back into a GPR (`floatBits`). Opcode 0F 7E with
+// the 66 prefix; note the operand order is the REVERSE of xMovXG's — the XMM
+// register is the ModRM reg field and the GPR the r/m field, so the two
+// arguments swap places in xModrmReg. `movd r32, xmm` writes the 32-bit
+// register, which zero-extends to 64. SSE2, like every float op here.
+function xMovGX(b: X64Buf, dst: XReg64, src: XmmReg, width: int) {
+  xEmitByte(b, 0x66)
+  xMaybeRex(b, width == 8, xNeedsRexBit(xmmNum(src)), false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x7E)
+  xEmitByte(b, xModrmReg(xmmNum(src), xRegNum(dst)))
+}
+
+// `sqrtsd`/`sqrtss` — SSE2, IEEE-exact and correctly rounded, so no libm and
+// no runtime call.
+function xSqrtF(b: X64Buf, dst: XmmReg, src: XmmReg, width: int) {
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x51)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
+}
+
+function xEmitConstInt(cx: XCtx, dst: int, val: int) {
+  xMovRI(cx.buf, xScratch1(), val)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// A float constant is materialized by its BITS, not by any conversion — the
+// literal's exact IEEE encoding goes into a GPR and then across to an xmm.
+function xEmitConstFloat(cx: XCtx, dst: int, bits: int, width: int) {
+  xMovRI(cx.buf, xScratch1(), bits)
+  xMovXG(cx.buf, xFScratch1(), xScratch1(), width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `dst = lhs << rhs` / `>> rhs`. `constAmt >= 0` selects the immediate form;
+// otherwise the count goes through cl, x86-64's only variable shift count —
+// which is why a function with a variable shift excludes rcx from allocation.
+function xEmitShiftInt(cx: XCtx, op: XShift, dst: int, lhs: int, rhs: int, constAmt: int, w: Width) {
+  let l = xGetInt(cx, lhs, xScratch1())
+  xMovRR(cx.buf, xScratch1(), l)
+  if (constAmt >= 0) {
+    xShiftImm(cx.buf, op, xScratch1(), constAmt)
+  } else {
+    let r = xGetInt(cx, rhs, xScratch2())
+    xMovRR(cx.buf, XReg64.Rcx, r)
+    xShiftCl(cx.buf, op, xScratch1())
+  }
+  // Only a LEFT shift pushes bits past the type width. The right shifts carry a
+  // canonical operand to a canonical result, so they need no re-narrowing —
+  // and that is exactly why the canonical invariant is worth maintaining.
+  if (op == XShift.Shl) {
+    xCanonNarrow(cx.buf, xScratch1(), w)
+  }
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `dst = base.field`. `base` is already the GC body pointer (runtime/ABI.md §1:
+// codegen never sees the header), so `offset` is a plain byte offset with no
+// header adjustment.
+//
+// `isArray` marks a fixed-size array field, which is INLINE storage: its value
+// is the interior address `base + offset`, formed with lea — loading a word
+// there would read the array's first element as if it were the array itself.
+function xEmitFieldGet(cx: XCtx, dst: int, base: int, offset: int, w: Width, isArray: bool) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  if (isArray) {
+    xLea(cx.buf, xScratch1(), baseReg, offset)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  if (w.class == RegClass.Int) {
+    xMovLoad(cx.buf, xScratch1(), xMemB(baseReg, offset), w.bytes, w.signed)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  xMovFLoad(cx.buf, xFScratch1(), xMemB(baseReg, offset), w.bytes)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `base.field = value`. The base is fetched into the SECONDARY scratch so the
+// primary stays free for the value — fetching both into the same scratch would
+// have the second overwrite the first.
+function xEmitFieldSet(cx: XCtx, base: int, offset: int, value: int, w: Width) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  if (w.class == RegClass.Int) {
+    let v = xGetInt(cx, value, xScratch1())
+    xMovStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
+    return
+  }
+  let v = xGetFloat(cx, value, xFScratch1())
+  xMovFStore(cx.buf, xMemB(baseReg, offset), v, w.bytes)
+}
+
+// ---- atomics (§11.5) -------------------------------------------------------
+// `*T` is an int-classed word; every sequence is call-free (never a safepoint).
+// `lock`-prefixed forms are seq-cst regardless of the requested ordering.
+
+function xEmitAtomicLoad(cx: XCtx, dst: int, ptr: int, w: Width) {
+  let base = xGetInt(cx, ptr, xScratch2())
+  xMovLoad(cx.buf, xScratch1(), xMemB(base, 0), w.bytes, w.signed) // plain load is acquire on x86-TSO
+  xPutInt(cx, dst, xScratch1())
+}
+
+function xEmitAtomicStore(cx: XCtx, ptr: int, value: int, w: Width) {
+  let base = xGetInt(cx, ptr, xScratch2())
+  let val = xGetInt(cx, value, xScratch1())
+  xMovStore(cx.buf, xMemB(base, 0), val, w.bytes)
+  xMfence(cx.buf) // a seq-cst store needs a trailing full barrier on x86
+}
+
+// `rax` is pinned in this function (xScanFuncFlags sets needsRaxRdx), so
+// CMPXCHG's implicit accumulator is free to clobber. Result: the Go-style bool.
+function xEmitAtomicCmpxchg(cx: XCtx, dst: int, ptr: int, expected: int, desired: int) {
+  let w = widthOf(cx.ctx, cx.f.instrs[expected].ty)
+  let base = xGetInt(cx, ptr, xScratch2())
+  let des = xGetInt(cx, desired, xScratch3())
+  let exp = xGetInt(cx, expected, xScratch1())
+  xMovRR(cx.buf, XReg64.Rax, exp)
+  xLockCmpxchgMem(cx.buf, des, base, w.bytes)
+  xSetcc(cx.buf, ccE(), xScratch1()) // ZF=1 => swapped
+  xMovzxb(cx.buf, xScratch1(), xScratch1())
+  xPutInt(cx, dst, xScratch1())
+}
+
+// Fetch-and-op; returns the pre-op value. add/sub/xchg are single implicit-lock
+// instructions; and/or have no native fetch form on x86 and use the CMPXCHG
+// retry loop (rax pinned).
+function xEmitAtomicRmw(cx: XCtx, op: Op, dst: int, ptr: int, operand: int, w: Width) {
+  let base = xGetInt(cx, ptr, xScratch2())
+  if (op == Op.AtomicRmwAdd || op == Op.AtomicRmwSub || op == Op.AtomicRmwXchg) {
+    let oper = xGetInt(cx, operand, xScratch1())
+    xMovRR(cx.buf, xScratch1(), oper) // reg holds the source and receives the old value
+    if (op == Op.AtomicRmwAdd) {
+      xLockXaddMem(cx.buf, xScratch1(), base, w.bytes)
+    } else if (op == Op.AtomicRmwSub) {
+      xNegR(cx.buf, xScratch1()) // fetch-and-sub == fetch-and-add(-v)
+      xLockXaddMem(cx.buf, xScratch1(), base, w.bytes)
+    } else {
+      xXchgMem(cx.buf, xScratch1(), base, w.bytes)
+    }
+  } else {
+    let oper = xGetInt(cx, operand, xScratch3())
+    xMovLoad(cx.buf, XReg64.Rax, xMemB(base, 0), w.bytes, w.signed)
+    let retryOff = len(cx.buf.code)
+    xCanonNarrow(cx.buf, XReg64.Rax, w) // keep the comparand canonical each iteration
+    xMovRR(cx.buf, xScratch1(), XReg64.Rax)
+    if (op == Op.AtomicRmwAnd) {
+      xArithRR(cx.buf, XArith.And, xScratch1(), oper)
+    } else {
+      xArithRR(cx.buf, XArith.Or, xScratch1(), oper)
+    }
+    xLockCmpxchgMem(cx.buf, xScratch1(), base, w.bytes)
+    xJccToOffset(cx.buf, ccNe(), retryOff) // JNZ retry: reservation lost, rax reloaded
+    xMovRR(cx.buf, xScratch1(), XReg64.Rax) // rax holds the old (pre-op) value
+  }
+  xCanonNarrow(cx.buf, xScratch1(), w)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `dst = len(slice)` — the `len` word at offset 8 of a slice or string header
+// (runtime/ABI.md §2). Shared by both, which is why one selector covers them.
+function xEmitSliceLen(cx: XCtx, dst: int, base: int) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  xMovLoad(cx.buf, xScratch1(), xMemB(baseReg, 8), 8, false)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `dst = base[index]` for a STATIC array only. A dynamic slice carries a
+// header and goes through the bounds-checked slice_get runtime call instead, so
+// lower.bit never emits index_get against one. The address is
+// `base + index*width` — no header, a static length (lower.bit's array scheme).
+function xEmitIndexGet(cx: XCtx, dst: int, base: int, index: int, w: Width) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  let idxReg = xGetInt(cx, index, xScratch3())
+  let m = xMemBI(baseReg, idxReg, w.bytes, 0)
+  if (w.class == RegClass.Int) {
+    xMovLoad(cx.buf, xScratch1(), m, w.bytes, w.signed)
+    xPutInt(cx, dst, xScratch1())
+    return
+  }
+  xMovFLoad(cx.buf, xFScratch1(), m, w.bytes)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+function xEmitIndexSet(cx: XCtx, base: int, index: int, value: int, w: Width) {
+  let baseReg = xGetInt(cx, base, xScratch2())
+  let idxReg = xGetInt(cx, index, xScratch3())
+  let m = xMemBI(baseReg, idxReg, w.bytes, 0)
+  if (w.class == RegClass.Int) {
+    let v = xGetInt(cx, value, xScratch1())
+    xMovStore(cx.buf, m, v, w.bytes)
+    return
+  }
+  let v = xGetFloat(cx, value, xFScratch1())
+  xMovFStore(cx.buf, m, v, w.bytes)
+}
+

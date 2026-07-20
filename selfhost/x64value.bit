@@ -1,0 +1,308 @@
+// Self-host Stage 3 (#1346): the x86-64 backend, constant and object selectors.
+// Split out of selfhost/x64.bit; same module, so nothing here is imported.
+
+// ---------------------------------------------------------------------------
+// Value selectors: constants, fneg, allocation, closures
+// ---------------------------------------------------------------------------
+
+// `fneg`: x86-64 has no scalar float negate, so subtract from +0.0. Zeroing with
+// xorps and subtracting is the whole trick — note 0.0 - x, NOT x - 0.0, which is
+// the identity and would silently leave the value unchanged.
+// `-x` — flip the sign BIT. Not `0.0 - x`, which this used to be and which is
+// wrong twice: `0.0 - 0.0` is `+0.0`, so negating zero lost the sign, and
+// subtraction returns a NaN operand with its sign bit *cleared*, so `-NaN` came
+// back as `+NaN`. Both are invisible to `==` and to every arithmetic use, but
+// they change the bits and so the printed string. It stayed hidden because a
+// negated float LITERAL is constant-folded, so only negating a runtime value
+// ever reached here. AArch64 was unaffected: `FNEG` is a real sign-bit flip.
+function xEmitFneg(cx: XCtx, dst: int, operand: int, width: int) {
+  let v = xGetFloat(cx, operand, xFScratch1())
+  if (v != xFScratch1()) {
+    xMovFRR(cx.buf, xFScratch1(), v, width)
+  }
+  let mask = xF64SignMask()
+  if (width != 8) {
+    mask = 1 << 31
+  }
+  xMovRI(cx.buf, xScratch1(), mask)
+  xMovXG(cx.buf, xFScratch2(), xScratch1(), width)
+  xXorp(cx.buf, xFScratch1(), xFScratch2(), width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// `fsqrt(x)` — one instruction, no call.
+function xEmitFsqrt(cx: XCtx, dst: int, operand: int, width: int) {
+  let v = xGetFloat(cx, operand, xFScratch1())
+  xSqrtF(cx.buf, xFScratch1(), v, width)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+enum XRoundMode {
+  Floor,
+  Ceil,
+  Trunc,
+  Round,
+}
+
+// Raw f64 bit patterns this expansion needs as immediates. Materialized into a
+// GPR and moved across, exactly as xEmitConstFloat does — no .rodata constant
+// pool and so no relocation.
+function xF64AbsMask(): int { return 0x7FFFFFFFFFFFFFFF }  // clear the sign bit
+function xF64SignMask(): int { return 1 << 63 }            // keep only the sign bit
+function xF64Two52(): int { return 0x4330000000000000 }    // 2^52
+function xF64One(): int { return 0x3FF0000000000000 }      // 1.0
+function xF64Half(): int { return 0x3FE0000000000000 }     // 0.5
+
+// `ffloor`/`fceil`/`ftrunc`/`fround` on x86-64, where the one-instruction form
+// (`roundsd`) is SSE4.1 and this backend emits nothing above SSE2. Raising the
+// baseline would raise it for every binary the compiler produces — a much
+// larger decision than this change — so the op is expanded instead.
+//
+// The expansion is a cvttsd2si/cvtsi2sd round trip, which truncates toward
+// zero, plus a correction. Three things make it correct rather than merely
+// plausible, and each is the thing a naive version gets wrong:
+//
+//  1. The magnitude guard comes first. Every |x| >= 2^52 double is already an
+//     integer, so the result is x untouched. That is not just an optimization:
+//     it is also what keeps NaN and both infinities out of the round trip
+//     (cvttsd2si would turn them into INT64_MIN), and what keeps the conversion
+//     inside i64's range. NaN's and infinity's exponents put them above the
+//     threshold, so one unsigned compare covers all three.
+//  2. The sign of zero is restored explicitly. The round trip takes -0.5 to
+//     +0.0, losing the sign — invisible to `==` (`-0.0 == 0.0` is true) but it
+//     flips the printed shortest string. The sign bit is carried over from the
+//     operand after the conversion.
+//  3. The correction compares against the ORIGINAL x, not against a
+//     reconstructed value. This is why `ceil(-1e-300)` is -0.0 here and not
+//     +0.0: truncation gives -0.0, which is already >= x, so no +1.0 is applied
+//     and the sign survives. The `(x + 2^52) - 2^52` identity — the other
+//     obvious SSE2 approach — gets exactly this case wrong, which is why it is
+//     not used.
+//
+// `fround` is ties-AWAY-from-zero, so the correction tests |x - trunc(x)| >= 0.5
+// and adds copysign(1.0, x). It is NOT `roundsd` mode 0, which is ties-to-even
+// and disagrees on every halfway case.
+//
+// The branches are local skip-overs patched immediately (xPatchRel32Here), not
+// block edges — this stays a single IR instruction. It allocates nothing and
+// reaches no safepoint, so it remains legal inside `@nosplit`.
+function xEmitFRound(cx: XCtx, dst: int, operand: int, mode: XRoundMode) {
+  // `prim_sigs` types all four as (f64) -> f64; the expansion's constants are
+  // f64 bit patterns and would silently be wrong at any other width.
+  let width = widthOf(cx.ctx, cx.f.instrs[operand].ty).bytes
+  if (width != 8) {
+    panic("fround expansion requires an f64 operand")
+  }
+
+  let v = xGetFloat(cx, operand, xFScratch1())
+  if (v != xFScratch1()) {
+    xMovFRR(cx.buf, xFScratch1(), v, 8)
+  }
+
+  // xScratch1 = bits(x), kept live to the end: it is the source of both the
+  // sign restore and the untouched result on the guard path.
+  xMovGX(cx.buf, xScratch1(), xFScratch1(), 8)
+  xMovRI(cx.buf, xScratch2(), xF64AbsMask())
+  xArithRR(cx.buf, XArith.And, xScratch2(), xScratch1())  // |x| bits
+  xMovRI(cx.buf, xScratch3(), xF64Two52())
+  xArithRR(cx.buf, XArith.Cmp, xScratch2(), xScratch3())
+  // jae -> already integral (or inf/NaN): xFScratch1 still holds x verbatim.
+  let guard = xJccRel32Placeholder(cx, ccAe())
+
+  xCvtF2I(cx.buf, xScratch2(), xFScratch1(), 8)   // (i64)x, truncated toward zero
+  xMovXG(cx.buf, xFScratch2(), xScratch1(), 8)    // keep the original x for the compare
+  xCvtI2F(cx.buf, xFScratch1(), xScratch2(), 8)   // t = (f64)(i64)x
+
+  // t = copysign(|t|, x) — see (2) above.
+  xMovGX(cx.buf, xScratch2(), xFScratch1(), 8)
+  xMovRI(cx.buf, xScratch3(), xF64AbsMask())
+  xArithRR(cx.buf, XArith.And, xScratch2(), xScratch3())
+  xMovRI(cx.buf, xScratch3(), xF64SignMask())
+  xArithRR(cx.buf, XArith.And, xScratch3(), xScratch1())
+  xArithRR(cx.buf, XArith.Or, xScratch2(), xScratch3())
+  xMovXG(cx.buf, xFScratch1(), xScratch2(), 8)
+
+  let skip = -1
+  // Truncation is what the round trip already did, so XRoundMode.Trunc adds
+  // nothing here.
+  if (mode == XRoundMode.Floor) {
+    xUcomis(cx.buf, xFScratch1(), xFScratch2(), 8)
+    skip = xJccRel32Placeholder(cx, ccBe())  // jbe: t <= x, nothing to do
+    xMovRI(cx.buf, xScratch2(), xF64One())
+    xMovXG(cx.buf, xFScratch2(), xScratch2(), 8)
+    xFArithRR(cx.buf, XFArith.FSub, xFScratch1(), xFScratch2(), 8)
+  }
+  if (mode == XRoundMode.Ceil) {
+    xUcomis(cx.buf, xFScratch1(), xFScratch2(), 8)
+    skip = xJccRel32Placeholder(cx, ccAe())  // jae: t >= x, nothing to do
+    xMovRI(cx.buf, xScratch2(), xF64One())
+    xMovXG(cx.buf, xFScratch2(), xScratch2(), 8)
+    xFArithRR(cx.buf, XFArith.FAdd, xFScratch1(), xFScratch2(), 8)
+  }
+  if (mode == XRoundMode.Round) {
+    xFArithRR(cx.buf, XFArith.FSub, xFScratch2(), xFScratch1(), 8)  // d = x - t
+    xMovGX(cx.buf, xScratch2(), xFScratch2(), 8)
+    xMovRI(cx.buf, xScratch3(), xF64AbsMask())
+    xArithRR(cx.buf, XArith.And, xScratch2(), xScratch3())  // |d|
+    xMovRI(cx.buf, xScratch3(), xF64Half())
+    xArithRR(cx.buf, XArith.Cmp, xScratch2(), xScratch3())
+    skip = xJccRel32Placeholder(cx, ccB())  // jb: |d| < 0.5, ties-away does not fire
+    // copysign(1.0, x): away from zero, so the halfway case rounds up in
+    // magnitude in both directions.
+    xMovRI(cx.buf, xScratch2(), xF64One())
+    xMovRI(cx.buf, xScratch3(), xF64SignMask())
+    xArithRR(cx.buf, XArith.And, xScratch3(), xScratch1())
+    xArithRR(cx.buf, XArith.Or, xScratch2(), xScratch3())
+    xMovXG(cx.buf, xFScratch2(), xScratch2(), 8)
+    xFArithRR(cx.buf, XFArith.FAdd, xFScratch1(), xFScratch2(), 8)
+  }
+  if (skip >= 0) {
+    xPatchRel32Here(cx, skip)
+  }
+  xPatchRel32Here(cx, guard)
+  xPutFloat(cx, dst, xFScratch1())
+}
+
+// A register-class transfer, not a conversion, in whichever direction the
+// result type asks for. Float -> int is `floatBits`/`float32Bits`; int -> float
+// is the read half of the container word ABI, which turns the `u64` a runtime
+// primitive hands back in rax into the `f64`/`f32` the element is. `width` is
+// the FLOAT side's width in both directions.
+function xEmitBitcast(cx: XCtx, dst: int, operand: int, width: int, dstIsFloat: bool) {
+  if (dstIsFloat) {
+    let iv = xGetInt(cx, operand, xScratch1())
+    xMovXG(cx.buf, xFScratch1(), iv, width)
+    xPutFloat(cx, dst, xFScratch1())
+    return
+  }
+  let v = xGetFloat(cx, operand, xFScratch1())
+  xMovGX(cx.buf, xScratch1(), v, width)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `const_string` loads the address of its static string header (`__bitstr_N`,
+// N = the string-pool index) — the driver emits that header ({ptr,len} + the
+// bytes) into .rodata under the same name. v1 string literals are static, so the
+// value is a plain pointer and never a GC reference.
+function xEmitConstString(cx: XCtx, dst: int, poolIdx: int) {
+  xMovAbsSymbol(cx, xScratch1(), "__bitstr_${poolIdx}")
+  xPutInt(cx, dst, xScratch1())
+}
+
+function xEmitConstBool(cx: XCtx, dst: int, val: bool) {
+  let v = 0
+  if (val) {
+    v = 1
+  }
+  xMovRI(cx.buf, xScratch1(), v)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `nil` is the null pointer. Zeroing via `xor r32, r32` is 2 bytes shorter than
+// a mov of 0 and clears the full 64-bit register (a 32-bit write zero-extends).
+function xEmitConstNil(cx: XCtx, dst: int) {
+  xZero32(cx.buf, xScratch1())
+  xPutInt(cx, dst, xScratch1())
+}
+
+// Calls `bit_rt_gc_alloc(typeinfo)` -> zeroed body pointer in rax. A real call
+// and a GC point, so it records a safepoint at the RETURN address: a collection
+// triggered by this very allocation must find the caller's live pointers in the
+// stack map. buildIntervals counts gc_alloc as a safepoint site, so the slot
+// exists to record into.
+function xEmitGcAlloc(cx: XCtx, dst: int, disc: int, size: int, ptrOffsets: []int) {
+  xMovAbsSymbol(cx, xArg0(cx.cc), typeInfoSymbol(disc, size, ptrOffsets))
+  // Win64 requires 32 bytes of shadow space the callee may write, above the
+  // return address; SysV has none.
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReloc(cx, "bit_rt_gc_alloc")
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// `type_info`: materialize a named type's static TypeInfo address. NOT a call
+// and NOT a GC point — the descriptor is a .rodata constant, and its non-
+// reference result type keeps it out of the stack map.
+function xEmitTypeInfo(cx: XCtx, dst: int, disc: int, size: int, ptrOffsets: []int) {
+  xMovAbsSymbol(cx, XReg64.Rax, typeInfoSymbol(disc, size, ptrOffsets))
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// `make_closure`: allocate the {code, env} cell (a GC point, like gc_alloc), then
+// store the target's address at +0 and the already-materialized environment at
+// +8. The env load happens AFTER the call — rax holds the cell, and a value read
+// before the call could have been in a caller-saved register the call clobbered.
+function xEmitMakeClosure(cx: XCtx, dst: int, funcName: string, env: int, disc: int) {
+  xMovAbsSymbol(cx, xArg0(cx.cc), typeInfoSymbol(disc, xClosureCellSize(), xClosureCellPtrOffsets()))
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, true, 32)
+  }
+  xCallReloc(cx, "bit_rt_gc_alloc")
+  xRecordSafepoint(cx)
+  if (cx.cc == XCallConv.Win64) {
+    xRspAddSub(cx.buf, false, 32)
+  }
+  xMovAbsSymbol(cx, xScratch1(), funcName)
+  xMovStore(cx.buf, xMemB(XReg64.Rax, 0), xScratch1(), 8)
+  let envReg = xGetInt(cx, env, xScratch1())
+  xMovStore(cx.buf, xMemB(XReg64.Rax, 8), envReg, 8)
+  xPutInt(cx, dst, XReg64.Rax)
+}
+
+// `func_addr`: a function's code address via an absolute relocation to its own
+// symbol — the same primitive make_closure fills a cell's code slot with, minus
+// the cell. No call, no safepoint.
+function xEmitFuncAddr(cx: XCtx, dst: int, funcName: string) {
+  xMovAbsSymbol(cx, xScratch1(), funcName)
+  xPutInt(cx, dst, xScratch1())
+}
+
+// `global_addr` (§11.11): the static address of a module-level variable, via the
+// same absolute symbol relocation func_addr uses. Pure address materialization
+// — no load, no call, no safepoint — so it is legal inside a `@nosplit` body
+// (§10.3.1).
+//
+// A per-thread cell instead resolves against the thread pointer, so its address
+// differs per OS thread; that path is equally call-free, which is what lets
+// §11.11 promise `@nosplit` compatibility for both storage classes.
+function xEmitGlobalAddr(cx: XCtx, dst: int, sym: string) {
+  if (globalStorageOf(cx.module, sym) == 1) {
+    xMovTlsSymbol(cx, xScratch1(), sym)
+  } else {
+    xMovAbsSymbol(cx, xScratch1(), sym)
+  }
+  xPutInt(cx, dst, xScratch1())
+}
+
+// x86-64 ELF local-exec TLS (§11.11): the address of thread-local `symbol` in
+// the CALLING thread, as
+//
+//     mov dst, fs:[0]        ; the thread pointer itself
+//     add dst, symbol@tpoff  ; a negative 32-bit displacement
+//
+// No memory reference beyond the `%fs:0` self-load and no call, so the sequence
+// is legal in a `@nosplit` body and clobbers nothing but `dst`. Variant II
+// places the static TLS block BELOW the thread pointer, so the linker's offset
+// is negative — `ADD r/m64, imm32` sign-extends its immediate, which is exactly
+// what that requires.
+function xMovTlsSymbol(cx: XCtx, dst: XReg64, symbol: string) {
+  let d = xRegNum(dst)
+  xEmitByte(cx.buf, 0x64) // FS segment override
+  xMaybeRex(cx.buf, true, xNeedsRexBit(d), false, false)
+  xEmitByte(cx.buf, 0x8B) // MOV r64, r/m64
+  xEmitByte(cx.buf, ((d & 7) << 3) | 0x04) // ModRM: mod=00, rm=100 (SIB)
+  xEmitByte(cx.buf, 0x25) // SIB: no base, no index -> disp32 follows
+  xEmitU32(cx.buf, 0) // absolute address 0 within %fs
+  xMaybeRex(cx.buf, true, false, false, xNeedsRexBit(d))
+  xEmitByte(cx.buf, 0x81) // ADD r/m64, imm32
+  xEmitByte(cx.buf, 0xC0 | (d & 7)) // ModRM: mod=11, reg=/0 (add), rm=dst
+  let off = len(cx.buf.code)
+  xEmitU32(cx.buf, 0)
+  cx.relocs = append(cx.relocs, Reloc{ offset: off, symbol: symbol, kind: RelocKind.Tpoff32 })
+}
+
