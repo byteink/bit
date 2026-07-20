@@ -189,7 +189,8 @@ function nodeType(fc: FnCtx, node: int): int {
 // Module-wide lowering state shared across all functions (mutated as they lower
 // in order). `methodIds` assigns each interface-method *name* a stable dispatch
 // index on first encounter (the seed's methodId), so call_iface indices match.
-// One method as Pass A3 discovers it, before the per-type tables are built.
+// One method as the Pass A3' pre-pass discovers it, before the per-type tables
+// are built and before any body is lowered.
 struct MethodEntry {
   recvTy: int,
   // The method's RAW name. Its interface dispatch id is assigned from this, so
@@ -204,8 +205,10 @@ struct MethodEntry {
 
 struct Lowerer {
   methodIds: map<string, int>,
-  // Every method decl in declaration order — the seed's `l.method_table`. The
-  // per-type tables are built from this once Pass A3 has seen them all.
+  // Every method decl in declaration order — the seed's `l.method_table`. Filled
+  // by `collectMethodEntries` (Pass A3') and turned into the per-type tables
+  // before the first body is lowered, which is what makes the dispatch ids agree
+  // with the seed's (#1471).
   methodEntries: []MethodEntry,
   // The module's string pool, interned here as each const_string is emitted so
   // __bitstr_N numbering follows lowering order (see IrModule.stringPool).
@@ -5167,17 +5170,15 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   // types can share a method name (the seed's method FuncId scheme).
   if (kids[0] != 0) {
     let recvId = userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, kids[0])[1]))
-    // Record it for the per-type method tables. Pass A3 walks decls in source
-    // order, so this is the seed's `l.method_table` order exactly.
+    // The entry itself is recorded by Pass A3' (collectMethodEntries), which runs
+    // BEFORE any body is lowered — see the ordering note there. Only the name
+    // mangling happens here.
     //
     // A monomorphized instance (nameOverride set) is always a FREE function
-    // today — generic-type methods do not parse — so it never reaches here and
-    // cannot double-record. Asserted rather than guarded: if generic methods
-    // land, this fires loudly instead of silently emitting a duplicate slot.
+    // today — generic-type methods do not parse — so it never reaches here.
+    // Asserted rather than guarded: if generic methods land, this fires loudly
+    // instead of silently emitting a method the pre-pass never saw.
     assert(nameOverride == "")
-    lowerer.methodEntries = append(lowerer.methodEntries,
-      MethodEntry{ recvTy: recvId, name: c.source[nm.span.start:nm.span.end],
-        prefix: lowerer.modPrefix })
     name = lowerer.modPrefix + name + "\$t${recvId}"
   } else {
     name = lowerer.modPrefix + name
@@ -5876,6 +5877,21 @@ function lowerProject(mods: []Checker, root: int): IrModule {
     }
     ti = ti + 1
   }
+  // Pass A3' (#1471): record every method decl, and assign the global dispatch
+  // ids from them, BEFORE any body is lowered. The seed does the same — it fills
+  // `l.method_table` while reserving method FuncIds and builds the per-type
+  // tables at seed/lower.zig:998, both ahead of "Pass B: lower bodies". Doing it
+  // after instead lets the first `call_iface` in a body claim id 0, so a program
+  // mixing a concrete method with an interface method numbered them differently
+  // in the two compilers. Neither numbering is wrong per runtime/ABI.md §2.1
+  // (dense, one id per name, consistent program-wide), but the IR differential
+  // is only useful if it is quiet.
+  //
+  // The walk must match Pass A3 node-for-node, and the ids come out of
+  // buildMethodTables' GROUPED-BY-RECEIVER loop, not this flat order: for
+  // `A.m1; B.m2; A.m3` the seed's ids are m1, m3, m2.
+  collectMethodEntries(mods, root, lowerer)
+  let methodTables = buildMethodTables(lowerer)
   let funcs = []IrFunc(0)
 
   // Pass A: every module's non-generic free functions, in declaration order.
@@ -5936,7 +5952,7 @@ function lowerProject(mods: []Checker, root: int): IrModule {
     ci = ci + 1
   }
   return IrModule{ funcs: funcs, ctx: mods[root].ctx, stringPool: lowerer.stringPool,
-    asmBlocks: lowerer.asmBlocks, methodTables: buildMethodTables(lowerer), stubbed: lowerer.stubbed,
+    asmBlocks: lowerer.asmBlocks, methodTables: methodTables, stubbed: lowerer.stubbed,
     globals: lowerer.globals, externNames: collectExternNames(mods) }
 }
 
@@ -6122,6 +6138,33 @@ function lowerSourceDumpOpt(src: string): string {
   let m = lowerSourceModule(src)
   optimizeModule(m)
   return dumpIr(m)
+}
+
+// Pass A3' — every method decl in the project, in exactly the order Pass A3
+// lowers them (module order, then node order, `FuncDecl` with a receiver).
+// Split out of `lowerFuncNamed` so the entries, and therefore the dispatch ids,
+// exist before the first body is lowered (#1471). Everything an entry holds is
+// derivable from the decl alone, so this needs no lowering state beyond the
+// module prefix.
+function collectMethodEntries(mods: []Checker, root: int, lw: Lowerer) {
+  let mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    lw.modPrefix = modulePrefix(mi, root)
+    let m = 1
+    while (m < len(c.tree.nodes)) {
+      let n = getNode(c.tree, m)
+      if (n.tag == Tag.FuncDecl && kidsOf(c.tree, m)[0] != 0) {
+        let kids = kidsOf(c.tree, m)
+        let nm = getNode(c.tree, kids[1])
+        lw.methodEntries = append(lw.methodEntries,
+          MethodEntry{ recvTy: userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, kids[0])[1])),
+            name: c.source[nm.span.start:nm.span.end], prefix: lw.modPrefix })
+      }
+      m = m + 1
+    }
+    mi = mi + 1
+  }
 }
 
 // Per-type method tables (runtime/ABI.md §2.1) from Pass A3's entries: one table
