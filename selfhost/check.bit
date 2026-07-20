@@ -118,18 +118,6 @@ struct Checker {
   // key "ns.name", so `ns.member` resolves through the same name-keyed lookups a
   // plain `import { member }` uses — see `bindNamespaceImports`.
   namespaces: map<string, int>,
-  // A for-of / catch binder Ident node -> the type pre-pass 3 gave it; 0 for
-  // every other node. Parallel to `nodeTypes`, keyed the same way.
-  //
-  // Pre-pass 3 is the only place a binder's type is knowable (a loop header
-  // sits AFTER its body in arena order, so the main sweep would type the body
-  // before the binder). But `env` is flat and module-wide, so pre-pass 3's
-  // write for a name is then overwritten by every later same-named param —
-  // `for (k, v) of m` in one function ends up typed by another function's
-  // `(v: ConstVal)`. Recording the type per NODE lets the main sweep re-apply
-  // it as it passes the binder, which precedes its own body: right type, right
-  // body, immune to any other function's names.
-  binderTypes: []int,
   // An ArrowFn NODE -> the function type the arrow is written against, where
   // the source supplies one (#1487). The seed threads an `expected` type down
   // every checkExpr; this checker infers bottom-up and has no such parameter,
@@ -197,12 +185,6 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     nt = append(nt, 0)
     i = i + 1
   }
-  let bt = []int(0)
-  let b = 0
-  while (b < len(tree.nodes)) {
-    bt = append(bt, 0)
-    b = b + 1
-  }
   let dt = []int(0)
   let d = 0
   while (d < len(tree.nodes)) {
@@ -212,7 +194,7 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
   let sm = newSourceManager()
   let f = addFile(sm, "", source)
   return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
-    binderTypes: bt, arrowExpected: map<int, int>{},
+    arrowExpected: map<int, int>{},
     symbols: []Symbol(0), nodeSymbols: []int(0), declTypes: dt,
     diags: newDiagnostics(sm), files: [f], fileStarts: [0],
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
@@ -2462,21 +2444,22 @@ function checkSliceExpr(c: Checker, node: int): int {
 }
 
 // Binds a for-of / match-arm / catch / comma-ok binder. The type is recorded on
-// the NODE (`binderTypes`) as well as in the flat env, so the main sweep can
-// re-apply it when it reaches the binder — see `Checker.binderTypes` for why the
-// env write alone is not enough.
+// the binder's own NODE (`declTypes`) as well as in the flat env, so a reference
+// that resolves to this binder (nodeSymbols -> Symbol.decl -> declTypes) is typed
+// by THIS binder and not by whatever same-named binding another function left in
+// the module-wide env — see `declRefType`.
 //
-// Deliberately NOT recorded in `declTypes` (#1370): a binder is typed here at
-// pre-pass 3, BEFORE its iterable local is typed, so this value is best-effort
-// and can be stale. Lowering recomputes the real element type per scope/instance
-// and rebinds `env`; freezing the pre-pass value in `declTypes` would make a
-// decl-typed reference ignore that corrected env and mis-resolve. Params and
-// bindings ARE recorded (their annotation/initializer is always resolvable) —
-// that is where the flat-env receiver-type fix lives.
+// This was a separate `binderTypes` table until #1502, kept out of `declTypes`
+// because a binder is typed at pre-pass 3, BEFORE its iterable local is typed, so
+// the value is best-effort and lowering recomputes the real element type per
+// scope/instance. That is still true — lowering now rewrites `declTypes` at the
+// same binder node wherever it rewrites `env` (see lower.bit's binder sites), so
+// the corrected type wins on the decl path exactly as it does on the env path,
+// and one table serves both.
 function envBind(c: Checker, identNode: int, ty: int) {
   let n = getNode(c.tree, identNode)
   c.env[c.source[n.span.start:n.span.end]] = ty
-  c.binderTypes[identNode] = ty
+  c.declTypes[identNode] = ty
 }
 
 // The element type yielded by iterating a value: a slice/array element, or a
@@ -3328,25 +3311,22 @@ function checkModule(c: Checker) {
   let i = 1
   while (i < len(c.tree.nodes)) {
     let tag = getNode(c.tree, i).tag
-    // Re-apply a for-of / catch binder's type at its own node. Pre-pass 3 typed
-    // it, but every same-named param bound since has overwritten the flat env;
-    // a binder node precedes its own body, so this is where the loop's own type
-    // must go back in scope.
-    if (c.binderTypes[i] != 0) {
+    // Re-apply a DECL's own type into the flat env at its own name node. Pre-pass
+    // 3 types params, receivers, and for-of / match / catch binders; every
+    // same-named decl bound since has overwritten the module-wide env, and a name
+    // node precedes the body that reads it, so this is where the decl's own type
+    // goes back in scope. Without it a receiver reads a later param's type and a
+    // valid `recv.field` false-misses (#1370/#1373), and a loop binder reads
+    // another function's local (#1375).
+    //
+    // One rebind covers all of them because `declTypes` is now the single
+    // per-node decl table (#1502). Ident-only: a tuple pattern's slot is keyed by
+    // the pattern node, whose source text is not a name.
+    if (tag == Tag.Ident && c.declTypes[i] != 0) {
       let bn = getNode(c.tree, i)
-      c.env[c.source[bn.span.start:bn.span.end]] = c.binderTypes[i]
+      c.env[c.source[bn.span.start:bn.span.end]] = c.declTypes[i]
     }
-    if (tag == Tag.Param || tag == Tag.ParamRest || tag == Tag.Receiver) {
-      // A method receiver `(s: S)` needs the same rebind as a plain param:
-      // pre-pass 3 typed it, but every same-named param swept since has
-      // overwritten the flat env, and a receiver node precedes its own body in
-      // arena order, so this is where the receiver's type goes back in scope.
-      // Without it, `checkExprType(receiver)` reads a later param's type and a
-      // valid `recv.field` false-misses (see #1370/#1373).
-      let kids = kidsOf(c.tree, i)
-      let nm = getNode(c.tree, kids[0])
-      c.env[c.source[nm.span.start:nm.span.end]] = paramBindType(c, tag, kids[1])
-    } else if (tag == Tag.ArrowP) {
+    if (tag == Tag.ArrowP) {
       // An annotated closure parameter: type it (and bind it so the body can
       // reference it). Children precede parents in arena order, so this runs
       // before the arrow body and enclosing binding are typed. An arrow
