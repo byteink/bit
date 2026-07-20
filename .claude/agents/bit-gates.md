@@ -45,6 +45,17 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
   are not tested. Commit first, then gate.
 - **Gates write to fixed `/tmp` log paths** (#1496) — one agent has read another's result.
   Redirect to your own `mktemp -d`.
+- **Spawn the gate yourself, hold its PID, wait on that PID.** Every worktree's build
+  matches a name pattern, so `pgrep -f` answers about the wrong process — it went no-match
+  mid-run and a finished verdict was reported for a suite with 20 minutes left (#1520):
+
+      LOG=$(mktemp)
+      zig build test > "$LOG" 2>&1 &
+      PID=$!
+      wait "$PID"; RC=$?
+
+  Same rule for signalling: never `pkill -f`, and kill nothing you did not spawn, however
+  confident you are that it is an orphan.
 - The docker tag `bit-zig-0.16.0:latest` intermittently fails `docker image inspect` while
   showing in `docker images` (#1497). That is the known image bug, not a Bit failure — pass
   the id instead: `IMAGE=<id> scripts/arm64gate.sh`. Never gate with an edited copy of a

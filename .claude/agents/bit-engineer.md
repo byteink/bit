@@ -85,8 +85,23 @@ is the cheap direct check), and it links a STALE `libbitrt.a` — runtime `.zig`
 
 Every one of these was a real incident.
 
-- **Never `pkill -f`.** One agent ran `pkill -f "zig build test"` and killed a peer's
-  verification in another worktree (#1507). Kill only a PID you captured yourself.
+- **Own the process: spawn it, hold its PID, wait on that PID.** A name pattern is a
+  machine-global matcher for an agent-local intent, and every worktree's build matches it.
+  Write it this way and the other failures cannot happen:
+
+      LOG=$(mktemp)
+      zig build test > "$LOG" 2>&1 &
+      PID=$!
+      wait "$PID"; RC=$?
+
+- **Never `pgrep -f` as a wait condition** (#1520). It went no-match while the build was
+  still alive; the loop fell through and the agent reported a run that had 20 minutes left.
+  `kill -0 "$PID"` is the polling form if you need one.
+- **Never `pkill -f`, and never kill a process you did not spawn** — however confident the
+  orphan-inference feels. One agent killed a peer's verification in another worktree
+  (#1507); another killed three live peers it had reasoned were orphans, turning its own
+  gate run into three `signal TERM` artifacts. You cannot tell a peer's build from your own
+  orphan by looking at it.
 - **Never a shared scratch path.** Use your own `mktemp -d`. A sibling overwriting a shared
   baseline looked exactly like catastrophic corruption (#1508). Derive any "before"
   baseline from `git show HEAD:<path>`.
