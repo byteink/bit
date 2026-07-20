@@ -718,6 +718,13 @@ const Ctx = struct {
         const word: u32 = (@as(u32, @intFromBool(sf)) << 31) | (0b0110101 << 24) | ((bits & 0x7FFFF) << 5) | rt;
         try self.emitWord(word);
     }
+    /// CBZ Wt/Xt, #imm19*4 — branch if register zero. Same encoding as `cbnz`
+    /// with the op bit cleared.
+    fn cbz(self: *Ctx, sf: bool, rt: u5, imm19: i32) !void {
+        const bits: u32 = @bitCast(imm19);
+        const word: u32 = (@as(u32, @intFromBool(sf)) << 31) | (0b0110100 << 24) | ((bits & 0x7FFFF) << 5) | rt;
+        try self.emitWord(word);
+    }
     /// Access-width `size` field (00=byte,01=half,10=word,11=dword) for the
     /// exclusive/ordered load-store family.
     fn atomicSize(bytes: u8) u2 {
@@ -1453,9 +1460,32 @@ fn emitConstFloat(self: *Ctx, dst: u32, val: f64, width: u8) !void {
 /// on a static `[N]T` array folds to a `const_int` in lowering, and dynamic
 /// slice indexing goes through the `slice_get`/`_set` runtime calls, so this op
 /// only ever loads a header length.
+/// Loads a slice/string header word at `disp`, reading a NULL header as 0
+/// (#1564).
+///
+/// A struct zero-value is one `gc_alloc` of zeroed memory (SPEC §13.4), so a
+/// slice or string FIELD of a zeroed struct holds the null word rather than an
+/// empty header. `xs == nil` is not spellable for either type (E0053), so null
+/// and empty are indistinguishable to a program — only the fault was
+/// observable. Both header readers that are inline rather than runtime calls
+/// (`len` at +8, `cap` at +24) come through here, so the guard costs two
+/// instructions and leaves every IR dump untouched.
+fn emitHeaderWordOrZero(self: *Ctx, base_reg: Reg, disp: u32) !void {
+    // `scratch1` is never allocatable, so it cannot alias `base_reg` — the
+    // zeroing below is safe to do before the null test reads `base_reg`.
+    std.debug.assert(base_reg != scratch1);
+    try self.movImm64(scratch1, 0);
+    const at = self.code.items.len;
+    try self.cbz(true, @intFromEnum(base_reg), 2); // null header -> skip the load
+    try self.loadImm(scratch1, @intFromEnum(base_reg), disp, 8, false);
+    // `cbz +2` skips exactly one instruction: `disp` is a small word-aligned
+    // header offset, so `ldr` always encodes as a single unsigned-imm12 word.
+    std.debug.assert(self.code.items.len - at == 8);
+}
+
 fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
-    try self.loadImm(scratch1, @intFromEnum(base_reg), 8, 8, false);
+    try emitHeaderWordOrZero(self, base_reg, 8);
     try putInt(self, dst, scratch1);
 }
 
@@ -1465,6 +1495,15 @@ fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId)
     // address `base + offset` (an ADD-immediate), not a loaded word.
     if (self.tctx().typeOf(ty) == .array) {
         try self.addSubImmWide(false, @intFromEnum(scratch1), @intFromEnum(base_reg), offset);
+        try putInt(self, dst, scratch1);
+        return;
+    }
+    // `cap(s)` lowers to a `field_get [24]` on the slice HEADER itself (see
+    // `lower.zig`'s `len`/`cap` builtin), so a null header must read as 0 here
+    // exactly as it does for `len` (#1564). Keyed on the base's own type, so a
+    // struct field read is untouched and pays nothing.
+    if (self.tctx().typeOf(self.f.valueType(base)) == .slice) {
+        try emitHeaderWordOrZero(self, base_reg, offset);
         try putInt(self, dst, scratch1);
         return;
     }

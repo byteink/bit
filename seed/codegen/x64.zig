@@ -1763,6 +1763,14 @@ fn emitFieldGet(self: *Ctx, dst: u32, base: ir.ValueId, offset: u32, ty: TypeId)
         try putInt(self, dst, scratch1);
         return;
     }
+    // `cap(s)` lowers to a `field_get [24]` on the slice HEADER itself, so a
+    // null header must read as 0 here exactly as it does for `len` (#1564).
+    // Keyed on the base's own type, so a struct field read pays nothing.
+    if (self.tctx().typeOf(self.f.valueType(base)) == .slice) {
+        try emitHeaderWordOrZero(self, base_reg, offset);
+        try putInt(self, dst, scratch1);
+        return;
+    }
     const w = widthOf(self.tctx(), ty);
     switch (w.class) {
         .int => {
@@ -1833,9 +1841,34 @@ fn emitIndexGet(self: *Ctx, dst: u32, base: ir.ValueId, index: ir.ValueId, ty: T
 /// on a static `[N]T` array never reaches here (lowering folds it to a
 /// `const_int`), and dynamic slice indexing goes through the `slice_get`/`_set`
 /// runtime calls, so this op only ever loads a header length.
+/// Loads a slice/string header word at `disp`, reading a NULL header as 0
+/// (#1564).
+///
+/// A struct zero-value is one `gc_alloc` of zeroed memory (SPEC §13.4), so a
+/// slice or string FIELD of a zeroed struct holds the null word rather than an
+/// empty header. `xs == nil` is not spellable for either type (E0053), so null
+/// and empty are indistinguishable to a program — only the fault was
+/// observable. Both header readers that are inline rather than runtime calls
+/// (`len` at +8, `cap` at +24) come through here, so the guard leaves every IR
+/// dump untouched. Mirrors `arm64.zig`'s `emitHeaderWordOrZero`.
+fn emitHeaderWordOrZero(self: *Ctx, base_reg: Reg, disp: u32) !void {
+    // `scratch1` is never allocatable, so it cannot alias `base_reg` — zeroing
+    // it before the null test reads `base_reg` is safe.
+    std.debug.assert(base_reg != scratch1);
+    try self.movRI(scratch1, 0);
+    try self.testRR(base_reg, base_reg);
+    try self.emitByte(0x74); // JZ rel8 -> past the load, leaving the 0
+    try self.emitByte(0); // displacement backpatched once the load is sized
+    const after_jcc = self.code.items.len;
+    try self.movLoad(scratch1, base_reg, null, 1, @intCast(disp), 8, false);
+    const skip = self.code.items.len - after_jcc;
+    std.debug.assert(skip <= 127); // one `mov r64, [reg+disp32]` at most
+    self.code.items[after_jcc - 1] = @intCast(skip);
+}
+
 fn emitSliceLen(self: *Ctx, dst: u32, base: ir.ValueId) !void {
     const base_reg = try getInt(self, vregOf(self, base), scratch2);
-    try self.movLoad(scratch1, base_reg, null, 1, 8, 8, false);
+    try emitHeaderWordOrZero(self, base_reg, 8);
     try putInt(self, dst, scratch1);
 }
 

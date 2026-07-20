@@ -495,16 +495,16 @@ const stdout_fd = 1;
 /// bytes to stdout, no trailing newline. v1's `string` heap object is a
 /// `{ptr, len}` header (same shape as `RtBytes`); for a string literal it is
 /// static `.rodata` the compiler emits, so this only ever reads it.
-export fn bit_rt_print(s: *const RtBytes) callconv(.c) void {
-    writeAllFd(stdout_fd, s.ptr[0..s.len]);
+export fn bit_rt_print(s: ?*const RtBytes) callconv(.c) void {
+    writeAllFd(stdout_fd, strBytes(s));
 }
 
 /// `bit_rt_eprint` (ABI.md §12): `print`'s sibling on fd 2. Diagnostics,
 /// usage, and progress belong on stderr so a program's real output can be
 /// piped or redirected without them mixing in — a compiler written in Bit
 /// cannot report errors correctly without this.
-export fn bit_rt_eprint(s: *const RtBytes) callconv(.c) void {
-    writeAllFd(stderr_fd, s.ptr[0..s.len]);
+export fn bit_rt_eprint(s: ?*const RtBytes) callconv(.c) void {
+    writeAllFd(stderr_fd, strBytes(s));
 }
 
 // ---------------------------------------------------------------------------
@@ -774,18 +774,36 @@ fn allocString(len: usize) struct { hdr: *RtBytes, bytes: []u8 } {
     return .{ .hdr = hdr, .bytes = bytes };
 }
 
+/// The bytes of a `string` value, tolerating a NULL header (#1564).
+///
+/// A struct zero-value is one `gc_alloc` of zeroed memory (SPEC §13.4), so a
+/// `string` field of a zeroed struct is the null word, not `""`. `s == nil` is
+/// not spellable for a string (E0053), so null and empty are indistinguishable
+/// to a program — the only observable difference was the fault. Every string
+/// reader therefore goes through here and sees a null as `""`.
+///
+/// Deliberately returns a byte view rather than a substitute header: no shared
+/// header object is ever handed back to Bit code, so nothing can alias or
+/// mutate a process-wide empty (the trap #1557 called out for slices).
+fn strBytes(s: ?*const RtBytes) []const u8 {
+    const h = s orelse return &.{};
+    return h.ptr[0..h.len];
+}
+
 /// `bit_rt_string_concat` (ABI.md §2): a fresh string holding `a` then `b`.
 /// Binary — lowering folds an N-part interpolation into a chain of these.
-export fn bit_rt_string_concat(a: *const RtBytes, b: *const RtBytes) callconv(.c) *const RtBytes {
-    const s = allocString(a.len + b.len);
-    @memcpy(s.bytes[0..a.len], a.ptr[0..a.len]);
-    @memcpy(s.bytes[a.len..][0..b.len], b.ptr[0..b.len]);
+export fn bit_rt_string_concat(a: ?*const RtBytes, b: ?*const RtBytes) callconv(.c) *const RtBytes {
+    const ab = strBytes(a);
+    const bb = strBytes(b);
+    const s = allocString(ab.len + bb.len);
+    @memcpy(s.bytes[0..ab.len], ab);
+    @memcpy(s.bytes[ab.len..][0..bb.len], bb);
     return s.hdr;
 }
 
 /// `bit_rt_string_eq` (ABI.md §2): byte-wise equality; backs string `==`/`!=`.
-export fn bit_rt_string_eq(a: *const RtBytes, b: *const RtBytes) callconv(.c) bool {
-    return std.mem.eql(u8, a.ptr[0..a.len], b.ptr[0..b.len]);
+export fn bit_rt_string_eq(a: ?*const RtBytes, b: ?*const RtBytes) callconv(.c) bool {
+    return std.mem.eql(u8, strBytes(a), strBytes(b));
 }
 
 /// `bit_rt_sqrt` (ABI.md §14): the square root, backing `std/math`'s `sqrt`.
@@ -799,9 +817,10 @@ export fn bit_rt_sqrt(x: f64) callconv(.c) f64 {
 /// slice indexing (SPEC §18.4). Returns `u64` (zero-extended), like
 /// `bit_rt_slice_get`, so the whole return register is defined — a `u8` return
 /// leaves rax's upper bits undefined under the C ABI.
-export fn bit_rt_string_byte(s: *const RtBytes, index: usize) callconv(.c) u64 {
-    if (index >= s.len) fatal("index out of range");
-    return s.ptr[index];
+export fn bit_rt_string_byte(s: ?*const RtBytes, index: usize) callconv(.c) u64 {
+    const bs = strBytes(s);
+    if (index >= bs.len) fatal("index out of range");
+    return bs[index];
 }
 
 /// `bit_rt_string_slice` (ABI.md §2): `s[lo:hi]` (SPEC §12.6) — a fresh string
@@ -809,29 +828,32 @@ export fn bit_rt_string_byte(s: *const RtBytes, index: usize) callconv(.c) u64 {
 /// header's `ptr` is an interior pointer into its own GC object, so a shared
 /// view could not keep the backing alive (a slice can, because its header names
 /// the buffer object base). Panics unless `0 <= lo <= hi <= len`.
-export fn bit_rt_string_slice(s: *const RtBytes, lo: usize, hi: usize) callconv(.c) *const RtBytes {
-    if (!(lo <= hi and hi <= s.len)) fatal("string bounds out of range");
+export fn bit_rt_string_slice(s: ?*const RtBytes, lo: usize, hi: usize) callconv(.c) *const RtBytes {
+    const bs = strBytes(s);
+    if (!(lo <= hi and hi <= bs.len)) fatal("string bounds out of range");
     const out = allocString(hi - lo);
-    @memcpy(out.bytes, s.ptr[lo..hi]);
+    @memcpy(out.bytes, bs[lo..hi]);
     return out.hdr;
 }
 
 /// `bit_rt_bytes_from_string` (ABI.md §2): `[]byte(s)` (SPEC §12.9) — a fresh
 /// `[]u8` whose element `i` is `s[i]`. Slices are word-stored (ABI.md §2), so
 /// each byte lands zero-extended in its own word; the buffer is a leaf (non-ref).
-export fn bit_rt_bytes_from_string(s: *const RtBytes) callconv(.c) *SliceHeader {
-    const h = bit_rt_slice_new(s.len, s.len, 0);
+export fn bit_rt_bytes_from_string(s: ?*const RtBytes) callconv(.c) *SliceHeader {
+    const bs = strBytes(s);
+    const h = bit_rt_slice_new(bs.len, bs.len, 0);
     var i: usize = 0;
-    while (i < s.len) : (i += 1) h.buf[i] = s.ptr[i];
+    while (i < bs.len) : (i += 1) h.buf[i] = bs[i];
     return h;
 }
 
 /// `bit_rt_string_from_bytes` (ABI.md §2): `string(b)` for a `[]u8` (SPEC §12.9)
 /// — a fresh string whose byte `i` is the low byte of element word `i`.
-export fn bit_rt_string_from_bytes(h: *const SliceHeader) callconv(.c) *const RtBytes {
-    const out = allocString(h.len);
+export fn bit_rt_string_from_bytes(h: ?*const SliceHeader) callconv(.c) *const RtBytes {
+    const s = h orelse return allocString(0).hdr; // null header (#1564) => ""
+    const out = allocString(s.len);
     var i: usize = 0;
-    while (i < h.len) : (i += 1) out.bytes[i] = @truncate(h.buf[h.off + i]);
+    while (i < s.len) : (i += 1) out.bytes[i] = @truncate(s.buf[s.off + i]);
     return out.hdr;
 }
 
@@ -1260,8 +1282,9 @@ export fn bit_rt_random_bytes(len: i64) callconv(.c) *const RtBytes {
 /// the optimizer cannot elide (`std/crypto` uses it to clear key material). The
 /// slice's word model (ABI.md §2) stores one byte per 8-byte word, so wiping the
 /// whole `[off, off+len)` word range zeroes every logical byte the slice views.
-export fn bit_rt_secure_zero(h: *SliceHeader) callconv(.c) void {
-    const words = h.buf[h.off .. h.off + h.len];
+export fn bit_rt_secure_zero(h: ?*SliceHeader) callconv(.c) void {
+    const s = h orelse return; // null header (#1564) views no bytes
+    const words = s.buf[s.off .. s.off + s.len];
     rand.secureZero(std.mem.sliceAsBytes(words));
 }
 
@@ -1514,7 +1537,23 @@ export fn bit_rt_slice_new(len: usize, cap: usize, is_ref: usize) callconv(.c) *
 /// 1) when full. A grow reallocates from the current view and resets `off` to 0.
 /// Mutates the header in place and returns it, so `s = append(s, x)` observes
 /// the new length/buffer through the same value.
-export fn bit_rt_slice_append(h: *SliceHeader, word: u64) callconv(.c) *SliceHeader {
+/// A NULL header appends into a FRESH slice rather than mutating through null
+/// (#1564): a zeroed struct's slice field is the null word (SPEC §13.4), and
+/// `append` must treat it as the empty slice. It cannot reuse a shared empty —
+/// `append` grows the header IN PLACE, so a process-wide empty would be
+/// corrupted by the first append anywhere (#1557).
+///
+/// `is_ref` is unrecoverable from a null header, so the fresh buffer is
+/// conservatively marked traced. That is the safe direction: tracing a scalar
+/// word costs only a spurious mark candidate, which `markRoot` already
+/// validates before decoding a header, whereas leaving a genuine reference
+/// untraced would free a live element. #1569 tracks recovering the exact bit.
+fn appendTarget(h: ?*SliceHeader) *SliceHeader {
+    return h orelse bit_rt_slice_new(0, 0, 1);
+}
+
+export fn bit_rt_slice_append(h_opt: ?*SliceHeader, word: u64) callconv(.c) *SliceHeader {
+    const h = appendTarget(h_opt);
     if (h.len == h.cap) {
         const newcap = if (h.cap == 0) 1 else h.cap * 2;
         const nb = allocSliceBuf(newcap, h.is_ref != 0);
@@ -1531,24 +1570,35 @@ export fn bit_rt_slice_append(h: *SliceHeader, word: u64) callconv(.c) *SliceHea
 /// `bit_rt_slice_get`: bounds-checked element read (SPEC §18.4 — out-of-range
 /// panics). Returns the raw word; a sub-word `T` occupies its low bytes exactly
 /// as the producer left it (already correctly extended in its register).
-export fn bit_rt_slice_get(h: *const SliceHeader, index: usize) callconv(.c) u64 {
-    if (index >= h.len) fatal("index out of range");
-    return h.buf[h.off + index];
+/// A null header (a zeroed struct's slice field, #1564) has length 0, so every
+/// index is out of range — the same panic an empty slice gives.
+export fn bit_rt_slice_get(h: ?*const SliceHeader, index: usize) callconv(.c) u64 {
+    const s = h orelse fatal("index out of range");
+    if (index >= s.len) fatal("index out of range");
+    return s.buf[s.off + index];
 }
 
 /// `bit_rt_slice_set`: bounds-checked element write (SPEC §18.4).
-export fn bit_rt_slice_set(h: *SliceHeader, index: usize, word: u64) callconv(.c) void {
-    if (index >= h.len) fatal("index out of range");
-    h.buf[h.off + index] = word;
+export fn bit_rt_slice_set(h: ?*SliceHeader, index: usize, word: u64) callconv(.c) void {
+    const s = h orelse fatal("index out of range");
+    if (index >= s.len) fatal("index out of range");
+    s.buf[s.off + index] = word;
 }
 
 /// `bit_rt_slice_slice`: `s[lo:hi]` (SPEC §12.6). Shares `s`'s buffer; the new
 /// view is `buf[off+lo .. off+hi]` with capacity extending to the old end
 /// (`cap - lo`, Go semantics). Panics unless `0 <= lo <= hi <= cap`.
-export fn bit_rt_slice_slice(h: *const SliceHeader, lo: usize, hi: usize) callconv(.c) *SliceHeader {
-    if (!(lo <= hi and hi <= h.cap)) fatal("slice bounds out of range");
+export fn bit_rt_slice_slice(h: ?*const SliceHeader, lo: usize, hi: usize) callconv(.c) *SliceHeader {
+    const s = h orelse {
+        // A null header (#1564) is the empty slice: capacity 0, so `[0:0]` is
+        // the only in-bounds reslice. The result is a fresh empty slice, never
+        // a view onto a shared body.
+        if (!(lo == 0 and hi == 0)) fatal("slice bounds out of range");
+        return bit_rt_slice_new(0, 0, 0);
+    };
+    if (!(lo <= hi and hi <= s.cap)) fatal("slice bounds out of range");
     const nh: *SliceHeader = @ptrCast(@alignCast(gcAlloc(&slice_info)));
-    nh.* = .{ .buf = h.buf, .len = hi - lo, .off = h.off + lo, .cap = h.cap - lo, .is_ref = h.is_ref };
+    nh.* = .{ .buf = s.buf, .len = hi - lo, .off = s.off + lo, .cap = s.cap - lo, .is_ref = s.is_ref };
     return nh;
 }
 
