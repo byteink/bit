@@ -1,0 +1,459 @@
+// Split out of `root.bit` (#1503): Wyhash and the `map<K,V>` entry points
+// (SPEC §11.2, §13.5; ABI.md §15). Sibling file, same module — see `root.bit`
+// for the port's header and seams.
+
+// ---------------------------------------------------------------------------
+// Wyhash (final version 4) — the string-key hash
+// ---------------------------------------------------------------------------
+//
+// Ported from the pinned Zig stdlib's `std/hash/wyhash.zig`, which
+// `root.zig`'s `mapHash` calls, and NOT from memory of the upstream C: the two
+// have diverged across versions and only the exact routine the Zig calls
+// produces the same slot order. `tests/stress/rootmap` checks the port against
+// the SEVEN OFFICIAL TEST VECTORS from wangyi-fudan's `test_vector.cpp` that
+// Zig's own unit test uses, which is an oracle independent of this codebase.
+//
+// Only the one-shot `hash(seed, input)` path is ported. The streaming
+// `update`/`final` half exists for incremental hashing, which no map key needs.
+
+const wySecret0: u64 = 0xa0761d6478bd642f
+const wySecret1: u64 = 0xe7037ed1a0b428db
+const wySecret2: u64 = 0x8ebc6af09c88c6e3
+const wySecret3: u64 = 0x589965cc75374cc3
+
+// The high 64 bits of the 128-bit product `a * b`, via 32-bit limbs.
+//
+// Bit has no u128 and no widening multiply, so the schoolbook decomposition is
+// the only route. The carry out of the middle sum is the step that is easy to
+// drop — and dropping it is invisible on small inputs, which is exactly why the
+// test vectors (all four length classes) are the guard rather than a spot check.
+@nosplit function mulHi(a: u64, b: u64): u64 {
+  let lo32: u64 = 0xffffffff
+  let a0 = a & lo32
+  let a1 = a >> 32
+  let b0 = b & lo32
+  let b1 = b >> 32
+  let p00 = a0 * b0
+  let p01 = a0 * b1
+  let p10 = a1 * b0
+  let p11 = a1 * b1
+  let mid = (p00 >> 32) + (p01 & lo32) + (p10 & lo32)
+  return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
+}
+
+// Zig's `mix`: the low and high halves of the 128-bit product, xored.
+@nosplit function wyMix(a: u64, b: u64): u64 {
+  let lo = a * b
+  let hi = mulHi(a, b)
+  return lo ^ hi
+}
+
+// `n` little-endian bytes at `addr`, zero-extended. `n <= 8`.
+@nosplit function readLe(addr: int, n: int): u64 {
+  let v: u64 = 0
+  let i = 0
+  while (i < n) {
+    let b = loadByte(addr + i)
+    v = v | (u64(b) << u64(i * 8))
+    i = i + 1
+  }
+  return v
+}
+
+// Wyhash over the `len` bytes at `addr`, seed 0 — the exact call `root.zig`'s
+// `mapHash` makes.
+//
+// The state is three cells rather than a `[3]u64` because a local fixed array
+// is not addressable the way module state is; the round below is unrolled over
+// them, which is what Zig's `inline for (0..3)` compiles to anyway.
+@nosplit function wyhash(addr: int, vlen: int, seed: u64): u64 {
+  let s0 = seed ^ wyMix(seed ^ wySecret0, wySecret1)
+  let s1 = s0
+  let s2 = s0
+  let a: u64 = 0
+  let b: u64 = 0
+
+  if (vlen <= 16) {
+    // smallKey
+    if (vlen >= 4) {
+      let end = vlen - 4
+      let quarter = (vlen >> 3) << 2
+      a = (readLe(addr, 4) << 32) | readLe(addr + quarter, 4)
+      b = (readLe(addr + end, 4) << 32) | readLe(addr + end - quarter, 4)
+    } else if (vlen > 0) {
+      let c0 = loadByte(addr)
+      let c1 = loadByte(addr + (vlen >> 1))
+      let c2 = loadByte(addr + vlen - 1)
+      a = (u64(c0) << 16) | (u64(c1) << 8) | u64(c2)
+      b = 0
+    } else {
+      a = 0
+      b = 0
+    }
+  } else {
+    let i = 0
+    if (vlen >= 48) {
+      // round(): three independent lanes per 48-byte block.
+      while (i + 48 < vlen) {
+        let r0 = readLe(addr + i + 0, 8)
+        let r1 = readLe(addr + i + 8, 8)
+        s0 = wyMix(r0 ^ wySecret1, r1 ^ s0)
+        let r2 = readLe(addr + i + 16, 8)
+        let r3 = readLe(addr + i + 24, 8)
+        s1 = wyMix(r2 ^ wySecret2, r3 ^ s1)
+        let r4 = readLe(addr + i + 32, 8)
+        let r5 = readLe(addr + i + 40, 8)
+        s2 = wyMix(r4 ^ wySecret3, r5 ^ s2)
+        i = i + 48
+      }
+      // final0
+      s0 = s0 ^ (s1 ^ s2)
+    }
+    // final1, with `start_pos = i` over the whole input.
+    let j = i
+    while (j + 16 < vlen) {
+      let x = readLe(addr + j, 8)
+      let y = readLe(addr + j + 8, 8)
+      s0 = wyMix(x ^ wySecret1, y ^ s0)
+      j = j + 16
+    }
+    a = readLe(addr + vlen - 16, 8)
+    b = readLe(addr + vlen - 8, 8)
+  }
+
+  // final2
+  a = a ^ wySecret1
+  b = b ^ s0
+  let lo = a * b
+  let hi = mulHi(a, b)
+  a = lo
+  b = hi
+  return wyMix(a ^ wySecret0 ^ u64(vlen), b ^ wySecret1)
+}
+
+// ---------------------------------------------------------------------------
+// Maps (SPEC §11.2, §13.5; ABI.md §15)
+// ---------------------------------------------------------------------------
+
+// Wyhash over the bytes of a `string`, at an explicit seed. Exists so the
+// official test vectors can drive the exact routine `mapHash` uses, rather than
+// a copy of it that could drift.
+export @nosplit @symbol("bit_rt_root_wyhash_string")
+function rtWyhashString(s: int, seed: u64): u64 {
+  let p = strBytes(s)
+  let n = strSize(s)
+  return wyhash(p, n, seed)
+}
+
+// splitmix64's finalizer: cheap avalanche so low-entropy integer keys (0,1,2,…)
+// do not cluster in the low probe bins. Identical constants to the Zig.
+@nosplit function scalarHash(key: u64): u64 {
+  let x = key
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+  x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+  return x ^ (x >> 31)
+}
+
+// A key's hash: a `string` key hashes its BYTES (so two equal strings at
+// different addresses collide correctly), a scalar hashes by value.
+@nosplit function mapHash(m: int, key: int): u64 {
+  if (loadWord(m + mapKeyIsString) != 0) {
+    let p = strBytes(key)
+    let n = strSize(key)
+    return wyhash(p, n, u64(0))
+  }
+  return scalarHash(u64(key))
+}
+
+// Key equality, matching `mapHash`'s notion of identity.
+@nosplit function mapKeyEq(m: int, a: int, b: int): bool {
+  if (loadWord(m + mapKeyIsString) != 0) {
+    return rtStringEq(a, b)
+  }
+  return a == b
+}
+
+// Locates `key`'s slot. Returns the slot index; `mapProbeFound` reports whether
+// it holds the key. When it does not, the slot is where the key BELONGS — the
+// first tombstone seen, else the terminating EMPTY.
+//
+// Split into two calls rather than a two-result return because the pair is read
+// immediately and adjacently at every call site, and a struct return would be a
+// traced type this `@nosplit` body cannot hold. `probeFound` is written by
+// `mapProbe` and read by the very next statement, with no allocation, no
+// safepoint and no call in between — the same adjacency the ABI already relies
+// on for `iface_as_ok`.
+let probeFound: i64 = 0
+
+@nosplit function mapProbe(m: int, key: int): int {
+  let vcap = loadWord(m + mapCap)
+  let mask = vcap - 1
+  let ctrl = loadWord(m + mapCtrl)
+  let keys = loadWord(m + mapKeys)
+  let i = int(mapHash(m, key) & u64(mask))
+  let firstTomb = vcap    // sentinel: "none seen"
+  let steps = 0
+  // Bounded by `cap`: the 7/8 load factor guarantees an EMPTY slot exists.
+  while (steps < vcap) {
+    let c = loadByte(ctrl + i)
+    if (c == ctrlEmpty) {
+      probeFound = 0
+      if (firstTomb != vcap) {
+        return firstTomb
+      }
+      return i
+    }
+    if (c == ctrlTomb) {
+      if (firstTomb == vcap) {
+        firstTomb = i
+      }
+    } else {
+      let k = loadWord(keys + i * 8)
+      if (mapKeyEq(m, k, key)) {
+        probeFound = 1
+        return i
+      }
+    }
+    i = (i + 1) & mask
+    steps = steps + 1
+  }
+  // Unreachable: the load factor guarantees an EMPTY slot. Zig panics here;
+  // reporting "not found" at the last slot is the non-panicking equivalent and
+  // cannot corrupt — a caller inserting there overwrites one entry rather than
+  // running off the buffer.
+  probeFound = 0
+  return vcap - 1
+}
+
+@nosplit function allocCtrl(vcap: int): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let body = gcAllocRaw(g, vcap, base + riMapCtrl * 8)
+  if (body == 0) {
+    statOom = statOom + 1
+  }
+  // Zeroed by gcAllocRaw, so every slot starts CtrlEmpty.
+  return body
+}
+
+// Doubles `cap`, rehashes every FULL slot and drops tombstones.
+//
+// Reinsertion probes the NEW table linearly from the key's hash and stops at the
+// first non-FULL slot. It cannot encounter a tombstone (the new ctrl buffer is
+// freshly zeroed), which is why this loop is simpler than `mapProbe` and still
+// correct.
+@nosplit function mapGrow(m: int): bool {
+  let vcap = loadWord(m + mapCap)
+  let newcap = vcap * 2
+  let keyIsString = loadWord(m + mapKeyIsString)
+  let valIsRef = loadWord(m + mapValIsRef)
+  let nkeys = allocBuf(newcap, keyIsString != 0)
+  if (nkeys == 0) {
+    return false
+  }
+  let nvals = allocBuf(newcap, valIsRef != 0)
+  if (nvals == 0) {
+    return false
+  }
+  let nctrl = allocCtrl(newcap)
+  if (nctrl == 0) {
+    return false
+  }
+  let mask = newcap - 1
+  let keys = loadWord(m + mapKeys)
+  let vals = loadWord(m + mapVals)
+  let ctrl = loadWord(m + mapCtrl)
+  let i = 0
+  // Bounded by the old capacity.
+  while (i < vcap) {
+    let c = loadByte(ctrl + i)
+    if (c == ctrlFull) {
+      let key = loadWord(keys + i * 8)
+      let j = int(mapHash(m, key) & u64(mask))
+      // Bounded: the new table is half empty, so an open slot is always near.
+      while (loadByte(nctrl + j) == ctrlFull) {
+        j = (j + 1) & mask
+      }
+      storeWord(nkeys + j * 8, key)
+      storeWord(nvals + j * 8, loadWord(vals + i * 8))
+      storeByte(nctrl + j, ctrlFull)
+    }
+    i = i + 1
+  }
+  storeWord(m + mapKeys, nkeys)
+  storeWord(m + mapVals, nvals)
+  storeWord(m + mapCtrl, nctrl)
+  storeWord(m + mapCap, newcap)
+  // Tombstones reclaimed: `used` falls back to the live count.
+  storeWord(m + mapUsed, loadWord(m + mapLen))
+  return true
+}
+
+// `bit_rt_map_new`: an empty map. `keyIsString`/`valIsRef` (0/1) are fixed by
+// K/V at the call site and decide hashing, equality and GC tracing.
+export @nosplit @symbol("bit_rt_root_map_new")
+function rtMapNew(keyIsString: int, valIsRef: int): int {
+  let g = wordAt(gcAddr)
+  let base = infoAddr
+  let m = gcAlloc(g, base + riMap * 8)
+  if (m == 0) {
+    statOom = statOom + 1
+    return 0
+  }
+  let keys = allocBuf(mapInitCap, keyIsString != 0)
+  if (keys == 0) {
+    return 0
+  }
+  let vals = allocBuf(mapInitCap, valIsRef != 0)
+  if (vals == 0) {
+    return 0
+  }
+  let ctrl = allocCtrl(mapInitCap)
+  if (ctrl == 0) {
+    return 0
+  }
+  storeWord(m + mapKeys, keys)
+  storeWord(m + mapVals, vals)
+  storeWord(m + mapCtrl, ctrl)
+  storeWord(m + mapLen, 0)
+  storeWord(m + mapCap, mapInitCap)
+  storeWord(m + mapUsed, 0)
+  storeWord(m + mapKeyIsString, keyIsString)
+  storeWord(m + mapValIsRef, valIsRef)
+  return m
+}
+
+// `bit_rt_map_set`: insert or overwrite `m[key] = val`.
+//
+// THE GROW TEST RUNS BEFORE THE PROBE, exactly as the Zig's does, and the order
+// is observable: growing first means the slot the probe returns is a slot in the
+// NEW table. Probing first and then growing would insert at a stale index.
+// Reusing a TOMB keeps `used` unchanged — only an EMPTY slot is newly consumed,
+// which is what makes tombstones cost capacity until the next grow rather than
+// forever.
+export @nosplit @symbol("bit_rt_root_map_set")
+function rtMapSet(m: int, key: int, val: int) {
+  if (m == 0) {
+    return
+  }
+  let used = loadWord(m + mapUsed)
+  let vcap = loadWord(m + mapCap)
+  if ((used + 1) * 8 >= vcap * 7) {
+    if (!mapGrow(m)) {
+      return
+    }
+  }
+  let slot = mapProbe(m, key)
+  if (probeFound == 0) {
+    let ctrl = loadWord(m + mapCtrl)
+    if (loadByte(ctrl + slot) == ctrlEmpty) {
+      storeWord(m + mapUsed, loadWord(m + mapUsed) + 1)
+    }
+    storeByte(ctrl + slot, ctrlFull)
+    storeWord(m + mapLen, loadWord(m + mapLen) + 1)
+  }
+  storeWord(loadWord(m + mapKeys) + slot * 8, key)
+  storeWord(loadWord(m + mapVals) + slot * 8, val)
+}
+
+// `bit_rt_map_get`: `m[key]`, or the zero word when absent (SPEC §11.2 — an
+// absent key reads as V's zero value). A nil map reads as empty.
+export @nosplit @symbol("bit_rt_root_map_get")
+function rtMapGet(m: int, key: int): int {
+  if (m == 0) {
+    return 0
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return 0
+  }
+  let slot = mapProbe(m, key)
+  if (probeFound == 0) {
+    return 0
+  }
+  let v = loadWord(loadWord(m + mapVals) + slot * 8)
+  return v
+}
+
+// `bit_rt_map_has`: presence test (backs the two-result form and `delete`).
+export @nosplit @symbol("bit_rt_root_map_has")
+function rtMapHas(m: int, key: int): bool {
+  if (m == 0) {
+    return false
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return false
+  }
+  let slot = mapProbe(m, key)
+  return probeFound != 0
+}
+
+// `bit_rt_map_delete`: `delete(m, key)` — a no-op if absent.
+//
+// Leaves a TOMBSTONE (reclaimed at the next grow) and DROPS THE SLOT'S KEY AND
+// VALUE WORDS. The drop is not tidiness: those words live in traced ref buffers,
+// so leaving them would keep a removed key or value reachable and unreclaimable
+// for the lifetime of the map.
+export @nosplit @symbol("bit_rt_root_map_delete")
+function rtMapDelete(m: int, key: int) {
+  if (m == 0) {
+    return
+  }
+  if (loadWord(m + mapLen) == 0) {
+    return
+  }
+  let slot = mapProbe(m, key)
+  if (probeFound == 0) {
+    return
+  }
+  storeByte(loadWord(m + mapCtrl) + slot, ctrlTomb)
+  storeWord(loadWord(m + mapKeys) + slot * 8, 0)
+  storeWord(loadWord(m + mapVals) + slot * 8, 0)
+  storeWord(m + mapLen, loadWord(m + mapLen) - 1)
+}
+
+// `bit_rt_map_len`: `len(m)` — live entry count (nil map => 0).
+export @nosplit @symbol("bit_rt_root_map_len")
+function rtMapLen(m: int): int {
+  if (m == 0) {
+    return 0
+  }
+  let n = loadWord(m + mapLen)
+  return n
+}
+
+// Iteration (`for k of m`, §13.5): `iterInit` yields the first FULL slot or -1,
+// `iterNext` the next FULL slot after `prev` or -1. Slot order is unspecified
+// and a concurrent insert may rehash — iteration assumes no mutation, per spec.
+export @nosplit @symbol("bit_rt_root_map_iter_init")
+function rtMapIterInit(m: int): int {
+  return rtMapIterNext(m, -1)
+}
+
+export @nosplit @symbol("bit_rt_root_map_iter_next")
+function rtMapIterNext(m: int, prev: int): int {
+  if (m == 0) {
+    return -1
+  }
+  let vcap = loadWord(m + mapCap)
+  let ctrl = loadWord(m + mapCtrl)
+  let i = prev + 1
+  while (i < vcap) {
+    if (loadByte(ctrl + i) == ctrlFull) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+export @nosplit @symbol("bit_rt_root_map_key_at")
+function rtMapKeyAt(m: int, slot: int): int {
+  let k = loadWord(loadWord(m + mapKeys) + slot * 8)
+  return k
+}
+
+export @nosplit @symbol("bit_rt_root_map_val_at")
+function rtMapValAt(m: int, slot: int): int {
+  let v = loadWord(loadWord(m + mapVals) + slot * 8)
+  return v
+}
