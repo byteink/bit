@@ -34,6 +34,19 @@
 # signal in wording differences. A cell where both reject with different codes
 # is a MATCH here and diffcheck's problem there.
 #
+#
+# A TIMEOUT IS NOT A VERDICT (#1538). `verdict()` used to fold an alarm kill into
+# "R", because it only read the truth of the `if` and never distinguished
+# "rejected" from "never finished". That fabricates the exact signal this script
+# exists to find: a timed-out SEED reads as seed=R bit=A, i.e. a MISSING — the
+# #1470 shape — from a cell that was never actually decided. So a timeout is now
+# its own verdict "T", counted separately and `continue`d before classification.
+#
+# Exit codes (matching x64gate.sh / selfhost-diffsafepoints.sh / 3977211):
+#   0  every cell decided and the two checkers agree
+#   1  real divergence: a MISSING or a FALSEPOS
+#   2  could not decide: a cell timed out and was never compared. Not a pass.
+#
 # Usage: zig build && bash scripts/selfhost-diffverdict.sh [-v]
 set -u
 SEED=zig-out/bin/bit-seed
@@ -48,15 +61,32 @@ done
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/bitverdict.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
-match=0 missing=0 falsepos=0 n=0
-missing_list="" falsepos_list=""
+match=0 missing=0 falsepos=0 timeout=0 n=0
+missing_list="" falsepos_list="" timeout_list=""
 
-# Verdict of one compiler on one program: prints "A" (accepted) or "R".
-# `check` is used rather than `build`: this asks a question about the CHECKER,
-# and it keeps the sweep fast enough to gate on. A 20s alarm bounds a hang so a
-# stuck cell cannot wedge the run.
+# The alarm is a HANG guard, not a performance budget. These cells are tiny
+# synthesized programs — measured worst legitimate case over the real corpus is
+# 1.23s for a full multi-module file, and a cell here is far smaller — so 20s is
+# never crossed by real work and a trip is a DESCHEDULED process, not a slow one.
+# Rather than trade one arbitrary constant for another, a trip is RETRIED ONCE: a
+# genuine hang trips twice, a load artifact does not. TIMEOUT_S overrides.
+TIMEOUT_S=${TIMEOUT_S:-20}
+
+# Verdict of one compiler on one program: prints "A" (accepted), "R" (rejected)
+# or "T" (timed out — NOT a verdict; see the header). `check` is used rather than
+# `build`: this asks a question about the CHECKER, and it keeps the sweep fast
+# enough to gate on.
 verdict() {
-  if perl -e 'alarm 20; exec @ARGV' "$1" check "$2" >/dev/null 2>&1; then
+  local rc
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$1" check "$2" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$1" check "$2" >/dev/null 2>&1
+    rc=$?
+  fi
+  if [ "$rc" -eq 142 ]; then
+    printf 'T'
+  elif [ "$rc" -eq 0 ]; then
     printf 'A'
   else
     printf 'R'
@@ -72,6 +102,14 @@ cell() {
   local sv bv
   sv=$(verdict "$SEED" "$f")
   bv=$(verdict "$BIT2" "$f")
+  # Undecided cells leave BEFORE classification, so a cell that never ran can
+  # never meet another one and score MATCH, nor be read as a MISSING/FALSEPOS.
+  if [ "$sv" = "T" ] || [ "$bv" = "T" ]; then
+    timeout=$((timeout + 1))
+    timeout_list="${timeout_list}    seed=$sv bit=$bv  ${label}
+"
+    return
+  fi
   if [ "$sv" = "$bv" ]; then
     match=$((match + 1))
     [ "$VERBOSE" = 1 ] && printf '  MATCH    (%s%s) %s\n' "$sv" "$bv" "$label"
@@ -263,6 +301,7 @@ echo "verdict differential over $n generated constructs"
 echo "  MATCH    $match"
 echo "  MISSING  $missing   (seed rejects, selfhost accepts)"
 echo "  FALSEPOS $falsepos   (selfhost rejects, seed accepts)"
+echo "  TIMEOUT  $timeout   (never decided, NOT compared)"
 
 rc=0
 if [ "$missing" -ne 0 ]; then
@@ -272,6 +311,14 @@ fi
 if [ "$falsepos" -ne 0 ]; then
   printf '\nFALSEPOS — selfhost refuses what the seed admits:\n%s' "$falsepos_list"
   rc=1
+fi
+# A timeout decided nothing — it is neither an agreement nor a divergence. It
+# gates at 2 (could-not-decide), below a real divergence but never a pass.
+if [ "$rc" -eq 0 ] && [ "$timeout" -ne 0 ]; then
+  printf '\nUNDECIDED — %d cell(s) timed out after %ss x2 and were NOT compared:\n%s' \
+    "$timeout" "$TIMEOUT_S" "$timeout_list"
+  echo "Not a pass. Re-run on a quieter host, or raise TIMEOUT_S."
+  exit 2
 fi
 [ "$rc" -eq 0 ] && echo "OK: the two checkers agree on every generated construct."
 exit $rc
