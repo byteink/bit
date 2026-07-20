@@ -599,18 +599,103 @@ function exprDeclTypeNode(c: Checker, node: int): int {
   return kidsOf(c.tree, fr.decl)[4]
 }
 
+// The expression a match scrutinee's type arguments are recoverable from: the
+// scrutinee itself, or — for a bare local that wrote no type down anywhere — the
+// CALL that initialized it.
+//
+// `let r = idOpt(o)` has no annotation and no composite literal, so
+// `checkBinding` records nothing in `declTypeNodes` and the scrutinee `r`
+// contributed no type args at all; the arm binder then stayed at the bare param
+// and `v + 1` was refused (#1558). Redirecting to the initializer puts the Call
+// arm of `exprDeclTypeNode` back in reach.
+//
+// Resolver-keyed through `declInitOf` wherever the resolver ran, so a same-named
+// local in another function cannot answer for this one (#1536); `declInitByName`
+// is the deterministic fallback for the dump entry points, which do not resolve.
+function scrutineeExpr(c: Checker, node: int): int {
+  let n = getNode(c.tree, node)
+  if (n.tag != Tag.Ident || exprDeclTypeNode(c, node) != 0) {
+    return node
+  }
+  let init = declInitOf(c, node)
+  if (init == 0) {
+    init = declInitByName(c, c.source[n.span.start:n.span.end], node)
+  }
+  if (init != 0 && getNode(c.tree, init).tag == Tag.Call) {
+    return init
+  }
+  return node
+}
+
+// Whether an inferred type argument is worth substituting. `genericTypeArgs`
+// answers void for a type parameter no argument bound, and a template body's
+// own parameters resolve to TypeParam — neither is more informative than the
+// declared node, and substituting them turns a binder that merely read as `T`
+// into one that reads as `()`, which is a WORSE refusal. THE SAFETY RULE:
+// permissive when undecided.
+function usableTypeArg(c: Checker, ty: int): bool {
+  if (ty == 0 || ty == c.ctx.voidId) {
+    return false
+  }
+  return c.ctx.types[ty].kind != TypeKind.TypeParam
+}
+
+// The concrete type one type-argument node of a CALL's declared result denotes.
+//
+// The Call arm of `exprDeclTypeNode` hands back the callee's declared result
+// type node, which is written in the CALLEE's type parameters: for
+// `function idOpt<T>(o: Opt<T>): Opt<T>` that node is `Opt<T>`. Resolving `T`
+// against the caller yields the bare type parameter, so a match on the call's
+// result bound its payload at `T` and refused arithmetic on it (#1558).
+// `genericTypeArgs` already infers what this call binds each parameter to, so a
+// result type-arg naming a parameter resolves to that binding instead.
+//
+// Anything else — a concrete `int`, or a nested `Box<T>` this does not descend
+// into — falls through to the plain resolution, which is what it did before.
+function callResultTypeArg(c: Checker, callNode: int, targ: int): int {
+  let tn = getNode(c.tree, targ)
+  if (tn.tag != Tag.Ident) {
+    return typeFromNode(c, targ)
+  }
+  let cnode = calleeNodeOf(c, callNode)
+  if (cnode == 0 || getNode(c.tree, cnode).tag != Tag.Ident) {
+    return typeFromNode(c, targ)
+  }
+  let cn = getNode(c.tree, cnode)
+  let cname = c.source[cn.span.start:cn.span.end]
+  let fr = funcRefAt(c, cnode, cname)
+  if (!funcRefIsGeneric(fr)) {
+    return typeFromNode(c, targ)
+  }
+  let want = c.source[tn.span.start:tn.span.end]
+  // The type-param names belong to the DECLARING module's tree and source.
+  let oc = fr.owner
+  let tps = kidsOf(oc.tree, kidsOf(oc.tree, fr.decl)[2])
+  let bound = genericTypeArgs(c, cname, callNode)
+  let i = 0
+  while (i < len(tps) && i < len(bound)) {
+    let pn = getNode(oc.tree, kidsOf(oc.tree, tps[i])[0])
+    if (oc.source[pn.span.start:pn.span.end] == want && usableTypeArg(c, bound[i])) {
+      return bound[i]
+    }
+    i = i + 1
+  }
+  return typeFromNode(c, targ)
+}
+
 // The concrete type arguments of a generic-enum scrutinee expression, or empty.
 // The scrutinee's declared type node supplies them (see exprDeclTypeNode); only
 // variant construction has none written down and must infer them from arguments.
 function scrutineeTypeArgs(c: Checker, node: int): []int {
   let out = []int(0)
-  let n = getNode(c.tree, node)
-  if (n.tag == Tag.Call && getNode(c.tree, kidsOf(c.tree, node)[0]).tag == Tag.Member) {
+  let expr = scrutineeExpr(c, node)
+  let n = getNode(c.tree, expr)
+  if (n.tag == Tag.Call && getNode(c.tree, kidsOf(c.tree, expr)[0]).tag == Tag.Member) {
     // `Enum.Variant(args)` construction: infer the enum's type-args from the
     // variant's bare-type-param payload slots and their argument types.
-    return variantConstructionTypeArgs(c, node)
+    return variantConstructionTypeArgs(c, expr)
   }
-  let tnode = exprDeclTypeNode(c, node)
+  let tnode = exprDeclTypeNode(c, expr)
   if (tnode == 0 || getNode(c.tree, tnode).tag != Tag.GenericInst) {
     return out
   }
@@ -618,7 +703,11 @@ function scrutineeTypeArgs(c: Checker, node: int): []int {
   let targs = kidsOf(c.tree, kidsOf(c.tree, tnode)[1])
   let i = 0
   while (i < len(targs)) {
-    out = append(out, typeFromNode(c, targs[i]))
+    if (n.tag == Tag.Call) {
+      out = append(out, callResultTypeArg(c, expr, targs[i]))
+    } else {
+      out = append(out, typeFromNode(c, targs[i]))
+    }
     i = i + 1
   }
   return out
@@ -1498,6 +1587,35 @@ function declInitOf(c: Checker, node: int): int {
     }
   }
   return 0
+}
+
+// The initializing CALL of the nearest binding named `name` declared before
+// node `at`, WITHOUT consulting the resolver.
+//
+// `declInitOf` is the resolver-keyed answer and always takes precedence. This is
+// the fallback for the DUMP entry points, which run `checkModule` directly and
+// never run `resolveModule` (see `declInitOf`), so `nodeSymbols` is empty there
+// and a match scrutinee recovered no type arguments at all — `--dump-ir-pre`
+// then rendered `add <invalid>` where the seed renders `add i64` (#1558).
+//
+// Nearest PRECEDING declaration in arena order, not last-write-wins: map
+// iteration order is unspecified, so picking by position is what makes the
+// answer deterministic. Confined to type-ARGUMENT recovery, and #1536's rule
+// still holds where it matters — the resolver-keyed answer wins whenever the
+// resolver ran.
+function declInitByName(c: Checker, name: string, at: int): int {
+  let best = 0
+  let bestPat = 0
+  for (pat, init) of c.declInitNodes {
+    if (pat < at && pat > bestPat) {
+      let n = getNode(c.tree, pat)
+      if (c.source[n.span.start:n.span.end] == name) {
+        bestPat = pat
+        best = init
+      }
+    }
+  }
+  return best
 }
 
 // Binds `tpname` from a `Name<T>` parameter against an argument that is a local
@@ -3260,46 +3378,58 @@ function checkBinding(c: Checker, node: int) {
       c.moduleEnv[bname] = ty
     }
     c.declTypes[pat] = ty
-    // Record the binding's declared type NODE (annotation, or a composite
-    // literal's `Pair<i64>` type) so a generic call passing this binding can
-    // recover its type-args (`firstOf(p)` binds T from p's `Pair<i64>`).
-    let tnode = ann
-    if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.CompositeLit) {
-      tnode = kidsOf(c.tree, init)[0]
-    }
-    if (tnode != 0) {
-      c.declTypeNodes[bname] = tnode
-    } else if (init != 0) {
-      // A generic-enum variant construction writes its type args on the
-      // `Name<...>` RECEIVER — the same node an annotation would have supplied.
-      // Both variant forms are the same shape one level apart: `Wrap<i64>.Only(5)`
-      // puts the receiver under a Call's Member callee, `Two<i64>.Empty` (no
-      // payload, so no call) is that Member itself. Recorded separately rather
-      // than through `tnode` so the `declInitNodes` path below still fires
-      // (#1498). Without this the binding has no type node at all, so
-      // `scrutineeTypeArgs` finds none and a later `match` binds the arm payload
-      // at the raw type param `T`, which lowering cannot represent (#1545).
-      let recv = 0
-      let inode = getNode(c.tree, init)
-      if (inode.tag == Tag.Call) {
-        let callee = kidsOf(c.tree, init)[0]
-        if (getNode(c.tree, callee).tag == Tag.Member) {
-          recv = kidsOf(c.tree, callee)[0]
-        }
-      } else if (inode.tag == Tag.Member) {
-        recv = kidsOf(c.tree, init)[0]
+    recordBindingDeclNodes(c, bname, pat, ann, init)
+  }
+}
+
+// Records where a simple `let` binding's type ARGUMENTS can later be read from:
+// its declared type NODE (annotation, composite-literal type, or a generic-enum
+// variant construction's receiver), else the initializing CALL.
+//
+// Called from BOTH `checkBinding` and pre-pass 3's `seedBindingDeclType`, and
+// that is the point of it being one function. Match and for-of binders are typed
+// in pre-pass 3, long before the main sweep runs `checkBinding`, so anything only
+// the main sweep recorded was invisible to them: `let r: Opt<int> = idOpt(o)` and
+// `let r = idOpt(o)` alike left the arm binder at the bare type param and refused
+// arithmetic on it (#1558). Both passes write the same keys from the same nodes,
+// so the later write is a no-op.
+function recordBindingDeclNodes(c: Checker, bname: string, pat: int, ann: int, init: int) {
+  let tnode = ann
+  if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.CompositeLit) {
+    tnode = kidsOf(c.tree, init)[0]
+  }
+  if (tnode != 0) {
+    c.declTypeNodes[bname] = tnode
+  } else if (init != 0) {
+    // A generic-enum variant construction writes its type args on the
+    // `Name<...>` RECEIVER — the same node an annotation would have supplied.
+    // Both variant forms are the same shape one level apart: `Wrap<i64>.Only(5)`
+    // puts the receiver under a Call's Member callee, `Two<i64>.Empty` (no
+    // payload, so no call) is that Member itself. Recorded separately rather
+    // than through `tnode` so the `declInitNodes` path below still fires
+    // (#1498). Without this the binding has no type node at all, so
+    // `scrutineeTypeArgs` finds none and a later `match` binds the arm payload
+    // at the raw type param `T`, which lowering cannot represent (#1545).
+    let recv = 0
+    let inode = getNode(c.tree, init)
+    if (inode.tag == Tag.Call) {
+      let callee = kidsOf(c.tree, init)[0]
+      if (getNode(c.tree, callee).tag == Tag.Member) {
+        recv = kidsOf(c.tree, callee)[0]
       }
-      // The GenericInst guard is what keeps this narrow: an ordinary
-      // `let x = obj.field` has an Ident receiver and records nothing.
-      if (recv != 0 && getNode(c.tree, recv).tag == Tag.GenericInst) {
-        c.declTypeNodes[bname] = recv
-      }
+    } else if (inode.tag == Tag.Member) {
+      recv = kidsOf(c.tree, init)[0]
     }
-    // No written type: remember the initializing CALL so a later generic call
-    // taking this binding can re-derive the instance type-args it needs (#1498).
-    if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.Call) {
-      c.declInitNodes[pat] = init
+    // The GenericInst guard is what keeps this narrow: an ordinary
+    // `let x = obj.field` has an Ident receiver and records nothing.
+    if (recv != 0 && getNode(c.tree, recv).tag == Tag.GenericInst) {
+      c.declTypeNodes[bname] = recv
     }
+  }
+  // No written type: remember the initializing CALL so a later generic call
+  // taking this binding can re-derive the instance type-args it needs (#1498).
+  if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.Call) {
+    c.declInitNodes[pat] = init
   }
 }
 
@@ -3334,6 +3464,8 @@ function seedBindingDeclType(c: Checker, node: int) {
   if (getNode(c.tree, pat).tag != Tag.Ident) {
     return
   }
+  let pn = getNode(c.tree, pat)
+  recordBindingDeclNodes(c, c.source[pn.span.start:pn.span.end], pat, kids[1], kids[2])
   let ty = 0
   if (kids[1] != 0) {
     ty = typeFromNode(c, kids[1])
