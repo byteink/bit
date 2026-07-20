@@ -1,0 +1,326 @@
+// Bit standard library — quic module, the reader, ticker, loop, and application commands.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Reader, ticker, and the loop
+// ---------------------------------------------------------------------------
+
+// Reader thread: park on UDP recv and forward each datagram; on a socket error
+// (close) emit one `eof` and stop.
+function quicconnReader(sock: UdpSocket, inCh: chan<quicconnDgram>) {
+  while (true) {
+    let d = sock.recv(2048) catch e {
+      inCh <- quicconnDgram{ data: []byte(0), host: "", port: 0, eof: true }
+      return
+    }
+    inCh <- quicconnDgram{ data: []byte(d.data), host: d.host, port: d.port, eof: false }
+  }
+}
+
+// Ticker thread: emit a tick every `quicconnTick` ns to drive the RFC 9002
+// timers. A non-blocking send drops the tick if the loop is busy, so the ticker
+// never parks; it exits when the loop clears `running`. ponytail: a fixed tick
+// stands in for a cancellable per-deadline timer — a native timer channel would
+// let the loop block precisely instead of polling on the tick.
+function quicconnTicker(st: quicconnState) {
+  while (st.running) {
+    quicconnSleepTick()
+    select {
+      case st.tickCh <- 0:
+        {}
+      default:
+        {}
+    }
+  }
+}
+
+// Loop thread: the sole owner of `st`. Kick off the handshake, then fold in one
+// datagram, command, or tick at a time until the connection ends.
+function quicconnLoop(st: quicconnState) {
+  quicconnKickoff(st) catch e {
+    quicconnFail(st)
+  }
+  while (st.running) {
+    select {
+      case ev = <- st.inCh:
+        quicconnOnDgram(st, ev) catch e {
+          quicconnFail(st)
+        }
+      case cmd = <- st.cmdCh:
+        quicconnOnCmd(st, cmd) catch e {
+          quicconnFail(st)
+        }
+      case tk = <- st.tickCh:
+        quicconnOnTick(st) catch e {
+          quicconnFail(st)
+        }
+    }
+  }
+  quicconnReleaseWaiters(st)
+  // Signal loop exit so a server listener can reap this connection's demux
+  // entries. Non-blocking: nothing reads `doneCh` on the dial path.
+  select {
+    case st.doneCh <- 1:
+      {}
+    default:
+      {}
+  }
+}
+
+// Fail one command whose reply nobody will ever produce, so its caller unparks.
+// Both reply channels are buffered (capacity 1, created per call), so neither
+// send can block. `Write`/`Close` carry no reply.
+function quicconnFailCmd(c: quicconnCmd) {
+  if (c.kind == quicconnCmdOpen || c.kind == quicconnCmdAccept) {
+    c.replyOpen <- quicconnOpenReply{ id: -1, recvCh: chan<StreamChunk>(1) }
+  }
+  if (c.kind == quicconnCmdFinish) {
+    c.replyInt <- -1
+  }
+}
+
+// Release every application green thread parked on this connection, once the
+// loop has stopped. The loop is the sole producer for all of these, so once it
+// exits nothing else ever will: without this, a peer close (or any error) mid
+// `read`/`finish`/`acceptStream` parks the caller forever. Runs exactly once,
+// after the loop, so the `close` calls here cannot race a send or double-close.
+function quicconnReleaseWaiters(st: quicconnState) {
+  // Commands still queued in the buffered channel: their senders are parked on
+  // a reply channel the loop will never read.
+  let draining = true
+  let guard = 0
+  while (draining && guard < 100000) {
+    guard = guard + 1
+    select {
+      case c = <- st.cmdCh:
+        quicconnFailCmd(c)
+      default:
+        draining = false
+    }
+  }
+  for (id, s) of st.streams {
+    if (s.hasDrain) {
+      s.hasDrain = false
+      s.drainCh <- -1 // unblocks `finish`, which reports the failure
+    }
+    // A blocked `read` drains whatever is still buffered, then sees the close.
+    close(s.recvCh)
+  }
+  if (st.hasAcceptWaiter) {
+    st.hasAcceptWaiter = false
+    st.acceptWaiter <- quicconnOpenReply{ id: -1, recvCh: chan<StreamChunk>(1) }
+  }
+}
+
+// Abandon the connection on an unrecoverable error: unblock a waiting
+// dial/accept with a failure sentinel, stop the loop, and release the socket if
+// this connection owns it — which also errors out the reader thread's blocked
+// `recv` so it exits instead of leaking alongside the socket. Before #1473 this
+// path had to stay socket-neutral by hand, because a listener-created connection
+// shares `lst.sock`; `quicconnCloseOwnedSock` now enforces that structurally.
+function quicconnFail(st: quicconnState) {
+  if (!st.established) {
+    select {
+      case st.readyCh <- -1:
+        {}
+      default:
+        {}
+    }
+  }
+  st.running = false
+  quicconnCloseOwnedSock(st)
+}
+
+// Mark the connection established and release the waiting dial/accept once.
+function quicconnBecomeEstablished(st: quicconnState) {
+  if (st.established) {
+    return
+  }
+  st.established = true
+  select {
+    case st.readyCh <- 1:
+      {}
+    default:
+      {}
+  }
+}
+
+// Client-only: build the ClientHello and send the first Initial flight.
+function quicconnKickoff(st: quicconnState): ()! {
+  if (!st.isClient) {
+    return
+  }
+  match (st.chOpt) {
+    None => {}
+    Some(h) => {
+      quicconnQueueCrypto(st, quicconnLvlInitial, h.clientHelloMessage())
+      quicconnFlush(st)?
+    }
+  }
+}
+
+function quicconnOnDgram(st: quicconnState, ev: quicconnDgram): ()! {
+  if (ev.eof) {
+    st.running = false
+    return
+  }
+  st.peerHost = ev.host
+  st.peerPort = ev.port
+  st.havePeer = true
+  st.lastRecv = monotonic()
+  quicconnRecvDatagram(st, ev.data)?
+  quicconnFlush(st)?
+}
+
+function quicconnOnTick(st: quicconnState): ()! {
+  // A client whose handshake has stalled past the deadline gives up, so a dial
+  // to an absent/silent server returns an error rather than hanging. A listener-
+  // created server connection (`serverHsTimeout`) applies the same deadline: it
+  // is born mid-handshake when an Initial arrives, so a peer that never finishes
+  // is reaped instead of leaking a slot. The `acceptQuic` server, which binds
+  // before any peer exists, keeps waiting indefinitely.
+  if ((st.isClient || st.serverHsTimeout) && !st.established && monotonic() - st.handshakeStart > quicconnHandshakeTimeout) {
+    quicconnFail(st)
+    return
+  }
+  // Idle timeout (RFC 9000 §10.1): an established connection that has heard
+  // nothing from its peer for `st.idleTimeout` is dead. Stopping the loop
+  // runs `quicconnReleaseWaiters`, so `finish`/`read`/`acceptStream` fail
+  // instead of parking forever behind a PTO that nobody will ever answer.
+  if (st.established && monotonic() - st.lastRecv > st.idleTimeout) {
+    quicconnFail(st)
+    return
+  }
+  quicconnDetectLoss(st, quicconnLvlInitial)
+  quicconnDetectLoss(st, quicconnLvlHandshake)
+  quicconnDetectLoss(st, quicconnLvlApp)
+  quicconnMaybePto(st)
+  quicconnCheckDelivered(st)
+  quicconnFlush(st)?
+}
+
+// ---------------------------------------------------------------------------
+// Application commands
+// ---------------------------------------------------------------------------
+
+function quicconnOnCmd(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (cmd.kind == quicconnCmdOpen) {
+    quicconnDoOpen(st, cmd)
+    return
+  }
+  if (cmd.kind == quicconnCmdAccept) {
+    quicconnDoAccept(st, cmd)
+    return
+  }
+  if (cmd.kind == quicconnCmdWrite) {
+    quicconnDoWrite(st, cmd)?
+    return
+  }
+  if (cmd.kind == quicconnCmdFinish) {
+    quicconnDoFinish(st, cmd)?
+    return
+  }
+  if (cmd.kind == quicconnCmdSetIdle) {
+    quicconnDoSetIdle(st, cmd)
+    return
+  }
+  if (cmd.kind == quicconnCmdClose) {
+    quicconnDoClose(st, cmd)?
+    return
+  }
+}
+
+function quicconnDoOpen(st: quicconnState, cmd: quicconnCmd) {
+  let id = st.nextBidiId
+  st.nextBidiId = st.nextBidiId + 4
+  let s = quicconnNewStream(st, id, false)
+  st.streams[id] = s
+  st.present[id] = 1
+  cmd.replyOpen <- quicconnOpenReply{ id: id, recvCh: s.recvCh }
+}
+
+function quicconnDoAccept(st: quicconnState, cmd: quicconnCmd) {
+  if (len(st.acceptQueue) > 0) {
+    let id = st.acceptQueue[0]
+    st.acceptQueue = st.acceptQueue[1:len(st.acceptQueue)]
+    let s = st.streams[id]
+    cmd.replyOpen <- quicconnOpenReply{ id: id, recvCh: s.recvCh }
+    return
+  }
+  st.acceptWaiter = cmd.replyOpen
+  st.hasAcceptWaiter = true
+}
+
+function quicconnDoWrite(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.present[cmd.id] == 0) {
+    return
+  }
+  let s = st.streams[cmd.id]
+  if (len(s.sendBuf) == 0) {
+    s.sendBuf = cmd.data
+  } else {
+    for b of cmd.data {
+      s.sendBuf = append(s.sendBuf, b)
+    }
+  }
+  s.sendLen = len(s.sendBuf)
+  quicconnFlush(st)?
+}
+
+function quicconnDoFinish(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.present[cmd.id] == 0) {
+    cmd.replyInt <- -1
+    return
+  }
+  let s = st.streams[cmd.id]
+  s.finQueued = true
+  s.drainCh = cmd.replyInt
+  s.hasDrain = true
+  quicconnFlush(st)?
+  quicconnCheckDelivered(st)
+}
+
+// Apply a new idle timeout. `cmd.id` carries the nanosecond value; a value at or
+// below zero is ignored, since a zero timeout would fail the connection on the
+// very next tick and there is no sane caller for that.
+function quicconnDoSetIdle(st: quicconnState, cmd: quicconnCmd) {
+  if (cmd.id <= 0) {
+    return
+  }
+  st.idleTimeout = cmd.id
+}
+
+function quicconnDoClose(st: quicconnState, cmd: quicconnCmd): ()! {
+  if (st.established && !st.closeSent) {
+    // Re-arm the ACK so the closing packet carries one (RFC 9000 §10.2 permits
+    // other frames alongside CONNECTION_CLOSE, and `quicconnFlushApp` emits the
+    // ACK ahead of the pending close). After this we stop responding entirely,
+    // so a peer still waiting on an ACK whose earlier datagram was lost would
+    // otherwise never learn its data arrived — and, blocked in `finish`, would
+    // wait forever. Bundling makes delivery of the close also confirm delivery
+    // of everything we received.
+    st.aLevel.ackPending = true
+    st.aLevel.pending = append(st.aLevel.pending, Frame.ApplicationClose(0, []byte(0)))
+    st.closeSent = true
+    quicconnFlush(st)?
+  }
+  quicconnCloseOwnedSock(st)
+  st.running = false
+}
+
+// The single place a connection may close its socket. A connection that does not
+// own `sock` shares it with a listener and its sibling connections, so closing it
+// would kill the accept loop and every other connection on it — a use-after-close
+// on a descriptor other code still believes it owns (#1473). Every teardown path
+// (`quicconnDoClose`, `quicconnFail`, any future one) goes through here; no other
+// code in this file calls `sock.close()` on a connection's socket.
+function quicconnCloseOwnedSock(st: quicconnState) {
+  if (!st.ownsSock || st.sockClosed) {
+    return
+  }
+  st.sockClosed = true
+  st.sock.close()
+}
+

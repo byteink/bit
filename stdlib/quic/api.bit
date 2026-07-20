@@ -1,0 +1,203 @@
+// Bit standard library — quic module, the public QUIC API.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// The client TLS config for a QUIC handshake: TLS 1.3 with AES-128-GCM +
+// X25519, matching `packet.bit`'s AEAD and this module's key length.
+// insecureSkipVerify keeps the loopback path free of a trust anchor.
+function quicconnClientTlsConfig(serverName: string): TlsClientConfig {
+  return TlsClientConfig{
+    serverName: serverName,
+    alpn: []string(0),
+    trust: emptyTrustStore(),
+    insecureSkipVerify: true,
+    nowUnix: 0,
+    groups: [TlsGroup.X25519],
+    keyShareGroups: [TlsGroup.X25519],
+    suites: [TLS_AES_128_GCM_SHA256],
+    clientHelloOverride: []byte(0),
+    ephemeralOverride: []GroupKeypair(0),
+  }
+}
+
+// Open a QUIC connection to `host:port` and complete the handshake to 1-RTT.
+// Binds an ephemeral loopback UDP socket, spawns the reader/ticker/loop threads,
+// and blocks until the connection is established. ponytail: binds 127.0.0.1
+// only; no name resolution or IPv6.
+export function dialQuic(host: string, port: int, serverName: string): Conn! {
+  let sock = udpBind("127.0.0.1", 0)?
+  let scid = quicconnMakeCid()
+  let dcid = quicconnMakeCid()
+  let tp = quicconnLocalParams(scid)
+  let ext = Extension{
+    extType: quicTransportParametersExtension,
+    data: encodeTransportParameters(tp),
+  }
+  let h = tlsClientStartExts(quicconnClientTlsConfig(serverName), [ext])?
+  // Owns the socket: `dialQuic` bound it here, nothing else can reach it.
+  let st = quicconnNewState(true, sock, true, host, port, scid, dcid)
+  st.chOpt = Option.Some(h)
+  st.iLevel.ksend = clientInitialKeys(dcid)
+  st.iLevel.krecv = serverInitialKeys(dcid)
+  st.iLevel.haveSend = true
+  st.iLevel.haveRecv = true
+  spawn quicconnReader(sock, st.inCh)
+  spawn quicconnTicker(st)
+  spawn quicconnLoop(st)
+  let r = <- st.readyCh
+  if (r < 0) {
+    // The socket is already closed: `readyCh <- -1` comes only from
+    // quicconnFail, which releases the owned socket (and so unblocks the reader
+    // thread's recv) itself. Closing again here would double-close a descriptor
+    // the kernel may have handed to someone else.
+    fail newError("quic: handshake failed")
+  }
+  return Conn{ cmdCh: st.cmdCh, sock: sock }
+}
+
+// Accept a QUIC connection on the already-bound UDP socket `sock`, using the
+// given PEM certificate chain and private key, and complete the handshake. Serves
+// exactly one connection. ponytail: single connection per socket (no connection-
+// id demultiplexing across peers).
+export function acceptQuic(sock: UdpSocket, certChainPem: string, keyPem: string): Conn! {
+  let cfg = newTlsServerConfig(certChainPem, keyPem, []string(0))?
+  cfg.suites = [TLS_AES_128_GCM_SHA256]
+  cfg.groups = [TlsGroup.X25519]
+  let scid = quicconnMakeCid()
+  let tp = quicconnLocalParams(scid)
+  let ext = Extension{
+    extType: quicTransportParametersExtension,
+    data: encodeTransportParameters(tp),
+  }
+  let s = tlsServerStartExts(cfg, [ext])?
+  // Owns the socket: `acceptQuic` serves exactly one connection on `sock`, and
+  // its caller hands the socket over for that connection's lifetime.
+  let st = quicconnNewState(false, sock, true, "", 0, scid, []byte(0))
+  st.shOpt = Option.Some(s)
+  spawn quicconnReader(sock, st.inCh)
+  spawn quicconnTicker(st)
+  spawn quicconnLoop(st)
+  let r = <- st.readyCh
+  if (r < 0) {
+    fail newError("quic: server handshake failed")
+  }
+  return Conn{ cmdCh: st.cmdCh, sock: sock }
+}
+
+// Open a new client-initiated bidirectional stream.
+export function (c: Conn) openStream(): Stream! {
+  let reply = chan<quicconnOpenReply>(1)
+  c.cmdCh <- quicconnCmd{
+    kind: quicconnCmdOpen,
+    id: 0,
+    data: []byte(0),
+    replyOpen: reply,
+    replyInt: chan<int>(1),
+  }
+  let r = <- reply
+  if (r.id < 0) {
+    fail newError("quic: connection closed")
+  }
+  return Stream{ streamId: r.id, cmdCh: c.cmdCh, recvCh: r.recvCh }
+}
+
+// Accept the next peer-initiated bidirectional stream, blocking until one opens.
+// Fails if the connection ends first.
+export function (c: Conn) acceptStream(): Stream! {
+  let reply = chan<quicconnOpenReply>(1)
+  c.cmdCh <- quicconnCmd{
+    kind: quicconnCmdAccept,
+    id: 0,
+    data: []byte(0),
+    replyOpen: reply,
+    replyInt: chan<int>(1),
+  }
+  let r = <- reply
+  if (r.id < 0) {
+    fail newError("quic: connection closed")
+  }
+  return Stream{ streamId: r.id, cmdCh: c.cmdCh, recvCh: r.recvCh }
+}
+
+// Set how long this connection tolerates hearing nothing from its peer before it
+// gives up (RFC 9000 §10.1), in nanoseconds. The default is 30s. Lower it when
+// the application wants a vanished peer detected sooner than a PTO series would
+// ever reveal it; values at or below zero are ignored. Takes effect on the next
+// tick, and applies to a connection from either side (dialed, accepted, or
+// listener-created).
+export function (c: Conn) setIdleTimeout(ns: int) {
+  c.cmdCh <- quicconnCmd{
+    kind: quicconnCmdSetIdle,
+    id: ns,
+    data: []byte(0),
+    replyOpen: chan<quicconnOpenReply>(1),
+    replyInt: chan<int>(1),
+  }
+}
+
+// Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
+// socket if this connection owns it (a listener-created connection shares the
+// listener's socket and leaves it alone). ponytail: no draining timeout —
+// best-effort close.
+export function (c: Conn) close() {
+  c.cmdCh <- quicconnCmd{
+    kind: quicconnCmdClose,
+    id: 0,
+    data: []byte(0),
+    replyOpen: chan<quicconnOpenReply>(1),
+    replyInt: chan<int>(1),
+  }
+}
+
+// Queue `data` on the stream. Returns once buffered; the loop delivers it under
+// flow control and congestion control, retransmitting any losses.
+export function (s: Stream) write(data: []byte): ()! {
+  s.cmdCh <- quicconnCmd{
+    kind: quicconnCmdWrite,
+    id: s.streamId,
+    data: data,
+    replyOpen: chan<quicconnOpenReply>(1),
+    replyInt: chan<int>(1),
+  }
+}
+
+// Mark the send half finished (FIN) and block until every queued byte has been
+// acknowledged by the peer. Fails if the connection ends before the stream
+// drains — the data may or may not have arrived, so the caller must not assume
+// delivery.
+export function (s: Stream) finish(): ()! {
+  let done = chan<int>(1)
+  s.cmdCh <- quicconnCmd{
+    kind: quicconnCmdFinish,
+    id: s.streamId,
+    data: []byte(0),
+    replyOpen: chan<quicconnOpenReply>(1),
+    replyInt: done,
+  }
+  let r = <- done
+  if (r < 0) {
+    fail newError("quic: connection closed before the stream drained")
+  }
+}
+
+// Read the next reassembled inbound chunk, blocking until data or the FIN
+// arrives. The final chunk carries `fin = true`; read until then to consume the
+// whole stream. Fails once the connection has ended and every chunk already
+// received has been drained.
+export function (s: Stream) read(): StreamChunk! {
+  let (c, ok) = <- s.recvCh
+  if (!ok) {
+    fail newError("quic: connection closed")
+  }
+  return c
+}
+
+// The stream's id (RFC 9000 §2.1).
+export function (s: Stream) id(): int {
+  return s.streamId
+}

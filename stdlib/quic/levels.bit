@@ -1,0 +1,235 @@
+// Bit standard library — quic module, per-level and per-stream connection state.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Received-packet-number ranges (for ACK generation)
+// ---------------------------------------------------------------------------
+
+// One inclusive run of received (or acknowledged) packet numbers.
+struct quicconnRange { lo: int, hi: int }
+
+// Merge `rs` into a canonical descending (by `hi`), non-overlapping,
+// gap-preserving list. Adjacent runs (`hi + 1 == next.lo`) coalesce. Bounded by
+// `len(rs)`: an insertion sort then a single merge pass.
+function quicconnMergeRanges(rs: []quicconnRange): []quicconnRange {
+  let a = rs
+  let i = 1
+  while (i < len(a)) {
+    let key = a[i]
+    let j = i - 1
+    while (j >= 0 && a[j].lo > key.lo) {
+      a[j + 1] = a[j]
+      j = j - 1
+    }
+    a[j + 1] = key
+    i = i + 1
+  }
+  let merged = []quicconnRange(0)
+  for r of a {
+    if (len(merged) > 0 && r.lo <= merged[len(merged) - 1].hi + 1) {
+      let last = merged[len(merged) - 1]
+      if (r.hi > last.hi) {
+        last.hi = r.hi
+      }
+    } else {
+      merged = append(merged, quicconnRange{ lo: r.lo, hi: r.hi })
+    }
+  }
+  let out = []quicconnRange(0)
+  let k = len(merged) - 1
+  while (k >= 0) {
+    out = append(out, merged[k])
+    k = k - 1
+  }
+  return out
+}
+
+function quicconnPnInRanges(pn: int, ranges: []quicconnRange): bool {
+  for r of ranges {
+    if (pn >= r.lo && pn <= r.hi) {
+      return true
+    }
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Per-level (packet-number-space) state
+// ---------------------------------------------------------------------------
+
+// A sent, still-unacknowledged packet the recovery machinery tracks. `frames`
+// holds only its retransmittable frames, re-queued on loss.
+struct quicconnSent { pn: int, timeSent: int, size: int, ackEliciting: bool, frames: []Frame }
+
+// One encryption level's send/receive bookkeeping (RFC 9002 §6 tracks loss per
+// space). `pending` is the queue of frames waiting to be packetized, both new
+// CRYPTO and re-queued retransmits.
+struct quicconnLevel {
+  idx: int,
+  haveSend: bool,
+  haveRecv: bool,
+  ksend: PacketKeys,
+  krecv: PacketKeys,
+  nextPn: int,
+  largestAcked: int,
+  sent: []quicconnSent,
+  pending: []Frame,
+  crecv: CryptoAssembler,
+  recvRanges: []quicconnRange,
+  largestRecvPn: int,
+  ackPending: bool,
+  lossTime: int,
+  timeLastAckEliciting: int,
+}
+
+function quicconnNewLevel(idx: int): quicconnLevel {
+  return quicconnLevel{
+    idx: idx,
+    haveSend: false,
+    haveRecv: false,
+    ksend: quicconnZeroKeys(),
+    krecv: quicconnZeroKeys(),
+    nextPn: 0,
+    largestAcked: -1,
+    sent: []quicconnSent(0),
+    pending: []Frame(0),
+    crecv: newCryptoAssembler(1 << 16),
+    recvRanges: []quicconnRange(0),
+    largestRecvPn: -1,
+    ackPending: false,
+    lossTime: 0,
+    timeLastAckEliciting: 0,
+  }
+}
+
+// Record that packet `pn` was received at `lvl`, for later ACK generation.
+function quicconnRecordPn(lvl: quicconnLevel, pn: int) {
+  for r of lvl.recvRanges {
+    if (pn >= r.lo && pn <= r.hi) {
+      return
+    }
+  }
+  let all = append(lvl.recvRanges, quicconnRange{ lo: pn, hi: pn })
+  lvl.recvRanges = quicconnMergeRanges(all)
+}
+
+// Build an ACK frame covering everything received at `lvl` (RFC 9000 §19.3).
+// `delay` is sent as 0 — this endpoint acks promptly. ponytail: no ACK delay.
+function quicconnBuildAck(lvl: quicconnLevel): Frame {
+  let r0 = lvl.recvRanges[0]
+  let largest = r0.hi
+  let firstRange = r0.hi - r0.lo
+  let ranges = []AckRange(0)
+  let prevLo = r0.lo
+  let i = 1
+  while (i < len(lvl.recvRanges)) {
+    let r = lvl.recvRanges[i]
+    let gap = prevLo - r.hi - 2
+    let rangeLength = r.hi - r.lo
+    ranges = append(ranges, AckRange{ gap: u64(gap), rangeLength: u64(rangeLength) })
+    prevLo = r.lo
+    i = i + 1
+  }
+  return Frame.Ack(
+    AckFrame{
+      largest: u64(largest),
+      delay: 0,
+      firstRange: u64(firstRange),
+      ranges: ranges,
+      ecn: false,
+      ect0: 0,
+      ect1: 0,
+      ce: 0,
+    },
+  )
+}
+
+function quicconnLevelHasWork(lvl: quicconnLevel): bool {
+  return lvl.ackPending || len(lvl.pending) > 0
+}
+
+// Take frames off `lvl.pending` up to `budget` bytes (always at least one, so a
+// single oversized CRYPTO chunk still makes progress).
+function quicconnTakePending(lvl: quicconnLevel, budget: int): []Frame {
+  let out = []Frame(0)
+  let used = 0
+  let guard = 0
+  while (len(lvl.pending) > 0 && guard <= 100000) {
+    guard = guard + 1
+    let f = lvl.pending[0]
+    let sz = len(encodeFrame(f))
+    if (used + sz > budget && len(out) > 0) {
+      break
+    }
+    out = append(out, f)
+    used = used + sz
+    lvl.pending = lvl.pending[1:len(lvl.pending)]
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream state
+// ---------------------------------------------------------------------------
+
+// One bidirectional stream. Only the loop thread touches this. Send fields track
+// the outbound byte buffer and how much has been packetized; receive fields
+// reassemble inbound STREAM data and meter the flow-control window.
+struct quicconnStream {
+  id: int,
+  isPeer: bool,
+  sendBuf: []byte,
+  sendOff: int,
+  sendLen: int,
+  finQueued: bool,
+  finSent: bool,
+  /// Send-side byte ranges the peer has acknowledged, and whether the FIN was
+  /// acknowledged. Delivery is tracked per *byte*, not per packet: when a packet
+  /// is lost its bytes are retransmitted in a new one, so "no packet of mine is
+  /// outstanding" is strictly stronger than "every byte reached the peer" — and
+  /// once the peer closes, the stronger condition can never be met even though
+  /// the data did arrive (RFC 9000 §3.3 drains on data, not on packets).
+  ackedRanges: []quicconnRange,
+  finAcked: bool,
+  peerMaxStreamData: int,
+  blockedSignaled: bool,
+  delivered: bool,
+  hasDrain: bool,
+  drainCh: chan<int>,
+  recvAsm: CryptoAssembler,
+  recvDelivered: int,
+  recvFinalSize: int,
+  finDelivered: bool,
+  localMaxStreamData: int,
+  needMaxStreamData: bool,
+  recvCh: chan<StreamChunk>,
+}
+
+function quicconnNewStream(st: quicconnState, id: int, isPeer: bool): quicconnStream {
+  return quicconnStream{
+    id: id,
+    isPeer: isPeer,
+    sendBuf: []byte(0),
+    sendOff: 0,
+    sendLen: 0,
+    finQueued: false,
+    finSent: false,
+    ackedRanges: []quicconnRange(0),
+    finAcked: false,
+    peerMaxStreamData: st.peerInitStreamData,
+    blockedSignaled: false,
+    delivered: false,
+    hasDrain: false,
+    drainCh: chan<int>(1),
+    recvAsm: newCryptoAssembler(1 << 24),
+    recvDelivered: 0,
+    recvFinalSize: -1,
+    finDelivered: false,
+    localMaxStreamData: quicconnFlowWindow,
+    needMaxStreamData: false,
+    recvCh: chan<StreamChunk>(4096),
+  }
+}
+

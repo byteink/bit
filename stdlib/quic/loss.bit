@@ -1,0 +1,283 @@
+// Bit standard library — quic module, loss recovery, RTT, and congestion control.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Loss recovery, RTT, and NewReno congestion control (RFC 9002)
+// ---------------------------------------------------------------------------
+
+// Process an ACK frame (RFC 9002 §5, §7): retire acknowledged packets, update
+// RTT from the largest newly-acked ack-eliciting packet, feed NewReno, then run
+// loss detection and delivery checks.
+function quicconnProcessAck(st: quicconnState, levelIdx: int, a: AckFrame) {
+  let lvl = quicconnLvl(st, levelIdx)
+  let largest = int(a.largest)
+  let acked = []quicconnRange(0)
+  let hi = largest
+  let lo = largest - int(a.firstRange)
+  acked = append(acked, quicconnRange{ lo: lo, hi: hi })
+  let prevLo = lo
+  for rg of a.ranges {
+    let ghi = prevLo - int(rg.gap) - 2
+    let glo = ghi - int(rg.rangeLength)
+    acked = append(acked, quicconnRange{ lo: glo, hi: ghi })
+    prevLo = glo
+  }
+  if (largest > lvl.largestAcked) {
+    lvl.largestAcked = largest
+  }
+  let now = monotonic()
+  let largestAckedTime = -1
+  let kept = []quicconnSent(0)
+  let ackedAny = false
+  for sp of lvl.sent {
+    if (quicconnPnInRanges(sp.pn, acked)) {
+      if (sp.ackEliciting) {
+        st.bytesInFlight = st.bytesInFlight - sp.size
+      }
+      quicconnNoteAckedFrames(st, sp)
+      quicconnOnPacketAcked(st, sp)
+      ackedAny = true
+      if (sp.pn == largest && sp.ackEliciting) {
+        largestAckedTime = sp.timeSent
+      }
+    } else {
+      kept = append(kept, sp)
+    }
+  }
+  lvl.sent = kept
+  if (largestAckedTime >= 0) {
+    quicconnUpdateRtt(st, now - largestAckedTime)
+  }
+  if (ackedAny) {
+    st.ptoCount = 0
+    quicconnDetectLoss(st, levelIdx)
+    quicconnCheckDelivered(st)
+  }
+}
+
+// NewReno increase on acknowledgement (RFC 9002 §7.3.1 / §7.3.2). No increase
+// for a packet sent during the current recovery period.
+function quicconnOnPacketAcked(st: quicconnState, sp: quicconnSent) {
+  if (!sp.ackEliciting) {
+    return
+  }
+  if (sp.timeSent <= st.recoveryStart) {
+    return
+  }
+  if (st.cwnd < st.ssthresh) {
+    st.cwnd = st.cwnd + sp.size
+  } else {
+    st.cwnd = st.cwnd + quicconnMaxPacket * sp.size / st.cwnd
+  }
+}
+
+// Enter congestion recovery once per event (RFC 9002 §7.3.3): halve the window,
+// floored at the minimum.
+function quicconnOnCongestionEvent(st: quicconnState, lostSentTime: int) {
+  if (lostSentTime <= st.recoveryStart) {
+    return
+  }
+  st.recoveryStart = monotonic()
+  st.ssthresh = st.cwnd / 2
+  if (st.ssthresh < quicconnMinWindow) {
+    st.ssthresh = quicconnMinWindow
+  }
+  st.cwnd = st.ssthresh
+}
+
+// Update smoothed RTT and RTT variance (RFC 9002 §5.3). ACK delay is 0 in this
+// implementation, so it drops out.
+function quicconnUpdateRtt(st: quicconnState, latest: int) {
+  st.latestRtt = latest
+  if (!st.haveRtt) {
+    st.minRtt = latest
+    st.srtt = latest
+    st.rttvar = latest / 2
+    st.haveRtt = true
+    return
+  }
+  if (latest < st.minRtt) {
+    st.minRtt = latest
+  }
+  st.rttvar = (3 * st.rttvar + quicconnAbs(st.srtt - latest)) / 4
+  st.srtt = (7 * st.srtt + latest) / 8
+}
+
+// The time threshold for declaring a packet lost (RFC 9002 §6.1.2): 9/8 of the
+// larger of smoothed and latest RTT, floored at the timer granularity.
+function quicconnLossDelay(st: quicconnState): int {
+  let base = quicconnMax(st.srtt, st.latestRtt)
+  let delay = base * 9 / 8
+  if (delay < quicconnGranularity) {
+    delay = quicconnGranularity
+  }
+  return delay
+}
+
+// Declare packets in `levelIdx` lost by the packet threshold (3 later packets
+// acknowledged) or the time threshold (RFC 9002 §6.1), re-queue their
+// retransmittable frames, and signal a congestion event.
+function quicconnDetectLoss(st: quicconnState, levelIdx: int) {
+  let lvl = quicconnLvl(st, levelIdx)
+  if (lvl.largestAcked < 0) {
+    return
+  }
+  let now = monotonic()
+  let lossDelay = quicconnLossDelay(st)
+  let kept = []quicconnSent(0)
+  let lostFrames = []Frame(0)
+  let lostTime = -1
+  lvl.lossTime = 0
+  for sp of lvl.sent {
+    let byPacket = sp.pn <= lvl.largestAcked - quicconnPacketThreshold
+    let byTime = sp.pn < lvl.largestAcked && now - sp.timeSent >= lossDelay
+    if (byPacket || byTime) {
+      if (sp.ackEliciting) {
+        st.bytesInFlight = st.bytesInFlight - sp.size
+      }
+      for f of sp.frames {
+        lostFrames = append(lostFrames, f)
+      }
+      if (sp.timeSent > lostTime) {
+        lostTime = sp.timeSent
+      }
+    } else {
+      kept = append(kept, sp)
+      if (sp.pn < lvl.largestAcked) {
+        let t = sp.timeSent + lossDelay
+        if (lvl.lossTime == 0 || t < lvl.lossTime) {
+          lvl.lossTime = t
+        }
+      }
+    }
+  }
+  lvl.sent = kept
+  if (len(lostFrames) > 0) {
+    for f of lostFrames {
+      if (quicconnIsRetransmittable(f)) {
+        lvl.pending = append(lvl.pending, f)
+      }
+    }
+    quicconnOnCongestionEvent(st, lostTime)
+  }
+}
+
+// The base PTO duration (RFC 9002 §6.2.1), floored so a coarse tick and green-
+// thread jitter cannot make it fire before a genuine ACK would arrive.
+function quicconnPtoDuration(st: quicconnState): int {
+  if (!st.haveRtt) {
+    return quicconnInitialPto
+  }
+  let pto = st.srtt + quicconnMax(4 * st.rttvar, quicconnGranularity) + st.maxAckDelay
+  if (pto < quicconnMinPto) {
+    pto = quicconnMinPto
+  }
+  return pto
+}
+
+// Fire the probe timeout if the PTO has elapsed since the last ack-eliciting
+// packet with data still in flight (RFC 9002 §6.2). Retransmits the oldest
+// unacked packet's frames — this is what recovers a lost tail.
+function quicconnMaybePto(st: quicconnState) {
+  if (st.bytesInFlight == 0) {
+    return
+  }
+  let last = quicconnMax(
+    st.iLevel.timeLastAckEliciting,
+    quicconnMax(st.hLevel.timeLastAckEliciting, st.aLevel.timeLastAckEliciting),
+  )
+  if (last == 0) {
+    return
+  }
+  let backoff = 1 << st.ptoCount
+  let deadline = last + quicconnPtoDuration(st) * backoff
+  if (monotonic() < deadline) {
+    return
+  }
+  st.ptoCount = st.ptoCount + 1
+  if (st.ptoCount > 8) {
+    st.ptoCount = 8
+  }
+  quicconnSendProbe(st)
+}
+
+// Re-queue the oldest unacknowledged packet's frames on the highest level that
+// still has one, forcing a retransmission on the next flush.
+function quicconnSendProbe(st: quicconnState) {
+  let idx = -1
+  if (len(st.aLevel.sent) > 0) {
+    idx = quicconnLvlApp
+  } else if (len(st.hLevel.sent) > 0) {
+    idx = quicconnLvlHandshake
+  } else if (len(st.iLevel.sent) > 0) {
+    idx = quicconnLvlInitial
+  }
+  if (idx < 0) {
+    return
+  }
+  let lvl = quicconnLvl(st, idx)
+  let sp = lvl.sent[0]
+  for f of sp.frames {
+    if (quicconnIsRetransmittable(f)) {
+      lvl.pending = append(lvl.pending, f)
+    }
+  }
+}
+
+// Reply to any finished stream whose send buffer is fully acknowledged, so the
+// application's `finish` returns (RFC 9000 §3.3: the send stream is drained).
+function quicconnCheckDelivered(st: quicconnState) {
+  for (id, s) of st.streams {
+    if (s.hasDrain && !s.delivered) {
+      if (s.finSent && s.sendOff == s.sendLen && quicconnStreamFullyAcked(s)) {
+        s.delivered = true
+        s.hasDrain = false
+        s.drainCh <- 1
+      }
+    }
+  }
+}
+
+// Whether any STREAM data for `id` is still in flight or queued for (re)send.
+// Record what a newly-acknowledged packet actually delivered: the send-side byte
+// ranges of its STREAM frames, and the FIN if it carried one.
+function quicconnNoteAckedFrames(st: quicconnState, sp: quicconnSent) {
+  for f of sp.frames {
+    let id = quicconnFrameStreamId(f)
+    if (id >= 0 && st.present[id] != 0) {
+      let s = st.streams[id]
+      let n = quicconnFrameStreamLen(f)
+      if (n > 0) {
+        let lo = quicconnFrameStreamLo(f)
+        s.ackedRanges = quicconnMergeRanges(
+          append(s.ackedRanges, quicconnRange{ lo: lo, hi: lo + n - 1 }),
+        )
+      }
+      if (quicconnFrameStreamFin(f)) {
+        s.finAcked = true
+      }
+    }
+  }
+}
+
+// Whether every byte the application queued on `s` has been acknowledged. Bytes,
+// not packets: a lost packet's bytes are retransmitted in a new one, so an
+// already-delivered byte must not keep the stream "undrained" just because the
+// packet that first carried it was never acked.
+function quicconnStreamFullyAcked(s: quicconnStream): bool {
+  if (!s.finAcked) {
+    return false
+  }
+  if (s.sendLen == 0) {
+    return true
+  }
+  for r of s.ackedRanges {
+    if (r.lo <= 0 && r.hi >= s.sendLen - 1) {
+      return true
+    }
+  }
+  return false
+}
+

@@ -1,0 +1,171 @@
+// Bit standard library — quic module, handshake progression.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Handshake progression (drives the #1219 record-bypass TLS handshake)
+// ---------------------------------------------------------------------------
+
+// Advance whichever side's handshake we run, based on freshly reassembled
+// CRYPTO. Idempotent: safe to call after every decrypted packet.
+function quicconnDriveHandshake(st: quicconnState): ()! {
+  if (st.isClient) {
+    quicconnDriveClient(st)?
+    return
+  }
+  quicconnDriveServer(st)?
+}
+
+function quicconnDriveClient(st: quicconnState): ()! {
+  match (st.chOpt) {
+    None => {}
+    Some(h) => {
+      if (!st.serverHelloDone) {
+        let contig = st.iLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgServerHello)
+        if (end > 0) {
+          let resent = h.processServerHelloMessage(contig[0:end])?
+          if (len(resent) > 0) {
+            fail newError("quic: HelloRetryRequest unsupported")
+          }
+          quicconnInstallHandshakeKeys(
+            st,
+            h.cipherSuiteId(),
+            h.clientHandshakeSecret(),
+            h.serverHandshakeSecret(),
+          )
+          st.serverHelloDone = true
+        }
+      }
+      if (st.serverHelloDone && !st.clientFlightSent) {
+        let contig = st.hLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgFinished)
+        if (end > 0) {
+          let finMsg = h.clientReadHandshake(contig[0:end])?
+          quicconnInstallAppKeys(st, h.clientApplicationSecret(), h.serverApplicationSecret())
+          quicconnReadPeerParams(st, h.peerEncryptedExtensions())
+          quicconnQueueCrypto(st, quicconnLvlHandshake, finMsg)
+          st.clientFlightSent = true
+          quicconnBecomeEstablished(st)
+        }
+      }
+    }
+  }
+}
+
+function quicconnDriveServer(st: quicconnState): ()! {
+  match (st.shOpt) {
+    None => {}
+    Some(s) => {
+      if (!st.serverHelloDone) {
+        let contig = st.iLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgClientHello)
+        if (end > 0) {
+          let flight = s.processClientHelloMessage(contig[0:end])?
+          if (flight.retry) {
+            fail newError("quic: HelloRetryRequest unsupported")
+          }
+          quicconnInstallHandshakeKeys(
+            st,
+            s.cipherSuiteId(),
+            s.clientHandshakeSecret(),
+            s.serverHandshakeSecret(),
+          )
+          quicconnInstallAppKeys(st, s.clientApplicationSecret(), s.serverApplicationSecret())
+          quicconnQueueCrypto(st, quicconnLvlInitial, flight.serverHello)
+          quicconnQueueCrypto(st, quicconnLvlHandshake, flight.handshake)
+          st.serverHelloDone = true
+          quicconnBecomeEstablished(st)
+        }
+      }
+      if (st.serverHelloDone && !st.handshakeComplete) {
+        let contig = st.hLevel.crecv.contiguous()
+        let end = quicconnFlightEnd(contig, quicconnMsgFinished)
+        if (end > 0) {
+          let conn = s.processClientFinishedMessage(contig[0:end])?
+          st.handshakeComplete = true
+          st.sendHandshakeDone = true
+        }
+      }
+    }
+  }
+}
+
+// The byte length of `stream` up to and including the first TLS handshake
+// message of type `wantType` (RFC 8446 §4: 1-byte type, 3-byte length), or -1 if
+// no such complete message is present yet. Bounded by `len(stream)`.
+function quicconnFlightEnd(stream: []byte, wantType: int): int {
+  let p = 0
+  let guard = 0
+  while (p + 4 <= len(stream) && guard <= len(stream)) {
+    guard = guard + 1
+    let t = int(stream[p])
+    let mlen = (int(stream[p + 1]) << 16) | (int(stream[p + 2]) << 8) | int(stream[p + 3])
+    let end = p + 4 + mlen
+    if (end > len(stream)) {
+      return -1
+    }
+    if (t == wantType) {
+      return end
+    }
+    p = end
+  }
+  return -1
+}
+
+// Install a non-Initial level's keys from the TLS traffic secrets (RFC 9001
+// §5.1). The client sends with the client secret and receives with the server's;
+// the server is the mirror.
+function quicconnInstallHandshakeKeys(st: quicconnState, suiteId: int, cSec: []byte, sSec: []byte) {
+  st.suiteId = suiteId
+  let kp = levelKeyPair(quicconnNewHash, cSec, sSec, 16)
+  if (st.isClient) {
+    st.hLevel.ksend = kp.client
+    st.hLevel.krecv = kp.server
+  } else {
+    st.hLevel.ksend = kp.server
+    st.hLevel.krecv = kp.client
+  }
+  st.hLevel.haveSend = true
+  st.hLevel.haveRecv = true
+}
+
+function quicconnInstallAppKeys(st: quicconnState, cSec: []byte, sSec: []byte) {
+  let kp = levelKeyPair(quicconnNewHash, cSec, sSec, 16)
+  if (st.isClient) {
+    st.aLevel.ksend = kp.client
+    st.aLevel.krecv = kp.server
+  } else {
+    st.aLevel.ksend = kp.server
+    st.aLevel.krecv = kp.client
+  }
+  st.aLevel.haveSend = true
+  st.aLevel.haveRecv = true
+}
+
+// Adopt the peer's flow-control limits from its quic_transport_parameters
+// extension (RFC 9000 §18.2). The client, sending on a stream it opened, is
+// bounded by the server's initial_max_stream_data_bidi_remote.
+function quicconnReadPeerParams(st: quicconnState, exts: []Extension) {
+  for e of exts {
+    if (e.extType == quicTransportParametersExtension) {
+      let tp = decodeTransportParameters(e.data) catch err {
+        return
+      }
+      st.peerMaxData = int(tp.initialMaxData)
+      st.peerInitStreamData = int(tp.initialMaxStreamDataBidiRemote)
+    }
+  }
+}
+
+// Chunk `data` into CRYPTO frames at offset 0 and queue them for `level` (each
+// level carries a single one-shot flight per direction in this handshake).
+function quicconnQueueCrypto(st: quicconnState, levelIdx: int, data: []byte) {
+  let lvl = quicconnLvl(st, levelIdx)
+  let frs = cryptoFrames(data, 0, 1000)
+  for f of frs {
+    lvl.pending = append(lvl.pending, f)
+  }
+}
+

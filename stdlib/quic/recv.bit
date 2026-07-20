@@ -1,0 +1,296 @@
+// Bit standard library — quic module, the packet receive path.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Receiving
+// ---------------------------------------------------------------------------
+
+// Parse the (possibly coalesced) packets in one datagram (RFC 9000 §12.2), left
+// to right; a short-header 1-RTT packet is always last.
+function quicconnRecvDatagram(st: quicconnState, data: []byte): ()! {
+  let pos = 0
+  let guard = 0
+  while (pos < len(data) && guard <= len(data)) {
+    guard = guard + 1
+    let first = data[pos]
+    if ((first & 0x80) != 0) {
+      let nxt = quicconnRecvLong(st, data, pos)?
+      if (nxt <= pos) {
+        return
+      }
+      pos = nxt
+    } else if ((first & 0x40) != 0) {
+      quicconnRecvShort(st, data, pos)?
+      return
+    } else {
+      return
+    }
+  }
+}
+
+// Parse one long-header packet at `start`, decrypt and process it, and return
+// the offset of the next coalesced packet (RFC 9000 §17.2). A packet whose keys
+// are not yet installed, or that fails to decrypt, is skipped — the peer will
+// retransmit (RFC 9001 §5.4.1 / §5.5).
+function quicconnRecvLong(st: quicconnState, data: []byte, start: int): int! {
+  if (start + 7 > len(data)) {
+    return len(data)
+  }
+  let typ = int((data[start] >> 4) & 0x03)
+  let p = start + 5
+  let dcidLen = int(data[p])
+  p = p + 1
+  if (p + dcidLen + 1 > len(data)) {
+    return len(data)
+  }
+  let dcid = data[p:p + dcidLen]
+  p = p + dcidLen
+  let scidLen = int(data[p])
+  p = p + 1
+  if (p + scidLen > len(data)) {
+    return len(data)
+  }
+  let scid = data[p:p + scidLen]
+  p = p + scidLen
+  if (typ == longInitial) {
+    let r = quicfrReader{ data: data, pos: p }
+    let tokLen = int(quicfrReadVarint(r)?)
+    p = r.pos + tokLen
+    if (p > len(data)) {
+      return len(data)
+    }
+  }
+  let r2 = quicfrReader{ data: data, pos: p }
+  let length = int(quicfrReadVarint(r2)?)
+  let pnOffset = r2.pos
+  let packetEnd = pnOffset + length
+  if (packetEnd > len(data)) {
+    return len(data)
+  }
+  let levelIdx = -1
+  if (typ == longInitial) {
+    levelIdx = quicconnLvlInitial
+  } else if (typ == longHandshake) {
+    levelIdx = quicconnLvlHandshake
+  } else {
+    return packetEnd
+  }
+  if (!st.isClient && levelIdx == quicconnLvlInitial && !st.iLevel.haveRecv) {
+    quicconnServerInitKeys(st, dcid, scid)
+  }
+  if (st.isClient && !st.dcidSwitched && scidLen > 0) {
+    st.dcid = quicconnCopyBytes(scid)
+    st.dcidSwitched = true
+  }
+  let lvl = quicconnLvl(st, levelIdx)
+  if (!lvl.haveRecv) {
+    return packetEnd
+  }
+  quicconnDecryptAndProcess(st, levelIdx, data, start, pnOffset, packetEnd)?
+  return packetEnd
+}
+
+// Parse and process the trailing short-header (1-RTT) packet at `start` (RFC
+// 9000 §17.3). Its DCID length is our own issued id length.
+function quicconnRecvShort(st: quicconnState, data: []byte, start: int): ()! {
+  if (!st.aLevel.haveRecv) {
+    return
+  }
+  let pnOffset = start + 1 + len(st.scid)
+  if (pnOffset + 20 > len(data)) {
+    return
+  }
+  quicconnDecryptAndProcess(st, quicconnLvlApp, data, start, pnOffset, len(data))?
+}
+
+// Server-only: derive Initial keys from the client-chosen DCID carried in the
+// clear on its first Initial (RFC 9001 §5.2), and adopt the client's SCID as the
+// destination for replies.
+function quicconnServerInitKeys(st: quicconnState, dcid: []byte, scid: []byte) {
+  st.origDcid = quicconnCopyBytes(dcid)
+  st.dcid = quicconnCopyBytes(scid)
+  st.dcidSwitched = true
+  st.iLevel.ksend = serverInitialKeys(dcid)
+  st.iLevel.krecv = clientInitialKeys(dcid)
+  st.iLevel.haveSend = true
+  st.iLevel.haveRecv = true
+}
+
+// Remove header protection, decrypt, and process one packet's frames (RFC 9001
+// §5.4.1 / §5.3). Works on a copy of the packet so in-place unmasking never
+// disturbs the shared datagram buffer. Undecryptable packets are dropped.
+function quicconnDecryptAndProcess(
+  st: quicconnState,
+  levelIdx: int,
+  data: []byte,
+  start: int,
+  pnOffset: int,
+  packetEnd: int,
+): ()! {
+  let lvl = quicconnLvl(st, levelIdx)
+  let pkt = quicconnCopyRange(data, start, packetEnd)
+  let pnOffLocal = pnOffset - start
+  if (pnOffLocal + 20 > len(pkt)) {
+    return
+  }
+  let sample = pkt[pnOffLocal + 4:pnOffLocal + 20]
+  let mask = aesHeaderMask(lvl.krecv.hp, sample)?
+  let pnLen = removeHeaderProtection(pkt, pnOffLocal, mask)?
+  let trunc = 0
+  let i = 0
+  while (i < pnLen) {
+    trunc = (trunc << 8) | int(pkt[pnOffLocal + i])
+    i = i + 1
+  }
+  let fullPn = quicconnDecodePn(lvl.largestRecvPn, trunc, pnLen)
+  let aadEnd = pnOffLocal + pnLen
+  let header = pkt[0:aadEnd]
+  let ct = pkt[aadEnd:len(pkt)]
+  let pt = unprotectPayload(lvl.krecv, u64(fullPn), header, ct) catch e {
+    return
+  }
+  if (fullPn > lvl.largestRecvPn) {
+    lvl.largestRecvPn = fullPn
+  }
+  quicconnRecordPn(lvl, fullPn)
+  let frames = parseFrames(pt) catch e {
+    return
+  }
+  let elicit = false
+  for f of frames {
+    if (quicconnIsAckEliciting(f)) {
+      elicit = true
+    }
+    quicconnHandleFrame(st, levelIdx, f)?
+  }
+  if (elicit) {
+    lvl.ackPending = true
+  }
+  quicconnDriveHandshake(st)?
+}
+
+// Reconstruct a full packet number from its truncated form and the largest one
+// received in the space (RFC 9000 §A.3).
+function quicconnDecodePn(largest: int, truncated: int, pnLen: int): int {
+  let pnWin = 1 << (8 * pnLen)
+  let pnHalf = pnWin / 2
+  let expected = largest + 1
+  let base = expected - expected % pnWin
+  let cand = base + truncated
+  if (cand + pnHalf <= expected && cand + pnWin < (1 << 62)) {
+    return cand + pnWin
+  }
+  if (cand > expected + pnHalf && cand >= pnWin) {
+    return cand - pnWin
+  }
+  return cand
+}
+
+// Fold one received frame into connection state.
+function quicconnHandleFrame(st: quicconnState, levelIdx: int, f: Frame): ()! {
+  match (f) {
+    Padding(n) => {}
+    Ping => {}
+    Ack(a) => { quicconnProcessAck(st, levelIdx, a) }
+    ResetStream(id, code, size) => {}
+    StopSending(id, code) => {}
+    Crypto(offset, cdata) => { quicconnLvl(st, levelIdx).crecv.insert(offset, cdata)? }
+    NewToken(token) => {}
+    Stream(s) => { quicconnOnStream(st, s)? }
+    MaxData(m) => {
+      if (int(m) > st.peerMaxData) {
+        st.peerMaxData = int(m)
+        st.dataBlockedSignaled = false
+      }
+    }
+    MaxStreamData(id, m) => { quicconnOnMaxStreamData(st, int(id), int(m)) }
+    MaxStreams(bidi, m) => {}
+    DataBlocked(m) => {}
+    StreamDataBlocked(id, m) => {}
+    StreamsBlocked(bidi, m) => {}
+    NewConnectionId(seq, retire, cid, token) => {}
+    RetireConnectionId(seq) => {}
+    PathChallenge(d) => { st.aLevel.pending = append(st.aLevel.pending, Frame.PathResponse(d)) }
+    PathResponse(d) => {}
+    ConnectionClose(code, ft, reason) => { st.running = false }
+    ApplicationClose(code, reason) => { st.running = false }
+    HandshakeDone => { st.handshakeComplete = true }
+  }
+}
+
+function quicconnOnMaxStreamData(st: quicconnState, id: int, m: int) {
+  if (st.present[id] == 0) {
+    return
+  }
+  let s = st.streams[id]
+  if (m > s.peerMaxStreamData) {
+    s.peerMaxStreamData = m
+    s.blockedSignaled = false
+  }
+}
+
+// Accept a STREAM frame (RFC 9000 §19.8): create the stream on first sight,
+// enqueue it for `acceptStream`, reassemble the data, and deliver any newly
+// contiguous prefix.
+function quicconnOnStream(st: quicconnState, s: StreamFrame): ()! {
+  let id = int(s.id)
+  if (st.present[id] == 0) {
+    let ns = quicconnNewStream(st, id, true)
+    st.streams[id] = ns
+    st.present[id] = 1
+    if (st.hasAcceptWaiter) {
+      st.acceptWaiter <- quicconnOpenReply{ id: id, recvCh: ns.recvCh }
+      st.hasAcceptWaiter = false
+    } else {
+      st.acceptQueue = append(st.acceptQueue, id)
+    }
+  }
+  let str = st.streams[id]
+  str.recvAsm.insert(s.offset, s.data)?
+  if (s.fin) {
+    str.recvFinalSize = int(s.offset) + len(s.data)
+  }
+  quicconnDeliverStream(st, str)
+}
+
+// Hand any newly contiguous received bytes to the application and advance the
+// receive flow-control window (auto-tuning, RFC 9000 §4.1). When the FIN arrives
+// after the last data was already delivered (an empty STREAM frame at the final
+// offset, or a FIN reordered ahead of nothing), emit a trailing empty
+// `fin = true` chunk so the reader still sees the end of stream.
+function quicconnDeliverStream(st: quicconnState, str: quicconnStream) {
+  let contig = str.recvAsm.contiguousLen()
+  if (contig > str.recvDelivered) {
+    let all = str.recvAsm.contiguous()
+    let chunk = quicconnCopyRange(all, str.recvDelivered, contig)
+    let n = contig - str.recvDelivered
+    let isFin = str.recvFinalSize >= 0 && contig == str.recvFinalSize
+    str.recvDelivered = contig
+    st.dataConsumed = st.dataConsumed + n
+    str.recvCh <- StreamChunk{ data: chunk, fin: isFin }
+    if (isFin) {
+      str.finDelivered = true
+    }
+    quicconnMaybeExtendWindows(st, str)
+  }
+  if (!str.finDelivered && str.recvFinalSize >= 0 && str.recvDelivered >= str.recvFinalSize) {
+    str.finDelivered = true
+    str.recvCh <- StreamChunk{ data: []byte(0), fin: true }
+  }
+}
+
+// Keep the advertised windows a full `quicconnFlowWindow` ahead of what has been
+// consumed, queuing MAX_DATA / MAX_STREAM_DATA when they cross the midpoint.
+function quicconnMaybeExtendWindows(st: quicconnState, str: quicconnStream) {
+  if (str.localMaxStreamData - str.recvDelivered < quicconnFlowWindow / 2) {
+    str.localMaxStreamData = str.recvDelivered + quicconnFlowWindow
+    str.needMaxStreamData = true
+  }
+  if (st.localMaxData - st.dataConsumed < quicconnFlowWindow / 2) {
+    st.localMaxData = st.dataConsumed + quicconnFlowWindow
+    st.needMaxData = true
+  }
+}
+

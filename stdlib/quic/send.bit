@@ -1,0 +1,273 @@
+// Bit standard library — quic module, the packet send path.
+//
+// Split out of `conn.bit` (#1503) to keep files readable; `stdlib/quic` is one
+// flat module, so this file shares that file's imports and namespace.
+
+// ---------------------------------------------------------------------------
+// Sending
+// ---------------------------------------------------------------------------
+
+function quicconnSendDatagram(st: quicconnState, dg: []byte): ()! {
+  if (!st.havePeer || len(dg) == 0) {
+    return
+  }
+  st.sock.send(st.peerHost, st.peerPort, string(dg))?
+}
+
+// Flush anything pending: coalesced Initial+Handshake datagrams, then 1-RTT.
+function quicconnFlush(st: quicconnState): ()! {
+  if (!st.havePeer) {
+    return
+  }
+  quicconnFlushHandshake(st)?
+  if (st.aLevel.haveSend) {
+    quicconnFlushApp(st)?
+  }
+}
+
+// Send the Initial and Handshake levels, coalescing the two long-header packets
+// into one datagram per round so the client always processes the ServerHello
+// (which installs Handshake keys) before the Handshake packet beside it.
+function quicconnFlushHandshake(st: quicconnState): ()! {
+  let guard = 0
+  while (guard < 100) {
+    guard = guard + 1
+    let dg = []byte(0)
+    let any = false
+    if (quicconnLevelHasWork(st.iLevel) && st.iLevel.haveSend) {
+      let pkt = quicconnBuildCryptoPacket(st, quicconnLvlInitial)?
+      dg = quicpktPutBytes(dg, pkt)
+      any = true
+    }
+    if (quicconnLevelHasWork(st.hLevel) && st.hLevel.haveSend) {
+      let pkt = quicconnBuildCryptoPacket(st, quicconnLvlHandshake)?
+      dg = quicpktPutBytes(dg, pkt)
+      any = true
+    }
+    if (!any) {
+      break
+    }
+    quicconnSendDatagram(st, dg)?
+  }
+}
+
+// The unprotected header for a CRYPTO-level packet (Initial or Handshake).
+function quicconnCryptoHeader(st: quicconnState, levelIdx: int, length: int, pn: int): []byte {
+  if (levelIdx == quicconnLvlInitial) {
+    return encodeInitialHeader(
+      st.version,
+      st.dcid,
+      st.scid,
+      []byte(0),
+      u64(length),
+      u64(pn),
+      quicconnPnLen,
+    )
+  }
+  return quicconnEncodeHsHeader(st.version, st.dcid, st.scid, length, pn)
+}
+
+// A Handshake long header (RFC 9000 §17.2.4): long-form ‖ fixed ‖ type 2 ‖
+// pn-length bits, then version, the two connection ids, Length, and packet
+// number. No token (that is Initial-only).
+function quicconnEncodeHsHeader(
+  version: int,
+  dcid: []byte,
+  scid: []byte,
+  length: int,
+  pn: int,
+): []byte {
+  let first = 0xe0 | ((quicconnPnLen - 1) & 0x03)
+  let out = []byte(0)
+  out = append(out, byte(first))
+  out = quicpktPutU32(out, version)
+  out = append(out, byte(len(dcid)))
+  out = quicpktPutBytes(out, dcid)
+  out = append(out, byte(len(scid)))
+  out = quicpktPutBytes(out, scid)
+  out = quicpktPutBytes(out, encodeVarint(u64(length)))
+  return quicpktPutBytes(out, encodePacketNumber(u64(pn), quicconnPnLen))
+}
+
+// Build one protected Initial/Handshake packet: bundle a pending ACK, drain the
+// crypto queue up to budget, pad a client Initial carrying CRYPTO to the 1200
+// floor, then seal and header-protect. Records the packet for loss recovery.
+function quicconnBuildCryptoPacket(st: quicconnState, levelIdx: int): []byte! {
+  let lvl = quicconnLvl(st, levelIdx)
+  let frames = []Frame(0)
+  if (lvl.ackPending && len(lvl.recvRanges) > 0) {
+    frames = append(frames, quicconnBuildAck(lvl))
+    lvl.ackPending = false
+  }
+  let pend = quicconnTakePending(lvl, quicconnFrameBudget)
+  for f of pend {
+    frames = append(frames, f)
+  }
+  if (levelIdx == quicconnLvlInitial && st.isClient && quicconnFramesHaveCrypto(frames)) {
+    let plLen = quicconnFramesLen(frames)
+    if (plLen < quicconnInitialPad) {
+      frames = append(frames, Frame.Padding(quicconnInitialPad - plLen))
+    }
+  }
+  let payloadLen = quicconnFramesLen(frames)
+  let length = quicconnPnLen + payloadLen + 16
+  let header = quicconnCryptoHeader(st, levelIdx, length, lvl.nextPn)
+  return quicconnSealPacket(st, lvl, frames, header)?
+}
+
+// Seal `frames` under `lvl` behind `header`, apply header protection, advance
+// the packet number, and record the packet if it is ack-eliciting. Returns the
+// finished wire bytes.
+function quicconnSealPacket(
+  st: quicconnState,
+  lvl: quicconnLevel,
+  frames: []Frame,
+  header: []byte,
+): []byte! {
+  let payload = encodeFrames(frames)
+  let pn = lvl.nextPn
+  let pnOffset = len(header) - quicconnPnLen
+  let sealed = protectPayload(lvl.ksend, u64(pn), header, payload)?
+  let packet = quicpktPutBytes(header, sealed)
+  let sample = headerSample(sealed, quicconnPnLen)?
+  let mask = aesHeaderMask(lvl.ksend.hp, sample)?
+  applyHeaderProtection(packet, pnOffset, mask)?
+  lvl.nextPn = pn + 1
+  if (quicconnAnyAckEliciting(frames)) {
+    let now = monotonic()
+    lvl.sent = append(
+      lvl.sent, quicconnSent{
+        pn: pn,
+        timeSent: now,
+        size: len(packet),
+        ackEliciting: true,
+        frames: quicconnRetransFrames(frames),
+      },
+    )
+    st.bytesInFlight = st.bytesInFlight + len(packet)
+    lvl.timeLastAckEliciting = now
+  }
+  return packet
+}
+
+// Send 1-RTT packets while there is work and the congestion window permits new
+// data. ACK-only packets bypass the window; data packets are gated.
+function quicconnFlushApp(st: quicconnState): ()! {
+  let guard = 0
+  while (guard < 100000) {
+    guard = guard + 1
+    let frames = []Frame(0)
+    if (st.aLevel.ackPending && len(st.aLevel.recvRanges) > 0) {
+      frames = append(frames, quicconnBuildAck(st.aLevel))
+      st.aLevel.ackPending = false
+    }
+    frames = quicconnAppendWindowUpdates(st, frames)
+    if (st.sendHandshakeDone) {
+      frames = append(frames, Frame.HandshakeDone)
+      st.sendHandshakeDone = false
+    }
+    let pend = quicconnTakePending(st.aLevel, quicconnFrameBudget - quicconnFramesLen(frames))
+    for f of pend {
+      frames = append(frames, f)
+    }
+    if (st.bytesInFlight + quicconnMaxPacket <= st.cwnd) {
+      let data = quicconnFillStreamFrames(st, quicconnFrameBudget - quicconnFramesLen(frames))
+      for f of data {
+        frames = append(frames, f)
+      }
+    }
+    if (len(frames) == 0) {
+      break
+    }
+    let header = encodeShortHeader(st.dcid, u64(st.aLevel.nextPn), quicconnPnLen, false, false)
+    let packet = quicconnSealPacket(st, st.aLevel, frames, header)?
+    quicconnSendDatagram(st, packet)?
+  }
+}
+
+// Append any due MAX_DATA / MAX_STREAM_DATA window extensions (RFC 9000 §19.9,
+// §19.10) so the peer can keep sending.
+function quicconnAppendWindowUpdates(st: quicconnState, frames: []Frame): []Frame {
+  let out = frames
+  if (st.needMaxData) {
+    out = append(out, Frame.MaxData(u64(st.localMaxData)))
+    st.needMaxData = false
+  }
+  for (id, s) of st.streams {
+    if (s.needMaxStreamData) {
+      out = append(out, Frame.MaxStreamData(u64(id), u64(s.localMaxStreamData)))
+      s.needMaxStreamData = false
+    }
+  }
+  return out
+}
+
+// Fill up to `budget` bytes of new STREAM data from the send buffers, bounded by
+// per-stream and connection flow control (RFC 9000 §4.1). Emits a FIN on the
+// last frame of a finished stream and DATA_BLOCKED / STREAM_DATA_BLOCKED when a
+// window is exhausted with data still to send.
+// The map iteration uses no `break`/`continue`: a `for..of` cursor's implicit
+// advance is skipped by those (a compiler limitation, #1220 finding), so each
+// stream is gated by a `room > 0` check inside the body instead.
+function quicconnFillStreamFrames(st: quicconnState, budget: int): []Frame {
+  let out = []Frame(0)
+  let used = 0
+  for (id, s) of st.streams {
+    let room = budget - used - 24
+    let avail = s.sendLen - s.sendOff
+    if (room > 0 && avail == 0 && s.finQueued && !s.finSent) {
+      out = append(
+        out, Frame.Stream(
+          StreamFrame{
+            id: u64(id),
+            offset: u64(s.sendOff),
+            data: []byte(0),
+            hasOffset: true,
+            hasLength: true,
+            fin: true,
+          },
+        ),
+      )
+      s.finSent = true
+    } else if (room > 0 && avail > 0) {
+      let connCredit = st.peerMaxData - st.dataSent
+      let strCredit = s.peerMaxStreamData - s.sendOff
+      let can = quicconnMin(avail, quicconnMin(connCredit, quicconnMin(strCredit, room)))
+      if (can <= 0) {
+        if (strCredit <= 0 && !s.blockedSignaled) {
+          out = append(out, Frame.StreamDataBlocked(u64(id), u64(s.peerMaxStreamData)))
+          s.blockedSignaled = true
+        }
+        if (connCredit <= 0 && !st.dataBlockedSignaled) {
+          out = append(out, Frame.DataBlocked(u64(st.peerMaxData)))
+          st.dataBlockedSignaled = true
+        }
+      } else {
+        let chunk = s.sendBuf[s.sendOff:s.sendOff + can]
+        let fin = s.finQueued && s.sendOff + can == s.sendLen
+        out = append(
+          out, Frame.Stream(
+            StreamFrame{
+              id: u64(id),
+              offset: u64(s.sendOff),
+              data: chunk,
+              hasOffset: true,
+              hasLength: true,
+              fin: fin,
+            },
+          ),
+        )
+        s.sendOff = s.sendOff + can
+        st.dataSent = st.dataSent + can
+        if (fin) {
+          s.finSent = true
+        }
+        s.blockedSignaled = false
+        st.dataBlockedSignaled = false
+        used = used + can + 24
+      }
+    }
+  }
+  return out
+}
+
