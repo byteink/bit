@@ -105,6 +105,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Test RUN steps that read a runtime archive straight out of
+    // `zig-out/lib/<triple>/` instead of taking it as a build option (#1486).
+    // Those are the seed's own roots — `main.zig`'s E0078/`archiveDefines`
+    // tests, `link.zig`, `link/elf_reader.zig`, `link/macho*.zig` — and they
+    // name the path as a cwd-relative string, so no `addOptionPath` edge exists
+    // to keep what they read fresh. Collected here and wired to every
+    // `libbitrt` install at the tail, once those installs are declared.
+    //
+    // The edge has to land on the RUN step, not on `test_step`: `test_step`
+    // depending on an install only puts both in the same graph, and the build
+    // runner is free to run them concurrently — the harness then reads the
+    // archive mid-install. That is the #1229 shape, and it is why the old
+    // `test_step.dependOn(host_libbitrt_install)` was not enough.
+    var archive_readers: std.ArrayList(*std.Build.Step) = .empty;
+    archive_readers.append(b.allocator, &run_unit_tests.step) catch @panic("OOM");
+
     // Every `seed/` and `runtime/` unit-test root, declared once.
     //
     // Single-sourced deliberately. `tests/testroots.zig` measures which test
@@ -226,7 +242,9 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = r.filters,
         });
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        const t_run = b.addRunArtifact(t);
+        archive_readers.append(b.allocator, &t_run.step) catch @panic("OOM");
+        test_step.dependOn(&t_run.step);
     }
 
     // Orphaned-test-file gate (#1453): fails the build when a `.zig` file under
@@ -816,6 +834,16 @@ pub fn build(b: *std.Build) void {
             .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{triple}) } },
         });
         libbitrt_step.dependOn(&install.step);
+        // Make `zig build test` produce every archive its harnesses read out of
+        // `zig-out/lib/`, not just the host's (#1486). Before this only the host
+        // archive was installed under `test`, so the seed's cross-target tests
+        // read whatever an earlier `zig build libbitrt` happened to leave on
+        // disk: absent on a clean checkout (they self-skip, asserting nothing)
+        // or stale after a runtime edit (they fail, and the failure reads as a
+        // compiler regression). All four targets rather than only the three
+        // read today, so a test that starts reading the fourth is covered by
+        // construction.
+        for (archive_readers.items) |reader| reader.dependOn(&install.step);
 
         if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
             host_libbitrt_bin = lib.getEmittedBin();
@@ -841,12 +869,13 @@ pub fn build(b: *std.Build) void {
     // only emits objects and never links.
     wireLibbitrt(diffimports_opts, host_libbitrt_bin);
 
-    // Still install the host archive under `zig build test` so the CLI-path
-    // end-to-end tests (link.zig, main.zig) that read `zig-out/lib/<triple>/`
-    // keep running rather than self-skipping. Harnesses no longer read that
-    // path — they link the emitted-bin archive above — so this is only for
-    // those `zig-out`-reading tests.
-    if (host_libbitrt_install) |inst| test_step.dependOn(inst);
+    // The CLI-path end-to-end tests (link.zig, main.zig, link/elf_reader.zig,
+    // link/macho*.zig) that read `zig-out/lib/<triple>/` are now ordered after
+    // EVERY archive install by the `archive_readers` loop above, which both
+    // keeps them from self-skipping and keeps them from reading a stale archive
+    // (#1486). It replaces a bare `test_step.dependOn(host_libbitrt_install)`,
+    // which named only the host archive and left the install unordered against
+    // the harness runs.
 
     // The canonical `bit`: the self-hosted bit-in-Bit compiler under `selfhost/`,
     // compiled by the bootstrap seed (`bit-seed`) and installed as `bit`. This is
