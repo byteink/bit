@@ -65,6 +65,15 @@ struct Checker {
   // lowering), so a generic-enum scrutinee `o: Opt<i64>` can recover its type
   // arguments for match-binder substitution.
   declTypeNodes: map<string, int>,
+  // Local name -> the CALL node that initialized it, for an un-annotated
+  // `let found = find<i64>(xs, …)`. A generic INSTANCE type carries no type
+  // arguments (`Option<i64>` and `Option<string>` are one TypeId, deliberately —
+  // carrying them would move --dump-types off seed parity), and `declTypeNodes`
+  // only has an entry when the type was WRITTEN. So a type param reachable only
+  // through `Option<T>` had nothing to bind from and `unwrap(found)` stayed a
+  // bare type param (#1498). Recording the initializer lets the binder re-derive
+  // the instance's type arguments on demand instead.
+  declInitNodes: map<string, int>,
   // Named type -> its decl node, so a forward reference during declTypeOf can
   // reserve+resolve it on first touch (the seed's declTypeOf recursion), giving
   // type ids in source-order touch order (needed for method-name mangling).
@@ -201,7 +210,7 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
     funcSigs: map<string, int>{}, funcDecls: map<string, int>{},
     externFns: map<string, bool>{},
     typeParamConstraints: map<string, int>{},
-    declTypeNodes: map<string, int>{},
+    declTypeNodes: map<string, int>{}, declInitNodes: map<string, int>{},
     typeDecls: map<string, int>{}, genericParamIds: map<int, []int>{},
     moduleId: 0, mods: []Checker(0),
     importedFrom: map<string, ImportOrigin>{}, exports: map<string, bool>{},
@@ -1224,6 +1233,114 @@ function bindTypeParamNodeVsNode(pc: Checker, pnode: int, ac: Checker, anode: in
   return 0
 }
 
+// The concrete type arguments of a generic call's RESULT, when that result is
+// written as the generic instance `wantName<...>`: `find<T>(xs: []T, …): Option<T>`
+// applied to a `[]i64` yields [i64] for wantName "Option". Empty for anything
+// else — a non-generic callee, a result that is not an instance of `wantName`,
+// or any argument that does not resolve to a concrete type.
+//
+// Only the TYPE-based binder runs here, never `bindTypeParamAtCall`: that one
+// can reach back into this function through a binding's initializer, and two
+// functions with same-named locals (`let v = f(w)` / `let w = g(v)`) would make
+// the flat name map a cycle. Type-based binding terminates on the AST alone.
+function callResultTypeArgs(c: Checker, callNode: int, wantName: string): []int {
+  let out = []int(0)
+  let name = typeNodeName(c, kidsOf(c.tree, callNode)[0])
+  if (name == "") {
+    return out
+  }
+  let decl = funcDeclLookup(c, name)
+  if (decl == 0) {
+    return out
+  }
+  // The decl's nodes index its OWN module's tree (see declOwner); an extern is
+  // never generic (SPEC 11.7).
+  let oc = declOwner(c, name)
+  if (isExternDecl(oc.tree, decl)) {
+    return out
+  }
+  let dk = kidsOf(oc.tree, decl)
+  if (dk[2] == 0 || dk[4] == 0) {
+    return out
+  }
+  if (getNode(oc.tree, dk[4]).tag != Tag.GenericInst || typeNodeName(oc, dk[4]) != wantName) {
+    return out
+  }
+  let params = kidsOf(oc.tree, dk[3])
+  let tps = kidsOf(oc.tree, dk[2])
+  let sub = noSubst()
+  let ti = 0
+  while (ti < len(tps)) {
+    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[ti])[0])
+    let tpname = oc.source[tpn.span.start:tpn.span.end]
+    let pi = 0
+    while (pi < len(params)) {
+      let b = bindTypeParamFromNode(oc, kidsOf(oc.tree, params[pi])[1],
+        defaultType(c, checkArgType(c, callNode, pi)), tpname)
+      if (b != 0) {
+        sub.names = append(sub.names, tpname)
+        sub.types = append(sub.types, b)
+        pi = len(params)
+      }
+      pi = pi + 1
+    }
+    ti = ti + 1
+  }
+  let targs = kidsOf(oc.tree, kidsOf(oc.tree, dk[4])[1])
+  let i = 0
+  while (i < len(targs)) {
+    let a = typeFromNodeIn(oc, targs[i], sub)
+    // An unresolved or still-type-param argument is no better than binding
+    // nothing; report NOTHING rather than a wrong answer.
+    if (a == 0 || c.ctx.types[a].kind == TypeKind.TypeParam) {
+      return []int(0)
+    }
+    out = append(out, a)
+    i = i + 1
+  }
+  return out
+}
+
+// Binds `tpname` from a `Name<T>` parameter against an argument that is a local
+// with no written type, by re-deriving the type args of the call that
+// initialized it (#1498). This is the case `bindTypeParamNodeVsNode` cannot
+// reach: it needs the argument's written type node, and `let found = find<i64>(…)`
+// has none. Returns 0 unless the initializer's result is an instance of the same
+// generic the parameter names.
+function bindTypeParamFromInit(pc: Checker, pnode: int, ac: Checker, anode: int, tpname: string): int {
+  if (anode == 0) {
+    return 0
+  }
+  let an = getNode(ac.tree, anode)
+  if (an.tag != Tag.Ident) {
+    return 0
+  }
+  let name = ac.source[an.span.start:an.span.end]
+  let init = 0
+  for (k, v) of ac.declInitNodes {
+    if (k == name) {
+      init = v
+    }
+  }
+  if (init == 0) {
+    return 0
+  }
+  let args = callResultTypeArgs(ac, init, typeNodeName(pc, pnode))
+  let pta = kidsOf(pc.tree, kidsOf(pc.tree, pnode)[1])
+  if (len(pta) != len(args)) {
+    return 0 // arity disagreement: bind nothing rather than bind by luck
+  }
+  let i = 0
+  while (i < len(pta)) {
+    let b = bindTypeParamFromNode(pc, pta[i], args[i], tpname)
+    if (b != 0) {
+      return b
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 // Binds `tpname` from the first call parameter whose type mentions it: a
 // type-based structural match (`[]T`, `map<K,V>`, `T!`) or, for a generic-instance
 // param (`Pair<T>`) whose arg type carries no type-args, a node-vs-node match.
@@ -1237,6 +1354,9 @@ function bindTypeParamAtCall(pc: Checker, ac: Checker, callNode: int, params: []
     let b = bindTypeParamFromNode(pc, pnode, defaultType(ac, checkArgType(ac, callNode, pi)), tpname)
     if (b == 0 && getNode(pc.tree, pnode).tag == Tag.GenericInst) {
       b = bindTypeParamNodeVsNode(pc, pnode, ac, argTypeNode(ac, callArgNode(ac, callNode, pi)), tpname)
+      if (b == 0) {
+        b = bindTypeParamFromInit(pc, pnode, ac, callArgNode(ac, callNode, pi), tpname)
+      }
     }
     if (b != 0) {
       return b
@@ -2620,6 +2740,11 @@ function checkBinding(c: Checker, node: int) {
     }
     if (tnode != 0) {
       c.declTypeNodes[bname] = tnode
+    }
+    // No written type: remember the initializing CALL so a later generic call
+    // taking this binding can re-derive the instance type-args it needs (#1498).
+    if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.Call) {
+      c.declInitNodes[bname] = init
     }
   }
 }
