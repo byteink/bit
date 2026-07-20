@@ -14,6 +14,15 @@
 set -u
 SEED=zig-out/bin/bit-seed
 BIT2=zig-out/bin/bit
+
+# A missing compiler must ABORT, never score a vacuous green (#1514). `run` execs
+# through perl, and a FAILED exec still exits 0 — so an absent compiler yields
+# rc=0 with seed == b2 == "", and every truncation scores MATCH. Measured: 6642
+# MATCH, exit 0, no compiler on disk. Exit 2 to stay distinct from a divergence.
+for bin in "$SEED" "$BIT2"; do
+  [ -x "$bin" ] || { echo "fuzzdiff: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+done
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 # Alarm-guarded run: kills a hung child after 5s (macOS has no `timeout`).

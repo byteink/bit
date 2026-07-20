@@ -12,6 +12,15 @@
 set -u
 SEED=zig-out/bin/bit-seed
 BIT2=zig-out/bin/bit
+
+# A missing compiler must ABORT, never score a vacuous green (#1514). This gate
+# is the worst of the family without it: both sides render empty, and since it
+# skips nothing every file scores MATCH — a full green board from no compiler.
+# Exit 2 to keep this distinct from a real divergence (exit 1).
+for bin in "$SEED" "$BIT2"; do
+  [ -x "$bin" ] || { echo "diffdiags: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+done
+
 match=0 mismatch=0 firstbad=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
   seed=$("$SEED" --dump-diags "$f" 2>/dev/null)

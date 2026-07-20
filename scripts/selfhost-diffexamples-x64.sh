@@ -49,4 +49,12 @@ for d in examples/*/; do
   fi
 done
 echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused SEED-FAIL=$seedfail SCP-FAIL=$scpfail SKIP(unported)=$skipped"
+
+# A phase that measured nothing must not pass (#1514). On an empty corpus the
+# loop runs zero comparisons and every counter below is 0 for the wrong reason.
+if [ "$pass" -lt 1 ]; then
+  echo "FATAL: the x86_64 example differential compared nothing (PASS=$pass)." >&2
+  exit 2
+fi
+
 [ "$diff" -eq 0 ] && [ "$seedfail" -eq 0 ] && [ "$refused" -eq 0 ] && [ "$scpfail" -eq 0 ]

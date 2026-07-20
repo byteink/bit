@@ -11,6 +11,14 @@
 set -u
 SEED=zig-out/bin/bit-seed
 BIT2=zig-out/bin/bit
+
+# A missing compiler must ABORT, never score a vacuous green (#1514): both sides
+# of the differential would produce empty output, and equal-empty compares as
+# agreement. Exit 2 to keep this distinct from a real divergence (exit 1).
+for bin in "$SEED" "$BIT2"; do
+  [ -x "$bin" ] || { echo "difftokens: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+done
+
 match=0 mismatch=0 skip=0 firstbad=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
   seed=$("$SEED" --dump-tokens "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
