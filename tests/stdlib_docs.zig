@@ -65,6 +65,66 @@ test "hasSection matches a symbol heading, not a prefix or a mention" {
     try testing.expect(!hasSection(md, "coun")); // prefix of a heading
 }
 
+// #1528: `Checker.substMethod` and `TypeContext.reinstantiate` build an
+// instantiation's method set from the template's, and both used to drop
+// `Method.exported`. `doc.zig` filters on that flag, so an `export`ed method
+// vanished from the docs of any symbol whose type is an INSTANCE rather than
+// the template — i.e. an exported alias of a generic instantiation.
+//
+// No stdlib module declares such an alias today, so the whole walk above cannot
+// see this. The fixture is written to a scratch module of its own (the pattern
+// `tests/docs.zig` uses) rather than checked in, so it stays invisible to the
+// harnesses that scan `tests/` for Bit sources.
+test "an exported method survives instantiation into the docs (#1528)" {
+    const gpa = testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    const scratch = try std.fmt.allocPrint(gpa, "/tmp/bit-docexport-{x}", .{testing.random_seed});
+    defer gpa.free(scratch);
+    Dir.cwd().deleteTree(io, scratch) catch {};
+    try Dir.cwd().createDirPath(io, scratch);
+    defer Dir.cwd().deleteTree(io, scratch) catch {};
+
+    const main_path = try std.fs.path.join(gpa, &.{ scratch, "main.bit" });
+    defer gpa.free(main_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data =
+        \\export struct Box<T> {
+        \\  v: T
+        \\}
+        \\
+        \\export function (b: Box<T>) get(): T {
+        \\  return b.v
+        \\}
+        \\
+        \\function (b: Box<T>) hidden(): T {
+        \\  return b.v
+        \\}
+        \\
+        \\export type IntBox = Box<i64>
+        \\
+    });
+
+    var report: Io.Writer.Allocating = .init(gpa);
+    defer report.deinit();
+    var d = (try bit.doc.moduleDoc(gpa, io, scratch, build_options.stdlib_dir, &report.writer)) orelse {
+        std.debug.print("fixture does not compile:\n{s}\n", .{report.written()});
+        return error.FixtureFailed;
+    };
+    defer d.deinit();
+
+    var template_get = false;
+    var instance_get = false;
+    var hidden = false;
+    for (d.symbols) |s| {
+        if (std.mem.eql(u8, s.name, "Box.get")) template_get = true;
+        if (std.mem.eql(u8, s.name, "IntBox.get")) instance_get = true;
+        if (std.mem.endsWith(u8, s.name, ".hidden")) hidden = true;
+    }
+    try testing.expect(template_get); // the control: the template always worked
+    try testing.expect(instance_get); // the regression: dropped before #1528
+    try testing.expect(!hidden); // a private method is still no public surface
+}
+
 test "every exported stdlib symbol has a docs/stdlib section" {
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();

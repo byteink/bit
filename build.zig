@@ -577,7 +577,12 @@ pub fn build(b: *std.Build) void {
     stdlib_docs_mod.addOptions("build_options", docs_opts);
 
     const stdlib_docs_tests = b.addTest(.{ .root_module = stdlib_docs_mod });
-    test_step.dependOn(&b.addRunArtifact(stdlib_docs_tests).step);
+    const stdlib_docs_run = b.addRunArtifact(stdlib_docs_tests);
+    // #1528's fixture is written to /tmp at run time, invisible to the build
+    // cache — same reason as lintcmd, rootpins and diffimports.
+    stdlib_docs_run.has_side_effects = true;
+    b.step("test-stdlib-docs", "run the stdlib doc-coverage gate only (tests/stdlib_docs.zig)").dependOn(&stdlib_docs_run.step);
+    test_step.dependOn(&stdlib_docs_run.step);
 
     // AST tag-set parity (#1420): seed and selfhost must declare the same node
     // tags, each parser-reachable. #1418's `ParamRest` false positive — selfhost

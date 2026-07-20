@@ -972,9 +972,9 @@ pub const TypeContext = struct {
                     .name = m.name,
                     .params = try dupe(self.arena(), TypeId, mp),
                     .variadic = m.variadic,
-                    // `exported` is left at its default, matching `Checker`'s
-                    // `substMethod` — the two instance-population paths must
-                    // agree (see #1528 on which of them is right).
+                    // Carried, matching `Checker.substMethod` — the two
+                    // instance-population paths must agree (#1528).
+                    .exported = m.exported,
                     .result = try self.subst(m.result, env2, depth + 1),
                 };
                 // Re-fetched per method: interning above can grow the map.
@@ -1477,6 +1477,12 @@ const Checker = struct {
             .params = try dupe(self.ctx.arena(), TypeId, params),
             .variadic = m.variadic,
             .result = try self.subst(m.result, env, 0),
+            // Substituting a signature does not change who may call it: an
+            // `export`ed method stays part of the public surface on every
+            // instantiation (#1528). `Method.exported` is read only by doc.zig,
+            // and methods live in a side bucket rather than in the type itself,
+            // so carrying it cannot move type identity or interning.
+            .exported = m.exported,
         };
     }
 
