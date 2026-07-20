@@ -1409,6 +1409,37 @@ function bindTypeParamFromNode(pc: Checker, paramNode: int, argType: int, tpname
   if (pn.tag == Tag.Fallible && at.kind == TypeKind.Fallible) {
     return bindTypeParamFromNode(pc, pk[0], at.result, tpname)
   }
+  // `o: Opt<T>` against a concrete `Opt<string>` (#1560). Every other type
+  // constructor above descends into the argument's TYPE; a nominal generic
+  // could not, because before per-instantiation identity the argument type
+  // carried no arguments to descend into. `nominalArgsOf` now recovers them
+  // from the instantiation ledger, so this is the same structural recursion,
+  // not another syntactic recovery arm — which is why the shapes #1566 lists
+  // (a variant construction, a field read) all bind through one change rather
+  // than one arm each.
+  //
+  // Two guards, both THE SAFETY RULE. The argument must be a real
+  // INSTANTIATION — `typeInstOfResult` finding a ledger entry — not a template:
+  // a template's `nominalArgsOf` answers its own bare parameters, so descending
+  // into one binds `T := T` and returns a useless non-zero that short-circuits
+  // the syntactic fallbacks in `bindTypeParamAtCall` which used to answer here
+  // (that regressed `okOr(e, 0)` in tests/imports/coreopt to E0053). And the
+  // base NAME must match, since binding `Opt<T>` against a `Box<string>` would
+  // be a guess. Anything else returns 0 and leaves the old path in charge.
+  if (pn.tag == Tag.GenericInst && at.hasName && typeNodeName(pc, pk[0]) == at.name &&
+      typeInstOfResult(pc.ctx, argType) >= 0) {
+    let targs = kidsOf(pc.tree, pk[1])
+    let aargs = nominalArgsOf(pc, argType)
+    let i = 0
+    while (i < len(targs) && i < len(aargs)) {
+      let b = bindTypeParamFromNode(pc, targs[i], aargs[i], tpname)
+      if (b != 0) {
+        return b
+      }
+      i = i + 1
+    }
+    return 0
+  }
   // `f: (T) => U` against a concrete `(i64) => i64`. Without this a type param
   // reachable ONLY through a function-typed parameter — `U` in
   // `mapped<T, U>(xs: []T, f: (T) => U): []U` — can never bind. Func params live
@@ -2312,12 +2343,9 @@ function checkCall(c: Checker, node: int): int {
     }
     let mk = kidsOf(c.tree, callee)
     // Enum variant constructor `Enum.Variant(...)` / `Enum<T>.Variant(...)`.
-    let baseName = typeNodeName(c, mk[0])
-    if (baseName != "") {
-      let ut = userTypeLookup(c, baseName)
-      if (ut != 0 && c.ctx.types[ut].kind == TypeKind.Enum) {
-        return ut
-      }
+    let et = enumReceiverType(c, mk[0])
+    if (et != 0) {
+      return et
     }
     // Method call `recv.method(...)` -> the method's declared result. A
     // constrained type parameter dispatches through its constraint interface.
@@ -2919,8 +2947,14 @@ function typeMatchBinders(c: Checker, node: int) {
   if (subjectTy == 0 || c.ctx.types[subjectTy].kind != TypeKind.Enum) {
     return
   }
-  // A generic enum's payloads are bare type params; resolve them against the
-  // scrutinee's concrete arguments (`Opt<i64>.Some(v)` binds `v` at i64).
+  // `variantPayloadTypes` answers off the subject's own TypeId, and a generic
+  // enum's INSTANTIATION carries its payloads already substituted (#1560), so
+  // `Opt<i64>.Some(v)` binds `v` at i64 with no reference to the scrutinee's
+  // syntax at all. `scrutineeTypeArgs` survives only as the fallback for the
+  // subjects that still have no instantiation to read — chiefly an IMPORTED
+  // generic enum, which `instantiateNamed` deliberately leaves at its base
+  // template, and that covers the prelude's `Option`/`Result`. See
+  // `resolvedPayloadType`.
   let typeArgs = scrutineeTypeArgs(c, k[0])
   for arm of kidsOf(c.tree, k[1]) {
     let pat = kidsOf(c.tree, arm)[0]
@@ -2936,7 +2970,7 @@ function typeMatchBinders(c: Checker, node: int) {
     let binders = kidsOf(c.tree, vp[1])
     let i = 0
     while (i < len(binders) && i < len(ptypes)) {
-      envBind(c, binders[i], substPayloadType(c, subjectTy, ptypes[i], typeArgs))
+      envBind(c, binders[i], resolvedPayloadType(c, subjectTy, ptypes[i], typeArgs))
       i = i + 1
     }
   }
@@ -3097,16 +3131,44 @@ function substFieldType(c: Checker, structTy: int, ty: int, typeArgs: []int): in
   return substType(c, ty, structTypeEnv(c, structTy, typeArgs), 0)
 }
 
+// The enum type a variant access/construction receiver `Enum` / `Enum<T>`
+// denotes, or 0 when the receiver does not name an enum at all.
+//
+// `Enum<T>` resolves through `typeFromNode`, so it lands on the INSTANTIATION
+// rather than the base template (#1560). Before this, `Opt<string>.Some("s")`
+// typed as the bare `Opt` and every consumer had to recover `string` from the
+// receiver's syntax through `scrutineeTypeArgs` — the recovery table this
+// ticket exists to retire. With the instantiation's id in hand the payload
+// types come off `ctx.variantPayloads` already substituted.
+//
+// THE SAFETY RULE: any receiver that does not resolve to an enum type falls
+// back to the base lookup, which is exactly the id this returned before.
+function enumReceiverType(c: Checker, recv: int): int {
+  let baseName = typeNodeName(c, recv)
+  if (baseName == "") {
+    return 0
+  }
+  let ut = userTypeLookup(c, baseName)
+  if (ut == 0 || c.ctx.types[ut].kind != TypeKind.Enum) {
+    return 0
+  }
+  if (getNode(c.tree, recv).tag != Tag.GenericInst) {
+    return ut
+  }
+  let inst = typeFromNode(c, recv)
+  if (inst == 0 || c.ctx.types[inst].kind != TypeKind.Enum) {
+    return ut
+  }
+  return inst
+}
+
 function checkMember(c: Checker, node: int): int {
   let kids = kidsOf(c.tree, node)
   let recv = kids[0]
   // Enum-variant access `Enum.Variant` / `Enum<T>.Variant` -> the enum type.
-  let baseName = typeNodeName(c, recv)
-  if (baseName != "") {
-    let ut = userTypeLookup(c, baseName)
-    if (ut != 0 && c.ctx.types[ut].kind == TypeKind.Enum) {
-      return ut
-    }
+  let et = enumReceiverType(c, recv)
+  if (et != 0) {
+    return et
   }
   // `ns.member` — an exported const, module state or function of the namespaced
   // module, bound under the dotted key. Consulted before the receiver is typed:
@@ -3580,12 +3642,17 @@ function resolveStructFields(c: Checker, node: int, sname: string) {
   }
 }
 
-// Interns an enum's variant payload types (in variant then payload order) for
-// their id side effects — matching the seed's buildEnumTemplate — and records on
-// the type whether any variant carries a payload (so the value is boxed), which
-// codegen reads to classify GC references. Variant info itself is read back from
-// the decl node — see registerNamedType, which records the module that node
-// indexes into so an importer can find the right tree.
+// Interns an enum's variant payload types (in variant then payload order) —
+// matching the seed's buildEnumTemplate — records on the type whether any
+// variant carries a payload (so the value is boxed), which codegen reads to
+// classify GC references, and stores each variant's payload types in
+// `ctx.variantPayloads` under the TEMPLATE's id.
+//
+// The template's entry holds the declaration's own bare type params; an
+// instantiation gets its own substituted entry from `fillInstMembers`. This is
+// the seed's `buildEnumTemplate` -> `instantiateRecursive` split. Interning
+// order is unchanged: the ids still come from `typeFromNode` in the same walk,
+// so recording them costs no new id.
 function resolveEnumPayloads(c: Checker, node: int, enumTy: int) {
   let vs = kidsOf(c.tree, kidsOf(c.tree, node)[2])
   let i = 0
@@ -3594,11 +3661,14 @@ function resolveEnumPayloads(c: Checker, node: int, enumTy: int) {
     if (payload != 0) {
       c.ctx.types[enumTy].enumBoxed = true
       let types = kidsOf(c.tree, payload)
+      let ptypes = []int(0)
       let j = 0
       while (j < len(types)) {
-        typeFromNode(c, types[j])
+        ptypes = append(ptypes, typeFromNode(c, types[j]))
         j = j + 1
       }
+      let vn = getNode(c.tree, kidsOf(c.tree, vs[i])[0])
+      c.ctx.variantPayloads["${enumTy}." + c.source[vn.span.start:vn.span.end]] = ptypes
     }
     i = i + 1
   }
