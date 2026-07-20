@@ -32,41 +32,34 @@ function canStartType(k: Kind): bool {
 }
 
 // A `[`-led primary: a `[]T`/`[N]T` type used as a value (conversion/composite
-// callee, e.g. `[]byte(x)`), or a slice literal `[a, b, c]`. Uses lookahead
-// rather than the seed's speculation: `[]T` opens a slice type, `[N]T` (int,
-// `]`, type-start) an array type, else it is a slice literal.
-//
-// The element type is what distinguishes `[]T` from the EMPTY slice literal
-// `[]`: a slice type must name one, so a token after `]` that cannot start a
-// type means there is no element type and this is `[]`. The seed reaches the
-// same answer by speculating and falling back (`trySliceOrArrayTypePrimary`
-// commits only on a following `{`/`(`). Without this guard `let xs: []string =
-// []` consumed the NEXT statement as its element type (#1441).
+// callee, e.g. `[]byte(x)`), or a slice literal `[a, b, c]`. Lookahead picks the
+// shape (`bracketOpensType`) and speculation confirms it, matching the seed on
+// both counts.
 function parseBracketPrimary(p: Parser): int {
   // The `[` bounds these types and is not a kid — same explicit-Span rule as
   // parseSliceOrArrayType below.
   let open = peekTok(p)
-  if (peekKindAt(p, 1) == Kind.RBracket && canStartType(peekKindAt(p, 2))) {
-    advance(p)
-    advance(p)
-    let elem = parseType(p)
-    return addNode(p.tree, Tag.SliceType,
-      Span{ file: 0, start: open.start, end: getNode(p.tree, elem).span.end }, 0, [elem])
-  }
-  if (peekKindAt(p, 1) == Kind.IntLit && peekKindAt(p, 2) == Kind.RBracket &&
-    canStartType(peekKindAt(p, 3))) {
-    advance(p)
-    let size = leaf(p, Tag.IntLit)
-    advance(p)
-    let elem = parseType(p)
-    return addNode(p.tree, Tag.ArrayType,
-      Span{ file: 0, start: open.start, end: getNode(p.tree, elem).span.end }, 0, [size, elem])
+  if (bracketOpensType(p)) {
+    // The lookahead above decides the SHAPE; the seed additionally requires the
+    // whole `[]T{…}` / `[]T(…)` to parse CLEANLY, because its `fail` aborts
+    // speculation, so one diagnostic anywhere inside re-parses the `[` as a bare
+    // slice literal. Mirror that with the mark/dmark idiom (as `catch` binds do):
+    // on truncated input the body never closes, and without this the two
+    // compilers report entirely different parses (#1515).
+    let mark = p.pos
+    let dmark = len(p.diags.list)
+    let node = parseSliceOrArrayTypePrimary(p, open)
+    if (len(p.diags.list) == dmark) {
+      return node
+    }
+    truncateDiags(p.diags, dmark)
+    p.pos = mark
   }
   // Both brackets bound the literal and neither is a kid, so `mkNode` would span
   // `1, 2, 3` where the seed spans `[1, 2, 3]`.
   advance(p)
   let items = []int(0)
-  while (peekKind(p) != Kind.RBracket && peekKind(p) != Kind.Eof) {
+  while (!atListClose(p, Kind.RBracket)) {
     items = append(items, parseArgItem(p))
     if (!accept(p, Kind.Comma)) {
       break
@@ -76,6 +69,60 @@ function parseBracketPrimary(p: Parser): int {
   expect(p, Kind.RBracket)
   return addNode(p.tree, Tag.SliceLit,
     Span{ file: 0, start: open.start, end: rbEnd }, 0, items)
+}
+
+// Does the `[` at the cursor open a slice/array TYPE rather than a slice literal?
+// The element type is what distinguishes `[]T` from the EMPTY literal `[]`: a
+// slice type must name one, so a token after `]` that cannot start a type means
+// this is `[]`. Without this guard `let xs: []string = []` consumed the NEXT
+// statement as its element type (#1441).
+function bracketOpensType(p: Parser): bool {
+  if (peekKindAt(p, 1) == Kind.RBracket && canStartType(peekKindAt(p, 2))) {
+    return true
+  }
+  return peekKindAt(p, 1) == Kind.IntLit && peekKindAt(p, 2) == Kind.RBracket &&
+    canStartType(peekKindAt(p, 3))
+}
+
+// `[]T` / `[N]T` in value position, plus the `{…}` composite body or `(…)`
+// conversion that may follow it (the seed's `trySliceOrArrayTypePrimary`). The
+// body is parsed HERE, not left to the postfix loop, so that the caller's
+// speculation covers it — which is the whole point of speculating.
+function parseSliceOrArrayTypePrimary(p: Parser, open: Token): int {
+  advance(p)
+  let size = 0
+  let tag = Tag.SliceType
+  if (peekKind(p) == Kind.IntLit) {
+    size = leaf(p, Tag.IntLit)
+    tag = Tag.ArrayType
+  }
+  advance(p)
+  let elem = parseType(p)
+  let tySpan = Span{ file: 0, start: open.start, end: getNode(p.tree, elem).span.end }
+  let kids = [elem]
+  if (tag == Tag.ArrayType) {
+    kids = [size, elem]
+  }
+  let ty = addNode(p.tree, tag, tySpan, 0, kids)
+  if (peekKind(p) == Kind.LBrace) {
+    return parseCompositeLit(p, ty)
+  }
+  if (peekKind(p) != Kind.LParen) {
+    return ty
+  }
+  advance(p)
+  let argNodes = []int(0)
+  while (!atListClose(p, Kind.RParen)) {
+    argNodes = append(argNodes, parseArgItem(p))
+    if (!accept(p, Kind.Comma)) {
+      break
+    }
+  }
+  let rpEnd = peekTok(p).end
+  expect(p, Kind.RParen)
+  let args = mkNode(p, Tag.Args, 0, argNodes)
+  return addNode(p.tree, Tag.Call,
+    Span{ file: 0, start: open.start, end: rpEnd }, 0, [ty, 0, args])
 }
 
 // `field_init = name ":" expression`.
@@ -104,7 +151,7 @@ function parseCompositeLit(p: Parser, typeNode: int): int {
   let bodyTag = Tag.FieldInits
   if (tt == Tag.MapType) {
     bodyTag = Tag.MapEntries
-    while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    while (!atListClose(p, Kind.RBrace)) {
       items = append(items, parseMapEntry(p))
       if (!accept(p, Kind.Comma)) {
         break
@@ -112,14 +159,14 @@ function parseCompositeLit(p: Parser, typeNode: int): int {
     }
   } else if (tt == Tag.SliceType || tt == Tag.ArrayType) {
     bodyTag = Tag.Args
-    while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    while (!atListClose(p, Kind.RBrace)) {
       items = append(items, parseArgItem(p))
       if (!accept(p, Kind.Comma)) {
         break
       }
     }
   } else {
-    while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+    while (!atListClose(p, Kind.RBrace)) {
       items = append(items, parseFieldInit(p))
       if (!accept(p, Kind.Comma)) {
         break
@@ -289,7 +336,7 @@ function parsePostfix(p: Parser): int {
     if (k == Kind.LParen) {
       advance(p)
       let argNodes = []int(0)
-      while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+      while (!atListClose(p, Kind.RParen)) {
         argNodes = append(argNodes, parseArgItem(p))
         if (!accept(p, Kind.Comma)) {
           break
@@ -384,7 +431,7 @@ function parsePostfix(p: Parser): int {
         if (nk == Kind.LParen) {
           advance(p)
           let argNodes = []int(0)
-          while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+          while (!atListClose(p, Kind.RParen)) {
             argNodes = append(argNodes, parseArgItem(p))
             if (!accept(p, Kind.Comma)) {
               break
