@@ -1,0 +1,463 @@
+// The worker and scheduler blocks, the all-live-tasks registry, work discovery
+// and the M:N run loop, split out of `sched.bit` (#1503). Sibling file, so the
+// same module - nothing here changed but its home.
+
+// ---------------------------------------------------------------------------
+// Worker: one OS thread running the scheduling loop
+// ---------------------------------------------------------------------------
+//
+// `sched.zig`'s `Worker`, as a caller-owned word-indexed block. The saved
+// context occupies the prefix for the same reason a task's does — the switch
+// takes the block address unchanged.
+//
+//   0..21    sched_ctx   this worker's own context while a task runs
+//   22       id
+//   23       running     the task currently switched-to, 0 between tasks
+//   24       disposition how the running task last left the CPU
+//   25       sched       the owning scheduler block's address
+//   26..33   reserved
+//   34..291  deque       this worker's local run queue (`dqWords`)
+export const wkCtx: int = 0
+export const wkId: int = 22
+export const wkRunning: int = 23
+export const wkDisposition: int = 24
+export const wkSched: int = 25
+export const wkDeque: int = 34
+export const workerWords: int = 292
+
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
+//
+//   0        nworkers
+//   1        workers     base address of the worker array (stride `workerWords`)
+//   2        stopping    set once by `schedShutdown`, polled by every worker
+//   3        regHead     head of the all-live-tasks registry (ABI.md §5)
+//   4        regLock     an i32 cell, addressed via `lockOf`
+//   5        timerHead   head of the sleeping-task list (`TimerQueue` below)
+//   6        timerLock   an i32 cell, addressed via `lockOf`
+//   7        pollFd      the netpoller's epoll/kqueue descriptor, 0 when the
+//                        consumer bound no poller (see the netpoller section)
+//   8..10    global      the overflow queue (`gqWords`)
+//   11..15   reserved
+export const scNWorkers: int = 0
+export const scWorkers: int = 1
+export const scStopping: int = 2
+export const scRegHead: int = 3
+const scRegLock: int = 4
+export const scTimerHead: int = 5
+const scTimerLock: int = 6
+export const scPollFd: int = 7
+export const scGlobal: int = 8
+const scPollLock: int = 11
+export const schedWords: int = 16
+
+// The worker block at index `i`.
+export @nosplit function schedWorkerAt(s: *i64, i: int): *i64 {
+  let base = *(s + scWorkers)
+  return taskAt(base + i * workerWords * 8)
+}
+
+// Prepare a scheduler over `nworkers` caller-owned worker blocks laid out
+// contiguously at `workersAddr`.
+export @nosplit function schedInit(s: *i64, workersAddr: int, nworkers: int) {
+  *(s + scNWorkers) = nworkers
+  *(s + scWorkers) = workersAddr
+  atomicStore(s + scStopping, 0)
+  *(s + scRegHead) = 0
+  atomicStore(lockOf(s, scRegLock), 0)
+  *(s + scTimerHead) = 0
+  atomicStore(lockOf(s, scTimerLock), 0)
+  *(s + scPollFd) = 0
+  gqInit(s + scGlobal)
+
+  let i = 0
+  while (i < nworkers) {
+    let w = schedWorkerAt(s, i)
+    *(w + wkId) = i
+    *(w + wkRunning) = 0
+    *(w + wkDisposition) = taskRunning
+    *(w + wkSched) = int(s)
+    dqInit(w + wkDeque)
+    i = i + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The all-live-tasks registry (ABI.md §5)
+// ---------------------------------------------------------------------------
+//
+// `sched.zig`'s `registerTask`/`unregisterTask`: an intrusive doubly-linked
+// list of every task from spawn until its `.done` teardown, so the collector
+// can find every parked or runnable stack to scan. Distinct from the run
+// queues' `next` link, because a task is on the registry for its whole life
+// while simultaneously moving between queues.
+export @nosplit function schedRegister(s: *i64, task: int) {
+  let t = taskAt(task)
+  spinAcquire(lockOf(s, scRegLock))
+  let head = *(s + scRegHead)
+  *(t + taskRegPrev) = 0
+  *(t + taskRegNext) = head
+  if (head != 0) {
+    *(taskAt(head) + taskRegPrev) = task
+  }
+  *(s + scRegHead) = task
+  spinRelease(lockOf(s, scRegLock))
+}
+
+export @nosplit function schedUnregister(s: *i64, task: int) {
+  let t = taskAt(task)
+  spinAcquire(lockOf(s, scRegLock))
+  let prev = *(t + taskRegPrev)
+  let next = *(t + taskRegNext)
+  if (prev != 0) {
+    *(taskAt(prev) + taskRegNext) = next
+  } else {
+    *(s + scRegHead) = next
+  }
+  if (next != 0) {
+    *(taskAt(next) + taskRegPrev) = prev
+  }
+  *(t + taskRegPrev) = 0
+  *(t + taskRegNext) = 0
+  spinRelease(lockOf(s, scRegLock))
+}
+
+// Upper bound on a registry walk. `sched.zig`'s `max_registered_tasks`, which
+// is a runaway-loop backstop rather than a real capacity — the scheduler caps
+// concurrent OS threads, not green threads.
+export const schedMaxRegistered: int = 16777216
+
+// How many tasks are on the registry. The bounded walk `forEachOtherStack` and
+// `forEachTaskArg` are built from; those two take a callback, which `@nosplit`
+// cannot express (a call through a value is E0075), so the traversal is exposed
+// as a cursor instead and the collector drives it. `schedRegHead` plus
+// `schedRegNext` is that cursor.
+export @nosplit function schedRegCount(s: *i64): int {
+  spinAcquire(lockOf(s, scRegLock))
+  let n = 0
+  let it = *(s + scRegHead)
+  while (it != 0 && n < schedMaxRegistered) {
+    n = n + 1
+    it = *(taskAt(it) + taskRegNext)
+  }
+  spinRelease(lockOf(s, scRegLock))
+  return n
+}
+
+// ---------------------------------------------------------------------------
+// Work discovery
+// ---------------------------------------------------------------------------
+//
+// `sched.zig`'s `findWork`, with its order of preference unchanged, because the
+// order IS the policy: local queue first (warm, uncontended), then the global
+// overflow queue (oldest spilled work, so nothing starves), then one bounded
+// pass stealing from every other worker.
+//
+// THE TIMER AND NETPOLLER PROBES ARE NOT IN THIS FUNCTION — they are in
+// `schedFindWorkIdle` below, which wraps it. The split is forced, not stylistic:
+// both probes need platform code reached through a function value, and a call
+// through a value is E0075 in a `@nosplit` body. Keeping this half `@nosplit`
+// leaves the hot path (the three queue probes, which is what runs when there IS
+// work) free of safepoints and callable from `@nosplit` callers, and confines
+// the non-`@nosplit` part to the idle tail — which is exactly where `sched.zig`
+// puts it too.
+export @nosplit function schedFindWork(w: *i64): int {
+  let local = dqPopBottom(w + wkDeque)
+  if (local != 0) {
+    return local
+  }
+  let s = taskAt(*(w + wkSched))
+  let spilled = gqPop(s + scGlobal)
+  if (spilled != 0) {
+    return spilled
+  }
+
+  // One bounded pass over the worker array (Power of 10: the trip count is the
+  // worker count, which `threadMaxWorkers` caps at 1024).
+  let n = *(s + scNWorkers)
+  let me = *(w + wkId)
+  let i = 0
+  while (i < n) {
+    if (i != me) {
+      let stolen = dqSteal(schedWorkerAt(s, i) + wkDeque)
+      if (stolen != 0) {
+        return stolen
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// `sched.zig`'s `findWork` IN FULL: the three queue probes above, then the two
+// idle probes — due sleepers first (an expired timer is work), then the poller.
+// Both drain onto the global queue rather than returning a task directly, so
+// each probe is followed by a global pop, which is the Zig's shape exactly:
+//
+//     if (self.sched.timers.expire(self.sched, monoNs()) > 0) {
+//         if (self.sched.global.pop()) |t| return t;
+//     }
+//     if (self.sched.poller.pollReady(self.sched, 0) > 0) {
+//         if (self.sched.global.pop()) |t| return t;
+//     }
+//
+// ORDER IS POLICY, so it is preserved: timers before the poller, and both after
+// stealing. A woken timer is already-owed work, and running it before polling
+// for new I/O is what stops a busy fd from starving a sleeper.
+//
+// THE POLLER TIMEOUT IS 0 — a non-blocking drain, which is what the Zig passes.
+// That is worth stating because it is what makes the poller safe for the
+// collector: this thread never blocks in `epoll_wait`/`kevent`, so it is never
+// stuck in a syscall where it is neither `running` nor `parked` and cannot
+// answer a stop-the-world rendezvous. All the waiting is done by the idle
+// backoff below, on the loop's own terms, with a safepoint at every back edge.
+//
+// THE PLATFORM SEAM. `nowFn` is a monotonic clock in nanoseconds
+// (`runtime/park`'s `parkMonoNs`); `pollFn(schedAddr, timeoutMs)` drains ready
+// I/O events and returns how many tasks it unparked (`runtime/sched/<os>`'s
+// `pollDrain`). Both are taken as function VALUES rather than imported, because
+// this file must import neither provider — the same shape, and the same reason,
+// as `runtime/thread`'s `threadJoin`. A consumer with no I/O still passes
+// `pollDrain`: it returns 0 immediately when no poller was created.
+function schedFindWorkIdle(w: *i64, nowFn: () => int,
+                           pollFn: (int, int) => int): int {
+  let addr = schedFindWork(w)
+  if (addr != 0) {
+    return addr
+  }
+  let s = taskAt(*(w + wkSched))
+  if (schedTimerExpire(s, nowFn()) > 0) {
+    let t = gqPop(s + scGlobal)
+    if (t != 0) {
+      return t
+    }
+  }
+  if (pollFn(int(s), 0) > 0) {
+    let t = gqPop(s + scGlobal)
+    if (t != 0) {
+      return t
+    }
+  }
+  return 0
+}
+
+// The two seam arguments for a consumer that drives NEITHER timers nor I/O —
+// a pure-scheduler embedding, which is what every scheduler stress program is.
+//
+// They are named for what they DISABLE, not for what they return, because the
+// dangerous mistake is passing `schedNoTimers` to a scheduler that does use
+// `schedSleepUntil`: a clock frozen at 0 makes every deadline look expired, so
+// every sleeper would wake on the first idle pass instead of on time. A consumer
+// with timers must pass a real monotonic clock (`runtime/park`'s `parkMonoNs`).
+export @nosplit function schedNoTimers(): int {
+  return 0
+}
+
+export @nosplit function schedNoPoller(schedAddr: int, timeoutMs: int): int {
+  return 0
+}
+
+// ---------------------------------------------------------------------------
+// The M:N run loop
+// ---------------------------------------------------------------------------
+//
+// `sched.zig`'s `Worker.run`. One of these runs per OS thread; each drives green
+// tasks until `schedShutdown` is called and no work remains.
+//
+// THIS LOOP USED TO BE `@nosplit`, AND THAT CONSTRAINT SHAPED THE WHOLE POOL.
+// Codegen emits `bl bit_rt_safepoint` at every loop back-edge, and the safepoint
+// entry used to snapshot the caller's registers into one PROCESS-WIDE global
+// before running an unsynchronized stop-the-world collect. Two workers reaching
+// a safepoint together raced that frame and could collect concurrently, so a
+// worker loop had to reach no safepoint at all.
+//
+// That is fixed. #1429 made the snapshot per-thread (the shim reserves it below
+// the caller's `sp`) and made stop-the-world a real rendezvous; #1431 then fixed
+// the two defects that left the rendezvous unsound in practice — an allocating
+// thread that never registered as a mutator, and a parked thread that resumed
+// without re-checking the stop. The attribute is therefore GONE from this loop,
+// and `tests/stress/schedpool*` now reports a NON-ZERO collection count under
+// `BIT_GC=stress` where it previously reported zero (its safepoints were all
+// suppressed, so the stress run verified nothing extra — cf. #1409).
+//
+// OF THE THREE CONSEQUENCES, TWO ARE NOW DONE AND ONE REMAINS:
+//   1. TIMERS AND THE NETPOLLER ARE PORTED (#1364) — see `schedFindWorkIdle`.
+//      Both are driven from this loop's idle path through function values, and
+//      the poller is polled with timeout 0, so neither ever blocks this thread
+//      in a syscall where the collector could not stop it.
+//   2. THE IDLE WAIT STILL SPINS (see `spinBackoff`), so N idle workers still
+//      peg N cores. This is NO LONGER a `@nosplit` limitation — the loop may
+//      legally call `parkSleepNs` now — but a plain swap is NOT behaviourally
+//      equivalent and was measured rather than assumed. `sched.zig` brackets
+//      its idle sleep with `bit_rt_gc_blocking_begin`/`_end` (ABI.md §5) and
+//      says why: without it "the collector would wait for a sleeping worker to
+//      reach a safepoint it will not reach until work arrives". This USED to be
+//      inexpressible: `extern function` was rejected outright for ELF targets.
+//      #1444 removed that blanket — E0078 now tests archive membership, and both
+//      symbols are defined in `libbitrt.a`, so they are declarable and callable
+//      on Linux today (SPEC §11.7). What remains is the scheduler-side work of
+//      actually bracketing the sleep, tracked on #1433; measured cost of the
+//      naive swap is on #1364. The LANGUAGE gap is closed.
+//   3. TASK BODIES ARE STILL `@nosplit` in every caller. Removing the attribute
+//      from a task body has not been tested, and a green task's stack is reached
+//      by the conservative scan rather than by a published safepoint frame, so
+//      that half needs its own verification before it is claimed.
+//
+// THE TRIP BOUND. `sched.zig` writes `while (true)`. A statically provable bound
+// is required here (Power of 10), so the loop carries one, exactly as
+// `runtime/thread`'s `threadJoin` does and for the same reason: `stopping` is
+// the operative exit in every real run, and the constant exists so that
+// termination is provable by READING the loop rather than by trusting that some
+// other thread will eventually set a flag. A worker that exhausts it returns,
+// which degrades a wedged scheduler into a finishing one instead of a hung one.
+const WORKER_MAX_STEPS: int = 1000000000
+
+// Put a runnable task back on a queue: this worker's local ring for locality,
+// spilling to the global queue when the ring is full. Both places the run loop
+// needs this — an ordinary yield and an owed wake delivered out of the arm/park
+// window — want the identical placement, so it is written once.
+@nosplit function schedRequeue(s: *i64, w: *i64, addr: int) {
+  let queued = dqPushBottom(w + wkDeque, addr)
+  if (!queued) {
+    gqPush(s + scGlobal, addr)
+  }
+}
+
+// `nowFn` and `pollFn` are the platform seam; see `schedFindWorkIdle` for what
+// each must do and why they are function values rather than imports.
+export function schedWorkerRun(w: *i64, nowFn: () => int,
+                               pollFn: (int, int) => int) {
+  let s = taskAt(*(w + wkSched))
+  let backoff = parkMinBackoffNs
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    n = n + 1
+    let addr = schedFindWorkIdle(w, nowFn, pollFn)
+
+    if (addr == 0) {
+      // No work. Stop if shutdown has been signalled, else back off and retry.
+      // Checked AFTER `findWork` so a worker never exits leaving queued work
+      // behind — `sched.zig`'s ordering, and the reason shutdown drains.
+      let stopping = atomicLoad(s + scStopping)
+      if (stopping != 0) {
+        return
+      }
+      spinBackoff(backoff)
+      backoff = parkNextBackoff(backoff)
+    } else {
+      backoff = parkMinBackoffNs
+      let t = taskAt(addr)
+      *(w + wkRunning) = addr
+
+      // The migration point. A task carries no worker affinity, so the worker
+      // that resumes it need not be the one it parked on, and this store is what
+      // makes `schedCurrentWorker` correct after a migration. `sched.zig` gets
+      // the same effect from its thread-local, which is why its `trampoline`
+      // must RE-FETCH the worker after the body returns.
+      *(t + taskWorker) = int(w)
+      *(t + taskState) = taskRunning
+
+      // Must be overwritten by the task before it switches back; the states
+      // below are the only three a task may leave in.
+      *(w + wkDisposition) = taskRunning
+      schedSwitch(w + wkCtx, t)
+      *(w + wkRunning) = 0
+      *(t + taskWorker) = 0
+
+      let disp = *(w + wkDisposition)
+      if (disp == taskRunnable) {
+        schedRequeue(s, w, addr)
+      }
+      if (disp == taskParked) {
+        // Safe only now: `t`'s context was just saved by this same thread, in
+        // program order, above. The atomic store is what lets another thread's
+        // later load see that write — `sched.zig` makes exactly this argument
+        // for its release store, and §11.5's sequential consistency is strictly
+        // stronger.
+        //
+        // THREE CASES, TRIED IN THIS ORDER, AND THE ORDER IS THE PROOF.
+        //
+        //  1. `taskParking -> taskParked`. The task armed (`schedParkArm`) and
+        //     no waker reached it: publish the park, and a later waker finds a
+        //     properly parked task. This is the common armed path.
+        //  2. `taskWakePending -> taskRunnable`. A waker reached the task inside
+        //     its arm/park window and handed the wake here rather than dropping
+        //     it. The task must NOT be left parked — nothing will wake it again,
+        //     because a one-shot poller registration has already been consumed
+        //     by the drain that failed to deliver. So the owed wake is delivered
+        //     by requeueing, which is exactly what `schedUnpark` would have done
+        //     had it been able to.
+        //  3. Neither: the state is `taskRunning`, i.e. an ordinary unarmed park
+        //     (`schedPark` alone — timers, channels, `schedYield`'s siblings).
+        //     A plain store is correct AND cannot lose a wake, because only the
+        //     task itself writes `taskParking` and it is suspended right now, so
+        //     no waker can be inside the armed protocol for it.
+        //
+        // Case 2 is checked BETWEEN 1 and 3 rather than after 3, because a waker
+        // may flip `taskParking -> taskWakePending` after 1's compare-exchange
+        // has already failed. Once 2 has failed as well the state is `taskRunning`
+        // and can no longer change under us, which is what makes 3's plain store
+        // safe rather than merely likely.
+        if (!atomicCmpxchg(t + taskState, taskParking, taskParked)) {
+          if (atomicCmpxchg(t + taskState, taskWakePending, taskRunnable)) {
+            schedRequeue(s, w, addr)
+          } else {
+            atomicStore(t + taskState, taskParked)
+          }
+        }
+      }
+      if (disp == taskDone) {
+        atomicStore(t + taskState, taskDone)
+        schedUnregister(s, addr)
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler control
+// ---------------------------------------------------------------------------
+
+// Queue a runnable task. Prefers the calling worker's local ring when the
+// caller is itself on a task (the fast path), and falls back to the global
+// queue otherwise — `sched.zig`'s `Scheduler.spawn` placement rule.
+//
+// Registration happens first, and before the task is visible to any queue, so a
+// collector can never observe a runnable task that is not on the registry.
+export @nosplit function schedSpawn(s: *i64, task: int) {
+  schedRegister(s, task)
+  let wAddr = schedCurrentWorker()
+  if (wAddr != 0) {
+    let queued = dqPushBottom(taskAt(wAddr) + wkDeque, task)
+    if (queued) {
+      return
+    }
+  }
+  gqPush(s + scGlobal, task)
+}
+
+// Make a parked task runnable again, from any thread. Routes through the global
+// queue because the caller may not be a worker at all. `sched.zig`'s `unpark`.
+//
+// The compare-and-exchange both checks the precondition and performs the
+// transition, so a double unpark cannot race itself onto the queue twice.
+// Returns false when the task was not parked, rather than panicking as the Zig
+// does: a panic is not available in a `@nosplit` body, and a caller that can see
+// the answer can react to it.
+export @nosplit @symbol("bit_rt_port_sched_unpark") function schedUnpark(s: *i64, task: int): bool {
+  let t = taskAt(task)
+  if (!atomicCmpxchg(t + taskState, taskParked, taskRunnable)) {
+    return false
+  }
+  gqPush(s + scGlobal, task)
+  return true
+}
+
+// Signal every worker to stop once it next finds no work. `sched.zig`'s
+// `shutdown`. Joining the OS threads afterwards is `runtime/thread`'s
+// `threadJoin`, which the caller drives — this module creates no threads (see
+// the header) and so reaps none.
+export @nosplit function schedShutdown(s: *i64) {
+  atomicStore(s + scStopping, 1)
+}

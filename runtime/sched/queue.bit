@@ -1,0 +1,152 @@
+// The two run queues, split out of `sched.bit` (#1503): a worker's local
+// work-stealing ring and the global overflow queue. Sibling file, so the same
+// module - nothing here changed but its home.
+
+// ---------------------------------------------------------------------------
+// Per-worker run queue: a bounded work-stealing ring
+// ---------------------------------------------------------------------------
+//
+// `sched.zig`'s `Deque`, unchanged in discipline: the owner appends at `tail`;
+// the owner's pop and every other worker's steal contend for `head` by CAS, so
+// both take from the OLDEST end and a task is handed to exactly one taker. Go's
+// runtime shape, and simpler to prove correct than a full Chase-Lev deque at
+// the cost of one uncontended CAS on the owner's pop.
+//
+// Capacity is fixed and a power of two so the ring index is a mask. Overflow is
+// NOT an error: `dqPushBottom` reports false and the caller spills to the
+// global queue, which is why capacity need not be provably sufficient.
+//
+// Block layout, word-indexed:
+//   0            head   (monotonic; masked to index)
+//   1            tail   (monotonic; masked to index)
+//   2 .. 2+cap-1 ring of task addresses
+export const dqCapacity: int = 256
+const dqMask: int = 255
+export const dqWords: int = 258
+
+const dqHead: int = 0
+const dqTail: int = 1
+const dqBuf: int = 2
+
+// `@nosplit` throughout: these run on the scheduling hot path and inside the
+// idle loop, where an allocation or a safepoint would collect against a worker
+// mid-handoff. §10.3 forbids INDEXING in a `@nosplit` body (E0075), which is
+// why the ring is reached by base-pointer arithmetic and deref rather than
+// `buf[i]` — the same shape `runtime/gc` uses for its own tables.
+export @nosplit function dqInit(q: *i64) {
+  atomicStore(q + dqHead, 0)
+  atomicStore(q + dqTail, 0)
+}
+
+// Owner-only. False if the ring is full; the caller must then spill to the
+// global queue.
+export @nosplit function dqPushBottom(q: *i64, task: int): bool {
+  let h = atomicLoad(q + dqHead)
+  let t = atomicLoad(q + dqTail)
+  if (t - h >= dqCapacity) {
+    return false
+  }
+  *(q + dqBuf + t % dqCapacity) = task
+  atomicStore(q + dqTail, t + 1)
+  return true
+}
+
+// Owner-only pop; contends with `dqSteal` on `head`.
+//
+// The retry loop is bounded by `dqCapacity`, not left open. A CAS loop that
+// only exits on success has no statically provable limit (Power of 10), and the
+// bound is sound: every losing iteration means some other worker won a steal,
+// and at most `dqCapacity` tasks can be stolen from a ring that holds at most
+// that many. Exhausting the bound therefore means the ring was drained by
+// others, and reporting empty is the correct answer, not a lost task.
+export @nosplit function dqPopBottom(q: *i64): int {
+  let n = 0
+  while (n <= dqCapacity) {
+    let h = atomicLoad(q + dqHead)
+    let t = atomicLoad(q + dqTail)
+    if (h == t) {
+      return 0
+    }
+    let task = *(q + dqBuf + h % dqCapacity)
+    if (atomicCmpxchg(q + dqHead, h, h + 1)) {
+      return task
+    }
+    n = n + 1
+  }
+  return 0
+}
+
+// Callable from any other worker. Identical to `dqPopBottom` — both take from
+// `head` — and kept as its own name because the CONTRACT differs: this one is
+// safe to call on a queue this thread does not own, which is the property a
+// work-stealing loop depends on.
+export @nosplit function dqSteal(q: *i64): int {
+  return dqPopBottom(q)
+}
+
+// ---------------------------------------------------------------------------
+// Global overflow queue
+// ---------------------------------------------------------------------------
+//
+// `sched.zig`'s `GlobalQueue`: an intrusive FIFO under a spinlock, holding
+// spilled local pushes, tasks unparked from another thread, and tasks the
+// netpoller woke — everything whose target worker is unknown, or whose waker
+// is not a worker at all.
+//
+// FIFO order is part of the discipline, not an accident: it is what stops a
+// task that repeatedly overflows a local ring from being starved behind
+// newer work.
+//
+// Block layout, word-indexed:
+//   0  head task address (0 when empty)
+//   1  tail task address
+//   2  lock word — an i32 cell, addressed as such (see `lockOf`)
+export const gqWords: int = 3
+
+const gqHead: int = 0
+const gqTail: int = 1
+const gqLock: int = 2
+
+export @nosplit function gqInit(q: *i64) {
+  *(q + gqHead) = 0
+  *(q + gqTail) = 0
+  atomicStore(lockOf(q, gqLock), 0)
+}
+
+// Link `task` on at the tail. `taskNext` of `task` is cleared first, so a task
+// carrying a stale link from a previous queue cannot splice foreign tasks in.
+export @nosplit function gqPush(q: *i64, task: int) {
+  let t: *i64 = nil
+  let node = t + task / 8
+  *(node + taskNext) = 0
+  spinAcquire(lockOf(q, gqLock))
+  let tail = *(q + gqTail)
+  if (tail == 0) {
+    *(q + gqHead) = task
+  } else {
+    let tailNode = t + tail / 8
+    *(tailNode + taskNext) = task
+  }
+  *(q + gqTail) = task
+  spinRelease(lockOf(q, gqLock))
+}
+
+// Unlink and return the head task address, or 0 when empty.
+export @nosplit function gqPop(q: *i64): int {
+  spinAcquire(lockOf(q, gqLock))
+  let head = *(q + gqHead)
+  if (head == 0) {
+    spinRelease(lockOf(q, gqLock))
+    return 0
+  }
+  let t: *i64 = nil
+  let node = t + head / 8
+  let next = *(node + taskNext)
+  *(q + gqHead) = next
+  if (next == 0) {
+    *(q + gqTail) = 0
+  }
+  *(node + taskNext) = 0
+  spinRelease(lockOf(q, gqLock))
+  return head
+}

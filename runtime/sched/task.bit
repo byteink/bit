@@ -1,0 +1,274 @@
+// The task control block, the entry points task code calls, and the park-arming
+// rendezvous, split out of `sched.bit` (#1503). Sibling file, so the same
+// module - nothing here changed but its home.
+
+// ---------------------------------------------------------------------------
+// Task control block
+// ---------------------------------------------------------------------------
+//
+// Word-indexed, laid out so the saved context occupies the prefix — a switch
+// takes the task's base address unchanged, with no offset arithmetic on the
+// hottest path in the runtime.
+//
+//   0..21  saved context
+//   22     state
+//   23     next        intrusive run-queue link (owned by the holding queue)
+//   24     arg         opaque word handed to the task body
+//   25     stackBase   lowest address of the whole mapping, for teardown
+//   26     stackBytes  size of that mapping
+//   27     worker      the worker currently running this task (0 when not running)
+//   28     regNext     intrusive all-tasks registry links, owned by the
+//   29     regPrev       scheduler's registry lock — NOT the run queues' `next`,
+//                        because a task is on the registry for its whole life
+//                        while simultaneously moving between run queues
+//   30     timerNext   intrusive sleeping-task link and its wake deadline, owned
+//   31     deadline      by the scheduler's timer lock. A THIRD link distinct
+//                        from both `next` and `regNext` for the same reason they
+//                        are distinct from each other: a sleeping task is on the
+//                        timer list, on the registry, and on no run queue, all at
+//                        once. `sched.zig`'s `timer_next`/`deadline_ns`.
+//
+// 30 and 31 were already inside `taskWords`, so adding timers did NOT grow the
+// block — no caller's stack arithmetic moved.
+export const taskWords: int = 32
+
+export const taskState: int = 22
+export const taskNext: int = 23
+export const taskArg: int = 24
+export const taskStackBase: int = 25
+export const taskStackBytes: int = 26
+export const taskWorker: int = 27
+export const taskRegNext: int = 28
+export const taskRegPrev: int = 29
+export const taskTimerNext: int = 30
+export const taskDeadline: int = 31
+
+// Task states, matching `sched.zig`'s `TaskState` ordinals.
+export const taskRunnable: int = 0
+export const taskRunning: int = 1
+export const taskParked: int = 2
+export const taskDone: int = 3
+
+// TWO STATES `sched.zig` DOES NOT HAVE, AND THEY EXIST BECAUSE THIS PORT CANNOT
+// HAVE ITS `ParkFn` HOOK. See the "arming a park" section below for the whole
+// argument; in one line: a Bit task must make itself findable BEFORE it parks,
+// and these two states are the rendezvous that stops a wake landing in that
+// window from being dropped.
+//
+// A NEW PATH ON PURPOSE. `schedPark`, `schedUnpark`, the timer queue and every
+// channel operation continue to move a task only between the four states above —
+// nothing that works today changes behaviour, and a task that never calls
+// `schedParkArm` can never be in either of these. That containment is the reason
+// to spend two ordinals rather than to rework `schedUnpark`.
+export const taskParking: int = 4
+export const taskWakePending: int = 5
+
+// Prepare a task control block: build its entry context and clear its links.
+//
+// `stackBase`/`stackBytes` describe the mapping to release at teardown; the
+// usable top is their sum, which is where the context starts. The caller owns
+// that mapping — this module never maps or unmaps (see the header).
+export @nosplit function schedTaskInit(task: *i64, stackBase: int, stackBytes: int,
+                                       entry: *byte, arg: int) {
+  schedTaskContext(task, stackBase + stackBytes, entry)
+  *(task + taskState) = taskRunnable
+  *(task + taskNext) = 0
+  *(task + taskArg) = arg
+  *(task + taskStackBase) = stackBase
+  *(task + taskStackBytes) = stackBytes
+  *(task + taskWorker) = 0
+  *(task + taskRegNext) = 0
+  *(task + taskRegPrev) = 0
+  *(task + taskTimerNext) = 0
+  *(task + taskDeadline) = 0
+
+  // The self-pointer that makes `schedCurrentTask` O(1), and the tag that lets
+  // it tell a task stack from any other stack — see its comment.
+  *(taskAt(stackBase)) = int(task)
+  *(taskAt(stackBase) + 1) = schedStackTag
+}
+
+// A task block at a raw address, as the queues hand it back.
+//
+// Also used for worker and scheduler blocks: all three are word-indexed blocks
+// at a raw address and the conversion is the same arithmetic. Kept under one
+// name rather than three aliases that would differ only in what they are called.
+// PINNED (ABI.md §9): `runtime/chan` calls this across a module boundary. See
+// `../gc/mem.bit` for why the pin is required and why `bit_rt_port_` is
+// temporary (#1369 renames).
+export @nosplit @symbol("bit_rt_port_sched_task_at") function taskAt(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + addr / 8
+}
+
+// ---------------------------------------------------------------------------
+// What task code calls
+// ---------------------------------------------------------------------------
+
+// THE THREE FUNCTIONS BELOW MAY ONLY BE CALLED FROM TASK CODE. Off a task stack
+// `schedCurrentTask` returns 0 and they fault on the null dereference that
+// follows. That is deliberate, and it is the honest equivalent of `sched.zig`'s
+// `Worker.current()`, which is `tls.?` and panics for the same misuse: a
+// scheduler primitive that quietly did nothing would leave the caller believing
+// it had yielded or parked when it had not, which is far worse than a crash at
+// the call site. `panic` is not reachable from a `@nosplit` body in any case.
+//
+// `schedSpawn` is the exception and is safe from any thread, as the Zig's is —
+// see its own comment.
+
+// Give the CPU back to this task's worker, staying runnable. `sched.zig`'s
+// `yield`. Returns when some worker — NOT NECESSARILY THE SAME ONE — resumes it.
+export @nosplit function schedYield() {
+  let taskAddr = schedCurrentTask()
+  let t = taskAt(taskAddr)
+  let w = taskAt(*(t + taskWorker))
+  *(w + wkDisposition) = taskRunnable
+  schedSwitch(t, w + wkCtx)
+}
+
+// Stop running and do NOT requeue. `sched.zig`'s `park`, minus the `ParkFn`
+// hook: registering the parked task with its waker is a call through a function
+// value, which `@nosplit` rejects (E0075). The caller must therefore make itself
+// findable BEFORE parking, which reintroduces the race `sched.zig`'s hook exists
+// to close — so the safe pattern here is that the unparker discovers the task by
+// polling `taskState` for `taskParked`, which is only stored after the context
+// is saved. That is what tests/stress/schedpool does, and it is the seam a
+// channel implementation (#1365) will need closed properly.
+export @nosplit @symbol("bit_rt_port_sched_park") function schedPark() {
+  let taskAddr = schedCurrentTask()
+  let t = taskAt(taskAddr)
+  let w = taskAt(*(t + taskWorker))
+  *(w + wkDisposition) = taskParked
+  schedSwitch(t, w + wkCtx)
+}
+
+// ---------------------------------------------------------------------------
+// Arming a park: the rendezvous that replaces `sched.zig`'s `ParkFn`
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM, EXACTLY. `sched.zig` hands `park` a `ParkFn` that runs on the
+// WORKER's side of the switch — after the context is saved and after the state
+// is published as `.parked` — and registers the fd from there. That hook is a
+// call through a function value, which `@nosplit` rejects (E0075), so it cannot
+// be transcribed. A Bit task must therefore make itself findable BEFORE it
+// parks, and a wake that lands in the window between "registered" and "parked"
+// finds the task still `taskRunning`, fails `schedUnpark`'s compare-exchange,
+// and IS DROPPED.
+//
+// WHY TIMERS SURVIVE THAT AND A POLLER CANNOT. A dropped timer wake is retried:
+// the deadline is still on the timer list, so the next `schedTimerExpire` finds
+// the task again. A netpoller registration is ONE-SHOT (EPOLLONESHOT/EV_ONESHOT
+// — see the two `poll.bit` providers), so the drain that failed to deliver has
+// already consumed the readiness edge. Nothing will ever report that fd again,
+// and the task is parked forever. That is the QUIC-teardown shape recorded in
+// [[bit-quic-suite-hang]], reached by a much shorter path.
+//
+// THE PROTOCOL. `taskState` itself is the rendezvous, and both sides drive it
+// with a compare-exchange, so exactly one of them wins and the loser is told:
+//
+//   task:   taskRunning --schedParkArm-->      taskParking
+//   waker:  taskParking --schedPollUnpark-->   taskWakePending   (wake owed)
+//   worker: taskParking --schedWorkerRun-->    taskParked        (park published)
+//
+// If the worker's transition lands first the waker finds a properly parked task
+// and takes the ordinary `taskParked -> taskRunnable` path. If the waker's lands
+// first the worker's compare-exchange fails, it sees `taskWakePending`, and it
+// DELIVERS the owed wake by requeueing instead of parking. There is no
+// interleaving in which both fail, because both are compare-exchanges against
+// the same word and one of them must observe `taskParking`.
+//
+// Bounded and lock-free by construction: every operation below is a fixed number
+// of compare-exchanges with no retry loop (Power of 10).
+
+// Announce that this task is about to register itself somewhere and then park.
+// Returns false if the task was not `taskRunning`, which means the caller is not
+// a running task and has no business arming.
+//
+// MUST be followed by either `schedPark` or `schedParkDisarm` on every path. A
+// task left in `taskParking` that never parks is invisible to `schedUnpark` —
+// which is precisely why `schedParkDisarm` exists rather than being optional.
+export @nosplit @symbol("bit_rt_port_sched_park_arm") function schedParkArm(): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  return atomicCmpxchg(t + taskState, taskRunning, taskParking)
+}
+
+// Undo an arm without parking — the path a caller takes when the registration
+// it armed for FAILED and so nothing will ever wake it.
+//
+// Returns true when a wake had already been handed over, i.e. the waker won the
+// race while the caller was still registering. That wake is CONSUMED HERE: the
+// caller is running, so the wake's only meaning ("do not park") is already
+// satisfied, and requeueing an already-running task would put it on a run queue
+// twice. A caller that ignores the answer is still correct; it is returned
+// because a poller consumer wants to know its registration raced.
+export @nosplit @symbol("bit_rt_port_sched_park_disarm") function schedParkDisarm(): bool {
+  let taskAddr = schedCurrentTask()
+  if (taskAddr == 0) {
+    return false
+  }
+  let t = taskAt(taskAddr)
+  if (atomicCmpxchg(t + taskState, taskParking, taskRunning)) {
+    return false
+  }
+  // The only other state an armed task can be in is `taskWakePending`, and the
+  // waker that set it is done with the task. A plain store is therefore safe.
+  atomicStore(t + taskState, taskRunning)
+  return true
+}
+
+// Wake a task that may be anywhere in the arm/park protocol. THE POLLER'S
+// UNPARK — `pollDrain` calls this where it used to call `schedUnpark`, and the
+// difference is only what happens to a task caught mid-park.
+//
+// Returns true when the wake was delivered or handed over, false when the task
+// was in none of the three states a wake can be given to (already runnable,
+// running, or done) and the caller should drop it exactly as `schedUnpark` does.
+//
+// STEP 3 IS NOT REDUNDANT WITH STEP 1, and this is the one claim here that a
+// single-core test cannot demonstrate. Between step 1 observing `taskParking`
+// and step 2 running, the task's worker may publish `taskParked` — so step 2's
+// compare-exchange fails too, and without step 3 a genuinely parked task would
+// be left parked with its one-shot edge consumed. It needs two cores to
+// interleave that way, so it is kept on the argument rather than on a test, and
+// this comment is that argument.
+//
+// STEPS 1 AND 3 ARE TWO EQUIVALENT MUTANTS, AND THAT WAS MEASURED RATHER THAN
+// ASSUMED. Deleting step 1 alone SURVIVES every program in this suite, and so
+// does deleting step 3 alone — they are the same transition at two points, so
+// each masks the other's removal. Deleting BOTH is caught, by
+// ../../tests/stress/schedpoll{darwin,linux}: `woke true -> false`. So the pair
+// is guarded, the individual lines are not, and neither may be deleted on the
+// strength of a green run. ../../tests/stress/netpark cannot see either one: its
+// task is always caught mid-park, so only step 2 ever fires there.
+export @nosplit @symbol("bit_rt_port_sched_poll_unpark") function schedPollUnpark(s: *i64, task: int): bool {
+  let t = taskAt(task)
+  // 1. Already parked: the ordinary transition, identical to `schedUnpark`.
+  if (atomicCmpxchg(t + taskState, taskParked, taskRunnable)) {
+    gqPush(s + scGlobal, task)
+    return true
+  }
+  // 2. Caught mid-park: hand the wake to the worker, which owes its delivery.
+  if (atomicCmpxchg(t + taskState, taskParking, taskWakePending)) {
+    return true
+  }
+  // 3. It finished parking between 1 and 2. Retry the parked transition.
+  if (atomicCmpxchg(t + taskState, taskParked, taskRunnable)) {
+    gqPush(s + scGlobal, task)
+    return true
+  }
+  return false
+}
+
+// Leave for good. Never returns — the worker sees `taskDone` and never queues
+// this task again.
+export @nosplit function schedTaskExit() {
+  let taskAddr = schedCurrentTask()
+  let t = taskAt(taskAddr)
+  let w = taskAt(*(t + taskWorker))
+  *(w + wkDisposition) = taskDone
+  schedSwitch(t, w + wkCtx)
+}
