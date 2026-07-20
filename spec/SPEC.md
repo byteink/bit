@@ -1405,7 +1405,8 @@ was false, and admitting a length mismatch that read uninitialized memory. The
 rule is stated here so the two cannot drift again (see
 tests/cases/check_array_literal.bit and run_array_value.bit).
 
-**Diagnostic order inside a composite literal is normative.** A literal is
+**Diagnostic order inside a composite literal is normative** — this is the
+general post-order rule of §14.8, spelled out for the literal forms. A literal is
 checked slot by slot in source order; the literal's own whole-literal rule (the
 E0050 length mismatch of `[N]T{...}`) is reported first, and for each slot the
 slot's *expression* is checked to completion — reporting everything nested
@@ -1874,6 +1875,36 @@ Representation (non-normative): a no-payload-only enum is a bare tag word; an
 enum with any payload is a boxed `{tag, payloadPtr}` object whose payload is a
 separately allocated, GC-traced record. Inline (unboxed) payload layout is a
 future optimization.
+
+### 14.8 Diagnostic Order
+
+**The order in which diagnostics are reported is normative.** A conforming
+implementation checks a declaration by walking its tree in source order and
+emitting each node's own verdict **after** every verdict from that node's
+subtree — post-order. Equivalently: a node is judged only once its children have
+been judged.
+
+This is not a stylistic choice. A node's verdict generally *depends* on its
+children's types — assignability cannot be decided before the type of the value
+being assigned is known — so any single recursive checker produces this order
+naturally. Fixing it here means an implementation matches by having the right
+traversal, not by sorting at the output boundary; sorting would in fact have to
+undo the inner-before-outer nesting the rule requires.
+
+Three consequences, each of which has caused the two compilers to diverge:
+
+- A nested type reports **inner-first**. In `map<[]int, map<[]int, int>>` the
+  inner key is reported before the outer one; likewise `[2][2]string`.
+- A type node embedded in an expression reports **in its source position among
+  that expression's other diagnostics**, not hoisted ahead of them. In
+  `g(1) + len([2]string{})` the bad argument to `g` is reported first.
+- A binding reports its annotation's own diagnostics, then everything nested in
+  its initializer, then last its own assignability verdict — the order
+  `let w: map<[]int, int> = g(1)` requires.
+
+Order is user-facing, and the two compilers must render byte-identical output,
+so this is fixed rather than left to whichever traversal each implementation
+happens to use (#1489, #1521; tests/cases/check_typenode_order.bit).
 
 ---
 
