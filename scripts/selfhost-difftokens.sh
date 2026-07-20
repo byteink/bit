@@ -31,6 +31,14 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
   fi
 done
 echo "token differential: MATCH=$match MISMATCH=$mismatch SKIP(lex-err)=$skip"
+
+# A phase that measured nothing must not pass (#1516). On an empty or unfindable
+# corpus the loop runs zero comparisons and MISMATCH is 0 for the wrong reason.
+if [ "$match" -lt 1 ]; then
+  echo "FATAL: the token differential compared nothing (MATCH=$match) — corpus walk found no .bit file." >&2
+  exit 2
+fi
+
 if [ -n "$firstbad" ]; then
   echo "first divergence: $firstbad"
   diff <("$SEED" --dump-tokens "$firstbad" 2>/dev/null) <("$BIT2" --dump-tokens "$firstbad" 2>/dev/null) | head -20
