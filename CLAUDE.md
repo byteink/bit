@@ -58,6 +58,17 @@ dist/       packaging (brew formula, install scripts)
 - Differential testing is the self-hosting gate: Zig and Bit implementations must produce byte-identical AST/type/IR dumps over the full corpus.
 - Doc snippets are CI-verified — tutorial and stdlib docs compile as part of the build; docs that don't compile fail CI.
 
+## File Size
+
+Hard limit 800 lines per file, target ~500. 800 is the default of the repo's own lint rule E0200 max-file-lines (#1382) — the two must stay in step; changing one means changing the other. Split by moving top-level blocks into SIBLING `.bit` files in the same directory: siblings are the same module, so a split needs no imports, no namespace changes, and no call-site edits. Do not split into subdirectories — a new directory is a new module, which is a design change, not a cleanup.
+
+Two things a split can break that a green build will not catch (#1503):
+
+- **Silent line loss.** A split that swallows blank lines still compiles, passes selfcheck, and passes `zig build test`. Gate it with a line-multiset comparison of the directory before vs after — zero deletions, additions only for new file headers. Derive the "before" side from `git show HEAD:<path>`; a baseline written to a shared path can be clobbered by a concurrent agent, and a locale mismatch between the two sorts fabricates thousands of phantom deletions. Stronger still, and preferred: reassembling the new files in the original order must reproduce the original byte-for-byte.
+- **Changed codegen (#1511).** Module files concatenate in bytewise sorted filename order, and the inliner only inlines a callee it has already lowered. A new sibling that sorts *before* the file holding its helpers silently loses inlining — perfect text diff, different machine code. Name new files so they sort after their helpers (for `sock.bit` the working order was `sock < tcp < udp`), and confirm with `bit build <src> --emit-obj` byte-identical before vs after.
+
+Splitting a file can also make a test vacuous rather than failing it: any gate that names a single source path (`build.zig`'s `ast_tags` options did) will keep scanning the remnant. Point such gates at a directory.
+
 ## Deployment Context
 
 Website deploys to the byteink k3s cluster (`kubectx byteink`, namespace `byteink`, Traefik IngressRoutes — see workspace-root CLAUDE.md). Releases ship from GitHub Actions on version tags: 6 target artifacts (linux/macos/windows × x64/arm64) + brew tap `byteink/homebrew-bit` + curl|sh installer + winget.
