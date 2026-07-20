@@ -29,6 +29,9 @@
 # container with `docker ps --filter name=arm64gate` and
 # `docker exec <id> tail -f /tmp/o`. Raise the ceiling with ARM64GATE_DEADLINE.
 #
+# IMAGE=<tag-or-id> overrides the image. Needed when #1497 makes `docker image inspect`
+# deny a tag that `docker images` lists — pass the id instead of editing a copy.
+#
 # On success prints the log tail; on FAILURE prints the whole log, because the
 # tail alone routinely cuts off the one line that names the failing test — a gate
 # that cannot say what broke is not a gate. Always ends with `ARM64LINUX_EXIT=<code>`.
@@ -36,7 +39,10 @@ set -euo pipefail
 
 MODE="${1:-fast}"
 RUNS="${2:-1}"
-IMAGE="bit-zig-0.16.0:latest"
+# Overridable so #1497 (docker denying a tag that `docker images` lists) is not a hard
+# block: point it at the same image by id. The uname -m check below still applies, and
+# matters MORE with an id, which carries no descriptive name.
+IMAGE="${IMAGE:-bit-zig-0.16.0:latest}"
 VOLUME="bit-zig-cache-arm64"
 # Wall-clock ceiling for one suite run. A hang must read as a failure, never as a
 # gate that sits forever looking busy.

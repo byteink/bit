@@ -46,7 +46,9 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
 - **Gates write to fixed `/tmp` log paths** (#1496) — one agent has read another's result.
   Redirect to your own `mktemp -d`.
 - The docker tag `bit-zig-0.16.0:latest` intermittently fails `docker image inspect` while
-  showing in `docker images` (#1497). That is the known image bug, not a Bit failure.
+  showing in `docker images` (#1497). That is the known image bug, not a Bit failure — pass
+  the id instead: `IMAGE=<id> scripts/arm64gate.sh`. Never gate with an edited copy of a
+  gate script; a gate that is not the one in the repo has not been reviewed.
 - Before starting a hardware gate, check whether one is already running
   (`docker ps | grep -c arm64gate`) — another agent may own the box.
 
