@@ -111,13 +111,18 @@ first-touch + composite dedup), which method mangling `name$t{recvId}` depends o
 The optimizer mirrors `-O1` — fold, DCE, inline, fold, DCE — rebuilding each
 function rather than mutating it.
 
-The **1** remaining mismatch in both IR surfaces (`run_generic_nested`) is
-monomorphized-instance *index numbering*: the seed's `ctx.instantiations` is one
+The **1** remaining mismatch in both IR surfaces (`run_generic_nested`) is generic
+type substitution reaching lowering: the seed prints `field_get %28[8] i64` where
+the self-hosted compiler still prints `field_get %28[8] <T>`. Its function bodies,
+result types, and every type already match.
+
+That case used to carry a second, independent defect — instance *index numbering*
+(`wrap$7` vs `wrap$0`) — fixed in #1530. The seed's `ctx.instantiations` is one
 global ledger holding generic **type** instantiations alongside function ones, so
-`Opt<i64>`/`Pair<i64>`/`Box<i64>` consume indices ahead of the function instances
-(`wrap$7` vs `wrap$0`). Its function bodies, result types, and every type already
-match; recording type instantiations in the seed's exact discovery order is a
-substantive feature deferred to its own change.
+the printed suffix was sparse while the seed's own FuncIds for those instances were
+already dense: the symbol text disagreed with the id it named. Naming from the
+dense counter the seed already computes made both compilers converge without
+building type monomorphization in the port.
 
 Stage 3 (codegen + object writers + linker + driver, then `stage2 == stage3`)
 follows.
