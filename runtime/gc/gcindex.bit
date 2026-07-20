@@ -1,0 +1,222 @@
+// Split out of ./gc.bit (#1503): the address->object membership index.
+
+// ---------------------------------------------------------------------------
+// The address->object membership index
+// ---------------------------------------------------------------------------
+//
+// `owns` is the mark hot path: it runs once per traced reference. A linear walk
+// of the all-objects list there makes tracing O(objects^2) — that was a real,
+// measured regression in this codebase (fixed for the Zig in 3dc87a3, ~9x on
+// the h2 download path), so the index is ported, not skipped.
+//
+// Open addressing with linear probing over a power-of-two table of body
+// addresses. The Zig uses `std.AutoHashMapUnmanaged`; the internal layout is
+// NOT part of any contract (the index is a pure speed structure over the
+// authoritative all-objects list), so a simpler scheme is free to differ as
+// long as `owns` answers identically. It does: the index mirrors exactly the
+// insert/remove points that mutate `all`.
+//
+// Backed by its OWN reserve, never the object heap — mirroring Zig's
+// `index_alloc = std.heap.page_allocator`. Index bytes must not count toward
+// `liveBytes`, or they would perturb the growth trigger.
+
+// splitmix64's finalizer. Computed in `u64` because it relies on modular
+// multiplication; `i64` overflow traps in debug builds (§11.1).
+@nosplit function idxHash(addr: int, ncap: int): int {
+  let x = u64(addr)
+  x = x ^ (x >> 30)
+  x = x * 13787848793156543929
+  x = x ^ (x >> 27)
+  x = x * 10723151780598845931
+  x = x ^ (x >> 31)
+  let mask = u64(ncap - 1)
+  return int(x & mask)
+}
+
+@nosplit function idxSlotAddr(table: int, i: int): int {
+  return table + i * 8
+}
+
+// True if `addr` is present. Probes until an empty slot, which terminates
+// because the load factor is held below 100%. Bounded by `ncap` regardless.
+@nosplit function idxContains(g: *i64, addr: int): bool {
+  let ncap = *(g + gcIndexCap)
+  if (ncap == 0) {
+    return false
+  }
+  let table = *(g + gcIndexAddr)
+  let i = idxHash(addr, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let v = loadWord(idxSlotAddr(table, i))
+    if (v == idxEmpty) {
+      return false
+    }
+    if (v == addr) {
+      return true
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+  return false
+}
+
+// Place `addr` into `table` assuming capacity is available and `addr` is
+// absent. Used by both insert and rehash.
+@nosplit function idxPlace(table: int, ncap: int, addr: int): bool {
+  let i = idxHash(addr, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let slotAddr = idxSlotAddr(table, i)
+    let v = loadWord(slotAddr)
+    if (v == idxEmpty || v == idxTombstone) {
+      storeWord(slotAddr, addr)
+      return true
+    }
+    if (v == addr) {
+      return true
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+  return false
+}
+
+// Disable the index permanently and release its table. `owns` then reverts to
+// the exact `gcOwnsLinear` scan, so a failure costs speed, never correctness —
+// this is Zig's `catch { index_ok = false; ... }` path.
+@nosplit function idxDisable(g: *i64) {
+  *(g + gcIndexOk) = 0
+  *(g + gcIndexAddr) = 0
+  *(g + gcIndexCap) = 0
+  *(g + gcIndexLive) = 0
+  *(g + gcIndexUsed) = 0
+}
+
+// Grow (or first-allocate) the table so one more entry fits under the load
+// factor, rehashing the live entries and dropping tombstones.
+@nosplit function idxGrow(g: *i64): bool {
+  let oldTable = *(g + gcIndexAddr)
+  let oldCap = *(g + gcIndexCap)
+  let live = *(g + gcIndexLive)
+
+  let newCap = idxMinCap
+  // Bounded: doubles until the load factor admits `live + 1`; `live` is bounded
+  // by the number of live objects, so this terminates in <= 63 iterations.
+  let guard = 0
+  while (guard < 64) {
+    if ((live + 1) * 100 < newCap * idxLoadPct) {
+      break
+    }
+    newCap = newCap * 2
+    guard = guard + 1
+  }
+
+  // Reuse the spare when it is the right capacity. This is what keeps the
+  // index reserve from draining: removals leave TOMBSTONES, which count toward
+  // the load factor, so a long alloc/free workload rehashes repeatedly at an
+  // UNCHANGED capacity just to clear them. Taking fresh storage each time would
+  // exhaust any reserve and permanently disable the index — which would drop
+  // `owns` back to the O(objects) linear scan and make tracing O(n^2), the exact
+  // regression 3dc87a3 fixed for the Zig. The Zig avoids it by giving the table
+  // back to `page_allocator`; a bump reserve cannot, so one slot is cached.
+  // Capacity changes are O(log n) over a whole run, so at most that many tables
+  // are ever abandoned.
+  let newTable = 0
+  if (*(g + gcIdxSpareCap) == newCap) {
+    newTable = *(g + gcIdxSpareAddr)
+    *(g + gcIdxSpareAddr) = 0
+    *(g + gcIdxSpareCap) = 0
+  } else {
+    newTable = reserveTake(g + gcIdxRes, newCap * 8)
+  }
+  if (newTable == 0) {
+    idxDisable(g)
+    return false
+  }
+  // Zero the fresh table: every slot must read `idxEmpty`.
+  let i = 0
+  while (i < newCap) {
+    storeWord(idxSlotAddr(newTable, i), idxEmpty)
+    i = i + 1
+  }
+
+  // Rehash live entries. Bounded by `oldCap`.
+  let moved = 0
+  let j = 0
+  while (j < oldCap) {
+    let v = loadWord(idxSlotAddr(oldTable, j))
+    if (v != idxEmpty && v != idxTombstone) {
+      if (!idxPlace(newTable, newCap, v)) {
+        // Cannot happen: the new table was sized for `live + 1`. Treat as an
+        // index failure rather than silently losing a membership entry.
+        idxDisable(g)
+        return false
+      }
+      moved = moved + 1
+    }
+    j = j + 1
+  }
+
+  // Park the old table as the spare rather than abandoning it.
+  if (oldTable != 0) {
+    *(g + gcIdxSpareAddr) = oldTable
+    *(g + gcIdxSpareCap) = oldCap
+  }
+  *(g + gcIndexAddr) = newTable
+  *(g + gcIndexCap) = newCap
+  *(g + gcIndexLive) = moved
+  *(g + gcIndexUsed) = moved
+  return true
+}
+
+// Record `body` in the index, growing first if the load factor demands it.
+@nosplit function idxInsert(g: *i64, body: int) {
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  let ncap = *(g + gcIndexCap)
+  let used = *(g + gcIndexUsed)
+  if (ncap == 0 || (used + 1) * 100 >= ncap * idxLoadPct) {
+    if (!idxGrow(g)) {
+      return
+    }
+    ncap = *(g + gcIndexCap)
+  }
+  let table = *(g + gcIndexAddr)
+  if (!idxPlace(table, ncap, body)) {
+    idxDisable(g)
+    return
+  }
+  *(g + gcIndexLive) = *(g + gcIndexLive) + 1
+  *(g + gcIndexUsed) = *(g + gcIndexUsed) + 1
+}
+
+// Remove `body` from the index, leaving a tombstone so probe chains through
+// this slot keep working. Tombstones are reclaimed by the next `idxGrow`.
+@nosplit function idxRemove(g: *i64, body: int) {
+  if (*(g + gcIndexOk) == 0) {
+    return
+  }
+  let ncap = *(g + gcIndexCap)
+  if (ncap == 0) {
+    return
+  }
+  let table = *(g + gcIndexAddr)
+  let i = idxHash(body, ncap)
+  let probes = 0
+  while (probes < ncap) {
+    let slotAddr = idxSlotAddr(table, i)
+    let v = loadWord(slotAddr)
+    if (v == idxEmpty) {
+      return
+    }
+    if (v == body) {
+      storeWord(slotAddr, idxTombstone)
+      *(g + gcIndexLive) = *(g + gcIndexLive) - 1
+      return
+    }
+    i = (i + 1) % ncap
+    probes = probes + 1
+  }
+}
