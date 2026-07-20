@@ -451,6 +451,13 @@ pub const TypeContext = struct {
     /// GlobalSymbol.pack() -> TypeId, for struct/interface (template, generics
     /// unbound) and type_alias declarations.
     decl_memo: std.AutoHashMapUnmanaged(u64, TypeId) = .{},
+    /// The inverse of `decl_memo` for nominal shapes only (struct/interface/
+    /// enum, not aliases): TypeId -> GlobalSymbol.pack(). `subst` needs it to
+    /// recognize a *template* — an instantiation is recovered through
+    /// `inst_by_result`, but a template is not a recorded instantiation, and
+    /// substituting a generic type's own body (a method signature, §10.4) has
+    /// to monomorphize it through its own rigid params.
+    template_decl: std.AutoHashMapUnmanaged(u32, u64) = .{},
     /// GlobalSymbol.pack() -> signature, for every func_decl (free function or
     /// method) and every generic function's own template signature.
     func_sigs: std.AutoHashMapUnmanaged(u64, FuncShape) = .{},
@@ -561,6 +568,7 @@ pub const TypeContext = struct {
     pub fn deinit(self: *TypeContext) void {
         self.types.deinit();
         self.decl_memo.deinit(self.gpa);
+        self.template_decl.deinit(self.gpa);
         self.func_sigs.deinit(self.gpa);
         self.func_attrs.deinit(self.gpa);
         self.pinned_symbols.deinit(self.gpa);
@@ -840,7 +848,8 @@ pub const TypeContext = struct {
             // interface that is not a recorded nominal instantiation (a plain
             // type, or a template) has no params to bind — return it unchanged.
             .@"struct", .interface, .@"enum" => {
-                const rec_idx = self.inst_by_result.get(@intFromEnum(ty)) orelse return ty;
+                const rec_idx = self.inst_by_result.get(@intFromEnum(ty)) orelse
+                    return self.substTemplate(ty, env, depth);
                 const rec = self.instantiations.items[rec_idx];
                 var buf = try self.gpa.alloc(TypeId, rec.args.len);
                 defer self.gpa.free(buf);
@@ -863,6 +872,34 @@ pub const TypeContext = struct {
     /// self-referential field re-entering here finds the reserved id via
     /// `findInstantiation`. Bounds are not re-checked (the outer use site
     /// already did); generic-type methods are deferred, so none are copied.
+    /// `subst` for a nominal type that is a generic declaration's *template*
+    /// rather than a recorded instantiation. Its "arguments" are its own rigid
+    /// `type_param` ids, so binding those through `env` and re-instantiating
+    /// yields the concrete type. This is the path a generic type's own method
+    /// signature takes (`function (s: Stack<T>) push(v: T): Stack<T>` — the
+    /// result is the template, and monomorphizing `push` must carry it to
+    /// `Stack<i64>`). A non-generic template substitutes to itself.
+    fn substTemplate(self: *TypeContext, ty: TypeId, env: GenericEnv, depth: u32) Error!TypeId {
+        const packed_gsym = self.template_decl.get(@intFromEnum(ty)) orelse return ty;
+        const params = self.decl_generics.get(packed_gsym) orelse return ty;
+        if (params.len == 0) return ty;
+
+        var buf = try self.gpa.alloc(TypeId, params.len);
+        defer self.gpa.free(buf);
+        var changed = false;
+        for (params, 0..) |p, i| {
+            const rigid = try self.typeParamId(p);
+            buf[i] = try self.subst(rigid, env, depth + 1);
+            if (buf[i] != rigid) changed = true;
+        }
+        if (!changed) return ty;
+        const generic = GlobalSymbol{
+            .module = @enumFromInt(@as(u32, @truncate(packed_gsym >> 32))),
+            .id = @enumFromInt(@as(u32, @truncate(packed_gsym))),
+        };
+        return self.reinstantiate(generic, buf, depth + 1);
+    }
+
     fn reinstantiate(self: *TypeContext, generic: GlobalSymbol, args: []const TypeId, depth: u32) Error!TypeId {
         if (self.findInstantiation(generic, args)) |id| return id;
         const template = self.decl_memo.get(generic.pack()) orelse return .invalid;
@@ -913,6 +950,37 @@ pub const TypeContext = struct {
                 self.types.fill(id, .{ .interface = try dupe(self.arena(), Method, nm) });
             },
             else => unreachable,
+        }
+        // Methods (§10.4) travel with the type: a generic type's method set is
+        // held on its template with the declaration's own rigid params, so each
+        // signature substitutes exactly like a field type does.
+        if (self.methodsOf(template)) |src| {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(self.gpa);
+            var sigs: std.ArrayList(Method) = .empty;
+            defer sigs.deinit(self.gpa);
+            var it = src.iterator();
+            while (it.next()) |e| {
+                try names.append(self.gpa, e.key_ptr.*);
+                try sigs.append(self.gpa, e.value_ptr.*);
+            }
+            for (sigs.items, 0..) |m, i| {
+                var mp = try self.gpa.alloc(TypeId, m.params.len);
+                defer self.gpa.free(mp);
+                for (m.params, 0..) |p, j| mp[j] = try self.subst(p, env2, depth + 1);
+                const sm = Method{
+                    .name = m.name,
+                    .params = try dupe(self.arena(), TypeId, mp),
+                    .variadic = m.variadic,
+                    // `exported` is left at its default, matching `Checker`'s
+                    // `substMethod` — the two instance-population paths must
+                    // agree (see #1528 on which of them is right).
+                    .result = try self.subst(m.result, env2, depth + 1),
+                };
+                // Re-fetched per method: interning above can grow the map.
+                const dst = try self.methodBucket(id);
+                try dst.put(self.gpa, names.items[i], sm);
+            }
         }
         if (self.display_names.get(@intFromEnum(template))) |nm| try self.display_names.put(self.gpa, @intFromEnum(id), nm);
         return id;
@@ -1414,6 +1482,18 @@ const Checker = struct {
 
     // ---- declared type templates (struct/interface/alias) ------------------
 
+    /// Whether `args` is exactly `gsym`'s own generic parameters, each still
+    /// bound to its rigid `type_param` id — i.e. the "instantiation" is the
+    /// identity one and denotes the template.
+    fn isOwnParams(self: *Checker, gsym: GlobalSymbol, args: []const TypeId) Error!bool {
+        const gparams = self.ctx.decl_generics.get(gsym.pack()) orelse return false;
+        if (gparams.len == 0 or gparams.len != args.len) return false;
+        for (gparams, 0..) |gp, i| {
+            if (args[i] != try self.ctx.typeParamId(gp)) return false;
+        }
+        return true;
+    }
+
     fn declGenericArity(self: *Checker, gsym: GlobalSymbol) u32 {
         const gp = self.ctx.decl_generics.get(gsym.pack()) orelse return 0;
         return @intCast(gp.len);
@@ -1492,6 +1572,7 @@ const Checker = struct {
     fn buildStructTemplate(self: *Checker, gsym: GlobalSymbol, sym: Symbol) Error!TypeId {
         const placeholder = try self.ctx.types.reserve(.{ .@"struct" = &.{} });
         try self.ctx.decl_memo.put(self.gpa, gsym.pack(), placeholder);
+        try self.ctx.template_decl.put(self.gpa, @intFromEnum(placeholder), gsym.pack());
         const mf = self.files[sym.file_idx];
         const k = mf.tree.kids(sym.decl); // [name, generics, field_list]
         const env = try self.buildOwnGenericEnv(gsym, sym.file_idx, k[1]);
@@ -1513,6 +1594,7 @@ const Checker = struct {
     fn buildEnumTemplate(self: *Checker, gsym: GlobalSymbol, sym: Symbol) Error!TypeId {
         const placeholder = try self.ctx.types.reserve(.{ .@"enum" = .{ .decl = gsym, .variants = &.{} } });
         try self.ctx.decl_memo.put(self.gpa, gsym.pack(), placeholder);
+        try self.ctx.template_decl.put(self.gpa, @intFromEnum(placeholder), gsym.pack());
         const mf = self.files[sym.file_idx];
         const k = mf.tree.kids(sym.decl); // [name, generics, variant_list]
         const env = try self.buildOwnGenericEnv(gsym, sym.file_idx, k[1]);
@@ -1576,6 +1658,7 @@ const Checker = struct {
     fn buildInterfaceTemplate(self: *Checker, gsym: GlobalSymbol, sym: Symbol) Error!TypeId {
         const placeholder = try self.ctx.types.reserve(.{ .interface = &.{} });
         try self.ctx.decl_memo.put(self.gpa, gsym.pack(), placeholder);
+        try self.ctx.template_decl.put(self.gpa, @intFromEnum(placeholder), gsym.pack());
         const mf = self.files[sym.file_idx];
         const k = mf.tree.kids(sym.decl); // [name, generics, method_sig_list]
         const env = try self.buildOwnGenericEnv(gsym, sym.file_idx, k[1]);
@@ -1667,10 +1750,18 @@ const Checker = struct {
             },
             else => unreachable,
         }
+        // Snapshotted before substituting: `methodBucket` can insert into the
+        // map *of* buckets and `substMethod` can intern new types, either of
+        // which invalidates a live iterator over the template's bucket. Latent
+        // until generic types gained methods (§10.4) — before that a template's
+        // bucket was always empty here.
         if (self.ctx.methodsOf(template)) |bucket| {
+            var sigs: std.ArrayList(Method) = .empty;
+            defer sigs.deinit(self.gpa);
             var it = bucket.iterator();
-            while (it.next()) |entry| {
-                const sm = try self.substMethod(entry.value_ptr.*, env);
+            while (it.next()) |entry| try sigs.append(self.gpa, entry.value_ptr.*);
+            for (sigs.items) |m| {
+                const sm = try self.substMethod(m, env);
                 const dst = try self.ctx.methodBucket(id);
                 try dst.put(self.gpa, sm.name, sm);
             }
@@ -1682,6 +1773,13 @@ const Checker = struct {
     /// Instantiates generic declaration `gsym` at concrete `args`, validating
     /// arity/bounds and recording a monomorphization-ready `Instantiation`.
     fn instantiateGeneric(self: *Checker, gsym: GlobalSymbol, args: []const TypeId, mf: ModuleFile, node: ast.Index) Error!TypeId {
+        // `Stack<T>` written inside `Stack`'s own template — a method's receiver
+        // or result, or a self-referential field — names the template itself,
+        // not a fresh instantiation: every argument is that declaration's own
+        // rigid parameter, so substituting them changes nothing. Without this
+        // the two are distinct `TypeId`s and `return s` fails against its own
+        // declared result type.
+        if (try self.isOwnParams(gsym, args)) return self.declTypeOf(gsym);
         if (self.ctx.findInstantiation(gsym, args)) |id| return id;
         const gparams = self.ctx.decl_generics.get(gsym.pack()) orelse &[_]GlobalSymbol{};
         var env_buf = try self.gpa.alloc(GenericBinding, gparams.len);
@@ -1862,17 +1960,78 @@ const Checker = struct {
         return attrs;
     }
 
+    const RecvInfo = struct { ty: TypeId, env: GenericEnv };
+
+    /// A method's receiver type plus the generic env its signature and body are
+    /// checked against (§10.4).
+    ///
+    /// For a receiver on a generic struct (`function (s: Stack<T>) push(v: T)`)
+    /// the parser put `T` on the method's own generics list, where
+    /// `buildLocalGenericEnv` bound it to a *fresh* rigid id. That id is the
+    /// wrong one: the method is registered on the struct's uninstantiated
+    /// template, and `instantiateRecursive` substitutes the template's method
+    /// bucket through an env keyed by the struct's own param symbols. So the
+    /// leading params are rebound, by position, to the struct's rigid ids —
+    /// after which the method's signature substitutes at every instantiation
+    /// for free, exactly like a field type does.
+    ///
+    /// Any params the method declares beyond the receiver's keep their own
+    /// fresh ids, and a non-generic receiver takes the ordinary `checkType`
+    /// path unchanged.
+    fn receiverInfo(self: *Checker, file_idx: usize, rk: []const ast.Index, generics_node: ast.Index, env: GenericEnv) Error!RecvInfo {
+        const mf = self.files[file_idx];
+        const gsym = self.nodeSymbol(file_idx, rk[1]) orelse return self.plainRecv(file_idx, rk[1], env);
+        switch (self.symbolOf(gsym).kind) {
+            .struct_type, .interface_type, .type_alias, .enum_type => {},
+            else => return self.plainRecv(file_idx, rk[1], env),
+        }
+        // Forces the template (and with it `decl_generics`) to exist: a method
+        // may be declared before the type it attaches to.
+        const template = try self.declTypeOf(gsym);
+        const gparams = self.ctx.decl_generics.get(gsym.pack()) orelse &[_]GlobalSymbol{};
+        if (gparams.len == 0) return self.plainRecv(file_idx, rk[1], env);
+
+        const declared = if (generics_node == ast.none) 0 else mf.tree.kids(generics_node).len;
+        if (declared < gparams.len or env.len < gparams.len) {
+            const nm = self.symbolOf(gsym).name;
+            try self.emit(mf, rk[1], .generic_arity_mismatch, "receiver type '{s}' needs {d} type parameter(s); write '{s}<...>'", .{ nm, gparams.len, nm }, "a method on a generic type declares that type's parameters on its receiver");
+            return .{ .ty = .invalid, .env = env };
+        }
+
+        const bindings = try self.gpa.alloc(GenericBinding, env.len);
+        defer self.gpa.free(bindings);
+        @memcpy(bindings, env);
+        for (gparams, 0..) |gp, i| bindings[i] = .{ .sym = env[i].sym, .to = try self.ctx.typeParamId(gp) };
+        return .{ .ty = template, .env = try dupe(self.ctx.arena(), GenericBinding, bindings) };
+    }
+
+    /// A receiver that names no generic type: the ordinary type-evaluation path.
+    fn plainRecv(self: *Checker, file_idx: usize, node: ast.Index, env: GenericEnv) Error!RecvInfo {
+        return .{ .ty = try self.checkType(file_idx, node, env), .env = env };
+    }
+
     fn collectFuncDecl(self: *Checker, file_idx: usize, idx: ast.Index, exported: bool) Error!void {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(idx); // [recv, name, generics, params, result, body, attrs_or_none]
         const is_method = k[0] != ast.none;
         var gsym: ?GlobalSymbol = null;
-        const env: GenericEnv = if (is_method)
+        var env: GenericEnv = if (is_method)
             try self.buildLocalGenericEnv(file_idx, k[2])
         else blk: {
             gsym = self.nodeSymbol(file_idx, k[1]).?;
             break :blk try self.buildOwnGenericEnv(gsym.?, file_idx, k[2]);
         };
+
+        // The receiver is resolved *before* the signature: on a generic struct
+        // it rebinds the method's leading type params to the struct's own rigid
+        // ids, which the parameter and result types below are written against.
+        var recv_ty: TypeId = .invalid;
+        if (is_method) {
+            const info = try self.receiverInfo(file_idx, mf.tree.kids(k[0]), k[2], env);
+            recv_ty = info.ty;
+            env = info.env;
+            if (recv_ty == .invalid) return; // already diagnosed; don't cascade
+        }
 
         const param_nodes = mf.tree.kids(k[3]);
         var params = try self.gpa.alloc(TypeId, param_nodes.len);
@@ -1912,9 +2071,6 @@ const Checker = struct {
         if (fattrs.symbol != null)
             try self.emit(mf, k[1], .symbol_attr_invalid, "method '{s}' cannot pin a symbol name", .{Checker.identText(mf, k[1])}, "@symbol applies to free functions only");
 
-        const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
-        const recv_ty = try self.checkType(file_idx, rk[1], env);
-        if (recv_ty == .invalid) return; // receiver type already failed to resolve; don't cascade
         const name = Checker.identText(mf, k[1]);
         const method = Method{ .name = name, .params = shape.params, .variadic = shape.variadic, .result = shape.result, .exported = exported };
         const bucket = try self.ctx.methodBucket(recv_ty);
@@ -2049,6 +2205,54 @@ const Checker = struct {
             for (mf.tree.kids(mf.tree.root)) |decl_idx| {
                 if (decl_idx == ast.none) continue;
                 try self.collectTopDecl(file_idx, decl_idx);
+            }
+        }
+        try self.backfillInstanceMethods();
+    }
+
+    /// Copies a generic type's methods onto instantiations that were created
+    /// *before* the method declarations were collected (a signature naming
+    /// `Stack<i64>` ahead of `function (s: Stack<T>) push(...)` in source
+    /// order). `instantiateRecursive` copies the template's method bucket, but
+    /// only for instances it builds after the bucket is filled; this closes the
+    /// gap for the rest. Names already present are left alone, so an instance
+    /// built the normal way is untouched.
+    fn backfillInstanceMethods(self: *Checker) Error!void {
+        var pending: std.ArrayList(Method) = .empty;
+        defer pending.deinit(self.gpa);
+
+        var i: usize = 0;
+        // Indexed, not `for (items)`: substitution can intern new types and so
+        // append further instantiations, which must be back-filled too.
+        while (i < self.ctx.instantiations.items.len) : (i += 1) {
+            const inst = self.ctx.instantiations.items[i];
+            const template = self.ctx.decl_memo.get(inst.generic.pack()) orelse continue; // function instantiation: no method set
+            if (template == inst.result) continue;
+            const gparams = self.ctx.decl_generics.get(inst.generic.pack()) orelse continue;
+            if (gparams.len != inst.args.len) continue; // arity already diagnosed
+
+            pending.clearRetainingCapacity();
+            {
+                const src = self.ctx.methodsOf(template) orelse continue;
+                const dst = self.ctx.methodsOf(inst.result);
+                var it = src.iterator();
+                while (it.next()) |e| {
+                    if (dst != null and dst.?.contains(e.key_ptr.*)) continue;
+                    try pending.append(self.gpa, e.value_ptr.*);
+                }
+            }
+            if (pending.items.len == 0) continue;
+
+            var env_buf = try self.gpa.alloc(GenericBinding, gparams.len);
+            defer self.gpa.free(env_buf);
+            for (gparams, 0..) |gp, j| env_buf[j] = .{ .sym = gp, .to = inst.args[j] };
+
+            for (pending.items) |m| {
+                const sm = try self.substMethod(m, env_buf);
+                // Re-fetched each round: `substMethod` may have interned types
+                // and grown the method-set map, invalidating an older pointer.
+                const dst = try self.ctx.methodBucket(inst.result);
+                try dst.put(self.gpa, sm.name, sm);
             }
         }
     }

@@ -964,9 +964,12 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     // different types can reuse a method name), so their signature comes from
     // the receiver's method set and they get `FuncId`s after the instantiations.
     // `l.method_table` maps (receiver type, name) -> that id.
-    const MethodDecl = struct { module: ModuleId, file_idx: usize, decl: ast.Index, name: []const u8, ty: TypeId, shape: check.FuncShape };
+    const MethodDecl = struct { module: ModuleId, file_idx: usize, decl: ast.Index, name: []const u8, ty: TypeId, shape: check.FuncShape, gen_env: GenericEnv };
     var method_decls: std.ArrayList(MethodDecl) = .empty;
-    defer method_decls.deinit(gpa);
+    defer {
+        for (method_decls.items) |m| if (m.gen_env.len > 0) gpa.free(@constCast(m.gen_env));
+        method_decls.deinit(gpa);
+    }
     const method_base = base + func_inst_count;
     for (modules, 0..) |mod, mi| {
         for (mod.files, 0..) |mf, fidx| {
@@ -977,20 +980,41 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
                 const k = mf.tree.kids(inner); // [recv, name, generics, params, result, body]
                 if (k[0] == ast.none) continue; // free function, handled by Pass A
                 const rk = mf.tree.kids(k[0]); // receiver: [name, type_name]
-                if (mf.tree.get(rk[1]).tag != .ident) continue; // generic-struct receiver: deferred
+                if (mf.tree.get(rk[1]).tag != .ident) continue;
                 const recv_sid = mod.rmodule.node_symbols[fidx][rk[1]];
                 if (recv_sid == .none) continue;
                 const recv_gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = recv_sid };
-                if (ctx.decl_generics.get(recv_gsym.pack())) |gens| {
-                    if (gens.len > 0) continue; // method on a generic struct: deferred
-                }
-                const recv_ty = ctx.decl_memo.get(recv_gsym.pack()) orelse continue;
                 const name = identTextOf(mf, k[1]);
+                const template = ctx.decl_memo.get(recv_gsym.pack()) orelse continue;
+                const gens = ctx.decl_generics.get(recv_gsym.pack()) orelse &[_]GlobalSymbol{};
+
+                // A method on a generic type is monomorphized like a generic
+                // function: one body per instantiation of the receiver, each
+                // lowered under that instantiation's substitution env. The
+                // signature is read off the *instance's* method set, which the
+                // checker already substituted.
+                if (gens.len > 0) {
+                    for (ctx.instantiations.items) |inst| {
+                        if (inst.generic.pack() != recv_gsym.pack()) continue;
+                        if (inst.args.len != gens.len) continue;
+                        const bucket = ctx.methodsOf(inst.result) orelse continue;
+                        const method = bucket.get(name) orelse continue;
+                        const env = try gpa.alloc(GenericBinding, gens.len);
+                        errdefer gpa.free(env);
+                        for (gens, 0..) |gp, gi| env[gi] = .{ .sym = gp, .to = inst.args[gi] };
+                        const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
+                        try l.method_table.append(gpa, .{ .ty = inst.result, .name = name, .fid = fid, .result = method.result, .params = method.params, .variadic = method.variadic });
+                        try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .ty = inst.result, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result }, .gen_env = env });
+                    }
+                    continue;
+                }
+
+                const recv_ty = template;
                 const bucket = ctx.methodsOf(recv_ty) orelse continue;
                 const method = bucket.get(name) orelse continue;
                 const fid: ir.FuncId = @enumFromInt(method_base + method_decls.items.len);
                 try l.method_table.append(gpa, .{ .ty = recv_ty, .name = name, .fid = fid, .result = method.result, .params = method.params, .variadic = method.variadic });
-                try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .ty = recv_ty, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result } });
+                try method_decls.append(gpa, .{ .module = @enumFromInt(mi), .file_idx = fidx, .decl = inner, .name = name, .ty = recv_ty, .shape = .{ .params = method.params, .variadic = method.variadic, .result = method.result }, .gen_env = &.{} });
             }
         }
     }
@@ -1102,7 +1126,7 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
         // spelling is free — it only has to be collision-proof.
         const nm = try std.fmt.allocPrint(gpa, "{s}$t{d}", .{ base_nm, @intFromEnum(m.ty) });
         defer gpa.free(nm);
-        const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, &.{}, nm);
+        const f = try l.lowerFunctionDecl(m.file_idx, m.decl, m.shape, m.gen_env, nm);
         try l.out.funcs.append(gpa, f);
     }
 

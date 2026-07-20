@@ -595,13 +595,14 @@ const Parser = struct {
         const kw_span = self.tok.span;
         try self.advance(); // 'function'
         var recv: Index = none;
+        var recv_generics: Index = none;
         if (self.tok.kind == .l_paren) {
             try self.advance();
-            recv = try self.parseReceiver();
+            recv = try self.parseReceiver(&recv_generics);
             _ = try self.expect(.r_paren, "')'");
         }
         const name = try self.expectIdent();
-        const generics = try self.maybeGenericParams();
+        const generics = try self.mergeGenericParams(recv_generics, try self.maybeGenericParams());
         const params = try self.parseParams();
         var result: Index = none;
         if (try self.accept(.colon)) result = try self.parseResultType();
@@ -640,11 +641,38 @@ const Parser = struct {
         return self.tree.add(.extern_fn_decl, join(start, end), 0, &.{ name, params, result });
     }
 
-    fn parseReceiver(self: *Parser) ParseError!Index {
+    /// `receiver = IDENT ':' IDENT [ generic_params ]` (§10.4).
+    ///
+    /// A receiver on a generic struct (`(s: Stack<T>)`) *declares* `T`, it does
+    /// not use it — there is nothing in scope for `T` to name yet. So the list
+    /// is parsed as generic params and handed back through `out_generics` to
+    /// lead the method's own `<...>`; the receiver node keeps its two-child
+    /// shape and names the uninstantiated template.
+    fn parseReceiver(self: *Parser, out_generics: *Index) ParseError!Index {
         const name = try self.expectIdent();
         _ = try self.expect(.colon, "':'");
-        const ty = try self.expectIdent(); // receiver = IDENT ':' type_name (type_name = IDENT)
+        const ty = try self.expectIdent();
+        out_generics.* = try self.maybeGenericParams();
+        // The span covers the two kids only, not the type-param list: it stays
+        // what a plain receiver's is, and the list has its own node.
         return self.tree.add(.receiver, join(self.span(name), self.span(ty)), 0, &.{ name, ty });
+    }
+
+    /// Concatenates the receiver's type params with the method's own
+    /// (`function (s: Stack<T>) mapped<U>()`), receiver params first so
+    /// `collectFuncDecl` can zip them against the struct's declared params by
+    /// position. Either side may be absent.
+    fn mergeGenericParams(self: *Parser, a: Index, b: Index) ParseError!Index {
+        if (a == none) return b;
+        if (b == none) return a;
+        const merged_span = join(self.span(a), self.span(b));
+        const ak = self.tree.kids(a);
+        const bk = self.tree.kids(b);
+        const items = try self.gpa.alloc(Index, ak.len + bk.len);
+        defer self.gpa.free(items);
+        @memcpy(items[0..ak.len], ak);
+        @memcpy(items[ak.len..], bk);
+        return self.tree.add(.generic_params, merged_span, 0, items);
     }
 
     fn parseParams(self: *Parser) ParseError!Index {
