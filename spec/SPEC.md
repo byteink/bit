@@ -1494,6 +1494,10 @@ arrow_p    = IDENT [ ":" type ] .
 - Parameter types and the return type are inferred from the expected function type
   (§15.3) when omitted, or written explicitly.
 - A `=> expression` body returns that expression; a `=> block` body uses `return`.
+- With no expected function type, the result is inferred from the body: the
+  expression body's own type, or the first `return`'s expression type in a block
+  body, in each case with an untyped constant taken at its default type (§15.4).
+  A block body with no value-returning `return` has result `()`.
 - To disambiguate from a parenthesized expression, the parser commits to an arrow
   function when a `)` is immediately followed by `=>`. This is one token of
   lookahead after the matching `)`.

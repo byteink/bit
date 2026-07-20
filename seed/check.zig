@@ -3827,15 +3827,16 @@ const Checker = struct {
             try self.bindSimple(file_idx, pk[0], pty);
         }
 
-        // A `=> block` body uses explicit `return` (§12.8); with no expected
-        // function type there's nothing to check `return`s against — narrow
-        // gap, matches real usage where an arrow fn is almost always passed
-        // where an expected function type is available (a call argument, an
-        // annotated binding).
+        // A `=> block` body uses explicit `return` (§12.8). With an expected
+        // function type the `return`s are checked against its result; without
+        // one the result is INFERRED from the first `return` (#1488) rather
+        // than falling through to `()` — `(x: f32) => { return 4.5 }` typed as
+        // returning nothing, so every use of its value failed against '()'.
         const inner_fctx = FnCtx{ .env = env, .result_ty = expected_result, .err_ty = .invalid };
         var result: TypeId = expected_result;
         if (mf.tree.get(k[1]).tag == .block) {
             try self.checkBlock(file_idx, k[1], inner_fctx);
+            if (result == .invalid) result = self.arrowBlockResult(file_idx, k[1]);
             if (result == .invalid) result = self.ctx.void_id;
         } else {
             result = try self.checkExpr(file_idx, k[1], env, inner_fctx, expected_result);
@@ -3852,6 +3853,29 @@ const Checker = struct {
         }
 
         return self.ctx.types.intern(.{ .func = .{ .params = try dupe(self.ctx.arena(), TypeId, params), .variadic = false, .result = result } });
+    }
+
+    /// The result type a `=> { … }` arrow infers when no expected function type
+    /// supplies one: the DEFAULTED type of the first `return <expr>` in the
+    /// body, or `.invalid` when the body returns nothing.
+    ///
+    /// Types are read back from the sweep `checkBlock` has already run, never
+    /// re-checked, so a bad return expression is not diagnosed twice. A nested
+    /// arrow's `return`s belong to that arrow, so its subtree is skipped.
+    fn arrowBlockResult(self: *Checker, file_idx: usize, node: ast.Index) TypeId {
+        const mf = self.files[file_idx];
+        const tag = mf.tree.get(node).tag;
+        if (tag == .arrow_fn) return .invalid;
+        if (tag == .return_stmt) {
+            const k = mf.tree.kids(node);
+            if (k.len != 1) return .invalid; // bare `return`, or a tuple result
+            return self.defaultType(self.typeOfNode(file_idx, k[0]));
+        }
+        for (mf.tree.kids(node)) |kid| {
+            const t = self.arrowBlockResult(file_idx, kid);
+            if (t != .invalid) return t;
+        }
+        return .invalid;
     }
 
     // ---- composite/slice literals (§12.2, §12.3, §15.2) ----------------------
