@@ -1,0 +1,216 @@
+// Bit standard library — crypto module, X.509 chain building and verification (RFC 5280).
+
+// ---------------------------------------------------------------------------
+// Chain building and verification
+// ---------------------------------------------------------------------------
+
+// Verify `leaf` up to a trusted root, returning on success and failing with a
+// specific error for the first problem found. In order: the hostname must match
+// the leaf's SubjectAltName; the leaf must be within its validity window and, if
+// it declares an ExtendedKeyUsage, must permit server authentication; then a path
+// is built by matching each certificate's issuer DN to a candidate subject —
+// preferring the trusted `roots`, else the untrusted `intermediates` — verifying
+// every signature and requiring every issuer to be a CA whose key usage permits
+// certificate signing and whose validity window contains `nowUnix`. Finally the
+// path-length constraints are enforced. `nowUnix` is injected (never read from a
+// clock) so verification is deterministic.
+export function x509VerifyChain(
+  leaf: Certificate,
+  intermediates: []Certificate,
+  roots: []Certificate,
+  hostname: string,
+  nowUnix: int,
+): ()! {
+  if (!x509MatchHostname(leaf, hostname)) {
+    fail newError("x509: certificate is not valid for hostname ${hostname}")
+  }
+  x509CheckValidity(leaf, nowUnix)?
+  if (leaf.hasExtKeyUsage && !x509AllowsServerAuth(leaf)) {
+    fail newError("x509: leaf certificate is not valid for server authentication")
+  }
+
+  let chain = []Certificate(0)
+  chain = append(chain, leaf)
+  let current = leaf
+  let reachedRoot = false
+  let depth = 0
+  while (depth < x509MaxChainDepth && !reachedRoot) {
+    let ri = x509FindIssuer(current, roots)
+    if (ri >= 0) {
+      let issuer = roots[ri]
+      x509CheckIssuer(issuer, nowUnix)?
+      if (!x509VerifySignature(current, issuer)) {
+        fail newError("x509: signature verification failed")
+      }
+      chain = append(chain, issuer)
+      reachedRoot = true
+    } else {
+      let ii = x509FindIssuer(current, intermediates)
+      if (ii < 0) {
+        fail newError("x509: unable to build chain to a trusted root")
+      }
+      let issuer = intermediates[ii]
+      x509CheckIssuer(issuer, nowUnix)?
+      if (!x509VerifySignature(current, issuer)) {
+        fail newError("x509: signature verification failed")
+      }
+      chain = append(chain, issuer)
+      current = issuer
+      depth = depth + 1
+    }
+  }
+  if (!reachedRoot) {
+    fail newError("x509: certificate chain is too long")
+  }
+  x509CheckCriticalExts(chain)?
+  x509CheckNameConstraints(chain)?
+  x509CheckPathLen(chain)?
+}
+
+// Enforce every CA's nameConstraints across the path (RFC 5280 §6.1.3(b)). A CA's
+// constraints bind every certificate BELOW it, never itself, so for each
+// constraining CA at index `i` (0 = leaf, ascending toward the root) the
+// certificates at 0..i-1 are checked against it. Applying each CA's set
+// independently is equivalent to the RFC's running intersection of permitted
+// subtrees and union of excluded ones, and avoids carrying mutable path state.
+//
+// Only SubjectAltName dNSName entries are matched; the deprecated subject-CN
+// fallback is not consulted, consistent with `x509MatchHostname`. A certificate
+// carrying no dNSName is not constrained by a dNSName subtree — the RFC applies
+// a constraint only to names of that form that are actually present.
+function x509CheckNameConstraints(chain: []Certificate): ()! {
+  let i = 1
+  while (i < len(chain)) {
+    let ca = chain[i]
+    if (ca.hasNameConstraints) {
+      let j = 0
+      while (j < i) {
+        x509CheckDnsAgainst(ca, chain[j])?
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Fail unless every dNSName in `cert`'s SubjectAltName satisfies `ca`'s permitted
+// subtrees and avoids its excluded ones. Excluded is checked first: RFC 5280
+// §4.2.1.10 gives exclusion precedence over permission.
+function x509CheckDnsAgainst(ca: Certificate, cert: Certificate): ()! {
+  for raw of cert.dnsNames {
+    let name = x509ToLower(raw)
+    for e of ca.excludedDnsNames {
+      if (x509DnsInSubtree(name, e)) {
+        fail newError("x509: ${raw} is excluded by a name constraint")
+      }
+    }
+    if (ca.hasPermittedDns && !x509DnsPermitted(name, ca.permittedDnsNames)) {
+      fail newError("x509: ${raw} is not permitted by a name constraint")
+    }
+  }
+}
+
+// Whether `name` sits inside at least one of the permitted `subtrees`.
+function x509DnsPermitted(name: string, subtrees: []string): bool {
+  for s of subtrees {
+    if (x509DnsInSubtree(name, s)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether the (lower-cased) DNS `name` lies within the (lower-cased) subtree
+// `base`, per RFC 5280 §4.2.1.10: a name satisfies the constraint when it equals
+// the base or extends it by whole labels on the left. So `example.com` covers
+// `example.com` and `www.host.example.com`, but NOT `notexample.com` — the label
+// boundary is required, which is what makes this a subtree test rather than a
+// suffix test.
+function x509DnsInSubtree(name: string, base: string): bool {
+  if (name == base) {
+    return true
+  }
+  if (len(name) <= len(base) + 1) {
+    return false
+  }
+  let cut = len(name) - len(base)
+  if (name[cut - 1] != 46) {
+    return false
+  }
+  return name[cut:len(name)] == base
+}
+
+// Enforce RFC 5280 §4.2 across the whole path: reject if any certificate carries
+// a critical extension this verifier does not recognize. Checked for every
+// certificate in the built path, not just the leaf — a critical extension on an
+// intermediate constrains everything beneath it just as much.
+function x509CheckCriticalExts(chain: []Certificate): ()! {
+  let i = 0
+  while (i < len(chain)) {
+    let oids = chain[i].unknownCriticalOids
+    if (len(oids) > 0) {
+      fail newError("x509: unrecognized critical extension ${oids[0]}")
+    }
+    i = i + 1
+  }
+}
+
+// The index in `pool` of the first certificate whose subject DN equals `cert`'s
+// issuer DN, or -1 if none. DN equality is the linking rule; the signature is
+// verified separately by the caller.
+function x509FindIssuer(cert: Certificate, pool: []Certificate): int {
+  let i = 0
+  while (i < len(pool)) {
+    if (pool[i].subject == cert.issuer) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Fail unless `nowUnix` is within `[notBefore, notAfter]`.
+function x509CheckValidity(cert: Certificate, nowUnix: int): ()! {
+  if (nowUnix < cert.notBefore) {
+    fail newError("x509: certificate is not yet valid")
+  }
+  if (nowUnix > cert.notAfter) {
+    fail newError("x509: certificate has expired")
+  }
+}
+
+// Fail unless `cert` is a usable CA at `nowUnix`: valid, marked as a CA by
+// BasicConstraints, and (if it declares KeyUsage) permitting keyCertSign.
+function x509CheckIssuer(cert: Certificate, nowUnix: int): ()! {
+  x509CheckValidity(cert, nowUnix)?
+  if (!cert.hasBasicConstraints || !cert.isCa) {
+    fail newError("x509: issuer is not a CA")
+  }
+  if (cert.hasKeyUsage && (cert.keyUsage & x509KuKeyCertSign) == 0) {
+    fail newError("x509: issuer key usage does not permit certificate signing")
+  }
+}
+
+// Enforce every CA's pathLenConstraint: a CA at position `i` (0 = leaf) has `i-1`
+// intermediate CAs beneath it toward the leaf, which must not exceed its declared
+// maximum.
+function x509CheckPathLen(chain: []Certificate): ()! {
+  let i = 1
+  while (i < len(chain)) {
+    if (chain[i].hasPathLen && i - 1 > chain[i].maxPathLen) {
+      fail newError("x509: path length constraint exceeded")
+    }
+    i = i + 1
+  }
+}
+
+// Whether `cert`'s ExtendedKeyUsage permits TLS server authentication — either
+// id-kp-serverAuth or anyExtendedKeyUsage is present.
+function x509AllowsServerAuth(cert: Certificate): bool {
+  for oid of cert.extKeyUsageOids {
+    if (oid == x509OidServerAuth || oid == x509OidAnyExtKeyUsage) {
+      return true
+    }
+  }
+  return false
+}
