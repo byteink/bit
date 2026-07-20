@@ -1,0 +1,344 @@
+// Self-host Stage 3 (#1342): ARM64 per-function context, frame layout and
+// parallel-move sequencing, split out of arm64.bit (#1503). Sibling .bit file,
+// same module: see arm64.bit for the backend overview.
+
+// ===========================================================================
+// Per-function context
+//
+// Everything the instruction selectors read or append to while compiling one
+// IrFunc. The seed's `Ctx` (compiler/codegen/arm64.zig) additionally carries an
+// allocator and an `owned_syms` list to free the `__bitstr_N` symbol names it
+// mints; both are Zig memory bookkeeping with no counterpart here.
+// ===========================================================================
+
+struct JumpFixup {
+  patchOffset: int,
+  // Condition code, or -1 for an unconditional B — Bit has no optional int and
+  // no condition is negative.
+  cond: int,
+  target: int, // BlockId
+}
+
+struct A64Ctx {
+  module: IrModule,
+  f: IrFunc,
+  code: ByteBuf,
+  relocs: []Reloc,
+  // IR instruction index -> vreg (the allocator's dense numbering).
+  instToVreg: []int,
+  result: RegAllocResult,
+  // Allocatable register index -> physical register number, per class.
+  intRegs: []int,
+  floatRegs: []int,
+  frame: FrameInfo,
+  blockOffsets: []int,
+  jumpFixups: []JumpFixup,
+  safepoints: []SafepointView,
+  safepointPositions: []int,
+  nextSafepointIdx: int,
+}
+
+function codeLen(cx: A64Ctx): int {
+  return len(cx.code.bytes)
+}
+
+// ---- relocations -----------------------------------------------------------
+
+// BL with a placeholder imm26 the linker patches from the branch relocation.
+function emitCallReloc(cx: A64Ctx, symbol: string) {
+  let off = codeLen(cx)
+  emitWord(cx.code, 0x94000000)
+  cx.relocs = append(cx.relocs, Reloc{ offset: off, symbol: symbol, kind: RelocKind.Branch })
+}
+
+// Materializes the address of a static symbol into `dst` via the AArch64
+// ADRP/ADD pair (imm fields are 0 placeholders the linker patches from the
+// page21/pageoff12 relocations). No movabs equivalent exists on AArch64; this is
+// the standard PC-relative address-of sequence.
+function emitAddrOf(cx: A64Ctx, dst: int, symbol: string) {
+  let adrpOff = codeLen(cx)
+  emitWord(cx.code, 0x90000000 | dst) // ADRP dst, 0
+  cx.relocs = append(cx.relocs, Reloc{ offset: adrpOff, symbol: symbol, kind: RelocKind.Page21 })
+  let addOff = codeLen(cx)
+  emitWord(cx.code, 0x91000000 | (dst << 5) | dst) // ADD dst, dst, #0
+  cx.relocs = append(cx.relocs, Reloc{ offset: addOff, symbol: symbol, kind: RelocKind.PageOff12 })
+}
+
+// ---- branch fixups ---------------------------------------------------------
+
+function emitJumpFixup(cx: A64Ctx, target: int) {
+  let off = codeLen(cx)
+  emitWord(cx.code, 0x14000000) // B, imm26=0 placeholder
+  cx.jumpFixups = append(cx.jumpFixups, JumpFixup{ patchOffset: off, cond: -1, target: target })
+}
+
+function emitCondJumpFixup(cx: A64Ctx, cond: int, target: int) {
+  let off = codeLen(cx)
+  emitWord(cx.code, 0x54000000 | cond) // B.cond, imm19=0 placeholder
+  cx.jumpFixups = append(cx.jumpFixups, JumpFixup{ patchOffset: off, cond: cond, target: target })
+}
+
+// Emits a B.cond to a not-yet-known LOCAL code offset (never a real IR block —
+// used only to skip over one side of a `br`'s inline then/else code, resolved by
+// patchLocalCondBranch as soon as that offset is known, unlike jumpFixups which
+// resolve at the very end against blockOffsets).
+function emitLocalCondBranch(cx: A64Ctx, cond: int): int {
+  let off = codeLen(cx)
+  emitWord(cx.code, 0x54000000 | cond)
+  return off
+}
+
+function patchLocalCondBranch(cx: A64Ctx, patchOffset: int) {
+  // The placeholder's low 4 bits are its condition code; patchBranchTo needs it
+  // back to pick the imm19 form.
+  patchBranchTo(cx.code, patchOffset, codeLen(cx), readWordAt(cx.code, patchOffset) & 15)
+}
+
+function patchJumpFixups(cx: A64Ctx) {
+  let i = 0
+  while (i < len(cx.jumpFixups)) {
+    let fx = cx.jumpFixups[i]
+    patchBranchTo(cx.code, fx.patchOffset, cx.blockOffsets[fx.target], fx.cond)
+    i = i + 1
+  }
+}
+
+// ===========================================================================
+// Frame layout
+//
+// SP-relative throughout (no dynamic alloca in this language, so SP never moves
+// except once at entry and once before `ret` — no per-spill x29 indirection
+// needed the way the x86-64 backend uses rbp, though the encoder would happily
+// take any base register). Layout, low to high address:
+//   [0, outgoingBytes)                    outgoing stack-argument area
+//   [outgoingBytes, +spillBytes)          spill slots, 8 bytes each
+//   [+spillBytes, +gprBytes)              saved callee-saved GPRs
+//   [+gprBytes, +fprBytes)                saved callee-saved FP regs
+//   [frameSize-16, frameSize-8)           saved x29 (frame record)
+//   [frameSize-8, frameSize)              saved x30 (frame record)
+// frameSize is always a multiple of 16 (AAPCS64 requires SP 16-aligned at all
+// times, not just at call boundaries).
+//
+// The outgoing-argument area holds the 9th+ integer/reference or float argument
+// of any call this function makes (AAPCS64 passes the first eight of each class
+// in x0–x7 / v0–v7; the rest spill to the caller's stack). Sized to the widest
+// call (outgoingBytes) and reserved at the bottom of the frame — rather than a
+// transient `sub sp` per call — precisely because everything here is
+// SP-relative: a mid-body SP shift would move every spill/save offset. The
+// callee finds these same words just above its own frame at
+// [sp + frameSize + 8*k] (its caller stored them at its own [sp + 8*k], and the
+// prologue lowered SP by frameSize).
+// ===========================================================================
+
+struct FrameInfo {
+  savedGpr: []int,
+  savedFpr: []int,
+  numSpillSlots: int,
+  // Bytes reserved at the bottom of the frame for outgoing stack arguments (0 if
+  // every call this function makes fits in registers). A multiple of 8.
+  outgoingBytes: int,
+  frameSize: int,
+}
+
+function spillOffset(fr: FrameInfo, slot: int): int {
+  return fr.outgoingBytes + slot * 8
+}
+
+function gprSaveOffset(fr: FrameInfo, i: int): int {
+  return fr.outgoingBytes + fr.numSpillSlots * 8 + i * 8
+}
+
+function fprSaveOffset(fr: FrameInfo, i: int): int {
+  return fr.outgoingBytes + fr.numSpillSlots * 8 + len(fr.savedGpr) * 8 + i * 8
+}
+
+function savedFpOffset(fr: FrameInfo): int {
+  return fr.frameSize - 16
+}
+
+function savedLrOffset(fr: FrameInfo): int {
+  return fr.frameSize - 8
+}
+
+// SP-relative byte offset of the k-th outgoing stack argument (the caller side
+// stores here just before a `bl`).
+function outgoingArgOffset(k: int): int {
+  return k * 8
+}
+
+// SP-relative byte offset of the k-th incoming stack argument — the words the
+// caller placed just above this frame (see the layout note above).
+function incomingArgOffset(fr: FrameInfo, k: int): int {
+  return fr.frameSize + k * 8
+}
+
+function alignFrame16(raw: int): int {
+  return (raw + 15) & ~15
+}
+
+// ===========================================================================
+// Parallel move sequencing
+//
+// A block's arguments (and a call's) must all be read before any is written:
+// emitting the moves in their natural order clobbers a source that a later move
+// still needs. Two phases: repeatedly drain any move whose destination nothing
+// else reads (a topological order), then break whatever closed cycles remain
+// with a scratch register.
+// ===========================================================================
+
+// One end of a move: a physical register number, or an SP-relative frame offset.
+// Bit has no tagged union; `isReg` selects how `v` reads.
+struct PLoc {
+  isReg: bool,
+  v: int,
+}
+
+function plocReg(r: int): PLoc {
+  return PLoc{ isReg: true, v: r }
+}
+
+function plocMem(off: int): PLoc {
+  return PLoc{ isReg: false, v: off }
+}
+
+function plocEq(a: PLoc, b: PLoc): bool {
+  return a.isReg == b.isReg && a.v == b.v
+}
+
+struct PMove {
+  // `from`/`to` would read better; both are Bit keywords (import syntax).
+  src: PLoc,
+  dst: PLoc,
+}
+
+// Removes element `i` by overwriting it with the last (order is irrelevant to
+// both phases) — the seed's `swapRemove`.
+function swapRemoveMove(ms: []PMove, i: int): []PMove {
+  ms[i] = ms[len(ms) - 1]
+  return ms[0:len(ms) - 1]
+}
+
+function emitMove(cx: A64Ctx, src: PLoc, dst: PLoc, class: RegClass) {
+  if (class == RegClass.Int) {
+    if (src.isReg && dst.isReg) {
+      movRR(cx.code, dst.v, src.v)
+      return
+    }
+    if (src.isReg) {
+      storeImm(cx.code, src.v, regSp(), dst.v, 8)
+      return
+    }
+    if (dst.isReg) {
+      loadImm(cx.code, dst.v, regSp(), src.v, 8, false)
+      return
+    }
+    loadImm(cx.code, scratch1(), regSp(), src.v, 8, false)
+    storeImm(cx.code, scratch1(), regSp(), dst.v, 8)
+    return
+  }
+  if (src.isReg && dst.isReg) {
+    fmovFF(cx.code, dst.v, src.v, 8)
+    return
+  }
+  if (src.isReg) {
+    storeImmF(cx.code, src.v, regSp(), dst.v, 8)
+    return
+  }
+  if (dst.isReg) {
+    loadImmF(cx.code, dst.v, regSp(), src.v, 8)
+    return
+  }
+  loadImmF(cx.code, fscratch1(), regSp(), src.v, 8)
+  storeImmF(cx.code, fscratch1(), regSp(), dst.v, 8)
+}
+
+// True if any move other than `self` reads `loc`.
+function anyReads(ms: []PMove, self: int, loc: PLoc): bool {
+  let j = 0
+  while (j < len(ms)) {
+    if (j != self && plocEq(ms[j].src, loc)) {
+      return true
+    }
+    j = j + 1
+  }
+  return false
+}
+
+function sequentializeAndEmit(cx: A64Ctx, movesIn: []PMove, class: RegClass) {
+  let moves = []PMove(0)
+  let k = 0
+  while (k < len(movesIn)) {
+    if (!plocEq(movesIn[k].src, movesIn[k].dst)) {
+      moves = append(moves, movesIn[k])
+    }
+    k = k + 1
+  }
+
+  // Phase 1: drain every move nothing else depends on, until only cycles are
+  // left. Each pass emits at least one move or stops, so the outer loop runs at
+  // most len(moves) times.
+  let changed = true
+  while (changed) {
+    changed = false
+    let i = 0
+    while (i < len(moves)) {
+      if (anyReads(moves, i, moves[i].dst)) {
+        i = i + 1
+      } else {
+        emitMove(cx, moves[i].src, moves[i].dst, class)
+        moves = swapRemoveMove(moves, i)
+        changed = true
+      }
+    }
+  }
+
+  // Phase 2: what remains forms closed cycles. Walk one backwards from an
+  // arbitrary move's destination (each location is written exactly once, so the
+  // predecessor is unique) and rotate it through a scratch register.
+  while (len(moves) > 0) {
+    let cycle = []PMove(0)
+    let start = moves[0].dst
+    let cur = start
+    let guard = 0
+    while (guard <= len(movesIn)) {
+      let found = -1
+      let j = 0
+      while (j < len(moves)) {
+        if (plocEq(moves[j].dst, cur)) {
+          found = j
+          break
+        }
+        j = j + 1
+      }
+      assert(found >= 0) // invariant: what's left forms closed cycles
+      let mv = moves[found]
+      cycle = append(cycle, mv)
+      moves = swapRemoveMove(moves, found)
+      cur = mv.src
+      if (plocEq(cur, start)) {
+        break
+      }
+      guard = guard + 1
+    }
+    assert(plocEq(cur, start)) // the guard bound never trips before the cycle closes
+    // The cycle scratch holds one location's value across the whole rotation, so
+    // it must be a register emitMove never clobbers as its own temporary. A
+    // mem->mem move inside the cycle routes through scratch1/fscratch1 (see
+    // emitMove), so the cycle must use the *secondary* scratch — otherwise the
+    // first mem->mem rotation step overwrites the saved value and the cycle
+    // resolves to garbage (a spilled loop-carried value swap on a back-edge
+    // silently corrupts, task #1235). scratch2/fscratch2 are reserved and never a
+    // move source/destination, so they are safe to hold across the rotation.
+    let scratch = plocReg(fscratch2())
+    if (class == RegClass.Int) {
+      scratch = plocReg(scratch2())
+    }
+    emitMove(cx, cycle[0].dst, scratch, class)
+    let i = 0
+    while (i + 1 < len(cycle)) {
+      emitMove(cx, cycle[i].src, cycle[i].dst, class)
+      i = i + 1
+    }
+    emitMove(cx, scratch, cycle[len(cycle) - 1].dst, class)
+  }
+}
