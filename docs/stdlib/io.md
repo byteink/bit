@@ -118,3 +118,37 @@ function slurp(): string {
   return stdin().readAll()
 }
 ```
+
+### `Reader.readBytes(n: int): string`
+
+Exactly `n` bytes, or fewer only when the input truly ends first. Bytes already
+buffered by a prior `readLine` are consumed before any refill, so `readBytes`
+composes with `readLine` on the same `Reader` — the basis for length-framed
+protocols such as LSP's `Content-Length`. `n <= 0` reads nothing and touches no
+input.
+
+```bit
+import { Reader } from "std/io"
+
+// The integer after "Content-Length: " in an LSP header line.
+function parseLen(line: string): int {
+  let n = 0
+  let i = len("Content-Length: ")
+  while (i < len(line) && line[i] >= '0' && line[i] <= '9') {
+    n = n * 10 + int(line[i] - '0')
+    i = i + 1
+  }
+  return n
+}
+
+// One LSP-style frame: header line, blank line, then exactly the body's bytes.
+function readFrame(r: Reader): string {
+  let n = 0
+  match (r.readLine()) {
+    Some(h) => { n = parseLen(h) }
+    None => { return "" }
+  }
+  r.readLine() // blank separator line
+  return r.readBytes(n)
+}
+```
