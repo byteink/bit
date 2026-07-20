@@ -1,0 +1,642 @@
+// Self-host `bit fmt` (#1345): the canonical formatter, ported from seed/fmt.zig.
+// AST -> source text, gofmt philosophy — one true style, zero configuration,
+// idempotent. This file holds the printer substrate (comment collection, the
+// Printer state, low-level output, the list/sequence/block helpers) and the
+// public entry point; the per-node dispatch lives in the sibling files
+// fmtdispatch.bit (declarations + statements) and fmtexpr.bit (expressions +
+// types). Siblings are the same module, so this is a plain split.
+//
+// The style is byte-for-byte the seed's: the self-host formatter differential
+// (scripts/selfhost-difffmt.sh) compares seed-fmt output against this over the
+// whole corpus, so every choice here mirrors seed/fmt.zig exactly rather than
+// improving on it. Improving the output would break the differential.
+//
+// Comments are trivia the lexer discards, so they are re-derived by a second
+// pass that re-lexes the source and scans the byte gaps between consecutive
+// real tokens for `//` / `/*` (see collectComments). A gap between two tokens is
+// pure trivia by the lexer's own contract, so this can never misfire on a
+// string literal's contents.
+
+// Columns after which a bracketed list wraps one item per line.
+const fmtMaxWidth = 100
+// Spaces per indent level.
+const fmtIndentWidth = 2
+// Recursion cap, mirroring ast.dump's: a well-formed tree is far shallower, so
+// hitting it means a malformed tree, not deep real input.
+const fmtMaxDepth = 256
+
+// ---- comments --------------------------------------------------------------
+
+// A `//` line comment or `/* */` block comment, as a byte range in the source.
+struct Comment {
+  start: int,
+  end: int,
+  isLine: bool,
+}
+
+// Re-derives every comment in `src` by re-lexing it and scanning the byte gap
+// between each pair of consecutive real tokens. The lexer synthesizes ASI
+// semicolons and a final eof as tokens, exactly as the seed's `lx.next()` does,
+// so the gaps — and therefore the comment set — match the seed byte for byte.
+function collectComments(src: string): []Comment {
+  let toks = lexAll(src)
+  let out = []Comment(0)
+  let prevEnd = 0
+  let i = 0
+  while (i < len(toks)) {
+    let t = toks[i]
+    out = scanGap(out, src, prevEnd, t.start)
+    if (t.kind == Kind.Eof) {
+      break
+    }
+    prevEnd = t.end
+    i = i + 1
+  }
+  return out
+}
+
+// Scans `src[from..to]` — a trivia-only gap between two real tokens — for line
+// and block comments, appending each in source order.
+function scanGap(out: []Comment, src: string, lo: int, hi: int): []Comment {
+  let acc = out
+  let i = lo
+  while (i < hi) {
+    if (src[i] == '/' && i + 1 < hi && src[i + 1] == '/') {
+      let start = i
+      i = i + 2
+      while (i < hi && src[i] != '\n') {
+        i = i + 1
+      }
+      acc = append(acc, Comment{ start: start, end: i, isLine: true })
+    } else if (src[i] == '/' && i + 1 < hi && src[i + 1] == '*') {
+      let start = i
+      i = i + 2
+      while (i + 1 < hi && !(src[i] == '*' && src[i + 1] == '/')) {
+        i = i + 1
+      }
+      i = i + 2
+      if (i > hi) {
+        i = hi
+      }
+      acc = append(acc, Comment{ start: start, end: i, isLine: false })
+    } else {
+      i = i + 1
+    }
+  }
+  return acc
+}
+
+// Newlines strictly within `src[a..b]` — used to decide "same source line" (0)
+// and "blank line present" (>= 2). Returns 0 when `a >= b`: a match-shaped node
+// in expression position can leave `srcPos` ahead of a later node's start.
+function newlinesBetween(src: string, a: int, b: int): int {
+  if (a >= b) {
+    return 0
+  }
+  let n = 0
+  let i = a
+  while (i < b) {
+    if (src[i] == '\n') {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Operator precedence for re-parenthesization, keyed by the stored `main` int
+// (a Kind). Mirrors seed/fmt.zig's `precedence` (== the parser's precedenceOf).
+function fmtPrec(m: int): int {
+  if (m == int(Kind.Star) || m == int(Kind.Slash) || m == int(Kind.Percent) ||
+    m == int(Kind.Shl) || m == int(Kind.Shr) || m == int(Kind.Amp)) {
+    return 6
+  }
+  if (m == int(Kind.Plus) || m == int(Kind.Minus) || m == int(Kind.Pipe) ||
+    m == int(Kind.Caret)) {
+    return 5
+  }
+  if (m == int(Kind.EqEq) || m == int(Kind.BangEq) || m == int(Kind.Lt) ||
+    m == int(Kind.LtEq) || m == int(Kind.Gt) || m == int(Kind.GtEq)) {
+    return 4
+  }
+  if (m == int(Kind.AmpAmp)) {
+    return 3
+  }
+  if (m == int(Kind.PipePipe)) {
+    return 2
+  }
+  return 0
+}
+
+// The bitwise-and-shift operator family, whose mixed expressions the formatter
+// parenthesizes for clarity regardless of precedence.
+function fmtIsBitOrShift(m: int): bool {
+  return m == int(Kind.Amp) || m == int(Kind.Pipe) || m == int(Kind.Caret) ||
+    m == int(Kind.Shl) || m == int(Kind.Shr)
+}
+
+// ---- printer ---------------------------------------------------------------
+
+// The formatter's mutable state. A struct is a reference in Bit, so the free
+// functions below mutate it in place — the direct analogue of the seed's
+// `*Printer` methods. `out` accumulates the canonical text.
+struct Printer {
+  source: string,
+  tree: Tree,
+  out: string,
+  comments: []Comment,
+  ci: int,
+  indent: int,
+  col: int,
+  // True at the start of a fresh output line: the indent has not been written
+  // yet (written lazily by `fmtRaw` once real content is about to land).
+  bol: bool,
+  // Source byte offset just after the last real token or comment emitted.
+  srcPos: int,
+  depth: int,
+  // One-shot hint from a caller that knows how many characters of fixed content
+  // will follow a list's closing bracket on the same line. `fmtPrintCommaList`
+  // folds it into its width check and resets it. Zero means "no known tail".
+  nextListTail: int,
+}
+
+// The last '\n' in `s`, or -1 if none.
+function fmtLastNl(s: string): int {
+  let i = len(s) - 1
+  while (i >= 0) {
+    if (s[i] == '\n') {
+      return i
+    }
+    i = i - 1
+  }
+  return -1
+}
+
+// Whether `s` contains a '\n'.
+function fmtHasNl(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '\n') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Appends `text`, writing the pending indent lazily on the first real content
+// of a line and tracking the output column.
+function fmtRaw(p: Printer, text: string) {
+  if (len(text) == 0) {
+    return
+  }
+  if (p.bol) {
+    p.bol = false
+    let total = p.indent * fmtIndentWidth
+    p.out = p.out + repeatStr(" ", total)
+    p.col = total
+  }
+  p.out = p.out + text
+  let nl = fmtLastNl(text)
+  if (nl >= 0) {
+    p.col = len(text) - nl - 1
+  } else {
+    p.col = p.col + len(text)
+  }
+}
+
+function fmtNewline(p: Printer) {
+  p.out = p.out + "\n"
+  p.col = 0
+  p.bol = true
+}
+
+function fmtHasCommentBefore(p: Printer, end: int): bool {
+  return p.ci < len(p.comments) && p.comments[p.ci].start < end
+}
+
+// Flushes every comment starting before `nextStart` (trailing on the current
+// line if contiguous, else on its own line — with one blank preserved when
+// `allowBlank`), then leaves the cursor on a fresh line.
+function fmtGap(p: Printer, nextStart: int, allowBlank: bool) {
+  while (p.ci < len(p.comments) && p.comments[p.ci].start < nextStart) {
+    let c = p.comments[p.ci]
+    let sameLine = !p.bol && newlinesBetween(p.source, p.srcPos, c.start) == 0
+    if (sameLine) {
+      fmtRaw(p, " ")
+    } else {
+      if (!p.bol) {
+        fmtNewline(p)
+      }
+      if (allowBlank && newlinesBetween(p.source, p.srcPos, c.start) >= 2) {
+        fmtNewline(p)
+      }
+    }
+    fmtRaw(p, p.source[c.start:c.end])
+    p.srcPos = c.end
+    p.ci = p.ci + 1
+    if (c.isLine) {
+      fmtNewline(p)
+    }
+  }
+  if (!p.bol) {
+    fmtNewline(p)
+  }
+  if (allowBlank && newlinesBetween(p.source, p.srcPos, nextStart) >= 2) {
+    fmtNewline(p)
+  }
+}
+
+// Renders `idx` flat into a fresh buffer without touching real output, so a
+// caller can measure width before deciding how something earlier wraps. This is
+// the only render of `idx` — comments and `srcPos` advance for real — so the
+// caller must reuse the returned text as its actual output.
+function fmtRenderFlat(p: Printer, idx: int): string {
+  let colBefore = p.col
+  let savedOut = p.out
+  p.out = ""
+  fmtPrintNode(p, idx)
+  let text = p.out
+  p.out = savedOut
+  p.col = colBefore
+  return text
+}
+
+// The node dispatch entry: depth-guarded, then hands off to fmtDispatch, then
+// advances srcPos past the node's span.
+function fmtPrintNode(p: Printer, idx: int) {
+  if (idx == 0) {
+    return
+  }
+  if (p.depth >= fmtMaxDepth) {
+    return
+  }
+  p.depth = p.depth + 1
+  let n = getNode(p.tree, idx)
+  fmtDispatch(p, idx, n)
+  if (n.span.end > p.srcPos) {
+    p.srcPos = n.span.end
+  }
+  p.depth = p.depth - 1
+}
+
+// A postfix chain's receiver or a spawn/defer operand: atomic unless parens made
+// it a binary/unary/catch/arrow underneath, in which case they must be re-added.
+function fmtPrintAtomic(p: Printer, idx: int) {
+  let t = getNode(p.tree, idx).tag
+  let wrap = t == Tag.Binary || t == Tag.Unary || t == Tag.CatchDefault ||
+    t == Tag.CatchBind || t == Tag.ArrowFn
+  if (wrap) {
+    fmtRaw(p, "(")
+    fmtPrintNode(p, idx)
+    fmtRaw(p, ")")
+  } else {
+    fmtPrintNode(p, idx)
+  }
+}
+
+// `catch`'s left operand: only catch/arrow need re-parenthesizing there.
+function fmtPrintCatchLhs(p: Printer, idx: int) {
+  let t = getNode(p.tree, idx).tag
+  let wrap = t == Tag.CatchDefault || t == Tag.CatchBind || t == Tag.ArrowFn
+  if (wrap) {
+    fmtRaw(p, "(")
+    fmtPrintNode(p, idx)
+    fmtRaw(p, ")")
+  } else {
+    fmtPrintNode(p, idx)
+  }
+}
+
+// A comma-free, delimiter-free list (return values, assignment sides, `case`
+// expressions, constraint bounds): always flat.
+function fmtPrintFlatList(p: Printer, items: []int, sep: string) {
+  let i = 0
+  while (i < len(items)) {
+    if (i > 0) {
+      fmtRaw(p, sep)
+    }
+    fmtPrintNode(p, items[i])
+    i = i + 1
+  }
+}
+
+// A bracketed comma list (params, args, struct fields, generics, ...). Greedy
+// width-aware wrapping: render flat into a scratch buffer; if it has no comment
+// and fits, keep it, else re-render one item per line (preserving the author's
+// grouping) with a trailing comma. `{`/`}` pad with an inner space when flat.
+function fmtPrintCommaList(p: Printer, items: []int, open: string, close: string, spanEnd: int) {
+  let tail = p.nextListTail
+  p.nextListTail = 0
+  fmtRaw(p, open)
+  let pad = len(open) == 1 && open == "{"
+
+  if (len(items) == 0) {
+    if (fmtHasCommentBefore(p, spanEnd)) {
+      p.indent = p.indent + 1
+      fmtGap(p, spanEnd, false)
+      p.indent = p.indent - 1
+    }
+    fmtRaw(p, close)
+    return
+  }
+
+  if (!fmtHasCommentBefore(p, spanEnd)) {
+    let colBefore = p.col
+    let savedOut = p.out
+    p.out = ""
+    let i = 0
+    while (i < len(items)) {
+      if (i > 0) {
+        fmtRaw(p, ", ")
+      }
+      fmtPrintNode(p, items[i])
+      i = i + 1
+    }
+    let text = p.out
+    p.out = savedOut
+    p.col = colBefore
+    let extra = 0
+    if (pad) {
+      extra = 2
+    }
+    // A single-element list stays flat even when over-width: wrapping a lone
+    // item never shortens the line meaningfully. Multi-element lists still wrap.
+    let fits = colBefore + extra + len(text) + len(close) + tail <= fmtMaxWidth
+    if (!fmtHasNl(text) && (len(items) == 1 || fits)) {
+      if (pad) {
+        fmtRaw(p, " ")
+      }
+      fmtRaw(p, text)
+      if (pad) {
+        fmtRaw(p, " ")
+      }
+      fmtRaw(p, close)
+      return
+    }
+  }
+
+  p.indent = p.indent + 1
+  // Preserve the author's grouping: if the source already broke this list across
+  // lines, keep two items on the same output line exactly where the source kept
+  // them on the same source line — so a hand-laid table is not exploded.
+  let firstStart = getNode(p.tree, items[0]).span.start
+  let grouped = newlinesBetween(p.source, firstStart, spanEnd) > 0
+  let prevEnd = firstStart
+  let j = 0
+  while (j < len(items)) {
+    let it = items[j]
+    let start = getNode(p.tree, it).span.start
+    let sameLine = grouped && j > 0 &&
+      newlinesBetween(p.source, prevEnd, start) == 0 &&
+      !fmtHasCommentBefore(p, start)
+    if (sameLine) {
+      fmtRaw(p, " ")
+    } else {
+      fmtGap(p, start, false)
+    }
+    fmtPrintNode(p, it)
+    fmtRaw(p, ",")
+    prevEnd = getNode(p.tree, it).span.end
+    j = j + 1
+  }
+  fmtGap(p, spanEnd, false)
+  p.indent = p.indent - 1
+  fmtRaw(p, close)
+}
+
+// True for a statement/declaration whose canonical form always ends in a
+// block's closing `}` — printed with no trailing `;` (safe: `}` is an ASI
+// terminator).
+function fmtEndsInBlock(p: Printer, idx: int): bool {
+  let t = getNode(p.tree, idx).tag
+  if (t == Tag.Block || t == Tag.FuncDecl || t == Tag.StructDecl ||
+    t == Tag.InterfaceDecl || t == Tag.EnumDecl || t == Tag.IfStmt ||
+    t == Tag.WhileStmt || t == Tag.ForC || t == Tag.ForOf || t == Tag.ForIn ||
+    t == Tag.ForInf || t == Tag.SwitchStmt || t == Tag.SelectStmt ||
+    t == Tag.MatchStmt) {
+    return true
+  }
+  if (t == Tag.Export) {
+    return fmtEndsInBlock(p, kidsOf(p.tree, idx)[0])
+  }
+  return false
+}
+
+// Whether `idx`'s canonical form ends in a token after which ASI inserts a
+// semicolon — so an explicit `;` can be omitted. The last token kind is
+// invariant under canonicalization, so reading it from the source span is sound.
+function fmtEndsInTerminator(p: Printer, idx: int): bool {
+  let sp = getNode(p.tree, idx).span
+  if (sp.end <= sp.start) {
+    return false
+  }
+  let toks = lexAll(p.source[sp.start:sp.end])
+  let last = Kind.Eof
+  let i = 0
+  while (i < len(toks)) {
+    if (toks[i].kind != Kind.Eof) {
+      last = toks[i].kind
+    }
+    i = i + 1
+  }
+  // The lexer synthesizes a `.semicolon` at end-of-input after a terminator, so
+  // a trailing synthesized `;` is the definitive signal ASI would fire. Fall
+  // back to the raw terminator check for safety.
+  return last == Kind.Semicolon || isTerminator(last)
+}
+
+// A `{ stmt }` block that canonicalizes onto one line: exactly one child, that
+// child a simple statement (not block/control-flow, no inner match), and no
+// comment inside the braces.
+function fmtBlockInlineable(p: Printer, idx: int): bool {
+  let items = kidsOf(p.tree, idx)
+  if (len(items) != 1) {
+    return false
+  }
+  if (fmtEndsInBlock(p, items[0])) {
+    return false
+  }
+  if (fmtContainsMatch(p, items[0])) {
+    return false
+  }
+  return !fmtHasCommentBefore(p, getNode(p.tree, idx).span.end)
+}
+
+// Whether `idx`'s subtree contains a `match`, which always renders multi-line.
+function fmtContainsMatch(p: Printer, idx: int): bool {
+  if (idx == 0) {
+    return false
+  }
+  if (getNode(p.tree, idx).tag == Tag.MatchStmt) {
+    return true
+  }
+  let kids = kidsOf(p.tree, idx)
+  let i = 0
+  while (i < len(kids)) {
+    if (fmtContainsMatch(p, kids[i])) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Prints a body that is either a `.block` (collapsed to `{ stmt }` when
+// inlineable, else stacked) or a bare match-arm statement. `preserveSource`
+// (function bodies) inlines only what the author wrote inline; match arms pass
+// false, always collapsing a braced body.
+function fmtPrintBodyBlock(p: Printer, idx: int, preserveSource: bool) {
+  let n = getNode(p.tree, idx)
+  let sourceInline = !preserveSource || newlinesBetween(p.source, n.span.start, n.span.end) == 0
+  if (n.tag == Tag.Block && fmtBlockInlineable(p, idx) && sourceInline) {
+    let firstKid = kidsOf(p.tree, idx)[0]
+    if (fmtInlineFits(p, firstKid)) {
+      fmtRaw(p, "{ ")
+      fmtPrintNode(p, firstKid)
+      fmtRaw(p, " }")
+      if (n.span.end > p.srcPos) {
+        p.srcPos = n.span.end
+      }
+      return
+    }
+  }
+  fmtPrintNode(p, idx)
+}
+
+// Whether the sole statement of an inline body renders on one line within the
+// width, as `{ stmt }` at the current column. Trial-renders and fully restores
+// every mutable field, so it is side-effect-free.
+function fmtInlineFits(p: Printer, stmt: int): bool {
+  let col0 = p.col
+  let sBol = p.bol
+  let sIndent = p.indent
+  let sSrc = p.srcPos
+  let sCi = p.ci
+  let sDepth = p.depth
+  let savedOut = p.out
+  p.out = ""
+  p.col = col0 + 2
+  p.bol = false
+  fmtPrintNode(p, stmt)
+  let text = p.out
+  p.out = savedOut
+  p.col = col0
+  p.bol = sBol
+  p.indent = sIndent
+  p.srcPos = sSrc
+  p.ci = sCi
+  p.depth = sDepth
+  return !fmtHasNl(text) && col0 + 2 + len(text) + 2 <= fmtMaxWidth
+}
+
+// Like fmtPrintSeq but never keeps a blank before the first item. Used for
+// switch/select clause lists and case/default bodies.
+function fmtPrintNoLeadBlank(p: Printer, items: []int, stmtStyle: bool) {
+  let i = 0
+  while (i < len(items)) {
+    fmtGap(p, getNode(p.tree, items[i]).span.start, i != 0)
+    fmtPrintNode(p, items[i])
+    if (stmtStyle && !fmtEndsInBlock(p, items[i]) && !fmtEndsInTerminator(p, items[i])) {
+      fmtRaw(p, ";")
+    }
+    i = i + 1
+  }
+}
+
+// Statement/declaration sequence (top decls, block statements, case bodies): one
+// per line, one blank line preserved from the source.
+function fmtPrintSeq(p: Printer, items: []int, stmtStyle: bool) {
+  let i = 0
+  while (i < len(items)) {
+    fmtGap(p, getNode(p.tree, items[i]).span.start, true)
+    fmtPrintNode(p, items[i])
+    if (stmtStyle && !fmtEndsInBlock(p, items[i]) && !fmtEndsInTerminator(p, items[i])) {
+      fmtRaw(p, ";")
+    }
+    i = i + 1
+  }
+}
+
+// A brace block: `{`, the stacked statements (no blank kept right after `{`),
+// then `}`.
+function fmtPrintBlock(p: Printer, idx: int) {
+  let n = getNode(p.tree, idx)
+  let items = kidsOf(p.tree, idx)
+  fmtRaw(p, "{")
+  if (len(items) == 0 && !fmtHasCommentBefore(p, n.span.end)) {
+    fmtRaw(p, "}")
+    return
+  }
+  p.indent = p.indent + 1
+  fmtPrintNoLeadBlank(p, items, true)
+  fmtGap(p, n.span.end, true)
+  p.indent = p.indent - 1
+  fmtRaw(p, "}")
+}
+
+// One side of a binary expression, re-parenthesized when precedence (with
+// left-associativity) or the bitwise/shift clarity rule requires it.
+function fmtPrintBinarySide(p: Printer, idx: int, parentOp: int, isRhs: bool) {
+  let t = getNode(p.tree, idx).tag
+  let wrap = t == Tag.CatchDefault || t == Tag.CatchBind || t == Tag.ArrowFn
+  if (!wrap && t == Tag.Binary) {
+    let childOp = getNode(p.tree, idx).main
+    let parentPrec = fmtPrec(parentOp)
+    let childPrec = fmtPrec(childOp)
+    let precWrap = false
+    if (isRhs) {
+      precWrap = childPrec <= parentPrec
+    } else {
+      precWrap = childPrec < parentPrec
+    }
+    // A bitwise/shift expression mixing two different operators is always
+    // parenthesized for clarity, even where precedence makes it redundant.
+    let styleWrap = childOp != parentOp && (fmtIsBitOrShift(parentOp) || fmtIsBitOrShift(childOp))
+    wrap = precWrap || styleWrap
+  }
+  if (wrap) {
+    fmtRaw(p, "(")
+    fmtPrintNode(p, idx)
+    fmtRaw(p, ")")
+  } else {
+    fmtPrintNode(p, idx)
+  }
+}
+
+// ---- public API ------------------------------------------------------------
+
+// Canonical source on success, or rendered diagnostics when `src` does not parse
+// (`failed` true) — fmt never guesses at malformed input.
+struct FmtResult {
+  text: string,
+  failed: bool,
+}
+
+// Formats `src` to Bit's one canonical style. On a parse error, `failed` is true
+// and `text` holds the rendered diagnostics, matching the seed's `format`.
+function formatSource(path: string, src: string): FmtResult {
+  let sm = newSourceManager()
+  let f = addFile(sm, path, src)
+  let d = newDiagnostics(sm)
+  let tree = parseSourceD(src, f, d)
+  if (hasErrors(d)) {
+    return FmtResult{ text: renderDiags(d), failed: true }
+  }
+  let comments = collectComments(src)
+  let p = Printer{
+    source: src,
+    tree: tree,
+    out: "",
+    comments: comments,
+    ci: 0,
+    indent: 0,
+    col: 0,
+    bol: true,
+    srcPos: 0,
+    depth: 0,
+    nextListTail: 0,
+  }
+  fmtPrintNode(p, tree.root)
+  return FmtResult{ text: p.out, failed: false }
+}
