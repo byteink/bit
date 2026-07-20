@@ -2121,6 +2121,30 @@ function copyArrayInto(fc: FnCtx, dst: int, src: int, arrayTy: int) {
 
 // The zero value of a type as an IR value (SPEC §13.4): a scalar constant, a
 // fresh zeroed array/struct body (a live instance, not nil), else a nil word.
+// The field substitution behind a struct TypeId: the declaration's type-param
+// names bound to the instantiation's recorded arguments, so `Box<string>` lays
+// out `v: T` as a string (a traced pointer) and `Box<i64>` as a scalar. Without
+// it a generic field falls back to the bare param and the layout's pointer map
+// is wrong for one of the two. Empty for a non-generic struct; a TEMPLATE binds
+// its own rigid params, which changes nothing.
+function structTySubst(fc: FnCtx, oc: Checker, decl: int, ty: int): TypeSubst {
+  let sub = noSubst()
+  let gen = kidsOf(oc.tree, decl)[1]
+  if (gen == 0) {
+    return sub
+  }
+  let params = kidsOf(oc.tree, gen)
+  let args = nominalArgsOf(fc.c, ty)
+  let i = 0
+  while (i < len(params) && i < len(args)) {
+    let pn = getNode(oc.tree, kidsOf(oc.tree, params[i])[0])
+    sub.names = append(sub.names, oc.source[pn.span.start:pn.span.end])
+    sub.types = append(sub.types, args[i])
+    i = i + 1
+  }
+  return sub
+}
+
 function zeroValue(fc: FnCtx, ty: int): int {
   let td = fc.c.ctx.types[ty]
   if (td.kind == TypeKind.Prim) {
@@ -2151,11 +2175,20 @@ function zeroValue(fc: FnCtx, ty: int): int {
       fc.failed = true
       return 0
     }
-    let layout = structLayout(fc, typeOwner(fc.c, ty), decl, noSubst())
+    let oc = typeOwner(fc.c, ty)
+    let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, ty))
     let ga = mkInstr(Op.GcAlloc, ty)
     ga.ival = layout.size
     ga.offsets = layout.ptrOffsets
     return builderEmit(fc.b, ga)
+  }
+  // A slice zero-value is the EMPTY slice, not a null header (SPEC §13.4). A
+  // null header has no `len` word to load, so `len(xs)` on it faults; `nil` is
+  // unspellable for a slice (`xs == nil` is E0053), so an empty slice is
+  // indistinguishable from the `nil` the spec names — and unlike `nil` it is
+  // usable. Same shape as `string`'s zero above.
+  if (td.kind == TypeKind.Slice) {
+    return lowerSliceElems(fc, ty, []int(0))
   }
   let nl = mkInstr(Op.ConstNil, ty)
   return builderEmit(fc.b, nl)
@@ -2353,6 +2386,54 @@ function fieldAccessType(fc: FnCtx, oc: Checker, field: int, node: int): int {
   return declTy
 }
 
+// Does `ty`'s zero value (SPEC §13.4) differ from the null word that `map_get`
+// reports a miss with? True for the reference types whose zero is a live object
+// — `string` (`""`), slice (empty), struct (zeroed instance), `[N]T` (zeroed
+// block). False for map/chan/function/interface, whose zero IS `nil`, and for
+// every scalar, whose zero IS the word 0.
+function zeroIsObject(fc: FnCtx, ty: int): bool {
+  let td = fc.c.ctx.types[ty]
+  if (td.kind == TypeKind.Prim) {
+    return td.prim == 11
+  }
+  return td.kind == TypeKind.Slice || td.kind == TypeKind.Array ||
+    td.kind == TypeKind.Struct
+}
+
+// `m[k]` (SPEC §12.6): a missing key yields the value type's zero value.
+// `map_get` can only report a miss as the null word, so where V's zero is a live
+// object materialize it on the miss edge — otherwise a miss hands back a null
+// header and the first `len`/field read faults (#1557). The zero is built
+// lazily, inside the miss block, so a hit allocates nothing.
+function emitMapGet(fc: FnCtx, valTy: int, m: int, key: int): int {
+  let gv = mkInstr(Op.RtCall, valTy)
+  gv.name = "map_get"
+  gv.args = [m, key]
+  let v = emitRtCall(fc, gv)
+  if (!zeroIsObject(fc, valTy)) {
+    return v
+  }
+  let miss = builderNewBlock(fc.b)
+  let join = builderNewBlock(fc.b)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = neNil(fc, v, valTy)
+  br.ival = join
+  br.thenArgs = [v]
+  br.ival2 = miss
+  br.elseArgs = []int(0)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, miss)
+  let zero = zeroValue(fc, valTy)
+  if (fc.failed) {
+    return 0
+  }
+  emitJump(fc, join, [zero])
+  builderEndBlock(fc.b)
+  builderBeginBlock(fc.b, join)
+  return builderAddParam(fc.b, valTy)
+}
+
 // Lowers an index read `a[i]`: a slice via `rt_call slice_get`, a map via
 // `map_get`, a string via `string_byte`, a fixed array via the `index_get` op.
 function lowerIndex(fc: FnCtx, node: int): int {
@@ -2372,10 +2453,7 @@ function lowerIndex(fc: FnCtx, node: int): int {
     return emitRtCall(fc, ins)
   }
   if (rd.kind == TypeKind.Map) {
-    let ins = mkInstr(Op.RtCall, ty)
-    ins.name = "map_get"
-    ins.args = [recv, idx]
-    return emitRtCall(fc, ins)
+    return emitMapGet(fc, ty, recv, idx)
   }
   if (rd.kind == TypeKind.Prim && rd.prim == 11) {
     let ins = mkInstr(Op.RtCall, ty)
@@ -2910,10 +2988,10 @@ function lowerTwoResult(fc: FnCtx, node: int): []int {
     if (fc.failed) {
       return []int(0)
     }
-    let gv = mkInstr(Op.RtCall, valTy)
-    gv.name = "map_get"
-    gv.args = [m, key]
-    let v = emitRtCall(fc, gv)
+    let v = emitMapGet(fc, valTy, m, key)
+    if (fc.failed) {
+      return []int(0)
+    }
     let hv = mkInstr(Op.RtCall, boolTy)
     hv.name = "map_has"
     hv.args = [m, key]

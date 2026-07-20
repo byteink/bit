@@ -230,7 +230,9 @@ BOOL_LIT = "true" | "false" .
 NIL_LIT  = "nil" .
 ```
 
-`nil` is the zero value of every reference type (§13.3).
+`nil` is the zero value of a reference type that has no live zero — a map,
+channel, function, or interface. `string`, `struct`, and `[]T` have usable zero
+values instead (§13.4).
 
 ---
 
@@ -1453,7 +1455,9 @@ while being represented as a shared box.
 
 - `s[i]` indexes a slice/array (`i` must be an integer; out-of-range **panics**,
   §18.4) or a string (yielding `byte`).
-- `m[k]` indexes a map; a missing key yields the zero value of the value type. The
+- `m[k]` indexes a map; a missing key yields the zero value of the value type
+  (§13.4) — for a slice, string, or struct V that is a usable empty/zero object,
+  never a null reference. The
   two-result form `let (v, ok) = m[k]` also reports presence (`ok: bool`). The
   two-result form is only valid as the sole right-hand side of a value declaration
   or assignment.
@@ -1625,8 +1629,9 @@ does exactly that — see `runtime/ABI.md` §1.1, which also fixes the multi-val
 return ABI: `return a, b` builds one boxed tuple and returns a single handle.
 Structs are reference types (like TypeScript objects): assigning a struct copies
 the handle, and mutations through either handle are visible to both. To obtain an
-independent copy, define and call a `clone()` method. The zero value of every
-reference type is `nil`.
+independent copy, define and call a `clone()` method. Zero values of reference
+types are given in §13.4: `nil` for a map, channel, function, or interface, and a
+live empty value for `string`, `struct`, and `[]T`.
 
 Rationale: making structs references removes the need for pointers, `&`/`*`, and
 value-vs-pointer receiver rules, which is a large ceremony saving (priority #1)
@@ -1640,9 +1645,18 @@ Every declared binding without an initializer is deterministically zero-valued:
 - `[N]T` array → all elements zero-valued; tuple → each element zero-valued.
 - `struct` → a live instance with each field zero-valued (structs are references,
   so `let p: Point` yields a usable zeroed `Point`, not `nil`).
-- slice, map, `chan`, function, interface → `nil`. Reading a `nil` map yields zero
+- `[]T` slice → the **empty slice**: `len` and `cap` are `0`, `append` allocates,
+  iteration yields nothing, and indexing panics (§18.4). A slice cannot be
+  compared to `nil` (§14.6), so an empty slice is indistinguishable from the
+  `nil` slice Go names, and a zero slice is always usable rather than a header
+  that faults on the first `len`.
+- map, `chan`, function, interface → `nil`. Reading a `nil` map yields zero
   values; **writing** a `nil` map, sending on a `nil` channel, or calling a `nil`
   function **panics** (§18.4). Use the constructor forms (§12.9) to allocate.
+
+Every context that produces a zero value produces the *same* zero value: a
+declaration without an initializer, a missing map key (§12.6), a receive from a
+closed channel (§16.2), and the ok-value of a failed fallible call (§18.2).
 
 ### 13.5 Arithmetic and Overflow
 
@@ -1824,7 +1838,9 @@ See §15.4.
   comparable if all fields are comparable (field-wise).
 - A C-like enum (all variants payload-free) compares with `==`/`!=` by tag, and
   may be a map key. A payload-carrying enum is not comparable — use `match`.
-- Slices, maps, and functions are **not** comparable except against `nil`.
+- Maps and functions are **not** comparable except against `nil`. A slice is not
+  comparable at all, `nil` included: its zero value is the empty slice (§13.4),
+  so there is no `nil` slice to distinguish an empty one from.
 - Interface values are comparable; two are equal if their dynamic types are
   identical and their dynamic values are equal (panics if the dynamic type is not
   comparable — a documented runtime condition).

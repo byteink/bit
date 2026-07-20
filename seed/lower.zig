@@ -1296,6 +1296,12 @@ const FnCtx = struct {
             const layout = try self.l.structLayout(ty);
             return self.b.gcAlloc(ty, layout.size, layout.ptr_offsets);
         }
+        // A slice zero-value is the EMPTY slice, not a null header (SPEC §13.4).
+        // A null header has no `len` word to load, so `len(xs)` on it faults;
+        // `nil` is unspellable for a slice (`xs == nil` is E0053), so an empty
+        // slice is indistinguishable from the `nil` the spec names — and unlike
+        // `nil` it is usable. Same shape as `string`'s zero above.
+        if (data == .slice) return self.lowerSliceElems(ty, &.{});
         return self.b.constNil(ty);
     }
 
@@ -1522,7 +1528,7 @@ const FnCtx = struct {
                 if (recv_data != .map) return null;
                 const m = try self.lowerExpr(k[0]);
                 const key = try self.lowerExprH(k[1], recv_data.map.key);
-                const v = try self.rtCall(val_ty, .map_get, &.{ m, key });
+                const v = try self.mapGet(val_ty, m, key);
                 const ok = try self.rtCall(ok_ty, .map_has, &.{ m, key });
                 return .{ v, ok };
             },
@@ -1724,6 +1730,36 @@ const FnCtx = struct {
         return self.b.rtCall(ty, rt, cast_args);
     }
 
+    /// Does `ty`'s zero value (SPEC §13.4) differ from the null word that
+    /// `map_get` reports a miss with? True for the reference types whose zero is
+    /// a live object — `string` (`""`), slice (empty), struct (zeroed instance),
+    /// `[N]T` (zeroed block). False for map/chan/function/interface, whose zero
+    /// IS `nil`, and for every scalar, whose zero IS the word 0.
+    fn zeroIsObject(self: *const FnCtx, ty: TypeId) bool {
+        const d = self.ctx.typeOf(ty);
+        return d == .slice or d == .array or d == .@"struct" or
+            (d == .prim and d.prim == .string);
+    }
+
+    /// `m[k]` (SPEC §12.6): a missing key yields the value type's zero value.
+    /// `map_get` can only report a miss as the null word, so where V's zero is a
+    /// live object materialize it on the miss edge — otherwise a miss hands back
+    /// a null header and the first `len`/field read faults (#1557). The zero is
+    /// built lazily, inside the miss block, so a hit allocates nothing.
+    fn mapGet(self: *FnCtx, val_ty: TypeId, m: ir.ValueId, key: ir.ValueId) Error!ir.ValueId {
+        const v = try self.rtCall(val_ty, .map_get, &.{ m, key });
+        if (!self.zeroIsObject(val_ty)) return v;
+        const miss = try self.b.newBlock();
+        const join = try self.b.newBlock();
+        const hit = try self.neNil(v, val_ty);
+        try self.emitBr(hit, join, &.{v}, miss, &.{});
+        self.switchBlock(miss);
+        const zero = try self.zeroValue(val_ty);
+        try self.emitJump(join, &.{zero});
+        self.switchBlock(join);
+        return self.b.addParam(val_ty);
+    }
+
     fn readLvalue(self: *FnCtx, lv: Lvalue) Error!ir.ValueId {
         return switch (lv) {
             .local => |i| self.env.bindings.items[i].value,
@@ -1732,7 +1768,7 @@ const FnCtx = struct {
                 self.rtCall(e.ty, .slice_get, &.{ e.recv, e.index })
             else
                 self.b.indexGet(e.ty, e.recv, e.index),
-            .map_elem => |e| self.rtCall(e.val_ty, .map_get, &.{ e.recv, e.key }),
+            .map_elem => |e| self.mapGet(e.val_ty, e.recv, e.key),
         };
     }
     fn writeLvalue(self: *FnCtx, lv: Lvalue, val: ir.ValueId) Error!void {
@@ -3735,7 +3771,7 @@ const FnCtx = struct {
                 if (recv_data == .slice)
                     break :blk self.rtCall(ty, .slice_get, &.{ recv, idxv });
                 if (recv_data == .map)
-                    break :blk self.rtCall(ty, .map_get, &.{ recv, idxv });
+                    break :blk self.mapGet(ty, recv, idxv);
                 if (recv_data == .prim and recv_data.prim == .string)
                     break :blk self.rtCall(ty, .string_byte, &.{ recv, idxv });
                 break :blk self.b.indexGet(ty, recv, idxv);
