@@ -95,7 +95,11 @@ done
 
 if [ "${RUNS}" -gt 1 ]; then
   echo "===SUMMARY=== ${fails}/${RUNS} runs failed"
-  # An intermittent must not report success just because the last run passed.
-  [ "${fails}" -gt 0 ] && exit 1
 fi
+# The script's exit status must track the GATE, not merely whether ssh and docker
+# ran. This previously returned 0 unconditionally for a single run, so a red
+# X64LINUX_EXIT was reported as success by anything reading `$?` — a gate that
+# cannot fail is not a gate. An intermittent must not pass either, so a failure in
+# ANY run of a repeat sweep is a failure.
+[ "${fails}" -gt 0 ] && exit 1
 exit 0

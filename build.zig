@@ -568,7 +568,12 @@ pub fn build(b: *std.Build) void {
     // the file header for what it deliberately does not prove. Front end only.
     const ast_tags_opts = b.addOptions();
     ast_tags_opts.addOption([]const u8, "selfhost_ast", b.pathFromRoot("selfhost/ast.bit"));
-    ast_tags_opts.addOption([]const u8, "selfhost_parser", b.pathFromRoot("selfhost/parser.bit"));
+    // The parser is spread over `selfhost/parser*.bit` siblings (#1503), which are
+    // one module. Pass the directory and let the test concatenate them: naming a
+    // single file here made the gate silently vacuous the moment parser.bit was
+    // split — every tag read as unreachable because the scanned file no longer
+    // held the parsing code.
+    ast_tags_opts.addOption([]const u8, "selfhost_dir", b.pathFromRoot("selfhost"));
     ast_tags_opts.addOption([]const u8, "seed_parser", b.pathFromRoot("seed/parser.zig"));
 
     const ast_tags_mod = b.createModule(.{

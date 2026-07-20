@@ -146,13 +146,48 @@ test "seed and selfhost declare the same AST tag set" {
     }
 }
 
+/// Every `selfhost/parser*.bit` concatenated. They are sibling files in one
+/// module (#1503), so a tag is parser-reachable if ANY of them mentions it.
+///
+/// Reading the directory rather than a fixed file list is deliberate: this gate
+/// went vacuous once already when `parser.bit` was split and the hardcoded path
+/// kept pointing at the 233-line remnant. A future split must not be able to
+/// silently empty it again.
+fn readSelfhostParser(gpa: std.mem.Allocator, io: Io) ![]u8 {
+    var dir = try Dir.cwd().openDir(io, build_options.selfhost_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(gpa);
+
+    var seen: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.basename, "parser")) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".bit")) continue;
+        const src = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(max_source_bytes));
+        defer gpa.free(src);
+        try acc.appendSlice(gpa, src);
+        try acc.append(gpa, '\n');
+        seen += 1;
+    }
+
+    // A rename or a moved directory would otherwise read as "every tag missing",
+    // which is indistinguishable from a real regression. Fail on the cause.
+    if (seen == 0) return error.NoSelfhostParserSources;
+    return acc.toOwnedSlice(gpa);
+}
+
 test "every AST tag is reachable from its own parser" {
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();
 
     const seed_parser = try Dir.cwd().readFileAlloc(io, build_options.seed_parser, gpa, .limited(max_source_bytes));
     defer gpa.free(seed_parser);
-    const selfhost_parser = try Dir.cwd().readFileAlloc(io, build_options.selfhost_parser, gpa, .limited(max_source_bytes));
+    const selfhost_parser = try readSelfhostParser(gpa, io);
     defer gpa.free(selfhost_parser);
 
     var failed = false;
