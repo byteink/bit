@@ -87,13 +87,13 @@
 #
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffall.sh
 #   DIFFALL_TIMEOUT=n   per-constituent hang guard, seconds (default 3600)
-#   DIFFALL_MIN=n       discovery floor (default 14)
+#   DIFFALL_MIN=n       discovery floor (default 15)
 #   DIFFALL_DIR=path    constituent directory -- for mutation-testing this gate
 #   DIFFALL_KEEP=1      keep the per-constituent logs instead of deleting them
 set -uo pipefail
 
 DIR=${DIFFALL_DIR:-scripts}
-MIN=${DIFFALL_MIN:-14}
+MIN=${DIFFALL_MIN:-15}
 # A hang guard, not a perf budget: fixpoint builds the compiler twice and
 # diffexamples builds 44 examples twice, so the honest ceiling is minutes.
 TIMEOUT=${DIFFALL_TIMEOUT:-3600}
