@@ -20,6 +20,7 @@ pushing a branch that triggers a workflow. Everything below runs locally or over
 
 | gate | what it proves |
 |---|---|
+| `scripts/selfhost-diffall.sh` | **the whole differential family in one verdict** — run this, not a subset you chose, whenever the corpus (`tests/cases`, `examples/`, `stdlib/`, `tests/imports`) changed. Exit 1 = divergence, 2 = could-not-decide; `difffmt` reports ABSENT until `fmt` is ported |
 | `zig build` then `./zig-out/bin/bit` | builds; prints `selfcheck OK` |
 | `scripts/selfhost-fixpoint.sh` | stageB == stageC byte-identical |
 | `scripts/selfhost-diffcheck.sh` | diagnostics vs the seed; FALSEPOS must be 0 |

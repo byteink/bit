@@ -81,6 +81,16 @@ harness verdict line. `zig build` alone does NOT compile the Bit stdlib (`bit ch
 is the cheap direct check), and it links a STALE `libbitrt.a` — runtime `.zig` edits need
 `zig build libbitrt` first (#1486).
 
+## Touching the corpus? run the whole family
+
+Add or change anything under `tests/cases`, `examples/`, `stdlib/` or `tests/imports`, and
+the check is `bash scripts/selfhost-diffall.sh` — every differential, one verdict. Not a
+subset you chose. Five goldens in one day reddened a differential their author had not
+thought to run (#1493 prelude, #1541/#1531 diffir, #1529 difftypes, #1568 fuzzdiff), and
+in #1529 the ticket's own instructions named the wrong four. Note also that golden cases
+compile single-file with **no prelude**, so a clean `bit build` on the file is a different,
+weaker test.
+
 ## Running beside other agents
 
 Every one of these was a real incident.
