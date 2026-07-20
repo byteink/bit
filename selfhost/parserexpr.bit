@@ -1,0 +1,509 @@
+// Parser: the expression grammar — precedence climbing, unary/postfix, primary
+// literals, composite literals, interpolation, index/slice. Split out of
+// parser.bit (#1503); sibling .bit files are the same module, so this is a pure
+// move.
+
+// ---- expressions -----------------------------------------------------------
+
+function precedenceOf(k: Kind): int {
+  if (k == Kind.Star || k == Kind.Slash || k == Kind.Percent || k == Kind.Shl ||
+    k == Kind.Shr || k == Kind.Amp) {
+    return 6
+  }
+  if (k == Kind.Plus || k == Kind.Minus || k == Kind.Pipe || k == Kind.Caret) {
+    return 5
+  }
+  if (k == Kind.EqEq || k == Kind.BangEq || k == Kind.Lt || k == Kind.LtEq ||
+    k == Kind.Gt || k == Kind.GtEq) {
+    return 4
+  }
+  if (k == Kind.AmpAmp) {
+    return 3
+  }
+  if (k == Kind.PipePipe) {
+    return 2
+  }
+  return 0
+}
+
+function canStartType(k: Kind): bool {
+  return k == Kind.Ident || k == Kind.LBracket || k == Kind.KwMap ||
+    k == Kind.KwChan || k == Kind.LParen
+}
+
+// A `[`-led primary: a `[]T`/`[N]T` type used as a value (conversion/composite
+// callee, e.g. `[]byte(x)`), or a slice literal `[a, b, c]`. Uses lookahead
+// rather than the seed's speculation: `[]T` opens a slice type, `[N]T` (int,
+// `]`, type-start) an array type, else it is a slice literal.
+//
+// The element type is what distinguishes `[]T` from the EMPTY slice literal
+// `[]`: a slice type must name one, so a token after `]` that cannot start a
+// type means there is no element type and this is `[]`. The seed reaches the
+// same answer by speculating and falling back (`trySliceOrArrayTypePrimary`
+// commits only on a following `{`/`(`). Without this guard `let xs: []string =
+// []` consumed the NEXT statement as its element type (#1441).
+function parseBracketPrimary(p: Parser): int {
+  // The `[` bounds these types and is not a kid — same explicit-Span rule as
+  // parseSliceOrArrayType below.
+  let open = peekTok(p)
+  if (peekKindAt(p, 1) == Kind.RBracket && canStartType(peekKindAt(p, 2))) {
+    advance(p)
+    advance(p)
+    let elem = parseType(p)
+    return addNode(p.tree, Tag.SliceType,
+      Span{ file: 0, start: open.start, end: getNode(p.tree, elem).span.end }, 0, [elem])
+  }
+  if (peekKindAt(p, 1) == Kind.IntLit && peekKindAt(p, 2) == Kind.RBracket &&
+    canStartType(peekKindAt(p, 3))) {
+    advance(p)
+    let size = leaf(p, Tag.IntLit)
+    advance(p)
+    let elem = parseType(p)
+    return addNode(p.tree, Tag.ArrayType,
+      Span{ file: 0, start: open.start, end: getNode(p.tree, elem).span.end }, 0, [size, elem])
+  }
+  // Both brackets bound the literal and neither is a kid, so `mkNode` would span
+  // `1, 2, 3` where the seed spans `[1, 2, 3]`.
+  advance(p)
+  let items = []int(0)
+  while (peekKind(p) != Kind.RBracket && peekKind(p) != Kind.Eof) {
+    items = append(items, parseArgItem(p))
+    if (!accept(p, Kind.Comma)) {
+      break
+    }
+  }
+  let rbEnd = peekTok(p).end
+  expect(p, Kind.RBracket)
+  return addNode(p.tree, Tag.SliceLit,
+    Span{ file: 0, start: open.start, end: rbEnd }, 0, items)
+}
+
+// `field_init = name ":" expression`.
+function parseFieldInit(p: Parser): int {
+  let name = expectIdent(p)
+  expect(p, Kind.Colon)
+  let e = parseExpr(p)
+  return mkNode(p, Tag.FieldInit, 0, [name, e])
+}
+
+// `key : val` — one map composite-literal entry.
+function parseMapEntry(p: Parser): int {
+  let key = parseExpr(p)
+  expect(p, Kind.Colon)
+  let val = parseExpr(p)
+  return mkNode(p, Tag.MapEntry, 0, [key, val])
+}
+
+// A composite literal `Type{ ... }` — `[type, body]`. The body shape follows the
+// type: a struct name/generic-inst has keyed `field_inits`; a `map<K,V>` has
+// `map_entries`; a slice/array type has positional `args`.
+function parseCompositeLit(p: Parser, typeNode: int): int {
+  advance(p)
+  let tt = getNode(p.tree, typeNode).tag
+  let items = []int(0)
+  let bodyTag = Tag.FieldInits
+  if (tt == Tag.MapType) {
+    bodyTag = Tag.MapEntries
+    while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+      items = append(items, parseMapEntry(p))
+      if (!accept(p, Kind.Comma)) {
+        break
+      }
+    }
+  } else if (tt == Tag.SliceType || tt == Tag.ArrayType) {
+    bodyTag = Tag.Args
+    while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+      items = append(items, parseArgItem(p))
+      if (!accept(p, Kind.Comma)) {
+        break
+      }
+    }
+  } else {
+    while (peekKind(p) != Kind.RBrace && peekKind(p) != Kind.Eof) {
+      items = append(items, parseFieldInit(p))
+      if (!accept(p, Kind.Comma)) {
+        break
+      }
+    }
+  }
+  // The literal runs from its TYPE to the closing `}`, and neither delimiter is a
+  // kid — `mkNode` would end the span at the last field, one `}` short of the
+  // seed (E0075 underlining `S{ a: 1` for `S{ a: 1 }`). The seed gives the body
+  // node the same whole-literal span, so mirror that too.
+  let closeEnd = peekTok(p).end
+  expect(p, Kind.RBrace)
+  let lit = Span{ file: 0, start: getNode(p.tree, typeNode).span.start, end: closeEnd }
+  let body = addNode(p.tree, bodyTag, lit, 0, items)
+  return addNode(p.tree, Tag.CompositeLit, lit, 0, [typeNode, body])
+}
+
+// `str_interp = str_part { interp_start expression interp_end str_part }`.
+function parseInterpString(p: Parser): int {
+  let parts = []int(0)
+  let guard = 0
+  while (guard < 4096) {
+    parts = append(parts, leaf(p, Tag.StrPart))
+    if (!accept(p, Kind.InterpStart)) {
+      break
+    }
+    parts = append(parts, parseExpr(p))
+    // Named, not `expect`: `describe(InterpEnd)` is "a string", but what the
+    // user must actually close the interpolation with is `}`.
+    expectMsg(p, Kind.InterpEnd, "'}'")
+    guard = guard + 1
+  }
+  return mkNode(p, Tag.StrInterp, 0, parts)
+}
+
+// `recv[i]` index or `recv[lo:hi]` slice (either bound optional).
+function parseIndexOrSlice(p: Parser, recv: int): int {
+  advance(p)
+  let lo = 0
+  if (peekKind(p) != Kind.Colon) {
+    lo = parseExpr(p)
+  }
+  // Both forms run from the receiver through the closing `]`, which is not a kid
+  // — `mkNode` would stop at the last index expression, one column short of the
+  // seed (and for `xs[:]` the bounds are absent entirely).
+  let recvStart = getNode(p.tree, recv).span.start
+  if (accept(p, Kind.Colon)) {
+    let hi = 0
+    if (peekKind(p) != Kind.RBracket) {
+      hi = parseExpr(p)
+    }
+    let sliceEnd = peekTok(p).end
+    expect(p, Kind.RBracket)
+    return addNode(p.tree, Tag.SliceExpr,
+      Span{ file: 0, start: recvStart, end: sliceEnd }, 0, [recv, lo, hi])
+  }
+  let idxEnd = peekTok(p).end
+  expect(p, Kind.RBracket)
+  return addNode(p.tree, Tag.Index,
+    Span{ file: 0, start: recvStart, end: idxEnd }, 0, [recv, lo])
+}
+
+function parsePrimary(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.StrPart) { return parseInterpString(p) }
+  if (k == Kind.IntLit) { return leaf(p, Tag.IntLit) }
+  if (k == Kind.FloatLit) { return leaf(p, Tag.FloatLit) }
+  if (k == Kind.StringLit) { return leaf(p, Tag.StringLit) }
+  if (k == Kind.RawStringLit) { return leaf(p, Tag.RawStringLit) }
+  if (k == Kind.RuneLit) { return leaf(p, Tag.RuneLit) }
+  if (k == Kind.BoolLit) { return leaf(p, Tag.BoolLit) }
+  if (k == Kind.NilLit) { return leaf(p, Tag.NilLit) }
+  if (k == Kind.Ident) { return leaf(p, Tag.Ident) }
+  if (k == Kind.KwMatch) { return parseMatch(p, true) }
+  if (k == Kind.KwChan) { return parseChanType(p) }
+  if (k == Kind.KwMap) { return parseMapType(p) }
+  if (k == Kind.KwAsm) { return parseAsm(p) }
+  if (k == Kind.LBracket) { return parseBracketPrimary(p) }
+  if (k == Kind.LParen) {
+    // Speculate a parenthesized arrow `(a, b) => body` / `(a: T) => body`; on
+    // failure reset and parse a plain parenthesized expression (transparent).
+    let mark = p.pos
+    let dmark = len(p.diags.list)
+    advance(p)
+    let ok = true
+    let params = []int(0)
+    if (peekKind(p) != Kind.RParen) {
+      let done = false
+      while (!done) {
+        if (peekKind(p) != Kind.Ident) {
+          ok = false
+          done = true
+        } else {
+          let name = leaf(p, Tag.Ident)
+          let ty = 0
+          if (accept(p, Kind.Colon)) {
+            ty = parseType(p)
+          }
+          params = append(params, mkNode(p, Tag.ArrowP, 0, [name, ty]))
+          if (!accept(p, Kind.Comma)) {
+            done = true
+          }
+        }
+      }
+    }
+    if (ok && peekKind(p) == Kind.RParen) {
+      advance(p)
+      if (accept(p, Kind.FatArrow)) {
+        let ap = mkNode(p, Tag.ArrowParams, 0, params)
+        let body = 0
+        if (peekKind(p) == Kind.LBrace) {
+          body = parseBlock(p)
+        } else {
+          body = parseExpr(p)
+        }
+        return mkNode(p, Tag.ArrowFn, 0, [ap, body])
+      }
+    }
+    truncateDiags(p.diags, dmark)
+    p.pos = mark
+    advance(p)
+    let inner = parseExpr(p)
+    expect(p, Kind.RParen)
+    return inner
+  }
+  // No primary: report the missing expression, then consume one token (never
+  // past EOF) so parsing always advances. The nil_lit poison is never referenced
+  // by valid code.
+  parseFail(p, "an expression")
+  let bad = peekTok(p)
+  if (peekKind(p) != Kind.Eof) {
+    advance(p)
+  }
+  return addLeaf(p.tree, Tag.NilLit, Span{ file: 0, start: bad.start, end: bad.end })
+}
+
+// Whether a FloatLit's text is a tuple index (`.0`, `.12`) rather than a real
+// float — a leading `.` followed by digits only. `.5e3` and `.5.` are floats.
+// Mirrors the seed's `isDotDigits`.
+function isDotDigits(text: string): bool {
+  if (len(text) < 2 || text[0] != '.') {
+    return false
+  }
+  let i = 1
+  while (i < len(text)) {
+    if (text[i] < '0' || text[i] > '9') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Postfix chain: `f(a, b)` calls and `.name` member access. `call` is
+// `[callee, type_args_or_none, args]`; `args` holds `arg` nodes each `[expr]`;
+// `member` is `[recv, name]`.
+function parsePostfix(p: Parser): int {
+  // The whole postfix expression's start offset — a call spans from here to its
+  // `)`, which `--dump-types` reads back (interior nodes otherwise carry a dummy
+  // span; only call nodes are dumped, so only they need a real one).
+  let exprStart = peekTok(p).start
+  let expr = parsePrimary(p)
+  let bareName = getNode(p.tree, expr).tag == Tag.Ident
+  let guard = 0
+  while (guard < 4096) {
+    let k = peekKind(p)
+    if (k == Kind.LParen) {
+      advance(p)
+      let argNodes = []int(0)
+      while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+        argNodes = append(argNodes, parseArgItem(p))
+        if (!accept(p, Kind.Comma)) {
+          break
+        }
+      }
+      let rpEnd = peekTok(p).end
+      expect(p, Kind.RParen)
+      let args = mkNode(p, Tag.Args, 0, argNodes)
+      expr = mkNode(p, Tag.Call, 0, [expr, 0, args])
+      p.tree.nodes[expr].span = Span{ file: 0, start: exprStart, end: rpEnd }
+      bareName = false
+    } else if (k == Kind.LBrace && !p.noComposite &&
+      (bareName || getNode(p.tree, expr).tag == Tag.MapType ||
+        getNode(p.tree, expr).tag == Tag.SliceType ||
+        getNode(p.tree, expr).tag == Tag.ArrayType)) {
+      // A composite literal `Type{...}` — after a bare type name, or after a
+      // `map`/`chan`/`[]T` type primary; never when the `{` opens a loop body.
+      expr = parseCompositeLit(p, expr)
+      bareName = false
+    } else if (k == Kind.LBracket) {
+      expr = parseIndexOrSlice(p, expr)
+      bareName = false
+    } else if (k == Kind.Question) {
+      let q = peekTok(p)
+      advance(p)
+      // The seed spans `expr?` from the operand's start through the `?` (join),
+      // not just the operand — `mkNode`'s kid-only span would drop the `?`.
+      expr = addNode(p.tree, Tag.TryExpr,
+        Span{ file: 0, start: getNode(p.tree, expr).span.start, end: q.end }, 0, [expr])
+      bareName = false
+    } else if (k == Kind.Dot) {
+      advance(p)
+      if (accept(p, Kind.LParen)) {
+        // `.(T)` type assertion. Span to the closing `)` so a diagnostic on the
+        // assertion (E0041) covers `recv.(T)` whole, like the seed — mkNode's
+        // kid-only span would stop at the type node.
+        let ty = parseType(p)
+        let rp = peekTok(p)
+        expect(p, Kind.RParen)
+        expr = addNode(p.tree, Tag.TypeAssert,
+          Span{ file: 0, start: getNode(p.tree, expr).span.start, end: rp.end }, 0, [expr, ty])
+      } else if (peekKind(p) == Kind.IntLit) {
+        // `.N` tuple index, reached only when whitespace separates the `.` from
+        // the digits (`t. 0`) — glued `t.0` lexes as one FloatLit, handled below.
+        let idx = leaf(p, Tag.IntLit)
+        expr = mkNode(p, Tag.TupleIndex, 0, [expr, idx])
+      } else {
+        let name = leaf(p, Tag.Ident)
+        expr = mkNode(p, Tag.Member, 0, [expr, name])
+      }
+      bareName = false
+    } else if (k == Kind.FloatLit && isDotDigits(curText(p))) {
+      // `t.0` — the lexer emits ONE FloatLit token `.0`; no `Dot` token is ever
+      // produced, so the `Kind.Dot` arm above cannot see a glued tuple index.
+      // Split it here exactly as the seed does (parser.zig parsePostfix): the
+      // index leaf starts one byte past the `.` so its text is the digits alone,
+      // which is what parseIntText reads. mkNode's kid-derived span is already
+      // the seed's `join(span(expr), full)` — the leaf ends at `full.end`.
+      let full = peekTok(p)
+      advance(p)
+      let idx = addLeaf(p.tree, Tag.IntLit,
+        Span{ file: 0, start: full.start + 1, end: full.end })
+      expr = mkNode(p, Tag.TupleIndex, 0, [expr, idx])
+      bareName = false
+    } else if (k == Kind.Lt) {
+      // Turbofish `expr<T, U>` — a generic call `(...)`, generic composite
+      // `{...}`, or generic instantiation before `.` (`Option<i64>.None`).
+      // Speculative: a `<` that is really a comparison must reset cleanly, so
+      // capture the close-token position (expectGenericClose splits `>>` in
+      // place) to un-mutate on failure.
+      let mark = p.pos
+      let dmark = len(p.diags.list)
+      advance(p)
+      let tys = []int(0)
+      let done = false
+      while (!done) {
+        tys = append(tys, parseType(p))
+        if (!accept(p, Kind.Comma)) {
+          done = true
+        }
+      }
+      let closer = peekKind(p)
+      let isClose = closer == Kind.Gt || closer == Kind.Shr ||
+        closer == Kind.ShrEq || closer == Kind.GtEq
+      let handled = false
+      if (len(tys) >= 1 && isClose) {
+        let closePos = p.pos
+        let closeTok = p.toks[closePos]
+        expectGenericClose(p)
+        let targs = mkNode(p, Tag.TypeArgs, 0, tys)
+        let nk = peekKind(p)
+        if (nk == Kind.LParen) {
+          advance(p)
+          let argNodes = []int(0)
+          while (peekKind(p) != Kind.RParen && peekKind(p) != Kind.Eof) {
+            argNodes = append(argNodes, parseArgItem(p))
+            if (!accept(p, Kind.Comma)) {
+              break
+            }
+          }
+          let rpEnd = peekTok(p).end
+          expect(p, Kind.RParen)
+          expr = mkNode(p, Tag.Call, 0, [expr, targs, mkNode(p, Tag.Args, 0, argNodes)])
+          p.tree.nodes[expr].span = Span{ file: 0, start: exprStart, end: rpEnd }
+          handled = true
+        } else if (bareName && !p.noComposite && nk == Kind.LBrace) {
+          expr = parseCompositeLit(p, mkNode(p, Tag.GenericInst, 0, [expr, targs]))
+          handled = true
+        } else if (nk == Kind.Dot) {
+          expr = mkNode(p, Tag.GenericInst, 0, [expr, targs])
+          handled = true
+        } else {
+          p.toks[closePos] = closeTok
+        }
+      }
+      if (!handled) {
+        truncateDiags(p.diags, dmark)
+        p.pos = mark
+        break
+      }
+      bareName = false
+    } else {
+      break
+    }
+    guard = guard + 1
+  }
+  return expr
+}
+
+function parseUnary(p: Parser): int {
+  let k = peekKind(p)
+  // `*` is the pointer dereference prefix (`*p`), `<-` is channel receive; both
+  // ride the Unary node (main = the operator Kind).
+  if (k == Kind.Bang || k == Kind.Minus || k == Kind.Plus || k == Kind.Tilde ||
+    k == Kind.ArrowLeft || k == Kind.Star) {
+    // The span must cover the OPERATOR, not just its operand. `mkNode` derives a
+    // span from the kids alone, and the operator is a token rather than a child,
+    // so it would be dropped — the recurring shape in this parser (the same one
+    // that made an `@attr` node start after its `@`). The seed joins the operator
+    // token's own span here, and a divergence shows up as a diagnostic underlining
+    // `p` instead of `*p`: a DIFF, which no FALSEPOS check would catch.
+    let opTok = peekTok(p)
+    advance(p)
+    let operand = parseUnary(p)
+    return addNode(p.tree, Tag.Unary,
+      Span{ file: 0, start: opTok.start, end: getNode(p.tree, operand).span.end },
+      int(k), [operand])
+  }
+  return parsePostfix(p)
+}
+
+// Left-associative precedence climbing (§12).
+function parseBinary(p: Parser, minPrec: int): int {
+  let lhs = parseUnary(p)
+  let guard = 0
+  while (guard < 4096) {
+    let k = peekKind(p)
+    let prec = precedenceOf(k)
+    if (prec == 0 || prec < minPrec) {
+      break
+    }
+    advance(p)
+    let rhs = parseBinary(p, prec + 1)
+    lhs = mkNode(p, Tag.Binary, int(k), [lhs, rhs])
+    guard = guard + 1
+  }
+  return lhs
+}
+
+// `catch_expr = binary [ "catch" ( IDENT block | expression ) ]`. `catch e {…}`
+// binds the error and runs a block (catch_bind); `catch <expr>` supplies a
+// default value (catch_default).
+function parseCatchExpr(p: Parser): int {
+  let expr = parseBinary(p, 1)
+  if (peekKind(p) != Kind.KwCatch) {
+    return expr
+  }
+  advance(p)
+  // `catch IDENT block` binds the error; anything else is a default expression.
+  // Speculate the bind form (the seed's tryCatchBind): parse `IDENT {…}` and
+  // accept it only if the block parsed WITHOUT a diagnostic — a clean close. A
+  // composite default (`catch Circle{r: 1}`) or a truncated block emits one, so
+  // reset and take catch_default. This is why the block's `{` must directly
+  // follow the ident.
+  if (peekKind(p) == Kind.Ident && peekKindAt(p, 1) == Kind.LBrace) {
+    let mark = p.pos
+    let dmark = len(p.diags.list)
+    let name = leaf(p, Tag.Ident)
+    let block = parseBlock(p)
+    if (len(p.diags.list) == dmark) {
+      return mkNode(p, Tag.CatchBind, 0, [expr, name, block])
+    }
+    truncateDiags(p.diags, dmark)
+    p.pos = mark
+  }
+  let def = parseExpr(p)
+  return mkNode(p, Tag.CatchDefault, 0, [expr, def])
+}
+
+function parseExpr(p: Parser): int {
+  // Single-identifier arrow `x => body` — one token of lookahead past the ident.
+  // The parenthesized form `(a, b) => body` is a follow-up (needs speculation).
+  if (peekKind(p) == Kind.Ident && peekKindAt(p, 1) == Kind.FatArrow) {
+    let name = leaf(p, Tag.Ident)
+    advance(p)
+    let param = mkNode(p, Tag.ArrowP, 0, [name, 0])
+    let params = mkNode(p, Tag.ArrowParams, 0, [param])
+    let body = 0
+    if (peekKind(p) == Kind.LBrace) {
+      body = parseBlock(p)
+    } else {
+      body = parseExpr(p)
+    }
+    return mkNode(p, Tag.ArrowFn, 0, [params, body])
+  }
+  return parseCatchExpr(p)
+}

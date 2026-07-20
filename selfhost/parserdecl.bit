@@ -1,0 +1,253 @@
+// Parser: attributes, function and extern declarations, top-level decl
+// dispatch, and the program/source entry points. Split out of parser.bit
+// (#1503); sibling .bit files are the same module, so this is a pure move.
+
+// `attr_list = attr { attr }`, `attr = "@" IDENT [ "(" string_lit ")" ]`. One or
+// more `@name`, each optionally carrying a single string argument (§11.9
+// `@symbol("...")`); each consumes the `@`, so the loop is bounded by the token
+// count. The argument child is ELIDED when absent, so a bare `@naked`/`@nosplit`
+// keeps the exact 1-child shape it had before arguments existed.
+function parseAttrList(p: Parser): int {
+  // mkNode spans only its KIDS, and neither the `@` nor the closing `)` is one —
+  // capture both tokens explicitly so an `attr` covers `@name("arg")` whole, like
+  // the seed's. Without this a diagnostic carried on one of these nodes (E0080,
+  // which reports on the list) underlines one column short of the seed.
+  let listStart = peekTok(p).start
+  let items = []int(0)
+  let guard = 0
+  while (peekKind(p) == Kind.At && guard < 100000) {
+    let atStart = peekTok(p).start
+    advance(p) // '@'
+    let name = expectIdent(p)
+    if (peekKind(p) == Kind.LParen) {
+      advance(p) // '('
+      let arg = 0
+      if (peekKind(p) == Kind.StringLit) {
+        arg = leaf(p, Tag.StringLit)
+      } else {
+        parseFail(p, "a string literal argument")
+      }
+      let closeEnd = peekTok(p).end
+      expect(p, Kind.RParen)
+      items = append(items, addNode(p.tree, Tag.Attr,
+        Span{ file: 0, start: atStart, end: closeEnd }, 0, [name, arg]))
+    } else {
+      let nameEnd = spanOfKids(p.tree, [name]).end
+      items = append(items, addNode(p.tree, Tag.Attr,
+        Span{ file: 0, start: atStart, end: nameEnd }, 0, [name]))
+    }
+    // Both IDENT and `)` are ASI terminators (§7), so a newline after an
+    // attribute synthesizes a semicolon. An attribute list is only ever followed
+    // by another attribute or `function`, so a separator here can never be
+    // meaningful — drop it, which lets an attribute sit on its own line above
+    // the declaration it modifies.
+    let sguard = 0
+    while (peekKind(p) == Kind.Semicolon && sguard < 100000) {
+      advance(p)
+      sguard = sguard + 1
+    }
+    guard = guard + 1
+  }
+  // An empty list keeps the entry position for both ends, as the seed's does.
+  let end = listStart
+  if (len(items) != 0) {
+    end = spanOfKids(p.tree, [items[len(items) - 1]]).end
+  }
+  return addNode(p.tree, Tag.AttrList, Span{ file: 0, start: listStart, end: end }, 0, items)
+}
+
+// Attributes attach to function declarations (§10.3.1) and to module-level
+// state (§11.11 `@threadlocal let`). Any other target is a parse error.
+function parseAttrDecl(p: Parser): int {
+  let attrs = parseAttrList(p)
+  if (peekKind(p) == Kind.KwFunction) {
+    return parseFuncDecl(p, attrs)
+  }
+  if (peekKind(p) == Kind.KwLet) {
+    // §11.11 defines exactly one attribute at this position, so the legal set
+    // here is a syntactic property of the position and is checked here.
+    if (!attrsAreThreadLocal(p, attrs)) {
+      parseFail(p, "'@threadlocal', the only attribute a 'let' accepts")
+      synchronizeTopLevel(p)
+      return 0
+    }
+    return parseValueDecl(p, Tag.LetDecl, 1)
+  }
+  parseFail(p, "'function' or 'let' after an attribute")
+  synchronizeTopLevel(p)
+  return 0
+}
+
+// True iff `attrs` is exactly the single attribute `@threadlocal`, with no
+// argument. Anything else is rejected by the caller.
+function attrsAreThreadLocal(p: Parser, attrs: int): bool {
+  let list = kidsOf(p.tree, attrs)
+  if (len(list) != 1) {
+    return false
+  }
+  let attrKids = kidsOf(p.tree, list[0])
+  if (len(attrKids) != 1) {
+    return false
+  }
+  let sp = getNode(p.tree, attrKids[0]).span
+  return p.src[sp.start:sp.end] == "threadlocal"
+}
+
+// `func_decl = [recv_or_none, name, generics_or_none, params, result_or_none,
+// body, attrs_or_none]`. `attrs` (the 7th child) is elided when absent so the
+// attr-less corpus' AST dumps stay byte-identical.
+function parseFuncDecl(p: Parser, attrs: int): int {
+  advance(p)
+  // Optional method receiver `(name: Type)`. The receiver type is a bare name
+  // (generic-struct receivers are unimplemented in the seed too, #1325).
+  let recv = 0
+  if (peekKind(p) == Kind.LParen) {
+    advance(p)
+    let rname = leaf(p, Tag.Ident)
+    expect(p, Kind.Colon)
+    let rty = leaf(p, Tag.Ident)
+    recv = mkNode(p, Tag.Receiver, 0, [rname, rty])
+    expect(p, Kind.RParen)
+  }
+  let name = leaf(p, Tag.Ident)
+  let generics = maybeGenericParams(p)
+  let params = parseParams(p)
+  let result = 0
+  if (accept(p, Kind.Colon)) {
+    result = parseResultType(p)
+  }
+  let body = parseBlock(p)
+  if (attrs == 0) {
+    return mkNode(p, Tag.FuncDecl, 0, [recv, name, generics, params, result, body])
+  }
+  return mkNode(p, Tag.FuncDecl, 0, [recv, name, generics, params, result, body, attrs])
+}
+
+// `extern_fn_decl = "extern" "function" IDENT signature` (SPEC 11.7). No body,
+// no receiver, no generics — a bare binding from a Bit name to an external
+// symbol the linker resolves from a dylib.
+function parseExternFnDecl(p: Parser): int {
+  // mkNode spans only its KIDS, and `extern` is not one — capture the keyword
+  // token explicitly so the node covers the whole declaration like the seed's.
+  let start = peekTok(p).start
+  advance(p) // 'extern'
+  if (peekKind(p) != Kind.KwFunction) {
+    parseFail(p, "'function' after 'extern'")
+    advance(p)
+    return 0
+  }
+  advance(p) // 'function'
+  let name = leaf(p, Tag.Ident)
+  let params = parseParams(p)
+  let result = 0
+  if (accept(p, Kind.Colon)) {
+    result = parseResultType(p)
+  }
+  let kids = [name, params, result]
+  let sp = spanOfKids(p.tree, kids)
+  return addNode(p.tree, Tag.ExternFnDecl, Span{ file: 0, start: start, end: sp.end }, 0, kids)
+}
+
+// Skips to the next token that can start a top-level declaration, or `;`
+// (consumed), or eof — the seed's `synchronizeTopLevel`. Bounded by the
+// remaining tokens.
+//
+// The stop set deliberately mirrors the seed's EXACTLY, including its omission
+// of `enum` and `@`: the two compilers must agree on where recovery resumes or
+// every cascading diagnostic after a bad top-level token diverges. Widening it
+// here would be a unilateral change to the oracle.
+function synchronizeTopLevel(p: Parser) {
+  let guard = 0
+  while (peekKind(p) != Kind.Eof && guard < 1000000) {
+    let k = peekKind(p)
+    if (k == Kind.Semicolon) {
+      advance(p)
+      return
+    }
+    if (k == Kind.KwImport || k == Kind.KwExport || k == Kind.KwLet || k == Kind.KwConst ||
+      k == Kind.KwFunction || k == Kind.KwStruct || k == Kind.KwInterface || k == Kind.KwType) {
+      return
+    }
+    advance(p)
+    guard = guard + 1
+  }
+}
+
+// Every non-import declaration that may follow `export`. `what` names what was
+// expected, because the seed words the failure differently by context — "a
+// top-level declaration" at file scope, "a declaration after 'export'" after
+// the keyword.
+function parseExportableDecl(p: Parser, what: string): int {
+  let k = peekKind(p)
+  // `extern` is a CONTEXTUAL keyword: it lexes as an ordinary identifier and
+  // stays usable as one everywhere else. Unambiguous here because an identifier
+  // can never begin a declaration, so this commits with no lookahead.
+  if (k == Kind.Ident && curText(p) == "extern") { return parseExternFnDecl(p) }
+  if (k == Kind.KwConst) { return parseValueDecl(p, Tag.ConstDecl, 0) }
+  if (k == Kind.KwLet) { return parseValueDecl(p, Tag.LetDecl, 0) }
+  if (k == Kind.At) { return parseAttrDecl(p) }
+  if (k == Kind.KwFunction) { return parseFuncDecl(p, 0) }
+  if (k == Kind.KwStruct) { return parseStructDecl(p) }
+  if (k == Kind.KwInterface) { return parseInterfaceDecl(p) }
+  if (k == Kind.KwEnum) { return parseEnumDecl(p) }
+  if (k == Kind.KwType) { return parseTypeAlias(p) }
+  // Unrecognized: report and synchronize. Silently swallowing the token instead
+  // let ANY garbage at file scope through with no diagnostic at all.
+  parseFail(p, what)
+  synchronizeTopLevel(p)
+  return 0
+}
+
+function parseTopDecl(p: Parser): int {
+  let k = peekKind(p)
+  if (k == Kind.KwImport) { return parseImportDecl(p) }
+  if (k == Kind.KwExport) {
+    advance(p)
+    let inner = parseExportableDecl(p, "a declaration after 'export'")
+    if (inner == 0) {
+      return 0
+    }
+    return mkNode(p, Tag.Export, 0, [inner])
+  }
+  return parseExportableDecl(p, "a top-level declaration")
+}
+
+function parseProgram(p: Parser): int {
+  let decls = []int(0)
+  let guard = 0
+  while (peekKind(p) != Kind.Eof && guard < 100000) {
+    guard = guard + 1
+    if (accept(p, Kind.Semicolon)) {
+      continue
+    }
+    let d = parseTopDecl(p)
+    if (d == 0) {
+      continue // already reported and synchronized; re-checking would double-report
+    }
+    decls = append(decls, d)
+    // A declaration not closed by `;`/eof is malformed: report the missing
+    // separator once and synchronize, mirroring `parseBlock`'s statement
+    // recovery. Blanket-skipping semicolons instead let a run of garbage after a
+    // good declaration through unreported.
+    if (!accept(p, Kind.Semicolon) && peekKind(p) != Kind.Eof) {
+      parseFail(p, "';'")
+      synchronizeTopLevel(p)
+    }
+  }
+  return mkNode(p, Tag.Program, 0, decls)
+}
+
+// Parses `src` into a Tree whose root is the `program` node.
+function parseSource(src: string): Tree {
+  let p = newParser(src)
+  p.tree.root = parseProgram(p)
+  return p.tree
+}
+
+// Lexes + parses `src`, reporting lex and parse diagnostics into `diags` (spans
+// stamped `file`). Backs `--dump-diags`.
+function parseSourceD(src: string, file: int, diags: Diagnostics): Tree {
+  let p = newParserD(src, file, diags)
+  p.tree.root = parseProgram(p)
+  return p.tree
+}
