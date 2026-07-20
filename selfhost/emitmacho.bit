@@ -1,0 +1,362 @@
+// Split out of emit.bit (#1503): the Mach-O object writer — emitMachoObject and
+// its Mach-O-only naming and relocation helpers. The shared blob/global
+// placement helpers stay in emit.bit.
+
+// The Mach-O C ABI's leading underscore.
+function emMac(name: string): string {
+  return "_" + name
+}
+
+// The Mach-O-spelled names this module legitimately leaves undefined for dyld
+// to bind — its §11.7 `extern function` declarations. Mirrors the seed's
+// emit.externImportNames.
+//
+// The linker cannot derive this set itself: an `extern function` and a symbol
+// the compiler simply misspelled are emitted identically (both are just an
+// undefined external), so the declaration has to be carried across the object
+// boundary out of band. Without it the Mach-O linker has no way to tell a legal
+// dylib import from #1428's `_idg`.
+function machoImportNames(module: IrModule): []string {
+  let out = []string(0)
+  for n of module.externNames {
+    out = append(out, emMac(n))
+  }
+  return out
+}
+
+function emitMachoObject(module: IrModule, withEntry: bool, freestanding: bool): []u8! {
+  let code = newByteBuf()
+  let rodata = newByteBuf()
+  let data = newByteBuf()
+  let gc = newByteBuf()
+  let symbols = []MachoSymbol(0)
+  let relocs = []MachoRelocation(0)
+  let defined = map<string, bool>{}
+  let stackmaps = []FuncStackMap(0)
+  let emittedNames = []string(0)
+  if (freestanding) {
+    refuseManagedMetadata(module)?
+    refuseUnpinnedImports(module)?
+  }
+  refuseThreadLocalStorage(module)?
+
+  // §11.8: `syscall()` is Linux-only. The arm64 backend is shared with
+  // aarch64-linux, so the target-specific rejection belongs here, on the Mach-O
+  // path — the one place that knows the OS. Rejecting before any code is
+  // emitted keeps the failure a clean diagnostic rather than a partly written
+  // object.
+  let sf = 0
+  while (sf < len(module.funcs)) {
+    let sfn = module.funcs[sf]
+    // §17.6: only code this object emits can carry the instruction — rejecting
+    // on a module not being emitted would fail a valid freestanding build over
+    // a sibling's Linux-only code.
+    if (!emitsFunction(sfn, freestanding)) {
+      sf = sf + 1
+      continue
+    }
+    let si = 0
+    while (si < len(sfn.instrs)) {
+      if (sfn.instrs[si].op == Op.Syscall) {
+        fail newError("'syscall' is not supported on aarch64-macos: Darwin publishes no stable syscall numbers (SPEC §11.8)")
+      }
+      si = si + 1
+    }
+    sf = sf + 1
+  }
+
+  // ---- every function -> one __text symbol + its relocations -------------
+  let mainVoid = false
+  let haveMain = false
+  let fi = 0
+  while (fi < len(module.funcs)) {
+    let f = module.funcs[fi]
+    // §17.6: an imported module's function belongs to its own object.
+    if (!emitsFunction(f, freestanding)) {
+      fi = fi + 1
+      continue
+    }
+    let fc = compileFunction(module, f)
+    let off = len(code.bytes)
+    appendBytes(code, fc.code)
+    symbols = append(symbols, MachoSymbol{ name: emMac(f.name), hasSection: true,
+      section: MachoSectionKind.Text, offset: off, size: len(fc.code),
+      binding: MachoBinding.Global })
+    defined[emMac(f.name)] = true
+    let r = 0
+    while (r < len(fc.relocs)) {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Text,
+        offset: off + fc.relocs[r].offset, symbol: emMac(fc.relocs[r].symbol),
+        kind: emRelocKind(fc.relocs[r].kind) })
+      r = r + 1
+    }
+    stackmaps = append(stackmaps, emStackMapOf(fc))
+    emittedNames = append(emittedNames, f.name)
+    if (f.name == "main") {
+      haveMain = true
+      mainVoid = module.ctx.types[f.result].kind == TypeKind.Void
+    }
+    fi = fi + 1
+  }
+  if (withEntry) {
+    if (!haveMain) {
+      fail newError("NoMain")
+    }
+
+    // ---- _bit_main entry trampoline (AArch64) ----------------------------
+    // The runtime calls _bit_main (runtime/root.zig's boot runs it as a green
+    // thread); a void `main` still has to return an exit code, so the
+    // trampoline supplies 0.
+    let tramp = len(code.bytes)
+    emitWord(code, 0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+    let callField = len(code.bytes)
+    emitWord(code, 0x94000000) // bl _main (placeholder)
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Text,
+      offset: callField, symbol: "_main", kind: MachoRelocKind.Branch })
+    if (mainVoid) {
+      emitWord(code, 0x52800000) // movz w0, #0
+    }
+    emitWord(code, 0xA8C17BFD) // ldp x29, x30, [sp], #16
+    emitWord(code, 0xD65F03C0) // ret
+    symbols = append(symbols, MachoSymbol{ name: "_bit_main", hasSection: true,
+      section: MachoSectionKind.Text, offset: tramp, size: len(code.bytes) - tramp,
+      binding: MachoBinding.Global })
+    defined["_bit_main"] = true
+  }
+
+  // ---- string pool -> read-only bytes + a writable {ptr,len} header ------
+  let si = 0
+  while (si < len(module.stringPool)) {
+    let s = module.stringPool[si]
+    let dataOff = len(rodata.bytes)
+    appendBytes(rodata, []byte(s))
+    let dataName = "___bitstr_${si}_data"
+    symbols = append(symbols, MachoSymbol{ name: dataName, hasSection: true,
+      section: MachoSectionKind.Rodata, offset: dataOff, size: len([]byte(s)),
+      binding: MachoBinding.Local })
+    defined[dataName] = true
+
+    emPadTo8(data)
+    let hdrOff = len(data.bytes)
+    appendU64(data, 0)             // ptr — filled by the reloc, rebased by dyld
+    appendU64(data, len([]byte(s))) // len
+    let hdrName = "___bitstr_${si}"
+    // §17.6: local in a freestanding object — see emitElfBlobs.
+    let hdrBinding = MachoBinding.Global
+    if (freestanding) {
+      hdrBinding = MachoBinding.Local
+    }
+    symbols = append(symbols, MachoSymbol{ name: hdrName, hasSection: true,
+      section: MachoSectionKind.Data, offset: hdrOff, size: 16,
+      binding: hdrBinding })
+    defined[hdrName] = true
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+      offset: hdrOff, symbol: dataName, kind: MachoRelocKind.Unsigned64 })
+    si = si + 1
+  }
+
+  // ---- gc_alloc TypeInfo blobs -------------------------------------------
+  // §17.6: empty on the freestanding path — see refuseManagedMetadata.
+  let tis = collectTypeInfos(module, freestanding)
+  let ti = 0
+  while (ti < len(tis)) {
+    let t = tis[ti]
+    let name = typeInfoSymbol(t.disc, t.size, t.ptrOffsets)
+    let offsName = ""
+    if (len(t.ptrOffsets) > 0) {
+      emPadTo8(rodata)
+      let offsOff = len(rodata.bytes)
+      let k = 0
+      while (k < len(t.ptrOffsets)) {
+        appendU64(rodata, t.ptrOffsets[k])
+        k = k + 1
+      }
+      offsName = emMac(name + "_offs")
+      symbols = append(symbols, MachoSymbol{ name: offsName, hasSection: true,
+        section: MachoSectionKind.Rodata, offset: offsOff,
+        size: len(t.ptrOffsets) * 8, binding: MachoBinding.Local })
+      defined[offsName] = true
+    }
+    // The type's display name. The seed reads a display_names side table; this
+    // port keeps the name on the Type itself.
+    let tname = ""
+    if (module.ctx.types[t.disc].hasName) {
+      tname = module.ctx.types[t.disc].name
+    }
+    let nameSym = ""
+    if (len([]byte(tname)) > 0) {
+      let nmOff = len(rodata.bytes)
+      appendBytes(rodata, []byte(tname))
+      nameSym = emMac(name + "_name")
+      symbols = append(symbols, MachoSymbol{ name: nameSym, hasSection: true,
+        section: MachoSectionKind.Rodata, offset: nmOff, size: len([]byte(tname)),
+        binding: MachoBinding.Local })
+      defined[nameSym] = true
+    }
+    // The method table holds absolute fn pointers, so it lives in writable
+    // __data too.
+    let methods = emitMethodTable(module, data, t.disc, name)
+    let methodsName = ""
+    if (methods.sym != "") {
+      methodsName = emMac(methods.sym)
+      symbols = append(symbols, MachoSymbol{ name: methodsName, hasSection: true,
+        section: MachoSectionKind.Data, offset: methods.off, size: methods.size,
+        binding: MachoBinding.Local })
+      defined[methodsName] = true
+      let mr = 0
+      while (mr < len(methods.relocs)) {
+        relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+          offset: methods.relocs[mr].off, symbol: emMac(methods.relocs[mr].sym),
+          kind: MachoRelocKind.Unsigned64 })
+        mr = mr + 1
+      }
+    }
+
+    emPadTo8(data)
+    let tiOff = len(data.bytes)
+    appendU64(data, t.size)              // size
+    appendU64(data, 0)                   // ptr_offsets_ptr (rebased if any)
+    appendU64(data, len(t.ptrOffsets))   // ptr_offsets_len
+    appendU64(data, 0)                   // name_ptr (rebased if any)
+    appendU64(data, len([]byte(tname)))  // name_len
+    appendU64(data, 0)                   // methods_ptr (rebased if any)
+    appendU64(data, methods.size / 16)   // methods_len
+    let tiName = emMac(name)
+    symbols = append(symbols, MachoSymbol{ name: tiName, hasSection: true,
+      section: MachoSectionKind.Data, offset: tiOff, size: 56,
+      binding: MachoBinding.Global })
+    defined[tiName] = true
+    if (len(t.ptrOffsets) > 0) {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: tiOff + 8, symbol: offsName, kind: MachoRelocKind.Unsigned64 })
+    }
+    if (nameSym != "") {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: tiOff + 24, symbol: nameSym, kind: MachoRelocKind.Unsigned64 })
+    }
+    if (methods.sym != "") {
+      relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Data,
+        offset: tiOff + 40, symbol: methodsName, kind: MachoRelocKind.Unsigned64 })
+    }
+    ti = ti + 1
+  }
+
+  // ---- GC stack-map entries (runtime/ABI.md §4) -> __DATA,__bit_gc -------
+  // Per-MEMBER, not per-program (ABI.md §4.1): every object emits its own
+  // entries and the linker concatenates them between the symbols it defines at
+  // the extent's ends, so an archive member can carry stack maps and its
+  // functions are free to reach safepoints. No object defines _bit_stack_maps —
+  // one global name owned by several members would be a duplicate definition,
+  // so the linker owns it instead.
+  //
+  // Each entry holds an absolute code pointer, so like the string/TypeInfo blobs
+  // the section is in __DATA (dyld only rebases writable segments under PIE).
+  // One section with one LOCAL symbol per function: the writer rejects two
+  // sections of the same kind, and the reader carves one atom per symbol, which
+  // is what lets the linker drop an entry whose function it dropped.
+  assert(len(emittedNames) == len(stackmaps))
+  let smCodeRelocs = writeStackMaps(gc, stackmaps)
+  let smi = 0
+  while (smi < len(smCodeRelocs)) {
+    let smOff = smCodeRelocs[smi]
+    let smEnd = len(gc.bytes)
+    if (smi + 1 < len(smCodeRelocs)) {
+      smEnd = smCodeRelocs[smi + 1]
+    }
+    let smName = emMac("__bitsm_${smi}")
+    symbols = append(symbols, MachoSymbol{ name: smName, hasSection: true,
+      section: MachoSectionKind.GcMeta, offset: smOff, size: smEnd - smOff,
+      binding: MachoBinding.Local })
+    defined[smName] = true
+    // Offsets are already section-relative, and an entry starts with its
+    // codeAddr field — so the entry offset IS the reloc offset.
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.GcMeta,
+      offset: smOff, symbol: emMac(emittedNames[smi]),
+      kind: MachoRelocKind.Unsigned64 })
+    smi = smi + 1
+  }
+
+  // ---- module-level state (§11.11) -> the same writable __data ----------
+  let mgs = placeGlobals(module, 0, data)
+  let gi = 0
+  while (gi < len(mgs)) {
+    let gsym = emMac(mgs[gi].name)
+    symbols = append(symbols, MachoSymbol{ name: gsym, hasSection: true,
+      section: MachoSectionKind.Data, offset: mgs[gi].offset,
+      size: mgs[gi].size, binding: MachoBinding.Global })
+    defined[gsym] = true
+    gi = gi + 1
+  }
+
+  // ---- read-only module state (§11.11) -> the same __rodata --------------
+  // Two format differences from the ELF path, both silent wrongness if missed:
+  //   1. every symbol name is `_`-prefixed, on the REFERENCE as well as on the
+  //      definition — an unprefixed target would resolve against nothing;
+  //   2. Mach-O relocations carry NO addend field; the addend lives in the field
+  //      bytes and the reader takes it back out from there. So it is written
+  //      into the image here, where ELF leaves the image untouched.
+  let ro = placeReadonlyGlobals(module, rodata)
+  for rp of ro.placements {
+    let rsym = emMac(rp.name)
+    symbols = append(symbols, MachoSymbol{ name: rsym, hasSection: true,
+      section: MachoSectionKind.Rodata, offset: rp.offset, size: rp.size,
+      binding: MachoBinding.Global })
+    defined[rsym] = true
+  }
+  for f of ro.fixups {
+    patchU64Le(rodata.bytes, f.offset, f.addend)
+    relocs = append(relocs, MachoRelocation{ section: MachoSectionKind.Rodata,
+      offset: f.offset, symbol: emMac(f.symbol),
+      kind: MachoRelocKind.Unsigned64 })
+  }
+
+  // ---- undefined externals for runtime symbols ---------------------------
+  // Anything a relocation names that this object does not define is a runtime
+  // import the linker resolves.
+  let externs = map<string, bool>{}
+  let ri = 0
+  while (ri < len(relocs)) {
+    let sym = relocs[ri].symbol
+    let (_, isDef) = defined[sym]
+    let (_, isExt) = externs[sym]
+    if (!isDef && !isExt) {
+      externs[sym] = true
+      symbols = append(symbols, MachoSymbol{ name: sym, hasSection: false,
+        section: MachoSectionKind.Text, offset: 0, size: 0,
+        binding: MachoBinding.Global })
+    }
+    ri = ri + 1
+  }
+
+  let sections = [MachoSection{ kind: MachoSectionKind.Text, data: code.bytes,
+    size: 0, alignment: 4 }]
+  if (len(gc.bytes) > 0) {
+    // 1-aligned — see the ELF path: padding inside the extent would be decoded
+    // as an entry.
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.GcMeta,
+      data: gc.bytes, size: 0, alignment: 1 })
+  }
+  if (len(rodata.bytes) > 0) {
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.Rodata,
+      data: rodata.bytes, size: 0,
+      alignment: globalsAlign(module, storageReadonly()) })
+  }
+  if (len(data.bytes) > 0) {
+    sections = append(sections, MachoSection{ kind: MachoSectionKind.Data,
+      data: data.bytes, size: 0, alignment: globalsAlign(module, 0) })
+  }
+  return writeMacho(MachoTarget.Aarch64, MachoObject{ sections: sections,
+    symbols: symbols, relocations: relocs })?
+}
+
+// codegen's Reloc kinds map 1:1 onto the object writer's.
+function emRelocKind(k: RelocKind): MachoRelocKind {
+  if (k == RelocKind.Branch) {
+    return MachoRelocKind.Branch
+  }
+  if (k == RelocKind.Page21) {
+    return MachoRelocKind.Page21
+  }
+  assert(k == RelocKind.PageOff12)
+  return MachoRelocKind.Pageoff12
+}
