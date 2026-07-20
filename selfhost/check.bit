@@ -126,6 +126,13 @@ struct Checker {
   // node, before anything types an arrow. Sparse: arrows are rare, and only
   // `checkArrowFn` ever reads it.
   arrowExpected: map<int, int>,
+  // An arrow's own function type, keyed by node, as computed while its params
+  // were still in scope. The flat env holds ONE binding per name, so
+  // re-deriving an arrow's type after its scope closed — which lowering does
+  // through `nodeType` — resolves the arrow's own params against whatever else
+  // now owns those names. See `checkArrowFn` for why the memo only ever
+  // rescues an invalid re-derivation, never overrides a good one.
+  arrowTypes: map<int, int>,
   // --- resolver handoff (#1370) -------------------------------------------
   // The resolver's per-node symbol table for THIS module: `nodeSymbols[node]`
   // is the symbol id an identifier reference resolves to (0 = none), and
@@ -194,7 +201,7 @@ function newChecker(tree: Tree, source: string, ctx: TypeContext): Checker {
   let sm = newSourceManager()
   let f = addFile(sm, "", source)
   return Checker{ ctx: ctx, tree: tree, source: source, nodeTypes: nt,
-    arrowExpected: map<int, int>{},
+    arrowExpected: map<int, int>{}, arrowTypes: map<int, int>{},
     symbols: []Symbol(0), nodeSymbols: []int(0), declTypes: dt,
     diags: newDiagnostics(sm), files: [f], fileStarts: [0],
     env: map<string, int>{}, funcResults: map<string, int>{}, userTypes: map<string, int>{},
@@ -1038,6 +1045,34 @@ function isTypeParamName(c: Checker, decl: int, name: string): bool {
 // (as this did) left `[]T` resolving with `T` unsubstituted: `len()` still worked
 // (it ignores the element type) but indexing or iterating the result could not
 // compute an element width, and lowering silently stubbed the whole caller out.
+// The type arguments an EXPLICIT instantiation writes (`ident<i32>(7)`), in
+// declaration order, or an empty list when the call writes none — kid 1 of a
+// Call node is its `<...>` list.
+//
+// An explicit argument OUTRANKS structural inference from the argument types.
+// Inferring `ident<i32>(7)` from the argument alone defaults the untyped
+// literal `7` to i64 and so contradicts what the source plainly says; the seed
+// reads the written list first, and this is what makes the two agree. An entry
+// that fails to resolve comes back 0, and every caller falls back to structural
+// inference for it rather than committing to a wrong answer.
+function explicitCallTypeArgs(c: Checker, callNode: int): []int {
+  let out = []int(0)
+  if (callNode == 0 || getNode(c.tree, callNode).tag != Tag.Call) {
+    return out
+  }
+  let ck = kidsOf(c.tree, callNode)
+  if (len(ck) < 2 || ck[1] == 0) {
+    return out
+  }
+  let tas = kidsOf(c.tree, ck[1])
+  let i = 0
+  while (i < len(tas)) {
+    out = append(out, typeFromNode(c, tas[i]))
+    i = i + 1
+  }
+  return out
+}
+
 function genericResultAt(c: Checker, name: string, callNode: int): int {
   let decl = funcDeclLookup(c, name)
   if (decl == 0) {
@@ -1056,6 +1091,7 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
   }
   let tps = kidsOf(oc.tree, dk[2])
   let params = kidsOf(oc.tree, dk[3])
+  let explicit = explicitCallTypeArgs(c, callNode)
   let sub = noSubst()
   let ti = 0
   while (ti < len(tps)) {
@@ -1063,7 +1099,13 @@ function genericResultAt(c: Checker, name: string, callNode: int): int {
     let tpname = oc.source[tpn.span.start:tpn.span.end]
     // A type param no parameter mentions (`function zero<T>(): T`) stays
     // unbound and resolves as it always did — no worse than before.
-    let bound = bindTypeParamAtCall(oc, c, callNode, params, tpname)
+    let bound = 0
+    if (ti < len(explicit)) {
+      bound = explicit[ti]
+    }
+    if (bound == 0) {
+      bound = bindTypeParamAtCall(oc, c, callNode, params, tpname)
+    }
     if (bound != 0) {
       sub.names = append(sub.names, tpname)
       sub.types = append(sub.types, bound)
@@ -1375,11 +1417,18 @@ function genericTypeArgs(c: Checker, name: string, callNode: int): []int {
   let dk = kidsOf(oc.tree, decl)
   let tps = kidsOf(oc.tree, dk[2])
   let params = kidsOf(oc.tree, dk[3])
+  let explicit = explicitCallTypeArgs(c, callNode)
   let ti = 0
   while (ti < len(tps)) {
     let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[ti])[0])
     let tpname = oc.source[tpn.span.start:tpn.span.end]
-    let bound = bindTypeParamAtCall(oc, c, callNode, params, tpname)
+    let bound = 0
+    if (ti < len(explicit)) {
+      bound = explicit[ti]
+    }
+    if (bound == 0) {
+      bound = bindTypeParamAtCall(oc, c, callNode, params, tpname)
+    }
     if (bound == 0) {
       bound = c.ctx.voidId
     }
@@ -2288,7 +2337,33 @@ function arrowExpectedResult(c: Checker, node: int): int {
 // A closure `(x: T, ...) => body` has function type `(T, ...) => R`, R the
 // (defaulted) type of its body. ponytail: annotated params only — an untyped
 // param is left at 0 and recovered by lowering.
+// An arrow's function type, memoized per node against the flat env.
+//
+// `checkArrowFnAt` derives the result from the BODY, which reads the arrow's
+// own params out of the flat env. That env holds one binding per name, so once
+// the arrow's scope has closed those names belong to whoever came next — and
+// lowering re-derives every node type through `nodeType`, long after. Two
+// sibling arrows that both name a param `a` then both came back with an invalid
+// result, and the closure's `gc_alloc` was typed `fn(string) <invalid>`.
+//
+// The sweep computes the right answer while the params ARE in scope, so keep it
+// and consult it only when a later derivation comes back invalid. A valid fresh
+// answer always wins and is always re-stored, so this can only ever turn an
+// invalid type into the one the sweep already proved — never the reverse.
 function checkArrowFn(c: Checker, node: int): int {
+  let ft = checkArrowFnAt(c, node)
+  if (ft != 0 && c.ctx.types[ft].result != 0) {
+    c.arrowTypes[node] = ft
+    return ft
+  }
+  let (memo, ok) = c.arrowTypes[node]
+  if (ok && memo != 0) {
+    return memo
+  }
+  return ft
+}
+
+function checkArrowFnAt(c: Checker, node: int): int {
   let kids = kidsOf(c.tree, node)
   let params = []int(0)
   let ps = kidsOf(c.tree, kids[0])
