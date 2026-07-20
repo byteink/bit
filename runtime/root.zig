@@ -1397,9 +1397,29 @@ export fn bit_rt_string_from_int(v: i64) callconv(.c) *const RtBytes {
     return stringFromBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
 }
 
+/// The longest text `{d}` can produce for an f64. `{d}` is POSITIONAL decimal
+/// always — it never falls back to an exponent form — so the extremes are long:
+/// the negative smallest subnormal is `-0.` + 323 zeros + `5` = 327 bytes, and
+/// negative DBL_MAX is 310. 327 is the true maximum; the buffer carries slack so
+/// a formatting change upstream cannot silently reintroduce the overflow.
+///
+/// This bound is load-bearing, not decorative. It was 32, which truncated every
+/// float wider than 32 characters — and because `libbitrt` is built ReleaseSmall
+/// (build.zig), the `NoSpaceLeft` that `bufPrint` correctly returned met a
+/// `catch unreachable` with safety checks OFF. That is undefined behaviour, not
+/// a panic, and it surfaced as a silently truncated string: DBL_MAX printed as
+/// `17976931348623157000000000000000` and 5e-324 as `0.000...000`. Silent, and
+/// wrong in every Bit program that prints a float, not only in the IR dump.
+const float_text_max = 512;
+
 export fn bit_rt_string_from_float(v: f64) callconv(.c) *const RtBytes {
-    var buf: [32]u8 = undefined;
-    return stringFromBytes(std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
+    var buf: [float_text_max]u8 = undefined;
+    // Not `catch unreachable`: in a ReleaseSmall archive that is UB and degrades
+    // to silent truncation. An explicit `fatal` fails loudly instead, so a bound
+    // that ever stops holding is a stopped process rather than a wrong number.
+    const txt = std.fmt.bufPrint(&buf, "{d}", .{v}) catch
+        fatal("bit_rt_string_from_float: float text exceeds buffer");
+    return stringFromBytes(txt);
 }
 
 /// `parseFloat(text) -> f64`: the value of a float literal, `_` separators
@@ -1408,7 +1428,11 @@ export fn bit_rt_string_from_float(v: f64) callconv(.c) *const RtBytes {
 /// a byte-identical `const_float` IR dump (both format via `{d}`). Unparsable
 /// text yields 0 (the checker has already validated the literal's shape).
 export fn bit_rt_parse_float(s: *const RtBytes) callconv(.c) f64 {
-    var buf: [80]u8 = undefined;
+    // Sized to match `float_text_max` so the two directions compose: the widest
+    // text `bit_rt_string_from_float` can emit is 327 bytes, and at the old 80
+    // any such literal fell straight into the `return 0` below — a round trip
+    // that silently produced zero rather than the value it started from.
+    var buf: [float_text_max]u8 = undefined;
     if (s.len > buf.len) return 0;
     var n: usize = 0;
     for (s.ptr[0..s.len]) |c| {
