@@ -214,20 +214,43 @@ pub const max_mutators = 256;
 ///
 /// `std.atomic.spinLoopHint` is `yield` on AArch64 and `pause` on x86-64, and
 /// those differ by about two orders of magnitude: `yield` is a couple of cycles,
-/// while `pause` on Skylake and later parks the pipeline for ~140. A single
-/// 8_000_000 bound is therefore ~5ms on arm64 and most of a SECOND on x86-64.
+/// while `pause` on Skylake and later parks the pipeline for ~140.
 ///
 /// That is not theoretical. `tests/stress/gcthreads*` has a parent that sleeps
 /// inside its join without the `blocked` contract, so it reads as `running` and
 /// every collection its children attempt meanwhile runs the bound out in full.
 /// On a 6-core x86_64 box that made a program doing microseconds of arithmetic
 /// take 77 SECONDS and blow a 10s join deadline; with the bound below it is 2.5s.
-/// The same binary on arm64 was always about a second. Sized so the wait is tens
-/// of milliseconds on both, which is what the original comment claimed and only
-/// ever achieved on one of them.
+/// Sized so the wait is tens of milliseconds on both.
+///
+/// **SIZE THIS BY MEASURING A RENDEZVOUS, NOT BY COSTING THE HINT** (#1554). The
+/// arm64 figure was originally derived from `yield` alone and set to 8_000_000
+/// for a predicted ~5ms. The prediction was 20x optimistic, because the hint is
+/// not what the loop spends its time on: every iteration also re-walks the
+/// mutator registry, and the `seq_cst` load of a contended slot costs far more
+/// than the `yield` after it. Measured on native aarch64-linux, `gcthreadslinux`
+/// under `BIT_GC=stress` — same binary, same ~288 abandoned rendezvous, bound
+/// varied alone:
+///
+///     8_000_000 -> ~28_000ms total, ~97ms per abandoned rendezvous
+///     1_000_000 ->  ~2_800ms total, ~9.8ms per abandoned rendezvous
+///       200_000 ->    ~550ms total, ~1.9ms per abandoned rendezvous
+///
+/// Cost is linear in the bound and the collection counts are IDENTICAL at all
+/// three (246 collected / 288 abandoned), so on this workload the extra spinning
+/// bought not one additional successful stop — every one of those rendezvous was
+/// always going to expire, because the thread it waits for is in `nanosleep` and
+/// no bound short of the sleep can catch it. At 8_000_000 the run took ~28s
+/// against a 10s per-join deadline and failed whenever the host was loaded (3/15
+/// at load average 13 on an 18-core box; 15/15 at load 6.7 — the SAME bytes),
+/// which is #1554. 1_000_000 restores the stated tens-of-milliseconds target and
+/// leaves ~3x margin under that deadline.
+///
+/// So the two arches differ by about 7x per iteration, not the ~70x the hint
+/// costs alone would suggest. Re-measure before changing either number.
 const stw_spin_bound: usize = switch (builtin.cpu.arch) {
     .x86_64 => 200_000,
-    else => 8_000_000,
+    else => 1_000_000,
 };
 
 /// Iterations a *parked* mutator will wait for the stop to clear before
