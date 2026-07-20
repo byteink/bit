@@ -46,13 +46,23 @@ if [ "${MODE}" = "fuzz" ]; then
 fi
 VOLUME="bit-zig-cache-amd64"
 
-# Which real-x86_64 box runs the gate. Default `mustafa-desktop`: 28 cores and
-# otherwise idle, against hl-master's 6 cores carrying load ~12 alongside seven
-# production service containers (ntfy/qdrant/searxng/tasktap/whisper-shim) —
-# measured, not assumed. Override to compare hosts or when one is unreachable;
-# both carry the same `bit-zig-0.16.0-amd64` image, copied with docker save|load
-# so the two are byte-identical rather than independently built (#1500).
-X64GATE_HOST="${X64GATE_HOST:-mustafa-desktop}"
+# Which real-x86_64 box runs the gate. No hostname is baked into the repo —
+# machine names are the operator's, not the project's. Resolution order:
+#   1. $X64GATE_HOST
+#   2. scripts/.x64gate-host  (gitignored, one line: an ssh host alias)
+# The host needs ssh access and a `bit-zig-0.16.0-amd64` image. Copy it with
+# `docker save | docker load` rather than rebuilding, so every host runs a
+# byte-identical image and a host swap cannot change what is being tested.
+X64GATE_HOST="${X64GATE_HOST:-}"
+if [ -z "${X64GATE_HOST}" ] && [ -f "$(dirname "$0")/.x64gate-host" ]; then
+  X64GATE_HOST=$(tr -d '[:space:]' < "$(dirname "$0")/.x64gate-host")
+fi
+if [ -z "${X64GATE_HOST}" ]; then
+  echo "x64gate: no host configured. Set X64GATE_HOST=<ssh-alias>, or write it" >&2
+  echo "         to scripts/.x64gate-host (gitignored). The host needs ssh plus" >&2
+  echo "         a bit-zig-0.16.0-amd64 image." >&2
+  exit 127
+fi
 
 if [ "$MODE" = "clean" ]; then
   # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
