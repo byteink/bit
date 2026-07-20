@@ -1,0 +1,242 @@
+// Darwin TCP calls for the Stage-2 port of runtime/net.zig (#1366): listeners,
+// dials and stream I/O. Split out of sock.bit (#1503); same module, so the
+// constants, buffers and helpers there are in scope unchanged.
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+// A listening socket bound to `host:port`. `port == 0` lets the kernel pick one;
+// recover it with `netLocalPort`. Returns a negative value on failure.
+export @symbol("bit_rt_port_net_listen_tcp") function netListenTcp(host: *u8, hostLen: int, port: int, backlog: int): int {
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  let fd = netSysSocket(false)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  if (!netSetReuseAddr(fd)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  netFillSockAddr(saBytes(), ip, port)
+  if (!netSysBind(fd, saBytes())) {
+    netClose(fd)
+    return 0 - 1
+  }
+  if (!netSysListen(fd, backlog)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  return fd
+}
+
+// The port `fd` is actually bound to — the whole point of binding to port 0.
+export @symbol("bit_rt_port_net_local_port") function netLocalPort(fd: int): int {
+  putU32Le(lenBytes(), 0, saLen)
+  if (int(getsockname(i32(fd), saBytes(), lenBytes())) < 0) {
+    return 0 - 1
+  }
+  return netSockAddrPort(saBytes())
+}
+
+// Accept one connection, parking until a peer arrives. The returned socket is
+// non-blocking, like every socket here. Negative on failure.
+export @symbol("bit_rt_port_net_accept_tcp") function netAcceptTcp(lfd: int): int {
+  let stalls = 0
+  let spins = 0
+  // Two bounds, both static (Power of 10): `stalls` counts parked waits and
+  // `spins` counts unscheduled retries, and neither can run away.
+  while (stalls < netMaxStalls && spins < netMaxSpins) {
+    let none: *u8 = nil
+    let fd = int(accept(i32(lfd), none, none))
+    if (fd >= 0) {
+      if (!netSetNonBlock(fd)) {
+        netClose(fd)
+        return 0 - 1
+      }
+      return fd
+    }
+    let e = lastErr()
+    if (e == eAgain()) {
+      if (netAwaitReady(lfd, pollRead)) {
+        stalls = stalls + 1
+      } else {
+        spins = spins + 1
+      }
+    } else {
+      // A peer that vanished between the poll and the accept is routine, and
+      // not this listener's problem. EINTR likewise.
+      if (e != eConnAborted() && e != eIntr()) {
+        return 0 - 1
+      }
+      spins = spins + 1
+    }
+  }
+  return 0 - 1
+}
+
+// Connect to `host:port`, parking until the handshake finishes.
+//
+// A non-blocking `connect` reports EINPROGRESS and finishes in the background.
+// The socket then becomes WRITABLE whether it succeeded or failed, so the
+// outcome has to be read back from SO_ERROR. Skipping that read is the classic
+// bug: a refused connection looks connected until some later `write` fails far
+// away from the cause.
+export @symbol("bit_rt_port_net_dial_tcp") function netDialTcp(host: *u8, hostLen: int, port: int): int {
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  let fd = netSysSocket(false)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  netFillSockAddr(saBytes(), ip, port)
+  let rc = int(connect(i32(fd), saBytes(), i32(saLen)))
+  if (rc >= 0) {
+    return fd
+  }
+  let e = lastErr()
+  if (e != eInProgress() && e != eAgain() && e != eIntr()) {
+    netClose(fd)
+    return 0 - 1
+  }
+  let spins = 0
+  // Bounded (Power of 10). One parked wait suffices when there is a scheduler;
+  // the loop exists for the unscheduled caller, which must poll for completion.
+  //
+  // `SO_ERROR == 0` DOES NOT MEAN CONNECTED — it means "no error HAS BEEN
+  // RECORDED YET", and immediately after EINPROGRESS that is the state of every
+  // handshake, including the ones about to be refused. Reading it before the
+  // handshake finishes therefore reports success for a connection that has not
+  // happened, which is the very bug the comment above warns about, one step
+  // further in. This was invisible until #1462: `fcntl`'s misplaced variadic
+  // argument left every socket BLOCKING, so `connect` completed synchronously
+  // and this loop was never entered at all — the test's own notes record
+  // `refusedDial` as "passing for the wrong reason" and the SO_ERROR readback as
+  // an unexercised gap. Both are now real.
+  //
+  // So completion is established FIRST, by re-issuing `connect` — the BSD way to
+  // ask a pending handshake how it went, and one that needs no poller, which
+  // matters because the unscheduled caller has none:
+  //
+  //   EALREADY / EINPROGRESS   still running; keep waiting
+  //   EISCONN (or success)     finished and connected
+  //   anything else            the deferred failure, reported here
+  //
+  // SO_ERROR is then read on the completed socket, where it IS meaningful, and
+  // is what turns a handshake that completed-but-failed into an error.
+  while (spins < netMaxSpins) {
+    if (netAwaitReady(fd, pollWrite)) {
+      spins = netMaxSpins
+    } else {
+      spins = spins + 1
+    }
+    // THE ADDRESS IS REBUILT EVERY ATTEMPT, NOT REUSED. `saBytes()`/`ipBytes()`
+    // are module scratch shared by every entry point here, and `netAwaitReady`
+    // above PARKS the calling green thread — so another task can run a
+    // `netListenTcp`/`netBindUdp`/`netDialTcp` of its own and leave its address
+    // in the buffer. Reconnecting to whatever it left would be a silent
+    // cross-connection. Re-deriving from the caller's own `host`/`port`, with no
+    // park between the fill and the call, is what makes this safe.
+    if (!netParseIpv4(host, hostLen, ip)) {
+      netClose(fd)
+      return 0 - 1
+    }
+    netFillSockAddr(saBytes(), ip, port)
+    let rc2 = int(connect(i32(fd), saBytes(), i32(saLen)))
+    let ce = lastErr()
+    if (rc2 >= 0 || ce == eIsConn()) {
+      // Connected as far as the handshake is concerned; SO_ERROR is now the
+      // authority on whether it succeeded.
+      if (netSocketError(fd) != 0) {
+        netClose(fd)
+        return 0 - 1
+      }
+      return fd
+    }
+    if (ce != eAlready() && ce != eInProgress() && ce != eIntr()) {
+      netClose(fd)
+      return 0 - 1
+    }
+  }
+  netClose(fd)
+  return 0 - 1
+}
+
+// Read up to `cap` bytes into `buf`, parking until some arrive. `0` means the
+// peer closed: an orderly end of stream, not an error. Negative on failure.
+export @symbol("bit_rt_port_net_read_sock") function netReadSock(fd: int, buf: *u8, cap: int): int {
+  let stalls = 0
+  let spins = 0
+  while (stalls < netMaxStalls && spins < netMaxSpins) {
+    let n = int(read(i32(fd), buf, i64(cap)))
+    if (n >= 0) {
+      return n
+    }
+    let e = lastErr()
+    if (e == eAgain()) {
+      if (netAwaitReady(fd, pollRead)) {
+        stalls = stalls + 1
+      } else {
+        spins = spins + 1
+      }
+    } else {
+      if (e == eIntr()) {
+        spins = spins + 1
+      } else {
+        // A reset peer has no more bytes for us. Report end of stream so a
+        // caller's read loop terminates instead of erroring.
+        if (e == eConnReset()) {
+          return 0
+        }
+        return 0 - 1
+      }
+    }
+  }
+  return 0 - 1
+}
+
+// Write all `n` bytes of `buf`, parking whenever the send buffer is full. A
+// short write is normal on a socket and is not an error — hence the loop.
+export @symbol("bit_rt_port_net_write_sock") function netWriteSock(fd: int, buf: *u8, n: int): int {
+  let off = 0
+  let stalls = 0
+  let spins = 0
+  while (off < n && stalls < netMaxStalls && spins < netMaxSpins) {
+    let wrote = int(write(i32(fd), buf + off, i64(n - off)))
+    if (wrote > 0) {
+      off = off + wrote
+      // PROGRESS RESETS THE STALL BOUND: the bound is on CONSECUTIVE stalls, not
+      // on writes, so a large transfer that legitimately blocks many times is
+      // not mistaken for a wedged socket.
+      stalls = 0
+      spins = 0
+    } else {
+      if (wrote == 0) {
+        return 0 - 1
+      }
+      let e = lastErr()
+      if (e == eAgain()) {
+        if (netAwaitReady(fd, pollWrite)) {
+          stalls = stalls + 1
+        } else {
+          spins = spins + 1
+        }
+      } else {
+        if (e == eIntr()) {
+          spins = spins + 1
+        } else {
+          return 0 - 1
+        }
+      }
+    }
+  }
+  if (off < n) {
+    return 0 - 1
+  }
+  return off
+}
