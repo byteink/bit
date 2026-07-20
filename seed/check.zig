@@ -5377,6 +5377,15 @@ const Checker = struct {
                 if (k[2] != ast.none) return self.containsOwnBreakDepth(file_idx, k[2], depth + 1);
                 return false;
             },
+            // A match is not a break target (it pushes no loop frame in the
+            // lowerer), so a `break` in an arm body targets THIS loop (#1531).
+            .match_stmt => {
+                const k = mf.tree.kids(node);
+                for (mf.tree.kids(k[1])) |arm| {
+                    if (self.containsOwnBreakDepth(file_idx, mf.tree.kids(arm)[1], depth + 1)) return true;
+                }
+                return false;
+            },
             else => return false,
         }
     }
