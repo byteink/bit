@@ -1,0 +1,240 @@
+// The UDP and DNS sections of the Linux socket provider, split out of
+// ./sock.bit (#1503). Sibling file, so the same module: the syscall numbers,
+// kernel-struct constants, scratch buffers, `sysRc`/`lastErr` and
+// `netAwaitReady` it uses all live there and need no import in either
+// direction.
+//
+// DNS RIDES ALONG WITH UDP RATHER THAN GETTING ITS OWN FILE, AND THE REASON IS
+// LOAD ORDER, NOT TASTE. A module's files are concatenated in BYTEWISE SORTED
+// name order (see selfhost/project.bit), and this compiler's inliner only
+// inlines a callee it has already lowered — so a `dns.bit` would sort BEFORE
+// `sock.bit` and its resolver would emit CALLS to `tvBytes`/`putU64Le` where
+// the pre-split file inlined them. Same behaviour, different machine code, on a
+// provider that no native macOS build ever compiles. Keeping DNS here holds the
+// declaration order the single file had — sock, tcp, udp — which makes the
+// emitted object BYTE-IDENTICAL to the pre-split one on both Linux arches, and
+// that byte-identity is the only strong evidence this move changed nothing.
+
+// ---------------------------------------------------------------------------
+// UDP
+// ---------------------------------------------------------------------------
+
+// A datagram socket bound to `host:port`. `port == 0` lets the kernel pick one
+// (recover it with `netLocalPort`, exactly like a TCP listener). Connectionless:
+// unlike TCP there is no listen/accept — send and receive straight off the fd.
+export @symbol("bit_rt_port_net_bind_udp") function netBindUdp(host: *u8, hostLen: int, port: int): int {
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  let fd = netSysSocket(true)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  if (!netSetReuseAddr(fd)) {
+    netClose(fd)
+    return 0 - 1
+  }
+  netFillSockAddr(saBytes(), ip, port)
+  if (!netSysBind(fd, saBytes())) {
+    netClose(fd)
+    return 0 - 1
+  }
+  return fd
+}
+
+// Send one datagram to `host:port`. Parks on writability if the socket buffer is
+// momentarily full. A DATAGRAM IS ALL-OR-NOTHING: a partial send is an error,
+// never a short count, so there is no write loop as there is for TCP.
+export @symbol("bit_rt_port_net_send_to") function netSendTo(fd: int, host: *u8, hostLen: int, port: int,
+                          data: *u8, n: int): int {
+  let ip = ipBytes()
+  if (!netParseIpv4(host, hostLen, ip)) {
+    return 0 - 1
+  }
+  netFillSockAddr(saBytes2(), ip, port)
+  let stalls = 0
+  let spins = 0
+  while (stalls < netMaxStalls && spins < netMaxSpins) {
+    let sent = sysRc(int(syscall(nrSendTo(), i64(fd), i64(int(data)), i64(n), 0,
+                                 i64(int(saBytes2())), i64(saLen))))
+    if (sent >= 0) {
+      return sent
+    }
+    let e = lastErr()
+    if (e == eAgain()) {
+      if (netAwaitReady(fd, pollWrite)) {
+        stalls = stalls + 1
+      } else {
+        spins = spins + 1
+      }
+    } else {
+      if (e != eIntr()) {
+        return 0 - 1
+      }
+      spins = spins + 1
+    }
+  }
+  return 0 - 1
+}
+
+// Receive one datagram into `buf`, parking until one arrives, and write the
+// sender's address into `peer` (which must hold `netSockAddrLen()` bytes, or be
+// nil to discard it). Returns the byte count: A ZERO-LENGTH DATAGRAM IS LEGAL,
+// so 0 is NOT end-of-stream here — UDP has no stream to end.
+//
+// The out-parameter is `peer`, not `from`: `from` is a KEYWORD (import ... from)
+// and is rejected as an identifier.
+export @symbol("bit_rt_port_net_recv_from") function netRecvFrom(fd: int, buf: *u8, cap: int, peer: *u8): int {
+  let stalls = 0
+  let spins = 0
+  while (stalls < netMaxStalls && spins < netMaxSpins) {
+    // `salen` is IN/OUT and must be re-armed on EVERY attempt: the kernel writes
+    // the address size back into it, so a retry that reused the previous value
+    // would be passing whatever the last call left there.
+    putU32Le(lenBytes(), 0, saLen)
+    let got = sysRc(int(syscall(nrRecvFrom(), i64(fd), i64(int(buf)), i64(cap), 0,
+                                i64(int(saBytes())), i64(int(lenBytes())))))
+    if (got >= 0) {
+      if (int(peer) != 0) {
+        let k = 0
+        while (k < saLen) {
+          putU8(peer, k, getU8(saBytes(), k))
+          k = k + 1
+        }
+      }
+      return got
+    }
+    let e = lastErr()
+    if (e == eAgain()) {
+      if (netAwaitReady(fd, pollRead)) {
+        stalls = stalls + 1
+      } else {
+        spins = spins + 1
+      }
+    } else {
+      if (e != eIntr()) {
+        return 0 - 1
+      }
+      spins = spins + 1
+    }
+  }
+  return 0 - 1
+}
+
+// ---------------------------------------------------------------------------
+// DNS
+// ---------------------------------------------------------------------------
+
+// A BLOCKING socket with SO_RCVTIMEO, ON PURPOSE, matching the Zig. DNS is an
+// occasional millisecond cost, so a bounded receive timeout buys a real error on
+// packet loss without putting timer-driven wakes on the poller. It blocks the
+// calling worker for up to `netDnsTimeoutMs` on a lost packet; move it onto the
+// poller if resolution ever sits on a hot path.
+export @symbol("bit_rt_port_net_dns_socket") function netDnsSocket(): int {
+  let fd = sysRc(int(syscall(nrSocket(), i64(afInet()),
+                             i64(sockDgram() + sockCloExec()), 0)))
+  if (fd < 0) {
+    return 0 - 1
+  }
+  // BOTH fields are 64 bits here, unlike Darwin's 32-bit `tv_usec`.
+  let k = 0
+  while (k < tvSize) {
+    putU8(tvBytes(), k, 0)
+    k = k + 1
+  }
+  putU64Le(tvBytes(), tvSecOff, netDnsTimeoutMs / 1000)
+  putU64Le(tvBytes(), tvUsecOff, netDnsTimeoutMs % 1000 * 1000)
+  if (sysRc(int(syscall(nrSetSockOpt(), i64(fd), i64(solSocket()), i64(soRcvTimeo()),
+                        i64(int(tvBytes())), i64(tvSize)))) < 0) {
+    netClose(fd)
+    return 0 - 1
+  }
+  return fd
+}
+
+// The receive timeout configured on `fd`, in milliseconds, or -1 if the query
+// fails. Zero means no timeout is set.
+//
+// EXISTS TO BE ASSERTED ON, and deliberately so — the same argument
+// runtime/park/linux's `parkTimerSlackNs` makes. `struct timeval` is one of the
+// three real layout differences between this file and its twin (`tv_usec` is 32
+// bits on Darwin and 64 on Linux), and the ONLY behavioural guard for getting it
+// wrong is that a DNS query hangs instead of timing out. A guard whose failure
+// mode is a hang is not a guard: the harness reports a wedged suite rather than
+// a verdict, which is the trap this project has already hit once. Reading the
+// value back cannot hang and cannot flake.
+export @symbol("bit_rt_port_net_rcv_timeo_ms") function netRcvTimeoMs(fd: int): int {
+  let k = 0
+  while (k < tvSize) {
+    putU8(tvBytes(), k, 0)
+    k = k + 1
+  }
+  putU32Le(lenBytes(), 0, tvSize)
+  if (sysRc(int(syscall(nrGetSockOpt(), i64(fd), i64(solSocket()), i64(soRcvTimeo()),
+                        i64(int(tvBytes())), i64(int(lenBytes()))))) < 0) {
+    return 0 - 1
+  }
+  // BOTH fields are 64 bits here.
+  return getU64Le(tvBytes(), tvSecOff) * 1000 + getU64Le(tvBytes(), tvUsecOff) / 1000
+}
+
+// Resolve `host` to an IPv4 address, written to `out`. A dotted quad passes
+// straight through; a hostname is queried against the nameserver at `ns[0..4]`.
+//
+// THE NAMESERVER IS A PARAMETER, WHERE THE ZIG READS /etc/resolv.conf ITSELF.
+// The parse of that file is `netFirstNameserver` in ../net.bit, split out so it
+// is testable without a filesystem; reading the file is a platform call, and
+// keeping it out of here means `netResolve` can be pointed at a nameserver in
+// the same process — which is the only way to test a resolver without depending
+// on the network being up.
+export @symbol("bit_rt_port_net_resolve") function netResolve(host: *u8, hostLen: int, ns: *u8, out: *u8): bool {
+  if (netParseIpv4(host, hostLen, out)) {
+    return true
+  }
+  let query = dnsBytes()
+  let qlen = netBuildQuery(query, netMaxDnsMsg, host, hostLen, netDnsId)
+  if (qlen < 0) {
+    return false
+  }
+  let fd = netDnsSocket()
+  if (fd < 0) {
+    return false
+  }
+  let reply = dnsBytes() + netMaxDnsMsg
+  let attempt = 0
+  // Laid out INSIDE the loop rather than once before it: `saBuf2` is shared with
+  // `netSendTo`, so anything that ran in between may have overwritten it. The
+  // first draft filled it at the END of the body, which left the FIRST send
+  // aimed at whatever the previous caller had left there.
+  // Bounded retransmits (Power of 10): a lost query is retried a fixed number
+  // of times and then reported, never waited on forever.
+  while (attempt < netDnsRetries) {
+    netFillSockAddr(saBytes2(), ns, 53)
+    if (sysRc(int(syscall(nrSendTo(), i64(fd), i64(int(query)), i64(qlen), 0,
+                          i64(int(saBytes2())), i64(saLen)))) < 0) {
+      attempt = attempt + 1
+    } else {
+      let got = sysRc(int(syscall(nrRecvFrom(), i64(fd), i64(int(reply)),
+                                  i64(netMaxDnsMsg), 0, 0, 0)))
+      if (got < 0) {
+        // Timed out or interrupted: retransmit. Anything else is fatal.
+        let e = lastErr()
+        if (e != eAgain() && e != eIntr()) {
+          netClose(fd)
+          return false
+        }
+        attempt = attempt + 1
+      } else {
+        if (netParseAnswer(reply, got, netDnsId, out)) {
+          netClose(fd)
+          return true
+        }
+        // Malformed, or an answer with no A record: retry.
+        attempt = attempt + 1
+      }
+    }
+  }
+  netClose(fd)
+  return false
+}
