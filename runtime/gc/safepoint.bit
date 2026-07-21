@@ -1,0 +1,241 @@
+// The safepoint poll — `root.zig`'s `safepointEntry` (#1629), the ONE ABI symbol
+// `runtime/root.zig` defines that no `.bit` module did.
+//
+// It was missed by every earlier audit because it is not an `export fn`: root.zig
+// publishes it with `comptime { @export(&safepointEntry, .{ .name =
+// "bit_rt_safepoint" }); }` (root.zig:753), which a `grep 'export fn bit_rt_'`
+// enumeration cannot see. It is also the least optional symbol in the ABI — both
+// backends SYNTHESIZE a call to it at every loop back-edge (seed/codegen/x64.zig,
+// seed/codegen/arm64.zig), so an image that does not define it does not link.
+//
+// ---------------------------------------------------------------------------
+// WHY IT LIVES IN `runtime/gc` AND NOT IN `runtime/root`
+// ---------------------------------------------------------------------------
+//
+// The poll's whole body is the ABI.md §5 handshake against the World/Mutator
+// registry, and that registry is `./gcworld.bit`'s — its block address
+// (`worldAddr`) and this thread's slot (`curMut`) are module state there, private
+// to this module by construction (`@nosplit` cannot `ptrOf` module state, so
+// gcworld hands out no address for them). `runtime/root` holds no World block at
+// all today: nothing calls `worldBind`, so from root the handshake is
+// unwritable. Here it is three same-module calls. The symbol is root's in
+// root.zig only because root.zig is one file.
+//
+// `safepoint.bit` sorts LAST in this directory (`gc* < mem < safepoint`), so
+// every helper it calls is already lowered when the module concatenates (#1511)
+// and no inlining is lost.
+//
+// ---------------------------------------------------------------------------
+// THE PIN CYCLE, AND WHY NEITHER FUNCTION HERE CAN CALL ITSELF (#1367)
+// ---------------------------------------------------------------------------
+//
+// This is the pin-cycle trap (tests/rootpins.zig) in its purest form: the
+// backends emit a call to `bit_rt_safepoint` at every loop back edge, so a
+// definition of `bit_rt_safepoint` that contains a loop back edge calls ITSELF.
+// Pre-rename that call lands harmlessly on the still-linked Zig, so nothing —
+// not a build, not a link, not a test run — can see it until G2 (#1583) drops the
+// `_root` infix, at which point it is an instant stack overflow in every program
+// that loops.
+//
+// Two independent guarantees, one per function, both structural rather than
+// asserted:
+//
+//   - `safepointEntry` is `@naked` and its body is a single `asm` block. §10.3.1
+//     admits no locals, no control flow and no implicit prologue in a naked
+//     function, and an `asm` payload is emitted verbatim, so there is no back
+//     edge for codegen to attach a poll to. The emitted object carries no
+//     relocation to any `bit_rt_` name (checked by `zig build rootpins`, which
+//     performs the G2 rename symbolically on the emitted object).
+//   - `safepointPoll` is `@nosplit`, which suppresses back-edge poll emission
+//     outright (§10.3), and whose default-deny allowlist additionally refuses any
+//     call to a non-`@nosplit` function (E0075) — so the guarantee is transitive
+//     over everything it reaches without anyone having to re-derive the call
+//     graph.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS PORTED AND WHAT IS NOT (read before assuming this collects)
+// ---------------------------------------------------------------------------
+//
+// `safepointImpl` (root.zig:638) does three things. Only the first is expressible
+// in Bit today:
+//
+//  1. PORTED — the mutator side: register as a mutator (publishing the real
+//     snapshot, not 0 — a thread whose first touch of the collector is a poll
+//     already holds references that poll's stack map names), and park while a
+//     stop is pending so the collection cannot run behind this thread's back.
+//     This is what makes a Bit-defined safepoint SOUND to link: a mutator that
+//     ignored the stop flag would corrupt the heap; one that never triggers a
+//     collection merely does not collect.
+//
+//  2. NOT PORTED — the collector side (`shouldCollect` -> `tryAcquire` ->
+//     `rendezvous` -> `collect`). It is blocked on (3), not on effort: a
+//     collection whose root enumeration is incomplete sweeps live objects, so
+//     triggering one without (3) is strictly worse than not collecting.
+//
+//  3. BLOCKED, AND THE BLOCKER IS A LANGUAGE GAP — the precise stack-map walk
+//     (`scanSnapshot`/`scanFrame`, root.zig:303-377). It walks the half-open
+//     extent between the LINKER-DEFINED DATA SYMBOLS `bit_stack_maps` and
+//     `bit_stack_maps_end` (ABI.md §4), and Bit has no way to name a data symbol
+//     defined outside the program: `entryOf` (§11.10) takes a FUNCTION, `extern
+//     function` (§11.7) binds a function and is refused on Linux targets, and
+//     there is no `externOf`/`symbolOf`. So the walk is not "hard to port", it is
+//     inexpressible, and everything downstream of it waits on that. Filed
+//     separately rather than approximated here.
+//
+// The consequence is stated plainly so no one reads a green build as a working
+// collector: with this definition live (post-G2) and root.zig retired, a program
+// still answers every stop correctly, but NOTHING requests one. Heap growth is
+// unbounded until (2)+(3) land.
+
+// ---------------------------------------------------------------------------
+// The poll body — `safepointImpl`, mutator side (ABI.md §5)
+// ---------------------------------------------------------------------------
+
+// `snap` is the address of the caller's `SafepointFrame` (ABI.md §4), which the
+// naked shim below reserved on THIS thread's own stack. Per-thread by
+// construction — no TLS, no registration, no ordering — which is the #1429 fix;
+// the frame used to be one process-wide global and two workers polling at once
+// overwrote each other's registers and then both collected.
+//
+// The frame is valid for exactly as long as this call: it lives below the
+// shim's `sp`, so publishing it (`worldPark`) is sound only while this thread
+// stays inside the shim, which parking guarantees.
+//
+// `@nosplit` is REQUIRED, not stylistic — see the pin-cycle note above.
+export @nosplit @symbol("bit_rt_port_gc_safepoint_poll")
+function safepointPoll(snap: int) {
+  // Registers this thread if it has not registered yet, and parks it there if a
+  // stop is already pending. Publishes the REAL snapshot: `root.zig`'s
+  // `currentMutator` passes 0 from the allocation door (runtime code, no stack
+  // map) but its real frame from the safepoint door, and parking with 0 would
+  // hide exactly the references this poll's stack map names.
+  ensureMutator(snap)
+
+  if (curMut == 0) {
+    return    // registry full: no slot, so nothing can wait for this thread
+  }
+  if (worldAddr == 0) {
+    return    // pre-boot: `worldBind` has not run, so there is no registry yet
+  }
+  let world = wordAt(worldAddr)
+  if (worldStopRequested(world)) {
+    // Someone is collecting. Park until they finish — a mutator that ran on
+    // would be running behind the collector's back. `worldPark` returns at once
+    // if the stop cleared in the gap, which is what makes this safe to call
+    // speculatively.
+    worldPark(world, curMut - 1, snap)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `bit_rt_safepoint` — the naked register/frame snapshot shim (ABI.md §4)
+// ---------------------------------------------------------------------------
+//
+// Zero-arg, `callconv(.c)`, emitted by both backends at every loop back edge.
+// Naked so it runs with NO prologue: it captures the caller's return address,
+// frame pointer and callee-saved register file BEFORE any compiled code could
+// overwrite them, then hands that snapshot to `safepointPoll` as its first C
+// argument.
+//
+// The `SafepointFrame` layout it builds is root.zig's, field for field:
+//   +0   ret        the caller's return address (0 would mean "not captured")
+//   +8   fp         the caller's frame pointer
+//   +16  regs[32]   regs[n] at +16+8n, physical register n's live value
+// `regs` is deliberately NOT zeroed — this runs at every back edge and clearing
+// 32 words per poll is not free. Sound because ABI.md §4 restricts the registers
+// a stack map may name at a safepoint to exactly the callee-saved file saved
+// here, and because every word the walk reads goes through the validating
+// `markRoot`.
+//
+// The reservation is 8 bytes larger than the 272-byte struct on x86-64 and 16
+// larger on AArch64, purely to keep the stack ABI-aligned at the call. A function
+// containing a safepoint is non-leaf by construction (it calls this), so it may
+// not rely on the x86-64 red zone and overlapping that zone costs nothing.
+//
+// THE PAYLOAD IS HAND-ENCODED AND DISASSEMBLY-CHECKED, instruction for
+// instruction against root.zig's `asm volatile` (root.zig:698-750) — there is no
+// text assembler in the toolchain (§11.6), and a wrong offset here does not fail
+// a build, it publishes the wrong register as a root.
+//
+//   x86-64 (SysV; rbx=3, r13=13, r14=14, r15=15 -> +40,+120,+128,+136):
+//     48 81 EC 18 01 00 00        subq  $280, %rsp
+//     4C 8B 84 24 18 01 00 00     movq  280(%rsp), %r8    # the caller's ret addr
+//     4C 89 04 24                 movq  %r8, 0(%rsp)
+//     48 89 6C 24 08              movq  %rbp, 8(%rsp)
+//     48 89 5C 24 28              movq  %rbx, 40(%rsp)
+//     4C 89 6C 24 78              movq  %r13, 120(%rsp)
+//     4C 89 B4 24 80 00 00 00     movq  %r14, 128(%rsp)
+//     4C 89 BC 24 88 00 00 00     movq  %r15, 136(%rsp)
+//     48 89 E7                    movq  %rsp, %rdi        # arg 0 = the frame
+//     FF D1                       call  *%rcx
+//     48 81 C4 18 01 00 00        addq  $280, %rsp
+//     C3                          ret
+//   At entry `rsp % 16 == 8` (the caller's `call` pushed the return address), so
+//   subtracting 280 restores `rsp % 16 == 0` for the call while leaving the
+//   return address at 280(%rsp). `rbp` is still the caller's frame pointer — no
+//   prologue ran. `rdi`/`r8`/`rcx` are all caller-saved, so materializing them
+//   cannot destroy a callee-saved value before it is saved.
+//
+//   AArch64 (x19..x28 -> +168..+240):
+//     D10483FF   sub  sp, sp, #288
+//     F90003FE   str  x30, [sp, #0]        # x30 = the caller's return address
+//     F90007FD   str  x29, [sp, #8]        # x29 = the caller's frame pointer
+//     A90AD3F3   stp  x19, x20, [sp, #168]
+//     A90BDBF5   stp  x21, x22, [sp, #184]
+//     A90CE3F7   stp  x23, x24, [sp, #200]
+//     A90DEBF9   stp  x25, x26, [sp, #216]
+//     A90EF3FB   stp  x27, x28, [sp, #232]
+//     910003E0   mov  x0, sp               # arg 0 = the frame
+//     F81F0FFE   str  x30, [sp, #-16]!
+//     D63F0020   blr  x1
+//     F84107FE   ldr  x30, [sp], #16
+//     910483FF   add  sp, sp, #288
+//     D65F03C0   ret
+//   288 keeps `sp` 16-aligned (the hardware enforces it). `x0`/`x1` are the first
+//   argument and caller-saved scratch, so neither disturbs the saved file. `x30`
+//   is preserved across the call by its own push, NOT by the frame copy, so the
+//   return path does not depend on the callee leaving the frame untouched.
+//
+// `input` materializes `entryOf(safepointPoll)` into `rcx`/`x1` ahead of the
+// payload — the only compiler-emitted instruction in this function, an inline
+// address materialization against a link-time constant (§11.10) that touches no
+// other register and no memory. `entryOf` rather than a direct call because
+// §11.6 has no relocation for a branch OUT of an `asm` block.
+//
+// PINNED `bit_rt_root_safepoint`, NOT `bit_rt_safepoint`: root.zig still defines
+// the real name and claiming it now is a DuplicateSymbol at every link (#1624).
+// G2 (#1583) drops the `_root` infix, as for every other pin in this tree.
+@naked @symbol("bit_rt_root_safepoint")
+function safepointEntry() {
+  return asm volatile {
+    x64   { 0x48, 0x81, 0xEC, 0x18, 0x01, 0x00, 0x00,
+            0x4C, 0x8B, 0x84, 0x24, 0x18, 0x01, 0x00, 0x00,
+            0x4C, 0x89, 0x04, 0x24,
+            0x48, 0x89, 0x6C, 0x24, 0x08,
+            0x48, 0x89, 0x5C, 0x24, 0x28,
+            0x4C, 0x89, 0x6C, 0x24, 0x78,
+            0x4C, 0x89, 0xB4, 0x24, 0x80, 0x00, 0x00, 0x00,
+            0x4C, 0x89, 0xBC, 0x24, 0x88, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0xE7,
+            0xFF, 0xD1,
+            0x48, 0x81, 0xC4, 0x18, 0x01, 0x00, 0x00,
+            0xC3 }
+    arm64 { 0xD10483FF,
+            0xF90003FE,
+            0xF90007FD,
+            0xA90AD3F3,
+            0xA90BDBF5,
+            0xA90CE3F7,
+            0xA90DEBF9,
+            0xA90EF3FB,
+            0x910003E0,
+            0xF81F0FFE,
+            0xD63F0020,
+            0xF84107FE,
+            0x910483FF,
+            0xD65F03C0 }
+    input arm64 x1 x64 rcx = entryOf(safepointPoll)
+    clobber x64   { rdi, r8, memory }
+    clobber arm64 { x0, memory }
+  }
+}

@@ -164,6 +164,17 @@ const modules = [_]Module{
     // registry only through `bit_rt_port_gc_world_*`, so no reference to a
     // post-rename `bit_rt_gc_*` name can exist — which is exactly what this gate
     // proves per symbol.
+    //
+    // #1629 added a FIFTH `bit_rt_root_` pin to this module — `safepoint.bit`'s
+    // `bit_rt_root_safepoint` — and it is the one this gate matters most for. The
+    // backends SYNTHESIZE a call to `bit_rt_safepoint` at every loop back edge, so
+    // a definition of it containing a back edge calls itself after G2 renames it,
+    // and pre-rename the call lands harmlessly on the still-linked Zig. No entry
+    // is needed (the module is already listed) and none is enough on its own: the
+    // per-module vacuity check is satisfied by the four `gc_*` wrappers whether or
+    // not the safepoint atom is examined. Verified by MUTATION instead — pinning
+    // its callee `bit_rt_safepoint` made this gate report
+    // `'bit_rt_root_safepoint' references 'bit_rt_safepoint'` and exit 1.
     .{ .path = "runtime/gc", .target = .aarch64_macos },
     // SEAM 7 (#1581): `runtime/chan`'s `chanwrap.bit` pins the five
     // allocation-free channel/select ABI wrappers (`bit_rt_root_chan_send/recv/
