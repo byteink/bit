@@ -1014,15 +1014,28 @@ The rule is therefore archive membership, not the platform:
   **E0078** `extern_unsupported_target`, naming the symbol. A fully static ELF
   has nothing to resolve it against, so this would otherwise fail deep inside
   the linker.
-- Targeting a Linux triple with **no archive in the link** (`bit build-obj`,
-  which emits a bare relocatable and reads no archive): rejected. Membership is
-  undecidable there, and an undecided case must fall back to rejection — an
-  accept-on-unknown would convert a compile error into a link error or a silent
-  crash.
+- Targeting a Linux triple in a build whose archive **cannot be read**: rejected.
+  Membership is undecidable there, and an undecided case must fall back to
+  rejection — an accept-on-unknown would convert a compile error into a link
+  error or a silent crash.
 
 The decision is made where the target and the AST are both in hand, after
 checking and before lowering; the archive path is a pure function of the target,
 so the predicate is decidable exactly where the diagnostic already fired.
+
+**The rule is a property of the link, so an object emit is outside it.** `bit
+build --emit-obj` produces a relocatable and performs no link, so it poses no
+membership question and E0078 does not apply: every extern is emitted as an
+undefined relocation, exactly as §17.6 already says a freestanding object's
+cross-module calls are. An object is by definition an incomplete link, and
+undefined symbols in one are normal — they are resolved by whatever link later
+consumes it, which is the only place the answer exists (an object's future
+archive-mates are not knowable at emit time). This is not accept-on-unknown:
+nothing is accepted, the question is deferred to the two gates that *do* see a
+whole link. The build that links applies the bullets above to the program's own
+externs, and a static ELF link that cannot resolve a reference fails outright
+rather than producing a binary. An object emit that consulted an archive would
+also be circular, since the archive being built is made **of** these objects.
 
 Bit has no arch-conditional compilation, so a program needing a *libc* symbol on
 both platforms still uses `extern function` for Darwin and a raw syscall for

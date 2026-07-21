@@ -69,8 +69,10 @@ pub const Input = union(enum) {
 ///
 /// An empty or malformed archive answers **false**, never an error: the caller's
 /// only sound response to "undecidable" is to reject, so collapsing that into
-/// the negative keeps the decision in one place. `bit build-obj` reads no
-/// archive at all and reaches here with an empty slice.
+/// the negative keeps the decision in one place. That answer is for a LINK whose
+/// archive could not be read — `bit build --emit-obj` performs no link and no
+/// longer asks this question at all (#1645), rather than asking it with an empty
+/// slice and being told everything is absent.
 pub fn archiveDefines(gpa: Allocator, target: Target, bytes: []const u8, symbol: []const u8) bool {
     if (bytes.len == 0) return false;
     var arena_state = std.heap.ArenaAllocator.init(gpa);

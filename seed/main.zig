@@ -345,7 +345,10 @@ fn runBuildOrRun(gpa: std.mem.Allocator, io: Io, err_out: *Io.Writer, is_run: bo
 
     // An object is emitted, never linked, so it needs no runtime archive — and
     // must not demand one, since a Bit-sourced libbitrt.a is exactly what this
-    // path exists to build (#1397).
+    // path exists to build (#1397). The empty slice is NOT a stand-in archive
+    // that "defines nothing": every consumer takes the emit-obj flag itself and
+    // skips the archive question (#1645) — reading membership off a slice nobody
+    // filled is what made E0078 reject every extern under --emit-obj.
     const lib: []const u8 = if (emit_obj) "" else Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch |e| {
         try err_out.print("bit: runtime archive {s}: {s} (set BIT_LIBBITRT)\n", .{ libbitrtPath(target), @errorName(e) });
         return 1;
@@ -819,7 +822,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
     {
         var rejected = false;
         for (0..n) |i| {
-            if (try rejectExternForTarget(gpa, &diags, project.module_files.items[i], target, libbitrt)) rejected = true;
+            if (try rejectExternForTarget(gpa, &diags, project.module_files.items[i], target, libbitrt, !emit_obj)) rejected = true;
         }
         if (rejected) return try renderFail(gpa, &diags, err_out);
     }
@@ -913,7 +916,8 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
     defer checked.deinit();
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
-    if (try rejectExternForTarget(gpa, &diags, files, target, libbitrt)) return try renderFail(gpa, &diags, err_out);
+    // Always a linking build: `buildModule` has no object-emit mode.
+    if (try rejectExternForTarget(gpa, &diags, files, target, libbitrt, true)) return try renderFail(gpa, &diags, err_out);
 
     var module = try lower.lowerModule(gpa, &ctx, files, &checked, &rmodule);
     defer module.deinit();
@@ -954,17 +958,32 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
 ///
 /// So the predicate is archive membership, not the platform. A symbol present
 /// in the archive is accepted; one that is absent is still rejected here, with
-/// a real diagnostic naming it, rather than failing deep inside the linker.
-/// `libbitrt` empty (`bit build-obj`, which reads no archive) means membership
-/// is undecidable, and an undecided case must REJECT — accepting on unknown
-/// would trade a compile error for a link error or a silent crash.
+/// a real diagnostic naming it, rather than failing deep inside the linker. An
+/// empty or malformed `libbitrt` in a LINKING build leaves membership undecided,
+/// and an undecided case must REJECT — accepting on unknown would trade a
+/// compile error for a link error or a silent crash.
+///
+/// `linking` is false for `--emit-obj`, and the gate then does not apply at all
+/// (#1645). Membership is a property of a LINK, and an object emit performs
+/// none: the artifact is a relocatable, whose undefined symbols are normal and
+/// are resolved by whatever link later consumes it — §17.6 already says an
+/// extern call in a freestanding object "stays an undefined relocation, resolved
+/// at link". Answering "absent" there is not conservatism, it is a category
+/// error: the archive was never read, so the diagnostic's own stated
+/// precondition ("not defined in the runtime archive") is false when it fires,
+/// and it fires for EVERY extern including the `bit_rt_*` ones §11.7 exists to
+/// admit. Nothing is weakened by skipping it, because both later gates remain:
+/// the linking build re-runs this predicate against the real archive, and a
+/// static ELF link that cannot resolve a reference fails outright
+/// (`strip.resolveGlobals` -> `error.UndefinedSymbol`).
 ///
 /// The gate lives here, not in the checker, because the checker is deliberately
 /// target-independent (it runs once and its output feeds every backend); this
 /// is the first point where the selected target and the AST are both in hand,
 /// and the archive path is a pure function of the target. Returns true if
 /// anything was rejected.
-fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget, libbitrt: []const u8) !bool {
+fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget, libbitrt: []const u8, linking: bool) !bool {
+    if (!linking) return false;
     if (target == .aarch64_macos) return false;
     const link_target: link.Target = switch (target) {
         .x86_64_linux => .x86_64_linux,
@@ -1753,9 +1772,13 @@ test "E0078 admits a runtime-archive symbol on Linux and still rejects an absent
         try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), absent_symbol) != null);
 
         // --- undecidable: no archive in the link must fall back to REJECTION --
-        // `bit build-obj` reads no archive. Accepting on unknown would trade a
-        // compile error for a link error or a silent crash, so the same source
-        // that was accepted above must be refused with an empty archive.
+        // A LINKING build whose archive could not be read knows nothing about
+        // membership. Accepting on unknown would trade a compile error for a
+        // link error or a silent crash, so the same source that was accepted
+        // above must be refused with an empty archive. (An `--emit-obj` build
+        // does not reach here at all since #1645 — it performs no link, so it
+        // poses no membership question; that direction is covered by
+        // "E0078 does not apply to an object emit" below.)
         var none_err: Io.Writer.Allocating = .init(gpa);
         defer none_err.deinit();
         try std.testing.expect(try buildExecutable(gpa, "externok.bit", ok_src, "", target, &none_err.writer) == null);
@@ -1765,6 +1788,105 @@ test "E0078 admits a runtime-archive symbol on Linux and still rejects an absent
     // Anti-vacuity: a loop that ran zero times would pass while asserting
     // nothing — the failure mode this codebase has hit eleven times.
     if (checked == 0) return error.SkipZigTest;
+}
+
+test "E0078 does not apply to an object emit (#1645)" {
+    // SPEC §11.7: the rule is about the LINK that will resolve the reference.
+    // `bit build --emit-obj` performs no link — its artifact is a relocatable,
+    // whose undefined symbols are normal (§17.6: an extern call "stays an
+    // undefined relocation, resolved at link"). Before #1645 the emit path
+    // handed the predicate an EMPTY archive slice, which answers "absent" for
+    // everything, so E0078 rejected every extern on both Linux triples
+    // regardless of what the archive really contained.
+    //
+    // Both shapes are asserted, and they are the whole point of the pairing:
+    //   (a) a symbol libbitrt.a DOES define — the `bit_rt_*` case §11.7 says
+    //       the rule exists to admit, and the one runtime/gc needs (#1638);
+    //   (b) a symbol NOTHING defines — also emitted, because an object makes no
+    //       membership claim at all. Its counter-control is the last assertion:
+    //       the SAME source in a LINKING build is still refused with E0078, so
+    //       this test cannot pass by the gate having been deleted.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const present_src =
+        \\extern function bit_rt_gc_blocking_begin()
+        \\export @nosplit @symbol("probe_present") function probePresent() {
+        \\  bit_rt_gc_blocking_begin()
+        \\}
+        \\
+    ;
+    const absent_src = std.fmt.comptimePrint(
+        \\extern function {s}()
+        \\export @nosplit @symbol("probe_absent") function probeAbsent() {{
+        \\  {s}()
+        \\}}
+        \\
+    , .{ absent_symbol, absent_symbol });
+
+    // `buildProject` wants an absolute root, and `tmpDir` hands back only the
+    // leaf name of a directory it created under `.zig-cache/tmp` relative to the
+    // test's cwd (the repo root, which is also where `libbitrtPath` points).
+    const dir_rel = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir_rel);
+    const dir_abs = try absFromCwd(gpa, io, dir_rel);
+    defer gpa.free(dir_abs);
+
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux, .aarch64_macos }) |target| {
+        for ([_][]const u8{ present_src, absent_src }) |src| {
+            try tmp.dir.writeFile(io, .{ .sub_path = "m.bit", .data = src });
+            var err: Io.Writer.Allocating = .init(gpa);
+            defer err.deinit();
+            const obj = (try buildProject(
+                gpa,
+                io,
+                dir_abs,
+                null,
+                null, // freestanding: no stdlib root, so no prelude
+                "m",
+                "", // an object emit reads no archive
+                target,
+                &err.writer,
+                null,
+                true, // emit_obj
+                true, // freestanding
+            )) orelse {
+                std.debug.print("target {s}: object emit refused an extern:\n{s}\n", .{ target.name(), err.written() });
+                return error.ExternRejectedInObjectEmit;
+            };
+            defer gpa.free(obj);
+            try std.testing.expect(obj.len > 0);
+            // An emit that "succeeded" while still reporting is not success.
+            try std.testing.expectEqualStrings("", err.written());
+        }
+    }
+
+    // Counter-control: the linking build still refuses the absent symbol. Runs
+    // against the real archive, so it is the same decision a user's `bit build`
+    // makes — if this stops failing, the guard is gone, not merely narrowed.
+    var linked = false;
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux }) |target| {
+        const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch continue;
+        defer gpa.free(lib);
+        linked = true;
+        var err: Io.Writer.Allocating = .init(gpa);
+        defer err.deinit();
+        const bad_src = std.fmt.comptimePrint(
+            \\extern function {s}()
+            \\function main() {{
+            \\  {s}()
+            \\}}
+            \\
+        , .{ absent_symbol, absent_symbol });
+        try std.testing.expect(try buildExecutable(gpa, "externbad.bit", bad_src, lib, target, &err.writer) == null);
+        try std.testing.expect(std.mem.indexOf(u8, err.written(), "E0078") != null);
+    }
+    if (!linked) return error.SkipZigTest;
 }
 
 test "archiveDefines answers membership, not mere reference" {
