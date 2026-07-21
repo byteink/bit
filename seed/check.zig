@@ -3414,6 +3414,13 @@ const Checker = struct {
         .{ "auxv", PrimSig{ .params = &.{}, .ret = .i64 } },
         .{ "floatBits", PrimSig{ .params = &.{.f64}, .ret = .u64 } },
         .{ "float32Bits", PrimSig{ .params = &.{.f32}, .ret = .u32 } },
+        // The inverse of `floatBits`: `bitsToFloat(v: u64) -> f64`, an IEEE-754
+        // reinterpretation with no value conversion. Needed by the transcendental
+        // ports (compiler-rt log/pow reconstruct an f64 from manipulated bits
+        // mid-algorithm, `const z: f64 = @bitCast(iz)`). Lowers to the same
+        // `ir.Op.bitcast` as `floatBits`, in the int->float direction the result
+        // type selects (an `FMOV`/`movq`), so it is equally nosplit-safe.
+        .{ "bitsToFloat", PrimSig{ .params = &.{.u64}, .ret = .f64 } },
     });
 
     fn primSig(name: []const u8) ?PrimSig {
@@ -5683,6 +5690,7 @@ const Checker = struct {
                             std.mem.eql(u8, sym.name, "fsqrt") or
                             std.mem.eql(u8, sym.name, "floatBits") or
                             std.mem.eql(u8, sym.name, "float32Bits") or
+                            std.mem.eql(u8, sym.name, "bitsToFloat") or
                             std.mem.eql(u8, sym.name, "ffloor") or
                             std.mem.eql(u8, sym.name, "fceil") or
                             std.mem.eql(u8, sym.name, "ftrunc") or

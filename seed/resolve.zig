@@ -204,6 +204,8 @@ const predeclared_funcs = [_][]const u8{
     "parseFloat",
     // Float bit patterns, for the self-hosted compiler's `const_float` codegen.
           "floatBits",        "float32Bits",
+    // The inverse, `bitsToFloat(v: u64) -> f64`, for the transcendental ports.
+    "bitsToFloat",
     // Atomics (§11.5) — inline lock-free ops on a raw `*T` (Stage-2 subset).
     "atomicLoad", "atomicStore", "atomicCmpxchg",
     "atomicAdd",   "atomicSub",         "atomicAnd",        "atomicOr",         "atomicXchg",

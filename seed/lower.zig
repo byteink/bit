@@ -3116,6 +3116,9 @@ const FnCtx = struct {
         .{ "fsqrt", ir.Op.fsqrt },
         .{ "floatBits", ir.Op.bitcast },
         .{ "float32Bits", ir.Op.bitcast },
+        // `bitsToFloat(v: u64) -> f64`: the same `bitcast` op, int->float, the
+        // direction the result type selects in `emitBitcast`.
+        .{ "bitsToFloat", ir.Op.bitcast },
         .{ "ffloor", ir.Op.ffloor },
         .{ "fceil", ir.Op.fceil },
         .{ "ftrunc", ir.Op.ftrunc },
