@@ -162,6 +162,17 @@ const modules = [_]Module{
     // post-rename `bit_rt_gc_*` name can exist — which is exactly what this gate
     // proves per symbol.
     .{ .path = "runtime/gc", .target = .aarch64_macos },
+    // SEAM 7 (#1581): `runtime/chan`'s `chanwrap.bit` pins the five
+    // allocation-free channel/select ABI wrappers (`bit_rt_root_chan_send/recv/
+    // close` and `bit_rt_root_select`), which become bare ABI names at G2
+    // (#1583). Its other pins (`bit_rt_port_chan_*`) are port-internal and never
+    // renamed. The module is platform-free (no `syscall`/`extern function`), so
+    // the target is arbitrary; aarch64-macos matches its siblings. The wrappers
+    // reach the scheduler and the blocking operations only through
+    // `bit_rt_port_sched_*` and same-module helpers, so no reference to a
+    // post-rename `bit_rt_chan_*` name can exist — which is what this gate proves
+    // per symbol.
+    .{ .path = "runtime/chan", .target = .aarch64_macos },
 };
 
 /// Upper bound on symbols in one object — keeps every walk below provably
