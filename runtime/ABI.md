@@ -1176,10 +1176,12 @@ termination). It is `bit run`/`bit test`'s launcher — `fork` + immediate `exec
 it is safe with scheduler worker threads live.
 
 `bit_rt_host_target` returns the ordinal of the `BuildTarget` this binary's own
-host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos`). The runtime
-archive is compiled once per target, so it answers from its own `builtin.target`
-— the compile-time host constant the self-hosted compiler has no other way to see.
-It is the default `bit build`/`bit run` target when `--target` is absent.
+host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos` — the enum in
+selfhost/build.bit). The runtime archive is compiled once per target, so the answer
+is fixed when the archive is built; the Bit provider (#1635) takes the OS from its
+own provider directory and the arch from an `asm` per-arch immediate, the Zig it
+replaces read `builtin.target`. It is the default `bit build`/`bit run` target when
+`--target` is absent, so a wrong ordinal silently mis-targets the compiler.
 
 `bit_rt_auxv` returns the address of the ELF auxiliary vector the kernel placed
 on this process's initial stack, or 0 where there is none (Darwin, which has no
@@ -1198,18 +1200,39 @@ binary's synthetic `main` (selfhost/testgen.bit) dispatches to test `idx`.
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
 that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
 body called the primitive would therefore become a call to itself once #1369
-drops the `_root` infix (the pin cycle `tests/rootpins.zig` guards). The two
-differ, though, in whether the symbol they call is compiler-provided or ported:
+drops the `_root` infix (the pin cycle `tests/rootpins.zig` guards). Both are now
+PORTED regardless — `auxv` by #1617, `host_target` by #1635 — each by finding the
+answer somewhere other than the primitive:
 
-- `host_target` stays **compiler-provided end to end** — it is a **property of
-  the emit**, not a runtime computation. The archive is compiled once per target,
-  so its `builtin.target` *is* the build target — each per-target `libbitrt.a`
-  returns its own ordinal (verified by disassembly: x86_64-linux → 0,
+- `host_target` is a **property of the emit**, not a runtime computation. The
+  archive is compiled once per target, so its `builtin.target` *is* the build
+  target — each per-target `libbitrt.a` returns its own ordinal (x86_64-linux → 0,
   aarch64-linux → 1, aarch64-macos → 2). Since the seed selects the archive by
   `--target` (`libbitrtPath`), a cross-built binary reports the target it was
-  built FOR, not the host it was built ON. A running Bit program has no
-  compile-time `builtin` and thus no other way to know this, so `bit_rt_host_target`
-  is never ported.
+  built FOR, not the host it was built ON.
+
+  **As of #1635 the PROVIDER is Bit, not Zig — this was the last `bit_rt_*` symbol
+  only `root.zig` defined.** The old claim here, that a running Bit program has no
+  compile-time `builtin` and so this could never be ported, mistook "no `builtin`"
+  for "no compile-time knowledge". The emit carries both axes the ordinal needs:
+  - the **OS** is *which provider directory the source sits in* —
+    `runtime/root/linux/os.bit` vs `runtime/root/darwin/os.bit`. Mis-selection is a
+    compile error, not a wrong answer: a Darwin `--emit-obj` refuses the Linux
+    provider's `syscall` and a Linux one refuses the Darwin provider's
+    `extern function`, both even on an uncalled declaration.
+  - the **arch** is an `asm` block's per-arch sub-blocks (SPEC §11.6), which the
+    backend selects at codegen — `runtime/sched/sched.bit`'s `entryBias` shape.
+    This is the axis the directory split does NOT draw, and x86_64-linux vs
+    aarch64-linux is exactly where it is needed.
+
+  x86_64 exists only on Linux among the three recognised targets and Darwin is
+  aarch64-only, so (provider, arch) names all three exactly; Darwin therefore needs
+  no `asm` at all and returns the literal 2. The provider must never call
+  `hostTarget()` — that primitive lowers to a call to this very symbol once #1583
+  drops the `_root` infix (the pin cycle `tests/rootpins.zig` guards) — and an
+  `asm` immediate is inline by construction, so there is no callee for the rename
+  to redirect. Verified running on all three targets, not just by disassembly:
+  `tests/stress/roothost{darwin,linux}`.
 - `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
   as of #1617 the `bit_rt_auxv` PROVIDER is now Bit, not Zig. The kernel places the
   auxiliary vector on the initial stack, unreachable once any Bit code runs, so only
