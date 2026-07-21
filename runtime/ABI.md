@@ -1194,27 +1194,40 @@ prepended to the child's environment (first match wins, so it overrides any
 inherited value). `bit test` calls it once per discovered test so the test
 binary's synthetic `main` (selfhost/testgen.bit) dispatches to test `idx`.
 
-**`bit_rt_host_target` and `bit_rt_auxv` are permanently compiler-provided
-primitives — NOT ported to Bit (SEAM 6, #1580).** Both are entries in the seed's
-`prim_rt_fns`, so `hostTarget()`/`auxv()` lower to an `ir.RtFn` that codegen emits
-as a call to the symbol itself; a Bit body `return hostTarget()` would therefore
-become a call to itself once #1369 drops the `_root` infix (the pin cycle
-`tests/rootpins.zig` guards). Neither is expressible in Bit anyway:
+**`hostTarget()` and `auxv()` are seed `prim_rt_fns` entries — the CALLER side
+lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
+that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
+body called the primitive would therefore become a call to itself once #1369
+drops the `_root` infix (the pin cycle `tests/rootpins.zig` guards). The two
+differ, though, in whether the symbol they call is compiler-provided or ported:
 
-- `host_target` is a **property of the emit**, not a runtime computation. The
-  archive is compiled once per target, so its `builtin.target` *is* the build
-  target — each per-target `libbitrt.a` returns its own ordinal (verified by
-  disassembly: x86_64-linux → 0, aarch64-linux → 1, aarch64-macos → 2). Since the
-  seed selects the archive by `--target` (`libbitrtPath`), a cross-built binary
-  reports the target it was built FOR, not the host it was built ON. A running Bit
-  program has no compile-time `builtin` and thus no other way to know this.
-- `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**.
-  The kernel places the auxiliary vector on the initial stack, unreachable once any
-  Bit code runs, so only the entry (`rtStartMain` → `initLinuxTls`) can capture it —
-  a single writer, Linux-only; `machoMain` captures none. `bit_rt_auxv` merely hands
-  the captured pointer to Bit, whose own `runtime/auxv` does the scan. When SEAM 3
-  ports the entry to Bit the cell moves there; it must never be captured a second
-  time.
+- `host_target` stays **compiler-provided end to end** — it is a **property of
+  the emit**, not a runtime computation. The archive is compiled once per target,
+  so its `builtin.target` *is* the build target — each per-target `libbitrt.a`
+  returns its own ordinal (verified by disassembly: x86_64-linux → 0,
+  aarch64-linux → 1, aarch64-macos → 2). Since the seed selects the archive by
+  `--target` (`libbitrtPath`), a cross-built binary reports the target it was
+  built FOR, not the host it was built ON. A running Bit program has no
+  compile-time `builtin` and thus no other way to know this, so `bit_rt_host_target`
+  is never ported.
+- `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
+  as of #1617 the `bit_rt_auxv` PROVIDER is now Bit, not Zig. The kernel places the
+  auxiliary vector on the initial stack, unreachable once any Bit code runs, so only
+  the entry (`rtStartMain`) can capture it — a single writer, Linux-only;
+  `machoMain` captures none. The Bit Linux entry walks past `envp`'s NULL to the
+  auxv array and stores its address, through `bit_rt_port_root_os_set_auxv`, into
+  the cell `runtime/root/os.bit`'s `gAuxv` owns (beside `g_argc`/`g_argv`/`g_envp`);
+  the reader `bit_rt_root_auxv` (→ `bit_rt_auxv` at G2) hands that cell back. This
+  is the move promised above — ownership of the cell moves from `root.zig`'s
+  `g_auxv` to the Bit boot layer (the Zig `g_auxv`/`bit_rt_auxv` stay live only
+  until the #1369 archive swap makes the Bit entry the real one). The reader
+  reads `gAuxv` DIRECTLY, never through the `auxv()` primitive, precisely to avoid
+  the self-reference the pin-cycle gate forbids; `runtime/auxv` still does the scan
+  (`getauxval`) over what the reader returns, and `runtime/thread/linux` reads
+  `AT_PHDR`/`AT_PHNUM`/`AT_PHENT` through it to size a spawned thread's TLS block.
+  Darwin's `gAuxv` stays 0 (the reader is platform-free so the portable
+  `runtime/auxv` resolves the symbol there too), and the vector must never be
+  captured a second time.
 
 ---
 

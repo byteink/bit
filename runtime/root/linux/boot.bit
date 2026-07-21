@@ -29,22 +29,29 @@
 // standalone freestanding object: `--freestanding` refuses those mangled names.
 //
 // ---------------------------------------------------------------------------
-// WHAT IS NOT HERE YET, AND WHY (the auxv / static-TLS entanglement)
+// AUXV IS CAPTURED HERE (#1617); MAIN-THREAD STATIC-TLS INSTALL IS NOT YET
 // ---------------------------------------------------------------------------
 //
-// `root.zig`'s `rtStartMain` also calls `initLinuxTls`: it captures the ELF
-// auxiliary vector off the initial stack and installs the main thread's static
-// TLS (AT_PHDR/AT_PHNUM -> PT_TLS). That step is DELIBERATELY ABSENT here. The
-// auxv pointer that `runtime/auxv`'s `auxv()` primitive (`bit_rt_auxv`) hands
-// back is captured today by the STILL-LIVE Zig `rtStartMain` into `root.zig`'s
-// `g_auxv`; there is no Bit-settable cell for a Bit entry to write, and
-// `bit_rt_auxv` is a permanently compiler-provided primitive (ABI.md §19, SEAM
-// 6). ABI.md §19 says the cell "moves to the boot layer when SEAM 3 ports the
-// entry" — but that move needs a primitive that does not exist. Filed as its
-// own ticket. Until it and #1369 (the archive swap that makes THIS the live
-// entry) land, the auxv capture + TLS install cannot be written without
-// inventing a shell, so it is left out and `rtStartMain` captures argc/argv/envp
-// only, through the single sanctioned path `bit_rt_port_root_os_set_args`.
+// `root.zig`'s `rtStartMain` does two auxv-adjacent things: it CAPTURES the ELF
+// auxiliary vector off the initial stack, and it INSTALLS the main thread's
+// static TLS from it (`initLinuxTls`: AT_PHDR/AT_PHNUM -> PT_TLS ->
+// `tls.initStatic`). #1617 landed the first: `rtStartMain` below now walks past
+// `envp`'s NULL to the auxv array and stores its address through the single
+// sanctioned setter `bit_rt_port_root_os_set_auxv`, into the Bit cell
+// `../os.bit`'s `gAuxv` owns. The ABI reader `bit_rt_auxv` (now Bit-provided,
+// ABI.md §19) hands it back, so `runtime/auxv`'s `getauxval` and a spawned
+// thread's `tlsPrepare` (../../thread/linux/tls.bit) read real auxv data — the
+// worker-thread TLS path is complete.
+//
+// The SECOND step, installing the MAIN thread's own static TLS, is still absent:
+// that needs a Bit form of `tls.initStatic` (find PT_TLS, size and map the main
+// thread's block, set its thread pointer) which #1608 owns now that the auxv
+// blocker is cleared. Until then `boot` runs on the OS-provided main thread
+// without a Bit-installed TLS block, exactly as before this change — #1617
+// widened only the capture, not the install. The archive swap (#1369) is what
+// makes THIS the live entry; before it, the Zig `rtStartMain`/`g_auxv` remain
+// live and this capture is exercised by freestanding emit + the `getauxval`
+// read-back, not by a running binary.
 //
 // Nothing here is `@nosplit`: `boot` allocates (it maps the heap) and runs
 // before the stack-guard machinery exists, and `@nosplit` rejects `syscall`
@@ -61,7 +68,7 @@ import {
   schedTaskExit, dqPushBottom, taskAt,
   schedStackBytes, schedStackAligned, wkDeque,
 } from "../../sched"
-import { rootBindMemory, rootInit, rootConfigure, osSetArgs } from "../../root"
+import { rootBindMemory, rootInit, rootConfigure, osSetArgs, osSetAuxv } from "../../root"
 
 // `loadWord` (../../gc) and `parkMonoNs` (../../park/linux) are already imported
 // by sibling ./io.bit and ./time.bit; siblings share one module scope, so they
@@ -239,6 +246,29 @@ function boot(): int {
   return mainExitCode
 }
 
+// Upper bound on the envp walk (Power of 10 rule 2). A well-formed `envp` hits
+// its NULL terminator far sooner; this only caps a malformed (unterminated)
+// block, matching `../os.bit`'s `osMaxEnvCount`. Reaching it means no terminator
+// was found, so there is no trustworthy auxv and 0 ("none") is returned.
+const maxEnvpWalk: int = 65536
+
+// The auxv array's address, found by walking `envp` (pointer-width entries from
+// `envpBase`) to its NULL terminator: the auxv starts at the word immediately
+// after it. `root.zig` gets the same address from `std.mem.span(envp).len`; this
+// is that span, done explicitly. Returns 0 if no terminator is found within the
+// bound — a malformed stack, where refusing to hand back a wild pointer is the
+// safe answer (`runtime/auxv` then reports every key "absent").
+function auxvFromEnvp(envpBase: int): int {
+  let i = 0
+  while (i < maxEnvpWalk) {
+    if (loadWord(envpBase + i * 8) == 0) {
+      return envpBase + (i + 1) * 8
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 // The Linux stack-walk entry `_start` tail-calls. `sp` points at the raw initial
 // stack the kernel built: `[argc][argv0]..[argvN-1][NULL][envp0]..[NULL][auxv]`.
 // Captures argc/argv/envp through the SINGLE sanctioned path
@@ -255,6 +285,11 @@ function rtStartMain(sp: int) {
   // envp starts past argv[0..argc) and its own NULL terminator.
   let envpBase = argvBase + (argc + 1) * 8
   osSetArgs(argc, argvBase, envpBase)
+  // The ELF auxv array follows envp's own NULL terminator immediately — standard
+  // Linux ABI, no padding, both plain pointer-width arrays (`root.zig`'s
+  // `initLinuxTls` auxv_addr derivation). This is a CONTINUATION of the single
+  // capture above, not a second path: the same stack walk, one step further.
+  osSetAuxv(auxvFromEnvp(envpBase))
   let code = boot()
   rootExit(code)
 }
