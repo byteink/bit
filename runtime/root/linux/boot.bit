@@ -29,29 +29,31 @@
 // standalone freestanding object: `--freestanding` refuses those mangled names.
 //
 // ---------------------------------------------------------------------------
-// AUXV IS CAPTURED HERE (#1617); MAIN-THREAD STATIC-TLS INSTALL IS NOT YET
+// AUXV CAPTURE (#1617) AND MAIN-THREAD STATIC-TLS INSTALL (#1608)
 // ---------------------------------------------------------------------------
 //
 // `root.zig`'s `rtStartMain` does two auxv-adjacent things: it CAPTURES the ELF
 // auxiliary vector off the initial stack, and it INSTALLS the main thread's
 // static TLS from it (`initLinuxTls`: AT_PHDR/AT_PHNUM -> PT_TLS ->
-// `tls.initStatic`). #1617 landed the first: `rtStartMain` below now walks past
+// `tls.initStatic`). #1617 landed the first: `rtStartMain` below walks past
 // `envp`'s NULL to the auxv array and stores its address through the single
 // sanctioned setter `bit_rt_port_root_os_set_auxv`, into the Bit cell
 // `../os.bit`'s `gAuxv` owns. The ABI reader `bit_rt_auxv` (now Bit-provided,
 // ABI.md §19) hands it back, so `runtime/auxv`'s `getauxval` and a spawned
-// thread's `tlsPrepare` (../../thread/linux/tls.bit) read real auxv data — the
-// worker-thread TLS path is complete.
+// thread's `tlsPrepare` (../../thread/linux/tls.bit) read real auxv data.
 //
-// The SECOND step, installing the MAIN thread's own static TLS, is still absent:
-// that needs a Bit form of `tls.initStatic` (find PT_TLS, size and map the main
-// thread's block, set its thread pointer) which #1608 owns now that the auxv
-// blocker is cleared. Until then `boot` runs on the OS-provided main thread
-// without a Bit-installed TLS block, exactly as before this change — #1617
-// widened only the capture, not the install. The archive swap (#1369) is what
-// makes THIS the live entry; before it, the Zig `rtStartMain`/`g_auxv` remain
-// live and this capture is exercised by freestanding emit + the `getauxval`
-// read-back, not by a running binary.
+// #1608 landed the second: `initLinuxTls` below sizes, maps, fills and installs
+// the MAIN thread's own static TLS block from that captured auxv, reusing the
+// worker path's `tlsAreaBytes`/`tlsPrepare` and a new `setThreadPointer`
+// (arch_prctl on x86_64, `msr tpidr_el0` on aarch64 — ../../thread/linux/tls.bit).
+// `rtStartMain` calls it after the auxv capture and before `boot`, mirroring
+// `root.zig` exactly. With that, both the main thread and every worker thread run
+// on a correctly-installed thread pointer.
+//
+// The archive swap (#1369) is what makes THIS the live entry; before it, the Zig
+// `rtStartMain`/`g_auxv`/`initLinuxTls` remain live and this path is exercised by
+// freestanding emit + the `getauxval` read-back + the TP-set disassembly + the
+// PT_TLS-parse logic isolation, not by a running binary.
 //
 // Nothing here is `@nosplit`: `boot` allocates (it maps the heap) and runs
 // before the stack-guard machinery exists, and `@nosplit` rejects `syscall`
@@ -60,6 +62,7 @@
 
 import { mapPages } from "../../alloc/linux"
 import { threadStart, threadRelease } from "../../thread/linux"
+import { tlsAreaBytes, tlsPrepare, tlsUnavailable, setThreadPointer } from "../../thread/linux"
 import { schedStart, schedJoin } from "../../thread"
 import { parkSleepNs } from "../../park/linux"
 import {
@@ -272,11 +275,52 @@ function auxvFromEnvp(envpBase: int): int {
   return 0
 }
 
+// Install the MAIN thread's static TLS block, so any `@threadlocal` the main
+// green thread reads — and, before the #1369 archive swap, every `threadlocal`
+// the live Zig runtime carries (`root.zig`'s `g_mutator`/`pending_err`/... and
+// `sched.zig`'s `Worker.tls`) — resolves against a real thread pointer. The Bit
+// form of `root.zig`'s `initLinuxTls` -> `std.os.linux.tls.initStatic`.
+//
+// `initStatic` folds four steps together; they are explicit here because this
+// runtime's `tlsPrepare` (../../thread/linux/tls.bit) already exists for the
+// worker path and takes a caller-supplied area rather than allocating one:
+//   1. size the block from this image's `PT_TLS` (`tlsAreaBytes`);
+//   2. allocate it — a RAW `mmap`, not the GC heap, since this runs before
+//      `rootBindMemory`; a permanent mapping, since the main thread lives for the
+//      whole process (`root.zig` uses a static buffer / permanent mmap likewise);
+//   3. fill it and derive the thread pointer (`tlsPrepare`, the exact routine a
+//      worker uses — one layout for both);
+//   4. install the thread pointer (`setThreadPointer`, arch-specific asm).
+//
+// MUST run AFTER `osSetAuxv` (steps 1 and 3 read `AT_PHDR`/`AT_PHNUM` out of the
+// auxv cell) and BEFORE any worker OS thread or any `@threadlocal` access. On a
+// well-formed image produced by this project's linker `PT_TLS` is always present,
+// so this always installs; a `tlsUnavailable` result means the auxv/phdr table
+// could not be read — a malformed stack the process cannot run on regardless — so
+// it returns without installing rather than mapping against a guessed geometry,
+// the same refuse-don't-guess stance `tlsAreaBytes` takes.
+function initLinuxTls() {
+  let bytes = tlsAreaBytes()
+  if (bytes == tlsUnavailable) {
+    return
+  }
+  let area = mapPages(bytes)
+  if (area == 0) {
+    return
+  }
+  let tp = tlsPrepare(area)
+  if (tp == 0) {
+    return
+  }
+  setThreadPointer(tp)
+}
+
 // The Linux stack-walk entry `_start` tail-calls. `sp` points at the raw initial
 // stack the kernel built: `[argc][argv0]..[argvN-1][NULL][envp0]..[NULL][auxv]`.
 // Captures argc/argv/envp through the SINGLE sanctioned path
-// (`bit_rt_port_root_os_set_args`), boots, and exits with the returned code.
-// `root.zig`'s `rtStartMain`, minus the `initLinuxTls` step (see the header).
+// (`bit_rt_port_root_os_set_args`), installs the main thread's static TLS from the
+// captured auxv, boots, and exits with the returned code. `root.zig`'s
+// `rtStartMain` (root.zig:2040) in full.
 //
 // Reached by `_start` taking `entryOf(rtStartMain)` as an `asm` input operand —
 // a real reference, not a symbolic branch target (§11.6 forbids those) — which
@@ -293,6 +337,10 @@ function rtStartMain(sp: int) {
   // `initLinuxTls` auxv_addr derivation). This is a CONTINUATION of the single
   // capture above, not a second path: the same stack walk, one step further.
   osSetAuxv(auxvFromEnvp(envpBase))
+  // Install the main thread's TLS from the auxv just captured — BEFORE `boot`
+  // brings up any worker or reaches any `@threadlocal`. `root.zig` orders these
+  // identically (`initLinuxTls` immediately after the auxv address is known).
+  initLinuxTls()
   let code = boot()
   rootExit(code)
 }
