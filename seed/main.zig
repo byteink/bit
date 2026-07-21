@@ -983,6 +983,17 @@ fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics
             const name_node = mf.tree.kids(inner)[0];
             const name_span = mf.tree.get(name_node).span;
             const symbol = mf.source[name_span.start..name_span.end];
+            // §10: `bit_main` is the process entry symbol, emitted per-program
+            // by the entry trampoline (`emit.zig`) and resolved at the FINAL
+            // program link — it is deliberately absent from libbitrt.a (`nm`
+            // shows `U bit_main`). The ported boot layer (#1608), itself a
+            // libbitrt-resident module, references it to spawn the user's
+            // `main`; every final link defines it, so admitting this one
+            // designated symbol is not a hole in the gate. The allowance is
+            // exactly this symbol — every other absent name is still rejected,
+            // because the guarantee is specific to the entry, not to externs
+            // at large.
+            if (std.mem.eql(u8, symbol, "bit_main")) continue;
             if (link.archiveDefines(gpa, link_target, libbitrt, symbol)) continue;
 
             var buf: [256]u8 = undefined;
