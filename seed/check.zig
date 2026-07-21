@@ -5824,6 +5824,35 @@ const Checker = struct {
                 }
                 try self.nosplitWalk(file_idx, ck[2], caller, depth + 1); // args
             },
+            .index => {
+                // §11.11: indexing a FIXED ARRAY lowers to `index_get` — a scaled
+                // register-offset load against a static base (a `.rodata` const
+                // table, #1231), with no bounds-check branch, no call, no
+                // allocation and no safepoint (see codegen `emitIndexGet`; only a
+                // slice base takes the `slice_get` rt_call path). That is exactly
+                // the property this allowlist rests on, so an array read is
+                // admitted on proof, like `ptrOf` on module state. A SLICE base
+                // (`slice_get`) or MAP base (`map_elem`) IS an rt_call and stays
+                // rejected — it falls through to the catch-all below. This is the
+                // read side of the const rodata table #1231 made addressable and
+                // is what lets a `@nosplit` transcendental hold its constant table.
+                // The receiver must be a bare NAME resolving to an array — a const
+                // rodata table (§11.11) is always referenced by its ident, and
+                // restricting to that keeps this verdict identical to the selfhost
+                // validator (which resolves ident->decl->type), so the differential
+                // cannot diverge on a contrived non-ident array receiver.
+                const ik = mf.tree.kids(node); // [recv, index_expr]
+                const recv_ty = self.typeOfNode(file_idx, ik[0]);
+                if (mf.tree.get(ik[0]).tag != .ident or self.ctx.typeOf(recv_ty) != .array) {
+                    try self.emit(mf, node, .nosplit_calls_allocating, "nosplit function '{s}' may not allocate or reach a safepoint here", .{caller}, "nosplit bodies allow only non-allocating arithmetic, control flow, and calls to other nosplit functions");
+                    return;
+                }
+                // The base and the index are still ordinary expressions: an
+                // allocating index (a slice literal, say) stays E0075, the same
+                // operand discipline the `ptrOf`/`asm` carve-outs keep.
+                try self.nosplitWalk(file_idx, ik[0], caller, depth + 1);
+                try self.nosplitWalk(file_idx, ik[1], caller, depth + 1);
+            },
             .asm_stmt => {
                 // §10.3.1: an `asm` payload is pre-encoded machine code, opaque
                 // to every compiler pass. It is admitted on the author's

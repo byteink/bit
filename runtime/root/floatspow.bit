@@ -1,0 +1,267 @@
+// Split out of `floats.bit` (#1503, #1609): the std.math `pow(f64)` port (Go/musl
+// pow.go), its table-free `exp(f64)` (compiler-rt exp.c) and the bit helpers
+// `scalbn`/`frexp`/`modf`/`clz`/`ctz` those two reconstruct floats through.
+// Sibling of `floats.bit` — same module (runtime/root). See `floats.bit` SEAM 5b
+// for the seam header and the pin-cycle rule.
+//
+// `pow` reuses the natural-log already ported here (`rtLog`, #1609) for `@log`,
+// ports compiler-rt's table-FREE `exp` for `@exp`, and reconstructs the result
+// with `frexp`/`scalbn`; `atanIsNanBits`/`atanAbs` (sibling `floatsatan.bit`)
+// supply the NaN test and exact `|v|`. Every step is inline arithmetic + bit ops
+// (`floatBits`/`bitsToFloat`/`fsqrt`/`ftrunc`) so the whole port is
+// `@nosplit`-clean — the rootpins proof it is no rt_call cycle. The `-inf` case
+// (Go recurses `pow(1/x, -y)`) is INLINED as `pow(-0, -y)` rather than recursing,
+// so the pinned symbol never references itself. Measured bit-exact vs the
+// shipping `fpow` at 0 mismatches over the `bench/translog` corpus (structural
+// edges + every biased exponent both signs + a 500k xorshift (x, y) sweep + the
+// domain edges pow(0,0)=1, pow(-1,±inf)=1, negative-base integer/non-integer
+// exponents), NaN matched by class; mutation-tested.
+
+// Count leading zeros of a u64 (0..64). Bounded binary search (Power of 10).
+@nosplit function clz64(v: u64): int {
+  if (v == 0) { return 64 }
+  let n = 0
+  let x = v
+  if ((x & u64(0xFFFFFFFF00000000)) == 0) { n = n + 32; x = x << 32 }
+  if ((x & u64(0xFFFF000000000000)) == 0) { n = n + 16; x = x << 16 }
+  if ((x & u64(0xFF00000000000000)) == 0) { n = n + 8; x = x << 8 }
+  if ((x & u64(0xF000000000000000)) == 0) { n = n + 4; x = x << 4 }
+  if ((x & u64(0xC000000000000000)) == 0) { n = n + 2; x = x << 2 }
+  if ((x & u64(0x8000000000000000)) == 0) { n = n + 1 }
+  return n
+}
+
+// Count trailing zeros of a u64 (0..64). Bounded binary search (Power of 10).
+@nosplit function ctz64(v: u64): int {
+  if (v == 0) { return 64 }
+  let n = 0
+  let x = v
+  if ((x & u64(0x00000000FFFFFFFF)) == 0) { n = n + 32; x = x >> 32 }
+  if ((x & u64(0x000000000000FFFF)) == 0) { n = n + 16; x = x >> 16 }
+  if ((x & u64(0x00000000000000FF)) == 0) { n = n + 8; x = x >> 8 }
+  if ((x & u64(0x000000000000000F)) == 0) { n = n + 4; x = x >> 4 }
+  if ((x & u64(0x0000000000000003)) == 0) { n = n + 2; x = x >> 2 }
+  if ((x & u64(0x0000000000000001)) == 0) { n = n + 1 }
+  return n
+}
+
+// `scalbn`/`ldexp` for f64: x * 2^n, with faithful subnormal shift-and-round
+// (std.math.ldexp). Pure bit manipulation, no allocation.
+@nosplit function powScalbn(x: f64, n: int): f64 {
+  let repr = floatBits(x)
+  let signBit = repr & (u64(1) << 63)
+  let ef = (repr >> 52) & u64(0x7FF)
+  if (ef == u64(0x7FF)) { return x } // nan or inf: unchanged
+  let exponent = int((repr << 1) >> 53)
+  if (exponent == 0) {
+    exponent = exponent + (11 - clz64(repr << 1))
+  }
+  if (n >= 0) {
+    if (n > 2046 - exponent) {
+      return bitsToFloat(u64(0x7FF0000000000000) | signBit) // overflow: +-inf
+    }
+    if (exponent + n <= 0) {
+      return bitsToFloat((repr << u64(n)) | signBit) // subnormal result
+    }
+    if (exponent <= 0) {
+      let result = u64(n + exponent) << 52
+      result = result | ((repr << u64(1 - exponent)) & u64(0x000FFFFFFFFFFFFF))
+      return bitsToFloat(result | signBit)
+    }
+    return bitsToFloat(repr + (u64(n) << 52)) // no shifting
+  }
+  // n < 0
+  if (n <= -exponent) {
+    if (n < -(52 + exponent)) {
+      return bitsToFloat(signBit) // severe underflow: +-0
+    }
+    let a = -n
+    let b = -(exponent + n) + 1
+    let shift = a
+    if (b < a) { shift = b }
+    let exactTie = false
+    if (ctz64(repr) == shift - 1) { exactTie = true }
+    let result = repr & u64(0x000FFFFFFFFFFFFF)
+    if (exponent > 0) { result = result | (u64(1) << 52) }
+    result = result >> u64(shift - 1)
+    result = (result + u64(1)) >> 1
+    if (exactTie) { result = result & (~u64(1)) } // round-to-even on exact tie
+    return bitsToFloat(result | signBit)
+  }
+  return bitsToFloat(repr - (u64(-n) << 52)) // exact, no shifting
+}
+
+// Table-free `exp(f64)` — compiler-rt exp.c. Argument-reduce by k*ln2, evaluate
+// a degree-5 polynomial, rescale by `scalbn`.
+@nosplit function powExp(x0: f64): f64 {
+  let ln2hi = 6.93147180369123816490e-01
+  let ln2lo = 1.90821492927058770002e-10
+  let invln2 = 1.44269504088896338700e+00
+  let P1 = 1.66666666666666019037e-01
+  let P2 = -2.77777777770155933842e-03
+  let P3 = 6.61375632143793436117e-05
+  let P4 = -1.65339022054652515390e-06
+  let P5 = 4.13813679705723846039e-08
+  let x = x0
+  let ux = floatBits(x)
+  let hx = (ux >> 32) & u64(0xFFFFFFFF)
+  let sign = int(hx >> 31)
+  hx = hx & u64(0x7FFFFFFF)
+  if (atanIsNanBits(ux)) { return x }
+  if (hx >= u64(0x4086232B)) {
+    if (hx > u64(0x7FF00000)) { return x }
+    if (x > 709.782712893383973096) { return bitsToFloat(u64(0x7FF0000000000000)) }
+    if (x < -708.39641853226410622) {
+      if (x < -745.13321910194110842) { return 0.0 }
+    }
+  }
+  let k = 0
+  let hi = 0.0
+  let lo = 0.0
+  if (hx > u64(0x3FD62E42)) {
+    if (hx > u64(0x3FF0A2B2)) {
+      let hv = 0.5
+      if (sign != 0) { hv = -0.5 }
+      k = int(invln2 * x + hv)
+    } else {
+      k = 1 - sign - sign
+    }
+    let dk = f64(k)
+    hi = x - dk * ln2hi
+    lo = dk * ln2lo
+    x = hi - lo
+  } else {
+    if (hx > u64(0x3E300000)) {
+      k = 0
+      hi = x
+      lo = 0.0
+    } else {
+      return 1.0 + x
+    }
+  }
+  let xx = x * x
+  let c = x - xx * (P1 + xx * (P2 + xx * (P3 + xx * (P4 + xx * P5))))
+  let y = 1.0 + (x * c / (2.0 - c) - lo + hi)
+  if (k == 0) { return y }
+  return powScalbn(y, k)
+}
+
+// `isOddInteger(x)` (Go pow.go): x an integer with an odd unit digit. Anything
+// past 2^53 has no fractional part left and is treated as even.
+@nosplit function powIsOddInteger(x: f64): bool {
+  if (atanAbs(x) >= 9007199254740992.0) { return false } // 2^53
+  let ip = ftrunc(x)
+  let fp = x - ip
+  if (fp != 0.0) { return false }
+  return (int(ip) & 1) == 1
+}
+
+// `bit_rt_pow` (ABI.md §14): std.math `pow(x, y)` (Go pow.go). Special cases per
+// the spec table, then `a = x^yf * x^yi` reassembled through `frexp`/`scalbn`.
+// `@nosplit`-clean — the rootpins proof it is no rt_call cycle.
+export @nosplit @symbol("bit_rt_root_pow")
+function rtPow(x: f64, y: f64): f64 {
+  let bx = floatBits(x)
+  let by = floatBits(y)
+  // pow(x, +-0) = 1 for any x; pow(1, y) = 1 for any y
+  if (y == 0.0 || x == 1.0) { return 1.0 }
+  // pow(nan, y) = nan for y != 0; pow(x, nan) = nan for x != 1
+  if (atanIsNanBits(bx) || atanIsNanBits(by)) { return bitsToFloat(u64(0x7FF8000000000000)) }
+  // pow(x, 1) = x
+  if (y == 1.0) { return x }
+  if (x == 0.0) {
+    if (y < 0.0) {
+      // +-inf, odd int y carries x's sign (copysign(inf, x))
+      if (powIsOddInteger(y)) {
+        return bitsToFloat((bx & (u64(1) << 63)) | u64(0x7FF0000000000000))
+      }
+      return bitsToFloat(u64(0x7FF0000000000000))
+    }
+    if (powIsOddInteger(y)) { return x }
+    return 0.0
+  }
+  // isInf(y)
+  if ((by & u64(0x7FFFFFFFFFFFFFFF)) == u64(0x7FF0000000000000)) {
+    if (x == -1.0) { return 1.0 } // pow(-1, +-inf) = 1
+    let axlt1 = atanAbs(x) < 1.0
+    let ypos = (by == u64(0x7FF0000000000000))
+    if (axlt1 == ypos) { return 0.0 }
+    return bitsToFloat(u64(0x7FF0000000000000))
+  }
+  // isInf(x)
+  if ((bx & u64(0x7FFFFFFFFFFFFFFF)) == u64(0x7FF0000000000000)) {
+    if (bx == u64(0xFFF0000000000000)) {
+      // x == -inf == pow(-0, -y), inlined so the pin never recurses on itself.
+      let w = -y
+      if (w < 0.0) {
+        if (powIsOddInteger(w)) { return bitsToFloat(u64(0xFFF0000000000000)) }
+        return bitsToFloat(u64(0x7FF0000000000000))
+      }
+      if (powIsOddInteger(w)) { return -0.0 }
+      return 0.0
+    }
+    if (y < 0.0) { return 0.0 }
+    if (y > 0.0) { return bitsToFloat(u64(0x7FF0000000000000)) }
+  }
+  if (y == 0.5) { return fsqrt(x) }
+  if (y == -0.5) { return 1.0 / fsqrt(x) }
+  // modf(|y|)
+  let ay = atanAbs(y)
+  let yi = ftrunc(ay)
+  let yf = ay - yi
+  if (yf != 0.0 && x < 0.0) { return bitsToFloat(u64(0x7FF8000000000000)) }
+  if (yi >= 9223372036854775808.0) { // 2^63: yi is a large even int
+    return powExp(y * rtLog(atanAbs(x)))
+  }
+  let a1 = 1.0
+  let ae = 0
+  // a *= x^yf
+  if (yf != 0.0) {
+    if (yf > 0.5) { yf = yf - 1.0; yi = yi + 1.0 }
+    a1 = powExp(yf * rtLog(x))
+  }
+  // frexp(x): x is finite and nonzero here.
+  let fv = floatBits(x)
+  let fe = int((fv >> 52) & u64(0x7FF))
+  let xe = 0
+  let x1 = 0.0
+  if (fe == 0) {
+    // subnormal
+    let mant = fv & u64(0x000FFFFFFFFFFFFF)
+    let offset = clz64(mant) - 12 // clz within the 52-bit mantissa
+    let shiftv = offset + 1 // extra_denorm_shift
+    let nv = (fv & (u64(1) << 63)) | (u64(1022) << 52) |
+      ((mant << u64(shiftv)) & u64(0x000FFFFFFFFFFFFF))
+    x1 = bitsToFloat(nv)
+    xe = -1021 - offset
+  } else {
+    let nv = (fv & (~(u64(0x7FF) << 52))) | (u64(1022) << 52)
+    x1 = bitsToFloat(nv)
+    xe = fe - 1022
+  }
+  // a *= x^yi
+  let i = int(yi)
+  while (i != 0) {
+    if (xe < -4096 || 4096 < xe) {
+      ae = ae + xe
+      i = 0
+    } else {
+      if ((i & 1) == 1) {
+        a1 = a1 * x1
+        ae = ae + xe
+      }
+      x1 = x1 * x1
+      xe = xe << 1
+      if (x1 < 0.5) {
+        x1 = x1 + x1
+        xe = xe - 1
+      }
+      i = i >> 1
+    }
+  }
+  if (y < 0.0) {
+    a1 = 1.0 / a1
+    ae = -ae
+  }
+  return powScalbn(a1, ae)
+}
