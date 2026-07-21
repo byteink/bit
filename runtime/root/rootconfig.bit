@@ -1,0 +1,219 @@
+// GC tuning from the environment (#1618): the Bit port of `runtime/gc.zig`'s
+// `configFromEnv` (gc.zig:895). `root.zig` builds its collector config with
+// `Gc.init(&g_heap, configFromEnv(environ))`; this file is the `configFromEnv`
+// half, and `boot` (../{linux,darwin}/boot.bit) is the `Gc.init` call site that
+// hands the parsed values into `rootConfigure`/`rootInit`.
+//
+// Sibling of `os.bit` (same module, SPEC §17.1), so it reaches the process-entry
+// `envp` through `osEnvp` and reuses the two scan bounds `osMaxEnvCount`/
+// `osMaxCstr` and the raw `loadByte`/`loadWord` glue directly — the same raw
+// int-handle style as `os.bit`'s `rtOsEnv`, deliberately NOT the `string`-typed
+// world: the value bytes come straight off the kernel `envp` block, and going
+// through a `string` object would either allocate before the collector is up or
+// route the lookup through the Zig `bit_rt_os_env` (defeating the port).
+//
+// The five variables are exactly `configFromEnv`'s (gc.zig:882-887):
+//
+//   BIT_GC=off|0            disable automatic collection  (enabled = false)
+//   BIT_GC=stress           collect at every safepoint    (stress  = true)
+//   BIT_GC_MIN_KB=<n>       min live KiB before collection (min_trigger = n*1024)
+//   BIT_GC_GROWTH_PCT=<n>   heap growth percent, >= 100    (growth_pct)
+//   BIT_GC_MARKSTACK=<n>    mark worklist entries, > 0     (mark_stack_len)
+//   BIT_GC_STATS=1|on       one line per collection        (verbose = true)
+//
+// EACH PARSE IS OVER A DEFAULT, not over `gc.zig`'s `Config{}`: the Bit `boot`
+// carries its own bring-up defaults (min_trigger 65536, mark stack 4096), and the
+// env only overrides them — the same layering `configFromEnv` does over `Config{}`.
+// An unset variable, or one whose value fails to parse, leaves the default
+// untouched, byte-for-byte the `if (envUsize(...)) |v|` / `if (lookupEnv(...)) |v|`
+// guards in the Zig.
+//
+// `rtOsEnv` returns the empty string for an absent variable, and here an absent
+// variable returns the sentinel -1 "not found"; both collapse to "no override"
+// because an empty value matches none of the string tests and parses as no
+// integer — identical to `configFromEnv` treating `null` and `""` alike.
+//
+// Not `@nosplit`: called from `boot` before the scheduler is up but after the
+// heap is mapped, doing only bounded pointer reads — no allocation, no safepoint.
+
+// Pointer to the value bytes of environment variable `name` (the bytes just past
+// its `=`), or -1 when it is unset. The `rtOsEnv` walk (os.bit), but returning a
+// raw pointer into the `envp` block instead of a fresh `string` — no allocation.
+// BOUNDED by `osMaxEnvCount` (Power of 10 rule 2), the same cap `rtOsEnv` uses.
+function gcEnvValuePtr(name: string): int {
+  let base = osEnvp()
+  let n = len(name)
+  let i = 0
+  while (i < osMaxEnvCount) {
+    let entry = loadWord(base + i * 8)
+    if (entry == 0) {
+      return -1
+    }
+    if (gcEnvKeyMatch(entry, name)) {
+      return entry + n + 1
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// True if the `envp` entry at `entry` has key exactly `name`, i.e. the `len(name)`
+// bytes match and the byte right after is `=` (61). `os.bit`'s `osEnvMatch`, but
+// taking the key as a literal `string` (read with `name[j]`) rather than a raw
+// (pointer, length) pair. BOUNDED by `len(name)`.
+function gcEnvKeyMatch(entry: int, name: string): bool {
+  let n = len(name)
+  let j = 0
+  while (j < n) {
+    if (loadByte(entry + j) != int(name[j])) {
+      return false
+    }
+    j = j + 1
+  }
+  return loadByte(entry + n) == 61
+}
+
+// True if the NUL-terminated C string at `vp` equals the literal `lit`. Backs the
+// `std.mem.eql(u8, v, "off")` tests in `configFromEnv`. BOUNDED by `len(lit)`.
+function gcCstrEq(vp: int, lit: string): bool {
+  let n = len(lit)
+  let i = 0
+  while (i < n) {
+    if (loadByte(vp + i) != int(lit[i])) {
+      return false
+    }
+    i = i + 1
+  }
+  return loadByte(vp + n) == 0
+}
+
+// Parse the NUL-terminated decimal at `vp` as a non-negative integer, or -1 when
+// it is empty or holds a non-digit — `configFromEnv`'s `std.fmt.parseInt(usize,
+// v, 10) catch null`, whose failure the caller reads as "no override". Only ASCII
+// digits are accepted (no sign, no whitespace), which is every value the five
+// tuning knobs take. BOUNDED by `osMaxCstr`, the kernel's single-string ceiling.
+function gcCstrUsize(vp: int): int {
+  let acc = 0
+  let i = 0
+  while (i < osMaxCstr) {
+    let c = loadByte(vp + i)
+    if (c == 0) {
+      if (i == 0) {
+        return -1
+      }
+      return acc
+    }
+    if (c < 48 || c > 57) {
+      return -1
+    }
+    acc = acc * 10 + (c - 48)
+    i = i + 1
+  }
+  return -1
+}
+
+// `configFromEnv`'s `BIT_GC` disable test: `off` or `0` clears `enabled`; anything
+// else (including unset) keeps the default.
+function gcEnvEnabled(def: bool): bool {
+  let vp = gcEnvValuePtr("BIT_GC")
+  if (vp < 0) {
+    return def
+  }
+  if (gcCstrEq(vp, "off") || gcCstrEq(vp, "0")) {
+    return false
+  }
+  return def
+}
+
+// `configFromEnv`'s `BIT_GC=stress` test: `stress` sets torture mode; anything
+// else (including unset) keeps the default.
+function gcEnvStress(def: bool): bool {
+  let vp = gcEnvValuePtr("BIT_GC")
+  if (vp < 0) {
+    return def
+  }
+  if (gcCstrEq(vp, "stress")) {
+    return true
+  }
+  return def
+}
+
+// `configFromEnv`'s `BIT_GC_MIN_KB`: a parsed value overrides with `kb * 1024`
+// (KiB to bytes); a parse failure or unset keeps the default. No lower bound, so
+// `BIT_GC_MIN_KB=0` sets a min trigger of 0, exactly as the Zig does.
+function gcEnvMinTrigger(def: int): int {
+  let vp = gcEnvValuePtr("BIT_GC_MIN_KB")
+  if (vp < 0) {
+    return def
+  }
+  let kb = gcCstrUsize(vp)
+  if (kb < 0) {
+    return def
+  }
+  return kb * 1024
+}
+
+// `configFromEnv`'s `BIT_GC_GROWTH_PCT`: overrides only when parsed AND >= 100
+// (`if (g >= 100)`), so the heap is always allowed to grow between collections; a
+// smaller value, a parse failure, or unset keeps the default.
+function gcEnvGrowthPct(def: int): int {
+  let vp = gcEnvValuePtr("BIT_GC_GROWTH_PCT")
+  if (vp < 0) {
+    return def
+  }
+  let g = gcCstrUsize(vp)
+  if (g < 100) {
+    return def
+  }
+  return g
+}
+
+// `configFromEnv`'s `BIT_GC_MARKSTACK`: overrides only when parsed AND > 0
+// (`if (n > 0)`); a parse failure (-1), zero, or unset keeps the default. Applied
+// at `rootInit` time (the mark worklist is sized once at `gcInit`), so `boot`
+// reads this before `rootInit`, not through `rootConfigure`.
+function gcEnvMarkStack(def: int): int {
+  let vp = gcEnvValuePtr("BIT_GC_MARKSTACK")
+  if (vp < 0) {
+    return def
+  }
+  let n = gcCstrUsize(vp)
+  if (n <= 0) {
+    return def
+  }
+  return n
+}
+
+// `configFromEnv`'s `BIT_GC_STATS`: `1` or `on` enables the per-collection line;
+// anything else (including unset) keeps the default.
+function gcEnvVerbose(def: bool): bool {
+  let vp = gcEnvValuePtr("BIT_GC_STATS")
+  if (vp < 0) {
+    return def
+  }
+  if (gcCstrEq(vp, "1") || gcCstrEq(vp, "on")) {
+    return true
+  }
+  return def
+}
+
+// `Gc.init(&g_heap, configFromEnv(environ))`, the config half: parse the four
+// `rootConfigure` knobs over the defaults `boot` supplies and apply them through
+// the existing `rootConfigure` (which keeps the "values handed in" contract). One
+// pinned port-internal entry `boot` reaches by import — the reference must resolve
+// to a pinned symbol, the `bit_rt_port_root_*` gap #1612 records — never renamed,
+// as it names no ABI.md symbol (Zig's `configFromEnv` is internal too).
+export @symbol("bit_rt_port_root_configure_env")
+function rootConfigureFromEnv(enabled: bool, stress: bool, minTrigger: int, growthPct: int, verbose: bool) {
+  rootConfigure(gcEnvEnabled(enabled), gcEnvStress(stress),
+                gcEnvMinTrigger(minTrigger), gcEnvGrowthPct(growthPct),
+                gcEnvVerbose(verbose))
+}
+
+// The `BIT_GC_MARKSTACK` half, split out because the mark worklist is sized at
+// `gcInit` (`rootInit`), before `rootConfigure` runs. Pinned port-internal for the
+// same cross-module reason as `rootConfigureFromEnv`.
+export @symbol("bit_rt_port_root_env_mark_stack")
+function rootEnvMarkStack(def: int): int {
+  return gcEnvMarkStack(def)
+}
