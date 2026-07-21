@@ -1,0 +1,376 @@
+// Darwin filesystem provider for the SEAM 3 remainder (#1606): the 12
+// `bit_rt_fs_*` ABI wrappers (ABI.md §14) and the libSystem calls behind them.
+// This is the Bit form of `runtime/root.zig`'s `fs_*` block plus the Darwin
+// branch of `runtime/sched.zig`'s `openFd`/`readFd`/`writeFd`/`closeFd`/
+// `mkdirAt`/`removeAt`/`chmodAt`/`fileSize`/`listDir`/`statPath`.
+//
+// Goes through libSystem (§11.7) rather than raw traps: Apple publishes no stable
+// syscall numbers (../darwin/io.bit). KEPT DELIBERATELY IN THE SAME FUNCTION-FOR-
+// FUNCTION SHAPE AS ../linux/fs.bit, so a divergence between the two is a real
+// platform difference rather than a stylistic one. See ../fs.bit's header for why
+// each provider is self-contained rather than the netabi extern shape.
+//
+// EVERY `open` FLAG, PERMISSION AND `dirent` OFFSET BELOW WAS READ OUT OF THE
+// PINNED ZIG STDLIB (std/c.zig's Darwin `O`, `dirent`), NOT FROM MEMORY. The
+// Darwin `O` bits DIFFER FROM LINUX (O_CREAT=0x0200 vs 0o100, O_TRUNC=0x0400 vs
+// 0o1000, O_APPEND=0x0008 vs 0o2000) and the `dirent` name field sits at a
+// different offset — a wrong constant is a silent wrong-behaviour, never a
+// compile error.
+
+import { fsPathZ, rtStrAlloc, rtStringSlice } from "../../root"
+import { loadByte, storeByte } from "../../gc"
+
+// `write`, `strPtr`, `strLen` and `loadWord` are already declared/imported by this
+// module's sibling ../darwin/io.bit (module-scoped in Bit), so they are reused,
+// not re-declared — a redeclaration is E0042.
+
+// libSystem filesystem calls. Only C-representable types cross the boundary
+// (§11.7): a path/buffer travels as `*u8` and counts as `i64`.
+//
+// `open` IS VARIADIC (`int open(const char *, int, ...)`) and its `mode` is the
+// single variadic argument. On arm64 Apple every variadic argument is passed on
+// the STACK regardless of how many named ones precede, so `mode` must land there:
+// `modeReg` fills x2 and the five pads fill x3–x7 (all ignored by the callee),
+// and `modeStack` is the 9th argument, which lands on the stack where `open`
+// reads its vararg. Callers pass `mode` in both slots — the register copy is
+// inert. This is the exact device net/darwin/sock.bit uses for `fcntl`.
+extern function open(path: *u8, flags: i32, modeReg: i64, pad3: i64, pad4: i64, pad5: i64, pad6: i64, pad7: i64, modeStack: i64): i32
+extern function read(fd: i32, buf: *u8, n: i64): i64
+extern function lseek(fd: i32, offset: i64, whence: i32): i64
+extern function mkdir(path: *u8, mode: i32): i32
+extern function unlink(path: *u8): i32
+extern function rmdir(path: *u8): i32
+extern function chmod(path: *u8, mode: i32): i32
+extern function opendir(path: *u8): *u8
+extern function readdir(dirp: *u8): *u8
+extern function closedir(dirp: *u8): i32
+
+// `close` GOES THROUGH libSystem HERE AND CARRIES A KNOWN #1436 HAZARD. Under the
+// SEED compiler (which builds this runtime today and links every user binary
+// until G3) `extern function close` binds `_close` and works. Under the
+// SELF-HOSTED compiler, #1436 makes it emit only `_close$NOCANCEL` and drop the
+// `_close` import, SIGSEGV at run time — the defect sched/darwin/poll.bit sidesteps
+// by routing through libbitrt's `bit_rt_fs_close`. That workaround CANNOT apply
+// here: this IS `bit_rt_fs_close`'s implementation once G2/G3 rename the wrapper.
+// So the Darwin close path is blocked on #1436 landing before the archive swap
+// (#1369) — recorded, not fixable inside this port. It does not affect the
+// freestanding-emit or rootpins proofs, which never execute this body.
+extern function close(fd: i32): i32
+
+// Darwin `O` flags (std/c.zig): O_WRONLY=1, O_CREAT=0x0200=512, O_TRUNC=0x0400=
+// 1024, O_APPEND=0x0008=8. A read open is O_RDONLY=0. Default perms: file
+// 0o644=420, directory 0o755=493.
+const oWrite: int = 1537
+const oAppend: int = 521
+const permFile: int = 420
+const permDir: int = 493
+
+// SEEK_END / SEEK_SET for `lseek` (universal: 2 and 0).
+const seekEnd: int = 2
+const seekSet: int = 0
+
+// Darwin `struct dirent` (std/c.zig): ino(u64)@0, seekoff(u64)@8, reclen(u16)@16,
+// namlen(u16)@18, type(u8)@20, name@21. `readdir` on arm64 returns this 64-bit
+// -inode layout directly (no `$INODE64` variant — that is x86_64 only).
+const direntNameOff: int = 21
+
+// ---------------------------------------------------------------------------
+// Pointer / string glue
+// ---------------------------------------------------------------------------
+
+// A raw byte pointer at `addr` — `base + addr` on a nil `*u8`, the project idiom
+// (root/darwin/io.bit's `rootWriteAll`).
+function u8At(addr: int): *u8 {
+  let base: *u8 = nil
+  return base + addr
+}
+
+// A string object's inline byte pointer and length (ABI.md §2). `strPtr`/`strLen`
+// and `loadWord` are io.bit's module-scoped decls.
+function strData(s: int): int { return loadWord(s + strPtr) }
+function strLenOf(s: int): int { return loadWord(s + strLen) }
+function emptyStr(): int { return rtStrAlloc(0) }
+
+// ---------------------------------------------------------------------------
+// libSystem calls (the sched.zig helpers)
+// ---------------------------------------------------------------------------
+
+// Open `pathPtr` (NUL-terminated): mode 0=read-only, 1=create+truncate write-only,
+// 2=create+append write-only. Returns the fd or -1.
+function sysOpen(pathPtr: int, mode: int): int {
+  let flags = 0
+  if (mode == 1) {
+    flags = oWrite
+  }
+  if (mode == 2) {
+    flags = oAppend
+  }
+  let fd = int(open(u8At(pathPtr), i32(flags), i64(permFile), 0, 0, 0, 0, 0, i64(permFile)))
+  if (fd < 0) {
+    return 0 - 1
+  }
+  return fd
+}
+
+// The length of the NUL-terminated name at `addr`, capped at NAME_MAX+1 (256) so
+// the scan is provably bounded (Power of 10 rule 2).
+function cstrLen(addr: int): int {
+  let i = 0
+  while (i < 256) {
+    if (loadByte(addr + i) == 0) {
+      return i
+    }
+    i = i + 1
+  }
+  return 256
+}
+
+// `.` or `..` — the two entries `list_dir` omits.
+function isDotName(addr: int, nlen: int): bool {
+  if (nlen == 1 && loadByte(addr) == 46) {
+    return true
+  }
+  if (nlen == 2 && loadByte(addr) == 46 && loadByte(addr + 1) == 46) {
+    return true
+  }
+  return false
+}
+
+// List `pathPtr`'s entries, snprintf-shaped: write up to `cap` bytes of
+// NUL-terminated names (`.`/`..` omitted) to `outPtr` and return the TOTAL bytes
+// needed (a `cap == 0` call measures), or -1 if the directory cannot be opened.
+// The readdir loop is `sched.zig`'s `listDir` on Darwin.
+//
+// BOUNDED: `readdir` returns nil at end of directory (or on error, which Zig
+// treats identically), and a directory has finitely many entries.
+function sysList(pathPtr: int, outPtr: int, cap: int): int {
+  let dir = opendir(u8At(pathPtr))
+  if (int(dir) == 0) {
+    return 0 - 1
+  }
+  let total = 0
+  let done = false
+  while (!done) {
+    let ent = readdir(dir)
+    if (int(ent) == 0) {
+      done = true
+    } else {
+      let nameAddr = int(ent) + direntNameOff
+      let nlen = cstrLen(nameAddr)
+      if (!isDotName(nameAddr, nlen)) {
+        let j = 0
+        while (j < nlen) {
+          if (total + j < cap) {
+            storeByte(outPtr + total + j, loadByte(nameAddr + j))
+          }
+          j = j + 1
+        }
+        if (total + nlen < cap) {
+          storeByte(outPtr + total + nlen, 0)
+        }
+        total = total + nlen + 1
+      }
+    }
+  }
+  closedir(dir)
+  return total
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §14) — `bit_rt_root_` placeholder pins, `rtFs*`
+// names to avoid shadowing the `fsOpen`/`fsRead`/… builtins. See ../linux/fs.bit.
+// ---------------------------------------------------------------------------
+
+// `bit_rt_fs_open`: open `path` read-only or create+truncate write-only. fd or -1.
+export @symbol("bit_rt_root_fs_open") function rtFsOpen(path: int, write: bool): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let mode = 0
+  if (write) {
+    mode = 1
+  }
+  return sysOpen(p, mode)
+}
+
+// `bit_rt_fs_append`: open `path` create+append write-only. fd or -1.
+export @symbol("bit_rt_root_fs_append") function rtFsAppend(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  return sysOpen(p, 2)
+}
+
+// `bit_rt_fs_read`: up to `max` bytes from `fd` into a fresh string, trimmed to
+// what arrived (empty at EOF).
+export @symbol("bit_rt_root_fs_read") function rtFsRead(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let big = rtStrAlloc(max)
+  if (big == 0) {
+    return emptyStr()
+  }
+  let n = int(read(i32(fd), u8At(strData(big)), i64(max)))
+  if (n <= 0) {
+    return emptyStr()
+  }
+  return rtStringSlice(big, 0, n)
+}
+
+// `bit_rt_fs_exists`: false for a missing path. `opendir` succeeds on a directory;
+// a regular file still `open`s read-only. Mirrors `sched.zig`'s `statPath`.
+export @symbol("bit_rt_root_fs_exists") function rtFsExists(path: int): bool {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return false
+  }
+  let dir = opendir(u8At(p))
+  if (int(dir) != 0) {
+    closedir(dir)
+    return true
+  }
+  let fd = sysOpen(p, 0)
+  if (fd < 0) {
+    return false
+  }
+  close(i32(fd))
+  return true
+}
+
+// `bit_rt_fs_is_dir`: false for a missing path or a non-directory. `opendir`
+// distinguishes a directory directly.
+export @symbol("bit_rt_root_fs_is_dir") function rtFsIsDir(path: int): bool {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return false
+  }
+  let dir = opendir(u8At(p))
+  if (int(dir) == 0) {
+    return false
+  }
+  closedir(dir)
+  return true
+}
+
+// `bit_rt_fs_mkdir`: 0 on success, -1 on failure, mode 0o755.
+export @symbol("bit_rt_root_fs_mkdir") function rtFsMkdir(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (int(mkdir(u8At(p), i32(permDir))) == 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_remove`: 0 on success, -1 on failure. `unlink` then `rmdir`.
+export @symbol("bit_rt_root_fs_remove") function rtFsRemove(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (int(unlink(u8At(p))) == 0) {
+    return 0
+  }
+  if (int(rmdir(u8At(p))) == 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_list_dir`: `path`'s entries, NUL-terminated, `.`/`..` omitted. Empty
+// when the directory is empty or unreadable. Two passes (measure, then fill a
+// string sized to it), trimmed to what pass 2 wrote. See ../linux/fs.bit.
+export @symbol("bit_rt_root_fs_list_dir") function rtFsListDir(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return emptyStr()
+  }
+  let needed = sysList(p, 0, 0)
+  if (needed <= 0) {
+    return emptyStr()
+  }
+  let out = rtStrAlloc(needed)
+  if (out == 0) {
+    return emptyStr()
+  }
+  let got = sysList(p, strData(out), needed)
+  if (got <= 0) {
+    return emptyStr()
+  }
+  if (got > needed) {
+    got = needed
+  }
+  return rtStringSlice(out, 0, got)
+}
+
+// `bit_rt_fs_read_all`: the whole file as a fresh string, sized by `lseek` to the
+// end and back. A seek error or empty file yields the empty string; a short read
+// leaves the tail zero-filled.
+//
+// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration.
+export @symbol("bit_rt_root_fs_read_all") function rtFsReadAll(fd: int): int {
+  let end = int(lseek(i32(fd), i64(0), i32(seekEnd)))
+  if (end <= 0) {
+    return emptyStr()
+  }
+  lseek(i32(fd), i64(0), i32(seekSet))
+  let s = rtStrAlloc(end)
+  if (s == 0) {
+    return emptyStr()
+  }
+  let base = strData(s)
+  let off = 0
+  while (off < end) {
+    let n = int(read(i32(fd), u8At(base + off), i64(end - off)))
+    if (n <= 0) {
+      return s
+    }
+    off = off + n
+  }
+  return s
+}
+
+// `bit_rt_fs_write`: write all of `s`'s bytes to `fd`. Byte count, or -1.
+// `write` is ../darwin/io.bit's module-scoped extern.
+//
+// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration.
+export @symbol("bit_rt_root_fs_write") function rtFsWrite(fd: int, s: int): int {
+  let total = strLenOf(s)
+  let base = strData(s)
+  let off = 0
+  while (off < total) {
+    let n = int(write(i32(fd), u8At(base + off), i64(total - off)))
+    if (n < 0) {
+      return 0 - 1
+    }
+    if (n == 0) {
+      return off
+    }
+    off = off + n
+  }
+  return off
+}
+
+// `bit_rt_fs_chmod`: set `path`'s permission bits to `mode`. 0 on success, -1 on
+// any error.
+export @symbol("bit_rt_root_fs_chmod") function rtFsChmod(path: int, mode: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (int(chmod(u8At(p), i32(mode))) == 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_close`: close `fd`. Always reports success. See the #1436 note above.
+export @symbol("bit_rt_root_fs_close") function rtFsClose(fd: int): int {
+  close(i32(fd))
+  return 0
+}

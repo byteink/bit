@@ -1,0 +1,431 @@
+// Linux filesystem provider for the SEAM 3 remainder (#1606): the 12
+// `bit_rt_fs_*` ABI wrappers (ABI.md §14) and the raw per-arch syscalls behind
+// them. This is the Bit form of `runtime/root.zig`'s `fs_*` block plus the Linux
+// branch of `runtime/sched.zig`'s `openFd`/`readFd`/`writeFd`/`closeFd`/
+// `mkdirAt`/`removeAt`/`chmodAt`/`fileSize`/`listDir`/`statPath`, fused into one
+// self-contained module member.
+//
+// SELF-CONTAINED (the io.bit shape), NOT parent-wrappers-over-extern-primitives
+// (the netabi shape): see ../fs.bit's header for why the netabi shape breaks the
+// x86_64-linux `rejectExternForTarget` gate here. The wrappers call their
+// syscalls as LOCAL functions and reach `runtime/root`'s string glue by ordinary
+// `import`. The platform-free `fsPathZ` and the `.`/`..`-skipping listing logic
+// are the only pieces shared with ../darwin/fs.bit; everything numeric below is
+// Linux-only.
+//
+// EVERY SYSCALL NUMBER, `open` FLAG, `dirent64` OFFSET AND `AT_*` CONSTANT BELOW
+// WAS READ OUT OF THE PINNED ZIG STDLIB (std/os/linux/syscalls.zig, linux.zig's
+// `O`/`AT`/`dirent64`), NOT FROM MEMORY. A wrong number here is a silent
+// wrong-syscall or wrong-field, never a compile error.
+//
+// PER-ARCH SHAPE, NOT JUST PER-ARCH NUMBER. `std.os.linux.open`/`mkdir`/`unlink`/
+// `rmdir`/`chmod` use the bare syscall on x86_64 (which HAS it) and the `*at`
+// variant on aarch64 (which does NOT), and the `*at` form takes an extra leading
+// `AT_FDCWD` dirfd. This file mirrors that choice exactly rather than normalising
+// both arches onto `openat`, as the task and rand/linux/entropy.bit require.
+//
+// Nothing here is `@nosplit`: `@nosplit` REJECTS `syscall` (E0075), the same
+// reason io.bit gives — and the same reason this path cannot become a
+// freestanding archive member until #1369.
+
+import { fsPathZ, rtStrAlloc, rtStringSlice } from "../../root"
+import { loadByte, storeByte } from "../../gc"
+
+// `nr`, `nrWrite`, `strPtr`, `strLen` and `loadWord` are already imported/defined
+// by this module's sibling io.bit (imports and top-level decls are module-scoped
+// in Bit), so they are NOT re-declared here — doing so is an E0042 redeclaration.
+
+// Same-shape syscalls (identical arguments on both arches, only the number
+// differs). `nr`/`nrWrite` come from io.bit; the rest are read/close/lseek/
+// getdents64.
+function nrRead(): int { return nr(0, 63) }
+function nrClose(): int { return nr(3, 57) }
+function nrLseek(): int { return nr(8, 62) }
+function nrGetdents64(): int { return nr(217, 61) }
+
+function isX64(): bool { return hostTarget() == 0 }
+
+// `AT_FDCWD` (= -100): the dirfd every `*at` variant uses to mean "resolve
+// against the current directory". `AT_REMOVEDIR` (= 0x200) makes `unlinkat`
+// behave as `rmdir`.
+const atFdCwd: int = 0 - 100
+const atRemoveDir: int = 512
+
+// `open` flags (linux.zig's `O`, identical bit positions on x86_64 and aarch64):
+// O_WRONLY=1, O_CREAT=0o100=64, O_TRUNC=0o1000=512, O_APPEND=0o2000=1024. A read
+// open is O_RDONLY=0. Default perms: file 0o644=420, directory 0o755=493.
+const oWrite: int = 577
+const oAppend: int = 1089
+const permFile: int = 420
+const permDir: int = 493
+
+// `dirent64` (linux.zig): d_ino(u64)@0, d_off(u64)@8, d_reclen(u16)@16,
+// d_type(u8)@18, d_name@19, the name NUL-terminated within the record.
+const direntReclenOff: int = 16
+const direntNameOff: int = 19
+
+// getdents64 / stat-probe scratch. MODULE-LEVEL and unlocked, sound only under
+// the single-worker contract (ABI.md §5), exactly as net/linux/sock.bit's
+// `saBuf`. A scalar array is never scanned by the collector (rule 1). 1024 words
+// = 8192 bytes, matching `sched.zig`'s `listDir` buffer; 8-byte aligned, which
+// `dirent64` requires.
+let fsDirBuf: [1024]i64
+const fsDirBufBytes: int = 8192
+
+// ---------------------------------------------------------------------------
+// String glue: a string object's inline byte pointer and length (ABI.md §2).
+// `strPtr`/`strLen` are io.bit's module-scoped imports; `loadWord` too.
+// ---------------------------------------------------------------------------
+
+function strData(s: int): int { return loadWord(s + strPtr) }
+function strLenOf(s: int): int { return loadWord(s + strLen) }
+function emptyStr(): int { return rtStrAlloc(0) }
+
+// ---------------------------------------------------------------------------
+// Raw syscalls (the sched.zig helpers)
+// ---------------------------------------------------------------------------
+
+// Open `pathPtr` (NUL-terminated): mode 0=read-only, 1=create+truncate
+// write-only, 2=create+append write-only. Returns the fd or -1. x86_64 uses bare
+// `open` (nr 2); aarch64 has no `open` and uses `openat(AT_FDCWD, …)` (nr 56)
+// with the extra dirfd — mirroring `std.os.linux.open`.
+function sysOpen(pathPtr: int, mode: int): int {
+  let flags = 0
+  if (mode == 1) {
+    flags = oWrite
+  }
+  if (mode == 2) {
+    flags = oAppend
+  }
+  if (isX64()) {
+    let rc = int(syscall(2, i64(pathPtr), i64(flags), i64(permFile)))
+    if (rc < 0) {
+      return 0 - 1
+    }
+    return rc
+  }
+  let rc = int(syscall(56, i64(atFdCwd), i64(pathPtr), i64(flags), i64(permFile)))
+  if (rc < 0) {
+    return 0 - 1
+  }
+  return rc
+}
+
+// The length of the NUL-terminated name at `addr`, capped at NAME_MAX+1 (256) so
+// the scan is provably bounded (Power of 10 rule 2).
+function cstrLen(addr: int): int {
+  let i = 0
+  while (i < 256) {
+    if (loadByte(addr + i) == 0) {
+      return i
+    }
+    i = i + 1
+  }
+  return 256
+}
+
+// The little-endian u16 at `addr` (`dirent64.d_reclen`; both Linux arches are
+// little-endian).
+function loadU16(addr: int): int {
+  return loadByte(addr) + loadByte(addr + 1) * 256
+}
+
+// `.` or `..` — the two entries `list_dir` omits.
+function isDotName(addr: int, nlen: int): bool {
+  if (nlen == 1 && loadByte(addr) == 46) {
+    return true
+  }
+  if (nlen == 2 && loadByte(addr) == 46 && loadByte(addr + 1) == 46) {
+    return true
+  }
+  return false
+}
+
+// List `pathPtr`'s entries, snprintf-shaped: write up to `cap` bytes of
+// NUL-terminated names (`.`/`..` omitted) to `outPtr` and return the TOTAL bytes
+// needed (a `cap == 0` call measures), or -1 if the directory cannot be read.
+// The getdents64 loop is `sched.zig`'s `listDir` on Linux.
+//
+// BOUNDED: the outer loop consumes the directory a batch at a time and stops when
+// getdents64 returns 0 — a directory has finitely many entries and each call
+// makes forward progress. The inner loop advances by `d_reclen`, which the kernel
+// guarantees positive; the `reclen <= 0` guard keeps it bounded even against a
+// malformed record.
+function sysList(pathPtr: int, outPtr: int, cap: int): int {
+  let fd = sysOpen(pathPtr, 0)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  let dbuf = int(ptrOf(fsDirBuf))
+  let total = 0
+  let done = false
+  while (!done) {
+    let rc = int(syscall(nrGetdents64(), i64(fd), i64(dbuf), i64(fsDirBufBytes)))
+    if (rc < 0) {
+      syscall(nrClose(), i64(fd))
+      return 0 - 1
+    }
+    if (rc == 0) {
+      done = true
+    }
+    let off = 0
+    while (off < rc) {
+      let reclen = loadU16(dbuf + off + direntReclenOff)
+      if (reclen <= 0) {
+        off = rc
+      } else {
+        let nameAddr = dbuf + off + direntNameOff
+        let nlen = cstrLen(nameAddr)
+        if (!isDotName(nameAddr, nlen)) {
+          let j = 0
+          while (j < nlen) {
+            if (total + j < cap) {
+              storeByte(outPtr + total + j, loadByte(nameAddr + j))
+            }
+            j = j + 1
+          }
+          if (total + nlen < cap) {
+            storeByte(outPtr + total + nlen, 0)
+          }
+          total = total + nlen + 1
+        }
+        off = off + reclen
+      }
+    }
+  }
+  syscall(nrClose(), i64(fd))
+  return total
+}
+
+// ---------------------------------------------------------------------------
+// The exported ABI surface (ABI.md §14)
+// ---------------------------------------------------------------------------
+//
+// PINS CARRY THE `bit_rt_root_` PREFIX for the reason io.bit documents: G2/#1583
+// drops the `_root` infix so each becomes its bare `bit_rt_fs_*` ABI name. The
+// wrapper functions are named `rtFs*` (not `fs*`) to avoid shadowing the `fsOpen`
+// / `fsRead` / … language builtins, the same reason netabi names its wrappers
+// `netAbi*`.
+
+// `bit_rt_fs_open`: open `path` read-only (`write == false`) or create+truncate
+// write-only (`write == true`). Returns the fd, or -1.
+export @symbol("bit_rt_root_fs_open") function rtFsOpen(path: int, write: bool): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let mode = 0
+  if (write) {
+    mode = 1
+  }
+  return sysOpen(p, mode)
+}
+
+// `bit_rt_fs_append`: open `path` create+append write-only. Returns the fd, or -1.
+export @symbol("bit_rt_root_fs_append") function rtFsAppend(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  return sysOpen(p, 2)
+}
+
+// `bit_rt_fs_read`: up to `max` bytes from `fd` into a fresh string, shorter than
+// `max` at EOF (empty exactly at EOF). Allocates `max`, reads, trims to what
+// arrived — `root.zig`'s `stringFromBytes(tmp[0..n])`, one allocation.
+export @symbol("bit_rt_root_fs_read") function rtFsRead(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let big = rtStrAlloc(max)
+  if (big == 0) {
+    return emptyStr()
+  }
+  let n = int(syscall(nrRead(), i64(fd), i64(strData(big)), i64(max)))
+  if (n <= 0) {
+    return emptyStr()
+  }
+  return rtStringSlice(big, 0, n)
+}
+
+// `bit_rt_fs_exists`: false for a missing path. Probes without a `stat` struct:
+// open read-only, then `getdents64` — mirroring `sched.zig`'s `statPath`. Open
+// failure means absent.
+export @symbol("bit_rt_root_fs_exists") function rtFsExists(path: int): bool {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return false
+  }
+  let fd = sysOpen(p, 0)
+  if (fd < 0) {
+    return false
+  }
+  syscall(nrClose(), i64(fd))
+  return true
+}
+
+// `bit_rt_fs_is_dir`: false for a missing path or a non-directory. A directory
+// answers `getdents64`; a regular file answers `ENOTDIR`.
+export @symbol("bit_rt_root_fs_is_dir") function rtFsIsDir(path: int): bool {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return false
+  }
+  let fd = sysOpen(p, 0)
+  if (fd < 0) {
+    return false
+  }
+  let rc = int(syscall(nrGetdents64(), i64(fd), i64(int(ptrOf(fsDirBuf))), i64(fsDirBufBytes)))
+  syscall(nrClose(), i64(fd))
+  return rc >= 0
+}
+
+// `bit_rt_fs_mkdir`: 0 on success, -1 on failure (including "already exists").
+// x86_64 `mkdir` (nr 83) / aarch64 `mkdirat(AT_FDCWD, …)` (nr 34), mode 0o755.
+export @symbol("bit_rt_root_fs_mkdir") function rtFsMkdir(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let rc = 0
+  if (isX64()) {
+    rc = int(syscall(83, i64(p), i64(permDir)))
+  } else {
+    rc = int(syscall(34, i64(atFdCwd), i64(p), i64(permDir)))
+  }
+  if (rc == 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_remove`: 0 on success, -1 on failure. Deletes a file or an *empty*
+// directory: `unlink` then `rmdir` — `sched.zig`'s `removeAt`. aarch64 folds both
+// into `unlinkat`, the second carrying `AT_REMOVEDIR`.
+export @symbol("bit_rt_root_fs_remove") function rtFsRemove(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  if (isX64()) {
+    if (int(syscall(87, i64(p))) == 0) {
+      return 0
+    }
+    if (int(syscall(84, i64(p))) == 0) {
+      return 0
+    }
+    return 0 - 1
+  }
+  if (int(syscall(35, i64(atFdCwd), i64(p), i64(0))) == 0) {
+    return 0
+  }
+  if (int(syscall(35, i64(atFdCwd), i64(p), i64(atRemoveDir))) == 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_list_dir`: `path`'s entries, each terminated by a NUL byte, `.`/`..`
+// omitted. Empty string when the directory is empty or unreadable (`std/fs`
+// checks `isDir` first to tell those apart). Two passes — measure, then fill a
+// string sized to it (Power of 10 rule 3, no unbounded growth) — rather than
+// `root.zig`'s growing `ArrayList`. A directory that shrinks between passes
+// yields fewer bytes than measured, so the result is trimmed to what pass 2 wrote
+// (`rtStringSlice` rejects `hi > len`, so the clamp also guards the allocation).
+export @symbol("bit_rt_root_fs_list_dir") function rtFsListDir(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return emptyStr()
+  }
+  let needed = sysList(p, 0, 0)
+  if (needed <= 0) {
+    return emptyStr()
+  }
+  let out = rtStrAlloc(needed)
+  if (out == 0) {
+    return emptyStr()
+  }
+  let got = sysList(p, strData(out), needed)
+  if (got <= 0) {
+    return emptyStr()
+  }
+  if (got > needed) {
+    got = needed
+  }
+  return rtStringSlice(out, 0, got)
+}
+
+// `bit_rt_fs_read_all`: the whole file as a fresh string. Sized from the file
+// offset (`lseek` to end, then rewind); a seek error or empty file yields the
+// empty string. A short read leaves the tail zero-filled, matching `root.zig`.
+//
+// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration and the
+// loop exits at `off >= size`.
+export @symbol("bit_rt_root_fs_read_all") function rtFsReadAll(fd: int): int {
+  let end = int(syscall(nrLseek(), i64(fd), i64(0), i64(2)))
+  if (end <= 0) {
+    return emptyStr()
+  }
+  syscall(nrLseek(), i64(fd), i64(0), i64(0))
+  let s = rtStrAlloc(end)
+  if (s == 0) {
+    return emptyStr()
+  }
+  let base = strData(s)
+  let off = 0
+  while (off < end) {
+    let n = int(syscall(nrRead(), i64(fd), i64(base + off), i64(end - off)))
+    if (n <= 0) {
+      return s
+    }
+    off = off + n
+  }
+  return s
+}
+
+// `bit_rt_fs_write`: write all of `s`'s bytes to `fd`. Returns the byte count, or
+// -1 on any write error.
+//
+// BOUNDED (Power of 10 rule 2): `off` rises by at least 1 each iteration (a zero
+// write breaks, an error returns) and the loop exits at `off >= len`.
+export @symbol("bit_rt_root_fs_write") function rtFsWrite(fd: int, s: int): int {
+  let total = strLenOf(s)
+  let base = strData(s)
+  let off = 0
+  while (off < total) {
+    let n = int(syscall(nrWrite(), i64(fd), i64(base + off), i64(total - off)))
+    if (n < 0) {
+      return 0 - 1
+    }
+    if (n == 0) {
+      return off
+    }
+    off = off + n
+  }
+  return off
+}
+
+// `bit_rt_fs_chmod`: set `path`'s permission bits to `mode`. 0 on success, -1 on
+// any error. x86_64 `chmod` (nr 90) / aarch64 `fchmodat(AT_FDCWD, …)` (nr 53).
+export @symbol("bit_rt_root_fs_chmod") function rtFsChmod(path: int, mode: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let rc = 0
+  if (isX64()) {
+    rc = int(syscall(90, i64(p), i64(mode)))
+  } else {
+    rc = int(syscall(53, i64(atFdCwd), i64(p), i64(mode)))
+  }
+  if (rc == 0) {
+    return 0
+  }
+  return 0 - 1
+}
+
+// `bit_rt_fs_close`: close `fd`. Always reports success, matching `root.zig`.
+export @symbol("bit_rt_root_fs_close") function rtFsClose(fd: int): int {
+  syscall(nrClose(), i64(fd))
+  return 0
+}
