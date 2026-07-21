@@ -26,13 +26,25 @@
 //     which this cross-platform module cannot name). So the wrappers here mirror
 //     the internal boolean result — the operation still does the right thing to
 //     the channel — and leave the panic to that later half.
-//   - CHAN_MAKE / SELECT_ALLOC. Both allocate a GC-traced ref-array buffer, for
-//     which the only accessor is `runtime/root`'s `bit_rt_port_root_alloc_buf`;
-//     `chan` cannot import `runtime/root` (root/slots.bit imports this module's
-//     scratch layout, so the import is a module cycle), and `chan_make`
-//     additionally needs a boot-provisioned process-lifetime handle allocator
-//     and registry block that the Bit runtime does not yet wire. Those two pins
-//     are tracked separately; this file covers the five allocation-free symbols.
+//   - CHAN_MAKE. `chan_make` needs a process-lifetime channel handle and ring
+//     that outlive the GC (root.zig uses `page_allocator`, never GC), plus a
+//     process registry the collector scans (`chanScanRegistryRoots`) so a
+//     buffered `is_ref` channel's payloads are treated as roots. On main today
+//     NONE of that is provisioned: no chan reserve or registry block is set up
+//     at boot, `reserveInit`/`reserveTake` are unpinned (unreachable from a
+//     freestanding chan emit), and the registry scan has no live call site
+//     (#1602 defers it to #1610, still pending). The ring GC-reachability model
+//     (traced GC object vs. process memory + registry-scanned contents) is also
+//     unsettled. Pinning `chan_make` now would emit a shell that allocates from
+//     a zero reserve — silent wrongness at G3, not progress — so it stays out
+//     until that boot wiring + reachability decision lands (#1613/#1610).
+//
+// SELECT_ALLOC is now IN (below). Its buffer is transient, not process-lifetime:
+// codegen fills it and passes it straight to `bit_rt_select`, holding it in a
+// rooted stack slot across the call, so a GC-traced `alloc_buf` object rooted by
+// that slot is exactly right — the same shape `root.zig`'s `gcAllocRaw(...,
+// ref_array_info)` uses. It needs no reserve, no registry and no boot state, so
+// the chan<->root cycle break (#1612) is the only thing it was ever waiting on.
 //
 // ---------------------------------------------------------------------------
 // LIVENESS
@@ -47,6 +59,12 @@
 //
 // `schedPark`, `schedCurrentTask` and `taskAt` are already imported by
 // `./chan.bit` — imports are module-scoped, so this sibling names them directly.
+//
+// `allocBuf` is root's pinned ref-array allocator (`bit_rt_port_root_alloc_buf`,
+// SEAM 3 / #1576). Reaching it from chan is legal now the chan<->root cycle is
+// gone (#1612): the graph is root->sched, chan->sched, chan->root, chan->gc —
+// still a DAG, root never imports chan. Only `select_alloc` uses it.
+import { allocBuf } from "../root"
 
 // `bit_rt_chan_send(ch, value)` (ABI.md §11). A nil channel blocks the caller
 // forever (SPEC §16.2): there is nothing that can ever unpark it, matching
@@ -108,4 +126,28 @@ export @symbol("bit_rt_root_chan_close") function rtChanClose(ch: int) {
 // the scheduler through the first case's channel and drives the whole thing.
 export @symbol("bit_rt_root_select") function rtSelect(descs: int, n: int, hasDefault: bool): int {
   return chanSelect(taskAt(descs), n, hasDefault)
+}
+
+// `bit_rt_select_alloc(n) -> descs` (ABI.md §11). A zeroed `n`-case descriptor
+// buffer for codegen to populate (`dir`/`chan`, and a send case's `word`) before
+// calling `bit_rt_select`. `selCaseWords` (=4) words per case, `n` cases.
+//
+// TRACED, not a leaf: a case's `word` slot holds a live GC reference for a
+// `chan<T>` whose `T` is a reference type — a send case's value, or the value a
+// recv case just received (`bit_rt_select` writes it back there for codegen to
+// read). That reference lives ONLY in this buffer across `bit_rt_select`, which
+// may park and let a collection run, so an untraced buffer would sweep a still-
+// live received value. `allocBuf(.., true)` selects root's `ref_array_info`
+// descriptor, exactly as `root.zig`'s `gcAllocRaw(.., &ref_array_info)` does;
+// conservative per-word tracing is exact here because `dir`/`ok` are 0/1 and a
+// `chan` handle is not a GC object base, so `gcMarkRoot` skips all three and
+// marks only a real `word` reference (ABI.md §11).
+//
+// No process-lifetime storage, reserve or registry is involved: codegen holds
+// this buffer in a rooted stack slot from `select_alloc` to `bit_rt_select`, so
+// the collector's stack scan roots it — unlike `chan_make`'s handle/ring, which
+// must outlive any caller frame. `allocBuf` zeroes the body (`gcAllocRaw` ->
+// `zeroBytes`), satisfying the "zeroed descriptor buffer" contract.
+export @symbol("bit_rt_root_select_alloc") function rtSelectAlloc(n: int): int {
+  return allocBuf(n * selCaseWords, true)
 }
