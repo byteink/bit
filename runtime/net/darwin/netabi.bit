@@ -1,0 +1,320 @@
+// SEAM 1 of the runtime port (#1574, reshaped by #1600): the 12
+// `bit_rt_root_net_*` ABI wrappers (ABI.md §12/§20) over the ported Darwin socket
+// engine. This is `runtime/root.zig`'s `bit_rt_net_*` block expressed in Bit —
+// pure marshalling between the managed `string` boundary the compiler emits and
+// the `*u8 + length` boundary the socket engine speaks.
+//
+// ---------------------------------------------------------------------------
+// WHY THE WRAPPERS LIVE PER-PLATFORM NOW (io.bit / fs.bit shape, #1600)
+// ---------------------------------------------------------------------------
+//
+// SEAM 1 first kept these wrappers in the platform-FREE parent (`net/netabi.bit`)
+// and reached the socket engine by `extern function`. On aarch64-macos that is
+// fine — an `extern` is a load-time dyld import — but a Linux `--emit-obj` rejects
+// any `extern function` naming a symbol absent from `libbitrt.a` (E0078), and
+// because the parent module is imported by `net/{linux,darwin}` a single such
+// `extern` broke the providers' Linux build too. G3 (#1584) assembles
+// `libbitrt.a` per module on both Linux triples, so it would have hit exactly
+// this. See ../linux/netabi.bit's header for the full account.
+//
+// The fix is the `root/{linux,darwin}/fs.bit` shape (#1606): the wrappers live IN
+// each platform provider, calling the socket engine functions (`bit_rt_port_net_*`)
+// as module-scoped SIBLINGS by their Bit name — a local call, never an `extern` —
+// and reaching the platform-free glue by ordinary `import`. This Darwin half is
+// a byte-for-byte mirror of the Linux one save this header; only the socket engine
+// the sibling names resolve to differs (libSystem calls vs raw syscalls).
+//
+// ---------------------------------------------------------------------------
+// PINS CARRY THE `bit_rt_root_` PREFIX, NOT THE BARE ABI NAME
+// ---------------------------------------------------------------------------
+//
+// `runtime/root.zig` still defines `bit_rt_net_listen` and the rest, so claiming
+// those names here fails the link with `DuplicateSymbol`. G2 (#1583) drops the
+// `_root` infix. Until #1369's archive swap the calls still land on the working
+// Zig — no gate exercises these Bit bodies, exactly the pre-rename state.
+//
+// ---------------------------------------------------------------------------
+// NO PATH TO A NET RtFn, SO NO PIN CYCLE
+// ---------------------------------------------------------------------------
+//
+// The wrappers call the port-internal socket functions (`netListenTcp`/…, pinned
+// `bit_rt_port_net_*` by #1366), never the `netListen`/`netDial`/… BUILTINS that
+// would lower to `bit_rt_net_*` and self-recurse after G2's rename. `zig build
+// rootpins` proves it at the object level, with `runtime/net/darwin` in its list.
+//
+// ---------------------------------------------------------------------------
+// NOTHING HERE IS `@nosplit`
+// ---------------------------------------------------------------------------
+//
+// `netAbiRead`/`netAbiUdpRecv` allocate, park in a socket call (a safepoint),
+// then trim. The collector scans stacks CONSERVATIVELY (ABI.md §5), so the object
+// address in a plain `int`/`*u8` local pins the object across the park.
+
+import { strPtr, strLen, rtStrAlloc, rtStringSlice } from "../../root"
+import { loadWord } from "../../gc"
+// `netParseIpv4`, `netMax*` and the DNS codec are already imported from
+// "../../net" by this module's sibling sock.bit (imports are module-scoped), so
+// re-importing them here is an E0042 redeclaration — only the two names sock.bit
+// does NOT bring in are imported.
+import { netFormatOctets, netFirstNameserver } from "../../net"
+
+// ---------------------------------------------------------------------------
+// Marshalling helpers
+// ---------------------------------------------------------------------------
+
+// A raw byte pointer at `addr`. `base + addr` on a nil `*u8` is the project's
+// idiom for turning an address held as `int` back into a pointer.
+function u8At(addr: int): *u8 {
+  let base: *u8 = nil
+  return base + addr
+}
+
+// A `string` object's inline byte pointer and its length (ABI.md §2: a
+// `{ptr, len}` header whose `ptr` addresses the object's own bytes).
+function strData(s: int): *u8 {
+  return u8At(loadWord(s + strPtr))
+}
+
+function strSizeOf(s: int): int {
+  return loadWord(s + strLen)
+}
+
+// The empty string, the failure value for every string-returning entry point
+// (matching `root.zig`'s `stringFromBytes("")`).
+function emptyStr(): int {
+  return rtStrAlloc(0)
+}
+
+// A dotted quad from four packed octets, as a fresh string. `netFormatOctets`
+// writes at most 15 bytes into a scratch; the result is trimmed to its report.
+function formatQuad(octets: *u8): int {
+  let fmt = rtStrAlloc(15)
+  if (fmt == 0) {
+    return emptyStr()
+  }
+  let flen = netFormatOctets(octets, strData(fmt))
+  return rtStringSlice(fmt, 0, flen)
+}
+
+// ---------------------------------------------------------------------------
+// TCP (ABI.md §12)
+// ---------------------------------------------------------------------------
+
+// `bit_rt_net_listen`: a listening TCP socket on `host:port`, or -1. `port == 0`
+// asks the kernel to choose one; read it back with `net_local_port`.
+export @symbol("bit_rt_root_net_listen") function netAbiListen(host: int, port: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netListenTcp(strData(host), strSizeOf(host), port, 512)
+}
+
+// `bit_rt_net_local_port`: the port `fd` is bound to, or -1.
+export @symbol("bit_rt_root_net_local_port") function netAbiLocalPort(fd: int): int {
+  return netLocalPort(fd)
+}
+
+// `bit_rt_net_accept`: the next connection on listener `fd`, or -1. Parks the
+// calling green thread until a peer arrives.
+export @symbol("bit_rt_root_net_accept") function netAbiAccept(fd: int): int {
+  return netAcceptTcp(fd)
+}
+
+// `bit_rt_net_dial`: a connected TCP socket to `host:port`, or -1. Parks until
+// the handshake completes.
+export @symbol("bit_rt_root_net_dial") function netAbiDial(host: int, port: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netDialTcp(strData(host), strSizeOf(host), port)
+}
+
+// `bit_rt_net_read`: up to `max` bytes from `fd`, parking until some arrive.
+// Empty means the peer closed — an orderly end of stream. An I/O error reads as
+// empty too, exactly as `root.zig` documents.
+export @symbol("bit_rt_root_net_read") function netAbiRead(fd: int, max: int): int {
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let big = rtStrAlloc(max)
+  if (big == 0) {
+    return emptyStr()
+  }
+  let n = netReadSock(fd, strData(big), max)
+  if (n <= 0) {
+    return emptyStr()
+  }
+  return rtStringSlice(big, 0, n)
+}
+
+// `bit_rt_net_write`: all of `s` to `fd`, parking whenever the send buffer is
+// full. Returns the byte count, or -1. The port layer retries a short write.
+export @symbol("bit_rt_root_net_write") function netAbiWrite(fd: int, s: int): int {
+  return netWriteSock(fd, strData(s), strSizeOf(s))
+}
+
+// ---------------------------------------------------------------------------
+// UDP (ABI.md §12)
+// ---------------------------------------------------------------------------
+//
+// THE LAST SENDER IS MODULE STATE, NOT A THREADLOCAL. `root.zig` keeps it in a
+// `threadlocal`; Mach-O refuses `@threadlocal` (§11.11), so it lives in module
+// state here, sound under the ABI's single-worker contract (ABI.md §5) and the
+// adjacency the lowering gives `udp_recv` then `udp_sender_host`/`_port`. A scalar
+// array is never scanned by the collector (rule 1), required here: it holds a raw
+// `sockaddr`, not an object.
+let udpSenderBuf: [4]i64
+let udpSenderValid: i64 = 0
+
+// The stored sender as a `*u8`, re-derived each call (module-state address).
+function udpSenderAddr(): *u8 {
+  return u8At(int(ptrOf(udpSenderBuf)))
+}
+
+// `bit_rt_net_udp_bind`: a datagram socket bound to `host:port`, or -1.
+export @symbol("bit_rt_root_net_udp_bind") function netAbiUdpBind(host: int, port: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netBindUdp(strData(host), strSizeOf(host), port)
+}
+
+// `bit_rt_net_udp_send`: one datagram of `data` to `host:port` from `fd`.
+// Returns the byte count, or -1.
+export @symbol("bit_rt_root_net_udp_send") function netAbiUdpSend(fd: int, host: int, port: int, data: int): int {
+  if (port < 0 || port > 65535) {
+    return 0 - 1
+  }
+  return netSendTo(fd, strData(host), strSizeOf(host), port, strData(data), strSizeOf(data))
+}
+
+// `bit_rt_net_udp_recv`: up to `max` bytes of the next datagram on `fd`, parking
+// until one arrives. Records the sender for `udp_sender_host`/`_port`. On error
+// returns empty and marks the sender invalid; a zero-length datagram returns
+// empty with a valid sender (UDP has no end-of-stream).
+export @symbol("bit_rt_root_net_udp_recv") function netAbiUdpRecv(fd: int, max: int): int {
+  udpSenderValid = 0
+  if (max <= 0) {
+    return emptyStr()
+  }
+  let big = rtStrAlloc(max)
+  if (big == 0) {
+    return emptyStr()
+  }
+  let n = netRecvFrom(fd, strData(big), max, udpSenderAddr())
+  if (n < 0) {
+    return emptyStr()
+  }
+  udpSenderValid = 1
+  return rtStringSlice(big, 0, n)
+}
+
+// `bit_rt_net_udp_sender_host`: dotted-quad of the last recv's sender, or "".
+export @symbol("bit_rt_root_net_udp_sender_host") function netAbiUdpSenderHost(): int {
+  if (udpSenderValid == 0) {
+    return emptyStr()
+  }
+  let octStr = rtStrAlloc(4)
+  if (octStr == 0) {
+    return emptyStr()
+  }
+  netSockAddrOctets(udpSenderAddr(), strData(octStr))
+  return formatQuad(strData(octStr))
+}
+
+// `bit_rt_net_udp_sender_port`: the last recv's sender port, or -1.
+export @symbol("bit_rt_root_net_udp_sender_port") function netAbiUdpSenderPort(): int {
+  if (udpSenderValid == 0) {
+    return 0 - 1
+  }
+  return netSockAddrPort(udpSenderAddr())
+}
+
+// ---------------------------------------------------------------------------
+// DNS (ABI.md §20)
+// ---------------------------------------------------------------------------
+
+// `/etc/resolv.conf` is read into a fixed, bounded scratch (Power of 10 rule 3,
+// no unbounded growth): a nameserver directive lives at the top of the file, so
+// the first page bounds every real config. `root.zig` reads the whole file with a
+// growing buffer; this reads at most `resolvConfMax` and finds the first
+// `nameserver` line within it, behaviourally identical for every practical
+// `resolv.conf`.
+const resolvConfMax: int = 4096
+
+// Read up to `cap` bytes of `/etc/resolv.conf` into `bufPtr`, returning the byte
+// count or -1 if the file cannot be opened. `fsOpen`/`fsClose` are language
+// builtins (they lower to RtFn calls, not `extern function` declarations);
+// `netReadSock` is this module's socket-read sibling, and `read(2)` is generic
+// across a socket and a regular file — a blocking regular file never returns
+// EAGAIN, so its poller path is never taken.
+//
+// BOUNDED (Power of 10 rule 2): `total` rises by at least 1 each iteration (a
+// `n <= 0` sets `done`) and the loop also exits at `total >= cap`.
+function readResolvConf(bufPtr: *u8, cap: int): int {
+  let fd = fsOpen("/etc/resolv.conf", false)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  let total = 0
+  let done = false
+  while (!done && total < cap) {
+    let n = netReadSock(fd, bufPtr + total, cap - total)
+    if (n <= 0) {
+      done = true
+    } else {
+      total = total + n
+    }
+  }
+  fsClose(fd)
+  return total
+}
+
+// `bit_rt_net_resolve`: the first IPv4 A-record for `host` as a dotted quad, or
+// "" on failure. A dotted-quad `host` passes straight back. Uses the first
+// nameserver in /etc/resolv.conf (ABI.md §20).
+//
+// `netResolve` (this module's socket sibling) takes the nameserver as a
+// parameter, so this wrapper owns the file read. A missing or nameserver-less
+// file resolves to "", matching the Zig's `Error.BadAddress`.
+export @symbol("bit_rt_root_net_resolve") function netAbiResolve(host: int): int {
+  let hostPtr = strData(host)
+  let hostLen = strSizeOf(host)
+
+  let outStr = rtStrAlloc(4)
+  if (outStr == 0) {
+    return emptyStr()
+  }
+  let outPtr = strData(outStr)
+
+  // A literal address never needs the network — return it verbatim, exactly as
+  // `netResolve` would, but without touching /etc/resolv.conf.
+  if (netParseIpv4(hostPtr, hostLen, outPtr)) {
+    return formatQuad(outPtr)
+  }
+
+  let confStr = rtStrAlloc(resolvConfMax)
+  if (confStr == 0) {
+    return emptyStr()
+  }
+  // `confPtr` (a `*u8` in a stack slot) pins `confStr`'s bytes across the read's
+  // park under the conservative stack scan (ABI.md §5), so the buffer survives.
+  let confPtr = strData(confStr)
+  let confLen = readResolvConf(confPtr, resolvConfMax)
+  if (confLen <= 0) {
+    return emptyStr()
+  }
+
+  let nsStr = rtStrAlloc(4)
+  if (nsStr == 0) {
+    return emptyStr()
+  }
+  let nsPtr = strData(nsStr)
+  if (!netFirstNameserver(confPtr, confLen, nsPtr)) {
+    return emptyStr()
+  }
+  if (!netResolve(hostPtr, hostLen, nsPtr, outPtr)) {
+    return emptyStr()
+  }
+  return formatQuad(outPtr)
+}
