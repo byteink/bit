@@ -1,0 +1,138 @@
+// #1648 regression, Linux: the worker run loop must expire timers against THE
+// SAME monotonic clock the deadlines were computed from.
+//
+// WHY THIS EXISTS SEPARATELY FROM ../schedtimer. That program proves the timer
+// QUEUE — partition, ordering, the not-yet-parked retention — and it does so on
+// a deliberately FAKE clock, one tick per idle pass, so that wake order can be
+// asserted exactly. That is the right test for the queue and it is why the queue
+// was never the bug. The bug was one level out: `runtime/root/<os>`'s worker
+// entry drove the loop with the clock folded away to a CONSTANT 0, while sibling
+// ./time.bit's `bit_rt_time_sleep_ns` set deadlines as `parkMonoNs() + ns`. A
+// positive deadline is never `<= 0`, so against a Bit-sourced `libbitrt.a` the
+// three-line program
+//
+//     println("before"); sleep(30 * Millisecond); println("after")
+//
+// printed `before` and hung forever — the only task in the process was on the
+// timer list and the only worker asked "is anything due at time 0?" a billion
+// times. A fake clock cannot see that: the defect is precisely a MISMATCH
+// between the clock the sleeper used and the clock the worker used, so a test
+// that supplies one clock to both halves is structurally blind to it.
+//
+// So this program is the mismatch test, and it is deliberately the boot path's
+// own shape: a real monotonic clock on both sides, a real deadline, and the
+// worker loop spelled out over `schedWorkerStepNow` exactly as
+// `runtime/root/linux`'s `workerBody` spells it.
+//
+// IT FAILS RATHER THAN HANGS, WHICH IS NOT OPTIONAL (#1637: the harness has no
+// per-case timeout, so a hanging case stalls `zig build test` forever instead of
+// failing it). The give-up below is a WALL-CLOCK deadline read straight from
+// `parkMonoNs` in the driver, not from anything the timer path touches — a
+// termination guard that shared a code path with the property under test would
+// stop guarding at exactly the moment it was needed (../schedtimer paid for that
+// lesson once already). A lost wake therefore prints `woke false` after three
+// seconds and the golden diff reports it.
+//
+// Linux-only by construction, hence the sibling `linux-only` marker: it binds
+// runtime/park/linux, whose clock and sleep are raw `syscall`s (SPEC §11.8), a
+// form Darwin rejects even when uncalled. Kept identical in shape to its Darwin
+// twin so a divergence between the two means a real platform difference.
+
+import { schedInit, schedWorkerAt, schedWorkerStepNow, workerStepStop, WORKER_MAX_STEPS } from "../../../runtime/sched"
+import { schedSleepUntil, schedTaskInit, schedRegister, schedSpawn, schedShutdown, schedTaskExit } from "../../../runtime/sched"
+import { schedStackAligned, schedStackBytes, taskAt } from "../../../runtime/sched"
+import { parkMinBackoffNs } from "../../../runtime/park"
+import { parkMonoNs } from "../../../runtime/park/linux"
+
+// One worker: the timer queue is scheduler-wide, and a second worker would add
+// an OS thread without adding a property.
+const wakeWorkers: int = 1
+
+// Long enough that "woke immediately" and "slept" are distinguishable on any
+// machine, short enough that the suite does not notice. `../../../examples/timers`
+// uses 30ms for the same reason.
+const sleepNs: int = 20000000
+
+// The give-up. Generous next to a 20ms sleep and finite, so a lost wake costs
+// three seconds and a verdict rather than the whole suite.
+const giveUpNs: int = 3000000000
+
+let schedBlock: [16]i64
+let workerBlocks: [292]i64
+
+// 64KiB usable inside a 128KiB region, so a 64KiB-aligned base exists whatever
+// address the linker picks (module arrays are only 8-byte aligned, #1421).
+let stackArea: [16384]i64
+let liveTask: [32]i64
+
+// Written by the sleeping task, read by the driver. Untraced module state
+// (§11.11) because the collector must never walk it.
+let obsWoke: i64 = 0
+let addrWoke: i64 = 0
+let addrSched: i64 = 0
+let deadlineNs: i64 = 0
+
+// The sleeping task. `@nosplit` because a green task's stack is reached by the
+// conservative scan rather than by a published safepoint frame — still true for
+// every task body in the tree. `ptrOf` is rejected inside a `@nosplit` body
+// (#1421), so every address it needs is resolved on an ordinary thread by `main`
+// and carried here as an integer, the workaround every scheduler stress program
+// uses.
+//
+// The store after the sleep is the whole point: it is reached ONLY if the timer
+// queue woke this task and the worker resumed it.
+@nosplit function sleeperBody() {
+  schedSleepUntil(int(deadlineNs))
+  atomicStore(taskAt(addrWoke), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+function main() {
+  let s = taskAt(int(ptrOf(schedBlock)))
+  schedInit(s, int(ptrOf(workerBlocks)), wakeWorkers)
+  addrWoke = int(ptrOf(obsWoke))
+  addrSched = int(ptrOf(schedBlock))
+
+  let base = int(ptrOf(stackArea))
+  let bumped = base + schedStackBytes - 1
+  let stackBase = bumped - bumped % schedStackBytes
+  let aligned = schedStackAligned(stackBase)
+
+  // The deadline is computed HERE, on the real clock, before the task can run —
+  // `bit_rt_time_sleep_ns`'s own shape, where the caller adds `ns` to
+  // `parkMonoNs()` because `schedSleepUntil` has no clock of its own.
+  let t0 = parkMonoNs()
+  deadlineNs = t0 + sleepNs
+
+  let live = taskAt(int(ptrOf(liveTask)))
+  schedTaskInit(live, stackBase, schedStackBytes, entryOf(sleeperBody), 0)
+  schedRegister(s, int(ptrOf(liveTask)))
+  schedSpawn(s, int(ptrOf(liveTask)))
+
+  // `runtime/root/linux`'s `workerBody` verbatim, minus the done-word store.
+  let w = schedWorkerAt(s, 0)
+  let backoff = parkMinBackoffNs
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    n = n + 1
+    backoff = schedWorkerStepNow(w, parkMonoNs(), backoff)
+    if (backoff == workerStepStop) {
+      break
+    }
+    if (parkMonoNs() - t0 > giveUpNs) {
+      schedShutdown(s)
+    }
+  }
+  let elapsed = parkMonoNs() - t0
+
+  // `woke` is the load-bearing bit; `slept` and `prompt` bracket it from both
+  // sides, because a clock that is wrong in the other direction — anything that
+  // makes every deadline look already due — would wake the task at once and pass
+  // a test that only asked whether it woke at all.
+  let woke = int(obsWoke) != 0
+  println("stack ${aligned}")
+  println("woke ${woke}")
+  println("slept ${elapsed >= sleepNs}")
+  println("prompt ${elapsed < giveUpNs}")
+}

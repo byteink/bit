@@ -289,21 +289,33 @@ function schedFindWorkIdle(w: *i64, nowFn: () => int,
   return 0
 }
 
-// `schedFindWorkIdle` with the no-timer/no-poller seam FOLDED IN: `schedNoTimers`
-// is a clock frozen at 0 and `schedNoPoller` drains nothing, so the two probes
-// reduce to a timer expiry against now == 0 and no poll at all. Behaviourally
-// identical to `schedFindWorkIdle(w, schedNoTimers, schedNoPoller)`.
+// `schedFindWorkIdle` with the POLLER seam folded out but the CLOCK still a
+// parameter: the timer probe runs against the `now` the caller read, and no poll
+// happens at all. Behaviourally identical to `schedFindWorkIdle(w, <that clock>,
+// schedNoPoller)`.
 //
-// Written out instead of passing the pair because a function VALUE is a heap
-// cell (§11.10) and the runtime's own boot module must emit `--freestanding`
-// (§17.6) — see `schedWorkerRunBare`, its only caller.
-function schedFindWorkBare(w: *i64): int {
+// Written out instead of passing the pair because a function VALUE is a heap cell
+// (§11.10) and the runtime's own boot module must emit `--freestanding` (§17.6)
+// — see `schedWorkerStepNow`, its only caller.
+//
+// THE CLOCK USED TO BE FOLDED OUT TOO, AND THAT WAS #1648. The timer probe read
+// `schedTimerExpire(s, 0)` — `schedNoTimers` — because the boot path was
+// described as the "no-timer/no-poller configuration". But it DOES use timers:
+// `runtime/root/<os>`'s `bit_rt_time_sleep_ns` parks the calling task on
+// `schedSleepUntil` with a deadline of `parkMonoNs() + ns`, which is a large
+// positive number and therefore never `<= 0`. Against a Bit-sourced `libbitrt.a`
+// a three-line `println/sleep(30ms)/println` printed its first line and hung
+// forever: the only task in the process was on the timer list, and the only
+// worker asked "is anything due at time 0?" a billion times. The clock is a
+// parameter here so that this cannot be reintroduced by folding a seam away —
+// there is no longer any find-work path in this file that invents a time.
+function schedFindWorkAt(w: *i64, now: int): int {
   let addr = schedFindWork(w)
   if (addr != 0) {
     return addr
   }
   let s = taskAt(*(w + wkSched))
-  if (schedTimerExpire(s, 0) > 0) {
+  if (schedTimerExpire(s, now) > 0) {
     let t = gqPop(s + scGlobal)
     if (t != 0) {
       return t
@@ -317,9 +329,11 @@ function schedFindWorkBare(w: *i64): int {
 //
 // They are named for what they DISABLE, not for what they return, because the
 // dangerous mistake is passing `schedNoTimers` to a scheduler that does use
-// `schedSleepUntil`: a clock frozen at 0 makes every deadline look expired, so
-// every sleeper would wake on the first idle pass instead of on time. A consumer
-// with timers must pass a real monotonic clock (`runtime/park`'s `parkMonoNs`).
+// `schedSleepUntil`: a deadline is `parkMonoNs() + ns`, so against a clock frozen
+// at 0 NOTHING is ever due and every sleeper parks forever. That is #1648, and it
+// is why the runtime's own boot path no longer takes this pair — see
+// `schedWorkerStepNow`. A consumer with timers must pass a real monotonic clock
+// (`runtime/park`'s `parkMonoNs`).
 export @nosplit function schedNoTimers(): int {
   return 0
 }
@@ -381,7 +395,10 @@ export @nosplit function schedNoPoller(schedAddr: int, timeoutMs: int): int {
 // termination is provable by READING the loop rather than by trusting that some
 // other thread will eventually set a flag. A worker that exhausts it returns,
 // which degrades a wedged scheduler into a finishing one instead of a hung one.
-const WORKER_MAX_STEPS: int = 1000000000
+//
+// Exported because the runtime's own boot path drives the loop itself — see
+// `schedWorkerStepNow` — and must carry the SAME bound rather than invent one.
+export const WORKER_MAX_STEPS: int = 1000000000
 
 // Put a runnable task back on a queue: this worker's local ring for locality,
 // spilling to the global queue when the ring is full. Both places the run loop
@@ -397,15 +414,18 @@ const WORKER_MAX_STEPS: int = 1000000000
 // The value `schedWorkerStep` returns in place of a backoff to say "leave the
 // loop": shutdown has been signalled and no work remains. Distinguishable from
 // every real backoff because a backoff is always positive (`parkMinBackoffNs`).
-const workerStepStop: int = -1
+//
+// Exported for the same reason `WORKER_MAX_STEPS` is: `schedWorkerStepNow`'s
+// caller owns the loop and has to recognise the sentinel it returns.
+export const workerStepStop: int = -1
 
 // ONE TURN of the run loop, given the task `addr` the caller's find-work step
 // produced (0 = none) and the current `backoff`. Returns the next backoff, or
 // `workerStepStop` when the worker must return.
 //
 // Split out of `schedWorkerRun` so the two find-work seams — the function-value
-// one and the seam-free `schedWorkerRunBare` below — share this body verbatim
-// rather than keeping a copy each that could drift. Everything here is
+// one and `schedWorkerStepNow`'s poller-free one below — share this body
+// verbatim rather than keeping a copy each that could drift. Everything here is
 // independent of how `addr` was found.
 function schedWorkerStep(w: *i64, s: *i64, addr: int, backoff: int): int {
   if (addr == 0) {
@@ -503,26 +523,31 @@ export function schedWorkerRun(w: *i64, nowFn: () => int,
   }
 }
 
-// `schedWorkerRun` with the no-timer/no-poller seam SPELLED OUT rather than
-// passed: behaviourally identical to `schedWorkerRun(w, schedNoTimers,
-// schedNoPoller)`, which is what every seam-free consumer passes today.
+// ONE WHOLE TURN of `schedWorkerRun` — find work, then run it — for a caller that
+// owns the `while` itself. Returns the next backoff, or `workerStepStop` when the
+// worker must leave the loop.
 //
 // It exists because a function VALUE is a `(code, env)` cell on the managed heap
 // (§11.10), so a module that builds one needs a `TypeInfo` descriptor and can no
 // longer be emitted `--freestanding` (§17.6) — and the runtime's own boot path
 // (`runtime/root/<os>`'s `workerBody`) is precisely a module that must be. The
-// seam-carrying form above stays for consumers that do drive timers or I/O.
-export @symbol("bit_rt_port_sched_worker_run_bare") function schedWorkerRunBare(w: *i64) {
+// seam-carrying form above stays for consumers that do drive I/O.
+//
+// THE CLOCK IS THE CALLER'S, AND IT IS NOT OPTIONAL. `now` must be the SAME
+// monotonic clock in nanoseconds that the consumer's `bit_rt_time_sleep_ns`
+// computes its deadlines against (`runtime/park`'s `parkMonoNs` for both boot
+// providers). This used to be a `schedWorkerRunBare` that folded the clock away
+// to a constant 0, which parked every sleeper forever — #1648. A caller that has
+// no clock at all and genuinely runs no timers still has `schedWorkerRun(w,
+// schedNoTimers, schedNoPoller)`; the runtime's boot path is not such a caller.
+//
+// `now` is read by the caller once per turn rather than lazily on the idle path
+// only. That is one extra clock read per task dispatch, which is nanoseconds
+// against a context switch, and it buys the property that no code path in this
+// file can invent a time — the shape the bug came in through.
+export @symbol("bit_rt_port_sched_worker_step_now") function schedWorkerStepNow(w: *i64, now: int, backoff: int): int {
   let s = taskAt(*(w + wkSched))
-  let backoff = parkMinBackoffNs
-  let n = 0
-  while (n < WORKER_MAX_STEPS) {
-    n = n + 1
-    backoff = schedWorkerStep(w, s, schedFindWorkBare(w), backoff)
-    if (backoff == workerStepStop) {
-      return
-    }
-  }
+  return schedWorkerStep(w, s, schedFindWorkAt(w, now), backoff)
 }
 
 // ---------------------------------------------------------------------------
