@@ -1,0 +1,132 @@
+// The worker-pool start/join composition (#1607), driven WITHOUT real OS threads
+// so the LOGIC is checked deterministically on every host and both compilers.
+//
+// Its siblings ../threadpoollinux and ../threadpooldarwin run the same primitive
+// on two genuine OS threads; that is where the composition is proven end to end.
+// This program isolates the parts a real-thread run cannot check without racing:
+//
+//   - `schedStart` arms every started worker's `done` word, records each spawn's
+//     handle, and fills the two-word argument block with the worker address;
+//   - `schedStart` returns the number actually started, and STOPS at the first
+//     failed spawn (the started-count is a PREFIX, so a later reaper knows the
+//     exact set that came up);
+//   - `schedJoin` reaps only `[0, started)` — the started-only reap set — and
+//     touches no `done` word or handle for a worker that never ran.
+//
+// The OS thread is replaced by an in-process fake: `fakeStart` clears the `done`
+// word itself (as a completed worker's teardown would) and hands back a distinct
+// handle, so `schedJoin` -> `threadJoin` observes done == 0 on its first look and
+// returns without a real thread ever existing. Nothing here spawns a green task
+// or allocates on the heap, so it is declared `no-collect`.
+
+import { schedInit, schedWorkerAt, taskAt } from "../../../runtime/sched"
+import { schedStart, schedJoin } from "../../../runtime/thread"
+
+const kWorkers: int = 4
+
+// A value that is neither 0 (a finished worker) nor `threadRunning` (1, an armed
+// one), so a poisoned slot the reaper must not touch is unmistakable if it does.
+const POISON: int = 1515870810   // 0x5A5A5A5A
+
+let workerBlocks: [1168]i64      // kWorkers * workerWords(292)
+let schedBlock: [16]i64
+let argArea: [8]i64              // kWorkers * argWords(2)
+let doneWords: [4]i32
+let handles: [4]i64
+
+// Spawn counter, so each fake spawn returns a distinct nonzero handle and the
+// failing variant can fail on a chosen call. Single-threaded, so a plain var.
+let spawnSeen: i64 = 0
+
+// The entry address handed to `schedStart`; the fakes ignore it, but a real
+// `threadStart` would branch to it, so it must be a valid `entryOf`.
+function dummyBody(arg: *byte): *byte {
+  return nil
+}
+
+// A spawn that always succeeds: clear the done word (a finished worker's
+// teardown) and return a distinct handle.
+function fakeStart(entry: *byte, arg: *byte, done: *i32): int {
+  spawnSeen = spawnSeen + 1
+  atomicStore(done, i32(0))
+  return 100 + spawnSeen
+}
+
+// A spawn that fails on its SECOND call, to prove `schedStart` returns the
+// prefix count and stops.
+function fakeStartFailSecond(entry: *byte, arg: *byte, done: *i32): int {
+  spawnSeen = spawnSeen + 1
+  if (spawnSeen == 2) {
+    return 0
+  }
+  atomicStore(done, i32(0))
+  return 100 + spawnSeen
+}
+
+function fakeRelease(h: int): bool {
+  return h != 0
+}
+
+// `schedJoin` only reaches these when a done word is still nonzero; the fakes
+// clear it first, so they are never actually called. They exist to type the
+// join's clock seam. No-ops are safe precisely because they are unreached.
+function fakeSleep(ns: int) {}
+function fakeMono(): int {
+  return 0
+}
+
+function main() {
+  let s = taskAt(int(ptrOf(schedBlock)))
+  schedInit(s, int(ptrOf(workerBlocks)), kWorkers)
+
+  let dones: *i32 = ptrOf(doneWords)
+  let hs: *i64 = ptrOf(handles)
+  let args: *i64 = ptrOf(argArea)
+
+  // Poison the two slots that will NOT be started. A correct reaper leaves them.
+  *(dones + 2) = i32(POISON)
+  *(dones + 3) = i32(POISON)
+  *(hs + 2) = POISON
+  *(hs + 3) = POISON
+
+  // Bring up 2 of the 4 workers.
+  spawnSeen = 0
+  let started = schedStart(s, 2, entryOf(dummyBody), args, dones, hs, fakeStart)
+
+  // `schedStart` postconditions: count, recorded handles, filled arg blocks
+  // (worker address in word 0, done-word address in word 1), armed-then-cleared
+  // done words.
+  let okStart = started == 2 &&
+    int(*hs) == 101 && int(*(hs + 1)) == 102 &&
+    *args == int(schedWorkerAt(s, 0)) && *(args + 2) == int(schedWorkerAt(s, 1)) &&
+    *(args + 1) == int(dones) && *(args + 3) == int(dones + 1) &&
+    int(*dones) == 0 && int(*(dones + 1)) == 0
+
+  // Reap exactly the started set.
+  let joined = schedJoin(2, dones, hs, 1000, fakeSleep, fakeMono, fakeRelease)
+
+  // The started-only property: the un-started slots are untouched.
+  let untouched = int(*(dones + 2)) == POISON && int(*(dones + 3)) == POISON &&
+    *(hs + 2) == POISON && *(hs + 3) == POISON
+
+  // A failing spawn on the second worker: the returned count is the prefix that
+  // came up (1), not the requested 3.
+  spawnSeen = 0
+  let startedPrefix = schedStart(s, 3, entryOf(dummyBody), args, dones, hs, fakeStartFailSecond)
+  let okPrefix = startedPrefix == 1 && int(*hs) == 101 && *(hs + 1) == 0
+
+  let mask = 0
+  if (okStart) {
+    mask = mask | 1
+  }
+  if (joined) {
+    mask = mask | 2
+  }
+  if (untouched) {
+    mask = mask | 4
+  }
+  if (okPrefix) {
+    mask = mask | 8
+  }
+  print("${mask} 15\n")
+}

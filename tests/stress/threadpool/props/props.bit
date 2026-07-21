@@ -1,0 +1,186 @@
+// The end-to-end worker-pool bring-up/tear-down property (#1607), shared by the
+// two real-OS-thread drivers ../../threadpoollinux and ../../threadpooldarwin.
+//
+// The neutral ../../threadpool program checks `schedStart`/`schedJoin`'s LOGIC
+// with in-process fakes. This half proves the composition on GENUINE OS threads:
+// `schedStart` brings up two workers, each entering `schedWorkerRun` on its own
+// thread; the workers drain a set of green tasks that hammer one shared atomic
+// counter; and `schedJoin` reaps both cleanly after `schedShutdown`. The verdict
+// is the classic pair — every increment landed (nothing lost to a start that
+// raced its work), and the registry is empty once both threads are joined
+// (every task was unregistered at teardown, so nothing leaked).
+//
+// Kept identical in shape between the two platform drivers so a divergence
+// between them signals a real platform difference rather than a spelling one.
+
+import { schedInit, schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller } from "../../../../runtime/sched"
+import { schedShutdown, schedRegister, schedTaskInit, schedTaskExit, taskAt } from "../../../../runtime/sched"
+import { schedStackBytes, schedStackAligned, dqPushBottom, wkDeque } from "../../../../runtime/sched"
+import { workerWords, schedRegCount } from "../../../../runtime/sched"
+import { parkMinBackoffNs } from "../../../../runtime/park"
+
+// Two workers is the minimum M:N startup — the parallel-registration race the
+// primitive has to survive needs at least a second thread to be real.
+export const poolWorkers: int = 2
+
+// More tasks than workers, so both workers provably take work and neither drains
+// the whole set alone. The per-task count is kept small: under BIT_GC=stress
+// every loop back-edge is a full collection, so a tight million-iteration body
+// would turn this into a multi-minute run for no extra coverage.
+const nTasks: int = 6
+const perTask: int = 1000
+export const workTotal: int = 6000   // nTasks * perTask
+
+// Six 64KiB task stacks plus a 64KiB alignment slack (a module array is only
+// 8-byte aligned, #1421, so an aligned base is taken rather than assumed).
+let stackArea: [57344]i64
+let taskBlocks: [192]i64              // nTasks * 32
+let workerBlocks: [584]i64            // poolWorkers * workerWords
+let schedBlock: [16]i64
+
+// The one shared counter, written from green tasks on BOTH OS threads, so every
+// update is atomic. Module state is untraced and statically allocated (§11.11),
+// which is required: the collector must never walk it.
+let obsCount: i64 = 0
+
+// Addresses resolved once on an ordinary thread — `ptrOf` is rejected inside a
+// `@nosplit` body (#1421), and the task body below is `@nosplit`.
+let addrCount: i64 = 0
+
+@nosplit function alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+export function poolSchedAddr(): int {
+  return int(ptrOf(schedBlock))
+}
+
+export function poolWorkerAddr(i: int): int {
+  return int(ptrOf(workerBlocks)) + i * workerWords * 8
+}
+
+function taskAddrOf(i: int): int {
+  return int(ptrOf(taskBlocks)) + i * 32 * 8
+}
+
+function stackBaseOf(i: int): int {
+  return alignUpStack(int(ptrOf(stackArea))) + i * schedStackBytes
+}
+
+// `@nosplit` because a task stack is not known to the collector, and because
+// more than one OS thread is live — see `schedWorkerRun`'s comment on why the
+// whole pool is `@nosplit` today.
+@nosplit function workBody() {
+  let c = taskAt(addrCount)
+  let i = 0
+  while (i < perTask) {
+    atomicAdd(c, 1)
+    i = i + 1
+  }
+  schedTaskExit()
+}
+
+// Build the scheduler and every task, spreading the tasks across both workers'
+// local rings so the two OS threads start with work of their own.
+export function poolInit(): bool {
+  addrCount = int(ptrOf(obsCount))
+  obsCount = 0
+
+  let s = taskAt(poolSchedAddr())
+  schedInit(s, int(ptrOf(workerBlocks)), poolWorkers)
+
+  if (!schedStackAligned(stackBaseOf(0))) {
+    return false
+  }
+
+  let i = 0
+  while (i < nTasks) {
+    let t = taskAt(taskAddrOf(i))
+    schedTaskInit(t, stackBaseOf(i), schedStackBytes, entryOf(workBody), i)
+    schedRegister(s, taskAddrOf(i))
+    if (!dqPushBottom(schedWorkerAt(s, i % poolWorkers) + wkDeque, taskAddrOf(i))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+export function poolShutdown() {
+  schedShutdown(taskAt(poolSchedAddr()))
+}
+
+export function poolCount(): int {
+  return int(atomicLoad(ptrOf(obsCount)))
+}
+
+export function poolAllCounted(): bool {
+  return poolCount() == workTotal
+}
+
+// The OS thread body for a worker. NOT `@nosplit`, which is safe only because it
+// contains no loop — `schedWorkerRun` owns the loop and is itself `@nosplit`, so
+// no safepoint is reached on this thread before it registers as a worker. Same
+// argument runtime/thread's own providers make for their children.
+//
+// `arg` points at the two-word block `schedStart` filled: the worker's address,
+// then the `done` word to clear on the way out (mandatory on Darwin, harmless on
+// Linux where the kernel clears it too).
+export function poolWorkerEntry(arg: *byte): *byte {
+  let block = taskAt(int(arg))
+  let workerAddr = *block
+  let doneAddr = *(block + 1)
+
+  schedWorkerRun(taskAt(workerAddr), schedNoTimers, schedNoPoller)
+
+  let z: *i32 = nil
+  atomicStore(z + doneAddr / 4, i32(0))
+  return nil
+}
+
+// ---------------------------------------------------------------------------
+// The verdict
+// ---------------------------------------------------------------------------
+//
+//   1  every increment landed — no work was lost to a worker that started
+//      before its task was placed
+//   2  the registry is empty once both threads are joined — every task was
+//      unregistered at its `taskDone` teardown, so the pool left nothing behind
+//
+// Bit 2 is read only after BOTH threads are joined (the driver enforces that
+// ordering), so the count it checks cannot race a worker still tearing a task
+// down.
+export const poolTotal: int = 3
+
+export function poolVerdict(): int {
+  let mask = 0
+  if (poolAllCounted()) {
+    mask = mask | 1
+  }
+  if (schedRegCount(taskAt(poolSchedAddr())) == 0) {
+    mask = mask | 2
+  }
+  return mask
+}
+
+// A finite wait on the counter reaching its total — a deadline plus a static
+// trip bound, `runtime/thread`'s `threadJoin` pattern, so a wedged run fails the
+// suite instead of hanging it.
+const WAIT_MAX_POLLS: int = 100000000
+
+export function poolWaitCounted(sleepFn: (int) => (), monoFn: () => int, timeoutNs: int): bool {
+  let deadline = monoFn() + timeoutNs
+  let i = 0
+  while (i < WAIT_MAX_POLLS) {
+    if (poolAllCounted()) {
+      return true
+    }
+    if (monoFn() >= deadline) {
+      return false
+    }
+    sleepFn(parkMinBackoffNs)
+    i = i + 1
+  }
+  return false
+}

@@ -1,0 +1,184 @@
+// Bringing a scheduler's worker pool UP and DOWN on real OS threads: the
+// `Scheduler.start()`/`.join()` composition (#1607). Sibling of `thread.bit`, so
+// the same module — it reaches `threadJoin`/`threadRunning`/`threadJoinDone`
+// with no import.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS OWNS, AND WHY IT LIVES HERE RATHER THAN IN runtime/sched
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched` already exports every PIECE — `schedInit`, `schedSpawn`,
+// `schedWorkerRun`, `schedWorkerAt`, `schedShutdown` — and `runtime/thread`
+// exports `threadStart`/`threadJoin`/`threadRelease`. What did not exist as
+// callable runtime Bit is the loop that COMPOSES them: iterate the worker array,
+// spawn one OS thread per worker each entering `schedWorkerRun`, then reap
+// exactly the threads that were started. That glue lived only inside stress
+// drivers (`tests/stress/chanracelinux`, `tests/stress/schedpoollinux`,
+// `tests/stress/thread/props`); `Scheduler.start` (sched.zig:966+) and `.join`
+// (sched.zig:1283) are its Zig originals. This file is that loop and nothing
+// more — no run-queue, work-stealing, context-switch or park decision, which are
+// already ported in `runtime/sched`.
+//
+// It lives on runtime/thread's consumer side (one of the three homes #1607
+// names) rather than in runtime/sched for a concrete reason: `schedJoin` reaps
+// through `threadJoin`, and `runtime/sched` may not CALL `threadJoin` and stay
+// freestanding-emittable. A freestanding module can reference a cross-module
+// runtime function only by a stable `@symbol` name, but `threadJoin` takes
+// function-value parameters (`sleepFn`/`monoFn`), which `@symbol` refuses (E0079:
+// "the C ABI has no representation for a GC-managed Bit value"). So the reaper
+// belongs in `threadJoin`'s own module, where the call is same-module and needs
+// no pin. `schedStart` reaches `runtime/sched` only through the two CONSTS that
+// describe the worker array's layout — `scWorkers`, `workerWords` — which inline
+// as compile-time values and so keep this file freestanding-emittable too.
+//
+// ---------------------------------------------------------------------------
+// THE BOOT CONTRACT (#1608 sequences against this)
+// ---------------------------------------------------------------------------
+//
+// PRECONDITION of `schedStart`: the scheduler is fully populated on the calling
+// (boot) thread BEFORE any worker thread exists:
+//
+//   - the heap and collector are up (boot owns that step, not this one), and
+//   - `schedInit(s, workersAddr, n)` has run, so every worker block AND its
+//     deque are initialized, and
+//   - every initial task has been placed and registered (`schedSpawn`, or the
+//     `schedRegister` + `dqPushBottom` pair the stress harnesses use), so no
+//     worker can ever steal a task that is not yet on the registry.
+//
+// That ordering is why there is no register-before-steal race to manage HERE:
+// `schedInit` publishes every deque synchronously on one thread before
+// `schedStart` creates the first OS thread, so a worker that steals on its very
+// first `schedFindWork` reads a deque built happens-before its thread existed.
+// The register-before-steal invariant is the CALLER's (populate fully, THEN
+// start); `schedStart` enforces the "then" by being the only thing that makes a
+// worker runnable on hardware.
+//
+// POSTCONDITION of `schedStart`: it returns the number of workers actually
+// brought up (== `n` on success). Each started worker runs `schedWorkerRun` on
+// its own OS thread and will drive green tasks until `schedShutdown(s)` is
+// signalled and no work remains. The scheduler is ready to run the first green
+// thread the instant the first worker is up.
+//
+// `schedJoin` WAITS ON every started worker's `done` word reaching 0, which
+// `runtime/thread`'s contract guarantees means the worker has left
+// `schedWorkerRun` for good. It returns only once every started thread has both
+// joined and released, so a caller that has called `schedShutdown` then
+// `schedJoin` knows no worker still touches scheduler or task state — the
+// precondition for reading a final verdict or tearing the heap down.
+//
+// ---------------------------------------------------------------------------
+// THE STARTED-ONLY REAP SET
+// ---------------------------------------------------------------------------
+//
+// `schedJoin` is driven by the COUNT `schedStart` returned, not by the size of
+// the worker array. A caller may hold an array of `k` workers and bring up only
+// `n < k` of them (or `schedStart` may stop early at the first spawn failure);
+// either way `join` must touch exactly the threads that were started and must
+// not read a `done` word or handle for a worker that never ran. Mirroring
+// `Scheduler.join`'s "reap only what `start` spawned", the returned count is
+// that set, and `schedJoin` walks `[0, started)` and no further.
+//
+// ---------------------------------------------------------------------------
+// THE WORKER ENTRY IS CONSUMER-PROVIDED, BY NECESSITY
+// ---------------------------------------------------------------------------
+//
+// `entry` is `entryOf(f)` for a worker body the CONSUMER declares — the shape
+// `raceWorkerEntry`/`poolWorkerEntry` already have. This module cannot supply a
+// generic one, and the reason is structural: a worker body calls
+// `schedWorkerRun(w, nowFn, pollFn)`, and its `nowFn`/`pollFn` are the platform
+// clock and poller. A child thread receives only a `*byte` argument, so it
+// cannot be handed those as function values — it must NAME them, which a
+// pure-scheduler embedding does as `schedNoTimers`/`schedNoPoller` and a
+// consumer with I/O does as `parkMonoNs`/`pollDrain`. Materialising a function
+// value that way also allocates a closure on the managed heap, which is exactly
+// what a freestanding module may not do. So the entry stays where the seam is
+// chosen, and this file only spawns and reaps it. The entry MUST unpack the
+// two-word argument block below and clear its `done` word on the way out.
+//
+// ---------------------------------------------------------------------------
+// THE PLATFORM SEAM
+// ---------------------------------------------------------------------------
+//
+// `threadStart`/`threadRelease` reach the OS through `syscall` (Linux) or
+// `extern` (Darwin), which §11.7/§11.8 reject even as an uncalled declaration in
+// the wrong module — so this file, like the scheduler core, imports NEITHER
+// provider and takes the two as function VALUES (`startFn`/`releaseFn`). The
+// consumer binds its platform's pair. `threadJoin` is platform-free (same
+// module), so it is called directly, and `sleepFn`/`monoFn` are the clock pair
+// it needs (`runtime/park`'s `parkSleepNs`/`parkMonoNs`).
+
+import { scWorkers, workerWords } from "../sched"
+
+// The per-worker argument block is two words — {worker address, done-word
+// address} — the shape a worker entry unpacks from its `*byte` argument.
+const argWords: int = 2
+
+// Bring up `n` OS worker threads, one per worker block `[0, n)`, each entering
+// `entry` on its own OS thread. Returns the number actually started: `n` on
+// success, or the index of the first failed spawn (so `[0, that)` are up).
+//
+// The three caller-owned areas are each sized for `n` and filled/armed here:
+//   argArea   `n` blocks of `argWords` i64 — {worker address, done-word address}
+//   doneArea  `n` i32 done words — each armed to `threadRunning`
+//   handles   `n` i64 handle slots — each spawn's handle, for `schedJoin`
+//
+// `entry` is `entryOf(workerBody)` (see the header). `startFn` is the platform
+// `threadStart`.
+//
+// NOT `@nosplit`: this runs on the boot/parent thread, an ordinary registered
+// thread that may allocate and reach safepoints. Only the CHILD is constrained,
+// and that constraint is on `entry`, not on this.
+export function schedStart(s: *i64, n: int, entry: *byte,
+                           argArea: *i64, doneArea: *i32, handles: *i64,
+                           startFn: (*byte, *byte, *i32) => int): int {
+  let workersBase = *(s + scWorkers)
+  let bp: *byte = nil
+  let i = 0
+  while (i < n) {
+    let block = argArea + i * argWords
+    // The worker block's address — `schedWorkerAt(s, i)` computed inline off the
+    // layout consts, so no cross-module call breaks a freestanding emit.
+    *block = workersBase + i * workerWords * 8
+    let done = doneArea + i
+    *(block + 1) = int(done)
+
+    // Arm the done word BEFORE the thread can clear it, so a later join that
+    // observes 0 always means the worker finished rather than never started.
+    atomicStore(done, i32(threadRunning))
+    let h = startFn(entry, bp + int(block), done)
+    *(handles + i) = h
+    if (h == 0) {
+      return i
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Reap the `started` workers `schedStart` brought up: join each on its done word
+// (bounded by `timeoutNs`, `threadJoin`'s deadline+trip-bound contract), then
+// release its handle. Returns true only if every started thread both joined and
+// released.
+//
+// Walks `[0, started)` and touches no slot beyond it — the started-only reap set
+// (see the header). The caller signals `schedShutdown(s)` first; without it the
+// workers never leave `schedWorkerRun` and every join spends its full timeout.
+//
+// `sleepFn`/`monoFn` are the platform clock pair `threadJoin` needs; `releaseFn`
+// is the platform `threadRelease`. NOT `@nosplit`, same reason as `schedStart`.
+export function schedJoin(started: int, doneArea: *i32, handles: *i64,
+                          timeoutNs: int, sleepFn: (int) => (),
+                          monoFn: () => int, releaseFn: (int) => bool): bool {
+  let ok = true
+  let i = 0
+  while (i < started) {
+    if (threadJoin(doneArea + i, timeoutNs, sleepFn, monoFn) != threadJoinDone) {
+      ok = false
+    }
+    if (!releaseFn(*(handles + i))) {
+      ok = false
+    }
+    i = i + 1
+  }
+  return ok
+}
