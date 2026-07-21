@@ -3084,8 +3084,8 @@ test "global_addr on a .thread global emits the local-exec TLS sequence, not an 
     var module = ir.Module.init(gpa, &ctx);
     defer module.deinit();
     // `addGlobal` takes ownership of both slices, so they must be heap-owned.
-    const proc = try module.addGlobal(try gpa.dupe(u8, "p"), try gpa.dupe(u8, &[_]u8{0} ** 8), 8, .process);
-    const thr = try module.addGlobal(try gpa.dupe(u8, "t"), try gpa.dupe(u8, &[_]u8{0} ** 8), 8, .thread);
+    const proc = try module.addGlobal(try gpa.dupe(u8, "p"), try gpa.dupe(u8, &[_]u8{0} ** 8), 8, .process, true);
+    const thr = try module.addGlobal(try gpa.dupe(u8, "t"), try gpa.dupe(u8, &[_]u8{0} ** 8), 8, .thread, true);
 
     for ([_]struct { g: ir.GlobalId, tls: bool }{
         .{ .g = proc, .tls = false },

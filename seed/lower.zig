@@ -466,7 +466,7 @@ pub const Lowerer = struct {
                         const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = sid };
                         const name = try std.fmt.allocPrint(gpa, "__bitg_{d}_{s}", .{ mi, identTextOf(mf, pat) });
                         const bytes = try globalImage(gpa, self.ctx, ty, init);
-                        const id = try self.out.addGlobal(name, bytes, module_state_align, storage);
+                        const id = try self.out.addGlobal(name, bytes, module_state_align, storage, gsym.module == self.root);
                         try self.global_ids.put(gpa, gsym.pack(), id);
                     }
                 }
@@ -506,7 +506,7 @@ pub const Lowerer = struct {
                         }
                         const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = sid };
                         const name = try std.fmt.allocPrint(gpa, "__bitc_{d}_{s}", .{ mi, identTextOf(mf, pat) });
-                        const id = try self.out.addGlobal(name, bytes, module_state_align, .readonly);
+                        const id = try self.out.addGlobal(name, bytes, module_state_align, .readonly, gsym.module == self.root);
                         try self.global_ids.put(gpa, gsym.pack(), id);
                     }
                 }
@@ -601,7 +601,12 @@ pub const Lowerer = struct {
         const sym = self.symbolOf(gsym);
         const template_shape = self.ctx.func_sigs.get(gsym.pack()) orelse return error.UnsupportedConstruct;
         const shape = if (gen_env.len > 0) try self.ctx.substFuncShape(template_shape, gen_env) else template_shape;
-        return self.lowerFunctionDecl(sym.file_idx, sym.decl, shape, gen_env, name);
+        var f = try self.lowerFunctionDecl(sym.file_idx, sym.decl, shape, gen_env, name);
+        // §11.9/§17.6: recorded here rather than in `lowerFunctionDecl`, which
+        // also serves methods (never pinnable) and has no `GlobalSymbol` to look
+        // the attribute up by. See `ir.Function.is_pinned` (#1631).
+        f.is_pinned = if (self.ctx.func_attrs.get(gsym.pack())) |fa| fa.symbol != null else false;
+        return f;
     }
 
     /// Lowers one function/method body given its resolved `shape` directly, so

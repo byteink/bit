@@ -582,6 +582,10 @@ fn rebuild(gpa: Allocator, f: *const ir.Function, known: []const ?ConstVal, bloc
     // precedent is that a rebuild silently zeroing a flag is dead code nobody
     // notices. `test "opt: the freestanding module tag survives -O1"` gates it.
     out.in_root_module = f.in_root_module;
+    // §11.9: and the pin flag, which decides the symbol's BINDING in a
+    // freestanding object (#1631). Also defaults to `false`, so losing it here
+    // makes a runtime entry point local and fails the link loudly.
+    out.is_pinned = f.is_pinned;
     return out;
 }
 
@@ -755,17 +759,58 @@ const max_inline_insts = 8;
 /// self-recursion — this pass never re-inlines its own splice output, so an
 /// unguarded self-call would still just be one level, but excluding it keeps
 /// "small function inlining" from ever touching recursive functions at all).
+///
+/// It must also not carry another module's MODULE STATE into this one — see
+/// `importsForeignState` (#1630).
 fn inlineEligible(module: *const ir.Module, caller_id: ir.FuncId, callee_id: ir.FuncId) ?*const ir.Function {
     if (@intFromEnum(caller_id) == @intFromEnum(callee_id)) return null;
     const g = module.func(callee_id);
     if (g.blocks.len != 1) return null;
     if (g.is_fallible) return null;
+    if (importsForeignState(module, module.func(caller_id), g)) return null;
     const b = g.blocks[0];
     const term_idx = b.insts_start + b.insts_len - 1;
     if (g.insts.items(.op)[term_idx] != .ret) return null;
     const body_len = b.insts_len - b.param_count - 1;
     if (body_len > max_inline_insts) return null;
     return g;
+}
+
+/// True if splicing `callee` into `caller` would move a reference to a module
+/// cell across a module boundary (#1630).
+///
+/// §11.11 state is a per-module cell, and §17.6 gives each module its OWN
+/// object: the cell is defined by that object and by no other. Inlining is the
+/// one thing that can put a `global_addr` naming module M's cell inside code
+/// that is emitted as module N's — and then N's object either re-defines M's
+/// cell (two cells, one logical global, each module updating its own — silent,
+/// unbounded wrongness with no diagnostic at any stage) or leaves a dangling
+/// reference under a name M's own object does not use. That was live: the
+/// inliner spliced `runtime/root`'s pinned `rootBindMemory` into
+/// `runtime/root/darwin`'s `boot`, so the two objects held separate `gcAddr`
+/// and `gcState` cells and the collector booted against the wrong one.
+///
+/// Refused unconditionally rather than only under `--freestanding`, so the
+/// managed and freestanding lowerings of one program cannot disagree about
+/// which cell a function touches. The cost is one un-inlined call in a
+/// cross-module helper that reads module state; the alternative is a class of
+/// bug that only appears when the objects are compiled separately.
+///
+/// The comparison is over `in_root_module` because that is the module identity
+/// the IR carries. It is coarse — two distinct imported modules both read as
+/// "not root" — but it composes: a splice into a non-root caller leaves a
+/// non-root global reference behind, which this then refuses to carry into any
+/// root caller.
+fn importsForeignState(module: *const ir.Module, caller: *const ir.Function, callee: *const ir.Function) bool {
+    var i: u32 = 0;
+    while (i < callee.insts.len) : (i += 1) {
+        const ga = switch (callee.decode(@enumFromInt(i))) {
+            .global_addr => |x| x,
+            else => continue,
+        };
+        if (module.global(ga.global).in_root_module != caller.in_root_module) return true;
+    }
+    return false;
 }
 
 /// Splices `g`'s single block into `bldr`'s currently open block: `g`'s
@@ -852,6 +897,10 @@ fn inlineCalls(gpa: Allocator, module: *const ir.Module, fid: ir.FuncId) !ir.Fun
     // precedent is that a rebuild silently zeroing a flag is dead code nobody
     // notices. `test "opt: the freestanding module tag survives -O1"` gates it.
     out.in_root_module = f.in_root_module;
+    // §11.9: and the pin flag, which decides the symbol's BINDING in a
+    // freestanding object (#1631). Also defaults to `false`, so losing it here
+    // makes a runtime entry point local and fails the link loudly.
+    out.is_pinned = f.is_pinned;
     return out;
 }
 
@@ -1212,6 +1261,10 @@ test "opt: the freestanding module tag survives -O1" {
     gb.endBlock();
     var g = try gb.finish("callee", &.{i64_ty}, i64_ty, false, .invalid, g_entry);
     g.in_root_module = true;
+    // §11.9 `is_pinned` rides the same rebuild paths and has the same
+    // default-false failure mode (a lost pin makes a runtime entry point local),
+    // so it is gated here rather than in a near-duplicate test.
+    g.is_pinned = true;
     try module.funcs.append(gpa, g);
 
     var fb = ir.FunctionBuilder.init(gpa);
@@ -1226,11 +1279,14 @@ test "opt: the freestanding module tag survives -O1" {
     // both `false`, which the `caller` half alone could not distinguish from a
     // correct copy. One of each makes the assertion two-sided.
     f.in_root_module = false;
+    f.is_pinned = false;
     try module.funcs.append(gpa, f);
 
     try optimizeModule(gpa, &module, .o1);
     try testing.expect(module.funcs.items[0].in_root_module);
     try testing.expect(!module.funcs.items[1].in_root_module);
+    try testing.expect(module.funcs.items[0].is_pinned);
+    try testing.expect(!module.funcs.items[1].is_pinned);
 }
 
 test "optimizeModule at O1 inlines a call across the full pipeline" {

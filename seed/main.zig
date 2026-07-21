@@ -836,7 +836,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
     switch (target) {
         .x86_64_linux => {
             const object = emit.emitObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
-                error.FreestandingAlloc, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
+                error.FreestandingAlloc, error.FreestandingUnpinned, error.FreestandingImportedGlobal => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -845,7 +845,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
         },
         .aarch64_linux => {
             const object = emit.emitObjectArm64Elf(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
-                error.FreestandingAlloc, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
+                error.FreestandingAlloc, error.FreestandingUnpinned, error.FreestandingImportedGlobal => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -857,7 +857,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             // diagnostic (exit 1), not a raw propagated error.
             const object = emit.emitMachoObject(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
                 error.SyscallUnsupportedTarget => return try syscallUnsupported(err_out),
-                error.FreestandingAlloc, error.FreestandingUnpinned => return try freestandingRefused(err_out, e, &module),
+                error.FreestandingAlloc, error.FreestandingUnpinned, error.FreestandingImportedGlobal => return try freestandingRefused(err_out, e, &module),
                 else => return e,
             };
             if (emit_obj) return object;
@@ -1064,6 +1064,15 @@ fn freestandingRefused(err_out: *Io.Writer, e: anyerror, module: *const ir.Modul
     if (e == error.FreestandingUnpinned) {
         const name = emit.firstUnpinnedImport(module) orelse "?";
         try err_out.print("bit: --freestanding: this module references '{s}', a mangled cross-module symbol no sibling object can define; every runtime function another module calls must be pinned with @symbol (SPEC \xc2\xa711.9, ABI.md \xc2\xa79)\n", .{name});
+        return null;
+    }
+    // §11.11: likewise names the cell, for the same reason — but there is no
+    // `@symbol` for module state, so the fix is structural (move the cell into
+    // the module that uses it, or reach it through a pinned accessor) and the
+    // message says so rather than pointing at an attribute that does not exist.
+    if (e == error.FreestandingImportedGlobal) {
+        const name = emit.firstImportedGlobalRef(module) orelse "?";
+        try err_out.print("bit: --freestanding: this module references '{s}', another module's module-level state; a cell is defined by exactly one object and has no @symbol pin to share it by, so it cannot be reached across a freestanding object boundary (SPEC \xc2\xa711.11)\n", .{name});
         return null;
     }
     const why = switch (e) {

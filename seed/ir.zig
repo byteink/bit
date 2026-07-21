@@ -113,6 +113,21 @@ pub const Global = struct {
     /// by the checker, so their image is final at compile time. A `.readonly`
     /// global may carry them; see `GlobalReloc`.
     relocs: []const GlobalReloc = &.{},
+    /// §17.6 freestanding: true iff this cell was lowered from the build's ROOT
+    /// module — the exact counterpart of `Function.in_root_module`, and for the
+    /// same reason (#1630). `lowerProject` registers a cell for EVERY module in
+    /// the project, so without this an object emitted from `runtime/chan` also
+    /// defines `runtime/gc`'s cells. Archive two such objects and the loud
+    /// outcome is `DuplicateSymbol`; the quiet one is worse — the mangled name
+    /// carries a PROJECT-LOCAL module ordinal, so where two builds assign
+    /// different ordinals both definitions survive under different spellings
+    /// and the two modules read and write different cells for one logical
+    /// global.
+    ///
+    /// Defaults to FALSE — "not mine, do not emit" — for the same reason the
+    /// function flag does: a path that forgets to set it drops a definition and
+    /// fails the link loudly, rather than silently restoring the divergence.
+    in_root_module: bool = false,
 };
 
 /// Opaque runtime entry points lowering calls into `runtime/*.zig` symbols by
@@ -634,6 +649,26 @@ pub const Function = struct {
     /// fails the link loudly, rather than silently re-admitting the collision
     /// the flag exists to prevent. See `opt.zig`'s `rebuild`/`inlineCalls`.
     in_root_module: bool = false,
+    /// §11.9 `@symbol("name")`: true iff this function's link-level name was
+    /// PINNED by the author rather than synthesized by lowering.
+    ///
+    /// A pin is the only name two separately-compiled objects can agree on
+    /// (`firstUnpinnedImport` refuses every other cross-object call), so in a
+    /// freestanding object a pin is exactly the set of symbols that must be
+    /// externally visible — everything else is module-private and takes LOCAL
+    /// binding, which is what stops two modules' same-named private helpers
+    /// from colliding once their objects share an archive (#1631).
+    ///
+    /// Carried as a flag rather than re-derived from the name because the two
+    /// are not distinguishable after the fact: a pin and a ROOT module's own
+    /// unqualified helper are both bare, `$`-free names (see `isPinnedName`,
+    /// which answers a different question — "could a sibling object define
+    /// this?" — and deliberately says yes to both).
+    ///
+    /// Defaults to FALSE — "private, do not export": a path that forgets to
+    /// carry it makes a runtime entry point local, which fails the link loudly
+    /// with an undefined symbol rather than silently re-admitting a collision.
+    is_pinned: bool = false,
     err_ty: TypeId,
     blocks: []const BasicBlock,
     entry: BlockId,
@@ -856,9 +891,9 @@ pub const Module = struct {
 
     /// Appends a module-level variable, taking ownership of `name` and
     /// `bytes`. Returns its id.
-    pub fn addGlobal(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage) Allocator.Error!GlobalId {
+    pub fn addGlobal(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage, in_root: bool) Allocator.Error!GlobalId {
         const id: u32 = @intCast(self.globals.items.len);
-        try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage });
+        try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage, .in_root_module = in_root });
         return @enumFromInt(id);
     }
 
@@ -866,10 +901,10 @@ pub const Module = struct {
     /// of every `symbol` name inside it. Only `.readonly` globals may carry one
     /// (§11.11) — the writable classes are pointer-free by construction, and a
     /// relocation on one would be a pointer the collector never scans.
-    pub fn addGlobalWithRelocs(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage, relocs: []const GlobalReloc) Allocator.Error!GlobalId {
+    pub fn addGlobalWithRelocs(self: *Module, name: []const u8, bytes: []const u8, alignment: u32, storage: GlobalStorage, relocs: []const GlobalReloc, in_root: bool) Allocator.Error!GlobalId {
         std.debug.assert(relocs.len == 0 or storage == .readonly);
         const id: u32 = @intCast(self.globals.items.len);
-        try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage, .relocs = relocs });
+        try self.globals.append(self.gpa, .{ .name = name, .bytes = bytes, .alignment = alignment, .storage = storage, .relocs = relocs, .in_root_module = in_root });
         return @enumFromInt(id);
     }
 

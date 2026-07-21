@@ -19,7 +19,7 @@ const common = @import("codegen/common.zig");
 const obj_elf = @import("obj/elf.zig");
 const obj_macho = @import("obj/macho.zig");
 
-pub const Error = error{ NoMain, FreestandingAlloc, FreestandingUnpinned, UnsupportedTlsStorage } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
+pub const Error = error{ NoMain, FreestandingAlloc, FreestandingUnpinned, FreestandingImportedGlobal, UnsupportedTlsStorage } || x64.CodegenError || obj_elf.Error || obj_macho.Error || Allocator.Error;
 
 /// §17.6: does this function belong in a freestanding object? A freestanding
 /// emit keeps only the ROOT module's own code, so an imported module's
@@ -29,6 +29,35 @@ pub const Error = error{ NoMain, FreestandingAlloc, FreestandingUnpinned, Unsupp
 fn emitsFunction(f: *const ir.Function, freestanding: bool) bool {
     if (f.is_extern) return false;
     return f.in_root_module or !freestanding;
+}
+
+/// §17.6: does this module-level cell belong in a freestanding object? Exactly
+/// `emitsFunction`'s rule, one storage class down (#1630) — `lowerProject`
+/// registers a cell for every module in the project, and an object that emits
+/// an imported module's cells either collides with that module's own object or,
+/// where the project-local ordinals in the mangled name differ, quietly gives
+/// the two modules separate copies of one logical global.
+fn emitsGlobal(g: ir.Global, freestanding: bool) bool {
+    return g.in_root_module or !freestanding;
+}
+
+/// §17.6 + §11.9: the binding a definition this object emits should carry.
+///
+/// A freestanding object is one archive member among many, and the ONLY names
+/// its siblings may reference are §11.9 pins — `firstUnpinnedImport` refuses
+/// every other cross-object reference, precisely because no other spelling is
+/// stable across two separate compilations. So everything a freestanding object
+/// defines that is not pinned is module-private by construction, and exporting
+/// it buys nothing while costing a collision the moment two modules happen to
+/// declare a helper (`byteAt`, `strData`) or a cell of the same name (#1630,
+/// #1631). Local binding states the truth the design already relies on.
+///
+/// A managed (non-freestanding) object is the whole program in one unit, where
+/// these names are all the linker has to work with; that path keeps its
+/// bindings exactly as before.
+fn definitionBinding(comptime B: type, freestanding: bool, pinned: bool) B {
+    if (freestanding and !pinned) return .local;
+    return .global;
 }
 
 /// §17.6: refuses a module that needs the managed runtime's whole-program
@@ -142,6 +171,44 @@ fn refuseUnpinnedImports(module: *const ir.Module) Error!void {
     if (firstUnpinnedImport(module) != null) return error.FreestandingUnpinned;
 }
 
+/// §17.6 + §11.11: the first module-level cell this freestanding object would
+/// reference without emitting, or null when every `global_addr` lands on a cell
+/// the object defines.
+///
+/// The data counterpart of `firstUnpinnedImport`, and refused for the same
+/// reason (#1630): an imported module's cell is spelled `__bitg_<n>_name` with
+/// `<n>` an ordinal THIS build assigned, so a sibling object — where the same
+/// module is the root, under a different ordinal — can never define that name.
+/// There is no `@symbol` pin for a cell, so unlike a call there is no correct
+/// spelling to fall back on: a cross-module global reference is simply not
+/// expressible in a freestanding object today, and saying so here is the only
+/// place a reader learns it near the cause. The alternative is what this
+/// replaced — emitting a private copy per object, which links and runs and
+/// silently splits one logical global in two.
+///
+/// Reference-driven, not declaration-driven: `emitsGlobal` already drops the
+/// imported cells nothing names, and refusing merely *importing* a module that
+/// has state would be a false alarm about a symbol this object never mentions.
+pub fn firstImportedGlobalRef(module: *const ir.Module) ?[]const u8 {
+    for (module.funcs.items) |*f| {
+        if (!emitsFunction(f, true)) continue;
+        var i: u32 = 0;
+        while (i < f.insts.len) : (i += 1) {
+            const g = switch (f.decode(@enumFromInt(i))) {
+                .global_addr => |ga| module.global(ga.global),
+                else => continue,
+            };
+            if (emitsGlobal(g, true)) continue;
+            return g.name;
+        }
+    }
+    return null;
+}
+
+fn refuseImportedGlobalRefs(module: *const ir.Module) Error!void {
+    if (firstImportedGlobalRef(module) != null) return error.FreestandingImportedGlobal;
+}
+
 /// Builds one function's arch-neutral stack-map view (arena-owned) from its
 /// backend `FuncCode` records. `Sp` is the backend's `SafepointEntry` type;
 /// its `regs` are physical registers whose numbers (`@intFromEnum`) the
@@ -249,10 +316,11 @@ const GlobalPlacement = struct { name: []const u8, offset: u64, size: u64 };
 /// These cells are writable and **never scanned by the collector**, in both
 /// classes: the checker has proved each one's type untraced, so neither blob
 /// needs a pointer map or root registration. See SPEC §11.11.
-fn placeGlobals(a: Allocator, module: *const ir.Module, storage: ir.GlobalStorage, data: *std.ArrayList(u8)) Error![]const GlobalPlacement {
+fn placeGlobals(a: Allocator, module: *const ir.Module, storage: ir.GlobalStorage, data: *std.ArrayList(u8), freestanding: bool) Error![]const GlobalPlacement {
     var out: std.ArrayList(GlobalPlacement) = .empty;
     for (module.globals.items) |g| {
         if (g.storage != storage) continue;
+        if (!emitsGlobal(g, freestanding)) continue; // §17.6 (#1630)
         while (data.items.len % g.alignment != 0) try data.append(a, 0);
         const off: u64 = data.items.len;
         try data.appendSlice(a, g.bytes);
@@ -284,10 +352,12 @@ fn placeReadonlyGlobals(
     module: *const ir.Module,
     rodata: *std.ArrayList(u8),
     relocs: *std.ArrayList(GlobalFixup),
+    freestanding: bool,
 ) Error![]const GlobalPlacement {
     var out: std.ArrayList(GlobalPlacement) = .empty;
     for (module.globals.items) |g| {
         if (g.storage != .readonly) continue;
+        if (!emitsGlobal(g, freestanding)) continue; // §17.6 (#1630)
         while (rodata.items.len % g.alignment != 0) try rodata.append(a, 0);
         const off: u64 = rodata.items.len;
         try rodata.appendSlice(a, g.bytes);
@@ -317,10 +387,11 @@ const GlobalFixup = struct { offset: u64, symbol: []const u8, addend: i64 };
 /// Derived from the cells actually present rather than hardcoded, so the
 /// section can never again be weaker than what `placeGlobals` assumed. The 8
 /// floor keeps a module with no globals byte-identical to before.
-fn globalsAlign(module: *const ir.Module, storage: ir.GlobalStorage) u32 {
+fn globalsAlign(module: *const ir.Module, storage: ir.GlobalStorage, freestanding: bool) u32 {
     var want: u32 = 8;
     for (module.globals.items) |g| {
         if (g.storage != storage) continue;
+        if (!emitsGlobal(g, freestanding)) continue; // §17.6 (#1630)
         want = @max(want, g.alignment);
     }
     return want;
@@ -345,6 +416,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
     var emitted_names: std.ArrayList([]const u8) = .empty;
     if (freestanding) try refuseManagedMetadata(a, module);
     if (freestanding) try refuseUnpinnedImports(module);
+    if (freestanding) try refuseImportedGlobalRefs(module);
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -359,7 +431,7 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
         defer fc.deinit();
         const off: u64 = code.items.len;
         try code.appendSlice(a, fc.code);
-        try symbols.append(a, .{ .name = try a.dupe(u8, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = .global, .kind = .func });
+        try symbols.append(a, .{ .name = try a.dupe(u8, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = definitionBinding(obj_elf.Binding, freestanding, f.is_pinned), .kind = .func });
         try defined.put(a, f.name, {});
         for (fc.relocs) |r| try relocs.append(a, .{
             .section = .text,
@@ -405,8 +477,8 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
 
     // ---- module-level state (§11.11) -> writable .data --------------------
     var data: std.ArrayList(u8) = .empty;
-    for (try placeGlobals(a, module, .process, &data)) |g| {
-        try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+    for (try placeGlobals(a, module, .process, &data, freestanding)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_elf.Binding, freestanding, false), .kind = .object });
         try defined.put(a, g.name, {});
     }
 
@@ -419,8 +491,8 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
     // the template — the quantity the local-exec relocations add to the
     // thread pointer — rather than a link-time address.
     var tdata: std.ArrayList(u8) = .empty;
-    for (try placeGlobals(a, module, .thread, &tdata)) |g| {
-        try symbols.append(a, .{ .name = g.name, .section = .tdata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .tls });
+    for (try placeGlobals(a, module, .thread, &tdata, freestanding)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .tdata, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_elf.Binding, freestanding, false), .kind = .tls });
         try defined.put(a, g.name, {});
     }
 
@@ -430,8 +502,8 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
     // to end. `defined` gets each name so the undefined-externals pass below
     // does not then declare the table an unresolved import.
     var ro_fixups: std.ArrayList(GlobalFixup) = .empty;
-    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups)) |g| {
-        try symbols.append(a, .{ .name = g.name, .section = .rodata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups, freestanding)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .rodata, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_elf.Binding, freestanding, false), .kind = .object });
         try defined.put(a, g.name, {});
     }
     // ELF is RELA: the addend rides in the relocation and the field bytes are
@@ -444,10 +516,10 @@ pub fn emitObject(gpa: Allocator, module: *const ir.Module, with_entry: bool, fr
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
-    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly) });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly, freestanding) });
     if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
-    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
-    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process, freestanding) });
+    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread, freestanding) });
 
     return obj_elf.write(gpa, .x86_64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -634,6 +706,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     var emitted_names: std.ArrayList([]const u8) = .empty;
     if (freestanding) try refuseManagedMetadata(a, module);
     if (freestanding) try refuseUnpinnedImports(module);
+    if (freestanding) try refuseImportedGlobalRefs(module);
 
     // ---- every function -> one .text symbol + its relocations -------------
     var main_void = false;
@@ -648,7 +721,7 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
         defer fc.deinit();
         const off: u64 = code.items.len;
         try code.appendSlice(a, fc.code);
-        try symbols.append(a, .{ .name = try a.dupe(u8, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = .global, .kind = .func });
+        try symbols.append(a, .{ .name = try a.dupe(u8, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = definitionBinding(obj_elf.Binding, freestanding, f.is_pinned), .kind = .func });
         try defined.put(a, f.name, {});
         for (fc.relocs) |r| try relocs.append(a, .{
             .section = .text,
@@ -689,8 +762,8 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
 
     // ---- module-level state (§11.11) -> writable .data --------------------
     var data: std.ArrayList(u8) = .empty;
-    for (try placeGlobals(a, module, .process, &data)) |g| {
-        try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+    for (try placeGlobals(a, module, .process, &data, freestanding)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .data, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_elf.Binding, freestanding, false), .kind = .object });
         try defined.put(a, g.name, {});
     }
 
@@ -703,8 +776,8 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     // the template — the quantity the local-exec relocations add to the
     // thread pointer — rather than a link-time address.
     var tdata: std.ArrayList(u8) = .empty;
-    for (try placeGlobals(a, module, .thread, &tdata)) |g| {
-        try symbols.append(a, .{ .name = g.name, .section = .tdata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .tls });
+    for (try placeGlobals(a, module, .thread, &tdata, freestanding)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .tdata, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_elf.Binding, freestanding, false), .kind = .tls });
         try defined.put(a, g.name, {});
     }
 
@@ -714,8 +787,8 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
     // to end. `defined` gets each name so the undefined-externals pass below
     // does not then declare the table an unresolved import.
     var ro_fixups: std.ArrayList(GlobalFixup) = .empty;
-    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups)) |g| {
-        try symbols.append(a, .{ .name = g.name, .section = .rodata, .offset = g.offset, .size = g.size, .binding = .global, .kind = .object });
+    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups, freestanding)) |g| {
+        try symbols.append(a, .{ .name = g.name, .section = .rodata, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_elf.Binding, freestanding, false), .kind = .object });
         try defined.put(a, g.name, {});
     }
     // ELF is RELA: the addend rides in the relocation and the field bytes are
@@ -728,10 +801,10 @@ pub fn emitObjectArm64Elf(gpa: Allocator, module: *const ir.Module, with_entry: 
 
     var sections: std.ArrayList(obj_elf.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 16 });
-    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly) });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly, freestanding) });
     if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
-    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
-    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread) });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process, freestanding) });
+    if (tdata.items.len > 0) try sections.append(a, .{ .kind = .tdata, .data = tdata.items, .alignment = globalsAlign(module, .thread, freestanding) });
 
     return obj_elf.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -758,6 +831,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     var emitted_names: std.ArrayList([]const u8) = .empty;
     if (freestanding) try refuseManagedMetadata(a, module);
     if (freestanding) try refuseUnpinnedImports(module);
+    if (freestanding) try refuseImportedGlobalRefs(module);
 
     // Per-thread state (§11.11) is not emitted on Mach-O yet: it reaches a
     // thread-local through a `__thread_vars` `tlv_descriptor` and an indirect
@@ -809,7 +883,7 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
         defer fc.deinit();
         const off: u64 = code.items.len;
         try code.appendSlice(a, fc.code);
-        try symbols.append(a, .{ .name = try mac(a, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = .global });
+        try symbols.append(a, .{ .name = try mac(a, f.name), .section = .text, .offset = off, .size = fc.code.len, .binding = definitionBinding(obj_macho.Binding, freestanding, f.is_pinned) });
         try defined.put(a, try mac(a, f.name), {});
         for (fc.relocs) |r| try relocs.append(a, .{
             .section = .text,
@@ -977,9 +1051,9 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     }
 
     // ---- module-level state (§11.11) -> the same writable .data -----------
-    for (try placeGlobals(a, module, .process, &data)) |g| {
+    for (try placeGlobals(a, module, .process, &data, freestanding)) |g| {
         const sym = try mac(a, g.name);
-        try symbols.append(a, .{ .name = sym, .section = .data, .offset = g.offset, .size = g.size, .binding = .global });
+        try symbols.append(a, .{ .name = sym, .section = .data, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_macho.Binding, freestanding, false) });
         try defined.put(a, sym, {});
     }
 
@@ -994,9 +1068,9 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
     //     So it is written into the image here, where ELF leaves the image
     //     untouched and puts the addend in the RELA entry.
     var ro_fixups: std.ArrayList(GlobalFixup) = .empty;
-    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups)) |g| {
+    for (try placeReadonlyGlobals(a, module, &rodata, &ro_fixups, freestanding)) |g| {
         const sym = try mac(a, g.name);
-        try symbols.append(a, .{ .name = sym, .section = .rodata, .offset = g.offset, .size = g.size, .binding = .global });
+        try symbols.append(a, .{ .name = sym, .section = .rodata, .offset = g.offset, .size = g.size, .binding = definitionBinding(obj_macho.Binding, freestanding, false) });
         try defined.put(a, sym, {});
     }
     for (ro_fixups.items) |f| {
@@ -1014,9 +1088,9 @@ pub fn emitMachoObject(gpa: Allocator, module: *const ir.Module, with_entry: boo
 
     var sections: std.ArrayList(obj_macho.Section) = .empty;
     try sections.append(a, .{ .kind = .text, .data = code.items, .alignment = 4 });
-    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly) });
+    if (rodata.items.len > 0) try sections.append(a, .{ .kind = .rodata, .data = rodata.items, .alignment = globalsAlign(module, .readonly, freestanding) });
     if (gc.items.len > 0) try sections.append(a, .{ .kind = .gc_meta, .data = gc.items, .alignment = 1 });
-    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process) });
+    if (data.items.len > 0) try sections.append(a, .{ .kind = .data, .data = data.items, .alignment = globalsAlign(module, .process, freestanding) });
 
     return obj_macho.write(gpa, .aarch64, .{ .sections = sections.items, .symbols = symbols.items, .relocations = relocs.items });
 }
@@ -1121,6 +1195,104 @@ test "emit: a freestanding object holds only the root module's functions" {
     try testing.expect(try testObjectDefines(gpa, whole_obj, "importedFn"));
 }
 
+/// The binding the emitted object gives the atom named `want`, or null if it
+/// defines no such atom. Read back through the project's own ELF reader, so the
+/// answer is the one the LINKER sees rather than one inferred from the writer.
+fn testAtomBinding(gpa: Allocator, obj: []const u8, want: []const u8) !?object.Binding {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const mod = try elf_reader.read(arena_state.allocator(), .x86_64, "t.o", obj);
+    for (mod.atoms) |atom| {
+        if (std.mem.eql(u8, atom.name, want)) return atom.binding;
+    }
+    return null;
+}
+
+test "emit: a freestanding object holds only its own cells and exports only its pins" {
+    // #1630 + #1631, the two linkage defects that stopped a Bit-sourced
+    // libbitrt.a. Both are invisible to a single-object build and both are
+    // SILENT in the shape that matters most:
+    //
+    //  - #1630: `lowerProject` registers a cell for every module, so without
+    //    the filter each importer re-defines its imports' cells. Where the
+    //    project-local ordinal in `__bitg_<n>_` happens to differ between two
+    //    builds, both definitions survive the archive and the two modules then
+    //    read and write DIFFERENT cells for one logical global.
+    //  - #1631: a module-private helper took a plain global symbol equal to its
+    //    source name, so two modules that each declare a `byteAt` collide.
+    //
+    // Asserted on BINDING, not just on presence: a cell or helper that is
+    // defined-but-local cannot collide, and that is the property the archive
+    // rests on. The managed half of each assertion is what keeps this about the
+    // freestanding flag rather than about the symbol being unemittable.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testAppendFunc(gpa, &module, "helper", true); // private: the #1631 shape
+    try testAppendFunc(gpa, &module, "bit_rt_thing", true);
+    module.funcs.items[1].is_pinned = true; // §11.9: the one cross-object name
+    // `addGlobal` takes ownership of both slices, so they must be heap-owned.
+    _ = try module.addGlobal(try gpa.dupe(u8, "__bitg_0_mine"), try gpa.dupe(u8, &[_]u8{0} ** 8), 16, .process, true);
+    _ = try module.addGlobal(try gpa.dupe(u8, "__bitg_1_theirs"), try gpa.dupe(u8, &[_]u8{0} ** 8), 16, .process, false);
+
+    const free_obj = try emitObject(gpa, &module, false, true);
+    defer gpa.free(free_obj);
+    try testing.expectEqual(object.Binding.local, (try testAtomBinding(gpa, free_obj, "helper")).?);
+    try testing.expectEqual(object.Binding.global, (try testAtomBinding(gpa, free_obj, "bit_rt_thing")).?);
+    try testing.expectEqual(object.Binding.local, (try testAtomBinding(gpa, free_obj, "__bitg_0_mine")).?);
+    try testing.expectEqual(@as(?object.Binding, null), try testAtomBinding(gpa, free_obj, "__bitg_1_theirs"));
+
+    const whole_obj = try emitObject(gpa, &module, false, false);
+    defer gpa.free(whole_obj);
+    try testing.expectEqual(object.Binding.global, (try testAtomBinding(gpa, whole_obj, "helper")).?);
+    try testing.expectEqual(object.Binding.global, (try testAtomBinding(gpa, whole_obj, "__bitg_0_mine")).?);
+    try testing.expectEqual(object.Binding.global, (try testAtomBinding(gpa, whole_obj, "__bitg_1_theirs")).?);
+}
+
+test "emit: freestanding refuses a reference to another module's cell" {
+    // #1630's other half, and the one that was LIVE: the inliner spliced
+    // `runtime/root`'s pinned `rootBindMemory` into `runtime/root/darwin`'s
+    // `boot`, leaving a `global_addr` on `runtime/root`'s `gcAddr`/`gcState`
+    // inside an object that is not `runtime/root`. `opt.importsForeignState`
+    // now stops that splice; this refuses the residue however it arises, so a
+    // future pass that reintroduces the shape fails at emit instead of shipping
+    // two cells for one global.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    const theirs = try module.addGlobal(try gpa.dupe(u8, "__bitg_1_theirs"), try gpa.dupe(u8, &[_]u8{0} ** 8), 16, .process, false);
+    try testAppendGlobalReader(gpa, &module, "rootFn", theirs);
+
+    try testing.expectError(error.FreestandingImportedGlobal, emitObject(gpa, &module, false, true));
+    // Managed, the same module is one compilation unit and the cell is right
+    // there — so this is about the object boundary, not about the reference.
+    const whole_obj = try emitObject(gpa, &module, false, false);
+    defer gpa.free(whole_obj);
+    try testing.expect(try testObjectDefines(gpa, whole_obj, "rootFn"));
+}
+
+/// Appends a root-module `@nosplit` function whose body takes the address of
+/// `g` — the shape an inlined cross-module accessor leaves behind.
+fn testAppendGlobalReader(gpa: Allocator, module: *ir.Module, name: []const u8, g: ir.GlobalId) !void {
+    const i64_ty = module.ctx.prim_ids.get(.i64);
+    var b = ir.FunctionBuilder.init(gpa);
+    const entry = try b.newBlock();
+    b.beginBlock(entry);
+    const addr = try b.globalAddr(i64_ty, g);
+    try b.ret(&.{addr});
+    b.endBlock();
+    var f = try b.finish(name, &.{}, i64_ty, false, .invalid, entry);
+    f.is_nosplit = true;
+    f.in_root_module = true;
+    try module.funcs.append(gpa, f);
+}
+
 test "emit: a globals section is at least as aligned as the cells it holds" {
     // §11.11 guarantees every module cell is 16-byte aligned, and `placeGlobals`
     // pads each cell to its own alignment — but padding WITHIN a section only
@@ -1145,6 +1317,7 @@ test "emit: a globals section is at least as aligned as the cells it holds" {
         try gpa.dupe(u8, &[_]u8{0} ** 8),
         16,
         .process,
+        true,
     );
 
     const obj = try emitObject(gpa, &module, false, false);
@@ -1442,6 +1615,7 @@ fn testRoModule(gpa: Allocator, module: *ir.Module) !void {
         try gpa.dupe(u8, &ro_image),
         16,
         .readonly,
+        true,
     );
 }
 
@@ -1623,7 +1797,7 @@ test "emit: a readonly global's relocation targets the right symbol at the right
         try testAppendFunc(gpa, &module, "rootFn", true);
 
         // The payload, then a 16-byte header whose first word points at it.
-        _ = try module.addGlobal(try gpa.dupe(u8, "__bitro_buf"), try gpa.dupe(u8, &ro_image), 8, .readonly);
+        _ = try module.addGlobal(try gpa.dupe(u8, "__bitro_buf"), try gpa.dupe(u8, &ro_image), 8, .readonly, true);
         const fixups = try gpa.alloc(ir.GlobalReloc, 1);
         fixups[0] = .{ .offset = 0, .symbol = try gpa.dupe(u8, "__bitro_buf"), .addend = 0 };
         _ = try module.addGlobalWithRelocs(
@@ -1632,6 +1806,7 @@ test "emit: a readonly global's relocation targets the right symbol at the right
             8,
             .readonly,
             fixups,
+            true,
         );
 
         const obj = switch (t) {

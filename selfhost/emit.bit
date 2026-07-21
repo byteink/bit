@@ -61,6 +61,37 @@ function emitsFunction(f: IrFunc, freestanding: bool): bool {
   return f.inRootModule || !freestanding
 }
 
+// §17.6: does this module-level cell belong in a freestanding object? Exactly
+// emitsFunction's rule, one storage class down (#1630) — registerGlobals
+// registers a cell for every module in the project, and an object that emits an
+// imported module's cells either collides with that module's own object or,
+// where the project-local ordinals in the mangled name differ, quietly gives the
+// two modules separate copies of one logical global. Mirrors the seed's
+// emitsGlobal.
+function emitsGlobal(g: IrGlobal, freestanding: bool): bool {
+  return g.inRootModule || !freestanding
+}
+
+// §17.6 + §11.9: true when a definition this object emits should carry LOCAL
+// rather than global binding.
+//
+// A freestanding object is one archive member among many, and the ONLY names its
+// siblings may reference are §11.9 pins — firstUnpinnedImport refuses every
+// other cross-object reference, precisely because no other spelling is stable
+// across two separate compilations. So everything a freestanding object defines
+// that is not pinned is module-private by construction, and exporting it buys
+// nothing while costing a collision the moment two modules declare a helper
+// (byteAt, strData) or a cell of the same name (#1630, #1631). A managed
+// (non-freestanding) object is the whole program in one unit, where these names
+// are all the linker has; that path keeps its bindings exactly as before.
+//
+// Mirrors the seed's definitionBinding, which is generic over the two writers'
+// Binding enums; this port returns the DECISION instead and each writer spells
+// its own enum, since the two enums are distinct types here.
+function definitionIsLocal(freestanding: bool, pinned: bool): bool {
+  return freestanding && !pinned
+}
+
 // §17.6: refuses a module needing the managed runtime's whole-program tables,
 // which a freestanding object cannot carry — a TypeInfo descriptor is a global
 // symbol every sibling member describing the same layout would also define, and
@@ -172,6 +203,61 @@ function firstUnpinnedImport(module: IrModule): string {
     fi = fi + 1
   }
   return ""
+}
+
+// §17.6 + §11.11: the first module-level cell this freestanding object would
+// reference without emitting, or "" when every GlobalAddr lands on a cell the
+// object defines.
+//
+// The data counterpart of firstUnpinnedImport, refused for the same reason
+// (#1630): an imported module's cell is spelled `__bitg_<n>_name` with `<n>` an
+// ordinal THIS build assigned, so a sibling object — where the same module is
+// the root, under a different ordinal — can never define that name. There is no
+// @symbol pin for a cell, so unlike a call there is no correct spelling to fall
+// back on: a cross-module global reference is simply not expressible in a
+// freestanding object today, and saying so here is the only place a reader
+// learns it near the cause. The alternative is what this replaced — emitting a
+// private copy per object, which links and runs and silently splits one logical
+// global in two.
+//
+// Reference-driven, not declaration-driven: emitsGlobal already drops the
+// imported cells nothing names, and refusing merely IMPORTING a module that has
+// state would be a false alarm about a symbol this object never mentions.
+// Mirrors the seed's firstImportedGlobalRef; selfhost's GlobalAddr carries the
+// cell's symbol NAME where the seed carries a GlobalId.
+function firstImportedGlobalRef(module: IrModule): string {
+  let fi = 0
+  while (fi < len(module.funcs)) {
+    let f = module.funcs[fi]
+    if (!emitsFunction(f, true)) {
+      fi = fi + 1
+      continue
+    }
+    let i = 0
+    while (i < len(f.instrs)) {
+      let ins = f.instrs[i]
+      if (ins.op == Op.GlobalAddr) {
+        let gi = 0
+        while (gi < len(module.globals)) {
+          let g = module.globals[gi]
+          if (g.name == ins.name && !emitsGlobal(g, true)) {
+            return g.name
+          }
+          gi = gi + 1
+        }
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  return ""
+}
+
+function refuseImportedGlobalRefs(module: IrModule): ()! {
+  let nm = firstImportedGlobalRef(module)
+  if (nm != "") {
+    fail newError("--freestanding: this module references '${nm}', another module's module-level state; a cell is defined by exactly one object and has no @symbol pin to share it by, so it cannot be reached across a freestanding object boundary (SPEC §11.11)")
+  }
 }
 
 function refuseUnpinnedImports(module: IrModule): ()! {
@@ -294,12 +380,12 @@ struct GlobalPlacement {
 // sat at `addr % 16 == 8` on x86_64-linux. Derived from the cells present, so
 // the section can never be weaker than what placeGlobals assumed; the 8 floor
 // keeps a module with no globals byte-identical.
-function globalsAlign(module: IrModule, storage: int): int {
+function globalsAlign(module: IrModule, storage: int, freestanding: bool): int {
   let want = 8
   let i = 0
   while (i < len(module.globals)) {
     let g = module.globals[i]
-    if (g.storage == storage && g.align > want) {
+    if (g.storage == storage && emitsGlobal(g, freestanding) && g.align > want) {
       want = g.align
     }
     i = i + 1
@@ -307,12 +393,15 @@ function globalsAlign(module: IrModule, storage: int): int {
   return want
 }
 
-function placeGlobals(module: IrModule, storage: int, buf: ByteBuf): []GlobalPlacement {
+function placeGlobals(module: IrModule, storage: int, buf: ByteBuf,
+                     freestanding: bool): []GlobalPlacement {
   let out = []GlobalPlacement(0)
   let i = 0
   while (i < len(module.globals)) {
     let g = module.globals[i]
-    if (g.storage != storage) {
+    // §17.6 (#1630): an imported module's cell is that module's own object's to
+    // define.
+    if (g.storage != storage || !emitsGlobal(g, freestanding)) {
       i = i + 1
       continue
     }
@@ -362,13 +451,15 @@ struct ReadonlyPlacement {
 // mutated, so it cannot come to hold a pointer to a moved object, and the only
 // pointers it may contain are the link-time ones below — addresses of other
 // static data, not of heap objects.
-function placeReadonlyGlobals(module: IrModule, buf: ByteBuf): ReadonlyPlacement {
+function placeReadonlyGlobals(module: IrModule, buf: ByteBuf,
+                             freestanding: bool): ReadonlyPlacement {
   let out = []GlobalPlacement(0)
   let fixups = []GlobalFixup(0)
   let i = 0
   while (i < len(module.globals)) {
     let g = module.globals[i]
-    if (g.storage != storageReadonly()) {
+    // §17.6 (#1630): see placeGlobals.
+    if (g.storage != storageReadonly() || !emitsGlobal(g, freestanding)) {
       i = i + 1
       continue
     }
