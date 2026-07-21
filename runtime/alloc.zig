@@ -192,6 +192,29 @@ fn mapPages(len: usize) ?[*]align(page_align) u8 {
     return mem.ptr;
 }
 
+/// The page seam `runtime/gc/mem.bit` reaches through (#1638).
+///
+/// The Bit collector must compile for all three targets, so it cannot contain a
+/// `syscall` or a platform `extern function` itself; it names this symbol and
+/// lets the link resolve it. This definition is the one that serves while the
+/// ZIG archive is still the linked runtime, which is every program importing
+/// `runtime/gc` from source today (`tests/stress/gcbit` and its neighbours).
+/// In a Bit-sourced archive the definition is `runtime/root/{linux,darwin}`'s
+/// `rtMapPages`, pinned `bit_rt_root_map_pages` — the `bit_rt_root_` prefix
+/// every Bit port of a `root.zig` symbol carries so the two runtimes can be in
+/// one link without colliding, which G2's rename (#1583) strips to exactly this
+/// name. Spelling THIS one `bit_rt_port_alloc_map_pages` — the Bit page
+/// provider's own pin — is what a first attempt did, and it fails
+/// `tests/stress/roothostdarwin` with DuplicateSymbol: that program compiles
+/// `runtime/alloc/darwin` from source AND links this archive.
+///
+/// Returns 0 when the OS refuses, matching the Bit providers' sentinel.
+export fn bit_rt_map_pages(nbytes: i64) callconv(.c) i64 {
+    if (nbytes <= 0) return 0;
+    const mem = mapPages(@intCast(nbytes)) orelse return 0;
+    return @intCast(@intFromPtr(mem));
+}
+
 fn unmapPages(ptr: [*]u8, len: usize) void {
     if (builtin.os.tag == .windows) {
         std.os.windows.VirtualFree(@ptrCast(ptr), 0, std.os.windows.MEM_RELEASE);

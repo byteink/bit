@@ -26,6 +26,27 @@
 // is recycled by the allocator's free lists, not by the reserve, so a churning
 // program is bounded by its live set exactly as it is in the Zig.
 //
+// WHAT THE RESERVE IS NOT: A CAP (#1638)
+// --------------------------------------
+// It was one, and that was a bug, not a design. `boot` mapped a single fixed
+// 8 MiB arena, `reserveTake` returned 0 the moment the bump hit its end, and
+// nothing anywhere mapped another page — so the heap's capacity was a compile
+// time constant while `alloc.zig`'s is the machine's. Four 2 MiB slices was
+// enough to hit it; the first succeeded and the rest silently came back null.
+//
+// The fix is not a larger constant — that only moves the cliff. `reserveGrow`
+// below restores the Zig's actual behaviour: when the reserve cannot satisfy a
+// request, map a fresh chunk from the OS and bump out of that instead. The
+// reserve becomes what its name says, a batching buffer over `mapPages`, and
+// the boot arena becomes merely the first chunk.
+//
+// A DISCONTIGUOUS HEAP IS SAFE, and that is worth stating because a bump arena
+// invites the opposite assumption. Nothing in the collector requires one span:
+// `gcLoAddr`/`gcHiAddr` (../gc/gcalloc.bit) is a monotonic min/max REJECT
+// window that is allowed to span holes, the address->object index is a hash
+// table keyed on the exact body address, and `heapRefillLocked` already takes
+// an arbitrary span address. Chunks are simply new spans in a different place.
+//
 // Everything here is `@nosplit` (§10.3): it is the memory the collector and
 // allocator are built on, so it must not allocate through the managed heap and
 // must not reach a safepoint.
@@ -136,6 +157,90 @@ export @nosplit @symbol("bit_rt_port_mem_reserve_take") function reserveTake(r: 
   }
   *(r + resBump) = bump + want
   return bump
+}
+
+// ---------------------------------------------------------------------------
+// The OS page seam (#1638)
+// ---------------------------------------------------------------------------
+//
+// `runtime/gc` must compile for all three targets, so it cannot contain a
+// `syscall` (Linux-only) or a libc `extern function` with a Darwin-only symbol
+// — both are rejected on the DECLARATION, for the whole module, even uncalled
+// (SPEC §11.7/§11.8). The page mapper therefore lives per-OS and this module
+// reaches it as an ordinary undefined symbol resolved at link.
+//
+// That shape only became legal in the last two commits and both were needed:
+// #1640 admitted `extern function` calls inside a `@nosplit` body (the whole
+// allocator is `@nosplit`, so without it nothing on the allocation path could
+// call this), and #1645 stopped `--emit-obj` rejecting an `extern` whose
+// definition is not in an archive it never reads. Do not "simplify" this into
+// a direct call to `mapPages`: importing either provider makes `runtime/gc`
+// single-platform and fails 42 of the 63 freestanding emits.
+//
+// TWO DEFINITIONS ANSWER TO THIS NAME, AND NEVER BOTH IN ONE LINK. While the
+// Zig `libbitrt.a` is the runtime it is `runtime/alloc.zig`'s `bit_rt_map_pages`
+// (#1369 drops that half); in a Bit-sourced archive it is
+// `runtime/root/{linux,darwin}`'s `rtMapPages`, pinned `bit_rt_root_map_pages`,
+// which G2's rename (#1583) strips to this exact spelling.
+//
+// That prefix dance is not decoration — it is the same mechanism the whole
+// `runtime/root` port uses to sit in a link beside the `root.zig` it replaces.
+// Spelling this `bit_rt_port_alloc_map_pages`, the Bit page provider's own pin,
+// looks like the obvious choice and is wrong: the two definitions then collide
+// the moment a program compiles `runtime/alloc/darwin` from source AND links
+// the Zig archive. `tests/stress/roothostdarwin` does exactly that, and is how
+// the first attempt was caught (DuplicateSymbol).
+extern function bit_rt_map_pages(nbytes: i64): i64
+
+// Bytes the reserve asks the OS for when it has to grow. Chosen the way
+// `allocSpanBytes` is: large enough that growth is amortised to roughly one
+// syscall per chunk rather than one per span, small enough that a program with
+// a small live set does not reserve address space it will never touch.
+const reserveChunkBytes = 4194304
+
+// Take `n` bytes from the reserve, mapping a fresh chunk from the OS when it
+// no longer fits. Returns 0 only when the OS itself refuses.
+//
+// This is the growth `reserveTake` deliberately does not have, kept separate so
+// the plain bump take stays available to callers who own a fixed arena and must
+// not silently outgrow it (`runtime/chan`'s channel reserve is one).
+//
+// Rebasing abandons whatever is left in the current chunk. That is bounded by
+// the largest single request the reserve serves and happens at most once per
+// chunk, so it is a rounding error against `reserveChunkBytes` — and it keeps
+// the descriptor three words, with no chunk list to walk or free.
+@nosplit function reserveGrow(r: *i64, n: int): int {
+  let addr = reserveTake(r, n)
+  if (addr != 0) {
+    return addr
+  }
+  if (n <= 0) {
+    return 0
+  }
+  // A request larger than a chunk gets its own exactly-sized chunk.
+  let want = memRoundUp(n, 8)
+  let chunk = reserveChunkBytes
+  if (want > chunk) {
+    chunk = memRoundUp(want, reserveChunkBytes)
+  }
+  let base = int(bit_rt_map_pages(i64(chunk)))
+  if (base == 0) {
+    return 0
+  }
+  reserveInit(r, base, chunk)
+  return reserveTake(r, n)
+}
+
+// Map `nbytes` bytes straight from the OS, bypassing the reserve. This is the
+// direct-mapped (large) allocation path, and it is direct for the same reason
+// `alloc.zig`'s `allocLarge` is: the block is page-granular and individually
+// unmappable, so routing it through a bump reserve would make it permanently
+// unreclaimable (#1641).
+@nosplit function memMapPages(nbytes: int): int {
+  if (nbytes <= 0) {
+    return 0
+  }
+  return int(bit_rt_map_pages(i64(nbytes)))
 }
 
 // Bytes still available. Reported so a test can prove a churning workload is
