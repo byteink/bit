@@ -1,0 +1,297 @@
+// Linux process entry and boot sequence for the SEAM 3 remainder (#1608): the
+// `_start` stub, the `rtStartMain` stack-walker it tail-calls, and `boot` — the
+// Bit form of `runtime/root.zig`'s `startEntry`/`rtStartMain`/`boot`
+// (root.zig:1974-2130). This file OWNS the process from the first instruction
+// the kernel jumps to until the collector and scheduler are up, the user's
+// `bit_main` has run as the first green thread, and the runtime is torn down.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS LIVES IN THE PLATFORM MODULE, NOT PLATFORM-FREE `runtime/root`
+// ---------------------------------------------------------------------------
+//
+// `boot` names platform seams a platform-free module may not even DECLARE:
+// `mapPages` (raw `mmap`), `threadStart`/`threadRelease` (raw `clone`),
+// `parkSleepNs`/`parkMonoNs` (raw `clock_nanosleep`/`clock_gettime`) — all
+// `syscall`, which SPEC §11.8 rejects targeting Darwin. So `boot` cannot sit in
+// `runtime/root` (that module is emitted for aarch64-macos too) and is instead
+// duplicated function-for-function with ../darwin/boot.bit, exactly as
+// ./signal.bit is duplicated with ../darwin/signal.bit: a divergence between
+// the two is then a real platform difference, not a spelling one. The two boots
+// differ in precisely two places — the entry ABI (`_start` reads the raw kernel
+// stack; `machoMain` gets C args in registers) and the seam bindings.
+//
+// The scheduler bring-up glue (`schedInit`, `schedTaskInit`, `schedRegister`,
+// `dqPushBottom`, `schedStart`, `schedShutdown`, `schedJoin`) is NOT pinned with
+// @symbol — those take function-value parameters, which the C ABI cannot spell
+// (E0079) — so this file reaches them by ordinary mangled cross-module import,
+// the same way ./os.bit reaches `m5$allocString`. That is why this module is an
+// ARCHIVE MEMBER (emitted non-freestanding, the rootpins path) rather than a
+// standalone freestanding object: `--freestanding` refuses those mangled names.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS NOT HERE YET, AND WHY (the auxv / static-TLS entanglement)
+// ---------------------------------------------------------------------------
+//
+// `root.zig`'s `rtStartMain` also calls `initLinuxTls`: it captures the ELF
+// auxiliary vector off the initial stack and installs the main thread's static
+// TLS (AT_PHDR/AT_PHNUM -> PT_TLS). That step is DELIBERATELY ABSENT here. The
+// auxv pointer that `runtime/auxv`'s `auxv()` primitive (`bit_rt_auxv`) hands
+// back is captured today by the STILL-LIVE Zig `rtStartMain` into `root.zig`'s
+// `g_auxv`; there is no Bit-settable cell for a Bit entry to write, and
+// `bit_rt_auxv` is a permanently compiler-provided primitive (ABI.md §19, SEAM
+// 6). ABI.md §19 says the cell "moves to the boot layer when SEAM 3 ports the
+// entry" — but that move needs a primitive that does not exist. Filed as its
+// own ticket. Until it and #1369 (the archive swap that makes THIS the live
+// entry) land, the auxv capture + TLS install cannot be written without
+// inventing a shell, so it is left out and `rtStartMain` captures argc/argv/envp
+// only, through the single sanctioned path `bit_rt_port_root_os_set_args`.
+//
+// Nothing here is `@nosplit`: `boot` allocates (it maps the heap) and runs
+// before the stack-guard machinery exists, and `@nosplit` rejects `syscall`
+// anyway (E0075). `mainTrampoline` calls the user's `bit_main`, arbitrary work
+// that must reach safepoints, so it is not `@nosplit` either.
+
+import { mapPages } from "../../alloc/linux"
+import { threadStart, threadRelease } from "../../thread/linux"
+import { schedStart, schedJoin } from "../../thread"
+import { parkSleepNs } from "../../park/linux"
+import {
+  schedInit, schedTaskInit, schedRegister, schedShutdown,
+  schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller,
+  schedTaskExit, dqPushBottom, taskAt,
+  schedStackBytes, schedStackAligned, wkDeque,
+} from "../../sched"
+import { rootBindMemory, rootInit, rootConfigure, osSetArgs } from "../../root"
+
+// `loadWord` (../../gc) and `parkMonoNs` (../../park/linux) are already imported
+// by sibling ./io.bit and ./time.bit; siblings share one module scope, so they
+// are used here directly — re-importing either is E0042.
+
+// The per-program entry the compiled user object defines (ABI.md §10). Reachable
+// as an `extern function` since #1614 whitelisted `bit_main` in the E0078
+// archive gate; it resolves to `U bit_main` at final program link, exactly as
+// `root.zig`'s `extern fn bit_main` does. This is the ONE sanctioned extern in
+// the root tree that names no archive-resident symbol.
+extern function bit_main(): i32
+
+// ---------------------------------------------------------------------------
+// Boot-time storage (single-worker, ABI.md §5)
+// ---------------------------------------------------------------------------
+//
+// ABI.md §5 pins the scheduler to one worker, so exactly one worker block, one
+// green-task block and one task stack are needed. All are module-level and
+// unlocked, sound because `boot` fills them once on the boot thread BEFORE the
+// single worker's OS thread exists (the register-before-steal precondition
+// `schedStart` documents). Scalar `i64`/`i32` arrays are never scanned by the
+// collector (rule 1). Sizes are the exported layout widths: `schedWords` = 16,
+// `workerWords` = 292, a task block = 32 words.
+let schedBlock: [16]i64
+let workerBlock: [292]i64
+let mainTaskBlock: [32]i64
+
+// The main green thread's stack: one 64KiB stack, 64KiB-aligned. Carved from a
+// 128KiB region so an aligned 64KiB window always fits wherever the array
+// landed — the ../../../tests/stress/schedpool carve, applied to a single stack.
+let taskStackArea: [16384]i64
+
+// The three areas `schedStart`/`schedJoin` fill and reap, sized for one worker:
+// one 2-word argument block, one done word, one handle slot.
+let startArgs: [2]i64
+let startDones: [1]i32
+let startHandles: [1]i64
+
+// The main green thread's result, published across the boot thread's poll-wait.
+// `mainExitCode` is the process exit code; `mainDone` is the release flag the
+// poll loop acquires on — the Bit form of `root.zig`'s `MainRun{exit_code,done}`.
+let mainExitCode: int = 0
+let mainDone: i32 = 0
+
+// Heap geometry. 8 MiB object arena + 128 KiB span index, `runtime/root`'s own
+// proven bring-up sizes (tests/stress/rootbit). `mapPages` rounds to the true
+// page size; 4096 is passed as the nominal page size `rootBindMemory` records,
+// matching every other bring-up.
+const arenaWords: int = 1048576
+const indexWords: int = 16384
+const pageSize: int = 4096
+const markStack: int = 4096
+
+// GC tuning defaults (`gc.zig`'s `Config{}`). `root.zig`'s `configFromEnv` reads
+// BIT_GC/BIT_GC_STATS/BIT_GC_MIN_KB/... over these; that env parse needs a
+// string-construction helper on the boot path and is a documented follow-up, so
+// `boot` installs the defaults in the same sequence slot for now.
+const minTrigger: int = 65536
+const growthPct: int = 200
+
+// Join deadline: generous next to real teardown (a worker leaves `schedWorkerRun`
+// microseconds after shutdown is signalled) and finite so a wedge fails rather
+// than hangs. Matches the stress harnesses' `WAIT_NS`.
+const joinTimeoutNs: int = 15000000000
+
+// Round `addr` up to the next 64KiB stack boundary (`schedStackAligned`'s
+// contract). One add-and-mask, no allocation.
+function alignUpStack(addr: int): int {
+  let bumped = addr + schedStackBytes - 1
+  return bumped - bumped % schedStackBytes
+}
+
+// The worker OS-thread entry: unpack the {worker address, done-word address}
+// block `schedStart` armed, drive green tasks until shutdown, then clear the
+// done word so `schedJoin` observes the worker has left. The no-timer/no-poller
+// seam is the proven single-worker configuration (the netpoller is unported —
+// #1600); wiring real timers/netpoll through `schedWorkerRun`'s `nowFn`/`pollFn`
+// is a follow-up the scheduler core already admits. Same shape as
+// `poolWorkerEntry`.
+function workerBody(arg: *byte): *byte {
+  let block = taskAt(int(arg))
+  let workerAddr = *block
+  let doneAddr = *(block + 1)
+
+  schedWorkerRun(taskAt(workerAddr), schedNoTimers, schedNoPoller)
+
+  let z: *i32 = nil
+  atomicStore(z + doneAddr / 4, i32(0))
+  return nil
+}
+
+// The first green thread: run the user's `bit_main`, publish its exit code, then
+// leave the task through `schedTaskExit`. `root.zig`'s `mainTrampoline`. Not
+// `@nosplit` — `bit_main` is the whole user program and must reach safepoints.
+function mainTrampoline() {
+  mainExitCode = int(bit_main())
+  atomicStore(ptrOf(mainDone), i32(1))
+  schedTaskExit()
+}
+
+// Boot the collector and scheduler, run `bit_main` as the first green thread,
+// wait for it, tear down, and return the process exit code. THE ORDER IS
+// LOAD-BEARING and mirrors `root.zig`'s `boot` (root.zig:1974-2011) exactly:
+// heap before collector (the collector takes the heap's address), collector
+// before scheduler, scheduler populated on the boot thread before any worker
+// exists, then start -> wait -> shutdown -> join. A wrong order is a hang or
+// heap corruption, not a compile error. 70 (EX_SOFTWARE) on any setup failure,
+// the boot path's non-recoverable exit code.
+function boot(): int {
+  // 1. Ignore SIGPIPE process-wide (./signal.bit, this module).
+  ignoreSigpipe()
+
+  // 2. Map and bind the heap, then start the collector and type descriptors.
+  let spanBytes = arenaWords * 8
+  let idxBytes = indexWords * 8
+  let span = mapPages(spanBytes)
+  let idx = mapPages(idxBytes)
+  if (span == 0 || idx == 0) {
+    return 70
+  }
+  rootBindMemory(span, spanBytes, idx, idxBytes, pageSize)
+  if (!rootInit(markStack)) {
+    return 70
+  }
+
+  // 3. GC config (env parse is the documented follow-up; defaults for now).
+  rootConfigure(true, false, minTrigger, growthPct, false)
+
+  // 4. Scheduler over the single worker block.
+  let sched: *i64 = ptrOf(schedBlock)
+  schedInit(sched, int(ptrOf(workerBlock)), 1)
+
+  // 5. Place `bit_main`'s task on worker 0's deque. Register BEFORE queueing so
+  //    the worker can never steal a task the registry does not yet know (the
+  //    collector must find every live stack).
+  let stackBase = alignUpStack(int(ptrOf(taskStackArea)))
+  if (!schedStackAligned(stackBase)) {
+    return 70
+  }
+  let task = int(ptrOf(mainTaskBlock))
+  let t: *i64 = ptrOf(mainTaskBlock)
+  schedTaskInit(t, stackBase, schedStackBytes, entryOf(mainTrampoline), 0)
+  schedRegister(sched, task)
+  if (!dqPushBottom(schedWorkerAt(sched, 0) + wkDeque, task)) {
+    return 70
+  }
+
+  // 6. Bring the worker up on a real OS thread.
+  let started = schedStart(sched, 1, entryOf(workerBody),
+                           ptrOf(startArgs), ptrOf(startDones), ptrOf(startHandles),
+                           threadStart)
+  if (started != 1) {
+    return 70
+  }
+
+  // 7. This OS thread is not a worker, so it waits for `main` the way any
+  //    external caller would: poll with bounded exponential backoff, the same
+  //    shape as `sched.zig`'s idle loop. Unbounded by design — it waits for the
+  //    program itself to finish.
+  let backoff = 1000
+  while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+    parkSleepNs(backoff)
+    backoff = backoff * 2
+    if (backoff > 1000000) {
+      backoff = 1000000
+    }
+  }
+
+  // 8. Signal shutdown, reap the worker, and report the code. `schedJoin` after
+  //    `schedShutdown` guarantees no worker still touches scheduler or task
+  //    state, the precondition for reading `mainExitCode`.
+  schedShutdown(sched)
+  schedJoin(started, ptrOf(startDones), ptrOf(startHandles), joinTimeoutNs,
+            parkSleepNs, parkMonoNs, threadRelease)
+  return mainExitCode
+}
+
+// The Linux stack-walk entry `_start` tail-calls. `sp` points at the raw initial
+// stack the kernel built: `[argc][argv0]..[argvN-1][NULL][envp0]..[NULL][auxv]`.
+// Captures argc/argv/envp through the SINGLE sanctioned path
+// (`bit_rt_port_root_os_set_args`), boots, and exits with the returned code.
+// `root.zig`'s `rtStartMain`, minus the `initLinuxTls` step (see the header).
+//
+// Reached by `_start` taking `entryOf(rtStartMain)` as an `asm` input operand —
+// a real reference, not a symbolic branch target (§11.6 forbids those) — which
+// is what keeps this function (and thus `bit_main`) live under `_start`'s own
+// liveness, exactly as `root.zig` ties the two with `"r" (&rtStartMain)`.
+function rtStartMain(sp: int) {
+  let argc = loadWord(sp)
+  let argvBase = sp + 8
+  // envp starts past argv[0..argc) and its own NULL terminator.
+  let envpBase = argvBase + (argc + 1) * 8
+  osSetArgs(argc, argvBase, envpBase)
+  let code = boot()
+  rootExit(code)
+}
+
+// `_start`: the process entry the linker points `e_entry` at. Naked — there is
+// no caller, no return address, no valid frame — so it hands off to the ordinary
+// `rtStartMain` before anything the C convention assumes is set up. Hand-encoded
+// instruction bytes (x64) / words (arm64), verified by disassembly, NOT the
+// build going green (§11.6: no text assembler exists).
+//
+// x86_64:  31 ED        xor  ebp, ebp     ; mark outermost frame
+//          48 89 E7     mov  rdi, rsp     ; capture kernel sp (-> argc) BEFORE realign
+//          48 83 E4 F0  and  rsp, -16     ; ABI 16-byte stack alignment
+//          FF D0        call rax          ; rax = entryOf(rtStartMain)
+//          F4           hlt               ; rtStartMain is noreturn; unreachable
+//
+// aarch64: 910003E0     mov  x0, sp       ; add x0, sp, #0 — pass kernel sp
+//          D63F0020     blr  x1           ; x1 = entryOf(rtStartMain)
+//          D4200000     brk  #0           ; unreachable
+//
+// The `input` materialises `entryOf(rtStartMain)` into rax (x64) / x1 (arm64)
+// before the block; the compiler's naked epilogue (a dead ret) trails the
+// hlt/brk, matching `root.zig`'s `hlt`/`brk #0` + unreachable.
+//
+// PINNED `bit_rt_root_start` (ABI placeholder), NOT the literal `_start`: the
+// live `libbitrt.a` is still the Zig runtime, which already defines `_start`
+// (root.zig's `machoMain`/`startEntry` export). Any program that imports this
+// platform module (e.g. tests/stress/sigpipe* for `ignoreSigpipe`) links that
+// archive, so a literal `_start` here is a DuplicateSymbol at link — the exact
+// reason every ABI name in this tree waits under a `bit_rt_root_` placeholder.
+// G2 (#1583) / the #1369 archive swap claims the real `_start` entry name; the
+// entry is a documented special case there (the linker designates `_start` as
+// `e_entry` by name — ABI.md §9), not the plain `_root`-infix drop.
+@naked @symbol("bit_rt_root_start") function startEntry() {
+  return asm volatile {
+    x64   { 0x31, 0xED, 0x48, 0x89, 0xE7, 0x48, 0x83, 0xE4, 0xF0, 0xFF, 0xD0, 0xF4 }
+    arm64 { 0x910003E0, 0xD63F0020, 0xD4200000 }
+    input arm64 x1 x64 rax = entryOf(rtStartMain)
+  }
+}
