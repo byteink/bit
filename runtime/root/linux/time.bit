@@ -1,0 +1,103 @@
+// Linux time provider for the SEAM 3 remainder (#1604): the three `bit_rt_time_*`
+// ABI symbols (ABI.md §18). This is the Bit form of `runtime/root.zig`'s time
+// block (`bit_rt_time_mono_ns`/`_unix_ns`/`_sleep_ns`) plus the Linux branch of
+// `runtime/sched.zig`'s `realtimeNs`, fused into one self-contained module member.
+//
+// THE THREE ARE NOT EQUAL WORK, and each is deliberately a different mechanism:
+//
+//   - `mono_ns` is a PIN, not a port. The monotonic clock is already read by
+//     `runtime/park/linux`'s `parkMonoNs` (clock_gettime CLOCK_MONOTONIC); this
+//     wrapper reuses that exact body rather than opening a second copy of the
+//     syscall, so the two can never drift. `sched.zig`'s `bit_rt_time_mono_ns`
+//     likewise just forwards to `sched.monoNs()`.
+//   - `unix_ns` is a REAL port: CLOCK_REALTIME does not exist anywhere in the Bit
+//     runtime yet (only CLOCK_MONOTONIC), so this opens a new clock_gettime with
+//     a new clock id. It is the same shape as `parkMonoNs`, differing only in the
+//     clock constant (0 vs 1) — the one line `realtimeNs` and `monoNs` differ by.
+//   - `sleep_ns` is MARSHALLING to the scheduler, not a new timer. It parks the
+//     green thread on `runtime/sched`'s `schedSleepUntil`, which links the task on
+//     the `TimerQueue` and yields the worker (ABI.md §18: "park this green thread
+//     for >= ns"). It must NOT touch `parkSleepNs`, which blocks the OS thread.
+//
+// EVERY SYSCALL NUMBER AND CLOCK CONSTANT BELOW WAS READ OUT OF THE PINNED ZIG
+// STDLIB (std/os/linux/syscalls.zig's `X64`/`Arm64` clock_gettime, linux.zig's
+// clockid_t REALTIME/MONOTONIC), NOT FROM MEMORY. A wrong clock id here is a
+// silent wrong-TIME hazard — it compiles and runs, it just reports the wrong
+// clock — which is exactly the failure the mutation test forces and observes.
+//
+// SELF-CONTAINED (the io.bit/fs.bit shape), NOT the netabi extern shape: see
+// ../fs.bit's header for why `rejectExternForTarget` breaks the netabi shape on a
+// Linux `--emit-obj`. `nr` (the per-arch syscall-number selector) is io.bit's
+// module-scoped helper and is reused, not re-declared (E0042). The two cross-
+// module reaches — `parkMonoNs` for the clock and `schedSleepUntil`/`schedYield`
+// for the park — are ordinary `import`s, exactly as ../fs.bit reaches root/gc.
+//
+// Nothing here is `@nosplit`: `@nosplit` REJECTS `syscall` (E0075, the reason
+// io.bit gives), and `mono_ns`/`sleep_ns` reach bodies that trap or context-
+// switch. That is also why this path cannot become a freestanding archive member
+// until #1369 lifts the restriction — the same cost ../linux/io.bit documents.
+
+import { parkMonoNs } from "../../park/linux"
+import { schedSleepUntil, schedYield } from "../../sched"
+
+// clock_gettime: x86_64 nr 228, aarch64 nr 113 (std/os/linux/syscalls.zig, the
+// same pair `runtime/park/linux/wait.bit` reads for CLOCK_MONOTONIC). `nr` is
+// io.bit's module-scoped x64/arm64 selector.
+function nrClockGettime(): int { return nr(228, 113) }
+
+// CLOCK_REALTIME = 0 (linux.zig clockid_t). CLOCK_MONOTONIC = 1 is `parkMonoNs`'s
+// clock and is not opened here — the one constant that separates a wall clock
+// that can jump from a monotonic one that cannot.
+const clockRealtime: int = 0
+
+// Nanoseconds per second — named because the timespec split is easy to get subtly
+// wrong spelled as a bare literal (../../park/linux/wait.bit names it for the same
+// reason).
+const nsPerSec: int = 1000000000
+
+// `bit_rt_time_mono_ns` (ABI.md §18): monotonic nanoseconds; never jumps, measures
+// elapsed. A PIN over `parkMonoNs` — the same clock_gettime CLOCK_MONOTONIC read,
+// reused rather than duplicated. `root.zig`'s body is `sched.monoNs()`, the twin
+// of `parkMonoNs`.
+export @symbol("bit_rt_root_time_mono_ns") function rtTimeMonoNs(): int {
+  return parkMonoNs()
+}
+
+// `bit_rt_time_unix_ns` (ABI.md §18): wall-clock nanoseconds since the Unix epoch.
+// Can jump (NTP, clock set), so it dates events and never measures durations.
+// clock_gettime(CLOCK_REALTIME) into a `timespec` {sec, nsec} — two 64-bit words,
+// addressed with `ptrOf` (§11.5), identical to `parkMonoNs` but for the clock id.
+//
+// Returns 0 if the kernel refuses, matching `parkMonoNs`'s failure report rather
+// than reading back an uninitialised buffer (`realtimeNs` ignores the return code
+// like `monoNs`; reporting 0 is the one strictly-safer deviation both share).
+export @symbol("bit_rt_root_time_unix_ns") function rtTimeUnixNs(): int {
+  let ts = []i64(2)
+  let rc = int(syscall(nrClockGettime(), i64(clockRealtime), i64(int(ptrOf(ts)))))
+  if (rc != 0) {
+    return 0
+  }
+  return int(ts[0]) * nsPerSec + int(ts[1])
+}
+
+// `bit_rt_time_sleep_ns` (ABI.md §18): park the calling green thread for at least
+// `ns`, leaving its worker free to run other tasks. `root.zig`'s `bit_rt_time_
+// sleep_ns`: a non-positive duration just yields the worker (`schedYield`), and a
+// positive one parks on the scheduler's timer queue until the absolute deadline.
+//
+// `schedSleepUntil` takes an ABSOLUTE deadline on the monotonic clock that a
+// worker's idle path drives `schedTimerExpire` with — which is `parkMonoNs`
+// (runtime/sched/worker.bit's `nowFn`). So the deadline is `parkMonoNs() + ns`,
+// computed here because `schedSleepUntil` has no clock of its own to add to. This
+// is the one line `sched.zig` folds inside `sleepTask` (`monoNs() + ns`).
+//
+// NOT `parkSleepNs`: that blocks the OS thread and would freeze the worker's other
+// tasks, defeating the whole point of a green-thread sleep (ABI.md §18: "Never
+// blocks the OS thread").
+export @symbol("bit_rt_root_time_sleep_ns") function rtTimeSleepNs(ns: int) {
+  if (ns <= 0) {
+    schedYield()
+    return
+  }
+  schedSleepUntil(parkMonoNs() + ns)
+}
