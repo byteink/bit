@@ -43,9 +43,9 @@ import { threadStart, threadRelease } from "../../thread/darwin"
 import { schedStart, schedJoin } from "../../thread"
 import { parkSleepNs } from "../../park/darwin"
 import {
-  schedInit, schedTaskInit, schedRegister, schedShutdown,
+  schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
   schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller,
-  schedTaskExit, dqPushBottom, taskAt,
+  schedTaskExit, dqPushBottom, taskAt, taskWords,
   schedStackBytes, schedStackAligned, wkDeque,
 } from "../../sched"
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, osSetArgs } from "../../root"
@@ -72,6 +72,12 @@ let startDones: [1]i32
 let startHandles: [1]i64
 let mainExitCode: int = 0
 let mainDone: i32 = 0
+
+// The process-global scheduler address (`sched.zig`'s `g_sched`) — see
+// ../linux/boot.bit's `gSched` for why the otherwise caller-owned runtime needs
+// one: `bit_rt_spawn(fn_ptr, arg)` carries no scheduler argument. Untraced
+// scalar module state (rule 1).
+let gSched: int = 0
 
 const arenaWords: int = 1048576
 const indexWords: int = 16384
@@ -135,9 +141,11 @@ function boot(): int {
   //    is captured by now.
   rootConfigureFromEnv(true, false, minTrigger, growthPct, false)
 
-  // 4. Scheduler over the single worker block.
+  // 4. Scheduler over the single worker block. Publish it for `bit_rt_root_spawn`
+  //    the moment it exists (the Bit form of `root.zig` assigning `g_sched`).
   let sched: *i64 = ptrOf(schedBlock)
   schedInit(sched, int(ptrOf(workerBlock)), 1)
+  spawnBindScheduler(int(sched))
 
   // 5. Place `bit_main`'s task on worker 0's deque; register before queueing.
   let stackBase = alignUpStack(int(ptrOf(taskStackArea)))
@@ -175,6 +183,48 @@ function boot(): int {
   schedJoin(started, ptrOf(startDones), ptrOf(startHandles), joinTimeoutNs,
             parkSleepNs, parkMonoNs, threadRelease)
   return mainExitCode
+}
+
+// ---------------------------------------------------------------------------
+// bit_rt_spawn — the whole spawn job (#1611). Kept function-for-function with
+// ../linux/boot.bit; see its section header for the full rationale.
+// ---------------------------------------------------------------------------
+
+// Publish the scheduler `boot` created so `bit_rt_root_spawn` can reach it — the
+// single write path for `gSched`. Exported so the #1611 end-to-end test can bind
+// a scheduler it drives itself.
+export function spawnBindScheduler(schedAddr: int) {
+  gSched = schedAddr
+}
+
+// `bit_rt_spawn(fn_ptr, arg)` — the whole spawn job under the ABI placeholder G2
+// (#1583) renames. Recover the scheduler (`gSched`), map the task's stack and
+// carve its 64KiB-aligned window, allocate the task block, `schedTaskInit` it
+// with (entry, arg), then `schedSpawn` (register + queue). NOT `@nosplit` (it
+// maps). Stack and task block are raw `mapPages` mappings, never the GC heap,
+// exactly as ../linux/boot.bit's `rtSpawn` and `root.zig`'s `Task.create`.
+export @symbol("bit_rt_root_spawn") function rtSpawn(entry: *byte, arg: int) {
+  if (gSched == 0) {
+    rootExit(70)
+  }
+  let s = taskAt(gSched)
+
+  let region = mapPages(schedStackBytes * 2)
+  if (region == 0) {
+    rootExit(70)
+  }
+  let stackBase = alignUpStack(region)
+  if (!schedStackAligned(stackBase)) {
+    rootExit(70)
+  }
+
+  let taskAddr = mapPages(taskWords * 8)
+  if (taskAddr == 0) {
+    rootExit(70)
+  }
+
+  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes, entry, arg)
+  schedSpawn(s, taskAddr)
 }
 
 // The macOS entry point. dyld's `LC_MAIN` (the Mach-O writer, #345) calls this

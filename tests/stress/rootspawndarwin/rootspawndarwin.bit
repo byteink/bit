@@ -1,0 +1,116 @@
+// End-to-end proof of `bit_rt_root_spawn` (#1611): the wrapper really spawns a
+// green thread from just `(entry, arg)`, on a running scheduler.
+//
+// WHAT THIS EXERCISES THAT SYMBOL-PRESENCE DOES NOT. `rootpins` proves
+// `bit_rt_root_spawn` is defined and self-cycle-free; it says nothing about
+// whether the composition inside it works. This drives the wrapper: bind a
+// scheduler the test owns (`spawnBindScheduler`), call `rtSpawn(entryOf(body),
+// arg)` — which maps a stack, allocates a task block, `schedTaskInit`s it and
+// `schedSpawn`s it — then run the worker on THIS thread and observe the task
+// run to completion. The wrapper itself maps everything; the test maps nothing.
+//
+// WHY THE OBSERVABLES ARE LOAD-BEARING, i.e. why a param swap reddens this.
+// `rtSpawn(entry, arg)` puts `entry` in the task's resume pc and `arg` in its
+// `taskArg` word. So:
+//   - `ran` is set only from the far side of the context switch into `taskBody`,
+//     which happens only if the worker resumed a task whose pc == the code of
+//     `taskBody` — i.e. the wrapper wired `entry` correctly.
+//   - `gotArg` is the value `taskBody` reads back out of its own `taskArg` —
+//     i.e. the `arg` the wrapper stored.
+// Swap the wrapper's two parameters and the task's pc becomes `arg` (a small
+// integer, not code): the worker branches to it and the process dies before any
+// output. Drop `schedTaskInit` and the task block is uninitialised: same crash.
+// Either way this program produces no `spawned true ...` line and the golden
+// diff fails — the mutation the #1611 acceptance names.
+//
+// Darwin-only: it imports `runtime/root/darwin`, whose boot module binds
+// libSystem `extern function`s (mmap/pthread) that both Linux targets reject
+// (E0078) even uncalled. Its Linux counterpart (`runtime/root/linux`'s identical
+// `rtSpawn`) is covered by `rootpins` + `bit build --emit-obj --target
+// x86_64-linux`; a running Linux proof waits on a Linux host, exactly as every
+// SEAM 3 piece did.
+//
+// Single OS thread on purpose: `schedWorkerRun` drives the green task by context
+// switch on the calling thread, so this proves the map+init+register+queue+run
+// chain without an OS-thread variable in it. The cross-thread migration property
+// is already covered by ../schedpooldarwin.
+
+import { rtSpawn, spawnBindScheduler } from "../../../runtime/root/darwin"
+import { schedInit, schedWorkerAt, schedWorkerRun, schedShutdown, schedTaskExit } from "../../../runtime/sched"
+import { schedNoTimers, schedCurrentTask, taskAt, taskArg } from "../../../runtime/sched"
+
+// The distinctive word the spawned task echoes back — 0xBEEF, chosen so a wrong
+// value (a swapped or dropped arg) is unmistakable in the diff.
+const spawnArg: int = 48879
+
+// One worker: the property is "a spawned task runs", which one worker driven on
+// this thread proves. Sizes are the exported layout widths.
+let schedBlock: [16]i64
+let workerBlock: [292]i64
+
+// Written by the spawned task, read by the driver after the worker returns.
+// Untraced module state (rule 1); the collector must never walk it.
+let obsArg: i64 = 0
+let obsRan: i64 = 0
+
+// Addresses resolved once on this ordinary thread and carried as integers,
+// because `ptrOf` is rejected inside a `@nosplit` task body (#1421) — the
+// workaround every scheduler stress body uses.
+let addrArg: i64 = 0
+let addrRan: i64 = 0
+let addrSched: i64 = 0
+
+// A task that never runs must FAIL, not hang. This backstop rides the idle
+// poll hook — a path taken on every idle pass regardless of the queue — so it
+// still fires if the spawn produced no runnable task at all. Past the bound it
+// shuts the scheduler down; the program then prints `spawned false ...` and the
+// golden diff fails with the reason visible, rather than wedging for the kill
+// guard. The bound is reached by the loop's own idle progress, so this cannot be
+// flaky on a loaded machine.
+let idlePasses: i64 = 0
+const idleGiveUp: int = 100000
+
+function idleGuard(schedAddr: int, timeoutMs: int): int {
+  idlePasses = idlePasses + 1
+  if (int(idlePasses) > idleGiveUp) {
+    schedShutdown(taskAt(schedAddr))
+  }
+  return 0
+}
+
+// The spawned green thread. `@nosplit` like every task body (its stack is
+// reached by the conservative scan, not a published safepoint frame). It reads
+// its own `taskArg` — the word the wrapper stored — records it and a ran-flag,
+// shuts the scheduler down from the far side of having run (so termination
+// depends on the property under test), and leaves through `schedTaskExit`.
+@nosplit function taskBody() {
+  let me = *(taskAt(schedCurrentTask()) + taskArg)
+  atomicStore(taskAt(addrArg), me)
+  atomicStore(taskAt(addrRan), 1)
+  schedShutdown(taskAt(addrSched))
+  schedTaskExit()
+}
+
+function main() {
+  let s = taskAt(int(ptrOf(schedBlock)))
+  schedInit(s, int(ptrOf(workerBlock)), 1)
+
+  addrArg = int(ptrOf(obsArg))
+  addrRan = int(ptrOf(obsRan))
+  addrSched = int(ptrOf(schedBlock))
+
+  // Bind the scheduler the wrapper will recover, then spawn through the wrapper
+  // from just (entry, arg). This call — not any hand-rolled composition — is
+  // what maps the stack, allocates the task and queues it.
+  spawnBindScheduler(int(ptrOf(schedBlock)))
+  rtSpawn(entryOf(taskBody), spawnArg)
+
+  // Run the worker on this thread; it steals the spawned task off the global
+  // queue and switches into it. Returns once `taskBody`'s `schedShutdown` (or
+  // the idle backstop) stops the scheduler.
+  schedWorkerRun(schedWorkerAt(s, 0), schedNoTimers, idleGuard)
+
+  let ran = int(obsRan) != 0
+  let gotArg = int(obsArg)
+  println("spawned ${ran} arg ${gotArg}")
+}

@@ -66,9 +66,9 @@ import { tlsAreaBytes, tlsPrepare, tlsUnavailable, setThreadPointer } from "../.
 import { schedStart, schedJoin } from "../../thread"
 import { parkSleepNs } from "../../park/linux"
 import {
-  schedInit, schedTaskInit, schedRegister, schedShutdown,
+  schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
   schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller,
-  schedTaskExit, dqPushBottom, taskAt,
+  schedTaskExit, dqPushBottom, taskAt, taskWords,
   schedStackBytes, schedStackAligned, wkDeque,
 } from "../../sched"
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, osSetArgs, osSetAuxv } from "../../root"
@@ -115,6 +115,17 @@ let startHandles: [1]i64
 // poll loop acquires on — the Bit form of `root.zig`'s `MainRun{exit_code,done}`.
 let mainExitCode: int = 0
 let mainDone: i32 = 0
+
+// The process-global scheduler address, the Bit form of `sched.zig`'s `g_sched`.
+// The rest of this runtime is strictly caller-owned — every scheduler path takes
+// an explicit `s` — but `bit_rt_spawn(fn_ptr, arg)` carries no scheduler
+// argument (ABI.md §10), so the wrapper that implements it must recover the
+// scheduler from process-global state, exactly as `root.zig`'s
+// `g_sched.spawn(fn_ptr, arg)` does. `boot` publishes the block address here
+// once `schedInit` has run (via `spawnBindScheduler`); `rtSpawn` reads it.
+// Untraced scalar module state (rule 1) — it holds a raw block address, never a
+// GC object.
+let gSched: int = 0
 
 // Heap geometry. 8 MiB object arena + 128 KiB span index, `runtime/root`'s own
 // proven bring-up sizes (tests/stress/rootbit). `mapPages` rounds to the true
@@ -203,9 +214,12 @@ function boot(): int {
   //    is captured by now.
   rootConfigureFromEnv(true, false, minTrigger, growthPct, false)
 
-  // 4. Scheduler over the single worker block.
+  // 4. Scheduler over the single worker block. Publish it for `bit_rt_root_spawn`
+  //    the moment it exists, so a `spawn` from anywhere in the program can find
+  //    it — the Bit form of `root.zig` assigning the module-global `g_sched`.
   let sched: *i64 = ptrOf(schedBlock)
   schedInit(sched, int(ptrOf(workerBlock)), 1)
+  spawnBindScheduler(int(sched))
 
   // 5. Place `bit_main`'s task on worker 0's deque. Register BEFORE queueing so
   //    the worker can never steal a task the registry does not yet know (the
@@ -250,6 +264,73 @@ function boot(): int {
   schedJoin(started, ptrOf(startDones), ptrOf(startHandles), joinTimeoutNs,
             parkSleepNs, parkMonoNs, threadRelease)
   return mainExitCode
+}
+
+// ---------------------------------------------------------------------------
+// bit_rt_spawn — the whole spawn job (#1611)
+// ---------------------------------------------------------------------------
+
+// Publish the scheduler `boot` created so `bit_rt_root_spawn` can reach it. The
+// SINGLE write path for `gSched` (mirroring `osSetArgs`), so the invariant
+// "`gSched` names the live scheduler" is established in exactly one place.
+// Exported so a driver that runs its own scheduler (the #1611 end-to-end test)
+// can bind it before spawning.
+export function spawnBindScheduler(schedAddr: int) {
+  gSched = schedAddr
+}
+
+// `bit_rt_spawn(fn_ptr, arg)` — the WHOLE spawn job, under the ABI placeholder
+// G2 (#1583) renames to `bit_rt_spawn`. Codegen lowers the `spawn` keyword to
+// `bit_rt_spawn(trampoline_code_ptr, thunk_data_ptr)` (selfhost/lower.bit
+// `lowerSpawn`): a code pointer plus one opaque data word — exactly this
+// 2-argument signature (`entry: *byte`, `arg: int`; both C-representable, so no
+// E0079). `root.zig`'s `bit_rt_spawn` is `g_sched.spawn(fn_ptr, arg)` =
+// `Task.create` (map a stack + allocate the Task + build its entry context) then
+// register and queue (sched.zig:1205). This is that composition in Bit:
+//
+//   1. recover the scheduler from `gSched` (`bit_rt_spawn` gets no `s`);
+//   2. map the task's stack and carve its `schedStackBytes`-aligned window;
+//   3. allocate the task control block;
+//   4. `schedTaskInit` it with (entry, arg) — entry becomes the resume pc, arg
+//      the `taskArg` word, the same pair `Task.create` records;
+//   5. hand it to the scheduler (`schedSpawn` = register + queue).
+//
+// NOT `@nosplit`: it maps, and `mmap` is a `syscall` that E0075 forbids in a
+// nosplit body. The stack and task block are RAW mappings (`mapPages`), never
+// the GC heap — like `root.zig`'s `page_allocator.create(Task)`, and because the
+// scheduler holds both by raw address and the collector reaches the task through
+// the registry (`schedSpawn`'s `schedRegister`), not as a heap object. Each is
+// mapped per spawn and not reclaimed here; a stack/task freelist is the
+// sanctioned optimization (#1422), out of this wrapper's scope. A map failure or
+// an unbound scheduler is unrecoverable, so — like `root.zig`'s
+// `catch fatal("out of memory")` — this aborts rather than silently dropping the
+// green thread.
+export @symbol("bit_rt_root_spawn") function rtSpawn(entry: *byte, arg: int) {
+  if (gSched == 0) {
+    rootExit(70)
+  }
+  let s = taskAt(gSched)
+
+  // A `schedStackBytes` usable stack, carved 64KiB-aligned from a 2x region so an
+  // aligned window fits wherever `mapPages` landed — the same carve `boot` uses
+  // for the main task's stack, done dynamically here.
+  let region = mapPages(schedStackBytes * 2)
+  if (region == 0) {
+    rootExit(70)
+  }
+  let stackBase = alignUpStack(region)
+  if (!schedStackAligned(stackBase)) {
+    rootExit(70)
+  }
+
+  // The task control block, off the GC heap (root.zig's `page_allocator`).
+  let taskAddr = mapPages(taskWords * 8)
+  if (taskAddr == 0) {
+    rootExit(70)
+  }
+
+  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes, entry, arg)
+  schedSpawn(s, taskAddr)
 }
 
 // Upper bound on the envp walk (Power of 10 rule 2). A well-formed `envp` hits
