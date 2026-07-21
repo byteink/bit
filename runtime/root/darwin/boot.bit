@@ -50,8 +50,10 @@ import {
   schedStackBytes, schedStackAligned, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
 } from "../../sched"
-import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, osSetArgs } from "../../root"
+import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootStatOom, osSetArgs } from "../../root"
+import { rootGcAddr } from "../../root"
 import { chanBootBind } from "../../chan"
+import { stwBind, stwCollections, stwSwept, stwLiveObjects, stwAbandonedCount } from "../../stw"
 
 // `parkMonoNs` (../../park/darwin) is already imported by sibling ./time.bit;
 // siblings share one module scope, so it is used here directly — re-importing it
@@ -161,6 +163,86 @@ function mainTrampoline() {
   schedTaskExit()
 }
 
+// ---------------------------------------------------------------------------
+// The `BIT_GC_STATS` line (#1639) — kept identical in ../linux/boot.bit
+// ---------------------------------------------------------------------------
+//
+// `gc.zig`'s `collect` prints `[bit-gc] collection N: ...` per collection. THIS
+// PORT CANNOT PRINT FROM THERE: every function on the collection path is
+// `@nosplit`, which admits no `print`, no `extern` call and no `syscall`
+// (`runtime/gc` deviation 6, E0075). So the flag's OWNER is boot, which is
+// ordinary Bit sitting next to ./io.bit's write primitive, and the shape becomes
+// one SUMMARY line at exit instead of one line per collection.
+//
+// That deviation is worth naming precisely, because #1639 measured the missing
+// output and the missing collections together: a Bit-runtime binary printed
+// nothing under `BIT_GC_STATS=1` for TWO independent reasons, and fixing only
+// the wiring would still have printed nothing. `swept=` and `live=` are on the
+// line for the same reason — a count alone cannot tell a collector that
+// reclaims from one that marks everything.
+//
+// Text is emitted through `writeConst` (packed byte constants) rather than
+// string literals: this module is `--freestanding` (#1628) and builds no
+// managed string. The decimals go through ./os.bit's `osWriteDecimal`, a
+// sibling.
+
+// The line is assembled in MODULE STATE and written in ONE call, and it
+// allocates nothing. That is a hard requirement, not tidiness: this runs on the
+// boot thread after the worker is joined, i.e. after a whole run's worth of
+// collection, and `[]int(n)` there returned 0 on roughly 40% of runs at
+// 65k-collection density — a null the decimal writer then stored through
+// (`strb w19, [x20]`, x20 = 4). ../io.bit's `writeConst` allocates too, so it is
+// not used here either. `panicWrite` states the same rule for the same reason:
+// the one path that must work when allocation is what failed cannot allocate.
+// The residual question the null raised — whether a boot-thread allocation can
+// fail after a heavy collected run — is filed separately (#1643); it is not
+// reached from here any more.
+//
+// 128 bytes: the fixed text is 46, and four i64 decimals are at most 80.
+let statsBuf: [16]i64
+
+// Append `nbytes` low bytes of the packed constant `word` at byte offset `at`,
+// returning the new offset. Packed constants rather than string literals because
+// this module is `--freestanding` (#1628) and builds no managed string.
+function statsConst(at: int, word: int, nbytes: int): int {
+  let base = int(ptrOf(statsBuf))
+  let w = word
+  let i = 0
+  while (i < nbytes) {
+    storeByte(base + at + i, w & 255)
+    w = w >> 8
+    i = i + 1
+  }
+  return at + nbytes
+}
+
+// Append `v` in decimal at byte offset `at`, returning the new offset.
+function statsNum(at: int, v: int): int {
+  return at + osWriteDecimal(int(ptrOf(statsBuf)) + at, v)
+}
+
+// `[bit-gc] collections=<n> swept=<n> live=<n> abandoned=<n>`, on stderr, once,
+// only under `BIT_GC_STATS`. Called after `main` has finished and the worker is
+// reaped, so nothing can be collecting while it reads.
+function statsReport() {
+  let at = statsConst(0, 6729335713145905755, 8)   // "[bit-gc]"
+  at = statsConst(at, 8386658447444108064, 8)      // " collect"
+  at = statsConst(at, 263929622377, 5)             // "ions="
+  at = statsNum(at, stwCollections())
+  at = statsConst(at, 17297999666836256, 7)        // " swept="
+  at = statsNum(at, stwSwept())
+  at = statsConst(at, 67505987611680, 6)           // " live="
+  at = statsNum(at, stwLiveObjects())
+  at = statsConst(at, 7957689491829973280, 8)      // " abandon"
+  at = statsConst(at, 4023397, 3)                  // "ed="
+  at = statsNum(at, stwAbandonedCount())
+  at = statsConst(at, 28448, 2)                    // " o"
+  at = statsConst(at, 4025711, 3)                  // "om="
+  at = statsNum(at, rootStatOom())
+  at = statsConst(at, 10, 1)                       // "\n"
+  rootWriteAll(stderrFd, int(ptrOf(statsBuf)), at)
+}
+
 // Boot the collector and scheduler, run `bit_main` as the first green thread,
 // wait for it, tear down, and return the process exit code. THE ORDER IS
 // LOAD-BEARING and mirrors `root.zig`'s `boot` exactly: heap before collector,
@@ -205,6 +287,19 @@ function boot(): int {
   chanBootBind(int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
                int(ptrOf(chanRegBlock)), int(sched))
 
+  // 4c. Arm the STOP-THE-WORLD (#1639). `runtime/stw`'s poll — the body the
+  //     `bit_rt_safepoint` shim every loop back edge calls hands its snapshot to
+  //     — refuses to collect until all three root sources are reachable
+  //     (`stwCanCollect`), so without this call the collector half is present,
+  //     linked, and permanently dormant: 0 collections, no diagnostic, correct
+  //     output. Must come after `chanBootBind` (the registry block is only
+  //     meaningful once chan owns it) and after `schedInit`. `runtime/root`
+  //     itself cannot make this call — `runtime/chan` imports it, so importing
+  //     `runtime/stw` from there is an import cycle (E0044) — which is why the
+  //     bind lives in the platform boot, the leaf that already imports all three.
+  //     Identical to ../linux/boot.bit's.
+  stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)))
+
   // 5. Place `bit_main`'s task on worker 0's deque; register before queueing.
   let stackBase = alignUpStack(int(ptrOf(taskStackArea)))
   if (!schedStackAligned(stackBase)) {
@@ -244,6 +339,13 @@ function boot(): int {
   schedShutdown(sched)
   joinWorker(ptrOf(startDones), joinTimeoutNs)
   threadRelease(*ptrOf(startHandles))
+
+  // 9. `BIT_GC_STATS`. After the join, so the worker cannot be mid-collection
+  //    while the counters are read, and before the exit code goes back to the
+  //    entry so it lands on stderr while the process still has one.
+  if (rootEnvVerbose(false)) {
+    statsReport()
+  }
   return mainExitCode
 }
 

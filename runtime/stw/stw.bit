@@ -97,6 +97,7 @@ import { worldStopRequested, worldPark, worldRendezvous, worldRestart } from "..
 import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
 import { worldBlockAddr, worldEnsureSelf, maxMutators } from "../gc"
 import { gcShouldCollect, gcMarkBegin, gcCollectFinish } from "../gc"
+import { gcStatCollections, gcStatTotalSwept, gcNumObjects } from "../gc"
 import { gcMarkConservative, gcScanSnapshot } from "../gc"
 import { wordAt, loadWord } from "../gc"
 import { chanScanRegistryRoots } from "../chan"
@@ -144,6 +145,64 @@ export @nosplit @symbol("bit_rt_port_stw_bind") function stwBind(g: int, sched: 
 export @nosplit @symbol("bit_rt_port_stw_abandoned") function stwAbandonedCount(): int {
   let n = stwAbandoned
   return n
+}
+
+// ---------------------------------------------------------------------------
+// The `BIT_GC_STATS` readings (#1639)
+// ---------------------------------------------------------------------------
+//
+// `gc.zig`'s `collect` writes `[bit-gc] collection N: ...` to stderr itself.
+// THIS PORT CANNOT: every function that can reach a collection is `@nosplit`
+// (`runtime/gc` deviation 6 and this file's pin-cycle note), and `@nosplit`
+// admits neither `print`, nor an `extern` call, nor a `syscall` (E0075) — so
+// nothing on the collector's own path can emit a byte. The line's OWNER is
+// therefore the boot code, which is ordinary Bit and has a write primitive, and
+// what it needs from here is the numbers.
+//
+// They are read off the BOUND collector block rather than passed a `g`, because
+// the boot module must not be handed the collector state pointer just to print;
+// `stwBind` already gave this module the address. Zero before `stwBind`, which
+// is the same "nothing to report" answer as zero collections.
+//
+// The three are pinned rather than re-exported from `runtime/gc`: a
+// `--freestanding` module may only reference PINNED symbols (#1628), and
+// `runtime/gc`'s observability accessors carry no pin (they are read in-module
+// and by same-target stress tests). Pinning them there would widen `runtime/gc`'s
+// ABI surface for one caller; forwarding here costs three one-line bodies.
+
+// Collections completed by this collector — `Stats.collections`.
+export @nosplit @symbol("bit_rt_port_stw_collections") function stwCollections(): int {
+  if (gcAddr == 0) {
+    return 0
+  }
+  return gcStatCollections(wordAt(gcAddr))
+}
+
+// Objects swept over the whole run — `Stats.total_swept`. Zero across a run with
+// a non-zero collection count means the collector RAN and reclaimed nothing,
+// which is the failure a bare count check cannot tell from success.
+export @nosplit @symbol("bit_rt_port_stw_swept") function stwSwept(): int {
+  if (gcAddr == 0) {
+    return 0
+  }
+  return gcStatTotalSwept(wordAt(gcAddr))
+}
+
+// Objects the collector currently holds — the `live=` field.
+//
+// OBJECT COUNT, NOT `gcLiveBytes`, and the reason is mechanical rather than a
+// preference: `gcLiveBytes` reaches the heap through `runtime/gc`'s own private
+// `heapBlock`, and the inliner splices its body into this module, so forwarding
+// it makes THIS object reference `m2$heapBlock` — a mangled cross-module symbol
+// no sibling can define, which `--freestanding` refuses outright (measured).
+// The three accessors above and this one are plain word loads, which inline
+// cleanly. A count answers the question the stats line is for — did live data
+// actually fall across a collection — as directly as a byte total.
+export @nosplit @symbol("bit_rt_port_stw_live_objects") function stwLiveObjects(): int {
+  if (gcAddr == 0) {
+    return 0
+  }
+  return gcNumObjects(wordAt(gcAddr))
 }
 
 // Whether a collection is even permissible: every root source must be reachable.
@@ -338,6 +397,51 @@ export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
 }
 
 // ---------------------------------------------------------------------------
+// The LIVE entry: only a thread running compiled Bit code is a mutator (#1639)
+// ---------------------------------------------------------------------------
+//
+// This is what the shim below actually calls, and the only thing it adds to
+// `stwPoll` is a gate. The gate is not a tuning knob — it is what keeps the
+// registry's ONE current-mutator cache from being shared by two OS threads.
+//
+// `gcworld.bit`'s `curMut` stands in for `root.zig`'s `threadlocal g_mutator`
+// because `@threadlocal` is refused for Mach-O (§11.11). Zig's version is
+// per-thread, and no Zig thread outside compiled Bit code ever reaches a
+// safepoint, so only ONE thread was ever in it. The Bit port breaks that by
+// accident: `boot`'s wait-for-main loop and `joinWorker` are ordinary Bit
+// functions, so codegen puts a `bit_rt_safepoint` on their back edges and the
+// BOOT thread polls too. Both threads then read and write one `curMut`, and the
+// consequence is not a lost collection but a corrupted heap: the boot thread
+// would collect using the worker's slot as "its own", and `worldRendezvous` and
+// the parked-frame walk both SKIP the collector's own slot — so the worker's
+// published frame, the only precise record of the running task's references,
+// would never be scanned and every reference in it would be swept.
+//
+// `schedCurrentTask()` is the discriminator, and it needs no TLS: a green task
+// runs on a 64KiB-aligned stack whose base word carries `sched.bit`'s tag, so
+// masking the live `sp` answers "am I on a task stack" in two instructions and
+// returns 0 on the boot thread and on a worker's own loop stack. That set —
+// "executing compiled Bit code on a green thread" — is EXACTLY the set Zig's
+// threadlocal admits, so this restores the Zig behaviour rather than narrowing
+// it: compiled user code always runs on a task, and runtime code never does.
+//
+// A gated thread does nothing at all, which is the safe direction: it holds no
+// compiled Bit frame, so there is nothing of its to scan, nothing to park for,
+// and no reference of its can be missed by a collection it sits out.
+//
+// SEPARATE FROM `stwPoll` rather than folded into it, deliberately: `stwPoll` is
+// the poll body given that the caller IS a mutator, and that is what
+// `tests/stress/stwcollect` (#1633) drives directly with a collector block of
+// its own — under the still-live Zig scheduler, which writes no stack tag, so a
+// gate inside `stwPoll` would silently turn that whole test vacuous.
+export @nosplit @symbol("bit_rt_port_stw_safepoint") function stwSafepoint(snap: int) {
+  if (schedCurrentTask() == 0) {
+    return
+  }
+  stwPoll(snap)
+}
+
+// ---------------------------------------------------------------------------
 // `bit_rt_safepoint` — the naked register/frame snapshot shim (ABI.md §4)
 // ---------------------------------------------------------------------------
 //
@@ -405,7 +509,8 @@ export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
 //   is preserved across the call by its own push, NOT by the frame copy, so the
 //   return path does not depend on the callee leaving the frame untouched.
 //
-// `input` materializes `entryOf(stwPoll)` into `rcx`/`x1` ahead of the payload —
+// `input` materializes `entryOf(stwSafepoint)` into `rcx`/`x1` ahead of the
+// payload — the gated live entry, not `stwPoll` itself; see its comment —
 // the only compiler-emitted instruction in this function, an inline address
 // materialization against a link-time constant (§11.10) that touches no other
 // register and no memory. `entryOf` rather than a direct call because §11.6 has
@@ -443,7 +548,7 @@ function safepointEntry() {
             0xF84107FE,
             0x910483FF,
             0xD65F03C0 }
-    input arm64 x1 x64 rcx = entryOf(stwPoll)
+    input arm64 x1 x64 rcx = entryOf(stwSafepoint)
     clobber x64   { rdi, r8, memory }
     clobber arm64 { x0, memory }
   }

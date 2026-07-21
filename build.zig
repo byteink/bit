@@ -368,6 +368,32 @@ pub fn build(b: *std.Build) void {
     // minutes per mutation.
     b.step("rootpins", "Runtime-pin cycle gate (tests/rootpins.zig)").dependOn(&rootpins_run.step);
 
+    // Stop-the-world wiring gate (#1639): the collector `runtime/stw` implements
+    // must actually be REACHED by a booted program. It was not — nothing bound
+    // the World registry or the three root sources, so a fully-Bit `libbitrt.a`
+    // reported 0 collections against the Zig runtime's 65536 while every example
+    // still ran byte-identically. Pre-G2 the property has no run-time signal at
+    // all (the live `bit_rt_safepoint` is still root.zig's), so it is checked on
+    // the emitted objects. See tests/stwwiring.zig's header.
+    const stwwiring_opts = b.addOptions();
+    stwwiring_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+    stwwiring_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+
+    const stwwiring_mod = b.createModule(.{
+        .root_source_file = b.path("tests/stwwiring.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stwwiring_mod.addImport("bit", exe.root_module);
+    stwwiring_mod.addOptions("build_options", stwwiring_opts);
+
+    const stwwiring_tests = b.addTest(.{ .root_module = stwwiring_mod });
+    const stwwiring_run = b.addRunArtifact(stwwiring_tests);
+    // Same cache reason as rootpins: runtime/**/*.bit is read at run time.
+    stwwiring_run.has_side_effects = true;
+    test_step.dependOn(&stwwiring_run.step);
+    b.step("stwwiring", "Stop-the-world wiring gate (tests/stwwiring.zig)").dependOn(&stwwiring_run.step);
+
     // Import-set differential (#1436): the two compilers must emit the same
     // UNDEFINED symbols for the same source. `extern function close` built clean
     // under both and SIGSEGV'd under self-hosted `bit` only, because its
