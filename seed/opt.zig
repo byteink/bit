@@ -762,13 +762,43 @@ const max_inline_insts = 8;
 /// "small function inlining" from ever touching recursive functions at all).
 ///
 /// It must also not carry another module's MODULE STATE into this one — see
-/// `importsForeignState` (#1630).
+/// `importsForeignState` (#1630) — and neither side may be `@naked` (#1636).
+///
+/// §10.3.1 `@naked` is a codegen contract, not a hint: codegen emits NO
+/// prologue and NO epilogue, so the body is raw machine code that owns the
+/// frame itself and ends the call with its own `ret` (usually inside `asm
+/// volatile`). Splicing such a body into a caller is never correct in either
+/// direction:
+///
+///   - a naked CALLEE spliced into a normal caller drops that raw `ret` in the
+///     middle of the caller, which then returns with its callee-saved
+///     registers and link register never restored — a hang or a SIGSEGV with a
+///     perfectly clean build, and every instruction after the call site left
+///     unreachable. That was live: `bit_rt_root_safepoint` disappeared from
+///     every call site (#1636), and it becomes universal at G2 (#1583), when
+///     the backends' synthesized back-edge call starts reaching a naked shim.
+///   - a normal callee spliced INTO a naked caller adds instructions to a
+///     function that has no frame to spend: regalloc runs a naked function on
+///     a reduced register set with zero spill slots, so extra pressure trips
+///     the "no frame" assertion in both backends at best.
+///
+/// The refusal is on the ATTRIBUTE, not on a cost heuristic — a naked body
+/// small enough to fit the budget is exactly the dangerous case.
+///
+/// `@nosplit` is deliberately NOT refused. It only suppresses the BACK-EDGE
+/// safepoint (`codegen/*.zig`'s `needsNoSafepoints`), and an inlinable callee
+/// is single-block straight-line code with no back edge — so splicing it
+/// neither introduces a poll into nosplit code nor removes one from a caller
+/// that keeps its own back edges. Refusing it would also disable inlining
+/// across the whole runtime, where §17.6 makes every function `@nosplit`.
 fn inlineEligible(module: *const ir.Module, caller_id: ir.FuncId, callee_id: ir.FuncId) ?*const ir.Function {
     if (@intFromEnum(caller_id) == @intFromEnum(callee_id)) return null;
     const g = module.func(callee_id);
+    const f = module.func(caller_id);
+    if (g.is_naked or f.is_naked) return null; // §10.3.1, see below
     if (g.blocks.len != 1) return null;
     if (g.is_fallible) return null;
-    if (importsForeignState(module, module.func(caller_id), g)) return null;
+    if (importsForeignState(module, f, g)) return null;
     const b = g.blocks[0];
     const term_idx = b.insts_start + b.insts_len - 1;
     if (g.insts.items(.op)[term_idx] != .ret) return null;
@@ -1288,6 +1318,109 @@ test "opt: the freestanding module tag survives -O1" {
     try testing.expect(!module.funcs.items[1].in_root_module);
     try testing.expect(module.funcs.items[0].is_pinned);
     try testing.expect(!module.funcs.items[1].is_pinned);
+}
+
+/// Counts `.call` instructions left in `f` — the artifact-level question "did
+/// the call survive as a call", asked without reading a disassembly.
+fn testCountCalls(f: *const ir.Function) usize {
+    var n: usize = 0;
+    for (f.insts.items(.op)) |op| {
+        if (op == .call) n += 1;
+    }
+    return n;
+}
+
+/// Builds a two-function module: index 0 is a callee that is inlinable in every
+/// respect (one block, straight-line, under budget, not fallible), index 1 a
+/// caller whose whole body is one call to it. `naked` tags whichever side the
+/// caller asks for. Returns the module; the caller owns it.
+fn testNakedPair(gpa: Allocator, module: *ir.Module, i64_ty: check.TypeId, naked_callee: bool, naked_caller: bool) !void {
+    var gb = ir.FunctionBuilder.init(gpa);
+    const g_entry = try gb.newBlock();
+    gb.beginBlock(g_entry);
+    const seven = try gb.constInt(i64_ty, 7);
+    try gb.ret(&.{seven});
+    gb.endBlock();
+    var g = try gb.finish("shim", &.{}, i64_ty, false, .invalid, g_entry);
+    g.is_naked = naked_callee;
+    try module.funcs.append(gpa, g);
+
+    var fb = ir.FunctionBuilder.init(gpa);
+    const f_entry = try fb.newBlock();
+    fb.beginBlock(f_entry);
+    const call = try fb.call(i64_ty, @enumFromInt(0), &.{});
+    try fb.ret(&.{call});
+    fb.endBlock();
+    var f = try fb.finish("caller", &.{}, i64_ty, false, .invalid, f_entry);
+    f.is_naked = naked_caller;
+    try module.funcs.append(gpa, f);
+}
+
+test "opt: a @naked callee is never inlined (#1636)" {
+    // A @naked body has no prologue and no epilogue and ends the call with its
+    // own `ret` (§10.3.1), so splicing it into a caller makes that caller return
+    // with x19/x20/x29/x30 unrestored and leaves everything after the call site
+    // unreachable — a hang or a SIGSEGV out of a clean build.
+    //
+    // The callee here is otherwise MAXIMALLY inlinable (one block, one constant,
+    // under budget): only the attribute can refuse it, which is the point —
+    // the rule must not be a cost heuristic.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testNakedPair(gpa, &module, i64_ty, true, false);
+
+    try optimizeModule(gpa, &module, .o1);
+    try ir.verify(gpa, &module);
+    try testing.expectEqual(@as(usize, 1), testCountCalls(&module.funcs.items[1]));
+    // The refusal reads `is_naked` off a callee that the pipeline has already
+    // rebuilt (fold + DCE run over function 0 before function 1 is inlined), so
+    // a pass that dropped the flag would silently un-refuse. Asserting it here
+    // keeps the two failures from masking each other; both values are checked so
+    // a blanket `true` cannot pass.
+    try testing.expect(module.funcs.items[0].is_naked);
+    try testing.expect(!module.funcs.items[1].is_naked);
+}
+
+test "opt: nothing is inlined INTO a @naked caller (#1636)" {
+    // The other direction: regalloc gives a naked function a reduced register
+    // set and zero spill slots (both backends assert on a frame it must not
+    // have), so splicing extra instructions into one is equally invalid.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testNakedPair(gpa, &module, i64_ty, false, true);
+
+    try optimizeModule(gpa, &module, .o1);
+    try ir.verify(gpa, &module);
+    try testing.expectEqual(@as(usize, 1), testCountCalls(&module.funcs.items[1]));
+    try testing.expect(module.funcs.items[1].is_naked);
+}
+
+test "opt: a plain callee with the same shape IS still inlined (#1636)" {
+    // The control for the two tests above: identical module, no attribute. If
+    // this one ever stops inlining, the refusal has grown too wide and the
+    // guards above would pass vacuously.
+    const gpa = testing.allocator;
+    var ctx = try check.TypeContext.init(gpa);
+    defer ctx.deinit();
+    const i64_ty = ctx.prim_ids.get(.i64);
+
+    var module = ir.Module.init(gpa, &ctx);
+    defer module.deinit();
+    try testNakedPair(gpa, &module, i64_ty, false, false);
+
+    try optimizeModule(gpa, &module, .o1);
+    try ir.verify(gpa, &module);
+    try testing.expectEqual(@as(usize, 0), testCountCalls(&module.funcs.items[1]));
 }
 
 test "optimizeModule at O1 inlines a call across the full pipeline" {
