@@ -1,0 +1,289 @@
+// Linux process provider for the SEAM 3 remainder (#1605): the kernel-facing
+// `bit_rt_os_*` ABI wrappers (ABI.md §19) that need real syscalls —
+// `os_self_exe`, `os_run`, `os_run_test` — plus the raw per-arch traps behind
+// them. This is the Bit form of `runtime/root.zig`'s `bit_rt_os_run`/
+// `bit_rt_os_run_test`/`bit_rt_os_self_exe` and `runtime/sched.zig`'s
+// `selfExePath`. `os_argc`/`os_arg_at`/`os_env` are platform-free and live in
+// ../os.bit; `os_exit` already lives in ./io.bit as `bit_rt_root_os_exit`.
+//
+// SELF-CONTAINED (the io.bit/fs.bit shape), NOT parent-wrappers-over-extern
+// (the netabi shape): see ../fs.bit's header for why the netabi shape trips the
+// x86_64-linux `rejectExternForTarget` gate here. The wrappers call their
+// syscalls as LOCAL traps and reach `runtime/root`'s glue by ordinary `import`.
+//
+// EVERY SYSCALL NUMBER BELOW WAS READ OUT OF THE PINNED ZIG STDLIB
+// (std/os/linux/syscalls.zig `X64`/`Arm64`, linux.zig's `fork`/`readlink`/
+// `waitpid`/`W`/`E`/`SIG`), NOT FROM MEMORY. Per-arch, and per-arch SHAPE, not
+// just number: x86_64 has `fork` (57) and `readlink` (89); aarch64 has NEITHER
+// and uses `clone(SIGCHLD,0)` (220) and `readlinkat(AT_FDCWD,…)` (78) — this file
+// mirrors `std.os.linux.fork`/`.readlink`'s own arch choice exactly, as
+// ../fs.bit does for `open`/`mkdir`.
+//
+// Nothing here is `@nosplit`: `@nosplit` REJECTS `syscall` (E0075), the same
+// reason ./io.bit gives — and the same reason this path cannot become a
+// freestanding archive member until #1369.
+
+import { storeWord } from "../../gc"
+import { osEnvp } from "../../root"
+
+// `nr`, `isX64`, `atFdCwd`, `fsPathZ`, `rtStrAlloc`, `rtStringSlice`, `strData`,
+// `emptyStr`, `rootExit`, `loadByte`, `storeByte`, `loadWord` are already
+// imported/defined by this module's siblings ./io.bit and ./fs.bit (module-scoped
+// in Bit), so they are reused, not re-declared — a redeclaration is E0042.
+
+// `max_path` (root.zig): the ceiling on a `/proc/self/exe` result. A readlink
+// result that fills the buffer exactly is treated as truncated and rejected,
+// never resolved against a prefix that is a lie.
+const osMaxPath: int = 4096
+
+// `SIG.CHLD` (= 17 on every non-MIPS, non-SPARC Linux ABI, aarch64 included —
+// linux.zig's `else` `SIG` branch). The flag word `clone` gets on aarch64 so the
+// child behaves as a plain fork: SIGCHLD to the parent on exit, nothing shared.
+const osSigChld: int = 17
+
+// wait(2)'s status decode (linux.zig's `W`, identical to Darwin's BSD layout):
+// WIFEXITED = (status & 0x7f) == 0; WEXITSTATUS = (status >> 8) & 0xff.
+const osWStatusMask: int = 127
+const osWExitShift: int = 256
+
+// `execve` / `wait4`, same argument shape on both arches so only the number
+// differs (`nr` is ./io.bit's per-arch selector). `fork` (x86_64) vs
+// `clone` (aarch64) DIFFER IN ARGUMENT COUNT, so they are branched inline below,
+// not folded here.
+function nrExecve(): int { return nr(59, 221) }
+function nrWait4(): int { return nr(61, 260) }
+function nrReadlinkX64(): int { return 89 }
+function nrReadlinkAtArm(): int { return 78 }
+
+// ---------------------------------------------------------------------------
+// os_self_exe
+// ---------------------------------------------------------------------------
+
+// "/proc/self/exe" scratch, NUL-terminated. MODULE-LEVEL and unlocked, sound only
+// under the single-worker contract (ABI.md §5), exactly as ../fs.bit's `fsDirBuf`.
+// A scalar array is never scanned by the collector (rule 1). 16 bytes hold the
+// 14-byte literal plus its NUL.
+let osProcSelfExe: [2]i64
+
+// Fill `osProcSelfExe` with "/proc/self/exe\0" and return its address. Written
+// byte-literal (not a Bit string literal) to keep this a raw C string the kernel
+// reads directly, with no managed-object lifetime crossing the syscall.
+function osFillProcSelfExe(): int {
+  let b = int(ptrOf(osProcSelfExe))
+  storeByte(b + 0, 47)    // '/'
+  storeByte(b + 1, 112)   // 'p'
+  storeByte(b + 2, 114)   // 'r'
+  storeByte(b + 3, 111)   // 'o'
+  storeByte(b + 4, 99)    // 'c'
+  storeByte(b + 5, 47)    // '/'
+  storeByte(b + 6, 115)   // 's'
+  storeByte(b + 7, 101)   // 'e'
+  storeByte(b + 8, 108)   // 'l'
+  storeByte(b + 9, 102)   // 'f'
+  storeByte(b + 10, 47)   // '/'
+  storeByte(b + 11, 101)  // 'e'
+  storeByte(b + 12, 120)  // 'x'
+  storeByte(b + 13, 101)  // 'e'
+  storeByte(b + 14, 0)    // NUL
+  return b
+}
+
+// `bit_rt_os_self_exe`: the running executable's own path, symlinks resolved, or
+// the empty string when unknown. `/proc/self/exe` is already fully resolved, so
+// unlike Darwin no `realpath` pass is needed. `readlink` writes into the result
+// string's own byte buffer and the result is trimmed to the byte count — one
+// spare allocation, the ../fs.bit `rtFsRead` pattern. A result that fills the
+// buffer exactly is rejected (readlink neither NUL-terminates nor reports
+// truncation), matching `sched.zig`'s `selfExePath`.
+export @symbol("bit_rt_root_os_self_exe") function rtOsSelfExe(): int {
+  let pathPtr = osFillProcSelfExe()
+  let big = rtStrAlloc(osMaxPath)
+  if (big == 0) {
+    return emptyStr()
+  }
+  let buf = strData(big)
+  let rc = 0
+  if (isX64()) {
+    rc = int(syscall(nrReadlinkX64(), i64(pathPtr), i64(buf), i64(osMaxPath)))
+  } else {
+    rc = int(syscall(nrReadlinkAtArm(), i64(atFdCwd), i64(pathPtr), i64(buf), i64(osMaxPath)))
+  }
+  if (rc < 0 || rc >= osMaxPath) {
+    return emptyStr()
+  }
+  return rtStringSlice(big, 0, rc)
+}
+
+// ---------------------------------------------------------------------------
+// os_run / os_run_test — fork + execve + wait4
+// ---------------------------------------------------------------------------
+
+// child `argv` = [path, NULL] and the wait(2) status cell. Both MODULE-LEVEL and
+// unlocked, sound under the single-worker contract (ABI.md §5): a `run` fully
+// completes (fork through wait) before any other `run` can begin, with no park
+// between filling and reading. Scalars, never scanned (rule 1).
+let osArgvBuf: [2]i64
+let osStatusBuf: [1]i64
+
+// child env for `os_run_test`: "BIT_TEST_INDEX=<idx>" prepended to the inherited
+// entries. `max_env` (root.zig) = 1024 inherited + the prepended var + the NULL
+// terminator = 1026 words. `osIdxBuf` holds the prepended string: 15-byte key +
+// up to 20 decimal digits + NUL fits in 64 bytes.
+const osMaxEnv: int = 1024
+let osChildEnvp: [1026]i64
+let osIdxBuf: [8]i64
+
+// Write the decimal text of `v` at `dst` and return the byte count. Two passes
+// (count, then fill from the end) — `rtStringFromInt`'s technique, no scratch.
+// BOUNDED: at most 19 digits for an i64 magnitude.
+function osWriteDecimal(dst: int, v: int): int {
+  let neg = v < 0
+  let mag = v
+  if (neg) {
+    mag = 0 - v
+  }
+  let ndigits = 1
+  let probe = mag / 10
+  while (probe > 0) {
+    ndigits = ndigits + 1
+    probe = probe / 10
+  }
+  let total = ndigits
+  if (neg) {
+    total = total + 1
+    storeByte(dst, 45)
+  }
+  let at = total
+  let rest = mag
+  let k = 0
+  while (k < ndigits) {
+    let q = rest / 10
+    let r = rest - q * 10
+    at = at - 1
+    storeByte(dst + at, 48 + r)
+    rest = q
+    k = k + 1
+  }
+  return total
+}
+
+// Fill `osIdxBuf` with "BIT_TEST_INDEX=<idx>\0" and return its address.
+function osFillTestIndex(idx: int): int {
+  let b = int(ptrOf(osIdxBuf))
+  storeByte(b + 0, 66)    // 'B'
+  storeByte(b + 1, 73)    // 'I'
+  storeByte(b + 2, 84)    // 'T'
+  storeByte(b + 3, 95)    // '_'
+  storeByte(b + 4, 84)    // 'T'
+  storeByte(b + 5, 69)    // 'E'
+  storeByte(b + 6, 83)    // 'S'
+  storeByte(b + 7, 84)    // 'T'
+  storeByte(b + 8, 95)    // '_'
+  storeByte(b + 9, 73)    // 'I'
+  storeByte(b + 10, 78)   // 'N'
+  storeByte(b + 11, 68)   // 'D'
+  storeByte(b + 12, 69)   // 'E'
+  storeByte(b + 13, 88)   // 'X'
+  storeByte(b + 14, 61)   // '='
+  let n = osWriteDecimal(b + 15, idx)
+  storeByte(b + 15 + n, 0)
+  return b
+}
+
+// fork + execve the child at `pathPtr` with `argvPtr`/`envpPtr`, wait for it, and
+// return its exit code (-1 on any failure or abnormal termination). `root.zig`'s
+// `bit_rt_os_run` body, shared by both wrappers.
+//
+// fork + immediate exec is the ONLY work between fork and exec (`fsPathZ`/env
+// already ran), so it is safe with scheduler workers live: the child touches only
+// async-signal-safe syscalls. On exec failure the child `exit_group`s 127 (the
+// shell's "command not found"), never returning into forked runtime state.
+//
+// BOUNDED (Power of 10 rule 2): the EINTR retry runs at most 256 times.
+function osForkExecWait(pathPtr: int, argvPtr: int, envpPtr: int): int {
+  let forked = 0
+  if (isX64()) {
+    forked = int(syscall(57))
+  } else {
+    forked = int(syscall(220, i64(osSigChld), i64(0)))
+  }
+  if (forked < 0) {
+    return 0 - 1
+  }
+  if (forked == 0) {
+    syscall(nrExecve(), i64(pathPtr), i64(argvPtr), i64(envpPtr))
+    rootExit(127)
+  }
+  let sb = int(ptrOf(osStatusBuf))
+  storeWord(sb, 0)
+  let tries = 0
+  let ok = false
+  while (tries < 256) {
+    let w = int(syscall(nrWait4(), i64(forked), i64(sb), i64(0), i64(0)))
+    if (w >= 0) {
+      ok = true
+      tries = 256
+    } else {
+      if ((0 - w) != 4) {
+        return 0 - 1
+      }
+      tries = tries + 1
+    }
+  }
+  if (!ok) {
+    return 0 - 1
+  }
+  let status = loadWord(sb)
+  if ((status & osWStatusMask) == 0) {
+    return (status / osWExitShift) & 255
+  }
+  return 0 - 1
+}
+
+// `bit_rt_os_run`: run the executable at `path` as a child inheriting this
+// process's environment; return its exit code, or -1.
+export @symbol("bit_rt_root_os_run") function rtOsRun(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let ab = int(ptrOf(osArgvBuf))
+  storeWord(ab, p)
+  storeWord(ab + 8, 0)
+  return osForkExecWait(p, ab, osEnvp())
+}
+
+// `bit_rt_os_run_test(path, idx)`: like `os_run`, but execs the child with
+// `BIT_TEST_INDEX=<idx>` PREPENDED to the inherited environment so its synthetic
+// `main` dispatches to test `idx`. Prepending makes it win over any inherited
+// var (getenv returns the first match). BOUNDED copy (rule 3): a process with
+// more than `max_env` vars loses the overflow, never corrupts.
+export @symbol("bit_rt_root_os_run_test") function rtOsRunTest(path: int, idx: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let ab = int(ptrOf(osArgvBuf))
+  storeWord(ab, p)
+  storeWord(ab + 8, 0)
+
+  let idxStr = osFillTestIndex(idx)
+  let ce = int(ptrOf(osChildEnvp))
+  storeWord(ce, idxStr)
+
+  // Copy the inherited entries into ce[1..copied], leaving ce[0] the prepended
+  // var. `copied` survives the loop so the NULL terminator lands after the last
+  // entry placed. BOUNDED by `osMaxEnv`.
+  let src = osEnvp()
+  let copied = 0
+  while (copied < osMaxEnv) {
+    let e = loadWord(src + copied * 8)
+    if (e == 0) {
+      break
+    }
+    storeWord(ce + (copied + 1) * 8, e)
+    copied = copied + 1
+  }
+  storeWord(ce + (copied + 1) * 8, 0)
+  return osForkExecWait(p, ab, ce)
+}

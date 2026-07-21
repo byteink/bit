@@ -1,0 +1,255 @@
+// Darwin process provider for the SEAM 3 remainder (#1605): the kernel-facing
+// `bit_rt_os_*` ABI wrappers (ABI.md §19) that need real system calls —
+// `os_self_exe`, `os_run`, `os_run_test` — reached through libSystem (§11.7)
+// rather than raw traps, because Apple publishes no stable syscall numbers
+// (../darwin/io.bit). This is the Bit form of `runtime/root.zig`'s
+// `bit_rt_os_run`/`bit_rt_os_run_test`/`bit_rt_os_self_exe` and
+// `runtime/sched.zig`'s Darwin `selfExePath`. `os_argc`/`os_arg_at`/`os_env` are
+// platform-free (../os.bit); `os_exit` already lives in ./io.bit as
+// `bit_rt_root_os_exit`.
+//
+// KEPT DELIBERATELY IN THE SAME FUNCTION-FOR-FUNCTION SHAPE AS ../linux/os.bit, so
+// a divergence is a real platform difference, not a stylistic one. The two real
+// differences: (1) self_exe uses `_NSGetExecutablePath` + `realpath` (the reported
+// path is symlink-and-all, so it must be resolved), where Linux's `/proc/self/exe`
+// is pre-resolved; (2) fork/exec/wait go through libSystem `extern`s.
+//
+// #1436 HAZARD (same as ../darwin/fs.bit's `close`): under the SELF-HOSTED
+// compiler a libSystem cancellation-point import can be dropped for its
+// `$NOCANCEL` variant. `fork`/`execve`/`waitpid` are the exposure here. This body
+// is not executed until the archive swap (#1369) — the freestanding-emit and
+// rootpins proofs never run it — so it is recorded, not fixable inside this port,
+// exactly as fs.bit records its `close`.
+
+import { storeWord } from "../../gc"
+import { osEnvp } from "../../root"
+
+// `u8At`, `cstrLen`, `strData`, `emptyStr`, `fsPathZ`, `rtStrAlloc`,
+// `rtStringSlice`, `loadByte`, `storeByte`, `loadWord`, `rootExit` are already
+// imported/defined by this module's siblings ./io.bit and ./fs.bit (module-scoped
+// in Bit), so they are reused, not re-declared — a redeclaration is E0042.
+
+// libSystem process calls. Only C-representable types cross the boundary (§11.7):
+// pointers travel as `*u8`, counts/codes as `i32`/`i64`.
+//
+// `_NSGetExecutablePath(buf, *bufsize)` writes the exec path and returns 0 on
+// success. `realpath(path, resolved)` canonicalises it (resolving symlinks) into
+// `resolved` and returns `resolved`, or NULL on error.
+extern function fork(): i32
+extern function execve(path: *u8, argv: *u8, envp: *u8): i32
+extern function waitpid(pid: i32, status: *u8, options: i32): i32
+extern function _NSGetExecutablePath(buf: *u8, size: *u8): i32
+extern function realpath(path: *u8, resolved: *u8): *u8
+
+// `max_path`/`PATH_MAX` (root.zig / sched.zig): the ceiling for the exec path and
+// its resolution. `realpath` writes up to PATH_MAX; a smaller buffer would be an
+// overrun, so both scratch buffers are sized to it.
+const osMaxPath: int = 4096
+
+// wait(2)'s status decode (std.c's Darwin `W`, the BSD layout — identical to
+// Linux for these two): WIFEXITED = (status & 0o177) == 0; WEXITSTATUS =
+// (status >> 8) & 0xff.
+const osWStatusMask: int = 127
+const osWExitShift: int = 256
+
+// ---------------------------------------------------------------------------
+// os_self_exe
+// ---------------------------------------------------------------------------
+
+// `_NSGetExecutablePath` result, `realpath` result, and the 4-byte size cell it
+// is handed. All MODULE-LEVEL and unlocked, sound under the single-worker
+// contract (ABI.md §5) exactly as ../fs.bit's `fsDirBuf`; scalars, never scanned
+// (rule 1). 512 words = 4096 bytes = `max_path`.
+let osRawExe: [512]i64
+let osResolvedExe: [512]i64
+let osSizeCell: [1]i64
+
+// The NUL-terminated C string at `addr` as a fresh Bit `string`, capped at
+// `osMaxPath` (Power of 10 rule 2). ../fs.bit's `cstrLen` caps at 256 (NAME_MAX),
+// too small for a resolved path, so this scan is local.
+function osPathToStr(addr: int): int {
+  let n = 0
+  while (n < osMaxPath) {
+    if (loadByte(addr + n) == 0) {
+      break
+    }
+    n = n + 1
+  }
+  let s = rtStrAlloc(n)
+  if (s == 0) {
+    return emptyStr()
+  }
+  let dst = strData(s)
+  let i = 0
+  while (i < n) {
+    storeByte(dst + i, loadByte(addr + i))
+    i = i + 1
+  }
+  return s
+}
+
+// `bit_rt_os_self_exe`: the running executable's own path with symlinks resolved,
+// or the empty string when unknown. `_NSGetExecutablePath` reports the exec path
+// symlink-and-all, so it is run through `realpath` — `sched.zig`'s Darwin branch.
+export @symbol("bit_rt_root_os_self_exe") function rtOsSelfExe(): int {
+  let raw = int(ptrOf(osRawExe))
+  let sizePtr = int(ptrOf(osSizeCell))
+  storeWord(sizePtr, osMaxPath)
+  if (int(_NSGetExecutablePath(u8At(raw), u8At(sizePtr))) != 0) {
+    return emptyStr()
+  }
+  let resolved = int(ptrOf(osResolvedExe))
+  let rp = realpath(u8At(raw), u8At(resolved))
+  if (int(rp) == 0) {
+    return emptyStr()
+  }
+  return osPathToStr(resolved)
+}
+
+// ---------------------------------------------------------------------------
+// os_run / os_run_test — fork + execve + waitpid
+// ---------------------------------------------------------------------------
+
+// child `argv` = [path, NULL] and the wait(2) status cell. MODULE-LEVEL, unlocked,
+// sound under the single-worker contract (a `run` completes before another can
+// begin); scalars, never scanned (rule 1).
+let osArgvBuf: [2]i64
+let osStatusBuf: [1]i64
+
+// child env for `os_run_test`: "BIT_TEST_INDEX=<idx>" prepended to the inherited
+// entries. `max_env` (root.zig) = 1024 inherited + the var + the NULL = 1026
+// words. `osIdxBuf` holds the prepended string.
+const osMaxEnv: int = 1024
+let osChildEnvp: [1026]i64
+let osIdxBuf: [8]i64
+
+// Write the decimal text of `v` at `dst`, returning the byte count. `rtStringFromInt`'s
+// two-pass technique. BOUNDED: at most 19 digits for an i64 magnitude.
+function osWriteDecimal(dst: int, v: int): int {
+  let neg = v < 0
+  let mag = v
+  if (neg) {
+    mag = 0 - v
+  }
+  let ndigits = 1
+  let probe = mag / 10
+  while (probe > 0) {
+    ndigits = ndigits + 1
+    probe = probe / 10
+  }
+  let total = ndigits
+  if (neg) {
+    total = total + 1
+    storeByte(dst, 45)
+  }
+  let at = total
+  let rest = mag
+  let k = 0
+  while (k < ndigits) {
+    let q = rest / 10
+    let r = rest - q * 10
+    at = at - 1
+    storeByte(dst + at, 48 + r)
+    rest = q
+    k = k + 1
+  }
+  return total
+}
+
+// Fill `osIdxBuf` with "BIT_TEST_INDEX=<idx>\0" and return its address.
+function osFillTestIndex(idx: int): int {
+  let b = int(ptrOf(osIdxBuf))
+  storeByte(b + 0, 66)    // 'B'
+  storeByte(b + 1, 73)    // 'I'
+  storeByte(b + 2, 84)    // 'T'
+  storeByte(b + 3, 95)    // '_'
+  storeByte(b + 4, 84)    // 'T'
+  storeByte(b + 5, 69)    // 'E'
+  storeByte(b + 6, 83)    // 'S'
+  storeByte(b + 7, 84)    // 'T'
+  storeByte(b + 8, 95)    // '_'
+  storeByte(b + 9, 73)    // 'I'
+  storeByte(b + 10, 78)   // 'N'
+  storeByte(b + 11, 68)   // 'D'
+  storeByte(b + 12, 69)   // 'E'
+  storeByte(b + 13, 88)   // 'X'
+  storeByte(b + 14, 61)   // '='
+  let n = osWriteDecimal(b + 15, idx)
+  storeByte(b + 15 + n, 0)
+  return b
+}
+
+// fork + execve the child at `pathPtr` with `argvPtr`/`envpPtr`, wait for it, and
+// return its exit code (-1 on any failure or abnormal termination). `root.zig`'s
+// Darwin `bit_rt_os_run` body. fork + immediate exec is the only work between fork
+// and exec; on exec failure the child `_exit`s 127.
+//
+// BOUNDED (Power of 10 rule 2): the wait is a single call (libSystem `waitpid`
+// does not surface EINTR the way the raw Linux syscall does — `root.zig`'s Darwin
+// branch has no retry loop either).
+function osForkExecWait(pathPtr: int, argvPtr: int, envpPtr: int): int {
+  let pid = int(fork())
+  if (pid < 0) {
+    return 0 - 1
+  }
+  if (pid == 0) {
+    execve(u8At(pathPtr), u8At(argvPtr), u8At(envpPtr))
+    rootExit(127)
+  }
+  let sb = int(ptrOf(osStatusBuf))
+  storeWord(sb, 0)
+  if (int(waitpid(i32(pid), u8At(sb), i32(0))) < 0) {
+    return 0 - 1
+  }
+  let status = loadWord(sb)
+  if ((status & osWStatusMask) == 0) {
+    return (status / osWExitShift) & 255
+  }
+  return 0 - 1
+}
+
+// `bit_rt_os_run`: run the executable at `path` as a child inheriting this
+// process's environment; return its exit code, or -1.
+export @symbol("bit_rt_root_os_run") function rtOsRun(path: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let ab = int(ptrOf(osArgvBuf))
+  storeWord(ab, p)
+  storeWord(ab + 8, 0)
+  return osForkExecWait(p, ab, osEnvp())
+}
+
+// `bit_rt_os_run_test(path, idx)`: like `os_run`, but execs the child with
+// `BIT_TEST_INDEX=<idx>` PREPENDED to the inherited environment. Prepending makes
+// it win over any inherited var (getenv returns the first match). BOUNDED copy
+// (rule 3): more than `max_env` vars lose the overflow, never corrupt.
+export @symbol("bit_rt_root_os_run_test") function rtOsRunTest(path: int, idx: int): int {
+  let p = fsPathZ(path)
+  if (p == 0) {
+    return 0 - 1
+  }
+  let ab = int(ptrOf(osArgvBuf))
+  storeWord(ab, p)
+  storeWord(ab + 8, 0)
+
+  let idxStr = osFillTestIndex(idx)
+  let ce = int(ptrOf(osChildEnvp))
+  storeWord(ce, idxStr)
+
+  // Copy the inherited entries into ce[1..copied]; `copied` survives the loop so
+  // the NULL terminator lands after the last entry placed. BOUNDED by `osMaxEnv`.
+  let src = osEnvp()
+  let copied = 0
+  while (copied < osMaxEnv) {
+    let e = loadWord(src + copied * 8)
+    if (e == 0) {
+      break
+    }
+    storeWord(ce + (copied + 1) * 8, e)
+    copied = copied + 1
+  }
+  storeWord(ce + (copied + 1) * 8, 0)
+  return osForkExecWait(p, ab, ce)
+}
