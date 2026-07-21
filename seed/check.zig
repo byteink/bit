@@ -5700,8 +5700,10 @@ const Checker = struct {
     /// that could allocate or reach a safepoint (composite/slice/map literals,
     /// indexing, `append`, `spawn`, closures, string interpolation, channel ops,
     /// and any call not to a nosplit function) is rejected with E0075. An `asm`
-    /// block is admitted on the author's assertion (§10.3.1), but its operand
-    /// expressions are still walked.
+    /// block is admitted on the author's assertion (§10.3.1), as is a call to
+    /// an `extern function` (§11.7); the operand/argument expressions of both
+    /// are still walked. A raw `syscall` (§11.8) is admitted on proof — it is
+    /// an inline kernel trap, not a call.
     fn checkNosplitFn(self: *Checker, file_idx: usize, idx: ast.Index) Error!void {
         const mf = self.files[file_idx];
         const k = mf.tree.kids(idx);
@@ -5757,6 +5759,26 @@ const Checker = struct {
                 // shadowing keeps working here as it does everywhere else.
                 const is_nosplit = if (self.nodeSymbol(file_idx, ck[0])) |gsym| blk: {
                     const sym = self.symbolOf(gsym);
+                    // §11.7: a call to an `extern function` is admitted on the
+                    // author's ASSERTION, on exactly the footing `asm` is — and
+                    // for exactly the same reason. The callee's body lives in
+                    // another image, so it is opaque to every compiler pass and
+                    // no proof about it is possible; `extern function` is itself
+                    // an unmanaged-subset marker (§11.7 exists solely for the
+                    // runtime's libSystem path), so requiring a second marker
+                    // would gate nothing. What the compiler emits here IS
+                    // proved: a plain C-ABI `call`, no `gc_alloc`, and no
+                    // safepoint poll. The boundary is narrow by construction —
+                    // E0077 admits only scalars and raw pointers across it, so
+                    // no GC-managed value, closure or interface can reach the
+                    // callee. And unlike `asm`, this site is strictly safer than
+                    // the assertion it rests on: `.call` is a safepoint SITE on
+                    // both backends (`collectSafepoints`/`buildIntervals` record
+                    // it whether or not the function is `@nosplit` — only the
+                    // back-edge poll is suppressed), so the frame keeps a stack
+                    // map at the return address even if the callee were to
+                    // re-enter Bit through an address the author handed it.
+                    if (self.ctx.extern_fns.contains(gsym.pack())) break :blk true;
                     // `entryOf` (§11.10) joins the atomics on the same footing,
                     // and on proof rather than assertion: it lowers to a single
                     // inline address materialization (`func_addr`) against a
@@ -5821,7 +5843,24 @@ const Checker = struct {
                             std.mem.eql(u8, sym.name, "ffloor") or
                             std.mem.eql(u8, sym.name, "fceil") or
                             std.mem.eql(u8, sym.name, "ftrunc") or
-                            std.mem.eql(u8, sym.name, "fround");
+                            std.mem.eql(u8, sym.name, "fround") or
+                            // `syscall` (§11.8) joins on PROOF, and on the
+                            // strongest one on this list: it is not a call at
+                            // all. Both backends emit the kernel trap INLINE
+                            // (`syscall` / `svc #0`) — the `.syscall` IR op
+                            // reaches neither `emitCall` nor the safepoint
+                            // recorders, so no `bit_rt_*` symbol is referenced,
+                            // no stack map entry is taken, and nothing can
+                            // allocate. The kernel has no way back into Bit
+                            // code: a syscall returns to the instruction after
+                            // the trap, and Bit expresses no signal handler.
+                            // Refusing it would repeat the contradiction the
+                            // atomics carve-out exists to avoid — on Linux a
+                            // raw syscall is the ONLY way to reach the kernel
+                            // (the output is static, with no libc), so the
+                            // allocator and the collector, which are `@nosplit`
+                            // in their entirety, could never obtain a page.
+                            std.mem.eql(u8, sym.name, "syscall");
                     // A call whose callee names a builtin TYPE is a conversion
                     // (§12.9), not a call. A conversion between NUMERIC prims —
                     // including `int(p)`, a raw pointer's address (§11.4) — is

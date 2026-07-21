@@ -519,7 +519,8 @@ provably non-allocating forms — arithmetic and comparison, name and literal
 reads, field access on a value in hand, `if`/`while`/`for`, assignment,
 `break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
 to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5), **`entryOf`**
-(§11.10) and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), and **conversions
+(§11.10) and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), a raw **`syscall`**
+(§11.8), and **conversions
 between numeric prims** (§12.9), all of which lower
 to inline machine instructions rather than a call
 and so can neither allocate nor reach a safepoint. A numeric conversion covers
@@ -539,6 +540,16 @@ could never be called. Admission covers the address computation only — the
 **argument expression is still checked** against this allowlist, exactly as an
 `asm` operand is, so `ptrOf` applied to an allocating expression such as a
 slice literal remains E0075.
+
+A **`syscall` (§11.8)** is admitted on the strongest proof on that list: it is
+not a call at all. Both backends emit the kernel trap *inline* — `syscall` on
+x86-64, `svc #0` on AArch64 — so it references no symbol, takes no stack-map
+entry, and allocates nothing. The kernel returns to the instruction after the
+trap and Bit expresses no signal handler, so there is no path back into Bit code
+from it. The rule is load-bearing rather than convenient: the Linux output is
+fully static with no libc, so a raw syscall is the *only* way to reach the
+kernel, and the allocator and collector — `@nosplit` in their entirety — could
+otherwise never obtain a page from the OS.
 
 Anything else is **E0075** `nosplit_calls_allocating`, including composite,
 slice and map construction, indexing, `append`, `spawn`, closures, channel
@@ -573,6 +584,38 @@ Without this rule the unmanaged subset would contradict itself: the GC's
 register snapshot and the scheduler's context switch are both `@nosplit` by
 nature *and* irreducibly `asm`, so the attribute could not be applied to the two
 functions it most exists for.
+
+A call to an **`extern function` (§11.7) is permitted**, and is the *second* and
+last construct here admitted on assertion rather than on proof — on exactly the
+`asm` footing, for exactly the `asm` reason. The callee's body lives in another
+image, so it is opaque to every compiler pass and no proof about it is possible.
+`extern function` is already the unmanaged-subset marker for that boundary
+(§11.7 exists solely for the runtime's libSystem path, which is Darwin's
+counterpart to Linux's raw `syscall`), so requiring a second marker on the
+declaration would gate nothing an author willing to misuse it would not simply
+write. There is therefore **no `@nosplit` attribute on an `extern function`
+declaration** — the grammar of §11.7 admits none, and the permission attaches to
+the *call site*, which is the smaller surface.
+
+What the compiler emits for such a call *is* proved, and is what the rule rests
+on: a plain C-ABI call, with no allocation and no safepoint poll. The boundary
+is narrow by construction — §11.7 admits only scalars and raw pointers across
+it, so no `string`, slice, map, interface or closure can reach the callee, and
+the managed heap is unreachable from the other side except through an address
+the author passed deliberately. That residual is the identical one `asm`
+already carries, and this site is in fact strictly safer than `asm`: a call is a
+**safepoint site** in the stack map whether or not the enclosing function is
+`@nosplit` (only the *back-edge* poll is suppressed by the attribute), so the
+frame stays walkable at the return address even in the case the assertion covers.
+
+**Argument expressions are still checked**, as an `asm` operand's are: only the
+callee's body is taken on trust, and an allocating argument stays E0075.
+
+Without this rule the unmanaged subset would contradict itself a second time, in
+the same place as `asm` does. Darwin publishes no stable syscall numbers, so an
+`extern` call into libSystem is its *only* route to the kernel (§11.7); the
+allocator and the collector are `@nosplit` in their entirety and must be, so
+without this a Bit runtime could never map a page on macOS at all.
 
 Safety is transitive by induction rather than by whole-program analysis: each
 call site requires only that its own callee is `@nosplit`, and the same rule
