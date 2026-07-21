@@ -179,27 +179,27 @@ const predeclared_types = [_][]const u8{
     "error",
 };
 const predeclared_funcs = [_][]const u8{
-    "len",           "cap",               "append",           "delete",           "close",            "panic",       "assert",      "print",      "eprint",
+    "len",            "cap",               "append",           "delete",           "close",            "panic",       "assert",      "print",      "eprint",
     // Low-level filesystem primitives (ABI.md §14); the ergonomic File/open/
     // readFile layer wraps these in std/fs.
-    "fsOpen",        "fsReadAll",         "fsWrite",          "fsClose",          "fsAppend",         "fsRead",      "fsExists",    "fsIsDir",    "fsMkdir",
-    "fsRemove",      "fsListDir",         "fsChmod",
+    "fsOpen",         "fsReadAll",         "fsWrite",          "fsClose",          "fsAppend",         "fsRead",      "fsExists",    "fsIsDir",    "fsMkdir",
+    "fsRemove",       "fsListDir",         "fsChmod",
     // Non-blocking TCP primitives (ABI.md §20); std/net wraps these. Any of them
     // may park the calling green thread on the netpoller. `fsClose` closes a
     // socket too, so there is no `netClose`.
              "netListen",        "netLocalPort",     "netAccept",   "netDial",     "netRead",    "netWrite",
-    "netUdpBind",    "netUdpSend",        "netUdpRecv",       "netUdpSenderHost", "netUdpSenderPort", "netResolve",
+    "netUdpBind",     "netUdpSend",        "netUdpRecv",       "netUdpSenderHost", "netUdpSenderPort", "netResolve",
     // Float primitives (ABI.md §17); std/math re-exports them under plain names.
      "fsqrt",       "ffloor",     "fceil",
-    "fround",        "ftrunc",            "fpow",             "fatan2",           "flog",             "flog2",       "flog10",
+    "fround",         "ftrunc",            "fpow",             "fatan2",           "flog",             "flog2",       "flog10",
     // Clock + green-thread sleep (ABI.md §18); std/time wraps these.
          "timeMonoNs", "timeUnixNs",
     "timeSleepNs",
     // Process environment (ABI.md §19); std/os wraps these.
-      "osArgc",            "osArgAt",          "osEnv",            "osSelfExe",        "osExit",      "osRun",       "osRunTest",  "hostTarget",
+       "osArgc",            "osArgAt",          "osEnv",            "osSelfExe",        "osExit",      "osRun",       "osRunTest",  "hostTarget",
     "auxv",
     // Crypto boundary primitives (ABI.md §21); std/crypto wraps these.
-             "cryptoRandomBytes", "cryptoSecureZero",
+              "cryptoRandomBytes", "cryptoSecureZero",
     // Float-literal parsing, for the self-hosted compiler's `FloatLit` lowering.
     "parseFloat",
     // Float bit patterns, for the self-hosted compiler's `const_float` codegen.
@@ -208,7 +208,7 @@ const predeclared_funcs = [_][]const u8{
     "bitsToFloat",
     // Atomics (§11.5) — inline lock-free ops on a raw `*T` (Stage-2 subset).
     "atomicLoad", "atomicStore",
-    "atomicCmpxchg", "atomicAdd",         "atomicSub",        "atomicAnd",        "atomicOr",         "atomicXchg",
+    "atomicCmpxchg",  "atomicAdd",         "atomicSub",        "atomicAnd",        "atomicOr",         "atomicXchg",
     // Raw OS syscall (§11.8) — Linux only, variable arity (nr + up to 6 args).
      "syscall",
     // `ptrOf(s: []T): *T` — address of a slice's element 0, the one bridge from
@@ -220,6 +220,10 @@ const predeclared_funcs = [_][]const u8{
     // that one bridges traced memory to a raw pointer, this one bridges a
     // function declaration to one.
          "entryOf",
+    // `stackMapsBegin()`/`stackMapsEnd(): *byte` (§11.12) — the half-open extent
+    // of the compiler-emitted stack-map table (ABI.md §4). The only spelling for
+    // a data symbol the LINKER defines and no object may claim.
+    "stackMapsBegin", "stackMapsEnd",
 };
 
 // ============================================================================

@@ -1848,6 +1848,16 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) CodegenError!void {
     try putInt(self, dst, scratch1);
 }
 
+/// `stackmaps_addr` (§11.12): one bound of the linker-built stack-map table, via
+/// the same ADRP/ADD symbol relocation pair `func_addr` uses. The name is
+/// undefined in this object by design — no member may claim it (ABI.md §4) — so
+/// `emit.zig`'s undefined-externals pass carries it out and `seed/link/strip.zig`
+/// resolves it. Pure address materialization: no load, no call, no safepoint.
+fn emitStackMapsAddr(self: *Ctx, dst: u32, which: u32) CodegenError!void {
+    try self.emitAddrOf(scratch1, ir.stackMapsSymbol(which));
+    try putInt(self, dst, scratch1);
+}
+
 /// `global_addr` (§11.11): the static address of a module-level variable, via
 /// the same ADRP/ADD symbol relocation pair `func_addr` uses. Pure address
 /// arithmetic — no load, no call, no safepoint — so it is legal inside a
@@ -2140,6 +2150,7 @@ fn compileInst(self: *Ctx, cur_block: usize, id: ir.ValueId) CodegenError!void {
         .make_closure => |mc| try emitMakeClosure(self, i, mc.func, mc.env),
         .func_addr => |fa| try emitFuncAddr(self, i, fa.func),
         .global_addr => |ga| try emitGlobalAddr(self, i, ga.global),
+        .stackmaps_addr => |sa| try emitStackMapsAddr(self, i, sa.which),
         .rt_call => |rc| try emitCall(self, if (ty != .invalid) i else null, ty, rtSymbol(rc.rt), rc.args, true),
         .asm_stmt => |a| try emitAsm(self, if (ty != .invalid) i else null, a.block, a.args),
         .syscall => |s| try emitSyscall(self, i, s.nr, s.args),
@@ -2312,6 +2323,7 @@ fn extendUses(intervals: []regalloc.Interval, use_pos: u32, d: ir.Decoded) void 
         .make_closure => |mc| extendOne(intervals, use_pos, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .global_addr => {}, // references a GlobalId, no value operands
+        .stackmaps_addr => {}, // references a link-time symbol, no value operands
         .rt_call => |rc| for (rc.args) |a| extendOne(intervals, use_pos, a),
         .asm_stmt => |a| for (a.args) |arg| extendOne(intervals, use_pos, arg),
         .syscall => |s| {

@@ -541,6 +541,22 @@ pub const Op = enum {
     // function's own symbol. Used to hand `bit_rt_spawn` its trampoline (§9).
     func_addr,
 
+    // ---- stack-map table bound: extra = [which] --------------------------
+    // Materializes one bound of the compiler-emitted stack-map table (ABI.md
+    // §4) as a raw `*byte` (§11.12). `which` is 0 for `bit_stack_maps` and 1
+    // for `bit_stack_maps_end`.
+    //
+    // Neither name is defined by any object: the table is the concatenation of
+    // every contributing member's `.bit_gc`/`__DATA,__bit_gc` atoms, so only
+    // the linker knows the total (`seed/link/strip.zig` defines both bounds).
+    // Codegen emits the ordinary absolute / ADRP+ADD symbol relocation
+    // `func_addr` and `global_addr` already use, and `emit.zig`'s generic
+    // undefined-externals pass turns the unmatched name into an UNDEF symbol —
+    // so this is a pure address computation against a link-time constant: no
+    // load, no allocation, no safepoint, which is what makes it legal inside a
+    // `@nosplit` body.
+    stackmaps_addr,
+
     // ---- opaque runtime call: extra = [RtFn, argc, args...] --------------
     rt_call,
 
@@ -747,6 +763,7 @@ pub const Function = struct {
             .make_closure => .{ .make_closure = .{ .func = @enumFromInt(raw[0]), .env = @enumFromInt(raw[1]) } },
             .global_addr => .{ .global_addr = .{ .global = @enumFromInt(raw[0]) } },
             .func_addr => .{ .func_addr = .{ .func = @enumFromInt(raw[0]) } },
+            .stackmaps_addr => .{ .stackmaps_addr = .{ .which = raw[0] } },
             .rt_call => .{ .rt_call = .{ .rt = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
             .asm_stmt => .{ .asm_stmt = .{ .block = raw[0], .args = raw[2 .. 2 + raw[1]] } },
             .syscall => .{ .syscall = .{ .nr = @enumFromInt(raw[0]), .args = raw[2 .. 2 + raw[1]] } },
@@ -795,6 +812,8 @@ pub const Decoded = union(enum) {
     make_closure: struct { func: FuncId, env: ValueId },
     func_addr: struct { func: FuncId },
     global_addr: struct { global: GlobalId },
+    // 0 = `bit_stack_maps`, 1 = `bit_stack_maps_end` (§11.12).
+    stackmaps_addr: struct { which: u32 },
     rt_call: struct { rt: RtFn, args: []const u32 },
     // `block` indexes `Module.asm_blocks`; `args` are the `input` operand
     // values, in declaration order (parallel to the block's `in_*` reg lists).
@@ -949,6 +968,16 @@ pub const Module = struct {
         return &self.asm_blocks.items[idx];
     }
 };
+
+/// The unmangled linker-defined name for one bound of the stack-map table
+/// (§11.12, ABI.md §4): `which` 0 -> start, 1 -> end. These are exactly the two
+/// names `seed/link/strip.zig` (`stackmaps_start_symbol`/`stackmaps_end_symbol`)
+/// defines when it lays the merged table out, and the same two `runtime/root.zig`
+/// declares `extern const`. Platform mangling (Mach-O's leading underscore) is
+/// applied downstream by the object writer, exactly as for `bit_main`.
+pub fn stackMapsSymbol(which: u32) []const u8 {
+    return if (which == 0) "bit_stack_maps" else "bit_stack_maps_end";
+}
 
 /// Deterministic symbol name for the static `TypeInfo` a `gc_alloc` references.
 /// `disc` is the type discriminator (`@intFromEnum(TypeId)` of the allocation's
@@ -1284,6 +1313,12 @@ pub const FunctionBuilder = struct {
         return self.push(.func_addr, ty, &.{@intFromEnum(target)});
     }
 
+    /// Materializes one bound of the linker-built stack-map table (§11.12):
+    /// `which` 0 -> `bit_stack_maps`, 1 -> `bit_stack_maps_end`.
+    pub fn stackMapsAddr(self: *FunctionBuilder, ty: TypeId, which: u32) Allocator.Error!ValueId {
+        return self.push(.stackmaps_addr, ty, &.{which});
+    }
+
     pub fn rtCall(self: *FunctionBuilder, ty: TypeId, rt: RtFn, args: []const ValueId) Allocator.Error!ValueId {
         var buf = try self.gpa.alloc(u32, 2 + args.len);
         defer self.gpa.free(buf);
@@ -1585,6 +1620,7 @@ fn dumpInst(w: *Writer, module: *const Module, f: *const Function, id: ValueId) 
         },
         .make_closure => |mc| try w.print("  %{d} = make_closure @{s}, %{d}\n", .{ i, module.func(mc.func).name, @intFromEnum(mc.env) }),
         .func_addr => |fa| try w.print("  %{d} = func_addr @{s}\n", .{ i, module.func(fa.func).name }),
+        .stackmaps_addr => |sa| try w.print("  %{d} = stackmaps_addr @{s}\n", .{ i, stackMapsSymbol(sa.which) }),
         .global_addr => |ga| try w.print("  %{d} = global_addr @{s}\n", .{ i, module.global(ga.global).name }),
         .rt_call => |rc| {
             try w.print("  %{d} = rt_call {s}(", .{ i, @tagName(rc.rt) });
@@ -1790,6 +1826,7 @@ fn checkAllOperands(f: *const Function, dom: DomSets, use_block: BlockId, use_id
         .make_closure => |mc| try checkOperandDominance(f, dom, use_block, use_idx, @intFromEnum(mc.env)),
         .func_addr => {}, // references a FuncId, no value operands
         .global_addr => {}, // references a GlobalId, no value operands
+        .stackmaps_addr => {}, // references a link-time symbol, no value operands
         .rt_call => |rc| for (rc.args) |a| try checkOperandDominance(f, dom, use_block, use_idx, a),
         .asm_stmt => |a| for (a.args) |v| try checkOperandDominance(f, dom, use_block, use_idx, v),
         .syscall => |s| {

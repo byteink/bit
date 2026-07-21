@@ -3237,6 +3237,18 @@ const Checker = struct {
         if (std.mem.eql(u8, name, "entryOf")) {
             return self.checkEntryOf(file_idx, node, arg_items, env, fctx);
         }
+        // `stackMapsBegin()`/`stackMapsEnd(): *byte` (§11.12): the two bounds of
+        // the stack-map table (ABI.md §4). Zero-arity by construction — there is
+        // exactly one table per link, so there is nothing to select. Arity is the
+        // only thing to check; the result type is fixed.
+        if (std.mem.eql(u8, name, "stackMapsBegin") or std.mem.eql(u8, name, "stackMapsEnd")) {
+            const byte_ptr = self.ctx.types.intern(.{ .ptr = self.ctx.prim_ids.get(.u8) });
+            if (arg_items.len != 0) {
+                try self.emit(mf, node, .arg_count_mismatch, "'{s}' takes no arguments, found {d}", .{ name, arg_items.len }, null);
+                try self.checkArgsLoose(file_idx, arg_items, env, fctx);
+            }
+            return byte_ptr;
+        }
         // `cryptoSecureZero(b: []byte)`: special-cased rather than a `prim_sigs`
         // row because its `[]byte` parameter is not a `Prim` (ABI.md §21).
         if (std.mem.eql(u8, name, "cryptoSecureZero")) {
@@ -5776,6 +5788,17 @@ const Checker = struct {
                         break :blk atomicArity(sym.name) != null or
                             std.mem.eql(u8, sym.name, "entryOf") or
                             std.mem.eql(u8, sym.name, "ptrOf") or
+                            // `stackMapsBegin`/`stackMapsEnd` (§11.12) join on
+                            // the identical proof to `entryOf`: one inline
+                            // address materialization against a link-time
+                            // constant (`stackmaps_addr`), no load and no call.
+                            // Same contradiction to avoid, too — the only caller
+                            // that can exist is the collector's root walk, and a
+                            // safepoint poll is nosplit by construction, so
+                            // refusing them here would carve out an operation
+                            // that could never be reached from anywhere.
+                            std.mem.eql(u8, sym.name, "stackMapsBegin") or
+                            std.mem.eql(u8, sym.name, "stackMapsEnd") or
                             // `fsqrt`/`floatBits`/`float32Bits` join on the same
                             // proof, and the proof is the reason rather than the
                             // convenience: each lowers to a single inline machine

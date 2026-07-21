@@ -518,8 +518,9 @@ allocator and collector call it safely. A `@nosplit` body is restricted to
 provably non-allocating forms — arithmetic and comparison, name and literal
 reads, field access on a value in hand, `if`/`while`/`for`, assignment,
 `break`/`continue`, and `return` — plus calls to other `@nosplit` functions,
-to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5) and **`entryOf`**
-(§11.10), and **conversions between numeric prims** (§12.9), all of which lower
+to the **atomic builtins** (§11.5), to **`ptrOf`** (§11.5), **`entryOf`**
+(§11.10) and **`stackMapsBegin`/`stackMapsEnd`** (§11.12), and **conversions
+between numeric prims** (§12.9), all of which lower
 to inline machine instructions rather than a call
 and so can neither allocate nor reach a safepoint. A numeric conversion covers
 the integer and float prims and their aliases (`int`, `uint`, `byte`, `rune`),
@@ -1307,6 +1308,59 @@ is why the initializer must still be a compile-time constant. A thread created
 outside the runtime's own spawn path gets a correct copy only if its thread
 pointer was installed; a raw `clone(2)` without `CLONE_SETTLS` inherits its
 parent's, and therefore shares — not copies — its parent's cells.
+
+### 11.12 Stack-Map Table Bounds (unmanaged subset)
+
+`stackMapsBegin(): *byte` and `stackMapsEnd(): *byte` are the half-open extent
+`[begin, end)` of the **stack-map table** the compiler emits (ABI.md §4). Both
+take no arguments: a link produces exactly one table, so there is nothing to
+select — passing an argument is **E0050**.
+
+```
+// The shape a precise root walk needs: the merged table, as bytes.
+@nosplit function stackMapBytes(): int {
+  return int(stackMapsEnd()) - int(stackMapsBegin())
+}
+```
+
+They belong to the **unmanaged subset** for the same reason `entryOf` (§11.10)
+does — ordinary code has no use for a table describing its own frames — and they
+exist for one consumer: the collector cannot enumerate a thread's roots without
+walking this table, and no other expression in the language yields its address.
+
+**Why a builtin rather than a declaration.** These are the only names in the
+language that denote a *data* symbol the **linker** defines and no object may
+claim. The table is the concatenation of every contributing object's stack-map
+atoms, so no single object knows the total and any object that defined the bounds
+would collide with its siblings. §11.7's `extern function` is the wrong tool
+twice over: it binds a *function*, and it binds one resolved from a dynamic
+library, which is not what a statically linker-defined symbol is. Spelling this
+as a builtin keeps the set of names a program can leave undefined closed and
+compiler-owned, rather than opening an arbitrary-symbol escape hatch whose typos
+become link errors instead of compile errors.
+
+Each call lowers to **one inline address materialization** — the same symbol
+relocation `entryOf` and a module-state reference already emit — so like them
+both are permitted inside a `@nosplit` function (§10.3.1), on proof rather than
+assertion: no load, no call, no allocation, and no safepoint. That permission is
+not a convenience. The only caller that can exist is a root walk reached from a
+safepoint poll, which is nosplit by construction, so refusing them there would
+carve out an operation reachable from nowhere.
+
+The results are raw pointers (§11.4): not traced by the collector, and `int(...)`
+converts either to an integer by the ordinary rule. They address a table, not
+objects; nothing in the table is a GC reference.
+
+**Guarantees.** `end >= begin` always, and the extent is empty exactly when the
+image contains no safepoint at all. Like `entryOf`, each is invariant *within* a
+run, and their difference is invariant *across* runs; the absolute values are
+stable across runs only for the static ELF output, since the Mach-O output is
+position independent and slides.
+
+**A program that never links against the runtime still compiles.** The reference
+is emitted as an undefined external and resolved at link, so the failure mode for
+a build that somehow omits the table is a link error naming the symbol, not
+silent zeroes.
 
 ---
 

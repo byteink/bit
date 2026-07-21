@@ -3105,6 +3105,11 @@ const FnCtx = struct {
         }
         if (std.mem.eql(u8, name, "ptrOf")) return self.lowerPtrOf(node);
         if (std.mem.eql(u8, name, "entryOf")) return self.lowerEntryOf(node);
+        // `stackMapsBegin()`/`stackMapsEnd()` (§11.12): one bound of the merged
+        // stack-map table each, as a `*byte`. No operands to lower — the whole
+        // instruction is a relocation against a name only the linker defines.
+        if (std.mem.eql(u8, name, "stackMapsBegin")) return self.b.stackMapsAddr(try self.nodeType(node), 0);
+        if (std.mem.eql(u8, name, "stackMapsEnd")) return self.b.stackMapsAddr(try self.nodeType(node), 1);
         // `syscall` (§11.8) is the one builtin with no `bit_rt_*` symbol behind
         // it — the backends emit the kernel trap inline — so it takes its own
         // op and deliberately never reaches `primRtFn` below.

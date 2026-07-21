@@ -1642,6 +1642,16 @@ fn emitFuncAddr(self: *Ctx, dst: u32, func: ir.FuncId) !void {
     try putInt(self, dst, scratch1);
 }
 
+/// `stackmaps_addr` (§11.12): one bound of the linker-built stack-map table, via
+/// the same absolute symbol relocation `func_addr` uses. The name is undefined in
+/// this object by design — no member may claim it (ABI.md §4) — so `emit.zig`'s
+/// undefined-externals pass carries it out and `seed/link/strip.zig` resolves it.
+/// Pure address materialization: no load, no call, no safepoint.
+fn emitStackMapsAddr(self: *Ctx, dst: u32, which: u32) !void {
+    try self.movAbsReloc(scratch1, ir.stackMapsSymbol(which));
+    try putInt(self, dst, scratch1);
+}
+
 /// `global_addr` (§11.11): the static address of a module-level variable, via
 /// the same absolute symbol relocation `func_addr` uses. Pure address
 /// materialization — no load, no call, no safepoint — so it is legal inside a
@@ -2394,6 +2404,7 @@ fn markUses(intervals: []regalloc.Interval, d: ir.Decoded, pos: u32) void {
         .make_closure => |mc| markUse(intervals, @intFromEnum(mc.env), pos),
         .func_addr => {}, // references a FuncId, no value operands
         .global_addr => {}, // references a GlobalId, no value operands
+        .stackmaps_addr => {}, // references a link-time symbol, no value operands
         .rt_call => |rc| for (rc.args) |a| markUse(intervals, a, pos),
         .asm_stmt => |a| for (a.args) |arg| markUse(intervals, arg, pos),
         .syscall => |s| {
@@ -2704,6 +2715,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .make_closure => try emitMakeClosure(self, dst, d.make_closure.func, d.make_closure.env),
         .func_addr => try emitFuncAddr(self, dst, d.func_addr.func),
         .global_addr => try emitGlobalAddr(self, dst, d.global_addr.global),
+        .stackmaps_addr => try emitStackMapsAddr(self, dst, d.stackmaps_addr.which),
         .call_value => try emitCallValue(self, dst, ty, d.call_value.callee, d.call_value.args),
         .slice_len => try emitSliceLen(self, dst, d.slice_len.base),
         .call_iface => try emitCallIface(self, dst, ty, d.call_iface.iface, d.call_iface.method_index, d.call_iface.args),
