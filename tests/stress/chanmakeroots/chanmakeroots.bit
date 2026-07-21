@@ -1,0 +1,165 @@
+// The behavioural proof that `bit_rt_root_chan_make` (runtime/chan/chanwrap.bit,
+// #1613) is a REAL constructor — not a bound-but-unwired shell — and that the
+// channel it builds obeys the settled ring model (#1610): a buffered `is_ref`
+// channel's ring is PROCESS memory carved from the boot-provisioned reserve, and
+// its unreceived contents survive a collection ONLY because the registry it was
+// entered into is a GC root source.
+//
+// Where tests/stress/chanroots hand-builds a channel in stack memory and calls
+// `chanRegInit`/`chanRegister` itself, this test provisions a reserve + registry
+// exactly as `boot` does (`chanBootBind`) and then lets `chan_make` do the whole
+// job: carve the 13-word handle and the ring out of the reserve, init the header,
+// and register the channel. So the code under test is the shipped `chan_make`
+// path, driven against the live Bit collector (runtime/gc, #1363) over raw memory
+// the same way tests/stress/gcbit is.
+//
+//   scan1 — the channel `chan_make` built holds all PAYLOADS; the registry
+//           `chan_make` registered into is the only root source, so every payload
+//           must survive and each drained one must still be owned, marker intact.
+//   scan2 — the channel is emptied (count := 0), so the same scan finds no roots
+//           and every payload is swept. This is what proves the buffered contents
+//           were the roots — i.e. that `chan_make` really registered the channel.
+//
+// MUTATIONS this reddens (verified on #1613):
+//   - `chan_make` skipping `chanRegister` -> scan1 collapses to `0 6 0 0` (the
+//     channel is never a root source, so its payloads are swept immediately).
+//   - not calling `chanBootBind` (an unbound reserve) -> `chan_make` returns 0
+//     and the run aborts at "chan_make returned nil": the reserve is load-bearing.
+//
+// The backing `[]i64`/`[]i32` slices are held in `main` for the whole program so
+// only raw untraced pointers reach the Bit collector, keeping them alive under
+// the LIVE (libbitrt) collector when the suite reruns under BIT_GC=stress.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcAlloc, gcOwns, gcNumObjects, gcStatTotalSwept, gcStatCollections, gcWords, gcBindMemory, storeWord, loadWord, wordAt, reserveWords } from "../../../runtime/gc"
+import { rtChanMake, chanBootBind, chanDriveCollection, chanRegWords, chanBufferedCount, chanBufferedAt } from "../../../runtime/chan"
+
+// Channel header field offsets, in words — runtime/chan/chan.bit's private
+// layout, hardcoded (module-private) exactly as tests/stress/chanroots does. A
+// layout drift fails this test loudly, which is the intent.
+const CH_BUF = 2
+const CH_COUNT = 5
+
+const PAYLOADS = 6
+const CAP = 8
+const MARKER_BASE = 1000
+
+// Collector sizing, matching gcbit's generous arenas so nothing can run out.
+const ARENA_WORDS = 131072
+const INDEX_WORDS = 8192
+const MARK_STACK = 64
+const MIN_TRIGGER = 4096
+const GROWTH_PCT = 200
+
+// Metadata: one leaf `Node` TypeInfo (16-byte body, NO pointer fields, so the
+// marker word is pure data the tracer never reinterprets) plus the
+// `ref_array_info` sentinel gcInit matches by address. Seven words each.
+const META_WORDS = 14
+const MI_NODE = 0
+const MI_REFARR = 7
+
+// The channel reserve `chan_make` carves handle + ring out of. Generous next to
+// one 13-word handle + one 8-word ring.
+const CHAN_RESERVE_WORDS = 4096
+
+function main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+
+  // Storage `boot` normally owns and hands to `chanBootBind`: the reserve's
+  // backing pages (here a held slice, not mmap), its 3-word descriptor, the
+  // 2-word registry, and a scheduler. This test never sends/recvs, so the
+  // scheduler is only stored into the channel and never dereferenced — a 1-word
+  // stand-in is enough.
+  let chanReserve = []i64(CHAN_RESERVE_WORDS)
+  let reserveDesc = []i64(reserveWords)
+  let regBlock = []i64(chanRegWords)
+  let dummySched = []i64(1)
+
+  let metaAddr = int(ptrOf(meta))
+  // Node: leaf, 16-byte body, zero pointer offsets.
+  meta[MI_NODE + 0] = 16
+  meta[MI_NODE + 1] = 0
+  meta[MI_NODE + 2] = 0
+  let nodeInfo = metaAddr + MI_NODE * 8
+  let refArrInfo = metaAddr + MI_REFARR * 8
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+
+  let g = ptrOf(state)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(hlk), refArrInfo, MARK_STACK)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, false, MIN_TRIGGER, GROWTH_PCT, false)
+
+  // Provision the reserve + registry exactly as `boot` does, then let `chan_make`
+  // build a buffered is_ref channel: it carves the handle and the ring out of the
+  // reserve (process memory), inits the header, and registers the channel.
+  chanBootBind(int(ptrOf(reserveDesc)), int(ptrOf(chanReserve)), CHAN_RESERVE_WORDS * 8,
+               int(ptrOf(regBlock)), int(ptrOf(dummySched)))
+  let handle = rtChanMake(CAP, true)
+  if (handle == 0) {
+    print("chan_make returned nil\n")
+    return
+  }
+  let chPtr = wordAt(handle)
+
+  // Fill the ring `chan_make` carved with fresh managed payloads, each stamped
+  // with a distinct marker so a swept-and-reused slot is detectable. The ring
+  // address is the channel's own `chBuf` field — proof `chan_make` allocated it.
+  let bufAddr = loadWord(handle + CH_BUF * 8)
+  let i = 0
+  while (i < PAYLOADS) {
+    let p = gcAlloc(g, nodeInfo)
+    if (p == 0) {
+      print("alloc failed\n")
+      return
+    }
+    storeWord(p + 0, MARKER_BASE + i)
+    storeWord(bufAddr + i * 8, p)
+    i = i + 1
+  }
+  storeWord(handle + CH_COUNT * 8, PAYLOADS)
+
+  // scan1: the registry `chan_make` populated is the sole root source. Driven
+  // through the runtime driver `chanDriveCollection` (#1610). No precise roots.
+  chanDriveCollection(g, ptrOf(regBlock), 0, 0)
+  let survived1 = gcNumObjects(g)
+  let swept1 = gcStatTotalSwept(g)
+
+  // Drain through the cursors and check integrity: still owned, marker intact.
+  let intact = 0
+  let sum = 0
+  let n = chanBufferedCount(chPtr)
+  let j = 0
+  while (j < n) {
+    let p = chanBufferedAt(chPtr, j)
+    if (gcOwns(g, p)) {
+      let m = loadWord(p + 0)
+      if (m == MARKER_BASE + j) {
+        intact = intact + 1
+        sum = sum + m
+      }
+    }
+    j = j + 1
+  }
+  print("scan1 ${survived1} ${swept1} ${intact} ${sum}\n")
+
+  // scan2: empty the channel, then the same scan reports no roots — every payload
+  // is now swept. Proves the buffered contents were the roots above.
+  storeWord(handle + CH_COUNT * 8, 0)
+  chanDriveCollection(g, ptrOf(regBlock), 0, 0)
+  print("scan2 ${gcNumObjects(g)} ${gcStatTotalSwept(g)}\n")
+
+  print("collections ${gcStatCollections(g)}\n")
+}
