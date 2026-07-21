@@ -201,6 +201,25 @@ const modules = [_]Module{
     .{ .path = "runtime/rand", .target = .aarch64_macos },
     .{ .path = "runtime/rand/linux", .target = .x86_64_linux },
     .{ .path = "runtime/rand/darwin", .target = .aarch64_macos },
+    // #1633: `bit_rt_root_safepoint` MOVED OUT of `runtime/gc` into its own
+    // leaf module `runtime/stw`, because the collector half of the poll has to
+    // enumerate roots owned by `runtime/chan` and `runtime/sched` and
+    // `runtime/gc` cannot import either (`chan` imports `../gc`, so the reverse
+    // edge is an import cycle). `runtime/gc` stays listed above on its four
+    // `bit_rt_root_gc_*` wrappers; this entry carries the safepoint, and it is
+    // the one this gate matters most for — the backends SYNTHESIZE a call to
+    // `bit_rt_safepoint` at every loop back edge, so a definition of it
+    // containing a back edge calls itself after G2 renames it, and pre-rename
+    // the call lands harmlessly on the still-linked Zig. The module is
+    // platform-free (no `syscall`/`extern function`), so the target is
+    // arbitrary; aarch64-macos matches its siblings.
+    //
+    // The entry is NOT enough on its own, and the mutation that proves it is in
+    // #1633's ticket comment: `stwPoll` and its five loops reach the poll only
+    // through `@nosplit`, and pinning `bit_rt_safepoint` as `stwPoll`'s callee
+    // makes this gate report `'bit_rt_root_safepoint' references
+    // 'bit_rt_safepoint'` and exit 1.
+    .{ .path = "runtime/stw", .target = .aarch64_macos },
 };
 
 /// Upper bound on symbols in one object — keeps every walk below provably

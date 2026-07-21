@@ -1,0 +1,324 @@
+// The behavioural proof that the Bit COLLECTOR half of the safepoint handshake
+// (#1633, runtime/stw/stw.bit) actually collects, that its root enumeration is
+// complete, and that its sweep does not eat live objects.
+//
+// ---------------------------------------------------------------------------
+// ATTRIBUTION — WHY A COLLECTION COUNT HERE IS *THIS* COLLECTOR'S
+// ---------------------------------------------------------------------------
+//
+// Pre-G2 (#1583) `runtime/root.zig` is still linked and still owns the ABI name
+// `bit_rt_safepoint`, so the poll codegen synthesizes at every loop back edge
+// goes to ZIG. Any `BIT_GC=stress BIT_GC_STATS=1` count read out of a normally
+// linked binary is therefore Zig's collector and is identical with or without
+// this change — the trap #1632's agent measured (`collection 20000`) and
+// correctly refused to claim.
+//
+// This test dodges it on both sides at once:
+//
+//   - The CODE under test is `stwPoll`, called by name. That is the Bit poll
+//     body itself (`runtime/stw/stw.bit`), the function the `bit_rt_safepoint`
+//     shim hands its snapshot to; nothing in `runtime/root.zig` can reach it.
+//   - The HEAP under test is the `g` block below, a collector instance this
+//     program builds over its own arena. `runtime/root.zig`'s collector has
+//     never heard of it. Every number printed comes from `g`, so a non-zero
+//     `gcStatCollections(g)` cannot have been produced by anything else.
+//
+// WHAT THIS CANNOT DRIVE, AND WHY (#1636). The natural end-to-end form would
+// call the `@naked` shim `bit_rt_root_safepoint` so the snapshot is a real
+// register/frame capture. It is not callable from Bit today: the INLINER inlines
+// a `@naked` body into its caller, so the call site gets the shim's raw `ret`
+// instead of a call and the caller returns with its frame never restored —
+// filed as #1636 with a standalone repro. So the snapshot is supplied here
+// instead, in exactly the `SafepointFrame` layout the shim would have built.
+// The shim's own hand-encoded payload therefore remains UNEXECUTED by any test;
+// that is #1636's to close, not this file's.
+//
+// ---------------------------------------------------------------------------
+// WHAT EACH PHASE PROVES
+// ---------------------------------------------------------------------------
+//
+//   A — a poll COLLECTS, and every root class survives it. One payload is
+//       reachable only as a buffered `is_ref` channel element (ABI.md §11), one
+//       only as a registered task's `arg` (§5/§9), one only as a word on another
+//       registered task's stack (§5). A fourth is reachable from nothing and
+//       must be swept — without it the phase would pass on a collector that
+//       marks everything.
+//   B — remove all three roots, poll again, and all three are swept. This is
+//       what proves the survivals in A were caused by the enumeration rather
+//       than by a collection that never ran or never swept.
+//   C — the PRECISE stack-map walk (`gcScanSnapshot`, §4) marks the slots a real
+//       emitted stack map names. The table is decoded here independently of the
+//       runtime's decoder, a frame is synthesized at a real
+//       (code_addr + ret_off) safepoint, and the payload is planted in the first
+//       slot that safepoint names. Marked -> survives; a second payload planted
+//       nowhere is swept. Driven through the whole poll, not through
+//       `gcScanSnapshot` alone, so the precise walk is proved to be WIRED INTO
+//       the collection rather than merely to work in isolation.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcAlloc, gcOwns, gcNumObjects, gcStatCollections } from "../../../runtime/gc"
+import { gcWords, gcBindMemory, storeWord, loadWord, loadByte, reserveWords } from "../../../runtime/gc"
+import { worldBind, worldWords } from "../../../runtime/gc"
+import { rtChanMake, chanBootBind, chanRegWords } from "../../../runtime/chan"
+import { stwBind, stwPoll, stwAbandonedCount } from "../../../runtime/stw"
+import { schedWords, scRegHead, taskWords, taskArg, taskState, taskParked } from "../../../runtime/sched"
+import { taskStackBase, taskStackBytes, ctxSp } from "../../../runtime/sched"
+
+// Channel header field offsets, in words — runtime/chan/chan.bit's private
+// layout, hardcoded exactly as tests/stress/chanroots and chanmakeroots do. A
+// layout drift fails this test loudly, which is the intent.
+const CH_BUF = 2
+const CH_COUNT = 5
+
+const CAP = 8
+const ARENA_WORDS = 131072
+const INDEX_WORDS = 8192
+const MARK_STACK = 64
+const MIN_TRIGGER = 4096
+const GROWTH_PCT = 200
+const CHAN_RESERVE_WORDS = 4096
+const TASK_STACK_WORDS = 64
+const TASK_STACK_SLOT = 7
+
+// Metadata: one leaf `Node` TypeInfo (16-byte body, no pointer fields, so the
+// marker word is pure data the tracer never reinterprets) plus the
+// `ref_array_info` sentinel `gcInit` matches by address. Seven words each.
+const META_WORDS = 14
+const MI_NODE = 0
+const MI_REFARR = 7
+
+// The synthetic frame phase C plants a precise root in. `FRAME_MID` is far
+// enough from both ends that a stack-slot offset of either sign lands inside.
+const FRAME_WORDS = 4096
+const FRAME_MID = 2048
+// How far from `fp` a usable stack slot may sit.
+const FRAME_REACH = 8192
+
+// `SafepointFrame` (ABI.md §4): ret, fp, then 32 register words.
+const SNAP_WORDS = 34
+
+const M_CHAN = 1001
+const M_ARG = 1002
+const M_STACK = 1003
+const M_DEAD = 1004
+const M_PRECISE = 1005
+const M_MISSED = 1006
+
+// ---------------------------------------------------------------------------
+// An INDEPENDENT decoder for the emitted stack-map table (ABI.md §4)
+// ---------------------------------------------------------------------------
+//
+// Deliberately a second transcription rather than a call into the runtime's:
+// this is what lets phase C name a real safepoint address and a real slot offset
+// and then check that the RUNTIME's walk marks it. Layout, per entry:
+//
+//   u64 code_addr | u32 code_size | u16 num_saved | num_saved*(u16 reg, i32 off)
+//   u16 num_safepoints | num_safepoints*( u32 ret_off
+//                                       | u16 num_slots | num_slots*i32
+//                                       | u16 num_regs  | num_regs*u16 )
+
+function u16At(a: int): int {
+  return loadByte(a) | (loadByte(a + 1) << 8)
+}
+
+function u32At(a: int): int {
+  return u16At(a) | (u16At(a + 2) << 16)
+}
+
+function u64At(a: int): int {
+  return u32At(a) | (u32At(a + 4) << 32)
+}
+
+function i32At(a: int): int {
+  let v = u32At(a)
+  if (v >= 2147483648) {
+    return v - 4294967296
+  }
+  return v
+}
+
+@nosplit function mapsBegin(): int {
+  return int(stackMapsBegin())
+}
+
+@nosplit function mapsEnd(): int {
+  return int(stackMapsEnd())
+}
+
+// Still owned by `g` AND still carrying its marker: a swept-and-reused slot is
+// owned again but reads back the wrong word, so both halves are needed.
+function alive(g: *i64, p: int, marker: int): bool {
+  if (!gcOwns(g, p)) {
+    return false
+  }
+  return loadWord(p) == marker
+}
+
+// Whether a stack slot offset can host phase C's planted root: inside the
+// synthetic frame, and NOT on the frame record itself (+0 saved fp, +8 return
+// address), which the walk reads to decide where to stop — planting there would
+// break the walk's termination instead of testing its marking.
+function usableSlot(s: int): bool {
+  if (s == 0 || s == 8) {
+    return false
+  }
+  return s < FRAME_REACH && s > 0 - FRAME_REACH
+}
+
+function main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+
+  // Blocks `boot` normally owns: the World/Mutator registry, a scheduler, the
+  // channel reserve + registry, and one registered task.
+  let worldBlock = []i64(worldWords)
+  let schedBlock = []i64(schedWords)
+  let chanReserve = []i64(CHAN_RESERVE_WORDS)
+  let reserveDesc = []i64(reserveWords)
+  let regBlock = []i64(chanRegWords)
+  let fakeTask = []i64(taskWords)
+  let fakeStack = []i64(TASK_STACK_WORDS)
+  let frameBuf = []i64(FRAME_WORDS)
+  let snapBuf = []i64(SNAP_WORDS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[MI_NODE + 0] = 16
+  meta[MI_NODE + 1] = 0
+  meta[MI_NODE + 2] = 0
+  let nodeInfo = metaAddr + MI_NODE * 8
+  let refArrInfo = metaAddr + MI_REFARR * 8
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+
+  let g = ptrOf(state)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(hlk), refArrInfo, MARK_STACK)) {
+    print("gcInit failed\n")
+    return
+  }
+  // stress: every poll collects, ignoring the byte trigger — the precise-rooting
+  // oracle. A missed root is swept on the very next poll.
+  gcConfigure(g, true, true, MIN_TRIGGER, GROWTH_PCT, false)
+
+  // Wire the registry the mutator half uses and the three blocks the collector
+  // half enumerates roots from. `stwBind` is all-or-nothing by design: with any
+  // one of them 0 the poll refuses to collect rather than collecting with a
+  // smaller root set.
+  worldBind(int(ptrOf(worldBlock)))
+  chanBootBind(int(ptrOf(reserveDesc)), int(ptrOf(chanReserve)), CHAN_RESERVE_WORDS * 8,
+               int(ptrOf(regBlock)), int(ptrOf(schedBlock)))
+  stwBind(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)))
+
+  // Root source 1: a buffered `is_ref` channel, built by the shipped constructor
+  // so the registry entry is the real one.
+  let handle = rtChanMake(CAP, true)
+  if (handle == 0) {
+    print("chan_make returned nil\n")
+    return
+  }
+  let pChan = gcAlloc(g, nodeInfo)
+  storeWord(pChan, M_CHAN)
+  storeWord(loadWord(handle + CH_BUF * 8), pChan)
+  storeWord(handle + CH_COUNT * 8, 1)
+
+  // Root sources 4 and 5: one registered task, parked, whose `arg` holds one
+  // payload and whose stack holds another. The scheduler block is zeroed, so its
+  // registry lock is already `spinUnlocked` and its head is 0 until set here.
+  let pArg = gcAlloc(g, nodeInfo)
+  storeWord(pArg, M_ARG)
+  let pStack = gcAlloc(g, nodeInfo)
+  storeWord(pStack, M_STACK)
+  fakeStack[TASK_STACK_SLOT] = pStack
+  let t = ptrOf(fakeTask)
+  *(t + taskArg) = pArg
+  *(t + taskState) = taskParked
+  *(t + taskStackBase) = int(ptrOf(fakeStack))
+  *(t + taskStackBytes) = TASK_STACK_WORDS * 8
+  *(t + ctxSp) = int(ptrOf(fakeStack))
+  *(ptrOf(schedBlock) + scRegHead) = int(t)
+
+  // Reachable from nothing. Without this the phase would pass on a collector
+  // that simply marks every object it has.
+  let pDead = gcAlloc(g, nodeInfo)
+  storeWord(pDead, M_DEAD)
+
+  // ---- phase A: poll, and read the count out of OUR collector -------------
+  // A snapshot whose `ret` is 0 is exactly what the shim publishes from a door
+  // that holds no stack map, and it makes the precise walk a no-op here — phase
+  // C is where that walk is put under load.
+  let snap = int(ptrOf(snapBuf))
+  storeWord(snap + 0, 0)
+  storeWord(snap + 8, 0)
+  stwPoll(snap)
+  print("A ran=${gcStatCollections(g) > 0} chan=${alive(g, pChan, M_CHAN)} arg=${alive(g, pArg, M_ARG)} stack=${alive(g, pStack, M_STACK)} dead=${gcOwns(g, pDead)} abandoned=${stwAbandonedCount()}\n")
+
+  // ---- phase B: drop every root, poll again, everything goes --------------
+  storeWord(handle + CH_COUNT * 8, 0)
+  *(t + taskArg) = 0
+  fakeStack[TASK_STACK_SLOT] = 0
+  stwPoll(snap)
+  print("B chan=${gcOwns(g, pChan)} arg=${gcOwns(g, pArg)} stack=${gcOwns(g, pStack)} live=${gcNumObjects(g)}\n")
+
+  // ---- phase C: the precise stack-map walk marks what a stack map names ----
+  let base = mapsBegin()
+  let tblLen = mapsEnd() - base
+  let hitPc = 0
+  let hitSlot = 0
+  let off = 0
+  // Bounded by the extent; every entry is self-delimiting.
+  while (off < tblLen) {
+    let codeAddr = u64At(base + off)
+    off = off + 8
+    let codeSize = u32At(base + off)
+    off = off + 4
+    let numSaved = u16At(base + off)
+    off = off + 2 + numSaved * 6
+    let numSps = u16At(base + off)
+    off = off + 2
+    let si = 0
+    // Bounded: this entry's safepoint count.
+    while (si < numSps) {
+      let retOff = u32At(base + off)
+      off = off + 4
+      let numSlots = u16At(base + off)
+      off = off + 2
+      let slotsOff = off
+      off = off + numSlots * 4
+      let numRegs = u16At(base + off)
+      off = off + 2 + numRegs * 2
+      if (hitPc == 0 && numSlots > 0 && usableSlot(i32At(base + slotsOff))) {
+        hitPc = codeAddr + retOff
+        hitSlot = i32At(base + slotsOff)
+      }
+      si = si + 1
+    }
+  }
+
+  let pPrecise = gcAlloc(g, nodeInfo)
+  storeWord(pPrecise, M_PRECISE)
+  let pMissed = gcAlloc(g, nodeInfo)
+  storeWord(pMissed, M_MISSED)
+
+  let fp = int(ptrOf(frameBuf)) + FRAME_MID * 8
+  storeWord(fp, 0)                 // saved fp of 0 stops the walk after one frame
+  storeWord(fp + 8, 0)             // and its return address is never followed
+  storeWord(fp + hitSlot, pPrecise)
+  storeWord(snap + 0, hitPc)       // ret: the safepoint this stack map describes
+  storeWord(snap + 8, fp)          // fp: the synthetic frame above
+  stwPoll(snap)
+  print("C found=${hitPc != 0} precise=${alive(g, pPrecise, M_PRECISE)} missed=${gcOwns(g, pMissed)}\n")
+
+  // Hold every backing slice to the end of `main`, so only raw untraced pointers
+  // ever reach the collector under test and the LIVE (libbitrt) collector cannot
+  // move the ground under it when the suite reruns under BIT_GC=stress.
+  print("held ${len(arena) + len(indexArena) + len(heapBlock) + len(heapLock) + len(state) + len(meta)}\n")
+  print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(frameBuf) + len(snapBuf)}\n")
+}

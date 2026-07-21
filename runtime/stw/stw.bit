@@ -1,0 +1,450 @@
+// The stop-the-world safepoint — `root.zig`'s `safepointEntry` +
+// `safepointImpl` (root.zig:638-750) IN FULL: the mutator handshake (#1629) and
+// the COLLECTOR half (#1633), so a Bit-only `libbitrt.a` actually collects.
+//
+// It was missed by every earlier audit because it is not an `export fn`: root.zig
+// publishes it with `comptime { @export(&safepointEntry, .{ .name =
+// "bit_rt_safepoint" }); }` (root.zig:753), which a `grep 'export fn bit_rt_'`
+// enumeration cannot see. It is also the least optional symbol in the ABI — both
+// backends SYNTHESIZE a call to it at every loop back-edge (seed/codegen/x64.zig,
+// seed/codegen/arm64.zig), so an image that does not define it does not link.
+//
+// ---------------------------------------------------------------------------
+// WHY IT IS ITS OWN MODULE AND NOT `runtime/gc`'s (#1633 moved it here)
+// ---------------------------------------------------------------------------
+//
+// #1629 landed it in `runtime/gc` because the mutator handshake is entirely the
+// World registry's, which is `../gc/gcworld.bit`'s. The COLLECTOR half cannot
+// live there, and the reason is structural rather than stylistic: a collection
+// must enumerate root sources owned by `runtime/chan` (buffered `is_ref` channel
+// elements, ABI.md §11) and by `runtime/sched` (every other task's stack and
+// every task's `arg`, §5), and `runtime/gc` may not import either — `chan`
+// imports `../gc`, so the reverse edge is an import cycle (E0044). `extern
+// function` is not an escape: it is not on the `@nosplit` allowlist (§10.3) and
+// a Linux `--emit-obj` rejects it outright (E0078, the wall SEAM 1 hit at #1600).
+//
+// So the composition moves to a LEAF module that may import all three, and
+// nothing imports it. `../gc/gcworld.bit` keeps sole ownership of the World
+// block address and the current-mutator cache — duplicating that cache would let
+// one thread hold two slots, which the rendezvous then waits for forever — and
+// publishes the two reads this file needs (`worldBlockAddr`, `worldEnsureSelf`).
+//
+// `runtime/stw` holds ONE file, so the #1511 sort-order rule is trivially
+// satisfied; every helper it calls is a pinned symbol in another object.
+//
+// ---------------------------------------------------------------------------
+// THE PIN CYCLE, AND WHY NOTHING HERE CAN CALL ITSELF (#1367)
+// ---------------------------------------------------------------------------
+//
+// This is the pin-cycle trap (tests/rootpins.zig) in its purest form: the
+// backends emit a call to `bit_rt_safepoint` at every loop back edge, so a
+// definition of `bit_rt_safepoint` that contains a loop back edge calls ITSELF.
+// Pre-rename that call lands harmlessly on the still-linked Zig, so nothing —
+// not a build, not a link, not a test run — can see it until G2 (#1583) drops the
+// `_root` infix, at which point it is an instant stack overflow in every program
+// that loops.
+//
+// Two independent guarantees, both structural rather than asserted:
+//
+//   - `safepointEntry` is `@naked` and its body is a single `asm` block. §10.3.1
+//     admits no locals, no control flow and no implicit prologue in a naked
+//     function, and an `asm` payload is emitted verbatim, so there is no back
+//     edge for codegen to attach a poll to. The emitted object carries no
+//     relocation to any `bit_rt_` name (checked by `zig build rootpins`, which
+//     performs the G2 rename symbolically on the emitted object).
+//   - EVERY OTHER function here is `@nosplit`, which suppresses back-edge poll
+//     emission outright (§10.3), and whose default-deny allowlist additionally
+//     refuses any call to a non-`@nosplit` function (E0075) — so the guarantee is
+//     transitive over everything they reach, including the objects this file
+//     drives, without anyone having to re-derive the call graph. That matters
+//     most for the loops below: this file contains five, and each of them would
+//     otherwise be a recursive poll.
+//
+// ---------------------------------------------------------------------------
+// THE ROOT SET, AND WHY IT IS ALL-OR-NOTHING
+// ---------------------------------------------------------------------------
+//
+// A collection that misses ONE root class does not crash — it sweeps a live
+// object and corrupts the heap silently. So the five classes `root.zig`'s
+// `scanRoots` (root.zig:406) funnels are enumerated here in the same order, and
+// each names where it is implemented:
+//
+//   1. Buffered `is_ref` channel elements (§11) — `chanScanRegistryRoots`
+//      (`../chan/chanreg.bit`, #1602). A buffered word is reachable only through
+//      the ring while it sits unreceived. The ring is PROCESS memory, not a
+//      GC-traced allocation, so its CONTENTS are the roots.
+//   2. THIS thread's own frames, precisely (§4) — `gcScanSnapshot`
+//      (`../gc/stackmap.bit`, #1633), walking the stack maps between
+//      `stackMapsBegin()`/`stackMapsEnd()`.
+//   3. Every OTHER stopped OS thread's frames, precisely — the same walk over
+//      each parked mutator's published snapshot (`worldParkedFrame`). The world
+//      is stopped, so each of those frames is valid and not moving.
+//   4. Every OTHER task's stack, conservatively (§5) — sound because a parked
+//      task's callee-saved references are all spilled by the runtime call chain
+//      that parked it.
+//   5. Every registered task's opaque `arg` (§5/§9) — a spawn thunk is a GC
+//      object reachable ONLY through the pending task's `arg` until that task
+//      runs and unpacks it.
+//
+// Classes 4 and 5 are reachable only when a scheduler block is bound; class 1
+// only when a channel registry is. `stwBind` takes all three addresses TOGETHER
+// and `stwCanCollect` refuses to collect unless every one of them is present —
+// deliberately, because "collect with a smaller root set" is the failure mode
+// this whole comment exists to prevent. An unbound runtime does not collect; it
+// never collects PARTIALLY.
+
+import { worldStopRequested, worldPark, worldRendezvous, worldRestart } from "../gc"
+import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
+import { worldBlockAddr, worldEnsureSelf, maxMutators } from "../gc"
+import { gcShouldCollect, gcMarkBegin, gcCollectFinish } from "../gc"
+import { gcMarkConservative, gcScanSnapshot } from "../gc"
+import { wordAt, loadWord } from "../gc"
+import { chanScanRegistryRoots } from "../chan"
+import { taskAt, schedCurrentTask, schedMaxRegistered } from "../sched"
+import { schedRegLock, schedRegUnlock, schedRegHead, schedRegNext } from "../sched"
+import { ctxSp, taskArg, taskState, taskDone, taskStackBase, taskStackBytes } from "../sched"
+
+// ---------------------------------------------------------------------------
+// The bound blocks
+// ---------------------------------------------------------------------------
+//
+// CALLER-OWNED, the convention every ported runtime block follows (`worldBind`,
+// `chanBootBind`): a `@nosplit` module cannot own a block another module must
+// also see, so the owner (`runtime/root`, which already holds `gcState`) passes
+// the addresses in once at boot. Zero until then, and zero means "do not
+// collect" rather than "collect with less".
+
+let gcAddr: i64 = 0
+let schedAddr: i64 = 0
+let chanRegAddr: i64 = 0
+
+// Collections given up because the stop-the-world rendezvous expired —
+// `gc.zig`'s `stats.stw_abandoned`, kept here rather than in the collector block
+// because that block is full (`gcWords` = 37, every word assigned) and its size
+// is `runtime/root`'s declaration. Abandoning is SAFE (skipping a collection
+// only costs heap growth) but is evidence that some thread blocks without the
+// `blocked` contract, so it is counted and readable.
+let stwAbandoned: i64 = 0
+
+// Statically bounded conservative stack scan (Power of 10): 32MB of words, far
+// above the 64KB task stacks the scheduler maps.
+const stwMaxStackWords = 4194304
+
+// Bind the three process-wide blocks a collection needs. Called once at boot by
+// `runtime/root`, after it has `ptrOf`'d its own collector state, scheduler and
+// channel registry (which this `@nosplit` module cannot do for it). The World
+// block goes to `worldBind` separately — `../gc/gcworld.bit` owns that one.
+export @nosplit @symbol("bit_rt_port_stw_bind") function stwBind(g: int, sched: int, chanReg: int) {
+  gcAddr = g
+  schedAddr = sched
+  chanRegAddr = chanReg
+}
+
+// Abandoned-collection count, so a test can assert it stayed 0.
+export @nosplit @symbol("bit_rt_port_stw_abandoned") function stwAbandonedCount(): int {
+  let n = stwAbandoned
+  return n
+}
+
+// Whether a collection is even permissible: every root source must be reachable.
+// See "THE ROOT SET" above — this is the guard that keeps a partially-bound
+// runtime from running a collection with a smaller root set than it has roots.
+@nosplit function stwCanCollect(): bool {
+  if (gcAddr == 0) {
+    return false
+  }
+  if (schedAddr == 0) {
+    return false
+  }
+  if (chanRegAddr == 0) {
+    return false
+  }
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Root enumeration
+// ---------------------------------------------------------------------------
+
+// Conservatively mark every aligned word in `[sp, top)` — `root.zig`'s
+// `conservativeStack`. Every word goes through `gcMarkConservative`, which
+// validates against the heap bounds and an exact ownership test before decoding
+// anything, so a small integer that looks like a pointer is simply ignored.
+@nosplit function stwScanStackRange(g: *i64, sp: int, top: int) {
+  if (sp <= 0) {
+    return
+  }
+  // Align UP, as `std.mem.alignForward` does: a misaligned base would read
+  // words straddling two slots, which are not object references in any case.
+  let a = (sp + 7) / 8 * 8
+  let n = 0
+  // Bounded by the mapped stack AND by `stwMaxStackWords`.
+  while (a + 8 <= top && n < stwMaxStackWords) {
+    gcMarkConservative(g, loadWord(a))
+    a = a + 8
+    n = n + 1
+  }
+}
+
+// Classes 4 and 5: every registered task's `arg`, and every task's stack except
+// the one this thread is running (scanned precisely from the snapshot instead)
+// and any finished task (its stack holds nothing live). `sched.zig`'s
+// `forEachTaskArg` + `forEachOtherStack`, fused into one walk because they visit
+// the same list under the same lock.
+@nosplit function stwScanTasks(g: *i64, sched: *i64) {
+  let cur = schedCurrentTask()
+  schedRegLock(sched)
+  let addr = schedRegHead(sched)
+  let n = 0
+  // Bounded by `schedMaxRegistered`, `sched.zig`'s own runaway backstop.
+  while (addr != 0 && n < schedMaxRegistered) {
+    let t = taskAt(addr)
+    gcMarkConservative(g, *(t + taskArg))
+    if (addr != cur && *(t + taskState) != taskDone) {
+      stwScanStackRange(g, *(t + ctxSp), *(t + taskStackBase) + *(t + taskStackBytes))
+    }
+    addr = schedRegNext(t)
+    n = n + 1
+  }
+  schedRegUnlock(sched)
+}
+
+// One full stop-the-world mark-sweep. The world is already stopped and this
+// thread holds the world lock; `snap` is this thread's own `SafepointFrame`.
+//
+// `gcMarkBegin` .. `gcCollectFinish` is `gc.zig`'s `collect` with the root
+// callback inverted (`../gc/gccollect.bit` deviation 2) — everything between the
+// two is the root enumeration, in `root.zig`'s `scanRoots` order.
+@nosplit function stwCollect(g: *i64, world: *i64, selfSlot: int, snap: int) {
+  gcMarkBegin(g)
+
+  // 1. Buffered `is_ref` channel elements (§11).
+  chanScanRegistryRoots(g, wordAt(chanRegAddr))
+
+  // 2. This thread's own frames, precisely (§4).
+  gcScanSnapshot(g, snap)
+
+  // 3. Every other stopped OS thread's frames, precisely.
+  let i = 0
+  // Bounded: exactly `maxMutators` slots.
+  while (i < maxMutators) {
+    if (i != selfSlot) {
+      let f = worldParkedFrame(world, i)
+      if (f != 0) {
+        gcScanSnapshot(g, f)
+      }
+    }
+    i = i + 1
+  }
+
+  // 4 + 5. Every other task's stack, conservatively, and every task's `arg`.
+  stwScanTasks(g, taskAt(schedAddr))
+
+  gcCollectFinish(g)
+}
+
+// ---------------------------------------------------------------------------
+// The poll body — `safepointImpl` (root.zig:638), IN FULL
+// ---------------------------------------------------------------------------
+//
+// `snap` is the address of the caller's `SafepointFrame` (ABI.md §4), which the
+// naked shim below reserved on THIS thread's own stack. Per-thread by
+// construction — no TLS, no registration, no ordering — which is the #1429 fix;
+// the frame used to be one process-wide global and two workers polling at once
+// overwrote each other's registers and then both collected.
+//
+// The frame is valid for exactly as long as this call: it lives below the
+// shim's `sp`, so publishing it (`worldPark`) is sound only while this thread
+// stays inside the shim, which parking guarantees.
+//
+// Exactly one of three things happens (ABI.md §5):
+//
+//  1. Someone else is collecting -> park here until they finish. A mutator that
+//     ignored this would run behind the collector's back.
+//  2. Nobody is collecting and the trigger is not crossed -> return. The hot
+//     path: one atomic load plus the trigger test.
+//  3. The trigger is crossed -> try to become the collector.
+//
+// The `tryAcquire` LOSER PARKS rather than spinning on the lock. That is the
+// deadlock-freedom argument, and it is why `worldLockTry` exists alongside the
+// spinning `worldLockAcquire`: a thread the collector is waiting for is never
+// itself waiting for the collector.
+//
+// `@nosplit` is REQUIRED, not stylistic — see the pin-cycle note above.
+export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
+  // Registers this thread if it has not registered yet, and parks it there if a
+  // stop is already pending. Publishes the REAL snapshot: `root.zig`'s
+  // `currentMutator` passes 0 from the allocation door (runtime code, no stack
+  // map) but its real frame from the safepoint door, and parking with 0 would
+  // hide exactly the references this poll's stack map names.
+  let mu = worldEnsureSelf(snap)
+
+  let waddr = worldBlockAddr()
+  if (waddr == 0) {
+    return    // pre-boot: `worldBind` has not run, so there is no registry yet
+  }
+  let world = wordAt(waddr)
+
+  if (worldStopRequested(world)) {
+    // Someone is collecting. Park until they finish. `worldPark` returns at
+    // once if the stop cleared in the gap, which is what makes this safe to
+    // call speculatively. A thread with no slot has nothing to publish and
+    // nothing waits for it.
+    if (mu != 0) {
+      worldPark(world, mu - 1, snap)
+    }
+    return
+  }
+
+  if (!stwCanCollect()) {
+    return
+  }
+  let g = wordAt(gcAddr)
+  if (!gcShouldCollect(g)) {
+    return
+  }
+
+  // A thread with no slot must not collect: `worldRendezvous` skips only the
+  // collector's own slot, so a slotless collector would wait for itself forever.
+  if (mu == 0) {
+    return
+  }
+  let selfSlot = mu - 1
+
+  if (!worldLockTry(world)) {
+    // Another thread is collecting, or is about to. Park speculatively — a
+    // no-op if it turns out no stop is pending.
+    worldPark(world, selfSlot, snap)
+    return
+  }
+
+  // Re-test UNDER THE LOCK: the thread that just released it may have collected
+  // everything we were about to collect for.
+  if (gcShouldCollect(g)) {
+    if (worldRendezvous(world, selfSlot)) {
+      stwCollect(g, world, selfSlot, snap)
+    } else {
+      // Could not stop the world within the bound. ABANDON — never force.
+      // Skipping a collection only costs heap growth; collecting while a mutator
+      // runs costs correctness.
+      stwAbandoned = stwAbandoned + 1
+    }
+    // Restart on BOTH paths: `rendezvous` sets the stop flag before it waits, so
+    // an expired rendezvous leaves it set and every mutator that already parked
+    // would never resume.
+    worldRestart(world)
+  }
+  worldLockRelease(world)
+}
+
+// ---------------------------------------------------------------------------
+// `bit_rt_safepoint` — the naked register/frame snapshot shim (ABI.md §4)
+// ---------------------------------------------------------------------------
+//
+// Zero-arg, `callconv(.c)`, emitted by both backends at every loop back edge.
+// Naked so it runs with NO prologue: it captures the caller's return address,
+// frame pointer and callee-saved register file BEFORE any compiled code could
+// overwrite them, then hands that snapshot to `stwPoll` as its first C argument.
+//
+// The `SafepointFrame` layout it builds is root.zig's, field for field:
+//   +0   ret        the caller's return address (0 would mean "not captured")
+//   +8   fp         the caller's frame pointer
+//   +16  regs[32]   regs[n] at +16+8n, physical register n's live value
+// `regs` is deliberately NOT zeroed — this runs at every back edge and clearing
+// 32 words per poll is not free. Sound because ABI.md §4 restricts the registers
+// a stack map may name at a safepoint to exactly the callee-saved file saved
+// here, and because every word the walk reads goes through the validating
+// `gcMarkRoot`.
+//
+// The reservation is 8 bytes larger than the 272-byte struct on x86-64 and 16
+// larger on AArch64, purely to keep the stack ABI-aligned at the call. A function
+// containing a safepoint is non-leaf by construction (it calls this), so it may
+// not rely on the x86-64 red zone and overlapping that zone costs nothing.
+//
+// THE PAYLOAD IS HAND-ENCODED AND DISASSEMBLY-CHECKED, instruction for
+// instruction against root.zig's `asm volatile` (root.zig:698-750) — there is no
+// text assembler in the toolchain (§11.6), and a wrong offset here does not fail
+// a build, it publishes the wrong register as a root.
+//
+//   x86-64 (SysV; rbx=3, r13=13, r14=14, r15=15 -> +40,+120,+128,+136):
+//     48 81 EC 18 01 00 00        subq  $280, %rsp
+//     4C 8B 84 24 18 01 00 00     movq  280(%rsp), %r8    # the caller's ret addr
+//     4C 89 04 24                 movq  %r8, 0(%rsp)
+//     48 89 6C 24 08              movq  %rbp, 8(%rsp)
+//     48 89 5C 24 28              movq  %rbx, 40(%rsp)
+//     4C 89 6C 24 78              movq  %r13, 120(%rsp)
+//     4C 89 B4 24 80 00 00 00     movq  %r14, 128(%rsp)
+//     4C 89 BC 24 88 00 00 00     movq  %r15, 136(%rsp)
+//     48 89 E7                    movq  %rsp, %rdi        # arg 0 = the frame
+//     FF D1                       call  *%rcx
+//     48 81 C4 18 01 00 00        addq  $280, %rsp
+//     C3                          ret
+//   At entry `rsp % 16 == 8` (the caller's `call` pushed the return address), so
+//   subtracting 280 restores `rsp % 16 == 0` for the call while leaving the
+//   return address at 280(%rsp). `rbp` is still the caller's frame pointer — no
+//   prologue ran. `rdi`/`r8`/`rcx` are all caller-saved, so materializing them
+//   cannot destroy a callee-saved value before it is saved.
+//
+//   AArch64 (x19..x28 -> +168..+240):
+//     D10483FF   sub  sp, sp, #288
+//     F90003FE   str  x30, [sp, #0]        # x30 = the caller's return address
+//     F90007FD   str  x29, [sp, #8]        # x29 = the caller's frame pointer
+//     A90AD3F3   stp  x19, x20, [sp, #168]
+//     A90BDBF5   stp  x21, x22, [sp, #184]
+//     A90CE3F7   stp  x23, x24, [sp, #200]
+//     A90DEBF9   stp  x25, x26, [sp, #216]
+//     A90EF3FB   stp  x27, x28, [sp, #232]
+//     910003E0   mov  x0, sp               # arg 0 = the frame
+//     F81F0FFE   str  x30, [sp, #-16]!
+//     D63F0020   blr  x1
+//     F84107FE   ldr  x30, [sp], #16
+//     910483FF   add  sp, sp, #288
+//     D65F03C0   ret
+//   288 keeps `sp` 16-aligned (the hardware enforces it). `x0`/`x1` are the first
+//   argument and caller-saved scratch, so neither disturbs the saved file. `x30`
+//   is preserved across the call by its own push, NOT by the frame copy, so the
+//   return path does not depend on the callee leaving the frame untouched.
+//
+// `input` materializes `entryOf(stwPoll)` into `rcx`/`x1` ahead of the payload —
+// the only compiler-emitted instruction in this function, an inline address
+// materialization against a link-time constant (§11.10) that touches no other
+// register and no memory. `entryOf` rather than a direct call because §11.6 has
+// no relocation for a branch OUT of an `asm` block.
+//
+// PINNED `bit_rt_root_safepoint`, NOT `bit_rt_safepoint`: root.zig still defines
+// the real name and claiming it now is a DuplicateSymbol at every link (#1624).
+// G2 (#1583) drops the `_root` infix, as for every other pin in this tree.
+@naked @symbol("bit_rt_root_safepoint")
+function safepointEntry() {
+  return asm volatile {
+    x64   { 0x48, 0x81, 0xEC, 0x18, 0x01, 0x00, 0x00,
+            0x4C, 0x8B, 0x84, 0x24, 0x18, 0x01, 0x00, 0x00,
+            0x4C, 0x89, 0x04, 0x24,
+            0x48, 0x89, 0x6C, 0x24, 0x08,
+            0x48, 0x89, 0x5C, 0x24, 0x28,
+            0x4C, 0x89, 0x6C, 0x24, 0x78,
+            0x4C, 0x89, 0xB4, 0x24, 0x80, 0x00, 0x00, 0x00,
+            0x4C, 0x89, 0xBC, 0x24, 0x88, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0xE7,
+            0xFF, 0xD1,
+            0x48, 0x81, 0xC4, 0x18, 0x01, 0x00, 0x00,
+            0xC3 }
+    arm64 { 0xD10483FF,
+            0xF90003FE,
+            0xF90007FD,
+            0xA90AD3F3,
+            0xA90BDBF5,
+            0xA90CE3F7,
+            0xA90DEBF9,
+            0xA90EF3FB,
+            0x910003E0,
+            0xF81F0FFE,
+            0xD63F0020,
+            0xF84107FE,
+            0x910483FF,
+            0xD65F03C0 }
+    input arm64 x1 x64 rcx = entryOf(stwPoll)
+    clobber x64   { rdi, r8, memory }
+    clobber arm64 { x0, memory }
+  }
+}

@@ -79,7 +79,7 @@
 
 // `spinAcquire`/`spinRelease` are already imported by the sibling `gc.bit` into
 // this shared module scope; only `spinCellAt` is new here.
-import { spinCellAt } from "../"
+import { spinCellAt, spinTryAcquire } from "../"
 
 // ---------------------------------------------------------------------------
 // Layout — the caller-owned `World` block, field for field with gc.zig's struct
@@ -399,6 +399,46 @@ export @nosplit @symbol("bit_rt_port_gc_world_unlock") function worldLockRelease
   spinRelease(spinCellAt(world, worldLockWord))
 }
 
+// `SpinLock.tryAcquire` — take the collector lock if it is free, else report
+// failure WITHOUT spinning. This is the door `root.zig`'s `safepointImpl` uses
+// (`if (!g_world.lock.tryAcquire())`), and the non-spinning half is the whole
+// deadlock-freedom argument: the loser PARKS instead of waiting, so a thread the
+// collector is waiting for is never itself waiting for the collector.
+// `worldLockAcquire` (spinning) is the wrong primitive there and is kept for the
+// callers that genuinely must serialize.
+export @nosplit @symbol("bit_rt_port_gc_world_trylock") function worldLockTry(world: *i64): bool {
+  return spinTryAcquire(spinCellAt(world, worldLockWord))
+}
+
+// The snapshot slot `slot` published when it parked, or 0 if it is not parked.
+//
+// The collector's cursor over `root.zig`'s `forEachParkedFrame`: with the world
+// stopped, every OTHER registered mutator is parked at its own safepoint with a
+// `SafepointFrame` published on ITS stack, and that frame stays valid for exactly
+// as long as it stays parked — which is until this collection ends. Scanning it
+// is how a second OS thread's precise roots are found (ABI.md §5).
+//
+// A cursor rather than Zig's callback form for the reason every other traversal
+// in this tree is one: `@nosplit` refuses a call through a function value
+// (E0075). The caller skips its own slot.
+//
+// Reads state and frame as two atomic loads and re-checks the state is still
+// `parked` — a slot that leaves `parked` between the two loads would hand back a
+// frame that is no longer published. Under a stopped world nothing may leave
+// `parked`, so this cannot fire today; it costs one load and removes the
+// dependence of a HEAP-CORRUPTING read on a caller-side precondition.
+export @nosplit @symbol("bit_rt_port_gc_world_parked_frame") function worldParkedFrame(world: *i64, slot: int): int {
+  let m = wMut(world, slot)
+  if (atomicLoad(m) != mParked) {
+    return 0
+  }
+  let f = atomicLoad(m + muFrame)
+  if (atomicLoad(m) != mParked) {
+    return 0
+  }
+  return f
+}
+
 // The deviation-5 counter: nonzero means a stop never cleared (a runtime bug).
 // Exposed so a test can assert it stayed 0 across a whole run.
 export @nosplit @symbol("bit_rt_port_gc_world_resume_giveup") function worldResumeGiveUp(world: *i64): int {
@@ -483,6 +523,45 @@ export @nosplit @symbol("bit_rt_port_gc_world_bind") function worldBind(addr: in
   if (worldStopRequested(world)) {
     worldPark(world, slot, frame)
   }
+}
+
+// ---------------------------------------------------------------------------
+// The two doors the SAFEPOINT POLL needs, and why they are exported (#1633)
+// ---------------------------------------------------------------------------
+//
+// `worldAddr` and `curMut` are this module's `g_world`/`g_mutator` stand-ins and
+// stay private: nothing outside may set them, or two callers would disagree
+// about which slot this thread holds. What the poll needs is the two READS, and
+// `ensureMutator`'s claim-and-park-on-entry, so exactly those are published.
+//
+// This is what lets the collector half (`runtime/stw`) live in a module that can
+// also see `runtime/chan` and `runtime/sched`, whose roots a collection must
+// enumerate. `runtime/gc` cannot import either (`chan` imports `../gc`, so the
+// reverse edge is an import cycle, E0044), and the current-mutator cache cannot
+// be duplicated there — a thread holding two slots is a thread the rendezvous
+// waits for forever. Publishing the two accessors keeps ONE cache with ONE
+// owner and moves only the composition.
+
+// The bound World block address, or 0 before `worldBind` — the value the poll
+// tests before touching the registry at all (pre-boot there is no registry).
+export @nosplit @symbol("bit_rt_port_gc_world_addr") function worldBlockAddr(): int {
+  let a = worldAddr
+  return a
+}
+
+// Register this thread if it has not registered (parking immediately if a stop
+// is already pending, so a thread joining mid-collection cannot run behind the
+// mark) and return its slot BIASED BY ONE — 0 means "no slot", exactly as
+// `curMut` encodes it, and `root.zig`'s `currentMutator` returns `?*Mutator` for
+// the same distinction.
+//
+// `frame` is the caller's `SafepointFrame` address, published on park. The
+// safepoint door passes its real frame; the thread_enter/blocking doors pass 0
+// (they hold no stack map).
+export @nosplit @symbol("bit_rt_port_gc_world_ensure_self") function worldEnsureSelf(frame: int): int {
+  ensureMutator(frame)
+  let m = curMut
+  return m
 }
 
 // `bit_rt_gc_thread_enter` (ABI.md §5/§6): register this OS thread as a mutator.
