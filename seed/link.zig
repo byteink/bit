@@ -109,16 +109,21 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
     const arena = arena_state.allocator();
 
     // ---- ingest: every input becomes one or more generic modules ----------
+    // Objects and archive members are kept apart: an object is always a link
+    // input, a member only if it satisfies a still-undefined symbol
+    // (`strip.selectArchiveMembers`, #1647). Reading a member is not loading it.
     var modules: std.ArrayList(object.Module) = .empty;
+    var members: std.ArrayList(object.Module) = .empty;
     for (inputs) |input| switch (input) {
         .object => |bytes| {
             try modules.append(arena, try elf_reader.read(arena, target.readerTarget(), "bit.o", bytes));
         },
         .archive => |bytes| {
-            const members = try archive.parse(arena, bytes);
-            for (members) |m| try modules.append(arena, try elf_reader.read(arena, target.readerTarget(), m.name, m.data));
+            for (try archive.parse(arena, bytes)) |m|
+                try members.append(arena, try elf_reader.read(arena, target.readerTarget(), m.name, m.data));
         },
     };
+    try modules.appendSlice(arena, try strip.selectArchiveMembers(arena, modules.items, members.items, &.{entry_symbol}));
     // ABI.md §4: the merged GC stack-map table's bounds are linker-defined, so
     // the boundary symbols enter the link as a synthetic module. It goes in
     // BEFORE `resolveGlobals` so the runtime's `extern` references resolve

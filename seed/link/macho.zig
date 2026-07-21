@@ -134,9 +134,12 @@ pub fn link(gpa: Allocator, inputs: []const Input, opts: Options) (Error || mach
     const arena = arena_state.allocator();
 
     var modules: std.ArrayList(object.Module) = .empty;
+    var members: std.ArrayList(object.Module) = .empty;
     // `.object` inputs are the compiled Bit program; archive members follow.
     // The undefined-symbol rule (#1445) keys off exactly this split, so count
-    // the program's modules here rather than assuming an ordering downstream.
+    // the program's modules here rather than assuming an ordering downstream —
+    // and collecting the members separately is also what lets them be pulled
+    // LAZILY, only to satisfy a still-undefined symbol (#1647).
     var program_modules: u32 = 0;
     for (inputs) |input| switch (input) {
         .object => |bytes| {
@@ -144,9 +147,10 @@ pub fn link(gpa: Allocator, inputs: []const Input, opts: Options) (Error || mach
             program_modules += 1;
         },
         .archive => |bytes| {
-            for (try archive.parse(arena, bytes)) |m| try modules.append(arena, try macho_reader.read(arena, m.name, m.data));
+            for (try archive.parse(arena, bytes)) |m| try members.append(arena, try macho_reader.read(arena, m.name, m.data));
         },
     };
+    try modules.appendSlice(arena, try strip.selectArchiveMembers(arena, modules.items, members.items, &.{entry_symbol}));
     std.debug.assert(program_modules <= modules.items.len);
 
     var o = opts;

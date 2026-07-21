@@ -74,6 +74,120 @@ pub fn resolveGlobals(gpa: Allocator, modules: []const Module) Error!GlobalTable
     return table;
 }
 
+/// Selects which archive members take part in the link, per the standard
+/// static-archive rule: a member is pulled in **only** to satisfy a symbol that
+/// is undefined at the moment it is considered. `eager` is every explicit
+/// object input (always loaded, always winning), `candidates` is every member of
+/// every archive in archive order, and `roots` names the symbols the container
+/// itself demands (the entry point), which no object references.
+///
+/// Why this is a correctness requirement and not an output-size optimization
+/// (#1647): a program that compiles a runtime module FROM SOURCE defines the
+/// same ABI names the archive's copy of that module defines. Loading every
+/// member unconditionally makes that a `DuplicateSymbol` — 38 of the 55
+/// host-runnable `tests/stress` programs, none of which any renaming can avoid,
+/// because the collision is between a program's own definition and the archive's.
+/// Under this rule the program's own definition satisfies the reference, the
+/// archive's member is never read, and there is nothing to collide with.
+///
+/// Pulling a member can leave NEW symbols undefined, which may pull further
+/// members, so this iterates to a fixed point. The bound is real, not
+/// hopeful: every round either takes at least one member or stops, and there
+/// are finitely many members, so `candidates.len + 1` rounds is an upper limit
+/// the assert below enforces (Power-of-10 rule 2).
+///
+/// What this deliberately does NOT do is weaken the duplicate diagnostic. Two
+/// explicit objects defining one strong symbol are both `eager` and still
+/// collide in `resolveGlobals`; so do two archive members that both get pulled.
+/// Laziness changes WHICH members enter the link, never what happens to the
+/// ones that do.
+pub fn selectArchiveMembers(
+    gpa: Allocator,
+    eager: []const Module,
+    candidates: []const Module,
+    roots: []const []const u8,
+) Error![]const Module {
+    // Two monotone sets, never erased from. "Still undefined" is the DERIVED
+    // predicate `wanted && !defined` (`isOutstanding`), not a third set kept in
+    // step by hand: a reference is satisfied the instant something defines the
+    // name, and there is no order of updates that can get that wrong.
+    var defined: std.StringHashMapUnmanaged(void) = .{};
+    defer defined.deinit(gpa);
+    var wanted: std.StringHashMapUnmanaged(void) = .{};
+    defer wanted.deinit(gpa);
+
+    for (roots) |name| try wanted.put(gpa, name, {});
+    for (eager) |mod| {
+        try noteDefinitions(gpa, mod, &defined);
+        try noteReferences(gpa, mod, &wanted);
+    }
+
+    const taken = try gpa.alloc(bool, candidates.len);
+    defer gpa.free(taken);
+    @memset(taken, false);
+
+    var rounds: usize = 0;
+    while (rounds <= candidates.len) : (rounds += 1) {
+        var progress = false;
+        for (candidates, 0..) |mod, i| {
+            if (taken[i]) continue;
+            if (!definesAnyOutstanding(mod, &defined, &wanted)) continue;
+            taken[i] = true;
+            progress = true;
+            try noteDefinitions(gpa, mod, &defined);
+            try noteReferences(gpa, mod, &wanted);
+        }
+        if (!progress) break;
+    }
+    // The loop can only exit by `break`: the round after the last productive one
+    // finds nothing new, and there are at most `candidates.len` productive
+    // rounds. Reaching the bound would mean a member was taken twice.
+    std.debug.assert(rounds <= candidates.len);
+
+    // Emitted in archive order rather than pull order, so a member's position in
+    // the link depends only on the archive, not on the order references happened
+    // to be discovered in.
+    var out: std.ArrayList(Module) = .empty;
+    errdefer out.deinit(gpa);
+    for (candidates, 0..) |mod, i| {
+        if (taken[i]) try out.append(gpa, mod);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// A name that something references (or the container demands) and nothing has
+/// defined yet — exactly the condition that pulls an archive member in.
+fn isOutstanding(name: []const u8, defined: *const std.StringHashMapUnmanaged(void), wanted: *const std.StringHashMapUnmanaged(void)) bool {
+    return wanted.contains(name) and !defined.contains(name);
+}
+
+fn noteDefinitions(gpa: Allocator, mod: Module, defined: *std.StringHashMapUnmanaged(void)) Allocator.Error!void {
+    for (mod.atoms) |atom| {
+        if (atom.binding != .global) continue;
+        try defined.put(gpa, atom.name, {});
+    }
+}
+
+/// Records every global `mod` references. A name nothing ever defines simply
+/// stays outstanding forever (the libSystem imports on Mach-O are exactly that)
+/// and pulls nothing.
+fn noteReferences(gpa: Allocator, mod: Module, wanted: *std.StringHashMapUnmanaged(void)) Allocator.Error!void {
+    for (mod.atoms) |atom| {
+        for (atom.relocs) |r| switch (r.target) {
+            .local => {},
+            .global => |name| try wanted.put(gpa, name, {}),
+        };
+    }
+}
+
+fn definesAnyOutstanding(mod: Module, defined: *const std.StringHashMapUnmanaged(void), wanted: *const std.StringHashMapUnmanaged(void)) bool {
+    for (mod.atoms) |atom| {
+        if (atom.binding != .global) continue;
+        if (isOutstanding(atom.name, defined, wanted)) return true;
+    }
+    return false;
+}
+
 /// Resolves one relocation target to the atom it names: a `.local` target is
 /// an index into `module_idx`'s own atoms; a `.global` target goes through the
 /// whole-link table (`error.UndefinedSymbol` if nothing defines it).
@@ -376,6 +490,114 @@ test "resolveGlobals maps every global, rejects a duplicate" {
     const dup = [_]object.Atom{mkAtom("_start", .global, &.{})};
     const mods2 = [_]Module{ .{ .name = "rt", .atoms = @constCast(&a0) }, .{ .name = "d", .atoms = @constCast(&dup) } };
     try testing.expectError(error.DuplicateSymbol, resolveGlobals(gpa, &mods2));
+}
+
+fn mkGlobalRef(name: []const u8) object.Reloc {
+    return .{ .offset = 0, .kind = .pc32, .target = .{ .global = name } };
+}
+
+test "selectArchiveMembers pulls a member only to satisfy an outstanding symbol" {
+    const gpa = testing.allocator;
+    // The #1647 shape: the program compiles `runtime/alloc` from source, so it
+    // DEFINES `bit_rt_alloc` itself while still needing `_start` from the
+    // archive. Loading every member made those two definitions a duplicate.
+    const prog = [_]object.Atom{
+        mkAtom("bit_main", .global, &.{mkGlobalRef("bit_rt_alloc")}),
+        mkAtom("bit_rt_alloc", .global, &.{}),
+    };
+    const rt_root = [_]object.Atom{mkAtom("_start", .global, &.{mkGlobalRef("bit_main")})};
+    const rt_alloc = [_]object.Atom{mkAtom("bit_rt_alloc", .global, &.{})};
+
+    const eager = [_]Module{.{ .name = "bit.o", .atoms = @constCast(&prog) }};
+    const members = [_]Module{
+        .{ .name = "runtime_root.o", .atoms = @constCast(&rt_root) },
+        .{ .name = "runtime_alloc.o", .atoms = @constCast(&rt_alloc) },
+    };
+
+    const picked = try selectArchiveMembers(gpa, &eager, &members, &.{"_start"});
+    defer gpa.free(picked);
+    // `runtime_root.o` is pulled (nothing else defines `_start`);
+    // `runtime_alloc.o` is NOT (the program already defines its only symbol).
+    try testing.expectEqual(@as(usize, 1), picked.len);
+    try testing.expectEqualStrings("runtime_root.o", picked[0].name);
+
+    // And the whole link therefore resolves, where loading both members is the
+    // duplicate this task exists to remove.
+    var mods: std.ArrayList(Module) = .empty;
+    defer mods.deinit(gpa);
+    try mods.appendSlice(gpa, &eager);
+    try mods.appendSlice(gpa, picked);
+    var globals = try resolveGlobals(gpa, mods.items);
+    defer globals.deinit(gpa);
+    try testing.expectEqual(@as(u32, 0), globals.get("bit_rt_alloc").?.module); // the program's own
+    try testing.expectError(error.DuplicateSymbol, resolveGlobals(gpa, &(eager ++ members)));
+}
+
+test "selectArchiveMembers reaches a fixed point across a chain of pulls" {
+    const gpa = testing.allocator;
+    // A pulls B pulls C — each new member creates the reference that pulls the
+    // next, so a single pass over the members in this order finds only A.
+    // `dup_c` also defines `c`, but nothing outstanding needs it once C is in,
+    // so it stays out and does not collide.
+    const prog = [_]object.Atom{mkAtom("bit_main", .global, &.{mkGlobalRef("a")})};
+    const a = [_]object.Atom{mkAtom("a", .global, &.{mkGlobalRef("b")})};
+    const b = [_]object.Atom{mkAtom("b", .global, &.{mkGlobalRef("c")})};
+    const c = [_]object.Atom{ mkAtom("c", .global, &.{}), mkAtom("only_c", .global, &.{}) };
+    const dup_c = [_]object.Atom{ mkAtom("c", .global, &.{}), mkAtom("unused", .global, &.{}) };
+
+    const eager = [_]Module{.{ .name = "bit.o", .atoms = @constCast(&prog) }};
+    const members = [_]Module{
+        .{ .name = "a.o", .atoms = @constCast(&a) },
+        .{ .name = "dup_c.o", .atoms = @constCast(&dup_c) },
+        .{ .name = "b.o", .atoms = @constCast(&b) },
+        .{ .name = "c.o", .atoms = @constCast(&c) },
+    };
+
+    const picked = try selectArchiveMembers(gpa, &eager, &members, &.{});
+    defer gpa.free(picked);
+    try testing.expectEqual(@as(usize, 3), picked.len);
+    // Archive order, not pull order (a, b, c was discovered a -> b -> c).
+    try testing.expectEqualStrings("a.o", picked[0].name);
+    try testing.expectEqualStrings("b.o", picked[1].name);
+    try testing.expectEqualStrings("c.o", picked[2].name);
+
+    var mods: std.ArrayList(Module) = .empty;
+    defer mods.deinit(gpa);
+    try mods.appendSlice(gpa, &eager);
+    try mods.appendSlice(gpa, picked);
+    var globals = try resolveGlobals(gpa, mods.items);
+    defer globals.deinit(gpa);
+    try testing.expect(globals.get("c") != null);
+
+    // Once something outstanding needs a symbol from EACH of the two members
+    // that define `c`, both are pulled and the duplicate is a real conflict
+    // again — laziness decides membership, it does not make duplicates legal.
+    const prog2 = [_]object.Atom{mkAtom("bit_main", .global, &.{ mkGlobalRef("a"), mkGlobalRef("unused"), mkGlobalRef("only_c") })};
+    const eager2 = [_]Module{.{ .name = "bit.o", .atoms = @constCast(&prog2) }};
+    const picked2 = try selectArchiveMembers(gpa, &eager2, &members, &.{});
+    defer gpa.free(picked2);
+    try testing.expectEqual(@as(usize, 4), picked2.len);
+    var mods2: std.ArrayList(Module) = .empty;
+    defer mods2.deinit(gpa);
+    try mods2.appendSlice(gpa, &eager2);
+    try mods2.appendSlice(gpa, picked2);
+    try testing.expectError(error.DuplicateSymbol, resolveGlobals(gpa, mods2.items));
+}
+
+test "selectArchiveMembers never lets an archive member displace an explicit object" {
+    const gpa = testing.allocator;
+    // Two explicit OBJECTS defining one strong symbol stay an error: both are
+    // eager, so neither can be dropped and the diagnostic must still fire.
+    const one = [_]object.Atom{mkAtom("bit_rt_alloc", .global, &.{})};
+    const two = [_]object.Atom{mkAtom("bit_rt_alloc", .global, &.{})};
+    const eager = [_]Module{
+        .{ .name = "a.o", .atoms = @constCast(&one) },
+        .{ .name = "b.o", .atoms = @constCast(&two) },
+    };
+    const picked = try selectArchiveMembers(gpa, &eager, &.{}, &.{});
+    defer gpa.free(picked);
+    try testing.expectEqual(@as(usize, 0), picked.len);
+    try testing.expectError(error.DuplicateSymbol, resolveGlobals(gpa, &eager));
 }
 
 test "deadStrip keeps only what the entry root reaches" {
