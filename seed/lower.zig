@@ -474,6 +474,46 @@ pub const Lowerer = struct {
         }
     }
 
+    /// Pass A0': every top-level `const` whose initializer the checker admitted
+    /// as a constant `[N]T` composite literal (§11.11) becomes one read-only
+    /// `.rodata` image. The checker rendered its element words into
+    /// `const_arrays`; here they are packed at the element's natural stride
+    /// (the same `fieldLayout` size `index_get`/`index_set` use, so the static
+    /// cell stands in for a heap array untouched) and given a `.readonly`
+    /// `GlobalId`. A reference lowers to a `global_addr` — an `[N]T`'s value IS
+    /// its base address in this IR — so the table is materialized once, with no
+    /// per-use `gc_alloc`/`slice_new`.
+    fn registerConstArrays(self: *Lowerer, gpa: Allocator) Error!void {
+        for (self.modules, 0..) |mod, mi| {
+            for (mod.files, 0..) |mf, file_idx| {
+                for (mf.tree.kids(mf.tree.root)) |decl_idx| {
+                    if (decl_idx == ast.none) continue;
+                    const inner = if (mf.tree.get(decl_idx).tag == .@"export") mf.tree.kids(decl_idx)[0] else decl_idx;
+                    if (mf.tree.get(inner).tag != .const_decl) continue;
+                    for (mf.tree.kids(inner)) |bind| {
+                        const pat = mf.tree.kids(bind)[0];
+                        if (mf.tree.get(pat).tag != .ident) continue;
+                        const sid = mod.rmodule.node_symbols[file_idx][pat];
+                        if (sid == .none) continue;
+                        const words = mod.checked.constArrayOf(sid) orelse continue;
+                        const ty = mod.checked.typeOf(file_idx, pat);
+                        if (self.ctx.typeOf(ty) != .array) continue; // defensive: checker only records arrays
+                        const esize = fieldLayout(self.ctx.typeOf(self.ctx.typeOf(ty).array.elem)).size;
+                        const bytes = try gpa.alloc(u8, words.len * esize);
+                        for (words, 0..) |w, i| {
+                            var j: u32 = 0;
+                            while (j < esize) : (j += 1) bytes[i * esize + j] = @truncate(w >> @intCast(j * 8));
+                        }
+                        const gsym = GlobalSymbol{ .module = @enumFromInt(mi), .id = sid };
+                        const name = try std.fmt.allocPrint(gpa, "__bitc_{d}_{s}", .{ mi, identTextOf(mf, pat) });
+                        const id = try self.out.addGlobal(name, bytes, module_state_align, .readonly);
+                        try self.global_ids.put(gpa, gsym.pack(), id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Re-point the per-module cursors at `m` before lowering one of its
     /// functions, so `FnCtx` (which reads `self.l.files/checked/rmodule`) sees
     /// the right module without a module id threaded through every method.
@@ -927,6 +967,10 @@ pub fn lowerProject(gpa: Allocator, ctx: *TypeContext, modules: []const ModuleIn
     // Pass A0: every module-level `let` (§11.11) gets a `GlobalId` and a
     // static byte image, before any function body is lowered.
     try l.registerGlobals(gpa);
+    // Pass A0': every `[N]T` `const` (§11.11) the checker admitted as a
+    // constant composite literal gets a read-only `.rodata` image, so a
+    // reference lowers to its static address rather than re-allocating.
+    try l.registerConstArrays(gpa);
 
     // Pass A: every non-generic func in every module gets a `FuncId` up front
     // (stable module-then-symbol order), so forward/mutually-recursive and
@@ -3871,6 +3915,11 @@ const FnCtx = struct {
     /// restored. The initializer lowers into the *current* function's IR
     /// builder regardless; only the source-reading context moves.
     fn lowerTopConst(self: *FnCtx, gsym: GlobalSymbol, file_idx: usize) Error!ir.ValueId {
+        // A `[N]T` const materialized as a read-only `.rodata` table
+        // (`registerConstArrays`) has a static address, and an `[N]T`'s value
+        // IS that base address in this IR — so reference it directly rather
+        // than re-lowering (and re-allocating) the literal at this use site.
+        if (self.l.global_ids.get(gsym.pack()) != null) return self.globalAddrOf(gsym);
         const mi = self.l.modules[@intFromEnum(gsym.module)];
         const init_node = mi.checked.constInitOf(gsym.id) orelse return error.UnsupportedConstruct;
         const saved_module = self.l.cur_module;

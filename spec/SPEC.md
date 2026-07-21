@@ -435,7 +435,11 @@ pat        = IDENT | "_" | tuple_pat .
 - `const` bindings must have an initializer and are immutable; their value must be
   a **compile-time constant expression** (§15.4) at top level, or any expression
   inside a function (a function-local `const` is an immutable single-assignment
-  binding, not required to be compile-time constant).
+  binding, not required to be compile-time constant). A top-level `const` may also
+  bind a **constant `[N]T` composite literal** (`[N]T{...}` whose every element is
+  a compile-time constant scalar); it is materialized once into the read-only
+  class (§11.11) — a `.rodata` image, not a per-reference allocation — and, being
+  read-only, a write through it (`K[i] = v`) is rejected.
 - `let` bindings are mutable. A `let` without an initializer is set to the **zero
   value** (§13.4) of its declared type; the type annotation is then required.
 - If both `:` type and `=` initializer are present, the initializer must be

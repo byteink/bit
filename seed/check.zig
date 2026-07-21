@@ -1169,6 +1169,13 @@ const Checker = struct {
     /// top-level `const`'s initializer — including one imported from another
     /// module — after this `Checker` goes out of scope.
     const_inits: std.AutoHashMapUnmanaged(SymbolId, ast.Index) = .{},
+    /// SymbolId (this module only) -> the rendered element words of a top-level
+    /// `const` whose initializer is a compile-time-constant `[N]T` composite
+    /// literal (§11.11). Populated by `checkBinding`; moved into `CheckedModule`
+    /// so lowering (`registerConstArrays`) can materialize the table as one
+    /// read-only `.rodata` image rather than re-lowering (and re-allocating) the
+    /// literal at each reference site.
+    const_arrays: std.AutoHashMapUnmanaged(SymbolId, []const u64) = .{},
     /// SymbolId -> the validated initial value of a module-level `let`
     /// (§11.11). Populated by `checkModuleState`, which has already proved the
     /// type is untraced and the initializer constant, so lowering can render
@@ -2372,7 +2379,56 @@ const Checker = struct {
         return false;
     }
 
-    const ConstVal = union(enum) { int: i128, float: f64, boolean: bool, string };
+    pub const ConstVal = union(enum) { int: i128, float: f64, boolean: bool, string };
+
+    /// One little-endian word per element of a `.rodata` composite `const`
+    /// (`[N]T{...}`, §11.11), sized to the element's width in its low bytes —
+    /// lowering (`registerConstArrays`) writes each element's low `fieldLayout`
+    /// bytes. `int`/`bool` become their two's-complement/0-1 encoding; a float
+    /// becomes its IEEE-754 bit pattern at the element's own width.
+    fn constWordFor(p: Prim, cv: ConstVal) u64 {
+        if (p.isFloat()) {
+            const f: f64 = switch (cv) {
+                .float => |x| x,
+                .int => |x| @floatFromInt(x),
+                else => 0,
+            };
+            return if (p == .f32) @as(u64, @as(u32, @bitCast(@as(f32, @floatCast(f))))) else @bitCast(f);
+        }
+        const iv: i64 = switch (cv) {
+            .int => |x| @truncate(x),
+            .boolean => |b| @intFromBool(b),
+            else => 0,
+        };
+        return @bitCast(iv);
+    }
+
+    /// Renders a compile-time-constant `[N]T` composite literal into one word
+    /// per element (`constWordFor`), or `null` when `init_node` is not a
+    /// constant array literal of exactly `len` scalar elements — in which case
+    /// the caller falls back to E0064. This is the composite counterpart of
+    /// `constEval`: it admits the one shape `constEval` cannot (an aggregate),
+    /// deferring each element to `constEval` so the two never drift apart.
+    fn constArrayWords(self: *Checker, file_idx: usize, elem_ty: TypeId, len: usize, init_node: ast.Index) Error!?[]const u64 {
+        const mf = self.files[file_idx];
+        if (mf.tree.get(init_node).tag != .composite_lit) return null;
+        if (self.ctx.typeOf(elem_ty) != .prim) return null;
+        const p = self.ctx.typeOf(elem_ty).prim;
+        if (p == .string) return null;
+        const items = mf.tree.kids(mf.tree.kids(init_node)[1]);
+        if (items.len != len) return null;
+        const words = try self.gpa.alloc(u64, len);
+        errdefer self.gpa.free(words);
+        for (items, 0..) |it, i| {
+            const inner = mf.tree.kids(it)[0];
+            const cv = self.constEval(file_idx, inner, 0) orelse {
+                self.gpa.free(words);
+                return null;
+            };
+            words[i] = constWordFor(p, cv);
+        }
+        return words;
+    }
 
     /// Bounded compile-time constant evaluator (§15.4): literals, unary
     /// +/-/! over a constant, binary arithmetic/bitwise ops over two integer
@@ -4601,7 +4657,24 @@ const Checker = struct {
         try self.bindPattern(file_idx, pat, bind_ty);
 
         if (is_const) {
-            if (is_top and self.constEval(file_idx, init_node, 0) == null) {
+            const scalar_const = is_top and self.constEval(file_idx, init_node, 0) != null;
+            // A `[N]T{...}` of constant scalar elements is admitted as a
+            // read-only `.rodata` table (§11.11) — the shape `constEval` cannot
+            // fold to a single scalar. Its words are recorded here so lowering
+            // renders one static image instead of re-allocating per reference.
+            var array_const = false;
+            if (is_top and !scalar_const and self.ctx.typeOf(bind_ty) == .array and self.untracedType(bind_ty, 0)) {
+                if (mf.tree.get(pat).tag == .ident) {
+                    if (self.nodeSymbol(file_idx, pat)) |gs| {
+                        const a = self.ctx.typeOf(bind_ty).array;
+                        if (try self.constArrayWords(file_idx, a.elem, a.len, init_node)) |words| {
+                            try self.const_arrays.put(self.gpa, gs.id, words);
+                            array_const = true;
+                        }
+                    }
+                }
+            }
+            if (is_top and !scalar_const and !array_const) {
                 try self.emit(mf, init_node, .non_constant_expr, "top-level 'const' initializer must be a compile-time constant expression", .{}, null);
             }
             if (mf.tree.get(pat).tag == .ident) {
@@ -4723,12 +4796,43 @@ const Checker = struct {
             try self.emit(mf, node, .immutable_assignment, "cannot assign to a tuple element: tuple elements are read-only; use a struct for a mutable field", .{}, null);
             return;
         }
-        if (mf.tree.get(node).tag != .ident) return; // index/member lvalues: mutability is the receiver's, not a binding
+        if (mf.tree.get(node).tag != .ident) {
+            // An index/member/slice lvalue is normally the receiver's to
+            // mutate, not a binding's — but a top-level `const` array lives in
+            // read-only `.rodata` (§11.11), so a write through `K[i]` would
+            // fault the loaded image. Reject at compile time by walking to the
+            // chain's root name and checking whether it is `const`.
+            if (self.rootBindingIsConst(file_idx, node)) |name| {
+                try self.emit(mf, node, .immutable_assignment, "cannot assign through '{s}': declared 'const' (a 'const' table is read-only)", .{name}, null);
+            }
+            return;
+        }
         const gsym = self.nodeSymbol(file_idx, node) orelse return;
         const sym = self.symbolOf(gsym);
         if (sym.kind == .const_binding) {
             try self.emit(mf, node, .immutable_assignment, "cannot assign to '{s}': declared 'const'", .{sym.name}, null);
         }
+    }
+
+    /// The name of the `const` binding at the root of an index/member/slice
+    /// lvalue chain (`K[i]`, `K[i].x`, `K[a:b][i]`), or `null` if the chain
+    /// does not root in a `const`. Bounded by the AST's depth (Power of 10).
+    fn rootBindingIsConst(self: *Checker, file_idx: usize, node: ast.Index) ?[]const u8 {
+        const mf = self.files[file_idx];
+        var cur = node;
+        var guard: u32 = 0;
+        while (guard < max_type_depth) : (guard += 1) {
+            switch (mf.tree.get(cur).tag) {
+                .index, .member, .slice_expr, .tuple_index => cur = mf.tree.kids(cur)[0],
+                .ident => {
+                    const gsym = self.nodeSymbol(file_idx, cur) orelse return null;
+                    const sym = self.symbolOf(gsym);
+                    return if (sym.kind == .const_binding) sym.name else null;
+                },
+                else => return null,
+            }
+        }
+        return null;
     }
 
     fn checkExprStmt(self: *Checker, file_idx: usize, node: ast.Index, fctx: FnCtx) Error!void {
@@ -6010,6 +6114,9 @@ pub const CheckedModule = struct {
     /// inlines a top-level `const`'s initializer by re-lowering the node this
     /// maps its symbol to.
     const_inits: std.AutoHashMapUnmanaged(SymbolId, ast.Index) = .{},
+    /// Moved out of `Checker.const_arrays` — lowering (`registerConstArrays`)
+    /// reads it to emit each `[N]T` `const` as one read-only `.rodata` image.
+    const_arrays: std.AutoHashMapUnmanaged(SymbolId, []const u64) = .{},
     /// Moved out of `Checker.module_state` — lowering reads it to emit each
     /// module-level `let` as a static `.data` cell (§11.11).
     module_state: std.AutoHashMapUnmanaged(SymbolId, ModuleStateInit) = .{},
@@ -6020,8 +6127,17 @@ pub const CheckedModule = struct {
         if (self.type_dump) |d| self.gpa.free(d);
         self.call_insts.deinit(self.gpa);
         self.const_inits.deinit(self.gpa);
+        var it = self.const_arrays.valueIterator();
+        while (it.next()) |w| self.gpa.free(w.*);
+        self.const_arrays.deinit(self.gpa);
         self.module_state.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// The rendered element words of the `[N]T` `const` bound to `sym`, or
+    /// `null` if `sym` is not such a table — see `Checker.const_arrays`.
+    pub fn constArrayOf(self: *const CheckedModule, sym: SymbolId) ?[]const u64 {
+        return self.const_arrays.get(sym);
     }
 
     /// The validated initial value of the module-level `let` bound to `sym`,
@@ -6111,14 +6227,15 @@ pub fn checkModule(
     try checker.checkBodies();
     try checker.checkInterpolations();
     const dump = if (dump_types) try checker.dumpTypesText() else null;
-    // `call_insts`/`const_inits`/`module_state` are moved out (not freed by
+    // `call_insts`/`const_inits`/`const_arrays`/`module_state` are moved out (not freed by
     // `deinitLocal`, which only ever owned the checking-time-only tables) into
     // the returned `CheckedModule`.
     const call_insts = checker.call_insts;
     const const_inits = checker.const_inits;
+    const const_arrays = checker.const_arrays;
     const module_state = checker.module_state;
     checker.deinitLocal();
-    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts, .const_inits = const_inits, .module_state = module_state };
+    return .{ .gpa = gpa, .node_types = node_types, .type_dump = dump, .call_insts = call_insts, .const_inits = const_inits, .const_arrays = const_arrays, .module_state = module_state };
 }
 
 const testing = std.testing;

@@ -1036,6 +1036,11 @@ const check = @import("check.zig");
 const elf_reader = @import("link/elf_reader.zig");
 const macho_reader = @import("link/macho_reader.zig");
 const object = @import("link/object.zig");
+const parser = @import("parser.zig");
+const resolve = @import("resolve.zig");
+const lower = @import("lower.zig");
+const ast = @import("ast.zig");
+const diagnostics = @import("diagnostics.zig");
 const strip = @import("link/strip.zig");
 const link = @import("link.zig");
 const builtin = @import("builtin");
@@ -1501,6 +1506,101 @@ test "emit: a readonly global lands in .rodata with its bytes intact, on every t
         if (!found) {
             std.debug.print("target {s}: no .rodata atom named {s} was emitted at all\n", .{ case.name, want_sym });
             return error.ReadonlyGlobalNotEmitted;
+        }
+    }
+}
+
+test "emit: a module-level `const [N]T` lands in .rodata from SOURCE, on every target (#1231)" {
+    // #1447 proved a readonly `ir.Global` reaches `.rodata`; this proves the
+    // half #1231 adds — that the checker+lowerer turn a `const [N]T{...}` in
+    // SOURCE into exactly such a global, with the authored bytes. Asserted
+    // through the object readers so it is target-independent (#1421) and
+    // fails on any host, NOT on a passing run: a wrong GC descriptor on a
+    // rodata table is invisible at runtime (the collector ignores the pointer),
+    // so program output would pass against a broken image.
+    const gpa = testing.allocator;
+    const src =
+        \\const T: [4]u8 = [4]u8{ 10, 20, 30, 40 }
+        \\function main() {
+        \\  print("${T[0]}")
+        \\}
+        \\
+    ;
+    // A byte image with no repeated neighbour and no run, so a truncated or
+    // shifted table cannot compare equal by luck.
+    const want_bytes = [_]u8{ 10, 20, 30, 40 };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Case = struct { name: []const u8, elf: ?elf_reader.Target };
+    for ([_]Case{
+        .{ .name = "x86_64-elf", .elf = .x86_64 },
+        .{ .name = "aarch64-elf", .elf = .aarch64 },
+        .{ .name = "aarch64-macho", .elf = null },
+    }) |case| {
+        var sm = diagnostics.SourceManager.init(gpa);
+        defer sm.deinit();
+        var diags = diagnostics.Diagnostics.init(gpa, &sm);
+        defer diags.deinit();
+
+        var tree = try ast.Tree.init(gpa);
+        defer tree.deinit();
+        const file = try sm.addFile("t.bit", src);
+        try parser.parse(gpa, &tree, &diags, file, src);
+        try testing.expect(!diags.hasErrors());
+
+        var files = [_]resolve.ModuleFile{.{ .file = file, .source = src, .tree = &tree }};
+        var no_imports: resolve.ImportTable = .{};
+        defer no_imports.deinit(gpa);
+        var rmodule = try resolve.resolveModule(gpa, &diags, &files, &no_imports, &.{}, null);
+        defer rmodule.deinit();
+        try testing.expect(!diags.hasErrors());
+
+        var ctx = try check.TypeContext.init(gpa);
+        defer ctx.deinit();
+        var checked = try check.checkModule(gpa, &diags, &ctx, &files, &rmodule, @enumFromInt(0), &.{}, false);
+        defer checked.deinit();
+        try testing.expect(!diags.hasErrors());
+
+        var module = try lower.lowerModule(gpa, &ctx, &files, &checked, &rmodule);
+        defer module.deinit();
+
+        // (0) The lowerer produced a READONLY global with the authored image —
+        // the boundary #1231 owns, before emission touches it.
+        var lowered = false;
+        for (module.globals.items) |g| {
+            if (!std.mem.eql(u8, g.name, "__bitc_0_T")) continue;
+            lowered = true;
+            try testing.expectEqual(ir.GlobalStorage.readonly, g.storage);
+            try testing.expectEqualSlices(u8, &want_bytes, g.bytes);
+        }
+        try testing.expect(lowered);
+
+        const obj = if (case.elf) |t| switch (t) {
+            .x86_64 => try emitObject(gpa, &module, false, false),
+            .aarch64 => try emitObjectArm64Elf(gpa, &module, false, false),
+        } else try emitMachoObject(gpa, &module, false, false);
+        defer gpa.free(obj);
+
+        const want_sym = if (case.elf == null) "___bitc_0_T" else "__bitc_0_T";
+        const mod = if (case.elf) |t|
+            try elf_reader.read(arena, t, "t.o", obj)
+        else
+            try macho_reader.read(arena, "t.o", obj);
+
+        var found = false;
+        for (mod.atoms) |atom| {
+            if (!std.mem.eql(u8, atom.name, want_sym)) continue;
+            found = true;
+            errdefer std.debug.print("target {s}\n", .{case.name});
+            try testing.expectEqual(object.SectionKind.rodata, atom.kind);
+            try testing.expectEqualSlices(u8, &want_bytes, atom.data[0..atom.size]);
+        }
+        if (!found) {
+            std.debug.print("target {s}: no .rodata atom named {s} was emitted from the const\n", .{ case.name, want_sym });
+            return error.ConstArrayNotInRodata;
         }
     }
 }
