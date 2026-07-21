@@ -29,9 +29,9 @@
 //
 // The seams `boot` binds are Darwin's (`mmap`/`pthread`/`clock` via libSystem
 // `extern function`, §11.7), reached by ordinary import. Like ../linux/boot.bit
-// this is an ARCHIVE MEMBER (emitted non-freestanding, the rootpins path): the
-// scheduler glue it calls takes function-value parameters and so is unpinned,
-// which `--freestanding` refuses.
+// THIS MODULE EMITS `--freestanding` (#1628), so it builds no function VALUE —
+// every seam is bound by direct call — and every cross-module callee it names is
+// `@symbol`-pinned. See ../linux/boot.bit's header for the full argument.
 //
 // Nothing here is `@nosplit`: `boot` allocates (maps the heap) and runs before
 // the stack-guard machinery, and `@nosplit` rejects `extern function` (E0075).
@@ -40,11 +40,12 @@
 
 import { mapPages } from "../../alloc/darwin"
 import { threadStart, threadRelease } from "../../thread/darwin"
-import { schedStart, schedJoin } from "../../thread"
+import { schedStartArm } from "../../thread"
 import { parkSleepNs } from "../../park/darwin"
+import { parkMinBackoffNs, parkNextBackoff } from "../../park"
 import {
   schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
-  schedWorkerAt, schedWorkerRun, schedNoTimers, schedNoPoller,
+  schedWorkerAt, schedWorkerRunBare,
   schedTaskExit, dqPushBottom, taskAt, taskWords,
   schedStackBytes, schedStackAligned, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
@@ -107,17 +108,50 @@ function alignUpStack(addr: int): int {
   return bumped - bumped % schedStackBytes
 }
 
-// The worker OS-thread entry — same as ../linux/boot.bit's `workerBody`.
+// The worker OS-thread entry — same as ../linux/boot.bit's `workerBody`,
+// including its reason for calling `schedWorkerRunBare` rather than passing the
+// no-timer/no-poller seam: a function value is a managed-heap `(code, env)` cell
+// and this module must emit `--freestanding` (§17.6, #1628).
 function workerBody(arg: *byte): *byte {
   let block = taskAt(int(arg))
   let workerAddr = *block
   let doneAddr = *(block + 1)
 
-  schedWorkerRun(taskAt(workerAddr), schedNoTimers, schedNoPoller)
+  schedWorkerRunBare(taskAt(workerAddr))
 
   let z: *i32 = nil
   atomicStore(z + doneAddr / 4, i32(0))
   return nil
+}
+
+// Trip bound for `joinWorker`, `runtime/thread`'s `JOIN_MAX_POLLS` unchanged, so
+// the join is finite even if the deadline clock misbehaves (Power of 10, rule 2).
+const joinMaxPolls: int = 100000
+
+// `runtime/thread`'s `threadJoin` for THE one worker this runtime starts, with
+// the platform clock and sleep called directly instead of taken as function
+// values (see `workerBody`). Identical to ../linux/boot.bit's.
+function joinWorker(done: *i32, timeoutNs: int): bool {
+  // A non-positive timeout still gets one look at the word, so a join on an
+  // already-finished worker succeeds rather than reporting a spurious timeout.
+  if (atomicLoad(done) == i32(0)) {
+    return true
+  }
+  let deadline = parkMonoNs() + timeoutNs
+  let backoff = parkMinBackoffNs
+  let i = 0
+  while (i < joinMaxPolls) {
+    if (atomicLoad(done) == i32(0)) {
+      return true
+    }
+    if (parkMonoNs() >= deadline) {
+      return false
+    }
+    parkSleepNs(backoff)
+    backoff = parkNextBackoff(backoff)
+    i = i + 1
+  }
+  return false
 }
 
 // The first green thread: run `bit_main`, publish its exit code, leave the task.
@@ -184,11 +218,14 @@ function boot(): int {
     return 70
   }
 
-  // 6. Bring the worker up on a real OS thread.
-  let started = schedStart(sched, 1, entryOf(workerBody),
-                           ptrOf(startArgs), ptrOf(startDones), ptrOf(startHandles),
-                           threadStart)
-  if (started != 1) {
+  // 6. Bring the worker up on a real OS thread: `schedStart`'s per-worker arming
+  //    (`schedStartArm`) then this platform's `threadStart` called DIRECTLY,
+  //    since `schedStart` takes the spawner as a function value this module may
+  //    not build. One worker, so the pool's loop collapses to one iteration.
+  let startArg = schedStartArm(sched, 0, ptrOf(startArgs), ptrOf(startDones))
+  let handle = threadStart(entryOf(workerBody), startArg, ptrOf(startDones))
+  *ptrOf(startHandles) = handle
+  if (handle == 0) {
     return 70
   }
 
@@ -202,10 +239,11 @@ function boot(): int {
     }
   }
 
-  // 8. Signal shutdown, reap the worker, report the code.
+  // 8. Signal shutdown, reap the worker, report the code — `schedJoin`'s body
+  //    for one worker, with the platform clock/sleep/release called directly.
   schedShutdown(sched)
-  schedJoin(started, ptrOf(startDones), ptrOf(startHandles), joinTimeoutNs,
-            parkSleepNs, parkMonoNs, threadRelease)
+  joinWorker(ptrOf(startDones), joinTimeoutNs)
+  threadRelease(*ptrOf(startHandles))
   return mainExitCode
 }
 

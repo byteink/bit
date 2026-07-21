@@ -53,14 +53,14 @@ const scPollLock: int = 11
 export const schedWords: int = 16
 
 // The worker block at index `i`.
-export @nosplit function schedWorkerAt(s: *i64, i: int): *i64 {
+export @nosplit @symbol("bit_rt_port_sched_worker_at") function schedWorkerAt(s: *i64, i: int): *i64 {
   let base = *(s + scWorkers)
   return taskAt(base + i * workerWords * 8)
 }
 
 // Prepare a scheduler over `nworkers` caller-owned worker blocks laid out
 // contiguously at `workersAddr`.
-export @nosplit function schedInit(s: *i64, workersAddr: int, nworkers: int) {
+export @nosplit @symbol("bit_rt_port_sched_init") function schedInit(s: *i64, workersAddr: int, nworkers: int) {
   *(s + scNWorkers) = nworkers
   *(s + scWorkers) = workersAddr
   atomicStore(s + scStopping, 0)
@@ -92,7 +92,7 @@ export @nosplit function schedInit(s: *i64, workersAddr: int, nworkers: int) {
 // can find every parked or runnable stack to scan. Distinct from the run
 // queues' `next` link, because a task is on the registry for its whole life
 // while simultaneously moving between queues.
-export @nosplit function schedRegister(s: *i64, task: int) {
+export @nosplit @symbol("bit_rt_port_sched_register") function schedRegister(s: *i64, task: int) {
   let t = taskAt(task)
   spinAcquire(lockOf(s, scRegLock))
   let head = *(s + scRegHead)
@@ -242,6 +242,29 @@ function schedFindWorkIdle(w: *i64, nowFn: () => int,
   return 0
 }
 
+// `schedFindWorkIdle` with the no-timer/no-poller seam FOLDED IN: `schedNoTimers`
+// is a clock frozen at 0 and `schedNoPoller` drains nothing, so the two probes
+// reduce to a timer expiry against now == 0 and no poll at all. Behaviourally
+// identical to `schedFindWorkIdle(w, schedNoTimers, schedNoPoller)`.
+//
+// Written out instead of passing the pair because a function VALUE is a heap
+// cell (§11.10) and the runtime's own boot module must emit `--freestanding`
+// (§17.6) — see `schedWorkerRunBare`, its only caller.
+function schedFindWorkBare(w: *i64): int {
+  let addr = schedFindWork(w)
+  if (addr != 0) {
+    return addr
+  }
+  let s = taskAt(*(w + wkSched))
+  if (schedTimerExpire(s, 0) > 0) {
+    let t = gqPop(s + scGlobal)
+    if (t != 0) {
+      return t
+    }
+  }
+  return 0
+}
+
 // The two seam arguments for a consumer that drives NEITHER timers nor I/O —
 // a pure-scheduler embedding, which is what every scheduler stress program is.
 //
@@ -324,6 +347,99 @@ const WORKER_MAX_STEPS: int = 1000000000
   }
 }
 
+// The value `schedWorkerStep` returns in place of a backoff to say "leave the
+// loop": shutdown has been signalled and no work remains. Distinguishable from
+// every real backoff because a backoff is always positive (`parkMinBackoffNs`).
+const workerStepStop: int = -1
+
+// ONE TURN of the run loop, given the task `addr` the caller's find-work step
+// produced (0 = none) and the current `backoff`. Returns the next backoff, or
+// `workerStepStop` when the worker must return.
+//
+// Split out of `schedWorkerRun` so the two find-work seams — the function-value
+// one and the seam-free `schedWorkerRunBare` below — share this body verbatim
+// rather than keeping a copy each that could drift. Everything here is
+// independent of how `addr` was found.
+function schedWorkerStep(w: *i64, s: *i64, addr: int, backoff: int): int {
+  if (addr == 0) {
+    // No work. Stop if shutdown has been signalled, else back off and retry.
+    // Checked AFTER `findWork` so a worker never exits leaving queued work
+    // behind — `sched.zig`'s ordering, and the reason shutdown drains.
+    let stopping = atomicLoad(s + scStopping)
+    if (stopping != 0) {
+      return workerStepStop
+    }
+    spinBackoff(backoff)
+    return parkNextBackoff(backoff)
+  }
+
+  let t = taskAt(addr)
+  *(w + wkRunning) = addr
+
+  // The migration point. A task carries no worker affinity, so the worker
+  // that resumes it need not be the one it parked on, and this store is what
+  // makes `schedCurrentWorker` correct after a migration. `sched.zig` gets
+  // the same effect from its thread-local, which is why its `trampoline`
+  // must RE-FETCH the worker after the body returns.
+  *(t + taskWorker) = int(w)
+  *(t + taskState) = taskRunning
+
+  // Must be overwritten by the task before it switches back; the states
+  // below are the only three a task may leave in.
+  *(w + wkDisposition) = taskRunning
+  schedSwitch(w + wkCtx, t)
+  *(w + wkRunning) = 0
+  *(t + taskWorker) = 0
+
+  let disp = *(w + wkDisposition)
+  if (disp == taskRunnable) {
+    schedRequeue(s, w, addr)
+  }
+  if (disp == taskParked) {
+    // Safe only now: `t`'s context was just saved by this same thread, in
+    // program order, above. The atomic store is what lets another thread's
+    // later load see that write — `sched.zig` makes exactly this argument
+    // for its release store, and §11.5's sequential consistency is strictly
+    // stronger.
+    //
+    // THREE CASES, TRIED IN THIS ORDER, AND THE ORDER IS THE PROOF.
+    //
+    //  1. `taskParking -> taskParked`. The task armed (`schedParkArm`) and
+    //     no waker reached it: publish the park, and a later waker finds a
+    //     properly parked task. This is the common armed path.
+    //  2. `taskWakePending -> taskRunnable`. A waker reached the task inside
+    //     its arm/park window and handed the wake here rather than dropping
+    //     it. The task must NOT be left parked — nothing will wake it again,
+    //     because a one-shot poller registration has already been consumed
+    //     by the drain that failed to deliver. So the owed wake is delivered
+    //     by requeueing, which is exactly what `schedUnpark` would have done
+    //     had it been able to.
+    //  3. Neither: the state is `taskRunning`, i.e. an ordinary unarmed park
+    //     (`schedPark` alone — timers, channels, `schedYield`'s siblings).
+    //     A plain store is correct AND cannot lose a wake, because only the
+    //     task itself writes `taskParking` and it is suspended right now, so
+    //     no waker can be inside the armed protocol for it.
+    //
+    // Case 2 is checked BETWEEN 1 and 3 rather than after 3, because a waker
+    // may flip `taskParking -> taskWakePending` after 1's compare-exchange
+    // has already failed. Once 2 has failed as well the state is `taskRunning`
+    // and can no longer change under us, which is what makes 3's plain store
+    // safe rather than merely likely.
+    if (!atomicCmpxchg(t + taskState, taskParking, taskParked)) {
+      if (atomicCmpxchg(t + taskState, taskWakePending, taskRunnable)) {
+        schedRequeue(s, w, addr)
+      } else {
+        atomicStore(t + taskState, taskParked)
+      }
+    }
+  }
+  if (disp == taskDone) {
+    atomicStore(t + taskState, taskDone)
+    schedUnregister(s, addr)
+  }
+  return parkMinBackoffNs
+}
+
 // `nowFn` and `pollFn` are the platform seam; see `schedFindWorkIdle` for what
 // each must do and why they are function values rather than imports.
 export function schedWorkerRun(w: *i64, nowFn: () => int,
@@ -333,84 +449,31 @@ export function schedWorkerRun(w: *i64, nowFn: () => int,
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     n = n + 1
-    let addr = schedFindWorkIdle(w, nowFn, pollFn)
+    backoff = schedWorkerStep(w, s, schedFindWorkIdle(w, nowFn, pollFn), backoff)
+    if (backoff == workerStepStop) {
+      return
+    }
+  }
+}
 
-    if (addr == 0) {
-      // No work. Stop if shutdown has been signalled, else back off and retry.
-      // Checked AFTER `findWork` so a worker never exits leaving queued work
-      // behind — `sched.zig`'s ordering, and the reason shutdown drains.
-      let stopping = atomicLoad(s + scStopping)
-      if (stopping != 0) {
-        return
-      }
-      spinBackoff(backoff)
-      backoff = parkNextBackoff(backoff)
-    } else {
-      backoff = parkMinBackoffNs
-      let t = taskAt(addr)
-      *(w + wkRunning) = addr
-
-      // The migration point. A task carries no worker affinity, so the worker
-      // that resumes it need not be the one it parked on, and this store is what
-      // makes `schedCurrentWorker` correct after a migration. `sched.zig` gets
-      // the same effect from its thread-local, which is why its `trampoline`
-      // must RE-FETCH the worker after the body returns.
-      *(t + taskWorker) = int(w)
-      *(t + taskState) = taskRunning
-
-      // Must be overwritten by the task before it switches back; the states
-      // below are the only three a task may leave in.
-      *(w + wkDisposition) = taskRunning
-      schedSwitch(w + wkCtx, t)
-      *(w + wkRunning) = 0
-      *(t + taskWorker) = 0
-
-      let disp = *(w + wkDisposition)
-      if (disp == taskRunnable) {
-        schedRequeue(s, w, addr)
-      }
-      if (disp == taskParked) {
-        // Safe only now: `t`'s context was just saved by this same thread, in
-        // program order, above. The atomic store is what lets another thread's
-        // later load see that write — `sched.zig` makes exactly this argument
-        // for its release store, and §11.5's sequential consistency is strictly
-        // stronger.
-        //
-        // THREE CASES, TRIED IN THIS ORDER, AND THE ORDER IS THE PROOF.
-        //
-        //  1. `taskParking -> taskParked`. The task armed (`schedParkArm`) and
-        //     no waker reached it: publish the park, and a later waker finds a
-        //     properly parked task. This is the common armed path.
-        //  2. `taskWakePending -> taskRunnable`. A waker reached the task inside
-        //     its arm/park window and handed the wake here rather than dropping
-        //     it. The task must NOT be left parked — nothing will wake it again,
-        //     because a one-shot poller registration has already been consumed
-        //     by the drain that failed to deliver. So the owed wake is delivered
-        //     by requeueing, which is exactly what `schedUnpark` would have done
-        //     had it been able to.
-        //  3. Neither: the state is `taskRunning`, i.e. an ordinary unarmed park
-        //     (`schedPark` alone — timers, channels, `schedYield`'s siblings).
-        //     A plain store is correct AND cannot lose a wake, because only the
-        //     task itself writes `taskParking` and it is suspended right now, so
-        //     no waker can be inside the armed protocol for it.
-        //
-        // Case 2 is checked BETWEEN 1 and 3 rather than after 3, because a waker
-        // may flip `taskParking -> taskWakePending` after 1's compare-exchange
-        // has already failed. Once 2 has failed as well the state is `taskRunning`
-        // and can no longer change under us, which is what makes 3's plain store
-        // safe rather than merely likely.
-        if (!atomicCmpxchg(t + taskState, taskParking, taskParked)) {
-          if (atomicCmpxchg(t + taskState, taskWakePending, taskRunnable)) {
-            schedRequeue(s, w, addr)
-          } else {
-            atomicStore(t + taskState, taskParked)
-          }
-        }
-      }
-      if (disp == taskDone) {
-        atomicStore(t + taskState, taskDone)
-        schedUnregister(s, addr)
-      }
+// `schedWorkerRun` with the no-timer/no-poller seam SPELLED OUT rather than
+// passed: behaviourally identical to `schedWorkerRun(w, schedNoTimers,
+// schedNoPoller)`, which is what every seam-free consumer passes today.
+//
+// It exists because a function VALUE is a `(code, env)` cell on the managed heap
+// (§11.10), so a module that builds one needs a `TypeInfo` descriptor and can no
+// longer be emitted `--freestanding` (§17.6) — and the runtime's own boot path
+// (`runtime/root/<os>`'s `workerBody`) is precisely a module that must be. The
+// seam-carrying form above stays for consumers that do drive timers or I/O.
+export @symbol("bit_rt_port_sched_worker_run_bare") function schedWorkerRunBare(w: *i64) {
+  let s = taskAt(*(w + wkSched))
+  let backoff = parkMinBackoffNs
+  let n = 0
+  while (n < WORKER_MAX_STEPS) {
+    n = n + 1
+    backoff = schedWorkerStep(w, s, schedFindWorkBare(w), backoff)
+    if (backoff == workerStepStop) {
+      return
     }
   }
 }
@@ -425,7 +488,7 @@ export function schedWorkerRun(w: *i64, nowFn: () => int,
 //
 // Registration happens first, and before the task is visible to any queue, so a
 // collector can never observe a runnable task that is not on the registry.
-export @nosplit function schedSpawn(s: *i64, task: int) {
+export @nosplit @symbol("bit_rt_port_sched_spawn") function schedSpawn(s: *i64, task: int) {
   schedRegister(s, task)
   let wAddr = schedCurrentWorker()
   if (wAddr != 0) {
