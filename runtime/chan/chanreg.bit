@@ -1,5 +1,15 @@
-// The channel registry and the GC root-scanning cursors (#1503).
-// Split out of `./chan.bit`; sibling file, so the same module — no import needed.
+// The channel registry and the GC root-scanning cursors (#1503), plus the scan
+// itself (#1602).
+//
+// The registry CURSORS below are sibling functions of `./chan.bit` — same
+// module, no import — but `chanScanRegistryRoots` reaches ACROSS the object
+// boundary into the collector to push each buffered word as a root, so it
+// imports the two pinned `runtime/gc` entry points it needs. That direction is
+// deliberate and acyclic: `runtime/gc` is a pure collector that knows nothing of
+// channels (it never imports `../chan`), exactly as `gc.zig` never imports
+// `chan.zig`; the knowledge that a channel's ring buffer holds roots lives with
+// the channel, which PUSHES them into the collector's conservative mark door.
+import { gcMarkConservative, wordAt } from "../gc"
 
 // ---------------------------------------------------------------------------
 // GC root scanning (ABI.md §11)
@@ -67,7 +77,64 @@ export @nosplit function chanBufferedAt(ch: *i64, i: int): int {
   return v
 }
 
+// How many words are currently buffered — the bound the collector walks
+// `0 .. chanBufferedCount(ch)` over. `chan.zig`'s `forEachBuffered` reads
+// `self.count` directly; a cursor cannot, so it is exposed. An unbuffered
+// (`chCap == 0`) channel never buffers, so this is always 0 there and the
+// modular index in `chanBufferedAt` — which would divide by `chCap` — is never
+// reached.
+export @nosplit function chanBufferedCount(ch: *i64): int {
+  let n = *(ch + chCount)
+  return n
+}
+
 // This channel's lock cell, for a collector that must hold it across a walk.
 export @nosplit function chanLockCell(ch: *i64): *i32 {
   return spinCellAt(ch, chLock)
+}
+
+// Visit every registered `isRef` channel's currently-buffered words as GC roots,
+// pushing each through the collector's conservative mark door. Called once per
+// collection from the root scan (ABI.md §11), while the world is stopped.
+//
+// This is the Bit port of `root.zig`'s `chan.WordChan.scanRegistryRoots(
+// markChanWord)`. `chan.zig` passes a `mark` function POINTER; the unmanaged
+// subset has none (a Bit function value is a GC object the collector cannot
+// depend on), so the registry traversal is a CURSOR walk here and the mark is a
+// direct call to `gcMarkConservative` — the same `markConservative` door
+// `markChanWord` routes through, chosen because the type system lists a `chan`
+// element word as a "reference" that may not be a GC object base at all;
+// `gcMarkConservative`/`gcMarkRoot` validate and skip anything that is not one.
+//
+// The per-channel lock is taken across each channel's walk, mirroring
+// `forEachBuffered` exactly. Safe under stop-the-world: a mutator holds a
+// channel lock only across straight-line code between safepoints (it publishes
+// its waiter and releases the lock BEFORE parking), so no parked thread holds it
+// while the collector runs.
+//
+// PINNED (ABI.md §9): the root orchestrator (`runtime/root`, #1367) calls this
+// across the object boundary, so it needs the emitted-symbol contract every
+// cross-module runtime call relies on. `bit_rt_port_` is the placeholder prefix
+// #1369 strips.
+export @nosplit @symbol("bit_rt_port_chan_scan_registry_roots") function chanScanRegistryRoots(g: *i64, reg: *i64) {
+  let addr = chanRegHead(reg)
+  // Bounded: one registered channel per link, and the registry is append-only
+  // and process-lifetime (v1 has no channel-free primitive, §11), so the list
+  // length is monotone and every node is distinct — the walk visits each once.
+  while (addr != 0) {
+    let ch = wordAt(addr)
+    if (chanIsRef(ch)) {
+      let lk = chanLockCell(ch)
+      spinAcquire(lk)
+      let n = chanBufferedCount(ch)
+      let i = 0
+      // Bounded: the channel's current buffered count, never above its capacity.
+      while (i < n) {
+        gcMarkConservative(g, chanBufferedAt(ch, i))
+        i = i + 1
+      }
+      spinRelease(lk)
+    }
+    addr = chanRegNext(ch)
+  }
 }
