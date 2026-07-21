@@ -176,6 +176,20 @@ const modules = [_]Module{
     // post-rename `bit_rt_chan_*` name can exist — which is what this gate proves
     // per symbol.
     .{ .path = "runtime/chan", .target = .aarch64_macos },
+    // #1626: the three crypto/test ABI pins. `runtime/rand` (rand.bit) pins the
+    // platform-free `bit_rt_root_secure_zero` and is buildable for either target;
+    // aarch64-macos matches its siblings. `runtime/rand/{linux,darwin}` each pin
+    // `bit_rt_root_random_bytes` over their own `entropyFill`, so both halves are
+    // listed on the target their entropy source is written for (Linux `syscall`,
+    // Darwin `extern`) — the net-provider shape. The random_bytes wrappers do call
+    // the `panic` builtin (which becomes `bit_rt_panic`), and that is precisely the
+    // reference this gate has to adjudicate: neither module DEFINES
+    // `bit_rt_root_panic`, so the rename cannot make it self-referential.
+    // `bit_rt_root_test_index` needs no new entry — it lives in `runtime/root`,
+    // already the first module listed.
+    .{ .path = "runtime/rand", .target = .aarch64_macos },
+    .{ .path = "runtime/rand/linux", .target = .x86_64_linux },
+    .{ .path = "runtime/rand/darwin", .target = .aarch64_macos },
 };
 
 /// Upper bound on symbols in one object — keeps every walk below provably
