@@ -233,6 +233,50 @@ b = run_session(
 check("initialize: hoverProvider advertised", any('"hoverProvider":true' in x for x in b if '"id":1' in x), joined(b))
 check("shutdown: replies null", any('"id":2' in x and '"result":null' in x for x in b), joined(b))
 
+# 9. extern/decorator diagnostic parity (#1601). The unmanaged subset (SPEC
+#    §11.7/§11.11) — `extern function` with pointer params and int/void returns,
+#    and `@nosplit`/`@symbol(...)`-attributed functions taking `*i64` — is valid
+#    code the real compiler (`bit check`) accepts. The LSP shares that parse/check
+#    pipeline, so it must publish ZERO diagnostics here; a false positive on this
+#    syntax (the reported regression, actually a stale installed binary) is the
+#    unacceptable class. A single `run_session` needs a Content-Length line here
+#    because Python len() differs from the byte count once we embed no non-ASCII.
+extern_ok = (
+    "extern function bit_rt_listen_tcp(host: *u8, hostLen: int, port: int): int\n"
+    "extern function bit_rt_addr_octets(sa: *u8, out: *u8)\n"
+    "@nosplit @symbol(\"bit_custom_entry\") function customEntry(p: *i64): int {\n"
+    "  return 0\n"
+    "}\n"
+)
+b = run_session(
+    {"main.bit": extern_ok},
+    [
+        {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+        {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+            "textDocument":{"uri":"{URI:main.bit}","text":extern_ok}}},
+    ])
+diag = [x for x in b if "publishDiagnostics" in x]
+check("extern: exactly one publishDiagnostics", len(diag) == 1, joined(b))
+check("extern: no diagnostics on valid extern/decorator/pointer code",
+      any('"diagnostics":[]' in x for x in diag), joined(diag))
+
+# 9b. Not over-suppressed: a genuine type error in the SAME file as valid externs
+#     is still reported (severity 1), while the extern lines above stay clean.
+extern_mixed = (
+    "extern function bit_rt_listen_tcp(host: *u8, hostLen: int): int\n"
+    "let bad: i32 = \"nope\"\n"
+)
+b = run_session(
+    {"main.bit": extern_mixed},
+    [
+        {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+        {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+            "textDocument":{"uri":"{URI:main.bit}","text":extern_mixed}}},
+    ])
+diag = [x for x in b if "publishDiagnostics" in x]
+check("extern-mixed: genuine error beside externs still reported",
+      any('"severity":1' in x for x in diag), joined(diag))
+
 print()
 if fails:
     print(f"lsp-transcript: {fails} FAILED")
