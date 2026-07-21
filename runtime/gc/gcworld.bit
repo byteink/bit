@@ -1,0 +1,535 @@
+// SEAM 2 (#1575): the stop-the-world World/Mutator registry — the port of
+// `runtime/gc.zig:176-479` that the #1363 collector port deliberately left out
+// (`gc.bit` mentions `World` nowhere but in comments). This is the multi-thread
+// rendezvous, ABI.md §5: the machinery a collector uses to bring every other
+// mutator to a safe stop, and the machinery a mutator uses to yield to — or step
+// out of the way of — that stop.
+//
+// `gcworld` sorts AFTER `gcmark` and BEFORE `mem` in bytewise filename order, so
+// module concatenation (#1511) places it past every helper it inlines from the
+// earlier `gc*` files and before `mem.bit`'s low-level word accessors; those it
+// reaches by import-of-self (same module) with no inlining dependency in either
+// direction, because the atomics lower inline and `wordAt`/`spinCellAt` are
+// leaf address-fabrication.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS DIFFERENT FROM THE ZIG, AND WHY (the complete list)
+// ---------------------------------------------------------------------------
+//
+// 1. STATE IS CALLER-OWNED — identical to `gc.bit`'s deviation 1. Zig's `World`
+//    is a `struct` with an embedded `[max_mutators]Mutator` array; Bit has no
+//    way to hand back a struct that lives outside the managed heap, so the
+//    registry is a block of `worldWords` machine words the caller provides and
+//    every entry point takes as its first parameter. Field-for-field the block
+//    IS the Zig `World`: slot `i`'s three atomics sit at words `i*muWords + {0,1,
+//    2}`, then `stop`, `epoch` and the serialization `lock` follow. The
+//    process-wide instance belongs to `runtime/root` (`g_world` in `root.zig`),
+//    exactly as the collector state does; see the `worldBind`/wrapper note below.
+//
+// 2. ALL ATOMICS ARE SEQUENTIALLY CONSISTENT. Zig hand-picks orderings
+//    (`.acq_rel` on `claim`, `.release` on `release`/`beginBlocking`, `.seq_cst`
+//    only on the Dekker pair in `resumeWhenClear`/`rendezvous`). Bit's atomics
+//    (§11.5) expose ONLY seq_cst. seq_cst is strictly stronger than every
+//    ordering it replaces, so no interleaving the Zig admits is added here — the
+//    load-bearing seq_cst fences the algorithm's correctness depends on are
+//    present, and the rest are merely stronger than they need to be. The cost is
+//    a few extra fences on the park/stop paths, which already spin; it changes
+//    behaviour not at all.
+//
+// 3. A MUTATOR IS A SLOT INDEX, NOT A `*Mutator`. Zig passes `*Mutator`; the
+//    caller-owned block makes the natural handle the slot ordinal (0..maxMutators
+//    -1), from which `wMut` recovers the three word pointers. `worldClaim`
+//    returns -1 for "registry full" where Zig returns `null`.
+//
+// 4. THE SPIN-LOOP HINT IS OMITTED. Zig calls `std.atomic.spinLoopHint()` in
+//    every wait body; it is an `asm` block, and `@nosplit` rejects `asm` (E0075,
+//    §10.3) — the same omission `spinlock.bit` documents. The hint is a
+//    power/scheduling advisory with no memory-ordering or outcome content, so
+//    dropping it preserves correctness exactly.
+//
+// 5. THE `@panic` ON A NEVER-CLEARING STOP BECOMES A COUNTER. Zig's
+//    `resumeWhenClear` spins `stw_park_bound` times and `@panic`s if the stop
+//    never clears (a runtime bug, not a slow collection). `@nosplit` cannot call
+//    `panic`, so — exactly as `gc.bit`'s deviation 5 turns an assert into
+//    `gcStatBadOffset` — the bound expiry is counted in `worldStatResumeGiveUp`
+//    and the thread is released. On every sound run the counter is zero, which a
+//    test asserts; unlike the Zig `@panic` the signal survives into a release
+//    build instead of compiling out.
+//
+// 6. THE PER-ARCH SPIN BOUND IS A SINGLE VALUE. Zig sizes `stw_spin_bound`
+//    differently on x86-64 (200_000) and elsewhere (1_000_000) because the hint
+//    costs ~70x more on x86-64 (see gc.zig's essay). With the hint omitted
+//    (deviation 4) that asymmetry is gone, and the bound is throughput-only:
+//    ABI.md §5 makes an EXPIRED rendezvous abandon the collection, which is
+//    always safe (the heap grows to the next trigger), so no correctness rides on
+//    the figure. One conservative value is used; a per-target split is a pure
+//    throughput refinement and is deferred until this registry is actually linked
+//    (#1400) and can be measured.
+//
+// 7. `forEachParkedFrame` IS NOT PORTED HERE. It takes a function pointer and
+//    feeds published frames to the root scan, which is `runtime/root`'s precise
+//    walk (§4) — SEAM 3 territory, and inexpressible in the unmanaged subset
+//    (a Bit function value is a GC object) exactly as `gc.bit`'s deviation 2
+//    inverted `RootScanner` into a phase API. The registry it iterates lives
+//    here; the iteration belongs with the scanner that consumes it.
+//
+// Every function is `@nosplit` (§10.3): a registry operation must not itself
+// reach a safepoint or allocate, or a thread answering the collector's stop
+// would re-enter the very handshake it is trying to complete.
+
+// `spinAcquire`/`spinRelease` are already imported by the sibling `gc.bit` into
+// this shared module scope; only `spinCellAt` is new here.
+import { spinCellAt } from "../"
+
+// ---------------------------------------------------------------------------
+// Layout — the caller-owned `World` block, field for field with gc.zig's struct
+// ---------------------------------------------------------------------------
+
+// One `Mutator` occupies three consecutive words. Zig's `Mutator` is
+// `{state: u32, frame: usize, acked: u64}`; all three are represented as i64
+// words here (the state's 0..3 enum and the epoch/frame values all fit, and a
+// uniform width lets one `*i64` atomic address every field). The registry is
+// runtime-internal — it appears nowhere in ABI.md — so the widths are free to
+// differ, the same licence `spinlock.bit` took to widen a 1-byte lock to i32.
+const muState = 0     // MutatorState (atomic)
+const muFrame = 1     // published safepoint-snapshot address while parked, else 0
+const muAcked = 2     // the stop epoch this slot last parked FOR
+const muWords = 3
+
+// Hard cap on concurrently registered mutator OS threads, from gc.zig's
+// `max_mutators`. Fixed at startup (Power-of-10 rule 2): no allocation on the
+// safepoint path and every walk over the registry is statically bounded.
+export const maxMutators = 256
+
+// The three trailing words, past the slot array.
+const worldStopWord = maxMutators * muWords          // 768: atomic bool, 0/1
+const worldEpochWord = maxMutators * muWords + 1     // 769: atomic stop counter
+const worldLockWord = maxMutators * muWords + 2      // 770: i32 serialization lock
+// Deviation 5's counter: times `worldResumeWhenClear` gave up on a stop that
+// never cleared. Zig has no such field (it `@panic`s); it is a leaf stat here.
+const worldStatResumeGiveUp = maxMutators * muWords + 3   // 771
+
+// Words the caller must provide for the World block.
+export const worldWords = maxMutators * muWords + 4        // 772
+
+// MutatorState (gc.zig's enum). `free == 0` is the zero value, so a World block
+// carved from zeroed memory starts every slot free with no init step — matching
+// Zig's `.init(@intFromEnum(.free))` field default, and `stop`/`epoch` likewise
+// start 0.
+export const mFree = 0        // slot unused
+export const mRunning = 1     // executing Bit code; the collector waits for this
+export const mParked = 2      // stopped at a safepoint, snapshot published
+export const mBlocked = 3     // in a region holding NO live Bit references (§5)
+
+// Iterations the collector spins waiting for the world to stop. Deviation 6:
+// throughput-only, one value across targets. Expiry abandons the collection,
+// which ABI.md §5 makes always-safe.
+const stwSpinBound = 1000000
+
+// Iterations a waiting mutator spins before declaring the stop hung. Zig's
+// `stw_park_bound = 1 << 32`. NOT a timeout — a collector ALWAYS clears its stop
+// (on success or on abandonment), so reaching this means a runtime bug, and the
+// bound exists only to turn a hang into a diagnosable one (deviation 5 counts
+// it). Sized so a legitimately long mark/sweep cannot reach it.
+const stwParkBound = 4294967296
+
+// Bound on `worldResumeWhenClear`'s OUTER retry, which Zig writes `while (true)`.
+// The outer body re-runs only when a fresh stop that may already have counted
+// this slot lands in the gap between publishing `running` and re-checking — a
+// real but rare race, one extra pass per intervening collection. Power-of-10
+// forbids an unbounded loop, so it carries a static cap; exhausting it is the
+// same "runtime broken" signal as the inner bound and is counted, not panicked.
+const worldResumeOuterBound = 1073741824
+
+// ---------------------------------------------------------------------------
+// Slot addressing
+// ---------------------------------------------------------------------------
+
+// The three-word `Mutator` record for slot `slot`, as a `*i64` at its `state`
+// word; `frame` and `acked` are `+muFrame`/`+muAcked` from it. `world` is the
+// caller's block base; slot `slot` begins `slot*muWords` words in.
+@nosplit function wMut(world: *i64, slot: int): *i64 {
+  return world + slot * muWords
+}
+
+// ---------------------------------------------------------------------------
+// Registration — `World.claim` / `World.release`
+// ---------------------------------------------------------------------------
+
+// Claim a slot for the calling thread, or -1 if all `maxMutators` are taken.
+// Starts the slot `running`: a thread is assumed to be executing Bit code from
+// the moment it registers, the conservative direction (a spurious `running`
+// costs an abandoned collection; a spurious `stopped` corrupts the heap).
+export @nosplit @symbol("bit_rt_port_gc_world_claim") function worldClaim(world: *i64): int {
+  let i = 0
+  // Bounded: exactly `maxMutators` probes.
+  while (i < maxMutators) {
+    let m = wMut(world, i)
+    if (atomicCmpxchg(m, mFree, mRunning)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Release a slot. The thread must not touch Bit objects afterwards. Clears the
+// published frame first so no stale snapshot can be scanned, then frees.
+export @nosplit @symbol("bit_rt_port_gc_world_release") function worldRelease(world: *i64, slot: int) {
+  let m = wMut(world, slot)
+  atomicStore(m + muFrame, 0)
+  atomicStore(m, mFree)
+}
+
+// ---------------------------------------------------------------------------
+// The stop flag — `World.stopRequested`
+// ---------------------------------------------------------------------------
+
+// Whether a stop is pending. One atomic load; the overwhelmingly common
+// safepoint answer.
+export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") function worldStopRequested(world: *i64): bool {
+  return atomicLoad(world + worldStopWord) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Yielding to a stop — `World.park` / `mustStayPut` / `resumeWhenClear`
+// ---------------------------------------------------------------------------
+
+// Whether slot `slot` must stay in its `waiting` state rather than run Bit code.
+//
+// No stop pending: free to run. A `blocked` slot: `rendezvous` passed it WITHOUT
+// an acknowledgement, so any pending stop may already have counted it — it must
+// stay put until the stop clears outright. A `parked` slot: may resume as soon as
+// the pending stop is one it has NOT acknowledged (its ack names an older epoch),
+// because that stop's rendezvous is still waiting for this slot, so nothing has
+// marked behind it. Without the parked test the thread STARVES under stress (a
+// stop pending at every safepoint would re-park it forever); measured in gc.zig.
+@nosplit function worldMustStayPut(world: *i64, slot: int, waiting: int): bool {
+  if (atomicLoad(world + worldStopWord) == 0) {
+    return false
+  }
+  if (waiting == mBlocked) {
+    return true
+  }
+  let m = wMut(world, slot)
+  return atomicLoad(m + muAcked) == atomicLoad(world + worldEpochWord)
+}
+
+// Sit in `waiting` until this thread may run Bit code again.
+//
+// THE NAIVE VERSION ("wait for `stop` to clear, then store `running`") IS
+// UNSOUND — a thread that saw `stop == false` while still publishing
+// `parked`/`blocked` is read by the NEXT collector as already stopped, passed,
+// and marked behind while it resumes and mutates. This is the #1431 shape gc.zig
+// documents at length. The close differs by state and BOTH accesses are seq_cst,
+// paired with `worldRendezvous` (Dekker): store own flag, then load the other's.
+//
+//   - `parked` is closed by the EPOCH: acknowledge the epoch being parked for
+//     BEFORE publishing `parked`, so a collector that reads `parked` also reads a
+//     matching (or older) ack. A resuming thread's ack names an older stop, so
+//     the next collector waits for it rather than passing it.
+//   - `blocked` has no ack — rendezvous passes it unconditionally, the whole
+//     point of the contract — so the re-check below is load-bearing there:
+//     publish `running`, re-read `stop`, and go back if one is pending.
+@nosplit function worldResumeWhenClear(world: *i64, slot: int, waiting: int) {
+  let m = wMut(world, slot)
+  let outer = 0
+  // Bounded (deviation 5/outer bound): normally one pass; each extra pass costs
+  // one intervening collection, and exhaustion is counted as "runtime broken".
+  while (outer < worldResumeOuterBound) {
+    // Acknowledge the stop being parked FOR before publishing the state that
+    // lets rendezvous count us. A collector reading `parked` must read the ack.
+    if (waiting == mParked) {
+      atomicStore(m + muAcked, atomicLoad(world + worldEpochWord))
+    }
+    atomicStore(m, waiting)
+
+    let spins = 0
+    // Bounded by `stwParkBound`; expiry means the stop never cleared.
+    while (spins < stwParkBound) {
+      if (!worldMustStayPut(world, slot, waiting)) {
+        break
+      }
+      spins = spins + 1
+    }
+    if (spins >= stwParkBound) {
+      // The stop never cleared: a runtime bug. Zig @panics; count it and release
+      // (deviation 5). Leaving the slot `running` is the same result @panic's
+      // process teardown would reach, minus the abort.
+      let c = atomicLoad(world + worldStatResumeGiveUp)
+      atomicStore(world + worldStatResumeGiveUp, c + 1)
+      atomicStore(m, mRunning)
+      return
+    }
+
+    atomicStore(m, mRunning)
+    if (!worldMustStayPut(world, slot, waiting)) {
+      return
+    }
+    // A stop that may already have counted us landed in the gap. Nothing above
+    // touched the heap, so going back is always safe.
+    outer = outer + 1
+  }
+  // Outer bound exhausted: same "runtime broken" signal, counted not panicked.
+  let c = atomicLoad(world + worldStatResumeGiveUp)
+  atomicStore(world + worldStatResumeGiveUp, c + 1)
+  atomicStore(m, mRunning)
+}
+
+// Yield to an in-progress collection: publish this thread's snapshot (`frame`,
+// so the collector walks this stack precisely), go `parked`, wait for the stop
+// to clear, then drop the snapshot. Returns immediately if no stop is pending,
+// which is what makes it safe to call speculatively at a safepoint.
+export @nosplit @symbol("bit_rt_port_gc_world_park") function worldPark(world: *i64, slot: int, frame: int) {
+  let m = wMut(world, slot)
+  atomicStore(m + muFrame, frame)
+  worldResumeWhenClear(world, slot, mParked)
+  atomicStore(m + muFrame, 0)
+}
+
+// ---------------------------------------------------------------------------
+// The `blocked` contract — `World.beginBlocking` / `endBlocking`
+// ---------------------------------------------------------------------------
+
+// Enter a region that holds NO live Bit references in any frame (ABI.md §5).
+// The collector then neither waits for this thread nor scans it. PRECONDITION:
+// the caller genuinely holds no live references for the whole bracketed region —
+// one held across this is invisible and will be swept. Clears the frame so no
+// snapshot is left to be walked.
+export @nosplit @symbol("bit_rt_port_gc_world_begin_blocking") function worldBeginBlocking(world: *i64, slot: int) {
+  let m = wMut(world, slot)
+  atomicStore(m + muFrame, 0)
+  atomicStore(m, mBlocked)
+}
+
+// Leave that region. Stays `blocked` while a stop is pending rather than
+// resuming behind the collector's back — a `blocked` slot was passed without
+// acknowledging, so it must re-check the flag (`worldResumeWhenClear`) before it
+// runs. Staying blocked longer is free: nothing waits on it.
+export @nosplit @symbol("bit_rt_port_gc_world_end_blocking") function worldEndBlocking(world: *i64, slot: int) {
+  worldResumeWhenClear(world, slot, mBlocked)
+}
+
+// ---------------------------------------------------------------------------
+// The collector side — `World.rendezvous` / `stoppedFor` / `restart`
+// ---------------------------------------------------------------------------
+
+// Whether slot `slot` counts as stopped for the collection at epoch `e`. A free
+// or blocked slot always counts (blocked holds no live references by contract, so
+// needs no ack). A parked slot counts only once it has acknowledged THIS epoch:
+// a slot parked for an earlier stop is on its way out (see `worldMustStayPut`),
+// so treating it as stopped would be the very race the epoch pair exists to close.
+export @nosplit @symbol("bit_rt_port_gc_world_stopped_for") function worldStoppedFor(world: *i64, slot: int, e: int): bool {
+  let m = wMut(world, slot)
+  let s = atomicLoad(m)
+  if (s == mFree) {
+    return true
+  }
+  if (s == mBlocked) {
+    return true
+  }
+  if (s == mParked) {
+    return atomicLoad(m + muAcked) == e
+  }
+  return false
+}
+
+// Request a stop and wait until a WHOLE pass over the registry finds no other
+// mutator still `running`. Returns false if the bounded wait expired, in which
+// case the caller must abandon the collection (ABI.md §5). Caller holds the
+// world lock (`worldLockAcquire`), so collectors cannot race each other.
+//
+// RE-SCANNING FROM THE TOP each pass is load-bearing, not defensive: a thread
+// claims its slot on its first allocation or poll, which can land after this walk
+// already passed that slot. Requiring one clean sweep makes registration order
+// irrelevant; `claim` starting a slot `running` under a pending stop lets a
+// registering thread park at its next safepoint rather than run behind the mark.
+export @nosplit @symbol("bit_rt_port_gc_world_rendezvous") function worldRendezvous(world: *i64, selfSlot: int): bool {
+  // seq_cst, paired with `worldResumeWhenClear` — the Dekker store-then-load.
+  // `atomicAdd` returns the PREVIOUS value, so +1 is this stop's epoch. Epochs
+  // start at 1 (initial 0 acknowledges nothing).
+  let e = atomicAdd(world + worldEpochWord, 1) + 1
+  atomicStore(world + worldStopWord, 1)
+  let spins = 0
+  // Bounded by `stwSpinBound`; expiry returns false (abandon).
+  while (spins < stwSpinBound) {
+    let stillRunning = false
+    let i = 0
+    // Bounded: exactly `maxMutators` slots.
+    while (i < maxMutators) {
+      if (i != selfSlot) {
+        if (!worldStoppedFor(world, i, e)) {
+          stillRunning = true
+          break
+        }
+      }
+      i = i + 1
+    }
+    if (!stillRunning) {
+      return true
+    }
+    spins = spins + 1
+  }
+  return false
+}
+
+// Let every parked mutator go. Clears the stop; every waiter's
+// `worldResumeWhenClear` observes it and resumes.
+export @nosplit @symbol("bit_rt_port_gc_world_restart") function worldRestart(world: *i64) {
+  atomicStore(world + worldStopWord, 0)
+}
+
+// ---------------------------------------------------------------------------
+// The serialization lock — `World.lock`
+// ---------------------------------------------------------------------------
+//
+// Held for the whole stop-the-world window so only one collector runs at a time.
+// Zig embeds a `SpinLock` field; here it is the i32 at `worldLockWord`, reached
+// through `spinCellAt` (the low half of the word, both targets little-endian) —
+// the same bridge `runtime/chan` and `runtime/sched` use for a lock living
+// inside a word-indexed block.
+
+// Take the collector lock, spinning until won.
+export @nosplit @symbol("bit_rt_port_gc_world_lock") function worldLockAcquire(world: *i64) {
+  spinAcquire(spinCellAt(world, worldLockWord))
+}
+
+// Release the collector lock.
+export @nosplit @symbol("bit_rt_port_gc_world_unlock") function worldLockRelease(world: *i64) {
+  spinRelease(spinCellAt(world, worldLockWord))
+}
+
+// The deviation-5 counter: nonzero means a stop never cleared (a runtime bug).
+// Exposed so a test can assert it stayed 0 across a whole run.
+export @nosplit @symbol("bit_rt_port_gc_world_resume_giveup") function worldResumeGiveUp(world: *i64): int {
+  return atomicLoad(world + worldStatResumeGiveUp)
+}
+
+// The raw `MutatorState` of slot `slot` (`mFree`/`mRunning`/`mParked`/`mBlocked`).
+// A pure observer over the registry, so a test can assert a transition landed
+// where the state machine says it should.
+export @nosplit @symbol("bit_rt_port_gc_world_slot_state") function worldSlotState(world: *i64, slot: int): int {
+  return atomicLoad(wMut(world, slot))
+}
+
+// ---------------------------------------------------------------------------
+// The four ABI symbols (ABI.md §5/§6) — `bit_rt_gc_thread_enter/thread_exit/
+// blocking_begin/blocking_end`
+// ---------------------------------------------------------------------------
+//
+// These are the zero-argument C entry points `runtime/sched` calls (by symbol,
+// to break the import cycle — see sched.zig's `gc_hooks`). Pinned with the
+// `bit_rt_root_` PLACEHOLDER infix, not the bare ABI name: `runtime/root.zig` is
+// still linked into `libbitrt.a` and would collide (`DuplicateSymbol`) — G2
+// (#1583) strips the `_root` infix when it retires the Zig originals. Do NOT
+// call these by name from another module; they are the ABI boundary, reached
+// from outside the Bit tree.
+//
+// THE SINGLETON AND THE CURRENT-MUTATOR CACHE. Zig keeps `g_world` (the World
+// instance) and a `threadlocal g_mutator` (this OS thread's slot). Two adaptations,
+// both forced and both matching conventions already in this tree:
+//
+//   - `g_world` is CALLER-OWNED, exactly as the collector state is (deviation 1):
+//     `runtime/root` owns the block and its address is bound here once via
+//     `worldBind`. `@nosplit` rejects `ptrOf` (E0075, measured — the same gap
+//     `root.bit` documents), so this module cannot take the address of a
+//     module-state array itself; the owner passes it in, `wordAt` recovers the
+//     pointer. Until `worldBind` runs, `worldAddr == 0` and every wrapper is a
+//     safe no-op.
+//
+//   - `g_mutator` is MODULE STATE, not a threadlocal: `@threadlocal` is refused
+//     for Mach-O (§11.11), the same wall `root.bit`'s `iface_as_ok` and
+//     `net/netabi.bit`'s UDP sender hit. It is sound under the ABI's single-worker
+//     contract — ABI.md §5 pins nthreads to 1 for v1, and `root.bit`'s
+//     `rtGcAlloc` note names exactly this: "there is exactly one allocating
+//     thread, so nothing is lost TODAY". When #1400 links this registry and the
+//     scheduler goes genuinely M:N, the cache must move to per-worker storage
+//     (the mechanism #1364 establishes for `currentTask`); flagged here rather
+//     than hidden, tracked on #1433.
+
+// Address of the caller-owned World block, or 0 before `worldBind`.
+let worldAddr: i64 = 0
+
+// This thread's mutator slot, +1 so the 0 default means "not registered"
+// (slot 0 is a real slot). The `g_mutator` stand-in.
+let curMut: i64 = 0
+
+// Bind the process-wide World block. Called once at boot by `runtime/root`,
+// after it has `ptrOf`'d its own `g_world` array (which this `@nosplit` module
+// cannot do for it). Idempotent-friendly: re-binding the same address is a
+// no-op, and the block is expected zeroed (every slot free, no stop, epoch 0).
+export @nosplit @symbol("bit_rt_port_gc_world_bind") function worldBind(addr: int) {
+  worldAddr = addr
+}
+
+// Register the calling thread as a mutator if it is not already, mirroring
+// `root.zig`'s `currentMutator`: claim a slot, cache it, and — if a stop is
+// already pending — park immediately so a thread joining mid-collection does not
+// run behind the mark. `frame` is the safepoint snapshot address (0 from the
+// thread_enter/blocking_begin doors, which publish no snapshot).
+@nosplit function ensureMutator(frame: int) {
+  if (curMut != 0) {
+    return
+  }
+  if (worldAddr == 0) {
+    return
+  }
+  let world = wordAt(worldAddr)
+  let slot = worldClaim(world)
+  if (slot < 0) {
+    return
+  }
+  curMut = slot + 1
+  if (worldStopRequested(world)) {
+    worldPark(world, slot, frame)
+  }
+}
+
+// `bit_rt_gc_thread_enter` (ABI.md §5/§6): register this OS thread as a mutator.
+// Idempotent. Preferred over lazy registration so the claim stays off the first
+// allocation's path, but soundness does not depend on it being called (the
+// allocation and safepoint doors register lazily too).
+export @nosplit @symbol("bit_rt_root_gc_thread_enter") function gcThreadEnter() {
+  ensureMutator(0)
+}
+
+// `bit_rt_gc_thread_exit` (ABI.md §5/§6): release this thread's slot. NOT
+// optional — a leaked slot stays `running` forever, which corrupts nothing but
+// makes every later rendezvous expire, i.e. collection quietly stops.
+export @nosplit @symbol("bit_rt_root_gc_thread_exit") function gcThreadExit() {
+  if (curMut == 0) {
+    return
+  }
+  if (worldAddr == 0) {
+    return
+  }
+  let world = wordAt(worldAddr)
+  worldRelease(world, curMut - 1)
+  curMut = 0
+}
+
+// `bit_rt_gc_blocking_begin` (ABI.md §5/§6). PRECONDITION: the calling thread
+// holds NO live Bit references in any frame for the whole bracketed region.
+// Registers first (a thread may block before ever allocating), then hands its
+// slot to the collector's "pass without waiting" contract.
+export @nosplit @symbol("bit_rt_root_gc_blocking_begin") function gcBlockingBegin() {
+  ensureMutator(0)
+  if (curMut == 0) {
+    return
+  }
+  let world = wordAt(worldAddr)
+  worldBeginBlocking(world, curMut - 1)
+}
+
+// `bit_rt_gc_blocking_end` (ABI.md §5/§6). Blocks while a stop is pending rather
+// than resuming behind the collector's back (`worldEndBlocking`).
+export @nosplit @symbol("bit_rt_root_gc_blocking_end") function gcBlockingEnd() {
+  if (curMut == 0) {
+    return
+  }
+  if (worldAddr == 0) {
+    return
+  }
+  let world = wordAt(worldAddr)
+  worldEndBlocking(world, curMut - 1)
+}

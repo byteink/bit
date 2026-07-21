@@ -151,6 +151,17 @@ const modules = [_]Module{
     // never renamed), so the gate would find no `bit_rt_root_` symbol there and
     // fail its own per-module vacuity check.
     .{ .path = "runtime/net", .target = .aarch64_macos },
+    // SEAM 2 (#1575): `runtime/gc`'s `gcworld.bit` pins the four
+    // `bit_rt_root_gc_thread_enter/thread_exit/blocking_begin/blocking_end`
+    // wrappers over the World/Mutator registry, so it joins the at-risk set — its
+    // other pins (`bit_rt_port_gc_*`) are port-internal and never renamed, but
+    // the four `bit_rt_root_gc_*` become bare ABI names at G2 (#1583). The module
+    // is platform-free (no `syscall`/`extern function`), so the target is
+    // arbitrary; aarch64-macos matches `runtime/net`. The wrappers reach the
+    // registry only through `bit_rt_port_gc_world_*`, so no reference to a
+    // post-rename `bit_rt_gc_*` name can exist — which is exactly what this gate
+    // proves per symbol.
+    .{ .path = "runtime/gc", .target = .aarch64_macos },
 };
 
 /// Upper bound on symbols in one object — keeps every walk below provably
