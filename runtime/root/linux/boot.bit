@@ -124,7 +124,7 @@ import { parkSleepNs } from "../../park/linux"
 import { parkMinBackoffNs, parkNextBackoff } from "../../park"
 import {
   schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
-  schedWorkerAt, workerStepStop, WORKER_MAX_STEPS,
+  schedWorkerAt, workerStepStop, WORKER_MAX_STEPS, scStopping,
   schedFindWorkAt, schedWorkerStepAt, schedSetPollFd,
   schedTaskExit, dqPushBottom, taskAt, taskWords,
   schedStackBytes, schedStackAligned, wkDeque,
@@ -288,6 +288,35 @@ const joinTimeoutNs: int = 15000000000
 // `schedWorkerRunBare` that folded the clock away to a constant 0, against which
 // no positive deadline is ever due — `println/sleep/println` printed its first
 // line and hung forever, against a Bit-sourced `libbitrt.a`.
+//
+// ---------------------------------------------------------------------------
+// THE IDLE SLEEP (#1665) — kept identical in ../darwin/boot.bit
+// ---------------------------------------------------------------------------
+//
+// `runtime/sched`'s `schedWorkerStep` cannot reach a platform sleep for idle
+// (that module may import neither park provider, and the providers' pinned
+// `bit_rt_port_park_sleep_ns` is not a member of `libbitrt.a`, so `worker.bit`'s
+// own comment states it is unreachable there — E0078, verified on both Linux
+// triples). Its no-work branch instead burns `spinBackoff`, a busy spin, which
+// is why an idle worker pegged a whole core.
+//
+// `addr == 0 && woke == 0` is EXACTLY `schedWorkerStep`'s own no-work predicate
+// — `schedFindWorkAt` found nothing and `pollDrain` woke nothing — and this
+// loop already computes both before calling into the step, so the idle case is
+// distinguished HERE, by the caller, with no change to `runtime/sched`'s pinned
+// `bit_rt_port_sched_worker_step_at` API. This is sound only because this
+// runtime starts exactly ONE worker (ABI.md §5): `woke > 0` with nothing to pop
+// off the global queue would mean another consumer raced this thread for it,
+// which cannot happen here. When work IS found, `schedWorkerStepAt` is called
+// exactly as before and runs it.
+//
+// The sleep is bracketed with `bit_rt_gc_blocking_begin`/`_end` (ABI.md §5),
+// `sched.zig`'s own idle path and this file's `boot`/`joinWorker` sleeps: no
+// frame here holds a live Bit reference while parked, so the collector may pass
+// this worker's slot without waiting for a safepoint it will not reach until
+// `parkSleepNs` returns. `scStopping` is checked first and by hand, matching
+// `schedWorkerStep`'s own order, so a shutdown signalled while idle is still
+// seen within one backoff step rather than after a sleep starts.
 function workerBody(arg: *byte): *byte {
   let block = taskAt(int(arg))
   let workerAddr = *block
@@ -303,6 +332,16 @@ function workerBody(arg: *byte): *byte {
     let woke = 0
     if (addr == 0) {
       woke = pollDrain(int(s), 0)
+    }
+    if (addr == 0 && woke == 0) {
+      if (atomicLoad(s + scStopping) != 0) {
+        break
+      }
+      gcBlockingBegin()
+      parkSleepNs(backoff)
+      gcBlockingEnd()
+      backoff = parkNextBackoff(backoff)
+      continue
     }
     backoff = schedWorkerStepAt(w, addr, woke, backoff)
     if (backoff == workerStepStop) {
