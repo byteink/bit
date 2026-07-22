@@ -44,6 +44,21 @@ pub const Error = error{
     RelocationOutOfRange,
 };
 
+/// Names the symbol a failed link could not resolve and the module that
+/// referenced it. Zig errors carry no payload, so `error.UndefinedSymbol` alone
+/// says only that SOMETHING is missing — which is all the ELF driver could print
+/// until #1646 ("bit: link prog.out: UndefinedSymbol"). Both linkers now fill
+/// this in, so both name the symbol.
+///
+/// Borrowed from the link inputs; valid as long as they are.
+pub const UndefinedRef = struct {
+    symbol: []const u8,
+    /// The `object.Module.name` of the module holding the referencing atom, or
+    /// `link roots` when the unresolved name is one the container itself
+    /// demands (the entry point) rather than one an atom referenced.
+    referenced_from: []const u8,
+};
+
 /// Builds `name -> AtomId` over every global-binding atom in every module. A
 /// name defined twice is `error.DuplicateSymbol` (see the module doc comment
 /// on the missing weak model).
@@ -217,14 +232,31 @@ pub const KeptSet = struct {
 /// kept atom's relocations transitively. Everything unmarked is dead and the
 /// driver drops it. An explicit work stack (not recursion) keeps the traversal
 /// bounded and stack-safe over `libbitrt`'s large call graph.
-pub fn deadStrip(gpa: Allocator, modules: []const Module, globals: *const GlobalTable, roots: []const []const u8) Error!KeptSet {
+///
+/// This walk is where a static link discovers that nothing defines a name, so
+/// it is where `undefined_out` is filled in (#1646). It runs AFTER
+/// `selectArchiveMembers` has reached its fixed point, which is what makes the
+/// answer trustworthy under #1647's lazy member loading: a symbol is undefined
+/// only once no further member can be pulled to satisfy it, never on a first
+/// pass. The later relocation passes resolve only atoms this walk already
+/// resolved, so they cannot be the first to notice.
+pub fn deadStrip(
+    gpa: Allocator,
+    modules: []const Module,
+    globals: *const GlobalTable,
+    roots: []const []const u8,
+    undefined_out: ?*UndefinedRef,
+) Error!KeptSet {
     var kept: KeptSet = .{};
     errdefer kept.deinit(gpa);
     var stack: std.ArrayList(AtomId) = .empty;
     defer stack.deinit(gpa);
 
     for (roots) |name| {
-        const id = globals.get(name) orelse return error.UndefinedSymbol;
+        const id = globals.get(name) orelse {
+            if (undefined_out) |out| out.* = .{ .symbol = name, .referenced_from = "link roots" };
+            return error.UndefinedSymbol;
+        };
         if ((try kept.set.getOrPut(gpa, id.key())).found_existing) continue;
         try stack.append(gpa, id);
     }
@@ -232,7 +264,18 @@ pub fn deadStrip(gpa: Allocator, modules: []const Module, globals: *const Global
     while (stack.pop()) |id| {
         const cur = modules[id.module].atoms[id.atom];
         for (cur.relocs) |r| {
-            const target = try resolveRef(globals, id.module, r.target);
+            const target = resolveRef(globals, id.module, r.target) catch |e| {
+                if (e == error.UndefinedSymbol) {
+                    if (undefined_out) |out| out.* = .{
+                        .symbol = switch (r.target) {
+                            .global => |name| name,
+                            .local => "?",
+                        },
+                        .referenced_from = modules[id.module].name,
+                    };
+                }
+                return e;
+            };
             if ((try kept.set.getOrPut(gpa, target.key())).found_existing) continue;
             try stack.append(gpa, target);
         }
@@ -616,7 +659,7 @@ test "deadStrip keeps only what the entry root reaches" {
 
     var globals = try resolveGlobals(gpa, &mods);
     defer globals.deinit(gpa);
-    var kept = try deadStrip(gpa, &mods, &globals, &.{"_start"});
+    var kept = try deadStrip(gpa, &mods, &globals, &.{"_start"}, null);
     defer kept.deinit(gpa);
 
     try testing.expect(kept.contains(.{ .module = 0, .atom = 0 })); // _start

@@ -29,6 +29,7 @@ const emit = @import("emit.zig");
 const link = @import("link.zig");
 const archive = @import("link/archive.zig");
 const macho = @import("link/macho.zig");
+const machosyms = @import("link/machosyms.zig");
 /// `pub` for the runtime-pin cycle gate (tests/rootpins.zig): it reads back an
 /// object this compiler just emitted, which is the only way to see the symbol a
 /// call actually lands on rather than the name the source spells. Both readers,
@@ -828,9 +829,16 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
     }
 
     {
+        // Project-wide, not per-module: a §11.9 pin in one module is what
+        // resolves an `extern` in another (`tests/stress/pinsym` is exactly
+        // that shape), and the link merges them all.
+        var pins: PinSet = .{};
+        defer pins.deinit(gpa);
+        for (0..n) |i| try collectPinnedSymbols(gpa, &pins, project.module_files.items[i]);
+
         var rejected = false;
         for (0..n) |i| {
-            if (try rejectExternForTarget(gpa, &diags, project.module_files.items[i], target, libbitrt, !emit_obj)) rejected = true;
+            if (try rejectExternForTarget(gpa, &diags, project.module_files.items[i], target, libbitrt, !emit_obj, &pins)) rejected = true;
         }
         if (rejected) return try renderFail(gpa, &diags, err_out);
     }
@@ -852,7 +860,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             };
             if (emit_obj) return object;
             defer gpa.free(object);
-            return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+            return try elfLink(gpa, err_out, .x86_64_linux, object, libbitrt);
         },
         .aarch64_linux => {
             const object = emit.emitObjectArm64Elf(gpa, &module, !emit_obj, freestanding) catch |e| switch (e) {
@@ -861,7 +869,7 @@ pub fn buildProject(gpa: std.mem.Allocator, io: Io, root_abs: []const u8, root_o
             };
             if (emit_obj) return object;
             defer gpa.free(object);
-            return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+            return try elfLink(gpa, err_out, .aarch64_linux, object, libbitrt);
         },
         .aarch64_macos => {
             // §11.8: `syscall()` has no Darwin encoding — report it as a
@@ -925,7 +933,10 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
     if (diags.hasErrors()) return try renderFail(gpa, &diags, err_out);
 
     // Always a linking build: `buildModule` has no object-emit mode.
-    if (try rejectExternForTarget(gpa, &diags, files, target, libbitrt, true)) return try renderFail(gpa, &diags, err_out);
+    var pins: PinSet = .{};
+    defer pins.deinit(gpa);
+    try collectPinnedSymbols(gpa, &pins, files);
+    if (try rejectExternForTarget(gpa, &diags, files, target, libbitrt, true, &pins)) return try renderFail(gpa, &diags, err_out);
 
     var module = try lower.lowerModule(gpa, &ctx, files, &checked, &rmodule);
     defer module.deinit();
@@ -936,12 +947,12 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
         .x86_64_linux => {
             const object = try emit.emitObject(gpa, &module, true, false);
             defer gpa.free(object);
-            return try link.linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+            return try elfLink(gpa, err_out, .x86_64_linux, object, libbitrt);
         },
         .aarch64_linux => {
             const object = try emit.emitObjectArm64Elf(gpa, &module, true, false);
             defer gpa.free(object);
-            return try link.linkExecutable(gpa, .aarch64_linux, &.{ .{ .object = object }, .{ .archive = libbitrt } });
+            return try elfLink(gpa, err_out, .aarch64_linux, object, libbitrt);
         },
         .aarch64_macos => {
             // §11.8: `syscall()` has no Darwin encoding — report it as a
@@ -957,19 +968,29 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
 }
 
 /// §11.7: `extern function` binds a Bit name to a raw external symbol. On
-/// Mach-O that symbol is bound by dyld at load time and anything is admissible.
-/// Bit's ELF output has no load-time resolution at all — no interpreter, no
+/// Mach-O that symbol is bound by dyld at load time, so the image has TWO
+/// sources for it — the merged archive and libSystem — and admissible means
+/// "in one of them", not "anything" (#1634). Bit's ELF output has no
+/// load-time resolution at all — no interpreter, no
 /// dynamic symbol table, no libc — but that is not the same as no resolution:
 /// the static link already merges `libbitrt.a`, and a symbol **defined inside
 /// that archive** resolves through the very same global symbol table as the
 /// runtime's own calls.
 ///
-/// So the predicate is archive membership, not the platform. A symbol present
-/// in the archive is accepted; one that is absent is still rejected here, with
+/// So the predicate is where a symbol may come from, not the platform. A symbol
+/// present in the archive is accepted; one that is absent is still rejected here, with
 /// a real diagnostic naming it, rather than failing deep inside the linker. An
 /// empty or malformed `libbitrt` in a LINKING build leaves membership undecided,
 /// and an undecided case must REJECT — accepting on unknown would trade a
 /// compile error for a link error or a silent crash.
+///
+/// Darwin has a SECOND legitimate source and therefore a wider predicate, not
+/// no predicate (#1634): the `LC_LOAD_DYLIB` libSystem every Mac carries, which
+/// is the whole reason §11.7 exists. Its surface is `machosyms.libsystem`,
+/// so a Darwin extern is admissible when the archive defines it OR libSystem
+/// exports it. A name in NEITHER used to be accepted here and then aborted at
+/// dyld load — build-clean, die-far-from-the-cause, the exact failure
+/// `emit.firstUnpinnedImport` already refuses for pins.
 ///
 /// `linking` is false for `--emit-obj`, and the gate then does not apply at all
 /// (#1645). Membership is a property of a LINK, and an object emit performs
@@ -990,14 +1011,8 @@ fn buildModule(gpa: std.mem.Allocator, inputs: []const SrcFile, ident: []const u
 /// is the first point where the selected target and the AST are both in hand,
 /// and the archive path is a pure function of the target. Returns true if
 /// anything was rejected.
-fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget, libbitrt: []const u8, linking: bool) !bool {
+fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics, files: []const resolve.ModuleFile, target: BuildTarget, libbitrt: []const u8, linking: bool, pins: *const PinSet) !bool {
     if (!linking) return false;
-    if (target == .aarch64_macos) return false;
-    const link_target: link.Target = switch (target) {
-        .x86_64_linux => .x86_64_linux,
-        .aarch64_linux => .aarch64_linux,
-        .aarch64_macos => unreachable,
-    };
     var found = false;
     for (files) |mf| {
         for (mf.tree.kids(mf.tree.root)) |top| {
@@ -1021,19 +1036,126 @@ fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics
             // because the guarantee is specific to the entry, not to externs
             // at large.
             if (std.mem.eql(u8, symbol, "bit_main")) continue;
-            if (link.archiveDefines(gpa, link_target, libbitrt, symbol)) continue;
+            if (externResolvable(gpa, target, libbitrt, symbol, pins)) continue;
 
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "'extern function' {s} is not defined in the runtime archive for target {s}", .{ symbol, target.name() }) catch "'extern function': undefined symbol for this target";
-            try diags.report(.extern_unsupported_target, mf.tree.get(inner).span, msg, "the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved");
+            const what = if (target == .aarch64_macos)
+                "is defined neither in the runtime archive nor by libSystem, for target"
+            else
+                "is not defined in the runtime archive for target";
+            const msg = std.fmt.bufPrint(&buf, "'extern function' {s} {s} {s}", .{ symbol, what, target.name() }) catch "'extern function': undefined symbol for this target";
+            const note = if (target == .aarch64_macos)
+                "dyld would bind it to libSystem and abort at load: only a symbol inside libbitrt.a or exported by libSystem can be resolved"
+            else
+                "the Linux output is fully static: only a symbol already inside libbitrt.a can be resolved";
+            try diags.report(.extern_unsupported_target, mf.tree.get(inner).span, msg, note);
             found = true;
         }
     }
     return found;
 }
 
+/// Whether the link this build is about to perform can resolve `symbol`, per
+/// SPEC §11.7. One function so the two targets' answers cannot drift into two
+/// AST walks: what differs between them is only where a symbol may legitimately
+/// come from.
+///
+///   - Linux: the merged `libbitrt.a`, and nothing else — the image is static,
+///     with no interpreter and no dynamic symbol table.
+///   - Darwin: that same archive OR libSystem, which the Mach-O image loads as
+///     `LC_LOAD_DYLIB` and dyld binds at load.
+///
+/// Undecidable inputs (an empty or malformed archive) answer false on both, so
+/// the caller rejects — the sound direction, since accepting on unknown trades a
+/// compile error for a crash.
+fn externResolvable(gpa: std.mem.Allocator, target: BuildTarget, libbitrt: []const u8, symbol: []const u8, pins: *const PinSet) bool {
+    return switch (target) {
+        .x86_64_linux => link.archiveDefines(gpa, .x86_64_linux, libbitrt, symbol),
+        .aarch64_linux => link.archiveDefines(gpa, .aarch64_linux, libbitrt, symbol),
+        .aarch64_macos => machosyms.archiveDefines(gpa, libbitrt, symbol) or
+            machosyms.libsystemDefines(symbol) or
+            pins.contains(symbol),
+    };
+}
+
+/// The §11.9 `@symbol("…")` names this build's own modules define. An `extern`
+/// naming one is resolved by the final link out of the program's own object —
+/// `tests/stress/pinsym` is exactly that shape, and `bit_main` is the same idea
+/// hardcoded — so it is admissible even though no archive defines it.
+///
+/// Consulted on Darwin only, deliberately. Darwin is the platform whose gate is
+/// being TIGHTENED here (#1634), so it must not turn a shape that built and ran
+/// before into an error. The Linux arm has always refused this shape, and
+/// widening it is a separate decision with its own goldens, not a side effect of
+/// this one — see #1669.
+const PinSet = std.StringHashMapUnmanaged(void);
+
+/// Collects every `@symbol("…")` on a top-level declaration of `files`. Keys
+/// borrow the module sources, so the set must not outlive them.
+fn collectPinnedSymbols(gpa: std.mem.Allocator, out: *PinSet, files: []const resolve.ModuleFile) !void {
+    for (files) |mf| {
+        for (mf.tree.kids(mf.tree.root)) |top| {
+            if (top == ast.none) continue;
+            const inner = if (mf.tree.get(top).tag == .@"export") mf.tree.kids(top)[0] else top;
+            if (mf.tree.get(inner).tag != .func_decl) continue;
+            for (mf.tree.kids(inner)) |kid| {
+                if (kid == ast.none) continue;
+                if (mf.tree.get(kid).tag != .attr_list) continue;
+                for (mf.tree.kids(kid)) |a| {
+                    const ak = mf.tree.kids(a); // [name_ident, arg_string_lit?]
+                    if (ak.len < 2 or ak[1] == ast.none) continue;
+                    const name_span = mf.tree.get(ak[0]).span;
+                    if (!std.mem.eql(u8, mf.source[name_span.start..name_span.end], "symbol")) continue;
+                    const arg_span = mf.tree.get(ak[1]).span;
+                    const raw = mf.source[arg_span.start..arg_span.end];
+                    // The literal minus its quotes. §11.9 symbol names are C
+                    // identifiers, so there is nothing to unescape.
+                    if (raw.len < 2) continue;
+                    try out.put(gpa, raw[1 .. raw.len - 1], {});
+                }
+            }
+        }
+    }
+}
+
 /// The §11.8 Darwin rejection, rendered like any other build failure: a
 /// message plus a `null` result, which the caller maps to exit code 1.
+/// The static ELF link, with the undefined-symbol report wired up (#1646).
+///
+/// A static ELF has no load-time resolution, so a name nothing defines is a hard
+/// link failure — correctly refused before this, but ANONYMOUSLY: the driver
+/// propagated `error.UndefinedSymbol` and printed only its name, so the one fact
+/// the user needs (WHICH symbol) was the one fact missing. That matters more
+/// since #1645: an object carrying an unresolvable extern is legitimately
+/// emitted, and the link is now the place that reports it.
+///
+/// The report is trustworthy under #1647's lazy archive loading because
+/// `strip.deadStrip` — which fills the ref in — runs only after member selection
+/// has reached its fixed point.
+///
+/// Returns `null` (having printed) when the link is refused, mirroring every
+/// other build failure in this file.
+fn elfLink(
+    gpa: std.mem.Allocator,
+    err_out: *Io.Writer,
+    target: link.Target,
+    object: []const u8,
+    libbitrt: []const u8,
+) !?[]u8 {
+    var undef: link.UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    return link.linkExecutable(gpa, target, &.{ .{ .object = object }, .{ .archive = libbitrt } }, &undef) catch |e| switch (e) {
+        error.UndefinedSymbol => {
+            try err_out.print(
+                "bit: undefined symbol '{s}', referenced from {s}\n" ++
+                    "bit: the Linux output is fully static, so nothing resolves it at load time: it must be defined by the program or by libbitrt.a (SPEC \xc2\xa711.7)\n",
+                .{ undef.symbol, undef.referenced_from },
+            );
+            return null;
+        },
+        else => return e,
+    };
+}
+
 /// The Mach-O link, with #1445's undefined-symbol gate wired up: the program's
 /// §11.7 `extern function` declarations are the only names it may legitimately
 /// leave for dyld, and anything else it leaves undefined is refused here with
@@ -1796,6 +1918,99 @@ test "E0078 admits a runtime-archive symbol on Linux and still rejects an absent
     // Anti-vacuity: a loop that ran zero times would pass while asserting
     // nothing — the failure mode this codebase has hit eleven times.
     if (checked == 0) return error.SkipZigTest;
+}
+
+test "E0078 on Darwin admits libSystem and the archive, and refuses a name in neither (#1634)" {
+    // SPEC §11.7. Darwin's predicate is WIDER than Linux's, not absent: dyld
+    // binds the image against libSystem at load, so an `extern function` may
+    // name a libSystem export as well as an archive member. Before #1634 the
+    // Darwin arm returned early and accepted EVERYTHING, so a misspelled or
+    // absent symbol built clean and aborted at dyld load — the exact
+    // build-clean/die-far-away shape this codebase pays for repeatedly.
+    //
+    // All three poles are asserted over one target and one archive, so none can
+    // pass by accident: a gate that always accepted would fail the third, and
+    // one that always rejected would fail the first two.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const target: BuildTarget = .aarch64_macos;
+    const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch
+        return error.SkipZigTest; // `zig build libbitrt` not run for this target here
+    defer gpa.free(lib);
+
+    // --- accepted: a genuine libSystem import, the case §11.7 exists for ----
+    // Several at once, and the ones the Darwin runtime providers actually use:
+    // a table that admitted only the toy example would break `runtime/**/darwin`.
+    var ok_err: Io.Writer.Allocating = .init(gpa);
+    defer ok_err.deinit();
+    const ok_src =
+        \\extern function getpid(): i32
+        \\extern function mmap(addr: *u8, len: i64, prot: i32, flags: i32, fd: i32, off: i64): *u8
+        \\extern function arc4random_buf(buf: *u8, n: i64)
+        \\extern function pthread_create(t: *u8, attr: *u8, f: *u8, arg: *u8): i32
+        \\function main() {
+        \\  if (getpid() <= 0) { panic("no pid") }
+        \\}
+        \\
+    ;
+    const exe = (try buildExecutable(gpa, "darwinok.bit", ok_src, lib, target, &ok_err.writer)) orelse {
+        std.debug.print("rejected a genuine libSystem import:\n{s}\n", .{ok_err.written()});
+        return error.LegitimateExternRejected;
+    };
+    defer gpa.free(exe);
+    try std.testing.expect(exe.len > 0);
+
+    // --- accepted: defined by the runtime archive --------------------------
+    var rt_err: Io.Writer.Allocating = .init(gpa);
+    defer rt_err.deinit();
+    const rt_src =
+        \\extern function bit_rt_gc_blocking_begin()
+        \\extern function bit_rt_gc_blocking_end()
+        \\function main() {
+        \\  bit_rt_gc_blocking_begin()
+        \\  bit_rt_gc_blocking_end()
+        \\}
+        \\
+    ;
+    const rt_exe = (try buildExecutable(gpa, "darwinrt.bit", rt_src, lib, target, &rt_err.writer)) orelse {
+        std.debug.print("rejected a symbol libbitrt.a defines:\n{s}\n", .{rt_err.written()});
+        return error.LegitimateExternRejected;
+    };
+    defer gpa.free(rt_exe);
+
+    // --- rejected: in NEITHER source. The bug (#1634) --------------------
+    var bad_err: Io.Writer.Allocating = .init(gpa);
+    defer bad_err.deinit();
+    const bad_src = try std.fmt.allocPrint(gpa,
+        \\extern function {s}()
+        \\function main() {{
+        \\  {s}()
+        \\}}
+        \\
+    , .{ absent_symbol, absent_symbol });
+    defer gpa.free(bad_src);
+    try std.testing.expect(try buildExecutable(gpa, "darwinbad.bit", bad_src, lib, target, &bad_err.writer) == null);
+    // Scored on the REASON and on the symbol being NAMED — the ticket's whole
+    // complaint about anonymous failures.
+    try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), "E0078") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), absent_symbol) != null);
+
+    // A near-miss of a real libSystem name is rejected too: the predicate is
+    // membership, never a prefix or a plausible shape.
+    var typo_err: Io.Writer.Allocating = .init(gpa);
+    defer typo_err.deinit();
+    const typo_src =
+        \\extern function getpidd(): i32
+        \\function main() {
+        \\  if (getpidd() <= 0) { panic("no pid") }
+        \\}
+        \\
+    ;
+    try std.testing.expect(try buildExecutable(gpa, "darwintypo.bit", typo_src, lib, target, &typo_err.writer) == null);
+    try std.testing.expect(std.mem.indexOf(u8, typo_err.written(), "getpidd") != null);
 }
 
 test "E0078 does not apply to an object emit (#1645)" {

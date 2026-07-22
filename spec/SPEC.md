@@ -994,30 +994,46 @@ nothing on this path marshals — the value would be handed over raw and misread
 linker must find, so it is used verbatim (with the platform's own decoration —
 Mach-O's leading underscore, so `getpid` links against `_getpid`).
 
-**macOS binds against a dylib; Linux binds against the linked archive.** The
-Mach-O output is a normal dynamically-linked image and its linker already binds
-any still-undefined global as a libSystem import, so an extern needs no new
-linker machinery and any symbol name is admissible there. The ELF output is
-deliberately the opposite: a fully static binary with no interpreter, no dynamic
-symbol table and no libc. There is no load-time resolution at all — but that is
-not the same as *no resolution*. The static link already merges the runtime
-archive (`libbitrt.a`), and a symbol **defined inside that archive** resolves
-exactly like any other cross-module reference, through the same global symbol
-table and the same dead-strip reachability the runtime's own calls use.
+**macOS binds against a dylib as well as the archive; Linux binds against the
+archive alone.** The Mach-O output is a normal dynamically-linked image: its
+linker binds a still-undefined global as a libSystem import, so an extern needs
+no new linker machinery there. The ELF output is deliberately the opposite: a
+fully static binary with no interpreter, no dynamic symbol table and no libc.
+There is no load-time resolution at all — but that is not the same as *no
+resolution*. The static link already merges the runtime archive (`libbitrt.a`),
+and a symbol **defined inside that archive** resolves exactly like any other
+cross-module reference, through the same global symbol table and the same
+dead-strip reachability the runtime's own calls use.
 
-The rule is therefore archive membership, not the platform:
+So the rule is where a symbol may legitimately come from, not the platform:
 
-- Targeting `aarch64-macos`: always accepted.
+- Targeting `aarch64-macos`, symbol **defined in the linked `libbitrt.a`** or
+  **exported by libSystem**: accepted. Those are the image's two sources — the
+  merged archive and the `LC_LOAD_DYLIB` dyld binds at load.
+- Targeting `aarch64-macos`, symbol in **neither**: rejected with **E0078**
+  `extern_unsupported_target`, naming the symbol. Darwin does not fail such a
+  link: it falls through to a libSystem import and the process aborts at dyld
+  load instead, far from the declaration that caused it. The compiler therefore
+  has to decide it, which is the one thing accepting everything cannot do.
 - Targeting a Linux triple, symbol **defined in the linked `libbitrt.a`**:
   accepted. The reference is resolved statically at link time.
 - Targeting a Linux triple, symbol **absent** from that archive: rejected with
-  **E0078** `extern_unsupported_target`, naming the symbol. A fully static ELF
-  has nothing to resolve it against, so this would otherwise fail deep inside
-  the linker.
-- Targeting a Linux triple in a build whose archive **cannot be read**: rejected.
+  **E0078**, naming the symbol. A fully static ELF has nothing to resolve it
+  against, so this would otherwise fail deep inside the linker.
+- In a build whose archive **cannot be read**: rejected on either platform.
   Membership is undecidable there, and an undecided case must fall back to
   rejection — an accept-on-unknown would convert a compile error into a link
   error or a silent crash.
+
+The admitted libSystem surface is a **table the compiler carries** (both
+compilers carry the same one), not a query against the host. It has to be, for
+the same reason the whole predicate is decided here: the answer must be a pure
+function of the target, so that `--target aarch64-macos` decides identically on
+a Linux CI box and on a Mac. macOS itself offers nothing else to consult —
+`/usr/lib/libSystem.B.dylib` has not been a file on disk since macOS 11, only a
+host-architecture dyld shared cache. A genuinely exported name the table lacks
+is a one-line addition to both compilers, and until then it is a compile-time
+diagnostic rather than a crash at launch.
 
 The decision is made where the target and the AST are both in hand, after
 checking and before lowering; the archive path is a pure function of the target,

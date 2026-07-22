@@ -67,11 +67,11 @@ const libsystem_path = "/usr/lib/libSystem.B.dylib";
 /// render the message shape `object.zig`'s `Module.name` was always meant to
 /// serve: "undefined symbol X, referenced from <module>". Zig errors carry no
 /// payload, hence the out-parameter.
-pub const UndefinedRef = struct {
-    symbol: []const u8,
-    /// The `object.Module.name` of the module holding the referencing atom.
-    referenced_from: []const u8,
-};
+///
+/// Defined in `strip.zig` since #1646, so the ELF path reports the same shape
+/// through the same type instead of failing anonymously; re-exported here
+/// because `macho.UndefinedRef` is what the driver has always spelled.
+pub const UndefinedRef = strip.UndefinedRef;
 
 pub const Options = struct {
     /// Code-signing identifier (typically the output filename stem).

@@ -1487,7 +1487,7 @@ test "link: the merged table is bounded by linker-defined markers only" {
     const all = mods.items;
 
     var globals = try strip.resolveGlobals(arena, all);
-    var kept = try strip.deadStrip(arena, all, &globals, &.{ "_start", strip.stackmaps_start_symbol, strip.stackmaps_end_symbol });
+    var kept = try strip.deadStrip(arena, all, &globals, &.{ "_start", strip.stackmaps_start_symbol, strip.stackmaps_end_symbol }, null);
     defer kept.deinit(arena);
     const group = try strip.mergedStackMapAtoms(arena, all, &globals, &kept, marker_module);
 
@@ -1910,7 +1910,7 @@ test "link: a readonly global's bytes reach the executable in a NON-WRITABLE seg
 
         // No archive: the program is self-contained and needs no runtime, which
         // also keeps this independent of whether `zig build libbitrt` has run.
-        const exe = try link.linkExecutable(gpa, target, &.{ .{ .object = obj }, .{ .object = entry } });
+        const exe = try link.linkExecutable(gpa, target, &.{ .{ .object = obj }, .{ .object = entry } }, null);
         defer gpa.free(exe);
 
         // Located by CONTENT, because our linker writes no symbol table into a

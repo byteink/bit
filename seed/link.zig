@@ -102,8 +102,16 @@ fn alignUp(v: u64, a: u64) u64 {
     return std.mem.alignForward(u64, v, a);
 }
 
+pub const UndefinedRef = strip.UndefinedRef;
+
 /// Links `inputs` into a standalone ELF executable, returned as owned bytes.
-pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]u8 {
+///
+/// `undefined_out`, when given, is filled in on `error.UndefinedSymbol` with the
+/// symbol nothing defined and the module that referenced it (#1646). Before it
+/// the ELF driver could only print "UndefinedSymbol" — an error that cannot say
+/// what failed, which is the shape this repo has repeatedly paid for. The
+/// Mach-O writer has reported it this way since #1445; this is the same type.
+pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input, undefined_out: ?*UndefinedRef) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -134,7 +142,7 @@ pub fn linkExecutable(gpa: Allocator, target: Target, inputs: []const Input) ![]
 
     // ---- resolve + dead-strip ---------------------------------------------
     var globals = try strip.resolveGlobals(arena, mods);
-    var kept = try strip.deadStrip(arena, mods, &globals, &.{ entry_symbol, strip.stackmaps_start_symbol, strip.stackmaps_end_symbol });
+    var kept = try strip.deadStrip(arena, mods, &globals, &.{ entry_symbol, strip.stackmaps_start_symbol, strip.stackmaps_end_symbol }, undefined_out);
     defer kept.deinit(arena);
 
     // `-fdata-sections` can emit one variable as several adjacent symbols in a
@@ -654,7 +662,7 @@ test "links a bit_main object with libbitrt into a running zero-libc executable"
     };
     defer gpa.free(lib);
 
-    const exe = try linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = bit_obj }, .{ .archive = lib } });
+    const exe = try linkExecutable(gpa, .x86_64_linux, &.{ .{ .object = bit_obj }, .{ .archive = lib } }, null);
     defer gpa.free(exe);
 
     try testing.expect(exe.len > @sizeOf(elf.Elf64_Ehdr));
@@ -679,10 +687,50 @@ test "links a self-contained _start into a running executable" {
     const obj = try obj_elf.write(gpa, .x86_64, .{ .sections = &sections, .symbols = &symbols });
     defer gpa.free(obj);
 
-    const exe = try linkExecutable(gpa, .x86_64_linux, &.{.{ .object = obj }});
+    const exe = try linkExecutable(gpa, .x86_64_linux, &.{.{ .object = obj }}, null);
     defer gpa.free(exe);
     try testing.expect(exe.len > 0);
 
     if (!can_exec_native) return error.SkipZigTest;
     try testing.expectEqual(@as(u8, 42), try linkAndRun(gpa, "bit-raw", exe));
+}
+
+test "a failed ELF link names the undefined symbol and the module that wants it (#1646)" {
+    // The whole point is the message, not the failure: this link already
+    // refused, but as a bare `error.UndefinedSymbol`, so the driver printed
+    // "bit: link prog.out: UndefinedSymbol" and the user learned nothing.
+    const gpa = testing.allocator;
+    // `_start` calls a name nothing in the link defines.
+    const code = [_]u8{ 0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3 }; // call rel32 ; ret
+    const sections = [_]obj_elf.Section{.{ .kind = .text, .data = &code, .alignment = 16 }};
+    const symbols = [_]obj_elf.Symbol{
+        .{ .name = "_start", .section = .text, .offset = 0, .size = code.len, .binding = .global, .kind = .func },
+        // `section == null`: an external the link must resolve, exactly how a
+        // §11.7 extern call leaves the object.
+        .{ .name = "no_such_runtime_symbol", .section = null, .binding = .global },
+    };
+    const relocs = [_]obj_elf.Relocation{.{ .section = .text, .offset = 1, .kind = .pc32, .symbol = "no_such_runtime_symbol", .addend = -4 }};
+    const obj = try obj_elf.write(gpa, .x86_64, .{ .sections = &sections, .symbols = &symbols, .relocations = &relocs });
+    defer gpa.free(obj);
+
+    var undef: UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    try testing.expectError(error.UndefinedSymbol, linkExecutable(gpa, .x86_64_linux, &.{.{ .object = obj }}, &undef));
+    try testing.expectEqualStrings("no_such_runtime_symbol", undef.symbol);
+    // `bit.o` is the name `linkExecutable` gives the program object; for an
+    // archive member it is the member's own name.
+    try testing.expectEqualStrings("bit.o", undef.referenced_from);
+
+    // A root the link demands and nothing defines reports too, distinguished by
+    // `referenced_from` — no atom referenced it, the container did.
+    const empty_syms = [_]obj_elf.Symbol{.{ .name = "unused", .section = .text, .offset = 0, .size = code.len, .binding = .global, .kind = .func }};
+    const obj2 = try obj_elf.write(gpa, .x86_64, .{ .sections = &sections, .symbols = &empty_syms });
+    defer gpa.free(obj2);
+    var undef2: UndefinedRef = .{ .symbol = "?", .referenced_from = "?" };
+    try testing.expectError(error.UndefinedSymbol, linkExecutable(gpa, .x86_64_linux, &.{.{ .object = obj2 }}, &undef2));
+    try testing.expectEqualStrings(entry_symbol, undef2.symbol);
+    try testing.expectEqualStrings("link roots", undef2.referenced_from);
+
+    // Passing no out-parameter must still fail the same way — the reporting is
+    // an addition to the refusal, never a condition of it.
+    try testing.expectError(error.UndefinedSymbol, linkExecutable(gpa, .x86_64_linux, &.{.{ .object = obj }}, null));
 }
