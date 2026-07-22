@@ -58,16 +58,33 @@ if [ -n "${inprog}" ]; then
 fi
 
 # --- worktrees / branches ---------------------------------------------------
-wt=$(git worktree list 2>/dev/null | tail -n +2)
+# A LOCKED worktree is held by a live agent — git takes that lock for the
+# duration. Blocking on it would jam every turn of a parallel run, and acting on
+# it (`worktree remove --force`) would destroy work in flight. So locked ones are
+# reported, never blocked; only an UNLOCKED leftover is rot.
+wt_live=$(git worktree list 2>/dev/null | tail -n +2 | grep ' locked$')
+wt=$(git worktree list 2>/dev/null | tail -n +2 | grep -v ' locked$')
+if [ -n "${wt_live}" ]; then
+  printf 'WORKTREES HELD BY A LIVE AGENT — confirm each agent is still running:\n%s\n' \
+    "$(printf '%s' "${wt_live}" | sed 's/^/  /')" >&2
+fi
 if [ -n "${wt}" ]; then
   findings="${findings}
-OPEN WORKTREES:
+OPEN WORKTREES (not locked — no agent holds these):
 $(printf '%s' "${wt}" | sed 's/^/  /')
   Close each the moment its work is merged:
     git worktree remove --force <path> && git branch -D <branch>"
 fi
 
+# A branch checked out in a live worktree is not stray either — exclude it here
+# or every locked worktree reports twice, once as itself and once as its branch.
 br=$(git branch --format='%(refname:short)' 2>/dev/null | grep -v '^main$')
+if [ -n "${br}" ] && [ -n "${wt_live}" ]; then
+  live_br=$(printf '%s' "${wt_live}" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+  for b in ${live_br}; do
+    br=$(printf '%s\n' ${br} | grep -vx "${b}")
+  done
+fi
 if [ -n "${br}" ]; then
   merged=""
   unmerged=""
