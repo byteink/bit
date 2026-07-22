@@ -48,16 +48,26 @@
 //!                all-or-nothing, so a missing bind is a permanently dormant
 //!                collector rather than a partial one. Delete the call -> red.
 //!   shim target  the `@naked bit_rt_safepoint` shim must call `stwSafepoint`,
-//!                the GATED entry, not `stwPoll` directly. Point it back at
-//!                `stwPoll` -> red.
-//!   the gate     `stwSafepoint` must consult the sched task-stack probe. The
-//!                gate is what keeps the boot thread out of the one shared
-//!                current-mutator cache; without it the boot thread can become
-//!                the collector, and both the rendezvous and the parked-frame
-//!                walk SKIP the collector's own slot, so the worker's published
-//!                frame — the only precise record of the running task's
-//!                references — is never scanned and its references are swept.
-//!                Delete the gate -> red.
+//!                the pinned live entry, not `stwPoll` directly. Point it back
+//!                at `stwPoll` -> red.
+//!   registration `stwPoll` must reach the mutator registration door
+//!                (`currentMutator`) so that EVERY polling thread is registered
+//!                before it can park or collect. Delete the call -> red.
+//!   NO gate      `stwSafepoint` must NOT consult the sched task-stack probe.
+//!                THIS ENTRY USED TO REQUIRE THE OPPOSITE, and it was pinning a
+//!                bug: the #1639 gate was a workaround for one process-wide
+//!                current-mutator cell, and it suppressed the poll on a worker's
+//!                own OS-thread stack — where `schedWorkerRun`'s `nowFn`/`pollFn`
+//!                function-value cells live. They were swept while live and
+//!                `tests/stress/chanracelinux` faulted 20/20. #1650 keyed the
+//!                registry on a real per-OS-thread token, so the gate has
+//!                nothing left to protect. Re-add the gate -> red.
+//!
+//! The last one is a FORBID edge, and it is the only one here that has to be:
+//! a re-added gate ADDS a call rather than removing one, and its consequence is
+//! silent — the program prints the same answer while the collector reports
+//! `collections=0 abandoned=217`, every rendezvous expiring because a registered
+//! worker can never park. No positive edge can express that.
 //!
 //! Every check names the symbol it expects and fails loudly when it finds
 //! nothing, so a rename that makes a check stop matching is a failure rather
@@ -81,6 +91,19 @@ const Edge = struct {
     from: []const u8,
     to: []const u8,
     why: []const u8,
+
+    /// When set, the edge must NOT exist: `from` must still be present (so the
+    /// check is never vacuous), but must carry no relocation naming `to`.
+    ///
+    /// Added by #1650 for the one property whose violation is SILENT. Every
+    /// other entry here guards against a call going missing, which some run
+    /// eventually notices. Re-adding the #1639 safepoint gate does the
+    /// opposite — it adds a call — and nothing downstream changes: the program
+    /// prints the same answer while `BIT_GC_STATS=1` reports `collections=0
+    /// abandoned=217`, because a registered worker that can never park makes
+    /// every rendezvous expire. A positive edge cannot express "this call must
+    /// not come back", and that is exactly what has to be pinned.
+    forbid: bool = false,
 
     /// Mach-O carries the C leading underscore verbatim and ELF does not;
     /// `macho_reader` passes names through unchanged. Normalising here is what
@@ -128,18 +151,53 @@ const edges = [_]Edge{
         .target = .aarch64_macos,
         .from = "bit_rt_root_safepoint",
         .to = "bit_rt_port_stw_safepoint",
-        .why = "the naked shim must enter through the GATED poll, not stwPoll directly",
+        .why = "the naked shim must enter through the pinned live entry, not stwPoll directly",
     },
+    // THIS EDGE REPLACES THE #1639 GATE ASSERTION, WHICH WAS PINNING A BUG.
+    //
+    // It used to require `bit_rt_port_stw_safepoint` -> `bit_rt_port_sched_task_on_stack`,
+    // i.e. that the safepoint gate on "am I on a green-thread stack". That gate
+    // was a workaround for `gcworld.bit` keeping ONE process-wide current-mutator
+    // cell, and #1650 measured what it cost: `schedCurrentTask()` is 0 on a
+    // worker's OWN OS-thread stack, so a worker's run loop never polled, and
+    // `schedWorkerRun`'s `nowFn`/`pollFn` function-value cells — which live in
+    // exactly those frames — were swept while live. `tests/stress/chanracelinux`
+    // faulted 20 runs out of 20 against a Bit-built `libbitrt.a`.
+    //
+    // The registry is keyed on a real per-OS-thread token now (`gcthread.bit`),
+    // so the gate is gone. What must be pinned instead is the property the gate
+    // was standing in front of: EVERY thread that polls must go through
+    // registration first. Re-adding the gate breaks this edge, and it must
+    // break, because the failure a re-added gate produces is silent — the
+    // program still prints the right answer while `BIT_GC_STATS=1` reports
+    // `collections=0 abandoned=217`. A registered worker that never parks makes
+    // every rendezvous expire, so the collector stops collecting altogether and
+    // no test output changes. Measured, not predicted.
     .{
         .path = "runtime/stw",
         .target = .aarch64_macos,
         .from = "bit_rt_port_stw_safepoint",
-        // `schedCurrentTask` inlines (it reads `sp` and forwards), so the edge
-        // that survives into the object is to the probe it forwards to.
         .to = "bit_rt_port_sched_task_on_stack",
-        .why = "stwSafepoint must gate on 'am I on a green-thread stack', or the boot " ++
-            "thread shares the one current-mutator slot with the worker and can " ++
-            "collect while skipping the worker's published frame",
+        .forbid = true,
+        .why = "stwSafepoint must NOT gate on 'am I on a green-thread stack' — that " ++
+            "gate suppresses the poll on a worker's own OS-thread stack, where " ++
+            "schedWorkerRun's nowFn/pollFn function-value cells live, and they are " ++
+            "then swept while live (#1650)",
+    },
+    // The positive half of the same property, on `stwPoll` because that is the
+    // atom that carries it: `stwSafepoint` is a pure forward and `stwPoll` is
+    // separately pinned, so the registration edge survives there and not in the
+    // caller. Deleting `worldEnsureSelf` from the poll reddens this.
+    .{
+        .path = "runtime/stw",
+        .target = .aarch64_macos,
+        .from = "bit_rt_port_stw_poll",
+        // `worldEnsureSelf` inlines into the poll, so the edge that survives
+        // into the object names the registration door it forwards to.
+        .to = "bit_rt_port_gc_current_mutator",
+        .why = "the poll must reach the mutator registration door on EVERY thread " ++
+            "that polls, or a thread is invisible to both the rendezvous and the " ++
+            "root scan and its live references are swept (#1650)",
     },
 };
 
@@ -239,12 +297,22 @@ fn checkEdge(gpa: std.mem.Allocator, e: Edge, module: anytype) !void {
                 .global => |g| g,
                 .local => continue,
             };
-            if (std.mem.eql(u8, target, want_to)) return;
+            if (std.mem.eql(u8, target, want_to)) {
+                if (!e.forbid) return;
+                std.debug.print(
+                    \\stwwiring: {s}: '{s}' MUST NOT reference '{s}', and does.
+                    \\  {s}.
+                    \\
+                , .{ e.path, want_from, want_to, e.why });
+                return error.StwWiringForbidden;
+            }
         }
     }
 
     // A missing DEFINITION and a missing EDGE are different repairs, so they are
     // reported differently rather than as one "not found".
+    if (from_seen and e.forbid) return;
+
     if (!from_seen) {
         std.debug.print(
             "stwwiring: {s}: no definition named '{s}'. The gate examined nothing " ++

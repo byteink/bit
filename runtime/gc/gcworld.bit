@@ -85,32 +85,65 @@ import { spinCellAt, spinTryAcquire } from "../"
 // Layout — the caller-owned `World` block, field for field with gc.zig's struct
 // ---------------------------------------------------------------------------
 
-// One `Mutator` occupies three consecutive words. Zig's `Mutator` is
+// One `Mutator` occupies four consecutive words. Zig's `Mutator` is
 // `{state: u32, frame: usize, acked: u64}`; all three are represented as i64
 // words here (the state's 0..3 enum and the epoch/frame values all fit, and a
 // uniform width lets one `*i64` atomic address every field). The registry is
 // runtime-internal — it appears nowhere in ABI.md — so the widths are free to
 // differ, the same licence `spinlock.bit` took to widen a 1-byte lock to i32.
+//
+// THE FOURTH WORD HAS NO ZIG COUNTERPART and is #1650. Zig finds a thread's
+// `*Mutator` through `threadlocal var g_mutator`, so its slots need not say who
+// owns them; this port has no threadlocal (§11.11 refuses one for Mach-O) and
+// must therefore find a thread's slot BY SEARCH, keyed on `../gc/gcthread.bit`'s
+// per-OS-thread token. Storing the key in the slot is what makes that search
+// exact, and an exact search is the whole fix: the previous stand-in was one
+// process-wide `curMut`, which handed the second Bit thread the first thread's
+// slot and left it invisible to both the rendezvous and the root scan.
 const muState = 0     // MutatorState (atomic)
 const muFrame = 1     // published safepoint-snapshot address while parked, else 0
 const muAcked = 2     // the stop epoch this slot last parked FOR
-const muWords = 3
+const muOwner = 3     // `gcThreadToken()` of the owning OS thread, 0 when free
+const muWords = 4
 
 // Hard cap on concurrently registered mutator OS threads, from gc.zig's
 // `max_mutators`. Fixed at startup (Power-of-10 rule 2): no allocation on the
 // safepoint path and every walk over the registry is statically bounded.
 export const maxMutators = 256
 
-// The three trailing words, past the slot array.
-const worldStopWord = maxMutators * muWords          // 768: atomic bool, 0/1
-const worldEpochWord = maxMutators * muWords + 1     // 769: atomic stop counter
-const worldLockWord = maxMutators * muWords + 2      // 770: i32 serialization lock
+// The trailing words, past the slot array.
+const worldStopWord = maxMutators * muWords          // 1024: atomic bool, 0/1
+const worldEpochWord = maxMutators * muWords + 1     // 1025: atomic stop counter
+const worldLockWord = maxMutators * muWords + 2      // 1026: i32 serialization lock
 // Deviation 5's counter: times `worldResumeWhenClear` gave up on a stop that
 // never cleared. Zig has no such field (it `@panic`s); it is a leaf stat here.
-const worldStatResumeGiveUp = maxMutators * muWords + 3   // 771
+const worldStatResumeGiveUp = maxMutators * muWords + 3   // 1027
+
+// One past the highest slot index ever claimed — a monotonic high-water mark,
+// and a PURE THROUGHPUT device with no correctness content.
+//
+// `worldFindOwner` runs at every safepoint poll, i.e. at every loop back edge in
+// every compiled function, and a full `maxMutators` sweep there would put 256
+// atomic loads on the hottest path in the runtime. Bounding the search by the
+// high-water mark makes it 2-4 loads in a real process, because slots are
+// claimed lowest-free-first and a process has as many mutators as it has OS
+// threads.
+//
+// It may only ever be too LARGE, never too small: too large costs a few wasted
+// loads over free slots, too small would hide a live thread's own slot from it
+// and hand that thread a second one — the two-slots-one-thread wedge. That is
+// why the bump below is a bounded compare-and-exchange loop rather than the
+// load-max-store it reads as: two threads claiming slots 0 and 1 concurrently
+// can otherwise interleave so that the 2 is written first and then clobbered by
+// the 1, which loses slot 1 permanently.
+//
+// Nothing else reads it. `worldRendezvous` and the parked-frame walk sweep the
+// FULL registry deliberately (see `worldRendezvous`'s re-scan note), so a stale
+// or lagging high-water mark can never shrink a collection's root set.
+const worldHighWater = maxMutators * muWords + 4          // 1028
 
 // Words the caller must provide for the World block.
-export const worldWords = maxMutators * muWords + 4        // 772
+export const worldWords = maxMutators * muWords + 5        // 1029
 
 // MutatorState (gc.zig's enum). `free == 0` is the zero value, so a World block
 // carved from zeroed memory starts every slot free with no init step — matching
@@ -156,16 +189,45 @@ const worldResumeOuterBound = 1073741824
 // Registration — `World.claim` / `World.release`
 // ---------------------------------------------------------------------------
 
-// Claim a slot for the calling thread, or -1 if all `maxMutators` are taken.
-// Starts the slot `running`: a thread is assumed to be executing Bit code from
-// the moment it registers, the conservative direction (a spurious `running`
-// costs an abandoned collection; a spurious `stopped` corrupts the heap).
-export @nosplit @symbol("bit_rt_port_gc_world_claim") function worldClaim(world: *i64): int {
+// Raise the high-water mark to at least `n`. Bounded compare-and-exchange loop;
+// see `worldHighWater` for why a plain load-max-store is not sufficient.
+@nosplit function worldRaiseHighWater(world: *i64, n: int) {
+  let p = world + worldHighWater
+  let i = 0
+  // Bounded: each failed exchange means another thread raised it, and it is
+  // monotonic and capped at `maxMutators`, so this cannot spin indefinitely.
+  while (i < maxMutators) {
+    let cur = atomicLoad(p)
+    if (cur >= n) {
+      return
+    }
+    if (atomicCmpxchg(p, cur, n)) {
+      return
+    }
+    i = i + 1
+  }
+}
+
+// Claim a slot for the OS thread identified by `token`, or -1 if all
+// `maxMutators` are taken. Starts the slot `running`: a thread is assumed to be
+// executing Bit code from the moment it registers, the conservative direction (a
+// spurious `running` costs an abandoned collection; a spurious `stopped`
+// corrupts the heap).
+//
+// THE OWNER IS PUBLISHED AFTER THE STATE, AND THAT ORDER IS LOAD-BEARING. The
+// compare-and-exchange is what takes the slot; until it succeeds no other thread
+// may write the slot's owner. Between the exchange and the owner store the slot
+// reads `{running, owner 0}`, and `worldFindOwner` matches on the OWNER alone —
+// so another thread searching for its own (never-zero) token cannot match this
+// half-built slot. The mirror-image rule is in `worldRelease`.
+export @nosplit @symbol("bit_rt_port_gc_world_claim_for") function worldClaimFor(world: *i64, token: int): int {
   let i = 0
   // Bounded: exactly `maxMutators` probes.
   while (i < maxMutators) {
     let m = wMut(world, i)
     if (atomicCmpxchg(m, mFree, mRunning)) {
+      atomicStore(m + muOwner, token)
+      worldRaiseHighWater(world, i + 1)
       return i
     }
     i = i + 1
@@ -173,10 +235,59 @@ export @nosplit @symbol("bit_rt_port_gc_world_claim") function worldClaim(world:
   return -1
 }
 
-// Release a slot. The thread must not touch Bit objects afterwards. Clears the
-// published frame first so no stale snapshot can be scanned, then frees.
+// `worldClaimFor` with no owner — an ANONYMOUS slot, findable by nobody.
+//
+// Kept because it is the pinned shape `tests/stress/gcworld` drives the state
+// machine through, which registers no real threads and asks only that claim,
+// park, rendezvous and release compose. Registration by the collector's own
+// doors goes through `worldClaimFor`; a 0 owner can never match a lookup,
+// because `gcThreadToken()` returning 0 means "no token" and is refused before
+// any search is made.
+export @nosplit @symbol("bit_rt_port_gc_world_claim") function worldClaim(world: *i64): int {
+  return worldClaimFor(world, 0)
+}
+
+// The slot owned by `token`, or -1 if that thread holds none.
+//
+// Matches on the owner word ALONE, never on the state: a slot can be `running`,
+// `parked` or `blocked` and still be this thread's, and reading two words would
+// need them to be consistent with each other, which claim and release
+// deliberately arrange NOT to require (see their ordering notes).
+//
+// Bounded by the high-water mark, which is why that word exists — this runs at
+// every safepoint poll.
+//
+// Exported so `tests/stress/gcworld` can drive the LOOKUP and not just its
+// effects. That matters more here than for any other accessor in this file: the
+// defect this replaces (#1650) was a lookup that returned another thread's slot,
+// and its only symptom was a swept live object faulting somewhere else entirely
+// — no assertion anywhere in the suite could see it. A test that asks "which
+// slot does token B resolve to" can.
+export @nosplit @symbol("bit_rt_port_gc_world_owner_slot") function worldFindOwner(world: *i64, token: int): int {
+  let hw = atomicLoad(world + worldHighWater)
+  let i = 0
+  // Bounded twice over: by the high-water mark, and by `maxMutators` regardless.
+  while (i < hw && i < maxMutators) {
+    if (atomicLoad(wMut(world, i) + muOwner) == token) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Release a slot. The thread must not touch Bit objects afterwards.
+//
+// THE OWNER IS CLEARED FIRST, and that order is the mirror of `worldClaimFor`'s.
+// Freeing the state first would leave a window in which another thread could
+// claim this slot and start using it while it still carries the DEPARTED
+// thread's token — and a third thread searching for that token would then be
+// handed a slot it does not own. Clearing the owner first makes the slot
+// unfindable before it becomes claimable. The published frame goes next, so no
+// stale snapshot can be scanned, and the state last.
 export @nosplit @symbol("bit_rt_port_gc_world_release") function worldRelease(world: *i64, slot: int) {
   let m = wMut(world, slot)
+  atomicStore(m + muOwner, 0)
   atomicStore(m + muFrame, 0)
   atomicStore(m, mFree)
 }
@@ -452,6 +563,25 @@ export @nosplit @symbol("bit_rt_port_gc_world_slot_state") function worldSlotSta
   return atomicLoad(wMut(world, slot))
 }
 
+// The per-OS-thread token that owns slot `slot`, or 0 if it is unowned (#1650).
+//
+// A pure observer, exported for the same reason `worldSlotState` is: it is the
+// only way a test can assert that two OS threads took TWO DISTINCT SLOTS rather
+// than merely that the program stopped crashing. The defect this word exists to
+// fix was invisible to the whole suite precisely because its symptom — a swept
+// live object — is a fault somewhere else entirely, so the registry has to be
+// observable directly. `tests/stress/gcworld` drives exactly that.
+export @nosplit @symbol("bit_rt_port_gc_world_slot_owner") function worldSlotOwner(world: *i64, slot: int): int {
+  return atomicLoad(wMut(world, slot) + muOwner)
+}
+
+// How many slots the registry has ever handed out (`worldHighWater`). With one
+// thread per slot and slots claimed lowest-free-first, this is the number of OS
+// threads that have registered — the count a test asserts is 2 and not 1.
+export @nosplit @symbol("bit_rt_port_gc_world_high_water") function worldHighWaterMark(world: *i64): int {
+  return atomicLoad(world + worldHighWater)
+}
+
 // ---------------------------------------------------------------------------
 // The four ABI symbols (ABI.md §5/§6) — `bit_rt_gc_thread_enter/thread_exit/
 // blocking_begin/blocking_end`
@@ -477,22 +607,23 @@ export @nosplit @symbol("bit_rt_port_gc_world_slot_state") function worldSlotSta
 //     pointer. Until `worldBind` runs, `worldAddr == 0` and every wrapper is a
 //     safe no-op.
 //
-//   - `g_mutator` is MODULE STATE, not a threadlocal: `@threadlocal` is refused
+//   - `g_mutator` IS NOT CACHED AT ALL — it is LOOKED UP, keyed on
+//     `./gcthread.bit`'s per-OS-thread token (#1650). `@threadlocal` is refused
 //     for Mach-O (§11.11), the same wall `root.bit`'s `iface_as_ok` and
-//     `net/netabi.bit`'s UDP sender hit. It is sound under the ABI's single-worker
-//     contract — ABI.md §5 pins nthreads to 1 for v1, and `root.bit`'s
-//     `rtGcAlloc` note names exactly this: "there is exactly one allocating
-//     thread, so nothing is lost TODAY". When #1400 links this registry and the
-//     scheduler goes genuinely M:N, the cache must move to per-worker storage
-//     (the mechanism #1364 establishes for `currentTask`); flagged here rather
-//     than hidden, tracked on #1433.
+//     `net/netabi.bit`'s UDP sender hit, so there is nowhere per-thread to cache
+//     it. THE PREVIOUS STAND-IN WAS A MODULE-LEVEL `let curMut`, i.e. ONE cell
+//     for the whole process, justified by "ABI.md §5 pins nthreads to 1 for v1".
+//     `tests/stress/chanracelinux` is the first program with two Bit threads and
+//     it faulted 20 runs out of 20: the second thread read the first's slot,
+//     returned early from registration, and was then invisible to BOTH the
+//     rendezvous (so it mutated straight through the mark) and the root scan (so
+//     it published no frame) — its function-value cells were swept while live.
+//     A search keyed on the thread pointer costs a few atomic loads bounded by
+//     `worldHighWater` and is exact, which no amount of caching in shared state
+//     can be.
 
 // Address of the caller-owned World block, or 0 before `worldBind`.
 let worldAddr: i64 = 0
-
-// This thread's mutator slot, +1 so the 0 default means "not registered"
-// (slot 0 is a real slot). The `g_mutator` stand-in.
-let curMut: i64 = 0
 
 // Bind the process-wide World block. Called once at boot by `runtime/root`,
 // after it has `ptrOf`'d its own `g_world` array (which this `@nosplit` module
@@ -502,45 +633,68 @@ export @nosplit @symbol("bit_rt_port_gc_world_bind") function worldBind(addr: in
   worldAddr = addr
 }
 
-// Register the calling thread as a mutator if it is not already, mirroring
-// `root.zig`'s `currentMutator`: claim a slot, cache it, and — if a stop is
-// already pending — park immediately so a thread joining mid-collection does not
-// run behind the mark. `frame` is the safepoint snapshot address (0 from the
-// thread_enter/blocking_begin doors, which publish no snapshot).
-@nosplit function ensureMutator(frame: int) {
-  if (curMut != 0) {
-    return
-  }
+// This thread's slot BIASED BY ONE (0 = none), registering it first if it holds
+// none — `root.zig`'s `currentMutator` exactly: find or claim a slot, and if a
+// stop is already pending, park immediately so a thread joining mid-collection
+// does not run behind the mark. `frame` is the safepoint snapshot address (0
+// from the thread_enter/blocking_begin/allocation doors, which publish no
+// snapshot).
+//
+// THE ORDER OF THE TWO REFUSALS MATTERS ON x86-64. `worldAddr == 0` is tested
+// BEFORE the token is read, because the x64 token is a load through `%fs:0` and
+// a thread whose FS base has not been installed yet would fault on it rather
+// than read 0. `worldBind` runs after `../../root/linux/boot.bit`'s
+// `initLinuxTls`, so a bound World implies an installed thread pointer; testing
+// in the other order would make every pre-boot safepoint a segfault.
+// PINNED, though nothing outside this module calls it by name. `worldEnsureSelf`
+// below forwards to it and `runtime/stw` inlines THAT, which drags a reference to
+// this body into a separately-emitted object; `--freestanding` refuses a mangled
+// `m2$currentMutator` outright (SPEC §11.9, ABI.md §9) — measured, not guessed.
+// The predecessor was small enough to be inlined away entirely; #1650 gave this
+// one a search loop, so it stays a real call and needs a real name.
+export @nosplit @symbol("bit_rt_port_gc_current_mutator") function currentMutator(frame: int): int {
   if (worldAddr == 0) {
-    return
+    return 0
+  }
+  let token = gcThreadToken()
+  if (token == 0) {
+    // No thread pointer installed: this thread cannot be told from any other, so
+    // it gets no slot. Not registering is the safe direction — an unregistered
+    // thread is never counted as stopped, so no collection proceeds believing it
+    // has parked.
+    return 0
   }
   let world = wordAt(worldAddr)
-  let slot = worldClaim(world)
-  if (slot < 0) {
-    return
+  let found = worldFindOwner(world, token)
+  if (found >= 0) {
+    return found + 1
   }
-  curMut = slot + 1
+  let slot = worldClaimFor(world, token)
+  if (slot < 0) {
+    return 0
+  }
   if (worldStopRequested(world)) {
     worldPark(world, slot, frame)
   }
+  return slot + 1
 }
 
 // ---------------------------------------------------------------------------
 // The two doors the SAFEPOINT POLL needs, and why they are exported (#1633)
 // ---------------------------------------------------------------------------
 //
-// `worldAddr` and `curMut` are this module's `g_world`/`g_mutator` stand-ins and
-// stay private: nothing outside may set them, or two callers would disagree
-// about which slot this thread holds. What the poll needs is the two READS, and
-// `ensureMutator`'s claim-and-park-on-entry, so exactly those are published.
+// `worldAddr` is this module's `g_world` stand-in and stays private: nothing
+// outside may set it, or two callers would disagree about which registry this
+// process has. What the poll needs is that READ, and `currentMutator`'s
+// find-or-claim-and-park-on-entry, so exactly those are published.
 //
 // This is what lets the collector half (`runtime/stw`) live in a module that can
 // also see `runtime/chan` and `runtime/sched`, whose roots a collection must
 // enumerate. `runtime/gc` cannot import either (`chan` imports `../gc`, so the
-// reverse edge is an import cycle, E0044), and the current-mutator cache cannot
-// be duplicated there — a thread holding two slots is a thread the rendezvous
-// waits for forever. Publishing the two accessors keeps ONE cache with ONE
-// owner and moves only the composition.
+// reverse edge is an import cycle, E0044), and the registration path must not be
+// duplicated there — a thread holding two slots is a thread the rendezvous waits
+// for forever. Publishing the two accessors keeps ONE registry with ONE owner
+// and moves only the composition.
 
 // The bound World block address, or 0 before `worldBind` — the value the poll
 // tests before touching the registry at all (pre-boot there is no registry).
@@ -551,17 +705,14 @@ export @nosplit @symbol("bit_rt_port_gc_world_addr") function worldBlockAddr(): 
 
 // Register this thread if it has not registered (parking immediately if a stop
 // is already pending, so a thread joining mid-collection cannot run behind the
-// mark) and return its slot BIASED BY ONE — 0 means "no slot", exactly as
-// `curMut` encodes it, and `root.zig`'s `currentMutator` returns `?*Mutator` for
-// the same distinction.
+// mark) and return its slot BIASED BY ONE — 0 means "no slot", and `root.zig`'s
+// `currentMutator` returns `?*Mutator` for the same distinction.
 //
 // `frame` is the caller's `SafepointFrame` address, published on park. The
-// safepoint door passes its real frame; the thread_enter/blocking doors pass 0
-// (they hold no stack map).
+// safepoint door passes its real frame; the thread_enter/blocking/allocation
+// doors pass 0 (they hold no stack map).
 export @nosplit @symbol("bit_rt_port_gc_world_ensure_self") function worldEnsureSelf(frame: int): int {
-  ensureMutator(frame)
-  let m = curMut
-  return m
+  return currentMutator(frame)
 }
 
 // `bit_rt_gc_thread_enter` (ABI.md §5/§6): register this OS thread as a mutator.
@@ -569,22 +720,30 @@ export @nosplit @symbol("bit_rt_port_gc_world_ensure_self") function worldEnsure
 // allocation's path, but soundness does not depend on it being called (the
 // allocation and safepoint doors register lazily too).
 export @nosplit @symbol("bit_rt_root_gc_thread_enter") function gcThreadEnter() {
-  ensureMutator(0)
+  let mu = currentMutator(0)
 }
 
 // `bit_rt_gc_thread_exit` (ABI.md §5/§6): release this thread's slot. NOT
 // optional — a leaked slot stays `running` forever, which corrupts nothing but
 // makes every later rendezvous expire, i.e. collection quietly stops.
+//
+// Looks the slot up rather than registering: a thread that never registered has
+// nothing to release, and CLAIMING one here just to free it would be a pure
+// waste (and, under a pending stop, would park a thread that is on its way out).
 export @nosplit @symbol("bit_rt_root_gc_thread_exit") function gcThreadExit() {
-  if (curMut == 0) {
-    return
-  }
   if (worldAddr == 0) {
     return
   }
+  let token = gcThreadToken()
+  if (token == 0) {
+    return
+  }
   let world = wordAt(worldAddr)
-  worldRelease(world, curMut - 1)
-  curMut = 0
+  let slot = worldFindOwner(world, token)
+  if (slot < 0) {
+    return
+  }
+  worldRelease(world, slot)
 }
 
 // `bit_rt_gc_blocking_begin` (ABI.md §5/§6). PRECONDITION: the calling thread
@@ -592,23 +751,28 @@ export @nosplit @symbol("bit_rt_root_gc_thread_exit") function gcThreadExit() {
 // Registers first (a thread may block before ever allocating), then hands its
 // slot to the collector's "pass without waiting" contract.
 export @nosplit @symbol("bit_rt_root_gc_blocking_begin") function gcBlockingBegin() {
-  ensureMutator(0)
-  if (curMut == 0) {
+  let mu = currentMutator(0)
+  if (mu == 0) {
     return
   }
   let world = wordAt(worldAddr)
-  worldBeginBlocking(world, curMut - 1)
+  worldBeginBlocking(world, mu - 1)
 }
 
 // `bit_rt_gc_blocking_end` (ABI.md §5/§6). Blocks while a stop is pending rather
 // than resuming behind the collector's back (`worldEndBlocking`).
 export @nosplit @symbol("bit_rt_root_gc_blocking_end") function gcBlockingEnd() {
-  if (curMut == 0) {
-    return
-  }
   if (worldAddr == 0) {
     return
   }
+  let token = gcThreadToken()
+  if (token == 0) {
+    return
+  }
   let world = wordAt(worldAddr)
-  worldEndBlocking(world, curMut - 1)
+  let slot = worldFindOwner(world, token)
+  if (slot < 0) {
+    return
+  }
+  worldEndBlocking(world, slot)
 }

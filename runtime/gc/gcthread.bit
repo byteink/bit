@@ -1,0 +1,97 @@
+// The per-OS-thread identity token (#1650) — `root.zig`'s `threadlocal var
+// g_mutator` expressed as a KEY rather than as storage.
+//
+// `gcworld.bit` needs to answer one question at every door into the collector:
+// WHICH OS THREAD IS ASKING. Zig answers it with a `threadlocal`, which this
+// port cannot have — `@threadlocal` (§11.11) is implemented on ELF but refused
+// at emission for Mach-O, and `sched.bit` documents the same wall. The port's
+// stand-in was a module-level `let curMut`, i.e. ONE process-wide cell, and that
+// is #1650: the second Bit thread read the first thread's slot, concluded it was
+// already registered, and was then invisible to both the rendezvous and the root
+// scan. It mutated straight through the mark and its function-value cells were
+// swept out from under it.
+//
+// A threadlocal is not needed to key a registry — only a per-thread VALUE that
+// two different threads can never share. That is exactly what a thread pointer
+// is, and it has three properties nothing stack-derived has:
+//
+//   1. IT IS EXACT. A stack-derived token (an `sp` granule, a landmark plus a
+//      fudge distance, a worker-block range) is an approximation of "which
+//      region is this `sp` in", and an approximation that shifts hands ONE
+//      thread TWO slots. A thread holding two slots is a thread the rendezvous
+//      waits for forever; that was measured as a hang, not deduced.
+//   2. IT IS THE SAME ON EITHER STACK. A green task runs on a 64KiB task stack
+//      and a worker's own loop runs on its 16MiB OS-thread stack; the safepoint
+//      must resolve BOTH to one slot. A register does not care which stack is
+//      live, so the two cases need no reconciliation at all.
+//   3. IT NEEDS NO COOPERATION. No registration, no bind, no scheduler seam, no
+//      ordering against thread creation. It is readable from the first
+//      instruction a thread executes.
+//
+// ---------------------------------------------------------------------------
+// WHY ONE `asm` BLOCK COVERS BOTH OPERATING SYSTEMS, WITH NO PLATFORM SEAM
+// ---------------------------------------------------------------------------
+//
+// `sched.bit` writes the seam off ("reading the thread pointer out of
+// TPIDRRO_EL0 needs a platform seam too — Linux and Darwin use different system
+// registers on the same architecture"). The register split is real; the SEAM is
+// not, because on each operating system the other register is not a thread
+// pointer at all and says so at run time. MEASURED on hardware, three pthreads
+// each, not read off the ARM ARM:
+//
+//   aarch64-macos   TPIDRRO_EL0 = 1f1c9de60 / 16aeb70e0 / 16af430e0  per-thread
+//                   TPIDR_EL0   = 2 / 1 / 2                          THE CPU ID
+//   aarch64-linux   TPIDRRO_EL0 = 0 / 0 / 0                          unused
+//                   TPIDR_EL0   = 420710 / ffff849c4fe8 / ffff849a1fe8  per-thread
+//
+// TPIDR_EL0 being a small NONZERO integer on Darwin is the trap in that table:
+// it is why the probe order is TPIDRRO_EL0 first and TPIDR_EL0 second, and why
+// the reverse order — the one that reads more natural, since TPIDR_EL0 is the
+// architectural TLS register — silently hands every thread on a 2-core Mac one
+// of two tokens. Linux zeroes TPIDRRO_EL0 for 64-bit tasks, so the first probe
+// falls through there and the second answers.
+//
+// x86-64 has no such split: `fs:0` is the variant-II ABI TCB's self-referential
+// word, which ./`../thread/linux/tls.bit`'s `tlsPrepare` writes itself
+// (`storeWord(tp, tp)`) and which Zig's static TLS writes identically, so the
+// same load is the thread pointer under either runtime.
+//
+// `asm` — as opposed to `syscall`, `extern`, or a call through a function value
+// — is legal in a `@nosplit` body; `sched.bit`'s `readSp` is the precedent, and
+// every function that can reach the collector must be `@nosplit` (see
+// `gcworld.bit`'s header). This file sorts between `gcmark` and `gcworld` in
+// bytewise filename order (#1511), so the token is lowered before its only
+// callers, and it references nothing — no helper, no module state, no import.
+
+// This OS thread's identity, or 0 if no thread pointer is installed yet.
+//
+// The AArch64 payload, assembled with `clang -target aarch64-linux-gnu` and
+// disassembled to confirm each word rather than hand-derived:
+//
+//   d53bd060   mrs  x0, tpidrro_el0    Darwin: the thread pointer. Linux: 0.
+//   b5000040   cbnz x0, +8             non-zero -> that IS the answer
+//   d53bd040   mrs  x0, tpidr_el0      Linux: the thread pointer.
+//   927df000   and  x0, x0, #~7        Darwin packs a cpu id in the low bits
+//
+// The mask is harmless on Linux, where a thread pointer is at least 16-byte
+// aligned by the TLS ABI, and load-bearing on Darwin, where TPIDRRO_EL0's low
+// three bits carry the CPU number and would make one thread's token change
+// under it every time the scheduler moved it between cores.
+//
+// x86-64:
+//
+//   64 48 8B 04 25 00 00 00 00   movq %fs:0, %rax
+//
+// ZERO IS A REAL ANSWER AND MUST STAY ONE. A thread that has not had its thread
+// pointer installed — pre-boot, before `../thread/linux/tls.bit` runs — reads 0
+// here, and every caller treats 0 as "no token, do not register". That is the
+// same do-nothing this module's callers already do before `worldBind`, and it
+// is the safe direction: an unregistered thread is not counted by the
+// rendezvous, so no collection can proceed believing it has stopped.
+export @nosplit @symbol("bit_rt_port_gc_thread_token") function gcThreadToken(): int {
+  return asm {
+    arm64 { 0xD53BD060, 0xB5000040, 0xD53BD040, 0x927DF000 }
+    x64   { 0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00 }
+    result arm64 x0 x64 rax : int
+  }
+}
