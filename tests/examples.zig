@@ -10,10 +10,17 @@
 //! Skipped when the host is not a supported runtime target (no libbitrt to link
 //! against — build.zig leaves `libbitrt_path` empty then), mirroring the golden
 //! `// run` cases.
+//!
+//! Every spawned example binary carries the shared per-subprocess deadline from
+//! `tests/proc.zig` (#1652): an example that hangs is a RED CASE naming itself,
+//! not a suite that stalls with no verdict. Only one process is spawned here —
+//! the compile is in-process (`bit.buildHostProject`), so a looping compiler is
+//! bounded by the build runner, not by this deadline.
 
 const std = @import("std");
 const bit = @import("bit");
 const build_options = @import("build_options");
+const proc = @import("proc.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -44,6 +51,11 @@ test "examples compile and run" {
     };
     defer gpa.free(libbitrt);
 
+    // Read once for the whole suite: the limit is a property of the host, not of
+    // a case, and re-reading the environment per case would let two cases
+    // disagree about it.
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     // Each example is its own module: a subdirectory of examples/ holding one
     // `.bit` file (SPEC §17.1 — a module is a directory, and §17.4 — the root
     // module declares exactly one `main`). A flat folder of standalone programs
@@ -62,12 +74,19 @@ test "examples compile and run" {
         const dir_abs = try std.fs.path.join(gpa, &.{ build_options.examples_dir, sub });
         defer gpa.free(dir_abs);
 
-        try runExample(gpa, io, sub, dir_abs, libbitrt);
+        try runExample(gpa, io, sub, dir_abs, libbitrt, timeout_s);
     }
     try testing.expect(scanned < max_examples); // folder stayed within bound
 }
 
-fn runExample(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const u8, libbitrt: []const u8) !void {
+fn runExample(
+    gpa: std.mem.Allocator,
+    io: Io,
+    name: []const u8,
+    dir_abs: []const u8,
+    libbitrt: []const u8,
+    timeout_s: u32,
+) !void {
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
     const exe = (try bit.buildHostProject(gpa, io, dir_abs, build_options.stdlib_dir, name, libbitrt, &discard.writer)) orelse {
@@ -93,9 +112,26 @@ fn runExample(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const
     });
     defer Dir.cwd().deleteFile(run_io, bin_path) catch {};
 
-    const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path} });
+    // Three outcomes kept apart, as in the golden harness: the DEADLINE expiring
+    // is the machine intervening (a hang), a SIGNAL the program raised on itself
+    // is a crash and a result, and anything else is an ordinary exit code.
+    const outcome = try proc.run(gpa, run_io, timeout_s, .{ .argv = &.{bin_path} });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("example '{s}': TIMED OUT\n", .{name});
+            proc.timedOutNote(limit, bin_path);
+            return error.ExampleRunTimedOut;
+        },
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+    if (result.term == .signal) {
+        std.debug.print("example '{s}': CRASHED\n", .{name});
+        proc.crashNote(result.term.signal);
+        std.debug.print("stderr: {s}\n", .{result.stderr});
+        return error.ExampleRunCrashed;
+    }
     const code: u8 = switch (result.term) {
         .exited => |c| c,
         else => 255,

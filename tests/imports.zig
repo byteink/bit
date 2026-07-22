@@ -16,10 +16,18 @@
 //!
 //! Skipped when the host is not a supported runtime target (no libbitrt), like
 //! the golden `// run` cases and the other guards.
+//!
+//! Both processes each case spawns — the self-hosted compiler's `bit build` and
+//! each built binary — carry the shared deadline from `tests/proc.zig` (#1652).
+//! This corpus is where this repo's real indefinite stalls came from (#1475's
+//! `quicconn` teardown), and with 90+ projects on a worker pool a single hang
+//! takes the whole suite down with no line naming the culprit. The seed's own
+//! compile is in-process and is not bounded here.
 
 const std = @import("std");
 const bit = @import("bit");
 const build_options = @import("build_options");
+const proc = @import("proc.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -54,6 +62,10 @@ const Shared = struct {
     gpa: std.mem.Allocator,
     libbitrt: []const u8,
     cases: []const Case,
+    /// Wall-clock seconds allowed to any one child. Read once on the main thread
+    /// before either pool starts: the limit is a property of the host, and a
+    /// worker re-reading the environment could disagree with its siblings.
+    timeout_s: u32,
     next: std.atomic.Value(usize) = .init(0),
     failures: std.atomic.Value(usize) = .init(0),
     // Phase 1's output, phase 2's input. Null = that case never built.
@@ -142,6 +154,7 @@ test "imports + prelude programs run with the expected output" {
         .gpa = gpa,
         .libbitrt = libbitrt,
         .cases = cases.items,
+        .timeout_s = proc.timeoutSeconds(gpa),
         .failed_reason = failed_reason,
         .selfhost_reason = selfhost_reason,
         .built = built,
@@ -288,7 +301,7 @@ fn buildWorker(sh: *Shared) void {
         // two values phase 2 needs outlive it, so they come from the gpa.
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        sh.built[i] = buildProgram(arena.allocator(), sh.gpa, sh.libbitrt, c.name, c.dir_abs, &sh.selfhost_reason[i]) catch |e| {
+        sh.built[i] = buildProgram(arena.allocator(), sh.gpa, sh.libbitrt, c.name, c.dir_abs, sh.timeout_s, &sh.selfhost_reason[i]) catch |e| {
             _ = sh.failures.fetchAdd(1, .monotonic);
             sh.failed_reason[i] = @errorName(e);
             continue;
@@ -305,7 +318,7 @@ fn runWorker(sh: *Shared) void {
         const b = sh.built[i] orelse continue; // never built; phase 1 already counted it
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        runProgram(arena.allocator(), sh.cases[i].name, b, &sh.selfhost_reason[i]) catch |e| {
+        runProgram(arena.allocator(), sh.cases[i].name, b, sh.timeout_s, &sh.selfhost_reason[i]) catch |e| {
             _ = sh.failures.fetchAdd(1, .monotonic);
             sh.failed_reason[i] = @errorName(e);
         };
@@ -318,6 +331,7 @@ fn buildProgram(
     libbitrt: []const u8,
     name: []const u8,
     dir_abs: []const u8,
+    timeout_s: u32,
     selfhost_reason: *?[]const u8,
 ) !Built {
     // Each worker gets its own Io: the shared single-threaded one is not
@@ -347,7 +361,7 @@ fn buildProgram(
     // failure here is a real failure: `bit` must build everything the seed can.
     const selfhost_bin_path = try std.fmt.allocPrintSentinel(gpa, "/tmp/bit-imports-{s}-{x}-selfhost", .{ name, testing.random_seed }, 0);
     errdefer gpa.free(selfhost_bin_path);
-    buildSelfhost(arena, io, name, dir_abs, selfhost_bin_path) catch |e| {
+    buildSelfhost(arena, io, name, dir_abs, selfhost_bin_path, timeout_s) catch |e| {
         selfhost_reason.* = @errorName(e);
         gpa.free(selfhost_bin_path);
         return .{ .bin_path = bin_path, .selfhost_bin_path = null, .expected = expected };
@@ -364,16 +378,27 @@ fn buildSelfhost(
     name: []const u8,
     dir_abs: []const u8,
     out_path: [:0]const u8,
+    timeout_s: u32,
 ) !void {
     var env = std.process.Environ.Map.init(arena);
     defer env.deinit();
     try env.put("BIT_LIBBITRT", build_options.libbitrt_path);
     try env.put("BIT_STDLIB", build_options.stdlib_dir);
 
-    const result = try std.process.run(arena, io, .{
+    // The compiler is bounded too: a compiler that loops forever stalls the
+    // suite exactly as a hung program does, and says even less about why.
+    const outcome = try proc.run(arena, io, timeout_s, .{
         .argv = &.{ build_options.selfhost_bit, "build", dir_abs, "-o", out_path },
         .environ_map = &env,
     });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("imports '{s}' [selfhost]: COMPILE TIMED OUT\n", .{name});
+            proc.timedOutNote(limit, build_options.selfhost_bit);
+            return error.ImportsSelfhostCompileTimedOut;
+        },
+    };
     const ok = switch (result.term) {
         .exited => |c| c == 0,
         else => false,
@@ -383,7 +408,7 @@ fn buildSelfhost(
     return error.ImportsSelfhostCompileFailed;
 }
 
-fn runProgram(arena: std.mem.Allocator, name: []const u8, b: Built, selfhost_reason: *?[]const u8) !void {
+fn runProgram(arena: std.mem.Allocator, name: []const u8, b: Built, timeout_s: u32, selfhost_reason: *?[]const u8) !void {
     var threaded = Io.Threaded.init(arena, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -393,9 +418,9 @@ fn runProgram(arena: std.mem.Allocator, name: []const u8, b: Built, selfhost_rea
 
     // The seed's verdict is unconditional. The self-hosted one is recorded and
     // judged against the expected-gap set once every case has reported.
-    try runOne(arena, io, name, "seed", b.bin_path, b.expected);
+    try runOne(arena, io, name, "seed", b.bin_path, b.expected, timeout_s);
     if (b.selfhost_bin_path) |p| {
-        runOne(arena, io, name, "selfhost", p, b.expected) catch |e| {
+        runOne(arena, io, name, "selfhost", p, b.expected, timeout_s) catch |e| {
             selfhost_reason.* = @errorName(e);
         };
     }
@@ -403,6 +428,11 @@ fn runProgram(arena: std.mem.Allocator, name: []const u8, b: Built, selfhost_rea
 
 /// One built binary against `expected`. `who` names the compiler that produced
 /// it, so a failure says which of the two is wrong without a second run.
+///
+/// Three outcomes are kept apart, as in the golden harness: a DEADLINE expiry is
+/// the machine intervening and reads as a hang; a SIGNAL the program raised on
+/// itself (SIGSEGV/SIGBUS/SIGABRT) is a result and reads as a crash naming the
+/// signal; anything else is an ordinary exit code.
 fn runOne(
     arena: std.mem.Allocator,
     io: Io,
@@ -410,8 +440,23 @@ fn runOne(
     who: []const u8,
     bin_path: [:0]const u8,
     expected: []const u8,
+    timeout_s: u32,
 ) !void {
-    const result = try std.process.run(arena, io, .{ .argv = &.{bin_path} });
+    const outcome = try proc.run(arena, io, timeout_s, .{ .argv = &.{bin_path} });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("imports '{s}' [{s}]: TIMED OUT\n", .{ name, who });
+            proc.timedOutNote(limit, bin_path);
+            return error.ImportsRunTimedOut;
+        },
+    };
+    if (result.term == .signal) {
+        std.debug.print("imports '{s}' [{s}]: CRASHED\n", .{ name, who });
+        proc.crashNote(result.term.signal);
+        std.debug.print("stderr: {s}\n", .{result.stderr});
+        return error.ImportsRunCrashed;
+    }
     const code: u8 = switch (result.term) {
         .exited => |c| c,
         else => 255,

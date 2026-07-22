@@ -45,9 +45,18 @@
 //! `seed/codegen_x64_test.zig`). This gate also backstops the namespace filter
 //! on the `seed/lower_lsp_test.zig` entry: if that filter stops matching, the
 //! entry silently runs zero tests, and it surfaces here as an orphan.
+//!
+//! ## Bounded like every other spawn
+//!
+//! The one subprocess this gate runs per root — `zig test` with the listing
+//! runner — carries the shared deadline from `tests/proc.zig` (#1652). It is a
+//! COMPILE, which is exactly the shape that can loop forever on a bad module
+//! graph, and an unbounded one here stalls the suite with no line saying which
+//! root it was stuck on.
 
 const std = @import("std");
 const build_options = @import("build_options");
+const proc = @import("proc.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -194,6 +203,7 @@ fn collectedNamespaces(
     io: Io,
     root_file: []const u8,
     filters: []const u8,
+    timeout_s: u32,
 ) !std.StringHashMapUnmanaged(void) {
     var out: std.StringHashMapUnmanaged(void) = .empty;
     errdefer out.deinit(gpa);
@@ -213,7 +223,7 @@ fn collectedNamespaces(
     const opts_arg = try std.fmt.allocPrint(gpa, "-Mbuild_options={s}", .{build_options.build_options_zig});
     defer gpa.free(opts_arg);
 
-    const result = try std.process.run(gpa, io, .{
+    const outcome = try proc.run(gpa, io, timeout_s, .{
         .argv = &.{
             build_options.zig_exe,
             "test",
@@ -231,12 +241,22 @@ fn collectedNamespaces(
         .stdout_limit = .limited(8 << 20),
         .stderr_limit = .limited(1 << 20),
     });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("testroots: listing tests for root '{s}' TIMED OUT\n", .{root_file});
+            proc.timedOutNote(limit, build_options.zig_exe);
+            return error.TestRootListTimedOut;
+        },
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
     // A root that will not even build is a hard failure, not an orphan: the gate
     // would otherwise report every file under it as uncovered and bury the real
-    // error. Report the compiler's own message.
+    // error. Report the compiler's own message. A signal is folded in here
+    // deliberately: a `zig test` the OS killed is a broken listing either way,
+    // and `{any}` on the term already names the signal.
     if (result.term != .exited or result.term.exited != 0) {
         std.debug.print(
             "testroots: listing tests for root '{s}' failed ({any}):\n{s}\n",
@@ -335,8 +355,9 @@ test "every test-bearing file under seed/ and runtime/ is collected by a wired r
     }
     try testing.expect(build_options.roots.len >= 10);
     try testing.expectEqual(build_options.roots.len, build_options.root_filters.len);
+    const timeout_s = proc.timeoutSeconds(gpa);
     for (build_options.roots, build_options.root_filters) |root_file, filters| {
-        try per_root.append(gpa, try collectedNamespaces(gpa, io, root_file, filters));
+        try per_root.append(gpa, try collectedNamespaces(gpa, io, root_file, filters, timeout_s));
     }
 
     var orphans: std.ArrayList([]const u8) = .empty;

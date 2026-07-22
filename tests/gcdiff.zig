@@ -28,6 +28,12 @@
 //! objects and a type that fans out 8 ways, so the worklist overflows and the
 //! bounded-rescan recovery runs on nearly every collection in both.
 
+// No `tests/proc.zig` deadline here, and none is needed (#1652): this gate
+// spawns no subprocess. It drives the Zig collector IN-PROCESS and diffs the
+// table against a checked-in `.expected` produced by the Bit port, which
+// `tests/stress.zig` — already bounded — is what actually executes. The script
+// loop is statically bounded by `steps`, so the test terminates by construction.
+
 const std = @import("std");
 const gc = @import("gc");
 const build_options = @import("build_options");
