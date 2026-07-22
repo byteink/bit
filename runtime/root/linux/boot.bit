@@ -27,7 +27,8 @@
 //     the managed heap, so a module that makes one needs a `TypeInfo` descriptor
 //     that a freestanding object may not carry (§17.6). Every platform seam here
 //     is therefore bound by DIRECT CALL — a local `while` over
-//     `schedWorkerStepNow` not `schedWorkerRun(w, nowFn, pollFn)`, `schedStartArm` +
+//     `schedFindWorkAt`/`pollDrain`/`schedWorkerStepAt` not `schedWorkerRun(w,
+//     nowFn, pollFn)`, `schedStartArm` +
 //     `threadStart` not `schedStart(..., threadStart)`, `joinWorker` not
 //     `schedJoin(..., parkSleepNs, parkMonoNs, threadRelease)`.
 //   - EVERY CROSS-MODULE CALLEE IT NAMES IS `@symbol`-PINNED (SPEC §11.9,
@@ -123,11 +124,18 @@ import { parkSleepNs } from "../../park/linux"
 import { parkMinBackoffNs, parkNextBackoff } from "../../park"
 import {
   schedInit, schedTaskInit, schedRegister, schedSpawn, schedShutdown,
-  schedWorkerAt, schedWorkerStepNow, workerStepStop, WORKER_MAX_STEPS,
+  schedWorkerAt, workerStepStop, WORKER_MAX_STEPS,
+  schedFindWorkAt, schedWorkerStepAt, schedSetPollFd,
   schedTaskExit, dqPushBottom, taskAt, taskWords,
   schedStackBytes, schedStackAligned, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
 } from "../../sched"
+// The netpoller provider (#1673). `runtime/sched` may not import it — epoll
+// against kqueue is the platform split the parent module exists to stay clear of
+// — so the binding is made here, in the leaf that is already per-platform, by
+// direct call to the three pinned entries. ../darwin/boot.bit binds the kqueue
+// twin at exactly the same three points.
+import { pollCreate, pollClose, pollDrain } from "../../sched/linux"
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootStatOom, osSetArgs, osSetAuxv } from "../../root"
 import { rootGcAddr } from "../../root"
 import { chanBootBind } from "../../chan"
@@ -170,6 +178,14 @@ let taskStackArea: [16384]i64
 let startArgs: [2]i64
 let startDones: [1]i32
 let startHandles: [1]i64
+
+// The netpoller descriptor `boot` creates, kept so teardown can close it —
+// `sched.zig`'s `NetPoller.deinit`, which its `Scheduler.deinit` calls. The
+// scheduler block holds the same value, but this runtime frees the poller AFTER
+// `joinWorker`, at a point where reaching back into a block no thread owns any
+// more is a needless coupling. 0 means "never created", which cannot happen past
+// step 4b's guard but keeps the close a no-op on any path that skipped it.
+let bootPollFd: int = 0
 
 // The main green thread's result, published across the boot thread's poll-wait.
 // `mainExitCode` is the process exit code; `mainDone` is the release flag the
@@ -236,15 +252,34 @@ const joinTimeoutNs: int = 15000000000
 
 // The worker OS-thread entry: unpack the {worker address, done-word address}
 // block `schedStart` armed, drive green tasks until shutdown, then clear the
-// done word so `joinWorker` observes the worker has left. The netpoller is still
-// unported (#1600), so no I/O is drained here; TIMERS ARE DRIVEN, and must be.
-// Same shape as `poolWorkerEntry`.
+// done word so `joinWorker` observes the worker has left. TIMERS AND THE
+// NETPOLLER ARE BOTH DRIVEN, and both must be. Same shape as `poolWorkerEntry`.
 //
-// A local `while` over `schedWorkerStepNow` rather than `schedWorkerRun(w,
+// A local `while` over the find/drain/step trio rather than `schedWorkerRun(w,
 // parkMonoNs, pollDrain)`: the seam-carrying form takes function VALUES, and a
 // function value is a `(code, env)` cell on the managed heap — which is exactly
 // what `--freestanding` refuses to emit a descriptor for (§17.6, #1628). Every
 // seam in this file is bound by DIRECT CALL for that reason.
+//
+// THE DRAIN IS NOT OPTIONAL, AND ITS ABSENCE WAS #1673. This loop used to be a
+// bare `schedWorkerStepNow`, which probes the three queues and the timer list and
+// NOTHING ELSE. So this — the only worker the runtime starts — never called
+// `pollDrain`, and a green thread parked on the netpoller by `netAwaitReady` had
+// no thread in the process that could ever wake it. It did not hang: the poll fd
+// was never created either (see `boot` step 4b), so `netAwaitReady` bailed at its
+// `pollFd == 0` guard, `netReadSock` fell through to the unscheduled-caller spin,
+// exhausted it, and returned -1 — which `bit_rt_net_read` reports as an EMPTY
+// READ, indistinguishable from an orderly peer close. Every socket read that had
+// to wait for a packet silently returned "". Both halves are needed and neither
+// is sufficient: a poll fd nothing drains parks the reader forever, and a drain
+// with no poll fd returns 0 on its first line.
+//
+// THE ORDER IS `schedFindWorkIdle`'s, which is `sched.zig`'s: queues, then
+// timers, then — only if all of those came up empty — the poller, whose woken
+// tasks land on the global queue, which `schedWorkerStepAt` pops from when the
+// drain reports a non-zero wake count. Polling
+// only when idle is what keeps an `epoll_wait` syscall off the task-dispatch hot
+// path; polling AFTER the timers is what stops a busy fd from starving a sleeper.
 //
 // `parkMonoNs()` IS THE POINT OF THE LOCAL LOOP (#1648). Timer deadlines are set
 // by sibling ./time.bit's `bit_rt_time_sleep_ns` as `parkMonoNs() + ns`, so the
@@ -258,11 +293,17 @@ function workerBody(arg: *byte): *byte {
   let doneAddr = *(block + 1)
 
   let w = taskAt(workerAddr)
+  let s: *i64 = ptrOf(schedBlock)
   let backoff = parkMinBackoffNs
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     n = n + 1
-    backoff = schedWorkerStepNow(w, parkMonoNs(), backoff)
+    let addr = schedFindWorkAt(w, parkMonoNs())
+    let woke = 0
+    if (addr == 0) {
+      woke = pollDrain(int(s), 0)
+    }
+    backoff = schedWorkerStepAt(w, addr, woke, backoff)
     if (backoff == workerStepStop) {
       break
     }
@@ -496,7 +537,31 @@ function boot(): int {
   schedInit(sched, int(ptrOf(workerBlock)), 1)
   spawnBindScheduler(int(sched))
 
-  // 4b. Provision the channel reserve + root-scan registry for
+  // 4b. Create the netpoller and bind it into the scheduler (#1673). This is
+  //     `sched.zig`'s `Scheduler.init`, which does `poller = try NetPoller.init()`
+  //     inline; the port cannot, because `runtime/sched` may import neither
+  //     provider, so the consumer that already is per-platform makes the call.
+  //     Nothing else in the tree did, which is why `scPollFd` read back 0 for
+  //     every socket in every Bit-sourced `libbitrt.a` ever built.
+  //
+  //     A FAILURE IS FATAL, and deliberately not a degrade-to-no-poller. A
+  //     runtime with no poll descriptor still links, still boots and still runs
+  //     every non-networking program correctly — it just returns "" from any read
+  //     that has to wait, which reads as an orderly peer close. Refusing to boot
+  //     is the only answer that is not silent. 70 = EX_SOFTWARE, the same code the
+  //     heap and channel-reserve map failures use.
+  //     `pollCreate` already reports a descriptor of 0 as a failure — the
+  //     scheduler block spells "no poller bound" as a `scPollFd` of 0, so a
+  //     descriptor 0 could not be told apart from an unbound one — so a single
+  //     `< 0` test here covers both.
+  let pollFd = pollCreate()
+  if (pollFd < 0) {
+    return 70
+  }
+  bootPollFd = pollFd
+  schedSetPollFd(sched, pollFd)
+
+  // 4c. Provision the channel reserve + root-scan registry for
   //     `bit_rt_root_chan_make` (#1613), the worldBind pattern. Done AFTER the
   //     scheduler exists because `chan_make` stores it into every channel; map
   //     the process-lifetime reserve pages and hand chan the reserve descriptor,
@@ -509,7 +574,7 @@ function boot(): int {
   chanBootBind(int(ptrOf(chanReserveDesc)), chanMem, chanReserveBytes,
                int(ptrOf(chanRegBlock)), int(sched))
 
-  // 4c. Arm the STOP-THE-WORLD (#1639). `runtime/stw`'s poll — the body the
+  // 4d. Arm the STOP-THE-WORLD (#1639). `runtime/stw`'s poll — the body the
   //     `bit_rt_safepoint` shim every loop back edge calls hands its snapshot to
   //     — refuses to collect until all three root sources are reachable
   //     (`stwCanCollect`), so without this call the collector half is present,
@@ -573,6 +638,17 @@ function boot(): int {
   schedShutdown(sched)
   joinWorker(ptrOf(startDones), joinTimeoutNs)
   threadRelease(*ptrOf(startHandles))
+
+  // 8b. Close the netpoller — `sched.zig`'s `NetPoller.deinit`, called from its
+  //     `Scheduler.deinit`. AFTER the join, because the worker calls `pollDrain`
+  //     on this descriptor from its own loop and closing it under a live poller
+  //     is a use-after-close, not a leak. The process is about to exit either way,
+  //     so this buys no resource back; it is here because the teardown ordering is
+  //     the part that has to be right if this boot is ever reused.
+  if (bootPollFd > 0) {
+    pollClose(bootPollFd)
+    bootPollFd = 0
+  }
 
   // 9. `BIT_GC_STATS`. After the join, so the worker cannot be mid-collection
   //    while the counters are read, and before the exit code goes back to the

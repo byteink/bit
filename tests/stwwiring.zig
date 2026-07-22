@@ -199,6 +199,85 @@ const edges = [_]Edge{
             "that polls, or a thread is invisible to both the rendezvous and the " ++
             "root scan and its live references are swept (#1650)",
     },
+    // -----------------------------------------------------------------------
+    // THE NETPOLLER (#1673) — the same defect class as #1639, in a second place
+    // -----------------------------------------------------------------------
+    //
+    // `runtime/sched/{linux,darwin}/poll.bit` was complete and correct: epoll
+    // and kqueue providers, one-shot registration, the ADD/MOD re-arm split, the
+    // try-lock around the drain. NOTHING CALLED EITHER END OF IT. `pollCreate`
+    // had no caller in the tree, so `scPollFd` stayed 0 for the life of every
+    // process; `pollDrain` had no caller on the live boot path, so nothing could
+    // have delivered a wake even had the descriptor existed.
+    //
+    // The consequence is SILENT, which is why it needs an object-level gate
+    // rather than a test that runs. `netAwaitReady` bails at its `pollFd == 0`
+    // guard and reports "there was nobody to park on"; `netReadSock` falls
+    // through to the unscheduled-caller spin, exhausts it and returns -1; and
+    // `bit_rt_net_read` reports that as an EMPTY READ, which is the documented
+    // "peer closed" answer. So `tests/imports/nettcp` printed BLANK LINES where
+    // `HELLO`/`BIT` belong and still EXITED 0. No exit-code, example, golden or
+    // differential gate could see it, and none did — for as long as the Bit net
+    // port has existed, no packet had ever gone through it.
+    //
+    // It is unobservable on `main` for `tests/stwwiring.zig`'s own stated reason:
+    // the linked `libbitrt.a` is Zig's, so `runtime/net`'s Bit code is dead and
+    // the Zig netpoller answers instead. Only G2/G3 (#1583/#1584) make it live.
+    // What IS observable today is the emitted object: `boot` either references
+    // the create/bind pair or it does not, and the worker loop either references
+    // the drain or it does not.
+    //
+    // BOTH HALVES ARE LISTED BECAUSE NEITHER IS SUFFICIENT. A descriptor nothing
+    // drains parks the reader forever; a drain with no descriptor returns 0 on
+    // its first line. Deleting either call reddens exactly one of these.
+    .{
+        .path = "runtime/root/darwin",
+        .target = .aarch64_macos,
+        .from = "",
+        .to = "bit_rt_port_sched_poll_create",
+        .why = "boot must create the netpoller descriptor, or scPollFd stays 0 and " ++
+            "every socket read that must wait returns an empty string (#1673)",
+    },
+    .{
+        .path = "runtime/root/darwin",
+        .target = .aarch64_macos,
+        .from = "",
+        .to = "bit_rt_port_sched_set_poll_fd",
+        .why = "boot must bind the descriptor into the scheduler block, or netAwaitReady " ++
+            "cannot find it however it was created (#1673)",
+    },
+    .{
+        .path = "runtime/root/darwin",
+        .target = .aarch64_macos,
+        .from = "",
+        .to = "bit_rt_port_sched_poll_drain",
+        .why = "the worker loop must drain the netpoller, or a task parked on an fd has " ++
+            "no thread in the process that can ever wake it (#1673)",
+    },
+    .{
+        .path = "runtime/root/linux",
+        .target = .x86_64_linux,
+        .from = "",
+        .to = "bit_rt_port_sched_poll_create",
+        .why = "boot must create the netpoller descriptor, or scPollFd stays 0 and " ++
+            "every socket read that must wait returns an empty string (#1673)",
+    },
+    .{
+        .path = "runtime/root/linux",
+        .target = .x86_64_linux,
+        .from = "",
+        .to = "bit_rt_port_sched_set_poll_fd",
+        .why = "boot must bind the descriptor into the scheduler block, or netAwaitReady " ++
+            "cannot find it however it was created (#1673)",
+    },
+    .{
+        .path = "runtime/root/linux",
+        .target = .x86_64_linux,
+        .from = "",
+        .to = "bit_rt_port_sched_poll_drain",
+        .why = "the worker loop must drain the netpoller, or a task parked on an fd has " ++
+            "no thread in the process that can ever wake it (#1673)",
+    },
 };
 
 /// Upper bound on atoms/relocations walked in one object — every walk provably

@@ -1,0 +1,197 @@
+// A MULTI-MEGABYTE TCP round trip (#1673): the case that fails when a socket
+// read cannot park.
+//
+// WHY THIS EXISTS NEXT TO ../nettcp, WHICH ALREADY DOES A ROUND TRIP. Because
+// ../nettcp's payloads are five and three bytes, and a five-byte reply is
+// normally sitting in the socket buffer by the time the client asks for it — so
+// a runtime whose reads can never WAIT can still pass it on a good day. This one
+// moves 4 MiB in each direction, which no buffer holds: every chunk after the
+// first forces the reader to wait for bytes that have not been sent yet, and the
+// writer to wait for window that has not opened yet. It cannot be satisfied
+// without the netpoller.
+//
+// IT ASSERTS ON THE PAYLOAD, NEVER ON THE EXIT CODE, and that is the whole point
+// (#1673). An empty read is the documented "peer closed" answer, so a runtime
+// that returns "" from every read that would block does not error, does not
+// crash and does not exit non-zero — it reports a short, orderly end of stream.
+// ../nettcp printed two BLANK LINES and exited 0 for exactly that reason. So the
+// checks here are the byte count and a content checksum, and the expected output
+// names both.
+//
+// THE WRITER RUNS ON ITS OWN GREEN THREAD, on both sides, and that is required
+// rather than tidy: 4 MiB does not fit in the socket buffers, so a client that
+// wrote it all before reading any of it would fill the path and deadlock against
+// a server doing the same. Splitting the direction across two green threads is
+// also what puts a WRITE readiness wait on the path, not just a read one.
+import { listen, dial, Listener, Conn } from "std/net"
+
+// The read size, and how many chunks each side pushes. `makeChunk` builds a
+// chunk of roughly `readBytes`; the exact length is whatever the generated lines
+// come to and is printed, so the expectation is derived from `len(chunk)` rather
+// than asserted to be a round number.
+//
+// 16 chunks is ~750 KB each way. That is an order of magnitude past any socket
+// buffer — so every read after the first has to WAIT, which is the property this
+// case exists to check — and past the 64 KiB single-read path #1668 verified with
+// data PRE-BUFFERED, which is the case that cannot tell a working netpoller from
+// a missing one.
+//
+// THE SIZE IS CAPPED BY A SEPARATE, PRE-EXISTING DEFECT (#1678), not by caution.
+// The same program at 64 chunks (3 MB each way) HANGS on aarch64-linux against
+// the ZIG `libbitrt.a` — the oracle — while 32 passes; on aarch64-macos 128
+// chunks (6 MB each way) completes byte-exactly against both runtimes. So the
+// ceiling is a Linux-side bug in the networking stack rather than anything about
+// this test, and it is filed rather than papered over. 16 sits at a quarter of
+// the largest size observed to pass, so this case fails for its own reasons or
+// not at all.
+const readBytes: int = 65536
+const chunkCount: int = 16
+
+// One deterministic 64 KiB chunk, built once. The byte pattern is position-
+// dependent so that a checksum over it detects reordering and duplication, not
+// just truncation — a reader that returned the same chunk twice would otherwise
+// look identical to one that worked.
+function makeChunk(): string {
+  let parts = []string(0)
+  let i = 0
+  while (i < readBytes / 64) {
+    parts = append(parts, "bit netpoller bulk transfer chunk line ${i % 1000} ....")
+    i = i + 1
+  }
+  let s = ""
+  let j = 0
+  while (j < len(parts)) {
+    s = s + parts[j]
+    j = j + 1
+  }
+  return s
+}
+
+// FNV-1a over the bytes seen so far. Folded incrementally so the checker never
+// holds the whole 4 MiB, which would make this a memory test as much as a
+// networking one.
+function fold(h: int, s: string): int {
+  let acc = h
+  let i = 0
+  while (i < len(s)) {
+    acc = (acc ^ int(s[i])) * 16777619 % 4294967296
+    i = i + 1
+  }
+  return acc
+}
+
+// Push `chunk` `n` times down `c`. A write of this size blocks long before it
+// completes, so every iteration past the first waits for the window to open.
+function pump(c: Conn, chunk: string, n: int, done: chan<int>) {
+  let i = 0
+  while (i < n) {
+    c.write(chunk) catch e {
+      println("write failed: ${e.message()}")
+      done <- 0 - 1
+      return
+    }
+    i = i + 1
+  }
+  done <- i
+}
+
+// What a drain saw. A struct rather than a pair because a Bit function returns
+// one value, and the count and the checksum are only meaningful together: the
+// count alone cannot tell a correct transfer from a reordered one, and the
+// checksum alone cannot tell a correct one from a truncated-then-lucky one.
+struct Drained {
+  bytes: int
+  sum: int
+}
+
+// Read from `c` until either `want` bytes have arrived (`want` 0 = until the
+// peer closes), reporting bytes and checksum.
+//
+// THE LIMIT IS NOT A CONVENIENCE, IT BREAKS A DEADLOCK. `std/net` exposes no
+// half-close, so a side that reads to EOF cannot also be the side the peer is
+// waiting to see close. Both sides reading to EOF wedges: each waits for the
+// other's close, and neither can issue one. So the CLIENT stops at exactly the
+// byte count it expects and closes; the SERVER reads to EOF and sees it.
+//
+// A short read is end of stream — which is precisely the answer a broken runtime
+// gives for a read that merely had to WAIT, so the caller must check the COUNT
+// and not just that the loop ended.
+function drain(c: Conn, want: int): Drained {
+  let total = 0
+  let h = 2166136261
+  let more = true
+  while (more) {
+    let part = c.read(readBytes)
+    if (len(part) == 0) {
+      more = false
+    } else {
+      total = total + len(part)
+      h = fold(h, part)
+      if (want > 0 && total >= want) {
+        more = false
+      }
+    }
+  }
+  return Drained{ bytes: total, sum: h }
+}
+
+// The echo server: read everything the client sends, send it straight back.
+function echo(l: Listener, chunk: string, done: chan<int>) {
+  let c = l.accept() catch e {
+    println("accept failed: ${e.message()}")
+    done <- 0 - 1
+    return
+  }
+  let sent = chan<int>(1)
+  spawn pump(c, chunk, chunkCount, sent)
+  let got = drain(c, 0).bytes
+  let wrote = <- sent
+  c.close()
+  if (wrote != chunkCount) {
+    done <- 0 - 1
+    return
+  }
+  done <- got
+}
+
+function run(): ()! {
+  let chunk = makeChunk()
+  println("chunk bytes: ${len(chunk)}")
+  println("total bytes each way: ${len(chunk) * chunkCount}")
+
+  let l = listen("127.0.0.1", 0)?
+  let port = l.port()?
+
+  let served = chan<int>(1)
+  spawn echo(l, chunk, served)
+
+  let c = dial("127.0.0.1", port)?
+  let sent = chan<int>(1)
+  spawn pump(c, chunk, chunkCount, sent)
+  let seen = drain(c, len(chunk) * chunkCount)
+  let wrote = <- sent
+  c.close()
+  l.close()
+
+  let serverGot = <- served
+
+  // The expected checksum is the fold over `chunkCount` copies of `chunk`,
+  // computed the same way so the file states one number rather than a magic one.
+  let want = 2166136261
+  let i = 0
+  while (i < chunkCount) {
+    want = fold(want, chunk)
+    i = i + 1
+  }
+
+  println("client wrote chunks: ${wrote}")
+  println("server received bytes: ${serverGot}")
+  println("client received bytes: ${seen.bytes}")
+  println("payload intact: ${seen.bytes == len(chunk) * chunkCount && seen.sum == want}")
+}
+
+function main() {
+  run() catch e {
+    println("failed: ${e.message()}")
+  }
+}
