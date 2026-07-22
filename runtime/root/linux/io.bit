@@ -125,6 +125,16 @@ const panicPrefixLen: int = 7
 const newlineWord: int = 10
 const newlineLen: int = 1
 
+// "out of memory", packed into two immediate words for `bit_rt_root_oom` below
+// (#1662) — the same one-word-at-a-time device `panicPrefixWord` uses, and for
+// the same reason: the exhaustion path must not allocate the string it needs in
+// order to say that allocation failed. Computed, not hand-derived.
+//
+//     "out of m" = 0x6d20666f2074756f   (8 bytes)
+//     "emory"    = 0x79726f6d65         (5 bytes)
+const oomWord0: int = 7863397576860792175
+const oomWord1: int = 521610947941
+
 // ---------------------------------------------------------------------------
 // The write path
 // ---------------------------------------------------------------------------
@@ -156,7 +166,7 @@ const newlineLen: int = 1
 // pinned because a sibling module (the stress program) calls it and `-O1`
 // splices bodies across the boundary. Same convention as
 // runtime/sched/linux/poll.bit's `bit_rt_port_sched_poll_*`.
-export @symbol("bit_rt_port_root_io_write_all")
+export @nosplit @symbol("bit_rt_port_root_io_write_all")
 function rootWriteAll(fd: int, addr: int, n: int) {
   let off = 0
   while (off < n) {
@@ -168,34 +178,39 @@ function rootWriteAll(fd: int, addr: int, n: int) {
   }
 }
 
+// The one-word scratch `writeConst` hands the kernel. MODULE-LEVEL AND SCALAR,
+// not a per-call `[]int(1)`, and that is what makes `writeConst` `@nosplit`-able
+// (#1658): `@nosplit` forbids allocation outright (E0075), so a per-call GC slice
+// cannot stay on the panic path. It is also the strictly safer shape for its own
+// sake — the panic path must work when allocation is what failed.
+//
+// A scalar array is never scanned by the collector (ABI.md §5, rule 1). That is
+// required here and harmless: this holds a packed byte constant, never an object
+// address. Unlocked, sound under the ABI's single-worker contract (§5) on the
+// same terms as ../fs.bit's `fsPathBuf` — it is filled and written inside one
+// poll-free call, so no second caller can interleave.
+let ioConstBuf: [1]i64
+
 // Write `nbytes` low bytes of the packed constant `word` to `fd`.
 //
-// NO READ-BACK OF `buf` AFTER THE WRITE, AND THAT IS A MEASURED DECISION.
+// THE COMMENT THIS REPLACES WAS WRONG, AND WRONG IN THE EXACT WAY #1656 COST A
+// G3 ATTEMPT. It argued that a raw object address in a stack slot is pinned
+// because "the collector scans stacks CONSERVATIVELY (ABI.md §5)", and cited a
+// mutation (deleting a `buf[0]` read-back, with 20,000 forced collections) that
+// failed to reproduce a fault. ABI.md §5 says the opposite of what it was read to
+// say: the RUNNING task's stack is walked PRECISELY, and only every *other*
+// registered task's is scanned conservatively. A runtime frame holding a GC
+// object as a raw `int` is named by no stack map, so the precise walk does not
+// see it — which is the whole of #1656. The mutation did not disprove the hazard;
+// it failed to hit it, because this buffer's live range happens to end before the
+// poll inside `rootWriteAll` could matter.
 //
-// An earlier version of this function ended `return buf[0] & 255` and carried a
-// confident comment explaining that the read was load-bearing — that liveness is
-// by LAST USE rather than by scope, so without it `buf`'s live range would end at
-// the `ptrOf` and a collection inside `rootWriteAll` could sweep the very buffer
-// the kernel was handed. MUTATION DISPROVED IT: deleting the read changes
-// nothing, even with 20,000 intervening allocations deliberately inserted
-// between the `ptrOf` and the write to force collections at stress density.
-//
-// The reason is the distinction that matters here, and it is worth more than the
-// deleted line: THE ADDRESS IS IN A STACK SLOT, and the collector scans stacks
-// CONSERVATIVELY (ABI.md §5) — a plain `int` that happens to hold the object's
-// address pins it. The liveness hazard is real, violent, and reproducible, but
-// it strikes a different case: an address handed to MODULE STATE, which rule 1
-// says the collector never scans. That is exactly why ../../../tests/stress/
-// rootio/props' arena dies without its `rooted` witness (SIGSEGV, mutation M12)
-// while this buffer does not.
-//
-// So: keep raw addresses out of module state, or root them yourself. A raw
-// address in a local is already safe. The deleted line was defending against a
-// hazard this code cannot have.
-function writeConst(fd: int, word: int, nbytes: int) {
-  let buf = []int(1)
-  buf[0] = word
-  rootWriteAll(fd, int(ptrOf(buf)), nbytes)
+// The rule that survives is the one about module state, and it now applies to
+// this function itself: the buffer below is module state, so the collector never
+// scans it, which is exactly why it must never hold an object address.
+@nosplit function writeConst(fd: int, word: int, nbytes: int) {
+  storeWord(int(ptrOf(ioConstBuf)), word)
+  rootWriteAll(fd, int(ptrOf(ioConstBuf)), nbytes)
 }
 
 // The bytes of the port-heap `string` at `s` (ABI.md §2: a `{ptr, len}` header
@@ -209,7 +224,7 @@ function writeConst(fd: int, word: int, nbytes: int) {
 // privates and cannot be reached from here, so the guard is duplicated rather
 // than shared. Length 0 makes `rootWriteAll` write nothing at all, so the null
 // address is never handed to the kernel.
-function strBytesOf(s: int): int {
+@nosplit function strBytesOf(s: int): int {
   if (s == 0) {
     return 0
   }
@@ -217,7 +232,7 @@ function strBytesOf(s: int): int {
   return p
 }
 
-function strSizeOf(s: int): int {
+@nosplit function strSizeOf(s: int): int {
   if (s == 0) {
     return 0
   }
@@ -238,7 +253,7 @@ function strSizeOf(s: int): int {
 // concession — its own `panicWrite` test drives `writeAllFd(fds[1], ...)` down a
 // pipe rather than calling `panicWrite`. Exposing the fd is the smaller of the
 // two, since the one caller below still fixes it to stderr.
-export @symbol("bit_rt_port_root_io_panic_write")
+export @nosplit @symbol("bit_rt_port_root_io_panic_write")
 function panicWrite(fd: int, s: int) {
   writeConst(fd, panicPrefixWord, panicPrefixLen)
   rootWriteAll(fd, strBytesOf(s), strSizeOf(s))
@@ -262,7 +277,7 @@ function panicWrite(fd: int, s: int) {
 // low byte and the bitcast to u8 reinterprets the same bits. Wait(2) only ever
 // reports 8 bits to the parent regardless, so this is the kernel's own rounding
 // made explicit rather than a choice.
-export @symbol("bit_rt_root_os_exit") function rootExit(code: int) {
+export @nosplit @symbol("bit_rt_root_os_exit") function rootExit(code: int) {
   syscall(nrExitGroup(), i64(code & 255))
 }
 
@@ -272,7 +287,7 @@ export @symbol("bit_rt_root_os_exit") function rootExit(code: int) {
 //
 // No stack trace, matching the Zig: codegen makes no frame-pointer-chain
 // promise, and there is no debug-info format to symbolize one with yet.
-export @symbol("bit_rt_root_panic") function rootPanic(s: int) {
+export @nosplit @symbol("bit_rt_root_panic") function rootPanic(s: int) {
   panicWrite(stderrFd, s)
   rootExit(2)
 }
@@ -280,7 +295,7 @@ export @symbol("bit_rt_root_panic") function rootPanic(s: int) {
 // `bit_rt_assert` (ABI.md §12): backs `assert(cond)` / `assert(cond, msg)`.
 // Fixed 2-arg — lowering always supplies a message, since this symbol has one
 // frozen native signature whichever surface form the program used.
-export @symbol("bit_rt_root_assert") function rootAssert(cond: bool, s: int) {
+export @nosplit @symbol("bit_rt_root_assert") function rootAssert(cond: bool, s: int) {
   if (cond) {
     return
   }
@@ -289,11 +304,38 @@ export @symbol("bit_rt_root_assert") function rootAssert(cond: bool, s: int) {
 
 // `bit_rt_print` (ABI.md §12): the `print` builtin — a string's bytes on
 // stdout, no trailing newline.
-export @symbol("bit_rt_root_print") function rootPrint(s: int) {
+export @nosplit @symbol("bit_rt_root_print") function rootPrint(s: int) {
   rootWriteAll(stdoutFd, strBytesOf(s), strSizeOf(s))
 }
 
 // `bit_rt_eprint` (ABI.md §12): `print`'s sibling on fd 2.
-export @symbol("bit_rt_root_eprint") function rootEprint(s: int) {
+export @nosplit @symbol("bit_rt_root_eprint") function rootEprint(s: int) {
   rootWriteAll(stderrFd, strBytesOf(s), strSizeOf(s))
+}
+
+// `bit_rt_oom` (#1642/#1662): the heap-exhaustion door `runtime/gc/mem.bit`
+// reaches through by `extern function bit_rt_oom()`. NEVER RETURNS — it writes
+// `panic: out of memory` to fd 2 and exits 2, which is `root.zig`'s
+// `fatal("out of memory")` (`panicWrite` then `rawExit(2)`) byte for byte. The
+// `int` result exists only because the unmanaged subset has no `noreturn`; no
+// caller may use it.
+//
+// NOT ROUTED THROUGH `rootPanic`, and that is the whole point of writing it out
+// longhand. `rootPanic` takes a Bit STRING OBJECT — a managed-heap allocation —
+// so reaching it here would mean allocating in order to report that allocation
+// failed. `writeConst` needs no heap at all: the message is packed into two
+// immediate words, exactly as the `panic: ` prefix and the newline already are.
+//
+//     "out of m" = 0x6d20666f2074756f, "emory" = 0x79726f6d65
+//
+// Both computed, not hand-derived. `panicPrefixLen` is 7 and the two message
+// words carry 8 and 5 bytes, so 7 + 13 + 1 = the 21 bytes of
+// `panic: out of memory\n`.
+export @nosplit @symbol("bit_rt_root_oom") function rootOom(): int {
+  writeConst(stderrFd, panicPrefixWord, panicPrefixLen)
+  writeConst(stderrFd, oomWord0, 8)
+  writeConst(stderrFd, oomWord1, 5)
+  writeConst(stderrFd, newlineWord, newlineLen)
+  rootExit(2)
+  return 0
 }

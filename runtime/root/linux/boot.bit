@@ -115,7 +115,7 @@
 // instructions between the sleep returning and the loop's back edge, and the
 // poll there publishes a real snapshot as any mutator does.
 
-import { mapPages } from "../../alloc/linux"
+import { mapPages, unmapPages } from "../../alloc/linux"
 import { threadStart, threadRelease } from "../../thread/linux"
 import { tlsAreaBytes, tlsPrepare, tlsUnavailable, setThreadPointer } from "../../thread/linux"
 import { schedStartArm } from "../../thread"
@@ -131,7 +131,7 @@ import {
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootStatOom, osSetArgs, osSetAuxv } from "../../root"
 import { rootGcAddr } from "../../root"
 import { chanBootBind } from "../../chan"
-import { gcBlockingBegin, gcBlockingEnd } from "../../gc"
+import { gcBlockingBegin, gcBlockingEnd, gcThreadExit } from "../../gc"
 import { stwBind, stwCollections, stwSwept, stwLiveObjects, stwAbandonedCount } from "../../stw"
 
 // `loadWord` (../../gc) and `parkMonoNs` (../../park/linux) are already imported
@@ -229,7 +229,7 @@ const joinTimeoutNs: int = 15000000000
 
 // Round `addr` up to the next 64KiB stack boundary (`schedStackAligned`'s
 // contract). One add-and-mask, no allocation.
-function alignUpStack(addr: int): int {
+@nosplit function alignUpStack(addr: int): int {
   let bumped = addr + schedStackBytes - 1
   return bumped - bumped % schedStackBytes
 }
@@ -267,6 +267,28 @@ function workerBody(arg: *byte): *byte {
       break
     }
   }
+
+  // RELEASE THE MUTATOR SLOT (#1666). `sched.zig`'s `Worker.run` — the oracle
+  // this function ports — carries `gc_hooks.threadEnter()` /
+  // `defer gc_hooks.threadExit()`, and the exit half was missing here. The
+  // worker registers lazily at its first safepoint poll and then died without
+  // ever releasing slot 1, which stayed `mRunning` forever; from that moment
+  // every rendezvous the boot thread started waited out `stwSpinBound` for a
+  // thread that no longer existed and abandoned. `../../gc/gcworld.bit` states
+  // the consequence on `gcThreadExit` itself: "a leaked slot stays `running`
+  // forever, which corrupts nothing but makes every later rendezvous expire,
+  // i.e. collection quietly stops." Measured at ~160 abandoned collections per
+  // run regardless of workload size, and 0 with this call.
+  //
+  // PLACEMENT IS LOAD-BEARING, and it is the oracle's: AFTER the run loop, so
+  // no Bit code runs on this thread again, and BEFORE the done store, whose
+  // tail is raw pointer arithmetic holding no managed reference. That is
+  // `gcThreadExit`'s precondition. This is NOT the #1650/#1651 shape — nothing
+  // is suppressed while the thread can still run Bit code; the slot is released
+  // only once the thread is leaving. Releasing it any earlier would let a
+  // rendezvous proceed past a thread that is still running, which is the defect
+  // that sweeps live objects.
+  gcThreadExit()
 
   let z: *i32 = nil
   atomicStore(z + doneAddr / 4, i32(0))
@@ -356,7 +378,7 @@ let statsBuf: [16]i64
 // Append `nbytes` low bytes of the packed constant `word` at byte offset `at`,
 // returning the new offset. Packed constants rather than string literals because
 // this module is `--freestanding` (#1628) and builds no managed string.
-function statsConst(at: int, word: int, nbytes: int): int {
+@nosplit function statsConst(at: int, word: int, nbytes: int): int {
   let base = int(ptrOf(statsBuf))
   let w = word
   let i = 0
@@ -369,14 +391,14 @@ function statsConst(at: int, word: int, nbytes: int): int {
 }
 
 // Append `v` in decimal at byte offset `at`, returning the new offset.
-function statsNum(at: int, v: int): int {
+@nosplit function statsNum(at: int, v: int): int {
   return at + osWriteDecimal(int(ptrOf(statsBuf)) + at, v)
 }
 
 // `[bit-gc] collections=<n> swept=<n> live=<n> abandoned=<n>`, on stderr, once,
 // only under `BIT_GC_STATS`. Called after `main` has finished and the worker is
 // reaped, so nothing can be collecting while it reads.
-function statsReport() {
+@nosplit function statsReport() {
   let at = statsConst(0, 6729335713145905755, 8)   // "[bit-gc]"
   at = statsConst(at, 8386658447444108064, 8)      // " collect"
   at = statsConst(at, 263929622377, 5)             // "ions="
@@ -415,6 +437,25 @@ function statsReport() {
 // are the two halves the prefix already keeps apart.
 export @nosplit @symbol("bit_rt_root_map_pages") function rtMapPages(nbytes: int): int {
   return mapPages(nbytes)
+}
+
+// The release half of the same seam (#1641/#1662). `runtime/gc/mem.bit` frees a
+// direct-mapped large object by naming `bit_rt_unmap_pages`; today the Zig
+// `runtime/alloc.zig` answers, and after G2's rename this does. Non-zero on
+// success, 0 when there is nothing to release — the same report
+// `alloc.zig`'s `bit_rt_unmap_pages` gives, and ignored by the caller in both
+// runtimes, because a `munmap` of a range the allocator itself mapped cannot
+// fail for any reason a caller could act on.
+//
+// A wrapper over `../../alloc/{linux,darwin}`'s `unmapPages` for the identical
+// reason `rtMapPages` wraps `mapPages` rather than pinning it: pinning inside
+// the page provider collides with `root.zig` in any link that compiles that
+// module from source AND links the Zig archive.
+export @nosplit @symbol("bit_rt_root_unmap_pages") function rtUnmapPages(addr: int, nbytes: int): int {
+  if (unmapPages(addr, nbytes)) {
+    return 1
+  }
+  return 0
 }
 
 // Boot the collector and scheduler, run `bit_main` as the first green thread,
@@ -551,7 +592,7 @@ function boot(): int {
 // "`gSched` names the live scheduler" is established in exactly one place.
 // Exported so a driver that runs its own scheduler (the #1611 end-to-end test)
 // can bind it before spawning.
-export function spawnBindScheduler(schedAddr: int) {
+export @nosplit function spawnBindScheduler(schedAddr: int) {
   gSched = schedAddr
 }
 
@@ -581,7 +622,7 @@ export function spawnBindScheduler(schedAddr: int) {
 // an unbound scheduler is unrecoverable, so — like `root.zig`'s
 // `catch fatal("out of memory")` — this aborts rather than silently dropping the
 // green thread.
-export @symbol("bit_rt_root_spawn") function rtSpawn(entry: *byte, arg: int) {
+export @nosplit @symbol("bit_rt_root_spawn") function rtSpawn(entry: *byte, arg: int) {
   if (gSched == 0) {
     rootExit(70)
   }
@@ -628,7 +669,7 @@ const maxEnvpWalk: int = 65536
 // is that span, done explicitly. Returns 0 if no terminator is found within the
 // bound — a malformed stack, where refusing to hand back a wild pointer is the
 // safe answer (`runtime/auxv` then reports every key "absent").
-function auxvFromEnvp(envpBase: int): int {
+@nosplit function auxvFromEnvp(envpBase: int): int {
   let i = 0
   while (i < maxEnvpWalk) {
     if (loadWord(envpBase + i * 8) == 0) {

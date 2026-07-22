@@ -110,8 +110,13 @@ function rtTrunc(x: f64): f64 {
 // way a Bit program can observe -0.0 or distinguish two NaNs, and therefore the
 // only sound basis for a float test — `==` reports `-0.0 == +0.0` as true and
 // `NaN == NaN` as false, so it both passes broken implementations and fails
-// correct ones. There is still no inverse (`bitsToFloat` does not exist), so a
-// float cannot be RECONSTRUCTED from a manipulated pattern; only inspected.
+// correct ones. THE INVERSE EXISTS: `bitsToFloat(v: u64) -> f64` landed with
+// #1609 and is documented in the SEAM 5b block below, so a float CAN be
+// reconstructed from a manipulated pattern, not merely inspected. This comment
+// asserted the opposite until #1661, and that stale claim is not harmless — the
+// identical sentence in the `bit_rt_parse_float` note below is why that pin
+// returned `u64` instead of `f64` and shipped the s0 register-class mismatch of
+// #1655.
 export @nosplit @symbol("bit_rt_root_float_bits")
 function rtFloatBits(v: f64): u64 {
   return floatBits(v)
@@ -133,13 +138,59 @@ function rtFloat32Bits(v: f32): u32 {
 // (`parseBits`), ported verbatim from `bench/fptext` (#1539), measured at 0
 // mismatches / 1,000,000 f64 patterns in both directions and mutation-tested.
 //
-// These two are NOT `@nosplit`: they allocate the digit buffers, the bignum
-// limb arrays and the result string, so they pass a safepoint. That is also why
-// they are not the pin-cycle hazard SEAM 6 records — `fmtBits`/`parseBits` never
-// reach the ABI name these wrappers become (`bit_rt_string_from_float` /
-// `bit_rt_parse_float`); the only float bitcast in play is `floatBits`, a
-// `prim_unary_op` (inline FMOV) since #1442, not an `RtFn`. `zig build rootpins`
-// is the proof.
+// These two are the one pair in `runtime/root` that CANNOT simply take
+// `@nosplit`, and #1658 restructured them instead. They allocate the digit
+// buffers, the bignum limb arrays and the result string, and `@nosplit` forbids
+// allocation outright (E0075), so the annotation is not available to them. What
+// #1658 requires of every runtime ABI function is not the annotation but the
+// property behind it: NO RAW GC ADDRESS MAY BE HELD ACROSS A POLL. So each of
+// these two now keeps every raw address inside a small `@nosplit` helper
+// (`packLowBytes` / `unpackToWords`) where no collection can occur, and holds
+// only MANAGED values — which the stack map names and the precise walk finds —
+// in the outer body. See #1656 for the mechanism; the members of this file's
+// class were `out`/`dst` in `rtStringFromFloat` and `s`/`src` in `rtParseFloat`,
+// each held raw across a byte-copy loop's back-edge poll.
+//
+// This is also why they are not the pin-cycle hazard SEAM 6 records —
+// `fmtBits`/`parseBits` never reach the ABI name these wrappers become
+// (`bit_rt_string_from_float` / `bit_rt_parse_float`); the only float bitcast in
+// play is `floatBits`, a `prim_unary_op` (inline FMOV) since #1442, not an
+// `RtFn`. `zig build rootpins` is the proof.
+
+// Pack `n` word-strided bytes at `src` into a fresh `string` object, returning
+// its address (0 on exhaustion). The whole raw lifetime — allocate, take the
+// interior pointer, fill — is inside this one `@nosplit` body, so no collection
+// can happen between the allocation and the last write to it.
+//
+// `src` must be the buffer of a MANAGED `[]byte` that the CALLER still holds:
+// the caller's slice is what keeps those bytes alive, and it can only do that
+// because a `[]byte` local is a stack-map slot while a raw `int` is not.
+@nosplit function packLowBytes(src: int, n: int): int {
+  let out = allocString(n)
+  if (out == 0) {
+    return 0
+  }
+  let dst = strBytes(out)
+  let i = 0
+  while (i < n) {
+    storeByte(dst + i, loadWord(src + i * 8) & 255)
+    i = i + 1
+  }
+  return out
+}
+
+// The inverse: spread the `n` packed bytes of the `string` at raw address `s`
+// one-per-word into the caller's managed `[]byte` buffer at `dst`. Same
+// contract, same reason — `s` is a raw address, so it must not outlive a
+// poll-free region, and this body has none.
+@nosplit function unpackToWords(dst: int, s: int, n: int) {
+  let src = strBytes(s)
+  let i = 0
+  while (i < n) {
+    storeWord(dst + i * 8, loadByte(src + i))
+    i = i + 1
+  }
+}
 
 // `bit_rt_string_from_float` (ABI.md §14): the exact `{d}` decimal of `v`,
 // returned as a `string` object address (an `int` at the C ABI — a pinned
@@ -154,6 +205,14 @@ function rtFloat32Bits(v: f32): u32 {
 // the infinities and every NaN survive intact. `fmtBits` then stays entirely in
 // the integer domain and hands back a managed `string`; the loop copies its
 // bytes into a fresh runtime string so no managed value crosses the pin.
+//
+// TRAP #2 (#1658): the copy loop used to be written out here, holding `out` and
+// `dst` — a fresh GC string and an interior pointer into it — as raw `int`s
+// across the loop's back-edge poll. No stack map named them, so a collection at
+// that poll swept the string this function was in the middle of filling. The
+// loop now lives in `packLowBytes`, which is `@nosplit` and therefore poll-free;
+// what is left here holds only `s` and `bytes`, both MANAGED and so both real
+// stack-map slots.
 export @symbol("bit_rt_root_string_from_float")
 function rtStringFromFloat(v: f64): int {
   let s = fmtBits(floatBits(v))
@@ -161,19 +220,7 @@ function rtStringFromFloat(v: f64): int {
   // byte is the low octet of its word rather than a packed run — hence the
   // per-word read rather than a `copyBytes`.
   let bytes = []byte(s)
-  let n = len(bytes)
-  let out = allocString(n)
-  if (out == 0) {
-    return 0
-  }
-  let dst = strBytes(out)
-  let src = int(ptrOf(bytes))
-  let i = 0
-  while (i < n) {
-    storeByte(dst + i, loadWord(src + i * 8) & 255)
-    i = i + 1
-  }
-  return out
+  return packLowBytes(int(ptrOf(bytes)), len(bytes))
 }
 
 // `bit_rt_parse_float` (ABI.md §14): the nearest f64 to the decimal text at
@@ -201,16 +248,18 @@ function rtStringFromFloat(v: f64): int {
 // `s` arrives as a raw `int` (E0079 again). Its packed bytes are lifted into a
 // managed `string` so `parseBits` can consume them; the round trip through
 // `[]byte` is cheap on the ~24-char inputs a float literal ever spans.
+//
+// AND THE LIFT MUST BE POLL-FREE (#1658), for the same reason as its twin above:
+// the loop that used to stand here held `s` and `src` — the caller's string and
+// an interior pointer into it — as raw `int`s across a back-edge poll, so a
+// collection there could sweep the very text being parsed. `unpackToWords` is
+// `@nosplit`, so nothing can collect while those raw values are live, and after
+// it returns only the managed `bytes` is needed.
 export @symbol("bit_rt_root_parse_float")
 function rtParseFloat(s: int): f64 {
   let n = strSize(s)
   let bytes = []byte(n)
-  let src = strBytes(s)
-  let i = 0
-  while (i < n) {
-    bytes[i] = byte(loadByte(src + i))
-    i = i + 1
-  }
+  unpackToWords(int(ptrOf(bytes)), s, n)
   return bitsToFloat(parseBits(string(bytes)))
 }
 
