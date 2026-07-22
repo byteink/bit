@@ -85,6 +85,13 @@
 //   5. Every registered task's opaque `arg` (§5/§9) — a spawn thunk is a GC
 //      object reachable ONLY through the pending task's `arg` until that task
 //      runs and unpacks it.
+//   6. Every registered task's per-task SCRATCH area (`stwScanScratch`, #1679).
+//      THIS ONE HAS NO `root.zig` COUNTERPART. It exists because the port keeps
+//      two live references (`scrElem`, the blocking channel value slot, and
+//      `scrErr`, the pending-error object) in the `chanScratchWords` words at
+//      the BASE of each task's stack, which is strictly BELOW `ctx.sp` and so
+//      outside class 4's range for every task, always. Zig keeps the first as a
+//      stack local (class 4 covers it) and the second in a `threadlocal`.
 //
 // Classes 4 and 5 are reachable only when a scheduler block is bound; class 1
 // only when a channel registry is. `stwBind` takes all three addresses TOGETHER
@@ -104,6 +111,8 @@ import { chanScanRegistryRoots } from "../chan"
 import { taskAt, schedCurrentTask, schedMaxRegistered } from "../sched"
 import { schedRegLock, schedRegUnlock, schedRegHead, schedRegNext } from "../sched"
 import { ctxSp, taskArg, taskState, taskDone, taskStackBase, taskStackBytes } from "../sched"
+// The per-task scratch area's word count (#1679) — see `stwScanScratch`.
+import { chanScratchWords } from "../sched"
 
 // ---------------------------------------------------------------------------
 // The bound blocks
@@ -245,11 +254,68 @@ export @nosplit @symbol("bit_rt_port_stw_live_objects") function stwLiveObjects(
   }
 }
 
-// Classes 4 and 5: every registered task's `arg`, and every task's stack except
-// the one this thread is running (scanned precisely from the snapshot instead)
-// and any finished task (its stack holds nothing live). `sched.zig`'s
-// `forEachTaskArg` + `forEachOtherStack`, fused into one walk because they visit
-// the same list under the same lock.
+// Class 6: one task's per-task SCRATCH area (`runtime/sched/scratch.bit`), the
+// `chanScratchWords` words at the BASE of its stack. THIS CLASS HAS NO
+// COUNTERPART IN `root.zig` AND IT IS NOT AN OPTIMISATION — it is the root class
+// this port needs and the Zig runtime does not, because the port had to put two
+// live references somewhere Zig keeps them in places the existing classes
+// already cover (#1679):
+//
+//   - `scrElem` (word 5) is the value slot of a BLOCKING channel send/receive.
+//     `chanops.bit` writes the sent value there, points the waiter at it and
+//     parks; `chanwrap.bit` receives INTO it and reads the result back out of
+//     it. `chan.zig` keeps that slot as an ordinary LOCAL in the parked task's
+//     Zig frame, which lives inside `[sp, stackTop)` and is therefore covered by
+//     class 4. The port's slot is not: the scratch is at `stackBase`, and a
+//     stack grows DOWN from `stackTop`, so the whole scratch area sits strictly
+//     BELOW `ctx.sp` — outside class 4's range by construction, for every task,
+//     always.
+//   - `scrErr` (word 7) is the pending-error object (ABI.md §13). `root.zig`
+//     holds it in a `threadlocal`, which Mach-O refuses (§11.11), so SEAM 4
+//     moved it here.
+//
+// Neither is named by any stack map either, so the PRECISE walk (classes 2/3)
+// cannot see them and this must cover the RUNNING task as well as parked ones.
+// The symptom when it is missing is the one this file's "ROOT SET" header warns
+// about: no crash at the point of failure, a live value swept, and a wrong
+// answer some time later.
+//
+// Conservative and whole-area rather than field-by-field: words 8..264 are
+// chan-owned waiter nodes and select index arrays whose contents are slot
+// ADDRESSES and case indices, and `gcMarkConservative` rejects anything that is
+// not an object base, so scanning them costs a bounded walk and cannot retain
+// more than a stack scan already can. Enumerating only words 5 and 7 would also
+// make this file depend on a layout `runtime/chan` is free to extend.
+// BOUNDED BY THE TASK'S OWN MAPPING, NOT ONLY BY `chanScratchWords`. Every task
+// the scheduler creates has a `schedStackBytes` (64 KiB) stack, so the scratch
+// always fits — but a caller-supplied block need not, and
+// `tests/stress/stwcollect` supplies a 64-WORD synthetic stack. Reading a fixed
+// 265 words off that base walks 201 words past the array and SIGSEGVs, which is
+// how this bound was found rather than reasoned about. `min` of the two is the
+// same walk for every real task and a safe one for a synthetic block.
+@nosplit function stwScanScratch(g: *i64, t: *i64) {
+  let base = *(t + taskStackBase)
+  if (base <= 0) {
+    return
+  }
+  let n = *(t + taskStackBytes) / 8
+  if (n > chanScratchWords) {
+    n = chanScratchWords
+  }
+  let i = 0
+  // Bounded: at most `chanScratchWords` words, and never past the mapping.
+  while (i < n) {
+    gcMarkConservative(g, loadWord(base + i * 8))
+    i = i + 1
+  }
+}
+
+// Classes 4, 5 and 6: every registered task's `arg` and scratch area, and every
+// task's stack except the one this thread is running (scanned precisely from the
+// snapshot instead) and any finished task (its stack holds nothing live).
+// `sched.zig`'s `forEachTaskArg` + `forEachOtherStack`, fused into one walk
+// because they visit the same list under the same lock, plus the port-only
+// scratch class documented above.
 @nosplit function stwScanTasks(g: *i64, sched: *i64) {
   let cur = schedCurrentTask()
   schedRegLock(sched)
@@ -259,6 +325,11 @@ export @nosplit @symbol("bit_rt_port_stw_live_objects") function stwLiveObjects(
   while (addr != 0 && n < schedMaxRegistered) {
     let t = taskAt(addr)
     gcMarkConservative(g, *(t + taskArg))
+    // Every task, including the running one and a finished one: a `done` task's
+    // STACK holds nothing live, but its scratch still holds whatever the last
+    // operation left in `scrElem`/`scrErr`, and the running task's scratch is
+    // invisible to the precise walk.
+    stwScanScratch(g, t)
     if (addr != cur && *(t + taskState) != taskDone) {
       stwScanStackRange(g, *(t + ctxSp), *(t + taskStackBase) + *(t + taskStackBytes))
     }
