@@ -517,6 +517,63 @@ function schedWorkerStep(w: *i64, s: *i64, addr: int, backoff: int): int {
 
 // `nowFn` and `pollFn` are the platform seam; see `schedFindWorkIdle` for what
 // each must do and why they are function values rather than imports.
+//
+// ---------------------------------------------------------------------------
+// THIS FUNCTION DOES NOT TOUCH THE MUTATOR REGISTRY, AND MUST NOT (#1671)
+// ---------------------------------------------------------------------------
+//
+// AN OS THREAD THAT ENTERS THIS LOOP AND THEN EXITS MUST RELEASE ITS MUTATOR
+// SLOT, and the call belongs in that thread's ENTRY function, not here. The
+// entry owns the thread's whole life; this function does not.
+//
+// The leak is real and was measured, not assumed. Two worker OS threads enter
+// this loop, drain their tasks, are joined, and the boot thread then allocates
+// in a 20,000-iteration loop under `BIT_GC=stress BIT_GC_STATS=1`. Against the
+// identical program with the two threads never brought up:
+//
+//   target          workers, no exit          no workers      workers + exit
+//   aarch64-macos   abandoned 20130 / coll 11 |  0 / 20134  |  0 / 20142
+//   aarch64-linux   abandoned 20275 / coll 263|  0 / 20134  |  0 / 20538
+//   x86_64-linux    abandoned 20165 / coll 113|  0 / 20134  |  0 / 20278
+//
+// i.e. once a worker thread has left this loop without releasing its slot,
+// essentially EVERY later collection is abandoned — the slot stays `mRunning`
+// forever and every rendezvous waits out `stwSpinBound` for a thread that no
+// longer exists. `../gc/gcworld.bit` states the consequence on `gcThreadExit`
+// itself: "a leaked slot stays `running` forever, which corrupts nothing but
+// makes every later rendezvous expire, i.e. collection quietly stops." This is
+// the same defect #1666 fixed in `runtime/root/<os>`'s `workerBody`, which is
+// the OTHER consumer of this loop and which drives `schedWorkerStepNow` in its
+// own `while` rather than calling this.
+//
+// WHY THE PAIR IS NOT PUT HERE, WHERE IT WOULD BE CONVENIENT. `sched.zig`'s
+// `Worker.run` — the oracle — does carry `gc_hooks.threadEnter()` plus
+// `defer gc_hooks.threadExit()`, but it is a PRIVATE `fn` reachable only as a
+// thread entry. This one is `export`ed and is predominantly NOT a thread entry:
+// of the nine in-tree call sites, six are a direct call from `main()` on the
+// BOOT thread (`tests/stress/`: `schedtimer`, `netpark`, `schedpolldarwin`,
+// `polloneshotdarwin`, `rootspawndarwin`, and `schedpool`, which calls it twice
+// in a row) and only three are an OS-thread entry. A `gcThreadExit()` in here
+// would therefore deregister the BOOT thread in the majority of uses while it
+// carries on running Bit code — every one of those six allocates afterwards, at
+// minimum in its closing interpolated `print`. That is the CORRUPTION direction:
+// a slot released too early lets a rendezvous proceed past a thread that is
+// still running and sweep its live roots, which is strictly worse than leaking
+// one, and it is the #1650/#1651 defect in a new place. Leaking is safe and
+// wasteful; releasing early is not safe at all.
+//
+// So the placement rule is #1666's, unchanged, and it is the ENTRY's to obey:
+// call the collector's exit door AFTER this function returns — no Bit code runs
+// on the thread again — and BEFORE the done store, whose tail is raw pointer
+// arithmetic holding no managed reference. Do not gate it on anything, and in
+// particular never on `schedCurrentTask() == 0` (#1639, deleted by #1650/#1651).
+//
+// The enter half is deliberately absent on BOTH sides. Registration is lazy on
+// first touch of either door — any allocation, or the first safepoint poll,
+// which this loop's back edge is — and ABI.md §5 makes that a guarantee rather
+// than a fallback. The table above is itself the evidence that it works on this
+// exact path: a thread that had never registered would hold no slot to leak,
+// and the `abandoned` column would be zero.
 export function schedWorkerRun(w: *i64, nowFn: () => int,
                                pollFn: (int, int) => int) {
   let s = taskAt(*(w + wkSched))

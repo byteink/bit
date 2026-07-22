@@ -71,11 +71,30 @@
 //! loudly rather than degrading to a green no-op. The comptime length assert
 //! covers the outer level (an empty `fixtures` makes the loop a no-op), the
 //! lesson `rootpins` paid for.
+//!
+//! ---------------------------------------------------------------------------
+//! THE TWO PROPERTIES EVERY `bit` SPAWN HERE CARRIES
+//! ---------------------------------------------------------------------------
+//!
+//! Both are hard-won and neither is optional, so they are stated at the top
+//! rather than left to be inferred from the call sites.
+//!
+//!   - **A private copy of the compiler** (`tests/selfbin.zig`, #1644), never
+//!     `build_options.selfhost_bit` itself. That artifact is rewritten in place
+//!     by a `has_side_effects` Run step, and exec'ing it mid-rewrite is SIGKILL
+//!     before `main` with both streams empty.
+//!   - **A wall-clock deadline** (`tests/proc.zig`, #1670). Every spawn goes
+//!     through `proc.run`, so a self-hosted compiler that loops on a fixture
+//!     reddens this gate BY NAME instead of stalling `zig build test` with no
+//!     verdict. This file was the last harness that spawned bare, and it was
+//!     missed by #1652's sweep precisely because it did not import `proc.zig`
+//!     at all — so a grep for `proc.run` call sites could not see it.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const bit = @import("bit");
 const build_options = @import("build_options");
+const proc = @import("proc.zig");
 const selfbin = @import("selfbin.zig");
 
 const testing = std.testing;
@@ -155,6 +174,12 @@ test "seed and selfhost emit the same undefined-symbol set" {
     defer selfbin.release(gpa, io, copy);
     self_compiler = copy;
 
+    // Every `bit` spawn below carries this one deadline (#1670). Read once per
+    // test rather than per spawn: it is a constant for the run, and re-reading
+    // the environment inside the loop would let a mid-run change split the
+    // fixtures across two different bounds.
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     var failures: usize = 0;
 
     for (fixtures) |f| {
@@ -164,7 +189,7 @@ test "seed and selfhost emit the same undefined-symbol set" {
         // for writing: driving it means `fork`, and `fork` copies the whole fd
         // table, so a write fd held here to a file about to be exec'd elsewhere
         // is an ETXTBSY waiting to happen (74811a3, kept by tests/harness.zig).
-        const self_obj = try emitWithSelfhost(gpa, io, abs, f);
+        const self_obj = try emitWithSelfhost(gpa, io, abs, f, timeout_s);
         const seed_obj = try emitWithSeed(gpa, io, abs, f);
 
         const seed_undef = try undefinedSet(gpa, f.path, seed_obj);
@@ -288,7 +313,19 @@ fn emitWithSeed(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixture)
 }
 
 /// Emits `dir_abs` as a relocatable object by driving the self-hosted `bit`.
-fn emitWithSelfhost(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixture) ![]u8 {
+///
+/// Bounded by `timeout_s` (#1670): a self-hosted compiler that loops on a
+/// fixture used to block `zig build test` forever with no case named, the exact
+/// failure #1637 was filed for and the one gap #1652's sweep missed — this file
+/// did not import `proc.zig` at all, so a grep for `proc.run` call sites could
+/// not see it.
+fn emitWithSelfhost(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir_abs: []const u8,
+    f: Fixture,
+    timeout_s: u32,
+) ![]u8 {
     const out = try std.fmt.allocPrint(
         gpa,
         "/tmp/bit-diffimports-{s}-{x}.o",
@@ -296,7 +333,7 @@ fn emitWithSelfhost(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixt
     );
     defer Dir.cwd().deleteFile(io, out) catch {};
 
-    const result = try std.process.run(gpa, io, .{
+    const outcome = try proc.run(gpa, io, timeout_s, .{
         .argv = &.{
             self_compiler,
             "build",
@@ -308,11 +345,17 @@ fn emitWithSelfhost(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixt
             targetFlag(target),
         },
     });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("diffimports: '{s}' [selfhost]: EMIT TIMED OUT\n", .{f.path});
+            proc.timedOutNote(limit, self_compiler);
+            return error.SelfhostCompileTimedOut;
+        },
+    };
     if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print(
-            "diffimports: selfhost failed to compile '{s}':\n{s}{s}\n",
-            .{ f.path, result.stdout, result.stderr },
-        );
+        std.debug.print("diffimports: selfhost failed to compile '{s}':\n", .{f.path});
+        proc.toolFailedNote(result.term, self_compiler, result.stdout, result.stderr);
         return error.SelfhostCompileFailed;
     }
     return Dir.cwd().readFileAlloc(io, out, gpa, .limited(64 << 20));
@@ -353,20 +396,31 @@ test "both linkers accept every legitimate extern program" {
     defer selfbin.release(gpa, io, copy);
     self_compiler = copy;
 
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     for (fixtures) |f| {
         const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, f.path });
 
         // Selfhost first — same `fork`/ETXTBSY ordering rule as above.
         const self_out = try std.fmt.allocPrint(gpa, "/tmp/bit-diflink-{s}-{x}", .{ std.fs.path.basename(abs), testing.random_seed });
         defer Dir.cwd().deleteFile(io, self_out) catch {};
-        const r = try std.process.run(gpa, io, .{
+        const outcome = try proc.run(gpa, io, timeout_s, .{
             .argv = &.{ self_compiler, "build", abs, "-o", self_out, "--target", targetFlag(target) },
         });
+        const r = switch (outcome) {
+            .finished => |res| res,
+            .timed_out => |limit| {
+                std.debug.print("diffimports: '{s}' [selfhost]: LINK TIMED OUT\n", .{f.path});
+                proc.timedOutNote(limit, self_compiler);
+                return error.SelfhostLinkTimedOut;
+            },
+        };
         if (r.term != .exited or r.term.exited != 0) {
             std.debug.print(
-                "diffimports: selfhost REFUSED to link '{s}', which declares its imports with 'extern function' and must link:\n{s}{s}\n",
-                .{ f.path, r.stdout, r.stderr },
+                "diffimports: selfhost REFUSED to link '{s}', which declares its imports with 'extern function' and must link:\n",
+                .{f.path},
             );
+            proc.toolFailedNote(r.term, self_compiler, r.stdout, r.stderr);
             return error.SelfhostLinkRejected;
         }
 
