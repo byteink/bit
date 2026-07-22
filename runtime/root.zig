@@ -828,6 +828,24 @@ export fn bit_rt_string_eq(a: ?*const RtBytes, b: ?*const RtBytes) callconv(.c) 
     return std.mem.eql(u8, strBytes(a), strBytes(b));
 }
 
+/// `bit_rt_string_cmp` (ABI.md §2): three-way lexicographic order, backing
+/// string `<`/`<=`/`>`/`>=` (SPEC §14.6). Negative when `a < b`, 0 when equal,
+/// positive when `a > b`. Bytes compare UNSIGNED and a common prefix is broken
+/// by length (shorter is less), which is also code-point order for UTF-8.
+/// Length-driven, never NUL-terminated: an embedded NUL is an ordinary byte,
+/// and a sliced string carries its own length.
+export fn bit_rt_string_cmp(a: ?*const RtBytes, b: ?*const RtBytes) callconv(.c) i64 {
+    const ab = strBytes(a);
+    const bb = strBytes(b);
+    const n = @min(ab.len, bb.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (ab[i] != bb[i]) return @as(i64, ab[i]) - @as(i64, bb[i]);
+    }
+    if (ab.len == bb.len) return 0;
+    return if (ab.len < bb.len) -1 else 1;
+}
+
 /// `bit_rt_sqrt` (ABI.md §14): the square root, backing `std/math`'s `sqrt`.
 /// `@sqrt` lowers to the hardware instruction (`sqrtsd`/`fsqrt`) — no libm.
 export fn bit_rt_sqrt(x: f64) callconv(.c) f64 {

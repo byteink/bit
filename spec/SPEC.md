@@ -1964,6 +1964,12 @@ See §15.4.
 
 - Numeric, `bool`, `string`, `rune` values compare with `==`/`!=` and (numerics,
   strings) with ordering operators.
+- String ordering (`<`, `<=`, `>`, `>=`) is **lexicographic on the byte
+  contents**, never on the backing address: bytes compare as UNSIGNED values,
+  and when one operand is a prefix of the other the shorter one is less. The
+  empty string is less than every other string, and a NUL byte is an ordinary
+  byte with no terminating meaning. Because Bit strings are UTF-8 (§5.6), this
+  byte order is also code-point order.
 - Arrays and tuples are comparable if their element types are; structs are
   comparable if all fields are comparable (field-wise).
 - A C-like enum (all variants payload-free) compares with `==`/`!=` by tag, and

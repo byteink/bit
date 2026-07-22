@@ -151,6 +151,13 @@ pub const RtFn = enum {
     /// Two `string` args -> `bool`: byte-wise equality. Backs string `==`/`!=`
     /// (`!=` negates the result). Distinct from integer `icmp_eq`.
     string_eq,
+    /// Two `string` args -> `i64`: a three-way lexicographic compare (SPEC
+    /// §14.6) — negative when `a < b`, zero when equal, positive when `a > b`.
+    /// Bytes compare UNSIGNED and length breaks a common prefix (shorter is
+    /// less), so the result also orders UTF-8 by code point. Backs string
+    /// `<`/`<=`/`>`/`>=`, which lowering turns into `icmp_s*` of this against
+    /// `0`. One primitive for all four, mirroring `string_eq` for `==`/`!=`.
+    string_cmp,
     /// `(string, index) -> u8`: the byte at `index`, bounds-checked (panics on
     /// out-of-range, SPEC §18.4). Backs `s[i]` on a string.
     string_byte,

@@ -4003,11 +4003,26 @@ const FnCtx = struct {
             const iop: ir.Op = if (op == .plus) .add else .sub;
             return self.b.binary(iop, common, base_val, off_ptr);
         }
-        if (cdata == .prim and cdata.prim == .string and (op == .eq_eq or op == .bang_eq or op == .plus)) {
+        if (cdata == .prim and cdata.prim == .string and (is_cmp or op == .plus)) {
             const sl = try self.lowerExprH(k[0], common);
             const sr = try self.lowerExprH(k[1], common);
             if (op == .plus) return self.rtCall(common, .string_concat, &.{ sl, sr });
             const bool_ty = self.ctx.prim_ids.get(.bool);
+            if (op == .lt or op == .lt_eq or op == .gt or op == .gt_eq) {
+                // Ordering is content-based (SPEC §14.6), never a compare of the
+                // two backing addresses: `string_cmp` yields the three-way sign
+                // and the relational op is that sign against 0.
+                const i64_ty = self.ctx.prim_ids.get(.i64);
+                const c = try self.rtCall(i64_ty, .string_cmp, &.{ sl, sr });
+                const z = try self.b.constInt(i64_ty, 0);
+                const iop: ir.Op = switch (op) {
+                    .lt => .icmp_slt,
+                    .lt_eq => .icmp_sle,
+                    .gt => .icmp_sgt,
+                    else => .icmp_sge,
+                };
+                return self.b.binary(iop, bool_ty, c, z);
+            }
             const eq = try self.rtCall(bool_ty, .string_eq, &.{ sl, sr });
             if (op == .eq_eq) return eq;
             const f = try self.b.constBool(bool_ty, false); // `!=` is `(a == b) == false`

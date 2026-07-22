@@ -1587,6 +1587,7 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .string_from_float => "bit_rt_string_from_float",
         .string_from_bool => "bit_rt_string_from_bool",
         .string_eq => "bit_rt_string_eq",
+        .string_cmp => "bit_rt_string_cmp",
         .string_byte => "bit_rt_string_byte",
         .string_slice => "bit_rt_string_slice",
         .bytes_from_string => "bit_rt_bytes_from_string",
