@@ -461,6 +461,28 @@ fn fatal(msg: []const u8) noreturn {
     rawExit(2);
 }
 
+/// The heap-exhaustion seam `runtime/gc/mem.bit` reaches through (#1642).
+///
+/// Every allocating door in this file already spells exhaustion `orelse
+/// fatal("out of memory")`, so a null object has never reached compiled code
+/// here. The Bit port could not say the same: `@nosplit` cannot call `panic`,
+/// so `runtime/root/root.bit` deviation 3 returned 0 and bumped a counter
+/// nothing reads, and exhaustion showed up as wrong output followed by a null
+/// store instead of a diagnostic.
+///
+/// `runtime/gc` must compile for all three targets, so it can no more write the
+/// stderr write and the exit itself than it can write an mmap — it names this
+/// symbol and lets the link resolve it, exactly as it does for
+/// `bit_rt_map_pages`. Routing it here rather than duplicating the sequence is
+/// what makes the two runtimes agree by CONSTRUCTION: same message, same fd,
+/// same exit code, because it is the same `fatal`.
+///
+/// Declared with an `i64` result only because Bit's unmanaged subset has no
+/// `noreturn`. It does not return.
+export fn bit_rt_oom() callconv(.c) i64 {
+    fatal("out of memory");
+}
+
 /// `bit_rt_panic` (ABI.md §12): backs the `panic` builtin and every panic
 /// source in SPEC.md §18.4 (index/slice range, divide-by-zero, nil-channel
 /// misuse, failed `assert`, ...) — codegen routes all of them through this

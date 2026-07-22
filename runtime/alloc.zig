@@ -215,6 +215,25 @@ export fn bit_rt_map_pages(nbytes: i64) callconv(.c) i64 {
     return @intCast(@intFromPtr(mem));
 }
 
+/// The release half of the `bit_rt_map_pages` seam (#1641).
+///
+/// `runtime/gc/mem.bit`'s `memUnmapPages` names this symbol for exactly the
+/// reasons the mapping half documents above, and the same two definitions
+/// answer to it: this one while the Zig archive is the linked runtime, and
+/// `runtime/root/{linux,darwin}`'s provider once G2's rename (#1583) strips the
+/// `bit_rt_root_` prefix. Do not rename it to the Bit page provider's own pin —
+/// see `bit_rt_map_pages` for the DuplicateSymbol that produces.
+///
+/// `addr`/`nbytes` must be a range this runtime mapped. Returns 1 on release
+/// and 0 for a rejected argument; the Bit caller ignores the result, matching
+/// `unmapPages` returning void.
+export fn bit_rt_unmap_pages(addr: i64, nbytes: i64) callconv(.c) i64 {
+    if (addr == 0 or nbytes <= 0) return 0;
+    const ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(addr)));
+    unmapPages(ptr, @intCast(nbytes));
+    return 1;
+}
+
 fn unmapPages(ptr: [*]u8, len: usize) void {
     if (builtin.os.tag == .windows) {
         std.os.windows.VirtualFree(@ptrCast(ptr), 0, std.os.windows.MEM_RELEASE);
