@@ -1,0 +1,200 @@
+// Split out of ./gcworld.bit (#1653): the park/rendezvous state machine.
+
+// ---------------------------------------------------------------------------
+// The stop flag — `World.stopRequested`
+// ---------------------------------------------------------------------------
+
+// Whether a stop is pending. One atomic load; the overwhelmingly common
+// safepoint answer.
+export @nosplit @symbol("bit_rt_port_gc_world_stop_requested") function worldStopRequested(world: *i64): bool {
+  return atomicLoad(world + worldStopWord) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Yielding to a stop — `World.park` / `mustStayPut` / `resumeWhenClear`
+// ---------------------------------------------------------------------------
+
+// Whether slot `slot` must stay in its `waiting` state rather than run Bit code.
+//
+// No stop pending: free to run. A `blocked` slot: `rendezvous` passed it WITHOUT
+// an acknowledgement, so any pending stop may already have counted it — it must
+// stay put until the stop clears outright. A `parked` slot: may resume as soon as
+// the pending stop is one it has NOT acknowledged (its ack names an older epoch),
+// because that stop's rendezvous is still waiting for this slot, so nothing has
+// marked behind it. Without the parked test the thread STARVES under stress (a
+// stop pending at every safepoint would re-park it forever); measured in gc.zig.
+@nosplit function worldMustStayPut(world: *i64, slot: int, waiting: int): bool {
+  if (atomicLoad(world + worldStopWord) == 0) {
+    return false
+  }
+  if (waiting == mBlocked) {
+    return true
+  }
+  let m = wMut(world, slot)
+  return atomicLoad(m + muAcked) == atomicLoad(world + worldEpochWord)
+}
+
+// Sit in `waiting` until this thread may run Bit code again.
+//
+// THE NAIVE VERSION ("wait for `stop` to clear, then store `running`") IS
+// UNSOUND — a thread that saw `stop == false` while still publishing
+// `parked`/`blocked` is read by the NEXT collector as already stopped, passed,
+// and marked behind while it resumes and mutates. This is the #1431 shape gc.zig
+// documents at length. The close differs by state and BOTH accesses are seq_cst,
+// paired with `worldRendezvous` (Dekker): store own flag, then load the other's.
+//
+//   - `parked` is closed by the EPOCH: acknowledge the epoch being parked for
+//     BEFORE publishing `parked`, so a collector that reads `parked` also reads a
+//     matching (or older) ack. A resuming thread's ack names an older stop, so
+//     the next collector waits for it rather than passing it.
+//   - `blocked` has no ack — rendezvous passes it unconditionally, the whole
+//     point of the contract — so the re-check below is load-bearing there:
+//     publish `running`, re-read `stop`, and go back if one is pending.
+@nosplit function worldResumeWhenClear(world: *i64, slot: int, waiting: int) {
+  let m = wMut(world, slot)
+  let outer = 0
+  // Bounded (deviation 5/outer bound): normally one pass; each extra pass costs
+  // one intervening collection, and exhaustion is counted as "runtime broken".
+  while (outer < worldResumeOuterBound) {
+    // Acknowledge the stop being parked FOR before publishing the state that
+    // lets rendezvous count us. A collector reading `parked` must read the ack.
+    if (waiting == mParked) {
+      atomicStore(m + muAcked, atomicLoad(world + worldEpochWord))
+    }
+    atomicStore(m, waiting)
+
+    let spins = 0
+    // Bounded by `stwParkBound`; expiry means the stop never cleared.
+    while (spins < stwParkBound) {
+      if (!worldMustStayPut(world, slot, waiting)) {
+        break
+      }
+      spins = spins + 1
+    }
+    if (spins >= stwParkBound) {
+      // The stop never cleared: a runtime bug. Zig @panics; count it and release
+      // (deviation 5). Leaving the slot `running` is the same result @panic's
+      // process teardown would reach, minus the abort.
+      let c = atomicLoad(world + worldStatResumeGiveUp)
+      atomicStore(world + worldStatResumeGiveUp, c + 1)
+      atomicStore(m, mRunning)
+      return
+    }
+
+    atomicStore(m, mRunning)
+    if (!worldMustStayPut(world, slot, waiting)) {
+      return
+    }
+    // A stop that may already have counted us landed in the gap. Nothing above
+    // touched the heap, so going back is always safe.
+    outer = outer + 1
+  }
+  // Outer bound exhausted: same "runtime broken" signal, counted not panicked.
+  let c = atomicLoad(world + worldStatResumeGiveUp)
+  atomicStore(world + worldStatResumeGiveUp, c + 1)
+  atomicStore(m, mRunning)
+}
+
+// Yield to an in-progress collection: publish this thread's snapshot (`frame`,
+// so the collector walks this stack precisely), go `parked`, wait for the stop
+// to clear, then drop the snapshot. Returns immediately if no stop is pending,
+// which is what makes it safe to call speculatively at a safepoint.
+export @nosplit @symbol("bit_rt_port_gc_world_park") function worldPark(world: *i64, slot: int, frame: int) {
+  let m = wMut(world, slot)
+  atomicStore(m + muFrame, frame)
+  worldResumeWhenClear(world, slot, mParked)
+  atomicStore(m + muFrame, 0)
+}
+
+// ---------------------------------------------------------------------------
+// The `blocked` contract — `World.beginBlocking` / `endBlocking`
+// ---------------------------------------------------------------------------
+
+// Enter a region that holds NO live Bit references in any frame (ABI.md §5).
+// The collector then neither waits for this thread nor scans it. PRECONDITION:
+// the caller genuinely holds no live references for the whole bracketed region —
+// one held across this is invisible and will be swept. Clears the frame so no
+// snapshot is left to be walked.
+export @nosplit @symbol("bit_rt_port_gc_world_begin_blocking") function worldBeginBlocking(world: *i64, slot: int) {
+  let m = wMut(world, slot)
+  atomicStore(m + muFrame, 0)
+  atomicStore(m, mBlocked)
+}
+
+// Leave that region. Stays `blocked` while a stop is pending rather than
+// resuming behind the collector's back — a `blocked` slot was passed without
+// acknowledging, so it must re-check the flag (`worldResumeWhenClear`) before it
+// runs. Staying blocked longer is free: nothing waits on it.
+export @nosplit @symbol("bit_rt_port_gc_world_end_blocking") function worldEndBlocking(world: *i64, slot: int) {
+  worldResumeWhenClear(world, slot, mBlocked)
+}
+
+// ---------------------------------------------------------------------------
+// The collector side — `World.rendezvous` / `stoppedFor` / `restart`
+// ---------------------------------------------------------------------------
+
+// Whether slot `slot` counts as stopped for the collection at epoch `e`. A free
+// or blocked slot always counts (blocked holds no live references by contract, so
+// needs no ack). A parked slot counts only once it has acknowledged THIS epoch:
+// a slot parked for an earlier stop is on its way out (see `worldMustStayPut`),
+// so treating it as stopped would be the very race the epoch pair exists to close.
+export @nosplit @symbol("bit_rt_port_gc_world_stopped_for") function worldStoppedFor(world: *i64, slot: int, e: int): bool {
+  let m = wMut(world, slot)
+  let s = atomicLoad(m)
+  if (s == mFree) {
+    return true
+  }
+  if (s == mBlocked) {
+    return true
+  }
+  if (s == mParked) {
+    return atomicLoad(m + muAcked) == e
+  }
+  return false
+}
+
+// Request a stop and wait until a WHOLE pass over the registry finds no other
+// mutator still `running`. Returns false if the bounded wait expired, in which
+// case the caller must abandon the collection (ABI.md §5). Caller holds the
+// world lock (`worldLockAcquire`), so collectors cannot race each other.
+//
+// RE-SCANNING FROM THE TOP each pass is load-bearing, not defensive: a thread
+// claims its slot on its first allocation or poll, which can land after this walk
+// already passed that slot. Requiring one clean sweep makes registration order
+// irrelevant; `claim` starting a slot `running` under a pending stop lets a
+// registering thread park at its next safepoint rather than run behind the mark.
+export @nosplit @symbol("bit_rt_port_gc_world_rendezvous") function worldRendezvous(world: *i64, selfSlot: int): bool {
+  // seq_cst, paired with `worldResumeWhenClear` — the Dekker store-then-load.
+  // `atomicAdd` returns the PREVIOUS value, so +1 is this stop's epoch. Epochs
+  // start at 1 (initial 0 acknowledges nothing).
+  let e = atomicAdd(world + worldEpochWord, 1) + 1
+  atomicStore(world + worldStopWord, 1)
+  let spins = 0
+  // Bounded by `stwSpinBound`; expiry returns false (abandon).
+  while (spins < stwSpinBound) {
+    let stillRunning = false
+    let i = 0
+    // Bounded: exactly `maxMutators` slots.
+    while (i < maxMutators) {
+      if (i != selfSlot) {
+        if (!worldStoppedFor(world, i, e)) {
+          stillRunning = true
+          break
+        }
+      }
+      i = i + 1
+    }
+    if (!stillRunning) {
+      return true
+    }
+    spins = spins + 1
+  }
+  return false
+}
+
+// Let every parked mutator go. Clears the stop; every waiter's
+// `worldResumeWhenClear` observes it and resumes.
+export @nosplit @symbol("bit_rt_port_gc_world_restart") function worldRestart(world: *i64) {
+  atomicStore(world + worldStopWord, 0)
+}
+
