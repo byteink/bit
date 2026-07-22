@@ -368,13 +368,20 @@ pub fn build(b: *std.Build) void {
     // minutes per mutation.
     b.step("rootpins", "Runtime-pin cycle gate (tests/rootpins.zig)").dependOn(&rootpins_run.step);
 
-    // Runtime-ABI register-class gate (#1655): a ported pin and the `root.zig`
-    // export it replaces must agree on which values travel in FLOAT registers.
-    // `bit_rt_parse_float` did not — Zig returned `f64` in `d0`/`xmm0`, the Bit
-    // pin returned `u64` in `x0`/`rax` — so against a Bit-built `libbitrt.a`
-    // every float literal in every program folded to 0.0 while integers stayed
-    // correct. No object-level or differential gate can see a C type; see
-    // tests/rootabi.zig's header.
+    // Runtime-ABI gates (#1655/#1658/#1662): register-class agreement between a
+    // pin and the `root.zig` export it replaces, poll-freedom of the runtime
+    // subtrees an ABI pin reaches, and ABI membership (every Zig export has a
+    // Bit provider). `bit_rt_parse_float` is the register-class defect this
+    // caught: Zig returned `f64` in `d0`/`xmm0`, the Bit pin returned `u64` in
+    // `x0`/`rax` — so against a Bit-built `libbitrt.a` every float literal in
+    // every program folded to 0.0 while integers stayed correct. No
+    // object-level or differential gate can see a C type; see
+    // tests/rootabi.zig's header. Split under #1674 into tests/rootabi.zig
+    // (register-class + shared entry point), tests/rootabi_shared.zig (parsing
+    // helpers), tests/rootabi_pollfree.zig and tests/rootabi_membership.zig —
+    // the latter two are anchored into this same test binary via
+    // `_ = @import(...)` in tests/rootabi.zig, so this module still needs only
+    // its one root_source_file below.
     const rootabi_opts = b.addOptions();
     rootabi_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
 
@@ -392,7 +399,7 @@ pub fn build(b: *std.Build) void {
     // an edit to either is invisible to the build cache.
     rootabi_run.has_side_effects = true;
     test_step.dependOn(&rootabi_run.step);
-    b.step("rootabi", "Runtime-ABI register-class gate (tests/rootabi.zig)").dependOn(&rootabi_run.step);
+    b.step("rootabi", "Runtime-ABI gates: register-class, poll-free, ABI membership (tests/rootabi*.zig)").dependOn(&rootabi_run.step);
 
     // Stop-the-world wiring gate (#1639): the collector `runtime/stw` implements
     // must actually be REACHED by a booted program. It was not — nothing bound
