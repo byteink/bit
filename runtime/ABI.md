@@ -438,12 +438,41 @@ parked    stopped at a safepoint, its snapshot published for the collector
 blocked   inside a call that holds NO live Bit references (see below)
 ```
 
-**REGISTRATION IS ALSO LAZY, AND THAT IS A GUARANTEE, NOT A FALLBACK.** A thread
-claims its slot on its **first touch of the collector by either door** — any
-allocation, or its first safepoint poll — so a thread that never calls
-`bit_rt_gc_thread_enter` is still never invisible. Calling it explicitly is still
-correct and still preferred (it keeps registration off the first allocation's
-path), but soundness does not depend on it.
+**REGISTRATION IS LAZY, BUT "A THREAD IS NEVER INVISIBLE" IS FALSE AS A BLANKET
+CLAIM — IT IS FALSIFIED, NOT MERELY UNCONFIRMED (#1677).** A thread claims its
+slot on its **first touch of the collector by either door** — any allocation, or
+its first safepoint poll. Before that first touch the thread holds NO slot:
+`rendezvous` does not wait for it, no snapshot exists for it (root classes 2/3,
+§4, do not apply), and — if the thread is not itself a scheduler-registered
+green task — the conservative task-stack scan below does not apply to it
+either. A thread that becomes the **sole holder of a live reference** during
+this window — reading it out of shared/module state whose other copy is then
+cleared, with no allocation and no loop back-edge crossed since the thread
+started — is invisible to every root class this file documents, and a
+concurrent collection running on an already-registered mutator elsewhere WILL
+sweep it.
+
+This is not hypothetical. #1677 built a reproducer: a raw OS thread (started via
+`runtime/thread`'s `threadStart`, the same primitive `runtime/root/<os>/boot.bit`
+uses to start the scheduler's own worker) whose first statements read a live
+object's sole address out of an otherwise-cleared mailbox and hold it in a local
+while another, already-registered mutator forces real collections under
+`BIT_GC=stress`. The object was swept and its memory reused every one of 20/20
+runs. A mutation-test control — adding one allocation to the thread before the
+hand-off, so it registers first — flips the result to "survives" every time,
+confirming the window is exactly the pre-registration gap and nothing else.
+
+The window is narrow (a thread must hold a reference nowhere a root class
+covers, before its first door-touch, while a collection completes) but it is
+real, and it is exactly what `sched.zig`'s `Worker.run` closes by calling
+`gc_hooks.threadEnter()` **eagerly** at OS-thread entry rather than relying on
+lazy registration alone. The Bit port dropped that eager call (#1671) on the
+reasoning that lazy registration was sufficient on its own; #1677/#1699 correct
+that — the eager call is being restored at OS-thread entry points, measured for
+`abandoned`-count regression on all three targets (#1699). Calling
+`bit_rt_gc_thread_enter` explicitly at a thread's start is not merely
+"preferred", it is what closes this gap; a thread that skips it is exposed for
+as long as its first door-touch is delayed.
 
 The allocation door is the one that matters, and it means *every* allocation
 entry point, not just `bit_rt_gc_alloc`: strings, slice headers, slice buffers,
@@ -530,6 +559,18 @@ runtime call chain that parked it (a channel op → `park` → context switch), 
 they lie within that range; the non-moving collector makes a false positive
 merely retain garbage, never corrupt. Precise per-frame maps for parked tasks
 (instead of the conservative scan) are a later refinement.
+
+**This soundness argument is scoped to a task that has actually parked at least
+once.** A task that has been scheduled but never yet switched into and out of —
+`ctx.sp` still holds the value set at task creation, not a genuine snapshot of
+where its frames currently are — is on the registry but the conservative scan
+of `[ctx.sp, stack_top)` covers essentially none of its real stack while it
+runs. The Bit port's `runtime/sched/worker.bit` can dispatch straight into an
+already-queued task on a fresh OS thread before that thread's own run-loop
+back edge is ever reached (#1677's finding, stated there for the OS-thread
+registry rather than this one, applies identically here): the same "holds no
+live Bit references before its first door-touch" gap. #1699 tracks closing
+both with the same eager-registration fix.
 
 ---
 
