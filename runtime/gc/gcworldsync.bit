@@ -117,23 +117,66 @@ export @nosplit @symbol("bit_rt_port_gc_world_high_water") function worldHighWat
 //     pointer. Until `worldBind` runs, `worldAddr == 0` and every wrapper is a
 //     safe no-op.
 //
-//   - `g_mutator` IS NOT CACHED AT ALL — it is LOOKED UP, keyed on
-//     `./gcthread.bit`'s per-OS-thread token (#1650). `@threadlocal` is refused
-//     for Mach-O (§11.11), the same wall `root.bit`'s `iface_as_ok` and
-//     `net/netabi.bit`'s UDP sender hit, so there is nowhere per-thread to cache
-//     it. THE PREVIOUS STAND-IN WAS A MODULE-LEVEL `let curMut`, i.e. ONE cell
-//     for the whole process, justified by "ABI.md §5 pins nthreads to 1 for v1".
-//     `tests/stress/chanracelinux` is the first program with two Bit threads and
-//     it faulted 20 runs out of 20: the second thread read the first's slot,
-//     returned early from registration, and was then invisible to BOTH the
-//     rendezvous (so it mutated straight through the mark) and the root scan (so
-//     it published no frame) — its function-value cells were swept while live.
-//     A search keyed on the thread pointer costs a few atomic loads bounded by
-//     `worldHighWater` and is exact, which no amount of caching in shared state
-//     can be.
+//   - `g_mutator` USED TO NOT BE CACHED AT ALL (#1698) — every poll re-derived
+//     the slot via `gcThreadToken()` (a real call) then `worldFindOwner` (a real
+//     call, plus a bounded atomic-load search), where Zig's `threadlocal
+//     g_mutator` costs one plain load after the first poll. Measured on real
+//     x86-64 (`hl-master`): a tight, allocation-free, crypto-free integer loop
+//     ran ~10.4x slower against a Bit-sourced `libbitrt.a` than against the Zig
+//     one, and restructuring the SAME arithmetic to hit ~2000x fewer safepoint
+//     polls collapsed the ratio to ~1.03x — direct confirmation the per-poll
+//     cost, not the arithmetic, was the term.
+//
+//     A genuine `threadlocal`-shaped fix is unavailable for the reason stated
+//     above (`@threadlocal` refused for Mach-O) — but so is the OBVIOUS
+//     workaround of reserving an extra word in the per-OS-thread TLS block
+//     `./gcthread.bit`'s token is read from: on Linux that block is one this
+//     runtime builds itself (`../thread/linux/tls.bit`) and could be extended,
+//     but on Darwin `TPIDRRO_EL0` is the OS's own opaque per-thread pointer
+//     (measured non-writable, kernel-managed) — this runtime does not own the
+//     memory at that address and must not write past it. Any fix expressed only
+//     in THIS architecture-independent Bit source (no platform seam, matching
+//     every other function in this file) therefore cannot dereference the token
+//     as a base address; it may only use it as an opaque comparison key.
+//
+//     `mutHintSlot` below is that: a single process-wide HINT — the last slot
+//     any thread resolved — re-verified against the registry's own atomic owner
+//     word before ever being trusted. A hit costs one token read (already paid,
+//     unavoidable) plus one atomic load, no call, no loop. A miss (a different
+//     thread's poll clobbered the hint since this thread's own last poll, or the
+//     hint is stale after a release) costs exactly what today's full search
+//     costs — never worse, never wrong, only sometimes not the fast path. This
+//     is NOT the #1650 defect returning: #1650's `curMut` was TRUSTED without
+//     re-checking the registry, so a second thread inherited the first thread's
+//     slot outright. Every read of `mutHintSlot` here is re-verified against
+//     `wMut(...)+muOwner` before being returned, so a stale, torn, or
+//     another-thread's hint can only ever cost a fallback to the exact search,
+//     never a wrong slot. (A naturally aligned 64-bit load/store does not tear
+//     on either target this runtime supports, so "stale" is the only failure
+//     mode a concurrent writer can produce here, not "corrupt".)
+//
+//     Plain module-state reads/writes, not atomics: `@nosplit` is measured to
+//     reject `ptrOf` even on module state despite SPEC §11.11 saying it is
+//     legal there (`root.bit`'s own documented gap, #1421) — the same reason
+//     `worldAddr` below is a plain scalar and not something the atomics touch.
+//     A hint that only ever gets safer, never worse, by being re-verified has
+//     no correctness need for atomics in the first place.
+//
+//     `gcThreadExit` clears the hint when it currently names the slot being
+//     released, so a departed thread's slot cannot linger as a stale guess
+//     (belt-and-braces: the owner-word re-check above already makes a stale hint
+//     harmless, since a released slot's owner reads 0, which matches no live
+//     token).
 
 // Address of the caller-owned World block, or 0 before `worldBind`.
 let worldAddr: i64 = 0
+
+// The steady-state poll hint (#1698) — see the header note above. A slot
+// number BIASED BY ONE (0 = empty), naming the last slot ANY thread resolved.
+// Never trusted on its own: every read is re-verified against the registry's
+// own atomic owner word before being returned, so a stale or another-thread's
+// value can only ever fall through to the exact search, never mislead one.
+let mutHintSlot: i64 = 0
 
 // Bind the process-wide World block. Called once at boot by `runtime/root`,
 // after it has `ptrOf`'d its own `g_world` array (which this `@nosplit` module
@@ -175,8 +218,25 @@ export @nosplit @symbol("bit_rt_port_gc_current_mutator") function currentMutato
     return 0
   }
   let world = wordAt(worldAddr)
+
+  // FAST PATH (#1698): re-derived fresh every call (nothing here survives a
+  // possible migration between this read and the last one — there is no
+  // registration between two SEPARATE calls to re-derive across), so this is
+  // safe against the #1466 TLS-hoisting shape by construction: there is no
+  // threadlocal, and no value is trusted without checking it against the
+  // registry's own atomic word first. A hit costs one extra atomic load and no
+  // call; a miss costs nothing more than today's full search below.
+  let hint = mutHintSlot
+  if (hint != 0) {
+    let hintSlot = hint - 1
+    if (atomicLoad(wMut(world, hintSlot) + muOwner) == token) {
+      return hint
+    }
+  }
+
   let found = worldFindOwner(world, token)
   if (found >= 0) {
+    mutHintSlot = found + 1
     return found + 1
   }
   let slot = worldClaimFor(world, token)
@@ -186,6 +246,7 @@ export @nosplit @symbol("bit_rt_port_gc_current_mutator") function currentMutato
   if (worldStopRequested(world)) {
     worldPark(world, slot, frame)
   }
+  mutHintSlot = slot + 1
   return slot + 1
 }
 
@@ -254,6 +315,14 @@ export @nosplit @symbol("bit_rt_root_gc_thread_exit") function gcThreadExit() {
     return
   }
   worldRelease(world, slot)
+  // Invalidate the fast-path hint if it currently names this slot (#1698):
+  // belt-and-braces, since `currentMutator`'s owner re-check already makes a
+  // stale hint harmless (a released slot's owner reads 0, matching no live
+  // token) — this just keeps the hint from pointing at a dead slot any longer
+  // than it has to.
+  if (mutHintSlot == slot + 1) {
+    mutHintSlot = 0
+  }
 }
 
 // `bit_rt_gc_blocking_begin` (ABI.md §5/§6). PRECONDITION: the calling thread
