@@ -54,16 +54,49 @@
 //       nowhere is swept. Driven through the whole poll, not through
 //       `gcScanSnapshot` alone, so the precise walk is proved to be WIRED INTO
 //       the collection rather than merely to work in isolation.
+//   D — the per-task SCRATCH area (#1679, #1683), the class that had no case
+//       here and therefore no gate at all.
+//   E — another stopped OS thread's PARKED FRAME (#1683), likewise.
+//   F — the `bad=` counter the `BIT_GC_STATS` line grew in #1682, read through
+//       the same bound-block accessor that line uses.
+//
+// ---------------------------------------------------------------------------
+// ONE CASE PER ROOT CLASS — THE RULE, AND WHY IT IS ENFORCED STATICALLY (#1683)
+// ---------------------------------------------------------------------------
+//
+// #1679 was a whole root class covered by NOTHING: the per-task scratch area
+// held two live references (`scrElem`, a blocking channel send/receive's value
+// slot, and `scrErr`, the pending-error object) and no enumerated class reached
+// them. Everything stayed green — `zig build`, `libbitrt`, `rootpins`,
+// `rootabi`, `stwwiring`, `zig build test`, `test-stress` and the full
+// differential sweep — because a missing root class is not a missing symbol and
+// not a wrong dump. It is a live object swept, which shows up later, somewhere
+// else, as a SIGSEGV on one platform and a wrong answer with exit 0 on another.
+//
+// This file already had the shape of the answer and only covered the classes
+// its author had thought of, which is precisely the failure mode: a class
+// nobody wrote is a class nobody tests. So the rule is now mechanical rather
+// than aspirational — `runtime/stw/stw.bit`'s ROOT SET header enumerates the
+// classes, every one of them carries a `ROOT CLASS <n>` marker here, and
+// `tests/stwwiring.zig`'s "every enumerated root class has a case" test fails
+// if the two sets ever differ or if the count falls below the floor. Adding a
+// class to the collector without a case here is a RED BUILD, not a silent hole.
+//
+// Every phase asserts a NON-ZERO collection count of its own (`ran=`), because
+// a straight-line Bit program collects zero times under `BIT_GC=stress` — the
+// backends emit safepoints only at loop back edges — and a survival check
+// across a collection that never happened proves nothing at all.
 
 import { spinUnlocked } from "../../../runtime"
 import { heapInit, heapWords } from "../../../runtime/alloc"
 import { gcInit, gcConfigure, gcAlloc, gcOwns, gcNumObjects, gcStatCollections } from "../../../runtime/gc"
 import { gcWords, gcBindMemory, storeWord, loadWord, loadByte, reserveWords } from "../../../runtime/gc"
-import { worldBind, worldWords } from "../../../runtime/gc"
+import { worldBind, worldWords, worldClaim, worldRelease, maxMutators, mParked } from "../../../runtime/gc"
 import { rtChanMake, chanBootBind, chanRegWords } from "../../../runtime/chan"
-import { stwBind, stwPoll, stwAbandonedCount } from "../../../runtime/stw"
+import { stwBind, stwPoll, stwAbandonedCount, stwBadOffsets } from "../../../runtime/stw"
 import { schedWords, scRegHead, taskWords, taskArg, taskState, taskParked } from "../../../runtime/sched"
-import { taskStackBase, taskStackBytes, ctxSp } from "../../../runtime/sched"
+import { taskStackBase, taskStackBytes, ctxSp, taskRegNext } from "../../../runtime/sched"
+import { chanScratchWords, scrElem, scrErr, scrRecvOk } from "../../../runtime/sched"
 
 // Channel header field offsets, in words — runtime/chan/chan.bit's private
 // layout, hardcoded exactly as tests/stress/chanroots and chanmakeroots do. A
@@ -78,15 +111,53 @@ const MARK_STACK = 64
 const MIN_TRIGGER = 4096
 const GROWTH_PCT = 200
 const CHAN_RESERVE_WORDS = 4096
+// The SHORT synthetic stack, and it is short on purpose: #1679's scratch scan
+// walked a fixed `chanScratchWords` (265) words off a task's stack base, which
+// on a 64-word block reads 201 words past the end and SIGSEGVs. That is how the
+// scan's `min(chanScratchWords, stackBytes/8)` bound was found rather than
+// reasoned about, so a registered task with a stack shorter than the scratch
+// area has to stay in this program.
 const TASK_STACK_WORDS = 64
-const TASK_STACK_SLOT = 7
+
+// The class-4 task's stack, and THE REASON IT IS LONGER THAN THE SCRATCH AREA.
+//
+// The class-4 payload used to sit at word 7 of the 64-word stack above, with
+// `sp` at the base — and that case went VACUOUS the moment #1679 added class 6,
+// because the scratch scan covers `min(265, 64)` = the whole of that block.
+// Deleting the class-4 stack walk left this program fully green (measured), so
+// the assertion labelled `stack=` was being carried by a different class.
+//
+// The separation is now structural: `sp` starts exactly ONE WORD PAST the
+// scratch area, so class 6 covers words 0..264, class 4 covers 265..511, and
+// the payload at 400 is reachable from class 4 and nothing else.
+const LONG_STACK_WORDS = 512
+const LONG_STACK_SLOT = 400
 
 // Metadata: one leaf `Node` TypeInfo (16-byte body, no pointer fields, so the
-// marker word is pure data the tracer never reinterprets) plus the
-// `ref_array_info` sentinel `gcInit` matches by address. Seven words each.
-const META_WORDS = 14
+// marker word is pure data the tracer never reinterprets), the
+// `ref_array_info` sentinel `gcInit` matches by address, and one MALFORMED
+// TypeInfo for phase F. Seven words each, then the malformed one's offset
+// array.
+const META_WORDS = 22
 const MI_NODE = 0
 const MI_REFARR = 7
+// A 16-byte body declaring ONE pointer field at offset 4 — MISALIGNED, so
+// `scanObject` must count it in `gcStatBadOffsets` and skip it rather than read
+// a straddling word (`runtime/gc` deviation 5).
+const MI_BAD = 14
+const MI_BAD_OFFS = 21
+
+// The `Mutator` record layout in the World block (`runtime/gc/gcworld.bit`),
+// whose word offsets are private to that file — hardcoded here exactly as the
+// channel header offsets above are, and a drift fails phase E loudly (the fake
+// slot never reads as parked, the rendezvous expires and `abandoned=` goes
+// non-zero) rather than silently skipping the class.
+const MU_STATE = 0
+const MU_FRAME = 1
+const MU_ACKED = 2
+const MU_WORDS = 4
+// `worldEpochWord`: the stop counter, one past the slot array.
+const MU_EPOCH_IDX = 1
 
 // The synthetic frame phase C plants a precise root in. `FRAME_MID` is far
 // enough from both ends that a stack-slot offset of either sign lands inside.
@@ -104,6 +175,13 @@ const M_STACK = 1003
 const M_DEAD = 1004
 const M_PRECISE = 1005
 const M_MISSED = 1006
+const M_SCR_ELEM = 1007
+const M_SCR_ERR = 1008
+const M_SCR_LAST = 1009
+const M_SCR_DEAD = 1010
+const M_PARKED = 1011
+const M_PARKED_DEAD = 1012
+const M_BADMAP = 1013
 
 // ---------------------------------------------------------------------------
 // An INDEPENDENT decoder for the emitted stack-map table (ABI.md §4)
@@ -183,15 +261,37 @@ function main() {
   let regBlock = []i64(chanRegWords)
   let fakeTask = []i64(taskWords)
   let fakeStack = []i64(TASK_STACK_WORDS)
+  let longTask = []i64(taskWords)
+  let longStack = []i64(LONG_STACK_WORDS)
   let frameBuf = []i64(FRAME_WORDS)
   let snapBuf = []i64(SNAP_WORDS)
+
+  // Phase D's task. Its stack is exactly `chanScratchWords` words, so the whole
+  // scratch area is mapped and the scan's `min(chanScratchWords, stackBytes/8)`
+  // bound resolves to the full area — that is what lets the payload at the
+  // LAST scratch word (`scrRecvOk`, 264) be a floor on the scanned set rather
+  // than a second copy of the first word's test. `fakeStack` above stays 64
+  // words on purpose: it is the block whose short mapping caught the unbounded
+  // 265-word read (#1679).
+  let scratchTask = []i64(taskWords)
+  let scratchStack = []i64(chanScratchWords)
+  // Phase E's parked-thread frame and the `SafepointFrame` that publishes it,
+  // both kept apart from phase C's so that phase C's snapshot is not what phase
+  // E ends up proving.
+  let parkFrame = []i64(FRAME_WORDS)
+  let parkSnap = []i64(SNAP_WORDS)
 
   let metaAddr = int(ptrOf(meta))
   meta[MI_NODE + 0] = 16
   meta[MI_NODE + 1] = 0
   meta[MI_NODE + 2] = 0
+  meta[MI_BAD + 0] = 16
+  meta[MI_BAD + 1] = metaAddr + MI_BAD_OFFS * 8
+  meta[MI_BAD + 2] = 1
+  meta[MI_BAD_OFFS] = 4
   let nodeInfo = metaAddr + MI_NODE * 8
   let refArrInfo = metaAddr + MI_REFARR * 8
+  let badInfo = metaAddr + MI_BAD * 8
 
   let hp = ptrOf(heapBlock)
   heapInit(hp)
@@ -217,7 +317,7 @@ function main() {
                int(ptrOf(regBlock)), int(ptrOf(schedBlock)))
   stwBind(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)))
 
-  // Root source 1: a buffered `is_ref` channel, built by the shipped constructor
+  // ROOT CLASS 1: a buffered `is_ref` channel, built by the shipped constructor
   // so the registry entry is the real one.
   let handle = rtChanMake(CAP, true)
   if (handle == 0) {
@@ -229,20 +329,40 @@ function main() {
   storeWord(loadWord(handle + CH_BUF * 8), pChan)
   storeWord(handle + CH_COUNT * 8, 1)
 
-  // Root sources 4 and 5: one registered task, parked, whose `arg` holds one
-  // payload and whose stack holds another. The scheduler block is zeroed, so its
-  // registry lock is already `spinUnlocked` and its head is 0 until set here.
+  // ROOT CLASS 4 and ROOT CLASS 5: one registered task, parked, whose stack
+  // holds one payload (class 4) and whose `arg` holds another (class 5) —
+  // `stack=` and `arg=` in phase A are one assertion each. The scheduler block
+  // is zeroed, so its registry lock is already `spinUnlocked` and its head is 0
+  // until set here.
   let pArg = gcAlloc(g, nodeInfo)
   storeWord(pArg, M_ARG)
   let pStack = gcAlloc(g, nodeInfo)
   storeWord(pStack, M_STACK)
-  fakeStack[TASK_STACK_SLOT] = pStack
+
+  // The class-5 task, on the SHORT stack. Its own stack holds nothing: `arg` is
+  // the only root it contributes, so `arg=` cannot be carried by the stack walk.
   let t = ptrOf(fakeTask)
   *(t + taskArg) = pArg
   *(t + taskState) = taskParked
   *(t + taskStackBase) = int(ptrOf(fakeStack))
   *(t + taskStackBytes) = TASK_STACK_WORDS * 8
   *(t + ctxSp) = int(ptrOf(fakeStack))
+
+  // The class-4 task, on the long stack, with `sp` one word past the scratch
+  // area and `arg` empty — see LONG_STACK_WORDS for why that placement is the
+  // whole point.
+  let lt = ptrOf(longTask)
+  longStack[LONG_STACK_SLOT] = pStack
+  *(lt + taskArg) = 0
+  *(lt + taskState) = taskParked
+  *(lt + taskStackBase) = int(ptrOf(longStack))
+  *(lt + taskStackBytes) = LONG_STACK_WORDS * 8
+  *(lt + ctxSp) = int(ptrOf(longStack)) + chanScratchWords * 8
+
+  // Both on the all-tasks registry, in the intrusive `regNext` list the
+  // collector walks.
+  *(t + taskRegNext) = int(lt)
+  *(lt + taskRegNext) = 0
   *(ptrOf(schedBlock) + scRegHead) = int(t)
 
   // Reachable from nothing. Without this the phase would pass on a collector
@@ -263,11 +383,13 @@ function main() {
   // ---- phase B: drop every root, poll again, everything goes --------------
   storeWord(handle + CH_COUNT * 8, 0)
   *(t + taskArg) = 0
-  fakeStack[TASK_STACK_SLOT] = 0
+  longStack[LONG_STACK_SLOT] = 0
+  let cB = gcStatCollections(g)
   stwPoll(snap)
-  print("B chan=${gcOwns(g, pChan)} arg=${gcOwns(g, pArg)} stack=${gcOwns(g, pStack)} live=${gcNumObjects(g)}\n")
+  print("B ran=${gcStatCollections(g) > cB} chan=${gcOwns(g, pChan)} arg=${gcOwns(g, pArg)} stack=${gcOwns(g, pStack)} live=${gcNumObjects(g)}\n")
 
-  // ---- phase C: the precise stack-map walk marks what a stack map names ----
+  // ---- phase C: ROOT CLASS 2, the precise stack-map walk over THIS thread's
+  // own published snapshot: it marks what a real emitted stack map names ------
   let base = mapsBegin()
   let tblLen = mapsEnd() - base
   let hitPc = 0
@@ -313,12 +435,132 @@ function main() {
   storeWord(fp + hitSlot, pPrecise)
   storeWord(snap + 0, hitPc)       // ret: the safepoint this stack map describes
   storeWord(snap + 8, fp)          // fp: the synthetic frame above
+  let cC = gcStatCollections(g)
   stwPoll(snap)
-  print("C found=${hitPc != 0} precise=${alive(g, pPrecise, M_PRECISE)} missed=${gcOwns(g, pMissed)}\n")
+  print("C ran=${gcStatCollections(g) > cC} found=${hitPc != 0} precise=${alive(g, pPrecise, M_PRECISE)} missed=${gcOwns(g, pMissed)}\n")
+
+  // ---- phase D: ROOT CLASS 6, the per-task SCRATCH area (#1679) ------------
+  //
+  // THE CLASS THAT HAD NO CASE, and the reason this file grew (#1683). The
+  // scratch is the `chanScratchWords` words at the BASE of a task's stack, and
+  // a stack grows DOWN from its top, so the whole area sits strictly BELOW
+  // `ctx.sp` — outside class 4's `[sp, top)` range for every task, always, by
+  // construction. No stack map names those words either, so classes 2 and 3
+  // cannot see them and the RUNNING task is as exposed as a parked one.
+  //
+  // The task below makes that separation explicit rather than incidental: its
+  // `arg` is 0 (class 5 covers nothing) and its `sp` is set to the TOP of its
+  // stack, so the class-4 range is EMPTY. The only enumerated class that can
+  // reach these three payloads is the scratch scan.
+  //
+  // Three payloads, not one, and the third is a floor on the SCANNED SET
+  // rather than a repeat: `scrElem` (word 5) is the blocking channel
+  // send/receive slot and `scrErr` (word 7) is the pending-error object — the
+  // two references #1679 actually lost — while `scrRecvOk` (word 264) is the
+  // LAST word of the area. A scan that walks a prefix, or that enumerates only
+  // the two named words instead of the whole area, keeps the first two alive
+  // and drops the third.
+  let pElem = gcAlloc(g, nodeInfo)
+  storeWord(pElem, M_SCR_ELEM)
+  let pErr = gcAlloc(g, nodeInfo)
+  storeWord(pErr, M_SCR_ERR)
+  let pLast = gcAlloc(g, nodeInfo)
+  storeWord(pLast, M_SCR_LAST)
+  let pScrDead = gcAlloc(g, nodeInfo)
+  storeWord(pScrDead, M_SCR_DEAD)
+
+  scratchStack[scrElem] = pElem
+  scratchStack[scrErr] = pErr
+  scratchStack[scrRecvOk] = pLast
+
+  let t2 = ptrOf(scratchTask)
+  *(t2 + taskArg) = 0
+  *(t2 + taskState) = taskParked
+  *(t2 + taskStackBase) = int(ptrOf(scratchStack))
+  *(t2 + taskStackBytes) = chanScratchWords * 8
+  *(t2 + ctxSp) = int(ptrOf(scratchStack)) + chanScratchWords * 8
+  *(ptrOf(schedBlock) + scRegHead) = int(t2)
+
+  // Back to a snapshot that names nothing, so class 2 cannot carry this phase.
+  storeWord(snap + 0, 0)
+  storeWord(snap + 8, 0)
+  let cD = gcStatCollections(g)
+  stwPoll(snap)
+  print("D ran=${gcStatCollections(g) > cD} elem=${alive(g, pElem, M_SCR_ELEM)} err=${alive(g, pErr, M_SCR_ERR)} last=${alive(g, pLast, M_SCR_LAST)} dead=${gcOwns(g, pScrDead)} abandoned=${stwAbandonedCount()}\n")
+
+  // ---- phase E: ROOT CLASS 3, another stopped OS thread's PARKED FRAME -----
+  //
+  // The collector walks every OTHER registered mutator's published
+  // `SafepointFrame` precisely. Driving that with a real second OS thread would
+  // need one parked at a safepoint for the whole collection; the registry is
+  // plain memory under a stopped world, so a slot is synthesized instead —
+  // claimed through the shipped `worldClaim`, then published as parked with a
+  // frame, in the same three words a real parking thread writes.
+  //
+  // `acked` must carry the epoch of the collection that is ABOUT to run, or
+  // `worldStoppedFor` refuses to count the slot as stopped and the rendezvous
+  // expires instead of collecting. That is why the epoch word is read first and
+  // incremented by one: `worldRendezvous` bumps it exactly once per collection.
+  // A mis-set slot is loud rather than silent — `ran=false abandoned=1`.
+  let pPark = gcAlloc(g, nodeInfo)
+  storeWord(pPark, M_PARKED)
+  let pParkDead = gcAlloc(g, nodeInfo)
+  storeWord(pParkDead, M_PARKED_DEAD)
+
+  let fp2 = int(ptrOf(parkFrame)) + FRAME_MID * 8
+  storeWord(fp2, 0)
+  storeWord(fp2 + 8, 0)
+  storeWord(fp2 + hitSlot, pPark)
+
+  // What a parking thread publishes is its `SafepointFrame` (ABI.md §4), NOT
+  // its frame pointer — `worldPark(world, slot, frame)` is handed the same
+  // `snap` the shim built. Publishing the frame itself instead reads its first
+  // word as `ret`, finds 0 and walks nothing, which passes every structural
+  // check and marks nothing: measured here as `parked=false` before the fix.
+  let parkSnapAddr = int(ptrOf(parkSnap))
+  storeWord(parkSnapAddr + 0, hitPc)
+  storeWord(parkSnapAddr + 8, fp2)
+
+  let wb = ptrOf(worldBlock)
+  let slot = worldClaim(wb)
+  let epoch = worldBlock[maxMutators * MU_WORDS + MU_EPOCH_IDX] + 1
+  worldBlock[slot * MU_WORDS + MU_FRAME] = parkSnapAddr
+  worldBlock[slot * MU_WORDS + MU_ACKED] = epoch
+  worldBlock[slot * MU_WORDS + MU_STATE] = mParked
+
+  let cE = gcStatCollections(g)
+  stwPoll(snap)
+  print("E ran=${gcStatCollections(g) > cE} other=${slot > 0} parked=${alive(g, pPark, M_PARKED)} missed=${gcOwns(g, pParkDead)} abandoned=${stwAbandonedCount()}\n")
+  // RELEASED IMMEDIATELY, and it must be: the slot stays `parked` with a now
+  // stale `acked`, so leaving it registered would make every later rendezvous
+  // spin to its bound and abandon.
+  worldRelease(wb, slot)
+
+  // ---- phase F: the `bad=` counter is real and reachable (#1682) -----------
+  //
+  // `gcStatBadOffsets` counts pointer-map offsets the tracer REFUSED —
+  // misaligned, or running past the body — and skips the field instead of
+  // reading out of bounds. Until #1682 no linked binary could report it, so a
+  // degraded trace (fields skipped, referents unmarked, live objects swept)
+  // read exactly like a healthy one. The `BIT_GC_STATS` line now carries it,
+  // through `stwBadOffsets` — the SAME bound-block accessor read here, so this
+  // is the field's value and not a parallel path.
+  //
+  // An always-zero field would be worse than none, which is what the two halves
+  // below assert: 0 across five clean collections, and non-zero the moment one
+  // malformed `TypeInfo` is traced.
+  let bad0 = stwBadOffsets()
+  let pBad = gcAlloc(g, badInfo)
+  storeWord(pBad, M_BADMAP)
+  scratchStack[scrElem] = pBad
+  let cF = gcStatCollections(g)
+  stwPoll(snap)
+  print("F ran=${gcStatCollections(g) > cF} clean=${bad0} bad=${stwBadOffsets() > 0} alive=${alive(g, pBad, M_BADMAP)}\n")
 
   // Hold every backing slice to the end of `main`, so only raw untraced pointers
   // ever reach the collector under test and the LIVE (libbitrt) collector cannot
   // move the ground under it when the suite reruns under BIT_GC=stress.
   print("held ${len(arena) + len(indexArena) + len(heapBlock) + len(heapLock) + len(state) + len(meta)}\n")
-  print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(frameBuf) + len(snapBuf)}\n")
+  print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(longTask) + len(longStack) + len(frameBuf) + len(snapBuf)}\n")
+  print("held ${len(scratchTask) + len(scratchStack) + len(parkFrame) + len(parkSnap)}\n")
 }

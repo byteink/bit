@@ -278,6 +278,44 @@ const edges = [_]Edge{
         .why = "the worker loop must drain the netpoller, or a task parked on an fd has " ++
             "no thread in the process that can ever wake it (#1673)",
     },
+    // -----------------------------------------------------------------------
+    // THE `bad=` FIELD (#1682) — the one counter that says the trace was WRONG
+    // -----------------------------------------------------------------------
+    //
+    // `gcStatBadOffsets` counts pointer-map offsets the tracer refused as
+    // misaligned or out of body, and SKIPS the field rather than reading past
+    // it (`runtime/gc` deviation 5, where Zig asserts). A skipped field is a
+    // reference that never gets marked, so a non-zero count means the collector
+    // was handed a map it could not trust and traced less than it should have —
+    // and a degraded trace reads exactly like a healthy one everywhere else.
+    //
+    // It was WRITE-ONLY outside unit tests until #1682: `statsReport` printed
+    // collections/swept/live/abandoned/oom and stopped, which is why #1679's
+    // verification bar asked for `bad=0` from a real run and could not get it.
+    //
+    // An edge rather than a run, for this file's standing reason: pre-G2 the
+    // linked archive is Zig's, so no `BIT_GC_STATS` line a binary prints today
+    // comes from `boot.bit` at all. What is observable is that the emitted
+    // freestanding object for each platform boot references the accessor.
+    // Deleting the field from either `statsReport` reddens exactly its own
+    // entry, and both are listed because the two copies are kept identical by
+    // hand and nothing else forces them to agree.
+    .{
+        .path = "runtime/root/darwin",
+        .target = .aarch64_macos,
+        .from = "",
+        .to = "bit_rt_port_stw_bad_offsets",
+        .why = "the BIT_GC_STATS line must report refused pointer-map offsets, or a " ++
+            "silently degraded trace is indistinguishable from a healthy one (#1682)",
+    },
+    .{
+        .path = "runtime/root/linux",
+        .target = .x86_64_linux,
+        .from = "",
+        .to = "bit_rt_port_stw_bad_offsets",
+        .why = "the BIT_GC_STATS line must report refused pointer-map offsets, or a " ++
+            "silently degraded trace is indistinguishable from a healthy one (#1682)",
+    },
 };
 
 /// Upper bound on atoms/relocations walked in one object — every walk provably
@@ -411,4 +449,214 @@ fn checkEdge(gpa: std.mem.Allocator, e: Edge, module: anytype) !void {
         \\
     , .{ e.path, if (e.from.len == 0) "<any definition>" else want_from, want_to, e.why });
     return error.StwWiringMissing;
+}
+
+// ---------------------------------------------------------------------------
+// THE ROOT-CLASS POPULATION FLOOR (#1683)
+// ---------------------------------------------------------------------------
+//
+// #1679 was a root class covered by NOTHING. The per-task scratch area held two
+// live references — `scrElem`, a blocking channel send/receive's value slot, and
+// `scrErr`, the pending-error object — and no enumerated class reached them, so
+// a value in flight through a blocking channel was swept. Every gate in the tree
+// was green the whole time: `zig build`, `libbitrt`, `rootpins`, `rootabi`, the
+// edges above, `zig build test`, `test-stress` and the full differential sweep.
+//
+// None of them could have seen it. The differentials compare check/type/IR
+// dumps, and a root set appears in no dump. The object-level edges here check
+// that a call EXISTS; the missing class was not a missing symbol —
+// `gcMarkConservative` was linked and called, just never with those words.
+// `zig build test`'s imports corpus links the ZIG archive, whose `root.zig` has
+// no scratch area at all, so the defect is unreachable there by construction.
+//
+// `tests/stress/stwcollect` does drive the Bit collector and IS the right
+// vehicle, but on its own it can only check the classes its author thought of:
+// it builds its own synthetic root sources, and a class nobody wrote is a class
+// nobody constructs. That is the hole this test closes, and it is deliberately
+// the cheap, static half of the answer — the expensive half is the per-class
+// behavioural case over there, one payload reachable from exactly one class,
+// each of which reddens on its own when its class is deleted.
+//
+// So: the collector enumerates its classes in ONE place, `stw.bit`'s ROOT SET
+// header, and every one of them must carry a `ROOT CLASS <n>` case marker in
+// `stwcollect.bit`. Adding a class to the collector without adding a case is a
+// red build. Deleting a class from the header without deleting its case is a
+// red build. Dropping below the floor — the six classes that exist today — is a
+// red build even if the two sides still agree, which is what stops the whole
+// gate from being quietly emptied one class at a time.
+//
+// The scratch area's own width is floored for the same reason one level down:
+// the scan is bounded by `min(chanScratchWords, stackBytes/8)`, so a shrunken
+// `chanScratchWords` would silently narrow the SCANNED SET while every class
+// stayed present and every case stayed green.
+
+/// The six classes `stw.bit` enumerates today (#1679 added the sixth). Raising
+/// this is part of adding a class; LOWERING it means a class was deleted, which
+/// is exactly the change that must not pass silently.
+const min_root_classes = 6;
+
+/// The scratch area's width today. The scan walks the whole area, so this is
+/// the population of words a missing-root check can possibly cover.
+const min_scratch_words = 265;
+
+const stw_source = "runtime/stw/stw.bit";
+const stw_root_set_anchor = "THE ROOT SET, AND WHY IT IS ALL-OR-NOTHING";
+const stwcollect_source = "tests/stress/stwcollect/stwcollect.bit";
+const case_marker = "ROOT CLASS ";
+const scratch_source = "runtime/sched/scratch.bit";
+const scratch_words_decl = "export const chanScratchWords: int = ";
+
+/// A set of class numbers 1..63, so the two sides can be compared and the
+/// difference NAMED rather than reported as a count mismatch.
+const ClassSet = u64;
+
+fn has(set: ClassSet, n: u6) bool {
+    return set & (@as(ClassSet, 1) << n) != 0;
+}
+
+fn readSource(gpa: std.mem.Allocator, io: Io, rel: []const u8) ![]u8 {
+    const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, rel });
+    return Io.Dir.cwd().readFileAlloc(io, abs, gpa, .limited(1 << 20));
+}
+
+/// Every class number enumerated in `stw.bit`'s ROOT SET header.
+///
+/// Bounded to that comment block by its own heading rather than matched over
+/// the whole file: `stwPoll`'s body carries a second numbered list ("1. Someone
+/// else is collecting"), and a file-wide scan would silently fold the two
+/// together — a gate that examines the wrong set is the failure mode this
+/// whole test exists to prevent.
+fn rootClassesDeclared(src: []const u8) !ClassSet {
+    const anchor = std.mem.indexOf(u8, src, stw_root_set_anchor) orelse {
+        std.debug.print(
+            "stwwiring: {s}: the ROOT SET header ('{s}') is gone. This test examined " ++
+                "nothing, which is a failure and not a pass — the class enumeration it " ++
+                "reads was renamed or deleted (#1683).\n",
+            .{ stw_source, stw_root_set_anchor },
+        );
+        return error.RootSetHeaderMissing;
+    };
+
+    var set: ClassSet = 0;
+    var it = std.mem.splitScalar(u8, src[anchor..], '\n');
+    _ = it.next(); // the heading line itself
+    var lines: usize = 0;
+    while (it.next()) |line| {
+        lines += 1;
+        if (lines > max_scan) return error.TooMuchToScan;
+        // The block ends at the first line that is not a comment.
+        if (!std.mem.startsWith(u8, line, "//")) break;
+        const body = std.mem.trimStart(u8, line[2..], " ");
+        if (body.len < 3) continue;
+        const dot = std.mem.indexOfScalar(u8, body, '.') orelse continue;
+        if (dot == 0 or dot > 2) continue;
+        const n = std.fmt.parseInt(u6, body[0..dot], 10) catch continue;
+        if (n == 0) continue;
+        set |= @as(ClassSet, 1) << n;
+    }
+    return set;
+}
+
+/// Every class number a `ROOT CLASS <n>` marker in `stwcollect.bit` claims a
+/// case for. A marker not followed by digits (the rule stated in that file's
+/// own header) contributes nothing.
+fn rootClassesCovered(src: []const u8) !ClassSet {
+    var set: ClassSet = 0;
+    var at: usize = 0;
+    var found: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, case_marker)) |i| {
+        found += 1;
+        if (found > max_scan) return error.TooMuchToScan;
+        at = i + case_marker.len;
+        var end = at;
+        while (end < src.len and std.ascii.isDigit(src[end])) end += 1;
+        if (end == at) continue;
+        const n = std.fmt.parseInt(u6, src[at..end], 10) catch continue;
+        if (n == 0) continue;
+        set |= @as(ClassSet, 1) << n;
+    }
+    return set;
+}
+
+test "every enumerated GC root class has a case in tests/stress/stwcollect" {
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const declared = try rootClassesDeclared(try readSource(gpa, io, stw_source));
+    const covered = try rootClassesCovered(try readSource(gpa, io, stwcollect_source));
+
+    if (@popCount(declared) < min_root_classes) {
+        std.debug.print(
+            "stwwiring: {s} enumerates {d} root classes, floor is {d}. A class was " ++
+                "REMOVED from the collector's root set. That is not a cleanup: the " ++
+                "symptom of a missing class is a live object swept and a wrong answer " ++
+                "somewhere else entirely (#1679). If the removal is deliberate, delete " ++
+                "its case in {s} and lower the floor in the same change.\n",
+            .{ stw_source, @popCount(declared), min_root_classes, stwcollect_source },
+        );
+        return error.RootClassCountBelowFloor;
+    }
+
+    var n: u6 = 1;
+    while (n < 63) : (n += 1) {
+        if (has(declared, n) and !has(covered, n)) {
+            std.debug.print(
+                "stwwiring: root class {d} is enumerated in {s} and has NO case in {s}.\n" ++
+                    "  Add a phase there that makes one payload reachable from THAT CLASS " ++
+                    "ALONE, asserts it survives a collection with a non-zero count, and " ++
+                    "marks itself 'ROOT CLASS {d}'.\n" ++
+                    "  A class with no case is exactly #1679: every build, link, golden, " ++
+                    "differential and stress gate stayed green while a live value was " ++
+                    "being swept.\n",
+                .{ n, stw_source, stwcollect_source, n },
+            );
+            return error.RootClassUncovered;
+        }
+        if (has(covered, n) and !has(declared, n)) {
+            std.debug.print(
+                "stwwiring: {s} claims a case for root class {d}, which {s} does not " ++
+                    "enumerate. Either the class was deleted from the collector (see the " ++
+                    "floor above) or the marker is stale — a case for a class that does " ++
+                    "not exist tests nothing.\n",
+                .{ stwcollect_source, n, stw_source },
+            );
+            return error.RootClassCaseStale;
+        }
+    }
+}
+
+test "the scanned scratch area has not shrunk" {
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    const src = try readSource(gpa, io, scratch_source);
+    const at = std.mem.indexOf(u8, src, scratch_words_decl) orelse {
+        std.debug.print(
+            "stwwiring: {s}: no '{s}' declaration. This check examined nothing.\n",
+            .{ scratch_source, scratch_words_decl },
+        );
+        return error.ScratchWidthAnchorMissing;
+    };
+    const rest = src[at + scratch_words_decl.len ..];
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    const words = try std.fmt.parseInt(usize, rest[0..end], 10);
+
+    if (words < min_scratch_words) {
+        std.debug.print(
+            "stwwiring: chanScratchWords is {d}, floor is {d}. The stop-the-world scratch " ++
+                "scan walks min(chanScratchWords, stackBytes/8) words, so shrinking this " ++
+                "NARROWS THE SCANNED SET while root class 6 stays present and its case " ++
+                "stays green — the live references at scrElem/scrErr/scrRecvOk fall out " ++
+                "of the scan one word at a time (#1679, #1683).\n",
+            .{ words, min_scratch_words },
+        );
+        return error.ScratchAreaShrunk;
+    }
 }
