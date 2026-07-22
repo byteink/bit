@@ -38,13 +38,23 @@ ${bad_states}
   saying what is proven and what is next) if it did not."
 fi
 
-# --- in_progress vs reality -------------------------------------------------
-inprog=$(smash whois 2>/dev/null | sed -n 's/^  In Progress: *\([0-9]*\).*/\1/p')
-if [ -n "${inprog:-}" ] && [ "${inprog}" -gt 0 ] 2>/dev/null; then
-  findings="${findings}
-IN PROGRESS: ${inprog} ticket(s). Each MUST have an agent actively on it right now.
-  If one does not, set it back to pending with a comment, or complete it. An
-  in_progress ticket nobody is working is the board lying."
+# --- in_progress: report, never block ---------------------------------------
+# in_progress is the NORMAL state while agents are running, so blocking on it
+# would jam every turn of a long parallel run. Print the list instead: the point
+# is that each id gets eyeballed against the live agents, not that the count is
+# zero. A ticket here with nobody on it is the board lying — set it back to
+# pending with a comment, or complete it.
+inprog=$(smash stats --json 2>/dev/null | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+rows = d.get('tasks') or d.get('perTask') or d.get('rows') or []
+for t in rows:
+    if (t.get('status') or '')=='in_progress':
+        print('  #%s %s' % (t.get('id'), (t.get('summary') or '')[:60]))
+" 2>/dev/null)
+if [ -n "${inprog}" ]; then
+  printf 'IN PROGRESS — confirm each still has a live agent:\n%s\n' "${inprog}" >&2
 fi
 
 # --- worktrees / branches ---------------------------------------------------
