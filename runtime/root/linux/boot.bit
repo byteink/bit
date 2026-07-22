@@ -66,6 +66,54 @@
 // before the stack-guard machinery exists, and `@nosplit` rejects `syscall`
 // anyway (E0075). `mainTrampoline` calls the user's `bit_main`, arbitrary work
 // that must reach safepoints, so it is not `@nosplit` either.
+//
+// ---------------------------------------------------------------------------
+// THE BOOT THREAD AND THE RENDEZVOUS (#1660) — kept identical in ../darwin/boot.bit
+// ---------------------------------------------------------------------------
+//
+// This is the ONE place the Bit boot diverges from `root.zig`'s by construction
+// rather than by choice, so the reasoning is recorded here in full.
+//
+// `root.zig`'s boot thread never appears in the mutator registry: Zig code
+// carries no back-edge safepoint polls, so that thread cannot take a safepoint,
+// never calls `currentMutator`, and its `World` slot stays `mFree` — which
+// `stoppedFor` counts as stopped. `boot` here is ordinary Bit, so codegen puts a
+// `bl bit_rt_safepoint` on step 7's back edge and on `joinWorker`'s. The thread
+// therefore DOES claim a slot and DOES go `mRunning`. It then sleeps up to 1 ms
+// per iteration while the collector burns its whole `stwSpinBound` (1e6) waiting
+// for it, so the rendezvous expires and the collection is abandoned: 165-168
+// abandoned collections in a measured 200k-collection `BIT_GC=stress` run.
+//
+// THE FIX IS NOT "DO NOT REGISTER". A thread that reaches safepoints must be
+// visible to the rendezvous for as long as it can run Bit code, and suppressing
+// its poll is the exact shape #1650/#1651 had to delete (`schedCurrentTask() == 0`
+// suppressed a worker's own OS-thread stack, whose closure cells were then swept
+// while live). Nor is it "poll promptly instead of sleeping": that pegs a core
+// for the whole program.
+//
+// It is the ABI's own `blocked` contract (ABI.md §5), applied exactly where
+// `sched.zig` applies it to its idle sleep: bracket THE SLEEP, and nothing else,
+// with `bit_rt_gc_blocking_begin`/`_end`. `blocked` means "holds no live Bit
+// reference for the whole bracketed region", and the collector then passes the
+// slot without waiting for it and without scanning its stack.
+//
+// THE PRECONDITION HOLDS, AND IT IS THE WHOLE SAFETY ARGUMENT — a partial root
+// enumeration sweeps live objects, so this is not an optimisation to hand-wave.
+// `boot` allocates NOTHING on the managed heap, at any point: the heap, the
+// scheduler block, the task block, the channel reserve and the stats buffer are
+// `mapPages` mappings and module-state arrays (untraced scalars, rule 1), the
+// GC config is parsed straight off `environ` as raw pointers
+// (`../rootconfig.bit`'s `gcEnvValuePtr`/`gcCstrUsize` build no string), and
+// `statsReport` writes packed byte constants into `statsBuf` for the reason its
+// own comment gives. Every local live across the bracketed sleep is an `int` or
+// a `*i64` into module state, i.e. outside the heap bounds `gcMarkConservative`
+// tests. The one managed object this file's control flow ever creates belongs to
+// `bit_main`, which runs on the WORKER's green task, not here.
+//
+// Outside the bracket the thread is `mRunning` and polls normally, which is what
+// keeps the registration honest: the running window is the handful of
+// instructions between the sleep returning and the loop's back edge, and the
+// poll there publishes a real snapshot as any mutator does.
 
 import { mapPages } from "../../alloc/linux"
 import { threadStart, threadRelease } from "../../thread/linux"
@@ -83,6 +131,7 @@ import {
 import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootStatOom, osSetArgs, osSetAuxv } from "../../root"
 import { rootGcAddr } from "../../root"
 import { chanBootBind } from "../../chan"
+import { gcBlockingBegin, gcBlockingEnd } from "../../gc"
 import { stwBind, stwCollections, stwSwept, stwLiveObjects, stwAbandonedCount } from "../../stw"
 
 // `loadWord` (../../gc) and `parkMonoNs` (../../park/linux) are already imported
@@ -462,10 +511,13 @@ function boot(): int {
   // 7. This OS thread is not a worker, so it waits for `main` the way any
   //    external caller would: poll with bounded exponential backoff, the same
   //    shape as `sched.zig`'s idle loop. Unbounded by design — it waits for the
-  //    program itself to finish.
+  //    program itself to finish. THE SLEEP IS BRACKETED `blocked` — see "THE BOOT
+  //    THREAD AND THE RENDEZVOUS" above. Identical in ../darwin/boot.bit.
   let backoff = 1000
   while (atomicLoad(ptrOf(mainDone)) == i32(0)) {
+    gcBlockingBegin()
     parkSleepNs(backoff)
+    gcBlockingEnd()
     backoff = backoff * 2
     if (backoff > 1000000) {
       backoff = 1000000
