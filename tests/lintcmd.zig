@@ -10,6 +10,13 @@
 //!
 //! Exit codes are a CI contract, so every one of the three is asserted here,
 //! against a fixture that produces it for the documented reason.
+//!
+//! Exec's a private per-run copy of the compiler (`tests/selfbin.zig`, #1644)
+//! rather than the build artifact directly — a second concurrent `zig build`
+//! truncates that artifact in place and macOS kills a live exec of it with no
+//! output, a false red indistinguishable from "the compiler is broken". Every
+//! spawn carries the shared `tests/proc.zig` deadline (#1652/#1672): a hung
+//! `bit lint` used to block `zig build test` forever with no case named.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -17,6 +24,9 @@ const build_options = @import("build_options");
 const testing = std.testing;
 const Io = std.Io;
 const Dir = std.Io.Dir;
+
+const proc = @import("proc.zig");
+const selfbin = @import("selfbin.zig");
 
 const Run = struct {
     code: u8,
@@ -30,23 +40,35 @@ const Run = struct {
 };
 
 /// Runs `bit lint <args...>` with `cwd` as the working directory. A signalled
-/// exit is reported as 255 so it can never be mistaken for one of 0/1/2.
-fn runLint(gpa: std.mem.Allocator, io: Io, cwd: []const u8, args: []const []const u8) !Run {
-    // The child runs in the fixture directory, so the compiler's own path must
-    // be absolute — a build-relative LazyPath would resolve against /tmp.
-    const bit_abs = try Dir.cwd().realPathFileAlloc(io, build_options.selfhost_bit, gpa);
-    defer gpa.free(bit_abs);
-
+/// exit is reported as 255 so it can never be mistaken for one of 0/1/2. A
+/// timeout is never folded into that bucket: it is a distinct, named failure
+/// (see `tests/proc.zig`'s header), so it returns an error instead of a `Run`.
+fn runLint(
+    gpa: std.mem.Allocator,
+    io: Io,
+    timeout_s: u32,
+    bit_abs: []const u8,
+    cwd: []const u8,
+    args: []const []const u8,
+) !Run {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, bit_abs);
     try argv.append(gpa, "lint");
     try argv.appendSlice(gpa, args);
 
-    const result = try std.process.run(gpa, io, .{
+    const outcome = try proc.run(gpa, io, timeout_s, .{
         .argv = argv.items,
         .cwd = .{ .path = cwd },
     });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("lintcmd: 'bit lint' TIMED OUT\n", .{});
+            proc.timedOutNote(limit, bit_abs);
+            return error.LintTimedOut;
+        },
+    };
     return .{
         .code = switch (result.term) {
             .exited => |c| c,
@@ -101,13 +123,17 @@ test "bit lint: exit 1 on a finding, exit 0 once an override covers it" {
     defer threaded.deinit();
     const io = threaded.io();
 
+    const bit_abs = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, bit_abs);
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     const root = try makeFixture(gpa, io);
     defer gpa.free(root);
     defer Dir.cwd().deleteTree(io, root) catch {};
 
     // The whole tree: big.bit is over, raised.bit is covered by its override.
     {
-        const r = try runLint(gpa, io, root, &.{"."});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{"."});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 1), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "warning[E0200]") != null);
@@ -123,7 +149,7 @@ test "bit lint: exit 1 on a finding, exit 0 once an override covers it" {
 
     // A clean subtree still prints the summary, and exits 0.
     {
-        const r = try runLint(gpa, io, root, &.{"sub"});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{"sub"});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 0), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "lint: 0 findings, 0 overrides active") != null);
@@ -131,7 +157,7 @@ test "bit lint: exit 1 on a finding, exit 0 once an override covers it" {
 
     // No path argument means `.`, so it must agree with the explicit form.
     {
-        const r = try runLint(gpa, io, root, &.{});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 1), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "lint: 1 findings, 1 overrides active") != null);
@@ -139,7 +165,7 @@ test "bit lint: exit 1 on a finding, exit 0 once an override covers it" {
 
     // A single file names exactly that file.
     {
-        const r = try runLint(gpa, io, root, &.{"raised.bit"});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{"raised.bit"});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 0), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "lint: 0 findings, 1 overrides active") != null);
@@ -154,11 +180,15 @@ test "bit lint: --json goes to stdout in the check --json shape" {
     defer threaded.deinit();
     const io = threaded.io();
 
+    const bit_abs = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, bit_abs);
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     const root = try makeFixture(gpa, io);
     defer gpa.free(root);
     defer Dir.cwd().deleteTree(io, root) catch {};
 
-    const r = try runLint(gpa, io, root, &.{ "--json", "." });
+    const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{ "--json", "." });
     defer r.deinit(gpa);
     try testing.expectEqual(@as(u8, 1), r.code);
 
@@ -192,11 +222,15 @@ test "bit lint: --stats lists the overrides in force and reports no findings" {
     defer threaded.deinit();
     const io = threaded.io();
 
+    const bit_abs = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, bit_abs);
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     const root = try makeFixture(gpa, io);
     defer gpa.free(root);
     defer Dir.cwd().deleteTree(io, root) catch {};
 
-    const r = try runLint(gpa, io, root, &.{ "--stats", "." });
+    const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{ "--stats", "." });
     defer r.deinit(gpa);
     // Findings are suppressed, so the run is clean even though big.bit is over.
     try testing.expectEqual(@as(u8, 0), r.code);
@@ -214,13 +248,17 @@ test "bit lint: exit 2 on a usage error, an unreadable path, and a bad directive
     defer threaded.deinit();
     const io = threaded.io();
 
+    const bit_abs = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, bit_abs);
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     const root = try makeFixture(gpa, io);
     defer gpa.free(root);
     defer Dir.cwd().deleteTree(io, root) catch {};
 
     // Usage error: an unknown flag is never taken for a path.
     {
-        const r = try runLint(gpa, io, root, &.{ "--quiet", "." });
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{ "--quiet", "." });
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 2), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "unknown flag '--quiet'") != null);
@@ -228,7 +266,7 @@ test "bit lint: exit 2 on a usage error, an unreadable path, and a bad directive
 
     // Unreadable path: named by the user and not read is a hole in the run.
     {
-        const r = try runLint(gpa, io, root, &.{"no/such/path"});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{"no/such/path"});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 2), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "no such file or directory") != null);
@@ -248,7 +286,7 @@ test "bit lint: exit 2 on a usage error, an unreadable path, and a bad directive
     };
     for (cases) |c| {
         try dir.writeFile(io, .{ .sub_path = "bad.bit", .data = c.src });
-        const r = try runLint(gpa, io, root, &.{"."});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{"."});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 2), r.code);
         try testing.expect(std.mem.indexOf(u8, r.stderr, c.code) != null);
@@ -261,7 +299,7 @@ test "bit lint: exit 2 on a usage error, an unreadable path, and a bad directive
 
     // And with every directive fixed, the same tree is back to exit 1.
     {
-        const r = try runLint(gpa, io, root, &.{"."});
+        const r = try runLint(gpa, io, timeout_s, bit_abs, root, &.{"."});
         defer r.deinit(gpa);
         try testing.expectEqual(@as(u8, 1), r.code);
     }
