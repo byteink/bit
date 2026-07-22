@@ -3,13 +3,21 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Io = std.Io;
 
-const diagnostics = @import("diagnostics.zig");
+/// `pub` alongside `parser`, for the same gate: driving the parser directly
+/// means supplying it a `SourceManager` and `Diagnostics` to report into.
+pub const diagnostics = @import("diagnostics.zig");
 const lexer = @import("lexer.zig");
 /// `pub` so the AST tag-set parity gate (tests/ast_tags.zig) can enumerate
 /// `Tag` by reflection instead of parsing ast.zig — a text scan of that file
 /// silently misses `@"export"`.
 pub const ast = @import("ast.zig");
-const parser = @import("parser.zig");
+/// `pub` for the runtime-ABI register-class gate (tests/rootabi.zig), which
+/// reads the *declared* signature of every `@symbol`-pinned runtime function.
+/// A declaration is one of the few properties that genuinely does live in the
+/// source text, so unlike tests/rootpins.zig this gate can answer its question
+/// without emitting an object — but it still asks the real parser rather than a
+/// text scan, so it cannot drift from the grammar.
+pub const parser = @import("parser.zig");
 const resolve = @import("resolve.zig");
 const check = @import("check.zig");
 const lower = @import("lower.zig");
