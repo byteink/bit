@@ -116,6 +116,7 @@ const builtin = @import("builtin");
 const bit = @import("bit");
 const build_options = @import("build_options");
 const proc = @import("proc.zig");
+const selfbin = @import("selfbin.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -124,6 +125,15 @@ const Dir = std.Io.Dir;
 /// Upper bound on programs scanned — keeps the directory walk provably bounded
 /// (Power of 10).
 const max_programs = 256;
+
+/// The self-hosted compiler this run execs — a PRIVATE COPY, never
+/// `build_options.selfhost_bit` itself. A concurrent `zig build` rewrites that
+/// artifact in place and macOS SIGKILLs the exec, failing every case with no
+/// output at all (#1644); see tests/selfbin.zig.
+///
+/// Module-scoped rather than threaded through `runStress`: written once, by the
+/// test below, before the first program is built, and only read afterwards.
+var self_compiler: []const u8 = "";
 
 test "stress programs pass under default and BIT_GC=stress" {
     if (build_options.libbitrt_path.len == 0) return; // host not a runtime target
@@ -137,6 +147,15 @@ test "stress programs pass under default and BIT_GC=stress" {
 
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();
+
+    // Exec a PRIVATE COPY of `bit`, never the build system's own artifact: a
+    // concurrent `zig build` rewrites that file in place and macOS SIGKILLs the
+    // exec, failing every case with no output (#1644). See tests/selfbin.zig.
+    var copy_threaded = Io.Threaded.init(gpa, .{});
+    defer copy_threaded.deinit();
+    const copy = try selfbin.privateCopy(gpa, copy_threaded.io(), build_options.selfhost_bit);
+    defer selfbin.release(gpa, copy_threaded.io(), copy);
+    self_compiler = copy;
 
     var dir = Dir.openDirAbsolute(io, build_options.stress_dir, .{ .iterate = true }) catch |e| {
         std.debug.print("cannot open stress dir '{s}': {s}\n", .{ build_options.stress_dir, @errorName(e) });
@@ -276,27 +295,25 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_a
 
     // The compiler is bounded too: a compiler that loops forever stalls the
     // suite exactly as a deadlocked stress program does, and says even less.
+    std.debug.assert(self_compiler.len > 0);
     const outcome = try proc.run(gpa, run_io, timeout_s, .{
-        .argv = &.{ build_options.selfhost_bit, "build", dir_abs, "-o", out_path },
+        .argv = &.{ self_compiler, "build", dir_abs, "-o", out_path },
         .environ_map = &env,
     });
     const result = switch (outcome) {
         .finished => |r| r,
         .timed_out => |limit| {
             std.debug.print("stress '{s}' [selfhost]: COMPILE TIMED OUT\n", .{name});
-            proc.timedOutNote(limit, build_options.selfhost_bit);
+            proc.timedOutNote(limit, self_compiler);
             return error.StressSelfhostCompileTimedOut;
         },
     };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
-    const ok = switch (result.term) {
-        .exited => |c| c == 0,
-        else => false,
-    };
-    if (ok) return;
-    std.debug.print("stress '{s}' [selfhost]: compile failed:\n{s}{s}\n", .{ name, result.stdout, result.stderr });
+    if (result.term == .exited and result.term.exited == 0) return;
+    std.debug.print("stress '{s}' [selfhost]: compile failed:\n", .{name});
+    proc.toolFailedNote(result.term, self_compiler, result.stdout, result.stderr);
     return error.StressSelfhostCompileFailed;
 }
 

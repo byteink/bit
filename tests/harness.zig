@@ -66,6 +66,7 @@ const std = @import("std");
 const bit = @import("bit");
 const build_options = @import("build_options");
 const proc = @import("proc.zig");
+const selfbin = @import("selfbin.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -90,9 +91,28 @@ const Outcome = enum { checked, ran_both, skipped };
 /// a crash (signal, 255) from passing as a panic.
 const panic_exit_code: u8 = 2;
 
+/// The self-hosted compiler this run execs — a PRIVATE COPY, never
+/// `build_options.selfhost_bit` itself. A concurrent `zig build` rewrites that
+/// artifact in place and macOS SIGKILLs the exec mid-flight, failing every case
+/// with no output at all (#1644); see tests/selfbin.zig. Empty on a cross build,
+/// where there is no runnable `bit`.
+///
+/// Module-scoped rather than threaded through `checkCase`: it is written once,
+/// by the test below, before the first case runs, and only read afterwards.
+var self_compiler: []const u8 = "";
+
 test "golden cases" {
     const gpa = testing.allocator;
     const io = Io.Threaded.global_single_threaded.io();
+
+    var copy_threaded = Io.Threaded.init(gpa, .{});
+    defer copy_threaded.deinit();
+    const copy: ?[:0]const u8 = if (build_options.selfhost_bit.len > 0)
+        try selfbin.privateCopy(gpa, copy_threaded.io(), build_options.selfhost_bit)
+    else
+        null;
+    defer if (copy) |p| selfbin.release(gpa, copy_threaded.io(), p);
+    self_compiler = copy orelse "";
 
     var dir = Dir.openDirAbsolute(io, build_options.cases_dir, .{ .iterate = true }) catch |e| {
         std.debug.print("cannot open cases dir '{s}': {s}\n", .{ build_options.cases_dir, @errorName(e) });
@@ -302,27 +322,25 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, out_p
 
     // The compiler is bounded too: a compiler that loops forever stalls the
     // suite exactly as a hung case binary does, and says even less about why.
+    std.debug.assert(self_compiler.len > 0);
     const outcome = try proc.run(gpa, run_io, timeout_s, .{
-        .argv = &.{ build_options.selfhost_bit, "build", case_path, "-o", out_path },
+        .argv = &.{ self_compiler, "build", case_path, "-o", out_path },
         .environ_map = &env,
     });
     const result = switch (outcome) {
         .finished => |r| r,
         .timed_out => |limit| {
             std.debug.print("case '{s}' [selfhost]: COMPILE TIMED OUT\n", .{name});
-            proc.timedOutNote(limit, build_options.selfhost_bit);
+            proc.timedOutNote(limit, self_compiler);
             return error.SelfhostCompileTimedOut;
         },
     };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
-    const ok = switch (result.term) {
-        .exited => |c| c == 0,
-        else => false,
-    };
-    if (ok) return;
-    std.debug.print("case '{s}' [selfhost]: expected compile to succeed, got:\n{s}{s}\n", .{ name, result.stdout, result.stderr });
+    if (result.term == .exited and result.term.exited == 0) return;
+    std.debug.print("case '{s}' [selfhost]: expected compile to succeed:\n", .{name});
+    proc.toolFailedNote(result.term, self_compiler, result.stdout, result.stderr);
     return error.SelfhostCompileFailed;
 }
 

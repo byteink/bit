@@ -76,6 +76,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bit = @import("bit");
 const build_options = @import("build_options");
+const selfbin = @import("selfbin.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -120,6 +121,13 @@ fn targetFlag(t: bit.BuildTarget) []const u8 {
 /// (Power of 10 rule 2). Two orders of magnitude above today's counts.
 const max_symbols = 16384;
 
+/// The self-hosted compiler these gates exec — a PRIVATE COPY, never
+/// `build_options.selfhost_bit` itself. A concurrent `zig build` rewrites that
+/// artifact in place and macOS SIGKILLs the exec with no output at all (#1644);
+/// see tests/selfbin.zig. Each test below publishes its own copy here before it
+/// visits a fixture, and releases it on the way out.
+var self_compiler: []const u8 = "";
+
 test "seed and selfhost emit the same undefined-symbol set" {
     // An empty fixture list makes the loop below a no-op and the whole gate a
     // green no-op with it — a per-fixture vacuity check cannot fire for a
@@ -142,6 +150,10 @@ test "seed and selfhost emit the same undefined-symbol set" {
     var threaded = Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+
+    const copy = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, copy);
+    self_compiler = copy;
 
     var failures: usize = 0;
 
@@ -286,7 +298,7 @@ fn emitWithSelfhost(gpa: std.mem.Allocator, io: Io, dir_abs: []const u8, f: Fixt
 
     const result = try std.process.run(gpa, io, .{
         .argv = &.{
-            build_options.selfhost_bit,
+            self_compiler,
             "build",
             dir_abs,
             "--emit-obj",
@@ -337,6 +349,10 @@ test "both linkers accept every legitimate extern program" {
 
     const libbitrt = try Dir.cwd().readFileAlloc(io, build_options.libbitrt_path, gpa, .limited(64 << 20));
 
+    const copy = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, copy);
+    self_compiler = copy;
+
     for (fixtures) |f| {
         const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, f.path });
 
@@ -344,7 +360,7 @@ test "both linkers accept every legitimate extern program" {
         const self_out = try std.fmt.allocPrint(gpa, "/tmp/bit-diflink-{s}-{x}", .{ std.fs.path.basename(abs), testing.random_seed });
         defer Dir.cwd().deleteFile(io, self_out) catch {};
         const r = try std.process.run(gpa, io, .{
-            .argv = &.{ build_options.selfhost_bit, "build", abs, "-o", self_out, "--target", targetFlag(target) },
+            .argv = &.{ self_compiler, "build", abs, "-o", self_out, "--target", targetFlag(target) },
         });
         if (r.term != .exited or r.term.exited != 0) {
             std.debug.print(

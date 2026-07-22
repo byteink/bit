@@ -163,6 +163,54 @@ pub fn timedOutNote(limit_s: u32, argv0: []const u8) void {
     );
 }
 
+/// Reports a COMPILER subprocess that did not exit 0, and says which kind of
+/// "did not exit 0" it was.
+///
+/// A compile that fails by exiting non-zero has diagnostics to show. A compile
+/// that dies by SIGNAL has nothing to show, because the tool never reached
+/// `main` — and printing its two empty streams under a "compile failed:" header
+/// produces the single most misleading line this harness can emit: an
+/// all-cases red with no text, which reads exactly like "the self-hosted
+/// compiler broke on every program in the corpus".
+///
+/// The instance that has actually happened here (#1644, reproduced) is SIGKILL
+/// with both streams empty. macOS kills an exec immediately, before `main`,
+/// with `EXC_CRASH / SIGKILL (Code Signature Invalid)` when the binary's file
+/// is truncated and rewritten underneath it. `bit` is emitted by a
+/// `has_side_effects` Run step, which Zig writes DIRECTLY to a deterministic
+/// `.zig-cache/o/<digest>/bit` on every invocation with no temp-and-rename — so
+/// a second concurrent `zig build` sharing that cache root truncates the very
+/// file a live harness is exec'ing. `tests/selfbin.zig` removes the cause; this
+/// note is the backstop for every other way a tool can be killed.
+pub fn toolFailedNote(
+    term: std.process.Child.Term,
+    tool: []const u8,
+    stdout: []const u8,
+    stderr: []const u8,
+) void {
+    switch (term) {
+        .exited => |code| std.debug.print("  exited {d}\n{s}{s}\n", .{ code, stdout, stderr }),
+        .signal, .stopped => |sig| {
+            std.debug.print(
+                "  KILLED BY SIG{s} ({d}) — the tool did not run to completion.\n",
+                .{ signalName(sig), @intFromEnum(sig) },
+            );
+            if (stdout.len == 0 and stderr.len == 0) std.debug.print(
+                "  It produced NO output at all, so this is NOT a compile error and NOT\n" ++
+                    "  evidence that '{s}' is broken. A signal death before any output means\n" ++
+                    "  the process was killed from outside: on macOS the usual cause is the\n" ++
+                    "  binary's file being rewritten while it was exec'd (run only ONE\n" ++
+                    "  `zig build` at a time per cache root), or the box running out of memory.\n",
+                .{tool},
+            ) else std.debug.print("{s}{s}\n", .{ stdout, stderr });
+        },
+        .unknown => |raw| std.debug.print(
+            "  terminated abnormally (raw status {d}); no output to report.\n{s}{s}\n",
+            .{ raw, stdout, stderr },
+        ),
+    }
+}
+
 test "parseTimeout: unset, explicit, disable, clamp, garbage" {
     try std.testing.expectEqual(@as(?u32, null), parseTimeout(""));
     try std.testing.expectEqual(@as(?u32, null), parseTimeout("  \n"));

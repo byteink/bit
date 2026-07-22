@@ -1,0 +1,158 @@
+// Large-block RECYCLING: the property #1641 fixed and nothing guarded (#1663).
+//
+// `gcHeapFree`'s large branch (runtime/gc/gc.bit) must `memUnmapPages` the
+// pages of a direct-mapped block. Before #1641 it adjusted two counters and
+// dropped the address on the floor, so every slice or string backing above
+// `allocMaxSmall` (16 KiB) leaked its pages for the life of the process.
+//
+// WHY THIS FILE DOES NOT ASSERT ON THE COUNTERS. It is the trap that let the
+// leak live: `heapLargeFreeLocked` already did both `atomicSub`s, so
+// `gcLiveBytes`/`heapMappedBytes` reported the pages as released whether or not
+// they were. Measured on the fix and on the same tree with the `memUnmapPages`
+// line deleted, the counters are IDENTICAL (live=8192 mapped=131072 both ways).
+// #1641's own proposed verify section was therefore vacuous, and an assertion
+// written against those numbers here would pass in both directions.
+//
+// Two signals do separate the two, and this file uses the sharper and cheaper
+// of them: ADDRESS REUSE. A block whose pages were unmapped returns its address
+// range to the OS, so a later `memMapPages` of the same size can be handed the
+// same address back. A block that was never unmapped CANNOT be: its mapping is
+// still live, so the kernel will never return that range again while the
+// process runs. Under the bug the reuse count is not merely small, it is
+// exactly and necessarily ZERO. (The other signal is RSS — 54 MB fixed against
+// 2 GB mutated — but reading RSS needs a measurement from outside the process,
+// which does not fit the harness's stdout-vs-`.expected` shape.)
+//
+// The output is a PREDICATE, not a count. How many of the recorded addresses
+// come back is up to the kernel's placement policy; THAT any come back is the
+// property, and it is the half that inverts under the mutation.
+//
+// SIZING. #1641's scratch program churned 1920 MiB to make the RSS signal
+// unmistakable. Reuse needs far less — it appears on the first cycle after the
+// first sweep — and this file runs four times per `zig build test-stress` (two
+// compilers x two collector policies), so it churns 32 MiB. Every block is
+// still above `allocMaxSmall`, which is the only thing that decides the path.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcAlloc, gcCollectRoots, gcStatCollections, gcStatTotalSwept, gcWords, gcBindMemory } from "../../../runtime/gc"
+
+// Body size of every block. Well above `allocMaxSmall` (16384), so
+// `allocClassify` refuses it and `gcHeapAlloc` takes the direct-mapped branch —
+// the only branch `memUnmapPages` is on.
+const BODY = 1048576
+
+const CYCLES = 8
+const PER_CYCLE = 4
+
+// Arena words for the collector's own small allocations (object headers live in
+// the mapped blocks; the mark worklist and the index come from here). Generous
+// on purpose: a short run must never be an allocation failure in disguise.
+const ARENA_WORDS = 131072
+const INDEX_WORDS = 8192
+
+// One `TypeInfo` (ABI.md §2, 7 words): a big body with no reference fields, so
+// marking never has to walk it and the run is about the heap and nothing else.
+const META_WORDS = 7
+
+function main() {
+  // Held in `main` for the whole program: only raw, untraced pointers into
+  // these reach the collector, so these bindings are what keeps them alive
+  // under BIT_GC=stress.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let state = []i64(gcWords)
+  let lock = []i32(1)
+  let meta = []i64(META_WORDS)
+  let firstAddrs = []i64(PER_CYCLE)
+  let roots = []i64(PER_CYCLE)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = BODY
+  meta[1] = 0
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+  let bigInfo = metaAddr
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), 0, 64)) {
+    print("gcInit failed\n")
+    return
+  }
+  // Automatic collection off: this run's collections are the explicit ones
+  // below, so the sweep that frees every block is not left to a growth policy.
+  gcConfigure(g, false, false, 4096, 200, false)
+
+  let allocated = 0
+  let reused = 0
+  let cycle = 0
+  // Bounded: exactly CYCLES iterations.
+  while (cycle < CYCLES) {
+    let i = 0
+    // Bounded: exactly PER_CYCLE iterations.
+    while (i < PER_CYCLE) {
+      let addr = gcAlloc(g, bigInfo)
+      if (addr == 0) {
+        print("allocation failed\n")
+        return
+      }
+      allocated = allocated + 1
+      roots[i] = addr
+      if (cycle == 0) {
+        firstAddrs[i] = addr
+      } else {
+        // Does this block sit where a cycle-0 block sat? Only possible if that
+        // block's pages went back to the OS.
+        let j = 0
+        // Bounded: exactly PER_CYCLE iterations.
+        while (j < PER_CYCLE) {
+          if (firstAddrs[j] == addr) {
+            reused = reused + 1
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    // Drop every root and sweep, so all PER_CYCLE blocks of this cycle are
+    // freed through `gcHeapFree`'s large branch before the next cycle asks for
+    // the same amount again.
+    let k = 0
+    // Bounded: exactly PER_CYCLE iterations.
+    while (k < PER_CYCLE) {
+      roots[k] = 0
+      k = k + 1
+    }
+    gcCollectRoots(g, rootsAddr, PER_CYCLE)
+    cycle = cycle + 1
+  }
+
+  // A run that never collected never called `gcHeapFree` and would report
+  // "no reuse" for a reason that has nothing to do with unmapping (#1650), so
+  // the collection count is pinned alongside the property it enables.
+  let collected = "no"
+  if (gcStatCollections(g) > 0 && gcStatTotalSwept(g) >= allocated) {
+    collected = "yes"
+  }
+  let recycled = "no"
+  if (reused > 0) {
+    recycled = "yes"
+  }
+  print("large blocks allocated: ${allocated}\n")
+  print("collections swept them all: ${collected}\n")
+  print("freed addresses handed back out: ${recycled}\n")
+}
