@@ -1384,6 +1384,20 @@ const Parser = struct {
         if (self.tok.kind == .ident or self.tok.kind == .l_paren) {
             if (try self.speculate(tryRecvBindWithBinder)) |node| return node;
         }
+        // An UNBOUND receive `<- chan` (recv_bind's binder is optional, SPEC.md
+        // §16.3) must consume its own `<-` here, before falling into the general
+        // expression parser below: `<- chan` is ALSO a valid standalone expression
+        // (a receive whose value is discarded), so `parseExpression` would swallow
+        // the `<-` as that expression's prefix operator and hand back the
+        // ALREADY-received element rather than the channel — the checker then sees
+        // a recv_bind wrapping a non-channel operand and misdiagnoses legal syntax
+        // (#1693).
+        if (self.tok.kind == .arrow_left) {
+            const start = self.tok.span;
+            try self.advance();
+            const e = try self.parseExpression();
+            return self.tree.add(.recv_bind, join(start, self.span(e)), 0, &.{ none, e });
+        }
         const e = try self.parseExpression();
         if (try self.accept(.arrow_left)) {
             const rhs = try self.parseExpression();
