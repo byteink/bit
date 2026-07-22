@@ -67,11 +67,11 @@
 import { allocBuf } from "../root"
 
 // The process-lifetime channel reserve `chan_make` carves handles and rings out
-// of. `reserveInit`/`reserveTake` are `runtime/gc`'s bump reserve (gc/mem.bit),
+// of. `reserveInit`/`reserveGrow` are `runtime/gc`'s bump reserve (gc/mem.bit),
 // now pinned (`bit_rt_port_mem_reserve_*`, #1613) so this freestanding-emitted
 // module can call them across the object boundary. `wordAt` is already imported
 // by the sibling `./chanreg.bit` (module-scoped), so it is named directly below.
-import { reserveInit, reserveTake } from "../gc"
+import { reserveInit, reserveGrow } from "../gc"
 
 // `bit_rt_chan_send(ch, value)` (ABI.md §11). A nil channel blocks the caller
 // forever (SPEC §16.2): there is nothing that can ever unpark it, matching
@@ -194,27 +194,54 @@ export @symbol("bit_rt_root_select_alloc") function rtSelectAlloc(n: int): int {
 // seed lower): `capacity == 0` is the unbuffered rendezvous (no ring), `is_ref`
 // marks a channel whose buffered words are GC references and gates registration.
 //
-// OOM. `reserveTake` returns 0 when the fixed reserve is exhausted. `chan.zig`
-// makes that `fatal`; a cross-platform `@nosplit`-reachable module cannot name
-// the platform-split panic (the same wall the send-on-closed panic hits — see
-// this file's header, deferred to #1367), so exhaustion returns 0 here. It is
-// unreachable on any sane program (the reserve is sized for the process's whole
-// channel population) and the linked runtime is still the Zig `bit_rt_chan_make`
-// until #1369, so this path runs in no test today; the fatal wire-up lands with
-// the panic-raising half.
+// THE RESERVE GROWS, AND A CHANNEL IS NEVER HANDED BACK AS NIL (#1680).
+//
+// This used to call `reserveTake` — a plain bump out of the ONE fixed 1 MiB
+// arena `boot` maps — and return 0 when it no longer fit. 0 is a NIL CHANNEL,
+// and `rtChanSend`/`rtChanRecv` park on a nil channel FOREVER (SPEC §16.2), so
+// exhaustion did not surface as an error at all: it surfaced as a green thread
+// that never runs again. That was the `tests/imports/http3e2e` hang. Measured at
+// the hang: 12,744 bytes left in the arena and a `chan<StreamChunk>(4096)` —
+// 104 + 32,768 bytes — to make; one task parked forever on the nil result while
+// its connection's `inCh` held 12 undelivered datagrams.
+//
+// The header's claim that this was "unreachable on any sane program (the reserve
+// is sized for the process's whole channel population)" is simply false: the h3
+// stack makes a cap-4096 channel per stream, ~30 of them live at once, and 30 ×
+// 32 KiB is the whole arena.
+//
+// `chan.zig` allocates both the handle and the ring from `page_allocator` —
+// unbounded, straight from the OS — so a fixed arena was never the oracle's
+// behaviour. `reserveGrow` (../gc/mem.bit) restores it: the arena becomes the
+// first chunk of a reserve that maps another when a request will not fit,
+// exactly as the heap and the address index already do. A LARGER CONSTANT WOULD
+// NOT DO — that only moves the cliff, which is the lesson `mem.bit`'s own header
+// records from the same bug one layer down.
+//
+// OOM is now FATAL, matching the Zig. `reserveGrow` returns 0 only when the OS
+// itself refuses a mapping; `bit_rt_oom` writes `panic: out of memory` and exits
+// 2, byte-for-byte `chan.zig`'s `fatal`. An `extern function` call is legal in a
+// `@nosplit` body (#1640), which is what makes the platform-split panic wall
+// (this file's header, #1367) irrelevant here. `chanReserveAddr == 0` stays a
+// nil-channel return rather than a panic: it means `boot` has not run
+// `chanBootBind` yet, which no live path reaches.
+extern function bit_rt_oom(): i64
+
 export @symbol("bit_rt_root_chan_make") function rtChanMake(capacity: int, isRef: bool): int {
   if (chanReserveAddr == 0) {
     return 0
   }
   let res = wordAt(chanReserveAddr)
-  let handle = reserveTake(res, chanWords * 8)
+  let handle = reserveGrow(res, chanWords * 8)
   if (handle == 0) {
+    let dead = bit_rt_oom()
     return 0
   }
   let bufAddr = 0
   if (capacity > 0) {
-    bufAddr = reserveTake(res, capacity * 8)
+    bufAddr = reserveGrow(res, capacity * 8)
     if (bufAddr == 0) {
+      let dead = bit_rt_oom()
       return 0
     }
   }
