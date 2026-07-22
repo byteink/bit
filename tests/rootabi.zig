@@ -424,20 +424,51 @@ fn nodeText(tree: *const bit.ast.Tree, source: []const u8, idx: bit.ast.Index) [
 // annotation on an ABI wrapper proves the whole reachable body is poll-free, so
 // the checker does the closure and this gate only proves the roots were marked.
 //
-// SCOPE, STATED HONESTLY. `runtime/root/**` ONLY. `runtime/rand` (#1667) and
-// `runtime/net` (#1668) hold live members of this same class and are NOT covered
-// here; both close by widening `poll_free_roots`. A gate that silently implied
-// they were clean would be worse than no gate.
+// SCOPE. `runtime/root/**` (#1658), `runtime/rand/**` (#1667) and
+// `runtime/net/**` (#1668) — the three subtrees whose Bit functions are reached
+// from an ABI pin. The remaining runtime subtrees (`gc`, `stw`, `alloc`, `chan`,
+// `park`, `sched`, `thread`, `auxv`) are NOT asserted here, and this sentence is
+// the honest statement of that rather than an implied clean bill.
+//
+// WHAT `runtime/net` ADDED TO THE PICTURE (#1668), because it is the shape
+// `@nosplit` cannot express. `netReadSock` and its siblings must be able to PARK
+// the calling green thread, and E0075 is transitive into the scheduler, so the
+// annotation is unavailable to them by construction. What #1658 requires is not
+// the annotation but THE PROPERTY BEHIND IT — no raw GC address held across a
+// poll — and there are two ways to have it:
+//
+//   (a) `@nosplit`: no poll can occur, so a raw address is safe. Mechanically
+//       checked, which is why it is preferred and why this gate demands it.
+//   (b) Hold no raw GC address in the first place. `runtime/net`'s port layer
+//       takes every buffer as a `*u8` PARAMETER into memory its CALLER owns, and
+//       `netabi.bit`'s wrappers now hold their receive buffers as MANAGED `[]i64`
+//       locals — real stack-map slots the precise walk names, whose backing the
+//       non-moving collector never relocates. A `string` arriving as a raw `int`
+//       parameter is likewise rooted by the compiled Bit caller's own frame,
+//       which is what makes it different from #1656's `rtFsReadAll`, where the
+//       object was allocated INSIDE the runtime and so named by no frame at all.
+//
+// (b) is a REVIEWED claim, not a checked one, so every function resting on it is
+// an entry below carrying its argument. That is why the exception list is spelled
+// out per function rather than per directory.
 
-/// The subtrees this gate covers, relative to `runtime/`. Widened by #1667 and
-/// #1668; see the scope note above before adding to it.
-const poll_free_roots = [_][]const u8{"root"};
+/// A subtree this gate covers, relative to `runtime/`, with a lower bound on the
+/// declarations it must yield.
+///
+/// THE FLOOR IS PER-SUBTREE, AND THAT IS THE POINT. A single total floor lets one
+/// subtree fall to zero — a moved directory, a renamed provider, a parser change
+/// — while another's growth keeps the sum above the line, which is exactly the
+/// vacuous pass this gate exists to prevent. #1658's first cut silently examined
+/// 223 of 265 declarations and only a floor surfaced it.
+const PollFreeRoot = struct { sub: []const u8, min_scanned: usize };
 
-/// Lower bound on the declarations examined. The failure mode of a gate like
-/// this is a vacuous pass, not a wrong answer: a moved directory or a parser
-/// change would otherwise scan nothing and report success. Today's population
-/// is 261; this floor sits under it, and is a floor rather than a target.
-const min_poll_free_scanned = 240;
+/// Today's populations are root 265, rand 17, net 189. Each floor sits under its
+/// own subtree, and is a floor rather than a target.
+const poll_free_roots = [_]PollFreeRoot{
+    .{ .sub = "root", .min_scanned = 240 },
+    .{ .sub = "rand", .min_scanned = 15 },
+    .{ .sub = "net", .min_scanned = 170 },
+};
 
 /// Functions under `runtime/root/**` that are deliberately NOT poll-free.
 ///
@@ -525,9 +556,79 @@ const poll_free_exceptions = [_][]const u8{
     "root/linux/time.bit:rtTimeMonoNs",
     "root/linux/time.bit:rtTimeUnixNs",
     "root/linux/time.bit:rtTimeSleepNs",
+    // -----------------------------------------------------------------------
+    // (e) `runtime/rand` (#1667) — one per platform, and only because `panic`
+    //     is not `@nosplit`-callable. The allocate-and-fill half IS `@nosplit`
+    //     (`randomBytesFill`); what is left here is straight-line with NO LOOP,
+    //     and the one call it makes while `s` is set — `panic` — is on the
+    //     branch where `s` is the `randEntropyFailed` sentinel rather than an
+    //     object, and never returns. See `rand/*/random.bit`.
+    "rand/darwin/random.bit:rtRandomBytes",
+    "rand/linux/random.bit:rtRandomBytes",
+    // -----------------------------------------------------------------------
+    // (f) `runtime/net` (#1668) — THE PARK LAYER. Every entry from here down
+    //     rests on claim (b) in this section's header: it holds no raw GC
+    //     address, so a poll or a park inside it is harmless. `@nosplit` is not
+    //     merely inconvenient for these, it is unavailable — E0075 is transitive
+    //     and the subtree reaches `schedPark`. Each was confirmed refused by the
+    //     compiler rather than assumed: marking them yields
+    //     "calls 'netAwaitReady', which is not marked nosplit" (the engine),
+    //     "calls 'fsOpen'" (`readResolvConf`) or "may not allocate" (the four
+    //     wrappers that own a managed scratch).
+    //
+    //     (f1) The socket engine. Buffers arrive as `*u8` PARAMETERS pointing
+    //     into memory the caller owns and keeps alive; these frames hold no
+    //     object address of their own. `netAwaitReady` is the parker itself.
+    "net/darwin/sock.bit:netAwaitReady",
+    "net/linux/sock.bit:netAwaitReady",
+    "net/darwin/tcp.bit:netAcceptTcp",
+    "net/darwin/tcp.bit:netDialTcp",
+    "net/darwin/tcp.bit:netReadSock",
+    "net/darwin/tcp.bit:netWriteSock",
+    "net/linux/tcp.bit:netAcceptTcp",
+    "net/linux/tcp.bit:netDialTcp",
+    "net/linux/tcp.bit:netReadSock",
+    "net/linux/tcp.bit:netWriteSock",
+    "net/darwin/udp.bit:netRecvFrom",
+    "net/darwin/udp.bit:netSendTo",
+    "net/linux/udp.bit:netRecvFrom",
+    "net/linux/udp.bit:netSendTo",
+    //     (f2) `readResolvConf` — reads into the caller's managed `[]i64`
+    //     scratch through a `*u8`; owns no object. Refused `@nosplit` because
+    //     `fsOpen`/`fsClose` are RtFn builtins.
+    "net/darwin/netabi.bit:readResolvConf",
+    "net/linux/netabi.bit:readResolvConf",
+    //     (f3) The ABI wrappers that pass a caller's `string` STRAIGHT THROUGH
+    //     to the parking engine as `strData(s)`. `s` is a raw `int` here, but
+    //     the object is rooted by the compiled Bit caller's own stack-map slot —
+    //     the runtime never allocated it, so unlike #1656's `rtFsReadAll` there
+    //     IS a frame that names it, and the precise walk covers every frame of
+    //     the running task.
+    "net/darwin/netabi.bit:netAbiAccept",
+    "net/darwin/netabi.bit:netAbiDial",
+    "net/darwin/netabi.bit:netAbiUdpSend",
+    "net/darwin/netabi.bit:netAbiWrite",
+    "net/linux/netabi.bit:netAbiAccept",
+    "net/linux/netabi.bit:netAbiDial",
+    "net/linux/netabi.bit:netAbiUdpSend",
+    "net/linux/netabi.bit:netAbiWrite",
+    //     (f4) The four wrappers that ALLOCATE a receive buffer — this ticket's
+    //     actual defect, and now the reason they cannot be `@nosplit`: their
+    //     buffers are MANAGED `[]i64` locals and `@nosplit` forbids allocation
+    //     outright. That is the fix, not a workaround; a managed local is a
+    //     stack-map slot, which is precisely what the raw `rtStrAlloc` address
+    //     they used to hold was not.
+    "net/darwin/netabi.bit:netAbiRead",
+    "net/darwin/netabi.bit:netAbiUdpRecv",
+    "net/darwin/netabi.bit:netAbiUdpSenderHost",
+    "net/darwin/netabi.bit:netAbiResolve",
+    "net/linux/netabi.bit:netAbiRead",
+    "net/linux/netabi.bit:netAbiUdpRecv",
+    "net/linux/netabi.bit:netAbiUdpSenderHost",
+    "net/linux/netabi.bit:netAbiResolve",
 };
 
-test "every function in runtime/root is poll-free, or a reviewed exception" {
+test "every function in the covered runtime subtrees is poll-free, or a reviewed exception" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -536,10 +637,12 @@ test "every function in runtime/root is poll-free, or a reviewed exception" {
     for (poll_free_exceptions) |e| try allowed.put(e, {});
 
     const io = Io.Threaded.global_single_threaded.io();
-    var scanned: usize = 0;
     var failures: usize = 0;
+    var vacuous: usize = 0;
 
-    for (poll_free_roots) |sub| {
+    for (poll_free_roots) |root| {
+        const sub = root.sub;
+        var scanned: usize = 0;
         const abs = try std.fs.path.join(gpa, &.{ build_options.repo_root, "runtime", sub });
         var dir = try Dir.cwd().openDir(io, abs, .{ .iterate = true });
         defer dir.close(io);
@@ -562,21 +665,29 @@ test "every function in runtime/root is poll-free, or a reviewed exception" {
             const rel = try std.fs.path.join(gpa, &.{ "runtime", key_dir });
             try checkPollFreeInFile(gpa, &allowed, key_dir, rel, source, &scanned, &failures);
         }
+
+        // PER-SUBTREE, inside the loop: a total checked afterwards would let one
+        // subtree read zero while another's growth covers for it.
+        if (scanned < root.min_scanned) {
+            std.debug.print(
+                "rootabi: the poll-free gate examined only {d} function declarations " ++
+                    "under runtime/{s} (expected at least {d}). It is reading nothing " ++
+                    "useful there — a directory moved, or the Bit parser rejected the " ++
+                    "sources.\n",
+                .{ scanned, sub, root.min_scanned },
+            );
+            vacuous += 1;
+        }
     }
 
-    if (scanned < min_poll_free_scanned) {
-        std.debug.print(
-            "rootabi: the poll-free gate examined only {d} function declarations " ++
-                "(expected at least {d}). It is reading nothing useful — a directory " ++
-                "moved, or the Bit parser rejected the sources.\n",
-            .{ scanned, min_poll_free_scanned },
-        );
+    if (vacuous != 0) {
         return error.VacuousPollFreeScan;
     }
 
     if (failures != 0) {
         std.debug.print(
-            "rootabi: {d} function(s) under runtime/root are neither `@nosplit`/`@naked` " ++
+            "rootabi: {d} function(s) under the covered runtime subtrees are neither " ++
+                "`@nosplit`/`@naked` " ++
                 "nor on the reviewed exception list. See this file's #1658 header: such a " ++
                 "function takes a back-edge safepoint while holding GC objects as raw " ++
                 "`int` addresses no stack map names, and the collector sweeps them under " ++

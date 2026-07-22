@@ -56,17 +56,53 @@
 // proof, with `runtime/net/linux` in its module list.
 //
 // ---------------------------------------------------------------------------
-// NOTHING HERE IS `@nosplit`
+// WHY THE BUFFERS HERE ARE MANAGED `[]i64`, NOT RAW `rtStrAlloc` ADDRESSES
+// (#1668 — and THE COMMENT THIS REPLACES WAS WRONG)
 // ---------------------------------------------------------------------------
 //
-// `netAbiRead`/`netAbiUdpRecv` allocate, park in a syscall (a safepoint), then
-// trim. A call to a parking socket function is refused in a `@nosplit` body
-// (E0075), and the collector scans stacks CONSERVATIVELY (ABI.md §5), so the
-// object address sitting in a plain `int`/`*u8` local pins the object across the
-// park — no `@nosplit` needed, and it could not carry it anyway.
+// What stood here claimed: "`netAbiRead`/`netAbiUdpRecv` allocate, park in a
+// socket call (a safepoint), then trim. The collector scans stacks
+// CONSERVATIVELY (ABI.md §5), so the object address in a plain `int`/`*u8` local
+// pins the object across the park."
+//
+// ABI.md §5 says the opposite of what that read it to say, and the difference is
+// #1656 — an s0 that cost four G3 attempts. §5: "the running task's stack is
+// walked PRECISELY (§4); every *other* registered task's stack is scanned
+// conservatively". A runtime frame holding a GC object as a raw `int` is named
+// by no stack map, so while this task is the RUNNING one the precise walk does
+// not see it at all. The identical false premise was in
+// `runtime/root/{darwin,linux}/io.bit` and #1658 corrected it there.
+//
+// AND THE PARK IS NOT EVEN THE DANGEROUS PART. `netReadSock`'s retry loop
+// (../tcp.bit) carries a compiler-synthesized `bl bit_rt_safepoint` at its back
+// edge, and when `netAwaitReady` finds no task to park on it SPINS — staying
+// `running` across that poll. So a collection can run with this frame's raw
+// address invisible without any park occurring.
+//
+// `@nosplit` is the usual fix and IS NOT AVAILABLE HERE: E0075 makes the
+// guarantee transitive over the whole callee subtree, and that subtree reaches
+// `schedPark`. The port layer must be able to park; that is not negotiable.
+//
+// So this file takes the OTHER half of what #1658 requires — not the annotation
+// but the property behind it: NO RAW GC ADDRESS MAY BE HELD ACROSS A POLL. Every
+// receive buffer here is now a MANAGED `[]i64` local, which is a real stack-map
+// slot the precise walk names, and whose backing the non-moving collector never
+// relocates — so `ptrOf` on it is stable across any number of polls and parks.
+// The socket engine already takes its buffers as `*u8` parameters, so it needs
+// no change: the caller's managed local is what keeps them alive, exactly the
+// contract `runtime/root/floats.bit`'s `packLowBytes` documents.
+//
+// `[]i64` and not `[]byte` because a Bit `[]byte` is WORD-STRIDED (one byte per
+// 8-byte word, ABI.md §2) and the kernel writes packed bytes. `[]i64(k)` is `k`
+// contiguous 8-byte words, i.e. `k * 8` packed bytes, which is the only managed
+// Bit type that names a packed byte region.
+//
+// The allocate-and-copy that turns a filled scratch into the returned `string`
+// is the one place a raw address still appears, and it lives inside the
+// `@nosplit` helper `strFromPacked` below, where no collection can occur.
 
 import { strPtr, strLen, rtStrAlloc, rtStringSlice } from "../../root"
-import { loadWord } from "../../gc"
+import { loadWord, loadByte, storeByte } from "../../gc"
 // `netParseIpv4`, `netMax*` and the DNS codec are already imported from
 // "../../net" by this module's sibling sock.bit (imports are module-scoped), so
 // re-importing them here is an E0042 redeclaration — only the two names sock.bit
@@ -79,30 +115,63 @@ import { netFormatOctets, netFirstNameserver } from "../../net"
 
 // A raw byte pointer at `addr`. `base + addr` on a nil `*u8` is the project's
 // idiom for turning an address held as `int` back into a pointer.
-function u8At(addr: int): *u8 {
+@nosplit function u8At(addr: int): *u8 {
   let base: *u8 = nil
   return base + addr
 }
 
 // A `string` object's inline byte pointer and its length (ABI.md §2: a
 // `{ptr, len}` header whose `ptr` addresses the object's own bytes).
-function strData(s: int): *u8 {
+@nosplit function strData(s: int): *u8 {
   return u8At(loadWord(s + strPtr))
 }
 
-function strSizeOf(s: int): int {
+@nosplit function strSizeOf(s: int): int {
   return loadWord(s + strLen)
 }
 
 // The empty string, the failure value for every string-returning entry point
 // (matching `root.zig`'s `stringFromBytes("")`).
-function emptyStr(): int {
+@nosplit function emptyStr(): int {
   return rtStrAlloc(0)
+}
+
+// `n` packed bytes at raw address `src`, copied into a fresh `string`. Returns 0
+// on heap exhaustion.
+//
+// `@nosplit`, and that is the whole point of the function existing (#1668): the
+// entire raw lifetime — allocate, take the interior pointer, fill — is inside
+// this one poll-free body, so no collection can happen between the allocation
+// and the last write to it. `src` must point into memory the CALLER keeps alive,
+// which for every caller here is a managed `[]i64` local. Same contract, and the
+// same reason, as `runtime/root/floats.bit`'s `packLowBytes`.
+@nosplit function strFromPacked(src: int, n: int): int {
+  let out = rtStrAlloc(n)
+  if (out == 0) {
+    return 0
+  }
+  let dst = loadWord(out + strPtr)
+  let i = 0
+  while (i < n) { // bounded by `n`; the body always advances `i`
+    storeByte(dst + i, loadByte(src + i))
+    i = i + 1
+  }
+  return out
+}
+
+// Words of `[]i64` scratch needed to hold `nbytes` packed bytes.
+@nosplit function scratchWords(nbytes: int): int {
+  return (nbytes + 7) / 8
 }
 
 // A dotted quad from four packed octets, as a fresh string. `netFormatOctets`
 // writes at most 15 bytes into a scratch; the result is trimmed to its report.
-function formatQuad(octets: *u8): int {
+//
+// `@nosplit` (#1668): `fmt` is a fresh GC string held only as a raw `int` and
+// `strData(fmt)` is an interior pointer into it. `netFormatOctets` is pure
+// formatting over `*u8` — it never parks and never allocates — so the whole
+// sequence closes poll-free and the string cannot be swept mid-format.
+@nosplit function formatQuad(octets: *u8): int {
   let fmt = rtStrAlloc(15)
   if (fmt == 0) {
     return emptyStr()
@@ -117,7 +186,7 @@ function formatQuad(octets: *u8): int {
 
 // `bit_rt_net_listen`: a listening TCP socket on `host:port`, or -1. `port == 0`
 // asks the kernel to choose one; read it back with `net_local_port`.
-export @symbol("bit_rt_root_net_listen") function netAbiListen(host: int, port: int): int {
+export @symbol("bit_rt_root_net_listen") @nosplit function netAbiListen(host: int, port: int): int {
   if (port < 0 || port > 65535) {
     return 0 - 1
   }
@@ -125,7 +194,7 @@ export @symbol("bit_rt_root_net_listen") function netAbiListen(host: int, port: 
 }
 
 // `bit_rt_net_local_port`: the port `fd` is bound to, or -1.
-export @symbol("bit_rt_root_net_local_port") function netAbiLocalPort(fd: int): int {
+export @symbol("bit_rt_root_net_local_port") @nosplit function netAbiLocalPort(fd: int): int {
   return netLocalPort(fd)
 }
 
@@ -151,15 +220,15 @@ export @symbol("bit_rt_root_net_read") function netAbiRead(fd: int, max: int): i
   if (max <= 0) {
     return emptyStr()
   }
-  let big = rtStrAlloc(max)
-  if (big == 0) {
-    return emptyStr()
-  }
-  let n = netReadSock(fd, strData(big), max)
+  // MANAGED scratch, not `rtStrAlloc(max)` (#1668). `netReadSock` loops, polls
+  // and may park; `scratch` is a stack-map slot so the precise walk names it
+  // throughout, and the non-moving collector keeps `ptrOf` valid.
+  let scratch = []i64(scratchWords(max))
+  let n = netReadSock(fd, u8At(int(ptrOf(scratch))), max)
   if (n <= 0) {
     return emptyStr()
   }
-  return rtStringSlice(big, 0, n)
+  return strFromPacked(int(ptrOf(scratch)), n)
 }
 
 // `bit_rt_net_write`: all of `s` to `fd`, parking whenever the send buffer is
@@ -182,12 +251,12 @@ let udpSenderBuf: [4]i64
 let udpSenderValid: i64 = 0
 
 // The stored sender as a `*u8`, re-derived each call (module-state address).
-function udpSenderAddr(): *u8 {
+@nosplit function udpSenderAddr(): *u8 {
   return u8At(int(ptrOf(udpSenderBuf)))
 }
 
 // `bit_rt_net_udp_bind`: a datagram socket bound to `host:port`, or -1.
-export @symbol("bit_rt_root_net_udp_bind") function netAbiUdpBind(host: int, port: int): int {
+export @symbol("bit_rt_root_net_udp_bind") @nosplit function netAbiUdpBind(host: int, port: int): int {
   if (port < 0 || port > 65535) {
     return 0 - 1
   }
@@ -212,16 +281,14 @@ export @symbol("bit_rt_root_net_udp_recv") function netAbiUdpRecv(fd: int, max: 
   if (max <= 0) {
     return emptyStr()
   }
-  let big = rtStrAlloc(max)
-  if (big == 0) {
-    return emptyStr()
-  }
-  let n = netRecvFrom(fd, strData(big), max, udpSenderAddr())
+  // MANAGED scratch — see `netAbiRead`. `netRecvFrom` parks on the same engine.
+  let scratch = []i64(scratchWords(max))
+  let n = netRecvFrom(fd, u8At(int(ptrOf(scratch))), max, udpSenderAddr())
   if (n < 0) {
     return emptyStr()
   }
   udpSenderValid = 1
-  return rtStringSlice(big, 0, n)
+  return strFromPacked(int(ptrOf(scratch)), n)
 }
 
 // `bit_rt_net_udp_sender_host`: dotted-quad of the last recv's sender, or "".
@@ -229,16 +296,15 @@ export @symbol("bit_rt_root_net_udp_sender_host") function netAbiUdpSenderHost()
   if (udpSenderValid == 0) {
     return emptyStr()
   }
-  let octStr = rtStrAlloc(4)
-  if (octStr == 0) {
-    return emptyStr()
-  }
-  netSockAddrOctets(udpSenderAddr(), strData(octStr))
-  return formatQuad(strData(octStr))
+  // MANAGED scratch for the four octets (#1668): `octStr` used to be a raw
+  // `rtStrAlloc` address held across `netSockAddrOctets`.
+  let oct = []i64(1)
+  netSockAddrOctets(udpSenderAddr(), u8At(int(ptrOf(oct))))
+  return formatQuad(u8At(int(ptrOf(oct))))
 }
 
 // `bit_rt_net_udp_sender_port`: the last recv's sender port, or -1.
-export @symbol("bit_rt_root_net_udp_sender_port") function netAbiUdpSenderPort(): int {
+export @symbol("bit_rt_root_net_udp_sender_port") @nosplit function netAbiUdpSenderPort(): int {
   if (udpSenderValid == 0) {
     return 0 - 1
   }
@@ -296,11 +362,13 @@ export @symbol("bit_rt_root_net_resolve") function netAbiResolve(host: int): int
   let hostPtr = strData(host)
   let hostLen = strSizeOf(host)
 
-  let outStr = rtStrAlloc(4)
-  if (outStr == 0) {
-    return emptyStr()
-  }
-  let outPtr = strData(outStr)
+  // EVERY scratch below is a MANAGED `[]i64` local (#1668). They used to be raw
+  // `rtStrAlloc` addresses held across `readResolvConf`, which loops, polls and
+  // parks in `netReadSock`, and across `netResolve`, which parks on a DNS
+  // round trip. Managed locals are stack-map slots, so the precise walk names
+  // them for the whole of both.
+  let outBuf = []i64(1)
+  let outPtr = u8At(int(ptrOf(outBuf)))
 
   // A literal address never needs the network — return it verbatim, exactly as
   // `netResolve` would, but without touching /etc/resolv.conf.
@@ -308,23 +376,15 @@ export @symbol("bit_rt_root_net_resolve") function netAbiResolve(host: int): int
     return formatQuad(outPtr)
   }
 
-  let confStr = rtStrAlloc(resolvConfMax)
-  if (confStr == 0) {
-    return emptyStr()
-  }
-  // `confPtr` (a `*u8` in a stack slot) pins `confStr`'s bytes across the read's
-  // park under the conservative stack scan (ABI.md §5), so the buffer survives.
-  let confPtr = strData(confStr)
+  let confBuf = []i64(scratchWords(resolvConfMax))
+  let confPtr = u8At(int(ptrOf(confBuf)))
   let confLen = readResolvConf(confPtr, resolvConfMax)
   if (confLen <= 0) {
     return emptyStr()
   }
 
-  let nsStr = rtStrAlloc(4)
-  if (nsStr == 0) {
-    return emptyStr()
-  }
-  let nsPtr = strData(nsStr)
+  let nsBuf = []i64(1)
+  let nsPtr = u8At(int(ptrOf(nsBuf)))
   if (!netFirstNameserver(confPtr, confLen, nsPtr)) {
     return emptyStr()
   }

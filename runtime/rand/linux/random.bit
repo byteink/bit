@@ -44,10 +44,37 @@ import { loadWord } from "../../gc"
 // inline region `strPtr` addresses, and only a raw `*u8` can name it — a `[]u8`
 // is word-strided (one 8-byte word per element) and `entropyFill` writes packed
 // bytes straight from the kernel.
-export @symbol("bit_rt_root_random_bytes") function rtRandomBytes(len: int): int {
-  if (len <= 0) {
-    return rtStrAlloc(0)
-  }
+//
+// SPLIT IN TWO BY #1667, and the split is forced. The allocate-and-fill half
+// MUST be `@nosplit`: this is #1656's defect shape verbatim — `s` is a fresh GC
+// string held ONLY as a raw `int` (E0079 forbids a pin naming a managed type),
+// `p` is an interior pointer into it, and `entropyFill` loops. Unannotated,
+// that loop's back edge carries a compiler-synthesized `bl bit_rt_safepoint`;
+// ABI.md §5 walks the running task's stack PRECISELY so no root reaches `s`,
+// and the collector sweeps and re-zeroes the block while the kernel is still
+// filling it. The caller then gets recycled memory that a later allocation
+// overwrites — for a CSPRNG, silently weak bytes.
+//
+// But `panic` is not `@nosplit`-callable (E0075), and the entropy-failure abort
+// is an ABI contract, not a nicety, so it cannot simply be dropped. Hence the
+// shape below: a poll-free core that reports failure as an out-of-band sentinel
+// and a straight-line outer wrapper that turns the sentinel into the panic. It
+// is the same move `runtime/root/floats.bit` makes for `rtStringFromFloat` —
+// push everything that touches a raw GC address into a `@nosplit` helper and
+// leave the outer body holding nothing the collector could sweep.
+
+/// Out-of-band failure code for `randomBytesFill`. NOT 0, which the
+/// `bit_rt_string_from_bytes` convention already reserves for heap exhaustion,
+/// and not a possible object address.
+const randEntropyFailed: int = -1
+
+// Allocate a `len`-byte string and fill it from the OS CSPRNG. Returns the
+// string, 0 on heap exhaustion, or `randEntropyFailed`.
+//
+// EVERY raw address in this whole subtree lives inside this `@nosplit` closure,
+// which is the property that makes the fix a fix. E0075 propagates it to
+// `entropyFill`, `fillUrandom` and the syscall-number helpers.
+@nosplit function randomBytesFill(len: int): int {
   let s = rtStrAlloc(len)
   if (s == 0) {
     return 0 // heap exhausted; the `bit_rt_string_from_bytes` convention
@@ -55,6 +82,25 @@ export @symbol("bit_rt_root_random_bytes") function rtRandomBytes(len: int): int
   let nilb: *u8 = nil
   let p = nilb + loadWord(s + strPtr)
   if (!entropyFill(p, len)) {
+    return randEntropyFailed
+  }
+  return s
+}
+
+// NOT `@nosplit`, and on the poll-free gate's reviewed exception list with this
+// argument: safepoints are emitted at loop back edges and at call sites
+// (`seed/codegen/{arm64,x64}.zig`), and this body contains NO loop at all. The
+// only call made while `s` holds an object address is `panic`, which is on the
+// `s == randEntropyFailed` branch — where `s` is the sentinel, not an object —
+// and which never returns. So no collection can occur between `randomBytesFill`
+// handing the address back and this function returning it to a caller whose
+// stack map does name it.
+export @symbol("bit_rt_root_random_bytes") function rtRandomBytes(len: int): int {
+  if (len <= 0) {
+    return rtStrAlloc(0)
+  }
+  let s = randomBytesFill(len)
+  if (s == randEntropyFailed) {
     panic("random_bytes: OS CSPRNG failed")
   }
   return s

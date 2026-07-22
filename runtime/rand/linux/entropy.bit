@@ -16,40 +16,64 @@
 // .zigversion), NOT from memory. A wrong syscall number here is a silent
 // wrong-syscall, not a compile error.
 
+// THE HOST-TARGET ORDINAL, AS AN `asm` IMMEDIATE RATHER THAN `hostTarget()`
+// (#1659, applied here by #1667). Everything in this file has to be `@nosplit`
+// — see `entropyFill` — and §10.3.1 deliberately REFUSES `hostTarget()` inside
+// a poll-free body: it is a seed `prim_rt_fns` entry, so it lowers to a real
+// `call bit_rt_host_target` (tests/cases/check_nosplit_host_target.bit pins the
+// refusal). An `asm` block is inline by construction, so it is admitted, and
+// §11.6 selects the sub-block per architecture at codegen.
+//
+// This is `runtime/root/linux/os.bit`'s `rtHostTarget` verbatim, duplicated
+// rather than imported for the reason `nr` itself is already duplicated across
+// `runtime/{net,park,sched,rand,thread}/linux`: each is a separate module, and
+// a cross-module call here would make `runtime/rand/linux`'s freestanding emit
+// depend on `runtime/root/linux`'s. tests/cases/run_nosplit_asm_arch.bit is the
+// independent oracle for the immediates — it checks this exact pair against
+// `hostTarget()` at run time, so a flipped arch mapping (which assembles fine
+// either way and would silently issue the wrong syscall number) reddens there.
+@nosplit function randHostTarget(): int {
+  return asm {
+    arm64 { 0xD2800020 }                    // movz x0, #1   -> aarch64-linux
+    x64   { 0xB8, 0x00, 0x00, 0x00, 0x00 }  // mov  eax, 0   -> x86_64-linux
+    result arm64 x0 x64 rax : int
+  }
+}
+
 // Syscall numbers are per-architecture and Bit has no arch-conditional
-// compilation, so the number is selected at run time (§11.8). `hostTarget()`
+// compilation, so the number is selected at run time (§11.8). `randHostTarget()`
 // is 0 for x86_64-linux and 1 for aarch64-linux; this module is only ever
 // built for a Linux target, so the two cases are exhaustive.
-function nr(x64: int, arm64: int): int {
-  if (hostTarget() == 0) {
+@nosplit function nr(x64: int, arm64: int): int {
+  if (randHostTarget() == 0) {
     return x64
   }
   return arm64
 }
 
-function nrGetrandom(): int { return nr(318, 278) }
-function nrRead(): int { return nr(0, 63) }
-function nrClose(): int { return nr(3, 57) }
+@nosplit function nrGetrandom(): int { return nr(318, 278) }
+@nosplit function nrRead(): int { return nr(0, 63) }
+@nosplit function nrClose(): int { return nr(3, 57) }
 
 // x86_64 still has the legacy `open`; aarch64 never had it and must use
 // `openat` with `AT_FDCWD`. This is exactly the split Zig's `linux.open` makes
 // with `if (@hasField(SYS, "open"))`, so the port issues the same syscall the
 // Zig does on each architecture rather than normalising both onto `openat`.
-function nrOpenX64(): int { return 2 }
-function nrOpenatArm64(): int { return 56 }
-function atFdcwd(): int { return -100 }
+@nosplit function nrOpenX64(): int { return 2 }
+@nosplit function nrOpenatArm64(): int { return 56 }
+@nosplit function atFdcwd(): int { return -100 }
 
 // O_CLOEXEC is bit 19 on both x86_64 and aarch64 (the `O` packed struct in
 // std/os/linux.zig orders its earlier fields differently per architecture, but
 // CLOEXEC lands on the same bit in both).
-function oCloexec(): int { return 524288 }
+@nosplit function oCloexec(): int { return 524288 }
 
 // Negated errno values, as a raw syscall returns them. The `else` branch of
 // std/os/linux.zig's `E` enum — the one covering x86_64 and aarch64 — has
 // INTR = 4 and NOSYS = 38. (The MIPS and SPARC tables differ; neither is a
 // target here.)
-function errIntr(): int { return -4 }
-function errNosys(): int { return -38 }
+@nosplit function errIntr(): int { return -4 }
+@nosplit function errNosys(): int { return -38 }
 
 // Fills the `n` packed bytes at `p` from the OS CSPRNG. Returns true on
 // success; false is the Zig's `error.Entropy`. The buffer is not guaranteed
@@ -61,7 +85,17 @@ function errNosys(): int { return -38 }
 // a plain `bool`: the honest unmanaged equivalent of a single-error union. The
 // caller (`bit_rt_random_bytes`, #1367) turns false into the same fatal panic
 // that `catch fatal("random_bytes: OS CSPRNG failed")` produces today.
-export function entropyFill(p: *u8, n: int): bool {
+//
+// `@nosplit` (#1667), and REQUIRED rather than tidy. `p` is an interior pointer
+// into the fresh `string` `../linux/random.bit`'s `rtRandomBytes` just
+// allocated and holds only as a raw `int` (E0079 forbids the pin naming a
+// managed type). ABI.md §5 walks the RUNNING task's stack PRECISELY, so no
+// stack map names that object; without this annotation the `while` below
+// carries a compiler-synthesized `bl bit_rt_safepoint` at its back edge and a
+// collection there sweeps the buffer the kernel is filling (#1656). §10.3.1
+// admits `syscall`, which is all this subtree needs besides the `asm` immediate
+// in `randHostTarget`.
+export @nosplit function entropyFill(p: *u8, n: int): bool {
   if (n <= 0) { // matches the Zig's `if (buf.len == 0) return;`
     return true
   }
@@ -97,28 +131,56 @@ export function entropyFill(p: *u8, n: int): bool {
   return true
 }
 
+// The NUL-terminated `/dev/urandom` path scratch. MODULE-LEVEL AND SCALAR, not
+// the per-call `[]i64(2)` this used to build, and that is what makes
+// `fillUrandom` `@nosplit`-able (#1667): `@nosplit` forbids allocation outright
+// (E0075), so neither a per-call slice nor the `[]int{...}` character literal
+// can stay on this path. It is the shape `runtime/root/fs.bit`'s `fsPathBuf`
+// and `runtime/root/*/io.bit`'s `ioConstBuf` already use, for the same reason.
+//
+// A scalar array is never scanned by the collector (ABI.md §5, rule 1), which
+// is required here and harmless: it holds a fixed ASCII path, never an object
+// address. Unlocked, sound under the ABI's single-worker contract (§5) on the
+// same terms as `fsPathBuf` — it is filled and handed to `open` inside one
+// poll-free call, so no second caller can interleave. 2 words = 16 bytes holds
+// the 12-byte path plus its NUL.
+let randPathBuf: [2]i64
+
+// Store the packed byte `c` at `base + i`. A helper rather than 13 inline
+// pointer expressions, and unrolled by its caller rather than looped, because
+// the source of the characters used to be a `[]int` literal — an allocation.
+@nosplit function putPathByte(base: int, i: int, c: int) {
+  let nilb: *u8 = nil
+  let q = nilb + (base + i)
+  *q = u8(c)
+}
+
 // Pre-3.17 fallback: `/dev/urandom`, the same CSPRNG source `getrandom(0)`
 // wraps. Only reached when the syscall itself is absent (ENOSYS).
-function fillUrandom(p: *u8, n: int): bool {
+@nosplit function fillUrandom(p: *u8, n: int): bool {
   // "/dev/urandom\0" as packed bytes. The kernel wants a NUL-terminated byte
   // string, and a Bit slice stores one 8-byte word per element (§11.8), so the
-  // path is written byte-by-byte through a raw pointer into a 16-byte backing
-  // buffer rather than held as a `[]u8` or a `string`.
-  let backing = []i64(2)
-  backing[0] = 0
-  backing[1] = 0
-  let nilb: *u8 = nil
-  let path = nilb + int(ptrOf(backing))
-  let chars = []int{47, 100, 101, 118, 47, 117, 114, 97, 110, 100, 111, 109, 0}
-  let ci = 0
-  while (ci < len(chars)) { // bounded by the literal's fixed length
-    let cp = path + ci
-    *cp = u8(chars[ci])
-    ci = ci + 1
-  }
+  // path is written byte-by-byte through a raw pointer rather than held as a
+  // `[]u8` or a `string`. Written out per character rather than as two i64 word
+  // stores deliberately: a packed word constant would be endianness-dependent
+  // and unreadable, and this runs at most once per process.
+  let path = int(ptrOf(randPathBuf))
+  putPathByte(path, 0, 47) //  '/'
+  putPathByte(path, 1, 100) // 'd'
+  putPathByte(path, 2, 101) // 'e'
+  putPathByte(path, 3, 118) // 'v'
+  putPathByte(path, 4, 47) //  '/'
+  putPathByte(path, 5, 117) // 'u'
+  putPathByte(path, 6, 114) // 'r'
+  putPathByte(path, 7, 97) //  'a'
+  putPathByte(path, 8, 110) // 'n'
+  putPathByte(path, 9, 100) // 'd'
+  putPathByte(path, 10, 111) // 'o'
+  putPathByte(path, 11, 109) // 'm'
+  putPathByte(path, 12, 0) //   NUL
 
   let fdrc = 0
-  if (hostTarget() == 0) {
+  if (randHostTarget() == 0) {
     fdrc = int(syscall(nrOpenX64(), i64(path), i64(oCloexec()), 0))
   } else {
     fdrc = int(syscall(nrOpenatArm64(), i64(atFdcwd()), i64(path), i64(oCloexec()), 0))
