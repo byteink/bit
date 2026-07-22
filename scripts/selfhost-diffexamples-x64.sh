@@ -5,12 +5,15 @@
 # dump differentials compare check/lower, which are shared, so a codegen bug is
 # invisible to them (see selfhost-diffexamples.sh for the arm64/macOS twin).
 #
-# Needs an x86-64 Linux host reachable over ssh (BITX64_HOST, default hl-master).
+# Needs an x86-64 Linux host reachable over ssh. No hostname is baked into the
+# repo: set BITX64_HOST, or configure candidates for scripts/x64host.sh.
 # Usage: zig build && zig build selfhost && bash scripts/selfhost-diffexamples-x64.sh
 set -u
 SEED=zig-out/bin/bit-seed
 BIT2=${BIT2:-zig-out/bin/bit}
-HOST=${BITX64_HOST:-hl-master}
+HOST=${BITX64_HOST:-$(bash "$(dirname "$0")/x64host.sh")}
+[ -n "$HOST" ] || exit 127
+echo "diffexamples-x64: host=$HOST"
 REMOTE=/tmp/bitdiff-x64
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"; ssh "$HOST" "rm -rf $REMOTE" >/dev/null 2>&1' EXIT

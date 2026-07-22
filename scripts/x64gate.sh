@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run `zig build test` for x86_64-linux on the real-hardware box (hl-master) in
-# Docker, over the committed tree (git archive HEAD).
+# Run `zig build test` for x86_64-linux on the real-hardware box (see
+# scripts/x64host.sh) in Docker, over the committed tree (git archive HEAD).
 #
 #   x64gate.sh          # fast: reuse a persistent zig cache volume (only changed
 #                       #       files recompile) — for iterative checks
@@ -32,7 +32,7 @@ IMAGE="bit-zig-0.16.0-amd64:latest"
 # Bit bug — and this mode is how you check that claim instead of inheriting it.
 #
 # SETTLED 2026-07-19 (#1258), measured both ways at tree ff9ac2e — do not re-chase:
-#   real x86_64 (hl-master):  `x64gate.sh fuzz` -> 10,970 iterations, 0 crashes,
+#   real x86_64 hardware:     `x64gate.sh fuzz` -> 10,970 iterations, 0 crashes,
 #                             X64LINUX_EXIT=0.
 #   emulated amd64 on the Mac: `zig build fuzz` never runs a single iteration. It
 #                             fails to COMPILE with exactly 2 errors — glibc
@@ -50,6 +50,13 @@ VOLUME="bit-zig-cache-amd64"
 # machine names are the operator's, not the project's. Resolution order:
 #   1. $X64GATE_HOST
 #   2. scripts/.x64gate-host  (gitignored, one line: an ssh host alias)
+#   3. scripts/x64host.sh     (shared resolver: $BIT_X64_HOST, $BIT_X64_HOSTS,
+#                              $BIT_X64_HOSTS_FILE, ./.x64hosts,
+#                              ~/.config/bit/x64hosts — first candidate that
+#                              ANSWERS wins, so a sleeping box falls through)
+# The resolved host is ECHOED before the run: which box a number came from is
+# part of the result, and x86-64-vs-aarch64 disagreement is this repo's standard
+# tell for an ABI-boundary bug.
 # The host needs ssh access and a `bit-zig-0.16.0-amd64` image. Copy it with
 # `docker save | docker load` rather than rebuilding, so every host runs a
 # byte-identical image and a host swap cannot change what is being tested.
@@ -58,11 +65,13 @@ if [ -z "${X64GATE_HOST}" ] && [ -f "$(dirname "$0")/.x64gate-host" ]; then
   X64GATE_HOST=$(tr -d '[:space:]' < "$(dirname "$0")/.x64gate-host")
 fi
 if [ -z "${X64GATE_HOST}" ]; then
-  echo "x64gate: no host configured. Set X64GATE_HOST=<ssh-alias>, or write it" >&2
-  echo "         to scripts/.x64gate-host (gitignored). The host needs ssh plus" >&2
-  echo "         a bit-zig-0.16.0-amd64 image." >&2
-  exit 127
+  X64GATE_HOST=$(bash "$(dirname "$0")/x64host.sh") || {
+    echo "x64gate: no host configured (see above). The host also needs a" >&2
+    echo "         bit-zig-0.16.0-amd64 image." >&2
+    exit 127
+  }
 fi
+echo "x64gate: host=${X64GATE_HOST}"
 
 if [ "$MODE" = "clean" ]; then
   # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
