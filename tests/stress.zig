@@ -99,6 +99,15 @@
 //! longer timeout — neither buys any rooting coverage, and the first reads as if
 //! it did.
 //!
+//! EVERY SUBPROCESS HERE CARRIES A WALL-CLOCK DEADLINE (#1637). This is the
+//! corpus most able to hang — spawn, channels, select, park/unpark — and a
+//! program that deadlocks used to stall the whole suite with no output naming
+//! it, which is strictly worse than a failure. `tests/proc.zig` bounds each
+//! spawn and reports an expiry as its own outcome, distinct from a crash and
+//! from an output mismatch. See that file for the limit, how it was chosen
+//! against this corpus's own measured worst case (`quicwire` under
+//! `BIT_GC=stress`), and the `BIT_TEST_TIMEOUT_S` override.
+//!
 //! Skipped when the host is not a supported runtime target (no libbitrt to link
 //! against), mirroring the golden `// run` cases and the examples guard.
 
@@ -106,6 +115,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bit = @import("bit");
 const build_options = @import("build_options");
+const proc = @import("proc.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -203,8 +213,11 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     // opens anything for writing — and the seed's `writeFile` (which forks
     // nothing) follows it. No exec of a stress binary happens until phase 2, by
     // which point no write fd to either of them exists anywhere.
+    // One read of the knob per program, shared by the compile and all four runs.
+    const timeout_s = proc.timeoutSeconds(gpa);
+
     defer Dir.cwd().deleteFile(run_io, self_bin) catch {};
-    try buildWithSelfhost(gpa, run_io, name, dir_abs, self_bin);
+    try buildWithSelfhost(gpa, run_io, name, dir_abs, self_bin, timeout_s);
 
     var discard: Io.Writer.Allocating = .init(gpa);
     defer discard.deinit();
@@ -229,8 +242,8 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
 
     // ---- Phase 2: exec only. Both compilers' output must satisfy `.expected`
     // identically, under both collector policies.
-    try runBoth(gpa, run_io, name, "seed", seed_bin, expected, no_collect != null);
-    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected, no_collect != null);
+    try runBoth(gpa, run_io, name, "seed", seed_bin, expected, no_collect != null, timeout_s);
+    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected, no_collect != null, timeout_s);
 }
 
 /// The declared-inert marker: `null` when the program must collect, otherwise
@@ -255,16 +268,26 @@ fn readNoCollect(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: 
 /// `BIT_LIBBITRT`/`BIT_STDLIB` hand it the same archive and stdlib the seed pass
 /// is handed, which both puts the two compilers on identical inputs and keeps
 /// the harness independent of its working directory.
-fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: []const u8, out_path: [:0]const u8) !void {
+fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: []const u8, out_path: [:0]const u8, timeout_s: u32) !void {
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     try env.put("BIT_LIBBITRT", build_options.libbitrt_path);
     try env.put("BIT_STDLIB", build_options.stdlib_dir);
 
-    const result = try std.process.run(gpa, run_io, .{
+    // The compiler is bounded too: a compiler that loops forever stalls the
+    // suite exactly as a deadlocked stress program does, and says even less.
+    const outcome = try proc.run(gpa, run_io, timeout_s, .{
         .argv = &.{ build_options.selfhost_bit, "build", dir_abs, "-o", out_path },
         .environ_map = &env,
     });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("stress '{s}' [selfhost]: COMPILE TIMED OUT\n", .{name});
+            proc.timedOutNote(limit, build_options.selfhost_bit);
+            return error.StressSelfhostCompileTimedOut;
+        },
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
@@ -279,14 +302,14 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_a
 
 /// Both collector policies for one compiler's binary. The stress pass also
 /// carries `BIT_GC_STATS=1` so the run can prove the collector actually ran.
-fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, no_collect: bool) !void {
-    try runOnce(gpa, run_io, name, who, bin_path, expected, null, no_collect);
+fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, no_collect: bool, timeout_s: u32) !void {
+    try runOnce(gpa, run_io, name, who, bin_path, expected, null, no_collect, timeout_s);
 
     var stress_env = std.process.Environ.Map.init(gpa);
     defer stress_env.deinit();
     try stress_env.put("BIT_GC", "stress");
     try stress_env.put("BIT_GC_STATS", "1");
-    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env, no_collect);
+    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env, no_collect, timeout_s);
 }
 
 /// The prefix `gc.zig` writes per collection under `BIT_GC_STATS`. Counting
@@ -303,14 +326,32 @@ fn runOnce(
     expected: []const u8,
     env: ?*const std.process.Environ.Map,
     no_collect: bool,
+    timeout_s: u32,
 ) !void {
     const stress = env != null;
     const policy = if (stress) "BIT_GC=stress" else "default";
     const mode = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ who, policy });
     defer gpa.free(mode);
-    const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path}, .environ_map = env });
+    const outcome = try proc.run(gpa, run_io, timeout_s, .{ .argv = &.{bin_path}, .environ_map = env });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        // A deadlock is the failure this corpus exists to catch, so it must be
+        // named as one — not left as an unexplained stall, and not confused
+        // with the crash case immediately below.
+        .timed_out => |limit| {
+            std.debug.print("stress '{s}' [{s}]: TIMED OUT\n", .{ name, mode });
+            proc.timedOutNote(limit, bin_path);
+            return error.StressRunTimedOut;
+        },
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+    if (result.term == .signal) {
+        std.debug.print("stress '{s}' [{s}]: CRASHED\n", .{ name, mode });
+        proc.crashNote(result.term.signal);
+        std.debug.print("stderr: {s}\n", .{result.stderr});
+        return error.StressRunCrashed;
+    }
 
     const code: u8 = switch (result.term) {
         .exited => |c| c,

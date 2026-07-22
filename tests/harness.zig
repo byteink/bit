@@ -49,6 +49,14 @@
 //! the same archive the seed links, which also keeps the harness independent of
 //! its working directory.
 //!
+//! EVERY SUBPROCESS HERE CARRIES A WALL-CLOCK DEADLINE (#1637). A `run` case
+//! whose program hangs used to stall the whole suite with no output naming it —
+//! strictly worse than a failure, because CI burns its own job timeout and the
+//! log never says which case did it. `tests/proc.zig` bounds each spawn and
+//! reports an expiry as its own outcome, so a hang is a red case naming itself.
+//! See that file for the limit, how it was chosen, and the `BIT_TEST_TIMEOUT_S`
+//! override.
+//!
 //! Every `run`/`fmt`/`types` case (i.e. every case that is valid Bit source,
 //! per its own directive) also feeds a corpus-wide property check: fmt must
 //! be idempotent and must never drop a comment (see "fmt corpus properties"
@@ -57,6 +65,7 @@
 const std = @import("std");
 const bit = @import("bit");
 const build_options = @import("build_options");
+const proc = @import("proc.zig");
 
 const testing = std.testing;
 const Io = std.Io;
@@ -178,8 +187,12 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
             // anything for writing — and the seed's `writeFile` (which forks
             // nothing) follows it. Doubling the builds doubled the exposure;
             // phase separation removes it by construction.
+            // One read of the knob per case, shared by both the compile and the
+            // two executions below.
+            const timeout_s = proc.timeoutSeconds(gpa);
+
             defer Dir.cwd().deleteFile(run_io, self_bin) catch {};
-            try buildWithSelfhost(gpa, run_io, name, self_bin);
+            try buildWithSelfhost(gpa, run_io, name, self_bin, timeout_s);
 
             var discard: Io.Writer.Allocating = .init(gpa);
             defer discard.deinit();
@@ -198,8 +211,8 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
 
             // ---- Phase 2: exec only. Both compilers' output must satisfy the
             // same `.expected`.
-            try runBinary(gpa, run_io, name, "seed", seed_bin, directive, expected);
-            try runBinary(gpa, run_io, name, "selfhost", self_bin, directive, expected);
+            try runBinary(gpa, run_io, name, "seed", seed_bin, directive, expected, timeout_s);
+            try runBinary(gpa, run_io, name, "selfhost", self_bin, directive, expected, timeout_s);
             return .ran_both;
         },
         .err => {
@@ -278,7 +291,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
 /// links and the real stdlib, which keeps the harness independent of its
 /// working directory (sidestepping the installed-`bit`-libbitrt-CWD bug rather
 /// than depending on it).
-fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, out_path: [:0]const u8) !void {
+fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, out_path: [:0]const u8, timeout_s: u32) !void {
     const case_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ build_options.cases_dir, name });
     defer gpa.free(case_path);
 
@@ -287,10 +300,20 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, out_p
     try env.put("BIT_LIBBITRT", build_options.libbitrt_path);
     try env.put("BIT_STDLIB", build_options.stdlib_dir);
 
-    const result = try std.process.run(gpa, run_io, .{
+    // The compiler is bounded too: a compiler that loops forever stalls the
+    // suite exactly as a hung case binary does, and says even less about why.
+    const outcome = try proc.run(gpa, run_io, timeout_s, .{
         .argv = &.{ build_options.selfhost_bit, "build", case_path, "-o", out_path },
         .environ_map = &env,
     });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("case '{s}' [selfhost]: COMPILE TIMED OUT\n", .{name});
+            proc.timedOutNote(limit, build_options.selfhost_bit);
+            return error.SelfhostCompileTimedOut;
+        },
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
 
@@ -306,6 +329,14 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, out_p
 /// Execute one compiler's binary for a `run`/`panic` case and hold it to the
 /// case's `.expected`. `who` names the compiler so a failure says which of the
 /// two produced it.
+///
+/// Three outcomes are kept apart on purpose. A DEADLINE EXPIRY is the machine
+/// intervening and is reported as a timeout; a SIGNAL the program raised on
+/// itself (SIGSEGV, SIGBUS, SIGABRT) is a *result* and is reported as a crash
+/// naming the signal; anything else is an ordinary exit code. Folding a crash
+/// into "timed out", or a timeout into a generic mismatch, sends the reader
+/// hunting the wrong bug — which is the whole reason the timeout is a distinct
+/// outcome rather than a synthesised term.
 fn runBinary(
     gpa: std.mem.Allocator,
     run_io: Io,
@@ -314,10 +345,25 @@ fn runBinary(
     bin_path: [:0]const u8,
     directive: Directive,
     expected: []const u8,
+    timeout_s: u32,
 ) !void {
-    const result = try std.process.run(gpa, run_io, .{ .argv = &.{bin_path} });
+    const outcome = try proc.run(gpa, run_io, timeout_s, .{ .argv = &.{bin_path} });
+    const result = switch (outcome) {
+        .finished => |r| r,
+        .timed_out => |limit| {
+            std.debug.print("case '{s}' [{s}]: TIMED OUT\n", .{ name, who });
+            proc.timedOutNote(limit, bin_path);
+            return error.RunTimedOut;
+        },
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+    if (result.term == .signal) {
+        std.debug.print("case '{s}' [{s}]: CRASHED\n", .{ name, who });
+        proc.crashNote(result.term.signal);
+        std.debug.print("stderr: {s}\n", .{result.stderr});
+        return error.RunCrashed;
+    }
     const code: u8 = switch (result.term) {
         .exited => |c| c,
         else => 255,
