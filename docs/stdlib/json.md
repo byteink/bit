@@ -245,3 +245,37 @@ function jsoncExample(): i64 {
   }
 }
 ```
+
+## The CST types
+
+A concrete syntax tree shaped like `Json`, but every node also carries the
+comments/blank lines around it, so a later edit-layer task (#1479) can mutate
+one value and re-serialize the rest of the document byte-identical modulo the
+edit. Types only — no parser, no printer, no mutation yet.
+
+Bit enum variants take positional payloads only (no named payload fields), so
+`CstNode`'s multi-field variants are documented by argument order below.
+
+### `Trivia`
+
+The comment/blank-line tokens immediately around one CST node, verbatim
+source text (including `//` / `/* */` delimiters): `leading` is zero or more
+tokens before the node, in source order; `trailing` is an optional same-line
+comment after the node's own text, before the next comma/newline (or, for a
+container, before its close — see `CstArray`/`CstObject` below).
+
+### `CstEntry`
+
+One key/value pair of a `CstObject`, in source order: `keyText` is the raw
+source text of the key, including quotes, exactly as written; `key` is the
+decoded key string, for lookups.
+
+### `CstNode`
+
+A `Json` value together with the `Trivia` around it: `CstNull(Trivia)`,
+`CstBool(bool, Trivia)`, `CstNumber(rawText: string, Trivia)` (exact source
+span, e.g. `"1.50000"`), `CstString(rawText: string, Trivia)` (exact source
+span, including quotes), `CstArray([]CstNode, Trivia)`, or
+`CstObject([]CstEntry, Trivia)`. A comment on its own line right before an
+array/object's closing `]`/`}` is folded into that container's own
+`Trivia.trailing`, rather than a separate `closeTrivia` field.
