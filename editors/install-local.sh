@@ -5,29 +5,32 @@
 # tested in the editor. Run this after landing any language feature to keep the
 # extension, the language server, and the installed compiler in sync.
 #
-# Host hygiene: all zig/npm work happens in throwaway Docker containers; only
-# the finished binary and .vsix touch the Mac. Requires `docker` and the VS Code
-# `code` CLI.
+# Host hygiene: the compiler build runs the Mac's already-installed native zig
+# (required — see below); npm work for the extension still happens in a
+# throwaway Docker container, so only the finished binary and .vsix touch the
+# Mac otherwise. Requires `zig`, `docker`, and the VS Code `code` CLI.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
-zig_image="bit-zig-0.16.0-amd64:latest"
 bin="$HOME/.local/bin/bit"
 
 echo "==> Building native arm64 bit (compiler + LSP) ..."
-docker run --rm --platform linux/amd64 -v "$repo":/w -w /w "$zig_image" \
-  zig build -Dtarget=aarch64-macos
+# NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted now) is built by
+# RUNNING the seed to compile selfhost/ (build.zig's `native` check), which
+# only works when the seed targets the build host. A Linux-container cross
+# build can only ever produce `bit-seed` — and the seed never gets lint
+# (spec/LINT.md's epic scope: "seed/ is not touched"), so installing it would
+# silently serve an LSP that can never publish a lint finding. This Mac's zig
+# (brew, kept local on purpose — see the toolchain note) already targets its
+# own host, aarch64-macos, so a plain `zig build` here is both correct and
+# simpler than a container that could not do the job anyway.
+zig build
 mkdir -p "$HOME/.local/bin"
-# The editor compiler must serve `bit lsp` / `bit fmt`. Those subcommands are not
-# self-hosted yet (epic #1345), so the LSP-capable binary is the bootstrap seed,
-# `bit-seed`. Install it AS `bit` for the editor. This cross-build also produces
-# only `bit-seed` anyway (the self-hosted `bit` needs a native build — see
-# build.zig). Switch this to zig-out/bin/bit once lsp/fmt land in selfhost/.
-cp zig-out/bin/bit-seed "$bin"
-# Re-sign ad-hoc: copying a cross-signed arm64 Mach-O to a new path invalidates
-# its signature, and macOS SIGKILLs an invalidly-signed binary on exec.
+cp zig-out/bin/bit "$bin"
+# Re-sign ad-hoc: copying a signed Mach-O to a new path invalidates its
+# signature, and macOS SIGKILLs an invalidly-signed binary on exec.
 codesign --force --sign - "$bin"
 echo "    installed $bin ($(file -b "$bin"))"
 
