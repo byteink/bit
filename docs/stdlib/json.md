@@ -329,3 +329,110 @@ function cstExample(): string {
   }
 }
 ```
+
+## Editing the CST
+
+The path-based edit layer `bit add` (#1480, the package-manager epic) calls
+to change `bit.json` without disturbing anything it didn't touch — the json
+epic's namesake "edit layer". A path is `[]string` of object keys only
+(array-index paths are out of scope; `bit.json`'s dependency map is
+object-keyed). Every function mutates and returns its `root` — struct and
+slice writes along the path are visible in place, but an append or a
+deletion changes a slice's length, and a `CstNode`'s payload can't be
+reassigned in place, so that one node is rebuilt and returned; always use
+the return value rather than assuming the original `root` already reflects
+the edit.
+
+On a duplicate key, all three functions below resolve the **last** matching
+entry, the same policy `jsonGet` documents above.
+
+### `cstGet(root: CstNode, path: []string): Option<CstNode>`
+
+Read-only lookup of `path` under `root`, mirroring `jsonGet` but over the
+CST. `None` as soon as an intermediate segment isn't a `CstObject` or a key
+is missing — never a panic on an absent path.
+
+```bit
+import { cstParse, cstGet, CstNode } from "std/json"
+
+function cstGetExample(): string {
+  let root = cstParse("{\"a\": {\"b\": \"c\"}}") catch e {
+    return "error"
+  }
+  match (cstGet(root, []string{ "a", "b" })) {
+    Some(node) => {
+      match (node) {
+        CstString(raw, t) => return raw
+        CstNull(t) => return "null"
+        CstBool(b, t) => return "bool"
+        CstNumber(r, t) => return "number"
+        CstArray(a, t) => return "array"
+        CstObject(es, t) => return "object"
+      }
+    }
+    None => return "missing"
+  }
+}
+```
+
+### `cstSetString(root: CstNode, path: []string, value: string): CstNode!`
+
+Sets the string value at `path` to `value` (JSON-quoted and escaped). If
+`path` resolves to an existing `CstString` entry, only its `rawText` is
+replaced — that entry's `keyText` and `Trivia` are untouched. If the final
+key is absent but its parent object exists, a new `CstEntry` is appended
+(empty `Trivia`, no comment invented). Fails if the existing value at the
+final key isn't a `CstString`, or any intermediate segment doesn't resolve
+to a `CstObject` — this function never creates an intermediate object.
+
+```bit
+import { cstParse, cstSetString, cstGet, CstNode } from "std/json"
+
+function cstSetStringExample(): string {
+  let root = cstParse("{\"a\": \"old\"}") catch e {
+    return "error"
+  }
+  let updated = cstSetString(root, []string{ "a" }, "new") catch e {
+    return "error"
+  }
+  match (cstGet(updated, []string{ "a" })) {
+    Some(node) => {
+      match (node) {
+        CstString(raw, t) => return raw
+        CstNull(t) => return "null"
+        CstBool(b, t) => return "bool"
+        CstNumber(r, t) => return "number"
+        CstArray(a, t) => return "array"
+        CstObject(es, t) => return "object"
+      }
+    }
+    None => return "missing"
+  }
+}
+```
+
+### `cstDeleteKey(root: CstNode, path: []string): CstNode!`
+
+Removes the `CstEntry` at `path` from its parent's entries. Every sibling
+entry keeps its own `Trivia`, `rawText`, and relative order unchanged. The
+deleted entry's own `Trivia.leading` comments are dropped with it — the one
+case where a comment can legitimately disappear, and only that entry's own
+leading comments, never a sibling's. Fails if any path segment doesn't
+exist, or an intermediate segment doesn't resolve to a `CstObject`.
+
+```bit
+import { cstParse, cstDeleteKey, cstGet } from "std/json"
+
+function cstDeleteKeyExample(): string {
+  let root = cstParse("{\"a\": 1, \"b\": 2}") catch e {
+    return "error"
+  }
+  let updated = cstDeleteKey(root, []string{ "a" }) catch e {
+    return "error"
+  }
+  match (cstGet(updated, []string{ "a" })) {
+    Some(node) => return "still-present"
+    None => return "deleted"
+  }
+}
+```
