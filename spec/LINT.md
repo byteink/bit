@@ -185,6 +185,7 @@ information, so they can land first.
 | E0203 | `max-nesting` | 4 | Deep nesting is nearly always a missing early return. |
 | E0204 | `max-complexity` | 10 | Independent paths through a function, the count a reader must hold at once. |
 | E0205 | `defer-in-loop` | — | Defers run at function exit, so one inside a loop holds every resource until the function returns. |
+| E0212 | `unreachable-code` | — | A statement after `return`/`fail`/`break`/`continue`/`panic` in the same block. |
 
 Counting rules, so the numbers are reproducible:
 
@@ -209,6 +210,16 @@ Counting rules, so the numbers are reproducible:
 long flat function is readable, a short tangled one is not, and neither metric
 catches the other's case.
 
+`unreachable-code` is E0212 despite landing here, not E020x: it was assigned
+its code inside the E021x dead-weight block for family coherence with its
+neighbours below, before the dependency analysis that moved it here was done.
+Diagnostic codes are never renumbered once assigned (§3), so the code stays
+E0212; only its table row moves. It needs no resolver — whether a statement
+follows one that diverges (`return`/`fail`/`break`/`continue`/`panic`) is
+answered from the AST alone, by reusing the same `diverges` analysis
+`bit check` already uses for E0055 missing-return and catch-block
+completeness (seed/check.zig:5539, ported at selfhost/validatestmt.bit:610).
+
 ### Phase 2 — dead weight and footguns (needs the resolver)
 
 These need scope and symbol information and land after phase 1.
@@ -217,9 +228,11 @@ These need scope and symbol information and land after phase 1.
 |---|---|---|
 | E0210 | `unused-import` | Left behind by refactors; misleads the next reader about a module's dependencies. |
 | E0211 | `unused-local` | Same, at function scope. |
-| E0212 | `unreachable-code` | Statements after `return`/`fail`/`break` in the same block. |
 | E0213 | `shadowed-local` | A `let` that hides a name from an enclosing scope. Later edits to either binding silently change which one is read. |
 | E0214 | `append-aliasing` | `append` on a slice parameter grows it in place and aliases the caller's backing array, so the caller sees writes it never made. |
+
+(E0212 `unreachable-code` is numbered in this block but requires no resolver;
+see phase 1 above, where it is actually implemented.)
 
 `shadowed-local` closes a real gap: the resolver warns on shadowing a
 *predeclared* name ([resolve.zig:386](../seed/resolve.zig#L386)) but says
