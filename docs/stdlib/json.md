@@ -167,3 +167,39 @@ function encodeExample(): string {
   return jsonEncode(obj) + "\n" + jsonEncodePretty(obj, "  ")
 }
 ```
+
+## Parsing
+
+A recursive-descent parser over the lexer's token stream, building a `Json`
+tree. Strict RFC 8259 only — no comments, no trailing commas; JSONC is a
+separate layer on top. Malformed input (bad token sequence, an invalid
+escape, a number that doesn't match the grammar, or exceeding the lexer's
+64-level nesting cap) is a parse error via the fallible return, never a
+panic. An integral literal that fits `i64` decodes to `JsonInt`; anything
+wider, or with a `.`/`e`/`E`, decodes to `JsonFloat` via the runtime's own
+`parseFloat`. A duplicate object key keeps every entry — `jsonGet`'s
+last-key-wins policy is what resolves it.
+
+### `jsonParse(source: string): Json!`
+
+Parses `source` as one JSON value, optionally surrounded by whitespace and
+nothing else.
+
+```bit
+import { jsonParse, jsonGet, jsonAsInt } from "std/json"
+
+function parseExample(): i64 {
+  let v = jsonParse("{\"a\": 1, \"a\": 2}") catch e {
+    return -1
+  }
+  match (jsonGet(v, "a")) {
+    Some(inner) => {
+      match (jsonAsInt(inner)) {
+        Some(i) => return i
+        None => return -1
+      }
+    }
+    None => return -1
+  }
+}
+```

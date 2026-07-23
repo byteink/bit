@@ -1,0 +1,362 @@
+// Bit standard library — json module, strict-JSON recursive-descent parser.
+//
+// Consumes the flat token stream `lex` (stdlib/json/lex.bit) produces and
+// builds a `Json` tree (stdlib/json/value.bit). Strict RFC 8259 only: no
+// comments, no trailing commas — JSONC is a separate, later task layered on
+// top of this file. Every malformed shape (bad token sequence, invalid
+// escape, number that doesn't match the grammar, depth-limit token) is a
+// parse error via the fallible return, never a panic: this parser only ever
+// consumes untrusted input.
+//
+// Duplicate object keys: this parser keeps every entry, in source order,
+// rather than deduping while building `JsonObject`. `jsonGet` (value.bit)
+// already resolves duplicate keys last-wins, and it is the only sanctioned
+// way callers read a key (#1479), so keeping all entries and letting that one
+// place own the policy is simpler than enforcing it twice.
+
+// `newBuilder` is already imported into this module by encode.bit — importing
+// it again here would collide (same module, same declaration).
+import { parseInt, contains, Builder } from "std/strings"
+
+// A cursor over `lex`'s token stream, plus the original source (decoding a
+// string or number needs to slice raw bytes back out of it).
+struct Parser { src: string, toks: []Token, i: int }
+
+// The token under the cursor. `lex` always terminates with `Eof`, so this is
+// never out of bounds once `i` stops advancing past the last token.
+function peek(p: Parser): Token {
+  return p.toks[p.i]
+}
+
+// Returns the token under the cursor and moves past it, except at `Eof`
+// (the stream's fixed final token, which nothing should walk past).
+function advance(p: Parser): Token {
+  let t = p.toks[p.i]
+  if (p.i < len(p.toks) - 1) {
+    p.i = p.i + 1
+  }
+  return t
+}
+
+// Parses `source` as strict JSON (RFC 8259): one value, optionally
+// surrounded by whitespace, and nothing else.
+export function jsonParse(source: string): Json! {
+  let p = Parser{ src: source, toks: lex(source), i: 0 }
+  let v = parseValue(p)?
+  if (peek(p).kind != TokenKind.Eof) {
+    fail newError("json: trailing garbage after value")
+  }
+  return v
+}
+
+// An `Invalid` token can come from three places in the lexer (scanOpen on a
+// depth-cap hit, scanString on an unterminated string, everything else), and
+// the token itself carries no reason — only a span. The source byte at that
+// span disambiguates deterministically: `scanOpen` is the only path that
+// marks a `{`/`[` byte `Invalid` (a plain unexpected `{`/`[` always lexes as
+// `LBrace`/`LBracket`), and `scanString` is the only path that marks a `"`
+// byte `Invalid`.
+function describeInvalid(src: string, t: Token): string {
+  let c = src[t.start]
+  if (c == '{' || c == '[') {
+    return "json: max nesting depth exceeded"
+  }
+  if (c == '"') {
+    return "json: unterminated string"
+  }
+  return "json: unexpected character in input"
+}
+
+function parseValue(p: Parser): Json! {
+  let t = peek(p)
+  if (t.kind == TokenKind.LBrace) {
+    return parseObject(p)?
+  }
+  if (t.kind == TokenKind.LBracket) {
+    return parseArray(p)?
+  }
+  if (t.kind == TokenKind.StringTok) {
+    advance(p)
+    return Json.JsonString(decodeStringLiteral(p.src, t)?)
+  }
+  if (t.kind == TokenKind.NumberTok) {
+    advance(p)
+    return decodeNumber(p.src, t)?
+  }
+  if (t.kind == TokenKind.TrueTok) {
+    advance(p)
+    return Json.JsonBool(true)
+  }
+  if (t.kind == TokenKind.FalseTok) {
+    advance(p)
+    return Json.JsonBool(false)
+  }
+  if (t.kind == TokenKind.NullTok) {
+    advance(p)
+    return Json.JsonNull
+  }
+  if (t.kind == TokenKind.Invalid) {
+    fail newError(describeInvalid(p.src, t))
+  }
+  fail newError("json: unexpected token, expected a value")
+}
+
+// `{` was already peeked by the caller. Every entry is kept, including a
+// repeated key — see this file's header comment for why.
+function parseObject(p: Parser): Json! {
+  advance(p)
+  let entries = []JsonEntry(0)
+  if (peek(p).kind == TokenKind.RBrace) {
+    advance(p)
+    return Json.JsonObject(entries)
+  }
+  // Bounded by the token count: each iteration consumes at least a key, a
+  // colon, a value, and a comma, so the loop cannot outrun a finite stream.
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let keyTok = peek(p)
+    if (keyTok.kind != TokenKind.StringTok) {
+      fail newError("json: expected string key")
+    }
+    advance(p)
+    let key = decodeStringLiteral(p.src, keyTok)?
+    if (peek(p).kind != TokenKind.Colon) {
+      fail newError("json: expected ':' after object key")
+    }
+    advance(p)
+    let val = parseValue(p)?
+    entries = append(entries, JsonEntry{ key: key, value: val })
+    let nxt = peek(p)
+    if (nxt.kind == TokenKind.RBrace) {
+      advance(p)
+      return Json.JsonObject(entries)
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail newError("json: expected ',' or '}' in object")
+    }
+    advance(p)
+    guard = guard + 1
+  }
+  fail newError("json: object nesting exceeds token bound")
+}
+
+// `[` was already peeked by the caller.
+function parseArray(p: Parser): Json! {
+  advance(p)
+  let items = []Json(0)
+  if (peek(p).kind == TokenKind.RBracket) {
+    advance(p)
+    return Json.JsonArray(items)
+  }
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let v = parseValue(p)?
+    items = append(items, v)
+    let nxt = peek(p)
+    if (nxt.kind == TokenKind.RBracket) {
+      advance(p)
+      return Json.JsonArray(items)
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail newError("json: expected ',' or ']' in array")
+    }
+    advance(p)
+    guard = guard + 1
+  }
+  fail newError("json: array nesting exceeds token bound")
+}
+
+// --- numbers -----------------------------------------------------------
+
+// True when `s` matches RFC 8259 §6's number grammar exactly: optional `-`,
+// an integer part with no non-`0` leading zero, an optional `.` fraction
+// with at least one digit, an optional `e`/`E` exponent with at least one
+// digit. `lex`'s own comment says it "does not reject a malformed literal —
+// that check belongs to the parser task consuming this stream"; this is that
+// check.
+function isValidJsonNumber(s: string): bool {
+  let n = len(s)
+  let i = 0
+  if (i >= n) {
+    return false
+  }
+  if (s[i] == '-') {
+    i = i + 1
+  }
+  if (i >= n) {
+    return false
+  }
+  if (s[i] == '0') {
+    i = i + 1
+  } else if (s[i] >= '1' && s[i] <= '9') {
+    i = i + 1
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  } else {
+    return false
+  }
+  if (i < n && s[i] == '.') {
+    i = i + 1
+    if (i >= n || !isDigit(s[i])) {
+      return false
+    }
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  }
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+    i = i + 1
+    if (i < n && (s[i] == '+' || s[i] == '-')) {
+      i = i + 1
+    }
+    if (i >= n || !isDigit(s[i])) {
+      return false
+    }
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  }
+  return i == n
+}
+
+// A literal with no `.`/`e`/`E` that fits `i64` decodes to `JsonInt`; anything
+// wider, or with a fraction/exponent, decodes to `JsonFloat` via the
+// runtime's own `parseFloat` primitive so it can never drift a ULP from the
+// canonical parse (#1479's number-handling decision).
+function decodeNumber(src: string, t: Token): Json! {
+  let text = src[t.start:t.end]
+  if (!isValidJsonNumber(text)) {
+    fail newError("json: invalid number literal")
+  }
+  if (contains(text, ".") || contains(text, "e") || contains(text, "E")) {
+    return Json.JsonFloat(parseFloat(text))
+  }
+  let iv = parseInt(text) catch e {
+    return Json.JsonFloat(parseFloat(text))
+  }
+  return Json.JsonInt(iv)
+}
+
+// --- strings -------------------------------------------------------------
+
+function hexDigitVal(c: u8): i64! {
+  if (c >= '0' && c <= '9') {
+    return i64(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return i64(c - 'a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return i64(c - 'A') + 10
+  }
+  fail newError("json: invalid \\u escape")
+}
+
+// The 4-hex-digit codepoint starting at `src[i]`.
+function decodeHex4(src: string, i: int): i64! {
+  let v = i64(0)
+  let k = 0
+  while (k < 4) {
+    let d = hexDigitVal(src[i + k])?
+    v = v * 16 + d
+    k = k + 1
+  }
+  return v
+}
+
+// Encodes Unicode scalar value `cp` as UTF-8 into `b`. Hand-rolled because a
+// `\uXXXX` escape (and a surrogate pair, for an astral codepoint) is the only
+// place this parser needs to build UTF-8 from a codepoint, and `string(rune)`
+// is not implemented yet (SPEC §12.9, deferred to rune iteration landing).
+function writeUtf8(b: Builder, cp: i64): Builder {
+  if (cp < 0x80) {
+    return b.writeByte(u8(cp))
+  }
+  if (cp < 0x800) {
+    return b.writeByte(u8(0xC0 | (cp >> 6))).writeByte(u8(0x80 | (cp & 0x3F)))
+  }
+  if (cp < 0x10000) {
+    return b.writeByte(u8(0xE0 | (cp >> 12))).writeByte(u8(0x80 | ((cp >> 6) & 0x3F))).writeByte(u8(0x80 | (cp & 0x3F)))
+  }
+  return b.writeByte(u8(0xF0 | (cp >> 18))).writeByte(u8(0x80 | ((cp >> 12) & 0x3F))).writeByte(u8(0x80 | ((cp >> 6) & 0x3F))).writeByte(u8(0x80 | (cp & 0x3F)))
+}
+
+// Decodes a `StringTok`'s raw span (quotes included, escapes raw — see
+// lex.bit) into its string value: every RFC 8259 §7 escape, including a
+// `\uXXXX` surrogate pair for an astral codepoint. An invalid escape is a
+// parse error, never a panic. `lex` only ever emits `StringTok` for a span
+// that found its closing quote, so `[start+1, end-1)` is always the content
+// between the quotes.
+function decodeStringLiteral(src: string, t: Token): string! {
+  let i = t.start + 1
+  let end = t.end - 1
+  let b = newBuilder()
+  while (i < end) {
+    let c = src[i]
+    if (c < 32) {
+      fail newError("json: control character in string")
+    }
+    if (c != '\\') {
+      b = b.writeByte(c)
+      i = i + 1
+      continue
+    }
+    if (i + 1 >= end) {
+      fail newError("json: unterminated escape")
+    }
+    let e = src[i + 1]
+    if (e == '"') {
+      b = b.writeByte('"')
+      i = i + 2
+    } else if (e == '\\') {
+      b = b.writeByte('\\')
+      i = i + 2
+    } else if (e == '/') {
+      b = b.writeByte('/')
+      i = i + 2
+    } else if (e == 'b') {
+      b = b.writeByte(8)
+      i = i + 2
+    } else if (e == 'f') {
+      b = b.writeByte(12)
+      i = i + 2
+    } else if (e == 'n') {
+      b = b.writeByte('\n')
+      i = i + 2
+    } else if (e == 'r') {
+      b = b.writeByte('\r')
+      i = i + 2
+    } else if (e == 't') {
+      b = b.writeByte('\t')
+      i = i + 2
+    } else if (e == 'u') {
+      if (i + 6 > end) {
+        fail newError("json: invalid \\u escape")
+      }
+      let cp = decodeHex4(src, i + 2)?
+      i = i + 6
+      if (cp >= 0xD800 && cp <= 0xDBFF) {
+        if (i + 6 > end || src[i] != '\\' || src[i + 1] != 'u') {
+          fail newError("json: unpaired surrogate in \\u escape")
+        }
+        let lo = decodeHex4(src, i + 2)?
+        if (lo < 0xDC00 || lo > 0xDFFF) {
+          fail newError("json: invalid low surrogate in \\u escape")
+        }
+        i = i + 6
+        let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+        b = writeUtf8(b, combined)
+      } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+        fail newError("json: unpaired surrogate in \\u escape")
+      } else {
+        b = writeUtf8(b, cp)
+      }
+    } else {
+      fail newError("json: invalid escape character")
+    }
+  }
+  return b.toString()
+}
