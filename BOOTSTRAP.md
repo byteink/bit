@@ -66,25 +66,23 @@ seed to build the self-hosted bit needs a native host).
 
 ## Current state
 
-**Stage 1 — front-end, valid-input parity complete.** The lexer, AST arena,
-parser, and diagnostic renderer are ported (`selfhost/{lexer,ast,parser,
-diagnostics}.bit`); `bit2` drives them via `--dump-tokens`, `--dump-ast`, and
-`--dump-diags`. Against the seed over the whole corpus:
+**Stage 1 — front-end, COMPLETE (#363).** The lexer, AST arena, parser, and
+diagnostic renderer are ported (`selfhost/{lexer,ast,parser,diagnostics}.bit`);
+`bit2` drives them via `--dump-tokens`, `--dump-ast`, and `--dump-diags`.
+Against the seed over the whole corpus:
 
 | Surface | Script | Result |
 |---------|--------|--------|
-| tokens | `scripts/selfhost-difftokens.sh` | 326/0 byte-identical (1 lex-error skip) |
-| AST | `scripts/selfhost-diffast.sh` | 325/0 byte-identical (2 front-end-error skips) |
-| diagnostics | `scripts/selfhost-diffdiags.sh` | 327/0 byte-identical (incl. the 2 `// error` cases) |
+| tokens | `scripts/selfhost-difftokens.sh` | MATCH=515 MISMATCH=0 (14 lex-error skips) |
+| AST | `scripts/selfhost-diffast.sh` | MATCH=506 MISMATCH=0 (23 parse-error skips) |
+| diagnostics | `scripts/selfhost-diffdiags.sh` | MATCH=529 MISMATCH=0 (incl. every `// error` case) |
 
-Robustness + accept/reject parity are proven by `scripts/selfhost-fuzzdiff.sh`,
-which truncates every corpus file at each line and diffs `--dump-diags`: over
-5065 mutated inputs, **0 crashes/hangs** and **0 accept/reject disagreements**
-(every malformed input is rejected by both compilers). The remaining ~236 are
-byte-exact multi-error *cascade ordering* on truncated garbage — cosmetic
-diagnostic ordering that valid compiler source never reaches. Closing those to
-zero is bounded by the formal fuzz harness (#1332, not yet built; the fuzz crash
-corpus is empty), so it is deferred with that task rather than ground out blind.
+Robustness + accept/reject parity are proven by `scripts/selfhost-fuzzdiff.sh`
+(the #1332 harness), which truncates every corpus file at each line boundary
+and diffs `--dump-diags`: **MATCH=7526 MISMATCH=0 CRASH=0 TIMEOUT=0** — every
+malformed input is rejected identically by both compilers, including the
+multi-error cascade-ordering cases that used to diverge before #1332 landed.
+Zero diffs across all four surfaces; gate #363 is signed off.
 
 **Stage 2 — middle-end, COMPLETE.** `selfhost/{resolve,types,check,ir,lower,
 opt}.bit` port the resolve substrate, type checker, SSA IR model + text dumper,
