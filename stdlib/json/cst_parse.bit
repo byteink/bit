@@ -1,56 +1,37 @@
 // Bit standard library — json module, trivia-carrying CST parser (#1723).
 //
 // Parses JSONC source into the #1720 CST (Trivia/CstEntry/CstNode)
-// losslessly: every comment and each number/string's exact raw span survive,
-// unlike #1721/#1722's value-only jsonParse/jsoncParse, which discard both.
-// This is the parser a later edit-layer task mutates the output of, so it
-// must retain everything that value-only parser throws away.
+// losslessly: every byte of formatting — comments, indentation, blank lines,
+// and comma placement — survives, unlike #1721/#1722's value-only
+// jsonParse/jsoncParse, which discard all of it. This is what makes
+// #1726's `cstPrint(cstParse(source))` byte-identical for an untouched
+// document: every gap between structural tokens is captured verbatim rather
+// than decoded, so nothing is lost re-deriving it.
 //
-// Reuses stdlib/json/lex.bit's scanner via `lexCst` (this task's one addition
-// to that file): comments come back as `Comment` tokens instead of being
+// Reuses stdlib/json/lex.bit's scanner via `lexCst` (#1723's one addition to
+// that file): comments come back as `Comment` tokens instead of being
 // skipped, so string/number/word scanning is never re-implemented here.
 // Malformed input (bad token sequence, invalid escape, a number that doesn't
 // match the grammar, or exceeding the lexer's 64-level depth cap) is a parse
 // error via the fallible return, same as #1721/#1722 — never a panic.
 //
-// Trivia attachment rule (this file's own decision — neither #1720 nor #1722
-// pins one down):
-//   - leading:  every run of consecutive Comment tokens immediately before a
-//     node's own first token, in source order — one `leading` entry per
-//     comment, never concatenated.
-//   - trailing: a Comment token immediately following a node's own last
-//     token, on the same source line (no `\n` between them) — i.e.
-//     `1 /* like this */,` counts, `1, /* not this */` does not (that
-//     comment becomes the NEXT node's leading instead). Only one trailing
-//     comment is ever captured per node (`Trivia.trailing` is `Option<string>`,
-//     not a list).
-//   - A run of comments sitting right before a container's closing `}`/`]`
-//     (nothing follows them inside the container) folds into that
-//     container's own `Trivia.trailing`, per cst.bit's own documented
-//     decision. Trivia's shape allows only one string there, so if more than
-//     one comment sits in that run, only the first is kept — a real, minor
-//     ceiling of the landed type, not a bug in this parser.
-//   - A comment that sits on its own line strictly BETWEEN a value and its
-//     following comma (`1\n// odd\n,`) is not attached anywhere; the next
-//     token expected there is `,`/`}`/`]`, so this produces a parse error.
-//     This ordering is vanishingly rare in real JSONC (every realistic style
-//     puts such a comment either same-line before the comma, or after it, on
-//     its own line before the next entry) and is not exercised by the golden
-//     tests.
+// Gap-capture rule (this file's own decision — cst.bit's header documents the
+// resulting shape): a "gap" is the verbatim source text between two
+// structural boundaries — after a `{`/`[`/`,`/`:` and before the next
+// meaningful token — comments and plain whitespace together, exactly as
+// written. `ctSkipGap` computes one by skipping any `Comment` tokens at the
+// cursor and slicing from the caller-supplied start offset to wherever the
+// cursor lands: since comments and the whitespace around them are contiguous
+// in the source regardless of tokenization, one slice recovers both without
+// decoding either. Every value-builder (`ctBuildValue`) hands its node back
+// with empty `Trivia` — the caller (object/array/root) is the one holding the
+// boundary offsets, so it is the caller's job to attach the gap, never the
+// builder's.
 //
-// Trailing-comma re-serialization: this parser does NOT store a
-// `hadTrailingComma` flag on CstArray/CstObject. #1722's grammar allows at
-// most one trailing comma, so its presence is fully recoverable from
-// `len(items)` alone — a printer walking the array/object by index already
-// knows whether it is emitting the last element, and the trailing comma is
-// purely a function of that plus whatever style the printer wants to
-// reproduce; nothing about the parsed *content* depends on whether the comma
-// was there. Confirmed sufficient: no flag added.
-
-// A cursor over `lexCst`'s token stream (includes `Comment` tokens), plus the
-// original source — decoding a key, or validating a number/string's grammar,
-// still needs to slice raw bytes back out of it. Named distinctly from
-// parse.bit's `Parser` (same module, so both names are in one scope).
+// Trailing-comma re-serialization: no `hadTrailingComma` flag is needed.
+// A container's own `gaps[len(children)]` is the verbatim text between the
+// last child and the close brace/bracket — if a trailing comma was there, it
+// is simply part of that raw text, recovered the same way as any other gap.
 struct CstParser { src: string, toks: []Token, i: int }
 
 function ctPeek(p: CstParser): Token {
@@ -69,70 +50,43 @@ function ctSlice(p: CstParser, t: Token): string {
   return p.src[t.start:t.end]
 }
 
-// True when no '\n' appears in src[startAt:endAt) — decides whether a
-// comment shares its source line with the token immediately before it.
-function ctSameLine(src: string, startAt: int, endAt: int): bool {
-  let i = startAt
-  while (i < endAt) {
-    if (src[i] == '\n') {
-      return false
-    }
-    i = i + 1
-  }
-  return true
+// The end offset of whatever token was most recently consumed — valid any
+// time after at least one `ctAdvance`, which every value/entry/item parse
+// path guarantees before calling this.
+function ctLastEnd(p: CstParser): int {
+  return p.toks[p.i - 1].end
 }
 
-// Collects every Comment token at the cursor into `leading`, in source
-// order. Bounded by the token stream's own length: each iteration consumes
-// exactly one token, so this cannot outrun a finite stream.
-function ctCollectLeading(p: CstParser): []string {
-  let leading = []string(0)
+// Advances past any `Comment` tokens sitting at the cursor. Bounded by the
+// token stream's own length: each iteration consumes exactly one token.
+function ctSkipComments(p: CstParser) {
   let guard = 0
   let bound = len(p.toks) + 1
   while (guard <= bound && ctPeek(p).kind == TokenKind.Comment) {
-    let t = ctAdvance(p)
-    leading = append(leading, ctSlice(p, t))
+    ctAdvance(p)
     guard = guard + 1
   }
-  return leading
 }
 
-// Consumes the single same-line trailing comment right after `afterEnd` (a
-// node's own last byte offset), if one is there. See this file's header for
-// why only one is ever taken.
-function ctTakeTrailing(p: CstParser, afterEnd: int): Option<string> {
-  let t = ctPeek(p)
-  if (t.kind == TokenKind.Comment && ctSameLine(p.src, afterEnd, t.start)) {
-    ctAdvance(p)
-    return Option<string>.Some(ctSlice(p, t))
-  }
-  return Option<string>.None
+// Skips any `Comment` tokens sitting at the cursor and returns the verbatim
+// source text from `startAt` to wherever the cursor lands — comments and the
+// whitespace around them, together, exactly as written.
+function ctSkipGap(p: CstParser, startAt: int): string {
+  ctSkipComments(p)
+  return p.src[startAt:ctPeek(p).start]
 }
 
-// The container-close case: at most one comment fits `Trivia.trailing`, so a
-// run right before `}`/`]` keeps only its first entry (closest to the
-// container's own last real entry); any further ones in that same run are
-// dropped, per this file's header comment.
-function ctFirstOrNone(comments: []string): Option<string> {
-  if (len(comments) > 0) {
-    return Option<string>.Some(comments[0])
-  }
-  return Option<string>.None
-}
-
-// Dispatches on the token at the cursor and builds one CstNode, using
-// `leading` (already collected by the caller) as its leading trivia. Shared
-// by `ctParseValue` (top level, and after a colon — positions where nothing
-// but a value can follow, so collecting leading trivia can't be confused with
-// detecting a container's close) and `ctParseArray` (which must tell "next
-// item" apart from "the closing `]`" before committing to a value).
-function ctBuildValue(p: CstParser, leading: []string): CstNode! {
+// Dispatches on the token at the cursor and builds one CstNode. Trivia is
+// always empty here: the caller (ctParseObject/ctParseArray/cstParse) owns
+// the surrounding gap, since only it knows the boundary this value's leading
+// text starts from.
+function ctBuildValue(p: CstParser): CstNode! {
   let t = ctPeek(p)
   if (t.kind == TokenKind.LBrace) {
-    return ctParseObject(p, leading)?
+    return ctParseObject(p)?
   }
   if (t.kind == TokenKind.LBracket) {
-    return ctParseArray(p, leading)?
+    return ctParseArray(p)?
   }
   if (t.kind == TokenKind.StringTok) {
     ctAdvance(p)
@@ -141,8 +95,7 @@ function ctBuildValue(p: CstParser, leading: []string): CstNode! {
     // discarded here — CstString keeps only the raw span, decoding is the
     // later CST-to-Json projection task's job.
     decodeStringLiteral(p.src, t)?
-    let trailing = ctTakeTrailing(p, t.end)
-    return CstNode.CstString(ctSlice(p, t), Trivia{ leading: leading, trailing: trailing })
+    return CstNode.CstString(ctSlice(p, t), Trivia{ leading: "", trailing: "" })
   }
   if (t.kind == TokenKind.NumberTok) {
     ctAdvance(p)
@@ -150,20 +103,19 @@ function ctBuildValue(p: CstParser, leading: []string): CstNode! {
     if (!isValidJsonNumber(raw)) {
       fail newError("json: invalid number literal")
     }
-    let trailing = ctTakeTrailing(p, t.end)
-    return CstNode.CstNumber(raw, Trivia{ leading: leading, trailing: trailing })
+    return CstNode.CstNumber(raw, Trivia{ leading: "", trailing: "" })
   }
   if (t.kind == TokenKind.TrueTok) {
     ctAdvance(p)
-    return CstNode.CstBool(true, Trivia{ leading: leading, trailing: ctTakeTrailing(p, t.end) })
+    return CstNode.CstBool(true, Trivia{ leading: "", trailing: "" })
   }
   if (t.kind == TokenKind.FalseTok) {
     ctAdvance(p)
-    return CstNode.CstBool(false, Trivia{ leading: leading, trailing: ctTakeTrailing(p, t.end) })
+    return CstNode.CstBool(false, Trivia{ leading: "", trailing: "" })
   }
   if (t.kind == TokenKind.NullTok) {
     ctAdvance(p)
-    return CstNode.CstNull(Trivia{ leading: leading, trailing: ctTakeTrailing(p, t.end) })
+    return CstNode.CstNull(Trivia{ leading: "", trailing: "" })
   }
   if (t.kind == TokenKind.Invalid) {
     fail newError(describeInvalid(p.src, t))
@@ -171,34 +123,26 @@ function ctBuildValue(p: CstParser, leading: []string): CstNode! {
   fail newError("json: unexpected token, expected a value")
 }
 
-// One value at the cursor, collecting its own leading trivia first.
-function ctParseValue(p: CstParser): CstNode! {
-  let leading = ctCollectLeading(p)
-  return ctBuildValue(p, leading)?
-}
-
-// `{` was already peeked by the caller (`ctBuildValue`). Every entry is kept,
-// including a repeated key — same policy as #1721/#1722's parseObject.
-function ctParseObject(p: CstParser, leading: []string): CstNode! {
-  ctAdvance(p)
+// `{` was already peeked by the caller. Every entry is kept, including a
+// repeated key — same policy as #1721/#1722's parseObject.
+function ctParseObject(p: CstParser): CstNode! {
+  let openTok = ctAdvance(p)
   let entries = []CstEntry(0)
+  let gaps = []Option<string>(0)
+  let cursor = openTok.end
   // Bounded by the token count: each iteration consumes at least a key, a
-  // colon, a value, and a comma, so the loop cannot outrun a finite stream.
+  // colon, a value, and (except for the last) a comma, so the loop cannot
+  // outrun a finite stream.
   let guard = 0
   let bound = len(p.toks) + 1
   while (guard <= bound) {
-    // Collected once: this is EITHER the next key's leading trivia (if a key
-    // follows) OR — folded via ctFirstOrNone — the container's own trailing,
-    // if a close follows instead (covers both an empty `{}` and the run
-    // right after a trailing comma).
-    let pending = ctCollectLeading(p)
+    let gap = ctSkipGap(p, cursor)
     if (ctPeek(p).kind == TokenKind.RBrace) {
       ctAdvance(p)
-      return CstNode.CstObject(
-        entries,
-        Trivia{ leading: leading, trailing: ctFirstOrNone(pending) },
-      )
+      gaps = append(gaps, Option<string>.Some(gap))
+      return CstNode.CstObject(entries, gaps, Trivia{ leading: "", trailing: "" })
     }
+    gaps = append(gaps, Option<string>.Some(gap))
     let keyTok = ctPeek(p)
     if (keyTok.kind != TokenKind.StringTok) {
       fail newError("json: expected string key")
@@ -210,61 +154,80 @@ function ctParseObject(p: CstParser, leading: []string): CstNode! {
       fail newError("json: expected ':' after object key")
     }
     ctAdvance(p)
-    let val = ctParseValue(p)?
-    entries = append(
-      entries,
-      CstEntry{
-        keyText: keyText,
-        key: key,
-        trivia: Trivia{ leading: pending, trailing: Option<string>.None },
-        value: val,
-      },
-    )
+    let midGap = ctSkipGap(p, keyTok.end)
+    let val = ctBuildValue(p)?
+    entries = append(entries, CstEntry{ keyText: keyText, key: key, midGap: midGap, value: val })
+    // `cursor` stays at the value's own end, not past a following comma: the
+    // comma (if any) belongs to the NEXT gap, captured verbatim like any
+    // other byte between two tokens, never synthesized by the printer.
+    cursor = ctLastEnd(p)
+    // A same-line (or, more leniently than #1723's original grammar, any)
+    // comment between the value and its comma/close is skipped here so the
+    // comma/close check below sees past it; it is still captured, verbatim,
+    // by the next `ctSkipGap` call, since that slices from `cursor` and
+    // slicing does not care how many tokens have already been consumed.
+    ctSkipComments(p)
     let nxt = ctPeek(p)
-    if (nxt.kind == TokenKind.RBrace) {
+    if (nxt.kind == TokenKind.Comma) {
       ctAdvance(p)
-      return CstNode.CstObject(entries, Trivia{ leading: leading, trailing: Option<string>.None })
-    }
-    if (nxt.kind != TokenKind.Comma) {
+    } else if (nxt.kind != TokenKind.RBrace) {
       fail newError("json: expected ',' or '}' in object")
     }
-    ctAdvance(p)
     // JSONC: a single trailing comma is legal; a second one is not — the next
-    // loop iteration's `pending` check falls through to "expected string key"
-    // once it sees a second `,` instead of a key or `}`.
+    // loop iteration's key check fails once it sees a second `,` instead of
+    // a key or `}`.
     guard = guard + 1
   }
   fail newError("json: object nesting exceeds token bound")
 }
 
-// `[` was already peeked by the caller (`ctBuildValue`).
-function ctParseArray(p: CstParser, leading: []string): CstNode! {
-  ctAdvance(p)
+// `[` was already peeked by the caller.
+function ctParseArray(p: CstParser): CstNode! {
+  let openTok = ctAdvance(p)
   let items = []CstNode(0)
+  let gaps = []Option<string>(0)
+  let cursor = openTok.end
   let guard = 0
   let bound = len(p.toks) + 1
   while (guard <= bound) {
-    // Same "next item vs. close" ambiguity as ctParseObject's `pending`,
-    // just without a key in between.
-    let pending = ctCollectLeading(p)
+    let gap = ctSkipGap(p, cursor)
     if (ctPeek(p).kind == TokenKind.RBracket) {
       ctAdvance(p)
-      return CstNode.CstArray(items, Trivia{ leading: leading, trailing: ctFirstOrNone(pending) })
+      gaps = append(gaps, Option<string>.Some(gap))
+      return CstNode.CstArray(items, gaps, Trivia{ leading: "", trailing: "" })
     }
-    let v = ctBuildValue(p, pending)?
+    gaps = append(gaps, Option<string>.Some(gap))
+    let v = ctBuildValue(p)?
     items = append(items, v)
+    // See ctParseObject's own comment: `cursor` stays at the item's end, not
+    // past a following comma, so the comma is captured as part of the next
+    // gap instead of being dropped.
+    cursor = ctLastEnd(p)
+    ctSkipComments(p)
     let nxt = ctPeek(p)
-    if (nxt.kind == TokenKind.RBracket) {
+    if (nxt.kind == TokenKind.Comma) {
       ctAdvance(p)
-      return CstNode.CstArray(items, Trivia{ leading: leading, trailing: Option<string>.None })
-    }
-    if (nxt.kind != TokenKind.Comma) {
+    } else if (nxt.kind != TokenKind.RBracket) {
       fail newError("json: expected ',' or ']' in array")
     }
-    ctAdvance(p)
     guard = guard + 1
   }
   fail newError("json: array nesting exceeds token bound")
+}
+
+// Rebuilds `node` with its outer `Trivia` replaced by `t` — used exactly
+// once, to attach the document-level leading/trailing gap (a comment or
+// blank line before the first token, or after the last) to the root node,
+// since every builder above hands its node back with empty Trivia.
+function ctAttachRootTrivia(node: CstNode, t: Trivia): CstNode {
+  match (node) {
+    CstNull(old) => return CstNode.CstNull(t)
+    CstBool(b, old) => return CstNode.CstBool(b, t)
+    CstNumber(r, old) => return CstNode.CstNumber(r, t)
+    CstString(s, old) => return CstNode.CstString(s, t)
+    CstArray(items, gaps, old) => return CstNode.CstArray(items, gaps, t)
+    CstObject(entries, gaps, old) => return CstNode.CstObject(entries, gaps, t)
+  }
 }
 
 // Parses `source` as JSONC (stdlib/json/parse.bit's header documents the
@@ -272,14 +235,11 @@ function ctParseArray(p: CstParser, leading: []string): CstNode! {
 // JSON5), into a trivia-carrying CST rather than a plain `Json` value.
 export function cstParse(source: string): CstNode! {
   let p = CstParser{ src: source, toks: lexCst(source), i: 0 }
-  let node = ctParseValue(p)?
-  // A comment after the root value has no CST node left to attach to
-  // (Trivia lives on nodes, not on the document as a whole); accept and
-  // discard it rather than rejecting otherwise-valid JSONC — jsoncParse's own
-  // lexer (#1722) already treats a file-trailing comment as plain whitespace.
-  ctCollectLeading(p)
+  let leading = ctSkipGap(p, 0)
+  let node = ctBuildValue(p)?
+  let trailing = ctSkipGap(p, ctLastEnd(p))
   if (ctPeek(p).kind != TokenKind.Eof) {
     fail newError("json: trailing garbage after value")
   }
-  return node
+  return ctAttachRootTrivia(node, Trivia{ leading: leading, trailing: trailing })
 }

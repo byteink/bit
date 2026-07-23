@@ -266,45 +266,58 @@ edit. Types only — no parser, no printer, no mutation yet.
 Bit enum variants take positional payloads only (no named payload fields), so
 `CstNode`'s multi-field variants are documented by argument order below.
 
+`Trivia.leading`/`.trailing` are only ever populated on the root node
+returned by `cstParse` (a comment or blank line before the document's first
+token, or after its last) — every other node's own `Trivia` is empty,
+because its surrounding formatting is owned by its parent container's `gaps`
+or by its `CstEntry.midGap` instead. #1726 (the CST printer) found that a
+comment-only `Trivia` couldn't reproduce a document's plain whitespace
+(indentation, blank lines) or comma placement — this shape closes that gap by
+making every boundary between structural tokens a single verbatim raw-text
+field.
+
 ### `Trivia`
 
-The comment/blank-line tokens immediately around one CST node, verbatim
-source text (including `//` / `/* */` delimiters): `leading` is zero or more
-tokens before the node, in source order; `trailing` is an optional same-line
-comment after the node's own text, before the next comma/newline (or, for a
-container, before its close — see `CstArray`/`CstObject` below).
+`leading`/`trailing`: verbatim source text (comments and whitespace
+together, exactly as written) before/after the root node's own text. Empty
+on every non-root node.
 
 ### `CstEntry`
 
 One key/value pair of a `CstObject`, in source order: `keyText` is the raw
 source text of the key, including quotes, exactly as written; `key` is the
-decoded key string, for lookups.
+decoded key string, for lookups; `midGap` is the verbatim text between the
+key's closing quote and the value's first token (the `:` plus any
+surrounding whitespace or comments).
 
 ### `CstNode`
 
 A `Json` value together with the `Trivia` around it: `CstNull(Trivia)`,
 `CstBool(bool, Trivia)`, `CstNumber(rawText: string, Trivia)` (exact source
 span, e.g. `"1.50000"`), `CstString(rawText: string, Trivia)` (exact source
-span, including quotes), `CstArray([]CstNode, Trivia)`, or
-`CstObject([]CstEntry, Trivia)`. A comment on its own line right before an
-array/object's closing `]`/`}` is folded into that container's own
-`Trivia.trailing`, rather than a separate `closeTrivia` field.
+span, including quotes), `CstArray([]CstNode, gaps: []Option<string>,
+Trivia)`, or `CstObject([]CstEntry, gaps: []Option<string>, Trivia)`.
+
+A container's `gaps` holds one verbatim raw-text boundary per child plus one:
+`gaps[i]` is the text before child `i` (comments, indentation, and — for
+`i > 0` — the comma that ended child `i - 1`); `gaps[len(children)]` is the
+text after the last child, before the closing `}`/`]` (including an optional
+trailing comma). `gaps[i]` is `Option<string>.None` only for an entry
+appended by `cstSetString` after the original parse — there is no original
+formatting to echo; `cstPrint` (below) synthesizes it from the preceding
+sibling's own indentation instead of guessing a hardcoded style. Every gap
+`cstParse` produces is `Some`.
 
 ## CST parsing
 
-`cstParse` parses JSONC into the CST above, losslessly: every comment and
-each number/string's exact raw span survive, unlike `jsonParse`/`jsoncParse`
-above, which discard both. This is the parser a later edit-layer task
-mutates the output of.
+`cstParse` parses JSONC into the CST above, losslessly: every byte of
+formatting — comments, indentation, blank lines, and comma placement —
+survives, unlike `jsonParse`/`jsoncParse` above, which discard all of it.
+This is the parser a later edit-layer task mutates the output of.
 
-A leading comment run attaches to the following node's `Trivia.leading`, one
-entry per comment, in source order — never concatenated. A comment on the
-same source line as a value, before that value's own trailing comma, attaches
-to that value's `Trivia.trailing` (`1 /* like this */,` counts, `1, /* not
-this */` does not — that one becomes the next node's leading instead). No
-`hadTrailingComma` flag is stored on `CstArray`/`CstObject`: a printer
-re-derives comma placement from the array/object's own length and each
-entry's index.
+No `hadTrailingComma` flag is stored on `CstArray`/`CstObject`: a trailing
+comma, if present, is simply part of the container's own `gaps` raw text,
+recovered the same way as any other gap.
 
 ### `cstParse(source: string): CstNode!`
 
@@ -320,12 +333,12 @@ function cstExample(): string {
     return "error"
   }
   match (root) {
-    CstObject(entries, trivia) => return entries[0].trivia.leading[0]
+    CstObject(entries, gaps, trivia) => return entries[0].midGap
     CstNull(t) => return "null"
     CstBool(b, t) => return "bool"
     CstNumber(r, t) => return "number"
     CstString(s, t) => return "string"
-    CstArray(a, t) => return "array"
+    CstArray(a, g, t) => return "array"
   }
 }
 ```
@@ -366,8 +379,8 @@ function cstGetExample(): string {
         CstNull(t) => return "null"
         CstBool(b, t) => return "bool"
         CstNumber(r, t) => return "number"
-        CstArray(a, t) => return "array"
-        CstObject(es, t) => return "object"
+        CstArray(a, g, t) => return "array"
+        CstObject(es, g, t) => return "object"
       }
     }
     None => return "missing"
@@ -379,9 +392,11 @@ function cstGetExample(): string {
 
 Sets the string value at `path` to `value` (JSON-quoted and escaped). If
 `path` resolves to an existing `CstString` entry, only its `rawText` is
-replaced — that entry's `keyText` and `Trivia` are untouched. If the final
-key is absent but its parent object exists, a new `CstEntry` is appended
-(empty `Trivia`, no comment invented). Fails if the existing value at the
+replaced — that entry's `keyText` and the value's own `Trivia` are untouched.
+If the final key is absent but its parent object exists, a new `CstEntry` is
+appended with no comment invented; the gap immediately before it is `None`,
+so `cstPrint` synthesizes formatting for it from the preceding sibling's own
+indentation rather than a hardcoded style. Fails if the existing value at the
 final key isn't a `CstString`, or any intermediate segment doesn't resolve
 to a `CstObject` — this function never creates an intermediate object.
 
@@ -402,8 +417,8 @@ function cstSetStringExample(): string {
         CstNull(t) => return "null"
         CstBool(b, t) => return "bool"
         CstNumber(r, t) => return "number"
-        CstArray(a, t) => return "array"
-        CstObject(es, t) => return "object"
+        CstArray(a, g, t) => return "array"
+        CstObject(es, g, t) => return "object"
       }
     }
     None => return "missing"
@@ -414,11 +429,11 @@ function cstSetStringExample(): string {
 ### `cstDeleteKey(root: CstNode, path: []string): CstNode!`
 
 Removes the `CstEntry` at `path` from its parent's entries. Every sibling
-entry keeps its own `Trivia`, `rawText`, and relative order unchanged. The
-deleted entry's own `Trivia.leading` comments are dropped with it — the one
-case where a comment can legitimately disappear, and only that entry's own
-leading comments, never a sibling's. Fails if any path segment doesn't
-exist, or an intermediate segment doesn't resolve to a `CstObject`.
+entry keeps its own value and relative order unchanged. The deleted entry's
+own leading gap (its comments/indentation) is dropped with it — the one case
+where a comment can legitimately disappear, and only that entry's own
+leading gap, never a sibling's. Fails if any path segment doesn't exist, or
+an intermediate segment doesn't resolve to a `CstObject`.
 
 ```bit
 import { cstParse, cstDeleteKey, cstGet } from "std/json"
@@ -434,5 +449,46 @@ function cstDeleteKeyExample(): string {
     Some(node) => return "still-present"
     None => return "deleted"
   }
+}
+```
+
+## Printing the CST
+
+`cstPrint` is the other side of `cstParse`: it turns a CST back into JSONC
+source text. For any node an edit function (above) did not touch, it
+reproduces `cstParse`'s original input byte-for-byte — every `rawText`
+verbatim, every comment in its original form, and the surrounding structural
+whitespace, indentation, and comma placement — because `cstParse` already
+captured all of that as opaque raw text instead of decoding it; printing an
+untouched subtree is concatenation, never re-encoding. For a value
+`cstSetString` replaced, the fresh `rawText` takes the old one's place with
+everything else around it unchanged. For an entry `cstSetString` appended,
+`cstPrint` synthesizes its one new line (`,` + a newline + indentation) by
+reading the indentation off the immediately preceding sibling's own gap,
+rather than a hardcoded style.
+
+### `cstPrint(n: CstNode): string`
+
+Serializes `n` to JSONC source text.
+
+```bit
+import { cstParse, cstSetString, cstPrint } from "std/json"
+
+function cstPrintRoundTrip(): string {
+  let source = "{\n  // keep\n  \"a\": 1\n}"
+  let root = cstParse(source) catch e {
+    return "parse-error"
+  }
+  return cstPrint(root)
+}
+
+function cstPrintAfterEdit(): string {
+  let root = cstParse("{\"a\": \"old\"}") catch e {
+    return "parse-error"
+  }
+  let updated = cstSetString(root, []string{ "a" }, "new") catch e {
+    return "edit-error"
+  }
+  return cstPrint(updated)
 }
 ```
