@@ -406,8 +406,19 @@ one format for both tools.
 
 A new golden mode, `// lint`, joins the existing set in
 [harness.zig:240](../tests/harness.zig#L240). A case runs `bit lint` over the
-file and compares stderr against the sibling `.expected`, matching how
-`// error` cases work.
+file and compares stderr against the sibling `.expected` — except that lint
+also asserts the process exit code, since 0 (clean), 1 (findings), and 2 (bad
+directive) are all reachable and a stderr diff alone cannot separate 1 from 2.
+
+The exit code is a mandatory `exit=<0|1|2>` suffix on the directive itself,
+`// lint exit=1`, rather than a second line in `.expected` or an inferred
+default: the directive line is where every other golden mode's contract lives,
+and a case that gets the exit code wrong should fail to parse rather than pass
+by accident. It costs nothing against §5.2's line-1/leading-comment-block
+split — the harness still reads only line 1 for both the mode and the exit
+code, and a `// bit:lint` override still lives anywhere in the leading comment
+block, so `// lint exit=0` / `// bit:lint max-file-lines=20 -- ...` on lines 1
+and 2 exercises both readers at once.
 
 Required coverage:
 
