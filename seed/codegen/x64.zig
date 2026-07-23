@@ -1303,13 +1303,61 @@ fn emitPow2DivInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool, w:
     try putInt(self, dst, scratch1);
 }
 
+/// Emits `l % 2^k` as a mask (unsigned) or a mask-and-correct sequence
+/// (signed) instead of a real `srem`/`urem` — the remainder sibling of
+/// `emitPow2DivInt` (#1702's `sdiv`/`udiv` strength reduction; this is
+/// #1704). `idiv` also produces the remainder in `rdx`, so avoiding it here
+/// saves the identical non-pipelined divide. x86-64-ONLY for the same
+/// reason as `emitPow2DivInt`: this is not a generic strength reduction, it
+/// is specifically working around x86-64's `idiv` cost.
+///
+/// Unsigned: `l % 2^k` is exactly `l & (2^k - 1)` — no bias needed, single
+/// AND.
+///
+/// Signed (round-toward-zero remainder, SPEC §13.5 — the remainder takes
+/// the dividend's sign): computed as `l - ((l + bias) & ~(2^k-1))`, where
+/// `bias` is the same "0 or 2^k-1" sign-dependent bias `emitPow2DivInt`
+/// adds before its final shift to round the quotient toward zero.
+/// `(l + bias) & ~(2^k-1)` is `l` rounded toward zero to the nearest
+/// multiple of `2^k`, so subtracting it back out of `l` leaves exactly the
+/// truncated remainder — exact for every dividend, not only aligned ones.
+///
+/// The bias shifts here use fixed 64-bit amounts (63, 64-k), never the
+/// operand's type width: every integer SSA value lives in a full 64-bit
+/// GPR held width-canonical (module doc comment above), so a narrow signed
+/// value sign-extended into the register is numerically identical to its
+/// 64-bit counterpart — the sign replication and bit isolation this needs
+/// already spans the whole register regardless of the source type's width.
+fn emitPow2RemInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool) !void {
+    const l = try getInt(self, vregOf(self, lhs), scratch1);
+    try self.movRR(scratch1, l);
+    const mask_lo: u64 = (@as(u64, 1) << k) - 1;
+    if (!signed) {
+        try self.movRI(scratch2, @bitCast(mask_lo));
+        try self.arithRR(.and_, scratch1, scratch2);
+        try putInt(self, dst, scratch1);
+        return;
+    }
+    try self.movRR(scratch2, scratch1);
+    try self.shiftImm(.sar, scratch2, 63); // sign mask: 0 or all-ones
+    try self.shiftImm(.shr, scratch2, @intCast(64 - @as(u7, k))); // bias: 0 or 2^k-1
+    try self.movRR(scratch3, scratch1);
+    try self.arithRR(.add, scratch3, scratch2); // l + bias
+    try self.movRI(scratch2, @bitCast(~mask_lo));
+    try self.arithRR(.and_, scratch3, scratch2); // l rounded toward zero to a multiple of 2^k
+    try self.arithRR(.sub, scratch1, scratch3); // l - that = truncated remainder
+    try putInt(self, dst, scratch1);
+}
+
 /// `sdiv`/`udiv`/`srem`/`urem` — the function containing this was already
 /// forced (by `buildIntervals`'s prescan) to exclude `rax`/`rdx` from
 /// allocation, so neither operand's real register can ever alias them.
 fn emitDivInt(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) !void {
-    if (op == .sdiv or op == .udiv) {
-        if (constPow2Divisor(self.f, rhs, w)) |k| {
-            return emitPow2DivInt(self, dst, lhs, k, op == .sdiv, w);
+    if (constPow2Divisor(self.f, rhs, w)) |k| {
+        switch (op) {
+            .sdiv, .udiv => return emitPow2DivInt(self, dst, lhs, k, op == .sdiv, w),
+            .srem, .urem => return emitPow2RemInt(self, dst, lhs, k, op == .srem),
+            else => unreachable,
         }
     }
     const l = try getInt(self, vregOf(self, lhs), scratch1);
