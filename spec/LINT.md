@@ -461,12 +461,16 @@ lint is selfhost-only and the differential stays valid.
 
 1. **Phase 2 placement.** `unused-import` / `unused-local` as lint warnings, or
    as `bit check` errors in Go's style? Decide before 1.0 (§4).
-2. **A file that does not parse.** The phase-1 rules that need an AST (§4) have
-   to decide what lint does with a file `bit check` would reject. Linting a
-   recovered tree invents findings; skipping the file silently is the no-op
-   this spec forbids elsewhere. Exit 2 with "does not parse, run `bit check`"
-   is the likely answer. Undecided because the only rule shipped so far reads
-   lines, not syntax — decide with the first AST rule (#1383).
+2. **A file that does not parse (settled, #1383).** Decided: the parser's own
+   diagnostics are reported through the same sink and exit path as a malformed
+   override directive (§2.1, §5.2) — exit 2, findings withheld for that run.
+   Linting the parser's recovered tree would invent findings from nodes it
+   filled with the poison placeholder; a bespoke "does not parse, run
+   `bit check`" message would only repeat what the parser's own diagnostic
+   already says with an exact span. Reusing the directive-error path costs
+   nothing new: both are "the findings for this run were never computed,"
+   which is why the exit-2 summary line reads `N errors`, not
+   `N directive errors`, now that a directive error is not the only kind.
 3. **Default values.** 800 / 80 / 5 / 4 are judgement calls, chosen to be
    restrictive enough to bite. Worth revisiting once the whole repo is under
    the limit and the real distribution is visible.

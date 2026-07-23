@@ -20,6 +20,9 @@ import { compare } from "std/strings"
 // Lint's slice of the central registry (spec/LINT.md §3): rules from E0200 up,
 // directive machinery from E0299 down.
 const ecLintMaxFileLines = 200
+const ecLintMaxFnLines = 201
+const ecLintMaxParams = 202
+const ecLintMaxNesting = 203
 const ecLintUnknownRule = 298
 const ecLintBadDirective = 299
 
@@ -51,6 +54,9 @@ struct LintRule {
 function lintRules(): []LintRule {
   return [
     LintRule{ name: "max-file-lines", code: ecLintMaxFileLines, hasLimit: true, limit: 800 },
+    LintRule{ name: "max-fn-lines", code: ecLintMaxFnLines, hasLimit: true, limit: 80 },
+    LintRule{ name: "max-params", code: ecLintMaxParams, hasLimit: true, limit: 5 },
+    LintRule{ name: "max-nesting", code: ecLintMaxNesting, hasLimit: true, limit: 4 },
   ]
 }
 
@@ -399,12 +405,15 @@ function lintCountLines(src: string): int {
   return n
 }
 
-// Runs every registered rule over one file, appending findings to `d`.
+// Runs every registered rule over one file, appending findings to `d`. `tree`
+// is the file's parsed AST — unused by `max-file-lines`, which reads only
+// `src`, and required by every function-shaped rule (§4 phase 1).
 //
 // This is the ONE place a rule is dispatched. A new rule adds its entry to
 // `lintRules()` and its arm here; nothing else in the runner changes.
-function runLintRules(src: string, file: int, cfg: LintConfig, d: Diagnostics) {
+function runLintRules(src: string, file: int, tree: Tree, cfg: LintConfig, d: Diagnostics) {
   let rules = lintRules()
+  let funcs = lintCollectFuncs(tree, tree.root, []int(0))
   let i = 0
   while (i < len(rules)) {
     if (cfg.disabled[i]) {
@@ -413,6 +422,12 @@ function runLintRules(src: string, file: int, cfg: LintConfig, d: Diagnostics) {
     }
     if (rules[i].code == ecLintMaxFileLines) {
       lintMaxFileLines(src, file, cfg.limits[i], d)
+    } else if (rules[i].code == ecLintMaxFnLines) {
+      lintMaxFnLines(tree, funcs, file, cfg.limits[i], d)
+    } else if (rules[i].code == ecLintMaxParams) {
+      lintMaxParams(tree, funcs, file, cfg.limits[i], d)
+    } else if (rules[i].code == ecLintMaxNesting) {
+      lintMaxNesting(tree, funcs, file, cfg.limits[i], d)
     }
     i = i + 1
   }
@@ -431,6 +446,150 @@ function lintMaxFileLines(src: string, file: int, limit: int, d: Diagnostics) {
   warn(d, ecLintMaxFileLines, Span{ file: file, start: 0, end: 0 },
     "file is ${n} lines, limit is ${limit}",
     "split it, or raise the limit with `// bit:lint max-file-lines=${n} -- <reason>`")
+}
+
+// E0201/E0202/E0203 share one AST walk over every function-shaped node — a
+// `FuncDecl` (plain function or method) or an `ArrowFn` — because all three
+// rules measure the same thing found the same way (spec/LINT.md §4).
+
+// One function-shaped node's measurements: the byte offset to report at (its
+// own declaration, never an inner node, so a finding points at what the author
+// has to change), the `[startOff, endOff)` span `max-fn-lines` counts lines
+// over, its declared parameter count, and its body node for `max-nesting`.
+struct LintFuncInfo {
+  reportAt: int,
+  startOff: int,
+  endOff: int,
+  params: int,
+  body: int,
+}
+
+// Every `FuncDecl`/`ArrowFn` anywhere in `node`'s subtree, nested included: a
+// closure defined inside a function is its own function and is measured on
+// its own, not folded into the enclosing one's counts.
+function lintCollectFuncs(tree: Tree, node: int, out: []int): []int {
+  if (node == 0) {
+    return out
+  }
+  let tag = getNode(tree, node).tag
+  if (tag == Tag.FuncDecl || tag == Tag.ArrowFn) {
+    out = append(out, node)
+  }
+  for k of kidsOf(tree, node) {
+    out = lintCollectFuncs(tree, k, out)
+  }
+  return out
+}
+
+// `node`'s measurements. `FuncDecl` is `[recv, name, generics, params, result,
+// body(, attrs)]` (selfhost/parserdecl.bit): the node's own span cannot be used
+// for `startOff` because an attribute (the 7th kid) sits BEFORE `function` in
+// the source and would widen it past the declaration itself, so `startOff` is
+// read explicitly from the receiver (if any) or the name, whichever is
+// earliest — both fall on the `function` keyword's line in practice, since
+// nothing else can precede them on it. `ArrowFn` has no attrs, so its own
+// aggregate span (`ArrowParams` through body) is exactly right, including the
+// zero-param case where `ArrowParams` contributes no span at all.
+function lintFuncInfo(tree: Tree, node: int): LintFuncInfo {
+  if (getNode(tree, node).tag == Tag.ArrowFn) {
+    let k = kidsOf(tree, node)
+    let sp = getNode(tree, node).span
+    return LintFuncInfo{ reportAt: sp.start, startOff: sp.start, endOff: sp.end,
+      params: len(kidsOf(tree, k[0])), body: k[1] }
+  }
+  let k = kidsOf(tree, node)
+  let recv = k[0]
+  let start = getNode(tree, k[1]).span.start // name
+  if (recv != 0) {
+    start = getNode(tree, recv).span.start
+  }
+  let body = k[5]
+  return LintFuncInfo{ reportAt: start, startOff: start, endOff: getNode(tree, body).span.end,
+    params: len(kidsOf(tree, k[3])), body: body }
+}
+
+// Whether `tag` is a construct spec/LINT.md §4 counts as one nesting level:
+// `if`, `while`, `for` (all four loop shapes), a `match` ARM (not the `match`
+// itself — a flat 60-arm match stays at depth 1), and a `catch` that binds and
+// runs a BLOCK. `catch <expr>` (`CatchDefault`) supplies a plain default value,
+// introduces no block, and does not count.
+function lintOpensNesting(tag: Tag): bool {
+  return tag == Tag.IfStmt || tag == Tag.WhileStmt || tag == Tag.ForC ||
+    tag == Tag.ForOf || tag == Tag.ForIn || tag == Tag.ForInf ||
+    tag == Tag.MatchArm || tag == Tag.CatchBind
+}
+
+// The deepest nesting reached in `node`'s subtree, starting from `depth`. Stops
+// at a nested `FuncDecl`/`ArrowFn` without descending into it — that function's
+// own nesting is measured separately, starting back at 0, the same boundary
+// `validatestmt.bit`'s `vArrow` draws for its break/loop counters.
+function lintMaxNestingIn(tree: Tree, node: int, depth: int): int {
+  if (node == 0) {
+    return depth
+  }
+  let tag = getNode(tree, node).tag
+  if (tag == Tag.FuncDecl || tag == Tag.ArrowFn) {
+    return depth
+  }
+  let childDepth = depth
+  if (lintOpensNesting(tag)) {
+    childDepth = depth + 1
+  }
+  let best = depth
+  for k of kidsOf(tree, node) {
+    let d = lintMaxNestingIn(tree, k, childDepth)
+    if (d > best) {
+      best = d
+    }
+  }
+  return best
+}
+
+// E0201 `max-fn-lines`: from the line of the `function` keyword (or an arrow's
+// own start) through the line of its closing brace, inclusive (§4).
+function lintMaxFnLines(tree: Tree, funcs: []int, file: int, limit: int, d: Diagnostics) {
+  for n of funcs {
+    let info = lintFuncInfo(tree, n)
+    let startLine = locate(d.sm, file, info.startOff).line
+    let endLine = locate(d.sm, file, info.endOff - 1).line
+    let lines = endLine - startLine + 1
+    if (lines <= limit) {
+      continue
+    }
+    warn(d, ecLintMaxFnLines, Span{ file: file, start: info.reportAt, end: info.reportAt },
+      "function is ${lines} lines, limit is ${limit}",
+      "split it, or raise the limit with `// bit:lint max-fn-lines=${lines} -- <reason>`")
+  }
+}
+
+// E0202 `max-params`: declared parameters, receiver excluded — a `FuncDecl`'s
+// receiver lives in its own `Receiver` kid, never in `Params`, so no
+// special-casing is needed here to honour that (§4).
+function lintMaxParams(tree: Tree, funcs: []int, file: int, limit: int, d: Diagnostics) {
+  for n of funcs {
+    let info = lintFuncInfo(tree, n)
+    if (info.params <= limit) {
+      continue
+    }
+    warn(d, ecLintMaxParams, Span{ file: file, start: info.reportAt, end: info.reportAt },
+      "function has ${info.params} params, limit is ${limit}",
+      "group them into a struct, or raise the limit with `// bit:lint max-params=${info.params} -- <reason>`")
+  }
+}
+
+// E0203 `max-nesting`: nested blocks inside a function body, the body itself
+// depth 0 (§4).
+function lintMaxNesting(tree: Tree, funcs: []int, file: int, limit: int, d: Diagnostics) {
+  for n of funcs {
+    let info = lintFuncInfo(tree, n)
+    let depth = lintMaxNestingIn(tree, info.body, 0)
+    if (depth <= limit) {
+      continue
+    }
+    warn(d, ecLintMaxNesting, Span{ file: file, start: info.reportAt, end: info.reportAt },
+      "function nests ${depth} deep, limit is ${limit}",
+      "add an early return, or raise the limit with `// bit:lint max-nesting=${depth} -- <reason>`")
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -660,12 +819,24 @@ function lintCmd(a: []string): int {
       }
       continue
     }
-    runLintRules(src, file, cfg, findings)
+    // The phase-1 rules need an AST (§4). A file `bit check` would reject
+    // parses into a recovered tree with holes a rule would read as real nodes
+    // — noise on top of the syntax errors that caused them, the same reason
+    // `checkFile` stops there (selfhost/check.bit:1072). So a parse error is
+    // reported through the SAME sink and exit path as a directive error
+    // (§10 open question 2): it already carries an exact span and message,
+    // and a run with one is not asked to compute findings under it either.
+    let tree = parseSourceD(src, file, errs)
+    if (hasErrors(errs)) {
+      continue
+    }
+    runLintRules(src, file, tree, cfg, findings)
   }
 
-  // A malformed override is reported instead of findings, not alongside them:
-  // the overrides decide what the findings are, so a run with a broken one
-  // would report a finding set nobody asked for.
+  // A malformed override or a file that does not parse is reported instead of
+  // findings, not alongside them: either one means the findings for that file
+  // were never computed, so reporting a finding set nobody asked for would be
+  // wrong.
   if (hasErrors(errs)) {
     lintSortDiags(errs)
     if (opts.json) {
@@ -673,7 +844,7 @@ function lintCmd(a: []string): int {
     } else {
       eprint(renderDiags(errs))
     }
-    eprint("lint: ${len(errs.list)} directive errors, ${overrides} overrides active\n")
+    eprint("lint: ${len(errs.list)} errors, ${overrides} overrides active\n")
     return 2
   }
 
