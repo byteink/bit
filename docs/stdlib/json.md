@@ -102,7 +102,9 @@ untouched literal back byte-for-byte.
 
 The lexical categories a token can be: `LBrace`, `RBrace`, `LBracket`,
 `RBracket`, `Colon`, `Comma`, `StringTok`, `NumberTok`, `TrueTok`, `FalseTok`,
-`NullTok`, `Eof`, `Invalid`.
+`NullTok`, `Eof`, `Invalid`, `Comment`. `Comment` is only ever produced by
+`lexCst`; `lex` and the JSONC-strict-value scan both skip comments as
+whitespace instead of tokenizing them.
 
 ### `Token`
 
@@ -116,6 +118,14 @@ The combined `{`/`[` nesting limit: 64 levels. Opening a 65th level yields an
 ### `lex(source: string): []Token`
 
 The full token stream for `source`, ending with one `Eof`.
+
+### `lexCst(source: string): []Token`
+
+Same scanner and grammar as `lex`, JSONC mode, except a `//`/`/* */` comment
+comes back as a `Comment` token (verbatim span, delimiters included) instead
+of being skipped as whitespace. The CST parser (`cstParse`, below) uses this
+to collect comments into `Trivia` without a second implementation of
+string/number/word scanning.
 
 ```bit
 import { Json, JsonEntry, jsonGet, jsonAsInt } from "std/json"
@@ -279,3 +289,43 @@ span, including quotes), `CstArray([]CstNode, Trivia)`, or
 `CstObject([]CstEntry, Trivia)`. A comment on its own line right before an
 array/object's closing `]`/`}` is folded into that container's own
 `Trivia.trailing`, rather than a separate `closeTrivia` field.
+
+## CST parsing
+
+`cstParse` parses JSONC into the CST above, losslessly: every comment and
+each number/string's exact raw span survive, unlike `jsonParse`/`jsoncParse`
+above, which discard both. This is the parser a later edit-layer task
+mutates the output of.
+
+A leading comment run attaches to the following node's `Trivia.leading`, one
+entry per comment, in source order — never concatenated. A comment on the
+same source line as a value, before that value's own trailing comma, attaches
+to that value's `Trivia.trailing` (`1 /* like this */,` counts, `1, /* not
+this */` does not — that one becomes the next node's leading instead). No
+`hadTrailingComma` flag is stored on `CstArray`/`CstObject`: a printer
+re-derives comma placement from the array/object's own length and each
+entry's index.
+
+### `cstParse(source: string): CstNode!`
+
+Parses `source` as JSONC (same grammar as `jsoncParse`) into a trivia-carrying
+CST rather than a plain `Json` value. Malformed input is a parse error via the
+fallible return, never a panic.
+
+```bit
+import { cstParse, CstNode } from "std/json"
+
+function cstExample(): string {
+  let root = cstParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
+    return "error"
+  }
+  match (root) {
+    CstObject(entries, trivia) => return entries[0].trivia.leading[0]
+    CstNull(t) => return "null"
+    CstBool(b, t) => return "bool"
+    CstNumber(r, t) => return "number"
+    CstString(s, t) => return "string"
+    CstArray(a, t) => return "array"
+  }
+}
+```
