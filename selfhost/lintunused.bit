@@ -1,0 +1,170 @@
+// E0210 `unused-import` / E0211 `unused-local` (spec/LINT.md §4, phase 2) — the
+// first lint rules to consume the resolver's `nodeSymbols` (task #1387) instead
+// of `check.bit`'s flat `env: map<string,int>`. The flat env cannot tell two
+// same-named locals in sibling scopes apart, which is exactly the distinction
+// "was THIS binding read" needs; `nodeSymbols` already carries it, because the
+// resolver resolved every reference to the specific symbol id it binds to,
+// wherever it sits in the scope chain (including inside a nested block or a
+// closure) — so "used" falls out of a single pass over that array, with no
+// hand-rolled scope walk here.
+//
+// A lint rule only has one file to look at, never a project: an import's
+// target module does not need to exist for us to tell whether the imported
+// NAME is referenced in this file, so `lintAnalyzeUnused` resolves the file
+// against synthetic stub modules (`buildStubImports`) that export whatever
+// names this file's own `import { ... }` groups ask for, rather than reusing
+// the real project loader.
+
+const ecLintUnusedImport = 210
+const ecLintUnusedLocal = 211
+
+// One throwaway target module per unique import path in `tree`, each exporting
+// exactly the names this file imports from it — enough for `rDeclareImportItem`
+// to bind a real `ImportItem` symbol (not `Poison`) regardless of whether the
+// path resolves to anything on disk. `ImportNs`/`ImportStar` need no stub:
+// resolve.bit binds those unconditionally.
+struct StubImports {
+  paths: map<string, int>,
+  mods: []Module,
+}
+
+function buildStubImports(tree: Tree, source: string): StubImports {
+  let paths = map<string, int>{}
+  let mods = []Module(0)
+  let decls = kidsOf(tree, tree.root)
+  let i = 0
+  while (i < len(decls)) {
+    let idx = decls[i]
+    if (idx != 0 && getNode(tree, idx).tag == Tag.ImportDecl) {
+      let k = kidsOf(tree, idx) // [body, path]
+      let pathNode = k[1]
+      if (pathNode != 0 && getNode(tree, k[0]).tag == Tag.ImportGroup) {
+        let pathText = stringLitText(source, getNode(tree, pathNode).span)
+        let (modId, found) = paths[pathText]
+        if (!found) {
+          modId = len(mods)
+          mods = append(mods, newModule())
+          paths[pathText] = modId
+        }
+        let items = kidsOf(tree, k[0])
+        let j = 0
+        while (j < len(items)) {
+          let ik = kidsOf(tree, items[j]) // [name, alias_or_none]
+          if (ik[0] != 0) {
+            let sp = getNode(tree, ik[0]).span
+            mods[modId].exports[source[sp.start:sp.end]] = 0
+          }
+          j = j + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  return StubImports{ paths: paths, mods: mods }
+}
+
+// A bare-ident, plain `=` assignment target — `x = v`, not `x += v` and not
+// `x.f = v` or `x[i] = v`. Writing to a binding is not a use of it (E0211's
+// "assigned but never read" case), while a compound assignment reads before it
+// writes and counts as a use like any other reference.
+function collectWriteOnlyNodes(tree: Tree): []bool {
+  let writeOnly = []bool(len(tree.nodes))
+  let i = 1
+  while (i < len(tree.nodes)) {
+    let n = getNode(tree, i)
+    if (n.tag == Tag.Assign && n.main == int(Kind.Eq)) {
+      let k = kidsOf(tree, i) // [lhsList, rhsList]
+      let targets = kidsOf(tree, k[0])
+      let ti = 0
+      while (ti < len(targets)) {
+        let t = targets[ti]
+        if (t != 0 && getNode(tree, t).tag == Tag.Ident) {
+          writeOnly[t] = true
+        }
+        ti = ti + 1
+      }
+    }
+    i = i + 1
+  }
+  return writeOnly
+}
+
+// `used[id]` iff some node other than `mod.symbols[id]`'s own declaration
+// resolves to `id` and is not a write-only assignment target. One pass over
+// `nodeSymbols`, parallel to the tree: this is the "clean accessor" other lint
+// rules and the eventual checker migration can build the same way, rather than
+// re-deriving it from the resolver's scopes/symbols internals.
+function computeUsedSymbols(mod: Module, writeOnly: []bool): []bool {
+  let used = []bool(len(mod.symbols))
+  let i = 0
+  while (i < len(mod.nodeSymbols)) {
+    let sid = mod.nodeSymbols[i]
+    if (sid > 0 && i != mod.symbols[sid].decl && !writeOnly[i]) {
+      used[sid] = true
+    }
+    i = i + 1
+  }
+  return used
+}
+
+// Everything E0210/E0211 need for one file: the resolved module (symbols +
+// nodeSymbols) and which symbols are actually read. Takes the runner's
+// already-parsed `tree` — by the time `runLintRules` is called, the CLI/LSP
+// caller has already confirmed `src` parses cleanly (spec/LINT.md §10 open
+// question 2), so there is no second "does not parse" case to guard here.
+struct LintUnusedAnalysis {
+  mod: Module,
+  used: []bool,
+}
+
+function lintAnalyzeUnused(tree: Tree, src: string, file: int, sm: SourceManager): LintUnusedAnalysis {
+  let stubs = buildStubImports(tree, src)
+  let m = SrcModule{ dir: "", fileNames: []string(0), fileStarts: [0], source: src, tree: tree,
+    imports: stubs.paths, files: [file] }
+  // A throwaway sink: undefined-name and other resolve-phase diagnostics are
+  // not this rule's business (and expected — this file gets no real prelude),
+  // only `nodeSymbols` is.
+  let resolveDiags = newDiagnostics(sm)
+  let mod = resolveModule(resolveDiags, m, stubs.mods, -1)
+  let used = computeUsedSymbols(mod, collectWriteOnlyNodes(tree))
+  return LintUnusedAnalysis{ mod: mod, used: used }
+}
+
+// E0210: an import binding (`ImportItem` or `ImportNamespace`) with no read
+// anywhere in the file. The blank identifier (`import { f as _ } from "..."`)
+// never becomes a symbol at all (resolve.bit's `rInsertModuleSymbol`), so it is
+// already exempt with no special-casing here.
+function lintUnusedImport(tree: Tree, mod: Module, used: []bool, file: int, d: Diagnostics) {
+  let i = 1
+  while (i < len(mod.symbols)) {
+    let s = mod.symbols[i]
+    if ((s.kind == SymbolKind.ImportItem || s.kind == SymbolKind.ImportNamespace) && !used[i]) {
+      let sp = getNode(tree, s.decl).span
+      warn(d, ecLintUnusedImport, Span{ file: file, start: sp.start, end: sp.end },
+        "'${s.name}' is imported but never used",
+        "remove the import, or bind it to '_' if it is needed only for a side effect")
+    }
+    i = i + 1
+  }
+}
+
+// E0211: a function/block-local `let`/`const` (not a top-level one — `LINT.md`
+// scopes this rule to function scope, matching Go's compile error) with no
+// read anywhere, including a read that happens only inside a closure (a plain
+// reference from any scope, nested or not, resolves to the same symbol id, so
+// it is already covered by `computeUsedSymbols`). An assignment alone does not
+// count, so `x = 1` with `x` never read after still fires.
+function lintUnusedLocal(tree: Tree, mod: Module, used: []bool, file: int, d: Diagnostics) {
+  let i = 1
+  while (i < len(mod.symbols)) {
+    let s = mod.symbols[i]
+    let isLocal = (s.kind == SymbolKind.LetBinding || s.kind == SymbolKind.ConstBinding) && !s.moduleScoped
+    if (isLocal && !used[i]) {
+      let sp = getNode(tree, s.decl).span
+      warn(d, ecLintUnusedLocal, Span{ file: file, start: sp.start, end: sp.end },
+        "'${s.name}' is declared but never used",
+        "remove it, or bind it to '_' if the value must be discarded")
+    }
+    i = i + 1
+  }
+}
