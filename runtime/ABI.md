@@ -1375,3 +1375,71 @@ one byte per 8-byte word (§2), wiping the word range clears every logical byte.
 The wipe is `@memset` followed by a compiler memory barrier so dead-store
 elimination cannot drop it — the standard defense against a "cleared" key
 lingering in memory.
+
+---
+
+## 22. Shared mutable state audit (#1248)
+
+Every container-scope `var` in `runtime/*.zig` (grep: `^var `, `^threadlocal
+var `), classified per-worker / per-task / synchronized, with why. This is the
+M:N epic's enumeration ticket — §5 and §13 above already argue the two hardest
+cases (mutator registration, the error slot) in depth; this section is the
+complete list so nothing was skipped.
+
+**Write-once-before-any-worker-exists, read-only after (safe by boot order):**
+`rtStartMain` runs on the process's one and only thread before `boot` spawns
+the scheduler's worker pool (§9) — nothing below is ever written again once a
+second OS thread can observe it:
+- `root.zig`: `g_environ`, `g_argc`, `g_argv`, `g_envp`, `g_auxv`.
+- `root.zig`: `g_booted` — a single-boot guard (`std.debug.assert(!g_booted)`
+  before it is set); the test-only resets to `false` between test bodies run
+  single-threaded, never racing a live scheduler.
+- `shims.zig`: `g_auxv` — set once by `rtStartMain` via `setTable`, read-only
+  through every later `getauxval` call.
+
+**Self-synchronized (the global is a struct instance; its own fields carry the
+lock/atomics, not this list):**
+- `root.zig`: `g_heap` (`alloc.zig`'s `Heap` — one `SpinLock` around the free
+  lists, `std.atomic.Value` byte counters; has its own N-thread stress test).
+- `root.zig`: `g_gc` / `g_world` (`gc.zig`'s `Gc` / `World` — the §5
+  stop-the-world registry: `std.atomic.Value` mutator states and epoch, one
+  `SpinLock` serializing collectors).
+- `root.zig`: `g_sched` (`sched.zig`'s `Scheduler` — per-worker work-stealing
+  deques plus a lock-free global queue, designed for N workers from the start;
+  §5/§9's "pinned to 1" is a boot-time choice, not a correctness dependency).
+
+**Per-OS-thread by design (`threadlocal`), each because nothing between the
+write and its matching read can cross a scheduling point — a green task
+migrates workers only at an explicit yield/park, never mid-expression:**
+- `root.zig`: `pending_err` (§13) — read via `bit_rt_get_err` immediately after
+  the fallible call that may have set it, before any `?`/`catch` propagation
+  runs. Regression-guarded by `root.zig`'s
+  `"bit_rt_set_err/get_err: threadlocal slot never crosses OS threads"` test.
+- `root.zig`: `last_iface_ok` — read via `bit_rt_iface_as_ok`, which codegen
+  always emits directly after the paired `bit_rt_iface_as`.
+- `root.zig`: `udp_last_sender`, `last_recv_ok` — same adjacent
+  set-then-read-before-yield contract, documented at each declaration.
+- `sched.zig`: `Worker.tls` — re-derived through a `noinline` accessor on every
+  read rather than cached across a call boundary, specifically because a
+  parked task can resume on a *different* OS thread (#1466): a cached thread
+  pointer would hand back the previous thread's stale `Worker`.
+
+**Global, mutated, but inert or already atomic:**
+- `root.zig`: `scan_ctx` — a fixed non-null `u8` passed as an opaque `ctx`
+  pointer to root-scan callbacks that never read or write through it (only its
+  address, as a "valid pointer" sentinel, is used); it is never reassigned
+  after its `= 0` initializer, so there is nothing to race.
+- `chan.zig`: `select_seed_counter` — `std.atomic.Value(u64)`, bumped with
+  `fetchAdd`; already synchronized. (`chan.zig`'s send/recv/select rendezvous
+  itself is #1247's scope, not this ticket's.)
+
+**Read-only after link (never a `var` at all):** `TypeInfo` method tables and
+per-type pointer-offset arrays (§2) and every `RtFn`/`bit_rt_*` dispatch target
+are compiler-emitted `const` data baked into the object at build time; nothing
+in the runtime ever mutates a `TypeInfo` or a dispatch table post-link, so they
+need no synchronization under any worker count.
+
+**Not found:** no interned-data table, memoization cache, or process-global
+counter exists in `runtime/*.zig` outside the entries above (`rand.zig` and
+`net.zig` declare no container-scope state at all — every random/network call
+is a stateless syscall wrapper).

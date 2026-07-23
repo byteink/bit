@@ -2318,3 +2318,38 @@ test "panicWrite: formats panic: <msg>\\n to the given fd" {
     const n = std.posix.read(fds[0], &buf) catch |err| return err;
     try testing.expectEqualStrings("panic: boom\n", buf[0..n]);
 }
+
+// #1248 (M:N shared-state audit): `pending_err` is `threadlocal`, not a
+// process-global — this is the regression guard for that. Each OS thread
+// hammers `bit_rt_set_err`/`bit_rt_get_err` with its own distinct value and
+// must only ever read back its own writes, never another thread's. A
+// `pending_err` accidentally demoted to a plain `var` would fail this
+// immediately (whichever thread wrote last "wins" for everyone); §13's
+// "goroutine-correct even under M:N" claim rests on it staying `threadlocal`.
+test "bit_rt_set_err/get_err: threadlocal slot never crosses OS threads" {
+    if (builtin.single_threaded) return;
+
+    const Worker = struct {
+        fn run(seed: usize) void {
+            const iterations: usize = 20_000;
+            var i: usize = 0;
+            while (i < iterations) : (i += 1) { // statically bounded
+                const tag = seed * 131 + i + 1; // never 0, so never confused with "cleared"
+                const val: ?*anyopaque = @ptrFromInt(tag);
+                bit_rt_set_err(val);
+                const got = bit_rt_get_err();
+                std.debug.assert(got == val); // never another thread's tag
+                bit_rt_set_err(null);
+                std.debug.assert(bit_rt_get_err() == null);
+            }
+        }
+    };
+
+    const nthreads = @min(@as(usize, 4), std.Thread.getCpuCount() catch 2);
+    var threads: [4]std.Thread = undefined;
+    var t: usize = 0;
+    while (t < nthreads) : (t += 1) {
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{t + 1});
+    }
+    for (threads[0..nthreads]) |th| th.join();
+}
