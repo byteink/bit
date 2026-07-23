@@ -122,8 +122,52 @@ already dense: the symbol text disagreed with the id it named. Naming from the
 dense counter the seed already computes made both compilers converge without
 building type monomorphization in the port.
 
-Stage 3 (codegen + object writers + linker + driver, then `stage2 == stage3`)
-follows.
+**Stage 3 — back-end + driver, COMPLETE (#365).** `selfhost/{codegen/,obj/,link.bit,
+main.bit,fmt.bit,doc.bit,lsp.bit}` port codegen (x86-64 + ARM64), the ELF/Mach-O/PE
+object writers, the static linker, and the CLI driver (`build`/`run`/`check`/
+`test`/`fmt`/`doc`/`lsp`/`ar`/every `--dump-*` mode). The seed has already been
+retired to `seed/` (installed as `bit-seed`); the canonical `zig-out/bin/bit` is
+built by running `bit-seed` once against `selfhost/` — after that, `bit` builds
+itself.
+
+**The fixed-point proof** (`scripts/selfhost-fixpoint.sh`) no longer compares
+against the seed — once the seed is retired there is no "stage2" built by it to
+compare against. The meaningful property instead is self-reproducibility: the
+current self-hosted `bit` (stageA) builds `selfhost/` to produce stageB, and
+stageB builds `selfhost/` again to produce stageC. `stageB == stageC` is the
+fixed point. Verified on aarch64-macos:
+
+```
+stageB (stageA built selfhost): f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a
+stageC (stageB built selfhost): f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a
+FIXED POINT OK — the self-hosted compiler reproducibly builds itself.
+```
+
+**The #1332 differential harness** (`scripts/selfhost-diffall.sh`), which
+discovers and runs the whole `selfhost-*.sh` family so no differential can be
+forgotten, is green end to end on aarch64-macos:
+
+```
+diffall: PASS=15 FAIL=0 INCONCLUSIVE=0 TIMEOUT=0 ABSENT=0 (of 15)
+diffall: GREEN — every differential in the family agrees.
+```
+
+That covers diffast, diffcheck, diffdiags, diffdoc, diffexamples (the full
+examples/ corpus, compiled and diffed against the seed), difffmt, diffir,
+diffiropt, diffsafepoints, difftests, difftokens, difftypes, diffverdict,
+fixpoint, and fuzzdiff. `imports [selfhost]` (`tests/imports.zig`, a separate
+`zig build test` step) also reported clean: 94/94 projects OK, 0 regressions.
+
+**Not yet verified this session:** the fixed-point and differential runs above
+are aarch64-macos only — aarch64-linux and x86_64-linux (via the docker/
+hl-master topology) still need a pass before this gate can claim the
+three-target verify bullet literally. The general `zig build test` run (the
+whole Zig-side suite, including runtime/scheduler/GC unit tests unrelated to
+self-hosting) was still in flight when this was written; CI's `.github/
+workflows/ci.yml` already runs `zig build`/`zig build test` natively per
+matrix arch (ubuntu, macos) followed by the self-host differential scripts —
+whether that already satisfies "CI's primary build switches to the self-hosted
+compiler" or needs restructuring is an open call for whoever closes #365.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.
