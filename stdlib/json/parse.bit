@@ -13,6 +13,22 @@
 // already resolves duplicate keys last-wins, and it is the only sanctioned
 // way callers read a key (#1479), so keeping all entries and letting that one
 // place own the policy is simpler than enforcing it twice.
+//
+// JSONC (#1479's accepted grammar — narrow, explicit, NOT JSON5):
+//
+//   - `//` line comments: from `//` to end of line, anywhere whitespace is
+//     currently allowed.
+//   - `/* */` block comments: non-nesting, anywhere whitespace is currently
+//     allowed. An unterminated `/*` is a parse error.
+//   - Trailing commas: a single trailing `,` is allowed before `}` or `]`
+//     (`[1, 2,]` and `{"a": 1,}` are valid). More than one trailing comma, or
+//     a leading comma, is still a parse error.
+//   - Explicitly OUT OF SCOPE: unquoted object keys, single-quoted strings,
+//     hex numbers, `NaN`/`Infinity`, or any other JSON5 leniency.
+//
+// `jsoncParse` is this same grammar with comments (lex.bit's `lexJsonc`) and
+// one trailing comma (`Parser.allowTrailingComma`) switched on; `jsonParse`
+// stays strict RFC 8259 so a caller that wants to reject comments still can.
 
 // `newBuilder` is already imported into this module by encode.bit — importing
 // it again here would collide (same module, same declaration).
@@ -20,7 +36,9 @@ import { parseInt, contains, Builder } from "std/strings"
 
 // A cursor over `lex`'s token stream, plus the original source (decoding a
 // string or number needs to slice raw bytes back out of it).
-struct Parser { src: string, toks: []Token, i: int }
+// `allowTrailingComma` is JSONC-only (false for strict `jsonParse`): it lets
+// `parseObject`/`parseArray` accept one trailing `,` before the closer.
+struct Parser { src: string, toks: []Token, i: int, allowTrailingComma: bool }
 
 // The token under the cursor. `lex` always terminates with `Eof`, so this is
 // never out of bounds once `i` stops advancing past the last token.
@@ -38,10 +56,11 @@ function advance(p: Parser): Token {
   return t
 }
 
-// Parses `source` as strict JSON (RFC 8259): one value, optionally
-// surrounded by whitespace, and nothing else.
-export function jsonParse(source: string): Json! {
-  let p = Parser{ src: source, toks: lex(source), i: 0 }
+// One value out of `p`'s token stream, optionally surrounded by whitespace
+// (already stripped by the lexer) and nothing else. Shared by `jsonParse` and
+// `jsoncParse` — they differ only in how `p` was built (which lexer, and
+// whether a trailing comma is allowed), not in this top-level shape check.
+function parseTopLevel(p: Parser): Json! {
   let v = parseValue(p)?
   if (peek(p).kind != TokenKind.Eof) {
     fail newError("json: trailing garbage after value")
@@ -49,13 +68,32 @@ export function jsonParse(source: string): Json! {
   return v
 }
 
-// An `Invalid` token can come from three places in the lexer (scanOpen on a
-// depth-cap hit, scanString on an unterminated string, everything else), and
-// the token itself carries no reason — only a span. The source byte at that
-// span disambiguates deterministically: `scanOpen` is the only path that
-// marks a `{`/`[` byte `Invalid` (a plain unexpected `{`/`[` always lexes as
-// `LBrace`/`LBracket`), and `scanString` is the only path that marks a `"`
-// byte `Invalid`.
+// Parses `source` as strict JSON (RFC 8259): one value, optionally
+// surrounded by whitespace, and nothing else. No comments, no trailing
+// commas — see `jsoncParse` for the JSONC extension.
+export function jsonParse(source: string): Json! {
+  let p = Parser{ src: source, toks: lex(source), i: 0, allowTrailingComma: false }
+  return parseTopLevel(p)?
+}
+
+// Parses `source` as JSONC (this file's header comment documents the exact
+// grammar): strict JSON plus `//`/`/* */` comments and a single trailing
+// comma before `}`/`]`. Everything else — number/string decoding, depth
+// limit, error-vs-panic behavior — is identical to `jsonParse`.
+export function jsoncParse(source: string): Json! {
+  let p = Parser{ src: source, toks: lexJsonc(source), i: 0, allowTrailingComma: true }
+  return parseTopLevel(p)?
+}
+
+// An `Invalid` token can come from four places in the lexer (scanOpen on a
+// depth-cap hit, scanString on an unterminated string, an unterminated `/*`
+// (JSONC only), everything else), and the token itself carries no reason —
+// only a span. The source byte at that span disambiguates deterministically:
+// `scanOpen` is the only path that marks a `{`/`[` byte `Invalid` (a plain
+// unexpected `{`/`[` always lexes as `LBrace`/`LBracket`), `scanString` is
+// the only path that marks a `"` byte `Invalid`, and an unterminated `/*`
+// is the only `Invalid` starting on `/` whose span is more than one byte (a
+// lone stray `/` is always a single-byte `Invalid`).
 function describeInvalid(src: string, t: Token): string {
   let c = src[t.start]
   if (c == '{' || c == '[') {
@@ -63,6 +101,9 @@ function describeInvalid(src: string, t: Token): string {
   }
   if (c == '"') {
     return "json: unterminated string"
+  }
+  if (c == '/' && t.end - t.start > 1) {
+    return "json: unterminated block comment"
   }
   return "json: unexpected character in input"
 }
@@ -136,6 +177,13 @@ function parseObject(p: Parser): Json! {
       fail newError("json: expected ',' or '}' in object")
     }
     advance(p)
+    // JSONC: a single trailing comma closes the object right here. A second
+    // one does not — `peek(p)` would be `Comma` again, so the loop falls
+    // through to "expected string key" on the next iteration.
+    if (p.allowTrailingComma && peek(p).kind == TokenKind.RBrace) {
+      advance(p)
+      return Json.JsonObject(entries)
+    }
     guard = guard + 1
   }
   fail newError("json: object nesting exceeds token bound")
@@ -163,6 +211,13 @@ function parseArray(p: Parser): Json! {
       fail newError("json: expected ',' or ']' in array")
     }
     advance(p)
+    // JSONC: a single trailing comma closes the array right here. A second
+    // one does not — `peek(p)` would be `Comma` again, so `parseValue` on the
+    // next iteration rejects it ("unexpected token, expected a value").
+    if (p.allowTrailingComma && peek(p).kind == TokenKind.RBracket) {
+      advance(p)
+      return Json.JsonArray(items)
+    }
     guard = guard + 1
   }
   fail newError("json: array nesting exceeds token bound")

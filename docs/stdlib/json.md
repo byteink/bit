@@ -203,3 +203,45 @@ function parseExample(): i64 {
   }
 }
 ```
+
+## JSONC
+
+A narrow, explicit extension over strict JSON — deliberately **not** JSON5.
+The grammar (also documented as the authoritative source in
+stdlib/json/parse.bit's header comment):
+
+- `//` line comments: from `//` to end of line, anywhere whitespace is
+  currently allowed.
+- `/* */` block comments: non-nesting, anywhere whitespace is currently
+  allowed. An unterminated `/*` is a parse error.
+- Trailing commas: a single trailing `,` is allowed before `}` or `]`
+  (`[1, 2,]` and `{"a": 1,}` are valid). More than one trailing comma, or a
+  leading comma, is still a parse error.
+
+Explicitly out of scope: unquoted object keys, single-quoted strings, hex
+numbers, `NaN`/`Infinity`, or any other JSON5 leniency.
+
+### `jsoncParse(source: string): Json!`
+
+Parses `source` as JSONC: everything `jsonParse` accepts, plus comments and
+one trailing comma. `jsonParse` stays strict RFC 8259 so a caller that wants
+to reject comments still can.
+
+```bit
+import { jsoncParse, jsonGet, jsonAsInt } from "std/json"
+
+function jsoncExample(): i64 {
+  let v = jsoncParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
+    return -1
+  }
+  match (jsonGet(v, "a")) {
+    Some(inner) => {
+      match (jsonAsInt(inner)) {
+        Some(i) => return i
+        None => return -1
+      }
+    }
+    None => return -1
+  }
+}
+```
