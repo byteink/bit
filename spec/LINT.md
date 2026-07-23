@@ -239,6 +239,19 @@ see phase 1 above, where it is actually implemented.)
 nothing when an inner `let` hides an outer local. Prelude names are already
 covered, so this rule must not double-report them.
 
+**Decided: a parameter (or receiver) shadowing an outer name is not reported,
+only a `let`/`const` is** (this includes a `for`/`catch`/`match` binder — they
+activate as the same kind as a block-local `let`). `function f(count: int)`
+beside a module-level `count` is the single highest-volume shape of shadowing
+in real code, and it is close to harmless: a parameter's whole lexical extent
+*is* the function body, so there is no earlier read in the same scope whose
+meaning silently changes the way a mid-block `let` does. Reporting it would
+make the rule noisy enough that a team would reach for `disable
+shadowed-local` wholesale rather than fix the rarer, genuinely confusing case
+this rule exists for — which defeats the rule. `let`/`const` stays in scope
+because that is the shape with no lexical-extent excuse: it appears partway
+through a block that already has the outer name in play.
+
 `append-aliasing` has no equivalent in other languages' linters — it encodes a
 Bit-specific aliasing rule the type system does not express, and one this
 repository has already paid for once in the self-hosted compiler. It fires when
@@ -439,7 +452,9 @@ Required coverage:
 - one positive and one negative case per non-threshold rule — for
   `append-aliasing` the negative case must include an append to a local slice,
   and for `shadowed-local` an inner `let` of a prelude name, which
-  `shadows_predeclared` already reports and this rule must not duplicate
+  `shadows_predeclared` already reports and this rule must not duplicate, PLUS
+  a same-scope redeclaration, which `duplicate_declaration` (E0042) already
+  reports and this rule must not overlap
 - an override raising a limit
 - an override disabling a rule
 - a malformed directive, exit 2
