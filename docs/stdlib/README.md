@@ -21,6 +21,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [crypto](crypto.md) | `"std/crypto"` | The `Hash` streaming digest contract |
 | [tls](tls.md) | `"std/tls"` | TLS 1.3 groups, cipher suites, key schedule, handshake, record |
 | [uuid](uuid.md) | `"std/uuid"` | UUID v4/v5/v7, parse/format |
+| [json](json.md) | `"std/json"` | JSON and JSONC parsing, encoding, and comment-preserving editing |
 | [http2](http2.md) | `"std/http2"` | HPACK + HTTP/2 frame layer |
 | [quic](quic.md) | `"std/quic"` | QUIC v1 packet protection + frames |
 | [http3](http3.md) | `"std/http3"` | QPACK field compression |
