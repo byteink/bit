@@ -105,3 +105,33 @@ function lastWins(): i64 {
   }
 }
 ```
+
+## Encoding
+
+The plain-value encoder: serializes a `Json` tree to text. No trivia, no
+comments — the CST printer the edit layer needs is a separate, later task.
+
+### `jsonEncode(j: Json): string`
+
+Compact form: no whitespace, `,`/`:` with no padding. Keys and strings are
+JSON-escaped per RFC 8259 §7 (`"`, `\`, and control bytes < 0x20 — `\n`, `\t`,
+`\r`, `\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes
+`>= 0x20` pass through as-is, since JSON strings are UTF-8.
+
+### `jsonEncodePretty(j: Json, indent: string): string`
+
+Pretty form: each object/array element on its own line, `indent` repeated
+once per nesting depth, `": "` after each key. No trailing newline — matches
+the shape of `JSON.stringify(v, null, 2)`.
+
+```bit
+import { Json, JsonEntry, jsonEncode, jsonEncodePretty } from "std/json"
+
+function encodeExample(): string {
+  let obj = Json.JsonObject([]JsonEntry{
+    JsonEntry{ key: "name", value: Json.JsonString("bit\n") },
+    JsonEntry{ key: "count", value: Json.JsonInt(2) },
+  })
+  return jsonEncode(obj) + "\n" + jsonEncodePretty(obj, "  ")
+}
+```
