@@ -69,18 +69,18 @@ exist; the listing says which and where.
 |---|---|
 | 0 | no findings |
 | 1 | at least one finding |
-| 2 | usage error, unreadable path, or malformed override directive |
+| 2 | usage error, unreadable path, malformed override directive, or a file `bit check` would reject |
 
 Exit 2 covers an unknown flag, a path that does not exist or cannot be read,
-and any directive error from §5.2. A path the user named and lint could not
-read is a silent hole in the run, which is why it is a failure and not a
-warning.
+any directive error from §5.2, and a file that fails to parse (§10 open
+question 2). A path the user named and lint could not read is a silent hole in
+the run, which is why it is a failure and not a warning.
 
-A run with a directive error reports the directive errors **instead of**
-findings, not alongside them: the overrides decide what the findings are, so
-reporting findings computed under a broken override set would report a result
-nobody asked for. Every bad directive in the walk is reported before exiting,
-so one run fixes them all.
+A run with a directive error or a parse failure reports those errors
+**instead of** findings, not alongside them: either decides what the findings
+would be, so reporting findings computed past a broken override set or an
+unparseable file would report a result nobody asked for. Every such error in
+the walk is reported before exiting, so one run fixes them all.
 
 Lint findings are recorded at `severity=1` (warning) so they do not bump
 `errorCount` — `Diagnostics.warn` deliberately does not, and that semantic is

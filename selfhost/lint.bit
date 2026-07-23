@@ -26,6 +26,7 @@ const ecLintMaxNesting = 203
 const ecLintMaxComplexity = 204
 const ecLintUnreachableCode = 212
 const ecLintShadowedLocal = 213
+const ecLintAppendAliasing = 214
 const ecLintUnknownRule = 298
 const ecLintBadDirective = 299
 
@@ -63,6 +64,7 @@ function lintRules(): []LintRule {
     LintRule{ name: "max-complexity", code: ecLintMaxComplexity, hasLimit: true, limit: 10 },
     LintRule{ name: "unreachable-code", code: ecLintUnreachableCode, hasLimit: false, limit: 0 },
     LintRule{ name: "shadowed-local", code: ecLintShadowedLocal, hasLimit: false, limit: 0 },
+    LintRule{ name: "append-aliasing", code: ecLintAppendAliasing, hasLimit: false, limit: 0 },
   ]
 }
 
@@ -413,7 +415,8 @@ function lintCountLines(src: string): int {
 
 // Runs every registered rule over one file, appending findings to `d`. `tree`
 // is the file's parsed AST — unused by `max-file-lines`, which reads only
-// `src`, and required by every function-shaped rule (§4 phase 1).
+// `src`, and required by every rule that needs syntax (phase 1, plus
+// `append-aliasing`).
 //
 // This is the ONE place a rule is dispatched. A new rule adds its entry to
 // `lintRules()` and its arm here; nothing else in the runner changes.
@@ -440,6 +443,8 @@ function runLintRules(src: string, file: int, tree: Tree, cfg: LintConfig, d: Di
       lintUnreachableCode(tree, src, file, d)
     } else if (rules[i].code == ecLintShadowedLocal) {
       lintShadowedLocal(src, file, d)
+    } else if (rules[i].code == ecLintAppendAliasing) {
+      lintAppendAliasing(tree, src, file, d)
     }
     i = i + 1
   }
@@ -764,6 +769,164 @@ function lintShadowedLocal(src: string, file: int, d: Diagnostics) {
       "outer '${h.name}' declared at ${filePath(d.sm, file)}:${outerLoc.line + 1}:${outerLoc.column + 1}")
     i = i + 1
   }
+}
+
+// E0214 `append-aliasing`. `append(s, x)` grows `s` in place and aliases its
+// backing array (spec/LINT.md §4): if `s` is a slice-typed PARAMETER and the
+// call's result is not assigned straight back to that same parameter, the
+// caller's array may be mutated out from under it. This is the rule most
+// likely to need overriding — a parameter a function genuinely owns looks
+// identical, from the AST, to one the caller still holds — so it fires on the
+// shape alone and leaves the judgement call to `// bit:lint disable
+// append-aliasing`.
+//
+// Deliberately narrow (spec/LINT.md constraints): PARAMETERS only, never a
+// struct field or a call result, and never an attempt to prove the caller
+// actually reuses the slice afterward — that is the whole-program view this
+// rule avoids. A same-named local `let` shadowing the parameter is a false
+// positive this rule accepts rather than resolves (spec/LINT.md §4).
+function lintAppendAliasing(tree: Tree, src: string, file: int, d: Diagnostics) {
+  let i = 1
+  while (i < len(tree.nodes)) {
+    if (getNode(tree, i).tag == Tag.FuncDecl) {
+      lintAppendAliasingFunc(tree, src, file, i, d)
+    }
+    i = i + 1
+  }
+}
+
+// `func_decl = [recv, name, generics, params, result, body(, attrs)]`
+// (selfhost/parserdecl.bit): params is kid 3, the body block is kid 5.
+function lintAppendAliasingFunc(tree: Tree, src: string, file: int, funcNode: int, d: Diagnostics) {
+  let k = kidsOf(tree, funcNode)
+  let names = lintSliceParamNames(tree, src, k[3])
+  if (len(names) == 0) {
+    return
+  }
+  let protected = lintProtectedAppends(tree, src, k[5], []int(0))
+  lintFindAppendAliasing(tree, src, file, k[5], names, protected, d)
+}
+
+// The names of `params`' slice-typed parameters (`param = [name, type]`,
+// selfhost/parserdecl.bit). A method receiver is never in this list — it is
+// not a kid of `params` at all — so it can never be flagged.
+function lintSliceParamNames(tree: Tree, src: string, params: int): []string {
+  let out = []string(0)
+  for pn of kidsOf(tree, params) {
+    if (getNode(tree, pn).tag != Tag.Param) {
+      continue // a `...rest` param is excluded; its ownership rules differ
+    }
+    let pk = kidsOf(tree, pn)
+    if (getNode(tree, pk[1]).tag == Tag.SliceType) {
+      let nm = getNode(tree, pk[0]).span
+      out = append(out, src[nm.start:nm.end])
+    }
+  }
+  return out
+}
+
+// True iff `node` is a `call` whose callee is the bare identifier `append`.
+function lintIsAppendCall(tree: Tree, src: string, node: int): bool {
+  if (getNode(tree, node).tag != Tag.Call) {
+    return false
+  }
+  let callee = getNode(tree, kidsOf(tree, node)[0])
+  if (callee.tag != Tag.Ident) {
+    return false
+  }
+  return src[callee.span.start:callee.span.end] == "append"
+}
+
+// The name `append`'s first argument resolves to, or "" if it is not a bare
+// identifier (`append(f(), x)` can never alias a parameter this rule can
+// name). `args` holds `arg`/`arg_spread` nodes each wrapping one expression
+// (selfhost/parser.bit's `parseArgItem`).
+function lintAppendFirstArgName(tree: Tree, src: string, node: int): string {
+  let argKids = kidsOf(tree, kidsOf(tree, node)[2])
+  if (len(argKids) == 0) {
+    return ""
+  }
+  let expr = getNode(tree, kidsOf(tree, argKids[0])[0])
+  if (expr.tag != Tag.Ident) {
+    return ""
+  }
+  return src[expr.span.start:expr.span.end]
+}
+
+// Every `append` call node, anywhere under `node`, whose result is assigned
+// straight back to the same name it was called on — `p = append(p, x)` — and
+// so must not be flagged. Only this exact shape counts: routing the result
+// through a temporary before reassigning is indistinguishable, from the AST,
+// from never reassigning it at all, so it is not specially recognised either
+// (accepted per spec/LINT.md — override, don't chase the flow).
+function lintProtectedAppends(tree: Tree, src: string, node: int, out: []int): []int {
+  if (node == 0) {
+    return out
+  }
+  let n = getNode(tree, node)
+  if (n.tag == Tag.Assign) {
+    let k = kidsOf(tree, node)
+    let lhs = kidsOf(tree, k[0])
+    let rhs = kidsOf(tree, k[1])
+    let i = 0
+    while (i < len(lhs) && i < len(rhs)) {
+      let lhsNode = getNode(tree, lhs[i])
+      if (lhsNode.tag == Tag.Ident && lintIsAppendCall(tree, src, rhs[i])) {
+        let lhsName = src[lhsNode.span.start:lhsNode.span.end]
+        if (lintAppendFirstArgName(tree, src, rhs[i]) == lhsName) {
+          out = append(out, rhs[i])
+        }
+      }
+      i = i + 1
+    }
+  }
+  for kid of kidsOf(tree, node) {
+    out = lintProtectedAppends(tree, src, kid, out)
+  }
+  return out
+}
+
+// Reports every unprotected `append` call in `node`'s subtree whose first
+// argument is one of `names` (this function's slice-typed parameters).
+function lintFindAppendAliasing(tree: Tree, src: string, file: int, node: int,
+  names: []string, protected: []int, d: Diagnostics) {
+  if (node == 0) {
+    return
+  }
+  let n = getNode(tree, node)
+  if (n.tag == Tag.Call && lintIsAppendCall(tree, src, node) && !lintContainsInt(protected, node)) {
+    let argName = lintAppendFirstArgName(tree, src, node)
+    if (argName != "" && lintContainsString(names, argName)) {
+      warn(d, ecLintAppendAliasing, n.span,
+        "append on parameter '${argName}' may alias the caller's backing array",
+        "if '${argName}' is owned by this function, silence with `// bit:lint disable append-aliasing -- <reason>`; otherwise assign the result back: ${argName} = append(${argName}, ...)")
+    }
+  }
+  for kid of kidsOf(tree, node) {
+    lintFindAppendAliasing(tree, src, file, kid, names, protected, d)
+  }
+}
+
+function lintContainsInt(xs: []int, v: int): bool {
+  let i = 0
+  while (i < len(xs)) {
+    if (xs[i] == v) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+function lintContainsString(xs: []string, v: string): bool {
+  let i = 0
+  while (i < len(xs)) {
+    if (xs[i] == v) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 // ---------------------------------------------------------------------------
