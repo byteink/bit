@@ -25,6 +25,21 @@
 // ponytail: no aging-out of idle *established* connections yet.
 const quicListenerMaxConns: int = 1024
 
+// A much tighter ceiling on connections concurrently *mid-handshake* (admitted
+// but not yet established) — admission control against a retry storm (#1709).
+// The scheduler is single-worker (ABI.md §5, `nthreads` pinned to 1), and each
+// handshake's server-side RSA sign fully occupies that one worker for its
+// duration (cooperative, non-preemptive green threads: nothing else runs while
+// a sign call is in progress). Bounding how many connections may be mid-sign at
+// once bounds the round-robin population every tick has to service, so a client
+// retry storm cannot inflate per-connection scheduling latency without limit —
+// unbounded admission was exactly what let a slow-crypto runtime's arrivals
+// outpace its reaps and collapse to total starvation. Sized generously over the
+// modest genuine concurrency std/quic's own tests exercise (2), not against
+// `quicListenerMaxConns`, which bounds the demux table as a whole and is far too
+// loose to gate the CPU-bound handshake phase specifically.
+const quicListenerMaxHandshakes: int = 4
+
 // The listener's private state: the shared socket, the reusable TLS server
 // config, the DCID→connection table (`present` shadows key existence, since the
 // map has no comma-ok probe), the queue of established connections `accept`
@@ -41,6 +56,9 @@ struct quicListenerState {
   present: map<string, int>,
   acceptCh: chan<Conn>,
   count: int,
+  // Connections currently mid-handshake (admitted, not yet resolved established
+  // or failed) — the admission-control counter gated by `quicListenerMaxHandshakes`.
+  handshaking: int,
 }
 
 // A QUIC server listener owning one bound UDP socket and demultiplexing all
@@ -61,6 +79,7 @@ export function listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string
     present: map<string, int>(),
     acceptCh: chan<Conn>(64),
     count: 0,
+    handshaking: 0,
   }
   spawn quicListenerLoop(lst)
   return Listener{ acceptCh: lst.acceptCh, sock: sock }
@@ -108,6 +127,15 @@ function quicListenerDispatch(lst: quicListenerState, data: []byte, host: string
   if (lst.count >= quicListenerMaxConns) {
     return
   }
+  // Admission control (#1709): past the mid-handshake cap, shed the Initial
+  // instead of admitting more CPU-bound handshake work than the single worker
+  // can service. The client's own Initial retransmission (and, failing that,
+  // its handshake-timeout-driven redial) will retry; dropping here is the same
+  // "treat as loss" contract `quicListenerFeed` already uses for a backed-up
+  // connection, just applied before a connection exists at all.
+  if (lst.handshaking >= quicListenerMaxHandshakes) {
+    return
+  }
   let st = quicListenerNewConn(lst, key)?
   quicListenerFeed(st.inCh, data, host, port)
 }
@@ -147,6 +175,7 @@ function quicListenerNewConn(lst: quicListenerState, clientKey: string): quiccon
   lst.conns[scidKey] = st.inCh
   lst.present[scidKey] = 1
   lst.count = lst.count + 1
+  lst.handshaking = lst.handshaking + 1
   spawn quicconnTicker(st)
   spawn quicconnLoop(st)
   spawn quicListenerReap(lst, st, clientKey, scidKey)
@@ -158,6 +187,12 @@ function quicListenerNewConn(lst: quicListenerState, clientKey: string): quiccon
 // green-thread count stay bounded.
 function quicListenerReap(lst: quicListenerState, st: quicconnState, k1: string, k2: string) {
   let r = <- st.readyCh
+  // The handshake phase is resolved the moment `readyCh` answers, one way or
+  // the other (established, or `quicconnFail` gave up) — free the admission
+  // slot here rather than waiting for the connection to fully close, so a
+  // reaped or long-lived established connection cannot also hold open a
+  // mid-handshake slot it no longer occupies.
+  lst.handshaking = lst.handshaking - 1
   if (r > 0) {
     lst.acceptCh <- Conn{ cmdCh: st.cmdCh, sock: lst.sock }
   }
