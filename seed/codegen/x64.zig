@@ -1242,10 +1242,76 @@ fn emitMulInt(self: *Ctx, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) 
     try putInt(self, dst, scratch1);
 }
 
+/// Peeks whether `v` is a `const_int` holding a POSITIVE power-of-two value
+/// at `w`'s width, returning its log2 exponent when so — used to route
+/// `sdiv`/`udiv` around a real `idiv` (#1702). Declining a non-power-of-two
+/// or non-positive divisor is correct, not merely conservative: those need a
+/// different (unimplemented) reduction and must keep dividing for real.
+fn constPow2Divisor(f: *const ir.Function, v: ir.ValueId, w: Width) ?u6 {
+    if (f.insts.items(.op)[@intFromEnum(v)] != .const_int) return null;
+    const raw = f.decode(v).const_int;
+    const bits: u8 = w.bytes * 8;
+    var magnitude: u64 = undefined;
+    if (w.signed) {
+        if (raw <= 0) return null; // only a positive divisor's quotient is a plain shift
+        magnitude = @intCast(raw);
+    } else if (bits >= 64) {
+        magnitude = @bitCast(raw);
+    } else {
+        magnitude = @as(u64, @bitCast(raw)) & ((@as(u64, 1) << @intCast(bits)) - 1);
+    }
+    if (magnitude == 0 or (magnitude & (magnitude - 1)) != 0) return null; // zero, or not a power of two
+    const k: u6 = @intCast(@ctz(magnitude));
+    if (k == 0) return null; // divisor == 1: quotient is the dividend, no shift needed
+    return k;
+}
+
+/// Emits `l / 2^k` as shifts instead of a real `sdiv`/`udiv` — an EXACT
+/// replacement for every `l`, not merely aligned ones: this computes the
+/// identical quotient a real division would, just without the hardware
+/// divide. `idiv` is one of the most expensive common x86-64 ALU
+/// instructions (non-pipelined, ~20-40+ cycles) — a cost this codegen paid
+/// on every int-to-pointer reinterpret cast in `runtime/` (`n + (addr / N)`,
+/// SPEC §11.4) before this fix (#1702).
+///
+/// x86-64-ONLY, deliberately: AArch64's `sdiv`/`udiv` are cheap, low-latency
+/// hardware instructions (a handful of cycles, not tens), and this
+/// replacement's serial dependency chain (each shift/add depends on the
+/// last) measurably REGRESSED a tight loop there (~15-19% slower, hl-master
+/// vs an Apple-silicon Mac, #1702) — the "avoid the divide" premise this
+/// helper exists for is x86-64-specific, so the reduction is too.
+///
+/// Unsigned truncation is already a logical right shift. Signed truncation
+/// (round toward zero, SPEC §13.5) needs the standard bias-then-shift form:
+/// add `2^k - 1` when `l` is negative (recovered as a sign-extended shift,
+/// never a branch) before the final arithmetic shift, so a negative dividend
+/// still rounds toward zero rather than down.
+fn emitPow2DivInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool, w: Width) !void {
+    const l = try getInt(self, vregOf(self, lhs), scratch1);
+    try self.movRR(scratch1, l);
+    if (!signed) {
+        try self.shiftImm(.shr, scratch1, k);
+        try putInt(self, dst, scratch1);
+        return;
+    }
+    const bits: u8 = w.bytes * 8;
+    try self.movRR(scratch2, scratch1);
+    try self.shiftImm(.sar, scratch2, @intCast(bits - 1)); // sign mask: 0 or all-ones
+    try self.shiftImm(.shr, scratch2, @intCast(bits - @as(u8, k))); // isolate low k bits: 0 or 2^k-1
+    try self.arithRR(.add, scratch1, scratch2);
+    try self.shiftImm(.sar, scratch1, k);
+    try putInt(self, dst, scratch1);
+}
+
 /// `sdiv`/`udiv`/`srem`/`urem` — the function containing this was already
 /// forced (by `buildIntervals`'s prescan) to exclude `rax`/`rdx` from
 /// allocation, so neither operand's real register can ever alias them.
-fn emitDivInt(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId) !void {
+fn emitDivInt(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) !void {
+    if (op == .sdiv or op == .udiv) {
+        if (constPow2Divisor(self.f, rhs, w)) |k| {
+            return emitPow2DivInt(self, dst, lhs, k, op == .sdiv, w);
+        }
+    }
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     const r = try getInt(self, vregOf(self, rhs), scratch2);
     try self.movRR(.rax, l);
@@ -2673,7 +2739,7 @@ fn emitInst(self: *Ctx, id: ir.ValueId) CodegenError!void {
         .fmul => try emitBinaryFloat(self, .mul, dst, d.bin.lhs, d.bin.rhs, iw.bytes),
         .fdiv => try emitBinaryFloat(self, .div, dst, d.bin.lhs, d.bin.rhs, iw.bytes),
         .mul => try emitMulInt(self, dst, d.bin.lhs, d.bin.rhs, iw),
-        .sdiv, .udiv, .srem, .urem => try emitDivInt(self, op, dst, d.bin.lhs, d.bin.rhs),
+        .sdiv, .udiv, .srem, .urem => try emitDivInt(self, op, dst, d.bin.lhs, d.bin.rhs, iw),
         .shl => try emitShiftInt(self, .shl, dst, d.bin.lhs, d.bin.rhs, iw),
         .ashr => try emitShiftInt(self, .sar, dst, d.bin.lhs, d.bin.rhs, iw),
         .lshr => try emitShiftInt(self, .shr, dst, d.bin.lhs, d.bin.rhs, iw),
