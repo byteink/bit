@@ -85,6 +85,38 @@ data, never a crash.
 Looks up `key` in `o`. `None` when `o` is not a `JsonObject` or `key` is
 absent. On a duplicate key, returns the **last** matching entry.
 
+## Lexer
+
+A hand-written flat lexer over JSON text (strict RFC 8259, no comments — that
+is JSONC, a separate layer). No regex, no generated tables, no recursion:
+`{`/`[` nesting is tracked with a push/pop counter, not a call stack, so a
+pathologically deep input yields `Invalid` instead of a stack overflow.
+
+Tokens carry raw byte spans, not decoded values: a `StringTok` spans the
+source including its quotes with escapes left raw, and a `NumberTok` spans
+the literal exactly as written. Decoding and numeric-grammar validation are
+the parser task's job, not this layer's — so a later CST layer can echo an
+untouched literal back byte-for-byte.
+
+### `TokenKind`
+
+The lexical categories a token can be: `LBrace`, `RBrace`, `LBracket`,
+`RBracket`, `Colon`, `Comma`, `StringTok`, `NumberTok`, `TrueTok`, `FalseTok`,
+`NullTok`, `Eof`, `Invalid`.
+
+### `Token`
+
+One token: `kind`, and its `[start, end)` byte span in the source.
+
+### `jsonMaxDepth`
+
+The combined `{`/`[` nesting limit: 64 levels. Opening a 65th level yields an
+`Invalid` token instead of tracking it.
+
+### `lex(source: string): []Token`
+
+The full token stream for `source`, ending with one `Eof`.
+
 ```bit
 import { Json, JsonEntry, jsonGet, jsonAsInt } from "std/json"
 
