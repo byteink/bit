@@ -766,7 +766,7 @@ defined exactly once).
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
 | `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize) -> *SliceHeader` (§2) |
-| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64) -> *SliceHeader` (§2)     |
+| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize) -> *SliceHeader` (§2, `is_ref` is the static element type's — a null `h` has no header to read it from, #1569) |
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize) -> u64` (§2)     |
 | `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64) -> void` (§2) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2) |

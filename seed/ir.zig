@@ -223,7 +223,9 @@ pub const RtFn = enum {
     select_alloc,
     select,
     /// Dynamic `[]T` (ABI.md §2). `slice_new(len, cap, is_ref) -> slice`;
-    /// `slice_append(slice, word) -> slice` (grows, returns the header);
+    /// `slice_append(slice, word, is_ref) -> slice` (grows, returns the
+    /// header; `is_ref` is the static element type's, needed because a null
+    /// header — a zeroed struct's slice field, #1564 — has none to read, #1569);
     /// `slice_get(slice, index) -> word` and `slice_set(slice, index, word)`
     /// are bounds-checked (SPEC §18.4). Elements are one word each; `len(s)` on
     /// a slice stays the `slice_len` op (a plain header load, not a call).

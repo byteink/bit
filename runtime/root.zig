@@ -1583,17 +1583,17 @@ export fn bit_rt_slice_new(len: usize, cap: usize, is_ref: usize) callconv(.c) *
 /// `append` grows the header IN PLACE, so a process-wide empty would be
 /// corrupted by the first append anywhere (#1557).
 ///
-/// `is_ref` is unrecoverable from a null header, so the fresh buffer is
-/// conservatively marked traced. That is the safe direction: tracing a scalar
-/// word costs only a spurious mark candidate, which `markRoot` already
-/// validates before decoding a header, whereas leaving a genuine reference
-/// untraced would free a live element. #1569 tracks recovering the exact bit.
-fn appendTarget(h: ?*SliceHeader) *SliceHeader {
-    return h orelse bit_rt_slice_new(0, 0, 1);
+/// `is_ref` is unrecoverable from a NULL header — there is no header to read
+/// it from, and the element type never made the wire — so lowering passes it
+/// as a third argument (ABI.md §2, #1569): the call site is the only place
+/// that still knows the static element type. A non-null header ignores it and
+/// keeps its own `is_ref`, set once at `bit_rt_slice_new`.
+fn appendTarget(h: ?*SliceHeader, is_ref: usize) *SliceHeader {
+    return h orelse bit_rt_slice_new(0, 0, is_ref);
 }
 
-export fn bit_rt_slice_append(h_opt: ?*SliceHeader, word: u64) callconv(.c) *SliceHeader {
-    const h = appendTarget(h_opt);
+export fn bit_rt_slice_append(h_opt: ?*SliceHeader, word: u64, is_ref: usize) callconv(.c) *SliceHeader {
+    const h = appendTarget(h_opt, is_ref);
     if (h.len == h.cap) {
         const newcap = if (h.cap == 0) 1 else h.cap * 2;
         const nb = allocSliceBuf(newcap, h.is_ref != 0);
@@ -2285,6 +2285,29 @@ test "bit_rt_gc_alloc: zeroed body allocated through the exported symbol" {
         }
     };
     Harness.info_ptr = &info;
+
+    const code = try boot(Harness.main, std.process.Environ.empty);
+    try testing.expectEqual(@as(i32, 0), code);
+}
+
+test "bit_rt_slice_append: is_ref on a null header matches the caller's element type (#1569)" {
+    g_booted = false;
+    defer g_booted = false;
+
+    const Harness = struct {
+        fn main() callconv(.c) i32 {
+            // `[]i64` first appended through a null header (a zeroed struct
+            // field, #1564) must come back scalar, not conservatively traced.
+            const scalar = bit_rt_slice_append(null, 7, 0);
+            if (scalar.is_ref != 0) return 1;
+
+            // `[]string` through the same path must come back traced.
+            const ref = bit_rt_slice_append(null, 0, 1);
+            if (ref.is_ref != 1) return 2;
+
+            return 0;
+        }
+    };
 
     const code = try boot(Harness.main, std.process.Environ.empty);
     try testing.expectEqual(@as(i32, 0), code);

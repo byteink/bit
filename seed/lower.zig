@@ -3237,14 +3237,20 @@ const FnCtx = struct {
     /// threading the returned (possibly regrown) header so the caller's
     /// `s = append(s, ...)` observes the new length. The elements are checked
     /// against the slice's element type, so each lowers with that hint.
+    /// `is_ref` travels on every call (ABI.md §2, #1569): a null header (a
+    /// zeroed struct's slice field, #1564) has no element type to read, so the
+    /// runtime cannot recover it from the header alone — the call site is the
+    /// only place that still knows the static element type.
     fn lowerAppend(self: *FnCtx, node: ast.Index) Error!ir.ValueId {
         const arg_nodes = self.kids(self.kids(node)[2]);
         const slice_ty = try self.nodeType(self.kids(arg_nodes[0])[0]);
         const elem_ty = self.ctx.typeOf(slice_ty).slice;
+        const i64ty = self.ctx.prim_ids.get(.i64);
+        const is_ref = try self.b.constInt(i64ty, if (self.elemIsRef(elem_ty)) 1 else 0);
         var acc = try self.lowerExpr(self.kids(arg_nodes[0])[0]);
         for (arg_nodes[1..]) |an| {
             const v = try self.lowerExprH(self.kids(an)[0], elem_ty);
-            acc = try self.rtCall(slice_ty, .slice_append, &.{ acc, v });
+            acc = try self.rtCall(slice_ty, .slice_append, &.{ acc, v, is_ref });
         }
         return acc;
     }
