@@ -490,10 +490,10 @@ fn checkEdge(gpa: std.mem.Allocator, e: Edge, module: anytype) !void {
 // `chanScratchWords` would silently narrow the SCANNED SET while every class
 // stayed present and every case stayed green.
 
-/// The six classes `stw.bit` enumerates today (#1679 added the sixth). Raising
-/// this is part of adding a class; LOWERING it means a class was deleted, which
-/// is exactly the change that must not pass silently.
-const min_root_classes = 6;
+/// The seven classes `stw.bit` enumerates today (#1742 added the seventh).
+/// Raising this is part of adding a class; LOWERING it means a class was
+/// deleted, which is exactly the change that must not pass silently.
+const min_root_classes = 7;
 
 /// The scratch area's width today. The scan walks the whole area, so this is
 /// the population of words a missing-root check can possibly cover.

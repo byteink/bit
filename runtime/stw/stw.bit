@@ -79,9 +79,10 @@
 //   3. Every OTHER stopped OS thread's frames, precisely — the same walk over
 //      each parked mutator's published snapshot (`worldParkedFrame`). The world
 //      is stopped, so each of those frames is valid and not moving.
-//   4. Every OTHER task's stack, conservatively (§5) — sound because a parked
-//      task's callee-saved references are all spilled by the runtime call chain
-//      that parked it.
+//   4. Every OTHER task's stack, conservatively (§5) — claimed sound because a
+//      parked task's callee-saved references are all spilled by the runtime
+//      call chain that parked it. THAT CLAIM IS ONLY HALF TRUE HERE — see
+//      class 7.
 //   5. Every registered task's opaque `arg` (§5/§9) — a spawn thunk is a GC
 //      object reachable ONLY through the pending task's `arg` until that task
 //      runs and unpacks it.
@@ -92,8 +93,23 @@
 //      the BASE of each task's stack, which is strictly BELOW `ctx.sp` and so
 //      outside class 4's range for every task, always. Zig keeps the first as a
 //      stack local (class 4 covers it) and the second in a `threadlocal`.
+//   7. Every OTHER task's own saved register file, conservatively
+//      (`stwScanCtx`, #1742). THIS ONE ALSO HAS NO `root.zig` COUNTERPART, and
+//      it is the fix to class 4's soundness gap: `root.zig`'s `park` hands off
+//      through an ordinary LLVM call chain, whose callee-saved spills for a
+//      still-live value land on a callee's STACK FRAME and so are already
+//      inside class 4's `[sp, stackTop)` walk. This port's `schedSwitch`
+//      (`../sched/sched.bit`) is hand-written `asm`, and it saves the
+//      callee-saved file into the TASK'S OWN CONTROL BLOCK instead — a
+//      separate allocation from its stack, outside class 4's range by
+//      construction. A GC reference the register allocator keeps live in one
+//      of those registers across a park (measured: a `string`'s pointer held
+//      in a callee-saved register across a `sleep()` retry loop, #1742) was
+//      invisible to every class above and collected while still needed —
+//      silently, the way this header warns every missed class does. `root.zig`
+//      never needed this class because it never had this problem.
 //
-// Classes 4 and 5 are reachable only when a scheduler block is bound; class 1
+// Classes 4, 5 and 7 are reachable only when a scheduler block is bound; class 1
 // only when a channel registry is. `stwBind` takes all three addresses TOGETHER
 // and `stwCanCollect` refuses to collect unless every one of them is present —
 // deliberately, because "collect with a smaller root set" is the failure mode
@@ -118,7 +134,7 @@ import { heapLiveWord } from "../alloc"
 import { chanScanRegistryRoots } from "../chan"
 import { taskAt, schedCurrentTask, schedMaxRegistered } from "../sched"
 import { schedRegLock, schedRegUnlock, schedRegHead, schedRegNext } from "../sched"
-import { ctxSp, taskArg, taskState, taskDone, taskStackBase, taskStackBytes } from "../sched"
+import { ctxSp, ctxWords, taskArg, taskState, taskDone, taskStackBase, taskStackBytes } from "../sched"
 // The per-task scratch area's word count (#1679) — see `stwScanScratch`.
 import { chanScratchWords } from "../sched"
 
@@ -336,12 +352,47 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
   }
 }
 
-// Classes 4, 5 and 6: every registered task's `arg` and scratch area, and every
-// task's stack except the one this thread is running (scanned precisely from the
-// snapshot instead) and any finished task (its stack holds nothing live).
-// `sched.zig`'s `forEachTaskArg` + `forEachOtherStack`, fused into one walk
-// because they visit the same list under the same lock, plus the port-only
-// scratch class documented above.
+// Class 7: a parked task's OWN saved callee-saved register file — `t[0
+// .. ctxWords)`, the block `schedSwitch` (`../sched/sched.bit`) writes on
+// every park. THIS CLASS HAS NO `root.zig` COUNTERPART EITHER, and unlike
+// class 6 it is not an addition — it is a CORRECTION of class 4's own
+// soundness argument above ("sound because a parked task's callee-saved
+// references are all spilled by the runtime call chain that parked it").
+//
+// That argument holds for `sched.zig`'s oracle, where LLVM's ordinary
+// callee-saved spill for a value still live across a call lands ON THE
+// CALLEE'S STACK FRAME — inside `[sp, stackTop)`, so class 4's plain stack
+// walk already sees it. It does NOT hold here. `schedSwitch` is a
+// hand-written `asm` block, not an ordinary prologue: it saves x19..x28
+// (arm64) / rbx,r12..r15 (x64) into the TASK'S OWN CONTROL BLOCK — a
+// separate allocation from its stack — precisely because the whole point of
+// a context switch is to leave nothing usable behind on the stack it is
+// vacating. A value the register allocator keeps live in one of those
+// registers across a park (a `string`'s pointer held across a `sleep()` in
+// a retry loop is the case that found this) is therefore saved OUTSIDE
+// `[ctxSp, stackTop)` and invisible to `stwScanStackRange` — collected out
+// from under a task that has not finished with it, then silently reused.
+//
+// Scanned unconditionally over all 22 words rather than picking out the
+// GP-only slots: `gcMarkConservative` already rejects anything that is not
+// an exact heap object base (sp/pc/fp/lr and the FP file d8..d15 all fail
+// that test harmlessly), so a blanket walk costs a few wasted probes and
+// needs no per-architecture slot list to go stale.
+@nosplit function stwScanCtx(g: *i64, t: *i64) {
+  let i = 0
+  while (i < ctxWords) {
+    gcMarkConservative(g, *(t + i))
+    i = i + 1
+  }
+}
+
+// Classes 4, 5, 6 and 7: every registered task's `arg`, scratch area and
+// saved register file, and every task's stack except the one this thread is
+// running (scanned precisely from the snapshot instead) and any finished
+// task (its stack holds nothing live). `sched.zig`'s `forEachTaskArg` +
+// `forEachOtherStack`, fused into one walk because they visit the same list
+// under the same lock, plus the port-only scratch and ctx classes documented
+// above.
 @nosplit function stwScanTasks(g: *i64, sched: *i64) {
   let cur = schedCurrentTask()
   schedRegLock(sched)
@@ -358,6 +409,13 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
     stwScanScratch(g, t)
     if (addr != cur && *(t + taskState) != taskDone) {
       stwScanStackRange(g, *(t + ctxSp), *(t + taskStackBase) + *(t + taskStackBytes))
+      // The running task's own registers are live CPU state, not a saved
+      // block — scanning `t[0..ctxWords)` for it would read whatever this
+      // task's context slots last held (stale, from its previous park) and
+      // is neither needed (its real registers are covered by the precise
+      // snapshot walk) nor safe to treat as current. Gated identically to
+      // the stack range for that reason, not by accident of placement.
+      stwScanCtx(g, t)
     }
     addr = schedRegNext(t)
     n = n + 1
