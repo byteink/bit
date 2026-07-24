@@ -1,0 +1,314 @@
+// selfhost/pmcli.bit — `bit add` (#1734, epic #1480). Wires together the
+// pieces landed by the sibling package-manager tasks into one end-to-end
+// command:
+//   - selfhost/pmfetch.bit (#1733): parses `gitHost/owner/repo@ref`, resolves
+//     `ref` to a commit sha, fetches it into the content-addressed cache.
+//   - selfhost/pmresolve.bit (#1731): Minimal Version Selection, used here to
+//     confirm the version being added doesn't undercut something an existing
+//     locked dependency already transitively requires.
+//   - selfhost/pmlock.bit (#1732): reads/writes bit.lock.
+//   - stdlib/json's CST edit layer (#1725/#1726, epic #1479): the ONLY way
+//     bit.json is ever rewritten — cstParse -> cstSetStringPath -> cstPrint,
+//     never a plain parse-modify-reserialize, so a user's comments and
+//     formatting survive except the one entry actually changed.
+// No code from a fetched dependency is ever executed: pmfetch.bit already
+// refuses to run anything from a fetched checkout (no build/postinstall
+// scripts), and nothing below adds a new execution path.
+import { CstNode, cstParse, cstPrint, cstSetStringPath } from "std/json"
+
+const pmCliDefaultTimeoutMs: int = 30000
+
+// One dependency this run added or updated — enough to print a confirmation
+// and to hand to both the bit.json rewrite and the bit.lock upsert.
+struct AddResult {
+  name: string,
+  specRef: string,
+  url: string,
+  commit: string,
+}
+
+// ---- CLI entry --------------------------------------------------------
+
+// `bit add <gitHost/owner/repo>[@ref] [--dir <path>]`. Returns the process
+// exit code: 2 on a usage error, 1 on a fetch/resolve/write failure, 0 on
+// success.
+function addCmd(a: []string): int {
+  if (len(a) < 3) {
+    eprint("usage: bit add <gitHost/owner/repo>[@ref] [--dir <path>]\n")
+    return 2
+  }
+  let specArg = a[2]
+  let projectDir = "."
+  let ai = 3
+  while (ai < len(a)) {
+    if (a[ai] == "--dir" && ai + 1 < len(a)) {
+      projectDir = a[ai + 1]
+      ai = ai + 2
+    } else {
+      eprint("bit add: unexpected argument '${a[ai]}'\n")
+      return 2
+    }
+  }
+
+  let hadRef = lastIndexByte(specArg, '@') >= 0
+  let d = parseAddSpec(specArg) catch e {
+    eprint("bit add: ${e.message()}\n")
+    return 2
+  }
+  let url = "https://" + d.host + "/" + d.owner + "/" + d.repo + ".git"
+  let cacheRoot = defaultCacheRoot() catch e {
+    eprint("bit add: ${e.message()}\n")
+    return 1
+  }
+
+  let result = addDependency(
+    projectDir, cacheRoot, defaultGitBin,
+    d.host, d.owner, d.repo, d.ref, hadRef, url,
+    pmCliDefaultTimeoutMs,
+  ) catch e {
+    eprint("bit add: ${e.message()}\n")
+    return 1
+  }
+
+  print("bit add: ${result.name} -> ${result.specRef} (${result.commit})\n")
+  return 0
+}
+
+// `gitHost/owner/repo[@ref]` — like pmfetch.bit's own `parseSpec`, but `ref`
+// is OPTIONAL here (ticket #1734, step 1: default to the remote's default
+// branch HEAD). `resolveDependencyRef` already knows how to resolve the
+// pseudo-ref `"HEAD"` (`git ls-remote <url> HEAD`), so this is a thin wrapper
+// around `parseSpec`, not a fork of its validation.
+function parseAddSpec(spec: string): DepSpec! {
+  if (lastIndexByte(spec, '@') >= 0) {
+    return parseSpec(spec)?
+  }
+  return parseSpec(spec + "@HEAD")?
+}
+
+// ---- the add flow, independent of argv/exit codes ---------------------
+
+// Steps (ticket #1734):
+//  1. resolve `ref` to a commit sha (pmfetch.resolveDependencyRef). When
+//     `refIsExplicit` is false (no `@ref` in the user's spec), the resolved
+//     sha itself becomes the ref recorded in bit.json — spec §17.7 names
+//     exactly three legal ref forms (tag / branch / bare sha), and a bare
+//     sha is the only one of those that is already exactly what was
+//     resolved, so this never invents a fourth "HEAD" spelling.
+//  2. fetch that sha into the content-addressed cache (pmfetch.fetchSha).
+//  3. read the fetched dependency's own bit.json requirements (if any) and
+//     confirm this add doesn't undercut a version some existing locked
+//     dependency already transitively requires (pmresolve.resolveMVS) — non-
+//     version refs (a branch or bare sha) are not ordered versions and are
+//     not run through it, matching spec §17.7 point 2.
+//  4. rewrite bit.json's `dependencies.<name>` entry through the CST edit
+//     layer, preserving every other byte.
+//  5. regenerate bit.lock (pmlock.writeLock) with the resolved commit and the
+//     fetched dependency's own transitive requirements.
+//
+// `url` is a plain parameter, not derived here — the same layering
+// pmfetch.bit itself uses (its `DepSpec` never carries a url either) — so
+// this is directly testable against a `file://` fixture (pmclicheck.bit)
+// without needing a real `https://` remote. `addCmd` above always derives it
+// as `https://<host>/<owner>/<repo>.git`, per SPEC §17.7's git-only registry
+// model.
+export function addDependency(
+  projectDir: string, cacheRoot: string, gitBin: string,
+  host: string, owner: string, repo: string, ref: string, refIsExplicit: bool,
+  url: string, timeoutMs: int,
+): AddResult! {
+  let name = repo
+  let sha = resolveDependencyRef(gitBin, url, ref, timeoutMs)?
+  let fetched = fetchSha(gitBin, cacheRoot, host, owner, repo, url, sha, timeoutMs)?
+
+  let depManifest = readManifest(fetched.dir)?
+  let depRequires = manifestRequires(depManifest)
+
+  let finalRef = ref
+  if (!refIsExplicit) {
+    finalRef = sha
+  }
+
+  let lockPath = pmJoin(projectDir, "bit.lock")
+  checkVersionConflict(lockPath, name, finalRef, depRequires)?
+
+  let specRef = "${host}/${owner}/${repo}@${finalRef}"
+  rewriteManifest(projectDir, name, specRef)?
+
+  let entries = readLock(lockPath)?
+  let updated = upsertLockEntry(entries, name, url, sha, depRequires)
+  writeLock(lockPath, updated)?
+
+  return AddResult{ name: name, specRef: specRef, url: url, commit: sha }
+}
+
+// ---- reading a fetched dependency's own requirements -------------------
+
+// The `dependencies` object of a fetched dependency's `bit.json`
+// (`d`, from pmfetch.bit's `readManifest`), as `[]LockRequire` — an absent
+// manifest or an absent/malformed `dependencies` key is not an error, just
+// no transitive requirements (`readManifest` already returns a well-formed,
+// empty `JsonDoc` for a dependency with no manifest at all).
+function manifestRequires(d: JsonDoc): []LockRequire {
+  let out = []LockRequire(0)
+  if (!jsonHas(d, d.root)) {
+    return out
+  }
+  let depsId = jsonGet(d, d.root, "dependencies")
+  if (depsId < 0 || jsonKindOf(d, depsId) != JsonKind.Obj) {
+    return out
+  }
+  let n = jsonLen(d, depsId)
+  let i = 0
+  while (i < n) {
+    let key = jsonKeyAt(d, depsId, i)
+    out = append(out, LockRequire{ name: key, ref: jsonStrOf(d, jsonGet(d, depsId, key)) })
+    i = i + 1
+  }
+  return out
+}
+
+// ---- Minimal Version Selection over just this one add ------------------
+
+// An exact `vMAJOR.MINOR.PATCH` tag, or `(_, false)` for anything else (a
+// branch name or a bare commit sha — spec §17.7 point 2: not an MVS-ordered
+// version).
+function parseVersionTag(ref: string): (Version, bool) {
+  let zero = Version{ major: 0, minor: 0, patch: 0 }
+  if (len(ref) < 2 || ref[0] != 'v') {
+    return zero, false
+  }
+  let (major, i1, ok1) = pmScanUint(ref, 1)
+  if (!ok1 || i1 >= len(ref) || ref[i1] != '.') {
+    return zero, false
+  }
+  let (minor, i2, ok2) = pmScanUint(ref, i1 + 1)
+  if (!ok2 || i2 >= len(ref) || ref[i2] != '.') {
+    return zero, false
+  }
+  let (patch, i3, ok3) = pmScanUint(ref, i2 + 1)
+  if (!ok3 || i3 != len(ref)) {
+    return zero, false
+  }
+  return Version{ major: major, minor: minor, patch: patch }, true
+}
+
+// The decimal integer starting at `s[start]`, the index just past its last
+// digit, and whether at least one digit was read.
+function pmScanUint(s: string, start: int): (int, int, bool) {
+  let i = start
+  let n = 0
+  let any = false
+  while (i < len(s) && s[i] >= '0' && s[i] <= '9') {
+    n = n * 10 + (int(s[i]) - int('0'))
+    i = i + 1
+    any = true
+  }
+  return n, i, any
+}
+
+// `[]LockRequire` (raw ref strings) narrowed to the version-shaped subset, as
+// `pmresolve.bit`'s `Requirement`.
+function pmToRequirements(rs: []LockRequire): []Requirement {
+  let out = []Requirement(0)
+  let i = 0
+  while (i < len(rs)) {
+    let (v, ok) = parseVersionTag(rs[i].ref)
+    if (ok) {
+      out = append(out, Requirement{ name: rs[i].name, min: v })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Every version-shaped requirement any ALREADY-locked dependency's own
+// transitive `requires` states for `name` — the other half of "the current
+// project's requirements" ticket #1734 step 3 asks to feed the resolver,
+// alongside the dependency being added itself.
+function pmExistingRequirementsFor(entries: []LockEntry, name: string): []Requirement {
+  let out = []Requirement(0)
+  let i = 0
+  while (i < len(entries)) {
+    let j = 0
+    while (j < len(entries[i].requires)) {
+      let r = entries[i].requires[j]
+      if (r.name == name) {
+        let (v, ok) = parseVersionTag(r.ref)
+        if (ok) {
+          out = append(out, Requirement{ name: name, min: v })
+        }
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Fails if some already-locked dependency's own transitive requirements
+// demand a HIGHER version of `name` than `ref` — MVS's rule (spec §17.7 point
+// 2: the resolved version is never lower than the highest of all
+// requirements). A non-version `ref` (branch/sha) has nothing for MVS to
+// arbitrate and always passes.
+function checkVersionConflict(lockPath: string, name: string, ref: string, depRequires: []LockRequire): ()! {
+  let (reqVersion, isVersion) = parseVersionTag(ref)
+  if (!isVersion) {
+    return
+  }
+  let existing = readLock(lockPath)?
+  let transitive = pmExistingRequirementsFor(existing, name)
+
+  let graph = ReqGraph{
+    rootRequires: append(transitive, Requirement{ name: name, min: reqVersion }),
+    modules: [ModuleReqs{ name: name, version: reqVersion, requires: pmToRequirements(depRequires) }],
+  }
+  let resolved = resolveMVS(graph)
+  let (finalVer, found) = resolved[name]
+  if (found && versionLess(reqVersion, finalVer)) {
+    fail newError(
+      "bit add: ${name}@${ref} conflicts with a higher transitive requirement (v${finalVer.major}.${finalVer.minor}.${finalVer.patch} needed) — add that version instead",
+    )
+  }
+}
+
+// ---- bit.json / bit.lock writes -----------------------------------------
+
+// Rewrites `<projectDir>/bit.json`'s `dependencies.<name>` entry to
+// `specRef`, through the CST edit layer only — every other byte of the file
+// (comments, formatting, every other entry) survives untouched. Fails rather
+// than guessing if the project has no `bit.json` at all: `bit add` adds TO a
+// project, it does not scaffold one (that is `bit init`'s job, out of scope
+// here).
+function rewriteManifest(projectDir: string, name: string, specRef: string): ()! {
+  let path = pmJoin(projectDir, "bit.json")
+  if (!exists(path)) {
+    fail newError("bit add: ${path} does not exist — run inside a project with a bit.json")
+  }
+  let src = readFile(path)?
+  let root = cstParse(src)?
+  let updated = cstSetStringPath(root, ["dependencies", name], specRef)?
+  writeFile(path, cstPrint(updated))?
+}
+
+// `entries` with `name`'s entry replaced (or appended, if absent) by a fresh
+// one built from this run's fetch — bit.lock is fully machine-owned, so the
+// whole entry is regenerated rather than patched field-by-field.
+function upsertLockEntry(entries: []LockEntry, name: string, url: string, commit: string, requires: []LockRequire): []LockEntry {
+  let out = []LockEntry(0)
+  let replaced = false
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].name == name) {
+      out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires })
+      replaced = true
+    } else {
+      out = append(out, entries[i])
+    }
+    i = i + 1
+  }
+  if (!replaced) {
+    out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires })
+  }
+  return out
+}
