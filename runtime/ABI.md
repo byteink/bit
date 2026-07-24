@@ -833,6 +833,8 @@ defined exactly once).
 | `bit_rt_os_exit`      | `(code: i64) -> noreturn` (§19)                        |
 | `bit_rt_os_run`       | `(path: *const RtBytes) -> i64` (§19)                  |
 | `bit_rt_os_run_test`  | `(path: *const RtBytes, idx: i64) -> i64` (§19)        |
+| `bit_rt_os_run_bounded` | `(path: *const RtBytes, timeout_ms: i64) -> i64` (§19) |
+| `bit_rt_os_run_test_bounded` | `(path: *const RtBytes, idx: i64, timeout_ms: i64) -> i64` (§19) |
 | `bit_rt_host_target`  | `() -> i64` (§19)                                      |
 | `bit_rt_auxv`         | `() -> i64` (§19)                                      |
 | `bit_rt_net_listen`   | `(host: *const RtBytes, port: i64) -> i64` (§20)       |
@@ -1237,6 +1239,8 @@ bit_rt_os_self_exe()       -> *const RtBytes   // own path, symlinks resolved; "
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
 bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure
 bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i
+bit_rt_os_run_bounded(path, timeout_ms)      -> i64  // os_run, killed if it outlives timeout_ms
+bit_rt_os_run_test_bounded(path, i, timeout_ms) -> i64  // os_run_test, same bound
 bit_rt_host_target()       -> i64              // host BuildTarget ordinal (0/1/2)
 bit_rt_auxv()              -> i64              // ELF auxv address; 0 when none
 ```
@@ -1271,6 +1275,42 @@ through it to find `PT_TLS` and size a spawned thread's TLS block.
 prepended to the child's environment (first match wins, so it overrides any
 inherited value). `bit test` calls it once per discovered test so the test
 binary's synthetic `main` (compiler/testgen.bit) dispatches to test `idx`.
+
+**`bit_rt_os_run_bounded`/`bit_rt_os_run_test_bounded` are `os_run`/`os_run_test`
+with a wall-clock deadline (#1744).** `os_run`'s synchronous `waitpid` blocks the
+calling green thread forever if the child never exits, exactly the hazard
+`tests/proc.zig` was built to close for the Zig test harnesses (#1637/#1652) —
+and one a Bit-native harness (#1591) needs closed the same way, since nothing
+else in this ABI lets Bit code bound a subprocess wait. `os_run`/`os_run_test`
+themselves are unchanged: `bit run`/`bit test` still depend on their unbounded
+semantics for real user programs, so the bound is a new, separate primitive
+rather than an added argument to the existing two.
+
+Same fork+exec as `os_run`, but the parent polls `waitpid(WNOHANG)` on a
+`sched.sleepNs`-paced interval instead of blocking, checking the monotonic
+clock (`sched.monoNs`, ABI.md §18's layer) against a deadline resolved from
+`timeout_ms` once, before the first poll — the same "one absolute deadline,
+not a per-iteration timeout" shape `tests/proc.zig` uses, so a chatty or
+CPU-bound child cannot restart the clock. If the deadline elapses before the
+child exits, the parent `SIGKILL`s it and reaps it before returning, so a timed-
+out call never leaves a zombie or a stray process. Result encoding (three
+outcomes in one `i64`, no separate signal channel):
+
+```
+ >= 0     child exited normally with this code (0-255)
+ -1       spawn failure (fork/exec/wait error) — same sentinel as os_run
+ -2       timed out: the deadline elapsed, so the child was SIGKILLed and reaped
+ <= -100  child was killed by a signal observed during a poll; signal number
+          is -(result) - 100 (e.g. -109 = killed by SIGKILL from outside)
+```
+
+`-2` and `<= -100` stay distinct on purpose: `-2` means the *runtime* killed the
+child on a budget, `<= -100` means something else killed it first. `timeout_ms`
+is clamped to one hour (`os_run_bounded_max_ms`), mirroring `tests/proc.zig`'s
+`max_timeout_s` clamp, so a caller typo cannot reinstate an unbounded wait; the
+poll loop's iteration count is bounded by that clamp divided by the poll
+interval (Power of 10 rule 2) rather than an open-ended `while (true)` — the
+deadline check inside the loop is what actually ends every real call.
 
 **`hostTarget()` and `auxv()` are seed `prim_rt_fns` entries — the CALLER side
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and

@@ -1225,6 +1225,158 @@ export fn bit_rt_os_run_test(path: *const RtBytes, idx: i64) callconv(.c) i64 {
     }
 }
 
+/// Ceiling on `bit_rt_os_run_bounded`/`bit_rt_os_run_test_bounded`'s `timeout_ms`
+/// argument (ABI.md §19): one hour. Mirrors `tests/proc.zig`'s `max_timeout_s`
+/// clamp — a caller's typo must not reinstate an unbounded wait — and gives the
+/// poll loop below a compile-time-provable iteration ceiling (Power of 10 rule
+/// 2) instead of an open-ended `while (true)`.
+const os_run_bounded_max_ms: i64 = 3_600_000;
+
+/// Poll interval for the `waitpid(WNOHANG)` loop below. Small enough that a 2s
+/// caller bound is honored within a couple percent; large enough not to spin a
+/// core. `sched.sleepNs` — never a busy loop — pays the cost.
+const os_run_poll_ns: u64 = 2 * std.time.ns_per_ms;
+
+/// Worst-case number of polls: the clamp ceiling divided by the poll interval,
+/// plus slack. A hard ceiling on the loop below, satisfying Power of 10 rule 2;
+/// the monotonic-clock deadline check inside the loop is what actually ends it
+/// on every real call, this only bounds it if the clock is ever wrong.
+const os_run_max_polls: i64 = @divTrunc(os_run_bounded_max_ms * std.time.ns_per_ms, @as(i64, @intCast(os_run_poll_ns))) + 16;
+
+/// Shared fork+exec+bounded-wait body for `bit_rt_os_run_bounded` and
+/// `bit_rt_os_run_test_bounded` (ABI.md §19) — the two wrappers differ only in
+/// the `envp` they build (test prepends `BIT_TEST_INDEX`), so the poll-and-
+/// classify logic lives once here rather than quadruplicated across
+/// linux/darwin x run/run_test the way the unbounded pair above already is.
+///
+/// Result encoding (ABI.md §19):
+///   >= 0     child exited normally with this code (0-255)
+///   -1       spawn failure (fork/exec/wait error) — same sentinel as the
+///            unbounded `bit_rt_os_run`
+///   -2       timed out: the deadline elapsed before the child exited, so it
+///            was SIGKILLed and reaped
+///   <= -100  child was killed by a signal; signal number = -(result) - 100
+///
+/// fork + immediate exec is still the only work between fork and exec (same
+/// async-signal-safety argument as `bit_rt_os_run`); the polling happens in the
+/// parent only, after exec has already replaced the child's image.
+fn osRunBoundedImpl(
+    p: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    timeout_ms: i64,
+) i64 {
+    const clamped_ms: i64 = @max(0, @min(timeout_ms, os_run_bounded_max_ms));
+    const deadline = sched.monoNs() + @as(u64, @intCast(clamped_ms)) * std.time.ns_per_ms;
+    switch (builtin.os.tag) {
+        .linux => {
+            const forked: isize = @bitCast(std.os.linux.fork());
+            if (forked < 0) return -1;
+            if (forked == 0) {
+                _ = std.os.linux.execve(p, argv, envp);
+                rawExit(127);
+            }
+            const pid: std.os.linux.pid_t = @intCast(forked);
+            var status: u32 = 0;
+            var polls: i64 = 0;
+            while (polls <= os_run_max_polls) : (polls += 1) { // bounded (Power of 10)
+                const w: isize = @bitCast(std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG));
+                if (w == @as(isize, pid)) {
+                    if (std.os.linux.W.IFEXITED(status)) return @intCast(std.os.linux.W.EXITSTATUS(status));
+                    if (std.os.linux.W.IFSIGNALED(status)) return -(100 + @as(i64, @intFromEnum(std.os.linux.W.TERMSIG(status))));
+                    return -1;
+                }
+                if (w < 0) {
+                    if (@as(usize, @intCast(-w)) != @intFromEnum(std.os.linux.E.INTR)) return -1;
+                    continue; // EINTR before even one WNOHANG poll landed; retry
+                }
+                if (sched.monoNs() >= deadline) {
+                    _ = std.os.linux.kill(pid, std.os.linux.SIG.KILL);
+                    var reap: u32 = 0;
+                    _ = std.os.linux.waitpid(pid, &reap, 0); // blocking reap of a dying child
+                    return -2;
+                }
+                sched.sleepNs(os_run_poll_ns);
+            }
+            _ = std.os.linux.kill(pid, std.os.linux.SIG.KILL);
+            var reap: u32 = 0;
+            _ = std.os.linux.waitpid(pid, &reap, 0);
+            return -2;
+        },
+        else => {
+            const pid = std.c.fork();
+            if (pid < 0) return -1;
+            if (pid == 0) {
+                _ = std.c.execve(p, argv, envp);
+                rawExit(127);
+            }
+            var status: c_int = 0;
+            var polls: i64 = 0;
+            while (polls <= os_run_max_polls) : (polls += 1) { // bounded (Power of 10)
+                const w = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+                if (w == pid) {
+                    const us: u32 = @bitCast(status);
+                    if (std.c.W.IFEXITED(us)) return @intCast(std.c.W.EXITSTATUS(us));
+                    if (std.c.W.IFSIGNALED(us)) return -(100 + @as(i64, @intFromEnum(std.c.W.TERMSIG(us))));
+                    return -1;
+                }
+                if (w < 0) return -1;
+                if (sched.monoNs() >= deadline) {
+                    _ = std.c.kill(pid, std.c.SIG.KILL);
+                    var reap: c_int = 0;
+                    _ = std.c.waitpid(pid, &reap, 0); // blocking reap of a dying child
+                    return -2;
+                }
+                sched.sleepNs(os_run_poll_ns);
+            }
+            _ = std.c.kill(pid, std.c.SIG.KILL);
+            var reap: c_int = 0;
+            _ = std.c.waitpid(pid, &reap, 0);
+            return -2;
+        },
+    }
+}
+
+/// `bit_rt_os_run_bounded(path, timeout_ms)` (ABI.md §19): like `bit_rt_os_run`,
+/// but kills and reports the child rather than blocking forever once
+/// `timeout_ms` wall-clock milliseconds pass. Built for a Bit-native test
+/// harness (#1591) that spawns a compiled `bit`/fixture binary and must bound
+/// the wait the way `tests/proc.zig` already bounds every subprocess spawn in
+/// the Zig harnesses it will replace (#1637/#1652): a hung child must become a
+/// distinct `timed_out` outcome, never a stalled caller.
+export fn bit_rt_os_run_bounded(path: *const RtBytes, timeout_ms: i64) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    const child_argv = [_:null]?[*:0]const u8{p};
+    return osRunBoundedImpl(p, &child_argv, g_envp, timeout_ms);
+}
+
+/// `bit_rt_os_run_test_bounded(path, idx, timeout_ms)` (ABI.md §19): like
+/// `bit_rt_os_run_test`, with the same bounded wait as `bit_rt_os_run_bounded`.
+export fn bit_rt_os_run_test_bounded(path: *const RtBytes, idx: i64, timeout_ms: i64) callconv(.c) i64 {
+    var buf: [max_path]u8 = undefined;
+    const p = pathZ(path, &buf) orelse return -1;
+    const child_argv = [_:null]?[*:0]const u8{p};
+
+    var idx_buf: [40]u8 = undefined;
+    const idx_str = std.fmt.bufPrintZ(&idx_buf, "BIT_TEST_INDEX={d}", .{idx}) catch return -1;
+
+    // child env = BIT_TEST_INDEX :: inherited, same bounded copy as
+    // `bit_rt_os_run_test` (Power of 10 rule 3).
+    const max_env = 1024;
+    var envp: [max_env + 2]?[*:0]const u8 = undefined;
+    envp[0] = idx_str.ptr;
+    var n: usize = 0;
+    while (g_envp[n]) |e| : (n += 1) {
+        if (n + 1 >= max_env) break;
+        envp[n + 1] = e;
+    }
+    envp[n + 1] = null;
+    const child_envp: [*:null]?[*:0]const u8 = @ptrCast(&envp);
+
+    return osRunBoundedImpl(p, &child_argv, child_envp, timeout_ms);
+}
+
 /// `bit_rt_host_target()` (ABI.md §19): the BuildTarget ordinal of the host this
 /// binary runs on — 0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos, matching
 /// compiler/main.bit's BuildTarget enum. This archive is compiled once per
@@ -2422,6 +2574,58 @@ test "os_run: launches a child and returns its exit code" {
     // the child's own "exit code"), never hanging or corrupting the parent.
     const missing = RtBytes{ .ptr = "/nonexistent/bit-os-run".ptr, .len = "/nonexistent/bit-os-run".len };
     try testing.expectEqual(@as(i64, 127), bit_rt_os_run(&missing));
+}
+
+test "os_run_bounded: a fast exit returns its real exit code, not a false timeout" {
+    const empty = [_:null]?[*:0]const u8{};
+    g_envp = &empty;
+    const yes = RtBytes{ .ptr = "/usr/bin/true".ptr, .len = "/usr/bin/true".len };
+    const start = sched.monoNs();
+    const result = bit_rt_os_run_bounded(&yes, 2000);
+    const elapsed_ms = (sched.monoNs() - start) / std.time.ns_per_ms;
+    try testing.expectEqual(@as(i64, 0), result);
+    try testing.expect(elapsed_ms < 1000); // real work is milliseconds; nowhere near the 2s bound
+}
+
+test "os_run_bounded: a hung child is killed and reported timed out within the bound" {
+    // `os_run`'s ABI has no argv (ABI.md §19: `path` only), so a hang fixture
+    // must be a standalone zero-arg executable rather than e.g. `sh -c '...'`.
+    // A shebang script is exactly that: the kernel resolves the interpreter on
+    // exec, so `path` alone is enough to launch an infinite loop.
+    const empty = [_:null]?[*:0]const u8{};
+    g_envp = &empty;
+
+    const pid = switch (builtin.os.tag) {
+        .linux => std.os.linux.getpid(),
+        else => std.c.getpid(),
+    };
+    var path_buf: [64]u8 = undefined;
+    const script_path = std.fmt.bufPrintZ(&path_buf, "/tmp/bit_rt_test_loop_{d}.sh", .{pid}) catch unreachable;
+    const path_rt = RtBytes{ .ptr = script_path.ptr, .len = script_path.len };
+    defer _ = bit_rt_fs_remove(&path_rt);
+
+    const fd = bit_rt_fs_open(&path_rt, true);
+    try testing.expect(fd >= 0);
+    const script = "#!/bin/sh\nwhile :; do :; done\n";
+    const body = RtBytes{ .ptr = script.ptr, .len = script.len };
+    try testing.expectEqual(@as(i64, @intCast(script.len)), bit_rt_fs_write(fd, &body));
+    try testing.expectEqual(@as(i64, 0), bit_rt_fs_close(fd));
+    try testing.expectEqual(@as(i64, 0), bit_rt_fs_chmod(&path_rt, 0o755));
+
+    const timeout_ms: i64 = 200;
+    const start = sched.monoNs();
+    const result = bit_rt_os_run_bounded(&path_rt, timeout_ms);
+    const elapsed_ms: i64 = @intCast((sched.monoNs() - start) / std.time.ns_per_ms);
+    try testing.expectEqual(@as(i64, -2), result); // timed_out sentinel, not a hang
+    try testing.expect(elapsed_ms >= timeout_ms);
+    try testing.expect(elapsed_ms < timeout_ms + 3000); // killed promptly, not left hanging
+}
+
+test "os_run_test_bounded: the BIT_TEST_INDEX variant is bounded too" {
+    const empty = [_:null]?[*:0]const u8{};
+    g_envp = &empty;
+    const yes = RtBytes{ .ptr = "/usr/bin/true".ptr, .len = "/usr/bin/true".len };
+    try testing.expectEqual(@as(i64, 0), bit_rt_os_run_test_bounded(&yes, 3, 2000));
 }
 
 test "boot: spawn and channel round-trip through the ABI's exported symbols" {
