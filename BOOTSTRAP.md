@@ -135,39 +135,61 @@ against the seed — once the seed is retired there is no "stage2" built by it t
 compare against. The meaningful property instead is self-reproducibility: the
 current self-hosted `bit` (stageA) builds `selfhost/` to produce stageB, and
 stageB builds `selfhost/` again to produce stageC. `stageB == stageC` is the
-fixed point. Verified on aarch64-macos:
+fixed point. Verified with a real `sha256sum` + `cmp` on all three required
+targets:
 
-```
-stageB (stageA built selfhost): f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a
-stageC (stageB built selfhost): f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a
-FIXED POINT OK — the self-hosted compiler reproducibly builds itself.
-```
+| Target | Host | stageB == stageC (sha256) |
+|--------|------|----------------------------|
+| aarch64-macos | native | `f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a` |
+| aarch64-linux | docker `bit-zig-0.16.0-arm64native` | `f8b523c4d4ddf56973a408cba0515f3e7f92b31189bb555edc5647755a07dcfa` |
+| x86_64-linux | real hardware (hl-master), docker `bit-zig-0.16.0-amd64` | `26a64f2b4976bf1fdb215ae1a3b4603ef20923a031d7b510618364aeda17d435` |
+
+(The script's own `shasum` call silently no-ops on Linux — no `shasum` binary
+there — so the aarch64-linux/x86_64-linux numbers above were confirmed with an
+explicit `sha256sum` + `cmp` outside the script, not trusted from its own
+"FIXED POINT OK" line, which prints even when both sides hash to the empty
+string. Worth hardening the script separately.)
 
 **The #1332 differential harness** (`scripts/selfhost-diffall.sh`), which
 discovers and runs the whole `selfhost-*.sh` family so no differential can be
-forgotten, is green end to end on aarch64-macos:
+forgotten:
 
-```
-diffall: PASS=15 FAIL=0 INCONCLUSIVE=0 TIMEOUT=0 ABSENT=0 (of 15)
-diffall: GREEN — every differential in the family agrees.
-```
+| Target | Verdict |
+|--------|---------|
+| aarch64-macos | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN |
+| aarch64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN |
+| x86_64-linux | `PASS=14 FAIL=1 (selfhost-difffmt.sh) INCONCLUSIVE=0` — see below |
 
 That covers diffast, diffcheck, diffdiags, diffdoc, diffexamples (the full
 examples/ corpus, compiled and diffed against the seed), difffmt, diffir,
 diffiropt, diffsafepoints, difftests, difftokens, difftypes, diffverdict,
-fixpoint, and fuzzdiff. `imports [selfhost]` (`tests/imports.zig`, a separate
-`zig build test` step) also reported clean: 94/94 projects OK, 0 regressions.
+fixpoint, and fuzzdiff. `diffsafepoints` needs `objdump`, absent from both
+Linux docker images by default (`apt-get install binutils` fixes it; both
+runs above are post-fix, real MATCH=326/MISMATCH=0 results, not the
+INCONCLUSIVE the images give out of the box). `imports [selfhost]`
+(`tests/imports.zig`, a separate `zig build test` step) reported clean on
+aarch64-macos: 94/94 projects OK, 0 regressions.
 
-**Not yet verified this session:** the fixed-point and differential runs above
-are aarch64-macos only — aarch64-linux and x86_64-linux (via the docker/
-hl-master topology) still need a pass before this gate can claim the
-three-target verify bullet literally. The general `zig build test` run (the
-whole Zig-side suite, including runtime/scheduler/GC unit tests unrelated to
-self-hosting) was still in flight when this was written; CI's `.github/
-workflows/ci.yml` already runs `zig build`/`zig build test` natively per
-matrix arch (ubuntu, macos) followed by the self-host differential scripts —
-whether that already satisfies "CI's primary build switches to the self-hosted
-compiler" or needs restructuring is an open call for whoever closes #365.
+**x86_64-linux real finding: `bit fmt --check` segfaults on non-trivial
+files** — filed as #1761, blocking this gate. Repro: `zig-out/bin/bit fmt
+--check selfhost/lexer.bit` under `bit-zig-0.16.0-amd64` → SIGSEGV, exit 139,
+in 0.02s (not a hang — `selfhost-difffmt.sh`'s own 20s-per-file timeout
+mis-reports the crash as a "timeout", worth fixing separately). Confirmed on
+4 files (`selfhost/lexer.bit`, `selfhost/check.bit`, `runtime/gc/stackmap.bit`,
+`stdlib/http/h2.bit`); confirmed the same 4 files do **not** crash on either
+aarch64-macos or aarch64-linux (`fmt --check` runs clean or returns the normal
+non-crash "not formatted" exit code). Genuinely x86_64-only; not a
+stack-ulimit issue (`ulimit -s 65536` made no difference). This is exactly the
+kind of defect the three-target verify bullet exists to catch — everything
+else in this gate would have shipped clean without ever exercising x86_64 for
+real.
+
+CI's `.github/workflows/ci.yml` already runs `zig build`/`zig build test`
+natively per matrix arch (ubuntu, macos) followed by the self-host
+differential scripts — whether that already satisfies "CI's primary build
+switches to the self-hosted compiler" or needs restructuring, and whether it
+should gain an x86_64-specific job now that #1761 shows aarch64-only CI can
+miss a real crash, is an open call for whoever closes #365.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.
