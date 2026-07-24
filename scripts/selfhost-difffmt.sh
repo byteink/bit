@@ -47,7 +47,12 @@ SEED=${DIFFFMT_SEED:-zig-out/bin/bit-seed}
 # a known-disagreeing formatter. The verdict line always names what was actually
 # compared, so an overridden run cannot be quoted as a plain one.
 BIT2=${DIFFFMT_BIT:-zig-out/bin/bit}
-TIMEOUT=${DIFFFMT_TIMEOUT:-20}
+# 20s was too tight on slower hardware: #1761's own verification needed
+# DIFFFMT_TIMEOUT=40 on hl-master (older Skylake x86_64) to format
+# selfhost/lower.bit (6867 lines, ~23s wall there) without a false
+# TIMEOUT/INCONCLUSIVE on an otherwise-correct, just-slow, result. 45s keeps a
+# margin above that measured worst case.
+TIMEOUT=${DIFFFMT_TIMEOUT:-45}
 
 for bin in "$SEED" "$BIT2"; do
   [ -x "$bin" ] || { echo "difffmt: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
