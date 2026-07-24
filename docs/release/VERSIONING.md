@@ -62,7 +62,7 @@ one, without recompiling.
 
 - **Breaking**: changing an object header layout, a stack map encoding, or
   a `spawn`/`chan` call signature. Example: changing the GC object header
-  from a 8-byte type-tag word to a 4-byte tag + 4-byte flags split — every
+  from an 8-byte type-tag word to a 4-byte tag + 4-byte flags split — every
   binary compiled against the old header layout misreads object metadata
   and corrupts on next GC cycle.
 - **Additive**: a new runtime entry point that doesn't touch any existing
