@@ -4250,9 +4250,6 @@ function arithOpFor(fc: FnCtx, base: int, ty: int): Op {
   return binOpFor(base, isFloat, signed)
 }
 
-// Lowers an assignment to a simple local `x`: `x = e` SSA-reassigns the local's
-// value; `x op= e` reads it, applies the base op, and reassigns. ponytail:
-// single simple-ident target only; field/index lvalues land next.
 // Lowers `s.f = v` to `field_set %s[offset] = %v` at the field's byte offset.
 // ponytail: inline-array fields (copy semantics) deferred.
 function lowerFieldStore(fc: FnCtx, lhs: int, rhs: int) {
@@ -4346,6 +4343,182 @@ function lowerIndexStore(fc: FnCtx, lhs: int, rhs: int) {
   builderEmit(fc.b, ins)
 }
 
+// The lvalue shapes a read-modify-write target (`++`/`--`/compound-assign) can
+// take (SPEC §13.1's `lhs = IDENT | index | member`). Mirrors the seed's
+// resolveLvalue/readLvalue/writeLvalue triple (seed/lower.zig ~1682-1837) so
+// `x++`, `p.n++`, `xs[0] += 1` and `m[k]++` all route through one place
+// instead of three independent hand-rolled arms.
+enum LvKind {
+  Local,
+  Global,
+  Field,
+  Elem,
+  MapElem,
+}
+
+struct Lvalue {
+  kind: LvKind,
+  envIdx: int,   // Local: env slot index.
+  recv: int,     // Global: cell address. Field: struct receiver. Elem/MapElem: collection.
+  ty: int,       // Global/Field/Elem: cell/field/element type. MapElem: value type.
+  offset: int,   // Global/Field: byte offset (0 for Global).
+  index: int,    // Elem: index SSA value. MapElem: key SSA value.
+  isSlice: bool, // Elem only: true for a slice element, false for a fixed array.
+}
+
+// A stub Lvalue for a failed resolution; its fields are never read because
+// every caller checks fc.failed immediately after resolveLvalue.
+function invalidLvalue(): Lvalue {
+  return Lvalue{ kind: LvKind.Local, envIdx: -1, recv: 0, ty: 0, offset: 0, index: 0, isSlice: false }
+}
+
+// Classifies a read-modify-write target into its lvalue shape, evaluating the
+// base receiver and any index/key expression exactly once so the caller's
+// read and write share the same SSA values — `m[f()]++` must call `f` once,
+// not twice.
+function resolveLvalue(fc: FnCtx, node: int): Lvalue {
+  let n = getNode(fc.c.tree, node)
+  if (n.tag == Tag.Ident) {
+    let name = fc.c.source[n.span.start:n.span.end]
+    let idx = envIndex(fc, name)
+    if (idx != -1) {
+      return Lvalue{ kind: LvKind.Local, envIdx: idx, recv: 0, ty: 0, offset: 0, index: 0, isSlice: false }
+    }
+    // Not a local: a module-level `let` (§11.11). Its cell is written through
+    // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
+    let sym = moduleGlobalSym(fc, name)
+    if (sym == "") {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let addr = emitGlobalAddrVal(fc, sym)
+    return Lvalue{ kind: LvKind.Global, envIdx: -1, recv: addr, ty: nodeType(fc, node), offset: 0, index: 0, isSlice: false }
+  }
+  if (n.tag == Tag.Member) {
+    let mk = kidsOf(fc.c.tree, node)
+    let recvTy = nodeType(fc, mk[0])
+    if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let decl = structDeclOf(fc.c, recvTy)
+    if (decl == 0) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let oc = typeOwner(fc.c, recvTy)
+    let fields = structFieldNodes(oc, decl)
+    let mn = getNode(fc.c.tree, mk[1])
+    let fidx = fieldIndexByName(oc, fields, fc.c.source[mn.span.start:mn.span.end])
+    if (fidx == -1) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let fty = typeFromNode(oc, kidsOf(oc.tree, fields[fidx])[1])
+    // Inline-array fields are copy semantics, not a scalar lvalue — matches
+    // lowerFieldStore's deferral.
+    if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    // Substituted so a generic field's declared `T` is laid out at the
+    // instantiation's real argument width; must stay in step with the
+    // matching field_get/field_set in lowerFieldAccess/lowerFieldStore (#1565).
+    let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, recvTy))
+    let recv = lowerExpr(fc, mk[0])
+    if (fc.failed) {
+      return invalidLvalue()
+    }
+    return Lvalue{ kind: LvKind.Field, envIdx: -1, recv: recv, ty: fieldAccessType(fc, oc, fields[fidx], node), offset: layout.offsets[fidx], index: 0, isSlice: false }
+  }
+  if (n.tag == Tag.Index) {
+    let k = kidsOf(fc.c.tree, node)
+    let recvTy = defaultType(fc.c, nodeType(fc, k[0]))
+    let rd = fc.c.ctx.types[recvTy]
+    if (rd.kind == TypeKind.Map) {
+      let recv = lowerExpr(fc, k[0])
+      let key = lowerExpr(fc, k[1])
+      if (fc.failed) {
+        return invalidLvalue()
+      }
+      return Lvalue{ kind: LvKind.MapElem, envIdx: -1, recv: recv, ty: rd.mapVal, offset: 0, index: key, isSlice: false }
+    }
+    let isSlice = rd.kind == TypeKind.Slice
+    let recv = lowerExpr(fc, k[0])
+    let idx = lowerExpr(fc, k[1])
+    if (fc.failed) {
+      return invalidLvalue()
+    }
+    let elemTy = defaultType(fc.c, nodeType(fc, node))
+    return Lvalue{ kind: LvKind.Elem, envIdx: -1, recv: recv, ty: elemTy, offset: 0, index: idx, isSlice: isSlice }
+  }
+  fc.failed = true
+  return invalidLvalue()
+}
+
+// Emits the load for a resolved lvalue.
+function readLvalue(fc: FnCtx, lv: Lvalue): int {
+  if (lv.kind == LvKind.Local) {
+    return fc.env[lv.envIdx].value
+  }
+  if (lv.kind == LvKind.Global || lv.kind == LvKind.Field) {
+    let ins = mkInstr(Op.FieldGet, lv.ty)
+    ins.lhs = lv.recv
+    ins.ival = lv.offset
+    return builderEmit(fc.b, ins)
+  }
+  if (lv.kind == LvKind.Elem) {
+    if (lv.isSlice) {
+      let ins = mkInstr(Op.RtCall, lv.ty)
+      ins.name = "slice_get"
+      ins.args = [lv.recv, lv.index]
+      return emitRtCall(fc, ins)
+    }
+    let ins = mkInstr(Op.IndexGet, lv.ty)
+    ins.lhs = lv.recv
+    ins.rhs = lv.index
+    return builderEmit(fc.b, ins)
+  }
+  // MapElem
+  return emitMapGet(fc, lv.ty, lv.recv, lv.index)
+}
+
+// Emits the store for a resolved lvalue.
+function writeLvalue(fc: FnCtx, lv: Lvalue, val: int) {
+  if (lv.kind == LvKind.Local) {
+    fc.env[lv.envIdx].value = val
+    return
+  }
+  if (lv.kind == LvKind.Global || lv.kind == LvKind.Field) {
+    let ins = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    ins.lhs = lv.recv
+    ins.ival = lv.offset
+    ins.rhs = val
+    builderEmit(fc.b, ins)
+    return
+  }
+  if (lv.kind == LvKind.Elem) {
+    if (lv.isSlice) {
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = "slice_set"
+      ins.args = [lv.recv, lv.index, val]
+      emitRtCall(fc, ins)
+      return
+    }
+    let ins = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+    ins.lhs = lv.recv
+    ins.rhs = lv.index
+    ins.ival = val
+    builderEmit(fc.b, ins)
+    return
+  }
+  // MapElem
+  let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  ins.name = "map_set"
+  ins.args = [lv.recv, lv.index, val]
+  emitRtCall(fc, ins)
+}
+
 function lowerAssign(fc: FnCtx, node: int) {
   let opKind = getNode(fc.c.tree, node).main
   let k = kidsOf(fc.c.tree, node)
@@ -4420,6 +4593,36 @@ function lowerAssign(fc: FnCtx, node: int) {
     lowerPtrStore(fc, lhsItems[0], rhsItems[0])
     return
   }
+  // Compound-assign (`+= -= *= /= %= &= |= ^= <<= >>=`, SPEC §13.1): resolve
+  // the target once, read-modify-write it. Covers every lvalue shape — local,
+  // module global, struct field, slice/array index, map entry.
+  if (opKind != int(Kind.Eq)) {
+    let base = compoundBase(opKind)
+    if (base == -1) {
+      fc.failed = true
+      return
+    }
+    let lv = resolveLvalue(fc, lhsItems[0])
+    if (fc.failed) {
+      return
+    }
+    let cur = readLvalue(fc, lv)
+    let ty = nodeType(fc, lhsItems[0])
+    let rhs = lowerExprH(fc, rhsItems[0], ty)
+    if (fc.failed) {
+      return
+    }
+    let op = arithOpFor(fc, base, ty)
+    if (op == Op.BlockParam) {
+      fc.failed = true
+      return
+    }
+    let ins = mkInstr(op, ty)
+    ins.lhs = cur
+    ins.rhs = rhs
+    writeLvalue(fc, lv, builderEmit(fc.b, ins))
+    return
+  }
   if (ln.tag != Tag.Ident) {
     fc.failed = true
     return
@@ -4430,114 +4633,58 @@ function lowerAssign(fc: FnCtx, node: int) {
     // Not a local: a module-level `let` (§11.11). Its cell is written through
     // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
     let wsym = moduleGlobalSym(fc, lname)
-    if (wsym != "" && opKind == int(Kind.Eq)) {
-      // The lvalue's address is materialized BEFORE the right-hand side, which
-      // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
-      // two compilers' IR byte-identical.
-      let waddr = emitGlobalAddrVal(fc, wsym)
-      let wty = nodeType(fc, lhsItems[0])
-      let wv = lowerExprH(fc, rhsItems[0], wty)
-      if (fc.failed) {
-        return
-      }
-      let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-      st.lhs = waddr
-      st.ival = 0
-      st.rhs = wv
-      builderEmit(fc.b, st)
+    if (wsym == "") {
+      fc.failed = true
       return
     }
-    fc.failed = true
-    return
-  }
-  let ty = fc.env[idx].ty
-  if (opKind == int(Kind.Eq)) {
-    let rhsTy = defaultType(fc.c, nodeType(fc, rhsItems[0]))
-    let v = lowerExprH(fc, rhsItems[0], ty)
+    // The lvalue's address is materialized BEFORE the right-hand side, which
+    // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
+    // two compilers' IR byte-identical.
+    let waddr = emitGlobalAddrVal(fc, wsym)
+    let wty = nodeType(fc, lhsItems[0])
+    let wv = lowerExprH(fc, rhsItems[0], wty)
     if (fc.failed) {
       return
     }
-    // A concrete value assigned into an interface-typed local is relabelled.
-    fc.env[idx].value = coerceToIface(fc, v, rhsTy, ty)
-    return
-  }
-  let base = compoundBase(opKind)
-  if (base == -1) {
-    fc.failed = true
-    return
-  }
-  let cur = fc.env[idx].value
-  let rhs = lowerExprH(fc, rhsItems[0], ty)
-  if (fc.failed) {
-    return
-  }
-  let op = arithOpFor(fc, base, ty)
-  if (op == Op.BlockParam) {
-    fc.failed = true
-    return
-  }
-  let ins = mkInstr(op, ty)
-  ins.lhs = cur
-  ins.rhs = rhs
-  fc.env[idx].value = builderEmit(fc.b, ins)
-}
-
-// Lowers `x++` / `x--` on a local: `base` is Plus/Minus. Emits `const_int 1`
-// then the add/sub, and reassigns the local.
-function lowerIncDec(fc: FnCtx, node: int, base: int) {
-  let ln = getNode(fc.c.tree, kidsOf(fc.c.tree, node)[0])
-  if (ln.tag != Tag.Ident) {
-    fc.failed = true
-    return
-  }
-  let iname = fc.c.source[ln.span.start:ln.span.end]
-  let idx = envIndex(fc, iname)
-  if (idx == -1) {
-    // A module-level `let` (§11.11): read the cell, add/sub one, store it back.
-    let isym = moduleGlobalSym(fc, iname)
-    if (isym == "") {
-      fc.failed = true
-      return
-    }
-    let ity = nodeType(fc, kidsOf(fc.c.tree, node)[0])
-    let iop = arithOpFor(fc, base, ity)
-    if (iop == Op.BlockParam) {
-      fc.failed = true
-      return
-    }
-    let iaddr = emitGlobalAddrVal(fc, isym)
-    let ld = mkInstr(Op.FieldGet, ity)
-    ld.lhs = iaddr
-    ld.ival = 0
-    let curv = builderEmit(fc.b, ld)
-    let onei = mkInstr(Op.ConstInt, ity)
-    onei.ival = 1
-    let onev = builderEmit(fc.b, onei)
-    let ar = mkInstr(iop, ity)
-    ar.lhs = curv
-    ar.rhs = onev
-    let nv = builderEmit(fc.b, ar)
     let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-    st.lhs = iaddr
+    st.lhs = waddr
     st.ival = 0
-    st.rhs = nv
+    st.rhs = wv
     builderEmit(fc.b, st)
     return
   }
   let ty = fc.env[idx].ty
-  let cur = fc.env[idx].value
-  let one = mkInstr(Op.ConstInt, ty)
-  one.ival = 1
-  let oneV = builderEmit(fc.b, one)
+  let rhsTy = defaultType(fc.c, nodeType(fc, rhsItems[0]))
+  let v = lowerExprH(fc, rhsItems[0], ty)
+  if (fc.failed) {
+    return
+  }
+  // A concrete value assigned into an interface-typed local is relabelled.
+  fc.env[idx].value = coerceToIface(fc, v, rhsTy, ty)
+}
+
+// Lowers `x++` / `x--` (SPEC §13.1): resolve the target's lvalue, read it,
+// add/sub the constant 1, write the result back. `base` is Plus/Minus.
+function lowerIncDec(fc: FnCtx, node: int, base: int) {
+  let lhs = kidsOf(fc.c.tree, node)[0]
+  let lv = resolveLvalue(fc, lhs)
+  if (fc.failed) {
+    return
+  }
+  let ty = nodeType(fc, lhs)
+  let cur = readLvalue(fc, lv)
   let op = arithOpFor(fc, base, ty)
   if (op == Op.BlockParam) {
     fc.failed = true
     return
   }
+  let one = mkInstr(Op.ConstInt, ty)
+  one.ival = 1
+  let oneV = builderEmit(fc.b, one)
   let ins = mkInstr(op, ty)
   ins.lhs = cur
   ins.rhs = oneV
-  fc.env[idx].value = builderEmit(fc.b, ins)
+  writeLvalue(fc, lv, builderEmit(fc.b, ins))
 }
 
 // Lowers a `while (cond) body`: jump to a header block (loop-carried live locals
