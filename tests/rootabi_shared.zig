@@ -16,9 +16,10 @@ const Dir = std.Io.Dir;
 /// is the largest at ~60 KiB.
 pub const max_source_bytes = 1 << 22;
 
-/// The ABI prefix a ported runtime symbol will claim when #1369/G2 drops the
-/// `_root` infix. Mirrors `tests/rootpins.zig`'s rename.
-pub const pin_prefix = "bit_rt_root_";
+/// The ABI prefix a ported runtime symbol pins under. #1369/G2 dropped the
+/// `_root` infix, so this is now the SAME string as `abi_prefix` — mirrors
+/// `tests/rootpins.zig`'s post-rename `placeholder`/`real` merge.
+pub const pin_prefix = "bit_rt_";
 pub const abi_prefix = "bit_rt_";
 
 /// Upper bound on the runtime source files walked — keeps the walk provably

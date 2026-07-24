@@ -93,11 +93,17 @@ const build_options = @import("build_options");
 const testing = std.testing;
 const Io = std.Io;
 
-/// The placeholder prefix the Stage-2 port pins its ABI functions under, and
-/// the prefix #1369 rewrites it to. Keep both spellings here: when #1369 lands,
-/// `placeholder` becomes `""` and this gate keeps working unchanged, now
-/// checking plain self-reference.
-const placeholder = "bit_rt_root_";
+/// The placeholder prefix the Stage-2 port pinned its ABI functions under,
+/// before #1369's rename. Now that the rename has landed, `placeholder` and
+/// `real` are the SAME string, so `renameOf` is the identity and this gate
+/// checks plain self-reference — the post-rename shape of the same defect.
+///
+/// TRAP: do not set `placeholder = ""` to "finish the job". That leaves
+/// `real = "bit_rt_"` and double-prefixes every check to
+/// `bit_rt_bit_rt_floor`, which matches nothing — a vacuous pass. Both
+/// constants must move together, and post-rename that means both are
+/// `"bit_rt_"`.
+const placeholder = "bit_rt_";
 const real = "bit_rt_";
 
 /// Runtime modules built from Bit that define pinned ABI symbols, each with the

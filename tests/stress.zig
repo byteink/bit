@@ -369,6 +369,30 @@ const collection_line = "[bit-gc] collection ";
 /// collection is given up. See `Oracles.must_not_abandon`.
 const abandoned_line = "[bit-gc] stop-the-world rendezvous expired";
 
+/// The Bit port's counterpart, one SUMMARY line at exit rather than one line
+/// per collection (`runtime/root/{linux,darwin}/boot.bit`'s `statsReport`):
+/// every function on the collection path is `@nosplit`, which admits no
+/// `print`/`extern`/`syscall` (E0075), so `gc.zig`'s per-collection line has no
+/// legal home there, and boot — ordinary Bit, next to the write primitive —
+/// reports the running total once instead. Same oracle, different shape:
+/// `[bit-gc] collections=<n> swept=<n> live=<n> abandoned=<n> om=<n> bad=<n>`.
+const aggregate_prefix = "[bit-gc] collections=";
+
+/// One `<field>=<n>` of the aggregate line, or `null` if the aggregate line is
+/// absent (a Zig-sourced archive's stderr, which uses `collection_line` and
+/// `abandoned_line` instead — the two forms never both appear in one run).
+///
+/// `null` and `0` must stay distinguishable: `null` means "this archive does not
+/// report the field, ask the other form", while `0` is a real reading. Collapsing
+/// them is how an oracle silently stops oracling.
+fn aggregateField(stderr: []const u8, field: []const u8) ?u64 {
+    const line = std.mem.indexOf(u8, stderr, aggregate_prefix) orelse return null;
+    const key = std.mem.indexOfPos(u8, stderr, line, field) orelse return null;
+    const digits_start = key + field.len;
+    const digits_end = std.mem.indexOfAnyPos(u8, stderr, digits_start, " \n") orelse stderr.len;
+    return std.fmt.parseInt(u64, stderr[digits_start..digits_end], 10) catch null;
+}
+
 fn runOnce(
     gpa: std.mem.Allocator,
     run_io: Io,
@@ -422,7 +446,14 @@ fn runOnce(
     // The oracle check. A zero count means every root this program cares about
     // was re-proven live exactly never, so the run above says nothing at all
     // about rooting — regardless of how much it allocated.
-    const collections = std.mem.count(u8, result.stderr, collection_line);
+    // The two forms are per BINARY ARCHIVE, not per compiler (#1584/G3): every
+    // test binary here, however it was compiled, links the one shared
+    // `libbitrt.a` — so once that archive is Bit-sourced, `who` (seed vs
+    // selfhost) says nothing about which line shape to expect. Prefer the
+    // aggregate form (the current shipped runtime's), falling back to the
+    // per-collection count for a Zig-sourced archive elsewhere in the tree.
+    const collections = aggregateField(result.stderr, "collections=") orelse
+        std.mem.count(u8, result.stderr, collection_line);
     if (oracles.must_collect and collections == 0) {
         std.debug.print(
             "stress '{s}' [{s}]: the collector never ran, so this run verified nothing about rooting.\n" ++
@@ -437,7 +468,11 @@ fn runOnce(
     // The opt-in mirror (#1801). Only checked where the program was built to make
     // the defect the sole possible cause — see `Oracles.must_not_abandon`.
     if (oracles.must_not_abandon) {
-        const abandoned = std.mem.count(u8, result.stderr, abandoned_line);
+        // Same archive-shaped split as `collections` above. Reading only the
+        // Zig per-collection line would make this oracle vacuously pass against
+        // a Bit-sourced archive, which never writes that line.
+        const abandoned = aggregateField(result.stderr, "abandoned=") orelse
+            std.mem.count(u8, result.stderr, abandoned_line);
         if (abandoned != 0) {
             std.debug.print(
                 "stress '{s}' [{s}]: {d} collections were ABANDONED against {d} collected, and\n" ++

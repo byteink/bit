@@ -125,7 +125,7 @@ const edges = [_]Edge{
     .{
         .path = "runtime/root",
         .target = .aarch64_macos,
-        .from = "bit_rt_root_init",
+        .from = "bit_rt_init",
         .to = "bit_rt_port_gc_world_bind",
         .why = "rootInit must bind the World/Mutator registry, or the safepoint poll " ++
             "returns at `worldBlockAddr() == 0` and no thread ever registers",
@@ -149,7 +149,7 @@ const edges = [_]Edge{
     .{
         .path = "runtime/stw",
         .target = .aarch64_macos,
-        .from = "bit_rt_root_safepoint",
+        .from = "bit_rt_safepoint",
         .to = "bit_rt_port_stw_safepoint",
         .why = "the naked shim must enter through the pinned live entry, not stwPoll directly",
     },

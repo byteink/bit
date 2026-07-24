@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # g2archive.sh (#1694) — build a Bit-SOURCED libbitrt.a for one target from
-# runtime/, encoding the G2 rename (#1583) + per-module emit + `bit ar`
-# recipe that #1685/#1691/#1692/#1643 each hand-reconstructed this session.
+# runtime/: the per-module emit + `bit ar` recipe that #1685/#1691/#1692/#1643
+# each hand-reconstructed this session. Since G3 (#1584) this IS `zig build
+# libbitrt`'s archive step, not a side tool — the shipped runtime comes from
+# here.
 #
 # Usage: bash scripts/g2archive.sh <x86_64-linux|aarch64-linux|aarch64-macos> <out.a>
 #
-# Works entirely on a private `mktemp -d` scratch copy of `runtime/` taken
-# from `git archive HEAD` — the shared checkout and the shared
-# `zig-out/lib/<target>/libbitrt.a` are never written. Set BIT=<path> to use
-# a `bit` other than `zig-out/bin/bit` (e.g. to rebuild with a fresher seed).
+# Reads the working tree, writes only its own `mktemp -d` scratch and $OUT; the
+# shared `zig-out/lib/<target>/libbitrt.a` is explicitly refused. Set BIT=<path>
+# to use a `bit` other than `zig-out/bin/bit` (e.g. a fresher seed).
 #
 # Three traps this script exists to encode rather than let the next reader
 # rediscover:
 #   1. Each runtime module is a DIRECTORY, not a single file — a lone file
 #      cannot see its siblings (confirmed: building boot.bit alone fails
 #      with 'undefined name' on every helper in its sibling files).
-#   2. `bit_rt_root_start` renames to the literal `@symbol("_start")`, not
+#   2. The process entry is the literal `@symbol("_start")`, never
 #      `bit_rt_start` — the linker hardcodes `_start` as the entry symbol
 #      name (seed/link.zig), so anything else fails MissingEntry.
 #   3. Under zsh, the object list from `find | sort` must go through an
@@ -67,29 +68,30 @@ esac
 SCRATCH=$(mktemp -d) || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 
-mkdir -p "$SCRATCH/src"
-if ! git -C "$REPO_ROOT" archive HEAD -- runtime | tar -x -C "$SCRATCH/src"; then
-  echo "g2archive: git archive of runtime/ failed" >&2
-  exit 1
-fi
-RT="$SCRATCH/src/runtime"
+# Compiled straight out of the checkout. This used to take a `git archive HEAD`
+# scratch copy of runtime/ and apply the G2 rename to it, because the rename
+# could not be written into the shared tree while root.zig still claimed the
+# real ABI names. G2 (#1583) landed that rename in the source, so there is
+# nothing left to rewrite — and reading HEAD instead of the working tree is now
+# actively wrong: this script is `zig build libbitrt`'s archive step, so it
+# would compile committed source and silently ignore every uncommitted runtime
+# edit. That is #1486's stale-archive failure with a new cause. Only the
+# emitted objects go to scratch; the checkout is still never written.
+RT="$REPO_ROOT/runtime"
 
-# --- G2 rename (#1583): drop the temporary `_root` infix from ABI pins. ---
-# The infix exists only because `runtime/root.zig` still claims the real ABI
-# name; this script's whole point is to build as though it did not.
-perl -0777 -i -pe 's/\@symbol\("bit_rt_root_start"\)/\@symbol("_start")/g' \
-  "$RT/root/linux/boot.bit" "$RT/root/darwin/boot.bit" || exit 1
-
-find "$RT" -name '*.bit' -print0 | xargs -0 perl -i -ne \
-  'if (m{^\s*//}) { print; next; } s/\@symbol\("bit_rt_root_/\@symbol("bit_rt_/g; print;' || exit 1
-
-# Rename sanity: zero live (non-comment) bit_rt_root_ pins may survive. This
-# is a pre-flight check on the rename itself, distinct from and cheaper than
-# tests/rootpins.zig's pin-cycle gate (which this script does not run).
+# The rename is a SOURCE property now, so this is a verification rather than a
+# transformation: zero live (non-comment) `bit_rt_root_` pins may exist. Kept
+# because it is the cheap pre-flight for the whole class — `tests/rootpins.zig`
+# proves the pin graph has no cycle, but only after a full build.
 LEFT=$(find "$RT" -name '*.bit' -print0 | xargs -0 grep -n '@symbol("bit_rt_root_' \
   | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l | tr -d ' ')
 if [ "$LEFT" != "0" ]; then
-  echo "g2archive: G2 rename incomplete: $LEFT live bit_rt_root_ pin(s) remain" >&2
+  echo "g2archive: $LEFT live bit_rt_root_ pin(s) remain in runtime/ — the G2" >&2
+  echo "  rename (#1583) is incomplete. Every ABI pin must be its bare" >&2
+  echo "  'bit_rt_<name>'; 'bit_rt_root_start' is the one special case and" >&2
+  echo "  becomes the literal @symbol(\"_start\")." >&2
+  find "$RT" -name '*.bit' -print0 | xargs -0 grep -n '@symbol("bit_rt_root_' \
+    | grep -vE ':[0-9]+:[[:space:]]*//' >&2
   exit 1
 fi
 

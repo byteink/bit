@@ -971,28 +971,58 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz.step);
 
     // `zig build libbitrt`: the runtime archive the static linker (task #345)
-    // consumes, one `libbitrt.a` per target this runtime actually supports.
-    // Fixed target queries, not `-Dtarget` — the point is to produce every
-    // supported target's archive in one invocation regardless of host.
-    // Windows and other architectures are deliberately absent: `sched.zig`
-    // and `root.zig` both `@compileError` outside POSIX x86-64/ARM64 today
-    // (see their module doc comments) — Windows lands when the scheduler
-    // and GC gain Windows support, not before.
+    // consumes. #1584 (G3): built from Bit-compiled objects via
+    // `scripts/g2archive.sh` (#1694's proven, mutation-tested recipe: per-module
+    // `--emit-obj --freestanding` + `bit ar`), not `runtime/root.zig` — this is
+    // the moment the Bit runtime stops being a parallel implementation and
+    // becomes the runtime that ships. One `libbitrt.a` per target Bit itself
+    // can build for. `x86_64-macos` is deliberately ABSENT (it was a 4th entry
+    // before this task): once the archive is compiled FROM Bit, only a target
+    // `seed/main.zig`'s `BuildTarget.parse` accepts can emit its member
+    // objects, and that enum has exactly three members. Keeping the entry
+    // would mean keeping a Zig build input for an archive nothing consumes —
+    // see dist/README.md and dist/package.sh's `RUNTIME_TRIPLES`, which
+    // already excluded it. Windows and other architectures are absent for the
+    // pre-existing reason: the runtime `@compileError`s outside POSIX
+    // x86-64/ARM64 today.
     const libbitrt_step = b.step("libbitrt", "Build libbitrt.a for every target this runtime supports");
+    // Kept as target QUERIES rather than triple strings so the rebuild-cache
+    // gate below (#1796) keeps working unchanged: it needs `zigTriple` for the
+    // install path and a query comparison to pick the host's archive. The
+    // `g2archive.sh` triple is that same `zigTriple` string.
     const libbitrt_targets = [_]std.Target.Query{
         .{ .cpu_arch = .x86_64, .os_tag = .linux },
         .{ .cpu_arch = .aarch64, .os_tag = .linux },
-        .{ .cpu_arch = .x86_64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     };
-    // The host test target always matches one of the four above, so every test
-    // harness reuses that archive to link and execute real binaries under
-    // `zig build test`. Captured in the loop as the runtime `lib`'s emitted
-    // binary (a LazyPath into the build cache, always the fresh archive), not
-    // the install-path string — see `wireLibbitrt`. Stays null (harnesses skip)
-    // if the host is not a supported runtime target. `host_libbitrt_install` is
-    // kept so `zig build test` still populates `zig-out/lib/<triple>/` for the
-    // CLI-path end-to-end tests (link.zig, main.zig) that read it there.
+
+    // A HOST-NATIVE seed to run `g2archive.sh` with, distinct from `exe`
+    // above: `exe` targets whatever `-Dtarget=` selects, and a cross-compiled
+    // seed cannot `exec` on this host (the same reason `selfhost_run`
+    // self-skips on a cross build, below) — but archive assembly must keep
+    // working under `-Dtarget=` regardless, since it is what produces every
+    // target's `libbitrt.a` in one invocation.
+    const rt_builder = b.addExecutable(.{
+        .name = "bit-seed-rt-builder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("seed/main.zig"),
+            .target = b.resolveTargetQuery(.{}),
+            .optimize = optimize,
+        }),
+    });
+    rt_builder.root_module.addOptions("build_options", seed_opts);
+    const rt_builder_install = b.addInstallArtifact(rt_builder, .{
+        .dest_dir = .{ .override = .{ .custom = "bin" } },
+    });
+    const rt_builder_path = b.getInstallPath(.bin, "bit-seed-rt-builder");
+
+    // The one archive of the three every test harness reuses to link and
+    // execute real binaries under `zig build test`. Captured as the archive's
+    // `LazyPath` (into the build cache), not the install-path string — see
+    // `wireLibbitrt`. Stays null (harnesses skip) if the host is not a supported
+    // runtime target. `host_libbitrt_install` is kept so `zig build test` still
+    // populates `zig-out/lib/<triple>/` for the CLI-path end-to-end tests
+    // (link.zig, main.zig) that read it there.
     var host_libbitrt_bin: ?std.Build.LazyPath = null;
     var host_libbitrt_install: ?*std.Build.Step = null;
     // Set only when the gate below actually rebuilds (non-null), so a caller
@@ -1001,14 +1031,13 @@ pub fn build(b: *std.Build) void {
     // recorded once that rebuild succeeds.
     var libbitrt_record_step: ?*std.Build.Step = null;
 
-    // Rebuild-cache gate (#1796): the archive's real inputs today are
-    // `runtime/**/*.zig` (root.zig's import graph); `seed/**` is included too
-    // since the seed compiler becomes the thing reading `runtime/**/*.bit`
-    // once the parked G3 rewrite (Bit objects instead of root.zig) lands —
-    // gating on source freshness rather than on how the archive is assembled
-    // is what lets this survive that rewrite unchanged. `build.zig` and
-    // `.zigversion` are folded in because a flag or toolchain bump can change
-    // the output without touching a single source file.
+    // Rebuild-cache gate (#1796): the archive's inputs are `runtime/**/*.bit`
+    // (the module set `g2archive.sh` compiles) and `seed/**` (the compiler that
+    // reads them). Gating on source freshness rather than on how the archive is
+    // assembled is what let this survive G3's rewrite unchanged — it was written
+    // against `runtime/**/*.zig` and needed no edit when the assembly changed.
+    // `build.zig` and `.zigversion` are folded in because a flag or toolchain
+    // bump can change the output without touching a single source file.
     const libbitrt_fp = fingerprintTree(b, &.{ "runtime", "seed" }, &.{ "build.zig", ".zigversion" }, null);
     var libbitrt_artifact_paths: [libbitrt_targets.len][]const u8 = undefined;
     for (libbitrt_targets, 0..) |q, i| {
@@ -1020,7 +1049,7 @@ pub fn build(b: *std.Build) void {
     if (libbitrt_skip) {
         // Fingerprint unchanged since the last successful build and every
         // archive it produced is still on disk: reuse them untouched instead
-        // of re-running `zig build-lib` + install for all four targets.
+        // of re-running `g2archive.sh` + install for all three targets.
         // `.cwd_relative` carries no step dependency on purpose — nothing
         // writes these files this invocation, so there is no #1229-style race
         // to guard against.
@@ -1032,59 +1061,28 @@ pub fn build(b: *std.Build) void {
     } else {
         var libbitrt_installs: [libbitrt_targets.len]*std.Build.Step = undefined;
         for (libbitrt_targets, 0..) |query, install_idx| {
-            const rt_target = b.resolveTargetQuery(query);
             const triple = query.zigTriple(b.allocator) catch @panic("OOM");
-            // The runtime archive's build settings are fixed regardless of the
-            // top-level `-Doptimize` a user passes: the static linker (#345)
-            // consumes this, and its object reader deliberately handles only the
-            // minimal, no-unwind relocation/section set a stripped ReleaseSmall
-            // runtime produces. ReleaseSmall + strip drops DWARF/`__eh_frame`;
-            // `.unwind_tables = .none` drops `__compact_unwind` (ABI.md §12
-            // promises no backtrace/unwind contract anyway). `.pic = false` on
-            // Linux keeps every code reference a plain absolute/PC-relative reloc
-            // — no GOT/PLT — since a static zero-dynamic-linker ELF never needs
-            // it. Darwin mandates PIC (the toolchain refuses `-fno-PIC`), so the
-            // macOS archives keep it and the linker's Mach-O reader handles the
-            // GOT-page reloc pair that entails.
-            const lib = b.addLibrary(.{
-                .linkage = .static,
-                .name = "bitrt",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("runtime/root.zig"),
-                    .target = rt_target,
-                    .optimize = .ReleaseSmall,
-                    .strip = true,
-                    .unwind_tables = .none,
-                    .pic = if (query.os_tag == .macos) null else false,
-                    // The green-thread context switch (sched.zig) rewrites `rsp` to
-                    // another stack mid-function. The x86-64 red zone — 128 bytes
-                    // below `rsp` that leaf code may use without reserving — is not
-                    // preserved across that stack swap, so a value the compiler
-                    // parked in the outgoing stack's red zone is read back from the
-                    // incoming stack's red zone (garbage). Disable it for the
-                    // runtime; ARM64 has no red zone, so this is x86-64's concern.
-                    .red_zone = false,
-                }),
-            });
-            // Bundle compiler-rt into the archive so the static linker (#345)
-            // finds correct `memcpy`/`memset`/`memmove`/`__divti3` there rather
-            // than us hand-rolling them (a naive Zig `memcpy` recurses: `@memcpy`
-            // lowers back to a `memcpy` call). `runtime/shims.zig` then only has
-            // to supply the two symbols compiler-rt does not: `strlen` and
-            // `getauxval`.
-            lib.bundle_compiler_rt = true;
-            // One section per function/global so the linker's symbol-granularity
-            // dead-strip is sound: without this, a call to a function inside a
-            // shared `.text` is a `.text + offset` section relocation whose
-            // PC-relative addend (offset - 4) lands in the *previous* function's
-            // atom, dropping the real target and misresolving the call. With each
-            // symbol in its own section, a reference names that symbol's own
-            // section at offset 0 (unambiguous), exactly as `--gc-sections` needs.
-            lib.link_function_sections = true;
-            lib.link_data_sections = true;
-            const install = b.addInstallArtifact(lib, .{
-                .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{triple}) } },
-            });
+            // `scripts/g2archive.sh` (#1694) is the ONE recipe for this archive,
+            // and it is a script rather than inline steps here on purpose: four
+            // agents in one session each reconstructed the procedure by hand,
+            // every reconstruction a fresh chance to diverge. It compiles each of
+            // the 21 runtime module DIRECTORIES with `--emit-obj --freestanding`
+            // and assembles them with `bit ar` (not `zig ar`, whose GNU
+            // long-name members the Bit linker rejects). No `bundle_compiler_rt`
+            // and no `.red_zone`/`.pic` knobs appear here because there is no
+            // Zig compilation left to configure: `rtSymbol` emits `bit_rt_*` and
+            // nothing else, so the archive has no compiler-rt surface to supply.
+            const run = b.addSystemCommand(&.{ "bash", "scripts/g2archive.sh", triple });
+            run.setEnvironmentVariable("BIT", rt_builder_path);
+            run.step.dependOn(&rt_builder_install.step);
+            run.expectExitCode(0);
+            // The compiler reads `runtime/**/*.bit` at run time, which is
+            // invisible to the build cache — the same reason `selfhost_run`
+            // carries this. Without it a runtime edit links a stale archive, and
+            // that failure reads as a compiler regression (#1486).
+            run.has_side_effects = true;
+            const archive = run.addOutputFileArg("libbitrt.a");
+            const install = b.addInstallFile(archive, b.fmt("lib/{s}/libbitrt.a", .{triple}));
             libbitrt_step.dependOn(&install.step);
             // Make `zig build test` produce every archive its harnesses read out of
             // `zig-out/lib/`, not just the host's (#1486). Before this only the host
@@ -1092,14 +1090,12 @@ pub fn build(b: *std.Build) void {
             // read whatever an earlier `zig build libbitrt` happened to leave on
             // disk: absent on a clean checkout (they self-skip, asserting nothing)
             // or stale after a runtime edit (they fail, and the failure reads as a
-            // compiler regression). All four targets rather than only the three
-            // read today, so a test that starts reading the fourth is covered by
-            // construction.
+            // compiler regression).
             for (archive_readers.items) |reader| reader.dependOn(&install.step);
 
             libbitrt_installs[install_idx] = &install.step;
             if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
-                host_libbitrt_bin = lib.getEmittedBin();
+                host_libbitrt_bin = archive;
                 host_libbitrt_install = &install.step;
             }
         }
