@@ -87,11 +87,16 @@ try {
     $installDir = Join-Path $BitRoot $installName
     if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
     New-Item -ItemType Directory -Path $BitRoot -Force | Out-Null
-    Expand-Archive -Path $artifactPath -DestinationPath $BitRoot -Force
 
     $binDir = Join-Path $installDir "bin"
-    if (-not (Test-Path (Join-Path $binDir "bit.exe"))) {
-        Die "archive did not contain $installName\bin\bit.exe"
+    try {
+        Expand-Archive -Path $artifactPath -DestinationPath $BitRoot -Force
+        if (-not (Test-Path (Join-Path $binDir "bit.exe"))) {
+            Die "archive did not contain $installName\bin\bit.exe"
+        }
+    } catch {
+        if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
+        throw
     }
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
