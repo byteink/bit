@@ -1,6 +1,6 @@
-// selfhost/pmcli.bit — `bit add` (#1734, epic #1480). Wires together the
-// pieces landed by the sibling package-manager tasks into one end-to-end
-// command:
+// selfhost/pmcli.bit — `bit add` (#1734) and `bit up`/`bit update` (#1735,
+// epic #1480). Wires together the pieces landed by the sibling package-manager
+// tasks into two end-to-end commands:
 //   - selfhost/pmfetch.bit (#1733): parses `gitHost/owner/repo@ref`, resolves
 //     `ref` to a commit sha, fetches it into the content-addressed cache.
 //   - selfhost/pmresolve.bit (#1731): Minimal Version Selection, used here to
@@ -11,10 +11,15 @@
 //     bit.json is ever rewritten — cstParse -> cstSetStringPath -> cstPrint,
 //     never a plain parse-modify-reserialize, so a user's comments and
 //     formatting survive except the one entry actually changed.
+// `bit up [name]` (alias `update`) re-resolves every dependency `bit.json`
+// names (or, with an argument, just that one) against its CURRENT ref —
+// picking up a moved branch/tag's new HEAD — and rewrites bit.lock with the
+// refreshed commit and transitive requirements. `bit.json` itself is never
+// touched: the ref an entry names only changes if the user edits it by hand.
 // No code from a fetched dependency is ever executed: pmfetch.bit already
 // refuses to run anything from a fetched checkout (no build/postinstall
 // scripts), and nothing below adds a new execution path.
-import { CstNode, cstParse, cstPrint, cstSetStringPath } from "std/json"
+import { CstNode, cstParse, cstPrint, cstSetStringPath, Json, jsoncParse, jsonGet as jsonGetC, jsonAsString } from "std/json"
 
 const pmCliDefaultTimeoutMs: int = 30000
 
@@ -69,6 +74,47 @@ function addCmd(a: []string): int {
   return 0
 }
 
+// `bit up [name] [--dir <path>]` / `bit update [name] [--dir <path>]` —
+// `update` is an exact alias, both routed here by main.bit's dispatch. With
+// no `name`, refreshes every dependency `bit.json` names; with one, restricts
+// the refresh to that dependency alone. Returns the process exit code: 2 on a
+// usage error, 1 on a fetch/resolve/write failure, 0 on success.
+function upCmd(a: []string): int {
+  let name = ""
+  let projectDir = "."
+  let ai = 2
+  if (ai < len(a) && a[ai] != "--dir") {
+    name = a[ai]
+    ai = ai + 1
+  }
+  while (ai < len(a)) {
+    if (a[ai] == "--dir" && ai + 1 < len(a)) {
+      projectDir = a[ai + 1]
+      ai = ai + 2
+    } else {
+      eprint("bit up: unexpected argument '${a[ai]}'\n")
+      return 2
+    }
+  }
+
+  let cacheRoot = defaultCacheRoot() catch e {
+    eprint("bit up: ${e.message()}\n")
+    return 1
+  }
+
+  let results = upDependencies(projectDir, cacheRoot, defaultGitBin, name, pmCliDefaultTimeoutMs) catch e {
+    eprint("bit up: ${e.message()}\n")
+    return 1
+  }
+
+  let i = 0
+  while (i < len(results)) {
+    print("bit up: ${results[i].name} -> ${results[i].ref} (${results[i].commit})\n")
+    i = i + 1
+  }
+  return 0
+}
+
 // `gitHost/owner/repo[@ref]` — like pmfetch.bit's own `parseSpec`, but `ref`
 // is OPTIONAL here (ticket #1734, step 1: default to the remote's default
 // branch HEAD). `resolveDependencyRef` already knows how to resolve the
@@ -113,20 +159,14 @@ export function addDependency(
   url: string, timeoutMs: int,
 ): AddResult! {
   let name = repo
-  let sha = resolveDependencyRef(gitBin, url, ref, timeoutMs)?
-  let fetched = fetchSha(gitBin, cacheRoot, host, owner, repo, url, sha, timeoutMs)?
-
-  let depManifest = readManifest(fetched.dir)?
-  let depRequires = manifestRequires(depManifest)
+  let lockPath = pmJoin(projectDir, "bit.lock")
+  let entries = readLock(lockPath)?
+  let entry = resolveDependency(cacheRoot, gitBin, name, host, owner, repo, ref, url, entries, timeoutMs)?
 
   let finalRef = ref
   if (!refIsExplicit) {
-    finalRef = sha
+    finalRef = entry.commit
   }
-
-  let lockPath = pmJoin(projectDir, "bit.lock")
-  let entries = readLock(lockPath)?
-  checkVersionConflict(entries, name, finalRef, depRequires)?
 
   // bit.lock first, bit.json second: bit.lock is fully machine-owned and
   // regenerated on every add/up/remove (pmlock.bit's own contract), so a
@@ -134,13 +174,34 @@ export function addDependency(
   // it from whatever bit.json says. The reverse order would risk bit.json
   // claiming a dependency bit.lock never recorded, a silent mismatch with no
   // rollback.
-  let updated = upsertLockEntry(entries, name, url, sha, depRequires)
+  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires)
   writeLock(lockPath, updated)?
 
   let specRef = "${host}/${owner}/${repo}@${finalRef}"
   rewriteManifest(projectDir, name, specRef)?
 
-  return AddResult{ name: name, specRef: specRef, url: url, commit: sha }
+  return AddResult{ name: name, specRef: specRef, url: url, commit: entry.commit }
+}
+
+// The fetch/resolve/MVS-check sequence `bit add` and `bit up` both need,
+// kept in exactly one place (ticket #1735's hard constraint: never fork
+// #1734's plumbing): re-resolve `ref` against `url` to a commit, fetch it into
+// the cache, read its own transitive requirements, and re-run MVS
+// (`checkVersionConflict`) against `existing`'s already-locked transitive
+// requirements. Returns the fresh `LockEntry` without writing bit.lock —
+// the caller (an add of one new dependency, or an up refreshing one already
+// in bit.lock) decides how and when that gets written.
+function resolveDependency(
+  cacheRoot: string, gitBin: string,
+  name: string, host: string, owner: string, repo: string, ref: string, url: string,
+  existing: []LockEntry, timeoutMs: int,
+): LockEntry! {
+  let sha = resolveDependencyRef(gitBin, url, ref, timeoutMs)?
+  let fetched = fetchSha(gitBin, cacheRoot, host, owner, repo, url, sha, timeoutMs)?
+  let depManifest = readManifest(fetched.dir)?
+  let depRequires = manifestRequires(depManifest)
+  checkVersionConflict(existing, name, ref, depRequires)?
+  return LockEntry{ name: name, url: url, commit: sha, requires: depRequires }
 }
 
 // ---- reading a fetched dependency's own requirements -------------------
@@ -273,7 +334,7 @@ function checkVersionConflict(
   let resolved = resolveMVS(graph)
   let (finalVer, found) = resolved[name]
   if (found && versionLess(reqVersion, finalVer)) {
-    fail newError("bit add: ${name}@${ref} conflicts with a higher transitive requirement (v${finalVer.major}.${finalVer.minor}.${finalVer.patch} needed) — add that version instead")
+    fail newError("pmcli: ${name}@${ref} conflicts with a higher transitive requirement (v${finalVer.major}.${finalVer.minor}.${finalVer.patch} needed) — pick that version instead")
   }
 }
 
@@ -320,6 +381,146 @@ function upsertLockEntry(
   }
   if (!replaced) {
     out = append(out, LockEntry{ name: name, url: url, commit: commit, requires: requires })
+  }
+  return out
+}
+
+// ---- the up flow, independent of argv/exit codes -----------------------
+
+// One dependency `bit up`/`bit update` refreshed — enough to print a
+// confirmation, mirroring `AddResult`.
+struct UpResult { name: string, ref: string, url: string, commit: string }
+
+// One `bit.json` `dependencies` entry, decoded.
+struct DepSpecNamed { name: string, spec: DepSpec }
+
+// Every dependency `<projectDir>/bit.json` names, decoded through
+// `jsoncParse` (std/json) — unlike `readManifest` (pmfetch.bit), which reads
+// a FETCHED dependency's manifest through the strict local JSON parser, this
+// reads the PROJECT's OWN bit.json, which routinely carries the user's
+// comments (JSONC, not plain JSON — same format the CST edit layer preserves
+// for `bit add`). Each value is decoded through pmfetch.bit's own `parseSpec`
+// — the identical `host/owner/repo@ref` shape `bit add` already validates —
+// so a malformed entry fails the same way it would on `add`. Fails if the
+// project has no `bit.json` at all: `bit up` refreshes an existing project,
+// it does not scaffold one.
+function projectDeps(projectDir: string): []DepSpecNamed! {
+  let path = pmJoin(projectDir, "bit.json")
+  if (!exists(path)) {
+    fail newError("bit up: ${path} does not exist — run inside a project with a bit.json")
+  }
+  let src = readFile(path)?
+  let doc = jsoncParse(src)?
+  let depsField = jsonGetC(doc, "dependencies")
+  match (depsField) {
+    Some(deps) => return projectDepsOf(deps)?
+    None => return []DepSpecNamed(0)
+  }
+}
+
+function projectDepsOf(deps: Json): []DepSpecNamed! {
+  let out = []DepSpecNamed(0)
+  match (deps) {
+    JsonObject(entries) => {
+      for e of entries {
+        let refStr = jsonAsString(e.value)
+        match (refStr) {
+          Some(specRef) => {
+            let spec = parseSpec(specRef)?
+            out = append(out, DepSpecNamed{ name: e.key, spec: spec })
+          }
+          None => fail newError("bit up: bit.json dependency '${e.key}' is not a string")
+        }
+      }
+    }
+    JsonNull => {}
+    JsonBool(b) => {}
+    JsonInt(n) => {}
+    JsonFloat(f) => {}
+    JsonString(s) => {}
+    JsonArray(a) => {}
+  }
+  return out
+}
+
+// `deps` narrowed to the single entry named `name`. Fails if there is none —
+// `bit up <name>` on a dependency `bit.json` doesn't name is a usage error,
+// not a silent no-op.
+function onlyNamed(deps: []DepSpecNamed, name: string): []DepSpecNamed! {
+  let i = 0
+  while (i < len(deps)) {
+    if (deps[i].name == name) {
+      return [deps[i]]
+    }
+    i = i + 1
+  }
+  fail newError("bit up: no such dependency '${name}' in bit.json")
+}
+
+// `name`'s already-locked `url`, or `fallbackUrl` when bit.lock has no entry
+// for it yet (a dependency added to bit.json by hand, never yet `add`ed or
+// `up`ed) — `bit up` reuses the URL a dependency was ORIGINALLY fetched from
+// rather than re-deriving it, so a non-standard-https remote (recorded once,
+// at `add` time) survives every later refresh unchanged.
+function existingUrlFor(entries: []LockEntry, name: string, fallbackUrl: string): string {
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].name == name) {
+      return entries[i].url
+    }
+    i = i + 1
+  }
+  return fallbackUrl
+}
+
+// Refreshes one dependency already named in `bit.json`: re-resolves `ref`
+// against `url` (a moved branch/tag re-fetches its new HEAD; an already-
+// pinned sha is unchanged, `resolveDependencyRef`'s own rule) and rewrites
+// just that name's `bit.lock` entry with the refreshed commit and the
+// refreshed manifest's own transitive requirements. Shares
+// `resolveDependency`/`upsertLockEntry`/`writeLock` with `addDependency` —
+// ticket #1735's hard constraint: reuse #1734's plumbing, never fork it.
+function upDependency(
+  projectDir: string, cacheRoot: string, gitBin: string,
+  name: string, host: string, owner: string, repo: string, ref: string,
+  url: string, timeoutMs: int,
+): UpResult! {
+  let lockPath = pmJoin(projectDir, "bit.lock")
+  let entries = readLock(lockPath)?
+  let entry = resolveDependency(cacheRoot, gitBin, name, host, owner, repo, ref, url, entries, timeoutMs)?
+  let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires)
+  writeLock(lockPath, updated)?
+  return UpResult{ name: name, ref: ref, url: entry.url, commit: entry.commit }
+}
+
+// `bit up`'s/`bit update`'s core: every dependency `bit.json` names (or, when
+// `only` is non-empty, just that one) refreshed and rewritten into bit.lock.
+// `bit.json` itself is never touched here — its `ref` per entry is exactly
+// what was already there; only bit.lock's resolved commit and transitive
+// requirements move.
+export function upDependencies(
+  projectDir: string, cacheRoot: string, gitBin: string, only: string, timeoutMs: int,
+): []UpResult! {
+  let deps = projectDeps(projectDir)?
+  if (len(only) > 0) {
+    deps = onlyNamed(deps, only)?
+  }
+
+  let lockPath = pmJoin(projectDir, "bit.lock")
+  let locked = readLock(lockPath)?
+
+  let out = []UpResult(0)
+  let i = 0
+  while (i < len(deps)) {
+    let d = deps[i]
+    let fallbackUrl = "https://" + d.spec.host + "/" + d.spec.owner + "/" + d.spec.repo + ".git"
+    let url = existingUrlFor(locked, d.name, fallbackUrl)
+    let r = upDependency(
+      projectDir, cacheRoot, gitBin, d.name, d.spec.host, d.spec.owner, d.spec.repo, d.spec.ref,
+      url, timeoutMs,
+    )?
+    out = append(out, r)
+    i = i + 1
   }
   return out
 }
