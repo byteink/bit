@@ -3240,6 +3240,8 @@ const FnCtx = struct {
         .{ "fsChmod", ir.RtFn.fs_chmod },
         .{ "osRun", ir.RtFn.os_run },
         .{ "osRunTest", ir.RtFn.os_run_test },
+        .{ "osRunBounded", ir.RtFn.os_run_bounded },
+        .{ "osRunTestBounded", ir.RtFn.os_run_test_bounded },
         .{ "hostTarget", ir.RtFn.host_target },
         .{ "auxv", ir.RtFn.auxv },
     });

@@ -3474,6 +3474,12 @@ const Checker = struct {
         // `osRunTest(path: string, idx: i64) -> i64`: run `path` with
         // `BIT_TEST_INDEX=idx` set, for the `bit test` per-test exec loop.
         .{ "osRunTest", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        // `osRunBounded(path: string, timeout_ms: i64) -> i64`: like `osRun`,
+        // bounded by a wall-clock deadline (§19 `bit_rt_os_run_bounded`).
+        .{ "osRunBounded", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
+        // `osRunTestBounded(path: string, idx: i64, timeout_ms: i64) -> i64`:
+        // `osRunBounded` combined with `osRunTest`'s `BIT_TEST_INDEX` behavior.
+        .{ "osRunTestBounded", PrimSig{ .params = &.{ .string, .i64, .i64 }, .ret = .i64 } },
         // `hostTarget() -> i64`: the host BuildTarget ordinal, for `bit build`'s
         // default target (compiler/main.bit's hostBuildTarget reads it).
         .{ "hostTarget", PrimSig{ .params = &.{}, .ret = .i64 } },

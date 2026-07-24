@@ -1669,6 +1669,8 @@ fn rtSymbol(rt: ir.RtFn) []const u8 {
         .os_exit => "bit_rt_os_exit",
         .os_run => "bit_rt_os_run",
         .os_run_test => "bit_rt_os_run_test",
+        .os_run_bounded => "bit_rt_os_run_bounded",
+        .os_run_test_bounded => "bit_rt_os_run_test_bounded",
         .host_target => "bit_rt_host_target",
         .auxv => "bit_rt_auxv",
         .random_bytes => "bit_rt_random_bytes",

@@ -276,6 +276,14 @@ pub const RtFn = enum {
     /// in the child's environment so the test binary's synthetic `main` runs the
     /// one test named by `idx`. The `bit test` runner calls it once per test.
     os_run_test,
+    /// `os_run_bounded(path, timeout_ms) -> i64`: like `os_run`, but the parent
+    /// polls instead of blocking and SIGKILLs+reaps the child if it has not
+    /// exited within `timeout_ms`. Result: `>=0` real exit code, `-1` spawn
+    /// failure, `-2` timed out, `<=-100` killed by signal (`-100-signum`).
+    os_run_bounded,
+    /// `os_run_test_bounded(path, idx, timeout_ms) -> i64`: `os_run_bounded`
+    /// combined with `os_run_test`'s `BIT_TEST_INDEX` behavior.
+    os_run_test_bounded,
     /// `host_target() -> i64`: the BuildTarget ordinal of the host this binary
     /// runs on (0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos). The runtime
     /// archive is per-target, so it answers from its own `builtin.target`.

@@ -197,7 +197,7 @@ const predeclared_funcs = [_][]const u8{
     "timeSleepNs",
     // Process environment (ABI.md §19); std/os wraps these.
        "osArgc",            "osArgAt",          "osEnv",            "osSelfExe",        "osExit",      "osRun",       "osRunTest",  "hostTarget",
-    "auxv",
+    "auxv",         "osRunBounded",      "osRunTestBounded",
     // Crypto boundary primitives (ABI.md §21); std/crypto wraps these.
               "cryptoRandomBytes", "cryptoSecureZero",
     // Float-literal parsing, for the self-hosted compiler's `FloatLit` lowering.
