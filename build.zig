@@ -310,8 +310,15 @@ pub fn build(b: *std.Build) void {
         .{ .path = "seed/codegen_arm64_test.zig" },
         .{ .path = "seed/codegen_x64_test.zig" },
 
-        // Same anchor reason: `pe.zig`'s `../codegen/x64.zig` import.
+        // `obj/pe.zig` has no imports outside `std`, but `main.zig` doesn't
+        // import it either, so it still needs its own root to be collected.
         .{ .path = "seed/obj_pe_test.zig" },
+
+        // The Windows PE/COFF object reader + executable linker (task #1103).
+        // Same anchor reason as `link_macho_test.zig`: `main.zig` does not
+        // import either file yet, and `pe_reader.zig`'s own `../obj/pe.zig`
+        // import needs a module rooted at `seed/`, not `seed/link/`.
+        .{ .path = "seed/link_pe_test.zig" },
 
         // The ELF linker driver, which imports the whole `link/` package
         // (object/archive/elf_reader/strip) plus `obj/elf.zig`, so their tests
