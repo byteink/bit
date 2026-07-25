@@ -1,0 +1,778 @@
+// run
+// stdlib/json/cst_value.bit's CST-to-Json projection (#1479's json epic,
+// #1724), exercised behaviourally. A golden case is a single file with no
+// prelude and cannot import std/json (see json_cst_parse_trivia.bit /
+// jsonc_parse_comments.bit), so this redeclares the comment-aware lexer, the
+// #1720 CST types + #1723 CST parser, the #1717 Json value type, a JSONC
+// value parser (#1722), and the #1724 projection locally.
+//
+// Parses one JSONC document — comments in three positions, plus every Json
+// scalar kind, an array, and a nested object — two ways: once through
+// cstParse + cstToJson (the CST path under test), once through jsoncParse
+// (the direct value parser, #1722). Both are rendered through the same debug
+// stringifier and compared: comments must make no difference to the
+// projected values.
+
+struct jsonErr { msg: string }
+function (e: jsonErr) message(): string { return e.msg }
+
+enum Opt<T> { Some(T), None }
+
+// --- lexer (stdlib/json/lex.bit: JSONC grammar, Comment emission toggle) --
+
+enum TokenKind {
+  LBrace,
+  RBrace,
+  LBracket,
+  RBracket,
+  Colon,
+  Comma,
+  StringTok,
+  NumberTok,
+  TrueTok,
+  FalseTok,
+  NullTok,
+  Eof,
+  Invalid,
+  Comment,
+}
+
+struct Token { kind: TokenKind, start: int, end: int }
+
+const jsonMaxDepth = 64
+
+struct Lexer { src: string, i: int, depth: int }
+
+function isDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+function isLower(c: u8): bool {
+  return c >= 'a' && c <= 'z'
+}
+
+function emit(lx: Lexer, start: int, n: int, k: TokenKind): Token {
+  lx.i = start + n
+  return Token{ kind: k, start: start, end: start + n }
+}
+
+function scanOpen(lx: Lexer, k: TokenKind): Token {
+  let start = lx.i
+  if (lx.depth >= jsonMaxDepth) {
+    return emit(lx, start, 1, TokenKind.Invalid)
+  }
+  lx.depth = lx.depth + 1
+  return emit(lx, start, 1, k)
+}
+
+function scanClose(lx: Lexer, k: TokenKind): Token {
+  let start = lx.i
+  if (lx.depth > 0) {
+    lx.depth = lx.depth - 1
+  }
+  return emit(lx, start, 1, k)
+}
+
+function scanString(lx: Lexer): Token {
+  let start = lx.i
+  lx.i = lx.i + 1
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    if (c == '"') {
+      lx.i = lx.i + 1
+      return Token{ kind: TokenKind.StringTok, start: start, end: lx.i }
+    }
+    if (c == '\\' && lx.i + 1 < len(lx.src)) {
+      lx.i = lx.i + 2
+    } else {
+      lx.i = lx.i + 1
+    }
+  }
+  return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+}
+
+function scanNumber(lx: Lexer): Token {
+  let start = lx.i
+  if (lx.src[lx.i] == '-') {
+    lx.i = lx.i + 1
+  }
+  while (lx.i < len(lx.src) && isDigit(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  if (lx.i < len(lx.src) && lx.src[lx.i] == '.') {
+    lx.i = lx.i + 1
+    while (lx.i < len(lx.src) && isDigit(lx.src[lx.i])) {
+      lx.i = lx.i + 1
+    }
+  }
+  if (lx.i < len(lx.src) && (lx.src[lx.i] == 'e' || lx.src[lx.i] == 'E')) {
+    lx.i = lx.i + 1
+    if (lx.i < len(lx.src) && (lx.src[lx.i] == '+' || lx.src[lx.i] == '-')) {
+      lx.i = lx.i + 1
+    }
+    while (lx.i < len(lx.src) && isDigit(lx.src[lx.i])) {
+      lx.i = lx.i + 1
+    }
+  }
+  return Token{ kind: TokenKind.NumberTok, start: start, end: lx.i }
+}
+
+function scanWord(lx: Lexer): Token {
+  let start = lx.i
+  while (lx.i < len(lx.src) && isLower(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  let word = lx.src[start:lx.i]
+  if (word == "true") {
+    return Token{ kind: TokenKind.TrueTok, start: start, end: lx.i }
+  }
+  if (word == "false") {
+    return Token{ kind: TokenKind.FalseTok, start: start, end: lx.i }
+  }
+  if (word == "null") {
+    return Token{ kind: TokenKind.NullTok, start: start, end: lx.i }
+  }
+  return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+}
+
+// JSONC comment recognition, with `emitComments` picking whether a `//`/`/* */`
+// span comes back as a `Comment` token (CST mode) or is skipped like
+// whitespace (plain-value mode) — one scanner, two observable outcomes, same
+// as stdlib/json/lex.bit's own `scanToken`.
+function scanToken(lx: Lexer, emitComments: bool): Token {
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      lx.i = lx.i + 1
+    } else if (c == '/' && lx.i + 1 < len(lx.src) && lx.src[lx.i + 1] == '/') {
+      let start = lx.i
+      lx.i = lx.i + 2
+      while (lx.i < len(lx.src) && lx.src[lx.i] != '\n') {
+        lx.i = lx.i + 1
+      }
+      if (emitComments) {
+        return Token{ kind: TokenKind.Comment, start: start, end: lx.i }
+      }
+    } else if (c == '/' && lx.i + 1 < len(lx.src) && lx.src[lx.i + 1] == '*') {
+      let start = lx.i
+      lx.i = lx.i + 2
+      let closed = false
+      while (lx.i + 1 < len(lx.src)) {
+        if (lx.src[lx.i] == '*' && lx.src[lx.i + 1] == '/') {
+          lx.i = lx.i + 2
+          closed = true
+          break
+        }
+        lx.i = lx.i + 1
+      }
+      if (!closed) {
+        lx.i = len(lx.src)
+        return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+      }
+      if (emitComments) {
+        return Token{ kind: TokenKind.Comment, start: start, end: lx.i }
+      }
+    } else if (c == '{') {
+      return scanOpen(lx, TokenKind.LBrace)
+    } else if (c == '}') {
+      return scanClose(lx, TokenKind.RBrace)
+    } else if (c == '[') {
+      return scanOpen(lx, TokenKind.LBracket)
+    } else if (c == ']') {
+      return scanClose(lx, TokenKind.RBracket)
+    } else if (c == ':') {
+      return emit(lx, lx.i, 1, TokenKind.Colon)
+    } else if (c == ',') {
+      return emit(lx, lx.i, 1, TokenKind.Comma)
+    } else if (c == '"') {
+      return scanString(lx)
+    } else if (isDigit(c) || c == '-') {
+      return scanNumber(lx)
+    } else if (isLower(c)) {
+      return scanWord(lx)
+    } else {
+      return emit(lx, lx.i, 1, TokenKind.Invalid)
+    }
+  }
+  return Token{ kind: TokenKind.Eof, start: lx.i, end: lx.i }
+}
+
+function lexTokens(source: string, emitComments: bool): []Token {
+  let lx = Lexer{ src: source, i: 0, depth: 0 }
+  let toks = []Token(0)
+  let guard = 0
+  let bound = len(source) * 2 + 2
+  while (guard <= bound) {
+    let t = scanToken(lx, emitComments)
+    toks = append(toks, t)
+    if (t.kind == TokenKind.Eof) {
+      break
+    }
+    guard = guard + 1
+  }
+  return toks
+}
+
+// --- shared number/string decoding (stdlib/json/parse.bit) -----------------
+//
+// One decoder each, called from BOTH the plain jsoncParse below and the
+// cstToJson projection further down — exactly like the real
+// stdlib/json/parse.bit + stdlib/json/cst_value.bit share theirs, so the
+// escape-decoding switch is never duplicated.
+
+function describeInvalid(src: string, t: Token): string {
+  let c = src[t.start]
+  if (c == '{' || c == '[') {
+    return "json: max nesting depth exceeded"
+  }
+  if (c == '"') {
+    return "json: unterminated string"
+  }
+  if (c == '/' && t.end - t.start > 1) {
+    return "json: unterminated block comment"
+  }
+  return "json: unexpected character in input"
+}
+
+function isValidJsonNumber(s: string): bool {
+  let n = len(s)
+  let i = 0
+  if (i >= n) {
+    return false
+  }
+  if (s[i] == '-') {
+    i = i + 1
+  }
+  if (i >= n) {
+    return false
+  }
+  if (s[i] == '0') {
+    i = i + 1
+  } else if (s[i] >= '1' && s[i] <= '9') {
+    i = i + 1
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  } else {
+    return false
+  }
+  if (i < n && s[i] == '.') {
+    i = i + 1
+    if (i >= n || !isDigit(s[i])) {
+      return false
+    }
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  }
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+    i = i + 1
+    if (i < n && (s[i] == '+' || s[i] == '-')) {
+      i = i + 1
+    }
+    if (i >= n || !isDigit(s[i])) {
+      return false
+    }
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  }
+  return i == n
+}
+
+function looksIntegral(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '.' || s[i] == 'e' || s[i] == 'E') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// No overflow guard, no `\uXXXX`/surrogate-pair path: this fixture's numbers
+// and strings never need either, so — unlike the real decodeNumber /
+// decodeStringLiteral this mirrors — these stay non-fallible and only
+// implement the subset the fixture below actually exercises.
+function parseIntLocal(s: string): i64 {
+  let i = 0
+  let neg = false
+  if (s[0] == '-') {
+    neg = true
+    i = 1
+  }
+  let v = i64(0)
+  while (i < len(s)) {
+    v = v * 10 + i64(s[i] - '0')
+    i = i + 1
+  }
+  if (neg) {
+    return 0 - v
+  }
+  return v
+}
+
+function decodeNumber(src: string, t: Token): Json {
+  let text = src[t.start:t.end]
+  if (looksIntegral(text)) {
+    return Json.JsonInt(parseIntLocal(text))
+  }
+  return Json.JsonFloat(parseFloat(text))
+}
+
+// No escapes in this fixture's strings, so this is just the span between the
+// quotes.
+function decodeStringLiteral(src: string, t: Token): string {
+  return src[t.start + 1:t.end - 1]
+}
+
+// --- CST types (stdlib/json/cst.bit, #1720) --------------------------------
+
+struct Trivia { leading: []string, trailing: Opt<string> }
+
+struct CstEntry { keyText: string, key: string, trivia: Trivia, value: CstNode }
+
+enum CstNode {
+  CstNull(Trivia),
+  CstBool(bool, Trivia),
+  CstNumber(string, Trivia),
+  CstString(string, Trivia),
+  CstArray([]CstNode, Trivia),
+  CstObject([]CstEntry, Trivia),
+}
+
+// --- CST parser (stdlib/json/cst_parse.bit, #1723) --------------------------
+
+struct CstParser { src: string, toks: []Token, i: int }
+
+function ctPeek(p: CstParser): Token {
+  return p.toks[p.i]
+}
+
+function ctAdvance(p: CstParser): Token {
+  let t = p.toks[p.i]
+  if (p.i < len(p.toks) - 1) {
+    p.i = p.i + 1
+  }
+  return t
+}
+
+function ctSlice(p: CstParser, t: Token): string {
+  return p.src[t.start:t.end]
+}
+
+function ctSameLine(src: string, startAt: int, endAt: int): bool {
+  let i = startAt
+  while (i < endAt) {
+    if (src[i] == '\n') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+function ctCollectLeading(p: CstParser): []string {
+  let leading = []string(0)
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound && ctPeek(p).kind == TokenKind.Comment) {
+    let t = ctAdvance(p)
+    leading = append(leading, ctSlice(p, t))
+    guard = guard + 1
+  }
+  return leading
+}
+
+function ctTakeTrailing(p: CstParser, afterEnd: int): Opt<string> {
+  let t = ctPeek(p)
+  if (t.kind == TokenKind.Comment && ctSameLine(p.src, afterEnd, t.start)) {
+    ctAdvance(p)
+    return Opt<string>.Some(ctSlice(p, t))
+  }
+  return Opt<string>.None
+}
+
+function ctFirstOrNone(comments: []string): Opt<string> {
+  if (len(comments) > 0) {
+    return Opt<string>.Some(comments[0])
+  }
+  return Opt<string>.None
+}
+
+function ctBuildValue(p: CstParser, leading: []string): CstNode! {
+  let t = ctPeek(p)
+  if (t.kind == TokenKind.LBrace) {
+    return ctParseObject(p, leading)?
+  }
+  if (t.kind == TokenKind.LBracket) {
+    return ctParseArray(p, leading)?
+  }
+  if (t.kind == TokenKind.StringTok) {
+    ctAdvance(p)
+    decodeStringLiteral(p.src, t)
+    let trailing = ctTakeTrailing(p, t.end)
+    return CstNode.CstString(ctSlice(p, t), Trivia{ leading: leading, trailing: trailing })
+  }
+  if (t.kind == TokenKind.NumberTok) {
+    ctAdvance(p)
+    let raw = ctSlice(p, t)
+    if (!isValidJsonNumber(raw)) {
+      fail jsonErr{ msg: "json: invalid number literal" }
+    }
+    let trailing = ctTakeTrailing(p, t.end)
+    return CstNode.CstNumber(raw, Trivia{ leading: leading, trailing: trailing })
+  }
+  if (t.kind == TokenKind.TrueTok) {
+    ctAdvance(p)
+    return CstNode.CstBool(true, Trivia{ leading: leading, trailing: ctTakeTrailing(p, t.end) })
+  }
+  if (t.kind == TokenKind.FalseTok) {
+    ctAdvance(p)
+    return CstNode.CstBool(false, Trivia{ leading: leading, trailing: ctTakeTrailing(p, t.end) })
+  }
+  if (t.kind == TokenKind.NullTok) {
+    ctAdvance(p)
+    return CstNode.CstNull(Trivia{ leading: leading, trailing: ctTakeTrailing(p, t.end) })
+  }
+  if (t.kind == TokenKind.Invalid) {
+    fail jsonErr{ msg: describeInvalid(p.src, t) }
+  }
+  fail jsonErr{ msg: "json: unexpected token, expected a value" }
+}
+
+function ctParseValue(p: CstParser): CstNode! {
+  let leading = ctCollectLeading(p)
+  return ctBuildValue(p, leading)?
+}
+
+function ctParseObject(p: CstParser, leading: []string): CstNode! {
+  ctAdvance(p)
+  let entries = []CstEntry(0)
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let pending = ctCollectLeading(p)
+    if (ctPeek(p).kind == TokenKind.RBrace) {
+      ctAdvance(p)
+      return CstNode.CstObject(
+        entries,
+        Trivia{ leading: leading, trailing: ctFirstOrNone(pending) },
+      )
+    }
+    let keyTok = ctPeek(p)
+    if (keyTok.kind != TokenKind.StringTok) {
+      fail jsonErr{ msg: "json: expected string key" }
+    }
+    ctAdvance(p)
+    let keyText = ctSlice(p, keyTok)
+    let key = decodeStringLiteral(p.src, keyTok)
+    if (ctPeek(p).kind != TokenKind.Colon) {
+      fail jsonErr{ msg: "json: expected ':' after object key" }
+    }
+    ctAdvance(p)
+    let val = ctParseValue(p)?
+    entries = append(
+      entries,
+      CstEntry{
+        keyText: keyText,
+        key: key,
+        trivia: Trivia{ leading: pending, trailing: Opt<string>.None },
+        value: val,
+      },
+    )
+    let nxt = ctPeek(p)
+    if (nxt.kind == TokenKind.RBrace) {
+      ctAdvance(p)
+      return CstNode.CstObject(entries, Trivia{ leading: leading, trailing: Opt<string>.None })
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail jsonErr{ msg: "json: expected ',' or '}' in object" }
+    }
+    ctAdvance(p)
+    guard = guard + 1
+  }
+  fail jsonErr{ msg: "json: object nesting exceeds token bound" }
+}
+
+function ctParseArray(p: CstParser, leading: []string): CstNode! {
+  ctAdvance(p)
+  let items = []CstNode(0)
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let pending = ctCollectLeading(p)
+    if (ctPeek(p).kind == TokenKind.RBracket) {
+      ctAdvance(p)
+      return CstNode.CstArray(items, Trivia{ leading: leading, trailing: ctFirstOrNone(pending) })
+    }
+    let v = ctBuildValue(p, pending)?
+    items = append(items, v)
+    let nxt = ctPeek(p)
+    if (nxt.kind == TokenKind.RBracket) {
+      ctAdvance(p)
+      return CstNode.CstArray(items, Trivia{ leading: leading, trailing: Opt<string>.None })
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail jsonErr{ msg: "json: expected ',' or ']' in array" }
+    }
+    ctAdvance(p)
+    guard = guard + 1
+  }
+  fail jsonErr{ msg: "json: array nesting exceeds token bound" }
+}
+
+function cstParse(source: string): CstNode! {
+  let p = CstParser{ src: source, toks: lexTokens(source, true), i: 0 }
+  let node = ctParseValue(p)?
+  ctCollectLeading(p)
+  if (ctPeek(p).kind != TokenKind.Eof) {
+    fail jsonErr{ msg: "json: trailing garbage after value" }
+  }
+  return node
+}
+
+// --- Json value type (stdlib/json/value.bit, #1717) -------------------------
+
+struct JsonEntry { key: string, value: Json }
+
+enum Json {
+  JsonNull
+  JsonBool(bool)
+  JsonInt(i64)
+  JsonFloat(f64)
+  JsonString(string)
+  JsonArray([]Json)
+  JsonObject([]JsonEntry)
+}
+
+// --- plain JSONC value parser (stdlib/json/parse.bit's jsoncParse, #1722) --
+
+struct Parser { src: string, toks: []Token, i: int }
+
+function peek(p: Parser): Token {
+  return p.toks[p.i]
+}
+
+function advance(p: Parser): Token {
+  let t = p.toks[p.i]
+  if (p.i < len(p.toks) - 1) {
+    p.i = p.i + 1
+  }
+  return t
+}
+
+function parseValue(p: Parser): Json! {
+  let t = peek(p)
+  if (t.kind == TokenKind.LBrace) {
+    return parseObject(p)?
+  }
+  if (t.kind == TokenKind.LBracket) {
+    return parseArray(p)?
+  }
+  if (t.kind == TokenKind.StringTok) {
+    advance(p)
+    return Json.JsonString(decodeStringLiteral(p.src, t))
+  }
+  if (t.kind == TokenKind.NumberTok) {
+    advance(p)
+    return decodeNumber(p.src, t)
+  }
+  if (t.kind == TokenKind.TrueTok) {
+    advance(p)
+    return Json.JsonBool(true)
+  }
+  if (t.kind == TokenKind.FalseTok) {
+    advance(p)
+    return Json.JsonBool(false)
+  }
+  if (t.kind == TokenKind.NullTok) {
+    advance(p)
+    return Json.JsonNull
+  }
+  if (t.kind == TokenKind.Invalid) {
+    fail jsonErr{ msg: describeInvalid(p.src, t) }
+  }
+  fail jsonErr{ msg: "json: unexpected token, expected a value" }
+}
+
+function parseObject(p: Parser): Json! {
+  advance(p)
+  let entries = []JsonEntry(0)
+  if (peek(p).kind == TokenKind.RBrace) {
+    advance(p)
+    return Json.JsonObject(entries)
+  }
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let keyTok = peek(p)
+    if (keyTok.kind != TokenKind.StringTok) {
+      fail jsonErr{ msg: "json: expected string key" }
+    }
+    advance(p)
+    let key = decodeStringLiteral(p.src, keyTok)
+    if (peek(p).kind != TokenKind.Colon) {
+      fail jsonErr{ msg: "json: expected ':' after object key" }
+    }
+    advance(p)
+    let val = parseValue(p)?
+    entries = append(entries, JsonEntry{ key: key, value: val })
+    let nxt = peek(p)
+    if (nxt.kind == TokenKind.RBrace) {
+      advance(p)
+      return Json.JsonObject(entries)
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail jsonErr{ msg: "json: expected ',' or '}' in object" }
+    }
+    advance(p)
+    if (peek(p).kind == TokenKind.RBrace) {
+      advance(p)
+      return Json.JsonObject(entries)
+    }
+    guard = guard + 1
+  }
+  fail jsonErr{ msg: "json: object nesting exceeds token bound" }
+}
+
+function parseArray(p: Parser): Json! {
+  advance(p)
+  let items = []Json(0)
+  if (peek(p).kind == TokenKind.RBracket) {
+    advance(p)
+    return Json.JsonArray(items)
+  }
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let v = parseValue(p)?
+    items = append(items, v)
+    let nxt = peek(p)
+    if (nxt.kind == TokenKind.RBracket) {
+      advance(p)
+      return Json.JsonArray(items)
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail jsonErr{ msg: "json: expected ',' or ']' in array" }
+    }
+    advance(p)
+    if (peek(p).kind == TokenKind.RBracket) {
+      advance(p)
+      return Json.JsonArray(items)
+    }
+    guard = guard + 1
+  }
+  fail jsonErr{ msg: "json: array nesting exceeds token bound" }
+}
+
+function jsoncParse(source: string): Json! {
+  let p = Parser{ src: source, toks: lexTokens(source, false), i: 0 }
+  let v = parseValue(p)?
+  if (peek(p).kind != TokenKind.Eof) {
+    fail jsonErr{ msg: "json: trailing garbage after value" }
+  }
+  return v
+}
+
+// --- CST-to-Json projection under test (stdlib/json/cst_value.bit, #1724) --
+//
+// Reuses this same file's decodeNumber/decodeStringLiteral — the exact
+// functions jsoncParse above calls — rather than a second decode
+// implementation, mirroring how the real cst_value.bit reuses parse.bit's.
+
+// The real cst_value.bit points a synthetic Token at rawText's own bounds to
+// reuse parse.bit's Token-shaped decoders; same trick here.
+function wholeSpan(rawText: string, kind: TokenKind): Token {
+  return Token{ kind: kind, start: 0, end: len(rawText) }
+}
+
+function cstToJson(n: CstNode): Json {
+  match (n) {
+    CstNull(trivia) => return Json.JsonNull
+    CstBool(b, trivia) => return Json.JsonBool(b)
+    CstNumber(rawText, trivia) => return decodeNumber(rawText, wholeSpan(rawText, TokenKind.NumberTok))
+    CstString(rawText, trivia) => return Json.JsonString(decodeStringLiteral(rawText, wholeSpan(rawText, TokenKind.StringTok)))
+    CstArray(items, trivia) => {
+      let out = []Json(0)
+      for item of items {
+        out = append(out, cstToJson(item))
+      }
+      return Json.JsonArray(out)
+    }
+    CstObject(entries, trivia) => {
+      let out = []JsonEntry(0)
+      for e of entries {
+        out = append(out, JsonEntry{ key: e.key, value: cstToJson(e.value) })
+      }
+      return Json.JsonObject(out)
+    }
+  }
+}
+
+// --- debug stringifier, used only to compare the two Json trees ------------
+
+function jsonToDebugString(j: Json): string {
+  match (j) {
+    JsonNull => return "null"
+    JsonBool(b) => {
+      if (b) {
+        return "true"
+      }
+      return "false"
+    }
+    JsonInt(i) => return "${i}"
+    JsonFloat(f) => return "${f}"
+    JsonString(s) => return "\"${s}\""
+    JsonArray(a) => {
+      let out = "["
+      let i = 0
+      while (i < len(a)) {
+        if (i > 0) {
+          out = out + ","
+        }
+        out = out + jsonToDebugString(a[i])
+        i = i + 1
+      }
+      return out + "]"
+    }
+    JsonObject(entries) => {
+      let out = "{"
+      let i = 0
+      while (i < len(entries)) {
+        if (i > 0) {
+          out = out + ","
+        }
+        out = out + "\"${entries[i].key}\":" + jsonToDebugString(entries[i].value)
+        i = i + 1
+      }
+      return out + "}"
+    }
+  }
+}
+
+// --- test --------------------------------------------------------------
+
+function main() {
+  // Comments in three positions (leading block comment on the whole file, a
+  // leading `//` before a key, a same-line `/* */` trailing a value) plus
+  // every Json scalar kind, an array, and a nested object.
+  let src = "/* config */\n{\n  // name comment\n  \"name\": \"bit\", // trailing name comment\n  \"version\": 1,\n  \"pi\": 3.5,\n  \"enabled\": true,\n  \"disabled\": false,\n  \"extra\": null,\n  \"tags\": [\"a\", \"b\", /* mid */ \"c\"],\n  \"nested\": {\n    \"x\": 1,\n    \"y\": 2 // y comment\n  }\n}"
+
+  let cst = cstParse(src) catch e {
+    print("cstParse failed: ${e.message()}\n")
+    return
+  }
+  let viaProjection = jsonToDebugString(cstToJson(cst))
+
+  let direct = jsoncParse(src) catch e {
+    print("jsoncParse failed: ${e.message()}\n")
+    return
+  }
+  let viaDirect = jsonToDebugString(direct)
+
+  print("projection=${viaProjection}\n")
+  print("direct=${viaDirect}\n")
+  print("match=${viaProjection == viaDirect}\n")
+}

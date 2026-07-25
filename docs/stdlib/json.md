@@ -492,3 +492,38 @@ function cstPrintAfterEdit(): string {
   return cstPrint(updated)
 }
 ```
+
+## CST-to-Json projection
+
+A read-only consumer that only wants a JSONC document's values (e.g. `bit lsp`
+inspecting a config) does not need to know the CST shape at all: parse with
+`cstParse`, project with `cstToJson`, then read the result with the same
+`jsonGet`/`jsonAsX` accessors a plain-JSON caller uses.
+
+### `cstToJson(n: CstNode): Json`
+
+Strips every `Trivia` and decodes each `CstNumber`/`CstString`'s raw source
+span, turning a CST into a plain `Json` tree. Pure and total — unlike
+`cstParse`, it cannot fail, since every span it decodes was already validated
+once when `cstParse` built the CST. Comments make no difference to the result:
+projecting `cstParse(source)` and calling `jsoncParse(source)` directly always
+agree, for any JSONC `source`.
+
+```bit
+import { cstParse, cstToJson, jsonGet, jsonAsInt } from "std/json"
+
+function cstToJsonExample(): i64 {
+  let root = cstParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
+    return -1
+  }
+  match (jsonGet(cstToJson(root), "a")) {
+    Some(v) => {
+      match (jsonAsInt(v)) {
+        Some(i) => return i
+        None => return -1
+      }
+    }
+    None => return -1
+  }
+}
+```
