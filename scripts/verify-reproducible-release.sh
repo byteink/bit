@@ -81,11 +81,18 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
     FAIL=1
     continue
   fi
-  grep -q " ${NAME}.tar.xz\$" "${PUBLISHED_DIR}/SHA256SUMS" || {
+  expected_sum="$(grep " ${NAME}.tar.xz\$" "${PUBLISHED_DIR}/SHA256SUMS" | awk '{print $1}')"
+  [ -n "${expected_sum}" ] || {
     echo "verify-reproducible-release.sh: ${TARGET}: ${NAME}.tar.xz not listed in SHA256SUMS" >&2
     FAIL=1
     continue
   }
+  actual_sum="$(shasum -a 256 "${published_tar}" | awk '{print $1}')"
+  if [ "${expected_sum}" != "${actual_sum}" ]; then
+    echo "verify-reproducible-release.sh: ${TARGET}: ${NAME}.tar.xz FAILS its own SHA256SUMS check (expected ${expected_sum}, got ${actual_sum}) — corrupt or tampered download, refusing to diff it" >&2
+    FAIL=1
+    continue
+  fi
 
   echo "rebuilding ${TARGET}..."
   mkdir -p "${WORK}/build-${TARGET}/stage/bin"
