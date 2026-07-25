@@ -17,6 +17,14 @@ const sched = @import("sched.zig");
 const chan = @import("chan.zig");
 const net = @import("net.zig");
 const rand = @import("rand.zig");
+const cpu = @import("cpu.zig");
+
+/// x86-64-only hardware crypto kernels (AES-NI/PCLMULQDQ/SHA-NI, task #1223)
+/// — `struct {}` on ARM64, matching the `shims` idiom just below: the module
+/// itself is written entirely in x86-only inline asm, so it must stay an
+/// untaken comptime branch on any other target.
+const is_x86_64 = builtin.cpu.arch == .x86_64;
+const cryptohw = if (is_x86_64) @import("cryptohw.zig") else struct {};
 
 /// Linux-only C-runtime shims (`memcpy`/`__divti3`/`getauxval`/...) — see
 /// that file's module doc comment for why this runtime needs them at all.
@@ -1408,6 +1416,87 @@ export fn bit_rt_secure_zero(h: ?*SliceHeader) callconv(.c) void {
     const s = h orelse return; // null header (#1564) views no bytes
     const words = s.buf[s.off .. s.off + s.len];
     rand.secureZero(std.mem.sliceAsBytes(words));
+}
+
+// ---- Hardware crypto fast paths (ABI.md §21b, task #1223) -----------------
+// AES-NI/PCLMULQDQ/SHA-NI, reached from `stdlib/crypto/*.bit` through plain
+// `extern function` declarations (SPEC.md §11.7) rather than the `RtFn`
+// mechanism above — every parameter and result here is a scalar or raw
+// pointer, exactly what `extern function` admits, so no compiler-side
+// wiring is needed at all. `cpu.zig` caches the one-time CPUID+XGETBV probe;
+// `cryptohw.zig` holds the actual AES-NI/PCLMULQDQ/SHA-NI instruction
+// sequences (`struct {}` on non-x86-64, per the `is_x86_64` comptime branch
+// above) — every `if (is_x86_64) ... else @panic(...)` below is that same
+// dead-branch elimination, proven safe by `cpu.zig`'s own module doc: these
+// exports still must exist (as a linkable symbol) on every target, because
+// `extern function`'s target-membership rule (SPEC.md §11.7) checks archive
+// presence, not reachability — but on ARM64 they are never actually called,
+// since `bitCrypto*HwAvailable` is unconditionally `false` there. Each
+// `@panic` carries a DISTINCT message (never a bare `unreachable`) on
+// purpose: an ARM64 build's five stub bodies would otherwise compile to
+// byte-identical machine code, and the linker's identical-code-folding
+// merges them into one physical symbol — the E0078 archive-membership check
+// (SPEC.md §11.7) then finds only the survivor and rejects every extern that
+// folded into it as "absent", even though the export genuinely exists.
+
+/// `bit_rt_crypto_aes_hw_available`: AES-NI usable on this host (AES + AVX +
+/// OS XSAVE support, `cpu.zig`'s cached probe) — backs `stdlib/crypto/aes.bit`
+/// and `gcm.bit`'s `bitCryptoAesHwAvailable()`.
+export fn bit_rt_crypto_aes_hw_available() callconv(.c) bool {
+    return (cpu.detect(g_environ) & cpu.aes) != 0;
+}
+
+/// `bit_rt_crypto_ghash_hw_available`: PCLMULQDQ usable on this host (PCLMUL
+/// + AVX) — backs `stdlib/crypto/gcm.bit`'s `bitCryptoGhashHwAvailable()`.
+export fn bit_rt_crypto_ghash_hw_available() callconv(.c) bool {
+    return (cpu.detect(g_environ) & cpu.pclmul) != 0;
+}
+
+/// `bit_rt_crypto_sha256_hw_available`: SHA-NI usable on this host (SHA +
+/// AVX2) — backs `stdlib/crypto/sha256.bit`'s `bitCryptoSha256HwAvailable()`.
+export fn bit_rt_crypto_sha256_hw_available() callconv(.c) bool {
+    return (cpu.detect(g_environ) & cpu.sha) != 0;
+}
+
+/// `bit_rt_crypto_aes_encrypt_hw`: one AES-NI block encrypt under the forward
+/// FIPS-197 schedule `round_keys` (`16*(nr+1)` bytes — `aes.bit`'s own
+/// `expandKey` layout). Caller (`aes.bit`'s `encryptBlockInto`) has already
+/// checked `bitCryptoAesHwAvailable`.
+export fn bit_rt_crypto_aes_encrypt_hw(round_keys: [*]const u8, nr: i64, block: [*]const u8, out: [*]u8) callconv(.c) void {
+    if (is_x86_64) cryptohw.encryptBlock(round_keys, nr, block, out) else @panic("bit_rt_crypto_aes_encrypt_hw: x86-64 only");
+}
+
+/// `bit_rt_crypto_aes_decrypt_hw`: one AES-NI block decrypt under the
+/// decrypt-equivalent schedule `dec_round_keys` (see
+/// `bit_rt_crypto_aes_invert_schedule_hw`).
+export fn bit_rt_crypto_aes_decrypt_hw(dec_round_keys: [*]const u8, nr: i64, block: [*]const u8, out: [*]u8) callconv(.c) void {
+    if (is_x86_64) cryptohw.decryptBlock(dec_round_keys, nr, block, out) else @panic("bit_rt_crypto_aes_decrypt_hw: x86-64 only");
+}
+
+/// `bit_rt_crypto_aes_invert_schedule_hw`: derive the AES-NI decrypt-schedule
+/// (`AESIMC` on every interior round key) from the forward schedule
+/// `enc_round_keys` computed by `aes.bit`'s existing software `expandKey`.
+export fn bit_rt_crypto_aes_invert_schedule_hw(enc_round_keys: [*]const u8, nr: i64, out: [*]u8) callconv(.c) void {
+    if (is_x86_64) cryptohw.invertSchedule(enc_round_keys, nr, out) else @panic("bit_rt_crypto_aes_invert_schedule_hw: x86-64 only");
+}
+
+/// `bit_rt_crypto_ghash_mul_hw`: one PCLMULQDQ GHASH block step, `acc = (acc
+/// XOR block) * H` in GF(2^128) — bit-for-bit the same NIST-defined product
+/// `gcm.bit`'s software `gcmMulHWords(acc, b0, b1, h0, h1)` computes. Returns
+/// the low word; `out_hi` receives the high word (an `extern function` result
+/// is one scalar, so the second word needs an out-pointer).
+export fn bit_rt_crypto_ghash_mul_hw(acc0: u64, acc1: u64, b0: u64, b1: u64, h0: u64, h1: u64, out_hi: *u64) callconv(.c) u64 {
+    if (is_x86_64) return cryptohw.ghashMul(acc0, acc1, b0, b1, h0, h1, out_hi);
+    @panic("bit_rt_crypto_ghash_mul_hw: x86-64 only");
+}
+
+/// `bit_rt_crypto_sha256_compress_hw`: one SHA-NI compression round over a
+/// 64-byte block, updating the 8-word `state` in place — bit-for-bit the same
+/// FIPS-180-4 round function `sha256.bit`'s software `compress` runs (shared
+/// by SHA-224 and SHA-256, which differ only in IV/output truncation, both
+/// applied outside `compress`).
+export fn bit_rt_crypto_sha256_compress_hw(state: [*]u32, block: [*]const u8) callconv(.c) void {
+    if (is_x86_64) cryptohw.compress(state, block) else @panic("bit_rt_crypto_sha256_compress_hw: x86-64 only");
 }
 
 // ---------------------------------------------------------------------------

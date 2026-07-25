@@ -23,6 +23,18 @@
 // The 128-bit state lives in fixed two-element `[]u64` arrays and every step is a
 // small helper, both for readability and to keep any one function's live-word set
 // modest — 128-bit field math is otherwise a register-pressure trap.
+//
+// HARDWARE FAST PATH (task #1223). `gcmMulHWords` calls PCLMULQDQ through
+// `runtime/cryptohw.zig` when `bit_rt_crypto_ghash_hw_available()` reports it,
+// else runs the constant-time shift-and-xor above unchanged; `gcmGctr`
+// similarly prefers `aes.bit`'s (itself AES-NI-accelerated) `encryptBlockInto`
+// over the bitsliced software keystream when `bit_rt_crypto_aes_hw_available()`
+// — GCM's real bulk cost. Both branch on the same cached CPU-capability flag
+// `aes.bit` already declared `bit_rt_crypto_aes_hw_available` for (siblings
+// share one module, so it needs no re-declaration here); see that file and
+// ABI.md §21b.
+extern function bit_rt_crypto_ghash_hw_available(): bool
+extern function bit_rt_crypto_ghash_mul_hw(acc0: uint, acc1: uint, b0: uint, b1: uint, h0: uint, h1: uint, outHi: *uint): uint
 
 // Load 8 bytes of `data` at `off` as a big-endian `u64`, treating any index past
 // the end as a zero byte (the zero-padding GHASH applies to a final short block).
@@ -120,6 +132,14 @@ function gcmMulH(acc: []u64, block: []u64, h: []u64) {
 // allocation, the previous two-word-array formulation's dominant cost — and
 // writes the result back into the caller's two-word `acc`.
 function gcmMulHWords(acc: []u64, b0: u64, b1: u64, h0: u64, h1: u64) {
+  if (bit_rt_crypto_ghash_hw_available()) {
+    let outHi = []uint(1)
+    let lo = bit_rt_crypto_ghash_mul_hw(acc[0], acc[1], b0, b1, h0, h1, ptrOf(outHi))
+    acc[0] = outHi[0]
+    acc[1] = lo
+    return
+  }
+
   // R = 11100001 ‖ 0^120: 0xe1 in the top byte of word 0, the fold applied when a
   // 1 falls off the low end of V during the ×x shift.
   let r: u64 = 0xe100000000000000
@@ -225,8 +245,32 @@ function gcmCopyBlock(src: []byte): []byte {
 // end still get a valid (advanced) counter but their keystream is simply not used.
 function gcmGctr(cipher: AesCipher, icb: []byte, data: []byte): []byte {
   let out = []byte(len(data))
-  let sk = aesctExpandSkey(cipher.roundKeys, cipher.nr)
   let counter = gcmCopyBlock(icb)
+
+  if (bit_rt_crypto_aes_hw_available()) {
+    // One AES-NI block encrypt per counter block beats even the bitsliced
+    // 4-wide software keystream by a wide margin, so prefer it outright
+    // rather than only accelerating the scalar path below.
+    let ksBlock = []byte(16)
+    let off = 0
+    while (off < len(data)) {
+      cipher.encryptBlockInto(ksBlock, counter)
+      gcmInc32(counter)
+      let n = len(data) - off
+      if (n > 16) {
+        n = 16
+      }
+      let k = 0
+      while (k < n) {
+        out[off + k] = data[off + k] ^ ksBlock[k]
+        k = k + 1
+      }
+      off = off + 16
+    }
+    return out
+  }
+
+  let sk = aesctExpandSkey(cipher.roundKeys, cipher.nr)
   let blocks = []byte(64)
   let ks = []byte(64)
   let off = 0
@@ -272,6 +316,13 @@ function gcmTag(s: []u64, ej0: []byte): []byte {
     i = i + 1
   }
   return tag
+}
+
+// Whether `gcmMulHWords` is taking the PCLMULQDQ hardware path on this host
+// (task #1223) rather than the shift-and-xor software path — a diagnostic
+// query, like `hwAvailableAes` (aes.bit); the dispatch itself is transparent.
+export function hwAvailableGhash(): bool {
+  return bit_rt_crypto_ghash_hw_available()
 }
 
 // A keyed AES-GCM cipher. `cipher` is the expanded AES schedule; `h` is the hash

@@ -849,6 +849,14 @@ defined exactly once).
 | `bit_rt_net_resolve`  | `(host: *const RtBytes) -> *const RtBytes` (§20)       |
 | `bit_rt_random_bytes` | `(len: i64) -> *const RtBytes` (§21)                   |
 | `bit_rt_secure_zero`  | `(h: *SliceHeader) -> void` (§21)                      |
+| `bit_rt_crypto_aes_hw_available` | `() -> bool` (§21b)                         |
+| `bit_rt_crypto_ghash_hw_available` | `() -> bool` (§21b)                       |
+| `bit_rt_crypto_sha256_hw_available` | `() -> bool` (§21b)                      |
+| `bit_rt_crypto_aes_encrypt_hw` | `(rk: *byte, nr: i64, block: *byte, out: *byte) -> void` (§21b) |
+| `bit_rt_crypto_aes_decrypt_hw` | `(drk: *byte, nr: i64, block: *byte, out: *byte) -> void` (§21b) |
+| `bit_rt_crypto_aes_invert_schedule_hw` | `(erk: *byte, nr: i64, out: *byte) -> void` (§21b) |
+| `bit_rt_crypto_ghash_mul_hw` | `(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64` (§21b) |
+| `bit_rt_crypto_sha256_compress_hw` | `(state: *u32, block: *byte) -> void` (§21b) |
 
 **Narrow return values.** The C ABI returns a `bool` in `al`/`w0` and leaves the
 rest of the return register **unspecified**; the same is true of any sub-word
@@ -1401,6 +1409,86 @@ one byte per 8-byte word (§2), wiping the word range clears every logical byte.
 The wipe is `@memset` followed by a compiler memory barrier so dead-store
 elimination cannot drop it — the standard defense against a "cleared" key
 lingering in memory.
+
+---
+
+## 21b. Hardware crypto fast paths (`runtime/cpu.zig` + `runtime/cryptohw.zig`, task #1223)
+
+x86-64 AES-NI / PCLMULQDQ / SHA-NI, runtime-CPUID-gated, reached from
+`stdlib/crypto/{aes,gcm,sha256}.bit` through plain `extern function`
+declarations (SPEC.md §11.7) rather than the `RtFn` mechanism §12-§21 above
+use — every parameter and result is a scalar or raw pointer (`extern
+function`'s exact admission rule), so no compiler-side wiring (`RtFn` enum,
+lowering table, in either compiler) is needed. Highest-value primitives only,
+per the task's own scope: **ChaCha20/Poly1305 SIMD acceleration is an
+explicitly deferred follow-up**, not covered here.
+
+```
+bit_rt_crypto_aes_hw_available()      -> bool   // AES-NI usable: AES + AVX + OS XSAVE
+bit_rt_crypto_ghash_hw_available()    -> bool   // PCLMULQDQ usable: PCLMUL + AVX + OS XSAVE
+bit_rt_crypto_sha256_hw_available()   -> bool   // SHA-NI usable: SHA + AVX2 + OS XSAVE
+
+bit_rt_crypto_aes_encrypt_hw(rk: *byte, nr: i64, block: *byte, out: *byte)
+bit_rt_crypto_aes_decrypt_hw(drk: *byte, nr: i64, block: *byte, out: *byte)
+bit_rt_crypto_aes_invert_schedule_hw(erk: *byte, nr: i64, out: *byte)
+bit_rt_crypto_ghash_mul_hw(acc0, acc1, b0, b1, h0, h1: u64, outHi: *u64) -> u64
+bit_rt_crypto_sha256_compress_hw(state: *u32, block: *byte)
+```
+
+**Runtime detection, not compile-time.** Bit ships one binary per target that
+must run on any host CPU of that architecture — unlike Zig's own
+`std.crypto`, which selects its AES-NI/PCLMULQDQ/SHA-NI paths at *compile*
+time from `builtin.cpu.has(...)` (a decision baked into the binary by
+`-mcpu`), `runtime/cpu.zig` probes the actual host via the raw `cpuid` and
+`xgetbv` instructions (both baseline x86-64 opcodes, always legal to issue —
+no target-feature gating needed to execute the probe itself) and caches the
+result on first use. `BIT_CRYPTO_NO_HW=1` (or `on`) forces every
+`bit_rt_crypto_*_hw_available` false, read once at the same first-use point,
+so the constant-time software path can be exercised and cross-checked
+against the hardware path even on capable silicon — the fallback
+verification the task requires.
+
+**Feature gates match Zig std.crypto's own precedent exactly**, not an
+independently invented set: AES-NI needs `AES + AVX`; PCLMULQDQ needs
+`PCLMUL + AVX`; SHA-NI needs `SHA + AVX2`. All four CPUID bits also require
+`OSXSAVE` (`CPUID.1:ECX[27]`) and `XGETBV(0)` reporting the OS has opted the
+SSE/AVX state into its context-switch save set (`XCR0` bits 1-2) — the
+standard "CPU says yes, but has the OS enabled it" check every real-world
+AVX-using library performs before dispatching; skipping it is a genuine
+`#UD`/state-corruption risk on an OS that has not opted in.
+
+**Dispatch cannot leak.** Every `bit_rt_crypto_*_hw_available` call reads one
+cached process-wide flag, decided once from the host CPU, never from key or
+plaintext bytes — the `if (bitCryptoAesHwAvailable()) { ... } else { ... }`
+gate in each `stdlib/crypto` module is a branch on a CPU-capability constant,
+the same shape as any other host-detection branch in the codebase, not a
+data-dependent one.
+
+**AES-NI key material.** `bit_rt_crypto_aes_encrypt_hw` takes the plain
+FIPS-197 forward round-key schedule (`16*(nr+1)` bytes, one 128-bit round key
+per round) exactly as `aes.bit`'s existing constant-time software
+`expandKey` already produces — no format translation, and no
+hardware-accelerated key *expansion* (`AESKEYGENASSIST`): expansion runs once
+per cipher construction, not in a hot loop, so the existing software path
+already covers it at negligible cost. The one place hardware genuinely helps
+key material is `bit_rt_crypto_aes_invert_schedule_hw`, which runs `AESIMC`
+(InvMixColumns) over each interior round key to derive the decrypt-equivalent
+schedule `bit_rt_crypto_aes_decrypt_hw` consumes — the actual expensive part
+of preparing a decrypt schedule.
+
+**GHASH.** `bit_rt_crypto_ghash_mul_hw` computes the same NIST
+SP800-38D-defined GF(2^128) product `gcm.bit`'s software
+`gcmMulHWords(acc, b0, b1, h0, h1)` does, from the same big-endian
+wire-byte-order words, via PCLMULQDQ carryless-multiply (Karatsuba-free
+schoolbook, 3 `vpclmulqdq`s) and Shay Gueron's reduction rather than the
+software path's 128-iteration shift-and-xor — a different algorithm
+computing the one function GCM defines, so the two agree bit-for-bit by
+construction.
+
+**SHA-256 compression.** `bit_rt_crypto_sha256_compress_hw` runs the same
+FIPS-180-4 round function `sha256.bit`'s software `compress` does, shared
+unchanged by SHA-224 and SHA-256 (they differ only in IV and output
+truncation, both applied outside `compress`).
 
 ---
 
