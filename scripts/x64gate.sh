@@ -39,7 +39,9 @@ IMAGE="bit-zig-0.16.0-amd64:latest"
 #                             `libc_nonshared.a` and `Scrt1.o`, both
 #                             "unknown target CPU 'athlon-xp'".
 # Zero Bit code executes in the emulated failure, so it cannot be a Bit defect.
-STEP="test"
+# STEP defaults to the full suite but an exported STEP env wins (scripts/gate.sh
+# sets it to a scoped set like "test-golden test-imports"). #1772.
+STEP="${STEP:-test}"
 if [ "${MODE}" = "fuzz" ]; then
   STEP="fuzz -- ${FUZZ_SECS:-60}"
   MODE="fast"
