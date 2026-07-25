@@ -129,6 +129,35 @@ Consumers:
 A checksum mismatch must abort loudly; there is no signature layer behind it
 yet, so this file is the only integrity check a downloader gets.
 
+## Known nondeterminism
+
+`scripts/verify-reproducible-release.sh` (#1753) rebuilds a released tag in a
+throwaway git worktree and diffs the rebuild's extracted contents + per-file
+sha256 against the published `SHA256SUMS`. One source of drift is known and
+cannot be eliminated from this repo alone:
+
+* **`zig build libbitrt`'s archive member name.** Each `lib/<triple>/libbitrt.a`
+  is a plain `ar` archive Zig's own build system produces; every byte is
+  reproducible except one thing — the member name it gives the bundled
+  compilation unit, e.g. `.zig-cache/o/<hex>/libbitrt_zcu.o`, where `<hex>` is
+  a Zig-internal build-cache digest. Rebuilding the identical source, at the
+  identical path, with a cleared cache, still changes this digest run to run —
+  confirmed by diffing two such rebuilds: of 692246 bytes, exactly the 28 bytes
+  of that one hex string differ, byte-for-byte identical everywhere else
+  (symbol table, every object's code and data). The digest is not path- or
+  input-derived in any way this repo controls; it comes from Zig 0.16.0's own
+  cache manifest hashing. Nothing downstream depends on that member name (Bit's
+  own static linker reads the archive's symbol table and section contents, not
+  member names), but it is bytes inside the shipped `.tar.xz`, so
+  `verify-reproducible-release.sh` correctly reports `lib/<triple>/libbitrt.a`
+  as differing rather than silently ignoring it.
+
+If this ever needs eliminating rather than tolerating, the fix belongs in
+`dist/package.sh`: re-archive each `libbitrt.a` with fixed member names right
+after `zig build libbitrt`, before hashing or packaging. Out of scope here —
+this file documents what verify-reproducible-release.sh already tells the
+truth about, not a proposal to build.
+
 ## How the pipeline is verified
 
 The `dist` job smoke-tests the **unpacked artifact**, not the staging tree: it

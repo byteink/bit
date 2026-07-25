@@ -69,11 +69,11 @@ echo "building seed + runtime archives at ${TAG}..."
 FAIL=0
 for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
   case "${TARGET}" in
-    x86_64-linux)  os=linux; arch=x86_64 ;;
-    aarch64-linux) os=linux; arch=aarch64 ;;
-    aarch64-macos) os=macos; arch=aarch64 ;;
+    x86_64-linux)  OS=linux;  ARCH=x86_64 ;;
+    aarch64-linux) OS=linux;  ARCH=aarch64 ;;
+    aarch64-macos) OS=macos;  ARCH=aarch64 ;;
   esac
-  NAME="bit-${VERSION}-${os}-${arch}"
+  NAME="bit-${VERSION}-${OS}-${ARCH}"
   published_tar="${PUBLISHED_DIR}/${NAME}.tar.xz"
 
   if [ ! -f "${published_tar}" ]; then
@@ -108,8 +108,8 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
     continue
   fi
 
-  hash_diff="$(diff <(cd "${WORK}/extract-${TARGET}/published" && find . -type f -exec shasum -a 256 {} \; | sort -k2) \
-                     <(cd "${WORK}/extract-${TARGET}/rebuilt" && find . -type f -exec shasum -a 256 {} \; | sort -k2) || true)"
+  hash_diff="$(diff <(cd "${WORK}/extract-${TARGET}/published" && find . -type f -exec shasum -a 256 {} + | sort -k2) \
+                     <(cd "${WORK}/extract-${TARGET}/rebuilt" && find . -type f -exec shasum -a 256 {} + | sort -k2) || true)"
   if [ -n "${hash_diff}" ]; then
     echo "verify-reproducible-release.sh: ${TARGET}: CONTENT differs:" >&2
     echo "${hash_diff}" >&2
