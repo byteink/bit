@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Shared by selfhost-diffir.sh and selfhost-diffiropt.sh (#1766).
 #
 # `$t<id>` type-id suffixes are assigned in first-touch interning order, which

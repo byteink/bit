@@ -58,8 +58,10 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
   fi
 
   # $t<id> suffixes are interning-order artifacts, not structural — canonicalize
-  # before comparing (see selfhost-ir-canon.sh).
-  if [ "$(canon_ir_ids "$seed")" = "$(canon_ir_ids "$b2")" ]; then
+  # before comparing (see selfhost-ir-canon.sh). Raw compare first: the
+  # overwhelming majority of files already match byte-for-byte, so skip the
+  # two awk forks unless the raw strings actually differ.
+  if [ "$seed" = "$b2" ] || [ "$(canon_ir_ids "$seed")" = "$(canon_ir_ids "$b2")" ]; then
     match=$((match + 1))
   else
     echo "$f" >>"$work/mismatch"
