@@ -29,16 +29,23 @@ struct AddResult { name: string, specRef: string, url: string, commit: string }
 
 // ---- CLI entry --------------------------------------------------------
 
-// `bit add <gitHost/owner/repo>[@ref] [--dir <path>]`. Returns the process
-// exit code: 2 on a usage error, 1 on a fetch/resolve/write failure, 0 on
-// success.
+// `bit add <gitHost/owner/repo>[@ref] [--dir <path>] [--url <override>]`.
+// `--url`, when given, is the URL actually fetched from instead of the
+// `https://<host>/<owner>/<repo>.git` the spec derives — a CLI-only escape
+// hatch for a private registry mirror or a `file://` fixture in a test. It is
+// never recorded: `bit.json`'s dependency grammar (spec §17.7) has no field
+// for a URL at all, and `bit.lock`'s `url` field keeps recording the derived
+// `https://` URL so the lockfile stays reproducible from `bit.json` alone,
+// exactly as spec §17.7 documents it, even on a run that used the override.
+// Returns the process exit code: 2 on a usage error, 1 on a fetch/resolve/
+// write failure, 0 on success.
 function addCmd(a: []string): int {
   if (len(a) < 3) {
-    eprint("usage: bit add <gitHost/owner/repo>[@ref] [--dir <path>]\n")
+    eprint("usage: bit add <gitHost/owner/repo>[@ref] [--dir <path>] [--url <override>]\n")
     return 2
   }
   let specArg = a[2]
-  let (projectDir, badArg, hasBadArg) = parseDirFlag(a, 3)
+  let (projectDir, urlOverride, badArg, hasBadArg) = parseAddFlags(a, 3)
   if (hasBadArg) {
     eprint("bit add: unexpected argument '${badArg}'\n")
     return 2
@@ -50,6 +57,10 @@ function addCmd(a: []string): int {
     return 2
   }
   let url = defaultDepUrl(d.host, d.owner, d.repo)
+  let fetchUrl = url
+  if (len(urlOverride) > 0) {
+    fetchUrl = urlOverride
+  }
   let cacheRoot = defaultCacheRoot() catch e {
     eprint("bit add: ${e.message()}\n")
     return 1
@@ -57,7 +68,7 @@ function addCmd(a: []string): int {
 
   let result = addDependency(
     projectDir, cacheRoot, defaultGitBin,
-    d.host, d.owner, d.repo, d.ref, hadRef, url,
+    d.host, d.owner, d.repo, d.ref, hadRef, url, fetchUrl,
     pmCliDefaultTimeoutMs,
   ) catch e {
     eprint("bit add: ${e.message()}\n")
@@ -127,6 +138,31 @@ function parseDirFlag(a: []string, start: int): (string, string, bool) {
   return projectDir, "", false
 }
 
+// `addCmd`-only: like `parseDirFlag`, but also accepts `--url <override>`
+// (interleaved with `--dir` in any order) — the CLI-only fetch-URL escape
+// hatch documented on `addCmd`. `removeCmd` has no use for a fetch URL and
+// keeps using the plain `parseDirFlag` above. Returns the project directory,
+// the URL override (`""` if `--url` was never given), the offending trailing
+// argument, and whether one was found — same not-a-sentinel reasoning as
+// `parseDirFlag`.
+function parseAddFlags(a: []string, start: int): (string, string, string, bool) {
+  let projectDir = "."
+  let urlOverride = ""
+  let ai = start
+  while (ai < len(a)) {
+    if (a[ai] == "--dir" && ai + 1 < len(a)) {
+      projectDir = a[ai + 1]
+      ai = ai + 2
+    } else if (a[ai] == "--url" && ai + 1 < len(a)) {
+      urlOverride = a[ai + 1]
+      ai = ai + 2
+    } else {
+      return projectDir, urlOverride, a[ai], true
+    }
+  }
+  return projectDir, urlOverride, "", false
+}
+
 // `gitHost/owner/repo[@ref]` — like pmfetch.bit's own `parseSpec`, but `ref`
 // is OPTIONAL here (ticket #1734, step 1: default to the remote's default
 // branch HEAD). `resolveDependencyRef` already knows how to resolve the
@@ -159,21 +195,26 @@ function parseAddSpec(spec: string): DepSpec! {
 //  5. regenerate bit.lock (pmlock.writeLock) with the resolved commit and the
 //     fetched dependency's own transitive requirements.
 //
-// `url` is a plain parameter, not derived here — the same layering
-// pmfetch.bit itself uses (its `DepSpec` never carries a url either) — so
-// this is directly testable against a `file://` fixture (pmclicheck.bit)
-// without needing a real `https://` remote. `addCmd` above always derives it
-// as `https://<host>/<owner>/<repo>.git`, per SPEC §17.7's git-only registry
-// model.
+// `url` and `fetchUrl` are plain parameters, not derived here — the same
+// layering pmfetch.bit itself uses (its `DepSpec` never carries a url
+// either) — so this is directly testable against a `file://` fixture
+// (pmclicheck.bit) without needing a real `https://` remote. `addCmd` above
+// always derives `url` as `https://<host>/<owner>/<repo>.git`, per SPEC
+// §17.7's git-only registry model; `fetchUrl` is the same value unless its
+// `--url` escape hatch overrode it. The two are kept apart deliberately:
+// `fetchUrl` is where the fetch actually reaches (below), `url` is what ends
+// up in `bit.lock` (`upsertLockEntry`, at the bottom of this function) — so
+// an override never leaks into a written file, only into where this one run
+// looked.
 export function addDependency(
   projectDir: string, cacheRoot: string, gitBin: string,
   host: string, owner: string, repo: string, ref: string, refIsExplicit: bool,
-  url: string, timeoutMs: int,
+  url: string, fetchUrl: string, timeoutMs: int,
 ): AddResult! {
   let name = repo
   let lockPath = pmJoin(projectDir, "bit.lock")
   let entries = readLock(lockPath)?
-  let entry = resolveDependency(cacheRoot, gitBin, name, host, owner, repo, ref, url, entries, timeoutMs)?
+  let entry = resolveDependency(cacheRoot, gitBin, name, host, owner, repo, ref, url, fetchUrl, entries, timeoutMs)?
 
   let finalRef = ref
   if (!refIsExplicit) {
@@ -197,19 +238,23 @@ export function addDependency(
 
 // The fetch/resolve/MVS-check sequence `bit add` and `bit up` both need,
 // kept in exactly one place (ticket #1735's hard constraint: never fork
-// #1734's plumbing): re-resolve `ref` against `url` to a commit, fetch it into
-// the cache, read its own transitive requirements, and re-run MVS
+// #1734's plumbing): re-resolve `ref` against `fetchUrl` to a commit, fetch it
+// into the cache, read its own transitive requirements, and re-run MVS
 // (`checkVersionConflict`) against `existing`'s already-locked transitive
 // requirements. Returns the fresh `LockEntry` without writing bit.lock —
 // the caller (an add of one new dependency, or an up refreshing one already
 // in bit.lock) decides how and when that gets written.
+//
+// `url` and `fetchUrl` differ only when `bit add --url` overrode where this
+// one run looks (#1767): the fetch reaches `fetchUrl`, while the returned
+// `LockEntry` records `url`, so an override never leaks into bit.lock.
 function resolveDependency(
   cacheRoot: string, gitBin: string,
   name: string, host: string, owner: string, repo: string, ref: string, url: string,
-  existing: []LockEntry, timeoutMs: int,
+  fetchUrl: string, existing: []LockEntry, timeoutMs: int,
 ): LockEntry! {
-  let sha = resolveDependencyRef(gitBin, url, ref, timeoutMs)?
-  let fetched = fetchSha(gitBin, cacheRoot, host, owner, repo, url, sha, timeoutMs)?
+  let sha = resolveDependencyRef(gitBin, fetchUrl, ref, timeoutMs)?
+  let fetched = fetchSha(gitBin, cacheRoot, host, owner, repo, fetchUrl, sha, timeoutMs)?
   let depManifest = readManifest(fetched.dir)?
   let depRequires = manifestRequires(depManifest)
   checkVersionConflict(existing, name, ref, depRequires)?
@@ -511,9 +556,11 @@ export function upDependencies(
     let d = deps[i]
     let fallbackUrl = defaultDepUrl(d.spec.host, d.spec.owner, d.spec.repo)
     let url = existingUrlFor(entries, d.name, fallbackUrl)
+    // `bit up` has no `--url` escape hatch: it refreshes what bit.lock
+    // already records, so the fetch reaches the same url it will write back.
     let entry = resolveDependency(
       cacheRoot, gitBin, d.name, d.spec.host, d.spec.owner, d.spec.repo, d.spec.ref, url,
-      entries, timeoutMs,
+      url, entries, timeoutMs,
     )?
     entries = upsertLockEntry(entries, d.name, entry.url, entry.commit, entry.requires)
     out = append(out, UpResult{ name: d.name, ref: d.spec.ref, url: entry.url, commit: entry.commit })

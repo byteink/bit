@@ -457,7 +457,17 @@ fn runOne(
     expected: []const u8,
     timeout_s: u32,
 ) !void {
-    const outcome = try proc.run(arena, io, timeout_s, .{ .argv = &.{bin_path} });
+    // The child inherits this process's own environment plus one addition: the
+    // absolute path of the compiler that built it. Cloning (rather than a
+    // fresh two-key map, as `buildSelfhost` uses for the compiler itself) is
+    // required here because a *program* under test may depend on anything an
+    // ordinary shell invocation would see (PATH, HOME, ...) — only a program
+    // that reads BIT_SELF_EXE is affected by the addition (#1767).
+    std.debug.assert(self_compiler.len > 0);
+    var env = try std.process.Environ.createMap(std.testing.environ, arena);
+    defer env.deinit();
+    try env.put("BIT_SELF_EXE", self_compiler);
+    const outcome = try proc.run(arena, io, timeout_s, .{ .argv = &.{bin_path}, .environ_map = &env });
     const result = switch (outcome) {
         .finished => |r| r,
         .timed_out => |limit| {
