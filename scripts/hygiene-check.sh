@@ -78,7 +78,11 @@ fi
 
 # A branch checked out in a live worktree is not stray either — exclude it here
 # or every locked worktree reports twice, once as itself and once as its branch.
-br=$(git branch --format='%(refname:short)' 2>/dev/null | grep -v '^main$')
+# smash/task-* branches are created, moved and deleted by the live smash daemon;
+# they are not stray dev branches and cannot be reconciled by hand without racing
+# it (the ref set mutates mid-check), so exclude them — the worktree section above
+# already reports any smash worktree that actually needs attention.
+br=$(git branch --format='%(refname:short)' 2>/dev/null | grep -v '^main$' | grep -v '^smash/task-')
 if [ -n "${br}" ] && [ -n "${wt_live}" ]; then
   live_br=$(printf '%s' "${wt_live}" | sed -n 's/.*\[\(.*\)\].*/\1/p')
   for b in ${live_br}; do
