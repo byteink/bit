@@ -14,6 +14,13 @@ fn wireLibbitrt(opts: *std.Build.Step.Options, bin: ?std.Build.LazyPath) void {
     if (bin) |lp| opts.addOptionPath("libbitrt_path", lp) else opts.addOption([]const u8, "libbitrt_path", "");
 }
 
+/// Gives an already-constructed test RUN its own independently-runnable step
+/// (mirroring test-stress/test-imports), without building a second artifact —
+/// the umbrella `test` step and the named step both depend on the same `run`.
+fn addNamedRun(b: *std.Build, run: *std.Build.Step.Run, name: []const u8, desc: []const u8) void {
+    b.step(name, desc).dependOn(&run.step);
+}
+
 /// Extracts the toolchain version from `selfhost/version.bit`, the single
 /// source of truth both compilers report (#1451). The self-hosted `bit`
 /// compiles that constant directly; the Zig seed cannot, so its copy is parsed
@@ -311,6 +318,7 @@ pub fn build(b: *std.Build) void {
     // the second compiler with it.
     golden_run.has_side_effects = true;
     test_step.dependOn(&golden_run.step);
+    addNamedRun(b, golden_run, "test-golden", "run the golden tests/cases/*.bit harness only");
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
     // Examples guard: discovers examples/*.bit and compiles + runs each so the
@@ -336,6 +344,7 @@ pub fn build(b: *std.Build) void {
     // run is cache-skipped and a broken example passes silently.
     examples_run.has_side_effects = true;
     test_step.dependOn(&examples_run.step);
+    addNamedRun(b, examples_run, "test-examples", "run the examples/*.bit build+run guard only");
 
     // Runtime-pin cycle gate (#1367): emits each ported runtime module as an
     // ELF object and refuses any pinned ABI definition that references the very
@@ -536,7 +545,9 @@ pub fn build(b: *std.Build) void {
     gcdiff_mod.addOptions("build_options", stress_opts);
 
     const gcdiff_tests = b.addTest(.{ .root_module = gcdiff_mod });
-    test_step.dependOn(&b.addRunArtifact(gcdiff_tests).step);
+    const gcdiff_run = b.addRunArtifact(gcdiff_tests);
+    test_step.dependOn(&gcdiff_run.step);
+    addNamedRun(b, gcdiff_run, "test-gcdiff", "run the GC differential (tests/gcdiff.zig) only");
 
     // `bit version` (#1451): both compilers must report the stamped version, and
     // a typo'd subcommand must be a usage error rather than the banner it used
@@ -552,7 +563,9 @@ pub fn build(b: *std.Build) void {
     });
     version_mod.addOptions("build_options", version_opts);
     const version_tests = b.addTest(.{ .root_module = version_mod });
-    test_step.dependOn(&b.addRunArtifact(version_tests).step);
+    const version_run = b.addRunArtifact(version_tests);
+    test_step.dependOn(&version_run.step);
+    addNamedRun(b, version_run, "test-version", "run the `bit version` contract (tests/version.zig) only");
 
     // `bit test` runner (#1105): discovers `test_` functions and runs each in
     // its own process (a failed `assert` panics). Shares the host libbitrt
@@ -569,7 +582,9 @@ pub fn build(b: *std.Build) void {
     testcmd_mod.addOptions("build_options", testcmd_opts);
 
     const testcmd_tests = b.addTest(.{ .root_module = testcmd_mod });
-    test_step.dependOn(&b.addRunArtifact(testcmd_tests).step);
+    const testcmd_run = b.addRunArtifact(testcmd_tests);
+    test_step.dependOn(&testcmd_run.step);
+    addNamedRun(b, testcmd_run, "test-testcmd", "run the `bit test` runner contract (tests/testcmd.zig) only");
 
     // `bit lint` CLI contract (#1380): exit codes, path walk, summary line,
     // `--json`, `--stats`. Execs the SELF-HOSTED `bit` (lint is selfhost-only),
@@ -605,7 +620,9 @@ pub fn build(b: *std.Build) void {
     osenv_mod.addOptions("build_options", osenv_opts);
 
     const osenv_tests = b.addTest(.{ .root_module = osenv_mod });
-    test_step.dependOn(&b.addRunArtifact(osenv_tests).step);
+    const osenv_run = b.addRunArtifact(osenv_tests);
+    test_step.dependOn(&osenv_run.step);
+    addNamedRun(b, osenv_run, "test-osenv", "run the std/os args+environment round-trip (tests/osenv.zig) only");
 
     // Doc-tests (#351): every ```bit block under docs/ must typecheck against
     // the real prelude and std/*. Front end only — a snippet is a module, not a
@@ -622,7 +639,9 @@ pub fn build(b: *std.Build) void {
     docs_mod.addOptions("build_options", docs_opts);
 
     const docs_tests = b.addTest(.{ .root_module = docs_mod });
-    test_step.dependOn(&b.addRunArtifact(docs_tests).step);
+    const docs_run = b.addRunArtifact(docs_tests);
+    test_step.dependOn(&docs_run.step);
+    addNamedRun(b, docs_run, "test-docs", "run the doc-snippet typecheck gate (tests/docs.zig) only");
 
     // Stdlib doc coverage (#356): every symbol `bit doc` reports as exported must
     // have a section in `docs/stdlib/<module>.md`. Shares the docs options (same
@@ -697,6 +716,7 @@ pub fn build(b: *std.Build) void {
     // cache; without this the run is cache-skipped and drift passes silently.
     fmt_check_run.has_side_effects = true;
     test_step.dependOn(&fmt_check_run.step);
+    addNamedRun(b, fmt_check_run, "test-fmt", "run the Bit-source fmt-canonical gate (tests/fmt_check.zig) only");
 
     // Std-stream writer gate: `.init(.stderr())` builds a POSITIONAL handle that
     // pwrites from offset 0, so a second writer on the same fd overwrites the
@@ -717,6 +737,7 @@ pub fn build(b: *std.Build) void {
     // Sources are read at runtime, invisible to the build cache (as above).
     stdstream_run.has_side_effects = true;
     test_step.dependOn(&stdstream_run.step);
+    addNamedRun(b, stdstream_run, "test-stdstream", "run the std-stream positional-writer gate (tests/stdstream_check.zig) only");
 
     // Multi-module imports + prelude guard (#1153): builds + runs each
     // tests/imports/* program through the whole-project pipeline (relative and
@@ -1021,7 +1042,9 @@ pub fn build(b: *std.Build) void {
     });
     pathresolve_mod.addOptions("build_options", pathresolve_opts);
     const pathresolve_tests = b.addTest(.{ .root_module = pathresolve_mod });
-    test_step.dependOn(&b.addRunArtifact(pathresolve_tests).step);
+    const pathresolve_run = b.addRunArtifact(pathresolve_tests);
+    test_step.dependOn(&pathresolve_run.step);
+    addNamedRun(b, pathresolve_run, "test-pathresolve", "run the install-prefix path-resolution gate (tests/pathresolve.zig) only");
 
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
@@ -1055,4 +1078,5 @@ pub fn build(b: *std.Build) void {
     selfhost_selfcheck.has_side_effects = true;
     selfhost_selfcheck.expectExitCode(0);
     test_step.dependOn(&selfhost_selfcheck.step);
+    addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (selfhost/selfcheck.bit) only");
 }
