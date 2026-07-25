@@ -2020,12 +2020,16 @@ pub fn boot(main_fn: MainFn, environ: std.process.Environ) !i32 {
     g_heap = heap_mod.Heap.init();
     g_gc = try gc_mod.Gc.init(&g_heap, gc_mod.configFromEnv(environ));
 
-    // ABI.md §5: nthreads pinned to 1. Only one green thread is ever actually
-    // executing at a time, which is what lets v1's single-scanner, no-barrier
-    // collector remain correct despite not walking parked tasks' stacks
-    // (nothing runs concurrently with a collection to mutate the heap under
-    // it) — see §5's full rationale for why lifting this pin needs a real
-    // pause-all-workers barrier first.
+    // ABI.md §9: nthreads pinned to 1. Stale note this replaces: earlier text
+    // here said the pin was a collector correctness requirement (a
+    // single-scanner, no-barrier design that could not walk a second mutator's
+    // stack). §5's stop-the-world handshake already supports any number of
+    // concurrent mutators — that was never actually true of this codebase, per
+    // ABI.md §9's boot-sequence note. The pin is scheduler-maturity only: work
+    // stealing across several `sched.zig` workers has no test that exercises
+    // it yet. Raising it is a scheduler ticket, not a GC one (#1769 found this
+    // drift while tracing why a busy single worker can starve a green thread
+    // indefinitely — worth knowing precisely, not just working around).
     g_sched = try sched.Scheduler.init(1);
     try g_sched.start();
 

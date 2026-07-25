@@ -1083,18 +1083,26 @@ const Worker = struct {
     }
 
     fn findWork(self: *Worker) ?*Task {
+        // A due timer is real work, not idle-only bookkeeping: check the
+        // lock-free hint on every call, before anything else. Checking timers
+        // only once this worker ran out of every other kind of work (the old
+        // order) never fires on a fleet that is continuously busy — every
+        // worker's `findWork` keeps returning early from local/global/steal
+        // forever, so `sleepTask` (and anything built on it, e.g.
+        // `quicconnTicker`'s tick) can starve indefinitely (#1769). The hint is
+        // one relaxed atomic load in the overwhelmingly common case of nothing
+        // due, so this costs nothing on the hot path.
+        const now = monoNs();
+        if (self.sched.timers.dueSoon(now)) {
+            _ = self.sched.timers.expire(self.sched, now);
+        }
         if (self.deque.popBottom()) |t| return t;
         if (self.sched.global.pop()) |t| return t;
         for (self.sched.workers) |*other| { // bounded: one pass over all workers
             if (other == self) continue;
             if (other.deque.steal()) |t| return t;
         }
-        // Idle: due sleepers first (an expired timer is work), then the poller.
-        // The idle backoff caps at `max_backoff_ns`, which bounds how late a
-        // timer can fire once its worker has nothing else to run.
-        if (self.sched.timers.expire(self.sched, monoNs()) > 0) {
-            if (self.sched.global.pop()) |t| return t;
-        }
+        // Idle: nothing local, global, stealable, or due — try the poller.
         if (self.sched.poller.pollReady(self.sched, 0) > 0) {
             if (self.sched.global.pop()) |t| return t;
         }
@@ -1110,15 +1118,25 @@ const Worker = struct {
 ///
 /// An unsorted intrusive list: `push` is O(1), and `expire` is one bounded pass
 /// unparking every task whose deadline has passed. Sorting would only pay off
-/// with many timers *and* frequent expiry checks — the check runs solely on a
-/// worker's idle path (below), so a linear scan of the sleepers is cheaper than
-/// keeping the order.
+/// with many timers *and* frequent expiry checks — `findWork` now checks the
+/// lock-free `dueSoon` hint on every scheduling decision (#1769), not only on
+/// a worker's idle path, so a linear scan of the sleepers under `lock` is still
+/// cheaper than keeping the order, as long as taking that lock stays rare.
 ///
 /// ponytail: unsorted list, O(n) expire. Swap in a 4-ary heap if a program ever
 /// holds enough concurrent sleepers for the scan to show up in a profile.
 const TimerQueue = struct {
     lock: SpinLock = .{},
     head: ?*Task = null,
+    /// Earliest deadline among currently-queued sleepers, or `maxInt(u64)` when
+    /// none are pending. `push`/`expire` maintain it under `lock`; `dueSoon`
+    /// reads it without one, so `findWork` — called on every worker context
+    /// switch — can skip the lock entirely in the common case of nothing due,
+    /// instead of only discovering a due timer once a worker has run out of
+    /// every other kind of work. That old gating is what let a continuously
+    /// busy fleet starve `sleepTask` forever: no worker's `findWork` ever
+    /// reached the timer check at all (#1769).
+    earliest_ns: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
 
     /// Links `t` in. Runs as a `ParkFn` — i.e. after the task's context is
     /// safely saved — so the deadline is visible before any worker can expire it.
@@ -1127,6 +1145,20 @@ const TimerQueue = struct {
         defer self.lock.release();
         t.timer_next = self.head;
         self.head = t;
+        if (t.deadline_ns < self.earliest_ns.load(.monotonic)) {
+            self.earliest_ns.store(t.deadline_ns, .release);
+        }
+    }
+
+    /// Lock-free hint: whether `now` may have reached the earliest queued
+    /// deadline. Never a false negative — `earliest_ns` only ever moves to an
+    /// earlier time outside of `expire` recomputing it from what is actually
+    /// still queued, and both happen under `lock` — so callers may safely skip
+    /// `expire` when this is false. A false positive (checked right as the
+    /// deadline passes, or after `expire` already cleared it) just costs one
+    /// uncontended lock acquire and an empty scan.
+    fn dueSoon(self: *TimerQueue, now: u64) bool {
+        return now >= self.earliest_ns.load(.acquire);
     }
 
     /// Unparks every sleeper whose deadline has passed. Returns how many woke.
@@ -1135,6 +1167,7 @@ const TimerQueue = struct {
         self.lock.acquire();
         var due: ?*Task = null;
         var keep: ?*Task = null;
+        var next_earliest: u64 = std.math.maxInt(u64);
         var it = self.head;
         while (it) |t| {
             const next = t.timer_next;
@@ -1144,10 +1177,12 @@ const TimerQueue = struct {
             } else {
                 t.timer_next = keep;
                 keep = t;
+                next_earliest = @min(next_earliest, t.deadline_ns);
             }
             it = next;
         }
         self.head = keep;
+        self.earliest_ns.store(next_earliest, .release);
         self.lock.release();
 
         // Unpark outside the lock: `unpark` pushes onto the global run queue,

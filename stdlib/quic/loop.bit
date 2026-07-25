@@ -24,6 +24,34 @@ function quicconnReader(sock: UdpSocket, inCh: chan<quicconnDgram>) {
 // never parks; it exits when the loop clears `running`. ponytail: a fixed tick
 // stands in for a cancellable per-deadline timer — a native timer channel would
 // let the loop block precisely instead of polling on the tick.
+//
+// #1769: this tick is genuinely droppable and delayable — a fleet kept
+// continuously busy by channel traffic can starve it, on two levels: (1)
+// `runtime/sched.zig`'s `findWork` used to check for a due `sleepTask`
+// deadline only once a worker had *no other* runnable work anywhere, and (2)
+// `runtime/root.zig` pins the scheduler to one OS thread (ABI.md §9 —
+// scheduler-maturity only, not a GC requirement), so a `quicconnLoop` whose
+// `select` keeps finding `inCh`/`cmdCh` immediately ready never parks and
+// never gives that one thread back to this ticker at all. Both are fixed
+// ((1) in `findWork` directly; (2) by having `quicconnLoop` check
+// `quicconnCheckDeadlines` itself, unconditionally, every trip through its
+// own loop — see the call there — so the handshake/idle timeouts no longer
+// depend on a tick arriving).
+//
+// Investigating this ticket's original repro (h3core hanging for 900s+ under
+// `BIT_GC=stress`) with direct instrumentation found neither cause was what
+// was actually happening: the connection never gets far enough for its own
+// `select` to matter. Under `BIT_GC=stress`, `quicconnFlush`'s AEAD encryption
+// of the very first Initial packet — inside the synchronous `quicconnKickoff`
+// that runs before `quicconnLoop`'s while loop starts at all — had not
+// returned even once after 30+ seconds. A plain RSA test with no QUIC, no
+// channels, and no scheduler involvement (`tests/imports/cryptorsa`) shows the
+// identical stall under the same flag. This is the same phenomenon
+// `tests/imports/quicconn`'s own file comment already documents and excludes
+// from stress testing for: a real handshake is millions of loop back-edges,
+// `BIT_GC=stress` collects at every one of them, and the aggregate cost
+// balloons far past what any tick-delivery fix can address. Real, but a
+// separate, already-known issue — not this ticket's mechanism.
 function quicconnTicker(st: quicconnState) {
   while (st.running) {
     quicconnSleepTick()
@@ -56,6 +84,20 @@ function quicconnLoop(st: quicconnState) {
         quicconnOnTick(st) catch e {
           quicconnFail(st)
         }
+    }
+    // #1769: checked here too, unconditionally, not only inside
+    // `quicconnOnTick`. `runtime/root.zig` pins the scheduler to one OS
+    // thread (ABI.md §9), so whenever this `select` keeps finding `inCh` (or
+    // `cmdCh`) immediately ready — sustained traffic, retransmits, duplicate
+    // datagrams — this loop's own green thread never parks and so never gives
+    // the single worker thread back to `quicconnTicker`'s green thread at
+    // all; the tick this loop is waiting on is then never even produced, no
+    // matter how fair `select` or the scheduler's timer queue are. This trip
+    // through the loop is proof enough that the loop itself is still
+    // scheduled, so checking the deadlines right here — on every iteration,
+    // tick or not — no longer depends on the ticker getting a turn.
+    if (st.running) {
+      quicconnCheckDeadlines(st)
     }
   }
   quicconnReleaseWaiters(st)
@@ -175,7 +217,11 @@ function quicconnOnDgram(st: quicconnState, ev: quicconnDgram): ()! {
   quicconnFlush(st)?
 }
 
-function quicconnOnTick(st: quicconnState): ()! {
+// Handshake, abandoned-handshake, and idle timeouts: wall-clock deadlines that
+// must be enforced even if a periodic tick never arrives (#1769 — see the call
+// in `quicconnLoop`). Returns true if the connection was just failed, so a
+// caller mid-tick-processing knows to stop there.
+function quicconnCheckDeadlines(st: quicconnState): bool {
   // A client whose handshake has stalled past the deadline gives up, so a dial
   // to an absent/silent server returns an error rather than hanging. A listener-
   // created server connection (`serverHsTimeout`) applies the same deadline: it
@@ -184,7 +230,7 @@ function quicconnOnTick(st: quicconnState): ()! {
   // before any peer exists, keeps waiting indefinitely.
   if ((st.isClient || st.serverHsTimeout) && !st.established && monotonic() - st.handshakeStart > quicconnHandshakeTimeout) {
     quicconnFail(st)
-    return
+    return true
   }
   // Abandoned-handshake reap (#1709): a listener-created connection whose OWN
   // handshake did not finish until AFTER `quicconnHandshakeTimeout` had already
@@ -216,7 +262,7 @@ function quicconnOnTick(st: quicconnState): ()! {
   // patience budget and the connection is not presumed abandoned.
   if (st.serverHsTimeout && st.established && st.establishedAt - st.handshakeStart > quicconnHandshakeTimeout && monotonic() - st.establishedAt > quicconnAbandonTimeout) {
     quicconnFail(st)
-    return
+    return true
   }
   // Idle timeout (RFC 9000 §10.1): an established connection that has heard
   // nothing from its peer for `st.idleTimeout` is dead. Stopping the loop
@@ -224,6 +270,13 @@ function quicconnOnTick(st: quicconnState): ()! {
   // instead of parking forever behind a PTO that nobody will ever answer.
   if (st.established && monotonic() - st.lastRecv > st.idleTimeout) {
     quicconnFail(st)
+    return true
+  }
+  return false
+}
+
+function quicconnOnTick(st: quicconnState): ()! {
+  if (quicconnCheckDeadlines(st)) {
     return
   }
   quicconnDetectLoss(st, quicconnLvlInitial)
