@@ -1264,6 +1264,29 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&pathresolve_run.step);
     addNamedRun(b, pathresolve_run, "test-pathresolve", "run the install-prefix path-resolution gate (tests/pathresolve.zig) only");
 
+    // External-package imports through bit.lock + the pkg cache (#1737):
+    // selfhost-only (the seed has no bit.lock equivalent), so this drives the
+    // self-hosted `bit` directly through its real CLI rather than the shared
+    // tests/imports.zig harness (which requires the seed to build every
+    // project there too). `selfhost_bit` is wired in at the tail, next to the
+    // artifact it names, same as lintcmd/pathresolve above.
+    const pmimports_opts = b.addOptions();
+    pmimports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    wireLibbitrt(pmimports_opts, host_libbitrt_bin);
+    const pmimports_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pmimports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pmimports_mod.addOptions("build_options", pmimports_opts);
+    const pmimports_tests = b.addTest(.{ .root_module = pmimports_mod });
+    const pmimports_run = b.addRunArtifact(pmimports_tests);
+    // The fixtures are written to /tmp at run time, invisible to the build
+    // cache — same reason as lintcmd, rootpins and diffimports.
+    pmimports_run.has_side_effects = true;
+    b.step("test-pmimports", "run the package-manager import-resolution CLI contract only (tests/pmimports.zig)").dependOn(&pmimports_run.step);
+    test_step.dependOn(&pmimports_run.step);
+
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
@@ -1275,6 +1298,7 @@ pub fn build(b: *std.Build) void {
         lintcmd_opts.addOptionPath("selfhost_bit", selfhosted);
         version_opts.addOptionPath("selfhost_bit", selfhosted);
         pathresolve_opts.addOptionPath("selfhost_bit", selfhosted);
+        pmimports_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
@@ -1283,6 +1307,7 @@ pub fn build(b: *std.Build) void {
         lintcmd_opts.addOption([]const u8, "selfhost_bit", "");
         version_opts.addOption([]const u8, "selfhost_bit", "");
         pathresolve_opts.addOption([]const u8, "selfhost_bit", "");
+        pmimports_opts.addOption([]const u8, "selfhost_bit", "");
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
