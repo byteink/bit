@@ -54,6 +54,7 @@ dist/       packaging (brew formula, install scripts)
 
 ## Testing Conventions
 
+- **Verify scoped changes with `scripts/gate.sh`, not the full suite (#1770).** It reads your `git diff` and runs only the steps that change touches — a `selfhost/**` edit runs the selfhost diffs + `test-imports`, a `tests/cases/**` edit runs `zig build test-golden`, etc. Run the full `zig build test` (all 28 harnesses, ~7 min) only for a cross-cutting change (build.zig, seed/, spec/), a mixed change set, or the final pre-merge gate — and `gate.sh` already falls back to it automatically in those cases. Every harness also has its own named step (`zig build test-golden|test-examples|test-gcdiff|test-version|test-selfcheck|…`) for running one area directly. The `libbitrt.a`/selfhost `bit` rebuild is now source-fingerprint cache-gated, so an unchanged tree skips the ~23s recompile automatically on every `zig build`.
 - Golden-file tests: `tests/cases/*.bit` with sibling `.expected`; line-1 directive selects the mode — `// run` (execute, compare stdout), `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics), `// fmt` (canonicalization), `// types` (inferred-type dump). Every compiler stage adds cases as it lands.
 - Differential testing is the self-hosting gate: Zig and Bit implementations must produce byte-identical AST/type/IR dumps over the full corpus.
 - Doc snippets are CI-verified — tutorial and stdlib docs compile as part of the build; docs that don't compile fail CI.
