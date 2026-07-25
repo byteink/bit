@@ -1015,11 +1015,14 @@ So the rule is where a symbol may legitimately come from, not the platform:
   link: it falls through to a libSystem import and the process aborts at dyld
   load instead, far from the declaration that caused it. The compiler therefore
   has to decide it, which is the one thing accepting everything cannot do.
-- Targeting a Linux triple, symbol **defined in the linked `libbitrt.a`**:
-  accepted. The reference is resolved statically at link time.
-- Targeting a Linux triple, symbol **absent** from that archive: rejected with
-  **E0078**, naming the symbol. A fully static ELF has nothing to resolve it
-  against, so this would otherwise fail deep inside the linker.
+- Targeting a Linux triple, symbol **defined in the linked `libbitrt.a`, or
+  defined by this build's own modules under a §11.9 `@symbol` pin**: accepted.
+  The archive case resolves statically at link time; the pinned case resolves
+  the same way — out of the program's own object, exactly as `bit_main` always
+  has — so a static link has something to resolve it against either way.
+- Targeting a Linux triple, symbol **absent** from that archive **and unpinned**:
+  rejected with **E0078**, naming the symbol. A fully static ELF has nothing to
+  resolve it against, so this would otherwise fail deep inside the linker.
 - In a build whose archive **cannot be read**: rejected on either platform.
   Membership is undecidable there, and an undecided case must fall back to
   rejection — an accept-on-unknown would convert a compile error into a link

@@ -54,9 +54,10 @@ pub const Input = union(enum) {
 
 /// True if `symbol` is **defined** by some member of the `ar` archive `bytes`
 /// when read for `target` — i.e. whether a static link against this archive
-/// would resolve a reference to it. Backs SPEC §11.7's E0078 predicate: an
-/// `extern function` on Linux is admissible exactly when the symbol is already
-/// inside the archive being linked.
+/// would resolve a reference to it. Backs SPEC §11.7's E0078 predicate: on
+/// Linux an `extern function` is admissible when the symbol is inside the
+/// archive being linked, OR pinned by this build's own modules (`externResolvable`
+/// also consults `PinSet`) — this function answers only the archive half.
 ///
 /// "Defined" means a global-binding *atom*, which is what `strip.resolveGlobals`
 /// keys the whole-link symbol table on — the same notion the real link uses, not
