@@ -36,7 +36,8 @@ def main() -> int:
         python = str(Path(venv_dir, "bin", "python3"))
 
         subprocess.run(
-            [pip, "install", "--quiet", "-r", str(ROOT / "dist" / "sbom-requirements.txt")],
+            [pip, "install", "--quiet", "--require-hashes", "-r",
+             str(ROOT / "dist" / "sbom-requirements.txt")],
             check=True,
         )
         out = subprocess.run(
