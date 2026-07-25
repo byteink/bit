@@ -1286,7 +1286,14 @@ fn constPow2Divisor(f: *const ir.Function, v: ir.ValueId, w: Width) ?u6 {
 /// add `2^k - 1` when `l` is negative (recovered as a sign-extended shift,
 /// never a branch) before the final arithmetic shift, so a negative dividend
 /// still rounds toward zero rather than down.
-fn emitPow2DivInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool, w: Width) !void {
+///
+/// The bias shifts use fixed 64-bit amounts (63, 64-k), never the operand's
+/// type width, for the same reason given in `emitPow2RemInt` below: every
+/// integer SSA value lives in a full 64-bit GPR held width-canonical, so a
+/// narrow signed value sign-extended into the register is numerically
+/// identical to its 64-bit counterpart — using the narrower width here
+/// under-shifts and corrupts the bias for `bits < 64` (#1707).
+fn emitPow2DivInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool) !void {
     const l = try getInt(self, vregOf(self, lhs), scratch1);
     try self.movRR(scratch1, l);
     if (!signed) {
@@ -1294,10 +1301,9 @@ fn emitPow2DivInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool, w:
         try putInt(self, dst, scratch1);
         return;
     }
-    const bits: u8 = w.bytes * 8;
     try self.movRR(scratch2, scratch1);
-    try self.shiftImm(.sar, scratch2, @intCast(bits - 1)); // sign mask: 0 or all-ones
-    try self.shiftImm(.shr, scratch2, @intCast(bits - @as(u8, k))); // isolate low k bits: 0 or 2^k-1
+    try self.shiftImm(.sar, scratch2, 63); // sign mask: 0 or all-ones
+    try self.shiftImm(.shr, scratch2, @intCast(64 - @as(u7, k))); // isolate low k bits: 0 or 2^k-1
     try self.arithRR(.add, scratch1, scratch2);
     try self.shiftImm(.sar, scratch1, k);
     try putInt(self, dst, scratch1);
@@ -1355,7 +1361,7 @@ fn emitPow2RemInt(self: *Ctx, dst: u32, lhs: ir.ValueId, k: u6, signed: bool) !v
 fn emitDivInt(self: *Ctx, op: ir.Op, dst: u32, lhs: ir.ValueId, rhs: ir.ValueId, w: Width) !void {
     if (constPow2Divisor(self.f, rhs, w)) |k| {
         switch (op) {
-            .sdiv, .udiv => return emitPow2DivInt(self, dst, lhs, k, op == .sdiv, w),
+            .sdiv, .udiv => return emitPow2DivInt(self, dst, lhs, k, op == .sdiv),
             .srem, .urem => return emitPow2RemInt(self, dst, lhs, k, op == .srem),
             else => unreachable,
         }
