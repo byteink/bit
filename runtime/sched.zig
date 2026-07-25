@@ -228,6 +228,18 @@ pub const ParkFn = *const fn (t: *Task, arg: ?*anyopaque) void;
 /// v1 fixed stack size. See the module doc comment's ponytail note.
 const stack_size: usize = 64 * 1024;
 
+/// Stack size for the program's `main` task only (boot()'s `mainTrampoline`
+/// spawn, not user `spawn`). `main` runs the program's real workload directly
+/// — for the self-hosted compiler that's parse/check/format recursing over a
+/// real file's AST — so it needs OS-thread-scale headroom, not goroutine-scale.
+/// User `spawn` stays at `stack_size`: the M:N model's cheap-concurrency
+/// promise depends on per-goroutine stacks staying small, and a concurrent
+/// server may spawn many. 8 MiB matches glibc's default pthread stack, the
+/// same budget a C/Go `main` gets today. Reserved via mmap (see
+/// mapGuardedStack): virtual address space only, RSS grows solely with pages
+/// actually touched, so this costs nothing for a shallow `main`.
+const main_stack_size: usize = 8 * 1024 * 1024;
+
 pub const Task = struct {
     fn_ptr: TaskFn,
     arg: ?*anyopaque,
@@ -260,10 +272,10 @@ pub const Task = struct {
         return @intFromPtr(t.mapping.ptr) + t.mapping.len;
     }
 
-    fn create(f: TaskFn, arg: ?*anyopaque) !*Task {
+    fn create(f: TaskFn, arg: ?*anyopaque, stack_bytes: usize) !*Task {
         const t = try std.heap.page_allocator.create(Task);
         errdefer std.heap.page_allocator.destroy(t);
-        const mapping = try mapGuardedStack(stack_size);
+        const mapping = try mapGuardedStack(stack_bytes);
         errdefer unmapGuardedStack(mapping);
         const top = @intFromPtr(mapping.ptr) + mapping.len;
         t.* = .{
@@ -1203,7 +1215,18 @@ pub const Scheduler = struct {
     /// falling back to the global queue when the local queue is full or the
     /// caller isn't a worker at all.
     pub fn spawn(self: *Scheduler, f: TaskFn, arg: ?*anyopaque) !void {
-        const t = try Task.create(f, arg);
+        try self.spawnStack(f, arg, stack_size);
+    }
+
+    /// Like `spawn`, but for `boot()`'s single top-level `main` task: gives it
+    /// `main_stack_size` instead of the goroutine-scale `stack_size`. See
+    /// `main_stack_size`'s doc comment for why `main` alone gets more.
+    pub fn spawnMain(self: *Scheduler, f: TaskFn, arg: ?*anyopaque) !void {
+        try self.spawnStack(f, arg, main_stack_size);
+    }
+
+    fn spawnStack(self: *Scheduler, f: TaskFn, arg: ?*anyopaque, stack_bytes: usize) !void {
+        const t = try Task.create(f, arg, stack_bytes);
         self.registerTask(t);
         if (Worker.currentOrNull()) |w| {
             if (!w.deque.pushBottom(t)) self.global.push(t);

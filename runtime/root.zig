@@ -2030,7 +2030,7 @@ pub fn boot(main_fn: MainFn, environ: std.process.Environ) !i32 {
     try g_sched.start();
 
     var run = MainRun{ .fn_ptr = main_fn };
-    try g_sched.spawn(mainTrampoline, @ptrCast(&run));
+    try g_sched.spawnMain(mainTrampoline, @ptrCast(&run));
 
     // This OS thread is not itself a scheduler worker (see sched.zig's module
     // doc comment), so it waits for `main` the same way any external caller
