@@ -25,12 +25,53 @@ const std = @import("std");
 
 const V2u64 = @Vector(2, u64);
 
-fn loadBlock(p: [*]const u8) V2u64 {
-    return std.mem.bytesToValue(V2u64, p[0..16]);
+// Bit's dynamic `[]T` slice stores every element as one FULL 8-BYTE WORD
+// regardless of `T`'s own width — value in the low bytes, little-endian,
+// zero-extended (ABI.md §2.1: "Elements are one word each... a T that fits
+// in a word is stored by value"). A raw pointer from `ptrOf([]byte)`/
+// `ptrOf([]u32)` therefore does NOT point at packed C-style bytes/words —
+// logical element `i` lives at byte address `base + i*8`, not `base + i`.
+// Every gather/scatter below threads through `wordAt`/`wordAtMut` rather
+// than plain pointer-plus-index arithmetic for exactly this reason: the
+// first version of this file skipped it, read/wrote 8x-too-dense packed
+// buffers, and silently corrupted whatever heap memory sat past the true
+// (8x-larger) backing allocation — caught only on real x86-64 hardware,
+// where the AES-NI/PCLMULQDQ paths actually execute (see task #1223 hl-master
+// verification notes; nothing here is exercised on the ARM64 software path).
+fn wordAt(base: [*]const u8, logical_index: usize) [*]const u8 {
+    return base + logical_index * 8;
 }
 
+fn wordAtMut(base: [*]u8, logical_index: usize) [*]u8 {
+    return base + logical_index * 8;
+}
+
+/// Gather 16 logical bytes starting at logical index 0 of `p` (each 8 bytes
+/// apart in real memory) into one packed XMM-shaped value.
+fn loadBlock(p: [*]const u8) V2u64 {
+    var packed_bytes: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) packed_bytes[i] = wordAt(p, i)[0];
+    return std.mem.bytesToValue(V2u64, &packed_bytes);
+}
+
+/// Scatter a packed XMM-shaped value back out to 16 logical bytes at `p`,
+/// the inverse of `loadBlock`.
 fn storeBlock(p: [*]u8, v: V2u64) void {
-    p[0..16].* = std.mem.toBytes(v);
+    const packed_bytes = std.mem.toBytes(v);
+    var i: usize = 0;
+    while (i < 16) : (i += 1) wordAtMut(p, i)[0] = packed_bytes[i];
+}
+
+/// The byte address of round `r`'s 16-logical-byte round key within a
+/// `round_keys` slice's backing buffer — logical byte index `16*r`, hence
+/// real address `round_keys + 16*r*8`.
+fn roundKeyAt(round_keys: [*]const u8, r: usize) [*]const u8 {
+    return wordAt(round_keys, 16 * r);
+}
+
+fn roundKeyAtMut(round_keys: [*]u8, r: usize) [*]u8 {
+    return wordAtMut(round_keys, 16 * r);
 }
 
 // ---- AES-NI: block encrypt / decrypt / decrypt-schedule invert -----------
@@ -82,12 +123,12 @@ fn vaesimc(rk: V2u64) V2u64 {
 /// and `block` may alias (both are read/written only through XMM registers).
 pub fn encryptBlock(round_keys: [*]const u8, nr: i64, block: [*]const u8, out: [*]u8) void {
     const n: usize = @intCast(nr);
-    var state = loadBlock(block) ^ loadBlock(round_keys);
+    var state = loadBlock(block) ^ loadBlock(roundKeyAt(round_keys, 0));
     var r: usize = 1;
     while (r < n) : (r += 1) {
-        state = vaesenc(state, loadBlock(round_keys + 16 * r));
+        state = vaesenc(state, loadBlock(roundKeyAt(round_keys, r)));
     }
-    state = vaesenclast(state, loadBlock(round_keys + 16 * n));
+    state = vaesenclast(state, loadBlock(roundKeyAt(round_keys, n)));
     storeBlock(out, state);
 }
 
@@ -96,12 +137,12 @@ pub fn encryptBlock(round_keys: [*]const u8, nr: i64, block: [*]const u8, out: [
 /// derives it from the forward schedule), writing the plaintext to `out`.
 pub fn decryptBlock(dec_round_keys: [*]const u8, nr: i64, block: [*]const u8, out: [*]u8) void {
     const n: usize = @intCast(nr);
-    var state = loadBlock(block) ^ loadBlock(dec_round_keys + 16 * n);
+    var state = loadBlock(block) ^ loadBlock(roundKeyAt(dec_round_keys, n));
     var r: usize = n - 1;
     while (r > 0) : (r -= 1) {
-        state = vaesdec(state, loadBlock(dec_round_keys + 16 * r));
+        state = vaesdec(state, loadBlock(roundKeyAt(dec_round_keys, r)));
     }
-    state = vaesdeclast(state, loadBlock(dec_round_keys));
+    state = vaesdeclast(state, loadBlock(roundKeyAt(dec_round_keys, 0)));
     storeBlock(out, state);
 }
 
@@ -116,12 +157,12 @@ pub fn decryptBlock(dec_round_keys: [*]const u8, nr: i64, block: [*]const u8, ou
 /// not a hot loop, so `AESKEYGENASSIST` buys nothing real here).
 pub fn invertSchedule(enc_round_keys: [*]const u8, nr: i64, out: [*]u8) void {
     const n: usize = @intCast(nr);
-    storeBlock(out, loadBlock(enc_round_keys));
+    storeBlock(roundKeyAtMut(out, 0), loadBlock(roundKeyAt(enc_round_keys, 0)));
     var r: usize = 1;
     while (r < n) : (r += 1) {
-        storeBlock(out + 16 * r, vaesimc(loadBlock(enc_round_keys + 16 * r)));
+        storeBlock(roundKeyAtMut(out, r), vaesimc(loadBlock(roundKeyAt(enc_round_keys, r))));
     }
-    storeBlock(out + 16 * n, loadBlock(enc_round_keys + 16 * n));
+    storeBlock(roundKeyAtMut(out, n), loadBlock(roundKeyAt(enc_round_keys, n)));
 }
 
 // ---- PCLMULQDQ: GHASH multiply --------------------------------------------
@@ -237,6 +278,18 @@ const K: [64]u32 = .{
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
+/// `state`'s logical word `i` (a `[]u32` slice element — one full 8-byte Bit
+/// word, value in the low 4 bytes, ABI.md §2.1) and `block`'s logical byte
+/// `i` (a `[]byte` slice element, same word model) — see `wordAt`'s doc
+/// comment above for why this indirection exists at all.
+fn stateGet(state: [*]const u8, i: usize) u32 {
+    return std.mem.bytesToValue(u32, wordAt(state, i)[0..4]);
+}
+
+fn stateSet(state: [*]u8, i: usize, v: u32) void {
+    wordAtMut(state, i)[0..4].* = std.mem.toBytes(v);
+}
+
 /// Run all 64 SHA-256 compression rounds over one 64-byte `block`, updating
 /// the 8-word `state` in place — `stdlib/crypto/sha256.bit`'s `compress`
 /// signature exactly (minus `k`, which this kernel carries its own flat copy
@@ -249,17 +302,17 @@ const K: [64]u32 = .{
 /// AVX/SHA-NI operand's source/dest mapping from the mnemonic by hand is
 /// exactly the kind of subtle-transcription-error risk a byte-for-byte port
 /// of a tested implementation avoids.
-pub fn compress(state: [*]u32, block: [*]const u8) void {
+pub fn compress(state: [*]u8, block: [*]const u8) void {
     var s: [64]u32 align(16) = undefined;
     var i: usize = 0;
     while (i < 16) : (i += 1) {
         const b = i * 4;
-        s[i] = (@as(u32, block[b]) << 24) | (@as(u32, block[b + 1]) << 16) |
-            (@as(u32, block[b + 2]) << 8) | @as(u32, block[b + 3]);
+        s[i] = (@as(u32, wordAt(block, b)[0]) << 24) | (@as(u32, wordAt(block, b + 1)[0]) << 16) |
+            (@as(u32, wordAt(block, b + 2)[0]) << 8) | @as(u32, wordAt(block, b + 3)[0]);
     }
 
-    var x: V4u32 = .{ state[5], state[4], state[1], state[0] };
-    var y: V4u32 = .{ state[7], state[6], state[3], state[2] };
+    var x: V4u32 = .{ stateGet(state, 5), stateGet(state, 4), stateGet(state, 1), stateGet(state, 0) };
+    var y: V4u32 = .{ stateGet(state, 7), stateGet(state, 6), stateGet(state, 3), stateGet(state, 2) };
     const s_v: *[16]V4u32 = @ptrCast(&s);
 
     var k: usize = 0;
@@ -296,12 +349,12 @@ pub fn compress(state: [*]u32, block: [*]const u8) void {
         );
     }
 
-    state[0] +%= x[3];
-    state[1] +%= x[2];
-    state[4] +%= x[1];
-    state[5] +%= x[0];
-    state[2] +%= y[3];
-    state[3] +%= y[2];
-    state[6] +%= y[1];
-    state[7] +%= y[0];
+    stateSet(state, 0, stateGet(state, 0) +% x[3]);
+    stateSet(state, 1, stateGet(state, 1) +% x[2]);
+    stateSet(state, 4, stateGet(state, 4) +% x[1]);
+    stateSet(state, 5, stateGet(state, 5) +% x[0]);
+    stateSet(state, 2, stateGet(state, 2) +% y[3]);
+    stateSet(state, 3, stateGet(state, 3) +% y[2]);
+    stateSet(state, 6, stateGet(state, 6) +% y[1]);
+    stateSet(state, 7, stateGet(state, 7) +% y[0]);
 }

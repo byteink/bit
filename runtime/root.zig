@@ -1495,7 +1495,7 @@ export fn bit_rt_crypto_ghash_mul_hw(acc0: u64, acc1: u64, b0: u64, b1: u64, h0:
 /// FIPS-180-4 round function `sha256.bit`'s software `compress` runs (shared
 /// by SHA-224 and SHA-256, which differ only in IV/output truncation, both
 /// applied outside `compress`).
-export fn bit_rt_crypto_sha256_compress_hw(state: [*]u32, block: [*]const u8) callconv(.c) void {
+export fn bit_rt_crypto_sha256_compress_hw(state: [*]u8, block: [*]const u8) callconv(.c) void {
     if (is_x86_64) cryptohw.compress(state, block) else @panic("bit_rt_crypto_sha256_compress_hw: x86-64 only");
 }
 
