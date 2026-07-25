@@ -1819,24 +1819,149 @@ closed channel (§16.2), and the ok-value of a failed fallible call (§18.2).
 
 ### 13.7 Concurrency Memory Model (happens-before)
 
-For programs using channels correctly, Bit provides a sequentially-consistent view
-via these happens-before edges (mirrors Go's model):
+This section was written for a single-worker runtime, where every interleaving
+was sequentially consistent by construction (ABI.md §9). The runtime now
+schedules green threads over **N** OS worker threads — real parallelism, not
+just concurrency — so two green threads can execute Bit instructions at the
+literal same instant, and this section is what keeps a correctly-synchronized
+program deterministic anyway.
 
-1. A `spawn f(...)` statement **happens-before** the spawned function begins.
-2. A send on a channel **happens-before** the corresponding receive completes.
-3. The close of a channel **happens-before** a receive that observes the channel is
-   closed.
-4. On an **unbuffered** channel, a receive **happens-before** the send completes.
+Bit provides a sequentially-consistent view **only across these
+happens-before edges** (mirrors Go's memory model):
+
+1. A `spawn f(...)` statement **happens-before** the spawned function begins
+   (§16.1) — `f`'s arguments are fully evaluated on the spawning thread first.
+2. A send on a channel **happens-before** the corresponding receive completes
+   (§16.2).
+3. The close of a channel **happens-before** a receive that observes the
+   channel is closed (§16.2).
+4. On an **unbuffered** channel, a receive **happens-before** the send
+   completes.
 5. The `k`-th receive on a channel with capacity `C` happens-before the
    `(k+C)`-th send completes.
+6. A `std/sync` `Mutex`/`RWMutex` unlock **happens-before** the next
+   successful lock that acquires the same mutex.
+7. `std/sync`'s `Once.do(f)` runs `f` at most once; `f` returning
+   **happens-before** every `Once.do` call (on any thread, including the one
+   that ran `f`) returns.
+8. A `std/sync` `WaitGroup`'s final `Done()` call (the one that brings the
+   counter to 0) **happens-before** the `Wait()` call it unblocks returns.
+9. A `std/sync` atomic **release** operation on a location **happens-before**
+   the first **acquire** operation on that location that observes it
+   (§13.7.1).
 
-Program order holds within a single green thread. Access to shared **mutable**
-memory (e.g. a struct or slice) from multiple threads **without** an ordering edge
-established through channels is a **data race** and its result is unspecified.
-v0.1 provides channels as the only synchronization primitive; higher-level
-synchronization (mutex, atomics) is deferred to the standard library in a later
-release. The recommended discipline: *do not communicate by sharing memory; share
-memory by communicating.*
+Program order holds within a single green thread, and happens-before is
+transitive. Everything else — ordering between two green threads absent one of
+the edges above — is exactly what the next paragraph defines.
+
+**Data race.** Two accesses to the same memory location from different green
+threads, at least one a write, with no happens-before edge between them, race.
+Bit picks a **defined, not undefined**, outcome, because the language stays
+memory-safe (GC, bounds-checked, no manual `free`) even when a program is
+buggy:
+
+- A racing access to a value that fits in **one machine word** (any integer
+  width, `bool`, `f64`, a single pointer/reference, a `chan`/`func` value) is
+  guaranteed **not to tear**: every read observes some value some write
+  actually stored there, never a fabricated bit pattern. *Which* writer's
+  value a racing reader sees is unspecified — that is the race itself, and the
+  fix is always one of the edges above, not this guarantee.
+- A racing access to a value **wider than one word** — a struct assigned as a
+  whole, a slice header `{ptr, len, cap}`, a `string` header `{ptr, len}`, an
+  interface value `{type, data}`, or a multi-return tuple — **can tear**: a
+  reader can observe a mix of words from different writes (e.g. one write's
+  `ptr` paired with another write's `len`). A torn ordinary value is a **logic
+  bug** (wrong length, wrong bounds-check outcome, a stale-but-well-typed
+  field) — Bit's usual safety nets (bounds checks, `nil` checks) still run
+  against whatever was actually read, so this alone does not corrupt memory.
+- The one exception: if a torn **GC-traced** multiword value (a slice, string,
+  interface, or reference-holding struct) is what a root scan observes live in
+  a stack slot or register at a safepoint (ABI.md §5), the collector trusts
+  that slot's declared shape — a `data` pointer paired with a mismatched
+  `type` tag from a torn interface, or a `ptr` paired with a mismatched `len`,
+  can violate the collector's precision. This is the one way a race in
+  otherwise-safe Bit code can reach real memory-unsafety. It is rare (a
+  safepoint must land inside the torn window) but real, exactly as in Go, and
+  it is why a race on a shared composite value is never "just a data bug to
+  shrug off."
+
+Channels and `std/sync` (`Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics) are
+the race-free coordination tools; the raw `*T` pointer and its atomic builtins
+(§11.5) are the unmanaged-subset escape hatch and carry their own, stricter
+contract (no GC safety net at all). The recommended discipline is unchanged:
+*do not communicate by sharing memory; share memory by communicating* — reach
+for `std/sync` only for a shared-memory hot path a channel would make
+needlessly slow.
+
+**Race-free** (edges 1 and 2/5 above: each worker owns its own state; the only
+cross-thread contact is the value it sends):
+
+```
+function worker(id: int, results: chan<int>) {
+  results <- id * id
+}
+
+function main() {
+  let n = 4
+  let results = chan<int>(n)
+  for (let i = 0; i < n; i++) {
+    spawn worker(i, results)
+  }
+  let total = 0
+  for (let i = 0; i < n; i++) {
+    total = total + <- results
+  }
+  print("total=${total}\n") // deterministic: 0+1+4+9 = 14
+}
+```
+
+**Racy** (what the race gate flags, not a pattern to copy): two green threads
+write `total` with no happens-before edge between the writes themselves —
+only their *completion* is ordered, by the unrelated `done` channel, which
+does not help:
+
+```
+let total = 0
+
+function bump(done: chan<int>) {
+  total = total + 1 // read-modify-write, no edge vs. the other bump()
+  done <- 0
+}
+
+function main() {
+  let done = chan<int>(0)
+  spawn bump(done)
+  spawn bump(done)
+  <- done
+  <- done
+  print("total=${total}\n") // races: 2 today, but not guaranteed
+}
+```
+
+#### 13.7.1 Atomic Orderings (`std/sync`)
+
+`std/sync`'s atomic operations (`Atomic<T>` and the free `Add` /
+`CompareAndSwap` / `Load` / `Store` / `Swap` functions) take an explicit
+ordering, independent of the raw `*T` builtins in §11.5 (which stay
+sequentially consistent only — no weaker mode is exposed there):
+
+- **`SeqCst`** (the default when no ordering is given) — every `SeqCst`
+  operation, across every location, is seen in one global total order by every
+  thread. Safest, and what to reach for first.
+- **`Release`** (store-side) paired with **`Acquire`** (load-side) — a
+  `Release` store happens-before every `Acquire` load that observes it (edge 9
+  above), without requiring a single global order across unrelated locations.
+  This is the publish-through-a-flag pattern: write the payload with plain
+  stores, then `Store(flag, 1, Release)`; the reader spins
+  `Load(flag, Acquire)` until it observes `1`, only then reads the payload.
+- **`Relaxed`** — atomicity only (no torn reads/writes, per the single-word
+  guarantee above), no ordering guarantee relative to any other memory access.
+  Correct only when nothing else depends on the access's relative order (e.g.
+  a counter nobody reads-to-act-on).
+
+Mixing orderings on the same location is allowed (e.g. `Relaxed` increments,
+one final `Acquire` load to publish the total) — the guarantee attaches to
+each operation, not to the location as a whole.
 
 ### 13.8 Match
 
@@ -2108,6 +2233,10 @@ representability error). This is the sole implicit-conversion path.
 ---
 
 ## 16. Concurrency
+
+This section defines `spawn`, channels, and `select`. The ordering guarantees
+they provide across threads — and `std/sync`'s — are §13.7's job, not this
+section's; read §13.7 for what is and is not safe to share across a `spawn`.
 
 ### 16.1 Green Threads
 
@@ -2565,10 +2694,10 @@ Intentionally **not** in v0.1, to keep the surface minimal:
   unmanaged subset; only taking the address of a value with `&` remains reserved.)
 - Operator overloading; user-defined implicit conversions.
 - `recover`; catchable panics.
-- Mutexes and `sync`-style primitives (channels are the safe concurrency
-  primitive in v0.1). Lock-free **atomics** on a raw `*T` *are* specified — see
-  §11.5 — for the unmanaged subset; only their weaker memory orderings (a
-  seq-cst-only surface ships now) remain reserved.
+- Weaker memory orderings on the raw `*T` unmanaged-subset atomics (§11.5) — a
+  seq-cst-only surface ships there; `std/sync`'s `Atomic<T>` (§13.7.1) is
+  where `Relaxed`/`Release`/`Acquire` live instead. `std/sync` itself
+  (`Mutex`, `RWMutex`, `WaitGroup`, `Once`) is no longer reserved — see §13.7.
 - Nominal newtypes (all `type` aliases are transparent in v0.1).
 - Thread handles / structured concurrency for `spawn`.
 - UTF-8 rune conversions (`string(rune)`, `string([]rune)`, `[]rune(s)`) and
