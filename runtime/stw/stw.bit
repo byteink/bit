@@ -100,13 +100,21 @@
 // this whole comment exists to prevent. An unbound runtime does not collect; it
 // never collects PARTIALLY.
 
-import { worldStopRequested, worldPark, worldRendezvous, worldRestart } from "../gc"
+import { worldPark, worldRendezvous, worldRestart } from "../gc"
 import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
-import { worldBlockAddr, worldEnsureSelf, maxMutators } from "../gc"
+import { worldEnsureSelf, maxMutators } from "../gc"
 import { gcShouldCollect, gcMarkBegin, gcCollectFinish } from "../gc"
 import { gcStatCollections, gcStatTotalSwept, gcNumObjects, gcStatBadOffsets } from "../gc"
 import { gcMarkConservative, gcScanSnapshot } from "../gc"
 import { wordAt, loadWord } from "../gc"
+// stwPoll's hot path inlines worldStopRequested/gcShouldCollect's bodies
+// directly (#1700, avoids a cross-module call); these offsets are what it
+// needs to do that. MUST STAY IN LOCKSTEP with the real definitions in
+// ../gc/gcworldstop.bit, ../gc/gc.bit and ../alloc/alloc.bit — a drifted copy
+// here silently disables collection.
+import { worldStopWord } from "../gc"
+import { gcHeapAddr, gcCfgEnabled, gcCfgStress, gcNextBytes } from "../gc"
+import { heapLiveWord } from "../alloc"
 import { chanScanRegistryRoots } from "../chan"
 import { taskAt, schedCurrentTask, schedMaxRegistered } from "../sched"
 import { schedRegLock, schedRegUnlock, schedRegHead, schedRegNext } from "../sched"
@@ -127,6 +135,9 @@ import { chanScratchWords } from "../sched"
 let gcAddr: i64 = 0
 let schedAddr: i64 = 0
 let chanRegAddr: i64 = 0
+// Cached alongside the three above (#1700): stwPoll's hot path reads this
+// directly instead of calling `worldBlockAddr`, avoiding a cross-module call.
+let worldAddr: i64 = 0
 
 // Collections given up because the stop-the-world rendezvous expired —
 // `gc.zig`'s `stats.stw_abandoned`, kept here rather than in the collector block
@@ -144,10 +155,11 @@ const stwMaxStackWords = 4194304
 // `runtime/root`, after it has `ptrOf`'d its own collector state, scheduler and
 // channel registry (which this `@nosplit` module cannot do for it). The World
 // block goes to `worldBind` separately — `../gc/gcworld.bit` owns that one.
-export @nosplit @symbol("bit_rt_port_stw_bind") function stwBind(g: int, sched: int, chanReg: int) {
+export @nosplit @symbol("bit_rt_port_stw_bind") function stwBind(g: int, sched: int, chanReg: int, world: int) {
   gcAddr = g
   schedAddr = sched
   chanRegAddr = chanReg
+  worldAddr = world
 }
 
 // Abandoned-collection count, so a test can assert it stayed 0.
@@ -238,21 +250,11 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
   return gcStatBadOffsets(wordAt(gcAddr))
 }
 
-// Whether a collection is even permissible: every root source must be reachable.
-// See "THE ROOT SET" above — this is the guard that keeps a partially-bound
-// runtime from running a collection with a smaller root set than it has roots.
-@nosplit function stwCanCollect(): bool {
-  if (gcAddr == 0) {
-    return false
-  }
-  if (schedAddr == 0) {
-    return false
-  }
-  if (chanRegAddr == 0) {
-    return false
-  }
-  return true
-}
+// Whether a collection is even permissible: every root source must be
+// reachable. See "THE ROOT SET" above — this is the guard that keeps a
+// partially-bound runtime from running a collection with a smaller root set
+// than it has roots. Inlined directly into stwPoll's hot path (#1700, was a
+// standalone `stwCanCollect`, now dead — the checks are duplicated there).
 
 // ---------------------------------------------------------------------------
 // Root enumeration
@@ -433,13 +435,19 @@ export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
   // hide exactly the references this poll's stack map names.
   let mu = worldEnsureSelf(snap)
 
-  let waddr = worldBlockAddr()
+  // Inlined `worldBlockAddr` + `wordAt` (#1700): `worldAddr` is this module's
+  // own cache (`stwBind`'s 4th param), so this is a plain load instead of a
+  // cross-module call.
+  let waddr = worldAddr
   if (waddr == 0) {
     return    // pre-boot: `worldBind` has not run, so there is no registry yet
   }
-  let world = wordAt(waddr)
+  let worldNil: *i64 = nil
+  let world = worldNil + (waddr / 8)
 
-  if (worldStopRequested(world)) {
+  // MUST MIRROR `worldStopRequested` (../gc/gcworldstop.bit) — inlined to skip
+  // a cross-module call on this hot path.
+  if (atomicLoad(world + worldStopWord) != 0) {
     // Someone is collecting. Park until they finish. `worldPark` returns at
     // once if the stop cleared in the gap, which is what makes this safe to
     // call speculatively. A thread with no slot has nothing to publish and
@@ -450,12 +458,33 @@ export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
     return
   }
 
-  if (!stwCanCollect()) {
+  // MUST MIRROR the former `stwCanCollect` (see its note above) — inlined for
+  // the same reason.
+  if (gcAddr == 0) {
     return
   }
-  let g = wordAt(gcAddr)
-  if (!gcShouldCollect(g)) {
+  if (schedAddr == 0) {
     return
+  }
+  if (chanRegAddr == 0) {
+    return
+  }
+  let gNil: *i64 = nil
+  let g = gNil + (gcAddr / 8)
+
+  // MUST MIRROR `gcShouldCollect` (../gc/gccollect.bit) — inlined for the same
+  // reason. DRIFT HERE SILENTLY DISABLES COLLECTION: keep this predicate
+  // exactly in step with the real one (the cold path below still calls the
+  // real function, so both must agree).
+  if (*(g + gcCfgEnabled) == 0) {
+    return
+  }
+  if (*(g + gcCfgStress) == 0) {
+    let hNil: *i64 = nil
+    let hb = hNil + (*(g + gcHeapAddr) / 8)
+    if (atomicLoad(hb + heapLiveWord) < *(g + gcNextBytes)) {
+      return
+    }
   }
 
   // A thread with no slot must not collect: `worldRendezvous` skips only the
