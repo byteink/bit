@@ -1,9 +1,10 @@
 # Deprecation Policy
 
 How a feature, flag, or API is retired without breaking users out from under
-them. This doc governs the three surfaces from `docs/release/VERSIONING.md`
-(C2) that can lose members on a MINOR bump pre-1.0 and require a MAJOR bump
-post-1.0: **language features**, **CLI flags**, and **stdlib API**. (Runtime
+them. This doc governs the three surfaces from `docs/release/VERSIONING.md`'s
+numbered surface list (§1 language, §2 CLI, §3 stdlib) that can lose members
+on a MINOR bump pre-1.0 and require a MAJOR bump post-1.0: **language
+features**, **CLI flags**, and **stdlib API**. (Runtime
 ABI removals are covered by `runtime/ABI.md` directly — the ABI has no
 "deprecated but still linkable" state, an old binary either links or it
 doesn't.)
@@ -12,19 +13,22 @@ doesn't.)
 
 **A deprecated item must remain deprecated-but-working for at least one full
 LTS cycle before it can be removed**, per the cadence in
-`docs/release/SUPPORT.md` (C3). Concretely, using SUPPORT.md's LTS line
-numbering:
+`docs/release/SUPPORT.md`'s "Cadence definitions" section. Concretely, using
+SUPPORT.md's LTS line numbering:
 
-> If an item is marked deprecated no later than LTS line N, it is removable
-> no earlier than LTS line N+1's GA.
+> If an item is marked deprecated no later than LTS line N's GA, it is
+> removable no earlier than LTS line N+1's GA.
 
-This guarantees anyone who adopted LTS line N sees the deprecation warning
-for that LTS line's entire support life (full-support + security-only,
-12–60 months per SUPPORT.md) before upgrading past the release that removes
-the item — they are never forced to jump two LTS lines in one upgrade to
-avoid a silent break. Deprecating and removing within the same LTS line, or
-between an LTS line and the next interim release, is not sufficient; the
-clock only counts full LTS-to-LTS spans.
+The floor is LTS line N's GA, not merely "sometime during N" — a deprecation
+that lands mid-cycle, after N has already shipped, does not satisfy the rule
+for N; it must wait for N+1 as its baseline instead. This guarantees anyone
+who adopts LTS line N at GA sees the deprecation warning for that LTS line's
+entire support life (full-support + security-only, 12–60 months per
+SUPPORT.md) before upgrading past the release that removes the item — they
+are never forced to jump two LTS lines in one upgrade to avoid a silent
+break. Deprecating and removing within the same LTS line, or between an LTS
+line and the next interim release, is not sufficient; the clock only counts
+full LTS-to-LTS spans anchored at each line's GA.
 
 Pre-1.0, there is no LTS line yet (`docs/release/SUPPORT.md`'s pre-1.0
 phasing note), so this rule has no floor to enforce until #366 (v1.0) ships
