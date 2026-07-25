@@ -21,6 +21,130 @@ fn addNamedRun(b: *std.Build, run: *std.Build.Step.Run, name: []const u8, desc: 
     b.step(name, desc).dependOn(&run.step);
 }
 
+/// Rebuild-cache gate (#1796): `libbitrt.a` and the self-hosted `bit` are each
+/// produced by a step that reads its true sources at runtime (`root.zig`'s
+/// `runtime/**/*.zig` today, `selfhost/**/*.bit` always) — invisible to Zig's
+/// own build cache, so both were forced with `has_side_effects = true` and
+/// paid their full cost on every invocation regardless of change. This
+/// computes a content fingerprint over the REAL inputs and compares it to a
+/// stamp file so an unchanged tree can skip straight to the existing
+/// artifact. Correctness rule: any read/parse/missing-file surprise reports
+/// "changed" (falls back to a full rebuild) — never the reverse. Over-hashing
+/// is deliberate too: `build.zig` and `.zigversion` are folded in because a
+/// flag or toolchain change can alter the output without touching a single
+/// `.bit`/`.zig` source file.
+///
+/// Hashes every regular file under each of `dirs` (recursive, no extension
+/// filter — a new file type silently joining the input set is exactly the
+/// failure mode to avoid) plus every path in `extra_files`, sorted by
+/// slash-joined relative path so host walk order never perturbs the digest.
+/// `fold_in`, when given, is mixed in as one more entry (e.g. a prerequisite
+/// gate's own fingerprint), so a change to libbitrt is visible to the
+/// self-host gate without re-reading libbitrt.a's bytes.
+fn fingerprintTree(
+    b: *std.Build,
+    dirs: []const []const u8,
+    extra_files: []const []const u8,
+    fold_in: ?[64]u8,
+) [64]u8 {
+    const io = b.graph.io;
+    var rel_paths: std.ArrayList([]const u8) = .empty;
+    defer rel_paths.deinit(b.allocator);
+
+    for (dirs) |dir_rel| {
+        var dir = b.build_root.handle.openDir(io, dir_rel, .{ .iterate = true }) catch
+            @panic("build: fingerprint gate cannot open a required source directory");
+        defer dir.close(io);
+        var walker = dir.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch @panic("build: fingerprint gate walk failed")) |entry| {
+            if (entry.kind != .file) continue;
+            rel_paths.append(b.allocator, std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ dir_rel, entry.path }) catch @panic("OOM")) catch @panic("OOM");
+        }
+    }
+    for (extra_files) |f| rel_paths.append(b.allocator, f) catch @panic("OOM");
+
+    std.mem.sort([]const u8, rel_paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, bb: []const u8) bool {
+            return std.mem.order(u8, a, bb) == .lt;
+        }
+    }.lessThan);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (rel_paths.items) |rel| {
+        hasher.update(rel);
+        hasher.update(&.{0});
+        const data = b.build_root.handle.readFileAlloc(io, rel, b.allocator, .limited(32 << 20)) catch
+            @panic("build: fingerprint gate cannot read a required source file");
+        defer b.allocator.free(data);
+        hasher.update(data);
+        hasher.update(&.{0});
+    }
+    if (fold_in) |f| {
+        hasher.update("<fold-in>");
+        hasher.update(&f);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Reads the stamp `name` under the build cache root and reports whether it
+/// equals `fingerprint_hex` AND every path in `artifact_paths` (absolute)
+/// still exists. Any missing stamp, mismatch, unreadable stamp, or missing
+/// artifact means "must rebuild" — the safe default on every failure path.
+fn fingerprintMatchesStamp(
+    b: *std.Build,
+    stamp_name: []const u8,
+    fingerprint_hex: [64]u8,
+    artifact_paths: []const []const u8,
+) bool {
+    const io = b.graph.io;
+    const stamped = b.cache_root.handle.readFileAlloc(io, stamp_name, b.allocator, .limited(256)) catch return false;
+    defer b.allocator.free(stamped);
+    const trimmed = std.mem.trim(u8, stamped, " \t\r\n");
+    if (!std.mem.eql(u8, trimmed, &fingerprint_hex)) return false;
+    for (artifact_paths) |p| {
+        std.Io.Dir.accessAbsolute(io, p, .{}) catch return false;
+    }
+    return true;
+}
+
+/// A custom build step that writes `fingerprint_hex` to a stamp file under the
+/// build cache root. Wired as a dependant of the real rebuild's completion
+/// steps ONLY, so it runs — and the stamp updates — only once those steps
+/// have actually succeeded; a failed or interrupted rebuild must never leave
+/// a stamp that reads as fresh on the next invocation.
+const RecordFingerprint = struct {
+    step: std.Build.Step,
+    stamp_name: []const u8,
+    fingerprint_hex: [64]u8,
+
+    fn create(b: *std.Build, name: []const u8, stamp_name: []const u8, fingerprint_hex: [64]u8) *RecordFingerprint {
+        const self = b.allocator.create(RecordFingerprint) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = name,
+                .owner = b,
+                .makeFn = make,
+            }),
+            .stamp_name = stamp_name,
+            .fingerprint_hex = fingerprint_hex,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *RecordFingerprint = @fieldParentPtr("step", step);
+        step.owner.cache_root.handle.writeFile(step.owner.graph.io, .{
+            .sub_path = self.stamp_name,
+            .data = &self.fingerprint_hex,
+        }) catch @panic("build: fingerprint gate cannot write its stamp file");
+    }
+};
+
 /// Extracts the toolchain version from `selfhost/version.bit`, the single
 /// source of truth both compilers report (#1451). The self-hosted `bit`
 /// compiles that constant directly; the Zig seed cannot, so its copy is parsed
@@ -864,76 +988,122 @@ pub fn build(b: *std.Build) void {
     // CLI-path end-to-end tests (link.zig, main.zig) that read it there.
     var host_libbitrt_bin: ?std.Build.LazyPath = null;
     var host_libbitrt_install: ?*std.Build.Step = null;
-    for (libbitrt_targets) |query| {
-        const rt_target = b.resolveTargetQuery(query);
-        const triple = query.zigTriple(b.allocator) catch @panic("OOM");
-        // The runtime archive's build settings are fixed regardless of the
-        // top-level `-Doptimize` a user passes: the static linker (#345)
-        // consumes this, and its object reader deliberately handles only the
-        // minimal, no-unwind relocation/section set a stripped ReleaseSmall
-        // runtime produces. ReleaseSmall + strip drops DWARF/`__eh_frame`;
-        // `.unwind_tables = .none` drops `__compact_unwind` (ABI.md §12
-        // promises no backtrace/unwind contract anyway). `.pic = false` on
-        // Linux keeps every code reference a plain absolute/PC-relative reloc
-        // — no GOT/PLT — since a static zero-dynamic-linker ELF never needs
-        // it. Darwin mandates PIC (the toolchain refuses `-fno-PIC`), so the
-        // macOS archives keep it and the linker's Mach-O reader handles the
-        // GOT-page reloc pair that entails.
-        const lib = b.addLibrary(.{
-            .linkage = .static,
-            .name = "bitrt",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("runtime/root.zig"),
-                .target = rt_target,
-                .optimize = .ReleaseSmall,
-                .strip = true,
-                .unwind_tables = .none,
-                .pic = if (query.os_tag == .macos) null else false,
-                // The green-thread context switch (sched.zig) rewrites `rsp` to
-                // another stack mid-function. The x86-64 red zone — 128 bytes
-                // below `rsp` that leaf code may use without reserving — is not
-                // preserved across that stack swap, so a value the compiler
-                // parked in the outgoing stack's red zone is read back from the
-                // incoming stack's red zone (garbage). Disable it for the
-                // runtime; ARM64 has no red zone, so this is x86-64's concern.
-                .red_zone = false,
-            }),
-        });
-        // Bundle compiler-rt into the archive so the static linker (#345)
-        // finds correct `memcpy`/`memset`/`memmove`/`__divti3` there rather
-        // than us hand-rolling them (a naive Zig `memcpy` recurses: `@memcpy`
-        // lowers back to a `memcpy` call). `runtime/shims.zig` then only has
-        // to supply the two symbols compiler-rt does not: `strlen` and
-        // `getauxval`.
-        lib.bundle_compiler_rt = true;
-        // One section per function/global so the linker's symbol-granularity
-        // dead-strip is sound: without this, a call to a function inside a
-        // shared `.text` is a `.text + offset` section relocation whose
-        // PC-relative addend (offset - 4) lands in the *previous* function's
-        // atom, dropping the real target and misresolving the call. With each
-        // symbol in its own section, a reference names that symbol's own
-        // section at offset 0 (unambiguous), exactly as `--gc-sections` needs.
-        lib.link_function_sections = true;
-        lib.link_data_sections = true;
-        const install = b.addInstallArtifact(lib, .{
-            .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{triple}) } },
-        });
-        libbitrt_step.dependOn(&install.step);
-        // Make `zig build test` produce every archive its harnesses read out of
-        // `zig-out/lib/`, not just the host's (#1486). Before this only the host
-        // archive was installed under `test`, so the seed's cross-target tests
-        // read whatever an earlier `zig build libbitrt` happened to leave on
-        // disk: absent on a clean checkout (they self-skip, asserting nothing)
-        // or stale after a runtime edit (they fail, and the failure reads as a
-        // compiler regression). All four targets rather than only the three
-        // read today, so a test that starts reading the fourth is covered by
-        // construction.
-        for (archive_readers.items) |reader| reader.dependOn(&install.step);
+    // Set only when the gate below actually rebuilds (non-null), so a caller
+    // that reaches libbitrt only as a `selfhost` dependency (rather than via
+    // `zig build libbitrt`/`test` directly) can still make sure the stamp gets
+    // recorded once that rebuild succeeds.
+    var libbitrt_record_step: ?*std.Build.Step = null;
 
-        if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
-            host_libbitrt_bin = lib.getEmittedBin();
-            host_libbitrt_install = &install.step;
+    // Rebuild-cache gate (#1796): the archive's real inputs today are
+    // `runtime/**/*.zig` (root.zig's import graph); `seed/**` is included too
+    // since the seed compiler becomes the thing reading `runtime/**/*.bit`
+    // once the parked G3 rewrite (Bit objects instead of root.zig) lands —
+    // gating on source freshness rather than on how the archive is assembled
+    // is what lets this survive that rewrite unchanged. `build.zig` and
+    // `.zigversion` are folded in because a flag or toolchain bump can change
+    // the output without touching a single source file.
+    const libbitrt_fp = fingerprintTree(b, &.{ "runtime", "seed" }, &.{ "build.zig", ".zigversion" }, null);
+    var libbitrt_artifact_paths: [libbitrt_targets.len][]const u8 = undefined;
+    for (libbitrt_targets, 0..) |q, i| {
+        const t = q.zigTriple(b.allocator) catch @panic("OOM");
+        libbitrt_artifact_paths[i] = b.getInstallPath(.{ .custom = b.fmt("lib/{s}", .{t}) }, "libbitrt.a");
+    }
+    const libbitrt_skip = fingerprintMatchesStamp(b, "fp-libbitrt.stamp", libbitrt_fp, &libbitrt_artifact_paths);
+
+    if (libbitrt_skip) {
+        // Fingerprint unchanged since the last successful build and every
+        // archive it produced is still on disk: reuse them untouched instead
+        // of re-running `zig build-lib` + install for all four targets.
+        // `.cwd_relative` carries no step dependency on purpose — nothing
+        // writes these files this invocation, so there is no #1229-style race
+        // to guard against.
+        for (libbitrt_targets, 0..) |query, i| {
+            if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
+                host_libbitrt_bin = .{ .cwd_relative = libbitrt_artifact_paths[i] };
+            }
         }
+    } else {
+        var libbitrt_installs: [libbitrt_targets.len]*std.Build.Step = undefined;
+        for (libbitrt_targets, 0..) |query, install_idx| {
+            const rt_target = b.resolveTargetQuery(query);
+            const triple = query.zigTriple(b.allocator) catch @panic("OOM");
+            // The runtime archive's build settings are fixed regardless of the
+            // top-level `-Doptimize` a user passes: the static linker (#345)
+            // consumes this, and its object reader deliberately handles only the
+            // minimal, no-unwind relocation/section set a stripped ReleaseSmall
+            // runtime produces. ReleaseSmall + strip drops DWARF/`__eh_frame`;
+            // `.unwind_tables = .none` drops `__compact_unwind` (ABI.md §12
+            // promises no backtrace/unwind contract anyway). `.pic = false` on
+            // Linux keeps every code reference a plain absolute/PC-relative reloc
+            // — no GOT/PLT — since a static zero-dynamic-linker ELF never needs
+            // it. Darwin mandates PIC (the toolchain refuses `-fno-PIC`), so the
+            // macOS archives keep it and the linker's Mach-O reader handles the
+            // GOT-page reloc pair that entails.
+            const lib = b.addLibrary(.{
+                .linkage = .static,
+                .name = "bitrt",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("runtime/root.zig"),
+                    .target = rt_target,
+                    .optimize = .ReleaseSmall,
+                    .strip = true,
+                    .unwind_tables = .none,
+                    .pic = if (query.os_tag == .macos) null else false,
+                    // The green-thread context switch (sched.zig) rewrites `rsp` to
+                    // another stack mid-function. The x86-64 red zone — 128 bytes
+                    // below `rsp` that leaf code may use without reserving — is not
+                    // preserved across that stack swap, so a value the compiler
+                    // parked in the outgoing stack's red zone is read back from the
+                    // incoming stack's red zone (garbage). Disable it for the
+                    // runtime; ARM64 has no red zone, so this is x86-64's concern.
+                    .red_zone = false,
+                }),
+            });
+            // Bundle compiler-rt into the archive so the static linker (#345)
+            // finds correct `memcpy`/`memset`/`memmove`/`__divti3` there rather
+            // than us hand-rolling them (a naive Zig `memcpy` recurses: `@memcpy`
+            // lowers back to a `memcpy` call). `runtime/shims.zig` then only has
+            // to supply the two symbols compiler-rt does not: `strlen` and
+            // `getauxval`.
+            lib.bundle_compiler_rt = true;
+            // One section per function/global so the linker's symbol-granularity
+            // dead-strip is sound: without this, a call to a function inside a
+            // shared `.text` is a `.text + offset` section relocation whose
+            // PC-relative addend (offset - 4) lands in the *previous* function's
+            // atom, dropping the real target and misresolving the call. With each
+            // symbol in its own section, a reference names that symbol's own
+            // section at offset 0 (unambiguous), exactly as `--gc-sections` needs.
+            lib.link_function_sections = true;
+            lib.link_data_sections = true;
+            const install = b.addInstallArtifact(lib, .{
+                .dest_dir = .{ .override = .{ .custom = b.fmt("lib/{s}", .{triple}) } },
+            });
+            libbitrt_step.dependOn(&install.step);
+            // Make `zig build test` produce every archive its harnesses read out of
+            // `zig-out/lib/`, not just the host's (#1486). Before this only the host
+            // archive was installed under `test`, so the seed's cross-target tests
+            // read whatever an earlier `zig build libbitrt` happened to leave on
+            // disk: absent on a clean checkout (they self-skip, asserting nothing)
+            // or stale after a runtime edit (they fail, and the failure reads as a
+            // compiler regression). All four targets rather than only the three
+            // read today, so a test that starts reading the fourth is covered by
+            // construction.
+            for (archive_readers.items) |reader| reader.dependOn(&install.step);
+
+            libbitrt_installs[install_idx] = &install.step;
+            if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
+                host_libbitrt_bin = lib.getEmittedBin();
+                host_libbitrt_install = &install.step;
+            }
+        }
+
+        // Only reached once every target above succeeded, so a stamp is never
+        // written for a failed or partial rebuild.
+        const libbitrt_record = RecordFingerprint.create(b, "record libbitrt fingerprint", "fp-libbitrt.stamp", libbitrt_fp);
+        for (libbitrt_installs) |s| libbitrt_record.step.dependOn(s);
+        libbitrt_step.dependOn(&libbitrt_record.step);
+        test_step.dependOn(&libbitrt_record.step);
+        libbitrt_record_step = &libbitrt_record.step;
     }
 
     // Wire the fresh host archive into every harness that links + runs real
@@ -976,41 +1146,82 @@ pub fn build(b: *std.Build) void {
     // specifically (not the whole install step) to stay cycle-free.
     const native = target.result.cpu.arch == b.graph.host.result.cpu.arch and
         target.result.os.tag == b.graph.host.result.os.tag;
-    const selfhost_run = b.addRunArtifact(exe);
-    selfhost_run.addArg("build");
-    if (b.user_input_options.contains("version")) {
-        // `-Dversion=` given: compile a COPY of selfhost/ whose `version.bit`
-        // carries the override, so the self-hosted `bit` reports exactly what
-        // the seed reports (#1451). Only on the override path — an ordinary
-        // build compiles the real source tree, unstaged, so the common case
-        // gains no copy step and no new way to go stale.
-        const staged = b.addWriteFiles();
-        // The real `version.bit` MUST be excluded, not merely overwritten:
-        // WriteFile emits its added files first and its copied directories
-        // second, so an unexcluded copy silently clobbers the stamped file and
-        // the release binary reports the development version (it did).
-        _ = staged.addCopyDirectory(b.path("selfhost"), "", .{ .exclude_extensions = &.{"version.bit"} });
-        _ = staged.add("version.bit", b.fmt(
-            "// Generated by build.zig from -Dversion=. Source of truth: selfhost/version.bit.\nconst bitVersion: string = \"{s}\"\n",
-            .{version},
-        ));
-        selfhost_run.addDirectoryArg(staged.getDirectory());
-    } else {
-        selfhost_run.addArg("selfhost");
-    }
-    selfhost_run.addArg("-o");
-    const selfhosted = selfhost_run.addOutputFileArg("bit");
-    selfhost_run.step.dependOn(&seed_install.step);
-    if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
-    // The seed reads selfhost/*.bit at runtime, invisible to the build cache, so
-    // an edit to a ported module wouldn't re-trigger the build — force it.
-    selfhost_run.has_side_effects = true;
-    const install_bit = b.addInstallBinFile(selfhosted, "bit");
-    // Only pull `bit` into the default install on a native build (see above).
-    if (native) b.getInstallStep().dependOn(&install_bit.step);
+
+    // Rebuild-cache gate (#1796): selfhost/**/*.bit are the compiler's real
+    // sources; the resulting `bit` binary also links in the just-built host
+    // libbitrt.a, so `libbitrt_fp` (computed above) is folded in rather than
+    // re-hashing that archive's own bytes. Skipped on a cross build (can't
+    // exec a cross-built seed to find out anyway) and on a `-Dversion=`
+    // override (a release build, not the hot dev-iteration loop this gate
+    // targets) — both fall through to the unconditional rebuild below exactly
+    // as before.
+    const selfhost_gate_applies = native and !b.user_input_options.contains("version");
+    const selfhost_artifact_path = b.getInstallPath(.bin, "bit");
+    const selfhost_fp = if (selfhost_gate_applies)
+        fingerprintTree(b, &.{"selfhost"}, &.{ "build.zig", ".zigversion" }, libbitrt_fp)
+    else
+        [_]u8{0} ** 64;
+    const selfhost_skip = selfhost_gate_applies and
+        fingerprintMatchesStamp(b, "fp-selfhost.stamp", selfhost_fp, &.{selfhost_artifact_path});
 
     const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bit-seed → bit");
-    selfhost_step.dependOn(&install_bit.step);
+    var selfhosted: std.Build.LazyPath = undefined;
+
+    if (selfhost_skip) {
+        // Fingerprint unchanged and the previously-built `bit` is still on
+        // disk: skip re-running the seed over selfhost/ entirely. No step
+        // dependency on `.cwd_relative` on purpose — nothing writes this file
+        // this invocation.
+        selfhosted = .{ .cwd_relative = selfhost_artifact_path };
+    } else {
+        const selfhost_run = b.addRunArtifact(exe);
+        selfhost_run.addArg("build");
+        if (b.user_input_options.contains("version")) {
+            // `-Dversion=` given: compile a COPY of selfhost/ whose `version.bit`
+            // carries the override, so the self-hosted `bit` reports exactly what
+            // the seed reports (#1451). Only on the override path — an ordinary
+            // build compiles the real source tree, unstaged, so the common case
+            // gains no copy step and no new way to go stale.
+            const staged = b.addWriteFiles();
+            // The real `version.bit` MUST be excluded, not merely overwritten:
+            // WriteFile emits its added files first and its copied directories
+            // second, so an unexcluded copy silently clobbers the stamped file and
+            // the release binary reports the development version (it did).
+            _ = staged.addCopyDirectory(b.path("selfhost"), "", .{ .exclude_extensions = &.{"version.bit"} });
+            _ = staged.add("version.bit", b.fmt(
+                "// Generated by build.zig from -Dversion=. Source of truth: selfhost/version.bit.\nconst bitVersion: string = \"{s}\"\n",
+                .{version},
+            ));
+            selfhost_run.addDirectoryArg(staged.getDirectory());
+        } else {
+            selfhost_run.addArg("selfhost");
+        }
+        selfhost_run.addArg("-o");
+        selfhosted = selfhost_run.addOutputFileArg("bit");
+        selfhost_run.step.dependOn(&seed_install.step);
+        if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
+        // `zig build selfhost` alone reaches libbitrt only as this dependency —
+        // never through `libbitrt_step`/`test_step` — so without this its
+        // rebuild would go unrecorded and the next libbitrt-only invocation
+        // would needlessly redo it (safe, just not free).
+        if (libbitrt_record_step) |s| selfhost_step.dependOn(s);
+        // The seed reads selfhost/*.bit at runtime, invisible to the build cache, so
+        // an edit to a ported module wouldn't re-trigger the build — force it.
+        selfhost_run.has_side_effects = true;
+        const install_bit = b.addInstallBinFile(selfhosted, "bit");
+        // Only pull `bit` into the default install on a native build (see above).
+        if (native) b.getInstallStep().dependOn(&install_bit.step);
+        selfhost_step.dependOn(&install_bit.step);
+
+        // Only reached once the rebuild above succeeded, so a stamp is never
+        // written for a failed or partial build.
+        if (selfhost_gate_applies) {
+            const selfhost_record = RecordFingerprint.create(b, "record selfhost fingerprint", "fp-selfhost.stamp", selfhost_fp);
+            selfhost_record.step.dependOn(&install_bit.step);
+            selfhost_step.dependOn(&selfhost_record.step);
+            test_step.dependOn(&selfhost_record.step);
+        }
+    }
 
     // Hand the stress harness the self-hosted compiler so it builds every stress
     // program with BOTH compilers (#1413). Until this, the suite drove only the
