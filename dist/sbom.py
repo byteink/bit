@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Generate a CycloneDX 1.6 SBOM for a release.
+"""Generate a CycloneDX 1.7 SBOM for a release.
 
     dist/sbom.py <version> <zig-version>
 
 <version> is the tag without its leading `v`. <zig-version> is the pinned
 seed toolchain version (.zigversion / build.zig.zon's minimum_zig_version).
+1.7 (Oct 2025, ratified as ECMA-424 2nd edition) is the current spec version
+per cyclonedx.org/specification/overview as of this writing; 1.6 remains
+readable by every validator 1.7 is, so there is no compatibility cost to
+using the newer one.
 
-Uses the official cyclonedx-python-lib (pip install cyclonedx-python-lib) to
-build and serialise the document, so the output is schema-conformant by
-construction rather than hand-rolled JSON. Prints the BOM as JSON to stdout;
-the caller redirects it to bit-<version>.cdx.json (dist/README.md naming).
+Uses the official cyclonedx-python-lib (dist/sbom-requirements.txt pins the
+version) to build and serialise the document, so the output is
+schema-conformant by construction rather than hand-rolled JSON. This is the
+one script in dist/ written in Python rather than bash: CycloneDX has no
+Bash-native generator, and hand-writing the schema in bash is exactly what
+this must not do. Prints the BOM as JSON to stdout; the caller redirects it
+to bit-<version>.cdx.json (dist/README.md naming).
 
 Bit has no ecosystem-specific CycloneDX generator (build.zig.zon has no
 `.dependencies` field today, and the wider Zig tooling has no PURL type yet),
@@ -24,7 +31,7 @@ import sys
 from cyclonedx.model import Property
 from cyclonedx.model.bom import Bom
 from cyclonedx.model.component import Component, ComponentType
-from cyclonedx.output.json import JsonV1Dot6
+from cyclonedx.output.json import JsonV1Dot7
 
 NO_VENDORED_DEPS = (
     "bit vendors no third-party source and build.zig.zon declares no "
@@ -64,7 +71,7 @@ def main() -> int:
         return 2
     _, version, zig_version = sys.argv
     bom = build_bom(version, zig_version)
-    print(JsonV1Dot6(bom).output_as_string(indent=2))
+    print(JsonV1Dot7(bom).output_as_string(indent=2))
     return 0
 
 

@@ -6,9 +6,10 @@
 # Not wired into `zig build test` — dist/*.sh has never been (changelog.sh,
 # package.sh aren't either); this exercises the one thing zig build test
 # can't: that the Python generator emits the fields the release pipeline and
-# downstream consumers rely on. Requires cyclonedx-python-lib (the same
-# version pinned in release.yml); installs it into a throwaway venv if
-# missing rather than touching the caller's environment.
+# downstream consumers rely on. Installs cyclonedx-python-lib into a
+# throwaway venv rather than touching the caller's environment, pinned by
+# dist/sbom-requirements.txt — the same file release.yml's "sbom" step reads,
+# so the two never drift apart.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +17,7 @@ VENV="$(mktemp -d)"
 trap 'rm -rf "${VENV}"' EXIT
 
 python3 -m venv "${VENV}"
-"${VENV}/bin/pip" install --quiet cyclonedx-python-lib==11.6.0
+"${VENV}/bin/pip" install --quiet -r "${ROOT}/dist/sbom-requirements.txt"
 
 OUT="$("${VENV}/bin/python3" "${ROOT}/dist/sbom.py" 9.9.9-test 0.16.0)"
 
@@ -37,7 +38,7 @@ print(d)
 }
 
 check 'bomFormat'             'bomFormat'                                   'CycloneDX'
-check 'specVersion'           'specVersion'                                 '1.6'
+check 'specVersion'           'specVersion'                                 '1.7'
 check 'app component name'    'metadata/component/name'                    'bit'
 check 'app component version' 'metadata/component/version'                 '9.9.9-test'
 check 'zig tool name'         'metadata/tools/components/0/name'           'zig'
