@@ -1,0 +1,582 @@
+// Bit standard library — std/tls, session resumption + 0-RTT early data
+// (RFC 8446 §2.3, §4.2.10, §4.2.11, §4.5, §4.6.1, #1209).
+//
+// A server that finishes a handshake may call `TlsServerConn.issueTicket` to
+// hand the client an opaque ticket (`NewSessionTicket`), sealed as a
+// post-handshake record the same way `client.bit`'s doc comment already
+// describes ("NewSessionTicket / KeyUpdate"). The client bundles the ticket
+// with the connection's `resumptionSecret()` into a `SessionTicket` (via
+// `newSessionTicket`) and, on a later connection, drives `tlsClientStartResume`
+// instead of `tlsClientStart`. That builds a ClientHello carrying
+// `psk_key_exchange_modes` (psk_dhe_ke only — RFC 8446 also defines a
+// no-DHE `psk_ke` mode this module does not implement, per #1209's scope) and
+// `pre_shared_key` (the ticket as the offered identity, with a binder proving
+// possession of the PSK the ticket derives), optionally followed immediately by
+// 0-RTT `early_data` application records. The server (`processClientHello`)
+// validates the binder, and on success skips Certificate/CertificateVerify —
+// the PSK already authenticates the connection — deriving the rest of the
+// handshake from a ticket-derived early secret instead of the all-zero default
+// (RFC 8446 §7.1's ladder is already generic over this, so nothing in
+// `keyschedule.bit` changes; only what feeds it does).
+//
+// *** 0-RTT data is replayable. ***  An attacker who captures a ClientHello +
+// early-data flight can replay it verbatim, and the server has no way to tell
+// a replay from the original: RFC 8446 §8 gives servers only mitigations
+// (single-use tickets, ClientHello recording within a short window), never a
+// guarantee, and this module implements none of them (explicitly out of scope
+// for #1209 — see its ticket). An application MUST treat any request that
+// might arrive as 0-RTT data as safe to execute more than once (idempotent) —
+// e.g. a GET, not a fund transfer. `TlsServerHandshake.earlyDataReceived()`
+// exists to let a caller apply exactly that discipline; this module cannot
+// enforce it for you.
+//
+// One flat module: this file shares `handshake.bit`'s `tlsHsWrap`/`tlsHsUnwrap`
+// framing, `keyschedule.bit`'s ladder, `client.bit`/`clientflight.bit`'s
+// `TlsClientHandshake` (and its private `clientBuildExts`/`clientMakeOffers`/
+// `clientNewHash`), and `server.bit`'s `TlsServerHandshake`/`TlsServerConn`,
+// all without imports of their own. Private free functions are prefixed
+// `resume`; server-only ones `srv` to match `server.bit`'s convention.
+
+// --- extension types (RFC 8446 §4.2, ExtensionType) -------------------------
+
+// pre_shared_key (41). MUST be the last extension in a ClientHello (§4.2.11).
+const extTypePreSharedKey: int = 41
+// early_data (42). Empty body in a ClientHello/EncryptedExtensions; a
+// `uint32 max_early_data_size` in a NewSessionTicket (§4.2.10).
+const extTypeEarlyData: int = 42
+// psk_key_exchange_modes (45).
+const extTypePskKeyExchangeModes: int = 45
+
+// psk_dhe_ke (1): a PSK used together with an (EC)DHE key exchange — the only
+// mode this module offers or accepts. RFC 8446 also defines psk_ke(0), a
+// PSK-only mode with no forward secrecy; out of scope for #1209.
+const pskKeModePskDhe: int = 1
+
+// end_of_early_data (5): the RFC 8446 §4.5 message that closes the early-data
+// flight, sealed under the early traffic key as the signal the record layer is
+// about to switch to handshake keys. Its body is always empty.
+const hsEndOfEarlyData: int = 5
+
+// A server-issued ticket lifetime and the 0-RTT data cap this module
+// advertises when it issues a ticket. Not configurable — #1209 is explicit
+// this is a latency optimization, not a tunable production knob; a caller who
+// needs different values can encode/seal a `NewSessionTicket` by hand with the
+// same `encodeNewSessionTicket`/`extEarlyDataMaxSize` this uses.
+const resumeTicketLifetimeSec: int = 7200
+const resumeMaxEarlyData: int = 16384
+
+// One `PskIdentity` entry of a ClientHello's `pre_shared_key` extension: the
+// opaque ticket bytes and the client's (obfuscated) estimate of how long ago it
+// received the ticket. This module always sends `obfuscatedTicketAge: 0` — it
+// does not track wall-clock ticket age (#1209: the server's anti-replay window
+// this age would feed is explicitly out of scope) — which is a valid, if
+// maximally conservative, value on the wire.
+export struct PskIdentity { export identity: []byte, export obfuscatedTicketAge: int }
+
+// --- extension codecs ---------------------------------------------------
+
+// A `psk_key_exchange_modes` extension offering `modes` (RFC 8446 §4.2.9).
+function extPskKeyExchangeModes(modes: []int): Extension {
+  let list = []byte(0)
+  for m of modes {
+    list = tlsHsPutU8(list, m)
+  }
+  return Extension{ extType: extTypePskKeyExchangeModes, data: tlsHsPutVec8([]byte(0), list) }
+}
+
+// The modes of a `psk_key_exchange_modes` extension.
+function parsePskKeyExchangeModes(e: Extension): []int! {
+  let r = tlsHsReader{ data: e.data, pos: 0 }
+  let list = tlsHsGetVec8(r)?
+  tlsHsExpectEnd(r)?
+  let out = []int(0)
+  let i = 0
+  while (i < len(list)) {
+    out = append(out, int(list[i]))
+    i = i + 1
+  }
+  return out
+}
+
+// The empty-body `early_data` extension a ClientHello sends to signal it is
+// attempting 0-RTT, and an EncryptedExtensions sends to confirm acceptance.
+function extEarlyDataEmpty(): Extension {
+  return Extension{ extType: extTypeEarlyData, data: []byte(0) }
+}
+
+// The `early_data` extension a NewSessionTicket carries: the `uint32
+// max_early_data_size` a client offering this ticket may send before the
+// server's handshake response.
+function extEarlyDataMaxSize(n: int): Extension {
+  return Extension{ extType: extTypeEarlyData, data: tlsHsPutU32([]byte(0), n) }
+}
+
+// A ClientHello `pre_shared_key` extension offering `identities`, each with its
+// (still-zero, to be patched in place) `binders` entry. Caller-supplied binders
+// let this build both the dummy-binder ClientHello the binder is computed over
+// and the final one after `resumeSpliceTail` patches the real value in — same
+// length either way, so the extension/extensions-block length prefixes never
+// need to move.
+function extPreSharedKeyClient(identities: []PskIdentity, binders: [][]byte): Extension {
+  let idList = []byte(0)
+  for id of identities {
+    idList = tlsHsPutVec16(idList, id.identity)
+    idList = tlsHsPutU32(idList, id.obfuscatedTicketAge)
+  }
+  let binderList = []byte(0)
+  for b of binders {
+    binderList = tlsHsPutVec8(binderList, b)
+  }
+  let data = tlsHsPutVec16([]byte(0), idList)
+  data = tlsHsPutVec16(data, binderList)
+  return Extension{ extType: extTypePreSharedKey, data: data }
+}
+
+// The identities and binders offered in a ClientHello `pre_shared_key`
+// extension, in order.
+struct PskOffered { identities: []PskIdentity, binders: [][]byte }
+
+// Parse a ClientHello `pre_shared_key` extension. Fails on trailing bytes at
+// either level, exactly as the rest of this module's handshake parsing does —
+// the server sees hostile input here as much as anywhere else.
+function parsePreSharedKeyClient(e: Extension): PskOffered! {
+  let r = tlsHsReader{ data: e.data, pos: 0 }
+  let idBlock = tlsHsGetVec16(r)?
+  let binderBlock = tlsHsGetVec16(r)?
+  tlsHsExpectEnd(r)?
+
+  let ir = tlsHsReader{ data: idBlock, pos: 0 }
+  let ids = []PskIdentity(0)
+  let guard = 0
+  while (ir.pos < len(idBlock) && guard < len(idBlock) + 1) {
+    let identity = tlsHsGetVec16(ir)?
+    let age = tlsHsGetU32(ir)?
+    ids = append(ids, PskIdentity{ identity: identity, obfuscatedTicketAge: age })
+    guard = guard + 1
+  }
+  if (ir.pos != len(idBlock)) {
+    fail newError("tls: pre_shared_key identities not fully consumed")
+  }
+
+  let br = tlsHsReader{ data: binderBlock, pos: 0 }
+  let binders = [][]byte(0)
+  let guard2 = 0
+  while (br.pos < len(binderBlock) && guard2 < len(binderBlock) + 1) {
+    binders = append(binders, tlsHsGetVec8(br)?)
+    guard2 = guard2 + 1
+  }
+  if (br.pos != len(binderBlock)) {
+    fail newError("tls: pre_shared_key binders not fully consumed")
+  }
+
+  return PskOffered{ identities: ids, binders: binders }
+}
+
+// A ServerHello `pre_shared_key` extension selecting identity 0 — the only
+// index this module ever sends, since it offers/accepts a single PSK identity.
+function extPreSharedKeyServer(selectedIndex: int): Extension {
+  return Extension{ extType: extTypePreSharedKey, data: tlsHsPutU16([]byte(0), selectedIndex) }
+}
+
+// The Handshake-framed encoding of an EndOfEarlyData message (RFC 8446 §4.5) —
+// always empty-bodied.
+function encodeEndOfEarlyData(): []byte {
+  return tlsHsWrap(hsEndOfEarlyData, []byte(0))
+}
+
+// Parse a Handshake-framed EndOfEarlyData, failing on a wrong type or a
+// non-empty body.
+function parseEndOfEarlyData(msg: []byte): ()! {
+  let r = tlsHsUnwrap(msg, hsEndOfEarlyData)?
+  tlsHsExpectEnd(r)?
+}
+
+// --- small extension-list lookups (shared by the client and server halves) --
+
+// The result of an optional extension lookup: `found` is false, with a
+// zero-value `ext`, when `t` is absent — unlike `clientFindExt`, this is not a
+// fatal condition (a missing `pre_shared_key`/`early_data` just means the peer
+// declined).
+struct extLookup { found: bool, ext: Extension }
+
+function findExtOptional(exts: []Extension, t: int): extLookup {
+  for e of exts {
+    if (e.extType == t) {
+      return extLookup{ found: true, ext: e }
+    }
+  }
+  return extLookup{ found: false, ext: Extension{ extType: 0, data: []byte(0) } }
+}
+
+function hasExt(exts: []Extension, t: int): bool {
+  return findExtOptional(exts, t).found
+}
+
+function hasInt(list: []int, want: int): bool {
+  for v of list {
+    if (v == want) {
+      return true
+    }
+  }
+  return false
+}
+
+// --- server-side ticket store -------------------------------------------
+
+// What a server remembers about one ticket it issued: enough to recompute the
+// resumption PSK (`resumptionSecret` + the ticket's own `nonce`, RFC 8446
+// §4.6.1), confirm the redeeming handshake negotiated a compatible suite, and
+// decide whether to allow 0-RTT on it. ALPN is not part of the stored session:
+// the client re-offers it and `srvSelectAlpn` renegotiates it normally on
+// every handshake, resumed or not.
+struct TlsServerSession {
+  resumptionSecret: []byte,
+  nonce: []byte,
+  suiteId: int,
+  allowEarlyData: bool,
+}
+
+// A server-lifetime store of issued tickets, keyed by the raw ticket bytes (as
+// a string). Reference-typed like every other `map<K,V>` (§14.6 / the doc
+// comment on `struct RecordKeys`'s sibling types), so every handshake driven
+// from the same `TlsServerConfig` shares one store — `newTlsServerConfig` gives
+// each config its own, and `TlsServerConn.issueTicket` writes into it via the
+// config it was built from.
+export struct TlsTicketStore { sessions: map<string, TlsServerSession> }
+
+// An empty ticket store.
+export function newTicketStore(): TlsTicketStore {
+  return TlsTicketStore{ sessions: map<string, TlsServerSession>() }
+}
+
+// A pseudo-random uint32 (as an `int`) from four fresh random bytes — used for
+// `NewSessionTicket.ageAdd`, whose only requirement (RFC 8446 §4.6.1) is that
+// it not be predictable to an observer.
+function resumeRandomU32(): int {
+  let b = randomBytes(4)
+  return (int(b[0]) << 24) | (int(b[1]) << 16) | (int(b[2]) << 8) | int(b[3])
+}
+
+// Issue a NewSessionTicket for this connection: mint fresh ticket and nonce
+// bytes, record the session (resumption secret, suite, whether 0-RTT is
+// allowed on it) in the ticket store this connection's config carries, and
+// return the sealed post-handshake record to send. The caller decides when —
+// and whether — to call this, same as `sealApp`; a server that never calls it
+// simply never offers resumption.
+export function (c: TlsServerConn) issueTicket(): []byte! {
+  let ticket = randomBytes(32)
+  let nonce = randomBytes(8)
+  c.tickets.sessions[string(ticket)] = TlsServerSession{
+    resumptionSecret: c.resumption,
+    nonce: nonce,
+    suiteId: c.suite.id,
+    allowEarlyData: c.allowEarlyData,
+  }
+  let exts = []Extension(0)
+  if (c.allowEarlyData) {
+    exts = append(exts, extEarlyDataMaxSize(resumeMaxEarlyData))
+  }
+  let nst = NewSessionTicket{
+    lifetime: resumeTicketLifetimeSec,
+    ageAdd: resumeRandomU32(),
+    nonce: nonce,
+    ticket: ticket,
+    extensions: exts,
+  }
+  return c.appWrite.seal(encodeNewSessionTicket(nst), recordHandshake)?
+}
+
+// --- client-side session record ------------------------------------------
+
+// What a client keeps, after a connection closes, to attempt resumption on a
+// later one: the raw ticket and nonce a NewSessionTicket carried, the
+// connection's resumption_master_secret (from which the ticket's actual PSK is
+// derived, RFC 8446 §4.6.1), and enough of the original connection's
+// parameters (`suiteId`, `alpn`) to rebuild a compatible offer. Build one with
+// `newSessionTicket`; store it however the caller likes (in memory, keyed by
+// server name, is enough for #1209's scope — no persistence or session-cache
+// abstraction is implemented, since nothing in the task needs one).
+export struct SessionTicket {
+  export ticket: []byte,
+  export nonce: []byte,
+  export resumptionSecret: []byte,
+  export suiteId: int,
+  export alpn: string,
+}
+
+// A `SessionTicket` from a NewSessionTicket message and the connection it
+// arrived on. `nst` is typically recovered from `TlsClientConn.openApp`
+// returning a `recordHandshake`-typed record: `parseNewSessionTicket(pt.content)`.
+export function newSessionTicket(nst: NewSessionTicket, conn: TlsClientConn): SessionTicket {
+  return SessionTicket{
+    ticket: nst.ticket,
+    nonce: nst.nonce,
+    resumptionSecret: conn.resumptionSecret(),
+    suiteId: conn.cipherSuiteId(),
+    alpn: conn.alpnProtocol(),
+  }
+}
+
+// --- client: build a resumed / 0-RTT ClientHello -------------------------
+
+// `full` with its last `len(tail)` bytes replaced by `tail` (same total
+// length) — how the real PSK binder is patched into a ClientHello already
+// encoded with a same-length zero placeholder, without re-encoding (and
+// without disturbing the length prefixes the placeholder already fixed).
+function resumeSpliceTail(full: []byte, tail: []byte): []byte {
+  let out = []byte(len(full))
+  let i = 0
+  while (i < len(full)) {
+    out[i] = full[i]
+    i = i + 1
+  }
+  let off = len(full) - len(tail)
+  let j = 0
+  while (j < len(tail)) {
+    out[off + j] = tail[j]
+    j = j + 1
+  }
+  return out
+}
+
+// `suites` with `preferred` moved to the front (and deduplicated) — the
+// resumed ClientHello must offer the ticket's original suite so the server can
+// select it and make the PSK usable (RFC 8446 §4.1.1: a resumed connection's
+// suite must share the PSK's hash algorithm; this module requires the exact
+// suite, the simplest sufficient rule for a 3-suite registry).
+function resumeSuitesWithPreferred(suites: []int, preferred: int): []int {
+  let out = []int(0)
+  out = append(out, preferred)
+  for s of suites {
+    if (s != preferred) {
+      out = append(out, s)
+    }
+  }
+  return out
+}
+
+// The extension list plus a dummy (all-zero, correctly sized) `pre_shared_key`
+// binder for a resumed ClientHello: the normal extension set
+// (`clientBuildExts`) plus `psk_key_exchange_modes`, optionally `early_data`,
+// then `pre_shared_key` last (RFC 8446 §4.2.11 requires this ordering).
+function (h: TlsClientHandshake) resumeBuildHello(
+  offers: []clientOffer,
+  session: SessionTicket,
+  wantEarlyData: bool,
+): []byte {
+  let exts = h.clientBuildExts(offers)
+  exts = append(exts, extPskKeyExchangeModes([pskKeModePskDhe]))
+  if (wantEarlyData) {
+    exts = append(exts, extEarlyDataEmpty())
+  }
+  let dummyBinder = []byte(h.pskSuite.hashLen)
+  let identity = PskIdentity{ identity: session.ticket, obfuscatedTicketAge: 0 }
+  exts = append(exts, extPreSharedKeyClient([identity], [dummyBinder]))
+  let suites = resumeSuitesWithPreferred(h.clientHelloSuites(), session.suiteId)
+  return encodeClientHello(
+    ClientHello{
+      legacyVersion: versionTls12,
+      random: h.clientRandom,
+      sessionId: h.sessionId,
+      cipherSuites: suites,
+      extensions: exts,
+    },
+  )
+}
+
+// Start a client handshake attempting session resumption with `session`, the
+// PSK-DHE mode (RFC 8446 §4.2.11), and — when `earlyData` is non-empty — 0-RTT
+// early application data (§2.3, §4.2.10) sent speculatively in the same flight
+// as the ClientHello, before the server has replied at all. The server may
+// still decline the PSK entirely (falling back to a fresh handshake — detect
+// this via `pskWasAccepted()` once connected) or accept the PSK but decline
+// early data (`earlyDataAccepted` stays false); in the latter case the caller
+// must resend `earlyData` itself as ordinary application data once connected
+// — this module does not buffer or auto-retry it, matching its sans-I/O
+// design everywhere else (the caller always drives what gets (re)sent).
+//
+// *** 0-RTT data is replayable — see this file's header comment. *** Only pass
+// `earlyData` the peer may safely process more than once.
+export function tlsClientStartResume(
+  config: TlsClientConfig,
+  session: SessionTicket,
+  earlyData: []byte,
+): TlsClientHandshake! {
+  let h = tlsClientStartExts(config, []Extension(0))?
+  h.pskSuite = tlsSuiteById(session.suiteId)?
+  let mk = () => tlsSuiteNewHash(h.pskSuite)
+  let psk = resumptionPsk(mk, session.resumptionSecret, session.nonce)
+  h.pskEarly = earlySecret(mk, psk)
+  h.pskUsed = true
+  h.offeredSuites = resumeSuitesWithPreferred(h.clientHelloSuites(), session.suiteId)
+
+  let wantEarly = len(earlyData) > 0
+  let chDummy = h.resumeBuildHello(h.offers, session, wantEarly)
+  let binderLen = h.pskSuite.hashLen
+  let truncated = chDummy[0:len(chDummy) - binderLen]
+  let bKey = binderKey(mk, h.pskEarly)
+  let binder = finishedMac(mk, bKey, digest(mk(), truncated))
+  h.ch1 = resumeSpliceTail(chDummy, binder)
+  h.transcript = h.ch1
+  h.hello = tlsWirePlaintextRecord(recordHandshake, h.ch1)
+
+  if (wantEarly) {
+    let earlyTraffic = clientEarlyTrafficSecret(mk, h.pskEarly, digest(mk(), h.transcript))
+    h.earlyWriteKeys = newRecordKeys(h.pskSuite, earlyTraffic)?
+    h.hello = tlsHsPutBytes(h.hello, h.earlyWriteKeys.seal(earlyData, recordApplicationData)?)
+    h.sentEarlyData = true
+  }
+  return h
+}
+
+// Whether the server accepted the PSK this handshake offered (echoed
+// `pre_shared_key` in its ServerHello) — meaningful only after
+// `processServerFlight` has processed the ServerHello. False for a handshake
+// that never called `tlsClientStartResume`, and also false when the server
+// declined the PSK and fell back to a fresh handshake (Certificate included).
+export function (h: TlsClientHandshake) pskWasAccepted(): bool {
+  return h.pskAccepted
+}
+
+// --- server: validate an offered PSK and, if accepted, 0-RTT early data -----
+
+// Validate `ch`'s `pre_shared_key`/`psk_key_exchange_modes` extensions against
+// this server's ticket store and, on a valid binder, accept the PSK
+// (`s.pskAccepted`/`s.pskEarly`) and — if the client also offered `early_data`
+// and this server allows it for that ticket — accept 0-RTT
+// (`s.earlyDataAccepted`/`s.earlyReadKeys`). Any failure to qualify (no PSK
+// offered, unknown ticket, wrong suite, bad binder) is not fatal: it silently
+// leaves `s.pskAccepted` false, which `srvBuildServerFlight` reads as "run a
+// fresh handshake" — exactly RFC 8446's "server MAY choose an earlier version
+// [handshake] instead" fallback. Only a structurally malformed PSK extension
+// (one that parses as present but not as valid TLS) is a hard failure, the
+// same standard the rest of this module's decoders hold hostile input to.
+//
+// PSK-after-HelloRetryRequest is not implemented (`s.usedHrr` short-circuits
+// this): #1209's required tests never combine resumption with HRR, and
+// supporting it would mean threading the truncated-transcript computation
+// through the post-HRR synthetic-transcript path for no tested benefit.
+function (s: TlsServerHandshake) srvTryPsk(ch: ClientHello, chMsg: []byte): ()! {
+  if (s.usedHrr) {
+    return
+  }
+  let pskLookup = findExtOptional(ch.extensions, extTypePreSharedKey)
+  if (!pskLookup.found) {
+    return
+  }
+  let modesLookup = findExtOptional(ch.extensions, extTypePskKeyExchangeModes)
+  if (!modesLookup.found) {
+    return
+  }
+  let modes = parsePskKeyExchangeModes(modesLookup.ext)?
+  if (!hasInt(modes, pskKeModePskDhe)) {
+    return
+  }
+
+  let offered = parsePreSharedKeyClient(pskLookup.ext)?
+  if (len(offered.identities) == 0 || len(offered.binders) == 0) {
+    return
+  }
+  let sess = s.config.tickets.sessions[string(offered.identities[0].identity)]
+  if (len(sess.resumptionSecret) == 0) {
+    return
+  }
+  if (sess.suiteId != s.suite.id) {
+    return
+  }
+
+  let mk = s.srvNewHash
+  let psk = resumptionPsk(mk, sess.resumptionSecret, sess.nonce)
+  let early = earlySecret(mk, psk)
+  let bKey = binderKey(mk, early)
+  let binder = offered.binders[0]
+  if (len(binder) > len(chMsg)) {
+    fail newError("tls server: pre_shared_key binder is longer than the ClientHello")
+  }
+  let truncated = chMsg[0:len(chMsg) - len(binder)]
+  let expected = finishedMac(mk, bKey, digest(mk(), truncated))
+  if (!ctEq(expected, binder)) {
+    return
+  }
+
+  s.pskAccepted = true
+  s.pskEarly = early
+
+  if (s.config.allowEarlyData && sess.allowEarlyData && hasExt(ch.extensions, extTypeEarlyData)) {
+    let earlyTraffic = clientEarlyTrafficSecret(mk, early, digest(mk(), s.transcript))
+    s.earlyReadKeys = newRecordKeys(s.suite, earlyTraffic)?
+    s.earlyDataAccepted = true
+  }
+}
+
+// Decrypt the client's speculative 0-RTT records — everything in the flight
+// after the ClientHello, `records[startIdx:]`, skipping any
+// change_cipher_spec — under the early traffic key `srvTryPsk` just derived,
+// accumulating their content into `s.earlyData`. Only called once
+// `s.earlyDataAccepted` is already true, so an unreadable record here is a
+// genuine protocol violation (RFC 8446 §4.2.10: "if the server fails to
+// decrypt a 0-RTT record following an accepted early_data extension, it MUST
+// terminate the connection with a bad_record_mac alert") rather than evidence
+// early data should have been declined — that decision was already made.
+function (s: TlsServerHandshake) srvConsumeEarlyData(records: [][]byte, startIdx: int): ()! {
+  let idx = startIdx
+  while (idx < len(records)) {
+    let rec = records[idx]
+    idx = idx + 1
+    if (tlsWireRecordType(rec) == tlsCcsType) {
+      continue
+    }
+    let pt = s.earlyReadKeys.open(rec)?
+    if (pt.contentType != recordApplicationData) {
+      fail newError("tls server: expected application_data in the early-data flight")
+    }
+    s.earlyData = tlsHsPutBytes(s.earlyData, pt.content)
+  }
+}
+
+// Consume the EndOfEarlyData record that must precede the client Finished when
+// early data was accepted (RFC 8446 §4.5): skip any change_cipher_spec from
+// `startIdx`, open the next record under the early traffic key (not
+// `serverReadKeys` — this one record is still early-traffic-protected), verify
+// it really is EndOfEarlyData, and fold its bytes into the transcript the
+// server's own Finished check and application-secret derivation both cover.
+// Returns the index of the first record after it, for `processClientFinished`
+// to resume its normal (handshake-key) record scan from.
+function (s: TlsServerHandshake) srvConsumeEndOfEarlyData(records: [][]byte, startIdx: int): int! {
+  let idx = startIdx
+  while (idx < len(records) && tlsWireRecordType(records[idx]) == tlsCcsType) {
+    idx = idx + 1
+  }
+  if (idx >= len(records)) {
+    fail newError("tls server: expected EndOfEarlyData after accepted early data")
+  }
+  let pt = s.earlyReadKeys.open(records[idx])?
+  if (pt.contentType != recordHandshake) {
+    fail newError("tls server: expected an EndOfEarlyData record")
+  }
+  parseEndOfEarlyData(pt.content)?
+  s.transcript = tlsHsPutBytes(s.transcript, pt.content)
+  return idx + 1
+}
+
+// Whether the client's ClientHello carried a PSK this server accepted — the
+// server-side mirror of `TlsClientHandshake.pskWasAccepted`. Meaningful once
+// `processClientHello` has run.
+export function (s: TlsServerHandshake) pskWasAccepted(): bool {
+  return s.pskAccepted
+}
+
+// Whether this handshake accepted the client's 0-RTT early data. When true,
+// `earlyDataReceived()` holds it.
+export function (s: TlsServerHandshake) earlyDataWasAccepted(): bool {
+  return s.earlyDataAccepted
+}
+
+// The 0-RTT early application data this handshake decrypted, concatenated in
+// the order the client sent it. Empty unless `earlyDataWasAccepted()`.
+//
+// *** This data is replayable — see this file's header comment. *** Treat it
+// as safe to process more than once before acting on it.
+export function (s: TlsServerHandshake) earlyDataReceived(): []byte {
+  return s.earlyData
+}
