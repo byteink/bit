@@ -49,6 +49,11 @@ struct SrcModule {
   tree: Tree,
   // Import path text ("std/fs") -> the module id it resolves to.
   imports: map<string, int>,
+  // Import path text -> why it failed, for exactly the paths whose `imports`
+  // entry is `modPkgFail` (#1737): a bit.lock/cache detail the resolver
+  // (resolve.bit) folds into the diagnostic it reports at that import's own
+  // span, in place of the generic "cannot find module" text.
+  pkgFail: map<string, string>,
   // Each file's SourceManager id, parallel to `fileNames`. The loader registers
   // them because it is what reads the files, and a diagnostic must render
   // against the file its text came from — see `remapDiags`.
@@ -87,6 +92,21 @@ struct Loader {
   // file present here but absent on disk is not listed — the file set still
   // comes from the directory, matching the seed's buildSnapshot.
   overlays: map<string, string>,
+  // bit.lock's entries by dependency name (#1737, spec §17.7), read ONCE for
+  // the whole build — one project has one lock file no matter how many modules
+  // it loads. Empty when the project ships no bit.lock, which is not an error
+  // (nothing to resolve as a package either).
+  lockEntries: map<string, LockEntry>,
+  // Set instead of failing `loadProjectOverlay` outright when bit.lock exists
+  // but is malformed JSON — the loader has no fallible return, so this surfaces
+  // through `resolvePackageImport` the same way every other package-resolution
+  // failure does, on the first import that actually needs the lock.
+  lockErr: string,
+  // `~/.bit/pkg` (or wherever `defaultCacheRoot` resolves), read once. `""` with
+  // `cacheRootErr` set when it could not be determined (e.g. HOME unset) —
+  // again surfaced lazily, only when a package import is actually attempted.
+  cacheRoot: string,
+  cacheRootErr: string,
 }
 
 // Bytewise string order: <0, 0, >0 like the seed's `std.mem.order`. A shorter
@@ -267,20 +287,83 @@ function moduleImportPaths(tree: Tree, source: string): []string {
   return out
 }
 
-// Resolves an import path to a directory. `std/x` maps under the stdlib root;
-// `./x` and `../x` resolve against the importing module's directory. Anything
-// else is not a module path and yields "" (the caller reports it).
-function resolveImportDir(lw: Loader, fromDir: string, path: string): string {
+// Resolves an import path to a directory, and — only on failure — a detail
+// string for the diagnostic. `std/x` maps under the stdlib root; `./x` and
+// `../x` resolve against the importing module's directory; anything else is a
+// package name, resolved against bit.lock + the package cache (#1737,
+// `resolvePackageImport`). `dir == ""` means unresolved; `detail == ""` then
+// means the caller should report the generic "cannot find module" (std/*
+// with no stdlib, matching the pre-#1737 behaviour) rather than a
+// package-specific one.
+function resolveImportDir(lw: Loader, fromDir: string, path: string): (string, string) {
   if (startsWith(path, "std/")) {
     if (lw.stdRoot == "") {
-      return ""
+      return "", ""
     }
-    return pathJoinResolve(lw.stdRoot, path[4:len(path)])
+    return pathJoinResolve(lw.stdRoot, path[4:len(path)]), ""
   }
   if (startsWith(path, "./") || startsWith(path, "../")) {
-    return pathJoinResolve(fromDir, path)
+    return pathJoinResolve(fromDir, path), ""
   }
-  return ""
+  return resolvePackageImport(lw, path)
+}
+
+// Resolves a bare import path — not "std/…", not "./…"/"../…" — against
+// bit.lock + the `~/.bit/pkg` content-addressed cache (#1737, spec §17.7).
+// `name` is looked up as-is: SPEC §17.7's `bit.json` dependency map is keyed by
+// exactly the name a project imports it by (see selfhost/pmcli.bit's `name =
+// repo`), and bit.lock (selfhost/pmlock.bit) mirrors that key, so this needs no
+// separate manifest read — bit.lock alone is authoritative for what a BUILD
+// resolves, matching the ticket's "never a live fetch during build" contract.
+//
+// Never reaches the network on a warm cache: a locked name whose cache
+// directory already exists is verified with a purely local `git rev-parse
+// HEAD` (pmfetch.bit's `fetchSha`), which never even reads `entry.url`. A cold
+// cache (e.g. a fresh CI checkout) fetches exactly once and re-verifies the
+// result against the locked sha. A name absent from bit.lock is refused
+// outright, before anything resembling a fetch is attempted — this never adds
+// an unlocked dependency during a build.
+function resolvePackageImport(lw: Loader, name: string): (string, string) {
+  if (lw.lockErr != "") {
+    return "", "bit.lock: ${lw.lockErr}"
+  }
+  let (entry, found) = lw.lockEntries[name]
+  if (!found) {
+    return "", "not declared in bit.lock — run `bit add <gitHost/owner/repo>[@ref]` to add \"${name}\" as a dependency"
+  }
+  if (lw.cacheRootErr != "") {
+    return "", "cannot resolve the package cache: ${lw.cacheRootErr}"
+  }
+  let (host, owner, repo, ok) = pkgUrlHostOwnerRepo(entry.url)
+  if (!ok) {
+    return "", "bit.lock entry for \"${name}\" has a malformed url: ${entry.url}"
+  }
+  let fetched = fetchSha(defaultGitBin, lw.cacheRoot, host, owner, repo, entry.url, entry.commit, defaultTimeoutMs) catch e {
+    return "", e.message()
+  }
+  return fetched.dir, ""
+}
+
+// Splits pmfetch.bit's `"https://" + host + "/" + owner + "/" + repo + ".git"`
+// back into its three parts — the inverse of how `addCmd` (pmcli.bit) built the
+// url a bit.lock entry stores. `ok` is false for anything else (a non-https
+// remote is outside spec §17.7's git-only registry model, and a bit.lock entry
+// this file cannot parse cannot be resolved to a cache path).
+function pkgUrlHostOwnerRepo(url: string): (string, string, string, bool) {
+  let prefix = "https://"
+  let suffix = ".git"
+  if (!startsWith(url, prefix) || len(url) < len(prefix) + len(suffix)) {
+    return "", "", "", false
+  }
+  let rest = url[len(prefix):len(url)]
+  if (rest[len(rest) - len(suffix):len(rest)] != suffix) {
+    return "", "", "", false
+  }
+  let parts = pathParts(rest[0:len(rest) - len(suffix)])
+  if (len(parts) != 3) {
+    return "", "", "", false
+  }
+  return parts[0], parts[1], parts[2], true
 }
 
 // A module id the loader could not produce. The seed's `ImportResolution` is a
@@ -290,6 +373,11 @@ function resolveImportDir(lw: Loader, fromDir: string, path: string): string {
 // for an unresolvable path, so the resolver's absent-key guard never fired.
 const modNotFound = -1
 const modCycle = -2
+// A package-shaped import (not "std/…" nor a relative path) that failed for a
+// bit.lock/cache reason (#1737) — distinct from `modNotFound` so the resolver
+// reports the specific detail (`SrcModule.pkgFail`) instead of the generic
+// "cannot find module" text.
+const modPkgFail = -3
 
 // Loads the module rooted at `dir` and every module it imports, depth-first.
 // Returns its id, `modCycle` when the directory is already on the load stack, or
@@ -355,10 +443,16 @@ function loadModuleAt(lw: Loader, dir: string, only: string): int {
   let tree = parseSourceD(source, 0, lw.diags)
   remapDiags(lw.diags, before, files, fileStarts)
   let imports = map<string, int>{}
+  let pkgFail = map<string, string>{}
   for path of moduleImportPaths(tree, source) {
-    let target = resolveImportDir(lw, canon, path)
+    let (target, detail) = resolveImportDir(lw, canon, path)
     if (target == "") {
-      imports[path] = modNotFound
+      if (detail == "") {
+        imports[path] = modNotFound
+      } else {
+        imports[path] = modPkgFail
+        pkgFail[path] = detail
+      }
       continue
     }
     imports[path] = loadModuleAt(lw, target, "")
@@ -367,9 +461,36 @@ function loadModuleAt(lw: Loader, dir: string, only: string): int {
   delete(lw.loading, canon)
   let id = len(lw.mods)
   lw.mods = append(lw.mods, SrcModule{ dir: canon, fileNames: fileNames,
-    fileStarts: fileStarts, source: source, tree: tree, imports: imports, files: files })
+    fileStarts: fileStarts, source: source, tree: tree, imports: imports, pkgFail: pkgFail, files: files })
   lw.resolved[canon] = id
   return id
+}
+
+// `<rootDir>/bit.lock`'s entries, by name — read once per build (#1737). A
+// missing lock file is not an error (`readLock` already returns an empty list
+// for one, matching bit.lock's "the first `bit add` creates it" contract); a
+// PRESENT but malformed one surfaces its message lazily, through
+// `resolvePackageImport`, the same way every other package-resolution failure
+// does — `loadProjectOverlay` itself has no fallible return to propagate it.
+function loadLockEntries(rootDir: string): (map<string, LockEntry>, string) {
+  let out = map<string, LockEntry>{}
+  let entries = readLock(rootDir + "/bit.lock") catch e {
+    return out, e.message()
+  }
+  for entry of entries {
+    out[entry.name] = entry
+  }
+  return out, ""
+}
+
+// `defaultCacheRoot()` (pmfetch.bit), or `("", detail)` when it could not be
+// determined (HOME unset). Read once per build for the same reason as
+// `loadLockEntries`: one cache root regardless of module count.
+function loadCacheRoot(): (string, string) {
+  let root = defaultCacheRoot() catch e {
+    return "", e.message()
+  }
+  return root, ""
 }
 
 // Loads every module reachable from `rootDir`. `stdRoot` is where `std/*`
@@ -388,9 +509,12 @@ function loadProject(rootDir: string, rootOnly: string, stdRoot: string): Projec
 function loadProjectOverlay(rootDir: string, rootOnly: string, stdRoot: string,
     overlays: map<string, string>): Project {
   let sm = newSourceManager()
+  let (lockEntries, lockErr) = loadLockEntries(rootDir)
+  let (cacheRoot, cacheRootErr) = loadCacheRoot()
   let lw = Loader{ mods: []SrcModule(0), resolved: map<string, int>{},
     loading: map<string, bool>{}, stdRoot: stdRoot, prelude: -1,
-    sm: sm, diags: newDiagnostics(sm), overlays: overlays }
+    sm: sm, diags: newDiagnostics(sm), overlays: overlays,
+    lockEntries: lockEntries, lockErr: lockErr, cacheRoot: cacheRoot, cacheRootErr: cacheRootErr }
   if (stdRoot != "") {
     lw.prelude = loadModuleAt(lw, pathJoinResolve(stdRoot, "core"), "")
   }
