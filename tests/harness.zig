@@ -26,6 +26,16 @@
 //!                self-host differential harness diffs the Zig and Bit compilers
 //!                on (#1327/#1328/#1329); here they also guard the Zig dumps'
 //!                own stability.
+//!   `// lint exit=<0|1|2>` — the self-hosted `bit lint` (lint is selfhost-only,
+//!                spec/LINT.md §9 — the seed never grows it) runs over the file;
+//!                stderr must byte-match `.expected` and the process exit code
+//!                must match the directive's `exit=` value. The value is
+//!                mandatory rather than defaulted: lint has three meaningful
+//!                exit codes (0 clean, 1 findings, 2 bad directive) and a
+//!                stderr diff alone cannot tell "no findings" from "the
+//!                directive itself is malformed" (spec/LINT.md §8). Skipped
+//!                like `run`/`panic` when there is no runnable self-hosted
+//!                `bit` (cross build).
 //!
 //! A mismatch fails the build with a readable diff (via `expectEqualStrings`).
 //!
@@ -79,7 +89,7 @@ const max_cases = 4096;
 /// Upper bound on any single case/expected file.
 const max_file_bytes = 1 << 20; // 1 MiB
 
-const Directive = enum { run, panic, err, fmt, types, tokens, ast, ir };
+const Directive = enum { run, panic, err, fmt, types, tokens, ast, ir, lint };
 
 /// `ran_both` is reported only by a `run`/`panic` case that actually built and
 /// executed under BOTH compilers, so the suite can assert the self-hosted pass
@@ -149,7 +159,7 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
     defer gpa.free(source);
 
     const directive = directiveOf(source) orelse {
-        std.debug.print("case '{s}': line 1 must be '// run', '// panic', '// error', '// fmt', '// types', '// tokens', '// ast', or '// ir'\n", .{name});
+        std.debug.print("case '{s}': line 1 must be '// run', '// panic', '// error', '// fmt', '// types', '// tokens', '// ast', '// ir', or '// lint exit=<0|1|2>'\n", .{name});
         return error.MissingDirective;
     };
 
@@ -301,6 +311,59 @@ fn checkCase(gpa: std.mem.Allocator, io: Io, dir: Dir, name: []const u8) !Outcom
                 std.debug.print("case '{s}' IR-dump mismatch:\n", .{name});
             try testing.expectEqualStrings(expected, report.text);
         },
+        .lint => {
+            const expected_exit = lintExitCode(source) catch |e| {
+                std.debug.print("case '{s}': line 1 must be '// lint exit=<0|1|2>'\n", .{name});
+                return e;
+            };
+
+            // lint is selfhost-only (spec/LINT.md §9); a cross build has no
+            // runnable self-hosted `bit` to exec, same gate as `run`/`panic`.
+            if (self_compiler.len == 0) return .skipped;
+
+            var run_threaded = Io.Threaded.init(gpa, .{});
+            defer run_threaded.deinit();
+            const run_io = run_threaded.io();
+            const timeout_s = proc.timeoutSeconds(gpa);
+
+            // Run with `cases_dir` as cwd and `name` (not a joined path) as the
+            // argument, so the diagnostic's `-->` line names the file the same
+            // way every other directive's `.expected` does — a path baked from
+            // the absolute `cases_dir` would break the moment the checkout
+            // moves.
+            const outcome = try proc.run(gpa, run_io, timeout_s, .{
+                .argv = &.{ self_compiler, "lint", name },
+                .cwd = .{ .path = build_options.cases_dir },
+            });
+            const result = switch (outcome) {
+                .finished => |r| r,
+                .timed_out => |limit| {
+                    std.debug.print("case '{s}' [lint]: TIMED OUT\n", .{name});
+                    proc.timedOutNote(limit, self_compiler);
+                    return error.LintTimedOut;
+                },
+            };
+            defer gpa.free(result.stdout);
+            defer gpa.free(result.stderr);
+
+            if (result.term == .signal) {
+                std.debug.print("case '{s}' [lint]: CRASHED\n", .{name});
+                proc.crashNote(result.term.signal);
+                std.debug.print("stderr: {s}\n", .{result.stderr});
+                return error.LintCrashed;
+            }
+            const code: u8 = switch (result.term) {
+                .exited => |c| c,
+                else => 255,
+            };
+            if (code != expected_exit) {
+                std.debug.print("case '{s}' [lint]: expected exit {d}, got exit {d}\nstderr: {s}\n", .{ name, expected_exit, code, result.stderr });
+                return error.LintExitMismatch;
+            }
+            if (!std.mem.eql(u8, expected, result.stderr))
+                std.debug.print("case '{s}' [lint] stderr mismatch:\n", .{name});
+            try testing.expectEqualStrings(expected, result.stderr);
+        },
     }
     return .checked;
 }
@@ -405,13 +468,21 @@ fn runBinary(
     try testing.expectEqualStrings(expected, result.stdout);
 }
 
-/// Reads the line-1 directive. Matches the first line's leading token, ignoring a
-/// trailing `\r` and any text after the keyword, so `// error: foo` still parses.
-fn directiveOf(source: []const u8) ?Directive {
+/// The trimmed line-1 text: up to (not including) the first `\n`, with a
+/// trailing `\r` and outer whitespace stripped. Shared by `directiveOf` (which
+/// mode) and `lintExitCode` (the `// lint` line's `exit=` suffix).
+fn firstLine(source: []const u8) []const u8 {
     const nl = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
     var line = source[0..nl];
     if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    line = std.mem.trim(u8, line, " \t");
+    return std.mem.trim(u8, line, " \t");
+}
+
+/// Reads the line-1 directive. Matches the first line's leading token, ignoring
+/// any text after the keyword, so `// error: foo` and `// lint exit=1` still
+/// parse.
+fn directiveOf(source: []const u8) ?Directive {
+    const line = firstLine(source);
     if (std.mem.startsWith(u8, line, "// error")) return .err;
     // Before `// run`: `startsWith` would never reach a `// panic` case, but an
     // ordering bug here would silently downgrade it to a stdout comparison.
@@ -422,7 +493,23 @@ fn directiveOf(source: []const u8) ?Directive {
     if (std.mem.startsWith(u8, line, "// tokens")) return .tokens;
     if (std.mem.startsWith(u8, line, "// ast")) return .ast;
     if (std.mem.startsWith(u8, line, "// ir")) return .ir;
+    if (std.mem.startsWith(u8, line, "// lint")) return .lint;
     return null;
+}
+
+/// Parses the mandatory `exit=<0|1|2>` suffix off a `// lint` case's line 1
+/// (e.g. `// lint exit=1`). The value is asserted explicitly rather than
+/// defaulted: lint has three meaningful exit codes and a stderr diff alone
+/// cannot tell "0 clean" from "1 findings" from "2 bad directive"
+/// (spec/LINT.md §8).
+fn lintExitCode(source: []const u8) !u8 {
+    const line = firstLine(source);
+    const marker = "exit=";
+    const at = std.mem.indexOf(u8, line, marker) orelse return error.MissingLintExit;
+    const digits = std.mem.trim(u8, line[at + marker.len ..], " \t");
+    const code = std.fmt.parseInt(u8, digits, 10) catch return error.MalformedLintExit;
+    if (code > 2) return error.MalformedLintExit;
+    return code;
 }
 
 test "directiveOf parses line-1 modes" {
@@ -433,6 +520,16 @@ test "directiveOf parses line-1 modes" {
     try testing.expectEqual(Directive.types, directiveOf("// types\nlet x=1\n").?);
     try testing.expectEqual(Directive.err, directiveOf("// error: stray byte").?);
     try testing.expectEqual(@as(?Directive, null), directiveOf("let x = 1\n"));
+    try testing.expectEqual(Directive.lint, directiveOf("// lint exit=1\nlet x = 1\n").?);
+}
+
+test "lintExitCode reads the mandatory exit= suffix" {
+    try testing.expectEqual(@as(u8, 0), try lintExitCode("// lint exit=0\nlet x = 1\n"));
+    try testing.expectEqual(@as(u8, 1), try lintExitCode("// lint exit=1\n"));
+    try testing.expectEqual(@as(u8, 2), try lintExitCode("// lint exit=2\n"));
+    try testing.expectError(error.MissingLintExit, lintExitCode("// lint\n"));
+    try testing.expectError(error.MalformedLintExit, lintExitCode("// lint exit=3\n"));
+    try testing.expectError(error.MalformedLintExit, lintExitCode("// lint exit=abc\n"));
 }
 
 // Property check over every valid-Bit-source case (`run` and `fmt`

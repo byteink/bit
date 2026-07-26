@@ -277,6 +277,56 @@ diag = [x for x in b if "publishDiagnostics" in x]
 check("extern-mixed: genuine error beside externs still reported",
       any('"severity":1' in x for x in diag), joined(diag))
 
+# 10. lint findings publish alongside check diagnostics (#1391): a file past
+#     max-file-lines (800) gets a severity-2 (Warning) finding, distinct from
+#     a severity-1 (Error) check diagnostic, and it updates as the file is
+#     edited — grow past the limit, then shrink back under it.
+short_lines = "let x = 1\n"
+# Comment padding, not 801 duplicate `let x` decls: the point is tripping
+# max-file-lines without also tripping a genuine duplicate-declaration error,
+# which would just add noise this scenario isn't testing.
+long_lines = "let x = 1\n" + "// pad\n" * 800
+b = run_session(
+    {"main.bit": short_lines},
+    [
+        {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+        {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+            "textDocument":{"uri":"{URI:main.bit}","text":short_lines}}},
+        {"jsonrpc":"2.0","method":"textDocument/didChange","params":{
+            "textDocument":{"uri":"{URI:main.bit}"},
+            "contentChanges":[{"text":long_lines}]}},
+        {"jsonrpc":"2.0","method":"textDocument/didChange","params":{
+            "textDocument":{"uri":"{URI:main.bit}"},
+            "contentChanges":[{"text":short_lines}]}},
+    ])
+diag = [x for x in b if "publishDiagnostics" in x]
+check("lint: at least three publishDiagnostics (open + 2 edits)", len(diag) >= 3, joined(b))
+check("lint: no finding on the short file", '"diagnostics":[]' in diag[0], diag[0])
+check("lint: E0200 warning (severity 2) once past the limit",
+      '"code":"E0200"' in diag[1] and '"severity":2' in diag[1], diag[1])
+check("lint: finding clears once back under the limit",
+      '"diagnostics":[]' in diag[2], diag[2])
+
+# 11. a malformed lint directive is reported in place and never blocks a
+#     check feature (#1391 constraint): hover on the very file with the bad
+#     directive still answers, and the directive error is severity 1 (Error)
+#     while sitting beside zero check errors (`p.diags` is untouched).
+bad_directive = "// bit:lint max-file-lines 900 -- missing '='\nlet x = 5\n"
+b = run_session(
+    {"main.bit": bad_directive},
+    [
+        {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+        {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
+            "textDocument":{"uri":"{URI:main.bit}","text":bad_directive}}},
+        {"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{
+            "textDocument":{"uri":"{URI:main.bit}"},"position":{"line":1,"character":4}}},
+    ])
+diag = [x for x in b if "publishDiagnostics" in x]
+resp = [x for x in b if '"id":2' in x]
+check("lint: malformed directive reported", any('"code":"E0299"' in x for x in diag), joined(diag))
+check("lint: hover still answers beside the bad directive",
+      len(resp) == 1 and "let x: i64" in resp[0], joined(b))
+
 print()
 if fails:
     print(f"lsp-transcript: {fails} FAILED")

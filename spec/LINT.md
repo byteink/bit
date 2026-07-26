@@ -69,18 +69,18 @@ exist; the listing says which and where.
 |---|---|
 | 0 | no findings |
 | 1 | at least one finding |
-| 2 | usage error, unreadable path, or malformed override directive |
+| 2 | usage error, unreadable path, malformed override directive, or a file `bit check` would reject |
 
 Exit 2 covers an unknown flag, a path that does not exist or cannot be read,
-and any directive error from §5.2. A path the user named and lint could not
-read is a silent hole in the run, which is why it is a failure and not a
-warning.
+any directive error from §5.2, and a file that fails to parse (§10 open
+question 2). A path the user named and lint could not read is a silent hole in
+the run, which is why it is a failure and not a warning.
 
-A run with a directive error reports the directive errors **instead of**
-findings, not alongside them: the overrides decide what the findings are, so
-reporting findings computed under a broken override set would report a result
-nobody asked for. Every bad directive in the walk is reported before exiting,
-so one run fixes them all.
+A run with a directive error or a parse failure reports those errors
+**instead of** findings, not alongside them: either decides what the findings
+would be, so reporting findings computed past a broken override set or an
+unparseable file would report a result nobody asked for. Every such error in
+the walk is reported before exiting, so one run fixes them all.
 
 Lint findings are recorded at `severity=1` (warning) so they do not bump
 `errorCount` — `Diagnostics.warn` deliberately does not, and that semantic is
@@ -185,6 +185,7 @@ information, so they can land first.
 | E0203 | `max-nesting` | 4 | Deep nesting is nearly always a missing early return. |
 | E0204 | `max-complexity` | 10 | Independent paths through a function, the count a reader must hold at once. |
 | E0205 | `defer-in-loop` | — | Defers run at function exit, so one inside a loop holds every resource until the function returns. |
+| E0212 | `unreachable-code` | — | A statement after `return`/`fail`/`break`/`continue`/`panic` in the same block. |
 
 Counting rules, so the numbers are reproducible:
 
@@ -209,6 +210,16 @@ Counting rules, so the numbers are reproducible:
 long flat function is readable, a short tangled one is not, and neither metric
 catches the other's case.
 
+`unreachable-code` is E0212 despite landing here, not E020x: it was assigned
+its code inside the E021x dead-weight block for family coherence with its
+neighbours below, before the dependency analysis that moved it here was done.
+Diagnostic codes are never renumbered once assigned (§3), so the code stays
+E0212; only its table row moves. It needs no resolver — whether a statement
+follows one that diverges (`return`/`fail`/`break`/`continue`/`panic`) is
+answered from the AST alone, by reusing the same `diverges` analysis
+`bit check` already uses for E0055 missing-return and catch-block
+completeness (seed/check.zig:5539, ported at selfhost/validatestmt.bit:610).
+
 ### Phase 2 — dead weight and footguns (needs the resolver)
 
 These need scope and symbol information and land after phase 1.
@@ -217,14 +228,29 @@ These need scope and symbol information and land after phase 1.
 |---|---|---|
 | E0210 | `unused-import` | Left behind by refactors; misleads the next reader about a module's dependencies. |
 | E0211 | `unused-local` | Same, at function scope. |
-| E0212 | `unreachable-code` | Statements after `return`/`fail`/`break` in the same block. |
 | E0213 | `shadowed-local` | A `let` that hides a name from an enclosing scope. Later edits to either binding silently change which one is read. |
 | E0214 | `append-aliasing` | `append` on a slice parameter grows it in place and aliases the caller's backing array, so the caller sees writes it never made. |
+
+(E0212 `unreachable-code` is numbered in this block but requires no resolver;
+see phase 1 above, where it is actually implemented.)
 
 `shadowed-local` closes a real gap: the resolver warns on shadowing a
 *predeclared* name ([resolve.zig:386](../seed/resolve.zig#L386)) but says
 nothing when an inner `let` hides an outer local. Prelude names are already
 covered, so this rule must not double-report them.
+
+**Decided: a parameter (or receiver) shadowing an outer name is not reported,
+only a `let`/`const` is** (this includes a `for`/`catch`/`match` binder — they
+activate as the same kind as a block-local `let`). `function f(count: int)`
+beside a module-level `count` is the single highest-volume shape of shadowing
+in real code, and it is close to harmless: a parameter's whole lexical extent
+*is* the function body, so there is no earlier read in the same scope whose
+meaning silently changes the way a mid-block `let` does. Reporting it would
+make the rule noisy enough that a team would reach for `disable
+shadowed-local` wholesale rather than fix the rarer, genuinely confusing case
+this rule exists for — which defeats the rule. `let`/`const` stays in scope
+because that is the shape with no lexical-extent excuse: it appears partway
+through a block that already has the outer name in play.
 
 `append-aliasing` has no equivalent in other languages' linters — it encodes a
 Bit-specific aliasing rule the type system does not express, and one this
@@ -406,8 +432,19 @@ one format for both tools.
 
 A new golden mode, `// lint`, joins the existing set in
 [harness.zig:240](../tests/harness.zig#L240). A case runs `bit lint` over the
-file and compares stderr against the sibling `.expected`, matching how
-`// error` cases work.
+file and compares stderr against the sibling `.expected` — except that lint
+also asserts the process exit code, since 0 (clean), 1 (findings), and 2 (bad
+directive) are all reachable and a stderr diff alone cannot separate 1 from 2.
+
+The exit code is a mandatory `exit=<0|1|2>` suffix on the directive itself,
+`// lint exit=1`, rather than a second line in `.expected` or an inferred
+default: the directive line is where every other golden mode's contract lives,
+and a case that gets the exit code wrong should fail to parse rather than pass
+by accident. It costs nothing against §5.2's line-1/leading-comment-block
+split — the harness still reads only line 1 for both the mode and the exit
+code, and a `// bit:lint` override still lives anywhere in the leading comment
+block, so `// lint exit=0` / `// bit:lint max-file-lines=20 -- ...` on lines 1
+and 2 exercises both readers at once.
 
 Required coverage:
 
@@ -415,7 +452,9 @@ Required coverage:
 - one positive and one negative case per non-threshold rule — for
   `append-aliasing` the negative case must include an append to a local slice,
   and for `shadowed-local` an inner `let` of a prelude name, which
-  `shadows_predeclared` already reports and this rule must not duplicate
+  `shadows_predeclared` already reports and this rule must not duplicate, PLUS
+  a same-scope redeclaration, which `duplicate_declaration` (E0042) already
+  reports and this rule must not overlap
 - an override raising a limit
 - an override disabling a rule
 - a malformed directive, exit 2
@@ -450,12 +489,16 @@ lint is selfhost-only and the differential stays valid.
 
 1. **Phase 2 placement.** `unused-import` / `unused-local` as lint warnings, or
    as `bit check` errors in Go's style? Decide before 1.0 (§4).
-2. **A file that does not parse.** The phase-1 rules that need an AST (§4) have
-   to decide what lint does with a file `bit check` would reject. Linting a
-   recovered tree invents findings; skipping the file silently is the no-op
-   this spec forbids elsewhere. Exit 2 with "does not parse, run `bit check`"
-   is the likely answer. Undecided because the only rule shipped so far reads
-   lines, not syntax — decide with the first AST rule (#1383).
+2. **A file that does not parse (settled, #1383).** Decided: the parser's own
+   diagnostics are reported through the same sink and exit path as a malformed
+   override directive (§2.1, §5.2) — exit 2, findings withheld for that run.
+   Linting the parser's recovered tree would invent findings from nodes it
+   filled with the poison placeholder; a bespoke "does not parse, run
+   `bit check`" message would only repeat what the parser's own diagnostic
+   already says with an exact span. Reusing the directive-error path costs
+   nothing new: both are "the findings for this run were never computed,"
+   which is why the exit-2 summary line reads `N errors`, not
+   `N directive errors`, now that a directive error is not the only kind.
 3. **Default values.** 800 / 80 / 5 / 4 are judgement calls, chosen to be
    restrictive enough to bite. Worth revisiting once the whole repo is under
    the limit and the real distribution is visible.
