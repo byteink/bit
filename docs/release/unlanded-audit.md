@@ -112,6 +112,25 @@ Content-checked (added files absent from `main`) and therefore rescued:
 
 Already tagged before this audit: `rescue/task-1728`.
 
+## Leftover `git cherry` markers that are NOT gaps
+
+After the landings, `git cherry main <branch>` still prints `+` lines for a
+few branches. Each was content-checked; none is missing work:
+
+- `smash/task-1724`, `1737`, `1761` — landed under a different hash (an
+  adapted cherry-pick or a merge replay changes the patch id).
+- `smash/task-1755` — `292b4d2`'s `docs/release/SUPPORT.md` is byte-identical
+  to main's (`git diff` between them is empty); it landed via the later
+  fix-up commit in the same series.
+- `smash/task-1736`, `1738`, `1767` — the PM CLI, landed under #1816 by
+  replaying #1738's merge of the `bit remove` line; see that ticket.
+- `smash/task-359` — `9f3399a` ("ci(release): publish Formula/bit.rb to
+  byteink/homebrew-tap on release", 2026-07-24) is DELIBERATELY superseded,
+  not lost. The same task later shipped `dist/brew/publish.sh` (2026-07-26), a
+  local publisher that does the same job without spending a GitHub Actions
+  run. Landing the CI job would reintroduce billed CI for something a local
+  script already does. Left on the branch on purpose.
+
 ## The root cause, unfixed
 
 Nothing in this audit stops the next drop. As long as no task owns the merge,
