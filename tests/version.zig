@@ -130,6 +130,59 @@ test "bit version: the self-hosted compiler reports the same version as the seed
     try testing.expectEqualStrings(seed.stdout, self.stdout);
 }
 
+test "bit: no arguments is a usage error, not a self-test" {
+    // #1827: `bit` with no arguments ran the in-Bit self-check suite. That was
+    // correct while the binary was a bootstrap artifact and wrong once it shipped:
+    // a user who typed `bit` got lock-file test fixtures on stdout
+    // ("pmlock check: no stale fixture to remove") and a wait long enough to look
+    // like a hang. Asserting the exit code alone would not catch a regression here
+    // — selfcheck also exits 0 on success — so stdout must be empty and the
+    // fixture string must be absent.
+    //
+    // SELF-HOSTED ONLY, deliberately. The seed prints its version banner on
+    // no-args and exits 0; it is the bootstrap oracle, is not distributed to
+    // anyone, and is slated for retirement, so aligning its CLI ergonomics buys
+    // nothing and touches the one binary the whole bootstrap trusts.
+    if (build_options.selfhost_bit.len == 0) return; // cross build: no self-hosted bit
+
+    const gpa = testing.allocator;
+    var threaded = Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const timeout_s = proc.timeoutSeconds(gpa);
+
+    const self_bit = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
+    defer selfbin.release(gpa, io, self_bit);
+
+    const r = try run(gpa, io, timeout_s, self_bit, &.{});
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+
+    const code = exitCode(r.term) orelse {
+        std.debug.print("version: {s} with no args died by signal\n", .{self_bit});
+        return error.NoArgsDiedBySignal;
+    };
+    if (code != 2) {
+        std.debug.print("version: {s} with no args exited {d}, want 2\n", .{ self_bit, code });
+        return error.NoArgsNotAUsageError;
+    }
+    try testing.expectEqualStrings("", r.stdout);
+    try testing.expect(std.mem.indexOf(u8, r.stderr, "usage: bit") != null);
+    // The exact fixture line a user reported seeing. Named rather than implied, so
+    // this fails loudly if any self-check output ever reaches a bare invocation.
+    try testing.expect(std.mem.indexOf(u8, r.stdout, "pmlock check") == null);
+    try testing.expect(std.mem.indexOf(u8, r.stderr, "pmlock check") == null);
+}
+
+// The other half of #1827 — that `bit selfcheck` still RUNS the self-checks — is
+// deliberately NOT tested here. `zig build test-selfcheck` already invokes exactly
+// that subcommand and requires exit 0, so a second test would be duplicate
+// coverage; and it would be actively harmful, because `selfcheck` is not
+// re-entrant: selfhost/pmlockcheck.bit writes fixed paths under /tmp
+// (/tmp/bit-pmlock-check.lock), so two concurrent runs fight over the same files.
+// Adding one here made the full suite fail while passing standalone. Filed
+// separately; do not "restore" this test without fixing those paths first.
+
 test "bit version: a typo'd subcommand is a usage error, not the banner" {
     const gpa = testing.allocator;
     var threaded = Io.Threaded.init(gpa, .{});

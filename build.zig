@@ -1311,13 +1311,19 @@ pub fn build(b: *std.Build) void {
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
-    // self-hosted `bit` from the current selfhost/ sources and runs it. Its
-    // `main` runs the in-Bit self-checks (selfhost/selfcheck.bit) — a failed
+    // self-hosted `bit` from the current selfhost/ sources and runs
+    // `bit selfcheck` — the in-Bit self-checks (selfhost/selfcheck.bit). A failed
     // assert panics (exit 2) and fails the build, so a regression in a ported
     // module is caught on both arm64 and x86_64. `bit` targets the host, so it
     // always execs here. `has_side_effects` keeps it from being cache-skipped.
+    //
+    // The SUBCOMMAND IS REQUIRED (#1827). This used to run the binary bare,
+    // because no-args meant selfcheck; that shipped a compiler which ran its own
+    // test suite when a user typed `bit`, so no-args is now a usage error (exit 2)
+    // and this gate would fail without the explicit argument.
     const selfhost_selfcheck = std.Build.Step.Run.create(b, "run self-hosted bit self-checks");
     selfhost_selfcheck.addFileArg(selfhosted);
+    selfhost_selfcheck.addArg("selfcheck");
     selfhost_selfcheck.has_side_effects = true;
     selfhost_selfcheck.expectExitCode(0);
     test_step.dependOn(&selfhost_selfcheck.step);
