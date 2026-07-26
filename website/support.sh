@@ -1,6 +1,6 @@
 #!/bin/sh
 # Generates website/public/support.html — the Support/Security page for
-# bit-lang.byteink.com — from docs/release/SUPPORT.md plus the repo's published
+# bitlang.org — from docs/release/SUPPORT.md plus the repo's published
 # GitHub Security Advisories. Output is static HTML with no client-side JS, so
 # the page cannot leak a token and cannot break if GitHub is down.
 #

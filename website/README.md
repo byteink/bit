@@ -1,6 +1,6 @@
 # website/
 
-Static content for **bit-lang.byteink.com**, per the planned layout in the
+Static content for **bitlang.org**, per the planned layout in the
 repo root `CLAUDE.md` (`website/   static site → k3s byteink namespace`).
 
 ```
@@ -8,7 +8,8 @@ website/
   support.sh          generator for the Support/Security page
   deploy.sh           regenerate + push to the byteink k3s cluster
   deploy/
-    bit-lang.yaml     Deployment + Service + Traefik IngressRoute
+    bitlang-org.yaml  Deployment + Service + IngressRoute, plus the
+                      bitlang.io/.net → bitlang.org redirect
   public/             served as-is; no build step, no npm, no framework
     index.html        generated — a copy of support.html, so "/" is the page
     support.html      generated — do not hand-edit
@@ -113,8 +114,8 @@ matches the page, and every malformed `BIT_REPO` is rejected.
 ## Deployment
 
 `website/deploy.sh` regenerates the page, pushes `public/` as the
-`bit-lang-site` ConfigMap, applies `deploy/bit-lang.yaml` (nginx Deployment +
-Service + Traefik IngressRoute for `bit-lang.byteink.com`, `websecure`
+`bitlang-site` ConfigMap, applies `deploy/bitlang-org.yaml` (nginx Deployment +
+Service + Traefik IngressRoute for `bitlang.org`, `websecure`
 entrypoint, `letsencrypt` cert resolver, namespace `byteink`), and restarts the
 Deployment so the new bytes are actually served.
 
@@ -124,7 +125,7 @@ sh website/deploy.sh    # needs kubectl and the `byteink` context
 
 Two things are outside this repo and both are needed before the page is live:
 
-1. **A DNS record** for `bit-lang.byteink.com` pointing at the cluster. None
+1. **A DNS record** for `bitlang.org` pointing at the cluster. None
    exists as of 2026-07-26.
 2. **The decision to publish.** Nothing about Bit is public yet, so this has not
    been run.

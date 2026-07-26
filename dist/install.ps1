@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # Install the Bit compiler on Windows.
 #
-#   irm https://bit-lang.byteink.com/install.ps1 | iex
+#   irm https://bitlang.org/install.ps1 | iex
 #
 # Downloads the release zip named per dist/README.md's naming contract
 # (bit-<version>-windows-<arch>.zip), verifies it against the release's

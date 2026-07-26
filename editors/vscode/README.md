@@ -1,6 +1,6 @@
 # Bit Language for VS Code
 
-Editor support for [Bit](https://bit-lang.byteink.com), a systems language with
+Editor support for [Bit](https://bitlang.org), a systems language with
 TypeScript-flavored syntax and Go-like semantics.
 
 ## Features

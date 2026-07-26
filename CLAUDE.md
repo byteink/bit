@@ -15,7 +15,7 @@ Settled in planning — do not relitigate:
 - **Output**: single static native binary, like Go/Zig. No interpreter, no VM, no libc dependency.
 - **Zero external toolchain**: own lexer→parser→checker→SSA IR→codegen (x86-64 + ARM64)→object writers (ELF/Mach-O/PE)→own static linker. No LLVM, no system assembler/linker.
 - **Seed compiler in Zig**, then self-host in three staged ports (differential-tested, stage2 == stage3 byte-identical). Zig seed retires to `seed/` after bootstrap.
-- **Naming**: language "Bit", binary `bit`, extension `.bit`, LSP `bit lsp`, site bit-lang.byteink.com. Working name — renamable by find-replace, don't bikeshed it.
+- **Naming**: language "Bit", binary `bit`, extension `.bit`, LSP `bit lsp`, site **bitlang.org** (settled 2026-07-26 — `.org` is the convention for open-source languages, and byteink.io stays the company site; bitlang.io/.net redirect to it). The language name itself is still renamable by find-replace — don't bikeshed it.
 
 ## Workflow
 
