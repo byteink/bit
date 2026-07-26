@@ -10,9 +10,14 @@ website/
   deploy/
     bit-lang.yaml     Deployment + Service + Traefik IngressRoute
   public/             served as-is; no build step, no npm, no framework
+    index.html        generated — a copy of support.html, so "/" is the page
     support.html      generated — do not hand-edit
     support.css
 ```
+
+The site is one page, so `index.html` and `support.html` are the same bytes,
+written by the same run. nginx serves the mount with autoindex off, so without an
+index `/` — the URL people actually type — is a 403.
 
 `support.sh` reads `../docs/release/SUPPORT.md` by relative path, so it assumes
 this directory sits beside `docs/` in the same checkout. That one line is what
@@ -25,10 +30,12 @@ would need changing if the site is ever split into its own repo.
 - The **support matrix** — every row of the table under `## Support matrix` in
   `docs/release/SUPPORT.md` (version, released, full-support-end, EOL, status),
   copied verbatim. The section opens at that heading and closes at the next
-  heading of any level, so neither a subheading's table nor a later section's
-  table bleeds into the matrix. Column count comes from the header row: a row
-  that disagrees with it fails the build rather than losing a cell, and a matrix
-  with no release rows yet renders an empty state rather than failing.
+  heading of any level, and fenced code blocks are opaque — a `#` comment inside
+  a fence is not a heading, and a pipe table inside one is not the matrix — so
+  nothing bleeds in and no row is lost. Column count comes from the header row: a
+  row that disagrees with it fails the build rather than losing a cell, a cell may
+  contain an escaped `\|`, and a matrix with no release rows yet renders an empty
+  state rather than failing.
 - The **security advisory feed** — published advisories from
   `GET /repos/byteink/bit/security-advisories`, newest first.
 
@@ -98,8 +105,10 @@ makes it when it actually reached the right repo's advisories endpoint:
 `--self-check` covers the parsing and escaping paths against fixtures with no
 network: a draft advisory is dropped, a `<script>` in a summary is escaped, an
 alignment delimiter row is not mistaken for data, tables under a sibling h2 or a
-child h3 stay out of the matrix, a ragged row fails the build, a header-only
-matrix renders, and every malformed `BIT_REPO` is rejected.
+child h3 stay out of the matrix, a fenced block neither contributes rows nor
+truncates the matrix, an escaped `\|` survives, an unterminated fence fails the
+build, a ragged row fails the build, a header-only matrix renders, `index.html`
+matches the page, and every malformed `BIT_REPO` is rejected.
 
 ## Deployment
 

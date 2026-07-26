@@ -42,6 +42,9 @@ matrix_rows() {
 			return s
 		}
 		function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+		# A cell may legally contain an escaped pipe. Park it somewhere split()
+		# cannot see before splitting, and put it back per cell afterwards.
+		function unpipe(s) { gsub(SUBSEP, "|", s); return s }
 		# A GFM delimiter row is all dashes and optional alignment colons —
 		# |---|, |:-:|, and |-|-| are all legal and none of them are data.
 		function is_delim(nc, c,   i, t) {
@@ -51,10 +54,17 @@ matrix_rows() {
 			}
 			return 1
 		}
+		# Fenced blocks are opaque: a shell comment inside one is not a heading and
+		# a pipe table inside one is not the matrix. Tracked before anything else,
+		# because both mistakes are silent — one truncates the matrix at the fence,
+		# the other pulls the fence contents into it.
+		/^[ \t]*```/ { fence = !fence; next }
+		fence { next }
 		/^##[ \t]+Support matrix/ { insec = 1; next }
 		insec && /^#+[ \t]/ { insec = 0 }
 		insec && /^[ \t]*\|/ {
 			line = trim($0)
+			gsub(/\\\|/, SUBSEP, line)
 			sub(/^\|/, "", line); sub(/\|$/, "", line)
 			n = split(line, cell, /\|/)
 			if (is_delim(n, cell)) next
@@ -65,10 +75,13 @@ matrix_rows() {
 				exit 4
 			}
 			printf "        <tr>"
-			for (i = 1; i <= cols; i++) printf "<%s>%s</%s>", kind, esc(trim(cell[i])), kind
+			for (i = 1; i <= cols; i++)
+				printf "<%s>%s</%s>", kind, esc(unpipe(trim(cell[i]))), kind
 			printf "</tr>\n"
 		}
 		END {
+			# An unclosed fence would have swallowed the rest of the doc silently.
+			if (fence) { print "unterminated code fence" > "/dev/stderr"; exit 5 }
 			if (seen < 1) exit 3
 			# A header with no releases under it is the state SUPPORT.md declares
 			# correct until v1.0 ships ("the matrix below is empty by design"), so
@@ -203,7 +216,13 @@ self_check() {
 | version | released | full-support-end | EOL | status |
 |:-:|:-:|:-:|:-:|:-:|
 | 1.0 | 2026-10-01 | 2027-10-01 | 2031-10-01 | full support |
-| 0.9 <script> | 2026-01-01 | 2026-10-01 | 2026-10-01 | EOL |
+
+```sh
+# a comment inside a fence is not a heading, and must not end the section
+| FENCED | must | not | be | emitted |
+```
+
+| 0.9 \| beta <script> | 2026-01-01 | 2026-10-01 | 2026-10-01 | EOL |
 
 ### Deprecated lines
 
@@ -256,7 +275,11 @@ JSON
 	refute "raw img tag emitted" -- '<img src=x'
 	assert "matrix header row" -- '<th>full-support-end</th>'
 	assert "matrix row 1.0" -- '<td>1\.0</td>'
-	assert "matrix cell HTML-escaped" -- '<td>0\.9 &lt;script&gt;</td>'
+	assert "matrix cell HTML-escaped" -- '<td>0\.9 | beta &lt;script&gt;</td>'
+	# A fenced block inside the section must neither end it (dropping every row
+	# after the fence) nor contribute rows of its own.
+	assert "row after a fenced block survives" -- '<td>0\.9 | beta'
+	refute "fenced table bled in" -- '<td>FENCED</td>'
 	refute "table from a later h2 bled in" -- '<td>bleed</td>'
 	refute "table under an h3 subheading bled in" -- '<td>subsec</td>'
 	refute "cadence table bled in" -- '<td>matrix</td>'
@@ -266,6 +289,15 @@ JSON
 	if [ "$(grep -n 'GHSA-new' "$tmp/out.html" | cut -d: -f1 | head -1)" -gt \
 	     "$(grep -n 'GHSA-old' "$tmp/out.html" | cut -d: -f1 | head -1)" ]; then
 		echo "FAIL: advisory feed not newest-first" >&2; fail=1
+	fi
+
+	# The bare domain must resolve to the page, not to nginx's 403. Checked before
+	# the sub-runs below, which write their own index.html into the same $tmp.
+	if [ -f "$tmp/index.html" ]; then
+		cmp -s "$tmp/out.html" "$tmp/index.html" ||
+			{ echo "FAIL: index.html differs from the generated page" >&2; fail=1; }
+	else
+		echo "FAIL: no index.html written beside the page" >&2; fail=1
 	fi
 
 	# A header-only matrix renders an empty state instead of failing the build.
@@ -286,6 +318,13 @@ JSON
 	fi
 	[ ! -f "$tmp/ragged.html" ] ||
 		{ echo "FAIL: ragged matrix still wrote a page" >&2; fail=1; }
+
+	# An unclosed fence would silently swallow the rest of the doc.
+	sed '/^```sh$/d' "$tmp/SUPPORT.md" >"$tmp/openfence.md"
+	if BIT_SUPPORT_MD=$tmp/openfence.md BIT_SUPPORT_OUT=$tmp/openfence.html \
+		BIT_ADVISORIES_JSON=$tmp/adv.json "$0" >/dev/null 2>&1; then
+		echo "FAIL: unterminated fence accepted" >&2; fail=1
+	fi
 
 	# REPO crosses a trust boundary into an href and the API path.
 	for bad in 'byteink/bit" onmouseover="alert(1)' 'byteink/bit?x=1' \
@@ -315,6 +354,7 @@ case $rc in
 0) ;;
 3) die "no support matrix table found under '## Support matrix' in $src" ;;
 4) die "support matrix in $src has a row whose cell count differs from the header" ;;
+5) die "unterminated code fence in $src" ;;
 *) die "reading the support matrix from $src failed (awk exit $rc)" ;;
 esac
 
@@ -331,6 +371,16 @@ else
     list on GitHub</a> for the authoritative feed.</p>"
 fi
 
-mkdir -p "$(dirname -- "$out")"
+dir=$(dirname -- "$out")
+mkdir -p "$dir"
 render "$rows" "$advisories" "$note" "$(date -u '+%Y-%m-%d %H:%M UTC')" >"$out"
 echo "support.sh: wrote $out"
+
+# The site is one page, so the bare domain has to be that page. nginx serves the
+# ConfigMap mount with autoindex off, so with no index.html "/" is a 403 — and
+# "/" is the URL anyone actually types. Written from the same run as $out, so the
+# two copies cannot drift.
+if [ "$(basename -- "$out")" != index.html ]; then
+	cp -- "$out" "$dir/index.html"
+	echo "support.sh: wrote $dir/index.html"
+fi
