@@ -355,6 +355,41 @@ The Finished message's `verify_data` (RFC 8446 §4.4.4): `HMAC(finishedKey(baseK
 transcriptHash)`. The receiver recomputes it over its own transcript and compares
 in constant time to authenticate the whole handshake.
 
+The four functions below fill out the branches that hang off the Early Secret
+rung when a pre-shared key is in play (RFC 8446 §7.1) — session resumption and
+0-RTT (see [Session resumption and 0-RTT](#session-resumption-and-0-rtt)) never
+change the ladder itself; `handshakeSecret`/`masterSecret` above are already
+generic over `early`, only what feeds it and what is derived from it early
+differs.
+
+### `binderKey(newHash: () => Hash, early: []byte): []byte`
+
+`binder_key` (RFC 8446 §7.1): `Derive-Secret(early, "res binder", "")`. Keys the
+Finished-shaped MAC (`finishedMac`) that binds a ClientHello's `pre_shared_key`
+identity to the PSK it claims. Only the resumption-PSK label is implemented —
+this module has no external-PSK API.
+
+### `clientEarlyTrafficSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
+
+`client_early_traffic_secret` (RFC 8446 §7.1): `Derive-Secret(early, "c e traffic",
+clientHello1Hash)`. Protects the client's 0-RTT early application data and the
+`end_of_early_data` message that closes it out.
+
+### `earlyExporterMasterSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
+
+`early_exporter_master_secret` (RFC 8446 §7.1, §7.5): `Derive-Secret(early,
+"e exp master", clientHello1Hash)`. The exporter root for 0-RTT data, valid
+before the handshake completes and so without the full handshake's
+forward-secrecy guarantee.
+
+### `resumptionPsk(newHash: () => Hash, resumptionMasterSecret: []byte, ticketNonce: []byte): []byte`
+
+The PSK a `NewSessionTicket`'s `nonce` derives from a connection's
+resumption_master_secret (RFC 8446 §4.6.1): `HKDF-Expand-Label(
+resumptionMasterSecret, "resumption", ticketNonce, Hash.length)`. Each ticket a
+server issues carries its own nonce, so the same resumption_master_secret
+yields a distinct, unlinkable PSK per ticket.
+
 
 The wire encoding of the TLS 1.3 handshake (RFC 8446 §4): the `Handshake`
 framing and a typed encoder/decoder for every message a 1-RTT exchange carries.
@@ -1146,6 +1181,139 @@ import { TlsServerConn } from "std/tls"
 function respond(conn: TlsServerConn, incoming: []byte): []byte! {
   let request = conn.openApp(incoming)?
   return conn.sealApp(request.content)?
+}
+```
+
+## Session resumption and 0-RTT
+
+Session resumption (RFC 8446 §2.3, §4.6.1) lets a client skip certificate-based
+authentication on a later connection to the same server by presenting a PSK
+derived from an earlier handshake instead. A server that finishes a handshake
+may call `TlsServerConn.issueTicket` to hand the client an opaque ticket, sealed
+as a post-handshake record exactly like any other message `TlsClientConn.openApp`
+recovers as a `recordHandshake`-typed record. The client bundles the ticket with
+the connection's `resumptionSecret()` into a `SessionTicket` (via
+`newSessionTicket`) and, on a later connection, drives `tlsClientStartResume`
+instead of `tlsClientStart`. That builds a ClientHello carrying
+`psk_key_exchange_modes` (PSK with (EC)DHE, `psk_dhe_ke` — this module does not
+implement the no-DHE `psk_ke` mode) and `pre_shared_key` (the ticket as the
+offered identity, with a binder proving possession of the PSK the ticket
+derives). The server validates the binder and, on success, skips Certificate
+and CertificateVerify entirely — the PSK already authenticates the connection.
+
+**0-RTT early data is replayable.** An attacker who captures a ClientHello plus
+its early-data flight can replay it verbatim, and the server has no way to tell
+a replay from the original: RFC 8446 §8 gives servers only mitigations
+(single-use tickets, ClientHello recording within a short window), never a
+guarantee, and this module implements neither. An application **must** treat
+any request that might arrive as 0-RTT data as safe to execute more than once
+(idempotent) — a `GET`, never a fund transfer. `TlsServerHandshake.earlyDataReceived`
+exists to let a caller apply exactly that discipline; the module cannot enforce
+it for you.
+
+### `PskIdentity`
+
+One `pre_shared_key` identity entry: the opaque ticket bytes (`identity`) and
+the client's (obfuscated) estimate of how long ago it received the ticket
+(`obfuscatedTicketAge`). `tlsClientStartResume` always sends an
+`obfuscatedTicketAge` of 0 — this module does not track wall-clock ticket age,
+a valid if maximally conservative value on the wire.
+
+### `SessionTicket`
+
+What a client keeps, after a connection closes, to attempt resumption on a
+later one: the raw ticket and nonce a `NewSessionTicket` carried, the
+connection's resumption_master_secret, and enough of the original connection's
+parameters (`suiteId`, `alpn`) to rebuild a compatible offer. Build one with
+`newSessionTicket`; store it however the caller likes — in memory, keyed by
+server name, is enough for most uses. No persistence or session-cache
+abstraction is built in.
+
+### `newSessionTicket(nst: NewSessionTicket, conn: TlsClientConn): SessionTicket`
+
+A `SessionTicket` from a `NewSessionTicket` message and the connection it
+arrived on.
+
+### `TlsTicketStore`
+
+A server-lifetime store of issued tickets. Every handshake driven from the same
+`TlsServerConfig` shares one store (`newTlsServerConfig` gives each config its
+own), so a ticket issued on one connection can be redeemed on a later,
+independent one.
+
+### `newTicketStore(): TlsTicketStore`
+
+An empty ticket store. `newTlsServerConfig` already creates one per config; call
+this directly only when building a `TlsServerConfig` by hand.
+
+### `TlsServerConn.issueTicket(): []byte!`
+
+Issue a `NewSessionTicket` for this connection: mint fresh ticket and nonce
+bytes, record the session (resumption secret, suite, whether 0-RTT is allowed
+on it — `TlsServerConfig.allowEarlyData` at the time of the original handshake)
+in the connection's ticket store, and return the sealed post-handshake record
+to send. The caller decides when — and whether — to call this, same as
+`sealApp`; a server that never calls it simply never offers resumption.
+
+### `tlsClientStartResume(config: TlsClientConfig, session: SessionTicket, earlyData: []byte): TlsClientHandshake!`
+
+Start a client handshake attempting session resumption with `session`, the
+PSK-DHE mode, and — when `earlyData` is non-empty — 0-RTT early application
+data sent speculatively in the same flight as the ClientHello, before the
+server has replied at all. The server may still decline the PSK entirely
+(falling back to a fresh handshake — detect this via `pskWasAccepted()` once
+connected) or accept the PSK but decline early data (`earlyDataAccepted` stays
+false on the resulting `TlsClientHandshake`); in the latter case the caller
+must resend `earlyData` itself as ordinary application data once connected —
+this module does not buffer or auto-retry it.
+
+### `TlsClientHandshake.pskWasAccepted(): bool`
+
+Whether the server accepted the PSK this handshake offered — meaningful only
+after `processServerFlight` has processed the ServerHello. False for a
+handshake that never called `tlsClientStartResume`, and also false when the
+server declined the PSK and fell back to a fresh handshake (Certificate
+included).
+
+### `TlsServerHandshake.pskWasAccepted(): bool`
+
+The server-side mirror of `TlsClientHandshake.pskWasAccepted`. Meaningful once
+`processClientHello` has run.
+
+### `TlsServerHandshake.earlyDataWasAccepted(): bool`
+
+Whether this handshake accepted the client's 0-RTT early data. When true,
+`earlyDataReceived()` holds it.
+
+### `TlsServerHandshake.earlyDataReceived(): []byte`
+
+The 0-RTT early application data this handshake decrypted, concatenated in the
+order the client sent it. Empty unless `earlyDataWasAccepted()`. **Replayable —
+see this section's opening caveat** — treat it as safe to process more than
+once before acting on it.
+
+```bit
+import {
+  TlsServerConn, TlsClientConn, TlsClientConfig, TlsClientHandshake,
+  SessionTicket, tlsClientStartResume, newSessionTicket, parseNewSessionTicket,
+} from "std/tls"
+
+// After a full handshake, hand the client a ticket to resume with later.
+function issue(serverConn: TlsServerConn): []byte! {
+  return serverConn.issueTicket()?
+}
+
+// The client stores the ticket, then later resumes with it — optionally
+// attempting 0-RTT by passing early application data (must be idempotent).
+function storeAndResume(
+  clientConn: TlsClientConn,
+  ticketRecord: []byte,
+  config: TlsClientConfig,
+): TlsClientHandshake! {
+  let pt = clientConn.openApp(ticketRecord)?
+  let nst = parseNewSessionTicket(pt.content)?
+  let session = newSessionTicket(nst, clientConn)
+  return tlsClientStartResume(config, session, []byte(0))?
 }
 ```
 

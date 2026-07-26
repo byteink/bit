@@ -29,6 +29,9 @@ BIT2=zig-out/bin/bit
 GAPS=tests/selfhost-iropt-gaps.txt
 TIMEOUT=${DIFFIROPT_TIMEOUT:-20}
 
+# shellcheck source=scripts/selfhost-ir-canon.sh
+. "$(dirname "$0")/selfhost-ir-canon.sh"
+
 for bin in "$SEED" "$BIT2"; do
   [ -x "$bin" ] || { echo "diffiropt: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
 done
@@ -54,7 +57,11 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
     continue
   fi
 
-  if [ "$seed" = "$b2" ]; then
+  # $t<id> suffixes are interning-order artifacts, not structural — canonicalize
+  # before comparing (see selfhost-ir-canon.sh). Raw compare first: the
+  # overwhelming majority of files already match byte-for-byte, so skip the
+  # two awk forks unless the raw strings actually differ.
+  if [ "$seed" = "$b2" ] || [ "$(canon_ir_ids "$seed")" = "$(canon_ir_ids "$b2")" ]; then
     match=$((match + 1))
   else
     echo "$f" >>"$work/mismatch"
@@ -93,9 +100,9 @@ if [ -s "$work/entered" ]; then
   # Bounded evidence for the first few, so the failure is actionable in one read.
   head -3 "$work/entered" | while read -r f; do
     echo
-    echo "--- diff (seed vs bit): $f"
-    diff <("$SEED" --dump-ir "$f" 2>/dev/null) \
-         <(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir "$f" 2>/dev/null) | head -20
+    echo "--- diff (seed vs bit, \$t<id> canonicalized): $f"
+    diff <(canon_ir_ids "$("$SEED" --dump-ir "$f" 2>/dev/null)") \
+         <(canon_ir_ids "$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir "$f" 2>/dev/null)") | head -20
   done
   status=1
 fi

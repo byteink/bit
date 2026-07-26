@@ -226,7 +226,19 @@ pub const TaskState = enum(u8) { runnable, running, parked, done };
 pub const ParkFn = *const fn (t: *Task, arg: ?*anyopaque) void;
 
 /// v1 fixed stack size. See the module doc comment's ponytail note.
-const stack_size: usize = 64 * 1024;
+///
+/// 64 KiB (#1761): `bit fmt --check` segfaulted on x86_64, but not aarch64,
+/// for ordinary source files (selfhost/lexer.bit and friends) — every Bit
+/// program's `main` runs as the scheduler's first task (`root.zig`'s `boot`),
+/// so the self-hosted compiler's own recursive-descent formatter walked each
+/// file's AST on this fixed, guard-paged stack. Confirmed via gdb on real
+/// x86_64 hardware (hl-master): the fault address (`si_addr`) landed exactly
+/// inside the mapped guard page, at the `call` instruction's return-address
+/// push — a stack overflow, not a codegen miscompile. x86-64 frames for the
+/// same recursion run bigger than AArch64's, so 64 KiB was enough headroom on
+/// arm64 but not x64. 128 KiB was the empirically confirmed minimum for the
+/// full corpus on x86_64; 256 KiB keeps a 2x margin over that measured floor.
+const stack_size: usize = 256 * 1024;
 
 /// Stack size for the program's `main` task only (boot()'s `mainTrampoline`
 /// spawn, not user `spawn`). `main` runs the program's real workload directly

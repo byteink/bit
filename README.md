@@ -40,6 +40,10 @@ zig build test     # run unit tests
 | `dist/`     | Packaging (brew formula, installers)                |
 | `tests/`    | Golden-file and stress tests                        |
 
+See [`docs/release/VERSIONING.md`](docs/release/VERSIONING.md) for what
+counts as a breaking, additive, or fix change across the language, CLI,
+stdlib, and runtime ABI.
+
 ## Benchmarks
 
 Bit compiles to a single static native binary with a garbage-collected runtime.

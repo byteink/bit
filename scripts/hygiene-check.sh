@@ -91,23 +91,40 @@ if [ -n "${br}" ] && [ -n "${wt_live}" ]; then
 fi
 if [ -n "${br}" ]; then
   merged=""
+  empty=""
   unmerged=""
   for b in ${br}; do
     if git merge-base --is-ancestor "${b}" main 2>/dev/null; then
-      merged="${merged} ${b}"
+      # is-ancestor is trivially true for a branch that never diverged from
+      # main (0 commits ahead) — that is NOT proof of "integrated and safe to
+      # delete", it is equally consistent with a freshly created, still-live
+      # worktree that just has not committed yet (see #1688). Only a branch
+      # with real commits that are now reachable from main is provably done.
+      ahead=$(git rev-list --count "main..${b}" 2>/dev/null || echo 0)
+      if [ "${ahead}" = "0" ]; then
+        empty="${empty} ${b}"
+      else
+        merged="${merged} ${b}"
+      fi
     else
       unmerged="${unmerged} ${b}"
     fi
   done
   [ -n "${merged}" ] && findings="${findings}
-BRANCHES ALREADY IN main (delete them):${merged}
+BRANCHES ALREADY IN main, with commits that landed (delete them):${merged}
     git branch -D${merged}"
   [ -n "${unmerged}" ] && findings="${findings}
 BRANCHES NOT IN main (cherry-pick or delete — do not just leave them):${unmerged}"
+  [ -n "${empty}" ] && findings="${findings}
+BRANCHES WITH ZERO COMMITS AHEAD OF main — do NOT delete on this signal alone:${empty}
+  0 commits ahead is indistinguishable from a live worktree that has not
+  committed yet. Confirm no worktree/agent references it before removing:
+    git worktree list | grep -F '<branch>'"
 fi
 
 if [ -n "${findings}" ]; then
   printf 'HYGIENE — resolve before ending the turn:%s\n' "${findings}" >&2
+  printf 'NOTE: the commands above are suggestions for a human/agent to review, never auto-execute them against a worktree you did not create.\n' >&2
   exit 2
 fi
 exit 0

@@ -850,6 +850,9 @@ function lowerLen(fc: FnCtx, node: int, isCap: bool): int {
 // Lowers `append(s, e1, e2, ...)`: folds each element through `slice_append`,
 // threading the returned (possibly regrown) header so a `s = append(s, ...)`
 // observes the new length. Each element lowers with the slice's element hint.
+// `is_ref` travels on every call (ABI.md §2, #1569): a null header (a zeroed
+// struct's slice field, #1564) has no element type to read, so the call site
+// — the only place that still knows the static element type — supplies it.
 function lowerAppend(fc: FnCtx, node: int): int {
   let args = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])
   let a0 = args[0]
@@ -858,6 +861,12 @@ function lowerAppend(fc: FnCtx, node: int): int {
   }
   let sliceTy = defaultType(fc.c, nodeType(fc, a0))
   let elemTy = fc.c.ctx.types[sliceTy].elem
+  let i64ty = primType(fc.c.ctx, 3)
+  let refI = mkInstr(Op.ConstInt, i64ty)
+  if (fieldLayoutFor(fc, elemTy).isPtr) {
+    refI.ival = 1
+  }
+  let refV = builderEmit(fc.b, refI)
   let acc = lowerExpr(fc, a0)
   if (fc.failed) {
     return 0
@@ -874,7 +883,7 @@ function lowerAppend(fc: FnCtx, node: int): int {
     }
     let ins = mkInstr(Op.RtCall, sliceTy)
     ins.name = "slice_append"
-    ins.args = [acc, v]
+    ins.args = [acc, v, refV]
     acc = emitRtCall(fc, ins)
     i = i + 1
   }
@@ -1705,65 +1714,6 @@ function variantPayloadTypes(c: Checker, enumTy: int, variantName: string): []in
     i = i + 1
   }
   return out
-}
-
-// The index of a type-parameter name in a generic enum's `<...>` list, or -1.
-function enumTypeParamIndex(c: Checker, enumTy: int, tpname: string): int {
-  let oc = typeOwner(c, enumTy)
-  let decl = enumDeclOf(c, enumTy)
-  if (decl == 0) {
-    return -1
-  }
-  let tps = kidsOf(oc.tree, kidsOf(oc.tree, decl)[1])
-  let i = 0
-  while (i < len(tps)) {
-    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[i])[0])
-    if (oc.source[tpn.span.start:tpn.span.end] == tpname) {
-      return i
-    }
-    i = i + 1
-  }
-  return -1
-}
-
-// A variant payload binder's type: the type table's answer, and only where that
-// is still an unresolved type param, the AST recovery (#1560).
-//
-// The order is the whole point of #1560. `variantPayloadTypes` reads an
-// instantiation's ALREADY-SUBSTITUTED payloads off `ctx.variantPayloads`, which
-// is a type-level fact and cannot be defeated by the scrutinee's syntax — that
-// is what closes the shapes #1566 lists (a swapped type param, an array-literal
-// element, a field-read argument, a same-name collision) without adding an arm
-// per shape.
-//
-// `scrutineeTypeArgs` remains as the fallback, not as the authority. It is still
-// reachable for a subject with no instantiation to read: an IMPORTED generic
-// enum keeps its base template (`instantiateNamed` says so explicitly), and the
-// prelude's `Option`/`Result` are imported into every module — deleting this
-// fallback outright refuses `examples/optionresult` and diverges
-// `run_generic_enum`. Retiring it needs cross-module nominal instantiation,
-// which is a separate change.
-//
-// THE SAFETY RULE: when the table is undecided, the previous behaviour runs.
-function resolvedPayloadType(c: Checker, enumTy: int, ty: int, typeArgs: []int): int {
-  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.TypeParam) {
-    return ty
-  }
-  return substPayloadType(c, enumTy, ty, typeArgs)
-}
-
-// Substitutes a variant-payload type-param with the scrutinee's concrete type
-// argument: a bare `T` in `Opt<i64>` resolves to i64 via the enum's type-param
-// index. Non-type-param payloads pass through.
-function substPayloadType(c: Checker, enumTy: int, ty: int, typeArgs: []int): int {
-  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.TypeParam) {
-    return ty
-  }
-  let idx = enumTypeParamIndex(c, enumTy, c.ctx.types[ty].name)
-  if (idx >= 0 && idx < len(typeArgs)) {
-    return typeArgs[idx]
-  }
-  return ty
 }
 
 // Builds a boxed enum object `{ tag: i64 @0, payloadPtr @8 }` (16 bytes, the
@@ -3915,7 +3865,12 @@ function tagType(fc: FnCtx, subjectTy: int, boxed: bool): int {
 
 // Binds a boxed variant arm's payload `V(a, b) =>`: word i of the box (object
 // word 8) into binder i. No-op for a C-like enum or a no-binder arm.
-function bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: int, scrutinee: int) {
+//
+// An instantiation's payload types come off the type table already
+// substituted — local, imported, or a bare inferred variant construction all
+// instantiate through `instantiateNamed` now (#1573), so `ptypes[i]` is
+// concrete here whenever `enumTy` resolved to a real instantiation.
+function bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: int) {
   if (!boxed) {
     return
   }
@@ -3924,16 +3879,7 @@ function bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: 
     return
   }
   let vn = getNode(fc.c.tree, vp[0])
-  // An instantiation's payload types come off the type table already
-  // substituted (#1560); `typeArgs`/`typeArgNodes` are the fallback for a
-  // subject with no instantiation, chiefly an imported generic enum. See
-  // `resolvedPayloadType`.
   let ptypes = variantPayloadTypes(fc.c, enumTy, fc.c.source[vn.span.start:vn.span.end])
-  let typeArgs = scrutineeTypeArgs(fc.c, scrutinee)
-  // The scrutinee's type-arg NODES, so a payload binder whose type is itself a
-  // generic instance (`inner: Opt<i64>` from `Opt<Opt<i64>>.Some(inner)`) records
-  // its declared type node — letting a nested match on it recover its type-args.
-  let typeArgNodes = scrutineeTypeArgNodes(fc.c, scrutinee)
   let binders = kidsOf(fc.c.tree, vp[1])
   let box = mkInstr(Op.FieldGet, primType(fc.c.ctx, 3))
   box.lhs = subject
@@ -3943,10 +3889,10 @@ function bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: 
   while (i < len(binders)) {
     let bty = primType(fc.c.ctx, 3)
     if (i < len(ptypes)) {
-      bty = resolvedPayloadType(fc.c, enumTy, ptypes[i], typeArgs)
+      bty = ptypes[i]
     }
-    // Still a bare param means neither the table nor the recovery decided —
-    // typically a generic function body, whose node types lowering re-derives
+    // Still a bare param means the table had no instantiation to read —
+    // typically a generic FUNCTION body, whose node types lowering re-derives
     // per instantiation. The checker's binder type is the stronger answer there
     // (#1558). Guarded on TypeParam so it never overrides a concrete answer.
     if (fc.c.ctx.types[bty].kind == TypeKind.TypeParam) {
@@ -3964,19 +3910,13 @@ function bindArmPayload(fc: FnCtx, arm: int, boxed: bool, enumTy: int, subject: 
     // Keep the checker consistent so `checkExprType` types the binder during
     // lowering (see lowerFunc).
     rebindCheckerName(fc, binders[i], bty)
-    if (i < len(ptypes) && fc.c.ctx.types[ptypes[i]].kind == TypeKind.TypeParam) {
-      let idx = enumTypeParamIndex(fc.c, enumTy, fc.c.ctx.types[ptypes[i]].name)
-      if (idx >= 0 && idx < len(typeArgNodes)) {
-        fc.c.declTypeNodes[bname] = typeArgNodes[idx]
-      }
-    }
     i = i + 1
   }
 }
 
-function lowerMatchArm(fc: FnCtx, arm: int, preLen: int, join: int, boxed: bool, enumTy: int, subject: int, scrutinee: int): bool {
+function lowerMatchArm(fc: FnCtx, arm: int, preLen: int, join: int, boxed: bool, enumTy: int, subject: int): bool {
   let ak = kidsOf(fc.c.tree, arm)
-  bindArmPayload(fc, arm, boxed, enumTy, subject, scrutinee)
+  bindArmPayload(fc, arm, boxed, enumTy, subject)
   lowerArmBody(fc, ak[1])
   if (fc.failed) {
     return false
@@ -4038,7 +3978,7 @@ function lowerMatch(fc: FnCtx, node: int) {
     builderEndBlock(fc.b)
     builderBeginBlock(fc.b, bodyBlk)
     fc.terminated = false
-    if (lowerMatchArm(fc, arm, preLen, join, boxed, subjectTy, subject, k[0])) {
+    if (lowerMatchArm(fc, arm, preLen, join, boxed, subjectTy, subject)) {
       joinReachable = true
     }
     builderEndBlock(fc.b)
@@ -4050,7 +3990,7 @@ function lowerMatch(fc: FnCtx, node: int) {
   // Last arm: the exhaustive fallthrough, lowered in the current block with no
   // test.
   fc.terminated = false
-  if (lowerMatchArm(fc, arms[len(arms) - 1], preLen, join, boxed, subjectTy, subject, k[0])) {
+  if (lowerMatchArm(fc, arms[len(arms) - 1], preLen, join, boxed, subjectTy, subject)) {
     joinReachable = true
   }
   builderEndBlock(fc.b)
@@ -4069,9 +4009,9 @@ function lowerMatch(fc: FnCtx, node: int) {
 // Lowers one match-expression arm: its body is an *expression* whose value is
 // carried to the join as the trailing block param. Returns whether the join is
 // reached.
-function lowerMatchExprArm(fc: FnCtx, arm: int, preLen: int, join: int, resultTy: int, isVoid: bool, boxed: bool, enumTy: int, subject: int, scrutinee: int): bool {
+function lowerMatchExprArm(fc: FnCtx, arm: int, preLen: int, join: int, resultTy: int, isVoid: bool, boxed: bool, enumTy: int, subject: int): bool {
   let ak = kidsOf(fc.c.tree, arm)
-  bindArmPayload(fc, arm, boxed, enumTy, subject, scrutinee)
+  bindArmPayload(fc, arm, boxed, enumTy, subject)
   let val = 0
   if (isVoid) {
     lowerExpr(fc, ak[1])
@@ -4101,7 +4041,6 @@ function matchExprResultTy(fc: FnCtx, node: int, enumTy: int): int {
   }
   let ak = kidsOf(fc.c.tree, arms[0])
   let vp = kidsOf(fc.c.tree, ak[0])
-  let typeArgs = scrutineeTypeArgs(fc.c, k[0])
   if (vp[1] != 0) {
     let vn = getNode(fc.c.tree, vp[0])
     let ptypes = variantPayloadTypes(fc.c, enumTy, fc.c.source[vn.span.start:vn.span.end])
@@ -4110,7 +4049,7 @@ function matchExprResultTy(fc: FnCtx, node: int, enumTy: int): int {
     while (i < len(binders)) {
       let bt = primType(fc.c.ctx, 3)
       if (i < len(ptypes)) {
-        bt = resolvedPayloadType(fc.c, enumTy, ptypes[i], typeArgs)
+        bt = ptypes[i]
       }
       rebindCheckerName(fc, binders[i], bt)
       i = i + 1
@@ -4174,7 +4113,7 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
     builderEndBlock(fc.b)
     builderBeginBlock(fc.b, bodyBlk)
     fc.terminated = false
-    if (lowerMatchExprArm(fc, arm, preLen, join, resultTy, isVoid, boxed, subjectTy, subject, k[0])) {
+    if (lowerMatchExprArm(fc, arm, preLen, join, resultTy, isVoid, boxed, subjectTy, subject)) {
       joinReachable = true
     }
     builderEndBlock(fc.b)
@@ -4184,7 +4123,7 @@ function lowerMatchExpr(fc: FnCtx, node: int): int {
     i = i + 1
   }
   fc.terminated = false
-  if (lowerMatchExprArm(fc, arms[len(arms) - 1], preLen, join, resultTy, isVoid, boxed, subjectTy, subject, k[0])) {
+  if (lowerMatchExprArm(fc, arms[len(arms) - 1], preLen, join, resultTy, isVoid, boxed, subjectTy, subject)) {
     joinReachable = true
   }
   builderEndBlock(fc.b)
@@ -4250,9 +4189,6 @@ function arithOpFor(fc: FnCtx, base: int, ty: int): Op {
   return binOpFor(base, isFloat, signed)
 }
 
-// Lowers an assignment to a simple local `x`: `x = e` SSA-reassigns the local's
-// value; `x op= e` reads it, applies the base op, and reassigns. ponytail:
-// single simple-ident target only; field/index lvalues land next.
 // Lowers `s.f = v` to `field_set %s[offset] = %v` at the field's byte offset.
 // ponytail: inline-array fields (copy semantics) deferred.
 function lowerFieldStore(fc: FnCtx, lhs: int, rhs: int) {
@@ -4346,6 +4282,182 @@ function lowerIndexStore(fc: FnCtx, lhs: int, rhs: int) {
   builderEmit(fc.b, ins)
 }
 
+// The lvalue shapes a read-modify-write target (`++`/`--`/compound-assign) can
+// take (SPEC §13.1's `lhs = IDENT | index | member`). Mirrors the seed's
+// resolveLvalue/readLvalue/writeLvalue triple (seed/lower.zig ~1682-1837) so
+// `x++`, `p.n++`, `xs[0] += 1` and `m[k]++` all route through one place
+// instead of three independent hand-rolled arms.
+enum LvKind {
+  Local,
+  Global,
+  Field,
+  Elem,
+  MapElem,
+}
+
+struct Lvalue {
+  kind: LvKind,
+  envIdx: int,   // Local: env slot index.
+  recv: int,     // Global: cell address. Field: struct receiver. Elem/MapElem: collection.
+  ty: int,       // Global/Field/Elem: cell/field/element type. MapElem: value type.
+  offset: int,   // Global/Field: byte offset (0 for Global).
+  index: int,    // Elem: index SSA value. MapElem: key SSA value.
+  isSlice: bool, // Elem only: true for a slice element, false for a fixed array.
+}
+
+// A stub Lvalue for a failed resolution; its fields are never read because
+// every caller checks fc.failed immediately after resolveLvalue.
+function invalidLvalue(): Lvalue {
+  return Lvalue{ kind: LvKind.Local, envIdx: -1, recv: 0, ty: 0, offset: 0, index: 0, isSlice: false }
+}
+
+// Classifies a read-modify-write target into its lvalue shape, evaluating the
+// base receiver and any index/key expression exactly once so the caller's
+// read and write share the same SSA values — `m[f()]++` must call `f` once,
+// not twice.
+function resolveLvalue(fc: FnCtx, node: int): Lvalue {
+  let n = getNode(fc.c.tree, node)
+  if (n.tag == Tag.Ident) {
+    let name = fc.c.source[n.span.start:n.span.end]
+    let idx = envIndex(fc, name)
+    if (idx != -1) {
+      return Lvalue{ kind: LvKind.Local, envIdx: idx, recv: 0, ty: 0, offset: 0, index: 0, isSlice: false }
+    }
+    // Not a local: a module-level `let` (§11.11). Its cell is written through
+    // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
+    let sym = moduleGlobalSym(fc, name)
+    if (sym == "") {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let addr = emitGlobalAddrVal(fc, sym)
+    return Lvalue{ kind: LvKind.Global, envIdx: -1, recv: addr, ty: nodeType(fc, node), offset: 0, index: 0, isSlice: false }
+  }
+  if (n.tag == Tag.Member) {
+    let mk = kidsOf(fc.c.tree, node)
+    let recvTy = nodeType(fc, mk[0])
+    if (recvTy == 0 || fc.c.ctx.types[recvTy].kind != TypeKind.Struct) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let decl = structDeclOf(fc.c, recvTy)
+    if (decl == 0) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let oc = typeOwner(fc.c, recvTy)
+    let fields = structFieldNodes(oc, decl)
+    let mn = getNode(fc.c.tree, mk[1])
+    let fidx = fieldIndexByName(oc, fields, fc.c.source[mn.span.start:mn.span.end])
+    if (fidx == -1) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    let fty = typeFromNode(oc, kidsOf(oc.tree, fields[fidx])[1])
+    // Inline-array fields are copy semantics, not a scalar lvalue — matches
+    // lowerFieldStore's deferral.
+    if (fc.c.ctx.types[fty].kind == TypeKind.Array) {
+      fc.failed = true
+      return invalidLvalue()
+    }
+    // Substituted so a generic field's declared `T` is laid out at the
+    // instantiation's real argument width; must stay in step with the
+    // matching field_get/field_set in lowerFieldAccess/lowerFieldStore (#1565).
+    let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, recvTy))
+    let recv = lowerExpr(fc, mk[0])
+    if (fc.failed) {
+      return invalidLvalue()
+    }
+    return Lvalue{ kind: LvKind.Field, envIdx: -1, recv: recv, ty: fieldAccessType(fc, oc, fields[fidx], node), offset: layout.offsets[fidx], index: 0, isSlice: false }
+  }
+  if (n.tag == Tag.Index) {
+    let k = kidsOf(fc.c.tree, node)
+    let recvTy = defaultType(fc.c, nodeType(fc, k[0]))
+    let rd = fc.c.ctx.types[recvTy]
+    if (rd.kind == TypeKind.Map) {
+      let recv = lowerExpr(fc, k[0])
+      let key = lowerExpr(fc, k[1])
+      if (fc.failed) {
+        return invalidLvalue()
+      }
+      return Lvalue{ kind: LvKind.MapElem, envIdx: -1, recv: recv, ty: rd.mapVal, offset: 0, index: key, isSlice: false }
+    }
+    let isSlice = rd.kind == TypeKind.Slice
+    let recv = lowerExpr(fc, k[0])
+    let idx = lowerExpr(fc, k[1])
+    if (fc.failed) {
+      return invalidLvalue()
+    }
+    let elemTy = defaultType(fc.c, nodeType(fc, node))
+    return Lvalue{ kind: LvKind.Elem, envIdx: -1, recv: recv, ty: elemTy, offset: 0, index: idx, isSlice: isSlice }
+  }
+  fc.failed = true
+  return invalidLvalue()
+}
+
+// Emits the load for a resolved lvalue.
+function readLvalue(fc: FnCtx, lv: Lvalue): int {
+  if (lv.kind == LvKind.Local) {
+    return fc.env[lv.envIdx].value
+  }
+  if (lv.kind == LvKind.Global || lv.kind == LvKind.Field) {
+    let ins = mkInstr(Op.FieldGet, lv.ty)
+    ins.lhs = lv.recv
+    ins.ival = lv.offset
+    return builderEmit(fc.b, ins)
+  }
+  if (lv.kind == LvKind.Elem) {
+    if (lv.isSlice) {
+      let ins = mkInstr(Op.RtCall, lv.ty)
+      ins.name = "slice_get"
+      ins.args = [lv.recv, lv.index]
+      return emitRtCall(fc, ins)
+    }
+    let ins = mkInstr(Op.IndexGet, lv.ty)
+    ins.lhs = lv.recv
+    ins.rhs = lv.index
+    return builderEmit(fc.b, ins)
+  }
+  // MapElem
+  return emitMapGet(fc, lv.ty, lv.recv, lv.index)
+}
+
+// Emits the store for a resolved lvalue.
+function writeLvalue(fc: FnCtx, lv: Lvalue, val: int) {
+  if (lv.kind == LvKind.Local) {
+    fc.env[lv.envIdx].value = val
+    return
+  }
+  if (lv.kind == LvKind.Global || lv.kind == LvKind.Field) {
+    let ins = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    ins.lhs = lv.recv
+    ins.ival = lv.offset
+    ins.rhs = val
+    builderEmit(fc.b, ins)
+    return
+  }
+  if (lv.kind == LvKind.Elem) {
+    if (lv.isSlice) {
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = "slice_set"
+      ins.args = [lv.recv, lv.index, val]
+      emitRtCall(fc, ins)
+      return
+    }
+    let ins = mkInstr(Op.IndexSet, fc.c.ctx.voidId)
+    ins.lhs = lv.recv
+    ins.rhs = lv.index
+    ins.ival = val
+    builderEmit(fc.b, ins)
+    return
+  }
+  // MapElem
+  let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  ins.name = "map_set"
+  ins.args = [lv.recv, lv.index, val]
+  emitRtCall(fc, ins)
+}
+
 function lowerAssign(fc: FnCtx, node: int) {
   let opKind = getNode(fc.c.tree, node).main
   let k = kidsOf(fc.c.tree, node)
@@ -4420,6 +4532,36 @@ function lowerAssign(fc: FnCtx, node: int) {
     lowerPtrStore(fc, lhsItems[0], rhsItems[0])
     return
   }
+  // Compound-assign (`+= -= *= /= %= &= |= ^= <<= >>=`, SPEC §13.1): resolve
+  // the target once, read-modify-write it. Covers every lvalue shape — local,
+  // module global, struct field, slice/array index, map entry.
+  if (opKind != int(Kind.Eq)) {
+    let base = compoundBase(opKind)
+    if (base == -1) {
+      fc.failed = true
+      return
+    }
+    let lv = resolveLvalue(fc, lhsItems[0])
+    if (fc.failed) {
+      return
+    }
+    let cur = readLvalue(fc, lv)
+    let ty = nodeType(fc, lhsItems[0])
+    let rhs = lowerExprH(fc, rhsItems[0], ty)
+    if (fc.failed) {
+      return
+    }
+    let op = arithOpFor(fc, base, ty)
+    if (op == Op.BlockParam) {
+      fc.failed = true
+      return
+    }
+    let ins = mkInstr(op, ty)
+    ins.lhs = cur
+    ins.rhs = rhs
+    writeLvalue(fc, lv, builderEmit(fc.b, ins))
+    return
+  }
   if (ln.tag != Tag.Ident) {
     fc.failed = true
     return
@@ -4430,114 +4572,58 @@ function lowerAssign(fc: FnCtx, node: int) {
     // Not a local: a module-level `let` (§11.11). Its cell is written through
     // the ordinary FieldSet at offset 0, the same lvalue shape `*p = x` uses.
     let wsym = moduleGlobalSym(fc, lname)
-    if (wsym != "" && opKind == int(Kind.Eq)) {
-      // The lvalue's address is materialized BEFORE the right-hand side, which
-      // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
-      // two compilers' IR byte-identical.
-      let waddr = emitGlobalAddrVal(fc, wsym)
-      let wty = nodeType(fc, lhsItems[0])
-      let wv = lowerExprH(fc, rhsItems[0], wty)
-      if (fc.failed) {
-        return
-      }
-      let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-      st.lhs = waddr
-      st.ival = 0
-      st.rhs = wv
-      builderEmit(fc.b, st)
+    if (wsym == "") {
+      fc.failed = true
       return
     }
-    fc.failed = true
-    return
-  }
-  let ty = fc.env[idx].ty
-  if (opKind == int(Kind.Eq)) {
-    let rhsTy = defaultType(fc.c, nodeType(fc, rhsItems[0]))
-    let v = lowerExprH(fc, rhsItems[0], ty)
+    // The lvalue's address is materialized BEFORE the right-hand side, which
+    // is the seed's resolveLvalue-then-lowerExpr order; matching it keeps the
+    // two compilers' IR byte-identical.
+    let waddr = emitGlobalAddrVal(fc, wsym)
+    let wty = nodeType(fc, lhsItems[0])
+    let wv = lowerExprH(fc, rhsItems[0], wty)
     if (fc.failed) {
       return
     }
-    // A concrete value assigned into an interface-typed local is relabelled.
-    fc.env[idx].value = coerceToIface(fc, v, rhsTy, ty)
-    return
-  }
-  let base = compoundBase(opKind)
-  if (base == -1) {
-    fc.failed = true
-    return
-  }
-  let cur = fc.env[idx].value
-  let rhs = lowerExprH(fc, rhsItems[0], ty)
-  if (fc.failed) {
-    return
-  }
-  let op = arithOpFor(fc, base, ty)
-  if (op == Op.BlockParam) {
-    fc.failed = true
-    return
-  }
-  let ins = mkInstr(op, ty)
-  ins.lhs = cur
-  ins.rhs = rhs
-  fc.env[idx].value = builderEmit(fc.b, ins)
-}
-
-// Lowers `x++` / `x--` on a local: `base` is Plus/Minus. Emits `const_int 1`
-// then the add/sub, and reassigns the local.
-function lowerIncDec(fc: FnCtx, node: int, base: int) {
-  let ln = getNode(fc.c.tree, kidsOf(fc.c.tree, node)[0])
-  if (ln.tag != Tag.Ident) {
-    fc.failed = true
-    return
-  }
-  let iname = fc.c.source[ln.span.start:ln.span.end]
-  let idx = envIndex(fc, iname)
-  if (idx == -1) {
-    // A module-level `let` (§11.11): read the cell, add/sub one, store it back.
-    let isym = moduleGlobalSym(fc, iname)
-    if (isym == "") {
-      fc.failed = true
-      return
-    }
-    let ity = nodeType(fc, kidsOf(fc.c.tree, node)[0])
-    let iop = arithOpFor(fc, base, ity)
-    if (iop == Op.BlockParam) {
-      fc.failed = true
-      return
-    }
-    let iaddr = emitGlobalAddrVal(fc, isym)
-    let ld = mkInstr(Op.FieldGet, ity)
-    ld.lhs = iaddr
-    ld.ival = 0
-    let curv = builderEmit(fc.b, ld)
-    let onei = mkInstr(Op.ConstInt, ity)
-    onei.ival = 1
-    let onev = builderEmit(fc.b, onei)
-    let ar = mkInstr(iop, ity)
-    ar.lhs = curv
-    ar.rhs = onev
-    let nv = builderEmit(fc.b, ar)
     let st = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
-    st.lhs = iaddr
+    st.lhs = waddr
     st.ival = 0
-    st.rhs = nv
+    st.rhs = wv
     builderEmit(fc.b, st)
     return
   }
   let ty = fc.env[idx].ty
-  let cur = fc.env[idx].value
-  let one = mkInstr(Op.ConstInt, ty)
-  one.ival = 1
-  let oneV = builderEmit(fc.b, one)
+  let rhsTy = defaultType(fc.c, nodeType(fc, rhsItems[0]))
+  let v = lowerExprH(fc, rhsItems[0], ty)
+  if (fc.failed) {
+    return
+  }
+  // A concrete value assigned into an interface-typed local is relabelled.
+  fc.env[idx].value = coerceToIface(fc, v, rhsTy, ty)
+}
+
+// Lowers `x++` / `x--` (SPEC §13.1): resolve the target's lvalue, read it,
+// add/sub the constant 1, write the result back. `base` is Plus/Minus.
+function lowerIncDec(fc: FnCtx, node: int, base: int) {
+  let lhs = kidsOf(fc.c.tree, node)[0]
+  let lv = resolveLvalue(fc, lhs)
+  if (fc.failed) {
+    return
+  }
+  let ty = nodeType(fc, lhs)
+  let cur = readLvalue(fc, lv)
   let op = arithOpFor(fc, base, ty)
   if (op == Op.BlockParam) {
     fc.failed = true
     return
   }
+  let one = mkInstr(Op.ConstInt, ty)
+  one.ival = 1
+  let oneV = builderEmit(fc.b, one)
   let ins = mkInstr(op, ty)
   ins.lhs = cur
   ins.rhs = oneV
-  fc.env[idx].value = builderEmit(fc.b, ins)
+  writeLvalue(fc, lv, builderEmit(fc.b, ins))
 }
 
 // Lowers a `while (cond) body`: jump to a header block (loop-carried live locals

@@ -18,6 +18,14 @@
 #
 # IT ONLY SEES COMMITTED WORK. `git archive HEAD` ignores the working tree and
 # the index, so uncommitted edits are NOT tested. Commit first, then gate.
+#
+# X64GATE_ALL_HOSTS=1 x64gate.sh   # run against EVERY reachable candidate from
+#                                  # x64host.sh, not just the first that answers.
+# One machine-local candidate list can rank a fast box first and a slow one
+# second (e.g. desktop over `hl-master`); a hardware-timing-sensitive gate that
+# stops at the first answer can pass on the fast box while a real regression
+# stays invisible there (#1690). Opt into this for any gate checking timing,
+# not for routine runs — it costs one full run per reachable box.
 set -euo pipefail
 
 MODE="${1:-fast}"
@@ -66,14 +74,24 @@ X64GATE_HOST="${X64GATE_HOST:-}"
 if [ -z "${X64GATE_HOST}" ] && [ -f "$(dirname "$0")/.x64gate-host" ]; then
   X64GATE_HOST=$(tr -d '[:space:]' < "$(dirname "$0")/.x64gate-host")
 fi
-if [ -z "${X64GATE_HOST}" ]; then
-  X64GATE_HOST=$(bash "$(dirname "$0")/x64host.sh") || {
+if [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; then
+  # Opt-in: every reachable candidate, not just the first that answers — see
+  # the file header for why a hardware-timing-sensitive gate needs this.
+  HOSTS=$(bash "$(dirname "$0")/x64host.sh" --all) || {
+    echo "x64gate: no host configured (see above). Each host also needs a" >&2
+    echo "         bit-zig-0.16.0-amd64 image." >&2
+    exit 127
+  }
+elif [ -n "${X64GATE_HOST}" ]; then
+  HOSTS="${X64GATE_HOST}"
+else
+  HOSTS=$(bash "$(dirname "$0")/x64host.sh") || {
     echo "x64gate: no host configured (see above). The host also needs a" >&2
     echo "         bit-zig-0.16.0-amd64 image." >&2
     exit 127
   }
 fi
-echo "x64gate: host=${X64GATE_HOST}"
+echo "x64gate: host(s)=$(printf '%s' "${HOSTS}" | tr '\n' ' ')"
 
 if [ "$MODE" = "clean" ]; then
   # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
@@ -86,26 +104,31 @@ else
 fi
 
 fails=0
-for i in $(seq 1 "${RUNS}"); do
-  [ "${RUNS}" -gt 1 ] && echo "===RUN ${i}/${RUNS}==="
-  code=$(git archive HEAD | ssh "${X64GATE_HOST}" "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
-    mkdir -p /work && cd /work && tar x &&
-    ZIG_GLOBAL_CACHE_DIR=${CACHE_ENV} zig build ${STEP} > /tmp/o 2>&1
-    e=\$?
-    if [ \$e -eq 0 ]; then
-      echo ===TAIL===
-      tail -35 /tmp/o
-    else
-      echo ===FAILURE_FULL_LOG===
-      cat /tmp/o
-    fi
-    echo X64LINUX_EXIT=\$e
-  '" | tee /dev/stderr | sed -n 's/^X64LINUX_EXIT=//p')
-  [ "${code}" != "0" ] && fails=$((fails + 1))
-done
+total=0
+while IFS= read -r host; do
+  [ -n "${host}" ] || continue
+  for i in $(seq 1 "${RUNS}"); do
+    total=$((total + 1))
+    { [ "${RUNS}" -gt 1 ] || [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; } && echo "===RUN host=${host} ${i}/${RUNS}==="
+    code=$(git archive HEAD | ssh "${host}" "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
+      mkdir -p /work && cd /work && tar x &&
+      ZIG_GLOBAL_CACHE_DIR=${CACHE_ENV} zig build ${STEP} > /tmp/o 2>&1
+      e=\$?
+      if [ \$e -eq 0 ]; then
+        echo ===TAIL===
+        tail -35 /tmp/o
+      else
+        echo ===FAILURE_FULL_LOG===
+        cat /tmp/o
+      fi
+      echo X64LINUX_EXIT=\$e
+    '" | tee /dev/stderr | sed -n 's/^X64LINUX_EXIT=//p')
+    [ "${code}" != "0" ] && fails=$((fails + 1))
+  done
+done <<< "${HOSTS}"
 
-if [ "${RUNS}" -gt 1 ]; then
-  echo "===SUMMARY=== ${fails}/${RUNS} runs failed"
+if [ "${total}" -gt 1 ]; then
+  echo "===SUMMARY=== ${fails}/${total} runs failed"
 fi
 # The script's exit status must track the GATE, not merely whether ssh and docker
 # ran. This previously returned 0 unconditionally for a single run, so a red

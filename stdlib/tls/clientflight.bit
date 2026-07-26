@@ -125,6 +125,19 @@ function (h: TlsClientHandshake) clientProcessServerHello(sh: ServerHello, shMsg
 
   let mk = h.clientNewHash
   let early = earlySecret(mk, []byte(0))
+  // Session resumption (#1209): the server echoes pre_shared_key in ServerHello
+  // only when it accepted the PSK we offered; use the PSK-derived early secret
+  // for the rest of the ladder in that case, exactly as a fresh handshake uses
+  // the all-zero one otherwise (RFC 8446 §7.1's Early Secret rung is generic
+  // over the PSK, so nothing downstream needs to know which branch this is).
+  let pskLookup = findExtOptional(sh.extensions, extTypePreSharedKey)
+  if (h.pskUsed && pskLookup.found) {
+    if (sh.cipherSuite != h.pskSuite.id) {
+      fail newError("tls client: server accepted resumption with a mismatched cipher suite")
+    }
+    h.pskAccepted = true
+    early = h.pskEarly
+  }
   h.hsSec = handshakeSecret(mk, early, h.shared)
   let thSH = h.clientTh()
   h.chs = clientHandshakeTrafficSecret(mk, h.hsSec, thSH)
@@ -149,6 +162,9 @@ function (h: TlsClientHandshake) clientConsumeAuthFlight(stream: []byte): []byte
       let ee = parseEncryptedExtensions(msg)?
       h.serverEEExts = ee.extensions
       h.alpn = h.clientPickAlpn(ee.extensions)
+      if (h.sentEarlyData && hasExt(ee.extensions, extTypeEarlyData)) {
+        h.earlyDataAccepted = true
+      }
       h.transcript = tlsHsPutBytes(h.transcript, msg)
     } else if (t == hsCertificate) {
       let cert = parseCertificate(msg)?
@@ -177,11 +193,19 @@ function (h: TlsClientHandshake) clientConsumeAuthFlight(stream: []byte): []byte
 }
 
 // Record mode: consume the AEAD-decrypted auth flight, then seal the resulting
-// client Finished message into a handshake record to send.
+// client Finished message into a handshake record to send. When 0-RTT early
+// data was accepted (#1209), an EndOfEarlyData record — sealed under the early
+// traffic key, the RFC 8446 §4.5 signal that the record layer is switching back
+// to handshake keys — precedes it; `clientFinishMessage` already folded its
+// bytes into the transcript the Finished MAC covers.
 function (h: TlsClientHandshake) clientProcessAuthFlight(stream: []byte): TlsClientStep! {
   let finMsg = h.clientConsumeAuthFlight(stream)?
-  let record = h.clientHsKeys.seal(finMsg, recordHandshake)?
-  return TlsClientStep{ retry: false, done: true, outbound: record }
+  let out = []byte(0)
+  if (h.earlyDataAccepted) {
+    out = tlsHsPutBytes(out, h.earlyWriteKeys.seal(encodeEndOfEarlyData(), recordHandshake)?)
+  }
+  out = tlsHsPutBytes(out, h.clientHsKeys.seal(finMsg, recordHandshake)?)
+  return TlsClientStep{ retry: false, done: true, outbound: out }
 }
 
 // Verify the peer certificate chain up to a trusted root and against the SNI
@@ -287,13 +311,21 @@ function (h: TlsClientHandshake) clientVerifyServerFinished(fin: Finished): ()! 
 // into a record; the QUIC path carries it verbatim in a CRYPTO frame.
 function (h: TlsClientHandshake) clientFinishMessage(): []byte {
   let mk = h.clientNewHash
+  // RFC 8446 §7.1 fixes the application-traffic/exporter secrets to
+  // "ClientHello...server Finished", never extended by EndOfEarlyData — that
+  // extension applies only to the client Finished MAC's own Handshake Context
+  // (§4.4.4: "the later of server Finished/EndOfEarlyData"), computed below
+  // over a transcript that (when 0-RTT was accepted) already includes it.
   let thSF = h.clientTh()
   let master = masterSecret(mk, h.hsSec)
   h.capSecret = clientApplicationTrafficSecret(mk, master, thSF)
   h.sapSecret = serverApplicationTrafficSecret(mk, master, thSF)
   h.exporterSec = exporterMasterSecret(mk, master, thSF)
 
-  let verify = finishedMac(mk, h.chs, thSF)
+  if (h.earlyDataAccepted) {
+    h.transcript = tlsHsPutBytes(h.transcript, encodeEndOfEarlyData())
+  }
+  let verify = finishedMac(mk, h.chs, h.clientTh())
   let finMsg = encodeFinished(Finished{ verifyData: verify })
 
   h.transcript = tlsHsPutBytes(h.transcript, finMsg)
@@ -334,9 +366,14 @@ function (h: TlsClientHandshake) clientFindExt(exts: []Extension, t: int): Exten
   fail newError("tls client: server response is missing extension ${t}")
 }
 
-// Whether the client offered cipher suite `id`.
+// Whether the client offered cipher suite `id`. `offeredSuites` (set by
+// `tlsClientStartResume`, #1209) overrides the config-derived default when the
+// resumption path offered a different set (the ticket's suite first).
 function (h: TlsClientHandshake) clientOfferedSuite(id: int): bool {
-  let suites = h.config.suites
+  let suites = h.offeredSuites
+  if (len(suites) == 0) {
+    suites = h.config.suites
+  }
   if (len(suites) == 0) {
     suites = clientDefaultSuites()
   }

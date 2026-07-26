@@ -119,6 +119,22 @@ fn signExtend(raw: u64, bits: u8) i64 {
     return @as(i64, @bitCast(raw << shift)) >> shift;
 }
 
+/// Canonicalizes `raw`'s low `bits` bits per the codegen width-canonical
+/// invariant (`seed/codegen/x64.zig`'s module doc comment): the bits above
+/// the type's width must equal the type's sign — zero for unsigned, a copy
+/// of bit `bits-1` for signed. Every `ConstVal.int` a fold function hands
+/// back must already be in this form before it reaches `bldr.constInt`
+/// (`emitTranslated`), since codegen trusts a `const_int` at face value with
+/// no re-narrowing of its own (#1708: `maskTo` alone zero-extends, which is
+/// wrong for a negative signed result — `-5i32` folded that way stored as
+/// `4294967291`, the unsigned bit pattern, instead of a sign-extended `-5`).
+/// Only `raw`'s low `bits` bits are read, so it is safe to call on a value
+/// whose higher bits are still garbage from an intermediate computation.
+fn canon(raw: u64, bits: u8, signed: bool) u64 {
+    if (signed) return @bitCast(signExtend(raw, bits));
+    return maskTo(raw, bits);
+}
+
 /// Folds `add`/`sub`/`mul`. Unsigned always wraps modularly (§13.5: no trap
 /// possible). Signed only folds when the exact result fits the type's
 /// range — an out-of-range result is left as a runtime op so it keeps
@@ -138,7 +154,7 @@ fn foldAddSubMul(op: ir.Op, bits: u8, signed: bool, a_raw: u64, b_raw: u64) ?Con
         const min: i128 = -(@as(i128, 1) << @intCast(bits - 1));
         const max: i128 = (@as(i128, 1) << @intCast(bits - 1)) - 1;
         if (wide < min or wide > max) return null;
-        return .{ .int = maskTo(@bitCast(@as(i64, @intCast(wide))), bits) };
+        return .{ .int = canon(@bitCast(@as(i64, @intCast(wide))), bits, true) };
     }
     const modulus: i128 = @as(i128, 1) << @intCast(bits);
     var m = @mod(wide, modulus);
@@ -162,7 +178,7 @@ fn foldSignedDivRem(op: ir.Op, bits: u8, a_raw: u64, b_raw: u64) ?ConstVal {
         .srem => @rem(a, b),
         else => unreachable,
     };
-    return .{ .int = maskTo(@bitCast(result), bits) };
+    return .{ .int = canon(@bitCast(result), bits, true) };
 }
 
 /// Folds `udiv`/`urem`. Divide-by-zero always panics (§13.5) — left
@@ -180,15 +196,19 @@ fn foldUnsignedDivRem(op: ir.Op, bits: u8, a_raw: u64, b_raw: u64) ?ConstVal {
 
 /// Folds `shl`/`lshr`/`ashr`. Always total: §13.5 defines the shift count as
 /// taken modulo the operand bit width, so no trap is ever possible here.
-fn foldShift(op: ir.Op, bits: u8, a_raw: u64, b_raw: u64) ?ConstVal {
+/// `lshr`/`ashr` are themselves already sign-correct (`lower.zig` only ever
+/// emits `lshr` for an unsigned `>>` and `ashr` for a signed one), but `shl`
+/// serves both, so the caller's `signed` decides the final canonicalization.
+fn foldShift(op: ir.Op, bits: u8, signed: bool, a_raw: u64, b_raw: u64) ?ConstVal {
     const shift: u6 = @intCast(@mod(b_raw, bits));
     const a = maskTo(a_raw, bits);
-    return .{ .int = switch (op) {
-        .shl => maskTo(a << shift, bits),
+    const raw: u64 = switch (op) {
+        .shl => a << shift,
         .lshr => a >> shift,
-        .ashr => maskTo(@bitCast(signExtend(a_raw, bits) >> shift), bits),
+        .ashr => @bitCast(signExtend(a_raw, bits) >> shift),
         else => unreachable,
-    } };
+    };
+    return .{ .int = canon(raw, bits, signed) };
 }
 
 fn foldBinaryArith(ctx: *const check.TypeContext, op: ir.Op, ty: TypeId, lhs: ConstVal, rhs: ConstVal) ?ConstVal {
@@ -212,14 +232,14 @@ fn foldBinaryArith(ctx: *const check.TypeContext, op: ir.Op, ty: TypeId, lhs: Co
         .band, .bor, .bxor => blk: {
             const a = maskTo(lhs.int, bits);
             const b = maskTo(rhs.int, bits);
-            break :blk .{ .int = maskTo(switch (op) {
+            break :blk .{ .int = canon(switch (op) {
                 .band => a & b,
                 .bor => a | b,
                 .bxor => a ^ b,
                 else => unreachable,
-            }, bits) };
+            }, bits, signed) };
         },
-        .shl, .lshr, .ashr => foldShift(op, bits, lhs.int, rhs.int),
+        .shl, .lshr, .ashr => foldShift(op, bits, signed, lhs.int, rhs.int),
         else => null,
     };
 }
@@ -279,7 +299,7 @@ fn foldUnary(ctx: *const check.TypeContext, op: ir.Op, ty: TypeId, v: ConstVal) 
         .bnot => blk: {
             if (!isIntPrim(p)) break :blk null;
             const bits = widthOf(p);
-            break :blk .{ .int = maskTo(~maskTo(v.int, bits), bits) };
+            break :blk .{ .int = canon(~maskTo(v.int, bits), bits, isSignedPrim(p)) };
         },
         .neg => blk: {
             if (!isIntPrim(p)) break :blk null;
@@ -290,9 +310,9 @@ fn foldUnary(ctx: *const check.TypeContext, op: ir.Op, ty: TypeId, v: ConstVal) 
                 // before the negation, so the intermediate must be wider.
                 const min_val: i64 = @intCast(-(@as(i128, 1) << @intCast(bits - 1)));
                 if (a == min_val) break :blk null; // negating MIN overflows: preserve the trap
-                break :blk .{ .int = maskTo(@bitCast(-a), bits) };
+                break :blk .{ .int = canon(@bitCast(-a), bits, true) };
             }
-            break :blk .{ .int = maskTo(0 -% maskTo(v.int, bits), bits) };
+            break :blk .{ .int = canon(0 -% maskTo(v.int, bits), bits, false) };
         },
         else => null,
     };

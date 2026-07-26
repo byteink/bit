@@ -18,7 +18,18 @@
 # Prints the alias on stdout and exits 0, or explains how to configure and
 # exits 1. Callers must check the exit code: a gate that runs against the wrong
 # box, or reports "no host" as a result, is worse than one that does not run.
+#
+# `x64host.sh --all` opts OUT of first-answer-wins: it probes every candidate
+# and prints all reachable ones (one per line), for callers checking
+# hardware-timing-sensitive code, where "first box that happens to be awake"
+# can silently pick the machine that hides a real regression (#1690). Exits 0
+# if at least one candidate answered, 1 otherwise.
 set -u
+
+ALL=0
+if [ "${1:-}" = "--all" ]; then
+  ALL=1
+fi
 
 _probe() {                       # $1 = alias; answers ssh within 8s?
   ssh -o ConnectTimeout=8 -o BatchMode=yes "$1" true >/dev/null 2>&1
@@ -45,13 +56,16 @@ if [ -z "${_candidates}" ]; then
   done
 fi
 
+_found=0
 for _h in ${_candidates}; do
   [ -n "${_h}" ] || continue
   if _probe "${_h}"; then
     printf '%s\n' "${_h}"
-    exit 0
+    _found=1
+    [ "${ALL}" -eq 1 ] || exit 0
   fi
 done
+[ "${ALL}" -eq 1 ] && [ "${_found}" -eq 1 ] && exit 0
 
 {
   if [ -n "${_candidates}" ]; then

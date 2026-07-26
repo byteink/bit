@@ -766,7 +766,7 @@ defined exactly once).
 | `bit_rt_string_from_float` | `(v: f64) -> *const RtBytes` (§2)                  |
 | `bit_rt_string_from_bool`  | `(v: bool) -> *const RtBytes` (§2)                 |
 | `bit_rt_slice_new`    | `(len: usize, cap: usize, is_ref: usize) -> *SliceHeader` (§2) |
-| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64) -> *SliceHeader` (§2)     |
+| `bit_rt_slice_append` | `(h: *SliceHeader, word: u64, is_ref: usize) -> *SliceHeader` (§2, `is_ref` is the static element type's — a null `h` has no header to read it from, #1569) |
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize) -> u64` (§2)     |
 | `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64) -> void` (§2) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2) |
@@ -1443,3 +1443,71 @@ need no synchronization under any worker count.
 counter exists in `runtime/*.zig` outside the entries above (`rand.zig` and
 `net.zig` declare no container-scope state at all — every random/network call
 is a stateless syscall wrapper).
+
+## 23. Concurrency memory model — runtime guarantees (SPEC.md §13.7)
+
+§22 audits the runtime's *own* internal state; this section is the other
+half — what the runtime does at each rendezvous point to make SPEC.md §13.7's
+happens-before edges actually hold for **Bit-level** (user heap) memory, once
+`boot` runs more than one worker (§9). Each edge is backed by a real
+release/acquire pairing, never a plain (relaxed) load/store, because a plain
+access on most targets permits the reordering the edge exists to forbid:
+
+1. **`spawn` → first statement (§13.7 edge 1).** The packed-argument struct
+   (§9 Spawn) is fully written by the spawning thread before `bit_rt_spawn`
+   hands the task off. `sched.zig`'s per-worker `Deque` writes the task into
+   its ring slot, then publishes it with a `.release`-ordered `tail` store
+   (`pushBottom`); a stealing or popping worker loads `head`/`tail` with
+   `.acquire` before reading that slot (`popBottom`/`steal`). The global
+   queue used on deque overflow is instead one `SpinLock`-guarded intrusive
+   list (same acquire/release CAS-then-store pairing as channels, item 2
+   below). Either path — not scheduling order, which is unspecified — is the
+   edge.
+2. **Channel send → matching receive (edges 2, 4, 5).** Each `Chan(T)` is
+   guarded end-to-end by one `spinlock.zig` `SpinLock` (`chan.zig`): `acquire`
+   is a `.acquire`-ordered CAS, `release` is a `.release` store (`spinlock.zig`).
+   A send writes the value (into the ring buffer, or straight to a parked
+   receiver for the unbuffered case) *before* releasing the lock; a receive
+   takes the lock (its `.acquire` CAS) before reading that value. The lock's
+   acquire/release pairing — not any weaker ordering — is the edge; nothing
+   in `chan.zig`'s rendezvous is lock-free.
+3. **`close` → observing closed (edge 3).** `close` sets the closed flag
+   under the same `SpinLock`; a receive observes it (and returns
+   `ok == false` once drained, ABI.md §11) only after taking that same lock.
+   Program order under one lock is what carries the edge — no separate
+   flag-specific ordering is needed.
+4. **`std/sync` `Mutex`/`RWMutex` (edge 6).** Expected to reuse
+   `spinlock.zig`'s `SpinLock` (or the scheduler's park/unpark on top of it,
+   for a mutex that parks instead of spins under contention) — the same
+   acquire/release CAS-then-store pairing already proven by `chan.zig` and
+   `sched.zig`'s deques above. `Once`/`WaitGroup` (edges 7, 8) are expected to
+   compose from the same Mutex/atomic primitives and inherit the same
+   pairing. This is `std/sync`'s implementation contract (#1251), not yet
+   built on this branch.
+5. **`std/sync` atomics — `Release`/`Acquire`/`Relaxed` (edge 9, SPEC.md
+   §13.7.1).** These must lower to the target's native ordered forms, not to
+   the seq-cst-only sequences §11.5's raw `*T` builtins already emit:
+   AArch64 `STLR`/`LDAR` (or the `STLXR`/`LDAXR` release/acquire retry forms
+   for the read-modify-write ops), x86-64 a plain `mov` for both directions
+   (TSO already gives release/acquire for free — the compiler's job is only to
+   not reorder *other* instructions across it) with `lock`-prefixed
+   read-modify-write ops as today. `Relaxed` skips the ordering but keeps the
+   underlying instruction atomic — it is never a plain non-atomic load/store,
+   which would reintroduce word-tearing SPEC.md §13.7 defines away for
+   single-word values. This is new codegen surface (tracked with `std/sync`'s
+   implementation, #1251) — the seq-cst-only raw builtins (§11.5) cannot be
+   reused as-is for `Relaxed`/`Release`/`Acquire` because they hard-code the
+   strongest ordering at every callsite.
+
+**Why the GC-safety exception in SPEC.md §13.7 is precise, not hand-waved.**
+§5's root scan trusts a stack slot's or register's declared shape at a
+safepoint — it does not re-validate that a slice's `ptr` and `len` (or an
+interface's `type` and `data`) were written together. A racing, non-atomic
+write to a GC-traced multiword field can leave exactly such a torn value
+sitting in a live slot; if a safepoint (§5) lands while it is there, the
+collector scans it as if it were well-formed. This is the concrete mechanism
+behind SPEC.md §13.7's claim that a composite-value race — never a
+single-word one — is the one way otherwise-safe Bit code can reach real
+memory-unsafety, and it is exactly why the audit in §22 above only needed to
+reason about *runtime*-internal state: user Bit code gets no such audit for
+free, which is the whole reason §13.7 and this section exist.

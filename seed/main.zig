@@ -1060,34 +1060,36 @@ fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics
 /// AST walks: what differs between them is only where a symbol may legitimately
 /// come from.
 ///
-///   - Linux: the merged `libbitrt.a`, and nothing else — the image is static,
-///     with no interpreter and no dynamic symbol table.
-///   - Darwin: that same archive OR libSystem, which the Mach-O image loads as
-///     `LC_LOAD_DYLIB` and dyld binds at load.
+///   - Every target: a §11.9 `@symbol` pin one of this build's own modules
+///     defines (`pins`) — the final link resolves it out of the program's own
+///     object, exactly the way `bit_main` is resolved.
+///   - Linux: otherwise the merged `libbitrt.a`, and nothing else — the image
+///     is static, with no interpreter and no dynamic symbol table.
+///   - Darwin: otherwise that same archive OR libSystem, which the Mach-O image
+///     loads as `LC_LOAD_DYLIB` and dyld binds at load.
 ///
 /// Undecidable inputs (an empty or malformed archive) answer false on both, so
 /// the caller rejects — the sound direction, since accepting on unknown trades a
 /// compile error for a crash.
+///
+/// The pin lookup runs first because it is O(1) while `archiveDefines` reparses
+/// and symbol-decodes every archive member; a pinned name is by design absent
+/// from the archive, so archive-first would pay that scan on every such build.
 fn externResolvable(gpa: std.mem.Allocator, target: BuildTarget, libbitrt: []const u8, symbol: []const u8, pins: *const PinSet) bool {
+    if (pins.contains(symbol)) return true;
     return switch (target) {
         .x86_64_linux => link.archiveDefines(gpa, .x86_64_linux, libbitrt, symbol),
         .aarch64_linux => link.archiveDefines(gpa, .aarch64_linux, libbitrt, symbol),
         .aarch64_macos => machosyms.archiveDefines(gpa, libbitrt, symbol) or
-            machosyms.libsystemDefines(symbol) or
-            pins.contains(symbol),
+            machosyms.libsystemDefines(symbol),
     };
 }
 
 /// The §11.9 `@symbol("…")` names this build's own modules define. An `extern`
 /// naming one is resolved by the final link out of the program's own object —
 /// `tests/stress/pinsym` is exactly that shape, and `bit_main` is the same idea
-/// hardcoded — so it is admissible even though no archive defines it.
-///
-/// Consulted on Darwin only, deliberately. Darwin is the platform whose gate is
-/// being TIGHTENED here (#1634), so it must not turn a shape that built and ran
-/// before into an error. The Linux arm has always refused this shape, and
-/// widening it is a separate decision with its own goldens, not a side effect of
-/// this one — see #1669.
+/// hardcoded — so it is admissible even though no archive defines it, on every
+/// target: the static ELF link resolves it the same way it resolves `bit_main`.
 const PinSet = std.StringHashMapUnmanaged(void);
 
 /// Collects every `@symbol("…")` on a top-level declaration of `files`. Keys
@@ -2013,6 +2015,82 @@ test "E0078 on Darwin admits libSystem and the archive, and refuses a name in ne
     try std.testing.expect(std.mem.indexOf(u8, typo_err.written(), "getpidd") != null);
 }
 
+test "E0078 admits a §11.9 pin on Linux and still refuses an unpinned absent symbol (#1669)" {
+    // SPEC §11.7. Before #1669 `externResolvable` consulted `pins` on the
+    // aarch64_macos arm only — a deliberate narrowing at #1634 time, since
+    // Darwin was the platform being tightened. But the archive-vs-pin predicate
+    // is not actually platform-specific: a pinned reference resolves out of the
+    // program's OWN object at link time, exactly like `bit_main`, and a static
+    // ELF link performs that resolution identically to Darwin's.
+    //
+    // Both poles are asserted over the SAME target and the SAME two-file
+    // "module" (sibling `.bit` files, no import needed — SPEC §17.1's sibling
+    // rule), so neither can pass by accident: a gate that always rejected would
+    // fail the first half, and one that dropped the archive/absent check
+    // entirely would fail the second.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var checked: usize = 0;
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux }) |target| {
+        const lib = Io.Dir.cwd().readFileAlloc(io, libbitrtPath(target), gpa, .unlimited) catch
+            continue; // `zig build libbitrt` not run for this target here
+        defer gpa.free(lib);
+        checked += 1;
+
+        // --- accepted: pinned by a sibling file of the SAME build, defined
+        // nowhere in the archive. `tests/stress/pinsym`'s exact shape.
+        var pin_err: Io.Writer.Allocating = .init(gpa);
+        defer pin_err.deinit();
+        const pin_def_src =
+            \\export @symbol("bit_pinned_sub_1669") function pinnedSub(a: i64, b: i64): i64 {
+            \\  return a - b
+            \\}
+            \\
+        ;
+        const pin_use_src =
+            \\extern function bit_pinned_sub_1669(a: i64, b: i64): i64
+            \\function main() {
+            \\  bit_pinned_sub_1669(64, 22)
+            \\}
+            \\
+        ;
+        const pin_inputs = [_]SrcFile{
+            .{ .path = "pindef.bit", .source = pin_def_src },
+            .{ .path = "pinuse.bit", .source = pin_use_src },
+        };
+        const exe = (try buildModule(gpa, &pin_inputs, "pinsym1669", lib, target, &pin_err.writer, null)) orelse {
+            std.debug.print("target {s}: rejected a symbol this build's own module pins:\n{s}\n", .{ target.name(), pin_err.written() });
+            return error.LegitimateExternRejected;
+        };
+        defer gpa.free(exe);
+        try std.testing.expect(exe.len > 0);
+
+        // --- rejected: nothing pins it and the archive does not define it -----
+        // The guard is WIDENED, not removed: this is the exact negative pole
+        // #1634's Darwin test asserts, now checked for Linux too.
+        var bad_err: Io.Writer.Allocating = .init(gpa);
+        defer bad_err.deinit();
+        const bad_src = try std.fmt.allocPrint(gpa,
+            \\extern function {s}()
+            \\function main() {{
+            \\  {s}()
+            \\}}
+            \\
+        , .{ absent_symbol, absent_symbol });
+        defer gpa.free(bad_src);
+        try std.testing.expect(try buildExecutable(gpa, "externbad1669.bit", bad_src, lib, target, &bad_err.writer) == null);
+        try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), "E0078") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bad_err.written(), absent_symbol) != null);
+    }
+
+    // Anti-vacuity: a loop that ran zero times would pass while asserting
+    // nothing.
+    if (checked == 0) return error.SkipZigTest;
+}
+
 test "E0078 does not apply to an object emit (#1645)" {
     // SPEC §11.7: the rule is about the LINK that will resolve the reference.
     // `bit build --emit-obj` performs no link — its artifact is a relocatable,
@@ -2141,4 +2219,29 @@ test "archiveDefines answers membership, not mere reference" {
         try std.testing.expect(!link.archiveDefines(gpa, lt, "not an ar archive at all", "bit_rt_gc_blocking_begin"));
     }
     if (checked == 0) return error.SkipZigTest;
+}
+
+test "externResolvable admits a pin without consulting the archive (#1669)" {
+    // The predicate in isolation, mirroring selfhost's `checkExternResolvable`.
+    // A malformed archive is the point: a pinned name must answer true on every
+    // target from `pins` ALONE, never from an archive scan — that is both the
+    // §11.7 rule and the reason the pin lookup runs first.
+    const gpa = std.testing.allocator;
+    const junk = "not an ar archive at all";
+
+    var pins: PinSet = .empty;
+    defer pins.deinit(gpa);
+    try pins.put(gpa, "bit_pinned_sub", {});
+    const no_pins: PinSet = .empty;
+
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux, .aarch64_macos }) |target| {
+        try std.testing.expect(externResolvable(gpa, target, junk, "bit_pinned_sub", &pins));
+        // Widened, not removed: unpinned and archive-absent stays rejected.
+        try std.testing.expect(!externResolvable(gpa, target, junk, "bit_pinned_sub", &no_pins));
+        try std.testing.expect(!externResolvable(gpa, target, junk, absent_symbol, &pins));
+    }
+    // Darwin's libSystem allowance is untouched by the pin path; Linux still has
+    // no dyld to bind against.
+    try std.testing.expect(externResolvable(gpa, .aarch64_macos, junk, "mmap", &no_pins));
+    try std.testing.expect(!externResolvable(gpa, .x86_64_linux, junk, "mmap", &no_pins));
 }
