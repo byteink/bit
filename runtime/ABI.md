@@ -615,15 +615,41 @@ code that starts a raw OS thread via `runtime/thread`):
 
 ```
 bit_rt_gc_thread_enter()   -> void   // claim a mutator slot for this OS thread
-bit_rt_gc_thread_exit()    -> void   // release it; MUST precede thread exit
+bit_rt_gc_thread_exit()    -> void   // release it; the platform does this at thread exit
 bit_rt_gc_blocking_begin() -> void   // enter a no-live-references blocking region
 bit_rt_gc_blocking_end()   -> void   // leave it
 ```
 
 `_enter` is idempotent per thread and is also performed lazily by the first
-safepoint poll, so a thread can never be invisible to the collector. `_exit` is
-not optional: a leaked slot stays `running` forever, which does not corrupt
-anything but does make every later rendezvous time out, i.e. collection stops.
+safepoint poll, so a thread can never be invisible to the collector.
+
+**`_exit` IS NO LONGER THE THREAD BODY'S RESPONSIBILITY (#1801).** A leaked slot
+stays `running` forever, which does not corrupt anything but does make every
+later rendezvous time out, i.e. collection stops — and that is silent, so a rule
+each new caller had to remember was the wrong place for it (measured: 247 of
+`tests/stress/gcthreadslinux`'s 292 abandoned collections were blocked on an
+exited child's slot). The release now happens without the body's cooperation, by
+whichever hook the platform actually offers:
+
+| Platform | Where the slot is released | Why there |
+|----------|----------------------------|-----------|
+| Linux    | `runtime/thread/linux`'s child exit path calls `_exit` once the body returns | the provider owns the whole `clone(2)` child exit path, and a static binary has no libc hook |
+| Darwin   | a pthread TSD destructor, armed when the slot is CLAIMED (`exit_hook`, `runtime/root.zig`) | `pthread_create` owns the child's entry and stack, so there is nothing to wrap — but every pthread runs its destructors, including threads this runtime never started |
+
+Three consequences worth stating. The Linux ordering is deliberate: the slot is
+released while the child is still in user space, so a joiner that sees the `done`
+word cleared also sees a released slot. Darwin's hook fires during
+`_pthread_tsd_cleanup`, the same pass that tears the thread's TLVs down, so it
+carries the slot pointer as the key's VALUE — a destructor reading the runtime's
+`threadlocal` sees null (measured) and releases nothing. And the Linux provider's
+`threadRelease` no longer treats `done` as proof that the child has left its
+stack, because a body may clear that word itself; it waits on a flag only the
+child's exit path clears, as that path's last memory access.
+
+`_exit` remains exported, and remains what a thread calls to give its slot back
+*earlier* than its own death — a worker that finishes its Bit loop and then keeps
+running is the case (`runtime/sched.zig`'s pool). Calling it disarms the platform
+hook, so the two can never release one slot twice.
 
 All are plain `callconv(.c)` functions with C linkage names — ordinary
 external symbols to the linker (§9's export table lists every `bit_rt_*`

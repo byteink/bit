@@ -178,13 +178,88 @@ threadlocal var g_mutator: ?*gc_mod.Mutator = null;
 /// map. THE SAFEPOINT DOOR MUST PASS ITS REAL SNAPSHOT: a thread whose first
 /// touch of the collector is a poll already holds live references named by that
 /// poll's stack map, and parking it with 0 would hide exactly those.
+///
+/// THE CLAIM ARMS ITS OWN RELEASE (#1801) — see `exit_hook`.
 fn currentMutator(frame: usize) ?*gc_mod.Mutator {
     if (g_mutator) |m| return m;
     const m = g_world.claim() orelse return null;
     g_mutator = m;
+    exit_hook.arm(m);
     if (g_world.stopRequested()) g_world.park(m, frame);
     return m;
 }
+
+/// Release this thread's mutator slot when the OS thread dies, so a thread that
+/// simply *returns* cannot leak one (#1801).
+///
+/// WHY A LEAKED SLOT MATTERS. A slot is claimed lazily, on this thread's first
+/// allocation or first poll (#1431), and nothing in a raw OS thread's exit path
+/// gives it back: `bit_rt_gc_thread_exit` used to be something ABI.md §6 ASKED
+/// the thread's body to call, a rule whose penalty for forgetting is silent —
+/// the slot stays `running` forever and every later rendezvous expires, i.e.
+/// collection stops. Measured on native x86_64 linux, 247 of
+/// `tests/stress/gcthreadslinux`'s 292 abandoned collections were blocked on an
+/// exited child's slot.
+///
+/// ARMED AT THE CLAIM, NOT AT THREAD CREATION, which is what makes it complete:
+/// this covers every thread that ever reaches the collector, including ones this
+/// runtime did not start, rather than only the ones some provider wrapped.
+///
+/// DARWIN ONLY, AND THE ASYMMETRY IS THE PLATFORM'S. A pthread runs its
+/// thread-specific-data destructors on the way out, which is the only hook a
+/// thread that merely returns from its body offers. Linux threads here are raw
+/// `clone(2)` children of a static binary with no libc and therefore no such
+/// hook, so that side is discharged where the exit path actually is — the child
+/// asm in `runtime/thread/linux/spawn.bit` calls `bit_rt_gc_thread_exit` itself,
+/// before the kernel clears the join word.
+///
+/// THE KEY IS CREATED ONCE AT BOOT, on the one thread that provably has no
+/// competition, rather than lazily behind a guard on the claim path — `arm` is
+/// then a single store and needs no synchronisation of its own.
+///
+/// THE KEY'S VALUE IS THE SLOT ITSELF, NOT A SENTINEL, and that is not a
+/// convenience — it is the only thing that works. `g_mutator` is a `threadlocal`,
+/// i.e. a Darwin TLV, and Darwin tears a thread's TLVs down in the same
+/// `_pthread_tsd_cleanup` pass that runs these destructors: MEASURED, a
+/// destructor that read `g_mutator` saw null and released nothing, so the slot
+/// leaked exactly as before while every trace said the hook had fired. pthreads
+/// hands a destructor its own value as an argument, and `g_world` is an ordinary
+/// global, so going through the argument depends on neither.
+const exit_hook = if (builtin.os.tag == .macos) struct {
+    /// Out of range for any key pthreads can hand out, so an `arm` that somehow
+    /// ran before `init` is rejected with EINVAL rather than storing through a
+    /// garbage key that could alias a real one.
+    var key: std.c.pthread_key_t = std.math.maxInt(std.c.pthread_key_t);
+
+    /// A destructor that failed to install is the whole defect back again, and
+    /// silently, so this refuses to continue rather than degrade.
+    fn init() void {
+        if (std.c.pthread_key_create(&key, release) != .SUCCESS) {
+            fatal("pthread_key_create failed; a thread's mutator slot could not be released");
+        }
+    }
+
+    /// pthreads clears a key's value before calling its destructor, so this runs
+    /// at most once per thread per claim and cannot double-release.
+    fn release(value: *anyopaque) callconv(.c) void {
+        g_world.release(@ptrCast(@alignCast(value)));
+    }
+
+    fn arm(m: *gc_mod.Mutator) void {
+        _ = std.c.pthread_setspecific(key, m);
+    }
+
+    /// Forget a slot released by hand, so the destructor cannot release it a
+    /// SECOND time — by then another thread may own it, and freeing that thread's
+    /// slot would put a live mutator outside the registry.
+    fn disarm() void {
+        _ = std.c.pthread_setspecific(key, null);
+    }
+} else struct {
+    fn init() void {}
+    fn arm(_: *gc_mod.Mutator) void {}
+    fn disarm() void {}
+};
 
 /// THE ONLY TWO WAYS THIS FILE MAY REACH THE COLLECTOR'S ALLOCATOR.
 ///
@@ -220,12 +295,19 @@ export fn bit_rt_gc_thread_enter() callconv(.c) void {
     _ = currentMutator(0);
 }
 
-/// `bit_rt_gc_thread_exit` (ABI.md §5/§6): release this thread's slot. **Not
-/// optional** — a leaked slot stays `running` forever, which corrupts nothing
-/// but makes every later rendezvous expire, i.e. collection quietly stops.
+/// `bit_rt_gc_thread_exit` (ABI.md §5/§6): release this thread's slot.
+///
+/// NO LONGER SOMETHING A THREAD BODY HAS TO REMEMBER (#1801) — the platform
+/// discharges it, see `exit_hook`. Still exported, and still what a caller that
+/// wants the slot back EARLIER than its thread's death calls: a worker that
+/// finishes its Bit loop and then keeps running is the case
+/// (`runtime/sched.zig`'s pool). A leaked slot stays `running` forever, which
+/// corrupts nothing but makes every later rendezvous expire, i.e. collection
+/// quietly stops.
 export fn bit_rt_gc_thread_exit() callconv(.c) void {
     const m = g_mutator orelse return;
     g_mutator = null;
+    exit_hook.disarm();
     g_world.release(m);
 }
 
@@ -2019,6 +2101,10 @@ pub fn boot(main_fn: MainFn, environ: std.process.Environ) !i32 {
 
     g_heap = heap_mod.Heap.init();
     g_gc = try gc_mod.Gc.init(&g_heap, gc_mod.configFromEnv(environ));
+
+    // Before any thread can claim a mutator slot, because claiming one arms the
+    // release this installs (#1801).
+    exit_hook.init();
 
     // ABI.md §9: nthreads pinned to 1. Stale note this replaces: earlier text
     // here said the pin was a collector correctness requirement (a
