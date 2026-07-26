@@ -905,6 +905,78 @@ test "unbuffered channel: producer/consumer, 1,000,000 messages, no loss or reor
     try testing.expect(Harness.in_order);
 }
 
+// #1769: `quicconnTicker`'s tick — and everything gated behind it, notably the
+// QUIC handshake/idle timeouts — is built on `sched.sleepTask`. `findWork`
+// used to check for a due timer only once a worker ran completely out of
+// local, global, *and* stealable work. Continuous unbuffered-channel traffic
+// (produce/consume pairs handing off synchronously, exactly the pattern
+// `quicconnLoop` sees from a busy `inCh`) keeps every worker's `findWork` call
+// finding something via local/global/steal instead, so that check was never
+// reached: a sleeper could starve forever even though the fleet was making
+// real, continuous progress elsewhere. Regression for the scheduler fix, not
+// for `quicconnTicker` itself — the QUIC-level behavior isn't unit-testable
+// without a live handshake.
+test "TimerQueue: a due sleeper wakes despite continuous channel churn" {
+    var s: sched.Scheduler = undefined;
+    try testScheduler(&s, 4);
+    defer teardown(&s);
+
+    const IntChan = Chan(u64);
+    const npairs = 8; // more churn pairs than workers, so no worker ever runs dry
+    var chans: [npairs]IntChan = undefined;
+    for (&chans) |*c| c.* = try IntChan.init(0); // unbuffered: every transfer parks one side
+    defer for (&chans) |*c| c.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    var woke = std.atomic.Value(bool).init(false);
+
+    const Harness = struct {
+        var sp: *sched.Scheduler = undefined;
+        var stop_ptr: *std.atomic.Value(bool) = undefined;
+        var woke_ptr: *std.atomic.Value(bool) = undefined;
+
+        fn produce(arg: ?*anyopaque) callconv(.c) void {
+            const c: *IntChan = @ptrCast(@alignCast(arg));
+            var i: u64 = 0;
+            // Power-of-10 backstop; `stop` is what actually ends this in practice.
+            while (!stop_ptr.load(.acquire) and i < 20_000_000) : (i += 1) c.send(sp, i);
+        }
+        fn consume(arg: ?*anyopaque) callconv(.c) void {
+            const c: *IntChan = @ptrCast(@alignCast(arg));
+            var i: u64 = 0;
+            while (!stop_ptr.load(.acquire) and i < 20_000_000) : (i += 1) _ = c.recv(sp);
+        }
+        fn sleepAndMark(_: ?*anyopaque) callconv(.c) void {
+            sched.sleepTask(20 * std.time.ns_per_ms);
+            woke_ptr.store(true, .release);
+        }
+    };
+    Harness.sp = &s;
+    Harness.stop_ptr = &stop;
+    Harness.woke_ptr = &woke;
+
+    for (&chans) |*c| {
+        try s.spawn(Harness.produce, @ptrCast(c));
+        try s.spawn(Harness.consume, @ptrCast(c));
+    }
+    try s.spawn(Harness.sleepAndMark, null);
+
+    const deadline = Deadline.after(5 * std.time.ns_per_s);
+    var timed_out = false;
+    while (!woke.load(.acquire)) {
+        if (deadline.expired()) {
+            timed_out = true;
+            break;
+        }
+        sleepNs(1_000_000);
+    }
+    // Let produce/consume notice `stop` and return on their own; `join` (in
+    // `teardown`) tolerates a leftover parked task on either side of a pair
+    // whose partner already exited, so this never hangs even then.
+    stop.store(true, .release);
+    if (timed_out) return error.Timeout;
+}
+
 test "select: one ready among three fires the correct arm" {
     var s: sched.Scheduler = undefined;
     try testScheduler(&s, 1);

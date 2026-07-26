@@ -1,0 +1,207 @@
+// A raw OS thread's exit must give its mutator slot back — without the body
+// asking for it (#1801).
+//
+// WHAT WENT WRONG. A thread claims a mutator slot lazily, on its first
+// allocation or first safepoint (#1431). Nothing in a raw thread's exit path
+// gave it back: on Linux the child leaves through a bare `SYS_exit`, on Darwin
+// by returning into pthreads, and neither can run `bit_rt_gc_thread_exit`. The
+// slot therefore stayed `running` FOREVER after the thread died, and ABI.md §5's
+// rendezvous waits for every `running` slot — so every later collection in the
+// process ran the bound out and was abandoned. Measured on native x86_64 linux,
+// `tests/stress/gcthreadslinux` under `BIT_GC=stress`: 247 of 292 abandoned
+// collections were blocked on an exited child's slot.
+//
+// THE FAILURE IS SILENT IN EVERY DIRECTION, which is why this program is worth
+// its length. Nothing corrupts, nothing crashes, no output changes: collection
+// simply stops and the heap grows to whatever the program's allocation total is.
+// ABI.md §6 used to close it by ASKING each thread body to call
+// `bit_rt_gc_thread_exit` itself — a rule every future caller had to remember,
+// whose penalty for forgetting was invisible. This program's child deliberately
+// does NOT make that call, so it fails if the obligation is ever handed back to
+// the body.
+//
+// ---------------------------------------------------------------------------
+// HOW THE ORACLE WORKS, AND WHY IT IS NOT THIS FILE'S RETURN VALUE
+// ---------------------------------------------------------------------------
+//
+// A Bit program cannot read the collector's counters, so "no collection was
+// abandoned" is checked out of band: each driver's directory carries a
+// `no-abandon` marker and `tests/stress.zig` fails the run if the `BIT_GC=stress`
+// pass prints a single rendezvous-expiry line. What THIS file guarantees is that
+// the run is a fair test of that — a live child that really claimed a slot, an
+// exit that really happened, and enough allocation afterwards to attempt
+// hundreds of collections.
+//
+// EVERY OTHER SOURCE OF AN ABANDONED COLLECTION IS DESIGNED OUT, so the marker
+// cannot go red for an unrelated reason:
+//
+//   - THE CHILD CONTAINS NO LOOP. Codegen emits a safepoint at loop back edges
+//     and nowhere else, so this child never polls, never attempts a collection,
+//     and cannot abandon one while the parent sleeps inside the join. That
+//     matters because a parent in `parkSleepNs` reads as `running` (ABI.md §5's
+//     stated limitation, #1562) — the very cost this program must not measure.
+//   - THE MEASURING LOOP RUNS AFTER `threadRelease`, NOT AFTER THE JOIN. The
+//     release is the platform's own barrier that the child is completely gone:
+//     `pthread_join` on Darwin returns only after the thread's TSD destructors
+//     have run, and the Linux provider's release gates on a flag the child's exit
+//     path clears as its last memory access. Measuring from the join word instead
+//     would race the tail of the child's teardown.
+//   - IN THAT LOOP THE PARENT IS THE ONLY LIVE MUTATOR. `rendezvous` skips the
+//     collecting thread's own slot, so with the child gone every stop must
+//     succeed. A single abandoned collection means a slot outlived its thread.
+//
+// MUTATION-TESTED BEFORE IT WAS TRUSTED, on native x86_64 linux: with the
+// Linux provider's epilogue emptied out, this program reports 581 abandoned
+// collections against 127 collected. Fixed, 0 against 708.
+
+import { i32At, i64At, byteAt, elemAddr } from "../props"
+import { threadJoin, threadJoinDone } from "../../../../runtime/thread"
+
+// All properties passed: E1|E2|E3|E4|E5 = 1|2|4|8|16. A bitmask, not a count, so
+// a failure names the property that broke.
+export function slotExitTotal(): int { return 31 }
+
+// Elements of the array the child holds live across its own allocation, and of
+// the parent's array held across every collection the measuring loop triggers.
+const KEEP_N: int = 4
+
+// Garbage-allocating iterations in the parent's measuring loop. Each one
+// allocates and each one is a back edge, so under `BIT_GC=stress` each one is a
+// collection ATTEMPT — which is what gives the `no-abandon` marker something to
+// be wrong about. Five hundred rather than a handful so a leaked slot produces
+// hundreds of expiry lines rather than a number that could be luck.
+const CHURN_N: int = 500
+
+// Join deadline. Generous by orders of magnitude: the child runs a fixed few
+// dozen instructions, and nothing in this program sleeps except the join itself.
+const JOIN_NS: int = 10000000000        // 10s
+
+// The child. IT DELIBERATELY DOES NOT CALL `bit_rt_gc_thread_exit`, which is the
+// whole property — releasing the slot is the provider's job now.
+//
+// IT ALSO CONTAINS NO LOOP, deliberately, so that it takes no safepoint and
+// therefore attempts no collection of its own; see the header. `keep` is what
+// makes it a mutator at all: the slice allocation goes through the registration
+// door and claims the slot whose release is under test.
+//
+// Its argument is a two-word region holding the ADDRESSES of the two words it
+// owns — its done word and its result cell — matching `../props`.
+//
+// THE STORE ORDER IS THE CONTRACT: the result is published BEFORE the done word
+// is cleared, so a parent that observes done == 0 also observes the result.
+function exitChild(arg: *byte): *byte {
+  let base = int(arg)
+  let done = i32At(int(*i64At(base)))
+  let cell = i32At(int(*i64At(elemAddr(base, 1))))
+  let seed = int(atomicLoad(cell))
+
+  let keep = []i64(KEEP_N)
+  keep[0] = i64(seed)
+  keep[KEEP_N - 1] = i64(seed + KEEP_N - 1)
+
+  // Unrolled rather than looped, for the reason in the header. Two elements is
+  // all a fixed KEEP_N of four affords, and it is enough: a lost or shifted
+  // allocation fails on the far element.
+  let bad = 0
+  if (int(keep[0]) != seed) { bad = bad + 1 }
+  if (int(keep[KEEP_N - 1]) != seed + KEEP_N - 1) { bad = bad + 1 }
+
+  atomicStore(cell, i32(bad))
+  atomicStore(done, i32(0))
+  return nil
+}
+
+// `entryOf` (§11.10) needs its operand to name a function declaration directly,
+// so the address is taken here, where that function is declared.
+export function exitChildEntry(): *byte {
+  return entryOf(exitChild)
+}
+
+// Run the whole set against one platform's thread provider.
+//
+// The provider arrives as function VALUES rather than imports, which is what lets
+// one copy of these checks run on either platform — the same shape `../gcprops`
+// and `../props` use.
+export function slotExitRun(startFn: (*byte, *byte, *i32) => int,
+                            releaseFn: (int) => bool,
+                            sleepFn: (int) => (),
+                            monoFn: () => int): int {
+  let mask = 0
+
+  // Every atomic word the child touches lives in one of these slices, so one live
+  // local per slice keeps all of them reachable. Holding only raw addresses would
+  // not: a raw pointer is untraced (§11.4), so the collector could reclaim a word
+  // a running child still writes to.
+  let dones = []i32(1)
+  let cells = []i32(1)
+  let region = []i64(2)
+
+  dones[0] = i32(0)
+  // Non-zero, so a child that read the wrong region or wrote the wrong cell
+  // produces a wrong answer rather than a coincidentally right one.
+  cells[0] = i32(101)
+  region[0] = i64(int(ptrOf(dones)))
+  region[1] = i64(int(ptrOf(cells)))
+
+  let donePtr = i32At(int(ptrOf(dones)))
+
+  // ---- E1: the child started ----------------------------------------------
+  let handle = startFn(exitChildEntry(), byteAt(int(ptrOf(region))), donePtr)
+  if (handle != 0) { mask = mask | 1 }
+
+  // ---- E2: it finished inside the deadline ---------------------------------
+  //
+  // A BOUNDED poll, so a child that never finishes fails this rather than
+  // hanging the suite.
+  let joined = threadJoin(donePtr, JOIN_NS, sleepFn, monoFn) == threadJoinDone
+  if (joined) { mask = mask | 2 }
+
+  // ---- E3: the child's own allocation survived ------------------------------
+  if (joined && int(cells[0]) == 0) { mask = mask | 4 }
+
+  // ---- E4: the release succeeded -------------------------------------------
+  //
+  // NOT A FORMALITY ON LINUX. That provider's release now waits for the child's
+  // exit path to publish that it has left the stack, and reports failure rather
+  // than unmapping a stack still in use — so a child whose exit path never runs
+  // fails HERE, before the measuring loop below is even reached.
+  //
+  // It is also the barrier that loop needs; see the header.
+  if (releaseFn(handle)) { mask = mask | 8 }
+
+  // ---- The measuring loop --------------------------------------------------
+  //
+  // The child is gone and this thread is the only live mutator, so under
+  // `BIT_GC=stress` every one of these back edges must stop the world and
+  // collect. Whether any of them failed to is the `no-abandon` marker's
+  // business, not this mask's — see the header.
+  //
+  // `keep` is held live across all of it and re-verified afterwards, so a
+  // collection that loses the parent's roots fails as a wrong value rather than
+  // silently.
+  let keep = []i64(KEEP_N)
+  let s = 0
+  while (s < KEEP_N) {
+    keep[s] = i64(1000 + s)
+    s = s + 1
+  }
+
+  let i = 0
+  while (i < CHURN_N) {
+    let tmp = []i64(8)
+    tmp[0] = i64(i)
+    tmp[7] = i64(i)
+    i = i + 1
+  }
+
+  // ---- E5: the parent's roots survived that loop ---------------------------
+  let parentOk = true
+  let v = 0
+  while (v < KEEP_N) {
+    if (int(keep[v]) != 1000 + v) { parentOk = false }
+    v = v + 1
+  }
+  if (parentOk) { mask = mask | 16 }
+
+  return mask
+}

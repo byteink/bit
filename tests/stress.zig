@@ -256,28 +256,59 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     // A program that cannot reach a safepoint where it matters says so in a
     // `no-collect` file, and says why in its contents. Read here rather than in
     // `runOnce` so a malformed marker fails once per program, not once per run.
-    const no_collect = try readNoCollect(gpa, run_io, name, dir_abs);
+    const no_collect = try readMarker(gpa, run_io, name, dir_abs, "no-collect");
     defer if (no_collect) |m| gpa.free(m);
+
+    // The mirror opt-IN (#1801): a program whose whole point is that no
+    // collection is held up says so in a `no-abandon` file. See
+    // `Oracles.must_not_abandon`.
+    const no_abandon = try readMarker(gpa, run_io, name, dir_abs, "no-abandon");
+    defer if (no_abandon) |m| gpa.free(m);
+
+    const oracles: Oracles = .{
+        .must_collect = no_collect == null,
+        .must_not_abandon = no_abandon != null,
+    };
 
     // ---- Phase 2: exec only. Both compilers' output must satisfy `.expected`
     // identically, under both collector policies.
-    try runBoth(gpa, run_io, name, "seed", seed_bin, expected, no_collect != null, timeout_s);
-    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected, no_collect != null, timeout_s);
+    try runBoth(gpa, run_io, name, "seed", seed_bin, expected, oracles, timeout_s);
+    try runBoth(gpa, run_io, name, "selfhost", self_bin, expected, oracles, timeout_s);
 }
 
-/// The declared-inert marker: `null` when the program must collect, otherwise
-/// its stated reason. An empty marker is an error — a bare file would let a
-/// program opt out of the oracle without anyone having to justify it, which is
-/// the failure mode the marker exists to prevent.
-fn readNoCollect(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: []const u8) !?[]u8 {
-    const marker_path = try std.fmt.allocPrint(gpa, "{s}/no-collect", .{dir_abs});
+/// What the `BIT_GC=stress` pass must be able to say about a program's stderr,
+/// beyond its stdout matching `.expected`. Both are per-directory marker files,
+/// so a program states its own terms and no default has to fit every case.
+const Oracles = struct {
+    /// The collector must have run at least once. The default; opted out of with
+    /// `no-collect`.
+    must_collect: bool,
+    /// Not one collection may be ABANDONED — no rendezvous-expiry line at all.
+    ///
+    /// OPT-IN, NOT DEFAULT, and that asymmetry is the honest one. An abandoned
+    /// rendezvous is always SAFE (the heap just grows to the next trigger), and
+    /// several programs in this corpus abandon collections for reasons that are
+    /// documented limitations rather than defects — a thread asleep in
+    /// `parkSleepNs` reads as `running` (ABI.md §5, #1562), so a program that
+    /// sleeps while another thread allocates cannot promise zero. Only a program
+    /// built so that the ONLY possible cause is the defect it guards can carry
+    /// this, which is exactly what `gcslotexit*` is.
+    must_not_abandon: bool,
+};
+
+/// One of the per-directory oracle markers: `null` when absent, otherwise the
+/// stated reason. An empty marker is an error — a bare file would let a program
+/// change the oracle without anyone having to justify it, which is the failure
+/// mode the markers exist to prevent.
+fn readMarker(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_abs: []const u8, marker: []const u8) !?[]u8 {
+    const marker_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_abs, marker });
     defer gpa.free(marker_path);
 
     const body = Dir.cwd().readFileAlloc(run_io, marker_path, gpa, .limited(4 << 10)) catch return null;
     errdefer gpa.free(body);
     if (std.mem.trim(u8, body, " \t\r\n").len == 0) {
-        std.debug.print("stress '{s}': 'no-collect' marker is empty — state why the collector cannot run\n", .{name});
-        return error.StressEmptyNoCollectMarker;
+        std.debug.print("stress '{s}': '{s}' marker is empty — state why it applies\n", .{ name, marker });
+        return error.StressEmptyMarker;
     }
     return body;
 }
@@ -319,20 +350,24 @@ fn buildWithSelfhost(gpa: std.mem.Allocator, run_io: Io, name: []const u8, dir_a
 
 /// Both collector policies for one compiler's binary. The stress pass also
 /// carries `BIT_GC_STATS=1` so the run can prove the collector actually ran.
-fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, no_collect: bool, timeout_s: u32) !void {
-    try runOnce(gpa, run_io, name, who, bin_path, expected, null, no_collect, timeout_s);
+fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8, bin_path: [:0]const u8, expected: []const u8, oracles: Oracles, timeout_s: u32) !void {
+    try runOnce(gpa, run_io, name, who, bin_path, expected, null, oracles, timeout_s);
 
     var stress_env = std.process.Environ.Map.init(gpa);
     defer stress_env.deinit();
     try stress_env.put("BIT_GC", "stress");
     try stress_env.put("BIT_GC_STATS", "1");
-    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env, no_collect, timeout_s);
+    try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env, oracles, timeout_s);
 }
 
 /// The prefix `gc.zig` writes per collection under `BIT_GC_STATS`. Counting
 /// these is what makes the stress pass an oracle rather than a second default
 /// run — see the header.
 const collection_line = "[bit-gc] collection ";
+
+/// The prefix `gc.zig` writes when a stop-the-world rendezvous expires and the
+/// collection is given up. See `Oracles.must_not_abandon`.
+const abandoned_line = "[bit-gc] stop-the-world rendezvous expired";
 
 fn runOnce(
     gpa: std.mem.Allocator,
@@ -342,7 +377,7 @@ fn runOnce(
     bin_path: [:0]const u8,
     expected: []const u8,
     env: ?*const std.process.Environ.Map,
-    no_collect: bool,
+    oracles: Oracles,
     timeout_s: u32,
 ) !void {
     const stress = env != null;
@@ -382,13 +417,13 @@ fn runOnce(
         std.debug.print("stress '{s}' [{s}]: output mismatch\n  expected: {s}\n  got:      {s}\n", .{ name, mode, expected, result.stdout });
         return error.StressOutputMismatch;
     }
-    if (!stress or no_collect) return;
+    if (!stress) return;
 
     // The oracle check. A zero count means every root this program cares about
     // was re-proven live exactly never, so the run above says nothing at all
     // about rooting — regardless of how much it allocated.
     const collections = std.mem.count(u8, result.stderr, collection_line);
-    if (collections == 0) {
+    if (oracles.must_collect and collections == 0) {
         std.debug.print(
             "stress '{s}' [{s}]: the collector never ran, so this run verified nothing about rooting.\n" ++
                 "  Give the program a loop where the roots it cares about are live, or — if it is\n" ++
@@ -397,5 +432,21 @@ fn runOnce(
             .{ name, mode },
         );
         return error.StressCollectorInert;
+    }
+
+    // The opt-in mirror (#1801). Only checked where the program was built to make
+    // the defect the sole possible cause — see `Oracles.must_not_abandon`.
+    if (oracles.must_not_abandon) {
+        const abandoned = std.mem.count(u8, result.stderr, abandoned_line);
+        if (abandoned != 0) {
+            std.debug.print(
+                "stress '{s}' [{s}]: {d} collections were ABANDONED against {d} collected, and\n" ++
+                    "  this program's 'no-abandon' marker says none may be. Something stayed in\n" ++
+                    "  the mutator registry as 'running' that should not have — the usual cause is\n" ++
+                    "  an OS thread that exited without its slot being released (ABI.md §6).\n",
+                .{ name, mode, abandoned, collections },
+            );
+            return error.StressCollectionAbandoned;
+        }
     }
 }

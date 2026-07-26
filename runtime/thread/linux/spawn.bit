@@ -60,6 +60,98 @@ function pageSize(): int { return 4096 }
 // provider is a leaf.
 function runningSentinel(): int { return 1 }
 
+// ---- the child's exit path (#1801) ---------------------------------------
+//
+// `bit_rt_gc_thread_exit` releases this OS thread's mutator slot (ABI.md §6). A
+// child that ALLOCATES claims one lazily (#1431), and a leaked slot stays
+// `running` forever — which corrupts nothing but makes every later rendezvous
+// expire, i.e. collection quietly stops. Measured on native x86_64 linux: 247 of
+// `tests/stress/gcthreadslinux`'s 292 abandoned collections were blocked on an
+// exited child's slot.
+//
+// THE OBLIGATION BELONGS HERE, NOT IN THE CHILD BODY. ABI.md §6 used to ask
+// "user code that starts a raw OS thread" to make this call itself, which is a
+// rule every future caller has to remember and whose penalty for forgetting is
+// silent: collection stops, nothing fails. This provider owns the child's whole
+// exit path — the `asm` below is the only code that runs after the body returns
+// — so it is the one place that can discharge it unconditionally.
+//
+// Declared and called directly rather than imported from `../../gc`: the live
+// registry in a normally linked program is `root.zig`'s, not the Bit module's,
+// whose `worldAddr` is bound only by `runtime/root`'s own boot. The symbol IS in
+// the linked archive (E0078 admits it, #1444) — the same call and the same
+// reason as tests/stress/chan/race/race.bit's.
+extern function bit_rt_gc_thread_exit()
+
+// The child's epilogue: the last Bit code an OS thread started here ever runs.
+//
+// Reached by an indirect `call`/`blr` from `cloneChild`'s child path, through the
+// word `threadStart` parked at the top of the child's own stack — see
+// `exitCellBytes`. It takes no arguments and returns normally; the `asm` clears
+// the on-stack flag and issues `SYS_exit` immediately afterwards.
+//
+// NOT `@nosplit`, because that attribute forbids the `extern` call this exists
+// to make. It contains no loop and allocates nothing, so codegen emits no
+// safepoint in it — which matters: a poll here would re-claim through the lazy
+// registration door the release just closed and leak the slot again.
+function threadEpilogue() {
+  bit_rt_gc_thread_exit()
+}
+
+// Bytes taken off the top of the child's usable stack for the two words the
+// child's exit path needs. Sixteen, which is also the alignment both ABIs
+// require at a function entry, so the child's initial stack pointer stays
+// conforming.
+//
+// The cell sits ABOVE that stack pointer, so every frame the body pushes —
+// starting with the return address `call`/`blr` writes — lands below it and
+// neither word can be overwritten while the body runs.
+//
+//   [childSp + 0]  `threadEpilogue`'s entry address, written before the clone.
+//   [childSp + 8]  the ON-STACK FLAG, `threadRelease`'s gate. See `stillOnStack`.
+function exitCellBytes(): int { return 16 }
+
+function onStackFlagOffset(): int { return 8 }
+
+// A `*i32` for a raw address. The flag is 32-bit rather than a full word so it
+// can be read with `atomicLoad`, whose operand is a typed pointer — a plain load
+// in `threadRelease`'s poll would be a load the optimiser may hoist out of the
+// loop, i.e. a spin on a value that can never change.
+function i32Ptr(addr: int): *i32 {
+  let z: *i32 = nil
+  return z + (addr / 4)
+}
+
+// Whether the child may still touch its own stack mapping.
+//
+// WHY THIS WORD EXISTS AT ALL, and why `done` cannot serve. `threadRelease`
+// unmaps the child's stack, so it must not run while the child is still standing
+// on it. Its previous licence to do so was that `done` is the CLONE_CHILD_CLEARTID
+// word, cleared by the kernel during teardown — after the child has left user
+// space. But a child BODY may also clear `done` itself (the Darwin half of the
+// contract requires it, so bodies shared between platforms do it unconditionally),
+// and then the signal is indistinguishable from the kernel's while the child is
+// still running. Before #1801 the child had two register-only instructions left
+// at that point and survived being unmapped; it now has a whole call to make, so
+// the window had to be closed rather than narrowed.
+//
+// The flag is armed before the clone and cleared by the `asm` AFTER the epilogue
+// returns, as the child's LAST memory access of any kind — everything past it is
+// `SYS_exit` in registers. So a zero here means the mapping is provably idle,
+// whoever cleared `done` and whenever.
+function stillOnStack(childSp: int): bool {
+  return int(atomicLoad(i32Ptr(childSp + onStackFlagOffset()))) != 0
+}
+
+// Iterations `threadRelease` waits for the flag to clear.
+//
+// This is not a timeout on the child's WORK: it is only ever reached after the
+// child's body has returned, so what it waits for is the epilogue's handful of
+// atomic operations plus one store. Sized far above that, and bounded rather than
+// unbounded because a Power-of-10 loop must be — expiry means refusing to unmap
+// rather than unmapping unsafely, which costs address space and nothing else.
+function onStackSpinBound(): int { return 1000000 }
+
 // ../thread.bit's `threadStackBytes` (16MiB — Zig's `default_stack_size`, which
 // is what `sched.zig`'s `std.Thread.spawn(.{}, ...)` takes by default).
 // Duplicated for the same leaf reason; tests/stress/thread/props pins the two
@@ -199,33 +291,55 @@ function mapStack(usable: int): int {
 // terminates any stack walk cleanly at the thread's base rather than letting a
 // walker follow an inherited pointer into the parent's stack.
 //
+// AFTER THE BODY RETURNS THE CHILD CALLS ONE MORE THING (#1801), and it reaches
+// it through MEMORY rather than a register: `[stackTop]` holds the epilogue
+// address `threadStart` parked there. A register would not do — the clone copies
+// the parent's registers into the child, but the body is an ordinary C-ABI
+// callee, so only the callee-saved ones survive it, and naming one of those here
+// would evict it from the enclosing function for the whole call. The word above
+// the child's own stack pointer is untouched by every frame the body pushes, so
+// it survives by construction. See `epilogueCell`.
+//
 // Returns the child's tid (> 0) in the parent, or a negative errno.
 function cloneChild(flags: int, stackTop: int, ctid: *i32,
                     entry: *byte, arg: *byte, tls: int): int {
   return asm {
     // arm64, one 32-bit word per instruction:
     //   svc  #0            issue clone
-    //   cbnz x0, +7        parent (x0 = child tid) -> skip the 6 child words
+    //   cbnz x0, +11       parent (x0 = child tid) -> skip the 10 child words
     //   mov  x29, #0       child: terminate the frame-pointer chain
     //   mov  x0, x6        child: arg -> first C argument
     //   blr  x5            child: enter the body
+    //   ldr  x9, [sp]      child: the epilogue address `threadStart` parked there
+    //   blr  x9            child: release this thread's mutator slot
+    //   add  x9, sp, #8    child: the on-stack flag's address
+    //   stlr wzr, [x9]     child: LAST memory access — the stack is now idle
     //   mov  x8, #93       child: SYS_exit
     //   mov  x0, #0        child: status 0
     //   svc  #0            child: never returns
-    arm64 { 0xD4000001, 0xB50000E0, 0xD280001D, 0xAA0603E0, 0xD63F00A0,
+    //
+    // `stlr` rather than a plain `str` so the release above cannot be reordered
+    // after the publication of it; x86-64's store is already ordered against the
+    // stores before it, which is why its arm needs no counterpart.
+    arm64 { 0xD4000001, 0xB5000160, 0xD280001D, 0xAA0603E0, 0xD63F00A0,
+            0xF94003E9, 0xD63F0120, 0x910023E9, 0x889FFD3F,
             0xD2800BA8, 0xD2800000, 0xD4000001 }
     // x64, one byte per element:
     //   0F 05              syscall
     //   48 85 C0           test rax, rax
-    //   75 11              jnz +17 (parent -> skip the 17 child bytes)
+    //   75 1C              jnz +28 (parent -> skip the 28 child bytes)
     //   31 ED              xor ebp, ebp
     //   4C 89 EF           mov rdi, r13     (arg -> first C argument)
     //   41 FF D4           call r12         (enter the body)
+    //   FF 14 24           call [rsp]       (release this thread's mutator slot)
+    //   C7 44 24 08 ...    mov dword [rsp+8], 0   (LAST memory access)
     //   B8 3C 00 00 00     mov eax, 60      (SYS_exit)
     //   31 FF              xor edi, edi
     //   0F 05              syscall
-    x64 { 0x0F, 0x05, 0x48, 0x85, 0xC0, 0x75, 0x11,
+    x64 { 0x0F, 0x05, 0x48, 0x85, 0xC0, 0x75, 0x1C,
           0x31, 0xED, 0x4C, 0x89, 0xEF, 0x41, 0xFF, 0xD4,
+          0xFF, 0x14, 0x24,
+          0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00,
           0xB8, 0x3C, 0x00, 0x00, 0x00, 0x31, 0xFF, 0x0F, 0x05 }
     result arm64 x0 x64 rax : int
     input arm64 x8 x64 rax = nrClone()
@@ -260,6 +374,12 @@ function cloneChild(flags: int, stackTop: int, ctid: *i32,
 // The handle is the stack mapping's base address. That is what actually has to
 // be released on this platform, and the caller never needs the tid — see
 // ../thread.bit on why the handle is opaque.
+//
+// THE TWO EXIT SIGNALS ARE ORDERED, and in the direction a joiner needs: the
+// child runs `threadEpilogue` — releasing its mutator slot — while still in user
+// space, and the kernel clears `done` afterwards, during teardown. So a caller
+// that observes `done == 0` also observes a released slot, and the collection it
+// runs next cannot be held up by the child that just finished (#1801).
 export @symbol("bit_rt_port_thread_start") function threadStart(entry: *byte, arg: *byte, done: *i32): int {
   // Refuse before mapping anything if this image's TLS geometry cannot be read.
   // A thread without a correct TLS block is not a degraded thread, it is a
@@ -274,11 +394,11 @@ export @symbol("bit_rt_port_thread_start") function threadStart(entry: *byte, ar
   if (base == 0) {
     return 0
   }
-  // The top of the STACK, which is where the child's stack pointer starts and
-  // grows DOWN from. Page-aligned by construction, so it satisfies both ABIs'
-  // 16-byte alignment requirement at a function entry. The TLS area occupies
-  // `[top, top + tlsBytes)` — above the stack, which grows away from it, so the
-  // two can never collide.
+  // The top of the STACK, which is what the child's stack grows DOWN from.
+  // Page-aligned by construction, so it — and `childSp` below, a multiple of 16
+  // beneath it — satisfies both ABIs' 16-byte alignment requirement at a function
+  // entry. The TLS area occupies `[top, top + tlsBytes)` — above the stack, which
+  // grows away from it, so the two can never collide.
   let top = base + pageSize() + stackBytes()
 
   // Build this child's TLS block before the clone: it must be complete the
@@ -290,13 +410,22 @@ export @symbol("bit_rt_port_thread_start") function threadStart(entry: *byte, ar
     return 0
   }
 
+  // The child's initial stack pointer, one cell below the top of the usable
+  // stack — and the cell that opens up carries the two words its exit path needs
+  // (#1801): how to reach `threadEpilogue`, and the flag that says it is still
+  // standing here. Both are written BEFORE the clone, because the child can run
+  // to completion before `clone` has even returned in this frame.
+  let childSp = top - exitCellBytes()
+  storeWord(childSp, int(entryOf(threadEpilogue)))
+  atomicStore(i32Ptr(childSp + onStackFlagOffset()), i32(1))
+
   // Armed BEFORE the clone, not after: the child can exit and the kernel can
   // clear this word before `clone` has even returned in the parent. Arming it
   // afterwards would overwrite the kernel's 0 with 1 and strand every joiner
   // until its deadline.
   atomicStore(done, i32(runningSentinel()))
 
-  let tid = cloneChild(cloneThreadFlags(), top, done, entry, arg, tp)
+  let tid = cloneChild(cloneThreadFlags(), childSp, done, entry, arg, tp)
   if (tid <= 0) {
     // No thread exists, so nothing will ever clear `done`. Disarm it so a
     // caller that joins anyway gets `threadJoinDone` immediately instead of
@@ -309,10 +438,14 @@ export @symbol("bit_rt_port_thread_start") function threadStart(entry: *byte, ar
 }
 
 // Release a finished thread's resources. Call only after `threadJoin` has
-// reported `threadJoinDone` — on this platform that word is cleared by the
-// kernel during teardown, after the child has left user space, so the stack is
-// provably idle and unmapping it cannot pull the ground from under a running
-// thread.
+// reported `threadJoinDone`.
+//
+// IT NO LONGER TAKES `done` AT ITS WORD (#1801). Unmapping the child's stack is
+// safe only once the child has stopped standing on it, and `done` does not prove
+// that — a child body may clear it itself, and one written against the Darwin
+// half of the contract does. So this gates on the provider's own on-stack flag,
+// which only the child's exit path clears and only as its final memory access.
+// See `stillOnStack`.
 export @symbol("bit_rt_port_thread_release") function threadRelease(handle: int): bool {
   if (handle <= 0) {
     return false
@@ -325,6 +458,17 @@ export @symbol("bit_rt_port_thread_release") function threadRelease(handle: int)
   let total = reservationBytes()
   if (total == tlsUnavailable) {
     return false
+  }
+  let childSp = handle + pageSize() + stackBytes() - exitCellBytes()
+  let spins = 0
+  while (stillOnStack(childSp)) {
+    if (spins >= onStackSpinBound()) {
+      // The child is still on this stack, so unmapping it would be a
+      // use-after-free. Leaking the reservation is the only safe answer, and it
+      // is reported as a failed release rather than hidden.
+      return false
+    }
+    spins = spins + 1
   }
   return int(syscall(nrMunmap(), i64(handle), i64(total))) == 0
 }
