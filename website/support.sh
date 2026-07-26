@@ -18,9 +18,22 @@ out=${BIT_SUPPORT_OUT:-$root/website/public/support.html}
 
 die() { echo "support.sh: $1" >&2; exit 1; }
 
-# Markdown table rows under the "## Support matrix" heading only. Anchoring to
-# the heading (and stopping at the next one) keeps any other table in the doc
-# from bleeding into the matrix.
+# REPO is spliced into the API request path and into href attributes, so it is a
+# value crossing a trust boundary: validate it here rather than escaping it at
+# four call sites. Rejecting anything outside owner/name also stops a value
+# carrying '?' or extra path segments from reshaping the request and slipping
+# past the server-side state=published filter.
+echo "$REPO" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' ||
+	die "BIT_REPO must be owner/name, got '$REPO'"
+
+# Markdown table rows under the "## Support matrix" heading only: the section
+# opens at that heading and closes at the next heading of ANY level, so neither a
+# subheading's table nor a later section's table can bleed into the matrix.
+#
+# The column count comes from the header row rather than a hardcoded 5. A row
+# that disagrees with the header is a hard error, not a silently truncated or
+# dropped row — the page's whole job is to list every row of the matrix, so
+# quietly publishing a subset is worse than failing the build.
 matrix_rows() {
 	awk '
 		function esc(s) {
@@ -29,20 +42,40 @@ matrix_rows() {
 			return s
 		}
 		function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+		# A GFM delimiter row is all dashes and optional alignment colons —
+		# |---|, |:-:|, and |-|-| are all legal and none of them are data.
+		function is_delim(nc, c,   i, t) {
+			for (i = 1; i <= nc; i++) {
+				t = trim(c[i])
+				if (t !~ /^:?-+:?$/) return 0
+			}
+			return 1
+		}
 		/^##[ \t]+Support matrix/ { insec = 1; next }
-		insec && /^##[ \t]/ { insec = 0 }
+		insec && /^#+[ \t]/ { insec = 0 }
 		insec && /^[ \t]*\|/ {
 			line = trim($0)
-			if (line ~ /^\|[ \t]*:?-{2,}/) next          # separator row
 			sub(/^\|/, "", line); sub(/\|$/, "", line)
 			n = split(line, cell, /\|/)
-			if (n < 5) next                              # not a matrix row
-			if (++seen == 1) { kind = "th" } else { kind = "td" }
+			if (is_delim(n, cell)) next
+			if (++seen == 1) { cols = n; kind = "th" } else { kind = "td" }
+			if (n != cols) {
+				printf "matrix row %d has %d cells, header has %d\n", NR, n, cols \
+					> "/dev/stderr"
+				exit 4
+			}
 			printf "        <tr>"
-			for (i = 1; i <= 5; i++) printf "<%s>%s</%s>", kind, esc(trim(cell[i])), kind
+			for (i = 1; i <= cols; i++) printf "<%s>%s</%s>", kind, esc(trim(cell[i])), kind
 			printf "</tr>\n"
 		}
-		END { if (seen < 2) exit 3 }
+		END {
+			if (seen < 1) exit 3
+			# A header with no releases under it is the state SUPPORT.md declares
+			# correct until v1.0 ships ("the matrix below is empty by design"), so
+			# it has to render rather than fail the build.
+			if (seen == 1)
+				printf "        <tr><td colspan=\"%d\">No release is under this policy yet.</td></tr>\n", cols
+		}
 	' "$src"
 }
 
@@ -50,10 +83,16 @@ matrix_rows() {
 # server-side so a draft is never sent to us, and again in jq so a future API
 # change cannot turn an embargoed draft into a published-looking row here.
 #
-# A 404 is an empty feed, not a failure: the endpoint 404s while the repo has no
-# advisories surface, and a *published* advisory is public by definition, so
-# there is nothing being hidden from us. Any other failure is a real outage and
-# must not be rendered as an all-clear.
+# A 404 is an empty feed ONLY once the repo itself is confirmed reachable. GitHub
+# answers 404 — not 403 — for a repo the token cannot see, and also for a renamed
+# or mistyped one, so "404" on its own cannot distinguish "this repo has no
+# advisory surface" from "we never reached the right repo". Publishing the
+# definitive "no advisories" for the second case is a false all-clear on a
+# security page. Everything else falls through to the "unavailable" banner,
+# including a --paginate run that failed partway: if the body holds a non-empty
+# array then some pages arrived and others did not, and a partial feed must not
+# be presented as the whole one. (The body is not simply tested for emptiness —
+# gh writes the API error object to stdout, so a plain 404 leaves a body too.)
 advisories_json() {
 	if [ -n "${BIT_ADVISORIES_JSON:-}" ]; then
 		cat "$BIT_ADVISORIES_JSON"
@@ -68,7 +107,9 @@ advisories_json() {
 		>"$body" 2>"$err" || rc=$?
 	if [ "$rc" -eq 0 ]; then
 		cat "$body"
-	elif grep -q 'HTTP 404' "$err"; then
+	elif grep -q '(HTTP 404)$' "$err" &&
+		! jq -e 'type == "array" and length > 0' "$body" >/dev/null 2>&1 &&
+		gh api "/repos/$REPO" >/dev/null 2>&1; then
 		echo '[]'
 		rc=0
 	fi
@@ -160,15 +201,27 @@ self_check() {
 ## Support matrix
 
 | version | released | full-support-end | EOL | status |
-|---|---|---|---|---|
+|:-:|:-:|:-:|:-:|:-:|
 | 1.0 | 2026-10-01 | 2027-10-01 | 2031-10-01 | full support |
 | 0.9 <script> | 2026-01-01 | 2026-10-01 | 2026-10-01 | EOL |
+
+### Deprecated lines
+
+| subsec | must | not | bleed | either |
+|-|-|-|-|-|
 
 ## After
 
 | bleed | must | not | happen | here |
 |---|---|---|---|---|
 MD
+
+	# Same doc with the release rows removed — the state SUPPORT.md calls correct
+	# until v1.0 ships. Must render, not fail the build.
+	grep -v '^| \(1\.0\|0\.9\) ' "$tmp/SUPPORT.md" >"$tmp/empty.md"
+
+	# A row that disagrees with the header must fail loudly, not lose a cell.
+	sed 's/^| 1\.0 .*/| 1.0 | 2026-10-01 | 2027-10-01 |/' "$tmp/SUPPORT.md" >"$tmp/ragged.md"
 
 	cat >"$tmp/adv.json" <<'JSON'
 [
@@ -204,15 +257,44 @@ JSON
 	assert "matrix header row" -- '<th>full-support-end</th>'
 	assert "matrix row 1.0" -- '<td>1\.0</td>'
 	assert "matrix cell HTML-escaped" -- '<td>0\.9 &lt;script&gt;</td>'
-	refute "table from another section bled in" -- '<td>bleed</td>'
+	refute "table from a later h2 bled in" -- '<td>bleed</td>'
+	refute "table under an h3 subheading bled in" -- '<td>subsec</td>'
 	refute "cadence table bled in" -- '<td>matrix</td>'
-	refute "separator row emitted" -- '<td>---</td>'
+	refute "alignment delimiter row emitted" -- '<td>:-:</td>'
 
 	# Newest advisory must come first.
 	if [ "$(grep -n 'GHSA-new' "$tmp/out.html" | cut -d: -f1 | head -1)" -gt \
 	     "$(grep -n 'GHSA-old' "$tmp/out.html" | cut -d: -f1 | head -1)" ]; then
 		echo "FAIL: advisory feed not newest-first" >&2; fail=1
 	fi
+
+	# A header-only matrix renders an empty state instead of failing the build.
+	if BIT_SUPPORT_MD=$tmp/empty.md BIT_SUPPORT_OUT=$tmp/empty.html \
+		BIT_ADVISORIES_JSON=$tmp/adv.json "$0" >/dev/null 2>&1; then
+		grep -q 'No release is under this policy yet' "$tmp/empty.html" ||
+			{ echo "FAIL: header-only matrix lost its empty state" >&2; fail=1; }
+		grep -q '<th>status</th>' "$tmp/empty.html" ||
+			{ echo "FAIL: header-only matrix lost its header" >&2; fail=1; }
+	else
+		echo "FAIL: header-only matrix failed the build" >&2; fail=1
+	fi
+
+	# A ragged row is a hard error, never a silently shortened page.
+	if BIT_SUPPORT_MD=$tmp/ragged.md BIT_SUPPORT_OUT=$tmp/ragged.html \
+		BIT_ADVISORIES_JSON=$tmp/adv.json "$0" >/dev/null 2>&1; then
+		echo "FAIL: ragged matrix row accepted" >&2; fail=1
+	fi
+	[ ! -f "$tmp/ragged.html" ] ||
+		{ echo "FAIL: ragged matrix still wrote a page" >&2; fail=1; }
+
+	# REPO crosses a trust boundary into an href and the API path.
+	for bad in 'byteink/bit" onmouseover="alert(1)' 'byteink/bit?x=1' \
+		'byteink/bit/extra' 'byteink' '../../etc'; do
+		if BIT_REPO=$bad BIT_SUPPORT_MD=$tmp/SUPPORT.md BIT_SUPPORT_OUT=$tmp/bad.html \
+			BIT_ADVISORIES_JSON=$tmp/adv.json "$0" >/dev/null 2>&1; then
+			echo "FAIL: BIT_REPO '$bad' accepted" >&2; fail=1
+		fi
+	done
 
 	[ "$fail" -eq 0 ] || die "self-check failed"
 	echo "support.sh: self-check passed"
@@ -227,7 +309,14 @@ esac
 [ -f "$src" ] || die "missing $src"
 command -v jq >/dev/null || die "jq not found"
 
-rows=$(matrix_rows) || die "no support matrix found in $src"
+rc=0
+rows=$(matrix_rows) || rc=$?
+case $rc in
+0) ;;
+3) die "no support matrix table found under '## Support matrix' in $src" ;;
+4) die "support matrix in $src has a row whose cell count differs from the header" ;;
+*) die "reading the support matrix from $src failed (awk exit $rc)" ;;
+esac
 
 note=""
 if json=$(advisories_json) && [ -n "$json" ]; then

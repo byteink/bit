@@ -6,10 +6,17 @@ repo root `CLAUDE.md` (`website/   static site → k3s byteink namespace`).
 ```
 website/
   support.sh          generator for the Support/Security page
+  deploy.sh           regenerate + push to the byteink k3s cluster
+  deploy/
+    bit-lang.yaml     Deployment + Service + Traefik IngressRoute
   public/             served as-is; no build step, no npm, no framework
     support.html      generated — do not hand-edit
     support.css
 ```
+
+`support.sh` reads `../docs/release/SUPPORT.md` by relative path, so it assumes
+this directory sits beside `docs/` in the same checkout. That one line is what
+would need changing if the site is ever split into its own repo.
 
 ## Support/Security page
 
@@ -17,8 +24,11 @@ website/
 
 - The **support matrix** — every row of the table under `## Support matrix` in
   `docs/release/SUPPORT.md` (version, released, full-support-end, EOL, status),
-  copied verbatim. The generator anchors to that heading and stops at the next
-  one, so other tables in the doc cannot bleed into the matrix.
+  copied verbatim. The section opens at that heading and closes at the next
+  heading of any level, so neither a subheading's table nor a later section's
+  table bleeds into the matrix. Column count comes from the header row: a row
+  that disagrees with it fails the build rather than losing a cell, and a matrix
+  with no release rows yet renders an empty state rather than failing.
 - The **security advisory feed** — published advisories from
   `GET /repos/byteink/bit/security-advisories`, newest first.
 
@@ -57,26 +67,58 @@ at `sh website/support.sh` if the monthly step starts getting missed.
 
 ### Advisory safety
 
-A draft or embargoed advisory must never reach this page. Three guards:
+A draft or embargoed advisory must never reach this page. Four guards:
 
 - The API is queried with `state=published`, so a draft is never sent.
 - jq filters `select(.state == "published")` again on what came back, so an API
   change cannot turn a draft into a published-looking row.
 - Every API-derived field is HTML-escaped (`@html`) before it lands in the page.
+- `BIT_REPO` is validated as `owner/name` before use. It is spliced into both the
+  request path and `href` attributes, so a value carrying `?` or extra segments
+  could otherwise reshape the request and get past the server-side filter,
+  leaving the jq filter as the only thing standing between a draft and the page.
 
-A fetch failure renders "Advisory feed unavailable at build time" plus a link
-to GitHub — never "no advisories", which would read as an all-clear the page
-has not earned. An HTTP 404 is the one exception and is treated as an empty
-feed: the endpoint 404s while the repo has no advisory surface, and a
-*published* advisory is public by definition, so nothing is being hidden.
-`--self-check` asserts all of this against fixtures, including that a draft
-advisory in the feed is dropped and that a `<script>` in a summary is escaped.
+### Never a false all-clear
+
+"No published security advisories." is a definitive claim, so the generator only
+makes it when it actually reached the right repo's advisories endpoint:
+
+- Fetch succeeded, feed empty → renders "No published security advisories."
+- **404, and `/repos/<owner>/<name>` itself resolves** → same. The endpoint 404s
+  while a repo has no advisory surface, and having confirmed access to the repo,
+  there is no published advisory being hidden from us. This is the current state
+  of `byteink/bit`.
+- 404 with the repo *not* resolving → "unavailable" + a link to GitHub. GitHub
+  answers 404, not 403, for a repo the token cannot see, so a mistyped
+  `BIT_REPO`, a rename, or an under-scoped `gh` lands here instead of publishing
+  a false all-clear.
+- Any other failure, including a `--paginate` run that died partway with pages
+  already in hand → "unavailable". A partial feed is never shown as the whole one.
+
+`--self-check` covers the parsing and escaping paths against fixtures with no
+network: a draft advisory is dropped, a `<script>` in a summary is escaped, an
+alignment delimiter row is not mistaken for data, tables under a sibling h2 or a
+child h3 stay out of the matrix, a ragged row fails the build, a header-only
+matrix renders, and every malformed `BIT_REPO` is rejected.
 
 ## Deployment
 
-Not yet deployed: `bit-lang.byteink.com` has no DNS record and no k3s
-IngressRoute as of 2026-07-26, and `byteink/bit` is still private (hence the
-empty advisory feed — there are no published advisories to list). Serving
-`public/` behind an IngressRoute in the `byteink` namespace is the remaining
-step and belongs to whoever owns that cluster config; nothing in this
-directory needs to change for it.
+`website/deploy.sh` regenerates the page, pushes `public/` as the
+`bit-lang-site` ConfigMap, applies `deploy/bit-lang.yaml` (nginx Deployment +
+Service + Traefik IngressRoute for `bit-lang.byteink.com`, `websecure`
+entrypoint, `letsencrypt` cert resolver, namespace `byteink`), and restarts the
+Deployment so the new bytes are actually served.
+
+```sh
+sh website/deploy.sh    # needs kubectl and the `byteink` context
+```
+
+Two things are outside this repo and both are needed before the page is live:
+
+1. **A DNS record** for `bit-lang.byteink.com` pointing at the cluster. None
+   exists as of 2026-07-26.
+2. **The decision to publish.** Nothing about Bit is public yet, so this has not
+   been run.
+
+`byteink/bit` is also still private, which is why the advisory feed renders
+empty — there are no published advisories to list.
