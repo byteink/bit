@@ -5,7 +5,7 @@ them. This doc governs the three surfaces from `docs/release/VERSIONING.md`'s
 numbered surface list (§1 language, §2 CLI, §3 stdlib) that can lose members
 on a MINOR bump pre-1.0 and require a MAJOR bump post-1.0: **language
 features**, **CLI flags**, and **stdlib API**. (Runtime
-ABI removals are covered by `runtime/ABI.md` directly — the ABI has no
+ABI removals are covered by `runtime/ABI.md` directly - the ABI has no
 "deprecated but still linkable" state, an old binary either links or it
 doesn't.)
 
@@ -19,12 +19,12 @@ SUPPORT.md's LTS line numbering:
 > If an item is marked deprecated no later than LTS line N's GA, it is
 > removable no earlier than LTS line N+1's GA.
 
-The floor is LTS line N's GA, not merely "sometime during N" — a deprecation
+The floor is LTS line N's GA, not merely "sometime during N" - a deprecation
 that lands mid-cycle, after N has already shipped, does not satisfy the rule
 for N; it must wait for N+1 as its baseline instead. This guarantees anyone
 who adopts LTS line N at GA sees the deprecation warning for that LTS line's
 entire support life (full-support + security-only, 12–60 months per
-SUPPORT.md) before upgrading past the release that removes the item — they
+SUPPORT.md) before upgrading past the release that removes the item - they
 are never forced to jump two LTS lines in one upgrade to avoid a silent
 break. Deprecating and removing within the same LTS line, or between an LTS
 line and the next interim release, is not sufficient; the clock only counts
@@ -34,19 +34,19 @@ Pre-1.0, there is no LTS line yet (`docs/release/SUPPORT.md`'s pre-1.0
 phasing note), so this rule has no floor to enforce until #366 (v1.0) ships
 and the first LTS line is designated. Before that point, 0.x deprecations
 still carry the compiler warning below as a courtesy, but removal timing is
-unconstrained — consistent with 0.x's "MINOR may break" rule in
+unconstrained - consistent with 0.x's "MINOR may break" rule in
 `VERSIONING.md`.
 
 ## Compiler deprecation diagnostic
 
-**`E09xx` is reserved for deprecation warnings** — the next free band after
+**`E09xx` is reserved for deprecation warnings** - the next free band after
 checker errors (`E0000`–`E0081`) and lint (`E0200`–`E0299`, per
 `spec/LINT.md` §3). Individual codes are allocated from `E0900` upward as
 deprecations are added, following the lint registry's never-renumber rule:
 once assigned, a code is never reused, even after the deprecated item is
 removed and the warning retired.
 
-A deprecation diagnostic is a **warning**, not an error — it does not fail
+A deprecation diagnostic is a **warning**, not an error - it does not fail
 `bit build`, only `bit lint` treats warnings as build-failing (per
 `spec/LINT.md` §1), and deprecation is emitted by `bit check`. It must name,
 in this order:
@@ -55,7 +55,7 @@ in this order:
    --legacy-layout`, or the language construct itself)
 2. the version it was deprecated in
 3. the version it will be removed in (the earliest LTS line per the rule
-   above — a concrete version once that line is designated, or "no earlier
+   above - a concrete version once that line is designated, or "no earlier
    than the next LTS line" pre-designation)
 4. the replacement, if one exists (omit this clause only when there is
    truly no replacement, e.g. a feature removed outright for a security

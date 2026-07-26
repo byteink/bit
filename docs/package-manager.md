@@ -29,19 +29,19 @@ dependency_entry = STRING_LIT ':' STRING_LIT .   (* name : "gitHost/owner/repo@r
 
 Each value is `gitHost/owner/repo@ref`, and `ref` is exactly one of:
 
-- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) — the only form Minimal
+- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) - the only form Minimal
   Version Selection (below) treats as an ordered version;
 - a branch name (e.g. `main`), resolved to that branch's current tip; or
 - a bare 40-character commit SHA, resolved to exactly that commit.
 
 **No range operators.** `^`, `~`, `>=`, `<`, `x`, and every other range or
-wildcard spelling are rejected at parse time — a dependency names one exact
+wildcard spelling are rejected at parse time - a dependency names one exact
 ref, never a range for a resolver to pick from.
 
 `bit.json` is JSONC (comments and trailing commas allowed); `bit add`/`bit
 up`/`bit remove` rewrite only the one entry that changed, through a
 comment-preserving edit layer, never a blind parse-and-reserialize. They add
-*to* an existing project — a bare `{}` is enough to start from — they do not
+*to* an existing project - a bare `{}` is enough to start from - they do not
 scaffold a new `bit.json`.
 
 ## `bit add`
@@ -73,8 +73,8 @@ bit update [name] [--dir <path>]
 ```
 
 `update` is an exact alias. With no `name`, re-resolves every dependency
-`bit.json` names against its *current* ref — picking up a moved branch tip or
-re-verifying a tag — and rewrites `bit.lock` with the refreshed commits and
+`bit.json` names against its *current* ref - picking up a moved branch tip or
+re-verifying a tag - and rewrites `bit.lock` with the refreshed commits and
 transitive requirements. With a `name`, restricts the refresh to that one
 dependency. Either way, `bit.json` itself is never touched: the ref an entry
 names only changes if you edit it by hand.
@@ -92,7 +92,7 @@ bit remove <name> [--dir <path>]
 
 Deletes one dependency's entry from `bit.json`'s `dependencies` object and
 its entry from `bit.lock`. Accepts either the bare name or a full
-`gitHost/owner/repo[@ref]` spec — only the trailing path segment is used, so
+`gitHost/owner/repo[@ref]` spec - only the trailing path segment is used, so
 `bit remove quicwire` and `bit remove github.com/byteink/quicwire@v1.4.2` name
 the same entry. Fails if the name is not present, rather than a silent no-op.
 Removal does not prune the on-disk `~/.bit/pkg` cache.
@@ -116,17 +116,17 @@ bit remove: quicwire
 }
 ```
 
-`bit.lock` is plain JSON — no comments, no trailing commas, unlike `bit.json`.
+`bit.lock` is plain JSON - no comments, no trailing commas, unlike `bit.json`.
 It is fully machine-owned: hand edits are not a supported workflow, and every
 `bit add`/`bit up`/`bit remove` regenerates it from scratch, sorted by
 dependency name so repeated resolutions diff cleanly. Per dependency it
 records:
 
-- `url` — the git remote it was fetched from.
-- `commit` — the exact resolved commit SHA. A tag or branch ref is always
+- `url` - the git remote it was fetched from.
+- `commit` - the exact resolved commit SHA. A tag or branch ref is always
   dereferenced to a commit before being recorded; `bit.lock` never stores a
   mutable ref.
-- `requires` — that dependency's own transitive `dependencies`, verbatim,
+- `requires` - that dependency's own transitive `dependencies`, verbatim,
   so Minimal Version Selection can re-run from the lockfile alone without
   re-fetching every transitive manifest.
 
@@ -137,7 +137,7 @@ for each module named anywhere in the transitive requirement graph, the
 resolver takes the **maximum** of every stated minimum version for it.
 Non-version refs (a branch or a bare SHA) are not compared against tagged
 versions. One pass over the graph, no backtracking, deterministic by
-construction — the resolved version is never lower than the highest of all
+construction - the resolved version is never lower than the highest of all
 requirements and never higher than some entry actually asked for.
 
 ## The package cache: `~/.bit/pkg`
@@ -150,7 +150,7 @@ A resolved dependency is cached at:
 
 a real `git` checkout (the `.git` directory is kept), content-addressed by
 commit SHA. `bit build` resolves a bare import name through `bit.lock` and
-this cache only — a warm cache means a fully-locked build never touches the
+this cache only - a warm cache means a fully-locked build never touches the
 network. A cache hit is verified, never trusted blind: `git rev-parse HEAD`
 inside the cached directory must equal the locked SHA, or the build fails
 loudly rather than silently rebuilding over a tampered or corrupted entry.
@@ -168,7 +168,7 @@ import { Frame } from "quicwire"
 ```
 
 An import naming something absent from `bit.lock` fails with a hint to run
-`bit add`, rather than reaching for the network mid-build — `bit build` never
+`bit add`, rather than reaching for the network mid-build - `bit build` never
 adds an unlocked dependency itself.
 
 ## Security posture
@@ -179,15 +179,15 @@ adds an unlocked dependency itself.
 - **Commit-SHA pinning is the integrity story.** `bit.lock` never stores a
   mutable ref; every dependency is locked to the exact commit fetched, and a
   cache hit is re-verified against that SHA on every read. There is no
-  separate signature scheme in v1 — the git object's own SHA-1 identity is
+  separate signature scheme in v1 - the git object's own SHA-1 identity is
   the check. If a tag is later force-moved, the next fetch's SHA won't match
   the lock, and the build fails rather than silently re-resolving.
 - **Git-URL-only means no separate namespace to police.** There is no
   hosted registry account system, so there is nothing to squat, and no
-  server-side yank to worry about — ownership of `owner/repo` on the git
+  server-side yank to worry about - ownership of `owner/repo` on the git
   host itself is the only identity that matters.
 - **Fetched manifests are bounded before they are parsed.** A dependency's
   `bit.json` is capped at 1 MiB and rejected outright above that, on top of
-  the JSON parser's existing nesting-depth guard — an oversized or
+  the JSON parser's existing nesting-depth guard - an oversized or
   maliciously deep manifest from a third-party remote is refused before any
   parsing happens.

@@ -11,7 +11,7 @@ self-host epic (#363–#365).
   zig build            (Zig toolchain)
       │  builds
       ▼
-  bit                 seed compiler — compiler/*.zig, ~34k lines of Zig
+  bit                 seed compiler - compiler/*.zig, ~34k lines of Zig
       │  builds  selfhost/*.bit
       ▼
   bit2 = stage1       the Bit compiler, built by the seed
@@ -25,11 +25,11 @@ self-host epic (#363–#365).
 
 **The proof:** `stage2 == stage3`, byte-for-byte (after stripping timestamps).
 A compiler that reproduces itself exactly when it compiles its own source is a
-fixed point — it has no dependency on the seed's code generation, only on the
+fixed point - it has no dependency on the seed's code generation, only on the
 language. That is what "self-hosted" means.
 
 The seed (`compiler/`) is then retired to `seed/`, kept only so the chain can be
-rebuilt from nothing. The **runtime** (`runtime/*.zig`) stays Zig — it is linked
+rebuilt from nothing. The **runtime** (`runtime/*.zig`) stays Zig - it is linked
 into every user binary via the ABI ([`runtime/ABI.md`](runtime/ABI.md)); only
 the *compiler* is ported.
 
@@ -66,7 +66,7 @@ seed to build the self-hosted bit needs a native host).
 
 ## Current state
 
-**Stage 1 — front-end, COMPLETE (#363).** The lexer, AST arena, parser, and
+**Stage 1 - front-end, COMPLETE (#363).** The lexer, AST arena, parser, and
 diagnostic renderer are ported (`selfhost/{lexer,ast,parser,diagnostics}.bit`);
 `bit2` drives them via `--dump-tokens`, `--dump-ast`, and `--dump-diags`.
 Against the seed over the whole corpus:
@@ -79,12 +79,12 @@ Against the seed over the whole corpus:
 
 Robustness + accept/reject parity are proven by `scripts/selfhost-fuzzdiff.sh`
 (the #1332 harness), which truncates every corpus file at each line boundary
-and diffs `--dump-diags`: **MATCH=7526 MISMATCH=0 CRASH=0 TIMEOUT=0** — every
+and diffs `--dump-diags`: **MATCH=7526 MISMATCH=0 CRASH=0 TIMEOUT=0** - every
 malformed input is rejected identically by both compilers, including the
 multi-error cascade-ordering cases that used to diverge before #1332 landed.
 Zero diffs across all four surfaces; gate #363 is signed off.
 
-**Stage 2 — middle-end, COMPLETE.** `selfhost/{resolve,types,check,ir,lower,
+**Stage 2 - middle-end, COMPLETE.** `selfhost/{resolve,types,check,ir,lower,
 opt}.bit` port the resolve substrate, type checker, SSA IR model + text dumper,
 AST→IR lowering, and the optimizer. Against the seed over the whole corpus:
 
@@ -106,7 +106,7 @@ instantiation), closures (arrows + capture, spawn, first-class and interface
 method values), comma-ok, arrays, maps, channels, floats/runes, and `show()`
 interpolation. Type ids are assigned in the seed's lazy touch order (declTypeOf
 first-touch + composite dedup), which method mangling `name$t{recvId}` depends on.
-The optimizer mirrors `-O1` — fold, DCE, inline, fold, DCE — rebuilding each
+The optimizer mirrors `-O1` - fold, DCE, inline, fold, DCE - rebuilding each
 function rather than mutating it.
 
 The **1** remaining mismatch in both IR surfaces (`run_generic_nested`) is generic
@@ -114,24 +114,24 @@ type substitution reaching lowering: the seed prints `field_get %28[8] i64` wher
 the self-hosted compiler still prints `field_get %28[8] <T>`. Its function bodies,
 result types, and every type already match.
 
-That case used to carry a second, independent defect — instance *index numbering*
-(`wrap$7` vs `wrap$0`) — fixed in #1530. The seed's `ctx.instantiations` is one
+That case used to carry a second, independent defect - instance *index numbering*
+(`wrap$7` vs `wrap$0`) - fixed in #1530. The seed's `ctx.instantiations` is one
 global ledger holding generic **type** instantiations alongside function ones, so
 the printed suffix was sparse while the seed's own FuncIds for those instances were
 already dense: the symbol text disagreed with the id it named. Naming from the
 dense counter the seed already computes made both compilers converge without
 building type monomorphization in the port.
 
-**Stage 3 — back-end + driver, COMPLETE (#365).** `selfhost/{codegen/,obj/,link.bit,
+**Stage 3 - back-end + driver, COMPLETE (#365).** `selfhost/{codegen/,obj/,link.bit,
 main.bit,fmt.bit,doc.bit,lsp.bit}` port codegen (x86-64 + ARM64), the ELF/Mach-O/PE
 object writers, the static linker, and the CLI driver (`build`/`run`/`check`/
 `test`/`fmt`/`doc`/`lsp`/`ar`/every `--dump-*` mode). The seed has already been
 retired to `seed/` (installed as `bit-seed`); the canonical `zig-out/bin/bit` is
-built by running `bit-seed` once against `selfhost/` — after that, `bit` builds
+built by running `bit-seed` once against `selfhost/` - after that, `bit` builds
 itself.
 
 **The fixed-point proof** (`scripts/selfhost-fixpoint.sh`) no longer compares
-against the seed — once the seed is retired there is no "stage2" built by it to
+against the seed - once the seed is retired there is no "stage2" built by it to
 compare against. The meaningful property instead is self-reproducibility: the
 current self-hosted `bit` (stageA) builds `selfhost/` to produce stageB, and
 stageB builds `selfhost/` again to produce stageC. `stageB == stageC` is the
@@ -144,8 +144,8 @@ targets:
 | aarch64-linux | docker `bit-zig-0.16.0-arm64native` | `f8b523c4d4ddf56973a408cba0515f3e7f92b31189bb555edc5647755a07dcfa` |
 | x86_64-linux | real x86-64 hardware, docker `bit-zig-0.16.0-amd64` | `26a64f2b4976bf1fdb215ae1a3b4603ef20923a031d7b510618364aeda17d435` |
 
-(The script's own `shasum` call silently no-ops on Linux — no `shasum` binary
-there — so the aarch64-linux/x86_64-linux numbers above were confirmed with an
+(The script's own `shasum` call silently no-ops on Linux - no `shasum` binary
+there - so the aarch64-linux/x86_64-linux numbers above were confirmed with an
 explicit `sha256sum` + `cmp` outside the script, not trusted from its own
 "FIXED POINT OK" line, which prints even when both sides hash to the empty
 string. Worth hardening the script separately.)
@@ -156,9 +156,9 @@ forgotten:
 
 | Target | Verdict |
 |--------|---------|
-| aarch64-macos | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN (re-run post-#1761 fix: still GREEN) |
-| aarch64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN |
-| x86_64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN, post-#1761 fix (was `PASS=14 FAIL=1 selfhost-difffmt.sh` pre-fix — see below) |
+| aarch64-macos | `PASS=15 FAIL=0 INCONCLUSIVE=0` - GREEN (re-run post-#1761 fix: still GREEN) |
+| aarch64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` - GREEN |
+| x86_64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` - GREEN, post-#1761 fix (was `PASS=14 FAIL=1 selfhost-difffmt.sh` pre-fix - see below) |
 
 That covers diffast, diffcheck, diffdiags, diffdoc, diffexamples (the full
 examples/ corpus, compiled and diffed against the seed), difffmt, diffir,
@@ -171,7 +171,7 @@ INCONCLUSIVE the images give out of the box). `imports [selfhost]`
 aarch64-macos: 94/94 projects OK, 0 regressions.
 
 **x86_64-linux real finding, RESOLVED: `bit fmt --check` segfaulted on
-non-trivial files** — filed and fixed as #1761. Root cause was not codegen:
+non-trivial files** - filed and fixed as #1761. Root cause was not codegen:
 every Bit program's `main` runs on the runtime scheduler's fixed-size
 goroutine stack (`runtime/sched.zig`), and the formatter's recursive-descent
 AST walk overflowed the 64 KiB default on x86-64's larger stack frames (ARM64
@@ -185,26 +185,26 @@ TIMEOUT=0` over the full corpus. `selfhost-difffmt.sh`'s own default timeout
 was also raised 20s → 45s (this file), since an older Skylake x86-64 box needed
 `DIFFFMT_TIMEOUT=40` to format `selfhost/lower.bit` (the corpus's largest
 file, ~23s there) without misreporting a slow-but-correct result as a
-timeout — the same false-signal class #1761 itself was first mistaken for.
+timeout - the same false-signal class #1761 itself was first mistaken for.
 This was found *because* the three-target verify bullet was actually
-exercised on real x86_64 hardware, not emulation — every other check in this
+exercised on real x86_64 hardware, not emulation - every other check in this
 gate would have shipped clean without it.
 
 **CI decision, made:** `.github/workflows/ci.yml`'s `zig build` /
 `zig build test` steps already build and exercise the self-hosted `bit` as
-the primary artifact — `build.zig` installs `bit` (self-hosted) by default on
+the primary artifact - `build.zig` installs `bit` (self-hosted) by default on
 a native host and wires it as the driver behind the golden/examples/stress/
 imports corpus in `zig build test`; `bit-seed` is retained only as the
 bootstrap tool and differential oracle. That already satisfies "CI's primary
-build switches to the self-hosted compiler" — no build-graph restructuring
+build switches to the self-hosted compiler" - no build-graph restructuring
 needed. What CI *was* missing, and now has: its self-host differential step
 called a hand-picked 5-of-15 script subset that never included
-`selfhost-difffmt.sh` — the one script that actually catches #1761. CI now
+`selfhost-difffmt.sh` - the one script that actually catches #1761. CI now
 calls `scripts/selfhost-diffall.sh` (self-discovering the full #1332 family,
 with a hard floor so a deleted differential can't silently under-run)
 instead of a hand-maintained list. The matrix already runs both `ubuntu-latest`
 (x86_64) and `macos-latest` (arm64) natively, so no separate x86_64 job was
-needed — the gap was coverage within the job, not the matrix.
+needed - the gap was coverage within the job, not the matrix.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.

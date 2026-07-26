@@ -16,7 +16,7 @@ are marks of byteink.
 
 - Use Bit for anything, commercially or otherwise. That is what the license is
   for, and nothing here narrows it.
-- Redistribute **unmodified** official releases under the name Bit — a package
+- Redistribute **unmodified** official releases under the name Bit - a package
   in a distro repo, a Docker image, a mirror.
 - Say true things about your own work: "written in Bit", "Bit bindings for X",
   "compatible with Bit 1.2". Factual references are not our business.
@@ -27,7 +27,7 @@ are marks of byteink.
 ## What needs a different name
 
 - **A fork, or any modified compiler.** If you change the compiler, runtime or
-  stdlib and distribute it, it is not Bit — pick your own name. You keep every
+  stdlib and distribute it, it is not Bit - pick your own name. You keep every
   right the license gives you over the code; you do not get the name with it.
 - **A product or service whose name suggests it is official**: "Bit Pro",
   "BitCloud", "Bit Enterprise", `bitlang.<anything>` domains, or a logo derived
@@ -48,7 +48,7 @@ for your own packages is fine; presenting it as **the** Bit registry is not.
 
 A language lives or dies on whether people can trust the thing named `bit` to
 behave the way the spec says. Ten incompatible forks all calling themselves Bit
-would destroy that, and every user with it — Apache-2.0 cannot prevent that on
+would destroy that, and every user with it - Apache-2.0 cannot prevent that on
 its own, and this policy is what does.
 
 It is not here to stop anyone forking. Fork it, rename it, ship it. That path

@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report suspected security vulnerabilities in Bit **privately** — do not open a
+Report suspected security vulnerabilities in Bit **privately** - do not open a
 public issue, discussion, or pull request.
 
 Preferred: GitHub's private vulnerability reporting on this repository.
@@ -16,12 +16,12 @@ maintainers, with its own discussion thread.
 
 **Fallback, while private vulnerability reporting is being enabled on this
 repository:** email **security@byteink.io**. This is a real, monitored
-maintainer channel — use it if the "Report a vulnerability" button isn't
+maintainer channel - use it if the "Report a vulnerability" button isn't
 present under the Security tab yet. Once GitHub PVR is confirmed live here
 (`gh api repos/byteink/bit/private-vulnerability-reporting`), it becomes the
 sole channel and this fallback is removed.
 
-No PGP key is published for this address yet — treat it as best-effort,
+No PGP key is published for this address yet - treat it as best-effort,
 unencrypted transport. If your report needs confidentiality in transit
 stronger than plain email/TLS gives you, hold the full exploit details:
 send only enough to confirm a channel and severity class, and we'll agree
@@ -37,7 +37,7 @@ triaged.
 - **Triage / severity assignment**: within **7 days** of submission, using
   CVSS to set severity and an initial fix timeline.
 
-These are maximums, not targets — most reports are acknowledged faster.
+These are maximums, not targets - most reports are acknowledged faster.
 
 ## Coordinated disclosure / embargo
 
@@ -57,7 +57,7 @@ developed:
 Bit's GitHub repository is registered (or will be registered, ahead of the
 first advisory) as a **GitHub CNA**-scoped repository. CVE identifiers for
 confirmed vulnerabilities are requested and issued directly through the
-GitHub Security Advisory (GHSA) workflow — no separate MITRE/CNA request is
+GitHub Security Advisory (GHSA) workflow - no separate MITRE/CNA request is
 needed.
 
 ## Advisory publication
@@ -73,14 +73,14 @@ They are also cross-linked from [`docs/release/SUPPORT.md`](docs/release/SUPPORT
 Security fixes are backported only to release lines still under support.
 [`docs/release/SUPPORT.md`](docs/release/SUPPORT.md) is the source of truth
 for which lines those are and their exact dates (release, full-support-end,
-EOL) — this table only summarizes what receives fixes, and is not
+EOL) - this table only summarizes what receives fixes, and is not
 duplicated here to avoid drift.
 
 | Line                          | Receives security fixes? |
 | ------------------------------ | ------------------------- |
 | Latest LTS line                 | Yes, until its EOL date (see SUPPORT.md) |
 | Latest interim (non-LTS) release | Yes, until superseded or its support window ends |
-| Older / EOL lines               | No — upgrade to a supported line |
+| Older / EOL lines               | No - upgrade to a supported line |
 | Pre-1.0 (`0.x`)                 | No support guarantee; upgrade-only until v1.0 (#366) activates this policy |
 
 If `docs/release/SUPPORT.md` and this table ever disagree, `SUPPORT.md`

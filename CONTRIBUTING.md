@@ -10,7 +10,7 @@ wrote.
 ## Who decides
 
 byteink maintains Bit and has the final say on what lands. That is not a
-formality — a language whose semantics drift by committee stops being
+formality - a language whose semantics drift by committee stops being
 predictable, and predictability is the product. Expect a real review, and
 expect some good patches to be declined on scope rather than quality.
 
@@ -40,17 +40,17 @@ changes the spec **in the same commit**, not afterwards.
    (`// run`, `// panic`, `// error`, `// fmt`, `// types`, `// lint`).
 2. **`scripts/gate.sh` green.** It reads your diff and runs only the steps that
    diff can affect; it falls back to the full suite when the change is
-   cross-cutting. Do not skip a red step — a hang counts as a failure, not a
+   cross-cutting. Do not skip a red step - a hang counts as a failure, not a
    stall.
 3. **Both compilers agree.** The Zig seed is the oracle: the self-hosted
    compiler must produce byte-identical AST/type/IR dumps over the corpus
    (`scripts/selfhost-diff*.sh`). A change to one that diverges from the other
    is incomplete.
 4. **Files stay under 800 lines** (target ~500). Split by moving top-level
-   blocks into sibling `.bit` files in the same directory — not into
+   blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.
 
-`CLAUDE.md` documents the traps that a green build will not catch — silent line
+`CLAUDE.md` documents the traps that a green build will not catch - silent line
 loss when splitting a file, inlining changes from filename sort order, the
 prelude difference between golden cases and directory projects. Read it before a
 large refactor.
@@ -65,7 +65,7 @@ for the whole tree. Please do not add them.
 ## The name
 
 The code is Apache-2.0; the name is not. If you fork and modify the compiler,
-call it something else — see `TRADEMARK.md`. Forking is fine and stays fine.
+call it something else - see `TRADEMARK.md`. Forking is fine and stays fine.
 
 ## Reporting a security issue
 
