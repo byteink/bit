@@ -97,4 +97,9 @@ Bit compile speed: **1844 lines/sec** (96 lines across 4 cases, warm).
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE). The code is open; the **name** is not — Apache-2.0
+grants no trademark rights, so a modified compiler needs a different name. See
+[TRADEMARK.md](TRADEMARK.md), and [CONTRIBUTING.md](CONTRIBUTING.md) before
+sending a change.
+
+Security reports go through [SECURITY.md](SECURITY.md), never a public issue.
