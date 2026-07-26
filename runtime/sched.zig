@@ -438,6 +438,11 @@ fn protect(mem: []align(std.heap.page_size_min) u8, prot: std.posix.PROT) !void 
 // — see the module doc comment); call the raw syscalls directly instead.
 
 pub fn closeFd(fd: std.posix.fd_t) void {
+    // `bit_rt_fs_close` closes sockets through this same path (ABI.md §20), so
+    // any fd here may be netpoller-registered. Forget it BEFORE the kernel is
+    // free to hand the number back out to a brand new, unrelated fd — see
+    // `NetPoller.forget`'s doc comment.
+    if (currentScheduler()) |s| s.poller.forget(fd);
     switch (builtin.os.tag) {
         .linux => _ = std.os.linux.close(fd),
         else => _ = std.c.close(fd),
@@ -846,6 +851,16 @@ const GlobalQueue = struct {
 
 pub const Interest = enum { read, write };
 
+/// Linux only: which task(s), if any, are currently parked waiting on a given
+/// fd. Needed because epoll's `EPOLLONESHOT` registration is keyed by fd, not
+/// by (fd, direction) the way kqueue's independent `EVFILT_READ`/`EVFILT_WRITE`
+/// filters are (each carries its own `udata`) — see `NetPoller.register`'s doc
+/// comment for why that split matters. Darwin never touches this type.
+const FdState = struct {
+    read_task: ?*Task = null,
+    write_task: ?*Task = null,
+};
+
 /// Non-blocking I/O readiness source: kqueue on Darwin, epoll on Linux. A
 /// blocking-syscall wrapper (future stdlib `io` package) registers its fd and
 /// interest here, then calls `park()`; when the fd becomes ready the poller
@@ -869,22 +884,70 @@ pub const NetPoller = struct {
     /// one) is the right shape here.
     polling: std.atomic.Value(bool) = .init(false),
 
+    /// Linux only: per-fd interest state, and the lock serializing every
+    /// access to it (both from `register` and from `pollReady`'s dispatch).
+    /// See `FdState`'s doc comment for why this table exists at all. Darwin
+    /// leaves both fields at their zero value and never touches them.
+    fd_lock: SpinLock = .{},
+    fd_states: std.AutoHashMapUnmanaged(std.posix.fd_t, FdState) = .{},
+
     fn init() !NetPoller {
         return .{ .fd = try createPollFd() };
     }
 
     fn deinit(self: *NetPoller) void {
+        self.fd_states.deinit(std.heap.page_allocator);
         closeFd(self.fd);
     }
 
+    /// Drop any interest-table record for `fd`. Must be called before `fd` is
+    /// closed and its number becomes eligible for reuse by the kernel — a
+    /// leftover record would apply a *different*, already-closed connection's
+    /// stale task pointers to whatever new fd the OS hands out next. A no-op
+    /// on Darwin: kqueue removes a fd's filters automatically on close, and
+    /// this side table does not exist there.
+    pub fn forget(self: *NetPoller, fd: std.posix.fd_t) void {
+        if (builtin.os.tag != .linux) return;
+        self.fd_lock.acquire();
+        defer self.fd_lock.release();
+        _ = self.fd_states.remove(fd);
+    }
+
     /// Register `task` to be woken when `fd` is ready for `interest`.
+    ///
+    /// Unlike kqueue, one epoll fd has exactly one interest mask and one
+    /// `data` payload — there is no way to register "wake task A on read,
+    /// task B on write" as two independent entries. A connection's reader and
+    /// writer green threads park on the SAME fd concurrently (one socket, two
+    /// directions in flight), so a naive per-call registration that just
+    /// overwrites the previous `epoll_event` loses whichever direction was
+    /// already waiting: the second `CTL_MOD` replaces both the event mask and
+    /// the `data` pointer wholesale, silently dropping the first task's
+    /// interest and its wake target. That is exactly the shape of bug that
+    /// only shows up once both directions are simultaneously saturated (#1678).
+    ///
+    /// The fix is to track both directions' waiting task per fd in
+    /// `fd_states` and always register the OR of whichever interests are
+    /// currently outstanding, keyed for dispatch by the fd itself
+    /// (`data.fd`) rather than by a task pointer, since up to two tasks can
+    /// now be waiting on one registration.
     pub fn register(self: *NetPoller, fd: std.posix.fd_t, interest: Interest, task: *Task) !void {
         switch (builtin.os.tag) {
             .linux => {
-                const io_bit: u32 = if (interest == .read) std.os.linux.EPOLL.IN else std.os.linux.EPOLL.OUT;
+                self.fd_lock.acquire();
+                defer self.fd_lock.release();
+                const gop = self.fd_states.getOrPut(std.heap.page_allocator, fd) catch return error.RegisterFailed;
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                switch (interest) {
+                    .read => gop.value_ptr.read_task = task,
+                    .write => gop.value_ptr.write_task = task,
+                }
+                var io_bits: u32 = 0;
+                if (gop.value_ptr.read_task != null) io_bits |= std.os.linux.EPOLL.IN;
+                if (gop.value_ptr.write_task != null) io_bits |= std.os.linux.EPOLL.OUT;
                 var ev: std.os.linux.epoll_event = .{
-                    .events = io_bit | std.os.linux.EPOLL.ONESHOT,
-                    .data = .{ .ptr = @intFromPtr(task) },
+                    .events = io_bits | std.os.linux.EPOLL.ONESHOT,
+                    .data = .{ .fd = fd },
                 };
                 // ONESHOT disarms the fd on the first event but leaves it in the
                 // set, so the *next* registration of the same open fd must
@@ -937,8 +1000,41 @@ pub const NetPoller = struct {
                     else => return 0,
                 }
                 for (events[0..rc]) |ev| {
-                    const t: *Task = @ptrFromInt(ev.data.ptr);
-                    unpark(sched, t);
+                    const fd = ev.data.fd;
+                    var wake_read: ?*Task = null;
+                    var wake_write: ?*Task = null;
+                    self.fd_lock.acquire();
+                    if (self.fd_states.getPtr(fd)) |st| {
+                        // HUP/ERR wakes BOTH waiting directions: a reset peer
+                        // or a faulted socket needs the reader and the writer
+                        // to both observe it, and neither IN nor OUT is
+                        // guaranteed set on its own for that case.
+                        const urgent = (ev.events & (std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.ERR)) != 0;
+                        if (st.read_task != null and (urgent or ev.events & std.os.linux.EPOLL.IN != 0)) {
+                            wake_read = st.read_task;
+                            st.read_task = null;
+                        }
+                        if (st.write_task != null and (urgent or ev.events & std.os.linux.EPOLL.OUT != 0)) {
+                            wake_write = st.write_task;
+                            st.write_task = null;
+                        }
+                        // ONESHOT disarms the whole fd, not just the direction
+                        // that just fired — re-arm now for whichever
+                        // direction is still waiting, or it would never wake.
+                        if (st.read_task != null or st.write_task != null) {
+                            var io_bits: u32 = 0;
+                            if (st.read_task != null) io_bits |= std.os.linux.EPOLL.IN;
+                            if (st.write_task != null) io_bits |= std.os.linux.EPOLL.OUT;
+                            var rearm: std.os.linux.epoll_event = .{
+                                .events = io_bits | std.os.linux.EPOLL.ONESHOT,
+                                .data = .{ .fd = fd },
+                            };
+                            _ = std.os.linux.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_MOD, fd, &rearm);
+                        }
+                    }
+                    self.fd_lock.release();
+                    if (wake_read) |t| unpark(sched, t);
+                    if (wake_write) |t| unpark(sched, t);
                 }
                 return rc;
             },
