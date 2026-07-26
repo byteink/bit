@@ -151,7 +151,7 @@ advisory_items() {
 }
 
 render() {
-	rows=$1 advisories=$2 note=$3 stamp=$4
+	rows=$1 advisories=$2 note=$3 stamp=$4 year=$5
 	cat <<HTML
 <!DOCTYPE html>
 <html lang="en">
@@ -188,7 +188,29 @@ $advisories
   </section>
 
   <footer>
-    <p>Generated $stamp by <code>website/support.sh</code> from
+    <!-- byteink notice, matching the sibling product sites (cardova, thinkbyte):
+         logo linking home, "<product> by ByteInk", the legal entity, copyright.
+         Plain <picture> rather than the siblings' React/next-intl components —
+         same content, this site's own idiom. The logo is loaded from byteink.io,
+         as both siblings do, so one brand asset serves every product. -->
+    <div class="byteink">
+      <a href="https://byteink.io" rel="noopener">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="https://byteink.io/byteink_dark.svg">
+          <img src="https://byteink.io/byteink_light.svg" alt="ByteInk" width="112" height="32" loading="lazy">
+        </picture>
+      </a>
+      <p><strong>Bit by ByteInk</strong> — a systems language with
+      TypeScript-flavored syntax and Go-like semantics, compiled to a single
+      static binary.</p>
+      <p class="entity">Bit is a product of Byteink LLC-FZ, Dubai, UAE.</p>
+      <p class="entity">&copy; $year Byteink LLC-FZ. All rights reserved.
+      Bit is <a href="https://github.com/$REPO/blob/main/LICENSE">Apache-2.0</a>
+      licensed; the name is a byteink mark, see
+      <a href="https://github.com/$REPO/blob/main/TRADEMARK.md">TRADEMARK.md</a>.</p>
+    </div>
+
+    <p class="provenance">Generated $stamp by <code>website/support.sh</code> from
     <code>docs/release/SUPPORT.md</code> and the GitHub Security Advisories API.
     Regenerated on every change to either source; see
     <a href="https://github.com/$REPO/blob/main/website/README.md">website/README.md</a>.</p>
@@ -373,7 +395,7 @@ fi
 
 dir=$(dirname -- "$out")
 mkdir -p "$dir"
-render "$rows" "$advisories" "$note" "$(date -u '+%Y-%m-%d %H:%M UTC')" >"$out"
+render "$rows" "$advisories" "$note" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$(date -u '+%Y')" >"$out"
 echo "support.sh: wrote $out"
 
 # The site is one page, so the bare domain has to be that page. nginx serves the
