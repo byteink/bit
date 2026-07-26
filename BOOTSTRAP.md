@@ -190,7 +190,7 @@ This was found *because* the three-target verify bullet was actually
 exercised on real x86_64 hardware, not emulation - every other check in this
 gate would have shipped clean without it.
 
-**CI decision, made:** `.github/workflows/ci.yml`'s `zig build` /
+**Verification decision, made:** the local gate's `zig build` /
 `zig build test` steps already build and exercise the self-hosted `bit` as
 the primary artifact - `build.zig` installs `bit` (self-hosted) by default on
 a native host and wires it as the driver behind the golden/examples/stress/

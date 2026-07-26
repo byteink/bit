@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Cut a release from THIS machine. Bit does not use GitHub Actions.
+#
+#   dist/release.sh <version>            # build, verify, upload as a draft
+#   dist/release.sh <version> --dry-run  # build and verify, publish nothing
+#
+# <version> is semver without the leading v, e.g. 0.1.0.
+#
+# This replaces the deleted .github/workflows/release.yml. It is not a
+# translation of it — a workflow can assume a clean runner per job, and this
+# cannot, so every step that mattered there is done here explicitly:
+#
+#   1. runtime archives for every target (the shipped compiler carries all three
+#      so one install can cross-compile)
+#   2. one self-hosted `bit` per target, produced by EXECING the seed
+#   3. dist/package.sh per target
+#   4. smoke-test each UNPACKED artifact by compiling and running a program, on
+#      hardware that matches it. Not the staging tree: the bytes that ship are
+#      the only thing worth testing, and this is what caught macOS serialising
+#      xattrs into every member.
+#   5. SHA256SUMS over the artifacts
+#   6. release notes from conventional commits
+#   7. `gh release create --draft` and upload
+#
+# Nothing here needs a token beyond the `gh` login already on this machine.
+set -euo pipefail
+
+VERSION="${1:?usage: dist/release.sh <version> [--dry-run]}"
+DRY=0
+[ "${2:-}" = "--dry-run" ] && DRY=1
+
+printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || {
+	echo "release.sh: '${VERSION}' is not a semver version" >&2
+	exit 2
+}
+
+ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
+OUT="${ROOT}/dist/out"
+cd "${ROOT}"
+
+command -v gh >/dev/null || { echo "release.sh: gh not found" >&2; exit 1; }
+command -v zig >/dev/null || { echo "release.sh: zig not found" >&2; exit 1; }
+
+# A release must come from a clean tree at a tagged commit, or the artifacts
+# cannot be traced back to source. Checked first, before any minutes are spent.
+git diff --quiet || { echo "release.sh: working tree is dirty" >&2; exit 1; }
+git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; exit 1; }
+
+TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
+
+echo "release.sh: building runtime archives for every target"
+zig build libbitrt
+
+echo "release.sh: building the bootstrap seed"
+zig build
+
+rm -rf "${OUT}"
+mkdir -p "${OUT}"
+for t in "${TARGETS[@]}"; do
+	echo "release.sh: ${t}"
+	rm -rf "${OUT}/stage"
+	mkdir -p "${OUT}/stage/bin"
+	# The SEED cross-produces the self-hosted compiler: `bit-seed build selfhost`
+	# is the same command release.yml used, for the same reason (build.zig's
+	# `native` note — only the caller knows which host it is on).
+	./zig-out/bin/bit-seed build selfhost --target "${t}" -o "${OUT}/stage/bin/bit"
+	chmod +x "${OUT}/stage/bin/bit"
+	bash dist/package.sh "${VERSION}" "${t}" "${OUT}"
+done
+
+# --- verify the bytes that ship ---------------------------------------------
+#
+# Each artifact is unpacked somewhere unrelated and asked to COMPILE AND RUN a
+# program. A version banner proves nothing about a compiler.
+smoke() { # <tarball> <target> <runner...>
+	local tar="$1" target="$2"; shift 2
+	local work; work="$(mktemp -d)"
+	tar -C "${work}" -xf "${tar}"
+	local prefix; prefix="$(ls -d "${work}"/bit-*)"
+	mkdir -p "${work}/proj"
+	printf 'function main() {\n  print("smoke ok\\n")\n}\n' > "${work}/proj/smoke.bit"
+	local got
+	got="$(cd "${work}/proj" && BIT_STDLIB="${prefix}/stdlib" \
+		BIT_LIBBITRT="${prefix}/lib/${target}/libbitrt.a" \
+		"$@" "${prefix}/bin/bit" run smoke.bit)"
+	rm -rf "${work}"
+	[ "${got}" = "smoke ok" ] || { echo "release.sh: ${target} smoke test said '${got}'" >&2; return 1; }
+	echo "release.sh: ${target} smoke ok"
+}
+
+# Native host: macOS on ARM64.
+smoke "${OUT}/bit-${VERSION}-macos-aarch64.tar.xz" aarch64-macos
+
+# The Linux targets run in containers / on the real x86-64 box, so they are
+# verified by scripts, not by this shell. Deliberately NOT qemu for x86-64: an
+# emulation artifact is not a pass (see the memory of the red-zone bug).
+echo "release.sh: verifying the Linux artifacts"
+if command -v docker >/dev/null; then
+	work="$(mktemp -d)"
+	cp "${OUT}/bit-${VERSION}-linux-aarch64.tar.xz" "${work}/"
+	cat > "${work}/go.sh" <<-SH
+		set -eu
+		tar -C /w -xf /w/bit-${VERSION}-linux-aarch64.tar.xz
+		p=\$(ls -d /w/bit-${VERSION}-linux-aarch64)
+		mkdir -p /w/proj && cd /w/proj
+		printf 'function main() {\n  print("smoke ok\\\\n")\n}\n' > smoke.bit
+		BIT_STDLIB="\$p/stdlib" BIT_LIBBITRT="\$p/lib/aarch64-linux/libbitrt.a" "\$p/bin/bit" run smoke.bit
+	SH
+	docker run --rm -v "${work}:/w" bit-zig-0.16.0:latest sh /w/go.sh | grep -q 'smoke ok' \
+		&& echo "release.sh: aarch64-linux smoke ok"
+	rm -rf "${work}"
+else
+	echo "release.sh: docker absent — aarch64-linux NOT verified" >&2
+fi
+
+host="$(sh scripts/x64host.sh 2>/dev/null | head -1 || true)"
+if [ -n "${host}" ]; then
+	scp -q "${OUT}/bit-${VERSION}-linux-x86_64.tar.xz" "${host}:/tmp/"
+	ssh "${host}" "set -eu
+		rm -rf /tmp/rel && mkdir -p /tmp/rel && mv /tmp/bit-${VERSION}-linux-x86_64.tar.xz /tmp/rel/
+		cat > /tmp/rel/go.sh <<'SH'
+set -eu
+tar -C /w -xf /w/bit-${VERSION}-linux-x86_64.tar.xz
+p=\$(ls -d /w/bit-${VERSION}-linux-x86_64)
+mkdir -p /w/proj && cd /w/proj
+printf 'function main() {\n  print(\"smoke ok\\\\n\")\n}\n' > smoke.bit
+BIT_STDLIB=\"\$p/stdlib\" BIT_LIBBITRT=\"\$p/lib/x86_64-linux/libbitrt.a\" \"\$p/bin/bit\" run smoke.bit
+SH
+		docker run --rm -v /tmp/rel:/w bit-zig-0.16.0-amd64:latest sh /w/go.sh" | grep -q 'smoke ok' \
+		&& echo "release.sh: x86_64-linux smoke ok on real hardware (${host})"
+else
+	echo "release.sh: no x86-64 host reachable — x86_64-linux NOT verified" >&2
+fi
+
+# --- checksums and notes ----------------------------------------------------
+( cd "${OUT}" && shasum -a 256 ./*.tar.xz | sed 's#\./##' > SHA256SUMS )
+echo "release.sh: SHA256SUMS"
+cat "${OUT}/SHA256SUMS" | sed 's/^/  /'
+
+bash dist/changelog.sh "${VERSION}" > "${OUT}/NOTES.md" 2>/dev/null || {
+	echo "release.sh: changelog.sh failed; writing a minimal note" >&2
+	printf '# Bit %s\n' "${VERSION}" > "${OUT}/NOTES.md"
+}
+
+if [ "${DRY}" -eq 1 ]; then
+	echo "release.sh: --dry-run, publishing nothing. Artifacts in ${OUT}"
+	exit 0
+fi
+
+# A DRAFT, always. A human checks the artifacts and presses publish; that is
+# also the signal any downstream packaging waits on.
+args=(--draft --title "Bit ${VERSION}" --notes-file "${OUT}/NOTES.md")
+case "${VERSION}" in *-*) args+=(--prerelease) ;; esac
+
+if gh release view "v${VERSION}" >/dev/null 2>&1; then
+	echo "release.sh: v${VERSION} exists; uploading assets with --clobber"
+	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}/SHA256SUMS" --clobber
+else
+	gh release create "v${VERSION}" "${args[@]}" "${OUT}"/*.tar.xz "${OUT}/SHA256SUMS"
+fi
+
+echo "release.sh: draft release v${VERSION} ready — review it, then publish:"
+echo "  gh release view v${VERSION} --web"

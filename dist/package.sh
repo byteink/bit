@@ -66,7 +66,14 @@ if tar --version 2>/dev/null | grep -q 'GNU tar'; then
 else
   # bsdtar: drop macOS-only metadata entirely rather than serialising it into
   # pax `LIBARCHIVE.xattr.*` headers that GNU tar then warns about on unpack.
-  TARFLAGS+=(--uname "" --gname "" --no-mac-metadata)
+  #
+  # BOTH flags are needed and they are not the same mechanism. --no-mac-metadata
+  # suppresses the AppleDouble `._name` copyfile members; --no-xattrs suppresses
+  # the pax `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*` headers. With only the first,
+  # every member of a macOS-built artifact still carried
+  # `com.apple.provenance`, and GNU tar printed a warning per file on unpack —
+  # verified by unpacking one on Linux and on real x86-64 hardware.
+  TARFLAGS+=(--uname "" --gname "" --no-mac-metadata --no-xattrs)
 fi
 
 # COPYFILE_DISABLE stops bsdtar (macOS) from serialising each file's extended

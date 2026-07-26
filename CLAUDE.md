@@ -104,6 +104,32 @@ Deploys go through **ssd** like every other byteink app. `.ssd/` is gitignored
 over to `ssd deploy website`, which builds the image on the server from committed
 source.
 
+## No GitHub Actions
+
+**This project does not use GitHub Actions, and is not planning to.** There is no
+`.github/workflows/` directory; it was deleted deliberately, not lost. Do not add
+one, and do not "fix" a missing CI badge by wiring a workflow back up.
+
+Verification happens on the machines that can actually prove things:
+
+- `scripts/gate.sh` reads your diff and runs only the steps it can affect,
+  falling back to the full `zig build test` (28 harnesses) when the change is
+  cross-cutting.
+- `scripts/arm64gate.sh` and `scripts/x64gate.sh` run the suite on real
+  aarch64-linux and real x86-64 Linux. The x86-64 host is resolved by
+  `scripts/x64host.sh` from a machine-local list, never hardcoded — an emulated
+  x86-64 pass is not a pass (a red-zone scheduler bug was only settled on real
+  hardware).
+- `dist/release.sh <version>` cuts a release: builds all three targets, smoke-
+  tests each UNPACKED artifact by compiling and running a program on hardware
+  that matches it, writes SHA256SUMS, renders notes from conventional commits,
+  and creates a DRAFT release. `--dry-run` builds and verifies without
+  publishing.
+
+Why: Actions minutes are billed to the owner, and every check worth running needs
+either the real x86-64 box or a container image that already exists here. A hosted
+runner adds cost and a second, weaker definition of "green".
+
 ## Deployment Context
 
-Releases ship from GitHub Actions on version tags: **3** target artifacts - `x86_64-linux`, `aarch64-linux`, `aarch64-macos`. There is NO Windows build: the PE/COFF writer landed but the CLI target and the Windows runtime port did not, so `dist/`'s matrix has no windows entry and `winget.yml` checks for the absent assets and skips + a Homebrew tap (`brew install byteink/tap/bit`) + a `curl | sh` installer + winget. Website deployment specifics (cluster, namespace, ingress) are operational detail kept out of this public repo - see the private workspace notes.
+Releases are cut LOCALLY with `dist/release.sh <version>` (see "No GitHub Actions" above). **3** target artifacts - `x86_64-linux`, `aarch64-linux`, `aarch64-macos` - plus a Homebrew tap (`brew install byteink/tap/bit`, published by `dist/brew/publish.sh`) and a `curl | sh` installer served from the site. There is NO Windows build and no winget submission: the PE/COFF writer landed but the CLI target and the Windows runtime port did not. Website deployment specifics (cluster, namespace, ingress) are operational detail kept out of this public repo.

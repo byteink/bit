@@ -1,7 +1,5 @@
 # Bit
 
-[![CI](https://github.com/byteink/bit/actions/workflows/ci.yml/badge.svg)](https://github.com/byteink/bit/actions/workflows/ci.yml)
-
 Bit is a systems programming language with TypeScript-flavored syntax and
 Go-like semantics. You write `let`/`const`, `function`, arrows, `interface`,
 and `<>` generics; you get garbage collection, green threads (`spawn`), typed

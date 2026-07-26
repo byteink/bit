@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproducible-release verifier (#1753): extends the repo's byte-identical
 # culture (scripts/selfhost-fixpoint.sh) to the artifacts .github/workflows/
-# release.yml actually ships.
+# dist/release.sh actually ships.
 #
 # Rebuilds all 3 shipping targets (x86_64-linux, aarch64-linux, aarch64-macos)
 # from a tag's source in a throwaway git worktree, repackages with

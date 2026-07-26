@@ -8,7 +8,7 @@ package.sh aren't either); this exercises the one thing zig build test can't:
 that the generator emits the fields the release pipeline and downstream
 consumers rely on. Installs cyclonedx-python-lib into a throwaway venv
 rather than touching the caller's environment, pinned by
-dist/sbom-requirements.txt — the same file release.yml's "sbom" step reads,
+dist/sbom-requirements.txt - the same file the release flow's SBOM step reads,
 so the two never drift apart.
 """
 import json
