@@ -6,9 +6,9 @@
 # Downloads the release tarball named per dist/README.md's naming contract
 # (bit-<version>-linux-<arch>.tar.xz), verifies it against the release's
 # SHA256SUMS, unpacks it under $BITROOT (default ~/.bit) and symlinks its
-# bin/bit into $BITROOT/bin. No wrapper script or env vars are needed: since
-# #1452 bin/bit resolves stdlib/libbitrt.a relative to its own install
-# location (dist/README.md, "Path resolution"). POSIX sh only, no bashisms.
+# bin/bit into $BITROOT/bin. No wrapper script or env vars are needed:
+# bin/bit resolves stdlib/libbitrt.a relative to its own install location
+# (dist/README.md, "Path resolution"). POSIX sh only, no bashisms.
 set -eu
 
 REPO="byteink/bit"
