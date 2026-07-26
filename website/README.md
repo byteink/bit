@@ -6,10 +6,8 @@ repo root `CLAUDE.md` (`website/   static site → k3s byteink namespace`).
 ```
 website/
   support.sh          generator for the Support/Security page
-  deploy.sh           regenerate + push to the byteink k3s cluster
-  deploy/
-    bitlang-org.yaml  Deployment + Service + IngressRoute, plus the
-                      bitlang.io/.net → bitlang.org redirect
+  deploy.sh           regenerate, then hand over to ssd
+  ssd.yaml.example    reference copy of the gitignored .ssd/ssd.yaml
   public/             served as-is; no build step, no npm, no framework
     index.html        generated — a copy of support.html, so "/" is the page
     support.html      generated — do not hand-edit
@@ -113,22 +111,38 @@ matches the page, and every malformed `BIT_REPO` is rejected.
 
 ## Deployment
 
-`website/deploy.sh` regenerates the page, pushes `public/` as the
-`bitlang-site` ConfigMap, applies `deploy/bitlang-org.yaml` (nginx Deployment +
-Service + Traefik IngressRoute for `bitlang.org`, `websecure`
-entrypoint, `letsencrypt` cert resolver, namespace `byteink`), and restarts the
-Deployment so the new bytes are actually served.
+Deployment goes through [ssd](https://github.com/byteink/ssd), the same tool
+every byteink app on that server uses.
 
 ```sh
-sh website/deploy.sh    # needs kubectl and the `byteink` context
+sh website/deploy.sh    # needs ssd; regenerates the page, then `ssd deploy website`
 ```
 
-Two things are outside this repo and both are needed before the page is live:
+`deploy.sh` exists for one reason: the pages are generated, so a bare
+`ssd deploy website` could ship a stale support matrix. Everything else lives in
+`.ssd/ssd.yaml` — server, the six domains and their redirect, the nginx image,
+and which file lands where.
 
-1. **A DNS record** for `bitlang.org` pointing at the cluster. None
-   exists as of 2026-07-26.
-2. **The decision to publish.** Nothing about Bit is public yet, so this has not
-   been run.
+**No Dockerfile, and no image build.** The service uses `image: nginx:1.30-alpine`
+off the shelf and ssd's `files:` to mount the three static pages into it — the
+same way playnext uses `image:` for postgres. Building an image per content change
+would push a registry layer to ship bytes that already sit in the repo.
+
+The cost of that choice: `files:` maps file to path, one line each, so **adding a
+new page to the site means adding a line to `.ssd/ssd.yaml`** or it simply will
+not be served.
+
+`.ssd/` is gitignored — deploy config names an SSH host from a personal
+`~/.ssh/config` and is machine-local. The committed reference is
+`website/ssd.yaml.example`; on a new machine, copy it to `.ssd/ssd.yaml`. Nothing
+enforces that the two stay in step, so change both.
+
+Two things are outside this repo, and both are needed before the page is live:
+
+1. **DNS.** `bitlang.org` resolving to the cluster (direct, or via Cloudflare as
+   byteink.io and cardova.io do). The other five hostnames only need to resolve
+   for their redirects to work — `bitlang.org` alone is enough to serve the site.
+2. **The decision to publish.** Tracked on #1802; not run yet.
 
 `byteink/bit` is also still private, which is why the advisory feed renders
 empty — there are no published advisories to list.
