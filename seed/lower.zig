@@ -1889,8 +1889,19 @@ const FnCtx = struct {
         const lv = try self.resolveLvalue(lhs);
         const ty = try self.nodeType(lhs);
         const cur = try self.readLvalue(lv);
-        const one = try self.b.constInt(ty, 1);
-        const result = try self.b.binary(op, ty, cur, one);
+        const data = self.ctx.typeOf(ty);
+        const is_float = data == .untyped_float or (data == .prim and (data.prim == .f32 or data.prim == .f64));
+        // `op` is literally `.add` (inc_stmt) or `.sub` (dec_stmt) from the two
+        // call sites below — a float target needs both the constant and the
+        // opcode in the float lane, or codegen reads the operand out of the
+        // wrong register class (ABI.md's int/float split).
+        const one = if (is_float) try self.b.constFloat(ty, 1.0) else try self.b.constInt(ty, 1);
+        const actual_op: ir.Op = if (is_float) switch (op) {
+            .add => .fadd,
+            .sub => .fsub,
+            else => unreachable,
+        } else op;
+        const result = try self.b.binary(actual_op, ty, cur, one);
         try self.writeLvalue(lv, result);
     }
 
