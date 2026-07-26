@@ -1,0 +1,258 @@
+// Bit standard library — json module, path-based edit API on the CST (#1725).
+//
+// The mutation layer `bit add` (#1480, the package-manager epic) calls to
+// change `bit.json` without disturbing anything it didn't touch — the json
+// epic's (#1479) namesake "edit layer". Operates on the #1720 CST
+// (stdlib/json/cst.bit), produced by `cstParse` (stdlib/json/cst_parse.bit),
+// never on the plain `Json` value: only the CST carries the trivia a
+// byte-identical-modulo-the-edit re-serialization needs.
+//
+// A path is `[]string` of object keys — array-index paths are out of scope
+// (`bit.json`'s dependency map, #1480's actual need, is object-keyed only;
+// add array-path support later if a real consumer needs it).
+//
+// Every function mutates and returns its `root`, per this codebase's struct
+// convention (structs and slices are reference types, §13.3: a struct field
+// write through any handle is visible through every other handle on the same
+// object). Concretely: `entries[i].value = x` mutates the shared `CstEntry`
+// in place, so an ancestor's own `entries` slice (which points at the same
+// backing array) sees the change with no rebuild. The one case that does
+// need a fresh node is a slice length change (`append`, or dropping an
+// entry) — a `CstNode`'s payload isn't independently assignable, so the
+// enclosing `CstObject` is rebuilt there and returned upward, and every
+// caller on the path writes that returned node into its own `entries[i]`
+// slot rather than assuming its original `root` already reflects the edit.
+// This is why every function returns `CstNode!` instead of `void!`: only the
+// top-level caller's return value is guaranteed current when the edited key
+// is a direct child of `root` itself.
+//
+// On duplicate keys, `cstGet`/`cstSetString`/`cstDeleteKey` all resolve the
+// LAST matching entry — the same last-key-wins policy `jsonGet`
+// (stdlib/json/value.bit) documents, so one policy governs every reader of a
+// possibly-duplicated key.
+
+// The index of the last `CstEntry` in `entries` whose `key == key`, or `-1`
+// if none match. Last-match-wins, mirroring `jsonGet`'s policy (value.bit).
+function findEntryIndex(entries: []CstEntry, key: string): int {
+  let idx = -1
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].key == key) {
+      idx = i
+    }
+    i = i + 1
+  }
+  return idx
+}
+
+// `entries` without the element at `at` (`0 <= at < len(entries)`), a fresh
+// slice sharing every kept `CstEntry` handle unchanged — no sibling is
+// rebuilt, only the array of handles is shorter.
+function removeEntryAt(entries: []CstEntry, at: int): []CstEntry {
+  let out = []CstEntry(0)
+  let i = 0
+  while (i < len(entries)) {
+    if (i != at) {
+      out = append(out, entries[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// A single leading `,` stripped from `s`, if present — nothing else is
+// touched. `gaps` (cst.bit) always has one more element than there are
+// children, so removing entries[0] leaves the OLD gaps[1] (originally "the
+// comma and formatting before entries[1]") as the new gaps[0]; a gap in the
+// very first position can never legally start with a comma, so that one
+// byte is the sole repair `cstDeleteKey` ever makes to a sibling's gap.
+function stripLeadingComma(s: string): string {
+  if (len(s) > 0 && s[0] == ',') {
+    return s[1:len(s)]
+  }
+  return s
+}
+
+// `gaps` (len(entries) + 1) with the boundary at `at` removed, so the result
+// still has exactly one gap per remaining-entry-plus-one. Removing gaps[at]
+// drops the deleted entry's own leading gap (its comments/indentation go with
+// it — cst.bit's documented rule); every other gap, including the one that
+// followed the deleted entry, keeps its own original text untouched, except
+// for the `at == 0` repair above.
+function removeGapAt(gaps: []Option<string>, at: int): []Option<string> {
+  let out = []Option<string>(0)
+  let i = 0
+  while (i < len(gaps)) {
+    if (i != at) {
+      out = append(out, gaps[i])
+    }
+    i = i + 1
+  }
+  if (at == 0 && len(out) > 0) {
+    match (out[0]) {
+      Some(g) => out[0] = Option<string>.Some(stripLeadingComma(g))
+      None => {}
+    }
+  }
+  return out
+}
+
+// Read-only lookup of `path` in `node`, mirroring `jsonGet` (value.bit) but
+// over the CST. `None` as soon as an intermediate segment isn't a
+// `CstObject` or a key is missing — never a panic on untrusted/absent paths.
+export function cstGet(root: CstNode, path: []string): Option<CstNode> {
+  let node = root
+  let i = 0
+  while (i < len(path)) {
+    match (node) {
+      CstObject(entries, gaps, trivia) => {
+        let found = findEntryIndex(entries, path[i])
+        if (found < 0) {
+          return Option<CstNode>.None
+        }
+        node = entries[found].value
+      }
+      CstNull(t) => return Option<CstNode>.None
+      CstBool(b, t) => return Option<CstNode>.None
+      CstNumber(r, t) => return Option<CstNode>.None
+      CstString(s, t) => return Option<CstNode>.None
+      CstArray(a, gaps, t) => return Option<CstNode>.None
+    }
+    i = i + 1
+  }
+  return Option<CstNode>.Some(node)
+}
+
+// `gaps` (len(entries) + 1) with one more slot inserted for an appended
+// entry: everything but the old tail gap stays as-is, a fresh `None` slot is
+// inserted for the new entry's own leading gap (printed by cstPrint by
+// inferring the preceding sibling's indentation, cst.bit's documented
+// contract for a `None` gap), and the OLD tail gap (the formatting between
+// the previous last entry and the closing brace) is reused as the new tail,
+// since it still describes "after the last entry, before the close".
+function appendGapSlot(gaps: []Option<string>): []Option<string> {
+  let out = []Option<string>(0)
+  let i = 0
+  while (i < len(gaps) - 1) {
+    out = append(out, gaps[i])
+    i = i + 1
+  }
+  out = append(out, Option<string>.None)
+  out = append(out, gaps[len(gaps) - 1])
+  return out
+}
+
+// `node`'s subtree with `path[idx:]` resolved and the final segment's
+// `CstString` value replaced (or, if absent, a new entry appended). See
+// cstSetString below for the exact contract.
+function cstSetStringAt(node: CstNode, path: []string, idx: int, value: string): CstNode! {
+  match (node) {
+    CstObject(entries, gaps, trivia) => {
+      let key = path[idx]
+      let found = findEntryIndex(entries, key)
+      if (idx == len(path) - 1) {
+        if (found >= 0) {
+          match (entries[found].value) {
+            CstString(raw, strTrivia) => {
+              entries[found].value = CstNode.CstString(jsonEscapeString(value), strTrivia)
+              return node
+            }
+            CstNull(t) => fail newError("json: cstSetString: key '" + key + "' is not a string value")
+            CstBool(b, t) => fail newError("json: cstSetString: key '" + key + "' is not a string value")
+            CstNumber(r, t) => fail newError("json: cstSetString: key '" + key + "' is not a string value")
+            CstArray(a, g, t) => fail newError("json: cstSetString: key '" + key + "' is not a string value")
+            CstObject(es, g, t) => fail newError("json: cstSetString: key '" + key + "' is not a string value")
+          }
+        }
+        // Final key doesn't exist but its parent object does: append a new
+        // entry — no comment invented, empty midGap style, and the gap
+        // immediately before it is `None` (no original formatting to echo;
+        // cstPrint, stdlib/json/cst_print.bit, synthesizes it from the
+        // preceding sibling's own indentation).
+        let newEntry = CstEntry{
+          keyText: jsonEscapeString(key),
+          key: key,
+          midGap: ": ",
+          value: CstNode.CstString(jsonEscapeString(value), Trivia{ leading: "", trailing: "" }),
+        }
+        return CstNode.CstObject(append(entries, newEntry), appendGapSlot(gaps), trivia)
+      }
+      // Intermediate segment: must already resolve to an object. This
+      // function never creates one.
+      if (found < 0) {
+        fail newError("json: cstSetString: path segment '" + key + "' does not exist")
+      }
+      let updated = cstSetStringAt(entries[found].value, path, idx + 1, value)?
+      entries[found].value = updated
+      return node
+    }
+    CstNull(t) => fail newError("json: cstSetString: path segment does not resolve to an object")
+    CstBool(b, t) => fail newError("json: cstSetString: path segment does not resolve to an object")
+    CstNumber(r, t) => fail newError("json: cstSetString: path segment does not resolve to an object")
+    CstString(s, t) => fail newError("json: cstSetString: path segment does not resolve to an object")
+    CstArray(a, g, t) => fail newError("json: cstSetString: path segment does not resolve to an object")
+  }
+}
+
+// Sets the string value at `path` under `root` to `value`, returning the
+// (possibly rebuilt) root — always use the return value, since an append at
+// `root`'s own level replaces it (see this file's header).
+//
+// If `path` resolves to an existing `CstString` entry, only its `rawText` is
+// replaced (with `value` JSON-quoted and escaped); that entry's `keyText`
+// and `Trivia` are untouched. If the final key is absent but its parent
+// object exists, a new `CstEntry` is appended (empty `Trivia`, no comment
+// invented). If the existing value at the final key is not a `CstString`, or
+// any intermediate segment doesn't resolve to a `CstObject` (missing or the
+// wrong shape), this fails rather than guessing or creating intermediate
+// objects.
+export function cstSetString(root: CstNode, path: []string, value: string): CstNode! {
+  if (len(path) == 0) {
+    fail newError("json: cstSetString: path must have at least one segment")
+  }
+  return cstSetStringAt(root, path, 0, value)?
+}
+
+function cstDeleteKeyAt(node: CstNode, path: []string, idx: int): CstNode! {
+  match (node) {
+    CstObject(entries, gaps, trivia) => {
+      let key = path[idx]
+      let found = findEntryIndex(entries, key)
+      if (found < 0) {
+        fail newError("json: cstDeleteKey: path segment '" + key + "' does not exist")
+      }
+      if (idx == len(path) - 1) {
+        return CstNode.CstObject(removeEntryAt(entries, found), removeGapAt(gaps, found), trivia)
+      }
+      let updated = cstDeleteKeyAt(entries[found].value, path, idx + 1)?
+      entries[found].value = updated
+      return node
+    }
+    CstNull(t) => fail newError("json: cstDeleteKey: path segment does not resolve to an object")
+    CstBool(b, t) => fail newError("json: cstDeleteKey: path segment does not resolve to an object")
+    CstNumber(r, t) => fail newError("json: cstDeleteKey: path segment does not resolve to an object")
+    CstString(s, t) => fail newError("json: cstDeleteKey: path segment does not resolve to an object")
+    CstArray(a, g, t) => fail newError("json: cstDeleteKey: path segment does not resolve to an object")
+  }
+}
+
+// Removes the `CstEntry` at `path` from its parent's entries, returning the
+// (possibly rebuilt) root — always use the return value (see this file's
+// header). Every sibling entry keeps its own handle unchanged: same value,
+// same relative order.
+//
+// The deleted entry's own leading gap (comments/indentation before it,
+// cst.bit's `gaps`) is dropped with it — there is no owner left to attach it
+// to once the entry is gone. This is the one case where a comment can
+// legitimately disappear, and only that entry's own leading gap, never a
+// sibling's (see `removeGapAt`'s doc comment for the one repair needed when
+// the removed entry was first).
+//
+// Fails if any path segment (including the final one) doesn't exist, or an
+// intermediate segment doesn't resolve to a `CstObject`.
+export function cstDeleteKey(root: CstNode, path: []string): CstNode! {
+  if (len(path) == 0) {
+    fail newError("json: cstDeleteKey: path must have at least one segment")
+  }
+  return cstDeleteKeyAt(root, path, 0)?
+}
