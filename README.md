@@ -40,8 +40,14 @@ bit --version
 Or run the toolchain as a container, no install at all:
 
 ```
-docker run --rm -v "$PWD:/work" ghcr.io/byteink/bit build hello.bit
+docker run --rm -v "$PWD:/work" ghcr.io/byteink/bit run hello.bit
+
+# to BUILD into your project, pass your own uid so the output belongs to you:
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/byteink/bit build hello.bit
 ```
+
+The image runs as an unprivileged user, so without `--user` it can read your
+sources but not write a binary back into them.
 
 New here? [Get started](docs/tutorial.md) takes about fifteen minutes and ends
 with a real concurrent program.

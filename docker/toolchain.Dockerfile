@@ -13,6 +13,13 @@
 
 FROM alpine:3.24
 
+LABEL org.opencontainers.image.title="Bit" \
+      org.opencontainers.image.description="The Bit compiler toolchain: a systems language with TypeScript-flavored syntax and Go-like semantics." \
+      org.opencontainers.image.source="https://github.com/byteink/bit" \
+      org.opencontainers.image.url="https://bitlang.org" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="byteink"
+
 # git, because the package manager shells out to it: `bit add <gitURL>` clones
 # into the content-addressed cache. A toolchain image without git can compile but
 # cannot resolve a dependency — this was learned the hard way when the test
@@ -46,11 +53,23 @@ RUN set -eux; \
     bit run t.bit; \
     rm -f /tmp/t.bit
 
-# Unprivileged. The compiler only reads sources and writes outputs, so root buys
-# nothing; 65532 is the conventional nonroot id. Users bind-mount their project
-# over /work, so it must be writable by this uid at runtime — a bind mount keeps
-# the host's ownership, which is the user's own, so this works for the common
-# `-v "$PWD:/work"` case.
+# Unprivileged by default. The compiler reads sources and writes outputs, so root
+# buys nothing, and 65532 is the conventional nonroot id.
+#
+# THE BIND-MOUNT CONSEQUENCE, measured rather than assumed: a bind mount keeps the
+# HOST's ownership, so this uid can read a world-readable project (`bit run` works)
+# but cannot create files in one owned by someone else — `bit build -o out` fails
+# with "cannot create file". A project directory at mode 0700 is not even readable
+# ("not a module", confusingly).
+#
+# The fix is the standard one, and it is in the README:
+#
+#     docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/byteink/bit build x.bit
+#
+# Verified on real x86-64: the output is then owned by the invoking user, mode
+# 0755, and executes on the host. The alternative — dropping USER so the container
+# runs as root — writes root-owned binaries into a user's source tree, which is a
+# worse default than a documented flag.
 WORKDIR /work
 USER 65532:65532
 
