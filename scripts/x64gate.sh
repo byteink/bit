@@ -22,7 +22,7 @@
 # X64GATE_ALL_HOSTS=1 x64gate.sh   # run against EVERY reachable candidate from
 #                                  # x64host.sh, not just the first that answers.
 # One machine-local candidate list can rank a fast box first and a slow one
-# second (e.g. desktop over `hl-master`); a hardware-timing-sensitive gate that
+# second (e.g. a faster box over a slower one); a hardware-timing-sensitive gate that
 # stops at the first answer can pass on the fast box while a real regression
 # stays invisible there (#1690). Opt into this for any gate checking timing,
 # not for routine runs — it costs one full run per reachable box.

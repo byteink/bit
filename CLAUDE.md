@@ -100,10 +100,10 @@ IS `docs/tutorial.md`, not a copy.
 
 Deploys go through **ssd** like every other byteink app. `.ssd/` is gitignored
 (machine-local); `website/ssd.yaml.example` is the committed reference.
-`website/deploy.sh` fetches the advisory feed, regenerates the pages,
-cross-compiles the server (`BIT_SERVER_TARGET`, default `x86_64-linux`), then
-hands over to `ssd deploy website`.
+`website/deploy.sh` fetches the advisory feed, regenerates the pages, then hands
+over to `ssd deploy website`, which builds the image on the server from committed
+source.
 
 ## Deployment Context
 
-Website deploys to the byteink k3s cluster (`kubectx byteink`, namespace `byteink`, Traefik IngressRoutes — see workspace-root CLAUDE.md). Releases ship from GitHub Actions on version tags: 6 target artifacts (linux/macos/windows × x64/arm64) + brew tap `byteink/homebrew-tap` (installed as `byteink/tap/bit`) + curl|sh installer + winget.
+Releases ship from GitHub Actions on version tags: 6 target artifacts (linux/macos/windows × x64/arm64) + a Homebrew tap (`brew install byteink/tap/bit`) + a `curl | sh` installer + winget. Website deployment specifics (cluster, namespace, ingress) are operational detail kept out of this public repo — see the private workspace notes.

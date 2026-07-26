@@ -232,7 +232,7 @@ pub const ParkFn = *const fn (t: *Task, arg: ?*anyopaque) void;
 /// program's `main` runs as the scheduler's first task (`root.zig`'s `boot`),
 /// so the self-hosted compiler's own recursive-descent formatter walked each
 /// file's AST on this fixed, guard-paged stack. Confirmed via gdb on real
-/// x86_64 hardware (hl-master): the fault address (`si_addr`) landed exactly
+/// x86_64 hardware: the fault address (`si_addr`) landed exactly
 /// inside the mapped guard page, at the `call` instruction's return-address
 /// push — a stack overflow, not a codegen miscompile. x86-64 frames for the
 /// same recursion run bigger than AArch64's, so 64 KiB was enough headroom on

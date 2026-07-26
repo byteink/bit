@@ -142,7 +142,7 @@ targets:
 |--------|------|----------------------------|
 | aarch64-macos | native | `f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a` |
 | aarch64-linux | docker `bit-zig-0.16.0-arm64native` | `f8b523c4d4ddf56973a408cba0515f3e7f92b31189bb555edc5647755a07dcfa` |
-| x86_64-linux | real hardware (hl-master), docker `bit-zig-0.16.0-amd64` | `26a64f2b4976bf1fdb215ae1a3b4603ef20923a031d7b510618364aeda17d435` |
+| x86_64-linux | real x86-64 hardware, docker `bit-zig-0.16.0-amd64` | `26a64f2b4976bf1fdb215ae1a3b4603ef20923a031d7b510618364aeda17d435` |
 
 (The script's own `shasum` call silently no-ops on Linux — no `shasum` binary
 there — so the aarch64-linux/x86_64-linux numbers above were confirmed with an
@@ -178,11 +178,11 @@ AST walk overflowed the 64 KiB default on x86-64's larger stack frames (ARM64
 frames stayed under it, which is why this was invisible on either aarch64
 target). Fixed by raising the goroutine stack to 256 KiB, with a
 `tests/stress/deeprecursion` regression case pinning the budget so it can't
-silently regress. Re-verified post-fix on hl-master (real x86_64 hardware):
+silently regress. Re-verified post-fix on real x86_64 hardware:
 the 4 originally-crashing files now exit with the same codes as aarch64
 (0/1, never SIGSEGV), and `selfhost-difffmt.sh` scores `MATCH=692 MISMATCH=0
 TIMEOUT=0` over the full corpus. `selfhost-difffmt.sh`'s own default timeout
-was also raised 20s → 45s (this file), since hl-master's older Skylake needed
+was also raised 20s → 45s (this file), since an older Skylake x86-64 box needed
 `DIFFFMT_TIMEOUT=40` to format `selfhost/lower.bit` (the corpus's largest
 file, ~23s there) without misreporting a slow-but-correct result as a
 timeout — the same false-signal class #1761 itself was first mistaken for.
@@ -214,7 +214,7 @@ point byte-identical on all three targets; full #1332 differential family
 15/15 GREEN on all three targets (aarch64-macos re-confirmed GREEN after the
 #1761 fix + the difffmt timeout raise, in the same tree as this commit);
 `zig build test` clean (0 real failures on both aarch64-macos and
-x86_64-hl-master; the sole aarch64-macos build-step miss was a cache artifact
+x86_64; the sole aarch64-macos build-step miss was a cache artifact
 from a session restart, not a code defect); seed retired to `seed/` as
 `bit-seed`, `compiler/` gone; CI's primary build already targets the
 self-hosted compiler, and its differential step now runs the full

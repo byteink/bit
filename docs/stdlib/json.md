@@ -2,7 +2,7 @@
 
 The `Json` value: a sum type over the seven shapes RFC 8259 §3 defines, plus
 `JsonEntry`, one object key/value pair. This is the primitive the rest of the
-json epic (#1479) - parser, encoder - builds on. Nothing here parses or
+json module - parser, encoder - builds on. Nothing here parses or
 encodes JSON text; these are pure constructors and accessors over an
 already-built `Json` value.
 
@@ -259,7 +259,7 @@ function jsoncExample(): i64 {
 ## The CST types
 
 A concrete syntax tree shaped like `Json`, but every node also carries the
-comments/blank lines around it, so a later edit-layer task (#1479) can mutate
+comments/blank lines around it, so the edit layer can mutate
 one value and re-serialize the rest of the document byte-identical modulo the
 edit. Types only - no parser, no printer, no mutation yet.
 
@@ -270,7 +270,7 @@ Bit enum variants take positional payloads only (no named payload fields), so
 returned by `cstParse` (a comment or blank line before the document's first
 token, or after its last) - every other node's own `Trivia` is empty,
 because its surrounding formatting is owned by its parent container's `gaps`
-or by its `CstEntry.midGap` instead. #1726 (the CST printer) found that a
+or by its `CstEntry.midGap` instead. The CST printer found that a
 comment-only `Trivia` couldn't reproduce a document's plain whitespace
 (indentation, blank lines) or comma placement - this shape closes that gap by
 making every boundary between structural tokens a single verbatim raw-text
@@ -345,7 +345,7 @@ function cstExample(): string {
 
 ## Editing the CST
 
-The path-based edit layer `bit add` (#1480, the package-manager epic) calls
+The path-based edit layer `bit add` (the package manager) calls
 to change `bit.json` without disturbing anything it didn't touch - the json
 epic's namesake "edit layer". A path is `[]string` of object keys only
 (array-index paths are out of scope; `bit.json`'s dependency map is

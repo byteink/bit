@@ -6,14 +6,12 @@ designated **LTS** (long support window). This doc is the source of truth -
 given a version string and today's date, it tells you full-support /
 security-only / EOL, no other lookup needed.
 
-Pre-1.0 signing/policy scope is tracked under epic #1746.
-
 ## Pre-1.0 phasing
 
 **0.x releases are not covered by this policy.** No support guarantee, no
 backports, no security-fix commitment - upgrade to the latest 0.x instead of
-requesting a backport. The policy activates at the v1.0 line, established by
-release #366. Until #366 ships, the matrix below is empty by design.
+requesting a backport. The policy activates at the v1.0 line. Until v1.0 ships, the matrix below is
+empty by design.
 
 ## Cadence definitions
 
@@ -63,7 +61,7 @@ resource allocation).
 ## Support matrix
 
 No version is under this policy yet - Bit is pre-1.0. This table starts
-populating at the v1.0 line (#366). The row below is illustrative only, to
+populating at the v1.0 line. The row below is illustrative only, to
 fix the table's shape; delete the `(example)` marker once real rows land.
 
 | version | released | full-support-end | EOL | status |

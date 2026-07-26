@@ -48,7 +48,7 @@ SEED=${DIFFFMT_SEED:-zig-out/bin/bit-seed}
 # compared, so an overridden run cannot be quoted as a plain one.
 BIT2=${DIFFFMT_BIT:-zig-out/bin/bit}
 # 20s was too tight on slower hardware: #1761's own verification needed
-# DIFFFMT_TIMEOUT=40 on hl-master (older Skylake x86_64) to format
+# DIFFFMT_TIMEOUT=40 on an older Skylake x86_64 host to format
 # selfhost/lower.bit (6867 lines, ~23s wall there) without a false
 # TIMEOUT/INCONCLUSIVE on an otherwise-correct, just-slow, result. 45s keeps a
 # margin above that measured worst case.

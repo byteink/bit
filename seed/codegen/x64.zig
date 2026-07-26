@@ -1277,7 +1277,7 @@ fn constPow2Divisor(f: *const ir.Function, v: ir.ValueId, w: Width) ?u6 {
 /// x86-64-ONLY, deliberately: AArch64's `sdiv`/`udiv` are cheap, low-latency
 /// hardware instructions (a handful of cycles, not tens), and this
 /// replacement's serial dependency chain (each shift/add depends on the
-/// last) measurably REGRESSED a tight loop there (~15-19% slower, hl-master
+/// last) measurably REGRESSED a tight loop there (~15-19% slower, the x86-64 test box
 /// vs an Apple-silicon Mac, #1702) — the "avoid the divide" premise this
 /// helper exists for is x86-64-specific, so the reduction is too.
 ///
