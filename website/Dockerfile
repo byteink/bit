@@ -11,43 +11,43 @@
 # which is exactly what it did before this became a stage. Everything the image
 # needs must be produced FROM committed source, inside the build.
 #
-# Cost, stated plainly: this compiles the Bit toolchain from source on every
-# deploy — minutes on a 4-core server — because there is no published Bit
-# toolchain image to start from yet. When that becomes annoying, the fix is a
-# prebuilt toolchain image, or building on the host and pushing to a registry with
-# `image:` in ssd.yaml. It is NOT going back to a gitignored binary.
+# Bit compiles Bit: stage 1 is the published toolchain image, so this file is the
+# whole toolchain story. No Zig, no bootstrap, no host-built artifact.
+#
+# --- stage 1: build the server with the RELEASED toolchain ------------------
+#
+# This used to install Zig and run `zig build` to produce a compiler from source:
+# ~132s of every deploy spent rebuilding a toolchain that is now published. The
+# image below is the release artifact, so the site is built by the exact compiler
+# users install — the website is a real, if small, test of the release.
+#
+# PINNED to a version, never `:latest`. A deploy must be reproducible from the
+# commit alone, and `:latest` silently changes what compiled the binary. Bumping
+# this is a deliberate commit, and the bump is where a regression gets caught.
+FROM ghcr.io/byteink/bit:0.1.0 AS build
 
-# --- stage 1: build the server from committed source ------------------------
-FROM debian:bookworm AS build
-
-ARG ZIG_VERSION=0.16.0
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates xz-utils git \
- && rm -rf /var/lib/apt/lists/*
-
-# Native arch only, no cross-compilation, so whatever this produces is correct for
-# the runtime stage by construction. dpkg's arch maps to zig's naming; an
-# unsupported arch fails loudly rather than yielding a wrong-arch image.
-RUN set -eux; \
-    case "$(dpkg --print-architecture)" in \
-      arm64) ZARCH=aarch64 ;; \
-      amd64) ZARCH=x86_64 ;; \
-      *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz; \
-    mkdir -p /opt/zig; \
-    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
-    rm /tmp/zig.tar.xz; \
-    /opt/zig/zig version
-ENV PATH="/opt/zig:${PATH}"
+# The toolchain image runs as uid 65532 (correct for its own job, compiling a
+# user's bind-mounted project). A build stage writes to the image filesystem, so
+# it needs root here; nothing from this stage ships — only /server is copied out.
+USER root
 
 WORKDIR /src
-COPY . .
 
-# `zig build` produces the self-hosted `bit` plus libbitrt for this arch, and
-# `bit` then builds the server: the container is compiled by the compiler whose
-# website it serves.
-RUN zig build && zig-out/bin/bit build website/server -o /server
+# ONLY website/server/. This was `COPY . .`, which is 17GB on a dev machine -
+# .zig-cache alone is 16GB - and that copy, not the compile, was most of the build
+# time. The server's only imports are std/http, std/fs, std/strings and std/os,
+# all of which live in the toolchain image, so nothing else in the tree is input.
+#
+# The server-side build never showed this: ssd sends `git archive HEAD`, so
+# untracked caches were already absent there. .dockerignore covers the local case
+# too, but a narrow COPY is the actual fix - it cannot be defeated by a missing
+# ignore rule, and it makes the build state exactly what the build needs.
+COPY website/server/ ./website/server/
+
+# One command, no bootstrap: `bit` resolves stdlib and libbitrt relative to its
+# own install location, so there is nothing to configure. Multi-arch image, native
+# build, so the output matches the runtime stage's platform by construction.
+RUN bit build website/server -o /server
 
 # --- stage 2: the image that runs -------------------------------------------
 #
