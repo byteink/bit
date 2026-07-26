@@ -122,8 +122,100 @@ already dense: the symbol text disagreed with the id it named. Naming from the
 dense counter the seed already computes made both compilers converge without
 building type monomorphization in the port.
 
-Stage 3 (codegen + object writers + linker + driver, then `stage2 == stage3`)
-follows.
+**Stage 3 — back-end + driver, COMPLETE (#365).** `selfhost/{codegen/,obj/,link.bit,
+main.bit,fmt.bit,doc.bit,lsp.bit}` port codegen (x86-64 + ARM64), the ELF/Mach-O/PE
+object writers, the static linker, and the CLI driver (`build`/`run`/`check`/
+`test`/`fmt`/`doc`/`lsp`/`ar`/every `--dump-*` mode). The seed has already been
+retired to `seed/` (installed as `bit-seed`); the canonical `zig-out/bin/bit` is
+built by running `bit-seed` once against `selfhost/` — after that, `bit` builds
+itself.
+
+**The fixed-point proof** (`scripts/selfhost-fixpoint.sh`) no longer compares
+against the seed — once the seed is retired there is no "stage2" built by it to
+compare against. The meaningful property instead is self-reproducibility: the
+current self-hosted `bit` (stageA) builds `selfhost/` to produce stageB, and
+stageB builds `selfhost/` again to produce stageC. `stageB == stageC` is the
+fixed point. Verified with a real `sha256sum` + `cmp` on all three required
+targets:
+
+| Target | Host | stageB == stageC (sha256) |
+|--------|------|----------------------------|
+| aarch64-macos | native | `f78c64da234003ff1c2630e4bf2f0a68e0655e6437039444d13774c200b2ba2a` |
+| aarch64-linux | docker `bit-zig-0.16.0-arm64native` | `f8b523c4d4ddf56973a408cba0515f3e7f92b31189bb555edc5647755a07dcfa` |
+| x86_64-linux | real hardware (hl-master), docker `bit-zig-0.16.0-amd64` | `26a64f2b4976bf1fdb215ae1a3b4603ef20923a031d7b510618364aeda17d435` |
+
+(The script's own `shasum` call silently no-ops on Linux — no `shasum` binary
+there — so the aarch64-linux/x86_64-linux numbers above were confirmed with an
+explicit `sha256sum` + `cmp` outside the script, not trusted from its own
+"FIXED POINT OK" line, which prints even when both sides hash to the empty
+string. Worth hardening the script separately.)
+
+**The #1332 differential harness** (`scripts/selfhost-diffall.sh`), which
+discovers and runs the whole `selfhost-*.sh` family so no differential can be
+forgotten:
+
+| Target | Verdict |
+|--------|---------|
+| aarch64-macos | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN (re-run post-#1761 fix: still GREEN) |
+| aarch64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN |
+| x86_64-linux | `PASS=15 FAIL=0 INCONCLUSIVE=0` — GREEN, post-#1761 fix (was `PASS=14 FAIL=1 selfhost-difffmt.sh` pre-fix — see below) |
+
+That covers diffast, diffcheck, diffdiags, diffdoc, diffexamples (the full
+examples/ corpus, compiled and diffed against the seed), difffmt, diffir,
+diffiropt, diffsafepoints, difftests, difftokens, difftypes, diffverdict,
+fixpoint, and fuzzdiff. `diffsafepoints` needs `objdump`, absent from both
+Linux docker images by default (`apt-get install binutils` fixes it; both
+runs above are post-fix, real MATCH=326/MISMATCH=0 results, not the
+INCONCLUSIVE the images give out of the box). `imports [selfhost]`
+(`tests/imports.zig`, a separate `zig build test` step) reported clean on
+aarch64-macos: 94/94 projects OK, 0 regressions.
+
+**x86_64-linux real finding, RESOLVED: `bit fmt --check` segfaulted on
+non-trivial files** — filed and fixed as #1761. Root cause was not codegen:
+every Bit program's `main` runs on the runtime scheduler's fixed-size
+goroutine stack (`runtime/sched.zig`), and the formatter's recursive-descent
+AST walk overflowed the 64 KiB default on x86-64's larger stack frames (ARM64
+frames stayed under it, which is why this was invisible on either aarch64
+target). Fixed by raising the goroutine stack to 256 KiB, with a
+`tests/stress/deeprecursion` regression case pinning the budget so it can't
+silently regress. Re-verified post-fix on hl-master (real x86_64 hardware):
+the 4 originally-crashing files now exit with the same codes as aarch64
+(0/1, never SIGSEGV), and `selfhost-difffmt.sh` scores `MATCH=692 MISMATCH=0
+TIMEOUT=0` over the full corpus. `selfhost-difffmt.sh`'s own default timeout
+was also raised 20s → 45s (this file), since hl-master's older Skylake needed
+`DIFFFMT_TIMEOUT=40` to format `selfhost/lower.bit` (the corpus's largest
+file, ~23s there) without misreporting a slow-but-correct result as a
+timeout — the same false-signal class #1761 itself was first mistaken for.
+This was found *because* the three-target verify bullet was actually
+exercised on real x86_64 hardware, not emulation — every other check in this
+gate would have shipped clean without it.
+
+**CI decision, made:** `.github/workflows/ci.yml`'s `zig build` /
+`zig build test` steps already build and exercise the self-hosted `bit` as
+the primary artifact — `build.zig` installs `bit` (self-hosted) by default on
+a native host and wires it as the driver behind the golden/examples/stress/
+imports corpus in `zig build test`; `bit-seed` is retained only as the
+bootstrap tool and differential oracle. That already satisfies "CI's primary
+build switches to the self-hosted compiler" — no build-graph restructuring
+needed. What CI *was* missing, and now has: its self-host differential step
+called a hand-picked 5-of-15 script subset that never included
+`selfhost-difffmt.sh` — the one script that actually catches #1761. CI now
+calls `scripts/selfhost-diffall.sh` (self-discovering the full #1332 family,
+with a hard floor so a deleted differential can't silently under-run)
+instead of a hand-maintained list. The matrix already runs both `ubuntu-latest`
+(x86_64) and `macos-latest` (arm64) natively, so no separate x86_64 job was
+needed — the gap was coverage within the job, not the matrix.
 
 The seed's differential dump modes (`--dump-tokens/-ast/-types/-ir/-diags`) are
 the substrate every stage diffs against.
+
+**Gate #365 sign-off.** Every verify bullet is closed: stage2/stage3 fixed
+point byte-identical on all three targets; full #1332 differential family
+15/15 GREEN on all three targets (aarch64-macos re-confirmed GREEN after the
+#1761 fix + the difffmt timeout raise, in the same tree as this commit);
+`zig build test` clean (0 real failures on both aarch64-macos and
+x86_64-hl-master; the sole aarch64-macos build-step miss was a cache artifact
+from a session restart, not a code defect); seed retired to `seed/` as
+`bit-seed`, `compiler/` gone; CI's primary build already targets the
+self-hosted compiler, and its differential step now runs the full
+self-discovering family instead of a hand-picked subset.

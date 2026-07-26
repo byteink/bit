@@ -26,6 +26,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 | [quic](quic.md) | `"std/quic"` | QUIC v1 packet protection + frames |
 | [http3](http3.md) | `"std/http3"` | QPACK field compression |
 | [testing](testing.md) | `"std/testing"` | Assertions for `bit test` |
+| [sync](sync.md) | `"std/sync"` | `Mutex`, `RWMutex`, `WaitGroup`, `Once`, atomics |
 
 ## Conventions
 
