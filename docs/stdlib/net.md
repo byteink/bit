@@ -3,11 +3,11 @@
 Non-blocking TCP over green threads. A connection that waits for bytes parks the
 green thread reading it and leaves its OS thread free, so the idiomatic "one
 green thread per connection" server costs one `Task` per connection, not one OS
-thread. Every operation that can fail returns `T!` — propagate with `?` or handle
+thread. Every operation that can fail returns `T!` - propagate with `?` or handle
 with `catch`.
 
 Addresses are dotted-quad IPv4 literals (`"127.0.0.1"`), not hostnames: there is
-no name resolution yet. There is also no TLS — put a terminating proxy in front
+no name resolution yet. There is also no TLS - put a terminating proxy in front
 before exposing a public port.
 
 <!-- doctest: per-block -->
@@ -22,13 +22,13 @@ A listening socket. The only thing you do with it is `accept`; it is not a
 ### `listen(host: string, port: int): Listener!`
 
 Binds a listening socket to `host:port`. Pass port `0` to let the kernel choose a
-free port, then read it back with `port()` — the reliable way to bind in a test,
+free port, then read it back with `port()` - the reliable way to bind in a test,
 since choosing a number yourself races every other process on the machine.
 
 ### `Listener.port(): int!`
 
 The port the listener is actually bound to. Meaningful even when `0` was
-requested — that is how you learn the kernel's choice.
+requested - that is how you learn the kernel's choice.
 
 ### `Listener.accept(): Conn!`
 
@@ -66,7 +66,7 @@ One end of an established connection. Read, write, close.
 ### `dial(host: string, port: int): Conn!`
 
 Connects to `host:port`. A refused connection fails here, at `dial`, not later at
-the first write — the failure is reported where it happened.
+the first write - the failure is reported where it happened.
 
 ### `Conn.read(max: int): string`
 
@@ -142,7 +142,7 @@ socket.
 ### `Datagram`
 
 One received datagram: its `data`, and the `host`/`port` it came from. The sender
-address is what a server replies to — there is no connection to reply over.
+address is what a server replies to - there is no connection to reply over.
 
 ### `udpBind(host: string, port: int): UdpSocket!`
 
@@ -155,14 +155,14 @@ The port this socket is bound to. Meaningful even when `0` was requested.
 
 ### `UdpSocket.send(host: string, port: int, data: string): ()!`
 
-Sends one datagram to `host:port`. All-or-nothing — a datagram is never partially
+Sends one datagram to `host:port`. All-or-nothing - a datagram is never partially
 sent, so success means every byte went.
 
 ### `UdpSocket.recv(max: int): Datagram!`
 
 Receives the next datagram, up to `max` bytes, parking until one arrives. The
 result carries the sender's address. A zero-length datagram is legal and is not
-an error — unlike a TCP read, empty here does not mean "closed".
+an error - unlike a TCP read, empty here does not mean "closed".
 
 ### `UdpSocket.close()`
 
@@ -190,7 +190,7 @@ function echo(s: UdpSocket, n: int): ()! {
 
 Resolves a hostname to an IPv4 address (a dotted quad), using the first
 nameserver in `/etc/resolv.conf`. A dotted-quad argument comes back unchanged, so
-it is safe on an address that may already be numeric. A records only — no IPv6,
+it is safe on an address that may already be numeric. A records only - no IPv6,
 no search domains, no caching. `dial` and `udpBind` take numeric addresses, so
 resolve first:
 

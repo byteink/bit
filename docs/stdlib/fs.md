@@ -55,7 +55,7 @@ Opens `path` for writing at the end, creating it if absent.
 
 ### `File.read(max: int): string`
 
-Up to `max` bytes. A shorter result than `max` — including `""` — means end of
+Up to `max` bytes. A shorter result than `max` - including `""` - means end of
 file.
 
 ### `File.readAll(): string`

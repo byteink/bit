@@ -1,6 +1,6 @@
 # std/path
 
-Lexical path handling. Nothing here touches the filesystem — `base("/no/such")`
+Lexical path handling. Nothing here touches the filesystem - `base("/no/such")`
 answers without asking whether the file exists. For that, use `std/fs`.
 
 <!-- doctest: per-block -->
@@ -55,7 +55,7 @@ Everything before the final component, without its trailing separator. `"."` whe
 
 ### `ext(p: string): string`
 
-The extension of the final component, including the leading dot — the **last**
+The extension of the final component, including the leading dot - the **last**
 dot, so `.gz` and not `.tar.gz`. Empty when there is none, and a leading dot does
 not count (`.bashrc` has no extension).
 

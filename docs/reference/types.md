@@ -10,8 +10,8 @@ conversions, and operators. (Spec: §5.4–§5.8, §11, §12.2–§12.9, §13.3,
 - Signed integers: `i8 i16 i32 i64`
 - Unsigned integers: `u8 u16 u32 u64`
 - Floats: `f32 f64` (IEEE-754)
-- `bool` — `true` or `false`
-- `string` — immutable UTF-8; indexing yields a `byte`, `len(s)` is byte length
+- `bool` - `true` or `false`
+- `string` - immutable UTF-8; indexing yields a `byte`, `len(s)` is byte length
 - Aliases: `int` = `i64`, `uint` = `u64`, `byte` = `u8`, `rune` = `i32`
 
 Sizes are fixed on every target, so behavior is deterministic across platforms.
@@ -50,8 +50,8 @@ An interpreted string embeds expressions with `${ ... }`; the value is converted
 to `string`. Any type implementing `interface Show { show(): string }` works, as
 do all primitives. Write `\$` for a literal dollar sign.
 
-There is no universal `toString`: interpolating anything else — a slice, a map, a
-channel, a function value, an `error`, or a struct/interface without `show` — is a
+There is no universal `toString`: interpolating anything else - a slice, a map, a
+channel, a function value, an `error`, or a struct/interface without `show` - is a
 compile error (`E0073`). Interpolate a field, an element, or the result of a
 method instead, or give the type a `show(): string` method.
 
@@ -161,7 +161,7 @@ Methods attach behavior to a struct; see [Functions](functions.md#methods).
 
 ## Type aliases
 
-`type` introduces another spelling for a type. Aliases are **transparent** — the
+`type` introduces another spelling for a type. Aliases are **transparent** - the
 alias and its target are the same type (there are no nominal newtypes in v0.1).
 
 ```bit
@@ -226,7 +226,7 @@ function operators(a: int, b: int): int {
 
 - Unsigned arithmetic is modular (wraps).
 - Signed overflow **traps in debug builds** and **wraps** (two's complement) in
-  release builds — deterministic either way.
+  release builds - deterministic either way.
 - Integer divide or remainder by zero **panics**.
 - Float division by zero yields ±∞ or NaN (no panic).
 - Shift counts are taken modulo the operand's bit width.
@@ -245,10 +245,10 @@ The zero value of every reference type is `nil`.
 
 Bit is **garbage collected** by a tracing collector linked into every binary.
 There is no manual `free`, no use-after-free, and no double-free. Allocation is
-implicit — composite literals, constructors, closures, `append` growth, and
+implicit - composite literals, constructors, closures, `append` growth, and
 boxing an interface value all allocate. Every reachable object stays live and
 unreachable objects are eventually reclaimed; object identity is stable for the
-object's lifetime. There are no finalizers in v0.1 — use `defer` (see
+object's lifetime. There are no finalizers in v0.1 - use `defer` (see
 [Errors](errors.md#deferred-cleanup-with-defer)) for deterministic cleanup.
 
 ## Comparability

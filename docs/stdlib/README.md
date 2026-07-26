@@ -1,13 +1,13 @@
 # The Bit standard library
 
-One page per module. Every symbol a module exports has a section here — a build
+One page per module. Every symbol a module exports has a section here - a build
 step compares these pages against what the compiler reports as exported
 (`bit doc <module>`), and fails if one is missing. Every ```` ```bit ```` example
 below is compiled by the test suite, so none of it can quietly rot.
 
 | Module | Import | What it is for |
 |---|---|---|
-| [core](core.md) | *(none — the prelude)* | `println`, `Option`, `Result`, `newError` |
+| [core](core.md) | *(none - the prelude)* | `println`, `Option`, `Result`, `newError` |
 | [io](io.md) | `"std/io"` | Buffered readers and writers |
 | [fs](fs.md) | `"std/fs"` | Files and directories |
 | [path](path.md) | `"std/path"` | Lexical path handling |
@@ -31,7 +31,7 @@ below is compiled by the test suite, so none of it can quietly rot.
 ## Conventions
 
 **Everything that can fail says so.** A fallible function returns `T!`. There are
-no exceptions and no error codes hidden in return values — propagate with `?`, or
+no exceptions and no error codes hidden in return values - propagate with `?`, or
 handle with `catch`. See [errors](../reference/errors.md).
 
 **Absence is a type, not a null.** A function that may find nothing returns

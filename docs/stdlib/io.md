@@ -4,7 +4,7 @@ Buffered streams over file descriptors. `println` (from the prelude) issues one
 write syscall per line; a `Writer` batches many writes into one.
 
 A `Writer` and a `Reader` are structs, so they are reference types: their methods
-mutate the stream in place. **Nothing flushes for you** — a `Writer` that goes
+mutate the stream in place. **Nothing flushes for you** - a `Writer` that goes
 out of scope unflushed loses whatever it still holds.
 
 <!-- doctest: per-block -->
@@ -13,15 +13,15 @@ out of scope unflushed loses whatever it still holds.
 
 ### `Stdin: i64`
 
-`0` — the process's standard input.
+`0` - the process's standard input.
 
 ### `Stdout: i64`
 
-`1` — standard output.
+`1` - standard output.
 
 ### `Stderr: i64`
 
-`2` — standard error.
+`2` - standard error.
 
 ## Writing
 
@@ -99,7 +99,7 @@ Everything still unread, to end of input.
 ```bit
 import { stdin, stdout } from "std/io"
 
-// `None` means end of input — the only way the loop terminates.
+// `None` means end of input - the only way the loop terminates.
 function echoLines() {
   let r = stdin()
   let w = stdout()
@@ -123,7 +123,7 @@ function slurp(): string {
 
 Exactly `n` bytes, or fewer only when the input truly ends first. Bytes already
 buffered by a prior `readLine` are consumed before any refill, so `readBytes`
-composes with `readLine` on the same `Reader` — the basis for length-framed
+composes with `readLine` on the same `Reader` - the basis for length-framed
 protocols such as LSP's `Content-Length`. `n <= 0` reads nothing and touches no
 input.
 

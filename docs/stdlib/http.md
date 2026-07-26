@@ -1,10 +1,10 @@
 # std/http
 
-HTTP/1.1, HTTP/2, and HTTP/3 — built entirely in Bit over `std/net` (cleartext),
+HTTP/1.1, HTTP/2, and HTTP/3 - built entirely in Bit over `std/net` (cleartext),
 `std/tls` (TLS 1.3), and `std/quic` (QUIC). A server accepts connections and handles each on its own green thread; a
 client dials, sends one request, and reads the response. The wire protocol is the
-same on either transport — an `https://` URL or `serveTls` just swaps the socket.
-Fallible calls return `T!` — propagate with `?` or handle with `catch`.
+same on either transport - an `https://` URL or `serveTls` just swaps the socket.
+Fallible calls return `T!` - propagate with `?` or handle with `catch`.
 
 Scope: HTTP/1.1 over cleartext or TLS, one request per connection
 (`Connection: close`), no chunked transfer encoding, no redirects. Headers are
@@ -15,13 +15,13 @@ carried as a raw block and read with `header()`.
 ## Transports
 
 The `Request`/`Response` types and the `(Request) => Response` handler are the
-same across all three protocols — only the socket underneath changes.
+same across all three protocols - only the socket underneath changes.
 
 | Protocol | How to use | Transport | Notes |
 | --- | --- | --- | --- |
 | HTTP/1.1 | `serve` / `listenAndServe`; `get`/`request` on `http://` or `https://` | TCP, cleartext or TLS 1.3 | Always available; the fallback for the other two. |
 | HTTP/2 | ALPN `h2`, negotiated by `serveTls` and `getTls`/`requestTls` over TLS | TCP + TLS 1.3 | Selected automatically when both peers offer `h2`; falls back to HTTP/1.1. |
-| HTTP/3 | `serveH3`; client via `https+h3://` or Alt-Svc discovery | QUIC (UDP) + TLS 1.3 | Opt-in — see [HTTP/3](#http3). |
+| HTTP/3 | `serveH3`; client via `https+h3://` or Alt-Svc discovery | QUIC (UDP) + TLS 1.3 | Opt-in - see [HTTP/3](#http3). |
 
 ## Messages
 
@@ -102,7 +102,7 @@ Stops listening.
 ### `listenAndServe(host: string, port: int, handler: (Request) => Response): ()!`
 
 Serves HTTP on `host:port` forever, dispatching every request to `handler` on its
-own green thread — the idiomatic server. `handler` is an ordinary function value.
+own green thread - the idiomatic server. `handler` is an ordinary function value.
 Returns only on a bind or accept error. For a kernel-chosen port, or to serve a
 bounded number of requests, drive `serve`/`accept`/`respond` yourself.
 
@@ -179,13 +179,13 @@ function head(url: string): Response! {
 
 An `https://` URL transparently runs the same request over TLS 1.3, verifying the
 server against the operating-system trust store (falling back to a small bundled
-root set) — no extra arguments to `request` / `get` / `post`. For a custom trust
-configuration — a pinned private CA, a fixed `serverName`, or `insecureSkipVerify`
-in a test — pass a `std/tls` `TlsConfig` to the https-only variants.
+root set) - no extra arguments to `request` / `get` / `post`. For a custom trust
+configuration - a pinned private CA, a fixed `serverName`, or `insecureSkipVerify`
+in a test - pass a `std/tls` `TlsConfig` to the https-only variants.
 
 ### `requestTls(method: string, url: string, body: string, config: TlsConfig): Response!`
 
-As `request`, but over https with an explicit `std/tls` `TlsConfig` — pinned
+As `request`, but over https with an explicit `std/tls` `TlsConfig` - pinned
 roots, a fixed `serverName`, or `insecureSkipVerify`. `config.alpn` defaults to
 `["h2","http/1.1"]` when empty, so the request runs over HTTP/2 whenever the
 server selects `h2`; set it to `["http/1.1"]` to force HTTP/1.1. A non-`https://`
@@ -209,13 +209,13 @@ connection and the server keeps serving.
 
 This is also the HTTP/2 server: `serveTls` offers ALPN `["h2","http/1.1"]`, so a
 client that negotiates `h2` is served over HTTP/2 and everything else over
-HTTP/1.1 — the same `handler` serves both, and you write nothing extra to get
+HTTP/1.1 - the same `handler` serves both, and you write nothing extra to get
 HTTP/2. There is no `serveH2` because there is nothing for it to do. See
 [HTTP/2](#http2) below and `examples/http2server`.
 
 A client that offers ALPN but shares no protocol with the server has its
 handshake **aborted** (RFC 7301 §3.2 `no_application_protocol`), not silently
-downgraded to HTTP/1.1 — so a client that offers only `h2` is either served over
+downgraded to HTTP/1.1 - so a client that offers only `h2` is either served over
 HTTP/2 or refused, never quietly served over something it did not ask for.
 
 ```bit
@@ -228,7 +228,7 @@ function fetchStatus(url: string): int! {
   return res.status
 }
 
-// An https GET pinned to a private CA (PEM) — a test fixture or corporate root.
+// An https GET pinned to a private CA (PEM) - a test fixture or corporate root.
 function fetchPinned(url: string, caPem: string): Response! {
   let cfg = newTlsConfig(newTrustStore(caPem)?)
   return getTls(url, cfg)?
@@ -251,36 +251,36 @@ function serveSecure(certPem: string, keyPem: string) {
 
 ## HTTP/2
 
-Over TLS, the protocol is chosen by ALPN during the handshake — HTTP/2 (`h2`, RFC
+Over TLS, the protocol is chosen by ALPN during the handshake - HTTP/2 (`h2`, RFC
 9113) when both ends support it, HTTP/1.1 otherwise. This is transparent: the same
 `get`/`request`/`serveTls` calls and the same `(Request) => Response` handler drive
-either protocol. Requests and responses map to HTTP/2 streams — the
+either protocol. Requests and responses map to HTTP/2 streams - the
 `:method`/`:scheme`/`:authority`/`:path` and `:status` pseudo-headers become the
-`Request`/`Response` fields, the rest become the raw header block — and HTTP/2
+`Request`/`Response` fields, the rest become the raw header block - and HTTP/2
 multiplexing, HPACK, and flow control are handled by the `std/http2` engine
 underneath.
 
 - **Client**: `request`/`get`/`post` over an `https://` URL offer ALPN
   `["h2","http/1.1"]`. If the server selects `h2`, the exchange runs over the
   HTTP/2 engine; otherwise it falls back to HTTP/1.1. `requestTls`/`getTls`/`postTls`
-  do the same, and default `config.alpn` to `["h2","http/1.1"]` when it is empty —
+  do the same, and default `config.alpn` to `["h2","http/1.1"]` when it is empty -
   set it to `["http/1.1"]` to force HTTP/1.1.
 - **Server**: `serveTls` advertises ALPN `["h2","http/1.1"]`. Each accepted
   connection is served over HTTP/2 or HTTP/1.1 by what it negotiated; HTTP/2
   streams are each dispatched to the handler on their own green thread.
-- **Cleartext** (`http://`, `listenAndServe`) is always HTTP/1.1 — HTTP/2 here
+- **Cleartext** (`http://`, `listenAndServe`) is always HTTP/1.1 - HTTP/2 here
   requires TLS ALPN.
 
 There is deliberately no `serveH2` entry point: HTTP/2 is not a separate server,
 it is what `serveTls` already speaks whenever ALPN selects it. `serveH3` is
-separate only because HTTP/3 is a different *transport* — QUIC over UDP, a socket
-`serveTls` does not own — not because HTTP/2 is missing. `examples/http2server`
+separate only because HTTP/3 is a different *transport* - QUIC over UDP, a socket
+`serveTls` does not own - not because HTTP/2 is missing. `examples/http2server`
 is a runnable HTTP/2 server that proves the negotiated protocol is `h2`.
 
 | API / URL | Transport | Protocol |
 |---|---|---|
-| `http://` — `get`/`request`/`listenAndServe` | cleartext TCP | HTTP/1.1 |
-| `https://` — `get`/`request`/`getTls` | TLS 1.3 + ALPN | HTTP/2 when the server picks `h2`, else HTTP/1.1 |
+| `http://` - `get`/`request`/`listenAndServe` | cleartext TCP | HTTP/1.1 |
+| `https://` - `get`/`request`/`getTls` | TLS 1.3 + ALPN | HTTP/2 when the server picks `h2`, else HTTP/1.1 |
 | `serveTls` | TLS 1.3 + ALPN `["h2","http/1.1"]` | per client: HTTP/2 or HTTP/1.1 |
 
 ```bit
@@ -295,7 +295,7 @@ function route(req: Request): Response {
 }
 
 // serveTls advertises ALPN ["h2","http/1.1"]; a client that negotiates h2 is
-// served over the HTTP/2 engine, any other over HTTP/1.1 — same handler.
+// served over the HTTP/2 engine, any other over HTTP/1.1 - same handler.
 function serveSecure(certPem: string, keyPem: string) {
   serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
     print("server failed: ${e.message()}\n")
@@ -312,14 +312,14 @@ function fetchStatus(url: string): int! {
 
 ## HTTP/3
 
-HTTP/3 (RFC 9114) runs over QUIC — a TLS 1.3 transport on UDP, not TCP — so unlike
+HTTP/3 (RFC 9114) runs over QUIC - a TLS 1.3 transport on UDP, not TCP - so unlike
 the HTTP/1.1 ↔ HTTP/2 choice it is **opt-in**, never negotiated behind a plain
 `https://` request: QUIC needs UDP and is heavier to set up, so the same
 `https://` URL always stays on TLS-over-TCP. A client reaches HTTP/3 one of two
 ways:
 
-- **Explicit scheme** — an `https+h3://` URL dials QUIC and speaks HTTP/3 directly.
-- **Alt-Svc discovery** — a `serveTls` server advertises `Alt-Svc: h3=":<port>"`
+- **Explicit scheme** - an `https+h3://` URL dials QUIC and speaks HTTP/3 directly.
+- **Alt-Svc discovery** - a `serveTls` server advertises `Alt-Svc: h3=":<port>"`
   (RFC 7838) on every response, naming an HTTP/3 endpoint on the same port number
   over UDP. A `Client` remembers that advertisement and upgrades a later request to
   the same authority to HTTP/3 automatically.
@@ -331,19 +331,19 @@ pseudo-headers as the `Request`/`Response` fields, the rest as the raw header
 block, and QPACK + QUIC framing are handled by the `std/http3` engine.
 
 The QUIC transport is one connection per UDP socket in this build, so `serveH3`
-serves one client connection's requests — run it on its own green thread, and pair
+serves one client connection's requests - run it on its own green thread, and pair
 it with a `serveTls` on the same port for discovery. The h3 client is one request
 per connection, like the rest of this module. (The QUIC layer does not yet verify
-server certificates, so the h3 client leg is unauthenticated — treat `https+h3://`
+server certificates, so the h3 client leg is unauthenticated - treat `https+h3://`
 and the Alt-Svc upgrade as experimental until QUIC certificate verification lands.)
 
 | API / URL | Transport | Protocol |
 |---|---|---|
-| `http://` — `get`/`request`/`listenAndServe` | cleartext TCP | HTTP/1.1 |
-| `https://` — `get`/`request`/`getTls` | TLS 1.3 + ALPN | HTTP/2 when the server picks `h2`, else HTTP/1.1 |
+| `http://` - `get`/`request`/`listenAndServe` | cleartext TCP | HTTP/1.1 |
+| `https://` - `get`/`request`/`getTls` | TLS 1.3 + ALPN | HTTP/2 when the server picks `h2`, else HTTP/1.1 |
 | `serveTls` | TLS 1.3 + ALPN `["h2","http/1.1"]` | per client: HTTP/2 or HTTP/1.1; advertises h3 via Alt-Svc |
-| `https+h3://` — `get`/`request` | QUIC (UDP) | HTTP/3 |
-| `Client` — after an Alt-Svc upgrade | QUIC (UDP) | HTTP/3 |
+| `https+h3://` - `get`/`request` | QUIC (UDP) | HTTP/3 |
+| `Client` - after an Alt-Svc upgrade | QUIC (UDP) | HTTP/3 |
 | `serveH3` | QUIC (UDP) | HTTP/3 |
 
 ### `serveH3(host, port, certPem, keyPem, handler): ()!`
@@ -391,7 +391,7 @@ function fetchH3(url: string): int! {
 
 An HTTP client that remembers the HTTP/3 endpoints servers advertise via Alt-Svc,
 so a later request to the same authority upgrades to HTTP/3. It carries its own TLS
-config and Alt-Svc cache — there is **no global state**: hold one `Client` across
+config and Alt-Svc cache - there is **no global state**: hold one `Client` across
 requests to reuse the cache.
 
 ### `newClient(): Client`
@@ -401,8 +401,8 @@ A `Client` with secure-by-default TLS (verification on, system/bundled roots, AL
 
 ### `newClientTls(config: TlsConfig): Client`
 
-A `Client` with an explicit `std/tls` config for its `https://` leg — pinned roots,
-a fixed `serverName`, or `insecureSkipVerify` — and an empty Alt-Svc cache.
+A `Client` with an explicit `std/tls` config for its `https://` leg - pinned roots,
+a fixed `serverName`, or `insecureSkipVerify` - and an empty Alt-Svc cache.
 
 ### `Client.request(method: string, url: string, body: string): Response!`
 

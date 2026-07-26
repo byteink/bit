@@ -3,7 +3,7 @@
 Bit uses **result-style error values with explicit propagation**, not
 exceptions. A fallible function returns either an ok value or an error;
 propagation is the single postfix operator `?`, and handling is the local
-`catch` expression. Control flow stays visible — every early exit is a `?` or
+`catch` expression. Control flow stays visible - every early exit is a `?` or
 `fail` you can see. Unrecoverable bugs use `panic`. (Spec: §18.)
 
 ## Fallible functions
@@ -18,7 +18,7 @@ function fetch(url: string): Response ! HttpError { } // custom error type
 function run(): ()! { }                               // nothing OR error
 ```
 
-(Signatures only — the bodies are empty and `Response`/`HttpError` stand in for
+(Signatures only - the bodies are empty and `Response`/`HttpError` stand in for
 your own types, so this block is not doc-tested.)
 
 The value of a fallible function is a built-in result; you cannot construct it by
@@ -82,9 +82,9 @@ function loadCount(path: string): int! {
 
 `catch` consumes a fallible value locally. Two forms:
 
-- `expr catch default` — evaluates to the ok value, or to `default` (of type `T`)
+- `expr catch default` - evaluates to the ok value, or to `default` (of type `T`)
   if err. The error is discarded.
-- `expr catch e { ... }` — binds the error to `e` in a block; the block must
+- `expr catch e { ... }` - binds the error to `e` in a block; the block must
   either produce a `T` (its final expression) or divert control with `return`,
   `fail`, `panic`, `break`, or `continue`.
 
@@ -123,7 +123,7 @@ function quickCount(path: string): int {
 ## Deferred cleanup with `defer`
 
 `defer call` schedules a call to run when the enclosing function returns by any
-path — normal `return`, `fail`, or `?` propagation — in last-in-first-out order.
+path - normal `return`, `fail`, or `?` propagation - in last-in-first-out order.
 Arguments are evaluated at the `defer` statement, not at execution time. This
 gives deterministic resource release without finalizers.
 
@@ -141,7 +141,7 @@ function copyFile(src: string, dst: string): ()! {
 ```
 
 Deferred calls also run while a panic unwinds to the top, so cleanup happens
-before abort — but they cannot stop the panic.
+before abort - but they cannot stop the panic.
 
 ## Panics
 

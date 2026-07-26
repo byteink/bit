@@ -1,4 +1,4 @@
-# std/core — the prelude
+# std/core - the prelude
 
 Every module gets `std/core` without importing it. It holds the two container
 types that stand in for null and for exceptions, and the one function you reach
@@ -22,7 +22,7 @@ right before a panic; for many small writes, use a `std/io` `Writer` instead.
 ## Errors
 
 Bit has no exceptions. A fallible function returns `T!`, and the error travels
-as a value — see [errors](../reference/errors.md).
+as a value - see [errors](../reference/errors.md).
 
 ### `newError(msg: string): error`
 
@@ -46,7 +46,7 @@ function show(n: int) {
 }
 ```
 
-## `Option<T>` — a value, or nothing
+## `Option<T>` - a value, or nothing
 
 ### `Option`
 
@@ -71,8 +71,8 @@ function report(xs: []int) {
 }
 ```
 
-A bare `None` carries nothing to infer `T` from, so annotate it —
-`Option<int>.None` — unless the target type already says which `Option` it is.
+A bare `None` carries nothing to infer `T` from, so annotate it -
+`Option<int>.None` - unless the target type already says which `Option` it is.
 
 ### `isSome(o: Option<T>): bool`
 
@@ -84,7 +84,7 @@ Whether `o` is empty. Exactly `!isSome(o)`.
 
 ### `unwrap(o: Option<T>): T`
 
-The contained value. **Panics** if `o` is `None` — use it only where `None` is a
+The contained value. **Panics** if `o` is `None` - use it only where `None` is a
 bug, not a possibility.
 
 ### `unwrapOr(o: Option<T>, dflt: T): T`
@@ -104,7 +104,7 @@ function must(o: Option<int>): int {
 }
 ```
 
-## `Result<T, E>` — a value, or a reason
+## `Result<T, E>` - a value, or a reason
 
 ### `Result`
 

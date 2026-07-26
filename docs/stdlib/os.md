@@ -48,7 +48,7 @@ function echoArgs() {
 ### `env(name: string): string`
 
 The value of `name`, or `""` when it is unset. An unset variable and one set to
-the empty string are indistinguishable — use `envOr` when that matters.
+the empty string are indistinguishable - use `envOr` when that matters.
 
 ### `envOr(name: string, fallback: string): string`
 
@@ -77,7 +77,7 @@ Resolving symlinks is what makes this usable for locating an installed
 program's own files: a tool is typically installed as a symlink into `PATH`,
 and the symlink's directory is not the install root.
 
-Prefer this over `arg(0)`, which is only what the caller passed — it may be a
+Prefer this over `arg(0)`, which is only what the caller passed - it may be a
 bare name, a path relative to a working directory that has since changed, or
 simply wrong. Treat an empty result as "unknown" and fall back; never treat it
 as a path.
@@ -101,7 +101,7 @@ function assetDir(): string {
 ### `exit(code: int)`
 
 Ends the process immediately with `code`. Deferred statements do not run and
-buffered `std/io` writers are not flushed — flush before calling.
+buffered `std/io` writers are not flushed - flush before calling.
 
 Returning from `main` is the ordinary way to exit; `exit` is for the cases where
 you are deep in a call stack and there is nothing to return to.

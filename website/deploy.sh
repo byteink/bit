@@ -41,6 +41,20 @@ trap 'rm -f "$gen"' EXIT
 "$root/zig-out/bin/bit" build "$root/website/gen" -o "$gen"
 (cd "$root" && "$gen")
 
+# The server binary the container runs, cross-compiled for the container's
+# target. `FROM scratch` has no toolchain and needs none: `bit build` emits a
+# static executable with no libc and no dynamic loader.
+#
+# BIT_SERVER_TARGET exists so a local `docker build` on this Mac can produce an
+# aarch64-linux image while the real deploy produces x86_64-linux for
+# byteink.main. Getting it wrong is not subtle — the container exits immediately
+# with an exec format error.
+target=${BIT_SERVER_TARGET:-x86_64-linux}
+mkdir -p "$root/website/build"
+"$root/zig-out/bin/bit" build "$root/website/server" \
+	-o "$root/website/build/staticserver" --target "$target"
+echo "deploy.sh: built the server for ${target}"
+
 # Run from the repo root: ssd resolves `files:` paths relative to it, not to
 # wherever this script was invoked from.
 cd "$root"

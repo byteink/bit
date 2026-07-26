@@ -29,7 +29,7 @@ Appends `s`. Returns the same builder.
 
 ### `Builder.writeByte(c: u8): Builder`
 
-Appends the single byte `c` — not a rune. Returns the same builder.
+Appends the single byte `c` - not a rune. Returns the same builder.
 
 ### `Builder.toString(): string`
 
@@ -172,7 +172,7 @@ yields `[s]`. The inverse of `join`.
 ### `parseInt(s: string): int!`
 
 The signed decimal integer `s` denotes. Fails on an empty string, a bare sign, a
-non-digit, or a value outside the `int` range — it never silently wraps. (The
+non-digit, or a value outside the `int` range - it never silently wraps. (The
 most negative `int` is rejected; the parser accumulates a positive magnitude.)
 
 ```bit

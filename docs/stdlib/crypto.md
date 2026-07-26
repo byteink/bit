@@ -16,14 +16,14 @@ the modern, safe choice; the alternatives exist for interop or legacy.
 | Task | Use | Notes |
 | --- | --- | --- |
 | Hash data | `Sha256` | `Blake2b`/`Sha512` are faster on 64-bit; `Blake3` for very large inputs. |
-| Authenticate with a shared key | HMAC-`Sha256` | Or Poly1305 inside an AEAD — don't hand-roll "hash the key + message". |
+| Authenticate with a shared key | HMAC-`Sha256` | Or Poly1305 inside an AEAD - don't hand-roll "hash the key + message". |
 | Encrypt **and** authenticate | AEAD: `Aes256Gcm`, or `ChaCha20Poly1305` where AES has no hardware | Never a raw cipher without a MAC. `AesGcmSiv` if nonce reuse is a real risk. |
-| Store a password | `argon2id` | Or `scrypt`/`bcrypt`. Never a plain or fast hash — those are brute-forceable. |
+| Store a password | `argon2id` | Or `scrypt`/`bcrypt`. Never a plain or fast hash - those are brute-forceable. |
 | Derive keys from a shared secret | `hkdf` over `Sha256` | For a password, derive with `argon2id` first, not HKDF. |
 | Sign (new protocol) | `ed25519` | `ecdsa` P-256 for interop; RSA-PSS only for legacy peers. |
 | Key agreement | `x25519` | `x448` for a higher security margin; NIST P-curves for interop. |
 | Post-quantum | `mlkem` (key encapsulation), `mldsa` (signatures) | Pair ML-KEM with X25519 as a hybrid until PQ is proven in the field. |
-| Encode bytes as text | `encodeHex` / `base64Encode` | Not encryption — just a wire representation. |
+| Encode bytes as text | `encodeHex` / `base64Encode` | Not encryption - just a wire representation. |
 
 Rules of thumb: prefer an AEAD over a bare cipher; never use MD5 or SHA-1 for
 anything security-relevant (they are here only to read legacy data); and compare
@@ -32,19 +32,19 @@ secrets with the [Constant-time](#constant-time) helpers, never `==`.
 ## Hashing
 
 The cryptographic hash contract. `Hash` is the streaming interface every digest
-in the library satisfies; concrete algorithms — SHA-256, SHA-512 — are separate
+in the library satisfies; concrete algorithms - SHA-256, SHA-512 - are separate
 types that conform to it structurally, so code can hash against `Hash` without
 naming a specific algorithm.
 
 Because interfaces are structural, a type is a `Hash` simply by having the five
-methods below. The example is a stand-in digest — it counts bytes rather than
-hashing them — but a real one plugs in exactly the same way.
+methods below. The example is a stand-in digest - it counts bytes rather than
+hashing them - but a real one plugs in exactly the same way.
 
 ```bit
 import { Hash, digest } from "std/crypto"
 
 // A stand-in "digest": it remembers how many bytes it saw and returns a fixed
-// 4-byte tag. A real SHA-256 satisfies `Hash` the same way — by its methods.
+// 4-byte tag. A real SHA-256 satisfies `Hash` the same way - by its methods.
 struct ByteCounter {
   seen: int
 }
@@ -104,7 +104,7 @@ interface Hash {
 
 Feed input with any number of `write` calls, then read the digest with `sum`.
 `reset` rewinds to the empty state so one value can hash many messages. `size` is
-the digest length and `blockSize` the algorithm's internal block size — HMAC keys
+the digest length and `blockSize` the algorithm's internal block size - HMAC keys
 that block, so it must be able to ask.
 
 ### `digest(h: Hash, data: []byte): []byte`
@@ -115,12 +115,12 @@ convenience over the streaming methods for the common one-buffer case.
 ## Randomness
 
 Cryptographically secure randomness, drawn from the operating system's CSPRNG.
-Every value here traces back to `cryptoRandomBytes` (ABI.md §21) — the OS entropy
+Every value here traces back to `cryptoRandomBytes` (ABI.md §21) - the OS entropy
 pool, never a userspace PRNG and never a weak or zero fallback. This module only
 reshapes those raw bytes into convenient forms; it adds no randomness of its own,
 so its output is exactly as strong as the OS source.
 
-If the OS entropy source fails, a draw is fatal rather than degraded — a
+If the OS entropy source fails, a draw is fatal rather than degraded - a
 silently weak key is worse than a crash.
 
 ### `randomBytes(n: int): []byte`
@@ -156,8 +156,8 @@ A uniformly random value in `[0, n)`, free of modulo bias. `n` must be greater
 than zero.
 
 A plain `randomU64() % n` over-represents the low residues whenever `n` does not
-divide 2^64. This rejects and redraws the draws that would cause that skew — the
-top `2^64 mod n` values — so every residue is equally likely.
+divide 2^64. This rejects and redraws the draws that would cause that skew - the
+top `2^64 mod n` values - so every residue is equally likely.
 
 ```bit
 import { randomU64, randomUintBelow } from "std/crypto"
@@ -217,30 +217,30 @@ exact inverse of `encodeHex`/`encodeHexUpper` on well-formed input.
 
 ## Constant-time
 
-Branchless, data-independent building blocks for constant-time code — tag
+Branchless, data-independent building blocks for constant-time code - tag
 comparison, secret-dependent selection, and wiping key material. Each is written
 so its control flow and memory access depend only on public values (slice
 lengths), never on secret contents.
 
-Policy for v1: the library is written to be constant-time *by construction* —
+Policy for v1: the library is written to be constant-time *by construction* -
 no primitive here branches on, or indexes memory by, a secret. The compiler does
 **not** machine-verify constant-timeness; it is a property of how this code is
 written, not a guarantee the toolchain enforces. And these are software
 implementations: they defend against data-dependent branches and lookups, but
 **not** against hardware micro-architectural side channels (cache, speculation,
 port contention, data-dependent instruction timing). Defeating those needs
-constant-time hardware primitives — a later hardware-acceleration track, out of
+constant-time hardware primitives - a later hardware-acceleration track, out of
 scope here.
 
-Because Bit is Go-like it has no `bool`->`int` conversion, so — like Go's own
-`crypto/subtle` — the selector for `ctSelect` is an `int` in `{0, 1}` (the 0/1
+Because Bit is Go-like it has no `bool`->`int` conversion, so - like Go's own
+`crypto/subtle` - the selector for `ctSelect` is an `int` in `{0, 1}` (the 0/1
 result of a prior constant-time comparison), not a `bool`.
 
 ```bit
 import { ctEq, ctSelect, secureZero } from "std/crypto"
 
-// Verify a MAC tag in constant time — no early exit reveals where a forgery
-// first diverges — then wipe the key so it can't linger in memory.
+// Verify a MAC tag in constant time - no early exit reveals where a forgery
+// first diverges - then wipe the key so it can't linger in memory.
 function checkTag(key: []byte, want: []byte, got: []byte): bool {
   let ok = ctEq(want, got)
   secureZero(key)
@@ -258,14 +258,14 @@ function pick(v: int, hi: int, lo: int): int {
 Constant-time byte-slice equality, for comparing MACs and hash digests. Unlike
 `a == b`, which can stop at the first differing byte and so leak *where* two tags
 diverge, this always scans the full length before deciding. The one
-length-dependent branch is the fast `len(a) != len(b)` reject — slice lengths are
-public, not secret — after which it OR-accumulates every `a[i] ^ b[i]` and
+length-dependent branch is the fast `len(a) != len(b)` reject - slice lengths are
+public, not secret - after which it OR-accumulates every `a[i] ^ b[i]` and
 returns whether that accumulator is still zero.
 
 ### `ctSelect(v: int, a: int, b: int): int`
 
 Constant-time select: returns `a` when `v` is 1 and `b` when `v` is 0, with no
-branch on `v`. `v` must be exactly 0 or 1 — pass the 0/1 result of a prior
+branch on `v`. `v` must be exactly 0 or 1 - pass the 0/1 result of a prior
 constant-time comparison. Internally `0 - v` is an all-ones mask for `v == 1` and
 an all-zeros mask for `v == 0`; `a` survives through the mask, `b` through its
 complement, and the two are ORed, so the choice never becomes a branch.
@@ -281,8 +281,8 @@ needed; `b`'s length is unchanged.
 The SHA-2 32-bit digests, SHA-256 and SHA-224 (FIPS 180-4). Both share one
 64-round compression over 32-bit words and differ only in their initial state and
 output length: SHA-256 is 32 bytes, SHA-224 is 28. Each is a `Hash` (structurally,
-§14.3), so it streams — feed bytes with any number of `write` calls, then read the
-digest with `sum` — and slots into anything written against `Hash`, including HMAC
+§14.3), so it streams - feed bytes with any number of `write` calls, then read the
+digest with `sum` - and slots into anything written against `Hash`, including HMAC
 and `digest`.
 
 `sum` finalizes on a copy of the running state, so it neither consumes the hasher
@@ -318,7 +318,7 @@ function streamed(): []byte {
 ### `Sha256`
 
 The streaming state for both SHA-256 and SHA-224. Build one with `newSha256` or
-`newSha224` rather than a literal — the constructors install the correct initial
+`newSha224` rather than a literal - the constructors install the correct initial
 state and round constants. It satisfies `Hash`, so it carries the five streaming
 methods below.
 
@@ -338,7 +338,7 @@ you like; the digest is of everything written since the last `reset`.
 
 ### `Sha256.sum(): []byte`
 
-The digest of everything written so far — 32 bytes for SHA-256, 28 for SHA-224.
+The digest of everything written so far - 32 bytes for SHA-256, 28 for SHA-224.
 Finalizes on a copy of the state, so it is non-destructive: you may call it
 repeatedly and keep writing afterward.
 
@@ -353,12 +353,12 @@ The digest length in bytes: 32 for SHA-256, 28 for SHA-224.
 
 ### `Sha256.blockSize(): int`
 
-The internal block size in bytes — 64 for both variants. HMAC keys this block.
+The internal block size in bytes - 64 for both variants. HMAC keys this block.
 ## SHA-1 (legacy)
 
 SHA-1 (FIPS 180-1) produces a 160-bit (20-byte) digest. It is provided for
-**interoperability only**: SHA-1 is **not** collision-resistant — practical
-collisions have existed since 2017 (SHAttered) — so it must **never** back a new
+**interoperability only**: SHA-1 is **not** collision-resistant - practical
+collisions have existed since 2017 (SHAttered) - so it must **never** back a new
 signature, certificate, MAC, or any new security decision. Use it solely to
 speak formats that still mandate it: UUIDv5 (RFC 4122) and the fingerprints of
 pre-existing X.509 certificates. For anything new, use SHA-256.
@@ -369,7 +369,7 @@ through `digest` or incrementally through `write`/`sum`.
 ```bit
 import { newSha1, digest, encodeHex } from "std/crypto"
 
-// One-shot: the lowercase hex fingerprint of a buffer. Legacy interop only —
+// One-shot: the lowercase hex fingerprint of a buffer. Legacy interop only -
 // e.g. a UUIDv5 namespace hash or an old certificate fingerprint, never a new
 // signature.
 function sha1Hex(data: []byte): string {
@@ -389,8 +389,7 @@ function sha1Stream(head: []byte, tail: []byte): []byte {
 
 ### `newSha1(): Hash`
 
-A fresh SHA-1 hasher in the empty state, typed as the streaming `Hash` interface
-— digest size 20 bytes, block size 64. Legacy: interop only, not
+A fresh SHA-1 hasher in the empty state, typed as the streaming `Hash` interface - digest size 20 bytes, block size 64. Legacy: interop only, not
 collision-resistant; never use it for new signatures or MACs.
 
 ## MD5 (legacy)
@@ -400,7 +399,7 @@ for **interoperability only**: collisions are trivial to produce (seconds on a
 laptop) and chosen-prefix collisions have forged real CA certificates. It must
 **never** back integrity checks, signatures, MACs, password hashing, or any
 security decision. Use it solely to read or reproduce legacy formats that still
-mandate it — old checksums, ETags, and pre-existing protocol fields. For anything
+mandate it - old checksums, ETags, and pre-existing protocol fields. For anything
 new, use SHA-256.
 
 MD5 is little-endian throughout (message words and the length pad), unlike the
@@ -410,7 +409,7 @@ works one-shot through `digest` or incrementally through `write`/`sum`.
 ```bit
 import { newMd5, digest, encodeHex } from "std/crypto"
 
-// One-shot: the lowercase hex digest of a buffer. Legacy interop only — e.g.
+// One-shot: the lowercase hex digest of a buffer. Legacy interop only - e.g.
 // reproducing an old checksum or ETag, never an integrity check or signature.
 function md5Hex(data: []byte): string {
   return encodeHex(digest(newMd5(), data))
@@ -429,7 +428,7 @@ function md5Stream(head: []byte, tail: []byte): []byte {
 
 ### `newMd5(): Hash`
 
-A fresh MD5 hasher in the empty state, typed as the streaming `Hash` interface —
+A fresh MD5 hasher in the empty state, typed as the streaming `Hash` interface -
 digest size 16 bytes, block size 64. Broken: interop only, not
 collision-resistant; never use it for integrity, signatures, or MACs.
 
@@ -494,7 +493,7 @@ SHA-256 and, on 64-bit hardware, outruns it.
 Base64 (RFC 4648) encodes arbitrary bytes as ASCII text, three input bytes per
 four output characters. Two variants are provided: the *standard* alphabet
 (`+`/`/`, `=`-padded) via `encode`/`decode`, and the *URL-safe* alphabet
-(`-`/`_`, no padding) via `encodeUrl`/`decodeUrl` — safe to drop into a URL or a
+(`-`/`_`, no padding) via `encodeUrl`/`decodeUrl` - safe to drop into a URL or a
 filename. Each variant is self-inverse: `decode(encode(b))` and
 `decodeUrl(encodeUrl(b))` return the original bytes. Decoding is validating: an
 out-of-alphabet character or an impossible length is an error, not silent
@@ -503,12 +502,12 @@ garbage.
 ```bit
 import { encode, decode, encodeUrl, decodeUrl } from "std/crypto"
 
-// Standard base64 with '=' padding — round-trips any bytes.
+// Standard base64 with '=' padding - round-trips any bytes.
 function roundTrip(data: []byte): []byte! {
   return decode(encode(data))?
 }
 
-// URL-safe alphabet (-/_), no padding — for URLs, query strings, and filenames.
+// URL-safe alphabet (-/_), no padding - for URLs, query strings, and filenames.
 function tokenize(data: []byte): string {
   return encodeUrl(data)
 }
@@ -536,7 +535,7 @@ result is safe inside a URL path, query, or filename.
 ### `decodeUrl(s: string): []byte!`
 
 Decodes an unpadded URL-safe base64 string. Fails on a character outside the
-URL-safe alphabet — an `=` included, since URL-safe output is never padded — or a
+URL-safe alphabet - an `=` included, since URL-safe output is never padded - or a
 length that no valid encoding can produce.
 
 ## ChaCha20
@@ -547,7 +546,7 @@ a 32-bit block counter into a keystream that is XORed with the data. Because XOR
 its own inverse, one function both encrypts and decrypts: run it again over the
 ciphertext with the same key, nonce, and counter to recover the plaintext.
 
-Both are constant-time by construction — every loop bound is a public length and no
+Both are constant-time by construction - every loop bound is a public length and no
 branch or memory access depends on a key or plaintext byte. Outputs are verified
 against the RFC 8439 known-answer vectors (the §2.3.2 keystream block and the
 §2.4.2 "Ladies and Gentlemen" ciphertext) and the XChaCha draft's §2.2.1 HChaCha20
@@ -555,7 +554,7 @@ subkey.
 
 A (key, nonce) pair must never repeat: ChaCha20 is a stream cipher, so reusing one
 XORs two plaintexts under the same keystream and leaks their difference. HChaCha20
-is not a cipher on its own — it is the step XChaCha20 uses to stretch a longer
+is not a cipher on its own - it is the step XChaCha20 uses to stretch a longer
 random nonce into a fresh ChaCha20 key.
 
 ```bit
@@ -566,7 +565,7 @@ function seal(key: []byte, nonce: []byte, plaintext: []byte): []byte {
   return chacha20(key, nonce, 1, plaintext)
 }
 
-// Decrypt: the identical call — XOR with the keystream is its own inverse.
+// Decrypt: the identical call - XOR with the keystream is its own inverse.
 function unseal(key: []byte, nonce: []byte, ciphertext: []byte): []byte {
   return chacha20(key, nonce, 1, ciphertext)
 }
@@ -581,7 +580,7 @@ function subkey(key: []byte, nonce16: []byte): []byte {
 ### `chacha20(key: []byte, nonce: []byte, counter: u32, data: []byte): []byte`
 
 Encrypt or decrypt `data` under ChaCha20 (RFC 8439). `key` must be 32 bytes and
-`nonce` 12 bytes; `counter` is the block counter of the first block — the RFC's
+`nonce` 12 bytes; `counter` is the block counter of the first block - the RFC's
 worked examples start at 1. Returns a fresh slice the length of `data`. Encryption
 and decryption are the same operation, so passing ciphertext back through the same
 key, nonce, and counter recovers the plaintext. Panics if `key` or `nonce` is the
@@ -592,34 +591,34 @@ wrong length. A (key, nonce) pair must never be reused.
 The HChaCha20 subkey of `key` (32 bytes) under the 16-byte `nonce16`
 (draft-irtf-cfrg-xchacha §2.2): 20 ChaCha rounds over the state with the nonce in
 the last four words and no final add-back, returning a 32-byte subkey. This is
-XChaCha20's key-derivation step — it lets XChaCha20 accept a 192-bit nonce — and is
+XChaCha20's key-derivation step - it lets XChaCha20 accept a 192-bit nonce - and is
 not a cipher on its own. Panics if `key` or `nonce16` is the wrong length.
 
 ## AEAD
 
 Authenticated encryption with associated data. `Aead` is the contract every
-authenticated cipher in the library satisfies; concrete algorithms — AES-GCM,
-ChaCha20-Poly1305 — are separate types that conform to it structurally, so code
+authenticated cipher in the library satisfies; concrete algorithms - AES-GCM,
+ChaCha20-Poly1305 - are separate types that conform to it structurally, so code
 can encrypt against `Aead` without naming a specific algorithm.
 
 AEAD binds confidentiality and integrity in one operation. `seal` encrypts the
 plaintext and authenticates both it and the unencrypted `aad` (additional
-authenticated data — headers, sequence numbers: data you must not hide but must
+authenticated data - headers, sequence numbers: data you must not hide but must
 not let an attacker forge), returning the ciphertext with the authentication tag
 appended. `open` recomputes that tag in constant time and *fails* on any
-mismatch, so a tampered message — or a wrong key, nonce, or `aad` — yields an
+mismatch, so a tampered message - or a wrong key, nonce, or `aad` - yields an
 error, never unauthenticated plaintext.
 
 Because interfaces are structural, a type is an `Aead` simply by having the four
-methods below. The example is a stand-in cipher — it XORs against a fixed pad
-rather than encrypting — but a real one plugs in exactly the same way.
+methods below. The example is a stand-in cipher - it XORs against a fixed pad
+rather than encrypting - but a real one plugs in exactly the same way.
 
 ```bit
 import { Aead } from "std/crypto"
 
 // A stand-in "cipher", NOT real encryption: it XORs each byte with a fixed pad
 // and appends a one-byte XOR-fold as the "tag". A real AES-GCM satisfies `Aead`
-// the same way — by its four methods.
+// the same way - by its four methods.
 struct XorSeal {
   pad: byte
 }
@@ -683,23 +682,23 @@ interface Aead {
   seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte,   // ciphertext‖tag
   open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!, // verify, then decrypt
   nonceSize(): int, // required nonce length in bytes
-  overhead(): int,  // bytes seal adds — the tag length
+  overhead(): int,  // bytes seal adds - the tag length
 }
 ```
 
 `seal` returns the ciphertext with the tag appended, so `len(seal(...))` is
 `len(plaintext) + overhead()`. `open` verifies the tag in constant time and
-returns `[]byte!` — it *fails* rather than return plaintext when the tag does not
+returns `[]byte!` - it *fails* rather than return plaintext when the tag does not
 match, which is the whole point of authenticated encryption: unverified bytes
 never reach the caller.
 
 The **nonce must be unique per key** for every `seal`. It need not be secret or
-random — a per-key counter is fine — but it must never repeat under one key.
+random - a per-key counter is fine - but it must never repeat under one key.
 Nonce reuse is catastrophic: it exposes the XOR of two plaintexts, and for
 AES-GCM a single repeat also leaks the polynomial authentication key `H`,
 letting an attacker forge tags for *any* message under that key. If you cannot
-guarantee uniqueness — random nonces at high volume risk a birthday collision,
-and distributed writers cannot share a counter — use a misuse-resistant scheme:
+guarantee uniqueness - random nonces at high volume risk a birthday collision,
+and distributed writers cannot share a counter - use a misuse-resistant scheme:
 XChaCha20-Poly1305 (a 192-bit random nonce makes collision negligible) or
 AES-GCM-SIV (nonce reuse degrades only to revealing message equality, not
 catastrophe).
@@ -707,17 +706,17 @@ catastrophe).
 
 The AES block cipher (FIPS 197) for 128-, 192-, and 256-bit keys. `newAes`
 expands a key once into an `AesCipher`; that value then enciphers or deciphers
-any number of 16-byte blocks. This is the raw single-block permutation — no
+any number of 16-byte blocks. This is the raw single-block permutation - no
 chaining, no padding, no IV. Real messages need a mode of operation (CBC, CTR,
 GCM) layered on top; never encrypt more than one block under bare ECB, because
 identical plaintext blocks would then produce identical ciphertext.
 
-The S-box is computed in GF(2^8) — the multiplicative inverse via `x^254`
-followed by the affine map — not read from a 256-byte table indexed by a secret
+The S-box is computed in GF(2^8) - the multiplicative inverse via `x^254`
+followed by the affine map - not read from a 256-byte table indexed by a secret
 byte. So there is no key- or plaintext-dependent memory access or branch
 anywhere in the cipher: it is constant-time by construction, which is the whole
 point of shipping it rather than a table-driven version that leaks through the
-data cache. The cost is speed — each substitution is a short chain of field
+data cache. The cost is speed - each substitution is a short chain of field
 multiplies instead of one load. Hardware AES (AES-NI, ARMv8 crypto) is a
 separate, later track; this is the portable reference every target shares.
 
@@ -731,7 +730,7 @@ function encryptBlockHex(key: []byte, block: []byte): string! {
   return encodeHex(cipher.encryptBlock(block))
 }
 
-// Decipher one block — the inverse of encryptBlock under the same key.
+// Decipher one block - the inverse of encryptBlock under the same key.
 function decryptBlockHex(key: []byte, block: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(cipher.decryptBlock(block))
@@ -741,7 +740,7 @@ function decryptBlockHex(key: []byte, block: []byte): string! {
 ### `AesCipher`
 
 A key-scheduled AES cipher. Build one with `newAes` rather than a struct
-literal — the constructor validates the key length and expands the round-key
+literal - the constructor validates the key length and expands the round-key
 schedule once, which every `encryptBlock`/`decryptBlock` call then reuses. One
 value ciphers any number of blocks.
 
@@ -754,18 +753,18 @@ AES-128, 24 is AES-192, 32 is AES-256. Fails on any other length.
 
 Enciphers one 16-byte `block`, returning a fresh 16-byte ciphertext block.
 `block` must be exactly 16 bytes. This is the bare block permutation with no
-chaining — use a mode of operation for multi-block messages.
+chaining - use a mode of operation for multi-block messages.
 
 ### `AesCipher.encryptBlockInto(dst: []byte, block: []byte)`
 
-Enciphers `block` into the caller-owned 16-byte `dst`, in place — identical to
+Enciphers `block` into the caller-owned 16-byte `dst`, in place - identical to
 `encryptBlock` but reusing `dst` so a hot loop (e.g. GCTR keystream) enciphers
 many blocks with no per-block allocation. Both `dst` and `block` must be exactly
 16 bytes and must not alias.
 
 ### `AesCipher.decryptBlock(block: []byte): []byte`
 
-Deciphers one 16-byte `block`, returning a fresh 16-byte plaintext block — the
+Deciphers one 16-byte `block`, returning a fresh 16-byte plaintext block - the
 inverse of `encryptBlock` under the same key, so `decryptBlock(encryptBlock(b))`
 equals `b`. `block` must be exactly 16 bytes.
 
@@ -774,13 +773,13 @@ equals `b`. `block` must be exactly 16 bytes.
 Poly1305 (RFC 8439 §2.5) is a **one-time** message authentication code: it takes
 a 32-byte key `r‖s` and a message and produces a 16-byte tag. It evaluates a
 polynomial in the message blocks modulo the prime 2^130 - 5, then adds the
-secret pad `s` modulo 2^128 — no hash function underneath, just field
+secret pad `s` modulo 2^128 - no hash function underneath, just field
 arithmetic, so it is fast and simple to make constant-time.
 
 The **one-time** part is not a suggestion: a given key must authenticate **at
 most one message**. Authenticating two different messages under the same key
 lets an attacker solve for `r` and forge tags for any message. In practice the
-key is never a constant — it is derived per-message from a nonce, which is
+key is never a constant - it is derived per-message from a nonce, which is
 exactly what ChaCha20-Poly1305 does (it keys Poly1305 with the first block of the
 cipher's keystream). Use Poly1305 directly only when you produce a fresh key for
 every single message.
@@ -794,7 +793,7 @@ valid tag one byte at a time.
 import { poly1305, poly1305Verify, encodeHex } from "std/crypto"
 
 // The 16-byte tag of `msg` under a 32-byte one-time key, as lowercase hex. The
-// key is r‖s and must be used for exactly one message — a real caller derives a
+// key is r‖s and must be used for exactly one message - a real caller derives a
 // fresh key per message (e.g. from a nonce-keyed ChaCha20 keystream), never a
 // reused constant.
 function authTag(key: []byte, msg: []byte): string {
@@ -837,7 +836,7 @@ same key authenticates any number of messages.
 
 The construction is generic over the digest. `hmac` takes a hash *constructor*
 (`() => Hash`) rather than a hash value, so the same code runs over SHA-256,
-SHA-384, or SHA-512 — it asks the hash for its own `blockSize` instead of
+SHA-384, or SHA-512 - it asks the hash for its own `blockSize` instead of
 hard-coding one, and calls the constructor once per message to get a fresh
 hasher. The SHA-512 family already returns `Hash`, so `newSha512`/`newSha384`
 pass directly; `newSha256` returns the concrete `Sha256`, so wrap it in a tiny
@@ -846,7 +845,7 @@ pass directly; `newSha256` returns the concrete `Sha256`, so wrap it in a tiny
 The key is normalized to exactly one block (RFC 2104 §2): a key longer than
 `blockSize` is hashed down first (then it is `size` bytes, always at most a
 block), and a shorter key is zero-padded up. Verify a tag with `hmacEqual`, which
-compares in constant time via `ctEq` — never with `==`, whose first-mismatch
+compares in constant time via `ctEq` - never with `==`, whose first-mismatch
 timing leaks enough to forge a tag one byte at a time.
 
 ```bit
@@ -861,7 +860,7 @@ function tagHex(key: []byte, msg: []byte): string {
   return encodeHex(hmac(sha256Hash, key, msg))
 }
 
-// The same call over a different hash — HMAC-SHA-512 — by handing in another
+// The same call over a different hash - HMAC-SHA-512 - by handing in another
 // constructor. `newSha512` already returns `Hash`, so it needs no wrapper.
 function tag512Hex(key: []byte, msg: []byte): string {
   return encodeHex(hmac(newSha512, key, msg))
@@ -879,7 +878,7 @@ function verify(key: []byte, msg: []byte, tag: []byte): bool {
 The HMAC of `msg` under `key`, using the hash built by `newHash`. The tag length
 is the hash's own `size` (32 bytes for SHA-256, 64 for SHA-512). A key longer
 than the hash's block is hashed down first; a shorter key is zero-padded.
-`newHash` must return a fresh, empty hasher on each call — the SHA-512 family
+`newHash` must return a fresh, empty hasher on each call - the SHA-512 family
 constructors qualify directly, while `newSha256`/`newSha224` are wrapped as a
 `() => Hash` since they return the concrete `Sha256`.
 
@@ -895,7 +894,7 @@ Modes of operation (NIST SP 800-38A) that turn the single-block `AesCipher` into
 a cipher over arbitrary-length messages. Each rides an already-keyed cipher, so
 it reuses the expanded key schedule and adds no key handling of its own.
 
-`ctr` is the workhorse — counter mode, and the keystream generator AES-GCM is
+`ctr` is the workhorse - counter mode, and the keystream generator AES-GCM is
 built on. It enciphers a big-endian 128-bit counter starting from the 16-byte
 `iv`, then XORs that keystream into the data. Because XOR is its own inverse,
 encryption and decryption are the *same* operation, so one function serves both;
@@ -904,7 +903,7 @@ it needs no padding and handles a trailing partial block.
 `cbcEncrypt` / `cbcDecrypt` are cipher-block-chaining, provided for interop with
 existing CBC protocols rather than as a default. They do no padding, so the data
 must already be an exact multiple of the 16-byte block size. `ecbEncryptBlock` is
-the bare block permutation, exposed only for QUIC header protection — it is unsafe
+the bare block permutation, exposed only for QUIC header protection - it is unsafe
 as a general mode because ECB reveals when two plaintext blocks are equal.
 
 None of these authenticate: a mode gives confidentiality only. Whenever the
@@ -934,7 +933,7 @@ function cbcOpen(key: []byte, iv: []byte, ct: []byte): []byte! {
 }
 
 // QUIC header protection derives a mask from one sampled ciphertext block via
-// the bare ECB permutation — never a general-purpose cipher.
+// the bare ECB permutation - never a general-purpose cipher.
 function headerMask(key: []byte, sample: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(ecbEncryptBlock(cipher, sample))
@@ -952,7 +951,7 @@ is built on.
 
 ### `ecbEncryptBlock(cipher: AesCipher, block: []byte): []byte`
 
-Enciphers one 16-byte `block` as a bare ECB block — the raw AES permutation with
+Enciphers one 16-byte `block` as a bare ECB block - the raw AES permutation with
 no chaining or IV. Exposed **only** for QUIC header protection, which enciphers a
 sampled ciphertext block to derive the header mask. It is unsafe as a general
 mode: ECB reveals when two plaintext blocks are equal, so never encrypt more than
@@ -962,19 +961,19 @@ one block of real data through it.
 
 Encrypts `data` in AES cipher-block-chaining (CBC) mode with the explicit 16-byte
 `iv`, XORing each plaintext block with the previous ciphertext block before
-enciphering. `data` must already be an exact multiple of 16 bytes — CBC does no
+enciphering. `data` must already be an exact multiple of 16 bytes - CBC does no
 padding, so a non-block-multiple length is a caller error and panics. Interop
 only; prefer `ctr` or an AEAD for new designs.
 
 ### `cbcDecrypt(cipher: AesCipher, iv: []byte, data: []byte): []byte!`
 
-Decrypts `data` in AES CBC mode with the explicit 16-byte `iv` — the inverse of
+Decrypts `data` in AES CBC mode with the explicit 16-byte `iv` - the inverse of
 `cbcEncrypt`. Fails (fallible `[]byte!`) if `data` is not a multiple of 16 bytes,
 since a truncated ciphertext cannot be a valid CBC stream. Interop only.
 
 ## HKDF
 
-HKDF (RFC 5869) is the HMAC-based extract-and-expand key derivation function —
+HKDF (RFC 5869) is the HMAC-based extract-and-expand key derivation function -
 the TLS 1.3 key schedule. It turns one input keying material into any number of
 independent, cryptographically strong output keys, in two steps built entirely
 from `hmac`:
@@ -1008,7 +1007,7 @@ function deriveKey(salt: []byte, ikm: []byte): []byte! {
   return hkdfExpand(sha256Hash, prk, []byte("app v1 encryption"), 32)?
 }
 
-// The same derivation in one call — extract and expand together — as hex.
+// The same derivation in one call - extract and expand together - as hex.
 function deriveKeyHex(salt: []byte, ikm: []byte): string! {
   return encodeHex(hkdf(sha256Hash, salt, ikm, []byte("app v1 encryption"), 32)?)
 }
@@ -1024,7 +1023,7 @@ function deriveLong(ikm: []byte): []byte! {
 
 HKDF-Extract (RFC 5869 §2.2): the pseudo-random key `PRK = HMAC(salt, IKM)`,
 exactly one digest long. An empty `salt` is replaced by `HashLen` zero bytes, as
-the standard requires — that zero salt is what makes extraction a strong
+the standard requires - that zero salt is what makes extraction a strong
 randomness extractor, so it is not the same as omitting the salt entirely.
 `newHash` selects the digest and must return a fresh, empty hasher on each call.
 
@@ -1038,7 +1037,7 @@ should be a digest-length key from `hkdfExtract`; `info` may be empty.
 
 ### `hkdf(newHash: () => Hash, salt: []byte, ikm: []byte, info: []byte, outLen: int): []byte!`
 
-HKDF (RFC 5869 §2): extract then expand in one call — derive `outLen` bytes of
+HKDF (RFC 5869 §2): extract then expand in one call - derive `outLen` bytes of
 output keying material from `ikm`, salted by `salt` and bound to the context
 `info`. Equivalent to `hkdfExpand(newHash, hkdfExtract(newHash, salt, ikm),
 info, outLen)`, and fails on the same over-long `outLen` as `hkdfExpand`.
@@ -1049,8 +1048,8 @@ The ChaCha20-Poly1305 (RFC 8439 §2.8) and XChaCha20-Poly1305
 (draft-irtf-cfrg-xchacha §2.1) authenticated ciphers. Each is an `Aead`: `seal`
 encrypts the plaintext and authenticates it together with the `aad`, returning
 `ciphertext ‖ tag` (a 16-byte Poly1305 tag); `open` recomputes the tag, verifies
-it in constant time, and *fails* on any mismatch — a tampered message, or a wrong
-key, nonce, or `aad` — so unauthenticated plaintext never reaches the caller.
+it in constant time, and *fails* on any mismatch - a tampered message, or a wrong
+key, nonce, or `aad` - so unauthenticated plaintext never reaches the caller.
 
 `ChaChaPoly` derives a one-time Poly1305 key from ChaCha20 block 0, encrypts with
 the counter starting at block 1, and authenticates
@@ -1060,8 +1059,8 @@ two plaintexts under one keystream and leaks their difference.
 
 `XChaChaPoly` takes a **24-byte** nonce. It derives a subkey with HChaCha20 over
 the key and the first 16 nonce bytes, then runs the same construction under that
-subkey. The 192-bit nonce makes a random-nonce collision negligible, so — unlike
-the 96-bit variant — a freshly random nonce per message is safe.
+subkey. The 192-bit nonce makes a random-nonce collision negligible, so - unlike
+the 96-bit variant - a freshly random nonce per message is safe.
 
 Both compose the audited `chacha20`, `hchacha20`, `poly1305`, and
 `poly1305Verify` primitives, so they inherit their constant-time-by-construction
@@ -1072,7 +1071,7 @@ libsodium-verified XChaCha20-Poly1305 vector.
 import { newChaChaPoly, newXChaChaPoly } from "std/crypto"
 
 // Encrypt-then-authenticate with ChaCha20-Poly1305, then verify-then-decrypt.
-// `open` returns the original plaintext or fails — it never returns unverified
+// `open` returns the original plaintext or fails - it never returns unverified
 // bytes. `key` is 32 bytes and `nonce` 12 bytes, unique per key.
 function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
   let c = newChaChaPoly(key)?
@@ -1110,7 +1109,7 @@ a wrong length panics, like Go's `cipher.AEAD.Seal`.
 
 Verify the tag over `ciphertext` and `aad` in constant time, then decrypt.
 Returns the plaintext, or *fails* on a tampered message, a wrong key/nonce/`aad`,
-or an input shorter than the tag — never unauthenticated plaintext. A wrong nonce
+or an input shorter than the tag - never unauthenticated plaintext. A wrong nonce
 length panics.
 
 ### `ChaChaPoly.nonceSize(): int`
@@ -1119,7 +1118,7 @@ The required nonce length in bytes: 12.
 
 ### `ChaChaPoly.overhead(): int`
 
-The number of bytes `seal` adds — the 16-byte tag length.
+The number of bytes `seal` adds - the 16-byte tag length.
 
 ### `XChaChaPoly`
 
@@ -1149,31 +1148,31 @@ The required nonce length in bytes: 24.
 
 ### `XChaChaPoly.overhead(): int`
 
-The number of bytes `seal` adds — the 16-byte tag length.
+The number of bytes `seal` adds - the 16-byte tag length.
 ## AES-GCM
 
-Authenticated encryption (NIST SP 800-38D) — the AEAD behind TLS 1.2/1.3, IPsec,
+Authenticated encryption (NIST SP 800-38D) - the AEAD behind TLS 1.2/1.3, IPsec,
 and SSH. AES-GCM layers a GHASH authentication tag onto AES counter mode, so one
 pass gives confidentiality for the plaintext and integrity for both the plaintext
 and the associated data. `AesGcm` is the concrete cipher; it satisfies the `Aead`
 interface, so code written against `Aead` accepts it without naming it.
 
-`newGcm` keys the cipher once — expanding the AES schedule and deriving the GHASH
-subkey `H = AES_K(0)` — and the returned value seals and opens any number of
+`newGcm` keys the cipher once - expanding the AES schedule and deriving the GHASH
+subkey `H = AES_K(0)` - and the returned value seals and opens any number of
 messages under 16- or 32-byte keys (AES-128-GCM / AES-256-GCM). Each `seal` takes
 a 12-byte (96-bit) nonce and appends a 16-byte tag; `open` recomputes the tag,
-compares it in constant time, and *fails* on any mismatch — a tampered ciphertext,
-a wrong key, nonce, or `aad` — so unverified bytes never reach the caller.
+compares it in constant time, and *fails* on any mismatch - a tampered ciphertext,
+a wrong key, nonce, or `aad` - so unverified bytes never reach the caller.
 
 The **nonce must be unique for every `seal` under a given key.** It need not be
-secret or random — a per-key counter is ideal — but a single repeat is
+secret or random - a per-key counter is ideal - but a single repeat is
 catastrophic for GCM: it exposes the XOR of two plaintexts *and* leaks the GHASH
 subkey `H`, which lets an attacker forge tags for any message under that key. If
 unique nonces cannot be guaranteed (random nonces at high volume risk a birthday
 collision), reach for a misuse-resistant scheme instead (XChaCha20-Poly1305 or
 AES-GCM-SIV).
 
-GHASH multiplies in GF(2^128) with a constant-time, bit-by-bit shift-and-xor —
+GHASH multiplies in GF(2^128) with a constant-time, bit-by-bit shift-and-xor -
 not a key- or ciphertext-indexed table, which would leak through cache timing.
 Correctness over speed: a PCLMULQDQ/PMULL hardware GHASH is a separate later track.
 
@@ -1181,7 +1180,7 @@ Correctness over speed: a PCLMULQDQ/PMULL hardware GHASH is a separate later tra
 import { newGcm, encodeHex } from "std/crypto"
 
 // Seal then open one message. `key` is 16 or 32 bytes (AES-128/256-GCM); `nonce`
-// is 12 bytes and MUST be unique per key — never reuse one under the same key.
+// is 12 bytes and MUST be unique per key - never reuse one under the same key.
 // `aad` is authenticated but not encrypted (headers, sequence numbers). Returns
 // the recovered plaintext as hex, or fails if the tag does not verify.
 function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
@@ -1194,7 +1193,7 @@ function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! 
 
 ### `AesGcm`
 
-A keyed AES-GCM cipher. Build one with `newGcm`, not a struct literal — the
+A keyed AES-GCM cipher. Build one with `newGcm`, not a struct literal - the
 constructor validates the key length and derives the GHASH subkey. One value
 seals and opens any number of messages; it satisfies the `Aead` interface.
 
@@ -1209,14 +1208,14 @@ other length. The GHASH subkey is derived here once and reused by every later
 
 Encrypts `plaintext` under the 12-byte `nonce` and authenticates both it and the
 unencrypted `aad`, returning the ciphertext with the 16-byte tag appended (so
-`len(seal(...))` is `len(plaintext) + 16`). The **nonce must be unique per key** —
+`len(seal(...))` is `len(plaintext) + 16`). The **nonce must be unique per key** -
 reuse is catastrophic for GCM. A wrong nonce length is a caller error and panics.
 
 ### `AesGcm.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
 
 Verifies and decrypts `ciphertext` (the sealed `ct ‖ tag`) under `nonce` and
 `aad`. Recomputes the tag and compares it in constant time, *failing* on any
-mismatch — a tampered message, or a wrong key, nonce, or `aad` — without returning
+mismatch - a tampered message, or a wrong key, nonce, or `aad` - without returning
 the plaintext. Also fails if the input is shorter than the 16-byte tag.
 
 ### `AesGcm.nonceSize(): int`
@@ -1228,7 +1227,7 @@ The required nonce length in bytes: `12` (96-bit), the GCM/TLS standard.
 The number of bytes `seal` appends: `16`, the authentication tag length.
 ## ASN.1 / DER
 
-The Distinguished Encoding Rules (X.690) — the canonical binary form of ASN.1
+The Distinguished Encoding Rules (X.690) - the canonical binary form of ASN.1
 behind X.509 certificates, PKCS keys, and ECDSA/RSA signatures. Everything is one
 flat `Element`: a tag (class + constructed flag + number) carrying either raw
 content octets (a primitive) or a list of child elements (a constructed type).
@@ -1239,7 +1238,7 @@ Decoding is **strict**: malformed ASN.1 is a classic parser attack surface, so
 `asn1Parse` and every reader are fallible (`T!`) and *reject* rather than
 best-effort. A non-minimal length, an indefinite-length marker, a non-minimal
 (redundantly sign-extended) INTEGER, a non-minimal OID subidentifier, or trailing
-bytes after the top-level element all fail the parse — there is exactly one valid
+bytes after the top-level element all fail the parse - there is exactly one valid
 encoding of a value, and only that encoding is accepted.
 
 ```bit
@@ -1288,7 +1287,7 @@ over after the element.
 
 ### `asn1Encode(e: Element): []byte`
 
-The DER encoding of `e`: identifier octet(s), definite length, then content — a
+The DER encoding of `e`: identifier octet(s), definite length, then content - a
 constructed element's content is the concatenation of its encoded children, a
 primitive's is its raw bytes. Total and deterministic: every value has exactly one
 encoding, so `asn1Encode(asn1Parse(der)?)` reproduces valid DER byte-for-byte.
@@ -1321,7 +1320,7 @@ ECDSA `r`/`s` are encoded.
 ### `asn1ReadBigInteger(e: Element): []byte!`
 
 The unsigned big-endian magnitude of a non-negative INTEGER, with the sign octet
-removed — the inverse of `asn1BigInteger`. Fails on a non-minimal encoding or a
+removed - the inverse of `asn1BigInteger`. Fails on a non-minimal encoding or a
 negative value.
 
 ```bit
@@ -1384,7 +1383,7 @@ a non-minimal (leading-`0x80`) subidentifier.
 ### `asn1OidString(arcs: []int): string`
 
 The dotted-decimal text of `arcs`, e.g. `"1.2.840.113549.1.1.11"`. A rendering
-helper — it does no validation.
+helper - it does no validation.
 
 ```bit
 import { asn1Encode, asn1Parse, asn1Oid, asn1ReadOid, asn1OidString } from "std/crypto"
@@ -1558,7 +1557,7 @@ function isSequence(e: Element): bool {
 
 ## Big integers
 
-Variable-width unsigned big integers — the modular-arithmetic bedrock the
+Variable-width unsigned big integers - the modular-arithmetic bedrock the
 public-key primitives build on (RSA, the NIST curves). A `Nat` is an
 arbitrary-precision non-negative integer; its magnitude is unbounded, its
 representation always normalized. All routines are total on well-formed input,
@@ -1567,7 +1566,7 @@ a non-invertible element) or does not fit a requested fixed width.
 
 The exponentiation entry points split by whether the exponent is secret.
 `bigintModExp` defaults to a constant-time Montgomery ladder, so its timing does
-not leak the exponent — this is the path for RSA private-key operations and
+not leak the exponent - this is the path for RSA private-key operations and
 ECDSA nonces. `bigintModExpPublic` is a faster variable-time square-and-multiply
 for public exponents (RSA verification and encryption), and must never be used
 with a secret exponent. Likewise `bigintModInverse` is variable-time; for a
@@ -1578,7 +1577,7 @@ instead.
 
 A non-negative arbitrary-precision integer, backed by a normalized little-endian
 slice of 32-bit limbs (zero is the empty slice). Its field is module-private, so
-a `Nat` is built and inspected only through the `bigint*` functions below —
+a `Nat` is built and inspected only through the `bigint*` functions below -
 `bigintFromU64` and `bigintFromBytes` in, `bigintToU64` and `bigintToBytes` out.
 
 ```bit
@@ -1621,7 +1620,7 @@ The `Nat` equal to the unsigned 64-bit value `v`.
 ### `bigintToU64(n: Nat): u64!`
 
 The value of `n` as a `u64`; fails if `n` needs more than 64 bits. Intended for
-small results and assertions — compare large values as bytes via `bigintToBytes`.
+small results and assertions - compare large values as bytes via `bigintToBytes`.
 
 ### `bigintIsZero(n: Nat): bool`
 
@@ -1695,7 +1694,7 @@ variable-time square-and-multiply.
 
 `base^exp mod modN` by variable-time square-and-multiply, for a *public*
 exponent. Faster than the constant-time path, but it branches on the exponent
-bits — use only when the exponent is not secret. Fails on a zero modulus.
+bits - use only when the exponent is not secret. Fails on a zero modulus.
 
 ```bit
 import { Nat, bigintModExp, bigintModExpPublic, bigintFromBytes, bigintToBytes, bigintFromU64 } from "std/crypto"
@@ -1718,7 +1717,7 @@ function rsaPrivate(c: Nat, d: Nat, n: Nat): Nat! {
 
 The modular inverse of `a` modulo `n`: the value `x` in `[0, n)` with
 `a*x = 1 (mod n)`. Fails if `a` and `n` are not coprime or `n == 0`.
-Variable-time — for a secret inverse under a prime modulus prefer Fermat's little
+Variable-time - for a secret inverse under a prime modulus prefer Fermat's little
 theorem via `bigintModExp`.
 
 ```bit
@@ -1743,7 +1742,7 @@ zero. This is the OS2IP direction (RFC 8017).
 ### `bigintToBytes(n: Nat, outLen: int): []byte!`
 
 `n` as exactly `outLen` big-endian bytes, left-padded with zeros. Fails if `n`
-does not fit in `outLen` bytes rather than silently truncating — the safe I2OSP
+does not fit in `outLen` bytes rather than silently truncating - the safe I2OSP
 policy, so a key or point that overflows its field width is caught.
 
 ## NIST curves (P-256/P-384)
@@ -1751,8 +1750,8 @@ policy, so a key or point that overflows its field width is caught.
 Elliptic-curve point arithmetic over the two prime-field NIST curves, secp256r1
 (P-256) and secp384r1 (P-384), the building block for ECDSA and ECDH. Both curves
 have `a = -3` and a prime group order, so a single set of *complete* addition
-formulas (Renes–Costello–Batina, 2016) covers every case — the identity, a
-doubling, and `P + (-P)` — with no exceptional inputs. Scalar multiplication is a
+formulas (Renes–Costello–Batina, 2016) covers every case - the identity, a
+doubling, and `P + (-P)` - with no exceptional inputs. Scalar multiplication is a
 Montgomery ladder whose accumulators are exchanged by a branchless masked select,
 so it has no secret-dependent branch or table index and runs a fixed number of
 iterations per curve.
@@ -1834,7 +1833,7 @@ Whether `point` satisfies `y^2 = x^3 + a*x + b (mod p)` with both coordinates in
 ### `nistecPointEncode(curve: Curve, point: Point, compressed: bool): []byte!`
 
 The SEC 1 octet encoding of `point`: a single `0x00` for infinity, the
-`0x04 || X || Y` uncompressed form, or — when `compressed` is set — the
+`0x04 || X || Y` uncompressed form, or - when `compressed` is set - the
 `0x02|0x03 || X` compressed form whose prefix carries `y`'s low bit. Fails if a
 coordinate does not fit the field width.
 
@@ -1847,8 +1846,8 @@ that is not on the curve.
 ## RSA
 
 RSA (PKCS#1 v2.2 / RFC 8017) over the big-integer and ASN.1 layers: the four
-schemes — EMSA-PKCS1-v1_5 and EMSA-PSS signatures, RSAES-OAEP and
-RSAES-PKCS1-v1_5 encryption — plus parsers for the standard key encodings. Keys
+schemes - EMSA-PKCS1-v1_5 and EMSA-PSS signatures, RSAES-OAEP and
+RSAES-PKCS1-v1_5 encryption - plus parsers for the standard key encodings. Keys
 are `RsaPublicKey` / `RsaPrivateKey`; construct them from DER with the parsers,
 or from `Nat` fields directly.
 
@@ -1858,11 +1857,11 @@ turns `m^d` into `(m·r^e)^d · r^-1 mod n`), so its timing does not correlate w
 the ciphertext. The two **decrypt** padding checks are the Manger (OAEP) and
 Bleichenbacher (v1.5) oracle surfaces: both decode branchlessly, fold every check
 into one running mask, and reject a malformed ciphertext with a single uniform
-`"rsa: decryption error"` — never an early or check-specific failure. CRT (the
+`"rsa: decryption error"` - never an early or check-specific failure. CRT (the
 p/q fast path) is deferred in v1; the plain `c^d mod n` is used.
 
 The signature and OAEP schemes take a hash *constructor* (`() => Hash`, e.g.
-`newSha256` — wrap it as `newSha256` returns the concrete `Sha256`) so one
+`newSha256` - wrap it as `newSha256` returns the concrete `Sha256`) so one
 implementation serves the whole SHA-2 family; the PKCS#1 v1.5 signer additionally
 takes the matching `DigestInfo` prefix (`rsaDigestInfoSha256`, ...).
 
@@ -1896,7 +1895,7 @@ not retained in v1.
 
 ### `rsaParsePublicKey(der: []byte): RsaPublicKey!`
 
-Parse a `SubjectPublicKeyInfo` (X.509 / SPKI) DER public key — a `SEQUENCE` of an
+Parse a `SubjectPublicKeyInfo` (X.509 / SPKI) DER public key - a `SEQUENCE` of an
 `rsaEncryption` `AlgorithmIdentifier` and a `BIT STRING` wrapping the PKCS#1
 `RSAPublicKey`. Fails on any structural problem or a non-RSA algorithm.
 
@@ -1911,12 +1910,12 @@ function loadPublicKey(der: []byte): RsaPublicKey! {
 
 ### `rsaParsePkcs1PublicKey(der: []byte): RsaPublicKey!`
 
-Parse a PKCS#1 `RSAPublicKey` DER — `SEQUENCE { modulus INTEGER, publicExponent
+Parse a PKCS#1 `RSAPublicKey` DER - `SEQUENCE { modulus INTEGER, publicExponent
 INTEGER }`. This is the inner structure `rsaParsePublicKey` unwraps.
 
 ### `rsaParsePrivateKey(der: []byte): RsaPrivateKey!`
 
-Parse a PKCS#8 `PrivateKeyInfo` (RFC 5958) DER private key — a `SEQUENCE` of a
+Parse a PKCS#8 `PrivateKeyInfo` (RFC 5958) DER private key - a `SEQUENCE` of a
 version, an `rsaEncryption` `AlgorithmIdentifier`, and an `OCTET STRING` wrapping
 the PKCS#1 `RSAPrivateKey`. Fails on any structural problem or a non-RSA
 algorithm.
@@ -1932,7 +1931,7 @@ function loadPrivateKey(der: []byte): RsaPrivateKey! {
 
 ### `rsaParsePkcs1PrivateKey(der: []byte): RsaPrivateKey!`
 
-Parse a PKCS#1 `RSAPrivateKey` DER — `SEQUENCE { version, n, e, d, p, q, dP, dQ,
+Parse a PKCS#1 `RSAPrivateKey` DER - `SEQUENCE { version, n, e, d, p, q, dP, dQ,
 qInv }`. The CRT fields must be present and well-formed but are not retained; only
 `n`, `e`, `d` are kept. This is the inner structure `rsaParsePrivateKey` unwraps.
 
@@ -2021,7 +2020,7 @@ running mask and one uniform failure, so a padding oracle cannot distinguish
 
 ### `rsaDigestInfoSha256(): []byte`
 
-The DER `DigestInfo` prefix for SHA-256 — prepend to a 32-byte digest to form the
+The DER `DigestInfo` prefix for SHA-256 - prepend to a 32-byte digest to form the
 `T` of an EMSA-PKCS1-v1_5 encoding. Pass to `rsaSignPkcs1v15` /
 `rsaVerifyPkcs1v15`.
 
@@ -2041,7 +2040,7 @@ and then squeeze an arbitrary number of output bytes. All are verified against
 the NIST known-answer vectors.
 
 The state is addressed as little-endian bytes, so output is byte-identical on
-x86-64 and ARM64. Every value is fresh from its constructor — reuse one hash for
+x86-64 and ARM64. Every value is fresh from its constructor - reuse one hash for
 many messages by calling `reset` between them.
 
 ```bit
@@ -2067,7 +2066,7 @@ function derive(seed: []byte): []byte {
   return x.squeeze(64)
 }
 
-// Hashing against the `Hash` interface — the algorithm is a parameter.
+// Hashing against the `Hash` interface - the algorithm is a parameter.
 function tag(h: Hash, msg: []byte): string {
   return encodeHex(digest(h, msg))
 }
@@ -2084,7 +2083,7 @@ Absorbs more input into the running hash.
 
 ### `Sha3.sum(): []byte`
 
-The digest of everything written since the last `reset`. Non-destructive — it
+The digest of everything written since the last `reset`. Non-destructive - it
 finalizes a copy, so the hash may keep accepting input afterward.
 
 ### `Sha3.reset()`
@@ -2097,7 +2096,7 @@ The digest length in bytes (28, 32, 48, or 64).
 
 ### `Sha3.blockSize(): int`
 
-The sponge rate in bytes — the algorithm's internal block size, which HMAC needs.
+The sponge rate in bytes - the algorithm's internal block size, which HMAC needs.
 
 ### `newSha3_224(): Sha3`
 
@@ -2122,7 +2121,7 @@ number of output bytes. Build one with `newShake128`/`newShake256`.
 
 ### `Shake.absorb(data: []byte)`
 
-Absorbs more input. Panics if called after squeezing has begun — the sponge has
+Absorbs more input. Panics if called after squeezing has begun - the sponge has
 already switched to producing output.
 
 ### `Shake.squeeze(n: int): []byte`
@@ -2144,13 +2143,13 @@ A SHAKE256 XOF: 256-bit security strength, 136-byte rate.
 
 Elliptic-Curve Diffie-Hellman over the NIST curves P-256 and P-384, layered on
 the `nistec` point arithmetic. Each side generates a key pair, exchanges its
-SEC 1 public point, and derives the same shared secret — the x-coordinate of the
+SEC 1 public point, and derives the same shared secret - the x-coordinate of the
 joint point `d_A * d_B * G`, fixed-width big-endian. Both curves have cofactor 1,
 so that x is the raw ECDH secret TLS 1.3 feeds directly to HKDF as input keying
 material (no hashing, no cofactor multiplication).
 
 The peer's public point is validated before every use: an off-curve or malformed
-SEC 1 encoding, or the identity point, is rejected — the invalid-curve attack
+SEC 1 encoding, or the identity point, is rejected - the invalid-curve attack
 defense. The private scalar is drawn from the OS CSPRNG and reduced into
 `[1, n-1]` with the FIPS 186-4 extra-bits method, so it is never zero and never
 `>= n`.
@@ -2163,7 +2162,7 @@ import {
 
 // A full ECDH exchange on P-256. Both sides derive the identical secret; here
 // Alice combines her private key with Bob's public key. The returned bytes are
-// the raw shared x-coordinate — hand them straight to HKDF as input keying
+// the raw shared x-coordinate - hand them straight to HKDF as input keying
 // material.
 function ecdhExchangeP256(): []byte! {
   let c = nistecP256()
@@ -2189,8 +2188,8 @@ uncompressed encoding of `priv * G`.
 
 The raw ECDH shared secret: the fixed-width big-endian x-coordinate of
 `priv * peerPoint`, where `peerPub` is the peer's SEC 1 public point. Validates
-that the peer point is on the curve and is not the identity before multiplying —
-closing the invalid-curve attack — and fails on any malformed, off-curve, or
+that the peer point is on the curve and is not the identity before multiplying -
+closing the invalid-curve attack - and fails on any malformed, off-curve, or
 identity input.
 
 ## ECDSA
@@ -2201,7 +2200,7 @@ integers, the `asn1` DER codec, and `hmac`. Sign a pre-computed digest, verify a
 signature, handle keys, and serialize a signature as the standard
 `SEQUENCE { INTEGER r, INTEGER s }`.
 
-The nonce is **RFC 6979 deterministic** — derived by HMAC-DRBG from the private
+The nonce is **RFC 6979 deterministic** - derived by HMAC-DRBG from the private
 key and the message digest rather than drawn at random. A biased or repeated
 ECDSA nonce discloses the private key, so removing randomness removes that whole
 failure class; it also makes signatures reproducible, which is what lets them be
@@ -2215,7 +2214,7 @@ this is branch-safe but not a defence against a limb-timing adversary.
 The signature is **not** low-`s` normalized: the standard accepts any `s` in
 `[1, n-1]` and the RFC 6979 vectors are themselves high-`s`. A protocol that
 requires canonical low-`s` (e.g. BIP-62) can replace `s` with `n - s` when
-`s > n/2`; verification accepts either form. The digest is caller-supplied — hash
+`s > n/2`; verification accepts either form. The digest is caller-supplied - hash
 the message with SHA-256 (P-256) or SHA-384 (P-384) and pass the digest bytes
 plus the matching hash constructor (RFC 6979 keys its HMAC on the same hash).
 
@@ -2288,7 +2287,7 @@ length is accepted. The signature is not low-`s` normalized.
 
 Whether `sig` is a valid signature of the digest `hash` under `pub`. Rejects an
 `r` or `s` outside `[1, n-1]`, an off-curve or infinite public point, and any
-signature whose recovered `x` does not match `r`. Never fails — a malformed input
+signature whose recovered `x` does not match `r`. Never fails - a malformed input
 is simply `false`.
 
 ### `ecdsaSignatureToDer(sig: EcdsaSignature): []byte`
@@ -2304,8 +2303,8 @@ structure that is not exactly two INTEGERs, on a negative or non-minimally encod
 integer (the strict `asn1` reader enforces this), or on a zero `r`/`s`.
 ## PEM
 
-PEM (RFC 7468) is the textual wrapper that carries DER-encoded objects —
-certificates, public and private keys — as ASCII. Each object is one *block*:
+PEM (RFC 7468) is the textual wrapper that carries DER-encoded objects -
+certificates, public and private keys - as ASCII. Each object is one *block*:
 
 ```
 -----BEGIN CERTIFICATE-----
@@ -2318,7 +2317,7 @@ more concatenated blocks back into `PemBlock` values, so a file holding a
 certificate followed by its key parses in a single call. The two are inverse:
 `pemDecode(pemEncode(label, der))[0].der` is `der`.
 
-Decoding is strict — a lax PEM reader is a classic parser attack surface. The
+Decoding is strict - a lax PEM reader is a classic parser attack surface. The
 END label must match its BEGIN, a block with no END line is a truncation error,
 and the base64 body must be valid. Line endings are tolerant: CRLF, LF, and stray
 spaces or tabs inside the body are stripped before the base64 is decoded, so PEM
@@ -2327,7 +2326,7 @@ produced on Windows or Unix parses the same.
 ```bit
 import { pemEncode, pemDecode, PemBlock } from "std/crypto"
 
-// Wrap DER bytes as a PEM "CERTIFICATE" block — the text you would write to a
+// Wrap DER bytes as a PEM "CERTIFICATE" block - the text you would write to a
 // .pem or .crt file, base64 wrapped at 64 columns with the BEGIN/END framing.
 function certToPem(der: []byte): string {
   return pemEncode("CERTIFICATE", der)
@@ -2365,7 +2364,7 @@ BLAKE3 (the official specification) hashes a message through a binary Merkle tre
 of 1024-byte chunks, reduced by a seven-round compression function over a 16-word
 `u32` state. It is fast, and it is an extendable-output function (XOF): the same
 hasher yields a 32-byte digest by default or any number of bytes on demand. Three
-keying modes share one code path — the default hash, `keyed_hash` (a 32-byte-keyed
+keying modes share one code path - the default hash, `keyed_hash` (a 32-byte-keyed
 MAC), and `derive_key` (a KDF seeded by a context string). Every value is read and
 written little-endian, so output is byte-identical on x86-64 and ARM64, and every
 result is verified against the official BLAKE3 test vectors.
@@ -2421,7 +2420,7 @@ function widen(seed: []byte): []byte {
   return blake3Xof(seed, 64)
 }
 
-// Hashing against the `Hash` interface — the algorithm is a parameter, so BLAKE3
+// Hashing against the `Hash` interface - the algorithm is a parameter, so BLAKE3
 // drops into any `Hash`-based helper (HMAC, HKDF, `digest`) unchanged.
 function tag(h: Hash, msg: []byte): string {
   return encodeHex(digest(h, msg))
@@ -2436,7 +2435,7 @@ by field.
 
 ### `newBlake3(): Blake3`
 
-A fresh unkeyed BLAKE3 hasher — the default hash function.
+A fresh unkeyed BLAKE3 hasher - the default hash function.
 
 ### `newBlake3Keyed(key: []byte): Blake3!`
 
@@ -2447,7 +2446,7 @@ bytes; its little-endian words become the initial key words. Fails otherwise.
 
 A fresh derive-key hasher (BLAKE3's `derive_key`). The context is hashed once in
 context mode; its chaining value keys the hashing of the key material fed next.
-`context` should be a hardcoded, globally unique application string — not a
+`context` should be a hardcoded, globally unique application string - not a
 runtime secret or variable.
 
 ### `Blake3.write(data: []byte)`
@@ -2456,7 +2455,7 @@ Absorbs more input into the running hash.
 
 ### `Blake3.sum(): []byte`
 
-The 32-byte default digest of everything written since the last `reset` — exactly
+The 32-byte default digest of everything written since the last `reset` - exactly
 `finalize(32)`. Non-destructive, so the hasher may keep accepting input afterward.
 
 ### `Blake3.finalize(n: int): []byte`
@@ -2476,7 +2475,7 @@ The default digest length in bytes (32).
 
 ### `Blake3.blockSize(): int`
 
-The internal block size in bytes (64) — the value HMAC needs.
+The internal block size in bytes (64) - the value HMAC needs.
 
 ### `blake3Hash(data: []byte): []byte`
 
@@ -2500,7 +2499,7 @@ this equals `blake3Hash(data)`.
 ## Curve25519 field
 
 Arithmetic in the prime field GF(2^255 - 19), the field underneath Curve25519.
-A field element is a `[]u64` of length 5 — the value in radix 2^51, five 51-bit
+A field element is a `[]u64` of length 5 - the value in radix 2^51, five 51-bit
 limbs, little-endian. The representation is redundant between operations (limbs
 carry a few spare bits); `fe25519ToBytes` performs the one canonical reduction to
 the unique 0..p-1 representative. All operations are constant-time: no branch or
@@ -2554,7 +2553,7 @@ taken mod 2^255 and later reduced mod p by `fe25519ToBytes`. `s` must be at leas
 
 ### `fe25519ToBytes(f: []u64): []byte`
 
-Fully reduce `f` mod p = 2^255 - 19 and serialize it as 32 little-endian bytes —
+Fully reduce `f` mod p = 2^255 - 19 and serialize it as 32 little-endian bytes -
 the unique canonical encoding, with bit 255 always clear. The reduction is
 constant-time; two representations of the same field element always encode to the
 same bytes.
@@ -2593,7 +2592,7 @@ using the standard Curve25519 addition chain (constant-time). The inverse of 0 i
 0.
 ## bcrypt
 
-Password hashing with the bcrypt algorithm (Provos & Mazières, 1999) — a
+Password hashing with the bcrypt algorithm (Provos & Mazières, 1999) - a
 deliberately slow, salted hash built on the Blowfish cipher. Unlike a raw digest
 (SHA-256, BLAKE3), bcrypt is designed for *passwords*: it is intentionally
 expensive to compute, so an attacker who steals the hash database still cannot
@@ -2605,7 +2604,7 @@ A bcrypt hash is a self-describing 60-character string, `$2b$NN$` followed by a
 22-character salt and a 31-character digest. `NN` is the two-digit cost and `2b`
 is the version; `bcryptVerify` reads the version, cost, and salt straight out of
 the string, so only the hash needs to be stored. This module implements its own
-Blowfish and bcrypt base-64, and follows the `2b` rules — passwords are truncated
+Blowfish and bcrypt base-64, and follows the `2b` rules - passwords are truncated
 to 72 bytes, which is silent and matches every mainstream implementation.
 
 ### `bcryptHash(password: []byte, cost: int): string`
@@ -2613,7 +2612,7 @@ to 72 bytes, which is silent and matches every mainstream implementation.
 Hash `password` with a fresh 16-byte random salt at work factor `cost`, returning
 the 60-character `$2b$` string to store. `cost` must be in `[4, 31]` (it panics
 otherwise); the key schedule runs `2^cost` times, so each step up roughly doubles
-the time — pick the largest value your latency budget allows, commonly 10–12.
+the time - pick the largest value your latency budget allows, commonly 10–12.
 Because the salt is random, hashing the same password twice yields two different
 strings, and both verify.
 
@@ -2621,8 +2620,8 @@ strings, and both verify.
 
 Report whether `password` matches the bcrypt hash `encoded`, recomputing the
 digest under the salt and cost parsed from `encoded` and comparing it to the
-stored digest in constant time. It never panics: any malformed input — wrong
-length, bad prefix, unknown version, or a non-numeric or out-of-range cost —
+stored digest in constant time. It never panics: any malformed input - wrong
+length, bad prefix, unknown version, or a non-numeric or out-of-range cost -
 simply returns `false`. The `2a`, `2b`, `2x`, and `2y` prefixes are all accepted
 and agree for every password up to 72 bytes.
 
@@ -2644,7 +2643,7 @@ function login(password: string, stored: string): bool {
 
 X25519 Diffie-Hellman over Curve25519 (RFC 7748). Given a 32-byte scalar and the
 32-byte little-endian x-coordinate of a point, it returns the x-coordinate of the
-scalar multiple — the ECDH primitive TLS 1.3 uses for key agreement. It is built
+scalar multiple - the ECDH primitive TLS 1.3 uses for key agreement. It is built
 on the `fe25519` field and runs a constant-time Montgomery ladder: the scalar is
 clamped (RFC 7748 §5), and the two data-dependent point selections per bit are
 done with a branchless masked swap, never an `if`, so no branch or memory access
@@ -2663,7 +2662,7 @@ import {
 
 // A full X25519 exchange. Alice keeps a generated key pair; Bob derives his
 // public key from a private scalar with `x25519Base` (the base point u = 9).
-// Both sides reach the identical 32-byte secret — `x25519SharedSecret` rejects
+// Both sides reach the identical 32-byte secret - `x25519SharedSecret` rejects
 // the all-zero contributory case, so the returned bytes go straight to HKDF as
 // input keying material.
 function x25519Exchange(bobPriv: []byte): []byte! {
@@ -2684,7 +2683,7 @@ a peer. Both fields are exported.
 
 X25519 scalar multiplication (RFC 7748 §5): the 32-byte x-coordinate of
 `scalar * point`, where `point` is given by its 32-byte little-endian
-x-coordinate `uCoord`. Clamps the scalar (on a private copy — the caller's slice
+x-coordinate `uCoord`. Clamps the scalar (on a private copy - the caller's slice
 is not mutated) and runs the constant-time Montgomery ladder. This is the raw
 primitive; a small-order input point yields an all-zero result. Both arguments
 must be at least 32 bytes.
@@ -2697,8 +2696,8 @@ X25519 against the Curve25519 base point (u = 9): the public key for a private
 ### `x25519SharedSecret(scalar: []byte, uCoord: []byte): []byte!`
 
 The X25519 shared secret between our private `scalar` and a peer's public point
-`uCoord`, with the contributory check applied: an all-zero output — produced when
-the peer point has small order — is rejected rather than returned. This is the
+`uCoord`, with the contributory check applied: an all-zero output - produced when
+the peer point has small order - is rejected rather than returned. This is the
 function key agreement should call; the returned bytes are handed to HKDF
 directly as input keying material.
 
@@ -2716,7 +2715,7 @@ Curve25519 field arithmetic above and SHA-512. Keys and signatures are the RFC
 8032 byte strings, so they interoperate with any other Ed25519 implementation: a
 private key is a 32-byte seed, a public key is 32 bytes, a signature is 64 bytes.
 
-Signing is deterministic — the per-signature nonce is derived from the private
+Signing is deterministic - the per-signature nonce is derived from the private
 key and message, so no random number generator is involved and the same key and
 message always produce the same signature. Verification rejects malformed inputs:
 a wrong-length key or signature, a non-canonically encoded point, and a scalar `S`
@@ -2764,9 +2763,9 @@ non-canonical scalar (`S >= L`), or a signature that fails the group equation.
 
 BLAKE2 (RFC 7693), in both official widths: **BLAKE2b** over 64-bit words and a
 128-byte block, digest up to 64 bytes; **BLAKE2s** over 32-bit words and a
-64-byte block, digest up to 32. Both run the same design — a 12-round (2b) or
+64-byte block, digest up to 32. Both run the same design - a 12-round (2b) or
 10-round (2s) compression that mixes the message in with the `G` function over
-the fixed `sigma` schedule — and both satisfy the streaming `Hash` interface, so
+the fixed `sigma` schedule - and both satisfy the streaming `Hash` interface, so
 they stream with `write`/`sum`, run one-shot through `digest`, and slot into
 anything written against `Hash`. `sum` finalizes on a copy of the state, so it is
 non-destructive: read the digest and keep writing.
@@ -2774,11 +2773,11 @@ non-destructive: read the digest and keep writing.
 Two features set BLAKE2 apart from SHA-2. The **output length is a parameter**
 (1..64 for 2b, 1..32 for 2s): a shorter length is not a truncation of the full
 digest but a distinct function, because the length is folded into the initial
-state. And a non-empty **key turns it into a MAC** directly — no HMAC wrapper —
+state. And a non-empty **key turns it into a MAC** directly - no HMAC wrapper -
 by absorbing the key as a leading zero-padded block; the key may be up to 64
 bytes (2b) or 32 (2s). Both parameters live in the first word of the parameter
 block, XORed into the initial state at construction. Outputs are verified against
-the RFC 7693 / reference `blake2-kat.json` vectors — BLAKE2b of `"abc"` is
+the RFC 7693 / reference `blake2-kat.json` vectors - BLAKE2b of `"abc"` is
 `ba80a53f…d4009923`, and keyed BLAKE2b of the empty message under the canonical
 `00..3f` key is `10ebb677…3fc51568`.
 
@@ -2789,18 +2788,18 @@ memory access depends on a key or message byte.
 ```bit
 import { newBlake2b, newBlake2s, blake2b, digest, encodeHex } from "std/crypto"
 
-// One-shot BLAKE2b — the full 64-byte digest as lowercase hex. `blake2b` is the
+// One-shot BLAKE2b - the full 64-byte digest as lowercase hex. `blake2b` is the
 // unkeyed convenience; `digest` drives any Hash the same way.
 function blake2bHex(data: []byte): string {
   return encodeHex(blake2b(data))
 }
 
-// One-shot BLAKE2s — the full 32-byte digest. An empty key is unkeyed.
+// One-shot BLAKE2s - the full 32-byte digest. An empty key is unkeyed.
 function blake2sHex(data: []byte): string {
   return encodeHex(digest(newBlake2s(32, []byte(0)), data))
 }
 
-// Keyed BLAKE2 is a MAC on its own — no HMAC. A non-empty key selects keyed
+// Keyed BLAKE2 is a MAC on its own - no HMAC. A non-empty key selects keyed
 // mode; the tag is `size` bytes (32 here).
 function mac(key: []byte, msg: []byte): []byte {
   return digest(newBlake2b(32, key), msg)
@@ -2827,14 +2826,14 @@ function streamed(head: []byte, tail: []byte): int {
 ### `Blake2b`
 
 The streaming state for BLAKE2b. Build one with `newBlake2b` rather than a struct
-literal — the constructor installs the initial state for the chosen output length
+literal - the constructor installs the initial state for the chosen output length
 and key. It satisfies `Hash`, so it carries the five streaming methods below.
 
 ### `newBlake2b(outLen: int, key: []byte): Blake2b`
 
 A fresh BLAKE2b hasher emitting `outLen` bytes (1..64), keyed by `key` for a MAC
 or given an empty `key` (e.g. `[]byte(0)`) for a plain hash; `key` may be up to 64
-bytes. Panics on an out-of-range output length or an over-long key — a caller
+bytes. Panics on an out-of-range output length or an over-long key - a caller
 error, like a wrong-sized cipher key.
 
 ### `Blake2b.write(data: []byte)`
@@ -2844,7 +2843,7 @@ times; the digest is of everything written since the last `reset`.
 
 ### `Blake2b.sum(): []byte`
 
-The digest of everything written so far — `size` bytes. Finalizes on a copy of
+The digest of everything written so far - `size` bytes. Finalizes on a copy of
 the state, so it is non-destructive: call it repeatedly and keep writing after.
 
 ### `Blake2b.reset()`
@@ -2862,7 +2861,7 @@ The internal block size in bytes: 128.
 
 ### `Blake2s`
 
-The streaming state for BLAKE2s — the 32-bit sibling of `Blake2b` over a 64-byte
+The streaming state for BLAKE2s - the 32-bit sibling of `Blake2b` over a 64-byte
 block, digest up to 32 bytes. Build one with `newBlake2s`. It satisfies `Hash`.
 
 ### `newBlake2s(outLen: int, key: []byte): Blake2s`
@@ -2877,7 +2876,7 @@ times; the digest is of everything written since the last `reset`.
 
 ### `Blake2s.sum(): []byte`
 
-The digest of everything written so far — `size` bytes — finalized
+The digest of everything written so far - `size` bytes - finalized
 non-destructively on a copy of the state.
 
 ### `Blake2s.reset()`
@@ -2895,14 +2894,14 @@ The internal block size in bytes: 64.
 
 ### `blake2b(data: []byte): []byte`
 
-The 64-byte unkeyed BLAKE2b digest of `data` — the common one-shot case, a
+The 64-byte unkeyed BLAKE2b digest of `data` - the common one-shot case, a
 shorthand for `digest(newBlake2b(64, []byte(0)), data)`.
 
 ## PBKDF2
 
 PBKDF2 (RFC 8018 §5.2) is the password-based key derivation function: it
 stretches a low-entropy password into a derived key of any length, using HMAC as
-its pseudo-random function. Its defining property is deliberate slowness — the
+its pseudo-random function. Its defining property is deliberate slowness - the
 iteration count `iters` is a cost knob that an attacker must pay in full for
 *every* password guess, while a legitimate caller pays it once. Use it to turn a
 password into an encryption key, or (with a per-user random salt and a high
@@ -2920,7 +2919,7 @@ the last truncated to `outLen`:
 and uses the hash's own `size` as the block length, so the same code derives keys
 under SHA-1, SHA-256, or SHA-512. `newSha1` passes directly; `newSha256` returns
 the concrete `Sha256` and is wrapped as a `() => Hash`. Choose `iters` as high as
-your latency budget allows — hundreds of thousands for SHA-256 is typical — and
+your latency budget allows - hundreds of thousands for SHA-256 is typical - and
 use a unique random salt per key. Output is checked against the RFC 6070
 (HMAC-SHA-1) and RFC 7914 §11 (HMAC-SHA-256) known-answer vectors.
 
@@ -2958,7 +2957,7 @@ ML-KEM (FIPS 203, formerly Kyber) is a post-quantum key-encapsulation mechanism:
 one side publishes an encapsulation key, the other encapsulates a fresh 32-byte
 shared secret to it, and only the holder of the decapsulation key can recover
 that secret. Its security rests on the hardness of module lattice problems, so
-it stays safe against an adversary with a large quantum computer — unlike RSA or
+it stays safe against an adversary with a large quantum computer - unlike RSA or
 elliptic-curve Diffie-Hellman.
 
 This module implements the **768** parameter set (NIST security category 3),
@@ -2979,7 +2978,7 @@ respect to secret data.
 import { mlkemKeygen, mlkemEncaps, mlkemDecaps, ctEq } from "std/crypto"
 
 // A full key exchange: the two parties agree on 32 secret bytes, and the secret
-// itself never travels over the wire — only the public key and the ciphertext do.
+// itself never travels over the wire - only the public key and the ciphertext do.
 function exchange(): bool! {
   // Alice generates a key pair, publishes `kp.ek`, and keeps `kp.dk` secret.
   let kp = mlkemKeygen()
@@ -3050,12 +3049,12 @@ The ciphertext length in bytes (1088).
 The shared-secret length in bytes (32).
 ## AES-GCM-SIV
 
-AES-GCM-SIV (RFC 8452) is a **nonce-misuse-resistant** AEAD. A synthetic IV — the
-authentication tag — is derived from the plaintext *before* it keys the CTR
+AES-GCM-SIV (RFC 8452) is a **nonce-misuse-resistant** AEAD. A synthetic IV - the
+authentication tag - is derived from the plaintext *before* it keys the CTR
 encryption, so unlike plain AES-GCM a repeated nonce is not catastrophic: reusing
 one leaks only whether two `(nonce, aad, plaintext)` triples were identical (their
 ciphertexts then match), and never the authentication key or the XOR of two
-plaintexts. Reach for it when unique nonces cannot be guaranteed — random nonces
+plaintexts. Reach for it when unique nonces cannot be guaranteed - random nonces
 at high volume, or stateless senders that may replay a counter. Same `Aead`
 contract as `AesGcm` and `ChaChaPoly`: a 12-byte nonce and a 16-byte tag.
 
@@ -3070,8 +3069,8 @@ plaintext.
 import { newAesGcmSiv, encodeHex } from "std/crypto"
 
 // Seal then open one message. `key` is 16 or 32 bytes (AES-128/256-GCM-SIV);
-// `nonce` is 12 bytes. A repeated nonce is not catastrophic here — identical
-// inputs merely produce identical ciphertext — but a unique nonce is still
+// `nonce` is 12 bytes. A repeated nonce is not catastrophic here - identical
+// inputs merely produce identical ciphertext - but a unique nonce is still
 // preferred. `aad` is authenticated but not encrypted. Returns the recovered
 // plaintext as hex, or fails if the tag does not verify.
 function protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
@@ -3084,7 +3083,7 @@ function protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): strin
 
 ### `AesGcmSiv`
 
-A keyed AES-GCM-SIV cipher. Build one with `newAesGcmSiv`, not a struct literal —
+A keyed AES-GCM-SIV cipher. Build one with `newAesGcmSiv`, not a struct literal -
 the constructor validates the key length and expands the key-generating schedule.
 One value seals and opens any number of messages; it satisfies the `Aead`
 interface.
@@ -3092,7 +3091,7 @@ interface.
 ### `newAesGcmSiv(key: []byte): AesGcmSiv!`
 
 Keys an AES-GCM-SIV cipher from `key`, the key-generating key: 16 bytes selects
-AES-128-GCM-SIV, 32 bytes AES-256-GCM-SIV. Fails on any other length — unlike GCM,
+AES-128-GCM-SIV, 32 bytes AES-256-GCM-SIV. Fails on any other length - unlike GCM,
 the SIV construction has no 24-byte variant. The per-message record keys are
 derived from this key and the nonce inside every `seal`/`open`.
 
@@ -3100,16 +3099,15 @@ derived from this key and the nonce inside every `seal`/`open`.
 
 Encrypts `plaintext` under the 12-byte `nonce` and authenticates both it and the
 unencrypted `aad`, returning the ciphertext with the 16-byte tag appended (so
-`len(seal(...))` is `len(plaintext) + 16`). A repeated `nonce` is not catastrophic
-— identical `(nonce, aad, plaintext)` inputs produce identical ciphertext — but a
+`len(seal(...))` is `len(plaintext) + 16`). A repeated `nonce` is not catastrophic - identical `(nonce, aad, plaintext)` inputs produce identical ciphertext - but a
 unique nonce per message is still preferred. A wrong nonce length panics.
 
 ### `AesGcmSiv.open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte!`
 
 Verifies and decrypts `ciphertext` (the sealed `ct ‖ tag`) under `nonce` and
 `aad`. Recomputes the synthetic tag over the recovered plaintext and compares it
-in constant time, *failing* on any mismatch — a tampered message, or a wrong key,
-nonce, or `aad` — without returning the plaintext. Also fails if the input is
+in constant time, *failing* on any mismatch - a tampered message, or a wrong key,
+nonce, or `aad` - without returning the plaintext. Also fails if the input is
 shorter than the 16-byte tag.
 
 ### `AesGcmSiv.nonceSize(): int`
@@ -3155,7 +3153,7 @@ import { scrypt, encodeHex } from "std/crypto"
 // Derive a 32-byte encryption key from a password and a per-user random salt.
 // N is the memory/CPU cost and must be a power of two; r and p tune the block
 // size and parallelism. RFC 7914 §2 suggests N=16384, r=8, p=1 for interactive
-// logins — raise N as your hardware allows.
+// logins - raise N as your hardware allows.
 function deriveKey(password: []byte, salt: []byte): []byte! {
   return scrypt(password, salt, 16384, 8, 1, 32)?
 }
@@ -3182,7 +3180,7 @@ X448 Diffie-Hellman over Curve448 (RFC 7748), the higher-security sibling of
 X25519 (~224-bit security). Given a 56-byte scalar and the 56-byte little-endian
 x-coordinate of a point, it returns the x-coordinate of the scalar multiple. It
 runs the same x-only, constant-time Montgomery ladder as X25519, but over the
-Goldilocks field GF(2^448 - 2^224 - 1) — eight byte-aligned 56-bit limbs, so
+Goldilocks field GF(2^448 - 2^224 - 1) - eight byte-aligned 56-bit limbs, so
 serialization is exact and the reduction folds any overflow past 2^448 back in at
 limbs 0 and 4 (2^448 = 2^224 + 1). The scalar is clamped (RFC 7748 §5: clear the
 low 2 bits, set bit 447), and the two data-dependent point selections per bit are
@@ -3202,7 +3200,7 @@ import {
 
 // A full X448 exchange. Alice keeps a generated key pair; Bob derives his public
 // key from a private scalar with `x448Base` (the base point u = 5). Both sides
-// reach the identical 56-byte secret — `x448SharedSecret` rejects the all-zero
+// reach the identical 56-byte secret - `x448SharedSecret` rejects the all-zero
 // contributory case, so the returned bytes go straight to HKDF as input keying
 // material.
 function x448Exchange(bobPriv: []byte): []byte! {
@@ -3223,7 +3221,7 @@ a peer. Both fields are exported.
 
 X448 scalar multiplication (RFC 7748 §5): the 56-byte x-coordinate of
 `scalar * point`, where `point` is given by its 56-byte little-endian
-x-coordinate `uCoord`. Clamps the scalar (on a private copy — the caller's slice
+x-coordinate `uCoord`. Clamps the scalar (on a private copy - the caller's slice
 is not mutated) and runs the constant-time Montgomery ladder. This is the raw
 primitive; a small-order input point yields an all-zero result. Both arguments
 must be at least 56 bytes.
@@ -3236,8 +3234,8 @@ X448 against the Curve448 base point (u = 5): the public key for a private
 ### `x448SharedSecret(scalar: []byte, uCoord: []byte): []byte!`
 
 The X448 shared secret between our private `scalar` and a peer's public point
-`uCoord`, with the contributory check applied: an all-zero output — produced when
-the peer point has small order — is rejected rather than returned. This is the
+`uCoord`, with the contributory check applied: an all-zero output - produced when
+the peer point has small order - is rejected rather than returned. This is the
 function key agreement should call; the returned bytes are handed to HKDF directly
 as input keying material.
 
@@ -3249,7 +3247,7 @@ stored raw (clamped only inside `x448`), and the public key is
 point.
 ## X.509 certificates
 
-X.509 v3 certificate parsing and chain verification (RFC 5280) — the identity
+X.509 v3 certificate parsing and chain verification (RFC 5280) - the identity
 layer a TLS client and a trust store are built from. A DER certificate is parsed
 into a `Certificate` with the fields a caller acts on (subject and issuer
 distinguished names, validity window, public key, SubjectAltName, BasicConstraints,
@@ -3265,7 +3263,7 @@ Verification is **fail-closed**, as RFC 5280 §4.2 requires: a certificate carry
 a critical extension this library does not recognize is rejected rather than
 accepted, so an extension that restricts a certificate can never be bypassed by
 using one the verifier has not learned yet. NameConstraints (§4.2.1.10) are
-enforced across the whole path — a CA's permitted and excluded subtrees bind every
+enforced across the whole path - a CA's permitted and excluded subtrees bind every
 certificate beneath it, exclusion takes precedence over permission, and a present
 but empty permitted set permits nothing (which is not the same as the extension
 being absent). Only `dNSName` subtrees are evaluated; a constraint naming any other
@@ -3275,8 +3273,7 @@ same principle that "not understood" must not mean "allowed".
 Verification is deterministic: the current time is passed in as `nowUnix` (Unix
 seconds) rather than read from a clock, so the same inputs always reach the same
 decision and tests need no time control. Parsing is strict DER (a malformed
-certificate is rejected, not best-guessed), and hostname matching follows RFC 6125
-— a single leftmost-label `*.` wildcard, case-insensitive DNS comparison, and IPv4
+certificate is rejected, not best-guessed), and hostname matching follows RFC 6125 - a single leftmost-label `*.` wildcard, case-insensitive DNS comparison, and IPv4
 literals matched against iPAddress entries, with no deprecated subject-CN fallback.
 
 ```bit
@@ -3295,7 +3292,7 @@ function trusts(leafDer: []byte, intermediates: []Certificate, roots: []Certific
   return true
 }
 
-// Whether `cert` was directly signed by `issuer` and is valid for `host` — the
+// Whether `cert` was directly signed by `issuer` and is valid for `host` - the
 // building block `x509VerifyChain` applies at each step of a path.
 function signedBy(cert: Certificate, issuer: Certificate, host: string): bool {
   return x509MatchHostname(cert, host) && x509VerifySignature(cert, issuer)
@@ -3366,21 +3363,21 @@ only CPU time, Argon2 also forces the attacker to hold a large block of memory f
 the whole computation, so a massively parallel guesser (GPU/ASIC) gains far less
 per dollar. It is tuned by three parameters: `t` passes (time cost), `m` KiB of
 memory, and `p` lanes (parallelism), plus a salt and an optional secret key `K`
-and associated data `X` — all folded into the output.
+and associated data `X` - all folded into the output.
 
 Three variants differ only in how each memory block chooses the block it mixes
 with. **Argon2id** is the RFC 9106 recommendation and what you should use unless
 you have a specific reason not to: it is data-independent for the first half of
 the first pass (side-channel resistant) and data-dependent afterwards
-(GPU-resistant). **Argon2i** is fully data-independent — its memory access reveals
-nothing about the password — for shared or observable hosts. **Argon2d** is fully
+(GPU-resistant). **Argon2i** is fully data-independent - its memory access reveals
+nothing about the password - for shared or observable hosts. **Argon2d** is fully
 data-dependent, fastest and most GPU-resistant, but its access pattern depends on
 the password, so use it only where a side channel is not a threat (e.g. deriving a
 key from a value already secret).
 
 Every variant is built on this module's BLAKE2b. `m` must be at least `8*p` KiB
 and the salt at least 8 bytes (16 recommended); an out-of-range parameter panics.
-The lanes are filled serially rather than on `p` threads — Argon2's four sync
+The lanes are filled serially rather than on `p` threads - Argon2's four sync
 points make that byte-for-byte identical to the parallel schedule, just without
 the parallel speedup.
 
@@ -3416,8 +3413,8 @@ Check a login with `argon2Verify`.
 Report whether `password` matches the PHC Argon2 string `encoded`, re-deriving the
 tag under the type, version, parameters, and salt parsed from `encoded` and
 comparing it in constant time. Accepts `$argon2d`, `$argon2i`, and `$argon2id`
-strings. It never panics: any malformed input — wrong field count, unknown type, a
-version other than 19, a non-numeric parameter, or an undecodable salt or tag —
+strings. It never panics: any malformed input - wrong field count, unknown type, a
+version other than 19, a non-numeric parameter, or an undecodable salt or tag -
 simply returns `false`.
 
 ```bit
@@ -3446,7 +3443,7 @@ function deriveKey(password: []byte, salt: []byte): []byte {
 ML-DSA (FIPS 204), the lattice-based signature scheme formerly named CRYSTALS-
 Dilithium, in its category-3 parameter set **ML-DSA-65**. Its security rests on
 the hardness of Module-LWE / Module-SIS lattice problems, which no known quantum
-algorithm solves — so unlike Ed25519 and ECDSA it stays secure against a
+algorithm solves - so unlike Ed25519 and ECDSA it stays secure against a
 cryptographically-relevant quantum computer. Use it where signatures must outlive
 the arrival of such a machine, or alongside a classical scheme in a hybrid.
 
@@ -3464,8 +3461,8 @@ byte-for-byte against the NIST ACVP known-answer vectors, at the cost of the
 side-channel hardening a random nonce would add. An optional context string
 `ctx` (at most 255 bytes, empty by default) binds a signature to an application
 domain, exactly as it does in the FIPS 204 external interface. Verification
-returns `false` for any malformed input — a wrong-length key or signature, an
-out-of-bounds `z`, or a hint that violates its encoding rules — rather than
+returns `false` for any malformed input - a wrong-length key or signature, an
+out-of-bounds `z`, or a hint that violates its encoding rules - rather than
 raising. The generated key material comes from the OS CSPRNG via `mldsaKeygen`;
 `mldsaKeygenSeed` derives a key pair deterministically from a stored 32-byte seed.
 
@@ -3525,8 +3522,8 @@ wrong-length `sk` or an over-long `ctx`.
 
 Verify signature `sig` on `msg` under verification key `pk` with an empty context
 (FIPS 204 Algorithm 3). Returns `true` only if the signature is well formed and
-valid; any malformed input — wrong-length key or signature, out-of-bounds `z`, or
-a malformed hint — yields `false` rather than an error.
+valid; any malformed input - wrong-length key or signature, out-of-bounds `z`, or
+a malformed hint - yields `false` rather than an error.
 
 ### `mldsaVerifyCtx(pk: []byte, msg: []byte, sig: []byte, ctx: []byte): bool`
 
@@ -3536,20 +3533,20 @@ context.
 ## Trust store
 
 A `TrustStore` is the set of certificate-authority roots a caller treats as trust
-anchors — the roots a TLS client verifies a server's chain up to. It holds parsed
+anchors - the roots a TLS client verifies a server's chain up to. It holds parsed
 `Certificate`s and verifies a leaf against them by delegating to `x509VerifyChain`;
 it owns the anchor set, it does not reimplement verification.
 
 There are three ways to obtain a store. `systemRoots()` reads the operating
-system's own trust store — on Linux the distribution CA bundle
-(`/etc/ssl/certs/ca-certificates.crt`) or the hashed `/etc/ssl/certs` directory —
+system's own trust store - on Linux the distribution CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`) or the hashed `/etc/ssl/certs` directory -
 so trust tracks the administrator's decisions; on macOS and Windows, whose trust
 lives behind Security.framework / CryptoAPI, it fails with a clear error until
 that native integration lands. `fromPem(pem)` builds a store from roots the caller
 supplies (a pinned corporate root, a private PKI, a test fixture), parsing every
 `CERTIFICATE` block strictly. `bundled()` returns a small curated set of well-known
 public roots compiled into the binary, a working default when no system store is
-available — a convenience floor, not a substitute for the system store.
+available - a convenience floor, not a substitute for the system store.
 
 Verification is deterministic: `nowUnix` is injected, never read from a clock,
 exactly as `x509VerifyChain` requires.
@@ -3584,7 +3581,7 @@ function truststoreTrusts(rootsPem: string, interPem: string, leafPem: string, h
   return true
 }
 
-// The number of public roots the compiled-in default set carries — a nonzero
+// The number of public roots the compiled-in default set carries - a nonzero
 // fallback for when no system trust store is available.
 function truststoreBundledCount(): int {
   return len(bundled().roots)
@@ -3599,8 +3596,8 @@ hand the anchors to a lower-level verifier or inspect them.
 ### `fromPem(pem: string): TrustStore!`
 
 Build a store from a PEM bundle: every `CERTIFICATE` block in `pem`, in order,
-parsed into a root. Strict — a block whose DER is not a well-formed certificate
-fails the whole parse — and fails if the input carries no certificate at all.
+parsed into a root. Strict - a block whose DER is not a well-formed certificate
+fails the whole parse - and fails if the input carries no certificate at all.
 Non-CERTIFICATE blocks (a stray CRL or key) are ignored.
 
 ### `systemRoots(): TrustStore!`
@@ -3609,7 +3606,7 @@ The operating system's trust store. On Linux, the distribution CA bundle
 (`/etc/ssl/certs/ca-certificates.crt`), else the hashed `/etc/ssl/certs`
 directory read tolerantly (an entry the parser cannot yet handle is skipped, so
 one odd certificate does not sink the store). On macOS and Windows it fails with a
-clear error — call `bundled()` there until native trust-store integration lands.
+clear error - call `bundled()` there until native trust-store integration lands.
 
 ### `TrustStore.verifyChain(leaf: Certificate, intermediates: []Certificate, hostname: string, nowUnix: int): ()!`
 
@@ -3622,6 +3619,6 @@ signature, an unbuildable chain, a path-length violation).
 ### `bundled(): TrustStore`
 
 A store of a small, curated set of well-known public CA roots compiled into the
-binary — a working default when no system store is available. The embedded PEM is
+binary - a working default when no system store is available. The embedded PEM is
 vetted at commit time and parsed by CI, so a parse failure is a build-time
 invariant violation and panics rather than returning a silently empty store.

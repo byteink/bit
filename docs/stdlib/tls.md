@@ -27,7 +27,7 @@ agree on a shared secret. `std/tls` supports four, each with its IANA
 
 The classical groups are symmetric Diffie-Hellman: each side generates an
 ephemeral keypair and computes the shared secret from the peer's public share.
-`X25519MLKEM768` is a post-quantum **hybrid** — a key-encapsulation mechanism, so
+`X25519MLKEM768` is a post-quantum **hybrid** - a key-encapsulation mechanism, so
 its two roles differ (the client publishes an ML-KEM encapsulation key; the
 server encapsulates to it rather than generating a second keypair).
 
@@ -91,7 +91,7 @@ together (encapsulation yields both at once).
 ### `tlsGroupGenerate(g: TlsGroup): GroupKeypair`
 
 Generate the initiator's ephemeral `key_share` for group `g` and the private
-state to keep. Never fails — every group is a fresh keygen with no peer input to
+state to keep. Never fails - every group is a fresh keygen with no peer input to
 reject. For the hybrid this generates both an ML-KEM-768 keypair and an X25519
 keypair, packing the wire share as `ek ‖ x25519_pub` (1216 bytes).
 
@@ -99,7 +99,7 @@ keypair, packing the wire share as `ek ‖ x25519_pub` (1216 bytes).
 
 The initiator's shared secret, from its retained `priv` state and the
 responder's `peerKeyShare`. Fails if the peer's share is malformed or rejected
-(an all-zero X25519 output or an invalid EC point — the contributory-behaviour
+(an all-zero X25519 output or an invalid EC point - the contributory-behaviour
 checks TLS requires). For the hybrid, the returned 64 bytes are
 `mlkem_shared_secret ‖ x25519_shared_secret`.
 
@@ -126,7 +126,7 @@ ML-KEM part **first**, reversing the generic hybrid naming convention.
 | server `key_share` | `mlkem768_ct ‖ x25519_pub` | 1088 + 32 = 1120 | §4.2 |
 | shared secret | `mlkem_ss ‖ x25519_ss` | 32 + 32 = 64 | §4.3 |
 
-There is exactly one ML-KEM keypair — the client's. The client sends its
+There is exactly one ML-KEM keypair - the client's. The client sends its
 encapsulation key; the server encapsulates to it (producing the ciphertext and
 the ML-KEM shared secret) and runs its own X25519 half; the client decapsulates
 the ciphertext and runs the matching X25519 half. Both sides concatenate ML-KEM
@@ -135,7 +135,7 @@ first, then X25519, to reach the same 64-byte secret.
 ## Cipher suites
 
 The TLS 1.3 cipher-suite registry (RFC 8446 §B.4, §9.1). A `CipherSuite` is a
-pure descriptor — a code point, its registered name, and the four lengths a
+pure descriptor - a code point, its registered name, and the four lengths a
 record layer needs (AEAD key, the fixed 12-byte nonce, the tag, and the HKDF /
 transcript-hash digest). Two builders turn a descriptor into live primitives:
 `tlsSuiteNewAead` keys the suite's `Aead` from raw bytes and `tlsSuiteNewHash`
@@ -205,12 +205,12 @@ owns the key material.
 
 ### `tlsSuiteNewHash(suite: CipherSuite): Hash`
 
-A fresh `Hash` for the suite's transcript / HKDF digest — SHA-384 for
+A fresh `Hash` for the suite's transcript / HKDF digest - SHA-384 for
 `TLS_AES_256_GCM_SHA384` (48-byte output), SHA-256 for the other two.
 
 ## Key schedule
 
-The schedule is three `HKDF-Extract` rungs — Early, Handshake, Master — each one
+The schedule is three `HKDF-Extract` rungs - Early, Handshake, Master - each one
 mixing in a new input and feeding a family of `Derive-Secret` outputs, with the
 two rungs joined by `Derive-Secret(., "derived", "")`:
 
@@ -225,7 +225,7 @@ ECDHE -> Extract -> Handshake Secret -> c/s hs traffic
 Every function is generic over the negotiated cipher suite's hash and takes a
 hash *constructor* (`() => Hash`, e.g. `newSha256` or `newSha384`), asking it for
 its own digest size rather than hard-coding one. A leaf traffic secret is then
-unrolled into an AEAD `key` and `iv`, and — for the Finished message — a
+unrolled into an AEAD `key` and `iv`, and - for the Finished message - a
 `finished_key` MAC key, all by `HKDF-Expand-Label`.
 
 The `TranscriptHash` accumulator keeps the running hash of the handshake
@@ -284,7 +284,7 @@ derivation in the schedule.
 ### `deriveSecret(newHash: () => Hash, secret: []byte, label: string, transcriptHash: []byte): []byte`
 
 `Derive-Secret` (RFC 8446 §7.1): a full-digest-length child secret bound to the
-handshake transcript — `HKDF-Expand-Label(secret, label, transcriptHash,
+handshake transcript - `HKDF-Expand-Label(secret, label, transcriptHash,
 Hash.length)`.
 
 ### `earlySecret(newHash: () => Hash, psk: []byte): []byte`
@@ -294,7 +294,7 @@ pre-shared key; it becomes `HashLen` zero bytes, as the RFC requires.
 
 ### `handshakeSecret(newHash: () => Hash, early: []byte, ecdhe: []byte): []byte`
 
-The Handshake Secret, `HKDF-Extract(Derive-Secret(early, "derived", ""), ECDHE)` —
+The Handshake Secret, `HKDF-Extract(Derive-Secret(early, "derived", ""), ECDHE)` -
 mixes in the (EC)DHE shared secret. The handshake traffic secrets derive from it.
 
 ### `masterSecret(newHash: () => Hash, handshake: []byte): []byte`
@@ -304,22 +304,22 @@ The application, exporter, and resumption secrets derive from it.
 
 ### `clientHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte`
 
-`Derive-Secret(handshake, "c hs traffic", ClientHello..ServerHello)` — the
+`Derive-Secret(handshake, "c hs traffic", ClientHello..ServerHello)` - the
 client's handshake-record protection secret.
 
 ### `serverHandshakeTrafficSecret(newHash: () => Hash, handshake: []byte, transcriptHash: []byte): []byte`
 
-`Derive-Secret(handshake, "s hs traffic", ClientHello..ServerHello)` — the
+`Derive-Secret(handshake, "s hs traffic", ClientHello..ServerHello)` - the
 server's handshake-record protection secret.
 
 ### `clientApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
 
-`Derive-Secret(master, "c ap traffic", ClientHello..server Finished)` — the
+`Derive-Secret(master, "c ap traffic", ClientHello..server Finished)` - the
 initial client application-data secret.
 
 ### `serverApplicationTrafficSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
 
-`Derive-Secret(master, "s ap traffic", ClientHello..server Finished)` — the
+`Derive-Secret(master, "s ap traffic", ClientHello..server Finished)` - the
 initial server application-data secret.
 
 ### `exporterMasterSecret(newHash: () => Hash, master: []byte, transcriptHash: []byte): []byte`
@@ -356,7 +356,7 @@ transcriptHash)`. The receiver recomputes it over its own transcript and compare
 in constant time to authenticate the whole handshake.
 
 The four functions below fill out the branches that hang off the Early Secret
-rung when a pre-shared key is in play (RFC 8446 §7.1) — session resumption and
+rung when a pre-shared key is in play (RFC 8446 §7.1) - session resumption and
 0-RTT (see [Session resumption and 0-RTT](#session-resumption-and-0-rtt)) never
 change the ladder itself; `handshakeSecret`/`masterSecret` above are already
 generic over `early`, only what feeds it and what is derived from it early
@@ -366,7 +366,7 @@ differs.
 
 `binder_key` (RFC 8446 §7.1): `Derive-Secret(early, "res binder", "")`. Keys the
 Finished-shaped MAC (`finishedMac`) that binds a ClientHello's `pre_shared_key`
-identity to the PSK it claims. Only the resumption-PSK label is implemented —
+identity to the PSK it claims. Only the resumption-PSK label is implemented -
 this module has no external-PSK API.
 
 ### `clientEarlyTrafficSecret(newHash: () => Hash, early: []byte, clientHello1Hash: []byte): []byte`
@@ -394,21 +394,21 @@ yields a distinct, unlinkable PSK per ticket.
 The wire encoding of the TLS 1.3 handshake (RFC 8446 §4): the `Handshake`
 framing and a typed encoder/decoder for every message a 1-RTT exchange carries.
 This is the byte layer the client and server halves of the protocol are built
-from — it does no cryptography and drives no connection, it only turns handshake
+from - it does no cryptography and drives no connection, it only turns handshake
 messages to and from bytes.
 
 Each message maps to a struct with exported fields. `encode*` serializes one
 into a complete Handshake-framed message (the one-byte type, the three-byte
 length, then the body); `parse*` is the strict inverse. Parsing is written for
 hostile input: every `parse*` returns `T!`, a declared length that runs past the
-buffer fails, and a message — or extension block, certificate list, or extension
-body — with bytes left over is rejected rather than best-guessed.
+buffer fails, and a message - or extension block, certificate list, or extension
+body - with bytes left over is rejected rather than best-guessed.
 
 An `Extension` is generic: a two-byte type and its raw body bytes. A message
 never interprets the extensions it carries, so any extension round-trips
 byte-for-byte, whether or not this module has a typed helper for it. The typed
 `ext*` builders and `parse*` readers interpret the bodies of the extensions a
-handshake negotiates over — server name, ALPN, supported versions, supported
+handshake negotiates over - server name, ALPN, supported versions, supported
 groups, key share, and signature algorithms.
 
 ```bit
@@ -450,7 +450,7 @@ function demo(): string! {
 
 ### `handshakeType(msg: []byte): int!`
 
-The message type of a Handshake-framed message — its first byte — without
+The message type of a Handshake-framed message - its first byte - without
 decoding the body. Fails on an empty buffer. Dispatch on it to pick the right
 `parse*` before you know which message you hold.
 
@@ -469,7 +469,7 @@ bytes for it. The value the `key_share` extension carries.
 
 A ClientHello: `legacyVersion` (0x0303), a 32-byte `random`, the legacy
 `sessionId`, the offered `cipherSuites`, and `extensions`. The single null
-compression method TLS 1.3 mandates is implicit — written on encode, required on
+compression method TLS 1.3 mandates is implicit - written on encode, required on
 decode.
 
 ### `encodeClientHello(ch: ClientHello): []byte`
@@ -484,7 +484,7 @@ compression list, or trailing bytes.
 ### `ServerHello`
 
 A ServerHello: like `ClientHello` but with a single selected `cipherSuite` and
-no compression list. A HelloRetryRequest shares this framing — detect it with
+no compression list. A HelloRetryRequest shares this framing - detect it with
 `isHelloRetryRequest`.
 
 ### `encodeServerHello(sh: ServerHello): []byte`
@@ -653,11 +653,11 @@ The selected entry of a ServerHello `key_share` extension.
 
 ### `versionTls12: int`
 
-TLS 1.2 (0x0303) — the ClientHello/ServerHello `legacy_version`.
+TLS 1.2 (0x0303) - the ClientHello/ServerHello `legacy_version`.
 
 ### `versionTls13: int`
 
-TLS 1.3 (0x0304) — the value carried in `supported_versions`.
+TLS 1.3 (0x0304) - the value carried in `supported_versions`.
 
 ### `hsClientHello: int`
 
@@ -689,7 +689,7 @@ HandshakeType finished (20).
 
 ### `extTypeServerName: int`
 
-ExtensionType server_name (0) — SNI.
+ExtensionType server_name (0) - SNI.
 
 ### `extTypeSupportedGroups: int`
 
@@ -701,7 +701,7 @@ ExtensionType signature_algorithms (13).
 
 ### `extTypeALPN: int`
 
-ExtensionType application_layer_protocol_negotiation (16) — ALPN.
+ExtensionType application_layer_protocol_negotiation (16) - ALPN.
 
 ### `extTypeSupportedVersions: int`
 
@@ -756,7 +756,7 @@ The record layer (RFC 8446 §5) is the frame every TLS message travels in. Once
 traffic keys exist, each record is an AEAD-protected `TLSCiphertext`: its outer
 `opaque_type` is always `application_data(23)` and the true content type moves
 inside the sealed body, `content ‖ real_content_type ‖ zero_padding`. Protection
-is deterministic — the per-record nonce is the fixed traffic IV XORed with the
+is deterministic - the per-record nonce is the fixed traffic IV XORed with the
 64-bit record sequence number, and the AEAD's additional data is exactly the
 five-byte record header. Sequence numbers are **per direction** and reset to zero
 on every key change, so a read context and a write context each keep their own
@@ -765,7 +765,7 @@ counter.
 `RecordKeys` binds one direction's key, IV, sequence counter, and cipher suite.
 `seal` protects an outbound fragment (≤ 2^14 octets); `open` recovers an inbound
 one, rejecting any record whose ciphertext exceeds 2^14 + 256 octets or whose AEAD
-tag fails — a failed `open` is fatal (`bad_record_mac`) and is never retried.
+tag fails - a failed `open` is fatal (`bad_record_mac`) and is never retried.
 `keyUpdate` re-derives the direction's key and IV from the next
 application-traffic secret (RFC 8446 §7.2) and rewinds the counter to zero. Both
 sides are keyed from a traffic secret produced by the [key schedule](#key-schedule).
@@ -792,7 +792,7 @@ function roundtrip(secret: []byte, msg: []byte): []byte! {
 
 One direction's record-protection state: the negotiated suite, current traffic
 secret, keyed AEAD, fixed IV, and the monotonic sequence number. Its fields are
-private — build one with `newRecordKeys` and mutate it only through the methods,
+private - build one with `newRecordKeys` and mutate it only through the methods,
 so the sequence number can never desynchronise from the nonce it feeds.
 
 ### `RecordPlaintext`
@@ -817,7 +817,7 @@ cap. No padding is added.
 ### `RecordKeys.open(record: []byte): RecordPlaintext!`
 
 Recover the inner content of a protected `record` (full on-the-wire bytes, header
-included) and advance the sequence number. Fails — fatally, with no retry — on a
+included) and advance the sequence number. Fails - fatally, with no retry - on a
 truncated header, an over-long ciphertext (> 2^14 + 256), a header/length
 mismatch, or an AEAD authentication failure (`bad_record_mac`).
 
@@ -830,7 +830,7 @@ to zero. Fails only if the suite rejects the re-derived key length.
 
 ### `RecordKeys.sequence(): int`
 
-This direction's current record sequence number — the counter the next `seal` or
+This direction's current record sequence number - the counter the next `seal` or
 `open` will use, `0` on a fresh context or just after `keyUpdate`.
 
 ### `RecordKeys.nonce(): []byte`
@@ -845,7 +845,7 @@ Inner content type alert (21).
 
 ### `recordHandshake: int`
 
-Inner content type handshake (22) — the type carried by protected handshake
+Inner content type handshake (22) - the type carried by protected handshake
 records such as EncryptedExtensions, Certificate, and Finished.
 
 ### `recordApplicationData: int`
@@ -858,7 +858,7 @@ The 1-RTT client half of the protocol (RFC 8446), assembled from the pieces
 above. It is **sans-I/O**: the handshake owns no sockets, so the caller drives it
 by shuttling flights of raw record bytes, over a TCP stream, an in-memory pipe, or
 a recorded trace alike. Server authentication is the security core and is always
-enforced — the certificate chain is verified against a caller-supplied
+enforced - the certificate chain is verified against a caller-supplied
 [`TrustStore`](#-truststore-) and the SNI hostname, the server's CertificateVerify
 signature is checked over the RFC 8446 §4.4.3 signed content, and the server
 Finished MAC is checked in constant time; any failure aborts the handshake.
@@ -894,7 +894,7 @@ the struct literal.
 
 ### `newTrustStore(rootsPem: string): TrustStore!`
 
-A `TrustStore` from a PEM bundle of one or more `CERTIFICATE` blocks — the usual
+A `TrustStore` from a PEM bundle of one or more `CERTIFICATE` blocks - the usual
 system-roots format. Fails on malformed PEM, a certificate the X.509 parser
 rejects, or a bundle with no `CERTIFICATE` block.
 
@@ -914,8 +914,8 @@ certificate must match), `alpn` (protocols offered, preferred first), `trust` (t
 roots to verify against), `insecureSkipVerify` (skip chain + hostname only),
 `nowUnix` (the time for certificate validity), `groups` (named groups offered,
 preferred first), `keyShareGroups` (the subset of `groups` to actually send a
-key_share for — empty means all; a group offered but not shared is what a server
-requests via HelloRetryRequest), `suites` (cipher suites offered — empty means all
+key_share for - empty means all; a group offered but not shared is what a server
+requests via HelloRetryRequest), `suites` (cipher suites offered - empty means all
 three mandatory suites), and the advanced `clientHelloOverride` /
 `ephemeralOverride` (an exact ClientHello and pinned ephemeral keypairs, for
 deterministic replay).
@@ -960,7 +960,7 @@ derived as the handshake advances.
 
 Process one server flight of raw record bytes. Returns a `retry` step on a
 HelloRetryRequest (resend `outbound`, then feed the next flight) or a `done` step
-carrying the client Finished to send. Fails — fatally — on any parse error or
+carrying the client Finished to send. Fails - fatally - on any parse error or
 authentication failure (bad certificate chain, CertificateVerify signature, or
 server Finished MAC).
 
@@ -986,8 +986,8 @@ function finish(h: TlsClientHandshake, serverFlight: []byte): TlsClientConn! {
 ### `TlsClientStep`
 
 One step of the client handshake from `processServerFlight`: `retry` (a
-HelloRetryRequest was received — resend `outbound`), `done` (the handshake
-completed — `outbound` is the client Finished to send), and `outbound` (the
+HelloRetryRequest was received - resend `outbound`), `done` (the handshake
+completed - `outbound` is the client Finished to send), and `outbound` (the
 record(s) to send now).
 
 ### `TlsClientConn`
@@ -1026,7 +1026,7 @@ exceeds the 2^14 record limit.
 ### `TlsClientConn.openApp(record: []byte): RecordPlaintext!`
 
 Open one inbound protected record under the server's application-traffic key,
-returning the recovered content and its inner type — `recordHandshake` for a
+returning the recovered content and its inner type - `recordHandshake` for a
 post-handshake message (NewSessionTicket / KeyUpdate), `recordApplicationData` for
 caller data. Fails fatally on an authentication failure.
 
@@ -1043,7 +1043,7 @@ function roundtrip(conn: TlsClientConn, request: []byte): []byte! {
 
 ## Server handshake
 
-The 1-RTT server half — the mirror of the client. It negotiates a cipher suite and
+The 1-RTT server half - the mirror of the client. It negotiates a cipher suite and
 a named group from the ClientHello, answers with a ServerHello key_share (or a
 HelloRetryRequest when the client shared no acceptable group), sends its
 authentication flight (EncryptedExtensions, its Certificate chain, a
@@ -1137,9 +1137,9 @@ function accept(config: TlsServerConfig, clientHello: []byte, clientFinished: []
 
 ### `TlsServerStep`
 
-One step from `processClientHello`: `retry` (a HelloRetryRequest was produced —
+One step from `processClientHello`: `retry` (a HelloRetryRequest was produced -
 send `outbound` and feed the next ClientHello) and `outbound` (the record(s) to
-send now — the HelloRetryRequest, or the ServerHello plus the encrypted flight).
+send now - the HelloRetryRequest, or the ServerHello plus the encrypted flight).
 
 ### `TlsServerConn`
 
@@ -1195,11 +1195,11 @@ recovers as a `recordHandshake`-typed record. The client bundles the ticket with
 the connection's `resumptionSecret()` into a `SessionTicket` (via
 `newSessionTicket`) and, on a later connection, drives `tlsClientStartResume`
 instead of `tlsClientStart`. That builds a ClientHello carrying
-`psk_key_exchange_modes` (PSK with (EC)DHE, `psk_dhe_ke` — this module does not
+`psk_key_exchange_modes` (PSK with (EC)DHE, `psk_dhe_ke` - this module does not
 implement the no-DHE `psk_ke` mode) and `pre_shared_key` (the ticket as the
 offered identity, with a binder proving possession of the PSK the ticket
 derives). The server validates the binder and, on success, skips Certificate
-and CertificateVerify entirely — the PSK already authenticates the connection.
+and CertificateVerify entirely - the PSK already authenticates the connection.
 
 **0-RTT early data is replayable.** An attacker who captures a ClientHello plus
 its early-data flight can replay it verbatim, and the server has no way to tell
@@ -1207,7 +1207,7 @@ a replay from the original: RFC 8446 §8 gives servers only mitigations
 (single-use tickets, ClientHello recording within a short window), never a
 guarantee, and this module implements neither. An application **must** treat
 any request that might arrive as 0-RTT data as safe to execute more than once
-(idempotent) — a `GET`, never a fund transfer. `TlsServerHandshake.earlyDataReceived`
+(idempotent) - a `GET`, never a fund transfer. `TlsServerHandshake.earlyDataReceived`
 exists to let a caller apply exactly that discipline; the module cannot enforce
 it for you.
 
@@ -1216,7 +1216,7 @@ it for you.
 One `pre_shared_key` identity entry: the opaque ticket bytes (`identity`) and
 the client's (obfuscated) estimate of how long ago it received the ticket
 (`obfuscatedTicketAge`). `tlsClientStartResume` always sends an
-`obfuscatedTicketAge` of 0 — this module does not track wall-clock ticket age,
+`obfuscatedTicketAge` of 0 - this module does not track wall-clock ticket age,
 a valid if maximally conservative value on the wire.
 
 ### `SessionTicket`
@@ -1225,7 +1225,7 @@ What a client keeps, after a connection closes, to attempt resumption on a
 later one: the raw ticket and nonce a `NewSessionTicket` carried, the
 connection's resumption_master_secret, and enough of the original connection's
 parameters (`suiteId`, `alpn`) to rebuild a compatible offer. Build one with
-`newSessionTicket`; store it however the caller likes — in memory, keyed by
+`newSessionTicket`; store it however the caller likes - in memory, keyed by
 server name, is enough for most uses. No persistence or session-cache
 abstraction is built in.
 
@@ -1250,26 +1250,26 @@ this directly only when building a `TlsServerConfig` by hand.
 
 Issue a `NewSessionTicket` for this connection: mint fresh ticket and nonce
 bytes, record the session (resumption secret, suite, whether 0-RTT is allowed
-on it — `TlsServerConfig.allowEarlyData` at the time of the original handshake)
+on it - `TlsServerConfig.allowEarlyData` at the time of the original handshake)
 in the connection's ticket store, and return the sealed post-handshake record
-to send. The caller decides when — and whether — to call this, same as
+to send. The caller decides when - and whether - to call this, same as
 `sealApp`; a server that never calls it simply never offers resumption.
 
 ### `tlsClientStartResume(config: TlsClientConfig, session: SessionTicket, earlyData: []byte): TlsClientHandshake!`
 
 Start a client handshake attempting session resumption with `session`, the
-PSK-DHE mode, and — when `earlyData` is non-empty — 0-RTT early application
+PSK-DHE mode, and - when `earlyData` is non-empty - 0-RTT early application
 data sent speculatively in the same flight as the ClientHello, before the
 server has replied at all. The server may still decline the PSK entirely
-(falling back to a fresh handshake — detect this via `pskWasAccepted()` once
+(falling back to a fresh handshake - detect this via `pskWasAccepted()` once
 connected) or accept the PSK but decline early data (`earlyDataAccepted` stays
 false on the resulting `TlsClientHandshake`); in the latter case the caller
-must resend `earlyData` itself as ordinary application data once connected —
+must resend `earlyData` itself as ordinary application data once connected -
 this module does not buffer or auto-retry it.
 
 ### `TlsClientHandshake.pskWasAccepted(): bool`
 
-Whether the server accepted the PSK this handshake offered — meaningful only
+Whether the server accepted the PSK this handshake offered - meaningful only
 after `processServerFlight` has processed the ServerHello. False for a
 handshake that never called `tlsClientStartResume`, and also false when the
 server declined the PSK and fell back to a fresh handshake (Certificate
@@ -1288,8 +1288,8 @@ Whether this handshake accepted the client's 0-RTT early data. When true,
 ### `TlsServerHandshake.earlyDataReceived(): []byte`
 
 The 0-RTT early application data this handshake decrypted, concatenated in the
-order the client sent it. Empty unless `earlyDataWasAccepted()`. **Replayable —
-see this section's opening caveat** — treat it as safe to process more than
+order the client sent it. Empty unless `earlyDataWasAccepted()`. **Replayable -
+see this section's opening caveat** - treat it as safe to process more than
 once before acting on it.
 
 ```bit
@@ -1303,7 +1303,7 @@ function issue(serverConn: TlsServerConn): []byte! {
   return serverConn.issueTicket()?
 }
 
-// The client stores the ticket, then later resumes with it — optionally
+// The client stores the ticket, then later resumes with it - optionally
 // attempting 0-RTT by passing early application data (must be idempotent).
 function storeAndResume(
   clientConn: TlsClientConn,
@@ -1322,8 +1322,8 @@ function storeAndResume(
 QUIC does not run TLS over the TLS record layer (RFC 9001 §4): it carries the
 plaintext handshake **messages** inside its own CRYPTO frames and protects them
 with QUIC packet protection instead. This mode drives the very same client and
-server state machines at the handshake-message level — no `RecordKeys.seal`/`open`
-and no five-byte record framing — and exposes the traffic secrets so
+server state machines at the handshake-message level - no `RecordKeys.seal`/`open`
+and no five-byte record framing - and exposes the traffic secrets so
 [`std/quic`](quic.md) can key each encryption level. It is purely additive: the
 record-mode entrypoints and every record-mode behaviour are untouched.
 
@@ -1331,7 +1331,7 @@ Server authentication is **not** relaxed here. The client still verifies the
 certificate chain and hostname against its [`TrustStore`](#-truststore-) (unless
 `insecureSkipVerify`), the CertificateVerify signature, and the server Finished
 MAC in constant time; the server still verifies the client Finished MAC. The
-`Exts` entrypoints add extensions to the ClientHello / EncryptedExtensions — QUIC
+`Exts` entrypoints add extensions to the ClientHello / EncryptedExtensions - QUIC
 uses this to carry the `quic_transport_parameters` extension (RFC 9001 §8.2).
 
 ```bit
@@ -1361,7 +1361,7 @@ The `clientHelloOverride` path ignores `extraExts`.
 
 ### `TlsClientHandshake.clientHelloMessage(): []byte`
 
-The ClientHello handshake **message** (RFC 8446 §4.1.2) — the plaintext bytes for
+The ClientHello handshake **message** (RFC 8446 §4.1.2) - the plaintext bytes for
 Initial-level CRYPTO frames, exactly what `hello` wraps in a record without the
 five-byte record header.
 
@@ -1375,8 +1375,8 @@ second HelloRetryRequest.
 
 ### `TlsClientHandshake.clientReadHandshake(stream: []byte): []byte!`
 
-Consume the server's Handshake-level messages — EncryptedExtensions, Certificate,
-CertificateVerify, Finished — as one plaintext `stream` (reassembled from
+Consume the server's Handshake-level messages - EncryptedExtensions, Certificate,
+CertificateVerify, Finished - as one plaintext `stream` (reassembled from
 Handshake-level CRYPTO frames), and return the client Finished **message** to
 carry in a Handshake-level CRYPTO frame. Runs the full security core: it verifies
 the certificate chain + hostname (unless `insecureSkipVerify`), the
@@ -1385,7 +1385,7 @@ application-traffic secrets. Fails fatally on any parse or authentication failur
 
 ### `TlsClientHandshake.peerEncryptedExtensions(): []Extension`
 
-The server's EncryptedExtensions, as parsed during `clientReadHandshake` — QUIC
+The server's EncryptedExtensions, as parsed during `clientReadHandshake` - QUIC
 reads the peer's `quic_transport_parameters` (codepoint `0x0039`) from here. Empty
 until the auth flight has been consumed.
 
@@ -1419,7 +1419,7 @@ it.
 
 ### `TlsClientHandshake.exporterSecret(): []byte`
 
-The exporter_master_secret (RFC 8446 §7.5), derived by `clientReadHandshake` — the
+The exporter_master_secret (RFC 8446 §7.5), derived by `clientReadHandshake` - the
 root of exported keying material bound to this handshake.
 
 ### `tlsServerStartExts(config: TlsServerConfig, extraExts: []Extension): TlsServerHandshake!`
@@ -1488,7 +1488,7 @@ produced.
 The high-level, socket-driving API most callers reach for: `dial` for a client,
 `listen` + `accept` for a server, and a `TlsConn` whose `read`/`write` speak
 plaintext over the TLS record layer of an underlying [`std/net`](net.md)
-connection. It ties the sans-I/O handshakes above to real sockets — record
+connection. It ties the sans-I/O handshakes above to real sockets - record
 framing, flight boundaries, and the partial-record buffering a byte stream forces
 are all handled internally. Only TLS 1.3 is spoken.
 
@@ -1507,8 +1507,8 @@ match; `minVersion` is the version floor; `nowUnix` is the clock for
 certificate-validity checks; and `certPem`/`keyPem` are the server's certificate
 chain and private key, required by `listen`.
 
-**Security note.** `verify` false — including its `false` zero value in a
-hand-built struct literal — DISABLES server authentication: the connection then
+**Security note.** `verify` false - including its `false` zero value in a
+hand-built struct literal - DISABLES server authentication: the connection then
 proves only that the peer holds the CertificateVerify key and completes the
 Finished MAC, not that it is the host it claims to be. Build configs with
 `newTlsConfig`, which is secure by default, and set `verify: false` only for
@@ -1517,13 +1517,13 @@ tests or pinned-key scenarios.
 ### `newTlsConfig(roots: TrustStore): TlsConfig`
 
 A `TlsConfig` that verifies servers against `roots`, secure by default: `verify`
-is true and `minVersion` is TLS 1.3. The recommended constructor — a raw struct
+is true and `minVersion` is TLS 1.3. The recommended constructor - a raw struct
 literal risks a `verify: false` zero value.
 
 ### `emptyTrustStore(): TrustStore`
 
 A `TrustStore` with no roots, for a server config (which never verifies a peer) or
-a deliberately insecure client — the cases `newTrustStore`, which rejects an empty
+a deliberately insecure client - the cases `newTrustStore`, which rejects an empty
 root set, cannot serve.
 
 ### `dial(host: string, port: int, config: TlsConfig): TlsConn!`
@@ -1539,7 +1539,7 @@ error.
 
 Bind a TLS listener on `host:port`. `config.certPem` and `config.keyPem` (the
 server's certificate chain and matching private key, PEM) are required. `port`
-may be `0` to let the kernel choose one — read it back with `port()`.
+may be `0` to let the kernel choose one - read it back with `port()`.
 
 ### `TlsListener.accept(): TlsConn!`
 
@@ -1548,7 +1548,7 @@ returning its `TlsConn`. Fails on an accept or handshake error.
 
 ### `TlsListener.port(): int!`
 
-The port the listener is bound to — meaningful even when `0` was requested.
+The port the listener is bound to - meaningful even when `0` was requested.
 
 ### `TlsListener.close()`
 
@@ -1558,7 +1558,7 @@ Close the listening socket.
 
 Up to `n` decrypted application bytes, buffering any surplus from a record for the
 next call. Post-handshake handshake records (e.g. NewSessionTicket) are skipped.
-An empty result is end of stream — a clean socket close or a TLS `close_notify`.
+An empty result is end of stream - a clean socket close or a TLS `close_notify`.
 Fails on a record that fails authentication.
 
 ### `TlsConn.write(b: []byte): ()!`
@@ -1580,7 +1580,7 @@ The negotiated cipher suite's IANA code point.
 
 ### `TlsConn.peerCertificates(): [][]byte`
 
-The peer's certificate chain as raw DER, end-entity first — the server's chain on
+The peer's certificate chain as raw DER, end-entity first - the server's chain on
 a client connection, empty on a server connection (client certificates are not
 requested).
 

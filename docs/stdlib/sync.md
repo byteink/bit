@@ -1,14 +1,14 @@
 # std/sync
 
 Shared-memory synchronization for truly-parallel Bit code (SPEC §16.1, §13.7).
-**Channels remain the preferred concurrency primitive** — *do not communicate by
+**Channels remain the preferred concurrency primitive** - *do not communicate by
 sharing memory; share memory by communicating*. Reach for `std/sync` only on a
 shared-memory hot path, or to coordinate a fixed group of parallel workers,
 where routing every access through a channel costs more than the data
 warrants.
 
 Every primitive here is built entirely from SPEC §11.5's atomic builtins and
-§16.2's channels — no new runtime or grammar support. A blocking call
+§16.2's channels - no new runtime or grammar support. A blocking call
 (`Mutex.lock`, `WaitGroup.wait`) parks the caller on the scheduler rather than
 spinning, because it is implemented as a channel operation, and channel
 operations already do that under M:N (SPEC §16.1).
@@ -25,7 +25,7 @@ import { newMutex, newWaitGroup, newRWMutex, newOnce, newAtomicI64 } from "std/s
 
 Mutual exclusion lock. A struct, so it is a reference type: every holder of the
 same `Mutex` value contends for the same lock. The zero-valued `Mutex` (never
-constructed with `newMutex`) is not usable — always construct with
+constructed with `newMutex`) is not usable - always construct with
 `newMutex()`.
 
 ### `newMutex(): Mutex`
@@ -40,13 +40,13 @@ it does not spin.
 ### `Mutex.unlock()`
 
 Releases the lock. Unlocking a `Mutex` the caller does not hold is a caller
-bug, same as Go's `sync.Mutex` — it is not detected.
+bug, same as Go's `sync.Mutex` - it is not detected.
 
 ```bit
 import { Mutex, newMutex, WaitGroup, newWaitGroup } from "std/sync"
 
 // N spawned tasks incrementing a shared counter under a Mutex land on an
-// exact total — the same shape as this module's directory KAT
+// exact total - the same shape as this module's directory KAT
 // (examples/syncmutex), just small enough to typecheck as a doc example.
 function fanOutCount(counter: []i64, mu: Mutex, wg: WaitGroup, n: int) {
   let i = 0
@@ -113,7 +113,7 @@ function refreshCached(cache: []i64, mu: RWMutex, v: i64) {
 ### `WaitGroup`
 
 Coordinates a fan-out/fan-in: `add(n)` before spawning `n` workers, `done()`
-at the end of each, `wait()` in the coordinator. Single-use — construct a
+at the end of each, `wait()` in the coordinator. Single-use - construct a
 fresh `WaitGroup` per fan-out round rather than reusing one after `wait()`
 returns.
 
@@ -124,7 +124,7 @@ A fresh `WaitGroup` with a zero counter.
 ### `WaitGroup.add(delta: i64)`
 
 Adds `delta` (may be negative) to the counter. Call before spawning the
-workers that will call `done()` — `spawn`'s own happens-before edge (SPEC
+workers that will call `done()` - `spawn`'s own happens-before edge (SPEC
 §16.1) makes this safe with no further synchronization.
 
 ### `WaitGroup.done()`
@@ -169,7 +169,7 @@ A fresh `Once`, not yet run.
 
 ### `Once.do(f: () => ())`
 
-Runs `f` on the first call only. Every call — concurrent or not — blocks
+Runs `f` on the first call only. Every call - concurrent or not - blocks
 until that first run has completed.
 
 ```bit
@@ -187,9 +187,9 @@ function initOnce(o: Once, ready: []i64) {
 ### `AtomicI64`
 
 A single `i64` accessed only through sequentially-consistent atomic
-operations (SPEC §11.5 — the strongest ordering, and the only one v0.1
+operations (SPEC §11.5 - the strongest ordering, and the only one v0.1
 exposes). Generic constraints (SPEC §11.3) are interface bounds only, so
-there is no single `Atomic<T>` to write against an "integer prim" bound —
+there is no single `Atomic<T>` to write against an "integer prim" bound -
 this offers one concrete struct per width in common use, the same shape as
 Go's `sync/atomic.Int64`.
 
@@ -208,7 +208,7 @@ Writes `v`.
 ### `AtomicI64.add(delta: i64): i64`
 
 Adds `delta` and returns the **new** value (unlike the raw `atomicAdd`
-builtin, which returns the previous one — this matches Go's
+builtin, which returns the previous one - this matches Go's
 `atomic.Int64.Add`).
 
 ### `AtomicI64.compareAndSwap(old: i64, newVal: i64): bool`

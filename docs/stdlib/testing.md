@@ -3,7 +3,7 @@
 Assertions for `bit test`. A test is any top-level function named `test_...`;
 `bit test` finds them, runs each in its own process, and reports what failed.
 
-A failing assertion panics, which is why each test gets its own process — one
+A failing assertion panics, which is why each test gets its own process - one
 failure cannot take the rest of the run down with it. It also means the first
 failure in a test is the last thing that test does.
 
@@ -72,7 +72,7 @@ function test_classify() {
 
 ## Values
 
-These are generic, so a failure can print what it compared — not merely that the
+These are generic, so a failure can print what it compared - not merely that the
 comparison failed. Annotate the type argument when it cannot be inferred from the
 arguments alone: `eq<i64>(got, 42, "...")`.
 

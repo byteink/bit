@@ -3,15 +3,15 @@
 The HTTP/3 wire layer, built from scratch in Bit. Its first piece is **QPACK**
 header compression (RFC 9204): the format HTTP/3 carries its headers in, playing
 HPACK's role but redesigned for QUIC's out-of-order delivery. QPACK is a pure
-byte codec — it turns header fields and control instructions into wire bytes and
-back, with no QUIC, no streams, and no flow control — so it composes under a real
+byte codec - it turns header fields and control instructions into wire bytes and
+back, with no QUIC, no streams, and no flow control - so it composes under a real
 HTTP/3 connection without carrying any transport of its own.
 
 QPACK shares the RFC 7541 Huffman code and prefix-integer encoding with HPACK, so
 `std/http3` reuses `huffmanEncode`/`huffmanDecode` from `std/http2` rather than
-duplicating the 257-symbol table. Everything else — the 99-entry static table, the
+duplicating the 257-symbol table. Everything else - the 99-entry static table, the
 dynamic-table accounting, the encoder/decoder instruction streams, and the field-
-line representations — is specific to QPACK and lives here. Import it all from
+line representations - is specific to QPACK and lives here. Import it all from
 `"std/http3"`.
 
 <!-- doctest: per-block -->
@@ -19,7 +19,7 @@ line representations — is specific to QPACK and lives here. Import it all from
 ## QPACK
 
 QPACK compresses a list of `(name, value)` header fields against two tables: a
-fixed 99-entry **static table** (distinct from HPACK's — index 0 is `:authority`,
+fixed 99-entry **static table** (distinct from HPACK's - index 0 is `:authority`,
 index 1 is `:path=/`) and a per-connection **dynamic table** both peers grow in
 lock-step. Because QUIC can deliver streams out of order, QPACK cannot let a field
 section depend on the exact position of a dynamic-table insertion the way HPACK
@@ -36,8 +36,8 @@ does. It splits the work over three streams:
 
 The dynamic table is addressed by a monotonic **absolute index** (0 for the first
 entry ever inserted); eviction drops the oldest entries but never renumbers the
-survivors. A section's prefix names the Required Insert Count — the number of
-insertions the decoder must have processed before the section can be decoded —
+survivors. A section's prefix names the Required Insert Count - the number of
+insertions the decoder must have processed before the section can be decoded -
 which is how a section stays correct under reordering: one that arrives early
 blocks until the encoder stream catches up.
 
@@ -90,7 +90,7 @@ function dynamic(): []HeaderField! {
 ```
 
 After a decoder processes a section it acknowledges it, and the encoder folds that
-into its Known Received Count — the high-water mark of insertions it may safely
+into its Known Received Count - the high-water mark of insertions it may safely
 reference without risking a blocked stream:
 
 ```bit
@@ -167,7 +167,7 @@ Encode `fields` into one field section on `streamId` against the given `base`
 (§4.5). Each field is emitted as, in preference order: an indexed static line, an
 indexed dynamic line (relative or post-base per `base`), a literal with a
 static/dynamic name reference, or a literal with a literal name; a `sensitive`
-field is always a never-index literal. No new dynamic entries are inserted here —
+field is always a never-index literal. No new dynamic entries are inserted here -
 pre-populate the table with the encoder-stream methods. `base` is typically the
 current `insertCount()` but may be lower to force post-base indexing. The section
 is recorded as outstanding until acknowledged.
@@ -274,7 +274,7 @@ stream is modeled as a bidi stream the opener only writes to; the peer tells a u
 stream from a request stream by the stream-type byte a uni stream sends first. This
 core runs a **zero-capacity** QPACK dynamic table, so every field line is literal
 or a static-table reference, no field section ever blocks, and the QPACK streams
-carry only their type byte — while the encoder/decoder stream plumbing stays wired
+carry only their type byte - while the encoder/decoder stream plumbing stays wired
 for a future nonzero capacity.
 
 A client dials, then issues requests, each a single call that returns the response:

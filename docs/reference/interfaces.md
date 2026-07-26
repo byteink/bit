@@ -2,7 +2,7 @@
 
 An interface is a set of method signatures. Bit interfaces are **structural**: a
 type satisfies an interface simply by having all its methods with matching
-signatures — there is no `implements` clause and no declaration of intent.
+signatures - there is no `implements` clause and no declaration of intent.
 (Spec: §10.6, §14.3, §14.4, §14.6.)
 
 ## Declaring an interface
@@ -86,7 +86,7 @@ function mustCircle(s: Shape): Circle {
 The two-result form is valid only as the sole right-hand side of a declaration
 or assignment.
 
-The target must be a struct type — only structs carry methods, so only a struct
+The target must be a struct type - only structs carry methods, so only a struct
 can be the concrete type behind an interface value. Asserting a type that could
 never satisfy the interface is a compile-time error rather than a check that
 always fails.

@@ -1,16 +1,16 @@
 # std/http2
 
 The HTTP/2 wire layer, built from scratch in Bit: **HPACK** header compression
-(RFC 7541) and the **frame** codec (RFC 7540 / 9113). Both are pure byte codecs —
+(RFC 7541) and the **frame** codec (RFC 7540 / 9113). Both are pure byte codecs -
 they turn values into wire bytes and back with no I/O, no TLS, and no connection
-state machine — so they compose under a real HTTP/2 connection without carrying
+state machine - so they compose under a real HTTP/2 connection without carrying
 any transport of their own. The two files share one flat module: import
 everything from `"std/http2"`.
 
 HPACK's `Encoder` and `Decoder` each hold their own dynamic-table state; a matched
 pair walked over the same header sequence evolve identical tables. The frame codec
 is a set of typed encode/decode pairs over the fixed 9-byte frame header. Both
-halves are strict on decode — every malformed input (a bad index, an EOS symbol in
+halves are strict on decode - every malformed input (a bad index, an EOS symbol in
 a Huffman string, a frame over `SETTINGS_MAX_FRAME_SIZE`, padding larger than its
 payload, a connection-level frame on the wrong stream) is rejected with a `!`
 error rather than best-guessed.
@@ -22,8 +22,8 @@ error rather than best-guessed.
 HPACK (RFC 7541) compresses a list of `(name, value)` header fields against two
 tables: a fixed 61-entry **static table** and a per-connection **dynamic table**
 that both peers grow in lock-step. A field that is already in a table costs a
-single index byte; a new field is sent as a string literal — optionally
-**Huffman**-coded — and (usually) added to the dynamic table for next time.
+single index byte; a new field is sent as a string literal - optionally
+**Huffman**-coded - and (usually) added to the dynamic table for next time.
 
 An `Encoder` and a `Decoder` are the two halves. Reuse one of each per connection
 so their dynamic tables track each other. This example round-trips a request:
@@ -171,9 +171,9 @@ or not all 1-bits (RFC 7541 §5.2).
 
 ## Frames
 
-Every HTTP/2 message is a stream of frames: a fixed 9-byte header — a 24-bit
+Every HTTP/2 message is a stream of frames: a fixed 9-byte header - a 24-bit
 payload length, an 8-bit type, an 8-bit flags field, a reserved bit, and a 31-bit
-stream id (RFC 7540 §4.1) — followed by a type-specific payload. `readFrame`
+stream id (RFC 7540 §4.1) - followed by a type-specific payload. `readFrame`
 splits one frame off a buffer, enforcing the negotiated `SETTINGS_MAX_FRAME_SIZE`;
 the typed `decode*` helpers then interpret the payload.
 
@@ -203,7 +203,7 @@ function settingsBytes(): []byte! {
 }
 ```
 
-A HEADERS frame carries an HPACK block fragment — encode the headers with an
+A HEADERS frame carries an HPACK block fragment - encode the headers with an
 `Encoder`, then frame the bytes:
 
 ```bit
@@ -508,7 +508,7 @@ stream 0.
 
 ### `encodeSettings(f: SettingsFrame): []byte!`
 
-The wire bytes of a SETTINGS frame — six bytes per parameter. Fails if `ack` is set
+The wire bytes of a SETTINGS frame - six bytes per parameter. Fails if `ack` is set
 together with a non-empty `settings` list.
 
 ### `decodeSettings(f: Frame): SettingsFrame!`
@@ -598,7 +598,7 @@ The wire bytes of a CONTINUATION frame. Fails on a zero stream id.
 The CONTINUATION frame `f` carries. Fails on a wrong type or a zero stream id.
 ## Connection engine
 
-HPACK and the frame codec are pure — no I/O, no state machine. `conn.bit` puts
+HPACK and the frame codec are pure - no I/O, no state machine. `conn.bit` puts
 them to work over a live connection. A `Conn` runs the client preface and the
 SETTINGS exchange, tracks each stream through the idle → open → half-closed →
 closed lifecycle (RFC 9113 §5.1), reassembles HEADERS + CONTINUATION blocks into
@@ -608,9 +608,9 @@ byte stream. It is transport-agnostic and TLS-free: a `Transport` is any
 bidirectional byte stream, so the same engine runs over a socket or an in-memory
 pipe.
 
-A `Conn` is an actor. Three green threads run underneath it — a reader that turns
+A `Conn` is an actor. Three green threads run underneath it - a reader that turns
 transport bytes into frames, a writer that drains queued frames, and a loop that
-owns every piece of mutable state — and they talk only over channels, so there is
+owns every piece of mutable state - and they talk only over channels, so there is
 no shared mutable memory to race on. Because the one loop encodes outgoing header
 blocks and decodes incoming ones in wire order, the two peers' HPACK dynamic
 tables stay in lock-step automatically. `connect` returns once the peer's opening
@@ -625,7 +625,7 @@ function echo(req: Request): Response {
   return newResponse(200, []byte("you asked for " + req.path))
 }
 
-// `client` and `server` are the two ends of one byte stream — a socket pair, or
+// `client` and `server` are the two ends of one byte stream - a socket pair, or
 // an in-memory pipe in a test. Serve one end and fetch "/" from the other.
 function demo(client: Transport, server: Transport): Response! {
   spawn serveOn(server)
@@ -648,7 +648,7 @@ function serveOn(t: Transport) {
 A bidirectional byte stream, the substrate a `Conn` runs on. `read(n)` returns up
 to `n` bytes and an empty slice at end-of-stream; `write(b)` delivers every byte
 or fails; `shutdown()` releases the stream. All three fields are exported and are
-plain function values, so any stream — a `std/net` connection, an in-memory pipe —
+plain function values, so any stream - a `std/net` connection, an in-memory pipe -
 satisfies it. (The close hook is named `shutdown`, not `close`, to avoid
 shadowing the `close` channel builtin.)
 
@@ -691,7 +691,7 @@ A response with a status and a body and no extra headers.
 
 ### `getHeader(headers: []HeaderField, name: string): string`
 
-The value of the first header named `name` (case-sensitive — HTTP/2 field names
+The value of the first header named `name` (case-sensitive - HTTP/2 field names
 are lower-case), or "" if absent.
 
 ### `connect(t: Transport, cfg: Config): Conn!`
@@ -708,14 +708,14 @@ SETTINGS, and return a `Conn`. Fails on a malformed preface. Drive it with
 
 ### `Conn`
 
-A live connection. Opaque — its mutable protocol state lives in the loop thread,
+A live connection. Opaque - its mutable protocol state lives in the loop thread,
 and every operation is a method that talks to it over a channel, so a `Conn` is
 safe to share across green threads.
 
 ### `Conn.roundTrip(req: Request): Response!`
 
 Send `req` on a fresh stream and block until its full response arrives. Safe to
-call from many green threads at once — each call rides its own stream, multiplexed
+call from many green threads at once - each call rides its own stream, multiplexed
 over the one connection. Fails if the stream is reset by the peer or the
 connection is closing.
 

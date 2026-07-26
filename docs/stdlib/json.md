@@ -2,13 +2,13 @@
 
 The `Json` value: a sum type over the seven shapes RFC 8259 §3 defines, plus
 `JsonEntry`, one object key/value pair. This is the primitive the rest of the
-json epic (#1479) — parser, encoder — builds on. Nothing here parses or
+json epic (#1479) - parser, encoder - builds on. Nothing here parses or
 encodes JSON text; these are pure constructors and accessors over an
 already-built `Json` value.
 
 `JsonObject` is `[]JsonEntry`, not `map<string, Json>`: it keeps entries in
 source order and allows duplicate keys, both of which a `map` would erase.
-`jsonGet` resolves a duplicate key by returning the **last** matching entry —
+`jsonGet` resolves a duplicate key by returning the **last** matching entry -
 the same policy most JSON decoders apply.
 
 <!-- doctest: per-block -->
@@ -57,7 +57,7 @@ Whether `j` is a `JsonObject`.
 ## Accessors
 
 Each of these unwraps the matching variant's payload, or reports `None` on any
-other shape — a caller decoding untrusted JSON handles a shape mismatch as
+other shape - a caller decoding untrusted JSON handles a shape mismatch as
 data, never a crash.
 
 ### `jsonAsBool(j: Json): Option<bool>`
@@ -87,7 +87,7 @@ absent. On a duplicate key, returns the **last** matching entry.
 
 ## Lexer
 
-A hand-written flat lexer over JSON text (strict RFC 8259, no comments — that
+A hand-written flat lexer over JSON text (strict RFC 8259, no comments - that
 is JSONC, a separate layer). No regex, no generated tables, no recursion:
 `{`/`[` nesting is tracked with a push/pop counter, not a call stack, so a
 pathologically deep input yields `Invalid` instead of a stack overflow.
@@ -95,7 +95,7 @@ pathologically deep input yields `Invalid` instead of a stack overflow.
 Tokens carry raw byte spans, not decoded values: a `StringTok` spans the
 source including its quotes with escapes left raw, and a `NumberTok` spans
 the literal exactly as written. Decoding and numeric-grammar validation are
-the parser task's job, not this layer's — so a later CST layer can echo an
+the parser task's job, not this layer's - so a later CST layer can echo an
 untouched literal back byte-for-byte.
 
 ### `TokenKind`
@@ -151,19 +151,19 @@ function lastWins(): i64 {
 ## Encoding
 
 The plain-value encoder: serializes a `Json` tree to text. No trivia, no
-comments — the CST printer the edit layer needs is a separate, later task.
+comments - the CST printer the edit layer needs is a separate, later task.
 
 ### `jsonEncode(j: Json): string`
 
 Compact form: no whitespace, `,`/`:` with no padding. Keys and strings are
-JSON-escaped per RFC 8259 §7 (`"`, `\`, and control bytes < 0x20 — `\n`, `\t`,
+JSON-escaped per RFC 8259 §7 (`"`, `\`, and control bytes < 0x20 - `\n`, `\t`,
 `\r`, `\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes
 `>= 0x20` pass through as-is, since JSON strings are UTF-8.
 
 ### `jsonEncodePretty(j: Json, indent: string): string`
 
 Pretty form: each object/array element on its own line, `indent` repeated
-once per nesting depth, `": "` after each key. No trailing newline — matches
+once per nesting depth, `": "` after each key. No trailing newline - matches
 the shape of `JSON.stringify(v, null, 2)`.
 
 ```bit
@@ -181,13 +181,13 @@ function encodeExample(): string {
 ## Parsing
 
 A recursive-descent parser over the lexer's token stream, building a `Json`
-tree. Strict RFC 8259 only — no comments, no trailing commas; JSONC is a
+tree. Strict RFC 8259 only - no comments, no trailing commas; JSONC is a
 separate layer on top. Malformed input (bad token sequence, an invalid
 escape, a number that doesn't match the grammar, or exceeding the lexer's
 64-level nesting cap) is a parse error via the fallible return, never a
 panic. An integral literal that fits `i64` decodes to `JsonInt`; anything
 wider, or with a `.`/`e`/`E`, decodes to `JsonFloat` via the runtime's own
-`parseFloat`. A duplicate object key keeps every entry — `jsonGet`'s
+`parseFloat`. A duplicate object key keeps every entry - `jsonGet`'s
 last-key-wins policy is what resolves it.
 
 ### `jsonParse(source: string): Json!`
@@ -216,7 +216,7 @@ function parseExample(): i64 {
 
 ## JSONC
 
-A narrow, explicit extension over strict JSON — deliberately **not** JSON5.
+A narrow, explicit extension over strict JSON - deliberately **not** JSON5.
 The grammar (also documented as the authoritative source in
 stdlib/json/parse.bit's header comment):
 
@@ -261,18 +261,18 @@ function jsoncExample(): i64 {
 A concrete syntax tree shaped like `Json`, but every node also carries the
 comments/blank lines around it, so a later edit-layer task (#1479) can mutate
 one value and re-serialize the rest of the document byte-identical modulo the
-edit. Types only — no parser, no printer, no mutation yet.
+edit. Types only - no parser, no printer, no mutation yet.
 
 Bit enum variants take positional payloads only (no named payload fields), so
 `CstNode`'s multi-field variants are documented by argument order below.
 
 `Trivia.leading`/`.trailing` are only ever populated on the root node
 returned by `cstParse` (a comment or blank line before the document's first
-token, or after its last) — every other node's own `Trivia` is empty,
+token, or after its last) - every other node's own `Trivia` is empty,
 because its surrounding formatting is owned by its parent container's `gaps`
 or by its `CstEntry.midGap` instead. #1726 (the CST printer) found that a
 comment-only `Trivia` couldn't reproduce a document's plain whitespace
-(indentation, blank lines) or comma placement — this shape closes that gap by
+(indentation, blank lines) or comma placement - this shape closes that gap by
 making every boundary between structural tokens a single verbatim raw-text
 field.
 
@@ -299,11 +299,11 @@ span, including quotes), `CstArray([]CstNode, gaps: []Option<string>,
 Trivia)`, or `CstObject([]CstEntry, gaps: []Option<string>, Trivia)`.
 
 A container's `gaps` holds one verbatim raw-text boundary per child plus one:
-`gaps[i]` is the text before child `i` (comments, indentation, and — for
-`i > 0` — the comma that ended child `i - 1`); `gaps[len(children)]` is the
+`gaps[i]` is the text before child `i` (comments, indentation, and - for
+`i > 0` - the comma that ended child `i - 1`); `gaps[len(children)]` is the
 text after the last child, before the closing `}`/`]` (including an optional
 trailing comma). `gaps[i]` is `Option<string>.None` only for an entry
-appended by `cstSetString` after the original parse — there is no original
+appended by `cstSetString` after the original parse - there is no original
 formatting to echo; `cstPrint` (below) synthesizes it from the preceding
 sibling's own indentation instead of guessing a hardcoded style. Every gap
 `cstParse` produces is `Some`.
@@ -311,7 +311,7 @@ sibling's own indentation instead of guessing a hardcoded style. Every gap
 ## CST parsing
 
 `cstParse` parses JSONC into the CST above, losslessly: every byte of
-formatting — comments, indentation, blank lines, and comma placement —
+formatting - comments, indentation, blank lines, and comma placement -
 survives, unlike `jsonParse`/`jsoncParse` above, which discard all of it.
 This is the parser a later edit-layer task mutates the output of.
 
@@ -346,10 +346,10 @@ function cstExample(): string {
 ## Editing the CST
 
 The path-based edit layer `bit add` (#1480, the package-manager epic) calls
-to change `bit.json` without disturbing anything it didn't touch — the json
+to change `bit.json` without disturbing anything it didn't touch - the json
 epic's namesake "edit layer". A path is `[]string` of object keys only
 (array-index paths are out of scope; `bit.json`'s dependency map is
-object-keyed). Every function mutates and returns its `root` — struct and
+object-keyed). Every function mutates and returns its `root` - struct and
 slice writes along the path are visible in place, but an append or a
 deletion changes a slice's length, and a `CstNode`'s payload can't be
 reassigned in place, so that one node is rebuilt and returned; always use
@@ -363,7 +363,7 @@ entry, the same policy `jsonGet` documents above.
 
 Read-only lookup of `path` under `root`, mirroring `jsonGet` but over the
 CST. `None` as soon as an intermediate segment isn't a `CstObject` or a key
-is missing — never a panic on an absent path.
+is missing - never a panic on an absent path.
 
 ```bit
 import { cstParse, cstGet, CstNode } from "std/json"
@@ -392,13 +392,13 @@ function cstGetExample(): string {
 
 Sets the string value at `path` to `value` (JSON-quoted and escaped). If
 `path` resolves to an existing `CstString` entry, only its `rawText` is
-replaced — that entry's `keyText` and the value's own `Trivia` are untouched.
+replaced - that entry's `keyText` and the value's own `Trivia` are untouched.
 If the final key is absent but its parent object exists, a new `CstEntry` is
 appended with no comment invented; the gap immediately before it is `None`,
 so `cstPrint` synthesizes formatting for it from the preceding sibling's own
 indentation rather than a hardcoded style. Fails if the existing value at the
 final key isn't a `CstString`, or any intermediate segment doesn't resolve
-to a `CstObject` — this function never creates an intermediate object.
+to a `CstObject` - this function never creates an intermediate object.
 
 ```bit
 import { cstParse, cstSetString, cstGet, CstNode } from "std/json"
@@ -430,7 +430,7 @@ function cstSetStringExample(): string {
 
 Same contract as `cstSetString`, except a missing INTERMEDIATE object along
 `path` is created (recursively, empty except for the one path being set)
-rather than failing — `bit add`'s own need: a project's first-ever
+rather than failing - `bit add`'s own need: a project's first-ever
 dependency add when `bit.json` has no `"dependencies"` object yet at all.
 
 ```bit
@@ -463,7 +463,7 @@ function cstSetStringPathExample(): string {
 
 Removes the `CstEntry` at `path` from its parent's entries. Every sibling
 entry keeps its own value and relative order unchanged. The deleted entry's
-own leading gap (its comments/indentation) is dropped with it — the one case
+own leading gap (its comments/indentation) is dropped with it - the one case
 where a comment can legitimately disappear, and only that entry's own
 leading gap, never a sibling's. Fails if any path segment doesn't exist, or
 an intermediate segment doesn't resolve to a `CstObject`.
@@ -489,9 +489,9 @@ function cstDeleteKeyExample(): string {
 
 `cstPrint` is the other side of `cstParse`: it turns a CST back into JSONC
 source text. For any node an edit function (above) did not touch, it
-reproduces `cstParse`'s original input byte-for-byte — every `rawText`
+reproduces `cstParse`'s original input byte-for-byte - every `rawText`
 verbatim, every comment in its original form, and the surrounding structural
-whitespace, indentation, and comma placement — because `cstParse` already
+whitespace, indentation, and comma placement - because `cstParse` already
 captured all of that as opaque raw text instead of decoding it; printing an
 untouched subtree is concatenation, never re-encoding. For a value
 `cstSetString` replaced, the fresh `rawText` takes the old one's place with
@@ -536,7 +536,7 @@ inspecting a config) does not need to know the CST shape at all: parse with
 ### `cstToJson(n: CstNode): Json`
 
 Strips every `Trivia` and decodes each `CstNumber`/`CstString`'s raw source
-span, turning a CST into a plain `Json` tree. Pure and total — unlike
+span, turning a CST into a plain `Json` tree. Pure and total - unlike
 `cstParse`, it cannot fail, since every span it decodes was already validated
 once when `cstParse` built the CST. Comments make no difference to the result:
 projecting `cstParse(source)` and calling `jsoncParse(source)` directly always

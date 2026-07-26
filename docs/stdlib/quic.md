@@ -2,14 +2,14 @@
 
 QUIC v1 packet protection (RFC 9001) and the frame codec (RFC 9000), built in Bit
 on top of [`std/crypto`](crypto.md). This module is the cryptographic and wire-format
-core of QUIC — it derives the Initial keys, protects and unprotects packets, and
-serializes frames — but it is deliberately *not* a transport: there is no connection
+core of QUIC - it derives the Initial keys, protects and unprotects packets, and
+serializes frames - but it is deliberately *not* a transport: there is no connection
 state machine, no flow control, no loss recovery, and no congestion control here.
 Those layers sit above and drive these primitives.
 
 The module has two halves. **Packet protection** (`packet.bit`) derives keys with the
 TLS 1.3 HKDF ladder, seals payloads with AES-128-GCM under a packet-number-derived
-nonce, and masks headers with an AES-ECB or raw-ChaCha20 key stream — the same
+nonce, and masks headers with an AES-ECB or raw-ChaCha20 key stream - the same
 verified `std/crypto` primitives, never a second copy of the cryptography. **Frames**
 (`frames.bit`) encode and decode QUIC's variable-length integers and every v1 frame.
 
@@ -20,11 +20,11 @@ packets byte-for-byte and round-trips every frame through its own decoder.
 
 ## Frames
 
-A QUIC packet payload is a sequence of frames, and every number in the protocol — a
-length, offset, stream id, or error code — is a variable-length integer (RFC 9000
+A QUIC packet payload is a sequence of frames, and every number in the protocol - a
+length, offset, stream id, or error code - is a variable-length integer (RFC 9000
 §16): the top two bits of the first byte give the encoded length (1, 2, 4, or 8
 bytes) and the rest is the value, big-endian. `Frame` is a sum type over every frame
-RFC 9000 §19 defines; the codec is pure and strict — malformed input is rejected with
+RFC 9000 §19 defines; the codec is pure and strict - malformed input is rejected with
 a fallible `!`, never guessed at.
 
 ### `encodeVarint(v: u64): []byte`
@@ -56,7 +56,7 @@ function example(data: []byte): u64! {
 
 ### `varintSize(v: u64): int`
 
-The number of bytes `encodeVarint` will use for `v` (1, 2, 4, or 8) — for sizing a
+The number of bytes `encodeVarint` will use for `v` (1, 2, 4, or 8) - for sizing a
 buffer up front without encoding twice.
 
 ```bit
@@ -83,7 +83,7 @@ function example(): AckRange {
 ### `AckFrame`
 
 An ACK frame (RFC 9000 §19.3): the largest acknowledged packet number, the ack delay,
-the first range, the additional gap/range pairs, and — when `ecn` is set — the three
+the first range, the additional gap/range pairs, and - when `ecn` is set - the three
 ECN counters.
 
 ```bit
@@ -639,7 +639,7 @@ A full client↔server handshake runs on `std/tls`'s record-bypass handshake mod
 drivers, in [std/tls › QUIC handshake mode](tls.md#quic-handshake-mode)): carry
 each handshake message in CRYPTO frames across the Initial and Handshake levels,
 key each level from the exposed traffic secrets with `levelKeys` (or `levelKeyPair`
-for both directions at once), and reach 1-RTT on both sides — with the TLS
+for both directions at once), and reach 1-RTT on both sides - with the TLS
 certificate, CertificateVerify, and Finished verification all still enforced.
 
 ```bit
@@ -718,7 +718,7 @@ a malformed integer value, or trailing bytes.
 ### `EncryptionLevel`
 
 The three packet-protection encryption levels of a QUIC connection (RFC 9001 §2):
-`Initial`, `Handshake`, and `OneRtt` — the last being the only level subject to
+`Initial`, `Handshake`, and `OneRtt` - the last being the only level subject to
 key update.
 
 ### `levelPacketType(level: EncryptionLevel): int`
@@ -738,7 +738,7 @@ is the negotiated suite's hash. Initial keys instead come from `clientInitialKey
 ### `LevelKeyPair`
 
 Both directions' packet-protection keys for one non-Initial encryption level (RFC
-9001 §5.1) — the unit an endpoint installs for the Handshake or 1-RTT level.
+9001 §5.1) - the unit an endpoint installs for the Handshake or 1-RTT level.
 `client` protects the client's packets, `server` the server's.
 
 ### `levelKeyPair(newHash: () => Hash, clientSecret: []byte, serverSecret: []byte, keyLen: int): LevelKeyPair`
@@ -747,7 +747,7 @@ Derive both directions' keys for a non-Initial level from the endpoint TLS traff
 secrets (RFC 9001 §5.1): `clientSecret` is the client's handshake- or
 application-traffic secret and `serverSecret` the server's, as exposed by the
 `std/tls` record-bypass handshake. Both peers, deriving from the same pair of
-secrets, obtain byte-identical keys — the check that a QUIC-TLS handshake reached
+secrets, obtain byte-identical keys - the check that a QUIC-TLS handshake reached
 a level.
 
 ```bit
@@ -772,7 +772,7 @@ and iv from the result with `levelKeys`; the header-protection key is not update
 
 ### `nextKeyPhase(keyPhase: bool): bool`
 
-The key-phase bit after a key update (RFC 9001 §6.3) — it toggles, so a peer can
+The key-phase bit after a key update (RFC 9001 §6.3) - it toggles, so a peer can
 tell which key generation protected a packet. The bit itself is carried in the
 short header (`encodeShortHeader`).
 
@@ -790,7 +790,7 @@ contiguous ordered byte stream. Build one with `newCryptoAssembler`.
 
 ### `newCryptoAssembler(maxLen: int): CryptoAssembler`
 
-A fresh `CryptoAssembler` that accepts data up to `maxLen` bytes total — a bound
+A fresh `CryptoAssembler` that accepts data up to `maxLen` bytes total - a bound
 on offset + length across all fragments, so a hostile offset cannot force an
 unbounded allocation.
 
@@ -803,12 +803,12 @@ allowed only if they carry identical bytes; a mismatch, or a fragment past
 
 ### `CryptoAssembler.contiguous(): []byte`
 
-The contiguous handshake bytes reassembled so far — the ordered stream from offset
+The contiguous handshake bytes reassembled so far - the ordered stream from offset
 0 up to the first gap. Grows as later `insert`s fill earlier gaps.
 
 ### `CryptoAssembler.contiguousLen(): int`
 
-The length of the contiguous reassembled prefix — `len(contiguous())` without
+The length of the contiguous reassembled prefix - `len(contiguous())` without
 materializing the slice.
 
 ### `reassembleCryptoFrames(frames: []Frame, maxLen: int): []byte!`
@@ -827,7 +827,7 @@ CRYPTO frames, then carries application data on bidirectional streams with
 per-stream and connection flow control (MAX_DATA / MAX_STREAM_DATA), ACK-based and
 PTO loss recovery, and NewReno congestion control. Each connection is owned by one
 green thread (the loop) that folds in datagrams, application commands, and timer
-ticks one at a time — no shared mutable state, no locks.
+ticks one at a time - no shared mutable state, no locks.
 
 ponytail: NewReno only (no CUBIC/BBR); connection migration is connection-id
 basics only (fixed 8-byte ids, no path validation); one connection per socket (no
@@ -886,7 +886,7 @@ Accept the next peer-initiated bidirectional stream, blocking until one opens.
 Set how long this connection tolerates hearing nothing from its peer before it
 gives up (RFC 9000 §10.1), in nanoseconds. The default is 30s. Lower it when the
 application wants a vanished peer detected sooner than a PTO series would ever
-reveal it — without an idle timeout a thread parked in `read`, `finish`, or
+reveal it - without an idle timeout a thread parked in `read`, `finish`, or
 `acceptStream` waits forever. Values at or below zero are ignored. Takes effect
 on the next tick and applies to a connection from either side.
 
@@ -895,7 +895,7 @@ on the next tick and applies to a connection from either side.
 Close the connection: send a CONNECTION_CLOSE, stop the loop, and close the
 socket if this connection owns it. A connection accepted from a `Listener` shares
 the listener's socket with the listener and every sibling connection, so closing
-it leaves that socket alone. Best-effort — there is no draining timeout.
+it leaves that socket alone. Best-effort - there is no draining timeout.
 
 ### `Stream`
 

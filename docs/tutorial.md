@@ -66,7 +66,7 @@ function variables() {
 ```
 
 String interpolation is `${...}` inside a normal string. There is no implicit
-numeric conversion — widen explicitly with `i64(x)` or `f64(x)`.
+numeric conversion - widen explicitly with `i64(x)` or `f64(x)`.
 
 ## Functions
 
@@ -95,7 +95,7 @@ function useThem() {
 
 ## Errors are values
 
-A fallible function returns `T!` — "a `T`, or an error". `fail` produces the
+A fallible function returns `T!` - "a `T`, or an error". `fail` produces the
 error, `?` propagates it, and `catch` handles it locally. There are no
 exceptions, so every failure path is visible in the source.
 
@@ -141,7 +141,7 @@ function collections() {
 
 ## Concurrency
 
-`spawn` starts a green thread — cheap enough to have thousands. Channels carry
+`spawn` starts a green thread - cheap enough to have thousands. Channels carry
 typed values between them; `<-` sends and receives. A sleeping green thread
 parks, leaving its OS thread free for the others.
 
@@ -176,7 +176,7 @@ All four workers sleep concurrently, so this finishes in about 10ms, not 40.
 ## Putting it together: a concurrent word count
 
 One green thread per file, each returning its own tally over a channel; the
-main thread folds them into one map. This is the whole program — it is also
+main thread folds them into one map. This is the whole program - it is also
 `examples/wordcount/`, which the test suite builds and runs.
 
 ```bit
@@ -235,7 +235,7 @@ function main() {
 }
 ```
 
-The files are read in parallel, and the folding is sequential — so no lock is
+The files are read in parallel, and the folding is sequential - so no lock is
 needed anywhere, and the only shared state is the channel.
 
 ## Testing
@@ -267,10 +267,10 @@ A failing assertion prints the values it compared, not just that it failed.
 
 ## Where to next
 
-- [Language reference](reference/README.md) — types, functions, interfaces,
+- [Language reference](reference/README.md) - types, functions, interfaces,
   generics, errors, modules, concurrency.
-- [Standard library](stdlib/README.md) — one page per module, every exported
+- [Standard library](stdlib/README.md) - one page per module, every exported
   symbol.
-- `examples/` in the repository — one small program per feature.
+- `examples/` in the repository - one small program per feature.
 - `bit fmt` formats; `bit doc <module>` lists what a module exports; `bit lsp`
   backs the editor extension.

@@ -12,7 +12,7 @@ Each returns a fresh slice; none mutates its input.
 ### `mapped(xs: []T, f: (T) => U): []U`
 
 `f` applied to every element, in order. Named `mapped` because `map` is a
-keyword — Bit's built-in hash map type.
+keyword - Bit's built-in hash map type.
 
 ### `filter(xs: []T, keep: (T) => bool): []T`
 

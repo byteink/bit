@@ -62,7 +62,7 @@ function callers() {
 
 A method is a function with a receiver written before its name. The receiver
 type must be a struct or type alias declared in the same module. Because structs
-are reference types, a method that mutates a field mutates the caller's value —
+are reference types, a method that mutates a field mutates the caller's value -
 no pointer receivers needed.
 
 ```bit
@@ -148,7 +148,7 @@ function countdown(n: int) {
 Two documented forms: C-style counting and `for ... of` over a collection or
 channel. An empty `for { }` loops forever. (The grammar also reserves a
 `for ident in expr` form; its semantics are not yet fixed in the spec, so it is
-not documented here — this reference will add it when the spec does.)
+not documented here - this reference will add it when the spec does.)
 
 ```bit
 function loops(xs: []int, m: map<string, int>) {

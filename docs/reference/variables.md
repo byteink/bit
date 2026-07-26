@@ -37,7 +37,7 @@ function demo() {
 
 If both an annotation and an initializer are present, the initializer must be
 assignable to the annotated type (§14.2). No implicit numeric conversion
-happens, so `let x: i64 = anI32Value` is an error — convert explicitly (see
+happens, so `let x: i64 = anI32Value` is an error - convert explicitly (see
 [Types](types.md#conversions)).
 
 ## Zero values
@@ -138,9 +138,9 @@ function counterDemo() {
 
 ## Statement terminators (semicolons)
 
-Statements end with `;`, but you almost never type one — the lexer inserts them
+Statements end with `;`, but you almost never type one - the lexer inserts them
 at line ends (§7). The practical rule: **to continue a statement onto the next
-line, end the line with something that is not a value** — a binary operator, a
+line, end the line with something that is not a value** - a binary operator, a
 comma, an opening bracket, `=`, `=>`, `.`, or `<-`.
 
 ```bit

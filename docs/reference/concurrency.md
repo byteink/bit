@@ -10,7 +10,7 @@ communicating.* (Spec: §13.7, §16.)
 `spawn` runs a call on a new green thread scheduled over a fixed pool of OS
 threads. The argument **must be a call expression**; its arguments are evaluated
 in the current thread before the new one starts. There is no thread handle in
-v0.1 — coordinate through channels.
+v0.1 - coordinate through channels.
 
 ```bit
 function worker(id: int, out: chan<int>) {
@@ -28,7 +28,7 @@ function fanOut(n: int) {
 }
 ```
 
-The runtime fixes the number of OS worker threads at startup — no unbounded
+The runtime fixes the number of OS worker threads at startup - no unbounded
 thread creation.
 
 ## Channels

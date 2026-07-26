@@ -28,7 +28,7 @@ function main() {
 
 ## Easy to write is the design goal
 
-Not "powerful", not "fast to compile" — easy to write, deliberately chosen as the
+Not "powerful", not "fast to compile" - easy to write, deliberately chosen as the
 thing to optimize when the two conflict. The syntax is the one most working
 programmers already know, so the language you have to learn is the semantics
 underneath it, not a new notation on top.
@@ -70,7 +70,7 @@ function main() {
 ## Errors are values, and the compiler counts them
 
 A fallible function is marked `!`. `?` propagates, `catch` handles, and there is
-no third option — an unhandled error is a compile error, not a runtime surprise.
+no third option - an unhandled error is a compile error, not a runtime surprise.
 
 ## Self-hosted
 
@@ -80,7 +80,7 @@ byte-identical binaries.
 
 ## Honest status
 
-Bit is pre-1.0 and the spec says so. The language, stdlib and toolchain work —
+Bit is pre-1.0 and the spec says so. The language, stdlib and toolchain work -
 there is a package manager, a language server, a formatter, a linter and a test
-runner — but the API is not frozen and `0.x` releases carry no support guarantee.
+runner - but the API is not frozen and `0.x` releases carry no support guarantee.
 [Read the support policy](support.html) before depending on it.

@@ -1,7 +1,7 @@
 # Modules
 
 A module is a **directory** of `.bit` files that share one flat declaration
-namespace. There is no per-file package clause — membership is by directory, and
+namespace. There is no per-file package clause - membership is by directory, and
 declarations in the same module may reference each other in any order. (Spec:
 §17.)
 
@@ -92,7 +92,7 @@ function main(): ()! {           // a returned error prints to stderr, exit 1
 }
 ```
 
-(Three alternatives for one declaration, so this block is not doc-tested — a
+(Three alternatives for one declaration, so this block is not doc-tested - a
 module may only declare `main` once.)
 
 `main` takes no parameters; read command-line arguments and the environment via

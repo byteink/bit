@@ -2,8 +2,7 @@
 
 Generics let functions and types work over many element types without giving up
 static checking. Type parameters go in angle brackets `<...>`, may be bounded by
-one or more interfaces, and are resolved by **monomorphization** at compile time
-— no boxing, no runtime type erasure. (Spec: §11.3, §13.6, §15.3.)
+one or more interfaces, and are resolved by **monomorphization** at compile time - no boxing, no runtime type erasure. (Spec: §11.3, §13.6, §15.3.)
 
 ## Generic functions
 

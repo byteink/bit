@@ -5,7 +5,7 @@ you generate, format to the canonical `8-4-4-4-12` hex text, and parse back.
 
 Three generators cover the common cases: `uuidV4` for a purely random id,
 `uuidV5` for a deterministic name-based id, and `uuidV7` for a time-ordered id
-whose values sort by creation time. Compare two UUIDs with `equals` — a struct
+whose values sort by creation time. Compare two UUIDs with `equals` - a struct
 `==` in v0.1 tests reference identity, not the 128 bits.
 
 <!-- doctest: per-block -->
