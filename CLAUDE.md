@@ -73,4 +73,4 @@ Splitting a file can also make a test vacuous rather than failing it: any gate t
 
 ## Deployment Context
 
-Website deploys to the byteink k3s cluster (`kubectx byteink`, namespace `byteink`, Traefik IngressRoutes — see workspace-root CLAUDE.md). Releases ship from GitHub Actions on version tags: 6 target artifacts (linux/macos/windows × x64/arm64) + brew tap `byteink/homebrew-bit` + curl|sh installer + winget.
+Website deploys to the byteink k3s cluster (`kubectx byteink`, namespace `byteink`, Traefik IngressRoutes — see workspace-root CLAUDE.md). Releases ship from GitHub Actions on version tags: 6 target artifacts (linux/macos/windows × x64/arm64) + brew tap `byteink/homebrew-tap` (installed as `byteink/tap/bit`) + curl|sh installer + winget.

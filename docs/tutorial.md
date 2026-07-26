@@ -14,7 +14,7 @@ quietly rot.
 ## Install
 
 ```
-brew install byteink/bit/bit          # macOS
+brew install byteink/tap/bit             # macOS
 curl -fsSL bitlang.org/install.sh | sh   # Linux
 ```
 
