@@ -56,9 +56,18 @@ STEP="${ARM64GATE_STEP:-test}"
 
 command -v docker >/dev/null || { echo "arm64gate: docker not found" >&2; exit 127; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
-  echo "arm64gate: image ${IMAGE} missing — build it (debian:bookworm arm64 + zig-aarch64-linux-0.16.0)" >&2; exit 127; }
+  echo "arm64gate: image ${IMAGE} missing — build it: docker build -f docker/zig-linux.Dockerfile -t ${IMAGE} ." >&2; exit 127; }
 [ "$(docker run --rm "${IMAGE}" uname -m)" = "aarch64" ] || {
   echo "arm64gate: ${IMAGE} is not native aarch64 — it would gate the wrong backend" >&2; exit 127; }
+# The suite needs a `git` binary INSIDE the image: the package manager fetches
+# dependencies by shelling out to it, so tests/imports/pmadd_e2e,
+# tests/pmimports.zig and selfhost/pmclicheck.bit all fail without it — as
+# `git: not found`, an empty failure, and a bare assertion panic respectively
+# (#1818). Refusing here names the cause once instead of leaving three
+# unrelated-looking harnesses red. macOS has git from the host, which is why a
+# git-less image passed the local gate and only failed on Linux.
+docker run --rm "${IMAGE}" sh -c 'command -v git' >/dev/null 2>&1 || {
+  echo "arm64gate: ${IMAGE} has no git — rebuild it from docker/zig-linux.Dockerfile" >&2; exit 127; }
 
 if [ "${MODE}" = "clean" ]; then
   # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.

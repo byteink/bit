@@ -107,6 +107,15 @@ fails=0
 total=0
 while IFS= read -r host; do
   [ -n "${host}" ] || continue
+  # The suite needs a `git` binary INSIDE the image: the package manager fetches
+  # dependencies by shelling out to it, so tests/imports/pmadd_e2e,
+  # tests/pmimports.zig and selfhost/pmclicheck.bit all fail without it — as
+  # `git: not found`, an empty failure, and a bare assertion panic respectively
+  # (#1818). Refused here so the cause is named once, instead of three
+  # unrelated-looking harnesses going red on the remote box. macOS has git from
+  # the host, which is why a git-less image passed the local gate.
+  ssh "${host}" "docker run --rm ${IMAGE} sh -c 'command -v git'" >/dev/null 2>&1 || {
+    echo "x64gate: ${IMAGE} on ${host} has no git — rebuild it from docker/zig-linux.Dockerfile" >&2; exit 127; }
   for i in $(seq 1 "${RUNS}"); do
     total=$((total + 1))
     { [ "${RUNS}" -gt 1 ] || [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; } && echo "===RUN host=${host} ${i}/${RUNS}==="
