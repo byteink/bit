@@ -2481,6 +2481,91 @@ program's object does, since exactly one object per link may define each:
 - **string literals are local**, not global. Nothing outside the object names
   them, so two members' literals cannot collide.
 
+### 17.7 Package Manager
+
+A project's `bit.json` may declare third-party module dependencies alongside
+its other project metadata:
+
+```
+dependency_map   = '"dependencies"' ':' '{' [ dependency_entry { ',' dependency_entry } ] '}' .
+dependency_entry = STRING_LIT ':' STRING_LIT .   (* name : "gitHost/owner/repo@ref" *)
+```
+
+Each value is a single string of the form `gitHost/owner/repo@ref` — for
+example:
+
+```json
+{
+  "dependencies": {
+    "quicwire": "github.com/byteink/quicwire@v1.4.2",
+    "http2util": "github.com/byteink/http2util@main",
+    "scratch": "github.com/byteink/scratch@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+  }
+}
+```
+
+`ref` is exactly one of:
+
+- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) — the only form MVS (below)
+  treats as an ordered version;
+- a branch name (e.g. `main`), resolved to that branch's current tip at
+  resolution time; or
+- a bare commit SHA (full 40-character hex), resolved to exactly that commit.
+
+**No range operators.** `^`, `~`, `>=`, `<`, `x`, and every other
+range/wildcard spelling are rejected at parse time. A dependency names one
+exact ref; there is no version range for the resolver to pick from.
+
+**Resolution: Minimal Version Selection.** Bit resolves the dependency graph
+with Go-style MVS, not SAT-based range solving:
+
+1. Starting from the root module's `bit.json`, the resolver walks the
+   transitive requirement graph — every dependency's own `bit.json`
+   `dependencies`, recursively.
+2. For each distinct module named anywhere in that graph, the resolver
+   collects every stated minimum version for it and selects the **maximum**
+   of those minimums. Non-version refs (a branch or a bare commit SHA) are
+   not compared against tagged versions; a module reachable only through such
+   a ref resolves to exactly that ref.
+3. The result is deterministic and requires no backtracking and no SAT
+   search: one pass over the graph, one selection per module, done.
+
+This is the same rule as `go.mod`: the resolved version of any module is
+never higher than some `dependencies` entry actually requires, and never
+lower than the highest of all requirements — the *minimum* version that
+satisfies every requirer, not the *latest* available.
+
+**`bit.lock`.** Resolution output is written to `bit.lock`, a plain-JSON file
+(no comments, no trailing commas — unlike `bit.json`'s JSONC) in the project
+root. It is entirely machine-owned: hand edits are not a supported workflow,
+and it is fully regenerated on every `bit add`, `bit up`, and `bit remove`.
+Per resolved dependency it records:
+
+```json
+{
+  "quicwire": {
+    "url": "https://github.com/byteink/quicwire.git",
+    "commit": "9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c",
+    "requires": {
+      "streambuf": "github.com/byteink/streambuf@v0.9.0"
+    }
+  }
+}
+```
+
+- `url` — the git URL the module was fetched from.
+- `commit` — the exact resolved commit SHA (a tag or branch ref is dereferenced
+  to its commit before being recorded; `bit.lock` never stores a mutable ref).
+- `requires` — that dependency's own transitive requirement list, verbatim
+  from its `bit.json`, so MVS can re-run from the lockfile alone without
+  re-fetching every transitive dependency's manifest.
+
+**No install-time code execution.** Fetching a dependency reads only its
+`bit.json` and source tree. There is no build script, no postinstall hook,
+and no field in `bit.json` that names one — a fetched manifest is never
+scanned for, or permitted to run, arbitrary code during `add`/`up`/`remove`
+or any other resolution step.
+
 ---
 
 ## 18. Error Handling

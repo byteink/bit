@@ -426,6 +426,39 @@ function cstSetStringExample(): string {
 }
 ```
 
+### `cstSetStringPath(root: CstNode, path: []string, value: string): CstNode!`
+
+Same contract as `cstSetString`, except a missing INTERMEDIATE object along
+`path` is created (recursively, empty except for the one path being set)
+rather than failing — `bit add`'s own need: a project's first-ever
+dependency add when `bit.json` has no `"dependencies"` object yet at all.
+
+```bit
+import { cstParse, cstSetStringPath, cstGet, CstNode } from "std/json"
+
+function cstSetStringPathExample(): string {
+  let root = cstParse("{}") catch e {
+    return "error"
+  }
+  let updated = cstSetStringPath(root, []string{ "dependencies", "quicwire" }, "github.com/byteink/quicwire@v1.4.2") catch e {
+    return "error"
+  }
+  match (cstGet(updated, []string{ "dependencies", "quicwire" })) {
+    Some(node) => {
+      match (node) {
+        CstString(raw, t) => return raw
+        CstNull(t) => return "null"
+        CstBool(b, t) => return "bool"
+        CstNumber(r, t) => return "number"
+        CstArray(a, g, t) => return "array"
+        CstObject(es, g, t) => return "object"
+      }
+    }
+    None => return "missing"
+  }
+}
+```
+
 ### `cstDeleteKey(root: CstNode, path: []string): CstNode!`
 
 Removes the `CstEntry` at `path` from its parent's entries. Every sibling
