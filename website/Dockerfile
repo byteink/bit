@@ -21,10 +21,16 @@
 # image below is the release artifact, so the site is built by the exact compiler
 # users install — the website is a real, if small, test of the release.
 #
-# PINNED to a version, never `:latest`. A deploy must be reproducible from the
-# commit alone, and `:latest` silently changes what compiled the binary. Bumping
-# this is a deliberate commit, and the bump is where a regression gets caught.
-FROM ghcr.io/byteink/bit:0.1.0 AS build
+# PINNED BY DIGEST, not by tag. A version tag looks immutable and is not: 0.1.0
+# was re-cut to fix a version-string bug and `:0.1.0` was republished pointing at
+# different bytes, so a tag pin would have silently changed what compiles this site.
+# The digest cannot be re-pointed, which is the only way "reproducible from the
+# commit alone" is actually true.
+#
+# The comment carries the human-readable version; bumping the toolchain means
+# updating both, in a commit whose diff shows exactly what changed.
+FROM ghcr.io/byteink/bit@sha256:703f2a32b9e5ce0cccd8bfe17c3e6de24a03245648d6b3459add42b212f72705 AS build
+# ^ ghcr.io/byteink/bit:0.1.0
 
 # The toolchain image runs as uid 65532 (correct for its own job, compiling a
 # user's bind-mounted project). A build stage writes to the image filesystem, so
