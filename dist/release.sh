@@ -154,19 +154,31 @@ if command -v docker >/dev/null; then
 		v=\$("\$p/bin/bit" --version)
 		[ "\$v" = "bit ${VERSION}" ] || { echo "reports '\$v', want 'bit ${VERSION}'" >&2; exit 1; }
 	SH
-	docker run --rm -v "${work}:/w" bit-zig-0.16.0:latest sh /w/go.sh | grep -q 'smoke ok' \
-		&& echo "release.sh: aarch64-linux smoke ok"
+	# --user, so the container writes as THIS uid into the bind mount. As root it
+	# leaves root-owned files that the next run cannot clean (see the remote path
+	# below, where exactly that silently skipped a whole target's verification).
+	docker run --rm --user "$(id -u):$(id -g)" -v "${work}:/w" bit-zig-0.16.0:latest sh /w/go.sh \
+		| grep -q 'smoke ok' \
+		|| { echo "release.sh: aarch64-linux smoke FAILED" >&2; exit 1; }
+	echo "release.sh: aarch64-linux smoke ok"
 	rm -rf "${work}"
 else
-	echo "release.sh: docker absent — aarch64-linux NOT verified" >&2
+	echo "release.sh: docker absent — cannot verify aarch64-linux" >&2
+	exit 1
 fi
 
 host="$(sh scripts/x64host.sh 2>/dev/null | head -1 || true)"
 if [ -n "${host}" ]; then
-	scp -q "${OUT}/bit-${VERSION}-linux-x86_64.tar.xz" "${host}:/tmp/"
+	# A FRESH remote directory per run. This was hardcoded /tmp/rel, and the
+	# container wrote into it as root, so the next run's `rm -rf` hit Permission
+	# denied, the tarball never arrived, tar failed — and because the whole thing
+	# is `ssh … | grep -q && echo`, the failure was invisible and the release still
+	# exited 0. The x86-64 target went unverified with no warning at all. Same
+	# fixed-/tmp-path class of bug as link.zig's (noted in CLAUDE.md).
+	rdir="$(ssh "${host}" 'mktemp -d')"
+	scp -q "${OUT}/bit-${VERSION}-linux-x86_64.tar.xz" "${host}:${rdir}/"
 	ssh "${host}" "set -eu
-		rm -rf /tmp/rel && mkdir -p /tmp/rel && mv /tmp/bit-${VERSION}-linux-x86_64.tar.xz /tmp/rel/
-		cat > /tmp/rel/go.sh <<'SH'
+		cat > ${rdir}/go.sh <<'SH'
 set -eu
 tar -C /w -xf /w/bit-${VERSION}-linux-x86_64.tar.xz
 p=\$(ls -d /w/bit-${VERSION}-linux-x86_64)
@@ -176,10 +188,15 @@ BIT_STDLIB=\"\$p/stdlib\" BIT_LIBBITRT=\"\$p/lib/x86_64-linux/libbitrt.a\" \"\$p
 v=\$(\"\$p/bin/bit\" --version)
 [ \"\$v\" = \"bit ${VERSION}\" ] || { echo \"reports '\$v', want 'bit ${VERSION}'\" >&2; exit 1; }
 SH
-		docker run --rm -v /tmp/rel:/w bit-zig-0.16.0-amd64:latest sh /w/go.sh" | grep -q 'smoke ok' \
-		&& echo "release.sh: x86_64-linux smoke ok on real hardware (${host})"
+		docker run --rm --user \"\$(id -u):\$(id -g)\" -v ${rdir}:/w bit-zig-0.16.0-amd64:latest sh /w/go.sh" \
+		| grep -q 'smoke ok' \
+		|| { echo "release.sh: x86_64-linux smoke FAILED on ${host}" >&2; exit 1; }
+	echo "release.sh: x86_64-linux smoke ok on real hardware (${host})"
+	ssh "${host}" "rm -rf ${rdir}" || true
 else
-	echo "release.sh: no x86-64 host reachable — x86_64-linux NOT verified" >&2
+	echo "release.sh: no x86-64 host reachable — cannot verify x86_64-linux" >&2
+	echo "release.sh: refusing to publish an unverified release" >&2
+	exit 1
 fi
 
 # --- checksums and notes ----------------------------------------------------
@@ -209,5 +226,14 @@ else
 	gh release create "v${VERSION}" "${args[@]}" "${OUT}"/*.tar.xz "${OUT}/SHA256SUMS"
 fi
 
-echo "release.sh: draft release v${VERSION} ready — review it, then publish:"
-echo "  gh release view v${VERSION} --web"
+# Report what the release ACTUALLY is now, not what --draft asked for: re-cutting
+# an already-published release (an asset fix, as with the 0.1.0-dev version bug)
+# leaves it published, and printing "review it, then publish" there is a lie that
+# reads as "nothing is live yet".
+if [ "$(gh release view "v${VERSION}" --json isDraft --jq .isDraft)" = "true" ]; then
+	echo "release.sh: DRAFT v${VERSION} ready — review, then publish:"
+	echo "  gh release edit v${VERSION} --draft=false"
+else
+	echo "release.sh: v${VERSION} is PUBLISHED and its assets are now live:"
+	echo "  https://github.com/byteink/bit/releases/tag/v${VERSION}"
+fi
