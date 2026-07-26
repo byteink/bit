@@ -85,7 +85,7 @@ on the batch before the merge, and the one commit pair that reddened it
 
 | Task | Why |
 |---|---|
-| #1734, #1735, #1736, #1737, #1738, #1767 | The package-manager CLI (`selfhost/pm*.bit`, `docs/package-manager.md`, `tests/pmimports.zig`). #1800's constraints exclude them — the owner has not signed off on landing the PM. All six branches are intact. |
+| ~~#1734-#1738, #1767~~ | The package-manager CLI. Was out of scope here, then the owner approved landing it on 2026-07-26 — landed separately under #1816, gate green. All six branches kept intact. |
 | #1745 | x86_64-macos backend. Task is in `backlog`; owner has not scheduled it. |
 | #1583, #1584, #1591, #1562 | The Stage-2 runtime retirement (G2/G3) and its dependencies. Paused by the owner mid-landing; see `.g3-hold/`. Landing these is the G3 epic's job, not this audit's. |
 
