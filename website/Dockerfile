@@ -1,39 +1,89 @@
-# bitlang.org, served by Bit.
+# bitlang.org, served by Bit. Two stages: build the server, then ship it alone.
 #
-# `FROM scratch` — no base image, no distro, no libc, no shell. The whole
-# container is one statically linked binary the Bit compiler produced, plus the
-# HTML. That is not a stunt: `bit build` emits a static native executable with no
-# runtime to install and no dynamic loader to satisfy, so there is nothing for a
-# base image to provide. It is also the strongest possible demonstration of the
-# language's headline claim, running in production on its own website.
+# WHY THE BUILD IS A STAGE, and not a binary cross-compiled on the host: ssd
+# transfers the build context with `git archive --format=tar HEAD`
+# (ssd's remote/remote.go) and builds on the SERVER. Only committed, git-tracked
+# files reach that build. A host-built binary under a gitignored website/build/ is
+# never shipped, and the server-side build fails with
 #
-# Consequences worth knowing before debugging this container:
-#   - No shell. `docker exec ... sh` will not work. Read the logs instead.
-#   - No CA bundle, no /etc/passwd, no /tmp. The server reads files and writes
-#     sockets; it needs none of them.
-#   - Attack surface is the binary. Nothing else is in the image to exploit.
+#     failed to calculate checksum of ref ...: "/website/build/staticserver": not found
 #
-# The binary is built OUTSIDE this Dockerfile, by website/deploy.sh, cross-
-# compiled for the container's target with `bit build --target`. Building it here
-# would mean shipping the whole Zig+Bit toolchain into a build stage to produce a
-# 155 KB file the host can already produce in seconds.
+# which is exactly what it did before this became a stage. Everything the image
+# needs must be produced FROM committed source, inside the build.
 #
-# Both inputs are generated, so both are produced by deploy.sh immediately before
-# `ssd deploy` — the image can never be built from a stale tree.
+# Cost, stated plainly: this compiles the Bit toolchain from source on every
+# deploy — minutes on a 4-core server — because there is no published Bit
+# toolchain image to start from yet. When that becomes annoying, the fix is a
+# prebuilt toolchain image, or building on the host and pushing to a registry with
+# `image:` in ssd.yaml. It is NOT going back to a gitignored binary.
+
+# --- stage 1: build the server from committed source ------------------------
+FROM debian:bookworm AS build
+
+ARG ZIG_VERSION=0.16.0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates xz-utils git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Native arch only, no cross-compilation, so whatever this produces is correct for
+# the runtime stage by construction. dpkg's arch maps to zig's naming; an
+# unsupported arch fails loudly rather than yielding a wrong-arch image.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      arm64) ZARCH=aarch64 ;; \
+      amd64) ZARCH=x86_64 ;; \
+      *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    rm /tmp/zig.tar.xz; \
+    /opt/zig/zig version
+ENV PATH="/opt/zig:${PATH}"
+
+WORKDIR /src
+COPY . .
+
+# `zig build` produces the self-hosted `bit` plus libbitrt for this arch, and
+# `bit` then builds the server: the container is compiled by the compiler whose
+# website it serves.
+RUN zig build && zig-out/bin/bit build website/server -o /server
+
+# --- stage 2: the image that runs -------------------------------------------
+#
+# `FROM scratch` — no base image, no distro, no libc, no shell. `bit build` emits
+# a static executable with no dynamic loader, so a base image has nothing left to
+# provide. Before debugging this container: there is no shell, so
+# `docker exec ... sh` fails; there is no CA bundle and no /tmp. The server reads
+# files and writes sockets and needs none of them. The attack surface is the
+# binary and nothing else.
 FROM scratch
 
-# The server: website/server, cross-compiled by website/deploy.sh. The website
-# deliberately does NOT build out of examples/ — an example is a showcase, not a
-# dependency of production. examples/staticserver holds the same serving logic
-# plus the self-test the examples harness runs; the two are kept in step by hand
-# (see CLAUDE.md), and both are temporary: the real static server and the web
-# framework will replace them.
-COPY website/build/staticserver /staticserver
+# website/server, NOT examples/staticserver. The website deliberately does not
+# build out of examples/ — an example is a showcase, not a production dependency.
+# The example holds the same serving logic plus the self-test the examples harness
+# runs; the two are kept in step by hand (see CLAUDE.md), and both are temporary:
+# the real static server and the web framework replace them.
+COPY --from=build /server /staticserver
 
-# The site: 34 pages generated by website/gen, another Bit program.
+# The 34 pages, generated by website/gen (another Bit program) and COMMITTED, so
+# they arrive through `git archive HEAD` like everything else. website/deploy.sh
+# regenerates them and refuses to deploy while the result is uncommitted —
+# otherwise a server-side build would quietly ship the previous site.
 COPY website/public/ /public/
 
-# Serve /public on 8080. Traefik terminates TLS and routes to this port, so the
-# server speaks plain HTTP and never handles a certificate.
+# NUMERIC uid:gid, not a name: scratch has no /etc/passwd, so `USER nonroot`
+# cannot be resolved and the container will not start. 65532 is the conventional
+# nonroot id (distroless uses it). Root is needed for nothing here — the server
+# binds 8080, above 1024, and only reads /public — so uid 0 would only mean a
+# compromise starts as root, for no benefit. The COPYed files are world-readable
+# (binary 0755, pages 0644), so no chown layer is required.
+#
+# This must live HERE: ssd emits no securityContext in the k8s Deployment it
+# generates, so the image is the only place the container's user can be pinned.
+USER 65532:65532
+
+# Traefik terminates TLS and routes to this port, so the server speaks plain HTTP
+# and never handles a certificate.
 EXPOSE 8080
 ENTRYPOINT ["/staticserver", "/public", "8080"]
