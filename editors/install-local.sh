@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 #
-# Rebuild the native `bit` (compiler + LSP server) and the VS Code extension,
-# then install both locally so the latest language and tooling changes can be
-# tested in the editor. Run this after landing any language feature to keep the
-# extension, the language server, and the installed compiler in sync.
+# Rebuild the native `bit` and the VS Code extension, and install the extension.
+# Run this after landing any language feature to keep the extension and the
+# compiler it talks to in sync.
+#
+# NOTHING IS INSTALLED INTO $HOME ANYMORE. This used to `cp zig-out/bin/bit` to
+# ~/.local/bin/bit, which put a development build on PATH ahead of Homebrew's -
+# so plain `bit` in a terminal was the dev compiler reporting `0.1.0-dev`, which
+# read as a broken release more than once. The rule now:
+#
+#   bit            the RELEASED compiler, from `brew install byteink/tap/bit`
+#   ./zig-out/bin/bit   the development build, by explicit path
+#
+# The VS Code extension points at the brew binary (.vscode/settings.json), so
+# there is nothing left for a local install to feed. Use the full path when you
+# want the dev build; that way which one you are running is never ambiguous.
 #
 # Host hygiene: the compiler build runs the Mac's already-installed native zig
-# (required — see below); npm work for the extension still happens in a
-# throwaway Docker container, so only the finished binary and .vsix touch the
-# Mac otherwise. Requires `zig`, `docker`, and the VS Code `code` CLI.
+# (required — see below); npm work for the extension happens in a throwaway
+# Docker container, so only the .vsix touches the Mac. Requires `zig`, `docker`,
+# and the VS Code `code` CLI.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
-
-bin="$HOME/.local/bin/bit"
 
 echo "==> Building native arm64 bit (compiler + LSP) ..."
 # NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted now) is built by
@@ -27,12 +36,8 @@ echo "==> Building native arm64 bit (compiler + LSP) ..."
 # own host, aarch64-macos, so a plain `zig build` here is both correct and
 # simpler than a container that could not do the job anyway.
 zig build
-mkdir -p "$HOME/.local/bin"
-cp zig-out/bin/bit "$bin"
-# Re-sign ad-hoc: copying a signed Mach-O to a new path invalidates its
-# signature, and macOS SIGKILLs an invalidly-signed binary on exec.
-codesign --force --sign - "$bin"
-echo "    installed $bin ($(file -b "$bin"))"
+echo "    built zig-out/bin/bit ($(./zig-out/bin/bit --version))"
+echo "    dev builds are used BY PATH: ./zig-out/bin/bit — nothing is copied to \$HOME"
 
 echo "==> Building VS Code extension (.vsix) ..."
 docker run --rm -v "$repo/editors/vscode":/out node:20 sh -c '
