@@ -1060,21 +1060,28 @@ fn rejectExternForTarget(gpa: std.mem.Allocator, diags: *diagnostics.Diagnostics
 /// AST walks: what differs between them is only where a symbol may legitimately
 /// come from.
 ///
-///   - Linux: the merged `libbitrt.a`, and nothing else — the image is static,
-///     with no interpreter and no dynamic symbol table.
-///   - Darwin: that same archive OR libSystem, which the Mach-O image loads as
-///     `LC_LOAD_DYLIB` and dyld binds at load.
+///   - Every target: a §11.9 `@symbol` pin one of this build's own modules
+///     defines (`pins`) — the final link resolves it out of the program's own
+///     object, exactly the way `bit_main` is resolved.
+///   - Linux: otherwise the merged `libbitrt.a`, and nothing else — the image
+///     is static, with no interpreter and no dynamic symbol table.
+///   - Darwin: otherwise that same archive OR libSystem, which the Mach-O image
+///     loads as `LC_LOAD_DYLIB` and dyld binds at load.
 ///
 /// Undecidable inputs (an empty or malformed archive) answer false on both, so
 /// the caller rejects — the sound direction, since accepting on unknown trades a
 /// compile error for a crash.
+///
+/// The pin lookup runs first because it is O(1) while `archiveDefines` reparses
+/// and symbol-decodes every archive member; a pinned name is by design absent
+/// from the archive, so archive-first would pay that scan on every such build.
 fn externResolvable(gpa: std.mem.Allocator, target: BuildTarget, libbitrt: []const u8, symbol: []const u8, pins: *const PinSet) bool {
+    if (pins.contains(symbol)) return true;
     return switch (target) {
-        .x86_64_linux => link.archiveDefines(gpa, .x86_64_linux, libbitrt, symbol) or pins.contains(symbol),
-        .aarch64_linux => link.archiveDefines(gpa, .aarch64_linux, libbitrt, symbol) or pins.contains(symbol),
+        .x86_64_linux => link.archiveDefines(gpa, .x86_64_linux, libbitrt, symbol),
+        .aarch64_linux => link.archiveDefines(gpa, .aarch64_linux, libbitrt, symbol),
         .aarch64_macos => machosyms.archiveDefines(gpa, libbitrt, symbol) or
-            machosyms.libsystemDefines(symbol) or
-            pins.contains(symbol),
+            machosyms.libsystemDefines(symbol),
     };
 }
 
@@ -2212,4 +2219,29 @@ test "archiveDefines answers membership, not mere reference" {
         try std.testing.expect(!link.archiveDefines(gpa, lt, "not an ar archive at all", "bit_rt_gc_blocking_begin"));
     }
     if (checked == 0) return error.SkipZigTest;
+}
+
+test "externResolvable admits a pin without consulting the archive (#1669)" {
+    // The predicate in isolation, mirroring selfhost's `checkExternResolvable`.
+    // A malformed archive is the point: a pinned name must answer true on every
+    // target from `pins` ALONE, never from an archive scan — that is both the
+    // §11.7 rule and the reason the pin lookup runs first.
+    const gpa = std.testing.allocator;
+    const junk = "not an ar archive at all";
+
+    var pins: PinSet = .empty;
+    defer pins.deinit(gpa);
+    try pins.put(gpa, "bit_pinned_sub", {});
+    const no_pins: PinSet = .empty;
+
+    for ([_]BuildTarget{ .x86_64_linux, .aarch64_linux, .aarch64_macos }) |target| {
+        try std.testing.expect(externResolvable(gpa, target, junk, "bit_pinned_sub", &pins));
+        // Widened, not removed: unpinned and archive-absent stays rejected.
+        try std.testing.expect(!externResolvable(gpa, target, junk, "bit_pinned_sub", &no_pins));
+        try std.testing.expect(!externResolvable(gpa, target, junk, absent_symbol, &pins));
+    }
+    // Darwin's libSystem allowance is untouched by the pin path; Linux still has
+    // no dyld to bind against.
+    try std.testing.expect(externResolvable(gpa, .aarch64_macos, junk, "mmap", &no_pins));
+    try std.testing.expect(!externResolvable(gpa, .x86_64_linux, junk, "mmap", &no_pins));
 }
