@@ -61,10 +61,15 @@ gh repo clone "${TAP_REPO}" "${WORK}/tap" -- --depth 1
 printf '%s\n' "${FORMULA}" > "${WORK}/tap/Formula/bit.rb"
 
 cd "${WORK}/tap"
-if git diff --quiet -- Formula/bit.rb; then
+# `git add` BEFORE the comparison, then compare the INDEX. `git diff` ignores
+# untracked files, so on the very first publish - when Formula/bit.rb does not
+# exist in the tap yet - the old `git diff --quiet` saw no change and reported
+# "nothing to push". It pushed nothing, said so cheerfully, and exited 0. That is
+# exactly the case this script exists for.
+git add Formula/bit.rb
+if git diff --cached --quiet -- Formula/bit.rb; then
   echo "publish.sh: Formula/bit.rb unchanged for ${VERSION}, nothing to push"
   exit 0
 fi
-git add Formula/bit.rb
 git commit -m "bit ${VERSION}"
 git push
