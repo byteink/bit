@@ -3622,3 +3622,30 @@ A store of a small, curated set of well-known public CA roots compiled into the
 binary - a working default when no system store is available. The embedded PEM is
 vetted at commit time and parsed by CI, so a parse failure is a build-time
 invariant violation and panics rather than returning a silently empty store.
+
+## Hardware acceleration
+
+On x86-64, AES, GHASH and SHA-256 dispatch to CPU instructions (AES-NI,
+PCLMULQDQ, SHA extensions) when the host has them, and to the constant-time
+software implementations when it does not. **The dispatch is transparent** - the
+same call produces the same bytes either way, and no calling code branches on it.
+
+The three queries below exist for diagnostics: logging which path a deployment is
+actually taking, or asserting in a benchmark that the fast path is engaged. Do not
+gate behaviour on them. A `false` answer is not a degraded mode, it is the
+portable path every other target already runs.
+
+### `hwAvailableAes(): bool`
+
+Whether AES block encryption is taking the AES-NI hardware path on this host
+rather than the software rounds.
+
+### `hwAvailableGhash(): bool`
+
+Whether GF(2^128) multiplication (GHASH, the authenticator in AES-GCM) is taking
+the carry-less-multiply hardware path rather than shift-and-xor.
+
+### `hwAvailableSha256(): bool`
+
+Whether the SHA-256 compression function is taking the SHA-extensions hardware
+path rather than the 64-round software loop.
