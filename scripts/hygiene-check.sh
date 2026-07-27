@@ -7,17 +7,35 @@
 #   - a ticket parked in a review state nobody returns to
 #   - a worktree/branch left open after its work merged
 #
-# Prints findings to stderr and exits 2 (which surfaces them to the agent) when
-# something needs attention; exits 0 when clean. It REPORTS — it never edits the
-# ledger, because a hook that silently "fixes" status is how the board starts
-# lying in the other direction.
+# Everything goes to stderr. The EXIT CODE depends on which kind of finding it is:
+# exit 2 (which refuses to end the turn) only for findings that can be cleared
+# right now with no judgement call; exit 0 for findings that may be a deliberate
+# state someone is holding on purpose. See the two buckets below — getting that
+# split wrong in either direction is a real failure mode, and it has been wrong in
+# both.
+#
+# It REPORTS — it never edits the ledger, because a hook that silently "fixes"
+# status is how the board starts lying in the other direction.
 set -u
 
 REPO="${CLAUDE_PROJECT_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
 cd "${REPO}" 2>/dev/null || exit 0
 command -v smash >/dev/null 2>&1 || exit 0
 
-findings=""
+# TWO BUCKETS, and the split is the whole point of this script's exit code.
+#
+# `blockers` are findings the agent can clear IMMEDIATELY and without a judgement
+# call — a ticket parked in a state this project does not use, a branch whose
+# commits are already in main. Those are worth refusing to end the turn over.
+#
+# `advisories` are findings that may be entirely correct. A branch holding work
+# blocked on an open bug stays unmerged for as long as the bug does; a worktree in
+# active use is supposed to be open. Blocking on those makes the turn unendable —
+# the agent re-asserts the same deliberate decision once per turn forever, which
+# is far worse than the untidiness. Measured: ~40 consecutive turns lost to
+# exactly that before this split existed.
+blockers=""
+advisories=""
 
 # --- review-state tickets: not used in this project ------------------------
 bad_states=$(smash stats --json 2>/dev/null | python3 -c "
@@ -31,7 +49,7 @@ for t in rows:
         print('  %-14s #%s' % (st, t.get('id')))
 " 2>/dev/null)
 if [ -n "${bad_states}" ]; then
-  findings="${findings}
+  blockers="${blockers}
 TICKETS IN A REVIEW/LIMBO STATE — this project uses only pending / in_progress / completed:
 ${bad_states}
   Resolve each: completed (with evidence) if it landed, pending (with a comment
@@ -69,7 +87,7 @@ if [ -n "${wt_live}" ]; then
     "$(printf '%s' "${wt_live}" | sed 's/^/  /')" >&2
 fi
 if [ -n "${wt}" ]; then
-  findings="${findings}
+  advisories="${advisories}
 OPEN WORKTREES (not locked — no agent holds these):
 $(printf '%s' "${wt}" | sed 's/^/  /')
   Close each the moment its work is merged:
@@ -110,32 +128,25 @@ if [ -n "${br}" ]; then
       unmerged="${unmerged} ${b}"
     fi
   done
-  [ -n "${merged}" ] && findings="${findings}
+  [ -n "${merged}" ] && blockers="${blockers}
 BRANCHES ALREADY IN main, with commits that landed (delete them):${merged}
     git branch -D${merged}"
-  [ -n "${unmerged}" ] && findings="${findings}
+  [ -n "${unmerged}" ] && advisories="${advisories}
 BRANCHES NOT IN main (cherry-pick or delete — do not just leave them):${unmerged}"
-  [ -n "${empty}" ] && findings="${findings}
+  [ -n "${empty}" ] && advisories="${advisories}
 BRANCHES WITH ZERO COMMITS AHEAD OF main — do NOT delete on this signal alone:${empty}
   0 commits ahead is indistinguishable from a live worktree that has not
   committed yet. Confirm no worktree/agent references it before removing:
     git worktree list | grep -F '<branch>'"
 fi
 
-if [ -n "${findings}" ]; then
-  printf 'HYGIENE (advisory):%s\n' "${findings}" >&2
-  printf 'NOTE: the commands above are suggestions for a human/agent to review, never auto-execute them against a worktree you did not create.\n' >&2
+if [ -n "${advisories}" ]; then
+  printf 'HYGIENE (advisory — may be deliberate, does not block):%s\n' "${advisories}" >&2
 fi
-# ADVISORY, NOT BLOCKING — always exit 0.
-#
-# This used to `exit 2`, which a Stop hook treats as "do not end the turn". The
-# findings here are legitimately long-lived: an unmerged branch holding work that
-# is blocked on a real bug stays unmerged for as long as the bug does, and a
-# worktree in active use is supposed to be open. Blocking on those turned every
-# such state into an unbreakable loop — the agent re-asserts the same decision
-# once per turn and can never finish, which is strictly worse than the untidiness
-# it was guarding against.
-#
-# Reporting is the part that was working. Keep it loud on stderr, and let whoever
-# reads it decide; a checklist that cannot be overruled is not a checklist.
+
+if [ -n "${blockers}" ]; then
+  printf 'HYGIENE — clear these before ending the turn:%s\n' "${blockers}" >&2
+  printf 'NOTE: the commands above are suggestions to review, never auto-execute them against a worktree you did not create.\n' >&2
+  exit 2
+fi
 exit 0
