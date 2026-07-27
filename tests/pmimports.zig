@@ -118,8 +118,21 @@ fn baseEnv(gpa: std.mem.Allocator, io: Io) !std.process.Environ.Map {
 }
 
 /// Runs a system tool (e.g. `git`) for fixture setup and asserts it exited 0.
+///
+/// The spawn itself is handled separately from the exit status (#1819). A `try`
+/// here propagated `error.FileNotFound` when the tool was ABSENT, before any print
+/// ran, so a container without git failed this whole harness with the message
+/// "failed without output" — nothing naming git, nothing naming a cause. The
+/// non-zero-exit path below always reported fine; it was never reached, because
+/// there was no process to get a status from.
 fn sh(gpa: std.mem.Allocator, io: Io, cwd: []const u8, argv: []const []const u8) !void {
-    const result = try std.process.run(gpa, io, .{ .argv = argv, .cwd = .{ .path = cwd } });
+    const result = std.process.run(gpa, io, .{ .argv = argv, .cwd = .{ .path = cwd } }) catch |e| {
+        std.debug.print(
+            "pmimports fixture: cannot run '{s}': {s} — is it installed and on PATH?\n",
+            .{ argv[0], @errorName(e) },
+        );
+        return error.FixtureSetupFailed;
+    };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
     switch (result.term) {
