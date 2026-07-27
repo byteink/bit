@@ -123,8 +123,19 @@ BRANCHES WITH ZERO COMMITS AHEAD OF main — do NOT delete on this signal alone:
 fi
 
 if [ -n "${findings}" ]; then
-  printf 'HYGIENE — resolve before ending the turn:%s\n' "${findings}" >&2
+  printf 'HYGIENE (advisory):%s\n' "${findings}" >&2
   printf 'NOTE: the commands above are suggestions for a human/agent to review, never auto-execute them against a worktree you did not create.\n' >&2
-  exit 2
 fi
+# ADVISORY, NOT BLOCKING — always exit 0.
+#
+# This used to `exit 2`, which a Stop hook treats as "do not end the turn". The
+# findings here are legitimately long-lived: an unmerged branch holding work that
+# is blocked on a real bug stays unmerged for as long as the bug does, and a
+# worktree in active use is supposed to be open. Blocking on those turned every
+# such state into an unbreakable loop — the agent re-asserts the same decision
+# once per turn and can never finish, which is strictly worse than the untidiness
+# it was guarding against.
+#
+# Reporting is the part that was working. Keep it loud on stderr, and let whoever
+# reads it decide; a checklist that cannot be overruled is not a checklist.
 exit 0
