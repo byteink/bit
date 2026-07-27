@@ -174,14 +174,17 @@ test "bit: no arguments is a usage error, not a self-test" {
     try testing.expect(std.mem.indexOf(u8, r.stderr, "pmlock check") == null);
 }
 
-// The other half of #1827 — that `bit selfcheck` still RUNS the self-checks — is
-// deliberately NOT tested here. `zig build test-selfcheck` already invokes exactly
-// that subcommand and requires exit 0, so a second test would be duplicate
-// coverage; and it would be actively harmful, because `selfcheck` is not
-// re-entrant: selfhost/pmlockcheck.bit writes fixed paths under /tmp
-// (/tmp/bit-pmlock-check.lock), so two concurrent runs fight over the same files.
-// Adding one here made the full suite fail while passing standalone. Filed
-// separately; do not "restore" this test without fixing those paths first.
+// There is deliberately NO `bit selfcheck` test here, and the reason is COST, not
+// correctness. `zig build test-selfcheck` already runs that exact subcommand and
+// requires exit 0, so a second one adds no coverage — and selfcheck takes ~79s
+// standalone, so a second concurrent runner under full-suite load blew the 300s
+// `tests/proc.zig` deadline and reported `TIMED OUT` (measured, twice).
+//
+// The first attempt at this test failed for a DIFFERENT reason — pmlockcheck.bit's
+// fixed /tmp fixture paths raced, 2 failures in 9 concurrent runs. That is fixed
+// (#1828, per-process nonce), so concurrent selfchecks are now safe; they are just
+// too slow to be worth duplicating. Raising BIT_TEST_TIMEOUT_S to accommodate a
+// redundant test would weaken the deadline for every other harness.
 
 test "bit version: a typo'd subcommand is a usage error, not the banner" {
     const gpa = testing.allocator;
