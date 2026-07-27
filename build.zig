@@ -1328,4 +1328,25 @@ pub fn build(b: *std.Build) void {
     selfhost_selfcheck.expectExitCode(0);
     test_step.dependOn(&selfhost_selfcheck.step);
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (selfhost/selfcheck.bit) only");
+
+    // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
+    //
+    // This gate did not exist, and its absence hid a real break: the checker
+    // rejected `selfhost/pmcli.bit` with three E0057s, so `selfhost-fixpoint.sh`
+    // could not produce a stageB at all — while `zig build test` stayed fully green,
+    // because not one of the 28 harnesses ran `bit` over `selfhost/`. A red fixpoint
+    // and a green suite must never coexist again: the fixpoint is the proof that
+    // permits retiring seed/, so silence there is expensive.
+    //
+    // `check`, not `build`: this needs the front end's verdict, not an artifact, and
+    // it keeps the step to a few seconds. A golden case cannot cover this — the same
+    // construct in a single file checks clean; it took the real module to fail.
+    const selfhost_checks_self = std.Build.Step.Run.create(b, "self-hosted bit checks selfhost/");
+    selfhost_checks_self.addFileArg(selfhosted);
+    selfhost_checks_self.addArg("check");
+    selfhost_checks_self.addArg("selfhost");
+    selfhost_checks_self.has_side_effects = true;
+    selfhost_checks_self.expectExitCode(0);
+    test_step.dependOn(&selfhost_checks_self.step);
+    addNamedRun(b, selfhost_checks_self, "test-selfhostcheck", "the self-hosted bit must check selfhost/ clean (#1829)");
 }
