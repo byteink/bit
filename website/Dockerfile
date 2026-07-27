@@ -29,8 +29,8 @@
 #
 # The comment carries the human-readable version; bumping the toolchain means
 # updating both, in a commit whose diff shows exactly what changed.
-FROM ghcr.io/byteink/bit@sha256:703f2a32b9e5ce0cccd8bfe17c3e6de24a03245648d6b3459add42b212f72705 AS build
-# ^ ghcr.io/byteink/bit:0.1.0
+FROM ghcr.io/byteink/bit@sha256:5eb716a1fc43b504d370665ac4143bda127bc16a5b61ea51951058969b72fcf8 AS build
+# ^ ghcr.io/byteink/bit:0.1.2
 
 # The toolchain image runs as uid 65532 (correct for its own job, compiling a
 # user's bind-mounted project). A build stage writes to the image filesystem, so
