@@ -1,0 +1,649 @@
+// selfhost/checkexpr.bit — split out of check.bit (#1809). Sibling of
+// check.bit: same module, so this needs no imports and no call-site
+// changes. Grouping follows the layout recorded at
+// tag rescue/task-1689-stale-split.
+
+// Infers a call expression's result type: a void builtin is `()`; a top-level
+// function call is its declared result; `chan<T>(n)`/`map<K,V>{}`-style
+// constructors are the constructed type. Unknown callees infer to invalid (0).
+function checkCall(c: Checker, node: int): int {
+  let callee = kidsOf(c.tree, node)[0]
+  let cn = getNode(c.tree, callee)
+  if (cn.tag == Tag.Ident) {
+    let name = c.source[cn.span.start:cn.span.end]
+    // PRECEDENCE: local binding > user declaration > builtin (SPEC 17.5).
+    // Matching the callee's SOURCE TEXT against the predeclared names first put
+    // every one of them ahead of the user's own declarations, so a program
+    // declaring `close`/`osExit`/`print` typed its own call as the builtin's `()`
+    // and failed with a spurious E0073 — while `fsClose`/`timeMonoNs` typed
+    // wrongly but silently. Shadowing a predeclared name is legal (E0048 is a
+    // warning), so these must be consulted BEFORE the cascade below. lowerCall
+    // hoists the same two paths in the same order; the two must agree, or the
+    // checker and the lowerer disagree about which function is being called.
+    // Calling a func-typed value `f(...)` yields the value's result type.
+    let ev = envLookup(c, name)
+    if (ev != 0 && c.ctx.types[ev].kind == TypeKind.Func) {
+      return c.ctx.types[ev].result
+    }
+    // A generic call `identity(42)` whose result is a bare type parameter binds
+    // that parameter from the matching argument's type.
+    let g = genericResultAt(c, name, node)
+    if (g != -1) {
+      return g
+    }
+    let r = funcResultLookup(c, name)
+    if (r != 0) {
+      return r
+    }
+    if (builtinReturnsVoid(name)) {
+      return c.ctx.voidId
+    }
+    // `len`/`cap` always yield i64 regardless of argument.
+    if (name == "len" || name == "cap") {
+      return primType(c.ctx, 3)
+    }
+    // `append(slice, ...)` yields the slice's type (its first argument's).
+    if (name == "append") {
+      return checkArgType(c, node, 0)
+    }
+    // Atomics (§11.5): the `*T` first argument's element type drives the result.
+    // Load and the rmw family return `T`; `atomicCmpxchg` returns `bool`.
+    if (name == "atomicLoad" || name == "atomicAdd" || name == "atomicSub" ||
+      name == "atomicAnd" || name == "atomicOr" || name == "atomicXchg") {
+      return c.ctx.types[checkArgType(c, node, 0)].elem
+    }
+    if (name == "atomicCmpxchg") {
+      return primType(c.ctx, 10)
+    }
+    // `ptrOf(s: []T): *T` — a raw pointer to the slice's element 0. Module
+    // state (§11.11) is also addressable: its cell has a static address, which
+    // is the addressability the atomic builtins need. A scalar cell yields
+    // `*T`; an array cell yields a pointer to its element 0, like a slice.
+    if (name == "ptrOf") {
+      let at = checkArgType(c, node, 0)
+      if (at != 0 && c.ctx.types[at].kind == TypeKind.Prim) {
+        return mkPtr(c.ctx, at)
+      }
+      return mkPtr(c.ctx, c.ctx.types[at].elem)
+    }
+    // `entryOf(f): *byte` (§11.10) — a named function's code entry address. The
+    // result never depends on the operand: it is one machine address whatever
+    // `f`'s signature is, so unlike `ptrOf` there is no argument to inspect.
+    // validate.bit is what proves the operand may have an address at all.
+    if (name == "entryOf") {
+      return mkPtr(c.ctx, primType(c.ctx, 4))
+    }
+    // `stackMapsBegin()`/`stackMapsEnd(): *byte` (§11.12) — the two bounds of
+    // the stack-map table (ABI.md §4). Zero-arity by construction: there is
+    // exactly one table per link, so there is nothing to select and no argument
+    // to inspect. validate.bit is what rejects a call that passes one.
+    if (name == "stackMapsBegin" || name == "stackMapsEnd") {
+      return mkPtr(c.ctx, primType(c.ctx, 4))
+    }
+    // `syscall(nr, a0..a5): i64` (§11.8) — variable arity, every operand and
+    // the result i64, so the result needs no argument inspection at all.
+    if (name == "syscall") {
+      return primType(c.ctx, 3)
+    }
+    // A runtime-primitive builtin (`cryptoRandomBytes`, `fsReadAll`, ...).
+    let bt = builtinResultType(c, name)
+    if (bt != -1) {
+      return bt
+    }
+    // A primitive name used as a call is a conversion: `f64(x)` -> f64.
+    let p = primIndexByName(name)
+    if (p >= 0) {
+      return primType(c.ctx, p)
+    }
+    return 0
+  }
+  // `chan<T>(n)` / `[]T(n)` / `map<K,V>()` — the callee is a type node, so the
+  // result is that type.
+  if (cn.tag == Tag.ChanType || cn.tag == Tag.SliceType || cn.tag == Tag.MapType || cn.tag == Tag.ArrayType) {
+    return typeFromNode(c, callee)
+  }
+  if (cn.tag == Tag.Member) {
+    // `ns.fn(...)` — the namespace binds the callee under a dotted key, so it
+    // resolves through the same two lookups the Ident branch uses.
+    let qn = nsQualifiedName(c, callee)
+    if (qn != "") {
+      let qg = genericResultAt(c, qn, node)
+      if (qg != -1) {
+        return qg
+      }
+      return funcResultLookup(c, qn)
+    }
+    let mk = kidsOf(c.tree, callee)
+    // Enum variant constructor `Enum.Variant(...)` / `Enum<T>.Variant(...)`.
+    let et = variantConstructionEnumType(c, node, mk[0])
+    if (et != 0) {
+      return et
+    }
+    // Method call `recv.method(...)` -> the method's declared result. A
+    // constrained type parameter dispatches through its constraint interface.
+    let recvType = checkExprType(c, mk[0])
+    if (recvType != 0) {
+      let mn = getNode(c.tree, mk[1])
+      let key = "${methodRecvType(c, recvType)}." + c.source[mn.span.start:mn.span.end]
+      let mr = methodResultLookup(c, key)
+      if (mr != 0) {
+        // The method's result is copied onto the receiver's INSTANTIATION
+        // already substituted (`copyInstMethod`, #1540), so `mr` is concrete
+        // here whenever `recvType` resolved to a real instantiation. Only
+        // inside the generic's OWN body — where the receiver is still the bare
+        // template — can this stay a type param, and there is no scrutinee
+        // syntax left to recover a better answer from (#1573).
+        return mr
+      }
+    }
+  }
+  // Calling any other FUNC-TYPED VALUE expression: a func-typed field
+  // `r.read(4096)` (§9.4), a slice element `fs[0](41)`, a returned function
+  // `mk()(41)`. None of the branches above resolve a declaration for these, so
+  // the callee's own type IS the signature and the call yields its result.
+  // Mirrors the seed's tail in `checkCall`, which types the callee and reads
+  // `.func.result` once every declaration-shaped case has been ruled out. The
+  // Ident branch returns on every path and so never reaches here, which keeps
+  // its local>declaration>builtin precedence (SPEC 17.5) intact.
+  let ft = checkExprType(c, callee)
+  if (ft != 0 && c.ctx.types[ft].kind == TypeKind.Func) {
+    return c.ctx.types[ft].result
+  }
+  return 0
+}
+
+// The inferred type of a call's `i`-th argument (unwrapping the `arg` node).
+function checkArgType(c: Checker, callNode: int, i: int): int {
+  let args = kidsOf(c.tree, kidsOf(c.tree, callNode)[2])
+  if (i >= len(args)) {
+    return 0
+  }
+  let a = args[i]
+  if (getNode(c.tree, a).tag == Tag.Arg) {
+    a = kidsOf(c.tree, a)[0]
+  }
+  return checkExprType(c, a)
+}
+
+// A receive `<-ch` yields the channel's element type; other unary operators
+// (`-`/`+`/`~`) preserve the operand type, and `!` yields its (bool) operand.
+function checkUnary(c: Checker, node: int): int {
+  let n = getNode(c.tree, node)
+  let ot = checkExprType(c, kidsOf(c.tree, node)[0])
+  if (n.main == int(Kind.ArrowLeft)) {
+    if (ot != 0 && c.ctx.types[ot].kind == TypeKind.Chan) {
+      return c.ctx.types[ot].elem
+    }
+    return 0
+  }
+  // `*p` (§11.4): load the pointee. Result is the pointer's elem type.
+  if (n.main == int(Kind.Star)) {
+    if (ot != 0 && c.ctx.types[ot].kind == TypeKind.Ptr) {
+      return c.ctx.types[ot].elem
+    }
+    return 0
+  }
+  return ot
+}
+
+// Arithmetic/bitwise binaries merge their operand types; comparisons and logical
+// operators yield an (untyped) boolean.
+// The single type an operator's two operands meet at, or `invalid` if they do
+// not meet (§14.2). Ported from the seed's `joinOperandTypes`.
+//
+// An untyped operand takes the other's concrete type — but only if it is
+// ASSIGNABLE to it, which is where `1 + 1.5` dies: two untyped constants with
+// different default types (i64 vs f64) do not meet, so Bit has no implicit
+// int->float widening even between literals. `lty == rty` is answered first, so
+// `1 + 1` stays untyped int rather than defaulting early.
+function joinOperandTypes(c: Checker, lhs: int, rhs: int, lty: int, rty: int): int {
+  if (lty == 0 || rty == 0) { return 0 }
+  if (lty == rty) { return lty }
+  let lUn = isUntyped(c, lty)
+  let rUn = isUntyped(c, rty)
+  if (lUn && !rUn) {
+    if (vAssignableNode(c, lhs, lty, rty)) { return rty }
+    return 0
+  }
+  if (rUn && !lUn) {
+    if (vAssignableNode(c, rhs, rty, lty)) { return lty }
+    return 0
+  }
+  if (lUn && rUn) {
+    if (defaultType(c, lty) == defaultType(c, rty)) { return defaultType(c, lty) }
+    return 0
+  }
+  return 0
+}
+
+// Is `joined` a legal operand type for an arithmetic (or, with `requireInteger`,
+// a bitwise/shift) operator? The seed's `checkNumericBinary` ok-test.
+function numericBinaryOk(c: Checker, joined: int, requireInteger: bool): bool {
+  if (joined == 0) { return false }
+  let k = c.ctx.types[joined].kind
+  if (k == TypeKind.Prim) {
+    if (requireInteger) { return vPrimIsInt(c.ctx.types[joined].prim) }
+    return vPrimIsInt(c.ctx.types[joined].prim) || vPrimIsFloat(c.ctx.types[joined].prim)
+  }
+  if (k == TypeKind.UntypedInt || k == TypeKind.UntypedRune) { return true }
+  if (k == TypeKind.UntypedFloat) { return !requireInteger }
+  return false
+}
+
+// An integer operand for pointer arithmetic (§11.4): a concrete integer prim or
+// an untyped int/rune constant — never a float. Mirrors the seed's helper.
+function isIntegerOperand(c: Checker, ty: int): bool {
+  if (ty == 0) { return false }
+  let k = c.ctx.types[ty].kind
+  if (k == TypeKind.Prim) { return vPrimIsInt(c.ctx.types[ty].prim) }
+  return k == TypeKind.UntypedInt || k == TypeKind.UntypedRune
+}
+
+// True for `&`/`|`/`^`/`<<`/`>>` — the operators that demand integers.
+function isBitwiseOp(op: int): bool {
+  return op == int(Kind.Amp) || op == int(Kind.Pipe) || op == int(Kind.Caret) ||
+    op == int(Kind.Shl) || op == int(Kind.Shr)
+}
+
+// `ty` is `string` or an untyped string constant — `+` concatenates those.
+function stringish(c: Checker, ty: int): bool {
+  if (ty == c.ctx.untypedStringId) { return true }
+  return ty != 0 && c.ctx.types[ty].kind == TypeKind.Prim && c.ctx.types[ty].prim == 11
+}
+
+// Arithmetic/bitwise binaries meet their operand types; comparisons and logical
+// operators yield a boolean.
+//
+// Returns `invalid` when the operands do not admit the operator — that poisoning
+// is what stops a cascade: the seed diagnoses `let x = 1 + "a"` once, types `x`
+// invalid, and a later `return x` then stays quiet instead of reporting a second,
+// derived error.
+//
+// Emits NOTHING. `checkExprType` is a RECOMPUTE, not a cache — the sweep calls it
+// at Binding/Call nodes and validate.bit calls it again per Binary node — so a
+// diagnostic here would double-report. `vBinary` owns the E0053.
+function checkBinary(c: Checker, node: int): int {
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  let a = checkExprType(c, kids[0])
+  let b = checkExprType(c, kids[1])
+  if (a == 0 || b == 0) { return 0 }
+  if (isComparisonOp(n.main)) {
+    return c.ctx.untypedBoolId
+  }
+  // `+` over two stringish operands concatenates; everything else is numeric.
+  if (n.main == int(Kind.Plus) && stringish(c, a) && stringish(c, b)) {
+    return primType(c.ctx, 11)
+  }
+  // Pointer arithmetic (§11.4): `p + n` / `p - n` advance a `*T` by n*sizeOf(T)
+  // and yield a `*T`. Carved out before the numeric path, like the string case.
+  if ((n.main == int(Kind.Plus) || n.main == int(Kind.Minus)) &&
+      c.ctx.types[a].kind == TypeKind.Ptr && isIntegerOperand(c, b)) {
+    return a
+  }
+  let joined = joinOperandTypes(c, kids[0], kids[1], a, b)
+  if (!numericBinaryOk(c, joined, isBitwiseOp(n.main))) {
+    return 0
+  }
+  return joined
+}
+
+// The type of an identifier reference from the DECL it resolves to (the
+// resolver's `nodeSymbols`), or 0 to let the caller fall back to the flat env.
+// This is the flat-env kill: a name is typed by the binding it actually
+// resolves to in its scope, never by whatever same-named binding another
+// function left in the module-wide env. Returns 0 (fall back) when there is no
+// resolved local decl to read a type from — an import, a builtin, a bare
+// function value, a not-yet-typed forward reference, or the bare dump entry
+// points that never run the resolver (`nodeSymbols` empty). A local decl holds
+// its TEMPLATE type inside a generic body, exactly as the env does, so lowering's
+// `nodeType` substitution yields the same concrete type on either path.
+function declRefType(c: Checker, node: int): int {
+  if (node < 0 || node >= len(c.nodeSymbols)) {
+    return 0
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return 0
+  }
+  let decl = c.symbols[sid].decl
+  if (decl <= 0 || decl >= len(c.declTypes)) {
+    return 0
+  }
+  return c.declTypes[decl]
+}
+
+// True when the identifier at `node` names a VALUE BINDING — a local, a param, a
+// receiver, or a module const — rather than the free function / builtin of the
+// same name. Every "does a local shadow this callee?" guard asks this before
+// validating a call against a free function's signature (SPEC §17.5).
+//
+// The resolver answers it exactly, because it knows scopes. The flat env cannot:
+// `envLookup(name) != 0` is true as soon as ANY function in the module binds that
+// name, so a single unrelated local anywhere silently disabled the guard's whole
+// validation for every call site in the module. That is permissive, so it cost
+// diagnostics rather than correctness — but it is a guess where the resolver has
+// the fact.
+//
+// Falls back to the env guess when there is no resolved symbol, which is the
+// resolver-less dump entry points (`nodeSymbols` empty) — see declRefType.
+function shadowedByValue(c: Checker, node: int, name: string): bool {
+  if (node > 0 && node < len(c.nodeSymbols)) {
+    let sid = c.nodeSymbols[node]
+    if (sid > 0 && sid < len(c.symbols)) {
+      let k = c.symbols[sid].kind
+      return k == SymbolKind.LetBinding || k == SymbolKind.ConstBinding ||
+        k == SymbolKind.Param || k == SymbolKind.Receiver
+    }
+  }
+  return envLookup(c, name) != 0
+}
+
+// Infers an expression's (possibly untyped) type. Literals and void-builtin
+// calls for now; every other construct infers to invalid (0) until its
+// inference lands.
+function checkExprType(c: Checker, node: int): int {
+  let tag = getNode(c.tree, node).tag
+  if (tag == Tag.IntLit) { return c.ctx.untypedIntId }
+  if (tag == Tag.FloatLit) { return c.ctx.untypedFloatId }
+  if (tag == Tag.RuneLit) { return c.ctx.untypedRuneId }
+  if (tag == Tag.BoolLit) { return c.ctx.untypedBoolId }
+  if (tag == Tag.StringLit || tag == Tag.RawStringLit) { return c.ctx.untypedStringId }
+  if (tag == Tag.NilLit) { return c.ctx.untypedNilId }
+  // A string interpolation `"...${x}..."` is a concrete string.
+  if (tag == Tag.StrInterp) { return primType(c.ctx, 11) }
+  if (tag == Tag.Ident) {
+    // Type the name from the decl it resolves to (#1370). Falls back to the flat
+    // env only when there is no resolved local decl — imports, builtins, forward
+    // references, and the resolver-less dump entry points.
+    let d = declRefType(c, node)
+    if (d != 0) {
+      return d
+    }
+    let sp = getNode(c.tree, node).span
+    let name = c.source[sp.start:sp.end]
+    let e = envLookup(c, name)
+    if (e != 0) {
+      return e
+    }
+    // A bare reference to a top-level function is a first-class func value.
+    return funcSigLookup(c, name)
+  }
+  if (tag == Tag.Unary) { return checkUnary(c, node) }
+  if (tag == Tag.Binary) { return checkBinary(c, node) }
+  if (tag == Tag.Call) { return checkCall(c, node) }
+  if (tag == Tag.SliceLit) { return checkSliceLit(c, node) }
+  // A composite literal `Name{...}` / `map<K,V>{...}` / `[]T{...}` has the type
+  // of its type node.
+  if (tag == Tag.CompositeLit) { return typeFromNode(c, kidsOf(c.tree, node)[0]) }
+  if (tag == Tag.Index) { return checkIndex(c, node) }
+  if (tag == Tag.TupleIndex) { return checkTupleIndex(c, node) }
+  if (tag == Tag.Member) { return checkMember(c, node) }
+  // A type assertion `x.(T)` yields the asserted type.
+  if (tag == Tag.TypeAssert) { return typeFromNode(c, kidsOf(c.tree, node)[1]) }
+  // A match expression's type is its arms' body type (all arms agree).
+  if (tag == Tag.MatchStmt) { return checkMatch(c, node) }
+  // Inline assembly (§11.6) yields its `result` operand's type, or `()` when it
+  // declares none. Register/payload validation is the validator's job (#1374).
+  if (tag == Tag.AsmStmt) { return checkAsm(c, node) }
+  if (tag == Tag.SliceExpr) { return checkSliceExpr(c, node) }
+  if (tag == Tag.ArrowFn) { return checkArrowFn(c, node) }
+  // `e?` / `e catch d` / `e catch x { … }` all unwrap the operand's fallible
+  // type `T!` to its success type `T`.
+  if (tag == Tag.TryExpr || tag == Tag.CatchDefault || tag == Tag.CatchBind) {
+    return unwrapFallible(c, checkExprType(c, kidsOf(c.tree, node)[0]))
+  }
+  return 0
+}
+
+// The success type of a fallible `T!`, or the type unchanged if not fallible.
+function unwrapFallible(c: Checker, t: int): int {
+  if (t != 0 && c.ctx.types[t].kind == TypeKind.Fallible) {
+    return c.ctx.types[t].result
+  }
+  return t
+}
+
+// The result an arrow is written AGAINST, if the source supplied one — see
+// `Checker.arrowExpected`. 0 when there is no expectation to honour.
+//
+// Two callers, one rule: `checkArrowFn` types the arrow with it, and the
+// validator judges the body's `return`s against it (#1522). It is deliberately
+// the EXPECTED result and not the arrow's final one — an arrow with no
+// expectation INFERS its result from the first `return` (#1488), and checking
+// the later `return`s against an inference drawn from the first is a rule the
+// seed does not have (its `inner_fctx.result_ty` is `expected_result`, left
+// `.invalid` when absent).
+function arrowExpectedResult(c: Checker, node: int): int {
+  let (et, ok) = c.arrowExpected[node]
+  if (ok && et != 0 && c.ctx.types[et].kind == TypeKind.Func) {
+    return c.ctx.types[et].result
+  }
+  return 0
+}
+
+// A closure `(x: T, ...) => body` has function type `(T, ...) => R`, R the
+// (defaulted) type of its body. ponytail: annotated params only — an untyped
+// param is left at 0 and recovered by lowering.
+// An arrow's function type, memoized per node against the flat env.
+//
+// `checkArrowFnAt` derives the result from the BODY, which reads the arrow's
+// own params out of the flat env. That env holds one binding per name, so once
+// the arrow's scope has closed those names belong to whoever came next — and
+// lowering re-derives every node type through `nodeType`, long after. Two
+// sibling arrows that both name a param `a` then both came back with an invalid
+// result, and the closure's `gc_alloc` was typed `fn(string) <invalid>`.
+//
+// The sweep computes the right answer while the params ARE in scope, so keep it
+// and consult it only when a later derivation comes back invalid. A valid fresh
+// answer always wins and is always re-stored, so this can only ever turn an
+// invalid type into the one the sweep already proved — never the reverse.
+function checkArrowFn(c: Checker, node: int): int {
+  let ft = checkArrowFnAt(c, node)
+  if (ft != 0 && c.ctx.types[ft].result != 0) {
+    c.arrowTypes[node] = ft
+    return ft
+  }
+  let (memo, ok) = c.arrowTypes[node]
+  if (ok && memo != 0) {
+    return memo
+  }
+  return ft
+}
+
+function checkArrowFnAt(c: Checker, node: int): int {
+  let kids = kidsOf(c.tree, node)
+  let params = []int(0)
+  let ps = kidsOf(c.tree, kids[0])
+  let i = 0
+  while (i < len(ps)) {
+    let pk = kidsOf(c.tree, ps[i])
+    let pt = 0
+    if (pk[1] != 0) {
+      pt = typeFromNode(c, pk[1])
+    }
+    params = append(params, pt)
+    i = i + 1
+  }
+  let want = arrowExpectedResult(c, node)
+  // A `=> { … }` body returns explicitly (SPEC 12.8), so its result comes from
+  // the expectation if there is one and from the first `return` otherwise
+  // (#1488) — falling through to `()` typed `(x: f32) => { return 4.5 }` as
+  // returning nothing, and every use of its value then failed against '()'.
+  if (getNode(c.tree, kids[1]).tag == Tag.Block) {
+    let br = want
+    if (br == 0) {
+      br = arrowBlockResult(c, kids[1])
+    }
+    if (br == 0) {
+      br = c.ctx.voidId
+    }
+    return mkFunc(c.ctx, params, false, br)
+  }
+  let bt = checkExprType(c, kids[1])
+  // An UNTYPED constant body takes the expected result as the arrow's own
+  // (#1487): `(x: f32) => 4.5` otherwise interned as `(f32) => f64` and failed
+  // E0041 against the very `(f32) => f32` that supplied the expectation.
+  //
+  // Two guards keep this from SWALLOWING a real error. The body must be untyped
+  // — a body with a type of its own keeps it — and it must be assignable to the
+  // expected result, which is the same question the seed's `expect` asks at the
+  // body. Without the second guard `(x: f32) => 4.5` against `(f32) => i32`
+  // adopted i32, the arrow matched, and the seed's E0041 went missing.
+  if (want != 0 && defaultType(c, bt) != bt && vAssignableNode(c, kids[1], bt, want)) {
+    return mkFunc(c.ctx, params, false, want)
+  }
+  // Otherwise the body's type must be DEFAULTED before it becomes the
+  // function's result (#1472): an untyped constant is not a storable type, and
+  // leaving one here makes the call site and the callee disagree about the
+  // return's ABI slot — `(x: f32) => 4.5` then printed 4.5 while comparing
+  // unequal to 4.5.
+  return mkFunc(c.ctx, params, false, defaultType(c, bt))
+}
+
+// The result type a `=> { … }` arrow infers when no expected function type
+// supplies one: the DEFAULTED type of the first `return <expr>` in the body, or
+// 0 when the body returns nothing. A nested arrow's `return`s belong to that
+// arrow, so its subtree is skipped. Mirrors the seed's `arrowBlockResult`.
+function arrowBlockResult(c: Checker, node: int): int {
+  let tag = getNode(c.tree, node).tag
+  if (tag == Tag.ArrowFn) {
+    return 0
+  }
+  if (tag == Tag.ReturnStmt) {
+    let rk = kidsOf(c.tree, node)
+    if (len(rk) != 1) {
+      return 0 // a bare `return`, or a multi-value tuple result
+    }
+    return defaultType(c, checkExprType(c, rk[0]))
+  }
+  let kids = kidsOf(c.tree, node)
+  let i = 0
+  while (i < len(kids)) {
+    let t = arrowBlockResult(c, kids[i])
+    if (t != 0) {
+      return t
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// `let f: (i32) => i32 = (x) => …` — the annotation is the initializer's
+// expected type. Only an ArrowFn initializer is recorded; nothing else reads
+// the table.
+function seedArrowExpectedBinding(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pattern, type_or_none, init_or_none]
+  if (kids[1] == 0 || kids[2] == 0) {
+    return
+  }
+  if (getNode(c.tree, kids[2]).tag != Tag.ArrowFn) {
+    return
+  }
+  let ty = typeFromNode(c, kids[1])
+  if (ty != 0 && c.ctx.types[ty].kind == TypeKind.Func) {
+    c.arrowExpected[kids[2]] = ty
+  }
+}
+
+// `apply((x: f32) => 4.5)` — the matching parameter's declared type is the
+// argument's expected type.
+//
+// Resolution is vCall's, guard for guard: a bare-ident callee that no local
+// shadows, naming a known non-generic free function whose arity matches. Every
+// undecidable shape (method, value call, builtin, generic, variadic, spread)
+// records nothing and leaves the arrow inferred exactly as before, which is
+// what keeps a wrong expectation — the only way this could manufacture a
+// diagnostic the seed does not have — out of reach.
+function seedArrowExpectedCall(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [callee, generic_args, arg_list]
+  let args = kidsOf(c.tree, kids[2])
+  if (!hasArrowArg(c, args)) {
+    return
+  }
+  let cn = getNode(c.tree, kids[0])
+  if (cn.tag != Tag.Ident) {
+    return
+  }
+  let name = c.source[cn.span.start:cn.span.end]
+  if (shadowedByValue(c, kids[0], name)) {
+    return // a local value shadows the free function
+  }
+  let fr = funcRefAt(c, kids[0], name)
+  let decl = fr.decl
+  if (decl == 0) {
+    return
+  }
+  let owner = fr.owner
+  let plist = declParamListNode(owner, decl)
+  if (plist < 0) {
+    return // generic: the parameter type is not known until instantiation
+  }
+  let params = kidsOf(owner.tree, plist)
+  if (len(params) != len(args)) {
+    return // variadic, spread, or an arity error: which parameter is undecided
+  }
+  let i = 0
+  while (i < len(args)) {
+    let a = argInner(c, args[i])
+    if (getNode(c.tree, a).tag == Tag.ArrowFn) {
+      let pty = typeFromNode(owner, kidsOf(owner.tree, params[i])[1])
+      if (pty != 0 && c.ctx.types[pty].kind == TypeKind.Func) {
+        c.arrowExpected[a] = pty
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The expression an argument node wraps, unwrapping the `Arg` shell.
+function argInner(c: Checker, arg: int): int {
+  if (getNode(c.tree, arg).tag == Tag.Arg) {
+    return kidsOf(c.tree, arg)[0]
+  }
+  return arg
+}
+
+// Whether any argument is an arrow literal — the cheap guard that keeps the
+// seeding pass off every call in the program.
+function hasArrowArg(c: Checker, args: []int): bool {
+  let i = 0
+  while (i < len(args)) {
+    if (getNode(c.tree, argInner(c, args[i])).tag == Tag.ArrowFn) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The enum type a variant-construction CALL `Enum.Variant(args)` /
+// `Enum<T>.Variant(args)` denotes. An explicit `Enum<T>` receiver already
+// resolves to the instantiation through `enumReceiverType` (#1560). A BARE
+// receiver's type args are inferred from the call's own arguments — the
+// constructor's values are the only place they are written down — and
+// `instantiateNamed` mints the same nominal instantiation an explicit
+// `Enum<T>` would have, so `ctx.variantPayloads` carries a fully substituted
+// answer for it exactly like any other instantiation (#1573).
+//
+// THE SAFETY RULE: an argument that does not resolve, or an enum with no type
+// params at all, leaves the base template untouched — precisely the id
+// `enumReceiverType` returned before this inference existed.
+function variantConstructionEnumType(c: Checker, callNode: int, recv: int): int {
+  let et = enumReceiverType(c, recv)
+  if (et == 0 || getNode(c.tree, recv).tag == Tag.GenericInst) {
+    return et
+  }
+  let args = variantConstructionTypeArgs(c, callNode)
+  if (len(args) == 0) {
+    return et
+  }
+  let i = 0
+  while (i < len(args)) {
+    if (args[i] == 0) {
+      return et
+    }
+    i = i + 1
+  }
+  return instantiateNamed(c, c.ctx.types[et].name, args)
+}

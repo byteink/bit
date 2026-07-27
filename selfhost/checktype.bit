@@ -1,0 +1,394 @@
+// selfhost/checktype.bit — split out of check.bit (#1809). Sibling of
+// check.bit: same module, so this needs no imports and no call-site
+// changes. Grouping follows the layout recorded at
+// tag rescue/task-1689-stale-split.
+
+// Infers a type-annotation node to a TypeId. Primitives and simple composites
+// (slice/array/map/chan) are handled here; named types need resolve and infer
+// to invalid (0) for now.
+// A type-parameter substitution in force while resolving a type node: `names[i]`
+// resolves to `types[i]` rather than to whatever it names in scope. Parallel
+// slices, not a map — a generic declares a handful of type params, and a linear
+// scan of two beats hashing on typeFromNode's hot path.
+struct TypeSubst {
+  names: []string,
+  types: []int,
+}
+
+function noSubst(): TypeSubst {
+  return TypeSubst{ names: []string(0), types: []int(0) }
+}
+
+// The type bound to `name`, or 0 when `name` is not a substituted type param.
+// A type param can never legally bind to type id 0, so 0 is an unambiguous miss.
+function substLookup(sub: TypeSubst, name: string): int {
+  let i = 0
+  while (i < len(sub.names)) {
+    if (sub.names[i] == name) {
+      return sub.types[i]
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+function typeFromNode(c: Checker, node: int): int {
+  return typeFromNodeIn(c, node, noSubst())
+}
+
+// Resolves a type node to a TypeId with `sub`'s type-param bindings applied at
+// every depth. `[]T` under {T -> i64} is `[]i64`, and so on through every
+// composite — substitution is not a special case of the shape, it is a rule
+// about names, so it belongs in the one resolver rather than a parallel walker.
+function typeFromNodeIn(c: Checker, node: int, sub: TypeSubst): int {
+  if (node == 0) {
+    return 0
+  }
+  let n = getNode(c.tree, node)
+  let tag = n.tag
+  if (tag == Tag.Ident) {
+    let name = c.source[n.span.start:n.span.end]
+    // A bound type param wins outright: it cannot collide with a prim or with
+    // `error` (both reserved), so order costs nothing and states the intent.
+    let s = substLookup(sub, name)
+    if (s != 0) {
+      return s
+    }
+    let p = primIndexByName(name)
+    if (p >= 0) {
+      return primType(c.ctx, p)
+    }
+    // The predeclared `error` interface (§10.6) is a builtin, not a user type.
+    if (name == "error") {
+      return c.ctx.errorId
+    }
+    return resolveNamed(c, name)
+  }
+  let kids = kidsOf(c.tree, node)
+  if (tag == Tag.SliceType) {
+    return mkSlice(c.ctx, typeFromNodeIn(c, kids[0], sub))
+  }
+  if (tag == Tag.PtrType) {
+    return mkPtr(c.ctx, typeFromNodeIn(c, kids[0], sub))
+  }
+  if (tag == Tag.ChanType) {
+    return mkChan(c.ctx, typeFromNodeIn(c, kids[0], sub))
+  }
+  if (tag == Tag.MapType) {
+    return mkMap(c.ctx, typeFromNodeIn(c, kids[0], sub), typeFromNodeIn(c, kids[1], sub))
+  }
+  if (tag == Tag.ArrayType) {
+    let sn = getNode(c.tree, kids[0])
+    return mkArray(c.ctx, parseIntText(c.source[sn.span.start:sn.span.end]),
+      typeFromNodeIn(c, kids[1], sub))
+  }
+  if (tag == Tag.VoidType) {
+    return c.ctx.voidId
+  }
+  // A generic instance `Name<...>` gets its OWN nominal TypeId per argument list
+  // (#1540) — `Stack<i64>` and `Stack<string>` are distinct types, which is what
+  // gives each one its own `$t<id>`-mangled method bodies. It still RENDERS by
+  // its base name, so `--dump-types` is unchanged. `instantiateNamed` falls back
+  // to the base template for everything it cannot decide.
+  if (tag == Tag.GenericInst) {
+    let iname = typeNodeName(c, node)
+    return instantiateNamed(c, iname, genericInstArgs(c, node, sub))
+  }
+  // A fallible result `T!` / `T!E` — the error defaults to the `error` interface.
+  if (tag == Tag.Fallible) {
+    let errT = c.ctx.errorId
+    if (kids[1] != 0) {
+      errT = typeFromNodeIn(c, kids[1], sub)
+    }
+    return mkFallible(c.ctx, typeFromNodeIn(c, kids[0], sub), errT)
+  }
+  // A function type `(P, Q) => R` (func_type `[type_list, result]`).
+  // `(A, B, ...)` — the element types in order. Without this a tuple annotation
+  // resolved to 0 (unknown), which made every tuple-typed value permissive and
+  // silenced the diagnostics that depend on its type (E0041/E0059).
+  if (tag == Tag.TupleType) {
+    let members = []int(0)
+    let mi = 0
+    while (mi < len(kids)) {
+      members = append(members, typeFromNodeIn(c, kids[mi], sub))
+      mi = mi + 1
+    }
+    return mkTuple(c.ctx, members)
+  }
+  if (tag == Tag.FuncType) {
+    let params = []int(0)
+    let plist = kidsOf(c.tree, kids[0])
+    let pi = 0
+    while (pi < len(plist)) {
+      params = append(params, typeFromNodeIn(c, plist[pi], sub))
+      pi = pi + 1
+    }
+    return mkFunc(c.ctx, params, false, typeFromNodeIn(c, kids[1], sub))
+  }
+  return 0
+}
+
+// The value of a digit char in a radix up to 16, or -1 if not a digit (so
+// underscores and separators are skipped by the caller).
+function digitValue(ch: u8): int {
+  if (ch >= '0' && ch <= '9') {
+    return int(ch) - 48
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return int(ch) - 87
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return int(ch) - 55
+  }
+  return -1
+}
+
+// Parses an integer literal's value, honoring a `0x`/`0b`/`0o` radix prefix and
+// skipping `_` separators (§5.4). Used for array sizes and const_int lowering.
+function parseIntText(s: string): int {
+  let radix = 10
+  let start = 0
+  if (len(s) >= 2 && s[0] == '0') {
+    let c = s[1]
+    if (c == 'x' || c == 'X') {
+      radix = 16
+      start = 2
+    } else if (c == 'b' || c == 'B') {
+      radix = 2
+      start = 2
+    } else if (c == 'o' || c == 'O') {
+      radix = 8
+      start = 2
+    }
+  }
+  let n = 0
+  let i = start
+  while (i < len(s)) {
+    let d = digitValue(s[i])
+    if (d >= 0 && d < radix) {
+      n = n * radix + d
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// Register codes for `asm` operands (§11.6). x64 codes are the ModRM register
+// number (codegen `Reg` order); arm64 codes are the physical register number
+// (`x0`..`x30` = 0..30). 254 is the `memory` clobber sentinel (a barrier only);
+// arm64 31 is `sp`/`xzr`. Shared by the type inferencer and lowering so the two
+// never disagree. -1 = unknown name.
+function asmRegX64(name: string): int {
+  if (name == "rax") { return 0 }
+  if (name == "rcx") { return 1 }
+  if (name == "rdx") { return 2 }
+  if (name == "rbx") { return 3 }
+  if (name == "rsp") { return 4 }
+  if (name == "rbp") { return 5 }
+  if (name == "rsi") { return 6 }
+  if (name == "rdi") { return 7 }
+  if (name == "memory") { return 254 }
+  if (len(name) >= 2 && name[0:1] == "r") {
+    let num = parseIntText(name[1:len(name)])
+    if (num >= 8 && num <= 15) { return num }
+  }
+  return -1
+}
+
+function asmRegArm64(name: string): int {
+  if (name == "memory") { return 254 }
+  if (name == "sp" || name == "xzr") { return 31 }
+  if (len(name) >= 2 && name[0:1] == "x") {
+    let num = parseIntText(name[1:len(name)])
+    if (num >= 0 && num <= 30) { return num }
+  }
+  return -1
+}
+
+// Inline assembly (§11.6) as an expression: its type is the `result` operand's
+// declared type, or `()` when it declares none.
+function checkAsm(c: Checker, node: int): int {
+  let k = kidsOf(c.tree, node) // [x64_code, arm64_code, result?, clob_x64, clob_arm64, input...]
+  if (k[2] != 0) {
+    let rk = kidsOf(c.tree, k[2]) // [arm64_reg, x64_reg, type]
+    return typeFromNode(c, rk[2])
+  }
+  return c.ctx.voidId
+}
+
+// The code point of a rune literal `'c'` (§5.4): a bare byte/UTF-8 sequence or a
+// `\n`/`\x41`/`\u{1F600}`-style escape. Mirrors the seed's parseRuneLiteral.
+function parseRuneText(s: string): int {
+  if (len(s) < 3) {
+    return 0
+  }
+  let c0 = int(s[1])
+  if (s[1] != '\\') {
+    // A bare code point: ASCII is one byte; a multi-byte UTF-8 lead byte
+    // (110/1110/11110xxxx) is decoded with its continuation bytes.
+    if (c0 < 0x80) {
+      return c0
+    }
+    if (c0 >= 0xF0 && len(s) >= 6) {
+      return (c0 - 0xF0) * 0x40000 + (int(s[2]) - 0x80) * 0x1000 + (int(s[3]) - 0x80) * 0x40 + (int(s[4]) - 0x80)
+    }
+    if (c0 >= 0xE0 && len(s) >= 5) {
+      return (c0 - 0xE0) * 0x1000 + (int(s[2]) - 0x80) * 0x40 + (int(s[3]) - 0x80)
+    }
+    if (c0 >= 0xC0 && len(s) >= 4) {
+      return (c0 - 0xC0) * 0x40 + (int(s[2]) - 0x80)
+    }
+    return c0
+  }
+  let e = s[2]
+  if (e == 'n') { return 10 }
+  if (e == 'r') { return 13 }
+  if (e == 't') { return 9 }
+  if (e == '\\') { return 92 }
+  if (e == '\'') { return 39 }
+  if (e == '"') { return 34 }
+  if (e == '0') { return 0 }
+  if (e == 'x' && len(s) >= 6) {
+    return digitValue(s[3]) * 16 + digitValue(s[4])
+  }
+  if (e == 'u') {
+    // `\u{HEX}`: the hex digits between the braces.
+    let n = 0
+    let i = 4
+    while (i < len(s) && s[i] != '}') {
+      let d = digitValue(s[i])
+      if (d >= 0) {
+        n = n * 16 + d
+      }
+      i = i + 1
+    }
+    return n
+  }
+  return 0
+}
+
+// The predeclared builtins that return void `()` (spec §5.3). Their call
+// expressions type as the void id regardless of arguments.
+function builtinReturnsVoid(name: string): bool {
+  return name == "print" || name == "eprint" || name == "panic" || name == "assert" ||
+    name == "close" || name == "delete" || name == "atomicStore"
+}
+
+// The declared parameter types of a runtime-primitive builtin (the `params` half
+// of compiler/check.zig's `prim_sigs`; `builtinResultType` below is the `ret`
+// half). Empty for a non-builtin or a nullary one.
+//
+// `lowerBuiltinCall` materializes each argument at its declared type. Without
+// that hint an untyped literal lands at its DEFAULT type and the operand carries
+// the wrong width — `float32Bits(4.5)` handing an f64 to a signature that says
+// f32, so the narrow read takes the f64's low half, which is zero (#1467).
+//
+// Kept complete rather than float-only on purpose: a partial table silently
+// regresses the moment a primitive gains a narrow parameter. Drift against the
+// seed's `prim_sigs` shows up as an IR-dump differential, because a hinted
+// literal's const type is in the dump.
+function builtinParamTypes(c: Checker, name: string): []int {
+  let i64t = primType(c.ctx, 3)
+  let strt = primType(c.ctx, 11)
+  let boolt = primType(c.ctx, 10)
+  let f64t = primType(c.ctx, 9)
+  let f32t = primType(c.ctx, 8)
+  // Float primitives — the only ones whose parameter differs from the untyped
+  // default, and so the only ones where a missing hint is observable today.
+  if (name == "float32Bits") { return [f32t] }
+  // `bitsToFloat(v: u64) -> f64`: the sole builtin whose parameter is u64, so it
+  // stands apart from the f64 group below.
+  if (name == "bitsToFloat") { return [primType(c.ctx, 7)] }
+  if (name == "fsqrt" || name == "ffloor" || name == "fceil" || name == "fround" ||
+    name == "ftrunc" || name == "flog" || name == "flog2" || name == "flog10" ||
+    name == "floatBits") {
+    return [f64t]
+  }
+  if (name == "fpow" || name == "fatan2") { return [f64t, f64t] }
+  // Filesystem (§14).
+  if (name == "fsOpen") { return [strt, boolt] }
+  if (name == "fsWrite") { return [i64t, strt] }
+  if (name == "fsRead") { return [i64t, i64t] }
+  if (name == "fsChmod") { return [strt, i64t] }
+  if (name == "fsReadAll" || name == "fsClose" || name == "netLocalPort" ||
+    name == "netAccept" || name == "timeSleepNs" || name == "osArgAt" ||
+    name == "osExit" || name == "cryptoRandomBytes") {
+    return [i64t]
+  }
+  if (name == "fsAppend" || name == "fsExists" || name == "fsIsDir" ||
+    name == "fsMkdir" || name == "fsRemove" || name == "fsListDir" ||
+    name == "netResolve" || name == "osEnv" || name == "parseFloat" ||
+    name == "osRun") {
+    return [strt]
+  }
+  // Network (§15).
+  if (name == "netListen" || name == "netDial" || name == "netUdpBind") { return [strt, i64t] }
+  if (name == "netRead" || name == "netUdpRecv") { return [i64t, i64t] }
+  if (name == "netWrite") { return [i64t, strt] }
+  if (name == "netUdpSend") { return [i64t, strt, i64t, strt] }
+  if (name == "osRunTest") { return [strt, i64t] }
+  // Nullary: netUdpSenderHost/Port, timeMonoNs, timeUnixNs, osArgc, hostTarget,
+  // auxv — and every non-primitive name.
+  return []int(0)
+}
+
+// The result type of a runtime-primitive builtin (compiler/check.zig `prim_sigs`
+// / the ABI runtime surface), or -1 for a non-builtin.
+function builtinResultType(c: Checker, name: string): int {
+  if (name == "fsReadAll" || name == "fsRead" || name == "fsListDir" ||
+    name == "netRead" || name == "netUdpRecv" || name == "netUdpSenderHost" ||
+    name == "netResolve" || name == "osArgAt" || name == "osEnv" || name == "osSelfExe" ||
+    name == "cryptoRandomBytes") {
+    return primType(c.ctx, 11)
+  }
+  if (name == "fsOpen" || name == "fsWrite" || name == "fsClose" || name == "fsAppend" ||
+    name == "fsMkdir" || name == "fsRemove" || name == "netListen" || name == "netLocalPort" ||
+    name == "netAccept" || name == "netDial" || name == "netWrite" || name == "netUdpBind" ||
+    name == "netUdpSend" || name == "netUdpSenderPort" || name == "timeMonoNs" ||
+    name == "timeUnixNs" || name == "osArgc") {
+    return primType(c.ctx, 3)
+  }
+  if (name == "fsExists" || name == "fsIsDir") {
+    return primType(c.ctx, 10)
+  }
+  if (name == "fsqrt" || name == "ffloor" || name == "fceil" || name == "fround" ||
+    name == "ftrunc" || name == "fpow" || name == "fatan2" || name == "flog" ||
+    name == "flog2" || name == "flog10" || name == "parseFloat") {
+    return primType(c.ctx, 9)
+  }
+  // fsChmod(path: string, mode: i64) -> i64 (0 ok, -1 err).
+  if (name == "fsChmod") {
+    return primType(c.ctx, 3)
+  }
+  // osRun(path: string) -> i64 (child exit code, -1 on failure).
+  if (name == "osRun") {
+    return primType(c.ctx, 3)
+  }
+  // osRunTest(path: string, idx: i64) -> i64 (child exit code with BIT_TEST_INDEX).
+  if (name == "osRunTest") {
+    return primType(c.ctx, 3)
+  }
+  // hostTarget() -> i64 (the host BuildTarget ordinal).
+  if (name == "hostTarget") {
+    return primType(c.ctx, 3)
+  }
+  // auxv() -> i64 (this process's ELF auxiliary-vector address, 0 when none).
+  if (name == "auxv") {
+    return primType(c.ctx, 3)
+  }
+  // floatBits(v: f64) -> u64, float32Bits(v: f32) -> u32.
+  if (name == "floatBits") {
+    return primType(c.ctx, 7)
+  }
+  if (name == "float32Bits") {
+    return primType(c.ctx, 6)
+  }
+  // bitsToFloat(v: u64) -> f64 — the inverse of floatBits.
+  if (name == "bitsToFloat") {
+    return primType(c.ctx, 9)
+  }
+  if (name == "timeSleepNs" || name == "osExit" || name == "cryptoSecureZero") {
+    return c.ctx.voidId
+  }
+  return -1
+}
