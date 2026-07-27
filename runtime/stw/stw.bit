@@ -109,8 +109,44 @@
 //      silently, the way this header warns every missed class does. `root.zig`
 //      never needed this class because it never had this problem.
 //
-// Classes 4, 5 and 7 are reachable only when a scheduler block is bound; class 1
-// only when a channel registry is. `stwBind` takes all three addresses TOGETHER
+//   8. The RUNNING task's own stack, conservatively (`stwScanTasks`, #1832).
+//      THIS ONE HAS NO `root.zig` COUNTERPART EITHER, and like classes 6 and 7
+//      it exists because of a property of the PORT rather than an oversight.
+//
+//      Class 2 covers this stack precisely, and precisely is not enough here. A
+//      stack map names REFERENCE-TYPED slots; an `int` slot that happens to hold
+//      an object address is invisible to it by construction. The runtime is full
+//      of exactly that: the ABI boundary FORCES a pinned symbol to take its
+//      argument as a bare `int` (E0079 — a pinned symbol may not name a managed
+//      type), so `bit_rt_chan_send` receives the element it is about to store as
+//      an `int`, and holds it as one across its own loop.
+//
+//      And a collection CAN land there. Codegen synthesizes `bl
+//      bit_rt_safepoint` at every loop back-edge, so any `bit_rt_*` implemented
+//      in Bit and NOT marked `@nosplit` can be interrupted mid-operation
+//      (#1656/#1658). Six such pins are on the channel path alone —
+//      `bit_rt_chan_send/recv/make/close`, `bit_rt_select`,
+//      `bit_rt_select_alloc`. `root.zig` is structurally immune: `chan.zig` is
+//      Zig, Zig carries no back-edge polls, and no collection can occur inside
+//      a channel operation there at all.
+//
+//      So the running task's stack needs the same conservative treatment class 4
+//      gives every other task's. The low bound is the LIVE `sp`, not the
+//      snapshot's `fp`: frame pointers grow toward higher addresses, so
+//      `[fp, top)` is the CALLER frames and excludes the innermost frame's own
+//      locals — which is precisely where the raw `int` sits. That distinction is
+//      MEASURED, not argued (`tests/stress/quicwire` under `BIT_GC=stress`,
+//      12 packets over channels with `select`): bad-packet rate 2 of 8 with no
+//      class 8, 1 of 12 bounded at `fp`, 0 of 14 bounded at `sp`.
+//
+//      IT IS NOT FREE, unlike every class above it. Under `BIT_GC=stress` —
+//      a collection at every safepoint — quicwire goes from ~50s to ~157s,
+//      because this walks the live stack on every collection instead of only
+//      the frames a stack map names. That is a test policy, not production, but
+//      the cost is real and belongs in the record rather than in a surprise.
+//
+// Classes 4, 5, 7 and 8 are reachable only when a scheduler block is bound;
+// class 1 only when a channel registry is. `stwBind` takes all three addresses TOGETHER
 // and `stwCanCollect` refuses to collect unless every one of them is present —
 // deliberately, because "collect with a smaller root set" is the failure mode
 // this whole comment exists to prevent. An unbound runtime does not collect; it
@@ -393,6 +429,23 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
 // `forEachOtherStack`, fused into one walk because they visit the same list
 // under the same lock, plus the port-only scratch and ctx classes documented
 // above.
+// The live stack pointer, the same one-instruction form as
+// `../sched/sched.bit`'s `readSp` — inline by construction, so legal in a
+// `@nosplit` body. Duplicated rather than imported because that one is module
+// private and this is a different module; the instruction is the contract.
+//
+// Reading it in a callee is safe for class 8's purpose: a callee's prologue only
+// moves `sp` DOWN within the same stack, so the answer is never HIGHER than the
+// real boundary, and a low bound that is too low only widens a conservative
+// scan.
+@nosplit function stwReadSp(): int {
+  return asm {
+    arm64 { 0x910003E0 }              // mov x0, sp
+    x64   { 0x48, 0x89, 0xE0 }        // mov rax, rsp
+    result arm64 x0 x64 rax : int
+  }
+}
+
 @nosplit function stwScanTasks(g: *i64, sched: *i64) {
   let cur = schedCurrentTask()
   schedRegLock(sched)
@@ -407,15 +460,23 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
     // operation left in `scrElem`/`scrErr`, and the running task's scratch is
     // invisible to the precise walk.
     stwScanScratch(g, t)
-    if (addr != cur && *(t + taskState) != taskDone) {
-      stwScanStackRange(g, *(t + ctxSp), *(t + taskStackBase) + *(t + taskStackBytes))
+    if (*(t + taskState) != taskDone) {
+      // Class 8 (#1832): the RUNNING task gets the LIVE sp as its low bound.
+      // `ctxSp` is stale for it — that is its last park, not now.
+      let lo = *(t + ctxSp)
+      if (addr == cur) {
+        lo = stwReadSp()
+      }
+      stwScanStackRange(g, lo, *(t + taskStackBase) + *(t + taskStackBytes))
       // The running task's own registers are live CPU state, not a saved
       // block — scanning `t[0..ctxWords)` for it would read whatever this
       // task's context slots last held (stale, from its previous park) and
       // is neither needed (its real registers are covered by the precise
       // snapshot walk) nor safe to treat as current. Gated identically to
       // the stack range for that reason, not by accident of placement.
-      stwScanCtx(g, t)
+      if (addr != cur) {
+        stwScanCtx(g, t)
+      }
     }
     addr = schedRegNext(t)
     n = n + 1
