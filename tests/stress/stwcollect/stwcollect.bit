@@ -59,6 +59,11 @@
 //   E — another stopped OS thread's PARKED FRAME (#1683), likewise.
 //   F — the `bad=` counter the `BIT_GC_STATS` line grew in #1682, read through
 //       the same bound-block accessor that line uses.
+//   H — the RUNNING task's own stack (#1832). Unlike every phase above it does
+//       NOT fabricate a stack: class 8 fires only for the task holding the real
+//       `sp`, so the phase copies the real stack's bounds off the live current
+//       task and lets the compiler place sixteen raw-`int` payloads, which
+//       cannot all fit in the callee-saved file.
 //   G — a parked task's own saved CALLEE-SAVED REGISTER FILE (#1742): the
 //       `t[0..ctxWords)` block `schedSwitch` (`../../../runtime/sched`) writes
 //       on every park. The task below has an EMPTY class-4 stack range (`sp`
@@ -100,6 +105,7 @@ import { worldBind, worldWords, worldClaim, worldRelease, maxMutators, mParked }
 import { rtChanMake, chanBootBind, chanRegWords } from "../../../runtime/chan"
 import { stwBind, stwPoll, stwAbandonedCount, stwBadOffsets } from "../../../runtime/stw"
 import { schedWords, scRegHead, taskWords, taskArg, taskState, taskParked } from "../../../runtime/sched"
+import { schedCurrentTask, taskAt } from "../../../runtime/sched"
 import { taskStackBase, taskStackBytes, ctxSp, ctxWords, taskRegNext } from "../../../runtime/sched"
 import { chanScratchWords, scrElem, scrErr, scrRecvOk } from "../../../runtime/sched"
 
@@ -189,6 +195,14 @@ const M_PARKED_DEAD = 1012
 const M_BADMAP = 1013
 const M_CTX = 1014
 const M_CTX_DEAD = 1015
+// Phase H plants SIXTEEN payloads rather than one, and the count is the test.
+// See phase H: a raw `int` local must be on the STACK for class 8 to be the
+// class that reaches it, and sixteen simultaneously-live values cannot all sit
+// in the callee-saved file (ten on arm64, five on x64), so at least six are
+// spilled by any register allocator. One payload could have been kept in a
+// register for its whole life and proven nothing.
+const M_CLS8 = 1016
+const CLS8_COUNT = 16
 
 // A word inside `[0, ctxWords)` that is none of `ctxSp`/`ctxPc` — those two
 // carry a live stack/code address on a REAL parked task and using either
@@ -283,6 +297,9 @@ function main() {
   // Phase G's task and its (deliberately unused) stack — see phase G below.
   let ctxTask = []i64(taskWords)
   let ctxStack = []i64(TASK_STACK_WORDS)
+  // Phase H's task. It has NO stack array of its own, and that is the whole
+  // point — see phase H.
+  let cls8Task = []i64(taskWords)
 
   // Phase D's task. Its stack is exactly `chanScratchWords` words, so the whole
   // scratch area is mapped and the scan's `min(chanScratchWords, stackBytes/8)`
@@ -613,11 +630,137 @@ function main() {
   stwPoll(snap)
   print("G ran=${gcStatCollections(g) > cG} ctx=${alive(g, pCtx, M_CTX)} dead=${gcOwns(g, pCtxDead)} abandoned=${stwAbandonedCount()}\n")
 
+  // ---- phase H: ROOT CLASS 8, the RUNNING task's own stack (#1832) ---------
+  //
+  // Every phase above FABRICATES its task: a module-level `[]i64` stands in for
+  // a stack and the phase writes its payload into a known slot of it. THAT
+  // CANNOT WORK HERE. Class 8 fires only for the task holding the REAL stack
+  // pointer (`stwTaskHoldsSp`), and a fabricated stack never does — module data
+  // sits far below the stack in the address space, so no `[stackBase, +bytes)`
+  // range can contain both a module array and `sp`.
+  //
+  // Bit also has no stack-allocated aggregate to plant into: `[]i64(n)` is a
+  // heap slice and a module fixed array is `__DATA`, so there is no way to place
+  // a word at a chosen address on the running stack.
+  //
+  // So this phase does the opposite of fabricate. It COPIES the real stack's
+  // bounds off the live current task, registers them on its own task block, and
+  // lets the COMPILER place the payloads — which is exactly the shape of the
+  // defect: `bit_rt_chan_send` holds the element it is about to store as a bare
+  // `int`, because E0079 forbids a pinned symbol naming a managed type, and a
+  // stack map names only reference-typed slots.
+  //
+  // Why sixteen payloads: a raw `int` held across the `stwPoll` call must live
+  // either in a callee-saved register or in a stack slot. Sixteen simultaneously
+  // live values cannot all be in the callee-saved file (ten on arm64, five on
+  // x64), so any allocator spills at least six to the stack, where class 8 is
+  // the only enumerated class that reaches them. A single payload could have
+  // spent its whole life in a register and proven nothing.
+  //
+  // Every other class is empty for this task BY CONSTRUCTION, so the assertion
+  // cannot be carried by one of them: `arg` is 0 (class 5); `ctxSp` is the TOP
+  // of the stack, so class 4's `[ctxSp, top)` range is empty; `running` is true,
+  // so class 7's ctx scan is skipped; class 6's scratch scan reads the real
+  // stack's lowest 265 words, thousands of words BELOW `sp` and below anything
+  // a live frame occupies; and `snap` carries `ret = 0` so class 2 returns
+  // before walking. Deleting class 8's `lo = sp` reverts the range to
+  // `[ctxSp, top)` — empty — and must redden THIS phase alone.
+  //
+  // `schedCurrentTask()` is 0 when no green task owns this stack, which is the
+  // case against a Zig-sourced `libbitrt.a`. Reported rather than skipped
+  // silently, so the phase can never read as green while asserting nothing.
+  let curTask = schedCurrentTask()
+  let onTask = curTask != 0
+  let cls8Alive = 0
+  let cls8Dead = 0
+  if (onTask) {
+    let real = taskAt(curTask)
+    let ht = ptrOf(cls8Task)
+    *(ht + taskArg) = 0
+    *(ht + taskState) = taskParked
+    *(ht + taskStackBase) = *(real + taskStackBase)
+    *(ht + taskStackBytes) = *(real + taskStackBytes)
+    *(ht + ctxSp) = *(real + taskStackBase) + *(real + taskStackBytes)
+    *(ht + taskRegNext) = 0
+    *(ptrOf(schedBlock) + scRegHead) = int(ht)
+
+    // A control object allocated and then dropped, so this phase also shows the
+    // collector still SWEEPS — a class-8 scan that marked the whole stack
+    // indiscriminately would keep this too and the phase would pass for the
+    // wrong reason.
+    let pGone = gcAlloc(g, nodeInfo)
+    storeWord(pGone, M_CLS8 + 1)
+    let gone = pGone
+
+    let p0 = gcAlloc(g, nodeInfo)
+    let p1 = gcAlloc(g, nodeInfo)
+    let p2 = gcAlloc(g, nodeInfo)
+    let p3 = gcAlloc(g, nodeInfo)
+    let p4 = gcAlloc(g, nodeInfo)
+    let p5 = gcAlloc(g, nodeInfo)
+    let p6 = gcAlloc(g, nodeInfo)
+    let p7 = gcAlloc(g, nodeInfo)
+    let p8 = gcAlloc(g, nodeInfo)
+    let p9 = gcAlloc(g, nodeInfo)
+    let p10 = gcAlloc(g, nodeInfo)
+    let p11 = gcAlloc(g, nodeInfo)
+    let p12 = gcAlloc(g, nodeInfo)
+    let p13 = gcAlloc(g, nodeInfo)
+    let p14 = gcAlloc(g, nodeInfo)
+    let p15 = gcAlloc(g, nodeInfo)
+    storeWord(p0, M_CLS8)
+    storeWord(p1, M_CLS8)
+    storeWord(p2, M_CLS8)
+    storeWord(p3, M_CLS8)
+    storeWord(p4, M_CLS8)
+    storeWord(p5, M_CLS8)
+    storeWord(p6, M_CLS8)
+    storeWord(p7, M_CLS8)
+    storeWord(p8, M_CLS8)
+    storeWord(p9, M_CLS8)
+    storeWord(p10, M_CLS8)
+    storeWord(p11, M_CLS8)
+    storeWord(p12, M_CLS8)
+    storeWord(p13, M_CLS8)
+    storeWord(p14, M_CLS8)
+    storeWord(p15, M_CLS8)
+
+    storeWord(snap + 0, 0)
+    storeWord(snap + 8, 0)
+    let cH = gcStatCollections(g)
+    stwPoll(snap)
+    let ranH = gcStatCollections(g) > cH
+
+    // Counted, not `&&`-ed: the count is what distinguishes "class 8 reaches the
+    // spilled slots" from "the allocator happened to keep them all in registers".
+    if (alive(g, p0, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p1, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p2, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p3, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p4, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p5, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p6, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p7, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p8, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p9, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p10, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p11, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p12, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p13, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p14, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (alive(g, p15, M_CLS8)) { cls8Alive = cls8Alive + 1 }
+    if (gcOwns(g, gone)) { cls8Dead = 1 }
+    print("H ran=${ranH} onTask=true alive=${cls8Alive}/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
+  }
+  if (!onTask) {
+    print("H ran=false onTask=false alive=0/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
+  }
+
   // Hold every backing slice to the end of `main`, so only raw untraced pointers
   // ever reach the collector under test and the LIVE (libbitrt) collector cannot
   // move the ground under it when the suite reruns under BIT_GC=stress.
   print("held ${len(arena) + len(indexArena) + len(heapBlock) + len(heapLock) + len(state) + len(meta)}\n")
   print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(longTask) + len(longStack) + len(frameBuf) + len(snapBuf)}\n")
   print("held ${len(scratchTask) + len(scratchStack) + len(parkFrame) + len(parkSnap)}\n")
-  print("held ${len(ctxTask) + len(ctxStack)}\n")
+  print("held ${len(ctxTask) + len(ctxStack) + len(cls8Task)}\n")
 }
