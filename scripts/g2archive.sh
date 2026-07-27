@@ -95,13 +95,21 @@ if [ "$LEFT" != "0" ]; then
   exit 1
 fi
 
-# --- Module set: 14 platform-free dirs + 7 platform-specific pairs (21 total). ---
+# --- Module set: 15 platform-free dirs + 7 platform-specific pairs (22 total). ---
 # Matches tests/rootpins.zig's module split and the module set the G3 (#1584)
 # attempts converged on. Each entry is REL (module directory relative to $RT,
 # empty string for $RT itself) and LABEL (the archive-member-friendly name,
 # matching the "runtime_alloc.o" / "runtime_root_darwin.o" shape prior
 # sessions' `ar t` output showed).
-PLATFORM_FREE_RELS="- alloc auxv chan gc net park rand root sched shims shims/scan stw thread"
+#
+# This list is HAND-MAINTAINED and the completeness check below is why it is
+# safe to be: `runtime/cryptohw` was added to the tree after G3 was first
+# written and silently never reached the archive, because nothing compared the
+# list against the directories that actually exist. It surfaced only because
+# stdlib/crypto declares those symbols `extern` and E0078 caught the dangling
+# reference — a module nothing externs would simply have been absent, with
+# every gate green.
+PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw thread"
 PLATFORM_PAIRS="alloc net park rand root sched thread"
 
 REL_LIST=()
@@ -119,6 +127,33 @@ for p in $PLATFORM_PAIRS; do
   REL_LIST+=("$p/$PLAT")
   LABEL_LIST+=("runtime_${p}_${PLAT}")
 done
+
+# --- Completeness: every module directory in runtime/ must be in the list. ---
+# A Bit module is a DIRECTORY of .bit files, so the set of modules is exactly the
+# set of directories holding one. Anything present on disk but missing from the
+# list above is silently left out of the archive; anything in the list but absent
+# on disk is a typo that would abort the emit loop anyway, but is named here
+# because the message is clearer before 22 compiles than during them. The other
+# platform's directories are excluded, not missing: only $PLAT's providers belong
+# in this target's archive.
+OTHER_PLAT=linux
+[ "$PLAT" = linux ] && OTHER_PLAT=darwin
+
+on_disk=$(cd "$RT" && find . -name '*.bit' -exec dirname {} \; \
+  | sed 's|^\./||; s|^\.$|-|' | grep -v "/${OTHER_PLAT}\$" | sort -u)
+listed=$(printf '%s\n' "${REL_LIST[@]}" | sed 's|^$|-|' | sort -u)
+
+missing=$(comm -23 <(printf '%s\n' "$on_disk") <(printf '%s\n' "$listed"))
+extra=$(comm -13 <(printf '%s\n' "$on_disk") <(printf '%s\n' "$listed"))
+if [ -n "$missing" ] || [ -n "$extra" ]; then
+  echo "g2archive: the module list does not match runtime/ for $TARGET." >&2
+  [ -n "$missing" ] && echo "  on disk but NOT in the archive (would be silently absent):" >&2 &&
+    printf '    runtime/%s\n' $missing >&2
+  [ -n "$extra" ] && echo "  in the list but NOT on disk:" >&2 &&
+    printf '    runtime/%s\n' $extra >&2
+  echo "  Fix PLATFORM_FREE_RELS / PLATFORM_PAIRS above." >&2
+  exit 1
+fi
 
 OBJDIR="$SCRATCH/obj"
 mkdir -p "$OBJDIR"
