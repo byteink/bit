@@ -188,13 +188,33 @@ const edges = [_]Edge{
     // atom that carries it: `stwSafepoint` is a pure forward and `stwPoll` is
     // separately pinned, so the registration edge survives there and not in the
     // caller. Deleting `worldEnsureSelf` from the poll reddens this.
+    // Two edges, because #1836 split the poll in two: `stwPoll` reads the
+    // process-global bindings and forwards to `stwPollOn`, which takes all four
+    // as parameters so a program can drive a PRIVATE collector without calling
+    // `stwBind`/`worldBind` and replacing the live runtime's bindings for every
+    // thread. The registration property is unchanged and still one property —
+    // it just now needs both hops asserted, because checking only the first
+    // would pass over a `stwPollOn` that never registers, and checking only the
+    // second would pass over a `stwPoll` that never forwards.
     .{
         .path = "runtime/stw",
         .target = .aarch64_macos,
         .from = "bit_rt_port_stw_poll",
-        // `worldEnsureSelf` inlines into the poll, so the edge that survives
-        // into the object names the registration door it forwards to.
-        .to = "bit_rt_port_gc_current_mutator",
+        .to = "bit_rt_port_stw_poll_on",
+        .why = "the global-binding poll must forward to the explicit-binding one, " ++
+            "or the live safepoint path silently stops registering and collecting (#1836)",
+    },
+    .{
+        .path = "runtime/stw",
+        .target = .aarch64_macos,
+        .from = "bit_rt_port_stw_poll_on",
+        // BOTH wrappers inline into the poll — `worldEnsureSelfOn` forwards to
+        // `currentMutatorOn`, which forwards to `mutatorSlot` — so the edge that
+        // actually survives into the object names the pinned body at the end of
+        // that chain, not either forwarder. Verified with `nm -u` on the emitted
+        // object rather than reasoned about; the two forwarders leave no
+        // relocation at all.
+        .to = "bit_rt_port_gc_mutator_slot",
         .why = "the poll must reach the mutator registration door on EVERY thread " ++
             "that polls, or a thread is invisible to both the rendezvous and the " ++
             "root scan and its live references are swept (#1650)",

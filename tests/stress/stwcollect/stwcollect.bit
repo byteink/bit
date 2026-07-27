@@ -101,9 +101,9 @@ import { spinUnlocked } from "../../../runtime"
 import { heapInit, heapWords } from "../../../runtime/alloc"
 import { gcInit, gcConfigure, gcAlloc, gcOwns, gcNumObjects, gcStatCollections } from "../../../runtime/gc"
 import { gcWords, gcBindMemory, storeWord, loadWord, loadByte, reserveWords } from "../../../runtime/gc"
-import { worldBind, worldWords, worldClaim, worldRelease, maxMutators, mParked } from "../../../runtime/gc"
+import { worldWords, worldClaim, worldRelease, maxMutators, mParked } from "../../../runtime/gc"
 import { rtChanMake, chanBootBind, chanRegWords } from "../../../runtime/chan"
-import { stwBind, stwPoll, stwAbandonedCount, stwBadOffsets } from "../../../runtime/stw"
+import { stwPollOn, stwAbandonedCount, stwBadOffsetsOn } from "../../../runtime/stw"
 import { schedWords, scRegHead, taskWords, taskArg, taskState, taskParked } from "../../../runtime/sched"
 import { schedCurrentTask, taskAt } from "../../../runtime/sched"
 import { taskStackBase, taskStackBytes, ctxSp, ctxWords, taskRegNext } from "../../../runtime/sched"
@@ -203,8 +203,6 @@ const M_CTX_DEAD = 1015
 // register for its whole life and proven nothing.
 const M_CLS8 = 1016
 const CLS8_COUNT = 16
-// Retry bound for `pollUntilE` — an abandoned rendezvous costs only a re-poll.
-const POLL_TRIES = 4096
 
 // A word inside `[0, ctxWords)` that is none of `ctxSp`/`ctxPc` — those two
 // carry a live stack/code address on a REAL parked task and using either
@@ -257,91 +255,6 @@ function i32At(a: int): int {
 
 // Still owned by `g` AND still carrying its marker: a swept-and-reused slot is
 // owned again but reads back the wrong word, so both halves are needed.
-// Is the abandoned-collection count EXPLAINABLE (#1833)?
-//
-// `abandoned` counts stop-the-world rendezvous that expired. This program used
-// to assert it stayed literally 0, and that assertion is sound only while this
-// program owns every mutator in the world it collects. It stopped being sound
-// the moment `libbitrt.a` became Bit-sourced.
-//
-// `worldBind`/`stwBind` set PROCESS-GLOBAL bindings — `gcworldsync.bit`'s
-// `worldAddr` is one word of module state — and the live runtime binds them at
-// boot (`runtime/root/<os>/boot.bit` calls `stwBind(rootGcAddr(), sched,
-// chanRegBlock, rootWorldAddr())`). When this program rebinds them to its own
-// blocks it REPLACES those bindings for the whole process, so every
-// `bit_rt_safepoint` the live runtime's worker OS thread takes enters `stwPoll`
-// against THIS world and claims a slot in it — a mutator this program never
-// created and cannot schedule. Measured: a `maxMutators` scan reports 2 claimed
-// slots at phase D where this program has registered exactly 1.
-//
-// A rendezvous waiting on that worker legitimately expires; it is in the
-// scheduler's backoff loop or a syscall and does not re-poll inside the bound.
-// Abandoning is the SAFE outcome by `stw.bit`'s own rule — skipping a collection
-// costs heap growth, collecting while a mutator runs costs correctness — so this
-// is not a collector defect and must not be "fixed" by widening the bound.
-//
-// The oracle therefore keeps its teeth exactly where it still has them. With no
-// foreign mutator — the case against a Zig-sourced archive, where the live
-// runtime is `root.zig`'s and never touches this world — `abandoned` must still
-// be 0. With one present, a non-zero count is explained rather than asserted
-// away. The printed token is the same either way, so one `.expected` covers both
-// archives.
-//
-// DO NOT "fix" the abandons by retrying the poll until a collection lands. That
-// was tried and is WORSE: `pollUntil` returns as soon as the collection COUNTER
-// moves, and the collection that moved it may have been the foreign worker's —
-// performed on ITS stack, so class 8 scans its frames and not this program's.
-// Phase H went from a stable 16/16 to flipping 16/16 / 0/16 / 0/16 across runs.
-// The single poll below is deterministic: measured 8 consecutive runs, every
-// phase byte-identical. The residual question that experiment exposed — whether
-// class 8 must cover every stopped mutator's stack rather than only the
-// collector's — is #1834, and it is a runtime question, not this file's.
-// LOOP-FREE ON PURPOSE. The first version of this scanned the world block for
-// claimed slots — and a `while` here is a back-edge, which codegen turns into a
-// `bit_rt_safepoint` call, which is another `stwPoll`. Merely OBSERVING the
-// world moved when collections fired: the output went from byte-identical over 8
-// runs to three distinct results over 5, with phase E flipping to `ran=false`.
-// A probe that perturbs the thing it measures is worse than no probe.
-//
-// `schedCurrentTask() != 0` answers the same question without a loop. It is
-// non-zero exactly when this program is running as a green task of a LIVE Bit
-// scheduler — which is precisely the condition under which that scheduler's
-// worker OS thread exists, takes safepoints, and can claim a slot in the world
-// this program rebound. Against a Zig-sourced archive it is 0, no foreign
-// mutator can exist, and the strict `abandoned == 0` assertion still applies.
-// Retry phase E's poll until a collection actually runs, bounded.
-//
-// ONLY phase E, and the asymmetry is the point. A foreign mutator (see
-// `abandonOk`) can make any single `stwPoll` abandon, and phase E was measured
-// flipping to `ran=false missed=true` on roughly one run in eight. Its payload
-// lives on a synthetic PARKED task's stack, which every collector scans through
-// classes 3/4 regardless of which thread is collecting — so a retry that is
-// satisfied by the foreign worker's collection is still a correct proof for E.
-//
-// Phase H must NOT use this. Its payloads are raw `int`s on the RUNNING stack,
-// reachable only through class 8, which scans the COLLECTING thread's stack —
-// so a retry satisfied by the foreign worker's collection proves nothing and
-// sweeps them instead. Measured: H went from a stable 16/16 to flipping
-// 16/16 / 0/16 / 0/16 when this was applied to every phase. That asymmetry is
-// #1834.
-function pollUntilE(g: *i64, snap: int, before: int) {
-  let tries = 0
-  while (tries < POLL_TRIES) {
-    stwPoll(snap)
-    if (gcStatCollections(g) > before) {
-      return
-    }
-    tries = tries + 1
-  }
-}
-
-function abandonOk(): bool {
-  if (stwAbandonedCount() == 0) {
-    return true
-  }
-  return schedCurrentTask() != 0
-}
-
 function alive(g: *i64, p: int, marker: int): bool {
   if (!gcOwns(g, p)) {
     return false
@@ -434,10 +347,8 @@ function main() {
   // half enumerates roots from. `stwBind` is all-or-nothing by design: with any
   // one of them 0 the poll refuses to collect rather than collecting with a
   // smaller root set.
-  worldBind(int(ptrOf(worldBlock)))
   chanBootBind(int(ptrOf(reserveDesc)), int(ptrOf(chanReserve)), CHAN_RESERVE_WORDS * 8,
                int(ptrOf(regBlock)), int(ptrOf(schedBlock)))
-  stwBind(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)))
 
   // ROOT CLASS 1: a buffered `is_ref` channel, built by the shipped constructor
   // so the registry entry is the real one.
@@ -499,15 +410,15 @@ function main() {
   let snap = int(ptrOf(snapBuf))
   storeWord(snap + 0, 0)
   storeWord(snap + 8, 0)
-  stwPoll(snap)
-  print("A ran=${gcStatCollections(g) > 0} chan=${alive(g, pChan, M_CHAN)} arg=${alive(g, pArg, M_ARG)} stack=${alive(g, pStack, M_STACK)} dead=${gcOwns(g, pDead)} abandonOk=${abandonOk()}\n")
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("A ran=${gcStatCollections(g) > 0} chan=${alive(g, pChan, M_CHAN)} arg=${alive(g, pArg, M_ARG)} stack=${alive(g, pStack, M_STACK)} dead=${gcOwns(g, pDead)} abandoned=${stwAbandonedCount()}\n")
 
   // ---- phase B: drop every root, poll again, everything goes --------------
   storeWord(handle + CH_COUNT * 8, 0)
   *(t + taskArg) = 0
   longStack[LONG_STACK_SLOT] = 0
   let cB = gcStatCollections(g)
-  stwPoll(snap)
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
   print("B ran=${gcStatCollections(g) > cB} chan=${gcOwns(g, pChan)} arg=${gcOwns(g, pArg)} stack=${gcOwns(g, pStack)} live=${gcNumObjects(g)}\n")
 
   // ---- phase C: ROOT CLASS 2, the precise stack-map walk over THIS thread's
@@ -558,7 +469,7 @@ function main() {
   storeWord(snap + 0, hitPc)       // ret: the safepoint this stack map describes
   storeWord(snap + 8, fp)          // fp: the synthetic frame above
   let cC = gcStatCollections(g)
-  stwPoll(snap)
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
   print("C ran=${gcStatCollections(g) > cC} found=${hitPc != 0} precise=${alive(g, pPrecise, M_PRECISE)} missed=${gcOwns(g, pMissed)}\n")
 
   // ---- phase D: ROOT CLASS 6, the per-task SCRATCH area (#1679) ------------
@@ -607,8 +518,8 @@ function main() {
   storeWord(snap + 0, 0)
   storeWord(snap + 8, 0)
   let cD = gcStatCollections(g)
-  stwPoll(snap)
-  print("D ran=${gcStatCollections(g) > cD} elem=${alive(g, pElem, M_SCR_ELEM)} err=${alive(g, pErr, M_SCR_ERR)} last=${alive(g, pLast, M_SCR_LAST)} dead=${gcOwns(g, pScrDead)} abandonOk=${abandonOk()}\n")
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("D ran=${gcStatCollections(g) > cD} elem=${alive(g, pElem, M_SCR_ELEM)} err=${alive(g, pErr, M_SCR_ERR)} last=${alive(g, pLast, M_SCR_LAST)} dead=${gcOwns(g, pScrDead)} abandoned=${stwAbandonedCount()}\n")
 
   // ---- phase E: ROOT CLASS 3, another stopped OS thread's PARKED FRAME -----
   //
@@ -651,8 +562,8 @@ function main() {
   worldBlock[slot * MU_WORDS + MU_STATE] = mParked
 
   let cE = gcStatCollections(g)
-  pollUntilE(g, snap, cE)
-  print("E ran=${gcStatCollections(g) > cE} other=${slot > 0} parked=${alive(g, pPark, M_PARKED)} missed=${gcOwns(g, pParkDead)} abandonOk=${abandonOk()}\n")
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("E ran=${gcStatCollections(g) > cE} other=${slot > 0} parked=${alive(g, pPark, M_PARKED)} missed=${gcOwns(g, pParkDead)} abandoned=${stwAbandonedCount()}\n")
   // RELEASED IMMEDIATELY, and it must be: the slot stays `parked` with a now
   // stale `acked`, so leaving it registered would make every later rendezvous
   // spin to its bound and abandon.
@@ -665,19 +576,23 @@ function main() {
   // reading out of bounds. Until #1682 no linked binary could report it, so a
   // degraded trace (fields skipped, referents unmarked, live objects swept)
   // read exactly like a healthy one. The `BIT_GC_STATS` line now carries it,
-  // through `stwBadOffsets` — the SAME bound-block accessor read here, so this
-  // is the field's value and not a parallel path.
+  // through `stwBadOffsets` — and `stwBadOffsetsOn` read here is that same
+  // accessor over THIS program's collector rather than the process-global one,
+  // so it is still the field's value and not a parallel path. Reading the
+  // global form here silently reported the LIVE runtime's counter instead
+  // (#1836): `bad=` went false while the malformed TypeInfo was traced
+  // correctly in this program's own collector.
   //
   // An always-zero field would be worse than none, which is what the two halves
   // below assert: 0 across five clean collections, and non-zero the moment one
   // malformed `TypeInfo` is traced.
-  let bad0 = stwBadOffsets()
+  let bad0 = stwBadOffsetsOn(int(g))
   let pBad = gcAlloc(g, badInfo)
   storeWord(pBad, M_BADMAP)
   scratchStack[scrElem] = pBad
   let cF = gcStatCollections(g)
-  stwPoll(snap)
-  print("F ran=${gcStatCollections(g) > cF} clean=${bad0} bad=${stwBadOffsets() > 0} alive=${alive(g, pBad, M_BADMAP)}\n")
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("F ran=${gcStatCollections(g) > cF} clean=${bad0} bad=${stwBadOffsetsOn(int(g)) > 0} alive=${alive(g, pBad, M_BADMAP)}\n")
 
   // ---- phase G: ROOT CLASS 7, a parked task's own saved register file (#1742)
   //
@@ -714,8 +629,8 @@ function main() {
   storeWord(snap + 0, 0)
   storeWord(snap + 8, 0)
   let cG = gcStatCollections(g)
-  stwPoll(snap)
-  print("G ran=${gcStatCollections(g) > cG} ctx=${alive(g, pCtx, M_CTX)} dead=${gcOwns(g, pCtxDead)} abandonOk=${abandonOk()}\n")
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("G ran=${gcStatCollections(g) > cG} ctx=${alive(g, pCtx, M_CTX)} dead=${gcOwns(g, pCtxDead)} abandoned=${stwAbandonedCount()}\n")
 
   // ---- phase H: ROOT CLASS 8, the RUNNING task's own stack (#1832) ---------
   //
@@ -815,7 +730,7 @@ function main() {
     storeWord(snap + 0, 0)
     storeWord(snap + 8, 0)
     let cH = gcStatCollections(g)
-    stwPoll(snap)
+    stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
     let ranH = gcStatCollections(g) > cH
 
     // Counted, not `&&`-ed: the count is what distinguishes "class 8 reaches the
@@ -837,10 +752,10 @@ function main() {
     if (alive(g, p14, M_CLS8)) { cls8Alive = cls8Alive + 1 }
     if (alive(g, p15, M_CLS8)) { cls8Alive = cls8Alive + 1 }
     if (gcOwns(g, gone)) { cls8Dead = 1 }
-    print("H ran=${ranH} onTask=true alive=${cls8Alive}/${CLS8_COUNT} abandonOk=${abandonOk()}\n")
+    print("H ran=${ranH} onTask=true alive=${cls8Alive}/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
   }
   if (!onTask) {
-    print("H ran=false onTask=false alive=0/${CLS8_COUNT} abandonOk=${abandonOk()}\n")
+    print("H ran=false onTask=false alive=0/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
   }
 
   // Hold every backing slice to the end of `main`, so only raw untraced pointers

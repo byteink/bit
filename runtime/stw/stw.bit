@@ -154,6 +154,7 @@
 
 import { worldPark, worldRendezvous, worldRestart } from "../gc"
 import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
+import { worldEnsureSelfOn } from "../gc"
 import { worldEnsureSelf, maxMutators } from "../gc"
 import { gcShouldCollect, gcMarkBegin, gcCollectFinish } from "../gc"
 import { gcStatCollections, gcStatTotalSwept, gcNumObjects, gcStatBadOffsets } from "../gc"
@@ -296,10 +297,20 @@ export @nosplit @symbol("bit_rt_port_stw_live_objects") function stwLiveObjects(
 // object gains no reference to `runtime/gc`'s private heap block — the trap
 // recorded on `stwLiveObjects` above.
 export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets(): int {
-  if (gcAddr == 0) {
+  return stwBadOffsetsOn(gcAddr)
+}
+
+// The same read over a caller-supplied collector block (#1836), for a program
+// driving a private one. Without it such a program reads the LIVE runtime's
+// counter through this accessor and its assertion is vacuous — measured:
+// `tests/stress/stwcollect` phase F went `bad=true` -> `bad=false` the moment it
+// stopped calling `stwBind`, because `gcAddr` was then the live collector's and
+// the malformed TypeInfo it had just traced was in its own.
+export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsetsOn(gcA: int): int {
+  if (gcA == 0) {
     return 0
   }
-  return gcStatBadOffsets(wordAt(gcAddr))
+  return gcStatBadOffsets(wordAt(gcA))
 }
 
 // Whether a collection is even permissible: every root source must be
@@ -517,11 +528,11 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
 // `gcMarkBegin` .. `gcCollectFinish` is `gc.zig`'s `collect` with the root
 // callback inverted (`../gc/gccollect.bit` deviation 2) — everything between the
 // two is the root enumeration, in `root.zig`'s `scanRoots` order.
-@nosplit function stwCollect(g: *i64, world: *i64, selfSlot: int, snap: int) {
+@nosplit function stwCollect(g: *i64, world: *i64, selfSlot: int, snap: int, sched: int, chanReg: int) {
   gcMarkBegin(g)
 
   // 1. Buffered `is_ref` channel elements (§11).
-  chanScanRegistryRoots(g, wordAt(chanRegAddr))
+  chanScanRegistryRoots(g, wordAt(chanReg))
 
   // 2. This thread's own frames, precisely (§4).
   gcScanSnapshot(g, snap)
@@ -540,7 +551,7 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
   }
 
   // 4 + 5. Every other task's stack, conservatively, and every task's `arg`.
-  stwScanTasks(g, taskAt(schedAddr))
+  stwScanTasks(g, taskAt(sched))
 
   gcCollectFinish(g)
 }
@@ -574,17 +585,42 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets") function stwBadOffsets():
 //
 // `@nosplit` is REQUIRED, not stylistic — see the pin-cycle note above.
 export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
+  stwPollOn(gcAddr, schedAddr, chanRegAddr, worldAddr, snap)
+}
+
+// The same poll over CALLER-SUPPLIED bindings (#1836).
+//
+// The live path above must read module state: the safepoint shim is `@naked` and
+// calls this with nothing but a snapshot, so there is nowhere else for the four
+// addresses to come from. A program driving a PRIVATE collector has no such
+// constraint, and calling `stwBind`/`worldBind` to get one is not "private" at
+// all — those set process-wide bindings, so it replaces the live runtime's for
+// every thread. `tests/stress/stwcollect` did exactly that and the live worker
+// joined the test's registry as a mutator the test never created and could not
+// schedule; the rendezvous waited on it and abandoned (#1833).
+//
+// This is the line Go draws too. Components owning process-global state are
+// tested against the live runtime; components taking their state as a parameter
+// get real private instances, and those never write the global — `NewPageAlloc`
+// is handed `new(mutex)` and its own stats (`src/runtime/export_test.go`). Go
+// has no way to disable runtime startup at all, which is why the alternative of
+// an env-gated inert mode was rejected.
+//
+// Every binding is a parameter, including the World, so a caller can hold one
+// the live runtime has never heard of.
+export @nosplit @symbol("bit_rt_port_stw_poll_on")
+function stwPollOn(gcA: int, schedA: int, chanRegA: int, worldA: int, snap: int) {
   // Registers this thread if it has not registered yet, and parks it there if a
   // stop is already pending. Publishes the REAL snapshot: `root.zig`'s
   // `currentMutator` passes 0 from the allocation door (runtime code, no stack
   // map) but its real frame from the safepoint door, and parking with 0 would
   // hide exactly the references this poll's stack map names.
-  let mu = worldEnsureSelf(snap)
+  let mu = worldEnsureSelfOn(worldA, snap)
 
   // Inlined `worldBlockAddr` + `wordAt` (#1700): `worldAddr` is this module's
   // own cache (`stwBind`'s 4th param), so this is a plain load instead of a
   // cross-module call.
-  let waddr = worldAddr
+  let waddr = worldA
   if (waddr == 0) {
     return    // pre-boot: `worldBind` has not run, so there is no registry yet
   }
@@ -606,17 +642,17 @@ export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
 
   // MUST MIRROR the former `stwCanCollect` (see its note above) — inlined for
   // the same reason.
-  if (gcAddr == 0) {
+  if (gcA == 0) {
     return
   }
-  if (schedAddr == 0) {
+  if (schedA == 0) {
     return
   }
-  if (chanRegAddr == 0) {
+  if (chanRegA == 0) {
     return
   }
   let gNil: *i64 = nil
-  let g = gNil + (gcAddr / 8)
+  let g = gNil + (gcA / 8)
 
   // MUST MIRROR `gcShouldCollect` (../gc/gccollect.bit) — inlined for the same
   // reason. DRIFT HERE SILENTLY DISABLES COLLECTION: keep this predicate
@@ -651,7 +687,7 @@ export @nosplit @symbol("bit_rt_port_stw_poll") function stwPoll(snap: int) {
   // everything we were about to collect for.
   if (gcShouldCollect(g)) {
     if (worldRendezvous(world, selfSlot)) {
-      stwCollect(g, world, selfSlot, snap)
+      stwCollect(g, world, selfSlot, snap, schedA, chanRegA)
     } else {
       // Could not stop the world within the bound. ABANDON — never force.
       // Skipping a collection only costs heap growth; collecting while a mutator
