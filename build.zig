@@ -637,30 +637,9 @@ pub fn build(b: *std.Build) void {
     // pulls in the Bit runtime lock from `runtime/` rather than copying it.
     stress_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
 
-    const stress_mod = b.createModule(.{
-        .root_source_file = b.path("tests/stress.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    stress_mod.addImport("bit", exe.root_module);
-    stress_mod.addOptions("build_options", stress_opts);
-
-    const stress_tests = b.addTest(.{ .root_module = stress_mod });
-    const stress_run = b.addRunArtifact(stress_tests);
-    // The `tests/stress/*` programs are read at runtime, so a new program is
-    // invisible to the build cache — same reason the imports harness sets this.
-    // It matters more now that the run also drives the self-hosted `bit`, whose
-    // sources are equally invisible: a cache-skipped run would quietly stop
-    // checking the compiler this pass exists to check.
-    stress_run.has_side_effects = true;
-    test_step.dependOn(&stress_run.step);
-
-    // Scoped runner, same rationale as `test-imports`: this corpus now builds
-    // every program with both compilers, making it the slowest harness here and
-    // the one most worth running alone while chasing a self-hosted build failure.
-    const test_stress_step = b.step("test-stress", "run the tests/stress/* harness only");
-    test_stress_step.dependOn(&stress_run.step);
-    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
+    // tests/stress.zig is RETIRED (#1591); the harness is now
+    // tests/bit/stress.bit, wired at the tail. `stress_opts` outlives it
+    // because tests/gcdiff.zig still reads the same stress_dir/stdlib_dir.
 
     // GC differential (#1363): drives runtime/gc.zig through the same scripted
     // sequence tests/stress/gcbit drives runtime/gc/gc.bit through, and asserts
@@ -1038,6 +1017,12 @@ pub fn build(b: *std.Build) void {
 
     const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (compiler/) with the seed bit-seed → bit");
     var selfhosted: std.Build.LazyPath = undefined;
+    // Exposed so a gate that READS `zig-out/bin/bit` off disk (rather than
+    // taking it as a LazyPath arg) can depend on the install and stop racing
+    // it. tests/bit/stress.bit is the case: it copies the compiler out of
+    // zig-out to get a private one, and a copy taken mid-publish yields a
+    // truncated binary — #1644's hazard, one step earlier than #1644 found it.
+    var selfhost_install_step: ?*std.Build.Step = null;
 
     if (selfhost_skip) {
         // Fingerprint unchanged and the previously-built `bit` is still on
@@ -1084,6 +1069,7 @@ pub fn build(b: *std.Build) void {
         // Only pull `bit` into the default install on a native build (see above).
         if (native) b.getInstallStep().dependOn(&install_bit.step);
         selfhost_step.dependOn(&install_bit.step);
+        selfhost_install_step = &install_bit.step;
 
         // Only reached once the rebuild above succeeded, so a stamp is never
         // written for a failed or partial build.
@@ -1117,7 +1103,6 @@ pub fn build(b: *std.Build) void {
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
     if (native) {
-        stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
         // #1484: the imports harness drove the SEED only, so #1483 (an entire
         // stdlib module the self-hosted `bit` could not lower) stayed green
@@ -1126,7 +1111,6 @@ pub fn build(b: *std.Build) void {
         diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
         version_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
-        stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
         imports_opts.addOption([]const u8, "selfhost_bit", "");
         diffimports_opts.addOption([]const u8, "selfhost_bit", "");
@@ -1299,6 +1283,31 @@ pub fn build(b: *std.Build) void {
     imports_bit.has_side_effects = true;
     imports_bit.expectExitCode(0);
     addNamedRun(b, imports_bit, "test-imports-bit", "run the Bit import-resolution gate (selfhost half only)");
+
+    // Concurrency + GC stress corpus (#350), replacing tests/stress.zig.
+    //
+    // ONE THING IS DELIBERATELY LOST: the Zig harness built every program with
+    // BOTH compilers, 78 programs x 2 compilers x 2 GC policies = 312 runs. This
+    // drives only the shipped `bit`, so 156. The seed pass is dropped, not
+    // ported — the seed is the retiring bootstrap oracle and `bit` is what ships,
+    // so a stress corpus proving the seed's runtime is proving a thing that is
+    // being deleted. Recorded here because it is a coverage reduction, not a
+    // refactor, and #1593 is where the argument for it finally lands.
+    //
+    // Halving the run also matters right now: at #1849's regressed runtimes the
+    // 312-run version was tipping past its deadline under ordinary parallelism.
+    const stress_gate = addBitGate(b, selfhosted, test_step, "stress", "tests/bit/stress.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the tests/stress/* corpus (tests/bit/stress.bit) only");
+    if (host_libbitrt_install) |inst| stress_gate.step.dependOn(inst);
+    // stress.bit reads `zig-out/bin/bit` off disk to make its private copy, so
+    // it must not run while that file is still being installed. Without this the
+    // gate fails with NO harness output at all — the copy catches a partial
+    // binary — which reads exactly like the harness being broken. It is not; the
+    // same command passes standalone. This is tests/selfbin.zig's property
+    // reappearing in the Bit toolchain, which is why the class-(a) audit called
+    // that harness misclassified.
+    if (selfhost_install_step) |inst| stress_gate.step.dependOn(inst);
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
