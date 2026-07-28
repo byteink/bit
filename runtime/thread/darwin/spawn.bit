@@ -45,6 +45,126 @@ extern function pthread_join(th: i64, value: *u8): i32
 // provider is a leaf.
 function runningSentinel(): int { return 1 }
 
+// ---- the child's exit path (#1846) ---------------------------------------
+//
+// `bit_rt_gc_thread_exit` releases this OS thread's mutator slot (ABI.md §6). A
+// child that ALLOCATES claims one lazily (#1431), and a leaked slot stays
+// `running` forever — which corrupts nothing but makes every later rendezvous
+// expire, i.e. collection quietly stops. Measured here before the fix:
+// `tests/stress/gcslotexitdarwin` completed 1 collection and ABANDONED 625,
+// against 510 completed and 0 abandoned on the Zig runtime.
+//
+// THE OBLIGATION BELONGS HERE, NOT IN THE CHILD BODY, for the reason
+// ../linux/spawn.bit states at length: asking "user code that starts a raw OS
+// thread" to make the call is a rule every future caller must remember whose
+// penalty for forgetting is silent. This provider owns the child's entry, so it
+// is the one place that can discharge it unconditionally.
+//
+// WHY A TRAMPOLINE AND NOT `root.zig`'S pthread_key DESTRUCTOR. `root.zig` arms
+// a TSD destructor AT SLOT CLAIM, which is strictly stronger — it covers threads
+// this runtime never started. That is not expressible here: the claim path
+// (`../../gc`'s `currentMutatorOn`) is `@nosplit`, and `@nosplit` rejects both an
+// `extern` call and a `syscall` (E0075), so `pthread_setspecific` cannot be
+// reached from it. Arming from the PARENT in `threadStart` is not a substitute
+// either, since TSD is per-thread and would arm the parent's slot.
+//
+// THE GAP THAT LEAVES, stated rather than discovered later: a thread this
+// provider did not create still leaks its slot. Nothing in the tree creates one —
+// `threadStart`'s only caller in `runtime/` and `stdlib/` is boot's worker
+// bring-up, and `workerBody` brackets itself with `gcThreadEnter`/`gcThreadExit`
+// already — and a Bit binary embeds no foreign thread source. If one ever
+// appears, this is the comment that says what to fix.
+//
+// Declared and called directly rather than imported from `../../gc`: the live
+// registry in a normally linked program is `root.zig`'s, not the Bit module's,
+// whose `worldAddr` is bound only by `runtime/root`'s own boot. Same call and
+// same reason as ../linux/spawn.bit's.
+extern function bit_rt_gc_thread_exit()
+
+// `int` -> `*i64` and `int` -> `*byte`. A leaf may not import ../../sched's
+// `taskAt`, so the two casts are spelled here the same way it spells its one.
+@nosplit function wordsAt(addr: int): *i64 {
+  let z: *i64 = nil
+  return z + addr / 8
+}
+
+@nosplit function bytesAt(addr: int): *byte {
+  let z: *byte = nil
+  return z + addr
+}
+
+// Call the raw code address `entry` with `arg` in the first-argument register
+// (x0 / rdi) and return normally. A copy of ../../sched's `taskInvoke` for the
+// same reason and with the same encoding — `entry` is a bare code pointer, not a
+// `(code, env)` function value, so no `call_value` reaches it. `blr`/`call`
+// rather than a tail branch because the callee returns here and this thread's
+// exit path must run after it.
+@nosplit function invokeRaw(entry: int, arg: int) {
+  asm {
+    arm64 { 0xD63F0120 }        // blr x9
+    x64   { 0xFF, 0xD0 }        // call rax
+    input arm64 x9 x64 rax = entry
+    input arm64 x0 x64 rdi = arg
+    clobber arm64 { x30, memory }
+    clobber x64 { memory }
+  }
+}
+
+// `pthread_create` carries ONE `void *` to the child, and the trampoline needs
+// two words — the real entry and the real argument. They come from a fixed pool
+// rather than an allocator: a provider is a leaf with no allocator to call, and a
+// static pool keeps this off the "no unbounded allocation after startup" list.
+//
+// Two words per cell, and WORD 0 IS THE CLAIM FLAG — a cell is free exactly when
+// its entry word is 0, which no real `entryOf` ever is. That removes the third
+// word an explicit in-use flag would need and makes claiming a single CAS.
+const trampMax: int = 64
+let trampCells: [128]i64
+
+// Reserve a cell for `(start, arg)`, returning its address or 0 when the pool is
+// full. Bounded by `trampMax`.
+function trampClaim(start: int, arg: int): int {
+  let p: *i64 = ptrOf(trampCells)
+  let i = 0
+  while (i < trampMax) {
+    if (atomicCmpxchg(p + i * 2, 0, start)) {
+      // Safe unsynchronised: the CAS above makes this cell ours until the child
+      // releases it, and the child cannot run before `pthread_create`.
+      *(p + i * 2 + 1) = arg
+      return int(p) + i * 16
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Release a cell claimed for `start`. The CAS form, not a plain store, so a
+// release can never zero a cell some other thread has since claimed.
+function trampRelease(cell: int, start: int) {
+  let p = wordsAt(cell)
+  atomicCmpxchg(p, start, 0)
+}
+
+// Every OS thread this provider starts enters here, not at the caller's body.
+//
+// NOT `@nosplit`: that attribute forbids the `extern` call this exists to make.
+// The cell is released BEFORE the body runs, so a long-lived thread does not
+// hold a pool entry for its whole life and the pool bounds concurrent STARTS
+// rather than concurrent threads.
+function threadTrampoline(cell: *byte): *byte {
+  let addr = int(cell)
+  let p = wordsAt(addr)
+  let start = *p
+  let arg = *(p + 1)
+  trampRelease(addr, start)
+  invokeRaw(start, arg)
+  // The last Bit code this thread runs. After this its slot is free, so a
+  // rendezvous no longer waits on a thread that has gone.
+  bit_rt_gc_thread_exit()
+  let z: *byte = nil
+  return z
+}
+
 // Start an OS thread running `start(arg)`. Returns an opaque handle (> 0) for
 // `threadRelease`, or 0 on failure.
 //
@@ -68,12 +188,26 @@ export @symbol("bit_rt_port_thread_start") function threadStart(start: *byte, ar
   // until its deadline.
   atomicStore(done, i32(runningSentinel()))
 
+  // The child enters `threadTrampoline`, which calls `start(arg)` and then
+  // releases this thread's mutator slot (#1846). A cell carries the pair through
+  // pthread's single `void *`.
+  let cell = trampClaim(int(start), int(arg))
+  if (cell == 0) {
+    // Pool exhausted: `trampMax` starts are already in flight. Refused rather
+    // than started unwrapped, because an unwrapped child leaks its slot and the
+    // penalty for that is silent.
+    atomicStore(done, i32(0))
+    return 0
+  }
+
   let noattr: *u8 = nil
-  let rc = int(pthread_create(ptrOf(slot), noattr, start, arg))
+  let rc = int(pthread_create(ptrOf(slot), noattr, entryOf(threadTrampoline), bytesAt(cell)))
   if (rc != 0) {
     // No thread exists, so nothing will ever clear `done`. Disarm it so a
     // caller that joins anyway gets `threadJoinDone` immediately instead of
-    // waiting out a full deadline for a thread that was never created.
+    // waiting out a full deadline for a thread that was never created. The cell
+    // must go back too — no child will ever release it.
+    trampRelease(cell, int(start))
     atomicStore(done, i32(0))
     return 0
   }
