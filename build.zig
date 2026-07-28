@@ -704,24 +704,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&version_run.step);
     addNamedRun(b, version_run, "test-version", "run the `bit version` contract (tests/version.zig) only");
 
-    // `bit test` runner (#1105): discovers `test_` functions and runs each in
-    // its own process (a failed `assert` panics). Shares the host libbitrt
-    // archive wired in at the tail.
-    const testcmd_opts = b.addOptions();
-    testcmd_opts.addOption([]const u8, "testproj_dir", b.pathFromRoot("tests/testproj"));
-    testcmd_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    const testcmd_mod = b.createModule(.{
-        .root_source_file = b.path("tests/testcmd.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    testcmd_mod.addImport("bit", exe.root_module);
-    testcmd_mod.addOptions("build_options", testcmd_opts);
-
-    const testcmd_tests = b.addTest(.{ .root_module = testcmd_mod });
-    const testcmd_run = b.addRunArtifact(testcmd_tests);
-    test_step.dependOn(&testcmd_run.step);
-    addNamedRun(b, testcmd_run, "test-testcmd", "run the `bit test` runner contract (tests/testcmd.zig) only");
+    // `bit test` runner (#1105) is now compiler/testgencheck.bit's checkTestgen(),
+    // dispatched from compiler/selfcheck.bit and gated by `zig build selfhost-selfcheck`.
 
     // `bit lint` CLI contract (#1380) is now tests/bit/lintcmd.bit — see the Bit
     // gates at the tail.
@@ -848,68 +832,8 @@ pub fn build(b: *std.Build) void {
     const test_imports_step = b.step("test-imports", "run the tests/imports/* harness only (see -Dimports-filter)");
     test_imports_step.dependOn(&imports_run.step);
 
-    // Fuzz harness (task #334): lexer+parser must never crash/hang on
-    // arbitrary bytes. Two separate compilations of fuzz.zig, because
-    // `-ffuzz` instrumentation changes runtime behavior, not just codegen:
-    // `std.testing.fuzz` blocks forever waiting for the build system's fuzz
-    // coordinator whenever the module is built with `.fuzz = true`, coordinator
-    // or not. So the plain build (no `.fuzz`) is what `zig build test` runs —
-    // it just replays the seed corpus once, finite. The instrumented build
-    // only ever gets invoked as `zig build fuzz --fuzz` (or `--fuzz=N`), which
-    // is what actually drives the coordinator.
-    const fuzz_opts = b.addOptions();
-    fuzz_opts.addOption([]const u8, "cases_dir", b.pathFromRoot("tests/cases"));
-    fuzz_opts.addOption([]const u8, "crashes_dir", b.pathFromRoot("tests/fuzz/crashes"));
-
-    const fuzz_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/fuzz/fuzz.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true, // guard.zig's signal handler needs raw libc calls
-        }),
-    });
-    fuzz_tests.root_module.addImport("bit", exe.root_module);
-    fuzz_tests.root_module.addOptions("build_options", fuzz_opts);
-    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
-
-    // Saved-crash regression replay: deliberately kept in its own always-plain
-    // binary, never built with `-ffuzz` — Zig's native fuzzer segfaults when a
-    // fuzz-instrumented binary contains more than one `test` declaration
-    // (upstream ziglang/zig#26040), and this test doesn't call
-    // `std.testing.fuzz` anyway, so it has nothing to gain from instrumentation.
-    const crash_regression_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/fuzz/crash_regression.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    crash_regression_tests.root_module.addImport("bit", exe.root_module);
-    crash_regression_tests.root_module.addOptions("build_options", fuzz_opts);
-    test_step.dependOn(&b.addRunArtifact(crash_regression_tests).step);
-
-    // `zig build fuzz [-- <seconds>]`: bounded mutation-based fuzz run over
-    // the same target and corpus (see tests/fuzz/mutate.zig's header for why
-    // this isn't Zig's native coverage-guided `--fuzz` engine). Defaults to
-    // 60s, matching the CI smoke pass; pass e.g. `-- 600` for a 10-minute run.
-    const fuzz_exe = b.addExecutable(.{
-        .name = "bit-fuzz",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/fuzz/mutate.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    fuzz_exe.root_module.addImport("bit", exe.root_module);
-    fuzz_exe.root_module.addOptions("build_options", fuzz_opts);
-
-    const run_fuzz = b.addRunArtifact(fuzz_exe);
-    if (b.args) |args| run_fuzz.addArgs(args);
-    const fuzz_step = b.step("fuzz", "Mutation-fuzz the lexer+parser (default 60s; pass -- <seconds> to override)");
-    fuzz_step.dependOn(&run_fuzz.step);
+    // Fuzz harness (#334) is now tests/bit/fuzz.bit — wired at the tail,
+    // where `selfhosted` (the compiler under test) is in scope.
 
     // `zig build libbitrt`: the runtime archive the static linker (task #345)
     // consumes. #1584 (G3): built from Bit-compiled objects via
@@ -1060,7 +984,6 @@ pub fn build(b: *std.Build) void {
     // the kernel then killed by signal (#1229).
     wireLibbitrt(golden_opts, host_libbitrt_bin);
     wireLibbitrt(stress_opts, host_libbitrt_bin);
-    wireLibbitrt(testcmd_opts, host_libbitrt_bin);
     wireLibbitrt(imports_opts, host_libbitrt_bin);
     // #1445's link-acceptance half needs a real archive: the import-set half
     // only emits objects and never links.
@@ -1303,6 +1226,44 @@ pub fn build(b: *std.Build) void {
         .{ "BIT_EXAMPLES_DIR", b.pathFromRoot("examples") },
     }, "run the examples/*.bit build+run guard (tests/bit/examplesgate.bit) only");
     if (host_libbitrt_install) |inst| examples_gate.step.dependOn(inst);
+
+    // Fuzz harness (#334): the lexer+parser must never crash or hang on
+    // arbitrary bytes. Now tests/bit/fuzz.bit, driving `bit check` OUT of
+    // process — the kernel reports a fault as an exit status and `osRunBounded`
+    // reports a hang as -2, so the 174-line signal-handler-plus-watchdog
+    // apparatus in the old tests/fuzz/guard.zig has no counterpart and needed
+    // none. Zig's `-ffuzz` workarounds (ziglang/zig#26040: one `test` per
+    // instrumented binary, a separate always-plain replay binary) were Zig's
+    // problem and are gone with it.
+    //
+    // In `zig build test` the budget is short AND THE SEED IS FIXED. A random
+    // seed here would make the main suite nondeterministically red, which is
+    // how a suite gets ignored; the open-ended search belongs in `zig build
+    // fuzz`. The saved-crash replay under tests/fuzz/crashes/ runs first
+    // either way, and that part IS deterministic.
+    const fuzz_smoke = std.Build.Step.Run.create(b, "bit run tests/bit/fuzz.bit");
+    fuzz_smoke.addFileArg(selfhosted);
+    fuzz_smoke.addArg("run");
+    fuzz_smoke.addFileArg(b.path("tests/bit/fuzz.bit"));
+    fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_BIN", selfhost_artifact_path);
+    fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_CASES", b.pathFromRoot("tests/cases"));
+    fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_CRASHES", b.pathFromRoot("tests/fuzz/crashes"));
+    fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_SECONDS", "5");
+    fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_SEED", "1");
+    fuzz_smoke.setEnvironmentVariable("BIT_STDLIB", b.pathFromRoot("stdlib"));
+    fuzz_smoke.has_side_effects = true;
+    fuzz_smoke.expectExitCode(0);
+    test_step.dependOn(&fuzz_smoke.step);
+    addNamedRun(b, fuzz_smoke, "test-fuzz", "run the saved-crash replay + a 5s fixed-seed fuzz only");
+
+    // `zig build fuzz [-- <seconds> [seed]]`: the open-ended run.
+    const run_fuzz = std.Build.Step.Run.create(b, "scripts/fuzz.sh");
+    run_fuzz.addFileArg(b.path("scripts/fuzz.sh"));
+    if (b.args) |args| run_fuzz.addArgs(args);
+    run_fuzz.setEnvironmentVariable("BIT_FUZZ_BIN", selfhost_artifact_path);
+    run_fuzz.has_side_effects = true;
+    b.step("fuzz", "Mutation-fuzz the lexer+parser (default 60s; pass -- <seconds> [seed])").dependOn(&run_fuzz.step);
+
 
     // Doc-snippet typecheck, Bit port — DELIBERATELY NOT ON `test_step` YET.
     //
