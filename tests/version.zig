@@ -130,95 +130,11 @@ test "bit version: the self-hosted compiler reports the same version as the seed
     try testing.expectEqualStrings(seed.stdout, self.stdout);
 }
 
-test "bit: no arguments is a usage error, not a self-test" {
-    // #1827: `bit` with no arguments ran the in-Bit self-check suite. That was
-    // correct while the binary was a bootstrap artifact and wrong once it shipped:
-    // a user who typed `bit` got lock-file test fixtures on stdout
-    // ("pmlock check: no stale fixture to remove") and a wait long enough to look
-    // like a hang. Asserting the exit code alone would not catch a regression here
-    // — selfcheck also exits 0 on success — so stdout must be empty and the
-    // fixture string must be absent.
-    //
-    // SELF-HOSTED ONLY, deliberately. The seed prints its version banner on
-    // no-args and exits 0; it is the bootstrap oracle, is not distributed to
-    // anyone, and is slated for retirement, so aligning its CLI ergonomics buys
-    // nothing and touches the one binary the whole bootstrap trusts.
-    if (build_options.selfhost_bit.len == 0) return; // cross build: no self-hosted bit
-
-    const gpa = testing.allocator;
-    var threaded = Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const timeout_s = proc.timeoutSeconds(gpa);
-
-    const self_bit = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
-    defer selfbin.release(gpa, io, self_bit);
-
-    const r = try run(gpa, io, timeout_s, self_bit, &.{});
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-
-    const code = exitCode(r.term) orelse {
-        std.debug.print("version: {s} with no args died by signal\n", .{self_bit});
-        return error.NoArgsDiedBySignal;
-    };
-    if (code != 2) {
-        std.debug.print("version: {s} with no args exited {d}, want 2\n", .{ self_bit, code });
-        return error.NoArgsNotAUsageError;
-    }
-    try testing.expectEqualStrings("", r.stdout);
-    try testing.expect(std.mem.indexOf(u8, r.stderr, "usage: bit") != null);
-    // The exact fixture line a user reported seeing. Named rather than implied, so
-    // this fails loudly if any self-check output ever reaches a bare invocation.
-    try testing.expect(std.mem.indexOf(u8, r.stdout, "pmlock check") == null);
-    try testing.expect(std.mem.indexOf(u8, r.stderr, "pmlock check") == null);
-}
-
-// There is deliberately NO `bit selfcheck` test here, and the reason is COST, not
-// correctness. `zig build test-selfcheck` already runs that exact subcommand and
-// requires exit 0, so a second one adds no coverage — and selfcheck takes ~79s
-// standalone, so a second concurrent runner under full-suite load blew the 300s
-// `tests/proc.zig` deadline and reported `TIMED OUT` (measured, twice).
+// The two CLI-contract tests that used to close this file — "no arguments is a
+// usage error, not a self-test" (#1827) and "a typo'd subcommand is a usage
+// error, not the banner" — moved to tests/bit/version.bit (#1591). They asked
+// about the SHIPPED compiler's CLI, which is a property that outlives the seed.
 //
-// The first attempt at this test failed for a DIFFERENT reason — pmlockcheck.bit's
-// fixed /tmp fixture paths raced, 2 failures in 9 concurrent runs. That is fixed
-// (#1828, per-process nonce), so concurrent selfchecks are now safe; they are just
-// too slow to be worth duplicating. Raising BIT_TEST_TIMEOUT_S to accommodate a
-// redundant test would weaken the deadline for every other harness.
-
-test "bit version: a typo'd subcommand is a usage error, not the banner" {
-    const gpa = testing.allocator;
-    var threaded = Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const timeout_s = proc.timeoutSeconds(gpa);
-
-    var self_bit: ?[:0]const u8 = null;
-    defer if (self_bit) |p| selfbin.release(gpa, io, p);
-    if (build_options.selfhost_bit.len > 0)
-        self_bit = try selfbin.privateCopy(gpa, io, build_options.selfhost_bit);
-
-    var bins: std.ArrayList([]const u8) = .empty;
-    defer bins.deinit(gpa);
-    try bins.append(gpa, build_options.seed_bit);
-    if (self_bit) |p| try bins.append(gpa, p);
-
-    for (bins.items) |bin| {
-        const r = try run(gpa, io, timeout_s, bin, &.{"vresion"});
-        defer gpa.free(r.stdout);
-        defer gpa.free(r.stderr);
-
-        const code = exitCode(r.term) orelse {
-            std.debug.print("version: {s} vresion died by signal\n", .{bin});
-            return error.TypoDiedBySignal;
-        };
-        if (code != 2) {
-            std.debug.print("version: {s} vresion exited {d}, want 2\n", .{ bin, code });
-            return error.TypoNotAUsageError;
-        }
-        // The original bug: the typo printed the version banner on stdout.
-        // Asserting the exit code alone would not have caught it.
-        try testing.expectEqualStrings("", r.stdout);
-        try testing.expect(std.mem.indexOf(u8, r.stderr, "unknown subcommand") != null);
-    }
-}
+// What remains above does not: both tests read the seed's stamped version and
+// compare it against the self-hosted binary, so they are meaningless with one
+// compiler and are deleted with seed/ (#1593), not ported.

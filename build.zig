@@ -21,6 +21,35 @@ fn addNamedRun(b: *std.Build, run: *std.Build.Step.Run, name: []const u8, desc: 
     b.step(name, desc).dependOn(&run.step);
 }
 
+/// One `tests/bit/*.bit` gate: run the SHIPPED compiler on a harness written in
+/// Bit. Every retired `tests/*.zig` harness collapses to a call of this (#1591),
+/// so the wiring is stated once instead of twelve near-identical blocks.
+///
+/// `has_side_effects` is not optional here. Each harness reads its real inputs
+/// (sources, fixtures, docs) at RUN time, so Zig's build cache cannot see an
+/// edit to them; without it a regression is cache-skipped into a false pass,
+/// which is the exact failure the old fmt_check harness was marked against.
+fn addBitGate(
+    b: *std.Build,
+    bit_exe: std.Build.LazyPath,
+    test_step: *std.Build.Step,
+    name: []const u8,
+    src: []const u8,
+    env: []const [2][]const u8,
+    desc: []const u8,
+) *std.Build.Step.Run {
+    const run = std.Build.Step.Run.create(b, b.fmt("bit run {s}", .{src}));
+    run.addFileArg(bit_exe);
+    run.addArg("run");
+    run.addFileArg(b.path(src));
+    for (env) |kv| run.setEnvironmentVariable(kv[0], kv[1]);
+    run.has_side_effects = true;
+    run.expectExitCode(0);
+    test_step.dependOn(&run.step);
+    addNamedRun(b, run, b.fmt("test-{s}", .{name}), desc);
+    return run;
+}
+
 /// Rebuild-cache gate (#1796): `libbitrt.a` and the self-hosted `bit` are each
 /// produced by a step that reads its true sources at runtime (`root.zig`'s
 /// `runtime/**/*.zig` today, `compiler/**/*.bit` always) — invisible to Zig's
@@ -737,23 +766,9 @@ pub fn build(b: *std.Build) void {
     b.step("test-lint", "run the `bit lint` CLI contract only (tests/lintcmd.zig)").dependOn(&lintcmd_run.step);
     test_step.dependOn(&lintcmd_run.step);
 
-    // std/os args + environment round-trip (#354): one program run twice under
-    // a controlled environment. Shares the host libbitrt archive.
-    const osenv_opts = b.addOptions();
-    osenv_opts.addOption([]const u8, "osenv_dir", b.pathFromRoot("tests/osenv"));
-    osenv_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    const osenv_mod = b.createModule(.{
-        .root_source_file = b.path("tests/osenv.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    osenv_mod.addImport("bit", exe.root_module);
-    osenv_mod.addOptions("build_options", osenv_opts);
-
-    const osenv_tests = b.addTest(.{ .root_module = osenv_mod });
-    const osenv_run = b.addRunArtifact(osenv_tests);
-    test_step.dependOn(&osenv_run.step);
-    addNamedRun(b, osenv_run, "test-osenv", "run the std/os args+environment round-trip (tests/osenv.zig) only");
+    // std/os args + environment round-trip (#354). Was tests/osenv.zig; the
+    // check is now tests/bit/osenv.bit, wired at the tail beside the other
+    // Bit gates where `selfhosted` is in scope.
 
     // Doc-tests (#351): every ```bit block under docs/ must typecheck against
     // the real prelude and std/*. Front end only — a snippet is a module, not a
@@ -774,24 +789,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&docs_run.step);
     addNamedRun(b, docs_run, "test-docs", "run the doc-snippet typecheck gate (tests/docs.zig) only");
 
-    // Stdlib doc coverage (#356): every symbol `bit doc` reports as exported must
-    // have a section in `docs/stdlib/<module>.md`. Shares the docs options (same
-    // `docs_dir` + `stdlib_dir`). Front end only — needs no libbitrt.
-    const stdlib_docs_mod = b.createModule(.{
-        .root_source_file = b.path("tests/stdlib_docs.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    stdlib_docs_mod.addImport("bit", exe.root_module);
-    stdlib_docs_mod.addOptions("build_options", docs_opts);
-
-    const stdlib_docs_tests = b.addTest(.{ .root_module = stdlib_docs_mod });
-    const stdlib_docs_run = b.addRunArtifact(stdlib_docs_tests);
-    // #1528's fixture is written to /tmp at run time, invisible to the build
-    // cache — same reason as lintcmd, rootpins and diffimports.
-    stdlib_docs_run.has_side_effects = true;
-    b.step("test-stdlib-docs", "run the stdlib doc-coverage gate only (tests/stdlib_docs.zig)").dependOn(&stdlib_docs_run.step);
-    test_step.dependOn(&stdlib_docs_run.step);
+    // Stdlib doc coverage (#356) is now tests/bit/stdlibdocs.bit — see the Bit
+    // gates at the tail.
 
     // AST tag-set parity (#1420): seed and selfhost must declare the same node
     // tags, each parser-reachable. #1418's `ParamRest` false positive — selfhost
@@ -1103,7 +1102,6 @@ pub fn build(b: *std.Build) void {
     wireLibbitrt(examples_opts, host_libbitrt_bin);
     wireLibbitrt(stress_opts, host_libbitrt_bin);
     wireLibbitrt(testcmd_opts, host_libbitrt_bin);
-    wireLibbitrt(osenv_opts, host_libbitrt_bin);
     wireLibbitrt(imports_opts, host_libbitrt_bin);
     // #1445's link-acceptance half needs a real archive: the import-set half
     // only emits objects and never links.
@@ -1338,6 +1336,31 @@ pub fn build(b: *std.Build) void {
     fmt_gate.expectExitCode(0);
     test_step.dependOn(&fmt_gate.step);
     addNamedRun(b, fmt_gate, "test-fmt", "run the Bit-source fmt-canonical gate (`bit fmt --check`) only");
+
+    // ---- Bit-native harnesses (#1591) -------------------------------------
+    // Each of these replaced a tests/*.zig harness that was deleted with it.
+    // They live here because `selfhosted` is the compiler under test AND the
+    // interpreter running the check, so both sides need it in scope.
+    const stdlib_root = b.pathFromRoot("stdlib");
+
+    const osenv_gate = addBitGate(b, selfhosted, test_step, "osenv", "tests/bit/osenv.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the std/os args+environment round-trip (tests/bit/osenv.bit) only");
+    // It compiles and execs a fixture, so it needs a host libbitrt on disk;
+    // without the dependency a stale archive gets linked (#1229).
+    if (host_libbitrt_install) |inst| osenv_gate.step.dependOn(inst);
+
+    _ = addBitGate(b, selfhosted, test_step, "stdlib-docs", "tests/bit/stdlibdocs.bit", &.{
+        .{ "BIT_DOCS_ROOT", b.pathFromRoot(".") },
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the stdlib doc-coverage gate (tests/bit/stdlibdocs.bit) only");
+
+    // "version-cli", not "version": tests/version.zig still owns `test-version`
+    // for its seed-vs-selfhost parity half, which dies with seed/ (#1593) rather
+    // than being ported. The two names coexist until then.
+    _ = addBitGate(b, selfhosted, test_step, "version-cli", "tests/bit/version.bit", &.{
+        .{ "BIT_REPO", b.build_root.path.? },
+    }, "run the `bit version` CLI contract (tests/bit/version.bit) only");
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
