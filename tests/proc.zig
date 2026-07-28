@@ -40,12 +40,41 @@
 //! `default_timeout_s` is deliberately far above anything the corpus does.
 //! Measured on this host (arm64-macOS, 18 logical CPUs, load average ~4, i.e.
 //! already sharing the box with another agent) the slowest single subprocess in
-//! either harness is `tests/stress/quicwire` under `BIT_GC=stress` at 38.3s;
-//! the runner-up is `polloneshotdarwin` at 13.1s and everything else is under
-//! 3s. 300s leaves the worst case a ~7.8x margin. A timeout that fires on a
+//! either harness was `tests/stress/quicwire` under `BIT_GC=stress` at 38.3s;
+//! the runner-up was `polloneshotdarwin` at 13.1s and everything else under
+//! 3s. 300s left the worst case a ~7.8x margin. A timeout that fires on a
 //! merely-slow case is worse than no timeout at all — it manufactures a red
 //! that costs someone a day — so the number is chosen against the slowest case
 //! plus contention headroom, not against the average.
+//!
+//! ## Those numbers are STALE, and the margin they bought is gone (#1849)
+//!
+//! Re-measured 2026-07-29 on the same machine while NEARLY IDLE — better
+//! conditions than the baseline above, which explicitly shared the box:
+//!
+//!     quicwire           BIT_GC=stress    38.3s -> 161s   (4.2x)
+//!     polloneshotdarwin  BIT_GC=stress    13.1s -> 123s   (9.4x)
+//!
+//! Both still produce byte-correct output and exit 0; this is throughput, not
+//! correctness. It reproduces identically on a seed-built binary, so it is not
+//! self-hosted codegen — it is the runtime, and the prime suspect is the G3
+//! archive swap that made `libbitrt.a` all-Bit. Tracked as #1849.
+//!
+//! At 161s the 300s deadline was a 1.9x margin, so ordinary suite parallelism
+//! pushed the slowest program past it and `zig build test` went
+//! nondeterministically red — a DIFFERENT program on each of two consecutive
+//! runs, which is the signature of an eroded margin rather than of a hang.
+//! Worse, the harness then prints "This is a HANG, not an output mismatch" for
+//! a program that completes correctly in 123s, sending the reader after a
+//! deadlock that does not exist.
+//!
+//! 900s is a STOPGAP, not a new baseline: it restores roughly the documented
+//! margin against the CURRENT (regressed) worst case so the suite is
+//! deterministic again while #1849 is open. It costs a real hang 900s instead
+//! of 300s before it is reported, which is the price of not manufacturing reds.
+//! **#1849 must restore the old runtimes and put this back to 300s** — its
+//! acceptance says so. Raising this number is not a fix and must not be treated
+//! as one.
 //!
 //! Override with `BIT_TEST_TIMEOUT_S` when a host is slower still, or set it to
 //! `0` to disable the deadline entirely and restore the old block-forever
@@ -56,8 +85,9 @@ const std = @import("std");
 const Io = std.Io;
 
 /// Wall-clock seconds allowed to any one spawned subprocess. See the header for
-/// how this number was chosen.
-pub const default_timeout_s: u32 = 300;
+/// how this number was chosen — and note it is currently a STOPGAP for #1849,
+/// to go back to 300 when that regression is fixed.
+pub const default_timeout_s: u32 = 900;
 
 /// Environment variable that overrides `default_timeout_s`. `0` disables the
 /// deadline.
