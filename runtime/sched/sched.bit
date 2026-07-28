@@ -323,7 +323,27 @@ export @nosplit function schedTaskContext(ctx: *i64, stackTop: int, entry: *byte
 // stack does not fault — it silently resolves to the wrong task, which is why
 // the check exists rather than a comment asking for care.
 //
-// 64KiB is `sched.zig`'s `stack_size` unchanged, so this is not a fresh choice.
+// THIS IS THE IDENTITY GRANULE, and only incidentally a stack size (#1843).
+// Identity is "mask sp down to this and read the tag at the lowest word", so a
+// stack masked from anywhere inside it must land on ITS OWN base — which caps a
+// masked-identity stack at exactly this size. The interior boundaries cannot
+// carry copies of the tag: they fall inside the usable stack, where ordinary
+// frames overwrite them.
+//
+// So a task wanting MORE than this cannot use masking, and `main` is exactly that
+// task — see `schedRegisterBigStack` below, which is how it gets 8 MiB.
+//
+// 64KiB is unchanged, but the original justification for it was not: it read
+// "64KiB is `sched.zig`'s `stack_size` unchanged", which was true when written
+// and false by the time G3 landed. `sched.zig` carries `stack_size = 256 * 1024`
+// and `main_stack_size = 8 * 1024 * 1024`. Matching the first means rescaling the
+// twelve stress programs that carve `(n+1) * schedStackBytes` arenas out of fixed
+// module arrays, so it is filed rather than done here; matching the second is
+// what the oversized-stack registry does, and that is the one that was crashing.
+//
+// The bottom of the stack is not all usable: `scratchOf` puts the chan scratch
+// area at words 0..`chanScratchWords` of this same base, words 0 and 1 being the
+// self-pointer and tag. Usable stack starts above that.
 export const schedStackBytes: int = 65536
 
 // Written next to the self-pointer to mark a region as a TASK stack.
@@ -394,9 +414,86 @@ export @nosplit @symbol("bit_rt_port_sched_task_on_stack") function schedTaskOnS
   return t
 }
 
+// ---------------------------------------------------------------------------
+// OVERSIZED STACKS (#1843): the tasks masking cannot name
+// ---------------------------------------------------------------------------
+//
+// `main` needs a stack far larger than the granule. `sched.zig` gives it
+// `main_stack_size` = 8 MiB against a 256 KiB goroutine, because `main` is where
+// user code recurses — #1761 was `bit fmt`'s recursive-descent formatter
+// overflowing exactly this, and the port shipping `main` at 64KiB is what
+// `tests/stress/deeprecursion` caught.
+//
+// Masking cannot describe such a stack (see `schedStackBytes`), and raising the
+// granule to 8 MiB is not the answer either: the granule is the alignment unit,
+// so every goroutine would reserve 16 MiB, and the twelve stress programs that
+// carve `(n+1) * schedStackBytes` arenas out of fixed module arrays would all
+// need rescaling.
+//
+// So oversized stacks get a REGISTRY instead, and the fast path never sees it:
+// `schedCurrentTask` masks first, exactly as before, and only consults this when
+// masking finds no tag. That miss already happened on every worker OS thread, so
+// the cost is a few compares on a path that previously just returned 0.
+//
+// A FIXED FOUR ENTRIES, not a growable list, and the read loop is bounded by the
+// constant rather than by a live count so its limit is statically provable. Four
+// is `main` plus slack; a fifth registration is refused rather than silently
+// dropped, since a task whose stack nothing can name would resolve to 0 and
+// null-deref at its first `schedYield`.
+export const schedBigStackMax: int = 4
+
+// Three words per entry — base, bytes, task — and a zero base means empty.
+let bigStacks: [12]i64
+
+// Record `task` as owning `[base, base + bytes)`. False if the table is full or
+// the arguments are not a usable range, and the caller MUST treat that as fatal:
+// an unregistered oversized stack is a task `schedCurrentTask` cannot name.
+//
+// Pinned: `runtime/root/{linux,darwin}/boot.bit` calls it across a module
+// boundary and emits `--freestanding`, which refuses a mangled name.
+export @nosplit @symbol("bit_rt_port_sched_register_big_stack") function schedRegisterBigStack(base: int, bytes: int, task: int): bool {
+  if (base <= 0 || bytes <= 0 || task == 0) {
+    return false
+  }
+  let tbl: *i64 = ptrOf(bigStacks)
+  let i = 0
+  // Bounded by the constant, and first-free wins.
+  while (i < schedBigStackMax) {
+    if (*(tbl + i * 3) == 0) {
+      *(tbl + i * 3 + 1) = bytes
+      *(tbl + i * 3 + 2) = task
+      // Base LAST: it is the validity flag every reader tests, so publishing it
+      // after the other two words means a reader can never see a live entry
+      // whose length and task are not yet written.
+      *(tbl + i * 3) = base
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// The oversized-stack task containing `sp`, or 0. Bounded by `schedBigStackMax`.
+@nosplit function schedTaskOnBigStack(sp: int): int {
+  let tbl: *i64 = ptrOf(bigStacks)
+  let i = 0
+  while (i < schedBigStackMax) {
+    let base = *(tbl + i * 3)
+    if (base != 0 && sp >= base && sp < base + *(tbl + i * 3 + 1)) {
+      return *(tbl + i * 3 + 2)
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 export @nosplit @symbol("bit_rt_port_sched_current_task") function schedCurrentTask(): int {
   let sp = readSp()
-  return schedTaskOnStack(sp - sp % schedStackBytes)
+  let t = schedTaskOnStack(sp - sp % schedStackBytes)
+  if (t != 0) {
+    return t
+  }
+  return schedTaskOnBigStack(sp)
 }
 
 // The worker currently running the calling task. `sched.zig`'s `Worker.current()`.

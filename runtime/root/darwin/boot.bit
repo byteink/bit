@@ -96,7 +96,7 @@ import {
   schedWorkerAt, workerStepStop, WORKER_MAX_STEPS, scStopping,
   schedFindWorkAt, schedWorkerStepAt, schedSetPollFd,
   schedTaskExit, dqPushBottom, taskAt, taskWords,
-  schedStackBytes, schedStackAligned, wkDeque,
+  schedStackBytes, schedStackAligned, schedRegisterBigStack, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
 } from "../../sched"
 // The netpoller provider (#1673). `runtime/sched` may not import it — kqueue
@@ -128,7 +128,6 @@ extern function bit_main(): i32
 let schedBlock: [16]i64
 let workerBlock: [292]i64
 let mainTaskBlock: [32]i64
-let taskStackArea: [16384]i64
 let startArgs: [2]i64
 let startDones: [1]i32
 let startHandles: [1]i64
@@ -167,10 +166,65 @@ const joinTimeoutNs: int = 15000000000
 // Identical to ../linux/boot.bit.
 const chanReserveBytes: int = 1048576
 
-// Round `addr` up to the next 64KiB stack boundary (`schedStackAligned`).
+// Round `addr` up to the next `schedStackBytes` boundary (`schedStackAligned`).
 @nosplit function alignUpStack(addr: int): int {
   let bumped = addr + schedStackBytes - 1
   return bumped - bumped % schedStackBytes
+}
+
+// `main`'s own stack, and it is NOT `schedStackBytes` (#1843). `sched.zig` gives
+// `main` `main_stack_size` = 8 MiB against a goroutine's `stack_size`, because
+// `main` is where user code recurses; the port shipped it at 64KiB, which
+// `tests/stress/deeprecursion` caught by overflowing into neighbouring module
+// state and still printing the right answer. Too large for masked identity, so it
+// is named through `schedRegisterBigStack` instead. Identical to the sibling
+// platform's.
+const mainStackBytes: int = 8388608
+
+// One task stack, aligned as `schedStackAligned` requires and GUARDED BELOW.
+// Returns the base (lowest address, where the tag and the chan scratch live), or
+// 0 on failure. Identical to ../linux/boot.bit's.
+//
+// THE GUARD IS THE POINT, and it costs no extra syscall (#1843). The alignment
+// contract already forces mapping 2x the granule so a correctly-aligned window
+// can be carved out of it; that leaves slop BELOW the chosen base which was
+// previously left mapped and writable. Unmapping it turns it into a hole, so a
+// stack that grows past its base faults instead of scribbling over whatever the
+// allocator put next. `root.zig` had this as `mapGuardedStack`; the port shipped
+// without it, and the difference is measurable rather than theoretical: with the
+// hole, a recursion past the limit dies at the boundary having printed NOTHING;
+// without it, the same program printed a plausible checksum and died later
+// (`tests/stress/deeprecursion`, mutation-tested both ways).
+//
+// `alignUpStack(region + 1)` rather than `alignUpStack(region)`: `mapPages`
+// returns a page-aligned address that may ALREADY be granule-aligned, in which
+// case aligning it to itself leaves zero slop and therefore no guard. The `+ 1`
+// forces the base strictly above the region, so the hole is never empty — at
+// least one page, at most the whole granule — and the remainder above the base is
+// still a full `schedStackBytes` either way.
+@nosplit function mapGuardedStack(bytes: int): int {
+  if (bytes <= 0) {
+    return 0
+  }
+  // `bytes + schedStackBytes` so an aligned base can always be carved, and so the
+  // slop below it is never empty. Aligning to the granule even for an oversized
+  // stack keeps one code path: masking will miss inside it either way (its
+  // interior boundaries hold ordinary frame data, not the tag), and the
+  // oversized-stack registry is what names it.
+  let region = mapPages(bytes + schedStackBytes)
+  if (region == 0) {
+    return 0
+  }
+  let base = alignUpStack(region + 1)
+  if (!schedStackAligned(base) || base <= region || base - region > schedStackBytes) {
+    return 0
+  }
+  // The hole. A failure here is not fatal — the stack above is intact and usable,
+  // it just has no guard — but it is never expected, so it is not silent.
+  if (!unmapPages(region, base - region)) {
+    return 0
+  }
+  return base
 }
 
 // The worker OS-thread entry — same as ../linux/boot.bit's `workerBody`,
@@ -552,13 +606,21 @@ function boot(): int {
   stwBind(rootGcAddr(), int(sched), int(ptrOf(chanRegBlock)), rootWorldAddr())
 
   // 5. Place `bit_main`'s task on worker 0's deque; register before queueing.
-  let stackBase = alignUpStack(int(ptrOf(taskStackArea)))
-  if (!schedStackAligned(stackBase)) {
+  // A MAPPING, NOT A MODULE ARRAY (#1843). This was carved out of a
+  // `[16384]i64` in `__DATA`, which cannot be guarded — an overflow ran straight
+  // into neighbouring module state. `main` runs user code and is the deepest
+  // recursion in any program, so it is the last stack that should be unguarded.
+  let stackBase = mapGuardedStack(mainStackBytes)
+  if (stackBase == 0) {
     return 70
   }
   let task = int(ptrOf(mainTaskBlock))
   let t: *i64 = ptrOf(mainTaskBlock)
-  schedTaskInit(t, stackBase, schedStackBytes, entryOf(mainTrampoline), 0)
+  schedTaskInit(t, stackBase, mainStackBytes, entryOf(mainTrampoline), 0)
+  if (!schedRegisterBigStack(stackBase, mainStackBytes, task)) {
+    return 70
+  }
+
   schedRegister(sched, task)
   if (!dqPushBottom(schedWorkerAt(sched, 0) + wkDeque, task)) {
     return 70
@@ -637,12 +699,8 @@ export @nosplit @symbol("bit_rt_spawn") function rtSpawn(entry: *byte, arg: int)
   }
   let s = taskAt(gSched)
 
-  let region = mapPages(schedStackBytes * 2)
-  if (region == 0) {
-    rootExit(70)
-  }
-  let stackBase = alignUpStack(region)
-  if (!schedStackAligned(stackBase)) {
+  let stackBase = mapGuardedStack(schedStackBytes)
+  if (stackBase == 0) {
     rootExit(70)
   }
 
