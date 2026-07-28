@@ -27,7 +27,7 @@ cd "$repo"
 
 echo "==> Building native arm64 bit (compiler + LSP) ..."
 # NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted now) is built by
-# RUNNING the seed to compile selfhost/ (build.zig's `native` check), which
+# RUNNING the seed to compile compiler/ (build.zig's `native` check), which
 # only works when the seed targets the build host. A Linux-container cross
 # build can only ever produce `bit-seed` — and the seed never gets lint
 # (spec/LINT.md's epic scope: "seed/ is not touched"), so installing it would

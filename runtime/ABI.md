@@ -83,7 +83,7 @@ uniform "every aggregate is one traced handle" model this ABI is built on.
 This is not a new constraint being imposed on codegen — it is the contract
 codegen already implements. All four backends refuse a multi-value `ret` today
 (`seed/codegen/x64.zig` `emitRet`, `seed/codegen/arm64.zig` `.ret`,
-`selfhost/x64.bit` `xEmitRet`, `selfhost/arm64.bit` `Op.Ret`). Boxing in the
+`compiler/x64.bit` `xEmitRet`, `compiler/arm64.bit` `Op.Ret`). Boxing in the
 lowerer is what makes that refusal unreachable rather than what works around it.
 
 **Element mutability.** Tuple elements are **read-only** (SPEC §12.5): `t.0` may
@@ -1253,7 +1253,7 @@ it is safe with scheduler worker threads live.
 
 `bit_rt_host_target` returns the ordinal of the `BuildTarget` this binary's own
 host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos` — the enum in
-selfhost/build.bit). The runtime archive is compiled once per target, so the answer
+compiler/build.bit). The runtime archive is compiled once per target, so the answer
 is fixed when the archive is built; the Bit provider (#1635) takes the OS from its
 own provider directory and the arch from an `asm` per-arch immediate, the Zig it
 replaces read `builtin.target`. It is the default `bit build`/`bit run` target when
@@ -1270,7 +1270,7 @@ through it to find `PT_TLS` and size a spawned thread's TLS block.
 `bit_rt_os_run_test` is the same fork+exec launcher with `BIT_TEST_INDEX=<idx>`
 prepended to the child's environment (first match wins, so it overrides any
 inherited value). `bit test` calls it once per discovered test so the test
-binary's synthetic `main` (selfhost/testgen.bit) dispatches to test `idx`.
+binary's synthetic `main` (compiler/testgen.bit) dispatches to test `idx`.
 
 **`hostTarget()` and `auxv()` are seed `prim_rt_fns` entries — the CALLER side
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and

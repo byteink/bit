@@ -1167,7 +1167,7 @@ export fn bit_rt_os_run(path: *const RtBytes) callconv(.c) i64 {
 
 /// `bit_rt_os_run_test(path, idx)` (ABI.md §19): like `bit_rt_os_run`, but execs
 /// the child with `BIT_TEST_INDEX=<idx>` in front of the inherited environment so
-/// its synthetic `main` (see selfhost/testgen.bit) dispatches to test `idx`. The
+/// its synthetic `main` (see compiler/testgen.bit) dispatches to test `idx`. The
 /// `bit test` runner calls this once per discovered test. `getPosix` returns the
 /// first match, so prepending the var makes it win over any inherited one.
 export fn bit_rt_os_run_test(path: *const RtBytes, idx: i64) callconv(.c) i64 {
@@ -1227,7 +1227,7 @@ export fn bit_rt_os_run_test(path: *const RtBytes, idx: i64) callconv(.c) i64 {
 
 /// `bit_rt_host_target()` (ABI.md §19): the BuildTarget ordinal of the host this
 /// binary runs on — 0 x86_64-linux, 1 aarch64-linux, 2 aarch64-macos, matching
-/// selfhost/main.bit's BuildTarget enum. This archive is compiled once per
+/// compiler/main.bit's BuildTarget enum. This archive is compiled once per
 /// target, so `builtin.target` here IS the host: bit2 has no compile-time
 /// `builtin`, so its `hostTarget()` default reads this instead of hard-coding.
 /// `bit_rt_auxv()` (ABI.md §19): the address of this process's ELF auxiliary

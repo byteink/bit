@@ -228,7 +228,7 @@ pub const ParkFn = *const fn (t: *Task, arg: ?*anyopaque) void;
 /// v1 fixed stack size. See the module doc comment's ponytail note.
 ///
 /// 64 KiB (#1761): `bit fmt --check` segfaulted on x86_64, but not aarch64,
-/// for ordinary source files (selfhost/lexer.bit and friends) — every Bit
+/// for ordinary source files (compiler/lexer.bit and friends) — every Bit
 /// program's `main` runs as the scheduler's first task (`root.zig`'s `boot`),
 /// so the self-hosted compiler's own recursive-descent formatter walked each
 /// file's AST on this fixed, guard-paged stack. Confirmed via gdb on real

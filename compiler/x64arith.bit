@@ -1,0 +1,304 @@
+// Self-host Stage 3 (#1346): the x86-64 backend, integer and float encoders.
+// Split out of compiler/x64.bit; same module, so nothing here is imported.
+
+// ---------------------------------------------------------------------------
+// Integer arithmetic
+// ---------------------------------------------------------------------------
+
+// The group-1 ALU ops, in their `op rm, reg` (0x01-stride) encoding.
+enum XArith {
+  Add,
+  Or,
+  And,
+  Sub,
+  Xor,
+  Cmp,
+}
+
+function xArithOpcode(op: XArith): int {
+  if (op == XArith.Add) { return 0x01 }
+  if (op == XArith.Or) { return 0x09 }
+  if (op == XArith.And) { return 0x21 }
+  if (op == XArith.Sub) { return 0x29 }
+  if (op == XArith.Xor) { return 0x31 }
+  assert(op == XArith.Cmp)
+  return 0x39
+}
+
+// `dst <op>= src`. For Cmp, `dst` is unchanged and only flags are written.
+//
+// The destination is the rm field and the source the reg field, so REX.R
+// extends SRC and REX.B extends DST. That is the OPPOSITE of imul below, whose
+// destination IS the reg field — the single easiest thing to get backwards
+// here, and it silently targets the wrong register.
+function xArithRR(b: X64Buf, op: XArith, dst: XReg64, src: XReg64) {
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(src)), false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(b, xArithOpcode(op))
+  xEmitByte(b, xModrmReg(xRegNum(src), xRegNum(dst)))
+}
+
+// `test a, b` — flags only (`85 /r`).
+function xTestRR(b: X64Buf, a: XReg64, bb: XReg64) {
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(bb)), false, xNeedsRexBit(xRegNum(a)))
+  xEmitByte(b, 0x85)
+  xEmitByte(b, xModrmReg(xRegNum(bb), xRegNum(a)))
+}
+
+// `dst *= src` — two-operand IMUL (`0F AF /r`). Here the DESTINATION is the reg
+// field and the source the rm field, so the REX bits are the reverse of
+// xArithRR's.
+function xImulRR(b: X64Buf, dst: XReg64, src: XReg64) {
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(dst)), false, xNeedsRexBit(xRegNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0xAF)
+  xEmitByte(b, xModrmReg(xRegNum(dst), xRegNum(src)))
+}
+
+// The group-3 unary/division ops (`F7 /digit`).
+function xGroup3R(b: X64Buf, digit: int, r: XReg64) {
+  xMaybeRex(b, true, false, false, xNeedsRexBit(xRegNum(r)))
+  xEmitByte(b, 0xF7)
+  xEmitByte(b, xModrmReg(digit, xRegNum(r)))
+}
+
+function xNegR(b: X64Buf, r: XReg64) { xGroup3R(b, 3, r) }
+function xNotR(b: X64Buf, r: XReg64) { xGroup3R(b, 2, r) }
+function xIdivR(b: X64Buf, r: XReg64) { xGroup3R(b, 7, r) }
+function xDivR(b: X64Buf, r: XReg64) { xGroup3R(b, 6, r) }
+
+// `cqo` — sign-extends rax into rdx:rax, priming SIGNED division. Unsigned
+// division primes rdx with zero instead; using the wrong one gives a wildly
+// wrong quotient for negative inputs rather than an error.
+function xCqo(b: X64Buf) {
+  xEmitByte(b, xRex(true, false, false, false))
+  xEmitByte(b, 0x99)
+}
+
+// `xor r32, r32` — zeroes the full 64-bit register (a 32-bit write clears the
+// upper half), the standard idiom to prime unsigned division. Both REX bits
+// track the same register because it appears in both fields.
+function xZero32(b: X64Buf, r: XReg64) {
+  xMaybeRex(b, false, xNeedsRexBit(xRegNum(r)), false, xNeedsRexBit(xRegNum(r)))
+  xEmitByte(b, 0x31)
+  xEmitByte(b, xModrmReg(xRegNum(r), xRegNum(r)))
+}
+
+enum XShift {
+  Shl,
+  Shr,
+  Sar,
+}
+
+// The ModRM opcode-extension digit each shift uses. Note shr=5 and sar=7 are
+// NOT adjacent — a logical vs arithmetic mix-up here silently sign-extends (or
+// fails to) on every right shift.
+function xShiftDigit(op: XShift): int {
+  if (op == XShift.Shl) { return 4 }
+  if (op == XShift.Shr) { return 5 }
+  assert(op == XShift.Sar)
+  return 7
+}
+
+function xShiftImm(b: X64Buf, op: XShift, r: XReg64, amount: int) {
+  xMaybeRex(b, true, false, false, xNeedsRexBit(xRegNum(r)))
+  xEmitByte(b, 0xC1)
+  xEmitByte(b, xModrmReg(xShiftDigit(op), xRegNum(r)))
+  xEmitByte(b, amount & 63)
+}
+
+// Shift by `cl` — the low byte of rcx is x86-64's ONLY variable shift count,
+// which is why a function containing a variable shift excludes rcx from
+// allocation entirely.
+function xShiftCl(b: X64Buf, op: XShift, r: XReg64) {
+  xMaybeRex(b, true, false, false, xNeedsRexBit(xRegNum(r)))
+  xEmitByte(b, 0xD3)
+  xEmitByte(b, xModrmReg(xShiftDigit(op), xRegNum(r)))
+}
+
+// ---------------------------------------------------------------------------
+// Condition codes, setcc, and stack ops
+// ---------------------------------------------------------------------------
+
+// x86 condition-code numbers. The SIGNED set (l/ge/le/g) and the UNSIGNED set
+// (b/ae/be/a) are different encodings for the same english word — using `l`
+// where `b` belongs compares 0xFFFFFFFFFFFFFFFF as -1 instead of as a huge
+// positive, and nothing complains.
+function ccE(): int { return 0x4 }
+function ccNe(): int { return 0x5 }
+function ccB(): int { return 0x2 }  // unsigned <
+function ccAe(): int { return 0x3 } // unsigned >=
+function ccBe(): int { return 0x6 } // unsigned <=
+function ccA(): int { return 0x7 }  // unsigned >
+function ccL(): int { return 0xC }  // signed <
+function ccGe(): int { return 0xD } // signed >=
+function ccLe(): int { return 0xE } // signed <=
+function ccG(): int { return 0xF }  // signed >
+function ccP(): int { return 0xA }  // parity: a float compare was UNORDERED
+function ccNp(): int { return 0xB } // ordered
+
+// `setcc r8` — writes 0 or 1 into the low byte of `r`. Always forces a REX
+// prefix so the destination is the modern low-byte encoding: without one,
+// registers 4..7 name ah/ch/dh/bh instead of spl/bpl/sil/dil.
+function xSetcc(b: X64Buf, cc: int, r: XReg64) {
+  xRexForce(b, false, false, false, xNeedsRexBit(xRegNum(r)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x90 | cc & 0xF)
+  xEmitByte(b, xModrmReg(0, xRegNum(r)))
+}
+
+// `movzx dst64, src8` — widens a setcc result to a clean 0/1 across the whole
+// register. This is why setcc does not need a zeroing `xor` first: an `xor`
+// would clobber the very flags setcc has to read.
+function xMovzxb(b: X64Buf, dst: XReg64, src: XReg64) {
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(dst)), false, xNeedsRexBit(xRegNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0xB6)
+  xEmitByte(b, xModrmReg(xRegNum(dst), xRegNum(src)))
+}
+
+// 8-bit `and`/`or`, for combining two setcc results (the float compares need
+// both an equality and an orderedness test). REX forced, same low-byte reason.
+function xAnd8(b: X64Buf, dst: XReg64, src: XReg64) {
+  xRexForce(b, false, xNeedsRexBit(xRegNum(src)), false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(b, 0x20)
+  xEmitByte(b, xModrmReg(xRegNum(src), xRegNum(dst)))
+}
+
+function xOr8(b: X64Buf, dst: XReg64, src: XReg64) {
+  xRexForce(b, false, xNeedsRexBit(xRegNum(src)), false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(b, 0x08)
+  xEmitByte(b, xModrmReg(xRegNum(src), xRegNum(dst)))
+}
+
+// push/pop take no REX.W — they are 64-bit by default in long mode; only the
+// register-extension bit is ever needed.
+function xPush(b: X64Buf, r: XReg64) {
+  if (xNeedsRexBit(xRegNum(r))) {
+    xEmitByte(b, xRex(false, false, false, true))
+  }
+  xEmitByte(b, 0x50 | xRegNum(r) & 7)
+}
+
+function xPop(b: X64Buf, r: XReg64) {
+  if (xNeedsRexBit(xRegNum(r))) {
+    xEmitByte(b, xRex(false, false, false, true))
+  }
+  xEmitByte(b, 0x58 | xRegNum(r) & 7)
+}
+
+function xRet(b: X64Buf) {
+  xEmitByte(b, 0xC3)
+}
+
+// `ud2` — a guaranteed-invalid opcode. Emitted where control must never
+// arrive, so a compiler bug traps immediately instead of running into whatever
+// bytes follow.
+function xUd2(b: X64Buf) {
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x0B)
+}
+
+// ---------------------------------------------------------------------------
+// Scalar float (SSE2)
+// ---------------------------------------------------------------------------
+//
+// Three DIFFERENT prefix schemes live here, and they are not interchangeable:
+//   - scalar arithmetic and the conversions take F2 (double) or F3 (single),
+//   - ucomis takes 66 for double and NOTHING for single,
+//   - xorp takes 66 for double and NOTHING for single.
+// Using the arithmetic scheme for ucomis encodes a completely different
+// instruction rather than failing, so each is pinned to the assembler's bytes.
+
+// The scalar-arithmetic prefix: the movsd family vs the movss family.
+function xFPrefix(width: int): int {
+  if (width == 8) {
+    return 0xF2
+  }
+  return 0xF3
+}
+
+enum XFArith {
+  FAdd,
+  FSub,
+  FMul,
+  FDiv,
+}
+
+function xFArithOpcode(op: XFArith): int {
+  if (op == XFArith.FAdd) { return 0x58 }
+  if (op == XFArith.FSub) { return 0x5C }
+  if (op == XFArith.FMul) { return 0x59 }
+  assert(op == XFArith.FDiv)
+  return 0x5E
+}
+
+// `dst <op>= src`, scalar double or single per `width`. The destination is the
+// reg field (REX.R), the source the rm field (REX.B).
+function xFArithRR(b: X64Buf, op: XFArith, dst: XmmReg, src: XmmReg, width: int) {
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, xFArithOpcode(op))
+  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
+}
+
+// `ucomisd`/`ucomiss` — an ordered compare setting ZF/PF/CF. PF (the parity
+// flag) is set when either operand is NaN, which is what makes a float compare
+// distinguish "unordered" from "not equal".
+//
+// Note the prefix: 66 for DOUBLE, none for single — the opposite shape from the
+// arithmetic ops above, where double takes F2.
+function xUcomis(b: X64Buf, a: XmmReg, bx: XmmReg, width: int) {
+  if (width == 8) {
+    xEmitByte(b, 0x66)
+  }
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(a)), false, xNeedsRexBit(xmmNum(bx)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x2E)
+  xEmitByte(b, xModrmReg(xmmNum(a), xmmNum(bx)))
+}
+
+// `xorpd`/`xorps` — used to flip a float's sign bit (negation) and to zero a
+// register.
+function xXorp(b: X64Buf, dst: XmmReg, src: XmmReg, width: int) {
+  if (width == 8) {
+    xEmitByte(b, 0x66)
+  }
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x57)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
+}
+
+// `cvtsi2sd`/`cvtsi2ss` — a signed 64-bit int to a float. REX.W is what makes
+// the SOURCE 64-bit; without it the conversion reads only 32 bits.
+function xCvtI2F(b: X64Buf, dst: XmmReg, src: XReg64, fwidth: int) {
+  xEmitByte(b, xFPrefix(fwidth))
+  xMaybeRex(b, true, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xRegNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x2A)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xRegNum(src)))
+}
+
+// `cvttsd2si`/`cvttss2si` — a float to a signed 64-bit int, TRUNCATING toward
+// zero (SPEC §12.9). The double-t mnemonic is the truncating one; the single-t
+// form rounds per the MXCSR mode instead, which is a different answer for every
+// non-integral value.
+function xCvtF2I(b: X64Buf, dst: XReg64, src: XmmReg, fwidth: int) {
+  xEmitByte(b, xFPrefix(fwidth))
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x2C)
+  xEmitByte(b, xModrmReg(xRegNum(dst), xmmNum(src)))
+}
+
+// `cvtsd2ss` (fromWidth 8) / `cvtss2sd` (fromWidth 4) — float to float. The
+// prefix names the SOURCE width, not the destination's.
+function xCvtF2F(b: X64Buf, dst: XmmReg, src: XmmReg, fromWidth: int) {
+  xEmitByte(b, xFPrefix(fromWidth))
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x5A)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
+}
+

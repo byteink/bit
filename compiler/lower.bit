@@ -1,0 +1,709 @@
+// Self-host Stage 2 (#1337): AST -> SSA IR lowering, ported from
+// compiler/lower.zig. Builds an `IrModule` (compiler/ir.bit) whose `dumpIr`
+// byte-matches the seed's `bit --dump-ir` over the corpus. Grows
+// statement/expression by statement/expression; this first slice lowers each
+// function's *signature* and an empty body (`func f(…) R { bb0(…): ret }`),
+// the shape every function ends with when it falls off the end.
+//
+// Reuses the checker (compiler/check.bit) for types: a function's parameter and
+// result types come from the same `typeFromNode`/`funcResults` the type dump
+// uses, so IR types and inferred types stay consistent by construction.
+// No max-file-lines suppression: the 6869-line debt this file carried is gone
+// (#1809 split it into the lower*.bit siblings). If a future change pushes this
+// back over 800, split again — do not restore the directive.
+
+// Alignment of every module-level cell (§11.11). Mirrors seed/lower.zig's
+// `module_state_align`. 16, not the type's natural alignment: §11.11 admits a
+// fixed array `[N]U` so the runtime can carve its own memory out of one, and a
+// green-thread stack is that use. Both supported ABIs require a 16-byte-aligned
+// stack pointer, so an 8-aligned array lands at `addr % 16 == 8` for some
+// declaration orders and faults only then — a silent, order-dependent hazard.
+// A uniform 16 makes the guarantee statable; the cost is at most 8 bytes of
+// padding per cell.
+const moduleStateAlign = 16
+
+// The incremental IR builder: a flat instr array (index == value id) plus the
+// blocks that slice it, and the block currently being appended to.
+struct IrBuilder {
+  instrs: []IrInstr,
+  blocks: []IrBlock,
+  cur: int,
+  blockStart: int,
+  blockParamCount: int,
+}
+
+function newBuilder(): IrBuilder {
+  return IrBuilder{ instrs: []IrInstr(0), blocks: []IrBlock(0), cur: -1,
+    blockStart: 0, blockParamCount: 0 }
+}
+
+// Reserves a fresh block id; its instruction range is recorded later at
+// endBlock. Blocks are created ahead of being filled (e.g. an if's then/join),
+// so the range is deferred, mirroring the seed's FunctionBuilder.
+function builderNewBlock(b: IrBuilder): int {
+  b.blocks = append(b.blocks, IrBlock{ instsStart: 0, paramCount: 0, instsLen: 0 })
+  return len(b.blocks) - 1
+}
+
+// Opens a block for appending: its instructions start at the current end of the
+// flat array.
+function builderBeginBlock(b: IrBuilder, id: int) {
+  b.cur = id
+  b.blockStart = len(b.instrs)
+  b.blockParamCount = 0
+}
+
+// Records the current block's final [start, len, paramCount] range. The
+// terminator must already be emitted.
+function builderEndBlock(b: IrBuilder) {
+  b.blocks[b.cur] = IrBlock{ instsStart: b.blockStart, paramCount: b.blockParamCount,
+    instsLen: len(b.instrs) - b.blockStart }
+}
+
+// Appends one instruction to the current block, returning its SSA value id.
+function builderEmit(b: IrBuilder, ins: IrInstr): int {
+  b.instrs = append(b.instrs, ins)
+  return len(b.instrs) - 1
+}
+
+// True when `v` is literally `const_bool true`. Lets a loop's lowering see that
+// its condition never fails, which — with no `break` reaching the exit — proves
+// the exit unreachable (`lowerWhile`). Deliberately a structural test on the
+// already-lowered value, not a re-run of the validator's constant folding: it
+// can only under-report, and under-reporting costs a dead exit block, while
+// over-reporting would strand live code behind a trap.
+function isConstTrue(b: IrBuilder, v: int): bool {
+  if (v < 0 || v >= len(b.instrs)) {
+    return false
+  }
+  return b.instrs[v].op == Op.ConstBool && b.instrs[v].bval
+}
+
+// Adds a block parameter (phi result) to the current block. Params must precede
+// the block's body instructions, so this is called right after beginBlock.
+function builderAddParam(b: IrBuilder, ty: int): int {
+  let id = builderEmit(b, mkInstr(Op.BlockParam, ty))
+  b.blockParamCount = b.blockParamCount + 1
+  return id
+}
+
+// The parameter type list of a function declaration, in order, with a method
+// receiver (if any) as the leading parameter — mirroring lowerFunctionDecl.
+function lowerParamTypes(c: Checker, decl: int): []int {
+  return lowerParamTypesIn(c, decl, noSubst())
+}
+
+// The IR parameter SLOTS for `decl`. Identical to `lowerParamTypes` except that
+// a trailing `...xs: T` occupies one slot of type `[]T`: the declared type node
+// holds the element type T, but the body binds — and the call ABI passes — the
+// slice (§10.3). A signature built from the declared types alone would declare
+// a scalar that the body then reads a slice header off of, so this is the
+// callee-side half of variadic lowering; `lowerArgsRest` is the caller side.
+function lowerParamSlotTypes(c: Checker, decl: int): []int {
+  let types = lowerParamTypes(c, decl)
+  // An extern decl is [name, params, result] — no kid 3 — and cannot be
+  // variadic anyway (E0077), so it is never rewritten here.
+  if (len(types) == 0 || isExternDecl(c.tree, decl)) {
+    return types
+  }
+  if (paramsAreVariadic(c, kidsOf(c.tree, decl)[3])) {
+    types[len(types) - 1] = mkSlice(c.ctx, types[len(types) - 1])
+  }
+  return types
+}
+
+// `sub` binds the decl's type params (by name, which is unambiguous WITHIN one
+// decl) so a generic's parameter types come out concrete for one call.
+function lowerParamTypesIn(c: Checker, decl: int, sub: TypeSubst): []int {
+  let kids = kidsOf(c.tree, decl)
+  let types = []int(0)
+  // SPEC 11.7: an extern decl is [name, params, result] — its kid 0 is the NAME,
+  // not a receiver, and it has no kid 3. Both must be resolved by tag, not shape.
+  let paramsNode = 0
+  if (isExternDecl(c.tree, decl)) {
+    paramsNode = kids[1]
+  } else {
+    paramsNode = kids[3]
+    if (kids[0] != 0) {
+      types = append(types, typeFromNodeIn(c, kidsOf(c.tree, kids[0])[1], sub))
+    }
+  }
+  let params = kidsOf(c.tree, paramsNode)
+  let i = 0
+  while (i < len(params)) {
+    types = append(types, typeFromNodeIn(c, kidsOf(c.tree, params[i])[1], sub))
+    i = i + 1
+  }
+  return types
+}
+
+// One in-scope local: its name, current SSA value id, and type. The env is an
+// *ordered* list (not a map) so control-flow joins can snapshot/restore/rebind
+// live locals by position, matching the seed's Env.
+struct LocalBind {
+  name: string,
+  value: int,
+  ty: int,
+}
+
+// Per-function lowering state: the checker (for types), the IR builder, the
+// ordered local environment, and flags. `failed` trips on any construct not yet
+// lowerable, so the function falls back to a signature-only stub rather than
+// emitting partial/garbage IR.
+struct FnCtx {
+  c: Checker,
+  b: IrBuilder,
+  env: []LocalBind,
+  failed: bool,
+  terminated: bool,
+  // Enclosing loops (innermost last): break jumps to `exit`, continue to `cont`,
+  // both carrying the first `preLen` live locals.
+  loops: []LoopFrame,
+  // Module-level const name -> its initializer node, inlined at each reference
+  // (the seed materializes a top-level const's value at every use site).
+  moduleConsts: map<string, int>,
+  // Shared, module-wide lowering state (interface-method dispatch ids).
+  lowerer: Lowerer,
+  // Pending deferred calls (their args already lowered at the `defer` site);
+  // emitted in reverse (LIFO) at every function exit.
+  defers: []IrInstr,
+  // Fallible-function context (SPEC §18): the result's ok/err types when the
+  // enclosing function returns `T!E`, else 0. `fail`/`?`/ok-return use these.
+  fallibleOk: int,
+  fallibleErr: int,
+  // The enclosing function's declared result type, generic-substituted with a
+  // fallible `T!` already unwrapped to `T`; 0 for a void function. Mirrors the
+  // seed's `FnCtx.result_ty`. Two consumers:
+  //   - `return a, b` boxes against this (ABI.md §1.1) rather than a tuple
+  //     re-interned from the element expressions: an element may widen to its
+  //     declared type, and the callee's promise is what callers destructure.
+  //   - `lowerReturn` materializes the returned expression at it — `return 4.5`
+  //     from an `f32!` otherwise lands at the untyped default f64 and the narrow
+  //     return reads its zero low half (#1467).
+  resultTy: int,
+  // When lowering one monomorphization of a generic, that instantiation's
+  // (type param -> concrete arg) bindings; empty otherwise. The body was checked
+  // once against the template's unbound type params, so every body node's cached
+  // type must pass through this to become concrete — see nodeType.
+  genEnv: TypeEnv,
+}
+
+// A body node's CONCRETE type: what the checker recorded, with this
+// instantiation's type-param bindings applied. Mirrors the seed's
+// `FnCtx.nodeType` (`ctx.subst(checked.typeOf(node), gen_env, 0)`), and for the
+// same reason — the checker types a generic body once, against unbound params,
+// so its cached answer is `[]<T>` and only substitution makes it `[]i64`.
+// Outside a generic instance genEnv is empty and this is exactly checkExprType.
+//
+// Lowering must never read checkExprType directly: a site that does silently
+// keeps the template's type, which classifies as a GC reference and corrupts
+// both the is_ref flag and the stack maps.
+function nodeType(fc: FnCtx, node: int): int {
+  return substType(fc.c, checkExprType(fc.c, node), fc.genEnv, 0)
+}
+
+// Module-wide lowering state shared across all functions (mutated as they lower
+// in order). `methodIds` assigns each interface-method *name* a stable dispatch
+// index on first encounter (the seed's methodId), so call_iface indices match.
+// One method as the Pass A3' pre-pass discovers it, before the per-type tables
+// are built and before any body is lowered.
+struct MethodEntry {
+  recvTy: int,
+  // The method's RAW name. Its interface dispatch id is assigned from this, so
+  // two modules' `area` methods share one id and one interface call site can
+  // dispatch to either — the id is global, the symbol is not.
+  name: string,
+  // The declaring module's link prefix ("" for the root, else "m<id>$"). The
+  // emitted symbol is prefix + name + "$t<recvType>"; keeping it separate from
+  // `name` is what lets the dispatch id stay module-blind.
+  prefix: string,
+}
+
+struct Lowerer {
+  methodIds: map<string, int>,
+  // Every method decl in declaration order — the seed's `l.method_table`. Filled
+  // by `collectMethodEntries` (Pass A3') and turned into the per-type tables
+  // before the first body is lowered, which is what makes the dispatch ids agree
+  // with the seed's (#1471).
+  methodEntries: []MethodEntry,
+  // The module's string pool, interned here as each const_string is emitted so
+  // __bitstr_N numbering follows lowering order (see IrModule.stringPool).
+  stringPool: []string,
+  // Inline-assembly payloads (§11.6), appended as each `asm` block is lowered;
+  // referenced by an `Op.Asm`'s `ival`. Empty for programs with no `asm`.
+  asmBlocks: []AsmBlock,
+  // FuncId scheme for closures: the number of regular funcs (free + instances +
+  // methods) reserved before any closure; synthesized func-value trampolines get
+  // ids reservedCount, reservedCount+1, ... and their name embeds that id.
+  reservedCount: int,
+  closureFuncs: []IrFunc,
+  // Function name -> its func-value trampoline's FuncId (deduped: one trampoline
+  // per referenced function).
+  fnValueTramps: map<string, int>,
+  // Functions whose bodies could not be lowered and were emitted signature-only.
+  // A stub RETURNS GARBAGE, so a build that produces one is not a build: `bit2
+  // build` refuses rather than write a binary that silently computes the wrong
+  // answer. The dump surfaces still render stubs — that is how the differential
+  // marks a construct as not yet ported.
+  stubbed: []string,
+  // Module-level state (§11.11). `globals` is the emitted cell list; `globalSyms`
+  // maps "<ownerModuleId>$<name>" to that cell's symbol, which is how a
+  // reference site recognizes a module global (as opposed to a const or a
+  // function) and finds its symbol without re-walking the owner's tree.
+  globals: []IrGlobal,
+  globalSyms: map<string, string>,
+  // --- multi-module (#1345) -----------------------------------------------
+  // The link prefix for the module currently being lowered: "" for the root,
+  // else "m<id>$". Set before each module's pass; every emitted function name
+  // goes through it.
+  modPrefix: string,
+  // The root module's id — the module being built. Its names stay bare so
+  // `main` stays `main` and a single-module build is byte-identical to before.
+  root: int,
+  // The module currently being lowered, set beside `modPrefix` before each
+  // pass. §17.6 tags every function `inRootModule: curModule == root` so a
+  // freestanding emit can keep this module's own code and drop its imports'.
+  // Kept as its own field rather than inferred from `modPrefix == ""`: that
+  // equivalence is a coincidence of the naming scheme, not a statement about
+  // ownership, and it would break silently if the prefix rule ever changed.
+  curModule: int,
+  // Named TypeId -> the module that DECLARES it. A method's symbol is prefixed
+  // by its receiver type's module, not by whoever calls it: `s.area()` on an
+  // imported `Shape` must reach `m2$area$t87` from any module. Filled before any
+  // body is lowered, because a free function in Pass A can call a method whose
+  // own decl is not walked until Pass A3.
+  typeModule: map<int, int>,
+}
+
+// Interns a string literal into the module pool as it is emitted, so the pool's
+// order is lowering order. const_string carries its pool index in `ival` (the
+// text in `sval` is what the dump renders).
+function internPoolString(fc: FnCtx, s: string): int {
+  let i = 0
+  while (i < len(fc.lowerer.stringPool)) {
+    if (fc.lowerer.stringPool[i] == s) {
+      return i
+    }
+    i = i + 1
+  }
+  fc.lowerer.stringPool = append(fc.lowerer.stringPool, s)
+  return len(fc.lowerer.stringPool) - 1
+}
+
+// The dispatch index of an interface method name, assigned on first encounter.
+function methodId(lw: Lowerer, name: string): int {
+  for (k, v) of lw.methodIds {
+    if (k == name) {
+      return v
+    }
+  }
+  let id = len(lw.methodIds)
+  lw.methodIds[name] = id
+  return id
+}
+
+// One enclosing loop's break/continue targets and its live-local count.
+struct LoopFrame {
+  exit: int,
+  cont: int,
+  preLen: int,
+  // A switch frame is a `break` target but not a `continue` target — a
+  // `continue` inside a switch reaches the enclosing loop, skipping switches.
+  isSwitch: bool,
+  // Set when a `break` actually jumped to `exit`. A loop whose condition is
+  // statically true and whose exit no `break` reaches cannot fall out, so the
+  // exit block is unreachable and the loop diverges (#1548).
+  exitUsed: bool,
+}
+
+// Binds a name to a value id + type, appending to the ordered env.
+function declareLocal(fc: FnCtx, name: string, value: int, ty: int) {
+  fc.env = append(fc.env, LocalBind{ name: name, value: value, ty: ty })
+}
+
+// The current value id of a name (most recent binding wins), or -1 if unbound.
+function envValue(fc: FnCtx, name: string): int {
+  let i = len(fc.env) - 1
+  while (i >= 0) {
+    if (fc.env[i].name == name) {
+      return fc.env[i].value
+    }
+    i = i - 1
+  }
+  return -1
+}
+
+// The current value ids of the first `n` env locals (a control-flow snapshot).
+function snapshotValues(fc: FnCtx, n: int): []int {
+  let vals = []int(0)
+  let i = 0
+  while (i < n) {
+    vals = append(vals, fc.env[i].value)
+    i = i + 1
+  }
+  return vals
+}
+
+// Restores the first `len(vals)` locals' value ids from a snapshot (after a
+// branch that reassigned some of them).
+function restoreValues(fc: FnCtx, vals: []int) {
+  let i = 0
+  while (i < len(vals)) {
+    fc.env[i].value = vals[i]
+    i = i + 1
+  }
+}
+
+// At a reachable join, gives the current block one parameter per in-scope local
+// (the first `n`) and rebinds each local to its new block-param value — the
+// seed's addLoopParams. Params are added in env order.
+function addJoinParams(fc: FnCtx, n: int) {
+  let i = 0
+  while (i < n) {
+    fc.env[i].value = builderAddParam(fc.b, fc.env[i].ty)
+    i = i + 1
+  }
+}
+
+// The IR op for an arithmetic/bitwise binary operator, given whether its
+// operands are floats and (for int div/rem/shr) signed. Returns Op.BlockParam
+// as a "not lowerable yet" sentinel (never a real binary).
+function binOpFor(op: int, isFloat: bool, signed: bool): Op {
+  if (op == int(Kind.Plus)) {
+    if (isFloat) {
+      return Op.FAdd
+    }
+    return Op.Add
+  }
+  if (op == int(Kind.Minus)) {
+    if (isFloat) {
+      return Op.FSub
+    }
+    return Op.Sub
+  }
+  if (op == int(Kind.Star)) {
+    if (isFloat) {
+      return Op.FMul
+    }
+    return Op.Mul
+  }
+  if (op == int(Kind.Slash)) {
+    if (isFloat) {
+      return Op.FDiv
+    }
+    if (signed) {
+      return Op.SDiv
+    }
+    return Op.UDiv
+  }
+  if (op == int(Kind.Percent)) {
+    if (signed) {
+      return Op.SRem
+    }
+    return Op.URem
+  }
+  if (op == int(Kind.Amp)) {
+    return Op.BAnd
+  }
+  if (op == int(Kind.Pipe)) {
+    return Op.BOr
+  }
+  if (op == int(Kind.Caret)) {
+    return Op.BXor
+  }
+  if (op == int(Kind.Shl)) {
+    return Op.Shl
+  }
+  if (op == int(Kind.Shr)) {
+    if (signed) {
+      return Op.AShr
+    }
+    return Op.LShr
+  }
+  return Op.BlockParam
+}
+
+// Whether an operator kind is a relational/equality comparison (not a logical
+// `&&`/`||`, which needs short-circuit block lowering).
+function isRelationalOp(op: int): bool {
+  return op == int(Kind.EqEq) || op == int(Kind.BangEq) || op == int(Kind.Lt) ||
+    op == int(Kind.Gt) || op == int(Kind.LtEq) || op == int(Kind.GtEq)
+}
+
+// The IR compare op applied to `string_cmp`'s three-way sign for an ORDERING
+// operator on strings (SPEC §14.6). Signed against 0 in every case — the sign,
+// not the operand type, is what is being tested. Op.BlockParam means `op` is
+// not an ordering operator (`==`/`!=` take the `string_eq` path instead).
+function strCmpOpFor(op: int): Op {
+  if (op == int(Kind.Lt)) {
+    return Op.ICmpSlt
+  }
+  if (op == int(Kind.LtEq)) {
+    return Op.ICmpSle
+  }
+  if (op == int(Kind.Gt)) {
+    return Op.ICmpSgt
+  }
+  if (op == int(Kind.GtEq)) {
+    return Op.ICmpSge
+  }
+  return Op.BlockParam
+}
+
+// The IR compare op for a relational operator over ints (signed/unsigned by
+// `signed`) or floats. Returns Op.BlockParam as a not-yet-lowerable sentinel.
+function cmpOpFor(op: int, isFloat: bool, signed: bool): Op {
+  if (op == int(Kind.EqEq)) {
+    if (isFloat) {
+      return Op.FCmpEq
+    }
+    return Op.ICmpEq
+  }
+  if (op == int(Kind.BangEq)) {
+    if (isFloat) {
+      return Op.FCmpNe
+    }
+    return Op.ICmpNe
+  }
+  if (op == int(Kind.Lt)) {
+    if (isFloat) {
+      return Op.FCmpLt
+    }
+    if (signed) {
+      return Op.ICmpSlt
+    }
+    return Op.ICmpUlt
+  }
+  if (op == int(Kind.LtEq)) {
+    if (isFloat) {
+      return Op.FCmpLe
+    }
+    if (signed) {
+      return Op.ICmpSle
+    }
+    return Op.ICmpUle
+  }
+  if (op == int(Kind.Gt)) {
+    if (isFloat) {
+      return Op.FCmpGt
+    }
+    if (signed) {
+      return Op.ICmpSgt
+    }
+    return Op.ICmpUgt
+  }
+  if (op == int(Kind.GtEq)) {
+    if (isFloat) {
+      return Op.FCmpGe
+    }
+    if (signed) {
+      return Op.ICmpSge
+    }
+    return Op.ICmpUge
+  }
+  return Op.BlockParam
+}
+
+// The value of a hex digit, or -1.
+function hexDigitVal(c: byte): int {
+  if (c >= '0' && c <= '9') {
+    return int(c) - int('0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return int(c) - int('a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return int(c) - int('A') + 10
+  }
+  return -1
+}
+
+// Appends `cp` to `s` as UTF-8 — the seed's std.unicode.utf8Encode. A codepoint
+// above U+10FFFF, or a surrogate (U+D800..U+DFFF, which UTF-8 must not encode),
+// is rejected: the caller stops decoding, matching the seed's `catch break`.
+function utf8Append(s: string, cp: int): string {
+  if (cp < 0x80) {
+    return s + string([u8(cp)])
+  }
+  if (cp < 0x800) {
+    return s + string([u8(0xC0 | cp >> 6), u8(0x80 | cp & 0x3F)])
+  }
+  if (cp < 0x10000) {
+    return s + string([u8(0xE0 | cp >> 12), u8(0x80 | cp >> 6 & 0x3F), u8(0x80 | cp & 0x3F)])
+  }
+  return s + string([u8(0xF0 | cp >> 18), u8(0x80 | cp >> 12 & 0x3F),
+    u8(0x80 | cp >> 6 & 0x3F), u8(0x80 | cp & 0x3F)])
+}
+
+// Whether `cp` is encodable as UTF-8: in range, and not a UTF-16 surrogate half.
+function isEncodableCodepoint(cp: int): bool {
+  return cp >= 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)
+}
+
+// Decodes the escape sequences in a content range [cstart, cend), matching the
+// seed's unescapeInner: `n t r 0`, the literal `\\ " ' $`, `\xNN` (one byte) and
+// `\u{...}` (a codepoint, UTF-8 encoded). A malformed escape stops the decode
+// where the seed's `catch break` does, so both compilers produce the same bytes.
+function decodeEscapes(src: string, cstart: int, cend: int): string {
+  let s = ""
+  let i = cstart
+  while (i < cend) {
+    let c = src[i]
+    if (c != '\\') {
+      s = s + src[i:i + 1]
+      i = i + 1
+      continue
+    }
+    i = i + 1
+    if (i >= cend) {
+      break
+    }
+    let e = src[i]
+    i = i + 1
+    if (e == 'n') {
+      s = s + "\n"
+    } else if (e == 't') {
+      s = s + "\t"
+    } else if (e == 'r') {
+      s = s + "\r"
+    } else if (e == '0') {
+      s = s + "\0"
+    } else if (e == 'x') {
+      // `\xNN`: exactly two hex digits, one raw byte — no UTF-8 encoding, so
+      // `"\xff"` is one 0xFF byte and NOT the two bytes of U+00FF.
+      if (i + 2 > cend) {
+        return s
+      }
+      let hi = hexDigitVal(src[i])
+      let lo = hexDigitVal(src[i + 1])
+      if (hi < 0 || lo < 0) {
+        return s
+      }
+      s = s + string([u8(hi * 16 + lo)])
+      i = i + 2
+    } else if (e == 'u') {
+      // `\u{...}`: hex digits to the closing brace, encoded as UTF-8.
+      if (i >= cend || src[i] != '{') {
+        return s
+      }
+      i = i + 1
+      let cp = 0
+      let digits = 0
+      while (i < cend && src[i] != '}') {
+        let d = hexDigitVal(src[i])
+        if (d < 0) {
+          return s
+        }
+        // Bounded: past U+10FFFF nothing is encodable, so stop rather than
+        // overflow on a long digit run.
+        if (cp > 0x10FFFF) {
+          return s
+        }
+        cp = cp * 16 + d
+        digits = digits + 1
+        i = i + 1
+      }
+      if (digits == 0 || !isEncodableCodepoint(cp)) {
+        return s
+      }
+      if (i < cend) {
+        i = i + 1 // consume '}'
+      }
+      s = utf8Append(s, cp)
+    } else {
+      s = s + src[i - 1:i]
+    }
+  }
+  return s
+}
+
+function decodeStringContent(src: string, start: int, endPos: int): string {
+  return decodeEscapes(src, start + 1, endPos - 1)
+}
+
+// A raw string's only transformation: a CRLF pair becomes a lone LF, so a file
+// with Windows line endings yields the same value as one without. Every other
+// byte, backslash included, is literal. Mirrors seed lower.zig `normalizeRaw`.
+function normalizeRawString(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 13 && i + 1 < len(s) && s[i + 1] == 10) {
+      out = out + "\n"
+      i = i + 2
+    } else {
+      out = out + s[i:i + 1]
+      i = i + 1
+    }
+  }
+  return out
+}
+
+// Lowers a call's argument expressions in order (unwrapping each `arg` node).
+// Each arg takes the callee's matching parameter type as its context hint (so
+// an untyped literal argument materializes at the parameter's width); an empty
+// `paramTypes` gives no hints.
+function lowerArgs(fc: FnCtx, node: int, paramTypes: []int): []int {
+  return lowerArgsRest(fc, node, paramTypes, -1, 0)
+}
+
+// The declared parameter types of `recvTy`'s `mname` method, for `lowerArgs` to
+// hint with; empty when the signature is not recorded. A method's arguments need
+// the same materialization hint a free function's do — without it an untyped
+// literal lands at its default type and a narrower parameter reads the wrong
+// half of it, so `obj.take(4.5)` handed an f32 parameter an f64 (#1467).
+function methodParamTypes(fc: FnCtx, recvTy: int, mname: string): []int {
+  let fnTy = methodSigLookup(fc.c, "${recvTy}.${mname}")
+  if (fnTy == 0) {
+    return []int(0)
+  }
+  return fc.c.ctx.types[fnTy].members
+}
+
+// `lowerArgs` plus §10.3 variadic collection: the arguments from index `fixed`
+// onward are gathered into ONE `[]elemTy` value, because that single slice is
+// what the callee binds. Passing them as separate scalars instead leaves the
+// callee reading a slice header off an integer — an immediate segfault, not a
+// wrong answer. `fixed < 0` means the callee is not variadic and every argument
+// keeps its own slot, which is what plain `lowerArgs` asks for.
+function lowerArgsRest(fc: FnCtx, node: int, paramTypes: []int, fixed: int, elemTy: int): []int {
+  let args = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])
+  let vals = []int(0)
+  let stop = len(args)
+  if (fixed >= 0 && fixed < stop) {
+    stop = fixed
+  }
+  let i = 0
+  while (i < stop && !fc.failed) {
+    let a = args[i]
+    if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+      a = kidsOf(fc.c.tree, a)[0]
+    }
+    let hint = 0
+    if (i < len(paramTypes)) {
+      hint = paramTypes[i]
+    }
+    // An array argument from a location is copied (value semantics).
+    vals = append(vals, arrayValueForBind(fc, a, lowerExprH(fc, a, hint), defaultType(fc.c, nodeType(fc, a))))
+    i = i + 1
+  }
+  if (fixed < 0 || fc.failed) {
+    return vals
+  }
+  return append(vals, lowerVariadicTail(fc, elemTy, args[stop:len(args)]))
+}
+
+// `lowerArgs` for a call to `decl`, collecting the tail when that signature is
+// variadic. `paramTypes` is supplied by the caller rather than derived here
+// because a generic call substitutes its type params first.
+function lowerArgsFor(fc: FnCtx, node: int, oc: Checker, decl: int, paramTypes: []int): []int {
+  // An extern decl has no kid 3 and cannot be variadic (E0077).
+  if (len(paramTypes) == 0 || isExternDecl(oc.tree, decl)) {
+    return lowerArgs(fc, node, paramTypes)
+  }
+  if (!paramsAreVariadic(oc, kidsOf(oc.tree, decl)[3])) {
+    return lowerArgs(fc, node, paramTypes)
+  }
+  let fixed = len(paramTypes) - 1
+  return lowerArgsRest(fc, node, paramTypes, fixed, paramTypes[fixed])
+}

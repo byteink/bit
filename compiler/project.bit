@@ -1,0 +1,596 @@
+// Self-host Stage 2 (#1345): the project loader — the multi-module front door,
+// ported from compiler/resolve.zig's `Loader` / `loadProject`.
+//
+// A module is a DIRECTORY of `.bit` files sharing one flat namespace. This
+// mirrors the seed's contract exactly, because the two compilers must agree on
+// what a program even is:
+//   - a module's files are its `*.bit` entries sorted bytewise (directory
+//     iteration order is unspecified by the OS, so unsorted input would make
+//     the output nondeterministic),
+//   - modules load imports-first (depth-first), so a module's id is always
+//     greater than every id it depends on — which is what lets the checker walk
+//     `0..n` and find each import already checked,
+//   - `std/x` resolves under the stdlib root; `./x` and `../x` resolve against
+//     the importing module's own directory; anything else is not a module path,
+//   - `std/core` (the prelude) loads first so its exports auto-import into every
+//     module loaded after it — and, because it is loaded before the prelude id
+//     is set, deliberately not into itself.
+//
+// Where this diverges from the seed: the seed keeps a module's files as
+// separate trees and resolves names across them. Here the files are
+// CONCATENATED into one source before parsing. The two are equivalent — a
+// module is one flat namespace either way, and Bit's parser accepts an `import`
+// anywhere a declaration may appear, so a second file's imports still parse —
+// and concatenation lets one `Checker{tree, source}` cover a whole module with
+// no change to the ~460 places that read `c.source`. The cost is that a span is
+// a module-global offset; `fileOf` maps one back to its real file for
+// diagnostics.
+
+// A module's directory listing cannot grow without bound: the loop below is
+// bounded by this, matching the seed's `max_files_per_module`.
+const maxFilesPerModule = 1024
+
+// The maximum module count for one program — a bound on the load recursion, so
+// a pathological import graph cannot exhaust the stack.
+const maxModules = 4096
+
+struct SrcModule {
+  // The canonical directory this module loaded from. Two imports naming the
+  // same directory by different spellings resolve to the same module, so this
+  // is the identity the loader dedupes on.
+  dir: string,
+  // Every `.bit` file's name in load (sorted) order, and the module-global
+  // offset each one's text begins at. Parallel arrays: `fileStarts[i]` is where
+  // `fileNames[i]` begins in `source`.
+  fileNames: []string,
+  fileStarts: []int,
+  // The files concatenated — what the parser and the Checker actually see.
+  source: string,
+  tree: Tree,
+  // Import path text ("std/fs") -> the module id it resolves to.
+  imports: map<string, int>,
+  // Import path text -> why it failed, for exactly the paths whose `imports`
+  // entry is `modPkgFail` (#1737): a bit.lock/cache detail the resolver
+  // (resolve.bit) folds into the diagnostic it reports at that import's own
+  // span, in place of the generic "cannot find module" text.
+  pkgFail: map<string, string>,
+  // Each file's SourceManager id, parallel to `fileNames`. The loader registers
+  // them because it is what reads the files, and a diagnostic must render
+  // against the file its text came from — see `remapDiags`.
+  files: []int,
+}
+
+struct Project {
+  mods: []SrcModule,
+  root: int,
+  // The prelude module's id, or -1 when this build ships no stdlib.
+  prelude: int,
+  // The whole build's diagnostics and the source manager they render against.
+  // They belong to the LOADER: a lex/parse error happens while reading, long
+  // before any Checker exists, and dropping it is not an option — bit2 compiled
+  // `let x = @` to a running binary for exactly that reason.
+  sm: SourceManager,
+  diags: Diagnostics,
+}
+
+// Loader state, threaded by reference (a Bit struct is a reference) through the
+// recursive walk.
+struct Loader {
+  mods: []SrcModule,
+  // Canonical dir -> module id, for modules already fully loaded.
+  resolved: map<string, int>,
+  // Canonical dirs currently being loaded — an import that lands back on one is
+  // an import cycle, not a second load.
+  loading: map<string, bool>,
+  stdRoot: string,
+  prelude: int,
+  sm: SourceManager,
+  diags: Diagnostics,
+  // Absolute file path -> unsaved buffer text, substituted for the file's disk
+  // contents. Empty for a plain `bit build`/`check`; the language server (#1547)
+  // fills it from open documents so a module rechecks against unsaved edits. A
+  // file present here but absent on disk is not listed — the file set still
+  // comes from the directory, matching the seed's buildSnapshot.
+  overlays: map<string, string>,
+  // bit.lock's entries by dependency name (#1737, spec §17.7), read ONCE for
+  // the whole build — one project has one lock file no matter how many modules
+  // it loads. Empty when the project ships no bit.lock, which is not an error
+  // (nothing to resolve as a package either).
+  lockEntries: map<string, LockEntry>,
+  // Set instead of failing `loadProjectOverlay` outright when bit.lock exists
+  // but is malformed JSON — the loader has no fallible return, so this surfaces
+  // through `resolvePackageImport` the same way every other package-resolution
+  // failure does, on the first import that actually needs the lock.
+  lockErr: string,
+  // `~/.bit/pkg` (or wherever `defaultCacheRoot` resolves), read once. `""` with
+  // `cacheRootErr` set when it could not be determined (e.g. HOME unset) —
+  // again surfaced lazily, only when a package import is actually attempted.
+  cacheRoot: string,
+  cacheRootErr: string,
+  // Per-build memoization of `resolvePackageImport`, keyed by package name —
+  // exactly one of the two ever holds an entry for a given name (a
+  // resolution is either a directory or a failure detail, never both, never
+  // neither). Without this, N modules importing the same package name each
+  // re-run `fetchSha`'s warm-cache verify (a `git rev-parse HEAD` subprocess
+  // spawn) instead of the resolver running it once per package.
+  pkgDirCache: map<string, string>,
+  pkgDetailCache: map<string, string>,
+}
+
+// Bytewise string order: <0, 0, >0 like the seed's `std.mem.order`. A shorter
+// string that is a prefix of a longer one sorts first.
+function strCompare(a: string, b: string): int {
+  let n = len(a)
+  if (len(b) < n) {
+    n = len(b)
+  }
+  let i = 0
+  while (i < n) {
+    if (a[i] != b[i]) {
+      if (int(a[i]) < int(b[i])) {
+        return -1
+      }
+      return 1
+    }
+    i = i + 1
+  }
+  if (len(a) == len(b)) {
+    return 0
+  }
+  if (len(a) < len(b)) {
+    return -1
+  }
+  return 1
+}
+
+// ponytail: insertion sort, matching the seed's. A module directory holds a
+// handful of files; swap in a real sort if that stops being true.
+function sortStrings(names: []string): []string {
+  let i = 1
+  while (i < len(names)) {
+    let j = i
+    while (j > 0 && strCompare(names[j - 1], names[j]) > 0) {
+      let tmp = names[j - 1]
+      names[j - 1] = names[j]
+      names[j] = tmp
+      j = j - 1
+    }
+    i = i + 1
+  }
+  return names
+}
+
+// Splits `p` on '/' into its non-empty components.
+function pathParts(p: string): []string {
+  let out = []string(0)
+  let start = 0
+  let i = 0
+  while (i <= len(p)) {
+    if (i == len(p) || p[i] == '/') {
+      if (i > start) {
+        out = append(out, p[start:i])
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Lexical path resolution — the seed's `std.fs.path.resolve` for one path, with
+// no filesystem access: "." drops, ".." pops the previous component. Purely
+// textual, so it never follows a symlink; both compilers agree because both
+// only ever compare the result against another resolved path.
+function pathResolve(p: string): string {
+  let abs = len(p) > 0 && p[0] == '/'
+  let out = []string(0)
+  for part of pathParts(p) {
+    if (part == ".") {
+      continue
+    }
+    if (part == "..") {
+      // A leading ".." on a relative path has nothing to pop and must be kept,
+      // or "../x" would collapse to "x" — a different directory entirely.
+      if (len(out) > 0 && out[len(out) - 1] != "..") {
+        out = out[0:len(out) - 1]
+        continue
+      }
+      if (abs) {
+        continue // ".." above "/" is "/"
+      }
+    }
+    out = append(out, part)
+  }
+  let joined = ""
+  let i = 0
+  while (i < len(out)) {
+    if (i > 0) {
+      joined = joined + "/"
+    }
+    joined = joined + out[i]
+    i = i + 1
+  }
+  if (abs) {
+    return "/" + joined
+  }
+  if (joined == "") {
+    return "."
+  }
+  return joined
+}
+
+// Joins two path pieces, then resolves the result lexically.
+function pathJoinResolve(a: string, b: string): string {
+  if (len(b) > 0 && b[0] == '/') {
+    return pathResolve(b)
+  }
+  if (len(a) == 0) {
+    return pathResolve(b)
+  }
+  return pathResolve(a + "/" + b)
+}
+
+// True when `s` starts with `prefix`.
+function startsWith(s: string, prefix: string): bool {
+  if (len(s) < len(prefix)) {
+    return false
+  }
+  return s[0:len(prefix)] == prefix
+}
+
+// True when `name` ends with ".bit".
+function isBitFile(name: string): bool {
+  if (len(name) < 4) {
+    return false
+  }
+  return name[len(name) - 4:len(name)] == ".bit"
+}
+
+// The `.bit` entries of `dir`, sorted bytewise. The primitive returns entries
+// NUL-terminated (NUL being the one byte a POSIX filename cannot contain).
+function listBitFiles(dir: string): []string {
+  let raw = fsListDir(dir)
+  let out = []string(0)
+  let start = 0
+  let i = 0
+  while (i < len(raw) && len(out) < maxFilesPerModule) {
+    if (raw[i] == 0) {
+      let name = raw[start:i]
+      if (isBitFile(name)) {
+        out = append(out, name)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return sortStrings(out)
+}
+
+// The import paths a parsed module names, in declaration order, deduped. Reads
+// the tree's top-level `import_decl` nodes; the path is the second kid, a
+// string literal whose span includes its quotes.
+function moduleImportPaths(tree: Tree, source: string): []string {
+  let out = []string(0)
+  let seen = map<string, bool>{}
+  for d of kidsOf(tree, tree.root) {
+    if (d == 0) {
+      continue
+    }
+    if (getNode(tree, d).tag != Tag.ImportDecl) {
+      continue
+    }
+    let pathNode = getNode(tree, kidsOf(tree, d)[1])
+    // Strip the surrounding quotes: an import path is a plain string literal
+    // with no escapes (a module directory cannot contain one). A malformed
+    // import leaves the path node poisoned, which yields "" — the resolver
+    // reports that as E0045 rather than the loader crashing on it.
+    let text = stringLitText(source, pathNode.span)
+    let (_, dup) = seen[text]
+    if (dup) {
+      continue
+    }
+    seen[text] = true
+    out = append(out, text)
+  }
+  return out
+}
+
+// Resolves an import path to a directory, and — only on failure — a detail
+// string for the diagnostic. `std/x` maps under the stdlib root; `./x` and
+// `../x` resolve against the importing module's directory; anything else is a
+// package name, resolved against bit.lock + the package cache (#1737,
+// `resolvePackageImport`). `dir == ""` means unresolved; `detail == ""` then
+// means the caller should report the generic "cannot find module" (std/*
+// with no stdlib, matching the pre-#1737 behaviour) rather than a
+// package-specific one.
+function resolveImportDir(lw: Loader, fromDir: string, path: string): (string, string) {
+  if (startsWith(path, "std/")) {
+    if (lw.stdRoot == "") {
+      return "", ""
+    }
+    return pathJoinResolve(lw.stdRoot, path[4:len(path)]), ""
+  }
+  if (startsWith(path, "./") || startsWith(path, "../")) {
+    return pathJoinResolve(fromDir, path), ""
+  }
+  return resolvePackageImport(lw, path)
+}
+
+// Resolves a bare import path — not "std/…", not "./…"/"../…" — against
+// bit.lock + the `~/.bit/pkg` content-addressed cache (#1737, spec §17.7).
+// `name` is looked up as-is: SPEC §17.7's `bit.json` dependency map is keyed by
+// exactly the name a project imports it by (see compiler/pmcli.bit's `name =
+// repo`), and bit.lock (compiler/pmlock.bit) mirrors that key, so this needs no
+// separate manifest read — bit.lock alone is authoritative for what a BUILD
+// resolves, matching the ticket's "never a live fetch during build" contract.
+//
+// Never reaches the network on a warm cache: a locked name whose cache
+// directory already exists is verified with a purely local `git rev-parse
+// HEAD` (pmfetch.bit's `fetchSha`), which never even reads `entry.url`. A cold
+// cache (e.g. a fresh CI checkout) fetches exactly once and re-verifies the
+// result against the locked sha. A name absent from bit.lock is refused
+// outright, before anything resembling a fetch is attempted — this never adds
+// an unlocked dependency during a build.
+//
+// Memoized per build on `lw.pkgDirCache`/`pkgDetailCache`: a project where
+// several modules import the same package would otherwise re-run the warm
+// verify's `git rev-parse HEAD` subprocess once per IMPORT rather than once
+// per package. Exactly one of the two caches ever holds `name` — a result is
+// either a directory or a failure detail, never both.
+function resolvePackageImport(lw: Loader, name: string): (string, string) {
+  let (cachedDir, hasDir) = lw.pkgDirCache[name]
+  if (hasDir) {
+    return cachedDir, ""
+  }
+  let (cachedDetail, hasDetail) = lw.pkgDetailCache[name]
+  if (hasDetail) {
+    return "", cachedDetail
+  }
+  let (dir, detail) = resolvePackageImportUncached(lw, name)
+  if (dir != "") {
+    lw.pkgDirCache[name] = dir
+  } else {
+    lw.pkgDetailCache[name] = detail
+  }
+  return dir, detail
+}
+
+function resolvePackageImportUncached(lw: Loader, name: string): (string, string) {
+  if (lw.lockErr != "") {
+    return "", "bit.lock: ${lw.lockErr}"
+  }
+  let (entry, found) = lw.lockEntries[name]
+  if (!found) {
+    return "", "not declared in bit.lock — run `bit add <gitHost/owner/repo>[@ref]` to add \"${name}\" as a dependency"
+  }
+  if (lw.cacheRootErr != "") {
+    return "", "cannot resolve the package cache: ${lw.cacheRootErr}"
+  }
+  let (host, owner, repo, ok) = pkgUrlHostOwnerRepo(entry.url)
+  if (!ok) {
+    return "", "bit.lock entry for \"${name}\" has a malformed url: ${entry.url}"
+  }
+  let fetched = fetchSha(defaultGitBin, lw.cacheRoot, host, owner, repo, entry.url, entry.commit, defaultTimeoutMs) catch e {
+    return "", e.message()
+  }
+  return fetched.dir, ""
+}
+
+// Splits pmfetch.bit's `"https://" + host + "/" + owner + "/" + repo + ".git"`
+// back into its three parts — the inverse of how `addCmd` (pmcli.bit) built the
+// url a bit.lock entry stores. `ok` is false for anything else (a non-https
+// remote is outside spec §17.7's git-only registry model, and a bit.lock entry
+// this file cannot parse cannot be resolved to a cache path).
+function pkgUrlHostOwnerRepo(url: string): (string, string, string, bool) {
+  let prefix = "https://"
+  let suffix = ".git"
+  if (!startsWith(url, prefix) || len(url) < len(prefix) + len(suffix)) {
+    return "", "", "", false
+  }
+  let rest = url[len(prefix):len(url)]
+  if (rest[len(rest) - len(suffix):len(rest)] != suffix) {
+    return "", "", "", false
+  }
+  let parts = pathParts(rest[0:len(rest) - len(suffix)])
+  if (len(parts) != 3) {
+    return "", "", "", false
+  }
+  return parts[0], parts[1], parts[2], true
+}
+
+// A module id the loader could not produce. The seed's `ImportResolution` is a
+// three-way union (`ok` / `cycle` / `not_found`) and the resolver reports a
+// DIFFERENT diagnostic for each — E0044 for a cycle, E0045 for a miss. Collapsing
+// both to one sentinel is why bit2 emitted neither: `imports[path]` was present
+// for an unresolvable path, so the resolver's absent-key guard never fired.
+const modNotFound = -1
+const modCycle = -2
+// A package-shaped import (not "std/…" nor a relative path) that failed for a
+// bit.lock/cache reason (#1737) — distinct from `modNotFound` so the resolver
+// reports the specific detail (`SrcModule.pkgFail`) instead of the generic
+// "cannot find module" text.
+const modPkgFail = -3
+
+// Loads the module rooted at `dir` and every module it imports, depth-first.
+// Returns its id, `modCycle` when the directory is already on the load stack, or
+// `modNotFound` when it is not a loadable module. Ids are assigned AFTER a
+// module's imports load, so id order is dependency order.
+// Loads the module rooted at `dir`. `only` names the single `.bit` file to take
+// instead of scanning the directory — how a lone `bit run hello.bit` becomes a
+// module of exactly one file (SPEC §17.1); "" scans the whole directory. It
+// deliberately does NOT sweep in siblings: naming a file selects that file,
+// naming a directory selects all of it. Mirrors the seed's Loader.loadModule.
+function loadModuleAt(lw: Loader, dir: string, only: string): int {
+  let canon = pathResolve(dir)
+  let (existing, done) = lw.resolved[canon]
+  if (done) {
+    return existing
+  }
+  let (_, busy) = lw.loading[canon]
+  if (busy) {
+    return modCycle // this module is already on the load stack
+  }
+  if (!fsIsDir(canon)) {
+    return modNotFound
+  }
+  if (len(lw.mods) >= maxModules) {
+    return modNotFound
+  }
+  lw.loading[canon] = true
+
+  let names = listBitFiles(canon)
+  if (only != "") {
+    names = [only]
+  }
+  let source = ""
+  let fileNames = []string(0)
+  let fileStarts = []int(0)
+  let files = []int(0)
+  for name of names {
+    let full = canon + "/" + name
+    let (ovr, hasOvr) = lw.overlays[full]
+    let text = ""
+    if (hasOvr) {
+      text = ovr
+    } else {
+      text = readFile(full) catch e {
+        continue // unreadable file: skipped, like the seed's not_found
+      }
+    }
+    fileNames = append(fileNames, name)
+    fileStarts = append(fileStarts, len(source))
+    // Registered with its OWN text, not the concatenation, so a diagnostic's
+    // line number counts from this file's first line.
+    files = append(files, addFile(lw.sm, full, text))
+    // A newline between files keeps a file that ends mid-line (no trailing
+    // newline) from fusing its last token onto the next file's first one.
+    source = source + text + "\n"
+  }
+
+  // Parse WITH a diagnostics sink. `parseSource` (no sink) silently discarded
+  // every lex and parse error the whole project pipeline ever saw: `bit2 build`
+  // on `let x = @` exited 0 and produced a running binary, because the parser
+  // recovers by skipping the bad token and nothing was left to say so.
+  let before = len(lw.diags.list)
+  let tree = parseSourceD(source, 0, lw.diags)
+  remapDiags(lw.diags, before, files, fileStarts)
+  let imports = map<string, int>{}
+  let pkgFail = map<string, string>{}
+  for path of moduleImportPaths(tree, source) {
+    let (target, detail) = resolveImportDir(lw, canon, path)
+    if (target == "") {
+      if (detail == "") {
+        imports[path] = modNotFound
+      } else {
+        imports[path] = modPkgFail
+        pkgFail[path] = detail
+      }
+      continue
+    }
+    imports[path] = loadModuleAt(lw, target, "")
+  }
+
+  delete(lw.loading, canon)
+  let id = len(lw.mods)
+  lw.mods = append(lw.mods, SrcModule{ dir: canon, fileNames: fileNames,
+    fileStarts: fileStarts, source: source, tree: tree, imports: imports, pkgFail: pkgFail, files: files })
+  lw.resolved[canon] = id
+  return id
+}
+
+// `<rootDir>/bit.lock`'s entries, by name — read once per build (#1737). A
+// missing lock file is not an error (`readLock` already returns an empty list
+// for one, matching bit.lock's "the first `bit add` creates it" contract); a
+// PRESENT but malformed one surfaces its message lazily, through
+// `resolvePackageImport`, the same way every other package-resolution failure
+// does — `loadProjectOverlay` itself has no fallible return to propagate it.
+function loadLockEntries(rootDir: string): (map<string, LockEntry>, string) {
+  let out = map<string, LockEntry>{}
+  let entries = readLock(rootDir + "/bit.lock") catch e {
+    return out, e.message()
+  }
+  for entry of entries {
+    out[entry.name] = entry
+  }
+  return out, ""
+}
+
+// `defaultCacheRoot()` (pmfetch.bit), or `("", detail)` when it could not be
+// determined (HOME unset). Read once per build for the same reason as
+// `loadLockEntries`: one cache root regardless of module count.
+function loadCacheRoot(): (string, string) {
+  let root = defaultCacheRoot() catch e {
+    return "", e.message()
+  }
+  return root, ""
+}
+
+// Loads every module reachable from `rootDir`. `stdRoot` is where `std/*`
+// resolves ("" for a build with no stdlib). The prelude (`std/core`) loads
+// first so its exports auto-import everywhere; its own load sees `prelude == -1`
+// and so does not import itself.
+function loadProject(rootDir: string, rootOnly: string, stdRoot: string): Project {
+  return loadProjectOverlay(rootDir, rootOnly, stdRoot, map<string, string>{})
+}
+
+// As `loadProject`, but `overlays` (absolute file path -> unsaved text) is
+// substituted for those files' disk contents. The language server (#1547) builds
+// a project this way so it can type-check a module against a document that has
+// unsaved edits, or a mid-edit splice for `.`-completion. A plain build passes an
+// empty map and gets identical behaviour to reading every file from disk.
+function loadProjectOverlay(rootDir: string, rootOnly: string, stdRoot: string,
+    overlays: map<string, string>): Project {
+  let sm = newSourceManager()
+  let (lockEntries, lockErr) = loadLockEntries(rootDir)
+  let (cacheRoot, cacheRootErr) = loadCacheRoot()
+  let lw = Loader{ mods: []SrcModule(0), resolved: map<string, int>{},
+    loading: map<string, bool>{}, stdRoot: stdRoot, prelude: -1,
+    sm: sm, diags: newDiagnostics(sm), overlays: overlays,
+    lockEntries: lockEntries, lockErr: lockErr, cacheRoot: cacheRoot, cacheRootErr: cacheRootErr,
+    pkgDirCache: map<string, string>{}, pkgDetailCache: map<string, string>{} }
+  if (stdRoot != "") {
+    lw.prelude = loadModuleAt(lw, pathJoinResolve(stdRoot, "core"), "")
+  }
+  let root = loadModuleAt(lw, rootDir, rootOnly)
+  return Project{ mods: lw.mods, root: root, prelude: lw.prelude, sm: sm, diags: lw.diags }
+}
+
+// Rewrites the spans of the diagnostics added since `start`, from module-global
+// offsets to the file each one actually came from. A module's files are parsed
+// as ONE concatenated source, so the parser can only report module-global spans;
+// left alone they render against the wrong file and line the moment a module has
+// more than one. The checker's `vSpan` does the same for its own diagnostics.
+function remapDiags(d: Diagnostics, start: int, files: []int, fileStarts: []int) {
+  let i = start
+  while (i < len(d.list)) {
+    let sp = d.list[i].span
+    let loc = fileOf(fileStarts, sp.start)
+    if (loc.fileIdx < len(files)) {
+      d.list[i].span = Span{ file: files[loc.fileIdx], start: loc.offset,
+        end: loc.offset + (sp.end - sp.start) }
+    }
+    i = i + 1
+  }
+}
+
+// A module-global offset mapped back to the file it came from: an index into
+// `fileNames`, plus the offset's position within that file.
+struct FileLoc {
+  fileIdx: int,
+  offset: int,
+}
+
+// The file a module-global offset falls in. Diagnostics need this because
+// concatenating a module's files makes every span module-global. Takes the
+// starts alone, not the SrcModule: the Checker holds the same parallel array
+// (it never sees an SrcModule) and must map spans the identical way.
+function fileOf(fileStarts: []int, offset: int): FileLoc {
+  let i = len(fileStarts)
+  while (i > 0) {
+    i = i - 1
+    if (offset >= fileStarts[i]) {
+      return FileLoc{ fileIdx: i, offset: offset - fileStarts[i] }
+    }
+  }
+  return FileLoc{ fileIdx: 0, offset: offset }
+}

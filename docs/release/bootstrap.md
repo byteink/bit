@@ -87,7 +87,7 @@ from a machine that has one.
 
 ```sh
 # on a supported host
-./zig-out/bin/bit build selfhost --target <new-triple> -o bit-<new-triple>
+./zig-out/bin/bit build compiler --target <new-triple> -o bit-<new-triple>
 ```
 
 The new triple must already be a target the compiler can emit for. A genuinely
@@ -112,8 +112,8 @@ enough to ignore.
 `scripts/selfhost-fixpoint.sh` proves:
 
 ```
-stageA builds selfhost/ -> stageB
-stageB builds selfhost/ -> stageC
+stageA builds compiler/ -> stageB
+stageB builds compiler/ -> stageC
 sha256(stageB) == sha256(stageC)
 ```
 
@@ -131,8 +131,8 @@ byte-identical.
 
 ```sh
 # two stage0s: the pinned release, and the one before it
-bit-N-1 build selfhost -o /tmp/stageB-a
-bit-N-2 build selfhost -o /tmp/stageB-b
+bit-N-1 build compiler -o /tmp/stageB-a
+bit-N-2 build compiler -o /tmp/stageB-b
 cmp /tmp/stageB-a /tmp/stageB-b     # must be identical
 ```
 

@@ -1,0 +1,482 @@
+// Self-host Stage 3 (#1346): the x86-64 backend, ported from
+// compiler/codegen/x64.zig. This first slice is the substrate — registers, the
+// two calling conventions, and the low-level encoder every selector builds on.
+//
+// x86-64 differs from the AArch64 port (compiler/arm64.bit) in three ways that
+// shape everything here:
+//   - Instructions are VARIABLE length, built from optional prefixes (REX), an
+//     opcode, a ModRM byte, an optional SIB byte, and an optional displacement
+//     or immediate. There is no fixed 32-bit word to compose, so the encoder is
+//     a byte stream and every emitter must agree on the exact prefix rules.
+//   - Register numbers 8..15 are unreachable without a REX prefix, and the REX
+//     bit that extends a field depends on WHICH field the register sits in
+//     (reg -> REX.R, rm/base -> REX.B, index -> REX.X). Getting that wrong
+//     silently addresses the wrong register rather than failing to assemble.
+//   - There are TWO conventions (SysV and Win64) with different argument
+//     registers and different callee-saved sets, so `XCallConv` is threaded
+//     everywhere the ABI shows through, unlike arm64's single AAPCS64.
+//
+// Every encoder here is checked against the system assembler's own bytes
+// (`clang -c` on the equivalent .s), the same discipline the arm64 port used —
+// an encoder that assembles to plausible-but-wrong bytes is the one bug class
+// that reaches a running binary silently.
+
+// Physical GPR, numbered exactly as the ModRM/REX encoding expects: the enum's
+// ordinal IS the register number, so `xRegNum` is the identity. Reordering this
+// silently re-targets every instruction.
+enum XReg64 {
+  Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15,
+}
+
+// Physical XMM register, numbered the same way.
+enum XmmReg {
+  Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7,
+  Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13, Xmm14, Xmm15,
+}
+
+enum XCallConv {
+  SysV,
+  Win64,
+}
+
+// The register number an enum ordinal stands for. The tables above are declared
+// in encoding order, so this is the ordinal itself — asserted rather than
+// assumed, because everything below indexes REX/ModRM fields with it.
+function xRegNum(r: XReg64): int {
+  return int(r)
+}
+
+function xmmNum(x: XmmReg): int {
+  return int(x)
+}
+
+// The inverse of xRegNum/xmmNum: the register with encoding number `n`. A table
+// rather than a cast, because Bit has no int->enum conversion. Needed where a
+// register arrives as a raw number — the register allocator's results and the
+// architecture-neutral PLoc both carry plain ints.
+function xRegOf(n: int): XReg64 {
+  assert(n >= 0 && n < 16)
+  return [XReg64.Rax, XReg64.Rcx, XReg64.Rdx, XReg64.Rbx, XReg64.Rsp, XReg64.Rbp,
+    XReg64.Rsi, XReg64.Rdi, XReg64.R8, XReg64.R9, XReg64.R10, XReg64.R11,
+    XReg64.R12, XReg64.R13, XReg64.R14, XReg64.R15][n]
+}
+
+function xXmmOf(n: int): XmmReg {
+  assert(n >= 0 && n < 16)
+  return [XmmReg.Xmm0, XmmReg.Xmm1, XmmReg.Xmm2, XmmReg.Xmm3, XmmReg.Xmm4,
+    XmmReg.Xmm5, XmmReg.Xmm6, XmmReg.Xmm7, XmmReg.Xmm8, XmmReg.Xmm9,
+    XmmReg.Xmm10, XmmReg.Xmm11, XmmReg.Xmm12, XmmReg.Xmm13, XmmReg.Xmm14,
+    XmmReg.Xmm15][n]
+}
+
+// Reserved codegen scratch — never allocatable, and never an argument or return
+// register in either convention, so a selector may clobber one at any point
+// without consulting the ABI.
+// Linux x86-64 syscall argument registers (§11.8). Deliberately NOT the SysV C
+// argument list: the kernel ABI's 4th argument is r10, because the `syscall`
+// instruction itself overwrites rcx with the return address.
+function xSyscallArgRegs(): []XReg64 {
+  return [XReg64.Rdi, XReg64.Rsi, XReg64.Rdx, XReg64.R10, XReg64.R8, XReg64.R9]
+}
+
+function xScratch1(): XReg64 { return XReg64.R11 } // accumulator / setcc target / move-cycle temp
+function xScratch2(): XReg64 { return XReg64.R10 } // rhs operand / base pointer
+function xScratch3(): XReg64 { return XReg64.R12 } // index register (array indexing only)
+function xFScratch1(): XmmReg { return XmmReg.Xmm14 } // float accumulator / move-cycle temp
+function xFScratch2(): XmmReg { return XmmReg.Xmm15 } // secondary float operand
+
+// The allocatable GPRs, in the seed's order — regalloc hands out indices into
+// this, so the order is part of the contract, not a preference.
+function xMasterGprs(): []XReg64 {
+  return [XReg64.Rax, XReg64.Rcx, XReg64.Rdx, XReg64.Rbx, XReg64.Rsi, XReg64.Rdi, XReg64.R8, XReg64.R9,
+    XReg64.R13, XReg64.R14, XReg64.R15]
+}
+
+function xMaxIntRegs(): int {
+  return len(xMasterGprs())
+}
+
+// xmm0..xmm13; xmm14/xmm15 are the float scratch pair.
+function xMaxFloatRegs(): int {
+  return 14
+}
+
+// Integer argument registers, in order. SysV passes six, Win64 only four — and
+// they are DIFFERENT registers, not a prefix of the same list.
+function xIntArgRegs(cc: XCallConv): []XReg64 {
+  if (cc == XCallConv.Win64) {
+    return [XReg64.Rcx, XReg64.Rdx, XReg64.R8, XReg64.R9]
+  }
+  return [XReg64.Rdi, XReg64.Rsi, XReg64.Rdx, XReg64.Rcx, XReg64.R8, XReg64.R9]
+}
+
+// Whether `r` survives a call, so the frame must save it before use.
+function xIsCalleeSavedInt(cc: XCallConv, r: XReg64): bool {
+  if (r == XReg64.Rbx || r == XReg64.R13 || r == XReg64.R14 || r == XReg64.R15) {
+    return true
+  }
+  // Win64 additionally preserves rsi/rdi — under SysV those are argument
+  // registers and caller-saved.
+  if (cc == XCallConv.Win64 && (r == XReg64.Rsi || r == XReg64.Rdi)) {
+    return true
+  }
+  return false
+}
+
+// Whether `x` survives a call. SysV preserves no XMM at all; Win64 preserves
+// xmm6..xmm15.
+function xIsCalleeSavedFloat(cc: XCallConv, x: XmmReg): bool {
+  if (cc == XCallConv.SysV) {
+    return false
+  }
+  return xmmNum(x) >= 6
+}
+
+// ---------------------------------------------------------------------------
+// Low-level encoder
+// ---------------------------------------------------------------------------
+
+// The REX prefix. W = 64-bit operand size; R/X/B extend the ModRM.reg,
+// SIB.index and ModRM.rm/SIB.base fields to reach registers 8..15.
+function xRex(w: bool, r: bool, x: bool, b: bool): int {
+  let v = 0x40
+  if (w) { v = v | 8 }
+  if (r) { v = v | 4 }
+  if (x) { v = v | 2 }
+  if (b) { v = v | 1 }
+  return v
+}
+
+// A register-direct ModRM byte (mod=11): `reg` is the opcode's reg field, `rm`
+// the register operand. Only the low 3 bits of each land here — bit 3 travels
+// in REX.R / REX.B.
+function xModrmReg(regField: int, rm: int): int {
+  return 0xC0 | (regField & 7) << 3 | rm & 7
+}
+
+// A memory ModRM byte for the given mod (0, 1 or 2).
+function xModrmMem(mod: int, regField: int, rm: int): int {
+  return (mod & 3) << 6 | (regField & 7) << 3 | rm & 7
+}
+
+// The SIB byte: scale (encoded), index and base registers.
+function xSib(scale: int, index: int, base: int): int {
+  return (xScaleBits(scale) & 3) << 6 | (index & 7) << 3 | base & 7
+}
+
+// The 2-bit scale field for an element width. Only 1/2/4/8 are encodable — a
+// caller with any other width has an addressing mode x86 cannot express, so
+// this asserts rather than silently scaling by 1.
+function xScaleBits(scale: int): int {
+  if (scale == 1) { return 0 }
+  if (scale == 2) { return 1 }
+  if (scale == 4) { return 2 }
+  assert(scale == 8)
+  return 3
+}
+
+// ---------------------------------------------------------------------------
+// The emitter
+// ---------------------------------------------------------------------------
+
+// A growing code buffer with the encoder's byte-level helpers. Kept separate
+// from the full per-function Ctx so the encoders can be tested on their own.
+struct X64Buf {
+  code: []u8,
+}
+
+function newX64Buf(): X64Buf {
+  return X64Buf{ code: []u8(0) }
+}
+
+function xEmitByte(b: X64Buf, v: int) {
+  b.code = append(b.code, u8(v & 0xFF))
+}
+
+function xEmitU32(b: X64Buf, v: int) {
+  xEmitByte(b, v)
+  xEmitByte(b, v >> 8)
+  xEmitByte(b, v >> 16)
+  xEmitByte(b, v >> 24)
+}
+
+function xEmitU64(b: X64Buf, v: int) {
+  xEmitU32(b, v)
+  // An arithmetic shift is fine here: only the low 32 bits of the result are
+  // kept, and they are the same either way.
+  xEmitU32(b, v >> 32)
+}
+
+// Emits a REX prefix only when one is needed. A prefix of 0x40 (all bits clear)
+// is legal but wasted, EXCEPT where it is load-bearing for byte registers —
+// those callers use `xRexForce`.
+function xMaybeRex(b: X64Buf, w: bool, r: bool, x: bool, bb: bool) {
+  if (w || r || x || bb) {
+    xEmitByte(b, xRex(w, r, x, bb))
+  }
+}
+
+// Emits a REX prefix unconditionally. Needed to reach spl/bpl/sil/dil: without
+// ANY rex byte those encodings mean ah/ch/dh/bh instead — a silently different
+// register, not an error.
+function xRexForce(b: X64Buf, w: bool, r: bool, x: bool, bb: bool) {
+  xEmitByte(b, xRex(w, r, x, bb))
+}
+
+// True when a register needs its REX extension bit set to be addressed at all.
+function xNeedsRexBit(n: int): bool {
+  return n >= 8
+}
+
+// `mov dst, src` (64-bit). A move to itself encodes nothing.
+function xMovRR(b: X64Buf, dst: XReg64, src: XReg64) {
+  if (dst == src) {
+    return
+  }
+  xMaybeRex(b, true, xNeedsRexBit(xRegNum(src)), false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(b, 0x89)
+  xEmitByte(b, xModrmReg(xRegNum(src), xRegNum(dst)))
+}
+
+// `mov dst, imm` (64-bit). A value that fits in a sign-extended imm32 uses the
+// 7-byte C7 form; anything else needs the 10-byte movabs. Picking the short
+// form for a value that does NOT fit would sign-extend it into a different
+// number.
+function xMovRI(b: X64Buf, dst: XReg64, imm: int) {
+  if (imm >= -2147483648 && imm <= 2147483647) {
+    xMaybeRex(b, true, false, false, xNeedsRexBit(xRegNum(dst)))
+    xEmitByte(b, 0xC7)
+    xEmitByte(b, xModrmReg(0, xRegNum(dst)))
+    xEmitU32(b, imm)
+    return
+  }
+  xMaybeRex(b, true, false, false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(b, 0xB8 | xRegNum(dst) & 7)
+  xEmitU64(b, imm)
+}
+
+// ---------------------------------------------------------------------------
+// Memory operands
+// ---------------------------------------------------------------------------
+//
+// Every memory operand is emitted mod=10 (disp32), even when the displacement
+// is 0. That is deliberate and load-bearing: mod=00 has two special cases that
+// mean something else entirely — a base of rbp/r13 (low 3 bits 101) encodes
+// "no base, disp32 absolute", and a base of rsp/r12 (low 3 bits 100) is the
+// escape that demands a SIB byte. Always emitting disp32 removes the first case
+// completely and leaves only the second to handle, for a few extra bytes.
+// ponytail: always disp32; shrink to disp8/disp0 if code size ever matters.
+
+// Bit has no optionals, so an index register rides as a (has, reg) pair.
+struct XMem {
+  base: XReg64,
+  hasIndex: bool,
+  index: XReg64,
+  scale: int,
+  disp: int,
+}
+
+function xMemB(base: XReg64, disp: int): XMem {
+  return XMem{ base: base, hasIndex: false, index: XReg64.Rax, scale: 1, disp: disp }
+}
+
+function xMemBI(base: XReg64, index: XReg64, scale: int, disp: int): XMem {
+  return XMem{ base: base, hasIndex: true, index: index, scale: scale, disp: disp }
+}
+
+// True when this operand must carry a SIB byte: an index always needs one, and
+// so does a base whose low 3 bits are 100 — that is rsp AND r12, since the
+// ModRM rm field only sees the low 3 bits and 100 there is the SIB escape
+// rather than a base register. Missing r12 is the classic version of this bug.
+function xNeedsSib(m: XMem): bool {
+  return m.hasIndex || xRegNum(m.base) & 7 == 4
+}
+
+// Emits the ModRM byte, the optional SIB, and the disp32.
+function xMemModRM(b: X64Buf, regField: int, m: XMem) {
+  let rm = xRegNum(m.base) & 7
+  if (xNeedsSib(m)) {
+    rm = 4 // the SIB escape
+  }
+  xEmitByte(b, xModrmMem(2, regField, rm))
+  if (xNeedsSib(m)) {
+    // index=100 in a SIB means "no index" — the slot rsp would occupy, which is
+    // exactly why rsp can never be an index register.
+    let idx = 4
+    if (m.hasIndex) {
+      idx = xRegNum(m.index) & 7
+    }
+    xEmitByte(b, (xScaleBits(m.scale) & 3) << 6 | (idx & 7) << 3 | xRegNum(m.base) & 7)
+  }
+  xEmitU32(b, m.disp)
+}
+
+// The three REX extension bits a memory operand needs: R for the reg field, X
+// for the index, B for the base. Mixing these up addresses a different register
+// rather than failing to encode.
+function xMemRexR(regField: int): bool {
+  return regField >= 8
+}
+
+function xMemRexX(m: XMem): bool {
+  return m.hasIndex && xNeedsRexBit(xRegNum(m.index))
+}
+
+function xMemRexB(m: XMem): bool {
+  return xNeedsRexBit(xRegNum(m.base))
+}
+
+// Loads [base + index*scale + disp] into `dst`, sign/zero-extending from
+// `width` bytes per `signed`. The result is left WIDTH-CANONICAL in a full
+// 64-bit register — bits above the type width match the type — which is the
+// invariant every consumer (logical shift, signed/unsigned compare, division)
+// reads without re-masking.
+function xMovLoad(b: X64Buf, dst: XReg64, m: XMem, width: int, signed: bool) {
+  let r = xMemRexR(xRegNum(dst))
+  let x = xMemRexX(m)
+  let bb = xMemRexB(m)
+  if (width == 8) {
+    xMaybeRex(b, true, r, x, bb)
+    xEmitByte(b, 0x8B)
+  } else if (width == 4) {
+    if (signed) {
+      xMaybeRex(b, true, r, x, bb) // movsxd — REX.W is what makes it 32->64
+      xEmitByte(b, 0x63)
+    } else {
+      // A 32-bit mov zero-extends to 64 for free: no REX.W, no movzx needed.
+      xMaybeRex(b, false, r, x, bb)
+      xEmitByte(b, 0x8B)
+    }
+  } else if (width == 2) {
+    xMaybeRex(b, true, r, x, bb)
+    xEmitByte(b, 0x0F)
+    if (signed) {
+      xEmitByte(b, 0xBF)
+    } else {
+      xEmitByte(b, 0xB7)
+    }
+  } else {
+    assert(width == 1)
+    xMaybeRex(b, true, r, x, bb)
+    xEmitByte(b, 0x0F)
+    if (signed) {
+      xEmitByte(b, 0xBE)
+    } else {
+      xEmitByte(b, 0xB6)
+    }
+  }
+  xMemModRM(b, xRegNum(dst), m)
+}
+
+// `lea dst, [base + disp]` — forms an address without dereferencing it. Used
+// for the interior pointer of an inline aggregate field.
+function xLea(b: X64Buf, dst: XReg64, base: XReg64, disp: int) {
+  let m = xMemB(base, disp)
+  xMaybeRex(b, true, xMemRexR(xRegNum(dst)), false, xMemRexB(m))
+  xEmitByte(b, 0x8D)
+  xMemModRM(b, xRegNum(dst), m)
+}
+
+// Stores the low `width` bytes of `src` to [base + index*scale + disp].
+//
+// The 1-byte case forces a REX prefix even when every extension bit is clear.
+// That bare 0x40 is not waste: without ANY rex byte, the encodings for
+// sil/dil/bpl/spl instead name the legacy ah/ch/dh/bh — a different register,
+// assembled happily, wrong at run time. With a src of cl the assembler omits
+// it; with sil it emits `40`. Both are checked.
+function xMovStore(b: X64Buf, m: XMem, src: XReg64, width: int) {
+  let r = xMemRexR(xRegNum(src))
+  let x = xMemRexX(m)
+  let bb = xMemRexB(m)
+  if (width == 8) {
+    xMaybeRex(b, true, r, x, bb)
+    xEmitByte(b, 0x89)
+  } else if (width == 4) {
+    xMaybeRex(b, false, r, x, bb)
+    xEmitByte(b, 0x89)
+  } else if (width == 2) {
+    // The operand-size prefix must come BEFORE the REX byte, not after.
+    xEmitByte(b, 0x66)
+    xMaybeRex(b, false, r, x, bb)
+    xEmitByte(b, 0x89)
+  } else {
+    assert(width == 1)
+    xRexForce(b, false, r, x, bb)
+    xEmitByte(b, 0x88)
+  }
+  xMemModRM(b, xRegNum(src), m)
+}
+
+// ---------------------------------------------------------------------------
+// Atomics (§11.5)
+// ---------------------------------------------------------------------------
+// Memory-destination RMW forms with the operand in `reg` and the target at
+// [base] (disp=0). `lock` prepends F0; width picks the operand size (0x66 for
+// 2, REX.W for 8). XCHG-with-memory is implicitly locked, so it never prefixes.
+
+// `[lock] 0F <op8|op> [base], reg` — CMPXCHG (op8=B0, op=B1) and XADD
+// (op8=C0, op=C1); both are 0F-prefixed at every width.
+function xAtomic0F(b: X64Buf, lock: bool, op8: int, op: int, reg: XReg64, base: XReg64, width: int) {
+  if (lock) {
+    xEmitByte(b, 0xF0)
+  }
+  if (width == 2) {
+    xEmitByte(b, 0x66)
+  }
+  let m = xMemB(base, 0)
+  let r = xMemRexR(xRegNum(reg))
+  let x = xMemRexX(m)
+  let bb = xMemRexB(m)
+  if (width == 1) {
+    xRexForce(b, false, r, x, bb)
+  } else {
+    xMaybeRex(b, width == 8, r, x, bb)
+  }
+  xEmitByte(b, 0x0F)
+  if (width == 1) {
+    xEmitByte(b, op8)
+  } else {
+    xEmitByte(b, op)
+  }
+  xMemModRM(b, xRegNum(reg), m)
+}
+
+function xLockCmpxchgMem(b: X64Buf, reg: XReg64, base: XReg64, width: int) {
+  xAtomic0F(b, true, 0xB0, 0xB1, reg, base, width)
+}
+function xLockXaddMem(b: X64Buf, reg: XReg64, base: XReg64, width: int) {
+  xAtomic0F(b, true, 0xC0, 0xC1, reg, base, width)
+}
+// `XCHG [base], reg` (86/87) — implicitly locked with a memory operand, so no
+// F0 prefix.
+function xXchgMem(b: X64Buf, reg: XReg64, base: XReg64, width: int) {
+  if (width == 2) {
+    xEmitByte(b, 0x66)
+  }
+  let m = xMemB(base, 0)
+  let r = xMemRexR(xRegNum(reg))
+  let x = xMemRexX(m)
+  let bb = xMemRexB(m)
+  if (width == 1) {
+    xRexForce(b, false, r, x, bb)
+    xEmitByte(b, 0x86)
+  } else {
+    xMaybeRex(b, width == 8, r, x, bb)
+    xEmitByte(b, 0x87)
+  }
+  xMemModRM(b, xRegNum(reg), m)
+}
+// `MFENCE` (0F AE F0) — full barrier after a seq-cst store.
+function xMfence(b: X64Buf) {
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0xAE)
+  xEmitByte(b, 0xF0)
+}
+// `Jcc rel32` to an already-emitted local byte offset (the CAS retry label) — a
+// backward branch inside one instruction's own codegen.
+function xJccToOffset(b: X64Buf, cc: int, targetOff: int) {
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x80 | cc & 0xF)
+  xEmitU32(b, targetOff - (len(b.code) + 4))
+}
+

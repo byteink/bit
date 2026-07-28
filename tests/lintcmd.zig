@@ -4,7 +4,7 @@
 //! This harness execs the SELF-HOSTED `bit` — lint is selfhost-only (LINT.md
 //! §9), and none of what it asserts is reachable from inside the process that
 //! would produce it: an exit code is observable only to a parent, and stdout
-//! and stderr are only distinguishable from outside. `selfhost/lintcheck.bit`
+//! and stderr are only distinguishable from outside. `compiler/lintcheck.bit`
 //! covers everything below that line (the directive reader, the rule, the
 //! renderers) and runs under the same `zig build test`.
 //!

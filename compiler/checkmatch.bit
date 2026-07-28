@@ -1,0 +1,249 @@
+// compiler/checkmatch.bit — split out of check.bit (#1809). Sibling of
+// check.bit: same module, so this needs no imports and no call-site
+// changes. Grouping follows the layout recorded at
+// tag rescue/task-1689-stale-split.
+
+// `a[i:j]` preserves a slice/string type; slicing an array yields a slice of its
+// element.
+function checkSliceExpr(c: Checker, node: int): int {
+  let rt = checkExprType(c, kidsOf(c.tree, node)[0])
+  if (rt == 0) {
+    return 0
+  }
+  let t = c.ctx.types[rt]
+  if (t.kind == TypeKind.Slice) {
+    return rt
+  }
+  if (t.kind == TypeKind.Array) {
+    return mkSlice(c.ctx, t.elem)
+  }
+  if (t.kind == TypeKind.Prim && t.prim == 11) {
+    return rt
+  }
+  return 0
+}
+
+// Binds a for-of / match-arm / catch / comma-ok binder. The type is recorded on
+// the binder's own NODE (`declTypes`) as well as in the flat env, so a reference
+// that resolves to this binder (nodeSymbols -> Symbol.decl -> declTypes) is typed
+// by THIS binder and not by whatever same-named binding another function left in
+// the module-wide env — see `declRefType`.
+//
+// This was a separate `binderTypes` table until #1502, kept out of `declTypes`
+// because a binder is typed at pre-pass 3, BEFORE its iterable local is typed, so
+// the value is best-effort and lowering recomputes the real element type per
+// scope/instance. That is still true — lowering now rewrites `declTypes` at the
+// same binder node wherever it rewrites `env` (see lower.bit's binder sites), so
+// the corrected type wins on the decl path exactly as it does on the env path,
+// and one table serves both.
+function envBind(c: Checker, identNode: int, ty: int) {
+  let n = getNode(c.tree, identNode)
+  c.env[c.source[n.span.start:n.span.end]] = ty
+  c.declTypes[identNode] = ty
+}
+
+// The element type yielded by iterating a value: a slice/array element, or a
+// rune (i32) for a string. ponytail: rune-iteration is a guess — for-of binders
+// are typed for env resolution only, never dumped, so a wrong string element
+// cannot diverge the output unless the binder feeds a dumped call.
+function elementType(c: Checker, iterT: int): int {
+  if (iterT == 0) {
+    return 0
+  }
+  let t = c.ctx.types[iterT]
+  if (t.kind == TypeKind.Slice || t.kind == TypeKind.Array) {
+    return t.elem
+  }
+  if (t.kind == TypeKind.Prim && t.prim == 11) {
+    return primType(c.ctx, 2)
+  }
+  return 0
+}
+
+// Types a `for x of it` / `for (k, v) of it` loop binder into env so the loop
+// body resolves it. A tuple binder over a map yields (key, value); over a
+// slice/array it yields (index i64, element).
+function typeForOfBinder(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  let binder = kids[0]
+  let iterT = checkExprType(c, kids[1])
+  if (getNode(c.tree, binder).tag == Tag.TuplePat) {
+    let subs = kidsOf(c.tree, binder)
+    if (len(subs) == 2 && iterT != 0) {
+      let t = c.ctx.types[iterT]
+      if (t.kind == TypeKind.Map) {
+        envBind(c, subs[0], t.mapKey)
+        envBind(c, subs[1], t.mapVal)
+      } else if (t.kind == TypeKind.Slice || t.kind == TypeKind.Array) {
+        envBind(c, subs[0], primType(c.ctx, 3))
+        envBind(c, subs[1], t.elem)
+      }
+    }
+    return
+  }
+  envBind(c, binder, elementType(c, iterT))
+}
+
+// Types a `match (subject) { V(a, b) => … }`'s arm payload binders (§13.8).
+//
+// The checker never knew `Tag.VariantPat` existed. Lowering bound these itself
+// (`bindArmPayload`) and patched `c.env` as it went, so codegen was correct while
+// the checker's own view of an arm body was whatever ELSE in the module last
+// bound that name — `Text(s) => return s` typed `s` as another function's
+// `s: Shape`. Nothing consumed those types, so nothing noticed.
+//
+// Called from pre-pass 3, not the main sweep: a MatchStmt node sits AFTER its arm
+// bodies in arena order, exactly like a for-of header, so the type is only
+// knowable here. `envBind` records each binder on its NODE, and a binder precedes
+// its own arm body, so the sweep re-applies it in time and no other function's
+// names can reach it (see `Checker.binderTypes`).
+//
+// The payload resolution itself is lowering's, reused verbatim: those helpers
+// take a `Checker` and answer a purely type-level question — they live in
+// lower.bit only because lowering needed them first.
+function typeMatchBinders(c: Checker, node: int) {
+  let k = kidsOf(c.tree, node) // [subject, arm_list]
+  let subjectTy = defaultType(c, checkExprType(c, k[0]))
+  if (subjectTy == 0 || c.ctx.types[subjectTy].kind != TypeKind.Enum) {
+    return
+  }
+  // `variantPayloadTypes` answers off the subject's own TypeId, and every
+  // nominal enum — local, imported, or a bare inferred variant construction —
+  // now instantiates through `instantiateNamed`, so `Opt<i64>.Some(v)` binds
+  // `v` at i64 straight off `ctx.variantPayloads` with no reference to the
+  // scrutinee's syntax at all (#1573).
+  for arm of kidsOf(c.tree, k[1]) {
+    let pat = kidsOf(c.tree, arm)[0]
+    if (getNode(c.tree, pat).tag != Tag.VariantPat) {
+      continue
+    }
+    let vp = kidsOf(c.tree, pat) // [name, binders]
+    if (vp[1] == 0) {
+      continue
+    }
+    let vn = getNode(c.tree, vp[0])
+    let ptypes = variantPayloadTypes(c, subjectTy, c.source[vn.span.start:vn.span.end])
+    let binders = kidsOf(c.tree, vp[1])
+    let i = 0
+    while (i < len(binders) && i < len(ptypes)) {
+      envBind(c, binders[i], ptypes[i])
+      i = i + 1
+    }
+  }
+}
+
+// A match expression yields the type of its (first) arm's body.
+function checkMatch(c: Checker, node: int): int {
+  let arms = kidsOf(c.tree, kidsOf(c.tree, node)[1])
+  if (len(arms) == 0) {
+    return 0
+  }
+  return checkExprType(c, kidsOf(c.tree, arms[0])[1])
+}
+
+// `a[i]` yields the element/value type: slice/array element, map value, or a
+// byte (u8) for a string.
+function checkIndex(c: Checker, node: int): int {
+  let rt = checkExprType(c, kidsOf(c.tree, node)[0])
+  if (rt == 0) {
+    return 0
+  }
+  let t = c.ctx.types[rt]
+  if (t.kind == TypeKind.Slice || t.kind == TypeKind.Array) {
+    return t.elem
+  }
+  if (t.kind == TypeKind.Map) {
+    return t.mapVal
+  }
+  if (t.kind == TypeKind.Prim && t.prim == 11) {
+    return primType(c.ctx, 4)
+  }
+  return 0
+}
+
+// `t.N` yields the N-th element type of a tuple. An out-of-range index or a
+// non-tuple receiver is the validator's business (E0059/E0054); here they simply
+// yield 0 (unknown), which keeps every downstream check permissive.
+function checkTupleIndex(c: Checker, node: int): int {
+  let kids = kidsOf(c.tree, node)
+  let rt = checkExprType(c, kids[0])
+  if (rt == 0) {
+    return 0
+  }
+  let t = c.ctx.types[rt]
+  if (t.kind != TypeKind.Tuple) {
+    return 0
+  }
+  let n = getNode(c.tree, kids[1])
+  let i = parseIntText(c.source[n.span.start:n.span.end])
+  if (i < 0 || i >= len(t.members)) {
+    return 0
+  }
+  return t.members[i]
+}
+
+// The index of a type-param name in a generic struct's `<...>` list, or -1.
+// Reads the struct decl's generic list (kid 1).
+function structTypeParamIndex(c: Checker, structTy: int, tpname: string): int {
+  let oc = typeOwner(c, structTy)
+  let decl = structDeclOf(c, structTy)
+  if (decl == 0) {
+    return -1
+  }
+  let tps = kidsOf(oc.tree, kidsOf(oc.tree, decl)[1])
+  let i = 0
+  while (i < len(tps)) {
+    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[i])[0])
+    if (oc.source[tpn.span.start:tpn.span.end] == tpname) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// How many type params a generic struct declares, or 0 when `structTy` is not a
+// struct or is not generic. The count `structTypeParamIndex` searches within.
+function structTypeParamCount(c: Checker, structTy: int): int {
+  let oc = typeOwner(c, structTy)
+  let decl = structDeclOf(c, structTy)
+  if (decl == 0) {
+    return 0
+  }
+  let gen = kidsOf(oc.tree, decl)[1]
+  if (gen == 0) {
+    return 0
+  }
+  return len(kidsOf(oc.tree, gen))
+}
+
+// The enum type a variant access/construction receiver `Enum` / `Enum<T>`
+// denotes, or 0 when the receiver does not name an enum at all.
+//
+// `Enum<T>` resolves through `typeFromNode`, so it lands on the INSTANTIATION
+// rather than the base template (#1560). Before this, `Opt<string>.Some("s")`
+// typed as the bare `Opt` and every consumer had to recover `string` from the
+// receiver's syntax through a scrutinee-syntax recovery table, retired in
+// #1573. With the instantiation's id in hand the payload types come off
+// `ctx.variantPayloads` already substituted.
+//
+// THE SAFETY RULE: any receiver that does not resolve to an enum type falls
+// back to the base lookup, which is exactly the id this returned before.
+function enumReceiverType(c: Checker, recv: int): int {
+  let baseName = typeNodeName(c, recv)
+  if (baseName == "") {
+    return 0
+  }
+  let ut = userTypeLookup(c, baseName)
+  if (ut == 0 || c.ctx.types[ut].kind != TypeKind.Enum) {
+    return 0
+  }
+  if (getNode(c.tree, recv).tag != Tag.GenericInst) {
+    return ut
+  }
+  let inst = typeFromNode(c, recv)
+  if (inst == 0 || c.ctx.types[inst].kind != TypeKind.Enum) {
+    return ut
+  }
+  return inst
+}

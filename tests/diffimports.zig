@@ -368,7 +368,7 @@ fn emitWithSelfhost(
 // changed: the Mach-O path now refuses an undefined symbol that no `extern
 // function` declared, so a bug in deriving that allowlist would turn every
 // legitimate extern program into a link error. The unit tests in
-// `seed/link/macho.zig` and `selfhost/selfcheck.bit` each cover the rejecting
+// `seed/link/macho.zig` and `compiler/selfcheck.bit` each cover the rejecting
 // direction for one compiler; nothing covered the accepting direction
 // end-to-end, under both, over the real fixtures.
 //

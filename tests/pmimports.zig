@@ -1,6 +1,6 @@
 //! `bit build`/`check`/`run` resolving external-package imports through
 //! bit.lock + the package cache (#1737). This is a selfhost-ONLY feature:
-//! `selfhost/project.bit`'s loader is the only compiler that knows about
+//! `compiler/project.bit`'s loader is the only compiler that knows about
 //! bit.lock at all, the Zig seed has no equivalent and never will. That rules
 //! out `tests/imports.zig`'s shared harness — its own header is explicit that
 //! "the seed's verdict is unconditional" (every project there must build under
@@ -10,7 +10,7 @@
 //!
 //! Two real projects, each driven through the actual CLI (`bit run`,
 //! `bit check`) as a subprocess with a controlled environment — proving the
-//! wiring `selfhost/projectcheck.bit`'s own in-process self-check (which calls
+//! wiring `compiler/projectcheck.bit`'s own in-process self-check (which calls
 //! `Loader`/`resolvePackageImport` directly) cannot reach on its own:
 //! `main.bit`'s command dispatch, and `BIT_PKG_CACHE` actually taking effect
 //! end to end.

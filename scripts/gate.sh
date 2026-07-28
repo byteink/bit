@@ -17,7 +17,7 @@
 #   scripts/gate.sh --arm64            # route the computed zig steps through
 #                                      # scripts/arm64gate.sh (native aarch64-linux)
 #
-# BUCKETS: a change confined to exactly one of selfhost/, runtime/,
+# BUCKETS: a change confined to exactly one of compiler/, runtime/,
 # tests/cases/, examples/, stdlib/ runs only that area's minimal steps. A
 # change touching any OTHER path (build.zig, seed/, spec/, .github/, or
 # anything else unlisted), or spanning MORE THAN ONE of those five areas, is
@@ -81,7 +81,7 @@ touched_list=""
 
 while IFS= read -r f; do
   case "${f}" in
-    selfhost/*) has_selfhost=1 ;;
+    compiler/*) has_selfhost=1 ;;
     runtime/*) has_runtime=1 ;;
     tests/cases/*) has_testcases=1 ;;
     examples/*) has_examples=1 ;;
@@ -128,7 +128,7 @@ elif [ "${bucket_count}" -gt 1 ]; then
   REASON="spans more than one bucket: ${touched_list}"
 elif [ "${has_selfhost}" -eq 1 ]; then
   BUCKET="selfhost"
-  REASON="only selfhost/** changed"
+  REASON="only compiler/** changed"
 elif [ "${has_runtime}" -eq 1 ]; then
   BUCKET="runtime"
   REASON="only runtime/** changed"
@@ -185,7 +185,7 @@ esac
 if [ -n "${POST1}" ]; then echo "  bash ${POST1}"; fi
 if [ "${TARGET}" != "local" ]; then
   if [ -n "${PRE1}" ] || [ -n "${POST1}" ]; then
-    echo "gate: note: the selfhost/examples diff script(s) above run LOCALLY even under --${TARGET} — they need both compilers already built on this machine, not just the remote zig steps."
+    echo "gate: note: the compiler/examples diff script(s) above run LOCALLY even under --${TARGET} — they need both compilers already built on this machine, not just the remote zig steps."
   fi
 fi
 

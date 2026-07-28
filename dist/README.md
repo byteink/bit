@@ -9,7 +9,7 @@ then the pipeline, then the consumers.
 ## Which targets actually ship
 
 The compiler has three build targets — `bit build --target` accepts exactly
-`x86_64-linux`, `aarch64-linux`, `aarch64-macos` (`selfhost/main.bit`,
+`x86_64-linux`, `aarch64-linux`, `aarch64-macos` (`compiler/main.bit`,
 `parseBuildTarget`). Those three, and only those three, are published today.
 
 | target | artifact | status |
@@ -192,7 +192,7 @@ successful version query.
 
 ### How the version is stamped
 
-`selfhost/version.bit` is the single source of truth. `build.zig` parses the
+`compiler/version.bit` is the single source of truth. `build.zig` parses the
 string out of it and hands the same bytes to both compilers, so:
 
 * A release build stamps the tag with `zig build -Dversion=X.Y.Z`. That option is

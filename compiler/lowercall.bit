@@ -1,0 +1,635 @@
+// compiler/lowercall.bit — split out of lower.bit (#1809). Sibling of
+// lower.bit: same module, so this needs no imports and no call-site
+// changes. Grouping follows the layout recorded at
+// tag rescue/task-1689-stale-split.
+
+function lowerCall(fc: FnCtx, node: int): int {
+  let callee = kidsOf(fc.c.tree, node)[0]
+  let cn = getNode(fc.c.tree, callee)
+  if (cn.tag == Tag.Ident) {
+    let name = fc.c.source[cn.span.start:cn.span.end]
+    // PRECEDENCE: local binding > user declaration > builtin (§17.5), which is
+    // what the seed gets for free by resolving the callee to a SYMBOL
+    // (`env.lookup`/`nodeSymbol`) instead of matching its source text. Matching
+    // text put the whole ~70-name `predeclaredFuncs()` list ahead of the user's
+    // own declarations, so a program declaring any of those names — including an
+    // `extern function close` — silently got the builtin instead of its own
+    // function. Almost all of it failed quietly: a user `timeMonoNs` returned the
+    // real clock, `fsClose` returned 0. These two paths must therefore stay ABOVE
+    // the builtin block below, and in this order.
+    // A local/param of function type called directly (`f(x)`) dispatches through
+    // the closure via `call_value`.
+    let lvi = envIndex(fc, name)
+    if (lvi != -1 && fc.c.ctx.types[fc.env[lvi].ty].kind == TypeKind.Func) {
+      let members = fc.c.ctx.types[fc.env[lvi].ty].members
+      let vfixed = -1
+      let velem = 0
+      if (fc.c.ctx.types[fc.env[lvi].ty].variadic && len(members) > 0) {
+        vfixed = len(members) - 1
+        velem = members[vfixed]
+      }
+      let a = lowerArgsRest(fc, node, members, vfixed, velem)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, nodeType(fc, node)))
+      ins.lhs = fc.env[lvi].value
+      ins.args = a
+      return builderEmit(fc.b, ins)
+    }
+    if (funcRefAt(fc.c, calleeNodeOf(fc.c, node), name).decl != 0) {
+      let t = resolveCallTarget(fc, name, node)
+      if (!t.ok) {
+        fc.failed = true
+        return 0
+      }
+      // Hint each argument with the CONCRETE parameter type this call binds.
+      let a = lowerArgsFor(fc, node, t.owner, t.decl, t.paramTypes)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.Call, t.result)
+      ins.name = t.symbol
+      ins.args = a
+      return builderEmit(fc.b, ins)
+    }
+    // `print` (fd 1) and `eprint` (fd 2): one string arg, void, distinct rt
+    // primitives (ABI.md §12).
+    if (name == "print" || name == "eprint") {
+      let a = lowerArgs(fc, node, []int(0))
+      if (fc.failed || len(a) != 1) {
+        fc.failed = true
+        return 0
+      }
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = name
+      ins.args = a
+      return emitRtCall(fc, ins)
+    }
+    if (name == "panic") {
+      let a = lowerArgs(fc, node, []int(0))
+      if (fc.failed || len(a) != 1) {
+        fc.failed = true
+        return 0
+      }
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = "panic"
+      ins.args = a
+      let r = emitRtCall(fc, ins)
+      // panic never returns: the block ends with unreachable.
+      builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+      fc.terminated = true
+      return r
+    }
+    if (name == "assert") {
+      let a = lowerArgs(fc, node, []int(0))
+      if (fc.failed) {
+        return 0
+      }
+      // The runtime assert has a frozen 2-arg signature (ABI.md §12); a 1-arg
+      // source form supplies the default message.
+      if (len(a) == 1) {
+        let cs = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+        cs.sval = "assertion failed"
+        cs.ival = internPoolString(fc, cs.sval)
+        a = append(a, builderEmit(fc.b, cs))
+      }
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = "assert"
+      ins.args = a
+      return emitRtCall(fc, ins)
+    }
+    if (name == "len" || name == "cap") {
+      return lowerLen(fc, node, name == "cap")
+    }
+    if (name == "append") {
+      return lowerAppend(fc, node)
+    }
+    if (name == "delete") {
+      let a0 = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])[0]
+      if (getNode(fc.c.tree, a0).tag == Tag.Arg) {
+        a0 = kidsOf(fc.c.tree, a0)[0]
+      }
+      let keyTy = fc.c.ctx.types[defaultType(fc.c, nodeType(fc, a0))].mapKey
+      let a = lowerArgs(fc, node, [0, keyTy])
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = "map_delete"
+      ins.args = a
+      return emitRtCall(fc, ins)
+    }
+    if (name == "close") {
+      let ca = kidsOf(fc.c.tree, kidsOf(fc.c.tree, node)[2])[0]
+      if (getNode(fc.c.tree, ca).tag == Tag.Arg) {
+        ca = kidsOf(fc.c.tree, ca)[0]
+      }
+      let cv = lowerExpr(fc, ca)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+      ins.name = "chan_close"
+      ins.args = [cv]
+      return emitRtCall(fc, ins)
+    }
+    // Atomics (§11.5): dedicated inline IR ops on a raw `*T` (never an rt_call).
+    if (name == "atomicLoad" || name == "atomicStore" || name == "atomicCmpxchg" ||
+      name == "atomicAdd" || name == "atomicSub" || name == "atomicAnd" ||
+      name == "atomicOr" || name == "atomicXchg") {
+      return lowerAtomic(fc, node, name)
+    }
+    // `ptrOf(s)`: the address of a slice's element 0, as a `*T`.
+    if (name == "ptrOf") {
+      return lowerPtrOf(fc, node)
+    }
+    // `entryOf(f)` (§11.10): `f`'s code address, through the SAME FuncAddr op
+    // `spawn` already uses for its trampoline — a source spelling for an existing
+    // mechanism, not a new one. validate.bit has already proved the operand names
+    // a non-generic, non-extern function declaration.
+    if (name == "entryOf") {
+      return lowerEntryOf(fc, node)
+    }
+    // `stackMapsBegin()`/`stackMapsEnd()` (§11.12): one bound of the merged
+    // stack-map table each, as a `*byte`. No operands to lower — the whole
+    // instruction is a relocation against a name only the linker defines.
+    if (name == "stackMapsBegin" || name == "stackMapsEnd") {
+      return lowerStackMapsAddr(fc, node, name)
+    }
+    // `syscall` (§11.8) is the one builtin with no `bit_rt_*` symbol behind it —
+    // the backends emit the kernel trap inline — so it takes its own IR op and
+    // deliberately never reaches the `primRtName` path below.
+    if (name == "syscall") {
+      // Unhinted deliberately: `syscall` is variadic over i64 words, which is
+      // exactly what an untyped int literal already defaults to.
+      let a = lowerArgs(fc, node, []int(0))
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.Syscall, primType(fc.c.ctx, 3))
+      ins.lhs = a[0]
+      ins.args = a[1:len(a)]
+      return builderEmit(fc.b, ins)
+    }
+    // Primitives that ARE a machine instruction rather than a runtime call
+    // (mirrors compiler/lower.zig's `prim_unary_ops`). Checked before
+    // `primRtName` and single-operand by construction. An `rt_call` here would
+    // make the matching `bit_rt_*` unimplementable in Bit — its body would
+    // compile to a call to itself (tests/rootpins.zig).
+    let uop = primUnaryOp(name)
+    if (uop != Op.BlockParam) {
+      // Hinted by the primitive's declared signature: `float32Bits(4.5)` must
+      // materialize its literal as f32, not at the untyped default f64 (#1467).
+      let ua = lowerArgs(fc, node, builtinParamTypes(fc.c, name))
+      if (fc.failed) {
+        return 0
+      }
+      let uins = mkInstr(uop, nodeType(fc, node))
+      uins.lhs = ua[0]
+      return builderEmit(fc.b, uins)
+    }
+    // A runtime-primitive builtin lowers 1:1 to its `rt_call`, result already
+    // typed by the checker.
+    let rt = primRtName(name)
+    if (rt != "") {
+      let a = lowerArgs(fc, node, builtinParamTypes(fc.c, name))
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.RtCall, nodeType(fc, node))
+      ins.name = rt
+      ins.args = a
+      return emitRtCall(fc, ins)
+    }
+    // A primitive-named callee is a type conversion `T(x)`.
+    if (primIndexByName(name) >= 0) {
+      return lowerConvert(fc, node)
+    }
+  }
+  // A slice-type callee is a length-sized allocation `[]E(n)`: `slice_new(n, n,
+  // is_ref)`. Cap equals len (the single length arg reused).
+  if (cn.tag == Tag.SliceType) {
+    return lowerSliceAlloc(fc, node)
+  }
+  // A map-type callee is an empty-map construction `map<K,V>()`.
+  if (cn.tag == Tag.MapType) {
+    return lowerMapMake(fc, nodeType(fc, node))
+  }
+  // A chan-type callee is a channel construction `chan<T>(n)`.
+  if (cn.tag == Tag.ChanType) {
+    return lowerChanMake(fc, node)
+  }
+  // `ns.fn(...)` — a direct call to a namespaced module's exported function. The
+  // dotted key resolves to the same CallTarget a plain import of that symbol
+  // would, so generic instantiation and module qualification are unchanged.
+  if (cn.tag == Tag.Member) {
+    let qn = nsQualifiedName(fc.c, callee)
+    if (qn != "" && funcDeclLookup(fc.c, qn) != 0) {
+      let t = resolveCallTarget(fc, qn, node)
+      if (!t.ok) {
+        fc.failed = true
+        return 0
+      }
+      let a = lowerArgsFor(fc, node, t.owner, t.decl, t.paramTypes)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.Call, t.result)
+      ins.name = t.symbol
+      ins.args = a
+      return builderEmit(fc.b, ins)
+    }
+  }
+  // A call whose callee is `Enum.Variant` constructs a payload-carrying variant.
+  if (cn.tag == Tag.Member) {
+    let mk0 = kidsOf(fc.c.tree, callee)
+    let baseName = typeNodeName(fc.c, mk0[0])
+    if (baseName != "") {
+      let ut = userTypeLookup(fc.c, baseName)
+      if (ut != 0 && fc.c.ctx.types[ut].kind == TypeKind.Enum) {
+        return lowerVariantConstruction(fc, node)
+      }
+    }
+  }
+  // A method call `recv.method(...)` on an interface value dispatches dynamically
+  // via call_iface, using the method's stable dispatch index.
+  if (cn.tag == Tag.Member) {
+    let mk = kidsOf(fc.c.tree, callee)
+    let recvTy = nodeType(fc, mk[0])
+    if (recvTy != 0 && fc.c.ctx.types[recvTy].kind == TypeKind.Interface) {
+      let mn = getNode(fc.c.tree, mk[1])
+      let mname = fc.c.source[mn.span.start:mn.span.end]
+      let recvV = lowerExpr(fc, mk[0])
+      let a = lowerArgs(fc, node, methodParamTypes(fc, recvTy, mname))
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.CallIface, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
+      ins.lhs = recvV
+      ins.ival = methodId(fc.lowerer, mname)
+      ins.args = a
+      return builderEmit(fc.b, ins)
+    }
+    // A FUNC-TYPED FIELD called through its owner, `r.read(4096)` (SPEC 9.4):
+    // the member is a closure value, not a method, so it dispatches through
+    // `call_value` like any other first-class function. Checked BEFORE the
+    // struct-method branch below, which would otherwise mangle a `call
+    // @read$t<recvId>` against a method that does not exist and fail at link.
+    let fldTy = nodeType(fc, callee)
+    if (fldTy != 0 && fc.c.ctx.types[fldTy].kind == TypeKind.Func &&
+      methodSigLookup(fc.c, "${recvTy}." + fc.c.source[getNode(fc.c.tree, mk[1]).span.start:getNode(fc.c.tree, mk[1]).span.end]) == 0) {
+      let members = fc.c.ctx.types[fldTy].members
+      let fv = lowerExpr(fc, callee)
+      let a = lowerArgs(fc, node, members)
+      if (fc.failed) {
+        return 0
+      }
+      let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, nodeType(fc, node)))
+      ins.lhs = fv
+      ins.args = a
+      return builderEmit(fc.b, ins)
+    }
+    // A method call on a concrete struct value dispatches statically to the
+    // mangled method `call @method$t<recvId>(recv, args)`; the receiver is the
+    // leading argument.
+    if (recvTy != 0 && fc.c.ctx.types[recvTy].kind == TypeKind.Struct) {
+      let mn = getNode(fc.c.tree, mk[1])
+      let mname = fc.c.source[mn.span.start:mn.span.end]
+      let recvV = lowerExpr(fc, mk[0])
+      let a = lowerArgs(fc, node, methodParamTypes(fc, recvTy, mname))
+      if (fc.failed) {
+        return 0
+      }
+      let all = [recvV]
+      let j = 0
+      while (j < len(a)) {
+        all = append(all, a[j])
+        j = j + 1
+      }
+      let ins = mkInstr(Op.Call, unwrapFallible(fc.c, methodResultLookup(fc.c, "${recvTy}.${mname}")))
+      ins.name = methodSymbol(fc.lowerer, mname, recvTy)
+      ins.args = all
+      return builderEmit(fc.b, ins)
+    }
+  }
+  // Any OTHER callee expression that is itself a function VALUE: a slice
+  // element `fs[0](41)`, a returned function `mk()(41)`, a parenthesized one.
+  // No declaration backs these, so the callee lowers as an ordinary value and
+  // dispatches through `call_value` — the same shape the Ident local-binding
+  // and func-typed-field branches above emit. Pairs with the matching tail in
+  // check.bit's `checkCall`; the two must agree on which callees are values.
+  let cty = nodeType(fc, callee)
+  if (cty != 0 && fc.c.ctx.types[cty].kind == TypeKind.Func) {
+    let members = fc.c.ctx.types[cty].members
+    let vfixed = -1
+    let velem = 0
+    if (fc.c.ctx.types[cty].variadic && len(members) > 0) {
+      vfixed = len(members) - 1
+      velem = members[vfixed]
+    }
+    let fv = lowerExpr(fc, callee)
+    let a = lowerArgsRest(fc, node, members, vfixed, velem)
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(Op.CallValue, unwrapFallible(fc.c, nodeType(fc, node)))
+    ins.lhs = fv
+    ins.args = a
+    return builderEmit(fc.b, ins)
+  }
+  fc.failed = true
+  return 0
+}
+
+// A struct field's byte size and whether it holds a GC reference (ABI: prims by
+// width, string/slice/map/chan/tuple/struct/interface/func are 8-byte handles).
+// ponytail: enums treated as ref handles; C-like-enum non-ptr fields deferred.
+struct FieldLayout {
+  size: int,
+  isPtr: bool,
+}
+
+function fieldLayoutFor(fc: FnCtx, ty: int): FieldLayout {
+  let t = fc.c.ctx.types[ty]
+  if (t.kind == TypeKind.Prim) {
+    let p = t.prim
+    if (p == 0 || p == 4 || p == 10) {
+      return FieldLayout{ size: 1, isPtr: false }
+    }
+    if (p == 1 || p == 5) {
+      return FieldLayout{ size: 2, isPtr: false }
+    }
+    if (p == 2 || p == 6 || p == 8) {
+      return FieldLayout{ size: 4, isPtr: false }
+    }
+    if (p == 3 || p == 7 || p == 9) {
+      return FieldLayout{ size: 8, isPtr: false }
+    }
+  }
+  // A raw pointer `*T` (§11.4) is a single word the GC must never follow: 8
+  // bytes, isPtr=false so its offset stays out of the object's pointer map.
+  if (t.kind == TypeKind.Ptr) {
+    return FieldLayout{ size: 8, isPtr: false }
+  }
+  // A C-like enum's value is a bare i64 tag (not a traced pointer); only a boxed
+  // (payload) enum's value is an object reference.
+  if (t.kind == TypeKind.Enum && !t.enumBoxed) {
+    return FieldLayout{ size: 8, isPtr: false }
+  }
+  return FieldLayout{ size: 8, isPtr: true }
+}
+
+// Rounds `x` up to a multiple of `a`.
+function alignUp(x: int, a: int): int {
+  if (a <= 1) {
+    return x
+  }
+  return ((x + a - 1) / a) * a
+}
+
+// A struct's total size (8-aligned), per-field byte offsets, and the offsets of
+// its reference fields (for the GC descriptor). Mirrors layoutFields.
+struct StructLayout {
+  size: int,
+  offsets: []int,
+  ptrOffsets: []int,
+}
+
+// The StructDecl node for a named struct, or 0.
+// The Checker for the module that DECLARES `ty`, a named type. Fields, variants
+// and payloads are all read back from the decl node, and a node index only means
+// something in its own tree (the declOwner rule) — so an imported type (`File`
+// from std/fs, `Option` from the prelude) must be read from its declaring
+// module, not the importer's. Falls back to `c` when the module is unrecorded or
+// out of range, which is the single-module case.
+function typeOwner(c: Checker, ty: int): Checker {
+  let m = c.ctx.types[ty].declModule
+  if (m < 0 || m == c.moduleId || m >= len(c.mods)) {
+    return c
+  }
+  return c.mods[m]
+}
+
+// The decl node of tag `tag` named `name` in `oc`'s tree, or 0.
+function declNodeIn(oc: Checker, tag: Tag, name: string): int {
+  let i = 1
+  while (i < len(oc.tree.nodes)) {
+    if (getNode(oc.tree, i).tag == tag && declName(oc, i) == name) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The `struct_decl` node for `structTy`, or 0. The result indexes into
+// `typeOwner(c, structTy)`'s tree — never `c`'s.
+function structDeclOf(c: Checker, structTy: int): int {
+  return declNodeIn(typeOwner(c, structTy), Tag.StructDecl, typeName(c.ctx, structTy))
+}
+
+// The `enum_decl` node for `enumTy`, or 0. The result indexes into
+// `typeOwner(c, enumTy)`'s tree — never `c`'s.
+function enumDeclOf(c: Checker, enumTy: int): int {
+  return declNodeIn(typeOwner(c, enumTy), Tag.EnumDecl, typeName(c.ctx, enumTy))
+}
+
+// An enum declaration's variant nodes in order (kid 2 is the variant_list).
+function enumVariantNodes(c: Checker, decl: int): []int {
+  return kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+}
+
+// The declaration-order tag of a variant name in `enumTy`, or 0 if not found
+// (the checker has already validated the name).
+function variantOrdinal(c: Checker, enumTy: int, variantName: string): int {
+  let oc = typeOwner(c, enumTy)
+  let decl = enumDeclOf(c, enumTy)
+  if (decl == 0) {
+    return 0
+  }
+  let vs = enumVariantNodes(oc, decl)
+  let i = 0
+  while (i < len(vs)) {
+    let vn = getNode(oc.tree, kidsOf(oc.tree, vs[i])[0])
+    if (oc.source[vn.span.start:vn.span.end] == variantName) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The resolved payload types of a variant (empty when it has none).
+//
+// The TYPE TABLE is the authority (#1560): `ctx.variantPayloads` holds an
+// instantiation's payloads already substituted, so `Opt<i64>` answers i64 for
+// `Some` with no reference to the scrutinee's syntax at all. The AST walk below
+// is the fallback for the cases the table cannot have an entry for — a
+// payload-less variant, or an enum whose declaring module has not been resolved
+// through `declTypeOf` on this path. It reads the payload off `enum_variant`'s
+// kid 1, a `type_list` of type nodes, resolved against the declaring module
+// since that is the tree the type nodes index into.
+function variantPayloadTypes(c: Checker, enumTy: int, variantName: string): []int {
+  let recorded = variantPayloadLookup(c.ctx, "${enumTy}.${variantName}")
+  if (len(recorded) != 0) {
+    return recorded
+  }
+  let out = []int(0)
+  let oc = typeOwner(c, enumTy)
+  let decl = enumDeclOf(c, enumTy)
+  if (decl == 0) {
+    return out
+  }
+  let vs = enumVariantNodes(oc, decl)
+  let i = 0
+  while (i < len(vs)) {
+    let vn = getNode(oc.tree, kidsOf(oc.tree, vs[i])[0])
+    if (oc.source[vn.span.start:vn.span.end] == variantName) {
+      let payload = kidsOf(oc.tree, vs[i])[1]
+      if (payload == 0) {
+        return out
+      }
+      let types = kidsOf(oc.tree, payload)
+      let j = 0
+      while (j < len(types)) {
+        out = append(out, typeFromNode(oc, types[j]))
+        j = j + 1
+      }
+      return out
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Builds a boxed enum object `{ tag: i64 @0, payloadPtr @8 }` (16 bytes, the
+// payload pointer at offset 8 is the one GC-traced word; nil for a no-payload
+// variant). `payload` is -1 for none — NOT 0, which is the value id of the first
+// instruction in a function and so a perfectly valid payload (the seed's
+// `?ir.ValueId` carries the distinction in the type; here it must be a value the
+// id space can never produce).
+function buildEnumObj(fc: FnCtx, enumTy: int, tag: int, payload: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let ga = mkInstr(Op.GcAlloc, enumTy)
+  ga.ival = 16
+  ga.offsets = [8]
+  let obj = builderEmit(fc.b, ga)
+  let tc = mkInstr(Op.ConstInt, i64ty)
+  tc.ival = tag
+  let fs0 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs0.lhs = obj
+  fs0.ival = 0
+  fs0.rhs = builderEmit(fc.b, tc)
+  builderEmit(fc.b, fs0)
+  let payV = payload
+  if (payload == -1) {
+    let z = mkInstr(Op.ConstInt, i64ty)
+    payV = builderEmit(fc.b, z)
+  }
+  let fs8 = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs8.lhs = obj
+  fs8.ival = 8
+  fs8.rhs = payV
+  builderEmit(fc.b, fs8)
+  return obj
+}
+
+// Lowers `Enum.Variant(args)` for a boxed enum: allocate the payload box (word i
+// = arg i, GC-tracing its ref words), then wrap it in the enum object. A
+// no-payload variant construction is just the wrapped nil.
+function lowerVariantConstruction(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node)
+  let enumTy = nodeType(fc, k[0])
+  let mn = getNode(fc.c.tree, kidsOf(fc.c.tree, k[0])[1])
+  let vname = fc.c.source[mn.span.start:mn.span.end]
+  let tag = variantOrdinal(fc.c, enumTy, vname)
+  // The concrete payload types come from the arguments, not the variant's
+  // declared payload — so a generic enum `Opt<i64>.Some(x)` boxes the payload at
+  // the substituted type (i64), giving the right size and GC-ptr offsets.
+  let args = kidsOf(fc.c.tree, k[2])
+  let box = -1
+  if (len(args) > 0) {
+    let offs = []int(0)
+    let i = 0
+    while (i < len(args)) {
+      let at = defaultType(fc.c, checkArgType(fc.c, node, i))
+      if (fieldLayoutFor(fc, at).isPtr) {
+        offs = append(offs, 8 * i)
+      }
+      i = i + 1
+    }
+    let ga = mkInstr(Op.GcAlloc, enumTy)
+    ga.ival = 8 * len(args)
+    ga.offsets = offs
+    box = builderEmit(fc.b, ga)
+    let j = 0
+    while (j < len(args) && !fc.failed) {
+      let a = args[j]
+      if (getNode(fc.c.tree, a).tag == Tag.Arg) {
+        a = kidsOf(fc.c.tree, a)[0]
+      }
+      let av = lowerExprH(fc, a, defaultType(fc.c, checkArgType(fc.c, node, j)))
+      if (fc.failed) {
+        return 0
+      }
+      let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+      fs.lhs = box
+      fs.ival = 8 * j
+      fs.rhs = av
+      builderEmit(fc.b, fs)
+      j = j + 1
+    }
+  }
+  return buildEnumObj(fc, enumTy, tag, box)
+}
+
+// A struct declaration's field nodes in order (unwrapping exported fields).
+function structFieldNodes(c: Checker, decl: int): []int {
+  let raw = kidsOf(c.tree, kidsOf(c.tree, decl)[2])
+  let out = []int(0)
+  let i = 0
+  while (i < len(raw)) {
+    let f = raw[i]
+    if (getNode(c.tree, f).tag == Tag.Export) {
+      f = kidsOf(c.tree, f)[0]
+    }
+    out = append(out, f)
+    i = i + 1
+  }
+  return out
+}
+
+// Computes a struct's layout from its declaration (field decl order). `sub`
+// binds the struct's type parameters to concrete types at a generic
+// construction site (`Box<i64>{...}` -> {T: i64}); noSubst() for a non-generic
+// struct. Without it a generic field `val: T` resolves to the bare type param,
+// which classifies as a pointer — mislabelling `Box<i64>`'s i64 in the GC
+// descriptor.
+function structLayout(fc: FnCtx, oc: Checker, decl: int, sub: TypeSubst): StructLayout {
+  let fields = structFieldNodes(oc, decl)
+  let offsets = []int(0)
+  let ptrOffsets = []int(0)
+  let cur = 0
+  let i = 0
+  while (i < len(fields)) {
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, fields[i])[1], sub)
+    let ft = fc.c.ctx.types[fty]
+    if (ft.kind == TypeKind.Array) {
+      let el = fieldLayoutFor(fc, ft.elem)
+      cur = alignUp(cur, el.size)
+      offsets = append(offsets, cur)
+      cur = cur + ft.arrayLen * el.size
+    } else {
+      let fl = fieldLayoutFor(fc, fty)
+      cur = alignUp(cur, fl.size)
+      offsets = append(offsets, cur)
+      if (fl.isPtr) {
+        ptrOffsets = append(ptrOffsets, cur)
+      }
+      cur = cur + fl.size
+    }
+    i = i + 1
+  }
+  return StructLayout{ size: alignUp(cur, 8), offsets: offsets, ptrOffsets: ptrOffsets }
+}

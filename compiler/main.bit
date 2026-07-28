@@ -1,0 +1,549 @@
+// bit — the Bit-in-Bit compiler (self-host).
+//
+// Early driver. Two modes:
+//   `bit --dump-tokens <file>` — lex the file and print the token stream in
+//     the seed's exact format, so `bit --dump-tokens` diffs byte-for-byte
+//     against `bit --dump-tokens` (the differential harness, #1332).
+//   `bit build <file.bit> [-o out]` — compile a Bit program to a native,
+//     ad-hoc-signed aarch64-macos executable, using nothing but this compiler:
+//     parse -> check -> lower -> opt -> arm64 codegen -> Mach-O object -> link
+//     -> sign. No seed compiler, no system toolchain.
+//   `bit selfcheck` — self-test the ported modules (compiler/selfcheck.bit).
+//     A failed assert panics (exit 2), so `zig build test` / the gate catches a
+//     regression in any ported subsystem. This was the no-args behaviour until
+//     #1827; no args is now a usage error, because a shipped compiler must not
+//     run its own test suite when a user types its name with nothing after it.
+// The real front/middle/back ends land under this directory per the epic.
+import { args, exit, envOr, selfExe } from "std/os"
+import { readFile, writeFile } from "std/fs"
+
+// `--dump-tokens`: one line per token, `<kind> <start>..<end>`, including the
+// synthesized ASI/eof semicolons and the final eof — matching the seed's
+// tokensReport exactly.
+function dumpTokens(path: string) {
+  let src = readFile(path) catch e {
+    print("bit: cannot read ")
+    print(path)
+    print("\n")
+    return
+  }
+  let toks = lexAll(src)
+  let i = 0
+  while (i < len(toks)) {
+    let t = toks[i]
+    print("${kindName(t.kind)} ${t.start}..${t.end}\n")
+    i = i + 1
+  }
+}
+
+// `--dump-ast`: the parsed tree as an s-expression, matching the seed's
+// `ast.dump` byte-for-byte (no trailing newline).
+function dumpAstCmd(path: string) {
+  let src = readFile(path) catch e {
+    print("bit: cannot read ")
+    print(path)
+    print("\n")
+    return
+  }
+  let tree = parseSource(src)
+  print(dumpAst(tree, src))
+}
+
+// `--dump-diags`: run the front-end (lex + parse) and print the rendered
+// diagnostics — empty for a clean file — matching the seed's frontend
+// diagnostic output for the self-host error differential.
+function dumpDiagsCmd(path: string) {
+  let src = readFile(path) catch e {
+    print("bit: cannot read ")
+    print(path)
+    print("\n")
+    return
+  }
+  let sm = newSourceManager()
+  let f = addFile(sm, path, src)
+  let d = newDiagnostics(sm)
+  parseSourceD(src, f, d)
+  print(renderDiags(d))
+}
+
+// `check <file|dir>`: the front end only — load, parse, type-check, validate,
+// and render any diagnostics to stderr, matching `bit check` byte for byte (the
+// check differential diffs the two). Exit 1 iff anything was reported; silence
+// and exit 0 for a clean module.
+//
+// The same pipeline `build` uses, deliberately: `check` IS build's front end, so
+// anything it accepts or rejects here must be what a build would. A file and a
+// directory are both modules (SPEC §17.1); a file's module is that one file.
+function checkCmd(path: string): bool {
+  let rootDir = path
+  let rootOnly = ""
+  if (!fsIsDir(path)) {
+    rootDir = pathDir(path)
+    rootOnly = pathBase(path)
+  }
+  let p = loadProject(rootDir, rootOnly, stdRootPath())
+  if (p.root < 0 || len(p.mods) == 0) {
+    eprint("bit check: not a module: ${path}\n")
+    return false
+  }
+  // Resolve first: the module graph is decided by the loader, not by types, and
+  // the seed reports its resolve errors alongside the parse errors (it resolves
+  // as it loads). Gating before this dropped E0044/E0045 whenever the same file
+  // also had a parse error — exactly the case a malformed `import` produces.
+  let mods = resolveProject(p)
+  // THEN parse+resolve errors, together and alone — the type checker would read
+  // a recovered tree's holes as real nodes and pile noise on top of the cause.
+  if (reportCheckErrors(p.diags)) {
+    return false
+  }
+  checkResolved(p, mods)
+  return !reportCheckErrors(p.diags)
+}
+
+// `--dump-types`: parse + type-check the file and print the binding/param/call
+// type dump, matching the seed's `bit --dump-types` for the self-host Stage-2
+// differential.
+function dumpTypesCmd(path: string) {
+  let src = readFile(path) catch e {
+    print("bit: cannot read ")
+    print(path)
+    print("\n")
+    return
+  }
+  print(checkSourceDump(src))
+}
+
+// `--dump-ir`: parse + check + lower the file and print the SSA IR text,
+// matching the seed's `bit --dump-ir` for the self-host Stage-2 differential.
+function dumpIrCmd(path: string, optimize: bool) {
+  let src = readFile(path) catch e {
+    print("bit: cannot read ")
+    print(path)
+    print("\n")
+    return
+  }
+  if (optimize) {
+    print(lowerSourceDumpOpt(src))
+    return
+  }
+  print(lowerSourceDump(src))
+}
+
+// `bit` is itself a Bit program, so a `BIT_GC` policy aimed at the program
+// under test lands on THE COMPILER as well. `BIT_GC=stress` collects at every
+// loop back-edge, which over a whole compilation is hundreds of thousands of
+// collections — a six-line input takes hours and is indistinguishable from a
+// hang, with nothing on stderr to say why.
+//
+// #1438 was filed s1 against self-hosted safepoint emission on exactly that
+// reading, and cost two agents a debugging session before an empty
+// `print("hi")` program was shown to "hang" identically. The condition is
+// legitimate and self-inflicted, so it is diagnosed rather than second-guessed:
+// overriding the user's environment would be worse than a slow compile.
+//
+// Only `stress` is called out. `BIT_GC=off` also reaches the compiler but makes
+// it faster, not slower, so warning about it would be noise.
+function warnCompilerUnderStressGc() {
+  if (envOr("BIT_GC", "") != "stress") {
+    return
+  }
+  eprint("bit: warning: BIT_GC=stress applies to the compiler itself — bit is a Bit program.\n")
+  eprint("bit: this compile will be orders of magnitude slower, and may look like a hang.\n")
+  eprint("bit: to stress the program under test, build it first, then set BIT_GC to run it.\n")
+}
+
+function main() {
+  warnCompilerUnderStressGc()
+  let a = args()
+  // a[0] is the program name.
+  if (len(a) >= 3 && a[1] == "check") {
+    if (checkCmd(a[2])) {
+      return
+    }
+    exit(1)
+    return
+  }
+  // `lint` takes no mandatory operand — with no paths it lints `.` — so it is
+  // dispatched on argc >= 2, unlike `check`/`run`/`test`.
+  if (len(a) >= 2 && a[1] == "lint") {
+    exit(lintCmd(a))
+    return
+  }
+  // `lsp` takes no operand — it speaks the language server protocol over stdio
+  // until the client closes the stream. Dispatched on argc >= 2 like `lint`.
+  if (len(a) >= 2 && a[1] == "lsp") {
+    lspRun()
+    return
+  }
+  // `doc [--json] <module-dir>`: the module's exported symbols, derived from the
+  // checker rather than a hand-kept list (#1590). Dispatched on argc >= 2 so a
+  // bare `bit doc` reports the usage error rather than the banner, matching the
+  // seed. Exactly one operand must remain after an optional `--json`.
+  if (len(a) >= 2 && a[1] == "doc") {
+    let asJson = false
+    let di = 2
+    if (di < len(a) && a[di] == "--json") {
+      asJson = true
+      di = di + 1
+    }
+    if (di + 1 != len(a)) {
+      eprint("usage: bit doc [--json] <module-dir>\n")
+      exit(1)
+      return
+    }
+    if (docCmd(a[di], asJson)) {
+      return
+    }
+    exit(1)
+    return
+  }
+  if (len(a) >= 3 && a[1] == "add") {
+    exit(addCmd(a))
+    return
+  }
+  // `up [name]` / `update [name]`: the dependency name is OPTIONAL (refresh
+  // everything), unlike `add`'s mandatory spec — dispatched on argc >= 2 like
+  // `lint`/`lsp`, not argc >= 3. `update` is an exact alias, routed to the
+  // same handler as `up`.
+  if (len(a) >= 2 && (a[1] == "up" || a[1] == "update")) {
+    exit(upCmd(a))
+    return
+  }
+  if (len(a) >= 3 && a[1] == "remove") {
+    exit(removeCmd(a))
+    return
+  }
+  if (len(a) >= 3 && a[1] == "run") {
+    exit(runCmd(a[2]))
+    return
+  }
+  if (len(a) >= 3 && a[1] == "test") {
+    exit(testCmd(a[2]))
+    return
+  }
+  if (len(a) >= 3 && a[1] == "fmt") {
+    exit(fmtCmd(a))
+    return
+  }
+  if (len(a) >= 3 && a[1] == "--dump-tokens") {
+    dumpTokens(a[2])
+    return
+  }
+  if (len(a) >= 3 && a[1] == "--dump-types") {
+    dumpTypesCmd(a[2])
+    return
+  }
+  // `--dump-ir-pre` renders the raw lowering; `--dump-ir` renders it after the
+  // optimizer, matching the seed's two surfaces (#1338 / #1339 differentials).
+  if (len(a) >= 3 && a[1] == "--dump-ir-pre") {
+    dumpIrCmd(a[2], false)
+    return
+  }
+  if (len(a) >= 3 && a[1] == "--dump-ir") {
+    dumpIrCmd(a[2], true)
+    return
+  }
+  if (len(a) >= 3 && a[1] == "--dump-ast") {
+    dumpAstCmd(a[2])
+    return
+  }
+  if (len(a) >= 3 && a[1] == "--dump-diags") {
+    dumpDiagsCmd(a[2])
+    return
+  }
+  if (len(a) >= 2 && a[1] == "ar") {
+    if (len(a) < 3) {
+      print("usage: bit ar <out.a> <obj.o...> [--target x86_64-linux|aarch64-linux|aarch64-macos]\n")
+      exit(2)
+      return
+    }
+    if (!arCmd(a)) {
+      exit(1)
+    }
+    return
+  }
+  if (len(a) >= 3 && a[1] == "build") {
+    // Parse: one positional <src>, plus `-o <out>`, `--emit-obj` and
+    // `--target <t>` in any order after it.
+    let out = ""
+    let emitObj = false
+    let freestanding = false
+    let target = hostBuildTarget()
+    let ai = 3
+    while (ai < len(a)) {
+      if (a[ai] == "-o" && ai + 1 < len(a)) {
+        out = a[ai + 1]
+        ai = ai + 2
+      } else if (a[ai] == "--emit-obj" || a[ai] == "-c") {
+        emitObj = true
+        ai = ai + 1
+      } else if (a[ai] == "--freestanding") {
+        freestanding = true
+        ai = ai + 1
+      } else if ((a[ai] == "--target" || a[ai] == "-t") && ai + 1 < len(a)) {
+        let ti = parseBuildTarget(a[ai + 1])
+        if (ti < 0) {
+          print("bit: unknown target '${a[ai + 1]}' (x86_64-linux | aarch64-linux | aarch64-macos)\n")
+          exit(1)
+          return
+        }
+        target = buildTargetOf(ti)
+        ai = ai + 2
+      } else {
+        print("bit: unexpected argument '${a[ai]}'\n")
+        exit(1)
+        return
+      }
+    }
+    if (out == "") {
+      out = pathStem(a[2])
+      if (emitObj) {
+        out = out + ".o"
+      }
+    }
+    // §17.6: freestanding describes an archive MEMBER — a module compiled with
+    // no prelude and emitted alone. There is no freestanding executable today
+    // (nothing would boot it), so require --emit-obj rather than implying it.
+    if (freestanding && !emitObj) {
+      print("bit: --freestanding emits an archive member: pass --emit-obj\n")
+      exit(2)
+      return
+    }
+    let ok = false
+    if (emitObj) {
+      ok = buildObjCmd(a[2], out, target, freestanding)
+    } else {
+      ok = buildCmd(a[2], out, target)
+    }
+    if (ok) {
+      return
+    }
+    exit(1)
+    return
+  }
+  // A real `version` subcommand (#1451). It used to only APPEAR to work: every
+  // unrecognized argument fell through to the banner below, so `bit version`
+  // and `bit vresion` printed the same thing. The output is one machine-
+  // readable line, byte-identical to the seed's, so installers and the
+  // differential harnesses can compare the two compilers directly.
+  if (len(a) >= 2 && (a[1] == "version" || a[1] == "--version" || a[1] == "-V")) {
+    print("bit ${bitVersion}\n")
+    return
+  }
+  // `bit selfcheck`: the in-Bit self-tests, run by `zig build test-selfcheck`.
+  // EXPLICIT, because this used to be what no-args did. That was right while
+  // `bit` was a bootstrap artifact and wrong the moment it shipped: a user who
+  // typed `bit` got lock-file test fixtures ("pmlock check: no stale fixture to
+  // remove") and a wait long enough to look like a hang, instead of usage.
+  if (len(a) >= 2 && a[1] == "selfcheck") {
+    selfcheck()
+    print("bit (self-host, seed-built) ")
+    print(bitVersion)
+    print(" — selfcheck OK\n")
+    return
+  }
+  if (len(a) >= 2) {
+    // Reached only when a known subcommand is missing its operand, or the
+    // subcommand is not one we have. Either way it is a usage error (exit 2),
+    // never the banner.
+    if (isKnownSubcommand(a[1])) {
+      eprint("bit: ${a[1]}: missing operand\n")
+    } else {
+      eprint("bit: unknown subcommand '${a[1]}'\n")
+    }
+    eprint(bitUsage())
+    exit(2)
+    return
+  }
+  // No arguments is a usage error like any other, on stderr with exit 2. It must
+  // not run anything: whatever this path does is the first thing a new user sees.
+  eprint(bitUsage())
+  exit(2)
+}
+
+// The subcommands and flags `main` dispatches above. Kept beside the usage text
+// so a new subcommand cannot be added to one without the other going stale.
+// `selfcheck` is listed here but deliberately NOT in bitUsage(): it is the gate's
+// entry point, not something a user runs, yet a typo'd `bit selfchek` should still
+// report an unknown subcommand rather than a missing operand.
+function isKnownSubcommand(s: string): bool {
+  return s == "build" || s == "run" || s == "check" || s == "test" || s == "ar" ||
+    s == "fmt" || s == "doc" || s == "lsp" || s == "lint" || s == "add" ||
+    s == "up" || s == "update" || s == "remove" || s == "selfcheck" ||
+    s == "--dump-tokens" || s == "--dump-types" || s == "--dump-ir" ||
+    s == "--dump-ir-pre" || s == "--dump-ast" || s == "--dump-diags"
+}
+
+function bitUsage(): string {
+  return "usage: bit <build|run|check|test|fmt|doc|lint|lsp|ar|add|up|update|remove|version> <file.bit> [options]\n"
+}
+
+// `bit fmt [--check] <path>...`: reformats each file to Bit's one canonical
+// style (fmt.bit), rewriting it in place only when the canonical text differs
+// (idempotent). A file that fails to parse is left untouched and its diagnostics
+// go to stderr. `--check` writes nothing and instead names every file that is
+// not already canonical. Returns a nonzero exit code iff any file failed or,
+// under `--check`, drifted — matching the seed's runFmt per-file independence.
+function fmtCmd(a: []string): int {
+  let anyFailed = false
+  let checkOnly = false
+  let start = 2
+  if (len(a) > 2 && a[2] == "--check") {
+    checkOnly = true
+    start = 3
+  }
+  let i = start
+  while (i < len(a)) {
+    if (fmtOneFile(a[i], checkOnly)) {
+      anyFailed = true
+    }
+    i = i + 1
+  }
+  if (anyFailed) {
+    return 1
+  }
+  return 0
+}
+
+// Formats one path. Returns true iff it failed (unreadable, unparseable, or —
+// under `--check` — not canonical). Without `--check`, an out-of-date file is
+// rewritten in place and an unwritable one fails. Every path is independent, so
+// the caller keeps going after a failure (gofmt's contract).
+function fmtOneFile(path: string, checkOnly: bool): bool {
+  let readOk = true
+  let src = readFile(path) catch e {
+    eprint("bit fmt: cannot read ${path}\n")
+    readOk = false
+    ""
+  }
+  if (!readOk) {
+    return true
+  }
+  let r = formatSource(path, src)
+  if (r.failed) {
+    eprint(r.text)
+    return true
+  }
+  if (src == r.text) {
+    return false
+  }
+  if (checkOnly) {
+    eprint("${path}\n")
+    return true
+  }
+  writeFile(path, r.text) catch e {
+    eprint("bit fmt: cannot write ${path}\n")
+    return true
+  }
+  return false
+}
+
+// A path's directory, or "." when it names a bare file in the cwd.
+// "examples/hello.bit" -> "examples", "a.bit" -> ".". Mirrors the seed's
+// `std.fs.path.dirname(src) orelse "."`.
+function pathDir(path: string): string {
+  let b = []byte(path)
+  let cut = -1
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] == u8(47)) { // '/'
+      cut = i
+    }
+    i = i + 1
+  }
+  if (cut < 0) {
+    return "."
+  }
+  if (cut == 0) {
+    return "/" // a path rooted at "/" has "/" as its directory
+  }
+  return path[0:cut]
+}
+
+// A path's final component. "examples/hello.bit" -> "hello.bit".
+function pathBase(path: string): string {
+  let b = []byte(path)
+  let start = 0
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] == u8(47)) { // '/'
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return path[start:len(path)]
+}
+
+// The module name / default output: a path's basename without its extension.
+// "examples/hello.bit" -> "hello", "a.bit" -> "a".
+function pathStem(path: string): string {
+  let b = []byte(path)
+  let start = 0
+  let i = 0
+  while (i < len(b)) {
+    if (b[i] == u8(47)) { // '/'
+      start = i + 1
+    }
+    i = i + 1
+  }
+  let end = len(b)
+  i = start
+  while (i < len(b)) {
+    if (b[i] == u8(46)) { // '.'
+      end = i
+    }
+    i = i + 1
+  }
+  return string(b[start:end])
+}
+
+// Where `std/*` imports resolve (#1452), by the same three-step rule as
+// libbitrtPath: an explicit override, then this binary's own install prefix,
+// then the dev-tree cwd-relative default.
+function stdRootPath(): string {
+  let override = envOr("BIT_STDLIB", "")
+  if (len(override) > 0) {
+    return override
+  }
+  let near = resolveNearExe("stdlib")
+  if (len(near) > 0) {
+    return near
+  }
+  return "stdlib"
+}
+
+// `rel` resolved against the install prefix inferred from this binary's OWN
+// location, or "" when it is not there (#1452).
+//
+// This is what lets an unpacked release artifact work from any directory
+// through a bare symlink into PATH, with no wrapper script and no environment
+// variables — the shipped layout is `<prefix>/bin/bit` beside `<prefix>/stdlib`
+// and `<prefix>/lib/<triple>/libbitrt.a`, so the prefix is the parent of the
+// binary's directory. A flat unpack (everything beside the binary) is tried
+// second.
+//
+// `selfExe()` resolving symlinks is the load-bearing part: an installer puts a
+// symlink in PATH, and the SYMLINK's directory is not the install root. It also
+// returns "" rather than guessing when the platform cannot say — `arg(0)` is
+// not a fallback, being only whatever the caller passed.
+//
+// Probing rather than assuming is deliberate too: a build-tree `bit` sits at
+// `zig-out/bin/bit`, where `../lib/<triple>/libbitrt.a` really does exist but
+// `../stdlib` does not. Each path is answered on its own evidence, so the dev
+// tree keeps working without a special case.
+function resolveNearExe(rel: string): string {
+  let exe = selfExe()
+  if (len(exe) == 0) {
+    return ""
+  }
+  let binDir = pathDir(exe)
+  let atPrefix = "${pathDir(binDir)}/${rel}"
+  if (fsExists(atPrefix)) {
+    return atPrefix
+  }
+  let beside = "${binDir}/${rel}"
+  if (fsExists(beside)) {
+    return beside
+  }
+  return ""
+}

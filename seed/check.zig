@@ -3475,7 +3475,7 @@ const Checker = struct {
         // `BIT_TEST_INDEX=idx` set, for the `bit test` per-test exec loop.
         .{ "osRunTest", PrimSig{ .params = &.{ .string, .i64 }, .ret = .i64 } },
         // `hostTarget() -> i64`: the host BuildTarget ordinal, for `bit build`'s
-        // default target (selfhost/main.bit's hostBuildTarget reads it).
+        // default target (compiler/main.bit's hostBuildTarget reads it).
         .{ "hostTarget", PrimSig{ .params = &.{}, .ret = .i64 } },
         // `auxv() -> i64`: this process's ELF auxiliary-vector address, 0 when
         // there is none. `runtime/auxv`'s `getauxval` scans from it.

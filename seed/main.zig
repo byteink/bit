@@ -41,7 +41,7 @@ pub const macho_reader = @import("link/macho_reader.zig");
 pub const fmt = @import("fmt.zig");
 const lsp = @import("lsp.zig");
 
-/// The toolchain version, parsed by `build.zig` out of `selfhost/version.bit` —
+/// The toolchain version, parsed by `build.zig` out of `compiler/version.bit` —
 /// the single source of truth both compilers share (#1451). It is NOT a second
 /// copy: this file no longer names a version at all, so the seed cannot drift
 /// from the self-hosted `bit` the way it had (seed "0.0.0" vs selfhost
@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
     // every unrecognized argument fell through to the banner below, so
     // `bit version` and `bit vresion` printed the same thing. The line is
     // byte-identical to the self-hosted `bit`'s — both read the same
-    // `selfhost/version.bit` — so an installer or differential harness can
+    // `compiler/version.bit` — so an installer or differential harness can
     // compare the two compilers directly.
     if (argv.len >= 2 and (std.mem.eql(u8, argv[1], "version") or
         std.mem.eql(u8, argv[1], "--version") or std.mem.eql(u8, argv[1], "-V")))
@@ -230,7 +230,7 @@ fn scratchNonce(io: Io) u64 {
 /// artifact: it is never packaged, never installed, and is only ever run from
 /// the build root by `build.zig` and the harnesses. Teaching it to resolve
 /// against its own location would buy nothing and would change the paths every
-/// differential runs on. The self-hosted `bit` in `selfhost/main.bit` is the
+/// differential runs on. The self-hosted `bit` in `compiler/main.bit` is the
 /// one users get, and it resolves properly there.
 /// The native binary target `bit build`/`run` produces. Defaults to whichever
 /// host is running this `bit` (so `bit run` on a Mac execs an arm64 binary, on

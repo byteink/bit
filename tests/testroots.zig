@@ -63,8 +63,8 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 
 /// Directories swept for test-bearing files. Anything else (`tests/`,
-/// `selfhost/`) is out of scope: the harnesses under `tests/` are themselves
-/// roots, and `selfhost/` is Bit, not Zig.
+/// `compiler/`) is out of scope: the harnesses under `tests/` are themselves
+/// roots, and `compiler/` is Bit, not Zig.
 const swept_dirs = [_][]const u8{ "seed", "runtime" };
 
 /// Files excluded from the sweep, each with the reason. Kept explicit and

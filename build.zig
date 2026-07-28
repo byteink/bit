@@ -23,7 +23,7 @@ fn addNamedRun(b: *std.Build, run: *std.Build.Step.Run, name: []const u8, desc: 
 
 /// Rebuild-cache gate (#1796): `libbitrt.a` and the self-hosted `bit` are each
 /// produced by a step that reads its true sources at runtime (`root.zig`'s
-/// `runtime/**/*.zig` today, `selfhost/**/*.bit` always) — invisible to Zig's
+/// `runtime/**/*.zig` today, `compiler/**/*.bit` always) — invisible to Zig's
 /// own build cache, so both were forced with `has_side_effects = true` and
 /// paid their full cost on every invocation regardless of change. This
 /// computes a content fingerprint over the REAL inputs and compares it to a
@@ -145,7 +145,7 @@ const RecordFingerprint = struct {
     }
 };
 
-/// Extracts the toolchain version from `selfhost/version.bit`, the single
+/// Extracts the toolchain version from `compiler/version.bit`, the single
 /// source of truth both compilers report (#1451). The self-hosted `bit`
 /// compiles that constant directly; the Zig seed cannot, so its copy is parsed
 /// out here and handed over as a build option — that is what keeps the two from
@@ -157,10 +157,10 @@ const RecordFingerprint = struct {
 fn readVersionBit(b: *std.Build) []const u8 {
     const src = b.build_root.handle.readFileAlloc(
         b.graph.io,
-        "selfhost/version.bit",
+        "compiler/version.bit",
         b.allocator,
         .limited(64 << 10),
-    ) catch @panic("build: cannot read selfhost/version.bit");
+    ) catch @panic("build: cannot read compiler/version.bit");
     // Line-based, and comment lines are skipped: the file documents its own
     // required shape, so a whole-file `indexOf` matches the DOC COMMENT first
     // and stamps the placeholder as the version. It did — `bit-seed version`
@@ -173,11 +173,11 @@ fn readVersionBit(b: *std.Build) []const u8 {
         if (!std.mem.startsWith(u8, trimmed, marker)) continue;
         const rest = trimmed[marker.len..];
         const end = std.mem.indexOfScalar(u8, rest, '"') orelse
-            @panic("build: selfhost/version.bit has an unterminated version literal");
-        if (end == 0) @panic("build: selfhost/version.bit declares an empty version");
+            @panic("build: compiler/version.bit has an unterminated version literal");
+        if (end == 0) @panic("build: compiler/version.bit declares an empty version");
         return b.allocator.dupe(u8, rest[0..end]) catch @panic("OOM");
     }
-    @panic("build: selfhost/version.bit lost its `const bitVersion: string = \"...\"` declaration");
+    @panic("build: compiler/version.bit lost its `const bitVersion: string = \"...\"` declaration");
 }
 
 pub fn build(b: *std.Build) void {
@@ -189,7 +189,7 @@ pub fn build(b: *std.Build) void {
     // `version.bit` at the tail of this function). Never patch the source file
     // in CI — that makes the tree dirty and the two paths diverge.
     const version_default = readVersionBit(b);
-    const version = b.option([]const u8, "version", "Toolchain version to stamp into both compilers (default: selfhost/version.bit)") orelse version_default;
+    const version = b.option([]const u8, "version", "Toolchain version to stamp into both compilers (default: compiler/version.bit)") orelse version_default;
     // Default to ReleaseSafe, not Debug. In Debug, std's DebugAllocator captures
     // a DWARF stack trace on every allocation for leak detection; the compiler
     // allocates heavily, so a plain `zig build` compiler spent ~38s on the crypto
@@ -207,7 +207,7 @@ pub fn build(b: *std.Build) void {
     // The seed compiler, now retired to `seed/` and installed as `bit-seed`: a
     // bootstrap-only artifact that compiles the self-hosted `bit` (below) and
     // serves as the differential oracle. The canonical `bit` is the self-hosted
-    // compiler under `selfhost/`.
+    // compiler under `compiler/`.
     const exe = b.addExecutable(.{
         .name = "bit-seed",
         .root_module = b.createModule(.{
@@ -216,7 +216,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    // The seed's own version string, parsed out of selfhost/version.bit above so
+    // The seed's own version string, parsed out of compiler/version.bit above so
     // `bit-seed version` and `bit version` print the same bytes (#1451).
     const seed_opts = b.addOptions();
     seed_opts.addOption([]const u8, "version", version);
@@ -799,13 +799,13 @@ pub fn build(b: *std.Build) void {
     // differential because no corpus file used it. A NAME comparison only; see
     // the file header for what it deliberately does not prove. Front end only.
     const ast_tags_opts = b.addOptions();
-    ast_tags_opts.addOption([]const u8, "selfhost_ast", b.pathFromRoot("selfhost/ast.bit"));
-    // The parser is spread over `selfhost/parser*.bit` siblings (#1503), which are
+    ast_tags_opts.addOption([]const u8, "selfhost_ast", b.pathFromRoot("compiler/ast.bit"));
+    // The parser is spread over `compiler/parser*.bit` siblings (#1503), which are
     // one module. Pass the directory and let the test concatenate them: naming a
     // single file here made the gate silently vacuous the moment parser.bit was
     // split — every tag read as unreachable because the scanned file no longer
     // held the parsing code.
-    ast_tags_opts.addOption([]const u8, "selfhost_dir", b.pathFromRoot("selfhost"));
+    ast_tags_opts.addOption([]const u8, "selfhost_dir", b.pathFromRoot("compiler"));
     ast_tags_opts.addOption([]const u8, "seed_parser", b.pathFromRoot("seed/parser.zig"));
 
     const ast_tags_mod = b.createModule(.{
@@ -1135,22 +1135,22 @@ pub fn build(b: *std.Build) void {
     // which named only the host archive and left the install unordered against
     // the harness runs.
 
-    // The canonical `bit`: the self-hosted bit-in-Bit compiler under `selfhost/`,
+    // The canonical `bit`: the self-hosted bit-in-Bit compiler under `compiler/`,
     // compiled by the bootstrap seed (`bit-seed`) and installed as `bit`. This is
     // the compiler that retires the seed (epic #363-#365). Building it means
-    // RUNNING the seed to compile selfhost/, so it only works when the seed
+    // RUNNING the seed to compile compiler/, so it only works when the seed
     // targets the build host — a cross-compile (`-Dtarget=` for another machine)
     // cannot exec it. So a NATIVE `zig build` produces `bit` in the default
     // install; a cross build produces only `bit-seed` (use `bit-seed build
     // selfhost --target <t>` to cross-produce a self-hosted bit). The seed is
     // always kept alongside as `bit-seed` for bootstrap + the differentials.
-    // Runs from the build root so the seed resolves both `selfhost/` and the host
+    // Runs from the build root so the seed resolves both `compiler/` and the host
     // `zig-out/lib/<triple>/libbitrt.a`. Depends on the seed's install
     // specifically (not the whole install step) to stay cycle-free.
     const native = target.result.cpu.arch == b.graph.host.result.cpu.arch and
         target.result.os.tag == b.graph.host.result.os.tag;
 
-    // Rebuild-cache gate (#1796): selfhost/**/*.bit are the compiler's real
+    // Rebuild-cache gate (#1796): compiler/**/*.bit are the compiler's real
     // sources; the resulting `bit` binary also links in the just-built host
     // libbitrt.a, so `libbitrt_fp` (computed above) is folded in rather than
     // re-hashing that archive's own bytes. Skipped on a cross build (can't
@@ -1161,18 +1161,18 @@ pub fn build(b: *std.Build) void {
     const selfhost_gate_applies = native and !b.user_input_options.contains("version");
     const selfhost_artifact_path = b.getInstallPath(.bin, "bit");
     const selfhost_fp = if (selfhost_gate_applies)
-        fingerprintTree(b, &.{"selfhost"}, &.{ "build.zig", ".zigversion" }, libbitrt_fp)
+        fingerprintTree(b, &.{"compiler"}, &.{ "build.zig", ".zigversion" }, libbitrt_fp)
     else
         [_]u8{0} ** 64;
     const selfhost_skip = selfhost_gate_applies and
         fingerprintMatchesStamp(b, "fp-selfhost.stamp", selfhost_fp, &.{selfhost_artifact_path});
 
-    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (selfhost/) with the seed bit-seed → bit");
+    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (compiler/) with the seed bit-seed → bit");
     var selfhosted: std.Build.LazyPath = undefined;
 
     if (selfhost_skip) {
         // Fingerprint unchanged and the previously-built `bit` is still on
-        // disk: skip re-running the seed over selfhost/ entirely. No step
+        // disk: skip re-running the seed over compiler/ entirely. No step
         // dependency on `.cwd_relative` on purpose — nothing writes this file
         // this invocation.
         selfhosted = .{ .cwd_relative = selfhost_artifact_path };
@@ -1180,7 +1180,7 @@ pub fn build(b: *std.Build) void {
         const selfhost_run = b.addRunArtifact(exe);
         selfhost_run.addArg("build");
         if (b.user_input_options.contains("version")) {
-            // `-Dversion=` given: compile a COPY of selfhost/ whose `version.bit`
+            // `-Dversion=` given: compile a COPY of compiler/ whose `version.bit`
             // carries the override, so the self-hosted `bit` reports exactly what
             // the seed reports (#1451). Only on the override path — an ordinary
             // build compiles the real source tree, unstaged, so the common case
@@ -1190,14 +1190,14 @@ pub fn build(b: *std.Build) void {
             // WriteFile emits its added files first and its copied directories
             // second, so an unexcluded copy silently clobbers the stamped file and
             // the release binary reports the development version (it did).
-            _ = staged.addCopyDirectory(b.path("selfhost"), "", .{ .exclude_extensions = &.{"version.bit"} });
+            _ = staged.addCopyDirectory(b.path("compiler"), "", .{ .exclude_extensions = &.{"version.bit"} });
             _ = staged.add("version.bit", b.fmt(
-                "// Generated by build.zig from -Dversion=. Source of truth: selfhost/version.bit.\nconst bitVersion: string = \"{s}\"\n",
+                "// Generated by build.zig from -Dversion=. Source of truth: compiler/version.bit.\nconst bitVersion: string = \"{s}\"\n",
                 .{version},
             ));
             selfhost_run.addDirectoryArg(staged.getDirectory());
         } else {
-            selfhost_run.addArg("selfhost");
+            selfhost_run.addArg("compiler");
         }
         selfhost_run.addArg("-o");
         selfhosted = selfhost_run.addOutputFileArg("bit");
@@ -1208,7 +1208,7 @@ pub fn build(b: *std.Build) void {
         // rebuild would go unrecorded and the next libbitrt-only invocation
         // would needlessly redo it (safe, just not free).
         if (libbitrt_record_step) |s| selfhost_step.dependOn(s);
-        // The seed reads selfhost/*.bit at runtime, invisible to the build cache, so
+        // The seed reads compiler/*.bit at runtime, invisible to the build cache, so
         // an edit to a ported module wouldn't re-trigger the build — force it.
         selfhost_run.has_side_effects = true;
         const install_bit = b.addInstallBinFile(selfhosted, "bit");
@@ -1307,8 +1307,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
-    // self-hosted `bit` from the current selfhost/ sources and runs
-    // `bit selfcheck` — the in-Bit self-checks (selfhost/selfcheck.bit). A failed
+    // self-hosted `bit` from the current compiler/ sources and runs
+    // `bit selfcheck` — the in-Bit self-checks (compiler/selfcheck.bit). A failed
     // assert panics (exit 2) and fails the build, so a regression in a ported
     // module is caught on both arm64 and x86_64. `bit` targets the host, so it
     // always execs here. `has_side_effects` keeps it from being cache-skipped.
@@ -1323,26 +1323,26 @@ pub fn build(b: *std.Build) void {
     selfhost_selfcheck.has_side_effects = true;
     selfhost_selfcheck.expectExitCode(0);
     test_step.dependOn(&selfhost_selfcheck.step);
-    addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (selfhost/selfcheck.bit) only");
+    addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
     //
     // This gate did not exist, and its absence hid a real break: the checker
-    // rejected `selfhost/pmcli.bit` with three E0057s, so `selfhost-fixpoint.sh`
+    // rejected `compiler/pmcli.bit` with three E0057s, so `selfhost-fixpoint.sh`
     // could not produce a stageB at all — while `zig build test` stayed fully green,
-    // because not one of the 28 harnesses ran `bit` over `selfhost/`. A red fixpoint
+    // because not one of the 28 harnesses ran `bit` over `compiler/`. A red fixpoint
     // and a green suite must never coexist again: the fixpoint is the proof that
     // permits retiring seed/, so silence there is expensive.
     //
     // `check`, not `build`: this needs the front end's verdict, not an artifact, and
     // it keeps the step to a few seconds. A golden case cannot cover this — the same
     // construct in a single file checks clean; it took the real module to fail.
-    const selfhost_checks_self = std.Build.Step.Run.create(b, "self-hosted bit checks selfhost/");
+    const selfhost_checks_self = std.Build.Step.Run.create(b, "self-hosted bit checks compiler/");
     selfhost_checks_self.addFileArg(selfhosted);
     selfhost_checks_self.addArg("check");
-    selfhost_checks_self.addArg("selfhost");
+    selfhost_checks_self.addArg("compiler");
     selfhost_checks_self.has_side_effects = true;
     selfhost_checks_self.expectExitCode(0);
     test_step.dependOn(&selfhost_checks_self.step);
-    addNamedRun(b, selfhost_checks_self, "test-selfhostcheck", "the self-hosted bit must check selfhost/ clean (#1829)");
+    addNamedRun(b, selfhost_checks_self, "test-selfhostcheck", "the self-hosted bit must check compiler/ clean (#1829)");
 }

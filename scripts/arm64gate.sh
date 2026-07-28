@@ -61,7 +61,7 @@ docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
   echo "arm64gate: ${IMAGE} is not native aarch64 — it would gate the wrong backend" >&2; exit 127; }
 # The suite needs a `git` binary INSIDE the image: the package manager fetches
 # dependencies by shelling out to it, so tests/imports/pmadd_e2e,
-# tests/pmimports.zig and selfhost/pmclicheck.bit all fail without it — as
+# tests/pmimports.zig and compiler/pmclicheck.bit all fail without it — as
 # `git: not found`, an empty failure, and a bare assertion panic respectively
 # (#1818). Refusing here names the cause once instead of leaving three
 # unrelated-looking harnesses red. macOS has git from the host, which is why a

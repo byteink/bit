@@ -10,12 +10,12 @@
 //!    must not print a version.
 //!
 //! 2. The two compilers disagreed about the version (`seed/main.zig` said
-//!    "0.0.0" while `selfhost/version.bit` said "0.1.0-stub"). Both now derive
-//!    from `selfhost/version.bit`, so this compares their actual output bytes
+//!    "0.0.0" while `compiler/version.bit` said "0.1.0-stub"). Both now derive
+//!    from `compiler/version.bit`, so this compares their actual output bytes
 //!    rather than trusting that wiring.
 //!
 //! The expected string comes from `build_options`, which `build.zig` parses out
-//! of `selfhost/version.bit` — the same value it stamps into both binaries.
+//! of `compiler/version.bit` — the same value it stamps into both binaries.
 //! That is deliberately not a hardcoded literal here: a release build overrides
 //! it with `-Dversion=`, and this must hold for that build too.
 //!

@@ -1,0 +1,551 @@
+// Self-host Stage 3 (#1346): the x86-64 backend, emitter context and frame.
+// Split out of compiler/x64.bit; same module, so nothing here is imported.
+
+// ---------------------------------------------------------------------------
+// Calls, jumps, and fixups
+// ---------------------------------------------------------------------------
+//
+// Every PC-relative field on x86-64 is measured from the END of the
+// instruction, not its start — a rel32 at byte `off` targeting `t` holds
+// `t - (off + 4)`. Getting that 4 wrong is the classic x86 branch bug: it lands
+// four bytes off, which is usually still a valid instruction.
+
+// A pending intra-function jump: the rel32 field's byte offset, and the IR
+// block it targets. Resolved once every block's start offset is known.
+struct XJumpFixup {
+  patchOffset: int,
+  target: int,
+}
+
+// The encoder state for one function being compiled.
+struct XCtx {
+  buf: X64Buf,
+  cc: XCallConv,
+  relocs: []Reloc,
+  fixups: []XJumpFixup,
+  blockOffsets: []int,
+  // Register allocation results and the register file they index into. `alloc`
+  // hands out INDICES; intRegs/floatRegs map an index to a physical register,
+  // and the file differs per function (see xBuildIntRegs).
+  alloc: RegAllocResult,
+  intRegs: []XReg64,
+  floatRegs: []XmmReg,
+  frame: XFrame,
+  // The block currently being emitted — a jump target at or before it is a
+  // back-edge and needs a safepoint poll.
+  curBlock: int,
+  // One code offset per safepoint, in the order buildIntervals collected them
+  // (calls first-seen, then back-edge terminators) — emission re-encounters them
+  // in exactly that order, so `nextSafepointIdx` walks the two lists in lockstep
+  // and each stack map lands on its own return address. Preallocated to the
+  // safepoint count so an emitter deep in the call tree can record without
+  // threading a slice back out.
+  safepointCodeOffsets: []int,
+  nextSafepointIdx: int,
+  // The function being compiled, plus the shared type context and module.
+  // Marshalling and block-param moves classify each value by its TYPE (which
+  // bank it goes in) — something the width-carrying selectors never needed.
+  f: IrFunc,
+  ctx: TypeContext,
+  module: IrModule,
+}
+
+// The register class a value id belongs to — which bank marshals it.
+function xValueClass(cx: XCtx, v: int): RegClass {
+  return regClassOf(cx.ctx, cx.f.instrs[v].ty)
+}
+
+function xEmptyIrFunc(): IrFunc {
+  return IrFunc{ name: "", paramTypes: []int(0), result: 0, blocks: []IrBlock(0),
+    instrs: []IrInstr(0), isFallible: false }
+}
+
+function newXCtx(cc: XCallConv): XCtx {
+  let ctx = newTypeContext()
+  return XCtx{ buf: newX64Buf(), cc: cc, relocs: []Reloc(0), fixups: []XJumpFixup(0),
+    blockOffsets: []int(0),
+    alloc: RegAllocResult{ locations: []RegLoc(0), numSpillSlots: 0,
+      stackMaps: []StackMapEntry(0) },
+    intRegs: []XReg64(0), floatRegs: []XmmReg(0),
+    frame: XFrame{ savedGpr: []XReg64(0), savedXmm: []XmmReg(0), numSpillSlots: 0,
+      frameSize: 0 },
+    curBlock: 0, safepointCodeOffsets: []int(0), nextSafepointIdx: 0,
+    f: xEmptyIrFunc(), ctx: ctx,
+    module: IrModule{ funcs: []IrFunc(0), ctx: ctx, stringPool: []string(0),
+      methodTables: []MethodTable(0), stubbed: []string(0) } }
+}
+
+// `call <symbol>` — `E8 rel32` with a zero placeholder and a relocation naming
+// the target. Nothing needs to exist at codegen time; the linker fills it.
+function xCallReloc(cx: XCtx, symbol: string) {
+  xEmitByte(cx.buf, 0xE8)
+  let off = len(cx.buf.code)
+  xEmitU32(cx.buf, 0)
+  cx.relocs = append(cx.relocs, Reloc{ offset: off, symbol: symbol, kind: RelocKind.Branch })
+}
+
+// `movabs dst, <symbol>` — loads a symbol's full 64-bit address, the linker
+// filling the 8-byte immediate via an Abs64 relocation. This is where x86-64
+// diverges from AArch64, which composes an address from adrp+add instead.
+function xMovAbsSymbol(cx: XCtx, dst: XReg64, symbol: string) {
+  xMaybeRex(cx.buf, true, false, false, xNeedsRexBit(xRegNum(dst)))
+  xEmitByte(cx.buf, 0xB8 | xRegNum(dst) & 7)
+  let off = len(cx.buf.code)
+  xEmitU64(cx.buf, 0)
+  cx.relocs = append(cx.relocs, Reloc{ offset: off, symbol: symbol, kind: RelocKind.Abs64 })
+}
+
+// `call r/m64` (`FF /2`) — an indirect call through a register, for closure
+// dispatch. No REX.W: the operand is 64-bit by default in long mode.
+function xCallReg(cx: XCtx, r: XReg64) {
+  if (xNeedsRexBit(xRegNum(r))) {
+    xEmitByte(cx.buf, xRex(false, false, false, true))
+  }
+  xEmitByte(cx.buf, 0xFF)
+  xEmitByte(cx.buf, xModrmReg(2, xRegNum(r)))
+}
+
+// Emits a jump whose rel32 is a placeholder, recording a fixup for `target`.
+// Always the rel32 form: rel8 would be shorter but cannot reach every block,
+// and choosing between them needs a distance not yet known.
+function xJumpFixup(cx: XCtx, opcodes: []int, target: int) {
+  for o of opcodes {
+    xEmitByte(cx.buf, o)
+  }
+  let off = len(cx.buf.code)
+  xEmitU32(cx.buf, 0)
+  cx.fixups = append(cx.fixups, XJumpFixup{ patchOffset: off, target: target })
+}
+
+function xJmpRel32(cx: XCtx, target: int) {
+  xJumpFixup(cx, [0xE9], target)
+}
+
+function xJccRel32(cx: XCtx, cc: int, target: int) {
+  xJumpFixup(cx, [0x0F, 0x80 | cc & 0xF], target)
+}
+
+// A conditional jump whose destination is not a block but a point in this same
+// function (a br's skip-over). Returns the rel32 field's offset for
+// xPatchRel32Here; it takes no block target, so it registers no fixup.
+function xJccRel32Placeholder(cx: XCtx, cc: int): int {
+  xEmitByte(cx.buf, 0x0F)
+  xEmitByte(cx.buf, 0x80 | cc & 0xF)
+  let off = len(cx.buf.code)
+  xEmitU32(cx.buf, 0)
+  return off
+}
+
+// Writes a rel32 at `patchOffset` so control lands at `targetOff`. The
+// displacement is measured from the END of the 4-byte field, hence the +4.
+function xPatchRel32(cx: XCtx, patchOffset: int, targetOff: int) {
+  let rel = targetOff - (patchOffset + 4)
+  cx.buf.code[patchOffset] = u8(rel & 0xFF)
+  cx.buf.code[patchOffset + 1] = u8(rel >> 8 & 0xFF)
+  cx.buf.code[patchOffset + 2] = u8(rel >> 16 & 0xFF)
+  cx.buf.code[patchOffset + 3] = u8(rel >> 24 & 0xFF)
+}
+
+// Patches a rel32 to land at the current end of the code — "jump to here",
+// used for a br's skip-over once the not-taken path has been emitted.
+function xPatchRel32Here(cx: XCtx, patchOffset: int) {
+  xPatchRel32(cx, patchOffset, len(cx.buf.code))
+}
+
+// Resolves every recorded jump once all block offsets are known.
+function xPatchJumpFixups(cx: XCtx) {
+  for fx of cx.fixups {
+    assert(fx.target >= 0 && fx.target < len(cx.blockOffsets))
+    xPatchRel32(cx, fx.patchOffset, cx.blockOffsets[fx.target])
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Frame layout
+// ---------------------------------------------------------------------------
+//
+// The frame, downward from rbp:
+//   rbp+8   return address
+//   rbp+0   caller's rbp
+//   rbp-8.. saved callee-saved GPRs, one per 8 bytes
+//   then    spill slots, one per 8 bytes
+//   then    saved callee-saved XMMs
+// All offsets are rbp-relative, which is what lets the GC's stack walker stay
+// architecture-neutral (runtime/ABI.md §4).
+
+struct XFrame {
+  savedGpr: []XReg64,
+  savedXmm: []XmmReg,
+  numSpillSlots: int,
+  frameSize: int,
+}
+
+// Spill slot `slot` sits below the saved GPRs.
+function xSpillOffset(f: XFrame, slot: int): int {
+  return -(8 * len(f.savedGpr) + 8 * (slot + 1))
+}
+
+// Saved XMM `i` sits below the GPRs and the spill slots.
+function xXmmSaveOffset(f: XFrame, i: int): int {
+  return -(8 * len(f.savedGpr) + 8 * f.numSpillSlots + 8 * (i + 1))
+}
+
+// Rounds `raw` up so that, after `push rbp` (which itself leaves rsp
+// 16-aligned) plus `savedCount` further 8-byte pushes, `sub rsp, <result>`
+// leaves rsp 16-ALIGNED for any call in the body.
+//
+// This is not cosmetic. SysV requires rsp to be 16-aligned at a call, and the
+// SSE instructions libc uses fault on a misaligned stack — so a frame that is
+// off by 8 crashes inside someone else's code, far from the cause. An ODD
+// number of saved pushes leaves rsp at 8 mod 16, so the frame must itself be
+// 8 mod 16 to bring it back.
+function xAlignFrame(raw: int, savedCount: int): int {
+  let needed = 0
+  if (savedCount % 2 != 0) {
+    needed = 8
+  }
+  let rem = raw % 16
+  if (rem == needed) {
+    return raw
+  }
+  if (rem < needed) {
+    return raw + (needed - rem)
+  }
+  return raw + (16 - (rem - needed))
+}
+
+// `rsp -= imm32` / `rsp += imm32` — group-1 /5 (sub) and /0 (add).
+function xRspAddSub(b: X64Buf, isSub: bool, imm: int) {
+  xEmitByte(b, xRex(true, false, false, false))
+  xEmitByte(b, 0x81)
+  let digit = 0
+  if (isSub) {
+    digit = 5
+  }
+  xEmitByte(b, xModrmReg(digit, xRegNum(XReg64.Rsp)))
+  xEmitU32(b, imm)
+}
+
+// ---------------------------------------------------------------------------
+// Float moves
+// ---------------------------------------------------------------------------
+
+// `movsd`/`movss` register-to-register (`0F 10 /r`). A self-move encodes nothing.
+function xMovFRR(b: X64Buf, dst: XmmReg, src: XmmReg, width: int) {
+  if (dst == src) {
+    return
+  }
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xNeedsRexBit(xmmNum(dst)), false, xNeedsRexBit(xmmNum(src)))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x10)
+  xEmitByte(b, xModrmReg(xmmNum(dst), xmmNum(src)))
+}
+
+// Load: `0F 10` reads memory into the register.
+function xMovFLoad(b: X64Buf, dst: XmmReg, m: XMem, width: int) {
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xMemRexR(xmmNum(dst)), xMemRexX(m), xMemRexB(m))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x10)
+  xMemModRM(b, xmmNum(dst), m)
+}
+
+// Store: `0F 11` is the same instruction with the direction bit set — 0x10 here
+// would read the destination instead of writing it.
+function xMovFStore(b: X64Buf, m: XMem, src: XmmReg, width: int) {
+  xEmitByte(b, xFPrefix(width))
+  xMaybeRex(b, false, xMemRexR(xmmNum(src)), xMemRexX(m), xMemRexB(m))
+  xEmitByte(b, 0x0F)
+  xEmitByte(b, 0x11)
+  xMemModRM(b, xmmNum(src), m)
+}
+
+// ---------------------------------------------------------------------------
+// Parallel moves
+// ---------------------------------------------------------------------------
+//
+// PLoc/PMove/plocEq/swapRemoveMove are architecture-neutral and already defined
+// by the arm64 backend; only the emitters below differ. A spill location is an
+// rbp-relative offset here, exactly as it is x29-relative there.
+
+// Emits one move. A mem->mem move has no single-instruction form, so it routes
+// through the PRIMARY scratch — which is why a move CYCLE must rotate through
+// the SECONDARY scratch instead (see xSequentializeAndEmit).
+function xEmitMove(cx: XCtx, src: PLoc, dst: PLoc, class: RegClass) {
+  if (class == RegClass.Int) {
+    if (src.isReg && dst.isReg) {
+      xMovRR(cx.buf, xRegOf(dst.v), xRegOf(src.v))
+      return
+    }
+    if (src.isReg) {
+      xMovStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xRegOf(src.v), 8)
+      return
+    }
+    if (dst.isReg) {
+      xMovLoad(cx.buf, xRegOf(dst.v), xMemB(XReg64.Rbp, src.v), 8, false)
+      return
+    }
+    xMovLoad(cx.buf, xScratch1(), xMemB(XReg64.Rbp, src.v), 8, false)
+    xMovStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xScratch1(), 8)
+    return
+  }
+  if (src.isReg && dst.isReg) {
+    xMovFRR(cx.buf, xXmmOf(dst.v), xXmmOf(src.v), 8)
+    return
+  }
+  if (src.isReg) {
+    xMovFStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xXmmOf(src.v), 8)
+    return
+  }
+  if (dst.isReg) {
+    xMovFLoad(cx.buf, xXmmOf(dst.v), xMemB(XReg64.Rbp, src.v), 8)
+    return
+  }
+  xMovFLoad(cx.buf, xFScratch1(), xMemB(XReg64.Rbp, src.v), 8)
+  xMovFStore(cx.buf, xMemB(XReg64.Rbp, dst.v), xFScratch1(), 8)
+}
+
+// Emits `movesIn` so every destination receives the value it would under
+// true-parallel semantics, even when sources and destinations alias (register
+// swaps and rotations). Two phases: drain everything nothing else reads, then
+// break the remaining closed cycles through a scratch.
+function xSequentializeAndEmit(cx: XCtx, movesIn: []PMove, class: RegClass) {
+  let moves = []PMove(0)
+  let k = 0
+  while (k < len(movesIn)) {
+    if (!plocEq(movesIn[k].src, movesIn[k].dst)) {
+      moves = append(moves, movesIn[k])
+    }
+    k = k + 1
+  }
+
+  // Phase 1: emit every move whose destination no other pending move still
+  // reads. Each pass either emits one or stops, so this is bounded.
+  let changed = true
+  while (changed) {
+    changed = false
+    let i = 0
+    while (i < len(moves)) {
+      if (anyReads(moves, i, moves[i].dst)) {
+        i = i + 1
+      } else {
+        xEmitMove(cx, moves[i].src, moves[i].dst, class)
+        moves = swapRemoveMove(moves, i)
+        changed = true
+      }
+    }
+  }
+
+  // Phase 2: whatever remains forms closed cycles. Walk one backwards from an
+  // arbitrary destination (each location is written exactly once, so the
+  // predecessor is unique) and rotate it through a scratch register.
+  while (len(moves) > 0) {
+    let cycle = []PMove(0)
+    let start = moves[0].dst
+    let cur = start
+    let guard = 0
+    while (guard <= len(movesIn)) {
+      let found = -1
+      let j = 0
+      while (j < len(moves)) {
+        if (plocEq(moves[j].dst, cur)) {
+          found = j
+          j = len(moves)
+        } else {
+          j = j + 1
+        }
+      }
+      assert(found >= 0) // invariant: what is left forms closed cycles
+      let mv = moves[found]
+      cycle = append(cycle, mv)
+      moves = swapRemoveMove(moves, found)
+      cur = mv.src
+      if (plocEq(cur, start)) {
+        guard = len(movesIn) + 1
+      } else {
+        guard = guard + 1
+      }
+    }
+
+    // The cycle scratch holds one location's value across the WHOLE rotation,
+    // so it must be a register xEmitMove never uses as its own temporary. A
+    // mem->mem step inside the cycle routes through the PRIMARY scratch, so the
+    // cycle must use the SECONDARY one — otherwise the first mem->mem step
+    // overwrites the saved value and the cycle resolves to garbage. That is
+    // #1235: a spilled loop-carried value swapped on a back-edge, silently
+    // corrupted.
+    let scratch = plocReg(xRegNum(xScratch2()))
+    if (class == RegClass.Float) {
+      scratch = plocReg(xmmNum(xFScratch2()))
+    }
+    xEmitMove(cx, cycle[0].dst, scratch, class) // save what is about to be overwritten
+    let i = 0
+    while (i + 1 < len(cycle)) {
+      xEmitMove(cx, cycle[i].src, cycle[i].dst, class)
+      i = i + 1
+    }
+    xEmitMove(cx, scratch, cycle[len(cycle) - 1].dst, class)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Argument marshalling
+// ---------------------------------------------------------------------------
+
+// The register argument `position` lands in, or -1 when it goes on the stack.
+// `classOrdinal` counts only arguments of the same class seen so far.
+//
+// This is where the two ABIs genuinely diverge, and the difference is silent:
+//   - SysV counts the integer and float banks INDEPENDENTLY, so f(int, float,
+//     int) passes rdi, xmm0, rsi.
+//   - Win64 indexes by POSITION, the banks SHARING slots, so the same call
+//     passes rcx, xmm1, r8 — a float at position 1 consumes the slot rcx would
+//     otherwise take.
+// Using one rule under the other convention reads every argument after the
+// first float from the wrong register.
+function xArgReg(cc: XCallConv, class: RegClass, position: int, classOrdinal: int): int {
+  let ord = classOrdinal
+  if (cc == XCallConv.Win64) {
+    ord = position
+  }
+  if (class == RegClass.Int) {
+    let regs = xIntArgRegs(cc)
+    if (ord < len(regs)) {
+      return xRegNum(regs[ord])
+    }
+    return -1
+  }
+  // Floats go in xmm0.. in both conventions; only the count differs (SysV
+  // takes eight, Win64 four).
+  let maxF = 8
+  if (cc == XCallConv.Win64) {
+    maxF = 4
+  }
+  if (ord < maxF) {
+    return ord
+  }
+  return -1
+}
+
+// One argument that did not fit in a register and must be stored to the
+// outgoing stack area.
+struct XStackArg {
+  src: PLoc,
+  class: RegClass,
+  offset: int,
+}
+
+// Stores one overflow argument into the outgoing area at rsp+offset.
+function xEmitStackArgStore(cx: XCtx, sa: XStackArg) {
+  if (sa.class == RegClass.Int) {
+    let r = xScratch1()
+    if (sa.src.isReg) {
+      r = xRegOf(sa.src.v)
+    } else {
+      xMovLoad(cx.buf, r, xMemB(XReg64.Rbp, sa.src.v), 8, false)
+    }
+    xMovStore(cx.buf, xMemB(XReg64.Rsp, sa.offset), r, 8)
+    return
+  }
+  let f = xFScratch1()
+  if (sa.src.isReg) {
+    f = xXmmOf(sa.src.v)
+  } else {
+    xMovFLoad(cx.buf, f, xMemB(XReg64.Rbp, sa.src.v), 8)
+  }
+  xMovFStore(cx.buf, xMemB(XReg64.Rsp, sa.offset), f, 8)
+}
+
+// The outgoing stack area a call needs for `stackCount` overflow arguments,
+// rounded up to keep rsp 16-aligned at the call.
+function xStackReserve(stackCount: int): int {
+  let raw = 8 * stackCount
+  if (raw % 16 == 0) {
+    return raw
+  }
+  return raw + (16 - raw % 16)
+}
+
+// Win64 requires 32 bytes of "shadow space" below the return address that the
+// CALLER reserves and the callee may freely use to spill its four register
+// arguments. Omitting it lets the callee scribble over the caller's own frame.
+function xShadowSpace(cc: XCallConv): int {
+  if (cc == XCallConv.Win64) {
+    return 32
+  }
+  return 0
+}
+
+// ---------------------------------------------------------------------------
+// Per-function register file and safepoints
+// ---------------------------------------------------------------------------
+
+// What one function needs, scanned before register allocation.
+struct XFuncFlags {
+  // Any call, allocation, or loop back-edge — i.e. any safepoint. Such a
+  // function is restricted to callee-saved registers only.
+  hasSafepoints: bool,
+  // Contains a division: rax/rdx are fixed operands of idiv/div.
+  needsRaxRdx: bool,
+  // Contains a shift by a non-constant amount: cl is the only variable shift
+  // count x86-64 has.
+  needsRcx: bool,
+}
+
+// The allocatable GPRs for one function.
+//
+// When a function contains ANY safepoint, its register file shrinks to the
+// callee-saved subset. That sidesteps caller-save spill/reload entirely — no
+// vreg can ever live in a call-clobbered register, so a call needs no save
+// sequence — at the cost of using fewer registers in such functions.
+// ponytail: callee-saved-only across calls; add caller-save spill/reload if
+// this measurably hurts codegen.
+//
+// The rax/rdx and rcx exclusions only apply on the OTHER branch, and that is
+// not an oversight: no callee-saved register in either convention is rax, rdx
+// or rcx, so the restricted file already excludes them.
+function xBuildIntRegs(cc: XCallConv, flags: XFuncFlags): []XReg64 {
+  let out = []XReg64(0)
+  for r of xMasterGprs() {
+    if (flags.hasSafepoints) {
+      if (!xIsCalleeSavedInt(cc, r)) {
+        continue
+      }
+    } else {
+      if (flags.needsRaxRdx && (r == XReg64.Rax || r == XReg64.Rdx)) {
+        continue
+      }
+      if (flags.needsRcx && r == XReg64.Rcx) {
+        continue
+      }
+    }
+    out = append(out, r)
+  }
+  return out
+}
+
+// The allocatable XMMs for one function. Under SysV a function with any
+// safepoint gets NONE — SysV preserves no XMM at all, so every float vreg in
+// such a function spills. Win64 preserves xmm6..xmm15, so those remain.
+function xBuildFloatRegs(cc: XCallConv, hasSafepoints: bool): []XmmReg {
+  let out = []XmmReg(0)
+  if (!hasSafepoints) {
+    let i = 0
+    while (i < xMaxFloatRegs()) {
+      out = append(out, xXmmOf(i))
+      i = i + 1
+    }
+    return out
+  }
+  if (cc == XCallConv.SysV) {
+    return out // empty: SysV preserves no XMM
+  }
+  let r = 6
+  while (r < xMaxFloatRegs()) {
+    out = append(out, xXmmOf(r))
+    r = r + 1
+  }
+  return out
+}
+

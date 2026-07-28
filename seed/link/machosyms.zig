@@ -72,7 +72,7 @@ pub fn archiveDefines(gpa: Allocator, bytes: []const u8, symbol: []const u8) boo
 /// `extern function` on Darwin.
 ///
 /// A LINEAR scan, deliberately, even though the table is sorted: the mirror in
-/// `selfhost/machosyms.bit` has to compute the identical answer, and Bit's
+/// `compiler/machosyms.bit` has to compute the identical answer, and Bit's
 /// string ordering operators do not work (#1664 — `<` on `string` compares
 /// backing-buffer ADDRESSES in the seed and does not lower at all in the
 /// self-hosted compiler, so a binary search there silently answers "absent" for
@@ -88,7 +88,7 @@ pub fn libsystemDefines(symbol: []const u8) bool {
 /// The libSystem export surface Bit admits. Sorted and duplicate-free for
 /// readability and for the maintenance test below; the lookup does not depend
 /// on the order. Verified against a live `dlsym(RTLD_DEFAULT, …)` on
-/// aarch64-macOS, not recalled. `selfhost/machosyms.bit` carries the identical
+/// aarch64-macOS, not recalled. `compiler/machosyms.bit` carries the identical
 /// list — extending one means extending the other.
 pub const libsystem = [_][]const u8{
     "_NSGetExecutablePath",
@@ -307,7 +307,7 @@ test "the libSystem table is sorted and duplicate-free" {
     for (libsystem[1..], 1..) |name, i| {
         try std.testing.expect(std.mem.order(u8, libsystem[i - 1], name) == .lt);
     }
-    // The cross-language tripwire: `selfhost/machosyms.bit` asserts the same
+    // The cross-language tripwire: `compiler/machosyms.bit` asserts the same
     // count, so extending one table without the other reddens a test instead of
     // silently making the two compilers disagree about what links.
     try std.testing.expectEqual(@as(usize, 208), libsystem.len);

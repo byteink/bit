@@ -1,0 +1,702 @@
+// compiler/checkbind.bit — split out of check.bit (#1809). Sibling of
+// check.bit: same module, so this needs no imports and no call-site
+// changes. Grouping follows the layout recorded at
+// tag rescue/task-1689-stale-split.
+
+function checkMember(c: Checker, node: int): int {
+  let kids = kidsOf(c.tree, node)
+  let recv = kids[0]
+  // Enum-variant access `Enum.Variant` / `Enum<T>.Variant` -> the enum type.
+  let et = enumReceiverType(c, recv)
+  if (et != 0) {
+    return et
+  }
+  // `ns.member` — an exported const, module state or function of the namespaced
+  // module, bound under the dotted key. Consulted before the receiver is typed:
+  // a namespace alias is not a value and has no type of its own.
+  let qn = nsQualifiedName(c, node)
+  if (qn != "") {
+    let qe = envLookup(c, qn)
+    if (qe != 0) {
+      return qe
+    }
+    return funcSigLookup(c, qn)
+  }
+  let rt = checkExprType(c, recv)
+  if (rt != 0) {
+    let mn = getNode(c.tree, kids[1])
+    let mname = c.source[mn.span.start:mn.span.end]
+    let recvKey = "${methodRecvType(c, rt)}"
+    // Struct field access `value.field`. `structFieldLookup` is keyed by the
+    // receiver's own TypeId, and a generic INSTANTIATION's fields are recorded
+    // already substituted (`fillInstMembers`, #1540/#1573) — `Box<i64>.val`
+    // reads back i64 directly, with no scrutinee-syntax recovery needed. Only
+    // inside the generic's OWN body, where the receiver is still the bare
+    // template, can this answer stay a type param, and there is no better
+    // answer to recover there either.
+    if (c.ctx.types[rt].kind == TypeKind.Struct) {
+      let ft = structFieldLookup(c, recvKey + "." + mname)
+      if (ft != 0) {
+        return ft
+      }
+    }
+    // An uncalled method value `value.method` -> the method's func type.
+    return methodSigLookup(c, recvKey + "." + mname)
+  }
+  return 0
+}
+
+// Registers a struct/enum/interface declaration as a named type so references
+// to it resolve. Called in a pre-pass (types may be referenced before their
+// declaration, §9).
+// Mints a named type (struct / enum / interface). Records the declaring module:
+// fields, variants and payloads are all read back from the decl node later, and
+// only this module's tree can be indexed by it (see typeOwner).
+function registerNamedType(c: Checker, name: string, kind: TypeKind) {
+  let t = leafType(kind)
+  t.name = name
+  t.hasName = true
+  t.declModule = c.moduleId
+  c.userTypes[name] = addType(c.ctx, t)
+}
+
+// The source text of a declaration's name (kid 0 is the name leaf).
+function declName(c: Checker, node: int): string {
+  let nm = getNode(c.tree, kidsOf(c.tree, node)[0])
+  return c.source[nm.span.start:nm.span.end]
+}
+
+// An untyped slice literal `[a, b, ...]` is `[]E`, E the (defaulted) type of its
+// first element. ponytail: first element only — a heterogeneous literal would
+// need element unification, which the checker rejects anyway.
+function checkSliceLit(c: Checker, node: int): int {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) == 0) {
+    return 0
+  }
+  let first = kids[0]
+  if (getNode(c.tree, first).tag == Tag.Arg) {
+    first = kidsOf(c.tree, first)[0]
+  }
+  return mkSlice(c.ctx, defaultType(c, checkExprType(c, first)))
+}
+
+// Types each binder of a tuple pattern against the corresponding element of
+// `tupTy`, recursing into nested patterns (SPEC §10.1). When the type is unknown
+// or the arity disagrees the binders are left untyped rather than given a made-up
+// type: an inferencer that guesses here turns a checker gap into a wrong answer,
+// and the validator reports the mismatch on its own terms.
+function checkTupleBinders(c: Checker, binders: []int, tupTy: int) {
+  if (tupTy == 0 || c.ctx.types[tupTy].kind != TypeKind.Tuple) {
+    return
+  }
+  let members = c.ctx.types[tupTy].members
+  if (len(members) != len(binders)) {
+    return
+  }
+  let i = 0
+  while (i < len(binders)) {
+    if (getNode(c.tree, binders[i]).tag == Tag.TuplePat) {
+      checkTupleBinders(c, kidsOf(c.tree, binders[i]), members[i])
+    } else {
+      c.nodeTypes[binders[i]] = members[i]
+      envBind(c, binders[i], members[i])
+    }
+    i = i + 1
+  }
+}
+
+// Types one `binding` node whose pattern is a tuple: either a two-result
+// comma-ok form (`<-ch` / `m[k]` / `x.(T)`, where the value binder gets the
+// received/indexed/asserted element and the `ok` binder a bool), or the general
+// positional destructure of a tuple-typed initializer.
+function checkCommaOk(c: Checker, pat: int, init: int) {
+  let binders = kidsOf(c.tree, pat)
+  if (init == 0) {
+    return
+  }
+  let inNode = getNode(c.tree, init)
+  let valType = 0
+  let isTwoResult = false
+  if (len(binders) == 2) {
+    if (inNode.tag == Tag.Unary && inNode.main == int(Kind.ArrowLeft)) {
+      let chT = checkExprType(c, kidsOf(c.tree, init)[0])
+      if (chT != 0 && c.ctx.types[chT].kind == TypeKind.Chan) {
+        valType = c.ctx.types[chT].elem
+      }
+      isTwoResult = true
+    } else if (inNode.tag == Tag.Index) {
+      // Only a MAP index is a two-result form. Indexing a slice of tuples is an
+      // ordinary one-result read that happens to yield a tuple, and must fall
+      // through to the tuple path below.
+      let recvT = checkExprType(c, kidsOf(c.tree, init)[0])
+      if (recvT != 0 && c.ctx.types[recvT].kind == TypeKind.Map) {
+        valType = checkIndex(c, init)
+        isTwoResult = true
+      }
+    } else if (inNode.tag == Tag.TypeAssert) {
+      // `let (v, ok) = x.(T)` narrows to T with a success flag.
+      valType = typeFromNode(c, kidsOf(c.tree, init)[1])
+      isTwoResult = true
+    }
+  }
+  // `let (a, b, ...) = <tuple>` (SPEC §10.1/§13.1) — bind each element to its own
+  // declared type. Before this, ANY non-comma-ok initializer fell through with
+  // `valType` still 0 and the second binder typed `bool` REGARDLESS, so a tuple
+  // destructure silently bound a bool-typed name over a real element and the
+  // wrong value was read back with no diagnostic anywhere.
+  if (!isTwoResult) {
+    checkTupleBinders(c, binders, checkExprType(c, init))
+    return
+  }
+  c.nodeTypes[binders[0]] = valType
+  c.nodeTypes[binders[1]] = primType(c.ctx, 10)
+  // BIND them, not just type them. Recording `nodeTypes` feeds `--dump-types`,
+  // but every expression that READS a name resolves through `env` — so without
+  // this, `let (c, ok) = <- ch` left `c` typed by whatever else in the module
+  // last bound that name (in stdlib/quic: a `c: quicconnCmd` param 1600 lines
+  // up, making `return c` from a `StreamChunk!` method look like a mismatch).
+  // Same omission the for-of and match-arm binders had; `envBind` also records
+  // `binderTypes`, so the sweep re-applies each at its own node — which precedes
+  // the body that reads it.
+  envBind(c, binders[0], valType)
+  envBind(c, binders[1], primType(c.ctx, 10))
+}
+
+// True iff `binding` is a module-level `let` binding (§11.11) — a static cell
+// — as opposed to any local `let`, which is an ordinary SSA value. Both carry
+// SymbolKind.LetBinding; only the resolver's `moduleScoped` separates them.
+function isModuleStateBinding(c: Checker, binding: int): bool {
+  let pat = kidsOf(c.tree, binding)[0]
+  if (pat >= 0 && pat < len(c.nodeSymbols)) {
+    let sid = c.nodeSymbols[pat]
+    if (sid > 0 && sid < len(c.symbols)) {
+      let sym = c.symbols[sid]
+      return sym.kind == SymbolKind.LetBinding && sym.moduleScoped
+    }
+  }
+  // The dump entry points (`--dump-ir`, `--dump-types`) never run the resolver,
+  // so `nodeSymbols` is empty there — see declRefType's note. Fall back to the
+  // structural fact the resolver would have recorded: a module-level `let` is a
+  // binding of a LetDecl that is a DIRECT child of the tree root. Any deeper
+  // LetDecl is a local.
+  return isTopLevelLetBinding(c, binding)
+}
+
+// True iff `binding` belongs to a `let` declared at module scope, determined
+// structurally rather than through the resolver. Bounded by the top-level decl
+// count.
+// A binding of ANY module-level declaration — `let` (§11.11 module state) or
+// `const`. isTopLevelLetBinding answers only the `let` half because module state
+// is what it exists to identify; this is the one to ask when the question is
+// merely "is this binding outside every function body", which is what decides
+// whether the statement sweep will ever reach it.
+function isTopLevelBinding(c: Checker, binding: int): bool {
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let inner = d
+    if (getNode(c.tree, inner).tag == Tag.Export) {
+      inner = kidsOf(c.tree, inner)[0]
+    }
+    let dt = getNode(c.tree, inner).tag
+    if (dt != Tag.LetDecl && dt != Tag.ConstDecl) {
+      continue
+    }
+    for b of kidsOf(c.tree, inner) {
+      if (b == binding) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function isTopLevelLetBinding(c: Checker, binding: int): bool {
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let inner = d
+    if (getNode(c.tree, inner).tag == Tag.Export) {
+      inner = kidsOf(c.tree, inner)[0]
+    }
+    if (getNode(c.tree, inner).tag != Tag.LetDecl) {
+      continue
+    }
+    for b of kidsOf(c.tree, inner) {
+      if (b == binding) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// The `const` half, the mirror of isTopLevelLetBinding. The seed's checkBinding
+// takes `is_const` and `is_top` as separate parameters and gates E0064's
+// top-level arm on BOTH, so asking "module-level" (isTopLevelBinding) is not
+// enough — a module `let` reaches its own E0064 through vModuleState, with a
+// different message (#1534).
+function isTopLevelConstBinding(c: Checker, binding: int): bool {
+  for d of kidsOf(c.tree, c.tree.root) {
+    if (d == 0) {
+      continue
+    }
+    let inner = d
+    if (getNode(c.tree, inner).tag == Tag.Export) {
+      inner = kidsOf(c.tree, inner)[0]
+    }
+    if (getNode(c.tree, inner).tag != Tag.ConstDecl) {
+      continue
+    }
+    for b of kidsOf(c.tree, inner) {
+      if (b == binding) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function checkBinding(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  let pat = kids[0]
+  let ann = kids[1]
+  let init = kids[2]
+  if (getNode(c.tree, pat).tag == Tag.TuplePat) {
+    checkCommaOk(c, pat, init)
+    return
+  }
+  let ty = 0
+  if (ann != 0) {
+    ty = typeFromNode(c, ann)
+  } else if (init != 0) {
+    ty = defaultType(c, checkExprType(c, init))
+  }
+  c.nodeTypes[pat] = ty
+  // Record a simple-ident binding so later expressions resolve it.
+  let pn = getNode(c.tree, pat)
+  if (pn.tag == Tag.Ident) {
+    let bname = c.source[pn.span.start:pn.span.end]
+    c.env[bname] = ty
+    if (isTopLevelBinding(c, node)) {
+      c.moduleEnv[bname] = ty
+    }
+    c.declTypes[pat] = ty
+  }
+}
+
+// Records where a simple `let` binding's type ARGUMENTS can later be read from:
+// its declared type NODE (annotation, composite-literal type, or a generic-enum
+// variant construction's receiver), else the initializing CALL. Feeds
+// `argTypeNode`'s structural generic-function-argument binding.
+//
+// Called from pre-pass 3's `seedBindingDeclType` only (#1573): match and for-of
+// binders are typed in pre-pass 3, long before the main sweep runs
+// `checkBinding`, so a duplicate call from `checkBinding` itself only ever
+// re-wrote the same keys from the same nodes — a no-op every time, since
+// pre-pass 3 runs first in ascending arena order and always reaches a binding
+// before the main sweep does.
+function recordBindingDeclNodes(c: Checker, bname: string, pat: int, ann: int, init: int) {
+  let tnode = ann
+  if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.CompositeLit) {
+    tnode = kidsOf(c.tree, init)[0]
+  }
+  if (tnode != 0) {
+    c.declTypeNodes[bname] = tnode
+  } else if (init != 0) {
+    // A generic-enum variant construction writes its type args on the
+    // `Name<...>` RECEIVER — the same node an annotation would have supplied.
+    // Both variant forms are the same shape one level apart: `Wrap<i64>.Only(5)`
+    // puts the receiver under a Call's Member callee, `Two<i64>.Empty` (no
+    // payload, so no call) is that Member itself. Recorded separately rather
+    // than through `tnode` so the `declInitNodes` path below still fires
+    // (#1498). Without this the binding has no type node at all, and
+    // `argTypeNode` cannot structurally bind a later generic call's type
+    // param from it (#1545).
+    let recv = 0
+    let inode = getNode(c.tree, init)
+    if (inode.tag == Tag.Call) {
+      let callee = kidsOf(c.tree, init)[0]
+      if (getNode(c.tree, callee).tag == Tag.Member) {
+        recv = kidsOf(c.tree, callee)[0]
+      }
+    } else if (inode.tag == Tag.Member) {
+      recv = kidsOf(c.tree, init)[0]
+    }
+    // The GenericInst guard is what keeps this narrow: an ordinary
+    // `let x = obj.field` has an Ident receiver and records nothing.
+    if (recv != 0 && getNode(c.tree, recv).tag == Tag.GenericInst) {
+      c.declTypeNodes[bname] = recv
+    }
+  }
+  // No written type: remember the initializing CALL so a later generic call
+  // taking this binding can re-derive the instance type-args it needs (#1498).
+  if (tnode == 0 && init != 0 && getNode(c.tree, init).tag == Tag.Call) {
+    c.declInitNodes[pat] = init
+  }
+}
+
+// Pre-seeds a simple `let x = …` binding's type into `declTypes` — the decl-path
+// (#1370) — during pre-pass 3, so a for-of / match binder typed in that same pass
+// resolves its ITERABLE through the binding it actually refers to.
+//
+// Without this the iterable was unknowable at pre-pass 3 (bindings are typed in
+// the main sweep, which runs later), so `checkExprType` fell through to the
+// module-wide flat `env` and read whatever same-named binding another function
+// had left there. The binder then got element type 0 — which ALSO suppressed the
+// main sweep's `binderTypes` rebind, leaving the binder NAME resolving to an
+// unrelated function's local. In stdlib/crypto that is #1375: `blocks` is
+// `[]byte` in gcm.bit and `[]PemBlock` in truststore.bit, so `for b of blocks`
+// typed `b` as u8 and every `b.label` looked like an unknown member.
+//
+// Only `declTypes` is written — never `env` or `nodeTypes` — so this is a
+// resolution input, not an inference result. The main sweep's `checkBinding`
+// overwrites the same slot with the authoritative value, so a best-effort miss
+// here (an initializer not yet typeable) costs nothing.
+//
+// A type-param-bearing result is dropped rather than recorded: generic argument
+// binding is not resolvable this early (`declTypeNodes` is filled by the main
+// sweep), so `let evens = keep<i64>(squares, …)` reads back as the TEMPLATE
+// `[]U`. Recording that would freeze a bogus binder type into `binderTypes`,
+// which the main sweep re-applies — and the main sweep cannot undo it. Leaving
+// the slot at 0 keeps the binder merely unknown, which every validator already
+// treats permissively. Seed only what is confidently concrete.
+function seedBindingDeclType(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  let pat = kids[0]
+  if (getNode(c.tree, pat).tag != Tag.Ident) {
+    return
+  }
+  let pn = getNode(c.tree, pat)
+  recordBindingDeclNodes(c, c.source[pn.span.start:pn.span.end], pat, kids[1], kids[2])
+  let ty = 0
+  if (kids[1] != 0) {
+    ty = typeFromNode(c, kids[1])
+  } else if (kids[2] != 0) {
+    ty = defaultType(c, checkExprType(c, kids[2]))
+  }
+  if (ty == 0 || vHasTypeParam(c, ty, 0) || vMentionsInvalid(c, ty, 0)) {
+    return
+  }
+  c.declTypes[pat] = ty
+}
+
+// Walks every node and types the bindings. (arrow-param and call typing land
+// with expression inference; a flat arena walk catches bindings at any nesting.)
+// Resolves a named-type reference, reserving+resolving it on first touch if it
+// is a not-yet-seen forward reference (the seed's declTypeOf recursion). After
+// the collect pass every named type is reserved, so this is a plain lookup.
+function resolveNamed(c: Checker, name: string): int {
+  let id = userTypeLookup(c, name)
+  if (id != 0) {
+    return id
+  }
+  if (c.typeDecls[name] != 0) {
+    return declTypeOf(c, name)
+  }
+  return 0
+}
+
+// Registers a `<T, U: Bound>` list: every param name first (each a distinct
+// named TypeParam), then each constraint interface — matching the seed's
+// buildOwnGenericEnv two-loop order so ids line up.
+function registerGenerics(c: Checker, genNode: int) {
+  if (genNode == 0) {
+    return
+  }
+  let ps = kidsOf(c.tree, genNode)
+  let ids = []int(0)
+  let i = 0
+  while (i < len(ps)) {
+    let nm = getNode(c.tree, kidsOf(c.tree, ps[i])[0])
+    // Each decl's type params are distinct ids (the seed's per-symbol
+    // typeParamId), even when two decls share a param name — reusing an id would
+    // undercount and shift a later named type. userTypes[name] is overwritten to
+    // this decl's param, which is correct: members resolve against the decl being
+    // built, and a template body's param id never reaches a dump (monomorphized).
+    let pname = c.source[nm.span.start:nm.span.end]
+    registerNamedType(c, pname, TypeKind.TypeParam)
+    // Keep THIS decl's ids: the next generic to declare a `T` overwrites
+    // userTypes["T"], and monomorphizing this one then needs the id its body was
+    // actually checked against.
+    ids = append(ids, userTypeLookup(c, pname))
+    i = i + 1
+  }
+  c.genericParamIds[genNode] = ids
+  i = 0
+  while (i < len(ps)) {
+    let gk = kidsOf(c.tree, ps[i])
+    if (gk[1] != 0) {
+      let cons = kidsOf(c.tree, gk[1])
+      if (len(cons) > 0) {
+        // Key off THIS decl's param id (ids[i], minted above in the same order),
+        // never the name — a name key is module-wide (#1551).
+        c.typeParamConstraints[ids[i]] = typeFromNode(c, cons[0])
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Puts a decl's OWN type params back in scope, from the ids registerGenerics
+// minted for this generics node. The name table is module-wide, so after the
+// collect pass every `T` in the module resolves to the LAST decl to declare one
+// (#1551 — `first<T: Boxy>`'s body was checked against `Wordy`'s `T`, and with
+// it that param's constraint). Both later sweeps walk the arena in source order
+// and a decl's generics node precedes its params, result and body, so calling
+// this at the generics node scopes every reference that follows to the decl it
+// was written in.
+function bindGenericScope(c: Checker, genNode: int) {
+  // Comma-ok, not a bare index: a lazily-resolved type decl may never have been
+  // collected, and this map's value is a SLICE — a miss yields a null one, which
+  // `len` faults on (both compilers, #1557).
+  let (ids, ok) = c.genericParamIds[genNode]
+  if (!ok) {
+    return
+  }
+  let ps = kidsOf(c.tree, genNode)
+  if (len(ids) != len(ps)) {
+    return // not this decl's own list: leave the table alone
+  }
+  let i = 0
+  while (i < len(ps)) {
+    let nm = getNode(c.tree, kidsOf(c.tree, ps[i])[0])
+    c.userTypes[c.source[nm.span.start:nm.span.end]] = ids[i]
+    i = i + 1
+  }
+}
+
+// Resolves a struct's field types into `structFields` (interning each in field
+// order). An exported field is wrapped `export[field[name, type]]`.
+function resolveStructFields(c: Checker, node: int, sname: string) {
+  let fields = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let fi = 0
+  while (fi < len(fields)) {
+    let fld = fields[fi]
+    if (getNode(c.tree, fld).tag == Tag.Export) {
+      fld = kidsOf(c.tree, fld)[0]
+    }
+    let fk = kidsOf(c.tree, fld)
+    let fnn = getNode(c.tree, fk[0])
+    c.ctx.structFields["${userTypeLookup(c, sname)}." + c.source[fnn.span.start:fnn.span.end]] = typeFromNode(c, fk[1])
+    fi = fi + 1
+  }
+}
+
+// Interns an enum's variant payload types (in variant then payload order) —
+// matching the seed's buildEnumTemplate — records on the type whether any
+// variant carries a payload (so the value is boxed), which codegen reads to
+// classify GC references, and stores each variant's payload types in
+// `ctx.variantPayloads` under the TEMPLATE's id.
+//
+// The template's entry holds the declaration's own bare type params; an
+// instantiation gets its own substituted entry from `fillInstMembers`. This is
+// the seed's `buildEnumTemplate` -> `instantiateRecursive` split. Interning
+// order is unchanged: the ids still come from `typeFromNode` in the same walk,
+// so recording them costs no new id.
+function resolveEnumPayloads(c: Checker, node: int, enumTy: int) {
+  let vs = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let i = 0
+  while (i < len(vs)) {
+    let payload = kidsOf(c.tree, vs[i])[1]
+    if (payload != 0) {
+      c.ctx.types[enumTy].enumBoxed = true
+      let types = kidsOf(c.tree, payload)
+      let ptypes = []int(0)
+      let j = 0
+      while (j < len(types)) {
+        ptypes = append(ptypes, typeFromNode(c, types[j]))
+        j = j + 1
+      }
+      let vn = getNode(c.tree, kidsOf(c.tree, vs[i])[0])
+      c.ctx.variantPayloads["${enumTy}." + c.source[vn.span.start:vn.span.end]] = ptypes
+    }
+    i = i + 1
+  }
+}
+
+// Resolves an interface's method results into methodResults, interning each
+// sig's params (source order) then result — the seed's walk. The func-type sig
+// wrapper is deferred to buildSignatures (see collectFuncDecl).
+function resolveInterfaceSigs(c: Checker, node: int, iname: string) {
+  let sigs = kidsOf(c.tree, kidsOf(c.tree, node)[2])
+  let mi = 0
+  while (mi < len(sigs)) {
+    let mk = kidsOf(c.tree, sigs[mi])
+    let mnn = getNode(c.tree, mk[0])
+    paramTypeIds(c, mk[1])
+    let mres = c.ctx.voidId
+    if (mk[2] != 0) {
+      mres = typeFromNode(c, mk[2])
+    }
+    let sname = c.source[mnn.span.start:mnn.span.end]
+    c.ctx.methodResults["${userTypeLookup(c, iname)}.${sname}"] = mres
+    noteTypeMethod(c.ctx, userTypeLookup(c, iname), sname)
+    mi = mi + 1
+  }
+}
+
+// The seed's declTypeOf: reserves `name`'s TypeId (memoized via userTypes
+// presence) BEFORE resolving its members, so members' composites/forward-named
+// refs intern after it (source touch order) and self/mutual references
+// terminate. An alias resolves transparently to its underlying (no reserved id).
+function declTypeOf(c: Checker, name: string): int {
+  let existing = userTypeLookup(c, name)
+  if (existing != 0) {
+    return existing
+  }
+  let node = c.typeDecls[name]
+  if (node == 0) {
+    return 0
+  }
+  let dn = getNode(c.tree, node)
+  let k = kidsOf(c.tree, node)
+  if (dn.tag == Tag.TypeAlias) {
+    let u = typeFromNode(c, k[2])
+    c.userTypes[name] = u
+    return u
+  }
+  let kind = TypeKind.Struct
+  if (dn.tag == Tag.EnumDecl) {
+    kind = TypeKind.Enum
+  } else if (dn.tag == Tag.InterfaceDecl) {
+    kind = TypeKind.Interface
+  }
+  registerNamedType(c, name, kind)
+  registerGenerics(c, k[1])
+  if (dn.tag == Tag.StructDecl) {
+    resolveStructFields(c, node, name)
+  } else if (dn.tag == Tag.EnumDecl) {
+    resolveEnumPayloads(c, node, userTypeLookup(c, name))
+  } else if (dn.tag == Tag.InterfaceDecl) {
+    resolveInterfaceSigs(c, node, name)
+  }
+  return userTypeLookup(c, name)
+}
+
+// The seed's collectFuncDecl: interns a function's signature composites in touch
+// order — generics, then params (source order), then result, then (for a method)
+// the receiver — and records its result + decl. The `(params)=>result` func-type
+// id itself is NOT minted here (the seed stores a FuncShape, not a TypeId, so a
+// sig wrapper would wrongly consume an id before later named types); it is built
+// afterward by buildSignatures.
+function collectFuncDecl(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [recv, name, generics, params, result, body]
+  registerGenerics(c, kids[2])
+  paramTypeIds(c, kids[3])
+  let rty = c.ctx.voidId
+  if (kids[4] != 0) {
+    rty = typeFromNode(c, kids[4])
+  }
+  let nm = getNode(c.tree, kids[1])
+  let fname = c.source[nm.span.start:nm.span.end]
+  if (kids[0] != 0) {
+    let recvType = typeNodeName(c, kidsOf(c.tree, kids[0])[1])
+    resolveNamed(c, recvType)
+    c.ctx.methodResults["${userTypeLookup(c, recvType)}.${fname}"] = rty
+    noteTypeMethod(c.ctx, userTypeLookup(c, recvType), fname)
+  } else {
+    c.funcResults[fname] = rty
+    c.funcDecls[fname] = node
+  }
+}
+
+// SPEC 11.7: records an `extern function`'s signature exactly like a free
+// function's, so call sites type-check through the ordinary path, plus the
+// extern marker lowering reads. There is no body and no receiver.
+function collectExternFnDecl(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [name, params, result_or_none]
+  paramTypeIds(c, kids[1])
+  let rty = c.ctx.voidId
+  if (kids[2] != 0) {
+    rty = typeFromNode(c, kids[2])
+  }
+  let nm = getNode(c.tree, kids[0])
+  let fname = c.source[nm.span.start:nm.span.end]
+  c.funcResults[fname] = rty
+  c.funcDecls[fname] = node
+  c.externFns[fname] = true
+}
+
+// Builds the `(params)=>result` func-type id for every free function, method, and
+// interface method, filling funcSigs/methodSigs. Runs AFTER the collect pass so a
+// sig wrapper's id lands past every named type (the seed mints these lazily, at
+// the same relative position) — keeping named-type ids in touch order.
+function buildSignatures(c: Checker) {
+  let m = 1
+  while (m < len(c.tree.nodes)) {
+    let n = getNode(c.tree, m)
+    if (n.tag == Tag.FuncDecl) {
+      let kids = kidsOf(c.tree, m)
+      let rty = c.ctx.voidId
+      if (kids[4] != 0) {
+        rty = typeFromNode(c, kids[4])
+      }
+      let sig = funcTypeFromParams(c, kids[3], rty)
+      let nm = getNode(c.tree, kids[1])
+      let fname = c.source[nm.span.start:nm.span.end]
+      if (kids[0] != 0) {
+        let rid = userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, kids[0])[1]))
+        c.ctx.methodSigs["${rid}.${fname}"] = sig
+        noteTypeMethod(c.ctx, rid, fname)
+      } else {
+        c.funcSigs[fname] = sig
+      }
+    } else if (n.tag == Tag.ExternFnDecl) {
+      let ek = kidsOf(c.tree, m) // [name, params, result_or_none]
+      let erty = c.ctx.voidId
+      if (ek[2] != 0) {
+        erty = typeFromNode(c, ek[2])
+      }
+      let enn = getNode(c.tree, ek[0])
+      c.funcSigs[c.source[enn.span.start:enn.span.end]] = funcTypeFromParams(c, ek[1], erty)
+    } else if (n.tag == Tag.InterfaceDecl) {
+      let iname = declName(c, m)
+      let sigs = kidsOf(c.tree, kidsOf(c.tree, m)[2])
+      let mi = 0
+      while (mi < len(sigs)) {
+        let mk = kidsOf(c.tree, sigs[mi])
+        let mnn = getNode(c.tree, mk[0])
+        let mres = c.ctx.voidId
+        if (mk[2] != 0) {
+          mres = typeFromNode(c, mk[2])
+        }
+        let signame = c.source[mnn.span.start:mnn.span.end]
+        c.ctx.methodSigs["${userTypeLookup(c, iname)}.${signame}"] = funcTypeFromParams(c, mk[1], mres)
+        noteTypeMethod(c.ctx, userTypeLookup(c, iname), signame)
+        mi = mi + 1
+      }
+    }
+    m = m + 1
+  }
+}
+
+// Records which concrete methods carry `export`, keyed "<recvTypeId>.<name>" in
+// the shared TypeContext, so `bit doc` can drop a type's PRIVATE methods from its
+// public surface. Mirrors the seed's `Method.exported`. An `export`ed method is an
+// `Export` node wrapping a `FuncDecl` that has a receiver (kid 0); the receiver
+// type name resolves to the same TypeId `buildSignatures` keyed the method under.
+// Runs after `buildSignatures` and before `copyMethodsToInsts`, so the flag is in
+// place for `copyInstMethod` to carry onto each instantiation (#1528).
+function collectMethodExports(c: Checker) {
+  let i = 1
+  while (i < len(c.tree.nodes)) {
+    if (getNode(c.tree, i).tag == Tag.Export) {
+      let inner = kidsOf(c.tree, i)[0]
+      if (inner != 0 && getNode(c.tree, inner).tag == Tag.FuncDecl) {
+        let k = kidsOf(c.tree, inner)
+        if (k[0] != 0 && k[1] != 0) {
+          let rid = userTypeLookup(c, typeNodeName(c, kidsOf(c.tree, k[0])[1]))
+          if (rid != 0) {
+            let nm = getNode(c.tree, k[1])
+            c.ctx.methodExported["${rid}." + c.source[nm.span.start:nm.span.end]] = true
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+}

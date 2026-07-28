@@ -84,7 +84,7 @@ the walk is reported before exiting, so one run fixes them all.
 
 Lint findings are recorded at `severity=1` (warning) so they do not bump
 `errorCount` — `Diagnostics.warn` deliberately does not, and that semantic is
-shared with the resolver ([diagnostics.bit:93](../selfhost/diagnostics.bit#L93)).
+shared with the resolver ([diagnostics.bit:93](../compiler/diagnostics.bit#L93)).
 Failure is expressed by the exit code of `bit lint`, not by the severity of the
 diagnostic. This keeps a lint finding from failing an unrelated `bit build`.
 
@@ -154,7 +154,7 @@ A prefix letter would add a fourth signal, not a first one. Against that:
 - **One registry, one collision authority.** Two prefixes means the
   never-renumber rule has to be enforced in two places, and "is E0213 taken?"
   becomes two questions.
-- **`codeString` is shared with the frozen seed.** `selfhost/diagnostics.bit`
+- **`codeString` is shared with the frozen seed.** `compiler/diagnostics.bit`
   mirrors `seed/diagnostics.zig` byte for byte, and the seed is still the
   differential oracle for the bootstrap (§9). A prefix parameter would make the
   two diagnostic renderers structurally divergent, mid-bootstrap, for a
@@ -218,7 +218,7 @@ E0212; only its table row moves. It needs no resolver — whether a statement
 follows one that diverges (`return`/`fail`/`break`/`continue`/`panic`) is
 answered from the AST alone, by reusing the same `diverges` analysis
 `bit check` already uses for E0055 missing-return and catch-block
-completeness (seed/check.zig:5539, ported at selfhost/validatestmt.bit:610).
+completeness (seed/check.zig:5539, ported at compiler/validatestmt.bit:610).
 
 ### Phase 2 — dead weight and footguns (needs the resolver)
 
@@ -378,17 +378,17 @@ violation:
 
 | File | Lines |
 |---|---|
-| `selfhost/selfcheck.bit` | 7078 |
-| `selfhost/lower.bit` | 5109 |
-| `selfhost/x64.bit` | 2748 |
+| `compiler/selfcheck.bit` | 7078 |
+| `compiler/lower.bit` | 5109 |
+| `compiler/x64.bit` | 2748 |
 | `stdlib/quic/conn.bit` | 2536 |
-| `selfhost/check.bit` | 2458 |
-| `selfhost/arm64.bit` | 2294 |
-| `selfhost/parser.bit` | 1585 |
+| `compiler/check.bit` | 2458 |
+| `compiler/arm64.bit` | 2294 |
+| `compiler/parser.bit` | 1585 |
 | `stdlib/crypto/bcrypt.bit` | 1498 |
 | `stdlib/http2/conn.bit` | 1353 |
-| `selfhost/validate.bit` | 1280 |
-| `selfhost/machoexec.bit` | 1221 |
+| `compiler/validate.bit` | 1280 |
+| `compiler/machoexec.bit` | 1221 |
 
 Each stamped number is that file's current length, so the file is frozen at its
 present size and any growth fails:
@@ -411,7 +411,7 @@ caret, and hint machinery as `bit check`:
 
 ```
 warning[E0200]: file is 1204 lines, limit is 800
-  --> selfhost/lower.bit:1:1
+  --> compiler/lower.bit:1:1
   = hint: split it, or raise the limit with
           `// bit:lint max-file-lines=1204 -- <reason>`
 ```
@@ -468,9 +468,9 @@ Required coverage:
 
 | File | Change |
 |---|---|
-| `selfhost/lint.bit` | new — registry, directive reader, runner, rule passes |
-| `selfhost/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
-| `selfhost/main.bit` | `lint` subcommand dispatch |
+| `compiler/lint.bit` | new — registry, directive reader, runner, rule passes |
+| `compiler/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
+| `compiler/main.bit` | `lint` subcommand dispatch |
 | `tests/lintcmd.zig` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
 | `tests/harness.zig` | `.lint` directive |
 | `tests/cases/lint_*.bit` | golden cases |

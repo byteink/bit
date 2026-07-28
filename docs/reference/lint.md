@@ -160,7 +160,7 @@ already spoken for by the test harness's own mode directive, so the override
 directive can sit on line 2 or later in the same leading comment block.
 
 ```bit
-// selfhost/lower.bit - AST -> SSA IR lowering.
+// compiler/lower.bit - AST -> SSA IR lowering.
 // bit:lint max-file-lines=6869 -- known debt (5-8x the
 // limit); stamped at its current size, not a target to grow toward.
 ```

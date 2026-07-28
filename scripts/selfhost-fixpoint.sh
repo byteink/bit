@@ -4,8 +4,8 @@
 # guarantee that lets the seed retire — once it is gone there is no stage2 to
 # compare against, so the meaningful property is self-reproducibility:
 #
-#   stageA (the current self-hosted bit) builds selfhost/ -> stageB
-#   stageB                              builds selfhost/ -> stageC
+#   stageA (the current self-hosted bit) builds compiler/ -> stageB
+#   stageB                              builds compiler/ -> stageC
 #   sha256(stageB) == sha256(stageC)    <-- byte-identical fixed point
 #
 # NOTE on stage2 vs stage3: the seed-built self-hosted binary (`bit2`, "stage2")

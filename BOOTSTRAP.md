@@ -1,7 +1,7 @@
 # Bootstrap
 
 How Bit becomes self-hosted: the compiler is written in Zig (the *seed*), then
-re-written in Bit under [`selfhost/`](selfhost/) and proven correct by compiling
+re-written in Bit under [`compiler/`](compiler/) and proven correct by compiling
 itself to a fixed point. This document is the map; the work is tracked as the
 self-host epic (#363–#365).
 
@@ -12,13 +12,13 @@ self-host epic (#363–#365).
       │  builds
       ▼
   bit                 seed compiler - compiler/*.zig, ~34k lines of Zig
-      │  builds  selfhost/*.bit
+      │  builds  compiler/*.bit
       ▼
   bit2 = stage1       the Bit compiler, built by the seed
-      │  builds  selfhost/*.bit  (itself)
+      │  builds  compiler/*.bit  (itself)
       ▼
   stage2               the Bit compiler, built by the Bit compiler
-      │  builds  selfhost/*.bit  (itself again)
+      │  builds  compiler/*.bit  (itself again)
       ▼
   stage3
 ```
@@ -60,14 +60,14 @@ zig build               # native: builds the seed (bit-seed) AND the self-hosted
 ```
 
 The seed compiler now lives in `seed/` and installs as `bit-seed`; the canonical
-`bit` is the self-hosted compiler built from `selfhost/`. A native `zig build`
+`bit` is the self-hosted compiler built from `compiler/`. A native `zig build`
 produces both; a cross build (`-Dtarget=`) produces only `bit-seed` (execing the
 seed to build the self-hosted bit needs a native host).
 
 ## Current state
 
 **Stage 1 - front-end, COMPLETE (#363).** The lexer, AST arena, parser, and
-diagnostic renderer are ported (`selfhost/{lexer,ast,parser,diagnostics}.bit`);
+diagnostic renderer are ported (`compiler/{lexer,ast,parser,diagnostics}.bit`);
 `bit2` drives them via `--dump-tokens`, `--dump-ast`, and `--dump-diags`.
 Against the seed over the whole corpus:
 
@@ -84,7 +84,7 @@ malformed input is rejected identically by both compilers, including the
 multi-error cascade-ordering cases that used to diverge before #1332 landed.
 Zero diffs across all four surfaces; gate #363 is signed off.
 
-**Stage 2 - middle-end, COMPLETE.** `selfhost/{resolve,types,check,ir,lower,
+**Stage 2 - middle-end, COMPLETE.** `compiler/{resolve,types,check,ir,lower,
 opt}.bit` port the resolve substrate, type checker, SSA IR model + text dumper,
 AST→IR lowering, and the optimizer. Against the seed over the whole corpus:
 
@@ -122,19 +122,19 @@ already dense: the symbol text disagreed with the id it named. Naming from the
 dense counter the seed already computes made both compilers converge without
 building type monomorphization in the port.
 
-**Stage 3 - back-end + driver, COMPLETE (#365).** `selfhost/{codegen/,obj/,link.bit,
+**Stage 3 - back-end + driver, COMPLETE (#365).** `compiler/{codegen/,obj/,link.bit,
 main.bit,fmt.bit,doc.bit,lsp.bit}` port codegen (x86-64 + ARM64), the ELF/Mach-O/PE
 object writers, the static linker, and the CLI driver (`build`/`run`/`check`/
 `test`/`fmt`/`doc`/`lsp`/`ar`/every `--dump-*` mode). The seed has already been
 retired to `seed/` (installed as `bit-seed`); the canonical `zig-out/bin/bit` is
-built by running `bit-seed` once against `selfhost/` - after that, `bit` builds
+built by running `bit-seed` once against `compiler/` - after that, `bit` builds
 itself.
 
 **The fixed-point proof** (`scripts/selfhost-fixpoint.sh`) no longer compares
 against the seed - once the seed is retired there is no "stage2" built by it to
 compare against. The meaningful property instead is self-reproducibility: the
-current self-hosted `bit` (stageA) builds `selfhost/` to produce stageB, and
-stageB builds `selfhost/` again to produce stageC. `stageB == stageC` is the
+current self-hosted `bit` (stageA) builds `compiler/` to produce stageB, and
+stageB builds `compiler/` again to produce stageC. `stageB == stageC` is the
 fixed point. Verified with a real `sha256sum` + `cmp` on all three required
 targets:
 
@@ -183,7 +183,7 @@ the 4 originally-crashing files now exit with the same codes as aarch64
 (0/1, never SIGSEGV), and `selfhost-difffmt.sh` scores `MATCH=692 MISMATCH=0
 TIMEOUT=0` over the full corpus. `selfhost-difffmt.sh`'s own default timeout
 was also raised 20s → 45s (this file), since an older Skylake x86-64 box needed
-`DIFFFMT_TIMEOUT=40` to format `selfhost/lower.bit` (the corpus's largest
+`DIFFFMT_TIMEOUT=40` to format `compiler/lower.bit` (the corpus's largest
 file, ~23s there) without misreporting a slow-but-correct result as a
 timeout - the same false-signal class #1761 itself was first mistaken for.
 This was found *because* the three-target verify bullet was actually

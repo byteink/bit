@@ -1,0 +1,693 @@
+// compiler/lowerexpr.bit — split out of lower.bit (#1809). Sibling of
+// lower.bit: same module, so this needs no imports and no call-site
+// changes. Grouping follows the layout recorded at
+// tag rescue/task-1689-stale-split.
+
+// Converts a lowered value to a string for interpolation (§5.7): a string is
+// itself; bool/float/int dispatch to their `string_from_*` runtime call. A
+// struct/interface `show()` operand falls back for now.
+function lowerToString(fc: FnCtx, v: int, node: int): int {
+  let ty = defaultType(fc.c, nodeType(fc, node))
+  let td = fc.c.ctx.types[ty]
+  let stringTy = primType(fc.c.ctx, 11)
+  if (td.kind == TypeKind.Prim) {
+    if (td.prim == 11) {
+      return v
+    }
+    let rt = "string_from_int"
+    if (td.prim == 10) {
+      rt = "string_from_bool"
+    } else if (td.prim == 8 || td.prim == 9) {
+      rt = "string_from_float"
+    }
+    let arg = v
+    // `bit_rt_string_from_float` takes an `f64`, so an `f32` must be widened
+    // first: passing a single leaves the callee's d0/xmm0 upper half undefined
+    // and it formats a denormal near zero (a long all-zero fractional tail —
+    // #1457). Converted here, not by the callee, because the C signature is f64.
+    if (td.prim == 8) {
+      let cv = mkInstr(Op.Convert, primType(fc.c.ctx, 9))
+      cv.lhs = v
+      arg = builderEmit(fc.b, cv)
+    }
+    let ins = mkInstr(Op.RtCall, stringTy)
+    ins.name = rt
+    ins.args = [arg]
+    return emitRtCall(fc, ins)
+  }
+  // An interface value stringifies through its `show()` method (dynamic dispatch).
+  if (td.kind == TypeKind.Interface) {
+    let ins = mkInstr(Op.CallIface, stringTy)
+    ins.lhs = v
+    ins.ival = methodId(fc.lowerer, "show")
+    ins.args = []int(0)
+    return builderEmit(fc.b, ins)
+  }
+  // A struct value with a `show()` method stringifies through it (static call).
+  if (td.kind == TypeKind.Struct && methodResultLookup(fc.c, "${ty}.show") != 0) {
+    let ins = mkInstr(Op.Call, stringTy)
+    ins.name = methodSymbol(fc.lowerer, "show", ty)
+    ins.args = [v]
+    return builderEmit(fc.b, ins)
+  }
+  fc.failed = true
+  return 0
+}
+
+// Lowers a string interpolation `"a${x}b"`: each literal segment -> const_string
+// (decoded), each interpolated expr -> lowerToString, then the parts fold left
+// with string_concat — matching the seed's lowerStrInterp.
+function lowerStrInterp(fc: FnCtx, node: int): int {
+  let parts = kidsOf(fc.c.tree, node)
+  let stringTy = primType(fc.c.ctx, 11)
+  let vals = []int(0)
+  let i = 0
+  while (i < len(parts) && !fc.failed) {
+    let p = parts[i]
+    let pn = getNode(fc.c.tree, p)
+    if (pn.tag == Tag.StrPart) {
+      let cs = mkInstr(Op.ConstString, stringTy)
+      cs.sval = decodeEscapes(fc.c.source, pn.span.start, pn.span.end)
+      cs.ival = internPoolString(fc, cs.sval)
+      vals = append(vals, builderEmit(fc.b, cs))
+    } else {
+      vals = append(vals, lowerToString(fc, lowerExpr(fc, p), p))
+    }
+    i = i + 1
+  }
+  if (fc.failed) {
+    return 0
+  }
+  let acc = vals[0]
+  let j = 1
+  while (j < len(vals)) {
+    let ins = mkInstr(Op.RtCall, stringTy)
+    ins.name = "string_concat"
+    ins.args = [acc, vals[j]]
+    acc = emitRtCall(fc, ins)
+    j = j + 1
+  }
+  return acc
+}
+
+// Whether a type id is a concrete numeric prim (i8..f64), so an untyped literal
+// can be materialized at that context type instead of its default.
+function isNumericPrim(fc: FnCtx, ty: int): bool {
+  return ty != 0 && fc.c.ctx.types[ty].kind == TypeKind.Prim && fc.c.ctx.types[ty].prim <= 9
+}
+
+// The register code (`check.asmRegX64`/`asmRegArm64`) for one `asm` operand's
+// register-name ident; an unknown name (validator's job, #1374) falls back to 0.
+function asmRegCode(fc: FnCtx, ident: int, isArm64: bool): int {
+  let sp = getNode(fc.c.tree, ident).span
+  let name = fc.c.source[sp.start:sp.end]
+  let code = -1
+  if (isArm64) {
+    code = asmRegArm64(name)
+  } else {
+    code = asmRegX64(name)
+  }
+  if (code < 0) {
+    return 0
+  }
+  return code
+}
+
+// The pre-encoded byte/word values of an `asm_code` block (empty if none).
+function asmCodeVals(fc: FnCtx, code: int): []int {
+  let out = []int(0)
+  if (code == 0) {
+    return out
+  }
+  let lits = kidsOf(fc.c.tree, code)
+  let i = 0
+  while (i < len(lits)) {
+    let sp = getNode(fc.c.tree, lits[i]).span
+    out = append(out, parseIntText(fc.c.source[sp.start:sp.end]))
+    i = i + 1
+  }
+  return out
+}
+
+// The register codes of an `asm_clobber` list (empty if none).
+function asmRegVals(fc: FnCtx, list: int, isArm64: bool): []int {
+  let out = []int(0)
+  if (list == 0) {
+    return out
+  }
+  let regs = kidsOf(fc.c.tree, list)
+  let i = 0
+  while (i < len(regs)) {
+    out = append(out, asmRegCode(fc, regs[i], isArm64))
+    i = i + 1
+  }
+  return out
+}
+
+// Lowers an `asm` block (§11.6) into an `IrModule.asmBlocks` entry plus the
+// `Op.Asm` that references it. Both target sub-blocks are pooled; the backend
+// reads only its own arch's. Result type is the checker's type for `result`, or
+// void when there is none.
+function lowerAsm(fc: FnCtx, node: int): int {
+  let k = kidsOf(fc.c.tree, node) // [x64_code, arm64_code, result?, clob_x64, clob_arm64, input...]
+  let inX64 = []int(0)
+  let inArm64 = []int(0)
+  let inVals = []int(0)
+  let i = 5
+  while (i < len(k)) {
+    let ik = kidsOf(fc.c.tree, k[i]) // [arm64_reg, x64_reg, value]
+    inArm64 = append(inArm64, asmRegCode(fc, ik[0], true))
+    inX64 = append(inX64, asmRegCode(fc, ik[1], false))
+    inVals = append(inVals, lowerExpr(fc, ik[2]))
+    i = i + 1
+  }
+  let hasResult = false
+  let resultX64 = 0
+  let resultArm64 = 0
+  let ty = fc.c.ctx.voidId
+  if (k[2] != 0) {
+    let rk = kidsOf(fc.c.tree, k[2]) // [arm64_reg, x64_reg, type]
+    hasResult = true
+    resultArm64 = asmRegCode(fc, rk[0], true)
+    resultX64 = asmRegCode(fc, rk[1], false)
+    ty = nodeType(fc, node)
+  }
+  let blk = AsmBlock{
+    x64Bytes: asmCodeVals(fc, k[0]),
+    arm64Words: asmCodeVals(fc, k[1]),
+    hasResult: hasResult,
+    resultX64: resultX64,
+    resultArm64: resultArm64,
+    inX64: inX64,
+    inArm64: inArm64,
+    clobX64: asmRegVals(fc, k[3], false),
+    clobArm64: asmRegVals(fc, k[4], true),
+  }
+  fc.lowerer.asmBlocks = append(fc.lowerer.asmBlocks, blk)
+  let blockIdx = len(fc.lowerer.asmBlocks) - 1
+  let ins = mkInstr(Op.Asm, ty)
+  ins.ival = blockIdx
+  ins.args = inVals
+  if (hasResult) {
+    ins.ival2 = 1
+  }
+  return builderEmit(fc.b, ins)
+}
+
+// Lowers an expression with no type context.
+function lowerExpr(fc: FnCtx, node: int): int {
+  return lowerExprH(fc, node, 0)
+}
+
+// Lowers an expression to its SSA value id under an optional expected type
+// `hint` (0 = none), which types an otherwise-untyped numeric literal — the
+// seed's lowerExprH. Trips `failed` (returning 0) for unhandled constructs.
+function lowerExprH(fc: FnCtx, node: int, hint: int): int {
+  let n = getNode(fc.c.tree, node)
+  let tag = n.tag
+  if (tag == Tag.StrInterp) {
+    return lowerStrInterp(fc, node)
+  }
+  if (tag == Tag.IntLit) {
+    let ty = defaultType(fc.c, nodeType(fc, node))
+    if (isNumericPrim(fc, hint)) {
+      ty = hint
+    }
+    let ins = mkInstr(Op.ConstInt, ty)
+    ins.ival = parseIntText(fc.c.source[n.span.start:n.span.end])
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.BoolLit) {
+    let ins = mkInstr(Op.ConstBool, primType(fc.c.ctx, 10))
+    ins.bval = fc.c.source[n.span.start:n.span.end] == "true"
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.RuneLit) {
+    // A rune's code point is a `const_int`, materialized at the context width
+    // (`p[0] == '/'` over u8 -> const_int u8 47), like an int literal.
+    let ty = defaultType(fc.c, nodeType(fc, node))
+    if (isNumericPrim(fc, hint)) {
+      ty = hint
+    }
+    let ins = mkInstr(Op.ConstInt, ty)
+    ins.ival = parseRuneText(fc.c.source[n.span.start:n.span.end])
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.NilLit) {
+    // `nil` adopts its context type (a ref/interface); the dump shows no type.
+    let ty = hint
+    if (ty == 0) {
+      ty = defaultType(fc.c, nodeType(fc, node))
+    }
+    return builderEmit(fc.b, mkInstr(Op.ConstNil, ty))
+  }
+  if (tag == Tag.FloatLit) {
+    // An untyped float literal defaults to f64; an f32/f64 context adopts the
+    // hint. `parseFloat` yields the same bits the seed does (both format via
+    // `{d}`), so the const_float dump matches byte-for-byte.
+    let ty = defaultType(fc.c, nodeType(fc, node))
+    if (isNumericPrim(fc, hint)) {
+      ty = hint
+    }
+    let ins = mkInstr(Op.ConstFloat, ty)
+    ins.fval = parseFloat(fc.c.source[n.span.start:n.span.end])
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.StringLit) {
+    let ins = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+    ins.sval = decodeStringContent(fc.c.source, n.span.start, n.span.end)
+    ins.ival = internPoolString(fc, ins.sval)
+    return builderEmit(fc.b, ins)
+  }
+  // A raw string `` `...` `` has no escape processing (SPEC 5.6); only a CRLF
+  // pair normalizes to a lone LF, so the source text between the backticks is
+  // the value. Mirrors seed lower.zig `normalizeRaw`.
+  if (tag == Tag.RawStringLit) {
+    let ins = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+    ins.sval = normalizeRawString(fc.c.source[n.span.start + 1:n.span.end - 1])
+    ins.ival = internPoolString(fc, ins.sval)
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.Call) {
+    return lowerCall(fc, node)
+  }
+  if (tag == Tag.AsmStmt) {
+    return lowerAsm(fc, node)
+  }
+  if (tag == Tag.CompositeLit) {
+    return lowerCompositeLit(fc, node)
+  }
+  if (tag == Tag.SliceLit) {
+    let st = defaultType(fc.c, nodeType(fc, node))
+    // A `[]Shape` context types `[nil]` as `[]Shape`, not the inferred
+    // `[]untyped_nil`; prefer the hint slice type.
+    if (hint != 0 && fc.c.ctx.types[hint].kind == TypeKind.Slice) {
+      st = hint
+    }
+    if (fc.c.ctx.types[st].kind != TypeKind.Slice) {
+      fc.failed = true
+      return 0
+    }
+    return lowerSliceElems(fc, st, kidsOf(fc.c.tree, node))
+  }
+  if (tag == Tag.Member) {
+    return lowerFieldAccess(fc, node)
+  }
+  if (tag == Tag.Index) {
+    return lowerIndex(fc, node)
+  }
+  if (tag == Tag.SliceExpr) {
+    return lowerSliceExpr(fc, node)
+  }
+  if (tag == Tag.Ident) {
+    return lowerNamedValue(fc, node, fc.c.source[n.span.start:n.span.end])
+  }
+  if (tag == Tag.Unary) {
+    return lowerUnary(fc, node, hint)
+  }
+  if (tag == Tag.Binary) {
+    if (n.main == int(Kind.AmpAmp) || n.main == int(Kind.PipePipe)) {
+      return lowerShortCircuit(fc, node)
+    }
+    if (isRelationalOp(n.main)) {
+      return lowerComparison(fc, node)
+    }
+    let ty = defaultType(fc.c, nodeType(fc, node))
+    // String `+` is concatenation via the runtime, not an `add`.
+    if (fc.c.ctx.types[ty].kind == TypeKind.Prim && fc.c.ctx.types[ty].prim == 11 &&
+      n.main == int(Kind.Plus)) {
+      let kids = kidsOf(fc.c.tree, node)
+      let l = lowerExpr(fc, kids[0])
+      let r = lowerExpr(fc, kids[1])
+      if (fc.failed) {
+        return 0
+      }
+      let sc = mkInstr(Op.RtCall, ty)
+      sc.name = "string_concat"
+      sc.args = [l, r]
+      return emitRtCall(fc, sc)
+    }
+    // Pointer arithmetic (§11.4): `p ± n` scales `n` by sizeOf(elem) and offsets
+    // the raw address. A `*T` is an int-classed word (is_ref=0), so this is plain
+    // integer add/sub. The scaled byte offset is retyped to the pointer type with
+    // a no-op `convert` so add/sub's operands and result share a type.
+    if (fc.c.ctx.types[ty].kind == TypeKind.Ptr &&
+      (n.main == int(Kind.Plus) || n.main == int(Kind.Minus))) {
+      let pk = kidsOf(fc.c.tree, node)
+      let elemTy = fc.c.ctx.types[ty].elem
+      let scale = fieldLayoutFor(fc, elemTy).size
+      let i64ty = primType(fc.c.ctx, 3)
+      let baseVal = lowerExprH(fc, pk[0], ty)
+      let off = lowerExprH(fc, pk[1], i64ty)
+      if (fc.failed) {
+        return 0
+      }
+      if (scale != 1) {
+        let sc = mkInstr(Op.ConstInt, i64ty)
+        sc.ival = scale
+        let ml = mkInstr(Op.Mul, i64ty)
+        ml.lhs = off
+        ml.rhs = builderEmit(fc.b, sc)
+        off = builderEmit(fc.b, ml)
+      }
+      let paConv = mkInstr(Op.Convert, ty)
+      paConv.lhs = off
+      let offPtr = builderEmit(fc.b, paConv)
+      let pop = Op.Add
+      if (n.main == int(Kind.Minus)) {
+        pop = Op.Sub
+      }
+      let ins = mkInstr(pop, ty)
+      ins.lhs = baseVal
+      ins.rhs = offPtr
+      return builderEmit(fc.b, ins)
+    }
+    let isFloat = fc.c.ctx.types[ty].kind == TypeKind.Prim &&
+      (fc.c.ctx.types[ty].prim == 8 || fc.c.ctx.types[ty].prim == 9)
+    let signed = !(fc.c.ctx.types[ty].kind == TypeKind.Prim &&
+      fc.c.ctx.types[ty].prim >= 4 && fc.c.ctx.types[ty].prim <= 7)
+    let op = binOpFor(n.main, isFloat, signed)
+    if (op == Op.BlockParam) {
+      fc.failed = true
+      return 0
+    }
+    let kids = kidsOf(fc.c.tree, node)
+    // Operands take the operation's type as context, so an untyped literal
+    // operand materializes at the same width (`a + 1` over i32 -> const_int i32).
+    let lhs = lowerExprH(fc, kids[0], ty)
+    let rhs = lowerExprH(fc, kids[1], ty)
+    if (fc.failed) {
+      return 0
+    }
+    let ins = mkInstr(op, ty)
+    ins.lhs = lhs
+    ins.rhs = rhs
+    return builderEmit(fc.b, ins)
+  }
+  if (tag == Tag.TypeAssert) {
+    return lowerTypeAssert(fc, node)
+  }
+  if (tag == Tag.ArrowFn) {
+    return lowerArrowFn(fc, node)
+  }
+  if (tag == Tag.TryExpr) {
+    return lowerTryExpr(fc, node)
+  }
+  if (tag == Tag.CatchDefault) {
+    return lowerCatch(fc, node, false)
+  }
+  if (tag == Tag.CatchBind) {
+    return lowerCatch(fc, node, true)
+  }
+  if (tag == Tag.MatchStmt) {
+    return lowerMatchExpr(fc, node)
+  }
+  // `t.0` — a field read at the element's offset in the boxed tuple (ABI.md
+  // §1.1). The checker has already range-checked the index against the arity.
+  if (tag == Tag.TupleIndex) {
+    let tk = kidsOf(fc.c.tree, node)
+    let tupTy = nodeType(fc, tk[0])
+    if (tupTy == 0 || fc.c.ctx.types[tupTy].kind != TypeKind.Tuple) {
+      fc.failed = true
+      return 0
+    }
+    let idxNode = getNode(fc.c.tree, tk[1])
+    let idx = parseIntText(fc.c.source[idxNode.span.start:idxNode.span.end])
+    if (idx < 0 || idx >= len(fc.c.ctx.types[tupTy].members)) {
+      fc.failed = true
+      return 0
+    }
+    let recv = lowerExpr(fc, tk[0])
+    if (fc.failed) {
+      return 0
+    }
+    return tupleElem(fc, tupTy, recv, idx)
+  }
+  fc.failed = true
+  return 0
+}
+
+// Lowers the one-result assertion `iface.(T)` (SPEC §14.4): the receiver, then
+// `T`'s TypeInfo descriptor, then `rt_call iface_assert(recv, info) T` — which
+// panics on a mismatch. The two-result form `(v, ok) = iface.(T)` routes through
+// the assign path instead.
+function lowerTypeAssert(fc: FnCtx, node: int): int {
+  let kids = kidsOf(fc.c.tree, node)
+  let ty = nodeType(fc, node)
+  let recv = lowerExpr(fc, kids[0])
+  if (fc.failed) {
+    return 0
+  }
+  let info = lowerTypeInfo(fc, ty)
+  if (fc.failed) {
+    return 0
+  }
+  let ins = mkInstr(Op.RtCall, ty)
+  ins.name = "iface_assert"
+  ins.args = [recv, info]
+  return emitRtCall(fc, ins)
+}
+
+// The two-result forms `<- c` / `m[k]` / `iface.(T)` (SPEC §12.6/§14.4/§16.2),
+// returning [value, ok] — or an empty list if `node` is none of them. The
+// chan/interface `ok` comes from a call reporting the immediately preceding one
+// (ABI.md §2.2/§11), so each pair is emitted back to back.
+function lowerTwoResult(fc: FnCtx, node: int): []int {
+  let n = getNode(fc.c.tree, node)
+  let k = kidsOf(fc.c.tree, node)
+  let valTy = nodeType(fc, node)
+  let boolTy = primType(fc.c.ctx, 10)
+  if (n.tag == Tag.Unary && n.main == int(Kind.ArrowLeft)) {
+    let ch = lowerExpr(fc, k[0])
+    if (fc.failed) {
+      return []int(0)
+    }
+    let rv = mkInstr(Op.RtCall, valTy)
+    rv.name = "chan_recv"
+    rv.args = [ch]
+    let v = emitRtCall(fc, rv)
+    let okI = mkInstr(Op.RtCall, boolTy)
+    okI.name = "chan_recv_ok"
+    return [v, emitRtCall(fc, okI)]
+  }
+  if (n.tag == Tag.Index) {
+    let recvTy = defaultType(fc.c, nodeType(fc, k[0]))
+    if (fc.c.ctx.types[recvTy].kind != TypeKind.Map) {
+      return []int(0)
+    }
+    let m = lowerExpr(fc, k[0])
+    let key = lowerExprH(fc, k[1], fc.c.ctx.types[recvTy].mapKey)
+    if (fc.failed) {
+      return []int(0)
+    }
+    let v = emitMapGet(fc, valTy, m, key)
+    if (fc.failed) {
+      return []int(0)
+    }
+    let hv = mkInstr(Op.RtCall, boolTy)
+    hv.name = "map_has"
+    hv.args = [m, key]
+    return [v, emitRtCall(fc, hv)]
+  }
+  if (n.tag == Tag.TypeAssert) {
+    let recv = lowerExpr(fc, k[0])
+    if (fc.failed) {
+      return []int(0)
+    }
+    let info = lowerTypeInfo(fc, valTy)
+    if (fc.failed) {
+      return []int(0)
+    }
+    let av = mkInstr(Op.RtCall, valTy)
+    av.name = "iface_as"
+    av.args = [recv, info]
+    let v = emitRtCall(fc, av)
+    let okI = mkInstr(Op.RtCall, boolTy)
+    okI.name = "iface_as_ok"
+    return [v, emitRtCall(fc, okI)]
+  }
+  return []int(0)
+}
+
+// Rebinds a name in the CHECKER for the body being lowered, so a later
+// `checkExprType` on that name sees the type this scope/instance actually gives
+// it (see lowerFunc). Both of the checker's name paths are written: the flat
+// `env` by name, and `declTypes` at the binder's own node — the decl path a
+// reference resolves through (nodeSymbols -> Symbol.decl -> declTypes, #1502).
+// Writing only the env would leave the decl path holding the check pass's
+// best-effort type, which for a monomorphized instance is the bare template.
+function rebindCheckerName(fc: FnCtx, identNode: int, ty: int) {
+  let n = getNode(fc.c.tree, identNode)
+  fc.c.env[fc.c.source[n.span.start:n.span.end]] = ty
+  if (identNode > 0 && identNode < len(fc.c.declTypes)) {
+    fc.c.declTypes[identNode] = ty
+  }
+}
+
+// Binds a two-result binder unless it is the blank `_` (which discards).
+function declareUnlessBlank(fc: FnCtx, patNode: int, val: int, ty: int) {
+  let pn = getNode(fc.c.tree, patNode)
+  let name = fc.c.source[pn.span.start:pn.span.end]
+  if (name == "_") {
+    return
+  }
+  declareLocal(fc, name, val, ty)
+  rebindCheckerName(fc, patNode, ty)
+}
+
+// The body layout of a boxed tuple (ABI.md §1.1) — a tuple is laid out exactly
+// like a struct, so its element types go straight to `layoutFields`.
+function tupleLayout(fc: FnCtx, ty: int): StructLayout {
+  return layoutFields(fc, fc.c.ctx.types[ty].members)
+}
+
+// Boxes `vals` into a fresh tuple record of type `tupTy` (ABI.md §1.1): the same
+// `gc_alloc` + one store per element that a struct composite literal emits,
+// because a tuple is a struct without names.
+function buildTuple(fc: FnCtx, tupTy: int, vals: []int): int {
+  let layout = tupleLayout(fc, tupTy)
+  let ga = mkInstr(Op.GcAlloc, tupTy)
+  ga.ival = layout.size
+  ga.offsets = layout.ptrOffsets
+  let obj = builderEmit(fc.b, ga)
+  let i = 0
+  while (i < len(vals)) {
+    let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+    fs.lhs = obj
+    fs.ival = layout.offsets[i]
+    fs.rhs = vals[i]
+    builderEmit(fc.b, fs)
+    i = i + 1
+  }
+  return obj
+}
+
+// Reads element `idx` out of the boxed tuple `recv` (ABI.md §1.1).
+function tupleElem(fc: FnCtx, tupTy: int, recv: int, idx: int): int {
+  let layout = tupleLayout(fc, tupTy)
+  let fg = mkInstr(Op.FieldGet, fc.c.ctx.types[tupTy].members[idx])
+  fg.lhs = recv
+  fg.ival = layout.offsets[idx]
+  return builderEmit(fc.b, fg)
+}
+
+// Binds each of `pats` to the corresponding element of the boxed tuple `val`,
+// recursing into nested patterns (SPEC §10.1 `pat = IDENT | "_" | tuple_pat`).
+// Arity is checker-enforced; a mismatch is refused rather than read past the end
+// of the layout.
+function destructureTuple(fc: FnCtx, pats: []int, tupTy: int, val: int) {
+  if (tupTy == 0 || fc.c.ctx.types[tupTy].kind != TypeKind.Tuple) {
+    fc.failed = true
+    return
+  }
+  let members = fc.c.ctx.types[tupTy].members
+  if (len(members) != len(pats)) {
+    fc.failed = true
+    return
+  }
+  let i = 0
+  while (i < len(pats)) {
+    let pn = getNode(fc.c.tree, pats[i])
+    if (pn.tag == Tag.TuplePat) {
+      destructureTuple(fc, kidsOf(fc.c.tree, pats[i]), members[i], tupleElem(fc, tupTy, val, i))
+      if (fc.failed) {
+        return
+      }
+    } else {
+      // `_` discards: skip the load entirely rather than emit a dead one.
+      if (fc.c.source[pn.span.start:pn.span.end] != "_") {
+        declareUnlessBlank(fc, pats[i], tupleElem(fc, tupTy, val, i), members[i])
+      }
+    }
+    i = i + 1
+  }
+}
+
+// `let (v, ok) = <two-result>` (SPEC §12.6/§14.4/§16.2), or the general
+// `let (a, b, ...) = <tuple>` destructure (§10.1).
+//
+// The two-result forms are tried first and only at arity 2: `m[k]` and `<- c`
+// are not tuple-typed — they are a value plus a separate presence flag — so they
+// can never fall through to the tuple path, and a tuple can never be mistaken
+// for one.
+function lowerTwoResultLet(fc: FnCtx, binding: int) {
+  let bk = kidsOf(fc.c.tree, binding)
+  let pats = kidsOf(fc.c.tree, bk[0])
+  if (bk[2] == 0) {
+    fc.failed = true
+    return
+  }
+  if (len(pats) == 2 && allIdentPats(fc, pats)) {
+    let two = lowerTwoResult(fc, bk[2])
+    if (fc.failed) {
+      return
+    }
+    if (len(two) == 2) {
+      declareUnlessBlank(fc, pats[0], two[0], nodeType(fc, bk[2]))
+      declareUnlessBlank(fc, pats[1], two[1], primType(fc.c.ctx, 10))
+      return
+    }
+  }
+  let tupTy = nodeType(fc, bk[2])
+  let val = lowerExpr(fc, bk[2])
+  if (fc.failed) {
+    return
+  }
+  destructureTuple(fc, pats, tupTy, val)
+}
+
+// Rebinds an existing local destructuring target to `val`. `_` discards, so it
+// names no slot to rebind.
+function assignEnvSlot(fc: FnCtx, target: int, val: int) {
+  let tn = getNode(fc.c.tree, target)
+  if (tn.tag != Tag.Ident) {
+    fc.failed = true
+    return
+  }
+  let name = fc.c.source[tn.span.start:tn.span.end]
+  if (name == "_") {
+    return
+  }
+  let ix = envIndex(fc, name)
+  if (ix == -1) {
+    fc.failed = true
+    return
+  }
+  fc.env[ix].value = val
+}
+
+// True when every pattern is a plain identifier (so the two-result shape, which
+// binds exactly two names, applies).
+function allIdentPats(fc: FnCtx, pats: []int): bool {
+  let i = 0
+  while (i < len(pats)) {
+    if (getNode(fc.c.tree, pats[i]).tag != Tag.Ident) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Emits a `type_info` for struct type `ty`: `disc` is the type id, `size` and
+// `ptrs` its GC layout (ABI.md §2). Typed `u64` — it is a `.rodata` address, not
+// a traced reference. The checker restricts assertion targets to structs.
+function lowerTypeInfo(fc: FnCtx, ty: int): int {
+  let decl = structDeclOf(fc.c, ty)
+  if (decl == 0) {
+    fc.failed = true
+    return 0
+  }
+  // `ty` is the INSTANTIATION (`Box<i64>`), but `structDeclOf` resolves it back
+  // to the `Box` template by name, whose field is declared `v: T`. Laying that
+  // out unsubstituted classifies the bare param as a traced pointer, so
+  // `Box<i64>`'s integer would be walked as a heap reference — a GC precision
+  // bug baked into a static .rodata descriptor, not a compile error (#1565).
+  let oc = typeOwner(fc.c, ty)
+  let layout = structLayout(fc, oc, decl, structTySubst(fc, oc, decl, ty))
+  let ti = mkInstr(Op.TypeInfo, primType(fc.c.ctx, 7))
+  ti.ival = ty
+  ti.ival2 = layout.size
+  ti.offsets = layout.ptrOffsets
+  return builderEmit(fc.b, ti)
+}

@@ -1,6 +1,6 @@
 //! AST tag-set parity gate (#1420).
 //!
-//! Asserts that the seed's `ast.Tag` and selfhost's `enum Tag` (selfhost/ast.bit)
+//! Asserts that the seed's `ast.Tag` and selfhost's `enum Tag` (compiler/ast.bit)
 //! name exactly the same set of nodes, and that every tag is mentioned by its
 //! own parser.
 //!
@@ -66,7 +66,7 @@ fn snakeCase(gpa: std.mem.Allocator, pascal: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// The tag identifiers declared in selfhost/ast.bit's `enum Tag { ... }`, in
+/// The tag identifiers declared in compiler/ast.bit's `enum Tag { ... }`, in
 /// declaration order. Returns PascalCase names; the caller converts.
 ///
 /// The parse is deliberately literal: find the enum header, then take every
@@ -132,12 +132,12 @@ test "seed and selfhost declare the same AST tag set" {
     var failed = false;
     for (seed_tags) |t| {
         if (contains(selfhost_snake.items, t)) continue;
-        std.debug.print("AST tag '{s}' exists in seed/ast.zig but not in selfhost/ast.bit\n", .{t});
+        std.debug.print("AST tag '{s}' exists in seed/ast.zig but not in compiler/ast.bit\n", .{t});
         failed = true;
     }
     for (selfhost_snake.items, pascal) |t, p| {
         if (contains(&seed_tags, t)) continue;
-        std.debug.print("AST tag '{s}' (Tag.{s}) exists in selfhost/ast.bit but not in seed/ast.zig\n", .{ t, p });
+        std.debug.print("AST tag '{s}' (Tag.{s}) exists in compiler/ast.bit but not in seed/ast.zig\n", .{ t, p });
         failed = true;
     }
     if (failed) {
@@ -146,7 +146,7 @@ test "seed and selfhost declare the same AST tag set" {
     }
 }
 
-/// Every `selfhost/parser*.bit` concatenated. They are sibling files in one
+/// Every `compiler/parser*.bit` concatenated. They are sibling files in one
 /// module (#1503), so a tag is parser-reachable if ANY of them mentions it.
 ///
 /// Reading the directory rather than a fixed file list is deliberate: this gate
@@ -217,7 +217,7 @@ test "every AST tag is reachable from its own parser" {
         const needle = try std.fmt.allocPrint(gpa, "Tag.{s}", .{p});
         defer gpa.free(needle);
         if (std.mem.indexOf(u8, selfhost_parser, needle) != null) continue;
-        std.debug.print("AST tag 'Tag.{s}' is never produced by selfhost/parser.bit\n", .{p});
+        std.debug.print("AST tag 'Tag.{s}' is never produced by compiler/parser.bit\n", .{p});
         failed = true;
     }
 

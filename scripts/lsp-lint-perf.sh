@@ -17,7 +17,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export BIT_STDLIB="$ROOT/stdlib"
 
-SRC="selfhost/lspserver.bit"
+SRC="compiler/lspserver.bit"
 MARK_START="    let lint = lspLintDiagnostics(src)"
 MARK_END="    }"
 # Overhead budget: lint must not add more than this fraction of the baseline
