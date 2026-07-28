@@ -1109,7 +1109,6 @@ pub fn build(b: *std.Build) void {
     // with no environment set — the property every installer depends on.
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
-
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
         golden_opts.addOptionPath("selfhost_bit", selfhosted);
@@ -1263,7 +1262,6 @@ pub fn build(b: *std.Build) void {
     run_fuzz.setEnvironmentVariable("BIT_FUZZ_BIN", selfhost_artifact_path);
     run_fuzz.has_side_effects = true;
     b.step("fuzz", "Mutation-fuzz the lexer+parser (default 60s; pass -- <seconds> [seed])").dependOn(&run_fuzz.step);
-
 
     // Doc-snippet typecheck, Bit port — DELIBERATELY NOT ON `test_step` YET.
     //
