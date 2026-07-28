@@ -1,0 +1,993 @@
+// bit:lint max-file-lines=993 -- a `bit run <file>` harness is ONE file by
+// construction (each tests/bit/*.bit is its own program with its own `main`), so
+// the sibling split CLAUDE.md prescribes is unavailable here. The excess over
+// 800 is the Mach-O and ELF relocation readers this port had to rebuild: the Zig
+// original imported `bit.macho_reader`/`bit.elf_reader`, and a Bit harness
+// cannot import compiler-module files. See "WHAT THE PORT HAD TO REBUILD".
+//
+// Stop-the-world WIRING gate (#1639) — the Bit port of tests/stwwiring.zig.
+//
+// The collector is not merely PRESENT, it is actually REACHABLE from a real
+// boot. Same for the netpoller (#1673) and the `bad=` counter (#1682).
+//
+// Run it: `bit run tests/bit/stwwiring.bit` from the repository root.
+// Configure it by environment, since `bit run` forwards no argv:
+//   BIT                 compiler under test    (default zig-out/bin/bit)
+//   REPO                repository root        (default .)
+//   BIT_TEST_TIMEOUT_S  per-child deadline     (default 300, clamped to 3600)
+//
+// THE DEFECT THIS EXISTS TO CATCH. #1633 landed `runtime/stw`: `stwBind`,
+// `stwCanCollect`, the root enumeration and the precise stack walk, every piece
+// mutation-tested. It proved itself by calling `stwPoll` BY NAME from a test
+// program that owned its own collector block. NO SUCH CALL EXISTED ON THE LIVE
+// PATH. Nothing bound the World registry, nothing bound the three root sources,
+// and so a fully-Bit `libbitrt.a` reported ZERO collections where the Zig
+// runtime reported 65536. It is silent in every direction: a program that never
+// collects is a program that never frees, and it exits 0, prints the right
+// answer, and ran 27 examples byte-identically with the collector dormant. No
+// build, link, golden, differential or stress gate could see it.
+//
+// WHY AN OBJECT-LEVEL GATE AND NOT A PROGRAM THAT RUNS. The property is
+// UNOBSERVABLE AT RUN TIME until G2/G3 (#1583/#1584) swap the archive.
+// `runtime/root.zig` is still in `libbitrt.a` and still owns `bit_rt_safepoint`,
+// so the poll both backends synthesize at every loop back edge goes to ZIG. Any
+// `BIT_GC_STATS` count read out of a normally linked binary is Zig's collector's
+// and is identical with or without this wiring — the measurement trap #1632 hit
+// and #1633 refused to claim. A gate that can only run after the thing it
+// protects has landed protects nothing. What IS observable today is the emitted
+// object: `boot` either references the bind symbols or it does not. Same oracle
+// the linker uses, same technique as `tests/rootpins.zig`.
+//
+// WHAT EACH CHECK PROTECTS, AND THE MUTATION THAT REDDENS IT:
+//
+//   world bind   `rootInit` must hand `runtime/gc` the World block, or
+//                `worldBlockAddr()` stays 0 and the poll returns before it ever
+//                looks at the registry.   Delete the call -> red.
+//   stw bind     each platform `boot` must hand `runtime/stw` the collector,
+//                scheduler and channel-registry addresses. `stwCanCollect` is
+//                all-or-nothing, so a missing bind is a permanently dormant
+//                collector, not a partial one.   Delete the call -> red.
+//   shim target  the `@naked bit_rt_safepoint` shim must enter through
+//                `stwSafepoint`, the pinned live entry, not `stwPoll` directly.
+//   registration `stwPoll` must reach the mutator registration door so EVERY
+//                polling thread is registered before it can park or collect, or
+//                a thread is invisible to both the rendezvous and the root scan
+//                and its live references are swept (#1650).
+//   netpoller    `boot` must create the netpoller fd, bind it into the scheduler
+//                block, and drain it from the worker loop (#1673). Nothing
+//                called either end of `poll.bit` for as long as the Bit net port
+//                existed: `netAwaitReady` bailed at `pollFd == 0`, `netReadSock`
+//                returned -1, and `bit_rt_net_read` reported that as an EMPTY
+//                READ — the documented "peer closed" answer. So
+//                `tests/imports/nettcp` printed BLANK LINES where `HELLO`/`BIT`
+//                belong and still EXITED 0. All three calls are listed because
+//                none is sufficient: a descriptor nothing drains parks the
+//                reader forever, a drain with no descriptor returns 0 at once.
+//   bad offsets  the `BIT_GC_STATS` line must report `gcStatBadOffsets`, the
+//                pointer-map offsets the tracer REFUSED as misaligned or out of
+//                body and therefore never marked (#1682). A degraded trace reads
+//                exactly like a healthy one everywhere else. Both platform
+//                copies are listed because they are kept identical by hand and
+//                nothing else forces them to agree.
+//   NO gate      `stwSafepoint` must NOT consult the sched task-stack probe.
+//                THIS ENTRY USED TO REQUIRE THE OPPOSITE, and it was pinning a
+//                bug: the #1639 gate was a workaround for one process-wide
+//                current-mutator cell, and it suppressed the poll on a worker's
+//                own OS-thread stack — where `schedWorkerRun`'s `nowFn`/`pollFn`
+//                function-value cells live. They were swept while live and
+//                `tests/stress/chanracelinux` faulted 20/20. #1650 keyed the
+//                registry on a real per-OS-thread token, so the gate has nothing
+//                left to protect.   Re-add the gate -> red.
+//
+// The last is a FORBID edge, and it is the only one that has to be: a re-added
+// gate ADDS a call rather than removing one, and its consequence is silent — the
+// program prints the same answer while the collector reports `collections=0
+// abandoned=217`, every rendezvous expiring because a registered worker can
+// never park. No positive edge can express that.
+//
+// Every check names the symbol it expects and fails loudly when it finds
+// nothing, so a rename that makes a check stop matching is a failure rather than
+// a vacuous pass — the specific way `tests/rootpins.zig`'s Darwin half read
+// green for months while examining nothing.
+//
+// WHAT THE PORT HAD TO REBUILD. The Zig original called `bit.buildProject`
+// in-process and handed the bytes to `bit.macho_reader`/`bit.elf_reader`.
+// Neither is reachable from a Bit program: `compiler/machoreader.bit` and
+// `compiler/elfreader.bit` are files of the compiler MODULE, and a `tests/bit/`
+// harness cannot import them. So this file carries its own object reader —
+// deliberately the narrow half of one, since the only question asked of an
+// object is "which relocation names which symbol, inside which definition".
+//
+// It reproduces `seed/link/object.zig`'s `atomizeModule` rule exactly, because
+// the rule IS the gate: an ATOM starts at each defined symbol and spans to the
+// NEXT defined symbol in the same section, and a relocation belongs to the atom
+// whose span contains its offset. A relocation names a symbol only when that
+// symbol is UNDEFINED or GLOBAL (`N_EXT` / non-`STB_LOCAL`), matching
+// `RawTarget.global`; a reference to a local definition is `.local` and is
+// skipped, exactly as the Zig `checkEdge` skipped it. Measured, not assumed:
+// moving the forbidden `schedTaskOnStack` call out of `stwSafepoint` into a
+// neighbouring function in the SAME module leaves this gate green while `nm -u`
+// still shows the symbol — the scoping is real, not a substring search.
+//
+// `--freestanding` IS LOAD-BEARING AND NOT AN INHERITED DEFAULT. An ordinary
+// object inlines the imported modules' bodies into itself, so
+// `runtime/root/darwin` DEFINES `bit_rt_port_stw_bind` whether or not `boot`
+// calls it (measured: `nm` on the plain object shows `T _bit_rt_port_stw_bind`
+// with the call deleted; the freestanding object shows nothing), and a presence
+// check passes vacuously. It is also how the archive G3 ships is assembled.
+//
+// One deliberate difference from the original: objects are emitted ONCE PER
+// MODULE here and reused across the edges that read them, where the Zig test
+// re-emitted per edge. Four compiles instead of fifteen, same bytes, same
+// verdict — and `main` refuses to pass if the grouping visits fewer edges than
+// the table holds.
+
+import { exists, isDir, readFile, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { join } from "std/path"
+import { hasPrefix, indexOf, parseInt } from "std/strings"
+import { now } from "std/time"
+
+// Per-child wall-clock limit, mirroring `tests/proc.zig`. A hang is a failure,
+// not a stall (#1637/#1652); the compiler is a child here, so it is bounded.
+const defaultTimeoutS: int = 300
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+// `osRunBounded`'s result encoding (ABI.md §19).
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+// Upper bound on symbols/relocations walked in one object — every walk provably
+// bounded (Power of 10 rule 2), two orders of magnitude above today's counts.
+const maxScan: int = 1048576
+
+// Target names as `bit build --target` spells them. Mach-O carries the C leading
+// underscore verbatim and ELF does not, so the target also selects the symbol
+// prefix — normalising that is what keeps a Darwin entry from silently matching
+// nothing, the vacuity `tests/rootpins.zig` documents at length.
+const tMacos: string = "aarch64-macos"
+const tLinux: string = "x86_64-linux"
+
+// Where the compiler binary and the tree under test live, so no function has to
+// thread them one parameter at a time.
+struct Cfg { bin: string, repo: string, timeoutMs: int }
+
+// One required edge: in the object emitted from module `path`, the definition
+// `fromSym` must carry a relocation naming `toSym`. `fromSym` empty means "any
+// definition", used where the caller is a private function whose symbol name is
+// a mangling detail rather than a contract. `forbid` inverts it: `fromSym` must
+// still be PRESENT (so the check is never vacuous) but must carry no such
+// relocation.
+struct Edge { path: string, target: string, fromSym: string, toSym: string, forbid: bool, why: string }
+
+// The five rationales that cover two entries each — one text, so the Darwin and
+// Linux halves cannot drift into disagreeing about what they protect.
+const whyStwBind: string = "boot must bind the collector, scheduler and channel registry, or stwCanCollect refuses every collection for the life of the process"
+const whyPollCreate: string = "boot must create the netpoller descriptor, or scPollFd stays 0 and every socket read that must wait returns an empty string (#1673)"
+const whySetPollFd: string = "boot must bind the descriptor into the scheduler block, or netAwaitReady cannot find it however it was created (#1673)"
+const whyPollDrain: string = "the worker loop must drain the netpoller, or a task parked on an fd has no thread in the process that can ever wake it (#1673)"
+const whyBadOffsets: string = "the BIT_GC_STATS line must report refused pointer-map offsets, or a silently degraded trace is indistinguishable from a healthy one (#1682)"
+const whyWorldBind: string = "rootInit must bind the World/Mutator registry, or the safepoint poll returns at `worldBlockAddr() == 0` and no thread ever registers"
+const whyShim: string = "the naked shim must enter through the pinned live entry, not stwPoll directly"
+// THIS EDGE REPLACES THE #1639 GATE ASSERTION, WHICH WAS PINNING A BUG. It used
+// to REQUIRE stwSafepoint -> schedTaskOnStack. `schedCurrentTask()` is 0 on a
+// worker's OWN OS-thread stack, so a worker's run loop never polled and
+// `schedWorkerRun`'s nowFn/pollFn function-value cells — which live in exactly
+// those frames — were swept while live. Measured, not predicted:
+// `tests/stress/chanracelinux` faulted 20 runs out of 20.
+const whyNoGate: string = "stwSafepoint must NOT gate on 'am I on a green-thread stack' — that gate suppresses the poll on a worker's own OS-thread stack, where schedWorkerRun's nowFn/pollFn function-value cells live, and they are then swept while live (#1650)"
+// The positive half of the same property, in two hops because #1836 split the
+// poll: `stwPoll` reads the process-global bindings and forwards to `stwPollOn`,
+// which takes all four as parameters so a program can drive a PRIVATE collector
+// without replacing the live runtime's bindings for every thread. Checking only
+// the first would pass over a `stwPollOn` that never registers; only the second,
+// over a `stwPoll` that never forwards.
+const whyPollFwd: string = "the global-binding poll must forward to the explicit-binding one, or the live safepoint path silently stops registering and collecting (#1836)"
+// BOTH wrappers inline into the poll — `worldEnsureSelfOn` forwards to
+// `currentMutatorOn`, which forwards to `mutatorSlot` — so the edge that
+// survives into the object names the pinned body at the end of that chain, not
+// either forwarder. Verified against the emitted object, not reasoned about; the
+// two forwarders leave no relocation at all.
+const whyRegister: string = "the poll must reach the mutator registration door on EVERY thread that polls, or a thread is invisible to both the rendezvous and the root scan and its live references are swept (#1650)"
+
+// Both platform boots are listed, each on the target its seams are written for
+// (Linux `syscall`, Darwin `extern function`) — a `linux/` module cannot be
+// emitted for Darwin nor a `darwin/` one for Linux, even on an uncalled
+// declaration. Same per-module targeting as `tests/rootpins.zig`.
+function edgeTable(): []Edge {
+  return [
+    Edge{ path: "runtime/root", target: tMacos, forbid: false, fromSym: "bit_rt_init", toSym: "bit_rt_port_gc_world_bind", why: whyWorldBind },
+    Edge{ path: "runtime/root/darwin", target: tMacos, forbid: false, fromSym: "", toSym: "bit_rt_port_stw_bind", why: whyStwBind },
+    Edge{ path: "runtime/root/linux", target: tLinux, forbid: false, fromSym: "", toSym: "bit_rt_port_stw_bind", why: whyStwBind },
+    Edge{ path: "runtime/stw", target: tMacos, forbid: false, fromSym: "bit_rt_safepoint", toSym: "bit_rt_port_stw_safepoint", why: whyShim },
+    Edge{ path: "runtime/stw", target: tMacos, forbid: true, fromSym: "bit_rt_port_stw_safepoint", toSym: "bit_rt_port_sched_task_on_stack", why: whyNoGate },
+    Edge{ path: "runtime/stw", target: tMacos, forbid: false, fromSym: "bit_rt_port_stw_poll", toSym: "bit_rt_port_stw_poll_on", why: whyPollFwd },
+    Edge{ path: "runtime/stw", target: tMacos, forbid: false, fromSym: "bit_rt_port_stw_poll_on", toSym: "bit_rt_port_gc_mutator_slot", why: whyRegister },
+    Edge{ path: "runtime/root/darwin", target: tMacos, forbid: false, fromSym: "", toSym: "bit_rt_port_sched_poll_create", why: whyPollCreate },
+    Edge{ path: "runtime/root/darwin", target: tMacos, forbid: false, fromSym: "", toSym: "bit_rt_port_sched_set_poll_fd", why: whySetPollFd },
+    Edge{ path: "runtime/root/darwin", target: tMacos, forbid: false, fromSym: "", toSym: "bit_rt_port_sched_poll_drain", why: whyPollDrain },
+    Edge{ path: "runtime/root/linux", target: tLinux, forbid: false, fromSym: "", toSym: "bit_rt_port_sched_poll_create", why: whyPollCreate },
+    Edge{ path: "runtime/root/linux", target: tLinux, forbid: false, fromSym: "", toSym: "bit_rt_port_sched_set_poll_fd", why: whySetPollFd },
+    Edge{ path: "runtime/root/linux", target: tLinux, forbid: false, fromSym: "", toSym: "bit_rt_port_sched_poll_drain", why: whyPollDrain },
+    Edge{ path: "runtime/root/darwin", target: tMacos, forbid: false, fromSym: "", toSym: "bit_rt_port_stw_bad_offsets", why: whyBadOffsets },
+    Edge{ path: "runtime/root/linux", target: tLinux, forbid: false, fromSym: "", toSym: "bit_rt_port_stw_bad_offsets", why: whyBadOffsets },
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// The object model: what an edge question needs, and nothing more
+// ---------------------------------------------------------------------------
+
+// One section, in whichever fields its format uses. Mach-O fills addr/size/
+// reloff/nreloc; ELF fills kind/addr/off/size/link/info.
+struct Sec { kind: int, addr: int, off: int, size: int, link: int, info: int, reloff: int, nreloc: int }
+
+// `sect` is -1 unless the symbol DEFINES an atom in a section of this object
+// (undefined, absolute and debug symbols anchor nothing); `value` is then the
+// section-relative offset it starts at. `isGlobal` is true when a relocation
+// against it resolves by NAME at link time rather than to a local atom.
+struct ObjSym { name: string, sect: int, value: int, isGlobal: bool }
+
+// One relocation that names a global symbol, addressed the way the raw object
+// addresses it: an offset within its own section.
+struct ObjReloc { sect: int, off: int, toSym: string }
+
+struct Obj { ok: bool, secs: []Sec, syms: []ObjSym, relocs: []ObjReloc }
+
+function badObj(): Obj {
+  return Obj{ ok: false, secs: []Sec(0), syms: []ObjSym(0), relocs: []ObjReloc(0) }
+}
+
+function objFail(msg: string): Obj {
+  eprint("stwwiring: ${msg}\n")
+  return badObj()
+}
+
+// Every walk below is clamped to `maxScan` so it is provably bounded (Power of
+// 10 rule 2). A clamp that TRUNCATES a table would leave the gate examining less
+// than it thinks — the failure mode this whole file exists to prevent — so a
+// table at the bound is refused outright, as the Zig original's
+// `error.TooMuchToScan` did.
+function objOversized(n: int, what: string): bool {
+  if (n < maxScan) { return false }
+  eprint("stwwiring: ${what} holds ${n} entries, at or above the ${maxScan} scan bound\n")
+  return true
+}
+
+// Little-endian primitive reads, unaligned-safe by construction: nothing in a
+// relocatable object may assume an alignment wider than the field it reads.
+function rdU16(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8)
+}
+
+function rdU32(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8) | (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+}
+
+function rdU64(b: []u8, off: int): int {
+  return rdU32(b, off) | (rdU32(b, off + 4) << 32)
+}
+
+// The NUL-terminated name at `off` in a string table.
+function cstr(b: []u8, off: int): string {
+  if (off < 0 || off >= len(b)) { return "" }
+  let end = off
+  while (end < len(b) && end - off < maxScan && b[end] != u8(0)) {
+    end = end + 1
+  }
+  return string(b[off:end])
+}
+
+// ---------------------------------------------------------------------------
+// Mach-O 64 relocatable objects (aarch64-macos)
+// ---------------------------------------------------------------------------
+//
+// Sections are numbered from 1 across every LC_SEGMENT_64 in load-command order,
+// which is what `nlist_64.n_sect` indexes. A section's `addr` exists only so a
+// symbol's ADDRESS can be turned back into the section-relative offset that
+// `relocation_info.r_address` already is.
+
+// Byte offsets of every load command, or empty if the header is not one.
+function machoCmds(b: []u8): []int {
+  let out = []int(0)
+  if (len(b) < 32 || rdU32(b, 0) != 0xfeedfacf) { return out }
+  let ncmds = rdU32(b, 16)
+  let off = 32
+  let i = 0
+  while (i < ncmds && i < maxScan) {
+    if (off + 8 > len(b) || rdU32(b, off + 4) <= 0) { return []int(0) }
+    out = append(out, off)
+    off = off + rdU32(b, off + 4)
+    i = i + 1
+  }
+  return out
+}
+
+// Every section of every LC_SEGMENT_64 (0x19), in ordinal order.
+function machoSecs(b: []u8, cmds: []int): []Sec {
+  let secs = []Sec(0)
+  for c of cmds {
+    if (rdU32(b, c) != 0x19) { continue }
+    let nsects = rdU32(b, c + 64)
+    let i = 0
+    while (i < nsects && i < maxScan) {
+      let s = c + 72 + i * 80
+      secs = append(secs, Sec{ kind: 0, addr: rdU64(b, s + 32), off: 0,
+        size: rdU64(b, s + 40), link: 0, info: 0,
+        reloff: rdU32(b, s + 56), nreloc: rdU32(b, s + 60) })
+      i = i + 1
+    }
+  }
+  return secs
+}
+
+// One `nlist_64` at `n`. N_STAB (0xe0) is debug bookkeeping: it anchors no atom
+// and names no relocation target. N_TYPE (0x0e) == N_SECT is a definition;
+// anything else (N_UNDF, N_ABS, N_INDR) defines nothing here.
+function machoSym(b: []u8, strtab: []u8, n: int, secs: []Sec): ObjSym {
+  let ntype = int(b[n + 4])
+  let nsect = int(b[n + 5])
+  let stab = (ntype & 0xe0) != 0
+  let global = (!stab && (ntype & 0x0e) == 0) || (ntype & 0x01) != 0
+  let name = cstr(strtab, rdU32(b, n))
+  if (stab || (ntype & 0x0e) != 0x0e || nsect < 1 || nsect > len(secs)) {
+    return ObjSym{ name: name, sect: 0 - 1, value: 0, isGlobal: global }
+  }
+  return ObjSym{ name: name, sect: nsect - 1,
+    value: rdU64(b, n + 8) - secs[nsect - 1].addr, isGlobal: global }
+}
+
+// The LC_SYMTAB (0x2) symbols, rebased from address to section-relative offset.
+function machoSyms(b: []u8, cmds: []int, secs: []Sec): []ObjSym {
+  let syms = []ObjSym(0)
+  for c of cmds {
+    if (rdU32(b, c) != 0x2) { continue }
+    let symoff = rdU32(b, c + 8)
+    let nsyms = rdU32(b, c + 12)
+    let strtab = b[rdU32(b, c + 16):rdU32(b, c + 16) + rdU32(b, c + 20)]
+    let i = 0
+    while (i < nsyms && i < maxScan) {
+      syms = append(syms, machoSym(b, strtab, symoff + i * 16, secs))
+      i = i + 1
+    }
+  }
+  return syms
+}
+
+// Every relocation that names a global symbol. R_SCATTERED (bit 31 of the first
+// word) reinterprets the whole entry and never names an external symbol, so it
+// carries no edge; this compiler emits none, and skipping is defensive rather
+// than load-bearing. r_extern (bit 27) distinguishes "r_symbolnum is a symbol
+// index" from "r_symbolnum is a section ordinal".
+function machoRelocs(b: []u8, secs: []Sec, syms: []ObjSym): []ObjReloc {
+  let out = []ObjReloc(0)
+  let si = 0
+  while (si < len(secs)) {
+    let ri = 0
+    while (ri < secs[si].nreloc && ri < maxScan) {
+      let r = secs[si].reloff + ri * 8
+      let addr = rdU32(b, r)
+      let w = rdU32(b, r + 4)
+      ri = ri + 1
+      if ((addr & 0x80000000) != 0 || ((w >> 27) & 1) == 0) { continue }
+      let sn = w & 0xffffff
+      if (sn >= len(syms) || !syms[sn].isGlobal) { continue }
+      out = append(out, ObjReloc{ sect: si, off: addr, toSym: syms[sn].name })
+    }
+    si = si + 1
+  }
+  return out
+}
+
+function readMacho(b: []u8): Obj {
+  let cmds = machoCmds(b)
+  if (len(cmds) == 0) { return objFail("not a 64-bit little-endian Mach-O object") }
+  let secs = machoSecs(b, cmds)
+  if (len(secs) == 0) { return objFail("Mach-O object has no sections") }
+  for c of cmds {
+    if (rdU32(b, c) == 0x2 && objOversized(rdU32(b, c + 12), "the Mach-O symbol table")) {
+      return badObj()
+    }
+  }
+  for s of secs {
+    if (objOversized(s.nreloc, "a Mach-O relocation table")) { return badObj() }
+  }
+  let syms = machoSyms(b, cmds, secs)
+  if (len(syms) == 0) { return objFail("Mach-O object has no symbol table") }
+  return Obj{ ok: true, secs: secs, syms: syms, relocs: machoRelocs(b, secs, syms) }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 relocatable objects (x86_64-linux)
+// ---------------------------------------------------------------------------
+//
+// `sh_info` of an SHT_RELA section names the section it relocates and `r_offset`
+// is an offset inside that section — already the atomizer's coordinate system,
+// so nothing needs rebasing beyond `sh_addr` (0 in ET_REL).
+
+function elfSecs(b: []u8): []Sec {
+  let out = []Sec(0)
+  if (len(b) < 64 || b[0] != u8(0x7f) || b[1] != u8(0x45) || b[2] != u8(0x4c) ||
+      b[3] != u8(0x46) || b[4] != u8(2) || b[5] != u8(1)) {
+    return out
+  }
+  let shoff = rdU64(b, 0x28)
+  let shentsize = rdU16(b, 0x3a)
+  let shnum = rdU16(b, 0x3c)
+  let i = 0
+  while (i < shnum && i < maxScan) {
+    let s = shoff + i * shentsize
+    out = append(out, Sec{ kind: rdU32(b, s + 4), addr: rdU64(b, s + 16),
+      off: rdU64(b, s + 24), size: rdU64(b, s + 32), link: rdU32(b, s + 40),
+      info: rdU32(b, s + 44), reloff: 0, nreloc: 0 })
+    i = i + 1
+  }
+  return out
+}
+
+// The SHT_SYMTAB (2) symbols. STT_SECTION (3) names a section, not a definition,
+// and STT_FILE (4) names nothing at all; both would otherwise split an atom at
+// offset 0 and steal its relocations. SHN_ABS and up (0xff00) are not section
+// indices. An unnamed symbol anchors no atom for the same reason `atomizeModule`
+// identifies an atom by its symbol's name.
+function elfSym(b: []u8, strtab: []u8, e: int, secs: []Sec): ObjSym {
+  let name = cstr(strtab, rdU32(b, e))
+  let info = int(b[e + 4])
+  let shndx = rdU16(b, e + 6)
+  let kind = info & 0x0f
+  let global = shndx == 0 || (info >> 4) != 0
+  if (shndx < 1 || shndx >= len(secs) || kind == 3 || kind == 4 || len(name) == 0) {
+    return ObjSym{ name: name, sect: 0 - 1, value: 0, isGlobal: global }
+  }
+  return ObjSym{ name: name, sect: shndx, value: rdU64(b, e + 8) - secs[shndx].addr,
+    isGlobal: global }
+}
+
+function elfSyms(b: []u8, secs: []Sec, symIdx: int): []ObjSym {
+  let syms = []ObjSym(0)
+  let strIdx = secs[symIdx].link
+  if (strIdx <= 0 || strIdx >= len(secs)) { return syms }
+  let strtab = b[secs[strIdx].off:secs[strIdx].off + secs[strIdx].size]
+  let n = 0
+  while (n < secs[symIdx].size / 24 && n < maxScan) {
+    syms = append(syms, elfSym(b, strtab, secs[symIdx].off + n * 24, secs))
+    n = n + 1
+  }
+  return syms
+}
+
+// Every SHT_RELA (4) entry that names a global symbol. `r_info` is 8 bytes at
+// +8; the symbol index is its high half, at +12.
+function elfRelocs(b: []u8, secs: []Sec, syms: []ObjSym): []ObjReloc {
+  let out = []ObjReloc(0)
+  let i = 0
+  while (i < len(secs)) {
+    let tgt = secs[i].info
+    if (secs[i].kind != 4 || tgt <= 0 || tgt >= len(secs)) {
+      i = i + 1
+      continue
+    }
+    let j = 0
+    while (j < secs[i].size / 24 && j < maxScan) {
+      let r = secs[i].off + j * 24
+      let sym = rdU32(b, r + 12)
+      j = j + 1
+      if (sym >= len(syms) || !syms[sym].isGlobal || len(syms[sym].name) == 0) { continue }
+      out = append(out, ObjReloc{ sect: tgt, off: rdU64(b, r), toSym: syms[sym].name })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function readElf(b: []u8): Obj {
+  let secs = elfSecs(b)
+  if (len(secs) == 0) { return objFail("not a 64-bit little-endian ELF object") }
+  // A missing .symtab is a parse FAILURE, never an empty symbol list: an empty
+  // list would make every `fromSym` report "anchor missing" and every `forbid`
+  // edge pass for the wrong reason.
+  let symIdx = 0 - 1
+  let k = 0
+  while (k < len(secs)) {
+    if (secs[k].kind == 2) { symIdx = k }
+    k = k + 1
+  }
+  if (symIdx < 0) { return objFail("ELF object has no .symtab") }
+  if (objOversized(secs[symIdx].size / 24, "the ELF symbol table")) { return badObj() }
+  for s of secs {
+    if (s.kind == 4 && objOversized(s.size / 24, "an ELF relocation table")) { return badObj() }
+  }
+  let syms = elfSyms(b, secs, symIdx)
+  if (len(syms) == 0) { return objFail("ELF .symtab is empty or has no string table") }
+  return Obj{ ok: true, secs: secs, syms: syms, relocs: elfRelocs(b, secs, syms) }
+}
+
+// ---------------------------------------------------------------------------
+// The edge check
+// ---------------------------------------------------------------------------
+
+// The end of the atom starting at (`sect`, `start`): the next defined symbol's
+// offset in the same section, or the section's size. `atomizeModule`'s rule —
+// span to the NEXT SYMBOL, never to a declared size, because any padding between
+// them still carries relocations that must belong to some atom.
+function atomEnd(o: Obj, sect: int, start: int): int {
+  let end = o.secs[sect].size
+  let i = 0
+  while (i < len(o.syms)) {
+    if (o.syms[i].sect == sect && o.syms[i].value > start && o.syms[i].value < end) {
+      end = o.syms[i].value
+    }
+    i = i + 1
+  }
+  return end
+}
+
+// Every definition named `want`: the atom, plus any aliases at one offset.
+function edgeAnchors(o: Obj, want: string): []ObjSym {
+  let out = []ObjSym(0)
+  let i = 0
+  while (i < len(o.syms)) {
+    if (o.syms[i].sect >= 0 && o.syms[i].name == want) { out = append(out, o.syms[i]) }
+    i = i + 1
+  }
+  return out
+}
+
+// True when a relocation naming `wantTo` lies inside one of `starts` — or
+// anywhere in the object when `starts` is the "any definition" case.
+function edgeHit(o: Obj, starts: []ObjSym, anyFrom: bool, wantTo: string): bool {
+  let i = 0
+  while (i < len(o.relocs)) {
+    let r = o.relocs[i]
+    i = i + 1
+    if (r.toSym != wantTo) { continue }
+    if (anyFrom) { return true }
+    for s of starts {
+      if (r.sect == s.sect && r.off >= s.value && r.off < atomEnd(o, s.sect, s.value)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// True when the object satisfies `e`. A missing DEFINITION and a missing EDGE
+// are different repairs, so they are reported differently rather than as one
+// "not found".
+function checkEdge(e: Edge, o: Obj): bool {
+  let sp = ""
+  if (e.target == tMacos) { sp = "_" }
+  let wantTo = "${sp}${e.toSym}"
+  let anyFrom = len(e.fromSym) == 0
+  let wantFrom = "<any definition>"
+  let starts = []ObjSym(0)
+  if (!anyFrom) {
+    wantFrom = "${sp}${e.fromSym}"
+    starts = edgeAnchors(o, wantFrom)
+    if (len(starts) == 0) {
+      eprint("stwwiring: ${e.path}: no definition named '${wantFrom}'. The gate examined " +
+        "nothing for this edge — the symbol was renamed or the pin was dropped, which " +
+        "is a failure here and not a pass.\n")
+      return false
+    }
+  }
+  let hit = edgeHit(o, starts, anyFrom, wantTo)
+  if (e.forbid) {
+    if (!hit) { return true }
+    eprint("stwwiring: ${e.path}: '${wantFrom}' MUST NOT reference '${wantTo}', and does.\n" +
+      "  ${e.why}.\n")
+    return false
+  }
+  if (hit) { return true }
+  eprint("stwwiring: ${e.path}: '${wantFrom}' does not reference '${wantTo}'.\n" +
+    "  ${e.why}.\n" +
+    "  This is invisible to every other gate: pre-G2 the safepoint still resolves\n" +
+    "  to runtime/root.zig, so a program linked today collects exactly the same\n" +
+    "  with or without the missing call (#1639).\n")
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Emitting the objects
+// ---------------------------------------------------------------------------
+
+// Compiles `<repo>/<path>` for `target` as a FREESTANDING relocatable object and
+// parses it. See the header for why `--freestanding` is load-bearing.
+function loadObject(c: Cfg, path: string, target: string, idx: int): Obj {
+  let dir = join(c.repo, path)
+  if (!isDir(dir)) { return objFail("not a module directory: ${dir} (set REPO)") }
+  let base = "/tmp/bit-stwwiring-${now()}-${idx}"
+  let obj = "${base}.o"
+  let cmd = "exec \"${c.bin}\" build \"${dir}\" --emit-obj --freestanding " +
+    "--target ${target} -o \"${obj}\""
+  let rc = runBounded("${base}.sh", "${base}.log", cmd, c.timeoutMs)
+  if (rc != 0) {
+    reportChild("${path} (${target})", rc, "${base}.log")
+    fsRemove(obj)
+    return badObj()
+  }
+  fsRemove("${base}.log")
+  let raw = readFile(obj) catch e {
+    fsRemove(obj)
+    return objFail("cannot read emitted object ${obj}: ${e.message()}")
+  }
+  fsRemove(obj)
+  if (target == tMacos) { return readMacho([]u8(raw)) }
+  return readElf([]u8(raw))
+}
+
+// Writes `cmd` into an executable `/bin/sh` script and runs it under a deadline.
+// The script exists only because `osRunBounded` takes a path and NO argv
+// (ABI.md §19), so a command WITH arguments cannot be expressed directly.
+function runBounded(script: string, log: string, cmd: string, timeoutMs: int): int {
+  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
+    eprint("stwwiring: cannot write ${script}: ${e.message()}\n")
+    return rcSpawnFailed
+  }
+  if (fsChmod(script, 493) != 0) {
+    eprint("stwwiring: cannot make ${script} executable\n")
+    fsRemove(script)
+    return rcSpawnFailed
+  }
+  let r = osRunBounded(script, timeoutMs)
+  fsRemove(script)
+  return r
+}
+
+// Names a failed child on stderr. A timeout and a crash are distinct outcomes:
+// scoring a segfault as a timeout sends the reader hunting the wrong bug.
+function reportChild(what: string, r: int, log: string) {
+  if (r == rcTimedOut) {
+    eprint("stwwiring: ${what}: TIMED OUT at the ${timeoutEnvVar} deadline\n")
+  } else if (r <= rcSignalBase) {
+    eprint("stwwiring: ${what}: compiler CRASHED — ${signalName(0 - r + rcSignalBase)}\n")
+  } else if (r == rcSpawnFailed) {
+    eprint("stwwiring: ${what}: could not spawn the compiler\n")
+  } else {
+    eprint("stwwiring: ${what}: compiler exited with ${r}\n")
+  }
+  let text = readFile(log) catch _ {
+    ""
+  }
+  if (len(text) > 0) { eprint("--- ${what} ---\n${text}\n") }
+  fsRemove(log)
+}
+
+// The signal numbers worth naming, as `tests/proc.zig`'s `signalName` does.
+function signalName(sig: int): string {
+  if (sig == 4) { return "SIGILL (4)" }
+  if (sig == 6) { return "SIGABRT (6)" }
+  if (sig == 8) { return "SIGFPE (8)" }
+  if (sig == 9) { return "SIGKILL (9)" }
+  if (sig == 10) { return "SIGBUS (10)" }
+  if (sig == 11) { return "SIGSEGV (11)" }
+  return "signal ${sig}"
+}
+
+// The per-child limit in seconds, clamped into [1, maxTimeoutS] so a typo can
+// neither disable the deadline nor make it useless.
+function timeoutSeconds(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) { return defaultTimeoutS }
+  let n = parseInt(raw) catch _ {
+    eprint("stwwiring: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS
+  }
+  if (n < 1) { return 1 }
+  if (n > maxTimeoutS) { return maxTimeoutS }
+  return n
+}
+
+// ---------------------------------------------------------------------------
+// THE ROOT-CLASS POPULATION FLOOR (#1683)
+// ---------------------------------------------------------------------------
+//
+// #1679 was a root class covered by NOTHING. The per-task scratch area held two
+// live references — `scrElem`, a blocking channel send/receive's value slot, and
+// `scrErr`, the pending-error object — and no enumerated class reached them, so
+// a value in flight through a blocking channel was swept. Every gate in the tree
+// was green the whole time, and none could have seen it: the differentials
+// compare check/type/IR dumps and a root set appears in no dump; the edges above
+// check that a call EXISTS, and the missing class was not a missing symbol; and
+// `zig build test`'s imports corpus links the ZIG archive, whose `root.zig` has
+// no scratch area at all, so the defect is unreachable there by construction.
+//
+// `tests/stress/stwcollect` IS the right vehicle, but on its own it can only
+// check the classes its author thought of — it builds its own synthetic root
+// sources, and a class nobody wrote is a class nobody constructs. So: the
+// collector enumerates its classes in ONE place, `stw.bit`'s ROOT SET header,
+// and every one must carry a `ROOT CLASS <n>` case marker over there. Adding a
+// class without a case is red; deleting a class without deleting its case is
+// red; and dropping below the floor is red even when the two sides still agree,
+// which is what stops the gate being quietly emptied one class at a time.
+const minRootClasses: int = 7
+// The scratch area's width today. The stop-the-world scan is bounded by
+// `min(chanScratchWords, stackBytes/8)`, so shrinking this NARROWS THE SCANNED
+// SET one word at a time while every class stays present and every case green.
+const minScratchWords: int = 265
+
+const stwSource: string = "runtime/stw/stw.bit"
+const stwRootSetAnchor: string = "THE ROOT SET, AND WHY IT IS ALL-OR-NOTHING"
+const stwcollectSource: string = "tests/stress/stwcollect/stwcollect.bit"
+const caseMarker: string = "ROOT CLASS "
+const scratchSource: string = "runtime/sched/scratch.bit"
+const scratchWordsDecl: string = "export const chanScratchWords: int = "
+
+// Class numbers run 1..62, held as a bitmask so the two sides can be compared
+// and the difference NAMED rather than reported as a count mismatch. A NEGATIVE
+// set means "this scan examined nothing", which is a failure, not a pass.
+const maxClass: int = 62
+
+function classHas(set: int, n: int): bool {
+  return ((set >> n) & 1) == 1
+}
+
+function classCount(set: int): int {
+  let c = 0
+  let n = 1
+  while (n <= maxClass) {
+    if (classHas(set, n)) { c = c + 1 }
+    n = n + 1
+  }
+  return c
+}
+
+function isDigitAt(s: string, i: int): bool {
+  return i < len(s) && s[i:i + 1] >= "0" && s[i:i + 1] <= "9"
+}
+
+// The class number a `  N. ...` comment line enumerates, or 0.
+function classInLine(line: string): int {
+  if (!hasPrefix(line, "//")) { return 0 }
+  let body = trimLeadingSpace(line[2:len(line)])
+  if (len(body) < 3) { return 0 }
+  let dot = indexOf(body, ".")
+  if (dot < 1 || dot > 2) { return 0 }
+  let n = parseInt(body[0:dot]) catch _ {
+    0
+  }
+  if (n < 1 || n > maxClass) { return 0 }
+  return n
+}
+
+function trimLeadingSpace(s: string): string {
+  let i = 0
+  while (i < len(s) && s[i:i + 1] == " ") {
+    i = i + 1
+  }
+  return s[i:len(s)]
+}
+
+// Every class number enumerated in `stw.bit`'s ROOT SET header.
+//
+// Bounded to that comment block by its own heading rather than matched over the
+// whole file: `stwPoll`'s body carries a second numbered list ("1. Someone else
+// is collecting"), and a file-wide scan would silently fold the two together — a
+// gate that examines the wrong set is the failure mode this file exists to
+// prevent. The block ends at the first line that is not a comment.
+function rootClassesDeclared(src: string): int {
+  let at = indexOf(src, stwRootSetAnchor)
+  if (at < 0) {
+    eprint("stwwiring: ${stwSource}: the ROOT SET header ('${stwRootSetAnchor}') is gone. " +
+      "This check examined nothing, which is a failure and not a pass — the class " +
+      "enumeration it reads was renamed or deleted (#1683).\n")
+    return 0 - 1
+  }
+  let set = 0
+  let pos = at
+  let lines = 0
+  let first = true
+  while (pos < len(src) && lines < maxScan) {
+    lines = lines + 1
+    let rel = indexOf(src[pos:len(src)], "\n")
+    let line = src[pos:len(src)]
+    if (rel >= 0) {
+      line = src[pos:pos + rel]
+      pos = pos + rel + 1
+    } else {
+      pos = len(src)
+    }
+    if (first) {
+      first = false
+      continue
+    }
+    if (!hasPrefix(line, "//")) { return set }
+    set = set | (1 << classInLine(line))
+  }
+  return set
+}
+
+// Every class number a `ROOT CLASS <n>` marker in `stwcollect.bit` claims a case
+// for. A marker not followed by digits contributes nothing — the rule stated in
+// that file's own header.
+function rootClassesCovered(src: string): int {
+  let set = 0
+  let at = 0
+  let found = 0
+  while (at < len(src) && found < maxScan) {
+    let rel = indexOf(src[at:len(src)], caseMarker)
+    if (rel < 0) { return set }
+    found = found + 1
+    let d = at + rel + len(caseMarker)
+    let end = d
+    while (isDigitAt(src, end)) {
+      end = end + 1
+    }
+    at = d
+    if (end == d) { continue }
+    let n = parseInt(src[d:end]) catch _ {
+      0
+    }
+    if (n >= 1 && n <= maxClass) { set = set | (1 << n) }
+  }
+  return set
+}
+
+// True when every enumerated class has a case and no case names a class that
+// does not exist.
+function reportClassGap(declared: int, covered: int): bool {
+  let n = 1
+  while (n <= maxClass) {
+    if (classHas(declared, n) && !classHas(covered, n)) {
+      eprint("stwwiring: root class ${n} is enumerated in ${stwSource} and has NO case in " +
+        "${stwcollectSource}.\n  Add a phase there that makes one payload reachable from " +
+        "THAT CLASS ALONE, asserts it survives a collection with a non-zero count, and " +
+        "marks itself 'ROOT CLASS ${n}'.\n  A class with no case is exactly #1679: every " +
+        "build, link, golden, differential and stress gate stayed green while a live " +
+        "value was being swept.\n")
+      return false
+    }
+    if (classHas(covered, n) && !classHas(declared, n)) {
+      eprint("stwwiring: ${stwcollectSource} claims a case for root class ${n}, which " +
+        "${stwSource} does not enumerate. Either the class was deleted from the collector " +
+        "(see the floor above) or the marker is stale — a case for a class that does not " +
+        "exist tests nothing.\n")
+      return false
+    }
+    n = n + 1
+  }
+  return true
+}
+
+function checkRootClasses(repo: string): bool {
+  let stwSrc = readFile(join(repo, stwSource)) catch e {
+    eprint("stwwiring: cannot read ${stwSource}: ${e.message()}\n")
+    return false
+  }
+  let caseSrc = readFile(join(repo, stwcollectSource)) catch e {
+    eprint("stwwiring: cannot read ${stwcollectSource}: ${e.message()}\n")
+    return false
+  }
+  let declared = rootClassesDeclared(stwSrc)
+  if (declared < 0) { return false }
+  if (classCount(declared) < minRootClasses) {
+    eprint("stwwiring: ${stwSource} enumerates ${classCount(declared)} root classes, floor " +
+      "is ${minRootClasses}. A class was REMOVED from the collector's root set. That is " +
+      "not a cleanup: the symptom of a missing class is a live object swept and a wrong " +
+      "answer somewhere else entirely (#1679). If the removal is deliberate, delete its " +
+      "case in ${stwcollectSource} and lower the floor in the same change.\n")
+    return false
+  }
+  return reportClassGap(declared, rootClassesCovered(caseSrc))
+}
+
+// True when the scanned scratch area has not shrunk.
+function checkScratchWidth(repo: string): bool {
+  let src = readFile(join(repo, scratchSource)) catch e {
+    eprint("stwwiring: cannot read ${scratchSource}: ${e.message()}\n")
+    return false
+  }
+  let at = indexOf(src, scratchWordsDecl)
+  if (at < 0) {
+    eprint("stwwiring: ${scratchSource}: no '${scratchWordsDecl}' declaration. This check " +
+      "examined nothing.\n")
+    return false
+  }
+  let d = at + len(scratchWordsDecl)
+  let end = d
+  while (isDigitAt(src, end)) {
+    end = end + 1
+  }
+  let words = parseInt(src[d:end]) catch _ {
+    eprint("stwwiring: ${scratchSource}: chanScratchWords is not a literal integer\n")
+    return false
+  }
+  if (words < minScratchWords) {
+    eprint("stwwiring: chanScratchWords is ${words}, floor is ${minScratchWords}. The " +
+      "stop-the-world scratch scan walks min(chanScratchWords, stackBytes/8) words, so " +
+      "shrinking this NARROWS THE SCANNED SET while root class 6 stays present and its " +
+      "case stays green — the live references at scrElem/scrErr/scrRecvOk fall out of the " +
+      "scan one word at a time (#1679, #1683).\n")
+    return false
+  }
+  return true
+}
+
+// ---------------------------------------------------------------------------
+
+// True when the (path, target) at `ei` was already emitted for an earlier edge.
+function alreadyEmitted(edges: []Edge, ei: int): bool {
+  let i = 0
+  while (i < ei) {
+    if (edges[i].path == edges[ei].path && edges[i].target == edges[ei].target) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Checks every edge, one object per module. Returns the failure count, or -1
+// when an object could not be read at all — its edges are then UNCHECKED, which
+// is never a pass. `checked` is returned through `counts` so `main` can prove
+// the grouping visited the whole table.
+function runEdges(c: Cfg, edges: []Edge, counts: []int): int {
+  let failed = 0
+  let objIdx = 0
+  let ei = 0
+  while (ei < len(edges)) {
+    if (alreadyEmitted(edges, ei)) {
+      ei = ei + 1
+      continue
+    }
+    objIdx = objIdx + 1
+    let obj = loadObject(c, edges[ei].path, edges[ei].target, objIdx)
+    if (!obj.ok) {
+      eprint("stwwiring: could not read the object for ${edges[ei].path} " +
+        "(${edges[ei].target}); its edges are UNCHECKED\n")
+      return 0 - 1
+    }
+    let gi = ei
+    while (gi < len(edges)) {
+      if (edges[gi].path == edges[ei].path && edges[gi].target == edges[ei].target) {
+        counts[0] = counts[0] + 1
+        if (!checkEdge(edges[gi], obj)) { failed = failed + 1 }
+      }
+      gi = gi + 1
+    }
+    ei = ei + 1
+  }
+  return failed
+}
+
+function main() {
+  let c = Cfg{ bin: envOr("BIT", "zig-out/bin/bit"), repo: envOr("REPO", "."),
+    timeoutMs: timeoutSeconds() * 1000 }
+  if (!exists(c.bin)) {
+    eprint("stwwiring: compiler not found: ${c.bin} (set BIT)\n")
+    exit(1)
+    return
+  }
+  let edges = edgeTable()
+  // An empty table makes the loop a no-op and the whole gate a green no-op with
+  // it — the failure `tests/rootpins.zig` measured when `modules` was emptied.
+  if (len(edges) == 0) {
+    eprint("stwwiring: the edge table is EMPTY, so this gate checks nothing\n")
+    exit(1)
+    return
+  }
+  let counts = [0]
+  let failed = runEdges(c, edges, counts)
+  if (failed < 0) {
+    exit(1)
+    return
+  }
+  // Grouping is an optimisation; silently dropping an edge through it would be
+  // the same vacuity every check above is written to refuse.
+  if (counts[0] != len(edges)) {
+    eprint("stwwiring: checked ${counts[0]} of ${len(edges)} edges — the grouping dropped " +
+      "one, which is a failure and not a pass\n")
+    exit(1)
+    return
+  }
+  if (!checkRootClasses(c.repo)) { failed = failed + 1 }
+  if (!checkScratchWidth(c.repo)) { failed = failed + 1 }
+  if (failed > 0) {
+    eprint("stwwiring: FAILED — ${failed} check(s)\n")
+    exit(1)
+    return
+  }
+  print("${counts[0]} wiring edges, root-class coverage and scratch width all hold\n")
+}

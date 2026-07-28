@@ -547,31 +547,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&rootabi_run.step);
     b.step("rootabi", "Runtime-ABI gates: register-class, poll-free, ABI membership (tests/rootabi*.zig)").dependOn(&rootabi_run.step);
 
-    // Stop-the-world wiring gate (#1639): the collector `runtime/stw` implements
-    // must actually be REACHED by a booted program. It was not — nothing bound
-    // the World registry or the three root sources, so a fully-Bit `libbitrt.a`
-    // reported 0 collections against the Zig runtime's 65536 while every example
-    // still ran byte-identically. Pre-G2 the property has no run-time signal at
-    // all (the live `bit_rt_safepoint` is still root.zig's), so it is checked on
-    // the emitted objects. See tests/stwwiring.zig's header.
-    const stwwiring_opts = b.addOptions();
-    stwwiring_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
-    stwwiring_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-
-    const stwwiring_mod = b.createModule(.{
-        .root_source_file = b.path("tests/stwwiring.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    stwwiring_mod.addImport("bit", exe.root_module);
-    stwwiring_mod.addOptions("build_options", stwwiring_opts);
-
-    const stwwiring_tests = b.addTest(.{ .root_module = stwwiring_mod });
-    const stwwiring_run = b.addRunArtifact(stwwiring_tests);
-    // Same cache reason as rootpins: runtime/**/*.bit is read at run time.
-    stwwiring_run.has_side_effects = true;
-    test_step.dependOn(&stwwiring_run.step);
-    b.step("stwwiring", "Stop-the-world wiring gate (tests/stwwiring.zig)").dependOn(&stwwiring_run.step);
+    // Stop-the-world wiring gate (#1639) is now tests/bit/stwwiring.bit,
+    // wired at the tail. See its header for the 15 edges it checks.
 
     // Import-set differential (#1436): the two compilers must emit the same
     // UNDEFINED symbols for the same source. `extern function close` built clean
@@ -1308,6 +1285,23 @@ pub fn build(b: *std.Build) void {
     // reappearing in the Bit toolchain, which is why the class-(a) audit called
     // that harness misclassified.
     if (selfhost_install_step) |inst| stress_gate.step.dependOn(inst);
+
+    // Poll-free runtime audit (#1656/#1658), replacing tests/rootabi_pollfree.zig.
+    // Every top-level function under runtime/{root,rand,net} must be @nosplit or
+    // @naked, or be one of 95 reviewed exceptions — carried across verbatim and
+    // machine-verified byte-identical to the Zig table.
+    _ = addBitGate(b, selfhosted, test_step, "pollfree", "tests/bit/pollfree.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the poll-free runtime audit (tests/bit/pollfree.bit) only");
+
+    // Stop-the-world wiring (#1639), replacing tests/stwwiring.zig: the collector
+    // and netpoller must actually be REACHABLE from a booted program. Checked on
+    // the emitted objects, so it needs the compiler settled on disk.
+    const stw_gate = addBitGate(b, selfhosted, test_step, "stwwiring", "tests/bit/stwwiring.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the stop-the-world wiring gate (tests/bit/stwwiring.bit) only");
+    if (selfhost_install_step) |inst| stw_gate.step.dependOn(inst);
+    if (host_libbitrt_install) |inst| stw_gate.step.dependOn(inst);
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).

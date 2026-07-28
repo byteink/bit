@@ -1,0 +1,746 @@
+// The poll-free gate (#1658) — the Bit port of `tests/rootabi_pollfree.zig`.
+//
+// THIS GATE DOES NOT DIE WITH THE ZIG RUNTIME. It walks `runtime/**/*.bit` and
+// nothing else: no `runtime/*.zig`, no seed data structure, no build option that
+// only the seed defines. Deleting `runtime/*.zig` leaves the property it asserts
+// intact and makes it MORE load-bearing, not less — once the Bit runtime is the
+// only runtime, #1656 stops being latent and becomes the live failure mode.
+//
+// THE DEFECT (#1656, an s0 that survived four G3 attempts; read that ticket for
+// the full mechanism). A `bit_rt_*` function written in Bit and NOT marked
+// `@nosplit` gets a compiler-synthesized `bl bit_rt_safepoint` at every loop
+// back edge (`needsNoSafepoints` in the arm64 backend), so a collection can run
+// INSIDE the runtime — where the Zig runtime never collected, carrying no
+// back-edge polls. There the runtime holds its GC objects only as raw `int`
+// addresses and interior pointers, because the ABI boundary FORCES that (E0079:
+// a pinned symbol may not name a managed type), and no stack map names them —
+// ABI.md §5 walks the RUNNING task's stack PRECISELY and scans only every
+// *other* registered task's conservatively. So the object is swept, recycled and
+// re-zeroed under a live reference.
+//
+// WHY A GATE AND NOT JUST THE FIX. The whole golden corpus returns OK / NUL 0 /
+// HANG 0 on a tree that still has the defect; only `BIT_GC=stress` against a
+// relinked compiler discriminates, and that configuration does not exist on
+// `main`. Nothing in the tree fails when a NEW runtime function joins the class.
+//
+// WHAT IS ASSERTED. Every top-level function declared under the covered subtrees
+// carries `@nosplit` or `@naked`, unless it is on the reviewed exception list
+// below. `@nosplit` is the right primitive because E0075 makes the guarantee
+// TRANSITIVE over the callee subtree and forbids allocation outright: one
+// annotation on an ABI wrapper proves the whole reachable body is poll-free, so
+// the checker does the closure and this gate only proves the roots were marked.
+//
+// SCOPE. `runtime/root/**` (#1658), `runtime/rand/**` (#1667) and
+// `runtime/net/**` (#1668) — the three subtrees whose Bit functions are reached
+// from an ABI pin. The remaining runtime subtrees (`gc`, `stw`, `alloc`, `chan`,
+// `park`, `sched`, `thread`, `auxv`) are NOT asserted here, and this sentence is
+// the honest statement of that rather than an implied clean bill.
+//
+// WHAT `runtime/net` ADDED TO THE PICTURE (#1668), because it is the shape
+// `@nosplit` cannot express. `netReadSock` and its siblings must be able to PARK
+// the calling green thread, and E0075 is transitive into the scheduler, so the
+// annotation is unavailable to them by construction. What #1658 requires is not
+// the annotation but THE PROPERTY BEHIND IT — no raw GC address held across a
+// poll — and there are two ways to have it:
+//
+//   (a) `@nosplit`: no poll can occur, so a raw address is safe. Mechanically
+//       checked, which is why it is preferred and why this gate demands it.
+//   (b) Hold no raw GC address in the first place. `runtime/net`'s port layer
+//       takes every buffer as a `*u8` PARAMETER into memory its CALLER owns, and
+//       `netabi.bit`'s wrappers now hold their receive buffers as MANAGED `[]i64`
+//       locals — real stack-map slots the precise walk names, whose backing the
+//       non-moving collector never relocates. A `string` arriving as a raw `int`
+//       parameter is likewise rooted by the compiled Bit caller's own frame,
+//       which is what makes it different from #1656's `rtFsReadAll`, where the
+//       object was allocated INSIDE the runtime and so named by no frame at all.
+//
+// (b) is a REVIEWED claim, not a checked one, so every function resting on it is
+// an entry below carrying its argument. That is why the exception list is spelled
+// out per function rather than per directory.
+//
+// HOW THE PORT READS THE SOURCES, and what changed. The Zig harness imported the
+// seed's own parser and matched `func_decl` nodes. A Bit harness has no such
+// library — `bit` exposes no AST dump — so this one scans declaration lines
+// directly. That is a weaker reader, so it is treated as one: `checkScanner()`
+// below unit-tests it against every shape the runtime actually uses BEFORE the
+// walk, including the two ways a text scanner silently goes wrong (an attribute
+// leaking across a blank line onto the next declaration, and an indented
+// `function` inside a body being taken for a top-level one). Both directions are
+// asserted, so a scanner that answers "poll-free" to everything fails here rather
+// than passing the corpus. Where the two readers could still disagree the port is
+// the CONSERVATIVE one: an unrecognised declaration shape is a hard failure, and
+// an attribute that does not sit immediately above its `function` is not counted.
+//
+// Usage (cwd is the repository root):
+//
+//     bit run tests/bit/pollfree.bit
+//
+// `BIT_REPO` overrides the repository root (default ".").
+
+import { isDir, readFile, walk } from "std/fs"
+import { exit, envOr } from "std/os"
+import { hasPrefix, hasSuffix, split } from "std/strings"
+
+// ---------------------------------------------------------------------------
+// Bounds — every walk and every scan is provably finite (Power of 10 rule 2).
+// ---------------------------------------------------------------------------
+
+// Mirrors `rootabi_shared.max_bit_files`: an order of magnitude above today's
+// count of runtime sources.
+const maxBitFiles: int = 1024
+// Mirrors `rootabi_shared.max_source_bytes` (1 << 22).
+const maxSourceBytes: int = 4194304
+const maxLinesPerFile: int = 200000
+const maxAttrsPerDecl: int = 8
+
+const exportKw: string = "export "
+const externKw: string = "extern "
+const funcKw: string = "function "
+
+// ---------------------------------------------------------------------------
+// The covered subtrees
+// ---------------------------------------------------------------------------
+
+// A subtree this gate covers, relative to `runtime/`, with a lower bound on the
+// declarations it must yield.
+//
+// THE FLOOR IS PER-SUBTREE, AND THAT IS THE POINT. A single total floor lets one
+// subtree fall to zero — a moved directory, a renamed provider, a scanner change
+// — while another's growth keeps the sum above the line, which is exactly the
+// vacuous pass this gate exists to prevent. #1658's first cut silently examined
+// 223 of 265 declarations and only a floor surfaced it.
+struct Root {
+  sub: string
+  minScanned: int
+}
+
+// The floors are carried over from the Zig gate UNCHANGED, so the contract is
+// the same one that was reviewed. Its header recorded populations of root 265,
+// rand 17 and net 189; this scanner reads 288 / 21 / 194 on the same tree, which
+// is growth plus the small counting differences a line scanner has against an
+// AST walk. Each floor still sits under its own subtree, and is a floor rather
+// than a target.
+function pollFreeRoots(): []Root {
+  return [
+    Root{sub: "root", minScanned: 240},
+    Root{sub: "rand", minScanned: 15},
+    Root{sub: "net", minScanned: 170},
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// The reviewed exception list — carried across VERBATIM from
+// `tests/rootabi_pollfree.zig`, per-entry justifications intact. It was
+// hand-audited and cannot be cheaply reconstructed.
+// ---------------------------------------------------------------------------
+
+// Functions under the covered subtrees that are deliberately NOT poll-free.
+//
+// EVERY ENTRY IS A CLAIM THAT THE FUNCTION HOLDS NO GC OBJECT AS A RAW
+// ADDRESS, not merely that annotating it was inconvenient. Adding a line here
+// is a review decision; the groups and their reasons:
+//
+// (a) `float{big,fmt,parse}.bit` and the two `floats.bit` wrappers — genuinely
+//     MANAGED Bit code, allocating bignum limb arrays, digit buffers and
+//     `string`s, so `@nosplit` (which forbids allocation) is not available to
+//     them. #1658 gave them the property instead of the annotation: every raw
+//     address now lives inside `packLowBytes`/`unpackToWords`, which ARE
+//     `@nosplit`, and the outer bodies hold only managed values.
+// (b) `rootconfig.bit`/`testindex.bit` — they read the kernel-supplied `envp`
+//     block, so every address they carry is outside the heap. They could not be
+//     annotated anyway: `len(<literal>)` is not `@nosplit`-callable.
+// (c) `{darwin,linux}/boot.bit`'s boot machinery — must reach the scheduler,
+//     thread and park layers and run user `main`, which E0075 would forbid. It
+//     carries only raw kernel addresses (argv/envp/auxv, `mapPages` stacks).
+// (d) `{darwin,linux}/time.bit`'s three ABI pins — every parameter and result
+//     is a scalar `int`; no object crosses them in either direction.
+//
+// The one list is spelled across four functions ONLY because a single one
+// exceeds `max-fn-lines`. The split follows the group boundaries above, so no
+// entry is separated from the reasoning that admitted it; `pollFreeExceptions`
+// is the whole list and is the only thing the gate reads.
+function pollFreeExceptions(): []string {
+  let out = []string(0)
+  for e of exceptionsFloatText() {
+    out = append(out, e)
+  }
+  for e of exceptionsEnvBoot() {
+    out = append(out, e)
+  }
+  for e of exceptionsRandNetEngine() {
+    out = append(out, e)
+  }
+  for e of exceptionsNetAbi() {
+    out = append(out, e)
+  }
+  return out
+}
+
+// (a) managed float text — see `runtime/root/floats.bit`'s SEAM 5a block.
+function exceptionsFloatText(): []string {
+  return [
+    "root/floatbig.bit:bigLimbs",
+    "root/floatbig.bit:bigNew",
+    "root/floatbig.bit:bigSetU64",
+    "root/floatbig.bit:bigNorm",
+    "root/floatbig.bit:bigCopy",
+    "root/floatbig.bit:bigCmp",
+    "root/floatbig.bit:bigAdd",
+    "root/floatbig.bit:bigSub",
+    "root/floatbig.bit:bigMulSmall",
+    "root/floatbig.bit:bigMulAddSmall",
+    "root/floatbig.bit:bigShl",
+    "root/floatbig.bit:bigShr1",
+    "root/floatbig.bit:bigBitLen",
+    "root/floatbig.bit:bigIsZero",
+    "root/floatbig.bit:bigMulPow10",
+    "root/floatfmt.bit:fmtMaxDigits",
+    "root/floatfmt.bit:fmtBits",
+    "root/floatfmt.bit:dragon4",
+    "root/floatfmt.bit:highTest",
+    "root/floatfmt.bit:render",
+    "root/floatfmt.bit:zeros",
+    "root/floatfmt.bit:u64BitLen",
+    "root/floatfmt.bit:floorDiv",
+    "root/floatparse.bit:parseMaxDigits",
+    "root/floatparse.bit:parseBits",
+    "root/floatparse.bit:roundShiftRight",
+    "root/floatparse.bit:infBits",
+    "root/floats.bit:rtStringFromFloat",
+    "root/floats.bit:rtParseFloat",
+  ]
+}
+
+// (b) envp readers, (c) boot machinery, (d) clocks and sleep.
+function exceptionsEnvBoot(): []string {
+  return [
+    // (b) envp readers — no heap object in play.
+    "root/rootconfig.bit:gcEnvValuePtr",
+    "root/rootconfig.bit:gcEnvKeyMatch",
+    "root/rootconfig.bit:gcCstrEq",
+    "root/rootconfig.bit:gcCstrUsize",
+    "root/rootconfig.bit:gcEnvEnabled",
+    "root/rootconfig.bit:gcEnvStress",
+    "root/rootconfig.bit:gcEnvMinTrigger",
+    "root/rootconfig.bit:gcEnvGrowthPct",
+    "root/rootconfig.bit:gcEnvMarkStack",
+    "root/rootconfig.bit:gcEnvVerbose",
+    "root/rootconfig.bit:rootConfigureFromEnv",
+    "root/rootconfig.bit:rootEnvVerbose",
+    "root/rootconfig.bit:rootEnvMarkStack",
+    "root/testindex.bit:testIndexParse",
+    "root/testindex.bit:rtTestIndex",
+    // (c) boot machinery — reaches the scheduler/thread/park layers and `main`.
+    "root/darwin/boot.bit:workerBody",
+    "root/darwin/boot.bit:joinWorker",
+    "root/darwin/boot.bit:mainTrampoline",
+    "root/darwin/boot.bit:boot",
+    "root/darwin/boot.bit:machoMain",
+    "root/linux/boot.bit:workerBody",
+    "root/linux/boot.bit:joinWorker",
+    "root/linux/boot.bit:mainTrampoline",
+    "root/linux/boot.bit:boot",
+    "root/linux/boot.bit:initLinuxTls",
+    "root/linux/boot.bit:rtStartMain",
+    // (d) clocks and sleep — scalars only, and `sleep_ns` parks.
+    "root/darwin/time.bit:rtTimeMonoNs",
+    "root/darwin/time.bit:rtTimeUnixNs",
+    "root/darwin/time.bit:rtTimeSleepNs",
+    "root/linux/time.bit:rtTimeMonoNs",
+    "root/linux/time.bit:rtTimeUnixNs",
+    "root/linux/time.bit:rtTimeSleepNs",
+  ]
+}
+
+// (e) `runtime/rand`, and (f1)/(f2) of `runtime/net`.
+function exceptionsRandNetEngine(): []string {
+  return [
+    // -----------------------------------------------------------------------
+    // (e) `runtime/rand` (#1667) — one per platform, and only because `panic`
+    //     is not `@nosplit`-callable. The allocate-and-fill half IS `@nosplit`
+    //     (`randomBytesFill`); what is left here is straight-line with NO LOOP,
+    //     and the one call it makes while `s` is set — `panic` — is on the
+    //     branch where `s` is the `randEntropyFailed` sentinel rather than an
+    //     object, and never returns. See `rand/*/random.bit`.
+    "rand/darwin/random.bit:rtRandomBytes",
+    "rand/linux/random.bit:rtRandomBytes",
+    // -----------------------------------------------------------------------
+    // (f) `runtime/net` (#1668) — THE PARK LAYER. Every entry from here down
+    //     rests on claim (b) in this file's header: it holds no raw GC
+    //     address, so a poll or a park inside it is harmless. `@nosplit` is not
+    //     merely inconvenient for these, it is unavailable — E0075 is transitive
+    //     and the subtree reaches `schedPark`. Each was confirmed refused by the
+    //     compiler rather than assumed: marking them yields
+    //     "calls 'netAwaitReady', which is not marked nosplit" (the engine),
+    //     "calls 'fsOpen'" (`readResolvConf`) or "may not allocate" (the four
+    //     wrappers that own a managed scratch).
+    //
+    //     (f1) The socket engine. Buffers arrive as `*u8` PARAMETERS pointing
+    //     into memory the caller owns and keeps alive; these frames hold no
+    //     object address of their own. `netAwaitReady` is the parker itself.
+    "net/darwin/sock.bit:netAwaitReady",
+    "net/linux/sock.bit:netAwaitReady",
+    "net/darwin/tcp.bit:netAcceptTcp",
+    "net/darwin/tcp.bit:netDialTcp",
+    "net/darwin/tcp.bit:netReadSock",
+    "net/darwin/tcp.bit:netWriteSock",
+    "net/linux/tcp.bit:netAcceptTcp",
+    "net/linux/tcp.bit:netDialTcp",
+    "net/linux/tcp.bit:netReadSock",
+    "net/linux/tcp.bit:netWriteSock",
+    "net/darwin/udp.bit:netRecvFrom",
+    "net/darwin/udp.bit:netSendTo",
+    "net/linux/udp.bit:netRecvFrom",
+    "net/linux/udp.bit:netSendTo",
+    //     (f2) `readResolvConf` — reads into the caller's managed `[]i64`
+    //     scratch through a `*u8`; owns no object. Refused `@nosplit` because
+    //     `fsOpen`/`fsClose` are RtFn builtins.
+    "net/darwin/netabi.bit:readResolvConf",
+    "net/linux/netabi.bit:readResolvConf",
+  ]
+}
+
+// (f3) and (f4) of `runtime/net` — the `netabi.bit` ABI wrappers.
+function exceptionsNetAbi(): []string {
+  return [
+    //     (f3) The ABI wrappers that pass a caller's `string` STRAIGHT THROUGH
+    //     to the parking engine as `strData(s)`. `s` is a raw `int` here, but
+    //     the object is rooted by the compiled Bit caller's own stack-map slot —
+    //     the runtime never allocated it, so unlike #1656's `rtFsReadAll` there
+    //     IS a frame that names it, and the precise walk covers every frame of
+    //     the running task.
+    "net/darwin/netabi.bit:netAbiAccept",
+    "net/darwin/netabi.bit:netAbiDial",
+    "net/darwin/netabi.bit:netAbiUdpSend",
+    "net/darwin/netabi.bit:netAbiWrite",
+    "net/linux/netabi.bit:netAbiAccept",
+    "net/linux/netabi.bit:netAbiDial",
+    "net/linux/netabi.bit:netAbiUdpSend",
+    "net/linux/netabi.bit:netAbiWrite",
+    //     (f4) The four wrappers that ALLOCATE a receive buffer — this ticket's
+    //     actual defect, and now the reason they cannot be `@nosplit`: their
+    //     buffers are MANAGED `[]i64` locals and `@nosplit` forbids allocation
+    //     outright. That is the fix, not a workaround; a managed local is a
+    //     stack-map slot, which is precisely what the raw `rtStrAlloc` address
+    //     they used to hold was not.
+    "net/darwin/netabi.bit:netAbiRead",
+    "net/darwin/netabi.bit:netAbiUdpRecv",
+    "net/darwin/netabi.bit:netAbiUdpSenderHost",
+    "net/darwin/netabi.bit:netAbiResolve",
+    "net/linux/netabi.bit:netAbiRead",
+    "net/linux/netabi.bit:netAbiUdpRecv",
+    "net/linux/netabi.bit:netAbiUdpSenderHost",
+    "net/linux/netabi.bit:netAbiResolve",
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// The declaration scanner
+// ---------------------------------------------------------------------------
+
+const kindOther: int = 0
+const kindAttrs: int = 1
+const kindFunc: int = 2
+
+// One source line, classified. `marked` is true when the attributes ON THIS LINE
+// include `@nosplit` or `@naked`; `bad` flags a declaration shape this scanner
+// does not understand, which is a hard failure rather than a skip.
+struct LineParse {
+  kind: int
+  name: string
+  marked: bool
+  bad: bool
+}
+
+struct AttrScan {
+  rest: string
+  count: int
+  marked: bool
+}
+
+struct Decl {
+  name: string
+  pollFree: bool
+}
+
+struct FileScan {
+  decls: []Decl
+  bad: int
+}
+
+function isSpaceByte(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\r'
+}
+
+function isIdentByte(c: u8): bool {
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return true
+  }
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  return c == '_'
+}
+
+function identEnd(s: string, at: int): int {
+  let i = at
+  while (i < len(s) && isIdentByte(s[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+function skipSpaces(s: string): string {
+  let i = 0
+  while (i < len(s) && isSpaceByte(s[i])) {
+    i = i + 1
+  }
+  return s[i:]
+}
+
+function trimRight(s: string): string {
+  let i = len(s)
+  while (i > 0 && isSpaceByte(s[i - 1])) {
+    i = i - 1
+  }
+  return s[:i]
+}
+
+// Past a `(...)` attribute argument, if there is one. `@symbol("bit_rt_x")` is
+// the only argument-taking attribute in the runtime and its literal contains no
+// `)`, so scanning to the first one is exact.
+function argEnd(s: string, at: int): int {
+  if (at >= len(s) || s[at] != '(') {
+    return at
+  }
+  let i = at
+  while (i < len(s) && s[i] != ')') {
+    i = i + 1
+  }
+  if (i < len(s)) {
+    return i + 1
+  }
+  return i
+}
+
+// The run of `@attr` tokens at the head of `s`, and what follows them.
+function scanAttrs(s: string): AttrScan {
+  let rest = s
+  let count = 0
+  let marked = false
+  while (count < maxAttrsPerDecl && len(rest) > 0 && rest[0] == '@') {
+    count = count + 1
+    let end = identEnd(rest, 1)
+    let name = rest[1:end]
+    if (name == "nosplit" || name == "naked") {
+      marked = true
+    }
+    rest = skipSpaces(rest[argEnd(rest, end):])
+  }
+  return AttrScan{rest: rest, count: count, marked: marked}
+}
+
+function funcDecl(a: AttrScan): LineParse {
+  let after = skipSpaces(a.rest[len(funcKw):])
+  let end = identEnd(after, 0)
+  if (end == 0) {
+    // A receiver form (`function (r: T) m()`) or anything else unnamed. The
+    // runtime has none today; if one appears, this gate must be taught about it
+    // rather than quietly not covering it.
+    return LineParse{kind: kindFunc, name: "", marked: a.marked, bad: true}
+  }
+  return LineParse{kind: kindFunc, name: after[:end], marked: a.marked, bad: false}
+}
+
+// A top-level declaration starts in column 0, so an indented `function` is a
+// body statement and an `extern function` is a foreign declaration with no body
+// to poll in — neither is scanned.
+function parseLine(line: string): LineParse {
+  let rest = trimRight(line)
+  if (len(rest) == 0 || isSpaceByte(rest[0]) || hasPrefix(rest, externKw)) {
+    return LineParse{kind: kindOther, name: "", marked: false, bad: false}
+  }
+  if (hasPrefix(rest, exportKw)) {
+    rest = skipSpaces(rest[len(exportKw):])
+  }
+  let a = scanAttrs(rest)
+  if (hasPrefix(a.rest, funcKw)) {
+    return funcDecl(a)
+  }
+  if (a.count > 0 && len(a.rest) == 0) {
+    return LineParse{kind: kindAttrs, name: "", marked: a.marked, bad: false}
+  }
+  return LineParse{kind: kindOther, name: "", marked: a.marked, bad: false}
+}
+
+// Every top-level function declaration in `source`.
+//
+// An attribute line carries ONLY to the line immediately below it. Anything
+// else — a blank line, a comment, another declaration — drops it, so an
+// attribute can never leak onto a function it does not belong to. The failure
+// direction of that rule is a false "not poll-free", which is loud.
+function scanDecls(source: string): FileScan {
+  let fs = FileScan{decls: []Decl(0), bad: 0}
+  let lines = split(source, "\n")
+  let n = len(lines)
+  if (n > maxLinesPerFile) {
+    n = maxLinesPerFile
+  }
+  let pending = false
+  for (let i = 0; i < n; i = i + 1) {
+    let p = parseLine(lines[i])
+    if (p.kind == kindFunc) {
+      if (p.bad) {
+        fs.bad = fs.bad + 1
+      } else {
+        fs.decls = append(fs.decls, Decl{name: p.name, pollFree: p.marked || pending})
+      }
+      pending = false
+      continue
+    }
+    pending = p.kind == kindAttrs && p.marked
+  }
+  return fs
+}
+
+// ---------------------------------------------------------------------------
+// The scanner's own unit test — run before the walk
+// ---------------------------------------------------------------------------
+
+// The fixture covers every declaration shape `runtime/{root,rand,net}` uses, in
+// both directions: what must be seen as poll-free, and what must NOT be.
+function scannerFixture(): string {
+  return "// a comment mentioning function nothing\n" +
+    "export @nosplit @symbol(\"bit_rt_sqrt\")\n" +
+    "function rtSqrt(x: f64): f64 {\n" +
+    "  return x\n" +
+    "}\n" +
+    "@nosplit function packLowBytes(src: int, n: int): int {\n" +
+    "  function shouldNotCount() {\n" +
+    "  }\n" +
+    "}\n" +
+    "@symbol(\"bit_rt_random_bytes\") function rtRandomBytes(n: int): int {\n" +
+    "}\n" +
+    "export @symbol(\"bit_rt_parse_float\")\n" +
+    "function rtParseFloat(s: int): f64 {\n" +
+    "}\n" +
+    "extern function write(fd: int, buf: *u8, n: i64): i64\n" +
+    "@naked function trampoline() {\n" +
+    "}\n" +
+    "export function exportedPlain(): int {\n" +
+    "}\n" +
+    "export @nosplit @symbol(\"bit_rt_leak\")\n" +
+    "\n" +
+    "function afterBlankLine(): int {\n" +
+    "}\n"
+}
+
+function expectDecl(fs: FileScan, i: int, name: string, pollFree: bool): int {
+  if (i >= len(fs.decls)) {
+    eprint("scanner: no declaration at index ${i}, wanted ${name}\n")
+    return 1
+  }
+  let d = fs.decls[i]
+  if (d.name != name) {
+    eprint("scanner: declaration ${i} is `${d.name}`, wanted `${name}`\n")
+    return 1
+  }
+  if (d.pollFree != pollFree) {
+    eprint("scanner: `${name}` reads pollFree=${d.pollFree}, wanted ${pollFree}\n")
+    return 1
+  }
+  return 0
+}
+
+// Returns true when the scanner behaves. A scanner that answers "poll-free" to
+// everything, or that finds nothing at all, fails here rather than sailing
+// through the corpus and reporting a clean sheet.
+function checkScanner(): bool {
+  let fs = scanDecls(scannerFixture())
+  let bad = fs.bad
+  if (bad != 0) {
+    eprint("scanner: ${bad} unrecognised declaration(s) in the fixture\n")
+  }
+  // `shouldNotCount` is indented and `write` is extern: neither is a top-level
+  // Bit function this gate covers.
+  if (len(fs.decls) != 7) {
+    eprint("scanner: found ${len(fs.decls)} declarations, wanted 7\n")
+    bad = bad + 1
+  }
+  bad = bad + expectDecl(fs, 0, "rtSqrt", true)
+  bad = bad + expectDecl(fs, 1, "packLowBytes", true)
+  bad = bad + expectDecl(fs, 2, "rtRandomBytes", false)
+  bad = bad + expectDecl(fs, 3, "rtParseFloat", false)
+  bad = bad + expectDecl(fs, 4, "trampoline", true)
+  bad = bad + expectDecl(fs, 5, "exportedPlain", false)
+  // THE LEAK CASE: a blank line between the attributes and the declaration must
+  // drop them. Reading `afterBlankLine` as poll-free is how a text scanner
+  // silently stops gating.
+  bad = bad + expectDecl(fs, 6, "afterBlankLine", false)
+  // And the empty source must yield nothing rather than one phantom entry.
+  if (len(scanDecls("").decls) != 0) {
+    eprint("scanner: an empty source produced declarations\n")
+    bad = bad + 1
+  }
+  return bad == 0
+}
+
+// ---------------------------------------------------------------------------
+// The walk
+// ---------------------------------------------------------------------------
+
+struct Gate {
+  allowed: map<string, bool>
+  used: map<string, bool>
+  failures: int
+  files: int
+  scanned: int
+}
+
+// One runtime source. `keyDir` is its path under `runtime/`, so an exception
+// entry names one function in one file and cannot be satisfied by a same-named
+// function elsewhere.
+function checkFile(g: Gate, keyDir: string, source: string) {
+  let fs = scanDecls(source)
+  if (fs.bad != 0) {
+    eprint("pollfree: runtime/${keyDir}: ${fs.bad} declaration(s) in a form this " +
+      "gate does not understand. Teach `parseLine` about it — leaving it " +
+      "unscanned is the vacuous pass #1658 exists to prevent.\n")
+    g.failures = g.failures + fs.bad
+  }
+  for d of fs.decls {
+    g.scanned = g.scanned + 1
+    if (d.pollFree) {
+      continue
+    }
+    let key = "${keyDir}:${d.name}"
+    if (g.allowed[key]) {
+      g.used[key] = true
+      continue
+    }
+    eprint("pollfree: runtime/${keyDir}: `${d.name}` is not `@nosplit` and is not a " +
+      "reviewed exception. Add `@nosplit` (E0075 will report any callee that also " +
+      "needs it), restructure so no raw GC address spans a poll, or justify an " +
+      "entry \"${key}\" in `pollFreeExceptions`.\n")
+    g.failures = g.failures + 1
+  }
+}
+
+// One covered subtree. Returns false when it read too little to be trusted.
+function checkSubtree(g: Gate, repo: string, r: Root): bool {
+  let base = "${repo}/runtime/${r.sub}"
+  if (!isDir(base)) {
+    eprint("pollfree: ${base} is not a directory (set BIT_REPO to the repository root)\n")
+    return false
+  }
+  let before = g.scanned
+  let paths = walk(base) catch e {
+    eprint("pollfree: cannot walk ${base}: ${e.message()}\n")
+    return false
+  }
+  for p of paths {
+    if (!hasSuffix(p, ".bit")) {
+      continue
+    }
+    g.files = g.files + 1
+    if (g.files > maxBitFiles) {
+      eprint("pollfree: more than ${maxBitFiles} runtime sources; raise the bound deliberately\n")
+      return false
+    }
+    let source = readFile(p) catch e {
+      eprint("pollfree: cannot read ${p}: ${e.message()}\n")
+      return false
+    }
+    if (len(source) > maxSourceBytes) {
+      eprint("pollfree: ${p} is larger than ${maxSourceBytes} bytes\n")
+      return false
+    }
+    checkFile(g, "${r.sub}/" + p[len(base) + 1:], source)
+  }
+  // PER-SUBTREE, and checked here rather than at the end: a total checked
+  // afterwards would let one subtree read zero while another's growth covers
+  // for it.
+  let got = g.scanned - before
+  if (got < r.minScanned) {
+    eprint("pollfree: examined only ${got} function declarations under " +
+      "runtime/${r.sub} (expected at least ${r.minScanned}). It is reading nothing " +
+      "useful there — a directory moved, or the sources changed shape.\n")
+    return false
+  }
+  return true
+}
+
+// An exception entry that matches nothing is a claim about a function that no
+// longer exists under that name. This is stricter than the Zig gate, which never
+// looked: a list that has drifted off the code it excuses is the slow way this
+// gate turns into decoration, and the fix — delete the line — puts a reviewer
+// back in front of it.
+function checkExceptionsUsed(g: Gate, entries: []string): int {
+  let stale = 0
+  for e of entries {
+    if (g.used[e]) {
+      continue
+    }
+    eprint("pollfree: the exception \"${e}\" matched no declaration. Either the " +
+      "function was renamed or removed, or it is `@nosplit` now — delete the line.\n")
+    stale = stale + 1
+  }
+  return stale
+}
+
+// Every covered subtree, and how many of them read too little to be trusted.
+function scanAllSubtrees(g: Gate, repo: string): int {
+  let vacuous = 0
+  for r of pollFreeRoots() {
+    if (!checkSubtree(g, repo, r)) {
+      vacuous = vacuous + 1
+    }
+  }
+  return vacuous
+}
+
+function main() {
+  if (!checkScanner()) {
+    eprint("FAIL pollfree: the declaration scanner does not pass its own unit test\n")
+    exit(1)
+  }
+
+  let entries = pollFreeExceptions()
+  let g = Gate{allowed: map<string, bool>{}, used: map<string, bool>{}, failures: 0, files: 0, scanned: 0}
+  for e of entries {
+    g.allowed[e] = true
+  }
+  // The list is the reviewed artifact this gate carries; a truncated one would
+  // only ever cause loud failures, but a silently empty one would not.
+  if (len(entries) < 95) {
+    eprint("FAIL pollfree: the exception list holds ${len(entries)} entries, expected at least 95\n")
+    exit(1)
+  }
+
+  let repo = envOr("BIT_REPO", ".")
+  let vacuous = scanAllSubtrees(g, repo)
+  if (vacuous != 0) {
+    eprint("FAIL pollfree: ${vacuous} covered subtree(s) could not be scanned\n")
+    exit(1)
+  }
+
+  let stale = checkExceptionsUsed(g, entries)
+  if (g.failures != 0) {
+    eprint("FAIL pollfree: ${g.failures} function(s) under the covered runtime subtrees " +
+      "are neither `@nosplit`/`@naked` nor on the reviewed exception list. See this " +
+      "file's #1658 header: such a function takes a back-edge safepoint while holding " +
+      "GC objects as raw `int` addresses no stack map names, and the collector sweeps " +
+      "them under a live reference (#1656).\n")
+  }
+  if (stale != 0) {
+    eprint("FAIL pollfree: ${stale} exception entr(y/ies) match nothing\n")
+  }
+  if (g.failures != 0 || stale != 0) {
+    exit(1)
+  }
+  println("PASS pollfree: ${g.scanned} runtime function declarations across ${g.files} " +
+    "files are poll-free or reviewed exceptions (${len(entries)} exceptions, all matched)")
+}

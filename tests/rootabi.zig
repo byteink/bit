@@ -266,6 +266,8 @@ fn collectZigExports(gpa: std.mem.Allocator, out: *SigMap) !void {
 // (seed/codegen_x64_test.zig and friends) — a file zig build rootabi never
 // analyzes has its test blocks silently never executed.
 test {
-    _ = @import("rootabi_pollfree.zig");
+    // rootabi_pollfree.zig is RETIRED (#1591) — the poll-free audit is now
+    // tests/bit/pollfree.bit, which walks the same runtime/**/*.bit sources and
+    // carries the same 95-entry exception list verbatim.
     _ = @import("rootabi_membership.zig");
 }
