@@ -481,30 +481,7 @@ pub fn build(b: *std.Build) void {
     addNamedRun(b, golden_run, "test-golden", "run the golden tests/cases/*.bit harness only");
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
-    // Examples guard: discovers examples/*.bit and compiles + runs each so the
-    // showcase can never rot as the language grows. No .expected files — this
-    // only asserts they build and exit 0; output correctness stays the golden
-    // corpus's job. Shares the host libbitrt archive wired in at the tail.
-    const examples_opts = b.addOptions();
-    examples_opts.addOption([]const u8, "examples_dir", b.pathFromRoot("examples"));
-    examples_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-
-    const examples_mod = b.createModule(.{
-        .root_source_file = b.path("tests/examples.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    examples_mod.addImport("bit", exe.root_module);
-    examples_mod.addOptions("build_options", examples_opts);
-
-    const examples_tests = b.addTest(.{ .root_module = examples_mod });
-    const examples_run = b.addRunArtifact(examples_tests);
-    // examples/* and stdlib/* are read at runtime (like the imports harness), so
-    // a new or edited example is invisible to the build cache; without this the
-    // run is cache-skipped and a broken example passes silently.
-    examples_run.has_side_effects = true;
-    test_step.dependOn(&examples_run.step);
-    addNamedRun(b, examples_run, "test-examples", "run the examples/*.bit build+run guard only");
+    // Examples guard is now tests/bit/examplesgate.bit — see the Bit gates at the tail.
 
     // Runtime-pin cycle gate (#1367): emits each ported runtime module as an
     // ELF object and refuses any pinned ABI definition that references the very
@@ -746,25 +723,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&testcmd_run.step);
     addNamedRun(b, testcmd_run, "test-testcmd", "run the `bit test` runner contract (tests/testcmd.zig) only");
 
-    // `bit lint` CLI contract (#1380): exit codes, path walk, summary line,
-    // `--json`, `--stats`. Execs the SELF-HOSTED `bit` (lint is selfhost-only),
-    // so `selfhost_bit` is wired in at the tail next to the artifact it names —
-    // empty on a cross build, where there is no runnable `bit` to drive.
-    const lintcmd_opts = b.addOptions();
-    const lintcmd_mod = b.createModule(.{
-        .root_source_file = b.path("tests/lintcmd.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lintcmd_mod.addOptions("build_options", lintcmd_opts);
-
-    const lintcmd_tests = b.addTest(.{ .root_module = lintcmd_mod });
-    const lintcmd_run = b.addRunArtifact(lintcmd_tests);
-    // The fixtures are written to /tmp at run time, invisible to the build
-    // cache — same reason as rootpins and diffimports.
-    lintcmd_run.has_side_effects = true;
-    b.step("test-lint", "run the `bit lint` CLI contract only (tests/lintcmd.zig)").dependOn(&lintcmd_run.step);
-    test_step.dependOn(&lintcmd_run.step);
+    // `bit lint` CLI contract (#1380) is now tests/bit/lintcmd.bit — see the Bit
+    // gates at the tail.
 
     // std/os args + environment round-trip (#354). Was tests/osenv.zig; the
     // check is now tests/bit/osenv.bit, wired at the tail beside the other
@@ -1099,7 +1059,6 @@ pub fn build(b: *std.Build) void {
     // `zig-out`, linking a stale, ABI-mismatched runtime whose malformed binary
     // the kernel then killed by signal (#1229).
     wireLibbitrt(golden_opts, host_libbitrt_bin);
-    wireLibbitrt(examples_opts, host_libbitrt_bin);
     wireLibbitrt(stress_opts, host_libbitrt_bin);
     wireLibbitrt(testcmd_opts, host_libbitrt_bin);
     wireLibbitrt(imports_opts, host_libbitrt_bin);
@@ -1226,42 +1185,7 @@ pub fn build(b: *std.Build) void {
     // stdlib and runtime archive from its OWN location, through a bare symlink,
     // with no environment set — the property every installer depends on.
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
-    const pathresolve_opts = b.addOptions();
-    pathresolve_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    wireLibbitrt(pathresolve_opts, host_libbitrt_bin);
-    const pathresolve_mod = b.createModule(.{
-        .root_source_file = b.path("tests/pathresolve.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pathresolve_mod.addOptions("build_options", pathresolve_opts);
-    const pathresolve_tests = b.addTest(.{ .root_module = pathresolve_mod });
-    const pathresolve_run = b.addRunArtifact(pathresolve_tests);
-    test_step.dependOn(&pathresolve_run.step);
-    addNamedRun(b, pathresolve_run, "test-pathresolve", "run the install-prefix path-resolution gate (tests/pathresolve.zig) only");
 
-    // External-package imports through bit.lock + the pkg cache (#1737):
-    // selfhost-only (the seed has no bit.lock equivalent), so this drives the
-    // self-hosted `bit` directly through its real CLI rather than the shared
-    // tests/imports.zig harness (which requires the seed to build every
-    // project there too). `selfhost_bit` is wired in at the tail, next to the
-    // artifact it names, same as lintcmd/pathresolve above.
-    const pmimports_opts = b.addOptions();
-    pmimports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    wireLibbitrt(pmimports_opts, host_libbitrt_bin);
-    const pmimports_mod = b.createModule(.{
-        .root_source_file = b.path("tests/pmimports.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pmimports_mod.addOptions("build_options", pmimports_opts);
-    const pmimports_tests = b.addTest(.{ .root_module = pmimports_mod });
-    const pmimports_run = b.addRunArtifact(pmimports_tests);
-    // The fixtures are written to /tmp at run time, invisible to the build
-    // cache — same reason as lintcmd, rootpins and diffimports.
-    pmimports_run.has_side_effects = true;
-    b.step("test-pmimports", "run the package-manager import-resolution CLI contract only (tests/pmimports.zig)").dependOn(&pmimports_run.step);
-    test_step.dependOn(&pmimports_run.step);
 
     if (native) {
         stress_opts.addOptionPath("selfhost_bit", selfhosted);
@@ -1271,19 +1195,13 @@ pub fn build(b: *std.Build) void {
         // through every `zig build test` while tests/imports/quicconn built it.
         imports_opts.addOptionPath("selfhost_bit", selfhosted);
         diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
-        lintcmd_opts.addOptionPath("selfhost_bit", selfhosted);
         version_opts.addOptionPath("selfhost_bit", selfhosted);
-        pathresolve_opts.addOptionPath("selfhost_bit", selfhosted);
-        pmimports_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
         stress_opts.addOption([]const u8, "selfhost_bit", "");
         golden_opts.addOption([]const u8, "selfhost_bit", "");
         imports_opts.addOption([]const u8, "selfhost_bit", "");
         diffimports_opts.addOption([]const u8, "selfhost_bit", "");
-        lintcmd_opts.addOption([]const u8, "selfhost_bit", "");
         version_opts.addOption([]const u8, "selfhost_bit", "");
-        pathresolve_opts.addOption([]const u8, "selfhost_bit", "");
-        pmimports_opts.addOption([]const u8, "selfhost_bit", "");
     }
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
@@ -1361,6 +1279,47 @@ pub fn build(b: *std.Build) void {
     _ = addBitGate(b, selfhosted, test_step, "version-cli", "tests/bit/version.bit", &.{
         .{ "BIT_REPO", b.build_root.path.? },
     }, "run the `bit version` CLI contract (tests/bit/version.bit) only");
+
+    // `bit lint` is selfhost-only, so the harness drives the same binary that
+    // interprets it — BIT_SELF_EXE is that path, not argv[0].
+    _ = addBitGate(b, selfhosted, test_step, "lint", "tests/bit/lintcmd.bit", &.{
+        .{ "BIT_SELF_EXE", selfhost_artifact_path },
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the `bit lint` CLI contract (tests/bit/lintcmd.bit) only");
+
+    const pathresolve_gate = addBitGate(b, selfhosted, test_step, "pathresolve", "tests/bit/pathresolve.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the install-prefix path-resolution gate (tests/bit/pathresolve.bit) only");
+    if (host_libbitrt_install) |inst| pathresolve_gate.step.dependOn(inst);
+
+    const pmimports_gate = addBitGate(b, selfhosted, test_step, "pmimports", "tests/bit/pmimports.bit", &.{
+        .{ "BIT_STDLIB_UNDER_TEST", stdlib_root },
+    }, "run the package-manager import-resolution CLI contract (tests/bit/pmimports.bit) only");
+    if (host_libbitrt_install) |inst| pmimports_gate.step.dependOn(inst);
+
+    // Compiles and runs every examples/*.bit, so it needs the host archive.
+    const examples_gate = addBitGate(b, selfhosted, test_step, "examples", "tests/bit/examplesgate.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+        .{ "BIT_EXAMPLES_DIR", b.pathFromRoot("examples") },
+    }, "run the examples/*.bit build+run guard (tests/bit/examplesgate.bit) only");
+    if (host_libbitrt_install) |inst| examples_gate.step.dependOn(inst);
+
+    // Doc-snippet typecheck, Bit port — DELIBERATELY NOT ON `test_step` YET.
+    //
+    // tests/docs.zig asks the same question in-process via `bit.compileReport`
+    // and costs almost nothing. This port spawns `bit check` once per snippet:
+    // 219 invocations, measured at 410s, against a full suite of ~15 minutes.
+    // Wiring it in would near-double `zig build test` for an identical verdict,
+    // so it stays runnable-by-name until the port batches its checks. Retiring
+    // tests/docs.zig before then would be trading a gate for a slower gate.
+    const docs_bit = std.Build.Step.Run.create(b, "bit run tests/bit/docs.bit");
+    docs_bit.addFileArg(selfhosted);
+    docs_bit.addArg("run");
+    docs_bit.addFileArg(b.path("tests/bit/docs.bit"));
+    docs_bit.setEnvironmentVariable("BIT_STDLIB", stdlib_root);
+    docs_bit.has_side_effects = true;
+    docs_bit.expectExitCode(0);
+    addNamedRun(b, docs_bit, "test-docs-bit", "run the Bit doc-snippet gate (slow: ~410s, not in `zig build test`)");
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
