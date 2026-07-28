@@ -44,6 +44,18 @@
 //! whose contents say why. The marker must be non-empty: the point is that
 //! inertness is DECLARED and argued, never inherited by accident.
 //!
+//! A THIRD MARKER, AND IT IS THE WEAKEST THING IN THIS FILE — `stress-waived`.
+//! `no-collect` says "the collector cannot matter here"; `stress-waived` says
+//! "the collector DOES matter here and this program does not survive it yet".
+//! The second run switches to `BIT_GC=off` and the collection oracle goes with
+//! it, so the program keeps proving its stdout under one policy and proves
+//! nothing under the other. That is a hole, and the marker's whole design is
+//! about not letting it hide: the reason is mandatory (`readMarker` rejects an
+//! empty one), it must name the ticket tracking the removal, and `runBoth`
+//! prints it on EVERY run so it shows up in output nobody had to go looking for.
+//! There is deliberately no name list in this file — a waiver lives in the
+//! program's own directory, where anyone reading the program finds it.
+//!
 //! #1438 is also why the suite must never be replaced by `BIT_GC=stress bit run
 //! <dir>`. Self-hosted `bit` is itself a Bit program, so that command applies
 //! the policy to THE COMPILER, which then collects at every back-edge of its own
@@ -265,9 +277,17 @@ fn runStress(gpa: std.mem.Allocator, io: Io, name: []const u8, dir_abs: []const 
     const no_abandon = try readMarker(gpa, run_io, name, dir_abs, "no-abandon");
     defer if (no_abandon) |m| gpa.free(m);
 
+    // The waiver (#1838). See the header: this one admits a hole rather than
+    // arguing one away, so it carries its reason all the way into the output.
+    const waived = try readMarker(gpa, run_io, name, dir_abs, "stress-waived");
+    defer if (waived) |m| gpa.free(m);
+
     const oracles: Oracles = .{
-        .must_collect = no_collect == null,
+        // A waived program's second run is `BIT_GC=off`, which collects nothing
+        // by definition — demanding a collection from it would fail every time.
+        .must_collect = no_collect == null and waived == null,
         .must_not_abandon = no_abandon != null,
+        .stress_waiver = waived,
     };
 
     // ---- Phase 2: exec only. Both compilers' output must satisfy `.expected`
@@ -294,6 +314,11 @@ const Oracles = struct {
     /// built so that the ONLY possible cause is the defect it guards can carry
     /// this, which is exactly what `gcslotexit*` is.
     must_not_abandon: bool,
+    /// Non-null when the program carries a `stress-waived` marker: its reason
+    /// text, which `runBoth` prints. This is the only oracle field that WEAKENS
+    /// the suite, so it holds the justification rather than a bool — a waiver
+    /// that cannot state why it exists should not be expressible.
+    stress_waiver: ?[]const u8,
 };
 
 /// One of the per-directory oracle markers: `null` when absent, otherwise the
@@ -355,7 +380,19 @@ fn runBoth(gpa: std.mem.Allocator, run_io: Io, name: []const u8, who: []const u8
 
     var stress_env = std.process.Environ.Map.init(gpa);
     defer stress_env.deinit();
-    try stress_env.put("BIT_GC", "stress");
+    // A waived program still gets a second run, and it still has to match
+    // `.expected` — the policy is what changes, not the assertion. `off` rather
+    // than skipping outright, because a skipped run proves nothing at all while
+    // this one at least proves the program is not broken independently of the
+    // collector, which is the difference between the two failures in #1835.
+    if (oracles.stress_waiver) |reason| {
+        std.debug.print("stress '{s}' [{s}]: STRESS-WAIVED, running BIT_GC=off instead:\n{s}\n", .{
+            name, who, std.mem.trim(u8, reason, " \t\r\n"),
+        });
+        try stress_env.put("BIT_GC", "off");
+    } else {
+        try stress_env.put("BIT_GC", "stress");
+    }
     try stress_env.put("BIT_GC_STATS", "1");
     try runOnce(gpa, run_io, name, who, bin_path, expected, &stress_env, oracles, timeout_s);
 }
@@ -405,7 +442,15 @@ fn runOnce(
     timeout_s: u32,
 ) !void {
     const stress = env != null;
-    const policy = if (stress) "BIT_GC=stress" else "default";
+    // Label the run by the policy it actually got, not by "is this the second
+    // run" — a waived failure reported as `BIT_GC=stress` would send the reader
+    // hunting a collector bug in a run that had no collector.
+    const policy = if (!stress)
+        "default"
+    else if (oracles.stress_waiver != null)
+        "BIT_GC=off (waived)"
+    else
+        "BIT_GC=stress";
     const mode = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ who, policy });
     defer gpa.free(mode);
     const outcome = try proc.run(gpa, run_io, timeout_s, .{ .argv = &.{bin_path}, .environ_map = env });
