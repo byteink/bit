@@ -828,26 +828,8 @@ pub fn build(b: *std.Build) void {
     const ast_tags_step = b.step("test-ast-tags", "run the AST tag-set parity gate only");
     ast_tags_step.dependOn(&ast_tags_run.step);
 
-    // Format gate (#1266): every `.bit` source under stdlib/ and examples/ must
-    // already be `bit fmt`-canonical (tests/cases/ is excluded — see the file
-    // header). Front end only — needs no libbitrt.
-    const fmt_check_opts = b.addOptions();
-    fmt_check_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    fmt_check_opts.addOption([]const u8, "examples_dir", b.pathFromRoot("examples"));
-    const fmt_check_mod = b.createModule(.{
-        .root_source_file = b.path("tests/fmt_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    fmt_check_mod.addImport("bit", exe.root_module);
-    fmt_check_mod.addOptions("build_options", fmt_check_opts);
-
-    const fmt_check_run = b.addRunArtifact(b.addTest(.{ .root_module = fmt_check_mod }));
-    // .bit sources are read at runtime, so an edit is invisible to the build
-    // cache; without this the run is cache-skipped and drift passes silently.
-    fmt_check_run.has_side_effects = true;
-    test_step.dependOn(&fmt_check_run.step);
-    addNamedRun(b, fmt_check_run, "test-fmt", "run the Bit-source fmt-canonical gate (tests/fmt_check.zig) only");
+    // Format gate (#1266) moved to the shipped CLI (#1848) — see `fmt_gate`
+    // down beside `selfhost_selfcheck`, which is where `selfhosted` is in scope.
 
     // Std-stream writer gate: `.init(.stderr())` builds a POSITIONAL handle that
     // pwrites from offset 0, so a second writer on the same fd overwrites the
@@ -1323,6 +1305,39 @@ pub fn build(b: *std.Build) void {
     selfhost_selfcheck.has_side_effects = true;
     selfhost_selfcheck.expectExitCode(0);
     test_step.dependOn(&selfhost_selfcheck.step);
+
+    // Format gate (#1266, re-homed by #1848): every `.bit` source under stdlib/
+    // and examples/ must already be canonical. This used to be tests/fmt_check.zig,
+    // 71 lines of Zig re-walking both trees and calling the formatter in-process;
+    // `bit fmt --check <dir>...` is the same question asked of the shipped CLI, so
+    // the harness was deleted rather than ported.
+    //
+    // NOTE THE CHANGE OF AUTHORITY: the old harness imported the SEED's formatter
+    // (`fmt_check_mod.addImport("bit", exe.root_module)`), so it asked "is this
+    // canonical to bit-seed". This asks "is this canonical to the compiler that
+    // actually ships" — the correct question once seed/ is gone, and the one that
+    // keeps meaning afterwards. Seed-vs-selfhost formatter agreement is a separate
+    // property, already gated by scripts/selfhost-difffmt.sh.
+    //
+    // tests/cases/ stays excluded on purpose: its `// fmt` cases are deliberately
+    // UNformatted input to the formatter and its `// error` cases do not parse, so
+    // gating either would be self-contradictory.
+    //
+    // Non-vacuity is enforced in the CLI, not here: `bit fmt` treats a directory
+    // holding no `.bit` source as an error (compiler/main.bit's `fmtPaths`), so a
+    // mistyped path fails loudly instead of passing over an empty input set.
+    // Directories, never file paths — a source added later must not escape it.
+    const fmt_gate = std.Build.Step.Run.create(b, "bit fmt --check stdlib examples");
+    fmt_gate.addFileArg(selfhosted);
+    fmt_gate.addArgs(&.{ "fmt", "--check" });
+    fmt_gate.addDirectoryArg(b.path("stdlib"));
+    fmt_gate.addDirectoryArg(b.path("examples"));
+    // Sources are read at run time, invisible to the build cache; without this a
+    // drifted file is cache-skipped into a false pass.
+    fmt_gate.has_side_effects = true;
+    fmt_gate.expectExitCode(0);
+    test_step.dependOn(&fmt_gate.step);
+    addNamedRun(b, fmt_gate, "test-fmt", "run the Bit-source fmt-canonical gate (`bit fmt --check`) only");
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
