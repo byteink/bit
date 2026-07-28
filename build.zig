@@ -832,6 +832,13 @@ pub fn build(b: *std.Build) void {
     const test_imports_step = b.step("test-imports", "run the tests/imports/* harness only (see -Dimports-filter)");
     test_imports_step.dependOn(&imports_run.step);
 
+    // The Bit port of the above, tests/bit/importsrun.bit, is wired at the tail
+    // as `test-imports-bit` and is deliberately NOT on `test_step`: it covers
+    // the SELFHOST half only, while tests/imports.zig drives both compilers
+    // over the same 96 projects. Running both would double the largest chunk of
+    // `zig build test` to re-prove what the Zig harness already proves. It gets
+    // promoted, and imports.zig deleted, when the seed goes (#1593).
+
     // Fuzz harness (#334) is now tests/bit/fuzz.bit — wired at the tail,
     // where `selfhosted` (the compiler under test) is in scope.
 
@@ -1279,6 +1286,19 @@ pub fn build(b: *std.Build) void {
     docs_bit.has_side_effects = true;
     docs_bit.expectExitCode(0);
     addNamedRun(b, docs_bit, "test-docs-bit", "run the Bit doc-snippet gate (slow: ~410s, not in `zig build test`)");
+
+    // Selfhost-half import resolution. Named-only for now — see the note beside
+    // tests/imports.zig for why running both would just double the suite.
+    const imports_bit = std.Build.Step.Run.create(b, "bit run tests/bit/importsrun.bit");
+    imports_bit.addFileArg(selfhosted);
+    imports_bit.addArg("run");
+    imports_bit.addFileArg(b.path("tests/bit/importsrun.bit"));
+    imports_bit.setEnvironmentVariable("BIT_IMPORTS_BIT", selfhost_artifact_path);
+    imports_bit.setEnvironmentVariable("BIT_IMPORTS_DIR", b.pathFromRoot("tests/imports"));
+    imports_bit.setEnvironmentVariable("BIT_STDLIB", stdlib_root);
+    imports_bit.has_side_effects = true;
+    imports_bit.expectExitCode(0);
+    addNamedRun(b, imports_bit, "test-imports-bit", "run the Bit import-resolution gate (selfhost half only)");
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).
