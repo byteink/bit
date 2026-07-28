@@ -1,0 +1,788 @@
+// The ABI-membership gate (#1662) — the Bit port of `tests/rootabi_membership.zig`.
+//
+// THE PROPERTY. Two halves must agree on one set of names: the half that EMITS a
+// `call bit_rt_*` relocation, and the half that DEFINES the symbol. Every name
+// the first can emit must be defined by the second, or it is an undefined symbol
+// at link time — in every shipped binary that reaches the call, not just a test.
+//
+// WHY IT HAD TO MOVE. The Zig gate read the defining half from `runtime/*.zig`
+// (`export fn` plus `comptime { @export(...) }`) and asserted Zig ⊆ the Bit pins.
+// Right question while both runtimes existed, but it DIES WITH ITS OWN ORACLE:
+// G3 deletes `runtime/*.zig`, and `min_zig_abi_symbols = 90` against a directory
+// with no `.zig` left is a hard failure with nothing wrong — whose obvious "fix"
+// is to delete the gate with the files, taking the property with it.
+//
+// WHERE IT POINTS NOW. The emitting half is the compiler's own RtFn table, which
+// survives the deletion: `seed/ir.zig`'s `RtFn` enum through the symbol
+// convention `compiler/codegen.bit`'s `rtSymbol` states (`bit_rt_<tag>`, except
+// `err_set`/`err_get`, whose symbols read verb-first), plus the names a backend
+// emits DIRECTLY rather than through an `rt_call` — `bit_rt_gc_alloc`,
+// `bit_rt_iface_lookup`, `bit_rt_safepoint`. The providing half is unchanged:
+// the `@symbol("bit_rt_*")` pins under `runtime/**/*.bit`. So is the direction —
+// every emitted name needs a provider, while a pin with no caller is fine, since
+// the port-internal `bit_rt_port_*` names were never in the ABI.
+//
+// THE SEED IS NOT THE ONLY DEMAND SOURCE, deliberately: `seed/` retires under
+// #1593. The self-hosted compiler is read too — every `<var>.name = "<tag>"`
+// whose `<var>` came from `mkInstr(Op.RtCall, ...)`, and every tag
+// `compiler/lowerprim.bit`'s `primRtName` returns. That half is INCOMPLETE by
+// construction (a tag reaching `.name` through a variable, as `print`/`eprint`
+// do, is invisible to a text scanner), and the floors are what stop the
+// incompleteness from passing quietly.
+//
+// THE FLOORS, and why they are right after the deletion. PER-SOURCE, for the
+// reason `tests/bit/pollfree.bit` records: one total floor lets one oracle die
+// while another's growth keeps the sum up.
+//
+//   `minRtFnTags` 90 against today's 96. The Zig gate's 90-against-103 was the
+//   same shape and too slack — it would have absorbed the loss of thirteen
+//   symbols in silence. 90 leaves room to retire a primitive or two (the
+//   compiler already lowers `sqrt`/`floor`/`float_bits` as IR ops, so the table
+//   shrinking is real) and no room for the table moving, being renamed, or the
+//   block parser failing to find it.
+//
+//   `minCompilerTags` 80 against today's 84, same argument for the Bit-side scan.
+//   `minDemand` 96 against today's 99 — the union, so it cannot go vacuous even
+//   if both per-source scans clear their own floors on garbage.
+//   `minPins` 250 against today's 306 (the Zig gate used 200 against 277): the
+//   population has only grown as the port completed, and a broken pin scan
+//   yields ~0, not 240.
+//
+// WHEN `seed/` GOES this gate FAILS LOUDLY — the Bit-side scan alone cannot meet
+// `minRtFnTags` (84 < 90). That is the design, not an oversight: the demand
+// oracle must then be re-pointed at a Bit-side RtFn table, and the alternative to
+// a red gate is a green one that proves nothing. Do not answer it with a lower
+// floor.
+//
+// THE TWO WAYS A TEXT SCANNER GOES WRONG, both carried over from the Zig gate's
+// header because both actually happened, and both unit-tested in `checkScanners`
+// before the walk runs:
+//
+//   (1) A FALSE POSITIVE IS NOT NOISE. `runtime/root.zig` held
+//       `fatal("bit_rt_string_from_float: float text exceeds buffer")`, and the
+//       rule "any `bit_rt_*` literal is an export name" reported it as a missing
+//       provider. An unsatisfiable demand is what pushes someone to weaken the
+//       check. So a literal counts only when the WHOLE literal is one identifier
+//       (never `"bit_rt_x: ..."`, never an interpolation), only outside comments,
+//       and — for `.name =` — only off an `Op.RtCall` local. `atoms.name =
+//       "bit_stack_maps"` is the live trap on that last rule.
+//
+//   (2) A FALSE NEGATIVE IS A GREEN HOLE. The Zig gate was got wrong by hand
+//       twice, green both times: reading only `export fn` (missing
+//       `bit_rt_safepoint`), then only `root.zig` (missing `bit_rt_unmap_pages`).
+//       The same class here is a pin the scanner fails to see, so a `@symbol(...)`
+//       not attached to a `function` on its own or the next line is a HARD
+//       FAILURE, not a skip.
+//
+// `compiler/*check.bit` is excluded from the emitting scan: those are the
+// compiler's in-tree unit tests, whose fixtures name symbols no runtime defines
+// on purpose (`bit_rt_absent`, `bit_rt_probe`, `bit_rt_no_such_symbol_exists_anywhere`).
+// What that exclusion could hide is a real emit site, so the five directly
+// emitted names are asserted BY NAME as anchors.
+//
+// Usage (cwd is the repository root):
+//
+//     bit run tests/bit/abimembers.bit
+//
+// `BIT_REPO` overrides the repository root (default "."), which is also how this
+// gate is mutation-tested: copy the tree, break one pin, point `BIT_REPO` at it.
+
+import { exists, isDir, readFile, walk } from "std/fs"
+import { exit, envOr } from "std/os"
+import { hasPrefix, hasSuffix, indexOf, join, split } from "std/strings"
+
+// ==== Bounds — every walk and every scan is provably finite (Power of 10 rule 2). ====
+
+// Mirrors `rootabi_shared.max_bit_files`: an order of magnitude above today's
+// count of runtime and compiler sources.
+const maxBitFiles: int = 1024
+// Mirrors `rootabi_shared.max_source_bytes` (1 << 22).
+const maxSourceBytes: int = 4194304
+const maxLinesPerFile: int = 200000
+
+const abiPrefix: string = "bit_rt_"
+
+// ==== The floors — see this file's header for why each number is what it is. ====
+
+const minRtFnTags: int = 90
+const minCompilerTags: int = 80
+const minDemand: int = 96
+const minPins: int = 250
+
+// ==== Lexical helpers ====
+
+function isIdentByte(c: u8): bool {
+  if (c >= '0' && c <= '9') {
+    return true
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return true
+  }
+  if (c >= 'a' && c <= 'z') {
+    return true
+  }
+  return c == '_'
+}
+
+function isSpaceByte(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\r'
+}
+
+function identEnd(s: string, at: int): int {
+  let i = at
+  while (i < len(s) && isIdentByte(s[i])) {
+    i = i + 1
+  }
+  return i
+}
+
+function identStart(s: string, at: int): int {
+  let i = at
+  while (i > 0 && isIdentByte(s[i - 1])) {
+    i = i - 1
+  }
+  return i
+}
+
+function trimLeft(s: string): string {
+  let i = 0
+  while (i < len(s) && isSpaceByte(s[i])) {
+    i = i + 1
+  }
+  return s[i:]
+}
+
+function trimRight(s: string): string {
+  let i = len(s)
+  while (i > 0 && isSpaceByte(s[i - 1])) {
+    i = i - 1
+  }
+  return s[:i]
+}
+
+// The line with any trailing `//` comment removed. Quote-aware, so a `//` inside
+// a string literal does not truncate the code, and a symbol name mentioned in a
+// comment cannot be read as one the compiler emits (trap (1) in the header).
+function stripComment(line: string): string {
+  let i = 0
+  let inStr = false
+  while (i < len(line)) {
+    let c = line[i]
+    if (inStr) {
+      if (c == 92) {
+        i = i + 2
+        continue
+      }
+      if (c == '"') {
+        inStr = false
+      }
+      i = i + 1
+      continue
+    }
+    if (c == '"') {
+      inStr = true
+      i = i + 1
+      continue
+    }
+    if (c == '/' && i + 1 < len(line) && line[i + 1] == '/') {
+      return line[:i]
+    }
+    i = i + 1
+  }
+  return line
+}
+
+// The identifier a string literal opening at `at` holds, or "" when the literal
+// is not EXACTLY one identifier. `"bit_rt_x: text"` and `"bit_rt_${rt}"` both
+// yield "" — that is trap (1), and it is the whole reason this is a function
+// rather than a substring search.
+function quotedIdent(s: string, at: int): string {
+  if (at >= len(s) || s[at] != '"') {
+    return ""
+  }
+  let end = identEnd(s, at + 1)
+  if (end >= len(s) || s[end] != '"') {
+    return ""
+  }
+  return s[at + 1:end]
+}
+
+// A `bit_rt_*` symbol name, or "" — `quotedIdent` plus the ABI prefix.
+function quotedAbiName(s: string, at: int): string {
+  let name = quotedIdent(s, at)
+  if (!hasPrefix(name, abiPrefix) || len(name) == len(abiPrefix)) {
+    return ""
+  }
+  return name
+}
+
+function lineCount(source: string): []string {
+  let lines = split(source, "\n")
+  if (len(lines) > maxLinesPerFile) {
+    return lines[:maxLinesPerFile]
+  }
+  return lines
+}
+
+// The runtime symbol implementing an `rt_call` — a verbatim port of
+// `compiler/codegen.bit`'s `rtSymbol`. The two must agree; the `bit_rt_set_err`
+// and `bit_rt_get_err` anchors in `main` are what proves they still do.
+function rtSymbol(rt: string): string {
+  if (rt == "err_set") {
+    return "bit_rt_set_err"
+  }
+  if (rt == "err_get") {
+    return "bit_rt_get_err"
+  }
+  return "bit_rt_${rt}"
+}
+
+// ==== Scanner 1 — the RtFn table (`seed/ir.zig`) ====
+
+struct TagScan {
+  tags: []string
+  bad: int
+}
+
+const rtFnHeader: string = "pub const RtFn = enum {"
+
+// Every tag of the `RtFn` enum. A line inside the block that is neither blank,
+// nor a comment, nor `    <ident>,` is counted `bad`: the enum's shape is the
+// whole oracle here, and silently skipping a line it does not recognise is how a
+// demand set shrinks without anyone noticing.
+function scanRtFnTags(source: string): TagScan {
+  let out = TagScan{tags: []string(0), bad: 0}
+  let inside = false
+  for line of lineCount(source) {
+    let t = trimRight(line)
+    if (!inside) {
+      inside = hasPrefix(t, rtFnHeader)
+      continue
+    }
+    if (hasPrefix(t, "};")) {
+      return out
+    }
+    let body = trimLeft(t)
+    if (len(body) == 0 || hasPrefix(body, "//")) {
+      continue
+    }
+    let end = identEnd(body, 0)
+    if (!hasPrefix(t, "    ") || end == 0 || end != len(body) - 1 || body[end] != ',') {
+      out.bad = out.bad + 1
+      continue
+    }
+    out.tags = append(out.tags, body[:end])
+  }
+  // Falling out of the loop means the closing `};` was never reached.
+  out.bad = out.bad + 1
+  return out
+}
+
+// ==== Scanner 2 — the self-hosted compiler's `rt_call` names and direct emissions ====
+
+struct EmitScan {
+  // `rt_call` tags, before `rtSymbol`.
+  tags: []string
+  // Whole `bit_rt_*` symbol names emitted directly by a backend.
+  names: []string
+}
+
+const mkInstrMark: string = "= mkInstr(Op."
+const nameMark: string = ".name = \""
+const returnMark: string = "return \""
+const primRtNameHead: string = "function primRtName("
+
+// Records the op a local was built with, so `<var>.name = "<tag>"` can be read
+// as an `rt_call` name only when `<var>` is an `Op.RtCall` instruction.
+function noteMkInstr(ops: map<string, string>, s: string) {
+  let at = indexOf(s, mkInstrMark)
+  if (at < 0) {
+    return
+  }
+  let lhs = trimRight(s[:at])
+  let v = lhs[identStart(lhs, len(lhs)):]
+  if (len(v) == 0) {
+    return
+  }
+  let o = at + len(mkInstrMark)
+  ops[v] = s[o:identEnd(s, o)]
+}
+
+// The `rt_call` tag a `<var>.name = "<tag>"` line carries, or "" — including ""
+// for the trap this rule exists for, `atoms.name = "bit_stack_maps"`, whose
+// `<var>` is an `Op.StackMapsAddr`.
+function rtCallName(ops: map<string, string>, s: string): string {
+  let at = indexOf(s, nameMark)
+  if (at <= 0) {
+    return ""
+  }
+  let v = s[identStart(s, at):at]
+  if (len(v) == 0 || ops[v] != "RtCall") {
+    return ""
+  }
+  return quotedIdent(s, at + len(nameMark) - 1)
+}
+
+// Every whole `"bit_rt_*"` literal on a line, comments already stripped, into
+// `out.names`.
+function emittedNames(out: EmitScan, s: string) {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '"') {
+      let name = quotedAbiName(s, i)
+      if (len(name) != 0) {
+        out.names = append(out.names, name)
+      }
+      i = identEnd(s, i + 1) + 1
+      continue
+    }
+    i = i + 1
+  }
+}
+
+// One compiler source. `primRtName`'s body is read separately because its tags
+// reach `.name` through a variable, which the `mkInstr` rule cannot see.
+function scanCompilerFile(out: EmitScan, source: string) {
+  let ops = map<string, string>{}
+  let inPrim = false
+  for line of lineCount(source) {
+    let t = stripComment(line)
+    let s = trimLeft(t)
+    if (inPrim) {
+      inPrim = !hasPrefix(t, "}")
+      let at = indexOf(s, returnMark)
+      let tag = ""
+      if (at >= 0) {
+        tag = quotedIdent(s, at + len(returnMark) - 1)
+      }
+      if (len(tag) != 0) {
+        out.tags = append(out.tags, tag)
+      }
+      continue
+    }
+    inPrim = hasPrefix(t, primRtNameHead)
+    noteMkInstr(ops, s)
+    let tag = rtCallName(ops, s)
+    if (len(tag) != 0) {
+      out.tags = append(out.tags, tag)
+    }
+    emittedNames(out, s)
+  }
+}
+
+// ==== Scanner 3 — the providing half: `@symbol("bit_rt_*")` under `runtime/**/*.bit` ====
+
+struct PinScan {
+  names: []string
+  bad: int
+}
+
+const symbolMark: string = "@symbol(\""
+const funcKw: string = "function "
+
+// A pin line is a top-level declaration head: column 0, `export` or an
+// attribute. That excludes the one live comment mentioning `@symbol("...")`
+// (`runtime/auxv/auxv.bit`), which would otherwise register as a provider — the
+// dangerous direction, since a phantom provider makes a missing symbol PASS.
+function isDeclHead(t: string): bool {
+  return hasPrefix(t, "export ") || hasPrefix(t, "@")
+}
+
+// Every `@symbol("bit_rt_*")` pin. The pin must be attached to a `function` — on
+// its own line or the next one — and a detached pin is `bad`, never a provider.
+function scanPins(source: string): PinScan {
+  let out = PinScan{names: []string(0), bad: 0}
+  let lines = lineCount(source)
+  for (let i = 0; i < len(lines); i = i + 1) {
+    let t = trimRight(lines[i])
+    if (!isDeclHead(t)) {
+      continue
+    }
+    let at = indexOf(t, symbolMark)
+    if (at < 0) {
+      continue
+    }
+    let name = quotedAbiName(t, at + len(symbolMark) - 1)
+    if (len(name) == 0) {
+      continue
+    }
+    let here = indexOf(t, funcKw) >= 0
+    let next = i + 1 < len(lines) && hasPrefix(trimRight(lines[i + 1]), funcKw)
+    if (!here && !next) {
+      out.bad = out.bad + 1
+      continue
+    }
+    out.names = append(out.names, name)
+  }
+  return out
+}
+
+// ==== The scanners' own unit tests — run before the walk ====
+
+function enumFixture(): string {
+  return "const std = @import(\"std\");\n" +
+    "pub const RtFn = enum {\n" +
+    "    /// Two `string` args, and a doc comment with a comma,\n" +
+    "    string_concat,\n" +
+    "\n" +
+    "    err_set,\n" +
+    "};\n" +
+    "pub fn rtWordArgs(rt: RtFn) u32 {\n" +
+    "    return switch (rt) {\n" +
+    "        .map_set => 0b110,\n" +
+    "    };\n" +
+    "}\n"
+}
+
+function compilerFixture(): string {
+  return "function emitAlloc(cx: X) {\n" +
+    "  emitCallReloc(cx, \"bit_rt_gc_alloc\")\n" +
+    "}\n" +
+    "function safepointSymbol(): string {\n" +
+    "  return \"bit_rt_safepoint\"\n" +
+    "}\n" +
+    "function rtSymbol(rt: string): string {\n" +
+    // Split so this harness's own lexer does not interpolate the fixture.
+    "  return \"bit_rt_$" + "{rt}\"\n" +
+    "}\n" +
+    "// a comment naming \"bit_rt_from_a_comment\", which emits nothing\n" +
+    "function fatalText(): string {\n" +
+    "  return \"bit_rt_string_from_float: float text exceeds buffer\"\n" +
+    "}\n" +
+    "function lowerThings(fc: FnCtx) {\n" +
+    "  let ins = mkInstr(Op.RtCall, ty)\n" +
+    "  ins.name = \"map_len\"\n" +
+    "  let atom = mkInstr(Op.StackMapsAddr, ty)\n" +
+    "  atom.name = \"bit_stack_maps\"\n" +
+    "  let cv = mkInstr(Op.Convert, ty)\n" +
+    "  cv.name = \"not_a_primitive\"\n" +
+    "}\n" +
+    "function primRtName(name: string): string {\n" +
+    "  if (name == \"fsOpen\") { return \"fs_open\" }\n" +
+    "  return \"\"\n" +
+    "}\n"
+}
+
+function pinFixture(): string {
+  return "// NOT PINNED WITH `@symbol(\"bit_rt_from_a_comment\")`, unlike its sibling.\n" +
+    "export @nosplit @symbol(\"bit_rt_slice_new\") function rtSliceNew(n: int): int {\n" +
+    "}\n" +
+    "export @symbol(\"bit_rt_parse_float\")\n" +
+    "function rtParseFloat(s: int): f64 {\n" +
+    "}\n" +
+    "@naked @symbol(\"bit_rt_safepoint\")\n" +
+    "function rtSafepoint() {\n" +
+    "}\n" +
+    "export @symbol(\"strlen\")\n" +
+    "function strlen(p: *u8): int {\n" +
+    "}\n" +
+    "export @symbol(\"bit_rt_detached\")\n" +
+    "\n" +
+    "function notItsFunction() {\n" +
+    "}\n"
+}
+
+function expectSet(got: []string, want: []string, what: string): int {
+  let bad = 0
+  let have = map<string, bool>{}
+  for g of got {
+    have[g] = true
+  }
+  for w of want {
+    if (!have[w]) {
+      eprint("scanner: ${what} did not find `${w}`\n")
+      bad = bad + 1
+    }
+  }
+  if (len(got) != len(want)) {
+    eprint("scanner: ${what} found ${len(got)} entries, wanted ${len(want)}: " +
+      "${join(got, " ")}\n")
+    bad = bad + 1
+  }
+  return bad
+}
+
+function checkEnumScanner(): int {
+  let s = scanRtFnTags(enumFixture())
+  let bad = 0
+  if (s.bad != 0) {
+    eprint("scanner: the enum fixture reported ${s.bad} unrecognised line(s)\n")
+    bad = bad + 1
+  }
+  // `.map_set => 0b110,` sits AFTER the closing `};`: reading it as a tag would
+  // demand a `bit_rt_map_set` provider from a table that never named one.
+  bad = bad + expectSet(s.tags, ["string_concat", "err_set"], "the RtFn scanner")
+  let none = scanRtFnTags("pub fn nothing() void {}\n")
+  if (len(none.tags) != 0 || none.bad == 0) {
+    eprint("scanner: a source with no RtFn enum must yield no tags AND report bad\n")
+    bad = bad + 1
+  }
+  return bad
+}
+
+function checkCompilerScanner(): int {
+  let s = EmitScan{tags: []string(0), names: []string(0)}
+  scanCompilerFile(s, compilerFixture())
+  // NOT `bit_stack_maps` (an `Op.StackMapsAddr`), NOT `not_a_primitive` (an
+  // `Op.Convert`) — both would be unsatisfiable demands.
+  let bad = expectSet(s.tags, ["map_len", "fs_open"], "the rt_call scanner")
+  // NOT the `fatal(...)` message, NOT the comment, NOT `"bit_rt_${rt}"`.
+  bad = bad + expectSet(s.names, ["bit_rt_gc_alloc", "bit_rt_safepoint"],
+    "the direct-emission scanner")
+  return bad
+}
+
+function checkPinScanner(): int {
+  let s = scanPins(pinFixture())
+  let bad = expectSet(s.names, ["bit_rt_slice_new", "bit_rt_parse_float", "bit_rt_safepoint"],
+    "the pin scanner")
+  // The detached pin: `bad`, and NOT a provider. A phantom provider is the one
+  // error that makes a missing symbol pass.
+  if (s.bad != 1) {
+    eprint("scanner: the pin fixture reported ${s.bad} detached pin(s), wanted 1\n")
+    bad = bad + 1
+  }
+  if (len(scanPins("").names) != 0) {
+    eprint("scanner: an empty source produced pins\n")
+    bad = bad + 1
+  }
+  return bad
+}
+
+function checkScanners(): bool {
+  return checkEnumScanner() + checkCompilerScanner() + checkPinScanner() == 0
+}
+
+// ==== The walk ====
+
+struct Sources {
+  paths: []string
+  ok: bool
+}
+
+// Every `.bit` file under `dir`, bounded.
+function bitSources(dir: string): Sources {
+  let out = Sources{paths: []string(0), ok: false}
+  if (!isDir(dir)) {
+    eprint("abimembers: ${dir} is not a directory (set BIT_REPO to the repository root)\n")
+    return out
+  }
+  let paths = walk(dir) catch e {
+    eprint("abimembers: cannot walk ${dir}: ${e.message()}\n")
+    return out
+  }
+  for p of paths {
+    if (!hasSuffix(p, ".bit")) {
+      continue
+    }
+    out.paths = append(out.paths, p)
+    if (len(out.paths) > maxBitFiles) {
+      eprint("abimembers: more than ${maxBitFiles} sources under ${dir}; raise the bound deliberately\n")
+      return out
+    }
+  }
+  out.ok = true
+  return out
+}
+
+function readBounded(path: string): string {
+  let source = readFile(path) catch e {
+    eprint("abimembers: cannot read ${path}: ${e.message()}\n")
+    return ""
+  }
+  if (len(source) > maxSourceBytes) {
+    eprint("abimembers: ${path} is larger than ${maxSourceBytes} bytes\n")
+    return ""
+  }
+  return source
+}
+
+// The providing half.
+function collectPins(repo: string): PinScan {
+  let out = PinScan{names: []string(0), bad: 0}
+  let src = bitSources("${repo}/runtime")
+  if (!src.ok) {
+    out.bad = out.bad + 1
+    return out
+  }
+  for p of src.paths {
+    let s = scanPins(readBounded(p))
+    out.bad = out.bad + s.bad
+    if (s.bad != 0) {
+      eprint("abimembers: ${p}: ${s.bad} `@symbol(\"bit_rt_*\")` pin(s) not attached to a " +
+        "`function`. Teach `scanPins` about the shape — an unread pin is a provider this " +
+        "gate cannot see.\n")
+    }
+    for n of s.names {
+      out.names = append(out.names, n)
+    }
+  }
+  return out
+}
+
+// The emitting half, self-hosted side. `*check.bit` is excluded: see the header.
+function collectCompiler(repo: string): EmitScan {
+  let out = EmitScan{tags: []string(0), names: []string(0)}
+  let src = bitSources("${repo}/compiler")
+  if (!src.ok) {
+    return out
+  }
+  for p of src.paths {
+    if (hasSuffix(p, "check.bit")) {
+      continue
+    }
+    scanCompilerFile(out, readBounded(p))
+  }
+  return out
+}
+
+// ==== The gate ====
+
+struct Demand {
+  name: string
+  origin: string
+}
+
+// The emitted names, deduplicated, each keeping the source that demanded it.
+struct DemandSet {
+  items: []Demand
+  seen: map<string, bool>
+}
+
+function addDemand(d: DemandSet, name: string, origin: string) {
+  if (len(name) == 0 || d.seen[name]) {
+    return
+  }
+  d.seen[name] = true
+  d.items = append(d.items, Demand{name: name, origin: origin})
+}
+
+function demandFromTags(d: DemandSet, tags: []string, origin: string) {
+  for t of tags {
+    addDemand(d, rtSymbol(t), origin)
+  }
+}
+
+// The five names the backends emit directly rather than through the RtFn table.
+// Asserted BY NAME because they are what the `*check.bit` exclusion could hide,
+// and because `bit_rt_set_err`/`bit_rt_get_err` exist only through `rtSymbol`'s
+// special case — finding them proves this file's copy of that mapping is current.
+function emissionAnchors(): []string {
+  return ["bit_rt_gc_alloc", "bit_rt_iface_lookup", "bit_rt_safepoint",
+    "bit_rt_set_err", "bit_rt_get_err"]
+}
+
+function checkAnchors(names: []string): int {
+  let have = map<string, bool>{}
+  for n of names {
+    have[n] = true
+  }
+  let missing = 0
+  for a of emissionAnchors() {
+    if (have[a]) {
+      continue
+    }
+    eprint("abimembers: `${a}` is emitted by no compiler source this gate can see. " +
+      "A backend call site or `rtSymbol`/`safepointSymbol` moved, or it now lives in a " +
+      "`*check.bit` file this scan skips — the demand set is no longer complete.\n")
+    missing = missing + 1
+  }
+  return missing
+}
+
+// How many DISTINCT names `xs` holds. Every floor counts distinct names, the way
+// the Zig gate's hash-map `count()` did: a scan that reads one file twice must
+// not be able to clear a floor with the duplicates.
+function distinct(xs: []string): int {
+  let seen = map<string, bool>{}
+  let n = 0
+  for x of xs {
+    if (seen[x]) {
+      continue
+    }
+    seen[x] = true
+    n = n + 1
+  }
+  return n
+}
+
+function checkFloor(got: int, want: int, what: string): int {
+  if (got >= want) {
+    return 0
+  }
+  eprint("abimembers: found only ${got} ${what} (expected at least ${want}). " +
+    "The membership check is reading nothing useful there — see this file's header " +
+    "on the floors; do NOT answer this by lowering one.\n")
+  return 1
+}
+
+function reportMissing(demand: []Demand, pins: []string): int {
+  let provided = map<string, bool>{}
+  for p of pins {
+    provided[p] = true
+  }
+  let missing = 0
+  for d of demand {
+    if (provided[d.name]) {
+      continue
+    }
+    eprint("abimembers: `${d.name}` is emitted by the compiler (${d.origin}) but NO " +
+      "`@symbol(\"${d.name}\")` pin under runtime/ provides it. That is an undefined " +
+      "symbol at link time in every binary reaching the call. Add the pinned Bit " +
+      "provider, or drop the primitive from the compiler.\n")
+    missing = missing + 1
+  }
+  return missing
+}
+
+function main() {
+  if (!checkScanners()) {
+    eprint("FAIL abimembers: the source scanners do not pass their own unit tests\n")
+    exit(1)
+  }
+  let repo = envOr("BIT_REPO", ".")
+  let irPath = "${repo}/seed/ir.zig"
+  if (!exists(irPath)) {
+    eprint("FAIL abimembers: ${irPath} is gone. Its `RtFn` enum is this gate's demand " +
+      "oracle; re-point it at the self-hosted compiler's own RtFn table before deleting " +
+      "the seed. A gate with no demand set passes everything.\n")
+    exit(1)
+  }
+
+  let seed = scanRtFnTags(readBounded(irPath))
+  let comp = collectCompiler(repo)
+  let pins = collectPins(repo)
+
+  let bad = seed.bad
+  if (seed.bad != 0) {
+    eprint("abimembers: ${seed.bad} line(s) of the `RtFn` enum are in a shape this gate " +
+      "does not understand; every one of them is a primitive it is not demanding.\n")
+  }
+  bad = bad + pins.bad
+  let nTags = distinct(seed.tags)
+  let nComp = distinct(comp.tags)
+  let nPins = distinct(pins.names)
+  bad = bad + checkFloor(nTags, minRtFnTags, "`RtFn` tags in seed/ir.zig")
+  bad = bad + checkFloor(nComp, minCompilerTags, "`rt_call` names in compiler/*.bit")
+  bad = bad + checkFloor(nPins, minPins, "`@symbol(\"bit_rt_*\")` pins under runtime/")
+  bad = bad + checkAnchors(comp.names)
+
+  let demand = DemandSet{items: []Demand(0), seen: map<string, bool>{}}
+  demandFromTags(demand, seed.tags, "seed/ir.zig RtFn")
+  demandFromTags(demand, comp.tags, "compiler/*.bit rt_call")
+  for n of comp.names {
+    addDemand(demand, n, "compiler/*.bit direct emission")
+  }
+  bad = bad + checkFloor(len(demand.items), minDemand, "distinct `bit_rt_*` names the compiler emits")
+  bad = bad + reportMissing(demand.items, pins.names)
+
+  if (bad != 0) {
+    eprint("FAIL abimembers: ${bad} problem(s). Every `bit_rt_*` name the compiler emits " +
+      "must be defined by a `@symbol` pin under runtime/ — that set is the ABI, and a " +
+      "hole in it is an undefined symbol in every shipped binary.\n")
+    exit(1)
+  }
+  println("PASS abimembers: ${len(demand.items)} `bit_rt_*` names the compiler emits " +
+    "(${nTags} RtFn tags, ${nComp} compiler rt_call names) are all provided by the " +
+    "${nPins} `@symbol` pins under runtime/")
+}

@@ -1,0 +1,321 @@
+// Context-switch throughput gate (#1849) — the Bit counterpart of the Zig test
+// `context switch: round trip and microbench sanity (<1us/switch)` in
+// `runtime/sched.zig`.
+//
+// WHY THIS EXISTS. Grep the whole of `tests/` for a throughput assertion —
+// microbench, ns/switch, "per switch" — and before this file there were ZERO
+// hits. That one Zig unit test was the repo's ONLY performance-regression gate,
+// and it lives in a file scheduled for deletion. Meanwhile #1849 records a 4-9x
+// slowdown that nothing caught:
+//
+//     tests/stress/quicwire           BIT_GC=stress   38.3s -> 161s
+//     tests/stress/polloneshotdarwin  BIT_GC=stress   13.1s -> 123s
+//
+// A suite with no throughput assertion cannot tell "still correct" from "still
+// correct, four times slower".
+//
+// WHAT IT MEASURES, AND HOW IT DIFFERS FROM THE ZIG ORIGINAL. The Zig test
+// drove `contextSwitch` directly against a hand-built `Context` on a manually
+// mapped stack: a raw register-save/restore microbenchmark with no scheduler in
+// the picture. That is unreachable from Bit by construction — `Context`,
+// `mapGuardedStack` and `contextSwitch` are runtime internals behind the ABI,
+// and a Bit program can only reach the scheduler through `spawn` and channels.
+// So this measures one level up: an unbuffered-channel ping-pong between two
+// green threads, which is the switch PLUS the park/unpark and run-queue work
+// that actually surrounds every switch in a real program. That is the more
+// useful quantity anyway — #1849's regressions are in that surrounding work,
+// not in the register shuffle — but it is a DIFFERENT number, and a strictly
+// larger one. See "coverage" at the bottom.
+//
+// THE HARD PART IS NOT MEASURING, IT IS NOT BEING FLAKY. A wall-clock
+// assertion that reddens on a loaded machine is worse than no assertion at all:
+// it teaches people to re-run until green, and then a real regression gets
+// re-run too. Two mechanisms make this one hold, both chosen from measurements
+// on the development host (Apple M-series, 18 cores) and not from taste:
+//
+//   1. MINIMUM OF `trials`, NOT MEAN. Contention can only ever make a timing
+//      worse, never better, so the minimum of N independent trials is the
+//      statistic that noise cannot inflate. Measured: under 72 spinning
+//      processes on 18 cores (load average 30+), individual trials degraded to
+//      4478 ns/switch — 10x — while the minimum over 9 trials stayed at 492
+//      against an unloaded 421. The mean would have failed; the minimum did
+//      not move.
+//
+//   2. NORMALIZED RATIOS, NOT ABSOLUTE NANOSECONDS. This was the surprise, and
+//      it is why an absolute threshold is not merely portable-unfriendly but
+//      wrong even on ONE host: over an hour of measurement, the same binary's
+//      minimum went from 421 to 827 ns/switch — 2x — purely from the machine's
+//      background state (the calibration loop slowed by the same 1.9x, so the
+//      host really was that much slower, not the scheduler). An absolute bound
+//      wide enough to survive that (>=2.5x headroom) can no longer see a 4x
+//      regression. So the assertion is on ratios against work measured in the
+//      SAME process, in the SAME trial loop:
+//
+//        cpuRatio   round-trip cost / cost of a fixed integer loop.
+//                   Cancels host CPU speed, thermal state and contention.
+//        chanRatio  round-trip cost / cost of the same number of buffered
+//                   channel send+recv pairs on ONE thread, which exercise the
+//                   same `chanSend`/`chanRecv` code with no switch in it.
+//                   Cancels everything cpuRatio does AND any change in channel
+//                   bookkeeping cost, isolating the park/switch/unpark path.
+//
+//      Both ratios held within ~10% across every condition measured, including
+//      the 2x host slowdown and the 4x-oversubscribed load, where the absolute
+//      number moved by 2x and 10x respectively.
+//
+// Two assertions rather than one because each covers the other's blind spot: a
+// regression that slows ALL channel traffic (buffered included) leaves
+// chanRatio flat and is caught by cpuRatio; a compiler codegen change that
+// alters the integer-loop baseline moves cpuRatio and is caught — as a
+// contradiction between the two — by chanRatio staying put. Both numbers are
+// printed unconditionally on success as well as failure, so a run's output is a
+// usable data point rather than just a verdict.
+//
+// WHAT IT WILL AND WILL NOT CATCH, measured rather than asserted. Inserting
+// relay green threads into the ping-pong chain makes each MEASURED switch cost
+// a known multiple of real scheduler work — no injected sleeps, no synthetic
+// delay, just more park/unpark per round trip — which is a faithful stand-in
+// for "the scheduler got N times slower". The sweep on this host:
+//
+//     relays   true slowdown   cpuRatio   chanRatio   verdict
+//        1          1.5x         510        151        pass
+//        2          2.0x         701        211        pass
+//        3          2.5x         871        262        FAIL
+//        6          4.0x        1416        426        FAIL
+//     (clean baseline: cpuRatio 348, chanRatio 104)
+//
+// So the detection floor is ~2.3x and the #1849 class (4-9x) fails by a wide
+// margin. Anything milder passes. That is the deliberate price of never crying
+// wolf: across ~25 runs spanning an idle host, a host running 2x slower from
+// background work, six concurrent copies of this harness, and 72 spinning
+// processes on 18 cores, the worst ratios observed were 355 and 113 — so the
+// ceilings sit 2.25x and 2.12x above the worst noise, and a 4x regression sits
+// 1.8x beyond the ceilings. Tightening the thresholds means first reducing that
+// spread, not just lowering the number.
+//
+// FALSE RED, HOW TO READ ONE. `cpuRatio` high and `chanRatio` normal, with
+// `spin` far faster than the recorded baseline, is a codegen improvement to the
+// calibration loop, not a scheduler regression — re-baseline `maxCpuRatioX10`.
+// Both ratios high is a real scheduler regression. Both normal but the absolute
+// `ns/switch` far above the baseline is a slow or busy host, and is exactly the
+// case these ratios exist to not fail on.
+
+import { monotonic, sleep } from "std/time"
+import { exit } from "std/os"
+
+// --- tunables ---------------------------------------------------------------
+
+// Round trips per timed run. 20k is 17-33ms here depending on host state: long
+// enough that timer granularity and one-off scheduling hiccups are noise, short
+// enough that all 15 trials of all three measurements cost ~1.2s.
+const rounds: int = 20000
+
+// Iterations of the integer calibration loop, sized to cost the same order as
+// one ping-pong run so neither dominates the trial.
+const spins: int = 2000000
+
+// Independent trials; the minimum of each series is the reported figure. 15
+// costs ~1.2s and gives the minimum enough chances that sustained contention
+// has to hit EVERY trial to move it.
+const trials: int = 15
+
+// Ceilings, as fixed point scaled by 10. Justified above and in the numbers
+// below; both were measured with this exact harness on the development host.
+//
+//   cpuRatioX10   integer-loop iterations of work per context switch.
+//                 Observed 316-355 over every condition tried. Ceiling 800.
+//   chanRatioX10  buffered send+recv pairs per context switch.
+//                 Observed 93-113 over every condition tried. Ceiling 240.
+//
+// Both ceilings are ~2.2x the worst value ever observed, and both are crossed
+// by a 2.5x regression (see the sweep above).
+const maxCpuRatioX10: int = 800
+const maxChanRatioX10: int = 240
+
+// Converts a deadlock into a failure instead of an infinite stall (CLAUDE.md:
+// "a hang is a failure, not a stall"). This harness spawns no child process, so
+// `tests/proc.zig`'s deadline does not cover it; the guard has to be in-process.
+// 120s is ~100x the measured runtime — far above anything a merely slow host
+// produces, so firing it means "stuck", never "busy".
+const watchdogNs: int = 120000000000
+
+// --- failure ----------------------------------------------------------------
+
+function benchFail(msg: string) {
+  eprint("FAIL schedbench: " + msg + "\n")
+  exit(1)
+}
+
+// Parks on the scheduler's timer queue, so it costs no worker while it waits
+// and cannot itself perturb the measurement. If `main` returns first the
+// process exits and this never runs.
+function benchWatchdog() {
+  sleep(watchdogNs)
+  eprint("FAIL schedbench: no result after 120s — the ping-pong deadlocked\n")
+  exit(1)
+}
+
+// --- the measurement --------------------------------------------------------
+
+// Echoes exactly `n` values back, then reports how many it saw. Each `<- a`
+// and each `b <- v` on an unbuffered channel is a park + switch, so one loop
+// iteration here is one round trip and two context switches.
+function benchPong(a: chan<int>, b: chan<int>, done: chan<int>, n: int) {
+  let seen: int = 0
+  while (seen < n) {
+    let v = <- a
+    b <- v
+    seen = seen + 1
+  }
+  done <- seen
+}
+
+// One timed ping-pong run: `n` round trips over unbuffered channels, returning
+// elapsed nanoseconds. Every echoed value is checked against what was sent and
+// the partner's own count is checked at the end — a channel that dropped,
+// duplicated or short-circuited traffic would otherwise post a spectacular
+// throughput number, which is the classic way a benchmark-shaped gate becomes
+// vacuous.
+function benchRoundTrips(n: int): int {
+  let a = chan<int>(0)
+  let b = chan<int>(0)
+  let done = chan<int>(0)
+  spawn benchPong(a, b, done, n)
+
+  let start = monotonic()
+  let i: int = 0
+  while (i < n) {
+    a <- i
+    let v = <- b
+    if (v != i) {
+      benchFail("ping-pong echoed ${v} where ${i} was sent")
+    }
+    i = i + 1
+  }
+  let elapsed = monotonic() - start
+
+  let seen = <- done
+  if (seen != n) {
+    benchFail("partner thread handled ${seen} round trips, expected ${n}")
+  }
+  return elapsed
+}
+
+// Pure integer work, no channel and no scheduler: the host-speed baseline.
+// Returns elapsed nanoseconds; the accumulator is returned through a checked
+// comparison so the loop cannot be optimized away.
+function benchSpinWork(n: int): int {
+  let acc: int = 0
+  let i: int = 0
+  while (i < n) {
+    acc = acc + (i ^ (acc >> 3)) + 1
+    i = i + 1
+  }
+  return acc
+}
+
+function benchSpin(n: int): int {
+  let start = monotonic()
+  let acc = benchSpinWork(n)
+  let elapsed = monotonic() - start
+  if (acc == 0) {
+    benchFail("calibration loop produced 0 — it was elided")
+  }
+  return elapsed
+}
+
+// `n` send+recv pairs on a capacity-1 channel from a single thread. The buffer
+// is empty at every send and full at every receive, so neither ever blocks:
+// this is `chanSend`/`chanRecv` with the park/switch/unpark path removed, which
+// is precisely the difference the ping-pong measures.
+function benchBuffered(n: int): int {
+  let c = chan<int>(1)
+  let start = monotonic()
+  let i: int = 0
+  while (i < n) {
+    c <- i
+    let v = <- c
+    if (v != i) {
+      benchFail("buffered channel returned ${v} where ${i} was sent")
+    }
+    i = i + 1
+  }
+  return monotonic() - start
+}
+
+// --- driver -----------------------------------------------------------------
+
+// Runs the three measurements `trials` times each, interleaved so that any
+// slow period on the host lands on all three rather than on one, and returns
+// the minimum of each series: (ping-pong, spin, buffered) nanoseconds.
+function benchMin(a: int, b: int): int {
+  if (a < b) {
+    return a
+  }
+  return b
+}
+
+function benchTrials(): (int, int, int) {
+  // Seeded above any measurement the watchdog would ever let through (1000s
+  // against a 120s deadline), so the first trial always wins and no
+  // first-iteration special case is needed. The guard after the loop proves a
+  // real measurement replaced it rather than the seed leaking into the result.
+  let bestSwitch: int = 1000000000000
+  let bestSpin: int = 1000000000000
+  let bestBuf: int = 1000000000000
+
+  let t: int = 0
+  while (t < trials) {
+    let sw = benchRoundTrips(rounds)
+    let sp = benchSpin(spins)
+    let bf = benchBuffered(rounds)
+    if (sw <= 0 || sp <= 0 || bf <= 0) {
+      benchFail("monotonic clock did not advance (switch=${sw} spin=${sp} buf=${bf})")
+    }
+    bestSwitch = benchMin(bestSwitch, sw)
+    bestSpin = benchMin(bestSpin, sp)
+    bestBuf = benchMin(bestBuf, bf)
+    t = t + 1
+  }
+  if (bestSwitch >= 1000000000000 || bestSpin >= 1000000000000 || bestBuf >= 1000000000000) {
+    benchFail("no trial recorded a measurement (trials=${trials})")
+  }
+  return bestSwitch, bestSpin, bestBuf
+}
+
+function main() {
+  spawn benchWatchdog()
+  let (bestSwitch, bestSpin, bestBuf) = benchTrials()
+
+  // Two switches per round trip, matching the Zig original's convention.
+  let switches = rounds * 2
+  let nsPerSwitch = bestSwitch / switches
+  let cpuRatioX10 = (bestSwitch * spins * 10) / (bestSpin * switches)
+  let chanRatioX10 = (bestSwitch * 10) / (bestBuf * 2)
+
+  print("schedbench: ${nsPerSwitch} ns/switch, cpuRatio ${cpuRatioX10}/10 (max ${maxCpuRatioX10}/10), chanRatio ${chanRatioX10}/10 (max ${maxChanRatioX10}/10)\n")
+  print("schedbench: best of ${trials} trials — pingpong ${bestSwitch}ns, spin ${bestSpin}ns, buffered ${bestBuf}ns\n")
+
+  if (cpuRatioX10 > maxCpuRatioX10) {
+    benchFail("context switch costs ${cpuRatioX10}/10 calibration iterations, ceiling is ${maxCpuRatioX10}/10 (${nsPerSwitch} ns/switch)")
+  }
+  if (chanRatioX10 > maxChanRatioX10) {
+    benchFail("context switch costs ${chanRatioX10}/10 buffered channel ops, ceiling is ${maxChanRatioX10}/10 (${nsPerSwitch} ns/switch)")
+  }
+  print("OK schedbench\n")
+}
+
+// COVERAGE RELATIVE TO THE ZIG ORIGINAL. The original also asserted
+// `iterations == round_trips`, that the partner fiber really ran; the
+// equivalent here is the `done` count plus the per-value echo check, and it is
+// stricter, since the original's counter could not detect reordering. What is
+// NOT reproduced is the bare `contextSwitch` path: the original built a
+// `Context` by hand and switched into a manually mapped guarded stack with no
+// task, no run queue and no channel, so it measured register save/restore
+// alone and would catch a regression confined to the assembly. Here that cost
+// is a fraction of a round trip that also includes park, unpark, queueing and
+// possibly a cross-worker wakeup, so an assembly-only regression is diluted.
+// Reaching it needs runtime internals a Bit program cannot address; if the
+// bare-switch number is wanted after `runtime/sched.zig` retires, it has to
+// come from a Bit runtime benchmark on the runtime side of the ABI, not from
+// here.

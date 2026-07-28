@@ -1,0 +1,796 @@
+// The register-class gate (#1655) — the Bit port of the first half of
+// `tests/rootabi.zig`, re-pointed at an oracle that survives `runtime/*.zig`.
+//
+// THE DEFECT IT EXISTS TO CATCH. `runtime/root/floats.bit` provides
+// `bit_rt_parse_float`. It once read
+//
+//     export @symbol("bit_rt_parse_float") function rtParseFloat(s: int): u64
+//
+// while every backend reads that call's result out of the FLOAT return register,
+// because the compiler types the `parse_float` primitive `f64`. A `u64` return is
+// written to the INTEGER one (x0/rax). Against a Bit-sourced `libbitrt.a` the
+// caller therefore read a register the callee never wrote, and EVERY FLOAT
+// LITERAL IN EVERY PROGRAM FOLDED TO 0.0 — `sqrt(2) = 0` — while integers stayed
+// correct and every other gate stayed green.
+//
+// Nothing else in the tree can see it. An object file records symbol names and
+// relocations, not C types, so `rootpins`-shaped gates are blind. The
+// differential family compares dumps from ONE compiler against ONE runtime, so a
+// runtime-side ABI defect cancels out. And the golden corpus links the Zig
+// archive, where no mismatch exists — which is why deleting `runtime/*.zig`
+// makes this property MORE load-bearing, not less: after the deletion a mismatch
+// detonates directly in the shipped archive, with no green oracle left to mask it.
+//
+// WHY THE ORACLE CHANGED, AND TO WHAT. The Zig gate read
+// `export fn bit_rt_*(...) callconv(.c) R` out of `runtime/root.zig` and
+// compared it with the pin. Both sides were declarations, and one is being
+// deleted. The surviving statement of the same invariant has neither side in Zig:
+//
+//   - THE COMPILER decides which register a result is READ from: it types every
+//     runtime primitive (`compiler/checktype.bit`'s builtin signatures, and the
+//     types lowering gives a container primitive), names the symbol
+//     (`compiler/codegen.bit`'s `rtSymbol`), and forces container element
+//     positions into the integer class with an explicit `bitcast`
+//     (`compiler/ir.bit`'s `rtWordArgs`/`rtReturnsWord`, via `lowerprim.bit`).
+//   - THE PIN decides which register it is WRITTEN to: its `@symbol(...)`
+//     declaration in `runtime/**/*.bit`.
+//
+// HOW THE COMPILER SIDE IS READ — IT ANSWERS, IT IS NOT SCRAPED. `compiler/` is
+// one module and exports nothing a harness can import, so the obvious port —
+// restating `builtinResultType`'s table here — would make the gate a COPY of what
+// it checks, and a copy agrees with itself forever. Instead the shipped `bit` is
+// asked directly: the probe below is written to scratch and compiled with
+// `bit --dump-ir`, and every
+//
+//     %N = rt_call <primitive>(%a, %b) <type>
+//
+// in the resulting SSA text is the compiler stating, in its own voice, the
+// symbol it will call and the type it will read the result back as. That is the
+// caller's half of the ABI with no restatement and no second source of truth.
+//
+// TWO THINGS MAKE THAT SAFE. On a module with parse errors `bit --dump-ir` still
+// EXITS 0, silently dropping what it could not parse — sometimes a whole body —
+// so a probe that stopped compiling would hand this gate a dump missing the very
+// `rt_call`s it reads; the probe is therefore run through `bit check` FIRST, and
+// the floors are a second, independent guard on that hole. Second, an instruction
+// whose opcode this reader does not know is a HARD FAILURE, never a skip: its
+// result type cannot be resolved, and guessing it integer is how a float slips
+// through unnoticed.
+//
+// WHY CLASS, NOT TYPE EQUALITY. The two sides are deliberately not identical and
+// never will be: a pinned Bit function may not name a GC-managed type (E0079),
+// so the `string` the compiler hands `bit_rt_string_concat` is a raw `int` in
+// the pin. That difference is sound — a pointer and an `int` are both integer
+// class, one register, same slot. Only the float/integer split changes which
+// physical register is used, so only that split is asserted. Arity is asserted
+// too: a parameter count that disagrees shifts every later argument by a slot.
+//
+// THE FLOORS — A VACUOUS PASS IS THIS FAMILY'S FAILURE MODE. `rootpins` shipped
+// a Darwin half that matched zero symbols for months. Four floors, each
+// independently fatal: pins scanned; DISTINCT symbols the compiler was seen to
+// call; `rt_call` sites compared; and pin DECLARATIONS examined. The last bites
+// hardest — every pin that exists for a called symbol is checked, not one per
+// symbol, because most ABI symbols are pinned twice, darwin and linux, and a gate
+// that stopped at the first would pass a linux-only mismatch on a macOS host. A
+// called symbol with no pin at all is a hard failure on its own.
+//
+// Usage, with cwd the repository root: `bit run tests/bit/rootabi.bit`. `BIT`
+// overrides the compiler (default `zig-out/bin/bit`), `REPO` the repository
+// root, `BIT_TEST_TIMEOUT_S` the per-child deadline.
+
+import { readFile, writeFile, walk, exists, mkdir, remove } from "std/fs"
+import { envOr, exit } from "std/os"
+import { hasPrefix, hasSuffix, indexOf, split, trimSpace, parseInt } from "std/strings"
+
+// --- bounds: every loop is statically bounded (Power of 10 rule 2) ----------
+const maxBitFiles: int = 1024
+const maxLinesPerFile: int = 200000
+const maxDumpLines: int = 400000
+const maxJoinLines: int = 8
+const maxParams: int = 16
+const symbolAttr: string = "@symbol(\""
+const funcKw: string = "function "
+// `osRunBounded`'s own ceiling (runtime/root/*/os.bit `osBoundedMaxMs`).
+const maxTimeoutMs: int = 3600000
+const defaultTimeoutS: int = 300
+
+// The floors. Measured 2026-07-29 on a clean tree: 392 pin sites, 88 distinct
+// called symbols, 273 call sites, 321 covered pins. Each sits BELOW today's
+// population — a floor, not a target — so growth never trips it, but a scanner,
+// probe or attribute that stops working does.
+const minPinSites: int = 360
+const minRtSymbols: int = 84
+const minCallSites: int = 250
+const minPinsCovered: int = 295
+
+// --- the probe -------------------------------------------------------------
+//
+// One Bit program that makes the compiler emit an `rt_call` for every runtime
+// primitive it can emit one for. It is never RUN — `--dump-ir` stops after
+// lowering — so `osExit`, `panic` and `fsRemove("p")` are safe to name. `\$` is an
+// escaped interpolation: the probe's own `${...}` must survive being a string
+// literal here, and those are not decoration — they exercise
+// `string_from_int`/`string_from_float`/`string_from_bool`.
+//
+// WHAT IT DELIBERATELY DOES NOT REACH, so the coverage claim stays honest:
+// `sqrt`, `floor`, `ceil`, `round`, `trunc`, `float_bits` and `float32_bits` are
+// lowered by this compiler to INLINE ops (`Op.FSqrt`, `Op.Bitcast`, ...), never
+// to a call, so no probe can make it emit one; their pins exist for the seed and
+// go dead with it. `test_index` is emitted only into the synthetic `main` that
+// `bit test` appends, which `--dump-ir` never builds.
+function probeMain(): string {
+  return "interface Shape { area(): f64 }\nstruct Sq { s: f64 }\n" +
+    "function (q: Sq) area(): f64 { return q.s * q.s }\n" +
+    "function fallible(): int! { fail newError(\"x\") }\n" +
+    "function worker() { print(\"w\") }\n\nfunction main() {\n" +
+    "  let a = \"ab\"\n  let b = \"cd\"\n  let c = a + b\n" +
+    "  let d = \"\${1}\${2.5}\${true}\${a}\"\n" +
+    "  let e = a == b\n  let f = a < b\n  let g = a[0]\n  let h = a[0:1]\n" +
+    "  let i = []byte(a)\n  let j = string(i)\n  print(c)\n  eprint(d)\n" +
+    "  let s = []f64(0)\n  s = append(s, 1.5)\n  let s0 = s[0]\n" +
+    "  s[0] = 2.5\n  let s1 = s[0:1]\n" +
+    "  let m = map<string, f64>{}\n  m[\"k\"] = 1.5\n" +
+    "  let (mv, mh) = m[\"k\"]\n  delete(m, \"k\")\n  let ml = len(m)\n" +
+    "  for (k, v) of m { print(\"\${k}\${v}\") }\n" +
+    "  let ch = chan<f64>(1)\n  ch <- 1.5\n  let cv = <- ch\n" +
+    "  let (cv2, ok) = <- ch\n  close(ch)\n  spawn worker()\n" +
+    "  select {\n    case x = <- ch: print(\"\${x}\")\n    default: print(\"d\")\n  }\n" +
+    "  let sh: Shape = Sq{s: 2.0}\n  let (sq, ok2) = sh.(Sq)\n" +
+    "  let sq2 = sh.(Sq)\n  let r = fallible() catch _ { 0 }\n" +
+    "  assert(true, \"m\")\n  let pf = parseFloat(\"1.5\")\n" +
+    "  print(\"\${pf}\${e}\${f}\${g}\${h}\${j}\${s0}\${len(s1)}\${mv}\${mh}\${ml}\" +\n" +
+    "    \"\${cv}\${cv2}\${ok}\${sq.s}\${sq2.s}\${r}\${ok2}\")\n" +
+    "  panic(\"end\")\n}\n"
+}
+
+// The builtin half: every primitive `compiler/lowerprim.bit`'s `primRtName`
+// maps to an `RtFn`, called at its declared signature.
+function probePrims(): string {
+  return "\nfunction prims() {\n" +
+    "  let fd = fsOpen(\"p\", false)\n  let all = fsReadAll(fd)\n" +
+    "  let nw = fsWrite(fd, \"x\")\n  let cl = fsClose(fd)\n" +
+    "  let ap = fsAppend(\"p\")\n  let rd = fsRead(fd, 8)\n" +
+    "  let ex = fsExists(\"p\")\n  let isd = fsIsDir(\"p\")\n" +
+    "  let mk = fsMkdir(\"p\")\n  let rm = fsRemove(\"p\")\n" +
+    "  let ld = fsListDir(\"p\")\n  let cm = fsChmod(\"p\", 493)\n" +
+    "  let l = netListen(\"h\", 1)\n  let lp = netLocalPort(l)\n" +
+    "  let ac = netAccept(l)\n  let dl = netDial(\"h\", 1)\n" +
+    "  let nr = netRead(l, 8)\n  let nwr = netWrite(l, \"x\")\n" +
+    "  let ub = netUdpBind(\"h\", 1)\n  let us = netUdpSend(ub, \"h\", 1, \"x\")\n" +
+    "  let ur = netUdpRecv(ub, 8)\n  let uh = netUdpSenderHost()\n" +
+    "  let up = netUdpSenderPort()\n  let rv = netResolve(\"h\")\n" +
+    "  let pw = fpow(2.0, 3.0)\n  let at = fatan2(1.0, 2.0)\n" +
+    "  let lg = flog(2.0)\n  let l2 = flog2(2.0)\n  let l10 = flog10(2.0)\n" +
+    "  let tm = timeMonoNs()\n  let tu = timeUnixNs()\n  timeSleepNs(1)\n" +
+    "  let ar = osArgc()\n  let a0 = osArgAt(0)\n  let ev = osEnv(\"X\")\n" +
+    "  let se = osSelfExe()\n  let rn = cryptoRandomBytes(4)\n" +
+    "  let bz = []byte(\"ab\")\n  cryptoSecureZero(bz)\n" +
+    "  let orn = osRun(\"p\")\n  let ort = osRunTest(\"p\", 0)\n" +
+    "  let orb = osRunBounded(\"p\", 1)\n  let ortb = osRunTestBounded(\"p\", 0, 1)\n" +
+    "  let ht = hostTarget()\n  let ax = auxv()\n" +
+    "  print(\"\${all}\${nw}\${cl}\${ap}\${rd}\${ex}\${isd}\${mk}\${rm}\${ld}\${cm}\${lp}\${ac}\" +\n" +
+    "    \"\${dl}\${nr}\${nwr}\${us}\${ur}\${uh}\${up}\${rv}\${pw}\${at}\${lg}\${l2}\${l10}\" +\n" +
+    "    \"\${tm}\${tu}\${ar}\${a0}\${ev}\${se}\${rn}\${orn}\${ort}\${orb}\${ortb}\${ht}\${ax}\")\n" +
+    "  osExit(0)\n}\n"
+}
+
+// --- shared model ----------------------------------------------------------
+// One declared or observed signature. `params`/`ret` hold TYPE TEXT; only
+// `isFloat` is ever asked of them.
+struct Sig {
+  symbol: string,
+  params: []string,
+  ret: string,
+  where: string,
+}
+
+struct Ctx {
+  repo: string,
+  bin: string,
+  scratch: string,
+  timeoutMs: int,
+  failures: int,
+}
+
+function say(c: Ctx, msg: string) {
+  c.failures = c.failures + 1
+  eprint("rootabi: FAIL ${msg}\n")
+}
+
+// Bit's floating-point types (SPEC §8.1). These and only these travel in a float
+// register at the C ABI; everything else this tree uses — integers, pointers,
+// `bool`, `string`, slices, maps, chans — travels in an integer register.
+function isFloat(t: string): bool {
+  return t == "f64" || t == "f32"
+}
+
+function className(t: string): string {
+  if (isFloat(t)) { return "float" } else { return "integer" }
+}
+
+function isMember(s: string, set: []string): bool {
+  for e of set { if (s == e) { return true } }
+  return false
+}
+
+// --- small text helpers ----------------------------------------------------
+function isSpaceByte(ch: u8): bool {
+  return ch == ' ' || ch == '\t' || ch == '\r'
+}
+
+function isIdentByte(ch: u8): bool {
+  return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '$'
+}
+
+function identEnd(s: string, at: int): int {
+  let i = at
+  while (i < len(s) && isIdentByte(s[i])) { i = i + 1 }
+  return i
+}
+
+function lastToken(s: string): string {
+  let t = trimSpace(s)
+  let i = len(t)
+  while (i > 0 && !isSpaceByte(t[i - 1])) { i = i - 1 }
+  return t[i:]
+}
+
+function firstToken(s: string): string {
+  let t = trimSpace(s)
+  let i = 0
+  while (i < len(t) && !isSpaceByte(t[i])) { i = i + 1 }
+  return t[:i]
+}
+
+function nestDelta(ch: u8): int {
+  if (ch == '<' || ch == '(' || ch == '[') { return 1 }
+  if (ch == '>' || ch == ')' || ch == ']') { return 0 - 1 }
+  return 0
+}
+
+// Splits a comma-separated list, ignoring commas nested inside `<...>`, `(...)`
+// or `[...]` — `map<string, f64>` is ONE element, and reading it as two shifts
+// every following parameter's position.
+function splitTop(s: string): []string {
+  let out = []string(0)
+  let depth = 0
+  let start = 0
+  for (let i = 0; i < len(s); i = i + 1) {
+    depth = depth + nestDelta(s[i])
+    if (s[i] == ',' && depth == 0) {
+      out = append(out, trimSpace(s[start:i]))
+      start = i + 1
+    }
+  }
+  let tail = trimSpace(s[start:])
+  if (len(tail) > 0) { out = append(out, tail) }
+  return out
+}
+
+// The index of the `)` closing the `(` at `open`, or -1.
+function matchParen(s: string, open: int): int {
+  let depth = 0
+  for (let i = open; i < len(s); i = i + 1) {
+    if (s[i] == '(') { depth = depth + 1 }
+    if (s[i] == ')') {
+      depth = depth - 1
+      if (depth == 0) { return i }
+    }
+  }
+  return 0 - 1
+}
+
+// `@symbol("bit_rt_x")`'s own parens are balanced and no string literal in a
+// runtime declaration contains a paren, so counting the whole line is exact.
+function parenDepth(s: string): int {
+  let depth = 0
+  for (let i = 0; i < len(s); i = i + 1) {
+    if (s[i] == '(') { depth = depth + 1 }
+    if (s[i] == ')') { depth = depth - 1 }
+  }
+  return depth
+}
+
+// --- the pin side: `@symbol("bit_rt_...")` declarations under runtime/ ------
+
+// The declaration text from `at`, joined across continuation lines until its
+// parameter list closes. Three `bit_rt_port_*` pins wrap today; no ABI symbol
+// does, but a scanner stopping at the newline reads a truncated parameter list
+// as a complete one — a silent wrong answer, not a loud one.
+function joinDecl(lines: []string, at: int): string {
+  let text = lines[at]
+  let i = at
+  let joined = 0
+  while (joined < maxJoinLines && parenDepth(text) > 0 && i + 1 < len(lines)) {
+    i = i + 1
+    joined = joined + 1
+    text = text + " " + trimSpace(lines[i])
+  }
+  return text
+}
+
+// The parameter types of `function name(a: T, b: U)`; ok=false on any odd shape.
+function parseParams(inner: string): ([]string, bool) {
+  let params = []string(0)
+  for p of splitTop(inner) {
+    let colon = indexOf(p, ":")
+    if (colon < 0) { return params, false }
+    params = append(params, trimSpace(p[colon + 1:]))
+  }
+  return params, len(params) <= maxParams
+}
+
+// Parses `function name(a: T, b: U): R {` out of `text`. ok=false when the shape
+// is not understood — a hard failure at the call site, never a skip.
+function parseSig(text: string, symbol: string, where: string): (Sig, bool) {
+  let none = Sig{symbol: symbol, params: []string(0), ret: "", where: where}
+  let fi = indexOf(text, funcKw)
+  if (fi < 0) { return none, false }
+  let rest = text[fi + len(funcKw):]
+  let open = indexOf(rest, "(")
+  if (identEnd(rest, 0) == 0 || open < 0) { return none, false }
+  let close = matchParen(rest, open)
+  if (close < 0) { return none, false }
+  let (params, okParams) = parseParams(rest[open + 1:close])
+  if (!okParams) { return none, false }
+  let after = trimSpace(rest[close + 1:])
+  let ret = "void"
+  if (hasPrefix(after, ":")) {
+    let brace = indexOf(after, "{")
+    if (brace < 0) { return none, false }
+    ret = trimSpace(after[1:brace])
+  }
+  return Sig{symbol: symbol, params: params, ret: ret, where: where}, true
+}
+
+// One pin declaration starting at `lines[i]`, appended to `out`. A top-level
+// declaration starts in column 0, so an indented `@symbol` cannot exist and a
+// comment naming the attribute is skipped by the same rule.
+function scanPinAt(c: Ctx, out: []Sig, lines: []string, i: int, path: string) {
+  let line = lines[i]
+  if (len(line) == 0 || isSpaceByte(line[0]) || hasPrefix(trimSpace(line), "//")) { return }
+  let si = indexOf(line, symbolAttr)
+  if (si < 0) { return }
+  let after = line[si + len(symbolAttr):]
+  let q = indexOf(after, "\"")
+  if (q < 0) {
+    say(c, "${path}:${i + 1}: unterminated @symbol(\"...\")")
+    return
+  }
+  let text = joinDecl(lines, i)
+  if (indexOf(text, funcKw) < 0) {
+    // The attribute sits on its own line; the declaration is below it.
+    if (i + 1 >= len(lines)) {
+      say(c, "${path}:${i + 1}: @symbol with no declaration under it")
+      return
+    }
+    text = text + " " + trimSpace(joinDecl(lines, i + 1))
+  }
+  let (sig, ok) = parseSig(text, after[:q], "${path}:${i + 1}")
+  if (!ok) {
+    say(c, "${path}:${i + 1}: cannot read the signature of `${after[:q]}`")
+    return
+  }
+  out = append(out, sig)
+}
+
+function scanPins(c: Ctx, out: []Sig, src: string, path: string) {
+  let lines = split(src, "\n")
+  if (len(lines) > maxLinesPerFile) {
+    say(c, "${path} has ${len(lines)} lines, above the ${maxLinesPerFile} bound")
+    return
+  }
+  for (let i = 0; i < len(lines); i = i + 1) { scanPinAt(c, out, lines, i, path) }
+}
+
+// Every `@symbol("...")` pin under `runtime/`, one entry per DECLARATION SITE:
+// a symbol pinned once per platform yields two, and both are checked.
+function collectPins(c: Ctx): []Sig {
+  let out = []Sig(0)
+  let root = c.repo + "/runtime"
+  let paths = walk(root) catch _ {
+    say(c, "cannot walk ${root}")
+    return out
+  }
+  if (len(paths) > maxBitFiles) {
+    say(c, "runtime/ holds ${len(paths)} entries, above the ${maxBitFiles} bound")
+    return out
+  }
+  for p of paths {
+    if (!hasSuffix(p, ".bit")) { continue }
+    let src = readFile(p) catch _ {
+      say(c, "cannot read ${p}")
+      continue
+    }
+    scanPins(c, out, src, p)
+  }
+  return out
+}
+
+// --- the compiler side: `bit --dump-ir` over the probe ---------------------
+function shQuote(s: string): string {
+  let out = "'"
+  for (let i = 0; i < len(s); i = i + 1) {
+    // A single quote ends the word, so it is spelled `'\''` outside it.
+    if (s[i] == 39) { out = out + "'\\''" } else { out = out + s[i:i + 1] }
+  }
+  return out + "'"
+}
+
+// `osRunBounded`'s negative results, named; "" means the child actually ran.
+function launchFailure(code: int, timeoutMs: int): string {
+  if (code == 0 - 2) { return "TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)" }
+  if (code == 0 - 1) { return "cannot launch the wrapper script (spawn/wait failure)" }
+  if (code <= 0 - 100) { return "CRASHED: killed by signal ${0 - code - 100}" }
+  return ""
+}
+
+// Writes and runs a `/bin/sh` wrapper that `exec`s `argv` with both streams
+// redirected to files — `tests/bit/golden.bit`'s idiom: `osRunBounded` takes a
+// bare path and captures nothing, and `exec` makes a child that dies of a signal
+// kill the process being waited on. Returns ok=false only after reporting why, so
+// a caller can never read an absent redirect file as "empty output" — the hole
+// that would let this gate pass on a compiler that never ran.
+function runCapture(c: Ctx, what: string, argv: []string): (string, bool) {
+  let outPath = c.scratch + "/out"
+  let errPath = c.scratch + "/err"
+  let shPath = c.scratch + "/w.sh"
+  removeQuiet(outPath)
+  removeQuiet(errPath)
+  let script = "#!/bin/sh\nexec"
+  for a of argv { script = script + " " + shQuote(a) }
+  script = script + " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch _ {
+    say(c, "${what}: cannot write the wrapper script ${shPath}")
+    return "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    say(c, "${what}: cannot chmod the wrapper script ${shPath}")
+    return "", false
+  }
+
+  let code = osRunBounded(shPath, c.timeoutMs)
+  let why = launchFailure(code, c.timeoutMs)
+  if (why != "") {
+    say(c, "${what}: ${why}")
+    return "", false
+  }
+  // The redirections are established before `exec`, so both files exist the
+  // moment the command starts. A missing one means the wrapper never got there.
+  if (!exists(outPath) || !exists(errPath)) {
+    say(c, "${what}: the wrapper produced no redirect files — it never ran ${c.bin}")
+    return "", false
+  }
+  // THE EXIT CODE IS THE VERDICT, not the captured stdout: `bit` writes every
+  // diagnostic to STDERR, so a guard reading stdout for them matches nothing.
+  if (code != 0) {
+    say(c, "${what}: `${c.bin}` exited ${code}:\n" + (readFile(errPath) catch _ { "" }))
+    return "", false
+  }
+  let text = readFile(outPath) catch _ {
+    say(c, "${what}: cannot read the captured stdout")
+    return "", false
+  }
+  return text, true
+}
+
+function removeQuiet(path: string) {
+  remove(path) catch _ { return }
+}
+
+// Writes the probe, refuses to continue unless it CHECKS clean, then returns its
+// SSA dump. Not redundant: on a module with parse errors `--dump-ir` still exits
+// 0, silently dropping what it could not parse — sometimes the whole body — so
+// without this a probe broken by a syntax change hands the gate a dump missing
+// the very `rt_call`s it exists to read, and every comparison then passes.
+function dumpProbe(c: Ctx): (string, bool) {
+  let src = c.scratch + "/probe.bit"
+  writeFile(src, probeMain() + probePrims()) catch _ {
+    say(c, "cannot write the probe to ${src}")
+    return "", false
+  }
+  let (unused, okCheck) = runCapture(c, "probe check", [c.bin, "check", src])
+  if (!okCheck || len(unused) > 0) {
+    return "", false
+  }
+  return runCapture(c, "probe dump-ir", [c.bin, "--dump-ir", src])
+}
+
+// --- the SSA reader --------------------------------------------------------
+// Vreg -> result-type text by vreg number; "" is "not defined here", fatal at a use.
+struct Vregs {
+  types: []string,
+}
+function vregSet(v: Vregs, idx: int, ty: string) {
+  while (len(v.types) <= idx) { v.types = append(v.types, "") }
+  v.types[idx] = ty
+}
+
+function vregGet(v: Vregs, idx: int): string {
+  if (idx < 0 || idx >= len(v.types)) { return "" }
+  return v.types[idx]
+}
+
+// Opcodes whose result type is the token immediately AFTER the opcode.
+function typeAfterOp(op: string): bool {
+  if (hasPrefix(op, "icmp_") || hasPrefix(op, "fcmp_")) { return true }
+  return isMember(op, ["const_int", "const_float", "bitcast", "convert",
+    "fmul", "fadd", "fsub", "fdiv", "fneg",
+    "fsqrt", "ffloor", "fceil", "fround", "ftrunc"])
+}
+
+// Opcodes whose result is an ADDRESS, whatever type text trails them.
+// `type_info` prints the type it DESCRIBES and `gc_alloc` the one it allocates;
+// both yield a pointer, so neither may be read off the tail.
+function opIsAddress(op: string): bool {
+  return isMember(op, ["type_info", "func_addr", "gc_alloc", "global_addr",
+    "stackmaps_addr"])
+}
+
+// Opcodes whose result type is the LAST token on the line.
+function typeAtEnd(op: string): bool {
+  return isMember(op, ["rt_call", "call", "call_value", "call_iface",
+    "field_get", "index_get", "make_closure"])
+}
+
+// The result type of one `%N = op ...` instruction, or "" when the opcode is
+// unknown — which the caller treats as fatal.
+function resultType(op: string, rest: string): string {
+  if (op == "const_bool") { return "bool" }
+  if (op == "const_string") { return "string" }
+  if (op == "const_nil") { return "nil" }
+  if (op == "slice_len") { return "i64" }
+  if (opIsAddress(op)) { return "ptr" }
+  if (typeAfterOp(op)) { return firstToken(rest) }
+  if (typeAtEnd(op)) { return lastToken(rest) }
+  return ""
+}
+
+// One observed call site: the symbol the compiler emits, and the types it uses.
+struct Site {
+  primitive: string,
+  symbol: string,
+  args: []string,
+  ret: string,
+  line: int,
+}
+
+// `compiler/codegen.bit`'s `rtSymbol`, the compiler's ONLY name-shaping rule:
+// tag prefixed with `bit_rt_`, bar the two error-slot accessors (verb-first).
+function rtSymbol(rt: string): string {
+  if (rt == "err_set") { return "bit_rt_set_err" }
+  if (rt == "err_get") { return "bit_rt_get_err" }
+  return "bit_rt_${rt}"
+}
+
+function parseVregRef(tok: string): int {
+  let t = trimSpace(tok)
+  if (!hasPrefix(t, "%")) { return 0 - 1 }
+  return parseInt(t[1:]) catch _ { 0 - 1 }
+}
+
+function readBlockParams(c: Ctx, v: Vregs, line: string, lineNo: int) {
+  let open = indexOf(line, "(")
+  if (open < 0) { return }
+  let close = matchParen(line, open)
+  if (close < 0) {
+    say(c, "IR line ${lineNo}: unbalanced block-parameter list")
+    return
+  }
+  for p of splitTop(line[open + 1:close]) {
+    let colon = indexOf(p, ":")
+    let idx = 0 - 1
+    if (colon >= 0) { idx = parseVregRef(p[:colon]) }
+    if (idx < 0) {
+      say(c, "IR line ${lineNo}: block parameter `${p}` has no vreg and type")
+      continue
+    }
+    vregSet(v, idx, trimSpace(p[colon + 1:]))
+  }
+}
+
+function readCallSite(c: Ctx, v: Vregs, sites: []Site, rest: string, lineNo: int) {
+  let open = indexOf(rest, "(")
+  let close = 0 - 1
+  if (open >= 0) { close = matchParen(rest, open) }
+  if (close < 0) {
+    say(c, "IR line ${lineNo}: rt_call has no readable argument list")
+    return
+  }
+  let prim = trimSpace(rest[:open])
+  let args = []string(0)
+  for a of splitTop(rest[open + 1:close]) {
+    let ty = vregGet(v, parseVregRef(a))
+    if (ty == "") {
+      say(c, "IR line ${lineNo}: rt_call `${prim}` argument `${a}` is not a defined vreg")
+      return
+    }
+    args = append(args, ty)
+  }
+  sites = append(sites, Site{primitive: prim, symbol: rtSymbol(prim),
+    args: args, ret: lastToken(rest[close + 1:]), line: lineNo})
+}
+
+// One `%N = ...` instruction: record its result type, and its call site when it
+// is an `rt_call`.
+function readInstr(c: Ctx, v: Vregs, sites: []Site, line: string, lineNo: int) {
+  let eq = indexOf(line, " = ")
+  if (eq < 0) { return }
+  let dst = parseVregRef(line[:eq])
+  if (dst < 0) {
+    say(c, "IR line ${lineNo}: cannot read the destination of `${line}`")
+    return
+  }
+  let body = line[eq + 3:]
+  let op = firstToken(body)
+  let rest = trimSpace(body[len(op):])
+  let ty = resultType(op, rest)
+  if (ty == "") {
+    say(c, "IR line ${lineNo}: unknown opcode `${op}` — this reader cannot type its " +
+      "result, and guessing integer is how a float would slip past. Teach it the op.")
+    return
+  }
+  vregSet(v, dst, ty)
+  if (op == "rt_call") { readCallSite(c, v, sites, rest, lineNo) }
+}
+
+// Reads the SSA text into one `Site` per `rt_call`. Vreg numbering restarts at
+// every `func`, so the type table is cleared there. One forward pass suffices:
+// SSA dominance puts every definition ahead of its uses, and an undefined use is
+// reported rather than assumed.
+function readSites(c: Ctx, dump: string): []Site {
+  let sites = []Site(0)
+  let lines = split(dump, "\n")
+  if (len(lines) > maxDumpLines) {
+    say(c, "the IR dump has ${len(lines)} lines, above the ${maxDumpLines} bound")
+    return sites
+  }
+  let v = Vregs{types: []string(0)}
+  for (let i = 0; i < len(lines); i = i + 1) {
+    let line = trimSpace(lines[i])
+    if (hasPrefix(line, "func ")) {
+      v = Vregs{types: []string(0)}
+      continue
+    }
+    if (hasPrefix(line, "bb")) {
+      readBlockParams(c, v, line, i + 1)
+      continue
+    }
+    if (hasPrefix(line, "%")) { readInstr(c, v, sites, line, i + 1) }
+  }
+  return sites
+}
+
+// --- the comparison --------------------------------------------------------
+// One call site against one pin. Arity is reported alone: once the counts
+// differ there is no meaningful positional comparison left to make.
+function compareOne(c: Ctx, s: Site, pin: Sig) {
+  if (len(s.args) != len(pin.params)) {
+    say(c, "${s.symbol}: ARITY differs — the compiler emits ${len(s.args)} argument(s) " +
+      "(IR line ${s.line}), the pin declares ${len(pin.params)} (${pin.where}). " +
+      "Every argument after the first difference lands in the wrong register.")
+    return
+  }
+  for (let i = 0; i < len(s.args); i = i + 1) {
+    if (isFloat(s.args[i]) == isFloat(pin.params[i])) { continue }
+    say(c, "${s.symbol}: parameter ${i} CROSSES THE REGISTER CLASS — the compiler passes " +
+      "`${s.args[i]}` (${className(s.args[i])} register, IR line ${s.line}), the pin " +
+      "declares `${pin.params[i]}` (${className(pin.params[i])} register, ${pin.where}). " +
+      "The value is written to one register and read from the other.")
+  }
+  if (isFloat(s.ret) != isFloat(pin.ret)) {
+    say(c, "${s.symbol}: RESULT CROSSES THE REGISTER CLASS — the compiler reads " +
+      "`${s.ret}` (${className(s.ret)} register, IR line ${s.line}), the pin returns " +
+      "`${pin.ret}` (${className(pin.ret)} register, ${pin.where}). Against a Bit-built " +
+      "libbitrt.a the caller reads a register the callee never wrote and the call " +
+      "silently yields 0 — this is #1655, `bit_rt_parse_float`, exactly.")
+  }
+}
+
+struct Tally {
+  callSites: int,
+  pinsCovered: int,
+  symbols: int,
+}
+// Once per SYMBOL, not per call site: `string_concat` alone has 131 probe sites,
+// and 131 copies of one fact buries every other failure.
+function reportMissing(c: Ctx, missing: map<string, bool>, s: Site) {
+  if (missing[s.symbol]) { return }
+  missing[s.symbol] = true
+  say(c, "${s.symbol}: the compiler emits this call (first at IR line ${s.line}, " +
+    "primitive `${s.primitive}`) but NO `@symbol(\"${s.symbol}\")` pin provides it " +
+    "under runtime/. The link fails, or worse, binds to something else.")
+}
+
+// Every call site against EVERY pin of its symbol. Not one pin per symbol: most
+// ABI symbols are pinned twice, once per platform, and a gate that stopped at
+// the first would pass a linux-only mismatch on a macOS host.
+function compareAll(c: Ctx, sites: []Site, pins: []Sig): Tally {
+  let t = Tally{callSites: 0, pinsCovered: 0, symbols: 0}
+  let seen = map<string, bool>{}
+  let missing = map<string, bool>{}
+  for s of sites {
+    let matched = 0
+    for pin of pins {
+      if (pin.symbol != s.symbol) { continue }
+      matched = matched + 1
+      compareOne(c, s, pin)
+    }
+    if (matched == 0) {
+      reportMissing(c, missing, s)
+      continue
+    }
+    t.callSites = t.callSites + 1
+    t.pinsCovered = t.pinsCovered + matched
+    if (!seen[s.symbol]) {
+      seen[s.symbol] = true
+      t.symbols = t.symbols + 1
+    }
+  }
+  return t
+}
+
+// --- floors ----------------------------------------------------------------
+function floorAt(c: Ctx, got: int, want: int, what: string, why: string) {
+  if (got >= want) { return }
+  say(c, "VACUOUS — ${what}: ${got}, floor ${want}. ${why}")
+}
+
+function checkFloors(c: Ctx, pinCount: int, t: Tally) {
+  floorAt(c, pinCount, minPinSites, "pins scanned out of runtime/**/*.bit",
+    "A moved directory, a changed declaration shape, or a renamed @symbol.")
+  floorAt(c, t.symbols, minRtSymbols, "distinct runtime symbols seen to be called",
+    "The probe stopped exercising primitives, or lowering stopped emitting " +
+    "rt_calls. A dump with no rt_call in it passes every comparison above.")
+  floorAt(c, t.callSites, minCallSites, "rt_call sites compared",
+    "Same cause as above, measured per call site rather than per symbol.")
+  floorAt(c, t.pinsCovered, minPinsCovered, "pin declarations examined",
+    "Fewer pins examined than exist for the symbols in play — a platform's pins " +
+    "stopped being found, so a mismatch there is invisible here.")
+}
+
+// --- entry point -----------------------------------------------------------
+// `BIT_TEST_TIMEOUT_S` per tests/proc.zig's contract: default 300s, `0` disables
+// the bound (here: the runtime's own one-hour ceiling).
+function timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") { return defaultTimeoutS * 1000 }
+  let s = parseInt(raw) catch _ {
+    eprint("rootabi: BIT_TEST_TIMEOUT_S='${raw}' is not a number; using ${defaultTimeoutS}s\n")
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0 || s * 1000 > maxTimeoutMs) { return maxTimeoutMs }
+  return s * 1000
+}
+
+function main() {
+  let bin = envOr("BIT", "zig-out/bin/bit")
+  if (!exists(bin)) {
+    eprint("rootabi: BIT='${bin}' does not exist — refusing to guess\n")
+    exit(2)
+  }
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-rootabi-${timeUnixNs()}"
+  mkdir(scratch) catch _ {
+    eprint("rootabi: cannot create the scratch directory ${scratch}\n")
+    exit(2)
+  }
+  let c = Ctx{repo: envOr("REPO", "."), bin: bin, scratch: scratch,
+    timeoutMs: timeoutMs(), failures: 0}
+
+  let pins = collectPins(c)
+  let (dump, ok) = dumpProbe(c)
+  if (!ok) {
+    eprint("rootabi: the compiler side produced nothing; not reporting a clean sheet.\n")
+    exit(1)
+  }
+  let t = compareAll(c, readSites(c, dump), pins)
+  checkFloors(c, len(pins), t)
+  print("rootabi: ${len(pins)} pins scanned, ${t.symbols} runtime symbols called, " +
+    "${t.callSites} call sites compared against ${t.pinsCovered} pin declarations\n")
+  if (c.failures != 0) {
+    eprint("rootabi: ${c.failures} failure(s).\n")
+    exit(1)
+  }
+  print("rootabi: OK\n")
+}

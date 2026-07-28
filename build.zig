@@ -483,69 +483,13 @@ pub fn build(b: *std.Build) void {
 
     // Examples guard is now tests/bit/examplesgate.bit — see the Bit gates at the tail.
 
-    // Runtime-pin cycle gate (#1367): emits each ported runtime module as an
-    // ELF object and refuses any pinned ABI definition that references the very
-    // symbol #1369's rename will turn it into — i.e. a function that will become
-    // unbounded self-recursion the moment `runtime/root.zig` is retired. The
-    // trap is that a Bit primitive (`ffloor`, `floatBits`, `hostTarget`, ...) is
-    // NOT an instruction: it lowers to a call to the `bit_rt_*` symbol being
-    // ported, so "return ffloor(x)" reads as a one-line port and is a cycle.
-    // See tests/rootpins.zig's header for why no other gate can see this.
-    const rootpins_opts = b.addOptions();
-    rootpins_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
-    rootpins_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    // Runtime-pin cycle gate (#1367) is now tests/bit/rootpins.bit, wired at
+    // the tail. See its header for the self-reference rule it enforces.
 
-    const rootpins_mod = b.createModule(.{
-        .root_source_file = b.path("tests/rootpins.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    rootpins_mod.addImport("bit", exe.root_module);
-    rootpins_mod.addOptions("build_options", rootpins_opts);
-
-    const rootpins_tests = b.addTest(.{ .root_module = rootpins_mod });
-    const rootpins_run = b.addRunArtifact(rootpins_tests);
-    // runtime/**/*.bit is read at run time, so an edit there is invisible to the
-    // build cache — without this a newly-introduced cycle is cache-skipped.
-    rootpins_run.has_side_effects = true;
-    test_step.dependOn(&rootpins_run.step);
-    // Also its own step: this gate is the one a runtime port wants to re-run on
-    // every edit, and mutation-testing it through the full `test` step costs
-    // minutes per mutation.
-    b.step("rootpins", "Runtime-pin cycle gate (tests/rootpins.zig)").dependOn(&rootpins_run.step);
-
-    // Runtime-ABI gates (#1655/#1658/#1662): register-class agreement between a
-    // pin and the `root.zig` export it replaces, poll-freedom of the runtime
-    // subtrees an ABI pin reaches, and ABI membership (every Zig export has a
-    // Bit provider). `bit_rt_parse_float` is the register-class defect this
-    // caught: Zig returned `f64` in `d0`/`xmm0`, the Bit pin returned `u64` in
-    // `x0`/`rax` — so against a Bit-built `libbitrt.a` every float literal in
-    // every program folded to 0.0 while integers stayed correct. No
-    // object-level or differential gate can see a C type; see
-    // tests/rootabi.zig's header. Split under #1674 into tests/rootabi.zig
-    // (register-class + shared entry point), tests/rootabi_shared.zig (parsing
-    // helpers), tests/rootabi_pollfree.zig and tests/rootabi_membership.zig —
-    // the latter two are anchored into this same test binary via
-    // `_ = @import(...)` in tests/rootabi.zig, so this module still needs only
-    // its one root_source_file below.
-    const rootabi_opts = b.addOptions();
-    rootabi_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
-
-    const rootabi_mod = b.createModule(.{
-        .root_source_file = b.path("tests/rootabi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    rootabi_mod.addImport("bit", exe.root_module);
-    rootabi_mod.addOptions("build_options", rootabi_opts);
-
-    const rootabi_tests = b.addTest(.{ .root_module = rootabi_mod });
-    const rootabi_run = b.addRunArtifact(rootabi_tests);
-    // Both halves are read at run time (runtime/root.zig + runtime/**/*.bit), so
-    // an edit to either is invisible to the build cache.
-    rootabi_run.has_side_effects = true;
-    test_step.dependOn(&rootabi_run.step);
-    b.step("rootabi", "Runtime-ABI gates: register-class, poll-free, ABI membership (tests/rootabi*.zig)").dependOn(&rootabi_run.step);
+    // Runtime-ABI gates (#1674) are now tests/bit/rootabi.bit (register class)
+    // and tests/bit/abimembers.bit (ABI membership), wired at the tail. Both
+    // moved their oracle off runtime/root.zig onto the compiler's own RtFn
+    // emission, which survives the seed.
 
     // Stop-the-world wiring gate (#1639) is now tests/bit/stwwiring.bit,
     // wired at the tail. See its header for the 15 edges it checks.
@@ -1302,6 +1246,50 @@ pub fn build(b: *std.Build) void {
     }, "run the stop-the-world wiring gate (tests/bit/stwwiring.bit) only");
     if (selfhost_install_step) |inst| stw_gate.step.dependOn(inst);
     if (host_libbitrt_install) |inst| stw_gate.step.dependOn(inst);
+
+    // Runtime-ABI register class (#1655), replacing tests/rootabi.zig. The
+    // oracle MOVED: the Zig gate compared the `@symbol(...)` pin against
+    // runtime/root.zig's `export fn`, and one of those is being deleted. This
+    // compares the pin against the compiler's own emission — it runs `bit
+    // --dump-ir` on a probe and reads the register class each rt_call actually
+    // reads its result from. Neither side is Zig, and it cannot degenerate into
+    // a table agreeing with itself.
+    const rootabi_gate = addBitGate(b, selfhosted, test_step, "rootabi", "tests/bit/rootabi.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the runtime-ABI register-class gate (tests/bit/rootabi.bit) only");
+    if (selfhost_install_step) |inst| rootabi_gate.step.dependOn(inst);
+
+    // ABI membership (#1674), replacing tests/rootabi_membership.zig: every
+    // bit_rt_* name the compiler can emit must have a pin providing it.
+    const abimembers_gate = addBitGate(b, selfhosted, test_step, "abimembers", "tests/bit/abimembers.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the ABI-membership gate (tests/bit/abimembers.bit) only");
+    if (selfhost_install_step) |inst| abimembers_gate.step.dependOn(inst);
+
+    // Runtime-pin cycle gate (#1367), replacing tests/rootpins.zig: no bit_rt_*
+    // definition may relocate to itself. Now that libbitrt.a is all-Bit, such a
+    // definition is unbounded recursion in every shipped binary. Spawns 28
+    // compiler children, ~51s.
+    const rootpins_gate = addBitGate(b, selfhosted, test_step, "rootpins", "tests/bit/rootpins.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the runtime-pin cycle gate (tests/bit/rootpins.bit) only");
+    if (selfhost_install_step) |inst| rootpins_gate.step.dependOn(inst);
+
+    // getauxval (#1591): runtime/auxv had NO test in any language. The Zig one
+    // that covered it lives in runtime/shims.zig, which dies with the runtime.
+    _ = addBitGate(b, selfhosted, test_step, "auxv", "tests/bit/auxv.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the getauxval gate (tests/bit/auxv.bit) only");
+
+    // Context-switch throughput (#1849). runtime/sched.zig's "<1us/switch" test
+    // is the ONLY throughput assertion in the repo — a grep across tests/ for
+    // any such gate returns nothing — and it dies with the runtime. #1849 is a
+    // 4-9x performance regression that nothing caught, which is what a repo with
+    // no perf gate looks like.
+    const schedbench_gate = addBitGate(b, selfhosted, test_step, "schedbench", "tests/bit/schedbench.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the context-switch throughput gate (tests/bit/schedbench.bit) only");
+    if (host_libbitrt_install) |inst| schedbench_gate.step.dependOn(inst);
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).

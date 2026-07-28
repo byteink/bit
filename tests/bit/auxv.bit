@@ -1,0 +1,289 @@
+// `runtime/auxv`'s `getauxval` (#1417), the Bit counterpart of the second of
+// `runtime/shims.zig`'s two tests. (The first, "strlen matches libc semantics",
+// is already covered by tests/stress/rand's `strlenScan` KAT; this file is the
+// remaining half, so `runtime/shims.zig` can retire without dropping coverage.)
+//
+// WHAT IS UNDER TEST. `runtime/auxv/auxv.bit`'s `getauxval(kind)` — the walk
+// over the kernel's `(a_type, a_val)` pairs — is imported and called DIRECTLY,
+// not reimplemented here. A copy of the walk would pass forever no matter what
+// the runtime did; this file has exactly one implementation in it, and it is
+// the shipped one.
+//
+// HOW THE ZIG TEST DID IT, AND HOW THIS ONE DOES. The Zig test set the module's
+// `g_auxv` global to a hand-built two-entry table and asserted three facts:
+// 0 before capture, the value for a present key, 0 for an absent one. The Bit
+// port keeps no module state — it asks `runtime/root`'s `bit_rt_auxv` for the
+// address on every call — so the same trick is available one layer down:
+// `osSetAuxv` (the pinned setter the Linux entry uses) points the runtime at a
+// synthetic table built in a `[]i64` here, `ptrOf` gives its address, and the
+// REAL scan runs over it. The live value is saved first and restored after, so
+// the process is left exactly as the kernel handed it over.
+//
+// THE HOST PROBLEM, AND THE CHOICE MADE. auxv is a Linux concept and this repo
+// is developed on aarch64-macOS, where `bit_rt_auxv` honestly returns 0 and no
+// real table exists. A gate that answered that by returning early on Darwin
+// would be a gate that never runs (this repo has shipped that mistake before),
+// so it is NOT what happens here:
+//
+//   - The synthetic-table checks — every branch of the walk: terminator, key
+//     match, value word, first-match-wins, and both sides of the `MAX_ENTRIES`
+//     bound — run IDENTICALLY on every platform. They are the bulk of the
+//     coverage and they are never skipped.
+//   - The live-process leg is platform-specific and asserts on BOTH platforms:
+//     on Linux the kernel's real AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ must be
+//     present and well-formed; on Darwin `auxv()` must be 0 and every lookup
+//     must report absent (that is the documented Darwin contract, and it is a
+//     real assertion, not a skip).
+//   - The Linux-only checks that genuinely cannot run here are NAMED, COUNTED
+//     and PRINTED as NOT RUN, so a reader of a macOS run can see precisely what
+//     the Linux gates (`scripts/x64gate.sh`, `scripts/arm64gate.sh`) still owe.
+import { exit } from "std/os"
+import { getauxval, atNull, atPhdr, atPhent, atPhnum, atPagesz } from "../../runtime/auxv"
+import { osSetAuxv } from "../../runtime/root"
+
+// The walk's own ceiling, from `runtime/auxv/auxv.bit`'s `MAX_ENTRIES`. Both
+// sides of it are pinned below (index 255 found, index 256 not), so raising or
+// lowering the cap there is a deliberate change that updates this line too,
+// never a silent one.
+const maxEntries: int = 256
+
+// A key no case ever queries, used to pad a table so the walk has ground to
+// cover. Not a real AT_* value.
+const padKey: int = 1234
+
+// Values planted BEYOND a table's `AT_NULL`, and in the terminator's own value
+// word. A correct walk stops at the terminator and can never return either; a
+// walk that dropped the terminator check, or that matched the key before
+// testing for it, returns one of these instead of 0 and is caught. Zero-filled
+// padding past the terminator would NOT catch that — the wrong answer and the
+// right answer are both 0 — which is why these are here.
+const beyondValue: int = 0x0DEAD000
+const terminatorValue: int = 0x0BADF00D
+
+// Checks that ran, for the summary line. A gate that reports "PASS" without a
+// count cannot be told apart from a gate whose cases all fell through.
+let ran: int = 0
+
+function die(msg: string) {
+  eprint("FAIL auxv: " + msg + "\n")
+  exit(1)
+}
+
+function want(got: int, expect: int, what: string) {
+  if (got != expect) {
+    die("${what}: got ${got}, want ${expect}")
+  }
+  ran = ran + 1
+}
+
+// `n` zeroed words. The table below is written into it and its address handed
+// to the runtime; the caller holds the slice for the whole test so the
+// collector keeps the memory it is pointed at alive.
+function words(n: int): []i64 {
+  let b: []i64 = []
+  let i = 0
+  while (i < n) {
+    b = append(b, i64(0))
+    i = i + 1
+  }
+  return b
+}
+
+// Entry `idx` of the auxv at `b`: two 8-byte words, key then value.
+function setEntry(b: []i64, idx: int, key: int, val: int) {
+  b[idx * 2] = i64(key)
+  b[idx * 2 + 1] = i64(val)
+}
+
+// Point the runtime at `b` as if the kernel had placed it on the initial stack.
+// The only other reader of this cell is the Linux TLS bootstrap, which runs
+// when an OS thread starts; this harness spawns nothing, so the window in which
+// the runtime is pointed at a synthetic table has no other observer, and the
+// live address is put back before `main` returns.
+function useTable(b: []i64) {
+  osSetAuxv(int(ptrOf(b)))
+}
+
+// --- the walk, over synthetic tables (runs on every platform) ---------------
+
+// No table at all: the Zig test's "before capture" case. Every key, including
+// the terminator's own, reports absent.
+function checkNoTable() {
+  osSetAuxv(0)
+  want(getauxval(atPagesz), 0, "no table, AT_PAGESZ")
+  want(getauxval(atPhdr), 0, "no table, AT_PHDR")
+  want(getauxval(atNull), 0, "no table, AT_NULL")
+}
+
+// The Zig test's table — AT_PAGESZ=4096 then AT_NULL — followed by poisoned
+// entries no correct walk can ever reach. Present key returns its value; absent
+// key returns 0; the terminator ends the walk and is not itself a key.
+function checkZigTable() {
+  let b = words(10)
+  setEntry(b, 0, atPagesz, 4096)
+  setEntry(b, 1, atNull, terminatorValue)
+  setEntry(b, 2, atPhdr, beyondValue)
+  setEntry(b, 3, atPhnum, beyondValue)
+  setEntry(b, 4, atNull, 0) // backstop: a runaway walk stops here, not on heap
+  useTable(b)
+  want(getauxval(atPagesz), 4096, "two-entry table, AT_PAGESZ")
+  want(getauxval(atPhdr), 0, "two-entry table, AT_PHDR is past the terminator")
+  want(getauxval(atPhnum), 0, "two-entry table, AT_PHNUM is past the terminator")
+  // The terminator is not a key: its own value word is never an answer, which
+  // also pins the order — the AT_NULL test comes BEFORE the key match.
+  want(getauxval(atNull), 0, "two-entry table, AT_NULL is not a key")
+}
+
+// A table whose first entry is the terminator: nothing is ever found, however
+// inviting what sits behind it looks.
+function checkEmptyTable() {
+  let b = words(6)
+  setEntry(b, 0, atNull, terminatorValue)
+  setEntry(b, 1, atPagesz, beyondValue)
+  setEntry(b, 2, atNull, 0)
+  useTable(b)
+  want(getauxval(atPagesz), 0, "empty table, AT_PAGESZ")
+  want(getauxval(atNull), 0, "empty table, AT_NULL")
+}
+
+// A key several entries in, and a duplicate: the walk is in order and the FIRST
+// match wins, exactly as the Zig loop's early `return` did.
+function checkOrder() {
+  let b = words(12)
+  setEntry(b, 0, atPhdr, 0x400040)
+  setEntry(b, 1, atPhent, 56)
+  setEntry(b, 2, atPhnum, 13)
+  setEntry(b, 3, atPagesz, 16384)
+  setEntry(b, 4, atPagesz, 99) // shadowed by entry 3
+  setEntry(b, 5, atNull, 0)
+  useTable(b)
+  want(getauxval(atPhdr), 0x400040, "ordered table, AT_PHDR (first entry)")
+  want(getauxval(atPhent), 56, "ordered table, AT_PHENT")
+  want(getauxval(atPhnum), 13, "ordered table, AT_PHNUM")
+  want(getauxval(atPagesz), 16384, "ordered table, AT_PAGESZ (first of two wins)")
+  want(getauxval(0x0EADBEEF), 0, "ordered table, absent key")
+}
+
+// Both sides of the `MAX_ENTRIES` bound, over a table that is NOT terminated
+// before the entry being asked about. The last in-bound entry is found; the
+// first out-of-bound one is not — a walk that ran one entry too far, or that
+// dropped the Power-of-10 ceiling entirely, fails here.
+function checkBound() {
+  let last = maxEntries - 1
+  let b = words((maxEntries + 2) * 2)
+  let i = 0
+  while (i < maxEntries + 1) {
+    setEntry(b, i, padKey, 0)
+    i = i + 1
+  }
+  setEntry(b, last, atPagesz, 4096)
+  setEntry(b, maxEntries, atPhdr, 0x400040)
+  useTable(b)
+  want(getauxval(atPagesz), 4096, "unterminated table, last in-bound entry")
+  want(getauxval(atPhdr), 0, "unterminated table, first out-of-bound entry")
+  want(getauxval(atPhnum), 0, "unterminated table, key that is not present at all")
+}
+
+// --- the live process ------------------------------------------------------
+
+// Linux: the kernel really did hand this process a table, and what it says is
+// self-consistent. `notRun` on the other branch names what this cannot check.
+function checkLiveLinux(host: string) {
+  if (int(auxv()) == 0) {
+    die("${host}: this process has no auxv — the kernel always supplies one on Linux, " +
+      "so either the entry never captured it or bit_rt_auxv is not reading what it captured")
+  }
+  ran = ran + 1
+
+  let pagesz = getauxval(atPagesz)
+  if (pagesz < 4096 || pagesz > 65536 || (pagesz & (pagesz - 1)) != 0) {
+    die("${host}: AT_PAGESZ is ${pagesz}, want a power of two in 4096..65536")
+  }
+  ran = ran + 1
+
+  // ELF64: sizeof(Elf64_Phdr). A different value means the walk returned the
+  // wrong word, not that the kernel is unusual.
+  want(getauxval(atPhent), 56, "${host}: AT_PHENT")
+
+  let phnum = getauxval(atPhnum)
+  if (phnum < 1 || phnum > 256) {
+    die("${host}: AT_PHNUM is ${phnum}, want 1..256")
+  }
+  ran = ran + 1
+
+  if (getauxval(atPhdr) == 0) {
+    die("${host}: AT_PHDR is 0 — a mapped program header is never at address 0")
+  }
+  ran = ran + 1
+
+  want(getauxval(0x0EADBEEF), 0, "${host}: absent key in the real auxv")
+}
+
+// Darwin: no auxv exists, and the runtime says so rather than reading wild
+// memory. This is an assertion, not a skip — it is the contract Darwin has.
+function checkLiveDarwin(host: string) {
+  want(int(auxv()), 0, "${host}: bit_rt_auxv must report no table")
+  want(getauxval(atPagesz), 0, "${host}: AT_PAGESZ with no table")
+  want(getauxval(atPhdr), 0, "${host}: AT_PHDR with no table")
+}
+
+// The Linux-only checks, named one by one, for the NOT RUN report.
+function linuxOnlyChecks(): []string {
+  return ["real auxv present (bit_rt_auxv != 0)",
+    "AT_PAGESZ is a power of two in 4096..65536",
+    "AT_PHENT == 56 (sizeof Elf64_Phdr)",
+    "AT_PHNUM in 1..256",
+    "AT_PHDR != 0",
+    "absent key in the real auxv returns 0"]
+}
+
+function triple(t: int): string {
+  if (t == 0) { return "x86_64-linux" }
+  if (t == 1) { return "aarch64-linux" }
+  if (t == 2) { return "aarch64-macos" }
+  die("unknown hostTarget() ordinal ${t}")
+  return ""
+}
+
+function main() {
+  let host = int(hostTarget())
+  let name = triple(host)
+  let linux = host == 0 || host == 1
+
+  // Save the real table BEFORE anything points the runtime elsewhere, and run
+  // the live leg against it while it is still installed.
+  let live = int(auxv())
+  if (linux) {
+    checkLiveLinux(name)
+  } else {
+    checkLiveDarwin(name)
+  }
+  let liveRan = ran
+
+  checkNoTable()
+  checkZigTable()
+  checkEmptyTable()
+  checkOrder()
+  checkBound()
+  let synthetic = ran - liveRan
+
+  // Put the process back exactly as the kernel left it, and prove it took.
+  osSetAuxv(live)
+  want(int(auxv()), live, "the live auxv address is restored")
+
+  if (!linux) {
+    let owed = linuxOnlyChecks()
+    eprint("auxv: NOT RUN on ${name} — ${len(owed)} live-auxv check(s) need a Linux kernel:\n")
+    for c of owed {
+      eprint("auxv:   NOT RUN: " + c + "\n")
+    }
+    eprint("auxv: the walk itself IS covered here (${synthetic} synthetic-table checks); " +
+      "the list above is owed by scripts/x64gate.sh and scripts/arm64gate.sh.\n")
+  }
+  let owedNote = ""
+  if (!linux) {
+    owedNote = " (${len(linuxOnlyChecks())} Linux-only check(s) NOT RUN — see above)"
+  }
+  println("PASS auxv: ${ran} check(s) — ${synthetic} synthetic-table over runtime/auxv's " +
+    "getauxval, ${liveRan} live-process on ${name}, 1 restore" + owedNote)
+}

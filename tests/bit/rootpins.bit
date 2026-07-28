@@ -1,0 +1,905 @@
+// bit:lint max-file-lines=905 -- a `bit run <file>` harness is ONE file by
+// construction (each tests/bit/*.bit is its own program with its own `main`), so
+// the sibling split CLAUDE.md prescribes is unavailable here. The excess over
+// 800 is the Mach-O and ELF relocation readers this port had to rebuild: the Zig
+// original imported `bit.macho_reader`/`bit.elf_reader`, and a Bit harness
+// cannot import compiler-module files. The readers are a VERBATIM copy of
+// `tests/bit/stwwiring.bit`'s — see "WHAT THE PORT HAD TO REBUILD".
+//
+// Runtime-pin cycle gate (#1367) — the Bit port of tests/rootpins.zig.
+//
+// No ported runtime symbol may call the ABI name it is going to become.
+//
+// Run it: `bit run tests/bit/rootpins.bit` from the repository root.
+// Configure it by environment, since `bit run` forwards no argv:
+//   BIT                 compiler under test    (default zig-out/bin/bit)
+//   REPO                repository root        (default .)
+//   BIT_TEST_TIMEOUT_S  per-child deadline     (default 300, clamped to 3600)
+//
+// THE DEFECT THIS EXISTS TO CATCH, AND WHY NOTHING ELSE CAN SEE IT.
+// Almost every ABI function the runtime port had to cover has a Bit PRIMITIVE
+// that looks like a ready-made implementation of it:
+//
+//     export @symbol("bit_rt_host_target") function rtHostTarget(): int {
+//       return hostTarget()          // looks like a one-line port
+//     }
+//
+// It is not one. `hostTarget` is not lowered to a hardware instruction — it is
+// an `RtFn`, which both backends emit as **a call to `bit_rt_host_target`**
+// (`compiler/codegen.bit`'s `rtSymbol`). So the body above compiles to a call
+// TO ITSELF: unbounded recursion in every shipped binary, discovered as a stack
+// overflow. Every other stage reads green — it builds, it links, it runs (before
+// the archive swap the call landed on the still-linked Zig), `--freestanding`
+// does not refuse it because `refuseUnpinnedImports` checks pinning and not
+// identity, and the differential gates compare check/type/IR dumps while this is
+// a property of the emitted object's symbols.
+//
+// WHY IT READS AN OBJECT INSTEAD OF SCANNING SOURCE. Because the source does not
+// contain the answer: `return hostTarget()` names no `bit_rt_*` symbol anywhere,
+// the call target is invented by codegen out of an RtFn tag. A grep-based guard
+// would have to re-derive the whole primitive -> RtFn -> symbol table and would
+// rot the moment one entry moved. The emitted object is the oracle, and it is
+// the SAME oracle the linker uses.
+//
+// WHAT THE RENAME LEFT BEHIND. The Stage-2 port pinned each ABI function under a
+// placeholder (`bit_rt_root_host_target`) while `runtime/root.zig` still owned
+// the real name. #1369 dropped the `_root` infix, so `placeholder` and `real`
+// are now the SAME string, `renameOf` is the identity, and the live check is
+// plain SELF-REFERENCE. The two constants are kept and applied explicitly rather
+// than collapsed away, because collapsing them is a documented trap: setting
+// `placeholder = ""` to "finish the job" leaves `real = "bit_rt_"` and
+// double-prefixes every check to `bit_rt_bit_rt_host_target`, which matches
+// nothing — a vacuous pass.
+//
+// ---------------------------------------------------------------------------
+// TWO THINGS THIS PORT FIXES RATHER THAN INHERITS
+// ---------------------------------------------------------------------------
+//
+// 1. THE MODULE LIST IS DISCOVERED, NOT HAND-MAINTAINED, AND COVERAGE IS
+//    ASSERTED. The Zig original carried a literal `modules` array whose stated
+//    selection rule ("`bit_rt_root_` is the only prefix the rename touches, so
+//    `bit_rt_heap_*` and `bit_rt_port_*` pins are out of scope") went OBSOLETE
+//    the moment placeholder == real: post-rename, EVERY `bit_rt_*` definition is
+//    at risk of self-reference, because every one of them is a name codegen can
+//    emit a call to. A list nobody is forced to update is a list that silently
+//    stops covering — the original's own mutation log records `modules` being
+//    emptied and the suite staying green.
+//
+//    So: every directory under `runtime/` holding a `.bit` file that pins a
+//    `bit_rt_*` symbol IS a module of this gate, found by walking the tree, and
+//    every pin found there must come back as a defined global in THAT module's
+//    own object (`coverage A`). Add a pin in a module nobody listed and the gate
+//    reddens; move a definition to a new directory and it reddens. Second half
+//    (`coverage B`): every `bit_rt_*` name any examined object emits a
+//    RELOCATION to must itself be one of the pins — so a symbol the compiler can
+//    call that no examined module defines is a hole, reported by name, rather
+//    than a silence.
+//
+// 2. `runtime/alloc` AND `runtime/cryptohw` ARE EXAMINED IN THEIR OWN RIGHT.
+//    Their pins landed in other modules' objects only because those objects are
+//    not freestanding, so an importer inlines the imported bodies. That is
+//    INCIDENTAL coverage: it evaporates the day an importer stops importing, and
+//    nothing would say so. Coverage A gives credit only from the object emitted
+//    for the directory the pin's source file lives in, so incidental copies
+//    cannot pay for a module that was never emitted.
+//
+// WHY IT PINS A TARGET PER MODULE INSTEAD OF USING THE HOST'S. The property is
+// target-independent — an RtFn becomes a call on every backend — but the modules
+// are not: a `linux/` provider cannot be emitted for Darwin nor a `darwin/` one
+// for Linux (the checker refuses `syscall` and `extern function` respectively,
+// even on an uncalled declaration). So the directory name selects the target,
+// and both object formats are read back. Fixing the target per module rather
+// than following the host is also what makes this gate fail IDENTICALLY
+// EVERYWHERE, the pattern #1421 established after a module-state alignment bug
+// that was correct on aarch64-macOS and wrong on ELF passed the whole
+// host-native golden suite. Nothing is linked or executed, so no `libbitrt.a` is
+// needed and there is no skip path: it runs on every host, always.
+//
+// NOT `--freestanding`, DELIBERATELY. `--freestanding` additionally refuses
+// unpinned imports and managed metadata, which several of these modules still
+// trip (E0078, #1434/#1421) — and none of that is what this gate is about. An
+// ordinary object carries the same relocations. The cost is the incidental
+// coverage described above, which is why coverage A attributes by source
+// directory instead of trusting whatever a module's object happens to contain.
+//
+// THE CONDITION IS SELF-REFERENCE, NOT "REFERENCES SOMETHING THIS OBJECT
+// DEFINES", and the distinction is the difference between a gate and a nuisance.
+// A first cut of the original checked the latter and reported
+// `m0$println -> bit_rt_string_concat` alongside the real findings. That is
+// correct code: the prelude calling into the runtime is the entire point of a
+// runtime. So is one runtime function calling another. Only a definition
+// reaching ITSELF is unconditionally a defect.
+//
+// WHAT THE PORT HAD TO REBUILD. The Zig original called `bit.buildProject`
+// in-process and handed the bytes to `bit.macho_reader`/`bit.elf_reader`.
+// Neither is reachable from a Bit program: `compiler/machoreader.bit` and
+// `compiler/elfreader.bit` are files of the compiler MODULE, and a `tests/bit/`
+// harness cannot import them. So this file carries its own object reader,
+// character-for-character the one in `tests/bit/stwwiring.bit` — TWO COPIES NOW
+// EXIST AND SHOULD BE CONSOLIDATED into a shared `tests/objread/` module the
+// moment a third is wanted.
+//
+// It reproduces `seed/link/object.zig`'s `atomizeModule` rule exactly, because
+// the rule IS the gate: an ATOM starts at each defined symbol and spans to the
+// NEXT defined symbol in the same section, and a relocation belongs to the atom
+// whose span contains its offset. A relocation names a symbol only when that
+// symbol is UNDEFINED or GLOBAL (`N_EXT` / non-`STB_LOCAL`), matching
+// `SymbolRef.global`; a reference to a local definition is `.local` and is
+// skipped, exactly as the Zig original skipped it.
+//
+// VACUITY IS THE FAILURE MODE THIS GATE IS MOST EXPOSED TO, and the original
+// measured three separate instances of it. Mach-O spells symbols with a leading
+// underscore, so for months the entire Darwin half matched zero names and
+// asserted NOTHING while reading green; the "did this examine anything" check
+// was global, which the working modules satisfied on behalf of the broken one;
+// and emptying the module list passed, because a per-module check cannot fire
+// for a module never visited. Hence, here: the symbol prefix is derived from the
+// target, every module must contribute at least one examined pinned definition,
+// BOTH object formats must have been exercised, and the discovered module and
+// pin counts carry floors so the examined set cannot be quietly emptied.
+
+import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { join } from "std/path"
+import { hasPrefix, indexOf, parseInt } from "std/strings"
+import { now } from "std/time"
+
+// The placeholder prefix the Stage-2 port pinned its ABI functions under, and
+// the real ABI prefix it became. Both are `bit_rt_` since #1369 landed, so
+// `renameOf` is the identity — see the header for why they are still two names.
+const placeholder: string = "bit_rt_"
+const real: string = "bit_rt_"
+
+// Per-child wall-clock limit, mirroring `tests/proc.zig`. A hang is a failure,
+// not a stall (#1637/#1652); the compiler is a child here, so it is bounded.
+const defaultTimeoutS: int = 300
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+// `osRunBounded`'s result encoding (ABI.md §19).
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+// Upper bound on symbols/relocations walked in one object — every walk provably
+// bounded (Power of 10 rule 2), two orders of magnitude above today's counts.
+const maxScan: int = 1048576
+
+// Target names as `bit build --target` spells them. Mach-O carries the C leading
+// underscore verbatim and ELF does not, so the target also selects the symbol
+// prefix — normalising that is what keeps a Darwin module from silently matching
+// nothing, the vacuity the original read green on for months.
+const tMacos: string = "aarch64-macos"
+const tLinux: string = "x86_64-linux"
+
+// Where the runtime tree lives, and how deep the walk may go. `runtime/` is two
+// levels (`runtime/net/linux`), so 2 covers it with the recursion still provably
+// bounded.
+const runtimeDir: string = "runtime"
+const maxDepth: int = 2
+
+// The pin syntax scanned for, and the marker that makes a line prose rather than
+// code. `runtime/root/floats.bit` documents the exact trap this gate guards by
+// QUOTING a pin inside a comment, so a scan that ignored comments would demand a
+// definition that deliberately does not exist.
+const pinMarker: string = "@symbol(\""
+const commentMarker: string = "//"
+
+// Floors on the examined set. Discovery cannot be emptied by editing this file,
+// but it CAN be emptied by deleting runtime source, and a gate that examines
+// nothing is the failure mode above. Today's tree gives 28 modules and 306 pins;
+// the floors sit below that so ordinary work does not trip them, and lowering
+// one is a deliberate act that says the runtime shrank.
+const minModules: int = 24
+const minPins: int = 280
+
+// Where the compiler binary and the tree under test live, so no function has to
+// thread them one parameter at a time.
+struct Cfg { bin: string, repo: string, timeoutMs: int }
+
+// One runtime module: the directory relative to the repository root, and the
+// target its sources can be emitted for.
+struct Mod { path: string, target: string }
+
+// ---------------------------------------------------------------------------
+// Discovering the modules and their pins
+// ---------------------------------------------------------------------------
+
+// A `linux/` module needs an ELF target and a `darwin/` one a Mach-O target,
+// because the checker refuses `syscall` for Darwin and `extern function` for
+// Linux even on an uncalled declaration. A platform-free module builds for
+// either; aarch64-macos is chosen so the underscore-spelling half of the reader
+// is exercised by the majority of the tree rather than by a lone entry.
+function targetFor(rel: string): string {
+  if (hasSuffix(rel, "/linux")) { return tLinux }
+  return tMacos
+}
+
+function hasSuffix(s: string, suf: string): bool {
+  if (len(suf) > len(s)) { return false }
+  return s[len(s) - len(suf):len(s)] == suf
+}
+
+function symPrefixFor(target: string): string {
+  if (target == tMacos) { return "_" }
+  return ""
+}
+
+function trimLeadingSpace(s: string): string {
+  let i = 0
+  while (i < len(s) && s[i:i + 1] == " ") {
+    i = i + 1
+  }
+  return s[i:len(s)]
+}
+
+// Every `bit_rt_*` name pinned by a line of `src` that is CODE. One pin per
+// line holds throughout this tree; a line whose first non-space characters are
+// `//` is prose and contributes nothing.
+function pinsInSrc(src: string, out: []string): []string {
+  let pos = 0
+  let lines = 0
+  while (pos < len(src) && lines < maxScan) {
+    lines = lines + 1
+    let rel = indexOf(src[pos:len(src)], "\n")
+    let line = src[pos:len(src)]
+    if (rel >= 0) {
+      line = src[pos:pos + rel]
+      pos = pos + rel + 1
+    } else {
+      pos = len(src)
+    }
+    let body = trimLeadingSpace(line)
+    if (hasPrefix(body, commentMarker)) { continue }
+    let at = indexOf(body, pinMarker)
+    if (at < 0) { continue }
+    let d = at + len(pinMarker)
+    let end = d
+    while (end < len(body) && body[end:end + 1] != "\"") {
+      end = end + 1
+    }
+    let name = body[d:end]
+    if (hasPrefix(name, placeholder)) { out = append(out, name) }
+  }
+  return out
+}
+
+// Every `bit_rt_*` pin in the `.bit` files directly inside `abs` — NOT
+// recursively, because a subdirectory is a different module (SPEC §17.1) and
+// crediting its pins here is exactly the incidental coverage this port refuses.
+function pinsOfDir(abs: string): []string {
+  let out = []string(0)
+  let names = readDir(abs) catch e {
+    eprint("rootpins: cannot list ${abs}: ${e.message()}\n")
+    return out
+  }
+  for name of names {
+    if (!hasSuffix(name, ".bit")) { continue }
+    let src = readFile(join(abs, name)) catch e {
+      eprint("rootpins: cannot read ${join(abs, name)}: ${e.message()}\n")
+      continue
+    }
+    out = pinsInSrc(src, out)
+  }
+  return out
+}
+
+// Every directory at or under `abs` that pins at least one ABI name, depth-first
+// and bounded by `depth`.
+function collectMods(abs: string, rel: string, out: []Mod, depth: int): []Mod {
+  if (depth < 0) { return out }
+  if (len(pinsOfDir(abs)) > 0) { out = append(out, Mod{ path: rel, target: targetFor(rel) }) }
+  let names = readDir(abs) catch e {
+    eprint("rootpins: cannot list ${abs}: ${e.message()}\n")
+    return out
+  }
+  for name of names {
+    let sub = join(abs, name)
+    if (!isDir(sub)) { continue }
+    out = collectMods(sub, join(rel, name), out, depth - 1)
+  }
+  return out
+}
+
+function discoverMods(repo: string): []Mod {
+  let root = join(repo, runtimeDir)
+  if (!isDir(root)) {
+    eprint("rootpins: not a directory: ${root} (set REPO)\n")
+    return []Mod(0)
+  }
+  return collectMods(root, runtimeDir, []Mod(0), maxDepth)
+}
+
+// ---------------------------------------------------------------------------
+// The object model: what a pin-cycle question needs, and nothing more
+// ---------------------------------------------------------------------------
+
+// One section, in whichever fields its format uses. Mach-O fills addr/size/
+// reloff/nreloc; ELF fills kind/addr/off/size/link/info.
+struct Sec { kind: int, addr: int, off: int, size: int, link: int, info: int, reloff: int, nreloc: int }
+
+// `sect` is -1 unless the symbol DEFINES an atom in a section of this object
+// (undefined, absolute and debug symbols anchor nothing); `value` is then the
+// section-relative offset it starts at. `isGlobal` is true when a relocation
+// against it resolves by NAME at link time rather than to a local atom.
+struct ObjSym { name: string, sect: int, value: int, isGlobal: bool }
+
+// One relocation that names a global symbol, addressed the way the raw object
+// addresses it: an offset within its own section.
+struct ObjReloc { sect: int, off: int, toSym: string }
+
+struct Obj { ok: bool, secs: []Sec, syms: []ObjSym, relocs: []ObjReloc }
+
+function badObj(): Obj {
+  return Obj{ ok: false, secs: []Sec(0), syms: []ObjSym(0), relocs: []ObjReloc(0) }
+}
+
+function objFail(msg: string): Obj {
+  eprint("rootpins: ${msg}\n")
+  return badObj()
+}
+
+// Every walk below is clamped to `maxScan` so it is provably bounded (Power of
+// 10 rule 2). A clamp that TRUNCATES a table would leave the gate examining less
+// than it thinks — the failure mode this whole file exists to prevent — so a
+// table at the bound is refused outright, as the Zig original's
+// `error.TooManySymbols` did.
+function objOversized(n: int, what: string): bool {
+  if (n < maxScan) { return false }
+  eprint("rootpins: ${what} holds ${n} entries, at or above the ${maxScan} scan bound\n")
+  return true
+}
+
+// Little-endian primitive reads, unaligned-safe by construction: nothing in a
+// relocatable object may assume an alignment wider than the field it reads.
+function rdU16(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8)
+}
+
+function rdU32(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8) | (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+}
+
+function rdU64(b: []u8, off: int): int {
+  return rdU32(b, off) | (rdU32(b, off + 4) << 32)
+}
+
+// The NUL-terminated name at `off` in a string table.
+function cstr(b: []u8, off: int): string {
+  if (off < 0 || off >= len(b)) { return "" }
+  let end = off
+  while (end < len(b) && end - off < maxScan && b[end] != u8(0)) {
+    end = end + 1
+  }
+  return string(b[off:end])
+}
+
+// ---------------------------------------------------------------------------
+// Mach-O 64 relocatable objects (aarch64-macos)
+// ---------------------------------------------------------------------------
+//
+// Sections are numbered from 1 across every LC_SEGMENT_64 in load-command order,
+// which is what `nlist_64.n_sect` indexes. A section's `addr` exists only so a
+// symbol's ADDRESS can be turned back into the section-relative offset that
+// `relocation_info.r_address` already is.
+
+// Byte offsets of every load command, or empty if the header is not one.
+function machoCmds(b: []u8): []int {
+  let out = []int(0)
+  if (len(b) < 32 || rdU32(b, 0) != 0xfeedfacf) { return out }
+  let ncmds = rdU32(b, 16)
+  let off = 32
+  let i = 0
+  while (i < ncmds && i < maxScan) {
+    if (off + 8 > len(b) || rdU32(b, off + 4) <= 0) { return []int(0) }
+    out = append(out, off)
+    off = off + rdU32(b, off + 4)
+    i = i + 1
+  }
+  return out
+}
+
+// Every section of every LC_SEGMENT_64 (0x19), in ordinal order.
+function machoSecs(b: []u8, cmds: []int): []Sec {
+  let secs = []Sec(0)
+  for c of cmds {
+    if (rdU32(b, c) != 0x19) { continue }
+    let nsects = rdU32(b, c + 64)
+    let i = 0
+    while (i < nsects && i < maxScan) {
+      let s = c + 72 + i * 80
+      secs = append(secs, Sec{ kind: 0, addr: rdU64(b, s + 32), off: 0,
+        size: rdU64(b, s + 40), link: 0, info: 0,
+        reloff: rdU32(b, s + 56), nreloc: rdU32(b, s + 60) })
+      i = i + 1
+    }
+  }
+  return secs
+}
+
+// One `nlist_64` at `n`. N_STAB (0xe0) is debug bookkeeping: it anchors no atom
+// and names no relocation target. N_TYPE (0x0e) == N_SECT is a definition;
+// anything else (N_UNDF, N_ABS, N_INDR) defines nothing here.
+function machoSym(b: []u8, strtab: []u8, n: int, secs: []Sec): ObjSym {
+  let ntype = int(b[n + 4])
+  let nsect = int(b[n + 5])
+  let stab = (ntype & 0xe0) != 0
+  let global = (!stab && (ntype & 0x0e) == 0) || (ntype & 0x01) != 0
+  let name = cstr(strtab, rdU32(b, n))
+  if (stab || (ntype & 0x0e) != 0x0e || nsect < 1 || nsect > len(secs)) {
+    return ObjSym{ name: name, sect: 0 - 1, value: 0, isGlobal: global }
+  }
+  return ObjSym{ name: name, sect: nsect - 1,
+    value: rdU64(b, n + 8) - secs[nsect - 1].addr, isGlobal: global }
+}
+
+// The LC_SYMTAB (0x2) symbols, rebased from address to section-relative offset.
+function machoSyms(b: []u8, cmds: []int, secs: []Sec): []ObjSym {
+  let syms = []ObjSym(0)
+  for c of cmds {
+    if (rdU32(b, c) != 0x2) { continue }
+    let symoff = rdU32(b, c + 8)
+    let nsyms = rdU32(b, c + 12)
+    let strtab = b[rdU32(b, c + 16):rdU32(b, c + 16) + rdU32(b, c + 20)]
+    let i = 0
+    while (i < nsyms && i < maxScan) {
+      syms = append(syms, machoSym(b, strtab, symoff + i * 16, secs))
+      i = i + 1
+    }
+  }
+  return syms
+}
+
+// Every relocation that names a global symbol. R_SCATTERED (bit 31 of the first
+// word) reinterprets the whole entry and never names an external symbol, so it
+// carries no edge; this compiler emits none, and skipping is defensive rather
+// than load-bearing. r_extern (bit 27) distinguishes "r_symbolnum is a symbol
+// index" from "r_symbolnum is a section ordinal".
+function machoRelocs(b: []u8, secs: []Sec, syms: []ObjSym): []ObjReloc {
+  let out = []ObjReloc(0)
+  let si = 0
+  while (si < len(secs)) {
+    let ri = 0
+    while (ri < secs[si].nreloc && ri < maxScan) {
+      let r = secs[si].reloff + ri * 8
+      let addr = rdU32(b, r)
+      let w = rdU32(b, r + 4)
+      ri = ri + 1
+      if ((addr & 0x80000000) != 0 || ((w >> 27) & 1) == 0) { continue }
+      let sn = w & 0xffffff
+      if (sn >= len(syms) || !syms[sn].isGlobal) { continue }
+      out = append(out, ObjReloc{ sect: si, off: addr, toSym: syms[sn].name })
+    }
+    si = si + 1
+  }
+  return out
+}
+
+function readMacho(b: []u8): Obj {
+  let cmds = machoCmds(b)
+  if (len(cmds) == 0) { return objFail("not a 64-bit little-endian Mach-O object") }
+  let secs = machoSecs(b, cmds)
+  if (len(secs) == 0) { return objFail("Mach-O object has no sections") }
+  for c of cmds {
+    if (rdU32(b, c) == 0x2 && objOversized(rdU32(b, c + 12), "the Mach-O symbol table")) {
+      return badObj()
+    }
+  }
+  for s of secs {
+    if (objOversized(s.nreloc, "a Mach-O relocation table")) { return badObj() }
+  }
+  let syms = machoSyms(b, cmds, secs)
+  if (len(syms) == 0) { return objFail("Mach-O object has no symbol table") }
+  return Obj{ ok: true, secs: secs, syms: syms, relocs: machoRelocs(b, secs, syms) }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 relocatable objects (x86_64-linux)
+// ---------------------------------------------------------------------------
+//
+// `sh_info` of an SHT_RELA section names the section it relocates and `r_offset`
+// is an offset inside that section — already the atomizer's coordinate system,
+// so nothing needs rebasing beyond `sh_addr` (0 in ET_REL).
+
+function elfSecs(b: []u8): []Sec {
+  let out = []Sec(0)
+  if (len(b) < 64 || b[0] != u8(0x7f) || b[1] != u8(0x45) || b[2] != u8(0x4c) ||
+      b[3] != u8(0x46) || b[4] != u8(2) || b[5] != u8(1)) {
+    return out
+  }
+  let shoff = rdU64(b, 0x28)
+  let shentsize = rdU16(b, 0x3a)
+  let shnum = rdU16(b, 0x3c)
+  let i = 0
+  while (i < shnum && i < maxScan) {
+    let s = shoff + i * shentsize
+    out = append(out, Sec{ kind: rdU32(b, s + 4), addr: rdU64(b, s + 16),
+      off: rdU64(b, s + 24), size: rdU64(b, s + 32), link: rdU32(b, s + 40),
+      info: rdU32(b, s + 44), reloff: 0, nreloc: 0 })
+    i = i + 1
+  }
+  return out
+}
+
+// The SHT_SYMTAB (2) symbols. STT_SECTION (3) names a section, not a definition,
+// and STT_FILE (4) names nothing at all; both would otherwise split an atom at
+// offset 0 and steal its relocations. SHN_ABS and up (0xff00) are not section
+// indices. An unnamed symbol anchors no atom for the same reason `atomizeModule`
+// identifies an atom by its symbol's name.
+function elfSym(b: []u8, strtab: []u8, e: int, secs: []Sec): ObjSym {
+  let name = cstr(strtab, rdU32(b, e))
+  let info = int(b[e + 4])
+  let shndx = rdU16(b, e + 6)
+  let kind = info & 0x0f
+  let global = shndx == 0 || (info >> 4) != 0
+  if (shndx < 1 || shndx >= len(secs) || kind == 3 || kind == 4 || len(name) == 0) {
+    return ObjSym{ name: name, sect: 0 - 1, value: 0, isGlobal: global }
+  }
+  return ObjSym{ name: name, sect: shndx, value: rdU64(b, e + 8) - secs[shndx].addr,
+    isGlobal: global }
+}
+
+function elfSyms(b: []u8, secs: []Sec, symIdx: int): []ObjSym {
+  let syms = []ObjSym(0)
+  let strIdx = secs[symIdx].link
+  if (strIdx <= 0 || strIdx >= len(secs)) { return syms }
+  let strtab = b[secs[strIdx].off:secs[strIdx].off + secs[strIdx].size]
+  let n = 0
+  while (n < secs[symIdx].size / 24 && n < maxScan) {
+    syms = append(syms, elfSym(b, strtab, secs[symIdx].off + n * 24, secs))
+    n = n + 1
+  }
+  return syms
+}
+
+// Every SHT_RELA (4) entry that names a global symbol. `r_info` is 8 bytes at
+// +8; the symbol index is its high half, at +12.
+function elfRelocs(b: []u8, secs: []Sec, syms: []ObjSym): []ObjReloc {
+  let out = []ObjReloc(0)
+  let i = 0
+  while (i < len(secs)) {
+    let tgt = secs[i].info
+    if (secs[i].kind != 4 || tgt <= 0 || tgt >= len(secs)) {
+      i = i + 1
+      continue
+    }
+    let j = 0
+    while (j < secs[i].size / 24 && j < maxScan) {
+      let r = secs[i].off + j * 24
+      let sym = rdU32(b, r + 12)
+      j = j + 1
+      if (sym >= len(syms) || !syms[sym].isGlobal || len(syms[sym].name) == 0) { continue }
+      out = append(out, ObjReloc{ sect: tgt, off: rdU64(b, r), toSym: syms[sym].name })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function readElf(b: []u8): Obj {
+  let secs = elfSecs(b)
+  if (len(secs) == 0) { return objFail("not a 64-bit little-endian ELF object") }
+  // A missing .symtab is a parse FAILURE, never an empty symbol list: an empty
+  // list would make every pinned definition unexaminable and the whole module
+  // pass for the wrong reason.
+  let symIdx = 0 - 1
+  let k = 0
+  while (k < len(secs)) {
+    if (secs[k].kind == 2) { symIdx = k }
+    k = k + 1
+  }
+  if (symIdx < 0) { return objFail("ELF object has no .symtab") }
+  if (objOversized(secs[symIdx].size / 24, "the ELF symbol table")) { return badObj() }
+  for s of secs {
+    if (s.kind == 4 && objOversized(s.size / 24, "an ELF relocation table")) { return badObj() }
+  }
+  let syms = elfSyms(b, secs, symIdx)
+  if (len(syms) == 0) { return objFail("ELF .symtab is empty or has no string table") }
+  return Obj{ ok: true, secs: secs, syms: syms, relocs: elfRelocs(b, secs, syms) }
+}
+
+// ---------------------------------------------------------------------------
+// The pin-cycle check
+// ---------------------------------------------------------------------------
+
+// The end of the atom starting at (`sect`, `start`): the next defined symbol's
+// offset in the same section, or the section's size. `atomizeModule`'s rule —
+// span to the NEXT SYMBOL, never to a declared size, because any padding between
+// them still carries relocations that must belong to some atom.
+function atomEnd(o: Obj, sect: int, start: int): int {
+  let end = o.secs[sect].size
+  let i = 0
+  while (i < len(o.syms)) {
+    if (o.syms[i].sect == sect && o.syms[i].value > start && o.syms[i].value < end) {
+      end = o.syms[i].value
+    }
+    i = i + 1
+  }
+  return end
+}
+
+// `bit_rt_root_host_target` -> `<sp>bit_rt_host_target`, where `sp` is the
+// object format's symbol prefix (`_` on Mach-O). `bare` must already have that
+// prefix stripped. BUILT, not sliced: `bit_rt_` and `host_target` are not
+// contiguous in `bit_rt_root_host_target`, and a slice that looked right on one
+// prefix pair would silently mis-derive on another.
+function renameOf(sp: string, bare: string): string {
+  return "${sp}${real}${bare[len(placeholder):len(bare)]}"
+}
+
+// Fails the module on any post-rename self-reference. `counts[0]` accumulates
+// the pinned ABI definitions examined, so a module that matched nothing can be
+// reported as the vacuity it is rather than passing.
+function checkSelfRef(m: Mod, sp: string, o: Obj, counts: []int): int {
+  let failures = 0
+  let i = 0
+  while (i < len(o.syms) && i < maxScan) {
+    let s = o.syms[i]
+    i = i + 1
+    if (s.sect < 0 || !s.isGlobal || !hasPrefix(s.name, sp)) { continue }
+    let bare = s.name[len(sp):len(s.name)]
+    if (!hasPrefix(bare, placeholder)) { continue }
+    counts[0] = counts[0] + 1
+    // `ObjReloc.toSym` is the linker's own view of the call target — the name
+    // codegen actually emitted, not the name the source spelled — which is what
+    // makes this gate see through the primitive -> RtFn -> symbol indirection
+    // that no source scan can follow.
+    let renamed = renameOf(sp, bare)
+    let end = atomEnd(o, s.sect, s.value)
+    let j = 0
+    while (j < len(o.relocs) && j < maxScan) {
+      let r = o.relocs[j]
+      j = j + 1
+      if (r.toSym != renamed || r.sect != s.sect) { continue }
+      if (r.off < s.value || r.off >= end) { continue }
+      eprint("rootpins: ${m.path}: '${s.name}' references '${r.toSym}'.\n" +
+        "  These are ONE symbol, so the call is unbounded self-recursion in every\n" +
+        "  binary that links this runtime. The reference is almost certainly a Bit\n" +
+        "  primitive that lowers to this RtFn (compiler/lowerprim.bit's primRtName\n" +
+        "  and compiler/codegen.bit's rtSymbol): the primitive IS this function, so\n" +
+        "  it cannot implement it.\n")
+      failures = failures + 1
+    }
+  }
+  return failures
+}
+
+// COVERAGE A. Every pin the module's own sources declare must come back as a
+// defined global in the module's own object. A pin that does not is either a
+// definition that moved to a directory this walk never reached, or a spelling
+// the reader no longer matches — both are holes, and both used to be silence.
+function checkPinsDefined(m: Mod, sp: string, o: Obj, pins: []string): int {
+  let missing = 0
+  for p of pins {
+    let want = "${sp}${p}"
+    let found = false
+    let i = 0
+    while (i < len(o.syms) && i < maxScan) {
+      if (o.syms[i].sect >= 0 && o.syms[i].isGlobal && o.syms[i].name == want) { found = true }
+      i = i + 1
+    }
+    if (found) { continue }
+    eprint("rootpins: ${m.path}: pins '${p}' but its object defines no such global " +
+      "('${want}'). The gate examined nothing for that name, which is a failure and " +
+      "not a pass — the definition moved, the pin is dead, or the symbol prefix for " +
+      "${m.target} is wrong.\n")
+    missing = missing + 1
+  }
+  return missing
+}
+
+// COVERAGE B. Every `bit_rt_*` name this object emits a relocation to must be a
+// pin some examined module declares. A target that is not is a symbol the
+// compiler can call and this gate never looked at — precisely the hole a
+// hand-maintained module list leaves behind.
+function checkTargetsCovered(m: Mod, sp: string, o: Obj, pinned: map<string, bool>): int {
+  let holes = 0
+  let seen = map<string, bool>{}
+  let i = 0
+  while (i < len(o.relocs) && i < maxScan) {
+    let t = o.relocs[i].toSym
+    i = i + 1
+    if (!hasPrefix(t, sp)) { continue }
+    let bare = t[len(sp):len(t)]
+    if (!hasPrefix(bare, real) || pinned[bare] || seen[bare]) { continue }
+    seen[bare] = true
+    eprint("rootpins: ${m.path}: calls '${bare}', which no examined module pins.\n" +
+      "  Either a runtime module defining it is outside ${runtimeDir}/ (so this gate " +
+      "never emitted it and cannot say whether it calls itself), or nothing defines it " +
+      "at all and the link is about to fail.\n")
+    holes = holes + 1
+  }
+  return holes
+}
+
+// ---------------------------------------------------------------------------
+// Emitting the objects
+// ---------------------------------------------------------------------------
+
+// Compiles `<repo>/<path>` for its target as a relocatable object and parses it.
+// NOT `--freestanding` — see the header.
+function loadObject(c: Cfg, m: Mod, idx: int): Obj {
+  let dir = join(c.repo, m.path)
+  if (!isDir(dir)) { return objFail("not a module directory: ${dir} (set REPO)") }
+  let base = "/tmp/bit-rootpins-${now()}-${idx}"
+  let obj = "${base}.o"
+  let cmd = "exec \"${c.bin}\" build \"${dir}\" --emit-obj " +
+    "--target ${m.target} -o \"${obj}\""
+  let rc = runBounded("${base}.sh", "${base}.log", cmd, c.timeoutMs)
+  if (rc != 0) {
+    reportChild("${m.path} (${m.target})", rc, "${base}.log")
+    fsRemove(obj)
+    return badObj()
+  }
+  fsRemove("${base}.log")
+  let raw = readFile(obj) catch e {
+    fsRemove(obj)
+    return objFail("cannot read emitted object ${obj}: ${e.message()}")
+  }
+  fsRemove(obj)
+  if (m.target == tMacos) { return readMacho([]u8(raw)) }
+  return readElf([]u8(raw))
+}
+
+// Writes `cmd` into an executable `/bin/sh` script and runs it under a deadline.
+// The script exists only because `osRunBounded` takes a path and NO argv
+// (ABI.md §19), so a command WITH arguments cannot be expressed directly.
+function runBounded(script: string, log: string, cmd: string, timeoutMs: int): int {
+  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
+    eprint("rootpins: cannot write ${script}: ${e.message()}\n")
+    return rcSpawnFailed
+  }
+  if (fsChmod(script, 493) != 0) {
+    eprint("rootpins: cannot make ${script} executable\n")
+    fsRemove(script)
+    return rcSpawnFailed
+  }
+  let r = osRunBounded(script, timeoutMs)
+  fsRemove(script)
+  return r
+}
+
+// Names a failed child on stderr. A timeout and a crash are distinct outcomes:
+// scoring a segfault as a timeout sends the reader hunting the wrong bug.
+function reportChild(what: string, r: int, log: string) {
+  if (r == rcTimedOut) {
+    eprint("rootpins: ${what}: TIMED OUT at the ${timeoutEnvVar} deadline\n")
+  } else if (r <= rcSignalBase) {
+    eprint("rootpins: ${what}: compiler CRASHED — ${signalName(0 - r + rcSignalBase)}\n")
+  } else if (r == rcSpawnFailed) {
+    eprint("rootpins: ${what}: could not spawn the compiler\n")
+  } else {
+    eprint("rootpins: ${what}: compiler exited with ${r}\n")
+  }
+  let text = readFile(log) catch _ {
+    ""
+  }
+  if (len(text) > 0) { eprint("--- ${what} ---\n${text}\n") }
+  fsRemove(log)
+}
+
+// The signal numbers worth naming, as `tests/proc.zig`'s `signalName` does.
+function signalName(sig: int): string {
+  if (sig == 4) { return "SIGILL (4)" }
+  if (sig == 6) { return "SIGABRT (6)" }
+  if (sig == 8) { return "SIGFPE (8)" }
+  if (sig == 9) { return "SIGKILL (9)" }
+  if (sig == 10) { return "SIGBUS (10)" }
+  if (sig == 11) { return "SIGSEGV (11)" }
+  return "signal ${sig}"
+}
+
+// The per-child limit in seconds, clamped into [1, maxTimeoutS] so a typo can
+// neither disable the deadline nor make it useless.
+function timeoutSeconds(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) { return defaultTimeoutS }
+  let n = parseInt(raw) catch _ {
+    eprint("rootpins: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS
+  }
+  if (n < 1) { return 1 }
+  if (n > maxTimeoutS) { return maxTimeoutS }
+  return n
+}
+
+// ---------------------------------------------------------------------------
+
+// The union of every module's pins, as a set — the authority coverage B checks
+// relocation targets against.
+function pinSet(c: Cfg, mods: []Mod, total: []int): map<string, bool> {
+  let set = map<string, bool>{}
+  for m of mods {
+    for p of pinsOfDir(join(c.repo, m.path)) {
+      total[0] = total[0] + 1
+      set[p] = true
+    }
+  }
+  return set
+}
+
+// Emits and checks every module. `counts` carries [modules examined, Mach-O
+// modules, ELF modules] so `main` can prove both readers ran.
+function runMods(c: Cfg, mods: []Mod, pinned: map<string, bool>, counts: []int): int {
+  let failed = 0
+  let idx = 0
+  for m of mods {
+    idx = idx + 1
+    let sp = symPrefixFor(m.target)
+    let o = loadObject(c, m, idx)
+    if (!o.ok) {
+      eprint("rootpins: could not read the object for ${m.path} (${m.target}); its " +
+        "pins are UNCHECKED\n")
+      return 0 - 1
+    }
+    let examined = [0]
+    failed = failed + checkSelfRef(m, sp, o, examined)
+    failed = failed + checkPinsDefined(m, sp, o, pinsOfDir(join(c.repo, m.path)))
+    failed = failed + checkTargetsCovered(m, sp, o, pinned)
+    // PER MODULE, not once for the whole run. A global "at least one module
+    // contributed" check is satisfied by the working modules while a broken one
+    // silently examines nothing — which is exactly how the original's Darwin
+    // half read green for months.
+    if (examined[0] == 0) {
+      eprint("rootpins: ${m.path}: contributed no pinned ABI definitions — the gate " +
+        "examined nothing. Either the module stopped pinning ABI names or symbol " +
+        "spelling changed and the '${sp}${placeholder}' prefix test no longer matches.\n")
+      failed = failed + 1
+    }
+    counts[0] = counts[0] + 1
+    if (m.target == tMacos) { counts[1] = counts[1] + 1 } else { counts[2] = counts[2] + 1 }
+  }
+  return failed
+}
+
+function main() {
+  let c = Cfg{ bin: envOr("BIT", "zig-out/bin/bit"), repo: envOr("REPO", "."),
+    timeoutMs: timeoutSeconds() * 1000 }
+  if (!exists(c.bin)) {
+    eprint("rootpins: compiler not found: ${c.bin} (set BIT)\n")
+    exit(1)
+    return
+  }
+  let mods = discoverMods(c.repo)
+  // An empty list makes the loop below a no-op and the whole gate a green no-op
+  // with it — measured on the original, which passed with `modules` emptied
+  // because a per-module vacuity check cannot fire for a module never visited.
+  if (len(mods) < minModules) {
+    eprint("rootpins: discovered ${len(mods)} pinning modules under ${runtimeDir}/, floor " +
+      "is ${minModules}. The examined set shrank: either the walk stopped finding " +
+      "modules (depth, permissions, a moved tree) or runtime source was deleted. " +
+      "Lowering the floor is the deliberate way to say the runtime got smaller.\n")
+    exit(1)
+    return
+  }
+  let total = [0]
+  let pinned = pinSet(c, mods, total)
+  if (total[0] < minPins) {
+    eprint("rootpins: found ${total[0]} pinned ABI names, floor is ${minPins}. Same " +
+      "reasoning as the module floor: a gate that examines less than it used to must " +
+      "say so.\n")
+    exit(1)
+    return
+  }
+  let counts = [0, 0, 0]
+  let failed = runMods(c, mods, pinned, counts)
+  if (failed < 0) {
+    exit(1)
+    return
+  }
+  // Both readers must have run. The original's whole Darwin half asserted
+  // nothing for months while the suite stayed green, so "some modules passed" is
+  // not evidence that both object formats were exercised.
+  if (counts[1] == 0 || counts[2] == 0) {
+    eprint("rootpins: examined ${counts[1]} Mach-O and ${counts[2]} ELF modules — one " +
+      "object format was never read, so half this gate asserted nothing\n")
+    failed = failed + 1
+  }
+  if (failed > 0) {
+    eprint("rootpins: FAILED — ${failed} finding(s)\n")
+    exit(1)
+    return
+  }
+  print("${counts[0]} runtime modules (${counts[1]} Mach-O, ${counts[2]} ELF), " +
+    "${total[0]} pinned ABI names: no definition references itself\n")
+}
