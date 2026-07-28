@@ -1,0 +1,332 @@
+// `bit version` — the Bit-native port of tests/version.zig (#1451, #1827).
+//
+// The property, in one sentence: the shipped `bit` binary's argv dispatch emits
+// a version line ONLY for a real version request, and anything it does not
+// recognize is a usage error that prints NOTHING on stdout.
+//
+// Two defects this guards, both of which shipped:
+//
+//  1. There was no real `version` subcommand. `bit version` only APPEARED to
+//     work because every unrecognized argument fell through to the banner,
+//     which happens to carry a version string — so `bit vresion` behaved
+//     identically. Asserting the happy path alone still passes against that
+//     bug, so the typo case is asserted too: usage error, empty stdout.
+//  2. `bit` with no arguments ran the in-Bit self-check suite: a user who typed
+//     `bit` got lock-file test fixtures on stdout ("pmlock check: no stale
+//     fixture to remove") and a wait long enough to look like a hang. Selfcheck
+//     also exits 0 on success, so the exit code alone would not catch it.
+//
+// WHY THE EXPECTED STRING IS PARSED OUT OF compiler/version.bit AND NOT TAKEN
+// FROM A COMPILED-IN CONSTANT. This program could import the toolchain's own
+// `bitVersion` and compare the binary's output to it — but that constant is
+// compiled into the very binary under test, so the comparison would be
+// tautological with respect to the version VALUE. Re-parsing the checked-in
+// source of truth (the same dumb one-line parse build.zig does) keeps the two
+// sides independent, which is what caught the seed/self-hosted skew.
+//
+// WHY A GENERATED /bin/sh SCRIPT. ABI.md §19 gives Bit `os_run_bounded(path,
+// timeout_ms)` and nothing else — no argv, no stdout capture. Redirection and
+// arguments therefore have to come from a shell. `exec` is load-bearing: it
+// makes the script's exit status BE the child's, which is the only way exit 2
+// reaches this program unmasked.
+//
+// WHY THE BINARY IS COPIED BEFORE BEING RUN. The self-hosted `bit` is rewritten
+// in place by a `has_side_effects` build step, so a concurrent build truncates
+// the file mid-exec (#1644). The per-run nonce in the scratch path is #1828's
+// fix for the fixed-/tmp-path race.
+//
+// HOW TO RUN: `bit run tests/bit/version.bit` FROM THE REPO ROOT. The `std/*`
+// imports below resolve against the cwd (or BIT_STDLIB), so another cwd is an
+// E0045 compile error, not a silent skip — but a driver must still set the cwd,
+// or BIT_REPO for the subject and BIT_STDLIB for the imports.
+//
+// DROPPED ON PURPOSE, NOT LOST: the Zig original also compared the seed's
+// output byte-for-byte against the self-hosted one, and took its expected
+// string from `build_options` so that a `-Dversion=` release build was covered.
+// Both die with Zig — the seed is retiring, and `-Dversion=` exists only in
+// build.zig. Re-pointing this check at a release-stamped binary is owed work on
+// dist/release.sh, not on this file.
+
+import { readFile, writeFile, exists, mkdir } from "std/fs"
+import { contains, indexOf, hasPrefix, trimSpace, split, join } from "std/strings"
+import { env } from "std/os"
+
+// Wall clock for one `bit version`-class invocation. Milliseconds each in
+// practice; 30s is ~4 orders of magnitude of headroom, and a bound is what
+// stops a wedged child from hanging the gate forever (ABI.md §19, #1637/#1652).
+const runTimeoutMs: i64 = 30000
+
+// One CLI invocation and everything asserted about it. `argv` is spliced into
+// the generated script verbatim, so it must stay shell-literal (it is).
+struct Case {
+  name: string
+  argv: string
+  wantExit: i64
+  wantStdout: string
+  wantErrSub: string
+  wantAbsent: string
+}
+
+// Setup failures are never a pass. Every one of them ends the process nonzero
+// rather than leaving a case unrun — a skipped case is a green test, which is
+// exactly the vacuity this file exists to avoid.
+function die(msg: string) {
+  eprint("version: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+function slurp(path: string, what: string): string {
+  if (!exists(path)) {
+    die("${what}: missing: ${path}")
+  }
+  return readFile(path) catch e {
+    die("${what}: ${path}: ${e.message()}")
+    ""
+  }
+}
+
+function spill(path: string, content: string, what: string) {
+  writeFile(path, content) catch e {
+    die("${what}: ${path}: ${e.message()}")
+  }
+}
+
+// 8 bytes of OS entropy, the same scheme compiler/build.bit uses for scratch
+// paths it writes and then execs. A timestamp is not enough: two processes CAN
+// read the same nanosecond, they cannot draw the same 64-bit nonce.
+function nonce(): uint {
+  let b = []byte(cryptoRandomBytes(8))
+  let x: uint = 0
+  let i = 0
+  while (i < 8) {
+    x = (x << 8) | uint(b[i])
+    i = i + 1
+  }
+  return x
+}
+
+// The repo root: the nearest ancestor that holds BOTH the built compiler and
+// the version source. Not finding one is a hard failure, never a skip — a
+// harness that quietly returns when it cannot find its subject is the shape
+// that made the Zig original's two `if (selfhost_bit.len == 0) return;` early
+// exits invisible.
+//
+// BIT_REPO overrides it, for a runner with a different cwd and, deliberately,
+// as the mutation seam: pointing this at a fixture root is how the assertions
+// below get proven against a deliberately broken `bit` without touching the
+// real one.
+function repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/zig-out/bin/bit") && exists("${c}/compiler/version.bit")) {
+      return c
+    }
+  }
+  die("cannot locate the repo root from this cwd; set BIT_REPO")
+  return ""
+}
+
+// The checked-in version: the one DECLARATION line shaped
+// `const bitVersion: string = "..."`.
+//
+// Line-based, comment lines skipped, exactly as build.zig's readVersionBit is —
+// and for the same reason it learned: compiler/version.bit documents its own
+// required shape, so a whole-file `indexOf` matches the DOC COMMENT first and
+// yields the literal `...` as the version. It did that here too on the first
+// attempt. A shape change must fail loudly rather than silently yield "".
+function stampedVersion(root: string): string {
+  let src = slurp("${root}/compiler/version.bit", "version source")
+  let marker = "const bitVersion: string = \""
+  for line of split(src, "\n") {
+    let t = trimSpace(line)
+    if (hasPrefix(t, "//")) {
+      continue
+    }
+    if (!hasPrefix(t, marker)) {
+      continue
+    }
+    let rest = t[len(marker):]
+    let end = indexOf(rest, "\"")
+    if (end <= 0) {
+      die("compiler/version.bit: unterminated or empty version literal")
+    }
+    return rest[:int(end)]
+  }
+  die("compiler/version.bit lost its `const bitVersion: string = \"...\"` declaration")
+  return ""
+}
+
+// The child's exit status, or -1 after reporting why there is none.
+//
+// ABI.md §19 packs three outcomes into one i64 alongside the exit code. Folding
+// any of them into "nonzero, therefore a usage error" is what would let a child
+// that never ran satisfy this file's exit-2 assertions, so each is named.
+function decodeRun(name: string, r: i64): i64 {
+  if (r >= 0) {
+    return r
+  }
+  if (r == -1) {
+    eprint("version: FAIL ${name}: spawn failed (fork/exec/wait error)\n")
+  } else if (r == -2) {
+    eprint("version: FAIL ${name}: TIMED OUT after ${runTimeoutMs}ms\n")
+  } else if (r <= -100) {
+    eprint("version: FAIL ${name}: killed by signal ${-r - 100}\n")
+  } else {
+    eprint("version: FAIL ${name}: unknown os_run_bounded result ${r}\n")
+  }
+  return -1
+}
+
+// Generates the redirection script for `c` and runs it, bounded. `exec` is
+// load-bearing: it makes the script's exit status BE the child's, which is the
+// only way exit 2 reaches this program unmasked.
+function spawnCase(bin: string, dir: string, c: Case): i64 {
+  let script = "${dir}/run-${c.name}.sh"
+  let out = "${dir}/out-${c.name}"
+  let err = "${dir}/err-${c.name}"
+  spill(script, "#!/bin/sh\nexec '${bin}' ${c.argv} >'${out}' 2>'${err}'\n", "script")
+  if (fsChmod(script, 493) != 0) {
+    die("chmod ${script}")
+  }
+  return decodeRun(c.name, osRunBounded(script, runTimeoutMs))
+}
+
+// Every assertion about one case's observed behaviour. All of them are checked
+// even after the first miss: a case that fails on three counts is a different
+// diagnosis from one that fails on one.
+function checkStreams(c: Case, code: i64, gotOut: string, gotErr: string): bool {
+  let ok = true
+  if (code != c.wantExit) {
+    eprint("version: FAIL ${c.name}: exited ${code}, want ${c.wantExit}\n")
+    ok = false
+  }
+  if (gotOut != c.wantStdout) {
+    eprint("version: FAIL ${c.name}: stdout was ${jsonish(gotOut)}, want ${jsonish(c.wantStdout)}\n")
+    ok = false
+  }
+  if (len(c.wantErrSub) > 0 && !contains(gotErr, c.wantErrSub)) {
+    eprint("version: FAIL ${c.name}: stderr lacks \"${c.wantErrSub}\"; got ${jsonish(gotErr)}\n")
+    ok = false
+  }
+  if (len(c.wantAbsent) > 0 && contains(gotOut, c.wantAbsent)) {
+    eprint("version: FAIL ${c.name}: stdout contains \"${c.wantAbsent}\"\n")
+    ok = false
+  }
+  if (len(c.wantAbsent) > 0 && contains(gotErr, c.wantAbsent)) {
+    eprint("version: FAIL ${c.name}: stderr contains \"${c.wantAbsent}\"\n")
+    ok = false
+  }
+  return ok
+}
+
+// Runs one case against `bin` and returns whether it held. Every failure names
+// the case; nothing is folded into a bare "nonzero".
+function runCase(bin: string, dir: string, c: Case): bool {
+  let code = spawnCase(bin, dir, c)
+  if (code < 0) {
+    return false
+  }
+  // Existence is asserted before reading: an absent capture file is exactly the
+  // shape that makes `stdout == ""` true for a process that never ran, and
+  // `readFile(...) catch ""` would launder it into a pass.
+  let out = "${dir}/out-${c.name}"
+  let err = "${dir}/err-${c.name}"
+  if (!exists(out)) {
+    eprint("version: FAIL ${c.name}: no stdout capture at ${out}\n")
+    return false
+  }
+  if (!exists(err)) {
+    eprint("version: FAIL ${c.name}: no stderr capture at ${err}\n")
+    return false
+  }
+  return checkStreams(c, code, slurp(out, "stdout capture"), slurp(err, "stderr capture"))
+}
+
+// A one-line, newline-escaped rendering, so a diff of captured output stays on
+// one line and an empty capture is visibly empty rather than invisible.
+//
+// split/join rather than a byte loop on purpose: `[]byte([ch])` does NOT build a
+// one-byte slice, it is `[]T(n)`'s MAKE form with the slice as the length, so it
+// asks for a multi-gigabyte allocation and hangs. That is a checker hole worth a
+// ticket; it is not this file's business to work around it in a loop.
+function jsonish(s: string): string {
+  return "\"" + join(split(s, "\n"), "\\n") + "\""
+}
+
+// Removes exactly what this run created — a 3 MB binary copy per run adds up on
+// a shared /tmp. Best-effort by design: a leftover file in a uniquely named
+// directory is harmless, and failing the gate over cleanup would report the
+// wrong thing.
+function sweep(dir: string, cases: []Case) {
+  for c of cases {
+    fsRemove("${dir}/run-${c.name}.sh")
+    fsRemove("${dir}/out-${c.name}")
+    fsRemove("${dir}/err-${c.name}")
+  }
+  fsRemove("${dir}/bit")
+  fsRemove(dir)
+}
+
+function main() {
+  let root = repoRoot()
+  let want = stampedVersion(root)
+  if (len(want) == 0) {
+    die("the parsed version is empty")
+  }
+
+  let src = "${root}/zig-out/bin/bit"
+  let dir = "/tmp/bit-versioncheck-${nonce()}"
+  mkdir(dir) catch e {
+    die("mkdir ${dir}: ${e.message()}")
+  }
+  // Copied, never exec'd in place: the self-hosted `bit` is rewritten by a
+  // build step, and a truncated binary execs with no output — which the empty-
+  // stdout assertions would happily accept.
+  let bin = "${dir}/bit"
+  spill(bin, slurp(src, "compiler under test"), "binary copy")
+  if (fsChmod(bin, 493) != 0) {
+    die("chmod ${bin}")
+  }
+
+  let want0 = "bit ${want}\n"
+  let cases = [
+    Case{ name: "version", argv: "version", wantExit: 0,
+      wantStdout: want0, wantErrSub: "", wantAbsent: "" },
+    Case{ name: "long-flag", argv: "--version", wantExit: 0,
+      wantStdout: want0, wantErrSub: "", wantAbsent: "" },
+    Case{ name: "short-flag", argv: "-V", wantExit: 0,
+      wantStdout: want0, wantErrSub: "", wantAbsent: "" },
+    // The original bug: this printed the banner on stdout and exited 0.
+    Case{ name: "typo", argv: "vresion", wantExit: 2,
+      wantStdout: "", wantErrSub: "unknown subcommand", wantAbsent: "" },
+    // #1827. "pmlock check" is the exact fixture line a user reported seeing —
+    // named rather than implied, so this fails loudly if any self-check output
+    // ever reaches a bare invocation again.
+    Case{ name: "no-args", argv: "", wantExit: 2,
+      wantStdout: "", wantErrSub: "usage: bit", wantAbsent: "pmlock check" },
+  ]
+  // An empty (or shortened) case list is a green run that proves nothing.
+  assert(len(cases) == 5)
+
+  let failed = 0
+  for c of cases {
+    if (!runCase(bin, dir, c)) {
+      failed = failed + 1
+    }
+  }
+
+  if (failed != 0) {
+    // The scratch dir is deliberately LEFT BEHIND on failure: the copied binary
+    // and the exact captured streams are the evidence, and they are what a
+    // reader needs before deciding whether the compiler or the gate is wrong.
+    eprint("version: FAILED ${failed}/${len(cases)} case(s) against ${src} (version ${want})\n")
+    eprint("version: captures kept in ${dir}\n")
+    osExit(1)
+  }
+  sweep(dir, cases)
+  print("version: ok — ${len(cases)} cases, `bit ${want}` from compiler/version.bit\n")
+}

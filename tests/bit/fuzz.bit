@@ -1,0 +1,429 @@
+// Mutation fuzzer + saved-crash replay for the compiler front end, in Bit.
+//
+// Replaces tests/fuzz/{guard,mutate,fuzz,crash_regression}.zig. The invariant is
+// unchanged: the front end TERMINATES on arbitrary bytes. Every input either
+// compiles or produces diagnostics - never a fatal signal, never a hang.
+//
+// SMOKE TEST, NOT A FUZZ CAMPAIGN. The Zig version called `bit.parseReport`
+// in-process, tens of thousands of inputs per second. Nothing in compiler/*.bit
+// is `export`ed and compiler/main.bit declares `main()`, so no Bit program
+// outside that directory can reach the lexer or parser. Until a `bit fuzz` verb
+// exists (compiler/fuzzloop.bit + a dispatch entry in main.bit), each mutant
+// costs one fork+exec of `bit check`: measured ~22 inputs/second over the real
+// tests/cases corpus on aarch64-macos, so a 60s run is ~1300 inputs. Treat the
+// number it prints as a smoke count, not fuzzer throughput.
+//
+// The bound on every child is `osRunBounded` (ABI.md §19), not a signal handler
+// and a watchdog thread: the runtime already polls `waitpid` against one
+// absolute deadline, SIGKILLs an overrunner and reaps it, and reports crash,
+// timeout and spawn failure as three distinct values. guard.zig's 90 lines of
+// async-signal-safe handler collapse into reading that return code.
+//
+// The mutant is written to disk BEFORE it is parsed, which is what made
+// guard.zig's static `crash_buf` necessary and now makes it unnecessary: the
+// input that killed the child is already a file when the child dies.
+//
+// NOTHING HERE IS FALLIBLE, ON PURPOSE. An error reaching the boundary of a
+// `main(): ()!` is swallowed by the runtime: the process prints nothing and
+// EXITS 0. The first draft of this file was written that way and a missing seed
+// corpus produced a silent, green, zero-iteration run - the exact vacuity this
+// harness exists to refuse. So every fallible call is handled at its call site
+// and routed through `die`, and `main` is not fallible.
+//
+// CONFIGURATION IS ENVIRONMENT, NOT ARGV. `bit run` forwards no arguments
+// (compiler/main.bit:220 calls `runCmd(a[2])`), so build_options' baked-in
+// absolute paths become env vars with cwd-relative defaults. Run it from the
+// repo root. A wrong path is a hard failure, never an empty run - that is the
+// single most important difference from the Zig original, whose
+// `readBitFiles` swallowed `error.FileNotFound` and let mutate.zig fuzz a
+// 1-byte random buffer forever while reporting success.
+//
+//   BIT_FUZZ_BIN        compiler under test        (default zig-out/bin/bit)
+//   BIT_FUZZ_CASES      seed corpus directory      (default tests/cases)
+//   BIT_FUZZ_CRASHES    saved-crash corpus         (default tests/fuzz/crashes)
+//   BIT_FUZZ_WORK       scratch directory          (default /tmp/bit-fuzz)
+//   BIT_FUZZ_SECONDS    wall-clock budget, > 0     (default 60)
+//   BIT_FUZZ_SEED       PRNG seed, for replay      (default the wall clock)
+//   BIT_FUZZ_TIMEOUT_MS per-input deadline         (default 10000)
+
+import { readFile, writeFile, walk, exists, isDir, mkdir } from "std/fs"
+import { envOr, exit } from "std/os"
+import { monotonic, now, Second } from "std/time"
+import { hasSuffix, parseInt } from "std/strings"
+
+// --- bounds (Power of 10 rule 2: every loop below is provably finite) -------
+
+// Mutant size ceiling. guard.zig's `max_input_len`, kept identical so a hash
+// saved by either implementation names the same bytes.
+const maxInputLen: int = 65536
+
+// Point mutations applied per generated input. mutate.zig's
+// `max_mutations_per_input`.
+const maxMutationsPerInput: int = 8
+
+// Hard iteration backstop, independent of the deadline, in case the clock
+// misbehaves. mutate.zig's `max_iterations`.
+const maxIterations: int = 50000000
+
+// Upper bound on corpus entries read from one directory. guard.zig's
+// `max_dir_files`.
+const maxCorpusFiles: int = 4096
+
+// --- failure ----------------------------------------------------------------
+
+// The only exit path for a red run. Every fallible call in this file ends here.
+function die(msg: string) {
+  print("FAIL: ${msg}\n")
+  exit(1)
+}
+
+function mustRead(path: string): string {
+  return readFile(path) catch e {
+    die("read ${path}: ${e.message()}")
+    ""
+  }
+}
+
+function mustWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    die("write ${path}: ${e.message()}")
+  }
+}
+
+function mustInt(name: string, fallback: int): int {
+  let raw = envOr(name, "")
+  if (len(raw) == 0) {
+    return fallback
+  }
+  return parseInt(raw) catch e {
+    die("${name}=${raw} is not an integer: ${e.message()}")
+    0
+  }
+}
+
+// --- PRNG -------------------------------------------------------------------
+//
+// xorshift64. std/rand does not exist, and mutate.zig seeded Zig's DefaultPrng
+// from the wall clock, so a red run there was only reproducible through the
+// saved file. Here the seed is an input and is always echoed.
+//
+// State lives in a one-element slice because Bit structs are value types
+// (stdlib/strings/builder.bit): a slice element is the shortest thing a callee
+// can actually write through.
+
+function nextU64(st: []u64): u64 {
+  let x = st[0]
+  x = x ^ (x << 13)
+  x = x ^ (x >> 7)
+  x = x ^ (x << 17)
+  st[0] = x
+  return x
+}
+
+// Uniform enough for point mutations; the modulo bias over an n far below 2^64
+// cannot matter to the choice of a byte offset.
+function nextBelow(st: []u64, n: int): int {
+  if (n <= 1) {
+    return 0
+  }
+  return int(nextU64(st) % u64(n))
+}
+
+function nextByte(st: []u64): u8 {
+  return u8(int(nextU64(st) % u64(256)))
+}
+
+// --- hashing ----------------------------------------------------------------
+
+// guard.zig:167, ported verbatim, so a crash harvested here and one harvested
+// by the Zig implementation land on the same filename.
+function fnv1a64(bytes: string): u64 {
+  let h = u64(14695981039346656037)
+  let i = 0
+  while (i < len(bytes)) {
+    h = h ^ u64(bytes[i])
+    h = h * u64(1099511628211)
+    i = i + 1
+  }
+  return h
+}
+
+function hex16(v: u64): string {
+  const digits = "0123456789abcdef"
+  let out = []byte(0)
+  let i = 0
+  while (i < 16) {
+    let nib = int((v >> u64(60 - 4 * i)) & u64(15))
+    out = append(out, digits[nib])
+    i = i + 1
+  }
+  return string(out)
+}
+
+// --- mutation ---------------------------------------------------------------
+//
+// mutate.zig:83-110, unchanged: byte flip / insert / delete, 1..8 per input.
+
+function insertAt(b: []byte, pos: int, v: u8): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < pos) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  out = append(out, v)
+  while (i < len(b)) {
+    out = append(out, b[i])
+    i = i + 1
+  }
+  return out
+}
+
+function deleteAt(b: []byte, pos: int): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < len(b)) {
+    if (i != pos) {
+      out = append(out, b[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function mutate(seed: string, st: []u64): string {
+  let b = []byte(0)
+  let i = 0
+  let n = len(seed)
+  if (n > maxInputLen) {
+    n = maxInputLen
+  }
+  while (i < n) {
+    b = append(b, u8(seed[i]))
+    i = i + 1
+  }
+  if (len(b) == 0) {
+    b = append(b, nextByte(st))
+  }
+
+  let rounds = 1 + nextBelow(st, maxMutationsPerInput)
+  let r = 0
+  while (r < rounds) {
+    let op = nextBelow(st, 3)
+    if (op == 0) {
+      b[nextBelow(st, len(b))] = nextByte(st)
+    } else if (op == 1) {
+      if (len(b) < maxInputLen) {
+        b = insertAt(b, nextBelow(st, len(b) + 1), nextByte(st))
+      }
+    } else {
+      if (len(b) > 1) {
+        b = deleteAt(b, nextBelow(st, len(b)))
+      }
+    }
+    r = r + 1
+  }
+  return string(b)
+}
+
+// --- corpus -----------------------------------------------------------------
+
+// Every `*.bit` file under `dir`. A missing or unreadable directory is fatal,
+// never an empty list: guard.zig returned an empty slice for a missing
+// directory and mutate.zig then fuzzed a random 1-byte buffer forever, green.
+function bitFilesIn(dir: string): []string {
+  if (!exists(dir) || !isDir(dir)) {
+    die("not a directory: ${dir}")
+  }
+  let all = walk(dir) catch e {
+    die("walk ${dir}: ${e.message()}")
+    []string(0)
+  }
+  let out = []string(0)
+  for p of all {
+    if (hasSuffix(p, ".bit")) {
+      if (len(out) >= maxCorpusFiles) {
+        die("corpus exceeds ${maxCorpusFiles} files: ${dir}")
+      }
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+// --- child ------------------------------------------------------------------
+//
+// `osRunBounded` takes a path and no argv, so the compiler invocation is a
+// generated wrapper. `exec` is the LAST and ONLY command: any trailing
+// statement would replace the compiler's status with the shell's and make every
+// crash invisible. The redirection is part of the exec'd command, not a second
+// one - the diagnostics for the input still on disk stay in `<work>.log`, and
+// the status reaching the parent is still the compiler's.
+
+function writeRunner(path: string, bin: string, work: string) {
+  mustWrite(path, "#!/bin/sh\nexec \"${bin}\" check \"${work}\" >\"${work}.log\" 2>&1\n")
+  if (fsChmod(path, 493) != 0) {
+    die("chmod +x failed: ${path}")
+  }
+}
+
+// Everything a bounded `bit check` needs: the generated wrapper, the file the
+// wrapper reads, where a triggering input is kept, and the child's deadline.
+struct Runner {
+  script: string
+  work: string
+  crashesDir: string
+  timeoutMs: int
+}
+
+function (r: Runner) check(): int {
+  return osRunBounded(r.script, r.timeoutMs)
+}
+
+struct Outcome {
+  ok: bool     // the child terminated on its own - clean or with diagnostics
+  fatal: bool  // the HARNESS is broken; nothing was tested
+  label: string
+}
+
+// ABI.md §19's four branches, every one of them explicit. `-1` is the branch a
+// lazy classifier drops: it means fork/exec/wait failed, so the compiler was
+// never launched, and reading it as "not a crash" turns the whole run green
+// having executed nothing.
+function classify(rc: int): Outcome {
+  if (rc == -1) {
+    return Outcome{ ok: false, fatal: true, label: "spawn failure (osRunBounded -1)" }
+  }
+  if (rc == -2) {
+    return Outcome{ ok: false, fatal: false, label: "hang" }
+  }
+  if (rc <= -100) {
+    return Outcome{ ok: false, fatal: false, label: "crash: signal ${-rc - 100}" }
+  }
+  // 126/127 are the shell's own "cannot execute" / "not found". The compiler
+  // never ran, so this is a broken harness wearing a normal exit code - the
+  // reachable twin of -1, since the runner script above always spawns.
+  if (rc == 126 || rc == 127) {
+    return Outcome{ ok: false, fatal: true, label: "runner could not exec the compiler (sh exit ${rc})" }
+  }
+  return Outcome{ ok: true, fatal: false, label: "exit ${rc}" }
+}
+
+function (r: Runner) harvest(prefix: string): string {
+  let bytes = mustRead(r.work)
+  let path = "${r.crashesDir}/${prefix}-${hex16(fnv1a64(bytes))}.bit"
+  mustWrite(path, bytes)
+  return path
+}
+
+// --- phases -----------------------------------------------------------------
+
+// Replays tests/fuzz/crashes/*.bit. The directory is legitimately empty today,
+// so an empty replay is not a failure - but the COUNT is printed, because that
+// is the only thing that distinguishes a clean corpus from a mistyped path, and
+// a missing directory is fatal.
+function (r: Runner) replayCrashes() {
+  let files = bitFilesIn(r.crashesDir)
+  print("regress: replaying ${len(files)} saved crash(es) from ${r.crashesDir}\n")
+  for f of files {
+    mustWrite(r.work, mustRead(f))
+    let o = classify(r.check())
+    if (!o.ok) {
+      die("regress: ${f}: ${o.label}")
+    }
+  }
+}
+
+// One `bit check` on a known-good program, before any mutant. Without it a
+// broken BIT_FUZZ_BIN is only visible through the 126/127 branch, and only on
+// shells that report it.
+function (r: Runner) preflight() {
+  mustWrite(r.work, "function main() {\n  print(\"ok\")\n}\n")
+  let rc = r.check()
+  if (rc != 0) {
+    die("preflight: the runner rejected a known-good program (rc=${rc}); the compiler under test is not reachable")
+  }
+}
+
+function (r: Runner) fuzzLoop(seeds: []string, seed: u64, seconds: int): int {
+  let st = []u64(1)
+  st[0] = seed
+
+  let deadline = monotonic() + seconds * Second
+  let iterations = 0
+  while (iterations < maxIterations && monotonic() < deadline) {
+    let src = mustRead(seeds[nextBelow(st, len(seeds))])
+    mustWrite(r.work, mutate(src, st))
+
+    let o = classify(r.check())
+    if (o.fatal) {
+      die("iteration ${iterations}: ${o.label}")
+    }
+    if (!o.ok) {
+      let prefix = "crash"
+      if (o.label == "hang") {
+        prefix = "hang"
+      }
+      let saved = r.harvest(prefix)
+      die("iteration ${iterations}: ${o.label} - input saved as ${saved}")
+    }
+    iterations = iterations + 1
+  }
+  return iterations
+}
+
+// --- entry ------------------------------------------------------------------
+
+function main() {
+  let bin = envOr("BIT_FUZZ_BIN", "zig-out/bin/bit")
+  let casesDir = envOr("BIT_FUZZ_CASES", "tests/cases")
+  let crashesDir = envOr("BIT_FUZZ_CRASHES", "tests/fuzz/crashes")
+  let workDir = envOr("BIT_FUZZ_WORK", "/tmp/bit-fuzz")
+  let seconds = mustInt("BIT_FUZZ_SECONDS", 60)
+  let timeoutMs = mustInt("BIT_FUZZ_TIMEOUT_MS", 10000)
+
+  if (seconds <= 0) {
+    die("BIT_FUZZ_SECONDS must be > 0; ${seconds} would report a green run of zero iterations")
+  }
+  if (timeoutMs <= 0) {
+    die("BIT_FUZZ_TIMEOUT_MS must be > 0")
+  }
+
+  // A zero seed is a xorshift64 fixed point - it would yield 0 forever - so it
+  // is replaced, and the replacement is what gets echoed.
+  let seed = u64(now())
+  let rawSeed = envOr("BIT_FUZZ_SEED", "")
+  if (len(rawSeed) > 0) {
+    seed = u64(mustInt("BIT_FUZZ_SEED", 0))
+  }
+  if (seed == u64(0)) {
+    seed = u64(88172645463325252)
+  }
+
+  if (!exists(workDir)) {
+    mkdir(workDir) catch e {
+      die("mkdir ${workDir}: ${e.message()}")
+    }
+  }
+  let r = Runner{
+    script: "${workDir}/run.sh",
+    work: "${workDir}/work.bit",
+    crashesDir: crashesDir,
+    timeoutMs: timeoutMs,
+  }
+  writeRunner(r.script, bin, r.work)
+
+  print("fuzz: compiler=${bin} seed=${seed} seconds=${seconds} timeout_ms=${timeoutMs}\n")
+
+  r.replayCrashes()
+  r.preflight()
+
+  let seeds = bitFilesIn(casesDir)
+  if (len(seeds) == 0) {
+    die("seed corpus ${casesDir} holds no .bit files; a random-byte generator is not a fuzzer")
+  }
+  print("fuzz: ${len(seeds)} seed inputs from ${casesDir}\n")
+
+  let iterations = r.fuzzLoop(seeds, seed, seconds)
+  print("PASS: ${iterations} inputs, 0 crashes, 0 hangs (seed=${seed}, replay with BIT_FUZZ_SEED=${seed})\n")
+}

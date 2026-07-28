@@ -1,0 +1,267 @@
+// Self-check for `bit test`'s discovery + dispatch contract (#1105). Ports
+// tests/testcmd.zig, which is deleted with it.
+//
+// THE PROPERTY: the name list `injectTestMain` returns and the synthetic `main`
+// it appends agree POSITIONALLY. BIT_TEST_INDEX `i` runs exactly the i-th
+// top-level `function test_*()` of the ROOT module in source order, and the
+// child's exit code is that test's verdict — 0 passed, 2 a panicking `assert`.
+// Nothing else runs: not a non-test helper, not an imported module's `test_*`,
+// and not the module's own `main`.
+//
+// Every assertion below is load-bearing against a specific way this check could
+// pass while checking nothing:
+//
+//   - The runtime archive is ASSERTED, never `catch { return }`. Both Zig tests
+//     opened with `if (build_options.libbitrt_path.len == 0) return;` — a silent
+//     green no-op, and one with no build-time signal that it fired.
+//   - The FAILING test is checked for exactly 2, not `!= 0`. `osRunTestBounded`
+//     returns -1 on spawn failure and -2 on timeout (ABI §19), both non-zero, so
+//     `!= 0` also passes when the binary was never executed at all.
+//   - Counts are asserted BEFORE the element-wise names. A name loop bounded by
+//     `len(names)` is green on an empty list.
+//   - The single-file fixture's own `main` is `assert(false)`. It must be
+//     renamed, not run, so every index that exits 0 also proves the rename. The
+//     Zig fixture had no `main` and never covered that path.
+//   - Index 99 dispatches to nothing and must still exit 0 (§19), so an
+//     out-of-range index is asserted as the ABI's harmless no-op rather than
+//     left to mean "everything passes".
+//   - The project fixture's non-root module really does define
+//     `test_notmine`, and its presence in the lowered module is asserted before
+//     its absence from the discovered names. tests/testcmd.zig asserted "root
+//     module only" against std/testing, which contains no `test_` at all, so
+//     that claim was quantified over an empty candidate set.
+//
+// Bounded spawns, never `osRunTest`: this is the first subprocess `bit
+// selfcheck` runs and there is no per-check timeout around it, so a hung child
+// would hang the whole gate rather than fail one case.
+//
+// EXPECTED NOISE. The children inherit this process's stderr and there is no
+// output-capture primitive, so a passing run prints exactly three panic lines —
+// `assertion failed`, `sum: got 6, want 7`, `nope` — one per deliberately
+// failing fixture test. They are the proof the children really ran; the verdict
+// is the exit code and `selfcheck OK`, not the absence of stderr.
+
+// The single-file fixture: three tests in source order, one non-test helper, and
+// a `main` that panics if it is ever the entry point.
+function testgenFixtureFile(): string {
+  return "function test_passes() {\n" +
+    "  assert(1 + 1 == 2)\n" +
+    "}\n\n" +
+    "function test_also_passes() {\n" +
+    "  assert(2 * 3 == 6)\n" +
+    "}\n\n" +
+    "function test_fails() {\n" +
+    "  assert(1 == 2)\n" +
+    "}\n\n" +
+    "function helper(): i64 {\n" +
+    "  return 1\n" +
+    "}\n\n" +
+    "function main() {\n" +
+    "  assert(false)\n" +
+    "}\n"
+}
+
+// The project fixture's ROOT module: four tests over std/testing, plus a call
+// into the sibling module so that module is really loaded and lowered.
+function testgenFixtureProjRoot(): string {
+  return "import { eq, neq, ok, failNow } from \"std/testing\"\n" +
+    "import { subHelper } from \"./sub\"\n\n" +
+    "function test_scalars() {\n" +
+    "  eq<i64>(1 + 1, 2, \"sum\")\n" +
+    "  neq<i64>(subHelper(), 5, \"sub\")\n" +
+    "}\n\n" +
+    "function test_strings() {\n" +
+    "  ok(len(\"abc\") == 3, \"len\")\n" +
+    "}\n\n" +
+    "function test_fails_with_a_diff() {\n" +
+    "  eq<i64>(6, 7, \"sum\")\n" +
+    "}\n\n" +
+    "function test_fails_explicitly() {\n" +
+    "  failNow(\"nope\")\n" +
+    "}\n"
+}
+
+// The project fixture's NON-ROOT module. `test_notmine` is a genuine discovery
+// candidate — same shape as a real test, exported, and present in the lowered
+// module — that the root-module rule must reject.
+function testgenFixtureProjSub(): string {
+  return "export function subHelper(): i64 {\n" +
+    "  return 7\n" +
+    "}\n\n" +
+    "export function test_notmine() {\n" +
+    "  assert(false)\n" +
+    "}\n"
+}
+
+// Writes `content` to `path`, failing the check rather than the fixture.
+function testgenWrite(path: string, content: string) {
+  writeFile(path, content) catch e {
+    assert(false, "testgen check: cannot write ${path}: ${e.message()}")
+  }
+}
+
+// Creates `path`, failing the check if it cannot be created.
+function testgenMkdir(path: string) {
+  assert(fsMkdir(path) >= 0, "testgen check: cannot create ${path}")
+}
+
+// Whether the lowered module defines a function named exactly `name`.
+function testgenHasFunc(m: IrModule, name: string): bool {
+  let i = 0
+  while (i < len(m.funcs)) {
+    if (m.funcs[i].name == name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether any lowered function's name ends with `suffix`. Used to find a
+// non-root module's function, which lowering renames to `m<id>$<name>`.
+function testgenHasFuncSuffix(m: IrModule, suffix: string): bool {
+  let i = 0
+  while (i < len(m.funcs)) {
+    let n = m.funcs[i].name
+    if (len(n) >= len(suffix) && n[len(n) - len(suffix):len(n)] == suffix) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `names` contains `name`.
+function testgenNamesHave(names: []string, name: string): bool {
+  let i = 0
+  while (i < len(names)) {
+    if (names[i] == name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// What `testgenBuild` produced: the discovered names in dispatch order and the
+// lowered module they were discovered from. The module is kept so the rejection
+// cases can assert what WAS a candidate, not just what came out.
+struct TestgenBuilt {
+  names: []string,
+  module: IrModule,
+}
+
+// Builds `src` for the host with the test `main` injected, asserting every step
+// the way `testCmd` reports it, and leaves the executable at `bin`.
+function testgenBuild(src: string, bin: string, rt: []u8): TestgenBuilt {
+  let m = buildIr(src, hostBuildTarget(), false, rt, true) catch e {
+    assert(false, "testgen check: ${src}: ${e.message()}")
+    return TestgenBuilt{ names: []string(0), module: IrModule{} }
+  }
+  // A stub lowers to a signature with no body, so a binary containing one runs
+  // the wrong program; `testCmd` refuses to run tests in that case and so does
+  // this check, rather than measure exit codes of something unlowered.
+  assert(len(m.stubbed) == 0, "testgen check: ${src}: unlowered functions")
+  let names = injectTestMain(m)
+  assert(writeModuleExe(m, src, bin, hostBuildTarget(), rt),
+    "testgen check: cannot build ${bin}")
+  return TestgenBuilt{ names: names, module: m }
+}
+
+// Per-test wall clock. Generous — the fixtures do arithmetic — because the
+// bound exists to turn a hang into a failure, not to measure anything.
+const testgenRunMs: int = 60000
+
+// A single-file module: discovery order, per-index verdicts, and the rename.
+function checkTestgenFile(dir: string, rt: []u8) {
+  let src = "${dir}/case.bit"
+  let bin = "${dir}/case.bin"
+  testgenWrite(src, testgenFixtureFile())
+
+  let built = testgenBuild(src, bin, rt)
+  let names = built.names
+  // The module's own `main` is RENAMED, not dropped and not left as the entry.
+  assert(testgenHasFunc(built.module, "__bit_module_main"),
+    "testgen check: module main was not renamed")
+  assert(!testgenNamesHave(names, "main"), "testgen check: main is not a test")
+  // Count first: an element-wise loop over an empty list asserts nothing.
+  assert(len(names) == 3, "testgen check: expected 3 tests")
+  assert(names[0] == "test_passes", "testgen check: names[0]")
+  assert(names[1] == "test_also_passes", "testgen check: names[1]")
+  assert(names[2] == "test_fails", "testgen check: names[2]")
+  // `helper` is not a test: no parameters is not enough, the `test_` prefix is
+  // the rule (§19).
+  assert(!testgenNamesHave(names, "helper"), "testgen check: helper is not a test")
+
+  assert(osRunTestBounded(bin, 0, testgenRunMs) == 0, "testgen check: index 0")
+  assert(osRunTestBounded(bin, 1, testgenRunMs) == 0, "testgen check: index 1")
+  // EXACTLY 2. `!= 0` would also accept -1 (spawn failure) and -2 (timeout).
+  assert(osRunTestBounded(bin, 2, testgenRunMs) == 2, "testgen check: index 2")
+  // Out of range dispatches to nothing and exits cleanly (§19) — and, since the
+  // fixture's own `main` panics, this also proves the rename took effect.
+  assert(osRunTestBounded(bin, 99, testgenRunMs) == 0, "testgen check: index 99")
+
+  remove(bin) catch println("testgen check: cleanup failed for ${bin}")
+  remove(src) catch println("testgen check: cleanup failed for ${src}")
+}
+
+// A directory module: tests may import std/testing, and discovery covers the
+// ROOT module only even when another module defines a real `test_*`.
+function checkTestgenProject(dir: string, rt: []u8) {
+  let root = "${dir}/proj"
+  let sub = "${root}/sub"
+  testgenMkdir(root)
+  testgenMkdir(sub)
+  let rootSrc = "${root}/main.bit"
+  let subSrc = "${sub}/sub.bit"
+  let bin = "${dir}/proj.bin"
+  testgenWrite(rootSrc, testgenFixtureProjRoot())
+  testgenWrite(subSrc, testgenFixtureProjSub())
+
+  let built = testgenBuild(root, bin, rt)
+  let names = built.names
+  assert(len(names) == 4, "testgen check: expected 4 project tests")
+  assert(names[0] == "test_scalars", "testgen check: project names[0]")
+  assert(names[1] == "test_strings", "testgen check: project names[1]")
+  assert(names[2] == "test_fails_with_a_diff", "testgen check: project names[2]")
+  assert(names[3] == "test_fails_explicitly", "testgen check: project names[3]")
+
+  // The rejection is asserted over a candidate that is REALLY THERE: the sub
+  // module lowers into this same module, `test_notmine` included, and discovery
+  // still does not pick it up. Assert the presence FIRST — without it, "absent
+  // from names" is satisfied by a fixture whose second module never loaded.
+  assert(testgenHasFuncSuffix(built.module, "$test_notmine"),
+    "testgen check: fixture broken, the non-root test was never lowered")
+  assert(!testgenNamesHave(names, "test_notmine"),
+    "testgen check: a non-root module's test was discovered")
+
+  assert(osRunTestBounded(bin, 0, testgenRunMs) == 0, "testgen check: project index 0")
+  assert(osRunTestBounded(bin, 1, testgenRunMs) == 0, "testgen check: project index 1")
+  assert(osRunTestBounded(bin, 2, testgenRunMs) == 2, "testgen check: project index 2")
+  assert(osRunTestBounded(bin, 3, testgenRunMs) == 2, "testgen check: project index 3")
+
+  remove(bin) catch println("testgen check: cleanup failed for ${bin}")
+  remove(subSrc) catch println("testgen check: cleanup failed for ${subSrc}")
+  remove(rootSrc) catch println("testgen check: cleanup failed for ${rootSrc}")
+  remove(sub) catch println("testgen check: cleanup failed for ${sub}")
+  remove(root) catch println("testgen check: cleanup failed for ${root}")
+}
+
+// Everything lives under a nonce-named /tmp directory: the check writes,
+// builds and EXECS these paths, and two `bit selfcheck` runs sharing one name
+// is the ETXTBSY/half-a-build shape #1459 records. It also makes the check
+// cwd-independent — `stdRootPath()`/`libbitrtPath()` resolve from this binary's
+// own location, never the working directory.
+function checkTestgen() {
+  let dir = "/tmp/bit-testgen-check-${scratchNonce()}"
+  testgenMkdir(dir)
+  // ASSERTED, not skipped: a missing archive is a broken build tree, and the
+  // Zig harness's silent `return` here is what made it a no-op nobody noticed.
+  let rt = readRtArchive(hostBuildTarget()) catch e {
+    assert(false, "testgen check: runtime archive ${libbitrtPath(hostBuildTarget())}: ${e.message()}")
+    return
+  }
+  checkTestgenFile(dir, rt)
+  checkTestgenProject(dir, rt)
+  remove(dir) catch println("testgen check: cleanup failed for ${dir}")
+}

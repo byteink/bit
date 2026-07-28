@@ -1,0 +1,496 @@
+// Multi-module imports + prelude guard, in Bit (port of tests/imports.zig, #1153).
+//
+// Every direct subdirectory of the corpus is a root module (its `main`); it may
+// import project-relative modules (`./util`) and standard-library modules
+// (`std/core`), and it sees the auto-imported prelude. This harness builds each
+// one with the self-hosted `bit` and diffs the program's stdout against the
+// project's checked-in `expected` — so cross-module lowering and the prelude can
+// never silently regress.
+//
+// Configuration is by ENVIRONMENT, not argv: `bit run <file>` forwards no
+// arguments to the program it launches (compiler/build.bit `runCmd`), so an
+// argv-shaped config would read empty and this harness would run over nothing.
+// Every variable is validated and a bad one is a loud failure, never a skip:
+//
+//   BIT_IMPORTS_DIR     absolute path to the corpus (tests/imports)   required
+//   BIT_IMPORTS_BIT     absolute path to the `bit` under test         required
+//   BIT_STDLIB          absolute path to stdlib/                      required
+//   BIT_LIBBITRT        absolute path to the target's libbitrt.a      required
+//   BIT_IMPORTS_FILTER  run one named project (must match exactly)    optional
+//   BIT_TEST_TIMEOUT_S  per-child wall clock, default 300             optional
+//
+// WHY A SHELL WRAPPER. `osRunBounded` (ABI.md §19) is the only bounded child
+// wait Bit has, and it takes a path and nothing else — no argv, no env, no
+// stdout capture. So each case gets two generated `/bin/sh` scripts, and the
+// shell supplies the three missing pieces. Each script ends in `exec`, which is
+// what keeps the exit status and the deadline honest — see `writeScripts`.
+//
+// WHY THIS IS SERIAL, unlike the Zig harness it replaces. `bit_rt_os_run_bounded`
+// is NOT re-entrant: its child argv, wait-status cell and timespec scratch are
+// module-level and unlocked, sound only "under the single-worker contract — a
+// `run` fully completes (fork through wait) before any other `run` can begin"
+// (runtime/root/{linux,darwin}/os.bit). It is also `@nosplit`, so it crosses no
+// safepoint and never parks the calling green thread; its poll delay is a raw
+// `nanosleep`, not `sched.sleepNs`. A `spawn`ed pool of green threads each
+// calling it would therefore race on shared runtime state — two cases could
+// exec the wrong path or read each other's wait status — and would pin a worker
+// apiece with no yield. Parallelism here needs a re-entrant primitive first;
+// until then, correct and slow beats fast and racy.
+//
+// TWO PHASES ANYWAY. Phase A writes every script and forks nothing; phase B
+// forks and writes nothing. `fork` duplicates the fd table, so a child spawned
+// while another thread holds a write fd open inherits it, and a later `execve`
+// of that inode fails with ETXTBSY. A serial harness has no such window, but
+// keeping the phases apart means re-introducing concurrency cannot silently
+// reopen one. The built BINARIES need no barrier either way: they are written
+// by the child `bit build`, which `osRunBounded` reaps before it returns.
+//
+// This file deliberately uses only universe builtins (ABI boundary primitives)
+// and no `std/*` import, so it runs under a bare `bit run` with no BIT_STDLIB
+// needed to compile the harness itself.
+
+// The corpus size this gate refuses to run below. The Zig original had only an
+// UPPER bound (`scanned < max_programs`) and an explicit `if (cases.len == 0)
+// return` — an empty corpus was a green pass. A floor is the whole difference
+// between a gate and a decoration: raise it when projects are added.
+const caseFloor: int = 96
+
+// Upper bound on directory entries examined (Power of 10 rule 2).
+const maxEntries: int = 4096
+
+const defaultTimeoutS: int = 300
+
+// 0o755 — the scripts must be executable by the `fork`+`execve` in osRunBounded.
+const scriptMode: int = 493
+
+struct Cfg {
+  corpus: string
+  bitExe: string
+  stdlib: string
+  libbitrt: string
+  filter: string
+  timeoutMs: int
+}
+
+struct Case {
+  name: string
+  dir: string
+  expected: string
+  compileSh: string
+  runSh: string
+  bin: string
+  log: string
+  out: string
+  err: string
+}
+
+// Per-case verdict. `reason` empty means the case passed; `detail` is the
+// evidence (compiler log, captured stderr, or the two sides of a mismatch).
+struct Verdict {
+  reason: string
+  detail: string
+}
+
+struct Text {
+  ok: bool
+  data: string
+}
+
+// --- small utilities (no std/*, no prelude) --------------------------------
+
+function readWhole(path: string): Text {
+  let fd = fsOpen(path, false)
+  if (fd < 0) {
+    return Text{ ok: false, data: "" }
+  }
+  let s = fsReadAll(fd)
+  fsClose(fd)
+  return Text{ ok: true, data: s }
+}
+
+function writeWhole(path: string, content: string): bool {
+  let fd = fsOpen(path, true)
+  if (fd < 0) {
+    return false
+  }
+  let n = fsWrite(fd, content)
+  fsClose(fd)
+  return n >= 0
+}
+
+// Byte-wise `a < b`, so a listing is reproducible across filesystems.
+function lessStr(a: string, b: string): bool {
+  let n = len(a)
+  if (len(b) < n) {
+    n = len(b)
+  }
+  let i = 0
+  while (i < n) {
+    if (a[i] != b[i]) {
+      return a[i] < b[i]
+    }
+    i = i + 1
+  }
+  return len(a) < len(b)
+}
+
+function sortStrings(xs: []string): []string {
+  let i = 1
+  while (i < len(xs)) {
+    let j = i
+    while (j > 0 && lessStr(xs[j], xs[j - 1])) {
+      let t = xs[j - 1]
+      xs[j - 1] = xs[j]
+      xs[j] = t
+      j = j - 1
+    }
+    i = i + 1
+  }
+  return xs
+}
+
+// `fsListDir` returns entries NUL-separated: NUL is the one byte a POSIX
+// filename cannot contain.
+function splitNul(raw: string): []string {
+  let out = []string(0)
+  let start = 0
+  let i = 0
+  while (i < len(raw) && len(out) < maxEntries) {
+    if (raw[i] == 0) {
+      if (i > start) {
+        out = append(out, raw[start:i])
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Digits only, and short enough that `v * 10` cannot overflow i64.
+const maxIntDigits: int = 9
+
+function parseNonNegInt(s: string): int {
+  if (len(s) == 0 || len(s) > maxIntDigits) {
+    return -1
+  }
+  let v = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c < 48 || c > 57) {
+      return -1
+    }
+    v = v * 10 + int(c) - 48
+    i = i + 1
+  }
+  return v
+}
+
+// A path is interpolated into a double-quoted shell word, so anything the shell
+// would still expand or terminate there must be rejected outright rather than
+// quoted around. Rejecting is safe: every real path in this repo is plain.
+function shSafe(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == 34 || c == 36 || c == 96 || c == 92 || c == 10 || c == 13 || c == 0) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+function fatal(msg: string) {
+  eprint("imports: FAIL ${msg}\n")
+  osExit(1)
+}
+
+// --- configuration ---------------------------------------------------------
+
+// Every path must be ABSOLUTE. A relative corpus path resolved against whatever
+// CWD the harness happens to inherit is the single most likely way this gate
+// goes silently vacuous — `fsListDir` on a missing directory yields nothing,
+// which without this check reads as "0 failed".
+function requireDir(name: string): string {
+  let v = osEnv(name)
+  if (len(v) == 0) {
+    fatal("${name} is unset; it must be an absolute directory path")
+  }
+  if (v[0] != 47) {
+    fatal("${name}='${v}' is not absolute")
+  }
+  if (!fsIsDir(v)) {
+    fatal("${name}='${v}' is not a directory")
+  }
+  if (!shSafe(v)) {
+    fatal("${name}='${v}' contains a character this harness will not put in a shell word")
+  }
+  return v
+}
+
+function requireFile(name: string): string {
+  let v = osEnv(name)
+  if (len(v) == 0) {
+    fatal("${name} is unset; it must be an absolute file path")
+  }
+  if (v[0] != 47) {
+    fatal("${name}='${v}' is not absolute")
+  }
+  if (!fsExists(v) || fsIsDir(v)) {
+    fatal("${name}='${v}' is not a file")
+  }
+  if (!shSafe(v)) {
+    fatal("${name}='${v}' contains a character this harness will not put in a shell word")
+  }
+  return v
+}
+
+function loadConfig(): Cfg {
+  let corpus = requireDir("BIT_IMPORTS_DIR")
+  let bitExe = requireFile("BIT_IMPORTS_BIT")
+  let stdlib = requireDir("BIT_STDLIB")
+  let libbitrt = requireFile("BIT_LIBBITRT")
+
+  let secs = defaultTimeoutS
+  let raw = osEnv("BIT_TEST_TIMEOUT_S")
+  if (len(raw) != 0) {
+    let parsed = parseNonNegInt(raw)
+    if (parsed <= 0) {
+      // The Zig harness reads 0 as "block forever". There is no unbounded form
+      // of `osRunBounded`, and a 0 ms budget would kill every child instantly,
+      // so an unusable value is refused instead of silently reinterpreted.
+      fatal("BIT_TEST_TIMEOUT_S='${raw}' is not a positive integer")
+    }
+    secs = parsed
+  }
+
+  let filter = osEnv("BIT_IMPORTS_FILTER")
+  if (len(filter) != 0 && !shSafe(filter)) {
+    fatal("BIT_IMPORTS_FILTER='${filter}' is not a plain name")
+  }
+
+  return Cfg{ corpus: corpus, bitExe: bitExe, stdlib: stdlib, libbitrt: libbitrt,
+    filter: filter, timeoutMs: secs * 1000 }
+}
+
+// --- discovery -------------------------------------------------------------
+
+function discover(cfg: Cfg, scratch: string): []Case {
+  let names = sortStrings(splitNul(fsListDir(cfg.corpus)))
+  let dirs = []string(0)
+  let i = 0
+  while (i < len(names)) {
+    let n = names[i]
+    if (fsIsDir("${cfg.corpus}/${n}")) {
+      dirs = append(dirs, n)
+    }
+    i = i + 1
+  }
+
+  if (len(cfg.filter) != 0) {
+    let kept = []string(0)
+    let j = 0
+    while (j < len(dirs)) {
+      if (dirs[j] == cfg.filter) {
+        kept = append(kept, dirs[j])
+      }
+      j = j + 1
+    }
+    if (len(kept) == 0) {
+      fatal("BIT_IMPORTS_FILTER='${cfg.filter}' matched no project under ${cfg.corpus}")
+    }
+    dirs = kept
+  } else if (len(dirs) < caseFloor) {
+    fatal("discovered ${len(dirs)} project(s) under ${cfg.corpus}, below the floor of ${caseFloor} — the corpus is wrong or has shrunk")
+  }
+
+  let cases = []Case(0)
+  let k = 0
+  while (k < len(dirs)) {
+    let name = dirs[k]
+    if (!shSafe(name)) {
+      fatal("project name '${name}' is not a plain name")
+    }
+    let dir = "${cfg.corpus}/${name}"
+    // Fail, never skip. A missing `main.bit` or a missing/empty `expected` is
+    // how 96 cases turn into 0 with no change in the output.
+    if (!fsExists("${dir}/main.bit")) {
+      fatal("project '${name}' has no main.bit")
+    }
+    let exp = readWhole("${dir}/expected")
+    if (!exp.ok) {
+      fatal("project '${name}' has no readable 'expected' file")
+    }
+    if (len(exp.data) == 0) {
+      fatal("project '${name}' has an EMPTY 'expected' file; an empty comparison proves nothing")
+    }
+    let base = "${scratch}/${name}"
+    cases = append(cases, Case{ name: name, dir: dir, expected: exp.data,
+      compileSh: "${base}.compile.sh", runSh: "${base}.run.sh", bin: "${base}.bin",
+      log: "${base}.log", out: "${base}.out", err: "${base}.err" })
+    k = k + 1
+  }
+  return cases
+}
+
+// --- phase A: write every script, fork nothing -----------------------------
+
+function writeScripts(cfg: Cfg, cases: []Case) {
+  let i = 0
+  while (i < len(cases)) {
+    let c = cases[i]
+    // `exec` is load-bearing twice over, and both reasons are silent-wrongness
+    // bugs when it is missing:
+    //
+    //  - EXIT STATUS. `osRunBounded` reports the SHELL's status. Without `exec`
+    //    a failed `bit build` would still leave the script exiting 0 unless
+    //    `set -e` caught it; with `exec` the shell IS the tool, so the status is
+    //    the tool's by construction and cannot be laundered at all.
+    //  - THE DEADLINE. `osRunBounded` SIGKILLs the pid it forked. Without
+    //    `exec` that pid is the shell, and a hung program under it is merely
+    //    orphaned to init and keeps running — measured: a `TIMED OUT` verdict
+    //    with the program still alive afterwards. With `exec` the forked pid is
+    //    the program, so the kill lands on the thing that hung.
+    //
+    // `set -e` stays as insurance for the `export` lines above the `exec`.
+    let compile = "#!/bin/sh\nset -e\nexport BIT_STDLIB=\"${cfg.stdlib}\"\nexport BIT_LIBBITRT=\"${cfg.libbitrt}\"\nexec \"${cfg.bitExe}\" build \"${c.dir}\" -o \"${c.bin}\" >\"${c.log}\" 2>&1\n"
+    // BIT_SELF_EXE is a real coupling, not decoration: tests/imports/pmadd_e2e
+    // execs the compiler that built it (`bit add`) and panics without it. The
+    // shell also hands the child the full inherited environment, which that
+    // case's git/HOME/PATH usage needs.
+    let run = "#!/bin/sh\nset -e\nexport BIT_SELF_EXE=\"${cfg.bitExe}\"\nexec \"${c.bin}\" >\"${c.out}\" 2>\"${c.err}\"\n"
+    if (!writeWhole(c.compileSh, compile) || fsChmod(c.compileSh, scriptMode) != 0) {
+      fatal("cannot write compile script for '${c.name}' at ${c.compileSh}")
+    }
+    if (!writeWhole(c.runSh, run) || fsChmod(c.runSh, scriptMode) != 0) {
+      fatal("cannot write run script for '${c.name}' at ${c.runSh}")
+    }
+    i = i + 1
+  }
+}
+
+// --- phase B: compile, run, compare ----------------------------------------
+
+// ABI.md §19: `>= 0` exit code, `-1` spawn failure, `-2` deadline, `<= -100`
+// signalled with the number at `-(r) - 100`. Every negative sentinel passes a
+// naive `if (code > 0)`, so a hung or SIGSEGV'd case would read as a pass; each
+// gets its own named outcome instead.
+function decode(r: int, what: string): string {
+  if (r == 0) {
+    return ""
+  }
+  if (r > 0) {
+    return "${what} exited ${r}"
+  }
+  if (r == -1) {
+    return "${what} SPAWN FAILED"
+  }
+  if (r == -2) {
+    return "${what} TIMED OUT"
+  }
+  if (r <= -100) {
+    return "${what} KILLED by signal ${0 - r - 100}"
+  }
+  return "${what} unknown osRunBounded result ${r}"
+}
+
+// Two separate bounded calls, not one combined script, so a compile hang and a
+// run hang stay distinguishable.
+function runCase(cfg: Cfg, c: Case): Verdict {
+  let cr = decode(osRunBounded(c.compileSh, cfg.timeoutMs), "compile")
+  if (len(cr) != 0) {
+    return Verdict{ reason: cr, detail: readWhole(c.log).data }
+  }
+  if (!fsExists(c.bin)) {
+    return Verdict{ reason: "compile produced no binary", detail: readWhole(c.log).data }
+  }
+  let rr = decode(osRunBounded(c.runSh, cfg.timeoutMs), "run")
+  if (len(rr) != 0) {
+    return Verdict{ reason: rr, detail: readWhole(c.err).data }
+  }
+  let got = readWhole(c.out)
+  if (!got.ok) {
+    // Both sides failing to read must never compare equal — that is how a
+    // harness that executed nothing reports every case as matching.
+    return Verdict{ reason: "no stdout captured", detail: "expected ${c.out} to exist" }
+  }
+  if (got.data != c.expected) {
+    return Verdict{ reason: "output mismatch",
+      detail: "  expected: ${c.expected}\n  got:      ${got.data}" }
+  }
+  return Verdict{ reason: "", detail: "" }
+}
+
+// --- cleanup + report ------------------------------------------------------
+
+function cleanup(scratch: string, cases: []Case) {
+  let i = 0
+  while (i < len(cases)) {
+    let c = cases[i]
+    fsRemove(c.compileSh)
+    fsRemove(c.runSh)
+    fsRemove(c.bin)
+    fsRemove(c.log)
+    fsRemove(c.out)
+    fsRemove(c.err)
+    i = i + 1
+  }
+  fsRemove(scratch)
+}
+
+function scratchRoot(): string {
+  let base = osEnv("TMPDIR")
+  if (len(base) == 0) {
+    base = "/tmp"
+  }
+  if (base[len(base) - 1] == 47) {
+    base = base[0:len(base) - 1]
+  }
+  return "${base}/bit-importsrun-${timeUnixNs()}"
+}
+
+function main() {
+  let cfg = loadConfig()
+
+  let scratch = scratchRoot()
+  if (!shSafe(scratch)) {
+    fatal("scratch path '${scratch}' is not shell-safe")
+  }
+
+  // Discovery only composes path STRINGS, so the directory is created after it
+  // — a config or corpus failure then leaves nothing behind to clean up, and
+  // `fatal` needs no unwinding of its own.
+  let cases = discover(cfg, scratch)
+  print("imports: discovered ${len(cases)} cases under ${cfg.corpus}\n")
+
+  if (fsMkdir(scratch) < 0) {
+    fatal("cannot create scratch directory ${scratch}")
+  }
+  writeScripts(cfg, cases)
+
+  let failed = 0
+  let summary = ""
+  let i = 0
+  while (i < len(cases)) {
+    let v = runCase(cfg, cases[i])
+    if (len(v.reason) != 0) {
+      failed = failed + 1
+      summary = "${summary} ${cases[i].name}(${v.reason})"
+      eprint("imports '${cases[i].name}': ${v.reason}\n")
+      if (len(v.detail) != 0) {
+        eprint("${v.detail}\n")
+      }
+    }
+    i = i + 1
+  }
+
+  cleanup(scratch, cases)
+
+  print("imports: ${len(cases) - failed}/${len(cases)} OK\n")
+  if (failed != 0) {
+    eprint("imports: FAILED:${summary}\n")
+    osExit(1)
+  }
+}

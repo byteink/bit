@@ -1,0 +1,717 @@
+// Concurrency + GC stress suite — the Bit port of `tests/stress.zig` (task #350,
+// ported under #1593's retire-the-seed programme). Each subdirectory of
+// `tests/stress/` is a Bit program that hammers spawn / channels / select / the
+// collector and prints one deterministic line encoding its own correctness. Each
+// is compiled, then run TWICE: once under the default collector policy and once
+// under `BIT_GC=stress`, which collects at every safepoint. The stress run is a
+// precise-rooting oracle — any root the compiler or runtime fails to report is
+// swept the instant it stops being marked, so a rooting bug that a rare
+// production collection would only occasionally hit becomes a deterministic
+// wrong answer here. Both runs must reproduce the program's `.expected` stdout.
+//
+// THE SEED PASS IS GONE, NOT PORTED, AND THAT IS THE ONE THING TO NOTICE.
+// `tests/stress.zig` built every program with BOTH compilers — `bit-seed`
+// in-process and self-hosted `bit` as a subprocess — and its header carried a
+// paragraph (#1413) about how the self-hosted pass being absent had once read as
+// coverage. This port drives the SELF-HOSTED COMPILER ONLY. That is deliberate:
+// the seed is the retiring bootstrap oracle, `bit` is what ships, and a harness
+// written in Bit cannot import a Zig module in-process anyway. But #1413's
+// lesson runs both ways — a dropped pass that nobody writes down reads as
+// coverage exactly like a missing one did. It is dropped, it is stated here, and
+// it belongs on #1593's ledger.
+//
+// THE ORACLE IS ONLY AS DENSE AS THE SAFEPOINTS, and a program must earn it.
+// Codegen emits `bit_rt_safepoint` at loop back-edges (runtime/ABI.md §4);
+// `bit_rt_alloc` does NOT poll, so allocating does not by itself collect. A
+// straight-line program therefore runs ZERO collections under `BIT_GC=stress` no
+// matter how much it allocates, and its second run verifies nothing about
+// rooting — it is the same run twice. #1438 made that rule enforced rather than
+// merely stated: every stress run sets `BIT_GC_STATS=1` and must show a non-zero
+// collection count, and a legitimately straight-line program declares itself
+// with a non-empty `no-collect` file saying why.
+//
+// AND THE POLICY IS NOW PROVEN TO HAVE ARRIVED, WHICH #1438's OWN GUARD COULD
+// NOT DO. `collections != 0` cannot tell a real `BIT_GC=stress` run from the
+// default run repeated — the churn programs collect under the default policy
+// too — so a harness whose env plumbing silently failed would pass #1438's check
+// on every program while exercising precise rooting exactly zero times. The
+// aggregate stats line does not name the active policy (that is the honest fix,
+// and it needs `statsReport` in runtime/root/{linux,darwin}/boot.bit to emit
+// `policy=<default|stress|off>`), so this port closes the hole differentially
+// instead: BOTH runs carry `BIT_GC_STATS=1`, and a MAJORITY of the oracled
+// programs must show a stress count more than `stressRatio` times their default
+// count. Allocation-driven programs clear it by two to five orders of magnitude
+// (`gcgrow`: 1 against 1,476,203). Clock-paced ones do not and must not be made
+// to — `schedtimer` measures 99 against 41 — which is why the assertion is over
+// the CORPUS, where it belongs: "the environment reached the child" is a fact
+// about this harness, not about any one program. A `stress-waived` program gets
+// the mirror proof directly: its second run is `BIT_GC=off`, which must collect
+// EXACTLY zero.
+//
+// A MISSING STATS LINE IS FATAL, NEVER A SKIP. `osRunBounded` returns only an
+// exit code, so stdout and stderr exist solely as files the wrapper redirected
+// into — if the wrapper never execs, or a redirect is dropped, the reads come
+// back empty and every field lookup "finds nothing". Treating that as "this
+// build does not report the field" would switch the rooting oracle off for the
+// whole corpus in one line with no error text anywhere. Absent is an error —
+// with one DECLARED exception, `no-stats`, for a program that replaces the
+// runtime's own write/exit provider and so never reaches `statsReport`
+// (`rootiodarwin`). Declared, with a reason, and it costs that program the
+// collection oracles while keeping its stdout comparison under both policies.
+//
+// A THIRD MARKER, AND IT IS THE WEAKEST THING IN THIS FILE — `stress-waived`.
+// `no-collect` says "the collector cannot matter here"; `stress-waived` says
+// "the collector DOES matter here and this program does not survive it yet". The
+// second run switches to `BIT_GC=off`, so the program keeps proving its stdout
+// under one policy and proves nothing about rooting under the other. The
+// marker's whole design is that the hole cannot hide: the reason is mandatory,
+// and it is printed on EVERY run. A waiver never suppresses the stdout
+// comparison — only the policy changes.
+//
+// EVERY SUBPROCESS CARRIES A WALL-CLOCK DEADLINE. This is the corpus most able
+// to hang, and a program that deadlocks must be reported as a failure naming
+// itself rather than stalling the suite. `osRunBounded` (ABI.md §19) bounds the
+// compile and both runs. `BIT_TEST_TIMEOUT_S` overrides the 300s default.
+// CAVEAT, and it is a real divergence from `tests/proc.zig`: `BIT_TEST_TIMEOUT_S=0`
+// meant "block forever" there, and `osRunBounded` has no unbounded mode — it
+// clamps to one hour. `0` is therefore honored as ONE HOUR here, loudly, rather
+// than silently redefined.
+//
+// WHY A `/bin/sh` WRAPPER. `osRunBounded(path, timeout_ms)` takes no argv, no
+// environment and captures no output, so a shell script is the only way to hand
+// a child `BIT_GC=stress` and keep its stdout. `exec` in the wrapper is
+// LOAD-BEARING, not style: without it the shell stays as the child, and
+// `osRunBounded`'s SIGKILL on timeout kills the shell and orphans the deadlocked
+// stress binary — precisely the hazard this corpus exists to catch. The honest
+// fix is an `osRunBoundedEnv(path, argv, env, timeout_ms)` primitive that returns
+// captured pipes; until it exists this suite has a shell dependency it did not
+// have in Zig.
+//
+// Run it: `zig-out/bin/bit run tests/bit/stress.bit`, from the repository root.
+// `BIT_STRESSGATE_DIR` / `BIT_STRESSGATE_ONLY` narrow the run for debugging and
+// mutation-testing; either one turns the corpus floors off and prints NOT A GATE.
+
+// Upper bound on the directory walk (Power of 10 rule 2).
+const maxPrograms: int = 256
+
+// Corpus floors. A suite that is one loop over a directory reports "0 programs,
+// 0 failures" and exits 0 when the walk finds nothing, so the counts are
+// asserted rather than trusted. `minRunnable` is the per-host half: 38 of the 78
+// directories carry a host marker, so a gate that skipped everything would still
+// look busy.
+const minPrograms: int = 78
+const minRunnable: int = 59
+
+// How many directories must be skipped for belonging to the OTHER host — 19
+// `darwin-only` and 19 `linux-only` today, and the fact that those two numbers
+// are EQUAL is why this constant exists. Inverting the host gate swaps which 19
+// are skipped and leaves `minRunnable` satisfied at 59; mutation-testing the
+// runnable floor is how that was found. Only a per-marker-kind assertion sees it.
+const minHostSkips: int = 19
+
+// How far above its default-policy count a program's stress-policy count must
+// sit before the second run counts as having had a different policy. See the
+// header: the measured margins are 250x and up.
+const stressRatio: int = 8
+
+// The corpus-wide plumbing assertion: at least 1-in-`minProofShare` of the
+// oracled programs must clear `stressRatio`, and the check only applies once
+// `minProofSample` of them have run (a one-program debugging run proves nothing
+// about plumbing and should not pretend to).
+const minProofShare: int = 2
+const minProofSample: int = 4
+
+const defaultTimeoutS: int = 300
+const clampTimeoutMs: int = 3600000
+
+const targetX64Linux: int = 0
+const targetArm64Linux: int = 1
+const targetArm64Macos: int = 2
+
+const aggregatePrefix: string = "[bit-gc] collections="
+
+struct Ctx {
+  root: string,
+  compiler: string,
+  stdlib: string,
+  libbitrt: string,
+  scratch: string,
+  timeoutMs: int,
+  target: int,
+}
+
+struct Text { ok: bool, body: string }
+
+struct Marker { present: bool, reason: string }
+
+// One execution's verdict. `statsOk` is separate from `collections` for the
+// reason the header gives: absent and zero are different answers.
+struct Outcome { ok: bool, statsOk: bool, collections: int, abandoned: int }
+
+// One program's verdict. `oracled` marks a program the collection oracle applies
+// to at all; `proved` marks one whose stress count cleared `stressRatio`, which
+// is what `main`'s corpus-wide plumbing assertion counts.
+struct Verdict { failed: int, oracled: bool, proved: bool }
+
+function say(s: string) {
+  print(s)
+  print("\n")
+}
+
+// Single-file mode has no prelude, so `string(i)` is not a conversion; the one
+// int-to-string road is interpolation.
+function num(v: int): string {
+  return "${v}"
+}
+
+function die(s: string) {
+  say("stress: FATAL: " + s)
+  osExit(1)
+}
+
+// --- small string helpers (single-file mode has no prelude, no std/*) -------
+
+function indexOfAt(hay: string, needle: string, at: int): int {
+  let n = len(needle)
+  if (n == 0) { return at }
+  let i = at
+  while (i + n <= len(hay)) {
+    let j = 0
+    while (j < n && hay[i + j] == needle[j]) { j = j + 1 }
+    if (j == n) { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+function trim(s: string): string {
+  let a = 0
+  let b = len(s)
+  while (a < b && (s[a] == 32 || s[a] == 9 || s[a] == 13 || s[a] == 10)) { a = a + 1 }
+  while (b > a && (s[b - 1] == 32 || s[b - 1] == 9 || s[b - 1] == 13 || s[b - 1] == 10)) { b = b - 1 }
+  return s[a:b]
+}
+
+function lessStr(a: string, b: string): bool {
+  let n = len(a)
+  if (len(b) < n) { n = len(b) }
+  let i = 0
+  while (i < n) {
+    if (a[i] != b[i]) { return a[i] < b[i] }
+    i = i + 1
+  }
+  return len(a) < len(b)
+}
+
+// `fsListDir` returns entries NUL-separated: NUL is the one byte a POSIX
+// filename cannot contain, so unlike a newline it can never appear inside a name.
+function splitNul(raw: string): []string {
+  let out = []string(0)
+  let start = 0
+  let i = 0
+  while (i < len(raw)) {
+    if (raw[i] == 0) {
+      out = append(out, raw[start:i])
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function sortNames(names: []string): []string {
+  let i = 1
+  while (i < len(names)) {
+    let j = i
+    while (j > 0 && lessStr(names[j], names[j - 1])) {
+      let tmp = names[j - 1]
+      names[j - 1] = names[j]
+      names[j] = tmp
+      j = j - 1
+    }
+    i = i + 1
+  }
+  return names
+}
+
+// POSIX single-quoting: everything is literal inside '...', and an embedded
+// quote closes, escapes and reopens. The one correct way to put a path this
+// harness did not choose into a shell command.
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { out = out + "'\\''" } else { out = out + s[i:i + 1] }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// --- files ------------------------------------------------------------------
+
+function readText(path: string): Text {
+  let fd = fsOpen(path, false)
+  if (fd < 0) { return Text{ ok: false, body: "" } }
+  let body = fsReadAll(fd)
+  fsClose(fd)
+  return Text{ ok: true, body: body }
+}
+
+function writeText(path: string, body: string): bool {
+  let fd = fsOpen(path, true)
+  if (fd < 0) { return false }
+  let n = fsWrite(fd, body)
+  fsClose(fd)
+  return n >= 0
+}
+
+// A per-directory oracle marker: absent, or the stated reason. An EMPTY marker
+// is an error — a bare file would let a program weaken the oracle without anyone
+// having to justify it, which is the failure mode the markers exist to prevent.
+function readMarker(name: string, dir: string, marker: string): Marker {
+  let t = readText(dir + "/" + marker)
+  if (!t.ok) { return Marker{ present: false, reason: "" } }
+  let reason = trim(t.body)
+  if (len(reason) == 0) {
+    die("stress '" + name + "': '" + marker + "' marker is empty - state why it applies")
+  }
+  return Marker{ present: true, reason: reason }
+}
+
+// --- the aggregate stats line ----------------------------------------------
+//
+// `runtime/root/{linux,darwin}/boot.bit`'s `statsReport` writes ONE summary line
+// at exit under `BIT_GC_STATS`:
+//   `[bit-gc] collections=<n> swept=<n> live=<n> abandoned=<n> oom=<n> bad=<n>`
+// Every function on the collection path is `@nosplit`, which admits no
+// print/extern/syscall (E0075), so there is no per-collection line to count.
+
+function statsPresent(stderrText: string): bool {
+  return indexOfAt(stderrText, aggregatePrefix, 0) >= 0
+}
+
+// `<field>=<n>` read from the aggregate line, or -1 when the field is absent.
+// Callers must have checked `statsPresent` first: -1 here means malformed, and
+// is never quietly folded into a count.
+function statsField(stderrText: string, field: string): int {
+  let line = indexOfAt(stderrText, aggregatePrefix, 0)
+  if (line < 0) { return -1 }
+  let key = indexOfAt(stderrText, field, line)
+  if (key < 0) { return -1 }
+  let i = key + len(field)
+  if (i >= len(stderrText) || stderrText[i] < 48 || stderrText[i] > 57) { return -1 }
+  let v = 0
+  while (i < len(stderrText) && stderrText[i] >= 48 && stderrText[i] <= 57) {
+    v = v * 10 + int(stderrText[i]) - 48
+    i = i + 1
+  }
+  return v
+}
+
+// --- bounded subprocesses ---------------------------------------------------
+
+// `osRunBounded`'s three outcomes in one i64 (ABI.md §19) rendered as a message,
+// or "" when the child exited 0. Every branch names a DIFFERENT failure: a
+// deadlock, an outside kill and a non-zero exit must not read alike.
+function runMsg(r: int): string {
+  if (r == 0) { return "" }
+  if (r == -1) { return "SPAWN FAILED (fork/exec/wait error)" }
+  if (r == -2) { return "TIMED OUT" }
+  if (r <= -100) { return "KILLED BY SIGNAL " + num(0 - r - 100) }
+  return "exited " + num(r)
+}
+
+// Write `body` as an executable `/bin/sh` script and run it under the deadline.
+function runScript(cx: Ctx, path: string, body: string): int {
+  if (!writeText(path, body)) { die("cannot write wrapper script " + path) }
+  if (fsChmod(path, 493) != 0) { die("cannot chmod wrapper script " + path) }
+  return osRunBounded(path, cx.timeoutMs)
+}
+
+// --- one program ------------------------------------------------------------
+
+// Build `dir` with the self-hosted compiler. `BIT_LIBBITRT`/`BIT_STDLIB` pin the
+// archive and stdlib so the harness is independent of its working directory, and
+// a whole-PROJECT build (not a single module) is what `tests/stress/spinlock`
+// needs: it imports the lock under test straight out of `runtime/`.
+function buildProgram(cx: Ctx, name: string, dir: string, bin: string): bool {
+  let base = cx.scratch + "/" + name
+  let errPath = base + ".berr"
+  let body = "#!/bin/sh\n" +
+    "BIT_STDLIB=" + shQuote(cx.stdlib) +
+    " BIT_LIBBITRT=" + shQuote(cx.libbitrt) +
+    " exec " + shQuote(cx.compiler) + " build " + shQuote(dir) + " -o " + shQuote(bin) +
+    " >" + shQuote(base + ".bout") + " 2>" + shQuote(errPath) + "\n"
+  let r = runScript(cx, base + ".build.sh", body)
+  if (r == 0) { return true }
+  say("stress '" + name + "' [compile]: " + runMsg(r))
+  let e = readText(errPath)
+  if (e.ok) { say(trim(e.body)) }
+  return false
+}
+
+// One execution. `envLine` is the environment prefix the wrapper applies; it is
+// always the whole story about the policy, so a run is labelled by what it got.
+//
+// `slot` keeps the two runs' capture files APART, and that is not tidiness: with
+// one shared pair of paths, a second run whose redirect never happened would
+// read the FIRST run's output and its stats line, and report the default run's
+// numbers as the stress run's. Absent has to look absent.
+function runOnce(cx: Ctx, name: string, bin: string, slot: string, label: string, envLine: string, expected: string, statsRequired: bool): Outcome {
+  let base = cx.scratch + "/" + name + "." + slot
+  let outPath = base + ".out"
+  let errPath = base + ".err"
+  let body = "#!/bin/sh\nunset BIT_GC BIT_GC_STATS\n" +
+    envLine + " exec " + shQuote(bin) +
+    " >" + shQuote(outPath) + " 2>" + shQuote(errPath) + "\n"
+  let r = runScript(cx, base + ".run.sh", body)
+
+  let errText = readText(errPath)
+  if (!errText.ok) {
+    say("stress '" + name + "' [" + label + "]: could not read captured stderr " + errPath +
+      " - the wrapper never ran, so nothing about this program was verified")
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+  }
+  if (r != 0) {
+    say("stress '" + name + "' [" + label + "]: " + runMsg(r))
+    say("stderr: " + trim(errText.body))
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+  }
+
+  let outText = readText(outPath)
+  if (!outText.ok) {
+    say("stress '" + name + "' [" + label + "]: could not read captured stdout " + outPath)
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+  }
+  if (outText.body != expected) {
+    say("stress '" + name + "' [" + label + "]: output mismatch")
+    say("  expected: " + trim(expected))
+    say("  got:      " + trim(outText.body))
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+  }
+
+  // Both runs carry `BIT_GC_STATS=1`, so the aggregate line must be there in
+  // BOTH. Its absence is the tell that the environment never reached the child
+  // (or that the capture is broken), and it is fatal for exactly that reason —
+  // unless the program has DECLARED that it owns the exit path and therefore
+  // never reaches `statsReport` (`no-stats`, see `checkProgram`).
+  if (!statsPresent(errText.body)) {
+    if (statsRequired) {
+      say("stress '" + name + "' [" + label + "]: no '" + aggregatePrefix + "' line in " + errPath + ".")
+      say("  BIT_GC_STATS=1 was set for this run, so the line is missing only if the")
+      say("  environment never reached the child or the capture is broken. Either way")
+      say("  the collector oracle below would read every field as absent. A program that")
+      say("  replaces the runtime's own exit path declares that with a 'no-stats' file.")
+      return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+    }
+    return Outcome{ ok: true, statsOk: false, collections: -1, abandoned: -1 }
+  }
+  let collections = statsField(errText.body, "collections=")
+  let abandoned = statsField(errText.body, "abandoned=")
+  if (collections < 0 || abandoned < 0) {
+    say("stress '" + name + "' [" + label + "]: malformed stats line in " + errPath)
+    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
+  }
+  return Outcome{ ok: true, statsOk: true, collections: collections, abandoned: abandoned }
+}
+
+// Both policies for one program, plus the oracles the second run must satisfy.
+// Returns 1 on failure, 0 on success.
+function checkProgram(cx: Ctx, name: string, dir: string): Verdict {
+  let bad = Verdict{ failed: 1, oracled: false, proved: false }
+  let expected = readText(dir + "/" + name + ".expected")
+  if (!expected.ok) {
+    // A hard error, never a skip: a rename would otherwise delete a program from
+    // the corpus in silence.
+    say("stress '" + name + "': cannot read " + dir + "/" + name + ".expected")
+    return bad
+  }
+
+  let noCollect = readMarker(name, dir, "no-collect")
+  let noAbandon = readMarker(name, dir, "no-abandon")
+  let waived = readMarker(name, dir, "stress-waived")
+  // A program that REPLACES the runtime's write/exit provider — `rootiodarwin`
+  // and `rootiolinux` are the whole of it — never reaches `statsReport`, so it
+  // emits no aggregate line however the environment is set. Declared, with a
+  // reason, exactly like the other markers: the alternative is treating a
+  // missing line as tolerable everywhere, which is how the oracle stops oracling.
+  let noStats = readMarker(name, dir, "no-stats")
+
+  let bin = cx.scratch + "/bin-" + name
+  if (!buildProgram(cx, name, dir, bin)) { return bad }
+
+  let base = "default"
+  let first = runOnce(cx, name, bin, "a", base, "BIT_GC_STATS=1", expected.body, !noStats.present)
+  if (!first.ok) { fsRemove(bin); return bad }
+
+  let label = "BIT_GC=stress"
+  let envLine = "BIT_GC=stress BIT_GC_STATS=1"
+  if (waived.present) {
+    // The waiver admits a hole rather than arguing one away, so it carries its
+    // reason into the output on every single run.
+    say("stress '" + name + "': STRESS-WAIVED, running BIT_GC=off instead:")
+    say("  " + waived.reason)
+    label = "BIT_GC=off (waived)"
+    envLine = "BIT_GC=off BIT_GC_STATS=1"
+  }
+  let second = runOnce(cx, name, bin, "b", label, envLine, expected.body, !noStats.present)
+  fsRemove(bin)
+  if (!second.ok) { return bad }
+  if (!second.statsOk) { return Verdict{ failed: 0, oracled: false, proved: false } }
+
+  // `BIT_GC=off` collects nothing BY DEFINITION, so a non-zero count here means
+  // the policy in the wrapper is not the policy the child ran under. The waived
+  // programs are the only place the port can prove that directly.
+  if (waived.present) {
+    if (second.collections != 0) {
+      say("stress '" + name + "' [" + label + "]: " + num(second.collections) +
+        " collections under BIT_GC=off. The policy in the wrapper did not reach the child.")
+      return bad
+    }
+    return Verdict{ failed: 0, oracled: false, proved: false }
+  }
+
+  let oracled = !noCollect.present
+  let proved = false
+  if (oracled) {
+    if (second.collections == 0) {
+      say("stress '" + name + "' [" + label + "]: the collector never ran, so this run verified")
+      say("  nothing about rooting. Give the program a loop where the roots it cares about are")
+      say("  live, or - if it proves something about emission or linking rather than rooting -")
+      say("  add a 'no-collect' file to its directory stating why.")
+      return bad
+    }
+    // The policy differential, and the reason it is reported rather than
+    // enforced HERE. Allocation-driven programs clear `stressRatio` by two to
+    // five orders of magnitude, but a sleep-bounded one does not: `schedtimer`
+    // measured 99 against 41 and `schedwakedarwin` 150 against 62, because their
+    // loops are paced by a clock rather than by back-edges. Failing those two
+    // would be calibrating the oracle to the wrong thing. The plumbing claim is
+    // a property of the HARNESS, not of each program, so it is asserted once
+    // over the corpus in `main` — see `minProofShare`.
+    proved = second.collections > first.collections * stressRatio
+    if (!proved) {
+      say("stress '" + name + "': " + num(second.collections) + " collections under " + label +
+        " against " + num(first.collections) + " under the default policy - below the " +
+        num(stressRatio) + "x margin, so this program is not one of the corpus's policy proofs.")
+    }
+  }
+
+  // Opt-in, and only where the program was built so the defect is the sole
+  // possible cause (ABI.md §6): an abandoned rendezvous is always SAFE, and a
+  // thread asleep in `parkSleepNs` reads as `running`, so most programs here
+  // cannot promise zero.
+  if (noAbandon.present && second.abandoned != 0) {
+    say("stress '" + name + "' [" + label + "]: " + num(second.abandoned) +
+      " collections were ABANDONED against " + num(second.collections) + " collected, and this")
+    say("  program's 'no-abandon' marker says none may be. Something stayed in the mutator")
+    say("  registry as 'running' that should not have - usually an OS thread that exited")
+    say("  without its slot being released (ABI.md §6).")
+    return bad
+  }
+  return Verdict{ failed: 0, oracled: oracled, proved: proved }
+}
+
+// --- setup ------------------------------------------------------------------
+
+function targetTriple(t: int): string {
+  if (t == targetX64Linux) { return "x86_64-linux" }
+  if (t == targetArm64Linux) { return "aarch64-linux" }
+  if (t == targetArm64Macos) { return "aarch64-macos" }
+  die("unknown host target ordinal " + num(t))
+  return ""
+}
+
+function timeoutMs(): int {
+  let raw = trim(osEnv("BIT_TEST_TIMEOUT_S"))
+  if (len(raw) == 0) { return defaultTimeoutS * 1000 }
+  let v = 0
+  let i = 0
+  while (i < len(raw)) {
+    if (raw[i] < 48 || raw[i] > 57) { die("BIT_TEST_TIMEOUT_S is not a number: " + raw) }
+    v = v * 10 + int(raw[i]) - 48
+    i = i + 1
+  }
+  if (v == 0) {
+    // CLAUDE.md documents 0 as "disable and block forever". `osRunBounded` has no
+    // unbounded mode, so say what actually happens instead of pretending.
+    say("stress: BIT_TEST_TIMEOUT_S=0 cannot disable the bound - osRunBounded clamps to one")
+    say("  hour (ABI.md §19). Using one hour.")
+    return clampTimeoutMs
+  }
+  return v * 1000
+}
+
+// A PRIVATE COPY of the compiler, never `zig-out/bin/bit` itself: a concurrent
+// `zig build` rewrites that artifact in place and macOS SIGKILLs the exec,
+// failing every case with no output at all (#1644).
+function privateCompiler(cx: Ctx, src: string): string {
+  let dst = cx.scratch + "/bit"
+  let r = runScript(cx, cx.scratch + "/copy.sh", "#!/bin/sh\nexec cp " + shQuote(src) + " " + shQuote(dst) + "\n")
+  if (r != 0) { die("cannot copy the compiler: " + runMsg(r)) }
+  if (fsChmod(dst, 493) != 0) { die("cannot chmod the compiler copy") }
+  return dst
+}
+
+function main() {
+  let root = trim(osEnv("BIT_STRESSGATE_ROOT"))
+  if (len(root) == 0) { root = "." }
+  if (!fsIsDir(root + "/tests/stress") || !fsIsDir(root + "/stdlib")) {
+    die("run this from the repository root (or set BIT_STRESSGATE_ROOT): '" + root +
+      "' has no tests/stress + stdlib")
+  }
+
+  // The two debugging knobs, and the asymmetry between them is deliberate.
+  // `BIT_STRESSGATE_ONLY` narrows which programs are EXECUTED; it does not touch
+  // enumeration or the host gate, so BOTH corpus floors still apply under it and
+  // a filtered run cannot hide an empty walk or an inverted host gate.
+  // `BIT_STRESSGATE_DIR` replaces the corpus outright, which the floors are
+  // counting - so that one, and only that one, turns them off and says so.
+  let corpus = trim(osEnv("BIT_STRESSGATE_DIR"))
+  let only = trim(osEnv("BIT_STRESSGATE_ONLY"))
+  let fixture = len(corpus) > 0
+  let partial = fixture || len(only) > 0
+  if (len(corpus) == 0) { corpus = root + "/tests/stress" }
+  if (partial) {
+    say("stress: *** PARTIAL RUN - NOT A GATE *** (BIT_STRESSGATE_DIR/ONLY set)")
+  }
+  if (fixture) { say("stress: corpus floors are OFF - BIT_STRESSGATE_DIR replaced the corpus") }
+
+  let target = hostTarget()
+  let compilerSrc = root + "/zig-out/bin/bit"
+  let libbitrt = root + "/zig-out/lib/" + targetTriple(target) + "/libbitrt.a"
+  if (!fsExists(compilerSrc)) { die("no self-hosted compiler at " + compilerSrc) }
+  if (!fsExists(libbitrt)) { die("no runtime archive at " + libbitrt) }
+
+  let scratch = "/tmp/bit-stressgate-" + num(timeUnixNs())
+  if (fsMkdir(scratch) != 0) { die("cannot create scratch dir " + scratch) }
+
+  let cx = Ctx{
+    root: root,
+    compiler: compilerSrc,
+    stdlib: root + "/stdlib",
+    libbitrt: libbitrt,
+    scratch: scratch,
+    timeoutMs: timeoutMs(),
+    target: target,
+  }
+  cx = Ctx{
+    root: cx.root,
+    compiler: privateCompiler(cx, compilerSrc),
+    stdlib: cx.stdlib,
+    libbitrt: cx.libbitrt,
+    scratch: cx.scratch,
+    timeoutMs: cx.timeoutMs,
+    target: cx.target,
+  }
+
+  let names = sortNames(splitNul(fsListDir(corpus)))
+  if (len(names) > maxPrograms) { die("more than " + num(maxPrograms) + " entries in " + corpus) }
+
+  let dirs = []string(0)
+  let i = 0
+  while (i < len(names) && i < maxPrograms) {
+    if (fsIsDir(corpus + "/" + names[i])) { dirs = append(dirs, names[i]) }
+    i = i + 1
+  }
+  if (!fixture && len(dirs) < minPrograms) {
+    die("found " + num(len(dirs)) + " program directories in " + corpus + ", expected at least " +
+      num(minPrograms) + " - the corpus walk found nothing to run")
+  }
+
+  // Apply the host gate as its OWN pass, and check its floor before a single
+  // program is built. A program that can only run on one OS marks itself:
+  // `darwin-only` is `extern function` (SPEC §11.7) — Bit's ELF output is fully
+  // static with no dynamic symbol table, so an extern symbol has nothing to
+  // resolve against and the compiler rejects it outright — and `linux-only` is
+  // the mirror, for `syscall` (§11.8). Neither compiles elsewhere, so it is a
+  // skip, not a failure.
+  //
+  // Separated from the run loop for two reasons. The floor below is the guard
+  // against an INVERTED gate, and an inverted gate selects exactly the programs
+  // that cannot compile here — so checking it afterwards means sitting through
+  // 19 compile failures to be told the gate is backwards. And `eligible` is
+  // counted before `ONLY` is applied, so a filtered run still enforces it: a
+  // guard a debugging knob can switch off is not a guard.
+  let eligible = []string(0)
+  let skippedDarwin = 0
+  let skippedLinux = 0
+  let e = 0
+  while (e < len(dirs)) {
+    let dir = corpus + "/" + dirs[e]
+    if (fsExists(dir + "/darwin-only") && target != targetArm64Macos) {
+      skippedDarwin = skippedDarwin + 1
+    } else if (fsExists(dir + "/linux-only") && target == targetArm64Macos) {
+      skippedLinux = skippedLinux + 1
+    } else {
+      eligible = append(eligible, dirs[e])
+    }
+    e = e + 1
+  }
+  let skipped = skippedDarwin + skippedLinux
+  if (!fixture && len(eligible) < minRunnable) {
+    die("only " + num(len(eligible)) + " of " + num(len(dirs)) + " programs are runnable on this host (" +
+      num(skipped) + " skipped), expected at least " + num(minRunnable))
+  }
+  // The count above does NOT catch an inverted gate, and finding that out is the
+  // reason this check exists. The corpus carries 19 `darwin-only` and 19
+  // `linux-only` directories — inverting the comparison SWAPS which 19 are
+  // skipped and leaves the runnable total at 59, green, with a skip count that
+  // still looks right. Only counting the two marker kinds SEPARATELY breaks that
+  // symmetry: on macOS the darwin-only skip count must be zero and the
+  // linux-only one must not be, and inverting the gate reverses exactly that.
+  let wrongWay = skippedDarwin
+  let rightWay = skippedLinux
+  if (target != targetArm64Macos) {
+    wrongWay = skippedLinux
+    rightWay = skippedDarwin
+  }
+  if (!fixture && (wrongWay != 0 || rightWay < minHostSkips)) {
+    die("host gate is inverted: skipped " + num(wrongWay) + " programs marked for THIS host and " +
+      num(rightWay) + " marked for the other (expected 0 and at least " + num(minHostSkips) + ")")
+  }
+
+  let ran = 0
+  let failures = 0
+  let oracled = 0
+  let proofs = 0
+  let k = 0
+  while (k < len(eligible)) {
+    let name = eligible[k]
+    k = k + 1
+    if (len(only) > 0 && indexOfAt("," + only + ",", "," + name + ",", 0) < 0) { continue }
+    ran = ran + 1
+    let v = checkProgram(cx, name, corpus + "/" + name)
+    failures = failures + v.failed
+    if (v.oracled) { oracled = oracled + 1 }
+    if (v.proved) { proofs = proofs + 1 }
+  }
+
+  // THE PLUMBING ASSERTION, and it is the one guard the Zig harness could not
+  // have. `collections != 0` cannot tell `BIT_GC=stress` from the default run
+  // repeated, so if the second wrapper's environment silently stopped arriving
+  // every program would still pass its own oracle while precise rooting was
+  // never exercised. Collecting at every safepoint costs two to five orders of
+  // magnitude, so a majority of the oracled programs must show it. Asserted over
+  // the corpus rather than per program because a clock-paced program legitimately
+  // cannot clear the margin (see `checkProgram`), and asserted as a SHARE rather
+  // than a count so a filtered run enforces it too.
+  say("stress: policy proofs " + num(proofs) + "/" + num(oracled) +
+    " (stress count above " + num(stressRatio) + "x the default count)")
+  if (oracled >= minProofSample && proofs * minProofShare < oracled) {
+    say("stress: FAIL - only " + num(proofs) + " of " + num(oracled) + " oracled programs collected")
+    say("  meaningfully more under BIT_GC=stress than under the default policy. That is not a")
+    say("  stress pass, it is the default run performed twice: the environment in the second")
+    say("  wrapper is not reaching the child.")
+    failures = failures + 1
+  }
+
+  if (failures != 0) {
+    say("stress: FAIL - " + num(ran) + " programs run, " + num(skipped) + " skipped, " +
+      num(failures) + " failed")
+    osExit(1)
+  }
+  let tag = "PASS"
+  if (partial) { tag = "PASS (PARTIAL RUN - NOT A GATE)" }
+  say("stress: " + tag + " - " + num(ran) + " programs run, " + num(skipped) + " skipped")
+}

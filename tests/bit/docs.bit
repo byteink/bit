@@ -1,0 +1,603 @@
+// Doc-tests — the Bit-native port of tests/docs.zig (#351).
+//
+// The property, in one sentence: every ```` ```bit ```` fenced block under
+// `docs/` that is not marked `ignore` typechecks against the real prelude and
+// the real `std/*` — with a page's blocks joined into ONE module unless the page
+// carries `<!-- doctest: per-block -->`.
+//
+// Documentation that does not compile is worse than no documentation, because a
+// reader trusts it. A snippet is CHECKED, not built: it is a module, not a
+// program, so it has no `main` to link. That is exactly what lets a reference
+// page show one function in isolation.
+//
+// A page's blocks are one module by default, concatenated in document order,
+// because that is how a reference page reads: `interfaces.md` declares
+// `interface Shape` in one block and implements it three blocks later. It also
+// means such a page cannot declare a name twice. A page whose blocks are
+// separate programs — a tutorial, where each snippet is a whole `main` you could
+// run — says so with `<!-- doctest: per-block -->`, and each of its blocks is
+// checked on its own. A block that cannot join its page's module is fenced
+// ```` ```bit ignore ````: still highlighted as Bit, just not checked.
+//
+// WHAT THE PORT CHANGES, AND THE NEW FAILURE MODE IT CREATES. The Zig original
+// called the front end in-process (`bit.checkHostProject`) and got the
+// diagnostics back as a value. Bit gets one subprocess primitive — ABI.md §19's
+// `os_run_bounded(path, timeout_ms)`, no argv and no stdout capture — so argv,
+// the `BIT_STDLIB` override and the output redirect all have to come from a
+// generated `/bin/sh` script, and the harness sees only that SCRIPT's exit
+// status. That is a way to be green while checking nothing which did not exist
+// before the port: `exec` on the last line is what makes the script's status BE
+// the compiler's, and any of a trailing command, a `; exit 0`, or `&>` (which
+// dash parses as `& >`, backgrounding the compiler) turns every check into a
+// silent pass. `plumbingSelfTest` runs FIRST and exists solely to kill that: it
+// checks one snippet that must pass and one that must fail, and aborts the whole
+// run if the broken one comes back clean.
+//
+// WHY THE SCRIPT IS WRITTEN ONCE AND NEVER REWRITTEN. Rewriting an executable
+// while a previous exec of it may still be in flight is the ETXTBSY trap that
+// bit tests/harness.zig (74811a3). Only `mod/main.bit` — data, never exec'd —
+// changes between the 219 invocations.
+//
+// WHY THE COMPILER IS COPIED BEFORE BEING RUN. The self-hosted `bit` is
+// rewritten in place by a `has_side_effects` build step, so a concurrent build
+// truncates the file mid-exec (#1644); a truncated binary execs with no output,
+// which a "did it report errors" assertion would happily read as success. The
+// per-run nonce in the scratch path is #1828's fix for the fixed-/tmp-path race.
+//
+// FLOORS, NOT A `> 0` FLOOR. `checked > 0` — the Zig original's only corpus
+// assertion — cannot tell 271 blocks from 1. A cursor that fails to advance past
+// a close fence yields exactly one block per page and still passes it. The
+// floors below are set just under the live corpus (271 blocks over 31 pages,
+// 219 invocations) so a structural regression in the extractor lands under them.
+
+import { readFile, writeFile, exists, isDir, mkdir, remove, walk } from "std/fs"
+import { contains, indexOf, hasSuffix, parseInt } from "std/strings"
+import { env, envOr } from "std/os"
+
+// Bounds on the walk, so the traversal is provably finite (Power of 10).
+const maxFiles: int = 256
+const maxBlocksPerFile: int = 128
+
+const fenceTag: string = "```bit"
+const fenceClose: string = "\n```"
+
+// A page carrying this marker has its blocks checked one at a time, rather than
+// joined into a single module.
+const perBlockMarker: string = "<!-- doctest: per-block -->"
+
+// Corpus floors. Each is set below today's real count with room for ordinary
+// documentation churn, and far above the value any known extractor regression
+// would produce.
+const minPagesWithBlocks: int = 25
+const minTotalBlocks: int = 250
+const minInvocations: int = 200
+
+// Everything one check invocation needs. Resolved once, asserted once.
+struct Cfg {
+  bin: string        // the compiler under test, already copied into scratch
+  stdlibDir: string
+  docsDir: string
+  dir: string        // scratch root
+  modDir: string     // the module `bit check` is pointed at
+  modMain: string    // the file rewritten per snippet
+  script: string     // the generated runner, written once
+  outPath: string    // captured stdout+stderr of one check
+  timeoutMs: i64
+}
+
+// One check: the child's ABI.md §19 status, and whatever it printed.
+struct CheckResult {
+  code: i64
+  report: string
+}
+
+// One extractBlocks unit case.
+struct ExtractCase {
+  name: string
+  md: string
+  want: []string
+}
+
+// Setup failures are never a pass. Every one of them ends the process nonzero
+// rather than leaving work unrun — a skipped check is a green test, which is
+// exactly the vacuity this file exists to avoid.
+function die(msg: string) {
+  eprint("docs: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+function slurp(path: string, what: string): string {
+  if (!exists(path)) {
+    die("${what}: missing: ${path}")
+  }
+  return readFile(path) catch e {
+    die("${what}: ${path}: ${e.message()}")
+    ""
+  }
+}
+
+function spill(path: string, content: string, what: string) {
+  writeFile(path, content) catch e {
+    die("${what}: ${path}: ${e.message()}")
+  }
+}
+
+// 8 bytes of OS entropy, the same scheme compiler/build.bit uses for scratch
+// paths it writes and then execs. A timestamp is not enough: two processes CAN
+// read the same nanosecond, they cannot draw the same 64-bit nonce.
+function nonce(): uint {
+  let b = []byte(cryptoRandomBytes(8))
+  let x: uint = 0
+  let i = 0
+  while (i < 8) {
+    x = (x << 8) | uint(b[i])
+    i = i + 1
+  }
+  return x
+}
+
+// The repo root: the nearest ancestor holding BOTH the built compiler and the
+// docs tree. Overridable with BIT_REPO. Not finding one is a hard failure, never
+// a skip — an empty corpus from a wrong cwd is the classic green no-op.
+function repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/zig-out/bin/bit") && isDir("${c}/docs")) {
+      return c
+    }
+  }
+  die("cannot locate the repo root from this cwd; set BIT_REPO")
+  return ""
+}
+
+// " \t\r" trimmed from both ends. NOT std/strings' trimSpace, which leaves `\r`
+// — a CRLF page would then have info string "\r", every block would test as
+// unchecked, and the whole page would silently contribute nothing.
+function trimInfo(s: string): string {
+  let lo = 0
+  while (lo < len(s) && (s[lo] == ' ' || s[lo] == '\t' || s[lo] == '\r')) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && (s[hi - 1] == ' ' || s[hi - 1] == '\t' || s[hi - 1] == '\r')) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+// The checkable `bit` blocks in `md`: those fenced exactly ```` ```bit ```` at
+// the start of a line. A port of the Zig extractor, decision for decision.
+//
+// The two tests that look redundant and are not: `atLineStart` rejects a
+// ```` ```bit ```` written inside prose (docs/stdlib/README.md has one), and
+// `len(info) == 0` rejects both ```` ```bit ignore ```` and a hypothetical
+// ```` ```bitrot ````, which shares the tag as a prefix.
+function extractBlocks(md: string): []string {
+  let blocks = []string(0)
+  let rest = md
+  while (len(blocks) < maxBlocksPerFile) {
+    let tagRel = indexOf(rest, fenceTag)
+    if (tagRel < 0) {
+      break
+    }
+    let t = int(tagRel)
+    let atLineStart = t == 0 || rest[t - 1] == '\n'
+    let afterTag = rest[t + len(fenceTag):]
+
+    // The rest of the fence line is the info string's remaining words.
+    let nlRel = indexOf(afterTag, "\n")
+    if (nlRel < 0) {
+      break
+    }
+    let n = int(nlRel)
+    let info = trimInfo(afterTag[:n])
+    let body = afterTag[n + 1:]
+
+    let closeRel = indexOf(body, fenceClose)
+    if (closeRel < 0) {
+      break
+    }
+    let c = int(closeRel)
+    if (atLineStart && len(info) == 0) {
+      blocks = append(blocks, body[:c])
+    }
+    // Advancing to the close fence — not past the open one — is what stops a
+    // nested ```` ```bit ```` inside a block being re-read as a new block, and
+    // is the line whose absence yields exactly one block per page.
+    rest = body[c:]
+  }
+  return blocks
+}
+
+// A page's blocks, joined into one module in document order.
+function joinBlocks(blocks: []string): string {
+  let out = ""
+  for b of blocks {
+    out = out + b + "\n\n"
+  }
+  return out
+}
+
+// Typechecks `src` as a module in the scratch directory.
+function checkModule(cfg: Cfg, src: string): CheckResult {
+  spill(cfg.modMain, src, "scratch module")
+
+  // The previous run's capture is removed before the child starts: a spawn that
+  // never happens must not be able to hand back stale, clean-looking output.
+  if (exists(cfg.outPath)) {
+    remove(cfg.outPath) catch e {
+      die("stale capture ${cfg.outPath}: ${e.message()}")
+    }
+  }
+
+  let r = osRunBounded(cfg.script, cfg.timeoutMs)
+  // ABI.md §19 packs three outcomes into one i64. Folding any of them into
+  // "nonzero, therefore the snippet is bad" would let a child that never ran
+  // masquerade as a real diagnostic; folding them into 0 would be worse.
+  if (r == -1) {
+    return CheckResult{ code: r, report: "SPAWN FAILED (fork/exec/wait error) running ${cfg.script}" }
+  }
+  if (r == -2) {
+    return CheckResult{ code: r, report: "TIMED OUT after ${cfg.timeoutMs}ms" }
+  }
+  if (r <= -100) {
+    return CheckResult{ code: r, report: "compiler killed by signal ${-r - 100}" }
+  }
+  if (r < 0) {
+    return CheckResult{ code: r, report: "unknown os_run_bounded result ${r}" }
+  }
+  if (!exists(cfg.outPath)) {
+    return CheckResult{ code: -3, report: "no output capture at ${cfg.outPath}: the runner script is not redirecting" }
+  }
+  return CheckResult{ code: r, report: slurp(cfg.outPath, "check output") }
+}
+
+// Runs BEFORE the corpus walk, and aborts it on any surprise.
+//
+// This is the countermeasure to the port's own failure mode: the harness reads
+// one number, the runner script's exit status, and a script that cannot fail
+// makes every page pass. So one snippet that must check clean and one that must
+// not are run through the exact same path the corpus uses. The good one also
+// imports `std/strings`, which proves BIT_STDLIB reached the child — without it
+// every std-importing page would fail for a reason that has nothing to do with
+// the docs.
+function plumbingSelfTest(cfg: Cfg) {
+  let good = checkModule(cfg, "import { contains } from \"std/strings\"\n\nfunction docsPlumbingOk(s: string): bool {\n  return contains(s, \"a\")\n}\n")
+  if (good.code != 0) {
+    die("plumbing: a known-good snippet did not check (status ${good.code}):\n${good.report}")
+  }
+
+  let bad = checkModule(cfg, "let docsPlumbingBad: int = \"not an int\"\n")
+  if (bad.code == 0) {
+    die("plumbing: a DELIBERATELY BROKEN snippet checked clean — the runner is swallowing the compiler's exit status, so this gate cannot fail. Captured output:\n${bad.report}")
+  }
+  if (!contains(bad.report, "error[")) {
+    die("plumbing: the broken snippet failed (status ${bad.code}) but no diagnostics were captured — the output redirect is not wired. Captured:\n${bad.report}")
+  }
+}
+
+// The extractor's own tests, on literal pages rather than the corpus. The
+// corpus floors prove the extractor finds a lot; these prove it finds the RIGHT
+// things, which no count can.
+function extractCases(): []ExtractCase {
+  return [
+    // The Zig original's case: takes ```bit, skips ```bit ignore and a bare
+    // fence, and the two results prove the cursor advances past a close fence.
+    ExtractCase{
+      name: "takes-bit-skips-ignore-and-plain",
+      md: "intro\n```bit\nlet a = 1\n```\nprose\n```\nnot bit\n```\n```bit ignore\nthis need not compile\n```\n```bit\nlet b = 2\n```\n",
+      want: ["let a = 1", "let b = 2"],
+    },
+    // docs/stdlib/README.md's live shape: a ```bit written inside prose. Its
+    // info string is empty in neither reading, but the at-line-start test is
+    // what must reject it — and the following real block must still be found.
+    ExtractCase{
+      name: "inline-fence-is-not-a-block",
+      md: "x ```bit\nnope\n```\n```bit\nlet ok = 1\n```\n",
+      want: ["let ok = 1"],
+    },
+    // CRLF. The info string is "\r", which only trimInfo (not std/strings'
+    // trimSpace) reduces to empty. Get this wrong and a CRLF page silently
+    // contributes zero blocks.
+    ExtractCase{
+      name: "crlf-page",
+      md: "```bit\r\nlet a = 1\r\n```\r\n",
+      want: ["let a = 1\r"],
+    },
+    // ```bitrot shares the tag as a prefix and is not a Bit fence at all.
+    ExtractCase{
+      name: "bitrot-is-not-bit",
+      md: "```bitrot\nlet a = 1\n```\n",
+      want: [],
+    },
+    // An unterminated fence is dropped, not half-read.
+    ExtractCase{
+      name: "unterminated-fence",
+      md: "```bit\nlet a = 1\n",
+      want: [],
+    },
+  ]
+}
+
+function runExtractTests(): int {
+  let cases = extractCases()
+  // A shortened case list is a green run that proves nothing.
+  assert(len(cases) == 5)
+
+  let failed = 0
+  for c of cases {
+    let got = extractBlocks(c.md)
+    if (len(got) != len(c.want)) {
+      eprint("docs: FAIL extractBlocks/${c.name}: got ${len(got)} block(s), want ${len(c.want)}\n")
+      failed = failed + 1
+      continue
+    }
+    let i = 0
+    let ok = true
+    while (i < len(got)) {
+      if (got[i] != c.want[i]) {
+        eprint("docs: FAIL extractBlocks/${c.name}: block #${i + 1} was ${jsonish(got[i])}, want ${jsonish(c.want[i])}\n")
+        ok = false
+      }
+      i = i + 1
+    }
+    if (!ok) {
+      failed = failed + 1
+    }
+  }
+  return failed
+}
+
+// A one-line, newline-escaped rendering, so a diff of captured text stays on one
+// line and an empty value is visibly empty rather than invisible.
+function jsonish(s: string): string {
+  let out = "\""
+  let i = 0
+  while (i < len(s)) {
+    let ch = s[i]
+    if (ch == byte(10)) {
+      out = out + "\\n"
+    } else if (ch == byte(13)) {
+      out = out + "\\r"
+    } else if (ch == byte(34)) {
+      out = out + "\\\""
+    } else {
+      out = out + string([]byte([ch]))
+    }
+    i = i + 1
+  }
+  return out + "\""
+}
+
+// The scratch tree, the compiler copy and the runner script. Built once.
+function setup(root: string): Cfg {
+  let docsDir = envOr("BIT_DOCS", "${root}/docs")
+  if (!isDir(docsDir)) {
+    die("BIT_DOCS is not a directory: ${docsDir}")
+  }
+
+  let stdlibDir = envOr("BIT_STDLIB", "${root}/stdlib")
+  if (!isDir(stdlibDir)) {
+    die("stdlib is not a directory: ${stdlibDir} (set BIT_STDLIB)")
+  }
+
+  // The compiler under test is the one built in this tree, never PATH's `bit`
+  // — that is brew's release build, a different compiler entirely.
+  let src = envOr("BIT", "${root}/zig-out/bin/bit")
+  if (!exists(src)) {
+    die("compiler under test is missing: ${src} (set BIT)")
+  }
+
+  let timeoutS = 300
+  let raw = envOr("BIT_TEST_TIMEOUT_S", "300")
+  timeoutS = parseInt(raw) catch _ {
+    die("BIT_TEST_TIMEOUT_S is not an integer: ${jsonish(raw)}")
+    300
+  }
+  // 0 disables the bound in the Zig harnesses; ABI.md §19 has no "forever", so
+  // it maps to the one-hour clamp rather than being silently treated as 0ms.
+  let timeoutMs: i64 = 3600000
+  if (timeoutS > 0) {
+    timeoutMs = i64(timeoutS) * 1000
+  }
+
+  let dir = "/tmp/bit-docsgate-${nonce()}"
+  mkdir(dir) catch e {
+    die("mkdir ${dir}: ${e.message()}")
+  }
+  let modDir = "${dir}/mod"
+  mkdir(modDir) catch e {
+    die("mkdir ${modDir}: ${e.message()}")
+  }
+
+  let bin = "${dir}/bit"
+  spill(bin, slurp(src, "compiler under test"), "compiler copy")
+  if (fsChmod(bin, 493) != 0) {
+    die("chmod ${bin}")
+  }
+
+  let cfg = Cfg{
+    bin: bin,
+    stdlibDir: stdlibDir,
+    docsDir: docsDir,
+    dir: dir,
+    modDir: modDir,
+    modMain: "${modDir}/main.bit",
+    script: "${dir}/run.sh",
+    outPath: "${dir}/out.txt",
+    timeoutMs: timeoutMs,
+  }
+
+  // Written ONCE, then never touched again: rewriting a script between execs is
+  // the ETXTBSY hazard, and `exec` on the last line is the load-bearing token —
+  // it makes this script's exit status BE the compiler's.
+  spill(cfg.script,
+    "#!/bin/sh\n" +
+    "BIT_STDLIB='${cfg.stdlibDir}'\n" +
+    "export BIT_STDLIB\n" +
+    "exec '${cfg.bin}' check '${cfg.modDir}' >'${cfg.outPath}' 2>&1\n",
+    "runner script")
+  if (fsChmod(cfg.script, 493) != 0) {
+    die("chmod ${cfg.script}")
+  }
+  return cfg
+}
+
+// std/fs has no recursive delete, so every leaf is named. Failures here are
+// reported, not fatal: the run's verdict is already decided.
+function teardown(cfg: Cfg) {
+  let leaves = [cfg.modMain, cfg.script, cfg.outPath, cfg.bin]
+  for p of leaves {
+    if (exists(p)) {
+      remove(p) catch e {
+        eprint("docs: warning: cannot remove ${p}: ${e.message()}\n")
+      }
+    }
+  }
+  let dirs = [cfg.modDir, cfg.dir]
+  for d of dirs {
+    if (exists(d)) {
+      remove(d) catch e {
+        eprint("docs: warning: cannot remove ${d}: ${e.message()}\n")
+      }
+    }
+  }
+}
+
+// Every .md file under `docsDir`, in walk order and bounded by maxFiles.
+function docPages(docsDir: string): []string {
+  let all = walk(docsDir) catch e {
+    // Never swallowed into an empty list: an empty corpus passes every
+    // assertion that is not a floor.
+    die("cannot walk ${docsDir}: ${e.message()}")
+    []string(0)
+  }
+  if (len(all) > maxFiles) {
+    die("${docsDir} holds ${len(all)} entries, over the maxFiles bound of ${maxFiles}")
+  }
+  let pages = []string(0)
+  for p of all {
+    if (hasSuffix(p, ".md")) {
+      pages = append(pages, p)
+    }
+  }
+  return pages
+}
+
+// What the corpus walk observed. Every field is asserted afterwards; none is
+// merely reported.
+struct Stats {
+  pages: int
+  pagesWithBlocks: int
+  pagesWithoutBlocks: int
+  totalBlocks: int
+  invocations: int
+  failures: int
+}
+
+// One page, checked. Returns the invocations it made and the failures it saw,
+// folded into `st` by the caller.
+function checkPage(cfg: Cfg, page: string, md: string, blocks: []string, st: Stats): Stats {
+  let out = st
+  if (contains(md, perBlockMarker)) {
+    let i = 0
+    while (i < len(blocks)) {
+      let r = checkModule(cfg, blocks[i])
+      out.invocations = out.invocations + 1
+      if (r.code != 0) {
+        out.failures = out.failures + 1
+        eprint("\ndocs: FAIL ${page} block #${i + 1} does not typecheck (status ${r.code}):\n${r.report}\n--- snippet ---\n${blocks[i]}\n")
+      }
+      i = i + 1
+    }
+    return out
+  }
+
+  let joined = joinBlocks(blocks)
+  let r = checkModule(cfg, joined)
+  out.invocations = out.invocations + 1
+  if (r.code != 0) {
+    out.failures = out.failures + 1
+    eprint("\ndocs: FAIL ${page} (${len(blocks)} blocks, joined) does not typecheck (status ${r.code}):\n${r.report}\n--- joined module ---\n${joined}\n")
+  }
+  return out
+}
+
+function runCorpus(cfg: Cfg, pages: []string): Stats {
+  let st = Stats{ pages: len(pages), pagesWithBlocks: 0, pagesWithoutBlocks: 0,
+    totalBlocks: 0, invocations: 0, failures: 0 }
+  for page of pages {
+    let md = slurp(page, "doc page")
+    let blocks = extractBlocks(md)
+    if (len(blocks) == 0) {
+      st.pagesWithoutBlocks = st.pagesWithoutBlocks + 1
+      continue
+    }
+    if (len(blocks) >= maxBlocksPerFile) {
+      die("${page} hit the maxBlocksPerFile bound of ${maxBlocksPerFile}; blocks past it are silently unchecked")
+    }
+    st.pagesWithBlocks = st.pagesWithBlocks + 1
+    st.totalBlocks = st.totalBlocks + len(blocks)
+    st = checkPage(cfg, page, md, blocks, st)
+  }
+  return st
+}
+
+// The floors, each naming what it would have caught — a bare number in a
+// failure message is a puzzle rather than a diagnosis.
+function checkFloors(st: Stats): int {
+  let floored = 0
+  if (st.pagesWithBlocks < minPagesWithBlocks) {
+    eprint("docs: FLOOR: only ${st.pagesWithBlocks} page(s) yielded blocks, want >= ${minPagesWithBlocks} — the corpus shrank or the fence match broke\n")
+    floored = floored + 1
+  }
+  if (st.totalBlocks < minTotalBlocks) {
+    eprint("docs: FLOOR: only ${st.totalBlocks} block(s) extracted, want >= ${minTotalBlocks} — a cursor that stops after the first block per page lands here\n")
+    floored = floored + 1
+  }
+  if (st.invocations < minInvocations) {
+    eprint("docs: FLOOR: only ${st.invocations} check invocation(s), want >= ${minInvocations} — per-block pages are being joined, or pages are being skipped\n")
+    floored = floored + 1
+  }
+  if (st.pagesWithoutBlocks * 2 >= st.pages) {
+    eprint("docs: FLOOR: ${st.pagesWithoutBlocks} of ${st.pages} page(s) yielded nothing — the info-string test is rejecting real fences\n")
+    floored = floored + 1
+  }
+  return floored
+}
+
+function main() {
+  let cfg = setup(repoRoot())
+
+  // Unit first: a broken extractor makes every corpus number meaningless.
+  let unitFailures = runExtractTests()
+  if (unitFailures != 0) {
+    teardown(cfg)
+    eprint("docs: FAILED — ${unitFailures} extractBlocks unit case(s)\n")
+    osExit(1)
+  }
+
+  // Plumbing second, and before a single page is read.
+  plumbingSelfTest(cfg)
+
+  let pages = docPages(cfg.docsDir)
+  if (len(pages) == 0) {
+    teardown(cfg)
+    eprint("docs: FAILED — no .md files under ${cfg.docsDir}\n")
+    osExit(1)
+  }
+
+  let st = runCorpus(cfg, pages)
+  teardown(cfg)
+
+  let floored = checkFloors(st)
+  if (st.failures != 0 || floored != 0) {
+    eprint("docs: FAILED — ${st.failures} page/block failure(s), ${floored} floor violation(s) over ${st.pages} page(s) in ${cfg.docsDir}\n")
+    osExit(1)
+  }
+  print("docs: ok — ${st.totalBlocks} block(s) over ${st.pagesWithBlocks} page(s), ${st.invocations} check invocation(s), ${st.pages} .md file(s) in ${cfg.docsDir}\n")
+}

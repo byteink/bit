@@ -1,0 +1,265 @@
+// Examples compile-and-run guard — the Bit port of tests/examples.zig.
+//
+// Every directory under `examples/` is a module holding one showcase program.
+// This gate asserts that each still COMPILES with the shipping compiler and
+// that the binary it produces EXITS 0. There are no directives and no
+// `.expected` files: an example is a showcase, not an output oracle, so the
+// only contract is "the showcase does not rot as the language grows". Output
+// correctness stays the golden corpus's job (tests/harness.zig).
+//
+// Run it: `bit run tests/bit/examplesgate.bit` from the repository root.
+// Configure it by environment, since `bit run` forwards no argv to the program:
+//   BIT                 compiler under test    (default zig-out/bin/bit)
+//   EXAMPLES            examples directory     (default examples)
+//   BIT_TEST_TIMEOUT_S  per-child deadline     (default 300, clamped to 3600)
+//
+// Three things this file exists to NOT do, each of which has shipped here
+// before as a green gate over an empty input set:
+//
+//   - `fs.walk` is never used. It returns FILES only ("directories are
+//     descended into, not themselves returned"), so the obvious
+//     `for p of walk(dir) { if (!isDir(p)) continue ... }` skips every entry
+//     forever. Discovery is `readDir` (one level, already sorted) filtered by
+//     `isDir`.
+//   - The discovered count is pinned EXACTLY, the way
+//     `scripts/selfhost-diffexamples.sh` pins EXPECTED_REFUSED. Adding or
+//     deleting an example is then a reviewed edit to `expectedExamples`, not an
+//     unasserted number scrolling past.
+//   - A bad `BIT`/`EXAMPLES` path, or a `readDir` that fails, is RED. "0
+//     examples, ok" is the failure mode this gate is defending against.
+//
+// A hang is a failure, not a stall (#1637/#1652): every child carries a
+// wall-clock deadline and a child killed by a signal is reported as a CRASH,
+// never as a timeout — scoring a segfault as a timeout sends the reader hunting
+// the wrong bug. Unlike the Zig harness, whose compile ran in-process, the
+// COMPILER is bounded here too.
+
+import { exists, isDir, readDir, readFile, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { join } from "std/path"
+import { parseInt } from "std/strings"
+import { now } from "std/time"
+
+// Exactly how many example modules there must be. See the header: this is a
+// pin, not a bound.
+const expectedExamples: int = 51
+
+// Per-child wall-clock limit, mirroring `tests/proc.zig`'s constants and its
+// `BIT_TEST_TIMEOUT_S` name. There is no `0` escape hatch here: `osRunBounded`
+// has no unbounded mode, so the floor is one second.
+const defaultTimeoutS: int = 300
+const maxTimeoutS: int = 3600
+const timeoutEnvVar: string = "BIT_TEST_TIMEOUT_S"
+
+// `osRunBounded`'s result encoding (ABI.md §19). `<= rcSignalBase` means the
+// child died of signal `-(r) - 100`.
+const rcSpawnFailed: int = -1
+const rcTimedOut: int = -2
+const rcSignalBase: int = -100
+
+// What one example did, in the order of severity the exit code reports.
+const outcomeOk: int = 0
+const outcomeFailed: int = 1
+const outcomeTimedOut: int = 2
+
+function main() {
+  let bin = envOr("BIT", "zig-out/bin/bit")
+  let dir = envOr("EXAMPLES", "examples")
+
+  // A mistyped path must be RED, never "0 examples, ok".
+  if (!exists(bin)) {
+    eprint("examplesgate: compiler not found: ${bin} (set BIT)\n")
+    exit(1)
+    return
+  }
+  if (!isDir(dir)) {
+    eprint("examplesgate: not a directory: ${dir} (set EXAMPLES)\n")
+    exit(1)
+    return
+  }
+
+  let cases = discover(dir)
+  if (len(cases) != expectedExamples) {
+    eprint("examplesgate: ${dir} holds ${len(cases)} modules, want ${expectedExamples}\n")
+    eprint("examplesgate: adding one means updating 'expectedExamples' here\n")
+    exit(1)
+    return
+  }
+  exit(runAll(bin, dir, cases, timeoutSeconds() * 1000))
+}
+
+// The example module names under `dir`: `readDir` (one level, already sorted,
+// so the report order is reproducible) filtered by `isDir`. NEVER `walk` — see
+// the header. A directory that cannot be read ends the run rather than
+// returning an empty list, which the caller could not tell from "no examples".
+function discover(dir: string): []string {
+  let names = readDir(dir) catch _ {
+    eprint("examplesgate: cannot read ${dir}\n")
+    exit(1)
+    return []string(0)
+  }
+  let cases = []string(0)
+  for name of names {
+    if (isDir(join(dir, name))) {
+      cases = append(cases, name)
+    }
+  }
+  return cases
+}
+
+// Runs every example and returns the process exit code: 0 all green, 1 a real
+// failure, 2 at least one TIMED OUT. Exit 2 is "could not decide", matching
+// scripts/x64gate.sh and scripts/selfhost-diffexamples.sh — a hang decided
+// nothing and is not a pass, and a caller can tell the two apart.
+function runAll(bin: string, dir: string, cases: []string, timeoutMs: int): int {
+  let failed = 0
+  let timedOut = 0
+  let i = 0
+  while (i < len(cases)) {
+    let r = runExample(bin, dir, cases[i], i, timeoutMs)
+    if (r == outcomeTimedOut) {
+      timedOut = timedOut + 1
+    } else if (r == outcomeFailed) {
+      failed = failed + 1
+    } else {
+      print("ok ${cases[i]}\n")
+    }
+    i = i + 1
+  }
+  if (timedOut > 0) {
+    eprint("examplesgate: FAILED — ${timedOut} timed out, ${failed} failed\n")
+    return 2
+  }
+  if (failed > 0) {
+    eprint("examplesgate: FAILED — ${failed} of ${len(cases)} example(s)\n")
+    return 1
+  }
+  print("${len(cases)}/${expectedExamples} examples built and exited 0\n")
+  return 0
+}
+
+// Builds `<dir>/<name>` and runs the binary, as two separately bounded
+// children so that compile-fail, hang, crash and non-zero-exit stay four
+// distinct outcomes. Returns one of the `outcome*` constants.
+function runExample(bin: string, dir: string, name: string, idx: int, timeoutMs: int): int {
+  // A nonce per example: a FIXED /tmp name is the clobber/ETXTBSY shape #1459
+  // records, and concurrent agents running this gate is routine here. Mirrors
+  // the compiler's own `scratchNonce`.
+  let base = "/tmp/bit-exgate-${name}-${now()}-${idx}"
+  let out = "${base}.bin"
+  let src = join(dir, name)
+
+  let buildCmd = "exec \"${bin}\" build \"${src}\" -o \"${out}\""
+  let br = runBounded("${base}-build.sh", "${base}-build.log", buildCmd, timeoutMs)
+  if (br != 0) {
+    fsRemove(out)
+    return report(name, "build", br, "${base}-build.log")
+  }
+  fsRemove("${base}-build.log")
+
+  // `exec` in the script makes the shell BECOME the example binary, so the
+  // exit code and any fatal signal belong to the example itself; the
+  // redirection keeps 51 programs' output out of the report unless one fails.
+  let rr = runBounded("${base}-run.sh", "${base}-run.log", "exec \"${out}\"", timeoutMs)
+  fsRemove(out)
+  if (rr != 0) {
+    return report(name, "run", rr, "${base}-run.log")
+  }
+  fsRemove("${base}-run.log")
+  return outcomeOk
+}
+
+// Writes `cmd` into an executable `/bin/sh` script and runs it under a
+// deadline, with the script's output captured in `log`.
+//
+// The script exists only because `osRunBounded` takes a path and NO argv
+// (ABI.md §19), so a command WITH arguments cannot be expressed directly. An
+// argv-taking bounded-spawn primitive would delete this function and the POSIX
+// shell it puts on the path of a toolchain that otherwise needs none.
+function runBounded(script: string, log: string, cmd: string, timeoutMs: int): int {
+  writeFile(script, "#!/bin/sh\nexec >\"${log}\" 2>&1\n${cmd}\n") catch e {
+    eprint("examplesgate: cannot write ${script}: ${e.message()}\n")
+    return rcSpawnFailed
+  }
+  if (fsChmod(script, 493) != 0) {
+    eprint("examplesgate: cannot make ${script} executable\n")
+    fsRemove(script)
+    return rcSpawnFailed
+  }
+  let r = osRunBounded(script, timeoutMs)
+  fsRemove(script)
+  return r
+}
+
+// Names one example's failure on stderr and classifies it. `phase` is "build"
+// or "run", so a compiler that refuses is never confused with a program that
+// exits non-zero.
+function report(name: string, phase: string, r: int, log: string): int {
+  if (r == rcTimedOut) {
+    eprint("example '${name}': TIMED OUT in ${phase}\n")
+    eprint("  killed at the ${timeoutEnvVar} deadline; raise it on a slower host\n")
+    fsRemove(log)
+    return outcomeTimedOut
+  }
+  if (r <= rcSignalBase) {
+    eprint("example '${name}': CRASHED in ${phase} — ${signalName(0 - r + rcSignalBase)}\n")
+  } else if (r == rcSpawnFailed) {
+    eprint("example '${name}': could not spawn ${phase}\n")
+  } else {
+    eprint("example '${name}': ${phase} exited with ${r}\n")
+  }
+  let text = readFile(log) catch _ {
+    ""
+  }
+  if (len(text) > 0) {
+    eprint("--- ${name} ${phase} output ---\n${text}\n")
+  }
+  fsRemove(log)
+  return outcomeFailed
+}
+
+// The signal numbers worth naming, as `tests/proc.zig`'s `signalName` does.
+// Anything else reports its number, which is still attributable.
+function signalName(sig: int): string {
+  if (sig == 4) {
+    return "SIGILL (4)"
+  }
+  if (sig == 6) {
+    return "SIGABRT (6)"
+  }
+  if (sig == 8) {
+    return "SIGFPE (8)"
+  }
+  if (sig == 9) {
+    return "SIGKILL (9)"
+  }
+  if (sig == 10) {
+    return "SIGBUS (10)"
+  }
+  if (sig == 11) {
+    return "SIGSEGV (11)"
+  }
+  return "signal ${sig}"
+}
+
+// The per-child limit in seconds. An unset or unparsable value falls back to
+// the default rather than failing the run — this is a host knob, not a
+// property of the corpus — and any value is clamped into [1, maxTimeoutS] so
+// a typo can neither disable the deadline nor make it useless.
+function timeoutSeconds(): int {
+  let raw = envOr(timeoutEnvVar, "")
+  if (len(raw) == 0) {
+    return defaultTimeoutS
+  }
+  let n = parseInt(raw) catch _ {
+    eprint("examplesgate: ${timeoutEnvVar}='${raw}' is not a number\n")
+    return defaultTimeoutS
+  }
+  if (n < 1) {
+    return 1
+  }
+  if (n > maxTimeoutS) {
+    return maxTimeoutS
+  }
+  return n
+}

@@ -1,0 +1,421 @@
+// `bit lint`'s process-exit-code contract (#1380), ported off `tests/lintcmd.zig`.
+//
+// The property under test: `bit lint`'s EXIT CODE is a faithful trichotomy over
+// a real directory walk — 0 only when every walked `.bit` file is clean or
+// covered by an override, 1 when a finding survived the overrides, 2 when the
+// run could not be trusted (unknown flag, unreadable path, malformed or unknown
+// directive). "Could not lint" must never degrade into "looks clean".
+//
+// None of that is reachable from inside the linting process: an exit code is
+// observable only to a parent, and stdout and stderr are only distinguishable
+// from outside. So this program builds a throwaway tree, execs the real
+// `bit lint` against it through `/bin/sh`, and reads back the code and both
+// streams. `compiler/lintcheck.bit` covers everything below that line (the
+// directive reader, the rule, the renderers).
+//
+// Run it from the repository root:
+//     ./zig-out/bin/bit run tests/bit/lintcmd.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/zig-out/bin/bit`, resolved from a child's own `pwd` — Bit has
+// no getcwd primitive, and `selfExe()` here is the throwaway binary `bit run`
+// built, not the compiler that built it.
+//
+// Anti-vacuity, all of it load-bearing: every capture is asserted non-empty and
+// matched against its POSITIVE needle before any absence check; the fixture is
+// read back off disk before the first lint run; the directive table's length is
+// asserted before the loop and its iteration count after it; and the final line
+// prints how many checks actually ran, so a gate that stops checking is visible
+// rather than green.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, walk, writeFile } from "std/fs"
+import { contains, parseInt, repeat, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+import { Json, jsonParse, jsonAsArray, jsonAsInt, jsonAsString, jsonGet } from "std/json"
+
+// One `bit lint` invocation, as seen from outside it.
+struct Run { code: int, out: string, err: string }
+
+// Assertion accounting. A struct because Bit has no mutable module-level state,
+// and the count is the anti-vacuity marker: an empty run must not read as pass.
+struct Tally { checks: int, failures: int }
+
+// One row of the LINT.md §5.2 directive-error table.
+struct Directive { src: string, code: string, needle: string }
+
+// How long any one child gets. The whole compiler corpus lints in ~70ms, so
+// this only ever fires on a hang — and a hang is a failure, not a stall (#1637).
+function timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status, so each one
+// is a named panic rather than a value any assertion could consume.
+function shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lintcmd: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lintcmd: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lintcmd: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lintcmd: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise the dev-tree build
+// artifact relative to the working directory this program was started in,
+// obtained by asking a child for its `pwd`. Never returns "" — a compiler this
+// cannot find is a hard stop, not a skipped test.
+function bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("lintcmd: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("lintcmd: could not read the working directory (exit ${code})")
+  }
+  let cwd = trimWs(readFile(cwdFile)?)
+  let candidate = "${cwd}/zig-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("lintcmd: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// The tree every case below lints. Write errors propagate: an unwritten fixture
+// makes `bit lint .` exit 0 over an empty directory, which would silently
+// satisfy most of this file's assertions.
+function makeFixture(root: string): ()! {
+  mkdir(root)?
+  mkdir("${root}/sub")?
+  // 900 lines, no directive: one E0200 against the 800 default.
+  writeFile("${root}/big.bit", "// a file over the default limit\n" + repeat("let x = 1\n", 899))?
+  // The same size, with the override that freezes it there: no finding, and one
+  // override in the accounting.
+  writeFile("${root}/raised.bit",
+    "// bit:lint max-file-lines=900 -- pre-dates lint\n" + repeat("let y = 2\n", 899))?
+  writeFile("${root}/sub/small.bit", "let z = 3\n")?
+  // Not a `.bit` file: the walk must not pick it up. It is 900 lines, so if the
+  // extension filter ever breaks, this fixture fires rather than passing.
+  writeFile("${root}/readme.txt", repeat("not bit\n", 900))?
+}
+
+// Reads the fixture back off disk. The Zig harness could take `writeFile`'s
+// success for granted; here the write path is the same GC'd runtime under test,
+// so the input set is confirmed to exist before anything is asserted about it.
+function verifyFixture(t: Tally, root: string): ()! {
+  let want = ["${root}/big.bit", "${root}/raised.bit", "${root}/readme.txt", "${root}/sub/small.bit"]
+  let got = walk(root)?
+  check(t, len(got) == len(want), "fixture: walk found ${len(got)} files, want ${len(want)}")
+  let i = 0
+  while (i < len(want) && i < len(got)) {
+    check(t, got[i] == want[i], "fixture: entry ${i} is ${got[i]}, want ${want[i]}")
+    i = i + 1
+  }
+  let big = readFile("${root}/big.bit")?
+  check(t, len(split(big, "\n")) == 901, "fixture: big.bit is not 900 lines")
+}
+
+// Runs `bit lint <args...>` with `root` as the working directory.
+//
+// The script always exits 0 and writes the real status to `code.txt`, so a
+// missing `code.txt` is unmistakably "the lint never ran" rather than a status
+// some assertion could mistake for a clean sheet. Stale captures are deleted
+// first for the same reason: no case may read a previous case's output.
+function runLint(bit: string, root: string, capDir: string, args: []string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  let quoted = ""
+  for a of args {
+    quoted = quoted + " '" + a + "'"
+  }
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 0\n" +
+    "'${bit}' lint${quoted} > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lintcmd: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lintcmd: no exit code was recorded for `bit lint${quoted}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+function clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Records one assertion. Failures are named and the run continues, so a single
+// invocation reports every broken expectation instead of only the first.
+function check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// `r` is a usable observation of a real run: a recorded status, and streams that
+// are not silently empty. Every absence check in this file runs only after its
+// case has passed this, because the empty string satisfies all of them.
+function checkRan(t: Tally, r: Run, label: string) {
+  check(t, len(r.err) > 0, "${label}: stderr is empty — `bit lint` always prints a summary")
+}
+
+function jsonField(o: Json, key: string): string {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return "<missing>"
+  }
+  return unwrapOr(jsonAsString(unwrap(f)), "<not-a-string>")
+}
+
+function jsonInt(o: Json, key: string): int {
+  let f = jsonGet(o, key)
+  if (isNone(f)) {
+    return -1
+  }
+  return unwrapOr(jsonAsInt(unwrap(f)), -1)
+}
+
+function jsonHas(o: Json, key: string): bool {
+  return isSome(jsonGet(o, key))
+}
+
+// exit 1 on a finding, exit 0 once an override covers it.
+function checkTrichotomy(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  // The whole tree: big.bit is over, raised.bit is covered by its override.
+  let all = runLint(bit, root, capDir, ["."], ms)?
+  checkRan(t, all, "whole tree")
+  check(t, all.code == 1, "whole tree: exit ${all.code}, want 1")
+  check(t, contains(all.err, "warning[E0200]"), "whole tree: no warning[E0200] on stderr")
+  check(t, contains(all.err, "file is 900 lines, limit is 800"), "whole tree: finding message missing")
+  // The hint must teach the form WITH the reason placeholder; without it, the
+  // form it teaches would itself exit 2 on first use.
+  check(t, contains(all.err, "max-file-lines=900 -- <reason>"), "whole tree: hint omits the reason placeholder")
+  // Exactly one finding: raised.bit is the same size and must not fire.
+  check(t, contains(all.err, "lint: 1 findings, 1 overrides active"), "whole tree: wrong summary line")
+  // readme.txt is not a .bit file and must not be walked at all.
+  check(t, !contains(all.err, "readme.txt"), "whole tree: readme.txt was walked")
+
+  // A clean subtree still prints the summary, and exits 0.
+  let sub = runLint(bit, root, capDir, ["sub"], ms)?
+  checkRan(t, sub, "sub")
+  check(t, sub.code == 0, "sub: exit ${sub.code}, want 0")
+  check(t, contains(sub.err, "lint: 0 findings, 0 overrides active"), "sub: wrong summary line")
+
+  // No path argument means `.`, so it must agree with the explicit form.
+  let bare = runLint(bit, root, capDir, []string(0), ms)?
+  checkRan(t, bare, "no path argument")
+  check(t, bare.code == 1, "no path argument: exit ${bare.code}, want 1")
+  check(t, contains(bare.err, "lint: 1 findings, 1 overrides active"), "no path argument: wrong summary line")
+
+  // A single file names exactly that file.
+  let one = runLint(bit, root, capDir, ["raised.bit"], ms)?
+  checkRan(t, one, "single file")
+  check(t, one.code == 0, "single file: exit ${one.code}, want 0")
+  check(t, contains(one.err, "lint: 0 findings, 1 overrides active"), "single file: wrong summary line")
+}
+
+// --json goes to stdout in the `bit check --json` shape.
+function checkJson(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runLint(bit, root, capDir, ["--json", "."], ms)?
+  checkRan(t, r, "--json")
+  check(t, r.code == 1, "--json: exit ${r.code}, want 1")
+  check(t, len(r.out) > 0, "--json: stdout is empty")
+  // Parsing it is the assertion that matters: a consumer that cannot parse it is
+  // the whole failure mode.
+  let parsed = jsonParse(trimWs(r.out)) catch e {
+    check(t, false, "--json: stdout does not parse: ${e.message()}")
+    return
+  }
+  let arr = unwrapOr(jsonAsArray(parsed), []Json(0))
+  check(t, len(arr) == 1, "--json: ${len(arr)} diagnostics, want 1")
+  if (len(arr) == 1) {
+    let d = arr[0]
+    check(t, jsonField(d, "code") == "E0200", "--json: code is ${jsonField(d, "code")}")
+    check(t, jsonField(d, "severity") == "warning", "--json: severity is ${jsonField(d, "severity")}")
+    check(t, jsonField(d, "file") == "./big.bit", "--json: file is ${jsonField(d, "file")}")
+    check(t, jsonHas(d, "message"), "--json: no message key")
+    check(t, jsonHas(d, "hint"), "--json: no hint key")
+    let range = jsonGet(d, "range")
+    check(t, isSome(range), "--json: no range key")
+    if (isSome(range)) {
+      let start = jsonGet(unwrap(range), "start")
+      check(t, isSome(start), "--json: range has no start")
+      if (isSome(start)) {
+        check(t, jsonInt(unwrap(start), "line") == 0, "--json: start.line is ${jsonInt(unwrap(start), "line")}")
+        check(t, jsonInt(unwrap(start), "character") == 0,
+          "--json: start.character is ${jsonInt(unwrap(start), "character")}")
+      }
+    }
+  }
+  // The summary stays on stderr so the JSON can be piped unfiltered.
+  check(t, contains(r.err, "lint: 1 findings"), "--json: summary not on stderr")
+  check(t, !contains(r.out, "lint:"), "--json: summary leaked onto stdout")
+}
+
+// --stats lists the overrides in force and reports no findings.
+function checkStats(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  let r = runLint(bit, root, capDir, ["--stats", "."], ms)?
+  checkRan(t, r, "--stats")
+  // Findings are suppressed, so the run is clean even though big.bit is over.
+  check(t, r.code == 0, "--stats: exit ${r.code}, want 0")
+  check(t, contains(r.out, "./raised.bit: max-file-lines=900"), "--stats: override not listed on stdout")
+  // The count still covers every file walked, not only files with findings.
+  check(t, contains(r.err, "lint: 0 findings, 1 overrides active"), "--stats: wrong summary line")
+  check(t, !contains(r.err, "E0200"), "--stats: a finding was reported anyway")
+}
+
+// exit 2 on a usage error, an unreadable path, and each bad-directive class.
+function checkUntrusted(t: Tally, bit: string, root: string, capDir: string, ms: int): ()! {
+  // Usage error: an unknown flag is never taken for a path.
+  let flag = runLint(bit, root, capDir, ["--quiet", "."], ms)?
+  checkRan(t, flag, "unknown flag")
+  check(t, flag.code == 2, "unknown flag: exit ${flag.code}, want 2")
+  check(t, contains(flag.err, "unknown flag '--quiet'"), "unknown flag: not named on stderr")
+
+  // Unreadable path: named by the user and not read is a hole in the run.
+  let missing = runLint(bit, root, capDir, ["no/such/path"], ms)?
+  checkRan(t, missing, "missing path")
+  check(t, missing.code == 2, "missing path: exit ${missing.code}, want 2")
+  check(t, contains(missing.err, "no such file or directory"), "missing path: not reported on stderr")
+
+  // Each of the four directive error classes (LINT.md §5.2), one at a time, and
+  // each must take down the whole run — a directive that quietly does nothing is
+  // how a lint rule dies.
+  let cases = [
+    Directive{ src: "// bit:lint max-file-lines 900 -- nope\n", code: "E0299", needle: "malformed lint directive" },
+    Directive{ src: "// bit:lint max-file-lines=900\n", code: "E0299", needle: "has no reason" },
+    Directive{ src: "// bit:lint max-file-lines=900 --   \n", code: "E0299", needle: "reason is empty" },
+    Directive{ src: "// bit:lint max-fyle-lines=900 -- typo\n", code: "E0298", needle: "unknown lint rule" },
+  ]
+  check(t, len(cases) == 4, "directive table holds ${len(cases)} rows, want 4")
+  let seen = 0
+  let bad = "${root}/bad.bit"
+  for c of cases {
+    writeFile(bad, c.src)?
+    let r = runLint(bit, root, capDir, ["."], ms)?
+    checkRan(t, r, "directive ${c.code}/${c.needle}")
+    check(t, r.code == 2, "directive ${c.code}/${c.needle}: exit ${r.code}, want 2")
+    check(t, contains(r.err, c.code), "directive ${c.code}/${c.needle}: code not on stderr")
+    check(t, contains(r.err, c.needle), "directive ${c.code}/${c.needle}: message not on stderr")
+    // Findings are reported INSTEAD of directive errors, never alongside: a
+    // broken override set would produce a finding set nobody asked for.
+    check(t, !contains(r.err, "E0200"), "directive ${c.code}/${c.needle}: a finding was reported alongside")
+    seen = seen + 1
+  }
+  check(t, seen == 4, "directive loop ran ${seen} times, want 4")
+
+  // And with every directive fixed, the same tree is back to exit 1.
+  remove(bad)?
+  let back = runLint(bit, root, capDir, ["."], ms)?
+  checkRan(t, back, "directives removed")
+  check(t, back.code == 1, "directives removed: exit ${back.code}, want 1")
+}
+
+// Every case, against a fixture built fresh under `scratch`. Split out of
+// `main` so each half stays inside the repo's own max-complexity limit.
+function runAll(t: Tally, scratch: string, ms: int) {
+  let root = "${scratch}/tree"
+  let capDir = "${scratch}/cap"
+  mkdir(capDir) catch e {
+    panic("lintcmd: cannot create ${capDir}: ${e.message()}")
+  }
+  let bit = bitBinary(scratch, ms) catch e {
+    panic("lintcmd: ${e.message()}")
+  }
+  makeFixture(root) catch e {
+    panic("lintcmd: cannot build the fixture: ${e.message()}")
+  }
+  verifyFixture(t, root) catch e {
+    panic("lintcmd: cannot read the fixture back: ${e.message()}")
+  }
+  checkTrichotomy(t, bit, root, capDir, ms) catch e { panic("lintcmd: ${e.message()}") }
+  checkJson(t, bit, root, capDir, ms) catch e { panic("lintcmd: ${e.message()}") }
+  checkStats(t, bit, root, capDir, ms) catch e { panic("lintcmd: ${e.message()}") }
+  checkUntrusted(t, bit, root, capDir, ms) catch e { panic("lintcmd: ${e.message()}") }
+}
+
+function main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-lintcmd-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("lintcmd: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, ms)
+  runAll(t, scratch, ms)
+
+  // The run marker: a gate that stopped checking is visible here rather than
+  // green. 72 is what the four cases above assert today; the floor only has to
+  // be tight enough that a whole case going missing trips it.
+  if (t.checks < 72) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 72\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("lintcmd: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("lintcmd: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+function teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+// `std/strings`' `trimSpace` stops at spaces and tabs, and every capture here
+// arrives newline-terminated from a shell redirect.
+function trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+function isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+function trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}

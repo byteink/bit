@@ -1,0 +1,374 @@
+// Every exported stdlib symbol is documented (#356) — the Bit port of
+// `tests/stdlib_docs.zig`.
+//
+// The list of what `std/strings` exports is not maintained by hand anywhere: it
+// is derived from the resolver's `exports` table by `compiler/doc.bit`, the same
+// code behind `bit doc`. This harness walks `stdlib/*`, asks `bit doc` for that
+// list, and exits non-zero if a symbol has no section in `docs/stdlib/<mod>.md`.
+//
+// A section is an `###` heading whose first backticked word is the symbol:
+//
+//     ### `toUpper(s: string): string`
+//     ### `pi: f64`
+//     ### `File.readAll(): string!`
+//
+// Requiring the heading — not merely a mention — is deliberate. Prose says
+// "returns the count"; a heading says "here is `count`, and here is its
+// signature". Adding an export without documenting it fails this gate, which is
+// the only mechanism that reliably keeps reference docs complete.
+//
+// The examples in those pages are compiled separately, by `tests/docs.zig`.
+//
+// Usage (cwd is the repo root, as for every other build step):
+//
+//     bit run tests/bit/stdlibdocs.bit
+//
+// `bit run` forwards no argv to the program, so the two paths the Zig version
+// got from `build_options` come from the environment instead, each with a
+// checked default and a hard failure when the default is wrong:
+//
+//     BIT_DOCS_ROOT      repo root                      (default ".")
+//     BIT_DOC_BIN        the `bit` under test           (default "<root>/zig-out/bin/bit")
+//     BIT_TEST_TIMEOUT_S per-module deadline in seconds (default 300, 0 = none)
+//
+// A wrong root cannot pass quietly: `<root>/stdlib` and `<root>/docs/stdlib`
+// must both be directories, at least `minModules` modules must be found, and at
+// least `minSymbols` exported symbols must be seen across them.
+
+import { readDir, isDir, readFile, writeFile } from "std/fs"
+import { exit, envOr } from "std/os"
+import { indexOf, hasPrefix, split, parseInt } from "std/strings"
+
+// Bounds, so every walk is provably finite (Power of 10 rule 2).
+const maxModules: int = 64
+const maxHeadings: int = 100000
+const maxSymbols: int = 20000
+
+// Anti-vacuity floors. Today's tree has 20 modules and 977 exported symbols; a
+// partial collapse (19 modules documenting nothing) has to be as loud as a total
+// one, which `documented > 0` on its own is not.
+const minModules: int = 20
+const minSymbols: int = 900
+
+// Matches `tests/proc.zig`'s default child deadline.
+const defaultTimeoutMs: int = 300000
+
+// ---------------------------------------------------------------------------
+// The matcher
+// ---------------------------------------------------------------------------
+
+// Whether `md` has an `### `<name>...`` heading. The character right after the
+// name must not be an identifier character, so `count` does not match a heading
+// for `countWords`.
+function hasSection(md: string, name: string): bool {
+  let marker = "### `"
+  let rest = md
+  let seen = 0
+  while (seen < maxHeadings) {
+    seen = seen + 1
+    let at = indexOf(rest, marker)
+    if (at < 0) {
+      return false
+    }
+    let after = rest[at + len(marker):]
+    if (hasPrefix(after, name)) {
+      let tail = after[len(name):]
+      if (len(tail) == 0 || !isIdentChar(tail[0])) {
+        return true
+      }
+    }
+    rest = after
+  }
+  return false
+}
+
+function isIdentChar(c: u8): bool {
+  if (c >= u8(48) && c <= u8(57)) {
+    return true
+  }
+  if (c >= u8(65) && c <= u8(90)) {
+    return true
+  }
+  if (c >= u8(97) && c <= u8(122)) {
+    return true
+  }
+  return c == u8(95)
+}
+
+// The six-case unit test for `hasSection`, run BEFORE the walk. Without it a
+// matcher that lost the `isIdentChar` guard — or one that says yes on empty
+// input — would report zero missing symbols and read as a clean pass.
+function checkHasSection(): bool {
+  let md = "Prose mentioning count and toUpper freely.\n" +
+    "### `count(s: string, sub: string): int`\n" +
+    "### `File.readAll(): string!`\n" +
+    "### `pi: f64`\n"
+  let ok = true
+  if (!hasSection(md, "count")) {
+    eprint("hasSection: missed the `count` heading\n")
+    ok = false
+  }
+  if (!hasSection(md, "File.readAll")) {
+    eprint("hasSection: missed the `File.readAll` heading\n")
+    ok = false
+  }
+  if (!hasSection(md, "pi")) {
+    eprint("hasSection: missed the `pi` heading\n")
+    ok = false
+  }
+  if (hasSection(md, "countWords")) {
+    eprint("hasSection: matched `countWords` against the `count` heading\n")
+    ok = false
+  }
+  if (hasSection(md, "toUpper")) {
+    eprint("hasSection: matched `toUpper`, which only appears in prose\n")
+    ok = false
+  }
+  if (hasSection(md, "coun")) {
+    eprint("hasSection: matched `coun`, a prefix of a heading\n")
+    ok = false
+  }
+  if (hasSection("", "anything")) {
+    eprint("hasSection: matched against an empty page\n")
+    ok = false
+  }
+  return ok
+}
+
+// ---------------------------------------------------------------------------
+// Running `bit doc`
+// ---------------------------------------------------------------------------
+
+// `osRunBounded` takes a path and nothing else — no argv, no environment, no
+// stdout capture — so the module path, `BIT_STDLIB` and the redirections are
+// baked into a generated `/bin/sh` script. `exec` makes the script's exit status
+// the compiler's own, which is what the caller's `rc` branch reads.
+function writeRunner(script: string, bin: string, root: string, mod: string, outPath: string, errPath: string): bool {
+  let body = "#!/bin/sh\n" +
+    "BIT_STDLIB=" + root + "/stdlib\n" +
+    "export BIT_STDLIB\n" +
+    "exec \"" + bin + "\" doc \"" + root + "/stdlib/" + mod + "\" >\"" + outPath + "\" 2>\"" + errPath + "\"\n"
+  writeFile(script, body) catch e {
+    eprint("cannot write " + script + ": " + e.message() + "\n")
+    return false
+  }
+  if (fsChmod(script, 493) != 0) {
+    eprint("cannot chmod " + script + "\n")
+    return false
+  }
+  return true
+}
+
+// A symbol as `bit doc` prints it in its plain form: `<kind> <name> <type...>`,
+// e.g. `method File.readAll () => string`. Bit symbol names contain no spaces,
+// so the name is exactly the second space-separated token.
+struct Symbol {
+  kind: string
+  name: string
+  typeText: string
+}
+
+function parseDoc(text: string): []Symbol {
+  let out = []Symbol(0)
+  let lines = split(text, "\n")
+  let n = len(lines)
+  if (n > maxSymbols) {
+    n = maxSymbols
+  }
+  for (let i = 0; i < n; i = i + 1) {
+    let line = lines[i]
+    if (len(line) == 0) {
+      continue
+    }
+    let parts = split(line, " ")
+    if (len(parts) < 2) {
+      continue
+    }
+    let rest = ""
+    for (let j = 2; j < len(parts); j = j + 1) {
+      if (len(rest) > 0) {
+        rest = rest + " "
+      }
+      rest = rest + parts[j]
+    }
+    out = append(out, Symbol{kind: parts[0], name: parts[1], typeText: rest})
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+
+function itoa(n: int): string {
+  if (n == 0) {
+    return "0"
+  }
+  let v = n
+  let neg = false
+  if (v < 0) {
+    neg = true
+    v = 0 - v
+  }
+  let s = ""
+  let guard = 0
+  while (v > 0 && guard < 32) {
+    guard = guard + 1
+    s = string([]byte{byte(48 + v % 10)}) + s
+    v = v / 10
+  }
+  if (neg) {
+    return "-" + s
+  }
+  return s
+}
+
+function timeoutMs(): int {
+  let raw = envOr("BIT_TEST_TIMEOUT_S", "")
+  if (len(raw) == 0) {
+    return defaultTimeoutMs
+  }
+  let secs = parseInt(raw) catch e {
+    eprint("BIT_TEST_TIMEOUT_S is not a number: " + raw + "\n")
+    return defaultTimeoutMs
+  }
+  if (secs <= 0) {
+    return 0
+  }
+  return secs * 1000
+}
+
+// The per-module directory list. `readDir` returns bare names, so `isDir` is
+// asked about the joined path — asking about the bare name would be false for
+// everything and silently produce an empty module list.
+function moduleList(stdRoot: string): []string {
+  let entries = readDir(stdRoot) catch e {
+    eprint("cannot read " + stdRoot + ": " + e.message() + "\n")
+    return []string(0)
+  }
+  let mods = []string(0)
+  let n = len(entries)
+  if (n > maxModules) {
+    n = maxModules
+  }
+  for (let i = 0; i < n; i = i + 1) {
+    if (isDir(stdRoot + "/" + entries[i])) {
+      mods = append(mods, entries[i])
+    }
+  }
+  return mods
+}
+
+function main() {
+  if (!checkHasSection()) {
+    eprint("FAIL stdlibdocs: the hasSection unit test did not pass\n")
+    exit(1)
+  }
+
+  let root = envOr("BIT_DOCS_ROOT", ".")
+  let bin = envOr("BIT_DOC_BIN", root + "/zig-out/bin/bit")
+  let stdRoot = root + "/stdlib"
+  let docsRoot = root + "/docs/stdlib"
+
+  if (!isDir(stdRoot)) {
+    eprint("FAIL stdlibdocs: " + stdRoot + " is not a directory (set BIT_DOCS_ROOT)\n")
+    exit(1)
+  }
+  if (!isDir(docsRoot)) {
+    eprint("FAIL stdlibdocs: " + docsRoot + " is not a directory (set BIT_DOCS_ROOT)\n")
+    exit(1)
+  }
+
+  let mods = moduleList(stdRoot)
+  if (len(mods) < minModules) {
+    eprint("FAIL stdlibdocs: found " + itoa(len(mods)) + " modules under " + stdRoot +
+      ", expected at least " + itoa(minModules) + "\n")
+    exit(1)
+  }
+
+  let ms = timeoutMs()
+  let documented = 0
+  let missing = 0
+  let skipped = 0
+  let broken = 0
+
+  for (let i = 0; i < len(mods); i = i + 1) {
+    let mod = mods[i]
+    let script = "/tmp/bit-stdlibdocs-" + mod + ".sh"
+    let outPath = "/tmp/bit-stdlibdocs-" + mod + ".out"
+    let errPath = "/tmp/bit-stdlibdocs-" + mod + ".err"
+    if (!writeRunner(script, bin, root, mod, outPath, errPath)) {
+      exit(1)
+    }
+
+    let rc = osRunBounded(script, ms)
+    if (rc == -2) {
+      eprint("TIMED OUT: stdlib/" + mod + " after " + itoa(ms) + "ms\n")
+      broken = broken + 1
+      continue
+    }
+    if (rc != 0) {
+      let why = readFile(errPath) catch e { "" }
+      eprint("stdlib/" + mod + " does not compile (rc=" + itoa(rc) + "):\n" + why + "\n")
+      broken = broken + 1
+      continue
+    }
+
+    let text = readFile(outPath) catch e {
+      eprint("stdlib/" + mod + ": documented cleanly but " + outPath + " is unreadable: " + e.message() + "\n")
+      broken = broken + 1
+      continue
+    }
+    let syms = parseDoc(text)
+    if (len(syms) == 0) {
+      skipped = skipped + 1 // an internal module with no exports
+      continue
+    }
+
+    let page = docsRoot + "/" + mod + ".md"
+    let md = readFile(page) catch e {
+      eprint("stdlib/" + mod + " exports " + itoa(len(syms)) + " symbols but " + page +
+        " is unreadable: " + e.message() + "\n")
+      broken = broken + 1
+      continue
+    }
+
+    for (let j = 0; j < len(syms); j = j + 1) {
+      let s = syms[j]
+      if (hasSection(md, s.name)) {
+        documented = documented + 1
+        continue
+      }
+      missing = missing + 1
+      eprint("docs/stdlib/" + mod + ".md: no `### `" + s.name + "`` section for the exported " +
+        s.kind + " `" + s.name + "` (" + s.typeText + ")\n")
+    }
+  }
+
+  let total = documented + missing
+  let failed = false
+
+  if (broken > 0) {
+    eprint("FAIL stdlibdocs: " + itoa(broken) + " module(s) could not be documented\n")
+    failed = true
+  }
+  if (documented == 0) {
+    eprint("FAIL stdlibdocs: the walk found no documented symbols at all\n")
+    failed = true
+  }
+  if (total < minSymbols) {
+    eprint("FAIL stdlibdocs: saw " + itoa(total) + " exported symbols, expected at least " +
+      itoa(minSymbols) + "\n")
+    failed = true
+  }
+  if (missing > 0) {
+    eprint("FAIL stdlibdocs: " + itoa(missing) + " exported symbol(s) have no docs section\n")
+    failed = true
+  }
+
+  if (failed) {
+    exit(1)
+  }
+  print("PASS stdlibdocs: " + itoa(documented) + " exported symbols documented across " +
+    itoa(len(mods)) + " modules (" + itoa(skipped) + " export nothing)\n")
+}

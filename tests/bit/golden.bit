@@ -1,0 +1,629 @@
+// Golden-case gate, written in Bit — the replacement for tests/harness.zig.
+//
+// For every `*.bit` in the corpus directory, the compiler's observable output
+// in that file's line-1 directive must byte-match the sibling `*.expected`.
+// That is an ABSOLUTE oracle: unlike the ten `scripts/selfhost-diff*.sh`
+// differentials (which compare the seed against the self-hosted compiler and
+// therefore evaporate the day the seed retires), this corpus pins what the
+// compiler must actually SAY. The 120 `// error` cases are the only place in
+// the repo that pins rendered diagnostic text at all.
+//
+// Everything here drives the shipped `bit` CLI as a subprocess. The Zig
+// harness ran six of the nine directives in-process against the seed's Zig
+// API; `compiler/` exports almost nothing, so an in-process Bit port is not
+// possible until `export` markers land on the dump entry points. Driving the
+// CLI is not merely a workaround: it is the path a real user takes, and it is
+// the only surface that still exists after `seed/` is deleted.
+//
+// SUBPROCESS MECHANICS. `osRunBounded(path, timeoutMs)` takes a bare path —
+// no argv, no environment, no stdout/stderr capture — so each invocation is a
+// generated `/bin/sh` wrapper that cds, exports the environment, and `exec`s
+// the real command with both streams redirected to files this process reads
+// back. `exec` matters: it makes the child REPLACE the shell, so a program
+// that dies of SIGSEGV kills the process `osRunBounded` is waiting on, and the
+// crash stays distinguishable from an ordinary nonzero exit (ABI.md §19).
+//
+// NON-VACUITY IS THE POINT. This repo has shipped guards that passed over
+// empty input sets. Four floors, each strictly stronger than the Zig original:
+//
+//   1. `BIT_CASES_DIR` and `BIT_BIN` have NO defaults. Unset is a failure, not
+//      a silent walk of ".".
+//   2. The per-directive census is pinned exactly (`expectedCounts` below).
+//      The Zig harness's only bound was `scanned < max_cases`, which 0
+//      satisfies. Adding or deleting a case must edit this table in the same
+//      commit.
+//   3. Orphans are detected BOTH ways: every `.bit` needs a readable
+//      `.expected` AND every `.expected` needs a `.bit`. The Zig version only
+//      checked the first, so a renamed case left dead weight behind.
+//   4. A wrapper that never reached its `exec` leaves no redirect file. That
+//      is a hard, named failure — never "the program errored, as expected".
+//      An `// error` case compares rendered TEXT, never just an exit code.
+//
+// An unrecognised line-1 directive is a hard failure, and `// panic` is
+// matched before `// run` (a `startsWith` ordering bug would silently downgrade
+// a panic case to a stdout comparison).
+//
+// Usage:
+//   BIT_CASES_DIR=$PWD/tests/cases BIT_BIN=$PWD/zig-out/bin/bit \
+//   BIT_STDLIB=$PWD/stdlib bit run tests/bit/golden.bit
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, readDir, exists, remove, mkdir } from "std/fs"
+import { hasPrefix, hasSuffix, indexOf, trimSpace, parseInt } from "std/strings"
+
+// Directive ids. Order is the census order below; it is not the match order.
+const dRun: int = 0
+const dPanic: int = 1
+const dErr: int = 2
+const dFmt: int = 3
+const dTypes: int = 4
+const dTokens: int = 5
+const dAst: int = 6
+const dIr: int = 7
+const dLint: int = 8
+const dCount: int = 9
+
+// Exit code the runtime uses for every panic (SPEC.md §18.4). Matched exactly
+// rather than "nonzero", so a crash cannot pass as a panic.
+const panicExit: int = 2
+
+// `osRunBounded`'s own ceiling (runtime/root/*/os.bit `osBoundedMaxMs`).
+// `BIT_TEST_TIMEOUT_S=0` means "do not bound", which here is this maximum.
+const maxTimeoutMs: int = 3600000
+const defaultTimeoutS: int = 300
+
+// THE CORPUS MANIFEST. Measured 2026-07-28; total 336.
+function expectedCounts(): []int {
+  let c = []int(dCount)
+  c[dRun] = 170
+  c[dPanic] = 2
+  c[dErr] = 120
+  c[dFmt] = 2
+  c[dTypes] = 5
+  c[dTokens] = 1
+  c[dAst] = 1
+  c[dIr] = 3
+  c[dLint] = 32
+  return c
+}
+
+function directiveName(d: int): string {
+  if (d == dRun) { return "run" }
+  if (d == dPanic) { return "panic" }
+  if (d == dErr) { return "error" }
+  if (d == dFmt) { return "fmt" }
+  if (d == dTypes) { return "types" }
+  if (d == dTokens) { return "tokens" }
+  if (d == dAst) { return "ast" }
+  if (d == dIr) { return "ir" }
+  return "lint"
+}
+
+struct Ctx {
+  casesDir: string,
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  scratch: string,
+  timeoutMs: int,
+  failures: int,
+}
+
+struct RunOut {
+  code: int,
+  out: string,
+  err: string,
+}
+
+// --- reporting -------------------------------------------------------------
+
+// Every failure names the case and the directive; nothing is ever counted
+// without being printed, so a red run says which case and why.
+function failCase(c: Ctx, name: string, what: string, why: string) {
+  c.failures = c.failures + 1
+  eprint("golden: FAIL ${name} [${what}]: ${why}\n")
+}
+
+// Prints a bounded, readable diff of two byte strings.
+function reportDiff(expected: string, actual: string) {
+  eprint("  expected (${len(expected)} bytes):\n${clip(expected)}\n")
+  eprint("  actual   (${len(actual)} bytes):\n${clip(actual)}\n")
+}
+
+function clip(s: string): string {
+  if (len(s) <= 600) {
+    return s
+  }
+  return s[0:600] + "\n  ...[truncated]"
+}
+
+// --- shell wrapper ---------------------------------------------------------
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word.
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+function outPath(c: Ctx): string { return c.scratch + "/out" }
+function errPath(c: Ctx): string { return c.scratch + "/err" }
+function shPath(c: Ctx): string { return c.scratch + "/w.sh" }
+
+function removeQuiet(path: string) {
+  remove(path) catch e { return }
+}
+
+// Builds and runs one `/bin/sh` wrapper: cd into `cwd`, export the compiler's
+// environment, then `exec` `argv` with stdout/stderr redirected to files.
+//
+// `withEnv` is false when executing a case's own binary — that program must
+// not inherit BIT_STDLIB/BIT_LIBBITRT, which are the compiler's business.
+//
+// Returns ok=false and reports the failure itself when the wrapper could not
+// be launched, timed out, crashed, or never reached its `exec`. The caller
+// therefore never has to guess what a negative code meant, and — critically —
+// can never read an absent redirect file as "empty output".
+function runWrapped(c: Ctx, name: string, what: string, cwd: string, argv: []string, withEnv: bool): (RunOut, bool) {
+  removeQuiet(outPath(c))
+  removeQuiet(errPath(c))
+
+  let script = "#!/bin/sh\n"
+  if (cwd != "") {
+    script = script + "cd " + shQuote(cwd) + " || exit 125\n"
+  }
+  if (withEnv) {
+    if (c.stdlib != "") {
+      script = script + "BIT_STDLIB=" + shQuote(c.stdlib) + "\nexport BIT_STDLIB\n"
+    }
+    if (c.libbitrt != "") {
+      script = script + "BIT_LIBBITRT=" + shQuote(c.libbitrt) + "\nexport BIT_LIBBITRT\n"
+    }
+  }
+  script = script + "exec"
+  let i = 0
+  while (i < len(argv)) {
+    script = script + " " + shQuote(argv[i])
+    i = i + 1
+  }
+  script = script + " > " + shQuote(outPath(c)) + " 2> " + shQuote(errPath(c)) + "\n"
+
+  let empty = RunOut{ code: 0, out: "", err: "" }
+  writeFile(shPath(c), script) catch e {
+    failCase(c, name, what, "cannot write wrapper script ${shPath(c)}")
+    return empty, false
+  }
+  if (fsChmod(shPath(c), 448) != 0) { // 0o700
+    failCase(c, name, what, "cannot chmod wrapper script ${shPath(c)}")
+    return empty, false
+  }
+
+  let code = osRunBounded(shPath(c), c.timeoutMs)
+  if (code == 0 - 2) {
+    failCase(c, name, what, "TIMED OUT after ${c.timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return empty, false
+  }
+  if (code == 0 - 1) {
+    failCase(c, name, what, "cannot launch wrapper script (spawn/wait failure)")
+    return empty, false
+  }
+  if (code <= 0 - 100) {
+    failCase(c, name, what, "CRASHED: killed by signal ${0 - code - 100}")
+    return empty, false
+  }
+  if (code == 125) {
+    failCase(c, name, what, "wrapper could not cd to ${cwd}")
+    return empty, false
+  }
+  // The redirections are established before `exec`, so both files exist the
+  // moment the command starts. A missing one means the wrapper never got that
+  // far — the exact silent hole a `readFile ... catch { "" }` fallback hides.
+  if (!exists(outPath(c)) || !exists(errPath(c))) {
+    failCase(c, name, what, "wrapper produced no redirect files — it never ran the command")
+    return empty, false
+  }
+  let so = readFile(outPath(c)) catch e {
+    failCase(c, name, what, "cannot read captured stdout")
+    return empty, false
+  }
+  let se = readFile(errPath(c)) catch e {
+    failCase(c, name, what, "cannot read captured stderr")
+    return empty, false
+  }
+  return RunOut{ code: code, out: so, err: se }, true
+}
+
+// --- directive parsing -----------------------------------------------------
+
+function firstLine(src: string): string {
+  let nl = indexOf(src, "\n")
+  let line = src
+  if (nl >= 0) {
+    line = src[0:nl]
+  }
+  if (len(line) > 0 && line[len(line) - 1] == 13) { // \r
+    line = line[0:len(line) - 1]
+  }
+  return trimSpace(line)
+}
+
+// -1 means "no recognised directive", which is a hard failure at the call site.
+function directiveOf(line: string): int {
+  if (hasPrefix(line, "// error")) { return dErr }
+  // Before `// run`: an ordering bug here would silently downgrade a panic
+  // case to a stdout comparison against a stderr-shaped `.expected`.
+  if (hasPrefix(line, "// panic")) { return dPanic }
+  if (hasPrefix(line, "// run")) { return dRun }
+  if (hasPrefix(line, "// fmt")) { return dFmt }
+  if (hasPrefix(line, "// types")) { return dTypes }
+  if (hasPrefix(line, "// tokens")) { return dTokens }
+  if (hasPrefix(line, "// ast")) { return dAst }
+  if (hasPrefix(line, "// ir")) { return dIr }
+  if (hasPrefix(line, "// lint")) { return dLint }
+  return 0 - 1
+}
+
+// The mandatory `exit=<0|1|2>` on a `// lint` line. Lint has three meaningful
+// exit codes and a stderr diff alone cannot tell them apart (spec/LINT.md §8),
+// so the value is asserted, never defaulted. -1 means malformed.
+function lintExitCode(line: string): int {
+  let at = indexOf(line, "exit=")
+  if (at < 0) {
+    return 0 - 1
+  }
+  let digits = trimSpace(line[at + 5:len(line)])
+  let v = parseInt(digits) catch e { return 0 - 1 }
+  if (v < 0 || v > 2) {
+    return 0 - 1
+  }
+  return v
+}
+
+// `bit check` renders a single-file module's path as `./<name>` because the
+// loader joins the canonicalised root dir onto the file name. The `.expected`
+// corpus was written against the seed's in-process API, which was handed the
+// bare name. Only the `-->` location header is rewritten, and only that exact
+// prefix, so no diagnostic body text can be caught by it. Delete this the day
+// the loader stops prefixing, or the day `compiler/` exports its renderer.
+function stripDotSlash(s: string): string {
+  let needle = " --> ./"
+  let repl = " --> "
+  let out = ""
+  let rest = s
+  while (true) {
+    let at = indexOf(rest, needle)
+    if (at < 0) {
+      return out + rest
+    }
+    out = out + rest[0:at] + repl
+    rest = rest[at + len(needle):len(rest)]
+  }
+  return out
+}
+
+// --- per-directive checks --------------------------------------------------
+
+function expectText(c: Ctx, name: string, what: string, expected: string, actual: string) {
+  if (expected == actual) {
+    return
+  }
+  failCase(c, name, what, "output does not match .expected")
+  reportDiff(expected, actual)
+}
+
+// One CLI dump (`--dump-tokens`/`--dump-ast`/`--dump-ir`/`--dump-types`)
+// compared to `.expected` on stdout. These commands print nothing on stderr
+// and exit 0 for a well-formed case, so a nonzero exit is itself a failure.
+function checkDump(c: Ctx, name: string, flag: string, what: string, expected: string) {
+  let (r, ok) = runWrapped(c, name, what, c.casesDir, [c.bin, flag, name], true)
+  if (!ok) {
+    return
+  }
+  if (r.code != 0) {
+    failCase(c, name, what, "expected exit 0, got ${r.code}\n  stderr: ${clip(r.err)}")
+    return
+  }
+  expectText(c, name, what, expected, r.out)
+}
+
+// `// error`: compilation must fail AND the rendered diagnostics must match.
+// The text is the oracle; the exit code alone is not, because a missing input
+// file also exits nonzero.
+function checkError(c: Ctx, name: string, expected: string) {
+  let (r, ok) = runWrapped(c, name, "error", c.casesDir, [c.bin, "check", name], true)
+  if (!ok) {
+    return
+  }
+  if (r.code == 0) {
+    failCase(c, name, "error", "expected compilation to fail, but `bit check` exited 0")
+    return
+  }
+  expectText(c, name, "error", expected, stripDotSlash(r.err))
+}
+
+// `// fmt`: canonicalisation. `bit fmt` rewrites in place and has no `--stdout`
+// mode, so the case is copied into the scratch directory, formatted there, and
+// read back. The copy also keeps the corpus read-only.
+function checkFmt(c: Ctx, name: string, src: string, expected: string) {
+  let tmp = c.scratch + "/fmt_" + name
+  writeFile(tmp, src) catch e {
+    failCase(c, name, "fmt", "cannot stage a copy at ${tmp}")
+    return
+  }
+  let (r, ok) = runWrapped(c, name, "fmt", "", [c.bin, "fmt", tmp], true)
+  if (!ok) {
+    return
+  }
+  if (r.code != 0) {
+    failCase(c, name, "fmt", "expected exit 0, got ${r.code}\n  stderr: ${clip(r.err)}")
+    return
+  }
+  let got = readFile(tmp) catch e {
+    failCase(c, name, "fmt", "cannot read back the formatted copy")
+    return
+  }
+  expectText(c, name, "fmt", expected, got)
+  removeQuiet(tmp)
+}
+
+// `// lint`: stderr must match AND the exit code must equal the directive's
+// mandatory `exit=` value. Run with the corpus as cwd and the bare name as the
+// operand, so the `-->` line names the file the way `.expected` does.
+function checkLint(c: Ctx, name: string, line: string, expected: string) {
+  let want = lintExitCode(line)
+  if (want < 0) {
+    failCase(c, name, "lint", "line 1 must be `// lint exit=<0|1|2>`")
+    return
+  }
+  let (r, ok) = runWrapped(c, name, "lint", c.casesDir, [c.bin, "lint", name], true)
+  if (!ok) {
+    return
+  }
+  if (r.code != want) {
+    failCase(c, name, "lint", "expected exit ${want}, got ${r.code}\n  stderr: ${clip(r.err)}")
+    return
+  }
+  expectText(c, name, "lint", expected, r.err)
+}
+
+// `// run` / `// panic`: compile with the shipped `bit`, then execute.
+// A `run` case must exit 0 and match `.expected` on stdout; a `panic` case
+// must exit exactly 2 and match on stderr.
+function checkRun(c: Ctx, name: string, directive: int, expected: string) {
+  let what = directiveName(directive)
+  let bin = c.scratch + "/case.bin"
+  removeQuiet(bin)
+
+  let (b, bok) = runWrapped(c, name, "${what}/compile", c.casesDir, [c.bin, "build", name, "-o", bin], true)
+  if (!bok) {
+    return
+  }
+  if (b.code != 0) {
+    failCase(c, name, "${what}/compile", "compile failed with exit ${b.code}\n  stderr: ${clip(b.err)}")
+    return
+  }
+  if (!exists(bin)) {
+    failCase(c, name, "${what}/compile", "compiler exited 0 but produced no binary at ${bin}")
+    return
+  }
+
+  let (r, ok) = runWrapped(c, name, what, "", [bin], false)
+  if (!ok) {
+    return
+  }
+  if (directive == dPanic) {
+    if (r.code != panicExit) {
+      failCase(c, name, what, "expected a panic (exit ${panicExit}), got exit ${r.code}\n  stderr: ${clip(r.err)}")
+      return
+    }
+    expectText(c, name, what, expected, r.err)
+    return
+  }
+  if (r.code != 0) {
+    failCase(c, name, what, "binary exited with ${r.code}\n  stderr: ${clip(r.err)}")
+    return
+  }
+  expectText(c, name, what, expected, r.out)
+}
+
+// --- corpus walk -----------------------------------------------------------
+
+function checkCase(c: Ctx, name: string, src: string, expected: string, directive: int, line: string) {
+  if (directive == dErr) {
+    checkError(c, name, expected)
+    return
+  }
+  if (directive == dRun || directive == dPanic) {
+    checkRun(c, name, directive, expected)
+    return
+  }
+  if (directive == dFmt) {
+    checkFmt(c, name, src, expected)
+    return
+  }
+  if (directive == dLint) {
+    checkLint(c, name, line, expected)
+    return
+  }
+  if (directive == dTypes) {
+    checkDump(c, name, "--dump-types", "types", expected)
+    return
+  }
+  if (directive == dTokens) {
+    checkDump(c, name, "--dump-tokens", "tokens", expected)
+    return
+  }
+  if (directive == dAst) {
+    checkDump(c, name, "--dump-ast", "ast", expected)
+    return
+  }
+  checkDump(c, name, "--dump-ir", "ir", expected)
+}
+
+// Every `.expected` must have a `.bit`. The Zig harness only checked the other
+// direction, so a renamed case left its old `.expected` behind as dead weight
+// that nothing read and nobody noticed.
+function checkOrphanExpected(c: Ctx, names: []string) {
+  let stems = map<string, bool>{}
+  for n of names {
+    if (hasSuffix(n, ".bit")) {
+      stems[n[0:len(n) - 4]] = true
+    }
+  }
+  for n of names {
+    if (!hasSuffix(n, ".expected")) {
+      continue
+    }
+    let stem = n[0:len(n) - 9]
+    let (_, has) = stems[stem]
+    if (!has) {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: orphaned .expected — no sibling ${stem}.bit\n")
+    }
+  }
+}
+
+function checkCensus(c: Ctx, counts: []int, total: int) {
+  let want = expectedCounts()
+  let d = 0
+  while (d < dCount) {
+    if (counts[d] != want[d]) {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL census: ${directiveName(d)} = ${counts[d]}, manifest says ${want[d]}\n")
+      eprint("  adding or removing a case must edit expectedCounts() in the same commit\n")
+    }
+    d = d + 1
+  }
+  let wantTotal = 0
+  let i = 0
+  while (i < dCount) {
+    wantTotal = wantTotal + want[i]
+    i = i + 1
+  }
+  if (total != wantTotal) {
+    c.failures = c.failures + 1
+    eprint("golden: FAIL census: scanned ${total} cases, manifest totals ${wantTotal}\n")
+  }
+}
+
+function requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("golden: ${name} is not set — refusing to guess. This gate has no defaults;\n")
+    eprint("golden: an unset corpus or compiler path must fail, never silently walk '.'.\n")
+    exit(2)
+  }
+  return v
+}
+
+// `BIT_TEST_TIMEOUT_S` per tests/proc.zig's contract: default 300s, `0`
+// disables the bound (here: the runtime's own one-hour ceiling).
+function timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch e {
+    eprint("golden: BIT_TEST_TIMEOUT_S='${raw}' is not a number; using ${defaultTimeoutS}s\n")
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+function main() {
+  let casesDir = requiredEnv("BIT_CASES_DIR")
+  let bin = requiredEnv("BIT_BIN")
+  if (!fsIsDir(casesDir)) {
+    eprint("golden: BIT_CASES_DIR='${casesDir}' is not a directory\n")
+    exit(2)
+  }
+  if (!exists(bin)) {
+    eprint("golden: BIT_BIN='${bin}' does not exist\n")
+    exit(2)
+  }
+
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-golden-${timeUnixNs()}"
+  mkdir(scratch) catch e {
+    eprint("golden: cannot create scratch directory ${scratch}\n")
+    exit(2)
+  }
+
+  let c = Ctx{
+    casesDir: casesDir,
+    bin: bin,
+    stdlib: env("BIT_STDLIB"),
+    libbitrt: env("BIT_LIBBITRT"),
+    scratch: scratch,
+    timeoutMs: timeoutMs(),
+    failures: 0,
+  }
+
+  let names = readDir(casesDir) catch e {
+    eprint("golden: cannot list ${casesDir}\n")
+    exit(2)
+    return
+  }
+  checkOrphanExpected(c, names)
+
+  let counts = []int(dCount)
+  let total = 0
+  for n of names {
+    if (!hasSuffix(n, ".bit")) {
+      continue
+    }
+    let path = casesDir + "/" + n
+    let src = readFile(path) catch e {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: cannot read case source\n")
+      continue
+    }
+    let line = firstLine(src)
+    let directive = directiveOf(line)
+    if (directive < 0) {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: unrecognised line-1 directive '${line}'\n")
+      eprint("  expected one of: // run, // panic, // error, // fmt, // types,\n")
+      eprint("                   // tokens, // ast, // ir, // lint exit=<0|1|2>\n")
+      continue
+    }
+    counts[directive] = counts[directive] + 1
+    total = total + 1
+
+    let expectedPath = casesDir + "/" + n[0:len(n) - 4] + ".expected"
+    let expected = readFile(expectedPath) catch e {
+      c.failures = c.failures + 1
+      eprint("golden: FAIL ${n}: cannot read ${expectedPath}\n")
+      continue
+    }
+    checkCase(c, n, src, expected, directive, line)
+  }
+
+  checkCensus(c, counts, total)
+
+  removeQuiet(outPath(c))
+  removeQuiet(errPath(c))
+  removeQuiet(shPath(c))
+  removeQuiet(scratch + "/case.bin")
+  removeQuiet(scratch)
+
+  if (c.failures > 0) {
+    eprint("golden: FAIL — ${c.failures} failure(s) over ${total} cases\n")
+    exit(1)
+    return
+  }
+  print("golden: PASS — ${total} cases, all directives byte-matched\n")
+}

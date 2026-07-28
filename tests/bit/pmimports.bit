@@ -1,0 +1,408 @@
+// tests/bit/pmimports.bit — the Bit port of tests/pmimports.zig (#1737).
+//
+// What this guards, and why it cannot be an in-process check: the `bit` CLI's
+// own PROCESS BOUNDARY honoring external-package imports end to end. A `bit
+// run`/`bit check` invocation must resolve an import through `bit.lock`
+// against the cache root named by `BIT_PKG_CACHE`, and deliver its verdict as
+// a parent-observable exit status plus stdout/stderr. `compiler/projectcheck
+// .bit`'s `checkProjectPackageImports*` calls `Loader`/`resolvePackageImport`
+// directly, in-process — it can never reach `main.bit`'s command dispatch, and
+// it never observes an exit code.
+//
+// Two cases, both driven through a real subprocess:
+//
+//  - a locked, WARM-cache dependency. The lock entry's `url` names a host
+//    under `.invalid` (RFC 2606 §2 — reserved, so it can never resolve on any
+//    network, anywhere), so a successful `bit run` printing the fixture
+//    package's own output proves the warm-cache path never dialed it.
+//    `BIT_PKG_CACHE` points the whole run at a scratch cache this file
+//    pre-populates with a real `git` checkout, so nothing reaches the
+//    developer's actual `~/.bit/pkg` either.
+//  - a project whose import has no `bit.lock` entry at all: `bit check` must
+//    exit 1 with a diagnostic naming the missing dependency and `bit add`, and
+//    must never create the cache root, let alone fetch into it.
+//
+// ANTI-VACUITY RULES this file holds itself to (a green gate that could never
+// have gone red is worse than no gate):
+//
+//  - Nothing is ever SKIPPED. A missing prerequisite — no `git`, no `bit`, no
+//    stdlib — is a loud failure naming it, never an early return.
+//  - Exit codes are compared EXACTLY (`== 0`, `== 1`), never `!= 0`. A wrapper
+//    that never launched the compiler exits 1/2/126/127 of its own accord, and
+//    `!= 0` would pass on that.
+//  - The wrapper script reserves 111-114 and 121 for its OWN failures, and
+//    those are rejected before any verdict is read, so "the tool never ran"
+//    can never masquerade as "the tool ran and disagreed".
+//  - Capture files must EXIST before they are read: an absent capture read
+//    through a `catch` yields "", and "" satisfies a `contains` check with an
+//    empty needle. Needles are length-checked for the same reason.
+//  - stdout is compared with exact equality, not `contains`.
+//  - The fixture HEAD is checked to be 40 hex digits before it is used to build
+//    any path — an empty sha yields a perfectly creatable directory and a
+//    syntactically valid `bit.lock`, i.e. a fixture over an empty identity.
+import { exists, remove, readFile, writeFile } from "std/fs"
+import { envOr, exit } from "std/os"
+import { base as pathBase, dir as pathDir } from "std/path"
+import { contains } from "std/strings"
+import { monotonic, since, Millisecond } from "std/time"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Wall-clock ceiling on any one subprocess. A cold `bit run` here compiles and
+// links a whole program from scratch; 120s is far above that and far below a
+// hang. `osRunBounded` reports a timeout as a distinct outcome (-2), never a
+// stalled caller — the discipline tests/proc.zig documents for this repo.
+const subprocessTimeoutMs: int = 120000
+
+// Ceiling on the warm-cache `bit run`. Generous slack over a cold local
+// compile + link + run, and nowhere near what dialing an unreachable host
+// would add on top (a connection attempt, then pmfetch.bit's 30s fetch
+// deadline). This only has to rule out "fell through to a fetch attempt".
+const warmRunBudgetMs: int = 60000
+
+// The wrapper script's own reserved exit codes. Every one of these means the
+// harness broke, NOT that the compiler under test disagreed.
+const rcCdFailed: int = 111
+const rcBitNotExecutable: int = 112
+const rcStdlibUnresolvable: int = 113
+const rcBitDirUnresolvable: int = 114
+const rcGitAbsent: int = 121
+
+// `osRunBounded`'s timed-out sentinel (runtime/root.zig, ABI.md §19).
+const rcTimedOut: int = -2
+
+struct Run { code: int, stdout: string, stderr: string, outPath: string, errPath: string }
+
+function main() {
+  let bitExe = envOr("BIT_UNDER_TEST", "zig-out/bin/bit")
+  let stdRoot = envOr("BIT_STDLIB_UNDER_TEST", "stdlib")
+  if (!exists(bitExe)) {
+    fatal("setup", "no compiler under test at '${bitExe}' — run from the repo root, or set BIT_UNDER_TEST")
+  }
+  if (!exists(stdRoot)) {
+    fatal("setup", "no stdlib at '${stdRoot}' — run from the repo root, or set BIT_STDLIB_UNDER_TEST")
+  }
+
+  checkWarmCacheRun(bitExe, stdRoot)
+  checkMissingLock(bitExe, stdRoot)
+  print("PASS: pmimports — bit run honors a warm BIT_PKG_CACHE, bit check rejects an unlocked import\n")
+}
+
+// --- case 1: `bit run` with a locked, warm-cache dependency ---------------
+
+function checkWarmCacheRun(bitExe: string, stdRoot: string) {
+  let name = "warm-cache-run"
+  let root = "/tmp/bit-pmimports-" + uuidFormat(uuidV4())
+  let srcDir = root + "/pkgsrc"
+  mkdirp(name, srcDir)
+
+  // The fixture package's own output. The trailing newline is part of the
+  // contract: stdout is compared exactly, so `print(greet())` must produce
+  // exactly this and nothing else.
+  writeFile(srcDir + "/greet.bit",
+    "export function greet(): string {\n  return \"hi from pkg\\n\"\n}\n") catch e {
+    fatal(name, "cannot write the fixture module: " + e.message())
+  }
+
+  let shaPath = root + "/sha"
+  let q = shQuote(srcDir)
+  let setup = "set -e\n" +
+    "command -v git > /dev/null 2>&1 || exit ${rcGitAbsent}\n" +
+    "git init --quiet -b main " + q + "\n" +
+    "git -C " + q + " config user.email pmimports@example.com\n" +
+    "git -C " + q + " config user.name pmimports\n" +
+    "git -C " + q + " add greet.bit\n" +
+    "git -C " + q + " commit --quiet -m 'pkg fixture'\n" +
+    "git -C " + q + " rev-parse HEAD > " + shQuote(shaPath) + "\n"
+  mustSucceed(name, "git fixture repo", setup)
+
+  let sha = trimEol(readFile(shaPath) catch e {
+    fatal(name, "cannot read the fixture HEAD: " + e.message())
+    ""
+  })
+  if (!isFullSha(sha)) {
+    fatal(name, "fixture HEAD is not a 40-hex commit sha: '${sha}'")
+  }
+
+  // `pkg.pmimports.invalid` is under the IANA-reserved `.invalid` TLD, so it
+  // is guaranteed never to resolve. `fetchSha`'s cache-hit branch never even
+  // reads the url — only host/owner/repo/sha — so a clean run through this
+  // entry is proof the warm-cache path was taken.
+  let host = "pkg.pmimports.invalid"
+  let owner = "acme"
+  let repo = "pkg"
+  let cacheRoot = root + "/cache"
+  let finalDir = cacheRoot + "/" + host + "/" + owner + "/" + repo + "/" + sha
+
+  // Warm the cache the way a prior cold `bit build` would have left it: a real
+  // `git init` + shallow fetch + checkout, from the local fixture — never a
+  // hand-faked directory tree.
+  let f = shQuote(finalDir)
+  let warm = "set -e\n" +
+    "command -v git > /dev/null 2>&1 || exit ${rcGitAbsent}\n" +
+    "mkdir -p " + f + "\n" +
+    "git init --quiet " + f + "\n" +
+    "git -C " + f + " fetch --quiet --depth 1 " + shQuote("file://" + srcDir) + " " + sha + "\n" +
+    "git -C " + f + " checkout --quiet " + sha + "\n"
+  mustSucceed(name, "warming the package cache", warm)
+  if (!exists(finalDir + "/greet.bit")) {
+    fatal(name, "the warmed cache has no checkout at ${finalDir}/greet.bit")
+  }
+
+  let projDir = root + "/proj"
+  mkdirp(name, projDir)
+  writeFile(projDir + "/bit.lock",
+    "{\"pkg\":{\"url\":\"https://${host}/${owner}/${repo}.git\",\"commit\":\"${sha}\",\"requires\":{}}}") catch e {
+    fatal(name, "cannot write bit.lock: " + e.message())
+  }
+  writeFile(projDir + "/bit.json",
+    "{\"dependencies\":{\"pkg\":\"${host}/${owner}/${repo}@${sha}\"}}") catch e {
+    fatal(name, "cannot write bit.json: " + e.message())
+  }
+  writeFile(projDir + "/main.bit",
+    "import { greet } from \"pkg\"\nfunction main() {\n  print(greet())\n}\n") catch e {
+    fatal(name, "cannot write main.bit: " + e.message())
+  }
+
+  let started = monotonic()
+  let r = runBitCli(name, bitExe, stdRoot, projDir, cacheRoot, ["run", "main.bit"],
+    root + "/run.out", root + "/run.err")
+  let elapsedMs = since(started) / Millisecond
+
+  if (r.code != 0) {
+    fatal(name, "`bit run main.bit` exited ${r.code}, want 0\n  stdout: ${r.stdout}  stderr: ${r.stderr}")
+  }
+  if (r.stdout != "hi from pkg\n") {
+    fatal(name, "stdout was '${r.stdout}', want exactly 'hi from pkg\\n'\n  stderr: ${r.stderr}")
+  }
+  if (elapsedMs >= warmRunBudgetMs) {
+    fatal(name, "`bit run` took ${elapsedMs}ms (budget ${warmRunBudgetMs}ms) — it did not take the warm-cache path")
+  }
+  rmrf(root)
+}
+
+// --- case 2: `bit check` with no bit.lock entry for the import ------------
+
+function checkMissingLock(bitExe: string, stdRoot: string) {
+  let name = "missing-lock"
+  let root = "/tmp/bit-pmimports-missing-" + uuidFormat(uuidV4())
+  mkdirp(name, root)
+
+  // No bit.lock at all: `readLock` treats that as zero entries, not an error.
+  writeFile(root + "/main.bit",
+    "import { x } from \"nope\"\nfunction main() {}\n") catch e {
+    fatal(name, "cannot write main.bit: " + e.message())
+  }
+
+  // A cache root this run could never legitimately populate. If the resolver
+  // ever fell through to a fetch despite the missing lock entry, it would land
+  // here rather than silently succeeding against the developer's real cache.
+  let cacheRoot = root + "/cache-never-used"
+
+  let r = runBitCli(name, bitExe, stdRoot, root, cacheRoot, ["check", "."],
+    root + "/check.out", root + "/check.err")
+
+  if (r.code != 1) {
+    fatal(name, "`bit check .` exited ${r.code}, want exactly 1\n  stdout: ${r.stdout}  stderr: ${r.stderr}")
+  }
+  mustContain(name, r.stderr, "cannot find module \"nope\"")
+  mustContain(name, r.stderr, "not declared in bit.lock")
+  mustContain(name, r.stderr, "bit add")
+  // The one assertion that is naturally non-vacuous: it fails if the code
+  // under test did anything at all towards a fetch.
+  if (exists(cacheRoot)) {
+    fatal(name, "the cache root ${cacheRoot} was created — the resolver reached toward a fetch")
+  }
+  rmrf(root)
+}
+
+// --- driving the CLI ------------------------------------------------------
+
+// Runs `<bitExe> <args...>` with `projDir` as its working directory and a
+// SEALED environment, capturing the two streams separately.
+//
+// `/usr/bin/env -i` is load-bearing, not hygiene theater: an inherited
+// `BIT_PKG_CACHE`, a real `~/.bit/pkg`, or a proxy variable would void the
+// "never dialed the network" proof this file exists to make. `PATH` and
+// `TMPDIR` are the only things put back, because the compiler's own `git`
+// shell-out (pmfetch.bit `runGit`) needs them if it is ever reached.
+//
+// `BIT_LIBBITRT` is deliberately NOT passed: `resolveNearExe` already finds
+// `zig-out/lib/<triple>/libbitrt.a` from a dev-tree `bit` and
+// `<prefix>/lib/...` from a release unpack, so leaving it out removes the last
+// build-system coupling. If it is genuinely missing, `bit run` fails loudly
+// with a nonzero code and its stderr is printed — never skipped.
+//
+// Both the stdlib root and the compiler are resolved to absolute paths INSIDE
+// the script, before the `cd`: Bit has no `getcwd`, and both may legitimately
+// be relative (`stdRootPath()` itself can return the bare literal "stdlib").
+function runBitCli(name: string, bitExe: string, stdRoot: string, projDir: string,
+                   pkgCache: string, args: []string, outPath: string, errPath: string): Run {
+  let cmd = "\"$BIT\""
+  let i = 0
+  while (i < len(args)) {
+    cmd = cmd + " " + shQuote(args[i])
+    i = i + 1
+  }
+
+  let body = "BITDIR=$(cd " + shQuote(pathDir(bitExe)) + " && pwd) || exit ${rcBitDirUnresolvable}\n" +
+    "BIT=\"$BITDIR\"/" + shQuote(pathBase(bitExe)) + "\n" +
+    "[ -x \"$BIT\" ] || exit ${rcBitNotExecutable}\n" +
+    "STD=$(cd " + shQuote(stdRoot) + " && pwd) || exit ${rcStdlibUnresolvable}\n" +
+    "cd " + shQuote(projDir) + " || exit ${rcCdFailed}\n" +
+    "exec /usr/bin/env -i" +
+    " PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin" +
+    " TMPDIR=/tmp BIT_STDLIB=\"$STD\" BIT_PKG_CACHE=" + shQuote(pkgCache) + " " +
+    cmd + " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+
+  let code = runScript(name, body)
+  if (code == rcTimedOut) {
+    fatal(name, "`bit ${args[0]}` TIMED OUT after ${subprocessTimeoutMs}ms — a hang is a failure, not a stall")
+  }
+  rejectWrapperFailure(name, code)
+  // Read only after proving the captures exist: an absent capture read through
+  // a `catch` yields "", and "" would satisfy several checks below.
+  if (!exists(outPath) || !exists(errPath)) {
+    fatal(name, "the wrapper exited ${code} without creating its capture files — it never launched the compiler")
+  }
+  let out = readFile(outPath) catch e {
+    fatal(name, "cannot read captured stdout: " + e.message())
+    ""
+  }
+  let err = readFile(errPath) catch e {
+    fatal(name, "cannot read captured stderr: " + e.message())
+    ""
+  }
+  return Run{ code: code, stdout: out, stderr: err, outPath: outPath, errPath: errPath }
+}
+
+// Every code the wrapper reserves for its own breakage, plus the two `/bin/sh`
+// reserves for "found but not executable" and "not found". None of them can be
+// the compiler's verdict, and all of them would otherwise read as a plain
+// failure — exactly the trap pmfetchcheck.bit's `pmGitMustSucceed` documents.
+function rejectWrapperFailure(name: string, code: int) {
+  if (code < 0) {
+    fatal(name, "the wrapper script could not be launched (osRunBounded returned ${code})")
+  }
+  if (code == rcCdFailed) {
+    fatal(name, "wrapper: cd into the project directory failed")
+  }
+  if (code == rcBitNotExecutable) {
+    fatal(name, "wrapper: the compiler under test is not executable")
+  }
+  if (code == rcStdlibUnresolvable) {
+    fatal(name, "wrapper: the stdlib root could not be resolved to an absolute path")
+  }
+  if (code == rcBitDirUnresolvable) {
+    fatal(name, "wrapper: the compiler's directory could not be resolved to an absolute path")
+  }
+  if (code == 126) {
+    fatal(name, "wrapper: /bin/sh reported a command found but not executable (126)")
+  }
+  if (code == 127) {
+    fatal(name, "wrapper: /bin/sh reported a command not found (127) — the compiler never ran")
+  }
+}
+
+// --- shell plumbing -------------------------------------------------------
+
+// Writes `body` as a `/bin/sh` script, makes it owner-executable, runs it under
+// a wall-clock deadline, and returns its exit code (or -2 when it timed out).
+function runScript(name: string, body: string): int {
+  let path = "/tmp/bit-pmimports-" + uuidFormat(uuidV4()) + ".sh"
+  writeFile(path, "#!/bin/sh\n" + body) catch e {
+    fatal(name, "cannot write the wrapper script: " + e.message())
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700: owner rwx only
+    fatal(name, "cannot make the wrapper script executable: ${path}")
+  }
+  let code = osRunBounded(path, subprocessTimeoutMs)
+  removeQuiet(path)
+  return code
+}
+
+// Runs a fixture-setup script and demands exit 0. A setup step that "failed"
+// with 127 because the tool was absent must never look like an ordinary
+// disagreement, so `rcGitAbsent` is named explicitly.
+function mustSucceed(name: string, what: string, body: string) {
+  let code = runScript(name, body)
+  if (code == rcTimedOut) {
+    fatal(name, "fixture setup (${what}) TIMED OUT after ${subprocessTimeoutMs}ms")
+  }
+  if (code == rcGitAbsent) {
+    fatal(name, "fixture setup (${what}) needs `git` on PATH and it is not there")
+  }
+  if (code != 0) {
+    fatal(name, "fixture setup (${what}) exited ${code}, want 0")
+  }
+}
+
+function mkdirp(name: string, path: string) {
+  mustSucceed(name, "mkdir -p ${path}", "set -e\nmkdir -p " + shQuote(path) + "\n")
+}
+
+function rmrf(path: string) {
+  let code = runScript("cleanup", "rm -rf " + shQuote(path) + "\n")
+  if (code != 0) {
+    print("note: could not remove the scratch tree ${path} (rm exited ${code})\n")
+  }
+}
+
+function removeQuiet(path: string) {
+  remove(path) catch e { return }
+}
+
+// Wraps `s` as one POSIX `/bin/sh` word: every embedded `'` becomes `'\''`.
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '\'') {
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// --- assertions -----------------------------------------------------------
+
+// `contains(s, "")` is TRUE, so an expected substring that came out empty
+// through a concatenation bug would assert nothing at all. Reject it.
+function mustContain(name: string, haystack: string, needle: string) {
+  if (len(needle) == 0) {
+    fatal(name, "the harness built an empty expected substring — that would assert nothing")
+  }
+  if (!contains(haystack, needle)) {
+    fatal(name, "stderr does not contain '${needle}'\n  stderr was: ${haystack}")
+  }
+}
+
+function isFullSha(s: string): bool {
+  if (len(s) != 40) {
+    return false
+  }
+  let i = 0
+  while (i < 40) {
+    let c = s[i]
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+function trimEol(s: string): string {
+  let n = len(s)
+  while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+    n = n - 1
+  }
+  return s[0:n]
+}
+
+function fatal(name: string, msg: string) {
+  print("FAIL [${name}]: ${msg}\n")
+  exit(1)
+}
