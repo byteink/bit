@@ -62,7 +62,7 @@ self-hosted language has, resolved by a published binary rather than by a second
 compiler. You need `sh`, `curl` and `tar`; none of it is needed to *use* Bit.
 
 ```
-./make             # build the compiler into zig-out/bin
+./make             # build the compiler into bit-out/bin
 ./make test        # run the full suite
 ./make --list      # every step and what it does
 scripts/gate.sh    # run only what your diff can affect
@@ -138,9 +138,8 @@ Bit compile speed: **1844 lines/sec** (96 lines across 4 cases, warm).
 
 ## License
 
-[Apache-2.0](LICENSE). The code is open; the **name** is not - Apache-2.0
-grants no trademark rights, so a modified compiler needs a different name. See
-[TRADEMARK.md](TRADEMARK.md), and [CONTRIBUTING.md](CONTRIBUTING.md) before
-sending a change.
+[Apache-2.0](LICENSE). Apache-2.0 grants no trademark rights, so a modified
+compiler gets a different name - see [TRADEMARK.md](TRADEMARK.md) for the naming
+policy, and [CONTRIBUTING.md](CONTRIBUTING.md) before sending a change.
 
 Security reports go through [SECURITY.md](SECURITY.md), never a public issue.

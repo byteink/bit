@@ -1,55 +1,42 @@
-# Trademark and naming policy
+# Naming policy
 
-Bit's code is licensed under Apache-2.0 (see `LICENSE`). Its **name is not**.
+**This is a project policy, not a trademark claim.** byteink holds no trademark
+registration for Bit, bitlang or byteink, and nothing here asserts one.
 
-Apache-2.0 grants copyright and patent rights and explicitly grants **no
-trademark rights** (section 6). That separation is deliberate here, and it is
-the project's actual control mechanism: the code is free to fork, the identity
-is not. This is the same arrangement Rust, Kotlin and Swift use.
+It exists because Apache-2.0 (see `LICENSE`) grants copyright and patent rights
+and explicitly grants **no** trademark rights (section 6). That leaves an
+obvious question unanswered - you can fork the code, but what do you call the
+result? - and this file answers it. Rust, Kotlin and Swift publish the same kind
+of policy.
 
-## The marks
-
-**Bit**, **bitlang**, **byteink**, the `bit` command name, and the project logo
-are marks of byteink.
-
-## What you may do without asking
+## Fine, no need to ask
 
 - Use Bit for anything, commercially or otherwise. That is what the license is
   for, and nothing here narrows it.
-- Redistribute **unmodified** official releases under the name Bit - a package
-  in a distro repo, a Docker image, a mirror.
+- Redistribute **unmodified** official releases as Bit - a package in a distro
+  repo, a Docker image, a mirror.
 - Say true things about your own work: "written in Bit", "Bit bindings for X",
   "compatible with Bit 1.2". Factual references are not our business.
 - Write books, courses, blog posts and talks about Bit.
-- Run a user group or conference about Bit, provided it is clear byteink does
+- Run a user group or conference about Bit, as long as it is clear byteink does
   not run it.
 
-## What needs a different name
+## Give it a different name
 
-- **A fork, or any modified compiler.** If you change the compiler, runtime or
-  stdlib and distribute it, it is not Bit - pick your own name. You keep every
-  right the license gives you over the code; you do not get the name with it.
-- **A product or service whose name suggests it is official**: "Bit Pro",
-  "BitCloud", "Bit Enterprise", `bitlang.<anything>` domains, or a logo derived
-  from ours.
-- **Anything implying endorsement**: "official Bit plugin", "certified for Bit",
-  "Bit-approved".
+- **A fork, or any modified compiler.** Change the compiler, runtime or stdlib
+  and ship it, and it is not Bit any more - name it something else. The license
+  still gives you every right over the code; this is about the name only.
+- **Anything shaped to look official**: "Bit Pro", "Bit Enterprise", "official
+  Bit plugin", "certified for Bit", `bitlang.<anything>` domains.
 
-If a reasonable person would think byteink published it, the name needs to
-change. If in doubt, ask: <hello@byteink.io>.
+The test is simple: if a reasonable person would think byteink published it, the
+name is wrong. Unsure? <hello@byteink.io>.
 
-## The registry
-
-The Bit package registry is a byteink-operated service, not part of this
-repository and not covered by the Apache-2.0 grant. Running your own registry
-for your own packages is fine; presenting it as **the** Bit registry is not.
-
-## Why this exists
+## Why
 
 A language lives or dies on whether people can trust the thing named `bit` to
 behave the way the spec says. Ten incompatible forks all calling themselves Bit
-would destroy that, and every user with it - Apache-2.0 cannot prevent that on
-its own, and this policy is what does.
+would destroy that, and every user with it.
 
-It is not here to stop anyone forking. Fork it, rename it, ship it. That path
-stays open on purpose.
+None of this is here to stop anyone forking. Fork it, rename it, ship it. That
+path stays open on purpose.

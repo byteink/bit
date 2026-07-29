@@ -64,8 +64,9 @@ for the whole tree. Please do not add them.
 
 ## The name
 
-The code is Apache-2.0; the name is not. If you fork and modify the compiler,
-call it something else - see `TRADEMARK.md`. Forking is fine and stays fine.
+The code is Apache-2.0, which grants no trademark rights. Fork and modify the
+compiler and it gets a different name - see `TRADEMARK.md`. Forking is fine and
+stays fine.
 
 ## Reporting a security issue
 
