@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Verify a stage0 `bit` artifact against the digest COMMITTED IN THIS REPO.
 #
 # See docs/release/bootstrap.md §1 for why this exists and why it does not reuse
@@ -11,7 +11,17 @@
 #
 # Refuses rather than warns. A bootstrap that continues past a failed digest
 # check is a bootstrap with no digest check.
-set -euo pipefail
+#
+# STRICTLY POSIX, AND `sh` NOT `bash` (#1874). scripts/stage0.sh runs this with
+# an explicit `sh`, which overrides the shebang — so a `set -o pipefail` here
+# was accepted by macOS (bash in POSIX mode) and rejected by dash on every Linux
+# gate host, killing the bootstrap with `Illegal option -o pipefail` before a
+# single digest was compared. This is the entry point to building the compiler;
+# it may not assume a shell richer than the host's /bin/sh.
+#
+# Losing pipefail costs nothing here because the one pipeline whose failure
+# matters is checked explicitly below.
+set -eu
 
 REPO="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SUMS="${REPO}/dist/stage0/SHA256SUMS"
@@ -60,6 +70,10 @@ elif command -v shasum >/dev/null 2>&1; then
 else
   die "neither sha256sum nor shasum found; cannot verify"
 fi
+
+# Checked rather than left to the comparison below. An empty `got` would still
+# refuse — as a DIGEST MISMATCH — which blames the artifact for a broken hasher.
+[ -n "${got}" ] || die "the checksum tool produced no digest for ${artifact}"
 
 [ "${got}" = "${want}" ] || die "DIGEST MISMATCH for ${base}
   expected ${want}
