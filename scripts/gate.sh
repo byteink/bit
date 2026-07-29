@@ -157,6 +157,10 @@ case "${BUCKET}" in
     ZIG_STEPS=(test-imports)
     PRE1="scripts/selfhost-diffcheck.sh"
     PRE2="scripts/selfhost-fixpoint.sh"
+    # #1857 was a COMPILER bug (`parseFloat` had no hex-float branch) whose only
+    # visible damage was in runtime codegen, and no differential walked
+    # `runtime/`. A compiler/** change must be diffed against it (#1859).
+    POST1="scripts/selfhost-diffruntime.sh"
     ;;
   runtime)
     # Every name here was stale (#1593). `test-gcdiff` was deleted with the Zig
@@ -165,6 +169,7 @@ case "${BUCKET}" in
     # runtime/** change ran FOUR nonexistent steps and died on `no step named`.
     # The check after this case block now catches that class before anything runs.
     ZIG_STEPS=(test-stress test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
+    POST1="scripts/selfhost-diffruntime.sh"
     ;;
   testcases)
     ZIG_STEPS=(test-golden)
