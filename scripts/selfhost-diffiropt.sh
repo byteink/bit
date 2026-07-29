@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Self-host POST-opt IR differential (#1339): diff `bit --dump-ir` (optimized)
-# against the seed's optimized `--dump-ir` over the corpus. Tracks optimizer
+# against the pinned stage0's optimized `--dump-ir` over the corpus. Tracks optimizer
 # coverage — MATCH grows as fold/DCE/inline passes land. Mirror of
 # selfhost-diffir.sh but for the post-optimizer surface.
 #
@@ -50,8 +50,8 @@ match=0 skip=0
 : >"$work/timeout"
 
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  seed=$("$ORACLE" --dump-ir "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
-  [ -z "$seed" ] && { skip=$((skip + 1)); continue; }
+  want=$("$ORACLE" --dump-ir "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
+  [ -z "$want" ] && { skip=$((skip + 1)); continue; }
 
   b2=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir "$f" 2>/dev/null)
   rc=$?
@@ -66,7 +66,7 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
   # before comparing (see selfhost-ir-canon.sh). Raw compare first: the
   # overwhelming majority of files already match byte-for-byte, so skip the
   # two awk forks unless the raw strings actually differ.
-  if [ "$seed" = "$b2" ] || [ "$(canon_ir_ids "$seed")" = "$(canon_ir_ids "$b2")" ]; then
+  if [ "$want" = "$b2" ] || [ "$(canon_ir_ids "$want")" = "$(canon_ir_ids "$b2")" ]; then
     match=$((match + 1))
   else
     echo "$f" >>"$work/mismatch"
@@ -105,7 +105,7 @@ if [ -s "$work/entered" ]; then
   # Bounded evidence for the first few, so the failure is actionable in one read.
   head -3 "$work/entered" | while read -r f; do
     echo
-    echo "--- diff (seed vs bit, \$t<id> canonicalized): $f"
+    echo "--- diff (stage0 vs bit, \$t<id> canonicalized): $f"
     diff <(canon_ir_ids "$("$ORACLE" --dump-ir "$f" 2>/dev/null)") \
          <(canon_ir_ids "$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir "$f" 2>/dev/null)") | head -20
   done
