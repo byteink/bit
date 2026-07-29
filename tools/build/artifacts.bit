@@ -1,0 +1,333 @@
+// Artifact steps for the Bit build driver (#1869, epic #1867): `libbitrt`,
+// `selfhost`, `install`, `uninstall`, and the rebuild fingerprint that keeps an
+// unchanged tree from paying a ~23s recompile on every invocation.
+//
+// Sorts before `defs.bit` and `main.bit` so the inliner has already lowered
+// these by the time their callers are lowered (#1511).
+
+import { readFile, writeFile, exists, mkdir, walk } from "std/fs"
+import { env } from "std/os"
+import { newSha256, encodeHex, Sha256 } from "std/crypto"
+import { hasSuffix } from "std/strings"
+
+// The three CLI targets. x86_64-macos is deliberately absent, matching
+// build.zig's list and dist/package.sh's.
+function targets(): []string {
+  return ["x86_64-linux", "aarch64-linux", "aarch64-macos"]
+}
+
+function outDir(): string { return "zig-out" }
+function stampPath(): string { return "zig-out/make/fp-libbitrt.stamp" }
+function selfhostStamp(): string { return "zig-out/make/fp-selfhost.stamp" }
+
+// --- shell -----------------------------------------------------------------
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word. Same rule golden.bit uses:
+// single-quote everything and escape embedded quotes by closing, escaping,
+// reopening.
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == '\'') {
+      out = out + "'\\''"
+    } else {
+      out = out + string([]byte{c})
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// Runs `script` through /bin/sh and returns its exit code, or -2 on timeout.
+//
+// A generated wrapper rather than a direct exec because the runtime's process
+// primitive takes one executable path, and every one of these needs an
+// environment and sometimes a redirect. This is the same shape `golden.bit`
+// and the other harnesses use.
+function runShell(name: string, script: string, timeoutMs: int): int {
+  let path = "zig-out/make/run-${name}.sh"
+  if (!ensureDir("zig-out/make")) {
+    eprint("make: cannot create zig-out/make\n")
+    return 1
+  }
+  writeFile(path, "#!/bin/sh\n" + script) catch _ {
+    eprint("make: cannot write ${path}\n")
+    return 1
+  }
+  if (fsChmod(path, 448) != 0) { // 0o700
+    eprint("make: cannot chmod ${path}\n")
+    return 1
+  }
+  return osRunBounded(path, timeoutMs)
+}
+
+// Generous: a cold three-target archive build is minutes, not seconds. A bound
+// exists at all so a wedged child fails loudly instead of hanging the driver —
+// a hang is a failure, not a stall (#1637/#1652).
+function buildTimeoutMs(): int { return 1800000 }
+
+// --- stage0 ----------------------------------------------------------------
+
+// Resolves the pinned stage0 exactly as every differential does, so there is
+// ONE answer to "which compiler builds this tree". Prints the wrapper path.
+function resolveStage0(): (string, bool) {
+  let outPath = "zig-out/make/stage0.path"
+  let rc = runShell("stage0", "sh scripts/stage0.sh > " + shQuote(outPath) + "\n", buildTimeoutMs())
+  if (rc != 0) {
+    eprint("make: cannot resolve stage0 (scripts/stage0.sh exited ${rc})\n")
+    return "", false
+  }
+  let text = readFile(outPath) catch _ {
+    eprint("make: cannot read ${outPath}\n")
+    return "", false
+  }
+  return trimNewline(text), true
+}
+
+function trimNewline(s: string): string {
+  let end = len(s)
+  while (end > 0 && (s[end - 1] == '\n' || s[end - 1] == '\r')) {
+    end = end - 1
+  }
+  return s[:end]
+}
+
+// --- fingerprint -----------------------------------------------------------
+
+// What decides `libbitrt.a`'s bytes: the runtime sources, this driver, and THE
+// COMPILER THAT READS THEM.
+//
+// The compiler half is the part that has already gone wrong once. build.zig
+// fingerprints `dist/stage0/SHA256SUMS`, which identifies the PINNED stage0
+// exactly — but `BIT_STAGE0_BIN` overrides which compiler is used without
+// touching that file, so an overridden run reuses the stale archive. That is
+// #1863, and it matters precisely because the override's only purpose is
+// replacing a stage0 that MISCOMPILES the runtime (#1857): the stale archive
+// would be the broken one the override existed to avoid.
+//
+// So both are folded in: the pin, and — when set — the bytes of the overriding
+// binary itself.
+function fingerprint(): string {
+  let h = newSha256()
+  h.write(bytes("v1\n"))
+  hashPathList(h, sourceFiles())
+  hashOne(h, "dist/stage0/SHA256SUMS")
+  let override = env("BIT_STAGE0_BIN")
+  if (override != "") {
+    h.write(bytes("override:" + override + "\n"))
+    hashOne(h, override)
+  }
+  return encodeHex(h.sum())
+}
+
+function bytes(s: string): []byte {
+  let out = []byte(0)
+  let i = 0
+  while (i < len(s)) {
+    out = append(out, s[i])
+    i = i + 1
+  }
+  return out
+}
+
+// `runtime/**` decides the archive; `tools/build/**` decides how it is built.
+function sourceFiles(): []string {
+  let out = []string(0)
+  for p of walkBit("runtime") {
+    out = append(out, p)
+  }
+  for p of walkBit("tools/build") {
+    out = append(out, p)
+  }
+  return out
+}
+
+function walkBit(root: string): []string {
+  let out = []string(0)
+  let all = walk(root) catch _ { return out }
+  for p of all {
+    if (hasSuffix(p, ".bit")) {
+      out = append(out, p)
+    }
+  }
+  return out
+}
+
+// Path AND content: a rename with identical bytes still changes what compiles.
+function hashPathList(h: Sha256, paths: []string) {
+  for p of paths {
+    hashOne(h, p)
+  }
+}
+
+function hashOne(h: Sha256, path: string) {
+  h.write(bytes("path:" + path + "\n"))
+  let data = readFile(path) catch _ {
+    h.write(bytes("missing\n"))
+    return
+  }
+  h.write(bytes(data))
+}
+
+function readStamp(path: string): string {
+  let s = readFile(path) catch _ { return "" }
+  return trimNewline(s)
+}
+
+// A stamp that cannot be written is not fatal — the next run simply rebuilds —
+// but it must not be silent, or a permanently-unwritable stamp looks like a
+// cache that never warms.
+function writeStamp(path: string, fp: string) {
+  if (!ensureDir("zig-out/make")) {
+    eprint("make: cannot create zig-out/make; not recording ${path}\n")
+    return
+  }
+  writeFile(path, fp + "\n") catch _ {
+    eprint("make: cannot write stamp ${path}; the next run will rebuild\n")
+    return
+  }
+}
+
+// `mkdir` on an existing directory fails, and this is called on paths that
+// usually already exist.
+function ensureDir(p: string): bool {
+  if (exists(p)) {
+    return true
+  }
+  mkdir(p) catch _ {
+    return false
+  }
+  return true
+}
+
+// A stamp match is only trustworthy if the outputs it describes still exist —
+// a stamp plus a deleted archive would skip the rebuild and leave nothing.
+function allExist(paths: []string): bool {
+  for p of paths {
+    if (!exists(p)) {
+      return false
+    }
+  }
+  return true
+}
+
+function archivePaths(): []string {
+  let out = []string(0)
+  for t of targets() {
+    out = append(out, "${outDir()}/lib/${t}/libbitrt.a")
+  }
+  return out
+}
+
+// --- host triple -----------------------------------------------------------
+
+// Which archive `bit` itself links against. Resolved with `uname` rather than
+// assumed: the driver runs on all three targets.
+function hostTriple(): string {
+  let outPath = "zig-out/make/host.triple"
+  let script = "case \"$(uname -s)-$(uname -m)\" in\n" +
+    "  Darwin-arm64)              echo aarch64-macos ;;\n" +
+    "  Linux-aarch64|Linux-arm64) echo aarch64-linux ;;\n" +
+    "  Linux-x86_64)              echo x86_64-linux ;;\n" +
+    "  *) echo unsupported ;;\n" +
+    "esac > " + shQuote(outPath) + "\n"
+  if (runShell("host", script, buildTimeoutMs()) != 0) {
+    return "unsupported"
+  }
+  let t = readFile(outPath) catch _ { return "unsupported" }
+  return trimNewline(t)
+}
+
+// --- steps -----------------------------------------------------------------
+
+// `scripts/g2archive.sh` is the ONE recipe for this archive and is called
+// rather than reimplemented, for the reason build.zig records: four agents in
+// one session each reconstructed the procedure by hand, every reconstruction a
+// fresh chance to diverge. It refuses to write the shared
+// `zig-out/lib/<t>/libbitrt.a` directly, so each target is built to a scratch
+// path and copied into place.
+function stepLibbitrt(stage0: string): int {
+  let fp = fingerprint()
+  if (readStamp(stampPath()) == fp && allExist(archivePaths())) {
+    print("make:   up to date (fingerprint ${fp[:12]})\n")
+    return 0
+  }
+  for t of targets() {
+    print("make:   ${t}\n")
+    let scratch = "zig-out/make/libbitrt-${t}.a"
+    let dest = "${outDir()}/lib/${t}"
+    let script = "set -e\n" +
+      "BIT=" + shQuote(stage0) + "\nexport BIT\n" +
+      "rm -f " + shQuote(scratch) + "\n" +
+      "bash scripts/g2archive.sh " + shQuote(t) + " " + shQuote(scratch) + "\n" +
+      "mkdir -p " + shQuote(dest) + "\n" +
+      "cp " + shQuote(scratch) + " " + shQuote(dest + "/libbitrt.a") + "\n"
+    let rc = runShell("libbitrt-${t}", script, buildTimeoutMs())
+    if (rc != 0) {
+      eprint("make: libbitrt ${t} failed (${rc})\n")
+      return 1
+    }
+  }
+  writeStamp(stampPath(), fp)
+  return 0
+}
+
+// LINK THE TREE'S RUNTIME, NOT THE RELEASE'S (#1857). stage0 is an installed
+// toolchain and resolves `libbitrt.a` relative to itself, so without
+// BIT_LIBBITRT the compiler produced here links the PREVIOUS RELEASE's runtime
+// and every `runtime/` change is invisible to the compiler binary. The symptom
+// was a fixed `bit_rt_parse_float` that had no effect on `bit`.
+function stepSelfhost(stage0: string): int {
+  let host = hostTriple()
+  if (host == "unsupported") {
+    eprint("make: unsupported host for selfhost\n")
+    return 1
+  }
+  let fp = fingerprint()
+  let binPath = "${outDir()}/bin/bit"
+  let compilerFp = fp + ":" + encodeHex(compilerHash())
+  if (readStamp(selfhostStamp()) == compilerFp && exists(binPath)) {
+    print("make:   up to date\n")
+    return 0
+  }
+  let archive = "${outDir()}/lib/${host}/libbitrt.a"
+  if (!exists(archive)) {
+    eprint("make: missing ${archive} — run `./make libbitrt` first\n")
+    return 1
+  }
+  let script = "set -e\n" +
+    "BIT_LIBBITRT=" + shQuote(archive) + "\nexport BIT_LIBBITRT\n" +
+    "mkdir -p " + shQuote(outDir() + "/bin") + "\n" +
+    shQuote(stage0) + " build compiler -o " + shQuote(binPath) + "\n"
+  let rc = runShell("selfhost", script, buildTimeoutMs())
+  if (rc != 0) {
+    eprint("make: selfhost failed (${rc})\n")
+    return 1
+  }
+  writeStamp(selfhostStamp(), compilerFp)
+  return 0
+}
+
+// `compiler/**` is not in `fingerprint()` because it does not affect the
+// runtime archive; the compiler binary depends on it as well as on everything
+// the archive does.
+function compilerHash(): []byte {
+  let h = newSha256()
+  hashPathList(h, walkBit("compiler"))
+  return h.sum()
+}
+
+// `install` is the default step and exists to depend on the two artifacts;
+// `zig build install` copies into zig-out, which is where they are already
+// produced, so there is nothing further to do here.
+function stepInstall(): int {
+  return 0
+}
+
+function stepUninstall(): int {
+  let rc = runShell("uninstall", "rm -rf " + shQuote(outDir() + "/bin") + " " +
+    shQuote(outDir() + "/lib") + " " + shQuote("zig-out/make") + "\n", buildTimeoutMs())
+  return rc
+}
