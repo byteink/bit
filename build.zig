@@ -863,7 +863,35 @@ pub fn build(b: *std.Build) void {
     const selfhost_skip = selfhost_gate_applies and
         fingerprintMatchesStamp(b, "fp-selfhost.stamp", selfhost_fp, &.{selfhost_artifact_path});
 
-    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (compiler/) with the seed bit-seed → bit");
+    const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (compiler/) with the pinned stage0 → bit");
+
+    // THE BOOTSTRAP NOW COMES FROM THE PINNED STAGE0, NOT THE SEED (#1593).
+    //
+    // `scripts/stage0.sh` downloads the release named by dist/stage0/SHA256SUMS,
+    // verifies it against that COMMITTED digest, unpacks it under zig-out/stage0/
+    // and writes a wrapper that pins BIT_STDLIB to this tree. First run fetches;
+    // every later run is silent and offline. It REFUSES on any failure, so a
+    // build cannot quietly fall back to something unverified.
+    //
+    // The wrapper path is fixed rather than read from the script's stdout because
+    // build.zig composes the graph before anything runs — it cannot capture output
+    // at configure time. `stage0.sh` writes exactly this path, and the run below
+    // fails loudly if it is absent.
+    //
+    // Building compiler/ with stage0 lands directly on the bootstrap FIXED POINT:
+    // verified on aarch64-macOS that stage0-built `bit` rebuilds itself
+    // byte-identically (sha256 4482c941…0031 both sides). The seed did not have
+    // that property — scripts/selfhost-fixpoint.sh records that seed-built and
+    // bit-built compilers differ by two cosmetic monomorph instance orderings —
+    // so this switch makes `zig build` produce the canonical binary rather than a
+    // stage that merely converges to it.
+    // stdout is the script's RETURN VALUE for shell callers (the wrapper path);
+    // build.zig already knows that path, so drop it rather than printing a stray
+    // line on every `zig build`. Diagnostics go to stderr and are kept.
+    const stage0_ensure = b.addSystemCommand(&.{ "sh", "-c", "sh scripts/stage0.sh >/dev/null" });
+    // Downloads and unpacks; the result is invisible to the build cache.
+    stage0_ensure.has_side_effects = true;
+    const stage0_bit = b.pathFromRoot("zig-out/stage0/bit-oracle");
     var selfhosted: std.Build.LazyPath = undefined;
     // Exposed so a gate that READS `zig-out/bin/bit` off disk (rather than
     // taking it as a LazyPath arg) can depend on the install and stop racing
@@ -879,7 +907,8 @@ pub fn build(b: *std.Build) void {
         // this invocation.
         selfhosted = .{ .cwd_relative = selfhost_artifact_path };
     } else {
-        const selfhost_run = b.addRunArtifact(exe);
+        const selfhost_run = b.addSystemCommand(&.{stage0_bit});
+        selfhost_run.step.dependOn(&stage0_ensure.step);
         selfhost_run.addArg("build");
         if (b.user_input_options.contains("version")) {
             // `-Dversion=` given: compile a COPY of compiler/ whose `version.bit`
@@ -903,7 +932,6 @@ pub fn build(b: *std.Build) void {
         }
         selfhost_run.addArg("-o");
         selfhosted = selfhost_run.addOutputFileArg("bit");
-        selfhost_run.step.dependOn(&seed_install.step);
         if (host_libbitrt_install) |inst| selfhost_run.step.dependOn(inst);
         // `zig build selfhost` alone reaches libbitrt only as this dependency —
         // never through `libbitrt_step`/`test_step` — so without this its

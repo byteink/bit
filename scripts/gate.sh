@@ -159,7 +159,12 @@ case "${BUCKET}" in
     PRE2="scripts/selfhost-fixpoint.sh"
     ;;
   runtime)
-    ZIG_STEPS=(test-stress test-gcdiff rootpins rootabi stwwiring)
+    # Every name here was stale (#1593). `test-gcdiff` was deleted with the Zig
+    # collector in #1854, and `rootpins`/`rootabi`/`stwwiring` gained a `test-`
+    # prefix when they moved from tests/*.zig to tests/bit/*.bit in #1591 — so a
+    # runtime/** change ran FOUR nonexistent steps and died on `no step named`.
+    # The check after this case block now catches that class before anything runs.
+    ZIG_STEPS=(test-stress test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
     ;;
   testcases)
     ZIG_STEPS=(test-golden)
@@ -172,6 +177,23 @@ case "${BUCKET}" in
     ZIG_STEPS=(test-imports test-stdlib-docs)
     ;;
 esac
+
+# A step name that no longer exists is a STALE GATE, and it must say so. Renaming
+# a harness silently invalidated a whole bucket here once (#1593 found four dead
+# names in `runtime`); the raw `error: no step named rootpins` that produced does
+# not point at this file, so nobody connected the two. Checked before any work is
+# done, and `test` is the umbrella step which `--help` does not list.
+if command -v zig >/dev/null 2>&1; then
+  STEP_LIST="$(zig build --help 2>/dev/null || true)"
+  for s in "${ZIG_STEPS[@]}"; do
+    [ "${s}" = "test" ] && continue
+    printf '%s\n' "${STEP_LIST}" | grep -q "^  ${s} " || {
+      echo "gate: STALE: bucket '${BUCKET}' names build step '${s}', which does not exist." >&2
+      echo "gate: fix scripts/gate.sh — a renamed harness leaves this list behind." >&2
+      exit 2
+    }
+  done
+fi
 
 echo "gate: bucket: ${BUCKET} (${REASON})"
 echo "gate: plan:"

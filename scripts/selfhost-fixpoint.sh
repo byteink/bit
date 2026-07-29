@@ -28,8 +28,32 @@ WORK="$(pwd)/.fixpoint-work"
 rm -rf "$WORK"
 mkdir -p "$WORK/b" "$WORK/c"
 
-"$STAGEA" build selfhost -o "$WORK/b/bit" >/dev/null 2>&1
-"$WORK/b/bit" build selfhost -o "$WORK/c/bit" >/dev/null 2>&1
+[ -x "$STAGEA" ] || { echo "fixpoint: missing $STAGEA — run: zig build selfhost" >&2; exit 2; }
+[ -d compiler ] || { echo "fixpoint: no compiler/ directory — run from the repo root" >&2; exit 2; }
+
+# A BUILD FAILURE IS NOT A FIXPOINT BREAK, and this script used to make them
+# indistinguishable. It passed `selfhost` — the directory's name before #1841
+# renamed it to `compiler` — so from 186b57e onward every run died on
+# `bit: selfhost: NoMain`. With `set -e` and the output sent to /dev/null, that
+# surfaced as a bare `exit 1` and NOTHING printed: the strongest gate in the
+# bootstrap story looked like a failing fixed point for months, and gate.sh's
+# `selfhost` bucket ran it on every compiler/** change.
+#
+# So: the stage builds keep their own logs, and a non-zero build exits 2 (a
+# broken gate) rather than 1 (a broken compiler), naming the log.
+stage() { # <label> <compiler> <out>
+  if ! "$2" build compiler -o "$3" >"$WORK/$1.log" 2>&1; then
+    echo "fixpoint: $1 FAILED TO BUILD — this is a broken gate, not a broken fixed point" >&2
+    sed -n '1,20p' "$WORK/$1.log" >&2
+    exit 2
+  fi
+  # Exit 0 is not proof of an artifact: a stand-in that ignores its arguments
+  # (`/bin/echo`) exits 0 and writes nothing, and the next stage would then fail
+  # for a misleading reason. Comparing two files requires two files.
+  [ -s "$3" ] || { echo "fixpoint: $1 exited 0 but produced no binary at $3" >&2; exit 2; }
+}
+stage stageB "$STAGEA" "$WORK/b/bit"
+stage stageC "$WORK/b/bit" "$WORK/c/bit"
 
 B=$(shasum -a 256 "$WORK/b/bit" | cut -d' ' -f1)
 C=$(shasum -a 256 "$WORK/c/bit" | cut -d' ' -f1)
