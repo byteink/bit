@@ -1,29 +1,38 @@
 #!/usr/bin/env bash
-# Self-host token differential (#1332/#1334): lex every corpus `.bit` file with
-# both the Zig seed (`bit`) and the Bit compiler (`bit2`) and diff their
-# `--dump-tokens` output. They must be byte-identical. Files the seed rejects
-# with a lex error are skipped — the Bit lexer has no diagnostic renderer yet
-# (deferred with the renderer port), so it lexes past errors into Invalid tokens
-# where the seed prints a diagnostic instead.
+# Token differential (#1332/#1334): lex every corpus `.bit` file with both the
+# PINNED STAGE0 (the previous release) and the working tree's compiler, and diff
+# their `--dump-tokens` output. They must be byte-identical. Files the oracle
+# rejects with a lex error are skipped — the two lexers disagree about how far
+# to lex past an error, so those files measure the diagnostic renderer rather
+# than the lexer.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-difftokens.sh
+# THE ORACLE CHANGED IN #1593, AND SO DID WHAT A GREEN RUN MEANS. It used to be
+# `zig-out/bin/bit-seed`, a compiler written in a different language, so green
+# meant "two independent implementations agree". It is now the last release of
+# this same compiler, so green means "this version did not change behaviour
+# versus the last release". See docs/release/bootstrap.md §4/§5 — the loss is
+# recorded there, not papered over.
+#
+# Usage: zig build selfhost && bash scripts/selfhost-difftokens.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 set -u
-SEED=zig-out/bin/bit-seed
+# Resolves, downloads and DIGEST-VERIFIES the pinned stage0; see scripts/stage0.sh.
+# It refuses rather than skipping, so a `set -u` failure here is loud.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 
 # A missing compiler must ABORT, never score a vacuous green (#1514): both sides
 # of the differential would produce empty output, and equal-empty compares as
 # agreement. Exit 2 to keep this distinct from a real divergence (exit 1).
-for bin in "$SEED" "$BIT2"; do
-  [ -x "$bin" ] || { echo "difftokens: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+for bin in "$ORACLE" "$BIT2"; do
+  [ -x "$bin" ] || { echo "difftokens: missing $bin — run: zig build selfhost" >&2; exit 2; }
 done
 
 match=0 mismatch=0 skip=0 firstbad=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  seed=$("$SEED" --dump-tokens "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
+  oracle_out=$("$ORACLE" --dump-tokens "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
   b2=$("$BIT2" --dump-tokens "$f" 2>/dev/null)
-  if [ "$seed" = "$b2" ]; then
+  if [ "$oracle_out" = "$b2" ]; then
     match=$((match + 1))
   else
     mismatch=$((mismatch + 1))
@@ -41,6 +50,6 @@ fi
 
 if [ -n "$firstbad" ]; then
   echo "first divergence: $firstbad"
-  diff <("$SEED" --dump-tokens "$firstbad" 2>/dev/null) <("$BIT2" --dump-tokens "$firstbad" 2>/dev/null) | head -20
+  diff <("$ORACLE" --dump-tokens "$firstbad" 2>/dev/null) <("$BIT2" --dump-tokens "$firstbad" 2>/dev/null) | head -20
   exit 1
 fi

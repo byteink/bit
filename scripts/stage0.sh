@@ -1,0 +1,90 @@
+#!/bin/sh
+# Resolve the PINNED stage0 `bit` — the previous release, which is the oracle
+# every `selfhost-diff*.sh` gate compares the working tree against once `seed/`
+# is gone (#1593, docs/release/bootstrap.md §4).
+#
+# Prints ONE line on stdout: the absolute path to the stage0 `bit` binary.
+# Everything else goes to stderr, so `ORACLE="$(sh scripts/stage0.sh)"` is safe.
+#
+# WHAT THIS REPLACES, AND HOW THE MEANING CHANGES
+#
+# Until #1593 the oracle was `zig-out/bin/bit-seed`: a compiler written in a
+# different language by different code, so a green diff meant "two independent
+# implementations agree". The pinned stage0 is the SAME implementation one
+# release back, so a green diff now means "this version did not change
+# behaviour versus the last release". Both are useful. They are not the same
+# assertion, and bootstrap.md §5 records the loss rather than papering over it.
+#
+# WHY IT REFUSES INSTEAD OF SKIPPING
+#
+# A gate that cannot reach its oracle and exits 0 is worse than no gate: it
+# reports green for an assertion it never made. Every failure path here is a
+# non-zero exit with a message naming what to do.
+set -eu
+
+ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
+SUMS="${ROOT}/dist/stage0/SHA256SUMS"
+CACHE="${BIT_STAGE0_CACHE:-${ROOT}/zig-out/stage0}"
+
+die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
+
+[ -f "${SUMS}" ] || die "missing ${SUMS} — the pin is what makes stage0 trustworthy;
+  see docs/release/bootstrap.md §1"
+
+# Same triple mapping as dist/stage0-verify.sh. Kept in step with it by the
+# gate below rather than by hope: an unsupported host has no stage0 and must
+# cross-compile from a supported one (bootstrap.md §2).
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)              triple=macos-aarch64 ;;
+  Linux-aarch64|Linux-arm64) triple=linux-aarch64 ;;
+  Linux-x86_64)              triple=linux-x86_64 ;;
+  *) die "unsupported host $(uname -s)-$(uname -m); stage0 ships macos-aarch64,
+  linux-aarch64 and linux-x86_64 only — bootstrap.md §2" ;;
+esac
+
+# The pin names the exact artifact. Reading the FILENAME out of the digest file
+# rather than composing it from a version variable means there is one source of
+# truth for which build is stage0.
+line="$(grep -E "  .*${triple}\.tar\.xz\$" "${SUMS}" || true)"
+[ -n "${line}" ] || die "no committed digest for triple '${triple}' in ${SUMS}"
+[ "$(printf '%s\n' "${line}" | wc -l | tr -d ' ')" = "1" ] \
+  || die "more than one digest for triple '${triple}' in ${SUMS} — ambiguous, refusing"
+
+artifact="${line##* }"
+# bit-<version>-<triple>.tar.xz -> <version>
+version="$(printf '%s' "${artifact}" | sed -e 's/^bit-//' -e "s/-${triple}\.tar\.xz\$//")"
+prefix="${CACHE}/bit-${version}-${triple}"
+binary="${prefix}/bin/bit"
+
+# Already unpacked: say nothing, print the path, touch the network never. This
+# is the path every gate takes on every run after the first.
+if [ -x "${binary}" ]; then
+  printf '%s\n' "${binary}"
+  exit 0
+fi
+
+command -v curl >/dev/null || die "curl not found; cannot fetch stage0"
+mkdir -p "${CACHE}"
+tarball="${CACHE}/${artifact}"
+
+if [ ! -f "${tarball}" ]; then
+  url="https://github.com/byteink/bit/releases/download/v${version}/${artifact}"
+  printf 'stage0: fetching %s\n' "${url}" >&2
+  # -f so an HTML error page is a failure rather than a corrupt "artifact".
+  curl -fsSL -o "${tarball}.part" "${url}" \
+    || { rm -f "${tarball}.part"; die "download failed: ${url}
+  A draft release is NOT publicly downloadable — check the release is published."; }
+  mv "${tarball}.part" "${tarball}"
+fi
+
+# The digest check is the whole point, so it runs on every fresh unpack and uses
+# the COMMITTED sums via the dedicated script — never a SHA256SUMS fetched from
+# the same server as the tarball (bootstrap.md §1).
+sh "${ROOT}/dist/stage0-verify.sh" "${tarball}" >&2 \
+  || { rm -f "${tarball}"; die "stage0 failed digest verification; refusing to use it"; }
+
+rm -rf "${prefix}"
+tar xf "${tarball}" -C "${CACHE}"
+[ -x "${binary}" ] || die "unpacked ${artifact} but ${binary} is missing or not executable"
+
+printf '%s\n' "${binary}"
