@@ -27,17 +27,17 @@ cd "$repo"
 
 echo "==> Building native arm64 bit (compiler + LSP) ..."
 # NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted) is built by RUNNING
-# the pinned stage0 over compiler/ (build.zig's `native` check), which only works
+# the pinned stage0 over compiler/ (the driver's host-triple check), which only works
 # when that compiler targets the build host. A Linux-container cross build cannot
 # produce a runnable host `bit` at all. This Mac's zig (brew, kept local on
 # purpose — see the toolchain note) already targets its own host, aarch64-macos,
-# so a plain `zig build` here is both correct and simpler than a container that
+# so a plain `./make` here is both correct and simpler than a container that
 # could not do the job anyway.
 #
 # The seed used to be the thing doing the compiling, and the paragraph here used
 # to warn that a container build could only ever yield `bit-seed`, which never
 # got lint. Both halves are moot since #1593 deleted seed/.
-zig build
+./make
 echo "    built zig-out/bin/bit ($(./zig-out/bin/bit --version))"
 echo "    dev builds are used BY PATH: ./zig-out/bin/bit — nothing is copied to \$HOME"
 

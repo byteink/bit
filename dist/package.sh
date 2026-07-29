@@ -8,7 +8,7 @@
 # its leading `v`. The staged `bit` binary must already exist at
 # <outdir>/stage/bin/bit — the caller produces it, because producing a
 # self-hosted `bit` means EXECING the seed and only the workflow knows which
-# host it is on (see build.zig's `native` note).
+# host it is on (see tools/build/artifacts.bit's hostTriple note).
 #
 # Emits <outdir>/bit-<version>-<os>-<arch>.tar.xz. The artifact contract this
 # implements — layout, naming, the BIT_STDLIB/BIT_LIBBITRT env requirement — is
@@ -31,7 +31,7 @@ esac
 
 # Every runtime archive the shipped compiler can actually link against, so a
 # user who re-points BIT_LIBBITRT can cross-produce the other targets with the
-# same install. x86_64-macos is deliberately absent: `zig build libbitrt`
+# same install. x86_64-macos is deliberately absent: `./make libbitrt`
 # emits it, but no compiler target selects it (the Mach-O linker has no x86-64
 # relocation support yet), so shipping it would advertise a target that fails.
 RUNTIME_TRIPLES="x86_64-linux aarch64-linux aarch64-macos"
@@ -43,7 +43,7 @@ STAGE="${OUTDIR}/stage"
 
 for triple in ${RUNTIME_TRIPLES}; do
   src="${ROOT}/zig-out/lib/${triple}/libbitrt.a"
-  [ -f "${src}" ] || { echo "package.sh: missing ${src} (run 'zig build libbitrt')" >&2; exit 1; }
+  [ -f "${src}" ] || { echo "package.sh: missing ${src} (run './make libbitrt')" >&2; exit 1; }
   mkdir -p "${STAGE}/lib/${triple}"
   cp "${src}" "${STAGE}/lib/${triple}/libbitrt.a"
 done

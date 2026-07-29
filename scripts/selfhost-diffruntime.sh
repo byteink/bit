@@ -44,7 +44,7 @@
 # a compiler feature, not a script; until then, per-file is the whole surface.
 # It happens to cost nothing: the walk below skips zero files.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffruntime.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
 
 # The oracle is the PINNED STAGE0 (previous release), like every other
@@ -71,7 +71,7 @@ MIN_FILES=${DIFFRUNTIME_MIN_FILES:-70}
 REQUIRED="runtime/root/floatslog.bit runtime/root/floatsatan.bit"
 
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffruntime: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "diffruntime: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 [ -f "$GAPS" ] || { echo "diffruntime: missing expected-gap list $GAPS" >&2; exit 2; }
 

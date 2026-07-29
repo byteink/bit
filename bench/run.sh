@@ -20,7 +20,7 @@ CFLAGS="-O2 -ffp-contract=off"   # -ffp-contract=off: match strict IEEE (see REA
 
 command -v go >/dev/null || { echo "go not found on PATH" >&2; exit 1; }
 command -v cc >/dev/null || { echo "cc not found on PATH" >&2; exit 1; }
-[ -x "$BIT" ] || { echo "$BIT not built (run: zig build)" >&2; exit 1; }
+[ -x "$BIT" ] || { echo "$BIT not built (run: ./make)" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT

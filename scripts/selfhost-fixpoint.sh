@@ -19,7 +19,7 @@
 # from the output FILENAME, so both stages must be named identically or the hash
 # differs for a spurious reason. bit2's writer does NOT mkdir parents — mkdir -p.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-fixpoint.sh
+# Usage: ./make selfhost && bash scripts/selfhost-fixpoint.sh
 #        (or pass an explicit stageA binary: bash scripts/selfhost-fixpoint.sh path/to/bit)
 # Run from the repo root so the CWD-relative libbitrt lookup resolves.
 set -eu
@@ -28,7 +28,7 @@ WORK="$(pwd)/.fixpoint-work"
 rm -rf "$WORK"
 mkdir -p "$WORK/b" "$WORK/c"
 
-[ -x "$STAGEA" ] || { echo "fixpoint: missing $STAGEA — run: zig build selfhost" >&2; exit 2; }
+[ -x "$STAGEA" ] || { echo "fixpoint: missing $STAGEA — run: ./make selfhost" >&2; exit 2; }
 [ -d compiler ] || { echo "fixpoint: no compiler/ directory — run from the repo root" >&2; exit 2; }
 
 # A BUILD FAILURE IS NOT A FIXPOINT BREAK, and this script used to make them

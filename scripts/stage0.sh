@@ -29,7 +29,7 @@ CACHE="${BIT_STAGE0_CACHE:-${ROOT}/zig-out/stage0}"
 die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
 
 # THE BOOTSTRAP ESCAPE HATCH (#1857). `BIT_STAGE0_BIN=<path>` makes every
-# consumer — build.zig, dist/release.sh, all fifteen differentials — use that
+# consumer — tools/build/, dist/release.sh, all fifteen differentials — use that
 # compiler as stage0 instead of the pinned release.
 #
 # It exists for one situation, and it is not hypothetical: when a bug is fixed
@@ -40,8 +40,8 @@ die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
 # coefficients to zero and `log(x)` returned 0 for every input. Breaking the
 # cycle takes two passes:
 #
-#   zig build                                     # pass 1: stage0 -> bit with the fix
-#   BIT_STAGE0_BIN=$PWD/zig-out/bin/bit zig build # pass 2: that bit -> correct runtime
+#   ./make                                        # pass 1: stage0 -> bit with the fix
+#   BIT_STAGE0_BIN=$PWD/zig-out/bin/bit ./make    # pass 2: that bit -> correct runtime
 #
 # then cut a release from pass 2 and repin dist/stage0/SHA256SUMS, after which a
 # single pass is correct again and this variable goes back to being unused.

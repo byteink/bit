@@ -3,8 +3,8 @@
 
     python3 dist/sbom_test.py
 
-Not wired into `zig build test` — dist/*.sh has never been (changelog.sh,
-package.sh aren't either); this exercises the one thing zig build test can't:
+Not wired into `./make test` — dist/*.sh has never been (changelog.sh,
+package.sh aren't either); this exercises the one thing the suite can't:
 that the generator emits the fields the release pipeline and downstream
 consumers rely on. Installs cyclonedx-python-lib into a throwaway venv
 rather than touching the caller's environment, pinned by
@@ -41,7 +41,7 @@ def main() -> int:
             check=True,
         )
         out = subprocess.run(
-            [python, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.16.0"],
+            [python, str(ROOT / "dist" / "sbom.py"), "9.9.9-test", "0.1.4"],
             check=True,
             capture_output=True,
             text=True,
@@ -53,8 +53,8 @@ def main() -> int:
         ("specVersion", "specVersion", "1.7"),
         ("app component name", "metadata/component/name", "bit"),
         ("app component version", "metadata/component/version", "9.9.9-test"),
-        ("zig tool name", "metadata/tools/components/0/name", "zig"),
-        ("zig tool version", "metadata/tools/components/0/version", "0.16.0"),
+        ("stage0 tool name", "metadata/tools/components/0/name", "bit"),
+        ("stage0 tool version", "metadata/tools/components/0/version", "0.1.4"),
     ]
     for desc, path, want in checks:
         got = get(doc, path)

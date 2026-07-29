@@ -63,7 +63,7 @@ fi
 git -C "${ROOT}" worktree add --detach "${WORK}/src" "${TAG}" >/dev/null
 
 echo "building seed + runtime archives at ${TAG}..."
-( cd "${WORK}/src" && zig build && zig build libbitrt ) >"${WORK}/build.log" 2>&1 ||
+( cd "${WORK}/src" && ./make && ./make libbitrt ) >"${WORK}/build.log" 2>&1 ||
   { echo "verify-reproducible-release.sh: build failed, see ${WORK}/build.log" >&2; exit 1; }
 
 FAIL=0

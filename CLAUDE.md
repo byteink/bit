@@ -27,15 +27,23 @@ The compiler↔runtime contract lives in `runtime/ABI.md` (object headers, stack
 
 ## Commands
 
-Nothing is scaffolded yet. Once #321 lands, the intended commands are:
-
 ```
-zig build              # fetch/verify stage0, build libbitrt.a + bit
-zig build test         # unit + golden tests
-zig build fuzz         # fuzzing harness (after #334)
+./make                 # fetch/verify stage0, build libbitrt.a + bit
+./make test            # every gate (23 harnesses + both artifacts)
+./make fuzz -- 60      # open-ended fuzzing (default 60s; add a seed to replay)
+./make --list          # every step and what it does
 ```
 
-Zig version is pinned in `.zigversion` - verify current stable before scaffolding, don't trust memory.
+**`./make` is a Bit program, not a Makefile and not `zig build`.** `build.zig`
+was deleted in #1871 and the repo contains no Zig at all. The `make` shell
+script is ~30 lines that resolve the pinned stage0, compile `tools/build/` with
+it, and exec the result; every step body is Bit. Shell is acceptable there and
+Zig was not, because the goal was removing a second TOOLCHAIN — `sh` was already
+a hard dependency of this repo (fifteen `selfhost-diff*.sh`, `gate.sh`,
+`stage0.sh`, `release.sh`), and ten lines of it add nothing that was not there.
+
+`zig-out/` keeps its name: it is hardcoded in dozens of harnesses, scripts and
+`.gitignore`, and renaming it is a mechanical change with no behavioural payoff.
 
 ## Layout
 
@@ -57,13 +65,13 @@ compiler, and "selfhost" only carried information while a non-self-hosted one
 existed. The Zig seed never lived in `compiler/` despite an earlier version of
 this list saying so; it lived in `seed/`, and `seed/` no longer exists (#1593).
 
-`zig build selfhost` keeps its step name — fifteen `scripts/selfhost-diff*.sh`
+`./make selfhost` keeps its step name — fifteen `scripts/selfhost-diff*.sh`
 invoke it — but it no longer means "build with the seed": it runs the pinned
 stage0 over `compiler/`.
 
 ## Testing Conventions
 
-- **Verify scoped changes with `scripts/gate.sh`, not the full suite (#1770).** It reads your `git diff` and runs only the steps that change touches - a `compiler/**` edit runs the selfhost diffs + `test-imports`, a `tests/cases/**` edit runs `zig build test-golden`, etc. Run the full `zig build test` (all 28 harnesses, ~7 min) only for a cross-cutting change (build.zig, runtime/, spec/), a mixed change set, or the final pre-merge gate - and `gate.sh` already falls back to it automatically in those cases. Every harness also has its own named step (`zig build test-golden|test-examples|test-stress|test-version|test-selfcheck|…`) for running one area directly. The `libbitrt.a`/selfhost `bit` rebuild is now source-fingerprint cache-gated, so an unchanged tree skips the ~23s recompile automatically on every `zig build`.
+- **Verify scoped changes with `scripts/gate.sh`, not the full suite (#1770).** It reads your `git diff` and runs only the steps that change touches - a `compiler/**` edit runs the selfhost diffs + `test-imports-bit`, a `tests/cases/**` edit runs `./make test-golden`, etc. Run the full `./make test` (every gate, ~7 min) only for a cross-cutting change (tools/build/, runtime/, spec/), a mixed change set, or the final pre-merge gate - and `gate.sh` already falls back to it automatically in those cases. Every harness also has its own named step (`./make test-golden|test-examples|test-stress|test-version-cli|test-selfcheck|…`) for running one area directly. The `libbitrt.a`/selfhost `bit` rebuild is now source-fingerprint cache-gated, so an unchanged tree skips the ~23s recompile automatically on every `./make`.
 - Golden-file tests: `tests/cases/*.bit` with sibling `.expected`; line-1 directive selects the mode - `// run` (execute, compare stdout), `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics), `// fmt` (canonicalization), `// types` (inferred-type dump). Every compiler stage adds cases as it lands.
 - **Differential testing is the self-hosting gate, and what it ASSERTS changed with #1593.** The fifteen `scripts/selfhost-diff*.sh` used to diff the Zig seed against the Bit compiler, so green meant "two independent implementations agree". The oracle is now the pinned stage0 — the same compiler one release back — so green means "this version did not change behaviour versus the last release". That cannot catch a bug present in both. `docs/release/bootstrap.md` §5 records it as the accepted loss; do not read a green differential as the stronger claim.
 - **Both sides of a differential must read THIS tree's stdlib and runtime.** The stage0 tarball ships its own `stdlib/` and `libbitrt.a`, and `bit` resolves them relative to the binary — so an unpinned oracle compares two stdlibs instead of two compilers. `scripts/stage0.sh` emits a wrapper pinning `BIT_STDLIB`; the two examples gates pin `BIT_LIBBITRT` themselves, because that names one archive per triple and the wrapper cannot know the target.
@@ -78,10 +86,10 @@ Hard limit 800 lines per file, target ~500. 800 is the default of the repo's own
 
 Two things a split can break that a green build will not catch (#1503):
 
-- **Silent line loss.** A split that swallows blank lines still compiles, passes selfcheck, and passes `zig build test`. Gate it with a line-multiset comparison of the directory before vs after - zero deletions, additions only for new file headers. Derive the "before" side from `git show HEAD:<path>`; a baseline written to a shared path can be clobbered by a concurrent agent, and a locale mismatch between the two sorts fabricates thousands of phantom deletions. Stronger still, and preferred: reassembling the new files in the original order must reproduce the original byte-for-byte.
+- **Silent line loss.** A split that swallows blank lines still compiles, passes selfcheck, and passes `./make test`. Gate it with a line-multiset comparison of the directory before vs after - zero deletions, additions only for new file headers. Derive the "before" side from `git show HEAD:<path>`; a baseline written to a shared path can be clobbered by a concurrent agent, and a locale mismatch between the two sorts fabricates thousands of phantom deletions. Stronger still, and preferred: reassembling the new files in the original order must reproduce the original byte-for-byte.
 - **Changed codegen (#1511).** Module files concatenate in bytewise sorted filename order, and the inliner only inlines a callee it has already lowered. A new sibling that sorts *before* the file holding its helpers silently loses inlining - perfect text diff, different machine code. Name new files so they sort after their helpers (for `sock.bit` the working order was `sock < tcp < udp`), and confirm with `bit build <src> --emit-obj` byte-identical before vs after.
 
-Splitting a file can also make a test vacuous rather than failing it: any gate that names a single source path (`build.zig`'s `ast_tags` options did) will keep scanning the remnant. Point such gates at a directory.
+Splitting a file can also make a test vacuous rather than failing it: any gate that names a single source path (build.zig's `ast_tags` options did, before #1871) will keep scanning the remnant. Point such gates at a directory.
 
 ## Website (bitlang.org)
 
@@ -125,7 +133,7 @@ one, and do not "fix" a missing CI badge by wiring a workflow back up.
 Verification happens on the machines that can actually prove things:
 
 - `scripts/gate.sh` reads your diff and runs only the steps it can affect,
-  falling back to the full `zig build test` (28 harnesses) when the change is
+  falling back to the full `./make test` when the change is
   cross-cutting.
 - `scripts/arm64gate.sh` and `scripts/x64gate.sh` run the suite on real
   aarch64-linux and real x86-64 Linux. The x86-64 host is resolved by

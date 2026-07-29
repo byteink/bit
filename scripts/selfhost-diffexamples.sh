@@ -28,7 +28,7 @@
 # deliberately, in the commit that causes it — which is the point: a refusal
 # becomes a reviewed decision instead of an unasserted number scrolling past.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffexamples.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffexamples.sh
 #
 # Exit codes (matching x64gate.sh / selfhost-diffsafepoints.sh):
 #   0  every example built, ran, and agreed
@@ -116,7 +116,7 @@ case "$(uname -s)-$(uname -m)" in
   Linux-aarch64|Linux-arm64) HOST_RT=zig-out/lib/aarch64-linux/libbitrt.a ;;
   Linux-x86_64)              HOST_RT=zig-out/lib/x86_64-linux/libbitrt.a ;;
 esac
-[ -f "$HOST_RT" ] || { echo "diffexamples: missing $HOST_RT — run: zig build" >&2; exit 2; }
+[ -f "$HOST_RT" ] || { echo "diffexamples: missing $HOST_RT — run: ./make" >&2; exit 2; }
 export BIT_LIBBITRT="$PWD/$HOST_RT"
 
 TMP=$(mktemp -d)

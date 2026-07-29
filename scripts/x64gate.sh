@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run `zig build test` for x86_64-linux on the real-hardware box (see
+# Run `./make test` for x86_64-linux on the real-hardware box (see
 # scripts/x64host.sh) in Docker, over the committed tree (git archive HEAD).
 #
 #   x64gate.sh          # fast: reuse a persistent zig cache volume (only changed
@@ -13,7 +13,7 @@
 #
 #   x64gate.sh <mode> N  # repeat N times, reporting each run — for chasing an
 #                        # intermittent, which a single green run cannot rule out.
-#   x64gate.sh fuzz      # run `zig build fuzz` (FUZZ_SECS=60 by default) instead
+#   x64gate.sh fuzz      # run `./make fuzz` (FUZZ_SECS=60 by default) instead
 #                        # of the test suite, on real x86_64 hardware.
 #
 # IT ONLY SEES COMMITTED WORK. `git archive HEAD` ignores the working tree and
@@ -42,13 +42,13 @@ IMAGE="bit-zig-0.16.0-amd64:latest"
 # SETTLED 2026-07-19 (#1258), measured both ways at tree ff9ac2e — do not re-chase:
 #   real x86_64 hardware:     `x64gate.sh fuzz` -> 10,970 iterations, 0 crashes,
 #                             X64LINUX_EXIT=0.
-#   emulated amd64 on the Mac: `zig build fuzz` never runs a single iteration. It
+#   emulated amd64 on the Mac: `./make fuzz` never runs a single iteration. It
 #                             fails to COMPILE with exactly 2 errors — glibc
 #                             `libc_nonshared.a` and `Scrt1.o`, both
 #                             "unknown target CPU 'athlon-xp'".
 # Zero Bit code executes in the emulated failure, so it cannot be a Bit defect.
 # STEP defaults to the full suite but an exported STEP env wins (scripts/gate.sh
-# sets it to a scoped set like "test-golden test-imports"). #1772.
+# sets it to a scoped set like "test-golden test-imports-bit"). #1772.
 STEP="${STEP:-test}"
 if [ "${MODE}" = "fuzz" ]; then
   STEP="fuzz -- ${FUZZ_SECS:-60}"
@@ -121,7 +121,7 @@ while IFS= read -r host; do
     { [ "${RUNS}" -gt 1 ] || [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; } && echo "===RUN host=${host} ${i}/${RUNS}==="
     code=$(git archive HEAD | ssh "${host}" "docker run --rm -i ${CACHE_ARGS} ${IMAGE} bash -c '
       mkdir -p /work && cd /work && tar x &&
-      ZIG_GLOBAL_CACHE_DIR=${CACHE_ENV} zig build ${STEP} > /tmp/o 2>&1
+      BIT_STAGE0_CACHE=${CACHE_ENV}/stage0 ./make ${STEP} > /tmp/o 2>&1
       e=\$?
       if [ \$e -eq 0 ]; then
         echo ===TAIL===

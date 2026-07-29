@@ -56,14 +56,15 @@ with a real concurrent program.
 
 You only need this to work *on* Bit. Users install the binary above.
 
-- [Zig](https://ziglang.org/) `0.16.0` (pinned in [`.zigversion`](.zigversion))
-
-Zig builds the bootstrap seed, which builds the Bit-written compiler - the usual
-chicken-and-egg every self-hosted language has. It is not needed to use Bit.
+No toolchain to install. `./make` downloads and digest-verifies the pinned
+previous release and builds this tree with it - the usual chicken-and-egg every
+self-hosted language has, resolved by a published binary rather than by a second
+compiler. You need `sh`, `curl` and `tar`; none of it is needed to *use* Bit.
 
 ```
-zig build          # build the compiler into zig-out/bin
-zig build test     # run the full suite (28 harnesses)
+./make             # build the compiler into zig-out/bin
+./make test        # run the full suite
+./make --list      # every step and what it does
 scripts/gate.sh    # run only what your diff can affect
 ```
 
@@ -71,8 +72,8 @@ scripts/gate.sh    # run only what your diff can affect
 
 | Path        | Purpose                                             |
 |-------------|-----------------------------------------------------|
-| `compiler/` | Zig seed compiler (`bit`)                           |
-| `runtime/`  | Zig runtime linked into user binaries               |
+| `compiler/` | The compiler (`bit`), written in Bit                |
+| `runtime/`  | Runtime linked into user binaries, written in Bit   |
 | `stdlib/`   | Standard library, written in Bit                    |
 | `spec/`     | Language specification (source of truth)            |
 | `docs/`     | Reference and tutorial documentation                |

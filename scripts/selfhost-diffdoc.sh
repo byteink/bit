@@ -33,7 +33,7 @@
 # pipe (a `| tail` returns tail's status, which is how a red diffir read green,
 # #1568). Nothing is inferred from output text.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffdoc.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffdoc.sh
 set -uo pipefail
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -45,7 +45,7 @@ ORACLE=${DIFFDOC_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 BIT2=${DIFFDOC_BIT:-zig-out/bin/bit}
 
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 
 work=$(mktemp -d)

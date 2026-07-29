@@ -33,7 +33,7 @@ fi
 
 restore() {
   git checkout -- "$SRC"
-  zig build >/dev/null
+  ./make >/dev/null
 }
 trap restore EXIT
 
@@ -106,7 +106,7 @@ PY
 }
 
 # Best-of-R, not average-of-R: this machine runs several other agents'
-# `zig build test` concurrently (observed 9-way contention while developing
+# `./make test` concurrently (observed 9-way contention while developing
 # this gate), which inflates every sample with scheduler noise but never
 # makes one run faster than the true floor. The minimum across repeats is the
 # noise-resistant statistic; an average would just launder the contention
@@ -123,7 +123,7 @@ measure() {
 }
 
 echo "==> Building lint-enabled bit (as committed) ..."
-zig build >/dev/null
+./make >/dev/null
 with_lint_ms="$(measure "$ROOT/zig-out/bin/bit")"
 echo "    best-of-3 min didChange->publishDiagnostics: ${with_lint_ms} ms (n=40/run)"
 
@@ -155,7 +155,7 @@ if not patched:
 with open(path, "w") as f:
     f.writelines(out)
 PY
-zig build >/dev/null
+./make >/dev/null
 without_lint_ms="$(measure "$ROOT/zig-out/bin/bit")"
 echo "    best-of-3 min didChange->publishDiagnostics: ${without_lint_ms} ms (n=40/run, lint call site skipped)"
 

@@ -47,7 +47,7 @@
 #   1  real divergence: a MISSING or a FALSEPOS
 #   2  could not decide: a cell timed out and was never compared. Not a pass.
 #
-# Usage: zig build && bash scripts/selfhost-diffverdict.sh [-v]
+# Usage: ./make && bash scripts/selfhost-diffverdict.sh [-v]
 set -u
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -60,7 +60,7 @@ VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
 for b in "$ORACLE" "$BIT2"; do
-  [ -x "$b" ] || { echo "missing $b — run: zig build" >&2; exit 1; }
+  [ -x "$b" ] || { echo "missing $b — run: ./make" >&2; exit 1; }
 done
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/bitverdict.XXXXXX") || exit 1

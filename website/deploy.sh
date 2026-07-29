@@ -20,7 +20,7 @@ root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 
 command -v ssd >/dev/null || { echo "deploy.sh: ssd not found (brew install ssd)" >&2; exit 1; }
 [ -x "$root/zig-out/bin/bit" ] || {
-	echo "deploy.sh: no built compiler at zig-out/bin/bit — run \`zig build\` first" >&2
+	echo "deploy.sh: no built compiler at zig-out/bin/bit — run \`./make\` first" >&2
 	exit 1
 }
 [ -f "$root/.ssd/ssd.yaml" ] || {

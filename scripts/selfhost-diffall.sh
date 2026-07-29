@@ -45,7 +45,7 @@
 # pipelines carry status (`tail`/`head` return THEIR OWN status -- a red diffir
 # was read as green that way today, #1568); every `tail` here runs strictly in
 # the reporting path, long after the verdict is decided. And nothing is ever
-# inferred from output TEXT: `zig build test` prints "failed command:" ON
+# inferred from output TEXT: `./make test` prints "failed command:" ON
 # SUCCESS, so grepping for "fail" is a broken oracle by construction.
 #
 # Status mapping, matching the family convention (x64gate.sh, diffverdict.sh,
@@ -85,7 +85,7 @@
 # fail-fast would hand back a partial board -- which is the checklist problem
 # again, one differential at a time.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffall.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffall.sh
 #   DIFFALL_TIMEOUT=n   per-constituent hang guard, seconds (default 3600)
 #   DIFFALL_MIN=n       discovery floor (default 15)
 #   DIFFALL_DIR=path    constituent directory -- for mutation-testing this gate
@@ -110,7 +110,7 @@ BIT2=zig-out/bin/bit
 # result (#1514).
 if [ "${DIFFALL_DIR:-}" = "" ]; then
   for bin in "$ORACLE" "$BIT2"; do
-    [ -x "$bin" ] || { echo "diffall: missing $bin — run: zig build selfhost" >&2; exit 2; }
+    [ -x "$bin" ] || { echo "diffall: missing $bin — run: ./make selfhost" >&2; exit 2; }
   done
 fi
 [ -f "$ABSENT_SET" ] || { echo "diffall: missing expected-absent set $ABSENT_SET" >&2; exit 2; }

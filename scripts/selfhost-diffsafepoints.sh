@@ -35,7 +35,7 @@ command -v objdump >/dev/null 2>&1 || {
   echo "FATAL: objdump not found — this harness cannot count safepoints without it" >&2
   exit 2
 }
-[ -x "$ORACLE" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (zig build)" >&2; exit 2; }
+[ -x "$ORACLE" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (./make)" >&2; exit 2; }
 
 sites() { # $1=compiler $2=source $3=objfile -> static bit_rt_safepoint call sites, or "x" if it did not build
   rm -f "$3"

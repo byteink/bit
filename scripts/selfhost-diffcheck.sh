@@ -48,7 +48,7 @@
 #   1  real failure: a FALSEPOS (bit rejects code the seed accepts)
 #   2  could not decide: a file timed out and was never compared. Not a pass.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffcheck.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather

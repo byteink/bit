@@ -9,7 +9,7 @@
 # output deliberately folds stdout+stderr together (2>&1): a test that fails by
 # panicking must print the same panic under both compilers.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-difftests.sh
+# Usage: ./make selfhost && bash scripts/selfhost-difftests.sh
 set -u
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/fuzz.sh — mutation-fuzz the compiler front end, replacing `zig build fuzz`.
+# scripts/fuzz.sh — mutation-fuzz the compiler front end, replacing `./make fuzz`.
 #
 # Runs tests/bit/fuzz.bit, the Bit port of tests/fuzz/{guard,mutate,fuzz,
 # crash_regression}.zig. Two phases in one process: replay every saved crash
@@ -20,7 +20,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 bit="${BIT:-$root/zig-out/bin/bit}"
-[[ -x "$bit" ]] || { echo "scripts/fuzz.sh: no compiler at $bit (run zig build first)" >&2; exit 1; }
+[[ -x "$bit" ]] || { echo "scripts/fuzz.sh: no compiler at $bit (run ./make first)" >&2; exit 1; }
 
 export BIT_STDLIB="${BIT_STDLIB:-$root/stdlib}"
 export BIT_FUZZ_BIN="$bit"

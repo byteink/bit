@@ -11,7 +11,7 @@ that no longer exists and would mislead anyone who found it first.
 against the digest committed in [`dist/stage0/SHA256SUMS`](dist/stage0/SHA256SUMS).
 
 ```
-zig build     # resolve + verify stage0, build libbitrt.a, compile compiler/ -> bit
+./make        # resolve + verify stage0, build libbitrt.a, compile compiler/ -> bit
 ```
 
 `scripts/stage0.sh` does the resolving. It reads the artifact name out of the

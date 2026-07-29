@@ -50,13 +50,13 @@ git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; ex
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 
 echo "release.sh: building runtime archives for every target"
-zig build libbitrt
+./make libbitrt
 
 echo "release.sh: resolving the pinned stage0"
 # Downloads + digest-verifies against dist/stage0/SHA256SUMS; refuses on failure.
 STAGE0="$(sh scripts/stage0.sh)"
 echo "release.sh: stage0 = ${STAGE0}"
-zig build
+./make
 
 rm -rf "${OUT}"
 mkdir -p "${OUT}"
@@ -68,15 +68,15 @@ mkdir -p "${OUT}"
 # it sits on disk ships a binary that reports `0.1.0-dev` no matter what version we
 # are releasing. v0.1.0 shipped exactly that bug: `bit --version` said 0.1.0-dev.
 #
-# `zig build -Dversion=` already solves this (build.zig stages a copy the same
-# way), but that path only produces a NATIVE compiler, and a release needs three
-# targets cross-built by the seed. So do the staging here, once, and point the seed
-# at the copy.
+# This IS the version-stamping mechanism — there is no build-driver option for
+# it. `zig build -Dversion=` used to exist to keep the seed and the self-hosted
+# compiler agreeing on one string; both it and build.zig are gone (#1871), and a
+# release always took this path anyway, because it needs three CROSS-built
+# targets rather than the one native compiler that option produced.
 #
 # EXCLUDE the real version.bit rather than overwriting it afterwards: two files
 # declaring `bitVersion` is a duplicate-symbol error, and a copy-then-overwrite
-# that silently loses the race leaves the dev version in place. build.zig carries
-# the same warning, learned the same way.
+# that silently loses the race leaves the dev version in place.
 # Basename stays `selfhost`: the directory name is the module name, so a staged
 # copy called anything else is not a drop-in substitute for the real thing.
 STAGE_SRC="${OUT}/stagesrc/compiler"

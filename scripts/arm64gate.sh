@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run `zig build test` for aarch64-linux in Docker on this machine, over the
+# Run `./make test` for aarch64-linux in Docker on this machine, over the
 # committed tree (git archive HEAD).
 #
 # The image `bit-zig-0.16.0:latest` is a NATIVE aarch64 Zig image, so on an
 # Apple-Silicon host this is real ARM64 Linux execution — no qemu, no emulation
-# artifacts to argue about. `zig build test` inside it resolves host_target to
+# artifacts to argue about. `./make test` inside it resolves host_target to
 # aarch64-linux, so the whole suite exercises that backend.
 #
 #   arm64gate.sh          # fast: reuse a persistent zig cache volume (only changed
@@ -50,7 +50,7 @@ VOLUME="bit-zig-cache-arm64"
 # >90min and still progressing, so a tighter ceiling kills good runs. The deadline
 # exists to catch a hang, not to enforce a performance budget.
 DEADLINE="${ARM64GATE_DEADLINE:-10800}"
-# Which `zig build` step to gate on. Override to narrow a run to one step, or to
+# Which build step to gate on. Override to narrow a run to one step, or to
 # `--help` for a green-path control that proves a zero exit really reports green.
 STEP="${ARM64GATE_STEP:-test}"
 
@@ -120,7 +120,7 @@ run_suite() {
 
   code=$(docker run --rm -i --name "${name}" ${CACHE_ARGS} "${IMAGE}" bash -c '
       mkdir -p /work && cd /work && tar x &&
-      ZIG_GLOBAL_CACHE_DIR='"${CACHE_ENV}"' zig build '"${STEP}"' > /tmp/o 2>&1
+      BIT_STAGE0_CACHE='"${CACHE_ENV}"'/stage0 ./make '"${STEP}"' > /tmp/o 2>&1
       e=$?
       if [ $e -eq 0 ]; then
         echo ===TAIL===
@@ -148,8 +148,11 @@ run_suite() {
 # the repo itself is never touched. $1 selects what to break:
 #   golden — corrupt a `.expected` file. The STRONG proof: it shows the gate sees
 #            a real TEST failure, not merely a build error. Needs a full build.
-#   build  — corrupt build.zig. The CHEAP proof: fails in seconds, so it is usable
-#            even when the suite cannot run to completion on this target.
+#   build  — corrupt the build driver. The CHEAP proof: fails in seconds, so it
+#            is usable even when the suite cannot run to completion on this
+#            target. The victim is tools/build/main.bit since #1871 deleted
+#            build.zig; breaking it makes `./make` fail to compile the driver,
+#            which is the same class of failure the old victim produced.
 mutant_stream() {
   local kind="${1:-build}" tmp victim
   tmp=$(mktemp -d)
@@ -159,9 +162,9 @@ mutant_stream() {
     [ -n "${victim}" ] || { echo "arm64gate: no golden .expected to mutate" >&2; rm -rf "${tmp}"; exit 127; }
     printf 'arm64gate-deliberate-breakage\n' >> "${victim}"
   else
-    victim="${tmp}/build.zig"
-    [ -f "${victim}" ] || { echo "arm64gate: build.zig missing" >&2; rm -rf "${tmp}"; exit 127; }
-    printf '\nthis is not valid zig — arm64gate deliberate breakage\n' >> "${victim}"
+    victim="${tmp}/tools/build/main.bit"
+    [ -f "${victim}" ] || { echo "arm64gate: tools/build/main.bit missing" >&2; rm -rf "${tmp}"; exit 127; }
+    printf '\nthis is not valid bit — arm64gate deliberate breakage\n' >> "${victim}"
   fi
   echo "arm64gate: mutating ${victim#"${tmp}"/}" >&2
   # --no-xattrs: macOS bsdtar otherwise stamps every entry with a

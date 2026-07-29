@@ -7,7 +7,7 @@
 #
 # Needs an x86-64 Linux host reachable over ssh. No hostname is baked into the
 # repo: set BITX64_HOST, or configure candidates for scripts/x64host.sh.
-# Usage: zig build selfhost && bash scripts/selfhost-diffexamples-x64.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffexamples-x64.sh
 set -u
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -23,7 +23,7 @@ echo "diffexamples-x64: host=$HOST"
 # live in the stage0 wrapper (BIT_LIBBITRT names one archive for one triple, and
 # this script cross-compiles).
 X64_RT=zig-out/lib/x86_64-linux/libbitrt.a
-[ -f "$X64_RT" ] || { echo "diffexamples-x64: missing $X64_RT — run: zig build libbitrt" >&2; exit 2; }
+[ -f "$X64_RT" ] || { echo "diffexamples-x64: missing $X64_RT — run: ./make libbitrt" >&2; exit 2; }
 export BIT_LIBBITRT="$PWD/$X64_RT"
 
 REMOTE=/tmp/bitdiff-x64

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # g2archive.sh (#1694) — build a Bit-SOURCED libbitrt.a for one target from
 # runtime/: the per-module emit + `bit ar` recipe that #1685/#1691/#1692/#1643
-# each hand-reconstructed this session. Since G3 (#1584) this IS `zig build
+# each hand-reconstructed this session. Since G3 (#1584) this IS `./make
 # libbitrt`'s archive step, not a side tool — the shipped runtime comes from
 # here.
 #
@@ -51,7 +51,7 @@ esac
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 BIT=${BIT:-"$REPO_ROOT/zig-out/bin/bit"}
 if [ ! -x "$BIT" ]; then
-  echo "g2archive: '$BIT' not found or not executable (build it first: zig build)" >&2
+  echo "g2archive: '$BIT' not found or not executable (build it first: ./make)" >&2
   exit 1
 fi
 
@@ -73,7 +73,7 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # could not be written into the shared tree while root.zig still claimed the
 # real ABI names. G2 (#1583) landed that rename in the source, so there is
 # nothing left to rewrite — and reading HEAD instead of the working tree is now
-# actively wrong: this script is `zig build libbitrt`'s archive step, so it
+# actively wrong: this script is `./make libbitrt`'s archive step, so it
 # would compile committed source and silently ignore every uncommitted runtime
 # edit. That is #1486's stale-archive failure with a new cause. Only the
 # emitted objects go to scratch; the checkout is still never written.

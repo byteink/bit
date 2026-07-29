@@ -40,7 +40,7 @@
 # than being scored as a mismatch or silently passing. The `continue` makes the
 # byte comparison structurally unreachable unless both sides produced output.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-difffmt.sh
+# Usage: ./make selfhost && bash scripts/selfhost-difffmt.sh
 set -uo pipefail
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -59,7 +59,7 @@ BIT2=${DIFFFMT_BIT:-zig-out/bin/bit}
 TIMEOUT=${DIFFFMT_TIMEOUT:-45}
 
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "difffmt: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "difffmt: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 
 work=$(mktemp -d)

@@ -9,7 +9,7 @@
 #   1. bit2 must not hang or crash on any input (each run is alarm-guarded).
 #   2. bit2's rendered front-end diagnostics must be byte-identical to the seed.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-fuzzdiff.sh
+# Usage: ./make selfhost && bash scripts/selfhost-fuzzdiff.sh
 # Prints MATCH/MISMATCH/CRASH/TIMEOUT totals and the first divergence.
 #
 # Exit codes (matching x64gate.sh / selfhost-diffsafepoints.sh):
@@ -31,7 +31,7 @@ BIT2=zig-out/bin/bit
 # rc=0 with seed == b2 == "", and every truncation scores MATCH. Measured: 6642
 # MATCH, exit 0, no compiler on disk. Exit 2 to stay distinct from a divergence.
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "fuzzdiff: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "fuzzdiff: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 
 TMP=$(mktemp -d)

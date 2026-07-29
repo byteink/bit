@@ -19,7 +19,7 @@
 # A timeout is not evidence: a `bit` run killed by the alarm produced no verdict,
 # so it is reported separately and fails, rather than being scored as a mismatch.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-difftypes.sh
+# Usage: ./make selfhost && bash scripts/selfhost-difftypes.sh
 set -uo pipefail
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
 # (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -31,7 +31,7 @@ BIT2=zig-out/bin/bit
 TIMEOUT=${DIFFTYPES_TIMEOUT:-20}
 
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "difftypes: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "difftypes: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 
 work=$(mktemp -d)

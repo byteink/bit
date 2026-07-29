@@ -21,7 +21,7 @@
 # mismatch that happens to sit in the expected set — a load-sensitive counter
 # that silently self-confirms is the exact bug this script is being fixed for.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffir.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffir.sh
 set -uo pipefail
 
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
@@ -38,7 +38,7 @@ TIMEOUT=${DIFFIR_TIMEOUT:-20}
 . "$(dirname "$0")/selfhost-ir-canon.sh"
 
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffir: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "diffir: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 [ -f "$GAPS" ] || { echo "diffir: missing expected-gap list $GAPS" >&2; exit 2; }
 

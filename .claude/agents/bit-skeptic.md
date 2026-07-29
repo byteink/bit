@@ -45,7 +45,7 @@ lines.
 go red. Break the thing deliberately and confirm the check fails; restore and confirm it
 passes. A claim of "verified" backed by a gate nobody mutated is unverified.
 
-**Read the exit code, not the output.** Capture `$?` on its own line. `zig build test`
+**Read the exit code, not the output.** Capture `$?` on its own line. `./make test`
 prints `failed command: ...` on success. Two gates here shipped reporting green while red.
 This Mac's shell is zsh — `$pipestatus`, never bash's `$PIPESTATUS`.
 

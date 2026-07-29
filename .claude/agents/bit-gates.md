@@ -1,6 +1,6 @@
 ---
 name: bit-gates
-description: Runs this repo's gate suite and reports the verdict — build, selfcheck, fixpoint, the selfhost-diff* differentials, zig build test, and the arm64/x64 hardware gates. Use for "is main green", "verify this landed cleanly", "run the differentials". Does not edit source. Owns the resource contention and remote-host knowledge that makes these gates flaky when run naively.
+description: Runs this repo's gate suite and reports the verdict — build, selfcheck, fixpoint, the selfhost-diff* differentials, ./make test, and the arm64/x64 hardware gates. Use for "is main green", "verify this landed cleanly", "run the differentials". Does not edit source. Owns the resource contention and remote-host knowledge that makes these gates flaky when run naively.
 tools: Read, Grep, Glob, Bash, mcp__smash__smash_show, mcp__smash__smash_add, mcp__smash__smash_comment
 model: sonnet
 ---
@@ -22,13 +22,13 @@ pushing a branch that triggers a workflow. Everything below runs locally or over
 | gate | what it proves |
 |---|---|
 | `scripts/selfhost-diffall.sh` | **the whole differential family in one verdict** — run this, not a subset you chose, whenever the corpus (`tests/cases`, `examples/`, `stdlib/`, `tests/imports`) changed. Exit 1 = divergence, 2 = could-not-decide; `difffmt` reports ABSENT until `fmt` is ported |
-| `zig build` then `./zig-out/bin/bit` | builds; prints `selfcheck OK` |
+| `./make` then `./zig-out/bin/bit` | builds; prints `selfcheck OK` |
 | `scripts/selfhost-fixpoint.sh` | stageB == stageC byte-identical |
 | `scripts/selfhost-diffcheck.sh` | diagnostics vs the seed; FALSEPOS must be 0 |
 | `scripts/selfhost-diffexamples.sh` | the two compilers' programs behave identically |
 | `scripts/selfhost-diff{ast,tokens,types,ir,iropt,diags,safepoints,tests}.sh` | per-stage dumps |
 | `scripts/selfhost-fuzzdiff.sh` | truncation fuzz over the corpus |
-| `zig build test` | the harness |
+| `./make test` | the harness |
 | `scripts/arm64gate.sh` | aarch64-linux in docker, local |
 | `scripts/x64gate.sh` | x86_64-linux on REAL hardware over ssh |
 
@@ -39,9 +39,9 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
 
 - **Never run two heavy gates concurrently in one worktree.** They fight over `zig-out`.
   Observed: exit 144, empty log, and the real process still running orphaned.
-- **`zig build test` prints `failed command: ...` on SUCCESS.** Trust the exit code and the
+- **`./make test` prints `failed command: ...` on SUCCESS.** Trust the exit code and the
   harness verdict line, not that string.
-- **`zig build` links a STALE `libbitrt.a`.** Runtime `.zig` edits need `zig build libbitrt`
+- **`./make` links a STALE `libbitrt.a`.** Runtime `.zig` edits need `./make libbitrt`
   first, or you are gating an archive that predates the change (#1486).
 - **`x64gate.sh` only sees COMMITTED work** — it runs `git archive HEAD`. Uncommitted edits
   are not tested. Commit first, then gate.
@@ -52,7 +52,7 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
   mid-run and a finished verdict was reported for a suite with 20 minutes left (#1520):
 
       LOG=$(mktemp)
-      zig build test > "$LOG" 2>&1 &
+      ./make test > "$LOG" 2>&1 &
       PID=$!
       wait "$PID"; RC=$?
 

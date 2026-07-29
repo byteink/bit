@@ -21,7 +21,7 @@
 # alarm is reported separately and fails the gate, rather than being scored as a
 # mismatch that happens to sit in the expected set.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffiropt.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffiropt.sh
 set -uo pipefail
 
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
@@ -38,7 +38,7 @@ TIMEOUT=${DIFFIROPT_TIMEOUT:-20}
 . "$(dirname "$0")/selfhost-ir-canon.sh"
 
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffiropt: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "diffiropt: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 [ -f "$GAPS" ] || { echo "diffiropt: missing expected-gap list $GAPS" >&2; exit 2; }
 

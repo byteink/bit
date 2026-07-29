@@ -7,7 +7,7 @@
 # produces empty output from both, and the seed's --dump-diags is frontend-only
 # so checker `// error` cases are empty on both sides too.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffdiags.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffdiags.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 set -u
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
@@ -23,7 +23,7 @@ BIT2=zig-out/bin/bit
 # skips nothing every file scores MATCH — a full green board from no compiler.
 # Exit 2 to keep this distinct from a real divergence (exit 1).
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffdiags: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "diffdiags: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 
 match=0 mismatch=0 firstbad=""

@@ -6,7 +6,7 @@
 # (deferred with the renderer port), so it parses past errors where the seed
 # prints a diagnostic instead.
 #
-# Usage: zig build selfhost && bash scripts/selfhost-diffast.sh
+# Usage: ./make selfhost && bash scripts/selfhost-diffast.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 set -u
 # The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
@@ -21,7 +21,7 @@ BIT2=zig-out/bin/bit
 # of the differential would produce empty output, and equal-empty compares as
 # agreement. Exit 2 to keep this distinct from a real divergence (exit 1).
 for bin in "$ORACLE" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffast: missing $bin — run: zig build selfhost" >&2; exit 2; }
+  [ -x "$bin" ] || { echo "diffast: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
 
 match=0 mismatch=0 skip=0 firstbad=""

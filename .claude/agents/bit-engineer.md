@@ -91,17 +91,17 @@ drive it with a fake verdict. Never silently skip.
 
 Strength order, weakest first:
 
-    zig build  <  decl count  <  `--stat` delta  <  line-multiset diff
+    ./make  <  decl count  <  `--stat` delta  <  line-multiset diff
                <  byte-identical reassembly  <  emitted-object `cmp`
 
-A pure-move refactor passed `zig build`, selfcheck AND `zig build test` while having
+A pure-move refactor passed `./make`, selfcheck AND `./make test` while having
 silently deleted 205 blank lines. Two independent agents hit the same bug. Only the
 multiset diff caught it.
 
-`zig build test` prints `failed command: ...` **on success** — trust the exit code and the
-harness verdict line. `zig build` alone does NOT compile the Bit stdlib (`bit check <dir>`
+`./make test` prints `failed command: ...` **on success** — trust the exit code and the
+harness verdict line. `./make` alone does NOT compile the Bit stdlib (`bit check <dir>`
 is the cheap direct check), and it links a STALE `libbitrt.a` — runtime `.zig` edits need
-`zig build libbitrt` first (#1486).
+`./make libbitrt` first (#1486).
 
 ## Touching the corpus? run the whole family
 
@@ -122,7 +122,7 @@ Every one of these was a real incident.
   Write it this way and the other failures cannot happen:
 
       LOG=$(mktemp)
-      zig build test > "$LOG" 2>&1 &
+      ./make test > "$LOG" 2>&1 &
       PID=$!
       wait "$PID"; RC=$?
 

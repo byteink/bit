@@ -219,7 +219,7 @@ double-compiling at release time. A developer build does not check this.
 
 Worth listing so the losses above are not read as larger than they are:
 
-- `zig build test`'s 28 harnesses, the 78-program stress suite, the golden
+- `./make test`'s 28 harnesses, the 78-program stress suite, the golden
   corpus, the doc gates and the stdlib-export gate are all self-contained. None
   of them needs the seed.
 - The byte-identical fixed point, which is the strongest single statement
