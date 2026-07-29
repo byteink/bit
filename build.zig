@@ -742,6 +742,11 @@ pub fn build(b: *std.Build) void {
     // populates `zig-out/lib/<triple>/` for the CLI-path end-to-end tests
     // (link.zig, main.zig) that read it there.
     var host_libbitrt_bin: ?std.Build.LazyPath = null;
+    // The host archive's INSTALL PATH, captured in the loop below from the same
+    // QUERY triple the install uses. Recomputing it from `target.result` does
+    // not work: a resolved target's `zigTriple` carries the OS version range
+    // (`aarch64-macos.26.5.2...26.5.2-none`), which is not the directory name.
+    var host_libbitrt_path: ?[]const u8 = null;
     var host_libbitrt_install: ?*std.Build.Step = null;
     // Set only when the gate below actually rebuilds (non-null), so a caller
     // that reaches libbitrt only as a `selfhost` dependency (rather than via
@@ -814,6 +819,7 @@ pub fn build(b: *std.Build) void {
             libbitrt_installs[install_idx] = &install.step;
             if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
                 host_libbitrt_bin = archive;
+                host_libbitrt_path = b.pathFromRoot(b.fmt("zig-out/lib/{s}/libbitrt.a", .{triple}));
                 host_libbitrt_install = &install.step;
             }
         }
@@ -899,6 +905,26 @@ pub fn build(b: *std.Build) void {
     } else {
         const selfhost_run = b.addSystemCommand(&.{stage0_bit});
         selfhost_run.step.dependOn(&stage0_ensure.step);
+        // LINK THE TREE'S RUNTIME, NOT THE RELEASE'S (#1857). stage0 is an
+        // installed toolchain and resolves `libbitrt.a` relative to itself, so
+        // without this the compiler `zig build` produces is linked against the
+        // PREVIOUS RELEASE's runtime — every runtime/ change invisible to the
+        // compiler binary until the next release. The seed did the right thing
+        // by accident (it defaulted to `zig-out/lib/<triple>/`); switching the
+        // bootstrap to stage0 in 3cb1f85 silently changed it, and the symptom
+        // was a fixed `bit_rt_parse_float` that had no effect on `bit`.
+        //
+        // Set here rather than in scripts/stage0.sh's wrapper for the reason
+        // that file records: BIT_LIBBITRT names ONE archive for ONE triple, and
+        // the wrapper cannot know the target. This build is host-native, so the
+        // host archive is the right one, and the run already depends on its
+        // install below.
+        // Named as the INSTALL PATH string, not the archive's LazyPath: a
+        // LazyPath cannot be resolved while the graph is still being built
+        // (`getPath2` panics at configure time), and an env var takes a string.
+        // Ordering is carried by the explicit dependency on the install below,
+        // which is the same shape every `addBitGate` env path uses.
+        if (host_libbitrt_path) |rt| selfhost_run.setEnvironmentVariable("BIT_LIBBITRT", rt);
         selfhost_run.addArg("build");
         if (b.user_input_options.contains("version")) {
             // `-Dversion=` given: compile a COPY of compiler/ whose `version.bit`
