@@ -1,0 +1,569 @@
+// A private, per-run copy of the compiler for a harness to exec — the Bit port
+// of `tests/selfbin.zig` (#1644).
+//
+// THE PROPERTY. A harness that runs the compiler under test must exec a copy
+// that is (1) named uniquely to this run, (2) published atomically, and
+// (3) proven runnable before any case depends on it. It must NEVER exec the
+// build's output path directly, because that path is rewritten IN PLACE.
+//
+// THE FAILURE THIS REMOVES. `zig build test` came back RED with every
+// `[selfhost]` case failing and BOTH streams empty — a signature
+// indistinguishable from "the compiler cannot build anything any more". It was
+// not a compiler fault: a second build truncated and rewrote the exact file a
+// live harness was exec'ing, and macOS killed the exec before `main` with
+// `EXC_CRASH / SIGKILL (Code Signature Invalid)`. Measured directly: exec'ing a
+// binary in a loop while `cp` rewrote that same path gave 39 failures in 42
+// execs (33x SIGKILL with empty output, 1x SIGBUS, 5x "cannot execute binary
+// file"); the same loop against an in-place rewrite of IDENTICAL bytes gave 0
+// failures in 4400 execs. Only a rewrite that truncates is fatal, which is why
+// it is intermittent.
+//
+// WHY THIS DID NOT DIE WITH THE ZIG, WHICH IS THE WHOLE REASON THE PORT EXISTS.
+// The Zig original blamed Zig's build system: a `has_side_effects` Run step
+// derives its output digest from the input hash alone, so the compiler landed at
+// the same cache path every time and was rewritten in place. That reading made
+// the hazard look like a property of `build.zig`. It is not. `compiler/build.bit`
+// publishes a linked binary with a plain truncating `writeFile(out, ...)`
+// followed by `fsChmod(out, 493)` — no temp path, no rename — so the Bit
+// toolchain reproduces the hazard exactly, and it bit twice in one session:
+// `tests/bit/stress.bit` copied the compiler out of `zig-out/bin/bit` and caught
+// a PARTIAL file mid-publish (its gate failed with no output at all), and
+// `tests/bit/lintcmd.bit` exec'd that same path via `BIT_SELF_EXE` and died with
+// "Segmentation fault: 11", empty stderr, exit 139. Both were worked around with
+// build-step dependencies. Neither fixed the publish.
+//
+// WHAT IS CHECKABLE FROM BIT, AND WHAT IS NOT. Bit has no `stat`, no inode
+// identity, no `rename` primitive and no way to observe another process opening
+// a name for writing, so this file cannot watch a race. It does not need to:
+// every consequence of a non-atomic publish is deterministic and is asserted
+// here as a state the exec name must never be in.
+//
+//   * unique name          — two copies never share a path (`checkDiscipline`).
+//   * atomic publish       — the exec name does not exist at all until the
+//                            rename commits, and the staged file is already
+//                            executable when it does (`checkAtomicity`).
+//   * proven runnable      — the copy answers `--version` with exit 0 before it
+//                            is returned; a torn or non-program source is
+//                            REFUSED rather than handed to the corpus
+//                            (`checkRefusal`).
+//   * not the publish path — the copy is under /tmp and never in the directory
+//                            a build writes (`checkRealCompiler`).
+//   * source untouched     — publishing reads the compiler and never writes it.
+//
+// `checkAtomicity` also runs the contrast leg: it performs the publish
+// `compiler/build.bit` performs — write the bytes to the final name, then chmod
+// it — and asserts that the exec name is VISIBLE AND UNRUNNABLE in between.
+// That window is not a hypothesis about that code; it is executed here.
+//
+// WHY /bin/sh. There is no `fsRename` builtin and `osRunBounded(path, ms)` takes
+// no argv and captures no output (ABI.md §19), so `cp`, `chmod`, `mv` and every
+// probe go through a wrapper script, exactly as `tests/bit/stress.bit` does.
+// `exec` in a wrapper is load-bearing: without it the shell stays as the child
+// and a timeout kills the shell rather than the process being bounded.
+//
+// Run it from the repository root:
+//     ./zig-out/bin/bit run tests/bit/selfbin.bit
+// `BIT_SELF_EXE` names the compiler to copy; unset, it is `<root>/zig-out/bin/bit`
+// with `<root>` from `BIT_SELFBIN_ROOT` or `.`. A compiler this cannot find is a
+// hard stop, never a skipped leg.
+//
+// NOT WIRED INTO `build.zig` YET, and that is a gap, not a decision. Every
+// sibling here is one `addBitGate` call; this one wants the same, plus the
+// dependency on the self-hosted install that `lint` and `stress` already carry:
+//
+//     _ = addBitGate(b, selfhosted, test_step, "selfbin", "tests/bit/selfbin.bit", &.{
+//         .{ "BIT_SELF_EXE", selfhost_artifact_path },
+//     }, "run the private-compiler-copy gate (tests/bit/selfbin.bit) only");
+//
+// Until that lands the file only runs when someone runs it by hand.
+//
+// Anti-vacuity: every leg counts its assertions and `main` fails the run if
+// fewer than `minChecks` of them executed, so a leg that stops checking is
+// visible rather than green. The assertions were mutation-tested rather than
+// trusted — five defects were injected into the routine and every one came back
+// red: publishing straight to the exec name (the `build.bit` shape), a fixed
+// copy name, no proof-of-life probe, a chmod moved to after the rename, and
+// exec'ing the source instead of the copy. The chmod mutant SURVIVED the first
+// time, which is why `checkAtomicity` builds its own 0644 fixture; see there.
+
+// Copy attempts before giving up. A torn read of the source is a narrow race a
+// re-read clears; three unrunnable copies in a row is not concurrency.
+const maxAttempts: int = 3
+
+// The name every private copy carries. Asserted, not merely used: a harness that
+// exec's anything else is exec'ing something this file did not publish.
+const copyPrefix: string = "/tmp/bit-selfbin-copy-"
+const scratchPrefix: string = "/tmp/bit-selfbin-run-"
+
+const defaultTimeoutS: int = 300
+const clampTimeoutMs: int = 3600000
+
+// The floor `main` enforces. 48 is what the four legs assert today; the floor
+// only has to be tight enough that a whole leg going missing trips it.
+const minChecks: int = 48
+
+// 0o755. Its counterpart needs no constant: a truncating `fsOpen(path, true)`
+// leaves 0o644 on its own, which is the whole point of `checkWriteThenChmod`.
+const execMode: int = 493
+
+struct Ctx { scratch: string, timeoutMs: int }
+
+struct Tally { checks: int, failures: int }
+
+struct Text { ok: bool, body: string }
+
+// One `--version` probe: whether the child exited 0, and what it printed.
+struct Probe { ok: bool, out: string }
+
+// One half of a publish, and the file its shell step wrote its complaints to.
+struct Step { ok: bool, errPath: string }
+
+function say(s: string) {
+  print(s)
+  print("\n")
+}
+
+function num(v: int): string {
+  return "${v}"
+}
+
+function die(s: string) {
+  say("selfbin: FATAL: " + s)
+  osExit(1)
+}
+
+// --- small helpers (single-file mode has no prelude and no std/*) ------------
+
+function indexOfAt(hay: string, needle: string, at: int): int {
+  let n = len(needle)
+  if (n == 0) { return at }
+  let i = at
+  while (i + n <= len(hay)) {
+    let j = 0
+    while (j < n && hay[i + j] == needle[j]) { j = j + 1 }
+    if (j == n) { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+function startsWith(s: string, prefix: string): bool {
+  return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+function isSpace(c: u8): bool {
+  return c == 32 || c == 9 || c == 13 || c == 10
+}
+
+function trim(s: string): string {
+  let a = 0
+  let b = len(s)
+  while (a < b && isSpace(s[a])) { a = a + 1 }
+  while (b > a && isSpace(s[b - 1])) { b = b - 1 }
+  return s[a:b]
+}
+
+// The directory part of `path`, or "." when it names no directory.
+function dirOf(path: string): string {
+  let i = len(path)
+  while (i > 0) {
+    i = i - 1
+    if (path[i] == 47) { return path[:i] }
+  }
+  return "."
+}
+
+// POSIX single-quoting: everything is literal inside '...', and an embedded
+// quote closes, escapes and reopens.
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { out = out + "'\\''" } else { out = out + s[i:i + 1] }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+// 16 hex digits from the OS entropy pool. The clock is not enough on its own:
+// two copies taken in the same nanosecond tick would collide, and uniqueness is
+// half of the defence.
+function nonceHex(): string {
+  let raw = cryptoRandomBytes(8)
+  if (len(raw) != 8) { die("cryptoRandomBytes returned " + num(len(raw)) + " bytes, want 8") }
+  let digits = "0123456789abcdef"
+  let out = ""
+  let i = 0
+  while (i < len(raw)) {
+    let b = int(raw[i])
+    out = out + digits[b / 16:b / 16 + 1] + digits[b % 16:b % 16 + 1]
+    i = i + 1
+  }
+  return out
+}
+
+function readText(path: string): Text {
+  let fd = fsOpen(path, false)
+  if (fd < 0) { return Text{ ok: false, body: "" } }
+  let body = fsReadAll(fd)
+  fsClose(fd)
+  return Text{ ok: true, body: body }
+}
+
+// A truncating write, which is what `compiler/build.bit` publishes with. It
+// leaves 0o644, so the file it produces is not executable until a later chmod.
+function writeText(path: string, body: string): bool {
+  let fd = fsOpen(path, true)
+  if (fd < 0) { return false }
+  let n = fsWrite(fd, body)
+  fsClose(fd)
+  return n >= 0
+}
+
+// --- the routine under test -------------------------------------------------
+
+// A name no other process on this box uses, drawn afresh on every attempt so a
+// retry never re-uses the name that just failed.
+function uniquePath(): string {
+  return copyPrefix + nonceHex()
+}
+
+function stagingPath(path: string): string {
+  return path + ".staging"
+}
+
+// Unlinks a copy — and ONLY a copy. Every caller below deletes the path
+// `privateCopy` handed it, so a routine that ever returned its SOURCE instead of
+// a copy would have this harness delete the compiler under test. That is not
+// hypothetical: the mutation run that injected exactly that defect deleted the
+// binary it was running against before the assertions could report it.
+function removeCopy(path: string) {
+  if (!startsWith(path, copyPrefix)) { return }
+  fsRemove(path)
+}
+
+function runScript(cx: Ctx, path: string, body: string): int {
+  if (!writeText(path, body)) { die("cannot write wrapper script " + path) }
+  if (fsChmod(path, execMode) != 0) { die("cannot chmod wrapper script " + path) }
+  return osRunBounded(path, cx.timeoutMs)
+}
+
+// Half one of the publish: copy to a staging name and make THAT executable. The
+// exec name is untouched, so nothing can observe it in a partial state, and the
+// chmod happens before the file is reachable under the name anyone execs.
+//
+// `cp`'s own stderr is captured rather than inherited: the refusal leg below
+// expects failures, and a passing run that prints anything is a false red
+// waiting to be misread — the same reason the Zig original had a quiet voice.
+function stagePublish(cx: Ctx, src: string, path: string): Step {
+  let base = cx.scratch + "/stage-" + nonceHex()
+  let stage = stagingPath(path)
+  let body = "#!/bin/sh\n" +
+    "cp " + shQuote(src) + " " + shQuote(stage) + " 2>" + shQuote(base + ".err") + " || exit 1\n" +
+    "chmod 755 " + shQuote(stage) + " 2>>" + shQuote(base + ".err") + " || exit 1\n"
+  return Step{ ok: runScript(cx, base + ".sh", body) == 0, errPath: base + ".err" }
+}
+
+// Half two: rename staging onto the exec name. `mv` within /tmp is `rename(2)`,
+// so a reader of `path` sees either nothing or the whole file — never a prefix.
+function commitPublish(cx: Ctx, path: string): Step {
+  let base = cx.scratch + "/commit-" + nonceHex()
+  let body = "#!/bin/sh\nmv " + shQuote(stagingPath(path)) + " " + shQuote(path) +
+    " 2>" + shQuote(base + ".err") + " || exit 1\n"
+  return Step{ ok: runScript(cx, base + ".sh", body) == 0, errPath: base + ".err" }
+}
+
+function publish(cx: Ctx, src: string, path: string): Step {
+  let staged = stagePublish(cx, src, path)
+  if (!staged.ok) { return staged }
+  return commitPublish(cx, path)
+}
+
+// What a failed publish said, for the one caller that reports rather than
+// retries in silence.
+function stepError(s: Step): string {
+  let t = readText(s.errPath)
+  if (!t.ok || len(trim(t.body)) == 0) { return "(no error text)" }
+  return trim(t.body)
+}
+
+// Proof of life, and the reason it is `--version`: it is one process start and
+// one line of output, and a compiler that cannot answer it cannot build a case
+// either. A torn copy fails to exec (`126`/`127` out of the wrapper), which is
+// exactly what this must catch — the alternative is 93 cases blaming themselves.
+function probe(cx: Ctx, path: string): Probe {
+  let base = cx.scratch + "/probe-" + nonceHex()
+  let outPath = base + ".out"
+  let body = "#!/bin/sh\nexec " + shQuote(path) + " --version" +
+    " >" + shQuote(outPath) + " 2>" + shQuote(base + ".err") + "\n"
+  let r = runScript(cx, base + ".sh", body)
+  if (r == -2) { say("selfbin: TIMED OUT probing " + path) }
+  if (r != 0) { return Probe{ ok: false, out: "" } }
+  let t = readText(outPath)
+  if (!t.ok) { return Probe{ ok: false, out: "" } }
+  return Probe{ ok: true, out: t.body }
+}
+
+// Copies `src` to a path only this run names, proves the copy runs, and returns
+// it — or "" when no attempt produced a runnable copy. `loud` is off for the
+// refusal leg, where failure is the expected result and its diagnosis is noise.
+function privateCopy(cx: Ctx, src: string, loud: bool): string {
+  let attempt = 0
+  while (attempt < maxAttempts) {
+    attempt = attempt + 1
+    let path = uniquePath()
+    let published = publish(cx, src, path)
+    if (published.ok) {
+      if (probe(cx, path).ok) { return path }
+      if (loud) { say("selfbin: the copy at " + path + " is not runnable (attempt " + num(attempt) + ")") }
+    } else if (loud) {
+      say("selfbin: copying " + src + " failed (attempt " + num(attempt) + "): " + stepError(published))
+    }
+    removeCopy(stagingPath(path))
+    removeCopy(path)
+  }
+  if (loud) {
+    say("selfbin: no runnable copy of " + src + " in " + num(maxAttempts) + " attempts. Every case")
+    say("  that depends on this compiler would have failed for that reason and not its own.")
+  }
+  return ""
+}
+
+// --- assertions -------------------------------------------------------------
+
+function check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    say("FAIL: " + label)
+  }
+}
+
+// Unique, whole, runnable, and leaving no staging file behind.
+function checkDiscipline(cx: Ctx, t: Tally, src: string) {
+  let a = privateCopy(cx, src, true)
+  let b = privateCopy(cx, src, true)
+  check(t, len(a) > 0, "discipline: no private copy was produced")
+  check(t, len(b) > 0, "discipline: no second private copy was produced")
+  if (len(a) == 0 || len(b) == 0) { return }
+
+  check(t, a != b, "discipline: two copies share the name " + a + " - one run can truncate the other's")
+  check(t, a != src, "discipline: the copy IS the source")
+  check(t, startsWith(a, copyPrefix), "discipline: " + a + " is not under " + copyPrefix)
+  check(t, startsWith(b, copyPrefix), "discipline: " + b + " is not under " + copyPrefix)
+  check(t, fsExists(a), "discipline: " + a + " does not exist")
+  check(t, fsExists(b), "discipline: " + b + " does not exist")
+  check(t, !fsExists(stagingPath(a)), "discipline: a staging file survived at " + stagingPath(a))
+  check(t, !fsExists(stagingPath(b)), "discipline: a staging file survived at " + stagingPath(b))
+
+  let want = readText(src)
+  let got = readText(a)
+  check(t, want.ok && got.ok, "discipline: cannot read the source and its copy back")
+  check(t, want.ok && got.ok && want.body == got.body,
+    "discipline: the copy is not byte-identical to " + src)
+  check(t, probe(cx, a).ok, "discipline: the copy at " + a + " does not run")
+  removeCopy(a)
+  removeCopy(b)
+}
+
+// The exec name is never observable in a state that cannot be exec'd. Both
+// publishes are performed for real; the assertions are about what is on disk
+// between their steps.
+//
+// THE SOURCE HERE DELIBERATELY LACKS THE EXEC BIT, and finding that out is what
+// this comment is for: `cp` copies the source's mode, so a publish that chmods
+// AFTER the rename still produces an executable staged file when the source was
+// already executable — the leg passed a mutant that moved the chmod, until the
+// fixture stopped carrying the bit for it. 0644 is also the faithful shape:
+// `compiler/build.bit`'s `writeFile` leaves exactly that, so the publisher is
+// the only thing that can supply the mode.
+function checkAtomicity(cx: Ctx, t: Tally) {
+  let src = cx.scratch + "/plain-source-" + nonceHex()
+  check(t, writeText(src, "#!/bin/sh\nexit 0\n"), "atomicity: cannot write the 0644 fixture")
+  check(t, !probe(cx, src).ok, "atomicity: the 0644 fixture is executable already, so this leg " +
+    "cannot see a chmod that happens after the rename")
+  let p = uniquePath()
+  let staged = stagePublish(cx, src, p)
+  check(t, staged.ok, "atomicity: staging the copy failed: " + stepError(staged))
+  check(t, fsExists(stagingPath(p)), "atomicity: staging wrote nothing")
+  // The claim the whole file rests on: half a publish is invisible under the
+  // name anyone execs.
+  check(t, !fsExists(p), "atomicity: " + p + " exists before the publish committed - " +
+    "a reader can catch a partial file under the exec name")
+  // And the exec bit is set BEFORE the name appears, not after: a chmod that
+  // follows the rename leaves a window where the published name exists and
+  // cannot be run.
+  check(t, probe(cx, stagingPath(p)).ok, "atomicity: the staged file is not executable yet - " +
+    "chmod must precede the rename, not follow it")
+  let committed = commitPublish(cx, p)
+  check(t, committed.ok, "atomicity: the commit failed: " + stepError(committed))
+  check(t, fsExists(p), "atomicity: the commit did not produce " + p)
+  check(t, !fsExists(stagingPath(p)), "atomicity: staging survived the commit")
+  check(t, probe(cx, p).ok, "atomicity: the published copy does not run")
+  removeCopy(p)
+  checkWriteThenChmod(cx, t, src)
+  fsRemove(src)
+}
+
+// The contrast leg, and it is not hypothetical: this is exactly what
+// `compiler/build.bit` does to publish a linked binary — `writeFile(out, ...)`
+// then `fsChmod(out, 493)`. Between those two calls the output path exists and
+// is NOT executable, so a harness that execs it in that window gets a permission
+// failure, and one that COPIES it gets whatever bytes had landed so far.
+function checkWriteThenChmod(cx: Ctx, t: Tally, src: string) {
+  let q = cx.scratch + "/write-then-chmod-" + nonceHex()
+  let body = readText(src)
+  check(t, body.ok, "write-then-chmod: cannot read " + src)
+  if (!body.ok) { return }
+  check(t, writeText(q, body.body), "write-then-chmod: cannot write the fixture")
+  check(t, fsExists(q), "write-then-chmod: the fixture does not exist")
+  check(t, !probe(cx, q).ok, "write-then-chmod: a truncating write left an executable file - " +
+    "the 0644 window this leg demonstrates is gone, so re-check the claim about build.bit")
+  check(t, fsChmod(q, execMode) == 0, "write-then-chmod: chmod failed")
+  check(t, probe(cx, q).ok, "write-then-chmod: the fixture does not run even after chmod")
+  fsRemove(q)
+}
+
+// A source that is not a runnable program is REFUSED. Without the probe these
+// copies would be handed out and every case would fail with the signature this
+// file exists to prevent.
+function checkRefusal(cx: Ctx, t: Tally) {
+  // A copy caught mid-publish: a real prefix of a real program. `tru` is what
+  // `true` looks like truncated, and the shell exits 127 on it.
+  let torn = cx.scratch + "/torn-" + nonceHex()
+  check(t, writeText(torn, "#!/bin/sh\ntru"), "refusal: cannot write the torn fixture")
+  check(t, fsChmod(torn, execMode) == 0, "refusal: cannot chmod the torn fixture")
+  check(t, len(privateCopy(cx, torn, false)) == 0,
+    "refusal: a torn source produced a copy - the proof-of-life probe is not running")
+
+  // Not a program at all, the `/etc/hosts` case from the Zig original, written
+  // here rather than borrowed so the leg does not depend on the host's files.
+  let text = cx.scratch + "/not-a-program-" + nonceHex()
+  check(t, writeText(text, "this file is not a program\n"), "refusal: cannot write the text fixture")
+  check(t, len(privateCopy(cx, text, false)) == 0, "refusal: a non-program source produced a copy")
+
+  // A source that does not exist fails in `cp`, one step earlier, and must also
+  // come back empty rather than as a path nobody can exec.
+  let missing = cx.scratch + "/absent-" + nonceHex()
+  check(t, !fsExists(missing), "refusal: the absent fixture exists")
+  check(t, len(privateCopy(cx, missing, false)) == 0, "refusal: a missing source produced a copy")
+
+  // The control: the same fixture, whole, IS accepted. Without this the three
+  // refusals above are satisfied by a routine that refuses everything.
+  let whole = cx.scratch + "/whole-" + nonceHex()
+  check(t, writeText(whole, "#!/bin/sh\ntrue\nexit 0\n"), "refusal: cannot write the whole fixture")
+  check(t, fsChmod(whole, execMode) == 0, "refusal: cannot chmod the whole fixture")
+  let copy = privateCopy(cx, whole, true)
+  check(t, len(copy) > 0, "refusal: a whole, runnable source was refused - the probe rejects everything")
+  removeCopy(copy)
+  fsRemove(torn)
+  fsRemove(text)
+  fsRemove(whole)
+}
+
+// The same discipline against the real compiler, which is the object every other
+// harness gets this wrong about. Reading `exe` is safe in a way exec'ing it is
+// not: a torn read is caught by the probe, where a torn exec is a SIGKILL with
+// no output.
+function checkRealCompiler(cx: Ctx, t: Tally, exe: string) {
+  let before = readText(exe)
+  check(t, before.ok && len(before.body) > 0, "compiler: cannot read " + exe)
+  let copy = privateCopy(cx, exe, true)
+  check(t, len(copy) > 0, "compiler: no runnable private copy of " + exe)
+  if (len(copy) == 0) { return }
+
+  check(t, copy != exe, "compiler: the copy IS the publish target " + exe)
+  check(t, !startsWith(copy, dirOf(exe) + "/"),
+    "compiler: the copy sits in the directory a build rewrites: " + copy)
+  check(t, startsWith(copy, copyPrefix), "compiler: " + copy + " is not under " + copyPrefix)
+
+  let p = probe(cx, copy)
+  check(t, p.ok, "compiler: the copy does not answer --version")
+  check(t, indexOfAt(p.out, "bit ", 0) == 0,
+    "compiler: --version printed '" + trim(p.out) + "', which is not this compiler's banner")
+
+  let after = readText(exe)
+  check(t, after.ok && after.body == before.body,
+    "compiler: publishing MODIFIED its source - a copy must never write the publish target")
+  let got = readText(copy)
+  check(t, got.ok && before.ok && got.body == before.body,
+    "compiler: the copy is not byte-identical to " + exe)
+  removeCopy(copy)
+}
+
+// --- setup ------------------------------------------------------------------
+
+function timeoutMs(): int {
+  let raw = trim(osEnv("BIT_TEST_TIMEOUT_S"))
+  if (len(raw) == 0) { return defaultTimeoutS * 1000 }
+  let v = 0
+  let i = 0
+  while (i < len(raw)) {
+    if (raw[i] < 48 || raw[i] > 57) { die("BIT_TEST_TIMEOUT_S is not a number: " + raw) }
+    v = v * 10 + int(raw[i]) - 48
+    i = i + 1
+  }
+  if (v == 0) {
+    // CLAUDE.md documents 0 as "disable and block forever"; `osRunBounded` has
+    // no unbounded mode and clamps to one hour (ABI.md §19). Say so rather than
+    // silently redefining it.
+    say("selfbin: BIT_TEST_TIMEOUT_S=0 cannot disable the bound - using one hour.")
+    return clampTimeoutMs
+  }
+  return v * 1000
+}
+
+// The compiler to copy. `BIT_SELF_EXE` wins, exactly as `tests/bit/lintcmd.bit`
+// reads it; otherwise the dev-tree artifact under `BIT_SELFBIN_ROOT` (default
+// "."). Never returns "": a compiler this cannot find is a hard stop.
+function compilerUnderTest(): string {
+  let explicit = trim(osEnv("BIT_SELF_EXE"))
+  if (len(explicit) > 0) {
+    if (!fsExists(explicit)) { die("BIT_SELF_EXE=" + explicit + " does not exist") }
+    return explicit
+  }
+  let root = trim(osEnv("BIT_SELFBIN_ROOT"))
+  if (len(root) == 0) { root = "." }
+  let candidate = root + "/zig-out/bin/bit"
+  if (!fsExists(candidate)) {
+    die("no compiler at " + candidate + " - run this from the repository root, or set " +
+      "BIT_SELF_EXE / BIT_SELFBIN_ROOT")
+  }
+  return candidate
+}
+
+function teardown(cx: Ctx) {
+  runScript(cx, cx.scratch + "/rm.sh", "#!/bin/sh\nrm -rf " + shQuote(cx.scratch) + "\n")
+}
+
+function main() {
+  let exe = compilerUnderTest()
+  let scratch = scratchPrefix + nonceHex()
+  if (fsMkdir(scratch) != 0) { die("cannot create scratch dir " + scratch) }
+  let cx = Ctx{ scratch: scratch, timeoutMs: timeoutMs() }
+  let t = Tally{ checks: 0, failures: 0 }
+
+  // A shell script stands in for the compiler in the legs that only need "a
+  // runnable file": unlike a system binary such as /bin/echo it carries no
+  // platform code signature that would refuse to validate once copied out of
+  // its blessed location, which is the very failure #1644 was.
+  let stub = scratch + "/stub-tool-" + nonceHex()
+  if (!writeText(stub, "#!/bin/sh\nexit 0\n")) { die("cannot write the stub tool " + stub) }
+  if (fsChmod(stub, execMode) != 0) { die("cannot chmod the stub tool " + stub) }
+
+  checkDiscipline(cx, t, stub)
+  checkAtomicity(cx, t)
+  checkRefusal(cx, t)
+  checkRealCompiler(cx, t, exe)
+  teardown(cx)
+
+  if (t.checks < minChecks) {
+    say("FAIL: only " + num(t.checks) + " checks ran, want at least " + num(minChecks))
+    t.failures = t.failures + 1
+  }
+  if (t.failures != 0) {
+    say("selfbin: FAIL - " + num(t.failures) + " of " + num(t.checks) + " checks failed")
+    osExit(1)
+  }
+  say("selfbin: PASS - " + num(t.checks) + " checks, compiler " + exe)
+}

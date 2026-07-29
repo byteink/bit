@@ -458,33 +458,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&testroots_run.step);
     b.step("testroots", "Orphaned-test-file gate (tests/testroots.zig)").dependOn(&testroots_run.step);
 
-    // Golden-file harness: discovers tests/cases/*.bit and checks each against
-    // its sibling .expected. The cases directory (absolute) is injected as a
-    // build option so the runner is independent of the process cwd.
-    const golden_opts = b.addOptions();
-    golden_opts.addOption([]const u8, "cases_dir", b.pathFromRoot("tests/cases"));
-    // The `run`/`panic` cases are also built by the self-hosted `bit` as a
-    // subprocess (#1424), which takes the whole-project path even for a lone
-    // file — so it needs the real stdlib to resolve the prelude from.
-    golden_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
+    // Golden corpus is now tests/bit/golden.bit (#1591), wired at the tail. It
+    // drives the SHIPPED compiler; tests/harness.zig ran every `// error` case
+    // through the seed in-process, so the binary that ships had no golden
+    // diagnostics coverage at all.
 
-    const golden_mod = b.createModule(.{
-        .root_source_file = b.path("tests/harness.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    golden_mod.addImport("bit", exe.root_module);
-    golden_mod.addOptions("build_options", golden_opts);
-
-    const golden_tests = b.addTest(.{ .root_module = golden_mod });
-    const golden_run = b.addRunArtifact(golden_tests);
-    // `tests/cases/*` and the selfhost sources are read at runtime, so neither a
-    // new case nor an edit to a ported module is visible to the build cache;
-    // without this a cache skip could quietly retire the whole corpus — and now
-    // the second compiler with it.
-    golden_run.has_side_effects = true;
-    test_step.dependOn(&golden_run.step);
-    addNamedRun(b, golden_run, "test-golden", "run the golden tests/cases/*.bit harness only");
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
     // Examples guard is now tests/bit/examplesgate.bit — see the Bit gates at the tail.
@@ -610,34 +588,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&version_run.step);
     addNamedRun(b, version_run, "test-version", "run the `bit version` contract (tests/version.zig) only");
 
-    // `bit test` runner (#1105) is now compiler/testgencheck.bit's checkTestgen(),
-    // dispatched from compiler/selfcheck.bit and gated by `zig build selfhost-selfcheck`.
-
-    // `bit lint` CLI contract (#1380) is now tests/bit/lintcmd.bit — see the Bit
-    // gates at the tail.
-
-    // std/os args + environment round-trip (#354). Was tests/osenv.zig; the
-    // check is now tests/bit/osenv.bit, wired at the tail beside the other
-    // Bit gates where `selfhosted` is in scope.
-
-    // Doc-tests (#351): every ```bit block under docs/ must typecheck against
-    // the real prelude and std/*. Front end only — a snippet is a module, not a
-    // program, so it has no `main` to link. Needs no libbitrt.
-    const docs_opts = b.addOptions();
-    docs_opts.addOption([]const u8, "docs_dir", b.pathFromRoot("docs"));
-    docs_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    const docs_mod = b.createModule(.{
-        .root_source_file = b.path("tests/docs.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    docs_mod.addImport("bit", exe.root_module);
-    docs_mod.addOptions("build_options", docs_opts);
-
-    const docs_tests = b.addTest(.{ .root_module = docs_mod });
-    const docs_run = b.addRunArtifact(docs_tests);
-    test_step.dependOn(&docs_run.step);
-    addNamedRun(b, docs_run, "test-docs", "run the doc-snippet typecheck gate (tests/docs.zig) only");
+    // Doc gate is now tests/bit/docs.bit, wired at the tail.
 
     // Stdlib doc coverage (#356) is now tests/bit/stdlibdocs.bit — see the Bit
     // gates at the tail.
@@ -895,7 +846,6 @@ pub fn build(b: *std.Build) void {
     // compile was cached the harness could run before the install refreshed
     // `zig-out`, linking a stale, ABI-mismatched runtime whose malformed binary
     // the kernel then killed by signal (#1229).
-    wireLibbitrt(golden_opts, host_libbitrt_bin);
     wireLibbitrt(stress_opts, host_libbitrt_bin);
     wireLibbitrt(imports_opts, host_libbitrt_bin);
     // #1445's link-acceptance half needs a real archive: the import-set half
@@ -1030,7 +980,6 @@ pub fn build(b: *std.Build) void {
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
     if (native) {
-        golden_opts.addOptionPath("selfhost_bit", selfhosted);
         // #1484: the imports harness drove the SEED only, so #1483 (an entire
         // stdlib module the self-hosted `bit` could not lower) stayed green
         // through every `zig build test` while tests/imports/quicconn built it.
@@ -1038,7 +987,6 @@ pub fn build(b: *std.Build) void {
         diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
         version_opts.addOptionPath("selfhost_bit", selfhosted);
     } else {
-        golden_opts.addOption([]const u8, "selfhost_bit", "");
         imports_opts.addOption([]const u8, "selfhost_bit", "");
         diffimports_opts.addOption([]const u8, "selfhost_bit", "");
         version_opts.addOption([]const u8, "selfhost_bit", "");
@@ -1186,22 +1134,22 @@ pub fn build(b: *std.Build) void {
     run_fuzz.has_side_effects = true;
     b.step("fuzz", "Mutation-fuzz the lexer+parser (default 60s; pass -- <seconds> [seed])").dependOn(&run_fuzz.step);
 
-    // Doc-snippet typecheck, Bit port — DELIBERATELY NOT ON `test_step` YET.
-    //
-    // tests/docs.zig asks the same question in-process via `bit.compileReport`
-    // and costs almost nothing. This port spawns `bit check` once per snippet:
-    // 219 invocations, measured at 410s, against a full suite of ~15 minutes.
-    // Wiring it in would near-double `zig build test` for an identical verdict,
-    // so it stays runnable-by-name until the port batches its checks. Retiring
-    // tests/docs.zig before then would be trading a gate for a slower gate.
+    // Doc-snippet typecheck (#351), replacing tests/docs.zig. Was held off
+    // test_step at 303s; batching brought it to 45s on an idle host (measured,
+    // load 2.3), which is affordable in a ~15 minute suite. The verdict is
+    // unchanged: 271 blocks over 31 pages, and a failing block is still named by
+    // file and page rather than lost in a batch.
     const docs_bit = std.Build.Step.Run.create(b, "bit run tests/bit/docs.bit");
     docs_bit.addFileArg(selfhosted);
     docs_bit.addArg("run");
     docs_bit.addFileArg(b.path("tests/bit/docs.bit"));
     docs_bit.setEnvironmentVariable("BIT_STDLIB", stdlib_root);
+    // docs/ is read at run time, invisible to the build cache.
     docs_bit.has_side_effects = true;
     docs_bit.expectExitCode(0);
-    addNamedRun(b, docs_bit, "test-docs-bit", "run the Bit doc-snippet gate (slow: ~410s, not in `zig build test`)");
+    if (selfhost_install_step) |inst| docs_bit.step.dependOn(inst);
+    test_step.dependOn(&docs_bit.step);
+    addNamedRun(b, docs_bit, "test-docs", "run the doc-snippet typecheck gate (tests/bit/docs.bit) only");
 
     // Selfhost-half import resolution. Named-only for now — see the note beside
     // tests/imports.zig for why running both would just double the suite.
@@ -1302,6 +1250,30 @@ pub fn build(b: *std.Build) void {
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the context-switch throughput gate (tests/bit/schedbench.bit) only");
     if (host_libbitrt_install) |inst| schedbench_gate.step.dependOn(inst);
+
+    // Golden corpus (#1591), replacing tests/harness.zig — all 336 cases against
+    // the SHIPPED compiler. tests/golden-gaps.txt holds the documented
+    // divergences, gated on the SET like tests/selfhost-imports-gaps.txt: a
+    // listed case that starts PASSING fails as a stale gap, and a listed name
+    // absent from the corpus fails as dangling, so the list cannot rot into
+    // permanent excuses.
+    const golden_gate = addBitGate(b, selfhosted, test_step, "golden", "tests/bit/golden.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+        .{ "BIT_CASES_DIR", b.pathFromRoot("tests/cases") },
+        .{ "BIT_BIN", selfhost_artifact_path },
+        .{ "BIT_LIBBITRT", b.pathFromRoot("zig-out/lib/aarch64-macos/libbitrt.a") },
+    }, "run the golden tests/cases/*.bit corpus (tests/bit/golden.bit) only");
+    if (selfhost_install_step) |inst| golden_gate.step.dependOn(inst);
+    if (host_libbitrt_install) |inst| golden_gate.step.dependOn(inst);
+
+    // Private-copy discipline (#1644), replacing tests/selfbin.zig. The hazard is
+    // NOT Zig's: compiler/build.bit:400 publishes with a truncating writeFile and
+    // no temp-then-rename, and it bit twice in this session (stress.bit copied a
+    // partial file; lintcmd.bit exec'd one and got SIGSEGV with empty stderr).
+    const selfbin_gate = addBitGate(b, selfhosted, test_step, "selfbin", "tests/bit/selfbin.bit", &.{
+        .{ "BIT_STDLIB", stdlib_root },
+    }, "run the private-copy discipline gate (tests/bit/selfbin.bit) only");
+    if (selfhost_install_step) |inst| selfbin_gate.step.dependOn(inst);
     addNamedRun(b, selfhost_selfcheck, "test-selfcheck", "run the self-hosted bit self-checks (compiler/selfcheck.bit) only");
 
     // The self-hosted compiler must be able to CHECK ITS OWN SOURCE (#1829).

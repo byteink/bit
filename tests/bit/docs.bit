@@ -24,19 +24,40 @@
 // diagnostics back as a value. Bit gets one subprocess primitive — ABI.md §19's
 // `os_run_bounded(path, timeout_ms)`, no argv and no stdout capture — so argv,
 // the `BIT_STDLIB` override and the output redirect all have to come from a
-// generated `/bin/sh` script, and the harness sees only that SCRIPT's exit
-// status. That is a way to be green while checking nothing which did not exist
-// before the port: `exec` on the last line is what makes the script's status BE
-// the compiler's, and any of a trailing command, a `; exit 0`, or `&>` (which
-// dash parses as `& >`, backgrounding the compiler) turns every check into a
-// silent pass. `plumbingSelfTest` runs FIRST and exists solely to kill that: it
+// generated `/bin/sh` script. That is a way to be green while checking nothing
+// which did not exist before the port: a script that cannot fail makes every
+// page pass. `plumbingSelfTest` runs FIRST and exists solely to kill that: it
 // checks one snippet that must pass and one that must fail, and aborts the whole
 // run if the broken one comes back clean.
 //
+// WHY THE CHECKS RUN IN PARALLEL, AND HOW THE VERDICT SURVIVES IT. Serially
+// this gate cost 303s, which is why it was wired out of `zig build test`. The
+// cost is neither the harness nor process startup: it is the front end
+// re-checking `std/*` once per snippet, so one page importing `std/http` costs
+// 2.8s against 0.03s for one importing nothing. No process can share that work,
+// so the only lever is running them at once — and `osRunBounded` cannot, being
+// `@nosplit` over module-level scratch, one child at a time. So the fan-out
+// lives in the script, and ONE `osRunBounded` call drives the whole corpus.
+//
+// The unit of judgement does NOT change: every snippet still gets its own module
+// directory, `bit check`, captured output and exit status, and a failure is
+// still named by page and by block. What changes is where the status comes from.
+// `exec` no longer makes the script's status BE the compiler's — there are N
+// compilers — so each job `echo`es its own into `s<i>`, and a MISSING or
+// unparseable `s<i>` is a hard abort, never a pass. `plumbingSelfTest` runs its
+// good and bad snippets as one two-job batch through that exact path, which also
+// pins the slot mapping: put both in slot 0 and the bad one comes back clean,
+// put both in slot 1 and the good one fails.
+//
+// The batch deadline replaces the per-check one and stays a real bound: ~48s
+// against `BIT_TEST_TIMEOUT_S`'s 300s default is the ~6x headroom CLAUDE.md sets
+// for every other harness. A timeout is still attributable — jobs that finished
+// wrote a status, so the ones missing one are the snippets that hung.
+//
 // WHY THE SCRIPT IS WRITTEN ONCE AND NEVER REWRITTEN. Rewriting an executable
 // while a previous exec of it may still be in flight is the ETXTBSY trap that
-// bit tests/harness.zig (74811a3). Only `mod/main.bit` — data, never exec'd —
-// changes between the 219 invocations.
+// bit tests/harness.zig (74811a3). Only data changes: the slot modules
+// `w<i>/main.bit` and the job count in `n.txt`, which the script reads.
 //
 // WHY THE COMPILER IS COPIED BEFORE BEING RUN. The self-hosted `bit` is
 // rewritten in place by a `has_side_effects` build step, so a concurrent build
@@ -57,6 +78,10 @@ import { env, envOr } from "std/os"
 // Bounds on the walk, so the traversal is provably finite (Power of 10).
 const maxFiles: int = 256
 const maxBlocksPerFile: int = 128
+// Ceilings on the queue and on the fan-out, so the run's resource use is
+// decided before it starts rather than by whatever the corpus grew into.
+const maxJobs: int = 512
+const maxFanout: int = 32
 
 const fenceTag: string = "```bit"
 const fenceClose: string = "\n```"
@@ -72,24 +97,36 @@ const minPagesWithBlocks: int = 25
 const minTotalBlocks: int = 250
 const minInvocations: int = 200
 
-// Everything one check invocation needs. Resolved once, asserted once.
+// Everything a batch of checks needs. Resolved once, asserted once.
 struct Cfg {
   bin: string        // the compiler under test, already copied into scratch
   stdlibDir: string
   docsDir: string
-  dir: string        // scratch root
-  modDir: string     // the module `bit check` is pointed at
-  modMain: string    // the file rewritten per snippet
+  dir: string        // scratch root, and the runner's cwd
+  jobs: int          // workers, i.e. how many `bit check` run at once
   script: string     // the generated runner, written once
-  outPath: string    // captured stdout+stderr of one check
+  countPath: string  // `n.txt`: how many slots this batch uses
   timeoutMs: i64
 }
 
-// One check: the child's ABI.md §19 status, and whatever it printed.
+// One check: the child's exit status, and whatever it printed.
 struct CheckResult {
   code: i64
   report: string
 }
+
+// One snippet queued for checking. `block` is the 1-based block number for a
+// per-block page, or 0 when the job is the page's blocks joined — the two cases
+// read differently in a failure message.
+struct Job {
+  page: string
+  block: int
+  blocks: int
+  src: string
+}
+
+// The corpus walk's output: what to check, and what was counted while deciding.
+struct Plan { jobs: []Job, st: Stats }
 
 // One extractBlocks unit case.
 struct ExtractCase {
@@ -222,58 +259,138 @@ function joinBlocks(blocks: []string): string {
   return out
 }
 
-// Typechecks `src` as a module in the scratch directory.
-function checkModule(cfg: Cfg, src: string): CheckResult {
-  spill(cfg.modMain, src, "scratch module")
+// Slot `i`'s paths: its module directory, its captured output, its exit status,
+// and the claim directory a worker `mkdir`s to take the job.
+function slotDir(cfg: Cfg, i: int): string { return "${cfg.dir}/w${i}" }
+function slotMain(cfg: Cfg, i: int): string { return "${cfg.dir}/w${i}/main.bit" }
+function slotOut(cfg: Cfg, i: int): string { return "${cfg.dir}/o${i}" }
+function slotStatus(cfg: Cfg, i: int): string { return "${cfg.dir}/s${i}" }
+function slotClaim(cfg: Cfg, i: int): string { return "${cfg.dir}/c${i}" }
 
-  // The previous run's capture is removed before the child starts: a spawn that
-  // never happens must not be able to hand back stale, clean-looking output.
-  if (exists(cfg.outPath)) {
-    remove(cfg.outPath) catch e {
-      die("stale capture ${cfg.outPath}: ${e.message()}")
-    }
+// A leftover from an earlier batch is removed before the next one starts: a
+// child that never ran must not hand back stale output or a stale zero status.
+// A stale CLAIM is the nastier one — every worker would skip that job, which
+// `slotResult` then reads as the harness being broken.
+function scrub(path: string) {
+  if (exists(path)) {
+    remove(path) catch e { die("cannot clear ${path}: ${e.message()}") }
   }
+}
 
+// What slot `i` produced, once the runner has finished with it. Absent, empty
+// or non-numeric status all abort the run: a check whose result is unknown is
+// not a check, and there is no lenient reading of this file.
+function slotResult(cfg: Cfg, i: int): CheckResult {
+  let p = slotStatus(cfg, i)
+  if (!exists(p)) {
+    die("no exit status at ${p}: the runner did not record slot ${i}, so its snippet is unchecked")
+  }
+  // trimInfo strips " \t\r" but not the newline `echo` writes, which is the
+  // last byte when present.
+  let raw = slurp(p, "check status")
+  let cut = raw
+  while (len(cut) > 0 && cut[len(cut) - 1] == '\n') { cut = cut[:len(cut) - 1] }
+  let code = parseInt(trimInfo(cut)) catch _ {
+    die("unreadable exit status in ${p}: ${jsonish(raw)}")
+    0
+  }
+  let outPath = slotOut(cfg, i)
+  if (!exists(outPath)) {
+    die("no output capture at ${outPath}: the runner script is not redirecting slot ${i}")
+  }
+  return CheckResult{ code: i64(code), report: slurp(outPath, "check output") }
+}
+
+// Typechecks `srcs` — one module per source — in ONE runner invocation, and
+// returns one result per source in the same order. The workers claim jobs
+// dynamically rather than being handed a fixed share, because the corpus is
+// wildly uneven and any static split leaves most workers idle behind the one
+// page that imports `std/http`. Measured here: 303s serially, 74s in fixed
+// rounds of 8, 48s pulled from one queue by 12.
+function runBatch(cfg: Cfg, srcs: []string): []CheckResult {
+  let n = len(srcs)
+  assert(n > 0 && n <= maxJobs)
+  stageBatch(cfg, srcs)
   let r = osRunBounded(cfg.script, cfg.timeoutMs)
-  // ABI.md §19 packs three outcomes into one i64. Folding any of them into
-  // "nonzero, therefore the snippet is bad" would let a child that never ran
-  // masquerade as a real diagnostic; folding them into 0 would be worse.
-  if (r == -1) {
-    return CheckResult{ code: r, report: "SPAWN FAILED (fork/exec/wait error) running ${cfg.script}" }
+  assertRunnerRan(cfg, r, n)
+  return collectBatch(cfg, n, r)
+}
+
+// One module per source, plus the count the runner reads, plus a clean slate.
+function stageBatch(cfg: Cfg, srcs: []string) {
+  let i = 0
+  while (i < len(srcs)) {
+    if (!exists(slotDir(cfg, i))) {
+      mkdir(slotDir(cfg, i)) catch e { die("mkdir ${slotDir(cfg, i)}: ${e.message()}") }
+    }
+    spill(slotMain(cfg, i), srcs[i], "scratch module")
+    scrub(slotOut(cfg, i))
+    scrub(slotStatus(cfg, i))
+    scrub(slotClaim(cfg, i))
+    i = i + 1
   }
-  if (r == -2) {
-    return CheckResult{ code: r, report: "TIMED OUT after ${cfg.timeoutMs}ms" }
+  spill(cfg.countPath, "${len(srcs)}\n", "batch size")
+}
+
+// ABI.md §19 packs three outcomes into one i64, and here they are the RUNNER's,
+// not a compiler's. Only the timeout is a verdict about the docs; the rest mean
+// the harness is broken, and a broken harness must not be able to pass.
+// The runner exits 0 after `wait`; 111-113 are its own setup failures, and any
+// other positive status means it never reached the worker loop.
+function assertRunnerRan(cfg: Cfg, r: i64, n: int) {
+  if (r == -1) { die("SPAWN FAILED (fork/exec/wait error) running ${cfg.script}") }
+  if (r <= -100) { die("runner ${cfg.script} killed by signal ${-r - 100}") }
+  if (r < 0 && r != -2) { die("unknown os_run_bounded result ${r} from ${cfg.script}") }
+  if (r > 0) { die("runner ${cfg.script} exited ${r} — it never ran the ${n} check(s) in this batch") }
+}
+
+// A hang is a failure, not a stall — and it is attributable: the jobs that
+// finished wrote a status, so a missing one names the snippet that hung instead
+// of condemning the whole batch.
+function collectBatch(cfg: Cfg, n: int, r: i64): []CheckResult {
+  let out = []CheckResult(0)
+  let j = 0
+  while (j < n) {
+    if (r == -2 && !exists(slotStatus(cfg, j))) {
+      out = append(out, CheckResult{ code: r,
+        report: "TIMED OUT: still running when the batch deadline of ${cfg.timeoutMs}ms elapsed" })
+    } else {
+      out = append(out, slotResult(cfg, j))
+    }
+    j = j + 1
   }
-  if (r <= -100) {
-    return CheckResult{ code: r, report: "compiler killed by signal ${-r - 100}" }
-  }
-  if (r < 0) {
-    return CheckResult{ code: r, report: "unknown os_run_bounded result ${r}" }
-  }
-  if (!exists(cfg.outPath)) {
-    return CheckResult{ code: -3, report: "no output capture at ${cfg.outPath}: the runner script is not redirecting" }
-  }
-  return CheckResult{ code: r, report: slurp(cfg.outPath, "check output") }
+  return out
 }
 
 // Runs BEFORE the corpus walk, and aborts it on any surprise.
 //
 // This is the countermeasure to the port's own failure mode: the harness reads
-// one number, the runner script's exit status, and a script that cannot fail
+// numbers a generated script wrote, and a script that cannot report failure
 // makes every page pass. So one snippet that must check clean and one that must
 // not are run through the exact same path the corpus uses. The good one also
 // imports `std/strings`, which proves BIT_STDLIB reached the child — without it
-// every std-importing page would fail for a reason that has nothing to do with
-// the docs.
+// every std-importing page would fail for a reason unrelated to the docs.
+//
+// Running them as ONE two-job batch is deliberate: it also pins the slot mapping
+// the batch depends on. If every job were checking slot 0 the bad snippet would
+// come back clean; if every job were checking the last slot the good one would
+// fail. Either way this aborts, and no corpus page is ever judged by a runner
+// that confuses one snippet with another.
 function plumbingSelfTest(cfg: Cfg) {
-  let good = checkModule(cfg, "import { contains } from \"std/strings\"\n\nfunction docsPlumbingOk(s: string): bool {\n  return contains(s, \"a\")\n}\n")
+  assert(cfg.jobs >= 2)
+  let rs = runBatch(cfg, [
+    "import { contains } from \"std/strings\"\n\nfunction docsPlumbingOk(s: string): bool {\n  return contains(s, \"a\")\n}\n",
+    "let docsPlumbingBad: int = \"not an int\"\n",
+  ])
+  assert(len(rs) == 2)
+  let good = rs[0]
+  let bad = rs[1]
+
   if (good.code != 0) {
     die("plumbing: a known-good snippet did not check (status ${good.code}):\n${good.report}")
   }
-
-  let bad = checkModule(cfg, "let docsPlumbingBad: int = \"not an int\"\n")
   if (bad.code == 0) {
-    die("plumbing: a DELIBERATELY BROKEN snippet checked clean — the runner is swallowing the compiler's exit status, so this gate cannot fail. Captured output:\n${bad.report}")
+    die("plumbing: a DELIBERATELY BROKEN snippet checked clean — the runner is not recording the compiler's exit status, so this gate cannot fail. Captured output:\n${bad.report}")
   }
   if (!contains(bad.report, "error[")) {
     die("plumbing: the broken snippet failed (status ${bad.code}) but no diagnostics were captured — the output redirect is not wired. Captured:\n${bad.report}")
@@ -392,26 +509,9 @@ function setup(root: string): Cfg {
     die("compiler under test is missing: ${src} (set BIT)")
   }
 
-  let timeoutS = 300
-  let raw = envOr("BIT_TEST_TIMEOUT_S", "300")
-  timeoutS = parseInt(raw) catch _ {
-    die("BIT_TEST_TIMEOUT_S is not an integer: ${jsonish(raw)}")
-    300
-  }
-  // 0 disables the bound in the Zig harnesses; ABI.md §19 has no "forever", so
-  // it maps to the one-hour clamp rather than being silently treated as 0ms.
-  let timeoutMs: i64 = 3600000
-  if (timeoutS > 0) {
-    timeoutMs = i64(timeoutS) * 1000
-  }
-
   let dir = "/tmp/bit-docsgate-${nonce()}"
   mkdir(dir) catch e {
     die("mkdir ${dir}: ${e.message()}")
-  }
-  let modDir = "${dir}/mod"
-  mkdir(modDir) catch e {
-    die("mkdir ${modDir}: ${e.message()}")
   }
 
   let bin = "${dir}/bit"
@@ -425,46 +525,112 @@ function setup(root: string): Cfg {
     stdlibDir: stdlibDir,
     docsDir: docsDir,
     dir: dir,
-    modDir: modDir,
-    modMain: "${modDir}/main.bit",
+    jobs: fanout(),
     script: "${dir}/run.sh",
-    outPath: "${dir}/out.txt",
-    timeoutMs: timeoutMs,
+    countPath: "${dir}/n.txt",
+    timeoutMs: deadlineMs(),
   }
+  writeRunner(cfg)
+  return cfg
+}
 
-  // Written ONCE, then never touched again: rewriting a script between execs is
-  // the ETXTBSY hazard, and `exec` on the last line is the load-bearing token —
-  // it makes this script's exit status BE the compiler's.
+// How many `bit check` run at once. 12 is where the measured curve flattens
+// (303s serial, 56s at 8, 48s at 12, 50s at 16 — beyond that they contend); a
+// fixed number rather than a core count because Bit cannot ask for one, with
+// `BIT_DOCS_JOBS` as the knob for a smaller host. Below 2 the plumbing
+// self-test's slot-mapping check has nothing to distinguish.
+function fanout(): int {
+  let raw = envOr("BIT_DOCS_JOBS", "12")
+  let jobs = parseInt(raw) catch _ {
+    die("BIT_DOCS_JOBS is not an integer: ${jsonish(raw)}")
+    12
+  }
+  if (jobs < 2 || jobs > maxFanout) {
+    die("BIT_DOCS_JOBS must be between 2 and ${maxFanout}, got ${jobs}")
+  }
+  return jobs
+}
+
+// The bound on the one runner invocation. 0 disables the bound in the Zig
+// harnesses; ABI.md §19 has no "forever", so it maps to the one-hour clamp
+// rather than being silently treated as 0ms.
+function deadlineMs(): i64 {
+  let raw = envOr("BIT_TEST_TIMEOUT_S", "300")
+  let timeoutS = parseInt(raw) catch _ {
+    die("BIT_TEST_TIMEOUT_S is not an integer: ${jsonish(raw)}")
+    300
+  }
+  if (timeoutS <= 0) {
+    return i64(3600000)
+  }
+  return i64(timeoutS) * 1000
+}
+
+// Written ONCE, then never touched again: rewriting a script between execs is
+// the ETXTBSY hazard. It reads its per-batch input (`n.txt`) rather than being
+// regenerated, and `echo $?` on its own line after the compiler is the
+// load-bearing token — that file IS the snippet's verdict, and `slotResult`
+// aborts rather than assume anything when it is missing.
+//
+// `mkdir` is the claim, because it is the one atomic test-and-set POSIX sh has:
+// exactly one worker can create `c$id`, so exactly one worker runs job `id` and
+// a loser moves straight on. That is what makes workers PULL work. `</dev/null`
+// stops the background workers sharing the shell's stdin, and `wait` with no
+// operand waits for all of them, so the runner cannot return while a check is
+// still writing its status.
+function writeRunner(cfg: Cfg) {
   spill(cfg.script,
     "#!/bin/sh\n" +
     "BIT_STDLIB='${cfg.stdlibDir}'\n" +
     "export BIT_STDLIB\n" +
-    "exec '${cfg.bin}' check '${cfg.modDir}' >'${cfg.outPath}' 2>&1\n",
+    "cd '${cfg.dir}' || exit 111\n" +
+    "n=$(cat n.txt) || exit 112\n" +
+    "[ \"$n\" -ge 1 ] || exit 113\n" +
+    "w=0\n" +
+    "while [ \"$w\" -lt ${cfg.jobs} ]; do\n" +
+    "  (\n" +
+    "    id=0\n" +
+    "    while [ \"$id\" -lt \"$n\" ]; do\n" +
+    "      if mkdir \"c$id\" 2>/dev/null; then\n" +
+    "        '${cfg.bin}' check \"w$id\" >\"o$id\" 2>&1\n" +
+    "        echo $? >\"s$id\"\n" +
+    "      fi\n" +
+    "      id=$((id+1))\n" +
+    "    done\n" +
+    "  ) </dev/null &\n" +
+    "  w=$((w+1))\n" +
+    "done\n" +
+    "wait\n" +
+    "exit 0\n",
     "runner script")
   if (fsChmod(cfg.script, 493) != 0) {
     die("chmod ${cfg.script}")
   }
-  return cfg
 }
 
 // std/fs has no recursive delete, so every leaf is named. Failures here are
 // reported, not fatal: the run's verdict is already decided.
 function teardown(cfg: Cfg) {
-  let leaves = [cfg.modMain, cfg.script, cfg.outPath, cfg.bin]
-  for p of leaves {
-    if (exists(p)) {
-      remove(p) catch e {
-        eprint("docs: warning: cannot remove ${p}: ${e.message()}\n")
-      }
-    }
+  for p of [cfg.script, cfg.countPath, cfg.bin] {
+    drop(p)
   }
-  let dirs = [cfg.modDir, cfg.dir]
-  for d of dirs {
-    if (exists(d)) {
-      remove(d) catch e {
-        eprint("docs: warning: cannot remove ${d}: ${e.message()}\n")
-      }
-    }
+  // Every slot the batch COULD have used, not just the ones it did: a bounded
+  // sweep is cheaper to trust than a second copy of the batch size.
+  let i = 0
+  while (i < maxJobs) {
+    drop(slotMain(cfg, i))
+    drop(slotOut(cfg, i))
+    drop(slotStatus(cfg, i))
+    drop(slotClaim(cfg, i))
+    drop(slotDir(cfg, i))
+    i = i + 1
+  }
+  drop(cfg.dir)
+}
+
+function drop(path: string) {
+  if (exists(path)) {
+    remove(path) catch e { eprint("docs: warning: cannot remove ${path}: ${e.message()}\n") }
   }
 }
 
@@ -499,37 +665,28 @@ struct Stats {
   failures: int
 }
 
-// One page, checked. Returns the invocations it made and the failures it saw,
-// folded into `st` by the caller.
-function checkPage(cfg: Cfg, page: string, md: string, blocks: []string, st: Stats): Stats {
-  let out = st
+// One page's jobs: one per block for a per-block page, otherwise one for the
+// whole page with its blocks joined in document order.
+function pageJobs(page: string, md: string, blocks: []string): []Job {
+  let out = []Job(0)
   if (contains(md, perBlockMarker)) {
     let i = 0
     while (i < len(blocks)) {
-      let r = checkModule(cfg, blocks[i])
-      out.invocations = out.invocations + 1
-      if (r.code != 0) {
-        out.failures = out.failures + 1
-        eprint("\ndocs: FAIL ${page} block #${i + 1} does not typecheck (status ${r.code}):\n${r.report}\n--- snippet ---\n${blocks[i]}\n")
-      }
+      out = append(out, Job{ page: page, block: i + 1, blocks: len(blocks), src: blocks[i] })
       i = i + 1
     }
     return out
   }
-
-  let joined = joinBlocks(blocks)
-  let r = checkModule(cfg, joined)
-  out.invocations = out.invocations + 1
-  if (r.code != 0) {
-    out.failures = out.failures + 1
-    eprint("\ndocs: FAIL ${page} (${len(blocks)} blocks, joined) does not typecheck (status ${r.code}):\n${r.report}\n--- joined module ---\n${joined}\n")
-  }
-  return out
+  return append(out, Job{ page: page, block: 0, blocks: len(blocks), src: joinBlocks(blocks) })
 }
 
-function runCorpus(cfg: Cfg, pages: []string): Stats {
+// Walks the corpus and queues every snippet, checking nothing. Extraction is
+// separated from execution so the runner gets one full queue — a per-page
+// fan-out would idle every worker on the 30 pages that yield a single job.
+function planCorpus(pages: []string): Plan {
   let st = Stats{ pages: len(pages), pagesWithBlocks: 0, pagesWithoutBlocks: 0,
     totalBlocks: 0, invocations: 0, failures: 0 }
+  let jobs = []Job(0)
   for page of pages {
     let md = slurp(page, "doc page")
     let blocks = extractBlocks(md)
@@ -542,9 +699,48 @@ function runCorpus(cfg: Cfg, pages: []string): Stats {
     }
     st.pagesWithBlocks = st.pagesWithBlocks + 1
     st.totalBlocks = st.totalBlocks + len(blocks)
-    st = checkPage(cfg, page, md, blocks, st)
+    for j of pageJobs(page, md, blocks) {
+      if (len(jobs) >= maxJobs) {
+        die("more than ${maxJobs} snippets queued; the corpus outgrew this harness's bound")
+      }
+      jobs = append(jobs, j)
+    }
   }
-  return st
+  return Plan{ jobs: jobs, st: st }
+}
+
+// A failure, named by page and by block — the whole point of batching
+// carefully: the message must be what it was one-snippet-per-process.
+function reportFailure(j: Job, r: CheckResult) {
+  if (j.block > 0) {
+    eprint("\ndocs: FAIL ${j.page} block #${j.block} does not typecheck (status ${r.code}):\n${r.report}\n--- snippet ---\n${j.src}\n")
+    return
+  }
+  eprint("\ndocs: FAIL ${j.page} (${j.blocks} blocks, joined) does not typecheck (status ${r.code}):\n${r.report}\n--- joined module ---\n${j.src}\n")
+}
+
+// Every queued job, in one batch. Results come back in submission order, so
+// result i is job i — the mapping the plumbing self-test pins before this runs.
+function runJobs(cfg: Cfg, jobs: []Job, st: Stats): Stats {
+  let out = st
+  let srcs = []string(0)
+  for j of jobs {
+    srcs = append(srcs, j.src)
+  }
+  let rs = runBatch(cfg, srcs)
+  // A short result list would silently drop the tail of the corpus.
+  assert(len(rs) == len(jobs))
+
+  let i = 0
+  while (i < len(jobs)) {
+    out.invocations = out.invocations + 1
+    if (rs[i].code != 0) {
+      out.failures = out.failures + 1
+      reportFailure(jobs[i], rs[i])
+    }
+    i = i + 1
+  }
+  return out
 }
 
 // The floors, each naming what it would have caught — a bare number in a
@@ -591,7 +787,8 @@ function main() {
     osExit(1)
   }
 
-  let st = runCorpus(cfg, pages)
+  let plan = planCorpus(pages)
+  let st = runJobs(cfg, plan.jobs, plan.st)
   teardown(cfg)
 
   let floored = checkFloors(st)
