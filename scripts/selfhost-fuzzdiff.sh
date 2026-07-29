@@ -24,7 +24,7 @@ set -u
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=zig-out/bin/bit
+BIT2=bit-out/bin/bit
 
 # A missing compiler must ABORT, never score a vacuous green (#1514). `run` execs
 # through perl, and a FAILED exec still exits 0 — so an absent compiler yields

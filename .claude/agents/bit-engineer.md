@@ -139,7 +139,7 @@ Every one of these was a real incident.
   baseline from `git show HEAD:<path>`.
 - **Sort both sides of any comparison with `LC_ALL=C` in one invocation** (#1510). A locale
   mismatch between two sorts fabricated thousands of phantom deletions.
-- **Never run two heavy gates concurrently in one worktree** — they fight over `zig-out`
+- **Never run two heavy gates concurrently in one worktree** — they fight over `bit-out`
   and produce exit 144 with an empty log while the real process runs on orphaned.
 - **Stage explicit paths only.** Never `git commit -a`, `git add -A`, or `git add .` —
   another agent or the main thread may have unrelated edits in the tree.

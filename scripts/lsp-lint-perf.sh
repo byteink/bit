@@ -124,7 +124,7 @@ measure() {
 
 echo "==> Building lint-enabled bit (as committed) ..."
 ./make >/dev/null
-with_lint_ms="$(measure "$ROOT/zig-out/bin/bit")"
+with_lint_ms="$(measure "$ROOT/bit-out/bin/bit")"
 echo "    best-of-3 min didChange->publishDiagnostics: ${with_lint_ms} ms (n=40/run)"
 
 echo "==> Patching out the lint call site and rebuilding ..."
@@ -156,7 +156,7 @@ with open(path, "w") as f:
     f.writelines(out)
 PY
 ./make >/dev/null
-without_lint_ms="$(measure "$ROOT/zig-out/bin/bit")"
+without_lint_ms="$(measure "$ROOT/bit-out/bin/bit")"
 echo "    best-of-3 min didChange->publishDiagnostics: ${without_lint_ms} ms (n=40/run, lint call site skipped)"
 
 overhead_pct="$(python3 -c "print((${with_lint_ms} - ${without_lint_ms}) / ${without_lint_ms} * 100.0)")"

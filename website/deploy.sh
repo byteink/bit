@@ -19,8 +19,8 @@ set -eu
 root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 
 command -v ssd >/dev/null || { echo "deploy.sh: ssd not found (brew install ssd)" >&2; exit 1; }
-[ -x "$root/zig-out/bin/bit" ] || {
-	echo "deploy.sh: no built compiler at zig-out/bin/bit — run \`./make\` first" >&2
+[ -x "$root/bit-out/bin/bit" ] || {
+	echo "deploy.sh: no built compiler at bit-out/bin/bit — run \`./make\` first" >&2
 	exit 1
 }
 [ -f "$root/.ssd/ssd.yaml" ] || {
@@ -38,7 +38,7 @@ sh "$root/website/advisories.sh" || true
 # compiler, so a deploy also proves the compiler can build a real program.
 gen=$(mktemp -t bitsite) || exit 1
 trap 'rm -f "$gen"' EXIT
-"$root/zig-out/bin/bit" build "$root/website/gen" -o "$gen"
+"$root/bit-out/bin/bit" build "$root/website/gen" -o "$gen"
 (cd "$root" && "$gen")
 
 # ssd ships the build context with `git archive HEAD`, so the SERVER builds from

@@ -50,7 +50,7 @@ ORACLE=${DIFFFMT_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and
 # a known-disagreeing formatter. The verdict line always names what was actually
 # compared, so an overridden run cannot be quoted as a plain one.
-BIT2=${DIFFFMT_BIT:-zig-out/bin/bit}
+BIT2=${DIFFFMT_BIT:-bit-out/bin/bit}
 # 20s was too tight on slower hardware: #1761's own verification needed
 # DIFFFMT_TIMEOUT=40 on an older Skylake x86_64 host to format
 # compiler/lower.bit (6867 lines, ~23s wall there) without a false

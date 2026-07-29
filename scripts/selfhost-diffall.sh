@@ -80,7 +80,7 @@
 #   2  no divergence, but at least one constituent could not decide
 #      (INCONCLUSIVE / TIMEOUT / ERROR), or discovery fell below the floor
 #
-# Constituents run SEQUENTIALLY and all of them run: they share zig-out/ and
+# Constituents run SEQUENTIALLY and all of them run: they share bit-out/ and
 # fixpoint rewrites .fixpoint-work, so parallelism would corrupt them, and
 # fail-fast would hand back a partial board -- which is the checklist problem
 # again, one differential at a time.
@@ -103,7 +103,7 @@ ABSENT_SET=${DIFFALL_ABSENT:-scripts/selfhost-diffall.absent}
 # than skipping. What a green run asserts changed with it: "unchanged versus the
 # last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=zig-out/bin/bit
+BIT2=bit-out/bin/bit
 
 # Preconditions abort. A family-wide run with no compiler on disk would have
 # every constituent bail at once, and a wall of exit 2 is not a differential

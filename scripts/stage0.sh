@@ -8,7 +8,7 @@
 #
 # WHAT THIS REPLACES, AND HOW THE MEANING CHANGES
 #
-# Until #1593 the oracle was `zig-out/bin/bit-seed`: a compiler written in a
+# Until #1593 the oracle was `bit-out/bin/bit-seed`: a compiler written in a
 # different language by different code, so a green diff meant "two independent
 # implementations agree". The pinned stage0 is the SAME implementation one
 # release back, so a green diff now means "this version did not change
@@ -24,7 +24,7 @@ set -eu
 
 ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
 SUMS="${ROOT}/dist/stage0/SHA256SUMS"
-CACHE="${BIT_STAGE0_CACHE:-${ROOT}/zig-out/stage0}"
+CACHE="${BIT_STAGE0_CACHE:-${ROOT}/bit-out/stage0}"
 
 die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
 
@@ -41,7 +41,7 @@ die() { printf 'stage0: %s\n' "$*" >&2; exit 1; }
 # cycle takes two passes:
 #
 #   ./make                                        # pass 1: stage0 -> bit with the fix
-#   BIT_STAGE0_BIN=$PWD/zig-out/bin/bit ./make    # pass 2: that bit -> correct runtime
+#   BIT_STAGE0_BIN=$PWD/bit-out/bin/bit ./make    # pass 2: that bit -> correct runtime
 #
 # then cut a release from pass 2 and repin dist/stage0/SHA256SUMS, after which a
 # single pass is correct again and this variable goes back to being unused.
@@ -106,7 +106,7 @@ wrapper="${CACHE}/bit-oracle"
 #
 # That is not hypothetical: it showed up the first time `selfhost-diffcheck.sh`
 # ran against stage0, as seven files whose diagnostics pointed at
-# `zig-out/stage0/.../stdlib/crypto/mldsantt.bit` on one side and
+# `bit-out/stage0/.../stdlib/crypto/mldsantt.bit` on one side and
 # `stdlib/crypto/mldsantt.bit` on the other. Same compiler, same source, and the
 # only difference was which copy of the stdlib each side read.
 #

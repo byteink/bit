@@ -96,7 +96,7 @@ for TARGET in x86_64-linux aarch64-linux aarch64-macos; do
 
   echo "rebuilding ${TARGET}..."
   mkdir -p "${WORK}/build-${TARGET}/stage/bin"
-  "${WORK}/src/zig-out/bin/bit-seed" build selfhost --target "${TARGET}" \
+  "${WORK}/src/bit-out/bin/bit-seed" build selfhost --target "${TARGET}" \
     -o "${WORK}/build-${TARGET}/stage/bin/bit"
   chmod +x "${WORK}/build-${TARGET}/stage/bin/bit"
   ( cd "${WORK}/src" && bash dist/package.sh "${VERSION}" "${TARGET}" "${WORK}/build-${TARGET}" ) >/dev/null

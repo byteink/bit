@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIT="${1:-$ROOT/zig-out/bin/bit}"
+BIT="${1:-$ROOT/bit-out/bin/bit}"
 
 if [ ! -x "$BIT" ]; then
   echo "FAIL: no bit binary at $BIT (run './make' first)" >&2

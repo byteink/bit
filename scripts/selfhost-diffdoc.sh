@@ -42,7 +42,7 @@ set -uo pipefail
 ORACLE=${DIFFDOC_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and a
 # known-disagreeing doc surface. The verdict line names what was actually compared.
-BIT2=${DIFFDOC_BIT:-zig-out/bin/bit}
+BIT2=${DIFFDOC_BIT:-bit-out/bin/bit}
 
 for bin in "$ORACLE" "$BIT2"; do
   [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: ./make selfhost" >&2; exit 2; }

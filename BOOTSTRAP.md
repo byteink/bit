@@ -15,7 +15,7 @@ against the digest committed in [`dist/stage0/SHA256SUMS`](dist/stage0/SHA256SUM
 ```
 
 `scripts/stage0.sh` does the resolving. It reads the artifact name out of the
-committed digest file, fetches it once into `zig-out/stage0/`, verifies it
+committed digest file, fetches it once into `bit-out/stage0/`, verifies it
 through `dist/stage0-verify.sh`, and refuses on any failure — a build never falls
 back to something unverified. Later runs are silent and offline.
 

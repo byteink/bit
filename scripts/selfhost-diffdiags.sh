@@ -16,7 +16,7 @@ set -u
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=zig-out/bin/bit
+BIT2=bit-out/bin/bit
 
 # A missing compiler must ABORT, never score a vacuous green (#1514). This gate
 # is the worst of the family without it: both sides render empty, and since it

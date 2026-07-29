@@ -14,7 +14,7 @@ set -u
 # than skipping. What a green run asserts changed with it: "unchanged versus the
 # last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=${BIT2:-zig-out/bin/bit}
+BIT2=${BIT2:-bit-out/bin/bit}
 HOST=${BITX64_HOST:-$(bash "$(dirname "$0")/x64host.sh")}
 [ -n "$HOST" ] || exit 127
 echo "diffexamples-x64: host=$HOST"
@@ -22,7 +22,7 @@ echo "diffexamples-x64: host=$HOST"
 # tarball's — see scripts/selfhost-diffexamples.sh for why, and why this cannot
 # live in the stage0 wrapper (BIT_LIBBITRT names one archive for one triple, and
 # this script cross-compiles).
-X64_RT=zig-out/lib/x86_64-linux/libbitrt.a
+X64_RT=bit-out/lib/x86_64-linux/libbitrt.a
 [ -f "$X64_RT" ] || { echo "diffexamples-x64: missing $X64_RT — run: ./make libbitrt" >&2; exit 2; }
 export BIT_LIBBITRT="$PWD/$X64_RT"
 

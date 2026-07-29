@@ -40,7 +40,6 @@ OUT="${ROOT}/dist/out"
 cd "${ROOT}"
 
 command -v gh >/dev/null || { echo "release.sh: gh not found" >&2; exit 1; }
-command -v zig >/dev/null || { echo "release.sh: zig not found" >&2; exit 1; }
 
 # A release must come from a clean tree at a tagged commit, or the artifacts
 # cannot be traced back to source. Checked first, before any minutes are spent.
@@ -105,7 +104,7 @@ for t in "${TARGETS[@]}"; do
 	# for this host by construction, so it cross-compiles every target from one
 	# invocation exactly as the seed did.
 	#
-	# NOT `zig-out/bin/bit`: that is built FROM this tree, and a release must be
+	# NOT `bit-out/bin/bit`: that is built FROM this tree, and a release must be
 	# produced by the previous release, so a compiler bug introduced here cannot
 	# silently compile itself into the artifact. Same reason the differentials
 	# use stage0 as their oracle.

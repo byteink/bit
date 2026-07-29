@@ -7,7 +7,7 @@
 # than the lexer.
 #
 # THE ORACLE CHANGED IN #1593, AND SO DID WHAT A GREEN RUN MEANS. It used to be
-# `zig-out/bin/bit-seed`, a compiler written in a different language, so green
+# `bit-out/bin/bit-seed`, a compiler written in a different language, so green
 # meant "two independent implementations agree". It is now the last release of
 # this same compiler, so green means "this version did not change behaviour
 # versus the last release". See docs/release/bootstrap.md §4/§5 — the loss is
@@ -19,7 +19,7 @@ set -u
 # Resolves, downloads and DIGEST-VERIFIES the pinned stage0; see scripts/stage0.sh.
 # It refuses rather than skipping, so a `set -u` failure here is loud.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=zig-out/bin/bit
+BIT2=bit-out/bin/bit
 
 # A missing compiler must ABORT, never score a vacuous green (#1514): both sides
 # of the differential would produce empty output, and equal-empty compares as

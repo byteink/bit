@@ -11,7 +11,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
-BIT=./zig-out/bin/bit
+BIT=./bit-out/bin/bit
 CASES="fib mandelbrot collatz alloc"
 RUNS=7                           # timed runs per case; median reported
 CRUNS=3                          # compile-time samples per case; median reported

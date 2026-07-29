@@ -42,7 +42,7 @@ set -u
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=${BIT2:-zig-out/bin/bit}
+BIT2=${BIT2:-bit-out/bin/bit}
 
 # TIMEOUT is its own outcome — never PASS, never DIFF (#1524/#1525).
 #
@@ -110,11 +110,11 @@ SKIP="h3fetch httpserver httpsserver http2server tlsclient"
 # this tree, so the two archives are byte-identical today and pinning changes
 # nothing observable. It starts mattering the first time runtime/ changes after
 # a release.
-HOST_RT=zig-out/lib/aarch64-macos/libbitrt.a
+HOST_RT=bit-out/lib/aarch64-macos/libbitrt.a
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64)              HOST_RT=zig-out/lib/aarch64-macos/libbitrt.a ;;
-  Linux-aarch64|Linux-arm64) HOST_RT=zig-out/lib/aarch64-linux/libbitrt.a ;;
-  Linux-x86_64)              HOST_RT=zig-out/lib/x86_64-linux/libbitrt.a ;;
+  Darwin-arm64)              HOST_RT=bit-out/lib/aarch64-macos/libbitrt.a ;;
+  Linux-aarch64|Linux-arm64) HOST_RT=bit-out/lib/aarch64-linux/libbitrt.a ;;
+  Linux-x86_64)              HOST_RT=bit-out/lib/x86_64-linux/libbitrt.a ;;
 esac
 [ -f "$HOST_RT" ] || { echo "diffexamples: missing $HOST_RT — run: ./make" >&2; exit 2; }
 export BIT_LIBBITRT="$PWD/$HOST_RT"

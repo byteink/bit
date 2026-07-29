@@ -4,13 +4,13 @@
 # Run this after landing any language feature to keep the extension and the
 # compiler it talks to in sync.
 #
-# NOTHING IS INSTALLED INTO $HOME ANYMORE. This used to `cp zig-out/bin/bit` to
+# NOTHING IS INSTALLED INTO $HOME ANYMORE. This used to `cp bit-out/bin/bit` to
 # ~/.local/bin/bit, which put a development build on PATH ahead of Homebrew's -
 # so plain `bit` in a terminal was the dev compiler reporting `0.1.0-dev`, which
 # read as a broken release more than once. The rule now:
 #
 #   bit            the RELEASED compiler, from `brew install byteink/tap/bit`
-#   ./zig-out/bin/bit   the development build, by explicit path
+#   ./bit-out/bin/bit   the development build, by explicit path
 #
 # The VS Code extension points at the brew binary (.vscode/settings.json), so
 # there is nothing left for a local install to feed. Use the full path when you
@@ -38,8 +38,8 @@ echo "==> Building native arm64 bit (compiler + LSP) ..."
 # to warn that a container build could only ever yield `bit-seed`, which never
 # got lint. Both halves are moot since #1593 deleted seed/.
 ./make
-echo "    built zig-out/bin/bit ($(./zig-out/bin/bit --version))"
-echo "    dev builds are used BY PATH: ./zig-out/bin/bit — nothing is copied to \$HOME"
+echo "    built bit-out/bin/bit ($(./bit-out/bin/bit --version))"
+echo "    dev builds are used BY PATH: ./bit-out/bin/bit — nothing is copied to \$HOME"
 
 echo "==> Building VS Code extension (.vsix) ..."
 docker run --rm -v "$repo/editors/vscode":/out node:20 sh -c '

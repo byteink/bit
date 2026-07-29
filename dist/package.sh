@@ -42,7 +42,7 @@ STAGE="${OUTDIR}/stage"
 [ -x "${STAGE}/bin/bit" ] || { echo "package.sh: missing ${STAGE}/bin/bit" >&2; exit 1; }
 
 for triple in ${RUNTIME_TRIPLES}; do
-  src="${ROOT}/zig-out/lib/${triple}/libbitrt.a"
+  src="${ROOT}/bit-out/lib/${triple}/libbitrt.a"
   [ -f "${src}" ] || { echo "package.sh: missing ${src} (run './make libbitrt')" >&2; exit 1; }
   mkdir -p "${STAGE}/lib/${triple}"
   cp "${src}" "${STAGE}/lib/${triple}/libbitrt.a"

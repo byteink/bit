@@ -53,7 +53,7 @@ set -uo pipefail
 # BIT_STDLIB to the WORKING TREE for both sides — without that this would diff
 # two stdlibs instead of two compilers.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=zig-out/bin/bit
+BIT2=bit-out/bin/bit
 GAPS=tests/selfhost-runtime-gaps.txt
 TIMEOUT=${DIFFRUNTIME_TIMEOUT:-20}
 

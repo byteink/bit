@@ -87,7 +87,7 @@ from a machine that has one.
 
 ```sh
 # on a supported host
-./zig-out/bin/bit build compiler --target <new-triple> -o bit-<new-triple>
+./bit-out/bin/bit build compiler --target <new-triple> -o bit-<new-triple>
 ```
 
 The new triple must already be a target the compiler can emit for. A genuinely
@@ -97,7 +97,7 @@ that is a property of self-hosting, not of this decision.
 
 **The first release cut after `seed/` is deleted is special and must not be
 missed:** `dist/release.sh:102` builds the shipped `bit` by exec'ing
-`./zig-out/bin/bit-seed`. With the seed gone that line has no compiler. It must
+`./bit-out/bin/bit-seed`. With the seed gone that line has no compiler. It must
 become the stage0 `bit`, and #1593 has to change it in the same commit that
 deletes `seed/`, or the first post-seed release cannot be cut at all.
 
@@ -153,8 +153,8 @@ result is reproducible.
 `scripts/` rather than from the ticket, because an undercount here means gates
 silently retired.
 
-Every `selfhost-diff*.sh` today runs `zig-out/bin/bit-seed` against
-`zig-out/bin/bit` and diffs the output. The substitution is mechanical: the seed
+Every `selfhost-diff*.sh` today runs `bit-out/bin/bit-seed` against
+`bit-out/bin/bit` and diffs the output. The substitution is mechanical: the seed
 side becomes the pinned stage0 (release N-1) and the self-hosted side stays.
 "Re-based" below means exactly that and nothing more.
 

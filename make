@@ -25,7 +25,7 @@ ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)"
 cd "${ROOT}"
 BIT_MAKE_ROOT="${ROOT}"
 export BIT_MAKE_ROOT
-CACHE="${ROOT}/zig-out/make"
+CACHE="${ROOT}/bit-out/make"
 DRIVER="${CACHE}/make-driver"
 SRC="${ROOT}/tools/build"
 

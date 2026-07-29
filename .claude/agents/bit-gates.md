@@ -22,7 +22,7 @@ pushing a branch that triggers a workflow. Everything below runs locally or over
 | gate | what it proves |
 |---|---|
 | `scripts/selfhost-diffall.sh` | **the whole differential family in one verdict** — run this, not a subset you chose, whenever the corpus (`tests/cases`, `examples/`, `stdlib/`, `tests/imports`) changed. Exit 1 = divergence, 2 = could-not-decide; `difffmt` reports ABSENT until `fmt` is ported |
-| `./make` then `./zig-out/bin/bit` | builds; prints `selfcheck OK` |
+| `./make` then `./bit-out/bin/bit` | builds; prints `selfcheck OK` |
 | `scripts/selfhost-fixpoint.sh` | stageB == stageC byte-identical |
 | `scripts/selfhost-diffcheck.sh` | diagnostics vs the seed; FALSEPOS must be 0 |
 | `scripts/selfhost-diffexamples.sh` | the two compilers' programs behave identically |
@@ -37,7 +37,7 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
 
 ## Resource rules — these are why gates go flaky
 
-- **Never run two heavy gates concurrently in one worktree.** They fight over `zig-out`.
+- **Never run two heavy gates concurrently in one worktree.** They fight over `bit-out`.
   Observed: exit 144, empty log, and the real process still running orphaned.
 - **`./make test` prints `failed command: ...` on SUCCESS.** Trust the exit code and the
   harness verdict line, not that string.

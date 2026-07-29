@@ -42,7 +42,7 @@ Zig was not, because the goal was removing a second TOOLCHAIN — `sh` was alrea
 a hard dependency of this repo (fifteen `selfhost-diff*.sh`, `gate.sh`,
 `stage0.sh`, `release.sh`), and ten lines of it add nothing that was not there.
 
-`zig-out/` keeps its name: it is hardcoded in dozens of harnesses, scripts and
+`bit-out/` keeps its name: it is hardcoded in dozens of harnesses, scripts and
 `.gitignore`, and renaming it is a mechanical change with no behavioural payoff.
 
 ## Layout

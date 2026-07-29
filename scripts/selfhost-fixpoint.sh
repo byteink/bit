@@ -23,7 +23,7 @@
 #        (or pass an explicit stageA binary: bash scripts/selfhost-fixpoint.sh path/to/bit)
 # Run from the repo root so the CWD-relative libbitrt lookup resolves.
 set -eu
-STAGEA="${1:-zig-out/bin/bit}"
+STAGEA="${1:-bit-out/bin/bit}"
 WORK="$(pwd)/.fixpoint-work"
 rm -rf "$WORK"
 mkdir -p "$WORK/b" "$WORK/c"

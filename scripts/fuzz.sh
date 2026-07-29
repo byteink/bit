@@ -19,7 +19,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-bit="${BIT:-$root/zig-out/bin/bit}"
+bit="${BIT:-$root/bit-out/bin/bit}"
 [[ -x "$bit" ]] || { echo "scripts/fuzz.sh: no compiler at $bit (run ./make first)" >&2; exit 1; }
 
 export BIT_STDLIB="${BIT_STDLIB:-$root/stdlib}"

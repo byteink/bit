@@ -8,8 +8,8 @@
 # Usage: bash scripts/g2archive.sh <x86_64-linux|aarch64-linux|aarch64-macos> <out.a>
 #
 # Reads the working tree, writes only its own `mktemp -d` scratch and $OUT; the
-# shared `zig-out/lib/<target>/libbitrt.a` is explicitly refused. Set BIT=<path>
-# to use a `bit` other than `zig-out/bin/bit` (e.g. a fresher seed).
+# shared `bit-out/lib/<target>/libbitrt.a` is explicitly refused. Set BIT=<path>
+# to use a `bit` other than `bit-out/bin/bit` (e.g. a fresher seed).
 #
 # Three traps this script exists to encode rather than let the next reader
 # rediscover:
@@ -49,17 +49,17 @@ case "$TARGET" in
 esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd) || exit 1
-BIT=${BIT:-"$REPO_ROOT/zig-out/bin/bit"}
+BIT=${BIT:-"$REPO_ROOT/bit-out/bin/bit"}
 if [ ! -x "$BIT" ]; then
   echo "g2archive: '$BIT' not found or not executable (build it first: ./make)" >&2
   exit 1
 fi
 
 # Guard on the shared archive's shape, not just this repo's absolute path, so
-# a relative "zig-out/lib/<target>/libbitrt.a" (a peer's likely first typo)
+# a relative "bit-out/lib/<target>/libbitrt.a" (a peer's likely first typo)
 # is refused too, not only the fully-qualified form.
 case "$OUT" in
-  */zig-out/lib/*/libbitrt.a|zig-out/lib/*/libbitrt.a)
+  */bit-out/lib/*/libbitrt.a|bit-out/lib/*/libbitrt.a)
     echo "g2archive: refusing to write the shared $OUT — it is read by peers" >&2
     exit 2
     ;;

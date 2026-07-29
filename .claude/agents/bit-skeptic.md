@@ -53,7 +53,7 @@ This Mac's shell is zsh — `$pipestatus`, never bash's `$PIPESTATUS`.
 
 Never `pkill -f` (it has killed a peer's build). Use your own `mktemp -d`, never a shared
 scratch path. Do not stage or commit anything — you verify, you do not change the tree. If
-you must build, be aware another agent may be using `zig-out`.
+you must build, be aware another agent may be using `bit-out`.
 
 ## Reporting
 

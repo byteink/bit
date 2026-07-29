@@ -26,7 +26,7 @@ set -u
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
-BIT2=zig-out/bin/bit
+BIT2=bit-out/bin/bit
 
 # --- preconditions, loud ------------------------------------------------------
 # A missing tool must ABORT, never silently score every case as "match". Four
