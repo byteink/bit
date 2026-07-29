@@ -687,6 +687,35 @@ pub fn build(b: *std.Build) void {
     // pre-existing reason: the runtime `@compileError`s outside POSIX
     // x86-64/ARM64 today.
     const libbitrt_step = b.step("libbitrt", "Build libbitrt.a for every target this runtime supports");
+
+    // THE PINNED STAGE0 (#1593), declared here because it is needed twice and the
+    // earlier of the two uses is the runtime archive immediately below.
+    //
+    // `scripts/stage0.sh` downloads the release named by dist/stage0/SHA256SUMS,
+    // verifies it against that COMMITTED digest, unpacks it under zig-out/stage0/
+    // and writes a wrapper pinning BIT_STDLIB to this tree. First run fetches;
+    // every later run is silent and offline. It REFUSES on any failure, so a
+    // build can never quietly fall back to something unverified.
+    //
+    // The wrapper path is fixed rather than read from the script's stdout because
+    // build.zig composes the graph before anything runs and cannot capture output
+    // at configure time. stage0.sh writes exactly this path; the runs fail loudly
+    // if it is absent.
+    //
+    // A CONSTRAINT THIS CREATES, worth knowing before it bites: stage0 compiles
+    // both `compiler/` and `runtime/`, so NEITHER may use a language feature or
+    // builtin the pinned release lacks. When they need one, the pin moves first —
+    // cut a release, repin dist/stage0/SHA256SUMS, then use the feature. That is
+    // the same discipline that made 0.1.2 unable to build today's compiler/
+    // (`osRunTestBounded`), which is what forced the 0.1.3 pin.
+    //
+    // stdout is the script's return value for shell callers; build.zig already
+    // knows the path, so it is dropped rather than printing a stray line on every
+    // `zig build`. Diagnostics go to stderr and are kept.
+    const stage0_ensure = b.addSystemCommand(&.{ "sh", "-c", "sh scripts/stage0.sh >/dev/null" });
+    // Downloads and unpacks; the result is invisible to the build cache.
+    stage0_ensure.has_side_effects = true;
+    const stage0_bit = b.pathFromRoot("zig-out/stage0/bit-oracle");
     // Kept as target QUERIES rather than triple strings so the rebuild-cache
     // gate below (#1796) keeps working unchanged: it needs `zigTriple` for the
     // install path and a query comparison to pick the host's archive. The
@@ -697,25 +726,13 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     };
 
-    // A HOST-NATIVE seed to run `g2archive.sh` with, distinct from `exe`
-    // above: `exe` targets whatever `-Dtarget=` selects, and a cross-compiled
-    // seed cannot `exec` on this host (the same reason `selfhost_run`
-    // self-skips on a cross build, below) — but archive assembly must keep
-    // working under `-Dtarget=` regardless, since it is what produces every
-    // target's `libbitrt.a` in one invocation.
-    const rt_builder = b.addExecutable(.{
-        .name = "bit-seed-rt-builder",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/main.zig"),
-            .target = b.resolveTargetQuery(.{}),
-            .optimize = optimize,
-        }),
-    });
-    rt_builder.root_module.addOptions("build_options", seed_opts);
-    const rt_builder_install = b.addInstallArtifact(rt_builder, .{
-        .dest_dir = .{ .override = .{ .custom = "bin" } },
-    });
-    const rt_builder_path = b.getInstallPath(.bin, "bit-seed-rt-builder");
+    // `g2archive.sh` compiles every runtime module and assembles the archive.
+    // It used to be driven by a HOST-NATIVE copy of the seed, built separately
+    // from `exe` because `exe` follows `-Dtarget=` and a cross-built seed cannot
+    // exec on this host. The pinned stage0 has no such problem: it is a native
+    // binary for THIS machine by construction, so archive assembly keeps working
+    // under `-Dtarget=` without a second compiler being built to do it (#1593).
+    const rt_builder_path = stage0_bit;
 
     // The one archive of the three every test harness reuses to link and
     // execute real binaries under `zig build test`. Captured as the archive's
@@ -775,7 +792,7 @@ pub fn build(b: *std.Build) void {
             // nothing else, so the archive has no compiler-rt surface to supply.
             const run = b.addSystemCommand(&.{ "bash", "scripts/g2archive.sh", triple });
             run.setEnvironmentVariable("BIT", rt_builder_path);
-            run.step.dependOn(&rt_builder_install.step);
+            run.step.dependOn(&stage0_ensure.step);
             run.expectExitCode(0);
             // The compiler reads `runtime/**/*.bit` at run time, which is
             // invisible to the build cache — the same reason `selfhost_run`
@@ -865,33 +882,6 @@ pub fn build(b: *std.Build) void {
 
     const selfhost_step = b.step("selfhost", "Build the self-hosted compiler (compiler/) with the pinned stage0 → bit");
 
-    // THE BOOTSTRAP NOW COMES FROM THE PINNED STAGE0, NOT THE SEED (#1593).
-    //
-    // `scripts/stage0.sh` downloads the release named by dist/stage0/SHA256SUMS,
-    // verifies it against that COMMITTED digest, unpacks it under zig-out/stage0/
-    // and writes a wrapper that pins BIT_STDLIB to this tree. First run fetches;
-    // every later run is silent and offline. It REFUSES on any failure, so a
-    // build cannot quietly fall back to something unverified.
-    //
-    // The wrapper path is fixed rather than read from the script's stdout because
-    // build.zig composes the graph before anything runs — it cannot capture output
-    // at configure time. `stage0.sh` writes exactly this path, and the run below
-    // fails loudly if it is absent.
-    //
-    // Building compiler/ with stage0 lands directly on the bootstrap FIXED POINT:
-    // verified on aarch64-macOS that stage0-built `bit` rebuilds itself
-    // byte-identically (sha256 4482c941…0031 both sides). The seed did not have
-    // that property — scripts/selfhost-fixpoint.sh records that seed-built and
-    // bit-built compilers differ by two cosmetic monomorph instance orderings —
-    // so this switch makes `zig build` produce the canonical binary rather than a
-    // stage that merely converges to it.
-    // stdout is the script's RETURN VALUE for shell callers (the wrapper path);
-    // build.zig already knows that path, so drop it rather than printing a stray
-    // line on every `zig build`. Diagnostics go to stderr and are kept.
-    const stage0_ensure = b.addSystemCommand(&.{ "sh", "-c", "sh scripts/stage0.sh >/dev/null" });
-    // Downloads and unpacks; the result is invisible to the build cache.
-    stage0_ensure.has_side_effects = true;
-    const stage0_bit = b.pathFromRoot("zig-out/stage0/bit-oracle");
     var selfhosted: std.Build.LazyPath = undefined;
     // Exposed so a gate that READS `zig-out/bin/bit` off disk (rather than
     // taking it as a LazyPath arg) can depend on the install and stop racing
