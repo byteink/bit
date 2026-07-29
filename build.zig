@@ -1116,10 +1116,14 @@ pub fn build(b: *std.Build) void {
 
     // `bit lint` is selfhost-only, so the harness drives the same binary that
     // interprets it — BIT_SELF_EXE is that path, not argv[0].
-    _ = addBitGate(b, selfhosted, test_step, "lint", "tests/bit/lintcmd.bit", &.{
+    const lint_gate = addBitGate(b, selfhosted, test_step, "lint", "tests/bit/lintcmd.bit", &.{
         .{ "BIT_SELF_EXE", selfhost_artifact_path },
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the `bit lint` CLI contract (tests/bit/lintcmd.bit) only");
+    // BIT_SELF_EXE names zig-out/bin/bit by PATH, so this must not run while
+    // that file is still being installed — a partially-written binary execs and
+    // SIGSEGVs with empty stderr (#1644). Same reason as the stress gate.
+    if (selfhost_install_step) |inst| lint_gate.step.dependOn(inst);
 
     const pathresolve_gate = addBitGate(b, selfhosted, test_step, "pathresolve", "tests/bit/pathresolve.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
@@ -1162,6 +1166,7 @@ pub fn build(b: *std.Build) void {
     fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_SECONDS", "5");
     fuzz_smoke.setEnvironmentVariable("BIT_FUZZ_SEED", "1");
     fuzz_smoke.setEnvironmentVariable("BIT_STDLIB", b.pathFromRoot("stdlib"));
+    if (selfhost_install_step) |inst| fuzz_smoke.step.dependOn(inst);
     fuzz_smoke.has_side_effects = true;
     fuzz_smoke.expectExitCode(0);
     test_step.dependOn(&fuzz_smoke.step);
@@ -1201,6 +1206,7 @@ pub fn build(b: *std.Build) void {
     imports_bit.setEnvironmentVariable("BIT_IMPORTS_BIT", selfhost_artifact_path);
     imports_bit.setEnvironmentVariable("BIT_IMPORTS_DIR", b.pathFromRoot("tests/imports"));
     imports_bit.setEnvironmentVariable("BIT_STDLIB", stdlib_root);
+    if (selfhost_install_step) |inst| imports_bit.step.dependOn(inst);
     imports_bit.has_side_effects = true;
     imports_bit.expectExitCode(0);
     addNamedRun(b, imports_bit, "test-imports-bit", "run the Bit import-resolution gate (selfhost half only)");
