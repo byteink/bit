@@ -17,10 +17,13 @@
 //! The tempting rule — "a file the root merely imports doesn't collect" — is
 //! wrong, and reasoning from it is how these survive review. Collection is
 //! *partial*: `seed/check.zig`'s 11 tests DO run under the `seed/main.zig`
-//! root, `seed/ir.zig`'s 4 under `seed/emit.zig`'s, `runtime/{net,rand,gc}`'s
-//! under `runtime/root.zig`'s — while `lower.zig` and `lsp.zig` fell through
-//! every root. Import-graph reachability calls all of those covered and cannot
-//! tell the two groups apart.
+//! root and `seed/ir.zig`'s 4 under `seed/emit.zig`'s, while `lower.zig` and
+//! `lsp.zig` fell through every root. Import-graph reachability calls all of
+//! those covered and cannot tell the two groups apart.
+//!
+//! `runtime/` holds no `.zig` at all since #1854, so that half of the sweep
+//! currently matches nothing. It stays in `swept_dirs` deliberately: it is what
+//! would catch a new test-bearing Zig file being added back to the runtime.
 //!
 //! So the gate asks the compiler. For each wired root it runs `zig test` with
 //! `tests/list_test_runner.zig`, which prints `builtin.test_functions` — the

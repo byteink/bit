@@ -4,18 +4,19 @@ The binary contract between the **compiler** (codegen) and the **runtime** (GC,
 scheduler, channels). Change this document first; codegen and runtime both
 implement what it says. Anything not written here is not guaranteed.
 
-Status: v1 covers the garbage collector (`runtime/gc.zig`, §1-8), green-thread
-Every section below names the **Bit** module that implements it. The Zig runtime
-those sections used to cite was deleted in #1591 once `libbitrt.a` was built
-entirely from `runtime/**/*.bit`; `runtime/gc.zig`, `runtime/alloc.zig` and
-`runtime/spinlock.zig` survive ONLY as the differential oracle `tests/gcdiff.zig`
-drives, and #1849 needs them to A/B the collector regression. They implement
-nothing that ships.
-
+Status: v1 covers the garbage collector (`runtime/gc`, §1-8), green-thread
 spawn and program entry (`runtime/root`, §9-10), channels (`runtime/chan`
 + `runtime/root`, §11), and panics (§12). The per-callsite stack-map wire
 format and the multi-worker stop-the-world barrier are explicitly **not**
 frozen here — §4/§5 say why and who owns them next.
+
+Every section below names the **Bit** module that implements it. There is no
+longer a Zig runtime to cite: `libbitrt.a` has been built entirely from
+`runtime/**/*.bit` since #1591, and the last three Zig files — `runtime/gc.zig`,
+`runtime/alloc.zig`, `runtime/spinlock.zig` — were deleted in #1854 along with
+the differential `tests/gcdiff.zig` that was their only consumer. They are
+recoverable from history (`git show 8e8cd5e:runtime/gc.zig`) and #1851 rebuilds
+that tree when it needs the pre-port collector as a performance oracle.
 
 All layouts below are for 64-bit targets (x86-64, ARM64). Pointers and `usize`
 are 8 bytes; the null reference is the all-zero bit pattern.

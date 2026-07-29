@@ -226,7 +226,7 @@ fn stackMapOf(a: Allocator, code_size: usize, saved: []const common.SavedReg, co
 }
 
 /// One distinct `TypeInfo` blob the runtime's `bit_rt_gc_alloc` reads
-/// (runtime/gc.zig). `disc` is the type discriminator (`@intFromEnum(TypeId)` of
+/// (runtime/gc). `disc` is the type discriminator (`@intFromEnum(TypeId)` of
 /// the allocation's result type) — descriptors are per type, not per layout, so
 /// each type's method table (ABI.md §2.1) attaches to the right one. `size` is
 /// the body size; `ptr_offsets` the byte offsets of pointer fields the GC scans.

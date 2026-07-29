@@ -308,17 +308,11 @@ pub fn build(b: *std.Build) void {
     const test_roots = [_]TestRoot{
         .{ .path = "seed/main.zig", .wired_above = true },
 
-        // Only alloc.zig remains: it is what runtime/gc.zig imports, and gc.zig
-        // survives solely as tests/gcdiff.zig's differential oracle (#1849 needs
-        // it to A/B the collector). sched/chan/root/shims were deleted with the
-        // rest of the Zig runtime in #1591 — every property they tested is now
-        // covered by tests/stress/* and tests/bit/*, except the two called out
-        // in that commit message.
-        .{ .path = "runtime/alloc.zig" },
-        // gc.zig's tests used to be collected through runtime/root.zig's root.
-        // Deleting that root orphaned them — tests/testroots.zig caught it, which
-        // is the whole reason that gate exists. Wired directly now.
-        .{ .path = "runtime/gc.zig" },
+        // No runtime/*.zig entries remain (#1854). `alloc.zig` and `gc.zig` were
+        // the last two, and they were roots only because `gc.zig` was
+        // tests/gcdiff.zig's differential oracle. #1849 consumed that oracle and
+        // recorded its numbers; #1851 recreates it from history rather than from
+        // the working tree, so all three files and the gate went together.
 
         .{ .path = "seed/diagnostics.zig" },
         .{ .path = "seed/lexer.zig" },
@@ -535,40 +529,18 @@ pub fn build(b: *std.Build) void {
     // every safepoint) — and diffs stdout against its `.expected`. The
     // production-readiness gate for spawn/channels/select/GC under load. Shares
     // the host libbitrt archive wired in at the tail.
-    const stress_opts = b.addOptions();
-    stress_opts.addOption([]const u8, "stress_dir", b.pathFromRoot("tests/stress"));
-    // Stress programs build through the whole-project pipeline (like examples
-    // and imports), so one may `import` another module — `tests/stress/spinlock`
-    // pulls in the Bit runtime lock from `runtime/` rather than copying it.
-    stress_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-
-    // tests/stress.zig is RETIRED (#1591); the harness is now
-    // tests/bit/stress.bit, wired at the tail. `stress_opts` outlives it
-    // because tests/gcdiff.zig still reads the same stress_dir/stdlib_dir.
-
-    // GC differential (#1363): drives runtime/gc.zig through the same scripted
-    // sequence tests/stress/gcbit drives runtime/gc/gc.bit through, and asserts
-    // both render the same table. The golden file is a shared oracle — the
-    // stress suite above checks the Bit collector against it, this checks the
-    // Zig collector against it, and neither is derived from the other. Front end
-    // only on this side: it links runtime/gc.zig directly, so it needs no
-    // libbitrt.
-    const gcdiff_mod = b.createModule(.{
-        .root_source_file = b.path("tests/gcdiff.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    gcdiff_mod.addImport("gc", b.createModule(.{
-        .root_source_file = b.path("runtime/gc.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    gcdiff_mod.addOptions("build_options", stress_opts);
-
-    const gcdiff_tests = b.addTest(.{ .root_module = gcdiff_mod });
-    const gcdiff_run = b.addRunArtifact(gcdiff_tests);
-    test_step.dependOn(&gcdiff_run.step);
-    addNamedRun(b, gcdiff_run, "test-gcdiff", "run the GC differential (tests/gcdiff.zig) only");
+    // tests/stress.zig is RETIRED (#1591) and the GC differential with it
+    // (#1854): the harness is tests/bit/stress.bit, wired at the tail, and it
+    // carries its own paths. `stress_opts` outlived tests/stress.zig only
+    // because tests/gcdiff.zig read the same stress_dir/stdlib_dir; with
+    // gcdiff and runtime/gc.zig gone, nothing consumes it.
+    //
+    // What the differential did, so the loss is on the record: it drove
+    // runtime/gc.zig through the same 600-step script tests/stress/gcbit drives
+    // runtime/gc/gc.bit through, and asserted both rendered the same table
+    // against tests/stress/gcbit/gcbit.expected. That golden is still enforced
+    // — tests/bit/stress.bit diffs gcbit against it twice per run — but it now
+    // has one witness instead of two, like every other .expected here.
 
     // `bit version` (#1451): both compilers must report the stamped version, and
     // a typo'd subcommand must be a usage error rather than the banner it used
@@ -846,7 +818,6 @@ pub fn build(b: *std.Build) void {
     // compile was cached the harness could run before the install refreshed
     // `zig-out`, linking a stale, ABI-mismatched runtime whose malformed binary
     // the kernel then killed by signal (#1229).
-    wireLibbitrt(stress_opts, host_libbitrt_bin);
     wireLibbitrt(imports_opts, host_libbitrt_bin);
     // #1445's link-acceptance half needs a real archive: the import-set half
     // only emits objects and never links.
