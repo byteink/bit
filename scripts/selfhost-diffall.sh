@@ -85,7 +85,7 @@
 # fail-fast would hand back a partial board -- which is the checklist problem
 # again, one differential at a time.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-diffall.sh
+# Usage: zig build selfhost && bash scripts/selfhost-diffall.sh
 #   DIFFALL_TIMEOUT=n   per-constituent hang guard, seconds (default 3600)
 #   DIFFALL_MIN=n       discovery floor (default 15)
 #   DIFFALL_DIR=path    constituent directory -- for mutation-testing this gate
@@ -98,15 +98,19 @@ MIN=${DIFFALL_MIN:-15}
 # diffexamples builds 44 examples twice, so the honest ceiling is minutes.
 TIMEOUT=${DIFFALL_TIMEOUT:-3600}
 ABSENT_SET=${DIFFALL_ABSENT:-scripts/selfhost-diffall.absent}
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping. What a green run asserts changed with it: "unchanged versus the
+# last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 
 # Preconditions abort. A family-wide run with no compiler on disk would have
 # every constituent bail at once, and a wall of exit 2 is not a differential
 # result (#1514).
 if [ "${DIFFALL_DIR:-}" = "" ]; then
-  for bin in "$SEED" "$BIT2"; do
-    [ -x "$bin" ] || { echo "diffall: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+  for bin in "$ORACLE" "$BIT2"; do
+    [ -x "$bin" ] || { echo "diffall: missing $bin — run: zig build selfhost" >&2; exit 2; }
   done
 fi
 [ -f "$ABSENT_SET" ] || { echo "diffall: missing expected-absent set $ABSENT_SET" >&2; exit 2; }

@@ -21,10 +21,15 @@
 # mismatch that happens to sit in the expected set — a load-sensitive counter
 # that silently self-confirms is the exact bug this script is being fixed for.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-diffir.sh
+# Usage: zig build selfhost && bash scripts/selfhost-diffir.sh
 set -uo pipefail
 
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 GAPS=tests/selfhost-ir-gaps.txt
 TIMEOUT=${DIFFIR_TIMEOUT:-20}
@@ -32,8 +37,8 @@ TIMEOUT=${DIFFIR_TIMEOUT:-20}
 # shellcheck source=scripts/selfhost-ir-canon.sh
 . "$(dirname "$0")/selfhost-ir-canon.sh"
 
-for bin in "$SEED" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffir: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+for bin in "$ORACLE" "$BIT2"; do
+  [ -x "$bin" ] || { echo "diffir: missing $bin — run: zig build selfhost" >&2; exit 2; }
 done
 [ -f "$GAPS" ] || { echo "diffir: missing expected-gap list $GAPS" >&2; exit 2; }
 
@@ -45,7 +50,7 @@ match=0 skip=0
 : >"$work/timeout"
 
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  seed=$("$SEED" --dump-ir-pre "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
+  seed=$("$ORACLE" --dump-ir-pre "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
   [ -z "$seed" ] && { skip=$((skip + 1)); continue; }
 
   b2=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir-pre "$f" 2>/dev/null)
@@ -102,7 +107,7 @@ if [ -s "$work/entered" ]; then
   head -3 "$work/entered" | while read -r f; do
     echo
     echo "--- diff (seed vs bit, \$t<id> canonicalized): $f"
-    diff <(canon_ir_ids "$("$SEED" --dump-ir-pre "$f" 2>/dev/null)") \
+    diff <(canon_ir_ids "$("$ORACLE" --dump-ir-pre "$f" 2>/dev/null)") \
          <(canon_ir_ids "$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir-pre "$f" 2>/dev/null)") | head -20
   done
   status=1

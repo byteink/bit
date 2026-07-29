@@ -48,9 +48,14 @@
 #   1  real failure: a FALSEPOS (bit rejects code the seed accepts)
 #   2  could not decide: a file timed out and was never compared. Not a pass.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-diffcheck.sh
+# Usage: zig build selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 ROOT="$(pwd)/"
 
@@ -82,7 +87,7 @@ match=0 missing=0 falsepos=0 diff=0 timeout=0 firstfp="" firstdiff="" firsthang=
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
   # BOTH sides are alarm-guarded and BOTH statuses are captured. The seed side
   # had no bound at all, so a hung ORACLE wedged the whole gate indefinitely.
-  seed=$(run "$SEED" check "$f"); src=$?
+  seed=$(run "$ORACLE" check "$f"); src=$?
   b2=$(run "$BIT2" check "$f"); brc=$?
   if [ "$src" -eq 142 ] || [ "$brc" -eq 142 ]; then
     # Undecided: this file was never compared. Counted on its own, and
@@ -115,7 +120,7 @@ if [ -n "$firstfp" ]; then
 fi
 if [ -n "$firstdiff" ]; then
   echo "=== first differing text: $firstdiff"
-  diff <(run "$SEED" check "$firstdiff" | grep -v '^error: CheckFailed$' | sed "s#--> ${ROOT}#--> #") \
+  diff <(run "$ORACLE" check "$firstdiff" | grep -v '^error: CheckFailed$' | sed "s#--> ${ROOT}#--> #") \
        <(run "$BIT2" check "$firstdiff") | head -14
 fi
 # Only a false positive is a build-breaking regression; MISSING shrinks as emit

@@ -9,15 +9,20 @@
 # output deliberately folds stdout+stderr together (2>&1): a test that fails by
 # panicking must print the same panic under both compilers.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-difftests.sh
+# Usage: zig build selfhost && bash scripts/selfhost-difftests.sh
 set -u
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-zig-out/bin/bit}
 PROJ=${1:-tests/testproj}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-"$SEED" test "$PROJ" >"$TMP/seed" 2>&1
+"$ORACLE" test "$PROJ" >"$TMP/seed" 2>&1
 se=$?
 "$BIT2" test "$PROJ" >"$TMP/b2" 2>&1
 b2=$?

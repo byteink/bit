@@ -20,7 +20,12 @@
 # neither is acceptable, so this compares for equality.
 set -u
 
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 
 # --- preconditions, loud ------------------------------------------------------
@@ -30,7 +35,7 @@ command -v objdump >/dev/null 2>&1 || {
   echo "FATAL: objdump not found — this harness cannot count safepoints without it" >&2
   exit 2
 }
-[ -x "$SEED" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (zig build)" >&2; exit 2; }
+[ -x "$ORACLE" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (zig build)" >&2; exit 2; }
 
 sites() { # $1=compiler $2=source $3=objfile -> static bit_rt_safepoint call sites, or "x" if it did not build
   rm -f "$3"
@@ -57,7 +62,7 @@ function main() {
   print("${n}\n")
 }
 EOF
-st_seed=$(sites "$SEED" "$tmp/selftest.bit" "$tmp/st_seed.o")
+st_seed=$(sites "$ORACLE" "$tmp/selftest.bit" "$tmp/st_seed.o")
 st_self=$(sites "$BIT2" "$tmp/selftest.bit" "$tmp/st_self.o")
 if [ "$st_seed" = "x" ] || [ "$st_self" = "x" ] || [ "$st_seed" -lt 1 ] || [ "$st_self" -lt 1 ]; then
   echo "FATAL: self-test found no safepoint in a plain loop (seed=$st_seed self=$st_self)." >&2
@@ -68,7 +73,7 @@ fi
 # --- the differential ---------------------------------------------------------
 match=0 mismatch=0 skip=0
 for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); do
-  s=$(sites "$SEED" "$f" "$tmp/a.o")
+  s=$(sites "$ORACLE" "$f" "$tmp/a.o")
   [ "$s" = "x" ] && { skip=$((skip + 1)); continue; }
   b=$(sites "$BIT2" "$f" "$tmp/b.o")
   [ "$b" = "x" ] && { skip=$((skip + 1)); continue; }
@@ -207,7 +212,7 @@ EOF
 # If `BIT_GC_STATS` is off, misspelled, or the stress policy stops polling, every
 # program reports 0 collections and every case "matches" — the same vacuous-green
 # failure the phase-1 self-test exists to prevent, one layer down.
-sc_seed=$(exe_collections "$SEED" "$tmp/exe/ifelse_in_loop.bit" "$tmp/exe/st_seed")
+sc_seed=$(exe_collections "$ORACLE" "$tmp/exe/ifelse_in_loop.bit" "$tmp/exe/st_seed")
 sc_self=$(exe_collections "$BIT2" "$tmp/exe/ifelse_in_loop.bit" "$tmp/exe/st_self")
 if [ "$sc_seed" = "x" ] || [ "$sc_self" = "x" ]; then
   echo "FATAL: self-test program did not build/link under both compilers (seed=$sc_seed self=$sc_self)." >&2
@@ -224,7 +229,7 @@ for f in "$tmp"/exe/*.bit; do
   name=$(basename "$f")
   sb="$tmp/exe/${name}.seedbin"
   bb="$tmp/exe/${name}.selfbin"
-  s=$(exe_collections "$SEED" "$f" "$sb")
+  s=$(exe_collections "$ORACLE" "$f" "$sb")
   [ "$s" = "x" ] && { echo "EXE SKIP (seed did not build) $name"; exe_skip=$((exe_skip + 1)); continue; }
   b=$(exe_collections "$BIT2" "$f" "$bb")
   [ "$b" = "x" ] && { echo "EXE SKIP (self did not build) $name"; exe_skip=$((exe_skip + 1)); continue; }

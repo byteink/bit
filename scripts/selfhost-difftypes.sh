@@ -19,14 +19,19 @@
 # A timeout is not evidence: a `bit` run killed by the alarm produced no verdict,
 # so it is reported separately and fails, rather than being scored as a mismatch.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-difftypes.sh
+# Usage: zig build selfhost && bash scripts/selfhost-difftypes.sh
 set -uo pipefail
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 TIMEOUT=${DIFFTYPES_TIMEOUT:-20}
 
-for bin in "$SEED" "$BIT2"; do
-  [ -x "$bin" ] || { echo "difftypes: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+for bin in "$ORACLE" "$BIT2"; do
+  [ -x "$bin" ] || { echo "difftypes: missing $bin — run: zig build selfhost" >&2; exit 2; }
 done
 
 work=$(mktemp -d)
@@ -36,7 +41,7 @@ trap 'rm -rf "$work"' EXIT
 match=0 skip=0
 
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  seed=$("$SEED" --dump-types "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
+  seed=$("$ORACLE" --dump-types "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
   b2=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-types "$f" 2>/dev/null)
   rc=$?
   if [ "$rc" -ge 128 ]; then
@@ -65,7 +70,7 @@ if [ -s "$work/mismatch" ]; then
   head -3 "$work/mismatch" | while read -r f; do
     echo
     echo "--- diff (seed vs bit): $f"
-    diff <("$SEED" --dump-types "$f" 2>/dev/null) \
+    diff <("$ORACLE" --dump-types "$f" 2>/dev/null) \
          <(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-types "$f" 2>/dev/null) | head -12
   done
   status=1

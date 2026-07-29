@@ -33,15 +33,19 @@
 # pipe (a `| tail` returns tail's status, which is how a red diffir read green,
 # #1568). Nothing is inferred from output text.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-diffdoc.sh
+# Usage: zig build selfhost && bash scripts/selfhost-diffdoc.sh
 set -uo pipefail
-SEED=${DIFFDOC_SEED:-zig-out/bin/bit-seed}
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping. What a green run asserts changed with it: "unchanged versus the
+# last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
+ORACLE=${DIFFDOC_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and a
 # known-disagreeing doc surface. The verdict line names what was actually compared.
 BIT2=${DIFFDOC_BIT:-zig-out/bin/bit}
 
-for bin in "$SEED" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+for bin in "$ORACLE" "$BIT2"; do
+  [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: zig build selfhost" >&2; exit 2; }
 done
 
 work=$(mktemp -d)
@@ -63,7 +67,7 @@ probe_doc() {
 }
 
 absent=""
-probe_doc "$SEED" seed || absent="$absent $SEED"
+probe_doc "$ORACLE" seed || absent="$absent $ORACLE"
 probe_doc "$BIT2" bit2 || absent="$absent $BIT2"
 if [ -n "$absent" ]; then
   echo "diffdoc: ABSENT — no \`doc\` subcommand in:$absent"
@@ -77,14 +81,14 @@ match=0 skip=0
 for d in stdlib/*/ examples/*/ tests/imports/*/; do
   [ -d "$d" ] || continue
 
-  "$SEED" doc "$d" >"$work/seed.plain" 2>/dev/null
+  "$ORACLE" doc "$d" >"$work/seed.plain" 2>/dev/null
   seed_rc=$?
   # The seed is the oracle: a directory it cannot document is out of scope.
   if [ "$seed_rc" -ne 0 ]; then
     skip=$((skip + 1))
     continue
   fi
-  "$SEED" doc --json "$d" >"$work/seed.json" 2>/dev/null
+  "$ORACLE" doc --json "$d" >"$work/seed.json" 2>/dev/null
 
   "$BIT2" doc "$d" >"$work/bit.plain" 2>/dev/null
   bit_rc=$?
@@ -105,7 +109,7 @@ done
 
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 compared=$((match + mismatch))
-echo "doc differential ($SEED vs $BIT2): MATCH=$match MISMATCH=$mismatch SKIP(not a module)=$skip"
+echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch SKIP(not a module)=$skip"
 
 # Corpus floor (#1516): comparing nothing is not agreement.
 if [ "$compared" -eq 0 ]; then
@@ -123,7 +127,7 @@ if [ -s "$work/mismatch" ]; then
     dir=${d%% *}
     echo
     echo "--- diff (seed vs bit): $dir"
-    "$SEED" doc "$dir" >"$work/da" 2>/dev/null
+    "$ORACLE" doc "$dir" >"$work/da" 2>/dev/null
     "$BIT2" doc "$dir" >"$work/db" 2>/dev/null
     diff "$work/da" "$work/db" | head -12
   done

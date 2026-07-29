@@ -6,22 +6,27 @@
 # (deferred with the renderer port), so it parses past errors where the seed
 # prints a diagnostic instead.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-diffast.sh
+# Usage: zig build selfhost && bash scripts/selfhost-diffast.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 set -u
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 
 # A missing compiler must ABORT, never score a vacuous green (#1514): both sides
 # of the differential would produce empty output, and equal-empty compares as
 # agreement. Exit 2 to keep this distinct from a real divergence (exit 1).
-for bin in "$SEED" "$BIT2"; do
-  [ -x "$bin" ] || { echo "diffast: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+for bin in "$ORACLE" "$BIT2"; do
+  [ -x "$bin" ] || { echo "diffast: missing $bin — run: zig build selfhost" >&2; exit 2; }
 done
 
 match=0 mismatch=0 skip=0 firstbad=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  seed=$("$SEED" --dump-ast "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
+  seed=$("$ORACLE" --dump-ast "$f" 2>/dev/null) || { skip=$((skip + 1)); continue; }
   b2=$("$BIT2" --dump-ast "$f" 2>/dev/null)
   if [ "$seed" = "$b2" ]; then
     match=$((match + 1))
@@ -41,6 +46,6 @@ fi
 
 if [ -n "$firstbad" ]; then
   echo "first divergence: $firstbad"
-  diff <("$SEED" --dump-ast "$firstbad" 2>/dev/null) <("$BIT2" --dump-ast "$firstbad" 2>/dev/null) | head -20
+  diff <("$ORACLE" --dump-ast "$firstbad" 2>/dev/null) <("$BIT2" --dump-ast "$firstbad" 2>/dev/null) | head -20
   exit 1
 fi

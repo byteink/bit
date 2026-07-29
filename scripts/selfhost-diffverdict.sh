@@ -49,12 +49,17 @@
 #
 # Usage: zig build && bash scripts/selfhost-diffverdict.sh [-v]
 set -u
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=zig-out/bin/bit
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
-for b in "$SEED" "$BIT2"; do
+for b in "$ORACLE" "$BIT2"; do
   [ -x "$b" ] || { echo "missing $b — run: zig build" >&2; exit 1; }
 done
 
@@ -100,7 +105,7 @@ cell() {
   local f="$TMP/c$n.bit"
   printf '%s\n' "$prog" > "$f"
   local sv bv
-  sv=$(verdict "$SEED" "$f")
+  sv=$(verdict "$ORACLE" "$f")
   bv=$(verdict "$BIT2" "$f")
   # Undecided cells leave BEFORE classification, so a cell that never ran can
   # never meet another one and score MATCH, nor be read as a MISSING/FALSEPOS.

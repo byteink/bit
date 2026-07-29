@@ -28,15 +28,20 @@
 # deliberately, in the commit that causes it — which is the point: a refusal
 # becomes a reviewed decision instead of an unasserted number scrolling past.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-diffexamples.sh
+# Usage: zig build selfhost && bash scripts/selfhost-diffexamples.sh
 #
 # Exit codes (matching x64gate.sh / selfhost-diffsafepoints.sh):
 #   0  every example built, ran, and agreed
-#   1  real failure: a DIFF (miscompile), a SEED-FAIL, or REFUSED off its pin
+#   1  real failure: a DIFF (miscompile), a ORACLE-FAIL, or REFUSED off its pin
 #   2  could not decide: an example timed out and was never compared. Not a
 #      pass — see #1524/#1525.
 set -u
-SEED=zig-out/bin/bit-seed
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping, so a failure here is loud. What a green run asserts changed with
+# it: "unchanged versus the last release", not "two implementations agree" —
+# docs/release/bootstrap.md §4/§5.
+ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-zig-out/bin/bit}
 
 # TIMEOUT is its own outcome — never PASS, never DIFF (#1524/#1525).
@@ -45,8 +50,8 @@ BIT2=${BIT2:-zig-out/bin/bit}
 # stay. But its exit code (142 = 128+SIGALRM) used to be fed straight into the
 # exit-code comparison below, which broke BOTH ways on a loaded host:
 #
-#   - one side times out -> "seed=0 bit2=142" reported as DIFF, a false RED
-#     against compilers that agree. Worse when the SEED is the side killed: the
+#   - one side times out -> "oracle=0 bit2=142" reported as DIFF, a false RED
+#     against compilers that agree. Worse when the ORACLE is the side killed: the
 #     board then accuses the self-hosted compiler of breaking a working example.
 #   - BOTH sides time out -> 142 == 142 and `cmp` finds two EMPTY files equal,
 #     so it scored PASS. Measured: 15 alarms in one run, 5 became DIFFs and the
@@ -89,10 +94,35 @@ EXPECTED_REFUSED=${EXPECTED_REFUSED:-0}
 # Network-dependent examples: they talk to the outside world, so their output is
 # not a function of the compiler alone.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"
+
+# BOTH SIDES LINK THE WORKING TREE'S RUNTIME (#1593), for the same reason
+# scripts/stage0.sh pins BIT_STDLIB: the stage0 tarball ships its own
+# libbitrt.a, and left to its defaults the oracle would link the RELEASE's
+# runtime while bit2 links the tree's. This gate would then report a runtime
+# change as a compiler divergence, and name the wrong culprit.
+#
+# The stdlib pin lives in the wrapper because it is target-independent. This one
+# cannot: BIT_LIBBITRT names ONE archive for ONE triple, and the wrapper has no
+# idea which target a caller wants. So it is set here, by the script that knows
+# it is building for the host.
+#
+# Untestable at the moment it was added and worth saying so: v0.1.3 was cut from
+# this tree, so the two archives are byte-identical today and pinning changes
+# nothing observable. It starts mattering the first time runtime/ changes after
+# a release.
+HOST_RT=zig-out/lib/aarch64-macos/libbitrt.a
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)              HOST_RT=zig-out/lib/aarch64-macos/libbitrt.a ;;
+  Linux-aarch64|Linux-arm64) HOST_RT=zig-out/lib/aarch64-linux/libbitrt.a ;;
+  Linux-x86_64)              HOST_RT=zig-out/lib/x86_64-linux/libbitrt.a ;;
+esac
+[ -f "$HOST_RT" ] || { echo "diffexamples: missing $HOST_RT — run: zig build" >&2; exit 2; }
+export BIT_LIBBITRT="$PWD/$HOST_RT"
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-pass=0 diff=0 refused=0 seedfail=0 skipped=0 timedout=0
+pass=0 diff=0 refused=0 oraclefail=0 skipped=0 timedout=0
 for d in examples/*/; do
   n=$(basename "$d")
   case " $SKIP " in *" $n "*) skipped=$((skipped + 1)); continue;; esac
@@ -100,16 +130,16 @@ for d in examples/*/; do
   # The BUILDS are alarm-guarded too: a compiler that hangs while compiling was
   # previously unbounded by this script, and a hung bit2 build would have been
   # scored REFUSED ("not ported yet") rather than surfaced.
-  alarm_run "$TMP/bs_$n" "$SEED" build "$d" -o "$TMP/seed_$n"
+  alarm_run "$TMP/bo_$n" "$ORACLE" build "$d" -o "$TMP/oracle_$n"
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    echo "TIMEOUT   $n (seed build, SIGALRM after ${TIMEOUT_S}s, twice)"
+    echo "TIMEOUT   $n (oracle build, SIGALRM after ${TIMEOUT_S}s, twice)"
     timedout=$((timedout + 1))
     continue
   fi
   if [ "$rc" -ne 0 ]; then
-    echo "SEED-FAIL $n"
-    seedfail=$((seedfail + 1))
+    echo "ORACLE-FAIL $n"
+    oraclefail=$((oraclefail + 1))
     continue
   fi
 
@@ -126,7 +156,7 @@ for d in examples/*/; do
     continue
   fi
 
-  alarm_run "$TMP/o_seed_$n" "$TMP/seed_$n"
+  alarm_run "$TMP/o_oracle_$n" "$TMP/oracle_$n"
   se=$?
   alarm_run "$TMP/o_b2_$n" "$TMP/b2_$n"
   b2=$?
@@ -134,7 +164,7 @@ for d in examples/*/; do
   # Undecided, not agreement: bail BEFORE the comparison so two absent results
   # can never be found equal.
   if [ "$se" -eq 142 ] || [ "$b2" -eq 142 ]; then
-    side="seed"
+    side="oracle"
     [ "$se" -ne 142 ] && side="bit2"
     [ "$se" -eq 142 ] && [ "$b2" -eq 142 ] && side="BOTH"
     echo "TIMEOUT   $n (run: $side, SIGALRM after ${TIMEOUT_S}s, twice)"
@@ -142,18 +172,18 @@ for d in examples/*/; do
     continue
   fi
 
-  if [ "$se" != "$b2" ] || ! cmp -s "$TMP/o_seed_$n" "$TMP/o_b2_$n"; then
-    echo "DIFF      $n (exit seed=$se bit2=$b2)"
-    command diff "$TMP/o_seed_$n" "$TMP/o_b2_$n" | head -6
+  if [ "$se" != "$b2" ] || ! cmp -s "$TMP/o_oracle_$n" "$TMP/o_b2_$n"; then
+    echo "DIFF      $n (exit oracle=$se bit2=$b2)"
+    command diff "$TMP/o_oracle_$n" "$TMP/o_b2_$n" | head -6
     diff=$((diff + 1))
     continue
   fi
   pass=$((pass + 1))
 done
 
-echo "example differential: PASS=$pass DIFF=$diff TIMEOUT=$timedout REFUSED=$refused (pinned $EXPECTED_REFUSED) SEED-FAIL=$seedfail SKIP(network)=$skipped"
-# A DIFF is a miscompile; a SEED-FAIL means the oracle itself did not build.
-if [ "$diff" -gt 0 ] || [ "$seedfail" -gt 0 ]; then
+echo "example differential: PASS=$pass DIFF=$diff TIMEOUT=$timedout REFUSED=$refused (pinned $EXPECTED_REFUSED) ORACLE-FAIL=$oraclefail SKIP(network)=$skipped"
+# A DIFF is a miscompile; a ORACLE-FAIL means the oracle itself did not build.
+if [ "$diff" -gt 0 ] || [ "$oraclefail" -gt 0 ]; then
   exit 1
 fi
 # A TIMEOUT decided nothing: those examples were never differentially tested, so

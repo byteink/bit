@@ -40,9 +40,13 @@
 # than being scored as a mismatch or silently passing. The `continue` makes the
 # byte comparison structurally unreachable unless both sides produced output.
 #
-# Usage: zig build && zig build selfhost && bash scripts/selfhost-difffmt.sh
+# Usage: zig build selfhost && bash scripts/selfhost-difffmt.sh
 set -uo pipefail
-SEED=${DIFFFMT_SEED:-zig-out/bin/bit-seed}
+# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
+# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# than skipping. What a green run asserts changed with it: "unchanged versus the
+# last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
+ORACLE=${DIFFFMT_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and
 # a known-disagreeing formatter. The verdict line always names what was actually
 # compared, so an overridden run cannot be quoted as a plain one.
@@ -54,8 +58,8 @@ BIT2=${DIFFFMT_BIT:-zig-out/bin/bit}
 # margin above that measured worst case.
 TIMEOUT=${DIFFFMT_TIMEOUT:-45}
 
-for bin in "$SEED" "$BIT2"; do
-  [ -x "$bin" ] || { echo "difffmt: missing $bin — run: zig build && zig build selfhost" >&2; exit 2; }
+for bin in "$ORACLE" "$BIT2"; do
+  [ -x "$bin" ] || { echo "difffmt: missing $bin — run: zig build selfhost" >&2; exit 2; }
 done
 
 work=$(mktemp -d)
@@ -79,7 +83,7 @@ probe_fmt() {
 }
 
 absent=""
-probe_fmt "$SEED" seed || absent="$absent $SEED"
+probe_fmt "$ORACLE" seed || absent="$absent $ORACLE"
 probe_fmt "$BIT2" bit2 || absent="$absent $BIT2"
 if [ -n "$absent" ]; then
   echo "difffmt: ABSENT — no \`fmt\` subcommand in:$absent"
@@ -97,7 +101,7 @@ for f in $(find stdlib examples tests/cases tests/imports selfhost runtime -name
   cp "$f" "$a/s.bit"
   cp "$f" "$b/s.bit"
 
-  "$SEED" fmt "$a/s.bit" >/dev/null 2>&1
+  "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
   seed_rc=$?
   # The seed is the oracle: a file it cannot format (the corpus deliberately
   # holds unparseable `// error` cases) is out of scope, exactly as difftypes
@@ -124,7 +128,7 @@ done
 compared=$((match + $(wc -l <"$work/mismatch" | tr -d ' ')))
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
-echo "fmt differential ($SEED vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(unformattable)=$skip"
+echo "fmt differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(unformattable)=$skip"
 
 status=0
 
@@ -149,7 +153,7 @@ if [ -s "$work/mismatch" ]; then
     a="$work/da"; b="$work/db"
     rm -rf "$a" "$b"; mkdir -p "$a" "$b"
     cp "$f" "$a/s.bit"; cp "$f" "$b/s.bit"
-    "$SEED" fmt "$a/s.bit" >/dev/null 2>&1
+    "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
     perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" fmt "$b/s.bit" >/dev/null 2>&1
     diff "$a/s.bit" "$b/s.bit" | head -12
   done
