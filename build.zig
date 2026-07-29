@@ -308,11 +308,17 @@ pub fn build(b: *std.Build) void {
     const test_roots = [_]TestRoot{
         .{ .path = "seed/main.zig", .wired_above = true },
 
+        // Only alloc.zig remains: it is what runtime/gc.zig imports, and gc.zig
+        // survives solely as tests/gcdiff.zig's differential oracle (#1849 needs
+        // it to A/B the collector). sched/chan/root/shims were deleted with the
+        // rest of the Zig runtime in #1591 — every property they tested is now
+        // covered by tests/stress/* and tests/bit/*, except the two called out
+        // in that commit message.
         .{ .path = "runtime/alloc.zig" },
-        .{ .path = "runtime/sched.zig" },
-        .{ .path = "runtime/chan.zig" },
-        .{ .path = "runtime/root.zig" },
-        .{ .path = "runtime/shims.zig", .linux_only = true },
+        // gc.zig's tests used to be collected through runtime/root.zig's root.
+        // Deleting that root orphaned them — tests/testroots.zig caught it, which
+        // is the whole reason that gate exists. Wired directly now.
+        .{ .path = "runtime/gc.zig" },
 
         .{ .path = "seed/diagnostics.zig" },
         .{ .path = "seed/lexer.zig" },

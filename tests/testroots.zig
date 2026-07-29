@@ -91,11 +91,11 @@ const Exception = struct {
     why: []const u8,
 };
 const exceptions = [_]Exception{
-    .{
-        .path = "runtime/shims.zig",
-        .unless_os = "linux",
-        .why = "@compileError's off Linux, so it cannot be built (let alone collected) on this host; it IS wired and measured on a Linux host",
-    },
+    // runtime/shims.zig was deleted with the Zig runtime (#1591); its getauxval
+    // property is now tests/bit/auxv.bit and its strlen property was already
+    // covered by tests/stress/rand's strlenScan KAT. An exception naming a file
+    // that no longer exists is exactly the rot this gate is against, so it is
+    // removed rather than left to look like coverage.
 };
 
 /// Max bytes read from a source file when looking for test blocks. The largest

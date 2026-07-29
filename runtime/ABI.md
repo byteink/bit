@@ -5,8 +5,15 @@ scheduler, channels). Change this document first; codegen and runtime both
 implement what it says. Anything not written here is not guaranteed.
 
 Status: v1 covers the garbage collector (`runtime/gc.zig`, §1-8), green-thread
-spawn and program entry (`runtime/root.zig`, §9-10), channels (`runtime/chan.zig`
-+ `runtime/root.zig`, §11), and panics (§12). The per-callsite stack-map wire
+Every section below names the **Bit** module that implements it. The Zig runtime
+those sections used to cite was deleted in #1591 once `libbitrt.a` was built
+entirely from `runtime/**/*.bit`; `runtime/gc.zig`, `runtime/alloc.zig` and
+`runtime/spinlock.zig` survive ONLY as the differential oracle `tests/gcdiff.zig`
+drives, and #1849 needs them to A/B the collector regression. They implement
+nothing that ships.
+
+spawn and program entry (`runtime/root`, §9-10), channels (`runtime/chan`
++ `runtime/root`, §11), and panics (§12). The per-callsite stack-map wire
 format and the multi-worker stop-the-world barrier are explicitly **not**
 frozen here — §4/§5 say why and who owns them next.
 
@@ -594,7 +601,7 @@ Gc.deinit()                     // free all objects and the mark worklist
 the stack maps make the roots precise.
 
 Codegen never calls the Zig API above directly — it calls the two exported C
-symbols `runtime/root.zig` wires to it:
+symbols `runtime/root` wires to it:
 
 ```
 bit_rt_gc_alloc(info: *const TypeInfo) -> *u8   // Gc.alloc, fatal (not null) on OOM
@@ -610,7 +617,7 @@ not).
 
 Threads that run Bit code participate in the §5 handshake through four more
 exports, none of which codegen emits — they are called by whatever creates the
-thread (`runtime/sched.zig`'s worker pool, `runtime/sched/`'s Bit port, or user
+thread (`runtime/sched`'s worker pool, `runtime/sched/`'s Bit port, or user
 code that starts a raw OS thread via `runtime/thread`):
 
 ```
@@ -634,7 +641,7 @@ whichever hook the platform actually offers:
 | Platform | Where the slot is released | Why there |
 |----------|----------------------------|-----------|
 | Linux    | `runtime/thread/linux`'s child exit path calls `_exit` once the body returns | the provider owns the whole `clone(2)` child exit path, and a static binary has no libc hook |
-| Darwin   | a pthread TSD destructor, armed when the slot is CLAIMED (`exit_hook`, `runtime/root.zig`) | `pthread_create` owns the child's entry and stack, so there is nothing to wrap — but every pthread runs its destructors, including threads this runtime never started |
+| Darwin   | a pthread TSD destructor, armed when the slot is CLAIMED (`exit_hook`, `runtime/root`) | `pthread_create` owns the child's entry and stack, so there is nothing to wrap — but every pthread runs its destructors, including threads this runtime never started |
 
 Three consequences worth stating. The Linux ordering is deliberate: the slot is
 released while the child is still in user space, so a joiner that sees the `done`
@@ -648,7 +655,7 @@ child's exit path clears, as that path's last memory access.
 
 `_exit` remains exported, and remains what a thread calls to give its slot back
 *earlier* than its own death — a worker that finishes its Bit loop and then keeps
-running is the case (`runtime/sched.zig`'s pool). Calling it disarms the platform
+running is the case (`runtime/sched`'s pool). Calling it disarms the platform
 hook, so the two can never release one slot twice.
 
 All are plain `callconv(.c)` functions with C linkage names — ordinary
@@ -685,7 +692,7 @@ is incremental/generational collection when pause times matter.
 
 ---
 
-## 9. Program entry, boot, and spawn (`runtime/root.zig`)
+## 9. Program entry, boot, and spawn (`runtime/root`)
 
 ### Process entry
 
@@ -902,7 +909,7 @@ exit-code truncation — Bit does not special-case it).
 
 ---
 
-## 11. Channels (`runtime/chan.zig` + `runtime/root.zig`)
+## 11. Channels (`runtime/chan` + `runtime/root`)
 
 ### The ABI's one channel type
 
@@ -1121,7 +1128,7 @@ other green threads on other workers keep running.
 
 ---
 
-## 15. Maps (`runtime/root.zig`)
+## 15. Maps (`runtime/root`)
 
 `map<K,V>` (SPEC §11.2, §13.5) is a `MapHeader` GC object over three parallel
 `cap`-slot buffers — an open-addressing hash table with linear probing.
@@ -1186,7 +1193,7 @@ by hand is a harmless no-op.
 
 ---
 
-## 17. Math (`runtime/root.zig`)
+## 17. Math (`runtime/root`)
 
 The low-level layer under `std/math`. `floor`/`ceil`/`round`/`trunc`/`sqrt` are
 single instructions on both targets; `pow`/`atan2`/`log`/`log2`/`log10` are the
@@ -1204,7 +1211,7 @@ silently-approximate stand-in.
 
 ---
 
-## 18. Time (`runtime/root.zig` + `runtime/sched.zig`)
+## 18. Time (`runtime/root` + `runtime/sched`)
 
 ```
 bit_rt_time_mono_ns()      -> i64   // monotonic; the only clock that measures elapsed time
@@ -1229,7 +1236,7 @@ finish together, in ~50ms, on one OS thread.
 
 ---
 
-## 19. OS (`runtime/root.zig`)
+## 19. OS (`runtime/root`)
 
 ```
 bit_rt_os_argc()           -> i64
@@ -1370,7 +1377,7 @@ answer somewhere other than the primitive:
 
 ---
 
-## 20. Networking (`runtime/net.zig` + `runtime/root.zig`)
+## 20. Networking (`runtime/net` + `runtime/root`)
 
 The low-level layer under `std/net`/`std/http`. Every socket is `O_NONBLOCK`; an
 operation that would block registers its fd with the netpoller (§11) and parks
@@ -1412,7 +1419,7 @@ bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on f
 
 ---
 
-## 21. Crypto (`runtime/rand.zig` + `runtime/root.zig`)
+## 21. Crypto (`runtime/rand` + `runtime/root`)
 
 The Zig↔Bit boundary primitives that cryptography needs from the runtime but
 that cannot be written in pure Bit — OS entropy and an optimizer-proof wipe.
@@ -1426,7 +1433,7 @@ bit_rt_secure_zero(h)           -> void     // wipe a []byte's element words, un
 **Entropy source is the OS CSPRNG, never a userspace PRNG and never a weak or
 zero fallback.** A weak-entropy result silently returned is worse than a crash,
 so an OS failure is **fatal** (routed through the §12 panic path), never a
-degraded draw. Per platform (`runtime/rand.zig`, raw syscalls for the same
+degraded draw. Per platform (`runtime/rand`, raw syscalls for the same
 reason as `net.zig`):
 
 - **Linux** — `getrandom(buf, len, 0)`: the `/dev/urandom` pool, **blocking**
@@ -1452,7 +1459,7 @@ lingering in memory.
 
 ---
 
-## 21b. Hardware crypto fast paths (`runtime/cpu.zig` + `runtime/cryptohw.zig`, task #1223)
+## 21b. Hardware crypto fast paths (`runtime/cryptohw` + `runtime/cryptohw`, task #1223)
 
 x86-64 AES-NI / PCLMULQDQ / SHA-NI, runtime-CPUID-gated, reached from
 `stdlib/crypto/{aes,gcm,sha256}.bit` through plain `extern function`
@@ -1479,7 +1486,7 @@ bit_rt_crypto_sha256_compress_hw(state: *u32, block: *byte)
 must run on any host CPU of that architecture — unlike Zig's own
 `std.crypto`, which selects its AES-NI/PCLMULQDQ/SHA-NI paths at *compile*
 time from `builtin.cpu.has(...)` (a decision baked into the binary by
-`-mcpu`), `runtime/cpu.zig` probes the actual host via the raw `cpuid` and
+`-mcpu`), `runtime/cryptohw` probes the actual host via the raw `cpuid` and
 `xgetbv` instructions (both baseline x86-64 opcodes, always legal to issue —
 no target-feature gating needed to execute the probe itself) and caches the
 result on first use. `BIT_CRYPTO_NO_HW=1` (or `on`) forces every
