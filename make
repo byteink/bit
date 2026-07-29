@@ -19,6 +19,12 @@
 set -eu
 
 ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)"
+# Every step runs relative to the repo, and the harnesses need ABSOLUTE paths:
+# several generate a wrapper that `cd`s elsewhere before exec'ing, so a relative
+# BIT_BIN or BIT_STDLIB would resolve against the wrong directory.
+cd "${ROOT}"
+BIT_MAKE_ROOT="${ROOT}"
+export BIT_MAKE_ROOT
 CACHE="${ROOT}/zig-out/make"
 DRIVER="${CACHE}/make-driver"
 SRC="${ROOT}/tools/build"
