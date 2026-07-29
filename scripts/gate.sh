@@ -154,7 +154,7 @@ case "${BUCKET}" in
     ZIG_STEPS=(test)
     ;;
   selfhost)
-    ZIG_STEPS=(test-imports)
+    ZIG_STEPS=(test-imports-bit)
     PRE1="scripts/selfhost-diffcheck.sh"
     PRE2="scripts/selfhost-fixpoint.sh"
     # #1857 was a COMPILER bug (`parseFloat` had no hex-float branch) whose only
@@ -179,7 +179,7 @@ case "${BUCKET}" in
     POST1="scripts/selfhost-diffexamples.sh"
     ;;
   stdlib)
-    ZIG_STEPS=(test-imports test-stdlib-docs)
+    ZIG_STEPS=(test-imports-bit test-stdlib-docs)
     ;;
 esac
 
