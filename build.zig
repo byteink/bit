@@ -379,13 +379,21 @@ pub fn build(b: *std.Build) void {
     var libbitrt_record_step: ?*std.Build.Step = null;
 
     // Rebuild-cache gate (#1796): the archive's inputs are `runtime/**/*.bit`
-    // (the module set `g2archive.sh` compiles) and `seed/**` (the compiler that
-    // reads them). Gating on source freshness rather than on how the archive is
-    // assembled is what let this survive G3's rewrite unchanged — it was written
-    // against `runtime/**/*.zig` and needed no edit when the assembly changed.
+    // (the module set `g2archive.sh` compiles) and THE COMPILER THAT READS THEM.
+    // Gating on source freshness rather than on how the archive is assembled is
+    // what let this survive G3's rewrite unchanged — it was written against
+    // `runtime/**/*.zig` and needed no edit when the assembly changed.
     // `build.zig` and `.zigversion` are folded in because a flag or toolchain
     // bump can change the output without touching a single source file.
-    const libbitrt_fp = fingerprintTree(b, &.{ "runtime", "seed" }, &.{ "build.zig", ".zigversion" }, null);
+    //
+    // The compiler input used to be `seed/**`, which #1593 deleted. Its
+    // replacement is NOT nothing: `rt_builder_path` is the pinned stage0, so the
+    // thing that decides which compiler emits this archive is
+    // `dist/stage0/SHA256SUMS`. Leaving it out would mean repinning stage0 does
+    // not rebuild `libbitrt.a`, and the stale archive would keep whatever the
+    // OLD compiler emitted — which is precisely #1857, where stage0 0.1.3's
+    // `parseFloat` zeroed `bit_rt_log`'s polynomial. A pin bump must invalidate.
+    const libbitrt_fp = fingerprintTree(b, &.{"runtime"}, &.{ "build.zig", ".zigversion", "dist/stage0/SHA256SUMS" }, null);
     var libbitrt_artifact_paths: [libbitrt_targets.len][]const u8 = undefined;
     for (libbitrt_targets, 0..) |q, i| {
         const t = q.zigTriple(b.allocator) catch @panic("OOM");
