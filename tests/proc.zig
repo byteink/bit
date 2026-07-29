@@ -37,44 +37,66 @@
 //!
 //! ## The limit
 //!
-//! `default_timeout_s` is deliberately far above anything the corpus does.
-//! Measured on this host (arm64-macOS, 18 logical CPUs, load average ~4, i.e.
-//! already sharing the box with another agent) the slowest single subprocess in
-//! either harness was `tests/stress/quicwire` under `BIT_GC=stress` at 38.3s;
-//! the runner-up was `polloneshotdarwin` at 13.1s and everything else under
-//! 3s. 300s left the worst case a ~7.8x margin. A timeout that fires on a
-//! merely-slow case is worse than no timeout at all — it manufactures a red
-//! that costs someone a day — so the number is chosen against the slowest case
-//! plus contention headroom, not against the average.
+//! `default_timeout_s` is deliberately far above anything the corpus does. A
+//! timeout that fires on a merely-slow case is worse than no timeout at all —
+//! it manufactures a red that costs someone a day — so the number is chosen
+//! against the slowest case plus contention headroom, not against the average.
 //!
-//! ## Those numbers are STALE, and the margin they bought is gone (#1849)
+//! Measured 2026-07-29 on this host (arm64-macOS, 18 logical CPUs, load ~3,
+//! near-idle), with #1849's first fix in:
 //!
-//! Re-measured 2026-07-29 on the same machine while NEARLY IDLE — better
-//! conditions than the baseline above, which explicitly shared the box:
+//!     tests/stress/quicwire           BIT_GC=stress    158s
+//!     tests/stress/polloneshotdarwin  BIT_GC=stress      2s
+//!     everything else                                   <3s
 //!
-//!     quicwire           BIT_GC=stress    38.3s -> 161s   (4.2x)
-//!     polloneshotdarwin  BIT_GC=stress    13.1s -> 123s   (9.4x)
+//! 900s leaves the worst case a ~5.7x margin.
 //!
-//! Both still produce byte-correct output and exit 0; this is throughput, not
-//! correctness. It reproduces identically on a seed-built binary, so it is not
-//! self-hosted codegen — it is the runtime, and the prime suspect is the G3
-//! archive swap that made `libbitrt.a` all-Bit. Tracked as #1849.
+//! ## Where those numbers came from, and why 38.3s/13.1s are gone (#1849)
 //!
-//! At 161s the 300s deadline was a 1.9x margin, so ordinary suite parallelism
-//! pushed the slowest program past it and `zig build test` went
-//! nondeterministically red — a DIFFERENT program on each of two consecutive
-//! runs, which is the signature of an eroded margin rather than of a hang.
-//! Worse, the harness then prints "This is a HANG, not an output mismatch" for
-//! a program that completes correctly in 123s, sending the reader after a
-//! deadlock that does not exist.
+//! An earlier version of this header recorded 38.3s for `quicwire` and 13.1s
+//! for `polloneshotdarwin` and sized the deadline at 300s. Both figures went
+//! stale, for DIFFERENT reasons, and only one of them was a regression. The
+//! difference matters: at 161s against a 300s deadline the margin was 1.9x, so
+//! ordinary suite parallelism tipped the slowest program over and `zig build
+//! test` went nondeterministically red — a different program each run — while
+//! the harness printed "This is a HANG, not an output mismatch" for a program
+//! that finished correctly. Anyone who believed that message went hunting a
+//! deadlock that did not exist.
 //!
-//! 900s is a STOPGAP, not a new baseline: it restores roughly the documented
-//! margin against the CURRENT (regressed) worst case so the suite is
-//! deterministic again while #1849 is open. It costs a real hang 900s instead
-//! of 300s before it is reported, which is the price of not manufacturing reds.
-//! **#1849 must restore the old runtimes and put this back to 300s** — its
-//! acceptance says so. Raising this number is not a fix and must not be treated
-//! as one.
+//! `polloneshotdarwin` was never slow. It proves a NEGATIVE — that a one-shot
+//! poller registration is not re-reported — by giving the failure a bounded
+//! amount of opportunity, and it denominated that bound in IDLE SCHEDULER
+//! PASSES (`idleGiveUp = 200000`). f81d768 (#1649) gave `spinBackoff` a
+//! monotonic-clock ceiling instead of an instruction count, so a saturated idle
+//! pass went from microseconds to `parkMaxBackoffNs` — 1ms — and the same
+//! 200,000 passes became 200 seconds of deliberate waiting. The 13.1s here was
+//! measured on a tree that predates #1649 (`git merge-base --is-ancestor
+//! f81d768 8e8cd5e` says NO), i.e. against a scheduler that under-waited.
+//! 791b826 re-bounds the give-up in wall clock, which is what it always meant:
+//! 122s -> 2s, byte-identical output, mutant still killed.
+//!
+//! `quicwire` really did get 4.4x slower, and it is NOT a defect. Same program,
+//! same host, same load, `BIT_GC=stress`:
+//!
+//!     collector from libbitrt.a at 8e8cd5e  (Zig, LLVM -O2)     36s
+//!     collector from libbitrt.a today       (Bit, built by bit) 158s
+//!
+//! Under `BIT_GC=off` both run in ~0-1s, so the user program's codegen is
+//! equivalent and the entire delta is the collector. The port is faithful: the
+//! 3dc87a3 membership index is present and enabled, `gcShouldCollect` matches
+//! `shouldCollect` exactly, and mark/sweep are the same traversal in the same
+//! order. What changed is that the collector's machine code stopped coming from
+//! an optimising backend — `bit` emits `header + 32` as four instructions
+//! (`mov x9,#0x20 / mov x21,x9 / add x9,x20,x21 / mov x22,x9`), with no copy
+//! propagation and no constant folding. That is a backend gap, not a runtime
+//! bug, and 158s stands until it closes.
+//!
+//! Tried and REFUTED, so nobody re-chases it: `runtime/gc/mem.bit` sorts last
+//! among its siblings, so per #1511 its `wordAt`/`byteAt` can never be inlined
+//! into a `gc*.bit` caller — `objdump -r runtime_gc.o` showed 36 branch
+//! relocations to them, i.e. every memory access in the collector was a call.
+//! Sorting the file first removed every one of those calls and moved the
+//! runtime from 158s to 162s.
 //!
 //! Override with `BIT_TEST_TIMEOUT_S` when a host is slower still, or set it to
 //! `0` to disable the deadline entirely and restore the old block-forever
@@ -85,8 +107,7 @@ const std = @import("std");
 const Io = std.Io;
 
 /// Wall-clock seconds allowed to any one spawned subprocess. See the header for
-/// how this number was chosen — and note it is currently a STOPGAP for #1849,
-/// to go back to 300 when that regression is fixed.
+/// how this number was chosen and what the corpus's measured worst case is.
 pub const default_timeout_s: u32 = 900;
 
 /// Environment variable that overrides `default_timeout_s`. `0` disables the
