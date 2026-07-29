@@ -29,10 +29,17 @@ fn addNamedRun(b: *std.Build, run: *std.Build.Step.Run, name: []const u8, desc: 
 /// (sources, fixtures, docs) at RUN time, so Zig's build cache cannot see an
 /// edit to them; without it a regression is cache-skipped into a false pass,
 /// which is the exact failure the old fmt_check harness was marked against.
+/// `archive_installs` is every `libbitrt.a` install step. A gate that names a
+/// `zig-out/lib/<triple>/` path in an env var reads it off disk at run time, so
+/// the edge has to land on this RUN — putting it on `test_step` would let the
+/// runner install and read concurrently (#1229). Passing them all is deliberate:
+/// an over-wired gate costs one ordering edge, an under-wired one reads a
+/// half-written archive.
 fn addBitGate(
     b: *std.Build,
     bit_exe: std.Build.LazyPath,
     test_step: *std.Build.Step,
+    archive_installs: []const *std.Build.Step,
     name: []const u8,
     src: []const u8,
     env: []const [2][]const u8,
@@ -42,6 +49,7 @@ fn addBitGate(
     run.addFileArg(bit_exe);
     run.addArg("run");
     run.addFileArg(b.path(src));
+    for (archive_installs) |st| run.step.dependOn(st);
     for (env) |kv| run.setEnvironmentVariable(kv[0], kv[1]);
     run.has_side_effects = true;
     run.expectExitCode(0);
@@ -227,439 +235,55 @@ pub fn build(b: *std.Build) void {
     // cutting that same compile to <1s. Pass `-Doptimize=Debug` for leak checks.
     // (standardOptimizeOption's preferred_optimize_mode only rebinds -Drelease and
     // still defaults to Debug, so bind -Doptimize directly with a ReleaseSafe default.)
-    const optimize = b.option(
+    // `-Doptimize` is still ACCEPTED but no longer applies to anything: it set the
+    // optimize mode of the Zig artifacts, and after #1593 the build compiles no
+    // Zig at all. Kept rather than removed so an existing invocation that passes
+    // it keeps working instead of dying on an unknown option; discarded rather
+    // than silently honoured so nobody reads this as still tuning a build.
+    _ = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
-    ) orelse .ReleaseSafe;
+        "Accepted for compatibility; no longer applies (the build compiles no Zig)",
+    );
 
     // The seed compiler, now retired to `seed/` and installed as `bit-seed`: a
     // bootstrap-only artifact that compiles the self-hosted `bit` (below) and
     // serves as the differential oracle. The canonical `bit` is the self-hosted
     // compiler under `compiler/`.
-    const exe = b.addExecutable(.{
-        .name = "bit-seed",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("seed/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    // The seed's own version string, parsed out of compiler/version.bit above so
-    // `bit-seed version` and `bit version` print the same bytes (#1451).
-    const seed_opts = b.addOptions();
-    seed_opts.addOption([]const u8, "version", version);
-    exe.root_module.addOptions("build_options", seed_opts);
-
-    const seed_install = b.addInstallArtifact(exe, .{});
-    b.getInstallStep().dependOn(&seed_install.step);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Build and run bit");
-    run_step.dependOn(&run_cmd.step);
-
-    const unit_tests = b.addTest(.{ .root_module = exe.root_module });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
 
-    // Test RUN steps that read a runtime archive straight out of
-    // `zig-out/lib/<triple>/` instead of taking it as a build option (#1486).
-    // Those are the seed's own roots — `main.zig`'s E0078/`archiveDefines`
-    // tests, `link.zig`, `link/elf_reader.zig`, `link/macho*.zig` — and they
-    // name the path as a cwd-relative string, so no `addOptionPath` edge exists
-    // to keep what they read fresh. Collected here and wired to every
-    // `libbitrt` install at the tail, once those installs are declared.
+    // Run steps that read a runtime archive straight out of `zig-out/lib/<triple>/`
+    // instead of taking it as a build option (#1486). They name the path as a
+    // plain string, so no `addOptionPath` edge exists to keep what they read fresh.
+    // Every `libbitrt` install lands in this list as it is declared, and
+    // `addBitGate` hangs each gate's RUN step off all of them.
     //
-    // The edge has to land on the RUN step, not on `test_step`: `test_step`
+    // THE EDGE HAS TO LAND ON THE RUN STEP, NOT ON `test_step`. `test_step`
     // depending on an install only puts both in the same graph, and the build
-    // runner is free to run them concurrently — the harness then reads the
-    // archive mid-install. That is the #1229 shape, and it is why the old
-    // `test_step.dependOn(host_libbitrt_install)` was not enough.
-    var archive_readers: std.ArrayList(*std.Build.Step) = .empty;
-    archive_readers.append(b.allocator, &run_unit_tests.step) catch @panic("OOM");
-
-    // Every `seed/` and `runtime/` unit-test root, declared once.
+    // runner is free to run them concurrently — the harness then reads the archive
+    // mid-install. That is the #1229 shape, and it is why the old
+    // `test_step.dependOn(host_libbitrt_install)` was not enough. The list used to
+    // hold the seed's own Zig test roots; it now holds the Bit gates, which read
+    // the same files for the same reason (#1593).
+    var libbitrt_readers: std.ArrayList(*std.Build.Step) = .empty;
+    // The seed-coupled Zig harnesses are GONE (#1593), all nine of them: they
+    // formed one connected component rooted in the seed and nothing survives it.
     //
-    // Single-sourced deliberately. `tests/testroots.zig` measures which test
-    // namespaces each of these roots actually collects, and fails the build if a
-    // test-bearing file under `seed/` or `runtime/` is collected by none of
-    // them. That gate is only as good as its idea of what the roots are, so the
-    // list it reads and the list `zig build test` runs have to be the same list
-    // — a hand-kept second copy sitting next to the real entries is precisely
-    // the kind of thing that looks authoritative and silently drifts. Adding a
-    // root here wires it and tells the gate about it in one edit.
-    const TestRoot = struct {
-        path: []const u8,
-        /// Restricts execution to test names starting with one of these.
-        /// Empty runs everything the root collects.
-        filters: []const []const u8 = &.{},
-        /// `runtime/shims.zig` `@compileError`s off Linux (see its module doc
-        /// comment), so it can't even be built for another host. Gated on the
-        /// resolved target rather than skipped at runtime, and dropped from the
-        /// gate's root set too so the two never disagree about what ran.
-        linux_only: bool = false,
-        /// Wired above rather than by the loop: the `main.zig` root reuses the
-        /// compiler's own module. Listed here so the gate still sees it.
-        wired_above: bool = false,
-    };
-    const test_roots = [_]TestRoot{
-        .{ .path = "seed/main.zig", .wired_above = true },
-
-        // No runtime/*.zig entries remain (#1854). `alloc.zig` and `gc.zig` were
-        // the last two, and they were roots only because `gc.zig` was
-        // tests/gcdiff.zig's differential oracle. #1849 consumed that oracle and
-        // recorded its numbers; #1851 recreates it from history rather than from
-        // the working tree, so all three files and the gate went together.
-
-        .{ .path = "seed/diagnostics.zig" },
-        .{ .path = "seed/lexer.zig" },
-        .{ .path = "seed/ast.zig" },
-        .{ .path = "seed/parser.zig" },
-        .{ .path = "seed/resolve.zig" },
-        .{ .path = "seed/fmt.zig" },
-        .{ .path = "seed/regalloc.zig" },
-        .{ .path = "seed/obj/elf.zig" },
-        .{ .path = "seed/opt.zig" },
-
-        // §17.6 module-scoped emission. Needs its own entry like every other
-        // file here: `unit_tests` is rooted at `main.zig`, and a test in a file
-        // that root merely imports is not necessarily collected — a test added
-        // to `emit.zig` without this could silently never run.
-        .{ .path = "seed/emit.zig" },
-
-        // Rooted at `seed/` (not `seed/codegen/`) via anchor files, so
-        // `arm64.zig`/`x64.zig`/`common.zig`'s `../ir.zig`-style imports
-        // resolve — a module rooted at `seed/codegen/` would have them escape
-        // its root, which Zig rejects. `compileFunction`'s native-execution
-        // tests self-skip off x86-64 Linux (see `x64.zig`'s `can_exec_native`),
-        // so both are safe to run on every CI host.
-        .{ .path = "seed/codegen_arm64_test.zig" },
-        .{ .path = "seed/codegen_x64_test.zig" },
-
-        // `obj/pe.zig` has no imports outside `std`, but `main.zig` doesn't
-        // import it either, so it still needs its own root to be collected.
-        .{ .path = "seed/obj_pe_test.zig" },
-
-        // The Windows PE/COFF object reader + executable linker (task #1103).
-        // Same anchor reason as `link_macho_test.zig`: `main.zig` does not
-        // import either file yet, and `pe_reader.zig`'s own `../obj/pe.zig`
-        // import needs a module rooted at `seed/`, not `seed/link/`.
-        .{ .path = "seed/link_pe_test.zig" },
-
-        // The ELF linker driver, which imports the whole `link/` package
-        // (object/archive/elf_reader/strip) plus `obj/elf.zig`, so their tests
-        // come along. The end-to-end tests (link a real object against
-        // `libbitrt.a` and run it) self-skip when `zig build libbitrt` hasn't
-        // populated `zig-out/lib/`, or off x86-64 Linux where the ELF can't run.
-        .{ .path = "seed/link.zig" },
-
-        // The Mach-O linker driver needs its OWN entry: `link.zig` is the ELF
-        // driver and never imports `link/macho.zig`. Between that and the
-        // main.zig root not collecting it, this file's tests — including the
-        // end-to-end "boots on macOS" one — had never run at all (#1445).
-        // Anchored at `seed/` so `../obj/macho.zig` resolves.
-        .{ .path = "seed/link_macho_test.zig" },
-
-        // Standalone object writer (task #343): no imports outside `std`. Its
-        // `otool`/`clang`/`ld` cross-validation tests self-skip off non-macOS
-        // hosts (those tools don't exist there), so this is safe everywhere.
-        .{ .path = "seed/obj/macho.zig" },
-
-        // The lowering pass and the language server. Both fell through every
-        // other root — 23 tests that had never executed (#1453), 14 of them
-        // covering `lower.zig`, one of the largest modules in the seed.
-        //
-        // Filtered to those two namespaces on purpose. The anchor's module
-        // collects 100+ tests, but all but 23 are `lexer`/`parser`/`resolve`/
-        // `check`/`fmt`/`ir` tests already running under their own entries;
-        // unfiltered, this one root would add ~160 duplicate executions to an
-        // already-slow suite. If the filter ever stops matching — a rename, say
-        // — the gate reports `lower`/`lsp` as orphaned rather than going quiet.
-        .{ .path = "seed/lower_lsp_test.zig", .filters = &.{ "lower.test.", "lsp.test." } },
-    };
-
-    // The subset that applies to this host, shared by the loop below and the
-    // gate, so neither can believe a root ran that the other skipped.
-    var applicable_roots: std.ArrayList([]const u8) = .empty;
-    defer applicable_roots.deinit(b.allocator);
-    // Filters, newline-joined per root and positionally aligned with
-    // `applicable_roots` (empty string = unfiltered). The gate has to model the
-    // filter, not just the root: a filter that stops matching leaves an entry
-    // that builds fine and runs zero tests, which is the same vacuous guard
-    // this task was opened to remove.
-    var applicable_filters: std.ArrayList([]const u8) = .empty;
-    defer applicable_filters.deinit(b.allocator);
-
-    for (test_roots) |r| {
-        if (r.linux_only and target.result.os.tag != .linux) continue;
-        applicable_roots.append(b.allocator, r.path) catch @panic("OOM");
-        applicable_filters.append(
-            b.allocator,
-            std.mem.join(b.allocator, "\n", r.filters) catch @panic("OOM"),
-        ) catch @panic("OOM");
-        if (r.wired_above) continue;
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(r.path),
-                .target = target,
-                .optimize = optimize,
-            }),
-            .filters = r.filters,
-        });
-        const t_run = b.addRunArtifact(t);
-        archive_readers.append(b.allocator, &t_run.step) catch @panic("OOM");
-        test_step.dependOn(&t_run.step);
-    }
-
-    // Orphaned-test-file gate (#1453): fails the build when a `.zig` file under
-    // `seed/` or `runtime/` contains tests that no wired root collects. Both
-    // #1445 and #1453 were exactly that, and both had shipped for months
-    // reading as coverage. Reachability is MEASURED, never derived from the
-    // import graph — see tests/testroots.zig and tests/list_test_runner.zig.
-    const testroots_opts = b.addOptions();
-    testroots_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
-    // The seed's generated `build_options.zig`, so the gate can hand each root
-    // the same module `build.zig` gives the compiler (#1451).
-    testroots_opts.addOptionPath("build_options_zig", seed_opts.getOutput());
-    testroots_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
-    // The gate spawns `zig test` itself. A test runner's environment need not
-    // carry HOME, and without it the child cannot resolve its own cache
-    // directory (`AppDataDirUnavailable`), so hand it both roots explicitly
-    // rather than depending on inherited environment.
-    testroots_opts.addOption([]const u8, "global_cache_root", b.graph.global_cache_root.path orelse ".");
-    testroots_opts.addOption([]const u8, "local_cache_root", b.cache_root.path orelse ".");
-    testroots_opts.addOption([]const []const u8, "roots", applicable_roots.items);
-    testroots_opts.addOption([]const []const u8, "root_filters", applicable_filters.items);
-    testroots_opts.addOption([]const u8, "host_os", @tagName(target.result.os.tag));
-    testroots_opts.addOptionPath("list_runner", b.path("tests/list_test_runner.zig"));
-
-    const testroots_mod = b.createModule(.{
-        .root_source_file = b.path("tests/testroots.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    testroots_mod.addOptions("build_options", testroots_opts);
-
-    const testroots_tests = b.addTest(.{ .root_module = testroots_mod });
-    const testroots_run = b.addRunArtifact(testroots_tests);
-    // Spawns `zig test` per root, so its result depends on the state of the
-    // source tree rather than on its own inputs alone — same reason rootpins
-    // below opts out of the build cache.
-    testroots_run.has_side_effects = true;
-    test_step.dependOn(&testroots_run.step);
-    b.step("testroots", "Orphaned-test-file gate (tests/testroots.zig)").dependOn(&testroots_run.step);
-
-    // Golden corpus is now tests/bit/golden.bit (#1591), wired at the tail. It
-    // drives the SHIPPED compiler; tests/harness.zig ran every `// error` case
-    // through the seed in-process, so the binary that ships had no golden
-    // diagnostics coverage at all.
-
-    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
-
-    // Examples guard is now tests/bit/examplesgate.bit — see the Bit gates at the tail.
-
-    // Runtime-pin cycle gate (#1367) is now tests/bit/rootpins.bit, wired at
-    // the tail. See its header for the self-reference rule it enforces.
-
-    // Runtime-ABI gates (#1674) are now tests/bit/rootabi.bit (register class)
-    // and tests/bit/abimembers.bit (ABI membership), wired at the tail. Both
-    // moved their oracle off runtime/root.zig onto the compiler's own RtFn
-    // emission, which survives the seed.
-
-    // Stop-the-world wiring gate (#1639) is now tests/bit/stwwiring.bit,
-    // wired at the tail. See its header for the 15 edges it checks.
-
-    // Import-set differential (#1436): the two compilers must emit the same
-    // UNDEFINED symbols for the same source. `extern function close` built clean
-    // under both and SIGSEGV'd under self-hosted `bit` only, because its
-    // lowering dispatched builtins on the callee's SOURCE TEXT and sent the call
-    // to `bit_rt_chan_close` — so the `_close` import simply disappeared. No
-    // dump differential can see that (the AST and types are identical), and the
-    // golden corpus could not either, because nothing in it used `extern` in
-    // that shape. See tests/diffimports.zig's header.
-    const diffimports_opts = b.addOptions();
-    diffimports_opts.addOption([]const u8, "repo_root", b.pathFromRoot("."));
-    diffimports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-
-    const diffimports_mod = b.createModule(.{
-        .root_source_file = b.path("tests/diffimports.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    diffimports_mod.addImport("bit", exe.root_module);
-    diffimports_mod.addOptions("build_options", diffimports_opts);
-
-    const diffimports_tests = b.addTest(.{ .root_module = diffimports_mod });
-    const diffimports_run = b.addRunArtifact(diffimports_tests);
-    // The fixtures are .bit files read at run time, so an edit to one is
-    // invisible to the build cache — same reason as rootpins above.
-    diffimports_run.has_side_effects = true;
-    // `selfhost_bit` is wired in at the tail, next to the artifact it names.
+    //   ast_tags/imports/diffimports/version  linked the seed as a library
+    //   selfbin, proc                          helpers for exactly those four
+    //   testroots, list_test_runner            swept seed/ and runtime/ for
+    //                                          orphaned Zig tests; runtime/ lost
+    //                                          its last .zig in #1854, so after
+    //                                          seed/ there is nothing to sweep
+    //   stdstream_check                        gated how Zig SOURCE used Zig's
+    //                                          std; there is no Zig source left
     //
-    // Now WIRED (#1436 fixed). It was committed unwired because it was red while
-    // the defect was present — self-hosted `lowerCall`/`checkCall`/`vCall` tested
-    // the predeclared builtins against the callee's SOURCE TEXT before consulting
-    // the resolved declaration, so a user `extern function close` lowered to
-    // `bit_rt_chan_close`. All four sites now use the seed's precedence (local
-    // binding > user declaration > builtin), and the gate is green.
-    b.step("diffimports", "Import-set differential gate (tests/diffimports.zig)").dependOn(&diffimports_run.step);
-    test_step.dependOn(&diffimports_run.step);
-
-    // Format gate for the Zig sources. A formatter nothing enforces is a
-    // suggestion: six files had already drifted before this landed. `--check`
-    // (never a rewrite) is the point — a gate that reformatted its own checkout
-    // would report success and enforce nothing.
-    //
-    // The Bit sources are NOT gated yet. `bit fmt` and the committed .bit tree
-    // disagree on 73 of 122 files, and the disagreements are formatter bugs, not
-    // drift (it explodes hand-grouped constant tables to one element per line,
-    // and mangles a body whose single statement is a multi-line `match`).
-    // Gating that would enshrine bad output. See the tracking task.
-    const fmt_check = b.addFmt(.{
-        .paths = &.{ "build.zig", "seed", "runtime", "tests" },
-        .check = true,
-    });
-    test_step.dependOn(&fmt_check.step);
-
-    // Concurrency + GC stress suite (task #350): compiles + runs each
-    // tests/stress/* program twice — default policy and BIT_GC=stress (collect
-    // every safepoint) — and diffs stdout against its `.expected`. The
-    // production-readiness gate for spawn/channels/select/GC under load. Shares
-    // the host libbitrt archive wired in at the tail.
-    // tests/stress.zig is RETIRED (#1591) and the GC differential with it
-    // (#1854): the harness is tests/bit/stress.bit, wired at the tail, and it
-    // carries its own paths. `stress_opts` outlived tests/stress.zig only
-    // because tests/gcdiff.zig read the same stress_dir/stdlib_dir; with
-    // gcdiff and runtime/gc.zig gone, nothing consumes it.
-    //
-    // What the differential did, so the loss is on the record: it drove
-    // runtime/gc.zig through the same 600-step script tests/stress/gcbit drives
-    // runtime/gc/gc.bit through, and asserted both rendered the same table
-    // against tests/stress/gcbit/gcbit.expected. That golden is still enforced
-    // — tests/bit/stress.bit diffs gcbit against it twice per run — but it now
-    // has one witness instead of two, like every other .expected here.
-
-    // `bit version` (#1451): both compilers must report the stamped version, and
-    // a typo'd subcommand must be a usage error rather than the banner it used
-    // to fall through to. `selfhost_bit` is wired in at the tail, next to the
-    // artifact it names.
-    const version_opts = b.addOptions();
-    version_opts.addOption([]const u8, "expected_version", version);
-    version_opts.addOptionPath("seed_bit", exe.getEmittedBin());
-    const version_mod = b.createModule(.{
-        .root_source_file = b.path("tests/version.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    version_mod.addOptions("build_options", version_opts);
-    const version_tests = b.addTest(.{ .root_module = version_mod });
-    const version_run = b.addRunArtifact(version_tests);
-    test_step.dependOn(&version_run.step);
-    addNamedRun(b, version_run, "test-version", "run the `bit version` contract (tests/version.zig) only");
-
-    // Doc gate is now tests/bit/docs.bit, wired at the tail.
-
-    // Stdlib doc coverage (#356) is now tests/bit/stdlibdocs.bit — see the Bit
-    // gates at the tail.
-
-    // AST tag-set parity (#1420): seed and selfhost must declare the same node
-    // tags, each parser-reachable. #1418's `ParamRest` false positive — selfhost
-    // refusing a construct the seed accepts — was invisible to every existing
-    // differential because no corpus file used it. A NAME comparison only; see
-    // the file header for what it deliberately does not prove. Front end only.
-    const ast_tags_opts = b.addOptions();
-    ast_tags_opts.addOption([]const u8, "selfhost_ast", b.pathFromRoot("compiler/ast.bit"));
-    // The parser is spread over `compiler/parser*.bit` siblings (#1503), which are
-    // one module. Pass the directory and let the test concatenate them: naming a
-    // single file here made the gate silently vacuous the moment parser.bit was
-    // split — every tag read as unreachable because the scanned file no longer
-    // held the parsing code.
-    ast_tags_opts.addOption([]const u8, "selfhost_dir", b.pathFromRoot("compiler"));
-    ast_tags_opts.addOption([]const u8, "seed_parser", b.pathFromRoot("seed/parser.zig"));
-
-    const ast_tags_mod = b.createModule(.{
-        .root_source_file = b.path("tests/ast_tags.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ast_tags_mod.addImport("bit", exe.root_module);
-    ast_tags_mod.addOptions("build_options", ast_tags_opts);
-
-    const ast_tags_tests = b.addTest(.{ .root_module = ast_tags_mod });
-    const ast_tags_run = b.addRunArtifact(ast_tags_tests);
-    // The three sources are read at RUNTIME, so edits to them are invisible to
-    // the build cache; without this a stale pass survives a tag being removed —
-    // a gate that cannot fail is worse than no gate.
-    ast_tags_run.has_side_effects = true;
-    test_step.dependOn(&ast_tags_run.step);
-
-    // Scoped runner, same precedent as `test-stress` / `test-imports`.
-    const ast_tags_step = b.step("test-ast-tags", "run the AST tag-set parity gate only");
-    ast_tags_step.dependOn(&ast_tags_run.step);
-
-    // Format gate (#1266) moved to the shipped CLI (#1848) — see `fmt_gate`
-    // down beside `selfhost_selfcheck`, which is where `selfhosted` is in scope.
-
-    // Std-stream writer gate: `.init(.stderr())` builds a POSITIONAL handle that
-    // pwrites from offset 0, so a second writer on the same fd overwrites the
-    // first. Invisible on a tty or pipe, corrupts every diagnostic under a
-    // redirect — a static gate is the only thing that catches it.
-    const stdstream_opts = b.addOptions();
-    stdstream_opts.addOption([]const u8, "compiler_dir", b.pathFromRoot("seed"));
-    stdstream_opts.addOption([]const u8, "tests_dir", b.pathFromRoot("tests"));
-    stdstream_opts.addOption([]const u8, "runtime_dir", b.pathFromRoot("runtime"));
-    const stdstream_mod = b.createModule(.{
-        .root_source_file = b.path("tests/stdstream_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    stdstream_mod.addOptions("build_options", stdstream_opts);
-
-    const stdstream_run = b.addRunArtifact(b.addTest(.{ .root_module = stdstream_mod }));
-    // Sources are read at runtime, invisible to the build cache (as above).
-    stdstream_run.has_side_effects = true;
-    test_step.dependOn(&stdstream_run.step);
-    addNamedRun(b, stdstream_run, "test-stdstream", "run the std-stream positional-writer gate (tests/stdstream_check.zig) only");
-
-    // Multi-module imports + prelude guard (#1153): builds + runs each
-    // tests/imports/* program through the whole-project pipeline (relative and
-    // std/* imports, auto-imported prelude) and diffs stdout. `stdlib_dir` is
-    // where `std/*` resolves; `imports_dir` holds the programs.
-    const imports_filter = b.option([]const u8, "imports-filter", "run only the named tests/imports/* project") orelse "";
-    const imports_opts = b.addOptions();
-    imports_opts.addOption([]const u8, "imports_dir", b.pathFromRoot("tests/imports"));
-    imports_opts.addOption([]const u8, "stdlib_dir", b.pathFromRoot("stdlib"));
-    imports_opts.addOption([]const u8, "imports_filter", imports_filter);
-    // The checked-in set of projects the self-hosted `bit` is allowed to fail on
-    // (#1484). Gating on the SET, not a count, so a gap closing while another
-    // opens cannot cancel out — same contract as tests/selfhost-ir-gaps.txt.
-    imports_opts.addOption([]const u8, "selfhost_gaps", b.pathFromRoot("tests/selfhost-imports-gaps.txt"));
-
-    const imports_mod = b.createModule(.{
-        .root_source_file = b.path("tests/imports.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    imports_mod.addImport("bit", exe.root_module);
-    imports_mod.addOptions("build_options", imports_opts);
-
-    const imports_tests = b.addTest(.{ .root_module = imports_mod });
-    const imports_run = b.addRunArtifact(imports_tests);
-    // The `tests/imports/*` projects and `stdlib/*` sources are read at runtime,
-    // so a new KAT dir or an edited stdlib file is invisible to the build cache;
-    // without this the run is cache-skipped and new tests silently never execute.
-    imports_run.has_side_effects = true;
-    test_step.dependOn(&imports_run.step);
-
-    // Scoped runner: `zig build test-imports` runs only the imports harness
-    // (the always-rerun, largest chunk of `zig build test`); add
-    // `-Dimports-filter=<name>` to gate a single KAT in seconds during a
-    // per-task edit loop, without the 200+ golden/example/unit runs.
-    const test_imports_step = b.step("test-imports", "run the tests/imports/* harness only (see -Dimports-filter)");
-    test_imports_step.dependOn(&imports_run.step);
+    // What each asserted that still needs asserting is covered on the Bit side:
+    // `test-imports-bit` runs the same 96 projects (96/96 OK) and
+    // `test-version-cli` (tests/bit/version.bit) holds the CLI contract. What is
+    // NOT replaced is the seed-vs-bit half of ast_tags and diffimports — those
+    // compared two independent implementations, and after #1593 there is only
+    // one. docs/release/bootstrap.md §5 records that as the accepted loss.
 
     // The Bit port of the above, tests/bit/importsrun.bit, is wired at the tail
     // as `test-imports-bit` and is deliberately NOT on `test_step`: it covers
@@ -809,12 +433,18 @@ pub fn build(b: *std.Build) void {
             libbitrt_step.dependOn(&install.step);
             // Make `zig build test` produce every archive its harnesses read out of
             // `zig-out/lib/`, not just the host's (#1486). Before this only the host
-            // archive was installed under `test`, so the seed's cross-target tests
-            // read whatever an earlier `zig build libbitrt` happened to leave on
-            // disk: absent on a clean checkout (they self-skip, asserting nothing)
-            // or stale after a runtime edit (they fail, and the failure reads as a
+            // archive was installed under `test`, so cross-target tests read
+            // whatever an earlier `zig build libbitrt` happened to leave on disk:
+            // absent on a clean checkout (they self-skip, asserting nothing) or
+            // stale after a runtime edit (they fail, and the failure reads as a
             // compiler regression).
-            for (archive_readers.items) |reader| reader.dependOn(&install.step);
+            //
+            // The list used to hold the seed's Zig test roots; those died with the
+            // seed (#1593) and the Bit gates took their place, reading the same
+            // files the same way. Still per-RUN, never on `test_step` — see the
+            // declaration of `libbitrt_readers` for why that distinction is load
+            // bearing (#1229).
+            libbitrt_readers.append(b.allocator, &install.step) catch @panic("OOM");
 
             libbitrt_installs[install_idx] = &install.step;
             if (query.cpu_arch == target.result.cpu.arch and query.os_tag == target.result.os.tag) {
@@ -841,14 +471,10 @@ pub fn build(b: *std.Build) void {
     // compile was cached the harness could run before the install refreshed
     // `zig-out`, linking a stale, ABI-mismatched runtime whose malformed binary
     // the kernel then killed by signal (#1229).
-    wireLibbitrt(imports_opts, host_libbitrt_bin);
-    // #1445's link-acceptance half needs a real archive: the import-set half
-    // only emits objects and never links.
-    wireLibbitrt(diffimports_opts, host_libbitrt_bin);
 
     // The CLI-path end-to-end tests (link.zig, main.zig, link/elf_reader.zig,
     // link/macho*.zig) that read `zig-out/lib/<triple>/` are now ordered after
-    // EVERY archive install by the `archive_readers` loop above, which both
+    // EVERY archive install via `libbitrt_readers`, which both
     // keeps them from self-skipping and keeps them from reading a stale archive
     // (#1486). It replaces a bare `test_step.dependOn(host_libbitrt_install)`,
     // which named only the host archive and left the install unordered against
@@ -994,18 +620,11 @@ pub fn build(b: *std.Build) void {
     // with no environment set — the property every installer depends on.
     // `selfhost_bit` is wired in at the tail, next to the artifact it names.
 
-    if (native) {
-        // #1484: the imports harness drove the SEED only, so #1483 (an entire
-        // stdlib module the self-hosted `bit` could not lower) stayed green
-        // through every `zig build test` while tests/imports/quicconn built it.
-        imports_opts.addOptionPath("selfhost_bit", selfhosted);
-        diffimports_opts.addOptionPath("selfhost_bit", selfhosted);
-        version_opts.addOptionPath("selfhost_bit", selfhosted);
-    } else {
-        imports_opts.addOption([]const u8, "selfhost_bit", "");
-        diffimports_opts.addOption([]const u8, "selfhost_bit", "");
-        version_opts.addOption([]const u8, "selfhost_bit", "");
-    }
+    // The `selfhost_bit` wiring that stood here fed tests/{imports,diffimports,
+    // version}.zig, all three of which died with the seed (#1593). Their
+    // surviving coverage is `test-imports-bit` (the same 96 projects) and
+    // `test-version-cli`, both of which take the compiler as a LazyPath through
+    // `addBitGate` and so need no separate plumbing.
 
     // Gate the self-host: `zig build test` (and the x86_64 gate) builds the
     // self-hosted `bit` from the current compiler/ sources and runs
@@ -1064,14 +683,14 @@ pub fn build(b: *std.Build) void {
     // interpreter running the check, so both sides need it in scope.
     const stdlib_root = b.pathFromRoot("stdlib");
 
-    const osenv_gate = addBitGate(b, selfhosted, test_step, "osenv", "tests/bit/osenv.bit", &.{
+    const osenv_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "osenv", "tests/bit/osenv.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the std/os args+environment round-trip (tests/bit/osenv.bit) only");
     // It compiles and execs a fixture, so it needs a host libbitrt on disk;
     // without the dependency a stale archive gets linked (#1229).
     if (host_libbitrt_install) |inst| osenv_gate.step.dependOn(inst);
 
-    _ = addBitGate(b, selfhosted, test_step, "stdlib-docs", "tests/bit/stdlibdocs.bit", &.{
+    _ = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "stdlib-docs", "tests/bit/stdlibdocs.bit", &.{
         .{ "BIT_DOCS_ROOT", b.pathFromRoot(".") },
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the stdlib doc-coverage gate (tests/bit/stdlibdocs.bit) only");
@@ -1079,13 +698,13 @@ pub fn build(b: *std.Build) void {
     // "version-cli", not "version": tests/version.zig still owns `test-version`
     // for its seed-vs-selfhost parity half, which dies with seed/ (#1593) rather
     // than being ported. The two names coexist until then.
-    _ = addBitGate(b, selfhosted, test_step, "version-cli", "tests/bit/version.bit", &.{
+    _ = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "version-cli", "tests/bit/version.bit", &.{
         .{ "BIT_REPO", b.build_root.path.? },
     }, "run the `bit version` CLI contract (tests/bit/version.bit) only");
 
     // `bit lint` is selfhost-only, so the harness drives the same binary that
     // interprets it — BIT_SELF_EXE is that path, not argv[0].
-    const lint_gate = addBitGate(b, selfhosted, test_step, "lint", "tests/bit/lintcmd.bit", &.{
+    const lint_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "lint", "tests/bit/lintcmd.bit", &.{
         .{ "BIT_SELF_EXE", selfhost_artifact_path },
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the `bit lint` CLI contract (tests/bit/lintcmd.bit) only");
@@ -1094,18 +713,18 @@ pub fn build(b: *std.Build) void {
     // SIGSEGVs with empty stderr (#1644). Same reason as the stress gate.
     if (selfhost_install_step) |inst| lint_gate.step.dependOn(inst);
 
-    const pathresolve_gate = addBitGate(b, selfhosted, test_step, "pathresolve", "tests/bit/pathresolve.bit", &.{
+    const pathresolve_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "pathresolve", "tests/bit/pathresolve.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the install-prefix path-resolution gate (tests/bit/pathresolve.bit) only");
     if (host_libbitrt_install) |inst| pathresolve_gate.step.dependOn(inst);
 
-    const pmimports_gate = addBitGate(b, selfhosted, test_step, "pmimports", "tests/bit/pmimports.bit", &.{
+    const pmimports_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "pmimports", "tests/bit/pmimports.bit", &.{
         .{ "BIT_STDLIB_UNDER_TEST", stdlib_root },
     }, "run the package-manager import-resolution CLI contract (tests/bit/pmimports.bit) only");
     if (host_libbitrt_install) |inst| pmimports_gate.step.dependOn(inst);
 
     // Compiles and runs every examples/*.bit, so it needs the host archive.
-    const examples_gate = addBitGate(b, selfhosted, test_step, "examples", "tests/bit/examplesgate.bit", &.{
+    const examples_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "examples", "tests/bit/examplesgate.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
         .{ "BIT_EXAMPLES_DIR", b.pathFromRoot("examples") },
     }, "run the examples/*.bit build+run guard (tests/bit/examplesgate.bit) only");
@@ -1192,7 +811,7 @@ pub fn build(b: *std.Build) void {
     //
     // Halving the run also matters right now: at #1849's regressed runtimes the
     // 312-run version was tipping past its deadline under ordinary parallelism.
-    const stress_gate = addBitGate(b, selfhosted, test_step, "stress", "tests/bit/stress.bit", &.{
+    const stress_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "stress", "tests/bit/stress.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the tests/stress/* corpus (tests/bit/stress.bit) only");
     if (host_libbitrt_install) |inst| stress_gate.step.dependOn(inst);
@@ -1209,14 +828,14 @@ pub fn build(b: *std.Build) void {
     // Every top-level function under runtime/{root,rand,net} must be @nosplit or
     // @naked, or be one of 95 reviewed exceptions — carried across verbatim and
     // machine-verified byte-identical to the Zig table.
-    _ = addBitGate(b, selfhosted, test_step, "pollfree", "tests/bit/pollfree.bit", &.{
+    _ = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "pollfree", "tests/bit/pollfree.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the poll-free runtime audit (tests/bit/pollfree.bit) only");
 
     // Stop-the-world wiring (#1639), replacing tests/stwwiring.zig: the collector
     // and netpoller must actually be REACHABLE from a booted program. Checked on
     // the emitted objects, so it needs the compiler settled on disk.
-    const stw_gate = addBitGate(b, selfhosted, test_step, "stwwiring", "tests/bit/stwwiring.bit", &.{
+    const stw_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "stwwiring", "tests/bit/stwwiring.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the stop-the-world wiring gate (tests/bit/stwwiring.bit) only");
     if (selfhost_install_step) |inst| stw_gate.step.dependOn(inst);
@@ -1229,14 +848,14 @@ pub fn build(b: *std.Build) void {
     // --dump-ir` on a probe and reads the register class each rt_call actually
     // reads its result from. Neither side is Zig, and it cannot degenerate into
     // a table agreeing with itself.
-    const rootabi_gate = addBitGate(b, selfhosted, test_step, "rootabi", "tests/bit/rootabi.bit", &.{
+    const rootabi_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "rootabi", "tests/bit/rootabi.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the runtime-ABI register-class gate (tests/bit/rootabi.bit) only");
     if (selfhost_install_step) |inst| rootabi_gate.step.dependOn(inst);
 
     // ABI membership (#1674), replacing tests/rootabi_membership.zig: every
     // bit_rt_* name the compiler can emit must have a pin providing it.
-    const abimembers_gate = addBitGate(b, selfhosted, test_step, "abimembers", "tests/bit/abimembers.bit", &.{
+    const abimembers_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "abimembers", "tests/bit/abimembers.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the ABI-membership gate (tests/bit/abimembers.bit) only");
     if (selfhost_install_step) |inst| abimembers_gate.step.dependOn(inst);
@@ -1245,14 +864,14 @@ pub fn build(b: *std.Build) void {
     // definition may relocate to itself. Now that libbitrt.a is all-Bit, such a
     // definition is unbounded recursion in every shipped binary. Spawns 28
     // compiler children, ~51s.
-    const rootpins_gate = addBitGate(b, selfhosted, test_step, "rootpins", "tests/bit/rootpins.bit", &.{
+    const rootpins_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "rootpins", "tests/bit/rootpins.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the runtime-pin cycle gate (tests/bit/rootpins.bit) only");
     if (selfhost_install_step) |inst| rootpins_gate.step.dependOn(inst);
 
     // getauxval (#1591): runtime/auxv had NO test in any language. The Zig one
     // that covered it lives in runtime/shims.zig, which dies with the runtime.
-    _ = addBitGate(b, selfhosted, test_step, "auxv", "tests/bit/auxv.bit", &.{
+    _ = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "auxv", "tests/bit/auxv.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the getauxval gate (tests/bit/auxv.bit) only");
 
@@ -1261,7 +880,7 @@ pub fn build(b: *std.Build) void {
     // any such gate returns nothing — and it dies with the runtime. #1849 is a
     // 4-9x performance regression that nothing caught, which is what a repo with
     // no perf gate looks like.
-    const schedbench_gate = addBitGate(b, selfhosted, test_step, "schedbench", "tests/bit/schedbench.bit", &.{
+    const schedbench_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "schedbench", "tests/bit/schedbench.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the context-switch throughput gate (tests/bit/schedbench.bit) only");
     if (host_libbitrt_install) |inst| schedbench_gate.step.dependOn(inst);
@@ -1272,7 +891,7 @@ pub fn build(b: *std.Build) void {
     // listed case that starts PASSING fails as a stale gap, and a listed name
     // absent from the corpus fails as dangling, so the list cannot rot into
     // permanent excuses.
-    const golden_gate = addBitGate(b, selfhosted, test_step, "golden", "tests/bit/golden.bit", &.{
+    const golden_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "golden", "tests/bit/golden.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
         .{ "BIT_CASES_DIR", b.pathFromRoot("tests/cases") },
         .{ "BIT_BIN", selfhost_artifact_path },
@@ -1285,7 +904,7 @@ pub fn build(b: *std.Build) void {
     // NOT Zig's: compiler/build.bit:400 publishes with a truncating writeFile and
     // no temp-then-rename, and it bit twice in this session (stress.bit copied a
     // partial file; lintcmd.bit exec'd one and got SIGSEGV with empty stderr).
-    const selfbin_gate = addBitGate(b, selfhosted, test_step, "selfbin", "tests/bit/selfbin.bit", &.{
+    const selfbin_gate = addBitGate(b, selfhosted, test_step, libbitrt_readers.items, "selfbin", "tests/bit/selfbin.bit", &.{
         .{ "BIT_STDLIB", stdlib_root },
     }, "run the private-copy discipline gate (tests/bit/selfbin.bit) only");
     if (selfhost_install_step) |inst| selfbin_gate.step.dependOn(inst);

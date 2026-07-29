@@ -26,15 +26,17 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
 echo "==> Building native arm64 bit (compiler + LSP) ..."
-# NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted now) is built by
-# RUNNING the seed to compile compiler/ (build.zig's `native` check), which
-# only works when the seed targets the build host. A Linux-container cross
-# build can only ever produce `bit-seed` — and the seed never gets lint
-# (spec/LINT.md's epic scope: "seed/ is not touched"), so installing it would
-# silently serve an LSP that can never publish a lint finding. This Mac's zig
-# (brew, kept local on purpose — see the toolchain note) already targets its
-# own host, aarch64-macos, so a plain `zig build` here is both correct and
-# simpler than a container that could not do the job anyway.
+# NATIVE, not Docker: `bit` (fmt/doc/lsp/lint all self-hosted) is built by RUNNING
+# the pinned stage0 over compiler/ (build.zig's `native` check), which only works
+# when that compiler targets the build host. A Linux-container cross build cannot
+# produce a runnable host `bit` at all. This Mac's zig (brew, kept local on
+# purpose — see the toolchain note) already targets its own host, aarch64-macos,
+# so a plain `zig build` here is both correct and simpler than a container that
+# could not do the job anyway.
+#
+# The seed used to be the thing doing the compiling, and the paragraph here used
+# to warn that a container build could only ever yield `bit-seed`, which never
+# got lint. Both halves are moot since #1593 deleted seed/.
 zig build
 echo "    built zig-out/bin/bit ($(./zig-out/bin/bit --version))"
 echo "    dev builds are used BY PATH: ./zig-out/bin/bit — nothing is copied to \$HOME"

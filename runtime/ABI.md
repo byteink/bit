@@ -90,7 +90,7 @@ uniform "every aggregate is one traced handle" model this ABI is built on.
 
 This is not a new constraint being imposed on codegen — it is the contract
 codegen already implements. All four backends refuse a multi-value `ret` today
-(`seed/codegen/x64.zig` `emitRet`, `seed/codegen/arm64.zig` `.ret`,
+(the codegen backends' `emitRet` / `.ret`,
 `compiler/x64.bit` `xEmitRet`, `compiler/arm64.bit` `Op.Ret`). Boxing in the
 lowerer is what makes that refusal unreachable rather than what works around it.
 
@@ -1320,7 +1320,7 @@ poll loop's iteration count is bounded by that clamp divided by the poll
 interval (Power of 10 rule 2) rather than an open-ended `while (true)` — the
 deadline check inside the loop is what actually ends every real call.
 
-**`hostTarget()` and `auxv()` are seed `prim_rt_fns` entries — the CALLER side
+**`hostTarget()` and `auxv()` are compiler `prim_rt_fns` entries — the CALLER side
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
 that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
 body called the primitive would therefore become a call to itself once #1369
@@ -1331,7 +1331,7 @@ answer somewhere other than the primitive:
 - `host_target` is a **property of the emit**, not a runtime computation. The
   archive is compiled once per target, so its `builtin.target` *is* the build
   target — each per-target `libbitrt.a` returns its own ordinal (x86_64-linux → 0,
-  aarch64-linux → 1, aarch64-macos → 2). Since the seed selects the archive by
+  aarch64-linux → 1, aarch64-macos → 2). Since the compiler selects the archive by
   `--target` (`libbitrtPath`), a cross-built binary reports the target it was
   built FOR, not the host it was built ON.
 
@@ -1591,7 +1591,7 @@ migrates workers only at an explicit yield/park, never mid-expression:**
   pointer to root-scan callbacks that never read or write through it (only its
   address, as a "valid pointer" sentinel, is used); it is never reassigned
   after its `= 0` initializer, so there is nothing to race.
-- `chan.zig`: `select_seed_counter` — `std.atomic.Value(u64)`, bumped with
+- `runtime/chan`: `select_seed_counter` — `std.atomic.Value(u64)`, bumped with
   `fetchAdd`; already synchronized. (`chan.zig`'s send/recv/select rendezvous
   itself is #1247's scope, not this ticket's.)
 

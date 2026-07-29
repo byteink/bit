@@ -12,7 +12,8 @@
 #
 #   1. runtime archives for every target (the shipped compiler carries all three
 #      so one install can cross-compile)
-#   2. one self-hosted `bit` per target, produced by EXECING the seed
+#   2. one self-hosted `bit` per target, cross-produced by the PINNED STAGE0
+#      (the previous release) — never by the compiler built from this tree
 #   3. dist/package.sh per target
 #   4. smoke-test each UNPACKED artifact by compiling and running a program, on
 #      hardware that matches it. Not the staging tree: the bytes that ship are
@@ -51,7 +52,10 @@ TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 echo "release.sh: building runtime archives for every target"
 zig build libbitrt
 
-echo "release.sh: building the bootstrap seed"
+echo "release.sh: resolving the pinned stage0"
+# Downloads + digest-verifies against dist/stage0/SHA256SUMS; refuses on failure.
+STAGE0="$(sh scripts/stage0.sh)"
+echo "release.sh: stage0 = ${STAGE0}"
 zig build
 
 rm -rf "${OUT}"
@@ -96,10 +100,16 @@ for t in "${TARGETS[@]}"; do
 	echo "release.sh: ${t}"
 	rm -rf "${OUT}/stage"
 	mkdir -p "${OUT}/stage/bin"
-	# The SEED cross-produces the self-hosted compiler, from the STAGED source:
-	# `bit-seed build` is the same command release.yml used, for the same reason
-	# (build.zig's `native` note — only the caller knows which host it is on).
-	./zig-out/bin/bit-seed build "${STAGE_SRC}" --target "${t}" -o "${OUT}/stage/bin/bit"
+	# The PINNED STAGE0 cross-produces the self-hosted compiler, from the STAGED
+	# source. This was the seed until #1593 deleted it; stage0 is a native binary
+	# for this host by construction, so it cross-compiles every target from one
+	# invocation exactly as the seed did.
+	#
+	# NOT `zig-out/bin/bit`: that is built FROM this tree, and a release must be
+	# produced by the previous release, so a compiler bug introduced here cannot
+	# silently compile itself into the artifact. Same reason the differentials
+	# use stage0 as their oracle.
+	"${STAGE0}" build "${STAGE_SRC}" --target "${t}" -o "${OUT}/stage/bin/bit"
 	chmod +x "${OUT}/stage/bin/bit"
 	bash dist/package.sh "${VERSION}" "${t}" "${OUT}"
 done

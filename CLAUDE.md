@@ -14,7 +14,7 @@ Settled in planning - do not relitigate:
 - **Semantics**: Go-like - garbage collected, green threads (`spawn`), typed channels, structural interfaces.
 - **Output**: single static native binary, like Go/Zig. No interpreter, no VM, no libc dependency.
 - **Zero external toolchain**: own lexer→parser→checker→SSA IR→codegen (x86-64 + ARM64)→object writers (ELF/Mach-O/PE)→own static linker. No LLVM, no system assembler/linker.
-- **Seed compiler in Zig**, then self-host in three staged ports (differential-tested, stage2 == stage3 byte-identical). Zig seed retires to `seed/` after bootstrap.
+- **Seed compiler in Zig**, then self-host in three staged ports (differential-tested, stage2 == stage3 byte-identical). **DONE, and `seed/` is DELETED (#1593).** `bit` is now bootstrapped by the PINNED STAGE0 — the previous release, resolved and digest-verified by `scripts/stage0.sh` against the committed `dist/stage0/SHA256SUMS`. Building `bit` requires a `bit`; the chain terminates at a published binary, not at source. `docs/release/bootstrap.md` is the authority.
 - **Naming**: language "Bit", binary `bit`, extension `.bit`, LSP `bit lsp`, site **bitlang.org** (settled 2026-07-26 - `.org` is the convention for open-source languages, and byteink.io stays the company site; bitlang.io/.net redirect to it). The language name itself is still renamable by find-replace - don't bikeshed it.
 
 ## Workflow
@@ -30,7 +30,7 @@ The compiler↔runtime contract lives in `runtime/ABI.md` (object headers, stack
 Nothing is scaffolded yet. Once #321 lands, the intended commands are:
 
 ```
-zig build              # build seed compiler bit
+zig build              # fetch/verify stage0, build libbitrt.a + bit
 zig build test         # unit + golden tests
 zig build fuzz         # fuzzing harness (after #334)
 ```
@@ -41,7 +41,6 @@ Zig version is pinned in `.zigversion` - verify current stable before scaffoldin
 
 ```
 compiler/   THE compiler, written in Bit. Self-hosted; this is what ships.
-seed/       Zig seed compiler - the bootstrap oracle, retiring (#1593)
 runtime/    linked into user binaries (alloc, gc, sched, chan) + ABI.md. Now Bit.
 stdlib/     written in Bit (core, io, fs, net, time, math, os, testing)
 spec/       SPEC.md - the authority
@@ -56,18 +55,21 @@ Two names that used to mean something else, so old notes will mislead:
 `compiler/` was `selfhost/` until #1841 - the self-hosted compiler is THE
 compiler, and "selfhost" only carried information while a non-self-hosted one
 existed. The Zig seed never lived in `compiler/` despite an earlier version of
-this list saying so; it has always been `seed/`.
+this list saying so; it lived in `seed/`, and `seed/` no longer exists (#1593).
 
-`zig build selfhost` keeps its step name: fifteen `scripts/selfhost-diff*.sh`
-invoke it, and those scripts are #1593's business, not a rename's.
+`zig build selfhost` keeps its step name — fifteen `scripts/selfhost-diff*.sh`
+invoke it — but it no longer means "build with the seed": it runs the pinned
+stage0 over `compiler/`.
 
 ## Testing Conventions
 
-- **Verify scoped changes with `scripts/gate.sh`, not the full suite (#1770).** It reads your `git diff` and runs only the steps that change touches - a `compiler/**` edit runs the selfhost diffs + `test-imports`, a `tests/cases/**` edit runs `zig build test-golden`, etc. Run the full `zig build test` (all 28 harnesses, ~7 min) only for a cross-cutting change (build.zig, seed/, spec/), a mixed change set, or the final pre-merge gate - and `gate.sh` already falls back to it automatically in those cases. Every harness also has its own named step (`zig build test-golden|test-examples|test-stress|test-version|test-selfcheck|…`) for running one area directly. The `libbitrt.a`/selfhost `bit` rebuild is now source-fingerprint cache-gated, so an unchanged tree skips the ~23s recompile automatically on every `zig build`.
+- **Verify scoped changes with `scripts/gate.sh`, not the full suite (#1770).** It reads your `git diff` and runs only the steps that change touches - a `compiler/**` edit runs the selfhost diffs + `test-imports`, a `tests/cases/**` edit runs `zig build test-golden`, etc. Run the full `zig build test` (all 28 harnesses, ~7 min) only for a cross-cutting change (build.zig, runtime/, spec/), a mixed change set, or the final pre-merge gate - and `gate.sh` already falls back to it automatically in those cases. Every harness also has its own named step (`zig build test-golden|test-examples|test-stress|test-version|test-selfcheck|…`) for running one area directly. The `libbitrt.a`/selfhost `bit` rebuild is now source-fingerprint cache-gated, so an unchanged tree skips the ~23s recompile automatically on every `zig build`.
 - Golden-file tests: `tests/cases/*.bit` with sibling `.expected`; line-1 directive selects the mode - `// run` (execute, compare stdout), `// panic` (must exit 2, compare stderr), `// error` (expect diagnostics), `// fmt` (canonicalization), `// types` (inferred-type dump). Every compiler stage adds cases as it lands.
-- Differential testing is the self-hosting gate: Zig and Bit implementations must produce byte-identical AST/type/IR dumps over the full corpus.
+- **Differential testing is the self-hosting gate, and what it ASSERTS changed with #1593.** The fifteen `scripts/selfhost-diff*.sh` used to diff the Zig seed against the Bit compiler, so green meant "two independent implementations agree". The oracle is now the pinned stage0 — the same compiler one release back — so green means "this version did not change behaviour versus the last release". That cannot catch a bug present in both. `docs/release/bootstrap.md` §5 records it as the accepted loss; do not read a green differential as the stronger claim.
+- **Both sides of a differential must read THIS tree's stdlib and runtime.** The stage0 tarball ships its own `stdlib/` and `libbitrt.a`, and `bit` resolves them relative to the binary — so an unpinned oracle compares two stdlibs instead of two compilers. `scripts/stage0.sh` emits a wrapper pinning `BIT_STDLIB`; the two examples gates pin `BIT_LIBBITRT` themselves, because that names one archive per triple and the wrapper cannot know the target.
+- **`compiler/` and `runtime/` may only use what the pinned stage0 understands.** stage0 compiles both. Needing a newer feature means moving the pin FIRST: cut a release, repin `dist/stage0/SHA256SUMS`, then use it. 0.1.2 could not build today's `compiler/` (`osRunTestBounded`), which is what forced the 0.1.3 pin.
 - Doc snippets are CI-verified - tutorial and stdlib docs compile as part of the build; docs that don't compile fail CI.
-- **A hang is a failure, not a stall (#1637, #1652).** Every subprocess a harness spawns carries a wall-clock deadline from `tests/proc.zig` - the golden, stress, examples, imports and orphaned-test (`tests/testroots.zig`) harnesses, covering both compilers' builds and every executed binary. Exceeding it kills that child (its own PID, never a name pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default **900s**; override with `BIT_TEST_TIMEOUT_S=<seconds>` on a slower host, or `0` to disable and block forever as before. A timeout is a distinct outcome from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is still reported as a crash naming the signal.
+- **A hang is a failure, not a stall (#1637, #1652).** Every subprocess a harness spawns carries a wall-clock deadline - the golden, stress, examples and imports harnesses, covering every compiler invocation and every executed binary. Exceeding it kills that child (its own PID, never a name pattern), reports `TIMED OUT` naming the case, and reddens the suite. Default **900s**; override with `BIT_TEST_TIMEOUT_S=<seconds>` on a slower host, or `0` to disable and block forever as before. A timeout is a distinct outcome from a crash: a child killed by SIGSEGV/SIGBUS/SIGABRT is still reported as a crash naming the signal.
 - **The corpus's worst case is `tests/stress/quicwire` at 158s under `BIT_GC=stress` (#1849), so 900s is a 5.7x margin — not a stopgap.** Two things about that number are counter-intuitive enough to be worth knowing before you re-measure. First, `polloneshotdarwin` used to sit next to it at 122s and is now 2s: it bounded a deliberately-never-satisfied wait in *idle scheduler passes*, and #1649 made an idle pass cost up to 1ms instead of microseconds, so 200,000 passes silently became 200 seconds. Any test that counts scheduler passes is measuring an implementation detail; bound it in wall clock. Second, quicwire's 158s is **not** a defect — the Zig collector ran the same program in 36s, and `BIT_GC=off` runs both in ~1s, so the gap is entirely that the collector's machine code stopped coming from an optimising backend. That is epic #1851, and quicwire is its benchmark. **Do not read a `TIMED OUT` as a hang until you have timed the program standalone**, and run `uptime` first: load above ~20 on this 18-core box makes every timing worthless.
 
 ## File Size
