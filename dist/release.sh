@@ -183,7 +183,7 @@ if [ -n "${host}" ]; then
 	# denied, the tarball never arrived, tar failed — and because the whole thing
 	# is `ssh … | grep -q && echo`, the failure was invisible and the release still
 	# exited 0. The x86-64 target went unverified with no warning at all. Same
-	# fixed-/tmp-path class of bug as link.zig's (noted in CLAUDE.md).
+	# fixed-/tmp-path class of bug the linker once had (noted in CLAUDE.md).
 	rdir="$(ssh "${host}" 'mktemp -d')"
 	scp -q "${OUT}/bit-${VERSION}-linux-x86_64.tar.xz" "${host}:${rdir}/"
 	ssh "${host}" "set -eu

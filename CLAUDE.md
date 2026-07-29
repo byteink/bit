@@ -114,8 +114,8 @@ mirrored into the example is a fix with no test, and the traversal guard is wher
 that bites. **Change one, change both**, until the real server retires both.
 
 The generator reads `docs/` and never writes it, so the doc gates
-(`tests/docs.zig` typechecks every ```bit block, `tests/stdlib_docs.zig` fails on
-an undocumented export) keep covering the content the site publishes. Get started
+(`tests/bit/docs.bit` typechecks every ```bit block, `tests/bit/stdlibdocs.bit`
+fails on an undocumented export) keep covering the content the site publishes. Get started
 IS `docs/tutorial.md`, not a copy.
 
 Deploys go through **ssd** like every other byteink app. `.ssd/` is gitignored

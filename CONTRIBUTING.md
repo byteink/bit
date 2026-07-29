@@ -58,7 +58,7 @@ large refactor.
 ## No per-file license headers
 
 Apache-2.0 recommends a header in each source file; this project deliberately
-does not use them. Stamping thousands of `.bit` and `.zig` files buries every
+does not use them. Stamping thousands of `.bit` files buries every
 real diff under boilerplate, and `LICENSE` plus `NOTICE` already state the terms
 for the whole tree. Please do not add them.
 
