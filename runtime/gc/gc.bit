@@ -1,77 +1,66 @@
-// Stage-2 port of `runtime/gc/` (#1363): the precise stop-the-world
-// mark-and-sweep collector. Both implementations exist during the port; #1400
-// swaps this one into `libbitrt.a` and #1369 retires the Zig original.
+// The precise stop-the-world mark-and-sweep collector.
 //
-// The algorithm is unchanged and deliberately so. Header layout (ABI.md §1),
-// the pointer-map contract (§2), the intrusive all-objects list and therefore
-// the sweep ORDER, the mark-worklist overflow/rescan recovery, the
-// address->object membership index, and the growth trigger are all reproduced
-// exactly. A collector is the one component where a "cleaner" deviation is
-// silent heap corruption rather than a crash, so where this file differs from
-// the Zig it says so in a comment and says why.
+// The algorithm is what it is deliberately. Header layout (ABI.md §1), the
+// pointer-map contract (§2), the intrusive all-objects list and therefore the
+// sweep ORDER, the mark-worklist overflow/rescan recovery, the address->object
+// membership index, and the growth trigger are all load-bearing. A collector is
+// the one component where a "cleaner" restructuring is silent heap corruption
+// rather than a crash, so every constraint below says why it is shaped that way.
 //
-// WHAT IS DIFFERENT, AND WHY (the complete list)
-// ----------------------------------------------
-// 1. STATE IS CALLER-OWNED. Zig's `Gc` is a struct the caller embeds. Bit has
-//    no mutable module-level state (#1402, in flight) and no way to return a
-//    struct that lives outside the managed heap, so the collector's state is a
-//    block of `gcWords` machine words the caller provides and every entry point
-//    takes as its first parameter. This is the shape #1361 (spinlock) and
-//    #1362 (allocator) both settled on; the process-wide instance belongs to
-//    `runtime/root/` (#1367). Field-for-field the block IS the Zig struct — see the
+// THE CONSTRAINTS THAT SHAPE THIS FILE (the complete list)
+// -------------------------------------------------------
+// 1. STATE IS CALLER-OWNED. There is no mutable module-level state (#1402) and
+//    no way to return a struct living outside the managed heap, so the
+//    collector's state is a block of `gcWords` machine words the caller provides
+//    and every entry point takes as its first parameter. This is the shape #1361
+//    (spinlock) and #1362 (allocator) both settled on; the process-wide instance
+//    belongs to `runtime/root/` (#1367). The block's layout is fixed — see the
 //    `gc*` word-index constants below.
 //
-// 2. ROOT SCANNING IS PUSHED, NOT PULLED. Zig's `RootScanner` is a `ctx` plus a
-//    function pointer, and `collect` calls it. The unmanaged subset has no
-//    function pointers (a Bit function value is a GC object, which the
-//    collector cannot depend on), so the callback is inverted into an explicit
-//    phase API: `gcMarkBegin` / <caller marks its roots> / `gcCollectFinish`.
-//    `gcCollectRoots` wraps the two around a root ARRAY, which is exactly the
-//    `RootArray` scanner runtime/gc/'s own tests use. The operation ORDER is
-//    identical — seed roots, drain, recover overflow, sweep, reschedule — only
-//    the direction of the call is reversed.
+// 2. ROOT SCANNING IS PUSHED, NOT PULLED. The unmanaged subset has no function
+//    pointers (a Bit function value is a GC object, which the collector cannot
+//    depend on), so there is no scanner callback for `collect` to invoke.
+//    Instead the phases are explicit: `gcMarkBegin` / <caller marks its roots> /
+//    `gcCollectFinish`. `gcCollectRoots` wraps the two around a root ARRAY,
+//    which is what `runtime/gc/`'s own tests use. The operation ORDER is fixed —
+//    seed roots, drain, recover overflow, sweep, reschedule.
 //
 // 3. PAGES COME FROM A CALLER-SUPPLIED RESERVE. The heap itself is the REAL
-//    allocator — `runtime/alloc/alloc.bit` (#1362), the Bit port of the
-//    `runtime/alloc/` this collector's Zig original calls — so all size-class
-//    policy, the free-list shape and the byte counters are the allocator's, not
-//    reinvented here. But that port pushed the OS page fetch out to its caller
-//    (`syscall` is Linux-only, `extern function` Darwin-only, and both are
-//    rejected on the declaration), and with no function pointers in the
-//    unmanaged subset a platform-free `gc.bit` cannot be handed a mapping
-//    callback — only memory. So the caller maps pages and hands in a reserve,
-//    and `gcHeapAlloc` bumps spans out of it to refill classes. See
-//    `./mem.bit`. This is what keeps this file compiling for all three targets.
+//    allocator — `runtime/alloc/alloc.bit` (#1362) — so all size-class policy,
+//    the free-list shape and the byte counters are the allocator's, not
+//    reinvented here. But the allocator pushes the OS page fetch out to ITS
+//    caller (`syscall` is Linux-only, `extern function` Darwin-only, and both
+//    are rejected on the declaration), and with no function pointers a
+//    platform-free `gc.bit` cannot be handed a mapping callback — only memory.
+//    So the caller maps pages and hands in a reserve, and `gcHeapAlloc` bumps
+//    spans out of it to refill classes. See `./mem.bit`. This is what keeps this
+//    file compiling for all three targets.
 //
-// 4. ADDRESSES ARE SIGNED. Zig uses `usize`; Bit's `int` is `i64` (§11.1). Every
-//    address comparison here (`lo_addr`/`hi_addr` bounds, index probing) is
-//    therefore signed. Userspace addresses on all three supported targets are
-//    far below 2^63, so the ordering is identical to the unsigned comparison.
-//    The one place this is visible is `gcAddrMax` standing in for
-//    `std.math.maxInt(usize)` as the initial `lo_addr`.
+// 4. ADDRESSES ARE SIGNED, because Bit's `int` is `i64` (§11.1). Every address
+//    comparison here (`lo_addr`/`hi_addr` bounds, index probing) is therefore
+//    signed. Userspace addresses on all three supported targets are far below
+//    2^63, so the ordering is identical to an unsigned comparison. The one place
+//    it shows is `gcAddrMax` as the initial `lo_addr`.
 //
-// 5. `std.debug.assert` BECOMES A COUNTER. Zig asserts that each pointer-map
-//    offset is 8-aligned and inside the body; those asserts compile OUT of the
-//    shipping ReleaseFast build. `@nosplit` cannot call `panic`, so this port
-//    counts a violating offset in `gcStatBadOffset` and SKIPS the slot rather
-//    than reading out of bounds. The stress test asserts the counter is zero, so
-//    on every input tested the traced-slot set is identical to Zig's — and
-//    unlike the Zig, a violation stays visible in a release build.
+// 5. INVARIANT VIOLATIONS ARE COUNTED, NOT ASSERTED. Each pointer-map offset
+//    must be 8-aligned and inside the body. `@nosplit` cannot call `panic`, so a
+//    violating offset increments `gcStatBadOffset` and the slot is SKIPPED
+//    rather than read out of bounds. The stress test asserts the counter is
+//    zero. Counting beats asserting here for a reason worth keeping: a violation
+//    stays visible in a RELEASE build, where a compiled-out assert would not.
 //
-// 6. `verbose` IS STORED, NOT EMITTED. Zig's `collect` writes a line to stderr
-//    via `std.debug.print`. `@nosplit` cannot call `print`, and the freestanding
-//    Bit runtime has no stderr primitive of its own yet, so the flag is kept and
-//    readable and emitting the line belongs to the caller (#1367 owns I/O). The
-//    stats the line reports are all exposed as accessors.
+// 6. `verbose` IS STORED, NOT EMITTED. `@nosplit` cannot call `print`, and the
+//    freestanding runtime has no stderr primitive of its own, so the flag is
+//    kept readable and emitting the line belongs to the caller (#1367 owns I/O).
+//    Every stat such a line would report is exposed as an accessor.
 //
-// 7. `configFromEnv` SPLITS. The env READING is the caller's (#1367); the
-//    POLICY — the clamps that make a bad setting harmless — is ported here as
-//    `gcConfigure`. That is the part with behaviour worth preserving.
+// 7. ENV READING AND ENV POLICY ARE SPLIT. Reading the environment is the
+//    caller's (#1367); the POLICY — the clamps that make a bad setting harmless
+//    — is here, as `gcConfigure`. That is the part with behaviour worth testing.
 //
-// 8. THE `ref_array_info` SENTINEL IS CALLER-PROVIDED. Zig compares
-//    `h.info == &ref_array_info`, the address of a module-level static. With no
-//    module-level state the sentinel's address is passed to `gcInit` and stored.
-//    It is address identity either way.
+// 8. THE `ref_array_info` SENTINEL IS CALLER-PROVIDED. With no module-level
+//    state there is no static whose address can serve as the sentinel, so the
+//    address is passed to `gcInit` and stored. It is address identity either way.
 //
 // Everything is `@nosplit` (§10.3): the collector must not allocate through the
 // managed heap and must not reach a safepoint, or it would re-enter itself.
@@ -95,7 +84,7 @@ export const gcHdrNext = 8
 export const gcHdrSize = 16
 // `marked` is a 1-byte bool at +24 followed by 7 bytes of padding. This port
 // writes the BYTE, not the whole word, so the header's bit pattern matches the
-// Zig's exactly and the padding stays untouched.
+// fixed, and the padding stays untouched.
 export const gcHdrMarked = 24
 
 // `TypeInfo` field offsets, in bytes (ABI.md §2, 56 bytes total).
@@ -108,19 +97,20 @@ export const gcTiMethodsPtr = 40
 export const gcTiMethodsLen = 48
 
 // Largest i64 — stands in for `std.math.maxInt(usize)` as the initial
-// `lo_addr`, so the first `noteBody` always lowers it. See deviation 4.
+// `lo_addr`, so the first `noteBody` always lowers it. See constraint 4.
 export const gcAddrMax = 9223372036854775807
 
 // ---------------------------------------------------------------------------
-// Collector state block layout, in words. Field-for-field the Zig `Gc` struct.
+// Collector state block layout, in words. Fixed: `runtime/root/` allocates the
+// block by `gcWords` and every accessor indexes it by these constants.
 // ---------------------------------------------------------------------------
 
 // gcHeapAddr/gcCfgEnabled/gcCfgStress/gcNextBytes are exported (#1700): stwPoll
 // inlines gcShouldCollect's predicate on its hot path to avoid a cross-module
 // call, and needs these offsets to do it. Every other field stays private.
-export const gcHeapAddr = 0 // address of the allocator's heap block (Zig: heap: *Heap)
+export const gcHeapAddr = 0 // address of the allocator's heap block
 const gcHeapLockAddr = 1   // address of the i32 word guarding that heap block
-const gcLockAddr = 2       // address of the i32 list-lock word (Zig: list_lock)
+const gcLockAddr = 2       // address of the i32 list-lock word
 const gcAll = 3            // head of the all-objects list, 0 = null
 const gcNumObjectsIdx = 4
 const gcStackAddr = 5      // mark worklist base address
@@ -145,12 +135,12 @@ const gcIndexCap = 23
 const gcIndexLive = 24
 const gcIndexUsed = 25      // live entries + tombstones, for the load factor
 const gcRefArrayInfo = 26   // address of the `ref_array_info` sentinel
-const gcStBadOffset = 27    // deviation 5
+const gcStBadOffset = 27    // constraint 5
 const gcPageSize = 28       // for the direct-mapped (large) path only
 // Span reserve: pages the caller mapped, which `gcHeapAlloc` carves into size
 // classes. Three words (base/end/bump) inline, see ./mem.bit.
 const gcSpanRes = 29
-// A SEPARATE reserve for the address->object index, mirroring the Zig's
+// A SEPARATE reserve for the address->object index, kept apart from the
 // `index_alloc = std.heap.page_allocator`: index bytes must never count toward
 // the heap's `liveBytes`, or they would perturb the growth trigger.
 const gcIdxRes = 32
@@ -173,7 +163,7 @@ export const gcDefaultMarkStack = 8192
 const idxEmpty = 0
 const idxTombstone = 1
 const idxMinCap = 16
-const idxLoadPct = 80        // grow at 80% occupancy, matching Zig's AutoHashMap
+const idxLoadPct = 80        // grow at 80% occupancy, the conventional open-addressing load factor
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -210,8 +200,8 @@ const idxLoadPct = 80        // grow at 80% occupancy, matching Zig's AutoHashMa
 // counts toward `liveBytes` in both implementations and the trigger schedules
 // identically.
 //
-// `markStackLen` of 0 becomes 1, matching Zig's `if (cfg.mark_stack_len == 0) 1`.
-// Returns false if the worklist could not be allocated (Zig's
+// `markStackLen` of 0 becomes 1: a zero-length worklist would make every mark overflow.
+// Returns false if the worklist could not be allocated (the
 // `error{OutOfMemory}`).
 export @nosplit @symbol("bit_rt_port_gc_init") function gcInit(g: *i64, heapAddr: int, heapLockAddr: int, listLockAddr: int, refArrayInfoAddr: int, markStackLen: int): bool {
   // `gcBindMemory` must have run first, because the mark worklist below is
@@ -278,7 +268,7 @@ export @nosplit @symbol("bit_rt_port_gc_init") function gcInit(g: *i64, heapAddr
 // `gcInit` allocates the mark worklist through the heap.
 //
 // `spanAddr`/`spanBytes` is memory the CALLER mapped from the OS — the
-// collector cannot map it itself and stay platform-free (see deviation 3).
+// collector cannot map it itself and stay platform-free (see constraint 3).
 // `idxAddr`/`idxBytes` backs the address->object index and is kept separate so
 // index bytes never reach the heap's `liveBytes`.
 export @nosplit @symbol("bit_rt_port_gc_bind_memory") function gcBindMemory(g: *i64, spanAddr: int, spanBytes: int, idxAddr: int, idxBytes: int, pageSize: int) {
@@ -295,7 +285,7 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") function gcBindMemory(g: *
 // same policy as `...Locked` primitives plus a caller-supplied span, because it
 // cannot reach the OS itself. Composing them is therefore the CALLER's job, and
 // the collector is the allocator's only caller. The lock discipline is the
-// Zig's exactly: one critical section spans classification, the refill and the
+// fixed: one critical section spans classification, the refill and the
 // take, so a span map still happens inside it and two workers cannot both
 // refill the same class.
 
@@ -367,7 +357,7 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") function gcBindMemory(g: *
 //
 // UNMAP BEFORE THE ACCOUNTING, INSIDE THE LOCK. The counters must not claim the
 // pages are gone while they still are, and holding the lock across the syscall
-// is the Zig's own discipline (`acquire(); defer release();` spans all of
+// is the required discipline (one acquire/release spanning all of
 // `free`), so two workers cannot race a map against an unmap of the same range.
 @nosplit function gcHeapFree(g: *i64, addr: int, size: int, alignment: int) {
   spinAcquire(heapLock(g))
@@ -389,7 +379,7 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") function gcBindMemory(g: *
 // for a fresh heap. A test asserting that is checking the whole
 // alloc/link/sweep/free path at once.
 //
-// The Zig drops the index up front and disables it so the per-object
+// The index is dropped up front and disabled so the per-object
 // `freeObject` removals below become no-ops instead of O(n) probes; this does
 // the same. The reserve is NOT returned — it is the caller's memory, and the
 // caller (who mapped it) is the only party that can unmap it.
@@ -415,7 +405,7 @@ export @nosplit function gcDeinit(g: *i64) {
 // a growth percent below 100 is IGNORED (the heap must be allowed to grow
 // between collections) and a mark-stack length of 0 is ignored. `minTrigger`
 // also reschedules `nextGcBytes`, because `Gc.init` seeds it from the config
-// and this port configures after init (deviation 7).
+// and this port configures after init (constraint 7).
 export @nosplit @symbol("bit_rt_port_gc_configure") function gcConfigure(g: *i64, enabled: bool, stress: bool, minTrigger: int, growthPct: int, verbose: bool) {
   if (enabled) {
     *(g + gcCfgEnabled) = 1
