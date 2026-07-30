@@ -21,16 +21,10 @@
 # release. Building a compiler here instead would cost ~132s of every deploy and
 # test something nobody installs.
 #
-# PINNED BY DIGEST, not by tag. A version tag looks immutable and is not: 0.1.0
-# was re-cut to fix a version-string bug and `:0.1.0` was republished pointing at
-# different bytes, so a tag pin would have silently changed what compiles this site.
-# The digest cannot be re-pointed, which is the only way "reproducible from the
-# commit alone" is actually true.
-#
-# The comment carries the human-readable version; bumping the toolchain means
-# updating both, in a commit whose diff shows exactly what changed.
-FROM ghcr.io/byteink/bit@sha256:c62475db5263556ab0209c2af468585434051cf1d730aad480afc05fb5b43f5b AS build
-# ^ ghcr.io/byteink/bit:0.1.4
+# Pinned to an exact version, never `:latest` — `latest` moves on the next push
+# and would silently change the compiler this site is built with. Bumping the
+# toolchain is a one-line edit here.
+FROM ghcr.io/byteink/bit:0.1.4 AS build
 
 # The toolchain image runs as uid 65532 (correct for its own job, compiling a
 # user's bind-mounted project). A build stage writes to the image filesystem, so
