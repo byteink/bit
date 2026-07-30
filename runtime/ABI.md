@@ -705,12 +705,34 @@ calls `boot`, and exits the process with `boot`'s returned code.
 
 1. Init the heap (`runtime/alloc/alloc.bit`) and collector (`runtime/gc/gc.bit`, config from
    `configFromEnv(environ)` — §7).
-2. Init and start the scheduler (`runtime/sched/sched.bit`) with **exactly one** worker OS
-   thread (`nthreads = 1`). This is no longer a *collector* requirement — §5's
-   handshake makes concurrent mutators safe, and each worker registers as a
-   mutator for the life of its run loop. It is now only a scheduler-maturity
-   choice: work stealing across several `runtime/sched/sched.bit` workers has no test that
-   exercises it. Raising it is a scheduler ticket, not a GC one.
+2. Init and start the scheduler (`runtime/sched/sched.bit`) with `nthreads`
+   worker OS threads: `BIT_WORKERS` if set and parseable, clamped to `[1, 32]`,
+   **otherwise 1**. The ceiling is static so `boot` allocates nothing new for it.
+
+   **The default is 1 by measurement, not caution.** Defaulting to the CPU count
+   was implemented and reverted in the same ticket: an idle worker still runs its
+   find-work/steal/backoff loop, so a pool wider than the runnable work costs
+   more than it saves. On an 18-core box, four CPU-bound tasks took 108% of one
+   task's time with four workers and 215% with eighteen; a full `./make test`,
+   which runs many Bit processes at once, drove load to 79 and timed out a test
+   that had never timed out. Every Bit process would have become a thread bomb.
+   The default flips once an idle worker is cheap.
+
+   This was pinned to **exactly one** until #1900. It was never a *collector*
+   requirement — §5's handshake makes concurrent mutators safe, and each worker
+   registers as a mutator for the life of its run loop — only a
+   scheduler-maturity choice, because work stealing across several workers had
+   no test that exercised it.
+
+   **What that means for anyone reading a stack trace from before #1900:** with
+   one worker, a worker's steal path could never find a victim, so the stealing
+   branch of `schedFindWorkAt` was unreachable in every binary this runtime ever
+   produced. It runs for the first time with `nthreads > 1`. Treat a failure
+   that appears only under multiple workers as a first execution, not a
+   regression.
+
+   `BIT_WORKERS=1` reproduces the pre-#1900 behaviour exactly, and exists so a
+   suspected concurrency failure can be bisected against it without a rebuild.
 3. Spawn `main_fn` (§10) as the first green thread.
 4. Poll (bounded exponential backoff) until that task reports done, then shut
    the scheduler down, tear down the collector, and return the task's exit

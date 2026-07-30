@@ -105,7 +105,7 @@ import {
 // direct call to the three pinned entries. ../linux/boot.bit binds the epoll
 // twin at exactly the same three points.
 import { pollCreate, pollClose, pollDrain } from "../../sched/darwin"
-import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootStatOom, osSetArgs } from "../../root"
+import { rootBindMemory, rootInit, rootConfigureFromEnv, rootEnvMarkStack, rootEnvVerbose, rootEnvWorkers, rootStatOom, osSetArgs } from "../../root"
 import { rootGcAddr, rootWorldAddr } from "../../root"
 import { chanBootBind } from "../../chan"
 import { gcBlockingBegin, gcBlockingEnd, gcThreadEnter, gcThreadExit } from "../../gc"
@@ -123,14 +123,17 @@ import { stwBadOffsets } from "../../stw"
 extern function bit_main(): i32
 
 // ---------------------------------------------------------------------------
-// Boot-time storage (single-worker, ABI.md §5) — identical to ../linux/boot.bit.
+// Boot-time storage, sized for `bootMaxWorkers` (#1900, ABI.md §8 step 2) —
+// identical to ../linux/boot.bit, including the reason the sizes are literals:
+// an array size must be an integer literal, so `[workerWords * bootMaxWorkers]`
+// does not parse and the arithmetic is by hand (292 x32 = 9344, 2 x32 = 64).
 // ---------------------------------------------------------------------------
 let schedBlock: [16]i64
-let workerBlock: [292]i64
+let workerBlock: [9344]i64
 let mainTaskBlock: [32]i64
-let startArgs: [2]i64
-let startDones: [1]i32
-let startHandles: [1]i64
+let startArgs: [64]i64
+let startDones: [32]i32
+let startHandles: [32]i64
 
 // The netpoller descriptor `boot` creates, kept so teardown can close it —
 // `runtime/sched/`'s `NetPoller.deinit`, which its `Scheduler.deinit` calls. Same
@@ -159,6 +162,9 @@ const pageSize: int = 4096
 const markStack: int = 4096
 const minTrigger: int = 65536
 const growthPct: int = 200
+
+// Worker-pool ceiling (#1900) — kept identical to ../linux/boot.bit.
+const bootMaxWorkers: int = 32
 const joinTimeoutNs: int = 15000000000
 
 // Backing size of the channel reserve `chan_make` bump-allocates out of: 1 MiB,
@@ -549,10 +555,22 @@ function boot(): int {
   //    is captured by now.
   rootConfigureFromEnv(true, false, minTrigger, growthPct, false)
 
-  // 4. Scheduler over the single worker block. Publish it for `bit_rt_root_spawn`
+  // 4. Scheduler over the worker blocks. Publish it for `bit_rt_root_spawn`
   //    the moment it exists (the Bit form of `runtime/root/` assigning `g_sched`).
+  //
+  //    WORKER COUNT (#1900, ABI.md §8 step 2), identical to ../linux/boot.bit:
+  //    the default is 1 and `BIT_WORKERS=<n>` opts in. See that file for the
+  //    measurement that rejected defaulting to the CPU count — an idle worker
+  //    is not free, so a pool wider than the runnable work is a net loss.
+  let nworkers = rootEnvWorkers(1)
+  if (nworkers < 1) {
+    nworkers = 1
+  }
+  if (nworkers > bootMaxWorkers) {
+    nworkers = bootMaxWorkers
+  }
   let sched: *i64 = ptrOf(schedBlock)
-  schedInit(sched, int(ptrOf(workerBlock)), 1)
+  schedInit(sched, int(ptrOf(workerBlock)), nworkers)
   spawnBindScheduler(int(sched))
 
   // 4b. Create the netpoller and bind it into the scheduler (#1673). This is
@@ -620,15 +638,29 @@ function boot(): int {
     return 70
   }
 
-  // 6. Bring the worker up on a real OS thread: `schedStart`'s per-worker arming
+  // 6. Bring the workers up on real OS threads: `schedStart`'s per-worker arming
   //    (`schedStartArm`) then this platform's `threadStart` called DIRECTLY,
   //    since `schedStart` takes the spawner as a function value this module may
-  //    not build. One worker, so the pool's loop collapses to one iteration.
-  let startArg = schedStartArm(sched, 0, ptrOf(startArgs), ptrOf(startDones))
-  let handle = threadStart(entryOf(workerBody), startArg, ptrOf(startDones))
-  *ptrOf(startHandles) = handle
-  if (handle == 0) {
-    return 70
+  //    not build, so its loop is written out here.
+  //
+  //    A FAILED SPAWN IS NOT FATAL PAST THE FIRST (#1900): worker 0 must come up
+  //    or nothing runs, but beyond that a program should keep the workers it
+  //    got. `started`, never `nworkers`, is what step 8 reaps.
+  let started = 0
+  let wi = 0
+  while (wi < nworkers) {
+    let startArg = schedStartArm(sched, wi, ptrOf(startArgs), ptrOf(startDones))
+    let handle = threadStart(entryOf(workerBody), startArg, ptrOf(startDones) + wi)
+    *(ptrOf(startHandles) + wi) = handle
+    if (handle == 0) {
+      if (wi == 0) {
+        return 70
+      }
+      wi = nworkers
+    } else {
+      started = started + 1
+      wi = wi + 1
+    }
   }
 
   // 7. Poll-wait for `main` with bounded exponential backoff (not a worker).
@@ -648,8 +680,12 @@ function boot(): int {
   // 8. Signal shutdown, reap the worker, report the code — `schedJoin`'s body
   //    for one worker, with the platform clock/sleep/release called directly.
   schedShutdown(sched)
-  joinWorker(ptrOf(startDones), joinTimeoutNs)
-  threadRelease(*ptrOf(startHandles))
+  let ji = 0
+  while (ji < started) {
+    joinWorker(ptrOf(startDones) + ji, joinTimeoutNs)
+    threadRelease(*(ptrOf(startHandles) + ji))
+    ji = ji + 1
+  }
 
   // 8b. Close the netpoller — `runtime/sched/`'s `NetPoller.deinit`, called from its
   //     `Scheduler.deinit`. AFTER the join, because the worker calls `pollDrain`
