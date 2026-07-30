@@ -110,7 +110,7 @@ fi
 # stdlib/crypto declares those symbols `extern` and E0078 caught the dangling
 # reference — a module nothing externs would simply have been absent, with
 # every gate green.
-PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw thread"
+PLATFORM_FREE_RELS="- alloc auxv chan cryptohw gc net park rand root sched shims shims/scan stw syscalls thread"
 PLATFORM_PAIRS="alloc net park rand root sched thread"
 
 REL_LIST=()
