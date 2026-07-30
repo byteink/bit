@@ -2,12 +2,12 @@
 # Run `./make test` for aarch64-linux in Docker on this machine, over the
 # committed tree (git archive HEAD).
 #
-# The image `bit-zig-0.16.0:latest` is a NATIVE aarch64 Zig image, so on an
+# The image `bit-linux-gate:latest` is a NATIVE aarch64 Linux image, so on an
 # Apple-Silicon host this is real ARM64 Linux execution — no qemu, no emulation
 # artifacts to argue about. `./make test` inside it resolves host_target to
 # aarch64-linux, so the whole suite exercises that backend.
 #
-#   arm64gate.sh          # fast: reuse a persistent zig cache volume (only changed
+#   arm64gate.sh          # fast: reuse a persistent build cache volume (only changed
 #                         #       files recompile) — for iterative checks
 #   arm64gate.sh clean    # clean-room: throwaway cache, full cold build — for a
 #                         #       final sign-off where no stale artifact may hide
@@ -42,8 +42,8 @@ RUNS="${2:-1}"
 # Overridable so #1497 (docker denying a tag that `docker images` lists) is not a hard
 # block: point it at the same image by id. The uname -m check below still applies, and
 # matters MORE with an id, which carries no descriptive name.
-IMAGE="${IMAGE:-bit-zig-0.16.0:latest}"
-VOLUME="bit-zig-cache-arm64"
+IMAGE="${IMAGE:-bit-linux-gate:latest}"
+VOLUME="bit-gate-cache-arm64"
 # Wall-clock ceiling for one suite run. A hang must read as a failure, never as a
 # gate that sits forever looking busy.
 # 3h: a COLD run on a machine already loaded by other agents was measured at
@@ -56,18 +56,18 @@ STEP="${ARM64GATE_STEP:-test}"
 
 command -v docker >/dev/null || { echo "arm64gate: docker not found" >&2; exit 127; }
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
-  echo "arm64gate: image ${IMAGE} missing — build it: docker build -f docker/zig-linux.Dockerfile -t ${IMAGE} ." >&2; exit 127; }
+  echo "arm64gate: image ${IMAGE} missing — build it: docker build -f docker/linux-gate.Dockerfile -t ${IMAGE} ." >&2; exit 127; }
 [ "$(docker run --rm "${IMAGE}" uname -m)" = "aarch64" ] || {
   echo "arm64gate: ${IMAGE} is not native aarch64 — it would gate the wrong backend" >&2; exit 127; }
 # The suite needs a `git` binary INSIDE the image: the package manager fetches
 # dependencies by shelling out to it, so tests/imports/pmadd_e2e,
-# tests/pmimports.zig and compiler/pmclicheck.bit all fail without it — as
+# tests/bit/pmimports.bit and compiler/pmclicheck.bit all fail without it — as
 # `git: not found`, an empty failure, and a bare assertion panic respectively
 # (#1818). Refusing here names the cause once instead of leaving three
 # unrelated-looking harnesses red. macOS has git from the host, which is why a
 # git-less image passed the local gate and only failed on Linux.
 docker run --rm "${IMAGE}" sh -c 'command -v git' >/dev/null 2>&1 || {
-  echo "arm64gate: ${IMAGE} has no git — rebuild it from docker/zig-linux.Dockerfile" >&2; exit 127; }
+  echo "arm64gate: ${IMAGE} has no git — rebuild it from docker/linux-gate.Dockerfile" >&2; exit 127; }
 
 if [ "${MODE}" = "clean" ]; then
   # Ephemeral in-container cache: nothing persists, guaranteeing a cold build.
@@ -150,9 +150,8 @@ run_suite() {
 #            a real TEST failure, not merely a build error. Needs a full build.
 #   build  — corrupt the build driver. The CHEAP proof: fails in seconds, so it
 #            is usable even when the suite cannot run to completion on this
-#            target. The victim is tools/build/main.bit since #1871 deleted
-#            build.zig; breaking it makes `./make` fail to compile the driver,
-#            which is the same class of failure the old victim produced.
+#            target. The victim is tools/build/main.bit; breaking it makes `./make`
+#            fail to compile the driver before any step body runs.
 mutant_stream() {
   local kind="${1:-build}" tmp victim
   tmp=$(mktemp -d)

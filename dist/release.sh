@@ -166,7 +166,7 @@ if command -v docker >/dev/null; then
 	# --user, so the container writes as THIS uid into the bind mount. As root it
 	# leaves root-owned files that the next run cannot clean (see the remote path
 	# below, where exactly that silently skipped a whole target's verification).
-	docker run --rm --user "$(id -u):$(id -g)" -v "${work}:/w" bit-zig-0.16.0:latest sh /w/go.sh \
+	docker run --rm --user "$(id -u):$(id -g)" -v "${work}:/w" bit-linux-gate:latest sh /w/go.sh \
 		| grep -q 'smoke ok' \
 		|| { echo "release.sh: aarch64-linux smoke FAILED" >&2; exit 1; }
 	echo "release.sh: aarch64-linux smoke ok"
@@ -197,7 +197,7 @@ BIT_STDLIB=\"\$p/stdlib\" BIT_LIBBITRT=\"\$p/lib/x86_64-linux/libbitrt.a\" \"\$p
 v=\$(\"\$p/bin/bit\" --version)
 [ \"\$v\" = \"bit ${VERSION}\" ] || { echo \"reports '\$v', want 'bit ${VERSION}'\" >&2; exit 1; }
 SH
-		docker run --rm --user \"\$(id -u):\$(id -g)\" -v ${rdir}:/w bit-zig-0.16.0-amd64:latest sh /w/go.sh" \
+		docker run --rm --user \"\$(id -u):\$(id -g)\" -v ${rdir}:/w bit-linux-gate-amd64:latest sh /w/go.sh" \
 		| grep -q 'smoke ok' \
 		|| { echo "release.sh: x86_64-linux smoke FAILED on ${host}" >&2; exit 1; }
 	echo "release.sh: x86_64-linux smoke ok on real hardware (${host})"

@@ -8,17 +8,14 @@
 # own arch.
 #
 #   # on the aarch64 host (this Mac):
-#   docker build -f docker/zig-linux.Dockerfile -t bit-zig-0.16.0:latest .
+#   docker build -f docker/linux-gate.Dockerfile -t bit-linux-gate:latest .
 #   # on the x86-64 box:
-#   docker build -f docker/zig-linux.Dockerfile -t bit-zig-0.16.0-amd64:latest .
+#   docker build -f docker/linux-gate.Dockerfile -t bit-linux-gate-amd64:latest .
 #
-# THE FILENAME AND THE IMAGE TAGS ARE NOW MISNOMERS, DELIBERATELY. #1871 deleted
-# build.zig, so the gates run `./make` and this image installs no Zig at all.
-# The names are kept because the images ALREADY BUILT under them are what the
-# two gate hosts have on disk, and renaming would break both gates until someone
-# rebuilt and redistributed — a change that has to be made on the hosts, not
-# here. An image built from this file today simply has no Zig in it; the older
-# images still carry it, harmlessly. Renaming is tracked separately.
+# The tags carry no version, on purpose: the image installs four Debian packages
+# and nothing that pins a compiler, so there is no version for it to be OF. The
+# thing under test arrives with the tree (`git archive HEAD`) and the bootstrap
+# compiler is downloaded and digest-verified per run by scripts/stage0.sh.
 #
 # This file exists because the images were originally built ad hoc, with no
 # recorded recipe — so when the suite grew a dependency the images lacked (git,

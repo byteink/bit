@@ -2,7 +2,7 @@
 # Run `./make test` for x86_64-linux on the real-hardware box (see
 # scripts/x64host.sh) in Docker, over the committed tree (git archive HEAD).
 #
-#   x64gate.sh          # fast: reuse a persistent zig cache volume (only changed
+#   x64gate.sh          # fast: reuse a persistent build cache volume (only changed
 #                       #       files recompile) — for iterative checks
 #   x64gate.sh clean    # clean-room: throwaway cache, full cold build — for a
 #                       #       final sign-off where no stale artifact may hide
@@ -30,23 +30,13 @@ set -euo pipefail
 
 MODE="${1:-fast}"
 RUNS="${2:-1}"
-IMAGE="bit-zig-0.16.0-amd64:latest"
+IMAGE="bit-linux-gate-amd64:latest"
 
-# `fuzz` runs the mutation fuzzer instead of the test suite, on REAL x86_64.
-# This exists because the amd64 image reports 2 fuzz failures when it runs
-# EMULATED on an Apple-Silicon Mac: emulated Zig's native-CPU autodetect returns
-# `athlon_xp`, which current Zig rejects for the musl crt1.o sub-compile that the
-# fuzz step's `link_libc` needs. That is a toolchain artifact of emulation, not a
-# Bit bug — and this mode is how you check that claim instead of inheriting it.
+# `fuzz` runs the mutation fuzzer instead of the test suite, on REAL x86_64 —
+# the only place an x86-64 codegen crash can be trusted as a Bit defect rather
+# than an emulation artifact. Baseline, measured at tree ff9ac2e (#1258):
+# 10,970 iterations, 0 crashes, X64LINUX_EXIT=0.
 #
-# SETTLED 2026-07-19 (#1258), measured both ways at tree ff9ac2e — do not re-chase:
-#   real x86_64 hardware:     `x64gate.sh fuzz` -> 10,970 iterations, 0 crashes,
-#                             X64LINUX_EXIT=0.
-#   emulated amd64 on the Mac: `./make fuzz` never runs a single iteration. It
-#                             fails to COMPILE with exactly 2 errors — glibc
-#                             `libc_nonshared.a` and `Scrt1.o`, both
-#                             "unknown target CPU 'athlon-xp'".
-# Zero Bit code executes in the emulated failure, so it cannot be a Bit defect.
 # STEP defaults to the full suite but an exported STEP env wins (scripts/gate.sh
 # sets it to a scoped set like "test-golden test-imports-bit"). #1772.
 STEP="${STEP:-test}"
@@ -54,7 +44,7 @@ if [ "${MODE}" = "fuzz" ]; then
   STEP="fuzz -- ${FUZZ_SECS:-60}"
   MODE="fast"
 fi
-VOLUME="bit-zig-cache-amd64"
+VOLUME="bit-gate-cache-amd64"
 
 # Which real-x86_64 box runs the gate. No hostname is baked into the repo —
 # machine names are the operator's, not the project's. Resolution order:
@@ -67,7 +57,7 @@ VOLUME="bit-zig-cache-amd64"
 # The resolved host is ECHOED before the run: which box a number came from is
 # part of the result, and x86-64-vs-aarch64 disagreement is this repo's standard
 # tell for an ABI-boundary bug.
-# The host needs ssh access and a `bit-zig-0.16.0-amd64` image. Copy it with
+# The host needs ssh access and a `bit-linux-gate-amd64` image. Copy it with
 # `docker save | docker load` rather than rebuilding, so every host runs a
 # byte-identical image and a host swap cannot change what is being tested.
 X64GATE_HOST="${X64GATE_HOST:-}"
@@ -79,7 +69,7 @@ if [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; then
   # the file header for why a hardware-timing-sensitive gate needs this.
   HOSTS=$(bash "$(dirname "$0")/x64host.sh" --all) || {
     echo "x64gate: no host configured (see above). Each host also needs a" >&2
-    echo "         bit-zig-0.16.0-amd64 image." >&2
+    echo "         bit-linux-gate-amd64 image." >&2
     exit 127
   }
 elif [ -n "${X64GATE_HOST}" ]; then
@@ -87,7 +77,7 @@ elif [ -n "${X64GATE_HOST}" ]; then
 else
   HOSTS=$(bash "$(dirname "$0")/x64host.sh") || {
     echo "x64gate: no host configured (see above). The host also needs a" >&2
-    echo "         bit-zig-0.16.0-amd64 image." >&2
+    echo "         bit-linux-gate-amd64 image." >&2
     exit 127
   }
 fi
@@ -109,13 +99,13 @@ while IFS= read -r host; do
   [ -n "${host}" ] || continue
   # The suite needs a `git` binary INSIDE the image: the package manager fetches
   # dependencies by shelling out to it, so tests/imports/pmadd_e2e,
-  # tests/pmimports.zig and compiler/pmclicheck.bit all fail without it — as
+  # tests/bit/pmimports.bit and compiler/pmclicheck.bit all fail without it — as
   # `git: not found`, an empty failure, and a bare assertion panic respectively
   # (#1818). Refused here so the cause is named once, instead of three
   # unrelated-looking harnesses going red on the remote box. macOS has git from
   # the host, which is why a git-less image passed the local gate.
   ssh "${host}" "docker run --rm ${IMAGE} sh -c 'command -v git'" >/dev/null 2>&1 || {
-    echo "x64gate: ${IMAGE} on ${host} has no git — rebuild it from docker/zig-linux.Dockerfile" >&2; exit 127; }
+    echo "x64gate: ${IMAGE} on ${host} has no git — rebuild it from docker/linux-gate.Dockerfile" >&2; exit 127; }
   for i in $(seq 1 "${RUNS}"); do
     total=$((total + 1))
     { [ "${RUNS}" -gt 1 ] || [ "${X64GATE_ALL_HOSTS:-0}" = "1" ]; } && echo "===RUN host=${host} ${i}/${RUNS}==="

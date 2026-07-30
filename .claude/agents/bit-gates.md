@@ -58,7 +58,7 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
 
   Same rule for signalling: never `pkill -f`, and kill nothing you did not spawn, however
   confident you are that it is an orphan.
-- The docker tag `bit-zig-0.16.0:latest` intermittently fails `docker image inspect` while
+- The docker tag `bit-linux-gate:latest` intermittently fails `docker image inspect` while
   showing in `docker images` (#1497). That is the known image bug, not a Bit failure — pass
   the id instead: `IMAGE=<id> scripts/arm64gate.sh`. Never gate with an edited copy of a
   gate script; a gate that is not the one in the repo has not been reviewed.
