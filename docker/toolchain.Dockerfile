@@ -13,8 +13,18 @@
 #
 # HOW IT IS PUBLISHED. Recorded because it was not: releases 0.1.3 and 0.1.4
 # shipped while ghcr still served 0.1.2, and no file in the tree said how to
-# build this image, so nobody noticed it had gone stale (#1888). Run after
-# `dist/release.sh <version>` has left the artifacts in dist/out/:
+# build this image, so nobody noticed it had gone stale (#1888).
+#
+# THIS STAYS A MANUAL STEP, by decision — do not wire it into dist/release.sh.
+# Everything that script publishes is a `gh release create --draft`, invisible
+# until a human flips it, so no bug and no stray run can make anything public.
+# A container tag has no draft state: `docker push` is live on completion and
+# moving `latest` is live for everyone pulling. Automating this would hand the
+# release path both write:packages and the ability to publish irreversibly, and
+# would put the push inside reach of a `--dry-run` that is supposed to publish
+# nothing.
+#
+# Run after `dist/release.sh <version>` has left the artifacts in dist/out/:
 #
 #   gh auth token | docker login ghcr.io -u <user> --password-stdin
 #   docker buildx build -f docker/toolchain.Dockerfile \
