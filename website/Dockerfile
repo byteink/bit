@@ -12,14 +12,14 @@
 # needs must be produced FROM committed source, inside the build.
 #
 # Bit compiles Bit: stage 1 is the published toolchain image, so this file is the
-# whole toolchain story. No Zig, no bootstrap, no host-built artifact.
+# whole toolchain story. No bootstrap step, no host-built artifact.
 #
 # --- stage 1: build the server with the RELEASED toolchain ------------------
 #
-# This used to install Zig and run `zig build` to produce a compiler from source:
-# ~132s of every deploy spent rebuilding a toolchain that is now published. The
-# image below is the release artifact, so the site is built by the exact compiler
-# users install — the website is a real, if small, test of the release.
+# The image below IS the release artifact, so the site is built by the exact
+# compiler users install — which makes the website a real, if small, test of the
+# release. Building a compiler here instead would cost ~132s of every deploy and
+# test something nobody installs.
 #
 # PINNED BY DIGEST, not by tag. A version tag looks immutable and is not: 0.1.0
 # was re-cut to fix a version-string bug and `:0.1.0` was republished pointing at
@@ -29,8 +29,8 @@
 #
 # The comment carries the human-readable version; bumping the toolchain means
 # updating both, in a commit whose diff shows exactly what changed.
-FROM ghcr.io/byteink/bit@sha256:5eb716a1fc43b504d370665ac4143bda127bc16a5b61ea51951058969b72fcf8 AS build
-# ^ ghcr.io/byteink/bit:0.1.2
+FROM ghcr.io/byteink/bit@sha256:c62475db5263556ab0209c2af468585434051cf1d730aad480afc05fb5b43f5b AS build
+# ^ ghcr.io/byteink/bit:0.1.4
 
 # The toolchain image runs as uid 65532 (correct for its own job, compiling a
 # user's bind-mounted project). A build stage writes to the image filesystem, so
@@ -39,10 +39,11 @@ USER root
 
 WORKDIR /src
 
-# ONLY website/server/. This was `COPY . .`, which is 17GB on a dev machine -
-# .zig-cache alone is 16GB - and that copy, not the compile, was most of the build
-# time. The server's only imports are std/http, std/fs, std/strings and std/os,
-# all of which live in the toolchain image, so nothing else in the tree is input.
+# ONLY website/server/. This was `COPY . .`, which on a dev machine drags in every
+# build cache in the tree — gigabytes of it — and that copy, not the compile, was
+# most of the build time. The server's only imports are std/http, std/fs,
+# std/strings and std/os, all of which live in the toolchain image, so nothing
+# else in the tree is input.
 #
 # The server-side build never showed this: ssd sends `git archive HEAD`, so
 # untracked caches were already absent there. .dockerignore covers the local case

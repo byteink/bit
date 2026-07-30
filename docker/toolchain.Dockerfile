@@ -10,6 +10,42 @@
 # Multi-arch from prebuilt binaries: both linux tarballs go into the context and
 # TARGETARCH picks one, so `buildx --platform linux/amd64,linux/arm64` produces a
 # real manifest list without emulating a compile.
+#
+# HOW IT IS PUBLISHED. Recorded because it was not: releases 0.1.3 and 0.1.4
+# shipped while ghcr still served 0.1.2, and no file in the tree said how to
+# build this image, so nobody noticed it had gone stale (#1888). Run after
+# `dist/release.sh <version>` has left the artifacts in dist/out/:
+#
+#   gh auth token | docker login ghcr.io -u <user> --password-stdin
+#   docker buildx build -f docker/toolchain.Dockerfile \
+#     --platform linux/amd64,linux/arm64 --build-arg BIT_VERSION=<version> \
+#     -t ghcr.io/byteink/bit:<version> --push .
+#
+# Then the per-arch tags the earlier releases established, and only once the
+# version tag is confirmed pullable, `latest`:
+#
+#   docker buildx imagetools create -t ghcr.io/byteink/bit:<version>-amd64 \
+#     ghcr.io/byteink/bit@<amd64 child digest>
+#   docker buildx imagetools create -t ghcr.io/byteink/bit:<version>-arm64 \
+#     ghcr.io/byteink/bit@<arm64 child digest>
+#   docker buildx imagetools create -t ghcr.io/byteink/bit:latest \
+#     ghcr.io/byteink/bit:<version>
+#
+# VERIFY ANONYMOUSLY, always. A ghcr package is private and unlinked by default,
+# and both settings are UI-only — so a successful authenticated pull says nothing
+# about what a stranger following README.md gets. Fetch a credential-less token
+# and read the tag list back:
+#
+#   tok=$(curl -s "https://ghcr.io/token?scope=repository:byteink/bit:pull&service=ghcr.io" \
+#         | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+#   curl -s -H "Authorization: Bearer $tok" https://ghcr.io/v2/byteink/bit/tags/list
+#
+# The `bit run t.bit` at the end of the RUN block below is what makes a single
+# build+push safe: a corrupt artifact fails the build, so nothing reaches ghcr.
+# On this Mac the amd64 half of that check runs under qemu. That is fine HERE —
+# it proves the tarball is not corrupt, and it is not a hardware gate. These
+# exact bytes were already smoke-tested on matching hardware by dist/release.sh
+# before the release was published.
 
 FROM alpine:3.24
 
