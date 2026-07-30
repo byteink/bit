@@ -166,10 +166,28 @@ mutant_stream() {
     printf '\nthis is not valid bit — arm64gate deliberate breakage\n' >> "${victim}"
   fi
   echo "arm64gate: mutating ${victim#"${tmp}"/}" >&2
-  # --no-xattrs: macOS bsdtar otherwise stamps every entry with a
-  # com.apple.provenance xattr that GNU tar in the container warns about once per
-  # file — ~100KB of noise that buries the actual result.
-  tar c --no-xattrs -C "${tmp}" .
+  # This is the ONLY tar in the repo built from the local filesystem; everything
+  # else pipes `git archive HEAD`, whose tar comes from git objects and carries no
+  # xattrs. That difference is the whole reason the two flags below are needed
+  # here and nowhere else.
+  #
+  # Every file `git archive | tar x` writes on macOS gets a com.apple.provenance
+  # xattr. --no-xattrs stops GNU tar in the container warning once per file
+  # (~100KB of noise). COPYFILE_DISABLE=1 stops something worse: bsdtar cannot
+  # hold an xattr natively in this format, so it emits each one as a separate
+  # AppleDouble `._<name>` MEMBER. bsdtar re-merges those on read, which hides
+  # them from any check run on this host — `tar c … | tar t | grep '\._'` finds
+  # nothing — while GNU tar in the container materializes them as real files.
+  # Measured against bit-linux-gate:latest: 2119 of them without this, 0 with it.
+  #
+  # Since #1871 the build driver discovers sources by globbing `*.bit`, and
+  # `._core.bit` matches, so those blobs get COMPILED — thousands of
+  # `unexpected byte 0x00`, a broken pipe, and no verdict at all, which is
+  # `mutant`/`selftest` unable to prove this gate can fail (#1890).
+  #
+  # --exclude '._*' does NOT work and was measured: still 2119. The members are
+  # synthesized at write time and never exist as paths for a filter to match.
+  COPYFILE_DISABLE=1 tar c --no-xattrs -C "${tmp}" .
   rm -rf "${tmp}"
 }
 
