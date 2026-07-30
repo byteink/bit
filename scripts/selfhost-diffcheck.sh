@@ -25,7 +25,7 @@
 # routes a lone file through `checkHostProject(absFromCwd(dirname), basename)`,
 # introduced when a lone .bit file became a module in 83b511f), so it renders
 # `--> /abs/repo/stdlib/x.bit`. bit2 renders the path AS GIVEN — `--> stdlib/x.bit`
-# — which is what gcc/clang/rustc/zig do and what the `.expected` goldens encode,
+# — which is what gcc, clang and rustc all do, and what the `.expected` goldens encode,
 # so bit2 is the correct one. Rather than do loader surgery on the about-to-retire
 # seed, strip the repo-root prefix from the seed's output before comparing: the
 # diff then reflects only REAL diagnostic differences, and this script retires
@@ -50,8 +50,9 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
-# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
-# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
+# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
 # than skipping, so a failure here is loud. What a green run asserts changed with
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.
@@ -97,9 +98,16 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
     [ -z "$firsthang" ] && firsthang="$f (SIGALRM after ${TIMEOUT_S}s x2, seed=$src bit=$brc)"
     continue
   fi
-  # The seed appends its own `error: CheckFailed` trace line; that is the Zig
-  # runtime reporting main's error return, not a diagnostic. Drop it, and strip
-  # the absolute repo-root prefix so the two rendered streams are comparable.
+  # BOTH of these normalizations are INERT against the current oracle and are
+  # kept only until #1893 proves that over the whole corpus rather than the one
+  # file it has been checked on. Measured 2026-07-30 against the 0.1.4 stage0:
+  # it emits no `error: CheckFailed` line (that line was never a diagnostic —
+  # it was a runtime reporting main's error return), and it renders the path
+  # exactly as given, identically to this tree.
+  #
+  # They are not harmless-by-default: a filter on a differential's ORACLE side
+  # can only ever hide a difference, never reveal one — the same hazard #1883
+  # deleted the expected-mismatch lists for. Remove, do not extend.
   seed=$(printf '%s\n' "$seed" | grep -v '^error: CheckFailed$' | sed "s#--> ${ROOT}#--> #")
   if [ "$seed" = "$b2" ]; then
     match=$((match + 1))

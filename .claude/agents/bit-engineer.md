@@ -100,7 +100,7 @@ multiset diff caught it.
 
 `./make test` prints `failed command: ...` **on success** — trust the exit code and the
 harness verdict line. `./make` alone does NOT compile the Bit stdlib (`bit check <dir>`
-is the cheap direct check), and it links a STALE `libbitrt.a` — runtime `.zig` edits need
+is the cheap direct check), and it links a STALE `libbitrt.a` — a `runtime/**` edit needs
 `./make libbitrt` first (#1486).
 
 ## Touching the corpus? run the whole family

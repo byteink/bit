@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # scripts/fuzz.sh — mutation-fuzz the compiler front end, replacing `./make fuzz`.
 #
-# Runs tests/bit/fuzz.bit, the Bit port of tests/fuzz/{guard,mutate,fuzz,
-# crash_regression}.zig. Two phases in one process: replay every saved crash
+# Runs tests/bit/fuzz.bit. Two phases in one process: replay every saved crash
 # under tests/fuzz/crashes/, then mutate tests/cases/*.bit until the budget
 # runs out. Both phases bound each child with `osRunBounded` (ABI.md §19).
 #

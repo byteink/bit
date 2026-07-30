@@ -10,7 +10,8 @@
 # seed-fmt output vs bit-fmt output. NOT fmt output vs the file on disk.
 # The formatter deliberately disagrees with most of the checked-in corpus
 # (it explodes hand-grouped crypto tables and mangles multi-line match bodies),
-# and Bit is deliberately NOT gated on `bit fmt` the way it is on `zig fmt`.
+# and the repo is deliberately NOT gated on `bit fmt` being a no-op: the
+# formatter is not yet good enough to be normative.
 # So "the formatted text differs from the repo" is expected and is not measured
 # here. Only the two compilers disagreeing with EACH OTHER is a finding.
 #
@@ -42,8 +43,9 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-difffmt.sh
 set -uo pipefail
-# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
-# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
+# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
 # than skipping. What a green run asserts changed with it: "unchanged versus the
 # last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
 ORACLE=${DIFFFMT_ORACLE:-$(sh scripts/stage0.sh)} || exit 2

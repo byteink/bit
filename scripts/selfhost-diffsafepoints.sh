@@ -20,8 +20,9 @@
 # neither is acceptable, so this compares for equality.
 set -u
 
-# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
-# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
+# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
 # than skipping, so a failure here is loud. What a green run asserts changed with
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.

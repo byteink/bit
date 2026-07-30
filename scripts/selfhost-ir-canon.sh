@@ -2,8 +2,8 @@
 # Shared by selfhost-diffir.sh and selfhost-diffiropt.sh (#1766).
 #
 # `$t<id>` type-id suffixes are assigned in first-touch interning order, which
-# depends on Zig HashMap / call-site-checking iteration order — the seed and
-# `bit` can intern the same set of types in a different order and emit
+# depends on hash-map and call-site-checking iteration order — two compiler
+# versions can intern the same set of types in a different order and emit
 # structurally-identical IR with different `$t<id>` numbers (see
 # tests/selfhost-ir-gaps.txt: run_generic_method.bit). A raw byte compare
 # flags that as a mismatch even though nothing is actually wrong.

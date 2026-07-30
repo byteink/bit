@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Self-host `bit doc` differential (#1590): run every corpus MODULE through both
 # compilers' `doc` and compare the exported-surface bytes. `doc` derives a
-# module's public API from the checker (not a text scrape), and `tests/stdlib_docs.zig`
-# fails the build on any undocumented export — so this surface is a live gate, and
-# it was seed-only until the port. This is the standing differential that keeps the
+# module's public API from the checker (not a text scrape), and `tests/bit/stdlibdocs.bit`
+# fails the build on any undocumented export — so this surface is a live gate.
+# This is the standing differential that keeps the
 # two `doc` implementations in step.
 #
 # ## What is being compared
@@ -35,8 +35,9 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffdoc.sh
 set -uo pipefail
-# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
-# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
+# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
 # than skipping. What a green run asserts changed with it: "unchanged versus the
 # last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
 ORACLE=${DIFFDOC_ORACLE:-$(sh scripts/stage0.sh)} || exit 2

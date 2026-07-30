@@ -68,10 +68,8 @@ mkdir -p "${OUT}"
 # are releasing. v0.1.0 shipped exactly that bug: `bit --version` said 0.1.0-dev.
 #
 # This IS the version-stamping mechanism — there is no build-driver option for
-# it. `zig build -Dversion=` used to exist to keep the seed and the self-hosted
-# compiler agreeing on one string; both it and build.zig are gone (#1871), and a
-# release always took this path anyway, because it needs three CROSS-built
-# targets rather than the one native compiler that option produced.
+# it, and there should not be: a release needs three CROSS-built targets, and a
+# driver flag would only ever stamp the one native compiler.
 #
 # EXCLUDE the real version.bit rather than overwriting it afterwards: two files
 # declaring `bitVersion` is a duplicate-symbol error, and a copy-then-overwrite

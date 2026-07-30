@@ -1,6 +1,6 @@
 ---
 name: bit-triage
-description: Finds the root cause when the Zig seed and the self-hosted compiler disagree, or when a Bit program miscompiles. Use for a red differential, a silent wrong answer, a SIGSEGV from a clean build, or "these two compilers produce different output". Narrows to the first diverging stage and reports the cause. Does not ship the fix.
+description: Finds the root cause when a differential goes red — this tree's compiler disagreeing with the pinned stage0 oracle — or when a Bit program miscompiles. Use for a silent wrong answer, a SIGSEGV from a clean build, or "these two compilers produce different output". Narrows to the first diverging stage and reports the cause. Does not ship the fix.
 tools: Read, Grep, Glob, Bash, mcp__smash__smash_show, mcp__smash__smash_add, mcp__smash__smash_comment
 ---
 

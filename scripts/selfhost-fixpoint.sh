@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# Self-hosted fixed-point proof (#1350): the self-hosted compiler must be able
-# to build ITSELF, reproducibly, with NO seed/Zig in the loop. This is the
-# guarantee that lets the seed retire — once it is gone there is no stage2 to
-# compare against, so the meaningful property is self-reproducibility:
+# Fixed-point proof (#1350): `bit` must be able to build ITSELF, reproducibly.
+# This is the property that makes the bootstrap terminate rather than regress:
 #
-#   stageA (the current self-hosted bit) builds compiler/ -> stageB
-#   stageB                              builds compiler/ -> stageC
+#   stageA (the current bit) builds compiler/ -> stageB
+#   stageB                   builds compiler/ -> stageC
 #   sha256(stageB) == sha256(stageC)    <-- byte-identical fixed point
 #
-# NOTE on stage2 vs stage3: the seed-built self-hosted binary (`bit2`, "stage2")
-# is NOT byte-identical to stageB ("stage3") — the seed and bit2 emit
-# different-but-equivalent code for the compiler (2 cosmetic monomorph
-# instance-ordering diffs, see selfhost-diffir.sh). That is expected and
-# irrelevant to retiring the seed: we require bit == bit-built-by-bit, not
-# bit == a-compiler-we-are-deleting. Go retired its C bootstrap the same way.
+# WHY THIS IS THE RIGHT PROPERTY, and not "matches the compiler that built me".
+# The binary produced by the pinned stage0 is NOT byte-identical to stageB, and
+# must not be required to be: two compilers can emit different-but-equivalent
+# code for the same source (the known case is monomorph instance ordering, see
+# selfhost-diffir.sh). Demanding equality there would pin this tree's output
+# forever to one past release. What must hold is bit == bit-built-by-bit.
 #
 # Same-basename outputs in different dirs: the Mach-O codesign identifier derives
 # from the output FILENAME, so both stages must be named identically or the hash
-# differs for a spurious reason. bit2's writer does NOT mkdir parents — mkdir -p.
+# differs for a spurious reason. The writer does NOT mkdir parents — mkdir -p.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-fixpoint.sh
 #        (or pass an explicit stageA binary: bash scripts/selfhost-fixpoint.sh path/to/bit)

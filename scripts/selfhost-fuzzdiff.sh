@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Self-host front-end fuzz differential (#1332/#363): mutate every corpus `.bit`
 # by truncating it at each line boundary, then diff `--dump-diags` between the
-# Zig seed and `bit2`. Truncation is the cheapest high-value fuzz — it strands
+# oracle and this tree's `bit`. Truncation is the cheapest high-value fuzz — it strands
 # strings, block comments, and declarations mid-construct, exercising the
 # unterminated/expected-token diagnostics that valid files never reach.
 #
@@ -18,8 +18,9 @@
 #   2  could not decide: a missing compiler, or a run timed out and was never
 #      compared. Not a pass — see #1524/#1525.
 set -u
-# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
-# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
+# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
 # than skipping, so a failure here is loud. What a green run asserts changed with
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.

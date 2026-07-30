@@ -1,19 +1,17 @@
 #!/bin/sh
-# Entry point for the Bit build driver (#1868, epic #1867) — the replacement for
-# `build.zig`, the last `.zig` file in the repository.
+# Entry point for the Bit build driver (#1868, epic #1867).
 #
 # All the logic lives in `tools/build/` and is written in Bit. This file exists
 # only to break the one bootstrap step that cannot be written in Bit: something
 # has to compile the driver before the driver can run. It resolves the pinned
 # stage0 (a `bit`), builds `tools/build/` with it, and execs the result.
 #
-# WHY SHELL IS ACCEPTABLE HERE AND ZIG WAS NOT. The goal of #1867 is removing
-# the ZIG TOOLCHAIN — a second compiler, a second language, a second build
-# system that had to be installed to build Bit at all. `sh` is already a hard
-# dependency of this repo: the fifteen `scripts/selfhost-diff*.sh`, `gate.sh`,
-# `g2archive.sh`, `stage0.sh`, `release.sh` and the harnesses' own generated
-# wrappers all use it. Ten lines of POSIX `sh` add no dependency that was not
-# already there; keeping `build.zig` would have kept a whole toolchain.
+# WHY SHELL IS ACCEPTABLE HERE, when the point of #1867 was to stop needing a
+# second toolchain to build Bit at all. `sh` is already a hard dependency of
+# this repo: the fifteen `scripts/selfhost-diff*.sh`, `gate.sh`, `g2archive.sh`,
+# `stage0.sh`, `release.sh` and the harnesses' own generated wrappers all use
+# it. Ten lines of POSIX `sh` add nothing that was not already required. This
+# file must stay that small — logic belongs in `tools/build/`, in Bit.
 #
 # Usage: ./make [--list] [<step>...]
 set -eu

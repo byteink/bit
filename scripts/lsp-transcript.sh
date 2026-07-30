@@ -4,7 +4,7 @@
 # replies. There is deliberately no lsp differential (one server, nothing to
 # diff, per #1542), so this is the end-to-end check: initialize -> didOpen ->
 # hover/definition/documentSymbol/completion -> shutdown, each against its own
-# temp directory, mirroring the seed's TestSession sessions (seed/lsp.zig).
+# temp directory, one session per request kind.
 #
 # Usage: bash scripts/lsp-transcript.sh [path-to-bit]
 # Exit 0 iff every scenario's assertions pass; nonzero (with a FAIL line) otherwise.

@@ -9,8 +9,9 @@
 # cannot confidently scope runs the full suite instead.
 #
 # Usage:
-#   scripts/gate.sh                    # scope to `git diff --name-only main...HEAD`
-#   RANGE=HEAD~1..HEAD scripts/gate.sh # scope to a different range
+#   scripts/gate.sh                    # scope to `main...HEAD` PLUS the working tree
+#   RANGE=HEAD~1..HEAD scripts/gate.sh # use a different range (the working tree is
+#                                      # still included on top of it)
 #   scripts/gate.sh --full             # always run the full `./make test`
 #   scripts/gate.sh --x64              # route the computed build steps through
 #                                      # scripts/x64gate.sh (real x86_64 hardware)
@@ -47,16 +48,43 @@ for arg in "$@"; do
 done
 
 RANGE="${RANGE:-main...HEAD}"
-CHANGED="$(git diff --name-only "${RANGE}")"
+
+# THE WORKING TREE IS ALWAYS INCLUDED, on top of the range (#1892). This used to
+# be `git diff --name-only "${RANGE}"` alone, which is commit-to-commit only and
+# never sees the working tree or the index — and `main...HEAD` is empty by
+# definition while HEAD *is* main. So the default invocation on main, with
+# `compiler/**` modified and sitting right there, printed "nothing to test" and
+# exited 0. A caller checking `$?` reads that as a pass on an unverified change,
+# which is the same defect as a differential that prints a count and cannot fail.
+#
+# `ls-files --others` matters as much as the diffs: a brand new untracked
+# tests/cases/*.bit is exactly the change that must select a bucket, and no form
+# of `git diff` reports one.
+CHANGED="$(
+  {
+    git diff --name-only "${RANGE}"
+    git diff --name-only                        # unstaged
+    git diff --cached --name-only                # staged
+    git ls-files --others --exclude-standard     # new, untracked
+  } | sed '/^$/d' | sort -u
+)"
 
 # --full always forces the full suite, even over an empty diff: it is an
 # explicit request, not something the diff-scoping should second-guess.
 if [ -z "${CHANGED}" ] && [ "${FULL}" -eq 0 ]; then
-  echo "gate: no changed files in range '${RANGE}' — nothing to test"
+  # Empty set on a DIRTY tree is a contradiction in this script's own logic, not
+  # a clean bill of health. Refuse rather than report success.
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "gate: tree is dirty but no files were resolved from range '${RANGE}'" >&2
+    echo "gate: refusing to report success — this is a bug in gate.sh, not a pass" >&2
+    git status --short >&2
+    exit 2
+  fi
+  echo "gate: no changed files in range '${RANGE}' and a clean tree — nothing to test"
   exit 0
 fi
 
-echo "gate: changed files (range '${RANGE}'):"
+echo "gate: changed files (range '${RANGE}' + working tree):"
 if [ -n "${CHANGED}" ]; then
   printf '%s\n' "${CHANGED}" | sed 's/^/  /'
 else
@@ -156,11 +184,11 @@ case "${BUCKET}" in
     POST1="scripts/selfhost-diffruntime.sh"
     ;;
   runtime)
-    # Every name here was stale (#1593). `test-gcdiff` was deleted with the Zig
-    # collector in #1854, and `rootpins`/`rootabi`/`stwwiring` gained a `test-`
-    # prefix when they moved from tests/*.zig to tests/bit/*.bit in #1591 — so a
-    # runtime/** change ran FOUR nonexistent steps and died on `no step named`.
-    # The check after this case block now catches that class before anything runs.
+    # Every name in this bucket was once stale: four of the six named steps did
+    # not exist, so a runtime/** change died on `no step named` instead of
+    # testing anything. The check after this case block now catches that class
+    # before a single step runs — a bucket naming a nonexistent step is a
+    # bucket that silently tests less than it claims.
     BUILD_STEPS=(test-stress test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
     POST1="scripts/selfhost-diffruntime.sh"
     ;;
@@ -182,9 +210,9 @@ esac
 # which this check is what caught. The raw `unknown step` the driver would print
 # does not point at this file, so nobody connects the two.
 #
-# The oracle is `./make --list`, and it is NO LONGER OPTIONAL. It used to be
-# wrapped in `command -v zig`, which meant a host without the toolchain skipped
-# the check silently — and after #1871 that would have been every host. An
+# The oracle is `./make --list`, and it is NOT OPTIONAL. It used to be guarded
+# by a `command -v` probe for a tool the build no longer needs, so on any host
+# without that tool the check skipped SILENTLY rather than failing. An
 # unreadable list now fails here rather than flagging every name as stale, since
 # "the oracle is missing" and "the name is wrong" need different fixes.
 STEP_LIST="$(./make --list 2>/dev/null)" || STEP_LIST=""

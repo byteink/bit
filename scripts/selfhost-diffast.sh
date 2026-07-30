@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Self-host AST differential (#1332/#1335): parse every corpus `.bit` file with
-# both the Zig seed (`bit`) and the Bit compiler (`bit2`) and diff their
-# `--dump-ast` output. They must be byte-identical. Files the seed rejects with
-# a parse/lex error are skipped — the Bit parser has no diagnostic renderer yet
-# (deferred with the renderer port), so it parses past errors where the seed
-# prints a diagnostic instead.
+# AST differential (#1332/#1335): parse every corpus `.bit` file with both the
+# oracle and this tree's `bit` and diff their `--dump-ast` output. They must be
+# byte-identical. Files the oracle rejects with a parse/lex error are skipped:
+# the two sides do not agree on how far to parse past an error, so a rejected
+# file compares diagnostics rather than trees and belongs to diffdiags.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffast.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
 set -u
-# The oracle is the PINNED STAGE0 (previous release), not the retired Zig seed
-# (#1593). scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
+# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
+# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
 # than skipping, so a failure here is loud. What a green run asserts changed with
 # it: "unchanged versus the last release", not "two implementations agree" —
 # docs/release/bootstrap.md §4/§5.

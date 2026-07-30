@@ -24,10 +24,9 @@ autodetecting scanner.
 
 The one real "component" in this build is the PINNED STAGE0 — the previous Bit
 release, which compiles this tree's compiler and every linked runtime archive.
-Until #1871 that slot held the Zig toolchain; `build.zig` and the Zig pin are
-gone, and nothing replaced them, so the build tooling is now a Bit binary. It is
-listed under metadata.tools, the schema's slot for build tooling, not as a
-shipped dependency — because it is not one.
+It is listed under metadata.tools, the schema's slot for build tooling, not as a
+shipped dependency — because it is not one. Nothing else occupies that slot:
+the build needs no compiler other than a previous Bit release.
 """
 import sys
 

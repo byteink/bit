@@ -41,7 +41,7 @@ compiler.** Necessary, never sufficient — a change can be self-consistently wr
   Observed: exit 144, empty log, and the real process still running orphaned.
 - **`./make test` prints `failed command: ...` on SUCCESS.** Trust the exit code and the
   harness verdict line, not that string.
-- **`./make` links a STALE `libbitrt.a`.** Runtime `.zig` edits need `./make libbitrt`
+- **`./make` links a STALE `libbitrt.a`.** A `runtime/**` edit needs `./make libbitrt`
   first, or you are gating an archive that predates the change (#1486).
 - **`x64gate.sh` only sees COMMITTED work** — it runs `git archive HEAD`. Uncommitted edits
   are not tested. Commit first, then gate.
