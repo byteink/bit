@@ -54,7 +54,6 @@ set -uo pipefail
 # two stdlibs instead of two compilers.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
-GAPS=tests/selfhost-runtime-gaps.txt
 TIMEOUT=${DIFFRUNTIME_TIMEOUT:-20}
 
 # A gate whose population can quietly go to zero passes everything. `runtime/`
@@ -73,7 +72,6 @@ REQUIRED="runtime/root/floatslog.bit runtime/root/floatsatan.bit"
 for bin in "$ORACLE" "$BIT2"; do
   [ -x "$bin" ] || { echo "diffruntime: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
-[ -f "$GAPS" ] || { echo "diffruntime: missing expected-gap list $GAPS" >&2; exit 2; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -141,28 +139,22 @@ if [ -s "$work/timeout" ]; then
   bad=1
 fi
 
-# Gate on the SET, not the count (#1469): MATCH could grow while a known gap
-# closed and a fresh regression opened in its place, and the two runs would read
-# identically.
+# NO DIVERGENCE IS PERMITTED. Any runtime file whose IR differs from the pinned
+# stage0's fails the run. There was an expected-mismatch list so a known
+# difference could be written down instead of fixed; its last entry closed and it
+# was deleted with its reader (#1883).
+#
+# The MIN_FILES floor and the REQUIRED list above are a SEPARATE property and
+# stay: they prove the run was not vacuous, which an exit code cannot (#1881).
 sort -u "$work/mismatch" >"$work/mismatch.sorted"
-grep -vE '^\s*(#|$)' "$GAPS" | sort -u >"$work/gaps.sorted"
 
-entered=$(comm -23 "$work/mismatch.sorted" "$work/gaps.sorted")
-left=$(comm -13 "$work/mismatch.sorted" "$work/gaps.sorted")
-
-if [ -n "$entered" ]; then
-  echo "diffruntime: FAIL — new mismatch(es), not in $GAPS:" >&2
-  echo "$entered" | sed 's/^/  /' >&2
+if [ -s "$work/mismatch.sorted" ]; then
+  echo "diffruntime: FAIL — $(wc -l <"$work/mismatch.sorted" | tr -d ' ') file(s) diverge from the pinned stage0:" >&2
+  sed 's/^/  /' "$work/mismatch.sorted" >&2
   echo "  Diff one with:  diff <(\"$ORACLE\" --dump-ir-pre FILE) <($BIT2 --dump-ir-pre FILE)" >&2
-  bad=1
-fi
-if [ -n "$left" ]; then
-  echo "diffruntime: FAIL — expected mismatch(es) now agree; delete from $GAPS:" >&2
-  echo "$left" | sed 's/^/  /' >&2
   bad=1
 fi
 
 [ "$bad" -ne 0 ] && exit 1
 
-echo "diffruntime: PASS — $match/$total runtime file(s) lower identically" \
-  "($skip skipped, $(wc -l <"$work/gaps.sorted" | tr -d ' ') known gap(s) held)"
+echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped)"

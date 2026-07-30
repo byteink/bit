@@ -13,9 +13,10 @@
 # because a known gap closed and a fresh regression opened in its place, and the
 # two runs would read identically.
 #
-# So the mismatching paths are compared against the checked-in expected set in
-# `tests/selfhost-iropt-gaps.txt`, and the gate fails when a file ENTERS or
-# LEAVES it. A swap at constant count is a failure, which is the whole point.
+# So every mismatching path is NAMED, and any mismatch at all fails the gate.
+# There was an expected-mismatch list for a while, so a known difference could be
+# written down instead of fixed; its last entry closed and it was deleted with its
+# reader (#1883). Nothing is permitted to differ now.
 #
 # A timeout is likewise not evidence. A file whose `bit` run is killed by the
 # alarm is reported separately and fails the gate, rather than being scored as a
@@ -31,7 +32,6 @@ set -uo pipefail
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
-GAPS=tests/selfhost-iropt-gaps.txt
 TIMEOUT=${DIFFIROPT_TIMEOUT:-20}
 
 # shellcheck source=scripts/selfhost-ir-canon.sh
@@ -40,7 +40,6 @@ TIMEOUT=${DIFFIROPT_TIMEOUT:-20}
 for bin in "$ORACLE" "$BIT2"; do
   [ -x "$bin" ] || { echo "diffiropt: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
-[ -f "$GAPS" ] || { echo "diffiropt: missing expected-gap list $GAPS" >&2; exit 2; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -74,50 +73,29 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
 done
 
 sort -o "$work/mismatch" "$work/mismatch"
-# Expected set: `path  # reason`, blank lines and full-line comments ignored.
-sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$GAPS" | grep -v '^$' | sort >"$work/expected"
 
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
-expected=$(wc -l <"$work/expected" | tr -d ' ')
 
-echo "IR (post-opt) differential: MATCH=$match MISMATCH=$mismatch (expected $expected) TIMEOUT=$timeouts SKIP(lower/check-err)=$skip"
-
-comm -23 "$work/mismatch" "$work/expected" >"$work/entered"
-comm -13 "$work/mismatch" "$work/expected" >"$work/left"
-comm -12 "$work/mismatch" "$work/expected" >"$work/held"
-
-if [ -s "$work/held" ]; then
-  echo
-  echo "known gaps still diverging (expected):"
-  while read -r f; do
-    reason=$(grep -F "$f" "$GAPS" | sed -e 's/^[^#]*#[[:space:]]*//' | head -1)
-    echo "  $f — ${reason:-no reason recorded}"
-  done <"$work/held"
-fi
+echo "IR (post-opt) differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(lower/check-err)=$skip"
 
 status=0
 
-if [ -s "$work/entered" ]; then
+# NO DIVERGENCE IS PERMITTED. There is no expected-mismatch list and no way to
+# add one (#1883): a file whose IR differs from the pinned stage0's fails the
+# run. The list existed so a known difference could be written down instead of
+# fixed; its last entry closed with #1882.
+if [ -s "$work/mismatch" ]; then
   echo
-  echo "REGRESSION: $(wc -l <"$work/entered" | tr -d ' ') file(s) newly diverge and are NOT in $GAPS:"
-  while read -r f; do echo "  entered: $f"; done <"$work/entered"
+  echo "REGRESSION: $mismatch file(s) diverge from the pinned stage0:"
+  while read -r f; do echo "  mismatch: $f"; done <"$work/mismatch"
   # Bounded evidence for the first few, so the failure is actionable in one read.
-  head -3 "$work/entered" | while read -r f; do
+  head -3 "$work/mismatch" | while read -r f; do
     echo
     echo "--- diff (stage0 vs bit, \$t<id> canonicalized): $f"
     diff <(canon_ir_ids "$("$ORACLE" --dump-ir "$f" 2>/dev/null)") \
          <(canon_ir_ids "$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir "$f" 2>/dev/null)") | head -20
   done
-  status=1
-fi
-
-if [ -s "$work/left" ]; then
-  echo
-  echo "STALE: $(wc -l <"$work/left" | tr -d ' ') expected gap(s) no longer diverge — delete them from $GAPS:"
-  while read -r f; do echo "  closed: $f"; done <"$work/left"
-  # Failing on a closed gap is deliberate: it is what makes a swap at constant
-  # count impossible to miss.
   status=1
 fi
 
@@ -128,5 +106,5 @@ if [ -s "$work/timeout" ]; then
   status=1
 fi
 
-[ "$status" -eq 0 ] && { echo; echo "diffiropt: mismatch set matches $GAPS exactly."; }
+[ "$status" -eq 0 ] && { echo; echo "diffiropt: every file's post-opt IR is identical to the pinned stage0's."; }
 exit "$status"
