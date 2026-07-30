@@ -58,24 +58,17 @@ compares two stdlibs instead of two compilers. `scripts/stage0.sh` emits a
 wrapper pinning `BIT_STDLIB`; the two examples gates pin `BIT_LIBBITRT`
 themselves, since that names one archive per triple.
 
-## History
+## Why this is called self-hosted
 
-The compiler was written in Zig first — the *seed* — and used to build the Bit
-compiler, which then built itself:
+`bit` compiles its own source to a fixed point: the binary stage 2 produces and
+the binary stage 3 produces are byte-identical.
 
 ```
-seed (Zig)  ->  stage1     the Bit compiler, built by the seed
-stage1      ->  stage2
-stage2      ->  stage3     and stage2 == stage3, byte for byte
+stage0  ->  stage1     this tree's compiler, built by the pinned release
+stage1  ->  stage2
+stage2  ->  stage3     and stage2 == stage3, byte for byte
 ```
 
-A compiler that reproduces itself exactly when it compiles its own source has no
-dependency on the seed's code generation, only on the language. That is what
-"self-hosted" means, and it is the property `selfhost-fixpoint.sh` still checks.
-
-The seed lived in `seed/` (~45k lines) and was kept after self-hosting only as
-the differential oracle. It was deleted in #1593, once v0.1.3 was published and
-pinned as stage0 — the first release capable of building the then-current
-`compiler/`, which 0.1.2 could not (it lacked `osRunTestBounded`).
-
-`git show 8e8cd5e:seed/` recovers it if it is ever needed again.
+A compiler that reproduces itself exactly when it compiles its own source depends
+on nothing but the language — not on whatever built it. That is what "self-hosted"
+means, and `scripts/selfhost-fixpoint.sh` checks it on every change.

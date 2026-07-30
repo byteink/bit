@@ -1,17 +1,12 @@
-# Bootstrap after `seed/` is gone
+# How `bit` bootstraps
 
 Status: DECIDED 2026-07-28 (#1840). Implementation is #1593.
 
-`seed/` is the Zig compiler that builds the first `bit`. Deleting it (41,555
-lines, the single largest block of Zig in the repo) is what "no Zig" actually
-means, and it takes two capabilities with it:
+`bit` is compiled by `bit`. This document decides how that terminates, and it
+answers two questions at once:
 
-1. the only way to build `bit` from a clean checkout with no `bit` already present
-2. the differential oracle that fifteen gates compare the self-hosted compiler against
-
-This document decides both. It is the answer to the question #1589's body
-deferred: "no Zig in the repo" and "no Zig to build it" are different claims, and
-the owner chose the second on 2026-07-28.
+1. how to build `bit` from a clean checkout with no `bit` already present
+2. what the differential oracle is that fifteen gates compare this tree against
 
 ## The decision in one paragraph
 
@@ -42,8 +37,8 @@ rather than memory:
   1.4 (the last C-implemented release) from source.
 - **Rust** downloads a stage0 `rustc` tarball and verifies it against SHA256
   checksums recorded in `src/stage0` in the rust repo itself.
-- **Zig** takes the other route: it commits `stage1/zig1.wasm`, a minimal Zig
-  compiler as a WebAssembly blob, so only a C compiler is needed.
+- A third route, taken by some projects, is to commit a minimal compiler as a
+  WebAssembly blob, so only a C compiler is needed.
 
 We take Rust's shape, because `release.sh` already emits checksummed per-target
 artifacts and a tap, so nothing new has to be built or hosted.
@@ -140,12 +135,11 @@ Two stage0s from the same publisher is weaker than two from different publishers
 and that limit is stated rather than hidden. This is required at RELEASE time,
 not on every developer build, because it costs a second full compile.
 
-Zig's committed blob has been audited this way in practice: a third party rebuilt
-`zig1.wasm` from the last C++-implemented Zig, iterating 45+ times, and got a
-byte-identical result, independently reproduced in Guix — the conclusion being
-"there is nothing hiding in `zig1.wasm` that hasn't been checked-in as a source
-file." That is the standard to aim at, and it is reachable only because the
-result is reproducible.
+A committed-blob bootstrap has been audited this way in practice: a third party
+rebuilt one from source, iterating 45+ times, got a byte-identical result, and
+had it independently reproduced in Guix — the conclusion being that nothing was
+hiding in the blob that had not been checked in as a source file. That is the
+standard to aim at, and it is reachable only because the result is reproducible.
 
 ## 4. What each differential gate compares after `seed/` is gone
 
@@ -206,8 +200,8 @@ version-over-version diffing substitutes for it.
 
 **From-source bootstrap with no prior binary.** After this, building `bit`
 requires a `bit`. The chain terminates at a published binary rather than at
-source. Zig's committed-blob approach would preserve a source-only path at the
-cost of a binary in the tree; we do not take it, so this is given up.
+source. A committed-blob approach would preserve a source-only path at the cost
+of a binary in the tree; we do not take it, so this is given up.
 
 **Bootstrapping on an unsupported host.** See section 2. Cross-compilation is the
 only path.

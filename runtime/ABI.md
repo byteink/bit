@@ -10,13 +10,8 @@ spawn and program entry (`runtime/root`, §9-10), channels (`runtime/chan`
 format and the multi-worker stop-the-world barrier are explicitly **not**
 frozen here — §4/§5 say why and who owns them next.
 
-Every section below names the **Bit** module that implements it. There is no
-longer a Zig runtime to cite: `libbitrt.a` has been built entirely from
-`runtime/**/*.bit` since #1591, and the last three Zig files — `runtime/gc.zig`,
-`runtime/alloc.zig`, `runtime/spinlock.zig` — were deleted in #1854 along with
-the differential `tests/gcdiff.zig` that was their only consumer. They are
-recoverable from history (`git show 8e8cd5e:runtime/gc.zig`) and #1851 rebuilds
-that tree when it needs the pre-port collector as a performance oracle.
+Every section below names the **Bit** module that implements it. `libbitrt.a` is
+built entirely from `runtime/**/*.bit`.
 
 All layouts below are for 64-bit targets (x86-64, ARM64). Pointers and `usize`
 are 8 bytes; the null reference is the all-zero bit pattern.
@@ -120,12 +115,12 @@ TypeInfo {                       // extern struct, 56 bytes, 8-aligned
 }
 ```
 
-`extern`, and split into raw `ptr`/`len` pairs rather than Zig `[]const T`
+`extern`, and split into raw `ptr`/`len` pairs rather than a slice
 slices: codegen (a different compiler than the one building the runtime)
 writes this struct directly into an object file's `.rodata`, so its layout
 must be a frozen, language-neutral contract, not whichever in-memory shape
-happens to match Zig slices today. `runtime/gc.zig`'s `TypeInfo.of(size,
-ptr_offsets, name)` is the Zig-side convenience constructor tests use;
+happens to match a slice's layout today. `runtime/gc/gc.bit`'s `TypeInfo.of(size,
+ptr_offsets, name)` is the convenience constructor tests use;
 codegen instead writes the raw fields directly.
 
 Because dispatch reads `methods` through the object's `info` pointer, a
@@ -256,7 +251,7 @@ The collector is **precise**: at a safepoint it must learn exactly which
 registers and stack slots hold live references, from compiler-emitted per-callsite
 stack maps.
 
-Runtime interface (`runtime/gc.zig`):
+Runtime interface (`runtime/gc/gc.bit`):
 
 ```
 RootScanner {
@@ -472,7 +467,7 @@ confirming the window is exactly the pre-registration gap and nothing else.
 
 The window is narrow (a thread must hold a reference nowhere a root class
 covers, before its first door-touch, while a collection completes) but it is
-real, and it is exactly what `sched.zig`'s `Worker.run` closes by calling
+real, and it is exactly what `runtime/sched/worker.bit`'s `Worker.run` closes by calling
 `gc_hooks.threadEnter()` **eagerly** at OS-thread entry rather than relying on
 lazy registration alone. The Bit port dropped that eager call (#1671) on the
 reasoning that lazy registration was sufficient on its own; #1677/#1699 correct
@@ -488,7 +483,7 @@ slice growth, map control blocks, map headers and select-case buffers all
 allocate, and a thread can reach any of them long before its first loop back
 edge. A runtime that registers at only some of them has threads that allocate
 while the rendezvous does not wait for them and the root scan cannot see them —
-their live objects are swept underneath them. (`root.zig` funnels all of these
+their live objects are swept underneath them. (`runtime/root/root.bit` funnels all of these
 through two wrappers so the invariant is checkable by grep; #1431 is what
 happens when it is not.)
 
@@ -584,7 +579,7 @@ both with the same eager-registration fix.
 
 ## 6. Allocation and collection entry points
 
-v1 exposes the runtime API in Zig (`runtime/gc.zig`); the runtime-init/codegen
+v1 exposes the runtime API in Bit (`runtime/gc/gc.bit`); the runtime-init/codegen
 ticket wires the process-wide collector instance and any C-callable export
 symbols.
 
@@ -601,7 +596,7 @@ Gc.deinit()                     // free all objects and the mark worklist
 `alloc` never collects on its own — collection happens only at safepoints, where
 the stack maps make the roots precise.
 
-Codegen never calls the Zig API above directly — it calls the two exported C
+Codegen never calls the API above directly — it calls the two exported C
 symbols `runtime/root` wires to it:
 
 ```
@@ -708,13 +703,13 @@ calls `boot`, and exits the process with `boot`'s returned code.
 
 ### Boot sequence (`boot(main_fn, environ) !i32`)
 
-1. Init the heap (`alloc.zig`) and collector (`gc.zig`, config from
+1. Init the heap (`runtime/alloc/alloc.bit`) and collector (`runtime/gc/gc.bit`, config from
    `configFromEnv(environ)` — §7).
-2. Init and start the scheduler (`sched.zig`) with **exactly one** worker OS
+2. Init and start the scheduler (`runtime/sched/sched.bit`) with **exactly one** worker OS
    thread (`nthreads = 1`). This is no longer a *collector* requirement — §5's
    handshake makes concurrent mutators safe, and each worker registers as a
    mutator for the life of its run loop. It is now only a scheduler-maturity
-   choice: work stealing across several `sched.zig` workers has no test that
+   choice: work stealing across several `runtime/sched/sched.bit` workers has no test that
    exercises it. Raising it is a scheduler ticket, not a GC one.
 3. Spawn `main_fn` (§10) as the first green thread.
 4. Poll (bounded exponential backoff) until that task reports done, then shut
@@ -915,7 +910,7 @@ exit-code truncation — Bit does not special-case it).
 ### The ABI's one channel type
 
 Every `chan<T>` a Bit program declares is realized at the runtime boundary as
-a channel of one 8-byte word (`WordChan = Chan(u64)` in `chan.zig`) — never a
+a channel of one 8-byte word (`WordChan = Chan(u64)` in `runtime/chan/chan.bit`) — never a
 per-`T` instantiation. A `T` that fits in 8 bytes (every integer width, `bool`,
 `f64`, and every reference type) is carried by value, bit-reinterpreted into a
 `u64`. A `T` that does not fit is out of scope for v1: box it in a
@@ -959,7 +954,7 @@ ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
   is process-lifetime. It is therefore never dangling, but also never
   reclaimed; a program that churns through many short-lived channels leaks
   their handles (not their buffered elements, which the GC still reclaims
-  once unreachable). Acceptable for v1 — see `chan.zig`'s registry note for
+  once unreachable). Acceptable for v1 — see `runtime/chan/chanreg.bit`'s note for
   the rationale — revisit if a real program's channel count matters.
 
 ### Select (§16.3)
@@ -991,7 +986,7 @@ caller's responsibility to omit (a nil case is never ready).
 
 A buffered word is reachable only through the channel's ring buffer while it
 sits unreceived — no stack or register holds it. `bit_rt_chan_make(_, true)`
-registers the channel into a process-wide registry (`chan.zig`); root.zig's
+registers the channel into a process-wide registry (`runtime/chan/chanreg.bit`); `runtime/root/root.bit`'s
 `scanRoots` walks that registry once per collection and marks every
 registered, `is_ref` channel's currently-buffered words as extra roots.
 
@@ -1099,7 +1094,7 @@ bit_rt_fs_list_dir(path)          -> string     // NUL-terminated entry names
 The low-level layer under `std/fs`. Deliberately plain (not fallible): failures
 surface as a `-1` fd/byte-count that the Bit `std/fs` wrappers turn into real
 errors (`fail newError(...)`), so all error *ergonomics* live in Bit, not the
-runtime. Backed by the raw per-platform syscalls in `sched.zig` (`openFd`/
+runtime. Backed by the raw per-platform syscalls in `runtime/sched/sched.bit` (`openFd`/
 `readFd`/`writeFd`/`closeFd`/`fileSize`, dispatched `std.os.linux.*` on Linux,
 `std.c.*` on Darwin — no libc dependency on the hot path).
 
@@ -1186,7 +1181,7 @@ environment block; this reads `BIT_TEST_INDEX` out of it.
 
 A failed `assert` panics, which aborts the process — so the runner cannot loop
 over tests in one process without the first failure taking the rest down. It
-instead compiles the module **once**, with `compiler/testgen.zig` appending a
+instead compiles the module **once**, with `compiler/testgen.bit` appending a
 synthetic `main` that calls this function and dispatches to that single test,
 then execs the binary once per test with `BIT_TEST_INDEX` set. An unset or
 out-of-range index matches no test and returns cleanly, so running a test binary
@@ -1267,7 +1262,7 @@ it is safe with scheduler worker threads live.
 host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos` — the enum in
 compiler/build.bit). The runtime archive is compiled once per target, so the answer
 is fixed when the archive is built; the Bit provider (#1635) takes the OS from its
-own provider directory and the arch from an `asm` per-arch immediate, the Zig it
+own provider directory and the arch from an `asm` per-arch immediate, the code it
 replaces read `builtin.target`. It is the default `bit build`/`bit run` target when
 `--target` is absent, so a wrong ordinal silently mis-targets the compiler.
 
@@ -1287,8 +1282,8 @@ binary's synthetic `main` (compiler/testgen.bit) dispatches to test `idx`.
 **`bit_rt_os_run_bounded`/`bit_rt_os_run_test_bounded` are `os_run`/`os_run_test`
 with a wall-clock deadline (#1744).** `os_run`'s synchronous `waitpid` blocks the
 calling green thread forever if the child never exits, exactly the hazard
-`tests/proc.zig` was built to close for the Zig test harnesses (#1637/#1652) —
-and one a Bit-native harness (#1591) needs closed the same way, since nothing
+the harnesses needed closed (#1637/#1652) —
+and one a Bit harness needs closed the same way, since nothing
 else in this ABI lets Bit code bound a subprocess wait. `os_run`/`os_run_test`
 themselves are unchanged: `bit run`/`bit test` still depend on their unbounded
 semantics for real user programs, so the bound is a new, separate primitive
@@ -1298,7 +1293,7 @@ Same fork+exec as `os_run`, but the parent polls `waitpid(WNOHANG)` on a
 `sched.sleepNs`-paced interval instead of blocking, checking the monotonic
 clock (`sched.monoNs`, ABI.md §18's layer) against a deadline resolved from
 `timeout_ms` once, before the first poll — the same "one absolute deadline,
-not a per-iteration timeout" shape `tests/proc.zig` uses, so a chatty or
+not a per-iteration timeout" shape the harnesses use, so a chatty or
 CPU-bound child cannot restart the clock. If the deadline elapses before the
 child exits, the parent `SIGKILL`s it and reaps it before returning, so a timed-
 out call never leaves a zombie or a stray process. Result encoding (three
@@ -1314,8 +1309,8 @@ outcomes in one `i64`, no separate signal channel):
 
 `-2` and `<= -100` stay distinct on purpose: `-2` means the *runtime* killed the
 child on a budget, `<= -100` means something else killed it first. `timeout_ms`
-is clamped to one hour (`os_run_bounded_max_ms`), mirroring `tests/proc.zig`'s
-`max_timeout_s` clamp, so a caller typo cannot reinstate an unbounded wait; the
+is clamped to one hour (`os_run_bounded_max_ms`), matching the harnesses'
+own `max_timeout_s` clamp, so a caller typo cannot reinstate an unbounded wait; the
 poll loop's iteration count is bounded by that clamp divided by the poll
 interval (Power of 10 rule 2) rather than an open-ended `while (true)` — the
 deadline check inside the loop is what actually ends every real call.
@@ -1324,7 +1319,7 @@ deadline check inside the loop is what actually ends every real call.
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
 that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
 body called the primitive would therefore become a call to itself once #1369
-drops the `_root` infix (the pin cycle `tests/rootpins.zig` guards). Both are now
+drops the `_root` infix (the pin cycle `tests/bit/rootpins.bit` guards). Both are now
 PORTED regardless — `auxv` by #1617, `host_target` by #1635 — each by finding the
 answer somewhere other than the primitive:
 
@@ -1335,8 +1330,7 @@ answer somewhere other than the primitive:
   `--target` (`libbitrtPath`), a cross-built binary reports the target it was
   built FOR, not the host it was built ON.
 
-  **As of #1635 the PROVIDER is Bit, not Zig — this was the last `bit_rt_*` symbol
-  only `root.zig` defined.** The old claim here, that a running Bit program has no
+  **The provider is `runtime/root/root.bit` (#1635).** The old claim here, that a running Bit program has no
   compile-time `builtin` and so this could never be ported, mistook "no `builtin`"
   for "no compile-time knowledge". The emit carries both axes the ordinal needs:
   - the **OS** is *which provider directory the source sits in* —
@@ -1353,20 +1347,20 @@ answer somewhere other than the primitive:
   aarch64-only, so (provider, arch) names all three exactly; Darwin therefore needs
   no `asm` at all and returns the literal 2. The provider must never call
   `hostTarget()` — that primitive lowers to a call to this very symbol once #1583
-  drops the `_root` infix (the pin cycle `tests/rootpins.zig` guards) — and an
+  drops the `_root` infix (the pin cycle `tests/bit/rootpins.bit` guards) — and an
   `asm` immediate is inline by construction, so there is no callee for the rename
   to redirect. Verified running on all three targets, not just by disassembly:
   `tests/stress/roothost{darwin,linux}`.
 - `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
-  as of #1617 the `bit_rt_auxv` PROVIDER is now Bit, not Zig. The kernel places the
+  `bit_rt_auxv`'s provider is `runtime/root/root.bit` (#1617). The kernel places the
   auxiliary vector on the initial stack, unreachable once any Bit code runs, so only
   the entry (`rtStartMain`) can capture it — a single writer, Linux-only;
   `machoMain` captures none. The Bit Linux entry walks past `envp`'s NULL to the
   auxv array and stores its address, through `bit_rt_port_root_os_set_auxv`, into
   the cell `runtime/root/os.bit`'s `gAuxv` owns (beside `g_argc`/`g_argv`/`g_envp`);
   the reader `bit_rt_root_auxv` (→ `bit_rt_auxv` at G2) hands that cell back. This
-  is the move promised above — ownership of the cell moves from `root.zig`'s
-  `g_auxv` to the Bit boot layer (the Zig `g_auxv`/`bit_rt_auxv` stay live only
+  is the move promised above — ownership of the cell moves from `runtime/root/root.bit`'s
+  `g_auxv` to the boot layer (the old `g_auxv`/`bit_rt_auxv` stay live only
   until the #1369 archive swap makes the Bit entry the real one). The reader
   reads `gAuxv` DIRECTLY, never through the `auxv()` primitive, precisely to avoid
   the self-reference the pin-cycle gate forbids; `runtime/auxv` still does the scan
@@ -1412,7 +1406,7 @@ bit_rt_net_udp_sender_port()            -> port  // last recv's sender port, or 
 on failure; a dotted-quad `host` passes straight back. Unlike the socket calls it
 uses a **blocking** UDP socket with `SO_RCVTIMEO` and bounded retransmits, not the
 netpoller — it blocks the calling worker for up to ~2s on a lost packet, the
-right trade for an occasional lookup (see the note in `net.zig`).
+right trade for an occasional lookup (see the note in `runtime/net/net.bit`).
 
 ```
 bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on failure
@@ -1422,7 +1416,7 @@ bit_rt_net_resolve(host)        -> str   // first A record, dotted quad. "" on f
 
 ## 21. Crypto (`runtime/rand` + `runtime/root`)
 
-The Zig↔Bit boundary primitives that cryptography needs from the runtime but
+The runtime boundary primitives that cryptography needs but
 that cannot be written in pure Bit — OS entropy and an optimizer-proof wipe.
 The low-level layer under `std/crypto`.
 
@@ -1435,7 +1429,7 @@ bit_rt_secure_zero(h)           -> void     // wipe a []byte's element words, un
 zero fallback.** A weak-entropy result silently returned is worse than a crash,
 so an OS failure is **fatal** (routed through the §12 panic path), never a
 degraded draw. Per platform (`runtime/rand`, raw syscalls for the same
-reason as `net.zig`):
+reason as `runtime/net/net.bit`):
 
 - **Linux** — `getrandom(buf, len, 0)`: the `/dev/urandom` pool, **blocking**
   until first-seeded (`flags = 0`, never `GRND_NONBLOCK`/`GRND_RANDOM`).
@@ -1484,7 +1478,7 @@ bit_rt_crypto_sha256_compress_hw(state: *u32, block: *byte)
 ```
 
 **Runtime detection, not compile-time.** Bit ships one binary per target that
-must run on any host CPU of that architecture — unlike Zig's own
+must run on any host CPU of that architecture — unlike a build that assumes its own
 `std.crypto`, which selects its AES-NI/PCLMULQDQ/SHA-NI paths at *compile*
 time from `builtin.cpu.has(...)` (a decision baked into the binary by
 `-mcpu`), `runtime/cryptohw` probes the actual host via the raw `cpuid` and
@@ -1496,7 +1490,7 @@ so the constant-time software path can be exercised and cross-checked
 against the hardware path even on capable silicon — the fallback
 verification the task requires.
 
-**Feature gates match Zig std.crypto's own precedent exactly**, not an
+**Feature gates are decided at run time, not build time**, not an
 independently invented set: AES-NI needs `AES + AVX`; PCLMULQDQ needs
 `PCLMUL + AVX`; SHA-NI needs `SHA + AVX2`. All four CPUID bits also require
 `OSXSAVE` (`CPUID.1:ECX[27]`) and `XGETBV(0)` reporting the OS has opted the
@@ -1542,7 +1536,7 @@ truncation, both applied outside `compress`).
 
 ## 22. Shared mutable state audit (#1248)
 
-Every container-scope `var` in `runtime/*.zig` (grep: `^var `, `^threadlocal
+Every container-scope mutable in `runtime/**/*.bit` (grep: `^var `, `^threadlocal
 var `), classified per-worker / per-task / synchronized, with why. This is the
 M:N epic's enumeration ticket — §5 and §13 above already argue the two hardest
 cases (mutator registration, the error slot) in depth; this section is the
@@ -1552,47 +1546,47 @@ complete list so nothing was skipped.
 `rtStartMain` runs on the process's one and only thread before `boot` spawns
 the scheduler's worker pool (§9) — nothing below is ever written again once a
 second OS thread can observe it:
-- `root.zig`: `g_environ`, `g_argc`, `g_argv`, `g_envp`, `g_auxv`.
-- `root.zig`: `g_booted` — a single-boot guard (`std.debug.assert(!g_booted)`
+- `runtime/root/root.bit`: `g_environ`, `g_argc`, `g_argv`, `g_envp`, `g_auxv`.
+- `runtime/root/root.bit`: `g_booted` — a single-boot guard (asserted false on entry
   before it is set); the test-only resets to `false` between test bodies run
   single-threaded, never racing a live scheduler.
-- `shims.zig`: `g_auxv` — set once by `rtStartMain` via `setTable`, read-only
+- `runtime/shims/shims.bit`: `g_auxv` — set once by `rtStartMain` via `setTable`, read-only
   through every later `getauxval` call.
 
 **Self-synchronized (the global is a struct instance; its own fields carry the
 lock/atomics, not this list):**
-- `root.zig`: `g_heap` (`alloc.zig`'s `Heap` — one `SpinLock` around the free
+- `runtime/root/root.bit`: `g_heap` (`runtime/alloc/alloc.bit`'s `Heap` — one `SpinLock` around the free
   lists, `std.atomic.Value` byte counters; has its own N-thread stress test).
-- `root.zig`: `g_gc` / `g_world` (`gc.zig`'s `Gc` / `World` — the §5
+- `runtime/root/root.bit`: `g_gc` / `g_world` (`runtime/gc/gc.bit`'s `Gc` / `World` — the §5
   stop-the-world registry: `std.atomic.Value` mutator states and epoch, one
   `SpinLock` serializing collectors).
-- `root.zig`: `g_sched` (`sched.zig`'s `Scheduler` — per-worker work-stealing
+- `runtime/root/root.bit`: `g_sched` (`runtime/sched/sched.bit`'s `Scheduler` — per-worker work-stealing
   deques plus a lock-free global queue, designed for N workers from the start;
   §5/§9's "pinned to 1" is a boot-time choice, not a correctness dependency).
 
 **Per-OS-thread by design (`threadlocal`), each because nothing between the
 write and its matching read can cross a scheduling point — a green task
 migrates workers only at an explicit yield/park, never mid-expression:**
-- `root.zig`: `pending_err` (§13) — read via `bit_rt_get_err` immediately after
+- `runtime/root/root.bit`: `pending_err` (§13) — read via `bit_rt_get_err` immediately after
   the fallible call that may have set it, before any `?`/`catch` propagation
-  runs. Regression-guarded by `root.zig`'s
+  runs. Regression-guarded by `runtime/root/root.bit`'s
   `"bit_rt_set_err/get_err: threadlocal slot never crosses OS threads"` test.
-- `root.zig`: `last_iface_ok` — read via `bit_rt_iface_as_ok`, which codegen
+- `runtime/root/root.bit`: `last_iface_ok` — read via `bit_rt_iface_as_ok`, which codegen
   always emits directly after the paired `bit_rt_iface_as`.
-- `root.zig`: `udp_last_sender`, `last_recv_ok` — same adjacent
+- `runtime/root/root.bit`: `udp_last_sender`, `last_recv_ok` — same adjacent
   set-then-read-before-yield contract, documented at each declaration.
-- `sched.zig`: `Worker.tls` — re-derived through a `noinline` accessor on every
+- `runtime/sched/sched.bit`: `Worker.tls` — re-derived through a `noinline` accessor on every
   read rather than cached across a call boundary, specifically because a
   parked task can resume on a *different* OS thread (#1466): a cached thread
   pointer would hand back the previous thread's stale `Worker`.
 
 **Global, mutated, but inert or already atomic:**
-- `root.zig`: `scan_ctx` — a fixed non-null `u8` passed as an opaque `ctx`
+- `runtime/root/root.bit`: `scan_ctx` — a fixed non-null `u8` passed as an opaque `ctx`
   pointer to root-scan callbacks that never read or write through it (only its
   address, as a "valid pointer" sentinel, is used); it is never reassigned
   after its `= 0` initializer, so there is nothing to race.
 - `runtime/chan`: `select_seed_counter` — `std.atomic.Value(u64)`, bumped with
-  `fetchAdd`; already synchronized. (`chan.zig`'s send/recv/select rendezvous
+  `fetchAdd`; already synchronized. (`runtime/chan/chan.bit`'s send/recv/select rendezvous
   itself is #1247's scope, not this ticket's.)
 
 **Read-only after link (never a `var` at all):** `TypeInfo` method tables and
@@ -1602,8 +1596,8 @@ in the runtime ever mutates a `TypeInfo` or a dispatch table post-link, so they
 need no synchronization under any worker count.
 
 **Not found:** no interned-data table, memoization cache, or process-global
-counter exists in `runtime/*.zig` outside the entries above (`rand.zig` and
-`net.zig` declare no container-scope state at all — every random/network call
+counter exists in `runtime/**/*.bit` outside the entries above (`runtime/rand/rand.bit` and
+`runtime/net/net.bit` declare no container-scope state at all — every random/network call
 is a stateless syscall wrapper).
 
 ## 23. Concurrency memory model — runtime guarantees (SPEC.md §13.7)
@@ -1617,7 +1611,7 @@ access on most targets permits the reordering the edge exists to forbid:
 
 1. **`spawn` → first statement (§13.7 edge 1).** The packed-argument struct
    (§9 Spawn) is fully written by the spawning thread before `bit_rt_spawn`
-   hands the task off. `sched.zig`'s per-worker `Deque` writes the task into
+   hands the task off. `runtime/sched/sched.bit`'s per-worker `Deque` writes the task into
    its ring slot, then publishes it with a `.release`-ordered `tail` store
    (`pushBottom`); a stealing or popping worker loads `head`/`tail` with
    `.acquire` before reading that slot (`popBottom`/`steal`). The global
@@ -1626,23 +1620,23 @@ access on most targets permits the reordering the edge exists to forbid:
    below). Either path — not scheduling order, which is unspecified — is the
    edge.
 2. **Channel send → matching receive (edges 2, 4, 5).** Each `Chan(T)` is
-   guarded end-to-end by one `spinlock.zig` `SpinLock` (`chan.zig`): `acquire`
-   is a `.acquire`-ordered CAS, `release` is a `.release` store (`spinlock.zig`).
+   guarded end-to-end by one `runtime/spinlock.bit` `SpinLock` (`runtime/chan/chan.bit`): `acquire`
+   is a `.acquire`-ordered CAS, `release` is a `.release` store (`runtime/spinlock.bit`).
    A send writes the value (into the ring buffer, or straight to a parked
    receiver for the unbuffered case) *before* releasing the lock; a receive
    takes the lock (its `.acquire` CAS) before reading that value. The lock's
    acquire/release pairing — not any weaker ordering — is the edge; nothing
-   in `chan.zig`'s rendezvous is lock-free.
+   in `runtime/chan/chan.bit`'s rendezvous is lock-free.
 3. **`close` → observing closed (edge 3).** `close` sets the closed flag
    under the same `SpinLock`; a receive observes it (and returns
    `ok == false` once drained, ABI.md §11) only after taking that same lock.
    Program order under one lock is what carries the edge — no separate
    flag-specific ordering is needed.
 4. **`std/sync` `Mutex`/`RWMutex` (edge 6).** Expected to reuse
-   `spinlock.zig`'s `SpinLock` (or the scheduler's park/unpark on top of it,
+   `runtime/spinlock.bit`'s `SpinLock` (or the scheduler's park/unpark on top of it,
    for a mutex that parks instead of spins under contention) — the same
-   acquire/release CAS-then-store pairing already proven by `chan.zig` and
-   `sched.zig`'s deques above. `Once`/`WaitGroup` (edges 7, 8) are expected to
+   acquire/release CAS-then-store pairing already proven by `runtime/chan/chan.bit` and
+   `runtime/sched/sched.bit`'s deques above. `Once`/`WaitGroup` (edges 7, 8) are expected to
    compose from the same Mutex/atomic primitives and inherit the same
    pairing. This is `std/sync`'s implementation contract (#1251), not yet
    built on this branch.

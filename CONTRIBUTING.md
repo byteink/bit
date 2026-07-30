@@ -42,10 +42,9 @@ changes the spec **in the same commit**, not afterwards.
    diff can affect; it falls back to the full suite when the change is
    cross-cutting. Do not skip a red step - a hang counts as a failure, not a
    stall.
-3. **Both compilers agree.** The Zig seed is the oracle: the self-hosted
-   compiler must produce byte-identical AST/type/IR dumps over the corpus
-   (`scripts/selfhost-diff*.sh`). A change to one that diverges from the other
-   is incomplete.
+3. **The differentials agree.** The pinned previous release is the oracle: this
+   tree's compiler must produce byte-identical AST/type/IR dumps over the corpus
+   (`scripts/selfhost-diff*.sh`). A divergence is a change that is not finished.
 4. **Files stay under 800 lines** (target ~500). Split by moving top-level
    blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.

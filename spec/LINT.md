@@ -117,7 +117,7 @@ suppresses it.
 ## 3. Diagnostic codes
 
 Lint reserves **E0200–E0299** in the central registry
-([diagnostics.zig:44](../seed/diagnostics.zig#L44)), which documents the
+([compiler/diagnostics.bit](../compiler/diagnostics.bit)), which documents the
 per-stage range convention and the rule that a code is never renumbered once
 shipped. Lint findings render through the existing path as
 `warning[E0200]: ...`, so neither `codeString` nor the JSON emitter changes.
@@ -154,10 +154,9 @@ A prefix letter would add a fourth signal, not a first one. Against that:
 - **One registry, one collision authority.** Two prefixes means the
   never-renumber rule has to be enforced in two places, and "is E0213 taken?"
   becomes two questions.
-- **`codeString` is shared with the frozen seed.** `compiler/diagnostics.bit`
-  mirrors `seed/diagnostics.zig` byte for byte, and the seed is still the
-  differential oracle for the bootstrap (§9). A prefix parameter would make the
-  two diagnostic renderers structurally divergent, mid-bootstrap, for a
+- **`codeString` is shared with the differential oracle.** `compiler/diagnostics.bit`
+  must render identically to the pinned stage0, which is the oracle for the
+  bootstrap (§9). A prefix parameter would make the renderer diverge from it for a
   distinction the severity word already carries. This is the decisive argument
   and it is specific to the project's current state, not a general preference.
 - **Greppability is a wash.** `grep -rn 'E02'` is exactly as clean as
@@ -218,7 +217,7 @@ E0212; only its table row moves. It needs no resolver — whether a statement
 follows one that diverges (`return`/`fail`/`break`/`continue`/`panic`) is
 answered from the AST alone, by reusing the same `diverges` analysis
 `bit check` already uses for E0055 missing-return and catch-block
-completeness (seed/check.zig:5539, ported at compiler/validatestmt.bit:610).
+completeness (compiler/validatestmt.bit:610).
 
 ### Phase 2 — dead weight and footguns (needs the resolver)
 
@@ -235,7 +234,7 @@ These need scope and symbol information and land after phase 1.
 see phase 1 above, where it is actually implemented.)
 
 `shadowed-local` closes a real gap: the resolver warns on shadowing a
-*predeclared* name ([resolve.zig:386](../seed/resolve.zig#L386)) but says
+*predeclared* name ([compiler/resolve.bit](../compiler/resolve.bit)) but says
 nothing when an inner `let` hides an outer local. Prelude names are already
 covered, so this rule must not double-report them.
 
@@ -280,7 +279,7 @@ tokens alone, and lint says nothing.
 Recorded so they are not re-proposed.
 
 - **Discarded call result**, **empty or non-diverting `catch`.** Already errors
-  in `bit check` — E0065 and E0067 ([check.zig:3513](../seed/check.zig#L3513)).
+  in `bit check` — E0065 and E0067 ([compiler/validateexpr.bit](../compiler/validateexpr.bit)).
   In Go this is what `errcheck` exists for; here the checker got there first,
   which removes what would otherwise be a linter's headline rule.
 - **`spawn` capturing a loop variable.** Go's classic bug. Bit closures capture
@@ -337,7 +336,7 @@ line, declaration, or non-comment token. Multiple directives may appear; the
 last assignment for a given rule wins.
 
 It is deliberately *not* pinned to line 1: golden test cases already use line 1
-for the harness mode directive ([harness.zig:240](../tests/harness.zig#L240)),
+for the harness mode directive ([tests/bit/golden.bit](../tests/bit/golden.bit)),
 and a `// lint` case must be able to carry both.
 
 Overrides are **file-scoped**. There is no line-scoped or function-scoped
@@ -417,7 +416,7 @@ warning[E0200]: file is 1204 lines, limit is 800
 ```
 
 `--json` emits the schema `bit check --json` already produces
-([diagnostics.zig:500](../seed/diagnostics.zig#L500)), so editors and CI parse
+([compiler/diagnostics.bit](../compiler/diagnostics.bit)), so editors and CI parse
 one format for both tools.
 
 ## 7. Integration
@@ -431,7 +430,7 @@ one format for both tools.
 ## 8. Testing
 
 A new golden mode, `// lint`, joins the existing set in
-[harness.zig:240](../tests/harness.zig#L240). A case runs `bit lint` over the
+[tests/bit/golden.bit](../tests/bit/golden.bit). A case runs `bit lint` over the
 file and compares stderr against the sibling `.expected` — except that lint
 also asserts the process exit code, since 0 (clean), 1 (findings), and 2 (bad
 directive) are all reachable and a stderr diff alone cannot separate 1 from 2.
@@ -471,8 +470,8 @@ Required coverage:
 | `compiler/lint.bit` | new — registry, directive reader, runner, rule passes |
 | `compiler/lintcheck.bit` | new — in-Bit self-checks, run by `selfcheck()` |
 | `compiler/main.bit` | `lint` subcommand dispatch |
-| `tests/lintcmd.zig` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
-| `tests/harness.zig` | `.lint` directive |
+| `tests/bit/lintcmd.bit` | CLI contract: exit codes, walk, summary, `--json`, `--stats` |
+| `tests/bit/golden.bit` | `// lint` directive |
 | `tests/cases/lint_*.bit` | golden cases |
 | `docs/reference/` | user-facing rule reference |
 
