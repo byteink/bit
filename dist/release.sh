@@ -46,6 +46,16 @@ command -v gh >/dev/null || { echo "release.sh: gh not found" >&2; exit 1; }
 git diff --quiet || { echo "release.sh: working tree is dirty" >&2; exit 1; }
 git diff --cached --quiet || { echo "release.sh: staged changes present" >&2; exit 1; }
 
+# THE COMMIT THE ARTIFACTS ARE BUILT FROM, resolved here and nowhere else (#1856).
+# The two checks above have just established that the tree equals HEAD, so HEAD
+# names the exact source of everything built below. `gh release create` defaults a
+# new tag to the DEFAULT BRANCH'S REMOTE HEAD, not to the local tree, so without
+# passing this explicitly a release cut while origin/main is ahead — or from any
+# branch at all — tags a commit whose source was never compiled. v0.1.3 shipped
+# that way. Captured before the build rather than after so a commit landing mid-run
+# cannot move it.
+BUILT_COMMIT="$(git rev-parse HEAD)"
+
 TARGETS=(x86_64-linux aarch64-linux aarch64-macos)
 
 echo "release.sh: building runtime archives for every target"
@@ -218,6 +228,7 @@ bash dist/changelog.sh "${VERSION}" > "${OUT}/NOTES.md" 2>/dev/null || {
 
 if [ "${DRY}" -eq 1 ]; then
 	echo "release.sh: --dry-run, publishing nothing. Artifacts in ${OUT}"
+	echo "release.sh: would tag v${VERSION} at ${BUILT_COMMIT}"
 	exit 0
 fi
 
@@ -230,7 +241,12 @@ if gh release view "v${VERSION}" >/dev/null 2>&1; then
 	echo "release.sh: v${VERSION} exists; uploading assets with --clobber"
 	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}/SHA256SUMS" --clobber
 else
-	gh release create "v${VERSION}" "${args[@]}" "${OUT}"/*.tar.xz "${OUT}/SHA256SUMS"
+	# --target pins the new tag to the tree that was actually built and smoke-tested
+	# (#1856). Only meaningful on this branch: for an existing tag gh ignores it,
+	# which is correct — the tag is already placed and re-cutting must not move it.
+	echo "release.sh: tagging v${VERSION} at ${BUILT_COMMIT}"
+	gh release create "v${VERSION}" --target "${BUILT_COMMIT}" "${args[@]}" \
+		"${OUT}"/*.tar.xz "${OUT}/SHA256SUMS"
 fi
 
 # Report what the release ACTUALLY is now, not what --draft asked for: re-cutting
