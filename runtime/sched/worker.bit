@@ -42,7 +42,9 @@ export const workerWords: int = 292
 //   11       pollLock    the netpoller's try-lock (an i32 cell)
 //   12       pollFdWrite the SECOND epoll descriptor, carrying write interest
 //                        only. LINUX ONLY — 0 everywhere else (#1910)
-//   13..15   reserved
+//   13       idleSeq     the futex word parked workers wait on (an i32 cell)
+//   14       idleCount   how many workers are parked on it (#1902)
+//   15       reserved
 export const scNWorkers: int = 0
 export const scWorkers: int = 1
 export const scStopping: int = 2
@@ -76,6 +78,13 @@ const scPollLock: int = 11
 // 0 on every platform that does not need it: kqueue already keys per filter, so
 // the Darwin provider leaves this unset and reads only `scPollFd`.
 export const scPollFdWrite: int = 12
+
+// The idle park's two words (#1902). `scIdleSeq` is an i32 cell — `futex(2)` and
+// `__ulock_wait` both compare 32 bits — so it takes a whole slot and uses a
+// quarter of it, exactly as `scPollLock` does. `sleep.bit` holds the rules the
+// two obey; the layout lives here with the rest of the block.
+export const scIdleSeq: int = 13
+export const scIdleCount: int = 14
 export const schedWords: int = 16
 
 // The worker block at index `i`.
@@ -97,6 +106,8 @@ export @nosplit @symbol("bit_rt_port_sched_init") function schedInit(s: *i64, wo
   *(s + scPollFd) = 0
   // 0 means "not bound", and the Darwin provider never binds it (#1910).
   *(s + scPollFdWrite) = 0
+  atomicStore(lockOf(s, scIdleSeq), 0)
+  atomicStore(s + scIdleCount, 0)
   gqInit(s + scGlobal)
 
   let i = 0
@@ -454,6 +465,10 @@ export const WORKER_MAX_STEPS: int = 1000000000
   if (!queued) {
     gqPush(s + scGlobal, addr)
   }
+  // Runnable again, so a parked worker may now have something to steal (#1902).
+  // Woken even when the task went on THIS worker's local ring: the ring is the
+  // steal source, and a peer that is asleep cannot take from it.
+  schedWakeIdle(s)
 }
 
 // The value `schedWorkerStep` returns in place of a backoff to say "leave the
@@ -734,10 +749,12 @@ export @nosplit @symbol("bit_rt_port_sched_spawn") function schedSpawn(s: *i64, 
   if (wAddr != 0 && *(taskAt(wAddr) + wkSched) == int(s)) {
     let queued = dqPushBottom(taskAt(wAddr) + wkDeque, task)
     if (queued) {
+      schedWakeIdle(s)
       return
     }
   }
   gqPush(s + scGlobal, task)
+  schedWakeIdle(s)
 }
 
 // Make a parked task runnable again, from any thread. Routes through the global
@@ -755,6 +772,7 @@ export @nosplit @symbol("bit_rt_port_sched_unpark") function schedUnpark(s: *i64
     return false
   }
   gqPush(s + scGlobal, task)
+  schedWakeIdle(s)
   return true
 }
 
@@ -764,4 +782,8 @@ export @nosplit @symbol("bit_rt_port_sched_unpark") function schedUnpark(s: *i64
 // the header) and so reaps none.
 export @nosplit function schedShutdown(s: *i64) {
   atomicStore(s + scStopping, 1)
+  // Parked workers check `scStopping` on waking, so shutdown has to wake them
+  // (#1902). Without this the join in `boot` waits out one `idleParkMaxNs` per
+  // parked worker before the process can exit — a 100ms tax on every run.
+  schedWakeIdle(s)
 }
