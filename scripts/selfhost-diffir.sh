@@ -80,6 +80,24 @@ timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
 
 echo "IR (pre-opt) differential: MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(lower/check-err)=$skip"
 
+# A RUN THAT COMPARED NOTHING IS NOT A PASS (#1881). Two ways to get here having
+# verified nothing, and both leave `mismatch` and `timeout` empty, so every check
+# below passes and the success line claims that every file's IR is identical:
+#
+#   - the corpus enumerated no files at all — a renamed or moved directory in the
+#     `find` list above, which `find` reports on stderr and then carries on past;
+#   - every file was skipped, because the oracle could not lower or check a single
+#     one. A stage0 that is broken for the whole corpus scores as agreement.
+#
+# The distinction from the count-vs-set argument in the header is that this is not
+# a threshold on how much matched. Zero is the one count that means the gate did
+# not run, so it is the one count worth asserting.
+if [ "$match" -eq 0 ]; then
+  echo
+  echo "INVALID: compared 0 files (skipped $skip) — the corpus or the oracle is broken. Nothing was verified." >&2
+  exit 1
+fi
+
 status=0
 
 # NO DIVERGENCE IS PERMITTED. There is no expected-mismatch list and no way to
