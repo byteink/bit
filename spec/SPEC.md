@@ -748,7 +748,10 @@ constructible, mutable aggregate wants a struct.
 
 - **Slice** `[]T`: growable view over a backing array; reference type; `len`/`cap`;
   built with `[]T(n)` (length `n`, zeroed) or `[]T(n, m)` (length `n`, cap `m`), or
-  a slice literal (§12.3). Slicing: `s[lo:hi]`.
+  a slice literal (§12.3). Slicing: `s[lo:hi]`. Those are the only two arities:
+  the constructor is **not** an element list, so `[]u8()` and
+  `[]u8(127, 69, 76, 70)` are both **E0050** rather than an empty slice and a
+  127-byte one. Write elements as `[]T{...}` and bytes as `[]byte("...")`.
 - **Array** `[N]T`: fixed length `N` (a compile-time constant), value type, copied
   on assignment. Built with an array literal or zero-valued via `let a: [N]T`.
   `N` is a `const_expr`: an integer literal, a module-level `const` of integer
