@@ -1810,8 +1810,14 @@ struct Outer { a: int, b: Inner }
 
 let o = Outer{ a: 1 }          // E0083 — omits the struct-typed `b`
 let p: Outer                   // E0083 — no initializer at all
+let s = []Outer(2)             // E0083 — `[]T(n)` means n zero values (§12.9)
 let q = Outer{ a: 1, b: Inner{} }   // ok; `Inner` has no struct-typed field
+let e = []Outer(0)             // ok; asks for no zero values at all
 ```
+
+`[]T(n)` is reported only when `n` is a constant above zero. A run-time `n` is
+checked where it is known — the allocation **panics** if it is above zero, and
+does nothing if it is zero.
 
 The reason is that a struct is a *reference* (§13.3). Zero bits in a struct-typed
 field is a **null**, not a live instance, so the promise above cannot be kept for

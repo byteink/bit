@@ -167,7 +167,9 @@ struct Outer { a: int, b: Inner }
 
 let bad = Outer{ a: 1 }              // E0083 - `b` omitted
 let alsoBad: Outer                   // E0083 - no initializer
+let orThis = []Outer(2)              // E0083 - `[]T(n)` means n zero values
 let good = Outer{ a: 1, b: Inner{} } // fine; `Inner` has no struct-typed field
+let empty = []Outer(0)               // fine; asks for no zero values
 ```
 
 Every other field type stays omittable, including an inline `[N]T`, because

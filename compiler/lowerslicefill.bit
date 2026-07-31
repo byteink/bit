@@ -1,0 +1,147 @@
+// compiler/lowerslicefill.bit — split out of lowerlit.bit (#1924), which the
+// fill loop below pushed past the 800-line limit. Sibling of lowerlit.bit: same
+// module, so this needs no imports and no call-site changes.
+//
+// Named to sort AFTER `lowerlit`, `lowerprim` and `lowercond`, which hold every
+// helper called here (`zeroValue`/`structTySubst`, `emitRtCall`, `emitJump`).
+// Module files concatenate in bytewise filename order and the inliner only
+// inlines a callee it has already lowered, so a name sorting earlier would
+// silently change the machine code rather than merely move text (#1511).
+
+// Whether `ty` is a struct with a struct-typed field — i.e. one of the types
+// §13.4 gives no zero value (E0083, #1914). The checker's
+// `vMissingStructFields` answers the same question and builds the message; this
+// side only needs the yes/no, and cannot reuse it because that one runs off a
+// `Checker` before lowering has a `FnCtx`.
+//
+// Substituted through `structTySubst`, for the same reason the layouts are: a
+// generic `Box<Inner>` must see `Inner` where the declaration says `T`, or a
+// monomorphization with a struct argument slips past.
+function structHasNoZeroValue(fc: FnCtx, ty: int): bool {
+  if (fc.c.ctx.types[ty].kind != TypeKind.Struct) {
+    return false
+  }
+  let decl = structDeclOf(fc.c, ty)
+  if (decl == 0) {
+    return false
+  }
+  let oc = typeOwner(fc.c, ty)
+  let sub = structTySubst(fc, oc, decl, ty)
+  for f of structFieldNodes(oc, decl) {
+    let fty = typeFromNodeIn(oc, kidsOf(oc.tree, f)[1], sub)
+    if (fc.c.ctx.types[fty].kind == TypeKind.Struct) {
+      return true
+    }
+  }
+  return false
+}
+
+// `[]T(n)` where T is a STRUCT: give the fresh backing `n` live zero instances
+// (#1924).
+//
+// `slice_new` zeroes the buffer, which IS the zero value of a scalar, a string
+// or a nested slice — and is a NULL for a struct, because structs are
+// references. So `[]Inner(2)` handed back two wild pointers and `s[0].xs`
+// segfaulted with no diagnostic, on a construct whose whole documented purpose
+// is "n zero values" (SPEC §12.9). Nothing else in the language produces a null
+// struct, so nothing downstream is prepared to meet one.
+//
+// A REAL IR LOOP, not a runtime primitive, and the reason is the collector
+// rather than convenience. The slice stays live across every element's
+// `gc_alloc` safepoint. Here it is a reference-typed SSA value, so the stack map
+// describes it by construction. Inside a `@nosplit` runtime helper it would be a
+// raw `int` in a frame that only the conservative scan can see, which is the
+// weaker guarantee and an open defect in its own right (#1834).
+//
+// Only `Struct` needs filling. Every other element kind's zero value is zero
+// bits, and `[N]T` cannot be a slice element at all (E0072 rejects a
+// reference-typed array element).
+//
+// Returns the slice again, as the exit block's parameter — NOT the value passed
+// in. That is a hard requirement, not a style choice, and it is what the first
+// attempt at this got wrong: EVERY value that crosses a block boundary in this
+// IR travels as a block parameter. Referencing a dominating definition directly
+// is accepted by the lowerer, dumps as valid-looking IR, and then miscompiles.
+// The version that read `sliceV` and `nV` straight out of the entry block ran
+// exactly ONE iteration — element 0 live, elements 1..n-1 still null — with no
+// diagnostic anywhere. Compare `lowerWhile`, which threads every live local
+// through the header for the same reason, and re-materializes constants inside
+// the loop rather than reaching back for them.
+//
+//     jump header(%s, %n, 0)
+//   header(%s', %n', %i):  br %i < %n' -> body, exit(%s')
+//   body:                  %o = gc_alloc T; slice_set %s'[%i] = %o
+//                          jump header(%s', %n', %i + 1)
+//   exit(%s''):            <- the enclosing expression carries on here
+//
+// The body takes no parameters: it has the header as its single predecessor, so
+// there is nothing to merge (again as `lowerWhile` does).
+function fillStructElems(fc: FnCtx, sliceV: int, elemTy: int, nV: int): int {
+  let i64ty = primType(fc.c.ctx, 3)
+  let sliceTy = fc.b.instrs[sliceV].ty
+  let header = builderNewBlock(fc.b)
+  let body = builderNewBlock(fc.b)
+  let exit = builderNewBlock(fc.b)
+
+  let zero = mkInstr(Op.ConstInt, i64ty)
+  zero.ival = 0
+  emitJump(fc, header, [sliceV, nV, builderEmit(fc.b, zero)])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, header)
+  let hSlice = builderAddParam(fc.b, sliceTy)
+  let hN = builderAddParam(fc.b, i64ty)
+  let hI = builderAddParam(fc.b, i64ty)
+  let lt = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
+  lt.lhs = hI
+  lt.rhs = hN
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, lt)
+  br.ival = body
+  br.thenArgs = []int(0)
+  br.ival2 = exit
+  br.elseArgs = [hSlice]
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, body)
+  // An element type with NO zero value (a struct with a struct-typed field,
+  // §13.4) cannot be filled. The checker rejects that outright when `n` folds to
+  // a constant above zero, which is the diagnosable case; a runtime `n` it
+  // cannot decide, and `[]S(0)` is both legal and the idiomatic empty slice. So
+  // the body — entered only when `n > 0` — panics rather than storing a null and
+  // handing the caller a segfault later, at a place that no longer names the
+  // slice.
+  if (structHasNoZeroValue(fc, elemTy)) {
+    let msg = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+    msg.sval = "[]" + typeName(fc.c.ctx, elemTy) + "(n): '" + typeName(fc.c.ctx, elemTy) +
+      "' has a struct-typed field and therefore no zero value (SPEC 13.4)"
+    msg.ival = internPoolString(fc, msg.sval)
+    let pn = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+    pn.name = "panic"
+    pn.args = [builderEmit(fc.b, msg)]
+    emitRtCall(fc, pn)
+    builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
+    builderEndBlock(fc.b)
+    builderBeginBlock(fc.b, exit)
+    return builderAddParam(fc.b, sliceTy)
+  }
+  let zv = zeroValue(fc, elemTy)
+  if (fc.failed) {
+    return 0
+  }
+  let ss = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  ss.name = "slice_set"
+  ss.args = [hSlice, hI, zv]
+  emitRtCall(fc, ss)
+  let one = mkInstr(Op.ConstInt, i64ty)
+  one.ival = 1
+  let next = mkInstr(Op.Add, i64ty)
+  next.lhs = hI
+  next.rhs = builderEmit(fc.b, one)
+  emitJump(fc, header, [hSlice, hN, builderEmit(fc.b, next)])
+  builderEndBlock(fc.b)
+
+  builderBeginBlock(fc.b, exit)
+  return builderAddParam(fc.b, sliceTy)
+}
