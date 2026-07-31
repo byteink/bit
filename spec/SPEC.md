@@ -710,7 +710,8 @@ type = type_name
 
 type_name    = IDENT .                          (* primitive, struct, interface, alias, or type param *)
 slice_type   = "[" "]" type .                   (* []T   dynamic, reference *)
-array_type   = "[" INT_LIT "]" type .           (* [N]T  fixed, value *)
+array_type   = "[" const_expr "]" type .        (* [N]T  fixed, value *)
+const_expr   = expr .                           (* folded at compile time; see below *)
 map_type     = "map" "<" type "," type ">" .    (* map<K,V> reference *)
 tuple_type   = "(" type "," type { "," type } ")" .   (* at least 2 elements *)
 func_type    = "(" [ type { "," type } ] ")" "=>" result_type .
@@ -750,6 +751,12 @@ constructible, mutable aggregate wants a struct.
   a slice literal (§12.3). Slicing: `s[lo:hi]`.
 - **Array** `[N]T`: fixed length `N` (a compile-time constant), value type, copied
   on assignment. Built with an array literal or zero-valued via `let a: [N]T`.
+  `N` is a `const_expr`: an integer literal, a module-level `const` of integer
+  type, or an expression over those (`[rows * cols]i64`). It is folded at compile
+  time; a length that does not fold to a non-negative integer is E0064, and a
+  function-local `let` is not a constant however evident its value. Note the
+  type-prefixed literal form `[N]T{...}` (§12.3) still requires a literal length,
+  because `[x]` there is ambiguous with a one-element slice literal.
 - **Map** `map<K,V>`: hash map; reference type; `K` must be a comparable type
   (§14.6). Built with `map<K,V>()` or a map literal. Absent keys read as the zero
   value of `V`; use the two-result index form to test presence (§12.6).
@@ -2851,7 +2858,8 @@ type          = type_name | slice_type | array_type | map_type | tuple_type
               | func_type | chan_type | generic_inst | "(" type ")" .
 type_name     = IDENT .
 slice_type    = "[" "]" type .
-array_type    = "[" INT_LIT "]" type .
+array_type    = "[" const_expr "]" type .
+const_expr    = expr .
 map_type      = "map" "<" type "," type ">" .
 tuple_type    = "(" type "," type { "," type } ")" .
 func_type     = "(" [ type { "," type } ] ")" "=>" result_type .
