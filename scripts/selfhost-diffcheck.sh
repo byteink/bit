@@ -98,17 +98,39 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
     [ -z "$firsthang" ] && firsthang="$f (SIGALRM after ${TIMEOUT_S}s x2, seed=$src bit=$brc)"
     continue
   fi
-  # BOTH of these normalizations are INERT against the current oracle and are
-  # kept only until #1893 proves that over the whole corpus rather than the one
-  # file it has been checked on. Measured 2026-07-30 against the 0.1.4 stage0:
-  # it emits no `error: CheckFailed` line (that line was never a diagnostic —
-  # it was a runtime reporting main's error return), and it renders the path
-  # exactly as given, identically to this tree.
+  # ONE NORMALIZATION, AND IT IS LOAD-BEARING (#1893).
   #
-  # They are not harmless-by-default: a filter on a differential's ORACLE side
-  # can only ever hide a difference, never reveal one — the same hazard #1883
-  # deleted the expected-mismatch lists for. Remove, do not extend.
-  seed=$(printf '%s\n' "$seed" | grep -v '^error: CheckFailed$' | sed "s#--> ${ROOT}#--> #")
+  # There were two. Both were assumed inert; measuring the whole 619-file corpus
+  # against the 0.1.4 stage0 — which is what #1893 asked for, rather than the
+  # single file they had been spot-checked on — split them:
+  #
+  #   grep -v '^error: CheckFailed$'   0 of 619 files. Genuinely dead, deleted.
+  #                                    That line was never a diagnostic anyway; it
+  #                                    was a runtime reporting main's error return.
+  #   sed "s#--> ${ROOT}#--> #"        7 of 619 files. LIVE. Do not delete.
+  #
+  # The seven are stdlib/{http3/h3,quic/{conn,packet,tls},tls/{ciphersuites,client,
+  # server}}.bit, and what makes them different is that their diagnostics point
+  # into an IMPORTED file rather than the one named on the command line. For those
+  # the 0.1.4 oracle prints an absolute path and this tree prints a relative one:
+  #
+  #     oracle:  --> /Users/…/bit/stdlib/crypto/mldsantt.bit:65:7
+  #     ours:    --> stdlib/crypto/mldsantt.bit:65:7
+  #
+  # So the sed is doing exactly what the warning below says a filter does: hiding
+  # a real behaviour change. Relative is the better rendering — absolute paths put
+  # the builder's home directory in compiler output — but nothing recorded the
+  # change, and this line is why nobody noticed. Tracked as #1920.
+  #
+  # It retires by itself. Repin stage0 to any release cut from this tree and the
+  # oracle starts printing relative paths too, at which point the measurement above
+  # reads 0 of 619 and the line can go. Delete it before then and those seven files
+  # turn red for a difference that is already understood.
+  #
+  # A filter on a differential's ORACLE side can only ever hide a difference, never
+  # reveal one — the same hazard #1883 deleted the expected-mismatch lists for.
+  # Remove when it measures dead, do not extend.
+  seed=$(printf '%s\n' "$seed" | sed "s#--> ${ROOT}#--> #")
   if [ "$seed" = "$b2" ]; then
     match=$((match + 1))
   elif [ -n "$seed" ] && [ -z "$b2" ]; then
@@ -128,7 +150,9 @@ if [ -n "$firstfp" ]; then
 fi
 if [ -n "$firstdiff" ]; then
   echo "=== first differing text: $firstdiff"
-  diff <(run "$ORACLE" check "$firstdiff" | grep -v '^error: CheckFailed$' | sed "s#--> ${ROOT}#--> #") \
+  # Same single normalization as the compare above; the two must not drift, or the
+  # evidence printed here describes a comparison that was never made.
+  diff <(run "$ORACLE" check "$firstdiff" | sed "s#--> ${ROOT}#--> #") \
        <(run "$BIT2" check "$firstdiff") | head -14
 fi
 # Only a false positive is a build-breaking regression; MISSING shrinks as emit
