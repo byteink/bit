@@ -14,10 +14,25 @@
 // DCID it has not seen. Each connection keeps its own reader-less loop fed by the
 // listener rather than parking on the shared socket itself.
 //
-// The demux table (`conns`/`present`) is touched only by the single listener
-// loop and the per-connection reaper threads; on the current single-worker
-// scheduler those never run concurrently across a heap mutation, so no lock is
-// needed. ponytail: the M:N epic (a multi-worker scheduler) must guard this map.
+// THE DEMUX TABLE IS GUARDED BY `lst.mu` (#1912). It is written by the single
+// listener loop AND by one reaper green thread per connection, and until #1900
+// the runtime booted exactly one worker, so those could not overlap across a
+// heap mutation and no lock was needed. This file said so, and said the M:N
+// epic would have to guard it. It does now.
+//
+// The symptom when it was not guarded is worth recording, because it does not
+// look like a data race from the outside. At `BIT_WORKERS=4`, seven of eight
+// concurrent connections completed in ~3s and the eighth failed after 49.7s
+// with "connection closed before the stream drained" — after which EVERY
+// subsequent handshake failed at exactly the 5s deadline, forever. A corrupted
+// hash table does not crash; it starts missing lookups, so the server silently
+// stops recognising its own connections and looks hung rather than broken.
+//
+// THE LOCK IS NEVER HELD ACROSS A CHANNEL OPERATION. `acceptCh <-`, `<- readyCh`
+// and `<- doneCh` all block, and blocking while holding this would wedge the
+// listener loop behind a connection that nobody is draining — the same stall
+// `quicListenerFeed`'s non-blocking send exists to avoid. Every critical
+// section below is a handful of map and counter operations with no park in it.
 
 // A hard ceiling on concurrently-tracked connections, bounding the demux table
 // and the per-connection green threads. Half-open handshakes free their slot via
@@ -46,6 +61,8 @@ const quicListenerMaxHandshakes: int = 4
 // drains, and a live-connection count for the connection cap.
 struct quicListenerState {
   sock: UdpSocket,
+  // Guards `conns`, `present`, `count` and `handshaking` — see the header.
+  mu: Mutex,
   cfg: TlsServerConfig,
   // The demux table maps a connection id to just that connection's inbound
   // datagram channel — not the whole `quicconnState`. The listener only ever
@@ -75,6 +92,7 @@ export function listenQuic(sock: UdpSocket, certChainPem: string, keyPem: string
   let lst = quicListenerState{
     sock: sock,
     cfg: cfg,
+    mu: newMutex(),
     conns: map<string, chan<quicconnDgram>>(),
     present: map<string, int>(),
     acceptCh: chan<Conn>(64),
@@ -116,15 +134,19 @@ function quicListenerDispatch(lst: quicListenerState, data: []byte, host: string
     return
   }
   let key = string(dcid)
-  if (lst.present[key] != 0) {
-    quicListenerFeed(lst.conns[key], data, host, port)
+  // The lookup and the feed are split: the map read is under the lock, the send
+  // is not. `quicListenerFeed` is non-blocking, but holding the table lock
+  // across any send invites exactly the stall the non-blocking send avoids.
+  lst.mu.lock()
+  let known = lst.present[key] != 0
+  let inCh = lst.conns[key]
+  lst.mu.unlock()
+  if (known) {
+    quicListenerFeed(inCh, data, host, port)
     return
   }
   // ponytail: unknown dcid falls through to the Initial/new-connection path.
   if (!quicDemuxIsInitial(data)) {
-    return
-  }
-  if (lst.count >= quicListenerMaxConns) {
     return
   }
   // Admission control (#1709): past the mid-handshake cap, shed the Initial
@@ -133,10 +155,29 @@ function quicListenerDispatch(lst: quicListenerState, data: []byte, host: string
   // its handshake-timeout-driven redial) will retry; dropping here is the same
   // "treat as loss" contract `quicListenerFeed` already uses for a backed-up
   // connection, just applied before a connection exists at all.
-  if (lst.handshaking >= quicListenerMaxHandshakes) {
+  // ADMISSION AND CREATION UNDER ONE LOCK, deliberately. Both caps are
+  // check-then-act: reading `count`/`handshaking` and then inserting in a
+  // separate critical section lets two datagrams for the same new DCID both
+  // pass the check and both create a connection, which double-counts the caps
+  // and leaves an orphaned connection nothing will ever route to.
+  lst.mu.lock()
+  if (lst.count >= quicListenerMaxConns || lst.handshaking >= quicListenerMaxHandshakes) {
+    lst.mu.unlock()
     return
   }
-  let st = quicListenerNewConn(lst, key)?
+  // Re-check under the lock: another datagram for this DCID may have created the
+  // connection between the probe above and here.
+  if (lst.present[key] != 0) {
+    let existing = lst.conns[key]
+    lst.mu.unlock()
+    quicListenerFeed(existing, data, host, port)
+    return
+  }
+  let st = quicListenerNewConn(lst, key) catch e {
+    lst.mu.unlock()
+    fail e
+  }
+  lst.mu.unlock()
   quicListenerFeed(st.inCh, data, host, port)
 }
 
@@ -156,6 +197,10 @@ function quicListenerFeed(inCh: chan<quicconnDgram>, data: []byte, host: string,
 // original DCID (used until the client adopts our SCID) and our own SCID (used
 // for 1-RTT). Spawns its ticker, loop, and a reaper that delivers it to `accept`
 // and frees its table entries when it ends.
+//
+// CALLED WITH `lst.mu` HELD (#1912) and does not take it itself. The reaper it
+// spawns blocks on `readyCh` before touching the table, so it cannot deadlock
+// against the caller's critical section.
 function quicListenerNewConn(lst: quicListenerState, clientKey: string): quicconnState! {
   let scid = quicconnMakeCid()
   let tp = quicconnLocalParams(scid)
@@ -192,19 +237,23 @@ function quicListenerReap(lst: quicListenerState, st: quicconnState, k1: string,
   // slot here rather than waiting for the connection to fully close, so a
   // reaped or long-lived established connection cannot also hold open a
   // mid-handshake slot it no longer occupies.
+  lst.mu.lock()
   lst.handshaking = lst.handshaking - 1
+  lst.mu.unlock()
   if (r > 0) {
     lst.acceptCh <- Conn{ cmdCh: st.cmdCh, sock: lst.sock }
   }
   <- st.doneCh
+  lst.mu.lock()
   quicListenerDrop(lst, k1)
   if (k2 != k1) {
     quicListenerDrop(lst, k2)
   }
   lst.count = lst.count - 1
+  lst.mu.unlock()
 }
 
-// Remove one demux key if present.
+// Remove one demux key if present. CALLED WITH `lst.mu` HELD (#1912).
 function quicListenerDrop(lst: quicListenerState, key: string) {
   if (lst.present[key] != 0) {
     lst.present[key] = 0
