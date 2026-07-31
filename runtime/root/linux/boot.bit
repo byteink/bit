@@ -129,7 +129,7 @@ import {
   schedTaskExit, dqPushBottom, taskAt, taskWords,
   schedStackBytes, schedStackAligned, schedRegisterBigStack, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
-  schedIdleSeq, schedIdlePark, wkId,
+  schedIdleArm, schedIdleDisarm, schedIdlePark, wkId,
 } from "../../sched"
 // The netpoller provider (#1673). `runtime/sched` may not import it — epoll
 // against kqueue is the platform split the parent module exists to stay clear of
@@ -426,10 +426,13 @@ function workerBody(arg: *byte): *byte {
   let n = 0
   while (n < WORKER_MAX_STEPS) {
     n = n + 1
-    // READ THE SEQ BEFORE LOOKING FOR WORK, never after: it is what closes the
-    // window between a failed find-work and the sleep. A producer that queues a
-    // task in that window has bumped it, and `parkWait` then refuses to sleep.
-    let seq = schedIdleSeq(s)
+    // ARM BEFORE LOOKING FOR WORK, never after: it is what closes the window
+    // between a failed find-work and the sleep. A producer that publishes in
+    // that window sees this worker armed, claims it, and the `parkWait` below
+    // returns immediately instead of sleeping through the wake.
+    if (parks) {
+      schedIdleArm(w)
+    }
     let addr = schedFindWorkAt(w, parkMonoNs())
     let woke = 0
     if (addr == 0) {
@@ -441,13 +444,18 @@ function workerBody(arg: *byte): *byte {
       }
       gcBlockingBegin()
       if (parks) {
-        schedIdlePark(s, seq)
+        schedIdlePark(s, w)
       } else {
         parkSleepNs(backoff)
       }
       gcBlockingEnd()
       backoff = parkNextBackoff(backoff)
       continue
+    }
+    // Running instead of parking: clear the arm so a producer does not spend
+    // its one wake on a worker that is already busy.
+    if (parks) {
+      schedIdleDisarm(w)
     }
     backoff = schedWorkerStepAt(w, addr, woke, backoff)
     if (backoff == workerStepStop) {
@@ -682,24 +690,30 @@ function boot(): int {
   //    the moment it exists, so a `spawn` from anywhere in the program can find
   //    it — the Bit form of `runtime/root/` assigning the module-global `g_sched`.
   //
-  //    WORKER COUNT (#1900, ABI.md §8 step 2). THE DEFAULT IS 1, AND THAT IS
-  //    MEASURED, NOT CONSERVATISM. Defaulting to the CPU count was tried and
-  //    reverted: an idle worker still runs its find-work/steal/backoff loop, so
-  //    a pool wider than the runnable work costs CPU rather than saving it. On
-  //    an 18-core box, 4 CPU-bound tasks took 108% of one task's time with 4
-  //    workers and 215% with 18 — and a full `./make test`, which runs many Bit
-  //    processes, drove load to 79 and timed a test out that has never timed out
-  //    before. Every Bit process would have become a thread bomb.
+  //    WORKER COUNT (#1900/#1902, ABI.md §8 step 2). THE DEFAULT IS 1, AND IT
+  //    STAYS 1 EVEN THOUGH #1902 MADE AN IDLE WORKER FREE.
   //
-  //    `BIT_WORKERS=<n>` opts in, which is what makes the parallelism usable
-  //    today. The default flips to the CPU count once an idle worker is cheap
-  //    (#1900's follow-up); until then a wider pool is the caller's explicit
-  //    choice, taken per program with knowledge of its concurrency.
+  //    #1900 measured the first reason: an idle worker ran its
+  //    find-work/steal/backoff loop at a 1ms ceiling, so 18 idle workers burned
+  //    84x the CPU of one to do nothing. #1902 fixed exactly that — workers
+  //    1..N-1 now park on the futex — and the same measurement is flat at 0.05s
+  //    for every count from 1 to 18, with four CPU-bound tasks still scaling to
+  //    383%. So the stated blocker is gone.
   //
-  //    `parkCpuCount` stays wired for that flip: it reads `sched_getaffinity`,
-  //    not the raw core count, so a container with a restricted cpuset sizes to
-  //    its real allowance, and it returns 0 rather than 1 on failure so "the
-  //    query failed" is distinguishable from "one CPU".
+  //    A SECOND ONE WAS FOUND WHEN THE FLIP WAS TRIED, and it is not about idle
+  //    cost at all: NESTED PARALLELISM. A CPU-count default is a claim on the
+  //    whole machine, and it is wrong for a process that is itself one of N run
+  //    at once. `tests/bit/docs.bit` runs 12 `bit` invocations concurrently by
+  //    design; at 18 workers each that is 216 worker threads on 18 cores, and a
+  //    batch that takes ~48s blew its 300s deadline. The threads were genuinely
+  //    parked (sampled at 0:00.00 CPU), so this is not the spin #1902 removed —
+  //    it is oversubscription, and no amount of making idle workers cheaper
+  //    fixes a pool sized against cores the process does not have to itself.
+  //
+  //    `BIT_WORKERS=<n>` opts in, and after #1902 opting in is genuinely cheap.
+  //    The default flips when the runtime can size a pool against the machine's
+  //    ACTUAL free capacity rather than its core count.
+  //
   let nworkers = rootEnvWorkers(1)
   if (nworkers < 1) {
     nworkers = 1

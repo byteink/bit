@@ -15,13 +15,20 @@
 //   23       running     the task currently switched-to, 0 between tasks
 //   24       disposition how the running task last left the CPU
 //   25       sched       the owning scheduler block's address
-//   26..33   reserved
+//   26       park        the worker's own futex word: 1 = armed to park or
+//                        parked, 0 = awake or claimed by a waker (#1902)
+//   27..33   reserved
 //   34..291  deque       this worker's local run queue (`dqWords`)
 export const wkCtx: int = 0
 export const wkId: int = 22
 export const wkRunning: int = 23
 export const wkDisposition: int = 24
 export const wkSched: int = 25
+
+// This worker's park word. PER WORKER, not one shared cell for the pool, and
+// that is the whole design — see `sleep.bit`. An i32, because that is what
+// `futex(2)` and `__ulock_wait` compare.
+export const wkPark: int = 26
 export const wkDeque: int = 34
 export const workerWords: int = 292
 
@@ -42,8 +49,8 @@ export const workerWords: int = 292
 //   11       pollLock    the netpoller's try-lock (an i32 cell)
 //   12       pollFdWrite the SECOND epoll descriptor, carrying write interest
 //                        only. LINUX ONLY — 0 everywhere else (#1910)
-//   13       idleSeq     the futex word parked workers wait on (an i32 cell)
-//   14       idleCount   how many workers are parked on it (#1902)
+//   13       reserved
+//   14       idleCount   how many workers are parked (#1902)
 //   15       reserved
 export const scNWorkers: int = 0
 export const scWorkers: int = 1
@@ -79,11 +86,9 @@ const scPollLock: int = 11
 // the Darwin provider leaves this unset and reads only `scPollFd`.
 export const scPollFdWrite: int = 12
 
-// The idle park's two words (#1902). `scIdleSeq` is an i32 cell — `futex(2)` and
-// `__ulock_wait` both compare 32 bits — so it takes a whole slot and uses a
-// quarter of it, exactly as `scPollLock` does. `sleep.bit` holds the rules the
-// two obey; the layout lives here with the rest of the block.
-export const scIdleSeq: int = 13
+// How many workers are parked (#1902). Read by `schedWakeIdle` to skip its scan
+// when nobody is asleep; the park words themselves are per WORKER (`wkPark`),
+// which is the whole design — see `sleep.bit`.
 export const scIdleCount: int = 14
 export const schedWords: int = 16
 
@@ -106,7 +111,6 @@ export @nosplit @symbol("bit_rt_port_sched_init") function schedInit(s: *i64, wo
   *(s + scPollFd) = 0
   // 0 means "not bound", and the Darwin provider never binds it (#1910).
   *(s + scPollFdWrite) = 0
-  atomicStore(lockOf(s, scIdleSeq), 0)
   atomicStore(s + scIdleCount, 0)
   gqInit(s + scGlobal)
 
@@ -114,6 +118,7 @@ export @nosplit @symbol("bit_rt_port_sched_init") function schedInit(s: *i64, wo
   while (i < nworkers) {
     let w = schedWorkerAt(s, i)
     *(w + wkId) = i
+    atomicStore(lockOf(w, wkPark), 0)
     *(w + wkRunning) = 0
     *(w + wkDisposition) = taskRunning
     *(w + wkSched) = int(s)
@@ -462,12 +467,18 @@ export const WORKER_MAX_STEPS: int = 1000000000
 // window — want the identical placement, so it is written once.
 @nosplit function schedRequeue(s: *i64, w: *i64, addr: int) {
   let queued = dqPushBottom(w + wkDeque, addr)
-  if (!queued) {
-    gqPush(s + scGlobal, addr)
+  if (queued) {
+    // ORDINARY YIELD — DO NOT WAKE, AND DO NOT BUMP THE SEQ (#1902). The task
+    // went back on the ring of the worker about to run it, so there is nothing
+    // for a peer to take; bumping the seq here instead makes every parked
+    // worker's `parkWait` return EAGAIN at THIS worker's yield rate. The first
+    // version did wake here and the pool spun rather than slept: load 68.8 on
+    // 18 cores, `bit` typechecks blowing a 300s deadline, h3fetch timed out —
+    // worse than the polling this ticket removes. See sleep.bit's header.
+    return
   }
-  // Runnable again, so a parked worker may now have something to steal (#1902).
-  // Woken even when the task went on THIS worker's local ring: the ring is the
-  // steal source, and a peer that is asleep cannot take from it.
+  // Spilled to the global queue: now it IS work another worker can take.
+  gqPush(s + scGlobal, addr)
   schedWakeIdle(s)
 }
 
@@ -785,5 +796,6 @@ export @nosplit function schedShutdown(s: *i64) {
   // Parked workers check `scStopping` on waking, so shutdown has to wake them
   // (#1902). Without this the join in `boot` waits out one `idleParkMaxNs` per
   // parked worker before the process can exit — a 100ms tax on every run.
-  schedWakeIdle(s)
+  // The whole-pool variant, unlike every other wake site: all of them must go.
+  schedWakeIdleAll(s)
 }

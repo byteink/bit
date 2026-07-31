@@ -4,10 +4,10 @@
 //
 // WHY THE FILE SORTS WHERE IT DOES. Module files concatenate in bytewise
 // filename order and the inliner only inlines a callee it has already lowered
-// (#1511). `schedWakeIdle` is called from `task.bit` and `worker.bit` and itself
-// calls `lockOf` from `sched.bit`, so the name has to land strictly between
-// them: sched < scratch < sleep < task < worker. A name like `idle.bit` would
-// have read better and cost `lockOf`'s inlining on the wake path.
+// (#1511). `schedWakeIdle` is called from `task.bit` and `worker.bit`, so the
+// name has to land before both: sched < scratch < sleep < task < worker. A name
+// like `idle.bit` would have read better and sorted before `sched.bit`, losing
+// the inlining of everything this file calls.
 //
 // ---------------------------------------------------------------------------
 // What was wrong
@@ -27,31 +27,57 @@
 // is the bug the epic exists to fix.
 //
 // ---------------------------------------------------------------------------
-// The sequence counter, and why a count of idle workers is NOT the mechanism
+// A park word PER WORKER, and why one shared word does not work
 // ---------------------------------------------------------------------------
 //
-// `scIdleSeq` is bumped by every transition that makes a task runnable. A worker
-// about to park READS IT FIRST, then looks for work, then hands the value it read
-// to `parkWait` as the expected one. The futex compares under its own lock and
-// refuses to sleep if the word has moved. So the lost wakeup this ticket's whole
-// risk consists of — producer queues work in the window between the failed
-// find-work and the sleep — cannot happen: that producer necessarily bumped the
-// seq, and the sleep returns immediately instead of starting.
+// Each worker owns `wkPark`, an i32 in its own block. 1 means "armed to park, or
+// parked"; 0 means "awake, or claimed by a waker". A worker ARMS BEFORE it looks
+// for work, and a producer that publishes work scans for an armed worker, claims
+// exactly one with a compare-and-exchange, and wakes that one.
 //
-// `scIdleCount` is an OPTIMISATION AND ONLY THAT. Without it every spawn, every
-// unpark and every channel send would issue a `FUTEX_WAKE` syscall even with no
-// worker parked to receive it — a syscall added to the hot path to remove one
-// from the idle path, which is not obviously a trade at all. With it the wake
-// syscall is skipped when the count reads zero. A STALE READ IN EITHER DIRECTION
-// IS HARMLESS, which is what makes it safe to be an optimisation: a stale zero
-// skips a wake that the seq check has already made unnecessary, and a stale
-// non-zero costs one wasted syscall.
+// THE FIRST VERSION USED ONE SHARED SEQUENCE WORD FOR THE POOL and it was a
+// spin, not a park. The mechanism is worth stating because the shared word looks
+// obviously cheaper: with one word, EVERY wake invalidates EVERY park. A worker
+// hands `parkWait` the sequence value it read, so any bump makes all N-2 sleepers
+// return EAGAIN, run a find-work pass, and re-arm — at the rate of whatever is
+// bumping. Cost is O(N) per event by construction, and the events are not rare:
+// a compiler doing thousands of file reads a second unparks its task on every
+// one.
 //
-// The ordering that makes that true is fixed and small. The producer bumps the
-// seq BEFORE it reads the count; the worker increments the count BEFORE it
-// waits. Given both, a producer that reads zero can only have done so before the
-// worker's increment, hence before the worker's compare — so the worker sees the
-// bumped seq and does not sleep. Reversing either line reintroduces the hang.
+// Measured with the CPU-count default, and it got worse each time I narrowed the
+// wake sites, because narrowing does not change the shape:
+//
+//     load 68.8 then 128 on an 18-core box, against a target of 25
+//     `bit` TYPECHECK invocations blowing a 300s deadline (no program even runs)
+//     h3fetch TIMED OUT
+//     worker threads in state R at ~12% CPU each — spinning, not sleeping
+//
+// Strictly worse than the 1kHz polling this file exists to remove. A per-worker
+// word has no such coupling: a wake disturbs one worker, and the others sleep
+// through it. The producer pays a bounded scan of at most `nworkers` words
+// instead, which is a few cache lines and no syscall.
+//
+// THE ARM ORDER IS THE CORRECTNESS ARGUMENT, and it is the only subtle part.
+// The worker arms BEFORE its find-work pass; the producer publishes the work
+// BEFORE it scans. Take the two interleavings:
+//
+//   - producer published first -> the worker's own find-work pass sees the work.
+//     The producer may also claim and wake it; that wake lands on a worker that
+//     is about to disarm and run, and a `FUTEX_WAKE` with no waiter is a no-op.
+//   - worker armed first, published after -> the scan sees `wkPark == 1`, claims
+//     it, and wakes. If the worker has not reached `parkWait` yet, the word is
+//     already 0, so `parkWait`'s own compare returns immediately rather than
+//     sleeping. That compare IS the double-check; there is no separate re-poll.
+//
+// Arming AFTER find-work instead reopens the window this closes: a producer that
+// publishes between the failed find-work and the arm sees no armed worker, and
+// the worker then sleeps through work that is already queued.
+//
+// `scIdleCount` survives as an OPTIMISATION AND ONLY THAT: it lets a producer
+// skip the scan entirely when nobody is parked. A stale read either way is
+// harmless — a stale zero skips a scan that would have found nothing settled
+// anyway (the armed worker's own find-work pass is still ahead of it), a stale
+// non-zero costs one bounded scan.
 //
 // ---------------------------------------------------------------------------
 // Worker 0 does not park, and that is the safety property
@@ -100,67 +126,98 @@ extern function bit_rt_port_park_wait(p: *i32, expected: i32, timeoutNs: i64): i
 // because a bound that never plausibly fires stops being a net anyone tests.
 export const idleParkMaxNs: int = 100000000
 
-// Where the futex waits. An i32 cell, because that is what `futex(2)` and
-// `__ulock_wait` compare — the reason this is a separate slot from a plain i64
-// counter.
+// Upper bound on the wake scan, so the loop's termination is provable from its
+// own body (Power of 10) rather than from trusting `scNWorkers`. Must not be
+// BELOW the consumers' own ceiling — `runtime/root/<os>`'s `bootMaxWorkers`,
+// which is 32 and is what actually clamps the count at boot — or a worker past
+// this index would arm and never be claimed. Kept as a separate constant because
+// those live in a module this one may not import.
+export const schedMaxWorkers: int = 32
+
+
+// This worker's park word as the i32 the futex compares.
 //
-// THE ARITHMETIC IS WRITTEN OUT RATHER THAN CALLING `sched.bit`'s `lockOf`,
-// WHICH DOES EXACTLY THIS. Not an oversight and not worth "cleaning up": the
-// consumers of this file are `runtime/root/<os>`'s boot, which emits
-// `--freestanding` (SPEC §11.9), and the inliner splices single-block callees.
-// Routing through `lockOf` therefore lands an unpinned `m6$lockOf` reference
-// inside boot's object, which no sibling object defines and which E0078 rejects
-// at link — the exact error this file was written with. Pinning the callee does
-// not help, because the inline happens first. So the two lines are duplicated at
-// the module boundary, deliberately, and a change to `lockOf` must be mirrored.
-//
-// PINNED DESPITE BEING AN INTERNAL HELPER, for the same reason. `schedIdleSeq`
-// is a single-block callee too, so it inlines into boot and carries its call to
-// THIS with it — leaving boot's object naming `m6$schedIdleAddr`. Under §11.9 a
-// function the inliner can drag across a freestanding edge IS a function another
-// module calls, whatever the source says.
-@nosplit @symbol("bit_rt_port_sched_idle_addr") function schedIdleAddr(s: *i64): *i32 {
+// The arithmetic is written out rather than calling `sched.bit`'s `lockOf`, which
+// does exactly this. Not an oversight: the consumers are `runtime/root/<os>`'s
+// boot, which emits `--freestanding` (SPEC §11.9), and THE INLINER SPLICES
+// SINGLE-BLOCK CALLEES ACROSS THAT EDGE — so routing through `lockOf` lands an
+// unpinned `m6$lockOf` reference inside boot's object that no sibling defines and
+// E0078 rejects at link. Pinning the callee does not help, because the inline
+// happens first. Mirror any change to `lockOf` here.
+@nosplit @symbol("bit_rt_port_sched_park_addr") function workerParkAddr(w: *i64): *i32 {
   let z: *i32 = nil
-  return z + int(s + scIdleSeq) / 4
+  return z + int(w + wkPark) / 4
 }
 
-// The value a worker must hand back to the park as the expected one. Read BEFORE
-// the find-work pass, never after — see the header.
-export @nosplit @symbol("bit_rt_port_sched_idle_seq") function schedIdleSeq(s: *i64): i32 {
-  return atomicLoad(schedIdleAddr(s))
+// Arm this worker to park. MUST be called before its find-work pass, not after —
+// see the header's interleaving argument.
+export @nosplit @symbol("bit_rt_port_sched_idle_arm") function schedIdleArm(w: *i64) {
+  atomicStore(workerParkAddr(w), 1)
 }
 
-// Park until woken, the seq moves, or `idleParkMaxNs` elapses.
+// Found work instead. Clear the arm so a producer does not spend its one wake on
+// a worker that is already running.
+export @nosplit @symbol("bit_rt_port_sched_idle_disarm") function schedIdleDisarm(w: *i64) {
+  atomicStore(workerParkAddr(w), 0)
+}
+
+// Park until claimed, or until `idleParkMaxNs` elapses.
 //
-// The whole wait lives on THIS side of the module edge rather than in the
-// caller, because the boot module would otherwise need four pinned entries and
-// the address of the futex word; here it needs `schedIdleSeq` and this. The
-// caller still owns the `gcBlockingBegin`/`gcBlockingEnd` bracket (ABI.md §5) —
-// a parked worker cannot reach a safepoint, so the collector must see it as
-// blocking or every rendezvous waits it out.
+// `parkWait` compares the word against 1 under its own lock: a producer that
+// claimed this worker between the arm and here has already stored 0, so the wait
+// returns immediately rather than sleeping through a wake. The caller owns the
+// `gcBlockingBegin`/`gcBlockingEnd` bracket (ABI.md §5) — a parked worker cannot
+// reach a safepoint, so the collector must see it as blocking or every rendezvous
+// waits it out.
 //
-// The count is incremented BEFORE the wait and decremented however the wait
-// ended — woken, timed out, or the immediate EAGAIN that says the seq moved.
-// That order is half of what makes `scIdleCount` safe to be an optimisation;
-// see the header for the other half.
-export @nosplit @symbol("bit_rt_port_sched_idle_park") function schedIdlePark(s: *i64, seq: i32) {
+// The word is cleared unconditionally on the way out, whichever way the wait
+// ended: woken, timed out, or returned immediately.
+export @nosplit @symbol("bit_rt_port_sched_idle_park") function schedIdlePark(s: *i64, w: *i64) {
   atomicAdd(s + scIdleCount, 1)
-  bit_rt_port_park_wait(schedIdleAddr(s), seq, idleParkMaxNs)
+  bit_rt_port_park_wait(workerParkAddr(w), 1, idleParkMaxNs)
+  atomicStore(workerParkAddr(w), 0)
   atomicSub(s + scIdleCount, 1)
 }
 
-// A task became runnable. Called from every transition that queues one.
+// Work is now reachable by another worker: wake exactly one parked worker.
 //
-// The bump is unconditional and the syscall is not: the seq is what correctness
-// rests on and costs one atomic add, while the wake is skipped when no worker is
-// parked to hear it. Order is load-after-bump and is not rearrangeable.
-// Pinned for the inliner's sake, not because boot names it: `schedSpawn` and
-// `schedShutdown` call it and both inline into boot. Same rule as
-// `schedIdleAddr` above.
+// Call sites are the transitions that PUBLISH work others can reach — a spill to
+// the global queue, a spawn, an unpark, a poller unpark. An ordinary yield back
+// onto the running worker's own ring is not one of them, and waking for it was
+// half of what made the shared-word version spin. The test for a new call site
+// is not "did something become runnable" but "can a DIFFERENT worker now find
+// work it could not find a moment ago".
+//
+// The scan is bounded by the worker count, itself clamped to 32 at boot, so the
+// loop's bound is provable from this body (Power of 10). Claiming with a
+// compare-and-exchange is what keeps two producers from spending two wakes on the
+// same worker.
 export @nosplit @symbol("bit_rt_port_sched_wake_idle") function schedWakeIdle(s: *i64) {
-  atomicAdd(schedIdleAddr(s), 1)
   if (atomicLoad(s + scIdleCount) <= 0) {
     return
   }
-  bit_rt_port_park_wake(schedIdleAddr(s), true)
+  let n = *(s + scNWorkers)
+  let i = 0
+  while (i < n && i < schedMaxWorkers) {
+    let p = workerParkAddr(schedWorkerAt(s, i))
+    if (atomicCmpxchg(p, 1, 0)) {
+      bit_rt_port_park_wake(p, false)
+      return
+    }
+    i = i + 1
+  }
+}
+
+// Shutdown's wake, and the one caller that genuinely wants the whole pool: every
+// worker must observe `scStopping` and leave, so waking one would exit one worker
+// per `idleParkMaxNs` and turn teardown into a staircase.
+export @nosplit @symbol("bit_rt_port_sched_wake_idle_all") function schedWakeIdleAll(s: *i64) {
+  let n = *(s + scNWorkers)
+  let i = 0
+  while (i < n && i < schedMaxWorkers) {
+    let p = workerParkAddr(schedWorkerAt(s, i))
+    atomicStore(p, 0)
+    bit_rt_port_park_wake(p, true)
+    i = i + 1
+  }
 }
