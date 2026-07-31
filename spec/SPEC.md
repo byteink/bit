@@ -1513,8 +1513,9 @@ A struct literal is **always** prefixed by its type name: `Point{ x: 1.0, y: 2.0
 This is the rule that removes the block-versus-object-literal ambiguity — a bare
 `{` in statement position is **always** a block (§13.1), never a struct or map
 literal. Struct literals are keyed; any field omitted from the literal takes its
-zero value (§13.4). Fields not visible to the current module (unexported fields of
-a foreign struct) may not appear.
+zero value (§13.4). A field whose own type is a **struct** has no zero value and
+therefore may **not** be omitted — leaving it out is **E0083**. Fields not visible
+to the current module (unexported fields of a foreign struct) may not appear.
 
 ### 12.3 Slice, Array, and Map Literals
 
@@ -1784,7 +1785,9 @@ Every declared binding without an initializer is deterministically zero-valued:
 - numeric → `0`; `bool` → `false`; `string` → `""`.
 - `[N]T` array → all elements zero-valued; tuple → each element zero-valued.
 - `struct` → a live instance with each field zero-valued (structs are references,
-  so `let p: Point` yields a usable zeroed `Point`, not `nil`).
+  so `let p: Point` yields a usable zeroed `Point`, not `nil`) — **provided every
+  field has a zero value**. A struct type with a **struct-typed field** has no
+  zero value at all: see below.
 - `[]T` slice → the **empty slice**: `len` and `cap` are `0`, `append` allocates,
   iteration yields nothing, and indexing panics (§18.4). A slice cannot be
   compared to `nil` (§14.6), so an empty slice is indistinguishable from the
@@ -1797,6 +1800,30 @@ Every declared binding without an initializer is deterministically zero-valued:
 Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
 closed channel (§16.2), and the ok-value of a failed fallible call (§18.2).
+
+**A struct type with a struct-typed field has no zero value and cannot be
+default-constructed.** Both forms that would ask for one are **E0083**:
+
+```
+struct Inner { xs: []u32 }
+struct Outer { a: int, b: Inner }
+
+let o = Outer{ a: 1 }          // E0083 — omits the struct-typed `b`
+let p: Outer                   // E0083 — no initializer at all
+let q = Outer{ a: 1, b: Inner{} }   // ok; `Inner` has no struct-typed field
+```
+
+The reason is that a struct is a *reference* (§13.3). Zero bits in a struct-typed
+field is a **null**, not a live instance, so the promise above cannot be kept for
+it: reading through such a field would fault, and a field left holding a
+plausible-looking address is a false root for the collector. Filling it with a
+fresh instance instead is not an option either, because struct types may form
+reference cycles and the fill would not terminate.
+
+Only a **struct-typed** field is affected. Scalars, `string`, slices, maps,
+channels, functions and interfaces all have a zero value that is literally zero
+bits, and an inline `[N]T` field lives in the struct's own storage, so all of
+them stay omittable and `let p: Inner` above is still valid.
 
 ### 13.5 Arithmetic and Overflow
 

@@ -1890,8 +1890,13 @@ struct literal.
 ### `RsaPrivateKey`
 
 An RSA private key: the exported `Nat` fields `n` (modulus), `e` (public
-exponent, used for blinding), and `d` (private exponent). The CRT parameters are
-not retained in v1.
+exponent, used for blinding), `d` (private exponent), and the CRT parameters
+`p`, `q`, `dp`, `dq` and `qinv`.
+
+Build one with `rsaParsePrivateKey` / `rsaParsePkcs1PrivateKey`. A struct literal
+must name **all eight** fields: `Nat` is itself a struct, and a struct-typed
+field has no zero value, so leaving one out is `E0083` (spec §13.4). There is no
+`RsaPrivateKey{ n: ..., e: ..., d: ... }` short form.
 
 ### `rsaParsePublicKey(der: []byte): RsaPublicKey!`
 

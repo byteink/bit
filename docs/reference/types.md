@@ -157,6 +157,22 @@ function structs() {
 }
 ```
 
+Reference semantics have one consequence worth knowing up front: a struct field
+whose own type is a struct **must** be given a value. It has no zero value,
+because zero bits in a reference field is a null, not a live instance.
+
+```bit ignore
+struct Inner { xs: []u32 }
+struct Outer { a: int, b: Inner }
+
+let bad = Outer{ a: 1 }              // E0083 - `b` omitted
+let alsoBad: Outer                   // E0083 - no initializer
+let good = Outer{ a: 1, b: Inner{} } // fine; `Inner` has no struct-typed field
+```
+
+Every other field type stays omittable, including an inline `[N]T`, because
+their zero value really is zero bits.
+
 Methods attach behavior to a struct; see [Functions](functions.md#methods).
 
 ## Type aliases

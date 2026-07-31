@@ -50,6 +50,12 @@ Every binding without an initializer is deterministically zeroed (§13.4):
   a zeroed struct is usable, not `nil`)
 - slices, maps, channels, functions, interfaces → `nil`
 
+One exception, and it is the only one: a struct that has a **struct-typed field**
+has no zero value, so it cannot be declared without an initializer and a literal
+cannot leave that field out. Both are `E0083`. A struct is a reference, so zero
+bits in such a field would be a null rather than a live instance - see
+[Types](types.md#structs).
+
 ```bit
 struct Point { x: f64; y: f64 }
 
