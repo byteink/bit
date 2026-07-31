@@ -97,7 +97,23 @@ fi
 : >"$work/timeout"
 match=0 skip=0
 
-for f in $(find stdlib examples tests/cases tests/imports selfhost runtime -name '*.bit' | sort); do
+# `compiler`, not `selfhost` — the directory was renamed in #1841 and this line
+# was not. A missing root makes `find` complain on stderr and carry on with the
+# rest, so the gate kept passing while silently scanning 706 files instead of
+# 840: every one of the compiler's own sources went format-unchecked from the
+# rename until #1922. Nothing failed, which is the whole problem with naming
+# corpus roots as bare strings.
+#
+# So the roots are named once, and checked. A rename now stops the gate instead
+# of quietly shrinking it — the same reasoning as the zero-file guard in the IR
+# differentials (#1881), one step earlier in the pipeline.
+CORPUS="stdlib examples tests/cases tests/imports compiler runtime"
+for d in $CORPUS; do
+  [ -d "$d" ] || { echo "difffmt: corpus root '$d' does not exist — refusing to scan a partial tree" >&2; exit 2; }
+done
+
+# shellcheck disable=SC2086  # CORPUS is a deliberate word-split list of roots.
+for f in $(find $CORPUS -name '*.bit' | sort); do
   a="$work/a"; b="$work/b"
   rm -rf "$a" "$b"; mkdir -p "$a" "$b"
   cp "$f" "$a/s.bit"
