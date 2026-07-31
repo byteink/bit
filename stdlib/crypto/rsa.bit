@@ -24,10 +24,14 @@
 //     padding is rejected with a single uniform error and a data-independent
 //     control flow.
 //
-// CRT (the p/q/dp/dq/qInv fast path) is deliberately deferred in v1: the plain
-// `c^d mod n` on the constant-time ladder is simpler to argue correct and to keep
-// constant-time, and key parsing still validates the CRT fields are present. The
-// public API is stable; CRT is a later internal optimization behind `RsaPrivateKey`.
+// CRT (the p/q/dp/dq/qInv fast path) IS IMPLEMENTED — `rsaExp` below. It was
+// deferred in v1 and the deferral cost more than it looked: one RSA-2048
+// signature was 1056ms, of which 948ms was the single full-width exponentiation,
+// and that alone made eight concurrent TLS handshakes miss a 5s deadline
+// (#1862/#1913). Two half-width legs cost 272ms measured. The fallback for a key
+// with no primes is kept, and every private operation now verifies itself with
+// the public exponent before returning — CRT is fault-sensitive in a way the
+// plain path is not.
 
 // ---------------------------------------------------------------------------
 // Keys
@@ -37,11 +41,24 @@
 // parser (`rsaParsePublicKey` / `rsaParsePkcs1PublicKey`) or the struct literal.
 export struct RsaPublicKey { export n: Nat, export e: Nat }
 
-// An RSA private key: modulus `n`, public exponent `e` (needed for blinding),
-// and private exponent `d`. The CRT parameters are not retained in v1 (see the
-// file header); `rsaParsePkcs1PrivateKey` still requires them to be present and
-// well-formed in the DER.
-export struct RsaPrivateKey { export n: Nat, export e: Nat, export d: Nat }
+// An RSA private key: modulus `n`, public exponent `e` (needed for blinding and
+// for the CRT fault check), private exponent `d`, and the CRT parameters — the
+// primes `p`/`q`, the reduced exponents `dp`/`dq`, and `qinv = q^-1 mod p`.
+//
+// `p` ZERO MEANS "NO CRT", and is the supported way to build a key from a bare
+// `{n, e, d}`: `rsaPrivateOp` branches on it and falls back to the single
+// full-width exponentiation. Every key `rsaParsePkcs1PrivateKey` returns has
+// them, because the DER is required to carry all nine fields.
+export struct RsaPrivateKey {
+  export n: Nat,
+  export e: Nat,
+  export d: Nat,
+  export p: Nat,
+  export q: Nat,
+  export dp: Nat,
+  export dq: Nat,
+  export qinv: Nat,
+}
 
 // The byte length `k` of the modulus, i.e. the size of every ciphertext and
 // signature this key produces (RFC 8017's `k`).
@@ -191,8 +208,58 @@ function rsaPrivateOp(priv: RsaPrivateKey, c: Nat): Nat! {
   }
   let re = bigintModExpPublic(r, priv.e, n)?
   let blinded = bigintMod(bigintMul(c, re), n)?
-  let md = bigintModExp(blinded, priv.d, n)?
-  return bigintMod(bigintMul(md, rInv), n)?
+  let md = rsaExp(priv, blinded)?
+  let m = bigintMod(bigintMul(md, rInv), n)?
+
+  // FAULT CHECK, AND IT IS NOT OPTIONAL ON THE CRT PATH. A single faulty leg
+  // yields an `m` correct modulo one prime and wrong modulo the other, and
+  // `gcd(m^e - c, n)` then hands an attacker the factorisation of `n` from ONE
+  // bad signature (Boneh-DeMillo-Lipton). Re-doing the public operation costs a
+  // modexp with `e` — 65537, about 19 multiplications — against the ~272ms the
+  // CRT path spends, so it is noise next to what CRT saves.
+  //
+  // Run on BOTH paths rather than only under the branch: it is equally cheap
+  // there, and a check that only guards one path is one refactor away from
+  // guarding neither.
+  if (bigintCmp(bigintModExpPublic(m, priv.e, n)?, c) != 0) {
+    fail newError("rsa: private operation failed verification")
+  }
+  return m
+}
+
+// `x^d mod n`, by the Chinese Remainder Theorem when the key carries its primes
+// and by the plain full-width exponentiation when it does not.
+//
+// WHY THIS IS WORTH THE BRANCH. `x^d mod n` for RSA-2048 is a 2048-bit exponent
+// modulo a 2048-bit modulus; the CRT form is two exponentiations of half the
+// width AND half the exponent length. Measured on aarch64-macos:
+//
+//     bigintModExp, 2048-bit modulus and exponent     948 ms
+//     bigintModExp, 1024-bit modulus and exponent     136 ms
+//
+// so two legs cost 272ms against 948ms — 3.5x, on the term that is 90% of a
+// signature. The ratio is 7x rather than the 4x limb count alone predicts
+// because halving the modulus also halves the iteration count; the cost runs at
+// roughly O(bits^3). If a later measurement shows only ~2x here, suspect a leg
+// running at full width rather than a limit of the technique.
+//
+// `bigintModExp` is constant-time for an odd modulus (`bigintModExpMont`), and
+// both primes are odd, so both legs keep that property. The caller's base
+// blinding is applied before this is reached and is what protects the input.
+function rsaExp(priv: RsaPrivateKey, x: Nat): Nat! {
+  if (bigintIsZero(priv.p) || bigintIsZero(priv.q)) {
+    return bigintModExp(x, priv.d, priv.n)?
+  }
+  let m1 = bigintModExp(bigintMod(x, priv.p)?, priv.dp, priv.p)?
+  let m2 = bigintModExp(bigintMod(x, priv.q)?, priv.dq, priv.q)?
+  // h = qinv * (m1 - m2) mod p. `Nat` has no negatives and `bigintSub` fails on
+  // a borrow, so the subtraction is done as `m1 + (p - (m2 mod p))`: `m2 mod p`
+  // is strictly below `p`, so the inner difference never borrows, and the outer
+  // reduction absorbs the added `p`.
+  let m2p = bigintMod(m2, priv.p)?
+  let diff = bigintMod(bigintAdd(m1, bigintSub(priv.p, m2p)?), priv.p)?
+  let h = bigintMod(bigintMul(priv.qinv, diff), priv.p)?
+  return bigintAdd(m2, bigintMul(h, priv.q))
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +724,11 @@ export function rsaParsePkcs1PrivateKey(der: []byte): RsaPrivateKey! {
     n: bigintFromBytes(asn1ReadBigInteger(seq[1])?),
     e: bigintFromBytes(asn1ReadBigInteger(seq[2])?),
     d: bigintFromBytes(asn1ReadBigInteger(seq[3])?),
+    p: bigintFromBytes(asn1ReadBigInteger(seq[4])?),
+    q: bigintFromBytes(asn1ReadBigInteger(seq[5])?),
+    dp: bigintFromBytes(asn1ReadBigInteger(seq[6])?),
+    dq: bigintFromBytes(asn1ReadBigInteger(seq[7])?),
+    qinv: bigintFromBytes(asn1ReadBigInteger(seq[8])?),
   }
 }
 
