@@ -1,0 +1,155 @@
+// compiler/verify.bit — the IR's unchecked invariant, checked (#1925).
+//
+// THE RULE. A value defined OUTSIDE a loop may not be read INSIDE it. Everything
+// live across a loop enters through the header's block parameters.
+//
+// Every lowering in `compiler/` already obeys it — `lowerWhile` threads the live
+// locals through the header, `lowerForOf` and `lowerForInf` the same, and each
+// of them re-materializes a constant inside the loop rather than reaching back
+// for the one in the entry block. None of that was written down, and nothing
+// enforced it.
+//
+// Reading a value from another block is otherwise ordinary: a `while` body reads
+// its header's parameters, and a straight-line value is read across a join
+// constantly. Only the loop boundary is dangerous.
+//
+// WHAT HAPPENS WHEN IT IS BROKEN, measured rather than reasoned about. #1924's
+// slice-fill loop first read the slice and the length straight out of the entry
+// block instead of passing them in. The result:
+//
+//   - the builder accepted it;
+//   - `--dump-ir` and `--dump-ir-pre` rendered plausible, correct-looking IR;
+//   - the optimizer passed it through;
+//   - and the program ran the loop body EXACTLY ONCE. Element 0 was live, the
+//     rest were null, and the crash landed at an unrelated later line.
+//
+// No diagnostic at any stage. That is the same class as #1914 and #1921: a
+// compiler that knows enough to refuse, and does not.
+//
+// WHY IT MISCOMPILES. A value's live interval runs from its definition to its
+// textually-last use, and the allocator does NOT extend an interval to cover a
+// loop that reads it. So a value defined before the loop and read inside it is
+// considered dead after that read, its register is reused by the rest of the
+// body — across the `gc_alloc` call, in that case — and the next iteration reads
+// whatever replaced it. A block parameter is immune because the back edge
+// redefines it on every iteration.
+//
+// So the underlying defect is in the register allocator, and this file does not
+// fix it: it refuses the IR that triggers it. Extending intervals across loops
+// is a real change to liveness in BOTH backends, and nothing in the tree needs
+// it today because every lowering already threads through block parameters.
+// That is tracked separately on #1925; what is unacceptable is the silence.
+//
+// The per-opcode operand table this reads lives in `opt.bit` as `instrOperands`,
+// shared with dead-code elimination rather than copied here — see its comment.
+
+// Every loop-boundary violation in `f`, as rendered messages. Empty is the
+// expected result for every function this compiler lowers.
+//
+// THE RULE IS ABOUT LOOPS, NOT ABOUT BLOCKS, and the first version of this
+// verifier got that wrong in a way worth recording. Reading a value from
+// another block is ordinary and correct — every `while` body reads its header's
+// parameters, and a straight-line value is used across a join all the time. A
+// verifier that flagged all of those reported twelve violations on `itoa`.
+//
+// What is NOT safe is a value defined OUTSIDE a loop and read INSIDE it. Its
+// live interval ends at the textually-last use, and the allocator does not
+// extend an interval to cover a loop that reads it, so the register is free for
+// reuse in the loop body — across a call, in #1924's case — and the next
+// iteration reads whatever replaced it. A block parameter is immune because the
+// back edge redefines it every iteration.
+//
+// Back edges are recognised by layout position rather than by dominators: a
+// block's instructions occupy a contiguous range of the flat array, blocks are
+// filled in the order they are begun, and every loop lowering fills its header
+// before its body. So a terminator naming a target that starts at or before the
+// current block closes a loop, and that loop spans every instruction from the
+// target's start to this block's end.
+//
+// Bounded by the instruction array and the block list, both fixed before this
+// runs. It executes once per function on the emit path, never inside a fixpoint.
+function verifyIrFunc(f: IrFunc): []string {
+  let out = []string(0)
+  let b = 0
+  while (b < len(f.blocks)) {
+    let blk = f.blocks[b]
+    if (blk.instsLen > 0) {
+      let hi = blk.instsStart + blk.instsLen
+      for t of terminatorTargets(f, hi - 1) {
+        if (t < 0 || t >= len(f.blocks) || f.blocks[t].instsStart > blk.instsStart) {
+          continue
+        }
+        out = concatStrs(out, loopEscapes(f, b, f.blocks[t].instsStart, hi))
+      }
+    }
+    b = b + 1
+  }
+  return out
+}
+
+// The block ids a terminator branches to. Anything else branches nowhere.
+function terminatorTargets(f: IrFunc, id: int): []int {
+  let ins = f.instrs[id]
+  if (ins.op == Op.Jump) {
+    return [ins.ival]
+  }
+  if (ins.op == Op.Br) {
+    return [ins.ival, ins.ival2]
+  }
+  return []int(0)
+}
+
+// Every read, inside the loop spanning instructions [lo, hi), of a value defined
+// before `lo` — i.e. outside the loop.
+function loopEscapes(f: IrFunc, backBlock: int, lo: int, hi: int): []string {
+  let out = []string(0)
+  let i = lo
+  while (i < hi) {
+    for v of instrOperands(f, i) {
+      if (v >= lo) {
+        continue
+      }
+      out = append(out, "${f.name}: %${i} (${opName(f.instrs[i].op)}) reads %${v}, which is defined outside the loop closed by the back edge in bb${backBlock} — pass it in as a block parameter")
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function concatStrs(dst: []string, src: []string): []string {
+  let o = dst
+  for s of src {
+    o = append(o, s)
+  }
+  return o
+}
+
+// The same over a whole module's functions, in order.
+function verifyIrFuncs(funcs: []IrFunc): []string {
+  let out = []string(0)
+  for f of funcs {
+    for m of verifyIrFunc(f) {
+      out = append(out, m)
+    }
+  }
+  return out
+}
+
+// The emit-path gate: reports every violation and answers whether `module` may
+// be emitted. `what` completes "refusing to ..." so the three call sites read as
+// the `stubbed` refusals beside them do.
+//
+// Called AFTER `optimizeModule`, deliberately: the optimizer renumbers values
+// and rewrites block arguments, so verifying the pre-optimization form would
+// check IR that codegen never sees.
+function verifyModuleOk(module: IrModule, src: string, what: string): bool {
+  let bad = verifyIrFuncs(module.funcs)
+  if (len(bad) == 0) {
+    return true
+  }
+  print("bit: ${src}: IR verification failed (${len(bad)} violation(s)); refusing to ${what}\n")
+  for m of bad {
+    print("  ${m}\n")
+  }
+  return false
+}
