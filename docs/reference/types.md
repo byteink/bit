@@ -175,6 +175,19 @@ let empty = []Outer(0)               // fine; asks for no zero values
 Every other field type stays omittable, including an inline `[N]T`, because
 their zero value really is zero bits.
 
+A map whose value type is such a struct is still fine to build, insert into,
+iterate and delete from. Only reading a **missing** key needs a zero value, so
+that one read panics - and the two-result form, which exists to ask whether a
+key is there, does not:
+
+```bit ignore
+let m = map<int, Outer>{}
+m[1] = Outer{ a: 1, b: Inner{} }   // fine
+let good = m[1]                    // fine - the key is there
+let (v, ok) = m[7]                 // fine - ok is false, do not read v
+let bad = m[7]                     // panics: 'Outer' has no zero value
+```
+
 Methods attach behavior to a struct; see [Functions](functions.md#methods).
 
 ## Type aliases

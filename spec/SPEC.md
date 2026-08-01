@@ -1605,6 +1605,19 @@ while being represented as a shared box.
   two-result form `let (v, ok) = m[k]` also reports presence (`ok: bool`). The
   two-result form is only valid as the sole right-hand side of a value declaration
   or assignment.
+
+  A value type with **no zero value** (a struct with a struct-typed field,
+  §13.4) has nothing to yield on a miss, and the two forms differ there:
+
+  - `m[k]` **panics** (§18.4), naming the type. There is no value to return
+    and the caller had no way to know, so it fails at the read rather than
+    handing back a reference that faults later.
+  - `let (v, ok) = m[k]` does **not** panic: `ok` is `false` and `v` must not
+    be read. This form exists to ask whether a key is present, and making it
+    panic would leave such a map unreadable by any means.
+
+  Every other operation on such a map — insert, `for (k, v) of m`, `delete`,
+  `len` — is unaffected, since none of them needs a zero value.
 - `s[lo:hi]` slices; `lo` defaults to `0`, `hi` to `len(s)`. Violation panics.
   On a `[]T` the result is a view sharing the backing buffer (`0 <= lo <= hi <=
   cap(s)`). On a `string` the result is a fresh string copying bytes `[lo, hi)`
@@ -1821,6 +1834,10 @@ let e = []Outer(0)             // ok; asks for no zero values at all
 `[]T(n)` is reported only when `n` is a constant above zero. A run-time `n` is
 checked where it is known — the allocation **panics** if it is above zero, and
 does nothing if it is zero.
+
+A `map<K,V>` whose `V` has no zero value stays legal, because inserting,
+iterating, deleting and `len` never need one. Only a read of a missing key does,
+and §12.6 gives the rule: `m[k]` panics, `let (v, ok) = m[k]` does not.
 
 The reason is that a struct is a *reference* (§13.3). Zero bits in a struct-typed
 field is a **null**, not a live instance, so the promise above cannot be kept for
