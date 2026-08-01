@@ -57,13 +57,41 @@ cp "${ROOT}/dist/README.md" "${STAGE}/ARTIFACT.md"
 rm -rf "${OUTDIR:?}/${NAME:?}"
 mv "${STAGE}" "${OUTDIR}/${NAME}"
 
-# Deterministic-ish tar: fixed owner and a fixed mtime so two builds of the same
-# commit produce the same bytes. GNU tar (Linux) also gets --sort=name; bsdtar
-# (macOS) has no equivalent, so its member order follows readdir.
-TARFLAGS=(--uid 0 --gid 0 --numeric-owner --exclude '._*' --exclude '.DS_Store')
+# NORMALISE THE TREE, DO NOT ASK TAR TO DO IT (#2060). The two properties that
+# make an archive reproducible are a fixed mtime on every member and a fixed
+# member order, and both used to be requested through GNU-only flags
+# (`--mtime=@0`, `--sort=name`) that sat in the GNU branch below. Releases are
+# cut on macOS. bsdtar 3.5.3 implements NEITHER — `--mtime=@0` is rejected
+# outright ("Option --mtime=@0 is not supported") — so on the one host that
+# actually produces artifacts the comment promised determinism the code never
+# delivered. Measured: cutting 0.1.5 twice from the same commit, minutes apart,
+# gave six different digests for three files, because `cp` restamped every
+# staged file's mtime on each run.
+#
+# Doing it to the tree instead works on both tars and cannot silently not apply.
+touch -h -t 197001010000 "${OUTDIR}/${NAME}"
+find "${OUTDIR}/${NAME}" -exec touch -h -t 197001010000 {} +
+# -h stamps a symlink itself rather than its target; a link whose target is
+# outside the tree would otherwise be followed and the tree's own entry left
+# with today's date.
+
+# Member order, the other half. `find | sort` under LC_ALL=C is a stable total
+# order that both tars honour through `-T`, so this replaces --sort=name.
+MEMBERS="${OUTDIR}/.members"
+( cd "${OUTDIR}" && find "${NAME}" | LC_ALL=C sort > "${MEMBERS}" )
+
+# `--numeric-owner` and the excludes are the only flags BOTH tars take. Zeroing
+# the owner is spelled differently by each, and it was in the shared part: GNU
+# tar 1.34 answers `--uid` with "unrecognized option" and exits 64, so this
+# script could never have run on Linux at all. Nobody noticed because releases
+# are cut on macOS — but the GNU branch existed precisely for a host that would
+# have died on line one of it. Found while verifying #2060 on both tars.
+TARFLAGS=(--numeric-owner --exclude '._*' --exclude '.DS_Store')
 if tar --version 2>/dev/null | grep -q 'GNU tar'; then
-  TARFLAGS+=(--sort=name --owner=0 --group=0 --mtime=@0)
+  TARFLAGS+=(--owner=0 --group=0)
 else
+  # bsdtar's spelling of the same thing.
+  TARFLAGS+=(--uid 0 --gid 0)
   # bsdtar: drop macOS-only metadata entirely rather than serialising it into
   # pax `LIBARCHIVE.xattr.*` headers that GNU tar then warns about on unpack.
   #
@@ -82,7 +110,8 @@ fi
 # compiler globs those as real sources — a macOS-built artifact then fails to
 # compile anything at all. Caught by unpacking a macOS-built package inside a
 # Linux container; the `--exclude`s above are the belt to this suspenders.
-COPYFILE_DISABLE=1 tar -C "${OUTDIR}" "${TARFLAGS[@]}" -cf - "${NAME}" | xz -9 -T0 > "${OUTDIR}/${NAME}.tar.xz"
+COPYFILE_DISABLE=1 tar -C "${OUTDIR}" "${TARFLAGS[@]}" -cf - -T "${MEMBERS}" | xz -9 -T0 > "${OUTDIR}/${NAME}.tar.xz"
+rm -f "${MEMBERS}"
 rm -rf "${OUTDIR:?}/${NAME}"
 
 echo "${OUTDIR}/${NAME}.tar.xz"
