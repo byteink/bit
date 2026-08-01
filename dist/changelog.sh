@@ -24,10 +24,28 @@ COMMITS="$(git log --no-merges --reverse --pretty=format:'%s|%h' "${RANGE}" || t
 
 # Conventional-commit bucketing. `type(scope): subject` and `type!: subject`;
 # a `!` marks a breaking change and is listed first regardless of its type.
-section() {
-  local title="$1" pattern="$2" body=""
-  body="$(printf '%s\n' "${COMMITS}" | grep -E "${pattern}" || true)"
+#
+# EVERY COMMIT IS CLAIMED, NOT COPIED. `take` moves the lines it matches out of
+# `REMAINING`, so a commit lands in exactly one section and the leftovers are
+# always exactly what nothing has explained yet. That is what lets the last
+# section be a catch-all and the guard below be a real assertion.
+REMAINING="${COMMITS}"
+EMITTED=0
+BODY=""
+
+# Move every REMAINING line matching <pattern> into BODY, in log order.
+take() {
+  BODY="$(printf '%s\n' "${REMAINING}" | grep -E "$1" || true)"
+  [ -n "${BODY}" ] || return 0
+  # -F with a multi-line pattern is a set of literal patterns; -x anchors each
+  # to a whole line, so a subject that is a prefix of another cannot claim it.
+  REMAINING="$(printf '%s\n' "${REMAINING}" | grep -vxF -e "${BODY}" || true)"
+}
+
+emit() {
+  local title="$1" body="$2"
   [ -n "${body}" ] || return 0
+  EMITTED=$((EMITTED + $(printf '%s\n' "${body}" | grep -c .)))
   printf '### %s\n\n' "${title}"
   printf '%s\n' "${body}" | while IFS='|' read -r subject sha; do
     printf -- '- %s (%s)\n' "${subject}" "${sha}"
@@ -36,11 +54,33 @@ section() {
 }
 
 printf '## Bit %s\n\n' "${VERSION}"
-section 'Breaking changes' '^[a-z]+(\([^)]*\))?!:'
-section 'Features'         '^feat(\([^)]*\))?:'
-section 'Fixes'            '^fix(\([^)]*\))?:'
-section 'Performance'      '^perf(\([^)]*\))?:'
-section 'Other'            '^(build|chore|ci|docs|refactor|spec|test|seed|selfhost|runtime)(\([^)]*\))?:'
+take '^[a-z][a-z0-9+-]*(\([^)]*\))?!:' ; emit 'Breaking changes' "${BODY}"
+take '^feat(\([^)]*\))?:'              ; emit 'Features'         "${BODY}"
+take '^fix(\([^)]*\))?:'               ; emit 'Fixes'            "${BODY}"
+take '^perf(\([^)]*\))?:'              ; emit 'Performance'      "${BODY}"
+# Everything else conventional-shaped, as a COMPLEMENT rather than a whitelist.
+# The whitelist this replaces named `seed` and `selfhost` — a directory deleted
+# in #1593 and one renamed to `compiler` in #1841 — and never named `compiler`
+# itself, so 41 of 0.1.5's 59 commits were reported nowhere and nothing said so
+# (#2061). A list of types has to be maintained against a repo that coins new
+# ones; a complement does not. The charset admits `zig-removal` and
+# `dist+website`, both of which appear in that range.
+take '^[a-z][a-z0-9+-]*(\([^)]*\))?:'  ; emit 'Other'            "${BODY}"
+# No conventional prefix at all. Listed rather than discarded — a subject nobody
+# formatted is still a change that shipped.
+emit 'Uncategorised' "${REMAINING}"
+
+# THE POINT OF THE ACCOUNTING. Every commit in the range must appear exactly
+# once: `take` claims, so a duplicate is impossible and a shortfall means a
+# pattern lost something. Release notes that quietly omit a third of a release
+# read as complete, which is why this exits rather than warns —
+# dist/release.sh's fallback writes a minimal note when this fails.
+TOTAL="$(printf '%s\n' "${COMMITS}" | grep -c .)"
+if [ "${EMITTED}" -ne "${TOTAL}" ]; then
+  echo "changelog.sh: listed ${EMITTED} of ${TOTAL} commits in ${RANGE}" >&2
+  printf '%s\n' "${REMAINING}" | sed 's/^/  unlisted: /' >&2
+  exit 1
+fi
 
 printf '### Artifacts\n\n'
 printf 'Published for `x86_64-linux`, `aarch64-linux` and `aarch64-macos`.\n'
