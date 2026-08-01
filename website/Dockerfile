@@ -24,7 +24,7 @@
 # Pinned to an exact version, never `:latest` — `latest` moves on the next push
 # and would silently change the compiler this site is built with. Bumping the
 # toolchain is a one-line edit here.
-FROM ghcr.io/byteink/bit:0.1.4 AS build
+FROM ghcr.io/byteink/bit:0.1.5 AS build
 
 # The toolchain image runs as uid 65532 (correct for its own job, compiling a
 # user's bind-mounted project). A build stage writes to the image filesystem, so
