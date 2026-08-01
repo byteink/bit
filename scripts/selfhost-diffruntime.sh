@@ -54,7 +54,26 @@ set -uo pipefail
 # two stdlibs instead of two compilers.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
-TIMEOUT=${DIFFRUNTIME_TIMEOUT:-20}
+# The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the
+# corpus's slowest file measured on the IR differentials (25.20s on this tree,
+# 21.86s on the oracle), so a busy box turned a clean run red with no divergence
+# at all. 300s is ~12x that, in the spirit of the suite's own 900s-against-158s.
+TIMEOUT=${DIFFRUNTIME_TIMEOUT:-300}
+
+# Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
+# this script set, so that alone is a timeout and every other signal is a crash.
+# Calling a SIGSEGV "timed out" sends the reader after a problem that is not
+# there — the same distinction the test harnesses make (#2070, CLAUDE.md).
+sep="  -> "
+whydied() {
+  case "$1" in
+    142) echo "timed out after ${TIMEOUT}s" ;;
+    139) echo "CRASHED (SIGSEGV)" ;;
+    138) echo "CRASHED (SIGBUS)" ;;
+    134) echo "CRASHED (SIGABRT)" ;;
+    *)   echo "CRASHED (signal $(( $1 - 128 )))" ;;
+  esac
+}
 
 # A gate whose population can quietly go to zero passes everything. `runtime/`
 # holds 85 `.bit` files today and the walk skips none of them, so a floor well
@@ -79,13 +98,27 @@ trap 'rm -rf "$work"' EXIT
 match=0 skip=0 total=0
 : >"$work/mismatch"
 : >"$work/timeout"
+: >"$work/oracletimeout"
+: >"$work/oraclecrash"
 : >"$work/compared"
 
 for f in $(find runtime -name '*.bit' | sort); do
   total=$((total + 1))
 
-  a=$("$ORACLE" --dump-ir-pre "$f" 2>/dev/null)
-  if [ $? -ne 0 ] || [ -z "$a" ]; then
+  # The oracle is bounded too (#2070). Its timeout is NOT a skip: a skip means
+  # the oracle could not lower the file, an expected outcome, while a hang is a
+  # broken stage0 — and an unbounded oracle wedged this gate with no message.
+  a=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" --dump-ir-pre "$f" 2>/dev/null)
+  arc=$?
+  if [ "$arc" -eq 142 ]; then
+    echo "$f${sep}$(whydied "$arc")" >>"$work/oracletimeout"
+    continue
+  fi
+  if [ "$arc" -ge 128 ]; then
+    echo "$f${sep}$(whydied "$arc")" >>"$work/oraclecrash"
+    continue
+  fi
+  if [ "$arc" -ne 0 ] || [ -z "$a" ]; then
     # The oracle cannot lower it, so there is no verdict to be had. Counted and
     # reported, never scored as agreement (#1514/#1516).
     skip=$((skip + 1))
@@ -94,10 +127,10 @@ for f in $(find runtime -name '*.bit' | sort); do
 
   b=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir-pre "$f" 2>/dev/null)
   rc=$?
-  # >=128 is death by signal, i.e. the alarm fired or bit crashed. Either way it
-  # produced no verdict, so it must not be scored as one.
+  # >=128 is death by signal, and WHICH signal is not a detail: 142 is our own
+  # alarm, anything else is the compiler crashing. Either way no verdict (#2070).
   if [ "$rc" -ge 128 ]; then
-    echo "$f" >>"$work/timeout"
+    echo "$f${sep}$(whydied "$rc")" >>"$work/timeout"
     continue
   fi
   if [ "$rc" -ne 0 ]; then
@@ -133,8 +166,27 @@ for r in $REQUIRED; do
   fi
 done
 
+if [ -s "$work/oracletimeout" ]; then
+  # Apart from ours because it means something different: the PINNED oracle hung,
+  # so the corpus shrank rather than this tree misbehaving. Folding it into the
+  # skip count would hide that behind a number meaning "the oracle declined it".
+  echo "diffruntime: FAIL — the pinned stage0 HUNG (corpus reduced, not verified):" >&2
+  sed 's/^/  /' "$work/oracletimeout" >&2
+  bad=1
+fi
+
+# Reported, not failed — the oracle is a published immutable binary and no change
+# here can stop it faulting, so failing would leave the gate red until the pin
+# moves (#1895's routed-around-red hazard). A HANG still fails: that one means the
+# run could not complete in bounded time. Naming the file every run is the point;
+# before #2070 an oracle crash was an anonymous +1 to the skip count (#2084).
+if [ -s "$work/oraclecrash" ]; then
+  echo "diffruntime: NOTE — the pinned stage0 crashed, no verdict available (#2084):" >&2
+  sed 's/^/  /' "$work/oraclecrash" >&2
+fi
+
 if [ -s "$work/timeout" ]; then
-  echo "diffruntime: FAIL — timed out after ${TIMEOUT}s (no verdict, not a match):" >&2
+  echo "diffruntime: FAIL — no verdict (not a match):" >&2
   sed 's/^/  /' "$work/timeout" >&2
   bad=1
 fi
