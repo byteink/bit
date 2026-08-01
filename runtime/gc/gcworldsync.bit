@@ -187,6 +187,29 @@ export @nosplit @symbol("bit_rt_port_gc_world_bind") function worldBind(addr: in
   worldAddr = addr
 }
 
+// Address of the caller-owned syscall register block — `maxMutators * muRegWords`
+// words, slot `i` at `i * muRegWords` (#1904). Caller-owned for the same reason
+// the World block is (`@nosplit` rejects `ptrOf`), and a SEPARATE block rather
+// than more words per mutator slot for the reason `muSp` records: widening the
+// World block itself to hold this SIGSEGVs every binary under the collector
+// (#1991). Until `worldBindSyscallRegs` runs this is 0 and the syscall state
+// publishes no registers, which is safe — `gcSyscallBegin` refuses outright.
+let syscallRegsAddr: i64 = 0
+
+export @nosplit @symbol("bit_rt_port_gc_world_bind_syscall_regs") function worldBindSyscallRegs(addr: int) {
+  syscallRegsAddr = addr
+}
+
+// Address of slot `slot`'s saved callee-saved register file, or 0 before the
+// block is bound. Valid only while that slot is in `mSyscall`; callers gate on
+// `worldSyscallSp` first.
+export @nosplit @symbol("bit_rt_port_gc_world_syscall_regs") function worldSyscallRegs(slot: int): int {
+  if (syscallRegsAddr == 0) {
+    return 0
+  }
+  return int(syscallRegsAddr) + slot * muRegWords * 8
+}
+
 // This thread's slot BIASED BY ONE (0 = none), registering it first if it holds
 // none — `runtime/root/`'s `currentMutator` exactly: find or claim a slot, and if a
 // stop is already pending, park immediately so a thread joining mid-collection
@@ -416,4 +439,103 @@ export @nosplit @symbol("bit_rt_gc_blocking_end") function gcBlockingEnd() {
     return
   }
   worldEndBlocking(world, slot)
+}
+
+// ---------------------------------------------------------------------------
+// `bit_rt_gc_syscall_begin` / `_end` (#1904)
+// ---------------------------------------------------------------------------
+//
+// The pair a thread about to block in the kernel uses instead of
+// blocking_begin/end. See `mSyscall` (./gcworld.bit) for why neither `running`
+// nor `blocked` can express this, and `worldBeginSyscall` (./gcworldstop.bit)
+// for the contract.
+
+// This thread's live stack pointer — the same one-instruction form as
+// `../stw/stw.bit`'s `stwReadSp` and `../sched/sched.bit`'s `readSp`, inline by
+// construction and so legal in a `@nosplit` body. Duplicated rather than
+// imported for the reason the other two are: each is module private and the
+// instruction, not the function, is the contract.
+@nosplit function gcReadSp(): int {
+  return asm {
+    arm64 { 0x910003E0 }              // mov x0, sp
+    x64   { 0x48, 0x89, 0xE0 }        // mov rax, rsp
+    result arm64 x0 x64 rax : int
+  }
+}
+
+// Save this thread's callee-saved integer registers into `muRegWords` words at
+// `dst`, the store half of `../sched/sched.bit`'s `schedSwitch` with a plain
+// return instead of a context load.
+//
+// THE FLOATING-POINT FILE IS DELIBERATELY OMITTED, unlike `schedSwitch`, which
+// saves d8..d15 because it must RESTORE them. Nothing is restored here — this is
+// a root snapshot, and an f64 is not a reference — so saving them would only
+// hand `gcMarkConservative` eight more words to reject.
+//
+// Saving from inside a Bit function is sound for the same reason `schedSwitch`
+// is, and that reason is worth stating because it is not obvious: if the
+// compiler clobbers a callee-saved register anywhere between the caller and
+// here, the ABI required it to spill the original into a frame first, and every
+// such frame lies ABOVE the `sp` published alongside this file — so the value is
+// covered by the conservative stack walk even when the copy captured here is the
+// clobbered one. The two publications overlap on purpose; neither alone is
+// enough.
+@nosplit function gcSaveCalleeRegs(dst: int) {
+  asm {
+    arm64 {
+      0xF9000013, 0xF9000414, 0xF9000815, 0xF9000C16, // str x19..x22, [x0, #0..24]
+      0xF9001017, 0xF9001418, 0xF9001819, 0xF9001C1A, // str x23..x26, [x0, #32..56]
+      0xF900201B, 0xF900241C,                         // str x27, x28, [x0, #64..72]
+      0xF900281D, 0xF9002C1E                          // str x29, x30, [x0, #80..88]
+    }
+    x64 {
+      0x48, 0x89, 0x5F, 0x00,       // mov [rdi+0x00], rbx
+      0x48, 0x89, 0x6F, 0x08,       // mov [rdi+0x08], rbp
+      0x4C, 0x89, 0x67, 0x10,       // mov [rdi+0x10], r12
+      0x4C, 0x89, 0x6F, 0x18,       // mov [rdi+0x18], r13
+      0x4C, 0x89, 0x77, 0x20,       // mov [rdi+0x20], r14
+      0x4C, 0x89, 0x7F, 0x28        // mov [rdi+0x28], r15
+    }
+    input arm64 x0 x64 rdi = dst
+    clobber arm64 { memory }
+    clobber x64 { memory }
+  }
+}
+
+// `bit_rt_gc_syscall_begin`. Registers first (a thread may reach a subprocess
+// wait before ever allocating), captures `sp` BEFORE saving the registers so the
+// save's own frame lies below the published bound, then publishes both.
+export @nosplit @symbol("bit_rt_gc_syscall_begin") function gcSyscallBegin() {
+  let mu = currentMutator(0)
+  if (mu == 0) {
+    return
+  }
+  let slot = mu - 1
+  let regs = worldSyscallRegs(slot)
+  if (regs == 0) {
+    return // block not bound yet: publish nothing rather than a half-snapshot
+  }
+  let world = wordAt(worldAddr)
+  let sp = gcReadSp()
+  gcSaveCalleeRegs(regs)
+  worldBeginSyscall(world, slot, sp)
+}
+
+// `bit_rt_gc_syscall_end`. Mirrors `gcBlockingEnd` exactly, including its
+// refusal order: `worldAddr` before the token, because the x64 token is a load
+// through `%fs:0` that faults on a thread whose FS base is not installed yet.
+export @nosplit @symbol("bit_rt_gc_syscall_end") function gcSyscallEnd() {
+  if (worldAddr == 0) {
+    return
+  }
+  let token = gcThreadToken()
+  if (token == 0) {
+    return
+  }
+  let world = wordAt(worldAddr)
+  let slot = worldFindOwner(world, token)
+  if (slot < 0) {
+    return
+  }
+  worldEndSyscall(world, slot)
 }

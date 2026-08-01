@@ -21,7 +21,7 @@
 // rootpins proofs never run it — so it is recorded, not fixable inside this port,
 // exactly as fs.bit records its `close`.
 
-import { storeWord } from "../../gc"
+import { storeWord, gcSyscallBegin, gcSyscallEnd } from "../../gc"
 import { osEnvp } from "../../root"
 
 // `u8At`, `cstrLen`, `strData`, `emptyStr`, `fsPathZ`, `rtStrAlloc`,
@@ -198,7 +198,16 @@ let osIdxBuf: [8]i64
   }
   let sb = int(ptrOf(osStatusBuf))
   storeWord(sb, 0)
-  if (int(waitpid(i32(pid), u8At(sb), i32(0))) < 0) {
+  // The `syscall` bracket matters MORE here than on the polling path (#1904):
+  // this `waitpid` blocks for the child's entire lifetime, so without it every
+  // collection attempted for however long the child runs is abandoned. Same
+  // reasoning as `osPollSleep` — the caller holds live references (the path,
+  // argv and envp arrays) across this, so `blocked` would sweep them, while
+  // `syscall` publishes the bound and register file for a scan in place.
+  gcSyscallBegin()
+  let w = int(waitpid(i32(pid), u8At(sb), i32(0)))
+  gcSyscallEnd()
+  if (w < 0) {
     return 0 - 1
   }
   let status = loadWord(sb)
@@ -303,11 +312,34 @@ const osNsPerSec: int = 1000000000
 // couple percent; long enough not to spin a core between polls.
 const osPollNs: int = 2000000
 
+// Bracketed with `bit_rt_gc_syscall_begin`/`_end` (#1904), NOT with
+// `blocking_begin`/`_end`. The distinction is the whole ticket: `blocked` claims
+// no frame holds a live Bit reference, and the caller `osRunBounded` holds
+// several across this — argv, the paths, the captured output buffer. Bracketing
+// it as `blocked` was tried and swept them. `syscall` makes no such claim: it
+// publishes this thread's stack pointer and callee-saved registers so the
+// collector scans the wait in place instead of waiting for a safepoint that
+// cannot arrive from `@nosplit` code.
+//
+// Without it every collection triggered while a subprocess is outstanding spun
+// `stwSpinBound` and was abandoned — 21 abandoned per completed collection under
+// `./make test`, which is both the CPU burn and, worse, a run during which
+// almost nothing was swept.
+//
+// The bracket is around the SLEEP alone, not the whole poll loop. The
+// intervening `waitpid(WNOHANG)` is non-blocking and returns in microseconds, so
+// the thread is in the kernel for essentially the entire interval, and the
+// rendezvous — which re-scans from the top and needs one clean pass — finds it
+// there. Keeping `waitpid` outside also keeps the shared `osStatusBuf` write on
+// the `running` side of the state, where the single-worker sharing contract
+// documented above still describes it.
 @nosplit function osPollSleep() {
   let req = int(ptrOf(osSleepReqBuf))
   storeWord(req, 0)
   storeWord(req + 8, osPollNs)
+  gcSyscallBegin()
   nanosleep(u8At(req), u8At(0))
+  gcSyscallEnd()
 }
 
 const osSigKill: int = 9

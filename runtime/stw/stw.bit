@@ -155,6 +155,7 @@
 
 import { worldPark, worldRendezvous, worldRestart } from "../gc"
 import { worldLockTry, worldLockRelease, worldParkedFrame } from "../gc"
+import { worldSyscallSp, worldSyscallRegs, worldSyscallRegWords, worldHighWaterMark } from "../gc"
 import { worldEnsureSelfOn } from "../gc"
 import { worldEnsureSelf, maxMutators } from "../gc"
 import { gcShouldCollect, gcMarkBegin, gcCollectFinish } from "../gc"
@@ -483,7 +484,60 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsets
   return sp >= base && sp < base + *(t + taskStackBytes)
 }
 
-@nosplit function stwScanTasks(g: *i64, sched: *i64) {
+// Class 9 (#1904): the lowest stack pointer any thread has published as parked
+// in a syscall INSIDE task `t`, or `lo` unchanged when none is.
+//
+// A thread in `mSyscall` runs no Bit code, so it never reached a safepoint and
+// its task's `ctxSp` still names wherever it last parked — far ABOVE the frames
+// it is actually sitting in. Stacks grow down, so scanning from `ctxSp` starts
+// past everything the wait is holding: exactly the argv, path and output-buffer
+// references #1904 recorded being swept. This lowers the bound to where the
+// thread really is.
+//
+// Only ever LOWERS it, which the class-4 header already argues is safe — a low
+// bound that is too low only widens a conservative scan. Bounded by the
+// registry's high-water mark rather than `maxMutators`: this runs once per task
+// per collection, and the high-water mark is the number of OS threads that have
+// ever registered, normally one or two.
+@nosplit function stwSyscallLo(g: *i64, world: *i64, t: *i64, lo: int): int {
+  let n = worldHighWaterMark(world)
+  let i = 0
+  // Bounded by the high-water mark, itself capped at `maxMutators`.
+  while (i < n) {
+    let s = worldSyscallSp(world, i)
+    if (s > 0 && stwTaskHoldsSp(t, s)) {
+      // The register file goes with the stack range, not separately: a live
+      // reference the allocator parked in a callee-saved register across the
+      // syscall is on no stack at all (#1742).
+      stwScanSyscallRegs(g, i)
+      if (s < lo || lo <= 0) {
+        lo = s
+      }
+    }
+    i = i + 1
+  }
+  return lo
+}
+
+// Class 9's register half. Conservative over all `muRegWords`, exactly as
+// `stwScanCtx` is over the saved context: `gcMarkConservative` rejects anything
+// that is not an exact heap object base, so a blanket walk costs a few wasted
+// probes and needs no per-architecture slot list that can go stale.
+@nosplit function stwScanSyscallRegs(g: *i64, slot: int) {
+  let regs = worldSyscallRegs(slot)
+  if (regs == 0) {
+    return // block not bound: nothing was published
+  }
+  let n = worldSyscallRegWords()
+  let i = 0
+  // Bounded by `muRegWords`.
+  while (i < n) {
+    gcMarkConservative(g, loadWord(regs + i * 8))
+    i = i + 1
+  }
+}
+
+@nosplit function stwScanTasks(g: *i64, world: *i64, sched: *i64) {
   let sp = stwReadSp()
   schedRegLock(sched)
   let addr = schedRegHead(sched)
@@ -505,6 +559,10 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsets
       if (running) {
         lo = sp
       }
+      // Class 9 (#1904): a thread parked in a syscall on this stack is running
+      // in exactly the same sense — deeper than `ctxSp` and nowhere near a
+      // safepoint — but it is another thread, so `sp` above does not find it.
+      lo = stwSyscallLo(g, world, t, lo)
       stwScanStackRange(g, lo, *(t + taskStackBase) + *(t + taskStackBytes))
       // The running task's own registers are live CPU state, not a saved
       // block — scanning `t[0..ctxWords)` for it would read whatever this
@@ -550,8 +608,10 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsets
     i = i + 1
   }
 
-  // 4 + 5. Every other task's stack, conservatively, and every task's `arg`.
-  stwScanTasks(g, taskAt(sched))
+  // 4 + 5 + 9. Every other task's stack, conservatively, and every task's `arg`
+  // — plus, for a task a syscall-parked thread is standing in, the bound and
+  // register file that thread published (#1904).
+  stwScanTasks(g, world, taskAt(sched))
 
   gcCollectFinish(g)
 }

@@ -439,6 +439,7 @@ one of three states:
 running   executing Bit code; may reach a safepoint at any moment
 parked    stopped at a safepoint, its snapshot published for the collector
 blocked   inside a call that holds NO live Bit references (see below)
+syscall   stopped in the kernel, holding live references; scanned in place (below)
 ```
 
 **REGISTRATION IS LAZY, BUT "A THREAD IS NEVER INVISIBLE" IS FALSE AS A BLANKET
@@ -533,15 +534,45 @@ worker would hold up every collection for the length of its sleep. Calling it
 around a region that *does* hold references is a collector bug — the references
 are invisible and will be swept.
 
-**Known limitation, stated rather than hidden.** Blocking runtime calls made
-*from* Bit code (`bit_rt_print` on a full pipe, `bit_rt_fs_read` on stdin,
-`bit_rt_os_run`'s `waitpid`, `bit_rt_net_resolve`'s DNS timeout) do **not** use
-the `blocked` contract, because their frames legitimately hold live references
-(the string being printed, the buffer being filled). Such a thread stays
-`running`, so a concurrent collection waits for it and abandons if it exceeds the
-rendezvous bound. That is safe but wastes a collection. Closing it requires those
-call sites to publish a conservative stack range at entry — a later refinement,
-not required for the handshake to be sound.
+**The `syscall` contract (#1904).** `bit_rt_gc_syscall_begin` / `_end` bracket a
+region in which the calling thread blocks in the kernel **while still holding
+live Bit references**. It is the state `blocked` cannot express and `running`
+cannot afford: the collector neither waits for the thread (like `blocked`) nor
+skips it (unlike `blocked`) — it scans the thread where it stands.
+
+`_begin` publishes the two things a conservative scan needs and a `@nosplit`
+frame cannot supply precisely, since such code carries no stack map:
+
+- the calling thread's **stack pointer**, which lowers the scan's bound from the
+  task's `ctxSp` (where it last *parked*, arbitrarily far above where it now is)
+  to where it actually stands;
+- its **callee-saved integer registers**, because a live reference the allocator
+  parked in one of those is on no stack at all — the #1742 defect exactly.
+
+The two overlap deliberately. If an intervening frame clobbered a callee-saved
+register, the ABI required it to spill the original above the published `sp`
+first, so the stack walk covers what the register snapshot missed.
+
+PRECONDITION: the thread really does block, and runs no Bit code and pushes
+nothing below the published `sp` until `_end`. A thread that kept running under
+this state would be scanned from a stale bound — the same class of bug as
+claiming `blocked` while holding references. `_end` re-checks the stop flag
+before running, like `blocking_end`, because a `syscall` slot is passed without
+acknowledging.
+
+**Known limitation, narrowed by #1904 but not closed.** Blocking runtime calls
+made *from* Bit code (`bit_rt_print` on a full pipe, `bit_rt_fs_read` on stdin,
+`bit_rt_net_resolve`'s DNS timeout) mostly do **not** use either contract: their
+frames legitimately hold live references, so `blocked` is wrong, and they have
+not been converted to `syscall`. Such a thread stays `running`, so a concurrent
+collection waits for it and abandons if it exceeds the rendezvous bound. That is
+safe but wastes a collection.
+
+`bit_rt_os_run`'s `waitpid` and the bounded variants' poll sleep WERE converted,
+and they were the expensive ones: a subprocess wait holds the whole world for the
+child's lifetime. Measured before, under `./make test`, at 21 abandoned
+rendezvous per completed collection; 0 after. The remaining call sites are the
+same refinement applied to the same pattern.
 
 The same limitation covers a thread asleep in `parkSleepNs`, and there the cost
 is proportional to the sleep: every concurrent collection waits out whatever is
@@ -621,6 +652,8 @@ bit_rt_gc_thread_enter()   -> void   // claim a mutator slot for this OS thread
 bit_rt_gc_thread_exit()    -> void   // release it; the platform does this at thread exit
 bit_rt_gc_blocking_begin() -> void   // enter a no-live-references blocking region
 bit_rt_gc_blocking_end()   -> void   // leave it
+bit_rt_gc_syscall_begin()  -> void   // enter a kernel block that DOES hold references
+bit_rt_gc_syscall_end()    -> void   // leave it
 ```
 
 `_enter` is idempotent per thread and is also performed lazily by the first
