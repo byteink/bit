@@ -58,7 +58,19 @@ set -u
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
-ROOT="$(pwd)/"
+
+# BOTH SIDES must reach the working tree's stdlib THROUGH THE SAME PATH STRING,
+# not merely reach the same files (#1920). stage0.sh's wrapper already pins
+# BIT_STDLIB for the oracle; BIT2 ran bare, and `stdRootPath` (compiler/main.bit)
+# then fell through `resolveNearExe` — there is no `bit-out/stdlib` — to the
+# cwd-relative literal `"stdlib"`. A diagnostic's path is whatever string the
+# module loader recorded (compiler/project.bit stores `pathResolve(dir)/name`,
+# and pathResolve is lexical, so it never absolutises), which made the two sides
+# render the same file differently and cost seven files a real comparison.
+# Exporting here covers both: the wrapper's `${BIT_STDLIB:-…}` takes this value
+# instead of substituting its own.
+BIT_STDLIB="$(pwd)/stdlib"
+export BIT_STDLIB
 
 # The alarm is a HANG guard, not a performance budget. Measured worst legitimate
 # case over this exact corpus is 1.23s (`bit check tests/imports/nethttp/main.bit`,
@@ -107,30 +119,28 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
   #   grep -v '^error: CheckFailed$'   0 of 619 files. Genuinely dead, deleted.
   #                                    That line was never a diagnostic anyway; it
   #                                    was a runtime reporting main's error return.
-  #   sed "s#--> ${ROOT}#--> #"        7 of 619 files. LIVE. Do not delete.
+  #   sed "s#--> ${ROOT}#--> #"        7 of 619 files. Was LIVE; now deleted, see
+  #                                    below — the cause was fixed, not filtered.
   #
-  # The seven are stdlib/{http3/h3,quic/{conn,packet,tls},tls/{ciphersuites,client,
-  # server}}.bit, and what makes them different is that their diagnostics point
-  # into an IMPORTED file rather than the one named on the command line. For those
-  # the 0.1.4 oracle prints an absolute path and this tree prints a relative one:
+  # THE PREDICTION THAT SAT HERE WAS WRONG, and it is worth recording because it
+  # would have kept this filter forever. It said the line "retires by itself —
+  # repin stage0 to any release cut from this tree and the oracle starts printing
+  # relative paths too". Measured against the actual 0.1.5 oracle after the pin
+  # moved, it still printed absolute. Nothing about the compiler changed between
+  # 0.1.4 and this tree; the SAME binary prints either form depending only on
+  # BIT_STDLIB, and the wrapper hands the oracle an absolute one. No release can
+  # ever retire this on its own.
   #
-  #     oracle:  --> /Users/…/bit/stdlib/crypto/mldsantt.bit:65:7
-  #     ours:    --> stdlib/crypto/mldsantt.bit:65:7
+  # The seven were stdlib/{http3/h3,quic/{conn,packet,tls},tls/{ciphersuites,
+  # client,server}}.bit — the files whose diagnostics point into an IMPORTED
+  # stdlib file rather than the one named on the command line, which is exactly
+  # the set that resolves through `stdRoot`. Pinning BIT_STDLIB for both sides at
+  # the top of this file makes them render identically, so the filter measures
+  # dead and is gone.
   #
-  # So the sed is doing exactly what the warning below says a filter does: hiding
-  # a real behaviour change. Relative is the better rendering — absolute paths put
-  # the builder's home directory in compiler output — but nothing recorded the
-  # change, and this line is why nobody noticed. Tracked as #1920.
-  #
-  # It retires by itself. Repin stage0 to any release cut from this tree and the
-  # oracle starts printing relative paths too, at which point the measurement above
-  # reads 0 of 619 and the line can go. Delete it before then and those seven files
-  # turn red for a difference that is already understood.
-  #
-  # A filter on a differential's ORACLE side can only ever hide a difference, never
-  # reveal one — the same hazard #1883 deleted the expected-mismatch lists for.
-  # Remove when it measures dead, do not extend.
-  seed=$(printf '%s\n' "$seed" | sed "s#--> ${ROOT}#--> #")
+  # A filter on a differential's ORACLE side can only ever hide a difference,
+  # never reveal one — the same hazard #1883 deleted the expected-mismatch lists
+  # for. Fix the cause; do not add another.
   if [ "$seed" = "$b2" ]; then
     match=$((match + 1))
   elif [ -n "$seed" ] && [ -z "$b2" ]; then
@@ -150,9 +160,11 @@ if [ -n "$firstfp" ]; then
 fi
 if [ -n "$firstdiff" ]; then
   echo "=== first differing text: $firstdiff"
-  # Same single normalization as the compare above; the two must not drift, or the
-  # evidence printed here describes a comparison that was never made.
-  diff <(run "$ORACLE" check "$firstdiff" | sed "s#--> ${ROOT}#--> #") \
+  # Both sides raw, exactly as the compare above sees them. The two must not
+  # drift, or the evidence printed here describes a comparison that was never
+  # made — which is why the normalization that used to sit on this line came out
+  # with the one in the loop (#1920), not separately.
+  diff <(run "$ORACLE" check "$firstdiff") \
        <(run "$BIT2" check "$firstdiff") | head -14
 fi
 # Only a false positive is a build-breaking regression; MISSING shrinks as emit
