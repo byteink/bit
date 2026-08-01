@@ -486,30 +486,66 @@ function rDeclareImportItem(r: Resolver, srcNameNode: int, bindNameNode: int, ta
 
 // ---- type-definition cycles (§17.1 mirrors the import-cycle check) ---------
 //
-// Only `type` alias substitution and array/tuple element types embed a value
-// directly (a fixed byte layout at every nesting level); struct/interface names,
-// slices, maps, and chans are reference types (§13.3) — a fixed-size handle
-// regardless of what they point to — so a reference through any of those breaks
-// the cycle and is safe.
+// `type` alias substitution and array/tuple element types embed a value directly
+// (a fixed byte layout at every nesting level), so a cycle through one is an
+// infinite layout. Slices, maps, chans, funcs, interfaces and enums are all safe
+// boundaries: each has an empty or nil state, so a cycle through one terminates.
+//
+// A STRUCT NAME IS NOT A BOUNDARY, which is the one that reads wrong at first
+// glance (#1923). A struct field is a single 8-byte handle, so the LAYOUT is
+// finite — but layout was never the binding constraint, constructibility is. A
+// struct has no nil (SPEC.md §13.4), so a struct-typed field can neither be
+// omitted (E0083) nor filled with nothing; filling one obliges you to fill one
+// more, and a cycle of them has no base case:
+//
+//     struct A { b: B }
+//     struct B { a: A }
+//     A{ b: B{ a: A{ b: B{ a: ...     // never terminates
+//
+// So a struct-to-struct cycle is uninstantiable at every length, and this walk
+// follows struct fields to reject it at the DECLARATION — one error naming the
+// cycle, on the line that can be changed, rather than one E0083 at every
+// attempted construction. `Option<T>` is the idiomatic way to break one, because
+// an enum HAS an empty state: `next: Option<Node>` is a working linked list.
+
+// Per-walk state, kept out of the recursion's parameter list. `visiting` guards
+// against looping and is reset for each starting symbol; `reported` outlives all
+// of them, so a cycle is diagnosed once rather than once per member — a three-
+// struct cycle is one defect, not three.
+struct CycleWalk {
+  visiting: []bool
+  reported: []bool
+  followStructs: bool
+}
 
 function rCheckTypeCycles(r: Resolver) {
   if (len(r.symbols) <= 1) {
     return
   }
+  let reported = []bool(len(r.symbols))
   let i = 1
   while (i < len(r.symbols)) {
     let s = r.symbols[i]
-    if (s.kind == SymbolKind.TypeAlias) {
-      let visiting = []bool(len(r.symbols))
-      rEmbedsSelf(r, i, kidsOf(r.tree, s.decl)[2], visiting)
+    if (reported[i]) {
+      // Already named as part of a cycle diagnosed from another member.
+    } else if (s.kind == SymbolKind.TypeAlias) {
+      let w = CycleWalk{ visiting: []bool(len(r.symbols)), reported: reported, followStructs: false }
+      rEmbedsSelf(r, w, i, kidsOf(r.tree, s.decl)[2], []int(0))
     } else if (s.kind == SymbolKind.StructType) {
-      let visiting = []bool(len(r.symbols))
-      let fields = kidsOf(r.tree, kidsOf(r.tree, s.decl)[2])
+      // A generic struct's fields name its type PARAMS, which this walk cannot
+      // see — it resolves every name in module scope — so following them would
+      // read `struct Box<S> { v: S }` as a reference to an unrelated module
+      // `struct S` and fabricate a cycle. Its own self-edge is still checked,
+      // since that resolves to the struct itself either way; whether a given
+      // INSTANTIATION cycles is a monomorphization question that E0083 catches
+      // at the construction site.
+      let w = CycleWalk{ visiting: []bool(len(r.symbols)), reported: reported,
+        followStructs: kidsOf(r.tree, s.decl)[1] == 0 }
+      let ftypes = rStructFieldTypes(r, s.decl)
       let j = 0
-      while (j < len(fields)) {
-        let fieldIdx = rUnwrapExport(r, fields[j])
-        if (rEmbedsSelf(r, i, kidsOf(r.tree, fieldIdx)[1], visiting)) {
-          j = len(fields) // reported once per struct, like the seed's `break`
+      while (j < len(ftypes)) {
+        if (rEmbedsSelf(r, w, i, ftypes[j], []int(0))) {
+          j = len(ftypes) // reported once per struct, like the seed's `break`
         }
         j = j + 1
       }
@@ -518,19 +554,61 @@ function rCheckTypeCycles(r: Resolver) {
   }
 }
 
-function rEmbedsSelf(r: Resolver, start: int, node: int, visiting: []bool): bool {
+// The declared type of every field of `decl`, export wrappers unwrapped.
+function rStructFieldTypes(r: Resolver, decl: int): []int {
+  let fields = kidsOf(r.tree, kidsOf(r.tree, decl)[2])
+  let out = []int(len(fields))
+  let i = 0
+  while (i < len(fields)) {
+    out[i] = kidsOf(r.tree, rUnwrapExport(r, fields[i]))[1]
+    i = i + 1
+  }
+  return out
+}
+
+// `path` grows by copy rather than `append` because sibling branches of the walk
+// share a backing array otherwise (append aliases what it grows), which would
+// let one branch's names leak into another's cycle text.
+function rPathPush(path: []int, id: int): []int {
+  let out = []int(len(path) + 1)
+  let i = 0
+  while (i < len(path)) {
+    out[i] = path[i]
+    i = i + 1
+  }
+  out[len(path)] = id
+  return out
+}
+
+function rCycleText(r: Resolver, start: int, path: []int): string {
+  let s = r.symbols[start].name
+  let i = 0
+  while (i < len(path)) {
+    s = s + " -> " + r.symbols[path[i]].name
+    i = i + 1
+  }
+  return s + " -> " + r.symbols[start].name
+}
+
+const rCycleHint = "use Option<T>, a slice, a map, or an interface to break the cycle"
+
+// `path` holds the symbols entered since `start`, so the diagnostic can name the
+// cycle it actually walked. `w.followStructs` is false when `start` is generic
+// (see rCheckTypeCycles) and for every alias walk, where a struct name really is
+// a boundary — an alias cycle is about byte layout, not constructibility.
+function rEmbedsSelf(r: Resolver, w: CycleWalk, start: int, node: int, path: []int): bool {
   if (node == 0) {
     return false
   }
   let tag = getNode(r.tree, node).tag
   if (tag == Tag.ArrayType) {
-    return rEmbedsSelf(r, start, kidsOf(r.tree, node)[1], visiting)
+    return rEmbedsSelf(r, w, start, kidsOf(r.tree, node)[1], path)
   }
   if (tag == Tag.TupleType) {
     let elems = kidsOf(r.tree, node)
     let i = 0
     while (i < len(elems)) {
-      if (rEmbedsSelf(r, start, elems[i], visiting)) {
+      if (rEmbedsSelf(r, w, start, elems[i], path)) {
         return true
       }
       i = i + 1
@@ -549,19 +627,44 @@ function rEmbedsSelf(r: Resolver, start: int, node: int, visiting: []bool): bool
     return false
   }
   if (found == start) {
-    rError(r, nameNode, ecTypeCycle, "'${r.symbols[start].name}' cannot embed itself without indirection",
-      "use a slice, map, or a struct/interface reference to break the cycle")
+    if (len(path) == 0) {
+      rError(r, nameNode, ecTypeCycle,
+        "'${r.symbols[start].name}' cannot embed itself without indirection", rCycleHint)
+    } else {
+      rError(r, nameNode, ecTypeCycle,
+        "'${r.symbols[start].name}' cannot contain itself: ${rCycleText(r, start, path)}", rCycleHint)
+    }
+    w.reported[start] = true
+    let k = 0
+    while (k < len(path)) {
+      w.reported[path[k]] = true
+      k = k + 1
+    }
     return true
   }
-  if (r.symbols[found].kind != SymbolKind.TypeAlias) {
-    return false // struct/interface/builtin: a safe reference boundary
+  let kind = r.symbols[found].kind
+  let isStruct = kind == SymbolKind.StructType && w.followStructs && tag == Tag.Ident &&
+    kidsOf(r.tree, r.symbols[found].decl)[1] == 0
+  if (kind != SymbolKind.TypeAlias && !isStruct) {
+    return false // interface/enum/builtin/generic: a safe reference boundary
   }
-  if (visiting[found]) {
-    return false // an unrelated cycle; reported when that alias is `start`
+  if (w.visiting[found]) {
+    return false // an unrelated cycle; reported when that symbol is `start`
   }
-  visiting[found] = true
-  let embeds = rEmbedsSelf(r, start, kidsOf(r.tree, r.symbols[found].decl)[2], visiting)
-  visiting[found] = false
+  w.visiting[found] = true
+  let next = rPathPush(path, found)
+  let embeds = false
+  if (isStruct) {
+    let ftypes = rStructFieldTypes(r, r.symbols[found].decl)
+    let i = 0
+    while (i < len(ftypes) && !embeds) {
+      embeds = rEmbedsSelf(r, w, start, ftypes[i], next)
+      i = i + 1
+    }
+  } else {
+    embeds = rEmbedsSelf(r, w, start, kidsOf(r.tree, r.symbols[found].decl)[2], next)
+  }
+  w.visiting[found] = false
   return embeds
 }
 

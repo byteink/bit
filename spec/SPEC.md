@@ -1794,6 +1794,27 @@ Rationale: making structs references removes the need for pointers, `&`/`*`, and
 value-vs-pointer receiver rules, which is a large ceremony saving (priority #1)
 while keeping the GC model simple.
 
+**A struct-typed field may not participate in a cycle of any length**, because a
+struct has no `nil` (§13.4): such a field can be neither omitted (`E0083`) nor
+filled with nothing, so filling one obliges filling one more and the chain never
+terminates. `struct Node { next: Node }` and the equivalent `A → B → A` and
+`P → Q → R → P` are all rejected at the declaration with `E0047`, naming the
+cycle. This is not a layout restriction — a struct field is a single handle, so
+the layout is finite either way — it is that no value of the type can be built.
+
+Break a cycle with any type that has an empty or `nil` state. `Option<T>` is the
+idiomatic one and gives the ordinary recursive structures:
+
+```bit
+struct Node { v: int, next: Option<Node> }   // linked list
+struct Tree { v: int, kids: []Tree }         // slice also terminates
+struct Trie { next: map<rune, Trie> }        // so does a map
+```
+
+A cycle passing through a generic instantiation is not diagnosed here, since
+whether it closes depends on the type argument; `E0083` reports it at the
+construction site instead.
+
 ### 13.4 Zero Values
 
 Every declared binding without an initializer is deterministically zero-valued:

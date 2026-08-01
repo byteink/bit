@@ -175,6 +175,26 @@ let empty = []Outer(0)               // fine; asks for no zero values
 Every other field type stays omittable, including an inline `[N]T`, because
 their zero value really is zero bits.
 
+The same fact rules out a **cycle** of struct-typed fields, at any length. There
+is no way to build one, because every step obliges another:
+
+```bit ignore
+struct Node { v: int, next: Node }   // E0047 - one hop
+struct A { b: B }                    // E0047 - A -> B -> A
+struct B { a: A }
+```
+
+The layout would be fine (a struct field is one handle, so nothing here is
+infinitely large). It is that no value of the type exists to write. Break the
+cycle with any type that has an empty or `nil` state - `Option<T>` is the
+idiomatic one:
+
+```bit
+struct ListNode { v: int, next: Option<ListNode> }   // linked list
+struct TreeNode { v: int, kids: []TreeNode }         // a slice terminates too
+struct TrieNode { next: map<rune, TrieNode> }        // and so does a map
+```
+
 A map whose value type is such a struct is still fine to build, insert into,
 iterate and delete from. Only reading a **missing** key needs a zero value, so
 that one read panics - and the two-result form, which exists to ask whether a
