@@ -29,13 +29,22 @@ SRC="${ROOT}/tools/build"
 
 mkdir -p "${CACHE}"
 
-# Rebuild only when a source file is newer than the driver, so the common path
+# Rebuild only when an INPUT is newer than the driver, so the common path
 # — running a step on an unchanged tree — does not pay a compile. `find -newer`
 # rather than a hash: this is a developer convenience, and the correctness gate
 # that actually matters (the libbitrt fingerprint) is #1869's problem, not this
 # file's.
+#
+# TWO inputs, not one (#2077): `tools/build/` is the source, and the PINNED
+# STAGE0 compiles it and supplies the `libbitrt.a` it links. Counting only the
+# first left the driver a week stale across the 0.1.4 -> 0.1.5 pin move, since
+# nothing under `tools/build/` had been touched. `SHA256SUMS` is the pin's
+# source of truth; resolving stage0 to compare the binary itself would put a
+# spawn and a digest check on the path this cache exists to keep free.
 needs_build=0
 if [ ! -x "${DRIVER}" ]; then
+  needs_build=1
+elif [ -n "$(find "${ROOT}/dist/stage0/SHA256SUMS" -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
 elif [ -n "$(find "${SRC}" -name '*.bit' -newer "${DRIVER}" -print -quit 2>/dev/null)" ]; then
   needs_build=1
