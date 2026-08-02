@@ -1322,7 +1322,7 @@ bit_rt_os_arg_at(i)        -> *const RtBytes   // "" when out of range
 bit_rt_os_env(name)        -> *const RtBytes   // "" when unset
 bit_rt_os_self_exe()       -> *const RtBytes   // own path, symlinks resolved; "" if unknown
 bit_rt_os_exit(code)       -> noreturn         // deferred calls do not run
-bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure
+bit_rt_os_run(path)        -> i64              // child exit code; -1 on failure, <= -100 signal-killed
 bit_rt_os_run_test(path, i) -> i64             // like os_run + BIT_TEST_INDEX=i
 bit_rt_os_run_bounded(path, timeout_ms)      -> i64  // os_run, killed if it outlives timeout_ms
 bit_rt_os_run_test_bounded(path, i, timeout_ms) -> i64  // os_run_test, same bound
@@ -1335,10 +1335,22 @@ Linux path and the Darwin `machoMain` path; `boot` captures the environment bloc
 Bit has no nil string, so an unset variable and one set to `""` both read empty.
 
 `bit_rt_os_run` runs the executable at `path` as a child process, inheriting the
-captured `envp`, and returns its exit code (`-1` on any failure or abnormal
-termination). It is `bit run`/`bit test`'s launcher — `fork` + immediate `execve`
+captured `envp`. It is `bit run`/`bit test`'s launcher — `fork` + immediate `execve`
 (Linux: raw syscalls; Darwin: libSystem), the only work between fork and exec, so
-it is safe with scheduler worker threads live.
+it is safe with scheduler worker threads live. Result encoding, the same one the
+bounded pair below uses minus the `-2` case it has no deadline to produce (#2019):
+
+```
+ >= 0     child exited normally with this code (0-255)
+ -1       spawn/exec/wait failure, or the child stopped rather than exited
+ <= -100  child was killed by a signal; signal number is -(result) - 100
+          (e.g. -111 = SIGSEGV)
+```
+
+The `<= -100` case used to collapse to `-1`, which made a program that ran and
+then crashed indistinguishable from one that never started — `bit run` reported
+every segfault as "could not run". A caller that only tests `code < 0` keeps its
+old behaviour; one that wants the distinction subtracts.
 
 `bit_rt_host_target` returns the ordinal of the `BuildTarget` this binary's own
 host matches (0 `x86_64-linux`, 1 `aarch64-linux`, 2 `aarch64-macos` — the enum in
