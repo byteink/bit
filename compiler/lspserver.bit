@@ -269,10 +269,16 @@ function lspTextDocPosition(d: JsonDoc, params: int): LspTdp {
 struct LspServer {
   overlays: map<string, string>,
   shuttingDown: bool,
+  // Directories whose diagnostics are STALE and owed a republish (#2201). A set,
+  // not a single directory, because one burst can touch files in more than one
+  // project and keeping only the last would leave the others displaying
+  // diagnostics for text the user has already replaced.
+  pendingDirs: map<string, bool>,
 }
 
 function newLspServer(): LspServer {
-  return LspServer{ overlays: map<string, string>{}, shuttingDown: false }
+  return LspServer{ overlays: map<string, string>{}, shuttingDown: false,
+    pendingDirs: map<string, bool>{} }
 }
 
 // ---- dispatch --------------------------------------------------------------
@@ -367,7 +373,7 @@ function lspOnDidOpen(server: LspServer, d: JsonDoc, params: int) {
     return
   }
   server.overlays[path] = text
-  lspRecheckAndPublish(server, pathDir(path))
+  server.pendingDirs[pathDir(path)] = true
 }
 
 function lspOnDidChange(server: LspServer, d: JsonDoc, params: int) {
@@ -388,7 +394,7 @@ function lspOnDidChange(server: LspServer, d: JsonDoc, params: int) {
     return
   }
   server.overlays[path] = text
-  lspRecheckAndPublish(server, pathDir(path))
+  server.pendingDirs[pathDir(path)] = true
 }
 
 function lspOnDidClose(server: LspServer, d: JsonDoc, params: int) {
@@ -402,7 +408,7 @@ function lspOnDidClose(server: LspServer, d: JsonDoc, params: int) {
     return
   }
   delete(server.overlays, path)
-  lspRecheckAndPublish(server, pathDir(path))
+  server.pendingDirs[pathDir(path)] = true
 }
 
 // ---- diagnostics -----------------------------------------------------------
@@ -512,6 +518,41 @@ function lspPublishDiagnostics(p: Project) {
 
 // The `bit lsp` entry: read framed messages from stdin and handle each until the
 // stream ends. Called from main's `lsp` arm.
+// Republishes every directory an edit left stale, then clears the set.
+//
+// COALESCED, NOT DEBOUNCED, and the distinction is the design: there is no timer
+// here. `lspRun` calls this only once the reader has drained, so a burst collapses
+// to ONE check however fast it arrived, while a single lone edit still publishes
+// immediately. A time-based debounce would need a clock the server does not have
+// and would add latency to the common case of one keystroke.
+function lspFlushPending(server: LspServer) {
+  for (dir, _) of server.pendingDirs {
+    lspRecheckAndPublish(server, dir)
+  }
+  server.pendingDirs = map<string, bool>{}
+}
+
+// The `bit lsp` entry: read framed messages from stdin and handle each until the
+// stream ends. Called from main's `lsp` arm.
+//
+// DIAGNOSTICS PUBLISH WHEN THE INPUT DRAINS, NOT PER MESSAGE (#2201).
+// `lspRecheckAndPublish` rebuilds the whole project — parse, resolve, check — and
+// that is tens of seconds on `compiler/`. Doing it inside each `didChange`
+// handler meant one full rebuild PER KEYSTROKE, so sustained typing queued work
+// faster than it could ever be retired: the released 0.1.5 server was found
+// holding a core at 78% with 88 minutes of CPU behind it, still grinding through
+// edits made two hours earlier.
+//
+// `len(r.buf) > 0` is the "more already waiting" test. `lspReadN` consumes only
+// its own message and leaves the rest of the chunk buffered, so a backlog — which
+// is exactly when many notifications sit in the socket together — leaves bytes
+// behind. Measured on this tree: 20 edits to a file in the 136-file `compiler/`
+// project produce 136 publishes, i.e. ONE check, against 20 checks before.
+//
+// A message ending flush with a chunk boundary can leave the buffer empty while
+// more bytes are still in the socket, costing one extra check. Bounded, never a
+// wrong answer, and closing it needs a readiness probe the compiler has no
+// primitive for. Raising the 4096-byte chunk was tried and changed nothing.
 function lspRun() {
   let server = newLspServer()
   let r = lspStdinReader()
@@ -519,9 +560,16 @@ function lspRun() {
   while (guard < 1000000) {
     let msg = lspReadMessage(r)
     if (!msg.ok) {
+      // NO final flush. End of stream means the client is gone, so rebuilding
+      // here would spend tens of seconds producing diagnostics nobody is left to
+      // read — the "still grinding after the editor closed" behaviour this
+      // change exists to remove.
       return
     }
     lspHandleMessage(server, msg.body)
+    if (len(r.buf) == 0) {
+      lspFlushPending(server)
+    }
     guard = guard + 1
   }
 }
