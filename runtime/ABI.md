@@ -435,28 +435,32 @@ statically sized registry (no allocation after startup; a slot is claimed by
 `bit_rt_gc_thread_enter` and released by `bit_rt_gc_thread_exit`). A slot is in
 one of three states:
 
-**THE REGISTRY BLOCK MUST NOT BE MANAGED MEMORY (#1991).** `bit_rt_gc_world_bind`
-takes the block's address as a plain integer and stores it, so the collector has
-no idea the block exists: it is not a root, it is never traced, and it is never
-rewritten. There is also no unbind — the binding is process-wide and permanent
-once made. The block must therefore be storage that the collector can never
-reclaim and that outlives every thread that will poll a safepoint, which in
-practice means module state. `runtime/root/root.bit`'s `worldBlock` is exactly
-that.
+**THE REGISTRY BLOCK IS `runtime/gc`'s OWN MODULE STATE, AND THERE IS NO WAY TO
+SUPPLY ONE (#1991/#2184).** `runtime/gc/gcworldsync.bit` declares `worldBlock`
+and `syscallRegBlock`; `bit_rt_gc_world_ready` tells it boot has finished, and
+carries no address. `bit_rt_gc_world_addr` reads the block's address back out and
+answers 0 until readiness — which is what every door tests before reading a
+thread token, because the x86-64 token is a `%fs:0` load that faults on a thread
+whose FS base is not installed yet.
 
-Handing it a GC-allocated block instead type-checks, links, and runs — until a
-collection sweeps it, after which every safepoint poll in the process reads freed
-memory. `tests/stress/gcworld` did this for months: it bound a `[]i64` slice,
-printed all 29 of its assertions correctly, and then took a SIGSEGV at teardown
-once `main` returned and the slice died. Keeping the slice live through `main`
-does not help, because the reads that fault happen after `main` returns. Size
-only decides whether a collection happens first, which is why it read as a size
-limit rather than as a lifetime bug.
+There used to be a `bit_rt_gc_world_bind(addr)` taking the block's address as a
+plain integer. That is what #1991 was. A bound address is invisible to the
+collector — not a root, never traced, never rewritten — and there was no unbind,
+so handing it managed memory type-checked, linked and ran until a collection
+swept the block, after which every safepoint poll in the process read freed
+memory. `tests/stress/gcworld` did exactly that: bound a `[]i64` slice, printed
+all 29 of its assertions correctly, then took a SIGSEGV at teardown once `main`
+returned. Keeping the slice live through `main` does not help; the faulting reads
+happen after `main` returns.
 
-A program that wants a **private** registry must not bind at all — it passes its
-own block to the parameterised doors (`bit_rt_port_stw_poll_on`,
-`bit_rt_port_gc_current_mutator_on`), which is the same rule #1833 established
-and which `tests/stress/stwcollect` follows.
+The block is module state now, so the lifetime invariant holds by construction
+and there is nothing left to check. The door that remains cannot be misused
+because it carries no address.
+
+A program that wants a **private** registry passes its own block to the
+parameterised doors (`bit_rt_port_stw_poll_on`,
+`bit_rt_port_gc_current_mutator_on`), which never touch the process-wide one —
+the rule #1833 established and `tests/stress/stwcollect` follows.
 
 ```
 running   executing Bit code; may reach a safepoint at any moment

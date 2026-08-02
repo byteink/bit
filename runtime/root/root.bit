@@ -166,8 +166,8 @@
 // were never in the ABI to begin with (ABI.md names no allocator symbol).
 
 import { loadWord, storeWord, loadByte, storeByte, wordAt } from "../gc"
-import { worldBind, worldWords } from "../gc"
-import { worldBindSyscallRegs, maxMutators, muRegWords } from "../gc"
+import { worldSetReady, worldBlockAddr, worldWords } from "../gc"
+import { maxMutators, muRegWords } from "../gc"
 import {
   gcInit, gcBindMemory, gcConfigure, gcAlloc, gcAllocRaw, gcOwns, gcWords,
   gcTiSize, gcTiPtrOffsetsPtr, gcTiPtrOffsetsLen, gcTiNamePtr, gcTiNameLen,
@@ -243,35 +243,6 @@ const mapInitCap: int = 8
 let gcState: [37]i64          // gcWords
 let heapBlock: [39]i64        // heapWords
 
-// The World/Mutator registry (`gcworld.bit`, `worldWords` = 1285) — `runtime/root/`'s
-// `g_world`. Owned HERE for the same reason `gcState` is: `runtime/gc` is
-// `@nosplit` throughout and `@nosplit` rejects `ptrOf` (E0075), so the block and
-// its address must come from a module that can take one. `rootInit` hands it to
-// `worldBind`; until that call every `gcworld` wrapper is a safe no-op and the
-// safepoint poll returns without ever touching a registry — which is exactly
-// what #1639 measured, the collector dormant because nothing bound it.
-//
-// Zeroed by construction, which is the initial state the registry wants (every
-// slot free, no stop pending, epoch 0).
-// 1285 = maxMutators * muWords + 5, up from 1029 when #1904 gave each slot one
-// more word (`muSp`, the syscall state's published stack pointer).
-let worldBlock: [1285]i64     // worldWords
-
-// #1904's saved callee-saved register file, `muRegWords` words per mutator slot,
-// owned here for the same reason `worldBlock` is: `runtime/gc` is `@nosplit`
-// throughout and `@nosplit` rejects `ptrOf` (E0075).
-//
-// A SEPARATE BLOCK, NOT MORE WORDS PER SLOT — a cost decision, and it used to
-// claim to be more than that. The note here said folding these 12 words into the
-// mutator slot makes `worldBlock` 4357 words and "every Bit binary then SIGSEGVs
-// under the collector". It does not, and #1991 closed on why: the crash was
-// `tests/stress/gcworld` binding its own GC-heap slice as the process-wide
-// registry, and `worldWords` sized that slice too, so a test bug read as a limit
-// on this array. `worldBlock: [4357]i64` with `muWords = 17` was then measured
-// green. The blocks stay separate because 12 words x 256 slots for a state only
-// a syscall-parked thread uses is a poor trade, not because the alternative
-// crashes.
-let syscallRegBlock: [3072]i64   // maxMutators * muRegWords
 let heapLockCell: i32 = 0
 let listLockCell: i32 = 0
 
@@ -291,11 +262,16 @@ const riWords: int = 46
 
 // The addresses of `gcState` and `infoBlock`, taken ONCE by `rootInit`.
 //
-// THIS INDIRECTION IS FORCED, and the reason matters. `ptrOf` is REJECTED in a
-// `@nosplit` body (E0075, measured) even on module state, which SPEC §11.11
-// explicitly says is legal there ("`ptrOf` yields its address for the atomic
-// builtins ... legal inside a `@nosplit` body"). Filed as a spec/implementation
-// mismatch rather than worked around silently.
+// THIS INDIRECTION IS NO LONGER FORCED, and the note claiming it was is
+// withdrawn (#2184). It said `ptrOf` is "REJECTED in a `@nosplit` body (E0075,
+// measured) even on module state, which SPEC §11.11 explicitly says is legal
+// there", filed as a spec/implementation mismatch. That mismatch was #1421 and
+// it was fixed on 2026-07-19 — the claim outlived its truth by 628 commits and
+// took a whole design with it, since `runtime/gc`'s registry was caller-owned
+// for exactly this reason and nothing else.
+//
+// The cached scalars below stay because caching a link-time constant is free and
+// the alternative is churn on the boot path, not because a rewrite is impossible.
 //
 // And `@nosplit` is NOT optional for the bodies below, it is the correctness
 // property: they hold live object addresses in plain `int` locals, which the
@@ -390,7 +366,14 @@ function rootInit(markStackLen: int): bool {
   }
   // A drift in either width would silently truncate the block these arrays
   // stand in for. Literal lengths cannot reference the consts, so check them.
-  if (gcWords != 37 || heapWords != 39 || worldWords != 1285) {
+  if (gcWords != 37 || heapWords != 39) {
+    return false
+  }
+  // The same check for the two blocks `runtime/gc` now owns (#2184). Their
+  // lengths are literals in `gcworldsync.bit` for the same reason the ones here
+  // are, and this module is the one that can refuse loudly — `@nosplit` cannot
+  // panic, so the owner cannot check itself.
+  if (worldWords != 1285 || maxMutators * muRegWords != 3072) {
     return false
   }
 
@@ -430,11 +413,15 @@ function rootInit(markStackLen: int): bool {
     return false
   }
 
-  // Publish the World registry (`runtime/root/`'s `g_world`, a plain global there).
-  // AFTER `gcInit`, so a thread that registers the instant this returns finds a
-  // collector that is already up.
-  worldBind(int(ptrOf(worldBlock)))
-  worldBindSyscallRegs(int(ptrOf(syscallRegBlock)))
+  // Open the World registry for business. AFTER `gcInit`, so a thread that
+  // registers the instant this returns finds a collector that is already up,
+  // and after the platform boot has installed the thread pointer, which the x64
+  // token read depends on (see `currentMutator`).
+  //
+  // No address crosses this call (#2184): `runtime/gc` owns the block, so there
+  // is nothing to hand over and nothing to hand over WRONGLY. Handing a bind
+  // door a GC-allocated block is #1991, and it is now unrepresentable.
+  worldSetReady()
 
   booted = 1
   return true
@@ -453,9 +440,12 @@ export @nosplit @symbol("bit_rt_gc_addr") function rootGcAddr(): int {
 // The World registry's address, for the same caller and the same reason as
 // `rootGcAddr` above: `stwBind` also caches this one (#1700), so stwPoll's hot
 // path can read it without a cross-module call to `worldBlockAddr`.
+//
+// A forwarder since #2184 — `runtime/gc` owns the block now. It stays because
+// `boot.bit` reaches it by ABI name (`bit_rt_world_addr`) and because forwarding
+// keeps the readiness gate: pre-boot this answers 0, exactly as it must.
 export @nosplit @symbol("bit_rt_world_addr") function rootWorldAddr(): int {
-  let a = int(ptrOf(worldBlock))
-  return a
+  return worldBlockAddr()
 }
 
 // `BIT_GC` / `BIT_GC_STATS` equivalents. Split out because reading the

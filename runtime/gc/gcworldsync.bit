@@ -109,13 +109,12 @@ export @nosplit @symbol("bit_rt_port_gc_world_high_water") function worldHighWat
 // instance) and a `threadlocal g_mutator` (this OS thread's slot). Two adaptations,
 // both forced and both matching conventions already in this tree:
 //
-//   - `g_world` is CALLER-OWNED, exactly as the collector state is (constraint 1):
-//     `runtime/root` owns the block and its address is bound here once via
-//     `worldBind`. `@nosplit` rejects `ptrOf` (E0075, measured — the same gap
-//     `root.bit` documents), so this module cannot take the address of a
-//     module-state array itself; the owner passes it in, `wordAt` recovers the
-//     pointer. Until `worldBind` runs, `worldAddr == 0` and every wrapper is a
-//     safe no-op.
+//   - `g_world` is THIS MODULE'S OWN module state (#2184). It was caller-owned,
+//     with `runtime/root` holding the array and `worldBind` handing the address
+//     over, because `@nosplit` rejected `ptrOf` — #1421 fixed that on
+//     2026-07-19 and the design outlived the constraint. What remains of the
+//     door is `worldSetReady`, which carries no address: until `rootInit` calls
+//     it every wrapper below is a safe no-op, exactly as before.
 //
 //   - `g_mutator` USED TO NOT BE CACHED AT ALL (#1698) — every poll re-derived
 //     the slot via `gcThreadToken()` (a real call) then `worldFindOwner` (a real
@@ -156,12 +155,11 @@ export @nosplit @symbol("bit_rt_port_gc_world_high_water") function worldHighWat
 //     on either target this runtime supports, so "stale" is the only failure
 //     mode a concurrent writer can produce here, not "corrupt".)
 //
-//     Plain module-state reads/writes, not atomics: `@nosplit` is measured to
-//     reject `ptrOf` even on module state despite SPEC §11.11 saying it is
-//     legal there (`root.bit`'s own documented gap, #1421) — the same reason
-//     `worldAddr` below is a plain scalar and not something the atomics touch.
-//     A hint that only ever gets safer, never worse, by being re-verified has
-//     no correctness need for atomics in the first place.
+//     Plain module-state reads/writes, not atomics, and that is now a choice
+//     rather than a constraint. It used to cite `@nosplit` rejecting `ptrOf` on
+//     module state; #1421 fixed that on 2026-07-19 and the note went stale. A
+//     hint that only ever gets safer, never worse, by being re-verified has no
+//     correctness need for atomics in the first place, so it stays as it is.
 //
 //     `gcThreadExit` clears the hint when it currently names the slot being
 //     released, so a departed thread's slot cannot linger as a stale guess
@@ -169,8 +167,43 @@ export @nosplit @symbol("bit_rt_port_gc_world_high_water") function worldHighWat
 //     harmless, since a released slot's owner reads 0, which matches no live
 //     token).
 
-// Address of the caller-owned World block, or 0 before `worldBind`.
-let worldAddr: i64 = 0
+// THE REGISTRY, OWNED HERE (#2184). It was caller-owned — `runtime/root` held
+// the array and handed the address over through `worldBind` — for one reason:
+// `@nosplit` rejected `ptrOf`, so this module could not take an address at all.
+// #1421 fixed that on 2026-07-19; the design outlived its cause by 628 commits.
+//
+// Owning it deletes a whole failure mode rather than checking for it. A bind
+// door takes an address as a plain `int`, so the collector cannot see the
+// binding, cannot trace it and never rewrites it, and there is no unbind — hand
+// it managed memory and every safepoint poll in the process reads a swept object
+// the moment that memory dies. That is exactly what #1991 was, and it cost three
+// sessions to find because the symptom (a fault on another thread, after all
+// output, sensitive to an unrelated array's size) names nothing.
+//
+// Module state cannot be collected and outlives every thread, so the invariant
+// now holds by construction. Nothing to enforce, nothing to get wrong.
+//
+// 1285 = `worldWords` (`gcworld.bit`). An array length must be a literal, so the
+// two cannot be written as one; `rootInit` asserts the relation at boot and
+// exits 70 on drift, which is where that guard already lived.
+let worldBlock: [1285]i64
+
+// Zero until `rootInit` says the runtime is up. NOT an address — the block above
+// is this module's own module state, so there is nothing to hand over, which is
+// the whole point of #2184. What the callers below actually needed from
+// `worldAddr == 0` was never the address; it was "has boot run yet", and this
+// says exactly that and nothing else.
+//
+// Load-bearing on x86-64, see `currentMutator`: the thread token is a load
+// through `%fs:0` that FAULTS on a thread whose FS base is not installed, so
+// every door must refuse on this word before it reads a token.
+let worldReady: i64 = 0
+
+// Publish readiness. Called once by `rootInit`, after `gcInit` and after the
+// platform boot has installed the thread pointer.
+export @nosplit @symbol("bit_rt_port_gc_world_ready") function worldSetReady() {
+  worldReady = 1
+}
 
 // The steady-state poll hint (#1698) — see the header note above. A slot
 // number BIASED BY ONE (0 = empty), naming the last slot ANY thread resolved.
@@ -179,35 +212,24 @@ let worldAddr: i64 = 0
 // value can only ever fall through to the exact search, never mislead one.
 let mutHintSlot: i64 = 0
 
-// Bind the process-wide World block. Called once at boot by `runtime/root`,
-// after it has `ptrOf`'d its own `g_world` array (which this `@nosplit` module
-// cannot do for it). Idempotent-friendly: re-binding the same address is a
-// no-op, and the block is expected zeroed (every slot free, no stop, epoch 0).
-export @nosplit @symbol("bit_rt_port_gc_world_bind") function worldBind(addr: int) {
-  worldAddr = addr
-}
+// #1904's saved callee-saved register file, `muRegWords` words per mutator slot,
+// slot `i` at `i * muRegWords`. Owned here alongside the registry and for the
+// same reason (#2184).
+//
+// A SEPARATE BLOCK, NOT MORE WORDS PER SLOT, and that is a cost decision. The
+// note here used to say folding it into the slot "SIGSEGVs every binary under
+// the collector"; #1991 closed on that being a test's heap-allocated registry,
+// not a limit on either array. 12 words x 256 slots for a state only a
+// syscall-parked thread uses is simply a poor trade.
+//
+// 3072 = `maxMutators * muRegWords` (`gcworld.bit`), a literal for the same
+// reason `worldBlock` is, and asserted by `rootInit` for the same reason.
+let syscallRegBlock: [3072]i64
 
-// Address of the caller-owned syscall register block — `maxMutators * muRegWords`
-// words, slot `i` at `i * muRegWords` (#1904). Caller-owned for the same reason
-// the World block is (`@nosplit` rejects `ptrOf`), and a SEPARATE block rather
-// than more words per mutator slot for the reason `muSp` records: widening the
-// World block itself to hold this SIGSEGVs every binary under the collector
-// (#1991). Until `worldBindSyscallRegs` runs this is 0 and the syscall state
-// publishes no registers, which is safe — `gcSyscallBegin` refuses outright.
-let syscallRegsAddr: i64 = 0
-
-export @nosplit @symbol("bit_rt_port_gc_world_bind_syscall_regs") function worldBindSyscallRegs(addr: int) {
-  syscallRegsAddr = addr
-}
-
-// Address of slot `slot`'s saved callee-saved register file, or 0 before the
-// block is bound. Valid only while that slot is in `mSyscall`; callers gate on
-// `worldSyscallSp` first.
+// Address of slot `slot`'s saved callee-saved register file. Valid only while
+// that slot is in `mSyscall`; callers gate on `worldSyscallSp` first.
 export @nosplit @symbol("bit_rt_port_gc_world_syscall_regs") function worldSyscallRegs(slot: int): int {
-  if (syscallRegsAddr == 0) {
-    return 0
-  }
-  return int(syscallRegsAddr) + slot * muRegWords * 8
+  return int(ptrOf(syscallRegBlock)) + slot * muRegWords * 8
 }
 
 // This thread's slot BIASED BY ONE (0 = none), registering it first if it holds
@@ -217,12 +239,15 @@ export @nosplit @symbol("bit_rt_port_gc_world_syscall_regs") function worldSysca
 // from the thread_enter/blocking_begin/allocation doors, which publish no
 // snapshot).
 //
-// THE ORDER OF THE TWO REFUSALS MATTERS ON x86-64. `worldAddr == 0` is tested
-// BEFORE the token is read, because the x64 token is a load through `%fs:0` and
-// a thread whose FS base has not been installed yet would fault on it rather
-// than read 0. `worldBind` runs after `../../root/linux/boot.bit`'s
-// `initLinuxTls`, so a bound World implies an installed thread pointer; testing
-// in the other order would make every pre-boot safepoint a segfault.
+// THE ORDER OF THE TWO REFUSALS MATTERS ON x86-64. `mutatorSlot` tests its
+// `waddr` argument BEFORE reading the token, because the x64 token is a load
+// through `%fs:0` and a thread whose FS base has not been installed yet would
+// fault on it rather than read 0. `worldBlockAddr()` answers 0 until
+// `worldSetReady`, which `rootInit` calls after `../../root/linux/boot.bit`'s
+// `initLinuxTls` — so a non-zero answer implies an installed thread pointer.
+// Testing in the other order would make every pre-boot safepoint a segfault.
+// That is why this passes `worldBlockAddr()` rather than the block's address
+// directly: the readiness gate lives inside it and must not be bypassed.
 // PINNED, though nothing outside this module calls it by name. `worldEnsureSelf`
 // below forwards to it and `runtime/stw` inlines THAT, which drags a reference to
 // this body into a separately-emitted object; `--freestanding` refuses a mangled
@@ -230,14 +255,15 @@ export @nosplit @symbol("bit_rt_port_gc_world_syscall_regs") function worldSysca
 // The predecessor was small enough to be inlined away entirely; #1650 gave this
 // one a search loop, so it stays a real call and needs a real name.
 export @nosplit @symbol("bit_rt_port_gc_current_mutator") function currentMutator(frame: int): int {
-  return mutatorSlot(worldAddr, frame, true)
+  return mutatorSlot(worldBlockAddr(), frame, true)
 }
 
 // The same find-or-claim over a CALLER-SUPPLIED registry (#1836).
 //
-// This exists so a program can drive a PRIVATE World without calling
-// `worldBind` — which would replace this process's registry for every thread,
-// including the live runtime's own workers. That is not hypothetical: it is
+// This exists so a program can drive a PRIVATE World. There used to be a way to
+// get one wrong — `worldBind`, which replaced this process's registry for every
+// thread, including the live runtime's own workers. #2184 deleted it, so this is
+// now the ONLY way, but the hazard is worth keeping on record. That is not hypothetical: it is
 // exactly what `tests/stress/stwcollect` did, and the live worker joined the
 // test's registry as a mutator the test never created and could not schedule,
 // so the rendezvous waited on it and abandoned (#1833, measured as 2 claimed
@@ -333,11 +359,14 @@ function mutatorSlot(waddr: int, frame: int, useHint: bool): int {
 // for forever. Publishing the two accessors keeps ONE registry with ONE owner
 // and moves only the composition.
 
-// The bound World block address, or 0 before `worldBind` — the value the poll
-// tests before touching the registry at all (pre-boot there is no registry).
+// This module's own registry block, or 0 before `worldSetReady` — the value the
+// poll tests before touching the registry at all, and the gate that keeps a
+// pre-boot door from reading an uninstalled x64 thread pointer.
 export @nosplit @symbol("bit_rt_port_gc_world_addr") function worldBlockAddr(): int {
-  let a = worldAddr
-  return a
+  if (worldReady == 0) {
+    return 0
+  }
+  return int(ptrOf(worldBlock))
 }
 
 // Register this thread if it has not registered (parking immediately if a stop
@@ -387,14 +416,14 @@ export @nosplit @symbol("bit_rt_gc_thread_enter") function gcThreadEnter() {
 // nothing to release, and CLAIMING one here just to free it would be a pure
 // waste (and, under a pending stop, would park a thread that is on its way out).
 export @nosplit @symbol("bit_rt_gc_thread_exit") function gcThreadExit() {
-  if (worldAddr == 0) {
+  if (worldReady == 0) {
     return
   }
   let token = gcThreadToken()
   if (token == 0) {
     return
   }
-  let world = wordAt(worldAddr)
+  let world = ptrOf(worldBlock)
   let slot = worldFindOwner(world, token)
   if (slot < 0) {
     return
@@ -419,21 +448,21 @@ export @nosplit @symbol("bit_rt_gc_blocking_begin") function gcBlockingBegin() {
   if (mu == 0) {
     return
   }
-  let world = wordAt(worldAddr)
+  let world = ptrOf(worldBlock)
   worldBeginBlocking(world, mu - 1)
 }
 
 // `bit_rt_gc_blocking_end` (ABI.md §5/§6). Blocks while a stop is pending rather
 // than resuming behind the collector's back (`worldEndBlocking`).
 export @nosplit @symbol("bit_rt_gc_blocking_end") function gcBlockingEnd() {
-  if (worldAddr == 0) {
+  if (worldReady == 0) {
     return
   }
   let token = gcThreadToken()
   if (token == 0) {
     return
   }
-  let world = wordAt(worldAddr)
+  let world = ptrOf(worldBlock)
   let slot = worldFindOwner(world, token)
   if (slot < 0) {
     return
@@ -511,11 +540,12 @@ export @nosplit @symbol("bit_rt_gc_syscall_begin") function gcSyscallBegin() {
     return
   }
   let slot = mu - 1
+  // No "is the block bound yet" refusal here since #2184: the register file is
+  // this module's own module state, so its address is always real. The only
+  // thing that could make it meaningless is an unregistered thread, and
+  // `currentMutator` above already answered that.
   let regs = worldSyscallRegs(slot)
-  if (regs == 0) {
-    return // block not bound yet: publish nothing rather than a half-snapshot
-  }
-  let world = wordAt(worldAddr)
+  let world = ptrOf(worldBlock)
   let sp = gcReadSp()
   gcSaveCalleeRegs(regs)
   worldBeginSyscall(world, slot, sp)
@@ -525,14 +555,14 @@ export @nosplit @symbol("bit_rt_gc_syscall_begin") function gcSyscallBegin() {
 // refusal order: `worldAddr` before the token, because the x64 token is a load
 // through `%fs:0` that faults on a thread whose FS base is not installed yet.
 export @nosplit @symbol("bit_rt_gc_syscall_end") function gcSyscallEnd() {
-  if (worldAddr == 0) {
+  if (worldReady == 0) {
     return
   }
   let token = gcThreadToken()
   if (token == 0) {
     return
   }
-  let world = wordAt(worldAddr)
+  let world = ptrOf(worldBlock)
   let slot = worldFindOwner(world, token)
   if (slot < 0) {
     return
