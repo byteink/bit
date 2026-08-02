@@ -167,21 +167,46 @@ fi
 # BUILD_STEPS is always a non-empty literal array, assigned per bucket below —
 # never built by splitting a variable, so "${BUILD_STEPS[@]}" is safe to expand
 # even on this repo's bash (3.2, where an EMPTY array under `set -u` errors).
-PRE1=""
-PRE2=""
-POST1=""
+# THE DIFFERENTIAL SCRIPTS EACH BUCKET RUNS, as two space-separated lists (no
+# path here contains a space). `$1` is the bucket; the caller reads BUCKET_PRE
+# and BUCKET_POST.
+#
+# A FUNCTION rather than the three scalar slots this replaced, because `full`
+# has to name MORE scripts than any single bucket and three slots could not hold
+# them (#2194). It also makes every bucket's set readable WITHOUT selecting it,
+# which is what lets the superset check below exist at all.
+bucket_scripts() {
+  BUCKET_PRE=""
+  BUCKET_POST=""
+  case "$1" in
+    selfhost)
+      BUCKET_PRE="scripts/selfhost-diffcheck.sh scripts/selfhost-fixpoint.sh"
+      # #1857 was a COMPILER bug (`parseFloat` had no hex-float branch) whose
+      # only visible damage was in runtime codegen, and no differential walked
+      # `runtime/`. A compiler/** change must be diffed against it (#1859).
+      BUCKET_POST="scripts/selfhost-diffruntime.sh"
+      ;;
+    runtime)
+      BUCKET_POST="scripts/selfhost-diffruntime.sh"
+      ;;
+    examples)
+      BUCKET_POST="scripts/selfhost-diffexamples.sh"
+      ;;
+    full)
+      # THE UNION OF EVERY BUCKET ABOVE, and it must stay that way — enforced
+      # below, not merely intended.
+      BUCKET_PRE="scripts/selfhost-diffcheck.sh scripts/selfhost-fixpoint.sh"
+      BUCKET_POST="scripts/selfhost-diffruntime.sh scripts/selfhost-diffexamples.sh"
+      ;;
+  esac
+}
+
 case "${BUCKET}" in
   full)
     BUILD_STEPS=(test)
     ;;
   selfhost)
     BUILD_STEPS=(test-imports-bit)
-    PRE1="scripts/selfhost-diffcheck.sh"
-    PRE2="scripts/selfhost-fixpoint.sh"
-    # #1857 was a COMPILER bug (`parseFloat` had no hex-float branch) whose only
-    # visible damage was in runtime codegen, and no differential walked
-    # `runtime/`. A compiler/** change must be diffed against it (#1859).
-    POST1="scripts/selfhost-diffruntime.sh"
     ;;
   runtime)
     # Every name in this bucket was once stale: four of the six named steps did
@@ -190,19 +215,54 @@ case "${BUCKET}" in
     # before a single step runs — a bucket naming a nonexistent step is a
     # bucket that silently tests less than it claims.
     BUILD_STEPS=(test-stress test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
-    POST1="scripts/selfhost-diffruntime.sh"
     ;;
   testcases)
     BUILD_STEPS=(test-golden)
     ;;
   examples)
     BUILD_STEPS=(test-examples)
-    POST1="scripts/selfhost-diffexamples.sh"
     ;;
   stdlib)
     BUILD_STEPS=(test-imports-bit test-stdlib-docs)
     ;;
 esac
+
+# `full` REPLACES a bucket whenever the change spans more than one or touches
+# anything outside the five, and this file sells that as the safe direction:
+# "cannot confidently scope runs the full suite instead", "never a partial skip".
+# It was neither. `full` ran `./make test` and nothing else, while `selfhost`
+# ran three differential scripts `./make test` does not contain — so adding one
+# unrelated file to a compiler/** change made the gate STRICTLY WEAKER, behind a
+# green GATE_RESULT=PASS. Measured on #2084, whose change set was two
+# compiler/** files plus tests/bit/golden.bit (#2194).
+#
+# So the invariant is CHECKED rather than trusted, in the same spirit as the
+# stale-step-name check below: adding a script to any bucket without adding it
+# to `full` fails here, before a single step runs. Existence is checked too —
+# a renamed script is the #1593 class of silent hole.
+bucket_scripts full
+FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
+for b in full selfhost runtime testcases examples stdlib; do
+  bucket_scripts "${b}"
+  for s in ${BUCKET_PRE} ${BUCKET_POST}; do
+    [ -f "${s}" ] || {
+      echo "gate: STALE: bucket '${b}' names script '${s}', which does not exist." >&2
+      exit 2
+    }
+    case "${FULL_SCRIPTS}" in
+      *" ${s} "*) ;;
+      *)
+        echo "gate: BROKEN: bucket '${b}' runs '${s}' but the 'full' fallback does not." >&2
+        echo "gate: 'full' replaces every bucket, so it must run at least what they do (#2194)." >&2
+        exit 2
+        ;;
+    esac
+  done
+done
+
+bucket_scripts "${BUCKET}"
+PRE_SCRIPTS="${BUCKET_PRE}"
+POST_SCRIPTS="${BUCKET_POST}"
 
 # A step name that no longer exists is a STALE GATE, and it must say so. Renaming
 # a harness silently invalidated a whole bucket here twice — #1593 found four dead
@@ -232,16 +292,15 @@ done
 
 echo "gate: bucket: ${BUCKET} (${REASON})"
 echo "gate: plan:"
-if [ -n "${PRE1}" ]; then echo "  bash ${PRE1}"; fi
-if [ -n "${PRE2}" ]; then echo "  bash ${PRE2}"; fi
+for s in ${PRE_SCRIPTS}; do echo "  bash ${s}"; done
 case "${TARGET}" in
   local) echo "  ./make ${BUILD_STEPS[*]}" ;;
   x64) echo "  STEP=\"${BUILD_STEPS[*]}\" scripts/x64gate.sh   (remote, real x86_64 hardware)" ;;
   arm64) echo "  ARM64GATE_STEP=\"${BUILD_STEPS[*]}\" scripts/arm64gate.sh   (remote, native aarch64-linux)" ;;
 esac
-if [ -n "${POST1}" ]; then echo "  bash ${POST1}"; fi
+for s in ${POST_SCRIPTS}; do echo "  bash ${s}"; done
 if [ "${TARGET}" != "local" ]; then
-  if [ -n "${PRE1}" ] || [ -n "${POST1}" ]; then
+  if [ -n "${PRE_SCRIPTS}${POST_SCRIPTS}" ]; then
     echo "gate: note: the compiler/examples diff script(s) above run LOCALLY even under --${TARGET} — they need both compilers already built on this machine, not just the remote build steps."
   fi
 fi
@@ -258,8 +317,7 @@ run_step() {
   return 0
 }
 
-if [ -n "${PRE1}" ]; then run_step bash "${PRE1}"; fi
-if [ -n "${PRE2}" ]; then run_step bash "${PRE2}"; fi
+for s in ${PRE_SCRIPTS}; do run_step bash "${s}"; done
 
 case "${TARGET}" in
   local)
@@ -273,7 +331,7 @@ case "${TARGET}" in
     ;;
 esac
 
-if [ -n "${POST1}" ]; then run_step bash "${POST1}"; fi
+for s in ${POST_SCRIPTS}; do run_step bash "${s}"; done
 
 if [ "${OVERALL_RC}" -eq 0 ]; then
   echo "GATE_RESULT=PASS"
