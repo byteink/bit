@@ -1,0 +1,277 @@
+// A process blocked in `fsRead` must burn no CPU (#2207).
+//
+// THE PROPERTY, in one sentence: a Bit program parked inside a blocking
+// `read(2)` on a pipe accrues essentially no CPU time, because the collector
+// must not spin on a thread that is asleep in a syscall.
+//
+// THE DEFECT THIS REMOVES, which shipped in 0.1.6. `rtFsRead` in
+// `runtime/root/{darwin,linux}/fs.bit` called the raw blocking read with
+// neither a scheduler park nor a `gcSyscallBegin`/`gcSyscallEnd` bracket, so a
+// thread sitting on a pipe never reached a safepoint and the collector spun
+// waiting for it. Measured on `bit lsp --stdio`, which sits on stdin by design:
+// ~77% of a core, continuously, from process start and BEFORE any protocol
+// traffic at all. Two of them were left running under VS Code and had burned
+// 2h04m of CPU between them.
+//
+// WHY THIS ASSERTS CPU TIME AND NOT "A COLLECTION COMPLETES". The first version
+// of this gate asserted the semantic consequence — spawn a blocked reader,
+// allocate hard, and require the program to finish — on the assumption that an
+// unacknowledged safepoint would deadlock. It does not. Mutation-testing that
+// gate against a deliberately unbracketed runtime showed it PASSING while the
+// same runtime demonstrably spun at 79%: the collection does complete, it just
+// burns a core getting there, and repeats. The gate was measuring the wrong
+// thing and would have shipped green over the live bug. CPU time is the
+// property that actually separates the two states.
+//
+// WHY A CPU-TIME DELTA IS NOT THE USUAL TIMING FLAKE. This repo has been burned
+// by wall-clock thresholds on a loaded machine (a host at load 43 made a healthy
+// program look like a deterministic hang), so the distinction matters: `ps -o
+// time=` reports CPU CONSUMED, not elapsed. A blocked process accrues none no
+// matter how loaded the box is, and a spinning one accrues a lot. The observed
+// separation is ~600 centiseconds versus ~3 over an 8-second window, and the
+// threshold sits at 100 — two orders of magnitude of headroom in a quantity that
+// does not move with load.
+//
+// WHY A FIFO AND THEREFORE A SHELL. The read has to be one that genuinely never
+// returns; a regular file always completes and would assert nothing. Bit has no
+// `mkfifo` primitive and `osRunBounded` takes a bare path with no argv, so the
+// plumbing is a `/bin/sh` wrapper — `tests/bit/stress.bit`'s idiom. The wrapper
+// backgrounds the program with the fifo as ITS stdin, then opens the write end,
+// which is what lets both `open`s complete; nothing is ever written, so the read
+// blocks forever by construction.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run tests/bit/fsblock.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// The sampling window, and the ceiling on CPU centiseconds inside it. Blocked
+// measures ~3; spinning measured 600-790 on the same machine.
+const sampleSeconds: int = 8
+const maxCentiseconds: int = 100
+
+function timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "120")) catch _ { 120 }
+  if (s <= 0) {
+    return 120000
+  }
+  return s * 1000
+}
+
+function shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("fsblock: cannot make script executable: ${scriptPath}")
+  }
+  return osRunBounded(scriptPath, ms)
+}
+
+function bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("fsblock: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("fsblock: could not read the working directory (exit ${code})")
+  }
+  let candidate = "${trimWs(readFile(cwdFile)?)}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("fsblock: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// Allocate first so the heap is real and the collector has something to do, then
+// announce and block. This is deliberately the shape `bit lsp --stdio` has: a
+// program that has done its work and is now waiting on a descriptor.
+//
+// NO `${...}` anywhere below: it is a Bit string literal inside a Bit program,
+// so an interpolation here would be evaluated by THIS file, not the fixture.
+function fixtureSource(): string {
+  return "function main() {\n" +
+    "  let live = []i64(0)\n" +
+    "  let i = 0\n" +
+    "  while (i < 40000) {\n" +
+    "    let chunk = []i64(64)\n" +
+    "    chunk[0] = i\n" +
+    "    if (i % 4096 == 0) {\n" +
+    "      live = append(live, chunk[0])\n" +
+    "    }\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "  if (len(live) > 0) { print(\"BLOCKING\\n\") }\n" +
+    "  let s = fsRead(0, 4096)\n" +
+    "  if (len(s) >= 0) { print(\"reader returned\\n\") }\n" +
+    "}\n"
+}
+
+// `prog < fifo &` opens the read end and blocks until a writer appears; the
+// `exec 9> fifo` that follows is that writer. Nothing is ever written, so the
+// fixture's `fsRead` never returns.
+//
+// `ps -o time=` yields `[[HH:]MM:]SS.CC`, so the awk fold accumulates base-60
+// and scales to centiseconds. The sample starts only once the fixture has
+// announced it reached the read, so the allocating loop's own CPU is never
+// counted — otherwise the gate would measure the workload, not the wait.
+function wrapperScript(prog: string, fifo: string, outPath: string, deltaPath: string): string {
+  return "#!/bin/sh\n" +
+    "rm -f '${fifo}'\n" +
+    "mkfifo '${fifo}' || exit 3\n" +
+    "'${prog}' < '${fifo}' > '${outPath}' 2>&1 &\n" +
+    "p=$!\n" +
+    "exec 9> '${fifo}'\n" +
+    "n=0\n" +
+    "while [ $n -lt 200 ]; do\n" +
+    "  grep -q BLOCKING '${outPath}' 2>/dev/null && break\n" +
+    "  sleep 0.1\n" +
+    "  n=$((n+1))\n" +
+    "done\n" +
+    // TWO KERNELS, TWO SOURCES. `ps -o time=` is what macOS offers and its
+    // output is `[[HH:]MM:]SS.CC`, so the awk fold accumulates base-60. The
+    // Linux gate images do not carry a `ps` that accepts it — this gate went red
+    // on aarch64-linux with an empty sample before this branch existed — so
+    // there /proc/<pid>/stat is read instead: utime+stime, fields 14 and 15, in
+    // clock ticks. `sed 's/.*) //'` drops `pid (comm) ` first, because comm can
+    // contain spaces and would shift every field after it; the two wanted fields
+    // are then 12 and 13 of what remains.
+    "CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)\n" +
+    "cpu() {\n" +
+    "  if [ -r \"/proc/$1/stat\" ]; then\n" +
+    "    sed 's/.*) //' \"/proc/$1/stat\" | " +
+    "awk -v t=\"$CLK\" '{printf \"%d\", ($12 + $13) * 100 / t}'\n" +
+    "  else\n" +
+    "    ps -o time= -p \"$1\" | tr -d ' ' | " +
+    "awk -F: '{s=0; for(i=1;i<=NF;i++) s=s*60+$i; printf \"%d\", s*100}'\n" +
+    "  fi\n" +
+    "}\n" +
+    "a=$(cpu $p)\n" +
+    "sleep ${sampleSeconds}\n" +
+    "b=$(cpu $p)\n" +
+    // `wait` absorbs the shell's own "Terminated: 15" job notice, which would
+    // otherwise land on the gate's stderr and read like a failure.
+    "kill $p 2>/dev/null\n" +
+    "wait $p 2>/dev/null\n" +
+    "exec 9>&-\n" +
+    "rm -f '${fifo}'\n" +
+    "if [ -z \"$a\" ] || [ -z \"$b\" ]; then echo MISSING > '${deltaPath}'; exit 0; fi\n" +
+    "echo $((b - a)) > '${deltaPath}'\n" +
+    "exit 0\n"
+}
+
+struct Tally { checks: int, failures: int }
+
+function check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+function runAll(t: Tally, scratch: string, ms: int) {
+  let bit = bitBinary(scratch, ms) catch e { panic("fsblock: ${e.message()}") }
+  let src = "${scratch}/blocked.bit"
+  let prog = "${scratch}/blocked"
+  let outPath = "${scratch}/out.txt"
+  let deltaPath = "${scratch}/delta.txt"
+
+  writeFile(src, fixtureSource()) catch e {
+    panic("fsblock: cannot write the fixture: ${e.message()}")
+  }
+  let build = shell("${scratch}/build.sh",
+    "#!/bin/sh\n'${bit}' build '${src}' -o '${prog}'\n", ms) catch e {
+    panic("fsblock: ${e.message()}")
+  }
+  check(t, build == 0, "the fixture must compile (bit build exited ${build})")
+  if (build != 0 || !exists(prog)) {
+    return
+  }
+
+  let code = shell("${scratch}/run.sh",
+    wrapperScript(prog, "${scratch}/fifo", outPath, deltaPath), ms) catch e {
+    panic("fsblock: ${e.message()}")
+  }
+  check(t, code == 0, "the wrapper must complete (osRunBounded returned ${code})")
+  if (code != 0) {
+    return
+  }
+
+  // ANTI-VACUITY, both halves, before the measurement is trusted at all. Without
+  // the first the fixture may never have reached the read; without the second the
+  // read may have returned, in which case a low CPU number means nothing.
+  let out = readFile(outPath) catch _ { "" }
+  check(t, contains(out, "BLOCKING"), "the fixture never reached the blocking read; output was: ${out}")
+  check(t, !contains(out, "reader returned"), "the read RETURNED, so nothing was measured: ${out}")
+
+  let raw = trimWs(readFile(deltaPath) catch _ { "" })
+  check(t, raw != "MISSING" && raw != "", "the wrapper could not sample the process's CPU time")
+  if (raw == "MISSING" || raw == "") {
+    return
+  }
+  let delta = parseInt(raw) catch _ { -1 }
+  check(t, delta >= 0, "unparsable CPU delta '${raw}'")
+
+  // THE assertion.
+  check(t, delta >= 0 && delta < maxCentiseconds,
+    "a process blocked in fsRead burned ${delta} centiseconds of CPU in ${sampleSeconds}s " +
+    "(limit ${maxCentiseconds}) — the collector is spinning on a thread asleep in a syscall (#2207)")
+  if (delta >= 0 && delta < maxCentiseconds) {
+    println("fsblock: blocked ${sampleSeconds}s on a fifo, used ${delta} centiseconds of CPU")
+  }
+}
+
+function main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-fsblock-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e { panic("fsblock: cannot create ${scratch}: ${e.message()}") }
+  defer teardown(scratch, ms)
+  runAll(t, scratch, ms)
+
+  if (t.checks < 7) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 7\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("fsblock: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("fsblock: PASS — ${t.checks} checks")
+}
+
+function teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+function trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+function isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+function trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
