@@ -63,7 +63,7 @@ FROM scratch
 # website/server, NOT examples/staticserver. The website deliberately does not
 # build out of examples/ — an example is a showcase, not a production dependency.
 # The example holds the same serving logic plus the self-test the examples harness
-# runs; the two are kept in step by hand (see CLAUDE.md), and both are temporary:
+# runs; the two are kept in step by hand (see docs/development.md), and both are temporary:
 # the real static server and the web framework replace them.
 COPY --from=build /server /staticserver
 

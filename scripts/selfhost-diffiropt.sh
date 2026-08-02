@@ -28,7 +28,7 @@
 # the slowest legitimate file rather than near it. It was 20s while the corpus's
 # worst case — tests/imports/cryptomldsa/main.bit — needed 25.20s wall and ~14s
 # CPU on THIS tree and 21.86s on the oracle. That is not a margin; the gate went
-# red with MISMATCH=0 whenever the box was busy, which is the shape CLAUDE.md
+# red with MISMATCH=0 whenever the box was busy, which is the shape docs/development.md
 # warns about ("do not read a TIMED OUT as a hang until you have timed the
 # program standalone"). 300s is ~12x the slowest observed file, in the spirit of
 # the suite's own 900s-against-158s choice from #1637/#1652.

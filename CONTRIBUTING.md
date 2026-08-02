@@ -49,10 +49,34 @@ changes the spec **in the same commit**, not afterwards.
    blocks into sibling `.bit` files in the same directory - not into
    subdirectories, which would make a new module.
 
-`CLAUDE.md` documents the traps that a green build will not catch - silent line
-loss when splitting a file, inlining changes from filename sort order, the
-prelude difference between golden cases and directory projects. Read it before a
-large refactor.
+[`docs/development.md`](docs/development.md) documents the traps that a green
+build will not catch - silent line loss when splitting a file, inlining changes
+from filename sort order, and what the differentials can and cannot prove. Read
+it before a large refactor.
+
+## No GitHub Actions
+
+**This project does not use GitHub Actions, and is not planning to.** There is no
+`.github/workflows/` directory; it was deleted deliberately, not lost. Do not add
+one, and do not "fix" a missing CI badge by wiring a workflow back up.
+
+Verification happens on machines that can actually prove things:
+
+- `scripts/gate.sh` reads your diff and runs only the steps it can affect,
+  falling back to the full `./make test` when the change is cross-cutting.
+- `scripts/arm64gate.sh` and `scripts/x64gate.sh` run the suite on real
+  aarch64-linux and real x86-64 Linux. The x86-64 host is resolved by
+  `scripts/x64host.sh` from a machine-local list, never hardcoded - an emulated
+  x86-64 pass is not a pass (a red-zone scheduler bug was only settled on real
+  hardware).
+- `dist/release.sh <version>` cuts a release: builds all three targets,
+  smoke-tests each UNPACKED artifact by compiling and running a program on
+  hardware that matches it, writes SHA256SUMS, renders notes from conventional
+  commits, and creates a DRAFT release. `--dry-run` verifies without publishing.
+
+Why: Actions minutes are billed to the project owner, and every check worth
+running needs either the real x86-64 box or a container image that already exists
+locally. A hosted runner adds cost and a second, weaker definition of "green".
 
 ## No per-file license headers
 

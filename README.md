@@ -68,6 +68,10 @@ compiler. You need `sh`, `curl` and `tar`; none of it is needed to *use* Bit.
 scripts/gate.sh    # run only what your diff can affect
 ```
 
+[`docs/development.md`](docs/development.md) covers the bootstrap chain, the
+testing conventions, the 800-line file-size rule and the traps a green build does
+not catch. Read it before a large refactor.
+
 ## Layout
 
 | Path        | Purpose                                             |

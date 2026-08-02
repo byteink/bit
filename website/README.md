@@ -1,7 +1,7 @@
 # website/
 
-Static content for **bitlang.org**, per the planned layout in the
-repo root `CLAUDE.md` (`website/   static site → k3s byteink namespace`).
+Static content for **bitlang.org**. See [`docs/development.md`](../docs/development.md)
+for how the site is generated, served and deployed.
 
 ```
 website/

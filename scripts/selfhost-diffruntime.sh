@@ -63,7 +63,7 @@ TIMEOUT=${DIFFRUNTIME_TIMEOUT:-300}
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.
 # Calling a SIGSEGV "timed out" sends the reader after a problem that is not
-# there — the same distinction the test harnesses make (#2070, CLAUDE.md).
+# there — the same distinction the test harnesses make (#2070, docs/development.md).
 sep="  -> "
 whydied() {
   case "$1" in
