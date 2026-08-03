@@ -158,6 +158,19 @@ loudly rather than silently rebuilding over a tampered or corrupted entry.
 Set `BIT_PKG_CACHE` to use a different root (e.g. a CI checkout with a
 pre-warmed, offline cache) instead of `~/.bit/pkg`.
 
+`BIT_VANITY_ORIGIN` is a **testing-only** variable, not for normal use: when
+set, it replaces the `https://<host>` prefix a vanity-name lookup (a
+dependency whose leading path segment isn't a known git host, e.g.
+`bitlang.org/pkg/http`) dials for its `bit-import:` document, so
+`BIT_VANITY_ORIGIN=http://127.0.0.1:8099` turns that lookup into a request to
+`http://127.0.0.1:8099/pkg/http` instead of `https://bitlang.org/pkg/http` -
+it exists so this path can be exercised against a local fixture server with
+no TLS and no network at all. It never weakens TLS verification for a real
+lookup, never changes what `bit.lock` records (still the `<gitURL>` the
+fetched document names), and never applies to the git fetch of that resolved
+URL - only to the vanity document request itself. Unset, resolution is
+byte-identical to not having this variable at all.
+
 ## Importing a dependency
 
 A bare import name (anything that isn't `std/...` or a relative `./`/`../`
