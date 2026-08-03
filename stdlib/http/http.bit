@@ -8,8 +8,14 @@
 // `byteStream` interface (`netStream` for cleartext, `tlsStream` for TLS).
 //
 // Scope for v1: HTTP/1.1 over cleartext or TLS, one request per connection
-// (`Connection: close`), no chunked transfer encoding, no redirects. Headers are
-// carried as a raw block and read with `header()` — case-insensitively, by name.
+// (`Connection: close`), no redirects. Headers are carried as a raw block and
+// read with `header()` — case-insensitively, by name. Request framing follows
+// RFC 9112 §6: a body is read only when `Content-Length` or
+// `Transfer-Encoding: chunked` says so — chunked is decoded, never passed
+// through as raw framing bytes — and a request declaring both, an unparsable
+// Content-Length, or a malformed chunk stream is rejected with 400 rather than
+// guessed at. Responses are always sent with an exact Content-Length; the
+// server itself never emits chunked.
 
 import { listen, dial, udpBind, Listener, Conn } from "std/net"
 import { indexOf, hasPrefix, toLower } from "std/strings"
@@ -70,6 +76,35 @@ function itoa(n: int): string {
     i = i - 1
   }
   return string(b)
+}
+
+// The non-negative integer a hex chunk-size token denotes, or -1 on any
+// non-hex-digit (including the empty string) or a token long enough that the
+// magnitude could approach an i64 overflow. Capped at 15 hex digits (60 bits,
+// ~1.15e18) — comfortably below `int`'s 63-bit magnitude, so the accumulation
+// below can never wrap.
+function hexToInt(s: string): int {
+  if (len(s) == 0 || len(s) > 15) {
+    return -1
+  }
+  let v = 0
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    let d = 0
+    if (c >= '0' && c <= '9') {
+      d = i64(c - '0')
+    } else if (c >= 'a' && c <= 'f') {
+      d = i64(c - 'a') + 10
+    } else if (c >= 'A' && c <= 'F') {
+      d = i64(c - 'A') + 10
+    } else {
+      return -1
+    }
+    v = v * 16 + d
+    i = i + 1
+  }
+  return v
 }
 
 // `s` with leading and trailing spaces and tabs removed.
@@ -234,9 +269,83 @@ function readAllStream(s: byteStream): string! {
 // Reading a message off a connection
 // ---------------------------------------------------------------------------
 
-// Reads a full HTTP message (headers, then a Content-Length body if any) from
-// `s`. Returns the header block and body separately. An empty header block means
-// the peer closed before sending a complete message.
+// Reads from `s`, appending to `buf`, until `buf` contains `delim`. Returns the
+// text before the first `delim` and whatever of `buf` came after it (bytes
+// already buffered past the delimiter — e.g. the start of a chunk body or the
+// next header line). Fails if the peer closes before `delim` ever appears.
+function readUntil(s: byteStream, buf: string, delim: string): (string, string)! {
+  let b = buf
+  while (indexOf(b, delim) < 0) {
+    let chunk = s.readUp(4096)?
+    if (len(chunk) == 0) {
+      fail newError("readMessage: connection closed mid-message")
+    }
+    b = b + chunk
+  }
+  let at = indexOf(b, delim)
+  return b[0:at], b[at + len(delim):len(b)]
+}
+
+// Decodes a `Transfer-Encoding: chunked` body (RFC 9112 §7.1) off `s`,
+// `buffered` being whatever body-position bytes already arrived with the
+// headers. Fails on a non-hex chunk-size, a stream that closes mid-chunk, or a
+// chunk stream that never terminates within `maxChunks` — bounded so the loop
+// is provably finite (Power of 10 rule 2), not to cap a legitimately large body.
+function decodeChunkedBody(s: byteStream, buffered: string): string! {
+  let maxChunks = 1048576
+  let buf = buffered
+  let body = ""
+  let n = 0
+  while (n < maxChunks) {
+    n = n + 1
+    let (sizeLine, rest) = readUntil(s, buf, "\r\n")?
+    buf = rest
+    let hexPart = sizeLine
+    let semi = indexOf(sizeLine, ";")
+    if (semi >= 0) {
+      hexPart = sizeLine[0:semi]
+    }
+    let size = hexToInt(trimSpace(hexPart))
+    if (size < 0) {
+      fail newError("readMessage: bad chunk size")
+    }
+    if (size == 0) {
+      // The final chunk: consume the (usually empty) trailer section, one
+      // field line at a time, up to and including its terminating blank line.
+      let t = 0
+      while (t < maxChunks) {
+        t = t + 1
+        let (line, rest2) = readUntil(s, buf, "\r\n")?
+        buf = rest2
+        if (len(line) == 0) {
+          return body
+        }
+      }
+      fail newError("readMessage: too many trailer fields")
+    }
+    while (len(buf) < size + 2) {
+      let chunk = s.readUp(4096)?
+      if (len(chunk) == 0) {
+        fail newError("readMessage: connection closed mid-chunk")
+      }
+      buf = buf + chunk
+    }
+    body = body + buf[0:size]
+    buf = buf[size + 2:len(buf)]
+  }
+  fail newError("readMessage: too many chunks")
+}
+
+// Reads a full HTTP message off `s`: the request line, headers, and a body
+// framed per RFC 9112 §6 — `Content-Length` bytes read exactly (truncating
+// anything beyond, e.g. a pipelined next request), `Transfer-Encoding: chunked`
+// decoded, and no framing header meaning no body, whatever bytes happened to
+// already be sitting in the read buffer. Fails — the caller answers 400 — on a
+// message declaring both `Content-Length` and `Transfer-Encoding`, an
+// unparsable `Content-Length`, an unsupported transfer coding, or a malformed
+// chunk stream. An empty method/path/headers/body `Request` (no failure) means
+// the peer closed before a complete header block arrived; the caller's
+// subsequent write will simply fail against the already-closed socket.
 function readMessage(s: byteStream): Request! {
   let buf = ""
   while (indexOf(buf, "\r\n\r\n") < 0) {
@@ -249,7 +358,7 @@ function readMessage(s: byteStream): Request! {
   }
   let sep = indexOf(buf, "\r\n\r\n")
   let headBlock = buf[0:sep]
-  let body = buf[sep + 4:len(buf)]
+  let bodyStart = buf[sep + 4:len(buf)]
 
   // Split the request line off the top of the header block.
   let eol = indexOf(headBlock, "\r\n")
@@ -273,14 +382,42 @@ function readMessage(s: byteStream): Request! {
     }
   }
 
-  // Read the rest of a declared body, if it did not all arrive with the headers.
-  let cl = atoi(header(headers, "content-length"))
-  while (cl > 0 && len(body) < cl) {
-    let chunk = s.readUp(4096)?
-    if (len(chunk) == 0) {
-      break
+  // Frame the body per RFC 9112 §6. Content-Length and Transfer-Encoding
+  // together is a request-smuggling-grade ambiguity — reject outright rather
+  // than pick one. Chunked is decoded, never handed through as raw framing.
+  // Neither header present means no body, regardless of what already arrived.
+  let clText = header(headers, "content-length")
+  let teText = toLower(header(headers, "transfer-encoding"))
+  let hasCl = len(clText) > 0
+  let hasTe = len(teText) > 0
+  if (hasCl && hasTe) {
+    fail newError("readMessage: Content-Length and Transfer-Encoding both present")
+  }
+  let body = ""
+  if (hasTe) {
+    if (teText != "chunked") {
+      fail newError("readMessage: unsupported Transfer-Encoding")
     }
-    body = body + chunk
+    body = decodeChunkedBody(s, bodyStart)?
+  } else if (hasCl) {
+    let cl = atoi(clText)
+    if (cl < 0) {
+      fail newError("readMessage: invalid Content-Length")
+    }
+    body = bodyStart
+    if (len(body) > cl) {
+      body = body[0:cl]
+    }
+    while (len(body) < cl) {
+      let chunk = s.readUp(4096)?
+      if (len(chunk) == 0) {
+        break
+      }
+      body = body + chunk
+      if (len(body) > cl) {
+        body = body[0:cl]
+      }
+    }
   }
   return Request{ method: method, path: path, headers: headers, body: body }
 }
