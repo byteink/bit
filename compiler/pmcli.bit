@@ -227,8 +227,13 @@ function parseAddSpec(spec: string): DepSpec! {
 //     not run through it, matching spec §17.7 point 2.
 //  4. rewrite bit.json's `dependencies.<name>` entry through the CST edit
 //     layer, preserving every other byte.
-//  5. regenerate bit.lock (pmlock.writeLock) with the resolved commit and the
-//     fetched dependency's own transitive requirements.
+//  5. walk the fetched dependency's own `requires` — and every dependency
+//     THEY require, recursively — fetching and locking each one that has no
+//     top-level bit.lock entry yet (`resolveTransitiveDeps`, #2251); a name
+//     required at more than one version picks the max via `resolveMVS`.
+//  6. regenerate bit.lock (pmlock.writeLock) with the resolved commit, the
+//     fetched dependency's own transitive requirements, and every
+//     transitive dependency step 5 resolved.
 //
 // `url` and `fetchUrl` are plain parameters, not derived here — the same
 // layering pmfetch.bit itself uses (its `DepSpec` never carries a url
@@ -263,7 +268,8 @@ export function addDependency(
   // claiming a dependency bit.lock never recorded, a silent mismatch with no
   // rollback.
   let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, "")
-  writeLock(lockPath, updated)?
+  let resolved = resolveTransitiveDeps(cacheRoot, gitBin, updated, flattenRequires(updated), timeoutMs)?
+  writeLock(lockPath, resolved)?
 
   let specRef = "${host}/${owner}/${repo}@${finalRef}"
   rewriteManifest(projectDir, name, specRef)?
@@ -321,7 +327,8 @@ export function addVanityDependency(
   // the next run, so a failure right after this write never leaves bit.json
   // claiming a dependency bit.lock does not record.
   let updated = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, entry.vanity)
-  writeLock(lockPath, updated)?
+  let resolved = resolveTransitiveDeps(cacheRoot, gitBin, updated, flattenRequires(updated), timeoutMs)?
+  writeLock(lockPath, resolved)?
 
   let specRef = "${vanityName}@${finalRef}"
   rewriteManifest(projectDir, name, specRef)?
@@ -351,6 +358,287 @@ function resolveVanityDependency(
   let depRequires = manifestRequires(depManifest)
   checkVersionConflict(existing, name, ref, depRequires)?
   return LockEntry{ name: name, url: gitUrl, commit: sha, requires: depRequires, vanity: vanityName }
+}
+
+// ---- transitive dependency resolution (#2251) --------------------------
+//
+// SPEC §17.7 step 1: "the resolver walks the transitive requirement graph —
+// every dependency's own bit.json dependencies, recursively." Step 2: "for
+// each distinct module named anywhere in that graph, the resolver ...
+// selects the maximum" of every stated minimum version. `pmresolve.bit`'s
+// `resolveMVS` already implements steps 2/3 over a `ReqGraph` handed to it
+// as data — its own header says assembling that data from `bit.lock`/git is
+// a separate job. This is that job: walk every `requires` edge a locked
+// dependency's own `bit.json` names, fetching each newly discovered name
+// (through the identical direct-vs-vanity classification and fetch
+// machinery a root `bit add` uses — a transitive dependency's own
+// dependency can itself be a vanity name, #2068) and giving each surviving
+// module its own top-level `bit.lock` entry.
+//
+// Two disjoint kinds of requirement, per SPEC §17.7 point 2:
+//   - version-tagged (an exact `vMAJOR.MINOR.PATCH` ref): every DISTINCT
+//     (name, version) pair reachable is fetched once to learn ITS OWN
+//     requirements, feeding `resolveMVS`'s `ReqGraph`; the winning
+//     (max-selected) version per name is then the one actually locked,
+//     reusing the fetch already done during discovery rather than fetching
+//     a second time.
+//   - non-version (a branch or bare commit SHA): SPEC's own carve-out — "a
+//     module reachable only through such a ref resolves to exactly that
+//     ref" — there is no ordering to arbitrate, so the first (and, since a
+//     name is fetched at most once here, only) ref discovered for a name is
+//     locked as-is.
+// A version-tagged resolution wins over a non-version one for the same name
+// if a walk somehow discovers both (an exact pinned version is a strictly
+// stronger constraint than an unordered branch/sha) — this resolver's one
+// tie-break rule, applied only at the very end so discovery never depends on
+// which requirement happens to be walked first.
+//
+// Known limitation, deliberately out of scope here: a name that ALREADY has
+// a top-level `bit.lock` entry (a direct dependency, or one this resolver
+// already locked on a prior run) is never reconsidered even if a freshly
+// discovered requirement would want a higher version — this walk only fills
+// in names bit.lock does not yet have an entry for. Re-arbitrating an
+// already-locked name against a newly discovered transitive requirement (the
+// same way `checkVersionConflict` guards a root `bit add`) is #2250's own
+// scope, which also covers `checkVersionConflict` itself never firing today.
+
+// One requirement discovered while walking a dependency's own `requires` —
+// `spec` is that dependency's stated value verbatim (`LockRequire.ref`,
+// pmlock.bit: a full `gitHost/owner/repo@ref` or vanity `path@ref` string,
+// not a bare ref). `fromRoot` marks a requirement that came directly from
+// `resolveTransitiveDeps`'s own `seed` (a "true" root of this resolver's own
+// graph) rather than from a deeper module's own requirements — only a root
+// requirement is fed to `resolveMVS` directly; every deeper edge is
+// re-derived by `resolveMVS`'s own internal walk over the `modules` this
+// file assembles, the same layering `checkVersionConflict` already uses.
+struct PendingReq { name: string, spec: string, fromRoot: bool }
+
+// The `Version` a FULL dependency spec string's trailing `@ref` names, or
+// `(_, false)` if that ref is not an exact `vMAJOR.MINOR.PATCH` tag. Unlike
+// `parseVersionTag` (above), which expects an already-bare ref, this takes
+// the full spec a `bit.json` `dependencies` value or a `bit.lock` `requires`
+// entry actually stores (`host/owner/repo@ref` or `vanityPath@ref`) and
+// extracts the ref itself first.
+function pendingVersionTag(spec: string): (Version, bool) {
+  let zero = Version{ major: 0, minor: 0, patch: 0 }
+  let at = lastIndexByte(spec, '@')
+  if (at < 0) {
+    return zero, false
+  }
+  return parseVersionTag(spec[at + 1:len(spec)])
+}
+
+// Whether `entries` already carries a top-level entry named `name` — the
+// gate that stops this resolver from re-fetching (or re-considering) a
+// dependency some earlier `bit add`/`bit up` already locked.
+function lockHasEntry(entries: []LockEntry, name: string): bool {
+  let i = 0
+  while (i < len(entries)) {
+    if (entries[i].name == name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// `queue` with one `PendingReq{fromRoot: false}` appended per entry of `rs`
+// (a freshly-fetched dependency's own `requires`) — every edge discovered
+// below the top level of this resolver's own walk.
+function enqueueRequires(queue: []PendingReq, rs: []LockRequire): []PendingReq {
+  let out = queue
+  let i = 0
+  while (i < len(rs)) {
+    out = append(out, PendingReq{ name: rs[i].name, spec: rs[i].ref, fromRoot: false })
+    i = i + 1
+  }
+  return out
+}
+
+// `rs` (raw `[]LockRequire`, full-spec-string refs) narrowed to its
+// version-shaped subset, as pmresolve.bit's `[]Requirement` — the data a
+// freshly-fetched module's own requirements become for `ReqGraph.modules`.
+// Deliberately NOT the same as this file's existing `pmToRequirements`
+// (used only by `checkVersionConflict`, and only ever fed requirements from
+// a manifest read the same way): that helper calls `parseVersionTag`
+// directly on a full spec string instead of extracting its `@ref` tail
+// first, so it never actually matches anything — `pendingVersionTag` (above)
+// is the corrected extraction this resolver needs. #2250 is that pre-existing
+// bug's own ticket: it also explains why `checkVersionConflict` never fires
+// for the diamond case in that ticket's repro, and why this resolver's own
+// "already-locked names are never reconsidered" limitation (above) matters —
+// #2250 is the follow-up that covers re-arbitrating an already-locked name.
+function versionRequirementsOf(rs: []LockRequire): []Requirement {
+  let out = []Requirement(0)
+  let i = 0
+  while (i < len(rs)) {
+    let (v, ok) = pendingVersionTag(rs[i].ref)
+    if (ok) {
+      out = append(out, Requirement{ name: rs[i].name, min: v })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Resolves one transitive requirement's full spec (a dependency's own
+// `bit.json` value, e.g. `"local.invalid/dev/textutil@v0.1.0"`) to a fetched
+// `LockEntry`, routing it through the identical direct-vs-vanity
+// classification (`parseSpec`/`parseAddSpec`) and fetch machinery
+// (`fetchSha`/`resolveVanityUrl`) a root `bit add` uses — a transitive
+// dependency's own dependency can itself be a vanity name (#2068), so this
+// must never assume the direct shape. `parseAddSpec` (not the stricter
+// `parseSpec`) is used so a hand-authored manifest that omits `@ref` on one
+// of ITS OWN dependencies resolves the same way an omitted `@ref` does for a
+// root `bit add`, rather than failing the whole resolution.
+function resolveTransitiveSpec(cacheRoot: string, gitBin: string, name: string, spec: string, timeoutMs: int): LockEntry! {
+  let d = parseAddSpec(spec)?
+  if (d.vanity) {
+    let gitUrl = resolveVanityUrl(d.vanityName, vanityTimeoutMs)?
+    let remote = parseGitRemoteUrl(gitUrl)?
+    let sha = resolveDependencyRef(gitBin, gitUrl, d.ref, timeoutMs)?
+    let fetched = fetchSha(gitBin, cacheRoot, remote.host, remote.owner, remote.repo, gitUrl, sha, timeoutMs)?
+    let depManifest = readManifest(fetched.dir)?
+    return LockEntry{ name: name, url: gitUrl, commit: sha, requires: manifestRequires(depManifest), vanity: d.vanityName }
+  }
+  let url = defaultDepUrl(d.host, d.owner, d.repo)
+  let sha = resolveDependencyRef(gitBin, url, d.ref, timeoutMs)?
+  let fetched = fetchSha(gitBin, cacheRoot, d.host, d.owner, d.repo, url, sha, timeoutMs)?
+  let depManifest = readManifest(fetched.dir)?
+  return LockEntry{ name: name, url: url, commit: sha, requires: manifestRequires(depManifest), vanity: "" }
+}
+
+// Fetches every dependency reachable from `seed` (typically every
+// already-locked entry's own `requires`, flattened — `flattenRequires`,
+// below) that does not already have a top-level `bit.lock` entry, giving
+// each its own entry — the loop this file's own module comment above says
+// `pmresolve.bit` is missing. Discovery never mutates `entries` — it only
+// fetches and records candidates — so `entries` is exactly as it started
+// throughout the walk regardless of queue order; both classes of winner
+// (version-tagged and non-version) are written into `entries` only in the
+// two materialization passes at the end.
+//
+// Bounded worklist: `queue` only ever grows from a freshly-fetched
+// dependency's own `requires` list (`enqueueRequires`), and a `(name,
+// version)` or bare `name` pair already visited is never re-enqueued for a
+// fetch (`visitedVersions`/`visitedNonVersion`) — so the total number of
+// fetches this performs is bounded by the number of distinct requirement
+// edges reachable across every `bit.json` this walk actually reads, the same
+// bound `resolveMVS`'s own worklist comment gives for its walk, and a cycle
+// or self-dependency cannot loop it forever for the identical reason.
+export function resolveTransitiveDeps(
+  cacheRoot: string, gitBin: string, entries: []LockEntry, seed: []LockRequire, timeoutMs: int,
+): []LockEntry! {
+  let queue = []PendingReq(0)
+  let i = 0
+  while (i < len(seed)) {
+    queue = append(queue, PendingReq{ name: seed[i].name, spec: seed[i].ref, fromRoot: true })
+    i = i + 1
+  }
+
+  let rootRequires = []Requirement(0)
+  let modules = []ModuleReqs(0)
+  let fetchedByVersion = map<string, LockEntry>{}
+  let visitedVersions = map<string, bool>{}
+  let nonVersionFetched = map<string, LockEntry>{}
+  let visitedNonVersion = map<string, bool>{}
+  let nonVersionNames = []string(0)
+
+  let qi = 0
+  while (qi < len(queue)) {
+    let req = queue[qi]
+    qi = qi + 1
+    if (lockHasEntry(entries, req.name)) {
+      continue
+    }
+
+    let (ver, isVersion) = pendingVersionTag(req.spec)
+    if (!isVersion) {
+      let (_, seenNV) = visitedNonVersion[req.name]
+      if (seenNV) {
+        continue
+      }
+      visitedNonVersion[req.name] = true
+      let entry = resolveTransitiveSpec(cacheRoot, gitBin, req.name, req.spec, timeoutMs)?
+      nonVersionFetched[req.name] = entry
+      nonVersionNames = append(nonVersionNames, req.name)
+      queue = enqueueRequires(queue, entry.requires)
+      continue
+    }
+
+    if (req.fromRoot) {
+      rootRequires = append(rootRequires, Requirement{ name: req.name, min: ver })
+    }
+
+    let key = "${req.name}@${ver.major}.${ver.minor}.${ver.patch}"
+    let (_, seenV) = visitedVersions[key]
+    if (seenV) {
+      continue
+    }
+    visitedVersions[key] = true
+    let entry = resolveTransitiveSpec(cacheRoot, gitBin, req.name, req.spec, timeoutMs)?
+    fetchedByVersion[key] = entry
+    modules = append(modules, ModuleReqs{ name: req.name, version: ver, requires: versionRequirementsOf(entry.requires) })
+    queue = enqueueRequires(queue, entry.requires)
+  }
+
+  let resolved = resolveMVS(ReqGraph{ rootRequires: rootRequires, modules: modules })
+
+  // Version-tagged winners first — the tie-break rule this resolver's own
+  // module comment names.
+  let vi = 0
+  while (vi < len(modules)) {
+    let name = modules[vi].name
+    vi = vi + 1
+    if (lockHasEntry(entries, name)) {
+      continue
+    }
+    let (winner, found) = resolved[name]
+    if (!found) {
+      continue
+    }
+    let winKey = "${name}@${winner.major}.${winner.minor}.${winner.patch}"
+    let (entry, hasEntry) = fetchedByVersion[winKey]
+    if (!hasEntry) {
+      fail newError("pmcli: internal error resolving transitive dependency ${name}: MVS chose v${winner.major}.${winner.minor}.${winner.patch}, which this resolver never fetched")
+    }
+    entries = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, entry.vanity)
+  }
+
+  let ni = 0
+  while (ni < len(nonVersionNames)) {
+    let name = nonVersionNames[ni]
+    ni = ni + 1
+    if (lockHasEntry(entries, name)) {
+      continue
+    }
+    let (entry, hasEntry) = nonVersionFetched[name]
+    if (!hasEntry) {
+      continue
+    }
+    entries = upsertLockEntry(entries, name, entry.url, entry.commit, entry.requires, entry.vanity)
+  }
+
+  return entries
+}
+
+// Every entry's own `requires`, flattened into one `[]LockRequire` — the
+// seed `resolveTransitiveDeps` starts its walk from, covering not just a
+// dependency just added but every requirement `bit.lock` already records (a
+// lock file written before this walk existed, or an entry whose own
+// requirements have grown since the last resolution).
+function flattenRequires(entries: []LockEntry): []LockRequire {
+  let out = []LockRequire(0)
+  let i = 0
+  while (i < len(entries)) {
+    let j = 0
+    while (j < len(entries[i].requires)) {
+      out = append(out, entries[i].requires[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return out
 }
 
 // ---- reading a fetched dependency's own requirements -------------------
@@ -632,6 +920,10 @@ function existingUrlFor(entries: []LockEntry, name: string, fallbackUrl: string)
 // same in-memory `entries` via `upsertLockEntry` (the same accumulate-in-
 // memory-then-write-once shape `addDependency` uses for its own single entry)
 // rather than each dependency doing its own read-resolve-write round trip.
+// After every direct dependency is refreshed, `resolveTransitiveDeps`
+// (#2251) walks and fetches whatever `requires` edges are now reachable but
+// still missing a top-level entry, so `bit up` backfills a lock written
+// before that walk existed, not just newly-added dependencies.
 export function upDependencies(
   projectDir: string, cacheRoot: string, gitBin: string, only: string, timeoutMs: int,
 ): []UpResult! {
@@ -669,6 +961,14 @@ export function upDependencies(
     }
     i = i + 1
   }
+
+  // Backfill every transitive dependency reachable from what's now locked
+  // (#2251) — not just the ones the loop above touched: a `bit.lock` written
+  // before this walk existed (or one whose refreshed entries grew new
+  // `requires`) is caught the same way, since the seed is every CURRENT
+  // entry's own requirements, not only the ones `bit up` refreshed this run.
+  entries = resolveTransitiveDeps(cacheRoot, gitBin, entries, flattenRequires(entries), timeoutMs)?
+
   writeLock(lockPath, entries)?
   return out
 }

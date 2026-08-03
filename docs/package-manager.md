@@ -65,6 +65,16 @@ are checked with Minimal Version Selection before anything is written: adding
 a version that undercuts what another already-locked dependency transitively
 requires fails loudly rather than locking an inconsistent graph.
 
+**Transitive dependencies are resolved too.** Every dependency named in the
+graph reachable from what was just added or refreshed - not only the direct
+ones `bit.json` names - is fetched and given its own top-level `bit.lock`
+entry, the same direct-vs-vanity classification and fetch path a root
+dependency uses. When two different requirers name different versions of the
+same transitive dependency, Minimal Version Selection picks the maximum. A
+name `bit.lock` already has a top-level entry for is not reconsidered, even
+by `bit up`, if a newly discovered requirement would want a higher version -
+only names with no entry yet are filled in.
+
 ## `bit up` / `bit update`
 
 ```
