@@ -172,8 +172,8 @@ yields `[s]`. The inverse of `join`.
 ### `parseInt(s: string): int!`
 
 The signed decimal integer `s` denotes. Fails on an empty string, a bare sign, a
-non-digit, or a value outside the `int` range - it never silently wraps. (The
-most negative `int` is rejected; the parser accumulates a positive magnitude.)
+non-digit, or a value outside the `int` range - it never silently wraps. Accepts
+the most negative `int`, `-9223372036854775808`.
 
 ```bit
 import { join, repeat, toUpper, split, trimSpace, parseInt } from "std/strings"
