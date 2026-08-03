@@ -160,6 +160,23 @@ JSON-escaped per RFC 8259 §7 (`"`, `\`, and control bytes < 0x20 - `\n`, `\t`,
 `\r`, `\b`, `\f` as their short escapes, anything else as `\u00XX`). Bytes
 `>= 0x20` pass through as-is, since JSON strings are UTF-8.
 
+A `JsonFloat` is formatted so that `jsonParse(jsonEncode(j))` always
+reproduces `j`, or - for the one shape JSON cannot represent - still
+produces text `jsonParse` accepts:
+
+- A non-finite value (`inf`, `-inf`, `nan`) encodes as `null`, matching
+  `JSON.stringify`/serde_json. JSON has no non-finite literal, and the
+  runtime's own `inf`/`-inf`/`nan` spelling is not valid JSON.
+- An integral value (`3.0`) keeps its `.0` (`"3.0"`, not `"3"`), and `-0.0`
+  keeps its sign (`"-0.0"`, not `"-0"`) - both are what distinguish a
+  `JsonFloat` from a `JsonInt` on the way back in, since a literal with no
+  `.`/`e`/`E` decodes to `JsonInt` (see Parsing, below).
+- A value outside roughly `1e-6 .. 1e21` in magnitude is written in
+  exponent form (`5e-324`, `1.7976931348623157e+308`) rather than a
+  positional expansion, matching where JS `Number#toString` and Go's
+  `strconv` switch. The digits are unchanged either way - this only
+  reshapes how they're written.
+
 ### `jsonEncodePretty(j: Json, indent: string): string`
 
 Pretty form: each object/array element on its own line, `indent` repeated
