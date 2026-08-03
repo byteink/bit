@@ -112,8 +112,8 @@ One token: `kind`, and its `[start, end)` byte span in the source.
 
 ### `jsonMaxDepth`
 
-The combined `{`/`[` nesting limit: 64 levels. Opening a 65th level yields an
-`Invalid` token instead of tracking it.
+The combined `{`/`[` nesting limit: 1000 levels. Opening a 1001st level
+yields an `Invalid` token instead of tracking it.
 
 ### `lex(source: string): []Token`
 
@@ -184,7 +184,7 @@ A recursive-descent parser over the lexer's token stream, building a `Json`
 tree. Strict RFC 8259 only - no comments, no trailing commas; JSONC is a
 separate layer on top. Malformed input (bad token sequence, an invalid
 escape, a number that doesn't match the grammar, or exceeding the lexer's
-64-level nesting cap) is a parse error via the fallible return, never a
+1000-level nesting cap) is a parse error via the fallible return, never a
 panic. An integral literal that fits `i64` decodes to `JsonInt`; anything
 wider, or with a `.`/`e`/`E`, decodes to `JsonFloat` via the runtime's own
 `parseFloat`. A duplicate object key keeps every entry - `jsonGet`'s
