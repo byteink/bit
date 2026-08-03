@@ -2597,6 +2597,108 @@ example:
 range/wildcard spelling are rejected at parse time. A dependency names one
 exact ref; there is no version range for the resolver to pick from.
 
+**Vanity import resolution.** The leading path of a dependency value
+(everything before the final `@ref`) is either a **direct** git host spec or
+a **vanity** name. The decision is made on the path's first segment — the
+host — and never on how many segments the path has: `bitlang.org/pkg/http`
+is three slash-separated segments, exactly the shape of `gitHost/owner/repo`,
+so a segment-count rule would misread it as a direct spec and derive
+`https://bitlang.org/pkg/http.git`, never performing a vanity lookup.
+
+The first segment is checked against a fixed list of known git hosts:
+
+```
+github.com, gitlab.com, codeberg.org, bitbucket.org, git.sr.ht
+```
+
+If it is one of these, resolution is **direct** and behaves exactly as
+specified above: the path must be `host/owner/repo` (three segments) and the
+fetch URL is `https://<host>/<owner>/<repo>.git`. Any other first segment
+makes the whole path — not just its first segment — a **vanity** name that
+must be looked up. First-party Bit packages are vanity names of the form
+`bitlang.org/pkg/<name>`; the `/pkg/` prefix is required because the
+generated site already serves `docs`, `examples`, `get-started.html`, and
+`install.sh` at the apex, and an unprefixed name would collide with a real
+page. For example:
+
+```json
+{
+  "dependencies": {
+    "http": "bitlang.org/pkg/http@v2.0.1"
+  }
+}
+```
+
+**Vanity document format.** Resolving a vanity name `<name>` is a single
+HTTPS GET of `https://<name>` (Transport, below, bounds the request). The
+response body, served as `text/plain`, is exactly one line:
+
+```
+bit-import: <name> git <gitURL>
+```
+
+- The literal tokens `bit-import:` and `git`, and `<name>` and `<gitURL>`,
+  are separated by exactly one space each.
+- `<name>` MUST be byte-for-byte identical to the vanity name that was
+  requested; if it is not, resolution fails. This is the whole trust
+  boundary — it is what stops `bitlang.org/pkg/http`'s document from also
+  claiming `bitlang.org/pkg/json`, and what stops any other host from
+  claiming a name it was never asked to resolve.
+- `<gitURL>` is an `https://` git remote URL, used exactly as a direct
+  spec's derived URL would be — fetched with the same git client, no
+  special-casing.
+- Any content after `<gitURL>` on the line is one or more additional
+  space-separated fields, ignored by this version of the resolver. This is
+  the format's sole extension point: a future field is appended after the
+  existing ones, and an older compiler still parses the line correctly by
+  reading the first three tokens and discarding the rest.
+- A document that does not start with the literal `bit-import:` token, is
+  missing the literal `git` token, or has no `<gitURL>`, is a resolution
+  failure.
+
+**No subpaths in v1.** A vanity name is matched exactly; there is no prefix
+rule. `bitlang.org/pkg/http` and `bitlang.org/pkg/http/client` are two
+independent names — each must serve its own `bit-import:` document at its
+own URL. Resolution never walks up parent path segments looking for a
+document that claims to own a longer name.
+
+**Vanity entries in `bit.lock`.** A dependency resolved through this path
+records one field beyond `url`/`commit`/`requires` (`bit.lock`, below):
+`vanity`, the exact vanity path as written in `bit.json` (without `@ref`).
+`url` still records the resolved `<gitURL>` read from the `bit-import:`
+document, so the entry is fully self-describing:
+
+```json
+{
+  "http": {
+    "vanity": "bitlang.org/pkg/http",
+    "url": "https://github.com/byteink/http.git",
+    "commit": "9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c",
+    "requires": {}
+  }
+}
+```
+
+A direct git-host dependency's entry omits `vanity` entirely. If `bit up`
+(or any later resolution of the same vanity name) fetches a `bit-import:`
+document whose `<gitURL>` differs from the `url` already recorded in
+`bit.lock` for that name, resolution is a **hard error** naming both URLs
+(the one already recorded and the newly resolved one) — never a silent
+switch to the new URL. Moving a vanity name to a different git remote
+requires removing the dependency and re-adding it.
+
+**Transport.** Vanity resolution is HTTPS only:
+
+- Plaintext `http://` is never fetched, whether as the initial request or as
+  a redirect target — a redirect whose `Location` scheme is not `https` is a
+  hard failure.
+- The response body is capped at 4096 bytes; a document exceeding the cap
+  before the single line completes is a hard failure, not a truncation.
+- The request carries a 5000 ms wall-clock deadline, separate from the
+  30000 ms budget used for the subsequent git fetch of the resolved
+  `<gitURL>` — a static single-line GET has no reason to share a git
+  clone's budget.
+
 **Resolution: Minimal Version Selection.** Bit resolves the dependency graph
 with Go-style MVS, not SAT-based range solving:
 
