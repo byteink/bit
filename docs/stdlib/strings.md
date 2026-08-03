@@ -99,6 +99,12 @@ passed as a function value.
 Negative, zero, or positive as `a` sorts before, with, or after `b`. Byte order,
 so it is code-point order for valid UTF-8.
 
+### `equalFold(a: string, b: string): bool`
+
+Whether `a` and `b` are equal under ASCII case folding (`A`-`Z` treated as
+`a`-`z`). Bytes outside ASCII compare exactly, unfolded — this is not full
+Unicode case folding, so `equalFold("ÉCOLE", "école")` is `false`.
+
 ### `hasPrefix(s: string, prefix: string): bool`
 
 Whether `s` begins with `prefix`. An empty prefix is always present.
