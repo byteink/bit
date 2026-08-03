@@ -185,10 +185,11 @@ tree. Strict RFC 8259 only - no comments, no trailing commas; JSONC is a
 separate layer on top. Malformed input (bad token sequence, an invalid
 escape, a number that doesn't match the grammar, or exceeding the lexer's
 1000-level nesting cap) is a parse error via the fallible return, never a
-panic. An integral literal that fits `i64` decodes to `JsonInt`; anything
-wider, or with a `.`/`e`/`E`, decodes to `JsonFloat` via the runtime's own
-`parseFloat`. A duplicate object key keeps every entry - `jsonGet`'s
-last-key-wins policy is what resolves it.
+panic. An integral literal that fits `i64` - including `i64` MIN,
+`-9223372036854775808` - decodes to `JsonInt`; anything wider, or with a
+`.`/`e`/`E`, decodes to `JsonFloat` via the runtime's own `parseFloat`. A
+duplicate object key keeps every entry - `jsonGet`'s last-key-wins policy is
+what resolves it.
 
 ### `jsonParse(source: string): Json!`
 
