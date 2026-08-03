@@ -24,11 +24,33 @@
 // it against a watcher subshell that SIGKILLs that exact child pid if the
 // deadline passes first, and reports which one happened. See `runGit`'s own
 // comment for the two races that shape its exact form.
+//
+// **Vanity name resolution (#2068, spec §17.7).** A dependency whose leading
+// path segment is not a known git host is a vanity name, resolved by one
+// HTTPS GET of `https://<name>` and a `bit-import:` line in the response
+// (`resolveVanityUrl`, below). `std/http`'s client has no request-level
+// deadline of its own (nothing in `std/http` or `std/net` does), so the
+// 5000 ms deadline spec §17.7 requires is enforced by racing the fetch
+// against a `sleep`-based timer through `spawn` + `select` — see
+// `resolveVanityUrl`'s own comment for the one real limitation that shape
+// has: the LOSING green thread (the fetch, if the timer wins) keeps running
+// until its own work finishes; the deadline bounds how long the caller
+// blocks, not how long that abandoned thread lives. Separately, `std/http`'s
+// client buffers a response's entire body before returning it — it has no
+// streaming/early-abort primitive — so the 4096-byte cap this file enforces
+// (`checkVanityCap`) bounds what gets *parsed*, not what a hostile or broken
+// server can make the process buffer in memory before that check runs.
+// `std/http` also never follows a redirect at all, so spec §17.7's "a
+// redirect to a non-https scheme is a hard failure" is satisfied for free:
+// any non-200 response (including a 3xx that would otherwise have
+// redirected) is treated as a resolution failure.
 import { open, exists, isDir, mkdir, remove } from "std/fs"
-import { split } from "std/strings"
+import { split, hasPrefix } from "std/strings"
 import { join as pmJoin } from "std/path"
 import { env } from "std/os"
 import { uuidV4, format as uuidFormat } from "std/uuid"
+import { get } from "std/http"
+import { sleep, Millisecond } from "std/time"
 
 // Wall-clock ceiling a caller may pass to any function below. 30s: resolving
 // a ref or shallow-fetching one small module over a healthy connection is a
@@ -47,8 +69,25 @@ export const maxManifestBytes: int = 1048576
 
 export const defaultGitBin: string = "git"
 
-// One resolved dependency spec, SPEC §17.7: `gitHost/owner/repo@ref`.
-export struct DepSpec { host: string, owner: string, repo: string, ref: string }
+// One resolved dependency spec, SPEC §17.7. A DIRECT spec (`vanity` false)
+// is `gitHost/owner/repo@ref`, with `host`/`owner`/`repo` set and
+// `vanityName` "". A VANITY spec (`vanity` true) is any other leading path
+// segment: `host`/`owner`/`repo` are "" (there is nothing to derive a URL
+// from until the name is resolved over HTTPS) and `vanityName` holds the
+// full path exactly as written, e.g. `"bitlang.org/pkg/http"`. Which of the
+// two a spec is depends only on the FIRST path segment against
+// `isKnownGitHost`'s fixed list, never on how many segments the path has.
+export struct DepSpec { vanity: bool, host: string, owner: string, repo: string, vanityName: string, ref: string }
+
+// The fixed git-host list SPEC §17.7 names. Checked against a spec's FIRST
+// path segment only — this is the entire direct-vs-vanity decision
+// (`parseSpec`, below); segment count never enters into it, because
+// `bitlang.org/pkg/http` is exactly as many segments as `gitHost/owner/repo`
+// and must still resolve as vanity.
+function isKnownGitHost(host: string): bool {
+  return host == "github.com" || host == "gitlab.com" || host == "codeberg.org" ||
+    host == "bitbucket.org" || host == "git.sr.ht"
+}
 
 export struct FetchResult { dir: string, sha: string, cacheHit: bool }
 
@@ -58,10 +97,17 @@ struct GitRun { exitCode: int, timedOut: bool, output: string }
 
 // --- dependency spec parsing ------------------------------------------
 
-// Splits `gitHost/owner/repo@ref` into its parts. Rejects a malformed spec
-// (missing `@`, wrong segment count, an empty ref) or a host/owner/repo that
-// is not a safe filesystem path component — both are validated here because
-// every valid parse becomes a cache directory name later.
+// Splits a dependency spec into its parts. Rejects a malformed spec (missing
+// `@`, an empty ref) or a path segment that is not a safe filesystem path
+// component — every segment either becomes a cache directory name directly
+// (a direct spec's host/owner/repo) or is validated as one anyway, since a
+// vanity name resolves to a git URL that is used exactly as a direct spec's
+// derived URL would be (`parseGitRemoteUrl`, below).
+//
+// The first path segment decides direct vs. vanity (`isKnownGitHost`); a
+// known host still requires exactly 3 segments (`host/owner/repo`, unchanged
+// from before this spec grew vanity resolution) — anything else is a vanity
+// name and may have any number of segments.
 export function parseSpec(spec: string): DepSpec! {
   let at = lastIndexByte(spec, '@')
   if (at < 0) {
@@ -71,14 +117,28 @@ export function parseSpec(spec: string): DepSpec! {
   if (len(ref) == 0) {
     fail newError("pmfetch: dependency spec has an empty ref: ${spec}")
   }
-  let parts = split(spec[0:at], "/")
-  if (len(parts) != 3) {
-    fail newError("pmfetch: dependency spec must be gitHost/owner/repo@ref: ${spec}")
+  let path = spec[0:at]
+  let parts = split(path, "/")
+  if (len(parts) == 0 || len(parts[0]) == 0) {
+    fail newError("pmfetch: dependency spec has no host: ${spec}")
   }
   validateSegment(parts[0])?
-  validateSegment(parts[1])?
-  validateSegment(parts[2])?
-  return DepSpec{ host: parts[0], owner: parts[1], repo: parts[2], ref: ref }
+
+  if (isKnownGitHost(parts[0])) {
+    if (len(parts) != 3) {
+      fail newError("pmfetch: dependency spec must be gitHost/owner/repo@ref: ${spec}")
+    }
+    validateSegment(parts[1])?
+    validateSegment(parts[2])?
+    return DepSpec{ vanity: false, host: parts[0], owner: parts[1], repo: parts[2], vanityName: "", ref: ref }
+  }
+
+  let i = 1
+  while (i < len(parts)) {
+    validateSegment(parts[i])?
+    i = i + 1
+  }
+  return DepSpec{ vanity: true, host: "", owner: "", repo: "", vanityName: path, ref: ref }
 }
 
 function lastIndexByte(s: string, c: u8): int {
@@ -320,13 +380,198 @@ export function defaultDepUrl(host: string, owner: string, repo: string): string
 
 // Parse + resolve + fetch in one call, against the default cache root and
 // system git. The high-level entry a future CLI layer (`bit add`/`up`, not
-// part of this file) would call for a fresh, not-yet-locked dependency.
+// part of this file) would call for a fresh, not-yet-locked dependency. A
+// vanity spec is refused here rather than silently mishandled: resolving one
+// safely needs a comparison against whatever `bit.lock` already records for
+// the name (`checkResolvedUrlMatches`, below), which this cache-only entry
+// point has no access to — `pmcli.bit`'s `addVanityDependency`/
+// `resolveVanityDependency` is the real vanity entry point.
 export function fetchDependency(spec: string, timeoutMs: int): FetchResult! {
   let d = parseSpec(spec)?
+  if (d.vanity) {
+    fail newError("pmfetch: fetchDependency does not resolve vanity names (${d.vanityName}) — use the bit add/up flow")
+  }
   let url = defaultDepUrl(d.host, d.owner, d.repo)
   let sha = resolveDependencyRef(defaultGitBin, url, d.ref, timeoutMs)?
   let root = defaultCacheRoot()?
   return fetchSha(defaultGitBin, root, d.host, d.owner, d.repo, url, sha, timeoutMs)?
+}
+
+// --- vanity name resolution (SPEC §17.7) ---------------------------------
+
+// The response body cap: a `bit-import:` document exceeding this before its
+// single line completes is a hard failure, not a truncation.
+export const vanityMaxDocBytes: int = 4096
+
+// The wall-clock deadline for resolving one vanity name, separate from
+// `defaultTimeoutMs`'s 30s git-fetch budget — a static single-line GET has no
+// reason to share a git clone's budget (SPEC §17.7).
+export const vanityTimeoutMs: int = 5000
+
+// The `host`/`owner`/`repo` a resolved git URL decomposes into, mirroring
+// `DepSpec`'s own fields for a direct spec — used to key the same
+// `<cacheRoot>/<host>/<owner>/<repo>/<sha>` layout `fetchSha` already uses,
+// regardless of whether the URL came from a direct spec or a vanity
+// resolution (`parseGitRemoteUrl`, below).
+struct GitRemoteRepo { host: string, owner: string, repo: string }
+
+// The inverse of `defaultDepUrl`: decomposes an `https://` git remote URL
+// that is `host/owner/repo[.git]` shaped — exactly the shape every direct
+// spec's own derived URL already has by construction. SPEC §17.7 says a
+// vanity document's `<gitURL>` is "used exactly as a direct spec's derived
+// URL would be", so requiring the same shape here is not a new limitation;
+// it is the existing one (`parseSpec` already requires exactly 3 segments
+// for a direct spec's owner/repo), just applied to a resolved URL instead of
+// a written-out spec. A deeper path (a GitLab subgroup, say) fails loudly
+// rather than being guessed at.
+function parseGitRemoteUrl(url: string): GitRemoteRepo! {
+  if (!hasPrefix(url, "https://")) {
+    fail newError("pmfetch: resolved git URL is not https: ${url}")
+  }
+  let rest = url[8:len(url)]
+  if (hasSuffix(rest, ".git")) {
+    rest = rest[0:len(rest) - 4]
+  }
+  let parts = split(rest, "/")
+  if (len(parts) != 3) {
+    fail newError("pmfetch: resolved git URL is not host/owner/repo shaped: ${url}")
+  }
+  validateSegment(parts[0])?
+  validateSegment(parts[1])?
+  validateSegment(parts[2])?
+  return GitRemoteRepo{ host: parts[0], owner: parts[1], repo: parts[2] }
+}
+
+// A later resolution of dependency `name` producing a DIFFERENT git URL than
+// `bit.lock` already records is a hard failure naming both — never a silent
+// switch (SPEC §17.7: "moving a vanity name to a different git remote
+// requires removing the dependency and re-adding it"). `existingUrl` empty
+// (no prior lock entry, or a fresh `add`) always passes.
+export function checkResolvedUrlMatches(name: string, existingUrl: string, freshUrl: string): ()! {
+  if (len(existingUrl) > 0 && existingUrl != freshUrl) {
+    fail newError("pmfetch: ${name} resolved to a different git URL than bit.lock already records (recorded: ${existingUrl}, resolved: ${freshUrl}) — remove and re-add the dependency to switch remotes")
+  }
+}
+
+// Enforces the `vanityMaxDocBytes` cap on a vanity document's body BEFORE any
+// parsing — an oversized document is a hard failure, not a truncation.
+// `std/http.get` buffers the whole response body before this ever runs (see
+// the module header), so this bounds what pmfetch itself will PARSE, not how
+// many bytes an oversized response makes the process buffer in memory first.
+function checkVanityCap(body: string): ()! {
+  if (len(body) > vanityMaxDocBytes) {
+    fail newError("pmfetch: vanity document exceeds the ${vanityMaxDocBytes}-byte cap (got ${len(body)} bytes)")
+  }
+}
+
+// `body` up to (not including) its first newline, with one trailing `\r`
+// stripped if present (a CRLF-terminated line).
+function firstLine(body: string): string {
+  let i = 0
+  while (i < len(body) && body[i] != '\n') {
+    i = i + 1
+  }
+  let line = body[0:i]
+  if (len(line) > 0 && line[len(line) - 1] == '\r') {
+    line = line[0:len(line) - 1]
+  }
+  return line
+}
+
+// Validates and parses a `bit-import:` document body (SPEC §17.7): its first
+// line must be exactly `bit-import: <name> git <gitURL>`, each token
+// separated by exactly one space, `<name>` byte-for-byte equal to `name`
+// (the vanity name that was requested — this is the format's whole trust
+// boundary) and `<gitURL>` an `https://` URL. Any content after `<gitURL>`
+// is the format's sole extension point and is ignored. A pure function over
+// an already-buffered body — the caller enforces the byte cap
+// (`checkVanityCap`) before this ever runs.
+function parseVanityDoc(name: string, body: string): string! {
+  let line = firstLine(body)
+  let parts = split(line, " ")
+  if (len(parts) < 4) {
+    fail newError("pmfetch: malformed bit-import document for ${name}: ${line}")
+  }
+  if (parts[0] != "bit-import:") {
+    fail newError("pmfetch: bit-import document for ${name} does not start with 'bit-import:': ${line}")
+  }
+  if (parts[1] != name) {
+    fail newError("pmfetch: bit-import document claims name '${parts[1]}', requested '${name}'")
+  }
+  if (parts[2] != "git") {
+    fail newError("pmfetch: bit-import document for ${name} is missing the 'git' token: ${line}")
+  }
+  let gitUrl = parts[3]
+  if (!hasPrefix(gitUrl, "https://")) {
+    fail newError("pmfetch: bit-import document for ${name} names a non-https git URL: ${gitUrl}")
+  }
+  return gitUrl
+}
+
+// The cap-then-parse sequence a fetched vanity document body runs through
+// (`resolveVanityUrl`, below) — factored out so it is directly testable
+// against a fixture string with no network involved (pmfetchcheck.bit),
+// and so the byte cap provably runs BEFORE any parsing rather than after.
+function checkAndParseVanityDoc(name: string, body: string): string! {
+  checkVanityCap(body)?
+  return parseVanityDoc(name, body)?
+}
+
+// One vanity-document fetch outcome, delivered over a channel by
+// `vanityFetchWorker` to the racing `select` in `resolveVanityUrl`.
+struct VanityFetchMsg { ok: bool, status: int, body: string, errMsg: string }
+
+// Runs in its own green thread: GET `url` and report the outcome. Never
+// fails outward — a transport/TLS error becomes a `VanityFetchMsg{ok:false}`
+// so the racing `select` in `resolveVanityUrl` always has a value to read.
+function vanityFetchWorker(url: string, ch: chan<VanityFetchMsg>) {
+  let res = get(url) catch e {
+    ch <- VanityFetchMsg{ ok: false, status: 0, body: "", errMsg: e.message() }
+    return
+  }
+  ch <- VanityFetchMsg{ ok: true, status: res.status, body: res.body, errMsg: "" }
+}
+
+// Runs in its own green thread: park for `timeoutMs`, then signal. Races
+// `vanityFetchWorker` in `resolveVanityUrl`'s `select` — `std/http` has no
+// request-level deadline of its own (module header), so this is how the
+// 5000 ms wall-clock deadline is enforced. If the fetch wins the race, this
+// thread's own `sleep` still runs to completion; if the TIMER wins, the fetch
+// green thread keeps running until its own work finishes — the deadline
+// bounds how long `resolveVanityUrl` blocks its caller, not how long the
+// loser lives (see the module header).
+function vanityTimerFire(ch: chan<bool>, timeoutMs: int) {
+  sleep(timeoutMs * Millisecond)
+  ch <- true
+}
+
+// Resolves vanity name `name` (e.g. `"bitlang.org/pkg/http"`) to its
+// `<gitURL>` per SPEC §17.7: one HTTPS GET of `https://<name>`, its
+// `bit-import:` document validated and parsed (`checkAndParseVanityDoc`),
+// bounded by `timeoutMs` wall-clock. `std/http.get` never follows a
+// redirect (module header), so any non-200 response — including a 3xx that
+// would otherwise have redirected — is treated as a resolution failure,
+// which is exactly SPEC's "a redirect to a non-https scheme is a hard
+// failure" for a client with no redirect-following code path to begin with.
+export function resolveVanityUrl(name: string, timeoutMs: int): string! {
+  let url = "https://" + name
+  let fetchCh = chan<VanityFetchMsg>(1)
+  let timeoutCh = chan<bool>(1)
+  spawn vanityFetchWorker(url, fetchCh)
+  spawn vanityTimerFire(timeoutCh, timeoutMs)
+
+  select {
+    case msg = <- fetchCh:
+      if (!msg.ok) {
+        fail newError("pmfetch: vanity fetch of ${url} failed: ${msg.errMsg}")
+      }
+      if (msg.status != 200) {
+        fail newError("pmfetch: vanity fetch of ${url} returned HTTP ${msg.status}, not 200")
+      }
+      return checkAndParseVanityDoc(name, msg.body)?
+    case <- timeoutCh:
+      fail newError("pmfetch: vanity fetch of ${url} timed out after ${timeoutMs}ms")
+  }
 }
 
 // --- a fetched dependency's own bit.json -----------------------------
