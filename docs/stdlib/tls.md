@@ -1500,25 +1500,28 @@ The TLS 1.3 wire version codepoint (`0x0304`), the default and only value
 ### `TlsConfig`
 
 The configuration shared by `dial` and `listen`. `roots` is the trust anchor set
-a client verifies the server chain against; `verify` turns certificate-chain and
-hostname verification on (its `newTlsConfig` default) or off; `alpn` is the ALPN
-protocol list; `serverName` is the SNI host and the name the certificate must
-match; `minVersion` is the version floor; `nowUnix` is the clock for
-certificate-validity checks; and `certPem`/`keyPem` are the server's certificate
-chain and private key, required by `listen`.
+a client verifies the server chain against; `insecureSkipVerify` turns off
+certificate-chain and hostname verification when true (its zero value, `false`,
+is the `newTlsConfig` default and verifies); `alpn` is the ALPN protocol list;
+`serverName` is the SNI host and the name the certificate must match;
+`minVersion` is the version floor (an omitted `0` is clamped to `tlsVersion13`
+by `dial`/`listen`); `nowUnix` is the clock for certificate-validity checks; and
+`certPem`/`keyPem` are the server's certificate chain and private key, required
+by `listen`.
 
-**Security note.** `verify` false - including its `false` zero value in a
-hand-built struct literal - DISABLES server authentication: the connection then
-proves only that the peer holds the CertificateVerify key and completes the
-Finished MAC, not that it is the host it claims to be. Build configs with
-`newTlsConfig`, which is secure by default, and set `verify: false` only for
-tests or pinned-key scenarios.
+**Security note.** `insecureSkipVerify` true DISABLES server authentication: the
+connection then proves only that the peer holds the CertificateVerify key and
+completes the Finished MAC, not that it is the host it claims to be. Its zero
+value is `false`, so an omitted field or a hand-built struct literal still
+verifies. Set `insecureSkipVerify: true` only for tests or pinned-key scenarios.
 
 ### `newTlsConfig(roots: TrustStore): TlsConfig`
 
-A `TlsConfig` that verifies servers against `roots`, secure by default: `verify`
-is true and `minVersion` is TLS 1.3. The recommended constructor - a raw struct
-literal risks a `verify: false` zero value.
+A `TlsConfig` that verifies servers against `roots`, secure by default:
+`insecureSkipVerify` is false and `minVersion` is TLS 1.3. The recommended
+constructor - a raw struct literal is just as safe now, since every omitted
+field defaults to its zero value and the zero value of `insecureSkipVerify` is
+"verify".
 
 ### `emptyTrustStore(): TrustStore`
 
@@ -1532,8 +1535,8 @@ Connect to `host:port` over TCP and run the TLS 1.3 client handshake to
 completion, returning a `TlsConn`. `host` is resolved through the system resolver
 (a dotted quad passes straight through) and is the default SNI. Verifies the
 server's certificate chain and hostname against `config.roots` unless
-`config.verify` is false. Fails on a connect, resolve, or handshake/verification
-error.
+`config.insecureSkipVerify` is true. Fails on a connect, resolve, or
+handshake/verification error.
 
 ### `listen(host: string, port: int, config: TlsConfig): TlsListener!`
 
