@@ -864,6 +864,7 @@ defined exactly once).
 | `bit_rt_select`       | `(descs: *SelectCaseDesc, n: usize, has_default: bool) -> usize` (§11) |
 | `bit_rt_panic`        | `(msg: *const RtBytes) -> noreturn` (§12)               |
 | `bit_rt_panic_div_zero` | `() -> noreturn` (§12.1)                              |
+| `bit_rt_panic_nil_call` | `() -> noreturn` (§12.1)                              |
 | `bit_rt_assert`       | `(cond: bool, msg: *const RtBytes) -> void` (§12)       |
 | `bit_rt_print`        | `(s: *const RtBytes) -> void` (§12, fd 1)               |
 | `bit_rt_eprint`       | `(s: *const RtBytes) -> void` (§12, fd 2)               |
@@ -1125,17 +1126,18 @@ RtBytes { ptr: *const u8, len: usize }   // extern struct — a transient,
   and the abort must already have run. The runtime only terminates the
   process; it does not itself walk or run deferred calls.
 
-### 12.1 Backend-injected, argument-free panics (#2016)
+### 12.1 Backend-injected, argument-free panics (#2016, #2018)
 
 ```
 bit_rt_panic_div_zero()  -> noreturn
+bit_rt_panic_nil_call()  -> noreturn
 ```
 
-A check a backend inserts directly at the operation that would otherwise
+Two checks a backend inserts directly at the operation that would otherwise
 fault, rather than through an `Op.RtCall`/lowering-built `RtBytes` message —
 the same "emitted directly, not through the `RtFn` table" class as
 `bit_rt_iface_lookup` (§2.1), and the same alloc-free-panic-path shape as
-`bit_rt_oom`: the message is a **fixed, compile-time string baked into the
+`bit_rt_oom`: each message is a **fixed, compile-time string baked into the
 runtime provider itself**, packed into immediate words the way `bit_rt_oom`'s
 "out of memory" is, so the report never allocates on the path that is
 reporting a broken invariant.
@@ -1146,14 +1148,18 @@ reporting a broken invariant.
   a non-zero divisor never reaches it. The compile-time-power-of-two fast path
   (`xEmitPow2DivInt`/`xEmitPow2RemInt`) needs no check — its divisor is proven
   non-zero at compile time by construction.
+- `bit_rt_panic_nil_call` — an indirect call through a nil function value
+  (SPEC.md §13.4, §18.4: "call of a `nil` function"). The backend tests the
+  closure cell for null immediately before loading its `{code, env}` fields
+  and branches to this call only when it is null.
 
-`@nosplit`, callable from anywhere a division can appear (including inside
-another `@nosplit` function, exactly as `bit_rt_panic` itself must be), and
-never returns — control does not resume in the caller on the branch that
-reaches it, so nothing after the call site needs to treat its argument-free
-signature as clobbering anything live. Sibling backend-injected panics for a
-nil function call and a nil interface method call (#2018, #2240) extend this
-same section.
+Both are `@nosplit`, callable from anywhere a division or an indirect call can
+appear (including inside another `@nosplit` function, exactly as
+`bit_rt_panic` itself must be), and never return — control does not resume in
+the caller on the branch that reaches them, so nothing after the call site
+needs to treat their argument-free signature as clobbering anything live. A
+sibling backend-injected panic for a nil interface method call (#2240)
+extends this same section.
 
 ## 13. Fallible results — the error channel (SPEC.md §18)
 
