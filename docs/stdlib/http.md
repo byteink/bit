@@ -7,8 +7,13 @@ same on either transport - an `https://` URL or `serveTls` just swaps the socket
 Fallible calls return `T!` - propagate with `?` or handle with `catch`.
 
 Scope: HTTP/1.1 over cleartext or TLS, one request per connection
-(`Connection: close`), no chunked transfer encoding, no redirects. Headers are
-carried as a raw block and read with `header()`.
+(`Connection: close`), no redirects. Headers are carried as a raw block and
+read with `header()`. Request framing follows RFC 9112 §6: a body is read only
+when `Content-Length` or `Transfer-Encoding: chunked` says so (chunked is
+decoded, never passed through raw); a request declaring both, or a
+Content-Length or chunk stream this parser cannot make sense of, is rejected
+with 400. Responses are always sent with an exact Content-Length - the server
+itself never emits chunked.
 
 <!-- doctest: per-block -->
 
@@ -39,6 +44,14 @@ fills in `Content-Length` and `Connection` for you.
 
 The value of header `name` in a raw header block, matched case-insensitively at a
 line start, or `""` if absent.
+
+### `atoi(s: string): int`
+
+The non-negative integer `s` denotes, or `-1` on any non-digit (including the
+empty string) or a magnitude that would overflow `int` — it never silently
+wraps. Used internally for a request's `Content-Length`, a response status
+code, and a URL port; exported so callers parsing the same kind of untrusted,
+network-sourced decimal text get the same overflow-safe guard.
 
 ### `ok(body: string): Response`
 
