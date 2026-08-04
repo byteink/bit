@@ -100,14 +100,20 @@ function parseUrl(url: string): Url! {
   return Url{ host: host, port: port, path: path, https: https, h3: h3 }
 }
 
-// Parse a response off a fully-read connection: status line, headers, body.
-function parseResponse(raw: string): Response! {
-  let sep = indexOf(raw, "\r\n\r\n")
-  if (sep < 0) {
-    fail newError("malformed response")
-  }
-  let headBlock = raw[0:sep]
-  let body = raw[sep + 4:len(raw)]
+// Reads one HTTP/1.1 response off `s`: the status line, headers, and a body
+// framed per RFC 9112 §6 — the same framing rule `readMessage` (http.bit)
+// applies to a request, and the same two helpers (`decodeChunkedBody`,
+// `readUntil`) do the work, so a chunked or Content-Length-delimited body is
+// decoded identically on both sides of the wire (#2292). `Transfer-Encoding:
+// chunked` is decoded, never returned with its chunk markers inline;
+// Content-Length is read exactly — a short read before the peer closes fails
+// outright rather than returning a truncated body as a clean response, the
+// response-side twin of #2168's request-smuggling fix (trailing bytes beyond
+// a declared Content-Length are discarded rather than appended to the body).
+// A response declaring both headers together is rejected outright, same as a
+// request. No framing header means no body.
+function readResponse(s: byteStream): Response! {
+  let (headBlock, bodyStart) = readUntil(s, "", "\r\n\r\n")?
 
   let eol = indexOf(headBlock, "\r\n")
   let statusLine = headBlock
@@ -131,6 +137,46 @@ function parseResponse(raw: string): Response! {
   if (code < 0) {
     fail newError("bad status code")
   }
+
+  let clText = header(headers, "content-length")
+  let teText = toLower(header(headers, "transfer-encoding"))
+  let hasCl = len(clText) > 0
+  let hasTe = len(teText) > 0
+  if (hasCl && hasTe) {
+    fail newError("response: Content-Length and Transfer-Encoding both present")
+  }
+  let body = ""
+  if (hasTe) {
+    if (teText != "chunked") {
+      fail newError("response: unsupported Transfer-Encoding")
+    }
+    body = decodeChunkedBody(s, bodyStart)?
+  } else if (hasCl) {
+    let cl = atoi(clText)
+    if (cl < 0) {
+      fail newError("response: invalid Content-Length")
+    }
+    body = bodyStart
+    if (len(body) > cl) {
+      body = body[0:cl]
+    }
+    while (len(body) < cl) {
+      let chunk = s.readUp(4096)?
+      if (len(chunk) == 0) {
+        fail newError("response: connection closed before Content-Length bytes arrived")
+      }
+      body = body + chunk
+      if (len(body) > cl) {
+        body = body[0:cl]
+      }
+    }
+  } else {
+    // Neither framing header present: RFC 9112 §6.3 case 7 — the body runs to
+    // end of stream. Sound here because every request this client sends
+    // carries `Connection: close`, so the peer closing is the terminator, not
+    // an ambiguity.
+    body = bodyStart + readAllStream(s)?
+  }
   return Response{
     status: code,
     contentType: header(headers, "content-type"),
@@ -151,12 +197,12 @@ function buildRequest(method: string, u: Url, body: string): string {
   return req + "\r\n" + body
 }
 
-// Send `reqText` over `s`, read the whole response to EOF, close, and parse it.
+// Send `reqText` over `s`, read one framed response, and close.
 function exchangeOn(s: byteStream, reqText: string): Response! {
   s.writeStr(reqText)?
-  let raw = readAllStream(s)?
+  let res = readResponse(s)?
   s.shut()
-  return parseResponse(raw)?
+  return res
 }
 
 // Default trust anchors for verifying servers: the operating-system store when
