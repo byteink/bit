@@ -1,0 +1,930 @@
+// run
+// Round-trip property test for five tickets that all fail the same
+// invariant — `jsonParse(jsonEncode(v))` must reproduce `v`, or, for the one
+// shape JSON genuinely cannot represent (non-finite float), the encoder must
+// still emit text `jsonParse` accepts. One shared file instead of five
+// near-duplicate ones: a golden case is single-file with no prelude and
+// cannot import std/json (see json_parse_valid.bit), so testing a real
+// round trip means reimplementing the lexer/parser/encoder locally, and
+// that reimplementation is the expensive part to duplicate five times over.
+//
+//   - #2281: a non-finite float (`1e999` overflowing on parse, or `inf`/
+//     `-inf`/`nan` built directly) must encode to something `jsonParse`
+//     accepts — `null`, matching JS `JSON.stringify`/serde_json — not the
+//     bare `inf`/`-inf`/`nan` the runtime formatter itself produces.
+//   - #2282: an integral `JsonFloat` (`3.0`, `-0.0`, `1.0e2`) must keep its
+//     `.0` so it re-parses as `JsonFloat`, not `JsonInt`.
+//   - #2283: an extreme-magnitude float (`5e-324`, `1e100`,
+//     `1.7976931348623157e308`) must encode in exponent form, not a
+//     300+-byte positional expansion, while staying value-stable.
+//   - #2285: `i64` MIN (`-9223372036854775808`) must decode to `JsonInt` and
+//     re-encode byte-identical, not silently become `-9223372036854776000`
+//     via a `JsonFloat` detour.
+//   - #2256: an ordinary 40-level nested tree — well inside the depth cap
+//     raised from 64 to 1000 — must survive encode-then-parse; at 64 the
+//     encoder had no matching cap and would silently produce text the
+//     parser rejected past ~32 levels.
+//
+// Mirrors stdlib/json/{value,lex,parse,encode}.bit as fixed for these five
+// tickets. Everything else (JSONC, the CST layer) is untouched and already
+// covered by the other json goldens.
+
+struct jsonErr { msg: string }
+function (e: jsonErr) message(): string { return e.msg }
+
+enum Opt<T> { Some(T), None }
+
+// --- lexer (stdlib/json/lex.bit) -------------------------------------------
+
+enum TokenKind {
+  LBrace,
+  RBrace,
+  LBracket,
+  RBracket,
+  Colon,
+  Comma,
+  StringTok,
+  NumberTok,
+  TrueTok,
+  FalseTok,
+  NullTok,
+  Eof,
+  Invalid,
+}
+
+struct Token { kind: TokenKind, start: int, end: int }
+
+// Raised from 64 (#2256) — see this file's header comment.
+const jsonMaxDepth = 1000
+
+struct Lexer { src: string, i: int, depth: int }
+
+function isDigit(c: u8): bool {
+  return c >= '0' && c <= '9'
+}
+
+function isLower(c: u8): bool {
+  return c >= 'a' && c <= 'z'
+}
+
+function emit(lx: Lexer, start: int, n: int, k: TokenKind): Token {
+  lx.i = start + n
+  return Token{ kind: k, start: start, end: start + n }
+}
+
+function scanOpen(lx: Lexer, k: TokenKind): Token {
+  let start = lx.i
+  if (lx.depth >= jsonMaxDepth) {
+    return emit(lx, start, 1, TokenKind.Invalid)
+  }
+  lx.depth = lx.depth + 1
+  return emit(lx, start, 1, k)
+}
+
+function scanClose(lx: Lexer, k: TokenKind): Token {
+  let start = lx.i
+  if (lx.depth > 0) {
+    lx.depth = lx.depth - 1
+  }
+  return emit(lx, start, 1, k)
+}
+
+function scanString(lx: Lexer): Token {
+  let start = lx.i
+  lx.i = lx.i + 1
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    if (c == '"') {
+      lx.i = lx.i + 1
+      return Token{ kind: TokenKind.StringTok, start: start, end: lx.i }
+    }
+    if (c == '\\' && lx.i + 1 < len(lx.src)) {
+      lx.i = lx.i + 2
+    } else {
+      lx.i = lx.i + 1
+    }
+  }
+  return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+}
+
+function scanNumber(lx: Lexer): Token {
+  let start = lx.i
+  if (lx.src[lx.i] == '-') {
+    lx.i = lx.i + 1
+  }
+  while (lx.i < len(lx.src) && isDigit(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  if (lx.i < len(lx.src) && lx.src[lx.i] == '.') {
+    lx.i = lx.i + 1
+    while (lx.i < len(lx.src) && isDigit(lx.src[lx.i])) {
+      lx.i = lx.i + 1
+    }
+  }
+  if (lx.i < len(lx.src) && (lx.src[lx.i] == 'e' || lx.src[lx.i] == 'E')) {
+    lx.i = lx.i + 1
+    if (lx.i < len(lx.src) && (lx.src[lx.i] == '+' || lx.src[lx.i] == '-')) {
+      lx.i = lx.i + 1
+    }
+    while (lx.i < len(lx.src) && isDigit(lx.src[lx.i])) {
+      lx.i = lx.i + 1
+    }
+  }
+  return Token{ kind: TokenKind.NumberTok, start: start, end: lx.i }
+}
+
+function scanWord(lx: Lexer): Token {
+  let start = lx.i
+  while (lx.i < len(lx.src) && isLower(lx.src[lx.i])) {
+    lx.i = lx.i + 1
+  }
+  let word = lx.src[start:lx.i]
+  if (word == "true") {
+    return Token{ kind: TokenKind.TrueTok, start: start, end: lx.i }
+  }
+  if (word == "false") {
+    return Token{ kind: TokenKind.FalseTok, start: start, end: lx.i }
+  }
+  if (word == "null") {
+    return Token{ kind: TokenKind.NullTok, start: start, end: lx.i }
+  }
+  return Token{ kind: TokenKind.Invalid, start: start, end: lx.i }
+}
+
+function scanToken(lx: Lexer): Token {
+  while (lx.i < len(lx.src)) {
+    let c = lx.src[lx.i]
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      lx.i = lx.i + 1
+    } else if (c == '{') {
+      return scanOpen(lx, TokenKind.LBrace)
+    } else if (c == '}') {
+      return scanClose(lx, TokenKind.RBrace)
+    } else if (c == '[') {
+      return scanOpen(lx, TokenKind.LBracket)
+    } else if (c == ']') {
+      return scanClose(lx, TokenKind.RBracket)
+    } else if (c == ':') {
+      return emit(lx, lx.i, 1, TokenKind.Colon)
+    } else if (c == ',') {
+      return emit(lx, lx.i, 1, TokenKind.Comma)
+    } else if (c == '"') {
+      return scanString(lx)
+    } else if (isDigit(c) || c == '-') {
+      return scanNumber(lx)
+    } else if (isLower(c)) {
+      return scanWord(lx)
+    } else {
+      return emit(lx, lx.i, 1, TokenKind.Invalid)
+    }
+  }
+  return Token{ kind: TokenKind.Eof, start: lx.i, end: lx.i }
+}
+
+function lex(source: string): []Token {
+  let lx = Lexer{ src: source, i: 0, depth: 0 }
+  let toks = []Token(0)
+  let guard = 0
+  let bound = len(source) * 2 + 2
+  while (guard <= bound) {
+    let t = scanToken(lx)
+    toks = append(toks, t)
+    if (t.kind == TokenKind.Eof) {
+      break
+    }
+    guard = guard + 1
+  }
+  return toks
+}
+
+// --- value type (stdlib/json/value.bit) -------------------------------------
+
+struct JsonEntry { key: string, value: Json }
+
+enum Json {
+  JsonNull
+  JsonBool(bool)
+  JsonInt(i64)
+  JsonFloat(f64)
+  JsonString(string)
+  JsonArray([]Json)
+  JsonObject([]JsonEntry)
+}
+
+function jsonIsNull(j: Json): bool {
+  match (j) {
+    JsonNull => return true
+    JsonBool(b) => return false
+    JsonInt(i) => return false
+    JsonFloat(f) => return false
+    JsonString(s) => return false
+    JsonArray(a) => return false
+    JsonObject(o) => return false
+  }
+}
+
+function jsonIsInt(j: Json): bool {
+  match (j) {
+    JsonInt(i) => return true
+    JsonNull => return false
+    JsonBool(b) => return false
+    JsonFloat(f) => return false
+    JsonString(s) => return false
+    JsonArray(a) => return false
+    JsonObject(o) => return false
+  }
+}
+
+function jsonIsFloat(j: Json): bool {
+  match (j) {
+    JsonFloat(f) => return true
+    JsonNull => return false
+    JsonBool(b) => return false
+    JsonInt(i) => return false
+    JsonString(s) => return false
+    JsonArray(a) => return false
+    JsonObject(o) => return false
+  }
+}
+
+function jsonAsFloat(j: Json): Opt<f64> {
+  match (j) {
+    JsonFloat(f) => return Opt<f64>.Some(f)
+    JsonNull => return Opt<f64>.None
+    JsonBool(b) => return Opt<f64>.None
+    JsonInt(i) => return Opt<f64>.None
+    JsonString(s) => return Opt<f64>.None
+    JsonArray(a) => return Opt<f64>.None
+    JsonObject(o) => return Opt<f64>.None
+  }
+}
+
+function jsonGet(o: Json, key: string): Opt<Json> {
+  match (o) {
+    JsonObject(entries) => {
+      let found = Opt<Json>.None
+      for e of entries {
+        if (e.key == key) {
+          found = Opt<Json>.Some(e.value)
+        }
+      }
+      return found
+    }
+    JsonNull => return Opt<Json>.None
+    JsonBool(b) => return Opt<Json>.None
+    JsonInt(i) => return Opt<Json>.None
+    JsonFloat(f) => return Opt<Json>.None
+    JsonString(s) => return Opt<Json>.None
+    JsonArray(a) => return Opt<Json>.None
+  }
+}
+
+// --- parser (stdlib/json/parse.bit) -----------------------------------------
+
+struct Parser { src: string, toks: []Token, i: int }
+
+function peek(p: Parser): Token {
+  return p.toks[p.i]
+}
+
+function advance(p: Parser): Token {
+  let t = p.toks[p.i]
+  if (p.i < len(p.toks) - 1) {
+    p.i = p.i + 1
+  }
+  return t
+}
+
+function describeInvalid(src: string, t: Token): string {
+  let c = src[t.start]
+  if (c == '{' || c == '[') {
+    return "json: max nesting depth exceeded"
+  }
+  if (c == '"') {
+    return "json: unterminated string"
+  }
+  return "json: unexpected character in input"
+}
+
+function isValidJsonNumber(s: string): bool {
+  let n = len(s)
+  let i = 0
+  if (i >= n) {
+    return false
+  }
+  if (s[i] == '-') {
+    i = i + 1
+  }
+  if (i >= n) {
+    return false
+  }
+  if (s[i] == '0') {
+    i = i + 1
+  } else if (s[i] >= '1' && s[i] <= '9') {
+    i = i + 1
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  } else {
+    return false
+  }
+  if (i < n && s[i] == '.') {
+    i = i + 1
+    if (i >= n || !isDigit(s[i])) {
+      return false
+    }
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  }
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+    i = i + 1
+    if (i < n && (s[i] == '+' || s[i] == '-')) {
+      i = i + 1
+    }
+    if (i >= n || !isDigit(s[i])) {
+      return false
+    }
+    while (i < n && isDigit(s[i])) {
+      i = i + 1
+    }
+  }
+  return i == n
+}
+
+function looksIntegral(s: string): bool {
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == '.' || s[i] == 'e' || s[i] == 'E') {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Accepts the FULL i64 range, including MIN (-9223372036854775808) — #2285.
+// A positive accumulator (as e.g. std/strings.parseInt uses) always
+// overflows one past i64 MAX before a sign can be applied to reach MIN, so
+// this accumulates negatively instead, which has exactly the headroom the
+// positive side lacks.
+function parseJsonInt(text: string): i64! {
+  let n = len(text)
+  let i = 0
+  let neg = false
+  if (text[0] == '-') {
+    neg = true
+    i = 1
+  }
+  // i64 MIN = -9223372036854775808 = -922337203685477580 * 10 - 8.
+  let minDiv10 = i64(-922337203685477580)
+  let minMod10 = i64(8)
+  let v = i64(0)
+  while (i < n) {
+    let d = i64(text[i] - '0')
+    if (v < minDiv10 || (v == minDiv10 && d > minMod10)) {
+      fail jsonErr{ msg: "json: number out of i64 range" }
+    }
+    v = v * 10 - d
+    i = i + 1
+  }
+  if (neg) {
+    return v
+  }
+  if (v == minDiv10 * 10 - minMod10) {
+    fail jsonErr{ msg: "json: number out of i64 range" }
+  }
+  return 0 - v
+}
+
+function decodeNumber(src: string, t: Token): Json! {
+  let text = src[t.start:t.end]
+  if (!isValidJsonNumber(text)) {
+    fail jsonErr{ msg: "json: invalid number literal" }
+  }
+  if (looksIntegral(text)) {
+    let iv = parseJsonInt(text) catch e {
+      return Json.JsonFloat(parseFloat(text))
+    }
+    return Json.JsonInt(iv)
+  }
+  return Json.JsonFloat(parseFloat(text))
+}
+
+function hexDigitVal(c: u8): i64! {
+  if (c >= '0' && c <= '9') {
+    return i64(c - '0')
+  }
+  if (c >= 'a' && c <= 'f') {
+    return i64(c - 'a') + 10
+  }
+  if (c >= 'A' && c <= 'F') {
+    return i64(c - 'A') + 10
+  }
+  fail jsonErr{ msg: "invalid hex" }
+}
+
+function decodeHex4(src: string, i: int): i64! {
+  let v = i64(0)
+  let k = 0
+  while (k < 4) {
+    let d = hexDigitVal(src[i + k])?
+    v = v * 16 + d
+    k = k + 1
+  }
+  return v
+}
+
+function byteToStr(c: u8): string {
+  let out = []byte(1)
+  out[0] = c
+  return string(out)
+}
+
+function writeUtf8(cp: i64): string {
+  if (cp < 0x80) {
+    return byteToStr(u8(cp))
+  }
+  if (cp < 0x800) {
+    return byteToStr(u8(0xC0 | (cp >> 6))) + byteToStr(u8(0x80 | (cp & 0x3F)))
+  }
+  if (cp < 0x10000) {
+    return byteToStr(u8(0xE0 | (cp >> 12))) + byteToStr(
+      u8(0x80 | ((cp >> 6) & 0x3F)),
+    ) + byteToStr(u8(0x80 | (cp & 0x3F)))
+  }
+  return byteToStr(u8(0xF0 | (cp >> 18))) + byteToStr(
+    u8(0x80 | ((cp >> 12) & 0x3F)),
+  ) + byteToStr(u8(0x80 | ((cp >> 6) & 0x3F))) + byteToStr(u8(0x80 | (cp & 0x3F)))
+}
+
+function decodeStringLiteral(src: string, t: Token): string! {
+  let i = t.start + 1
+  let end = t.end - 1
+  let out = ""
+  while (i < end) {
+    let c = src[i]
+    if (c < 32) {
+      fail jsonErr{ msg: "control character in string" }
+    }
+    if (c != '\\') {
+      out = out + byteToStr(c)
+      i = i + 1
+      continue
+    }
+    if (i + 1 >= end) {
+      fail jsonErr{ msg: "unterminated escape" }
+    }
+    let e = src[i + 1]
+    if (e == '"') {
+      out = out + "\""
+      i = i + 2
+    } else if (e == '\\') {
+      out = out + "\\"
+      i = i + 2
+    } else if (e == '/') {
+      out = out + "/"
+      i = i + 2
+    } else if (e == 'b') {
+      out = out + byteToStr(8)
+      i = i + 2
+    } else if (e == 'f') {
+      out = out + byteToStr(12)
+      i = i + 2
+    } else if (e == 'n') {
+      out = out + "\n"
+      i = i + 2
+    } else if (e == 'r') {
+      out = out + "\r"
+      i = i + 2
+    } else if (e == 't') {
+      out = out + "\t"
+      i = i + 2
+    } else if (e == 'u') {
+      if (i + 6 > end) {
+        fail jsonErr{ msg: "invalid \\u escape" }
+      }
+      let cp = decodeHex4(src, i + 2)?
+      i = i + 6
+      if (cp >= 0xD800 && cp <= 0xDBFF) {
+        if (i + 6 > end || src[i] != '\\' || src[i + 1] != 'u') {
+          fail jsonErr{ msg: "unpaired surrogate" }
+        }
+        let lo = decodeHex4(src, i + 2)?
+        if (lo < 0xDC00 || lo > 0xDFFF) {
+          fail jsonErr{ msg: "invalid low surrogate" }
+        }
+        i = i + 6
+        let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+        out = out + writeUtf8(combined)
+      } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+        fail jsonErr{ msg: "unpaired surrogate" }
+      } else {
+        out = out + writeUtf8(cp)
+      }
+    } else {
+      fail jsonErr{ msg: "invalid escape character" }
+    }
+  }
+  return out
+}
+
+function parseValue(p: Parser): Json! {
+  let t = peek(p)
+  if (t.kind == TokenKind.LBrace) {
+    return parseObject(p)?
+  }
+  if (t.kind == TokenKind.LBracket) {
+    return parseArray(p)?
+  }
+  if (t.kind == TokenKind.StringTok) {
+    advance(p)
+    return Json.JsonString(decodeStringLiteral(p.src, t)?)
+  }
+  if (t.kind == TokenKind.NumberTok) {
+    advance(p)
+    return decodeNumber(p.src, t)?
+  }
+  if (t.kind == TokenKind.TrueTok) {
+    advance(p)
+    return Json.JsonBool(true)
+  }
+  if (t.kind == TokenKind.FalseTok) {
+    advance(p)
+    return Json.JsonBool(false)
+  }
+  if (t.kind == TokenKind.NullTok) {
+    advance(p)
+    return Json.JsonNull
+  }
+  if (t.kind == TokenKind.Invalid) {
+    fail jsonErr{ msg: describeInvalid(p.src, t) }
+  }
+  fail jsonErr{ msg: "json: unexpected token, expected a value" }
+}
+
+function parseObject(p: Parser): Json! {
+  advance(p)
+  let entries = []JsonEntry(0)
+  if (peek(p).kind == TokenKind.RBrace) {
+    advance(p)
+    return Json.JsonObject(entries)
+  }
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let keyTok = peek(p)
+    if (keyTok.kind != TokenKind.StringTok) {
+      fail jsonErr{ msg: "json: expected string key" }
+    }
+    advance(p)
+    let key = decodeStringLiteral(p.src, keyTok)?
+    if (peek(p).kind != TokenKind.Colon) {
+      fail jsonErr{ msg: "json: expected ':' after object key" }
+    }
+    advance(p)
+    let val = parseValue(p)?
+    entries = append(entries, JsonEntry{ key: key, value: val })
+    let nxt = peek(p)
+    if (nxt.kind == TokenKind.RBrace) {
+      advance(p)
+      return Json.JsonObject(entries)
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail jsonErr{ msg: "json: expected ',' or '}' in object" }
+    }
+    advance(p)
+    guard = guard + 1
+  }
+  fail jsonErr{ msg: "json: object nesting exceeds token bound" }
+}
+
+function parseArray(p: Parser): Json! {
+  advance(p)
+  let items = []Json(0)
+  if (peek(p).kind == TokenKind.RBracket) {
+    advance(p)
+    return Json.JsonArray(items)
+  }
+  let guard = 0
+  let bound = len(p.toks) + 1
+  while (guard <= bound) {
+    let v = parseValue(p)?
+    items = append(items, v)
+    let nxt = peek(p)
+    if (nxt.kind == TokenKind.RBracket) {
+      advance(p)
+      return Json.JsonArray(items)
+    }
+    if (nxt.kind != TokenKind.Comma) {
+      fail jsonErr{ msg: "json: expected ',' or ']' in array" }
+    }
+    advance(p)
+    guard = guard + 1
+  }
+  fail jsonErr{ msg: "json: array nesting exceeds token bound" }
+}
+
+function jsonParse(source: string): Json! {
+  let p = Parser{ src: source, toks: lex(source), i: 0 }
+  let v = parseValue(p)?
+  if (peek(p).kind != TokenKind.Eof) {
+    fail jsonErr{ msg: "json: trailing garbage after value" }
+  }
+  return v
+}
+
+// --- encoder (stdlib/json/encode.bit) ---------------------------------------
+
+function encodeBool(b: bool): string {
+  if (b) {
+    return "true"
+  }
+  return "false"
+}
+
+const hexDigits: string = "0123456789abcdef"
+
+function unicodeEscape(c: u8): string {
+  let out = []byte(2)
+  out[0] = hexDigits[int(c >> 4)]
+  out[1] = hexDigits[int(c & 0x0f)]
+  return "\\u00" + string(out)
+}
+
+function jsonEscapeString(s: string): string {
+  let out = "\""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == '"') {
+      out = out + "\\\""
+    } else if (c == '\\') {
+      out = out + "\\\\"
+    } else if (c == '\n') {
+      out = out + "\\n"
+    } else if (c == '\t') {
+      out = out + "\\t"
+    } else if (c == '\r') {
+      out = out + "\\r"
+    } else if (c == 8) {
+      out = out + "\\b"
+    } else if (c == 12) {
+      out = out + "\\f"
+    } else if (c < 32) {
+      out = out + unicodeEscape(c)
+    } else {
+      out = out + byteToStr(c)
+    }
+    i = i + 1
+  }
+  return out + "\""
+}
+
+// Decomposition of a finite float's formatted text into sign, digit run
+// (decimal point removed) and the point's position within it — see
+// formatJsonFloat below.
+struct FloatParts { neg: bool, digits: string, pointPos: int }
+
+function splitFloatText(text: string): FloatParts {
+  let i = 0
+  let neg = false
+  if (len(text) > 0 && text[0] == '-') {
+    neg = true
+    i = 1
+  }
+  let intStart = i
+  while (i < len(text) && text[i] != '.') {
+    i = i + 1
+  }
+  let intPart = text[intStart:i]
+  let fracPart = ""
+  if (i < len(text)) {
+    fracPart = text[i + 1:len(text)]
+  }
+  return FloatParts{ neg: neg, digits: intPart + fracPart, pointPos: len(intPart) }
+}
+
+function hasDot(text: string): bool {
+  let i = 0
+  while (i < len(text)) {
+    if (text[i] == '.') {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+function formatScientific(neg: bool, sig: string, exp: int): string {
+  let out = ""
+  if (neg) {
+    out = out + "-"
+  }
+  out = out + byteToStr(sig[0])
+  if (len(sig) > 1) {
+    out = out + "." + sig[1:len(sig)]
+  }
+  out = out + "e"
+  let mag = exp
+  if (mag < 0) {
+    out = out + "-"
+    mag = 0 - mag
+  } else {
+    out = out + "+"
+  }
+  return out + "${mag}"
+}
+
+// #2281 (non-finite -> null), #2282 (integral keeps `.0`), #2283 (extreme
+// magnitude uses exponent form) — see this file's header comment.
+function formatJsonFloat(f: f64): string {
+  let text = "${f}"
+  if (text == "nan" || text == "inf" || text == "-inf") {
+    return "null"
+  }
+  let parts = splitFloatText(text)
+  let n = len(parts.digits)
+  let firstNZ = 0
+  while (firstNZ < n && parts.digits[firstNZ] == '0') {
+    firstNZ = firstNZ + 1
+  }
+  if (firstNZ == n) {
+    if (parts.neg) {
+      return "-0.0"
+    }
+    return "0.0"
+  }
+  let lastNZ = n - 1
+  while (parts.digits[lastNZ] == '0') {
+    lastNZ = lastNZ - 1
+  }
+  let exp = parts.pointPos - 1 - firstNZ
+  if (exp < -6 || exp >= 21) {
+    return formatScientific(parts.neg, parts.digits[firstNZ:lastNZ + 1], exp)
+  }
+  if (hasDot(text)) {
+    return text
+  }
+  return text + ".0"
+}
+
+function encodeValue(j: Json): string {
+  match (j) {
+    JsonNull => return "null"
+    JsonBool(b) => return encodeBool(b)
+    JsonInt(i) => return "${i}"
+    JsonFloat(f) => return formatJsonFloat(f)
+    JsonString(s) => return jsonEscapeString(s)
+    JsonArray(a) => return encodeArray(a)
+    JsonObject(o) => return encodeObject(o)
+  }
+}
+
+function encodeArray(a: []Json): string {
+  let out = "["
+  let i = 0
+  while (i < len(a)) {
+    if (i > 0) {
+      out = out + ","
+    }
+    out = out + encodeValue(a[i])
+    i = i + 1
+  }
+  return out + "]"
+}
+
+function encodeObject(o: []JsonEntry): string {
+  let out = "{"
+  let i = 0
+  while (i < len(o)) {
+    if (i > 0) {
+      out = out + ","
+    }
+    out = out + jsonEscapeString(o[i].key) + ":" + encodeValue(o[i].value)
+    i = i + 1
+  }
+  return out + "}"
+}
+
+function jsonEncode(j: Json): string {
+  return encodeValue(j)
+}
+
+// --- test --------------------------------------------------------------
+
+// Parses `source`, encodes the result, and parses that text again. Prints
+// the encoded text and whether the second parse succeeded — the shared
+// round-trip check every case below drives.
+function roundtrip(label: string, source: string) {
+  let v = jsonParse(source) catch e {
+    print("${label}: PARSE-FAIL ${e.message()}\n")
+    return
+  }
+  let text = jsonEncode(v)
+  let back = jsonParse(text) catch e {
+    print("${label}: text=${text} REPARSE-FAIL ${e.message()}\n")
+    return
+  }
+  print("${label}: text=${text} reparse=ok\n")
+}
+
+// `source` must parse to a `JsonFloat`; after the round trip the result must
+// still be a `JsonFloat` (#2282) holding the identical value (#2282/#2283).
+function roundtripFloat(label: string, source: string) {
+  let v = jsonParse(source) catch e {
+    print("${label}: PARSE-FAIL ${e.message()}\n")
+    return
+  }
+  let orig = jsonAsFloat(v)
+  let text = jsonEncode(v)
+  let back = jsonParse(text) catch e {
+    print("${label}: text=${text} REPARSE-FAIL ${e.message()}\n")
+    return
+  }
+  let stillFloat = jsonIsFloat(back)
+  let stable = false
+  match (orig) {
+    Some(o) => {
+      match (jsonAsFloat(back)) {
+        Some(r) => stable = o == r
+        None => stable = false
+      }
+    }
+    None => stable = false
+  }
+  print("${label}: text=${text} isFloat=${stillFloat} stable=${stable}\n")
+}
+
+function buildChain(depth: int): Json {
+  let kids = []Json(0)
+  if (depth > 0) {
+    kids = append(kids, buildChain(depth - 1))
+  }
+  let f = []JsonEntry(0)
+  f = append(f, JsonEntry{ key: "children", value: Json.JsonArray(kids) })
+  return Json.JsonObject(f)
+}
+
+function main() {
+  // #2281: 1e999 overflows to +inf on parse; jsonEncode must not emit the
+  // runtime's bare `inf` — must produce text jsonParse accepts.
+  roundtrip("2281_overflow", "{\"x\":1e999}")
+
+  // #2281, direct construction: no JSON source produces inf/-inf/nan —
+  // only arithmetic does — so these are built directly as JsonFloat.
+  let big = 1.0e308
+  let inf = big * 10.0
+  let ninf = 0.0 - inf
+  let nan = inf - inf
+  let nonfinite = Json.JsonObject([]JsonEntry{
+    JsonEntry{ key: "inf", value: Json.JsonFloat(inf) },
+    JsonEntry{ key: "ninf", value: Json.JsonFloat(ninf) },
+    JsonEntry{ key: "nan", value: Json.JsonFloat(nan) },
+  })
+  let nonfiniteText = jsonEncode(nonfinite)
+  let nonfiniteBack = jsonParse(nonfiniteText) catch e {
+    print("2281_direct: text=${nonfiniteText} REPARSE-FAIL ${e.message()}\n")
+    return
+  }
+  print("2281_direct: text=${nonfiniteText} reparse=ok\n")
+
+  // #2282: an integral JsonFloat keeps its `.0`, so the reparsed value is
+  // still a JsonFloat (not silently a JsonInt) holding the same value.
+  roundtripFloat("2282_integral", "3.0")
+  roundtripFloat("2282_negzero", "-0.0")
+  roundtripFloat("2282_exp_integral", "1.0e2")
+
+  // #2283: extreme-magnitude floats use exponent form and stay value-stable.
+  roundtripFloat("2283_tiny", "5e-324")
+  roundtripFloat("2283_huge", "1e100")
+  roundtripFloat("2283_negexp", "1e-100")
+  roundtripFloat("2283_max", "1.7976931348623157e308")
+
+  // #2285: i64 MIN decodes to JsonInt and re-encodes byte-identical to the
+  // source literal; the neighbour one greater must also stay exact.
+  let minSrc = "-9223372036854775808"
+  let minVal = jsonParse(minSrc) catch e {
+    print("2285_i64min: PARSE-FAIL ${e.message()}\n")
+    return
+  }
+  print("2285_i64min: isInt=${jsonIsInt(minVal)} out=${jsonEncode(minVal)}\n")
+
+  let neighbourSrc = "-9223372036854775807"
+  let neighbourVal = jsonParse(neighbourSrc) catch e {
+    print("2285_neighbour: PARSE-FAIL ${e.message()}\n")
+    return
+  }
+  print("2285_neighbour: isInt=${jsonIsInt(neighbourVal)} out=${jsonEncode(neighbourVal)}\n")
+
+  // #2256: a 40-level nested tree, well inside the raised 1000-level cap,
+  // must survive an encode-then-parse round trip. At the old cap of 64 this
+  // failed past ~32 levels (an object nested in an array counts as two).
+  let deep = buildChain(40)
+  let deepText = jsonEncode(deep)
+  let deepBack = jsonParse(deepText) catch e {
+    print("2256_depth40: bytes=${len(deepText)} REPARSE-FAIL ${e.message()}\n")
+    return
+  }
+  print("2256_depth40: bytes=${len(deepText)} reparse=ok\n")
+}

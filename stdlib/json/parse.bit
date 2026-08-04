@@ -31,8 +31,13 @@
 // stays strict RFC 8259 so a caller that wants to reject comments still can.
 
 // `newBuilder` is already imported into this module by encode.bit — importing
-// it again here would collide (same module, same declaration).
-import { parseInt, contains, Builder } from "std/strings"
+// it again here would collide (same module, same declaration). Deliberately
+// NOT importing `strings.parseInt`: it rejects i64 MIN by design (its own
+// doc comment — "the parser accumulates a positive magnitude and would
+// overflow representing it"), which would route -9223372036854775808 to
+// `JsonFloat` and silently rewrite it (#2285). `parseJsonInt` below does its
+// own digit accumulation so this module can accept the full i64 range.
+import { contains, Builder } from "std/strings"
 
 // A cursor over `lex`'s token stream, plus the original source (decoding a
 // string or number needs to slice raw bytes back out of it).
@@ -289,10 +294,49 @@ function decodeNumber(src: string, t: Token): Json! {
   if (contains(text, ".") || contains(text, "e") || contains(text, "E")) {
     return Json.JsonFloat(parseFloat(text))
   }
-  let iv = parseInt(text) catch e {
+  let iv = parseJsonInt(text) catch e {
     return Json.JsonFloat(parseFloat(text))
   }
   return Json.JsonInt(iv)
+}
+
+// The i64 that the integral literal `text` (already validated by
+// `isValidJsonNumber` — optional `-`, then only digits) denotes, over the
+// FULL i64 range including MIN (-9223372036854775808). `text`'s magnitude
+// alone has no positive i64 representation, so a positive accumulator (as
+// `strings.parseInt` uses) always overflows one past `i64` MAX before the
+// sign is applied; this accumulates negatively instead, which has exactly
+// the headroom the positive side lacks. Fails (falling back to `JsonFloat`
+// in `decodeNumber`) only when the magnitude exceeds even that.
+function parseJsonInt(text: string): i64! {
+  let n = len(text)
+  let i = 0
+  let neg = false
+  if (text[0] == '-') {
+    neg = true
+    i = 1
+  }
+  // i64 MIN = -9223372036854775808 = -922337203685477580 * 10 - 8.
+  let minDiv10 = i64(-922337203685477580)
+  let minMod10 = i64(8)
+  let v = i64(0)
+  while (i < n) {
+    let d = i64(text[i] - '0')
+    if (v < minDiv10 || (v == minDiv10 && d > minMod10)) {
+      fail newError("json: number out of i64 range")
+    }
+    v = v * 10 - d
+    i = i + 1
+  }
+  if (neg) {
+    return v
+  }
+  // Positive side: v accumulated as if negative, so negate back, but reject
+  // i64 MIN itself (v == i64 MIN has no positive negation).
+  if (v == minDiv10 * 10 - minMod10) {
+    fail newError("json: number out of i64 range")
+  }
+  return 0 - v
 }
 
 // --- strings -------------------------------------------------------------
@@ -345,10 +389,39 @@ function writeUtf8(b: Builder, cp: i64): Builder {
 // parse error, never a panic. `lex` only ever emits `StringTok` for a span
 // that found its closing quote, so `[start+1, end-1)` is always the content
 // between the quotes.
+//
+// Fast path (#2293): most JSON strings — object keys, plain text values —
+// carry no `\` escape at all. A single pre-scan for the first `\` (a raw
+// control byte is invalid either way and fails immediately) lets an
+// escape-free span return as a direct sub-slice of `src`, with no Builder
+// call at all. Skipping this made the escape-decoding loop below run once
+// per byte even for a string with zero escapes: `Builder.writeByte` copies
+// the whole accumulated buffer on every call (#2112), so decoding an L-byte
+// escape-free string cost O(L^2). A string that does contain an escape still
+// goes through the byte-by-byte loop from that point on, batched from one
+// Builder call per escape-free run instead of one per byte.
 function decodeStringLiteral(src: string, t: Token): string! {
-  let i = t.start + 1
+  let start = t.start + 1
   let end = t.end - 1
-  let b = newBuilder()
+  let firstEscape = -1
+  let j = start
+  while (j < end) {
+    let cj = src[j]
+    if (cj < 32) {
+      fail newError("json: control character in string")
+    }
+    if (cj == '\\') {
+      firstEscape = j
+      j = end
+    } else {
+      j = j + 1
+    }
+  }
+  if (firstEscape < 0) {
+    return src[start:end]
+  }
+  let i = firstEscape
+  let b = newBuilder().write(src[start:firstEscape])
   while (i < end) {
     let c = src[i]
     if (c < 32) {
