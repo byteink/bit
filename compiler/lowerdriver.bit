@@ -3,6 +3,181 @@
 // changes. Grouping follows the layout recorded at
 // tag rescue/task-1689-stale-split.
 
+// The most instantiations Pass A1 may ADD to the ledger. Polymorphic recursion
+// (`f<T>` calling `f<Box<T>>`) has no finite monomorphization, so the closure
+// needs a hard stop; running out of budget leaves the ledger exactly as
+// incomplete as it was before the pass existed, which means the build refuses
+// with "cannot lower" rather than looping forever.
+const closureBudget = 4096
+
+// Every `call` node in the subtree rooted at `node`, in source order.
+//
+// An explicit stack rather than recursion, and bounded by the arena's own size:
+// this runs over trees the parser produced, but a walker whose only termination
+// argument is "the tree is a tree" is one malformed node away from not
+// terminating at all.
+function subtreeCallNodes(t: Tree, node: int): []int {
+  let out = []int(0)
+  if (node == 0) {
+    return out
+  }
+  let stack = [node]
+  let steps = 0
+  while (len(stack) > 0 && steps < len(t.nodes)) {
+    let n = stack[len(stack) - 1]
+    stack = stack[0:len(stack) - 1]
+    if (getNode(t, n).tag == Tag.Call) {
+      out = append(out, n)
+    }
+    // Pushed in reverse so the pops come out in source order, matching the
+    // arena order the check pass records in.
+    let kids = kidsOf(t, n)
+    let i = len(kids) - 1
+    while (i >= 0) {
+      if (kids[i] != 0) {
+        stack = append(stack, kids[i])
+      }
+      i = i - 1
+    }
+    steps = steps + 1
+  }
+  return out
+}
+
+// Records the instantiation every generic call in `node`'s subtree will ask for,
+// resolved EXACTLY the way `resolveCallTarget` resolves it during lowering: same
+// `funcRefAt` node keying, same `genericTypeArgs`. Any other rule would fill the
+// ledger with instances the emitted calls do not name, which is the failure this
+// pass exists to end rather than move.
+//
+// `bareNames` selects which callee spellings to consider. A NON-generic body
+// passes false: the check pass already recorded its `f(...)` calls, and only the
+// dotted `ns.f(...)` spelling — which checkmodule.bit never looks at — is
+// missing. An instance body passes true, because its calls must be re-resolved
+// under this instantiation's bindings.
+//
+// `genEnv` is that instantiation's (type param -> concrete arg) map, empty for a
+// non-generic body. It is applied to the INFERRED arguments for the same reason
+// `nodeType` applies it to every body node's type: the body was checked once
+// against unbound parameters, so an argument still typed `T` here is `i64` in
+// this instance and the call binds `i64`.
+function recordSubtreeInstantiations(c: Checker, node: int, bareNames: bool, genEnv: TypeEnv) {
+  let calls = subtreeCallNodes(c.tree, node)
+  let i = 0
+  while (i < len(calls)) {
+    let callee = kidsOf(c.tree, calls[i])[0]
+    let cn = getNode(c.tree, callee)
+    let name = ""
+    if (cn.tag == Tag.Ident && bareNames) {
+      name = c.source[cn.span.start:cn.span.end]
+    }
+    if (cn.tag == Tag.Member) {
+      let qn = nsQualifiedName(c, callee)
+      if (qn != "" && funcDeclLookup(c, qn) != 0) {
+        name = qn
+      }
+    }
+    if (name != "") {
+      let fr = funcRefAt(c, callee, name)
+      if (funcRefIsGeneric(fr)) {
+        recordInstantiation(c, fr, substTypeList(c, genericTypeArgs(c, name, calls[i]), genEnv))
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Binds `decl`'s type parameters to `args` in `oc`'s flat `userTypes`, returning
+// what each name held before. The same rebinding `lowerInstance` performs, and
+// for the same reason: every type node re-resolved while it is in force reads
+// the instantiation's concrete argument instead of the bare parameter.
+function bindTypeParams(oc: Checker, decl: int, args: []int): []int {
+  let saved = []int(0)
+  let tps = kidsOf(oc.tree, kidsOf(oc.tree, decl)[2])
+  let j = 0
+  while (j < len(tps)) {
+    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[j])[0])
+    let tpname = oc.source[tpn.span.start:tpn.span.end]
+    saved = append(saved, userTypeLookup(oc, tpname))
+    if (j < len(args)) {
+      oc.userTypes[tpname] = args[j]
+    }
+    j = j + 1
+  }
+  return saved
+}
+
+// Undoes `bindTypeParams`.
+function restoreTypeParams(oc: Checker, decl: int, saved: []int) {
+  let tps = kidsOf(oc.tree, kidsOf(oc.tree, decl)[2])
+  let j = 0
+  while (j < len(tps) && j < len(saved)) {
+    let tpn = getNode(oc.tree, kidsOf(oc.tree, tps[j])[0])
+    oc.userTypes[oc.source[tpn.span.start:tpn.span.end]] = saved[j]
+    j = j + 1
+  }
+}
+
+// Pass A1 — the MONOMORPHIZATION CLOSURE, run before anything is lowered.
+//
+// The check pass records one instantiation per generic call it sees, with the
+// type arguments that call binds where it stands (checkmodule.bit). Two shapes
+// escape it, and both then failed at lowering with the spanless, span-less
+// "cannot lower N function(s)":
+//
+//   - a generic call inside a GENERIC body (#2102, #2307). The body is checked
+//     ONCE, against the template's own unbound parameters, so `let a = f1(x);
+//     return f2(a)` records `f2<T>`. Every monomorphization of the enclosing
+//     generic then asks for `f2<i64>` — an instance nothing recorded — and the
+//     whole caller was stubbed. `return f2(f1(x))` escaped only because a Call
+//     argument's type is RE-COMPUTED at lowering time and so came back `<T>`
+//     again, while a local's is read from the checker's table and came back
+//     concrete: the two spellings disagreed about the same call.
+//   - a generic reached through a NAMESPACE import (#2133), `util.idOf(7)`.
+//     checkmodule.bit records only an `Ident` callee, so a dotted one recorded
+//     nothing at all and `std/seq` was unusable in its namespace spelling.
+//
+// The ledger doubles as the worklist — an instance appended here is itself
+// scanned — so a chain of generics closes transitively.
+function closeInstantiations(mods: []Checker, root: int) {
+  // Step 1: the dotted generic calls in every NON-generic body. A generic
+  // template is deliberately skipped here: its type parameters are not in scope
+  // at this point (the flat `userTypes` holds whichever generic in the module
+  // declared a `T` last, #1485), so reading its body now would bind arguments
+  // off another declaration's parameters. Step 2 visits it once per
+  // instantiation, with the right bindings in force.
+  let mi = 0
+  while (mi < len(mods)) {
+    let c = mods[mi]
+    let m = 1
+    while (m < len(c.tree.nodes)) {
+      if (getNode(c.tree, m).tag == Tag.FuncDecl && !isGenericFuncDecl(c, m)) {
+        recordSubtreeInstantiations(c, kidsOf(c.tree, m)[5], false, emptyTypeEnv())
+      }
+      m = m + 1
+    }
+    mi = mi + 1
+  }
+  // Step 2: every instantiation's own body, under that instantiation's bindings.
+  let ctx = mods[root].ctx
+  let budget = len(ctx.instantiations) + closureBudget
+  let g = 0
+  while (g < len(ctx.instantiations) && len(ctx.instantiations) < budget) {
+    let inst = ctx.instantiations[g]
+    if (inst.module >= 0 && inst.module < len(mods)) {
+      let owner = mods[inst.module]
+      let decl = funcDeclLookup(owner, inst.name)
+      if (decl != 0) {
+        let saved = bindTypeParams(owner, decl, inst.args)
+        recordSubtreeInstantiations(owner, kidsOf(owner.tree, decl)[5], true,
+          genericEnvOf(owner, decl, inst.args))
+        restoreTypeParams(owner, decl, saved)
+      }
+    }
+    g = g + 1
+  }
+}
+
 // Lowers method `decl` once per nominal instantiation of its generic receiver
 // `recvName`, appending each to `out` in the checker's instantiation order (the
 // seed's emission order). Returns `out` unchanged when the generic was never
