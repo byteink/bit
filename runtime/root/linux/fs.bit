@@ -97,6 +97,31 @@ const fsDirBufBytes: int = 8192
 @nosplit function strLenOf(s: int): int { return loadWord(s + strLen) }
 @nosplit function emptyStr(): int { return rtStrAlloc(0) }
 
+// `fsPathZ` copies a Bit string's bytes verbatim and appends its own NUL
+// terminator (#2146): a string carrying an embedded NUL byte (legal per
+// SPEC §21) would let the copy stop early from the syscall's point of view
+// while every Bit-side check — `len`, `==`, `hasSuffix`, `ext` — still sees
+// the full string, so the syscall opens a different path than the one that
+// was validated. Reject up front, same "reject, not truncate" contract
+// `fsPathZ` already applies to `n >= fsMaxPath`. Every one of the 8
+// path-taking `bit_rt_fs_*` entry points below routes through this instead
+// of calling `fsPathZ` directly.
+//
+// BOUNDED (Power of 10 rule 2): the scan is bounded by the string's own
+// length, exactly as `fsPathZ`'s copy loop it precedes.
+@nosplit function checkedPathZ(path: int): int {
+  let n = strLenOf(path)
+  let base = strData(path)
+  let i = 0
+  while (i < n) {
+    if (loadByte(base + i) == 0) {
+      return 0
+    }
+    i = i + 1
+  }
+  return fsPathZ(path)
+}
+
 // ---------------------------------------------------------------------------
 // Raw syscalls (the runtime/sched/ helpers)
 // ---------------------------------------------------------------------------
@@ -125,6 +150,28 @@ const fsDirBufBytes: int = 8192
     return 0 - 1
   }
   return rc
+}
+
+// Errno numbers (`<asm-generic/errno-base.h>`, identical on x86_64 and
+// aarch64): a path that genuinely does not resolve.
+const errnoNoEnt: int = 0 - 2
+const errnoNotDir: int = 0 - 20
+
+// Like `sysOpen(pathPtr, 0)` but returns the open syscall's RAW return value
+// instead of `sysOpen`'s own normalized `-1`. This runtime's `syscall`
+// builtin is a raw trap (§11.8), not glibc's wrapper, so a failed syscall's
+// negative result on Linux IS `-errno` directly (syscall(2)) — no
+// translation happens. Used only by `rtFsExists` (#2114), which needs to
+// tell `ENOENT`/`ENOTDIR` (genuinely missing) apart from `EACCES`/`EMFILE`/
+// `ELOOP`/`ENAMETOOLONG` (exists, just not currently openable this way).
+// `sysOpen`'s other callers only ever check `< 0` and must keep seeing the
+// exact `bit_rt_fs_*` ABI contract of `-1` on failure, so this does not
+// change `sysOpen` itself.
+@nosplit function sysOpenErrno(pathPtr: int): int {
+  if (isX64()) {
+    return int(syscall(sysOpenX64(), i64(pathPtr), i64(0), i64(permFile)))
+  }
+  return int(syscall(sysOpenatArm64(), i64(atFdCwd), i64(pathPtr), i64(0), i64(permFile)))
 }
 
 // The length of the NUL-terminated name at `addr`, capped at NAME_MAX+1 (256) so
@@ -223,10 +270,24 @@ const fsDirBufBytes: int = 8192
 // / `fsRead` / … language builtins, the same reason netabi names its wrappers
 // `netAbi*`.
 
+// Whether the already-open `fd` names a directory: `getdents64` succeeds on a
+// directory fd and answers `ENOTDIR` (rc < 0) on a regular file. Factored out
+// of `rtFsIsDir` so `rtFsOpen` can reuse the fd it already has instead of
+// opening the path a second time.
+@nosplit function isDirFd(fd: int): bool {
+  let rc = int(syscall(sysGetdents64(), i64(fd), i64(int(ptrOf(fsDirBuf))), i64(fsDirBufBytes)))
+  return rc >= 0
+}
+
 // `bit_rt_fs_open`: open `path` read-only (`write == false`) or create+truncate
-// write-only (`write == true`). Returns the fd, or -1.
+// write-only (`write == true`). Returns the fd, or -1. Rejects a directory
+// (#2149): `open(O_RDONLY)` on a directory succeeds on Linux with no
+// `O_DIRECTORY` guard, handing out a `File` nothing can actually read —
+// `readAll` then fabricates a zero-filled string sized by the directory's
+// on-disk size instead of failing. Checked here, once, so every caller
+// (`readFile`, `open`) fails the same way a missing path does.
 export @nosplit @symbol("bit_rt_fs_open") function rtFsOpen(path: int, write: bool): int {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return 0 - 1
   }
@@ -234,12 +295,20 @@ export @nosplit @symbol("bit_rt_fs_open") function rtFsOpen(path: int, write: bo
   if (write) {
     mode = 1
   }
-  return sysOpen(p, mode)
+  let fd = sysOpen(p, mode)
+  if (fd < 0) {
+    return 0 - 1
+  }
+  if (isDirFd(fd)) {
+    syscall(sysClose(), i64(fd))
+    return 0 - 1
+  }
+  return fd
 }
 
 // `bit_rt_fs_append`: open `path` create+append write-only. Returns the fd, or -1.
 export @nosplit @symbol("bit_rt_fs_append") function rtFsAppend(path: int): int {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return 0 - 1
   }
@@ -277,26 +346,30 @@ export @nosplit @symbol("bit_rt_fs_read") function rtFsRead(fd: int, max: int): 
   return rtStringSlice(big, 0, n)
 }
 
-// `bit_rt_fs_exists`: false for a missing path. Probes without a `stat` struct:
-// open read-only, then `getdents64` — mirroring `runtime/sched/`'s `statPath`. Open
-// failure means absent.
+// `bit_rt_fs_exists`: whether `path` names anything at all, per its own
+// `std/fs` doc comment — NOT merely "did `open(O_RDONLY)` succeed" (#2114).
+// A mode-000 file, or a directory hit while another process has exhausted
+// its fd table, still exists; only `ENOENT`/`ENOTDIR` mean genuinely absent.
 export @nosplit @symbol("bit_rt_fs_exists") function rtFsExists(path: int): bool {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return false
   }
-  let fd = sysOpen(p, 0)
-  if (fd < 0) {
+  let rc = sysOpenErrno(p)
+  if (rc >= 0) {
+    syscall(sysClose(), i64(rc))
+    return true
+  }
+  if (rc == errnoNoEnt || rc == errnoNotDir) {
     return false
   }
-  syscall(sysClose(), i64(fd))
   return true
 }
 
 // `bit_rt_fs_is_dir`: false for a missing path or a non-directory. A directory
 // answers `getdents64`; a regular file answers `ENOTDIR`.
 export @nosplit @symbol("bit_rt_fs_is_dir") function rtFsIsDir(path: int): bool {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return false
   }
@@ -304,15 +377,15 @@ export @nosplit @symbol("bit_rt_fs_is_dir") function rtFsIsDir(path: int): bool 
   if (fd < 0) {
     return false
   }
-  let rc = int(syscall(sysGetdents64(), i64(fd), i64(int(ptrOf(fsDirBuf))), i64(fsDirBufBytes)))
+  let isDir = isDirFd(fd)
   syscall(sysClose(), i64(fd))
-  return rc >= 0
+  return isDir
 }
 
 // `bit_rt_fs_mkdir`: 0 on success, -1 on failure (including "already exists").
 // x86_64 `mkdir` (nr 83) / aarch64 `mkdirat(AT_FDCWD, …)` (nr 34), mode 0o755.
 export @nosplit @symbol("bit_rt_fs_mkdir") function rtFsMkdir(path: int): int {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return 0 - 1
   }
@@ -332,7 +405,7 @@ export @nosplit @symbol("bit_rt_fs_mkdir") function rtFsMkdir(path: int): int {
 // directory: `unlink` then `rmdir` — `runtime/sched/`'s `removeAt`. aarch64 folds both
 // into `unlinkat`, the second carrying `AT_REMOVEDIR`.
 export @nosplit @symbol("bit_rt_fs_remove") function rtFsRemove(path: int): int {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return 0 - 1
   }
@@ -362,7 +435,7 @@ export @nosplit @symbol("bit_rt_fs_remove") function rtFsRemove(path: int): int 
 // yields fewer bytes than measured, so the result is trimmed to what pass 2 wrote
 // (`rtStringSlice` rejects `hi > len`, so the clamp also guards the allocation).
 export @nosplit @symbol("bit_rt_fs_list_dir") function rtFsListDir(path: int): int {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return emptyStr()
   }
@@ -444,7 +517,7 @@ export @nosplit @symbol("bit_rt_fs_write") function rtFsWrite(fd: int, s: int): 
 // `bit_rt_fs_chmod`: set `path`'s permission bits to `mode`. 0 on success, -1 on
 // any error. x86_64 `chmod` (nr 90) / aarch64 `fchmodat(AT_FDCWD, …)` (nr 53).
 export @nosplit @symbol("bit_rt_fs_chmod") function rtFsChmod(path: int, mode: int): int {
-  let p = fsPathZ(path)
+  let p = checkedPathZ(path)
   if (p == 0) {
     return 0 - 1
   }
