@@ -213,7 +213,18 @@ export function resolveDependencyRef(gitBin: string, url: string, ref: string, t
     fail newError("pmfetch: git ls-remote timed out after ${timeoutMs}ms: ${url}@${ref}")
   }
   if (run.exitCode != 0) {
-    fail newError("pmfetch: git ls-remote failed (exit ${run.exitCode}) for ${url}@${ref}: ${pmTrim(run.output)}")
+    let detail = pmTrim(run.output)
+    // `git ls-remote <url> <ref>` exits non-zero with EMPTY stdout+stderr when
+    // `ref` simply does not exist (verified exit 2 on git 2.55.0) — unlike an
+    // unreachable/not-found remote (exit 128), which always writes to stderr.
+    // Passing that empty `detail` through verbatim left a bare trailing colon
+    // and no message at all (#2268); a nonexistent ref is the single most
+    // common `bit add` mistake, so this gets its own named diagnostic instead
+    // of degrading further into the generic exit-code line below.
+    if (len(detail) == 0) {
+      fail newError("pmfetch: no ref '${ref}' in ${url}")
+    }
+    fail newError("pmfetch: git ls-remote failed (exit ${run.exitCode}) for ${url}@${ref}: ${detail}")
   }
   let sha = shaFromLsRemote(run.output)
   if (len(sha) == 0) {
@@ -270,10 +281,20 @@ function shaFromLsRemote(output: string): string {
 // the cached checkout must equal `sha`, or this fails loudly rather than
 // silently re-fetching — a mismatch means the cache directory was tampered
 // with or corrupted, and re-resolving over it would paper over exactly that.
-// The same applies to a *partial* prior fetch (interrupted before it ever
-// reached a valid HEAD): the directory already exists, so it is a cache-hit
-// candidate, and verification reports it as broken rather than silently
-// redoing the work — clearing a broken cache entry is a human's call.
+//
+// A fresh fetch (`finalDir` does not exist yet) is built entirely inside a
+// SCRATCH directory beside it and only moved into place once every step
+// verifies (#2257): before this, `init`/`fetch`/`checkout` ran directly
+// against `finalDir`, so any failure in between — a network drop, a killed
+// process, a sha that turns out not to exist on the remote — left a
+// half-fetched directory sitting exactly where a later run's `isDir(finalDir)`
+// check treats a directory as a cache-hit CANDIDATE. That later run then hit
+// the integrity check above and failed with "cache integrity error", forever
+// — the identical `bit add` failed a SECOND time in a different, more
+// confusing way, and nothing in the tool could clear it. Building in scratch
+// means a failed fetch leaves nothing at `finalDir` at all: a corrected retry
+// (the right sha, a reachable host) succeeds on its own, no manual cleanup
+// needed.
 export function fetchSha(
   gitBin: string, cacheRoot: string, host: string, owner: string, repo: string,
   url: string, sha: string, timeoutMs: int,
@@ -290,22 +311,63 @@ export function fetchSha(
   if (isDir(finalDir)) {
     let actual = revParseHead(gitBin, finalDir, timeoutMs)?
     if (actual != sha) {
-      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${sha}, found ${actual}")
+      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${sha}, found ${actual} — remove it and retry: rm -rf ${finalDir}")
     }
     return FetchResult{ dir: finalDir, sha: sha, cacheHit: true }
   }
 
   mkdirAll(pathDir(finalDir))?
 
-  let init = runGit(gitBin, ["init", "--quiet", finalDir], timeoutMs)?
-  if (init.timedOut) {
-    fail newError("pmfetch: git init timed out after ${timeoutMs}ms: ${finalDir}")
-  }
-  if (init.exitCode != 0) {
-    fail newError("pmfetch: git init failed (exit ${init.exitCode}) for ${finalDir}: ${pmTrim(init.output)}")
+  let scratchDir = finalDir + ".tmp-" + uuidFormat(uuidV4())
+  fetchGitInto(gitBin, scratchDir, url, sha, timeoutMs) catch e {
+    removeTree(scratchDir, timeoutMs)
+    fail e
   }
 
-  let fetch = runGit(gitBin, ["-C", finalDir, "fetch", "--quiet", "--depth", "1", url, sha], timeoutMs)?
+  // Another process may have won the race and already placed a verified
+  // `finalDir` while this one was fetching into its own scratch copy (two
+  // concurrent `bit add`s of the same not-yet-cached dependency) — never
+  // overwrite a real entry; just discard the redundant scratch copy and
+  // verify the winner exactly like an ordinary cache hit.
+  if (isDir(finalDir)) {
+    removeTree(scratchDir, timeoutMs)
+    let actual = revParseHead(gitBin, finalDir, timeoutMs)?
+    if (actual != sha) {
+      fail newError("pmfetch: cache integrity error at ${finalDir}: expected ${sha}, found ${actual} — remove it and retry: rm -rf ${finalDir}")
+    }
+    return FetchResult{ dir: finalDir, sha: sha, cacheHit: true }
+  }
+
+  let mv = runGit("mv", [scratchDir, finalDir], timeoutMs) catch e {
+    removeTree(scratchDir, timeoutMs)
+    fail e
+  }
+  if (mv.timedOut) {
+    removeTree(scratchDir, timeoutMs)
+    fail newError("pmfetch: moving the fetched checkout into place timed out after ${timeoutMs}ms: ${finalDir}")
+  }
+  if (mv.exitCode != 0) {
+    removeTree(scratchDir, timeoutMs)
+    fail newError("pmfetch: moving the fetched checkout into place failed (exit ${mv.exitCode}) for ${finalDir}: ${pmTrim(mv.output)}")
+  }
+
+  return FetchResult{ dir: finalDir, sha: sha, cacheHit: false }
+}
+
+// The init/fetch/checkout/verify sequence that used to run directly against
+// `fetchSha`'s `finalDir`, now run entirely inside a scratch directory so
+// `fetchSha` can clean up with one `removeTree` call on any failure instead
+// of repeating it after each of the four steps (#2257).
+function fetchGitInto(gitBin: string, dir: string, url: string, sha: string, timeoutMs: int): ()! {
+  let init = runGit(gitBin, ["init", "--quiet", dir], timeoutMs)?
+  if (init.timedOut) {
+    fail newError("pmfetch: git init timed out after ${timeoutMs}ms: ${dir}")
+  }
+  if (init.exitCode != 0) {
+    fail newError("pmfetch: git init failed (exit ${init.exitCode}) for ${dir}: ${pmTrim(init.output)}")
+  }
+
+  let fetch = runGit(gitBin, ["-C", dir, "fetch", "--quiet", "--depth", "1", url, sha], timeoutMs)?
   if (fetch.timedOut) {
     fail newError("pmfetch: git fetch timed out after ${timeoutMs}ms: ${url}@${sha}")
   }
@@ -313,19 +375,29 @@ export function fetchSha(
     fail newError("pmfetch: git fetch failed (exit ${fetch.exitCode}) for ${url}@${sha}: ${pmTrim(fetch.output)}")
   }
 
-  let checkout = runGit(gitBin, ["-C", finalDir, "checkout", "--quiet", sha], timeoutMs)?
+  let checkout = runGit(gitBin, ["-C", dir, "checkout", "--quiet", sha], timeoutMs)?
   if (checkout.timedOut) {
-    fail newError("pmfetch: git checkout timed out after ${timeoutMs}ms: ${sha} in ${finalDir}")
+    fail newError("pmfetch: git checkout timed out after ${timeoutMs}ms: ${sha} in ${dir}")
   }
   if (checkout.exitCode != 0) {
-    fail newError("pmfetch: git checkout failed (exit ${checkout.exitCode}) for ${sha} in ${finalDir}: ${pmTrim(checkout.output)}")
+    fail newError("pmfetch: git checkout failed (exit ${checkout.exitCode}) for ${sha} in ${dir}: ${pmTrim(checkout.output)}")
   }
 
-  let actual = revParseHead(gitBin, finalDir, timeoutMs)?
+  let actual = revParseHead(gitBin, dir, timeoutMs)?
   if (actual != sha) {
-    fail newError("pmfetch: fetched content does not match requested sha (got ${actual}, want ${sha}) in ${finalDir}")
+    fail newError("pmfetch: fetched content does not match requested sha (got ${actual}, want ${sha}) in ${dir}")
   }
-  return FetchResult{ dir: finalDir, sha: sha, cacheHit: false }
+}
+
+// Best-effort recursive removal of a directory this file created (a scratch
+// fetch that failed partway) — reuses `runGit`'s generic, timeout-bounded
+// subprocess runner for `rm -rf` rather than adding a second one; `runGit`
+// itself is not git-specific despite the name, it just execs `[bin,
+// ...args]`. Never fails outward: a cleanup that itself errors (e.g. `dir`
+// was never created because `git init` is what failed) must not mask the
+// fetch failure the caller is already propagating.
+function removeTree(dir: string, timeoutMs: int) {
+  runGit("rm", ["-rf", dir], timeoutMs) catch e { return }
 }
 
 // The checked-out commit at `dir`, or a loud failure naming why it could not
