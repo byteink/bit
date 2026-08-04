@@ -1,0 +1,296 @@
+// `bit lsp` resolution gate (#2327, #2329, #2330): drives the REAL
+// self-hosted `bit lsp` binary as a subprocess and asserts on its raw
+// JSON-RPC output for hover and textDocument/definition on a member-access
+// expression (`recv.field`, `recv.method(...)`) and on an imported/stdlib
+// name. All three previously resolved the name through the flat,
+// project-wide `nodeSymbols` scope instead of against the receiver's type
+// (member access) or the imported module's own symbol table (#2330), so
+// hover reported an unrelated same-named variable's type and definition
+// always returned null.
+//
+// SUBPROCESS MECHANICS as tests/bit/lsplifecycle.bit: a generated `/bin/sh`
+// wrapper redirects a pre-built batch JSON-RPC transcript to stdin and both
+// output streams to files, via `osRunBounded` (ABI.md §19).
+//
+// NOT WIRED INTO `./make test` YET, same reason and same follow-up as
+// lsplifecycle.bit: #2352 (tools/build/gates.bit is outside this change's
+// file fence).
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+
+const timeoutMs: int = 20000
+
+function failCase(msg: string) {
+  eprint("FAIL lspresolve: " + msg + "\n")
+  exit(1)
+}
+
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+function frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+function mkdirQuiet(path: string) {
+  mkdir(path) catch e { return }
+}
+
+function runLsp(bin: string, scratch: string, payload: string): (int, string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return 0, "", false
+  }
+  // `osRunBounded` does not forward this process's environment to the
+  // child, so a scenario that imports std/* (#2330) needs BIT_STDLIB
+  // exported explicitly — tests/bit/golden.bit's own idiom.
+  let stdlib = env("BIT_STDLIB")
+  let envLines = ""
+  if (stdlib != "") {
+    envLines = "BIT_STDLIB=" + shQuote(stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  let script = "#!/bin/sh\n" + envLines + "exec " + shQuote(bin) + " lsp < " + shQuote(inPath) +
+    " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return 0, "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return 0, "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return 0, "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return 0, "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return 0, "", false
+  }
+  let out = readFile(outPath) catch e { "" }
+  return code, out, true
+}
+
+// Escapes `s` for embedding as a JSON string literal's body. Narrow on
+// purpose: the only bytes the fixture source texts in this file ever contain
+// are '"', '\' and '\n'.
+function jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) { return true }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// #2327: hover on a struct field resolves against the receiver's type, not a
+// same-named unrelated variable in a sibling file.
+function checkHoverField(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/hover"
+  mkdirQuiet(dir)
+  let modelPath = dir + "/model.bit"
+  let otherPath = dir + "/other.bit"
+  let model = "struct Task {\n  done: bool,\n}\n\n" +
+    "function show(t: Task) {\n  let flag = t.done\n}\n"
+  // The unrelated file that shares the field's name with a DIFFERENT type —
+  // exactly the shape that read a same-named variable instead of the field.
+  let other = "function helper() {\n  let done = 0\n}\n"
+  writeFile(modelPath, model) catch e {
+    failCase("cannot write ${modelPath}: " + e.message())
+    return
+  }
+  writeFile(otherPath, other) catch e {
+    failCase("cannot write ${otherPath}: " + e.message())
+    return
+  }
+  let mUri = "file://" + modelPath
+  let oUri = "file://" + otherPath
+  let initReq = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+    "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}")
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let openModel = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${mUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(model) + "\"}}}")
+  let openOther = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${oUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(other) + "\"}}}")
+  // line 5 (0-based) "  let flag = t.done": 'done' starts at character 15.
+  let hoverReq = frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\"," +
+    "\"params\":{\"textDocument\":{\"uri\":\"${mUri}\"},\"position\":{\"line\":5,\"character\":15}}}")
+  let payload = initReq + initNotif + openModel + openOther + hoverReq
+  let (code, out, ok) = runLsp(bin, dir, payload)
+  if (!ok) { return }
+  if (!contains(out, "\"id\":2")) {
+    failCase("hover field: no reply for id 2\n" + out)
+    return
+  }
+  if (!contains(out, "done: bool")) {
+    failCase("hover field: expected 'done: bool' in the reply, got:\n" + out)
+    return
+  }
+  if (contains(out, "done: i64")) {
+    failCase("hover field: reply carries the UNRELATED variable's type (done: i64)\n" + out)
+    return
+  }
+  print("PASS lspresolve: hover on a struct field resolves against the receiver's type\n")
+}
+
+// #2329: definition on a method call and a field access, cross-file.
+function checkDefinitionMember(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/def"
+  mkdirQuiet(dir)
+  let taskPath = dir + "/task.bit"
+  let boardPath = dir + "/board.bit"
+  let task = "struct Task {\n  done: bool,\n}\n\n" +
+    "function (t: Task) complete() {\n  t.done = true\n}\n"
+  let board = "function main() {\n  let t = Task{ done: false }\n  t.complete()\n}\n"
+  writeFile(taskPath, task) catch e {
+    failCase("cannot write ${taskPath}: " + e.message())
+    return
+  }
+  writeFile(boardPath, board) catch e {
+    failCase("cannot write ${boardPath}: " + e.message())
+    return
+  }
+  let tUri = "file://" + taskPath
+  let bUri = "file://" + boardPath
+  let initReq = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+    "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}")
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let openTask = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${tUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(task) + "\"}}}")
+  let openBoard = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${bUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(board) + "\"}}}")
+  // board.bit line 2 (0-based) "  t.complete()": 'complete' starts at character 4.
+  let defReq = frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\"," +
+    "\"params\":{\"textDocument\":{\"uri\":\"${bUri}\"},\"position\":{\"line\":2,\"character\":4}}}")
+  let payload = initReq + initNotif + openTask + openBoard + defReq
+  let (code, out, ok) = runLsp(bin, dir, payload)
+  if (!ok) { return }
+  if (!contains(out, "\"id\":2")) {
+    failCase("definition on method call: no reply for id 2\n" + out)
+    return
+  }
+  if (contains(out, "\"id\":2,\"result\":null")) {
+    failCase("definition on method call: returned null instead of task.bit's declaration\n" + out)
+    return
+  }
+  if (!contains(out, "task.bit")) {
+    failCase("definition on method call: reply does not point at task.bit\n" + out)
+    return
+  }
+  print("PASS lspresolve: definition on a cross-file method call resolves\n")
+}
+
+// #2330: definition on an imported stdlib name jumps to its real declaration
+// in the stdlib source, at both the import site and the call site — not the
+// import statement's own binding name. Needs BIT_STDLIB (see `runLsp`); a
+// caller running this file directly without it gets a clear failure rather
+// than a silent skip.
+function checkDefinitionImport(bin: string, scratchRoot: string) {
+  if (env("BIT_STDLIB") == "") {
+    failCase("BIT_STDLIB is unset — this scenario needs the real std/strings source")
+    return
+  }
+  let dir = scratchRoot + "/import"
+  mkdirQuiet(dir)
+  let reportPath = dir + "/report.bit"
+  let report = "import { toUpper } from \"std/strings\"\n\n" +
+    "function shout(s: string): string {\n  return toUpper(s)\n}\n"
+  writeFile(reportPath, report) catch e {
+    failCase("cannot write ${reportPath}: " + e.message())
+    return
+  }
+  let rUri = "file://" + reportPath
+  let initReq = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+    "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}")
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let openReport = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${rUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(report) + "\"}}}")
+  // line 0 "import { toUpper } from \"std/strings\"": 'toUpper' starts at character 9.
+  let importDefReq = frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\"," +
+    "\"params\":{\"textDocument\":{\"uri\":\"${rUri}\"},\"position\":{\"line\":0,\"character\":9}}}")
+  // line 3 "  return toUpper(s)": 'toUpper' starts at character 9.
+  let callDefReq = frame("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/definition\"," +
+    "\"params\":{\"textDocument\":{\"uri\":\"${rUri}\"},\"position\":{\"line\":3,\"character\":9}}}")
+  let payload = initReq + initNotif + openReport + importDefReq + callDefReq
+  let (code, out, ok) = runLsp(bin, dir, payload)
+  if (!ok) { return }
+  if (!contains(out, "\"id\":2") || !contains(out, "\"id\":3")) {
+    failCase("definition on import: missing a reply for id 2 or id 3\n" + out)
+    return
+  }
+  if (contains(out, "\"id\":2,\"result\":null")) {
+    failCase("definition on import: import-site toUpper returned null\n" + out)
+    return
+  }
+  if (contains(out, "\"id\":3,\"result\":null")) {
+    failCase("definition on import: call-site toUpper returned null\n" + out)
+    return
+  }
+  if (!contains(out, "strings.bit")) {
+    failCase("definition on import: reply does not point at std/strings' source\n" + out)
+    return
+  }
+  print("PASS lspresolve: definition on an imported stdlib name resolves to its real declaration\n")
+}
+
+function main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  let scratchRoot = envOr("TMPDIR", "/tmp") + "/bit-lspresolve-${timeUnixNs()}"
+  mkdirQuiet(scratchRoot)
+  checkHoverField(bin, scratchRoot)
+  checkDefinitionMember(bin, scratchRoot)
+  checkDefinitionImport(bin, scratchRoot)
+  print("lspresolve: all scenarios passed\n")
+}

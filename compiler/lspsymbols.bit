@@ -1,0 +1,269 @@
+// bit lsp — a nested `DocumentSymbol` tree for textDocument/documentSymbol
+// (#2333). Split out of lspquery.bit (#1547) to keep that file under its
+// target size; sibling `.bit` files in `compiler/` are the same module, so
+// nothing here needs an import and lspquery.bit needs none to call it.
+//
+// THE BUG THIS EXISTS TO FIX: the old handler emitted one flat
+// `SymbolInformation` per top-level decl. A method
+// (`function (t: Task) label() {...}`) is a top-level decl by grammar, so it
+// rendered indistinguishable from a free function, and a struct's fields
+// never rendered at all. This file groups a struct's fields and its methods
+// as `children` of the struct instead.
+//
+// DELIBERATELY TREE-ONLY, NOT CHECKER-DEPENDENT: `documentSymbol` answers
+// even on a file with a syntax error, returning whatever the parser's error
+// recovery could still produce (a property this file must not regress — see
+// the ticket's "Not in scope" note). So a method's receiver type and a
+// field's type are read as literal SOURCE TEXT off the tree (`typeNodeName`,
+// a raw source slice) rather than through `ctx.structFields`/`methodSigs`,
+// which only the checker (not the resolver alone) populates and which may be
+// empty on such a file. Grouping matches a method to its struct by NAME TEXT
+// for the same reason — not `userTypeLookup`, which needs the checker's
+// `userTypes` table.
+
+// A `Range` object (no `uri` — unlike a Location, a DocumentSymbol's range is
+// implicitly within the requested document).
+function lspSpanRangeJson(p: Project, span: Span): string {
+  let m = p.mods[p.root]
+  let fl = fileOf(m.fileStarts, span.start)
+  let src = fileSource(p.sm, m.files[fl.fileIdx])
+  let start = fl.offset
+  let end = fl.offset + (span.end - span.start)
+  return lspRangeJson(lspSpanToRange(src, start, end))
+}
+
+// One `DocumentSymbol` JSON entry. `declNode`'s own span is `range` (the
+// whole declaration, matching what an editor highlights/folds); `nameNode`'s
+// is `selectionRange` (what the outline actually points the cursor at). ""
+// for the blank `_` binder — callers must check before using the result.
+function lspDocSymEntry(p: Project, declNode: int, nameNode: int, kind: int,
+    detail: string, hasDetail: bool, children: []string): string {
+  let m = p.mods[p.root]
+  let nameSp = getNode(m.tree, nameNode).span
+  let name = m.source[nameSp.start:nameSp.end]
+  if (name == "_") {
+    return ""
+  }
+  let s = "{\"name\":" + jsonEncodeString(name) + ",\"kind\":${kind}"
+  if (hasDetail) {
+    s = s + ",\"detail\":" + jsonEncodeString(detail)
+  }
+  s = s + ",\"range\":" + lspSpanRangeJson(p, getNode(m.tree, declNode).span) +
+    ",\"selectionRange\":" + lspSpanRangeJson(p, nameSp)
+  if (len(children) > 0) {
+    s = s + ",\"children\":[" + lspJoinComma(children) + "]"
+  }
+  return s + "}"
+}
+
+// A binding pattern's leaf entries: a bare identifier, or every element of a
+// tuple pattern (a destructuring `let (a, b) = ...`) — mirrors the flat
+// form's own pattern walk, now emitting `DocumentSymbol`s.
+function lspDocSymPattern(p: Project, tree: Tree, pat: int, kind: int, items: []string): []string {
+  if (pat == 0) {
+    return items
+  }
+  if (getNode(tree, pat).tag == Tag.TuplePat) {
+    let out = items
+    for sub of kidsOf(tree, pat) {
+      out = lspDocSymPattern(p, tree, sub, kind, out)
+    }
+    return out
+  }
+  let entry = lspDocSymEntry(p, pat, pat, kind, "", false, []string(0))
+  if (entry == "") {
+    return items
+  }
+  return append(items, entry)
+}
+
+// The `DocumentSymbol` children for struct `declNode`'s own fields: one
+// `Field` (kind 8) per member, `detail` the field's declared type as literal
+// source text. Mirrors `checkbind.bit`'s `resolveStructFields` traversal
+// (kid 2 of a StructDecl is its field list) without touching the checker.
+function lspStructFieldSymbols(p: Project, tree: Tree, source: string, declNode: int): []string {
+  let items = []string(0)
+  let fields = kidsOf(tree, kidsOf(tree, declNode)[2])
+  let fi = 0
+  while (fi < len(fields)) {
+    let fld = fields[fi]
+    fi = fi + 1
+    if (fld == 0) {
+      continue
+    }
+    let fieldDecl = fld
+    if (getNode(tree, fld).tag == Tag.Export) {
+      fld = kidsOf(tree, fld)[0]
+    }
+    let fk = kidsOf(tree, fld) // [name, type]
+    let tySp = getNode(tree, fk[1]).span
+    let entry = lspDocSymEntry(p, fieldDecl, fk[0], 8, source[tySp.start:tySp.end], true, []string(0))
+    if (entry != "") {
+      items = append(items, entry)
+    }
+  }
+  return items
+}
+
+// The nested `DocumentSymbol[]` for `fileIdx` of the root module's tree —
+// the concatenated tree holds every file's decls under one root, so this
+// filters to the ones whose text begins in the requested file, exactly as
+// the flat form did.
+//
+// TWO PASSES over the same decl list, because a method commonly follows the
+// struct it belongs to in source order (the ticket's own `task.bit`
+// example), so a single top-to-bottom pass cannot know a struct's full
+// method list before it has already emitted that struct's entry:
+//   1. collect: struct field-lists (seeding `childrenOf`) and every method's
+//      entry, bucketed by its receiver's type NAME.
+//   2. emit, in decl order: a struct gets its fields + collected methods as
+//      `children`; a method whose receiver type has NO struct decl in this
+//      file (declared elsewhere, or a plain type alias) is emitted at the
+//      top level instead of silently dropped; everything else is unchanged
+//      from the flat form's own per-kind handling.
+function lspDocumentSymbolTree(lp: LspProject, fileIdx: int): []string {
+  let p = lp.p
+  let m = p.mods[p.root]
+  let c = lp.mods[lp.p.root]
+  let tree = c.tree
+  let source = c.source
+  let decls = kidsOf(tree, tree.root)
+
+  let childrenOf = map<string, []string>{}
+  let hasStruct = map<string, bool>{}
+
+  // Pass 1a: struct field-lists, keyed by the struct's own name text.
+  let di = 0
+  while (di < len(decls)) {
+    let node = decls[di]
+    di = di + 1
+    if (node == 0) {
+      continue
+    }
+    if (fileOf(m.fileStarts, getNode(tree, node).span.start).fileIdx != fileIdx) {
+      continue
+    }
+    let unwrapped = node
+    if (getNode(tree, unwrapped).tag == Tag.Export) {
+      unwrapped = kidsOf(tree, unwrapped)[0]
+    }
+    if (unwrapped == 0 || getNode(tree, unwrapped).tag != Tag.StructDecl) {
+      continue
+    }
+    let k = kidsOf(tree, unwrapped)
+    let nameSp = getNode(tree, k[0]).span
+    let name = source[nameSp.start:nameSp.end]
+    hasStruct[name] = true
+    childrenOf[name] = lspStructFieldSymbols(p, tree, source, unwrapped)
+  }
+
+  // Pass 1b: methods, appended to their receiver's bucket by NAME TEXT
+  // (`typeNodeName` handles a generic receiver's base name the same way
+  // `checkbind.bit`'s `buildSignatures` does).
+  di = 0
+  while (di < len(decls)) {
+    let node = decls[di]
+    di = di + 1
+    if (node == 0) {
+      continue
+    }
+    if (fileOf(m.fileStarts, getNode(tree, node).span.start).fileIdx != fileIdx) {
+      continue
+    }
+    let unwrapped = node
+    if (getNode(tree, unwrapped).tag == Tag.Export) {
+      unwrapped = kidsOf(tree, unwrapped)[0]
+    }
+    if (unwrapped == 0 || getNode(tree, unwrapped).tag != Tag.FuncDecl) {
+      continue
+    }
+    let k = kidsOf(tree, unwrapped)
+    if (k[0] == 0) {
+      continue // a free function: handled in pass 2
+    }
+    let recvName = typeNodeName(c, kidsOf(tree, k[0])[1])
+    let entry = lspDocSymEntry(p, unwrapped, k[1], 6, "", false, []string(0))
+    if (entry == "") {
+      continue
+    }
+    let (cur, ok) = childrenOf[recvName]
+    if (ok) {
+      childrenOf[recvName] = append(cur, entry)
+    }
+    // No matching struct in this file: pass 2 emits it at the top level.
+  }
+
+  // Pass 2: emit in decl order.
+  let items = []string(0)
+  di = 0
+  while (di < len(decls)) {
+    let node = decls[di]
+    di = di + 1
+    if (node == 0) {
+      continue
+    }
+    if (fileOf(m.fileStarts, getNode(tree, node).span.start).fileIdx != fileIdx) {
+      continue
+    }
+    let declNode = node
+    let unwrapped = node
+    if (getNode(tree, unwrapped).tag == Tag.Export) {
+      unwrapped = kidsOf(tree, unwrapped)[0]
+    }
+    if (unwrapped == 0) {
+      continue
+    }
+    let tag = getNode(tree, unwrapped).tag
+    if (tag == Tag.StructDecl) {
+      let k = kidsOf(tree, unwrapped)
+      let nameSp = getNode(tree, k[0]).span
+      let name = source[nameSp.start:nameSp.end]
+      let (kids, ok) = childrenOf[name]
+      if (!ok) {
+        kids = []string(0)
+      }
+      let entry = lspDocSymEntry(p, declNode, k[0], 23, "", false, kids)
+      if (entry != "") {
+        items = append(items, entry)
+      }
+    } else if (tag == Tag.InterfaceDecl || tag == Tag.EnumDecl || tag == Tag.TypeAlias) {
+      let kind = 11
+      if (tag == Tag.EnumDecl) { kind = 10 }
+      if (tag == Tag.TypeAlias) { kind = 5 }
+      let entry = lspDocSymEntry(p, declNode, kidsOf(tree, unwrapped)[0], kind, "", false, []string(0))
+      if (entry != "") {
+        items = append(items, entry)
+      }
+    } else if (tag == Tag.FuncDecl) {
+      let k = kidsOf(tree, unwrapped)
+      if (k[0] == 0) {
+        let entry = lspDocSymEntry(p, declNode, k[1], 12, "", false, []string(0))
+        if (entry != "") {
+          items = append(items, entry)
+        }
+        continue
+      }
+      let recvName = typeNodeName(c, kidsOf(tree, k[0])[1])
+      let (_, grouped) = hasStruct[recvName]
+      if (!grouped) {
+        // No struct decl for this receiver in this file: still surface it,
+        // ungrouped, rather than drop it (a method on a type alias, or on a
+        // struct declared in a different file).
+        let entry = lspDocSymEntry(p, declNode, k[1], 6, "", false, []string(0))
+        if (entry != "") {
+          items = append(items, entry)
+        }
+      }
+      // Otherwise already nested under its struct's entry above.
+    } else if (tag == Tag.LetDecl || tag == Tag.ConstDecl) {
+      let kind = 13
+      if (tag == Tag.ConstDecl) { kind = 14 }
+      for binding of kidsOf(tree, unwrapped) {
+        if (binding != 0) {
+          items = lspDocSymPattern(p, tree, kidsOf(tree, binding)[0], kind, items)
+        }
+      }
+    }
+  }
+  return items
+}
