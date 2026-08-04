@@ -207,6 +207,60 @@ function vMentionsInvalid(c: Checker, ty: int, depth: int): bool {
   return false
 }
 
+// Whether two types differ ONLY where a type parameter sits (#2041) — the
+// structural form of `vAssignable`'s bare-TypeParam escape, and a strict
+// superset of it: a bare parameter on either side still short-circuits at the
+// top, so nothing the old test accepted is refused here.
+//
+// This can only ever turn a rejection into an acceptance, which is what makes it
+// safe: the ids of two same-spelled type params cannot be compared at all (see
+// vAssignable), so a composite over one carries exactly as little information as
+// the parameter itself. Kind and arity must still agree, so `[]T` against
+// `map<T,int>`, or `[]T` against `i64`, remains a real mismatch — this is not a
+// blanket "anything mentioning a T".
+//
+// Bounded like vMentionsInvalid: a recursive generic can cycle through its own
+// instantiation and this must terminate (Power of 10). Undecided at the bottom
+// answers YES, matching the permissive direction of every rule it serves.
+function vSameModuloTypeParams(c: Checker, a: int, b: int, depth: int): bool {
+  if (depth >= 32) { return true }
+  if (a == 0 || b == 0 || a == b) { return true }
+  let ta = c.ctx.types[a]
+  let tb = c.ctx.types[b]
+  if (ta.kind == TypeKind.TypeParam || tb.kind == TypeKind.TypeParam) { return true }
+  if (ta.kind != tb.kind) { return false }
+  let k = ta.kind
+  if (k == TypeKind.Slice || k == TypeKind.Chan) {
+    return vSameModuloTypeParams(c, ta.elem, tb.elem, depth + 1)
+  }
+  if (k == TypeKind.Array) {
+    return ta.arrayLen == tb.arrayLen && vSameModuloTypeParams(c, ta.elem, tb.elem, depth + 1)
+  }
+  if (k == TypeKind.Map) {
+    return vSameModuloTypeParams(c, ta.mapKey, tb.mapKey, depth + 1) &&
+      vSameModuloTypeParams(c, ta.mapVal, tb.mapVal, depth + 1)
+  }
+  if (k == TypeKind.Fallible) {
+    return vSameModuloTypeParams(c, ta.result, tb.result, depth + 1) &&
+      vSameModuloTypeParams(c, ta.errTy, tb.errTy, depth + 1)
+  }
+  if (k == TypeKind.Tuple || k == TypeKind.Func) {
+    if (len(ta.members) != len(tb.members)) { return false }
+    let i = 0
+    while (i < len(ta.members)) {
+      if (!vSameModuloTypeParams(c, ta.members[i], tb.members[i], depth + 1)) { return false }
+      i = i + 1
+    }
+    if (k == TypeKind.Func) {
+      return vSameModuloTypeParams(c, ta.result, tb.result, depth + 1)
+    }
+    return true
+  }
+  // Named types (struct/enum/interface) are NOT descended into: they are
+  // nominal, and `sameNominalDecl` above already answers for them.
+  return false
+}
+
 // Structural assignability with no source-literal awareness: identity, `nil`
 // into a nilable type, or an untyped constant whose DEFAULT type matches `dst`
 // exactly.
@@ -238,14 +292,21 @@ function vAssignable(c: Checker, src: int, dst: int): bool {
   if (c.ctx.types[dst].kind == TypeKind.Interface) {
     return vStorableInInterface(c, src) && vSatisfies(c, src, dst)
   }
-  // A type parameter on either side is accepted unchecked. Two decls that each
-  // declare `<T>` get two distinct TypeParam ids, and `userTypes` keys them by
-  // BARE NAME, so the last `<T>` in the module wins and an earlier decl's `T`
-  // resolves to the wrong id — `expected 'T', found 'T'` on
-  // tests/cases/run_generic_nested.bit, where `Opt<T>` and `Box<T>` coexist.
-  // Real fix is per-decl type-param scoping; until then the ids cannot be
-  // compared and the only sound answer is yes.
-  if (c.ctx.types[src].kind == TypeKind.TypeParam || c.ctx.types[dst].kind == TypeKind.TypeParam) {
+  // A type parameter on either side is accepted unchecked, and the same answer
+  // must hold wherever one is REACHED, not only where one is the whole type
+  // (#2041). Two decls that each declare `<T>` get two distinct TypeParam ids,
+  // and `userTypes` keys them by BARE NAME, so the last `<T>` in the module wins
+  // and an earlier decl's `T` resolves to the wrong id — `expected 'T', found
+  // 'T'` on tests/cases/run_generic_nested.bit, where `Opt<T>` and `Box<T>`
+  // coexist. Real fix is per-decl type-param scoping; until then the ids cannot
+  // be compared and the only sound answer is yes.
+  //
+  // Written as a bare-kind test, this rule fired for `v: T` and not for
+  // `items: []T`, which is why `struct Stack<T> { items: []T }` had no writable
+  // constructor: the struct's field is `[]T_struct` and the constructor's
+  // literal is `[]T_func`, two Slice ids, neither of them a TypeParam, so
+  // identity failed and E0041 printed the SAME SPELLING on both sides.
+  if (vSameModuloTypeParams(c, src, dst, 0)) {
     return true
   }
   if (isUntyped(c, src)) {
@@ -610,6 +671,23 @@ function vAssignableNode(c: Checker, node: int, src: int, dst: int): bool {
     if (c.ctx.types[dst].kind == TypeKind.Prim) {
       let lit = vLiteralValue(c, node)
       if (lit.ok) { return vRepresentable(c, lit.value, dst) }
+      // SPEC §15.4: a `const` expression over untyped literals is ITSELF an
+      // untyped constant, "usable in any type in which it is representable". So
+      // `1 << 63` must adapt to a `u64` exactly as `5` adapts to an `i32`
+      // (#2265). `vLiteralValue` deliberately reads one literal and no more, and
+      // on declining, control fell to `vAssignable`, whose untyped branch accepts
+      // only `defaultType(src) == dst` — i.e. i64 and nothing else. Every sized
+      // integer type was therefore unreachable by any expression: `let b: i32 =
+      // 2 + 3` was E0041 on the line after `let a: i32 = 5` was accepted.
+      //
+      // The folder is the one §11.11 already trusts, so `check` and `build`
+      // cannot disagree about what folds (the #1430 divergence class). It is
+      // also the folder #2261 taught to REFUSE an overflowing fold, which is
+      // what keeps this from turning `let x: u8 = 200 + 200` into a silent 144:
+      // an out-of-range result is still caught by `vRepresentable` below, and an
+      // i64-overflowing one never reaches it.
+      let folded = vConstEval(c, node, 0)
+      if (folded.ok && folded.kind == vcInt) { return vRepresentable(c, folded.ival, dst) }
     }
   }
   return vAssignable(c, src, dst)
