@@ -141,9 +141,7 @@ fire on exactly that case and nobody could fix it, so it does not exist.
 
 A file can override a rule's default or disable it entirely with a comment
 in its **leading comment block** - the unbroken run of `//` lines at the top
-of the file. A blank line ends the block, and so does the first declaration;
-a directive after either point is an ordinary comment, silently not applied
-rather than an error, since it is no longer recognized as a directive at all:
+of the file. A blank line ends the block, and so does the first declaration:
 
 ```
 // bit:lint <rule>=<n> -- <reason>
@@ -153,7 +151,14 @@ rather than an error, since it is no longer recognized as a directive at all:
 The reason is mandatory - not a stylistic nicety, but the whole review
 signal an override carries. A directive with no reason, no `=`, an
 unparseable number, or an unknown rule name is a hard error (exit 2), never
-a silent no-op.
+a silent no-op - and so is a well-formed directive found AFTER the leading
+block ends: every rule's own fix hint is rendered at the offending
+construct's span, which is the strongest possible signal that the directive
+belongs there, and it is the one placement that never applies it. `bit lint`
+reports it (also exit 2) rather than accepting it as an ordinary comment,
+pointing at the misplaced `// bit:lint` line and naming the fix. A `bit:`
+line for another tool (`// bit:fmt ...`) is still skipped wherever it sits -
+this check is specific to `bit:lint`.
 
 Deliberately **not** pinned to line 1: a golden test case's line 1 is
 already spoken for by the test harness's own mode directive, so the override
