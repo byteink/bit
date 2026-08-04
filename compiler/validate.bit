@@ -66,6 +66,14 @@ const ecGenericArityMismatch = 58
 // which means something else.
 const ecNoZeroValue = 83
 
+// E0084 (§15.4): a constant expression whose value does not fit i64, the widest
+// integer the folder evaluates in. "Constant expressions are evaluated at compile
+// time with no overflow", so this is a REPRESENTABILITY error and deliberately
+// not E0064 — the expression is perfectly constant, its value just does not
+// exist in the target type. First free code above E0083; E0200+ is the lint
+// registry (spec/LINT.md).
+const ecConstOverflow = 84
+
 // A literal's value, or `ok: false` when the node is not one. Bit has no
 // optional and no tuple return; a two-field struct is the whole story.
 struct VLit {
@@ -75,10 +83,17 @@ struct VLit {
 
 // A folded compile-time constant (§15.4). `kind` is one of `vcInt`/`vcFloat`/
 // `vcBool` and selects which payload is live — the seed's `ConstVal` union in
-// the form Bit spells it. `ok: false` means "not a constant expression", which
-// is the only signal §11.11 needs.
+// the form Bit spells it. `ok: false` means "not a constant expression".
+//
+// `overflow` is a SECOND, distinct failure, and separating the two is the whole
+// point of it (#2261). Both leave `ok: false`, but they are opposite statements
+// about the program: `9223372036854775807 + 1` IS a constant expression — it is
+// simply not representable — so reporting it as E0064 "must be a compile-time
+// constant expression" would tell the user something false about their own code.
+// A caller that only reads `ok` behaves exactly as it did before.
 struct VConst {
   ok: bool,
+  overflow: bool,
   kind: int,
   ival: int,
   fval: f64,
@@ -313,7 +328,57 @@ const vcString = 3
 const vConstMaxDepth = 64
 
 function vConstNone(): VConst {
-  return VConst{ ok: false, kind: vcInt, ival: 0, fval: 0.0 }
+  return VConst{ ok: false, overflow: false, kind: vcInt, ival: 0, fval: 0.0 }
+}
+
+// The other failure: a genuine constant expression whose value leaves i64.
+function vConstOver(): VConst {
+  return VConst{ ok: false, overflow: true, kind: vcInt, ival: 0, fval: 0.0 }
+}
+
+// ---- overflow-checked constant arithmetic (§15.4) --------------------------
+//
+// "Constant expressions are evaluated at compile time with no overflow (overflow
+// of the final target type is the representability error)." Folding in wrapping
+// i64 broke both halves at once (#2261): `300 * 365 * 24 * 60 * 60 * 1000000000`
+// compiled clean and ran as -8985944073709551616, and the true value
+// (9460800000000000000) was never seen by anything that could have judged it.
+// The wrong value was not merely large, it was NEGATIVE — an expiry 300 years
+// out landing 341 years in the past, with no diagnostic from check, build or
+// lint.
+//
+// i64 is the widest the folder has, so "does not fit i64" is where detection has
+// to live; §14.2's existing `vRepresentable` cannot help, because the WRAPPED
+// value is representable in i64 by construction.
+//
+// Each predicate is written so the check itself cannot overflow — no operation
+// below computes the very value it is trying to reject.
+
+function vI64Min(): int { return vPrimMin(3) }
+function vI64Max(): int { return vPrimMax(3) }
+
+function vAddOverflows(x: int, y: int): bool {
+  if (y > 0) { return x > vI64Max() - y }
+  if (y < 0) { return x < vI64Min() - y }
+  return false
+}
+
+// `y > 0` and `y < 0` are tested separately rather than via `vAddOverflows(x, -y)`
+// because negating i64 MIN is itself the overflow being looked for.
+function vSubOverflows(x: int, y: int): bool {
+  if (y > 0) { return x < vI64Min() + y }
+  if (y < 0) { return x > vI64Max() + y }
+  return false
+}
+
+// The division test is only valid once `y == -1` is out of the way — `MIN / -1`
+// is the one division that overflows — and `x == -1` is handled with it so the
+// pair is symmetric.
+function vMulOverflows(x: int, y: int): bool {
+  if (x == 0 || y == 0) { return false }
+  if (x == 0 - 1) { return y == vI64Min() }
+  if (y == 0 - 1) { return x == vI64Min() }
+  return (x * y) / y != x
 }
 
 // The initializer node of the module-level `const` named `name` in the module
@@ -367,38 +432,43 @@ function vConstEval(c: Checker, node: int, depth: int): VConst {
   let text = c.source[n.span.start:n.span.end]
 
   if (tag == Tag.IntLit) {
-    return VConst{ ok: true, kind: vcInt, ival: parseIntText(text), fval: 0.0 }
+    return VConst{ ok: true, overflow: false, kind: vcInt, ival: parseIntText(text), fval: 0.0 }
   }
   if (tag == Tag.RuneLit) {
-    return VConst{ ok: true, kind: vcInt, ival: parseRuneText(text), fval: 0.0 }
+    return VConst{ ok: true, overflow: false, kind: vcInt, ival: parseRuneText(text), fval: 0.0 }
   }
   if (tag == Tag.FloatLit) {
-    return VConst{ ok: true, kind: vcFloat, ival: 0, fval: parseFloat(text) }
+    return VConst{ ok: true, overflow: false, kind: vcFloat, ival: 0, fval: parseFloat(text) }
   }
   if (tag == Tag.BoolLit) {
     let b = 0
     if (text == "true") { b = 1 }
-    return VConst{ ok: true, kind: vcBool, ival: b, fval: 0.0 }
+    return VConst{ ok: true, overflow: false, kind: vcBool, ival: b, fval: 0.0 }
   }
   if (tag == Tag.StringLit || tag == Tag.RawStringLit) {
-    return VConst{ ok: true, kind: vcString, ival: 0, fval: 0.0 }
+    return VConst{ ok: true, overflow: false, kind: vcString, ival: 0, fval: 0.0 }
   }
 
   if (tag == Tag.Unary) {
     let v = vConstEval(c, kidsOf(c.tree, node)[0], depth + 1)
-    if (!v.ok) { return vConstNone() }
+    // Propagate the operand's verdict rather than flattening it: an overflow
+    // deeper in the tree must still be reported as an overflow at the top, not
+    // demoted to "not a constant expression" by the enclosing operator.
+    if (!v.ok) { return v }
     let op = n.main
     if (op == int(Kind.Plus)) { return v }
     if (op == int(Kind.Minus)) {
-      if (v.kind == vcInt) { return VConst{ ok: true, kind: vcInt, ival: 0 - v.ival, fval: 0.0 } }
-      if (v.kind == vcFloat) { return VConst{ ok: true, kind: vcFloat, ival: 0, fval: 0.0 - v.fval } }
+      // `0 - MIN` is the one negation that leaves i64.
+      if (v.kind == vcInt && v.ival == vI64Min()) { return vConstOver() }
+      if (v.kind == vcInt) { return VConst{ ok: true, overflow: false, kind: vcInt, ival: 0 - v.ival, fval: 0.0 } }
+      if (v.kind == vcFloat) { return VConst{ ok: true, overflow: false, kind: vcFloat, ival: 0, fval: 0.0 - v.fval } }
       return vConstNone()
     }
     if (op == int(Kind.Bang)) {
       if (v.kind != vcBool) { return vConstNone() }
       let b = 1
       if (v.ival != 0) { b = 0 }
-      return VConst{ ok: true, kind: vcBool, ival: b, fval: 0.0 }
+      return VConst{ ok: true, overflow: false, kind: vcBool, ival: b, fval: 0.0 }
     }
     return vConstNone()
   }
@@ -406,9 +476,9 @@ function vConstEval(c: Checker, node: int, depth: int): VConst {
   if (tag == Tag.Binary) {
     let k = kidsOf(c.tree, node)
     let a = vConstEval(c, k[0], depth + 1)
-    if (!a.ok) { return vConstNone() }
+    if (!a.ok) { return a }   // propagates `overflow`; see the Unary arm
     let b = vConstEval(c, k[1], depth + 1)
-    if (!b.ok) { return vConstNone() }
+    if (!b.ok) { return b }
     // §15.4 names string among the kinds whose literals "(and `const`
     // expressions over them)" are untyped constants, so `+` over two constant
     // strings is a constant expression and may initialize a top-level `const`
@@ -425,7 +495,7 @@ function vConstEval(c: Checker, node: int, depth: int): VConst {
     // to non-constant, which is what keeps `<`, `==` and the rest out.
     if (a.kind == vcString && b.kind == vcString) {
       if (n.main == int(Kind.Plus)) {
-        return VConst{ ok: true, kind: vcString, ival: 0, fval: 0.0 }
+        return VConst{ ok: true, overflow: false, kind: vcString, ival: 0, fval: 0.0 }
       }
       return vConstNone()
     }
@@ -435,15 +505,39 @@ function vConstEval(c: Checker, node: int, depth: int): VConst {
     let op = n.main
     let x = a.ival
     let y = b.ival
-    if (op == int(Kind.Plus)) { return vConstInt(x + y) }
-    if (op == int(Kind.Minus)) { return vConstInt(x - y) }
-    if (op == int(Kind.Star)) { return vConstInt(x * y) }
+    // §15.4: no wrapping. Only the three arithmetic operators are checked.
+    //
+    // `<<` IS DELIBERATELY EXCLUDED, and the exclusion is the interesting part.
+    // `1 << 63` is how a top-bit mask is spelled — this compiler writes it
+    // itself (compiler/x64value.bit's xF64SignMask) and #2265 exists to make
+    // `let m: u64 = 1 << 63` work — so treating the sign bit as an overflow
+    // would reject the idiom the operator is for. Shifting is bit placement,
+    // not arithmetic; §13.5's wrap discussion is about the latter. The bitwise
+    // operators below are exact for the same reason.
+    if (op == int(Kind.Plus)) {
+      if (vAddOverflows(x, y)) { return vConstOver() }
+      return vConstInt(x + y)
+    }
+    if (op == int(Kind.Minus)) {
+      if (vSubOverflows(x, y)) { return vConstOver() }
+      return vConstInt(x - y)
+    }
+    if (op == int(Kind.Star)) {
+      if (vMulOverflows(x, y)) { return vConstOver() }
+      return vConstInt(x * y)
+    }
+    // `MIN / -1` is the one quotient that leaves i64 (+2^63 has no i64), and on
+    // x86 it is a hardware trap rather than a wrap — so it must be caught before
+    // the division, not judged after it. `%` shares the guard: the mathematical
+    // answer is 0, but the same instruction computes both.
     if (op == int(Kind.Slash)) {
       if (y == 0) { return vConstNone() }
+      if (x == vI64Min() && y == 0 - 1) { return vConstOver() }
       return vConstInt(x / y)
     }
     if (op == int(Kind.Percent)) {
       if (y == 0) { return vConstNone() }
+      if (x == vI64Min() && y == 0 - 1) { return vConstInt(0) }
       return vConstInt(x % y)
     }
     if (op == int(Kind.Amp)) { return vConstInt(x & y) }
@@ -504,7 +598,7 @@ function vConstIdent(c: Checker, name: string, depth: int): VConst {
 }
 
 function vConstInt(v: int): VConst {
-  return VConst{ ok: true, kind: vcInt, ival: v, fval: 0.0 }
+  return VConst{ ok: true, overflow: false, kind: vcInt, ival: v, fval: 0.0 }
 }
 
 // The real assignability entry point: `node` is the source expression being
