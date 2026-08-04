@@ -6,8 +6,24 @@
 //
 // Buffering is what makes many small writes cheap: each `write` appends to an
 // in-memory buffer, and only a full buffer (or an explicit `flush`) costs a
-// syscall. Always `flush` before the stream goes out of scope — nothing does it
-// for you.
+// syscall. Always `flush` before a buffered stream goes out of scope — nothing
+// does it for you.
+//
+// `stdout()`/`stderr()` are the exception, and deliberately unbuffered (#2323).
+// Module state cannot hold a GC-traced type such as `Writer` (SPEC §11.11), so
+// there is no single shared instance an accessor can hand back: every call to
+// `stdout()`/`stderr()`/`writer(Stdout)`/`writer(Stderr)` builds a fresh
+// `Writer`, and two independently-built Writers with their own buffers would
+// silently diverge — a `write` through one is invisible to a `flush` through
+// the other, and any buffered bytes never flushed are lost the moment the
+// Writer goes out of scope. So a Writer aimed at `Stdout` or `Stderr` skips
+// buffering: `write`/`writeLine` reach the fd before the call returns, and
+// `flush` is always a no-op. Buffering stays in effect for a Writer over any
+// other fd via `writer(fd)` and held across calls, e.g. writing to a file.
+//
+// Every write can fail — a closed pipe, a read-only fd, a full disk — and
+// `write`/`writeLine`/`flush` all return a fallible result so the error is
+// not silently dropped (#2338); propagate with `?` or handle with `catch`.
 
 // Standard file descriptors, as the OS hands them to every process.
 export const Stdin: i64 = 0
@@ -26,6 +42,12 @@ const readChunkSize: int = 4096
 // able to name the type to annotate a binding or return it onward.
 export struct Writer { fd: i64, buf: string }
 
+// True for the two descriptors every `stdout()`/`stderr()` call independently
+// targets — see the file header (#2323) for why they must be unbuffered.
+function isStandardStream(fd: i64): bool {
+  return fd == Stdout || fd == Stderr
+}
+
 // A buffered writer over an already-open descriptor.
 export function writer(fd: i64): Writer {
   return Writer{ fd: fd, buf: "" }
@@ -39,24 +61,38 @@ export function stderr(): Writer {
   return writer(Stderr)
 }
 
-// Buffer `s`, flushing once the buffer is full.
-export function (w: Writer) write(s: string) {
+// Buffer `s`, flushing once the buffer is full, or fail on a write error.
+// `Stdout`/`Stderr` are unbuffered (see file header): `s` reaches the fd
+// before this call returns.
+export function (w: Writer) write(s: string): ()! {
+  if (isStandardStream(w.fd)) {
+    if (fsWrite(w.fd, s) < 0) {
+      fail newError("write failed")
+    }
+    return
+  }
   w.buf = w.buf + s
   if (len(w.buf) >= writeBufferSize) {
-    w.flush()
+    w.flush()?
   }
 }
 
-// Buffer `s` and a newline.
-export function (w: Writer) writeLine(s: string) {
-  w.write(s + "\n")
+// Buffer `s` and a newline, or fail on a write error.
+export function (w: Writer) writeLine(s: string): ()! {
+  w.write(s + "\n")?
 }
 
-// Write everything buffered to the descriptor. A no-op when nothing is pending.
-export function (w: Writer) flush() {
-  if (len(w.buf) > 0) {
-    fsWrite(w.fd, w.buf)
-    w.buf = ""
+// Write everything buffered to the descriptor, or fail on a write error. A
+// no-op when nothing is pending — always true for `Stdout`/`Stderr`, which
+// never buffer.
+export function (w: Writer) flush(): ()! {
+  if (len(w.buf) == 0) {
+    return
+  }
+  let pending = w.buf
+  w.buf = ""
+  if (fsWrite(w.fd, pending) < 0) {
+    fail newError("write failed")
   }
 }
 
@@ -93,17 +129,34 @@ function (r: Reader) fill(): bool {
   return true
 }
 
+// Appends `buf[start:end]` to `acc` one byte at a time and returns `acc`.
+// `append` grows a `[]byte` in amortized O(1) per element, unlike
+// concatenating onto a `string`, which copies everything gathered so far on
+// every call — the shape that made `readLine` quadratic (#2328).
+function appendRange(acc: []byte, buf: string, start: int, end: int): []byte {
+  let j = start
+  while (j < end) {
+    acc = append(acc, buf[j])
+    j = j + 1
+  }
+  return acc
+}
+
 // The next line, without its trailing newline. `None` only at end of input, so
 // a final line with no newline of its own is still returned.
 export function (r: Reader) readLine(): Option<string> {
   if (!r.fill()) {
     return Option<string>.None
   }
-  let line = ""
+  // Only a line that spans more than one refill needs `acc`: the common case
+  // (a line found within the current buffer) returns a single string slice
+  // below, no byte-by-byte copy at all (#2328).
+  let acc = []byte(0)
+  let haveAcc = false
   while (true) {
     if (!r.fill()) {
       // Input ended mid-line: what we have is a real, newline-less last line.
-      return Option.Some(line)
+      return Option.Some(string(acc))
     }
     // Consume up to the next newline in the current buffer, in one slice.
     let start = r.pos
@@ -111,12 +164,19 @@ export function (r: Reader) readLine(): Option<string> {
     while (i < len(r.buf) && r.buf[i] != '\n') {
       i = i + 1
     }
-    line = line + r.buf[start:i]
     if (i < len(r.buf)) {
       r.pos = i + 1 // step over the newline; it is not part of the line
-      return Option.Some(line)
+      if (!haveAcc) {
+        return Option.Some(r.buf[start:i])
+      }
+      acc = appendRange(acc, r.buf, start, i)
+      return Option.Some(string(acc))
     }
-    r.pos = i // buffer exhausted mid-line: refill and keep going
+    // Buffer exhausted mid-line: accumulate what this refill held and keep
+    // going. Each refill costs O(chunk), never O(line-so-far).
+    acc = appendRange(acc, r.buf, start, i)
+    haveAcc = true
+    r.pos = i
   }
   return Option<string>.None // unreachable; the loop only exits by returning
 }
