@@ -3,27 +3,42 @@
 // changes. Grouping follows the layout recorded at
 // tag rescue/task-1689-stale-split.
 
-// Lowers `for x of it` over a slice or array to the seed's counted-loop SSA:
-// hidden `$iter`/`$idx` locals thread through a header (test idx < len), a body
-// (bind the element, run the body), a step (advance idx, back to header), and an
-// exit. break -> exit, continue -> step. ponytail: slice/array only — map
-// iteration ($idx cursor via map_iter_*) deferred.
+// Lowers `for x of it` over a slice, array or map to the seed's counted-loop
+// SSA: hidden `$iter`/`$idx` locals thread through a header (test idx < len), a
+// body (bind the element, run the body), a step (advance idx, back to header),
+// and an exit. break -> exit, continue -> step. A `chan` iterable has no cursor
+// at all and goes to `lowerForOfChan`.
+//
+// The binder is one name over a slice/array (the element) or a `(pat, pat)`
+// pair: `(index, element)` over a slice/array (#2012), `(key, value)` over a
+// map. The checker types both halves of the pair either way, so a shape it
+// accepts and this refused was a build that failed after a clean `bit check`.
 function lowerForOf(fc: FnCtx, node: int) {
   let k = kidsOf(fc.c.tree, node)
   let iterTy = defaultType(fc.c, nodeType(fc, k[1]))
   let id = fc.c.ctx.types[iterTy]
   let isMap = id.kind == TypeKind.Map
+  let binderNode = getNode(fc.c.tree, k[0])
+  if (id.kind == TypeKind.Chan) {
+    lowerForOfChan(fc, k, iterTy, id.elem, binderNode)
+    return
+  }
   if (id.kind != TypeKind.Slice && id.kind != TypeKind.Array && !isMap) {
     fc.failed = true
     return
   }
-  // A slice/array binds one element; a map binds a `(key, value)` pair.
-  let binderNode = getNode(fc.c.tree, k[0])
   if (isMap && binderNode.tag != Tag.TuplePat) {
     fc.failed = true
     return
   }
-  if (!isMap && binderNode.tag != Tag.Ident) {
+  if (binderNode.tag != Tag.Ident && binderNode.tag != Tag.TuplePat) {
+    fc.failed = true
+    return
+  }
+  // Both pair forms bind exactly two names; the parser's `"(" pat "," pat ")"`
+  // admits no other arity, so this is a guard against indexing what is not there
+  // rather than a diagnosis.
+  if (binderNode.tag == Tag.TuplePat && len(kidsOf(fc.c.tree, k[0])) != 2) {
     fc.failed = true
     return
   }
@@ -128,10 +143,24 @@ function lowerForOf(fc: FnCtx, node: int) {
       ig.rhs = idxVal
       elemV = builderEmit(fc.b, ig)
     }
-    declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
-    rebindCheckerName(fc, k[0], elemTy)
+    // `for (i, x) of xs`: the cursor the header already tests IS the index, so
+    // the pair costs one extra binding and no extra instruction (#2012).
+    if (binderNode.tag == Tag.TuplePat) {
+      let subs = kidsOf(fc.c.tree, k[0])
+      let inode = getNode(fc.c.tree, subs[0])
+      declareLocal(fc, fc.c.source[inode.span.start:inode.span.end], idxVal, i64ty)
+      rebindCheckerName(fc, subs[0], i64ty)
+      let enode = getNode(fc.c.tree, subs[1])
+      declareLocal(fc, fc.c.source[enode.span.start:enode.span.end], elemV, elemTy)
+      rebindCheckerName(fc, subs[1], elemTy)
+    } else {
+      declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
+      rebindCheckerName(fc, k[0], elemTy)
+    }
   }
+  let deferBase = deferMark(fc)
   lowerStmtList(fc, k[2])
+  deferScopeEnd(fc, deferBase, k[2])
   truncateEnv(fc, bodyMark)
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   if (!fc.terminated) {
@@ -163,6 +192,90 @@ function lowerForOf(fc: FnCtx, node: int) {
   fc.terminated = false
   // Drop the hidden $iter/$idx locals.
   truncateEnv(fc, preLen - 2)
+}
+
+// Lowers `for v of c` over a channel (SPEC §16.2's range form): receive until
+// the channel is closed AND drained. The same header/body/step/exit skeleton as
+// the counted loop, minus the cursor — the two-result receive in the header is
+// both the test and the step, so the `ok` it reports drives the branch and the
+// step block only jumps back.
+//
+// SPEC §16.2 lists this beside send/receive/close, no compiler ever lowered it,
+// and nothing in the corpus used it (#2020). Without it a consumer must know how
+// many values will arrive, or invent a sentinel — the bookkeeping the
+// `(zero, false)` close protocol exists to remove.
+//
+// A channel yields ONE value per iteration, so the `(a, b)` binder that a map
+// takes has nothing to bind here.
+function lowerForOfChan(fc: FnCtx, k: []int, chanTy: int, elemTy: int, binderNode: Node) {
+  if (binderNode.tag != Tag.Ident) {
+    fc.failed = true
+    return
+  }
+  let chanV = lowerExpr(fc, k[1])
+  if (fc.failed) {
+    return
+  }
+  // The channel is evaluated once and carried as a hidden local, so the loop
+  // keeps receiving from the channel the header expression named even if the
+  // body rebinds the name it came from.
+  declareLocal(fc, "$chan", chanV, chanTy)
+  let preLen = len(fc.env)
+  let chanSlot = preLen - 1
+  let header = builderNewBlock(fc.b)
+  let bodyBlk = builderNewBlock(fc.b)
+  let stepBlk = builderNewBlock(fc.b)
+  let exitBlk = builderNewBlock(fc.b)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Header: `chan_recv` then `chan_recv_ok`, emitted back to back because the
+  // second reports on the immediately preceding receive (ABI.md §2.2). `ok`
+  // false is "closed and drained", which leaves the loop.
+  builderBeginBlock(fc.b, header)
+  addJoinParams(fc, preLen)
+  let rv = mkInstr(Op.RtCall, elemTy)
+  rv.name = "chan_recv"
+  rv.args = [fc.env[chanSlot].value]
+  let elemV = emitRtCall(fc, rv)
+  let okI = mkInstr(Op.RtCall, primType(fc.c.ctx, 10))
+  okI.name = "chan_recv_ok"
+  let okV = emitRtCall(fc, okI)
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = okV
+  br.ival = bodyBlk
+  br.thenArgs = []int(0)
+  br.ival2 = exitBlk
+  br.elseArgs = snapshotValues(fc, preLen)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  // Body: bind the received value (the header dominates it, so it needs no block
+  // param), run the body, fall to the step.
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen, isSwitch: false, exitUsed: false })
+  builderBeginBlock(fc.b, bodyBlk)
+  fc.terminated = false
+  let bodyMark = len(fc.env)
+  declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], elemV, elemTy)
+  rebindCheckerName(fc, k[0], elemTy)
+  let deferBase = deferMark(fc)
+  lowerStmtList(fc, k[2])
+  deferScopeEnd(fc, deferBase, k[2])
+  truncateEnv(fc, bodyMark)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  if (!fc.terminated) {
+    emitJump(fc, stepBlk, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  // Step: `continue`'s target. There is no cursor to advance.
+  builderBeginBlock(fc.b, stepBlk)
+  addJoinParams(fc, preLen)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Exit.
+  builderBeginBlock(fc.b, exitBlk)
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+  // Drop the hidden $chan local.
+  truncateEnv(fc, preLen - 1)
 }
 
 // Lowers a C-style `for (init; cond; post) body`. `init` declares the loop
@@ -211,7 +324,9 @@ function lowerForC(fc: FnCtx, node: int) {
   builderBeginBlock(fc.b, bodyBlk)
   fc.terminated = false
   let bodyMark = len(fc.env)
+  let deferBase = deferMark(fc)
   lowerStmtList(fc, k[3])
+  deferScopeEnd(fc, deferBase, k[3])
   truncateEnv(fc, bodyMark)
   fc.loops = fc.loops[0:len(fc.loops) - 1]
   if (!fc.terminated) {
@@ -526,7 +641,9 @@ function lowerCatch(fc: FnCtx, node: int, bind: bool): int {
     let en = getNode(fc.c.tree, k[1])
     declareLocal(fc, fc.c.source[en.span.start:en.span.end], errv, errTy)
     rebindCheckerName(fc, k[1], errTy)
+    let deferBase = deferMark(fc)
     handled = lowerCatchBlock(fc, k[2], okTy)
+    deferScopeEnd(fc, deferBase, k[2])
     handledTy = catchBlockType(fc, k[2])
     truncateEnv(fc, mark)
   } else {
