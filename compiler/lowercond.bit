@@ -258,7 +258,10 @@ function lowerIf(fc: FnCtx, node: int) {
 
   builderBeginBlock(fc.b, thenBlk)
   fc.terminated = false
+  let thenDefers = deferMark(fc)
   lowerStmtList(fc, k[1])
+  // A `defer` in this branch is scheduled only when the branch runs (#2280).
+  deferScopeEnd(fc, thenDefers, k[1])
   let joinReachable = !hasElse
   if (!fc.terminated) {
     joinReachable = true
@@ -271,11 +274,13 @@ function lowerIf(fc: FnCtx, node: int) {
   if (hasElse) {
     builderBeginBlock(fc.b, elseBlk)
     fc.terminated = false
+    let elseDefers = deferMark(fc)
     if (getNode(fc.c.tree, k[2]).tag == Tag.IfStmt) {
       lowerIf(fc, k[2])
     } else {
       lowerStmtList(fc, k[2])
     }
+    deferScopeEnd(fc, elseDefers, k[2])
     if (!fc.terminated) {
       joinReachable = true
       emitJump(fc, join, snapshotValues(fc, preLen))
@@ -385,7 +390,9 @@ function lowerSwitch(fc: FnCtx, node: int) {
     fc.terminated = false
     restoreValues(fc, orig)
     let mark = len(fc.env)
+    let caseDefers = deferMark(fc)
     lowerStmtList(fc, ck[1])
+    deferScopeEnd(fc, caseDefers, ck[1])
     truncateEnv(fc, mark)
     if (!fc.terminated) {
       joinReachable = true
@@ -402,7 +409,9 @@ function lowerSwitch(fc: FnCtx, node: int) {
   restoreValues(fc, orig)
   if (defaultStmts != 0) {
     let mark = len(fc.env)
+    let dfltDefers = deferMark(fc)
     lowerStmtList(fc, defaultStmts)
+    deferScopeEnd(fc, dfltDefers, defaultStmts)
     truncateEnv(fc, mark)
   }
   if (!fc.terminated) {
@@ -545,24 +554,14 @@ function lowerSelect(fc: FnCtx, node: int) {
     let mark = len(fc.env)
     // A recv case with a binder reads the received word from the descriptor.
     if (getNode(fc.c.tree, comm).tag == Tag.RecvBind) {
-      let rk = kidsOf(fc.c.tree, comm)
-      if (rk[0] != 0) {
-        let bn = getNode(fc.c.tree, rk[0])
-        if (bn.tag != Tag.Ident) {
-          fc.failed = true
-          return
-        }
-        let elemTy = fc.c.ctx.types[defaultType(fc.c, nodeType(fc, rk[1]))].elem
-        let fg = mkInstr(Op.FieldGet, elemTy)
-        fg.lhs = buf
-        fg.ival = off + 16
-        let rv = builderEmit(fc.b, fg)
-        let name = fc.c.source[bn.span.start:bn.span.end]
-        declareLocal(fc, name, rv, elemTy)
-        rebindCheckerName(fc, rk[0], elemTy)
+      bindSelectRecv(fc, comm, buf, off)
+      if (fc.failed) {
+        return
       }
     }
+    let caseDefers = deferMark(fc)
     lowerStmtList(fc, ck[1])
+    deferScopeEnd(fc, caseDefers, ck[1])
     truncateEnv(fc, mark)
     if (!fc.terminated) {
       joinReachable = true
@@ -582,7 +581,9 @@ function lowerSelect(fc: FnCtx, node: int) {
   restoreValues(fc, orig)
   if (hasDefault) {
     let mark = len(fc.env)
+    let dfltDefers = deferMark(fc)
     lowerStmtList(fc, defaultStmts)
+    deferScopeEnd(fc, dfltDefers, defaultStmts)
     truncateEnv(fc, mark)
   }
   if (!fc.terminated) {
@@ -600,6 +601,65 @@ function lowerSelect(fc: FnCtx, node: int) {
     builderEmit(fc.b, mkInstr(Op.Unreachable, fc.c.ctx.voidId))
     fc.terminated = true
   }
+}
+
+// Binds a fired recv clause's results out of its select descriptor, at the top
+// of that clause's body block. `case v = <- c:` binds the received word
+// (`word`, ABI.md §11); `case (v, ok) = <- c:` also binds the runtime's verdict
+// (`ok`), which is false exactly when the channel was closed and drained — the
+// same pair `let (v, ok) = <- c` yields outside a select.
+//
+// SPEC §16.3's `recv_bind = [ ( IDENT | tuple_pat ) "=" ] "<-" expression` has
+// always admitted the pair, and the checker types both halves, but only the
+// IDENT form was lowered (#2322). A select-based worker therefore could not
+// observe a closed channel at all: it had to carry a second channel to signal
+// the close out of band, or give up `select` for the plain two-result receive
+// and then wait on only one channel.
+function bindSelectRecv(fc: FnCtx, comm: int, buf: int, off: int) {
+  // recv_bind: [binder_or_none, chan]
+  let rk = kidsOf(fc.c.tree, comm)
+  if (rk[0] == 0) {
+    return
+  }
+  let bn = getNode(fc.c.tree, rk[0])
+  let isPair = bn.tag == Tag.TuplePat
+  if (bn.tag != Tag.Ident && !isPair) {
+    fc.failed = true
+    return
+  }
+  let binders = [rk[0]]
+  if (isPair) {
+    binders = kidsOf(fc.c.tree, rk[0])
+    if (len(binders) != 2) {
+      fc.failed = true
+      return
+    }
+  }
+  let elemTy = fc.c.ctx.types[defaultType(fc.c, nodeType(fc, rk[1]))].elem
+  let fg = mkInstr(Op.FieldGet, elemTy)
+  fg.lhs = buf
+  fg.ival = off + 16
+  let vn = getNode(fc.c.tree, binders[0])
+  declareLocal(fc, fc.c.source[vn.span.start:vn.span.end], builderEmit(fc.b, fg), elemTy)
+  rebindCheckerName(fc, binders[0], elemTy)
+  if (!isPair) {
+    return
+  }
+  // `ok` is a full descriptor WORD holding 0 or 1, so it is read as an i64 and
+  // compared — not loaded at the narrower width `bool` lays out to, which would
+  // read one byte of a word and be right only by little-endian accident.
+  let i64ty = primType(fc.c.ctx, 3)
+  let okg = mkInstr(Op.FieldGet, i64ty)
+  okg.lhs = buf
+  okg.ival = off + 24
+  let zero = mkInstr(Op.ConstInt, i64ty)
+  let ne = mkInstr(Op.ICmpNe, primType(fc.c.ctx, 10))
+  ne.lhs = builderEmit(fc.b, okg)
+  ne.rhs = builderEmit(fc.b, zero)
+  let okV = builderEmit(fc.b, ne)
+  let on = getNode(fc.c.tree, binders[1])
+  declareLocal(fc, fc.c.source[on.span.start:on.span.end], okV, primType(fc.c.ctx, 10))
+  rebindCheckerName(fc, binders[1], primType(fc.c.ctx, 10))
 }
 
 // Emits `field_set buf[off] = val` for a select descriptor word.
