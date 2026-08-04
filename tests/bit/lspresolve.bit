@@ -1,0 +1,180 @@
+// `bit lsp` member-resolution gate (#2327): drives the REAL self-hosted
+// `bit lsp` binary as a subprocess and asserts on its raw JSON-RPC output for
+// hover on a member-access expression (`recv.field`) — it previously resolved
+// the name AFTER the `.` as a bare identifier in a flat, project-wide scope
+// instead of against the receiver's type, so it reported an unrelated
+// same-named variable's type instead of the field's.
+//
+// SUBPROCESS MECHANICS as tests/bit/lsplifecycle.bit: a generated `/bin/sh`
+// wrapper redirects a pre-built batch JSON-RPC transcript to stdin and both
+// output streams to files, via `osRunBounded` (ABI.md §19).
+//
+// NOT WIRED INTO `./make test` YET, same reason and same follow-up as
+// lsplifecycle.bit: #2352 (tools/build/gates.bit is outside this change's
+// file fence).
+
+import { envOr, exit } from "std/os"
+import { readFile, writeFile, mkdir, exists } from "std/fs"
+
+const timeoutMs: int = 20000
+
+function failCase(msg: string) {
+  eprint("FAIL lspresolve: " + msg + "\n")
+  exit(1)
+}
+
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+function frame(body: string): string {
+  return "Content-Length: ${len(body)}\r\n\r\n" + body
+}
+
+function mkdirQuiet(path: string) {
+  mkdir(path) catch e { return }
+}
+
+function runLsp(bin: string, scratch: string, payload: string): (int, string, bool) {
+  mkdirQuiet(scratch)
+  let inPath = scratch + "/in"
+  let outPath = scratch + "/out"
+  let errPath = scratch + "/err"
+  let shPath = scratch + "/w.sh"
+  writeFile(inPath, payload) catch e {
+    failCase("cannot write input payload: " + e.message())
+    return 0, "", false
+  }
+  let script = "#!/bin/sh\nexec " + shQuote(bin) + " lsp < " + shQuote(inPath) +
+    " > " + shQuote(outPath) + " 2> " + shQuote(errPath) + "\n"
+  writeFile(shPath, script) catch e {
+    failCase("cannot write wrapper script: " + e.message())
+    return 0, "", false
+  }
+  if (fsChmod(shPath, 448) != 0) { // 0o700
+    failCase("cannot chmod wrapper script")
+    return 0, "", false
+  }
+  let code = osRunBounded(shPath, timeoutMs)
+  if (code == 0 - 2) {
+    failCase("TIMED OUT after ${timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return 0, "", false
+  }
+  if (code == 0 - 1) {
+    failCase("cannot launch wrapper script (spawn/wait failure)")
+    return 0, "", false
+  }
+  if (code <= 0 - 100) {
+    failCase("CRASHED: killed by signal ${0 - code - 100}")
+    return 0, "", false
+  }
+  let out = readFile(outPath) catch e { "" }
+  return code, out, true
+}
+
+// Escapes `s` for embedding as a JSON string literal's body. Narrow on
+// purpose: the only bytes the fixture source texts in this file ever contain
+// are '"', '\' and '\n'.
+function jsonEscape(s: string): string {
+  let out = ""
+  let i = 0
+  while (i < len(s)) {
+    let c = s[i]
+    if (c == u8('"')) {
+      out = out + "\\\""
+    } else if (c == u8('\\')) {
+      out = out + "\\\\"
+    } else if (c == u8('\n')) {
+      out = out + "\\n"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out
+}
+
+function contains(haystack: string, needle: string): bool {
+  let n = len(needle)
+  if (n == 0) { return true }
+  let i = 0
+  while (i + n <= len(haystack)) {
+    if (haystack[i:i + n] == needle) { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// #2327: hover on a struct field resolves against the receiver's type, not a
+// same-named unrelated variable in a sibling file.
+function checkHoverField(bin: string, scratchRoot: string) {
+  let dir = scratchRoot + "/hover"
+  mkdirQuiet(dir)
+  let modelPath = dir + "/model.bit"
+  let otherPath = dir + "/other.bit"
+  let model = "struct Task {\n  done: bool,\n}\n\n" +
+    "function show(t: Task) {\n  let flag = t.done\n}\n"
+  // The unrelated file that shares the field's name with a DIFFERENT type —
+  // exactly the shape that read a same-named variable instead of the field.
+  let other = "function helper() {\n  let done = 0\n}\n"
+  writeFile(modelPath, model) catch e {
+    failCase("cannot write ${modelPath}: " + e.message())
+    return
+  }
+  writeFile(otherPath, other) catch e {
+    failCase("cannot write ${otherPath}: " + e.message())
+    return
+  }
+  let mUri = "file://" + modelPath
+  let oUri = "file://" + otherPath
+  let initReq = frame("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," +
+    "\"params\":{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}}")
+  let initNotif = frame("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+  let openModel = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${mUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(model) + "\"}}}")
+  let openOther = frame("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{" +
+    "\"textDocument\":{\"uri\":\"${oUri}\",\"languageId\":\"bit\",\"version\":1," +
+    "\"text\":\"" + jsonEscape(other) + "\"}}}")
+  // line 5 (0-based) "  let flag = t.done": 'done' starts at character 15.
+  let hoverReq = frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\"," +
+    "\"params\":{\"textDocument\":{\"uri\":\"${mUri}\"},\"position\":{\"line\":5,\"character\":15}}}")
+  let payload = initReq + initNotif + openModel + openOther + hoverReq
+  let (code, out, ok) = runLsp(bin, dir, payload)
+  if (!ok) { return }
+  if (!contains(out, "\"id\":2")) {
+    failCase("hover field: no reply for id 2\n" + out)
+    return
+  }
+  if (!contains(out, "done: bool")) {
+    failCase("hover field: expected 'done: bool' in the reply, got:\n" + out)
+    return
+  }
+  if (contains(out, "done: i64")) {
+    failCase("hover field: reply carries the UNRELATED variable's type (done: i64)\n" + out)
+    return
+  }
+  print("PASS lspresolve: hover on a struct field resolves against the receiver's type\n")
+}
+
+function main() {
+  let bin = envOr("BIT", "bit-out/bin/bit")
+  if (!exists(bin)) {
+    failCase("BIT='${bin}' does not exist — refusing to guess")
+    return
+  }
+  let scratchRoot = envOr("TMPDIR", "/tmp") + "/bit-lspresolve-${timeUnixNs()}"
+  mkdirQuiet(scratchRoot)
+  checkHoverField(bin, scratchRoot)
+  print("lspresolve: all scenarios passed\n")
+}
