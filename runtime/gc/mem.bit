@@ -20,11 +20,21 @@
 // classes. That keeps `gc.bit` compiling for all three targets while the real
 // size-class allocator does all the actual allocation policy.
 //
-// The reserve is bump-only: it never takes memory back. Deliberately,
+// The reserve is bump-only: it never takes an INDIVIDUAL span back. Deliberately,
 // where a span, once carved into a size class, is never unmapped either
 // (`runtime/alloc/` unmaps only direct-mapped LARGE blocks). Reclaimed object memory
 // is recycled by the allocator's free lists, not by the reserve, so a churning
 // program is bounded by its live set.
+//
+// WHOLE CHUNKS, HOWEVER, ARE KNOWABLE AND RELEASABLE (#2373). Until this ticket
+// they were neither: `reserveGrow` mapped a chunk, rebased the descriptor onto
+// it and discarded the previous chunk's address, so the pages could not be
+// unmapped even in principle. The three-word descriptor now threads a list of
+// the chunks IT mapped through the chunks themselves, and `reserveRelease`
+// walks it. Two things follow, and only the second is a behaviour change:
+// `gcDeinit` returns the collector's mapped memory to the OS, and a span is
+// now aligned to `allocSpanBytes` so that a later ticket can reason about
+// which span an address belongs to at all (#2374).
 //
 // WHAT THE RESERVE IS NOT: A CAP (#1638)
 // --------------------------------------
@@ -51,11 +61,34 @@
 // allocator are built on, so it must not allocate through the managed heap and
 // must not reach a safepoint.
 
-// A reserve descriptor is three words: base, end, bump.
+// A reserve descriptor is three words, and THREE IS A FIXED WIDTH rather than a
+// convenience: `runtime/root/{linux,darwin}/boot.bit` spells the channel
+// descriptor as a literal `[3]i64`, and `../gc.bit` embeds two of them in a
+// state block whose width `runtime/root/root.bit` refuses to boot unless it is
+// exactly `gcWords == 37`. A fourth word is not free; it is three edits in two
+// other modules.
 export const reserveWords = 3
-const resBase = 0
+
+// Head of the list of chunks THIS reserve mapped from the OS, 0 = none.
+//
+// It occupies the word the arena's BASE address used to, which nothing ever
+// read: a bump allocator needs a cursor (`resBump`) and a limit (`resEnd`), and
+// the base was only ever the cursor's initial value. Reusing it is what makes
+// the chunk list fit in the fixed three words above.
+//
+// The list is threaded through the chunks themselves — `chunkNextOff` and
+// `chunkLenOff` at each chunk's own base — so remembering a chunk costs no
+// allocation. Memory a CALLER handed to `reserveInit` is never on this list;
+// see `reserveRelease` for why that distinction is the whole point.
+const resChunks = 0
 const resEnd = 1
 const resBump = 2
+
+// Byte offsets of a mapped chunk's own two header words, written into the first
+// 16 bytes of the chunk. The bump therefore starts at `base + chunkHdrBytes`.
+const chunkNextOff = 0
+const chunkLenOff = 8
+const chunkHdrBytes = 16
 
 // The `*i64` addressing the 8-aligned machine word at `addr`. `*i64` arithmetic
 // scales by 8, so stepping that many elements off the null pointer lands
@@ -122,6 +155,18 @@ export @nosplit @symbol("bit_rt_port_mem_store_byte") function storeByte(addr: i
   return n + (m - r)
 }
 
+// Round `n` up to the next multiple of the POWER OF TWO `a`. The mask form, and
+// the only alignment the reserve needs: the sole value passed for `a` here is
+// `allocSpanBytes`.
+//
+// `allocSpanBytes` is `../alloc`'s and is in scope without an import of its
+// own: an import binds the whole MODULE, and `./gc.bit` — this file's sibling,
+// so the same module (§17.1) — already imports it. Importing it here as well is
+// E0042, not a second binding.
+@nosplit function memAlignUp(n: int, a: int): int {
+  return (n + a - 1) & ~(a - 1)
+}
+
 // Initialise a reserve over `[addr, addr + bytes)`. The caller owns the
 // storage and must have obtained it from the OS (mapped pages) or from memory
 // that is already resident for the process lifetime.
@@ -131,16 +176,39 @@ export @nosplit @symbol("bit_rt_port_mem_store_byte") function storeByte(addr: i
 // freestanding chan emit spells by the callee's emitted symbol — an unpinned
 // export is `m<N>$name`, a name no separately emitted object can define (#1613).
 // Same `bit_rt_port_` placeholder as every other cross-module runtime helper.
+// CALL IT ONCE PER RESERVE. It clears the chunk list, so calling it a second
+// time on a reserve that has since grown forgets every chunk `reserveGrow`
+// mapped — exactly the leak this ticket removed. `reserveGrow` therefore
+// rebases the descriptor itself instead of calling this.
 export @nosplit @symbol("bit_rt_port_mem_reserve_init") function reserveInit(r: *i64, addr: int, bytes: int) {
-  *(r + resBase) = addr
+  *(r + resChunks) = 0
   *(r + resEnd) = addr + bytes
   *(r + resBump) = addr
 }
 
-// Take `n` bytes, 8-aligned, from the reserve. Returns 0 when exhausted — the
+// Take `n` bytes from the reserve. Returns 0 when exhausted — the
 // same "out of memory" sentinel the allocator uses, and the one `gcAlloc`
 // propagates as `runtime/gc/`'s `?[*]u8` null.
 //
+// A TAKE OF AT LEAST `allocSpanBytes` IS ALIGNED TO `allocSpanBytes` (#2373);
+// anything smaller stays 8-aligned. The rule is by SIZE rather than by caller
+// because both matter:
+//
+//   - #2374 finds the span owning a slot by masking the slot's address with
+//     `~(allocSpanBytes - 1)`, which is sound only if EVERY span starts on that
+//     boundary. Enforced here it stays true for a second span consumer; passed
+//     in by the one call site it stays true until someone forgets.
+//   - Aligning the SMALL takes too would cost a whole span each, and the
+//     channel reserve makes thousands of 128-byte ones (#1680). So a take large
+//     enough to be a span is treated as one, and nothing else is.
+//
+// It is also stronger than page alignment on every target, deliberately: `boot`
+// passes 4096 as the nominal page size even on aarch64-macos, where the real
+// page is 16 KiB, so "align to the page size the collector was told about"
+// would not have produced a page-aligned span there. 131072 is a multiple of
+// both.
+//
+
 // PINNED (ABI.md §9): `runtime/chan`'s `chan_make` carves each channel handle
 // and (buffered) ring out of the boot-provisioned reserve with this call, across
 // the object boundary — so it needs the emitted-symbol contract every
@@ -152,11 +220,15 @@ export @nosplit @symbol("bit_rt_port_mem_reserve_take") function reserveTake(r: 
   let want = memRoundUp(n, 8)
   let bump = *(r + resBump)
   let end = *(r + resEnd)
-  if (bump + want > end) {
+  let start = bump
+  if (want >= allocSpanBytes) {
+    start = memAlignUp(bump, allocSpanBytes)
+  }
+  if (start + want > end) {
     return 0
   }
-  *(r + resBump) = bump + want
-  return bump
+  *(r + resBump) = start + want
+  return start
 }
 
 // ---------------------------------------------------------------------------
@@ -236,8 +308,13 @@ const reserveChunkBytes = 4194304
 //
 // Rebasing abandons whatever is left in the current chunk. That is bounded by
 // the largest single request the reserve serves and happens at most once per
-// chunk, so it is a rounding error against `reserveChunkBytes` — and it keeps
-// the descriptor three words, with no chunk list to walk or free.
+// chunk, so it is a rounding error against `reserveChunkBytes`.
+//
+// The abandoned chunk is REMEMBERED, though (#2373): it is pushed onto the
+// reserve's chunk list, threaded through its own first two words, before the
+// descriptor moves on. That is what `reserveRelease` walks, and it is why this
+// function rebases the three words by hand rather than calling `reserveInit`,
+// which clears the list.
 //
 // PINNED (ABI.md §9): `runtime/chan`'s `chan_make` calls it across the object
 // boundary, so it needs the emitted-symbol contract rather than a per-build
@@ -251,18 +328,59 @@ export @nosplit @symbol("bit_rt_port_mem_reserve_grow") function reserveGrow(r: 
   if (n <= 0) {
     return 0
   }
-  // A request larger than a chunk gets its own exactly-sized chunk.
+  // A request larger than a chunk gets its own chunk, sized for the request
+  // PLUS the two link words at the chunk's base and, for a take big enough to
+  // be span-aligned, the gap ahead of the first aligned address. Without that
+  // slack an exactly-`want`-sized chunk would not fit the take that asked for
+  // it and this would return 0 with memory in hand.
   let want = memRoundUp(n, 8)
-  let chunk = reserveChunkBytes
-  if (want > chunk) {
-    chunk = memRoundUp(want, reserveChunkBytes)
+  let slack = chunkHdrBytes
+  if (want >= allocSpanBytes) {
+    slack = chunkHdrBytes + allocSpanBytes
   }
+  let chunk = memRoundUp(want + slack, reserveChunkBytes)
   let base = int(bit_rt_map_pages(i64(chunk)))
   if (base == 0) {
     return 0
   }
-  reserveInit(r, base, chunk)
+  // Push before bumping: the link words are the chunk's own first 16 bytes, so
+  // the new bump starts past them.
+  storeWord(base + chunkNextOff, *(r + resChunks))
+  storeWord(base + chunkLenOff, chunk)
+  *(r + resChunks) = base
+  *(r + resEnd) = base + chunk
+  *(r + resBump) = base + chunkHdrBytes
   return reserveTake(r, n)
+}
+
+// Unmap every chunk this reserve mapped, and report how many bytes went back to
+// the OS. The reserve is EMPTY afterwards, not merely rewound: `resEnd` and
+// `resBump` are zeroed, so a later `reserveTake` returns 0 and a later
+// `reserveGrow` maps a fresh chunk rather than bumping into freed address
+// space.
+//
+// MEMORY A CALLER SUPPLIED TO `reserveInit` IS NEVER TOUCHED, and that is the
+// reason this walks a list instead of unmapping `[base, end)`. The collector's
+// first arena belongs to `boot`, and `tests/stress/gcindexchurn` binds a
+// Bit-managed `[]i64` as its own. Only `reserveGrow` pushes, so neither can
+// reach this loop — a distinction the previous "no chunk list" shape could not
+// have made at all.
+export @nosplit function reserveRelease(r: *i64): int {
+  let freed = 0
+  let c = *(r + resChunks)
+  // Bounded: one iteration per chunk this reserve mapped, each of which is at
+  // least `reserveChunkBytes` of address space the OS handed back.
+  while (c != 0) {
+    let next = loadWord(c + chunkNextOff)   // read BEFORE the chunk is unmapped
+    let nbytes = loadWord(c + chunkLenOff)
+    memUnmapPages(c, nbytes)
+    freed = freed + nbytes
+    c = next
+  }
+  *(r + resChunks) = 0
+  *(r + resEnd) = 0
+  *(r + resBump) = 0
+  return freed
 }
 
 // Map `nbytes` bytes straight from the OS, bypassing the reserve. This is the
