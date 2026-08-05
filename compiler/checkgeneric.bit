@@ -438,6 +438,150 @@ function isComparisonOp(op: int): bool {
     op == int(Kind.AmpAmp) || op == int(Kind.PipePipe)
 }
 
+// Whether the type node `tnode` names any of `names`. The seeding pass below
+// uses it to keep a parameter position whose type still mentions an UNBOUND type
+// param out of an arrow's expectation: resolving one anyway hands the arrow a
+// bare `T`, and `x * 2` against it is E0053 "operator not defined for 'T' and
+// 'untyped int'" — a diagnostic manufactured out of a program that checks today.
+function typeNodeMentionsAny(owner: Checker, tnode: int, names: []string): bool {
+  if (tnode == 0 || len(names) == 0) {
+    return false
+  }
+  let n = getNode(owner.tree, tnode)
+  if (n.tag == Tag.Ident) {
+    let nm = owner.source[n.span.start:n.span.end]
+    let i = 0
+    while (i < len(names)) {
+      if (names[i] == nm) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+  let kids = kidsOf(owner.tree, tnode)
+  let k = 0
+  while (k < len(kids)) {
+    if (typeNodeMentionsAny(owner, kids[k], names)) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+// Binds `tpname` from the first NON-arrow argument whose parameter type mentions
+// it. Deliberately not `bindTypeParamAtCall`: this runs in the seeding pre-pass,
+// before an arrow's own parameters have been typed, so reading an arrow argument
+// here would type that arrow with the invalid parameter the seeding exists to
+// prevent — and SPEC 15.3 makes the arrow the RECEIVER of the inward flow, never
+// its source. `bindTypeParamFromInit` is left out for the same reason: it walks
+// back through a binding's initializer, which is a call, which types its own
+// arguments.
+// `pc` declares the generic (its tree holds `params`); `ac` is the caller.
+function bindTypeParamFromValueArgs(pc: Checker, ac: Checker, callNode: int,
+    params: []int, args: []int, tpname: string): int {
+  let pi = 0
+  while (pi < len(params)) {
+    if (getNode(ac.tree, argInner(ac, args[pi])).tag != Tag.ArrowFn) {
+      let pnode = kidsOf(pc.tree, params[pi])[1]
+      let b = bindTypeParamFromNode(pc, pnode,
+        defaultType(ac, checkArgType(ac, callNode, pi)), tpname)
+      if (b == 0 && getNode(pc.tree, pnode).tag == Tag.GenericInst) {
+        b = bindTypeParamNodeVsNode(pc, pnode, ac,
+          argTypeNode(ac, callArgNode(ac, callNode, pi)), tpname)
+      }
+      if (b != 0) {
+        return b
+      }
+    }
+    pi = pi + 1
+  }
+  return 0
+}
+
+// The type `tnode` denotes under `sub`, or 0 when it still mentions a type param
+// nothing bound — recording nothing rather than a guess.
+function substTypeGuarded(owner: Checker, tnode: int, sub: TypeSubst, unbound: []string): int {
+  if (tnode == 0 || typeNodeMentionsAny(owner, tnode, unbound)) {
+    return 0
+  }
+  return typeFromNodeIn(owner, tnode, sub)
+}
+
+// `mapped([1, 2, 3], x => x * 2)` — a GENERIC callee's parameter type is written
+// against its type params, so the arrow's expectation only exists once the other
+// arguments have bound them. SPEC 15.3 fixes the order: type params are inferred
+// by unifying parameter types with argument types, and an expected type then
+// flows inward. `T` binds to i64 from the first argument, the arrow is checked
+// against `(i64) => U`, its body types to i64, and `bindTypeParamAtCall` then
+// binds `U` structurally from the arrow's OWN function type.
+//
+// Skipping generics outright is what made `seq.mapped` and `seq.forEach`
+// unusable with the bare-parameter arrow their signatures invite (#2040): the
+// arrow's parameter stayed at 0, its body typed to nothing, nothing bound `U`,
+// `genericTypeArgs` fell through to `()`, and the instantiation `mapped<i64, ()>`
+// refused to lower. `(T) => bool` escaped only because a concrete result needs no
+// binding at all, and `reduce` because `A` is fixed by `init` before the arrow.
+//
+// The non-generic path's rule survives one level down: a position still
+// mentioning an unbound type param resolves to 0, so the arrow is left inferred
+// exactly as before rather than handed a wrong expectation.
+function seedArrowExpectedGeneric(c: Checker, callNode: int, owner: Checker,
+    decl: int, args: []int) {
+  let dk = kidsOf(owner.tree, decl)
+  let params = kidsOf(owner.tree, dk[3])
+  if (len(params) != len(args)) {
+    return // variadic, spread, or an arity error: which parameter is undecided
+  }
+  let tps = kidsOf(owner.tree, dk[2])
+  let explicit = explicitCallTypeArgs(c, callNode)
+  let names = []string(0)
+  let types = []int(0)
+  let unbound = []string(0)
+  let ti = 0
+  while (ti < len(tps)) {
+    let tn = getNode(owner.tree, kidsOf(owner.tree, tps[ti])[0])
+    let tpname = owner.source[tn.span.start:tn.span.end]
+    let bound = 0
+    if (ti < len(explicit)) {
+      bound = explicit[ti]
+    }
+    if (bound == 0) {
+      bound = bindTypeParamFromValueArgs(owner, c, callNode, params, args, tpname)
+    }
+    if (bound == 0) {
+      unbound = append(unbound, tpname)
+    } else {
+      names = append(names, tpname)
+      types = append(types, bound)
+    }
+    ti = ti + 1
+  }
+  let sub = TypeSubst{ names: names, types: types }
+  let i = 0
+  while (i < len(args)) {
+    let a = argInner(c, args[i])
+    let ptn = kidsOf(owner.tree, params[i])[1]
+    // Same two guards as the non-generic path: the argument must be an arrow and
+    // the parameter must be function-typed.
+    if (getNode(c.tree, a).tag == Tag.ArrowFn &&
+        getNode(owner.tree, ptn).tag == Tag.FuncType) {
+      let ptk = kidsOf(owner.tree, ptn) // func_type [type_list, result]
+      let plist = kidsOf(owner.tree, ptk[0])
+      let members = []int(0)
+      let mi = 0
+      while (mi < len(plist)) {
+        members = append(members, substTypeGuarded(owner, plist[mi], sub, unbound))
+        mi = mi + 1
+      }
+      c.arrowExpected[a] = mkFunc(owner.ctx, members, false,
+        substTypeGuarded(owner, ptk[1], sub, unbound))
+    }
+    i = i + 1
+  }
+}
+
 // The prim-enum index for a predeclared type name, or -1 if not a primitive.
 // Includes the size aliases (`int`/`uint`/`byte`/`rune`) that map onto a prim.
 function primIndexByName(name: string): int {
