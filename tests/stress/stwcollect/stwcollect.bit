@@ -69,6 +69,12 @@
 //       on every park. The task below has an EMPTY class-4 stack range (`sp`
 //       set to its stack's own top) and a zero `arg`, so the only enumerated
 //       class that can reach its payload is the ctx scan.
+//   I — another stopped mutator's OWN STACK, conservatively (#1834). Phase E
+//       proves that mutator's frame is walked PRECISELY; this proves the stack
+//       BELOW that task's `ctxSp` and at or above the published frame is walked
+//       CONSERVATIVELY, which is what a raw `int` needs and what a stack map
+//       cannot give. Same synthetic-slot technique as E, with the payload
+//       placed where every other class is empty by construction.
 //
 // ---------------------------------------------------------------------------
 // ONE CASE PER ROOT CLASS — THE RULE, AND WHY IT IS ENFORCED STATICALLY (#1683)
@@ -208,6 +214,27 @@ const M_CTX_DEAD = 1015
 // register for its whole life and proven nothing.
 const M_CLS8 = 1016
 const CLS8_COUNT = 16
+const M_CLS10 = 1017
+const M_CLS10_DEAD = 1018
+
+// Phase I's stack, and the three slots in it. The geometry is what makes the
+// phase a test of class 10 ALONE, so each number is load-bearing:
+//
+//   - 512 words, longer than the 265-word scratch area, so class 6 covers only
+//     words 0..264 and both slots below sit outside it.
+//   - the published `SafepointFrame` at word 300, which is where the parked
+//     mutator claims to be. Its first word is left 0, so `gcScanSnapshot`
+//     (class 3) reads `ret == 0` and walks nothing — this phase must not be
+//     carried by the precise walk phase E already proves.
+//   - the payload at word 400, above the frame and below the task's `ctxSp`,
+//     which phase I sets to the stack's own TOP so class 4's range is empty.
+//
+// So the payload is reachable from class 10 and from nothing else, and deleting
+// `lo = stwParkedLo(world, t, lo)` from `stwScanTasks` must redden this line
+// alone.
+const PARK_STACK_WORDS = 512
+const PARK_FRAME_SLOT = 300
+const PARK_PAYLOAD_SLOT = 400
 
 // A word inside `[0, ctxWords)` that is none of `ctxSp`/`ctxPc` — those two
 // carry a live stack/code address on a REAL parked task and using either
@@ -305,6 +332,10 @@ function main() {
   // Phase H's task. It has NO stack array of its own, and that is the whole
   // point — see phase H.
   let cls8Task = []i64(taskWords)
+  // Phase I's task and the stack a synthesized parked mutator claims to be
+  // standing in — see PARK_STACK_WORDS for why the geometry is what it is.
+  let parkStackTask = []i64(taskWords)
+  let parkedStack = []i64(PARK_STACK_WORDS)
 
   // Phase D's task. Its stack is exactly `chanScratchWords` words, so the whole
   // scratch area is mapped and the scan's `min(chanScratchWords, stackBytes/8)`
@@ -763,11 +794,74 @@ function main() {
     print("H ran=false onTask=false alive=0/${CLS8_COUNT} abandoned=${stwAbandonedCount()}\n")
   }
 
+  // ---- phase I: ROOT CLASS 10, another stopped mutator's OWN STACK (#1834) --
+  //
+  // Class 8 lowers the conservative bound for the stack holding the LIVE `sp`.
+  // There is exactly one live `sp` and it belongs to the collector, so every
+  // OTHER thread stopped at a safepoint keeps class 4's `ctxSp` bound — where
+  // its task last PARKED, above the frames it is actually sitting in. What is
+  // left covering it is class 3's PRECISE walk, and a stack map names only
+  // reference-typed slots, so a GC object held as a bare `int` (which the ABI
+  // boundary FORCES on every pinned symbol, E0079) is invisible to it. Two
+  // threads inside `bit_rt_chan_send` at once is one scanned stack and one
+  // unscanned one.
+  //
+  // Driving that with a real second OS thread would need one parked at a
+  // safepoint for the whole collection, so a slot is synthesized exactly as
+  // phase E does — claimed through the shipped `worldClaim`, published as
+  // `parked` with a frame, acking the epoch the next collection will use.
+  //
+  // WHAT IS DIFFERENT FROM PHASE E is which half of that slot is under test.
+  // Phase E plants its payload INSIDE the published frame, where the precise
+  // walk finds it. This one plants the payload on the STACK, at a word no stack
+  // map names and no other class reaches, and publishes the frame ADDRESS as
+  // the only evidence of where that thread is. The frame's own first word is 0,
+  // so `gcScanSnapshot` walks nothing and cannot carry this phase.
+  //
+  // Registering `parkStackTask` alone also unregisters phase H's task, which is
+  // required: while that one is registered its mapping spans the REAL stack, so
+  // class 8 would conservatively scan main's own frames and keep `pStack10`
+  // alive no matter what class 10 did.
+  let pStack10 = gcAlloc(g, nodeInfo)
+  storeWord(pStack10, M_CLS10)
+  let pStack10Dead = gcAlloc(g, nodeInfo)
+  storeWord(pStack10Dead, M_CLS10_DEAD)
+
+  let parkBase = int(ptrOf(parkedStack))
+  parkedStack[PARK_FRAME_SLOT] = 0            // ret == 0: class 3 walks nothing
+  parkedStack[PARK_FRAME_SLOT + 1] = 0        // fp, never followed
+  parkedStack[PARK_PAYLOAD_SLOT] = pStack10
+
+  let pt = ptrOf(parkStackTask)
+  *(pt + taskArg) = 0
+  *(pt + taskState) = taskParked
+  *(pt + taskStackBase) = parkBase
+  *(pt + taskStackBytes) = PARK_STACK_WORDS * 8
+  *(pt + ctxSp) = parkBase + PARK_STACK_WORDS * 8
+  *(pt + taskRegNext) = 0
+  *(ptrOf(schedBlock) + scRegHead) = int(pt)
+
+  let slot10 = worldClaim(wb)
+  let epoch10 = worldBlock[maxMutators * muWords + MU_EPOCH_IDX] + 1
+  worldBlock[slot10 * muWords + MU_FRAME] = parkBase + PARK_FRAME_SLOT * 8
+  worldBlock[slot10 * muWords + MU_ACKED] = epoch10
+  worldBlock[slot10 * muWords + MU_STATE] = mParked
+
+  storeWord(snap + 0, 0)
+  storeWord(snap + 8, 0)
+  let cI = gcStatCollections(g)
+  stwPollOn(int(g), int(ptrOf(schedBlock)), int(ptrOf(regBlock)), int(ptrOf(worldBlock)), snap)
+  print("I ran=${gcStatCollections(g) > cI} other=${slot10 > 0} stack=${alive(g, pStack10, M_CLS10)} missed=${gcOwns(g, pStack10Dead)} abandoned=${stwAbandonedCount()}\n")
+  // Released for the reason phase E's is: the slot stays `parked` with a now
+  // stale `acked`, so leaving it registered would make every later rendezvous
+  // spin to its bound and abandon.
+  worldRelease(wb, slot10)
+
   // Hold every backing slice to the end of `main`, so only raw untraced pointers
   // ever reach the collector under test and the LIVE (libbitrt) collector cannot
   // move the ground under it when the suite reruns under BIT_GC=stress.
   print("held ${len(arena) + len(indexArena) + len(heapBlock) + len(heapLock) + len(state) + len(meta)}\n")
   print("held ${len(worldBlock) + len(schedBlock) + len(chanReserve) + len(reserveDesc) + len(regBlock) + len(fakeTask) + len(fakeStack) + len(longTask) + len(longStack) + len(frameBuf) + len(snapBuf)}\n")
   print("held ${len(scratchTask) + len(scratchStack) + len(parkFrame) + len(parkSnap)}\n")
-  print("held ${len(ctxTask) + len(ctxStack) + len(cls8Task)}\n")
+  print("held ${len(ctxTask) + len(ctxStack) + len(cls8Task) + len(parkStackTask) + len(parkedStack)}\n")
 }

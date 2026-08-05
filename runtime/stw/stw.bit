@@ -146,7 +146,49 @@
 //      the frames a stack map names. That is a test policy, not production, but
 //      the cost is real and belongs in the record rather than in a surprise.
 //
-// Classes 4, 5, 7 and 8 are reachable only when a scheduler block is bound;
+//
+//   10. Every OTHER stopped mutator's own stack, conservatively
+//      (`stwParkedLo`, #1834). Class 8 is only half the answer it reads as: it
+//      lowers the bound for the ONE stack the collector is standing on, found
+//      by asking which task's mapping contains the LIVE `sp`. There is only one
+//      live `sp` and it is the collector's, so every other thread that is
+//      stopped at a safepoint keeps class 4's `ctxSp` bound — where that task
+//      last PARKED, which is above the frames it is actually sitting in, so
+//      stacks grow down and the walk starts past everything it holds.
+//
+//      What is left covering it is class 3's PRECISE walk, and precisely is not
+//      enough for exactly the reason class 8 exists: a stack map names
+//      reference-typed slots, and `bit_rt_chan_send` holds its element as a
+//      bare `int`. Two threads in `bit_rt_chan_send` at once is therefore one
+//      scanned stack and one unscanned one.
+//
+//      NO ABI CHANGE WAS NEEDED, and the shape of that is the whole class. A
+//      parked mutator publishes `muFrame` — the address of the `SafepointFrame`
+//      the `@naked` shim reserved BELOW its own entry `sp` on that thread's own
+//      stack. The frame's ADDRESS is therefore already a valid, and strictly
+//      lower, stack pointer for that thread; only the frame's CONTENTS
+//      (`ret`/`fp`/`regs`) were ever being read. #1834 proposed adding an `sp`
+//      field to §4 for this and it is unnecessary — the published address is
+//      the better bound, because it also brings the frame's own `regs[32]`
+//      inside the conservative range, which closes #1742's raw-int-in-a-
+//      callee-saved-register case for stopped mutators as well.
+//
+//      This is class 9's shape over a different state: a thread that cannot
+//      answer for itself has its bound published on its behalf, and the bound
+//      is only ever LOWERED, which class 4's header already argues is safe.
+//
+// STILL OPEN — the classes above cover a stack only when some REGISTERED TASK's
+// mapping contains it, because that mapping is the only source of the stack's
+// TOP. A collection taken on a thread's own OS-thread stack (a worker between
+// tasks, the bootstrap thread before the first task) belongs to no task, so
+// classes 8 and 10 both find nothing to lower and no range to scan. Measured on
+// this tree: 1353-1771 of ~40000 collections under `BIT_GC=stress`, 0 of 190
+// under the default policy (`stwUnheldCount` below). #1837 holds that; the
+// missing datum is a per-OS-thread stack top, which this runtime records
+// nowhere, and deriving one from the frame-pointer chain needs the stack-map
+// validation that lives in `../gc/stackmap.bit`.
+//
+// Classes 4, 5, 7, 8 and 10 are reachable only when a scheduler block is bound;
 // class 1 only when a channel registry is. `stwBind` takes all three addresses TOGETHER
 // and `stwCanCollect` refuses to collect unless every one of them is present —
 // deliberately, because "collect with a smaller root set" is the failure mode
@@ -225,6 +267,41 @@ export @nosplit @symbol("bit_rt_port_stw_bind") function stwBind(g: int, sched: 
 // Abandoned-collection count, so a test can assert it stayed 0.
 export @nosplit @symbol("bit_rt_port_stw_abandoned") function stwAbandonedCount(): int {
   let n = stwAbandoned
+  return n
+}
+
+// ---------------------------------------------------------------------------
+// The running-stack coverage counters (#1837)
+// ---------------------------------------------------------------------------
+//
+// `stwScans` counts root enumerations; `stwUnheld` counts the subset in which NO
+// registered task's mapping contained the collecting thread's live `sp`.
+//
+// COUNTED RATHER THAN ASSERTED, and PERMANENT rather than re-derived. The
+// difference is not a bug by itself — it is the population in which classes 8
+// and 10 cannot fire, and a class that silently does not fire is exactly the
+// shape this file's ROOT SET header warns about: no build, link, golden or
+// stress gate can tell "the running stack was covered" from "the scan was inert
+// on every collection". #1837 was measured by adding these two words and then
+// REVERTING them, which is why its own repro field has to describe how to add
+// them back; keeping them makes the number one build away instead of one
+// re-instrumentation away, and makes any fix for #1837 falsifiable by the same
+// reading. Measured here: 0 of 190 under the default policy, 1353-1771 of
+// ~40000 under `BIT_GC=stress`.
+let stwScans: i64 = 0
+let stwUnheld: i64 = 0
+
+// Root enumerations performed by this collector.
+export @nosplit @symbol("bit_rt_port_stw_scans") function stwScanCount(): int {
+  let n = stwScans
+  return n
+}
+
+// The subset of those in which the collecting thread was standing on a stack no
+// registered task owns — a worker's or the bootstrap thread's OWN OS-thread
+// stack.
+export @nosplit @symbol("bit_rt_port_stw_unheld") function stwUnheldCount(): int {
+  let n = stwUnheld
   return n
 }
 
@@ -542,8 +619,42 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsets
   }
 }
 
+// Class 10 (#1834): the lowest `SafepointFrame` any mutator has published as
+// PARKED inside task `t`, or `lo` unchanged when none has.
+//
+// A parked mutator's frame address is a stack pointer for its own thread by
+// construction — the `@naked` shim reserves the frame by subtracting from `sp`
+// and hands its address on, so the address IS `sp` at that instant, and the
+// thread only goes DEEPER (into `stwPoll`/`worldPark`) from there. Everything
+// below it is `@nosplit` runtime frames that hold no Bit reference; everything
+// at or above it is that mutator's own Bit frames plus the frame's `regs[32]`.
+//
+// The collector's own slot cannot match: it is `mRunning` for the whole
+// collection, and `worldParkedFrame` answers 0 for anything but `mParked`. So
+// no self-slot test is needed here, unlike `stwCollect`'s class-3 walk.
+//
+// Only ever LOWERS the bound, and bounded by the high-water mark, for the two
+// reasons `stwSyscallLo` above states.
+@nosplit function stwParkedLo(world: *i64, t: *i64, lo: int): int {
+  let n = worldHighWaterMark(world)
+  let i = 0
+  // Bounded by the high-water mark, itself capped at `maxMutators`.
+  while (i < n) {
+    let f = worldParkedFrame(world, i)
+    if (f > 0 && stwTaskHoldsSp(t, f)) {
+      if (f < lo || lo <= 0) {
+        lo = f
+      }
+    }
+    i = i + 1
+  }
+  return lo
+}
+
 @nosplit function stwScanTasks(g: *i64, world: *i64, sched: *i64) {
   let sp = stwReadSp()
+  let held = false
+  stwScans = stwScans + 1
   schedRegLock(sched)
   let addr = schedRegHead(sched)
   let n = 0
@@ -563,11 +674,17 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsets
       let lo = *(t + ctxSp)
       if (running) {
         lo = sp
+        held = true
       }
       // Class 9 (#1904): a thread parked in a syscall on this stack is running
       // in exactly the same sense — deeper than `ctxSp` and nowhere near a
       // safepoint — but it is another thread, so `sp` above does not find it.
       lo = stwSyscallLo(g, world, t, lo)
+      // Class 10 (#1834): and a thread STOPPED AT A SAFEPOINT on this stack is
+      // in the same position — its `ctxSp` names where the task last parked,
+      // not where the thread is now. It published where it is, as the address
+      // of the frame it parked with.
+      lo = stwParkedLo(world, t, lo)
       stwScanStackRange(g, lo, *(t + taskStackBase) + *(t + taskStackBytes))
       // The running task's own registers are live CPU state, not a saved
       // block — scanning `t[0..ctxWords)` for it would read whatever this
@@ -583,6 +700,9 @@ export @nosplit @symbol("bit_rt_port_stw_bad_offsets_on") function stwBadOffsets
     n = n + 1
   }
   schedRegUnlock(sched)
+  if (!held) {
+    stwUnheld = stwUnheld + 1
+  }
 }
 
 // One full stop-the-world mark-sweep. The world is already stopped and this
