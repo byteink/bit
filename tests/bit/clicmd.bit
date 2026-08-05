@@ -1,0 +1,354 @@
+// The CLI's argv contract (#2107), the sibling of `tests/bit/lintcmd.bit` and
+// `tests/bit/runcmd.bit` for the layer above every subcommand.
+//
+// THE PROPERTY, in one sentence: a flag no subcommand declares is REFUSED with
+// a diagnostic on stderr and exit 2, and a flag one does declare is still
+// accepted — so "bit does not understand that" can never be mistaken for
+// "bit looked and found nothing wrong".
+//
+// THE DEFECT THIS REMOVES, which shipped in every release up to 0.1.8:
+//
+//     $ bit check --version <module-with-a-type-error> ; echo $?
+//     0
+//
+// No output, no warning, exit 0. `--version` was consumed as the module PATH,
+// the loader found no source under it, no diagnostic was produced, and the exit
+// code reported success. `--bogus` and `-x` did the same. `bit check` is the
+// command a CI pipeline runs to decide whether a tree is sound, so a stray or
+// future-dated flag turned the whole gate green over zero files — strictly
+// worse than a crash, because the exit code actively lies.
+//
+// WHY THE ACCEPTANCE CASES ARE NOT DECORATION. A front end that refused
+// EVERYTHING flag-shaped would satisfy every rejection case above and break the
+// compiler. So each rejection is paired with a flag the same subcommand really
+// takes, and `build -o -weird` specifically covers the value-skipping branch:
+// an output path that itself begins with `-` is a value, not a flag.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run tests/bit/clicmd.bit
+// `BIT_SELF_EXE` overrides which `bit` is exercised; unset, the compiler under
+// test is `<cwd>/bit-out/bin/bit`, resolved from a child's own `pwd` — Bit has
+// no getcwd primitive, and `selfExe()` here is the throwaway binary `bit run`
+// built, not the compiler that built it.
+import { env, envOr, exit } from "std/os"
+import { exists, mkdir, readFile, remove, writeFile } from "std/fs"
+import { contains, parseInt } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// One `bit` invocation, as seen from outside it.
+struct Run { code: int, out: string, err: string }
+
+// Assertion accounting. A struct because Bit has no mutable module-level
+// state, and the count is the anti-vacuity marker.
+struct Tally { checks: int, failures: int }
+
+// One row of the table below. `argv` is appended verbatim to the binary, so
+// every operand it names is written relative to the fixture tree the child
+// `cd`s into. An empty `wantErrSub`/`wantOutSub`/`absent` is "no requirement".
+struct Case {
+  name: string,
+  argv: string,
+  wantExit: int,
+  wantErrSub: string,
+  wantOutSub: string,
+  absent: string,
+}
+
+// How long any one child gets. Every case below compiles a two-line program at
+// most, so this only fires on a hang — and a hang is a failure, not a stall.
+function timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ { 300 }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns are
+// `osRunBounded`'s mechanism channel, never a program exit status, so each one
+// is a named panic rather than a value any assertion could consume.
+function shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("clicmd: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("clicmd: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("clicmd: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("clicmd: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+// The `bit` under test. `BIT_SELF_EXE` wins; otherwise the dev-tree build
+// artifact relative to the working directory this program was started in,
+// obtained by asking a child for its `pwd`. Never returns "" — a compiler this
+// cannot find is a hard stop, not a skipped test.
+function bitBinary(scratch: string, ms: int): string! {
+  let explicit = env("BIT_SELF_EXE")
+  if (len(explicit) > 0) {
+    if (!exists(explicit)) {
+      fail newError("clicmd: BIT_SELF_EXE=${explicit} does not exist")
+    }
+    return explicit
+  }
+  let cwdFile = "${scratch}/cwd.txt"
+  let code = shell("${scratch}/pwd.sh", "#!/bin/sh\npwd > '${cwdFile}'\n", ms)?
+  if (code != 0) {
+    fail newError("clicmd: could not read the working directory (exit ${code})")
+  }
+  let cwd = trimWs(readFile(cwdFile)?)
+  let candidate = "${cwd}/bit-out/bin/bit"
+  if (!exists(candidate)) {
+    fail newError("clicmd: no compiler at ${candidate}; run this from the repository root or set BIT_SELF_EXE")
+  }
+  return candidate
+}
+
+// The fixture tree every case runs inside. `bad/` is a module the checker
+// rejects — the whole point of #2107 is that `bit check` must keep rejecting it
+// no matter what precedes the path, and must never report success instead.
+function makeFixtures(root: string): ()! {
+  mkdir(root)?
+  mkdir("${root}/bad")?
+  mkdir("${root}/good")?
+  writeFile("${root}/bad/main.bit", "function main() { let x: int = \"oops\" }\n")?
+  writeFile("${root}/good/main.bit", "function main() { print(\"ok\\n\") }\n")?
+  writeFile("${root}/ok.bit", "function main() { print(\"ok\\n\") }\n")?
+}
+
+// Runs `bit <argv>` with `root` as the working directory.
+//
+// The script always exits 0 and writes the real status to `code.txt`, so a
+// missing `code.txt` is unmistakably "the run never happened" rather than a
+// status some assertion could mistake for success.
+function runBit(bit: string, root: string, capDir: string, argv: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  clear(outPath)
+  clear(errPath)
+  clear(codePath)
+
+  let script = "#!/bin/sh\n" +
+    "cd '${root}' || exit 0\n" +
+    "'${bit}' ${argv} > '${outPath}' 2> '${errPath}'\n" +
+    "echo $? > '${codePath}'\n" +
+    "exit 0\n"
+  let sh = shell("${capDir}/run.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("clicmd: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("clicmd: no exit code was recorded for `bit ${argv}` — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, out: readFile(outPath)?, err: readFile(errPath)? }
+}
+
+function clear(path: string) {
+  if (exists(path)) {
+    remove(path) catch _ { return }
+  }
+}
+
+// Records one assertion. Failures are named and the run continues, so a single
+// invocation reports every broken expectation instead of only the first.
+function check(t: Tally, cond: bool, label: string) {
+  t.checks = t.checks + 1
+  if (!cond) {
+    t.failures = t.failures + 1
+    eprint("FAIL: ${label}\n")
+  }
+}
+
+// THE REJECTIONS. One per subcommand that reaches the shared front end, each
+// naming the flag it refused — a bare non-zero exit would pass while printing
+// nothing, which is the half-fix this ticket is about.
+function rejectCases(): []Case {
+  return [
+    // The three spellings from the report, against a module that MUST be seen
+    // to fail. Exit 2 and the flag named, never 0 and silence.
+    Case{ name: "check-version", argv: "check --version bad", wantExit: 2,
+      wantErrSub: "unknown flag '--version'", wantOutSub: "", absent: "error[E0041]" },
+    Case{ name: "check-bogus", argv: "check --bogus bad", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+    Case{ name: "check-short", argv: "check -x bad", wantExit: 2,
+      wantErrSub: "unknown flag '-x'", wantOutSub: "", absent: "" },
+    Case{ name: "run-bogus", argv: "run --bogus ok.bit", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "ok" },
+    Case{ name: "build-bogus", argv: "build ok.bit --nope", wantExit: 2,
+      wantErrSub: "unknown flag '--nope'", wantOutSub: "", absent: "" },
+    Case{ name: "test-bogus", argv: "test --bogus ok.bit", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+    Case{ name: "fmt-bogus", argv: "fmt --bogus ok.bit", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "cannot read" },
+    Case{ name: "doc-bogus", argv: "doc --bogus good", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+    Case{ name: "lint-bogus", argv: "lint --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+    Case{ name: "lsp-bogus", argv: "lsp --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+    Case{ name: "ar-bogus", argv: "ar out.a --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+    Case{ name: "version-bogus", argv: "version --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "" },
+  ]
+}
+
+// THE ACCEPTANCES. Without these the file above is satisfied by a front end
+// that refuses every flag there is, which would be a worse compiler than the
+// one with the bug.
+function acceptCases(): []Case {
+  return [
+    // The behaviour #2107 exists to protect: the module is still checked, and
+    // still rejected, when nothing precedes it.
+    Case{ name: "check-bad", argv: "check bad", wantExit: 1,
+      wantErrSub: "error[E0041]", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "check-good", argv: "check good", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "run-plain", argv: "run ok.bit", wantExit: 0,
+      wantErrSub: "", wantOutSub: "ok", absent: "unknown flag" },
+    // Every declared `build` flag, including the value-skipping branch: `-o`'s
+    // value begins with `-` and is an operand, not a flag.
+    Case{ name: "build-dash-value", argv: "build ok.bit -o -weird", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "build-emit-obj", argv: "build ok.bit -c -o ok.o", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "build-target", argv: "build ok.bit --target aarch64-linux -o ok.lin", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "fmt-check", argv: "fmt --check ok.bit", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    // `--check` after the path, which used to be read as a filename. Declaring
+    // a flag accepted while the parser treats it as an operand is the drift the
+    // front end exists to prevent, so it is asserted rather than assumed.
+    Case{ name: "fmt-check-trailing", argv: "fmt ok.bit --check", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "cannot read" },
+    Case{ name: "doc-json", argv: "doc --json good", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "lint-json", argv: "lint --json good", wantExit: 0,
+      wantErrSub: "", wantOutSub: "", absent: "unknown flag" },
+    Case{ name: "version-plain", argv: "version", wantExit: 0,
+      wantErrSub: "", wantOutSub: "bit ", absent: "unknown flag" },
+    // `pmcli.bit` owns its own flags (#2267) and is absent from the front
+    // end's table, so its operand positions are guarded there instead. This
+    // one reached the NETWORK: `--bogus` became a vanity package and `bit add`
+    // tried to resolve `https://--bogus`. "must not touch the network" is what
+    // the absent needle asserts.
+    Case{ name: "add-flag-operand", argv: "add --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "https://--bogus" },
+    Case{ name: "remove-flag-operand", argv: "remove --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "no such dependency" },
+    Case{ name: "up-flag-operand", argv: "up --bogus", wantExit: 2,
+      wantErrSub: "unknown flag '--bogus'", wantOutSub: "", absent: "no such dependency" },
+    // The pm `--help` path landed by #2267 — asserted here so the guard above
+    // cannot be tightened into swallowing it.
+    Case{ name: "add-help-kept", argv: "add --help", wantExit: 0,
+      wantErrSub: "", wantOutSub: "usage: bit add", absent: "unknown flag" },
+  ]
+}
+
+// Runs one case and records every assertion it carries.
+function runCase(t: Tally, bit: string, root: string, capDir: string, c: Case, ms: int): ()! {
+  let r = runBit(bit, root, capDir, c.argv, ms)?
+  check(t, r.code == c.wantExit,
+    "${c.name}: `bit ${c.argv}` exit ${r.code}, want ${c.wantExit} (out=${r.out} err=${r.err})")
+  if (len(c.wantErrSub) > 0) {
+    check(t, contains(r.err, c.wantErrSub),
+      "${c.name}: stderr lacks \"${c.wantErrSub}\": ${r.err}")
+  }
+  if (len(c.wantOutSub) > 0) {
+    check(t, contains(r.out, c.wantOutSub),
+      "${c.name}: stdout lacks \"${c.wantOutSub}\": ${r.out}")
+  }
+  if (len(c.absent) > 0) {
+    check(t, !contains(r.out, c.absent) && !contains(r.err, c.absent),
+      "${c.name}: \"${c.absent}\" must appear on neither stream (out=${r.out} err=${r.err})")
+  }
+}
+
+// Every case, against fixtures built fresh under `scratch`.
+function runAll(t: Tally, scratch: string, ms: int) {
+  let root = "${scratch}/tree"
+  let capDir = "${scratch}/cap"
+  mkdir(capDir) catch e {
+    panic("clicmd: cannot create ${capDir}: ${e.message()}")
+  }
+  let bit = bitBinary(scratch, ms) catch e {
+    panic("clicmd: ${e.message()}")
+  }
+  makeFixtures(root) catch e {
+    panic("clicmd: cannot build the fixtures: ${e.message()}")
+  }
+  let cases = rejectCases()
+  for c of acceptCases() {
+    cases = append(cases, c)
+  }
+  // An empty or shortened case list is a green run that proves nothing.
+  if (len(cases) < 27) {
+    panic("clicmd: only ${len(cases)} cases in the table, want at least 27")
+  }
+  for c of cases {
+    runCase(t, bit, root, capDir, c, ms) catch e { panic("clicmd: ${e.message()}") }
+  }
+}
+
+function main() {
+  let ms = timeoutMs()
+  let tmp = trimSuffix(envOr("TMPDIR", "/tmp"), "/")
+  let scratch = "${tmp}/bit-clicmd-${uuidFormat(uuidV4())}"
+  let t = Tally{ checks: 0, failures: 0 }
+
+  mkdir(scratch) catch e {
+    panic("clicmd: cannot create ${scratch}: ${e.message()}")
+  }
+  defer teardown(scratch, ms)
+  runAll(t, scratch, ms)
+
+  // The run marker: every case asserts at least its exit code, so the floor is
+  // one per case. A case that stops running is visible rather than green.
+  if (t.checks < 50) {
+    eprint("FAIL: only ${t.checks} checks ran, want at least 50\n")
+    t.failures = t.failures + 1
+  }
+  if (t.failures > 0) {
+    println("clicmd: FAIL — ${t.failures} of ${t.checks} checks failed")
+    exit(1)
+  }
+  println("clicmd: PASS — ${t.checks} checks")
+}
+
+// std/fs has no recursive remove, so the scratch tree goes the way it came.
+function teardown(scratch: string, ms: int) {
+  shell("${scratch}/rm.sh", "#!/bin/sh\nrm -rf '${scratch}'\n", ms) catch _ { return }
+}
+
+// `std/strings`' `trimSpace` stops at spaces and tabs, and every capture here
+// arrives newline-terminated from a shell redirect.
+function trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+function isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+function trimSuffix(s: string, suffix: string): string {
+  if (len(suffix) > 0 && len(s) >= len(suffix) && s[len(s) - len(suffix):] == suffix) {
+    return s[:len(s) - len(suffix)]
+  }
+  return s
+}
