@@ -361,17 +361,38 @@ function lowerFuncNamed(c: Checker, decl: int, moduleConsts: map<string, int>, l
   builderBeginBlock(b, entry)
   let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false,
     loops: []LoopFrame(0), moduleConsts: moduleConsts, lowerer: lowerer, defers: []IrInstr(0),
-    fallibleOk: fallibleOk, fallibleErr: fallibleErr, genEnv: genEnv, resultTy: result }
+    fallibleOk: fallibleOk, fallibleErr: fallibleErr, genEnv: genEnv, resultTy: result,
+    boxedNames: []string(0) }
+  // Which of this body's locals a closure both captures and writes (§12.8). Decided
+  // once for the whole body, parameters included, because a capture's cell has to
+  // exist from the declaration that introduces it — see `boxedLocalNames`. An
+  // `overflow` answer may name only SOME of what escapes, and an unboxed capture is
+  // a silent wrong answer, so the function is refused instead (a stub, which `bit
+  // build` will not write a binary for).
+  let names = paramNames(c, decl)
+  let scan = boxedLocalNames(c, kids[5], names)
+  fc.boxedNames = scan.names
+  if (scan.overflow) {
+    fc.failed = true
+  }
   // Bind params (receiver first, if any) to their block-param value ids. The
   // checker's env is flat across the whole module, so a later function's
   // same-named param can have overwritten this one's type; rebind ours here so
   // `checkExprType` resolves this body's identifiers to the correct types during
   // lowering (`x: f64` here vs `x: int` in a sibling).
-  let names = paramNames(c, decl)
+  //
+  // Every block param is added BEFORE the first of them is bound: a boxed
+  // parameter's `declareLocal` emits its cell's `gc_alloc`, and a block's params
+  // must all precede its body instructions.
+  let paramIds = []int(0)
   let i = 0
   while (i < len(paramTypes)) {
-    let id = builderAddParam(b, paramTypes[i])
-    declareLocal(fc, names[i], id, paramTypes[i])
+    paramIds = append(paramIds, builderAddParam(b, paramTypes[i]))
+    i = i + 1
+  }
+  i = 0
+  while (i < len(paramTypes)) {
+    declareLocal(fc, names[i], paramIds[i], paramTypes[i])
     c.env[names[i]] = paramTypes[i]
     i = i + 1
   }
@@ -469,37 +490,50 @@ function layoutFields(fc: FnCtx, fieldTypes: []int): StructLayout {
 // reads its captures from the env object (word i) and its params from block
 // params. Returns the FuncId (post-order: nested closures get lower ids). Appends
 // the function to the shared closure list.
-function lowerClosureBody(fc: FnCtx, node: int, closureTy: int, capNames: []string, capTypes: []int, layout: StructLayout): int {
+function lowerClosureBody(fc: FnCtx, node: int, closureTy: int, caps: CaptureSet, layout: StructLayout): int {
   let k = kidsOf(fc.c.tree, node)
   let ft = fc.c.ctx.types[closureTy]
   let b = newBuilder()
   let entry = builderNewBlock(b)
   builderBeginBlock(b, entry)
+  // The boxed-name set is the ENCLOSING body's: a closure is lowered as part of
+  // the function that contains it, so a name a nested arrow captures and writes
+  // has to be boxed at the same scopes on both sides of the boundary.
   let cfc = FnCtx{ c: fc.c, b: b, env: []LocalBind(0), failed: false, terminated: false,
     loops: []LoopFrame(0), moduleConsts: fc.moduleConsts, lowerer: fc.lowerer, defers: []IrInstr(0),
-    fallibleOk: 0, fallibleErr: 0, genEnv: fc.genEnv, resultTy: ft.result }
+    fallibleOk: 0, fallibleErr: 0, genEnv: fc.genEnv, resultTy: ft.result,
+    boxedNames: fc.boxedNames }
   let envParam = builderAddParam(b, closureTy)
   let allParams = [closureTy]
   let pnodes = kidsOf(fc.c.tree, k[0])
+  // Params first, then their bindings: a boxed param's `declareLocal` emits its
+  // cell's `gc_alloc`, and a block's params must all precede its instructions.
+  let paramIds = []int(0)
   let i = 0
   while (i < len(pnodes)) {
-    let pty = ft.members[i]
-    let p = builderAddParam(b, pty)
-    let pn = getNode(fc.c.tree, kidsOf(fc.c.tree, pnodes[i])[0])
-    let pname = fc.c.source[pn.span.start:pn.span.end]
-    declareLocal(cfc, pname, p, pty)
-    fc.c.env[pname] = pty
-    allParams = append(allParams, pty)
+    paramIds = append(paramIds, builderAddParam(b, ft.members[i]))
+    allParams = append(allParams, ft.members[i])
     i = i + 1
   }
-  // Unpack captures from the env object (field_get word i).
   i = 0
-  while (i < len(capNames)) {
-    let fg = mkInstr(Op.FieldGet, capTypes[i])
+  while (i < len(pnodes)) {
+    let pn = getNode(fc.c.tree, kidsOf(fc.c.tree, pnodes[i])[0])
+    let pname = fc.c.source[pn.span.start:pn.span.end]
+    declareLocal(cfc, pname, paramIds[i], ft.members[i])
+    fc.c.env[pname] = ft.members[i]
+    i = i + 1
+  }
+  // Unpack captures from the env object (field_get word i). A boxed capture's slot
+  // holds the CELL POINTER, and the body keeps it boxed: that is what makes a write
+  // in here land in the cell the enclosing frame and every sibling closure read.
+  let slotTypes = captureSlotTypes(caps)
+  i = 0
+  while (i < len(caps.names)) {
+    let fg = mkInstr(Op.FieldGet, slotTypes[i])
     fg.lhs = envParam
     fg.ival = layout.offsets[i]
-    declareLocal(cfc, capNames[i], builderEmit(b, fg), capTypes[i])
-    fc.c.env[capNames[i]] = capTypes[i]
+    declareLocalRaw(cfc, caps.names[i], builderEmit(b, fg), caps.types[i], caps.boxTys[i])
+    fc.c.env[caps.names[i]] = caps.types[i]
     i = i + 1
   }
   let body = k[1]
@@ -538,22 +572,24 @@ function lowerArrowFn(fc: FnCtx, node: int): int {
     ownNames = append(ownNames, fc.c.source[pn.span.start:pn.span.end])
     pi = pi + 1
   }
-  let capNames = []string(0)
-  let capTypes = []int(0)
-  let capValues = []int(0)
+  // A boxed local contributes its CELL POINTER, not its value (§12.8): that is the
+  // one word both sides share, and packing the value instead is what made the
+  // capture a snapshot.
+  let caps = newCaptureSet()
   let i = len(fc.env) - 1
   while (i >= 0) {
     let bd = fc.env[i]
-    if (!stringInList(ownNames, bd.name) && !stringInList(capNames, bd.name)) {
-      capNames = append(capNames, bd.name)
-      capTypes = append(capTypes, bd.ty)
-      capValues = append(capValues, bd.value)
+    if (!stringInList(ownNames, bd.name) && !stringInList(caps.names, bd.name)) {
+      caps.names = append(caps.names, bd.name)
+      caps.types = append(caps.types, bd.ty)
+      caps.boxTys = append(caps.boxTys, bd.boxTy)
+      caps.values = append(caps.values, bd.value)
     }
     i = i - 1
   }
-  let layout = layoutFields(fc, capTypes)
+  let layout = layoutFields(fc, captureSlotTypes(caps))
   let envObj = 0
-  if (len(capNames) == 0) {
+  if (len(caps.names) == 0) {
     envObj = builderEmit(fc.b, mkInstr(Op.ConstNil, closureTy))
   } else {
     let ga = mkInstr(Op.GcAlloc, closureTy)
@@ -561,16 +597,16 @@ function lowerArrowFn(fc: FnCtx, node: int): int {
     ga.offsets = layout.ptrOffsets
     envObj = builderEmit(fc.b, ga)
     let ci = 0
-    while (ci < len(capNames)) {
+    while (ci < len(caps.names)) {
       let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
       fs.lhs = envObj
       fs.ival = layout.offsets[ci]
-      fs.rhs = capValues[ci]
+      fs.rhs = caps.values[ci]
       builderEmit(fc.b, fs)
       ci = ci + 1
     }
   }
-  let fid = lowerClosureBody(fc, node, closureTy, capNames, capTypes, layout)
+  let fid = lowerClosureBody(fc, node, closureTy, caps, layout)
   if (fc.failed) {
     return 0
   }

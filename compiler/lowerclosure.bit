@@ -1,0 +1,489 @@
+// compiler/lowerclosure.bit — capture by reference (#2128). Sibling of
+// lower.bit: same module, so this needs no imports and no call-site changes.
+//
+// A local in this lowerer is a pure SSA value (`LocalBind`), so an assignment to
+// one just rebinds `.value`. That is invisible across a function boundary, and
+// it made the counter closure return `1 1 1`:
+//
+//   function counter(): () => int { let n = 0; return () => { n = n + 1; return n } }
+//
+// `lowerArrowFn` packed the captured VALUE into the env object at creation time
+// — a snapshot — so the closure body's `n = n + 1` was an SSA rebind that died at
+// its `ret`, and the enclosing frame never saw it either. Every shape of the bug
+// (a write the frame cannot see, a frame write the closure cannot see, two
+// closures over one binding disagreeing) is that one representation choice.
+//
+// SPEC §12.8 now states the rule: a captured variable is SHARED between the
+// enclosing function and every function literal that refers to it. The
+// representation here is one heap cell per boxed local — the 1-tuple `(T)`, which
+// is exactly a one-word record: `LocalBind.value` holds the CELL POINTER, every
+// read is `field_get cell[0]`, every write `field_set cell[0] = v`, and a closure
+// captures the pointer instead of the value. Reusing the tuple shape is what
+// makes the GC correct for free: `layoutFields` already gives a `(string)` cell a
+// pointer map, so a boxed reference stays traced.
+//
+// Boxing is not universal, and `boxedLocalNames` is what keeps it off programs
+// that cannot tell the difference — see its own comment for the escape rule.
+
+// The heap-cell type for a local of type `ty`: the 1-tuple `(ty)`.
+function boxTypeFor(fc: FnCtx, ty: int): int {
+  return mkTuple(fc.c.ctx, [ty])
+}
+
+// Allocates a boxed local's cell and stores its initial value. The same
+// `gc_alloc` + one `field_set` a one-element tuple emits, because that is what
+// this is.
+function allocBox(fc: FnCtx, ty: int, value: int): int {
+  return buildTuple(fc, boxTypeFor(fc, ty), [value])
+}
+
+// The current value of env slot `idx`. A plain local IS its SSA value and emits
+// nothing, which is why an unboxed program's IR is unchanged; a boxed local takes
+// one load from its cell.
+function localRead(fc: FnCtx, idx: int): int {
+  if (fc.env[idx].boxTy == 0) {
+    return fc.env[idx].value
+  }
+  return tupleElem(fc, fc.env[idx].boxTy, fc.env[idx].value, 0)
+}
+
+// Stores `val` into env slot `idx`. A plain local rebinds its SSA value; a boxed
+// local's cell is written IN PLACE, which is the whole fix — that store is what
+// every closure over the binding, and the enclosing frame, subsequently read.
+function localWrite(fc: FnCtx, idx: int, val: int) {
+  if (fc.env[idx].boxTy == 0) {
+    fc.env[idx].value = val
+    return
+  }
+  let fs = mkInstr(Op.FieldSet, fc.c.ctx.voidId)
+  fs.lhs = fc.env[idx].value
+  fs.ival = 0
+  fs.rhs = val
+  builderEmit(fc.b, fs)
+}
+
+// The IR type of the SLOT a local occupies — what a block param carrying it
+// across a control-flow join must be typed as. A boxed local's slot holds the
+// cell POINTER, so typing that param as the value type would leave a live GC
+// reference out of the stack maps and let the collector free a variable that is
+// still in scope.
+function bindSlotTy(bd: LocalBind): int {
+  if (bd.boxTy != 0) {
+    return bd.boxTy
+  }
+  return bd.ty
+}
+
+// Binds a name to an already-formed slot, boxed or not. `declareLocal` decides
+// boxing from the escape rule and allocates a cell; this one takes the answer as
+// given, which is what a closure body needs when it unpacks a capture that is
+// ALREADY a cell pointer — boxing it again would give the body a private cell and
+// re-introduce the bug one level down.
+function declareLocalRaw(fc: FnCtx, name: string, value: int, ty: int, boxTy: int) {
+  fc.env = append(fc.env, LocalBind{ name: name, value: value, ty: ty, boxTy: boxTy })
+}
+
+// Go 1.22's per-iteration loop variable (SPEC §13.1), which a shared cell makes
+// observable for the first time. One cell per DECLARATION SITE would turn
+//
+//   for (let i = 0; i < 3; i = i + 1) { fs = append(fs, () => i) }
+//
+// from `0 1 2` into `3 3 3` — the wrong answer on much the more common idiom, and
+// the exact regression Go fixed in 1.22. So before the post statement runs, each
+// boxed loop variable gets a FRESH cell initialised from the previous iteration's
+// value; the post statement then advances the new cell, leaving the old one
+// holding what that iteration's body saw. Called at the top of the post block,
+// which is where the Go spec declares the new variable.
+//
+// `for x of xs` and `for x in xs` need nothing here: their binder is declared
+// inside the loop's BODY block, so its cell is already allocated once per
+// iteration.
+function reboxLoopVars(fc: FnCtx, start: int, stop: int) {
+  let i = start
+  while (i < stop) {
+    if (fc.env[i].boxTy != 0) {
+      let cur = localRead(fc, i)
+      fc.env[i].value = allocBox(fc, fc.env[i].ty, cur)
+    }
+    i = i + 1
+  }
+}
+
+// The captures of one arrow function, in the order they are packed into its env
+// object. `boxTys[i]` is nonzero for a capture that is shared by reference, and
+// then the env slot holds the cell pointer rather than the value.
+struct CaptureSet {
+  names: []string,
+  types: []int,
+  boxTys: []int,
+  values: []int,
+}
+
+function newCaptureSet(): CaptureSet {
+  return CaptureSet{ names: []string(0), types: []int(0), boxTys: []int(0), values: []int(0) }
+}
+
+// The ENV SLOT type of each capture — the env object's field types. A boxed
+// capture's slot holds a cell pointer, so the layout must class it as a GC
+// reference; typing it as the value type would keep the cell out of the env's
+// pointer map, and an `int` capture would then hide a live object from the
+// collector.
+function captureSlotTypes(caps: CaptureSet): []int {
+  let out = []int(0)
+  let i = 0
+  while (i < len(caps.names)) {
+    if (caps.boxTys[i] != 0) {
+      out = append(out, caps.boxTys[i])
+    } else {
+      out = append(out, caps.types[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// --- escape analysis ------------------------------------------------------
+
+// The recursion bound for the scoped free-variable walk, in AST nesting levels.
+// Reaching it means the answer may be a SUBSET of what escapes, and the caller
+// refuses to lower rather than trust it: an unboxed capture is a silent wrong
+// answer, a refused function is a failed build.
+const scanMaxDepth = 1024
+
+// A set of names, plus whether the walk that produced it gave up.
+struct NameScan {
+  names: []string,
+  overflow: bool,
+}
+
+// The names the function body rooted at `body` must box. Two conditions, and both
+// are required:
+//
+//   - the name is FREE in some arrow function inside `body` — some closure refers
+//     to a binding declared outside itself. A local no closure can see has only
+//     one observer, so by-value and by-reference are the same thing.
+//   - the name is ASSIGNED somewhere in `body`, closure bodies included. A
+//     capture that is only ever read is likewise indistinguishable either way.
+//
+// The second half is what keeps this off existing programs: a capture nothing
+// writes lowers to exactly the IR it did before.
+//
+// `params` seeds the scope chain with the enclosing function's parameter names,
+// which are locals the body never declares — without them a captured parameter
+// reads as an unbound global and never gets boxed.
+function boxedLocalNames(c: Checker, body: int, params: []string): NameScan {
+  if (body == 0) {
+    return NameScan{ names: []string(0), overflow: false }
+  }
+  let assigned = assignedNames(c, body)
+  if (len(assigned.names) == 0) {
+    return assigned
+  }
+  let sc = extendScope(emptyScope(), params, 0)
+  let s = FreeScan{ filter: assigned.names, found: []string(0), overflow: false }
+  scanFree(c, s, body, sc, 0, 0)
+  return NameScan{ names: s.found, overflow: assigned.overflow || s.overflow }
+}
+
+// Every name `body` REBINDS: the target of a plain or compound assignment, or of
+// `++`/`--`. A member, index or pointer store mutates the referent and leaves the
+// local bound to the same value, so it is not one.
+//
+// A flat worklist over the subtree rather than recursion: the AST is a tree
+// (`addNode` only appends, and a kid's index is always below its parent's), so
+// each node is enqueued once and `len(c.tree.nodes)` bounds the walk. Exceeding
+// that bound would mean the tree is not the shape this is written against, which
+// is reported rather than silently truncated.
+function assignedNames(c: Checker, body: int): NameScan {
+  let out = []string(0)
+  let work = [body]
+  let i = 0
+  let bound = len(c.tree.nodes)
+  while (i < len(work)) {
+    if (i >= bound) {
+      return NameScan{ names: out, overflow: true }
+    }
+    let kids = kidsOf(c.tree, work[i])
+    let t = getNode(c.tree, work[i]).tag
+    if (t == Tag.Assign && len(kids) > 0) {
+      for tgt of kidsOf(c.tree, kids[0]) {
+        out = addNames(out, patNames(c, tgt))
+      }
+    } else if ((t == Tag.IncStmt || t == Tag.DecStmt) && len(kids) > 0) {
+      out = addNames(out, patNames(c, kids[0]))
+    }
+    for k of kids {
+      if (k != 0) {
+        work = append(work, k)
+      }
+    }
+    i = i + 1
+  }
+  return NameScan{ names: out, overflow: false }
+}
+
+// The lexical scope chain of one walk: `names[i]` was declared inside the arrow
+// function nested `depths[i]` deep, innermost binding last. The depth is what
+// distinguishes a closure's own local from a capture.
+struct ScopeChain {
+  names: []string,
+  depths: []int,
+}
+
+function emptyScope(): ScopeChain {
+  return ScopeChain{ names: []string(0), depths: []int(0) }
+}
+
+// A fresh chain with `add` declared at arrow depth `depth`. Fresh, not appended
+// in place: a caller keeps walking siblings with its own chain after the inner
+// scope closes, and `append` may grow a shared backing array.
+function extendScope(sc: ScopeChain, add: []string, depth: int): ScopeChain {
+  if (len(add) == 0) {
+    return sc
+  }
+  let names = []string(0)
+  let depths = []int(0)
+  let i = 0
+  while (i < len(sc.names)) {
+    names = append(names, sc.names[i])
+    depths = append(depths, sc.depths[i])
+    i = i + 1
+  }
+  for n of add {
+    names = append(names, n)
+    depths = append(depths, depth)
+  }
+  return ScopeChain{ names: names, depths: depths }
+}
+
+// Is a reference to `name` at arrow depth `depth` a CAPTURE? Yes when the binding
+// it resolves to was declared further out than the innermost arrow containing the
+// reference — including a binding in the enclosing frame, which is depth 0.
+//
+// An unbound name counts as a capture too. It is usually a module global, const
+// or function, for which no local is ever declared and so no cell is ever
+// allocated; treating it as one costs nothing, whereas assuming it is NOT a local
+// would silently unbox any binder shape this walk fails to model, and that is the
+// failure this whole file exists to remove.
+function isCapturedRef(sc: ScopeChain, name: string, depth: int): bool {
+  if (depth == 0) {
+    return false
+  }
+  let i = len(sc.names) - 1
+  while (i >= 0) {
+    if (sc.names[i] == name) {
+      return sc.depths[i] < depth
+    }
+    i = i - 1
+  }
+  return true
+}
+
+// The accumulator for `scanFree`. A struct so the recursion can record into one
+// shared result instead of threading a return value through every arm.
+struct FreeScan {
+  // Only these names are recorded — the assigned ones. Everything else cannot
+  // need a cell, so tracking it would only cost memory.
+  filter: []string,
+  found: []string,
+  overflow: bool,
+}
+
+// Records every name in `s.filter` that some arrow function inside `node` refers
+// to without declaring, resolved lexically against `sc`. `adepth` is the arrow
+// nesting depth of `node`: 0 while walking the enclosing frame itself, where a
+// reference is not a capture.
+//
+// Every arm that introduces names extends the chain for the sub-tree those names
+// scope over, and for that sub-tree only. Getting one of those wrong in the
+// direction of "declared" would unbox a real capture, so the default arm — walk
+// the kids unchanged — is the one every unrecognised node takes.
+function scanFree(c: Checker, s: FreeScan, node: int, sc: ScopeChain, adepth: int, depth: int) {
+  if (node == 0 || s.overflow) {
+    return
+  }
+  if (depth >= scanMaxDepth) {
+    s.overflow = true
+    return
+  }
+  let n = getNode(c.tree, node)
+  let kids = kidsOf(c.tree, node)
+  if (n.tag == Tag.Ident) {
+    let name = c.source[n.span.start:n.span.end]
+    if (stringInList(s.filter, name) && isCapturedRef(sc, name, adepth)) {
+      s.found = addNames(s.found, [name])
+    }
+    return
+  }
+  // `(params) => body`: the params scope over the body, and the body is one arrow
+  // deeper. The params node itself is skipped — its identifiers are declarations,
+  // and its type annotations name types.
+  if (n.tag == Tag.ArrowFn && len(kids) == 2) {
+    scanFree(c, s, kids[1], extendScope(sc, arrowParamNames(c, kids[0]), adepth + 1),
+      adepth + 1, depth + 1)
+    return
+  }
+  // A statement list scopes sequentially: each `let`/`const` is visible to the
+  // statements after it and not before, so `let n = n` reads the OUTER n.
+  if (n.tag == Tag.Block || n.tag == Tag.StmtList) {
+    let inner = sc
+    for k of kids {
+      if (isValueDecl(c, k)) {
+        inner = scanValueDecl(c, s, k, inner, adepth, depth + 1)
+      } else {
+        scanFree(c, s, k, inner, adepth, depth + 1)
+      }
+    }
+    return
+  }
+  // `for (init; cond; post) body`: init's declarations scope over the other three.
+  if (n.tag == Tag.ForC && len(kids) == 4) {
+    let inner = sc
+    if (isValueDecl(c, kids[0])) {
+      inner = scanValueDecl(c, s, kids[0], inner, adepth, depth + 1)
+    } else {
+      scanFree(c, s, kids[0], inner, adepth, depth + 1)
+    }
+    scanFree(c, s, kids[1], inner, adepth, depth + 1)
+    scanFree(c, s, kids[2], inner, adepth, depth + 1)
+    scanFree(c, s, kids[3], inner, adepth, depth + 1)
+    return
+  }
+  // `for binder of/in iter body`: the iterable is evaluated outside, the binder
+  // scopes over the body.
+  if ((n.tag == Tag.ForOf || n.tag == Tag.ForIn) && len(kids) == 3) {
+    scanFree(c, s, kids[1], sc, adepth, depth + 1)
+    scanFree(c, s, kids[2], extendScope(sc, patNames(c, kids[0]), adepth), adepth, depth + 1)
+    return
+  }
+  // `pat => body`: a variant pattern's binders scope over the arm body.
+  if (n.tag == Tag.MatchArm && len(kids) == 2) {
+    scanFree(c, s, kids[1], extendScope(sc, variantPatNames(c, kids[0]), adepth), adepth, depth + 1)
+    return
+  }
+  // `expr catch e { … }`: the error binding scopes over the handler block.
+  if (n.tag == Tag.CatchBind && len(kids) == 3) {
+    scanFree(c, s, kids[0], sc, adepth, depth + 1)
+    scanFree(c, s, kids[2], extendScope(sc, patNames(c, kids[1]), adepth), adepth, depth + 1)
+    return
+  }
+  // `case v = <- ch: …` — the receive binding is a SIBLING of the body it scopes
+  // over, so the scope has to be extended here at the case rather than at the
+  // bind.
+  if (n.tag == Tag.CommCase && len(kids) == 2 &&
+      getNode(c.tree, kids[0]).tag == Tag.RecvBind) {
+    let rk = kidsOf(c.tree, kids[0])
+    if (len(rk) == 2) {
+      scanFree(c, s, rk[1], sc, adepth, depth + 1)
+      scanFree(c, s, kids[1], extendScope(sc, patNames(c, rk[0]), adepth), adepth, depth + 1)
+      return
+    }
+  }
+  // `recv.field` and `S{ field: v }` name a FIELD in one kid, not a variable.
+  if ((n.tag == Tag.Member || n.tag == Tag.FieldInit) && len(kids) == 2) {
+    let valueKid = kids[0]
+    if (n.tag == Tag.FieldInit) {
+      valueKid = kids[1]
+    }
+    scanFree(c, s, valueKid, sc, adepth, depth + 1)
+    return
+  }
+  for k of kids {
+    scanFree(c, s, k, sc, adepth, depth + 1)
+  }
+}
+
+// Walks one `let`/`const` declaration and returns the scope its bindings add.
+// Each initializer is walked in the scope BEFORE its own name is bound, so
+// `let a = 1, b = a` sees the `a` it just declared and `let n = n` does not.
+function scanValueDecl(c: Checker, s: FreeScan, node: int, sc: ScopeChain, adepth: int, depth: int): ScopeChain {
+  let inner = sc
+  for b of kidsOf(c.tree, node) {
+    let bk = kidsOf(c.tree, b)
+    if (len(bk) == 3) {
+      scanFree(c, s, bk[2], inner, adepth, depth + 1)
+      inner = extendScope(inner, patNames(c, bk[0]), adepth)
+    } else {
+      scanFree(c, s, b, inner, adepth, depth + 1)
+    }
+  }
+  return inner
+}
+
+function isValueDecl(c: Checker, node: int): bool {
+  if (node == 0) {
+    return false
+  }
+  let t = getNode(c.tree, node).tag
+  return t == Tag.LetDecl || t == Tag.ConstDecl
+}
+
+// The names a binding pattern declares: one for an identifier, one per element
+// for a tuple pattern. Anything else declares nothing.
+function patNames(c: Checker, pat: int): []string {
+  if (pat == 0) {
+    return []string(0)
+  }
+  let n = getNode(c.tree, pat)
+  if (n.tag == Tag.Ident) {
+    return [c.source[n.span.start:n.span.end]]
+  }
+  if (n.tag != Tag.TuplePat) {
+    return []string(0)
+  }
+  let out = []string(0)
+  for k of kidsOf(c.tree, pat) {
+    let kn = getNode(c.tree, k)
+    if (kn.tag == Tag.Ident) {
+      out = append(out, c.source[kn.span.start:kn.span.end])
+    }
+  }
+  return out
+}
+
+// The payload binders of a variant pattern `V(a, b)` — `[name, binders]`, the
+// binders an expr_list of ident leaves. The variant's own name binds nothing.
+function variantPatNames(c: Checker, pat: int): []string {
+  if (pat == 0 || getNode(c.tree, pat).tag != Tag.VariantPat) {
+    return []string(0)
+  }
+  let kids = kidsOf(c.tree, pat)
+  if (len(kids) != 2 || kids[1] == 0) {
+    return []string(0)
+  }
+  let out = []string(0)
+  for k of kidsOf(c.tree, kids[1]) {
+    let kn = getNode(c.tree, k)
+    if (kn.tag == Tag.Ident) {
+      out = append(out, c.source[kn.span.start:kn.span.end])
+    }
+  }
+  return out
+}
+
+// An arrow function's parameter names, from its `ArrowParams` node whose kids are
+// `ArrowP{ name, type }`.
+function arrowParamNames(c: Checker, params: int): []string {
+  if (params == 0) {
+    return []string(0)
+  }
+  let out = []string(0)
+  for p of kidsOf(c.tree, params) {
+    let pk = kidsOf(c.tree, p)
+    if (len(pk) > 0) {
+      out = addNames(out, patNames(c, pk[0]))
+    }
+  }
+  return out
+}
+
+// `xs` plus every name in `add` it does not already hold.
+function addNames(xs: []string, add: []string): []string {
+  let out = xs
+  for n of add {
+    if (!stringInList(out, n)) {
+      out = append(out, n)
+    }
+  }
+  return out
+}
