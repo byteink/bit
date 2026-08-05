@@ -889,7 +889,7 @@ defined exactly once).
 | `bit_rt_slice_get`    | `(h: *const SliceHeader, index: usize) -> u64` (§2)     |
 | `bit_rt_slice_set`    | `(h: *SliceHeader, index: usize, word: u64) -> void` (§2) |
 | `bit_rt_slice_slice`  | `(h: *const SliceHeader, lo: usize, hi: usize) -> *SliceHeader` (§2) |
-| `bit_rt_map_new`      | `(key_is_string: usize, val_is_ref: usize) -> *MapHeader` (§15) |
+| `bit_rt_map_new`      | `(key_desc: usize, val_is_ref: usize) -> *MapHeader` (§15, §15.1) |
 | `bit_rt_map_set`      | `(m: ?*MapHeader, key: u64, val: u64) -> void` (§15)    |
 | `bit_rt_map_get`      | `(m: ?*MapHeader, key: u64) -> u64` (§15)               |
 | `bit_rt_map_has`      | `(m: ?*MapHeader, key: u64) -> bool` (§15)              |
@@ -1268,24 +1268,27 @@ MapHeader {
   len:  usize           // +24  live entries
   cap:  usize           // +32  slot count (power of two, >= 8)
   used: usize           // +40  FULL + TOMB (drives growth)
-  key_is_string: usize  // +48
+  key_desc: usize       // +48  0 scalar / 1 string / else a descriptor (§15.1)
   val_is_ref:    usize  // +56
 }
 ```
 
 `map_info`'s pointer map is `{0, 8, 16}`: the three buffer bases are traced as
 references. The `keys`/`vals` buffers use `ref_array_info` (every word traced)
-exactly when their flag is set — `string` is the only comparable reference key
-type (§2, SPEC §14.6), so `key_is_string` doubles as "trace the key buffer".
-The `ctrl` buffer is always a leaf; tracing its base only keeps it alive. Empty,
-tombstoned, and unused slots hold a zero key/value word, which `markRoot` skips.
+exactly when their flag is set — for `keys` that is `key_desc != 0`, i.e. every
+reference key type, `string` and composite alike. The `ctrl` buffer is always a
+leaf; tracing its base only keeps it alive. Empty, tombstoned, and unused slots
+hold a zero key/value word, which `markRoot` skips.
+
+`key_desc` itself is NOT traced and must not be: it is either a small integer or
+the handle of a string CONSTANT, which is static for the life of the process.
 
 - **Word model.** A key or value is one word, same as slice elements (§2): a
   scalar by value, a `string` as its `*RtBytes` object base, a wider `V` boxed.
-- **Hash / equality.** `key_is_string` picks the strategy: a string key is
-  Wyhash'd over its bytes and compared byte-wise; any other key is hashed with a
-  splitmix64 finalizer (so low-entropy integer keys avalanche) and compared by
-  word.
+- **Hash / equality.** `key_desc` picks the strategy: `0` hashes the word with a
+  splitmix64 finalizer (so low-entropy integer keys avalanche) and compares by
+  word; `1` Wyhashes a string key over its bytes and compares byte-wise; anything
+  else is a composite key hashed and compared through its descriptor (§15.1).
 - **Growth.** At `(used+1)*8 >= cap*7` the table doubles and rehashes, dropping
   tombstones (`used` resets to `len`). This keeps an EMPTY slot present at all
   times, so every probe terminates in `<= cap` steps (a statically bounded loop).
@@ -1298,6 +1301,54 @@ tombstoned, and unused slots hold a zero key/value word, which `markRoot` skips.
   returns the first FULL slot or `-1`, `map_iter_next` the next after `prev`,
   then `map_key_at`/`map_val_at` read the pair. Slot order is unspecified and the
   protocol assumes no concurrent mutation (a resize would invalidate the cursor).
+
+### 15.1 Composite values — descriptor programs
+
+| symbol | signature |
+|---|---|
+| `bit_rt_value_eq` | `(a: usize, b: usize, desc: *const RtBytes) -> bool` |
+
+SPEC §14.6 makes a struct comparable **field-wise** and a tuple **element-wise**.
+Both are one traced handle to a heap box (§1, §1.1), so comparing the word asks
+"same allocation?" — which is what `==` did, and what the map hashed keys by.
+
+**The runtime cannot recover the shape on its own.** A `TypeInfo` (§2) says which
+body words hold references but not what kind: a `string` field and a nested
+struct field are both one traced word. Worse, a string LITERAL is a static
+`{ptr,len}` pair in `.data` with no GC header at all, so there is no descriptor
+to read off it. The compiler therefore emits a **descriptor program** — a string
+constant, one byte per body word — and passes it at the comparison site and to
+`map_new`.
+
+```
+'{' item* '}'   an aggregate; its items describe consecutive 8-byte body words
+'w'             a raw word, compared and hashed BY VALUE
+'s'             a `string` handle, compared and hashed BY ITS BYTES
+'r'             an opaque reference (slice, map, chan, func, interface, payload
+                enum), compared and hashed BY IDENTITY
+'{' ... '}'     a nested struct or tuple: dereferenced and walked
+```
+
+`struct P { x: int, name: string }` is `{ws}`; `struct Q { p: P, n: int }` is
+`{{ws}w}`. The producer is `descProgram` in `compiler/lowerprim.bit`; the
+consumers are `descEqAgg` and `descHashAgg` in `runtime/root/maps.bit`.
+
+- **Equality and hashing are ONE walk.** The two interpreters read the same
+  program and take the same cases in the same order, so `eq(a,b)` implies
+  `hash(a) == hash(b)` case by case. A hash that disagreed with equality gives a
+  map that silently loses entries, so this correspondence is a contract, not an
+  optimisation: the two functions must be edited together.
+- **Bounds.** The generator stops at 6 levels of nesting and a 96-word total
+  budget, emitting `'r'` past either; the interpreters stop at 8 levels. Every
+  loop in both is bounded by the program's length.
+- **Floats compare by bit pattern inside a composite**, where a bare `f64 ==` is
+  IEEE. This keeps composite equality reflexive — a key not equal to itself
+  could never be found or deleted — and matches what a bare `map<f64,int>` key
+  already does. `+0.0` and `-0.0` therefore differ in a field.
+- **A field whose type is not comparable** (a slice, a map) gets `'r'`: identity,
+  which is total and consistent with the hash, rather than failing the whole
+  comparison. The checker's `vComparable` is deliberately permissive on structs
+  (`compiler/validateattr.bit`), so such a field does reach lowering.
 
 ---
 
