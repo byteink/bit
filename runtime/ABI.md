@@ -993,6 +993,38 @@ as the process exit code, truncated to a byte for the OS `exit` syscall (a
 negative or out-of-`u8`-range value truncates, matching every POSIX shell's own
 exit-code truncation — Bit does not special-case it).
 
+### Where the fallible row is realized
+
+The trampoline that defines `bit_main` is hand-assembled (`emitmacho.bit`,
+`emitelf.bit`); it can `bl main` and it can zero the return register, and that
+covers the first two rows. It cannot dispatch `error.message()`, because the
+interface method's dispatch id is assigned per program (§2.1). So the third row
+is emitted as ordinary lowered IR instead, by `compiler/lowerentry.bit`:
+
+- the user's fallible `main` body is emitted under the private link name
+  **`main$fallible`** (same shape it always had — a void or `T` result, with the
+  error travelling in the §7 error slot);
+- a synthesized `main`, result `i64`, calls it, reads the slot with
+  `bit_rt_get_err`, and branches. The `i64` result is also what stops the
+  trampoline zeroing the return register: its void-`main` test reads the IR
+  function's result type.
+
+The err arm writes **`error: <msg>\n`** to fd 2 through `bit_rt_eprint`, as one
+concatenated write. SPEC §17.4 fixes fd 2 and exit 1 but not the wording; the
+prefix matches the runtime's own `panic: <msg>\n` (§12), which is the only other
+line a running Bit program puts on fd 2, and keeps a failed `main` from reading
+as the program's own logging. No new runtime symbol: `bit_rt_get_err`,
+`bit_rt_string_concat` and `bit_rt_eprint` all already exist.
+
+The ok arm returns an integer ok type as the exit code (§17.4's `int` rule,
+composed with the fallible marker), widened to `i64` first. A void ok type — the
+one shape §17.4 actually names — and the undefined `f64!` / `string!` / `bool!`
+shapes all return `0`: a float ok value would otherwise be handed back in
+`d0`/`xmm0` and read out of `x0`/`eax` as whatever was left there.
+
+Before #2235 this row did not exist in code at all: `fail` set the slot, nothing
+read it, and a failed `main` exited 0 with an empty stderr.
+
 ---
 
 ## 11. Channels (`runtime/chan` + `runtime/root`)
