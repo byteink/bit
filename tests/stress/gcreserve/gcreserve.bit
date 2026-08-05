@@ -1,0 +1,187 @@
+// The span reserve's two structural properties (runtime/gc/mem.bit, #2373).
+//
+// WHY THIS EXISTS. `bit lsp --stdio` reached 12.5 GB RSS while idle (#2325) and
+// the runtime could not have given a byte of it back even if it had wanted to,
+// for two reasons that are properties of the reserve rather than of any
+// allocation policy:
+//
+//   1. THE RESERVE FORGOT ITS CHUNKS. `reserveGrow` mapped a 4 MiB chunk and
+//      rebased the three-word descriptor onto it, discarding the previous
+//      chunk's base. The pages were unreachable by construction — not leaked by
+//      an oversight that a careful `free` could fix, but ADDRESSES NOBODY HELD.
+//   2. SPANS WERE 8-ALIGNED. A span carved at an arbitrary 8-byte offset inside
+//      a chunk cannot be `munmap`ped individually and cannot be found from a
+//      slot address by masking, which is what #2374 needs to do.
+//
+// Both are now fixed and both are asserted here, because both are invisible to
+// every other test in the corpus: nothing else in the suite can tell a reserve
+// that remembers its chunks from one that does not, and an unaligned span works
+// perfectly until something tries to reclaim it.
+//
+// WHAT EACH ASSERTION IS WORTH:
+//
+//   (a) ALIGNED. 64 span-sized takes, each checked against `allocSpanBytes` and
+//       against BOTH page sizes the three targets use (4096 and 16384 — an
+//       aarch64-macos page is 16 KiB while `boot` passes 4096 as the nominal
+//       page size, so "page-aligned" is ambiguous on this machine and the test
+//       pins the strong reading). 64 rather than a handful because the property
+//       must survive the chunk boundary: a 4 MiB chunk yields 31 spans, so 64
+//       takes cross it twice, and the first take out of a FRESH chunk is
+//       exactly where an off-by-the-header-words bug would show.
+//
+//   (b) DISTINCT. Alignment alone is satisfied by a broken reserve that returns
+//       the same address 64 times, which would be a use-after-free machine. The
+//       addresses are pairwise different and no two overlap by a span.
+//
+//   (c) RELEASED. `reserveRelease` reports the bytes it unmapped. It must be at
+//       least the 8 MiB of spans handed out and at most twice that — the chunk
+//       list was walked, real lengths were read out of the chunks' own header
+//       words, and the walk did not double-count. A reserve that still forgot
+//       its chunks reports 0 here.
+//
+//   (d) `gcDeinit` GIVES THE CHUNKS BACK. A private collector is bound to a
+//       deliberately small 512 KiB arena and then made to allocate several
+//       megabytes, so it must map chunks of its own — through the span reserve
+//       AND, because 20000 live objects outgrow a 32 KiB index arena, through
+//       the index reserve too. `heapMappedBytes` is non-zero before teardown
+//       and must be exactly 0 after it. One LARGE object is live across the
+//       teardown as well, so the direct-mapped path is included in that zero
+//       rather than accidentally excluded from it.
+//
+// WHAT IT DOES NOT PROVE. `heapMappedBytes` returning 0 is the runtime's own
+// ACCOUNTING; it does not by itself demonstrate that `munmap` ran. (c) is what
+// carries that half — the byte count comes from lengths stored in the chunks
+// themselves, so a reserve that never recorded a chunk cannot report them — but
+// a machine-level proof that the pages are gone belongs to an RSS measurement
+// outside this process, not to an in-process assertion.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords, heapMappedBytes, allocSpanBytes } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcBindMemory, gcAlloc, gcLiveBytes, gcDeinit, gcWords,
+  reserveWords, reserveInit, reserveGrow, reserveRelease } from "../../../runtime/gc"
+
+// Enough takes to cross a chunk boundary twice — see (a).
+const SPANS: int = 64
+
+// The two page sizes the supported targets use. A span-aligned address is
+// congruent to 0 modulo both; asserting them by name is what makes the claim
+// "page-aligned on every target" rather than "aligned to something".
+const PAGE_SMALL: int = 4096
+const PAGE_LARGE: int = 16384
+
+// Deliberately small (512 KiB): the collector must outgrow it and map chunks of
+// its own, or (d) would assert nothing.
+const ARENA_WORDS: int = 65536
+const INDEX_WORDS: int = 4096
+const META_WORDS: int = 8
+// 20000 live 48-byte objects is ~1 MiB of spans against a 512 KiB arena, and
+// enough live entries to push the index past its own 32 KiB arena.
+const OBJS: int = 20000
+// Larger than `allocMaxSmall` (16 KiB), so it is direct-mapped rather than
+// carved out of a span.
+const BIG_BODY: int = 65536
+
+// 64 spans out of a reserve with no caller arena at all: every one of them comes
+// from a chunk the reserve mapped itself. Returns 1 when every address is
+// aligned, distinct and non-null AND the release reports a sane byte count.
+function checkSpans(): int {
+  let desc = []i64(reserveWords)
+  let got = []i64(SPANS)
+  let r = ptrOf(desc)
+  reserveInit(r, 0, 0)
+
+  let ok = 1
+  let i = 0
+  while (i < SPANS) {                      // bounded: SPANS iterations
+    let s = reserveGrow(r, allocSpanBytes)
+    got[i] = s
+    if (s == 0) { ok = 0 }
+    if (s % allocSpanBytes != 0) { ok = 0 }
+    if (s % PAGE_SMALL != 0) { ok = 0 }
+    if (s % PAGE_LARGE != 0) { ok = 0 }
+    i = i + 1
+  }
+
+  // (b) pairwise distinct. Bounded: SPANS * SPANS comparisons.
+  let a = 0
+  while (a < SPANS) {
+    let b = a + 1
+    while (b < SPANS) {
+      if (got[a] == got[b]) { ok = 0 }
+      b = b + 1
+    }
+    a = a + 1
+  }
+
+  // (c) the chunks come back, and the reserve is empty afterwards.
+  let freed = reserveRelease(r)
+  if (freed < SPANS * allocSpanBytes) { ok = 0 }
+  if (freed > 2 * SPANS * allocSpanBytes) { ok = 0 }
+  if (reserveRelease(r) != 0) { ok = 0 }
+  return ok
+}
+
+function main() {
+  let spansOk = checkSpans()
+
+  // (d) a private collector, forced to grow, hands every chunk back.
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let bigMeta = []i64(META_WORDS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = 16   // body size
+  meta[1] = 0    // no pointer fields: a leaf, so this is pure allocator traffic
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let bigMetaAddr = int(ptrOf(bigMeta))
+  bigMeta[0] = BIG_BODY
+  bigMeta[1] = 0
+  bigMeta[2] = 0
+  bigMeta[3] = 0
+  bigMeta[4] = 0
+  bigMeta[5] = 0
+  bigMeta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, PAGE_SMALL)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    print("gcInit failed\n")
+    return
+  }
+  gcConfigure(g, true, false, 4096, 200, false)
+
+  // Never collected: every object stays live, so the reserve must keep growing.
+  let allocOk = 1
+  if (gcAlloc(g, bigMetaAddr) == 0) { allocOk = 0 }
+  let n = 0
+  while (n < OBJS) {                       // bounded: OBJS iterations
+    if (gcAlloc(g, metaAddr) == 0) { allocOk = 0 }
+    n = n + 1
+  }
+
+  let grew = 0
+  if (heapMappedBytes(hp) > ARENA_WORDS * 8) { grew = 1 }
+
+  gcDeinit(g)
+  let mappedAfter = heapMappedBytes(hp)
+  let leaked = gcLiveBytes(g)
+
+  print("gcreserve ${spansOk} ${allocOk} ${grew} ${mappedAfter} ${leaked}\n")
+}
