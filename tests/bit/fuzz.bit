@@ -19,6 +19,11 @@
 // timeout and spawn failure as three distinct values. guard.zig's 90 lines of
 // async-signal-safe handler collapse into reading that return code.
 //
+// "TERMINATES" IS NOT "IS FAST". A bounded child that overran its budget has
+// only ever proved the second, so a timeout here is a question and not a
+// verdict - see the hang-budget note below, and #2400 for the false artifact
+// that came of conflating them.
+//
 // The mutant is written to disk BEFORE it is parsed, which is what made
 // guard.zig's static `crash_buf` necessary and now makes it unnecessary: the
 // input that killed the child is already a file when the child dies.
@@ -44,11 +49,12 @@
 //   BIT_FUZZ_WORK       scratch directory          (default /tmp/bit-fuzz)
 //   BIT_FUZZ_SECONDS    wall-clock budget, > 0     (default 60)
 //   BIT_FUZZ_SEED       PRNG seed, for replay      (default the wall clock)
-//   BIT_FUZZ_TIMEOUT_MS per-input deadline         (default 10000)
+//   BIT_FUZZ_TIMEOUT_MS per-input budget FLOOR     (default 10000)
+//   BIT_FUZZ_HANG_MS    non-termination ceiling    (default 120000)
 
 import { readFile, writeFile, walk, exists, isDir, mkdir } from "std/fs"
 import { envOr, exit } from "std/os"
-import { monotonic, now, Second } from "std/time"
+import { monotonic, now, Second, Millisecond, since } from "std/time"
 import { hasSuffix, parseInt } from "std/strings"
 
 // --- bounds (Power of 10 rule 2: every loop below is provably finite) -------
@@ -68,6 +74,39 @@ const maxIterations: int = 50000000
 // Upper bound on corpus entries read from one directory. guard.zig's
 // `max_dir_files`.
 const maxCorpusFiles: int = 4096
+
+// --- the hang budget (#2400) ------------------------------------------------
+//
+// The per-input deadline used to be one flat constant, calibrated against a
+// trivial input. tests/cases now holds seeds that `import ... from "std/http"`,
+// whose HONEST `bit check` costs ~11.5s on an idle machine against a 10s
+// budget, so the fuzzer classified a merely-slow input as a hang and wrote a
+// false artifact into the saved-crash corpus - which the next run then replayed
+// first, a ratchet. Raising the constant only moves the line: the corpus grows
+// on purpose, and the next std/*-importing seed re-breaks it.
+//
+// So EXCEEDING THE BUDGET IS A QUESTION, NOT A VERDICT. It re-runs the same
+// bytes once against `hangMs`, the line where "slow" ends and "does not
+// terminate" begins. Terminating on the second attempt means slow, not hung:
+// nothing is saved, and the time it actually took becomes that seed's
+// high-water mark, so every later mutant of that seed is budgeted at
+// `hangFactor` times a MEASURED compile rather than a guessed constant. A new
+// slow seed therefore costs one adjudication, not a red gate. A genuine
+// infinite loop still elapses both budgets and is still saved and reported.
+//
+// Headroom over the measured high-water mark. Large because a mutant may
+// legitimately reach a slower path than its seed, and because this machine runs
+// several build agents at once - a load-inflated compile must not read as a
+// hang.
+const hangFactor: int = 8
+
+// Default `hangMs`. Well under the runtime's own `osBoundedMaxMs` (1h).
+const defaultHangMs: int = 120000
+
+// Adjudicating a slow input is not fuzzing, so its cost is credited back to the
+// wall-clock budget - otherwise one slow seed silently shortens the campaign to
+// a handful of iterations. Capped so the credit itself stays bounded.
+const slowCreditCapMs: int = 120000
 
 // --- failure ----------------------------------------------------------------
 
@@ -268,16 +307,63 @@ function writeRunner(path: string, bin: string, work: string) {
 }
 
 // Everything a bounded `bit check` needs: the generated wrapper, the file the
-// wrapper reads, where a triggering input is kept, and the child's deadline.
+// wrapper reads, where a triggering input is kept, and the two deadlines - the
+// budget floor a normal input is expected to beat, and the ceiling past which
+// an input is declared non-terminating.
 struct Runner {
   script: string
   work: string
   crashesDir: string
   timeoutMs: int
+  hangMs: int
 }
 
-function (r: Runner) check(): int {
-  return osRunBounded(r.script, r.timeoutMs)
+// One bounded `bit check`, with the wall time it actually took. The elapsed
+// time is the whole point: it is the measurement the budget calibrates against,
+// and it is what tells "took 11s" apart from "never came back".
+struct Attempt {
+  rc: int
+  ms: int
+}
+
+function (r: Runner) runFor(budgetMs: int): Attempt {
+  let start = monotonic()
+  let rc = osRunBounded(r.script, budgetMs)
+  return Attempt{ rc: rc, ms: since(start) / Millisecond }
+}
+
+// The budget for a seed whose confirmed-terminating high-water mark is
+// `observedMs` (0 before any mutant of it has been adjudicated).
+function (r: Runner) budgetFor(observedMs: int): int {
+  let b = observedMs * hangFactor
+  if (b < r.timeoutMs) {
+    b = r.timeoutMs
+  }
+  if (b > r.hangMs) {
+    b = r.hangMs
+  }
+  return b
+}
+
+// The second opinion on an input that blew its budget. `hung` is the only
+// answer that justifies saving anything.
+struct Slow {
+  hung: bool
+  rc: int   // the second attempt's raw code, when it terminated
+  ms: int   // and the wall time it took
+}
+
+// Re-runs the bytes already in `r.work` against the ceiling. Both outcomes are
+// printed: an adjudication that stayed silent is how a false artifact became
+// something two people deleted by hand instead of a thing anyone noticed.
+function (r: Runner) adjudicate(what: string, firstMs: int): Slow {
+  print("slow: ${what} did not finish in ${firstMs}ms; re-running once against the ${r.hangMs}ms non-termination ceiling\n")
+  let a = r.runFor(r.hangMs)
+  if (a.rc == -2) {
+    return Slow{ hung: true, rc: a.rc, ms: a.ms }
+  }
+  print("slow: ${what} terminated in ${a.ms}ms (rc=${a.rc}): slow, not hung - nothing saved\n")
+  return Slow{ hung: false, rc: a.rc, ms: a.ms }
 }
 
 struct Outcome {
@@ -294,8 +380,10 @@ function classify(rc: int): Outcome {
   if (rc == -1) {
     return Outcome{ ok: false, fatal: true, label: "spawn failure (osRunBounded -1)" }
   }
+  // Reached only if a caller forgot to adjudicate: every phase intercepts -2
+  // before classifying, because "over budget" alone is not a hang (#2400).
   if (rc == -2) {
-    return Outcome{ ok: false, fatal: false, label: "hang" }
+    return Outcome{ ok: false, fatal: false, label: "over budget, unadjudicated" }
   }
   if (rc <= -100) {
     return Outcome{ ok: false, fatal: false, label: "crash: signal ${-rc - 100}" }
@@ -322,12 +410,25 @@ function (r: Runner) harvest(prefix: string): string {
 // so an empty replay is not a failure - but the COUNT is printed, because that
 // is the only thing that distinguishes a clean corpus from a mistyped path, and
 // a missing directory is fatal.
+//
+// A saved case that now merely compiles slowly is a PASS, so the adjudication
+// applies here too: a 28-second replay cannot re-trip the budget that wrongly
+// harvested it. That was the ratchet in #2400 - one bad artifact made every
+// later run pay for it, first.
 function (r: Runner) replayCrashes() {
   let files = bitFilesIn(r.crashesDir)
   print("regress: replaying ${len(files)} saved crash(es) from ${r.crashesDir}\n")
   for f of files {
     mustWrite(r.work, mustRead(f))
-    let o = classify(r.check())
+    let a = r.runFor(r.timeoutMs)
+    if (a.rc == -2) {
+      let s = r.adjudicate("regress ${f}", a.ms)
+      if (s.hung) {
+        die("regress: ${f}: hang - the ${r.hangMs}ms ceiling elapsed too")
+      }
+      a = Attempt{ rc: s.rc, ms: s.ms }
+    }
+    let o = classify(a.rc)
     if (!o.ok) {
       die("regress: ${f}: ${o.label}")
     }
@@ -336,12 +437,15 @@ function (r: Runner) replayCrashes() {
 
 // One `bit check` on a known-good program, before any mutant. Without it a
 // broken BIT_FUZZ_BIN is only visible through the 126/127 branch, and only on
-// shells that report it.
+// shells that report it. Bounded by the ceiling rather than the floor: the
+// question is "is the compiler reachable at all", and a program that terminates
+// costs its own time whatever the budget says, so the generous bound buys
+// immunity to a loaded machine for free.
 function (r: Runner) preflight() {
   mustWrite(r.work, "function main() {\n  print(\"ok\")\n}\n")
-  let rc = r.check()
-  if (rc != 0) {
-    die("preflight: the runner rejected a known-good program (rc=${rc}); the compiler under test is not reachable")
+  let a = r.runFor(r.hangMs)
+  if (a.rc != 0) {
+    die("preflight: the runner rejected a known-good program (rc=${a.rc} after ${a.ms}ms); the compiler under test is not reachable")
   }
 }
 
@@ -349,22 +453,43 @@ function (r: Runner) fuzzLoop(seeds: []string, seed: u64, seconds: int): int {
   let st = []u64(1)
   st[0] = seed
 
+  // Per-seed high-water mark of a CONFIRMED terminating compile, in ms; zero
+  // until a mutant of that seed has been adjudicated. This is the measurement
+  // the budget scales from, so the corpus calibrates the fuzzer instead of the
+  // fuzzer's constant vetoing the corpus.
+  let slowMs = []int(len(seeds))
+
   let deadline = monotonic() + seconds * Second
+  let credited = 0
   let iterations = 0
   while (iterations < maxIterations && monotonic() < deadline) {
-    let src = mustRead(seeds[nextBelow(st, len(seeds))])
+    let idx = nextBelow(st, len(seeds))
+    let src = mustRead(seeds[idx])
     mustWrite(r.work, mutate(src, st))
 
-    let o = classify(r.check())
+    let a = r.runFor(r.budgetFor(slowMs[idx]))
+    if (a.rc == -2) {
+      let s = r.adjudicate("iteration ${iterations} (seed ${seeds[idx]})", a.ms)
+      if (s.hung) {
+        let saved = r.harvest("hang")
+        die("iteration ${iterations}: hang - neither the budget nor the ${r.hangMs}ms ceiling saw it terminate; input saved as ${saved}")
+      }
+      if (s.ms > slowMs[idx]) {
+        slowMs[idx] = s.ms
+      }
+      if (credited < slowCreditCapMs) {
+        deadline = deadline + (a.ms + s.ms) * Millisecond
+        credited = credited + a.ms + s.ms
+      }
+      a = Attempt{ rc: s.rc, ms: s.ms }
+    }
+
+    let o = classify(a.rc)
     if (o.fatal) {
       die("iteration ${iterations}: ${o.label}")
     }
     if (!o.ok) {
-      let prefix = "crash"
-      if (o.label == "hang") {
-        prefix = "hang"
-      }
-      let saved = r.harvest(prefix)
+      let saved = r.harvest("crash")
       die("iteration ${iterations}: ${o.label} - input saved as ${saved}")
     }
     iterations = iterations + 1
@@ -381,12 +506,19 @@ function main() {
   let workDir = envOr("BIT_FUZZ_WORK", "/tmp/bit-fuzz")
   let seconds = mustInt("BIT_FUZZ_SECONDS", 60)
   let timeoutMs = mustInt("BIT_FUZZ_TIMEOUT_MS", 10000)
+  let hangMs = mustInt("BIT_FUZZ_HANG_MS", defaultHangMs)
 
   if (seconds <= 0) {
     die("BIT_FUZZ_SECONDS must be > 0; ${seconds} would report a green run of zero iterations")
   }
   if (timeoutMs <= 0) {
     die("BIT_FUZZ_TIMEOUT_MS must be > 0")
+  }
+  // A ceiling below the floor would make every adjudication answer "hung"
+  // without ever giving the input more room than it already had - the exact
+  // false positive this pair exists to remove.
+  if (hangMs < timeoutMs) {
+    die("BIT_FUZZ_HANG_MS=${hangMs} is below BIT_FUZZ_TIMEOUT_MS=${timeoutMs}; the ceiling is a second opinion, not a tighter one")
   }
 
   // A zero seed is a xorshift64 fixed point - it would yield 0 forever - so it
@@ -410,10 +542,11 @@ function main() {
     work: "${workDir}/work.bit",
     crashesDir: crashesDir,
     timeoutMs: timeoutMs,
+    hangMs: hangMs,
   }
   writeRunner(r.script, bin, r.work)
 
-  print("fuzz: compiler=${bin} seed=${seed} seconds=${seconds} timeout_ms=${timeoutMs}\n")
+  print("fuzz: compiler=${bin} seed=${seed} seconds=${seconds} timeout_ms=${timeoutMs} hang_ms=${hangMs}\n")
 
   r.replayCrashes()
   r.preflight()
