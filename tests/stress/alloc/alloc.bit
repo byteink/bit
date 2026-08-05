@@ -68,6 +68,20 @@
 //       mirrored here: page alignment, exact live/mapped accounting in BOTH
 //       directions, and the full rounded length being writable memory.
 //
+//   (j) PER-SPAN OCCUPANCY — the property #2374 exists to establish. Every slot
+//       of one size class is taken across THREE spans, then freed in a
+//       scrambled order, and after every single free each span's own free count
+//       must equal a tally this file computes from the slot addresses alone.
+//       The independence is the point: `allocSpanOf` is a mask over the
+//       address, so a take or give that credited the wrong span leaves every
+//       aggregate over the class exactly right — `liveBytes`, the class total,
+//       even `sum over spans of (total - free)` — and only a per-span
+//       comparison sees it. Mutation-tested: masking one bit too few in
+//       `heapGiveSmallLocked` fails this and nothing else in the corpus.
+//       The scrambled order is a Fisher-Yates shuffle rather than a stride, so
+//       it stays a permutation if the slots-per-span count ever moves; a stride
+//       that stopped being coprime would free an address twice.
+//
 //   (h) CHURN WITH SENTINELS — a ring of live allocations is recycled 20000
 //       times; each allocation carries a unique tag in its first word which
 //       must still be there at free time. If the allocator ever handed the same
@@ -92,16 +106,20 @@
 import {
   allocNumClasses, allocMaxSmall, allocSpanBytes, heapWords,
   allocClassSize, allocAlignUp, allocNonZero, allocClassify, allocLargeLen,
+  allocSpanHdrWords, allocSpanOf, allocSpanSlots,
+  allocSpanClass, allocSpanTotal, allocSpanFree,
   heapInit, heapLiveBytes, heapMappedBytes,
   heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked,
   heapLargeAllocLocked, heapLargeFreeLocked,
+  heapCheckSpansLocked, heapSpanViolations,
 } from "../../../runtime/alloc"
 import { spinAcquire, spinRelease, spinUnlocked } from "../../../runtime"
 
 const PAGE = 4096
 // One span is consumed per size class on that class's first allocation (the
 // Zig behaves identically), and property (e) touches all 37 classes, so the
-// arena must cover every class plus the carve span and the large path.
+// arena must cover every class plus the carve span, property (j)'s three and
+// the large path.
 const MAX_SPANS = 48
 const SPAN_WORDS = 16384          // allocSpanBytes / 8
 // MAX_SPANS * SPAN_WORDS + 2048 alignment slack + 262144 words (2MB) for the
@@ -109,6 +127,13 @@ const SPAN_WORDS = 16384          // allocSpanBytes / 8
 const ARENA_WORDS = 1050624
 const RING = 128
 const CHURN = 20000
+
+// Property (j). Class 28 is 4096-byte slots, so a span yields 31 of them once
+// the header is carved out: three spans is 93 slots — enough for a scrambled
+// order to interleave the spans repeatedly, small enough to re-check every
+// span's count after every single free.
+const OCC_CLASS = 28
+const OCC_SPANS = 3
 
 // Arena state words.
 const A_NEXT = 0
@@ -341,7 +366,9 @@ function main() {
   heapRefillLocked(h2, carveClass, span)
   spinRelease(lk2)
   if (heapMappedBytes(h2) != allocSpanBytes) { carveOk = 0 }
-  let want = allocSpanBytes / cs4
+  // Not `allocSpanBytes / cs4`: the span header at the base costs the class its
+  // first `ceil(hdrBytes / cs4)` slots (#2374).
+  let want = allocSpanSlots(carveClass)
   let got = 0
   let prev = 0
   let drained = 0
@@ -358,7 +385,9 @@ function main() {
     if (s == 0) {
       drained = 1
     } else {
-      if (s < span || s + cs4 > span + allocSpanBytes) { carveOk = 0 }
+      // Inside the span, and clear of the header at its base.
+      if (s < span + allocSpanHdrWords * 8) { carveOk = 0 }
+      if (s + cs4 > span + allocSpanBytes) { carveOk = 0 }
       if (got > 0 && prev - s != cs4) { carveOk = 0 }   // descending, class-size apart
       prev = s
       got = got + 1
@@ -367,6 +396,131 @@ function main() {
   }
   if (drained == 0) { carveOk = 0 }                     // list never terminated
   if (got != want) { carveOk = 0 }
+
+  // ---- (j) per-span occupancy across three spans ---------------------------
+  // A third private heap, so the class owns exactly the three spans below and
+  // the tally has no other traffic to account for.
+  let h3buf = []i64(heapWords)
+  let h3 = ptrOf(h3buf)
+  let l3buf = []i32(1)
+  let lk3 = ptrOf(l3buf)
+  atomicStore(lk3, spinUnlocked)
+  heapInit(h3)
+
+  let occOk = 1
+  let occCs = allocClassSize(OCC_CLASS)
+  let perSpan = allocSpanSlots(OCC_CLASS)
+  let occN = OCC_SPANS * perSpan
+  let occSpan = []i64(OCC_SPANS)
+  let occFreed = []i64(OCC_SPANS)
+  let occAddr = []i64(occN)
+  let occOwner = []i64(occN)
+
+  // Three spans up front. Each must report the class it was carved for, the
+  // slot count the class expects, and no slot handed out yet.
+  let oi = 0
+  while (oi < OCC_SPANS) {                              // bounded: OCC_SPANS
+    let sp = spanTake(a)
+    occFreed[oi] = 0
+    if (sp == 0) {
+      occOk = 0                                         // arena exhausted
+    } else {
+      occSpan[oi] = sp
+      spinAcquire(lk3)
+      heapRefillLocked(h3, OCC_CLASS, sp)
+      spinRelease(lk3)
+      if (allocSpanOf(sp) != sp) { occOk = 0 }          // spans are self-aligned
+      if (allocSpanClass(sp) != OCC_CLASS) { occOk = 0 }
+      if (allocSpanTotal(sp) != perSpan) { occOk = 0 }
+      if (allocSpanFree(sp) != perSpan) { occOk = 0 }
+    }
+    oi = oi + 1
+  }
+
+  // Take every slot the three spans hold. Each address must belong to one of
+  // them, by the mask alone.
+  let ti = 0
+  while (ti < occN) {                                   // bounded: occN
+    spinAcquire(lk3)
+    let addr = heapTakeSmallLocked(h3, OCC_CLASS, occCs)
+    spinRelease(lk3)
+    occAddr[ti] = addr
+    occOwner[ti] = 0
+    if (addr == 0) {
+      occOk = 0
+    } else {
+      let owner = -1
+      let oj = 0
+      while (oj < OCC_SPANS) {                          // bounded: OCC_SPANS
+        if (allocSpanOf(addr) == occSpan[oj]) { owner = oj }
+        oj = oj + 1
+      }
+      if (owner < 0) { occOk = 0 } else { occOwner[ti] = owner }
+    }
+    ti = ti + 1
+  }
+
+  // Fully occupied: every span reads zero free, and one more take must FAIL
+  // rather than re-serve a live slot.
+  let oc = 0
+  while (oc < OCC_SPANS) {                              // bounded: OCC_SPANS
+    if (allocSpanFree(occSpan[oc]) != 0) { occOk = 0 }
+    oc = oc + 1
+  }
+  spinAcquire(lk3)
+  let occExtra = heapTakeSmallLocked(h3, OCC_CLASS, occCs)
+  spinRelease(lk3)
+  if (occExtra != 0) { occOk = 0 }
+
+  // A deterministic Fisher-Yates over the slot indices. A permutation by
+  // construction, so no address can be freed twice if `perSpan` ever moves.
+  let occOrder = []i64(occN)
+  let po = 0
+  while (po < occN) { occOrder[po] = po; po = po + 1 }  // bounded: occN
+  let seed = 12345
+  let sw = occN - 1
+  while (sw > 0) {                                      // bounded: occN - 1
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    let pick = seed % (sw + 1)
+    let tmp = occOrder[sw]
+    occOrder[sw] = occOrder[pick]
+    occOrder[pick] = tmp
+    sw = sw - 1
+  }
+
+  // The property: after EVERY free, each span's own free count equals the tally
+  // kept here from the addresses alone.
+  let fi = 0
+  while (fi < occN) {                                   // bounded: occN
+    let k = occOrder[fi]
+    spinAcquire(lk3)
+    heapGiveSmallLocked(h3, occAddr[k], OCC_CLASS, occCs)
+    spinRelease(lk3)
+    let own = occOwner[k]
+    occFreed[own] = occFreed[own] + 1
+    let cj = 0
+    while (cj < OCC_SPANS) {                            // bounded: OCC_SPANS
+      if (allocSpanFree(occSpan[cj]) != occFreed[cj]) { occOk = 0 }
+      cj = cj + 1
+    }
+    fi = fi + 1
+  }
+
+  // Everything back: each span wholly free, no live bytes, and the runtime's own
+  // cross-check of `sum over spans of (total - free)` against the class's live
+  // slot count agrees.
+  let oe = 0
+  while (oe < OCC_SPANS) {                              // bounded: OCC_SPANS
+    if (occFreed[oe] != perSpan) { occOk = 0 }
+    if (allocSpanFree(occSpan[oe]) != perSpan) { occOk = 0 }
+    oe = oe + 1
+  }
+  if (heapLiveBytes(h3) != 0) { occOk = 0 }
+  spinAcquire(lk3)
+  let occBad = heapCheckSpansLocked(h3)
+  spinRelease(lk3)
+  if (occBad != 0) { occOk = 0 }
+  if (heapSpanViolations(h3) != 0) { occOk = 0 }
 
   // ---- (i) the direct-mapped (large) path ----------------------------------
   // Requests above allocMaxSmall bypass the size classes entirely: they are
@@ -461,9 +615,15 @@ function main() {
   let mappedAtEnd = heapMappedBytes(h)
   let spansUsed = a[A_SPANS]
 
+  // The same cross-check over the heap every other property ran against, after
+  // 20000 rounds of churn across 37 classes rather than one class in isolation.
+  spinAcquire(lk)
+  let mainBad = heapCheckSpansLocked(h)
+  spinRelease(lk)
+
   // `arena` is reached here so it stays rooted across every collection above.
   let arenaRooted = 0
   if (len(arena) == ARENA_WORDS) { arenaRooted = 1 }
 
-  print("tbl=${tsum}/${twsum} mono=${mono} pows=${powsOk} cls=${classifyOk} init=${initOk} align=${alignOk}/${liveAfterAlign} reuse=${reuseOk} carve=${carveOk}/${got} large=${largeOk} churn=${churnOk} sent=${intact}/${checked} live=${liveAtEnd} mapped=${mappedAtEnd}/${spansUsed} root=${arenaRooted}\n")
+  print("tbl=${tsum}/${twsum} mono=${mono} pows=${powsOk} cls=${classifyOk} init=${initOk} align=${alignOk}/${liveAfterAlign} reuse=${reuseOk} carve=${carveOk}/${got} occ=${occOk}/${occN} large=${largeOk} churn=${churnOk} sent=${intact}/${checked} live=${liveAtEnd} mapped=${mappedAtEnd}/${spansUsed} chk=${mainBad} root=${arenaRooted}\n")
 }

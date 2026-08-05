@@ -8,7 +8,9 @@
 // Free contract: `free` receives the same `size` and
 // `alignment` that `alloc` was called with. That is how the GC calls it (object
 // sizes live in GC headers), so there are no per-object headers here and no
-// address->span lookup table.
+// address->span lookup table. There IS per-SPAN metadata (#2374), and it needs
+// no table either: a span is aligned to its own size, so the span owning a slot
+// is `addr & ~(allocSpanBytes - 1)`.
 //
 // NOT PART OF THE ABI. `runtime/ABI.md` names no allocator symbol: the heap is
 // an internal structure reached through `runtime/gc/` and `runtime/root/`'s `g_heap`,
@@ -91,11 +93,12 @@
 // while a worker holds the heap lock would deadlock against the very lock the
 // collector needs to sweep).
 //
-// ASSERTIONS ARE ABSENT, and that is forced rather than chosen. Four things the
+// ASSERTIONS ARE ABSENT, and that is forced rather than chosen. Five things the
 // caller must honour cannot be checked here:
 //
 //   alloc:      alignment != 0 and is a power of two
 //   allocLarge: alignment <= page size
+//   refill:     spanAddr % spanBytes == 0  (#2374 — see `allocSpanBytes`)
 //   comptime:   spanBytes >= maxSmall  (every span holds >= 1 slot of every class)
 //   comptime:   classSizes[0] >= sizeof(Slot)  (a free slot holds the next-pointer)
 //
@@ -104,10 +107,17 @@
 // and Bit has no compile-time assertion for the two comptime ones. They are
 // instead pinned as runtime properties by `tests/stress/alloc`: the power-of-two
 // class invariant (b) is what makes any supported alignment satisfiable, the
-// carve property (f) proves a span yields `spanBytes/classSize` >= 1 whole
-// slots, and class 0 being 8 bytes — exactly one machine word — is checked by
-// the same table properties. The GC is the only caller and always passes a
-// valid alignment, so nothing is lost beyond the debug aid.
+// carve property (f) proves a span yields `allocSpanSlots(idx)` >= 1 whole
+// slots, property (j) checks the span alignment of every span it is handed, and
+// class 0 being 8 bytes — exactly one machine word — is checked by the same table
+// properties. The GC is the only caller and always passes a valid alignment, so
+// nothing is lost beyond the debug aid.
+//
+// WHAT IS CHECKED, THOUGH, IS THE BOOKKEEPING (#2374). `heapCheckSpansLocked`
+// re-derives every class's occupancy from the spans and compares it against the
+// counts `take`/`give` maintain, COUNTING violations rather than asserting them —
+// the same shape `runtime/gc/gc.bit`'s constraint 5 uses, for the same reason,
+// and it stays visible in a release build.
 
 // --- Layout -----------------------------------------------------------------
 
@@ -120,16 +130,31 @@ export const allocMaxSmall: int = 16384
 
 // Bytes pulled from the OS each time a size class runs dry. Kept >=
 // `allocMaxSmall` so every span holds at least one slot of every class.
+//
+// EVERY SPAN MUST START ON A MULTIPLE OF THIS, and that is a contract on the
+// CALLER of `heapRefillLocked`, not a property this module can enforce: it is
+// what makes `allocSpanOf` a mask instead of a lookup. `runtime/gc/mem.bit`'s
+// `reserveTake` aligns any take of at least this size to it (#2373), and the
+// two test drivers that play the role of the OS do the same.
 export const allocSpanBytes: int = 131072
 
 // The heap's state as a count of 8-byte words, so a caller can size the block:
-// two counters followed by one free-list head per class.
+// two counters followed by one span-list head per class.
+//
+// 2 + 37 IS EXACTLY 39, AND THE BLOCK IS FULL. That is why the class-wide
+// bookkeeping #2374 needs — the free-slot list head, the live-slot count and
+// the violation count — lives in the anchor SPAN's header rather than here:
+// `runtime/root/root.bit` spells the block `[39]i64` and refuses to boot unless
+// `heapWords == 39`, so a fortieth word is an edit in another module, exactly as
+// a fourth reserve word would be (see `runtime/gc/mem.bit`).
 export const heapWords: int = 39
 
 // Exported (#1700): stwPoll inlines heapLiveBytes's one-load body on its hot
 // path to avoid a cross-module call, and needs the offset to do it.
 export const heapLiveWord: int = 0
 const heapMappedWord: int = 1
+// One word per class, holding the head of that class's SPAN list — not, since
+// #2374, the head of its free-slot list. See `--- Span metadata ---`.
 const heapListsWord: int = 2
 
 // Size of class `i`.
@@ -201,9 +226,91 @@ export @nosplit @symbol("bit_rt_alloc_classify") function allocClassify(size: in
   return z + (addr / 8)
 }
 
+// --- Span metadata ----------------------------------------------------------
+//
+// `bit lsp --stdio` reached 12.5 GB RSS while idle (#2325) and nothing could
+// have given a byte of it back, because a span, once carved, was not
+// represented anywhere: its slots went onto one flat per-class list and the
+// span itself was forgotten. "Is span S entirely free?" needed an O(n) walk of
+// the whole class, and even the answer was useless — the slots are interior
+// nodes of a singly-linked list with no back pointers.
+//
+// A span now carries a header in its own first words, so the question is O(1).
+// This ticket only makes it ANSWERABLE; unmapping an empty span is #2375.
+//
+// THE HEADER IS AT THE SPAN'S BASE, AND THE FIRST FEW SLOTS PAY FOR IT. The
+// carve starts at the first whole slot past the header (`spanSkip` of them),
+// which keeps every slot at an exact multiple of the class size from the span
+// base — the alignment argument `allocClassify` rests on, unchanged. Rounding
+// the carve start to a fixed byte offset instead would break it for the classes
+// whose size is not a power of two.
+//
+// FOUR OF THE SEVEN WORDS DESCRIBE THE SPAN. The other three are CLASS-WIDE and
+// are meaningful only in the span at the head of the class's list — the
+// "anchor" — because `heapWords` is full and has no room for them (see
+// `heapWords`). `heapRefillLocked` copies them onto the new anchor as it pushes
+// it, which is three stores on a path that already walks a whole span.
+const spanClass: int = 0     // owning size-class index
+const spanTotal: int = 1     // slots carved out of this span
+const spanFree: int = 2      // how many of those are on the class's free list
+const spanNext: int = 3      // next span of this class, 0 = end of list
+const spanList: int = 4      // ANCHOR ONLY: head of the class's free-slot list
+const spanLive: int = 5      // ANCHOR ONLY: slots of the class handed out
+const spanBad: int = 6       // ANCHOR ONLY: violations `heapCheckSpansLocked` saw
+export const allocSpanHdrWords: int = 7
+
+// The span owning `addr`. A MASK, NOT A LOOKUP, and that is what keeps
+// `heapTakeSmallLocked`/`heapGiveSmallLocked` `@nosplit`-safe and O(1): every
+// span starts on a multiple of `allocSpanBytes`, which is a power of two, so
+// clearing the low bits of any address inside it lands exactly on its base.
+//
+// It is sound only because #2373 aligned span-sized takes to `allocSpanBytes`
+// rather than to the page. Page alignment would NOT have been enough: on
+// aarch64-macos `runtime/root/darwin/boot.bit` passes 4096 as the nominal page
+// size while the real page is 16 KiB, so "page-aligned" is ambiguous there, and
+// neither reading implies this one.
+export @nosplit @symbol("bit_rt_alloc_span_of") function allocSpanOf(addr: int): int {
+  return addr & ~(allocSpanBytes - 1)
+}
+
+// Slots of size `cs` the header consumes at the span base. Rounded UP to a
+// whole slot so the carve stays on the class's own grid.
+@nosplit function spanSkip(cs: int): int {
+  return (allocSpanHdrWords * 8 + cs - 1) / cs
+}
+
+// Slots a span yields for class `idx`. At least 1 for every class: the largest
+// class is `allocMaxSmall` and `allocSpanBytes` is eight times it, so the
+// header costs one of those eight slots and seven remain.
+export @nosplit @symbol("bit_rt_alloc_span_slots") function allocSpanSlots(idx: int): int {
+  let cs = allocClassSize(idx)
+  return allocSpanBytes / cs - spanSkip(cs)
+}
+
+// The three per-span fields, read by address. Exposed so a test can compute the
+// occupancy tally independently and compare, which is the only way to catch a
+// take or give that updated the WRONG span — an error that leaves every
+// aggregate over the class exactly right.
+export @nosplit function allocSpanClass(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanClass)
+}
+
+export @nosplit function allocSpanTotal(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanTotal)
+}
+
+export @nosplit function allocSpanFree(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanFree)
+}
+
 // --- Heap state -------------------------------------------------------------
 
-// Zero the heap block: null free lists and zeroed counters.
+// Zero the heap block: null span lists and zeroed counters. Every span the heap
+// owned is FORGOTTEN, not freed — the memory is the caller's, so a caller
+// reinitialising a heap that has spans must have released them itself.
 //
 // There are no field defaults to lean on here. The
 // caller's block need not have started zeroed, so the stores are explicit.
@@ -248,12 +355,28 @@ export @nosplit function heapMappedBytes(h: *i64): int {
 // empty case returns to the caller because only the caller can reach the OS.
 // `0` is safe as the empty sentinel: address 0 is the null page and can never
 // be a live slot.
+// THE FREE LIST IS STILL ONE FLAT LIST PER CLASS and the pop is still LIFO, so
+// the ORDER addresses are handed out in is unchanged (see `heapRefillLocked`).
+// Only its head moved: it lives in the anchor span's header, because the heap
+// block has no fortieth word to keep it in.
+//
+// Two invariants make this body's shortcuts safe, and both are established by
+// `heapRefillLocked` and preserved by every path here:
+//   - a non-zero class word points at a span whose header is initialised, and
+//   - the free list's slots all belong to spans on that class's list, so
+//     `allocSpanOf` of any of them lands on a real span header.
 export @nosplit @symbol("bit_rt_heap_take_small_locked") function heapTakeSmallLocked(h: *i64, idx: int, size: int): int {
   let head = h + heapListsWord + idx
-  let addr = *head
-  if (addr == 0) { return 0 }
+  let anchor = *head
+  if (anchor == 0) { return 0 }          // no span yet: the caller must refill
+  let a = allocWordAt(anchor)
+  let addr = *(a + spanList)
+  if (addr == 0) { return 0 }            // every slot handed out: refill
   let slot = allocWordAt(addr)
-  *head = *slot                          // pop: head = slot.next
+  *(a + spanList) = *slot                // pop: list = slot.next
+  *(a + spanLive) = *(a + spanLive) + 1
+  let sp = allocWordAt(allocSpanOf(addr))
+  *(sp + spanFree) = *(sp + spanFree) - 1
   let live = h + heapLiveWord
   let prev = atomicAdd(live, size)
   return addr
@@ -264,11 +387,20 @@ export @nosplit @symbol("bit_rt_heap_take_small_locked") function heapTakeSmallL
 // The intrusive next-pointer is written into the freed slot itself, which is
 // why `allocClassSize(0)` (8) must be >= one machine word — an assert would catch
 // exactly this at comptime (`class_sizes[0] >= @sizeOf(Slot)`).
+//
+// `addr` MUST have come from a `heapTakeSmallLocked` on the same class, which is
+// the allocator's existing free contract stated in the module header. It is what
+// makes the class word non-zero here (a slot exists, so its span does) and what
+// makes `allocSpanOf(addr)` a span of THIS class.
 export @nosplit @symbol("bit_rt_heap_give_small_locked") function heapGiveSmallLocked(h: *i64, addr: int, idx: int, size: int) {
   let head = h + heapListsWord + idx
+  let a = allocWordAt(*head)
   let slot = allocWordAt(addr)
-  *slot = *head                          // push: slot.next = head
-  *head = addr
+  *slot = *(a + spanList)                // push: slot.next = list
+  *(a + spanList) = addr
+  *(a + spanLive) = *(a + spanLive) - 1
+  let sp = allocWordAt(allocSpanOf(addr))
+  *(sp + spanFree) = *(sp + spanFree) + 1
   let live = h + heapLiveWord
   let prev = atomicSub(live, size)
 }
@@ -276,23 +408,126 @@ export @nosplit @symbol("bit_rt_heap_give_small_locked") function heapGiveSmallL
 // Carve one fresh span of `allocSpanBytes` bytes at `spanAddr` into slots and
 // push them onto class `idx`. CALLER MUST HOLD THE LOCK.
 //
+// `spanAddr` MUST be a multiple of `allocSpanBytes` — see that constant. Nothing
+// here can check it (`@nosplit` cannot panic), and a misaligned span does not
+// fail: it makes `allocSpanOf` name a NEIGHBOURING span, whose free count then
+// drifts while this one's stands still.
+//
 // Slots are pushed in increasing address order, so the head ends on the HIGHEST
 // address. That order is observable (it decides which
 // address the next `take` hands out), so it is preserved deliberately.
+//
+// The new span becomes the class's ANCHOR, so the three class-wide words move
+// onto it. The free list is carried over rather than restarted: a refill happens
+// when the list is empty, but "empty" is the common case, not a guarantee — a
+// caller may refill early, and dropping a non-empty list would strand every slot
+// on it.
 export @nosplit @symbol("bit_rt_heap_refill_locked") function heapRefillLocked(h: *i64, idx: int, spanAddr: int) {
   let cs = allocClassSize(idx)
-  let count = allocSpanBytes / cs        // >= 1 by the allocSpanBytes >= allocMaxSmall invariant
+  let count = allocSpanBytes / cs - spanSkip(cs)   // >= 1, see `allocSpanSlots`
   let head = h + heapListsWord + idx
+  let prevAnchor = *head
+  let sp = allocWordAt(spanAddr)
+  *(sp + spanClass) = idx
+  *(sp + spanTotal) = count
+  *(sp + spanFree) = count
+  *(sp + spanNext) = prevAnchor
+  *(sp + spanList) = 0
+  *(sp + spanLive) = 0
+  *(sp + spanBad) = 0
+  if (prevAnchor != 0) {
+    let pa = allocWordAt(prevAnchor)
+    *(sp + spanList) = *(pa + spanList)
+    *(sp + spanLive) = *(pa + spanLive)
+    *(sp + spanBad) = *(pa + spanBad)
+  }
+  let base = spanAddr + spanSkip(cs) * cs
   let i = 0
   while (i < count) {                    // bounded: <= allocSpanBytes / allocClassSize(0)
-    let addr = spanAddr + i * cs
+    let addr = base + i * cs
     let slot = allocWordAt(addr)
-    *slot = *head
-    *head = addr
+    *slot = *(sp + spanList)
+    *(sp + spanList) = addr
     i = i + 1
   }
+  *head = spanAddr
   let mapped = h + heapMappedWord
   let prev = atomicAdd(mapped, allocSpanBytes)
+}
+
+// THE INVARIANT, CHECKED RATHER THAN TRUSTED: for every size class,
+// `sum over its spans of (total - free)` is the number of its slots currently
+// handed out. CALLER MUST HOLD THE LOCK.
+//
+// An off-by-one here hands a live slot out twice, which is heap corruption that
+// surfaces somewhere else entirely and much later, so the two sides are
+// maintained by different code: the sum comes from per-span counters that
+// `take`/`give` reach through `allocSpanOf`, the live count from a class-wide
+// counter they reach through the anchor. A span that is not on its class's list,
+// one that is on two, a wrong `total`, a free count out of range, a misaligned
+// span base and a slot credited to a span of another class all break the
+// equality. What it CANNOT see is a take or give that hit the wrong span of the
+// SAME class — that keeps the sum intact — and catching those is
+// `tests/stress/alloc`'s per-span tally, which is why the per-span fields are
+// exported.
+//
+// Returns the violations found now, and adds them to each class's anchor so
+// `heapSpanViolations` reports every one ever seen. Counting rather than
+// asserting is `runtime/gc/gc.bit`'s constraint 5, for its reason: a `@nosplit`
+// body cannot panic, and a counter stays visible in a release build.
+export @nosplit @symbol("bit_rt_heap_check_spans_locked") function heapCheckSpansLocked(h: *i64): int {
+  // Bound the walk by memory that exists: a span is `allocSpanBytes` of mapped
+  // memory, so no class can own more spans than the heap has mapped in total.
+  // The one function whose job is to distrust these links must not hang on a
+  // cycle in them.
+  let maxSpans = heapMappedBytes(h) / allocSpanBytes + 1
+  let found = 0
+  let idx = 0
+  while (idx < allocNumClasses) {        // bounded: allocNumClasses iterations
+    let anchor = *(h + heapListsWord + idx)
+    if (anchor != 0) {
+      let want = allocSpanSlots(idx)
+      let bad = 0
+      let inUse = 0
+      let seen = 0
+      let s = anchor
+      while (s != 0 && seen < maxSpans) {   // bounded: maxSpans iterations
+        let sp = allocWordAt(s)
+        if (s != allocSpanOf(s)) { bad = bad + 1 }
+        if (*(sp + spanClass) != idx) { bad = bad + 1 }
+        if (*(sp + spanTotal) != want) { bad = bad + 1 }
+        let f = *(sp + spanFree)
+        if (f < 0 || f > want) { bad = bad + 1 }
+        inUse = inUse + want - f
+        s = *(sp + spanNext)
+        seen = seen + 1
+      }
+      if (s != 0) { bad = bad + 1 }      // ran out of bound: a cycle or a bogus link
+      let av = allocWordAt(anchor)
+      if (inUse != *(av + spanLive)) { bad = bad + 1 }
+      *(av + spanBad) = *(av + spanBad) + bad
+      found = found + bad
+    }
+    idx = idx + 1
+  }
+  return found
+}
+
+// Every violation `heapCheckSpansLocked` has recorded on this heap. Zero on a
+// heap it has never run against, so a test must drive the check itself rather
+// than read this and conclude the heap was verified.
+export @nosplit @symbol("bit_rt_heap_span_violations") function heapSpanViolations(h: *i64): int {
+  let total = 0
+  let idx = 0
+  while (idx < allocNumClasses) {        // bounded: allocNumClasses iterations
+    let anchor = *(h + heapListsWord + idx)
+    if (anchor != 0) {
+      let av = allocWordAt(anchor)
+      total = total + *(av + spanBad)
+    }
+    idx = idx + 1
+  }
+  return total
 }
 
 // Account the release of `nbytes` of SPAN memory the caller has unmapped.
