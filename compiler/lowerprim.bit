@@ -86,6 +86,198 @@ function emitRtCall(fc: FnCtx, ins: IrInstr): int {
   return builderEmit(fc.b, ins)
 }
 
+// ===========================================================================
+// Structural comparison descriptors (SPEC §14.6)
+//
+// §14.6 makes a struct comparable FIELD-WISE and a tuple ELEMENT-WISE, but both
+// are one traced handle to a heap box, so the plain word compare `lowerComparison`
+// emits answered "same allocation?" instead (#2105, #2113) — and the runtime map
+// hashed the same handle, so an equal key missed and re-inserting it GREW the map
+// (#2111).
+//
+// All three are fixed by one runtime walk (`descEqAgg` / `descHashAgg` in
+// runtime/root/maps.bit), and that walk needs the type's shape. It cannot recover
+// it at run time: the GC's `TypeInfo` distinguishes reference words from scalar
+// words but not a `string` from a nested struct, and a string LITERAL is a static
+// `{ptr,len}` pair with no GC header to read at all. So the shape is compiled
+// here into a DESCRIPTOR PROGRAM — a string constant, one byte per body word —
+// and handed to the runtime at the comparison site and at `map_new`.
+//
+// runtime/root/maps.bit owns the grammar; this is its only producer. ONE producer
+// and ONE consumer is what makes the map's hash and its equality agree by
+// construction rather than by review.
+// ===========================================================================
+
+// How deep the generator will follow nested aggregates. Below the runtime's own
+// `descMaxDepth` (8) on purpose, so a program can never out-nest its interpreter.
+// A self-referential type (`struct N { next: N }`) is what this bounds: it stops
+// at 'r' — identity — which is also what Go gives such a field, since a
+// recursive Go struct must reach itself through a pointer.
+const descMaxDepth: int = 6
+
+// The token budget for one whole program, counted in body words. Each nested
+// aggregate is handed an equal share of what is left, so the total output is
+// bounded by this number however wide or deep the type is (Power of 10 rule 3).
+const descMaxWords: int = 96
+
+// The descriptor token for a value of type `ty` occupying ONE body word.
+// `budget` is the number of further words this token's own subtree may describe.
+function descToken(fc: FnCtx, ty: int, depth: int, budget: int): string {
+  let t = fc.c.ctx.types[ty]
+  if (t.kind == TypeKind.Prim && t.prim == 11) {
+    return "s"
+  }
+  if (depth < descMaxDepth && (t.kind == TypeKind.Struct || t.kind == TypeKind.Tuple)) {
+    let inner = descProgram(fc, ty, depth + 1, budget)
+    if (inner != "") {
+      return inner
+    }
+  }
+  // Everything else reachable through a traced word — a slice, map, chan,
+  // function, interface, payload enum or bare type parameter — has no value
+  // equality of its own (§14.6), so it keeps the identity comparison it has
+  // today. Blowing the depth or the budget lands here too, which degrades to the
+  // pre-fix answer rather than to a wrong one.
+  return "r"
+}
+
+// The body word slots of aggregate `ty`: `out[i]` is the type of the traced
+// value occupying body word `i`, or 0 when that word holds raw bytes (scalars,
+// packed sub-word fields, padding). Returns an empty slice when the layout
+// cannot be read, which the caller treats as "not describable".
+function descSlots(fc: FnCtx, ty: int): []int {
+  let t = fc.c.ctx.types[ty]
+  if (t.kind == TypeKind.Tuple) {
+    return descSlotsFrom(fc, layoutFields(fc, t.members), t.members)
+  }
+  let decl = structDeclOf(fc.c, ty)
+  if (decl == 0) {
+    return []int(0)
+  }
+  let oc = typeOwner(fc.c, ty)
+  // `ty` is the INSTANTIATION (`Box<i64>`), whose declaration still spells the
+  // field `v: T`; laying it out unsubstituted would call that integer a traced
+  // reference, the same trap `lowerTypeInfo` records for the GC descriptor.
+  let sub = structTySubst(fc, oc, decl, ty)
+  let fields = structFieldNodes(oc, decl)
+  let ftypes = []int(0)
+  let i = 0
+  while (i < len(fields)) {
+    ftypes = append(ftypes, typeFromNodeIn(oc, kidsOf(oc.tree, fields[i])[1], sub))
+    i = i + 1
+  }
+  return descSlotsFrom(fc, structLayout(fc, oc, decl, sub), ftypes)
+}
+
+// The shared half of `descSlots`, over a computed layout and its field types.
+function descSlotsFrom(fc: FnCtx, layout: StructLayout, ftypes: []int): []int {
+  let out = []int(layout.size / 8)
+  let i = 0
+  while (i < len(ftypes) && i < len(layout.offsets)) {
+    let ft = fc.c.ctx.types[ftypes[i]]
+    // An `[N]T` field is INLINED into the struct body (`structLayout`), so it
+    // occupies its elements' words rather than one handle word.
+    if (ft.kind == TypeKind.Array) {
+      let el = fieldLayoutFor(fc, ft.elem)
+      if (el.isPtr) {
+        let k = 0
+        while (k < ft.arrayLen) {
+          let w = (layout.offsets[i] + k * 8) / 8
+          if (w < len(out)) {
+            out[w] = ft.elem
+          }
+          k = k + 1
+        }
+      }
+    } else if (fieldLayoutFor(fc, ftypes[i]).isPtr) {
+      let w = layout.offsets[i] / 8
+      if (w < len(out)) {
+        out[w] = ftypes[i]
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The descriptor program for the aggregate type `ty`, e.g. `"{ws}"` for
+// `struct P { x: int, name: string }`. Empty when `ty` has no describable
+// layout or when `budget` will not cover it.
+function descProgram(fc: FnCtx, ty: int, depth: int, budget: int): string {
+  let slots = descSlots(fc, ty)
+  let n = len(slots)
+  if (n > budget) {
+    return ""
+  }
+  // Each word's own subtree gets an equal share of what this level leaves over,
+  // so the whole program is bounded by the budget it started with.
+  let share = 0
+  if (n > 0) {
+    share = (budget - n) / n
+  }
+  let out = "{"
+  let i = 0
+  while (i < n) {
+    if (slots[i] == 0) {
+      out = out + "w"
+    } else {
+      out = out + descToken(fc, slots[i], depth, share)
+    }
+    i = i + 1
+  }
+  return out + "}"
+}
+
+// The descriptor program for a type compared BY VALUE, or "" for a type that
+// keeps its word comparison. Structs and tuples are the two §14.6 admits with a
+// field/element-wise rule and a boxed representation; everything else — scalars,
+// `string`, C-like enums, interfaces (identity today, see #2105's note) — is
+// already handled by `lowerComparison` or has no value equality.
+function descForType(fc: FnCtx, ty: int): string {
+  let k = fc.c.ctx.types[ty].kind
+  if (k != TypeKind.Struct && k != TypeKind.Tuple) {
+    return ""
+  }
+  return descProgram(fc, ty, 0, descMaxWords)
+}
+
+// Materializes a descriptor program as a pooled string constant.
+function descConst(fc: FnCtx, prog: string): int {
+  let ins = mkInstr(Op.ConstString, primType(fc.c.ctx, 11))
+  ins.sval = prog
+  ins.ival = internPoolString(fc, prog)
+  return builderEmit(fc.b, ins)
+}
+
+// `a == b` / `a != b` over a struct or tuple: `rt_call value_eq(a, b, desc)`,
+// with `!=` negated the way the `string_eq` path next door negates its own.
+// Returns -1 when `operandTy` is not compared by value, leaving the caller's
+// word comparison in place.
+function lowerValueEq(fc: FnCtx, opKind: int, operandTy: int, lhs: int, rhs: int): int {
+  if (opKind != int(Kind.EqEq) && opKind != int(Kind.BangEq)) {
+    return -1
+  }
+  let prog = descForType(fc, operandTy)
+  if (prog == "") {
+    return -1
+  }
+  let boolTy = primType(fc.c.ctx, 10)
+  let ve = mkInstr(Op.RtCall, boolTy)
+  ve.name = "value_eq"
+  ve.args = [lhs, rhs, descConst(fc, prog)]
+  let eq = emitRtCall(fc, ve)
+  if (opKind == int(Kind.EqEq)) {
+    return eq
+  }
+  let f = mkInstr(Op.ConstBool, boolTy)
+  f.bval = false
+  let fV = builderEmit(fc.b, f)
+  let ne = mkInstr(Op.ICmpEq, boolTy)
+  ne.lhs = eq
+  ne.rhs = fV
+  return builderEmit(fc.b, ne)
+}
+
 // 2^n for the small, statically bounded `n` the word-argument mask needs.
 function pow2(n: int): int {
   let v = 1

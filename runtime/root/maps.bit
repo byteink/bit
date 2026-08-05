@@ -154,23 +154,235 @@ function rtWyhashString(s: int, seed: u64): u64 {
   return x ^ (x >> 31)
 }
 
+// ---------------------------------------------------------------------------
+// Structural comparison of composite values (SPEC §14.6)
+// ---------------------------------------------------------------------------
+//
+// A struct or tuple value IS a heap box, so comparing the word compares the
+// ALLOCATION and not the value: two separately built `P{x:1}` came out unequal
+// (#2105, #2113), and a `map<P,int>` hashed every insert into its own slot, so
+// re-inserting an equal key GREW the map instead of overwriting (#2111). §14.6
+// says a struct compares field-wise and a tuple element-wise, so both need a
+// walk of the box.
+//
+// THE RUNTIME CANNOT DERIVE THE SHAPE ON ITS OWN. The GC's `TypeInfo` says which
+// words hold references, never what KIND of reference — a `string` and a nested
+// struct are both one traced word — and a string LITERAL is a static `{ptr,len}`
+// pair in `.data` with no GC header at all, so there is nothing to read a
+// descriptor out of. The compiler therefore hands the shape down as a DESCRIPTOR
+// PROGRAM: a string constant it emits at the comparison site and at `map_new`.
+//
+// THE GRAMMAR — one byte per body word, in body order:
+//
+//   '{' item* '}'  an aggregate. Its items describe consecutive 8-byte words of
+//                  the box's body.
+//   'w'            a raw word, compared and hashed BY VALUE. Integers, bools,
+//                  runes, C-like enums, raw pointers, floats, and any packed
+//                  sub-word fields that share the word.
+//   's'            a `string` handle, compared and hashed BY ITS BYTES.
+//   'r'            an opaque reference — slice, map, chan, function, interface,
+//                  payload enum — compared and hashed BY IDENTITY, which is what
+//                  those types have in place of a value equality.
+//   '{' ... '}'    a nested struct or tuple: dereferenced and walked.
+//
+// WHY ONE WALK AND NOT TWO. `descEqAgg` and `descHashAgg` read the SAME program
+// and take the SAME cases in the SAME order, so `eq(a,b) => hash(a)==hash(b)`
+// holds case by case rather than by review: 'w' equal words hash the same word,
+// 's' equal bytes hash the same bytes, 'r' equal handles hash the same handle,
+// and a nested aggregate is the induction step. Two implementations that merely
+// agreed today would give a map that silently loses entries the day they drift,
+// which is worse than either original bug.
+//
+// FLOATS COMPARE BY BIT PATTERN inside a composite, where a bare `f64 ==` is
+// IEEE. Deliberate: it is the only rule that keeps composite equality REFLEXIVE,
+// and a key not equal to itself is a key that can never be found or deleted. It
+// also matches what a bare `map<f64,int>` key already does here. The cost is
+// that `+0.0` and `-0.0` differ in a field; the gain is that a NaN field does
+// not strand a map entry.
+//
+// A FIELD WHOSE TYPE IS NOT COMPARABLE AT ALL (a slice, a map) compares by
+// identity via 'r' rather than making the whole comparison fail. `vComparable`
+// is deliberately permissive on structs, so `P { tags: []string } == P {...}`
+// still reaches lowering; identity is the answer that is total, bounded and
+// consistent with the hash.
+
+// The deepest nesting either walk will follow. The compiler's generator stops
+// well short of this (`descMaxDepth` in compiler/lowerprim.bit), so this is the
+// backstop that keeps a malformed or recursive program from running away —
+// Power of 10 rule 2, a statically provable bound on every loop.
+const descMaxDepth: int = 8
+
+const descAgg: int = 123    // '{'
+const descEnd: int = 125    // '}'
+const descStr: int = 115    // 's'
+
+// The `key_is_string` header slot (ABI.md §15) now carries the key DESCRIPTOR:
+// 0 for a word-sized scalar key, 1 for a `string` key, and otherwise the handle
+// of the descriptor program for a composite key. The slot is UNTRACED, which is
+// exactly right for all three — a program is a string CONSTANT, static for the
+// life of the process, so nothing has to keep it alive.
+const mapKeyDesc: int = mapKeyIsString
+const mapKeyScalar: int = 0
+const mapKeyString: int = 1
+
+// The index just past the `}` matching the `{` at `p`, or `plen` when the
+// program is malformed. Bounded by the program's length.
+@nosplit function descSkipAgg(prog: int, plen: int, p: int): int {
+  let nest = 0
+  let i = p
+  while (i < plen) {
+    let c = loadByte(prog + i)
+    if (c == descAgg) {
+      nest = nest + 1
+    } else if (c == descEnd) {
+      nest = nest - 1
+      if (nest == 0) {
+        return i + 1
+      }
+    }
+    i = i + 1
+  }
+  return plen
+}
+
+// Compares the aggregates at `a` and `b` against the program at `prog[p..]`,
+// where `prog[p]` is the opening `{`. Returns the index just past the matching
+// `}` when they are equal, -1 when they are not. Bounded by the program's
+// length at each level and by `descMaxDepth` levels.
+@nosplit function descEqAgg(a: int, b: int, prog: int, plen: int, p: int, depth: int): int {
+  if (depth > descMaxDepth) {
+    return -1
+  }
+  let i = p + 1
+  let off = 0
+  while (i < plen) {
+    let c = loadByte(prog + i)
+    if (c == descEnd) {
+      return i + 1
+    }
+    let wa = loadWord(a + off)
+    let wb = loadWord(b + off)
+    if (c == descAgg) {
+      if (wa == wb) {
+        // The same box (or both null) on each side: equal without a walk, and
+        // `descHashAgg` reaches the identical value for the identical reason.
+        i = descSkipAgg(prog, plen, i)
+      } else if (wa == 0 || wb == 0) {
+        return -1
+      } else {
+        let n = descEqAgg(wa, wb, prog, plen, i, depth + 1)
+        if (n < 0) {
+          return -1
+        }
+        i = n
+      }
+      off = off + 8
+      continue
+    }
+    if (c == descStr) {
+      // `strSize(0)` is 0, so a null handle is the empty string here — the same
+      // reading `bit_rt_string_eq` already takes (ABI.md §2).
+      if (wa != wb && !rtStringEq(wa, wb)) {
+        return -1
+      }
+    } else if (wa != wb) {
+      // 'w' by value and 'r' by identity are both the raw word. An unrecognised
+      // byte lands here too, so a malformed program can only UNDER-report
+      // equality, never over-report it.
+      return -1
+    }
+    off = off + 8
+    i = i + 1
+  }
+  return -1
+}
+
+// `bit_rt_value_eq` (ABI.md §15.1): `a == b` for a struct or tuple, field-wise per
+// SPEC §14.6. `desc` is the descriptor program the compiler emitted for the
+// operand type.
+export @nosplit @symbol("bit_rt_value_eq")
+function rtValueEq(a: int, b: int, desc: int): bool {
+  if (a == b) {
+    return true
+  }
+  if (a == 0 || b == 0) {
+    return false
+  }
+  return descEqAgg(a, b, strBytes(desc), strSize(desc), 0, 0) >= 0
+}
+
+// Folds one component hash into the running value. Sequential, so the fold is
+// ORDER-SENSITIVE and `(1, 2)` does not collide with `(2, 1)`.
+@nosplit function descMixIn(h: u64, x: u64): u64 {
+  return wyMix(h ^ x, wySecret2)
+}
+
+// The value hash of the aggregate at `v` under the program at `prog[p..]`. Takes
+// the same cases in the same order as `descEqAgg` — that correspondence is what
+// makes `eq(a,b) => hash(a)==hash(b)` true, so the two must be edited together.
+@nosplit function descHashAgg(v: int, prog: int, plen: int, p: int, depth: int): u64 {
+  if (depth > descMaxDepth) {
+    return scalarHash(u64(v))
+  }
+  let h = wySecret0
+  let i = p + 1
+  let off = 0
+  while (i < plen) {
+    let c = loadByte(prog + i)
+    if (c == descEnd) {
+      return h
+    }
+    let w = loadWord(v + off)
+    if (c == descAgg) {
+      let sub: u64 = 0
+      if (w != 0) {
+        sub = descHashAgg(w, prog, plen, i, depth + 1)
+      }
+      h = descMixIn(h, sub)
+      i = descSkipAgg(prog, plen, i)
+      off = off + 8
+      continue
+    }
+    if (c == descStr) {
+      h = descMixIn(h, wyhash(strBytes(w), strSize(w), u64(0)))
+    } else {
+      h = descMixIn(h, scalarHash(u64(w)))
+    }
+    off = off + 8
+    i = i + 1
+  }
+  return h
+}
+
 // A key's hash: a `string` key hashes its BYTES (so two equal strings at
-// different addresses collide correctly), a scalar hashes by value.
+// different addresses collide correctly), a composite key hashes its CONTENTS
+// through its descriptor program, a scalar hashes by value.
 @nosplit function mapHash(m: int, key: int): u64 {
-  if (loadWord(m + mapKeyIsString) != 0) {
+  let d = loadWord(m + mapKeyDesc)
+  if (d == mapKeyScalar) {
+    return scalarHash(u64(key))
+  }
+  if (d == mapKeyString) {
     let p = strBytes(key)
     let n = strSize(key)
     return wyhash(p, n, u64(0))
   }
-  return scalarHash(u64(key))
+  if (key == 0) {
+    return 0
+  }
+  return descHashAgg(key, strBytes(d), strSize(d), 0, 0)
 }
 
-// Key equality, matching `mapHash`'s notion of identity.
+// Key equality, matching `mapHash`'s notion of identity case for case.
 @nosplit function mapKeyEq(m: int, a: int, b: int): bool {
-  if (loadWord(m + mapKeyIsString) != 0) {
+  let d = loadWord(m + mapKeyDesc)
+  if (d == mapKeyScalar) {
+    return a == b
+  }
+  if (d == mapKeyString) {
     return rtStringEq(a, b)
   }
-  return a == b
+  return rtValueEq(a, b, d)
 }
 
 // Locates `key`'s slot. Returns the slot index; `mapProbeFound` reports whether
@@ -245,9 +457,12 @@ let probeFound: i64 = 0
 @nosplit function mapGrow(m: int): bool {
   let vcap = loadWord(m + mapCap)
   let newcap = vcap * 2
-  let keyIsString = loadWord(m + mapKeyIsString)
+  let keyDesc = loadWord(m + mapKeyDesc)
   let valIsRef = loadWord(m + mapValIsRef)
-  let nkeys = allocBuf(newcap, keyIsString != 0)
+  // Any non-scalar key is a reference the key buffer has to KEEP ALIVE, not just
+  // a `string` one: a composite key is a GC box, and an untraced key buffer let
+  // it be collected out from under the map.
+  let nkeys = allocBuf(newcap, keyDesc != mapKeyScalar)
   if (nkeys == 0) {
     return false
   }
@@ -289,10 +504,12 @@ let probeFound: i64 = 0
   return true
 }
 
-// `bit_rt_map_new`: an empty map. `keyIsString`/`valIsRef` (0/1) are fixed by
-// K/V at the call site and decide hashing, equality and GC tracing.
+// `bit_rt_map_new`: an empty map. `keyDesc` and `valIsRef` are fixed by K/V at
+// the call site and decide hashing, equality and GC tracing. `keyDesc` is 0 for
+// a scalar key, 1 for a `string` key, and otherwise the descriptor program for a
+// composite key (see the descriptor header above).
 export @nosplit @symbol("bit_rt_map_new")
-function rtMapNew(keyIsString: int, valIsRef: int): int {
+function rtMapNew(keyDesc: int, valIsRef: int): int {
   let g = wordAt(gcAddr)
   let base = infoAddr
   let m = gcAlloc(g, base + riMap * 8)
@@ -300,7 +517,7 @@ function rtMapNew(keyIsString: int, valIsRef: int): int {
     statOom = statOom + 1
     return 0
   }
-  let keys = allocBuf(mapInitCap, keyIsString != 0)
+  let keys = allocBuf(mapInitCap, keyDesc != mapKeyScalar)
   if (keys == 0) {
     return 0
   }
@@ -318,7 +535,7 @@ function rtMapNew(keyIsString: int, valIsRef: int): int {
   storeWord(m + mapLen, 0)
   storeWord(m + mapCap, mapInitCap)
   storeWord(m + mapUsed, 0)
-  storeWord(m + mapKeyIsString, keyIsString)
+  storeWord(m + mapKeyDesc, keyDesc)
   storeWord(m + mapValIsRef, valIsRef)
   return m
 }
