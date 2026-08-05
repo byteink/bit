@@ -97,29 +97,14 @@ absent.
 
 ### `isDir(path: string): bool`
 
-Whether `path` exists and is a directory. This **follows** a symbolic link, as
-`stat(2)` does: a link pointing at a directory answers `true`.
-
-### `isSymlink(path: string): bool`
-
-Whether `path` is itself a symbolic link — the question asked of the link, not
-of what it resolves to, so this is `lstat`-shaped where `exists` and `isDir` are
-`stat`-shaped. A link pointing at a directory answers `true` to **both**
-`isDir` and `isSymlink`; a link whose target does not exist is still a link, and
-still answers `true`.
-
-False for the empty path, for a missing path, and for anything that is not a
-link. Like `exists` and `isDir`, it never fails.
+Whether `path` exists and is a directory.
 
 ```bit
-import { exists, isDir, isSymlink } from "std/fs"
+import { exists, isDir } from "std/fs"
 
 function kind(path: string): string {
   if (!exists(path)) {
     return "missing"
-  }
-  if (isSymlink(path)) {
-    return "symlink"
   }
   if (isDir(path)) {
     return "directory"
@@ -146,18 +131,6 @@ The names directly inside `path`, without `.` or `..`, in no guaranteed order.
 
 Every file below `root`, recursively, as paths joined onto `root`. Directories
 themselves are not included.
-
-**Symbolic links are reported but never followed.** A link is yielded as a leaf
-path exactly like a file, whatever it points at, and `walk` does not descend
-through it — the behaviour of Go's `filepath.WalkDir` and the default of Rust's
-`walkdir`. Two consequences the caller can rely on: no returned path can name
-data outside `root`, and a link pointing at one of its own ancestors cannot make
-the walk loop. Call `isSymlink` on a returned path to tell a link from a file.
-
-`root` itself is used as given, so naming a link as the root walks what it
-points at — an explicit request by the caller, not an escape.
-
-Nesting deeper than 64 **real** directories fails rather than recursing further.
 
 ```bit
 import { mkdir, readDir, walk, remove } from "std/fs"
