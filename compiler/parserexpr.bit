@@ -5,13 +5,23 @@
 
 // ---- expressions -----------------------------------------------------------
 
+// `catch`'s binding power: tighter than a comparison, looser than arithmetic, so
+// `f() catch d == x` is `(f() catch d) == x` while `f() catch a + b` still takes
+// the whole sum as the fallback. Named because parseBinary reads it twice.
+function catchPrec(): int {
+  return 5
+}
+
 function precedenceOf(k: Kind): int {
   if (k == Kind.Star || k == Kind.Slash || k == Kind.Percent || k == Kind.Shl ||
     k == Kind.Shr || k == Kind.Amp) {
-    return 6
+    return 7
   }
   if (k == Kind.Plus || k == Kind.Minus || k == Kind.Pipe || k == Kind.Caret) {
-    return 5
+    return 6
+  }
+  if (k == Kind.KwCatch) {
+    return catchPrec()
   }
   if (k == Kind.EqEq || k == Kind.BangEq || k == Kind.Lt || k == Kind.LtEq ||
     k == Kind.Gt || k == Kind.GtEq) {
@@ -478,6 +488,14 @@ function parseUnary(p: Parser): int {
   // ride the Unary node (main = the operator Kind).
   if (k == Kind.Bang || k == Kind.Minus || k == Kind.Plus || k == Kind.Tilde ||
     k == Kind.ArrowLeft || k == Kind.Star) {
+    // A prefix chain (`!!!x`, `- - -x`) recurses into itself WITHOUT passing
+    // through parseExpr, so it carries its own depth level or `maxParseDepth`
+    // would not bound it (#2022). The pass-through below deliberately does not:
+    // it is a tail delegation, not a recursion, and charging it would halve the
+    // limit for every other shape.
+    if (!enterExpr(p)) {
+      return poisonExpr(p)
+    }
     // The span must cover the OPERATOR, not just its operand. `mkNode` derives a
     // span from the kids alone, and the operator is a token rather than a child,
     // so it would be dropped — the recurring shape in this parser (the same one
@@ -487,6 +505,7 @@ function parseUnary(p: Parser): int {
     let opTok = peekTok(p)
     advance(p)
     let operand = parseUnary(p)
+    leaveExpr(p)
     return addNode(p.tree, Tag.Unary,
       Span{ file: 0, start: opTok.start, end: getNode(p.tree, operand).span.end },
       int(k), [operand])
@@ -494,7 +513,8 @@ function parseUnary(p: Parser): int {
   return parsePostfix(p)
 }
 
-// Left-associative precedence climbing (§12).
+// Left-associative precedence climbing (§12). `catch` rides the same table as a
+// right-associative operator of precedence `catchPrec()`; see parseCatchTail.
 function parseBinary(p: Parser, minPrec: int): int {
   let lhs = parseUnary(p)
   let guard = 0
@@ -505,23 +525,30 @@ function parseBinary(p: Parser, minPrec: int): int {
       break
     }
     advance(p)
-    let rhs = parseBinary(p, prec + 1)
-    lhs = mkNode(p, Tag.Binary, int(k), [lhs, rhs])
+    if (k == Kind.KwCatch) {
+      lhs = parseCatchTail(p, lhs)
+    } else {
+      let rhs = parseBinary(p, prec + 1)
+      lhs = mkNode(p, Tag.Binary, int(k), [lhs, rhs])
+    }
     guard = guard + 1
   }
   return lhs
 }
 
-// `catch_expr = binary [ "catch" ( IDENT block | expression ) ]`. `catch e {…}`
-// binds the error and runs a block (catch_bind); `catch <expr>` supplies a
-// default value (catch_default).
-function parseCatchExpr(p: Parser): int {
-  let expr = parseBinary(p, 1)
-  if (peekKind(p) != Kind.KwCatch) {
-    return expr
-  }
-  advance(p)
-  // `catch IDENT block` binds the error; anything else is a default expression.
+// The `( IDENT block | expression )` after a consumed `catch`, with `expr` as the
+// guarded operand. `catch e {…}` binds the error and runs a block (catch_bind);
+// `catch <expr>` supplies a default value (catch_default).
+//
+// The fallback is parsed at `catchPrec()`, NOT as a full `parseExpr`. Taking a
+// whole expression let the fallback swallow a trailing comparison, so
+// `readFile(d) catch "<denied>" == "<denied>"` parsed as
+// `readFile(d) catch ("<denied>" == "<denied>")` — a `bool` fallback against a
+// `string!` operand that the checker did not reject, reaching codegen and
+// SIGSEGVing at run time (#2344). Same minPrec rather than `+ 1` keeps `catch`
+// RIGHT-associative, so `a catch b catch 0` stays `a catch (b catch 0)`: the
+// left-associative reading would `catch` an already-handled, non-fallible value.
+function parseCatchTail(p: Parser, expr: int): int {
   // Speculate the bind form (the seed's tryCatchBind): parse `IDENT {…}` and
   // accept it only if the block parsed WITHOUT a diagnostic — a clean close. A
   // composite default (`catch Circle{r: 1}`) or a truncated block emits one, so
@@ -538,11 +565,34 @@ function parseCatchExpr(p: Parser): int {
     truncateDiags(p.diags, dmark)
     p.pos = mark
   }
-  let def = parseExpr(p)
+  let def = parseBinary(p, catchPrec())
   return mkNode(p, Tag.CatchDefault, 0, [expr, def])
 }
 
+// The stand-in an over-deep expression leaves behind. Same node the "no primary"
+// path uses, so nothing downstream needs a new shape; the file is already
+// rejected by the time anything reads it.
+function poisonExpr(p: Parser): int {
+  let t = peekTok(p)
+  return addLeaf(p.tree, Tag.NilLit, Span{ file: 0, start: t.start, end: t.end })
+}
+
+// Every recursive expression path funnels through here — `( e )` in parsePrimary,
+// each call/slice-literal element via parseArgItem, index and slice bounds,
+// composite-literal field and map-entry values, and interpolation holes — so one
+// counter here bounds all of them (#2022). Without it the recursive descent's
+// only bound was the OS stack, and `bit check` on 6000 nested parens died of
+// SIGSEGV with no diagnostic at all.
 function parseExpr(p: Parser): int {
+  if (!enterExpr(p)) {
+    return poisonExpr(p)
+  }
+  let node = parseExprInner(p)
+  leaveExpr(p)
+  return node
+}
+
+function parseExprInner(p: Parser): int {
   // Single-identifier arrow `x => body` — one token of lookahead past the ident.
   // The parenthesized form `(a, b) => body` is a follow-up (needs speculation).
   if (peekKind(p) == Kind.Ident && peekKindAt(p, 1) == Kind.FatArrow) {
@@ -558,5 +608,5 @@ function parseExpr(p: Parser): int {
     }
     return mkNode(p, Tag.ArrowFn, 0, [params, body])
   }
-  return parseCatchExpr(p)
+  return parseBinary(p, 1)
 }
