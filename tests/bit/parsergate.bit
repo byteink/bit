@@ -1,0 +1,412 @@
+// Front-end BEHAVIOURS this tree introduced that no released compiler shares —
+// gated the way tests/cases gates a `// run` case (build, run, byte-compare
+// stdout against a pinned `.expected`), but driven from a directory the corpus
+// differential does not sweep.
+//
+// The corpus, in tests/bit/parsercases/:
+//   run_catch_precedence.bit   `catch` precedence, #2344
+//
+// WHY THESE LIVE OUTSIDE tests/cases/.
+//
+// The self-host differential family compares this compiler against the PINNED
+// stage0 — the previous RELEASE of this same compiler — over
+//     find stdlib examples tests/cases tests/imports -name '*.bit'
+// and `scripts/selfhost-diffast.sh` requires the two `--dump-ast` renderings to
+// be BYTE-IDENTICAL. A deliberate change to the expression grammar is exactly a
+// tree the oracle renders differently, so a golden case under tests/cases/ IS
+// the file that turns the differential red. Measured with
+// run_catch_precedence.bit still in the sweep:
+//
+//   (let_decl (binding denied _ (catch_default (call read …) (binary == …))))   oracle
+//   (let_decl (binding denied _ (binary == (catch_default (call read …) …) …))) here
+//
+// which is the fix, stated as a diff. diffir and difftypes read the same corpus
+// and diverge for the same reason. Note this is NOT the tests/bit/checkerdiag.bit
+// case: that one is about a REJECTION the oracle does not make (a diffcheck
+// FALSEPOS). This is about a PARSE the oracle does not make, and it reddens
+// diffast/diffir/difftypes even though both compilers exit 0.
+//
+// A known-divergence list is not the repair either: selfhost-diffcheck.sh
+// refuses one on principle (#1883 — "a filter on a differential's ORACLE side
+// can only ever hide a difference, never reveal one").
+//
+// Same placement, and the same reasoning, as tests/bit/checkerdiag.bit (#2377),
+// tests/bit/constoverflow.bit (#2261) and tests/bit/genericdiag.bit.
+//
+// WHY IT RUNS THE PROGRAM RATHER THAN CHECKING IT.
+//
+// #2344's whole shape is "the compiler accepted it and then the binary
+// SIGSEGVed", so an exit-code-only or `bit check`-only assertion is satisfied by
+// the bug. Every case here is built AND run, and its stdout compared whole.
+//
+// NON-VACUITY. This repo has shipped guards that passed over empty input sets,
+// so checkerdiag.bit's four floors are reproduced rather than assumed:
+//
+//   1. `BIT_PARSER_CASES_DIR` and `BIT_BIN` have NO defaults. Unset is a hard
+//      failure, never a silent walk of ".".
+//   2. The case count is pinned exactly (`expectedCases`). Adding or removing a
+//      case must edit it in the same commit. "Fewer than max" is not a floor —
+//      zero satisfies it.
+//   3. Orphans are detected BOTH ways: every `.bit` needs a readable
+//      `.expected` AND every `.expected` needs a `.bit`.
+//   4. Line 1 of every case must be `// run`, so an `// error` case dropped in
+//      here fails loudly instead of being judged by the wrong oracle, and a
+//      wrapper that never reached its `exec` is a named failure rather than
+//      "the program printed nothing".
+//
+// Usage:
+//   BIT_PARSER_CASES_DIR=$PWD/tests/bit/parsercases BIT_BIN=$PWD/bit-out/bin/bit \
+//   BIT_STDLIB=$PWD/stdlib bit run tests/bit/parsergate.bit
+
+import { env, envOr, exit } from "std/os"
+import { readFile, writeFile, readDir, exists, remove, mkdir } from "std/fs"
+import { hasPrefix, hasSuffix, trimSpace, indexOf, parseInt } from "std/strings"
+
+// THE MANIFEST. Measured on disk; see the header for what belongs here.
+const expectedCases: int = 1
+
+// Assertions per case: exit 0, and stdout matches `.expected`.
+const checksPerCase: int = 2
+
+// `osRunBounded`'s own ceiling (runtime/root/*/os.bit `osBoundedMaxMs`).
+const maxTimeoutMs: int = 3600000
+const defaultTimeoutS: int = 300
+
+struct Ctx {
+  casesDir: string,
+  bin: string,
+  stdlib: string,
+  libbitrt: string,
+  scratch: string,
+  timeoutMs: int,
+  checks: int,
+  failures: int,
+}
+
+struct RunOut {
+  code: int,
+  out: string,
+  err: string,
+}
+
+// --- reporting -------------------------------------------------------------
+
+// Every failure names the case and what was being asserted; nothing is counted
+// without being printed, so a red run says which case and why.
+function failCase(c: Ctx, name: string, what: string, why: string) {
+  c.failures = c.failures + 1
+  eprint("parsergate: FAIL ${name} [${what}]: ${why}\n")
+}
+
+function clip(s: string): string {
+  if (len(s) <= 600) {
+    return s
+  }
+  return s[0:600] + "\n  ...[truncated]"
+}
+
+function reportDiff(expected: string, actual: string) {
+  eprint("  expected (${len(expected)} bytes):\n${clip(expected)}\n")
+  eprint("  actual   (${len(actual)} bytes):\n${clip(actual)}\n")
+}
+
+// --- shell wrapper ---------------------------------------------------------
+
+// Wraps `s` as exactly one POSIX `/bin/sh` word.
+function shQuote(s: string): string {
+  let out = "'"
+  let i = 0
+  while (i < len(s)) {
+    if (s[i] == 39) { // '
+      out = out + "'\\''"
+    } else {
+      out = out + s[i:i + 1]
+    }
+    i = i + 1
+  }
+  return out + "'"
+}
+
+function outPath(c: Ctx): string { return c.scratch + "/out" }
+function errPath(c: Ctx): string { return c.scratch + "/err" }
+function shPath(c: Ctx): string { return c.scratch + "/w.sh" }
+
+function removeQuiet(path: string) {
+  remove(path) catch e { return }
+}
+
+// Builds and runs one `/bin/sh` wrapper: cd into the corpus, export the
+// compiler's environment, then `exec` `argv` with stdout/stderr redirected to
+// files this process reads back. `exec` matters: it makes the child REPLACE the
+// shell, so a program that dies of SIGSEGV kills the process `osRunBounded`
+// waits on and the crash stays distinguishable from a nonzero exit (ABI.md §19)
+// — which is the entire point of this gate, since #2344 was a clean exit 0 from
+// the compiler followed by a signal death from its output.
+//
+// Returns ok=false and reports the failure itself when the wrapper could not be
+// launched, timed out, crashed, or never reached its `exec` — so the caller can
+// never read an absent redirect file as "empty output".
+function runWrapped(c: Ctx, name: string, what: string, argv: []string): (RunOut, bool) {
+  removeQuiet(outPath(c))
+  removeQuiet(errPath(c))
+
+  let script = "#!/bin/sh\n"
+  script = script + "cd " + shQuote(c.casesDir) + " || exit 125\n"
+  if (c.stdlib != "") {
+    script = script + "BIT_STDLIB=" + shQuote(c.stdlib) + "\nexport BIT_STDLIB\n"
+  }
+  if (c.libbitrt != "") {
+    script = script + "BIT_LIBBITRT=" + shQuote(c.libbitrt) + "\nexport BIT_LIBBITRT\n"
+  }
+  script = script + "exec"
+  let i = 0
+  while (i < len(argv)) {
+    script = script + " " + shQuote(argv[i])
+    i = i + 1
+  }
+  script = script + " > " + shQuote(outPath(c)) + " 2> " + shQuote(errPath(c)) + "\n"
+
+  let empty = RunOut{ code: 0, out: "", err: "" }
+  writeFile(shPath(c), script) catch e {
+    failCase(c, name, what, "cannot write wrapper script ${shPath(c)}")
+    return empty, false
+  }
+  if (fsChmod(shPath(c), 448) != 0) { // 0o700
+    failCase(c, name, what, "cannot chmod wrapper script ${shPath(c)}")
+    return empty, false
+  }
+
+  let code = osRunBounded(shPath(c), c.timeoutMs)
+  if (code == 0 - 2) {
+    failCase(c, name, what, "TIMED OUT after ${c.timeoutMs}ms (raise BIT_TEST_TIMEOUT_S)")
+    return empty, false
+  }
+  if (code == 0 - 1) {
+    failCase(c, name, what, "cannot launch wrapper script (spawn/wait failure)")
+    return empty, false
+  }
+  if (code <= 0 - 100) {
+    failCase(c, name, what, "CRASHED: killed by signal ${0 - code - 100}")
+    return empty, false
+  }
+  if (code == 125) {
+    failCase(c, name, what, "wrapper could not cd to ${c.casesDir}")
+    return empty, false
+  }
+  // The redirections are established before `exec`, so both files exist the
+  // moment the command starts. A missing one means the wrapper never got that
+  // far — the exact silent hole a `readFile ... catch { "" }` fallback hides.
+  if (!exists(outPath(c)) || !exists(errPath(c))) {
+    failCase(c, name, what, "wrapper produced no redirect files — it never ran the command")
+    return empty, false
+  }
+  let so = readFile(outPath(c)) catch e {
+    failCase(c, name, what, "cannot read captured stdout")
+    return empty, false
+  }
+  let se = readFile(errPath(c)) catch e {
+    failCase(c, name, what, "cannot read captured stderr")
+    return empty, false
+  }
+  return RunOut{ code: code, out: so, err: se }, true
+}
+
+// --- the check -------------------------------------------------------------
+
+function firstLine(src: string): string {
+  let nl = indexOf(src, "\n")
+  let line = src
+  if (nl >= 0) {
+    line = src[0:nl]
+  }
+  if (len(line) > 0 && line[len(line) - 1] == 13) { // \r
+    line = line[0:len(line) - 1]
+  }
+  return trimSpace(line)
+}
+
+// One `// run` case: `bit run` must exit 0 AND stdout must match `.expected`
+// byte for byte. `bit run` compiles to a temporary binary and executes it, so a
+// signal death in the PROGRAM is reported by `runWrapped` as CRASHED.
+function checkRun(c: Ctx, name: string, expected: string) {
+  let (r, ok) = runWrapped(c, name, "run", [c.bin, "run", name])
+  if (!ok) {
+    return
+  }
+  c.checks = c.checks + 1
+  if (r.code != 0) {
+    failCase(c, name, "run", "exited ${r.code}, want 0 — stderr:\n${clip(r.err)}")
+    return
+  }
+  c.checks = c.checks + 1
+  if (expected == r.out) {
+    return
+  }
+  failCase(c, name, "run", "stdout does not match .expected")
+  reportDiff(expected, r.out)
+}
+
+// --- corpus walk -----------------------------------------------------------
+
+// Every `.expected` must have a `.bit`, so a renamed case cannot leave dead
+// weight behind that nothing reads and nobody notices.
+function checkOrphanExpected(c: Ctx, names: []string) {
+  let stems = map<string, bool>{}
+  for n of names {
+    if (hasSuffix(n, ".bit")) {
+      stems[n[0:len(n) - 4]] = true
+    }
+  }
+  for n of names {
+    if (!hasSuffix(n, ".expected")) {
+      continue
+    }
+    let stem = n[0:len(n) - 9]
+    let (_, has) = stems[stem]
+    if (!has) {
+      c.failures = c.failures + 1
+      eprint("parsergate: FAIL ${n}: orphaned .expected — no sibling ${stem}.bit\n")
+    }
+  }
+}
+
+// Returns how many cases were actually walked, which the census then pins.
+function walk(c: Ctx, names: []string): int {
+  let total = 0
+  for n of names {
+    if (!hasSuffix(n, ".bit")) {
+      continue
+    }
+    total = total + 1
+    let src = readFile(c.casesDir + "/" + n) catch e {
+      c.failures = c.failures + 1
+      eprint("parsergate: FAIL ${n}: cannot read case source\n")
+      continue
+    }
+    // Only `// run` belongs here. Anything else would be judged by the wrong
+    // oracle — silently, since an `// error` case's `.expected` is stderr.
+    let line = firstLine(src)
+    if (!hasPrefix(line, "// run")) {
+      c.failures = c.failures + 1
+      eprint("parsergate: FAIL ${n}: line 1 is '${line}', want a `// run` directive\n")
+      eprint("  this gate drives `bit run` only; other directives belong elsewhere\n")
+      continue
+    }
+    let expectedPath = c.casesDir + "/" + n[0:len(n) - 4] + ".expected"
+    let expected = readFile(expectedPath) catch e {
+      c.failures = c.failures + 1
+      eprint("parsergate: FAIL ${n}: cannot read ${expectedPath}\n")
+      continue
+    }
+    // An empty `.expected` would be satisfied by a program that prints nothing.
+    if (len(expected) == 0) {
+      c.failures = c.failures + 1
+      eprint("parsergate: FAIL ${n}: ${expectedPath} is empty — nothing would be pinned\n")
+      continue
+    }
+    checkRun(c, n, expected)
+  }
+  return total
+}
+
+function checkCensus(c: Ctx, total: int) {
+  if (total == expectedCases) {
+    return
+  }
+  c.failures = c.failures + 1
+  eprint("parsergate: FAIL census: walked ${total} case(s), manifest says ${expectedCases}\n")
+  eprint("  adding or removing a case must edit expectedCases in the same commit\n")
+}
+
+// --- configuration ---------------------------------------------------------
+
+function requiredEnv(name: string): string {
+  let v = env(name)
+  if (v == "") {
+    eprint("parsergate: ${name} is not set — refusing to guess. This gate has no\n")
+    eprint("parsergate: defaults; an unset corpus or compiler path must fail, never\n")
+    eprint("parsergate: silently walk '.'.\n")
+    exit(2)
+  }
+  return v
+}
+
+// `BIT_TEST_TIMEOUT_S`, the contract every harness here shares: default 300s,
+// `0` disables the bound (here: the runtime's own one-hour ceiling).
+function timeoutMs(): int {
+  let raw = trimSpace(envOr("BIT_TEST_TIMEOUT_S", ""))
+  if (raw == "") {
+    return defaultTimeoutS * 1000
+  }
+  let s = parseInt(raw) catch e {
+    eprint("parsergate: BIT_TEST_TIMEOUT_S='${raw}' is not a number; using ${defaultTimeoutS}s\n")
+    return defaultTimeoutS * 1000
+  }
+  if (s <= 0) {
+    return maxTimeoutMs
+  }
+  if (s * 1000 > maxTimeoutMs) {
+    return maxTimeoutMs
+  }
+  return s * 1000
+}
+
+function newCtx(casesDir: string, bin: string, scratch: string): Ctx {
+  return Ctx{
+    casesDir: casesDir,
+    bin: bin,
+    stdlib: env("BIT_STDLIB"),
+    libbitrt: env("BIT_LIBBITRT"),
+    scratch: scratch,
+    timeoutMs: timeoutMs(),
+    checks: 0,
+    failures: 0,
+  }
+}
+
+function main() {
+  let casesDir = requiredEnv("BIT_PARSER_CASES_DIR")
+  let bin = requiredEnv("BIT_BIN")
+  if (!fsIsDir(casesDir)) {
+    eprint("parsergate: BIT_PARSER_CASES_DIR='${casesDir}' is not a directory\n")
+    exit(2)
+  }
+  if (!exists(bin)) {
+    eprint("parsergate: BIT_BIN='${bin}' does not exist\n")
+    exit(2)
+  }
+
+  let scratch = envOr("TMPDIR", "/tmp") + "/bit-parsergate-${timeUnixNs()}"
+  mkdir(scratch) catch e {
+    eprint("parsergate: cannot create scratch directory ${scratch}\n")
+    exit(2)
+  }
+
+  let c = newCtx(casesDir, bin, scratch)
+  let names = readDir(casesDir) catch e {
+    eprint("parsergate: cannot list ${casesDir}\n")
+    exit(2)
+    return
+  }
+  checkOrphanExpected(c, names)
+  let total = walk(c, names)
+  checkCensus(c, total)
+
+  removeQuiet(outPath(c))
+  removeQuiet(errPath(c))
+  removeQuiet(shPath(c))
+  removeQuiet(scratch)
+
+  // The run marker: a gate that stopped checking is visible here, not green.
+  let wantChecks = expectedCases * checksPerCase
+  if (c.checks < wantChecks) {
+    c.failures = c.failures + 1
+    eprint("parsergate: FAIL: only ${c.checks} checks ran, want ${wantChecks}\n")
+  }
+  if (c.failures > 0) {
+    eprint("parsergate: FAIL — ${c.failures} failure(s) over ${total} case(s), ${c.checks} checks\n")
+    exit(1)
+    return
+  }
+  print("parsergate: PASS — ${total} cases, ${c.checks} checks, 0 failures\n")
+}
