@@ -1,0 +1,183 @@
+// A small-object span goes BACK to the OS once it is entirely free (#2375).
+//
+// WHY THIS EXISTS. `bit lsp --stdio` reached 12,577 MB while completely idle and
+// ~105% of one core after 5h34m, and a second instance 7.1 GB after 14.5h
+// (#2325). The collector was not at fault and neither was its pacing: it ran
+// 3,102 times, swept 5.1M objects and ended with 3,361 live, while RSS climbed
+// monotonically and never once fell. The reason was structural — `memUnmapPages`
+// had exactly ONE call site in the whole runtime, inside `gcHeapFree`'s LARGE
+// branch, so the small path had no route back to the OS at all. Process RSS was
+// therefore a monotonic high-water mark of the sum over 37 size classes of each
+// class's all-time peak span count, and every transient allocation peak in a
+// long-lived process was permanent.
+//
+// The black-box proof of that, and the shape this program reproduces in-process:
+// two programs identical but for the size of the burst object, so only the
+// allocator path differs.
+//
+//     512 B x 300k   small / span path            442 MB peak ->  440 MB
+//      64 KiB x 12k  large / direct-mapped path   986 MB peak ->   56 MB
+//
+// WHAT THIS ASSERTS, AND WHAT IT DELIBERATELY DOES NOT. `heapMappedBytes` is the
+// runtime's own accounting, not a machine-level fact: a counter can fall without
+// a syscall happening. That half — that the pages are really gone — is an RSS
+// measurement from OUTSIDE the process, and it belongs to the ticket, not here.
+// What this program can prove, and what nothing else in the corpus can, is that
+// the ACCOUNTING falls at all, that it falls by nearly everything, and that the
+// heap is still correct afterwards. Before #2375 the mapped count for a small
+// burst was strictly monotonic, so `returned` below was 0 by construction.
+//
+//   (a) GREW. The caller-bound arena is deliberately tiny (256 KiB), so serving
+//       the burst forces the span reserve to map chunks of its own — which are
+//       the only spans that may ever be unmapped. Without this the run could
+//       report a perfect 100% return having never had anything to return.
+//
+//   (b) RETURNED. Every root is dropped and the collector sweeps, so every span
+//       the burst filled is entirely free. At least 80% of the mapped bytes the
+//       burst added must go back. Not 100%: a class never releases its ANCHOR
+//       span (it carries the class-wide bookkeeping and is the "one empty span
+//       cached" hysteresis), and a span carved out of the CALLER's arena is not
+//       the runtime's to unmap. Both floors are small and both are deliberate.
+//
+//   (c) STILL SERVES. The most valuable assertion here, because it is the one a
+//       half-done unlink fails. Reclaiming a span means taking its slots off the
+//       class's flat free list as well as taking the span off the class's span
+//       list; leave one slot behind and the allocator hands out an address inside
+//       memory it has just unmapped, which every aggregate counter still balances
+//       perfectly. So after the reclaim the same class is allocated from again,
+//       hard, and every address must be one the heap still owns.
+//
+//   (d) SOUND. `gcSpanViolations` re-derives the span bookkeeping — per-class span
+//       counts, releasable-span counts, and `sum over spans of (total - free)`
+//       against the class's live-slot count — and must be 0. `stress` is on, which
+//       is the flag `runtime/gc/gc.bit` arms that check with. Read BEFORE
+//       `gcDeinit`, because teardown unmaps the spans the count lives in.
+//
+//   (e) NO LEAK. `gcLiveBytes` is 0 after `gcDeinit` and `heapMappedBytes` is 0,
+//       so the reclaim path took nothing off the books that was still in use and
+//       left nothing on them that was gone.
+
+import { spinUnlocked } from "../../../runtime"
+import { heapInit, heapWords, heapMappedBytes, allocSpanBytes } from "../../../runtime/alloc"
+import { gcInit, gcConfigure, gcBindMemory, gcAlloc, gcCollectRoots, gcOwns,
+  gcLiveBytes, gcDeinit, gcWords, gcSpanViolations } from "../../../runtime/gc"
+
+// 256 KiB: two spans' worth, so all but a couple of the burst's spans come from
+// chunks the reserve mapped and are therefore releasable. See (a).
+const ARENA_WORDS: int = 32768
+const INDEX_WORDS: int = 8192
+const META_WORDS: int = 8
+
+// 20000 x 128-byte bodies is ~3 MB of spans, spread over ~25 spans of one class.
+// Enough that the reclaim trigger (at least half a class's spans releasable) has
+// to fire several times rather than once.
+const OBJS: int = 20000
+
+// The post-reclaim workload for (c). Larger than one span's slot count, so it
+// forces the retained anchor to run dry and the class to map again.
+const REUSE: int = 4000
+
+function main() {
+  let arena = []i64(ARENA_WORDS)
+  let indexArena = []i64(INDEX_WORDS)
+  let heapBlock = []i64(heapWords)
+  let heapLock = []i32(1)
+  let lock = []i32(1)
+  let state = []i64(gcWords)
+  let meta = []i64(META_WORDS)
+  let roots = []i64(OBJS)
+
+  let metaAddr = int(ptrOf(meta))
+  meta[0] = 128  // body size: a small-path object, well under allocMaxSmall
+  meta[1] = 0    // no pointer fields: a leaf, so this is pure allocator traffic
+  meta[2] = 0
+  meta[3] = 0
+  meta[4] = 0
+  meta[5] = 0
+  meta[6] = 0
+
+  let hp = ptrOf(heapBlock)
+  heapInit(hp)
+  let hlk = ptrOf(heapLock)
+  atomicStore(hlk, spinUnlocked)
+  let lp = ptrOf(lock)
+  atomicStore(lp, spinUnlocked)
+
+  let g = ptrOf(state)
+  let rootsAddr = int(ptrOf(roots))
+  gcBindMemory(g, int(ptrOf(arena)), ARENA_WORDS * 8, int(ptrOf(indexArena)), INDEX_WORDS * 8, 4096)
+  if (!gcInit(g, int(hp), int(hlk), int(lp), metaAddr, 256)) {
+    print("gcInit failed\n")
+    return
+  }
+  // `stress` on arms the span-bookkeeping check on every refill. See (d).
+  gcConfigure(g, true, true, 4096, 200, false)
+
+  let baseMapped = heapMappedBytes(hp)
+
+  // The burst, held live SIMULTANEOUSLY. That is the whole point and it is easy
+  // to get wrong: allocating and dropping one object at a time keeps the
+  // concurrent live set at one, the free list serves every request, one span
+  // suffices and nothing is ever reclaimable (recorded on #2325 as a measurement
+  // that produced a confident wrong answer).
+  let allocOk = 1
+  let i = 0
+  while (i < OBJS) {                       // bounded: OBJS iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0) { allocOk = 0 }
+    roots[i] = p
+    i = i + 1
+  }
+  gcCollectRoots(g, rootsAddr, OBJS)       // every root live: nothing is swept
+  let peakMapped = heapMappedBytes(hp)
+  let grew = 0
+  if (peakMapped > ARENA_WORDS * 8) { grew = 1 }
+
+  // Drop every reference and sweep. Now every span the burst filled is entirely
+  // free, which is exactly the state the LSP's heap reaches thousands of times
+  // over and could never act on.
+  let d = 0
+  while (d < OBJS) {                       // bounded: OBJS iterations
+    roots[d] = 0
+    d = d + 1
+  }
+  gcCollectRoots(g, rootsAddr, OBJS)
+  let quietMapped = heapMappedBytes(hp)
+
+  let rise = peakMapped - baseMapped
+  let drop = peakMapped - quietMapped
+  let returned = 0
+  if (rise > 0 && drop * 100 >= rise * 80) { returned = 1 }
+
+  // (c) the heap still serves the same class, and every address is one it owns.
+  let serves = 1
+  let r = 0
+  while (r < REUSE) {                      // bounded: REUSE iterations
+    let p = gcAlloc(g, metaAddr)
+    if (p == 0 || !gcOwns(g, p)) { serves = 0 }
+    roots[r] = p
+    r = r + 1
+  }
+  gcCollectRoots(g, rootsAddr, OBJS)
+  let ownsAll = 1
+  let q = 0
+  while (q < REUSE) {                      // bounded: REUSE iterations
+    if (roots[q] == 0 || !gcOwns(g, roots[q])) { ownsAll = 0 }
+    q = q + 1
+  }
+
+  // Read BEFORE `gcDeinit`: teardown frees every object, and a heap with no
+  // spans left has nowhere to keep the count.
+  let spanBad = gcSpanViolations(g)
+
+  gcDeinit(g)
+  let mappedAfter = heapMappedBytes(hp)
+  let leaked = gcLiveBytes(g)
+
+  // `arena` is reached here so it stays rooted across every ambient collection
+  // above, which under BIT_GC=stress is every loop back-edge.
+  let rooted = 0
+  if (len(arena) == ARENA_WORDS && len(roots) == OBJS) { rooted = 1 }
+
+  print("gcspanfree ${allocOk} ${grew} ${returned} ${serves} ${ownsAll} ${mappedAfter} ${leaked} ${spanBad} ${rooted}\n")
+}
