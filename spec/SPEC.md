@@ -1664,6 +1664,42 @@ arrow_p    = IDENT [ ":" type ] .
   function when a `)` is immediately followed by `=>`. This is one token of
   lookahead after the matching `)`.
 
+**Capture.** An arrow function may refer to variables declared in an enclosing
+function or block. Those variables are **shared** between the enclosing scope and
+every arrow function that refers to them, and they live as long as any of the
+three is reachable — the arrow function outliving the frame that declared them is
+not a special case:
+
+```bit
+function counter(): () => int {
+  let n = 0
+  return () => { n = n + 1; return n }   // one n, shared with the closure
+}
+let c = counter()
+print("${c()} ${c()} ${c()}")            // 1 2 3
+```
+
+Sharing runs in both directions and between siblings. A write through one arrow
+function is visible to the enclosing scope and to every other arrow function over
+the same variable, and a write the enclosing scope makes **after** the arrow
+function was created is visible to it:
+
+```bit
+let n = 0
+let peek = () => n
+n = 41
+print("${peek()}")                       // 41 — not the value at creation
+```
+
+Capture is not a copy, so §13.3's value/reference split does not apply to it: a
+captured `int` is shared exactly as a captured `struct` is. A parameter is a local
+variable and is captured on the same terms. What each activation captures is its
+own variable, so two calls to the same function yield closures over separate
+variables.
+
+An arrow function that only **reads** a variable no one writes cannot tell sharing
+from copying, so an implementation may represent that case either way.
+
 ### 12.9 Type Conversions and Constructors
 
 A type used in call position converts or constructs:
@@ -1762,6 +1798,35 @@ defer_stmt    = "defer" call_expression .
   reads one of the two-result forms (`m[k]`, `<- c`, `iface.(T)`, §12.6/§16/§14.7).
   Its arity must match: a two-result form binds exactly two names, and a
   tuple-typed rhs binds exactly the tuple's arity. `_` discards an element.
+
+**Loop-variable scope.** A loop variable a `for` statement itself declares is a
+**new variable each iteration**: the `for_c` variables declared by the init clause,
+and the `for_of`/`for_in` binders. The first iteration uses the variable the init
+clause (or the first binding) declares; each later iteration's variable is declared
+before the post clause runs and initialised from the previous iteration's value at
+that moment. This is only observable through capture (§12.8), and it is what makes
+the common idiom mean what it reads as:
+
+```bit
+let fs = []( () => int )(0)
+for (let i = 0; i < 3; i = i + 1) {
+  fs = append(fs, () => i)               // each closure keeps its OWN i
+}
+print("${fs[0]()} ${fs[1]()} ${fs[2]()}")   // 0 1 2
+```
+
+A `while` loop declares nothing, so a variable it counts is **one** variable and
+every closure over it shares that one:
+
+```bit
+let gs = []( () => int )(0)
+let j = 0
+while (j < 3) {
+  gs = append(gs, () => j)
+  j = j + 1
+}
+print("${gs[0]()} ${gs[1]()} ${gs[2]()}")   // 3 3 3
+```
 
 ### 13.2 Assignment vs Declaration
 
