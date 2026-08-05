@@ -28,7 +28,10 @@ function circleArea(r: f64): f64 {
 
 ### `abs(x: f64): f64`
 
-Magnitude of `x`.
+Magnitude of `x`: the sign bit cleared, IEEE 754-2019 §5.5.1. So `abs(-0.0)` is
+`+0.0` exactly, and `1.0 / abs(-0.0)` is `inf`, not `-inf`. Note that
+`abs(-0.0) == 0.0` is true either way — `-0.0 == 0.0` in IEEE 754 — so a test
+that compares against zero cannot tell a correct result from a wrong one.
 
 ### `sign(x: f64): f64`
 
