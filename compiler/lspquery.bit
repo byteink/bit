@@ -1,42 +1,16 @@
 // bit lsp (#1547) — the read-only queries: hover, goto-definition, document
 // symbols, and completion. Sorts before lspserver.bit
-// so the dispatch there is lowered after these. Every query rebuilds the edited
-// directory's project (loadProjectOverlay -> resolveProject -> checkResolved)
-// through the shared `lspBuildProject` and reads the checker's own tables:
-// `nodeSymbols`/`symbols` (resolver handoff), `nodeTypes`, and `ctx`. There is no
-// snapshot cache — a whole-module recheck per request is correct and simple.
-// ponytail: cache the checked project per directory once round-trips show it
-// matters, exactly as the seed's `Server.snapshots` does.
+// so the dispatch there is lowered after these. Every query builds the edited
+// directory's project through the shared `lspBuildProject` (compiler/
+// lspbuild.bit, which serves it from the last build when the bytes on disk and
+// in the open buffers are unchanged) and reads the checker's own tables:
+// `nodeSymbols`/`symbols` (resolver handoff), `nodeTypes`, and `ctx`.
 //
 // The re-model versus the seed: the seed keeps one AST tree per file and indexes
 // `node_symbols[file_idx][node]`; the selfhost concatenates a directory's files
 // into ONE tree, so a cursor's per-file (line,character) becomes a byte offset
 // within the file, then a module-global offset by adding `fileStarts[fileIdx]`.
 // `fileOf` maps a node span back to its file for the response URI/range.
-
-// A checked project for one directory: the loaded+resolved project, its per-module
-// checkers, and whether the type checker actually ran (no parse/resolve error).
-struct LspProject {
-  p: Project,
-  mods: []Checker,
-  checkedOk: bool,
-}
-
-// Loads, resolves, and (when clean) type-checks the module rooted at `dir` with
-// `overlays` substituted for open documents. `checkedOk` reports whether type
-// info is available, mirroring the seed's buildSnapshot gating.
-function lspBuildProject(overlays: map<string, string>, dir: string): LspProject {
-  let p = loadProjectOverlay(dir, "", stdRootPath(), overlays)
-  if (p.root < 0 || len(p.mods) == 0) {
-    return LspProject{ p: p, mods: []Checker(0), checkedOk: false }
-  }
-  let mods = resolveProject(p)
-  let ok = !hasErrors(p.diags)
-  if (ok) {
-    checkResolved(p, mods)
-  }
-  return LspProject{ p: p, mods: mods, checkedOk: ok }
-}
 
 // A located file within a built project's ROOT module: its index in the module's
 // file list, its own source text, and the module-global offset it begins at.
@@ -165,8 +139,13 @@ function lspHoverText(c: Checker, node: int): string {
   // `nodeTypes` is only fully populated by the `--dump-types` walk (binders get
   // an entry during the normal check, expression usages do not), so an
   // identifier/member/call the user hovers on falls back to re-deriving its type
-  // the same way the checker does. Any diagnostics/instantiations this produces
-  // land in the throwaway per-request project and are discarded.
+  // the same way the checker does. The instantiations this produces are deduped
+  // by `recordInstantiation`, and no checker path reports a diagnostic — which
+  // is what makes it safe against a project that outlives the request
+  // (lspbuild.bit), where the cheap `memo`-shaped side effects on `nodeTypes`
+  // are the same answer a fresh build would re-derive. `lspFindSnapshot` rolls
+  // the diagnostics sink back on every reuse so that safety is structural
+  // rather than a standing invitation to break it.
   if (ty <= 0 && node > 0) {
     let tag = getNode(c.tree, node).tag
     if (isLeafTag(tag) || tag == Tag.Member || tag == Tag.Call) {
@@ -186,7 +165,7 @@ function lspHoverText(c: Checker, node: int): string {
   return "```bit\n" + inner + "\n```"
 }
 
-function lspOnHover(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+function lspOnHover(server: LspServer, d: JsonDoc, params: int, idText: string) {
   let tdp = lspTextDocPosition(d, params)
   if (!tdp.ok) {
     lspRespond(idText, "null")
@@ -197,7 +176,7 @@ function lspOnHover(overlays: map<string, string>, d: JsonDoc, params: int, idTe
     lspRespond(idText, "null")
     return
   }
-  let lp = lspBuildProject(overlays, pathDir(path))
+  let lp = lspBuildProject(server, pathDir(path))
   if (len(lp.mods) == 0 || !lp.checkedOk) {
     lspRespond(idText, "null")
     return
@@ -311,7 +290,7 @@ function lspResolveImportChain(lp: LspProject, modIdx: int, sym: Symbol): LspRes
   return LspResolvedSymbol{ found: true, modIdx: curMod, sym: cur }
 }
 
-function lspOnDefinition(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+function lspOnDefinition(server: LspServer, d: JsonDoc, params: int, idText: string) {
   let tdp = lspTextDocPosition(d, params)
   if (!tdp.ok) {
     lspRespond(idText, "null")
@@ -322,7 +301,7 @@ function lspOnDefinition(overlays: map<string, string>, d: JsonDoc, params: int,
     lspRespond(idText, "null")
     return
   }
-  let lp = lspBuildProject(overlays, pathDir(path))
+  let lp = lspBuildProject(server, pathDir(path))
   if (len(lp.mods) == 0) {
     lspRespond(idText, "null")
     return
@@ -390,7 +369,7 @@ function lspOnDefinition(overlays: map<string, string>, d: JsonDoc, params: int,
 // a struct's fields and its methods as `children`, rather than one flat
 // entry per top-level decl.
 
-function lspOnDocumentSymbol(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+function lspOnDocumentSymbol(server: LspServer, d: JsonDoc, params: int, idText: string) {
   let doc = jsonGet(d, params, "textDocument")
   let uri = jsonStrOf(d, jsonGet(d, doc, "uri"))
   if (uri == "") {
@@ -402,7 +381,7 @@ function lspOnDocumentSymbol(overlays: map<string, string>, d: JsonDoc, params: 
     lspRespond(idText, "[]")
     return
   }
-  let lp = lspBuildProject(overlays, pathDir(path))
+  let lp = lspBuildProject(server, pathDir(path))
   if (len(lp.mods) == 0) {
     lspRespond(idText, "[]")
     return
@@ -503,7 +482,7 @@ function lspMemberCompletion(ctx: TypeContext, recvType: int): string {
   return lspCompletionList(items)
 }
 
-function lspOnCompletion(overlays: map<string, string>, d: JsonDoc, params: int, idText: string) {
+function lspOnCompletion(server: LspServer, d: JsonDoc, params: int, idText: string) {
   let empty = lspCompletionList([]string(0))
   let tdp = lspTextDocPosition(d, params)
   if (!tdp.ok) {
@@ -516,7 +495,7 @@ function lspOnCompletion(overlays: map<string, string>, d: JsonDoc, params: int,
     return
   }
   let dir = pathDir(path)
-  let (text, isOpen) = overlays[path]
+  let (text, isOpen) = server.overlays[path]
   if (!isOpen) {
     lspRespond(idText, empty)
     return
@@ -524,7 +503,7 @@ function lspOnCompletion(overlays: map<string, string>, d: JsonDoc, params: int,
   let fileOffset = lspPosToByte(text, tdp.pos)
   let dotBefore = fileOffset > 0 && text[fileOffset - 1] == u8('.')
   if (!dotBefore) {
-    let lp = lspBuildProject(overlays, dir)
+    let lp = lspBuildProject(server, dir)
     if (len(lp.mods) == 0 || !lp.checkedOk) {
       lspRespond(idText, empty)
       return
@@ -532,14 +511,14 @@ function lspOnCompletion(overlays: map<string, string>, d: JsonDoc, params: int,
     lspRespond(idText, lspScopeCompletion(lp.mods[lp.p.root]))
     return
   }
-  lspDotCompletion(overlays, dir, path, text, fileOffset, idText)
+  lspDotCompletion(server, dir, path, text, fileOffset, idText)
 }
 
 // Splices a throwaway identifier at the cursor so the receiver before the bare
 // `.` still parses, rebuilds against that overlay, and lists the receiver type's
 // members. The seed's "dummy identifier" technique — cheaper than teaching the
 // parser to accept an incomplete member expression.
-function lspDotCompletion(overlays: map<string, string>, dir: string, path: string,
+function lspDotCompletion(server: LspServer, dir: string, path: string,
     text: string, fileOffset: int, idText: string) {
   let empty = lspCompletionList([]string(0))
   let marker = "zqx"
@@ -547,11 +526,11 @@ function lspDotCompletion(overlays: map<string, string>, dir: string, path: stri
   // A fresh overlay map with the splice, so the server's real overlays are
   // untouched (a struct/map is a reference in Bit).
   let ov = map<string, string>{}
-  for (k, v) of overlays {
+  for (k, v) of server.overlays {
     ov[k] = v
   }
   ov[path] = spliced
-  let lp = lspBuildProject(ov, dir)
+  let lp = lspBuildProjectOverlay(server, ov, dir, false)
   if (len(lp.mods) == 0 || !lp.checkedOk) {
     lspRespond(idText, empty)
     return
