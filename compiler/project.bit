@@ -115,6 +115,16 @@ struct Loader {
   // spawn) instead of the resolver running it once per package.
   pkgDirCache: map<string, string>,
   pkgDetailCache: map<string, string>,
+  // ACROSS-BUILD parse reuse, canonical dir -> a module a PREVIOUS build of
+  // this process parsed there (#2348). Empty for every one-shot command, which
+  // is why `bit build`/`check`/`doc` are byte-for-byte unaffected: only
+  // `bit lsp` (compiler/lspbuild.bit) ever fills it, from the project it built
+  // last. `loadModuleAt` reuses an entry's TREE — never its `files`, which are
+  // ids into that build's SourceManager — and only when this build reads
+  // byte-identical input for that directory, so the reused tree is exactly the
+  // tree `parseSourceD` would have returned. See lspbuild.bit for why the
+  // entries are also restricted to modules that parsed clean.
+  parseCache: map<string, SrcModule>,
 }
 
 // Bytewise string order: <0, 0, >0 like the seed's `std.mem.order`. A shorter
@@ -141,6 +151,21 @@ function strCompare(a: string, b: string): int {
     return -1
   }
   return 1
+}
+
+// Element-wise string-slice equality.
+function strListEqual(a: []string, b: []string): bool {
+  if (len(a) != len(b)) {
+    return false
+  }
+  let i = 0
+  while (i < len(a)) {
+    if (a[i] != b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
 }
 
 // ponytail: insertion sort, matching the seed's. A module directory holds a
@@ -411,6 +436,28 @@ const modCycle = -2
 // "cannot find module" text.
 const modPkgFail = -3
 
+// The tree a previous build of this process parsed for `canon`, when this build
+// read the SAME file names and the SAME concatenated bytes for that directory —
+// which makes `parseSourceD(source, ...)` a call whose answer is already known.
+// `reused` false means "parse it"; the returned tree is then a placeholder the
+// caller overwrites (Bit has no zero value for a struct, §13.4).
+//
+// Both halves of the key are checked, not just the source: a directory whose
+// files were RENAMED with no net text change would otherwise reuse a tree whose
+// `fileStarts`/`fileNames` name the old layout, and every span in it would
+// render against the wrong file.
+function cachedModuleTree(lw: Loader, canon: string, source: string,
+    fileNames: []string): (Tree, bool) {
+  let (cached, inCache) = lw.parseCache[canon]
+  if (!inCache) {
+    return newTree(), false
+  }
+  if (cached.source != source || !strListEqual(cached.fileNames, fileNames)) {
+    return newTree(), false
+  }
+  return cached.tree, true
+}
+
 // Loads the module rooted at `dir` and every module it imports, depth-first.
 // Returns its id, `modCycle` when the directory is already on the load stack, or
 // `modNotFound` when it is not a loadable module. Ids are assigned AFTER a
@@ -471,9 +518,19 @@ function loadModuleAt(lw: Loader, dir: string, only: string): int {
   // every lex and parse error the whole project pipeline ever saw: `bit2 build`
   // on `let x = @` exited 0 and produced a running binary, because the parser
   // recovers by skipping the bad token and nothing was left to say so.
-  let before = len(lw.diags.list)
-  let tree = parseSourceD(source, 0, lw.diags)
-  remapDiags(lw.diags, before, files, fileStarts)
+  //
+  // ...unless a previous build of this process already parsed byte-identical
+  // input for this directory (#2348, `bit lsp` only): the parse is then a pure
+  // function of `source`, so its tree is reused and this module contributes no
+  // diagnostics either way — `lspParseCache` only offers modules that parsed
+  // clean, so there is nothing to replay into `lw.diags`.
+  let (cachedTree, reused) = cachedModuleTree(lw, canon, source, fileNames)
+  let tree = cachedTree
+  if (!reused) {
+    let before = len(lw.diags.list)
+    tree = parseSourceD(source, 0, lw.diags)
+    remapDiags(lw.diags, before, files, fileStarts)
+  }
   let imports = map<string, int>{}
   let pkgFail = map<string, string>{}
   for path of moduleImportPaths(tree, source) {
@@ -540,6 +597,20 @@ function loadProject(rootDir: string, rootOnly: string, stdRoot: string): Projec
 // empty map and gets identical behaviour to reading every file from disk.
 function loadProjectOverlay(rootDir: string, rootOnly: string, stdRoot: string,
     overlays: map<string, string>): Project {
+  return loadProjectCached(rootDir, rootOnly, stdRoot, overlays,
+    map<string, SrcModule>{})
+}
+
+// As `loadProjectOverlay`, but modules whose bytes are unchanged since a
+// previous build of this process reuse that build's TREE instead of re-parsing
+// (#2348). `parseCache` is canonical dir -> that module; an empty map is
+// exactly `loadProjectOverlay`, which is why every one-shot command still gets
+// the untouched pipeline. Only `bit lsp` passes a non-empty one, because only
+// `bit lsp` builds the same project over and over: measured on a 4-file project
+// importing std/strings, re-parsing the stdlib was 15,151 of the 62,281 GC
+// objects every single request allocated.
+function loadProjectCached(rootDir: string, rootOnly: string, stdRoot: string,
+    overlays: map<string, string>, parseCache: map<string, SrcModule>): Project {
   let sm = newSourceManager()
   let (lockEntries, lockErr) = loadLockEntries(rootDir)
   let (cacheRoot, cacheRootErr) = loadCacheRoot()
@@ -547,7 +618,8 @@ function loadProjectOverlay(rootDir: string, rootOnly: string, stdRoot: string,
     loading: map<string, bool>{}, stdRoot: stdRoot, prelude: -1,
     sm: sm, diags: newDiagnostics(sm), overlays: overlays,
     lockEntries: lockEntries, lockErr: lockErr, cacheRoot: cacheRoot, cacheRootErr: cacheRootErr,
-    pkgDirCache: map<string, string>{}, pkgDetailCache: map<string, string>{} }
+    pkgDirCache: map<string, string>{}, pkgDetailCache: map<string, string>{},
+    parseCache: parseCache }
   if (stdRoot != "") {
     lw.prelude = loadModuleAt(lw, pathJoinResolve(stdRoot, "core"), "")
   }
