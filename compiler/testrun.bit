@@ -1,0 +1,262 @@
+// compiler/testrun.bit — `bit test`'s CLI entry point and its recursive
+// directory walk (#2247). A sibling .bit file is the same module as
+// build.bit (#1503's pattern), so `buildIr`/`readRtArchive`/`writeModuleExe`
+// there and `injectTestMain` (testgen.bit) / `verifyModuleOk` (verify.bit)
+// need no import here.
+//
+// THE DEFECT THIS REMOVES. `bit test <dir>` used to build and run exactly one
+// module's `test_*` functions — the directory's own — and say nothing about a
+// subdirectory the root imports, however many `test_*` functions it held.
+// `bit test project-root` reported the root's tests as the whole suite,
+// silently green, while a failing test sat one level down. SPEC §19 said "the
+// root module (never in an imported one)", which stopped a DEPENDENCY's tests
+// from leaking into a run, but read the same way for a project's own
+// sub-packages — which is not what any of Go's `./...`, cargo, pytest or jest
+// mean by running a directory's tests, and not what a CI step named
+// `bit test .` has to mean to be trustworthy (#2247).
+
+// A path that names nothing at all is `moduleRootProblem`'s first question
+// (build.bit) and is checked once per module this walk visits, inside
+// `runModuleTests`' own call to `buildIr`; nothing here duplicates it.
+
+// Directories this walk never opens, regardless of what they hold: `bit-out`
+// is the build driver's own output (never a project's source), and a dotted
+// directory (`.git` among them) is neither a module nor a place a project
+// keeps one.
+function testWalkSkipsDir(name: string): bool {
+  if (len(name) > 0 && name[0] == '.') {
+    return true
+  }
+  return name == "bit-out"
+}
+
+// Bounds recursion depth the same way `std/fs.walk` bounds its own (a cycle
+// fails loudly rather than running forever), and the walk below also caps
+// the total modules found at `maxModules` (project.bit) — the ceiling a
+// project's own module count already has, reused rather than duplicated.
+const maxTestWalkDepth = 64
+
+// The raw entries of `dir`, files and subdirectories together ("." and ".."
+// excluded by construction — `fsListDir` never emits them), unfiltered:
+// `listBitFiles` (project.bit) already answers "which of these are `.bit`
+// files"; this answers "which of these are worth opening as a directory".
+function dirEntryNames(dir: string): []string {
+  let raw = fsListDir(dir)
+  let out = []string(0)
+  let start = 0
+  let i = 0
+  while (i < len(raw) && len(out) < maxFilesPerModule) {
+    if (raw[i] == 0) {
+      out = append(out, raw[start:i])
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Every module directory at or beneath `root`: `root` itself first if it
+// qualifies, then depth-first through its subdirectories in sorted order. A
+// "module" is any directory `listBitFiles` finds at least one `.bit` file in
+// (SPEC §17.1) — an intermediate directory holding only subdirectories is
+// walked through but never itself reported. `moduleRootProblem`'s (build.bit)
+// "holds no .bit source" question is deliberately NOT asked of `root` here:
+// that question is right for `build`/`run`/`check`, which read exactly one
+// directory, but wrong for this recursive walk, where `root` is allowed to
+// hold no `.bit` files of its own as long as a module beneath it does.
+//
+// NEVER LEAVES `root`'S OWN FILESYSTEM SUBTREE. This is a plain directory
+// walk, not an import-graph traversal: it never opens a `./`-relative import
+// target outside the tree it was given and never reaches into `~/.bit/pkg/**`
+// (a fetched dependency lives outside the project directory entirely, so
+// nothing here ever names its path) — which is the containment SPEC §19's
+// "never in an imported one" sentence protects, kept by construction rather
+// than by checking an import path against the root.
+//
+// KNOWN LIMITATION, shared with `bit lint <dir>` (compiler/lint.bit, via
+// `std/fs.walk`): neither walk can tell a real subdirectory from a symlink,
+// because the runtime has no `lstat`/is-symlink primitive today. One was
+// built and shipped for exactly this (#2152) and then REVERTED
+// (`49e74817`) — the build driver itself imports `std/fs`, and the pinned
+// stage0's `libbitrt.a` predates the runtime symbol the fix added, so a clean
+// `./make` could not even check the driver. Landing that fix is gated on
+// repinning stage0 to a release carrying the symbol first; this walk is at
+// the same, already-shipped risk level `bit lint` has carried since that
+// revert, not a new one. Tracked for `bit test` specifically as #2489.
+function collectTestModules(root: string): []string {
+  let out = []string(0)
+  if (len(listBitFiles(root)) > 0) {
+    out = append(out, root)
+  }
+  return testWalkInto(root, out, maxTestWalkDepth)
+}
+
+function testWalkInto(dir: string, acc: []string, depth: int): []string {
+  if (depth <= 0 || len(acc) >= maxModules) {
+    return acc
+  }
+  let out = acc
+  for name of sortStrings(dirEntryNames(dir)) {
+    if (testWalkSkipsDir(name)) {
+      continue
+    }
+    let p = dir + "/" + name
+    if (!fsIsDir(p)) {
+      continue
+    }
+    if (len(listBitFiles(p)) > 0) {
+      out = append(out, p)
+    }
+    if (len(out) >= maxModules) {
+      return out
+    }
+    out = testWalkInto(p, out, depth - 1)
+  }
+  return out
+}
+
+// "" for one thing, "s" otherwise — every summary line below counts a test,
+// a module, or both, and none of them wanted this spelled out three times.
+function pluralS(n: int): string {
+  if (n == 1) {
+    return ""
+  }
+  return "s"
+}
+
+// The result of running exactly one module's own `test_*` functions (never a
+// sub-module's — SPEC §19). `ranAny` false means "no tests in this module",
+// which is not a failure; `buildFailed` true means a message is already
+// printed and this module counts against the combined exit code regardless
+// of `passed`/`failed`, which stay 0.
+struct ModuleTestReport {
+  passed: int,
+  failed: int,
+  ranAny: bool,
+  buildFailed: bool,
+}
+
+// Builds `src` and runs its own `test_*` functions, printing ok/FAIL per test
+// (and any build-time error) as it goes. Never prints a summary line and
+// never decides an exit code — `testModule` and `testProject` need DIFFERENT
+// summaries from the same per-test detail, so both call this and finish it
+// themselves.
+function runModuleTests(src: string): ModuleTestReport {
+  let noRun = ModuleTestReport{ passed: 0, failed: 0, ranAny: false, buildFailed: true }
+  // Always the host target: a cross-compiled test binary could not be run here.
+  let rt = readRtArchive(hostBuildTarget()) catch e {
+    print("bit: runtime archive ${libbitrtPath(hostBuildTarget())}: ${e.message()}\n")
+    return noRun
+  }
+  let module = buildIr(src, hostBuildTarget(), false, rt, true) catch e {
+    print("bit: ${src}: ${e.message()}\n")
+    return noRun
+  }
+  if (len(module.stubbed) > 0) {
+    print("bit: ${src}: cannot lower ${len(module.stubbed)} function(s); refusing to run tests\n")
+    // Named, like the object/binary paths: a bare count says a gate is red
+    // without saying what to fix, which is how this one sat red and unread.
+    for nm of module.stubbed {
+      print("  ${nm}\n")
+    }
+    return noRun
+  }
+  if (!verifyModuleOk(module, src, "run tests")) {
+    return noRun
+  }
+  let names = injectTestMain(module)
+  if (len(names) == 0) {
+    return ModuleTestReport{ passed: 0, failed: 0, ranAny: false, buildFailed: false }
+  }
+  // Disambiguated for the same reason as `runCmd`'s path (#1459/#1463).
+  let tmp = "/tmp/bit-test-${pathStem(src)}-${scratchNonce()}"
+  if (!writeModuleExe(module, src, tmp, hostBuildTarget(), rt)) {
+    return ModuleTestReport{ passed: 0, failed: 0, ranAny: true, buildFailed: true }
+  }
+  let passed = 0
+  let i = 0
+  while (i < len(names)) {
+    let code = osRunTest(tmp, i)
+    if (code == 0) {
+      passed = passed + 1
+      print("ok   ${names[i]}\n")
+    } else {
+      print("FAIL ${names[i]}\n")
+    }
+    i = i + 1
+  }
+  fsRemove(tmp)
+  return ModuleTestReport{ passed: passed, failed: len(names) - passed, ranAny: true, buildFailed: false }
+}
+
+// `bit test <one module>`: unchanged from before #2247 byte-for-byte — same
+// wording, same exit codes — so every existing caller of a single file or a
+// single-module directory sees no difference. `testCmd` below falls through
+// to this whenever the walk finds nothing to recurse into.
+function testModule(src: string): int {
+  let r = runModuleTests(src)
+  if (r.buildFailed) {
+    return 1
+  }
+  if (!r.ranAny) {
+    print("no tests in ${src} (a test is a top-level `function test_<name>()`)\n")
+    return 0
+  }
+  let total = r.passed + r.failed
+  print("\n${total} test${pluralS(total)}: ${r.passed} passed, ${r.failed} failed\n")
+  if (r.failed == 0) {
+    return 0
+  }
+  return 1
+}
+
+// `bit test <project root>`: runs every module `mods` names — independently,
+// each its own `buildIr`, never sharing state — and reports each labeled by
+// its own path so a failure is attributable, plus one combined summary and
+// exit code. This is what makes `bit test <dir>` at a project root actually
+// cover the project (#2247) instead of only its own top level.
+function testProject(mods: []string): int {
+  let totalPassed = 0
+  let totalFailed = 0
+  let anyBuildFailed = false
+  for m of mods {
+    print("== ${m} ==\n")
+    let r = runModuleTests(m)
+    if (r.buildFailed) {
+      anyBuildFailed = true
+    } else if (!r.ranAny) {
+      print("no tests in ${m} (a test is a top-level `function test_<name>()`)\n")
+    } else {
+      totalPassed = totalPassed + r.passed
+      totalFailed = totalFailed + r.failed
+      let sub = r.passed + r.failed
+      print("${sub} test${pluralS(sub)}: ${r.passed} passed, ${r.failed} failed\n")
+    }
+    print("\n")
+  }
+  let total = totalPassed + totalFailed
+  print("${total} test${pluralS(total)} across ${len(mods)} module${pluralS(len(mods))}: " +
+    "${totalPassed} passed, ${totalFailed} failed\n")
+  if (totalFailed > 0 || anyBuildFailed) {
+    return 1
+  }
+  return 0
+}
+
+// `bit test <file.bit|dir>` (SPEC §19). A file is always exactly one module —
+// unchanged. A directory is walked for every module beneath it; when that
+// walk finds nothing but the directory itself (the common case: a single
+// module, no sub-packages, or none at all) the result is identical to
+// running that one module directly, so `testModule` alone still owns that
+// wording. Only a directory holding more than its own top level, or holding
+// modules with nothing at its own top level, reaches `testProject`.
+function testCmd(src: string): int {
+  if (!fsIsDir(src)) {
+    return testModule(src) // a file, or a path that does not exist at all
+  }
+  let mods = collectTestModules(src)
+  if (len(mods) == 0 || (len(mods) == 1 && mods[0] == src)) {
+    return testModule(src)
+  }
+  return testProject(mods)
+}

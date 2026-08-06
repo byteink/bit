@@ -2955,9 +2955,11 @@ function test_concat() {
 
 - No new syntax: a test is an ordinary function, so `test` is not a reserved
   word (§5.2) and a test may call any function in its module.
-- `bit test <file.bit|dir>` discovers every `test_` function in the **root**
-  module (never in an imported one), runs each, and prints `ok`/`FAIL` per test
-  plus a summary. It exits `0` iff every test passed, `1` otherwise.
+- `bit test <file.bit|dir>` discovers every `test_` function in the module a
+  file names, or in every module beneath a directory — never in a module
+  reached only by importing it from outside that directory. It runs each,
+  prints `ok`/`FAIL` per test plus a summary, and exits `0` iff every test
+  passed, `1` otherwise.
 - A test fails when it panics — which a failed `assert` (§18.4) does. Each test
   therefore runs in its own process, so one failure neither hides the others nor
   aborts the run.
