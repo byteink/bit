@@ -68,7 +68,7 @@
 // `./mem.bit` is a SIBLING file, so it is the same module as this one and needs
 // no import — its functions are already in scope.
 import { spinAcquire, spinRelease } from "../"
-import { allocClassify, allocLargeLen, allocSpanBytes, heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked, heapLargeAllocLocked, heapLargeFreeLocked, heapLiveBytes, heapMappedBytes, heapSpansReleasedLocked, heapCheckSpansLocked, heapSpanViolations } from "../alloc"
+import { allocClassify, allocLargeLen, allocSpanBytes, allocSpanNext, heapTakeSmallLocked, heapGiveSmallLocked, heapRefillLocked, heapReclaimSpansLocked, heapLargeAllocLocked, heapLargeFreeLocked, heapLiveBytes, heapMappedBytes, heapSpansReleasedLocked, heapCheckSpansLocked, heapSpanViolations } from "../alloc"
 
 // ---------------------------------------------------------------------------
 // ABI constants (runtime/ABI.md §1, §2) — frozen, shared with codegen.
@@ -351,7 +351,11 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") function gcBindMemory(g: *
       spinRelease(heapLock(g))
       return 0
     }
-    heapRefillLocked(heapBlock(g), idx, span)
+    // Whether this span may ever be given back to the OS is decided HERE and
+    // recorded on the span, because this is the only place that knows: a span out
+    // of a chunk the reserve mapped is releasable, one out of the arena the
+    // CALLER bound is not (#2375, see `reserveHeadOwns`).
+    heapRefillLocked(heapBlock(g), idx, span, reserveHeadOwns(g + gcSpanRes, span, allocSpanBytes))
     if (*(g + gcCfgStress) != 0) {
       let bad = heapCheckSpansLocked(heapBlock(g))
     }
@@ -394,11 +398,34 @@ export @nosplit @symbol("bit_rt_port_gc_bind_memory") function gcBindMemory(g: *
 // pages are gone while they still are, and holding the lock across the syscall
 // is the required discipline (one acquire/release spanning all of
 // `free`), so two workers cannot race a map against an unmap of the same range.
+//
+// A SMALL SPAN IS NOW RELEASED THE SAME WAY (#2375), and that is what stops a
+// long-lived process ratcheting its RSS to its all-time peak: before this, the
+// small branch was `heapGiveSmallLocked` and nothing else, `memUnmapPages` had
+// exactly one call site in the runtime — the large branch below — and an idle
+// `bit lsp --stdio` reached 12,577 MB (#2325).
+//
+// The allocator decides WHEN (it owns the policy and the hysteresis) and does the
+// unlinking; this composes the syscall onto it, exactly as the small path's
+// refill composes `reserveGrow` onto `heapRefillLocked`. Still inside the one
+// critical section, so no worker can hold a pointer into a span being unmapped:
+// every slot in it is on the free list, and the list itself is under this lock.
 @nosplit function gcHeapFree(g: *i64, addr: int, size: int, alignment: int) {
   spinAcquire(heapLock(g))
   let idx = allocClassify(size, alignment)
   if (idx >= 0) {
-    heapGiveSmallLocked(heapBlock(g), addr, idx, size)
+    let reclaim = heapGiveSmallLocked(heapBlock(g), addr, idx, size)
+    if (reclaim != 0) {
+      let chain = heapReclaimSpansLocked(heapBlock(g), idx)
+      // Bounded: `heapReclaimSpansLocked` builds the chain in a bounded walk of
+      // one class's span list, and every span on it is off both lists.
+      while (chain != 0) {
+        let nxt = allocSpanNext(chain)     // read BEFORE the pages go away
+        memUnmapPages(chain, allocSpanBytes)
+        heapSpansReleasedLocked(heapBlock(g), allocSpanBytes)
+        chain = nxt
+      }
+    }
   } else {
     let nbytes = allocLargeLen(size, *(g + gcPageSize))
     memUnmapPages(addr, nbytes)

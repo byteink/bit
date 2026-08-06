@@ -236,7 +236,7 @@ export @nosplit @symbol("bit_rt_alloc_classify") function allocClassify(size: in
 // nodes of a singly-linked list with no back pointers.
 //
 // A span now carries a header in its own first words, so the question is O(1).
-// This ticket only makes it ANSWERABLE; unmapping an empty span is #2375.
+// #2374 made it ANSWERABLE; #2375 answers it and gives the span back.
 //
 // THE HEADER IS AT THE SPAN'S BASE, AND THE FIRST FEW SLOTS PAY FOR IT. The
 // carve starts at the first whole slot past the header (`spanSkip` of them),
@@ -245,19 +245,48 @@ export @nosplit @symbol("bit_rt_alloc_classify") function allocClassify(size: in
 // the carve start to a fixed byte offset instead would break it for the classes
 // whose size is not a power of two.
 //
-// FOUR OF THE SEVEN WORDS DESCRIBE THE SPAN. The other three are CLASS-WIDE and
+// FIVE OF THE TEN WORDS DESCRIBE THE SPAN. The other five are CLASS-WIDE and
 // are meaningful only in the span at the head of the class's list — the
 // "anchor" — because `heapWords` is full and has no room for them (see
 // `heapWords`). `heapRefillLocked` copies them onto the new anchor as it pushes
-// it, which is three stores on a path that already walks a whole span.
-const spanClass: int = 0     // owning size-class index
+// it, which is five stores on a path that already walks a whole span.
+//
+// `spanOwned` IS A SAFETY WORD, NOT AN OPTIMISATION (#2375). A span is carved
+// out of whatever the caller bound as the span reserve, and that is not always
+// OS pages this runtime mapped: `boot` binds an 8 MiB arena of its own, and five
+// stress programs bind a Bit-MANAGED `[]i64`. `munmap` on a slice the collector
+// owns is not a leak, it is a hole in the live heap. So only a span the reserve
+// itself got from the OS is ever released, recorded at carve time by the one
+// caller that knows.
+//
+// `spanSpans`/`spanEmpty` EXIST TO KEEP RECLAMATION LINEAR. Reclaiming a span
+// means walking the class's flat free list to unlink the slots inside it
+// (`heapReclaimSpansLocked`), which is O(free slots) — so firing it once per span
+// that empties is quadratic in the span count. Both counters are maintained in
+// O(1) by `take`/`give`/`refill`/`reclaim`, and let `heapGiveSmallLocked` ask for
+// a pass only when at least HALF the class's spans are releasable: each pass then
+// halves the class, so the total walking is linear in the slots freed. Both are
+// re-derived and checked by `heapCheckSpansLocked`.
+const spanClass: int = 0     // owning size-class index, -1 once doomed
 const spanTotal: int = 1     // slots carved out of this span
 const spanFree: int = 2      // how many of those are on the class's free list
 const spanNext: int = 3      // next span of this class, 0 = end of list
-const spanList: int = 4      // ANCHOR ONLY: head of the class's free-slot list
-const spanLive: int = 5      // ANCHOR ONLY: slots of the class handed out
-const spanBad: int = 6       // ANCHOR ONLY: violations `heapCheckSpansLocked` saw
-export const allocSpanHdrWords: int = 7
+const spanOwned: int = 4     // 1 = the reserve mapped this span, so it may be unmapped
+const spanList: int = 5      // ANCHOR ONLY: head of the class's free-slot list
+const spanLive: int = 6      // ANCHOR ONLY: slots of the class handed out
+const spanBad: int = 7       // ANCHOR ONLY: violations `heapCheckSpansLocked` saw
+const spanSpans: int = 8     // ANCHOR ONLY: spans on this class's list
+const spanEmpty: int = 9     // ANCHOR ONLY: those that are entirely free AND owned
+export const allocSpanHdrWords: int = 10
+
+// Entirely-free owned spans a class must have accumulated before
+// `heapGiveSmallLocked` asks for a reclaim pass. THIS IS THE HYSTERESIS, and 2
+// is the smallest value that is one: at 1 a class holding a single span would
+// ask on every free of its last slot, and the pass would refuse every time
+// because the anchor is never released — a walk per free that reclaims nothing.
+// At 2 the class has one releasable span beyond the anchor, so every pass that
+// runs gives at least one span back.
+export const allocSpanKeep: int = 2
 
 // The span owning `addr`. A MASK, NOT A LOOKUP, and that is what keeps
 // `heapTakeSmallLocked`/`heapGiveSmallLocked` `@nosplit`-safe and O(1): every
@@ -304,6 +333,40 @@ export @nosplit function allocSpanTotal(spanAddr: int): int {
 export @nosplit function allocSpanFree(spanAddr: int): int {
   let sp = allocWordAt(spanAddr)
   return *(sp + spanFree)
+}
+
+// The next span of the same class, 0 at the end. On the chain
+// `heapReclaimSpansLocked` returns this is the next span to release, and the
+// caller MUST read it BEFORE unmapping this one — the link lives in the span,
+// exactly as a chunk's does in `reserveRelease`.
+export @nosplit @symbol("bit_rt_alloc_span_next") function allocSpanNext(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanNext)
+}
+
+// Non-zero when the reserve mapped this span from the OS, so it may be handed
+// back. See `spanOwned`.
+export @nosplit function allocSpanOwned(spanAddr: int): int {
+  let sp = allocWordAt(spanAddr)
+  return *(sp + spanOwned)
+}
+
+// Spans on class `idx`'s list, and how many of those are entirely free AND
+// releasable — the two counters the reclaim trigger reads. Exported so a test
+// can compare them against its own tally over the spans it handed the class,
+// the same independence argument the per-span fields are exported for.
+export @nosplit function heapClassSpans(h: *i64, idx: int): int {
+  let anchor = *(h + heapListsWord + idx)
+  if (anchor == 0) { return 0 }
+  let av = allocWordAt(anchor)
+  return *(av + spanSpans)
+}
+
+export @nosplit function heapClassEmpty(h: *i64, idx: int): int {
+  let anchor = *(h + heapListsWord + idx)
+  if (anchor == 0) { return 0 }
+  let av = allocWordAt(anchor)
+  return *(av + spanEmpty)
 }
 
 // --- Heap state -------------------------------------------------------------
@@ -376,7 +439,15 @@ export @nosplit @symbol("bit_rt_heap_take_small_locked") function heapTakeSmallL
   *(a + spanList) = *slot                // pop: list = slot.next
   *(a + spanLive) = *(a + spanLive) + 1
   let sp = allocWordAt(allocSpanOf(addr))
-  *(sp + spanFree) = *(sp + spanFree) - 1
+  let f = *(sp + spanFree)
+  *(sp + spanFree) = f - 1
+  // This slot may be the first taken out of an entirely-free span, in which case
+  // the span stops being releasable and the class's count of releasable spans
+  // must follow it down. Owned-only, so the count stays exactly the number of
+  // spans a reclaim pass could act on (#2375).
+  if (f == *(sp + spanTotal) && *(sp + spanOwned) != 0) {
+    *(a + spanEmpty) = *(a + spanEmpty) - 1
+  }
   let live = h + heapLiveWord
   let prev = atomicAdd(live, size)
   return addr
@@ -392,17 +463,43 @@ export @nosplit @symbol("bit_rt_heap_take_small_locked") function heapTakeSmallL
 // the allocator's existing free contract stated in the module header. It is what
 // makes the class word non-zero here (a slot exists, so its span does) and what
 // makes `allocSpanOf(addr)` a span of THIS class.
-export @nosplit @symbol("bit_rt_heap_give_small_locked") function heapGiveSmallLocked(h: *i64, addr: int, idx: int, size: int) {
+//
+// RETURNS 1 WHEN THE CLASS WANTS A RECLAIM PASS (#2375), 0 otherwise — the
+// caller's cue to call `heapReclaimSpansLocked` and unmap what it hands back.
+// The decision is POLICY and so lives here with the rest of it (module header),
+// is O(1), and is "yes" only when all four hold:
+//
+//   - this free brought a span to entirely free, and
+//   - that span is releasable at all (`spanOwned`), and
+//   - it is not the class's anchor. THE ANCHOR IS NEVER RELEASED: it carries the
+//     five class-wide words, and a class whose span list emptied to 0 would make
+//     the `*head` dereference above read address 0 on the next free. Retaining it
+//     is also the "keep one empty span cached" half of the hysteresis — the next
+//     allocation of this class needs no map at all.
+//   - the class has at least `allocSpanKeep` releasable spans AND they are at
+//     least half of its spans, which is what keeps the walking linear
+//     (`spanSpans`).
+export @nosplit @symbol("bit_rt_heap_give_small_locked") function heapGiveSmallLocked(h: *i64, addr: int, idx: int, size: int): int {
   let head = h + heapListsWord + idx
-  let a = allocWordAt(*head)
+  let anchor = *head
+  let a = allocWordAt(anchor)
   let slot = allocWordAt(addr)
   *slot = *(a + spanList)                // push: slot.next = list
   *(a + spanList) = addr
   *(a + spanLive) = *(a + spanLive) - 1
-  let sp = allocWordAt(allocSpanOf(addr))
-  *(sp + spanFree) = *(sp + spanFree) + 1
+  let span = allocSpanOf(addr)
+  let sp = allocWordAt(span)
+  let f = *(sp + spanFree) + 1
+  *(sp + spanFree) = f
   let live = h + heapLiveWord
   let prev = atomicSub(live, size)
+  if (f != *(sp + spanTotal) || *(sp + spanOwned) == 0) { return 0 }
+  let e = *(a + spanEmpty) + 1
+  *(a + spanEmpty) = e
+  if (span == anchor) { return 0 }
+  if (e < allocSpanKeep) { return 0 }
+  if (e * 2 < *(a + spanSpans)) { return 0 }
+  return 1
 }
 
 // Carve one fresh span of `allocSpanBytes` bytes at `spanAddr` into slots and
@@ -417,29 +514,44 @@ export @nosplit @symbol("bit_rt_heap_give_small_locked") function heapGiveSmallL
 // address. That order is observable (it decides which
 // address the next `take` hands out), so it is preserved deliberately.
 //
-// The new span becomes the class's ANCHOR, so the three class-wide words move
+// The new span becomes the class's ANCHOR, so the five class-wide words move
 // onto it. The free list is carried over rather than restarted: a refill happens
 // when the list is empty, but "empty" is the common case, not a guarantee — a
 // caller may refill early, and dropping a non-empty list would strand every slot
 // on it.
-export @nosplit @symbol("bit_rt_heap_refill_locked") function heapRefillLocked(h: *i64, idx: int, spanAddr: int) {
+//
+// `owned` MUST say whether `spanAddr` is inside memory the caller's span reserve
+// mapped from the OS, because it is what licenses a later `munmap` of this span
+// (#2375). Only the caller knows: it is the one that took the span. Passing
+// `true` for a span carved out of a caller-supplied arena — the 8 MiB `boot`
+// binds, or the Bit-managed `[]i64` five stress programs bind — would eventually
+// unmap live heap. When in doubt the answer is `false`: it costs this span's
+// 128 KiB for the life of the process and nothing else.
+export @nosplit @symbol("bit_rt_heap_refill_locked") function heapRefillLocked(h: *i64, idx: int, spanAddr: int, owned: bool) {
   let cs = allocClassSize(idx)
   let count = allocSpanBytes / cs - spanSkip(cs)   // >= 1, see `allocSpanSlots`
   let head = h + heapListsWord + idx
   let prevAnchor = *head
   let sp = allocWordAt(spanAddr)
+  let own = 0
+  if (owned) { own = 1 }
   *(sp + spanClass) = idx
   *(sp + spanTotal) = count
   *(sp + spanFree) = count
   *(sp + spanNext) = prevAnchor
+  *(sp + spanOwned) = own
   *(sp + spanList) = 0
   *(sp + spanLive) = 0
   *(sp + spanBad) = 0
+  *(sp + spanSpans) = 1
+  *(sp + spanEmpty) = own                          // a fresh span is entirely free
   if (prevAnchor != 0) {
     let pa = allocWordAt(prevAnchor)
     *(sp + spanList) = *(pa + spanList)
     *(sp + spanLive) = *(pa + spanLive)
     *(sp + spanBad) = *(pa + spanBad)
+    *(sp + spanSpans) = *(pa + spanSpans) + 1
+    *(sp + spanEmpty) = *(pa + spanEmpty) + own
   }
   let base = spanAddr + spanSkip(cs) * cs
   let i = 0
@@ -453,6 +565,86 @@ export @nosplit @symbol("bit_rt_heap_refill_locked") function heapRefillLocked(h
   *head = spanAddr
   let mapped = h + heapMappedWord
   let prev = atomicAdd(mapped, allocSpanBytes)
+}
+
+// Take every entirely-free releasable span off class `idx` and return them as a
+// chain linked through `allocSpanNext`, 0 when there is nothing to take. CALLER
+// MUST HOLD THE LOCK. This is the function #2375 exists for: before it, no small
+// span had any route back to the OS and process RSS was a monotonic high-water
+// mark of the sum over 37 classes of each class's all-time peak span count — an
+// idle `bit lsp --stdio` reached 12,577 MB that way (#2325).
+//
+// IT DOES NOT UNMAP, AND THAT IS THE PLATFORM SEAM rather than a division of
+// labour: this module cannot contain a `syscall` or a libc `extern` at all (see
+// the module header). The caller unmaps each span in the chain — reading
+// `allocSpanNext` BEFORE the unmap — and accounts the bytes with
+// `heapSpansReleasedLocked`.
+//
+// TWO PASSES, AND THE ORDER IS THE WHOLE DESIGN. The slots are still interior
+// nodes of ONE flat singly-linked free list per class (#2374 kept it
+// deliberately: per-span lists need a second head word per class to park full
+// spans in, and `heapWords` has none, so they would strand free slots in
+// non-head spans — the very leak this fixes). With no back pointers, unlinking a
+// span's slots means walking that list. So pass 1 splices ALL the doomed spans
+// off the SPAN list, marking each with `spanClass = -1`; pass 2 walks the free
+// list ONCE and drops every slot whose span carries the mark. One walk per span
+// instead is what makes reclamation quadratic.
+//
+// The anchor is never a candidate; `heapGiveSmallLocked` says why.
+export @nosplit @symbol("bit_rt_heap_reclaim_spans_locked") function heapReclaimSpansLocked(h: *i64, idx: int): int {
+  let anchor = *(h + heapListsWord + idx)
+  if (anchor == 0) { return 0 }
+  let av = allocWordAt(anchor)
+  // Bound both walks by memory that exists, exactly as `heapCheckSpansLocked`
+  // does: the function that rewrites these links must not hang on a cycle in
+  // them.
+  let maxSpans = heapMappedBytes(h) / allocSpanBytes + 1
+  let doomed = 0
+  let removed = 0
+  let prevSpan = anchor
+  let s = *(av + spanNext)
+  let seen = 0
+  while (s != 0 && seen < maxSpans) {    // bounded: maxSpans iterations
+    let sp = allocWordAt(s)
+    let nxt = *(sp + spanNext)
+    if (*(sp + spanFree) == *(sp + spanTotal) && *(sp + spanOwned) != 0) {
+      let pv = allocWordAt(prevSpan)
+      *(pv + spanNext) = nxt
+      *(sp + spanClass) = -1             // the mark pass 2 reads
+      *(sp + spanNext) = doomed
+      doomed = s
+      removed = removed + 1
+    } else {
+      prevSpan = s
+    }
+    s = nxt
+    seen = seen + 1
+  }
+  if (removed == 0) { return 0 }
+  *(av + spanSpans) = *(av + spanSpans) - removed
+  *(av + spanEmpty) = *(av + spanEmpty) - removed
+  let maxSlots = heapMappedBytes(h) / allocClassSize(idx) + 1
+  let prevSlot = 0                       // 0 is never a slot: it means "at the head"
+  let cur = *(av + spanList)
+  let steps = 0
+  while (cur != 0 && steps < maxSlots) { // bounded: maxSlots iterations
+    let cw = allocWordAt(cur)
+    let nxt = *cw
+    let ow = allocWordAt(allocSpanOf(cur))
+    if (*(ow + spanClass) < 0) {
+      if (prevSlot == 0) {
+        *(av + spanList) = nxt
+      } else {
+        let pw = allocWordAt(prevSlot)
+        *pw = nxt
+      }
+    } else {
+      prevSlot = cur
+    }
+    cur = nxt
+    steps = steps + 1
+  }
+  return doomed
 }
 
 // THE INVARIANT, CHECKED RATHER THAN TRUSTED: for every size class,
@@ -470,6 +662,12 @@ export @nosplit @symbol("bit_rt_heap_refill_locked") function heapRefillLocked(h
 // SAME class — that keeps the sum intact — and catching those is
 // `tests/stress/alloc`'s per-span tally, which is why the per-span fields are
 // exported.
+//
+// THE RECLAIM COUNTERS ARE CHECKED THE SAME WAY (#2375). `spanSpans` and
+// `spanEmpty` are maintained in O(1) by `take`/`give`/`refill`/`reclaim` and are
+// what decides when a span is handed back to the OS, so they are re-derived here
+// from the spans themselves. A drift in `spanSpans` mistimes the trigger; a drift
+// in `spanEmpty` is worse — one too high asks for passes that reclaim nothing.
 //
 // Returns the violations found now, and adds them to each class's anchor so
 // `heapSpanViolations` reports every one ever seen. Counting rather than
@@ -490,6 +688,7 @@ export @nosplit @symbol("bit_rt_heap_check_spans_locked") function heapCheckSpan
       let bad = 0
       let inUse = 0
       let seen = 0
+      let empty = 0
       let s = anchor
       while (s != 0 && seen < maxSpans) {   // bounded: maxSpans iterations
         let sp = allocWordAt(s)
@@ -498,6 +697,7 @@ export @nosplit @symbol("bit_rt_heap_check_spans_locked") function heapCheckSpan
         if (*(sp + spanTotal) != want) { bad = bad + 1 }
         let f = *(sp + spanFree)
         if (f < 0 || f > want) { bad = bad + 1 }
+        if (f == want && *(sp + spanOwned) != 0) { empty = empty + 1 }
         inUse = inUse + want - f
         s = *(sp + spanNext)
         seen = seen + 1
@@ -505,6 +705,8 @@ export @nosplit @symbol("bit_rt_heap_check_spans_locked") function heapCheckSpan
       if (s != 0) { bad = bad + 1 }      // ran out of bound: a cycle or a bogus link
       let av = allocWordAt(anchor)
       if (inUse != *(av + spanLive)) { bad = bad + 1 }
+      if (seen != *(av + spanSpans)) { bad = bad + 1 }
+      if (empty != *(av + spanEmpty)) { bad = bad + 1 }
       *(av + spanBad) = *(av + spanBad) + bad
       found = found + bad
     }
@@ -539,9 +741,11 @@ export @nosplit @symbol("bit_rt_heap_span_violations") function heapSpanViolatio
 // chunks it mapped, and `gcDeinit` unmaps them, so the mapped count must follow
 // them out or it would claim memory the process no longer has.
 //
-// It does NOT touch `liveBytes` and does not touch the free lists: the slots
-// carved out of those spans are gone with the mapping, so this is only ever
-// called as part of tearing a heap down, never while it can still serve a take.
+// It does NOT touch `liveBytes` and does not touch the free lists, because by
+// the time it is called the slots are already off them. Two callers, and both
+// must have done that first: `gcDeinit`, which is releasing whole chunks at
+// teardown, and the per-span reclaim path (#2375), whose `heapReclaimSpansLocked`
+// unlinked the slots and the span before its caller unmapped a single byte.
 export @nosplit @symbol("bit_rt_heap_spans_released_locked") function heapSpansReleasedLocked(h: *i64, nbytes: int) {
   let mapped = h + heapMappedWord
   let prev = atomicSub(mapped, nbytes)
