@@ -1,0 +1,147 @@
+// The §17.4 entry-point normalization: `main` in the shape the runtime calls.
+//
+// Split out of `lowerfunc.bit` because that file is at the 800-line limit; a
+// sibling `.bit` file is the same module, so nothing else changes.
+//
+// SPEC §17.4 permits three `main` signatures and ABI.md §10 collapses them to
+// one native shape, `bit_main() -> i32`. Two of the three need no code: the
+// hand-assembled trampoline in `emit{macho,elf}.bit` supplies a constant 0 for a
+// void `main` and passes an `int` `main`'s register through. The third —
+// `main(): ()!` — is the one that owes real work, and this file is that work.
+
+// The IR/link name the root module's fallible `main` body is moved to, so the
+// `main` symbol the entry trampoline branches to can be the wrapper.
+const fallibleMainBody: string = "main\$fallible"
+
+// Is this declaration the root module's fallible entry point — the one shape
+// that owes the §17.4 error arm? Every clause excludes a name that only READS
+// like the entry: a method (`kids[0]`), a monomorphized instance
+// (`nameOverride`), an `@symbol("main")` pin, and any module but the root's.
+function isFallibleEntry(lowerer: Lowerer, declName: string, kids: []int, nameOverride: string, pinned: string, fallibleErr: int): bool {
+  return declName == "main" && fallibleErr != 0 && kids[0] == 0 &&
+    nameOverride == "" && pinned == "" && lowerer.curModule == lowerer.root
+}
+
+// Emits the `main` the entry trampoline calls, for a program whose `main` is
+// fallible: run the body, then read the §18 error slot and turn a pending error
+// into a stderr line plus exit 1 (SPEC §17.4, ABI.md §10).
+//
+// WHY HERE AND NOT IN THE TRAMPOLINE. `emit{macho,elf}.bit` hand-assemble the
+// `bit_main` trampoline, and hand-written machine code can supply a constant 0
+// for a void `main` but cannot dispatch `error.message()` — the method's
+// dispatch id is assigned per program. So the error arm has to exist as real
+// lowered IR, and the wrapper is that IR.
+//
+// The wrapper's result is `i64`, which is also what makes the trampoline stop
+// zeroing the return register: its `mainVoid` reads `f.result`, so a void ok
+// type would have thrown BOTH arms' codes away.
+//
+// This was #2235: `fail` from `main` set the slot, nothing ever read it, and the
+// process exited 0 with an empty stderr — a failed run that no caller could tell
+// from a successful one.
+function emitFallibleMainWrapper(c: Checker, lowerer: Lowerer, moduleConsts: map<string, int>, genEnv: TypeEnv, okTy: int, errTy: int) {
+  let i64ty = primType(c.ctx, 3)
+  let b = newBuilder()
+  let entry = builderNewBlock(b)
+  builderBeginBlock(b, entry)
+  let fc = FnCtx{ c: c, b: b, env: []LocalBind(0), failed: false, terminated: false,
+    loops: []LoopFrame(0), moduleConsts: moduleConsts, lowerer: lowerer,
+    defers: []IrInstr(0), fallibleOk: 0, fallibleErr: 0, genEnv: genEnv, resultTy: i64ty }
+  let call = mkInstr(Op.Call, okTy)
+  call.name = fallibleMainBody
+  call.args = []int(0)
+  let okv = builderEmit(b, call)
+  let errv = getErr(fc, errTy)
+  let isErr = neNil(fc, errv, errTy)
+  let errBlk = builderNewBlock(b)
+  let okBlk = builderNewBlock(b)
+  let br = mkInstr(Op.Br, c.ctx.voidId)
+  br.lhs = isErr
+  br.ival = errBlk
+  br.thenArgs = []int(0)
+  br.ival2 = okBlk
+  br.elseArgs = []int(0)
+  builderEmit(b, br)
+  builderEndBlock(b)
+
+  builderBeginBlock(b, errBlk)
+  emitErrorLine(fc, errv, errTy)
+  emitConstIntRet(fc, i64ty, 1)
+  builderEndBlock(b)
+
+  builderBeginBlock(b, okBlk)
+  emitMainOkRet(fc, i64ty, okTy, okv)
+  builderEndBlock(b)
+
+  lowerer.closureFuncs = append(lowerer.closureFuncs, IrFunc{ name: "main",
+    paramTypes: []int(0), result: i64ty, blocks: b.blocks, instrs: b.instrs,
+    isFallible: false, isNaked: false, isNosplit: false, inRootModule: true })
+}
+
+// `error: <msg>\n` on fd 2, as one write.
+//
+// SPEC §17.4 fixes the destination and the exit code but NOT the wording, so the
+// prefix is chosen to match the only other diagnostic a running Bit program
+// writes to fd 2 — the runtime's own `panic: <msg>\n` (runtime/root/*/io.bit).
+// A bare message would be indistinguishable from the program's own logging.
+// Concatenated rather than three `eprint`s so the line cannot interleave with
+// another thread's output.
+function emitErrorLine(fc: FnCtx, errv: int, errTy: int) {
+  let stringTy = primType(fc.c.ctx, 11)
+  let msg = mkInstr(Op.CallIface, stringTy)
+  msg.lhs = errv
+  msg.ival = methodId(fc.lowerer, "message")
+  msg.args = []int(0)
+  let line = concatStrings(fc, stringTy, constString(fc, stringTy, "error: "),
+    builderEmit(fc.b, msg))
+  let out = concatStrings(fc, stringTy, line, constString(fc, stringTy, "\n"))
+  let ep = mkInstr(Op.RtCall, fc.c.ctx.voidId)
+  ep.name = "eprint"
+  ep.args = [out]
+  emitRtCall(fc, ep)
+}
+
+function constString(fc: FnCtx, stringTy: int, s: string): int {
+  let cs = mkInstr(Op.ConstString, stringTy)
+  cs.sval = s
+  cs.ival = internPoolString(fc, s)
+  return builderEmit(fc.b, cs)
+}
+
+function concatStrings(fc: FnCtx, stringTy: int, a: int, bv: int): int {
+  let ins = mkInstr(Op.RtCall, stringTy)
+  ins.name = "string_concat"
+  ins.args = [a, bv]
+  return emitRtCall(fc, ins)
+}
+
+function emitConstIntRet(fc: FnCtx, i64ty: int, v: int) {
+  let ci = mkInstr(Op.ConstInt, i64ty)
+  ci.ival = v
+  let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
+  r.args = [builderEmit(fc.b, ci)]
+  builderEmit(fc.b, r)
+}
+
+// The wrapper's ok arm. An integer ok type IS the exit code (§17.4's `main():
+// int` rule, composed with the fallible marker), widened to i64 first because
+// `Op.Ret` picks its register class from the ARGUMENT's type. Every other ok
+// type — `()`, and the `f64!`/`string!`/`bool!` shapes §17.4 does not define —
+// exits 0: a float would otherwise be returned in d0/xmm0 and read back out of
+// x0/eax as whatever happened to be there.
+function emitMainOkRet(fc: FnCtx, i64ty: int, okTy: int, okv: int) {
+  let td = fc.c.ctx.types[okTy]
+  if (td.kind != TypeKind.Prim || td.prim > 7) {
+    emitConstIntRet(fc, i64ty, 0)
+    return
+  }
+  let v = okv
+  if (okTy != i64ty) {
+    let cv = mkInstr(Op.Convert, i64ty)
+    cv.lhs = okv
+    v = builderEmit(fc.b, cv)
+  }
+  let r = mkInstr(Op.Ret, fc.c.ctx.voidId)
+  r.args = [v]
+  builderEmit(fc.b, r)
+}
