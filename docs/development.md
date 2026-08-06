@@ -37,6 +37,29 @@ pin *first*: cut a release, repin `dist/stage0/SHA256SUMS`, then use it. (0.1.2
 could not build a later `compiler/` because of `osRunTestBounded`, which is what
 forced the 0.1.3 pin.)
 
+**The same ordering rule binds a new runtime primitive to `tools/build/`
+itself.** `tools/build/` — the build driver — is compiled by the pinned stage0
+too, and it transitively imports `std/fs`, `std/os` and the rest of the stdlib
+the driver's own artifact steps need. A stdlib module `tools/build/` imports
+that declares an `extern function` the pinned stage0's bundled `libbitrt.a`
+does not provide cannot land until stage0 is repinned to a release that has
+it — the checker resolves every extern a module declares whether or not the
+importer calls it, so it is not enough for the driver to avoid *calling* the
+new function. #2152 landed exactly this (`bit_rt_fs_is_symlink_w`, added to
+`stdlib/fs/fs.bit` and reached through `tools/build/artifacts.bit`'s `import {
+walk } from "std/fs"`) and reverted at `49e74817` once `rm -rf bit-out &&
+./make` was tried against it — every warm-`bit-out` gate had stayed green.
+
+**`./make test-coldboot` is what catches that class before it lands.** It
+deletes `bit-out/` entirely and re-bootstraps through the pinned stage0 exactly
+as a fresh clone or `dist/release.sh` would (never `BIT_STAGE0_BIN` — that is
+the two-pass escape hatch for when stage0 genuinely cannot build the tree, and
+using it here would defeat the point), then asserts the default step
+(`install`) exits 0. It is deliberately **not** part of `./make test` — a cold
+bootstrap, including re-verifying and possibly re-fetching stage0, is the most
+expensive operation in this repo — so run it explicitly before a release,
+before merging to main, or right after a stage0 repin.
+
 ## Testing conventions
 
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
