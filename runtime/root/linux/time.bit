@@ -40,6 +40,7 @@
 
 import { parkMonoNs } from "../../park/linux"
 import { schedSleepUntil, schedYield } from "../../sched"
+import { schedCurrentWorker } from "../../sched"
 
 // clock_gettime: x86_64 nr 228, aarch64 nr 113 (the kernel syscall tables, the
 // same pair `runtime/park/linux/wait.bit` reads for CLOCK_MONOTONIC). `nr` is
@@ -55,29 +56,51 @@ const clockRealtime: int = 0
 // reason).
 const nsPerSec: int = 1000000000
 
+// A dedicated `[2]i64` fallback for the two functions below, used only when
+// the caller is not running on a task (`schedCurrentWorker() == 0`) and so has
+// no per-worker `wkSleepReq` scratch to reach — a case ABI.md §18's entry
+// points are not expected to hit (only compiled user code, always running as
+// a task, calls them), kept only so the fallback path is total rather than
+// undefined. Sharing it across that rare path is safe for the same reason
+// `../darwin/wait.bit`'s `tbScratch` is: nothing races it in the ordinary case.
+let timeFallbackScratch: [2]i64
+
+// The 2-word scratch `parkMonoNs`/`clock_gettime` write their `timespec` into
+// (#2318) — the caller-owned-block pattern `parkSleepNs` already uses: the
+// current task's own worker's `wkSleepReq`, or the shared fallback when there
+// is no current task.
+@nosplit function timeScratch(): *i64 {
+  let w = schedCurrentWorker()
+  if (w == 0) {
+    return ptrOf(timeFallbackScratch)
+  }
+  return taskAt(w) + wkSleepReq
+}
+
 // `bit_rt_time_mono_ns` (ABI.md §18): monotonic nanoseconds; never jumps, measures
 // elapsed. A PIN over `parkMonoNs` — the same clock_gettime CLOCK_MONOTONIC read,
 // reused rather than duplicated. `runtime/root/`'s body is `sched.monoNs()`, the twin
 // of `parkMonoNs`.
 export @symbol("bit_rt_time_mono_ns") function rtTimeMonoNs(): int {
-  return parkMonoNs()
+  return parkMonoNs(timeScratch())
 }
 
 // `bit_rt_time_unix_ns` (ABI.md §18): wall-clock nanoseconds since the Unix epoch.
 // Can jump (NTP, clock set), so it dates events and never measures durations.
 // clock_gettime(CLOCK_REALTIME) into a `timespec` {sec, nsec} — two 64-bit words,
-// addressed with `ptrOf` (§11.5), identical to `parkMonoNs` but for the clock id.
+// at the same caller-owned scratch `parkMonoNs` uses (#2318; this used to be a
+// fresh `[]i64(2)` heap slice on every call, identical to that ticket's defect).
 //
 // Returns 0 if the kernel refuses, matching `parkMonoNs`'s failure report rather
 // than reading back an uninitialised buffer (`realtimeNs` ignores the return code
 // like `monoNs`; reporting 0 is the one strictly-safer deviation both share).
 export @symbol("bit_rt_time_unix_ns") function rtTimeUnixNs(): int {
-  let ts = []i64(2)
-  let rc = int(syscall(sysClockGettime(), i64(clockRealtime), i64(int(ptrOf(ts)))))
+  let ts = timeScratch()
+  let rc = int(syscall(sysClockGettime(), i64(clockRealtime), i64(int(ts))))
   if (rc != 0) {
     return 0
   }
-  return int(ts[0]) * nsPerSec + int(ts[1])
+  return int(*(ts + 0)) * nsPerSec + int(*(ts + 1))
 }
 
 // `bit_rt_time_sleep_ns` (ABI.md §18): park the calling green thread for at least
@@ -99,5 +122,5 @@ export @symbol("bit_rt_time_sleep_ns") function rtTimeSleepNs(ns: int) {
     schedYield()
     return
   }
-  schedSleepUntil(parkMonoNs() + ns)
+  schedSleepUntil(parkMonoNs(timeScratch()) + ns)
 }
