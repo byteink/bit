@@ -141,11 +141,33 @@ by user declarations (doing so is discouraged and lints as a warning):
 
 - Types: `i8 i16 i32 i64  u8 u16 u32 u64  f32 f64  int uint  byte rune  bool string  error`
 - Constants: none beyond the `true`/`false`/`nil` literals.
-- Builtin functions: `len cap append delete close panic assert` (§16).
+- Builtin functions: `len cap append delete close panic assert` (§16),
+  and `parseFloat` (below).
 
 `int` is an alias for `i64`; `uint` for `u64`; `byte` for `u8`; `rune` for `i32`.
 Sizes are fixed on every target for deterministic behavior (this is not Go's
 platform-dependent `int`).
+
+**`parseFloat(s: string) -> f64`** converts decimal or hexadecimal float text to
+the nearest `f64`. The accepted text is exactly `FLOAT_LIT` (§5.5) with an
+optional leading `+` or `-`, including `_` digit separators; the conversion is
+correctly rounded (round-to-nearest-even on the exact value, never an
+approximation), so a given text always denotes the same `f64` on every target.
+
+**Text it cannot parse yields a quiet NaN**, so a failed conversion is
+distinguishable from every successful one — `parseFloat("nonsense")` is not
+`parseFloat("0")`. Callers test the result with `v != v`, which is true only for
+NaN. `parseFloat` does not panic and is not fallible: the value *is* the report.
+Only the failure is specified, not a particular NaN payload or sign, and a NaN is
+therefore not a legal successful result — the text `"nan"` is not a `FLOAT_LIT`
+and does not parse.
+
+Rationale for the NaN rather than a `f64!` or a `(f64, bool)`: `parseFloat` is
+predeclared, so its signature is part of every program's scope and cannot change
+without breaking every caller, and NaN is already the IEEE 754 value reserved for
+"not a number". Returning `0.0` — which earlier implementations did — made a bad
+parse indistinguishable from a good one, silently turning every malformed numeric
+field into zero.
 
 ### 5.4 Integer Literals
 

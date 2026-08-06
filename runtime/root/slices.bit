@@ -2,6 +2,159 @@
 // Sibling file, same module — see `root.bit` for the port's header and seams.
 
 // ---------------------------------------------------------------------------
+// THE BOUNDS PANICS (SPEC §12.6, §18.4, #2014)
+// ---------------------------------------------------------------------------
+//
+// SPEC §12.6 requires an out-of-range index or re-slice to PANIC, and this port
+// swallowed all five: `rtSliceGet` returned 0, `rtSliceSet` dropped the write,
+// `rtSliceSlice` returned 0, `rtStringByte` returned -1 and `rtStringSlice`
+// returned 0. So `xs[9]` on a 3-element slice evaluated to 0 and the program ran
+// on with fabricated data and exited 0 — a memory-safety net turned into a wrong
+// answer, which is strictly worse than the crash it replaced. Every release
+// through 0.1.8 shipped that way and no golden covered it.
+//
+// The four comments that documented the swallow all deferred the panic to "the
+// layer that owns the write path", and `rtSliceInBounds` was exported so that
+// layer could raise it. NO SUCH CALLER WAS EVER WRITTEN — nothing in `compiler/`
+// references `slice_in_bounds` at all, so lowering emitted bare `slice_get`/
+// `slice_set` and the panic was lost end to end. The check was always here; only
+// the report was missing. That is why the fix belongs here and needs no compiler
+// change: these five entry points already compute the predicate.
+//
+// `root.bit` constraint 3 says `@nosplit` cannot panic. That was true when it was
+// written and is not any more — `bit_rt_panic` is itself `@nosplit` (`<os>/io.bit`),
+// and #2016/#2018/#2240 have since raised three argument-free panics from exactly
+// this position (ABI.md §12.1). What `@nosplit` still forbids is ALLOCATING
+// (E0075), so the message cannot be a heap string. Constraint 3's OOM rule is
+// untouched: exhaustion still returns 0 and bumps `statOom`, because a heap that
+// cannot satisfy a request is not the caller's programming error.
+
+// `bit_rt_panic` (ABI.md §12) reached by ABI symbol rather than by import: it is
+// defined in `<os>/io.bit`, a different module, and `runtime/root` is
+// platform-free so it cannot define the write path itself. This is the same door
+// `runtime/chan/chanwrap.bit` opens for `bit_rt_oom`, legal inside a `@nosplit`
+// body (SPEC §11.7, #1640), and it is what makes the port's platform-split panic
+// wall irrelevant here.
+//
+// Routed through `bit_rt_panic` rather than through three new
+// `bit_rt_panic_*_out_of_range` symbols beside §12.1's: these three panics are
+// raised INSIDE an existing runtime entry point, not injected by a backend at an
+// operation, so no new ABI surface is needed and the rendering (`panic: <msg>\n`,
+// exit 2) is literally the same code path as `panic("x")` rather than a second
+// spelling of it.
+extern function bit_rt_panic(msg: int)
+
+// The three messages, packed little-endian into i64 words exactly as
+// `<os>/io.bit`'s `oomWord0`/`divZeroWord0` are, and for the identical reason:
+// the panic path must not allocate. Computed, not hand-derived. A trailing
+// partial word is zero-padded and its real length carried alongside, so only the
+// message bytes are ever written.
+//
+//   "index out of range"         (18) = "index ou" "t of ran" "ge"
+//   "slice bounds out of range"  (25) = "slice bo" "unds out" " of rang" "e"
+//   "string bounds out of range" (26) = "string b" "ounds ou" "t of ran" "ge"
+//
+// The wording is 0.1.2's, the last release that panicked here, and it is also
+// what the four swallow comments this fix replaces each named as the answer they
+// owed.
+const idxOobWord0: int = 8462017926321696361
+const idxOobWord1: int = 7953763900396085364
+const idxOobWord2: int = 25959
+const idxOobLen: int = 18
+
+const slcOobWord0: int = 8026013105759284339
+const slcOobWord1: int = 8391735665840385653
+const slcOobWord2: int = 7453001576142499616
+const slcOobWord3: int = 101
+const slcOobLen: int = 25
+
+const strOobWord0: int = 7070765138884850803
+const strOobWord1: int = 8462017904830739823
+const strOobWord2: int = 7953763900396085364
+const strOobWord3: int = 25959
+const strOobLen: int = 26
+
+// The `{ptr, len}` string header (ABI.md §2) plus the inline message bytes that
+// `bit_rt_panic` reads, assembled on the panic path. Two header words plus four
+// text words: 32 bytes of text, and the longest message is 26.
+//
+// MODULE STATE, NOT A LOCAL, for the same reason `<os>/io.bit`'s `ioConstBuf` and
+// `fs.bit`'s `fsPathBuf` are: `ptrOf` needs an addressable object and `@nosplit`
+// forbids allocating one per call (E0075) — and the panic path is precisely the
+// path that must still work when allocation is what failed. Scalar, so the
+// collector never scans it (root.bit constraint 1, ABI.md §5 rule 1), which is
+// required and not merely allowed: it holds a byte address, never an object
+// reference. Length 6 is a literal because a module-state array's length must be
+// (root.bit's note on `gcState`).
+//
+// UNLOCKED AND NON-REENTRANT, and that is sound here in a way it would not be
+// anywhere else in this file: the only writer never returns. `bit_rt_panic`
+// exits the process, so no second caller can observe a half-filled buffer and
+// there is no window for one to interleave.
+let boundsMsg: [6]i64
+
+// Which of the three messages to report. ONE ARGUMENT, SELECTED INSIDE, NOT FIVE
+// PACKED WORDS PASSED IN, and the reason is measured rather than stylistic.
+//
+// `bit_rt_slice_get` is the hottest symbol in the language — every `xs[i]` in
+// every program is a call to it. The first draft of this fix passed the words as
+// arguments through a per-message wrapper; `compiler/optinline.bit`'s 8-instruction
+// budget then spliced that wrapper into `rtSliceGet`, so its cold branch
+// materialized five 64-bit immediates (`movk` x3 apiece) inside the hot function.
+// That is what the cost showed up as: with a call anywhere in the body regalloc
+// promotes the function's values to CALLEE-SAVED registers, and the extra live
+// constants took the saved set from x29/x30 to x19-x27 — the frame grew 0x10 ->
+// 0x60 and the prologue from 2 stores to 11, on the FAST path, which pays for a
+// panic it never takes. Measured at +8% on a pure-index loop.
+//
+// Selecting on a small immediate keeps the whole cold path out of line: the guard
+// branch is now `mov` of one constant plus a `bl`, and the words are materialized
+// in a function that is about to exit the process anyway.
+const oobIndex: int = 0
+const oobSliceRange: int = 1
+const oobStringRange: int = 2
+
+// Report the `kind` message and abort. NEVER RETURNS.
+//
+// Writes all four text words unconditionally — a short message zero-pads, and
+// `nbytes` is what bounds the kernel write, so the padding is never emitted.
+// Four stores are cheaper than branching on the length on a path that is about
+// to make a syscall and exit.
+//
+// An unrecognised `kind` cannot happen (all three callers pass a const above),
+// and reports `index out of range` rather than asserting: this is the panic path,
+// and a wrong message beats a second panic inside the first.
+@nosplit function panicBounds(kind: int) {
+  let w0 = idxOobWord0
+  let w1 = idxOobWord1
+  let w2 = idxOobWord2
+  let w3 = 0
+  let nbytes = idxOobLen
+  if (kind == oobSliceRange) {
+    w0 = slcOobWord0
+    w1 = slcOobWord1
+    w2 = slcOobWord2
+    w3 = slcOobWord3
+    nbytes = slcOobLen
+  } else if (kind == oobStringRange) {
+    w0 = strOobWord0
+    w1 = strOobWord1
+    w2 = strOobWord2
+    w3 = strOobWord3
+    nbytes = strOobLen
+  }
+  let base = int(ptrOf(boundsMsg))
+  let text = base + strHeaderSize
+  storeWord(base + strPtr, text)
+  storeWord(base + strLen, nbytes)
+  storeWord(text + 0, w0)
+  storeWord(text + 8, w1)
+  storeWord(text + 16, w2)
+  storeWord(text + 24, w3)
+  bit_rt_panic(base)
+}
+
+// ---------------------------------------------------------------------------
 // Slices (ABI.md §2)
 // ---------------------------------------------------------------------------
 
@@ -94,21 +247,25 @@ function rtSliceAppend(hIn: int, word: int, isRef: int): int {
   return h
 }
 
-// `bit_rt_slice_get`: bounds-checked element read. A panic is the natural
-// answer out of range;
-// see constraint 3 — `ok` is reported through `rtSliceInBounds` for a caller that
-// must distinguish, and the value reads 0.
+// `bit_rt_slice_get`: bounds-checked element read. OUT OF RANGE PANICS (SPEC
+// §12.6, #2014). `rtSliceInBounds` below is still the predicate for a caller
+// that must ask rather than fault.
 //
 // A null header (a zeroed struct's slice field, #1564/#1570) has LENGTH 0, so
-// every index is out of range — the identical answer an empty slice gives, and
-// the same one `runtime/root/` reaches by panicking on both.
+// every index is out of range and panics — the identical answer an empty slice
+// gives, and the same one `runtime/root/` reached by `fatal("index out of range")`.
+//
+// The `return 0` after each panic is unreachable: Bit has no `noreturn`, so the
+// type checker still wants a value on that path.
 export @nosplit @symbol("bit_rt_slice_get")
 function rtSliceGet(h: int, index: int): int {
   if (h == 0) {
+    panicBounds(oobIndex)
     return 0
   }
   let vlen = loadWord(h + slcLen)
   if (index < 0 || index >= vlen) {
+    panicBounds(oobIndex)
     return 0
   }
   let off = loadWord(h + slcOff)
@@ -117,13 +274,17 @@ function rtSliceGet(h: int, index: int): int {
   return w
 }
 
-// Whether `index` is a legal element of `h`. The predicate the bounds check
-// panics on, exposed so the panic can be raised by the layer that owns the
-// write path (SEAM 3) rather than swallowed here.
+// Whether `index` is a legal element of `h`. The same predicate `rtSliceGet` and
+// `rtSliceSet` panic on, exposed for a caller that must ASK instead of faulting.
 //
-// A null header is length 0, so NO index is in bounds — which is exactly how the
-// caller that owns the panic learns that indexing a zeroed struct's slice field
-// must fault, matching `runtime/root/`'s `fatal("index out of range")` on null.
+// It was once exported so "the layer that owns the write path" could raise the
+// panic these two swallowed; that caller was never written and the panic is now
+// raised here, where the predicate already is (#2014). Nothing in `compiler/`
+// references `slice_in_bounds`, so this has no in-tree caller today — it stays
+// because a bounds question with no answer is worse than an unused entry point,
+// and because removing an exported ABI symbol is not this fix's business.
+//
+// A null header is length 0, so NO index is in bounds.
 export @nosplit @symbol("bit_rt_slice_in_bounds")
 function rtSliceInBounds(h: int, index: int): bool {
   if (h == 0) {
@@ -133,18 +294,21 @@ function rtSliceInBounds(h: int, index: int): bool {
   return index >= 0 && index < vlen
 }
 
-// `bit_rt_slice_set`: bounds-checked element write. Out of range is a no-op
-// (constraint 3); `rtSliceInBounds` is the check a caller raises on.
+// `bit_rt_slice_set`: bounds-checked element write. OUT OF RANGE PANICS (SPEC
+// §12.6, #2014), where it used to be a silent no-op — the worse half of the pair,
+// since a dropped write leaves the program reading a stale value it believes it
+// has just replaced.
 //
-// Null is the length-0 case again: no index is writable, so the write is
-// dropped rather than stored through null.
+// Null is the length-0 case again: no index is writable, so every index panics.
 export @nosplit @symbol("bit_rt_slice_set")
 function rtSliceSet(h: int, index: int, word: int) {
   if (h == 0) {
+    panicBounds(oobIndex)
     return
   }
   let vlen = loadWord(h + slcLen)
   if (index < 0 || index >= vlen) {
+    panicBounds(oobIndex)
     return
   }
   let off = loadWord(h + slcOff)
@@ -154,24 +318,30 @@ function rtSliceSet(h: int, index: int, word: int) {
 
 // `bit_rt_slice_slice`: `s[lo:hi]` (SPEC §12.6). SHARES `s`'s buffer; the new
 // view is `buf[off+lo .. off+hi]` with capacity extending to the old end
-// (`cap - lo`, Go semantics). Returns 0 unless `0 <= lo <= hi <= cap`.
+// (`cap - lo`, Go semantics). PANICS unless `0 <= lo <= hi <= cap` (#2014, where
+// it used to hand back 0 — which reads as an empty slice, so `xs[0:99]` silently
+// became `[]` and every element the caller expected simply vanished).
 //
 // A null header (#1564/#1570) is the empty slice: capacity 0, so `[0:0]` is the
 // ONLY in-bounds reslice of it. Its result is a FRESH empty slice, never a view
 // onto a shared body — the same rule `rtSliceAppend` obeys, and for the same
-// reason (a later `append` grows a view's header in place). Any other range is
-// out of bounds and returns 0, which is this port's form of `runtime/root/`'s
-// `fatal("slice bounds out of range")` (constraint 3).
+// reason (a later `append` grows a view's header in place). Any other range
+// panics, exactly as `runtime/root/`'s `fatal("slice bounds out of range")` did.
+//
+// The `nh == 0` exit below is EXHAUSTION, not a bounds violation, and stays a 0
+// return under constraint 3: the range was legal and the heap could not honour it.
 export @nosplit @symbol("bit_rt_slice_slice")
 function rtSliceSlice(h: int, lo: int, hi: int): int {
   if (h == 0) {
     if (lo != 0 || hi != 0) {
+      panicBounds(oobSliceRange)
       return 0
     }
     return rtSliceNew(0, 0, 0)
   }
   let vcap = loadWord(h + slcCap)
   if (lo < 0 || lo > hi || hi > vcap) {
+    panicBounds(oobSliceRange)
     return 0
   }
   let g = wordAt(gcAddr)
