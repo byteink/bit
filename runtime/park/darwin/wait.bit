@@ -72,6 +72,31 @@ function eTimedOut(): int { return 60 }
 
 function nsPerSec(): int { return 1000000000 }
 
+// The {numer, denom} pair `mach_timebase_info` reports, cached (#2318): it is a
+// per-MACHINE constant fixed at boot — the kernel does not change a running
+// process's tick rate — so querying it again on every call bought nothing but
+// a `[]i64(1)` heap slice on every one of them. `parkMonoNs` is `schedFindWorkAt`'s
+// clock argument, called on EVERY turn of EVERY worker's find-work loop, so
+// under real lock contention (many workers looping rapidly rather than sitting
+// parked) this fired millions of times over a program's life; each call
+// allocated and immediately discarded a ~40-byte object the collector had to
+// sweep. `tbNumer == 0` is the "not yet queried" sentinel: a real timebase
+// ratio is never zero (checked below before it is trusted).
+//
+// RACING INITIALIZERS ARE HARMLESS, deliberately not guarded by a lock: every
+// racing OS thread queries the SAME machine-wide constant and would write the
+// SAME values, so the worst a race costs is one redundant syscall, never a
+// wrong answer — the same "stale hint, never wrong" argument `gcworld.bit`'s
+// `mutHintSlot` makes for the identical reason.
+let tbNumer: int = 0
+let tbDenom: int = 0
+
+// Scratch for the one-time (per racing thread, at most) `mach_timebase_info`
+// call — module-level rather than a fresh slice for the same reason `tbNumer`/
+// `tbDenom` are module-level: the value it produces is idempotent, so sharing
+// it across callers costs nothing.
+let tbScratch: [1]i64
+
 // Monotonic clock in nanoseconds — `runtime/sched/`'s `monoNs()` on the Darwin
 // branch.
 //
@@ -86,20 +111,24 @@ function nsPerSec(): int { return 1000000000 }
 // failure report rather than handing back unscaled ticks that would look like a
 // plausible but wildly wrong duration.
 export @symbol("bit_rt_port_park_mono_ns") function parkMonoNs(): int {
-  let tb = []i64(1)
-  tb[0] = 0
-  let rc = int(mach_timebase_info(ptrOf(tb)))
-  if (rc != 0) {
-    return 0
+  if (tbNumer == 0) {
+    let scratch = ptrOf(tbScratch)
+    *(scratch + 0) = 0
+    let rc = int(mach_timebase_info(scratch))
+    if (rc != 0) {
+      return 0
+    }
+    // Split the packed pair: numer is the low 32 bits, denom the high 32.
+    let word = int(*(scratch + 0))
+    let numer = word % 4294967296
+    let denom = word / 4294967296
+    if (numer <= 0 || denom <= 0) {
+      return 0
+    }
+    tbNumer = numer
+    tbDenom = denom
   }
-  // Split the packed pair: numer is the low 32 bits, denom the high 32.
-  let word = int(tb[0])
-  let numer = word % 4294967296
-  let denom = word / 4294967296
-  if (numer <= 0 || denom <= 0) {
-    return 0
-  }
-  return int(mach_absolute_time()) * numer / denom
+  return int(mach_absolute_time()) * tbNumer / tbDenom
 }
 
 // Sleep the calling OS thread for at least `ns` nanoseconds.
@@ -107,20 +136,39 @@ export @symbol("bit_rt_port_park_mono_ns") function parkMonoNs(): int {
 // THIS IS THE CURRENT PARK PRIMITIVE — `runtime/sched/`'s `sleepNs`, which
 // `Worker.run` calls with the backoff delay. See the Linux provider's twin for
 // why a non-positive request is a no-op and why EINTR is not restarted.
-export @symbol("bit_rt_port_park_sleep_ns") function parkSleepNs(ns: int) {
+// `scratch` addresses (at least) 2 words the CALLER owns, to build the
+// `timespec` this hands the kernel — the caller-owned-block pattern every
+// other runtime structure here uses (`mem.bit`'s reserve, `sched`'s task and
+// worker blocks), and forced by the same rule: `ptrOf` requires a slice or
+// module-level state (E0053), never a function-local, so this cannot carve
+// its own two words without either heap-allocating them or naming module
+// state a second concurrent caller could collide with.
+//
+// THIS USED TO BE `let req = []i64(2)` (#2318): a fresh heap slice on every
+// call. `parkSleepNs` is worker 0's idle-backoff primitive — the ONE call
+// site `workerBody` reaches on every turn that finds no runnable task — so
+// under real contention (`BIT_WORKERS` > 1, where a lock's slow path is
+// actually reachable) it fires millions of times over a program's life.
+// Measured on the `std/sync` RWMutex `rLock`/`rUnlock` repro (#2318's own):
+// 640k contended acquisitions produced over two million calls here, each
+// allocating and immediately discarding a 48-byte object. The GC reclaimed
+// every one (`live` stayed near zero) but the allocation volume kept
+// touching spans that a `BIT_WORKERS=1` run — where this path is never
+// reached because the fast path always wins — never approached, which is
+// why RSS ratcheted up under contention and nowhere else.
+export @symbol("bit_rt_port_park_sleep_ns") function parkSleepNs(ns: int, scratch: *i64) {
   if (ns <= 0) {
     return
   }
-  let req = []i64(2)
-  req[0] = i64(ns / nsPerSec())
-  req[1] = i64(ns % nsPerSec())
+  *(scratch + 0) = i64(ns / nsPerSec())
+  *(scratch + 1) = i64(ns % nsPerSec())
   let none: *i64 = nil
   // The result is deliberately discarded, and the binding that used to hold it
   // is gone because it tripped E0211 (declared, never used) — a warning this
   // repo treats as build-breaking. EINTR is NOT restarted here (see the Linux
   // twin): a short sleep is harmless to every caller, all of which re-check
   // their own condition on the next pass.
-  nanosleep(ptrOf(req), none)
+  nanosleep(scratch, none)
 }
 
 // Block while the 32-bit word at `p` still holds `expected`, for at most
