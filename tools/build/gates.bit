@@ -18,6 +18,12 @@ struct Gate {
   name: string
   argv: []string
   env: []string
+  // Asserts on wall-clock or memory rather than a fixed expected result, so a
+  // co-scheduled neighbour changes the number it reports (#2400, #2401, #2210).
+  // Defaults false; set true on exactly the five gates that need the machine
+  // to itself. `runAll` (main.bit) keeps these out of the concurrent batch and
+  // runs them alone, afterwards.
+  exclusive: bool
 }
 
 // Absolute, because several harnesses generate a wrapper that `cd`s elsewhere
@@ -131,14 +137,14 @@ function gateTableA(): []Gate {
     Gate{name: "test-fsblock", argv: runArgs("tests/bit/fsblock.bit"),
       env: ["BIT_SELF_EXE=${bitBin()}", std]},
     Gate{name: "test-lsp-lifecycle", argv: runArgs("tests/bit/lsplifecycle.bit"),
-      env: ["BIT_SELF_EXE=${bitBin()}", std]},
+      env: ["BIT_SELF_EXE=${bitBin()}", std], exclusive: true},
     Gate{name: "test-lsp-resolve", argv: runArgs("tests/bit/lspresolve.bit"),
-      env: ["BIT_SELF_EXE=${bitBin()}", std]},
+      env: ["BIT_SELF_EXE=${bitBin()}", std], exclusive: true},
     // #2326/#2348. Measures ALLOCATION, not RSS, and compares two arms of one
     // run against each other rather than an absolute count — see the header of
     // tests/bit/lspcache.bit for why either alternative cannot work here.
     Gate{name: "test-lsp-cache", argv: runArgs("tests/bit/lspcache.bit"),
-      env: ["BIT_SELF_EXE=${bitBin()}", std]},
+      env: ["BIT_SELF_EXE=${bitBin()}", std], exclusive: true},
     Gate{name: "test-pathresolve", argv: runArgs("tests/bit/pathresolve.bit"), env: [std]},
     Gate{name: "test-pmimports", argv: runArgs("tests/bit/pmimports.bit"),
       env: ["BIT_STDLIB_UNDER_TEST=${stdlibRoot()}"]},
@@ -165,8 +171,8 @@ function gateTableA(): []Gate {
     Gate{name: "test-fuzz", argv: runArgs("tests/bit/fuzz.bit"),
       env: ["BIT_FUZZ_BIN=${bitBin()}", "BIT_FUZZ_CASES=${repoRoot()}/tests/cases",
         "BIT_FUZZ_CRASHES=${repoRoot()}/tests/fuzz/crashes",
-        "BIT_FUZZ_SECONDS=5", "BIT_FUZZ_SEED=1", std]},
-    Gate{name: "test-stress", argv: runArgs("tests/bit/stress.bit"), env: [std]},
+        "BIT_FUZZ_SECONDS=5", "BIT_FUZZ_SEED=1", std], exclusive: true},
+    Gate{name: "test-stress", argv: runArgs("tests/bit/stress.bit"), env: [std], exclusive: true},
   ]
 }
 
@@ -189,6 +195,13 @@ function gateTableB(): []Gate {
       env: [std]},
     Gate{name: "test-selfcheck", argv: ["selfcheck"], env: [std]},
     Gate{name: "test-selfhostcheck", argv: ["check", "${repoRoot()}/compiler"], env: [std]},
+    // #2416. BIT_REPO IS REQUIRED: the harness refuses rather than default to
+    // "." and rebuild whatever directory it happened to be invoked from — see
+    // the header of tests/bit/coldboot.bit. Not in `gateNames()`
+    // (tools/build/defs.bit), so `test` never runs it; `./make test-coldboot`
+    // does.
+    Gate{name: "test-coldboot", argv: runArgs("tests/bit/coldboot.bit"),
+      env: [std, "BIT_REPO=${repoRoot()}"]},
   ]
 }
 
@@ -248,17 +261,12 @@ function gatePrereqsReady(): bool {
   return true
 }
 
-function runGate(name: string): int {
-  let (g, ok) = findGate(name)
-  if (!ok) {
-    eprint("make: step '${name}' is not implemented yet\n")
-    return 1
-  }
-  if (!gatePrereqsReady()) {
-    return 1
-  }
-
-  let script = "set -e\n"
+// The env-export preamble plus the final `exec` line, shared by the single-
+// gate path below and the concurrent batch unit further down — one
+// definition of "how a Gate becomes a shell command" so the two paths cannot
+// drift apart.
+function gateEnvExecScript(g: Gate): string {
+  let script = ""
   for kv of g.env {
     let eq = indexOfByte(kv, '=')
     if (eq < 0) {
@@ -276,9 +284,19 @@ function runGate(name: string): int {
   for a of g.argv {
     script = script + " " + shQuote(a)
   }
-  script = script + "\n"
+  return script + "\n"
+}
 
-  let rc = runShell(name, script, gateTimeoutMs())
+function runGate(name: string): int {
+  let (g, ok) = findGate(name)
+  if (!ok) {
+    eprint("make: step '${name}' is not implemented yet\n")
+    return 1
+  }
+  if (!gatePrereqsReady()) {
+    return 1
+  }
+  let rc = runShell(name, "set -e\n" + gateEnvExecScript(g), gateTimeoutMs())
   return reportGate(name, rc)
 }
 
@@ -315,6 +333,196 @@ function reportGate(name: string, rc: int): int {
     return 1
   }
   return 0
+}
+
+// --- concurrent batch (#2434) ------------------------------------------------
+//
+// `main.bit`'s `runAll` hands a run of consecutive non-`exclusive` gate names
+// here instead of calling `runGate` on each in turn. The parallelism lives
+// entirely in the shell, not in Bit: `osRunBounded` (runtime/root/*/os.bit)
+// polls with a raw, `@nosplit` `nanosleep` and never yields, so a spawned Bit
+// green thread would never get scheduled until it returned — one gate at a
+// time, exactly like today, just with extra machinery. See #2434's ticket for
+// why `spawn` and a new runtime primitive were both ruled out.
+//
+// One composed script launches every gate in the chunk backgrounded with its
+// own private killer, each redirected to its own file under `batchDir()`, and
+// `wait`s for all of them. Reporting happens back here, from those files, in
+// the same `order` position the caller passed them in — never through a pipe,
+// and never while two gates could still be racing to write the same fd.
+
+function isExclusiveGate(name: string): bool {
+  let (g, ok) = findGate(name)
+  return ok && g.exclusive
+}
+
+// Reused across every chunk in one `./make` run: redirection truncates each
+// gate's own file at launch, and no two gates in a chunk share a name, so
+// there is nothing to clean between chunks. Lives under the driver's existing
+// scratch area (bit-out/make already holds the fp stamps and run-<name>.sh
+// wrappers), not a fresh `mktemp -d` — that path would only be known inside
+// the child shell, and the Bit code on this side of `runShell` is what has to
+// read it back.
+function batchDir(): string { return "bit-out/make/gatebatch" }
+
+// No new runtime primitive (#2152's lesson applies here too): core count
+// comes from the shell, the same round-trip `hostTriple()` already uses.
+// `nproc` covers Linux; `sysctl -n hw.ncpu` is the Darwin fallback.
+function numCPUs(): int {
+  let outPath = "bit-out/make/ncpu"
+  let script = "{ nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null; } > " + shQuote(outPath) + "\n"
+  if (runShell("ncpu", script, buildTimeoutMs()) != 0) {
+    return 1
+  }
+  let n = parseIntOr(trimNewline(readFile(outPath) catch ""), 0)
+  if (n < 1) {
+    return 1
+  }
+  return n
+}
+
+// Cores minus 2 (headroom for the OS and this driver itself), floor 1.
+// BIT_MAKE_JOBS overrides directly; =1 is the escape hatch back to today's
+// strict serial order and this ticket's own A/B control.
+function makeJobs(): int {
+  let s = envOr("BIT_MAKE_JOBS", "")
+  if (s == "") {
+    let n = numCPUs() - 2
+    if (n < 1) {
+      return 1
+    }
+    return n
+  }
+  let n = parseIntOr(s, 1)
+  if (n < 1) {
+    return 1
+  }
+  return n
+}
+
+// `gateTimeoutMs()` bounds one `osRunBounded` call today; in a batch that call
+// wraps the WHOLE chunk, so it would silently bound every gate in it by the
+// slowest one's budget shared across all of them. Each gate instead gets its
+// own killer inside the script (macOS ships no `timeout(1)`, hence
+// `sleep`+`kill -9`), and this outer bound becomes a backstop only: generous
+// slack over the same per-gate budget, since the gates run concurrently, not
+// stacked end to end.
+function batchOuterTimeoutMs(): int { return gateTimeoutMs() + 60000 }
+
+// One gate's slot inside the batch: backgrounded so N of these overlap, each
+// with its own deadline. The `.timedout` marker is written by the killer
+// BEFORE it sends `kill -9`, strictly before `wait "$GPID"` in the same slot
+// can observe the death — so reading it back afterward can never race, and it
+// is what lets a per-gate timeout still read as "TIMED OUT" instead of
+// "CRASHED — killed by signal 9" (`runGateChunk` below).
+function gateBatchUnit(g: Gate, dir: string, timeoutS: string): string {
+  let outFile = shQuote(dir + "/" + g.name + ".out")
+  let rcFile = shQuote(dir + "/" + g.name + ".rc")
+  let toFile = shQuote(dir + "/" + g.name + ".timedout")
+  return "(\n" +
+    "(\n" + gateEnvExecScript(g) + ") > " + outFile + " 2>&1 &\n" +
+    "GPID=$!\n" +
+    "( sleep " + timeoutS + "; : > " + toFile + "; kill -9 \"$GPID\" 2>/dev/null ) &\n" +
+    "KPID=$!\n" +
+    "wait \"$GPID\"\n" +
+    "RC=$?\n" +
+    "kill \"$KPID\" 2>/dev/null\n" +
+    "echo \"$RC\" > " + rcFile + "\n" +
+    ") &\n"
+}
+
+// One `osRunBounded`, N backgrounded gates, one `wait` — the whole chunk.
+function batchScript(chunk: []Gate, dir: string): string {
+  let timeoutS = "${gateTimeoutMs() / 1000}"
+  let script = ""
+  for g of chunk {
+    script = script + gateBatchUnit(g, dir, timeoutS)
+  }
+  return script + "wait\n"
+}
+
+// Runs one concurrent chunk (at most `makeJobs()` gates, none `exclusive`) and
+// reports every one of them in `chunk` position, so output never interleaves
+// and a run's `make: FAILED:` line is deterministic regardless of which gate
+// actually finished first.
+function runGateChunk(chunk: []Gate): []string {
+  let failed = []string(0)
+  if (len(chunk) == 0) {
+    return failed
+  }
+  if (!gatePrereqsReady()) {
+    for g of chunk {
+      failed = append(failed, g.name)
+    }
+    return failed
+  }
+  let dir = batchDir()
+  if (!ensureDir(dir)) {
+    eprint("make: cannot create ${dir}\n")
+    for g of chunk {
+      failed = append(failed, g.name)
+    }
+    return failed
+  }
+  let outerRc = runShell("gatebatch", batchScript(chunk, dir), batchOuterTimeoutMs())
+  for g of chunk {
+    print("make: ${g.name}\n")
+    let rcPath = "${dir}/${g.name}.rc"
+    print(readFile("${dir}/${g.name}.out") catch "")
+    if (!exists(rcPath)) {
+      // The batch's own outer backstop fired before this gate's slot got to
+      // write its rc — attribute the outer failure to it rather than going
+      // silent on it.
+      if (reportGate(g.name, outerRc) != 0) {
+        failed = append(failed, g.name)
+      }
+      continue
+    }
+    let rc = parseIntOr(trimNewline(readFile(rcPath) catch ""), 0 - 1)
+    if (exists("${dir}/${g.name}.timedout")) {
+      rc = 0 - 2
+    }
+    if (reportGate(g.name, rc) != 0) {
+      failed = append(failed, g.name)
+    }
+  }
+  return failed
+}
+
+// Splits `names` (all gates, none `exclusive`) into consecutive chunks of at
+// most `makeJobs()` and runs them one chunk after another. At `BIT_MAKE_JOBS=1`
+// every chunk holds exactly one gate, which is today's serial order exactly —
+// the A/B control #2434 asks for.
+function runGateBatch(names: []string): []string {
+  let failed = []string(0)
+  if (len(names) == 0) {
+    return failed
+  }
+  let jobs = makeJobs()
+  let i = 0
+  while (i < len(names)) {
+    let end = i + jobs
+    if (end > len(names)) {
+      end = len(names)
+    }
+    let chunk = []Gate(0)
+    let j = i
+    while (j < end) {
+      let (g, ok) = findGate(names[j])
+      if (!ok) {
+        eprint("make: step '${names[j]}' is not implemented yet\n")
+        failed = append(failed, names[j])
+      } else {
+        chunk = append(chunk, g)
+      }
+      j = j + 1
+    }
+    for f of runGateChunk(chunk) {
+      failed = append(failed, f)
+    }
+    i = end
+  }
+  return failed
 }
 
 // `./make fuzz [-- <seconds> [seed]]` — the open-ended run, as opposed to the

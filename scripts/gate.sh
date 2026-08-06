@@ -20,9 +20,22 @@
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
 # tests/cases/, examples/, stdlib/ runs only that area's minimal steps. A
-# change touching any OTHER path (tools/build/, spec/, docs/, or
-# anything else unlisted), or spanning MORE THAN ONE of those five areas, is
-# ambiguous and always runs the full `./make test` — never a partial skip.
+# change touching any OTHER path (spec/, docs/, or anything else unlisted),
+# or spanning MORE THAN ONE of those five areas, is ambiguous and always runs
+# the full `./make test` — never a partial skip.
+#
+# TWO NARROW EXCEPTIONS (#2435), because registering a gate is mandatory in
+# this repo and otherwise forces `full` on every single ticket that adds one:
+#   - tests/bit/** joins whichever of the five areas also changed, instead of
+#     forcing `full` on its own. If tests/bit/** is the ONLY thing that
+#     changed, the gates whose `Gate.argv` names each changed file run —
+#     nothing more — or `full` if any changed file cannot be mapped that way.
+#   - tools/build/defs.bit and tools/build/gates.bit are the same case only
+#     when the change is PURELY new `Step{}`/`Gate{}` registration: no edit to
+#     an existing entry, no edit to any function body. See
+#     `is_additive_registration` below for exactly what that means. Any other
+#     tools/build/** file, or any non-additive change to these two, still
+#     forces `full` — that code is the driver every step runs under.
 #
 # selfhost and examples pull in a non-`./make` diff script
 # (selfhost-diffcheck.sh/selfhost-fixpoint.sh, selfhost-diffexamples.sh).
@@ -96,9 +109,128 @@ has_runtime=0
 has_testcases=0
 has_examples=0
 has_stdlib=0
+has_testsbit=0
 has_other=0
 other_list=""
 touched_list=""
+testsbit_list=""
+
+# Extracts the gate name(s) whose `Gate.argv` literally names path `$1`, by
+# grepping the source rather than building anything — `runArgs("<path>")` is
+# how every harness-running gate spells its target in tools/build/gates.bit.
+# Prints nothing for a path that isn't named that way (a case-data file under
+# tests/bit/checkercases/ or tests/bit/parsercases/, say, which a gate reaches
+# through an env var, not argv) — the caller treats empty as ambiguous.
+gates_for_file() {
+  grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
+    sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' || true
+}
+
+# Space-joined, de-duplicated union of `gates_for_file` over every path in
+# space-separated `$1`. Prints "" the moment ANY path fails to map to a gate —
+# a partial guess is worse than `full`, so one unmapped file poisons the set.
+testsbit_steps_for() {
+  local files="$1" out="" g gg
+  for f in ${files}; do
+    g="$(gates_for_file "${f}")"
+    if [ -z "${g}" ]; then
+      printf ''
+      return 0
+    fi
+    for gg in ${g}; do
+      case " ${out} " in
+        *" ${gg} "*) ;;
+        *) out="${out:+${out} }${gg}" ;;
+      esac
+    done
+  done
+  printf '%s' "${out}"
+}
+
+# Trims a struct-literal-shaped diff hunk `$1` (one field's worth of added
+# lines, `+` already stripped, comment/blank lines allowed anywhere) down to
+# its first and last non-comment, non-blank line, and requires the first to
+# open a NEW entry (starts with `$2`, e.g. `Step{name:`) and the last to close
+# one (ends with `}` or `},`). A hunk of comments only (no entry at all) is
+# harmless and passes. This is a shape check, not a parser: it cannot see a
+# rogue line planted in the MIDDLE of a genuinely new multi-line entry, and it
+# does not need to — the earlier all-additions check plus this shape are
+# together the mechanical proxy #2435 asks for, and anything they cannot
+# clear falls through to `full` via `is_additive_registration`'s caller.
+hunk_is_safe() {
+  local block="$1" prefix="$2"
+  local first="" last="" t
+  while IFS= read -r l; do
+    t="$(printf '%s' "${l}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "${t}" ] && continue
+    case "${t}" in
+      //*) continue ;;
+    esac
+    [ -z "${first}" ] && first="${t}"
+    last="${t}"
+  done <<EOF
+${block}
+EOF
+  [ -z "${first}" ] && return 0
+  case "${first}" in
+    "${prefix}"*) ;;
+    *) return 1 ;;
+  esac
+  case "${last}" in
+    *"},"|*"}") ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# True only if every change to `$1` (tools/build/defs.bit or
+# tools/build/gates.bit), across the commit range AND the working tree —
+# same three sources CHANGED itself was built from, since a file can carry
+# changes in more than one of them at once — is a bare addition of whole new
+# `Step{}`/`Gate{}` entries: zero removed lines, and every added block either
+# is comment/blank-only or opens and closes exactly one (or more) new entry.
+# Editing an existing entry always removes its old line first, so it is
+# caught by the deletion check alone; inserting a statement into an existing
+# function body without deleting anything is caught by the shape check,
+# because that block does not open with `Step{name:`/`Gate{name:}`.
+is_additive_registration() {
+  local file="$1" diff prefix
+  case "${file}" in
+    tools/build/defs.bit) prefix="Step{name:" ;;
+    tools/build/gates.bit) prefix="Gate{name:" ;;
+    *) return 1 ;;
+  esac
+  diff="$(
+    { git diff -U0 "${RANGE}" -- "${file}"
+      git diff -U0 -- "${file}"
+      git diff --cached -U0 -- "${file}"
+    } 2>/dev/null
+  )" || true
+  [ -z "${diff}" ] && return 0
+
+  local block="" saw_hunk=0
+  while IFS= read -r line; do
+    case "${line}" in
+      "diff --git "*|"index "*|"--- "*|"+++ "*) continue ;;
+      @@*)
+        if [ "${saw_hunk}" -eq 1 ]; then
+          hunk_is_safe "${block}" "${prefix}" || return 1
+        fi
+        block=""
+        saw_hunk=1
+        ;;
+      -*) return 1 ;;
+      +*) block="${block}${line#+}"$'\n' ;;
+      *) continue ;;
+    esac
+  done <<EOF
+${diff}
+EOF
+  if [ "${saw_hunk}" -eq 1 ]; then
+    hunk_is_safe "${block}" "${prefix}" || return 1
+  fi
+  return 0
+}
 
 while IFS= read -r f; do
   case "${f}" in
@@ -107,6 +239,26 @@ while IFS= read -r f; do
     tests/cases/*) has_testcases=1 ;;
     examples/*) has_examples=1 ;;
     stdlib/*) has_stdlib=1 ;;
+    tests/bit/*)
+      has_testsbit=1
+      if [ -n "${testsbit_list}" ]; then
+        testsbit_list="${testsbit_list} ${f}"
+      else
+        testsbit_list="${f}"
+      fi
+      ;;
+    tools/build/defs.bit|tools/build/gates.bit)
+      if is_additive_registration "${f}"; then
+        :
+      else
+        has_other=1
+        if [ -n "${other_list}" ]; then
+          other_list="${other_list}, ${f}"
+        else
+          other_list="${f}"
+        fi
+      fi
+      ;;
     *)
       has_other=1
       if [ -n "${other_list}" ]; then
@@ -159,9 +311,25 @@ elif [ "${has_testcases}" -eq 1 ]; then
 elif [ "${has_examples}" -eq 1 ]; then
   BUCKET="examples"
   REASON="only examples/** changed"
-else
+elif [ "${has_stdlib}" -eq 1 ]; then
   BUCKET="stdlib"
   REASON="only stdlib/** changed"
+elif [ "${has_testsbit}" -eq 1 ]; then
+  testsbit_steps="$(testsbit_steps_for "${testsbit_list}")"
+  if [ -z "${testsbit_steps}" ]; then
+    BUCKET="full"
+    REASON="tests/bit/** changed but at least one file could not be mapped to a gate by name — falling through to full"
+  else
+    BUCKET="testsbit"
+    REASON="only tests/bit/** changed (gate(s): ${testsbit_steps})"
+  fi
+else
+  # Nothing in the five buckets or tests/bit/** changed, has_other is 0, and
+  # CHANGED is non-empty — the only way here is a purely-additive
+  # tools/build/defs.bit/gates.bit registration with no accompanying harness
+  # or source change. Nothing to scope narrowly against, so full.
+  BUCKET="full"
+  REASON="only additive tools/build/** registration changed; nothing left to scope against"
 fi
 
 # BUILD_STEPS is always a non-empty literal array, assigned per bucket below —
@@ -225,6 +393,15 @@ case "${BUCKET}" in
   stdlib)
     BUILD_STEPS=(test-imports-bit test-stdlib-docs)
     ;;
+  testsbit)
+    # Populated from `testsbit_steps`, which the bucket-selection above
+    # already guaranteed is non-empty before choosing this bucket — so this
+    # never assigns the empty array the header comment above warns about.
+    BUILD_STEPS=()
+    for s in ${testsbit_steps}; do
+      BUILD_STEPS+=("${s}")
+    done
+    ;;
 esac
 
 # `full` REPLACES a bucket whenever the change spans more than one or touches
@@ -242,7 +419,7 @@ esac
 # a renamed script is the #1593 class of silent hole.
 bucket_scripts full
 FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
-for b in full selfhost runtime testcases examples stdlib; do
+for b in full selfhost runtime testcases examples stdlib testsbit; do
   bucket_scripts "${b}"
   for s in ${BUCKET_PRE} ${BUCKET_POST}; do
     [ -f "${s}" ] || {
