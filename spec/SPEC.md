@@ -2537,10 +2537,20 @@ signatures:
 function main() { ... }          // exit code 0 on normal return
 function main(): int { ... }     // returned int is the process exit code
 function main(): ()! { ... }     // a returned error prints to stderr, exit code 1
+function main(): int! { ... }    // on ok the int is the exit code; on error, as above
 ```
 
 `main` takes no parameters; command-line arguments and environment are read via
 the standard library (`std/os`). A non-executable (library) module has no `main`.
+
+These four are the **only** permitted signatures, and the rule is enforced at
+check time: a `main` that declares a parameter, or whose result type is anything
+but `int` or nothing (with or without `!`), is rejected with **E0085**. Since
+`int` is `i64` (§5.3), `main(): i64` is the same declaration as `main(): int`;
+`uint`, `i32`, `f64`, `bool` and `string` are not among the permitted forms. The
+rule applies to the root module's own `main` only — a method named `main`, a
+`main` in a library module, and a `main` whose symbol is pinned elsewhere with
+`@symbol` (§11.9) are ordinary functions and are not entry points.
 
 `bit build --emit-obj` (`-c`) stops at a **relocatable object** instead of an
 executable. An object is not a program, so it requires no `main` and gets no
