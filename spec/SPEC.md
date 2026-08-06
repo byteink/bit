@@ -1816,6 +1816,14 @@ defer_stmt    = "defer" call_expression .
   result type exactly.
 - A `member` lhs must select a **struct field**. A tuple element (`t.0`) is
   read-only (§12.5) and is not a valid assignment target.
+- A `switch` with a subject runs the first case one of whose labels **compares
+  equal to the subject with `==`** — the operator of §14.6, not an identity test.
+  So a `string` label matches by byte contents, a struct label field-wise, a
+  tuple label element-wise, and a float label with float equality; the subject
+  type must be comparable, and every label must be assignable to it. Cases are
+  tested in source order and their labels left to right; a label is evaluated only
+  if no earlier one matched. A subject-less `switch` instead tests each label as a
+  `bool` condition. Unmatched, control goes to `default` if present.
 - A `tuple_pat` lhs destructures a tuple-typed right-hand side positionally, or
   reads one of the two-result forms (`m[k]`, `<- c`, `iface.(T)`, §12.6/§16/§14.7).
   Its arity must match: a two-result form binds exactly two names, and a
