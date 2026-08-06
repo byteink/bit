@@ -1,0 +1,114 @@
+// #1830 regression: `schedSpawn` must place a task on a queue THE SCHEDULER IT
+// WAS PASSED owns, never on whichever worker the calling STACK happens to be on.
+//
+// THE DEFECT, IN ONE LINE. `runtime/sched/worker.bit`'s `schedSpawn(s, task)`
+// takes a local-deque fast path when the caller is itself on a task, and the
+// worker it picks comes from `schedCurrentWorker()` — which is derived from the
+// stack pointer (`sched.bit`'s `schedCurrentTask`: mask `sp` to the 64KiB
+// granule, read the tag). That answers "which worker is this stack on" and
+// nothing at all about which scheduler that worker serves. Without the
+// `wkSched` back-pointer check, a caller running as a green task of scheduler A
+// that calls `schedSpawn(B, task)` registers the task with B and queues it on
+// A, where no worker of B will ever look for it, and it simply never runs.
+//
+// WHY A DEDICATED PROGRAM, WHEN OTHER CASES ALREADY CATCH IT. They do — the
+// guard was removed and `../schedwakedarwin` printed `woke false` 5/5,
+// `../schedpolldarwin` and `../netpark` hung, `../schedtimer` printed a wrong
+// answer. But every one of those catches it INCIDENTALLY, as a side effect of
+// testing a timer queue or a netpoller, and their comments do not say so; a
+// rewrite of any of them that stopped using a private scheduler would delete
+// the coverage silently. All of them are also host-marked. This program asserts
+// the placement rule itself, on every host, and says why.
+//
+// IT IS NOT ALLOWED TO GO VACUOUS, and that is the first line of output. The
+// bug is only reachable when the caller IS on a worker of some OTHER scheduler.
+// While `libbitrt.a` came from Zig the only live scheduler was invisible to
+// this module, so `schedCurrentWorker()` was 0 for exactly the callers that pass
+// a private `s`, the global-queue fallback always ran, and a test like this one
+// would have passed with the guard deleted. Now that the runtime is Bit-sourced,
+// `main` runs as a green task of the live scheduler on a real worker (#1584), so
+// the precondition holds — but it is ASSERTED (`onworker`, `distinct`) rather
+// than assumed, because a future runtime that stopped running `main` on a worker
+// would otherwise turn this file back into a vacuous gate with no warning.
+//
+// NOTHING IS EVER RUN. The task is spawned and then only LOOKED AT: `B` gets no
+// OS threads and its worker loop is never driven, so `B`'s global queue is the
+// task's permanent, quiet home. That is what makes the program instant,
+// deterministic and free of any teardown interaction — and if the guard is
+// missing, the misplaced task is popped straight back off the live worker's
+// deque so it cannot run behind `main`'s back either.
+
+import { schedInit, schedSpawn, schedCurrentWorker, schedRegCount } from "../../../runtime/sched"
+import { schedTaskInit, schedStackAligned, schedStackBytes, taskAt } from "../../../runtime/sched"
+import { dqPopBottom, wkSched, wkDeque, scGlobal, schedWords, workerWords } from "../../../runtime/sched"
+
+// One worker in the private scheduler. A second would add a block and no
+// property: the placement decision is per-scheduler, not per-worker.
+const ownerWorkers: int = 1
+
+let schedBlockB: [16]i64
+let workerBlocksB: [292]i64
+
+// 128KiB so a 64KiB-aligned base can always be carved: module arrays are only
+// 8-byte aligned (#1421), so the base has to be bumped up at run time.
+let stackArea: [16384]i64
+let strayTask: [32]i64
+
+// The spawned task's entry. UNREACHABLE BY CONSTRUCTION — see the header — and
+// present only because `schedTaskInit` needs an entry to build a context from.
+// `@nosplit` like every other task body in the tree: a green task's stack is
+// reached by the conservative scan, not by a published safepoint frame.
+@nosplit function strayBody() {
+}
+
+function main() {
+  // The private scheduler. Deliberately NOT started: no OS thread, no worker
+  // loop, so nothing of B's ever consumes what is queued on it.
+  let b = taskAt(int(ptrOf(schedBlockB)))
+  schedInit(b, int(ptrOf(workerBlocksB)), ownerWorkers)
+
+  let bumped = int(ptrOf(stackArea)) + schedStackBytes - 1
+  let stackBase = bumped - bumped % schedStackBytes
+  let aligned = schedStackAligned(stackBase)
+
+  let taskAddr = int(ptrOf(strayTask))
+  schedTaskInit(taskAt(taskAddr), stackBase, schedStackBytes, entryOf(strayBody), 0)
+
+  // The precondition, asserted rather than assumed: `main` is a green task on a
+  // worker, and that worker belongs to a scheduler that is NOT `b`. If either
+  // fails the bug is unreachable and the rest of this program proves nothing.
+  let wAddr = schedCurrentWorker()
+  let onWorker = wAddr != 0
+  let distinct = onWorker && *(taskAt(wAddr) + wkSched) != int(b)
+
+  // The live worker's local ring, sampled across the spawn. `dqTail` is word 1
+  // of the deque block (`queue.bit`'s layout) and is MONOTONIC: only the ring's
+  // owner pushes, and `main` IS the task that owner is running, so no concurrent
+  // push can move it. A steal by another worker moves `dqHead`, never this word,
+  // so the comparison is exact under `BIT_WORKERS` of any size.
+  let ringTail = taskAt(wAddr) + wkDeque + 1
+  let tailBefore = *ringTail
+  schedSpawn(b, taskAddr)
+  let localUntouched = *ringTail == tailBefore
+
+  // Word 0 of a global queue block is its head task address.
+  let queuedOnB = *(b + scGlobal) == taskAddr
+  let registeredWithB = schedRegCount(b) == 1
+
+  // Undo a misplacement before anything can act on it: with the guard gone the
+  // task is on the live worker's ring, and that worker resumes `main`'s deque
+  // the moment `main` returns. One bounded pop, and only when the sample above
+  // actually saw the ring grow.
+  if (!localUntouched) {
+    let strayed = dqPopBottom(taskAt(wAddr) + wkDeque)
+    println("recovered ${strayed == taskAddr}")
+  }
+
+  println("aligned ${aligned}")
+  println("onworker ${onWorker}")
+  println("distinct ${distinct}")
+  println("local untouched ${localUntouched}")
+  println("queued on b ${queuedOnB}")
+  println("registered with b ${registeredWithB}")
+  println("blocks ${schedWords == 16 && workerWords == 292}")
+}
