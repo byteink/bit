@@ -31,6 +31,48 @@ function fanOut(n: int) {
 The runtime fixes the number of OS worker threads at startup - no unbounded
 thread creation.
 
+### Stack size, and what happens when you exceed it
+
+**A green thread's stack is fixed at 64 KiB and does not grow.** `main` is the
+exception: it gets 8 MiB. So the same function recurses **128x deeper on `main`
+than inside `spawn`** - measured on arm64-macos with a 48-byte frame, 174,759
+calls succeed on `main` and 1,362 inside `spawn`.
+
+That is not the goroutine behaviour §16.1 compares green threads to, and it is
+not a number you can raise: 64 KiB is the *identity granule*. The runtime finds
+the running task by masking the stack pointer down to that boundary and reading
+a tag stored there, so the size is also the alignment unit and a stack cannot be
+larger than it. Raising or growing it is a change to how task identity works,
+not a constant edit.
+
+**Exceeding it is currently an undiagnosed crash.** The process dies with
+SIGSEGV - exit code 139 - and prints nothing at all on stdout or stderr. `bit
+run` reports `was killed by SIGSEGV (11)`; a built binary you ship says nothing.
+There is no environment variable or flag that changes the limit.
+
+```bit
+function down(n: int): int {
+  if (n == 0) { return 0 }
+  return 1 + down(n - 1)
+}
+
+function deepWorker(depth: int, done: chan<int>) {
+  done <- down(depth)      // 4000 frames: fine on main, SIGSEGV here
+}
+```
+
+This matters outside synthetic recursion, because every server built on this
+runtime handles a request in a green thread - `serveTls` spawns one per
+connection. A recursive walk over request-shaped data (a category tree, a
+comment thread, a directory listing, a nested JSON document) is running on 64
+KiB, and roughly 1,300 frames is within reach of merely deep, not even hostile,
+input.
+
+Until that is fixed, write recursion that runs inside `spawn` with an explicit
+depth bound and reject input past it, or convert the walk to an explicit
+heap-allocated worklist. Both the missing growth and the missing diagnostic are
+tracked as **#2246**; nothing in this section is settled design.
+
 ## Channels
 
 A channel is a typed synchronization primitive. Unbuffered channels are
