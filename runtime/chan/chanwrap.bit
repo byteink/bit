@@ -19,19 +19,17 @@
 //
 // TWO THINGS ARE OUT OF SCOPE HERE, BY THE MODULE'S OWN DIVISION OF LABOUR:
 //
-//   - PANIC, mostly. `runtime/chan/` reports send-on-closed as a boolean
-//     (`chanSend`'s `false`), never panicking itself; `./chan.bit`'s header
-//     records that the ABI wrapper is where that panic is meant to be raised —
-//     #1367's half — and that boolean is still dropped here, unraised. Both
-//     `chanClose` panic sources are now handled here (SPEC §18.4): a `nil`
+//   - PANIC. All three SPEC §18.4 panics are handled here now, each by reading
+//     a boolean `runtime/chan/` already computes instead of dropping it: send
+//     on a closed channel (#2017) reads `chanSend`'s `false`; close of an
+//     already-closed channel (#2506) reads `chanClose`'s; close of a `nil`
 //     channel (#2505) — `chanClose` cannot check for it itself, since it
-//     unconditionally dereferences the channel (ABI.md §11), so the `ch == 0`
-//     guard this wrapper already needs for that reason is exactly where the
-//     panic belongs — and an already-closed channel (#2506), where `chanClose`
-//     already computes the right boolean and this wrapper now reads it instead
-//     of dropping it. This does NOT extend to nil SEND/RECV, which block
-//     forever by design (SPEC §16.2, #2503) — a nil channel is a valid,
-//     permanent no-op arm of a `select`, and closing one has no such meaning.
+//     unconditionally dereferences the channel (ABI.md §11) — is caught by
+//     the `ch == 0` guard this wrapper already needs for that reason. None of
+//     this touches nil SEND/RECV, which still block forever by design (SPEC
+//     §16.2, #2503): a nil channel is a valid, permanent no-op arm of a
+//     `select`, and that blocking is unrelated to what a *closed* (non-nil)
+//     channel does.
 //   - CHAN_MAKE. `chan_make` needs a process-lifetime channel handle and ring
 //     that outlive the GC (runtime/root/ uses `page_allocator`, never GC), plus a
 //     process registry the collector scans (`chanScanRegistryRoots`) so a
@@ -80,15 +78,18 @@ import { reserveInit, reserveGrow, storeWord } from "../gc"
 
 // `bit_rt_chan_send(ch, value)` (ABI.md §11). A nil channel blocks the caller
 // forever (SPEC §16.2): there is nothing that can ever unpark it, matching
-// `runtime/chan/`'s `park(null, null)`. `chanSend`'s `false` return means the channel
-// was closed — the point at which `runtime/chan/` panics; that panic is #1367's half,
-// so the value is dropped here rather than raised.
+// `runtime/chan/`'s `park(null, null)`. A non-nil channel panics if it was
+// already closed (SPEC §18.4, #2017): `chanSend` returns `false` exactly
+// then, and that boolean is now read and raised instead of dropped.
 export @symbol("bit_rt_chan_send") function rtChanSend(ch: int, value: int) {
   if (ch == 0) {
     schedPark()
     return
   }
   let sent = chanSend(taskAt(ch), value)
+  if (!sent) {
+    panicSendClosed()
+  }
 }
 
 // `bit_rt_chan_recv(ch) -> value` (ABI.md §11). Codegen lowers `<- c` as this
@@ -122,19 +123,22 @@ export @symbol("bit_rt_chan_recv") function rtChanRecv(ch: int): int {
 }
 
 // ---------------------------------------------------------------------------
-// The two chan-close panics (SPEC §18.4, #2505 nil / #2506 already-closed)
+// The three channel panics (SPEC §18.4: #2505 nil close / #2506 already-
+// closed close / #2017 send on closed)
 // ---------------------------------------------------------------------------
 //
-// `close(c)` on a `nil` channel, or on a channel already closed by an earlier
-// `close(c)`, must panic — unlike nil send/recv (SPEC §16.2), which block
-// forever on purpose (that is how a `nil` arm is switched off inside a
-// `select`), closing has no useful meaning in either case: it is always a
-// caller bug, and Go panics on both too. `chanClose` (`./chanops.bit`) cannot
-// make the nil check itself; it unconditionally dereferences `*(ch + chSched)`
-// before ever looking at `chClosed`, so a null `ch` would fault there instead
-// of panicking with a message. The already-closed check it CAN and does make
-// (`chanClose` returns `false` exactly when `chClosed` was already set), but
-// until #2506 that boolean was assigned to an unused local and dropped.
+// `close(c)` on a `nil` channel, `close(c)` on a channel already closed by an
+// earlier `close(c)`, and `c <- v` on a channel already closed by a `close(c)`
+// must all panic — unlike nil send/recv (SPEC §16.2), which block forever on
+// purpose (that is how a `nil` arm is switched off inside a `select`), none
+// of these three has any useful meaning: each is always a caller bug, and Go
+// panics on all three too. `chanClose` (`./chanops.bit`) cannot make the nil
+// check itself; it unconditionally dereferences `*(ch + chSched)` before ever
+// looking at `chClosed`, so a null `ch` would fault there instead of panicking
+// with a message. The already-closed check it CAN and does make (`chanClose`
+// returns `false` exactly when `chClosed` was already set), but until #2506
+// that boolean was assigned to an unused local and dropped — the same shape
+// `chanSend`'s closed-channel `false` was in until this ticket (#2017).
 //
 // Routed through `bit_rt_panic` rather than a new ABI symbol, mirroring
 // `runtime/root/slices.bit`'s `panicBounds` and `runtime/root/maps.bit`'s
@@ -200,6 +204,31 @@ function panicClosedChanClose() {
   storeWord(text + 0, closedChanCloseWord0)
   storeWord(text + 8, closedChanCloseWord1)
   storeWord(text + 16, closedChanCloseWord2)
+  bit_rt_panic(base)
+}
+
+// The message for send-on-a-closed-channel (#2017), packed the same way —
+// Go's own wording.
+//
+//   "send on closed channel" (22) = "send on " "closed c" "hannel"
+const sendClosedWord0: int = 2336927441566459251
+const sendClosedWord1: int = 7142819395900763235
+const sendClosedWord2: int = 119182900224360
+const sendClosedLen: int = 22
+
+// Two header words plus three text words: 24 bytes of text, enough for the
+// 22-byte message. Module state, not a local — same reason as `nilChanCloseMsg`.
+let sendClosedMsg: [5]i64
+
+// Report "send on closed channel" and abort. NEVER RETURNS.
+function panicSendClosed() {
+  let base = int(ptrOf(sendClosedMsg))
+  let text = base + strHeaderSize
+  storeWord(base + strPtr, text)
+  storeWord(base + strLen, sendClosedLen)
+  storeWord(text + 0, sendClosedWord0)
+  storeWord(text + 8, sendClosedWord1)
+  storeWord(text + 16, sendClosedWord2)
   bit_rt_panic(base)
 }
 
