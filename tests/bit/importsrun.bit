@@ -22,28 +22,46 @@
 // WHY A SHELL WRAPPER. `osRunBounded` (ABI.md §19) is the only bounded child
 // wait Bit has, and it takes a path and nothing else — no argv, no env, no
 // stdout capture. So each case gets two generated `/bin/sh` scripts, and the
-// shell supplies the three missing pieces. Each script ends in `exec`, which is
-// what keeps the exit status and the deadline honest — see `writeScripts`.
+// shell supplies the three missing pieces, plus (below) its own parallelism —
+// see `writeScripts` and `driverScript`.
 //
-// WHY THIS IS SERIAL, unlike the Zig harness it replaces. `bit_rt_os_run_bounded`
-// is NOT re-entrant: its child argv, wait-status cell and timespec scratch are
-// module-level and unlocked, sound only "under the single-worker contract — a
-// `run` fully completes (fork through wait) before any other `run` can begin"
-// (runtime/root/{linux,darwin}/os.bit). It is also `@nosplit`, so it crosses no
-// safepoint and never parks the calling green thread; its poll delay is a raw
-// `nanosleep`, not `sched.sleepNs`. A `spawn`ed pool of green threads each
-// calling it would therefore race on shared runtime state — two cases could
-// exec the wrong path or read each other's wait status — and would pin a worker
-// apiece with no yield. Parallelism here needs a re-entrant primitive first;
-// until then, correct and slow beats fast and racy.
+// `bit_rt_os_run_bounded` IS STILL NOT RE-ENTRANT, and nothing here changes
+// that (#2508 does not touch it — that is `runtime/root/**`, a mandatory-full-
+// suite change, and out of scope). Its child argv, wait-status cell and
+// timespec scratch are module-level and unlocked (`osArgvBuf`, `osStatusBuf`,
+// `osChildEnvp`, `osIdxBuf`, `osClockBuf` in
+// `runtime/root/{linux,darwin}/os.bit`), sound only under the single-worker
+// contract — "a `run` fully completes (fork through wait) before any other
+// `run` can begin". A `spawn`ed pool of green threads each calling it would
+// race on that shared state.
 //
-// TWO PHASES ANYWAY. Phase A writes every script and forks nothing; phase B
-// forks and writes nothing. `fork` duplicates the fd table, so a child spawned
-// while another thread holds a write fd open inherits it, and a later `execve`
-// of that inode fails with ETXTBSY. A serial harness has no such window, but
-// keeping the phases apart means re-introducing concurrency cannot silently
-// reopen one. The built BINARIES need no barrier either way: they are written
-// by the child `bit build`, which `osRunBounded` reaps before it returns.
+// So the concurrency lives in the SHELL instead, which this harness already
+// delegated env/argv/stdout capture to. This file now makes exactly ONE
+// `osRunBounded` call, for every case combined, on one generated driver
+// script — and the driver, not Bit green threads, is what fans out:
+// `find | xargs -P` does in the shell exactly what a re-entrant
+// `osRunBounded` would otherwise have had to do inside the runtime.
+//
+// TWO WAVES, BARRIERED, NOT ONE. `fork` duplicates the fd table, so a child
+// spawned while another process still holds a write fd open to some binary
+// inherits it, and a later `execve` of that inode fails with ETXTBSY — a
+// real, already-paid-for bug (74811a3). A serial harness has no such window;
+// a parallel one does, UNLESS every compile's write fd is closed before any
+// run forks at all. So the driver runs `find …compile.sh | xargs -P …` to
+// COMPLETION — `xargs` blocks until every parallel invocation it started has
+// exited — before it even starts the second `find …run.sh | xargs -P …`. One
+// script, two statements in sequence, is the whole barrier. Collapsing that
+// into a single wave (compile-then-run per job) would reopen exactly the
+// window 74811a3 closed.
+//
+// PER-CASE DEADLINES MOVE INTO THE GENERATED SCRIPTS THEMSELVES. The outer
+// `osRunBounded` bound is now GLOBAL — it covers the whole driver, both
+// waves, every case — so `BIT_TEST_TIMEOUT_S` can no longer be enforced by
+// `osRunBounded` per case. Each generated script instead backgrounds its own
+// work, races it against a `sleep $T; kill -9` watchdog, and reports the
+// result through a `.rc` file (`decodeRc`/`readRcFile`) rather than through
+// an `osRunBounded` return value — which now describes only the driver as a
+// whole (`decode`, called exactly once, on the single outer call).
 //
 // This file deliberately uses only universe builtins (ABI boundary primitives)
 // and no `std/*` import, so it runs under a bare `bit run` with no BIT_STDLIB
@@ -60,7 +78,16 @@ const maxEntries: int = 4096
 
 const defaultTimeoutS: int = 300
 
-// 0o755 — the scripts must be executable by the `fork`+`execve` in osRunBounded.
+// The outer `osRunBounded` call now spans the WHOLE driver (every case, both
+// waves) instead of one case, so its bound must be generous rather than
+// tight — the per-case watchdog each generated script carries is what stays
+// tight (`BIT_TEST_TIMEOUT_S`). `2 *` covers two full waves at the fully
+// serial worst case (parallelism only ever finishes sooner than that); this
+// slack absorbs `find`/`xargs`/process-startup overhead on top of it.
+const outerSlackMs: int = 60000
+
+// 0o755 — the scripts must be executable by the `fork`+`execve` in `xargs`
+// (phase B) and, for the driver itself, in `osRunBounded`.
 const scriptMode: int = 493
 
 struct Cfg {
@@ -82,6 +109,11 @@ struct Case {
   log: string
   out: string
   err: string
+  // Written by `compileSh`/`runSh` themselves (`echo "$rc" > …`), since phase
+  // B no longer makes a per-case `osRunBounded` call whose return value could
+  // carry this instead.
+  compileRc: string
+  runRc: string
 }
 
 // Per-case verdict. `reason` empty means the case passed; `detail` is the
@@ -329,7 +361,8 @@ function discover(cfg: Cfg, scratch: string): []Case {
     let base = "${scratch}/${name}"
     cases = append(cases, Case{ name: name, dir: dir, expected: exp.data,
       compileSh: "${base}.compile.sh", runSh: "${base}.run.sh", bin: "${base}.bin",
-      log: "${base}.log", out: "${base}.out", err: "${base}.err" })
+      log: "${base}.log", out: "${base}.out", err: "${base}.err",
+      compileRc: "${base}.compile.rc", runRc: "${base}.run.rc" })
     k = k + 1
   }
   return cases
@@ -341,26 +374,24 @@ function writeScripts(cfg: Cfg, cases: []Case) {
   let i = 0
   while (i < len(cases)) {
     let c = cases[i]
-    // `exec` is load-bearing twice over, and both reasons are silent-wrongness
-    // bugs when it is missing:
-    //
-    //  - EXIT STATUS. `osRunBounded` reports the SHELL's status. Without `exec`
-    //    a failed `bit build` would still leave the script exiting 0 unless
-    //    `set -e` caught it; with `exec` the shell IS the tool, so the status is
-    //    the tool's by construction and cannot be laundered at all.
-    //  - THE DEADLINE. `osRunBounded` SIGKILLs the pid it forked. Without
-    //    `exec` that pid is the shell, and a hung program under it is merely
-    //    orphaned to init and keeps running — measured: a `TIMED OUT` verdict
-    //    with the program still alive afterwards. With `exec` the forked pid is
-    //    the program, so the kill lands on the thing that hung.
-    //
-    // `set -e` stays as insurance for the `export` lines above the `exec`.
-    let compile = "#!/bin/sh\nset -e\nexport BIT_STDLIB=\"${cfg.stdlib}\"\nexport BIT_LIBBITRT=\"${cfg.libbitrt}\"\nexec \"${cfg.bitExe}\" build \"${c.dir}\" -o \"${c.bin}\" >\"${c.log}\" 2>&1\n"
+    // Each script backgrounds its real work (`cmd &`) and captures that exact
+    // child's pid in `$p`, then races it against a `sleep $T; kill -9`
+    // watchdog running as a second background job (`$w`) — the per-job
+    // deadline a shared wave now needs, since a whole wave of cases goes
+    // through one outer `osRunBounded` call rather than one each. `wait "$p"`
+    // reports that specific child's status (128+9=137 on our own SIGKILL,
+    // since nothing else in this closed system sends it, which is what
+    // `decodeRc` below reads back out of the `.rc` file). `kill "$w"` reaps
+    // the watchdog once the real work is done so it does not outlive the
+    // script. No `exec`: the backgrounded command is already the direct
+    // child (no wrapping shell to hand status through), and control has to
+    // return to THIS script afterward to write the `.rc` file.
+    let compile = "#!/bin/sh\nexport BIT_STDLIB=\"${cfg.stdlib}\"\nexport BIT_LIBBITRT=\"${cfg.libbitrt}\"\n\"${cfg.bitExe}\" build \"${c.dir}\" -o \"${c.bin}\" >\"${c.log}\" 2>&1 &\np=$!\n( sleep ${cfg.timeoutMs / 1000}; kill -9 \"$p\" 2>/dev/null ) &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.compileRc}\"\nexit \"$rc\"\n"
     // BIT_SELF_EXE is a real coupling, not decoration: tests/imports/pmadd_e2e
     // execs the compiler that built it (`bit add`) and panics without it. The
     // shell also hands the child the full inherited environment, which that
     // case's git/HOME/PATH usage needs.
-    let run = "#!/bin/sh\nset -e\nexport BIT_SELF_EXE=\"${cfg.bitExe}\"\nexec \"${c.bin}\" >\"${c.out}\" 2>\"${c.err}\"\n"
+    let run = "#!/bin/sh\nexport BIT_SELF_EXE=\"${cfg.bitExe}\"\n\"${c.bin}\" >\"${c.out}\" 2>\"${c.err}\" &\np=$!\n( sleep ${cfg.timeoutMs / 1000}; kill -9 \"$p\" 2>/dev/null ) &\nw=$!\nwait \"$p\"\nrc=$?\nkill \"$w\" 2>/dev/null\necho \"$rc\" > \"${c.runRc}\"\nexit \"$rc\"\n"
     if (!writeWhole(c.compileSh, compile) || fsChmod(c.compileSh, scriptMode) != 0) {
       fatal("cannot write compile script for '${c.name}' at ${c.compileSh}")
     }
@@ -371,12 +402,40 @@ function writeScripts(cfg: Cfg, cases: []Case) {
   }
 }
 
-// --- phase B: compile, run, compare ----------------------------------------
+// --- phase B: one shell driver, two barriered waves -------------------------
+
+// The whole fan-out. `-print0`/`-0` so a case name can never be split by
+// `xargs`'s default whitespace/newline delimiting (case names are validated
+// plain by `shSafe`, but that does not rule out a space). `sh -c 'exec "$0"'`
+// treats each found path as the command to run — the scripts phase A wrote
+// are directly executable, so this is the standard portable idiom for
+// "execute every file `find` names", and it works identically with `-P`
+// (parallel) on both GNU and BSD (macOS) `xargs`, unlike `-I`.
+//
+// The barrier IS the ordering: the first `find | xargs -P` line runs to
+// completion — `xargs` does not return until every parallel invocation it
+// started has exited — before the second line's `find | xargs -P` starts a
+// single fork. See the header comment for why that barrier is the whole
+// ETXTBSY defense.
+//
+// `rc1`/`rc2` capture each wave's `xargs` exit status on its own line, not
+// discarded and not `||true`'d away: nonzero means at least one case's script
+// itself exited nonzero. That is expected and not fatal here — `gradeCase`
+// below is what names the specific case — but the driver still exits 1 in
+// that case (rather than swallowing it into an unconditional 0) so the
+// caller in `main` can read it back and, if `gradeCase` found NO failing case
+// at all despite `xargs` reporting one, treat that contradiction as its own
+// fatal error.
+function driverScript(scratch: string): string {
+  return "#!/bin/sh\nN=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)\nfind \"${scratch}\" -maxdepth 1 -name '*.compile.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc1=$?\nfind \"${scratch}\" -maxdepth 1 -name '*.run.sh' -print0 | xargs -0 -P \"$N\" -n1 sh -c 'exec \"$0\"'\nrc2=$?\nif [ \"$rc1\" -eq 0 ] && [ \"$rc2\" -eq 0 ]; then\n  exit 0\nfi\nexit 1\n"
+}
 
 // ABI.md §19: `>= 0` exit code, `-1` spawn failure, `-2` deadline, `<= -100`
 // signalled with the number at `-(r) - 100`. Every negative sentinel passes a
 // naive `if (code > 0)`, so a hung or SIGSEGV'd case would read as a pass; each
-// gets its own named outcome instead.
+// gets its own named outcome instead. Used exactly once now, on the single
+// outer `osRunBounded` call over the whole driver script — per-case results no
+// longer come from here, see `decodeRc`.
 function decode(r: int, what: string): string {
   if (r == 0) {
     return ""
@@ -396,17 +455,56 @@ function decode(r: int, what: string): string {
   return "${what} unknown osRunBounded result ${r}"
 }
 
-// Two separate bounded calls, not one combined script, so a compile hang and a
-// run hang stay distinguishable.
-function runCase(cfg: Cfg, c: Case): Verdict {
-  let cr = decode(osRunBounded(c.compileSh, cfg.timeoutMs), "compile")
+// Reads a `.rc` file the way `wait "$p"; rc=$?` fills it: a POSIX wait status
+// in 0..255, where a process killed by signal N reads back as `128 + N` — so
+// `137` means SIGKILL, and 9 is the only signal anything in this harness ever
+// sends (the per-case watchdog in `writeScripts`). A missing, empty, or
+// unparsable file (the script never reached its own `echo`, or never ran at
+// all) composes into `parseNonNegInt`'s existing `-1` sentinel with no extra
+// branching: `readWhole` on a missing path already returns empty data.
+function readRcFile(path: string): int {
+  let s = readWhole(path).data
+  if (len(s) != 0 && s[len(s) - 1] == 10) {
+    s = s[0:len(s) - 1]
+  }
+  return parseNonNegInt(s)
+}
+
+// Mirrors `decode` above but reads the `.rc`-file encoding instead of an
+// `osRunBounded` sentinel: there is no `-1`/`-2` here, because phase B no
+// longer makes a bounded call per case. A negative `rc` (from `readRcFile`)
+// means the file never got written at all, which this harness treats the same
+// as any other failure — never as a pass.
+function decodeRc(rc: int, what: string): string {
+  if (rc == 0) {
+    return ""
+  }
+  if (rc < 0) {
+    return "${what} produced no exit status (script did not run to completion)"
+  }
+  if (rc == 137) {
+    return "${what} TIMED OUT"
+  }
+  if (rc > 128) {
+    return "${what} KILLED by signal ${rc - 128}"
+  }
+  return "${what} exited ${rc}"
+}
+
+// --- phase C: grade every case from its .rc files ---------------------------
+
+// Two separate `.rc` files, not one combined script, so a compile failure and
+// a run failure stay distinguishable exactly as they did when this read two
+// separate `osRunBounded` calls.
+function gradeCase(c: Case): Verdict {
+  let cr = decodeRc(readRcFile(c.compileRc), "compile")
   if (len(cr) != 0) {
     return Verdict{ reason: cr, detail: readWhole(c.log).data }
   }
   if (!fsExists(c.bin)) {
     return Verdict{ reason: "compile produced no binary", detail: readWhole(c.log).data }
   }
-  let rr = decode(osRunBounded(c.runSh, cfg.timeoutMs), "run")
+  let rr = decodeRc(readRcFile(c.runRc), "run")
   if (len(rr) != 0) {
     return Verdict{ reason: rr, detail: readWhole(c.err).data }
   }
@@ -425,18 +523,21 @@ function runCase(cfg: Cfg, c: Case): Verdict {
 
 // --- cleanup + report ------------------------------------------------------
 
-function cleanup(scratch: string, cases: []Case) {
+function cleanup(scratch: string, cases: []Case, driverSh: string) {
   let i = 0
   while (i < len(cases)) {
     let c = cases[i]
     fsRemove(c.compileSh)
     fsRemove(c.runSh)
+    fsRemove(c.compileRc)
+    fsRemove(c.runRc)
     fsRemove(c.bin)
     fsRemove(c.log)
     fsRemove(c.out)
     fsRemove(c.err)
     i = i + 1
   }
+  fsRemove(driverSh)
   fsRemove(scratch)
 }
 
@@ -449,6 +550,62 @@ function scratchRoot(): string {
     base = base[0:len(base) - 1]
   }
   return "${base}/bit-importsrun-${timeUnixNs()}"
+}
+
+struct DriverRun {
+  driverSh: string
+  result: int
+}
+
+// Phase B: writes the driver script and makes the ONE outer `osRunBounded`
+// call for the whole corpus — see the header comment for why the bound is
+// generous and why the barrier between its two waves must stay a barrier.
+// Each per-case script already carries its OWN `BIT_TEST_TIMEOUT_S` watchdog,
+// so this outer bound only exists to catch the driver itself getting stuck
+// (`find`, `xargs`, or the shell never returning at all); a case that merely
+// runs slowly, even every case at once, is exactly what `2 *` plus
+// `outerSlackMs` is sized to absorb. Fatal only for the driver's OWN
+// process-level failure — a plain exit of 1 means at least one case's script
+// itself returned nonzero, which `gradeAll`/`gradeCase` are what name; a
+// spawn failure, the outer deadline firing, or a signal has no single case to
+// attribute it to, because the driver never ran at all or got stuck as a
+// whole.
+function runDriver(cfg: Cfg, scratch: string, caseCount: int): DriverRun {
+  let driverSh = "${scratch}/driver.sh"
+  if (!writeWhole(driverSh, driverScript(scratch)) || fsChmod(driverSh, scriptMode) != 0) {
+    fatal("cannot write driver script at ${driverSh}")
+  }
+  let outerTimeoutMs = 2 * caseCount * cfg.timeoutMs + outerSlackMs
+  let result = osRunBounded(driverSh, outerTimeoutMs)
+  if (result != 0 && result != 1) {
+    fatal("imports driver: ${decode(result, "driver")}")
+  }
+  return DriverRun{ driverSh: driverSh, result: result }
+}
+
+struct Report {
+  failed: int
+  summary: string
+}
+
+// Phase C: grades every case and prints each failure as it is found.
+function gradeAll(cases: []Case): Report {
+  let failed = 0
+  let summary = ""
+  let i = 0
+  while (i < len(cases)) {
+    let v = gradeCase(cases[i])
+    if (len(v.reason) != 0) {
+      failed = failed + 1
+      summary = "${summary} ${cases[i].name}(${v.reason})"
+      eprint("imports '${cases[i].name}': ${v.reason}\n")
+      if (len(v.detail) != 0) {
+        eprint("${v.detail}\n")
+      }
+    }
+    i = i + 1
+  }
+  return Report{ failed: failed, summary: summary }
 }
 
 function main() {
@@ -470,27 +627,24 @@ function main() {
   }
   writeScripts(cfg, cases)
 
-  let failed = 0
-  let summary = ""
-  let i = 0
-  while (i < len(cases)) {
-    let v = runCase(cfg, cases[i])
-    if (len(v.reason) != 0) {
-      failed = failed + 1
-      summary = "${summary} ${cases[i].name}(${v.reason})"
-      eprint("imports '${cases[i].name}': ${v.reason}\n")
-      if (len(v.detail) != 0) {
-        eprint("${v.detail}\n")
-      }
-    }
-    i = i + 1
+  let driver = runDriver(cfg, scratch, len(cases))
+  let report = gradeAll(cases)
+
+  // `driver.result` is `xargs`'s own verdict, read here rather than
+  // discarded: if it reported a failing case (1) but every case above graded
+  // clean, the `.rc`-file bookkeeping itself is broken — some case's script
+  // failed by `xargs`'s own account with nothing in this harness able to say
+  // which one, which is worse than any single named failure and must not
+  // report as 0 failed.
+  if (report.failed == 0 && driver.result == 1) {
+    fatal("imports driver: xargs reported a failing case script, but no case graded as failed — the .rc bookkeeping is broken")
   }
 
-  cleanup(scratch, cases)
+  cleanup(scratch, cases, driver.driverSh)
 
-  print("imports: ${len(cases) - failed}/${len(cases)} OK\n")
-  if (failed != 0) {
-    eprint("imports: FAILED:${summary}\n")
+  print("imports: ${len(cases) - report.failed}/${len(cases)} OK\n")
+  if (report.failed != 0) {
+    eprint("imports: FAILED:${report.summary}\n")
     osExit(1)
   }
 }
