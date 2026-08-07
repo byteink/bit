@@ -22,17 +22,28 @@
 // shape rather than by code.
 
 import { serve, get, respond, Server, Exchange, Request, Response } from "std/http"
-import { readFile, writeFile, mkdir, remove, exists, isDir } from "std/fs"
+import { readFile, writeFile, mkdir, remove, exists, isDir, isSymlink } from "std/fs"
 import { hasPrefix, hasSuffix, contains, indexOf } from "std/strings"
 
 // How many requests the demo serves before shutting down. A real deployment
 // calls the accept loop forever; an example must terminate, and the examples
-// harness kills anything that does not (tests/proc.zig's deadline).
-const demoRequests = 6
+// harness kills anything that does not (tests/proc.zig's deadline). One more
+// than `main`'s `expect`/`expectBlocked` call count, or the extra request
+// dials a server that already closed.
+const demoRequests = 7
 
 // The directory served. A single value so the traversal guard and the file
 // lookup cannot disagree about what "inside" means.
 struct Site { root: string }
+
+// --- #2397 regression fixture -----------------------------------------------
+//
+// A directory OUTSIDE `Site.root`, holding one file the server must never
+// serve, and a symbolic link INSIDE `Site.root` pointing at it. Fixed paths
+// alongside `Site.root`'s own, for the same reason: this is a regression
+// test for one specific escape, not a general-purpose fixture.
+const escapeOutsideDir = "/tmp/bit-staticserver-outside"
+const escapeMarker = "OUTSIDE THE SITE ROOT\n"
 
 // --- the actual server ------------------------------------------------------
 
@@ -61,10 +72,40 @@ function fileResponse(site: Site, path: string): Response {
     full = "${full}/index.html"
   }
 
+  // `safePath` above is lexical and answers BEFORE any syscall (rule 1) - it
+  // cannot see a symbolic link planted INSIDE the root, and `isDir` just
+  // above and `readFile` just below both FOLLOW links. So ask the filesystem
+  // directly, now that `full` is fully composed: walk every component below
+  // `site.root` and refuse if any is a link. 404, not 400 - the request was
+  // well formed, the filesystem answered otherwise.
+  if (hasSymlinkComponent(site.root, full)) {
+    return respond(404, "not found\n")
+  }
+
   let body = readFile(full) catch e {
     return respond(404, "not found\n")
   }
   return Response{ status: 200, contentType: mimeFor(full), headers: "", body: body }
+}
+
+// Whether any path component of `full` strictly below `root` is a symbolic
+// link - walked from `root` outward, never testing only the leaf:
+// `<root>/a/b.txt` escapes just as well when `a` is the link as when the
+// file itself is. `full` always has `root` as an exact prefix here
+// (`fileResponse` composes it that way, with no trailing slash on `root`),
+// so scanning starts right after the separator between them and each `/`
+// found after that marks the end of one more component to probe.
+function hasSymlinkComponent(root: string, full: string): bool {
+  let i = len(root) + 1
+  while (i < len(full)) {
+    if (full[i] == '/') {
+      if (isSymlink(full[0:i])) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return isSymlink(full)
 }
 
 // Is this request path safe to resolve under the site root?
@@ -202,6 +243,11 @@ function serveFiles(s: Server, site: Site, n: int, ready: chan<int>) {
 function main(): int {
   let site = Site{ root: "/tmp/bit-staticserver-demo" }
   setupSite(site)
+  if (!makeEscapeLink(site.root)) {
+    print("setup: could not create the #2397 symlink fixture\n")
+    cleanupSite(site)
+    return 1
+  }
 
   let s = serve("127.0.0.1", 0) catch e {
     print("serve: ${e.message()}\n")
@@ -231,7 +277,13 @@ function main(): int {
   // Traversal is refused before the filesystem is touched. /etc/passwd exists on
   // every host this runs on, so a server that resolved this would leak it.
   failures = failures + expect(base, "/../../../../etc/passwd", 400, "bad request path")
+  // #2397: a symlink placed INSIDE the root, pointing outside it. `safePath`
+  // cannot see this - it is lexical and answers before any syscall - so this
+  // is the one check here that exercises the filesystem-facing half of the
+  // guard rather than the request-string half.
+  failures = failures + expectBlocked(base, "/escape/secret.txt")
 
+  cleanupEscapeLink(site.root)
   cleanupSite(site)
 
   if (failures > 0) {
@@ -268,6 +320,27 @@ function expect(base: string, path: string, status: int, bodyHas: string): int {
   return 0
 }
 
+// Fetches `base + path` and asserts the traversal guard blocked it: status
+// 404, and the response never carries `escapeMarker` (the outside file's
+// exact contents). Two checks rather than `expect`'s one, because a leaked
+// body that happens to also 404 is exactly the failure this must catch.
+function expectBlocked(base: string, path: string): int {
+  let res = get("${base}${path}") catch e {
+    print("FAIL ${path}: ${e.message()}\n")
+    return 1
+  }
+  if (res.status != 404) {
+    print("FAIL ${path}: status ${res.status}, want 404\n")
+    return 1
+  }
+  if (contains(res.body, escapeMarker)) {
+    print("FAIL ${path}: response leaked content from outside the root\n")
+    return 1
+  }
+  print("ok   ${path} -> ${res.status} (blocked)\n")
+  return 0
+}
+
 // A tiny site on disk: a home page, a stylesheet, and a subdirectory with its own
 // index, which is what exercises the directory-to-index rule.
 function setupSite(site: Site) {
@@ -288,6 +361,33 @@ function setupSite(site: Site) {
   }
 }
 
+// The #2397 fixture: a directory OUTSIDE `root` holding one file, and a
+// symbolic link named `escape` INSIDE `root` pointing at it. `std/fs` has no
+// `symlink` (and a link cannot be committed to the repo as a plain file), so
+// - exactly as `tests/cases/fs_walk_symlink.bit` does for the same reason -
+// the link comes from a shell script run with `osRun`.
+function makeEscapeLink(root: string): bool {
+  if (!exists(escapeOutsideDir)) {
+    mkdir(escapeOutsideDir) catch _ {
+      return false
+    }
+  }
+  writeFile("${escapeOutsideDir}/secret.txt", escapeMarker) catch _ {
+    return false
+  }
+  let script = "${escapeOutsideDir}/link.sh"
+  // `-f`: idempotent against a symlink left by a prior run that crashed
+  // before `cleanupEscapeLink` ran, same as `site.root`'s own fixed path.
+  let body = "#!/bin/sh\nln -sf '${escapeOutsideDir}' '${root}/escape' || exit 1\n"
+  writeFile(script, body) catch _ {
+    return false
+  }
+  if (fsChmod(script, 448) != 0) { // 0o700: owner rwx only
+    return false
+  }
+  return osRun(script) == 0
+}
+
 // Best-effort: a leftover temp file is not worth failing a run over, but the
 // language will not accept an empty `catch` - and it is right not to, since that
 // is exactly how a real error gets swallowed. So each one says what it ignored.
@@ -297,6 +397,16 @@ function cleanupSite(site: Site) {
   rm("${site.root}/style.css")
   rm("${site.root}/docs")
   rm(site.root)
+}
+
+// Tears down the #2397 fixture. `rm` on `escape` unlinks the LINK, never the
+// directory behind it (the same contract `std/fs.remove` gives `fs.walk`'s
+// own symlink test), so `escapeOutsideDir` survives to be removed on its own.
+function cleanupEscapeLink(root: string) {
+  rm("${root}/escape")
+  rm("${escapeOutsideDir}/link.sh")
+  rm("${escapeOutsideDir}/secret.txt")
+  rm(escapeOutsideDir)
 }
 
 function rm(path: string) {
