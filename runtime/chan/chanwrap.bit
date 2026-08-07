@@ -19,13 +19,17 @@
 //
 // TWO THINGS ARE OUT OF SCOPE HERE, BY THE MODULE'S OWN DIVISION OF LABOUR:
 //
-//   - PANIC. `runtime/chan/` panics on send-on-closed, close-of-closed and
-//     close-of-nil; `./chan.bit`'s header records that the ABI wrapper which
-//     RAISES those as panics is #1367's half (a `@nosplit` body cannot panic,
-//     and the panic entry is `runtime/root`'s platform-split `bit_rt_root_panic`
-//     which this cross-platform module cannot name). So the wrappers here mirror
-//     the internal boolean result — the operation still does the right thing to
-//     the channel — and leave the panic to that later half.
+//   - PANIC, mostly. `runtime/chan/` reports send-on-closed and close-of-closed
+//     as a boolean (`chanSend`/`chanClose`'s `false`), never panicking itself;
+//     `./chan.bit`'s header records that the ABI wrapper is where that panic is
+//     meant to be raised — #1367's half — and both booleans are still dropped
+//     here, unraised. Close of a `nil` channel is the one exception (#2505,
+//     SPEC §18.4): `chanClose` cannot check for it (it unconditionally
+//     dereferences the channel, ABI.md §11), so the `ch == 0` guard this
+//     wrapper already needs for that reason is exactly where the panic belongs.
+//     This does NOT extend to nil SEND/RECV, which block forever by design
+//     (SPEC §16.2, #2503) — a nil channel is a valid, permanent no-op arm of a
+//     `select`, and closing one has no such meaning.
 //   - CHAN_MAKE. `chan_make` needs a process-lifetime channel handle and ring
 //     that outlive the GC (runtime/root/ uses `page_allocator`, never GC), plus a
 //     process registry the collector scans (`chanScanRegistryRoots`) so a
@@ -63,14 +67,14 @@
 // SEAM 3 / #1576). Reaching it from chan is legal now the chan<->root cycle is
 // gone (#1612): the graph is root->sched, chan->sched, chan->root, chan->gc —
 // still a DAG, root never imports chan. Only `select_alloc` uses it.
-import { allocBuf } from "../root"
+import { allocBuf, strPtr, strLen, strHeaderSize } from "../root"
 
 // The process-lifetime channel reserve `chan_make` carves handles and rings out
 // of. `reserveInit`/`reserveGrow` are `runtime/gc`'s bump reserve (gc/mem.bit),
 // now pinned (`bit_rt_port_mem_reserve_*`, #1613) so this freestanding-emitted
 // module can call them across the object boundary. `wordAt` is already imported
 // by the sibling `./chanreg.bit` (module-scoped), so it is named directly below.
-import { reserveInit, reserveGrow } from "../gc"
+import { reserveInit, reserveGrow, storeWord } from "../gc"
 
 // `bit_rt_chan_send(ch, value)` (ABI.md §11). A nil channel blocks the caller
 // forever (SPEC §16.2): there is nothing that can ever unpark it, matching
@@ -115,12 +119,66 @@ export @symbol("bit_rt_chan_recv") function rtChanRecv(ch: int): int {
   return *(scr + scrElem)
 }
 
+// ---------------------------------------------------------------------------
+// The nil-channel-close panic (SPEC §18.4, #2505)
+// ---------------------------------------------------------------------------
+//
+// `close(c)` on a `nil` channel must panic — unlike nil send/recv (SPEC §16.2),
+// which block forever on purpose (that is how a `nil` arm is switched off
+// inside a `select`), closing one has no useful meaning at all: it is always a
+// caller bug, and Go panics here too. `chanClose` (`./chanops.bit`) cannot make
+// this check itself; it unconditionally dereferences `*(ch + chSched)` before
+// ever looking at `chClosed`, so a null `ch` would fault there instead of
+// panicking with a message.
+//
+// Routed through `bit_rt_panic` rather than a new ABI symbol, mirroring
+// `runtime/root/slices.bit`'s `panicBounds` and `runtime/root/maps.bit`'s
+// `panicNilMapWrite` (#2502) exactly: a module-static message buffer, no
+// allocation on the panic path. `bit_rt_panic` is defined in `runtime/root`'s
+// platform `io.bit` (a different module), reached the same way this file
+// already reaches `bit_rt_oom` below — an `extern function` declaration is
+// legal here regardless of `@nosplit` (#1640), and `rtChanClose` is not
+// `@nosplit` at all, so no split-stack constraint is even in play; the
+// module-static buffer is required anyway, because `ptrOf` only accepts a
+// slice or module-level state (never a local), not because of `@nosplit`.
+extern function bit_rt_panic(msg: int)
+
+// The message, packed little-endian into i64 words exactly as `slices.bit`'s
+// and `maps.bit`'s are, and for the identical reason: computed, not
+// hand-derived.
+//
+//   "close of nil channel" (20) = "close of" " nil cha" "nnel"
+const nilChanCloseWord0: int = 7381153934384000099
+const nilChanCloseWord1: int = 7018969010165870112
+const nilChanCloseWord2: int = 1818586734
+const nilChanCloseLen: int = 20
+
+// The `{ptr, len}` string header (ABI.md §2) plus the inline message bytes
+// `bit_rt_panic` reads, assembled on the panic path — mirrors `maps.bit`'s
+// `nilMapMsg`. MODULE STATE, NOT A LOCAL: `ptrOf` needs an addressable object.
+// Scalar, so the collector never scans it. Two header words plus three text
+// words: 24 bytes of text, enough for the 20-byte message.
+let nilChanCloseMsg: [5]i64
+
+// Report "close of nil channel" and abort. NEVER RETURNS.
+function panicNilChanClose() {
+  let base = int(ptrOf(nilChanCloseMsg))
+  let text = base + strHeaderSize
+  storeWord(base + strPtr, text)
+  storeWord(base + strLen, nilChanCloseLen)
+  storeWord(text + 0, nilChanCloseWord0)
+  storeWord(text + 8, nilChanCloseWord1)
+  storeWord(text + 16, nilChanCloseWord2)
+  bit_rt_panic(base)
+}
+
 // `bit_rt_chan_close(ch)` (ABI.md §11). Wakes every blocked peer (`chanClose`).
-// A nil channel and a double close both panic in `runtime/chan/`; that panic is
-// #1367's half, so a nil channel is a no-op and `chanClose`'s `false` (already
-// closed) is dropped here.
+// A `nil` channel panics (above, #2505). `chanClose`'s `false` return (already
+// closed — the OTHER §18.4 close panic) is a separate, unestablished case and
+// stays dropped here, unchanged by this fix.
 export @symbol("bit_rt_chan_close") function rtChanClose(ch: int) {
   if (ch == 0) {
+    panicNilChanClose()
     return
   }
   let closed = chanClose(taskAt(ch))
