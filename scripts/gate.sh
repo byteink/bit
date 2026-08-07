@@ -27,9 +27,12 @@
 # TWO NARROW EXCEPTIONS (#2435), because registering a gate is mandatory in
 # this repo and otherwise forces `full` on every single ticket that adds one:
 #   - tests/bit/** joins whichever of the five areas also changed, instead of
-#     forcing `full` on its own. If tests/bit/** is the ONLY thing that
-#     changed, the gates whose `Gate.argv` names each changed file run —
-#     nothing more — or `full` if any changed file cannot be mapped that way.
+#     forcing `full` on its own: its own mapped gate(s) run IN ADDITION to
+#     that area's steps (#2510 — a five-area bucket used to silently replace
+#     the file's own gate instead of adding to it). If tests/bit/** is the
+#     ONLY thing that changed, the gates whose `Gate.argv` names each changed
+#     file run — nothing more — or `full` if any changed file cannot be
+#     mapped that way, whether or not one of the five areas also fired.
 #   - tools/build/defs.bit and tools/build/gates.bit are the same case only
 #     when the change is PURELY new `Step{}`/`Gate{}` registration: no edit to
 #     an existing entry, no edit to any function body. See
@@ -288,6 +291,23 @@ fi
 
 bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib))
 
+# Computed ONCE, ahead of bucket selection, regardless of whether one of the
+# five areas also fired (#2510). Two consequences fall out of computing it
+# here rather than only inside the old `has_testsbit` elif branch:
+#   - an UNMAPPED tests/bit/** file must force `full` even when it rides
+#     alongside a bucket, exactly like it already did when tests/bit/** was
+#     the only change — so `testsbit_unmapped` is checked ahead of every
+#     concrete bucket below, not after all five have had a chance to win.
+#   - a MAPPED file's gate(s) are available to be unioned into whichever
+#     bucket is chosen below, instead of only ever being reachable via the
+#     dedicated `testsbit` bucket that a five-area change never reaches.
+testsbit_steps=""
+testsbit_unmapped=0
+if [ "${has_testsbit}" -eq 1 ]; then
+  testsbit_steps="$(testsbit_steps_for "${testsbit_list}")"
+  [ -z "${testsbit_steps}" ] && testsbit_unmapped=1
+fi
+
 BUCKET=""
 REASON=""
 if [ "${FULL}" -eq 1 ]; then
@@ -299,6 +319,9 @@ elif [ "${has_other}" -eq 1 ]; then
 elif [ "${bucket_count}" -gt 1 ]; then
   BUCKET="full"
   REASON="spans more than one bucket: ${touched_list}"
+elif [ "${testsbit_unmapped}" -eq 1 ]; then
+  BUCKET="full"
+  REASON="tests/bit/** changed but at least one file could not be mapped to a gate by name — falling through to full"
 elif [ "${has_selfhost}" -eq 1 ]; then
   BUCKET="selfhost"
   REASON="only compiler/** changed"
@@ -315,14 +338,8 @@ elif [ "${has_stdlib}" -eq 1 ]; then
   BUCKET="stdlib"
   REASON="only stdlib/** changed"
 elif [ "${has_testsbit}" -eq 1 ]; then
-  testsbit_steps="$(testsbit_steps_for "${testsbit_list}")"
-  if [ -z "${testsbit_steps}" ]; then
-    BUCKET="full"
-    REASON="tests/bit/** changed but at least one file could not be mapped to a gate by name — falling through to full"
-  else
-    BUCKET="testsbit"
-    REASON="only tests/bit/** changed (gate(s): ${testsbit_steps})"
-  fi
+  BUCKET="testsbit"
+  REASON="only tests/bit/** changed (gate(s): ${testsbit_steps})"
 else
   # Nothing in the five buckets or tests/bit/** changed, has_other is 0, and
   # CHANGED is non-empty — the only way here is a purely-additive
@@ -401,6 +418,30 @@ case "${BUCKET}" in
     for s in ${testsbit_steps}; do
       BUILD_STEPS+=("${s}")
     done
+    ;;
+esac
+
+# tests/bit/** riding alongside one of the five concrete areas contributes
+# its OWN mapped gate(s) too (#2510) — the case above only reflects the AREA
+# that also changed, so without this union a changed harness's gate silently
+# never ran even though `has_testsbit` was 1 and it mapped cleanly. `full`
+# already runs everything and `testsbit` already built its array from
+# `testsbit_steps` directly above, so only the five concrete-area buckets
+# need the union; `testsbit_unmapped` was already handled by forcing `full`
+# before any of them could be chosen, so `testsbit_steps` here is never empty
+# when `has_testsbit` is 1.
+case "${BUCKET}" in
+  full | testsbit) ;;
+  *)
+    if [ "${has_testsbit}" -eq 1 ]; then
+      for s in ${testsbit_steps}; do
+        case " ${BUILD_STEPS[*]} " in
+          *" ${s} "*) ;;
+          *) BUILD_STEPS+=("${s}") ;;
+        esac
+      done
+      REASON="${REASON}; tests/bit/** also changed — added gate(s): ${testsbit_steps}"
+    fi
     ;;
 esac
 
