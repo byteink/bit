@@ -153,8 +153,8 @@ invariants, never for expected failures. Sources include:
 
 - index or slice out of range; integer divide-by-zero; signed overflow in debug
   builds
-- writing a `nil` map; send/close on a `nil` or closed channel; calling a `nil`
-  function; a single-result type-assertion mismatch
+- writing a `nil` map; closing a `nil` channel; send/close on a closed channel;
+  calling a `nil` function; a single-result type-assertion mismatch
 - an explicit `panic(msg)`
 - a failed `assert(cond)` or `assert(cond, msg)`
 

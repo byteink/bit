@@ -1926,8 +1926,9 @@ Every declared binding without an initializer is deterministically zero-valued:
   `nil` slice Go names, and a zero slice is always usable rather than a header
   that faults on the first `len`.
 - map, `chan`, function, interface → `nil`. Reading a `nil` map yields zero
-  values; **writing** a `nil` map, sending on a `nil` channel, or calling a `nil`
-  function **panics** (§18.4). Use the constructor forms (§12.9) to allocate.
+  values; **writing** a `nil` map, or calling a `nil` function, **panics**
+  (§18.4); sending on a `nil` channel blocks forever instead (§16.2). Use the
+  constructor forms (§12.9) to allocate.
 
 Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
@@ -2949,8 +2950,9 @@ errors and broken invariants, never for expected failures. Sources of panic:
 
 - index/slice out of range; integer divide-by-zero; signed overflow in debug
   builds (§13.5);
-- write to a `nil` map; send/close on a `nil` or closed channel; call of a `nil`
-  function; type assertion mismatch (single-result form);
+- write to a `nil` map; close of a `nil` channel; send or close on a closed
+  channel; call of a `nil` function; type assertion mismatch (single-result
+  form);
 - explicit `panic(msg)` builtin;
 - a failed `assert(cond)` / `assert(cond, msg)` builtin.
 
