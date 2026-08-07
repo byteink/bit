@@ -39,11 +39,16 @@ that compares against zero cannot tell a correct result from a wrong one.
 
 ### `min(a: f64, b: f64): f64`
 
-The smaller of the two.
+The smaller of the two, matching Go's `math.Min`. If either argument is NaN,
+the result is NaN. Of the two zeros, `-0.0` is smaller: `min(-0.0, 0.0)` and
+`min(0.0, -0.0)` are both `-0.0` — note `1.0 / result` to see the sign, since
+`-0.0 == 0.0` is true.
 
 ### `max(a: f64, b: f64): f64`
 
-The larger of the two.
+The larger of the two, matching Go's `math.Max`. If either argument is NaN,
+the result is NaN. Of the two zeros, `+0.0` is larger: `max(-0.0, 0.0)` and
+`max(0.0, -0.0)` are both `0.0` with the sign bit clear.
 
 ### `clamp(x: f64, lo: f64, hi: f64): f64`
 
