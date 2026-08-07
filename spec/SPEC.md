@@ -1926,8 +1926,9 @@ Every declared binding without an initializer is deterministically zero-valued:
   `nil` slice Go names, and a zero slice is always usable rather than a header
   that faults on the first `len`.
 - map, `chan`, function, interface → `nil`. Reading a `nil` map yields zero
-  values; **writing** a `nil` map, sending on a `nil` channel, or calling a `nil`
-  function **panics** (§18.4). Use the constructor forms (§12.9) to allocate.
+  values; **writing** a `nil` map, or calling a `nil` function, **panics**
+  (§18.4); sending on a `nil` channel blocks forever instead (§16.2). Use the
+  constructor forms (§12.9) to allocate.
 
 Every context that produces a zero value produces the *same* zero value: a
 declaration without an initializer, a missing map key (§12.6), a receive from a
@@ -2949,8 +2950,9 @@ errors and broken invariants, never for expected failures. Sources of panic:
 
 - index/slice out of range; integer divide-by-zero; signed overflow in debug
   builds (§13.5);
-- write to a `nil` map; send/close on a `nil` or closed channel; call of a `nil`
-  function; type assertion mismatch (single-result form);
+- write to a `nil` map; close of a `nil` channel; send or close on a closed
+  channel; call of a `nil` function; type assertion mismatch (single-result
+  form);
 - explicit `panic(msg)` builtin;
 - a failed `assert(cond)` / `assert(cond, msg)` builtin.
 
@@ -2966,10 +2968,12 @@ defer conn.release()
 
 `defer call` schedules a call to run when the enclosing **function** returns, by any
 path (normal `return`, `fail`, or propagation `?`), in **last-in-first-out** order.
-Deferred calls also run while a panic unwinds to the program's top (so cleanup
-happens before abort), but they cannot stop the panic. Deferred call arguments are
+Deferred calls do **not** run on a panic path: a panic (§18.4) aborts the process
+immediately, with no unwinding of any kind, deferred or otherwise. Cleanup that
+must happen before the process can die — releasing a lock, deleting a temp file —
+has to run explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
-deterministic resource release without finalizers.
+deterministic resource release without finalizers on every path that returns.
 
 ---
 

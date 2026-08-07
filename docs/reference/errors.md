@@ -140,8 +140,10 @@ function copyFile(src: string, dst: string): ()! {
 }
 ```
 
-Deferred calls also run while a panic unwinds to the top, so cleanup happens
-before abort - but they cannot stop the panic.
+Deferred calls do **not** run on a panic path: a panic aborts the process
+immediately, with no unwinding of any kind. Cleanup that must happen before the
+process can die - releasing a lock, deleting a temp file - has to run
+explicitly, before the call that may panic.
 
 ## Panics
 
@@ -151,8 +153,8 @@ invariants, never for expected failures. Sources include:
 
 - index or slice out of range; integer divide-by-zero; signed overflow in debug
   builds
-- writing a `nil` map; send/close on a `nil` or closed channel; calling a `nil`
-  function; a single-result type-assertion mismatch
+- writing a `nil` map; closing a `nil` channel; send/close on a closed channel;
+  calling a `nil` function; a single-result type-assertion mismatch
 - an explicit `panic(msg)`
 - a failed `assert(cond)` or `assert(cond, msg)`
 
