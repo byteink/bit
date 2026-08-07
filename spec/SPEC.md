@@ -2409,6 +2409,11 @@ usable as `u8`, `300` is not — compile error). Constant expressions are evalua
 at compile time with no overflow (overflow of the *final* target type is the
 representability error). This is the sole implicit-conversion path.
 
+An unconstrained non-negative integer literal that does not fit in the signed
+default (`i64`) — one whose value needs bit 63, e.g. `0xFFFFFFFFFFFFFFFF` or
+`18446744073709551615` — takes `u64` instead. A negative literal (`-1`) keeps
+the signed default regardless of magnitude.
+
 ---
 
 ## 16. Concurrency
