@@ -1544,8 +1544,8 @@ deadline check inside the loop is what actually ends every real call.
 **`hostTarget()` and `auxv()` are compiler `prim_rt_fns` entries — the CALLER side
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
 that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
-body called the primitive would therefore become a call to itself once #1369
-drops the `_root` infix (the pin cycle `tests/bit/rootpins.bit` guards). Both are now
+body called the primitive would therefore be a call to itself, now that #1369
+has dropped the `_root` infix (the pin cycle `tests/bit/rootpins.bit` guards). Both are
 PORTED regardless — `auxv` by #1617, `host_target` by #1635 — each by finding the
 answer somewhere other than the primitive:
 
@@ -1572,10 +1572,11 @@ answer somewhere other than the primitive:
   x86_64 exists only on Linux among the three recognised targets and Darwin is
   aarch64-only, so (provider, arch) names all three exactly; Darwin therefore needs
   no `asm` at all and returns the literal 2. The provider must never call
-  `hostTarget()` — that primitive lowers to a call to this very symbol once #1583
-  drops the `_root` infix (the pin cycle `tests/bit/rootpins.bit` guards) — and an
-  `asm` immediate is inline by construction, so there is no callee for the rename
-  to redirect. Verified running on all three targets, not just by disassembly:
+  `hostTarget()` — that primitive lowers to a call to this very symbol, now that
+  #1583 has dropped the `_root` infix (the pin cycle `tests/bit/rootpins.bit`
+  guards) — and an `asm` immediate is inline by construction, so there is no
+  callee for the rename to redirect. Verified running on all three targets, not
+  just by disassembly:
   `tests/stress/roothost{darwin,linux}`.
 - `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
   `bit_rt_auxv`'s provider is `runtime/root/root.bit` (#1617). The kernel places the
@@ -1584,10 +1585,10 @@ answer somewhere other than the primitive:
   `machoMain` captures none. The Bit Linux entry walks past `envp`'s NULL to the
   auxv array and stores its address, through `bit_rt_port_root_os_set_auxv`, into
   the cell `runtime/root/os.bit`'s `gAuxv` owns (beside `g_argc`/`g_argv`/`g_envp`);
-  the reader `bit_rt_root_auxv` (→ `bit_rt_auxv` at G2) hands that cell back. This
-  is the move promised above — ownership of the cell moves from `runtime/root/root.bit`'s
-  `g_auxv` to the boot layer (the old `g_auxv`/`bit_rt_auxv` stay live only
-  until the #1369 archive swap makes the Bit entry the real one). The reader
+  the reader `bit_rt_auxv` hands that cell back. This is the move promised
+  above — ownership of the cell moved from `runtime/root/root.bit`'s `g_auxv`
+  to the boot layer (the old `g_auxv`/`bit_rt_auxv` stayed live only until the
+  #1369 archive swap made the Bit entry the real one, which it now is). The reader
   reads `gAuxv` DIRECTLY, never through the `auxv()` primitive, precisely to avoid
   the self-reference the pin-cycle gate forbids; `runtime/auxv` still does the scan
   (`getauxval`) over what the reader returns, and `runtime/thread/linux` reads
