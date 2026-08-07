@@ -10,8 +10,18 @@
 # rejects — and for a long time it rejected nothing at all, silently compiling
 # `function f(): i32 { return "hi" }` into a binary that printed a raw pointer.
 #
-# Four outcomes, and the asymmetry between the last two is the point:
-#   MATCH    both compilers produce byte-identical diagnostics (or both none)
+# Four outcomes, and the asymmetry between the last two is the point. Verdict
+# (accept/reject) is read from the EXIT CODE, never from stderr emptiness —
+# #2499 fixed a proxy that misread any warning-severity diagnostic rendered on
+# an ACCEPTED program (#2491) as a rejection, because it used to classify by
+# whether the captured stderr text was empty instead of by $src/$brc:
+#   MATCH    both compilers reach the same accept/reject verdict, and — when
+#            both rejected — the rendered diagnostics are byte-identical. Both
+#            ACCEPTING is always a MATCH even if one side also rendered a
+#            warning the other's pinned oracle predates: this differential's
+#            job is accept/reject fidelity (see above), not warning-text
+#            parity on valid programs — that is diffverdict's explicit
+#            non-goal for the reject side, applied here to the accept side.
 #   MISSING  the seed rejects, bit2 accepts    — a gap: an emit site not ported
 #            yet. Expected to shrink; harmless (the seed is still the gate).
 #   FALSEPOS bit2 rejects, the seed accepts    — a BUG, and the dangerous one:
@@ -141,16 +151,25 @@ for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort);
   # A filter on a differential's ORACLE side can only ever hide a difference,
   # never reveal one — the same hazard #1883 deleted the expected-mismatch lists
   # for. Fix the cause; do not add another.
-  if [ "$seed" = "$b2" ]; then
+  #
+  # VERDICT FIRST, FROM THE EXIT CODE (#2499). $seed/$b2 text is consulted only
+  # to split a same-verdict REJECT into MATCH vs DIFF; it never decides
+  # accept-vs-reject, and a same-verdict ACCEPT is always MATCH regardless of
+  # text (see the header — this is deliberately not warning-text parity).
+  if [ "$src" -eq 0 ] && [ "$brc" -eq 0 ]; then
     match=$((match + 1))
-  elif [ -n "$seed" ] && [ -z "$b2" ]; then
-    missing=$((missing + 1))
-  elif [ -z "$seed" ] && [ -n "$b2" ]; then
+  elif [ "$src" -ne 0 ] && [ "$brc" -ne 0 ]; then
+    if [ "$seed" = "$b2" ]; then
+      match=$((match + 1))
+    else
+      diff=$((diff + 1))
+      [ -z "$firstdiff" ] && firstdiff="$f"
+    fi
+  elif [ "$src" -eq 0 ] && [ "$brc" -ne 0 ]; then
     falsepos=$((falsepos + 1))
     [ -z "$firstfp" ] && firstfp="$f"
   else
-    diff=$((diff + 1))
-    [ -z "$firstdiff" ] && firstdiff="$f"
+    missing=$((missing + 1))
   fi
 done
 echo "check differential: MATCH=$match MISSING=$missing FALSEPOS=$falsepos DIFF=$diff TIMEOUT=$timeout"
