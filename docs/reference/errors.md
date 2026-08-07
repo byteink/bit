@@ -140,8 +140,10 @@ function copyFile(src: string, dst: string): ()! {
 }
 ```
 
-Deferred calls also run while a panic unwinds to the top, so cleanup happens
-before abort - but they cannot stop the panic.
+Deferred calls do **not** run on a panic path: a panic aborts the process
+immediately, with no unwinding of any kind. Cleanup that must happen before the
+process can die - releasing a lock, deleting a temp file - has to run
+explicitly, before the call that may panic.
 
 ## Panics
 

@@ -2966,10 +2966,12 @@ defer conn.release()
 
 `defer call` schedules a call to run when the enclosing **function** returns, by any
 path (normal `return`, `fail`, or propagation `?`), in **last-in-first-out** order.
-Deferred calls also run while a panic unwinds to the program's top (so cleanup
-happens before abort), but they cannot stop the panic. Deferred call arguments are
+Deferred calls do **not** run on a panic path: a panic (§18.4) aborts the process
+immediately, with no unwinding of any kind, deferred or otherwise. Cleanup that
+must happen before the process can die — releasing a lock, deleting a temp file —
+has to run explicitly, before the call that may panic. Deferred call arguments are
 evaluated at the `defer` statement, not at execution time. `defer` gives
-deterministic resource release without finalizers.
+deterministic resource release without finalizers on every path that returns.
 
 ---
 
