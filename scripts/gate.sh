@@ -399,7 +399,7 @@ case "${BUCKET}" in
     # testing anything. The check after this case block now catches that class
     # before a single step runs — a bucket naming a nonexistent step is a
     # bucket that silently tests less than it claims.
-    BUILD_STEPS=(test-stress test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
+    BUILD_STEPS=(test-stress-exclusive test-stress-batch test-rootpins test-rootabi test-stwwiring test-abimembers test-pollfree)
     ;;
   testcases)
     BUILD_STEPS=(test-golden)
