@@ -34,15 +34,16 @@
 #
 # ## Why per-file and not per-module
 #
-# Not a preference — there is no module-level IR dump for a freestanding module:
+# Not a preference — there is no module-level IR dump. `--dump-ir-pre` reads
+# exactly one file (`readDumpSource` in compiler/main.bit calls `readFile` on
+# its argument) and lowers it standalone; a directory fails outright:
 #
-#     bit build runtime/gc --dump-ir-pre                 -> bit build: NoMain
-#     bit build runtime/root --dump-ir-pre --freestanding -> pass --emit-obj
+#     bit --dump-ir-pre runtime/gc   -> bit: cannot read runtime/gc   (rc=1)
+#     bit --dump-ir-pre runtime/root -> bit: cannot read runtime/root (rc=1)
 #
-# A runtime module has no `main`, and `--freestanding` (the flag that permits
-# that) forces object output. Adding `--dump-ir-pre` to the freestanding path is
-# a compiler feature, not a script; until then, per-file is the whole surface.
-# It happens to cost nothing: the walk below skips zero files.
+# Teaching it to resolve a directory as a module is a compiler feature, not a
+# script; until then, per-file is the whole surface. It happens to cost
+# nothing: the walk below skips zero files.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
