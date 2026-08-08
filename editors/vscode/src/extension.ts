@@ -40,10 +40,16 @@ function startClient(bitPath: string): LanguageClient {
     command: bitPath,
     args: ["lsp"],
     transport: TransportKind.stdio,
-    // argv0 reaches child_process.spawn verbatim and only renames the
-    // process's accounting name (ps/Activity Monitor); it does not change
-    // the exec path, so stdRootPath()/resolveNearExe() still resolve
-    // stdlib and libbitrt.a from bitPath as before.
+    // argv0 reaches child_process.spawn verbatim and sets the child's
+    // argv[0]. It does NOT set the kernel accounting name (`ps -o ucomm=`,
+    // which macOS derives from the resolved executable's filename), so this
+    // renames the server for `ps`, `pgrep -f`, `htop` and `lsof` but NOT for
+    // Activity Monitor's Process Name column — measured: comm=bit-lsp,
+    // ucomm=bit. A symlink named `bit-lsp` does not help either, because the
+    // name comes from the resolved target. See CHANGELOG 0.1.1.
+    //
+    // It does not change the exec path, so stdRootPath()/resolveNearExe()
+    // still resolve stdlib and libbitrt.a from bitPath as before.
     options: { argv0: "bit-lsp" } as ExecutableOptions & { argv0: string },
   };
   const clientOptions: LanguageClientOptions = {

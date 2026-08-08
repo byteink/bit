@@ -2,8 +2,22 @@
 
 ## 0.1.1
 
-- LSP child process now spawns with `argv0: "bit-lsp"`, so `ps`/Activity
-  Monitor show `bit-lsp` instead of a bare `bit`.
+- LSP child process now spawns with `argv0: "bit-lsp"`, so anything reading
+  `argv[0]` tells the server apart from a compile: `ps`, `pgrep -f`, `htop`
+  and `lsof` all show `bit-lsp lsp --stdio`.
+
+  **macOS Activity Monitor still shows `bit`, and no spawn-side change can
+  alter that.** Its Process Name column reads the kernel accounting name
+  (`ps -o ucomm=`), which macOS takes from the *resolved* executable's
+  filename at exec. `argv0` does not touch it, and neither does invoking
+  through a symlink named `bit-lsp` — both were measured, and `ucomm` stayed
+  `bit` in each case. Changing it would need a separately-named copy of the
+  binary on disk, or a `prctl(PR_SET_NAME)` equivalent, which macOS does not
+  provide.
+
+  On Linux the same split applies for the same reason: `/proc/pid/cmdline`
+  carries the new name so `ps`, `htop` and System Monitor show it, while
+  `/proc/pid/comm` stays `bit`, so `top` does not.
 
 ## 0.1.0
 
