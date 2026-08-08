@@ -2689,7 +2689,7 @@ example:
 ```json
 {
   "dependencies": {
-    "quicwire": "github.com/byteink/quicwire@v1.4.2",
+    "quicwire": "github.com/byteink/quicwire@^1.4.2",
     "http2util": "github.com/byteink/http2util@main",
     "scratch": "github.com/byteink/scratch@a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
   }
@@ -2698,15 +2698,58 @@ example:
 
 `ref` is exactly one of:
 
-- an exact tag `vMAJOR.MINOR.PATCH` (e.g. `v1.4.2`) — the only form MVS (below)
-  treats as an ordered version;
+- a **version constraint**, resolved against the target repository's git
+  tags — see **Version constraints**, below;
 - a branch name (e.g. `main`), resolved to that branch's current tip at
   resolution time; or
 - a bare commit SHA (full 40-character hex), resolved to exactly that commit.
 
-**No range operators.** `^`, `~`, `>=`, `<`, `x`, and every other
-range/wildcard spelling are rejected at parse time. A dependency names one
-exact ref; there is no version range for the resolver to pick from.
+**Version constraints.** A version constraint names a plain
+`MAJOR.MINOR.PATCH` — no `v` prefix — under exactly one of three forms:
+
+```
+version    = DIGITS "." DIGITS "." DIGITS .
+constraint = version | "^" version | "~" version .
+```
+
+- `MAJOR.MINOR.PATCH` (bare) — **exact**: matches that version only.
+- `^MAJOR.MINOR.PATCH` — matches every version reachable without a breaking
+  change, npm's "caret" rule:
+  - `^1.2.3` = `>=1.2.3 <2.0.0`
+  - `^0.1.2` = `>=0.1.2 <0.2.0` — below `1.0.0`, MAJOR `0` carries no
+    compatibility promise, so caret treats MINOR as the breaking boundary
+    instead.
+  - `^0.0.3` = `>=0.0.3 <0.0.4` — below `0.1.0`, PATCH carries no
+    compatibility promise either, so caret pins to that exact version.
+- `~MAJOR.MINOR.PATCH` — matches every version up to (but excluding) the
+  next MINOR:
+  - `~1.2.3` = `>=1.2.3 <1.3.0`
+  - `~0.1.2` = `>=0.1.2 <0.2.0`
+
+  `^0.1.2` and `~0.1.2` are the same range. This is intentional, not a
+  transcription error: below `1.0.0`, caret's breaking boundary and tilde's
+  MINOR boundary are the same boundary, so the two operators coincide for
+  every 0.x MINOR release — they diverge only at `1.0.0` and above. Since
+  every Bit package starts at `0.x`, this coincidence is the constraint form
+  a reader meets first, not an edge case.
+
+No other operator exists: `>=`, `<`, `*`, `||`, hyphen ranges
+(`1.2.3 - 1.4.0`), and every other npm/semver spelling beyond the two above
+are rejected at parse time. A dependency names exactly one of the three
+forms above; there is no broader range grammar to pick from.
+
+**No `v` prefix.** A version in `bit.json` — bare or under `^`/`~` — is
+written as plain semver; the previous `vMAJOR.MINOR.PATCH` form is gone.
+`bit add` accepts either spelling on its command line and writes the `v`-less
+form into `bit.json`; a `bit.json` containing a `v`-prefixed version is
+rejected at parse time, the same as any other malformed constraint.
+
+**Git tag matching.** A version constraint is resolved against the target
+repository's git tags: `MAJOR.MINOR.PATCH` matches a tag spelled either
+`vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH` — third-party repositories use
+both conventions, so resolution tries both rather than requiring one. If a
+repository tags the same version both ways, on different commits,
+`vMAJOR.MINOR.PATCH` takes precedence.
 
 **Vanity import resolution.** The leading path of a dependency value
 (everything before the final `@ref`) is either a **direct** git host spec or
@@ -2735,7 +2778,7 @@ page. For example:
 ```json
 {
   "dependencies": {
-    "http": "bitlang.org/pkg/http@v2.0.1"
+    "http": "bitlang.org/pkg/http@^2.0.1"
   }
 }
 ```
@@ -2810,24 +2853,27 @@ requires removing the dependency and re-adding it.
   `<gitURL>` — a static single-line GET has no reason to share a git
   clone's budget.
 
-**Resolution: Minimal Version Selection.** Bit resolves the dependency graph
-with Go-style MVS, not SAT-based range solving:
+**Resolution: one version per package per build.** Bit links with a flat
+symbol namespace, so a build resolves each package named anywhere in the
+transitive dependency graph — root and every transitive `bit.json`'s
+`dependencies` — to exactly **one** version. Two versions of the same
+package would define the same symbols twice, which is a duplicate-symbol
+failure at link time; Bit never resolves this the way npm does, by nesting a
+second copy so both versions coexist — a flat namespace has no place to put
+a second copy.
 
-1. Starting from the root module's `bit.json`, the resolver walks the
-   transitive requirement graph — every dependency's own `bit.json`
-   `dependencies`, recursively.
-2. For each distinct module named anywhere in that graph, the resolver
-   collects every stated minimum version for it and selects the **maximum**
-   of those minimums. Non-version refs (a branch or a bare commit SHA) are
-   not compared against tagged versions; a module reachable only through such
-   a ref resolves to exactly that ref.
-3. The result is deterministic and requires no backtracking and no SAT
-   search: one pass over the graph, one selection per module, done.
+For each package, the resolved version is the one satisfying every
+constraint stated against that package anywhere in the graph. A branch name
+or a commit SHA is not a version and is never weighed against a version
+constraint: a package reachable only through such a ref resolves to exactly
+that ref, and every other requirer of the same package must name that
+identical ref, or resolution fails as described next.
 
-This is the same rule as `go.mod`: the resolved version of any module is
-never higher than some `dependencies` entry actually requires, and never
-lower than the highest of all requirements — the *minimum* version that
-satisfies every requirer, not the *latest* available.
+If no single version satisfies every constraint stated against some
+package, resolution is a **hard error** naming that package and every
+conflicting requirement — each requiring package together with the
+constraint it stated. There is no fallback and no partial resolution: an
+unsatisfiable constraint set stops the build.
 
 **`bit.lock`.** Resolution output is written to `bit.lock`, a plain-JSON file
 (no comments, no trailing commas — unlike `bit.json`'s JSONC) in the project
@@ -2841,7 +2887,7 @@ Per resolved dependency it records:
     "url": "https://github.com/byteink/quicwire.git",
     "commit": "9f8e7d6c5b4a3928170695e4d3c2b1a0f9e8d7c",
     "requires": {
-      "streambuf": "github.com/byteink/streambuf@v0.9.0"
+      "streambuf": "github.com/byteink/streambuf@^0.9.0"
     }
   }
 }
@@ -2851,8 +2897,8 @@ Per resolved dependency it records:
 - `commit` — the exact resolved commit SHA (a tag or branch ref is dereferenced
   to its commit before being recorded; `bit.lock` never stores a mutable ref).
 - `requires` — that dependency's own transitive requirement list, verbatim
-  from its `bit.json`, so MVS can re-run from the lockfile alone without
-  re-fetching every transitive dependency's manifest.
+  from its `bit.json`, so resolution can re-run from the lockfile alone
+  without re-fetching every transitive dependency's manifest.
 
 **No install-time code execution.** Fetching a dependency reads only its
 `bit.json` and source tree. There is no build script, no postinstall hook,
