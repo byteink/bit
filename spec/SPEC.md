@@ -122,7 +122,7 @@ Reserved; may not be used as identifiers:
 ```
 as       break     case      catch     chan      const
 continue default   defer     else      enum      export
-fail     false     for       from      function  if
+fail     false     fn        for       from      if
 import   in        interface let       map       match
 nil      of        return    select    spawn     struct
 switch   true      type      while
@@ -482,12 +482,17 @@ are no nominal newtypes in v0.1.
 ### 10.3 Function Declarations
 
 ```
-func_decl     = [ attr_list ] "function" IDENT [ generic_params ] signature block .
+func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
 result_type   = type .            (* may carry the fallible marker, §18 *)
 ```
+
+**Bootstrap bridge, one release only:** the lexer also accepts `function` as a
+synonym for `fn` here, solely so compiler source still built by the previous
+stage0 release (which parses `function` only) keeps compiling until a release
+carrying `fn` exists and the pin moves. #2773 removes the alias from the lexer.
 
 - The return type is written after `:`. If omitted, the function returns nothing
   (its result type is the empty tuple `()`, i.e. "void").
@@ -662,7 +667,7 @@ Methods attach a named function to a struct or type-alias target via an explicit
 receiver placed before the method name:
 
 ```
-method_decl = [ "export" ] "function" "(" receiver ")" IDENT [ generic_params ] signature block .
+method_decl = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver    = IDENT ":" type_name .
 ```
 
@@ -989,7 +994,7 @@ must reach the kernel through libSystem, because Apple does not guarantee stable
 syscall numbers and reserves the right to renumber them.
 
 ```
-extern_fn_decl = "extern" "function" IDENT signature .
+extern_fn_decl = "extern" "fn" IDENT signature .
 ```
 
 - `extern` is a **contextual** keyword — an ordinary identifier everywhere else.
@@ -3173,10 +3178,10 @@ pat           = IDENT | "_" | tuple_pat .
 
 type_alias    = "type" IDENT [ generic_params ] "=" type .
 
-func_decl     = [ attr_list ] "function" IDENT [ generic_params ] signature block .
+func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
 attr          = "@" IDENT .
-method_decl   = [ "export" ] "function" "(" receiver ")" IDENT [ generic_params ] signature block .
+method_decl   = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
