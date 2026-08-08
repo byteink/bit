@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- LSP child process now spawns with `argv0: "bit-lsp"`, so `ps`/Activity
+  Monitor show `bit-lsp` instead of a bare `bit`.
+
 ## 0.1.0
 
 - Syntax highlighting and language configuration for `.bit` files.

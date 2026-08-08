@@ -3,6 +3,7 @@ import * as fs from "fs";
 import { execFile } from "child_process";
 import * as vscode from "vscode";
 import {
+  ExecutableOptions,
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
@@ -39,6 +40,11 @@ function startClient(bitPath: string): LanguageClient {
     command: bitPath,
     args: ["lsp"],
     transport: TransportKind.stdio,
+    // argv0 reaches child_process.spawn verbatim and only renames the
+    // process's accounting name (ps/Activity Monitor); it does not change
+    // the exec path, so stdRootPath()/resolveNearExe() still resolve
+    // stdlib and libbitrt.a from bitPath as before.
+    options: { argv0: "bit-lsp" } as ExecutableOptions & { argv0: string },
   };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "bit" }],
