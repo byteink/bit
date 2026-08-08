@@ -1,10 +1,12 @@
 # Bit release artifacts — the packaging contract
 
 This file is the contract between the release pipeline
-(`dist/release.sh`, run from a maintainer machine) and everything downstream that
-consumes a published release: the Homebrew tap (#359), the `curl | sh`
-installer (#360), and the PowerShell/winget path (#361). Change this file first,
-then the pipeline, then the consumers.
+(`dist/release.sh`, run by hand from a maintainer machine, never from CI — this
+repo has no GitHub Actions and never will, see `CONTRIBUTING.md`'s "No GitHub
+Actions") and everything downstream that consumes a published release:
+the Homebrew tap (#359), the `curl | sh` installer (#360), and the
+PowerShell/winget path (#361). Change this file first, then the pipeline, then
+the consumers.
 
 ## Which targets actually ship
 
@@ -21,10 +23,12 @@ The compiler has three build targets — `bit build --target` accepts exactly
 | `x86_64-windows` | `bit-<version>-windows-x86_64.zip`  | **not built** — blocked on #1103 (PE/COFF writer); the runtime also `@compileError`s outside POSIX |
 | `aarch64-windows` | `bit-<version>-windows-aarch64.zip` | **not built** — same blockers as above |
 
-The workflow's `dist-*` jobs take the target as a matrix entry, so enabling a
-target later is one matrix line plus one `case` arm in `dist/package.sh`. Do not
-publish a placeholder for an unbuilt target: a missing artifact is a clear
-failure downstream, a broken one is a silent one.
+`dist/release.sh` is a maintainer-run script with no CI behind it (this repo
+has no GitHub Actions and never will; see `CONTRIBUTING.md`'s "No GitHub
+Actions"). It loops over a plain `TARGETS` array, so enabling a target later is
+one array entry in `dist/release.sh` plus one `case` arm in `dist/package.sh`.
+Do not publish a placeholder for an unbuilt target: a missing artifact is a
+clear failure downstream, a broken one is a silent one.
 
 ## Naming
 
@@ -112,8 +116,8 @@ generate a wrapper.
 ## Checksums
 
 One `SHA256SUMS` file per release covers **every** published artifact. It is
-produced by GNU `sha256sum` on the release job, so it is the standard two-space
-format with bare filenames (no directory components):
+produced by `dist/release.sh` running macOS `shasum -a 256`, so it is the
+standard two-space format with bare filenames (no directory components):
 
 ```
 <64 hex>  bit-0.1.0-rc1-linux-x86_64.tar.xz
@@ -132,17 +136,35 @@ yet, so this file is the only integrity check a downloader gets.
 
 ## How the pipeline is verified
 
-The `dist` job smoke-tests the **unpacked artifact**, not the staging tree: it
-untars into an unrelated directory, symlinks `bin/bit` into `PATH` with **no**
-environment set, and requires `bit` to compile and run a program from an
-unrelated cwd. Testing the shipped bytes rather
-than the build tree is what caught macOS `bsdtar` writing an AppleDouble
-`._<name>.bit` beside every stdlib source — files the shipped compiler then
-globbed as real input, breaking every macOS artifact. A staging-tree test passed
-that build happily. Keep the ordering.
+`dist/release.sh`'s own `smoke()` function smoke-tests the **unpacked
+artifact**, not the staging tree: it untars into an unrelated directory, sets
+`BIT_STDLIB`/`BIT_LIBBITRT` explicitly, and requires `bit` to compile and run a
+program from an unrelated cwd. Testing the shipped bytes rather than the build
+tree is what caught macOS `bsdtar` writing an AppleDouble `._<name>.bit` beside
+every stdlib source — files the shipped compiler then globbed as real input,
+breaking every macOS artifact. A staging-tree test passed that build happily.
+Keep the ordering.
 
-Cross-built targets are smoke-tested under `qemu-user-static` on the runner, so
-no artifact is published without having executed at least once.
+The native target (`aarch64-macos`) is smoke-tested directly on the machine
+cutting the release. `aarch64-linux` runs in a local Docker container;
+`x86_64-linux` runs over ssh on a real x86-64 host, resolved by
+`scripts/x64host.sh`. Deliberately **not** emulated for x86_64: an emulation
+artifact is not a pass. No artifact is published without having executed at
+least once on hardware matching its target.
+
+## Container image
+
+`ghcr.io/byteink/bit` is built from the release artifacts by
+`docker/toolchain.Dockerfile` — not from source, so the image ships exactly the
+bytes `dist/release.sh` already produced and verified. This is a separate,
+manual step, by decision: unlike a draft GitHub release, a pushed container tag
+is live on completion with no undraft step, so it stays out of
+`dist/release.sh` on purpose. See `docker/toolchain.Dockerfile`'s own header for
+the exact `docker buildx` invocation and the anonymous-pull verification.
+
+**Ordering constraint:** push the ghcr image before deploying bitlang.org.
+`bit-website/Dockerfile`'s build stage is `FROM ghcr.io/byteink/bit:<version>`
+pinned to an exact tag, so a missing tag 404s that deploy.
 
 ## Version reporting
 
