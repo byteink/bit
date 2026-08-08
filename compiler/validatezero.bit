@@ -1,0 +1,399 @@
+// Self-host: §13.4 zero-value validation (#2573, split out as its own sibling
+// file — validateiface.bit was 879 lines against the 800-line limit). This is
+// the E0083/#1914 struct-typed-field-has-no-zero-value family plus the
+// composite-literal slot checks it shares a boundary with; validateiface.bit
+// keeps interface satisfaction/assignment and the §12.9 conversions.
+
+// ---- §13.4: a struct-typed field has no zero value (E0083, #1914) ----------
+//
+// SPEC §13.4 used to promise that every omitted field "takes its zero value",
+// and for a scalar, a string, a slice or a map that is exactly what the zeroed
+// `gc_alloc` hands back. It is NOT true of a field whose own type is a struct:
+// structs are references, so zero bits there is a NULL, and reading through it
+// segfaults with no diagnostic, arbitrarily far from the literal that made it.
+// Worse than the crash, an omitted field left holding a plausible address is a
+// false GC root — `gcMarkConservative` follows it and decodes a header that is
+// not one.
+//
+// Three fixes were possible and the operator chose the third:
+//
+//   1. fill one level (what shipped first) — still leaves a reachable SIGSEGV
+//      two structs deep, because the fill's own `zeroValue` does not recurse;
+//   2. fill every level, truncated at a type-graph cycle — the cycle still
+//      hands back a null, so the guarantee keeps a hole, and every such literal
+//      allocates a whole subtree it did not ask for;
+//   3. refuse. A struct type with a struct-typed field HAS NO ZERO VALUE and
+//      cannot be default-constructed. Rust takes the same position.
+//
+// So there is one rule and no fallback. The cost is bounded and was measured
+// before the change: 7 sites in the whole tree, all in `compiler/`, none in the
+// 46 examples and none of the initializer-less form.
+//
+// Arrays and slices are deliberately unaffected — an array is inline storage
+// and a slice's zero value is a real empty slice, so their zero bits are valid.
+// `[N]Struct` cannot arise at all (E0072 rejects a reference-typed array
+// element), and `[]Struct(n)`'s null elements are a different defect with a
+// different fix (#1924), not this rule.
+//
+// Both surfaces below are permissive on anything they cannot resolve — an
+// unresolved type or a missing declaration reports nothing, per the validator's
+// standing rule that inventing an error breaks a working build.
+
+// The names of `structTy`'s fields whose own type is a struct, in declaration
+// order, joined as `'a', 'b'` for a message. `named` is the literal's
+// initializer list; a field it names is not missing. Pass an empty list to get
+// every struct-typed field, which is what the initializer-less form needs.
+function vMissingStructFields(c: Checker, structTy: int, named: []int): string {
+  let decl = structDeclOf(c, structTy)
+  if (decl == 0) {
+    return ""
+  }
+  let oc = typeOwner(c, structTy)
+  let missing = ""
+  for f of structFieldNodes(oc, decl) {
+    let fn = getNode(oc.tree, kidsOf(oc.tree, f)[0])
+    let name = oc.source[fn.span.start:fn.span.end]
+    // BY NAME against the instantiation, not the declaration node: a generic
+    // `Box<Inner>` must see `Inner` where the decl says `T`. `structFieldLookup`
+    // is keyed on the instantiated type id, so it already carries the
+    // substitution `typeFromNodeIn` would have to redo.
+    let fty = structFieldLookup(c, "${structTy}." + name)
+    if (fty == 0 || c.ctx.types[fty].kind != TypeKind.Struct) {
+      continue
+    }
+    if (vLitNamesField(c, named, name)) {
+      continue
+    }
+    if (missing != "") {
+      missing = missing + ", "
+    }
+    missing = missing + "'" + name + "'"
+  }
+  return missing
+}
+
+// ---- E0057 a struct literal naming a field the struct does not have --------
+//
+// #2230. `User{ nmae: "ana" }` exited `bit check` 0, passed `bit lint`, and then
+// failed at LOWERING with "cannot lower 1 function(s)" — no file, no line, no
+// caret, no mention of the key. Reading the same misspelling (`u.emial`) has
+// always been a properly spanned E0057, so the diagnostic and the field lookup
+// both existed; only the literal path consulted neither.
+//
+// Judged against the DECLARATION's field nodes, not `structFields`. The member
+// tables record a field whose own type did not resolve with type 0, which a
+// lookup cannot tell apart from "no such field" — the read that invented 13
+// E0057s across stdlib/crypto (see vMember). Field NAMES come off the decl and
+// need no type to resolve, so this judges the one thing that is always known.
+//
+// Permissive when there is no reachable declaration (`structDeclOf == 0`): a
+// single-file check of a multi-file module cannot see the decl, and inventing an
+// error there breaks a working build. A declaration WITH no fields still judges
+// — `Empty{ x: 1 }` names a field `Empty` does not have.
+//
+// A generic instantiation resolves to its base template's decl (`typeName`
+// renders `Box<i64>` as `Box`), and substitution never renames a field, so the
+// name set is the right one for every instance.
+function vLitUnknownField(c: Checker, target: int, nameNode: int, fname: string) {
+  let decl = structDeclOf(c, target)
+  if (decl == 0) {
+    return
+  }
+  let oc = typeOwner(c, target)
+  let names = []string(0)
+  for f of structFieldNodes(oc, decl) {
+    let fn = getNode(oc.tree, kidsOf(oc.tree, f)[0])
+    let n = oc.source[fn.span.start:fn.span.end]
+    if (n == fname) {
+      return
+    }
+    names = append(names, n)
+  }
+  let tn = typeName(c.ctx, target)
+  let hint = vClosestFieldName(names, fname)
+  if (hint == "") {
+    reportNoHint(c.diags, ecUnknownMember, vSpan(c, nameNode),
+      "no field '${fname}' on '${tn}'")
+    return
+  }
+  report(c.diags, ecUnknownMember, vSpan(c, nameNode),
+    "no field '${fname}' on '${tn}'", "did you mean '${hint}'?")
+}
+
+// The name in `names` closest to `wanted`, or "" when none is within edit
+// distance 3 — the field-side twin of `vClosestMethodName`, sharing its
+// threshold and its first-visited tie-break so a typo in a literal and a typo in
+// a read suggest by the same rule.
+function vClosestFieldName(names: []string, wanted: string): string {
+  let best = ""
+  let bestDist = 64 + 1
+  for n of names {
+    let d = vEditDistance(n, wanted)
+    if (d < bestDist) {
+      bestDist = d
+      best = n
+    }
+  }
+  if (bestDist > 3) {
+    return ""
+  }
+  return best
+}
+
+// Whether a composite literal's initializer list names field `name`.
+function vLitNamesField(c: Checker, inits: []int, name: string): bool {
+  for it of inits {
+    if (getNode(c.tree, it).tag != Tag.FieldInit) {
+      continue
+    }
+    let fn = getNode(c.tree, kidsOf(c.tree, it)[0])
+    if (c.source[fn.span.start:fn.span.end] == name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Surface (1): `Outer{ a: 1 }` leaving out a struct-typed `b`.
+function vCompositeNoOmitted(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0 || c.ctx.types[target].kind != TypeKind.Struct) {
+    return
+  }
+  let missing = vMissingStructFields(c, target, kidsOf(c.tree, kids[1]))
+  if (missing == "") {
+    return
+  }
+  // Every missing field in ONE diagnostic, not one each: they share a span and
+  // a cause, and reporting them separately means fixing the literal N times.
+  report(c.diags, ecNoZeroValue, vSpan(c, node),
+    "'${typeName(c.ctx, target)}' literal omits struct-typed field(s) ${missing}",
+    "a struct is a reference and has no zero value, so an omitted struct-typed field would be null rather than a zeroed body — give each one a value (§13.4)")
+}
+
+// Surface (2): `let o: Outer` with no initializer at all. Not reachable from
+// vCompositeNoOmitted — there is no literal to inspect — so it hangs off the
+// binding instead, and it is the case `lowerctrl.bit`'s zero-value path used to
+// answer with a null.
+function vBindingNoZeroValue(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [pat, annotation, init]
+  if (len(kids) < 3 || kids[1] == 0 || kids[2] != 0) {
+    return
+  }
+  let ty = typeFromNode(c, kids[1])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Struct) {
+    return
+  }
+  let missing = vMissingStructFields(c, ty, []int(0))
+  if (missing == "") {
+    return
+  }
+  report(c.diags, ecNoZeroValue, vSpan(c, node),
+    "'${typeName(c.ctx, ty)}' cannot be default-constructed: struct-typed field(s) ${missing} have no zero value",
+    "give the binding an initializer naming them, e.g. `= ${typeName(c.ctx, ty)}{ ... }` (§13.4)")
+}
+
+// `[]T(...)` takes ONE length (or a length and a capacity), and anything else is
+// E0050 (#1921).
+//
+// The lowering read argument 0 as the length and never looked at `len(args)`, so
+// `[]u8(127, 69, 76, 70)` took 127 as the length and DISCARDED the other three,
+// producing a 127-byte run of zeroes. That is the dangerous shape rather than a
+// cosmetic one: it reads exactly like a byte-slice literal — the spelling most
+// bracket-style languages use for one — and it yields a plausible non-empty
+// slice instead of failing. It was found in `compiler/archivecheck.bit`, where a
+// magic-number predicate was handed a 127-zero-byte buffer, correctly returned
+// false, and so the assertion meant to prove ELF magic is ACCEPTED proved
+// nothing. A test that cannot fail is worse than no test.
+//
+// Zero arguments is the same defect from the other end: `[]u8()` type-checked
+// clean and only failed later as "cannot lower 1 function(s)", a message that
+// names neither the expression nor the problem.
+//
+// Deliberately NOT made to construct a literal from its arguments. That is a
+// language change needing a SPEC decision, and `[]byte("\x7fELF")` already
+// covers the case — so the diagnostic points there rather than inventing a form.
+function vSliceAllocArity(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3 || getNode(c.tree, kids[0]).tag != Tag.SliceType) {
+    return
+  }
+  let ty = typeFromNode(c, kids[0])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Slice) {
+    return
+  }
+  let n = len(kidsOf(c.tree, kids[2]))
+  if (n == 1 || n == 2) {
+    return
+  }
+  let name = typeName(c.ctx, ty)
+  if (n == 0) {
+    report(c.diags, ecArgCount, vSpan(c, node),
+      "'${name}()' needs a length: '${name}(n)' makes a slice of n zero values",
+      "or convert a string with `[]byte(s)`, or write the elements as `${name}{ ... }` (§12.9)")
+    return
+  }
+  report(c.diags, ecArgCount, vSpan(c, node),
+    "'${name}(n)' takes one length argument and an optional capacity, got ${n}",
+    "this is the sized constructor, not an element list — write the elements as `${name}{ ... }`, or bytes as `[]byte(\"...\")` (§12.9)")
+}
+
+// Surface (3): `[]S(n)`, whose whole meaning is "n zero values of S" (§12.9), so
+// an element type with no zero value cannot be filled — and unlike the literal
+// forms there is no longer spelling to fall back to.
+//
+// REPORTED ONLY WHEN `n` IS A CONSTANT GREATER THAN ZERO, which is the whole
+// subtlety here. `[]T(0)` asks for NO zero values, so it asks for nothing that
+// cannot be given, and it is the idiomatic empty slice — `[]CstEntry(0)` in the
+// JSON corpus is exactly that shape. A blanket rejection failed five golden
+// cases on code that was never unsafe.
+//
+// A non-constant `n` cannot be decided here, so it is not decided here: the
+// lowering emits a panic in the fill loop's body, which is unreachable when `n`
+// is zero and deterministic when it is not (`fillStructElems`). Static where the
+// answer is static, dynamic only where it has to be — the array-bounds split,
+// not a second opinion about the same question.
+//
+// The callee-tag test mirrors `lowerCall`'s dispatch: a `Tag.SliceType` in call
+// position is the length-sized allocation. `[]byte(s)` reaches here too and is
+// filtered out by the element kind, being a prim.
+function vSliceAllocNoZeroValue(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node)
+  if (len(kids) < 3 || getNode(c.tree, kids[0]).tag != Tag.SliceType) {
+    return
+  }
+  let ty = typeFromNode(c, kids[0])
+  if (ty == 0 || c.ctx.types[ty].kind != TypeKind.Slice) {
+    return
+  }
+  let elem = c.ctx.types[ty].elem
+  if (elem == 0 || c.ctx.types[elem].kind != TypeKind.Struct) {
+    return
+  }
+  let args = kidsOf(c.tree, kids[2])
+  if (len(args) == 0) {
+    return
+  }
+  let n = args[0]
+  if (getNode(c.tree, n).tag == Tag.Arg) {
+    n = kidsOf(c.tree, n)[0]
+  }
+  let cv = vConstEval(c, n, 0)
+  if (!cv.ok || cv.kind != vcInt || cv.ival <= 0) {
+    return
+  }
+  let missing = vMissingStructFields(c, elem, []int(0))
+  if (missing == "") {
+    return
+  }
+  report(c.diags, ecNoZeroValue, vSpan(c, node),
+    "'${typeName(c.ctx, elem)}' has no zero value, so '${typeName(c.ctx, ty)}(${cv.ival})' cannot fill its elements: struct-typed field(s) ${missing}",
+    "build the slice from values instead, e.g. `${typeName(c.ctx, ty)}{ ... }`, or start from `${typeName(c.ctx, ty)}(0)` and append (§13.4)")
+}
+
+
+// ---- composite literals `S{...}` / `map<K,V>{...}` / `[]T{...}` / `[N]T{...}`
+// Each field, entry and element against its declared slot type, plus the array
+// length rule. The typed `[N]T{...}` is the ONLY form SPEC.md admits for
+// constructing an array value (§11.2, §12.3), and its element count must equal
+// N (§12.3: "length must match").
+//
+// Last cell of the #1470 class. Unchecked, `let a: [2]f32 = [2]f32{4.5}` built
+// a 2-element array from one initializer and the second slot read uninitialized
+// heap — the same memory-safety shape as the bare-list length mismatch, just
+// reached through the form that IS legal.
+//
+// The slot types are the same #1470 hole as the annotated binding, reached
+// through a different syntax: before this, `S{ v: "s" }` for an `f32` field and
+// `map<i32,i32>{4.5: 1}` were both accepted by the self-hosted compiler and
+// rejected by the seed. Everything routes through vExpectExpr so the element of
+// a composite gets the identical treatment a binding's initializer gets.
+//
+// Interface-typed slots route to vIfaceStore, which emits the §14.3 wording —
+// the same split the call path uses with vCallArgIface. The two are mutually
+// exclusive (each returns unless the slot is / is not an interface), so a slot
+// asks both.
+//
+// The E0050 length rule is whole-literal and lands BEFORE any element, matching
+// checkCompositeLit: it reports the count, then calls checkSeqInit.
+function vCompositeArrayLen(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0) {
+    return
+  }
+  if (c.ctx.types[target].kind != TypeKind.Array) {
+    return
+  }
+  // Only the ARRAY form has a length rule; a `[]T{...}` slice literal has no
+  // fixed len. Seed's exact text and span.
+  let want = c.ctx.types[target].arrayLen
+  let got = len(kidsOf(c.tree, kids[1]))
+  if (got != want) {
+    reportNoHint(c.diags, ecArgCount, vSpan(c, node),
+      "array literal has ${got} element(s), expected ${want}")
+  }
+}
+
+// One SLOT of the composite literal `lit`: `item` is a FieldInit / MapEntry /
+// Arg, and `slot` picks a map entry's value (1) from its key (0) — every other
+// form has only slot 0.
+//
+// Per-slot, not per-literal, so the caller can interleave each judgement with
+// the descent into that slot's own expression. The seed checks a slot's
+// expression (reporting everything nested) and only THEN its assignability, so
+// a whole-literal pre-order pass emits the identical diagnostics in the wrong
+// sequence (#1489).
+//
+// Struct-literal FIELD types were the last declared-type slot in the language to
+// get assignability checking (#1476, closing the #1470 class). It was held out
+// because the recompute it needs panicked "index out of range" on all 10 corpus
+// files reaching stdlib/http; that was a genuine cross-module bug in the
+// match-scrutinee type-argument recovery this checker used to lean on, not a
+// reason to skip the check, and it was fixed at the source rather than avoided
+// here.
+function vCompositeSlot(c: Checker, lit: int, item: int, slot: int) {
+  let kids = kidsOf(c.tree, lit) // [type, init]
+  let target = typeFromNode(c, kids[0])
+  if (target == 0) {
+    return
+  }
+  let tk = c.ctx.types[target].kind
+  if (tk == TypeKind.Struct) {
+    if (slot != 0 || getNode(c.tree, item).tag != Tag.FieldInit) {
+      return
+    }
+    let fk = kidsOf(c.tree, item) // [name, expr]
+    let fnn = getNode(c.tree, fk[0])
+    let fname = c.source[fnn.span.start:fnn.span.end]
+    vLitUnknownField(c, target, fk[0], fname)
+    let want = structFieldLookup(c, "${target}." + fname)
+    vExpectExprNonIface(c, fk[1], want)
+    vIfaceStore(c, fk[1], want)
+    return
+  }
+  if (tk == TypeKind.Map) {
+    if (getNode(c.tree, item).tag != Tag.MapEntry) {
+      return
+    }
+    let mk = kidsOf(c.tree, item) // [key, val]
+    let want = c.ctx.types[target].mapKey
+    let e = mk[0]
+    if (slot == 1) {
+      want = c.ctx.types[target].mapVal
+      e = mk[1]
+    }
+    vExpectExprNonIface(c, e, want)
+    vIfaceStore(c, e, want)
+    return
+  }
+  if (slot != 0 || (tk != TypeKind.Slice && tk != TypeKind.Array)) {
+    return
+  }
+  let elem = c.ctx.types[target].elem
+  let e = item
+  if (getNode(c.tree, e).tag == Tag.Arg) { e = kidsOf(c.tree, e)[0] }
+  vExpectExprNonIface(c, e, elem)
+  vIfaceStore(c, item, elem)
+}
