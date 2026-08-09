@@ -740,7 +740,7 @@ type = type_name
 type_name    = IDENT .                          (* primitive, struct, interface, alias, or type param *)
 slice_type   = "[" "]" type .                   (* []T   dynamic, reference *)
 array_type   = "[" const_expr "]" type .        (* [N]T  fixed, value *)
-const_expr   = expr .                           (* folded at compile time; see below *)
+const_expr   = expression .                     (* folded at compile time; see below *)
 map_type     = "map" "<" type "," type ">" .    (* map<K,V> reference *)
 tuple_type   = "(" type "," type { "," type } ")" .   (* at least 2 elements *)
 func_type    = "(" [ type { "," type } ] ")" "=>" result_type .
@@ -3204,7 +3204,7 @@ type          = type_name | slice_type | array_type | map_type | tuple_type
 type_name     = IDENT .
 slice_type    = "[" "]" type .
 array_type    = "[" const_expr "]" type .
-const_expr    = expr .
+const_expr    = expression .
 map_type      = "map" "<" type "," type ">" .
 tuple_type    = "(" type "," type { "," type } ")" .
 func_type     = "(" [ type { "," type } ] ")" "=>" result_type .
