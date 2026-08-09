@@ -19,9 +19,10 @@
 #      hardware that matches it. Not the staging tree: the bytes that ship are
 #      the only thing worth testing, and this is what caught macOS serialising
 #      xattrs into every member.
-#   5. SHA256SUMS over the artifacts
-#   6. release notes from conventional commits
-#   7. `gh release create --draft` and upload
+#   5. generate a CycloneDX SBOM (dist/sbom.py) in a throwaway venv
+#   6. SHA256SUMS over every artifact, including the SBOM
+#   7. release notes from conventional commits
+#   8. `gh release create --draft` and upload
 #
 # Nothing here needs a token beyond the `gh` login already on this machine.
 set -euo pipefail
@@ -65,6 +66,12 @@ echo "release.sh: resolving the pinned stage0"
 # Downloads + digest-verifies against dist/stage0/SHA256SUMS; refuses on failure.
 STAGE0="$(sh scripts/stage0.sh)"
 echo "release.sh: stage0 = ${STAGE0}"
+# The SBOM's metadata.tools entry names stage0 by VERSION, not by path. Asking
+# the resolved binary itself (rather than re-parsing dist/stage0/SHA256SUMS'
+# header comment) means there is one source of truth for which release stage0
+# is — the same one scripts/stage0.sh already verified the digest of.
+STAGE0_VERSION="$("${STAGE0}" version | awk '{print $2}')"
+echo "release.sh: stage0 version = ${STAGE0_VERSION}"
 ./make
 
 rm -rf "${OUT}"
@@ -416,8 +423,25 @@ else
 	exit 1
 fi
 
+# --- SBOM --------------------------------------------------------------------
+#
+# dist/sbom.py needs cyclonedx-python-lib, which this Mac does not carry
+# system-wide (#2748: a fifth release artifact, dist/README.md's "## SBOM",
+# was never generated because nothing called the generator). A throwaway venv,
+# torn down right after, is the same isolation dist/sbom_test.py already uses —
+# pinned by the same dist/sbom-requirements.txt so the two never drift apart —
+# so this leaves no package installed on the host.
+echo "release.sh: generating SBOM"
+sbomVenv="$(mktemp -d)"
+python3 -m venv "${sbomVenv}"
+"${sbomVenv}/bin/pip" install --quiet --require-hashes -r dist/sbom-requirements.txt
+"${sbomVenv}/bin/python3" dist/sbom.py "${VERSION}" "${STAGE0_VERSION}" \
+	> "${OUT}/bit-${VERSION}.cdx.json"
+rm -rf "${sbomVenv}"
+echo "release.sh: wrote ${OUT}/bit-${VERSION}.cdx.json"
+
 # --- checksums and notes ----------------------------------------------------
-( cd "${OUT}" && shasum -a 256 ./*.tar.xz | sed 's#\./##' > SHA256SUMS )
+( cd "${OUT}" && shasum -a 256 ./*.tar.xz ./*.cdx.json | sed 's#\./##' > SHA256SUMS )
 echo "release.sh: SHA256SUMS"
 cat "${OUT}/SHA256SUMS" | sed 's/^/  /'
 
@@ -439,14 +463,14 @@ case "${VERSION}" in *-*) args+=(--prerelease) ;; esac
 
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
 	echo "release.sh: v${VERSION} exists; uploading assets with --clobber"
-	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}/SHA256SUMS" --clobber
+	gh release upload "v${VERSION}" "${OUT}"/*.tar.xz "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS" --clobber
 else
 	# --target pins the new tag to the tree that was actually built and smoke-tested
 	# (#1856). Only meaningful on this branch: for an existing tag gh ignores it,
 	# which is correct — the tag is already placed and re-cutting must not move it.
 	echo "release.sh: tagging v${VERSION} at ${BUILT_COMMIT}"
 	gh release create "v${VERSION}" --target "${BUILT_COMMIT}" "${args[@]}" \
-		"${OUT}"/*.tar.xz "${OUT}/SHA256SUMS"
+		"${OUT}"/*.tar.xz "${OUT}"/*.cdx.json "${OUT}/SHA256SUMS"
 fi
 
 # Report what the release ACTUALLY is now, not what --draft asked for: re-cutting
