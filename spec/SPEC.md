@@ -507,7 +507,7 @@ An attribute constrains how a function is compiled. Attributes precede
 
 ```
 attr_list     = attr { attr } .
-attr          = "@" IDENT [ "(" string_lit ")" ] .
+attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
 ```
 
 `export` stays outermost: `export @naked fn f() {}`. An attribute list may
@@ -3172,7 +3172,7 @@ type_alias    = "type" IDENT [ generic_params ] "=" type .
 
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
-attr          = "@" IDENT [ "(" string_lit ")" ] .
+attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
 method_decl   = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
