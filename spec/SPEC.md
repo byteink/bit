@@ -3182,7 +3182,7 @@ type_alias    = "type" IDENT [ generic_params ] "=" type .
 
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
-attr          = "@" IDENT .
+attr          = "@" IDENT [ "(" string_lit ")" ] .
 method_decl   = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
