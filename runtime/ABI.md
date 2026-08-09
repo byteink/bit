@@ -1212,13 +1212,22 @@ needs to treat their argument-free signature as clobbering anything live.
 
 A fallible function (`T!`) returns its **ok value** in the normal return
 register (`rax` / `x0`, or `xmm0` / `d0` for a float ok), exactly like a
-non-fallible one. The **error** rides a separate side channel: a per-worker
-threadlocal error slot, accessed through two symbols.
+non-fallible one. The **error** rides a separate side channel: a per-task
+scratch slot, accessed through two symbols.
 
 ```
 bit_rt_set_err(e: ?*anyopaque)  -> void   // publish (or, with nil, clear)
 bit_rt_get_err()                -> ?*anyopaque   // read; non-null ⇒ failed
 ```
+
+`bit_rt_set_err`/`bit_rt_get_err` (`runtime/root/slots.bit:49`/`:57`) read and
+write `scrErr`, word 7 of the per-task scratch block at the base of the
+running task's own stack (`runtime/sched/scratch.bit:53`) — never a
+threadlocal: Mach-O refuses `@threadlocal` in the freestanding emit, and even
+where a threadlocal were available, a per-OS-thread slot would not survive the
+M:N scheduler migrating a goroutine to a different worker between the write
+and the read. Per-task scratch does, because it travels with the task rather
+than being pinned to the worker (§22).
 
 The convention (a fallible callee's postcondition):
 
@@ -1234,12 +1243,15 @@ The convention (a fallible callee's postcondition):
   null, use the ok result.
 
 The slot is **read immediately after the call, before any yield or GC
-safepoint**, so a plain threadlocal is goroutine-correct even under M:N: no
-scheduling point sits between a fallible call's return and its `?`/`catch`
-check, so the goroutine cannot migrate workers in that window. The error value
-is an `error`-interface object pointer (a GC object); because it is live in the
-slot only across that safepoint-free window, it needs no distinct root
-registration — the caller roots it the instant it reads it.
+safepoint**: codegen emits `set_err`/`get_err` back to back and both are
+`@nosplit`, so no scheduling point sits between a fallible call's return and
+its `?`/`catch` check. That adjacency is not what makes the slot
+migration-safe — per-task scratch already is, independent of it (above) —
+it is what makes the *unrooted* error pointer safe from a collection while it
+sits there. The error value is an `error`-interface object pointer (a GC
+object); because it is live in the slot only across that safepoint-free
+window, it needs no distinct root registration — the caller roots it the
+instant it reads it.
 
 ## 14. Filesystem primitives
 
