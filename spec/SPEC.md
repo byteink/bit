@@ -489,10 +489,12 @@ param         = [ "..." ] IDENT ":" type .
 result_type   = type .            (* may carry the fallible marker, §18 *)
 ```
 
-**Bootstrap bridge, one release only:** the lexer also accepts `function` as a
-synonym for `fn` here, solely so compiler source still built by the previous
-stage0 release (which parses `function` only) keeps compiling until a release
-carrying `fn` exists and the pin moves. #2773 removes the alias from the lexer.
+**The bootstrap bridge is closed (#2773).** For one release, the lexer also
+accepted `function` as a synonym for `fn` here, solely so compiler source
+still built by the previous stage0 release (which parsed `function` only)
+kept compiling until a release carrying `fn` existed and the pin moved.
+`function` is no longer a keyword; writing it where a declaration is expected
+is **E0089** `function_keyword_removed`, naming `fn` as the replacement.
 
 - The return type is written after `:`. If omitted, the function returns nothing
   (its result type is the empty tuple `()`, i.e. "void").
