@@ -432,6 +432,7 @@ top_decl     = import_decl
              | [ "export" ] interface_decl
              | [ "export" ] enum_decl
              | [ "export" ] type_alias
+             | [ "export" ] extern_fn_decl
              | method_decl .            (* export follows the receiver type *)
 ```
 
@@ -3166,6 +3167,7 @@ top_decl      = import_decl
               | [ "export" ] interface_decl
               | [ "export" ] enum_decl
               | [ "export" ] type_alias
+              | [ "export" ] extern_fn_decl
               | method_decl .
 
 import_decl   = "import" import_body "from" STRING_LIT .
