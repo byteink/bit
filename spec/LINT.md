@@ -191,7 +191,7 @@ Counting rules, so the numbers are reproducible:
 - `max-file-lines` counts physical lines, including blanks and comments. Not
   "logical" lines: the cost being bounded is the reader's, and a reader pays
   for blank lines too.
-- `max-fn-lines` counts from the line of the `function` keyword through the
+- `max-fn-lines` counts from the line of the `fn` keyword through the
   line of its closing brace, inclusive.
 - `max-params` counts declared parameters. A method receiver does not count.
 - `max-nesting` counts nested *blocks* inside a function body; the body itself
@@ -240,7 +240,7 @@ covered, so this rule must not double-report them.
 
 **Decided: a parameter (or receiver) shadowing an outer name is not reported,
 only a `let`/`const` is** (this includes a `for`/`catch`/`match` binder — they
-activate as the same kind as a block-local `let`). `function f(count: int)`
+activate as the same kind as a block-local `let`). `fn f(count: int)`
 beside a module-level `count` is the single highest-volume shape of shadowing
 in real code, and it is close to harmless: a parameter's whole lexical extent
 *is* the function body, so there is no earlier read in the same scope whose
