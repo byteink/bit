@@ -21,11 +21,11 @@ replaces `a` entirely, and an empty component contributes nothing.
 ```bit
 import { join, isAbs } from "std/path"
 
-function configPath(home: string): string {
+fn configPath(home: string): string {
   return join(home, ".config/bit.toml")
 }
 
-function resolve(base: string, p: string): string {
+fn resolve(base: string, p: string): string {
   if (isAbs(p)) {
     return p
   }
@@ -67,16 +67,16 @@ always.
 ```bit
 import { base, dir, ext, stem } from "std/path"
 
-function isBitSource(p: string): bool {
+fn isBitSource(p: string): bool {
   return ext(p) == ".bit"
 }
 
 // Same directory, same name, different extension.
-function withExt(p: string, newExt: string): string {
+fn withExt(p: string, newExt: string): string {
   return dir(p) + "/" + stem(p) + newExt
 }
 
-function fileName(p: string): string {
+fn fileName(p: string): string {
   return base(p)
 }
 ```

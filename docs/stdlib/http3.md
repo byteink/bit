@@ -52,7 +52,7 @@ import { newEncoder, newDecoder, HeaderField } from "std/http3"
 // Encode a static-table-only field section, then decode it back to the same
 // fields. `:method: GET` is a full static match (one index byte); `:path` reuses
 // the static name with a literal value.
-function roundTrip(): []HeaderField! {
+fn roundTrip(): []HeaderField! {
   let enc = newEncoder()
   let fields = []HeaderField{
     HeaderField{ name: ":method", value: "GET", sensitive: false },
@@ -74,7 +74,7 @@ import { newEncoder, newDecoder, HeaderField } from "std/http3"
 
 // Grow the dynamic table on the encoder stream, mirror it on the decoder, then
 // encode a section that indexes the freshly inserted entry by a single byte.
-function dynamic(): []HeaderField! {
+fn dynamic(): []HeaderField! {
   let enc = newEncoder()
   let dec = newDecoder()
 
@@ -97,7 +97,7 @@ reference without risking a blocked stream:
 import { newEncoder, newDecoder, HeaderField } from "std/http3"
 
 // Encode a section on stream 4, then apply the decoder's acknowledgment.
-function acknowledge(): int! {
+fn acknowledge(): int! {
   let enc = newEncoder()
   let dec = newDecoder()
 
@@ -285,7 +285,7 @@ import { h3Dial, H3Request, H3Response, HeaderField } from "std/http3"
 // Dial an HTTP/3 server and GET "/". h3Dial completes the QUIC handshake and opens
 // the control + QPACK streams; `request` sends a HEADERS frame (QPACK-encoded
 // pseudo-headers) then reads the response HEADERS + DATA off the same stream.
-function getIndex(): H3Response! {
+fn getIndex(): H3Response! {
   let conn = h3Dial("127.0.0.1", 443, "example.com")?
   let req = H3Request{
     method: "GET",
@@ -309,7 +309,7 @@ import { udpBind } from "std/net"
 // Accept one HTTP/3 connection, read a request, and reply 200 with a short body.
 // `accept` skips the peer's control and QPACK streams and returns the first
 // request; `respond` writes the response HEADERS + DATA back on that stream.
-function serve(certChainPem: string, keyPem: string): ()! {
+fn serve(certChainPem: string, keyPem: string): ()! {
   let sock = udpBind("127.0.0.1", 8443)?
   let conn = h3Accept(sock, certChainPem, keyPem)?
   let sr = conn.accept()?

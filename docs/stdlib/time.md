@@ -39,11 +39,11 @@ Sixty minutes.
 ```bit
 import { Millisecond, Second } from "std/time"
 
-function timeout(): int {
+fn timeout(): int {
   return 250 * Millisecond
 }
 
-function retryDelay(attempt: int): int {
+fn retryDelay(attempt: int): int {
   return attempt * Second
 }
 ```
@@ -67,7 +67,7 @@ Nanoseconds elapsed since `start`, which must have come from `monotonic()`.
 ```bit
 import { monotonic, since, toMillis } from "std/time"
 
-function timed(label: string) {
+fn timed(label: string) {
   let start = monotonic()
   let sum = 0
   let i = 0
@@ -92,12 +92,12 @@ finish in about 50 ms in total, not 50 seconds.
 ```bit
 import { sleep, Millisecond } from "std/time"
 
-function worker(id: int, done: chan<int>) {
+fn worker(id: int, done: chan<int>) {
   sleep(10 * Millisecond)
   done <- id
 }
 
-function fanOut() {
+fn fanOut() {
   let done = chan<int>(8)
   let i = 0
   while (i < 8) {
@@ -134,11 +134,11 @@ Whole seconds in `d`, truncated.
 ```bit
 import { secs, millis, toSeconds, Second, Millisecond } from "std/time"
 
-function describe(d: int) {
+fn describe(d: int) {
   println("${secs(d)} s, ${millis(d)} ms, ${toSeconds(d)} exactly")
 }
 
-function example() {
+fn example() {
   describe(1 * Second + 500 * Millisecond)
 }
 ```

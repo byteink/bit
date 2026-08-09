@@ -65,14 +65,14 @@ A response with an explicit status and a text body.
 import { Request, Response, ok, respond, header } from "std/http"
 
 // Route a request to a response.
-function route(req: Request): Response {
+fn route(req: Request): Response {
   if (req.path == "/health") {
     return ok("ok")
   }
   return respond(404, "not found")
 }
 
-function accepts(req: Request): string {
+fn accepts(req: Request): string {
   return header(req.headers, "Accept")
 }
 ```
@@ -124,25 +124,25 @@ import { serve, listenAndServe, ok, respond, Server, Exchange, Request, Response
 import { hasPrefix } from "std/strings"
 
 // A request handler is just a function value.
-function route(req: Request): Response {
+fn route(req: Request): Response {
   if (req.path == "/") {
     return ok("hello from bit")
   }
   return respond(404, "not found")
 }
 
-function main() {
+fn main() {
   listenAndServe("127.0.0.1", 8080, route) catch e {
     print("server failed: ${e.message()}\n")
   }
 }
 
 // Or drive the loop yourself for a kernel-chosen port or bounded serving:
-function handle(ex: Exchange): ()! {
+fn handle(ex: Exchange): ()! {
   ex.respond(ok("hello from bit"))?
 }
 
-function runServer(s: Server, n: int): ()! {
+fn runServer(s: Server, n: int): ()! {
   let i = 0
   while (i < n) {
     let ex = s.accept()?
@@ -173,17 +173,17 @@ POSTs `body` to `url`.
 ```bit
 import { get, post, request, Response } from "std/http"
 
-function fetchStatus(url: string): int! {
+fn fetchStatus(url: string): int! {
   let res = get(url)?
   return res.status
 }
 
-function submit(url: string, payload: string): string! {
+fn submit(url: string, payload: string): string! {
   let res = post(url, payload)?
   return res.body
 }
 
-function head(url: string): Response! {
+fn head(url: string): Response! {
   return request("HEAD", url, "")?
 }
 ```
@@ -236,26 +236,26 @@ import { get, getTls, serveTls, ok, respond, Request, Response } from "std/http"
 import { newTlsConfig, newTrustStore } from "std/tls"
 
 // An https GET verified against the default (system/bundled) roots.
-function fetchStatus(url: string): int! {
+fn fetchStatus(url: string): int! {
   let res = get(url)?
   return res.status
 }
 
 // An https GET pinned to a private CA (PEM) - a test fixture or corporate root.
-function fetchPinned(url: string, caPem: string): Response! {
+fn fetchPinned(url: string, caPem: string): Response! {
   let cfg = newTlsConfig(newTrustStore(caPem)?)
   return getTls(url, cfg)?
 }
 
 // Serve HTTPS with a PEM certificate chain and key.
-function route(req: Request): Response {
+fn route(req: Request): Response {
   if (req.path == "/health") {
     return ok("ok")
   }
   return respond(404, "not found")
 }
 
-function serveSecure(certPem: string, keyPem: string) {
+fn serveSecure(certPem: string, keyPem: string) {
   serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
     print("server failed: ${e.message()}\n")
   }
@@ -300,7 +300,7 @@ is a runnable HTTP/2 server that proves the negotiated protocol is `h2`.
 import { get, serveTls, ok, respond, Request, Response } from "std/http"
 
 // One transport-agnostic handler serves HTTP/1.1 and HTTP/2 alike.
-function route(req: Request): Response {
+fn route(req: Request): Response {
   if (req.path == "/") {
     return ok("hello over h1 or h2")
   }
@@ -309,7 +309,7 @@ function route(req: Request): Response {
 
 // serveTls advertises ALPN ["h2","http/1.1"]; a client that negotiates h2 is
 // served over the HTTP/2 engine, any other over HTTP/1.1 - same handler.
-function serveSecure(certPem: string, keyPem: string) {
+fn serveSecure(certPem: string, keyPem: string) {
   serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
     print("server failed: ${e.message()}\n")
   }
@@ -317,7 +317,7 @@ function serveSecure(certPem: string, keyPem: string) {
 
 // The client offers h2 then http/1.1 by default, so get()/request() transparently
 // use HTTP/2 when the server supports it.
-function fetchStatus(url: string): int! {
+fn fetchStatus(url: string): int! {
   let res = get(url)?
   return res.status
 }
@@ -371,7 +371,7 @@ it through the Alt-Svc header.
 import { serveH3, serveTls, get, ok, respond, Request, Response } from "std/http"
 
 // One transport-agnostic handler serves HTTP/1.1, HTTP/2, and HTTP/3 alike.
-function route(req: Request): Response {
+fn route(req: Request): Response {
   if (req.path == "/") {
     return ok("hello over h1, h2, or h3")
   }
@@ -381,20 +381,20 @@ function route(req: Request): Response {
 // serveH3 binds a UDP socket; pair it with serveTls on the same port number so
 // https:// clients can discover the h3 endpoint via the Alt-Svc header. Each is a
 // void function value the caller can `spawn` onto its own green thread.
-function serveH3Secure(certPem: string, keyPem: string) {
+fn serveH3Secure(certPem: string, keyPem: string) {
   serveH3("127.0.0.1", 8443, certPem, keyPem, route) catch e {
     print("h3 server failed: ${e.message()}\n")
   }
 }
 
-function serveTlsSecure(certPem: string, keyPem: string) {
+fn serveTlsSecure(certPem: string, keyPem: string) {
   serveTls("127.0.0.1", 8443, certPem, keyPem, route) catch e {
     print("tls server failed: ${e.message()}\n")
   }
 }
 
 // A direct HTTP/3 fetch via the explicit, opt-in https+h3:// scheme.
-function fetchH3(url: string): int! {
+fn fetchH3(url: string): int! {
   let res = get(url)?
   return res.status
 }
@@ -438,7 +438,7 @@ import { newTlsConfig, newTrustStore } from "std/tls"
 
 // A client that auto-upgrades to HTTP/3 once a server advertises it via Alt-Svc.
 // Hold one across requests so its Alt-Svc cache persists (no global state).
-function browse(): Response! {
+fn browse(): Response! {
   let c = newClient()
   // First request runs over HTTPS (HTTP/2 or HTTP/1.1) and learns any Alt-Svc.
   let first = c.get("https://example.com/")?
@@ -450,12 +450,12 @@ function browse(): Response! {
 }
 
 // A client pinned to a private CA for its https leg (a test or corporate root).
-function browsePinned(caPem: string): Response! {
+fn browsePinned(caPem: string): Response! {
   let c = newClientTls(newTlsConfig(newTrustStore(caPem)?))
   return fetchWith(c, "https://internal.example/")?
 }
 
-function fetchWith(c: Client, url: string): Response! {
+fn fetchWith(c: Client, url: string): Response! {
   return c.get(url)?
 }
 ```

@@ -15,11 +15,11 @@ so make it say which case failed, not which function.
 ```bit
 import { eq, ok } from "std/testing"
 
-function double(n: int): int {
+fn double(n: int): int {
   return n * 2
 }
 
-function test_double() {
+fn test_double() {
   eq<i64>(double(21), 42, "double")
   ok(double(0) == 0, "zero doubles to zero")
 }
@@ -50,7 +50,7 @@ Fails immediately. For a branch that should be unreachable.
 import { ok, notOk, failNow } from "std/testing"
 import { hasPrefix } from "std/strings"
 
-function classify(n: int): string {
+fn classify(n: int): string {
   if (n > 0) {
     return "positive"
   }
@@ -60,7 +60,7 @@ function classify(n: int): string {
   return "zero"
 }
 
-function test_classify() {
+fn test_classify() {
   ok(hasPrefix(classify(3), "pos"), "3 is positive")
   notOk(classify(0) == "positive", "0 is not positive")
 
@@ -99,17 +99,17 @@ import { eq, neq, near, eqSlice } from "std/testing"
 import { sqrt } from "std/math"
 import { mapped } from "std/seq"
 
-function test_values() {
+fn test_values() {
   eq<string>("bit", "bit", "same string")
   neq<i64>(1, 2, "one is not two")
 }
 
-function test_sqrt() {
+fn test_sqrt() {
   // 1.41421356... is not exactly representable; compare with a tolerance.
   near(sqrt(2.0), 1.4142135, 0.0000001, "sqrt 2")
 }
 
-function test_mapped() {
+fn test_mapped() {
   let doubled = mapped([1, 2, 3], (x: int) => x * 2)
   eqSlice<i64>(doubled, [2, 4, 6], "each element doubled")
 }

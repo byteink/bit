@@ -68,7 +68,7 @@ import {
 // A full ephemeral key exchange for `group`: the client generates a share, the
 // server answers it, and the client derives the same secret from the server's
 // share. Returns the client's copy of the shared secret.
-function exchange(group: TlsGroup): []byte! {
+fn exchange(group: TlsGroup): []byte! {
   let client = tlsGroupGenerate(group)
   let response = tlsGroupResponder(group, client.keyShare)?
   return tlsGroupComputeShared(group, client.priv, response.keyShare)?
@@ -155,7 +155,7 @@ import { tlsSuitePreference, tlsSuiteNewAead, tlsSuiteNewHash } from "std/tls"
 // come from the TLS 1.3 key schedule; `hashLen` (via the suite's `Hash`) sizes
 // the transcript hash the same schedule feeds. `open` verifies-then-decrypts
 // symmetrically and never returns unauthenticated bytes.
-function sealRecord(key: []byte, nonce: []byte, record: []byte, aad: []byte): []byte! {
+fn sealRecord(key: []byte, nonce: []byte, record: []byte, aad: []byte): []byte! {
   let suite = tlsSuitePreference()[0]
   let aead = tlsSuiteNewAead(suite, key)?
   let transcript = tlsSuiteNewHash(suite) // SHA-256 or SHA-384, per the suite
@@ -238,11 +238,11 @@ import { TranscriptHash, earlySecret, handshakeSecret } from "std/tls"
 import { clientHandshakeTrafficSecret, trafficKey, trafficIV, finishedMac } from "std/tls"
 
 // SHA-256 as the suite hash, wrapped as a `() => Hash`.
-function suite(): Hash { return newSha256() }
+fn suite(): Hash { return newSha256() }
 
 // From the ECDHE shared secret and the running transcript, derive the client's
 // handshake write key and nonce, and the key that authenticates its Finished.
-function clientHandshake(ecdhe: []byte, t: TranscriptHash): []byte {
+fn clientHandshake(ecdhe: []byte, t: TranscriptHash): []byte {
   let early = earlySecret(suite, []byte(0))          // no PSK: all-zero IKM
   let hs = handshakeSecret(suite, early, ecdhe)
   let chs = clientHandshakeTrafficSecret(suite, hs, t.sum())
@@ -421,7 +421,7 @@ import {
 } from "std/tls"
 
 // Build a minimal TLS 1.3 ClientHello, serialize it, and read it back.
-function demo(): string! {
+fn demo(): string! {
   let exts = []Extension(0)
   exts = append(exts, extServerName("example.com"))
   exts = append(exts, extSupportedVersionsClient([versionTls13]))
@@ -776,7 +776,7 @@ import { newRecordKeys, recordApplicationData } from "std/tls"
 
 // Protect one outbound fragment and recover it, both contexts keyed from the
 // same application-traffic secret (one per direction in a real connection).
-function roundtrip(secret: []byte, msg: []byte): []byte! {
+fn roundtrip(secret: []byte, msg: []byte): []byte! {
   let suite = tlsSuiteById(TLS_AES_128_GCM_SHA256)?
   let writer = newRecordKeys(suite, secret)?
   let reader = newRecordKeys(suite, secret)?
@@ -872,7 +872,7 @@ import { TlsClientConfig, tlsClientStart, TlsClientConn } from "std/tls"
 // writes one of our flights, `recv` yields the server's next flight. The retry
 // loop resends after a HelloRetryRequest; the returned connection carries the
 // application-traffic keys.
-function handshake(config: TlsClientConfig, send: ([]byte) => ()!, recv: () => []byte!): TlsClientConn! {
+fn handshake(config: TlsClientConfig, send: ([]byte) => ()!, recv: () => []byte!): TlsClientConn! {
   let h = tlsClientStart(config)?
   send(h.hello)?
   let step = h.processServerFlight(recv()?)?
@@ -902,7 +902,7 @@ rejects, or a bundle with no `CERTIFICATE` block.
 import { newTrustStore, TrustStore } from "std/tls"
 
 // Parse a PEM roots bundle into a trust store for a client config.
-function roots(pem: string): TrustStore! {
+fn roots(pem: string): TrustStore! {
   return newTrustStore(pem)?
 }
 ```
@@ -932,7 +932,7 @@ import { newTrustStore, TlsClientConfig, tlsClientStart, TlsGroup, GroupKeypair 
 // Configure a client that authenticates against a PEM root bundle and offers the
 // post-quantum hybrid plus X25519, then start the handshake. `h.hello` is the
 // first flight to send.
-function begin(rootsPem: string): []byte! {
+fn begin(rootsPem: string): []byte! {
   let config = TlsClientConfig{
     serverName: "example.com",
     alpn: ["h2", "http/1.1"],
@@ -974,7 +974,7 @@ import { TlsClientHandshake, TlsClientConn } from "std/tls"
 
 // Feed the server's flight to a started handshake and, once it reports done,
 // take the application connection.
-function finish(h: TlsClientHandshake, serverFlight: []byte): TlsClientConn! {
+fn finish(h: TlsClientHandshake, serverFlight: []byte): TlsClientConn! {
   let step = h.processServerFlight(serverFlight)?
   if (!step.done) {
     fail newError("handshake needs another round")
@@ -1034,7 +1034,7 @@ caller data. Fails fatally on an authentication failure.
 import { TlsClientConn } from "std/tls"
 
 // Send a request and read the response over a live connection.
-function roundtrip(conn: TlsClientConn, request: []byte): []byte! {
+fn roundtrip(conn: TlsClientConn, request: []byte): []byte! {
   let record = conn.sealApp(request)?
   let reply = conn.openApp(record)?
   return reply.content
@@ -1060,7 +1060,7 @@ import { TlsServerConfig, tlsServerStart, TlsServerConn } from "std/tls"
 // writes one of our flights, `recv` yields the client's next flight. The retry
 // loop follows a HelloRetryRequest; the returned connection carries the
 // application-traffic keys.
-function serve(config: TlsServerConfig, send: ([]byte) => ()!, recv: () => []byte!): TlsServerConn! {
+fn serve(config: TlsServerConfig, send: ([]byte) => ()!, recv: () => []byte!): TlsServerConn! {
   let s = tlsServerStart(config)?
   let step = s.processClientHello(recv()?)?
   while (step.retry) {
@@ -1092,7 +1092,7 @@ Fails on malformed PEM, an empty chain, or an unreadable key.
 import { newTlsServerConfig, TlsServerConfig } from "std/tls"
 
 // Load a server's leaf certificate and RSA key from PEM, offering HTTP/2 + 1.1.
-function configure(certPem: string, keyPem: string): TlsServerConfig! {
+fn configure(certPem: string, keyPem: string): TlsServerConfig! {
   return newTlsServerConfig(certPem, keyPem, ["h2", "http/1.1"])?
 }
 ```
@@ -1125,7 +1125,7 @@ import { tlsServerStart, TlsServerConfig, TlsServerConn } from "std/tls"
 
 // Complete a handshake with no HelloRetryRequest: one ClientHello, then the
 // client Finished.
-function accept(config: TlsServerConfig, clientHello: []byte, clientFinished: []byte): TlsServerConn! {
+fn accept(config: TlsServerConfig, clientHello: []byte, clientFinished: []byte): TlsServerConn! {
   let s = tlsServerStart(config)?
   let step = s.processClientHello(clientHello)?
   if (step.retry) {
@@ -1178,7 +1178,7 @@ authentication failure.
 import { TlsServerConn } from "std/tls"
 
 // Read one client request and reply over a live connection.
-function respond(conn: TlsServerConn, incoming: []byte): []byte! {
+fn respond(conn: TlsServerConn, incoming: []byte): []byte! {
   let request = conn.openApp(incoming)?
   return conn.sealApp(request.content)?
 }
@@ -1299,13 +1299,13 @@ import {
 } from "std/tls"
 
 // After a full handshake, hand the client a ticket to resume with later.
-function issue(serverConn: TlsServerConn): []byte! {
+fn issue(serverConn: TlsServerConn): []byte! {
   return serverConn.issueTicket()?
 }
 
 // The client stores the ticket, then later resumes with it - optionally
 // attempting 0-RTT by passing early application data (must be idempotent).
-function storeAndResume(
+fn storeAndResume(
   clientConn: TlsClientConn,
   ticketRecord: []byte,
   config: TlsClientConfig,
@@ -1342,7 +1342,7 @@ import { tlsClientStartExts, TlsClientConfig, Extension } from "std/tls"
 // `clientHelloMessage`) goes in Initial-level CRYPTO frames; after the server's
 // ServerHello and Handshake flight, the returned client Finished goes in
 // Handshake-level CRYPTO frames. The secrets exposed on `h` key the QUIC levels.
-function quicClientHandshake(config: TlsClientConfig, tp: Extension, serverHello: []byte, serverFlight: []byte): []byte! {
+fn quicClientHandshake(config: TlsClientConfig, tp: Extension, serverHello: []byte, serverFlight: []byte): []byte! {
   let h = tlsClientStartExts(config, [tp])?
   let retry = h.processServerHelloMessage(serverHello)?
   if (len(retry) > 0) {
@@ -1592,7 +1592,7 @@ import { dial, listen, newTlsConfig, newTrustStore, emptyTrustStore } from "std/
 
 // Client: dial a host, verifying its certificate against a PEM root bundle, send
 // a request, and read the reply.
-function fetch(rootsPem: string, host: string, request: []byte): []byte! {
+fn fetch(rootsPem: string, host: string, request: []byte): []byte! {
   let cfg = newTlsConfig(newTrustStore(rootsPem)?)   // verification on by default
   cfg.serverName = host
   cfg.alpn = ["http/1.1"]
@@ -1605,7 +1605,7 @@ function fetch(rootsPem: string, host: string, request: []byte): []byte! {
 
 // Server: listen with a certificate chain and key, accept one connection, and
 // echo a single message back.
-function echoOnce(certPem: string, keyPem: string): ()! {
+fn echoOnce(certPem: string, keyPem: string): ()! {
   let cfg = newTlsConfig(emptyTrustStore())
   cfg.certPem = certPem
   cfg.keyPem = keyPem

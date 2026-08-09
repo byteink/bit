@@ -48,7 +48,7 @@ import { Mutex, newMutex, WaitGroup, newWaitGroup } from "std/sync"
 // N spawned tasks incrementing a shared counter under a Mutex land on an
 // exact total - the same shape as this module's directory KAT
 // (examples/syncmutex), just small enough to typecheck as a doc example.
-function fanOutCount(counter: []i64, mu: Mutex, wg: WaitGroup, n: int) {
+fn fanOutCount(counter: []i64, mu: Mutex, wg: WaitGroup, n: int) {
   let i = 0
   while (i < n) {
     spawn bump(counter, mu, wg)
@@ -56,7 +56,7 @@ function fanOutCount(counter: []i64, mu: Mutex, wg: WaitGroup, n: int) {
   }
 }
 
-function bump(counter: []i64, mu: Mutex, wg: WaitGroup) {
+fn bump(counter: []i64, mu: Mutex, wg: WaitGroup) {
   mu.lock()
   counter[0] = counter[0] + 1
   mu.unlock()
@@ -94,14 +94,14 @@ Releases a write lock acquired by `lock()`.
 ```bit
 import { RWMutex, newRWMutex } from "std/sync"
 
-function readCached(cache: []i64, mu: RWMutex): i64 {
+fn readCached(cache: []i64, mu: RWMutex): i64 {
   mu.rLock()
   let v = cache[0]
   mu.rUnlock()
   return v
 }
 
-function refreshCached(cache: []i64, mu: RWMutex, v: i64) {
+fn refreshCached(cache: []i64, mu: RWMutex, v: i64) {
   mu.lock()
   cache[0] = v
   mu.unlock()
@@ -139,7 +139,7 @@ Blocks until the counter reaches zero.
 ```bit
 import { WaitGroup, newWaitGroup } from "std/sync"
 
-function fanIn(n: int): int {
+fn fanIn(n: int): int {
   let wg = newWaitGroup()
   wg.add(n)
   let i = 0
@@ -151,7 +151,7 @@ function fanIn(n: int): int {
   return n
 }
 
-function finish(wg: WaitGroup) {
+fn finish(wg: WaitGroup) {
   wg.done()
 }
 ```
@@ -175,7 +175,7 @@ until that first run has completed.
 ```bit
 import { Once, newOnce } from "std/sync"
 
-function initOnce(o: Once, ready: []i64) {
+fn initOnce(o: Once, ready: []i64) {
   o.do(() => {
     ready[0] = 1
   })
@@ -252,7 +252,7 @@ Stores `v` and returns the previous value.
 ```bit
 import { newAtomicI64 } from "std/sync"
 
-function raceFreeCounter(n: i64): i64 {
+fn raceFreeCounter(n: i64): i64 {
   let counter = newAtomicI64(0)
   let i = 0
   while (i < n) {

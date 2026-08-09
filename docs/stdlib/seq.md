@@ -30,11 +30,11 @@ A new slice with the elements in the opposite order.
 ```bit
 import { mapped, filter, reduce } from "std/seq"
 
-function sum(xs: []int): int {
+fn sum(xs: []int): int {
   return reduce(xs, 0, (acc: int, x: int) => acc + x)
 }
 
-function evenSquares(xs: []int): []int {
+fn evenSquares(xs: []int): []int {
   let evens = filter(xs, (x: int) => x % 2 == 0)
   return mapped(evens, (x: int) => x * x)
 }
@@ -69,19 +69,19 @@ How many elements equal `x`.
 ```bit
 import { find, any, all, contains } from "std/seq"
 
-function firstNegative(xs: []int): Option<int> {
+fn firstNegative(xs: []int): Option<int> {
   return find(xs, (x: int) => x < 0)
 }
 
-function allPositive(xs: []int): bool {
+fn allPositive(xs: []int): bool {
   return all(xs, (x: int) => x > 0)
 }
 
-function hasZero(xs: []int): bool {
+fn hasZero(xs: []int): bool {
   return contains(xs, 0)
 }
 
-function anyLong(names: []string): bool {
+fn anyLong(names: []string): bool {
   return any(names, (s: string) => len(s) > 8)
 }
 ```
@@ -96,19 +96,19 @@ clearer; this exists so a callback can be passed around.
 ```bit
 import { forEach, reverse, indexOf, count } from "std/seq"
 
-function printAll(xs: []string) {
+fn printAll(xs: []string) {
   forEach(xs, (s: string) => println(s))
 }
 
-function lastFirst(xs: []int): []int {
+fn lastFirst(xs: []int): []int {
   return reverse(xs)
 }
 
-function where(xs: []int, target: int): i64 {
+fn where(xs: []int, target: int): i64 {
   return indexOf(xs, target)
 }
 
-function occurrences(xs: []int, target: int): i64 {
+fn occurrences(xs: []int, target: int): i64 {
   return count(xs, target)
 }
 ```

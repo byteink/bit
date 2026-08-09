@@ -131,7 +131,7 @@ string/number/word scanning.
 import { Json, JsonEntry, jsonGet, jsonAsInt } from "std/json"
 
 // Last-key-wins: two entries named "a", jsonGet returns the second (2).
-function lastWins(): i64 {
+fn lastWins(): i64 {
   let obj = Json.JsonObject([]JsonEntry{
     JsonEntry{ key: "a", value: Json.JsonInt(1) },
     JsonEntry{ key: "a", value: Json.JsonInt(2) },
@@ -186,7 +186,7 @@ the shape of `JSON.stringify(v, null, 2)`.
 ```bit
 import { Json, JsonEntry, jsonEncode, jsonEncodePretty } from "std/json"
 
-function encodeExample(): string {
+fn encodeExample(): string {
   let obj = Json.JsonObject([]JsonEntry{
     JsonEntry{ key: "name", value: Json.JsonString("bit\n") },
     JsonEntry{ key: "count", value: Json.JsonInt(2) },
@@ -216,7 +216,7 @@ nothing else.
 ```bit
 import { jsonParse, jsonGet, jsonAsInt } from "std/json"
 
-function parseExample(): i64 {
+fn parseExample(): i64 {
   let v = jsonParse("{\"a\": 1, \"a\": 2}") catch e {
     return -1
   }
@@ -258,7 +258,7 @@ to reject comments still can.
 ```bit
 import { jsoncParse, jsonGet, jsonAsInt } from "std/json"
 
-function jsoncExample(): i64 {
+fn jsoncExample(): i64 {
   let v = jsoncParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
     return -1
   }
@@ -346,7 +346,7 @@ fallible return, never a panic.
 ```bit
 import { cstParse, CstNode } from "std/json"
 
-function cstExample(): string {
+fn cstExample(): string {
   let root = cstParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
     return "error"
   }
@@ -386,7 +386,7 @@ is missing - never a panic on an absent path.
 ```bit
 import { cstParse, cstGet, CstNode } from "std/json"
 
-function cstGetExample(): string {
+fn cstGetExample(): string {
   let root = cstParse("{\"a\": {\"b\": \"c\"}}") catch e {
     return "error"
   }
@@ -421,7 +421,7 @@ to a `CstObject` - this function never creates an intermediate object.
 ```bit
 import { cstParse, cstSetString, cstGet, CstNode } from "std/json"
 
-function cstSetStringExample(): string {
+fn cstSetStringExample(): string {
   let root = cstParse("{\"a\": \"old\"}") catch e {
     return "error"
   }
@@ -454,7 +454,7 @@ dependency add when `bit.json` has no `"dependencies"` object yet at all.
 ```bit
 import { cstParse, cstSetStringPath, cstGet, CstNode } from "std/json"
 
-function cstSetStringPathExample(): string {
+fn cstSetStringPathExample(): string {
   let root = cstParse("{}") catch e {
     return "error"
   }
@@ -489,7 +489,7 @@ an intermediate segment doesn't resolve to a `CstObject`.
 ```bit
 import { cstParse, cstDeleteKey, cstGet } from "std/json"
 
-function cstDeleteKeyExample(): string {
+fn cstDeleteKeyExample(): string {
   let root = cstParse("{\"a\": 1, \"b\": 2}") catch e {
     return "error"
   }
@@ -525,7 +525,7 @@ Serializes `n` to JSONC source text.
 ```bit
 import { cstParse, cstSetString, cstPrint } from "std/json"
 
-function cstPrintRoundTrip(): string {
+fn cstPrintRoundTrip(): string {
   let source = "{\n  // keep\n  \"a\": 1\n}"
   let root = cstParse(source) catch e {
     return "parse-error"
@@ -533,7 +533,7 @@ function cstPrintRoundTrip(): string {
   return cstPrint(root)
 }
 
-function cstPrintAfterEdit(): string {
+fn cstPrintAfterEdit(): string {
   let root = cstParse("{\"a\": \"old\"}") catch e {
     return "parse-error"
   }
@@ -563,7 +563,7 @@ agree, for any JSONC `source`.
 ```bit
 import { cstParse, cstToJson, jsonGet, jsonAsInt } from "std/json"
 
-function cstToJsonExample(): i64 {
+fn cstToJsonExample(): i64 {
   let root = cstParse("{\n  // a comment\n  \"a\": 1,\n}") catch e {
     return -1
   }

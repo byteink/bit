@@ -24,12 +24,12 @@ Appends `content` to `path`, creating it if absent.
 ```bit
 import { readFile, writeFile, appendFile } from "std/fs"
 
-function logLine(path: string, line: string): ()! {
+fn logLine(path: string, line: string): ()! {
   appendFile(path, line + "\n")?
   return
 }
 
-function copy(src: string, dst: string): ()! {
+fn copy(src: string, dst: string): ()! {
   writeFile(dst, readFile(src)?)?
   return
 }
@@ -73,14 +73,14 @@ Releases the handle. Safe to call once; do not use the `File` afterwards.
 ```bit
 import { create, open } from "std/fs"
 
-function writeGreeting(path: string): ()! {
+fn writeGreeting(path: string): ()! {
   let f = create(path)?
   f.write("hello")?
   f.close()
   return
 }
 
-function head(path: string, n: int): string! {
+fn head(path: string, n: int): string! {
   let f = open(path)?
   let chunk = f.read(n)
   f.close()
@@ -114,7 +114,7 @@ link. Like `exists` and `isDir`, it never fails.
 ```bit
 import { exists, isDir, isSymlink } from "std/fs"
 
-function kind(path: string): string {
+fn kind(path: string): string {
   if (!exists(path)) {
     return "missing"
   }
@@ -163,15 +163,15 @@ Nesting deeper than 64 **real** directories fails rather than recursing further.
 import { mkdir, readDir, walk, remove } from "std/fs"
 import { join } from "std/strings"
 
-function listing(dir: string): string! {
+fn listing(dir: string): string! {
   return join(readDir(dir)?, "\n")
 }
 
-function fileCount(root: string): int! {
+fn fileCount(root: string): int! {
   return len(walk(root)?)
 }
 
-function scratch(path: string): ()! {
+fn scratch(path: string): ()! {
   mkdir(path)?
   remove(path)?
   return
