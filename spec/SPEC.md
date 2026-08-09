@@ -432,6 +432,7 @@ top_decl     = import_decl
              | [ "export" ] interface_decl
              | [ "export" ] enum_decl
              | [ "export" ] type_alias
+             | [ "export" ] extern_fn_decl
              | method_decl .            (* export follows the receiver type *)
 ```
 
@@ -740,7 +741,7 @@ type = type_name
 type_name    = IDENT .                          (* primitive, struct, interface, alias, or type param *)
 slice_type   = "[" "]" type .                   (* []T   dynamic, reference *)
 array_type   = "[" const_expr "]" type .        (* [N]T  fixed, value *)
-const_expr   = expr .                           (* folded at compile time; see below *)
+const_expr   = expression .                     (* folded at compile time; see below *)
 map_type     = "map" "<" type "," type ">" .    (* map<K,V> reference *)
 tuple_type   = "(" type "," type { "," type } ")" .   (* at least 2 elements *)
 func_type    = "(" [ type { "," type } ] ")" "=>" result_type .
@@ -1498,19 +1499,19 @@ inside an expression. There is no ternary `?:` operator in v0.1; use an `if`
 statement. `&&` and `||` short-circuit.
 
 ```
-expression   = arrow_fn | binary .
+expression   = arrow_fn | catch_expr .          (* catch_expr, §18.3 *)
 binary       = unary { binop unary } .          (* shaped by the precedence table *)
 binop        = "*" | "/" | "%" | "<<" | ">>" | "&"
              | "+" | "-" | "|" | "^"
              | "==" | "!=" | "<" | "<=" | ">" | ">="
              | "&&" | "||" .
 unary        = ( "!" | "-" | "+" | "~" | "<-" ) unary | postfix .
-postfix      = primary { call | index | slice | member | "?" } .
-call         = "[" type_args "]"  ... (* see §12.7 for the generic-call form *)
-             | "(" [ arguments ] ")" .
+postfix      = primary { call | index | slice | member | type_assert | "?" } .
+call         = [ "<" type { "," type } ">" ] "(" [ arguments ] ")" .   (* §12.7 *)
 index        = "[" expression "]" .
 slice        = "[" [ expression ] ":" [ expression ] "]" .
 member       = "." ( IDENT | INT_LIT ) .        (* INT_LIT selects a tuple element *)
+type_assert  = "." "(" type ")" .               (* §14.4 *)
 arguments    = arg { "," arg } [ "," ] .
 arg          = [ "..." ] expression .           (* '...' spreads a slice, §12.4 *)
 
@@ -1518,8 +1519,7 @@ primary      = literal
              | IDENT
              | "(" expression ")"
              | composite_lit
-             | "[" arguments "]"                 (* slice literal, element list *)
-             | block_expr .                      (* only where an expression block is allowed; see §12.8 *)
+             | "[" [ arguments ] "]" .           (* bare slice literal, possibly empty *)
 ```
 
 ### 12.1 Literals and Identifiers
@@ -1806,8 +1806,8 @@ return_stmt   = "return" [ expression { "," expression } ] .
 fail_stmt     = "fail" expression .
 break_stmt    = "break" .
 continue_stmt = "continue" .
-spawn_stmt    = "spawn" call_expression .        (* argument must be a call *)
-defer_stmt    = "defer" call_expression .
+spawn_stmt    = "spawn" postfix .                (* postfix must be a call *)
+defer_stmt    = "defer" postfix .                (* postfix must be a call *)
 ```
 
 - Multi-assignment `a, b = b, a` evaluates all right-hand sides before assigning
@@ -2248,10 +2248,10 @@ let (c, ok) = iface.(Circle)     // ok=false instead of panicking if mismatch
 let c2      = iface.(Circle)     // panics on mismatch
 ```
 
-Grammar:
+Grammar (a `postfix` suffix alongside `call`/`index`/`slice`/`member`, §12):
 
 ```
-type_assert = postfix "." "(" type ")" .
+type_assert = "." "(" type ")" .
 ```
 
 The two-result form is valid only as the sole right-hand side of a declaration or
@@ -2297,12 +2297,8 @@ See §15.4.
 
 ### 14.7 Enum Types
 
-An enum is a nominal type whose values are one of a fixed, named set of variants:
-
-```
-enum_decl    = "enum" IDENT [ generic_params ] "{" { enum_variant [ "," ] } "}" .
-enum_variant = IDENT [ "(" type { "," type } ")" ] .   (* optional payload *)
-```
+An enum is a nominal type whose values are one of a fixed, named set of
+variants. Its grammar (`enum_decl`/`enum_variant`) is given in §10.6.
 
 ```
 enum Color { Red, Green, Blue }
@@ -3166,6 +3162,7 @@ top_decl      = import_decl
               | [ "export" ] interface_decl
               | [ "export" ] enum_decl
               | [ "export" ] type_alias
+              | [ "export" ] extern_fn_decl
               | method_decl .
 
 import_decl   = "import" import_body "from" STRING_LIT .
@@ -3182,7 +3179,7 @@ type_alias    = "type" IDENT [ generic_params ] "=" type .
 
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
-attr          = "@" IDENT .
+attr          = "@" IDENT [ "(" string_lit ")" ] .
 method_decl   = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
@@ -3194,6 +3191,8 @@ field         = [ "export" ] IDENT ":" type .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
 fsep          = ";" | "," .
+enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_variant { fsep enum_variant } [ fsep ] ] "}" .
+enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 
 generic_params= "<" generic_param { "," generic_param } ">" .
 generic_param = IDENT [ ":" constraint ] .
@@ -3204,7 +3203,7 @@ type          = type_name | slice_type | array_type | map_type | tuple_type
 type_name     = IDENT .
 slice_type    = "[" "]" type .
 array_type    = "[" const_expr "]" type .
-const_expr    = expr .
+const_expr    = expression .
 map_type      = "map" "<" type "," type ">" .
 tuple_type    = "(" type "," type { "," type } ")" .
 func_type     = "(" [ type { "," type } ] ")" "=>" result_type .
