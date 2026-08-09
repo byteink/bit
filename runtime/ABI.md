@@ -972,7 +972,7 @@ through this table.
 
 ## 10. Main entry normalization
 
-SPEC.md §17.4 permits three surface `main` signatures. Codegen normalizes
+SPEC.md §17.4 permits four surface `main` signatures. Codegen normalizes
 whichever one a program declares into one fixed native shape and emits it
 under the fixed symbol name `bit_main`:
 
@@ -980,26 +980,27 @@ under the fixed symbol name `bit_main`:
 bit_main() -> i32     // callconv(.c); the process exit code
 ```
 
-Normalization (all three collapse to this one shape):
+Normalization (all four collapse to this one shape):
 
 | Surface form                     | `bit_main` body                                  |
 |-----------------------------------|---------------------------------------------------|
 | `function main() { ... }`         | run the body, return `0`                          |
 | `function main(): int { ... }`    | return the declared `int` directly                |
 | `function main(): ()! { ... }`    | on ok, return `0`; on err, print it to stderr, return `1` |
+| `function main(): int! { ... }`   | on ok, return the declared `int`; on err, print it to stderr, return `1` |
 
 `boot` (§9) spawns `bit_main` as the first green thread and returns its `i32`
 as the process exit code, truncated to a byte for the OS `exit` syscall (a
 negative or out-of-`u8`-range value truncates, matching every POSIX shell's own
 exit-code truncation — Bit does not special-case it).
 
-### Where the fallible row is realized
+### Where the fallible rows are realized
 
 The trampoline that defines `bit_main` is hand-assembled (`emitmacho.bit`,
 `emitelf.bit`); it can `bl main` and it can zero the return register, and that
 covers the first two rows. It cannot dispatch `error.message()`, because the
-interface method's dispatch id is assigned per program (§2.1). So the third row
-is emitted as ordinary lowered IR instead, by `compiler/lowerentry.bit`:
+interface method's dispatch id is assigned per program (§2.1). So the third and
+fourth rows are emitted as ordinary lowered IR instead, by `compiler/lowerentry.bit`:
 
 - the user's fallible `main` body is emitted under the private link name
   **`main$fallible`** (same shape it always had — a void or `T` result, with the
@@ -1016,11 +1017,13 @@ line a running Bit program puts on fd 2, and keeps a failed `main` from reading
 as the program's own logging. No new runtime symbol: `bit_rt_get_err`,
 `bit_rt_string_concat` and `bit_rt_eprint` all already exist.
 
-The ok arm returns an integer ok type as the exit code (§17.4's `int` rule,
-composed with the fallible marker), widened to `i64` first. A void ok type — the
-one shape §17.4 actually names — and the undefined `f64!` / `string!` / `bool!`
-shapes all return `0`: a float ok value would otherwise be handed back in
-`d0`/`xmm0` and read out of `x0`/`eax` as whatever was left there.
+The ok arm returns the declared `int` as the exit code for `main(): int!`
+(§17.4's fourth signature), widened to `i64` first, and `0` for `main(): ()!`.
+Since #2236's checker rule (E0085), these are the only two ok types that reach
+this code — every other shape (`f64!`, `string!`, `bool!`, ...) is rejected at
+`bit check` before lowering ever runs, rather than silently returning `0` with
+a float ok value handed back in `d0`/`xmm0` and read out of `x0`/`eax` as
+whatever was left there.
 
 Before #2235 this row did not exist in code at all: `fail` set the slot, nothing
 read it, and a failed `main` exited 0 with an empty stderr.
@@ -1556,7 +1559,8 @@ answer somewhere other than the primitive:
   `--target` (`libbitrtPath`), a cross-built binary reports the target it was
   built FOR, not the host it was built ON.
 
-  **The provider is `runtime/root/root.bit` (#1635).** The old claim here, that a running Bit program has no
+  **The provider is `runtime/root/linux/os.bit` or `runtime/root/darwin/os.bit` (#1635), selected by
+  the OS axis below.** The old claim here, that a running Bit program has no
   compile-time `builtin` and so this could never be ported, mistook "no `builtin`"
   for "no compile-time knowledge". The emit carries both axes the ordinal needs:
   - the **OS** is *which provider directory the source sits in* —
@@ -1579,7 +1583,7 @@ answer somewhere other than the primitive:
   just by disassembly:
   `tests/stress/roothost{darwin,linux}`.
 - `auxv` is a **process-entry fact owned by the boot layer (SEAM 3, #1576)**, and
-  `bit_rt_auxv`'s provider is `runtime/root/root.bit` (#1617). The kernel places the
+  `bit_rt_auxv`'s provider is `runtime/root/os.bit` (#1617). The kernel places the
   auxiliary vector on the initial stack, unreachable once any Bit code runs, so only
   the entry (`rtStartMain`) can capture it — a single writer, Linux-only;
   `machoMain` captures none. The Bit Linux entry walks past `envp`'s NULL to the
