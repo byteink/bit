@@ -22,7 +22,7 @@ A namespace import binds the module itself, and members are reached through it:
 import io from "std/io"       // namespace: io.stdout()
 import * as fs from "std/fs"  // explicit namespace form
 
-function dump(path: string): ()! {
+fn dump(path: string): ()! {
   let w = io.stdout()
   w.write(fs.readFile(path)?)
   w.flush()
@@ -41,7 +41,7 @@ Only exported members are importable, and import cycles between modules are an
 error.
 
 ```bit
-function show(path: string): ()! {
+fn show(path: string): ()! {
   println(readFile(path)?)   // readFile imported above
   return
 }
@@ -53,9 +53,9 @@ Visibility is by the explicit `export` keyword, not by identifier casing.
 Unmarked declarations are module-private.
 
 ```bit
-export function publicApi(): int { return 42 }   // visible to importers
+export fn publicApi(): int { return 42 }   // visible to importers
 
-function helper(): int { return 1 }               // module-private
+fn helper(): int { return 1 }               // module-private
 
 export struct Config {
   export name: string      // field visible outside the module
@@ -67,10 +67,10 @@ export struct Config {
 - `export` on a struct field makes that field readable and writable outside the
   module; an unexported field cannot appear in a foreign composite literal or be
   selected outside its module.
-- Export a method by placing `export` before its `function` keyword:
+- Export a method by placing `export` before its `fn` keyword:
 
 ```bit
-export function (c: Config) describe(): string {
+export fn (c: Config) describe(): string {
   return c.name
 }
 ```
@@ -81,13 +81,13 @@ The executable module is the root directory passed to `bit build`. It must
 declare exactly one `main` function. Three signatures are permitted:
 
 ```bit ignore
-function main() { }              // exit code 0 on normal return
+fn main() { }              // exit code 0 on normal return
 
-function main(): int {           // returned int is the process exit code
+fn main(): int {           // returned int is the process exit code
   return 0
 }
 
-function main(): ()! {           // a returned error prints to stderr, exit 1
+fn main(): ()! {           // a returned error prints to stderr, exit 1
   return
 }
 ```
@@ -104,7 +104,7 @@ A handful of functions are predeclared in every module and need no import:
 `len`, `cap`, `append`, `delete`, `close`, `panic`, `assert`.
 
 ```bit
-function builtins(xs: []int, m: map<string, int>) {
+fn builtins(xs: []int, m: map<string, int>) {
   let n = len(xs)
   let c = cap(xs)
   let ys = append(xs, 4, 5)
@@ -121,10 +121,10 @@ interface Shape { area(): f64 }
 struct Circle { export r: f64 }
 struct Rect   { export w: f64; export h: f64 }
 
-function (c: Circle) area(): f64 { return 3.14159 * c.r * c.r }
-function (r: Rect)   area(): f64 { return r.w * r.h }
+fn (c: Circle) area(): f64 { return 3.14159 * c.r * c.r }
+fn (r: Rect)   area(): f64 { return r.w * r.h }
 
-function totalArea<T: Shape>(shapes: []T): f64 {
+fn totalArea<T: Shape>(shapes: []T): f64 {
   let sum = 0.0
   for s of shapes {
     sum += s.area()
@@ -132,7 +132,7 @@ function totalArea<T: Shape>(shapes: []T): f64 {
   return sum
 }
 
-function main(): ()! {
+fn main(): ()! {
   // `T: Shape` binds T to a concrete type that satisfies Shape, so instantiate
   // over `Circle` rather than over `Shape` itself.
   let circles: []Circle = [Circle{ r: 1.0 }, Circle{ r: 2.0 }]

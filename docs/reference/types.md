@@ -17,7 +17,7 @@ conversions, and operators. (Spec: §5.4–§5.8, §11, §12.2–§12.9, §13.3,
 Sizes are fixed on every target, so behavior is deterministic across platforms.
 
 ```bit
-function primitives() {
+fn primitives() {
   let a: i32 = 42
   let b: u8 = 255
   let c: f64 = 3.14
@@ -29,7 +29,7 @@ function primitives() {
 ## Literals
 
 ```bit
-function literals() {
+fn literals() {
   let dec = 1_000_000         // '_' separates digit groups
   let hex = 0xFF
   let oct = 0o755
@@ -56,7 +56,7 @@ compile error (`E0073`). Interpolate a field, an element, or the result of a
 method instead, or give the type a `show(): string` method.
 
 ```bit
-function greet(name: string, n: int) {
+fn greet(name: string, n: int) {
   println("hi ${name}, you have ${n} messages")
 }
 ```
@@ -69,7 +69,7 @@ A growable reference view over a backing array. Build with a literal, or
 allocate a zeroed slice with the constructor form.
 
 ```bit
-function slices() {
+fn slices() {
   let xs = []int{1, 2, 3}     // typed slice literal
   let ys = [4, 5, 6]          // bare list; element type inferred from context
   let zeros = []int(4)        // length 4, all zero
@@ -84,7 +84,7 @@ function slices() {
 Fixed length `N`, a **value type** copied on assignment.
 
 ```bit
-function arrays() {
+fn arrays() {
   let a = [3]int{1, 2, 3}     // length must match N
   let b: [4]bool              // zeroed: all false
 }
@@ -96,7 +96,7 @@ Hash map, reference type; `K` must be comparable. A missing key reads as the
 zero value of `V`; the two-result index form reports presence.
 
 ```bit
-function maps() {
+fn maps() {
   let m = map<string, int>{ "a": 1, "b": 2 }
   let empty = map<string, int>()
   let x = m["a"]              // 1
@@ -111,7 +111,7 @@ Fixed heterogeneous group, a value type, used for grouped returns and
 destructuring. Access by destructuring or by index `.0`, `.1`, …
 
 ```bit ignore
-function tuples(): (int, string) {
+fn tuples(): (int, string) {
   let pair = (1, "one")
   let first = pair.0
   let second = pair.1
@@ -125,11 +125,11 @@ function tuples(): (int, string) {
 ### Function and channel types
 
 ```bit
-function higherOrder(f: (int) => int, x: int): int {
+fn higherOrder(f: (int) => int, x: int): int {
   return f(x)
 }
 
-function makeChan(): chan<int> {
+fn makeChan(): chan<int> {
   return chan<int>()
 }
 ```
@@ -149,7 +149,7 @@ struct User {
   age: int               // module-private
 }
 
-function structs() {
+fn structs() {
   let p = Point{ x: 1.0, y: 2.0 }   // keyed literal, always type-prefixed
   let q = Point{ x: 3.0 }           // y omitted -> zero value 0.0
   let shared = p                    // copies the handle
@@ -220,7 +220,7 @@ type Celsius = f64
 type IntPair = (int, int)
 type Transform = (int) => int
 
-function freezing(): Celsius {
+fn freezing(): Celsius {
   return 0.0            // Celsius and f64 are identical types
 }
 ```
@@ -232,7 +232,7 @@ explicitly by using a type in call position. Untyped constant literals are the
 only values that adapt to context automatically (§15.4).
 
 ```bit
-function conversions() {
+fn conversions() {
   let n: i32 = 5
   let wide = i64(n)          // explicit widening, required
   let f = f64(n)             // int -> float
@@ -265,7 +265,7 @@ error propagation, `<-` is channel send/receive (see [Errors](errors.md) and
 [Concurrency](concurrency.md)).
 
 ```bit
-function operators(a: int, b: int): int {
+fn operators(a: int, b: int): int {
   let masked = a & 0xFF
   let shifted = a << 2
   let ok = a > 0 && b > 0     // short-circuits

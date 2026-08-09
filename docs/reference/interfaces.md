@@ -26,16 +26,16 @@ checked where a value is used as the interface, not at declaration.
 struct Circle { export r: f64 }
 struct Rect   { export w: f64; export h: f64 }
 
-function (c: Circle) area(): f64      { return 3.14159 * c.r * c.r }
-function (c: Circle) perimeter(): f64 { return 2.0 * 3.14159 * c.r }
-function (r: Rect)   area(): f64      { return r.w * r.h }
-function (r: Rect)   perimeter(): f64 { return 2.0 * (r.w + r.h) }
+fn (c: Circle) area(): f64      { return 3.14159 * c.r * c.r }
+fn (c: Circle) perimeter(): f64 { return 2.0 * 3.14159 * c.r }
+fn (r: Rect)   area(): f64      { return r.w * r.h }
+fn (r: Rect)   perimeter(): f64 { return 2.0 * (r.w + r.h) }
 
-function describe(s: Shape): f64 {     // takes anything satisfying Shape
+fn describe(s: Shape): f64 {     // takes anything satisfying Shape
   return s.area()
 }
 
-function use() {
+fn use() {
   let total = describe(Circle{ r: 1.0 }) + describe(Rect{ w: 2.0, h: 3.0 })
 }
 ```
@@ -72,13 +72,13 @@ An interface value can be narrowed to a concrete type. The two-result form
 reports success instead of panicking; the single-result form panics on mismatch.
 
 ```bit ignore
-function areaOfCircle(s: Shape): f64 {
+fn areaOfCircle(s: Shape): f64 {
   let (c, ok) = s.(Circle)      // ok is false if s is not a Circle
   if (!ok) { return 0.0 }
   return 3.14159 * c.r * c.r
 }
 
-function mustCircle(s: Shape): Circle {
+fn mustCircle(s: Shape): Circle {
   return s.(Circle)             // panics if s is not a Circle
 }
 ```
@@ -101,7 +101,7 @@ are identical and their dynamic values are equal. Comparing values whose dynamic
 type is not comparable (a slice, map, or function) panics at runtime.
 
 ```bit
-function sameShape(a: Shape, b: Shape): bool {
+fn sameShape(a: Shape, b: Shape): bool {
   return a == b
 }
 ```

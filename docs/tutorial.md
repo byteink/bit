@@ -29,7 +29,7 @@ bit --version
 Put this in `hello.bit`:
 
 ```bit
-function main() {
+fn main() {
   println("hello, bit")
 }
 ```
@@ -53,7 +53,7 @@ it as the exit code.
 unless you write them.
 
 ```bit
-function variables() {
+fn variables() {
   let count = 0             // inferred int (i64)
   count = count + 1         // let is mutable
 
@@ -73,12 +73,12 @@ numeric conversion - widen explicitly with `i64(x)` or `f64(x)`.
 Parameters and return types are annotated; the body is an ordinary block.
 
 ```bit
-function add(a: int, b: int): int {
+fn add(a: int, b: int): int {
   return a + b
 }
 
 // Arrow functions are values, and close over their environment.
-function apply(xs: []int, f: (int) => int): []int {
+fn apply(xs: []int, f: (int) => int): []int {
   let out = []int(0)
   for x of xs {
     out = append(out, f(x))
@@ -86,7 +86,7 @@ function apply(xs: []int, f: (int) => int): []int {
   return out
 }
 
-function useThem() {
+fn useThem() {
   println("${add(2, 3)}")
   let doubled = apply([1, 2, 3], (x: int) => x * 2)
   println("${len(doubled)} doubled values")
@@ -102,7 +102,7 @@ exceptions, so every failure path is visible in the source.
 ```bit
 import { readFile } from "std/fs"
 
-function firstLineLength(path: string): int! {
+fn firstLineLength(path: string): int! {
   let text = readFile(path)?           // on error, return it to our caller
   if (len(text) == 0) {
     fail newError("file is empty: ${path}")
@@ -110,7 +110,7 @@ function firstLineLength(path: string): int! {
   return len(text)
 }
 
-function report(path: string) {
+fn report(path: string) {
   // `catch` with a default value: never fails.
   let n = firstLineLength(path) catch 0
   println("${n} bytes")
@@ -123,7 +123,7 @@ Slices grow with `append`; maps read an absent key as the zero value, which
 makes counting a one-liner.
 
 ```bit
-function collections() {
+fn collections() {
   let xs = [3, 1, 2]           // []int
   xs = append(xs, 4)
   println("len=${len(xs)} first=${xs[0]}")
@@ -148,12 +148,12 @@ parks, leaving its OS thread free for the others.
 ```bit
 import { sleep, Millisecond } from "std/time"
 
-function worker(id: int, out: chan<int>) {
+fn worker(id: int, out: chan<int>) {
   sleep(10 * Millisecond)   // parks; does not block an OS thread
   out <- id * id
 }
 
-function concurrency() {
+fn concurrency() {
   let results = chan<int>(4)
   let i = 0
   while (i < 4) {
@@ -183,7 +183,7 @@ main thread folds them into one map. This is the whole program - it is also
 import { readFile } from "std/fs"
 import { toLower } from "std/strings"
 
-function countWords(text: string): map<string, int> {
+fn countWords(text: string): map<string, int> {
   let counts = map<string, int>()
   let word = ""
   let i = 0
@@ -206,11 +206,11 @@ function countWords(text: string): map<string, int> {
 
 // A read error yields an empty tally, so the collector below always receives
 // exactly one message per worker it spawned.
-function worker(path: string, out: chan<map<string, int>>) {
+fn worker(path: string, out: chan<map<string, int>>) {
   out <- countWords(readFile(path) catch "")
 }
 
-function countFiles(paths: []string): map<string, int> {
+fn countFiles(paths: []string): map<string, int> {
   let results = chan<map<string, int>>(len(paths))
   for p of paths {
     spawn worker(p, results)
@@ -228,7 +228,7 @@ function countFiles(paths: []string): map<string, int> {
   return total
 }
 
-function main() {
+fn main() {
   let counts = countFiles(["a.txt", "b.txt", "c.txt"])
   println("distinct words: ${len(counts)}")
   println("the=${counts["the"]}")
@@ -246,11 +246,11 @@ each in its own process, and reports what failed.
 ```bit
 import { eq, ok } from "std/testing"
 
-function double(n: int): int {
+fn double(n: int): int {
   return n * 2
 }
 
-function test_double() {
+fn test_double() {
   eq<i64>(double(21), 42, "double")
   ok(double(0) == 0, "zero")
 }

@@ -10,7 +10,7 @@ rarely write a type annotation. (Spec: §10.1, §13.2, §13.4, §15.1.)
 let count = 0          // mutable, inferred type int
 const limit = 100      // immutable, inferred type int
 
-function tick() {
+fn tick() {
   count = count + 1    // ok: let is mutable
   // limit = 200       // error: const cannot be reassigned
 }
@@ -27,7 +27,7 @@ initializer. A `let` with no initializer is set to the type's **zero value**, so
 the annotation is then required.
 
 ```bit
-function demo() {
+fn demo() {
   let name: string = "bit"   // explicit type, redundant here
   let score: int             // no initializer -> zero value 0
   let ready: bool            // -> false
@@ -59,7 +59,7 @@ bits in such a field would be a null rather than a live instance - see
 ```bit
 struct Point { x: f64; y: f64 }
 
-function origin(): Point {
+fn origin(): Point {
   let p: Point       // {x: 0.0, y: 0.0}, ready to use
   return p
 }
@@ -71,7 +71,7 @@ function origin(): Point {
 exists. There is no `:=`. To shadow a name in an inner scope, declare it again.
 
 ```bit
-function scope() {
+fn scope() {
   let x = 1
   {
     let x = 2     // a new binding shadows the outer x in this block
@@ -88,14 +88,14 @@ tuple pattern. `_` is the **blank identifier**: it discards a value and may
 never be read.
 
 ```bit
-function unpack(): (int, int) {
+fn unpack(): (int, int) {
   let a = 1, b = 2                 // two bindings in one statement
   let (lo, hi) = bounds()          // destructure a tuple result
   let (_, second) = bounds()       // discard the first element
   return lo, hi
 }
 
-function bounds(): (int, int) { return 0, 10 }
+fn bounds(): (int, int) { return 0, 10 }
 ```
 
 ## Assignment statements
@@ -105,7 +105,7 @@ expression. Multi-assignment evaluates every right-hand side before assigning,
 which makes swaps clean:
 
 ```bit
-function swap() {
+fn swap() {
   let a = 1, b = 2
   a, b = b, a          // simultaneous: a is now 2, b is 1
 }
@@ -115,7 +115,7 @@ Compound assignment operators combine an operation with a store and require a
 single target and value:
 
 ```bit
-function accumulate() {
+fn accumulate() {
   let total = 0
   total += 5           // total = total + 5
   total *= 2
@@ -126,7 +126,7 @@ function accumulate() {
 Increment and decrement are statements too, not expressions:
 
 ```bit
-function counterDemo() {
+fn counterDemo() {
   let n = 0
   n++
   n--
@@ -152,7 +152,7 @@ comma, an opening bracket, `=`, `=>`, `.`, or `<-`.
 ```bit
 import { newBuilder } from "std/strings"
 
-function continuation() {
+fn continuation() {
   let total = 1 +      // ends with '+', continues
               2 + 3
 
@@ -167,7 +167,7 @@ Keep an opening brace on the same line as the construct it opens, or a semicolon
 is inserted before it:
 
 ```bit
-function braces(ready: bool) {
+fn braces(ready: bool) {
   if (ready) {         // correct: the brace opens on the construct's own line
     println("work")
   }

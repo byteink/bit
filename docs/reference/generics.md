@@ -7,11 +7,11 @@ one or more interfaces, and are resolved by **monomorphization** at compile time
 ## Generic functions
 
 ```bit
-function first<T>(xs: []T): T {
+fn first<T>(xs: []T): T {
   return xs[0]
 }
 
-function use() {
+fn use() {
   let a = first([]int{1, 2, 3})        // T inferred as int
   let b = first([]string{"x", "y"})    // T inferred as string
 }
@@ -30,7 +30,7 @@ interface Ord {
   less(other: Self): bool
 }
 
-function max<T: Ord>(a: T, b: T): T {
+fn max<T: Ord>(a: T, b: T): T {
   if (a.less(b)) { return b }
   return a
 }
@@ -42,7 +42,7 @@ Multiple bounds combine with `&`:
 interface Reader { read(): string }
 interface Closer { close() }
 
-function drain<T: Reader & Closer>(src: T): string {
+fn drain<T: Reader & Closer>(src: T): string {
   let data = src.read()
   src.close()
   return data
@@ -64,7 +64,7 @@ interface Container<T> {
 
 type Pair<A, B> = (A, B)
 
-function boxed() {
+fn boxed() {
   let b = Box<int>{ value: 42 }        // generic composite literal
   let v = b.value
 }
@@ -78,11 +78,11 @@ argument types, so you seldom write them. If a type parameter cannot be inferred
 `f<T>(...)`.
 
 ```bit
-function make<T>(): []T {
+fn make<T>(): []T {
   return []T(0)
 }
 
-function explicit() {
+fn explicit() {
   let xs = make<int>()      // explicit: T appears only in the result
 }
 ```

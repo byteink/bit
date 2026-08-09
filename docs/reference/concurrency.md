@@ -13,11 +13,11 @@ in the current thread before the new one starts. There is no thread handle in
 v0.1 - coordinate through channels.
 
 ```bit
-function worker(id: int, out: chan<int>) {
+fn worker(id: int, out: chan<int>) {
   out <- id * id
 }
 
-function fanOut(n: int) {
+fn fanOut(n: int) {
   let results = chan<int>(n)
   for (let i = 1; i <= n; i++) {
     spawn worker(i, results)     // starts a green thread
@@ -51,12 +51,12 @@ run` reports `was killed by SIGSEGV (11)`; a built binary you ship says nothing.
 There is no environment variable or flag that changes the limit.
 
 ```bit
-function down(n: int): int {
+fn down(n: int): int {
   if (n == 0) { return 0 }
   return 1 + down(n - 1)
 }
 
-function deepWorker(depth: int, done: chan<int>) {
+fn deepWorker(depth: int, done: chan<int>) {
   done <- down(depth)      // 4000 frames: fine on main, SIGSEGV here
 }
 ```
@@ -79,7 +79,7 @@ A channel is a typed synchronization primitive. Unbuffered channels are
 synchronous; buffered channels hold up to their capacity.
 
 ```bit
-function channels() {
+fn channels() {
   let c = chan<int>()      // unbuffered (synchronous)
   let b = chan<int>(16)    // buffered, capacity 16
 }
@@ -93,7 +93,7 @@ function channels() {
   two-result form reports whether the channel is still open.
 
 ```bit
-function pingPong(c: chan<int>) {
+fn pingPong(c: chan<int>) {
   c <- 1                         // send
   let x = <- c                   // receive
   let (v, ok) = <- c             // ok is false if closed and drained
@@ -107,14 +107,14 @@ buffered values then yield `(zero, false)`. Only the sending side should close.
 Range over a channel with `for ... of` until it is closed and drained.
 
 ```bit
-function producer(out: chan<int>) {
+fn producer(out: chan<int>) {
   for (let i = 0; i < 3; i++) {
     out <- i
   }
   close(out)                     // signal completion
 }
 
-function consumer(input: chan<int>) {
+fn consumer(input: chan<int>) {
   for v of input {               // receives until closed and drained
     // handle v
   }
@@ -134,7 +134,7 @@ if present, runs when no case is immediately ready, making the select
 non-blocking.
 
 ```bit
-function pump(input: chan<int>, out: chan<int>, next: int) {
+fn pump(input: chan<int>, out: chan<int>, next: int) {
   select {
     case v = <- input:
       handle(v)
@@ -145,9 +145,9 @@ function pump(input: chan<int>, out: chan<int>, next: int) {
   }
 }
 
-function handle(v: int) { }
-function advance() { }
-function idle() { }
+fn handle(v: int) { }
+fn advance() { }
+fn idle() { }
 ```
 
 An empty `select {}` blocks forever. Case operands (and the sent value for a
