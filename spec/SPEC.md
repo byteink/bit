@@ -2298,12 +2298,8 @@ See §15.4.
 
 ### 14.7 Enum Types
 
-An enum is a nominal type whose values are one of a fixed, named set of variants:
-
-```
-enum_decl    = "enum" IDENT [ generic_params ] "{" { enum_variant [ "," ] } "}" .
-enum_variant = IDENT [ "(" type { "," type } ")" ] .   (* optional payload *)
-```
+An enum is a nominal type whose values are one of a fixed, named set of
+variants. Its grammar (`enum_decl`/`enum_variant`) is given in §10.6.
 
 ```
 enum Color { Red, Green, Blue }
@@ -3196,6 +3192,8 @@ field         = [ "export" ] IDENT ":" type .
 interface_decl= "interface" IDENT [ generic_params ] "{" [ method_sig { fsep method_sig } [ fsep ] ] "}" .
 method_sig    = IDENT signature .
 fsep          = ";" | "," .
+enum_decl     = "enum" IDENT [ generic_params ] "{" [ enum_variant { fsep enum_variant } [ fsep ] ] "}" .
+enum_variant  = IDENT [ "(" type { "," type } ")" ] .
 
 generic_params= "<" generic_param { "," generic_param } ">" .
 generic_param = IDENT [ ":" constraint ] .
