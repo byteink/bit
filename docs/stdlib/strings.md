@@ -58,13 +58,19 @@ fn csv(xs: []string): string {
 
 ## Runes (UTF-8 code points)
 
+`runeCount` and `runes` count and decode by code point; `runeAt` takes a
+**byte offset** into `s`, not a code-point index.
+
 ### `runeCount(s: string): int`
 
 Code points in `s`. Differs from `len(s)` for any non-ASCII text.
 
 ### `runeAt(s: string, i: int): rune`
 
-The `i`-th code point, counting code points, not bytes.
+The code point starting at byte offset `i`, which must land on a rune
+boundary. Malformed or out-of-range input decodes as U+FFFD rather than
+panicking. Not indexed by rune count — to visit each rune in order, use
+`runes` or `runeCount`.
 
 ### `runes(s: string): []rune`
 
