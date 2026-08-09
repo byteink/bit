@@ -3178,6 +3178,7 @@ receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
 params        = param { "," param } [ "," ] .
 param         = [ "..." ] IDENT ":" type .
+extern_fn_decl = "extern" "fn" IDENT signature .
 
 struct_decl   = "struct" IDENT [ generic_params ] "{" [ field { fsep field } [ fsep ] ] "}" .
 field         = [ "export" ] IDENT ":" type .
