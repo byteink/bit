@@ -147,6 +147,125 @@ for t in "${TARGETS[@]}"; do
 	bash dist/package.sh "${VERSION}" "${t}" "${OUT}"
 done
 
+# --- packaged-runtime atomic-width probe (#2742, #2744) ---------------------
+#
+# The probe above (#2213) catches a STALE runtime; this one catches WRONG
+# CODEGEN in a runtime that is otherwise current. `bit_rt_spin_try_acquire`
+# and `bit_rt_spin_release` (runtime/spinlock.bit:61,118) take `p: *i32`
+# (spinUnlocked is declared `i32` at :46), so every aarch64 exclusive-access
+# instruction inside them must address a 32-bit word — `ldaxr`/`stlxr`/
+# `stlr`/`ldar` through a `w` register, never `x`. #2742 shipped the `x` form
+# in 0.1.11 unnoticed because nothing here looked for it.
+#
+# aarch64 ONLY. x86 atomics carry width in the OPERAND SIZE (`lock cmpxchg
+# %eax,(%rdi)` vs `%rax,(%rdi)`), not in a distinct register name the way
+# aarch64's w/x split does, so there is no equivalent single-mnemonic check
+# for x86_64-linux. Skipped on purpose, not an oversight.
+#
+# THE LAG THIS CANNOT CLOSE, BY DESIGN (#1857): `./make libbitrt` compiles
+# runtime/ with the PINNED STAGE0 — the previous release's compiler — never
+# with the compiler built from this tree (see `stepLibbitrt` in
+# tools/build/artifacts.bit), so a codegen fix landing in THIS tree does not
+# reach the packaged libbitrt.a until the pin moves past the release that
+# carries the fix. This assertion exists only to say that out loud, in exit
+# status, at release time — not to let a fixed compiler be mistaken for a
+# fixed runtime, which is exactly what shipped unnoticed in 0.1.11.
+
+# <archive> <symbol-spelling-as-it-appears-in-the-object> <triple>
+# <bit_rt-name-for-messages>. Returns 0 clean, 1 a 64-bit hit, 2 this spelling
+# of the symbol is not in the object — Mach-O mangles every C symbol with a
+# leading `_`, ELF does not, and the caller tries both.
+checkAtomicWidth() {
+	local archive="$1" name="$2" triple="$3" sym="$4"
+	local dump hits
+	dump="$(objdump -d --disassemble-symbols="${name}" "${archive}" 2>/dev/null)" || true
+	printf '%s\n' "${dump}" | grep -q "<${name}>:" || return 2
+	# The function's own body only: from its label to the next blank line, so
+	# the "missing symbol" warning objdump prints for every OTHER .o member of
+	# the archive (only one member defines this symbol) can never be mistaken
+	# for an instruction belonging to it.
+	hits="$(printf '%s\n' "${dump}" |
+		awk "/<${name}>:/{p=1} p; /^\$/{if (p) exit}" |
+		awk -F'\t' '
+			NF < 3 { next }
+			{
+				mnem = $2; ops = $3
+				gsub(/^[ \t]+|[ \t]+$/, "", mnem)
+				if (mnem !~ /^(ldaxr|stlxr|stlr|ldar)$/) next
+				n = split(ops, parts, ",")
+				regn = 0
+				for (i = 1; i <= n; i++) {
+					tok = parts[i]
+					gsub(/^[ \t]+|[ \t]+$/, "", tok)
+					if (tok ~ /^[wx][0-9]+$/) { regn++; regs[regn] = tok }
+				}
+				# stlxr Rs,Rt,[Rn]: Rs (regs[1]) is the exclusive-store status,
+				# always w by the ISA regardless of the data width — the WIDTH
+				# that matters is Rt (regs[2]). Every other mnemonic here takes
+				# one register operand, the value itself, in regs[1].
+				target = (mnem == "stlxr") ? regs[2] : regs[1]
+				if (substr(target, 1, 1) != "w") print mnem "\t" target "\t" $0
+			}')"
+	[ -z "${hits}" ] && return 0
+	while IFS="$(printf '\t')" read -r mnem target rest; do
+		echo "release.sh: ${triple} libbitrt.a: ${sym} does a 64-bit ${mnem} (${target}) through what runtime/spinlock.bit declares *i32: ${rest}" >&2
+	done <<<"${hits}"
+	return 1
+}
+
+# One triple's libbitrt.a, both symbols, both possible symbol spellings.
+checkAtomicWidthTriple() { # <archive> <triple>
+	local archive="$1" triple="$2" bad=0
+	local symname resolved rc spelling
+	for symname in bit_rt_spin_try_acquire bit_rt_spin_release; do
+		resolved=0
+		for spelling in "_${symname}" "${symname}"; do
+			rc=0
+			checkAtomicWidth "${archive}" "${spelling}" "${triple}" "${symname}" || rc=$?
+			[ "${rc}" -eq 2 ] && continue
+			resolved=1
+			[ "${rc}" -eq 0 ] || bad=1
+			break
+		done
+		if [ "${resolved}" -eq 0 ]; then
+			echo "release.sh: ${triple} libbitrt.a: symbol ${symname} not found under either Mach-O or ELF spelling — cannot verify atomic width" >&2
+			bad=1
+		fi
+	done
+	return "${bad}"
+}
+
+echo "release.sh: checking packaged aarch64 libbitrt.a for #2742's 64-bit-through-*i32 defect"
+atomicBad=0
+# package.sh embeds every RUNTIME_TRIPLE's libbitrt.a in every target's
+# tarball, so any produced tarball would do — each triple is still read from
+# ITS OWN tarball so a future package.sh that stops doing that does not
+# silently make this pass on the wrong bytes.
+for pair in "${OUT}/bit-${VERSION}-macos-aarch64.tar.xz aarch64-macos" \
+            "${OUT}/bit-${VERSION}-linux-aarch64.tar.xz aarch64-linux"; do
+	tarball="${pair%% *}" triple="${pair##* }"
+	work="$(mktemp -d)"
+	tar -C "${work}" -xf "${tarball}"
+	archive="$(ls -d "${work}"/bit-*)/lib/${triple}/libbitrt.a"
+	[ -f "${archive}" ] || {
+		echo "release.sh: ${tarball} has no lib/${triple}/libbitrt.a" >&2
+		rm -rf "${work}"
+		exit 1
+	}
+	rc=0
+	checkAtomicWidthTriple "${archive}" "${triple}" || rc=$?
+	[ "${rc}" -eq 0 ] || atomicBad=1
+	rm -rf "${work}"
+done
+if [ "${atomicBad}" -eq 1 ]; then
+	echo "release.sh: this is the pinned-stage0 lag by design (#1857), not a new bug —" >&2
+	echo "  the packaged runtime is built by the PREVIOUS release's compiler, so a" >&2
+	echo "  codegen fix landed in this tree (commit ${BUILT_COMMIT}) does not reach" >&2
+	echo "  libbitrt.a until the pin moves past the release that carries it. See #2742." >&2
+	exit 1
+fi
+echo "release.sh: aarch64 libbitrt.a atomic widths OK"
+
 # --- verify the bytes that ship ---------------------------------------------
 #
 # Each artifact is unpacked somewhere unrelated and asked to COMPILE AND RUN a
