@@ -20,19 +20,69 @@
 # `log(x)` return 0 for every input. The differentials were green throughout.
 # They were not wrong; they were asked about a corpus that excluded the code.
 #
-# ## Why IR text and not object bytes
+# ## Why IR text alone is not the whole picture (#2741)
 #
-# #1859 proposed object bytes as "the strongest available surface". They are not
-# usable here. Measured seed-vs-selfhost, every module differs and the
-# self-hosted output is consistently larger (root 147941 vs 171069, gc 50661 vs
-# 57173, sched 29813 vs 32309, chan 30736 vs 33856). That is #1851, the backend
-# optimiser gap, not a correctness difference. Object bytes only mean something
-# between two builds of the SAME implementation.
+# Measured on `main` at `948ec5fd`, over the same 87 files this walk compares:
+# 966 function bodies dumped, 477 EMPTY (49.4%). A single `.bit` file cannot
+# resolve its module siblings' imports, so lowering a body that references one
+# does not error — it emits an EMPTY body and exits 0. `runtime/root/root.bit`'s
+# `bit_rt_init`, the runtime's boot function, is one of the 477:
 #
-# IR text is the right surface anyway for this bug class: a mis-parsed constant
-# appears directly in it as `const_float f64 0.5`.
+#     func bit_rt_init(%0: i64) bool {
+#     bb0(%0: i64):
+#       ret
+#     }
 #
-# ## Why per-file and not per-module
+# `--dump-ir-pre` is also PRE-optimisation, so a divergence inside a small
+# `@nosplit` helper inlined by `compiler/opt.bit`'s `-O1` pass (`spinRelease`,
+# `spinTryAcquire`) is invisible in every per-file dump — it exists only in the
+# caller's post-inline body. #2569's divergence had 38 machine-code sites
+# across 6 modules; this walk alone named 2 files and 3 sites.
+#
+# The whole-module object-byte comparison below (added by #2741) closes both
+# gaps: a module build resolves its own siblings (no empty stubs) and emits
+# the actual post-optimisation machine code (inlining and all). It does not
+# replace this walk — IR text is still the right surface for a mis-parsed
+# constant, which appears in it directly as `const_float f64 0.5`, and
+# catches it (#1857) at the file granularity a module build cannot isolate.
+#
+# ## Why object bytes were rejected once, and why that no longer holds
+#
+# #1859 first proposed object bytes here. The measurement then was
+# seed-vs-selfhost: every module differed and the self-hosted output was
+# consistently larger (root 147941 vs 171069, gc 50661 vs 57173, sched 29813
+# vs 32309, chan 30736 vs 33856) — #1851's backend optimiser gap, not a
+# correctness difference — and the conclusion was "object bytes only mean
+# something between two builds of the SAME implementation."
+#
+# That sentence is the argument FOR doing it now: since #1593 the oracle IS
+# the same implementation one release back, not `bit-seed`. Measured on `main`
+# at `948ec5fd` against the pinned 0.1.11, host target, over the 23 modules
+# `scripts/g2archive.sh` builds into `libbitrt.a` (16 platform-free entries
+# including the bare `runtime/` dir, + 7 platform pairs — read from there
+# below, never copied, so the two lists cannot drift; note #2741's own filing
+# miscounted this population as 22):
+#
+#     23/23 modules byte-identical, 0 diverging (post-#2569)
+#
+# and it can fail: mutation-tested with `BIT_STAGE0_BIN` pointed at the
+# PREVIOUS pin, v0.1.10 — the exact release #2569 repinned away from because
+# it emitted a 64-bit atomic through a 32-bit pointer at 38 machine-code sites
+# in 6 modules. That run named all 6 by object bytes (runtime, chan, gc, root,
+# sched, stw) and exited non-zero; the per-file IR walk above, run in the same
+# pass, still named only the 2 files (spinlock.bit, root/maps.bit) it named
+# before this ticket — strictly less coverage of a divergence known to be
+# real, not "no coverage". Restoring the pinned 0.1.11 oracle returned both
+# surfaces to green. See the commit message for both full outputs.
+#
+# No Mach-O code-signature trap here (the family of bug where two
+# byte-identical compilers differ if built to different `-o` names): `-c
+# --freestanding` emits a relocatable object (Mach-O `MH_OBJECT`), which
+# carries no `LC_CODE_SIGNATURE` load command and no embedded filename or
+# path — confirmed by building the same module to two different basenames in
+# two different directories and finding all four outputs byte-identical.
+#
+# ## Why the IR walk above is per-file and not per-module
 #
 # Not a preference — there is no module-level IR dump. `--dump-ir-pre` reads
 # exactly one file (`readDumpSource` in compiler/main.bit calls `readFile` on
@@ -41,9 +91,11 @@
 #     bit --dump-ir-pre runtime/gc   -> bit: cannot read runtime/gc   (rc=1)
 #     bit --dump-ir-pre runtime/root -> bit: cannot read runtime/root (rc=1)
 #
-# Teaching it to resolve a directory as a module is a compiler feature, not a
-# script; until then, per-file is the whole surface. It happens to cost
-# nothing: the walk below skips zero files.
+# `bit build <dir>` has no such limit — it is what the object-byte comparison
+# below uses to get module granularity. Teaching `--dump-ir-pre` to resolve a
+# directory is a compiler feature, not a script; until then, per-file is the
+# whole surface this walk can reach. It happens to cost nothing: the walk
+# below skips zero files.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
@@ -88,6 +140,59 @@ MIN_FILES=${DIFFRUNTIME_MIN_FILES:-70}
 # skip set, leave the totals looking healthy, and silently retire the only
 # regression test this gate exists to provide.
 REQUIRED="runtime/root/floatslog.bit runtime/root/floatsatan.bit"
+
+# --- Object-byte module list (#2741): extracted, not hand-copied ---
+#
+# `PLATFORM_FREE_RELS` / `PLATFORM_PAIRS` come straight out of g2archive.sh —
+# never restated here — so the two lists cannot drift the way g2archive.sh's
+# own header (lines 106-112 there) warns a hand-maintained copy always does.
+# Sourcing the whole file is not an option: it is an argv-driven CLI that
+# calls `usage` and exits 2 when run with no arguments.
+GARCHIVE="$(dirname "$0")/g2archive.sh"
+eval "$(grep -E '^(PLATFORM_FREE_RELS|PLATFORM_PAIRS)=' "$GARCHIVE")"
+if [ -z "${PLATFORM_FREE_RELS:-}" ] || [ -z "${PLATFORM_PAIRS:-}" ]; then
+  echo "diffruntime: FAIL — could not extract the module list from $GARCHIVE." >&2
+  exit 2
+fi
+
+# Same OS mapping g2archive.sh uses (aarch64-macos -> darwin; x86_64-linux and
+# aarch64-linux both -> linux) restricted to the HOST — this check builds with
+# no --target, so `bit build` targets the host by default and the platform
+# pair must match it.
+case "$(uname -s)" in
+  Darwin) PLAT=darwin ;;
+  Linux)  PLAT=linux ;;
+  *) echo "diffruntime: FAIL — unsupported host $(uname -s) for the object-byte check." >&2; exit 2 ;;
+esac
+
+# Same (rel, label) expansion g2archive.sh applies to the same two variables —
+# glue over the extracted data, not a second copy of the data itself.
+MOD_RELS=()
+MOD_LABELS=()
+for rel in $PLATFORM_FREE_RELS; do
+  if [ "$rel" = "-" ]; then
+    MOD_RELS+=("")
+    MOD_LABELS+=("runtime")
+  else
+    MOD_RELS+=("$rel")
+    MOD_LABELS+=("runtime_$(printf '%s' "$rel" | tr '/' '_')")
+  fi
+done
+for p in $PLATFORM_PAIRS; do
+  MOD_RELS+=("$p/$PLAT")
+  MOD_LABELS+=("runtime_${p}_${PLAT}")
+done
+NMOD=${#MOD_RELS[@]}
+
+# A floor, not an exact match, for the same reason MIN_FILES above is a floor:
+# the extracted list is 23 today (16 platform-free entries incl. the bare
+# `runtime` dir, + 7 platform pairs) and legitimately grows as modules are
+# added — g2archive.sh's own on-disk completeness check (lines 132-157 there)
+# is what keeps it honest going forward. 20 is well under 23, so this still
+# catches an emptied list or a broken extraction without going stale the next
+# time a module is added, which is exactly how #2741's own filing ended up
+# citing 22.
+MIN_MODULES=${DIFFRUNTIME_MIN_MODULES:-20}
 
 for bin in "$ORACLE" "$BIT2"; do
   [ -x "$bin" ] || { echo "diffruntime: missing $bin — run: ./make selfhost" >&2; exit 2; }
@@ -150,6 +255,72 @@ for f in $(find runtime -name '*.bit' | sort); do
   fi
 done
 
+# --- Whole-module object-byte comparison (#2741) ---
+#
+# Same taxonomy as the per-file walk above (oracle hang is a FAIL, oracle
+# crash is a NOTE, dev hang/crash is a FAIL, dev build failure where the
+# oracle succeeded is a mismatch), applied at module instead of file
+# granularity. `-c --freestanding -o` with no `--target` compiles for the
+# host, matching `PLAT` resolved above.
+objdev="$work/obj_dev"
+objor="$work/obj_or"
+mkdir -p "$objdev" "$objor"
+
+modmatch=0 modskip=0
+: >"$work/mod_mismatch"
+: >"$work/mod_timeout"
+: >"$work/mod_oracletimeout"
+: >"$work/mod_oraclecrash"
+: >"$work/mod_compared"
+
+i=0
+while [ "$i" -lt "$NMOD" ]; do
+  rel=${MOD_RELS[$i]}
+  label=${MOD_LABELS[$i]}
+  i=$((i + 1))
+  dir="runtime${rel:+/$rel}"
+  devobj="$objdev/${label}.o"
+  orobj="$objor/${label}.o"
+
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" build "$dir" -c --freestanding -o "$orobj" >/dev/null 2>&1
+  orc=$?
+  if [ "$orc" -eq 142 ]; then
+    echo "$dir${sep}$(whydied "$orc")" >>"$work/mod_oracletimeout"
+    continue
+  fi
+  if [ "$orc" -ge 128 ]; then
+    echo "$dir${sep}$(whydied "$orc")" >>"$work/mod_oraclecrash"
+    continue
+  fi
+  if [ "$orc" -ne 0 ] || [ ! -s "$orobj" ]; then
+    # The oracle cannot build this module, so there is no verdict to be had —
+    # counted and reported, never scored as agreement (#1514/#1516).
+    modskip=$((modskip + 1))
+    continue
+  fi
+
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" build "$dir" -c --freestanding -o "$devobj" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ge 128 ]; then
+    echo "$dir${sep}$(whydied "$rc")" >>"$work/mod_timeout"
+    continue
+  fi
+  if [ "$rc" -ne 0 ] || [ ! -s "$devobj" ]; then
+    # The oracle built it and the working tree could not. That is a
+    # regression, not a skip.
+    echo "$dir (bit failed where stage0 succeeded)" >>"$work/mod_mismatch"
+    echo "$dir" >>"$work/mod_compared"
+    continue
+  fi
+
+  echo "$dir" >>"$work/mod_compared"
+  if cmp -s "$devobj" "$orobj"; then
+    modmatch=$((modmatch + 1))
+  else
+    echo "$dir" >>"$work/mod_mismatch"
+  fi
+done
+
 bad=0
 
 if [ "$total" -lt "$MIN_FILES" ]; then
@@ -208,6 +379,41 @@ if [ -s "$work/mismatch.sorted" ]; then
   bad=1
 fi
 
+# --- Object-byte checks (#2741), mirroring the IR-walk checks above ---
+
+if [ "$NMOD" -lt "$MIN_MODULES" ]; then
+  echo "diffruntime: FAIL — extracted $NMOD archive module(s) from $GARCHIVE, floor is $MIN_MODULES." >&2
+  echo "  An emptied or badly-split module list passes everything; check" >&2
+  echo "  PLATFORM_FREE_RELS/PLATFORM_PAIRS there." >&2
+  bad=1
+fi
+
+if [ -s "$work/mod_oracletimeout" ]; then
+  echo "diffruntime: FAIL — the pinned stage0 HUNG building a runtime module (corpus reduced, not verified):" >&2
+  sed 's/^/  /' "$work/mod_oracletimeout" >&2
+  bad=1
+fi
+
+if [ -s "$work/mod_oraclecrash" ]; then
+  echo "diffruntime: NOTE — the pinned stage0 crashed building a runtime module, no verdict available (#2084):" >&2
+  sed 's/^/  /' "$work/mod_oraclecrash" >&2
+fi
+
+if [ -s "$work/mod_timeout" ]; then
+  echo "diffruntime: FAIL — no verdict building a runtime module (not a match):" >&2
+  sed 's/^/  /' "$work/mod_timeout" >&2
+  bad=1
+fi
+
+sort -u "$work/mod_mismatch" >"$work/mod_mismatch.sorted"
+
+if [ -s "$work/mod_mismatch.sorted" ]; then
+  echo "diffruntime: FAIL — $(wc -l <"$work/mod_mismatch.sorted" | tr -d ' ') runtime module(s) diverge from the pinned stage0 (object bytes):" >&2
+  sed 's/^/  /' "$work/mod_mismatch.sorted" >&2
+  echo "  Rebuild one with:  \"$ORACLE\" build MODULE -c --freestanding -o /tmp/or.o && $BIT2 build MODULE -c --freestanding -o /tmp/dev.o && cmp /tmp/or.o /tmp/dev.o" >&2
+  bad=1
+fi
+
 [ "$bad" -ne 0 ] && exit 1
 
-echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped)"
+echo "diffruntime: PASS — $match/$total runtime file(s) lower identically ($skip skipped); $modmatch/$NMOD runtime module(s) byte-identical ($modskip skipped, object)"
