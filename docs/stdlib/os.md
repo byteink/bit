@@ -26,11 +26,11 @@ Every argument, program name first.
 import { argc, arg, args } from "std/os"
 import { join } from "std/strings"
 
-function usage() {
+fn usage() {
   println("usage: ${arg(0)} <input>")
 }
 
-function inputPath(): string {
+fn inputPath(): string {
   if (argc() < 2) {
     usage()
     return ""
@@ -38,7 +38,7 @@ function inputPath(): string {
   return arg(1)
 }
 
-function echoArgs() {
+fn echoArgs() {
   println(join(args(), " "))
 }
 ```
@@ -57,11 +57,11 @@ The value of `name`, or `fallback` when it is unset.
 ```bit
 import { env, envOr } from "std/os"
 
-function editor(): string {
+fn editor(): string {
   return envOr("EDITOR", "vi")
 }
 
-function isDebug(): bool {
+fn isDebug(): bool {
   return env("BIT_DEBUG") != ""
 }
 ```
@@ -87,7 +87,7 @@ import { selfExe } from "std/os"
 import { dir } from "std/path"
 
 // The directory holding this program's own data files.
-function assetDir(): string {
+fn assetDir(): string {
   let exe = selfExe()
   if (len(exe) == 0) {
     return "."
@@ -110,7 +110,7 @@ you are deep in a call stack and there is nothing to return to.
 import { exit } from "std/os"
 import { stdout } from "std/io"
 
-function die(msg: string) {
+fn die(msg: string) {
   let w = stdout()
   w.writeLine("fatal: ${msg}")
   w.flush() // exit will not do this for us

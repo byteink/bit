@@ -42,7 +42,7 @@ Bytes accumulated so far.
 ```bit
 import { newBuilder } from "std/strings"
 
-function csv(xs: []string): string {
+fn csv(xs: []string): string {
   let b = newBuilder()
   let first = true
   for x of xs {
@@ -78,7 +78,7 @@ How many bytes a UTF-8 sequence starting with lead byte `b` occupies: 1 to 4, or
 ```bit
 import { runeCount, runeAt, runes } from "std/strings"
 
-function describe(s: string) {
+fn describe(s: string) {
   println("${len(s)} bytes, ${runeCount(s)} runes")
   if (runeCount(s) > 0) {
     println("first rune is ${runeAt(s, 0)}")
@@ -130,18 +130,18 @@ Non-overlapping occurrences of `sub` in `s`.
 ```bit
 import { hasPrefix, indexOf, count } from "std/strings"
 
-function scheme(url: string): string {
+fn scheme(url: string): string {
   if (!hasPrefix(url, "https://")) {
     return "other"
   }
   return "https"
 }
 
-function commas(line: string): i64 {
+fn commas(line: string): i64 {
   return count(line, ",")
 }
 
-function firstSpace(s: string): i64 {
+fn firstSpace(s: string): i64 {
   return indexOf(s, " ")
 }
 ```
@@ -184,16 +184,16 @@ the most negative `int`, `-9223372036854775808`.
 ```bit
 import { join, repeat, toUpper, split, trimSpace, parseInt } from "std/strings"
 
-function banner(title: string): string {
+fn banner(title: string): string {
   return toUpper(title) + "\n" + repeat("-", len(title))
 }
 
-function render(names: []string): string {
+fn render(names: []string): string {
   return join(names, ", ")
 }
 
 // Sum a comma-separated list of integers, ignoring surrounding spaces.
-function sumCsv(line: string): int! {
+fn sumCsv(line: string): int! {
   let total = 0
   for field of split(line, ",") {
     total = total + parseInt(trimSpace(field))?

@@ -19,7 +19,7 @@ The base of the natural logarithm.
 ```bit
 import { pi } from "std/math"
 
-function circleArea(r: f64): f64 {
+fn circleArea(r: f64): f64 {
   return pi * r * r
 }
 ```
@@ -57,11 +57,11 @@ the result is NaN. Of the two zeros, `+0.0` is larger: `max(-0.0, 0.0)` and
 ```bit
 import { clamp, abs } from "std/math"
 
-function normalize(x: f64): f64 {
+fn normalize(x: f64): f64 {
   return clamp(x, 0.0, 1.0)
 }
 
-function closeEnough(a: f64, b: f64): bool {
+fn closeEnough(a: f64, b: f64): bool {
   return abs(a - b) < 0.000001
 }
 ```
@@ -89,7 +89,7 @@ To the nearest, halves away from zero.
 ```bit
 import { floor, ceil, round, trunc } from "std/math"
 
-function directions(x: f64) {
+fn directions(x: f64) {
   println("${trunc(x)} ${floor(x)} ${ceil(x)} ${round(x)}")
 }
 ```
@@ -124,19 +124,19 @@ signs of both arguments to pick the quadrant. Note the argument order: `y` first
 ```bit
 import { sqrt, pow, log2, atan2 } from "std/math"
 
-function hypot(a: f64, b: f64): f64 {
+fn hypot(a: f64, b: f64): f64 {
   return sqrt(a * a + b * b)
 }
 
-function bitsNeeded(n: f64): f64 {
+fn bitsNeeded(n: f64): f64 {
   return log2(n)
 }
 
-function angle(x: f64, y: f64): f64 {
+fn angle(x: f64, y: f64): f64 {
   return atan2(y, x)
 }
 
-function cube(x: f64): f64 {
+fn cube(x: f64): f64 {
   return pow(x, 3.0)
 }
 ```
@@ -169,15 +169,15 @@ Greatest common divisor of `|a|` and `|b|`. `gcd(0, 0)` is `0`.
 ```bit
 import { gcd, ipow, imax, iabs } from "std/math"
 
-function reduceFraction(n: int, d: int): int {
+fn reduceFraction(n: int, d: int): int {
   return gcd(iabs(n), iabs(d))
 }
 
-function kilobytes(n: int): int {
+fn kilobytes(n: int): int {
   return n * ipow(2, 10)
 }
 
-function widest(xs: []int): int {
+fn widest(xs: []int): int {
   let best = 0
   for x of xs {
     best = imax(best, x)

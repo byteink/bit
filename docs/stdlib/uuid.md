@@ -33,7 +33,7 @@ Whether two UUIDs are the same 128-bit value. Use this instead of `==`.
 ```bit
 import { uuidV4, equals } from "std/uuid"
 
-function sameId(): bool {
+fn sameId(): bool {
   let id = uuidV4()
   return equals(id, id) && id.version() == 4 && id.variant() == 2
 }
@@ -55,7 +55,7 @@ length, a misplaced hyphen, or a non-hex digit. Round-trips with `format`:
 ```bit
 import { uuidV4, parse, format, equals } from "std/uuid"
 
-function roundTrips(): bool! {
+fn roundTrips(): bool! {
   let id = uuidV4()
   let back = parse(format(id))?
   return equals(back, id)
@@ -81,11 +81,11 @@ values made in order sort in order, so v7 keys keep database indexes tidy.
 ```bit
 import { uuidV5, uuidV7, format, namespaceDNS } from "std/uuid"
 
-function idFor(host: string): string {
+fn idFor(host: string): string {
   return format(uuidV5(namespaceDNS(), host))
 }
 
-function timeOrderedId(): string {
+fn timeOrderedId(): string {
   return format(uuidV7())
 }
 ```
@@ -119,11 +119,11 @@ The RFC 9562 X.500 DN namespace, for `uuidV5` over a distinguished name.
 ```bit
 import { UUID, uuidV5, format, equals, nilUUID, maxUUID, namespaceURL } from "std/uuid"
 
-function urlId(url: string): string {
+fn urlId(url: string): string {
   return format(uuidV5(namespaceURL(), url))
 }
 
-function isSpecial(u: UUID): bool {
+fn isSpecial(u: UUID): bool {
   return equals(u, nilUUID()) || equals(u, maxUUID())
 }
 ```

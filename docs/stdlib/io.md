@@ -58,7 +58,7 @@ Writes everything buffered to the descriptor. A no-op when nothing is pending.
 import { stdout, stderr } from "std/io"
 
 // One syscall for the whole report, not one per line.
-function report(lines: []string) {
+fn report(lines: []string) {
   let w = stdout()
   for line of lines {
     w.writeLine(line)
@@ -66,7 +66,7 @@ function report(lines: []string) {
   w.flush()
 }
 
-function warn(msg: string) {
+fn warn(msg: string) {
   let w = stderr()
   w.writeLine("warning: ${msg}")
   w.flush()
@@ -100,7 +100,7 @@ Everything still unread, to end of input.
 import { stdin, stdout } from "std/io"
 
 // `None` means end of input - the only way the loop terminates.
-function echoLines() {
+fn echoLines() {
   let r = stdin()
   let w = stdout()
   while (true) {
@@ -114,7 +114,7 @@ function echoLines() {
   }
 }
 
-function slurp(): string {
+fn slurp(): string {
   return stdin().readAll()
 }
 ```
@@ -131,7 +131,7 @@ input.
 import { Reader } from "std/io"
 
 // The integer after "Content-Length: " in an LSP header line.
-function parseLen(line: string): int {
+fn parseLen(line: string): int {
   let n = 0
   let i = len("Content-Length: ")
   while (i < len(line) && line[i] >= '0' && line[i] <= '9') {
@@ -142,7 +142,7 @@ function parseLen(line: string): int {
 }
 
 // One LSP-style frame: header line, blank line, then exactly the body's bytes.
-function readFrame(r: Reader): string {
+fn readFrame(r: Reader): string {
   let n = 0
   match (r.readLine()) {
     Some(h) => { n = parseLen(h) }

@@ -7,7 +7,7 @@ for before anything else.
 <!-- doctest: per-block -->
 
 ```bit
-function greet(name: string) {
+fn greet(name: string) {
   println("hello, ${name}")
 }
 ```
@@ -30,14 +30,14 @@ Builds an `error` carrying `msg`. This is the constructor: there is no `error(..
 Read the text back with `e.message()`.
 
 ```bit
-function halve(n: int): int! {
+fn halve(n: int): int! {
   if (n % 2 != 0) {
     fail newError("not even: ${n}")
   }
   return n / 2
 }
 
-function show(n: int) {
+fn show(n: int) {
   let h = halve(n) catch e {
     println("failed: ${e.message()}")
     return
@@ -54,7 +54,7 @@ function show(n: int) {
 a `T`, and the possibility of absence is written into the type.
 
 ```bit
-function firstEven(xs: []int): Option<int> {
+fn firstEven(xs: []int): Option<int> {
   for x of xs {
     if (x % 2 == 0) {
       return Option.Some(x)
@@ -63,7 +63,7 @@ function firstEven(xs: []int): Option<int> {
   return Option<int>.None
 }
 
-function report(xs: []int) {
+fn report(xs: []int) {
   match (firstEven(xs)) {
     Some(v) => { println("found ${v}") }
     None => { println("none even") }
@@ -92,11 +92,11 @@ bug, not a possibility.
 The contained value, or `dflt` when there is none. The total version of `unwrap`.
 
 ```bit
-function port(configured: Option<int>): int {
+fn port(configured: Option<int>): int {
   return unwrapOr(configured, 8080)
 }
 
-function must(o: Option<int>): int {
+fn must(o: Option<int>): int {
   if (isNone(o)) {
     println("expected a value")
   }
@@ -129,7 +129,7 @@ The success value. **Panics** on `Err`.
 The success value, or `dflt` on `Err`.
 
 ```bit
-function parseFlag(s: string): Result<bool, string> {
+fn parseFlag(s: string): Result<bool, string> {
   if (s == "yes") {
     return Result.Ok(true)
   }
@@ -139,7 +139,7 @@ function parseFlag(s: string): Result<bool, string> {
   return Result<bool, string>.Err("not a flag: ${s}")
 }
 
-function verbose(s: string): bool {
+fn verbose(s: string): bool {
   return okOr(parseFlag(s), false)
 }
 ```

@@ -33,7 +33,7 @@ import { newEncoder, newDecoder, HeaderField } from "std/http2"
 
 // Build a header block, then decode it back to the same fields. `enc` and `dec`
 // each hold their own dynamic table, evolving identically across calls.
-function roundTrip(): []HeaderField! {
+fn roundTrip(): []HeaderField! {
   let enc = newEncoder()
   let fields = []HeaderField{
     HeaderField{ name: ":method", value: "GET", sensitive: false },
@@ -54,7 +54,7 @@ A `sensitive` field (a cookie, an authorization token) is always sent
 import { newEncoder, HeaderField } from "std/http2"
 
 // A sensitive field is encoded never-indexed (RFC 7541 §6.2.3).
-function encodeSecret(): []byte {
+fn encodeSecret(): []byte {
   let enc = newEncoder()
   let fields = []HeaderField{
     HeaderField{ name: "authorization", value: "Bearer s3cr3t", sensitive: true },
@@ -158,7 +158,7 @@ with 1-bits. Exposed for direct use; `Encoder` calls it for its string literals.
 import { huffmanEncode, huffmanDecode } from "std/http2"
 
 // Huffman is self-inverse for well-formed input.
-function huffRoundTrip(s: string): []byte! {
+fn huffRoundTrip(s: string): []byte! {
   return huffmanDecode(huffmanEncode([]byte(s)))?
 }
 ```
@@ -181,7 +181,7 @@ the typed `decode*` helpers then interpret the payload.
 import { readFrame, decodeSettings, frameSettings, defaultMaxFrameSize } from "std/http2"
 
 // Read one frame off `buf`, and if it is SETTINGS, pull out its parameters.
-function firstSettings(buf: []byte): int! {
+fn firstSettings(buf: []byte): int! {
   let frame = readFrame(buf, defaultMaxFrameSize)?
   if (frame.header.ftype != frameSettings) {
     return 0
@@ -197,7 +197,7 @@ Encoding is the mirror: build a typed frame value and call its `encode*`.
 import { encodeSettings, SettingsFrame, Setting, settingsMaxFrameSize } from "std/http2"
 
 // A SETTINGS frame advertising a 32 KiB max frame size.
-function settingsBytes(): []byte! {
+fn settingsBytes(): []byte! {
   let params = []Setting{ Setting{ id: settingsMaxFrameSize, value: 32768 } }
   return encodeSettings(SettingsFrame{ ack: false, settings: params })?
 }
@@ -210,7 +210,7 @@ A HEADERS frame carries an HPACK block fragment - encode the headers with an
 import { newEncoder, HeaderField, encodeHeaders, HeadersFrame } from "std/http2"
 
 // Frame a header block onto stream `sid`, ending both the headers and the stream.
-function headersFrame(sid: int): []byte! {
+fn headersFrame(sid: int): []byte! {
   let enc = newEncoder()
   let block = enc.encode([]HeaderField{ HeaderField{ name: ":status", value: "200", sensitive: false } })
   return encodeHeaders(HeadersFrame{
@@ -621,19 +621,19 @@ before the first request goes out.
 import { connect, accept, Transport, defaultConfig, Request, Response, newRequest, newResponse } from "std/http2"
 
 // Answer every request with its path echoed back in the body.
-function echo(req: Request): Response {
+fn echo(req: Request): Response {
   return newResponse(200, []byte("you asked for " + req.path))
 }
 
 // `client` and `server` are the two ends of one byte stream - a socket pair, or
 // an in-memory pipe in a test. Serve one end and fetch "/" from the other.
-function demo(client: Transport, server: Transport): Response! {
+fn demo(client: Transport, server: Transport): Response! {
   spawn serveOn(server)
   let conn = connect(client, defaultConfig())?
   return conn.roundTrip(newRequest("GET", "example.com", "/"))?
 }
 
-function serveOn(t: Transport) {
+fn serveOn(t: Transport) {
   let conn = accept(t, defaultConfig()) catch e {
     return
   }

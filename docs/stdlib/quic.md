@@ -35,7 +35,7 @@ in 62 bits. For example, 494,878,333 encodes to the four-byte `9d7f3e7d`.
 ```bit
 import { encodeVarint } from "std/quic"
 
-function example(): []byte {
+fn example(): []byte {
   return encodeVarint(494878333)
 }
 ```
@@ -49,7 +49,7 @@ an empty slice or a length that runs past the end.
 ```bit
 import { decodeVarint } from "std/quic"
 
-function example(data: []byte): u64! {
+fn example(data: []byte): u64! {
   return decodeVarint(data)?
 }
 ```
@@ -62,7 +62,7 @@ buffer up front without encoding twice.
 ```bit
 import { varintSize } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return varintSize(15293)
 }
 ```
@@ -75,7 +75,7 @@ One ACK Range (RFC 9000 §19.3.1): a `gap` of unacknowledged packets and a
 ```bit
 import { AckRange } from "std/quic"
 
-function example(): AckRange {
+fn example(): AckRange {
   return AckRange{ gap: 1, rangeLength: 4 }
 }
 ```
@@ -89,7 +89,7 @@ ECN counters.
 ```bit
 import { AckFrame, AckRange } from "std/quic"
 
-function example(): AckFrame {
+fn example(): AckFrame {
   return AckFrame{
     largest: 10,
     delay: 3,
@@ -112,7 +112,7 @@ the packet.
 ```bit
 import { StreamFrame } from "std/quic"
 
-function example(data: []byte): StreamFrame {
+fn example(data: []byte): StreamFrame {
   return StreamFrame{
     id: 4,
     offset: 8,
@@ -133,7 +133,7 @@ of `n` PADDING bytes; `ConnectionClose` is the transport variant (type 0x1c) and
 ```bit
 import { Frame } from "std/quic"
 
-function example(data: []byte): Frame {
+fn example(data: []byte): Frame {
   return Frame.Crypto(0, data)
 }
 ```
@@ -145,7 +145,7 @@ The wire encoding of a single frame (RFC 9000 §19).
 ```bit
 import { Frame, encodeFrame } from "std/quic"
 
-function example(): []byte {
+fn example(): []byte {
   return encodeFrame(Frame.Ping)
 }
 ```
@@ -157,7 +157,7 @@ The concatenated wire encoding of `frames`, in order.
 ```bit
 import { Frame, encodeFrames } from "std/quic"
 
-function example(): []byte {
+fn example(): []byte {
   return encodeFrames([Frame.Ping, Frame.HandshakeDone])
 }
 ```
@@ -170,7 +170,7 @@ an unknown frame type or any field that runs past the end.
 ```bit
 import { Frame, parseFrames } from "std/quic"
 
-function example(data: []byte): []Frame! {
+fn example(data: []byte): []Frame! {
   return parseFrames(data)?
 }
 ```
@@ -192,7 +192,7 @@ QUIC version 1 (RFC 9000 §15), `0x00000001`.
 ```bit
 import { quicVersion1 } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return quicVersion1
 }
 ```
@@ -204,7 +204,7 @@ The long-header type value for an Initial packet (RFC 9000 §17.2.2), `0`.
 ```bit
 import { longInitial } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return longInitial
 }
 ```
@@ -216,7 +216,7 @@ The long-header type value for a 0-RTT packet (RFC 9000 §17.2.3), `1`.
 ```bit
 import { longZeroRtt } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return longZeroRtt
 }
 ```
@@ -228,7 +228,7 @@ The long-header type value for a Handshake packet (RFC 9000 §17.2.4), `2`.
 ```bit
 import { longHandshake } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return longHandshake
 }
 ```
@@ -240,7 +240,7 @@ The long-header type value for a Retry packet (RFC 9000 §17.2.5), `3`.
 ```bit
 import { longRetry } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return longRetry
 }
 ```
@@ -253,7 +253,7 @@ for one direction of one encryption level.
 ```bit
 import { PacketKeys, deriveKeys } from "std/quic"
 
-function example(secret: []byte): PacketKeys {
+fn example(secret: []byte): PacketKeys {
   return deriveKeys(secret)
 }
 ```
@@ -266,7 +266,7 @@ Initial-secret extraction.
 ```bit
 import { initialSalt } from "std/quic"
 
-function example(): []byte {
+fn example(): []byte {
   return initialSalt()
 }
 ```
@@ -280,7 +280,7 @@ non-Initial suite, such as the 32-byte ChaCha20-Poly1305 key.
 ```bit
 import { expandLabel } from "std/quic"
 
-function example(secret: []byte): []byte {
+fn example(secret: []byte): []byte {
   return expandLabel(secret, "quic key", 16)
 }
 ```
@@ -293,7 +293,7 @@ initial_salt, dcid)` over the client's Destination Connection ID.
 ```bit
 import { deriveInitialSecret } from "std/quic"
 
-function example(dcid: []byte): []byte {
+fn example(dcid: []byte): []byte {
   return deriveInitialSecret(dcid)
 }
 ```
@@ -306,7 +306,7 @@ The client Initial traffic secret (RFC 9001 §5.2): `HKDF-Expand-Label(initial,
 ```bit
 import { clientInitialSecret } from "std/quic"
 
-function example(dcid: []byte): []byte {
+fn example(dcid: []byte): []byte {
   return clientInitialSecret(dcid)
 }
 ```
@@ -319,7 +319,7 @@ The server Initial traffic secret (RFC 9001 §5.2): `HKDF-Expand-Label(initial,
 ```bit
 import { serverInitialSecret } from "std/quic"
 
-function example(dcid: []byte): []byte {
+fn example(dcid: []byte): []byte {
   return serverInitialSecret(dcid)
 }
 ```
@@ -332,7 +332,7 @@ The AES-128-GCM key/iv/hp derived from a traffic `secret` (RFC 9001 §5.1): "qui
 ```bit
 import { PacketKeys, deriveKeys } from "std/quic"
 
-function example(secret: []byte): PacketKeys {
+fn example(secret: []byte): PacketKeys {
   return deriveKeys(secret)
 }
 ```
@@ -345,7 +345,7 @@ client-chosen `dcid`.
 ```bit
 import { PacketKeys, clientInitialKeys } from "std/quic"
 
-function example(dcid: []byte): PacketKeys {
+fn example(dcid: []byte): PacketKeys {
   return clientInitialKeys(dcid)
 }
 ```
@@ -358,7 +358,7 @@ The keys that protect the server's Initial packets, derived from the same client
 ```bit
 import { PacketKeys, serverInitialKeys } from "std/quic"
 
-function example(dcid: []byte): PacketKeys {
+fn example(dcid: []byte): PacketKeys {
   return serverInitialKeys(dcid)
 }
 ```
@@ -372,7 +372,7 @@ acknowledged yet.
 ```bit
 import { packetNumberLength } from "std/quic"
 
-function example(): int {
+fn example(): int {
   return packetNumberLength(42, -1)
 }
 ```
@@ -384,7 +384,7 @@ The `pnLength`-byte big-endian truncation of packet number `pn` (RFC 9000 §17.1
 ```bit
 import { encodePacketNumber } from "std/quic"
 
-function example(): []byte {
+fn example(): []byte {
   return encodePacketNumber(42, 2)
 }
 ```
@@ -397,7 +397,7 @@ right-aligned) XOR'd into its low bytes.
 ```bit
 import { packetNonce } from "std/quic"
 
-function example(iv: []byte): []byte {
+fn example(iv: []byte): []byte {
   return packetNonce(iv, 42)
 }
 ```
@@ -411,7 +411,7 @@ nonce `IV ^ pn` and `header` as additional data, returning the ciphertext with t
 ```bit
 import { PacketKeys, protectPayload } from "std/quic"
 
-function example(keys: PacketKeys, header: []byte, payload: []byte): []byte! {
+fn example(keys: PacketKeys, header: []byte, payload: []byte): []byte! {
   return protectPayload(keys, 0, header, payload)?
 }
 ```
@@ -424,7 +424,7 @@ authenticating `header`. Fails without returning plaintext if the tag does not v
 ```bit
 import { PacketKeys, unprotectPayload } from "std/quic"
 
-function example(keys: PacketKeys, header: []byte, ciphertext: []byte): []byte! {
+fn example(keys: PacketKeys, header: []byte, ciphertext: []byte): []byte! {
   return unprotectPayload(keys, 0, header, ciphertext)?
 }
 ```
@@ -437,7 +437,7 @@ The 16-byte header-protection sample from a protected payload (RFC 9001 §5.4.2)
 ```bit
 import { headerSample } from "std/quic"
 
-function example(protectedPayload: []byte): []byte! {
+fn example(protectedPayload: []byte): []byte! {
   return headerSample(protectedPayload, 4)?
 }
 ```
@@ -450,7 +450,7 @@ The 5-byte AES header-protection mask (RFC 9001 §5.4.3): AES-ECB of the 16-byte
 ```bit
 import { aesHeaderMask } from "std/quic"
 
-function example(hpKey: []byte, sample: []byte): []byte! {
+fn example(hpKey: []byte, sample: []byte): []byte! {
   return aesHeaderMask(hpKey, sample)?
 }
 ```
@@ -463,7 +463,7 @@ The 5-byte ChaCha20 header-protection mask (RFC 9001 §5.4.4): the counter is
 ```bit
 import { chachaHeaderMask } from "std/quic"
 
-function example(hpKey: []byte, sample: []byte): []byte! {
+fn example(hpKey: []byte, sample: []byte): []byte! {
   return chachaHeaderMask(hpKey, sample)?
 }
 ```
@@ -476,7 +476,7 @@ Apply header protection to a full packet buffer in place, for sending (RFC 9001
 ```bit
 import { applyHeaderProtection } from "std/quic"
 
-function example(packet: []byte, pnOffset: int, mask: []byte): ()! {
+fn example(packet: []byte, pnOffset: int, mask: []byte): ()! {
   applyHeaderProtection(packet, pnOffset, mask)?
 }
 ```
@@ -489,7 +489,7 @@ the recovered packet-number length (RFC 9001 §5.4.1).
 ```bit
 import { removeHeaderProtection } from "std/quic"
 
-function example(packet: []byte, pnOffset: int, mask: []byte): int! {
+fn example(packet: []byte, pnOffset: int, mask: []byte): int! {
   return removeHeaderProtection(packet, pnOffset, mask)?
 }
 ```
@@ -502,7 +502,7 @@ Destination and Source Connection IDs.
 ```bit
 import { LongHeader, parseLongHeader } from "std/quic"
 
-function example(packet: []byte): LongHeader! {
+fn example(packet: []byte): LongHeader! {
   return parseLongHeader(packet)?
 }
 ```
@@ -515,7 +515,7 @@ which is exactly the AEAD additional data for `protectPayload`.
 ```bit
 import { encodeInitialHeader } from "std/quic"
 
-function example(dcid: []byte, scid: []byte): []byte {
+fn example(dcid: []byte, scid: []byte): []byte {
   return encodeInitialHeader(1, dcid, scid, []byte(0), 1200, 0, 4)
 }
 ```
@@ -528,7 +528,7 @@ version, and the two connection IDs, stopping before the type-specific fields.
 ```bit
 import { LongHeader, parseLongHeader } from "std/quic"
 
-function example(packet: []byte): LongHeader! {
+fn example(packet: []byte): LongHeader! {
   return parseLongHeader(packet)?
 }
 ```
@@ -541,7 +541,7 @@ The short-header (1-RTT) fields recovered after header protection is removed (RF
 ```bit
 import { ShortHeader, parseShortHeader } from "std/quic"
 
-function example(packet: []byte): ShortHeader! {
+fn example(packet: []byte): ShortHeader! {
   return parseShortHeader(packet, 8)?
 }
 ```
@@ -554,7 +554,7 @@ the AEAD additional data for a 1-RTT packet.
 ```bit
 import { encodeShortHeader } from "std/quic"
 
-function example(dcid: []byte): []byte {
+fn example(dcid: []byte): []byte {
   return encodeShortHeader(dcid, 42, 2, false, false)
 }
 ```
@@ -567,7 +567,7 @@ which a short header does not carry on the wire. Call after `removeHeaderProtect
 ```bit
 import { ShortHeader, parseShortHeader } from "std/quic"
 
-function example(packet: []byte): ShortHeader! {
+fn example(packet: []byte): ShortHeader! {
   return parseShortHeader(packet, 8)?
 }
 ```
@@ -581,7 +581,7 @@ with its trailing tag removed.
 ```bit
 import { retryIntegrityTag } from "std/quic"
 
-function example(odcid: []byte, retryWithoutTag: []byte): []byte! {
+fn example(odcid: []byte, retryWithoutTag: []byte): []byte! {
   return retryIntegrityTag(odcid, retryWithoutTag)?
 }
 ```
@@ -594,7 +594,7 @@ Whether the trailing integrity tag of `fullRetry` is valid for `odcid` (RFC 9001
 ```bit
 import { verifyRetry } from "std/quic"
 
-function example(odcid: []byte, fullRetry: []byte): bool! {
+fn example(odcid: []byte, fullRetry: []byte): bool! {
   return verifyRetry(odcid, fullRetry)?
 }
 ```
@@ -607,7 +607,7 @@ lists the server's supported `versions`, echoing the client's connection IDs.
 ```bit
 import { encodeVersionNegotiation } from "std/quic"
 
-function example(dcid: []byte, scid: []byte): []byte {
+fn example(dcid: []byte, scid: []byte): []byte {
   return encodeVersionNegotiation(dcid, scid, [1])
 }
 ```
@@ -620,7 +620,7 @@ whose 32-bit version field is zero.
 ```bit
 import { isVersionNegotiation } from "std/quic"
 
-function example(packet: []byte): bool {
+fn example(packet: []byte): bool {
   return isVersionNegotiation(packet)
 }
 ```
@@ -655,10 +655,10 @@ import {
 import { Hash, newSha256 } from "std/crypto"
 
 // The negotiated suite's hash as a `() => Hash`.
-function sha256(): Hash { return newSha256() }
+fn sha256(): Hash { return newSha256() }
 
 // Our transport parameters, as the quic_transport_parameters extension body.
-function myParameters(): []byte {
+fn myParameters(): []byte {
   let tp = defaultTransportParameters()
   tp.initialMaxData = 1048576
   tp.initialMaxStreamsBidi = 100
@@ -667,16 +667,16 @@ function myParameters(): []byte {
 
 // The 1-RTT packet keys for one direction from its application traffic secret,
 // and the next secret after a key update (re-derive the key/iv, keep the hp).
-function oneRttKeys(secret: []byte): PacketKeys {
+fn oneRttKeys(secret: []byte): PacketKeys {
   return levelKeys(sha256, secret, 16)
 }
 
-function rollForward(secret: []byte): []byte {
+fn rollForward(secret: []byte): []byte {
   return updateSecret(sha256, secret)
 }
 
 // Carry a handshake message in CRYPTO frames and reassemble it in order.
-function carry(handshake: []byte): []byte! {
+fn carry(handshake: []byte): []byte! {
   let frames = cryptoFrames(handshake, 0, 1000)
   return reassembleCryptoFrames(frames, 65536)?
 }
@@ -755,11 +755,11 @@ import { levelKeyPair, LevelKeyPair } from "std/quic"
 import { Hash, newSha256 } from "std/crypto"
 
 // The negotiated suite's hash as a `() => Hash`.
-function suite(): Hash { return newSha256() }
+fn suite(): Hash { return newSha256() }
 
 // Both directions' 1-RTT keys from the client and server application secrets that
 // the std/tls record-bypass handshake exposed.
-function oneRtt(clientSecret: []byte, serverSecret: []byte): LevelKeyPair {
+fn oneRtt(clientSecret: []byte, serverSecret: []byte): LevelKeyPair {
   return levelKeyPair(suite, clientSecret, serverSecret, 16)
 }
 ```
@@ -933,7 +933,7 @@ import { UdpSocket } from "std/net"
 
 // Client: open a bidirectional stream, send a request, and read the reply to the
 // end of stream.
-function request(host: string, port: int, req: []byte): []byte! {
+fn request(host: string, port: int, req: []byte): []byte! {
   let conn = dialQuic(host, port, "example.com")?
   let s = conn.openStream()?
   s.write(req)?
@@ -953,7 +953,7 @@ function request(host: string, port: int, req: []byte): []byte! {
 
 // Server: accept one connection on an already-bound UDP socket, take the client's
 // stream, and drain it to the end.
-function serve(sock: UdpSocket, chainPem: string, keyPem: string): []byte! {
+fn serve(sock: UdpSocket, chainPem: string, keyPem: string): []byte! {
   let conn = acceptQuic(sock, chainPem, keyPem)?
   let s = conn.acceptStream()?
   let body = []byte(0)

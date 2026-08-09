@@ -49,11 +49,11 @@ struct ByteCounter {
   seen: int
 }
 
-function (c: ByteCounter) write(data: []byte) {
+fn (c: ByteCounter) write(data: []byte) {
   c.seen = c.seen + len(data)
 }
 
-function (c: ByteCounter) sum(): []byte {
+fn (c: ByteCounter) sum(): []byte {
   let out = []byte(4)
   out[0] = 1
   out[1] = 2
@@ -62,20 +62,20 @@ function (c: ByteCounter) sum(): []byte {
   return out
 }
 
-function (c: ByteCounter) reset() {
+fn (c: ByteCounter) reset() {
   c.seen = 0
 }
 
-function (c: ByteCounter) size(): int {
+fn (c: ByteCounter) size(): int {
   return 4
 }
 
-function (c: ByteCounter) blockSize(): int {
+fn (c: ByteCounter) blockSize(): int {
   return 64
 }
 
 // Streaming: reset, feed bytes across as many `write`s as you like, read `sum`.
-function streamed(c: ByteCounter): []byte {
+fn streamed(c: ByteCounter): []byte {
   c.reset()
   c.write([]byte("ab"))
   c.write([]byte("c"))
@@ -83,7 +83,7 @@ function streamed(c: ByteCounter): []byte {
 }
 
 // One-shot: `digest` does the reset / write / sum for a single buffer.
-function oneShot(c: ByteCounter): []byte {
+fn oneShot(c: ByteCounter): []byte {
   return digest(c, []byte("abc"))
 }
 ```
@@ -136,11 +136,11 @@ unchanged. Use it to re-key an existing buffer without allocating a new one.
 ```bit
 import { randomBytes, fillRandom } from "std/crypto"
 
-function token(): []byte {
+fn token(): []byte {
   return randomBytes(16)
 }
 
-function rekey(key: []byte) {
+fn rekey(key: []byte) {
   fillRandom(key)
 }
 ```
@@ -162,11 +162,11 @@ top `2^64 mod n` values - so every residue is equally likely.
 ```bit
 import { randomU64, randomUintBelow } from "std/crypto"
 
-function nonce(): uint {
+fn nonce(): uint {
   return randomU64()
 }
 
-function rollDie(): uint {
+fn rollDie(): uint {
   return randomUintBelow(6) + 1
 }
 ```
@@ -182,17 +182,17 @@ handled error rather than silent garbage.
 import { encodeHex, encodeHexUpper, decodeHex } from "std/crypto"
 
 // Lowercase hex, e.g. a hash or key rendered for logs.
-function fingerprint(raw: []byte): string {
+fn fingerprint(raw: []byte): string {
   return encodeHex(raw)
 }
 
 // Uppercase hex, for formats that expect it.
-function shout(raw: []byte): string {
+fn shout(raw: []byte): string {
   return encodeHexUpper(raw)
 }
 
 // Parse hex back to bytes, handling a malformed string at the call site.
-function parse(s: string): []byte {
+fn parse(s: string): []byte {
   return decodeHex(s) catch e {
     println("bad hex: ${e.message()}")
     return []byte(0)
@@ -241,14 +241,14 @@ import { ctEq, ctSelect, secureZero } from "std/crypto"
 
 // Verify a MAC tag in constant time - no early exit reveals where a forgery
 // first diverges - then wipe the key so it can't linger in memory.
-function checkTag(key: []byte, want: []byte, got: []byte): bool {
+fn checkTag(key: []byte, want: []byte, got: []byte): bool {
   let ok = ctEq(want, got)
   secureZero(key)
   return ok
 }
 
 // Pick `hi` when `v` is 1 and `lo` when `v` is 0, with no branch on `v`.
-function pick(v: int, hi: int, lo: int): int {
+fn pick(v: int, hi: int, lo: int): int {
   return ctSelect(v, hi, lo)
 }
 ```
@@ -294,18 +294,18 @@ verified against the FIPS 180-4 known-answer vectors (e.g. SHA-256 of `"abc"` is
 import { newSha256, newSha224, digest, encodeHex } from "std/crypto"
 
 // One-shot SHA-256 of a string, rendered as lowercase hex.
-function sha256Hex(s: string): string {
+fn sha256Hex(s: string): string {
   return encodeHex(digest(newSha256(), []byte(s)))
 }
 
 // One-shot SHA-224, rendered as hex.
-function sha224Hex(s: string): string {
+fn sha224Hex(s: string): string {
   return encodeHex(digest(newSha224(), []byte(s)))
 }
 
 // Streaming: write the message in parts, then read the digest. `size` and
 // `blockSize` report 32 and 64 for SHA-256; `reset` rewinds for reuse.
-function streamed(): []byte {
+fn streamed(): []byte {
   let h = newSha256()
   h.write([]byte("abc"))
   h.write([]byte("def"))
@@ -372,13 +372,13 @@ import { newSha1, digest, encodeHex } from "std/crypto"
 // One-shot: the lowercase hex fingerprint of a buffer. Legacy interop only -
 // e.g. a UUIDv5 namespace hash or an old certificate fingerprint, never a new
 // signature.
-function sha1Hex(data: []byte): string {
+fn sha1Hex(data: []byte): string {
   return encodeHex(digest(newSha1(), data))
 }
 
 // Streaming: reset, feed the bytes across as many writes as you like, then read
 // the 20-byte digest with `sum`.
-function sha1Stream(head: []byte, tail: []byte): []byte {
+fn sha1Stream(head: []byte, tail: []byte): []byte {
   let h = newSha1()
   h.reset()
   h.write(head)
@@ -411,13 +411,13 @@ import { newMd5, digest, encodeHex } from "std/crypto"
 
 // One-shot: the lowercase hex digest of a buffer. Legacy interop only - e.g.
 // reproducing an old checksum or ETag, never an integrity check or signature.
-function md5Hex(data: []byte): string {
+fn md5Hex(data: []byte): string {
   return encodeHex(digest(newMd5(), data))
 }
 
 // Streaming: reset, feed the bytes across as many writes as you like, then read
 // the 16-byte digest with `sum`.
-function md5Stream(head: []byte, tail: []byte): []byte {
+fn md5Stream(head: []byte, tail: []byte): []byte {
   let h = newMd5()
   h.reset()
   h.write(head)
@@ -450,21 +450,21 @@ share the engine. Prefer it over SHA-256 on 64-bit hardware, where it is faster.
 import { digest, newSha512, newSha384, newSha512_256, encodeHex } from "std/crypto"
 
 // One-shot: hash a whole buffer and render the digest as lowercase hex.
-function sha512Hex(data: []byte): string {
+fn sha512Hex(data: []byte): string {
   return encodeHex(digest(newSha512(), data))
 }
 
 // The shorter digests share the exact same call shape.
-function sha384Hex(data: []byte): string {
+fn sha384Hex(data: []byte): string {
   return encodeHex(digest(newSha384(), data))
 }
 
-function sha512_256Hex(data: []byte): string {
+fn sha512_256Hex(data: []byte): string {
   return encodeHex(digest(newSha512_256(), data))
 }
 
 // Streaming: absorb a message across as many `write`s as you like, read once.
-function fingerprint(head: []byte, tail: []byte): string {
+fn fingerprint(head: []byte, tail: []byte): string {
   let h = newSha512()
   h.write(head)
   h.write(tail)
@@ -503,16 +503,16 @@ garbage.
 import { encode, decode, encodeUrl, decodeUrl } from "std/crypto"
 
 // Standard base64 with '=' padding - round-trips any bytes.
-function roundTrip(data: []byte): []byte! {
+fn roundTrip(data: []byte): []byte! {
   return decode(encode(data))?
 }
 
 // URL-safe alphabet (-/_), no padding - for URLs, query strings, and filenames.
-function tokenize(data: []byte): string {
+fn tokenize(data: []byte): string {
   return encodeUrl(data)
 }
 
-function detokenize(token: string): []byte! {
+fn detokenize(token: string): []byte! {
   return decodeUrl(token)?
 }
 ```
@@ -561,18 +561,18 @@ random nonce into a fresh ChaCha20 key.
 import { chacha20, hchacha20 } from "std/crypto"
 
 // Encrypt under a 32-byte key and 12-byte nonce, starting at block counter 1.
-function seal(key: []byte, nonce: []byte, plaintext: []byte): []byte {
+fn seal(key: []byte, nonce: []byte, plaintext: []byte): []byte {
   return chacha20(key, nonce, 1, plaintext)
 }
 
 // Decrypt: the identical call - XOR with the keystream is its own inverse.
-function unseal(key: []byte, nonce: []byte, ciphertext: []byte): []byte {
+fn unseal(key: []byte, nonce: []byte, ciphertext: []byte): []byte {
   return chacha20(key, nonce, 1, ciphertext)
 }
 
 // Derive a 32-byte subkey from a 32-byte key and a 16-byte nonce, as XChaCha20
 // does to absorb a longer nonce before running ChaCha20.
-function subkey(key: []byte, nonce16: []byte): []byte {
+fn subkey(key: []byte, nonce16: []byte): []byte {
   return hchacha20(key, nonce16)
 }
 ```
@@ -623,7 +623,7 @@ struct XorSeal {
   pad: byte
 }
 
-function (x: XorSeal) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
+fn (x: XorSeal) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byte {
   let out = []byte(len(plaintext) + 1)
   let tag: byte = 0
   let i = 0
@@ -637,7 +637,7 @@ function (x: XorSeal) seal(nonce: []byte, plaintext: []byte, aad: []byte): []byt
   return out
 }
 
-function (x: XorSeal) open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte! {
+fn (x: XorSeal) open(nonce: []byte, ciphertext: []byte, aad: []byte): []byte! {
   if (len(ciphertext) < 1) {
     fail newError("open: ciphertext shorter than the tag")
   }
@@ -657,17 +657,17 @@ function (x: XorSeal) open(nonce: []byte, ciphertext: []byte, aad: []byte): []by
   return out
 }
 
-function (x: XorSeal) nonceSize(): int {
+fn (x: XorSeal) nonceSize(): int {
   return 12
 }
 
-function (x: XorSeal) overhead(): int {
+fn (x: XorSeal) overhead(): int {
   return 1
 }
 
 // Encrypt-then-decrypt through the `Aead` interface: `open` recovers what `seal`
 // produced, or fails if the ciphertext was tampered with.
-function roundtrip(a: Aead, nonce: []byte, msg: []byte, aad: []byte): []byte! {
+fn roundtrip(a: Aead, nonce: []byte, msg: []byte, aad: []byte): []byte! {
   let ct = a.seal(nonce, msg, aad)
   return a.open(nonce, ct, aad)?
 }
@@ -725,13 +725,13 @@ import { newAes, encodeHex } from "std/crypto"
 
 // Encipher a single 16-byte block with AES-128 and return the ciphertext as
 // hex. `newAes` fails unless the key is 16, 24, or 32 bytes, so this is fallible.
-function encryptBlockHex(key: []byte, block: []byte): string! {
+fn encryptBlockHex(key: []byte, block: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(cipher.encryptBlock(block))
 }
 
 // Decipher one block - the inverse of encryptBlock under the same key.
-function decryptBlockHex(key: []byte, block: []byte): string! {
+fn decryptBlockHex(key: []byte, block: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(cipher.decryptBlock(block))
 }
@@ -796,14 +796,14 @@ import { poly1305, poly1305Verify, encodeHex } from "std/crypto"
 // key is r‖s and must be used for exactly one message - a real caller derives a
 // fresh key per message (e.g. from a nonce-keyed ChaCha20 keystream), never a
 // reused constant.
-function authTag(key: []byte, msg: []byte): string {
+fn authTag(key: []byte, msg: []byte): string {
   return encodeHex(poly1305(key, msg))
 }
 
 // The receiver recomputes the tag and checks it in constant time. Prefer this
 // over comparing `poly1305(key, msg)` to the received tag with `==`, which would
 // leak the mismatch position through timing.
-function verified(key: []byte, msg: []byte, tag: []byte): bool {
+fn verified(key: []byte, msg: []byte, tag: []byte): bool {
   return poly1305Verify(key, msg, tag)
 }
 ```
@@ -853,22 +853,22 @@ import { Hash, hmac, hmacEqual, newSha256, newSha512, encodeHex } from "std/cryp
 
 // SHA-256 returns the concrete `Sha256`, so expose its constructor as a
 // `() => Hash` value; the SHA-512 family already returns `Hash` (see below).
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // The HMAC-SHA-256 tag of `msg` under `key`, as lowercase hex.
-function tagHex(key: []byte, msg: []byte): string {
+fn tagHex(key: []byte, msg: []byte): string {
   return encodeHex(hmac(sha256Hash, key, msg))
 }
 
 // The same call over a different hash - HMAC-SHA-512 - by handing in another
 // constructor. `newSha512` already returns `Hash`, so it needs no wrapper.
-function tag512Hex(key: []byte, msg: []byte): string {
+fn tag512Hex(key: []byte, msg: []byte): string {
   return encodeHex(hmac(newSha512, key, msg))
 }
 
 // Verify a received tag in constant time. Prefer this over comparing the tag
 // bytes with `==`, which leaks the first mismatch position through timing.
-function verify(key: []byte, msg: []byte, tag: []byte): bool {
+fn verify(key: []byte, msg: []byte, tag: []byte): bool {
   return hmacEqual(hmac(sha256Hash, key, msg), tag)
 }
 ```
@@ -914,27 +914,27 @@ import { newAes, ctr, ecbEncryptBlock, cbcEncrypt, cbcDecrypt, encodeHex } from 
 
 // CTR encrypts and decrypts with the same call. `key` is 16/24/32 bytes and `iv`
 // is the 16-byte initial counter block; the result is the ciphertext as hex.
-function ctrHex(key: []byte, iv: []byte, data: []byte): string! {
+fn ctrHex(key: []byte, iv: []byte, data: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(ctr(cipher, iv, data))
 }
 
 // CBC over block-aligned data (`data` must be a multiple of 16 bytes).
-function cbcHex(key: []byte, iv: []byte, data: []byte): string! {
+fn cbcHex(key: []byte, iv: []byte, data: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(cbcEncrypt(cipher, iv, data))
 }
 
 // CBC decrypt is fallible: a ciphertext that is not a whole number of blocks
 // fails rather than returning garbage.
-function cbcOpen(key: []byte, iv: []byte, ct: []byte): []byte! {
+fn cbcOpen(key: []byte, iv: []byte, ct: []byte): []byte! {
   let cipher = newAes(key)?
   return cbcDecrypt(cipher, iv, ct)?
 }
 
 // QUIC header protection derives a mask from one sampled ciphertext block via
 // the bare ECB permutation - never a general-purpose cipher.
-function headerMask(key: []byte, sample: []byte): string! {
+fn headerMask(key: []byte, sample: []byte): string! {
   let cipher = newAes(key)?
   return encodeHex(ecbEncryptBlock(cipher, sample))
 }
@@ -998,23 +998,23 @@ import { Hash, hkdf, hkdfExtract, hkdfExpand, newSha256, newSha512, encodeHex } 
 
 // SHA-256 returns the concrete `Sha256`, so expose its constructor as a
 // `() => Hash` value; the SHA-512 family already returns `Hash`.
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // Derive a 32-byte key in two explicit steps: extract the entropy of `ikm` into
 // a pseudo-random key, then expand it under a context label to the wanted size.
-function deriveKey(salt: []byte, ikm: []byte): []byte! {
+fn deriveKey(salt: []byte, ikm: []byte): []byte! {
   let prk = hkdfExtract(sha256Hash, salt, ikm)
   return hkdfExpand(sha256Hash, prk, []byte("app v1 encryption"), 32)?
 }
 
 // The same derivation in one call - extract and expand together - as hex.
-function deriveKeyHex(salt: []byte, ikm: []byte): string! {
+fn deriveKeyHex(salt: []byte, ikm: []byte): string! {
   return encodeHex(hkdf(sha256Hash, salt, ikm, []byte("app v1 encryption"), 32)?)
 }
 
 // The digest selects the strength and the output ceiling: HKDF-SHA-512 can
 // derive up to 255*64 bytes. An empty salt takes the HashLen-zero default.
-function deriveLong(ikm: []byte): []byte! {
+fn deriveLong(ikm: []byte): []byte! {
   return hkdf(newSha512, []byte(0), ikm, []byte("stream keys"), 128)?
 }
 ```
@@ -1073,7 +1073,7 @@ import { newChaChaPoly, newXChaChaPoly } from "std/crypto"
 // Encrypt-then-authenticate with ChaCha20-Poly1305, then verify-then-decrypt.
 // `open` returns the original plaintext or fails - it never returns unverified
 // bytes. `key` is 32 bytes and `nonce` 12 bytes, unique per key.
-function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
+fn protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
   let c = newChaChaPoly(key)?
   let sealed = c.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
   return c.open(nonce, sealed, aad)?
@@ -1081,7 +1081,7 @@ function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! 
 
 // The same with XChaCha20-Poly1305: a 24-byte nonce, wide enough that a random
 // nonce per message is safe.
-function protectX(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
+fn protectX(key: []byte, nonce: []byte, msg: []byte, aad: []byte): []byte! {
   let c = newXChaChaPoly(key)?
   let sealed = c.seal(nonce, msg, aad)
   return c.open(nonce, sealed, aad)?
@@ -1183,7 +1183,7 @@ import { newGcm, encodeHex } from "std/crypto"
 // is 12 bytes and MUST be unique per key - never reuse one under the same key.
 // `aad` is authenticated but not encrypted (headers, sequence numbers). Returns
 // the recovered plaintext as hex, or fails if the tag does not verify.
-function protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
+fn protect(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
   let cipher = newGcm(key)?
   let sealed = cipher.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
   let opened = cipher.open(nonce, sealed, aad)? // fails on any tag mismatch
@@ -1248,7 +1248,7 @@ import {
 } from "std/crypto"
 
 // Build SEQUENCE { INTEGER, INTEGER }, encode it, parse it back, and sum the two.
-function seqSum(a: int, b: int): int! {
+fn seqSum(a: int, b: int): int! {
   let seq = asn1Sequence([]Element{ asn1Integer(a), asn1Integer(b) })
   let parts = asn1ReadSequence(asn1Parse(asn1Encode(seq))?)?
   return asn1ReadInteger(parts[0])? + asn1ReadInteger(parts[1])?
@@ -1272,7 +1272,7 @@ final octet are padding, and `bytes` are the value octets.
 import { asn1Encode, asn1Parse, asn1BitString, asn1ReadBitString } from "std/crypto"
 
 // Round-trip a BIT STRING (no unused bits) and return its value octets.
-function bitOctets(data: []byte): []byte! {
+fn bitOctets(data: []byte): []byte! {
   let bs = asn1ReadBitString(asn1Parse(asn1Encode(asn1BitString(0, data)))?)?
   return bs.bytes
 }
@@ -1330,12 +1330,12 @@ import {
 } from "std/crypto"
 
 // Encode an ECDSA signature SEQUENCE { INTEGER r, INTEGER s } from raw magnitudes.
-function encodeSig(r: []byte, s: []byte): []byte {
+fn encodeSig(r: []byte, s: []byte): []byte {
   return asn1Encode(asn1Sequence([]Element{ asn1BigInteger(r), asn1BigInteger(s) }))
 }
 
 // Read `r` back out of a DER signature.
-function sigR(der: []byte): []byte! {
+fn sigR(der: []byte): []byte! {
   let parts = asn1ReadSequence(asn1Parse(der)?)?
   return asn1ReadBigInteger(parts[0])?
 }
@@ -1389,7 +1389,7 @@ helper - it does no validation.
 import { asn1Encode, asn1Parse, asn1Oid, asn1ReadOid, asn1OidString } from "std/crypto"
 
 // The dotted form of an OID after a build/parse round-trip (e.g. ecdsa-with-SHA256).
-function oidText(arcs: []int): string! {
+fn oidText(arcs: []int): string! {
   let oid = asn1Oid(arcs)?
   return asn1OidString(asn1ReadOid(asn1Parse(asn1Encode(oid))?)?)
 }
@@ -1425,7 +1425,7 @@ are returned as-is; per-type charset validation is the caller's.
 import { asn1Encode, asn1Parse, asn1Utf8String, asn1ReadString } from "std/crypto"
 
 // Round-trip a UTF8String through DER.
-function utf8RoundTrip(s: string): string! {
+fn utf8RoundTrip(s: string): string! {
   return asn1ReadString(asn1Parse(asn1Encode(asn1Utf8String(s)))?)?
 }
 ```
@@ -1470,7 +1470,7 @@ import {
 } from "std/crypto"
 
 // Wrap an OCTET STRING in an explicit [0] tag, then unwrap it after a round-trip.
-function unwrapZero(data: []byte): []byte! {
+fn unwrapZero(data: []byte): []byte! {
   let tagged = asn1ExplicitTag(0, asn1OctetString(data))
   let inner = asn1ReadExplicit(asn1Parse(asn1Encode(tagged))?, 0)?
   return asn1ReadOctetString(inner)?
@@ -1550,7 +1550,7 @@ Universal tag number 24, GeneralizedTime.
 import { Element, asn1Parse, asn1ReadSequence, classUniversal, tagSequence } from "std/crypto"
 
 // Whether a parsed element is a universal SEQUENCE by inspecting its tag directly.
-function isSequence(e: Element): bool {
+fn isSequence(e: Element): bool {
   return e.cls == classUniversal && e.constructed && e.tag == tagSequence
 }
 ```
@@ -1586,7 +1586,7 @@ import {
 } from "std/crypto"
 
 // Parse a big-endian modulus, and report its width and whether it is nonzero.
-function inspect(nBytes: []byte): int {
+fn inspect(nBytes: []byte): int {
   let n = bigintFromBytes(nBytes)
   if (bigintIsZero(n)) {
     return 0
@@ -1598,7 +1598,7 @@ function inspect(nBytes: []byte): int {
 }
 
 // Re-serialize a Nat to a fixed width, restoring any leading zero bytes.
-function fixedWidth(n: Nat, width: int): []byte! {
+fn fixedWidth(n: Nat, width: int): []byte! {
   return bigintToBytes(n, width)?
 }
 ```
@@ -1668,12 +1668,12 @@ import {
 } from "std/crypto"
 
 // Long division: 1000 / 7 is quotient 142, remainder 6.
-function divide(): QuotRem! {
+fn divide(): QuotRem! {
   return bigintDivMod(bigintFromU64(1000), bigintFromU64(7))?
 }
 
 // gcd(48, 36) == 12, and reduce it through the other primitives.
-function reduce(): u64! {
+fn reduce(): u64! {
   let g = bigintGcd(bigintFromU64(48), bigintFromU64(36))
   let sum = bigintAdd(g, bigintFromU64(0))
   let diff = bigintSub(sum, bigintFromU64(0))?
@@ -1700,7 +1700,7 @@ bits - use only when the exponent is not secret. Fails on a zero modulus.
 import { Nat, bigintModExp, bigintModExpPublic, bigintFromBytes, bigintToBytes, bigintFromU64 } from "std/crypto"
 
 // RSA public operation c = m^e mod n over big-endian byte strings (e = 65537).
-function rsaPublic(mBytes: []byte, nBytes: []byte): []byte! {
+fn rsaPublic(mBytes: []byte, nBytes: []byte): []byte! {
   let m = bigintFromBytes(mBytes)
   let n = bigintFromBytes(nBytes)
   let c = bigintModExpPublic(m, bigintFromU64(65537), n)?
@@ -1708,7 +1708,7 @@ function rsaPublic(mBytes: []byte, nBytes: []byte): []byte! {
 }
 
 // RSA private operation m = c^d mod n takes the constant-time ladder.
-function rsaPrivate(c: Nat, d: Nat, n: Nat): Nat! {
+fn rsaPrivate(c: Nat, d: Nat, n: Nat): Nat! {
   return bigintModExp(c, d, n)?
 }
 ```
@@ -1724,7 +1724,7 @@ theorem via `bigintModExp`.
 import { bigintFromU64, bigintModInverse, bigintToU64 } from "std/crypto"
 
 // The modular inverse of 3 modulo 11 is 4.
-function inverse(): u64! {
+fn inverse(): u64! {
   return bigintToU64(bigintModInverse(bigintFromU64(3), bigintFromU64(11))?)?
 }
 ```
@@ -1774,7 +1774,7 @@ import {
 } from "std/crypto"
 
 // The SEC 1 uncompressed public key for a P-256 private scalar.
-function p256PublicKey(privateKey: []byte): []byte! {
+fn p256PublicKey(privateKey: []byte): []byte! {
   let c = nistecP256()
   let pub = nistecScalarBaseMult(c, bigintFromBytes(privateKey))
   return nistecPointEncode(c, pub, false)?
@@ -1782,7 +1782,7 @@ function p256PublicKey(privateKey: []byte): []byte! {
 
 // The ECDH shared secret: decode and validate the peer's point, multiply it by
 // our scalar, and return the compressed result.
-function p256Ecdh(privateKey: []byte, peerPublic: []byte): []byte! {
+fn p256Ecdh(privateKey: []byte, peerPublic: []byte): []byte! {
   let c = nistecP256()
   let peer = nistecPointDecode(c, peerPublic)?
   let shared = nistecScalarMult(c, peer, bigintFromBytes(privateKey))?
@@ -1790,7 +1790,7 @@ function p256Ecdh(privateKey: []byte, peerPublic: []byte): []byte! {
 }
 
 // P-384 goes through the same API; only the curve constructor changes.
-function p384OnCurve(point: Point): bool {
+fn p384OnCurve(point: Point): bool {
   return nistecIsOnCurve(nistecP384(), point)
 }
 ```
@@ -1872,10 +1872,10 @@ import {
 } from "std/crypto"
 
 // SHA-256 as a `() => Hash` value (newSha256 returns the concrete Sha256).
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // EMSA-PKCS1-v1_5 sign over SHA-256, then verify the signature.
-function signAndVerify(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
+fn signAndVerify(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
   let sig = rsaSignPkcs1v15(priv, sha256Hash, rsaDigestInfoSha256(), msg)?
   return rsaVerifyPkcs1v15(pub, sha256Hash, rsaDigestInfoSha256(), msg, sig)
 }
@@ -1908,7 +1908,7 @@ Parse a `SubjectPublicKeyInfo` (X.509 / SPKI) DER public key - a `SEQUENCE` of a
 import { RsaPublicKey, rsaParsePublicKey } from "std/crypto"
 
 // Load an SPKI (X.509) public key from its DER bytes.
-function loadPublicKey(der: []byte): RsaPublicKey! {
+fn loadPublicKey(der: []byte): RsaPublicKey! {
   return rsaParsePublicKey(der)?
 }
 ```
@@ -1929,7 +1929,7 @@ algorithm.
 import { RsaPrivateKey, rsaParsePrivateKey } from "std/crypto"
 
 // Load a PKCS#8 private key from its DER bytes.
-function loadPrivateKey(der: []byte): RsaPrivateKey! {
+fn loadPrivateKey(der: []byte): RsaPrivateKey! {
   return rsaParsePrivateKey(der)?
 }
 ```
@@ -1962,10 +1962,10 @@ signature is `k` bytes.
 ```bit
 import { RsaPrivateKey, RsaPublicKey, Hash, newSha256, rsaSignPss, rsaVerifyPss } from "std/crypto"
 
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // EMSA-PSS sign and verify with a 32-byte salt.
-function pssRoundTrip(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
+fn pssRoundTrip(priv: RsaPrivateKey, pub: RsaPublicKey, msg: []byte): bool! {
   let sig = rsaSignPss(priv, sha256Hash, msg, 32)?
   return rsaVerifyPss(pub, sha256Hash, msg, sig, 32)
 }
@@ -1985,10 +1985,10 @@ protocols.
 ```bit
 import { RsaPrivateKey, RsaPublicKey, Hash, newSha256, rsaEncryptOaep, rsaDecryptOaep } from "std/crypto"
 
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // RSAES-OAEP encrypt then decrypt with an empty label.
-function oaepRoundTrip(pub: RsaPublicKey, priv: RsaPrivateKey, msg: []byte): []byte! {
+fn oaepRoundTrip(pub: RsaPublicKey, priv: RsaPrivateKey, msg: []byte): []byte! {
   let ct = rsaEncryptOaep(pub, sha256Hash, msg, []byte(0))?
   return rsaDecryptOaep(priv, sha256Hash, ct, []byte(0))?
 }
@@ -2010,7 +2010,7 @@ Fails if `message` exceeds `k - 11` bytes. Prefer OAEP for new protocols.
 import { RsaPrivateKey, RsaPublicKey, rsaEncryptPkcs1v15, rsaDecryptPkcs1v15 } from "std/crypto"
 
 // RSAES-PKCS1-v1_5 encrypt then decrypt.
-function v15RoundTrip(pub: RsaPublicKey, priv: RsaPrivateKey, msg: []byte): []byte! {
+fn v15RoundTrip(pub: RsaPublicKey, priv: RsaPrivateKey, msg: []byte): []byte! {
   let ct = rsaEncryptPkcs1v15(pub, msg)?
   return rsaDecryptPkcs1v15(priv, ct)?
 }
@@ -2052,12 +2052,12 @@ many messages by calling `reset` between them.
 import { Hash, digest, encodeHex, newSha3_256, newShake128 } from "std/crypto"
 
 // One-shot SHA3-256, rendered as a lowercase hex string.
-function sha3Hex(data: []byte): string {
+fn sha3Hex(data: []byte): string {
   return encodeHex(digest(newSha3_256(), data))
 }
 
 // Streaming: feed input across as many `write` calls as convenient, read `sum`.
-function streamed(): []byte {
+fn streamed(): []byte {
   let h = newSha3_256()
   h.write([]byte("Keccak "))
   h.write([]byte("sponge"))
@@ -2065,14 +2065,14 @@ function streamed(): []byte {
 }
 
 // SHAKE128 as an XOF: absorb the seed once, then squeeze a 64-byte key stream.
-function derive(seed: []byte): []byte {
+fn derive(seed: []byte): []byte {
   let x = newShake128()
   x.absorb(seed)
   return x.squeeze(64)
 }
 
 // Hashing against the `Hash` interface - the algorithm is a parameter.
-function tag(h: Hash, msg: []byte): string {
+fn tag(h: Hash, msg: []byte): string {
   return encodeHex(digest(h, msg))
 }
 ```
@@ -2169,7 +2169,7 @@ import {
 // Alice combines her private key with Bob's public key. The returned bytes are
 // the raw shared x-coordinate - hand them straight to HKDF as input keying
 // material.
-function ecdhExchangeP256(): []byte! {
+fn ecdhExchangeP256(): []byte! {
   let c = nistecP256()
   let alice = ecdhnistGenerateKeypair(c)
   let bob = ecdhnistGenerateKeypair(c)
@@ -2232,11 +2232,11 @@ import {
 } from "std/crypto"
 
 // SHA-256 as a `() => Hash` value (newSha256 returns the concrete Sha256).
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // Deterministically sign a SHA-256 digest, DER-encode and re-parse the
 // signature, and verify it against the derived public key.
-function signAndVerify(curve: Curve, scalar: []byte, digest: []byte): bool! {
+fn signAndVerify(curve: Curve, scalar: []byte, digest: []byte): bool! {
   let priv = ecdsaPrivateKey(curve, scalar)?
   let sig = ecdsaSign(priv, digest, sha256Hash)?
   let der = ecdsaSignatureToDer(sig)
@@ -2333,13 +2333,13 @@ import { pemEncode, pemDecode, PemBlock } from "std/crypto"
 
 // Wrap DER bytes as a PEM "CERTIFICATE" block - the text you would write to a
 // .pem or .crt file, base64 wrapped at 64 columns with the BEGIN/END framing.
-function certToPem(der: []byte): string {
+fn certToPem(der: []byte): string {
   return pemEncode("CERTIFICATE", der)
 }
 
 // The first block of a PEM file: its label and decoded DER. Fails on malformed
 // framing, a mismatched END label, or an invalid base64 body.
-function firstBlock(pem: string): PemBlock! {
+fn firstBlock(pem: string): PemBlock! {
   let blocks = pemDecode(pem)?
   return blocks[0]
 }
@@ -2389,12 +2389,12 @@ import {
 } from "std/crypto"
 
 // One-shot 32-byte digest, rendered as a lowercase hex string.
-function fingerprint(data: []byte): string {
+fn fingerprint(data: []byte): string {
   return encodeHex(blake3Hash(data))
 }
 
 // Streaming: feed input across as many `write` calls as convenient, read `sum`.
-function streamed(): []byte {
+fn streamed(): []byte {
   let h = newBlake3()
   h.write([]byte("BLAKE3 "))
   h.write([]byte("streaming"))
@@ -2402,32 +2402,32 @@ function streamed(): []byte {
 }
 
 // A keyed MAC (BLAKE3's keyed_hash) under a 32-byte key.
-function mac(key: []byte, msg: []byte): []byte! {
+fn mac(key: []byte, msg: []byte): []byte! {
   return blake3KeyedHash(key, msg)?
 }
 
 // The same keyed MAC, built as a streaming hasher.
-function keyedStream(key: []byte): []byte! {
+fn keyedStream(key: []byte): []byte! {
   let h = newBlake3Keyed(key)?
   h.write([]byte("authenticated data"))
   return h.sum()
 }
 
 // Key derivation: a subkey from a context string and input key material.
-function subkey(material: []byte): []byte {
+fn subkey(material: []byte): []byte {
   let h = newBlake3DeriveKey("example.com 2026 session-key")
   h.write(material)
   return h.finalize(32)
 }
 
 // Extendable output: draw a 64-byte key stream from the default hash.
-function widen(seed: []byte): []byte {
+fn widen(seed: []byte): []byte {
   return blake3Xof(seed, 64)
 }
 
 // Hashing against the `Hash` interface - the algorithm is a parameter, so BLAKE3
 // drops into any `Hash`-based helper (HMAC, HKDF, `digest`) unchanged.
-function tag(h: Hash, msg: []byte): string {
+fn tag(h: Hash, msg: []byte): string {
   return encodeHex(digest(h, msg))
 }
 ```
@@ -2523,7 +2523,7 @@ import {
 
 // a * a^-1 == 1, checked by comparing canonical encodings: 1 is the byte 0x01
 // followed by 31 zero bytes.
-function isInverse(scalar: []byte): bool {
+fn isInverse(scalar: []byte): bool {
   let a = fe25519FromBytes(scalar)
   let one = fe25519ToBytes(fe25519Mul(a, fe25519Invert(a)))
   if (one[0] != 1) {
@@ -2540,7 +2540,7 @@ function isInverse(scalar: []byte): bool {
 }
 
 // (a + b)(a - b) + 121666 * a^2, exercising the remaining operations.
-function combine(xBytes: []byte, yBytes: []byte): []byte {
+fn combine(xBytes: []byte, yBytes: []byte): []byte {
   let a = fe25519FromBytes(xBytes)
   let b = fe25519FromBytes(yBytes)
   let diffProd = fe25519Mul(fe25519Add(a, b), fe25519Sub(a, b))
@@ -2634,12 +2634,12 @@ and agree for every password up to 72 bytes.
 import { bcryptHash, bcryptVerify } from "std/crypto"
 
 // Hash a new user's password for storage. Cost 12 is a reasonable default.
-function register(password: string): string {
+fn register(password: string): string {
   return bcryptHash([]byte(password), 12)
 }
 
 // Check a login attempt against the stored hash.
-function login(password: string, stored: string): bool {
+fn login(password: string, stored: string): bool {
   return bcryptVerify([]byte(password), stored)
 }
 ```
@@ -2670,7 +2670,7 @@ import {
 // Both sides reach the identical 32-byte secret - `x25519SharedSecret` rejects
 // the all-zero contributory case, so the returned bytes go straight to HKDF as
 // input keying material.
-function x25519Exchange(bobPriv: []byte): []byte! {
+fn x25519Exchange(bobPriv: []byte): []byte! {
   let alice = x25519GenerateKeypair()
   let bobPub = x25519Base(bobPriv)
   let secret = x25519SharedSecret(alice.priv, bobPub)?
@@ -2731,14 +2731,14 @@ being accepted. The secret-dependent scalar multiplication is constant-time.
 import { ed25519PublicKey, ed25519Sign, ed25519Verify } from "std/crypto"
 
 // Derive the public key, sign a message, and confirm the signature verifies.
-function signAndVerify(seed: []byte, msg: []byte): bool {
+fn signAndVerify(seed: []byte, msg: []byte): bool {
   let pub = ed25519PublicKey(seed)
   let sig = ed25519Sign(seed, msg)
   return ed25519Verify(pub, msg, sig)
 }
 
 // A single flipped bit in the signature must make verification fail.
-function rejectsTamperedSignature(seed: []byte, msg: []byte): bool {
+fn rejectsTamperedSignature(seed: []byte, msg: []byte): bool {
   let pub = ed25519PublicKey(seed)
   let sig = ed25519Sign(seed, msg)
   sig[0] = sig[0] ^ 0x01
@@ -2795,30 +2795,30 @@ import { newBlake2b, newBlake2s, blake2b, digest, encodeHex } from "std/crypto"
 
 // One-shot BLAKE2b - the full 64-byte digest as lowercase hex. `blake2b` is the
 // unkeyed convenience; `digest` drives any Hash the same way.
-function blake2bHex(data: []byte): string {
+fn blake2bHex(data: []byte): string {
   return encodeHex(blake2b(data))
 }
 
 // One-shot BLAKE2s - the full 32-byte digest. An empty key is unkeyed.
-function blake2sHex(data: []byte): string {
+fn blake2sHex(data: []byte): string {
   return encodeHex(digest(newBlake2s(32, []byte(0)), data))
 }
 
 // Keyed BLAKE2 is a MAC on its own - no HMAC. A non-empty key selects keyed
 // mode; the tag is `size` bytes (32 here).
-function mac(key: []byte, msg: []byte): []byte {
+fn mac(key: []byte, msg: []byte): []byte {
   return digest(newBlake2b(32, key), msg)
 }
 
 // A parameterized shorter digest: pass the wanted output length (1..64 for 2b)
 // to the constructor. It is a distinct function, not a truncation.
-function shortHash(data: []byte): []byte {
+fn shortHash(data: []byte): []byte {
   return digest(newBlake2b(20, []byte(0)), data)
 }
 
 // Streaming: absorb across as many `write`s as you like, then read once with
 // `sum`; `size`/`blockSize` report 64 and 128 for BLAKE2b, and `reset` rewinds.
-function streamed(head: []byte, tail: []byte): int {
+fn streamed(head: []byte, tail: []byte): int {
   let h = newBlake2b(64, []byte(0))
   h.write(head)
   h.write(tail)
@@ -2933,17 +2933,17 @@ import { Hash, pbkdf2, newSha256, encodeHex } from "std/crypto"
 
 // SHA-256 returns the concrete `Sha256`, so expose its constructor as a
 // `() => Hash` value.
-function sha256Hash(): Hash { return newSha256() }
+fn sha256Hash(): Hash { return newSha256() }
 
 // Derive a 32-byte encryption key from a password and a per-user random salt.
 // The high iteration count is the brute-force cost; raise it as hardware allows.
-function deriveKey(password: []byte, salt: []byte): []byte {
+fn deriveKey(password: []byte, salt: []byte): []byte {
   return pbkdf2(sha256Hash, password, salt, 600000, 32)
 }
 
 // A password verifier for storage: keep the salt and the derived key, then on
 // login re-derive with the same salt and compare in constant time via `ctEq`.
-function passwordHash(password: string, salt: []byte): string {
+fn passwordHash(password: string, salt: []byte): string {
   return encodeHex(pbkdf2(sha256Hash, []byte(password), salt, 600000, 32))
 }
 ```
@@ -2984,7 +2984,7 @@ import { mlkemKeygen, mlkemEncaps, mlkemDecaps, ctEq } from "std/crypto"
 
 // A full key exchange: the two parties agree on 32 secret bytes, and the secret
 // itself never travels over the wire - only the public key and the ciphertext do.
-function exchange(): bool! {
+fn exchange(): bool! {
   // Alice generates a key pair, publishes `kp.ek`, and keeps `kp.dk` secret.
   let kp = mlkemKeygen()
 
@@ -3078,7 +3078,7 @@ import { newAesGcmSiv, encodeHex } from "std/crypto"
 // inputs merely produce identical ciphertext - but a unique nonce is still
 // preferred. `aad` is authenticated but not encrypted. Returns the recovered
 // plaintext as hex, or fails if the tag does not verify.
-function protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
+fn protectSiv(key: []byte, nonce: []byte, msg: []byte, aad: []byte): string! {
   let cipher = newAesGcmSiv(key)?
   let sealed = cipher.seal(nonce, msg, aad) // ciphertext ‖ 16-byte tag
   let opened = cipher.open(nonce, sealed, aad)? // fails on any tag mismatch
@@ -3159,14 +3159,14 @@ import { scrypt, encodeHex } from "std/crypto"
 // N is the memory/CPU cost and must be a power of two; r and p tune the block
 // size and parallelism. RFC 7914 §2 suggests N=16384, r=8, p=1 for interactive
 // logins - raise N as your hardware allows.
-function deriveKey(password: []byte, salt: []byte): []byte! {
+fn deriveKey(password: []byte, salt: []byte): []byte! {
   return scrypt(password, salt, 16384, 8, 1, 32)?
 }
 
 // A password verifier for storage: keep the salt and the derived key, then on
 // login re-derive with the same salt and compare the results in constant time
 // via `ctEq`. A unique random salt per user is mandatory.
-function passwordHash(password: string, salt: []byte): string! {
+fn passwordHash(password: string, salt: []byte): string! {
   return encodeHex(scrypt([]byte(password), salt, 16384, 8, 1, 32)?)
 }
 ```
@@ -3208,7 +3208,7 @@ import {
 // reach the identical 56-byte secret - `x448SharedSecret` rejects the all-zero
 // contributory case, so the returned bytes go straight to HKDF as input keying
 // material.
-function x448Exchange(bobPriv: []byte): []byte! {
+fn x448Exchange(bobPriv: []byte): []byte! {
   let alice = x448GenerateKeypair()
   let bobPub = x448Base(bobPriv)
   let secret = x448SharedSecret(alice.priv, bobPub)?
@@ -3287,7 +3287,7 @@ import { x509Parse, x509VerifySignature, x509VerifyChain, x509MatchHostname, Cer
 // Whether `leafDer` chains to one of `roots` (through `intermediates`) for `host`
 // at `nowUnix`. Any parse or verification failure returns false. `nowUnix` is
 // injected, so the decision never depends on the wall clock.
-function trusts(leafDer: []byte, intermediates: []Certificate, roots: []Certificate, host: string, nowUnix: int): bool {
+fn trusts(leafDer: []byte, intermediates: []Certificate, roots: []Certificate, host: string, nowUnix: int): bool {
   let leaf = x509Parse(leafDer) catch e {
     return false
   }
@@ -3299,7 +3299,7 @@ function trusts(leafDer: []byte, intermediates: []Certificate, roots: []Certific
 
 // Whether `cert` was directly signed by `issuer` and is valid for `host` - the
 // building block `x509VerifyChain` applies at each step of a path.
-function signedBy(cert: Certificate, issuer: Certificate, host: string): bool {
+fn signedBy(cert: Certificate, issuer: Certificate, host: string): bool {
   return x509MatchHostname(cert, host) && x509VerifySignature(cert, issuer)
 }
 ```
@@ -3428,18 +3428,18 @@ import { argon2id, argon2Hash, argon2Verify, randomBytes } from "std/crypto"
 // Store a new user's password: Argon2id with a fresh 16-byte salt at the RFC 9106
 // "second recommended" profile (64 MiB, 3 passes, 4 lanes). The returned PHC
 // string carries the parameters and salt, so only it needs to be stored.
-function register(password: string): string {
+fn register(password: string): string {
   return argon2Hash([]byte(password), randomBytes(16), 3, 65536, 4, 32)
 }
 
 // Check a login attempt against the stored PHC string.
-function login(password: string, stored: string): bool {
+fn login(password: string, stored: string): bool {
   return argon2Verify([]byte(password), stored)
 }
 
 // Derive a 32-byte symmetric key from a password and salt with Argon2id, passing
 // no secret key or associated data.
-function deriveKey(password: []byte, salt: []byte): []byte {
+fn deriveKey(password: []byte, salt: []byte): []byte {
   return argon2id(password, salt, []byte(0), []byte(0), 3, 65536, 4, 32)
 }
 ```
@@ -3477,7 +3477,7 @@ import {
 } from "std/crypto"
 
 // Derive a key pair from a stored 32-byte seed, sign a message, and verify it.
-function signAndVerify(seed: []byte, msg: []byte): bool {
+fn signAndVerify(seed: []byte, msg: []byte): bool {
   let kp = mldsaKeygenSeed(seed)
   let sig = mldsaSign(kp.sk, msg)
   return mldsaVerify(kp.pk, msg, sig)
@@ -3485,7 +3485,7 @@ function signAndVerify(seed: []byte, msg: []byte): bool {
 
 // A context string binds the signature to an application domain; verification
 // must use the same context, and a single flipped signature bit must fail.
-function contextRoundTrip(kp: MldsaKeypair, msg: []byte, ctx: []byte): bool {
+fn contextRoundTrip(kp: MldsaKeypair, msg: []byte, ctx: []byte): bool {
   let sig = mldsaSignCtx(kp.sk, msg, ctx)
   sig[0] = sig[0] ^ 0x01
   return mldsaVerifyCtx(kp.pk, msg, sig, ctx) == false
@@ -3560,7 +3560,7 @@ exactly as `x509VerifyChain` requires.
 import { TrustStore, fromPem, bundled, pemDecode, x509Parse, Certificate } from "std/crypto"
 
 // Parse the first CERTIFICATE block of `pem` into a certificate.
-function truststoreExampleCert(pem: string): Certificate! {
+fn truststoreExampleCert(pem: string): Certificate! {
   let blocks = pemDecode(pem)?
   return x509Parse(blocks[0].der)?
 }
@@ -3569,7 +3569,7 @@ function truststoreExampleCert(pem: string): Certificate! {
 // `host` at `nowUnix`. The caller's PEM roots become a TrustStore; any parse or
 // verification failure yields false. `nowUnix` is injected, so the decision
 // never depends on the wall clock.
-function truststoreTrusts(rootsPem: string, interPem: string, leafPem: string, host: string, nowUnix: int): bool {
+fn truststoreTrusts(rootsPem: string, interPem: string, leafPem: string, host: string, nowUnix: int): bool {
   let store = fromPem(rootsPem) catch e {
     return false
   }
@@ -3588,7 +3588,7 @@ function truststoreTrusts(rootsPem: string, interPem: string, leafPem: string, h
 
 // The number of public roots the compiled-in default set carries - a nonzero
 // fallback for when no system trust store is available.
-function truststoreBundledCount(): int {
+fn truststoreBundledCount(): int {
   return len(bundled().roots)
 }
 ```

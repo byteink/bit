@@ -44,7 +44,7 @@ import { listen, Listener, Conn } from "std/net"
 import { toUpper } from "std/strings"
 
 // Accept `n` connections, uppercase one request on each, and close.
-function serve(l: Listener, n: int): ()! {
+fn serve(l: Listener, n: int): ()! {
   let i = 0
   while (i < n) {
     let c = l.accept()?
@@ -91,7 +91,7 @@ Closes this end of the connection.
 import { dial } from "std/net"
 
 // One request, one response, over a fresh connection.
-function roundTrip(port: int, msg: string): string! {
+fn roundTrip(port: int, msg: string): string! {
   let c = dial("127.0.0.1", port)?
   c.write(msg)?
   let reply = c.readAll()
@@ -108,7 +108,7 @@ the next accept, because the handler runs on its own green thread.
 ```bit
 import { listen, Listener, Conn } from "std/net"
 
-function handle(c: Conn, done: chan<int>) {
+fn handle(c: Conn, done: chan<int>) {
   let req = c.read(4096)
   c.write(req) catch e {
     c.close()
@@ -119,7 +119,7 @@ function handle(c: Conn, done: chan<int>) {
   done <- len(req)
 }
 
-function echoServer(l: Listener, n: int, done: chan<int>): ()! {
+fn echoServer(l: Listener, n: int, done: chan<int>): ()! {
   let i = 0
   while (i < n) {
     let c = l.accept()?
@@ -173,7 +173,7 @@ import { udpBind, UdpSocket } from "std/net"
 import { toUpper } from "std/strings"
 
 // Echo `n` datagrams back, uppercased, to whoever sent them.
-function echo(s: UdpSocket, n: int): ()! {
+fn echo(s: UdpSocket, n: int): ()! {
   let i = 0
   while (i < n) {
     let d = s.recv(1024)?
@@ -197,7 +197,7 @@ resolve first:
 ```bit
 import { dial, resolve, Conn } from "std/net"
 
-function connectByName(host: string, port: int): Conn! {
+fn connectByName(host: string, port: int): Conn! {
   return dial(resolve(host)?, port)?
 }
 ```
