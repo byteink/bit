@@ -19,10 +19,24 @@
 #                                      # scripts/arm64gate.sh (native aarch64-linux)
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
-# tests/cases/, examples/, stdlib/ runs only that area's minimal steps. A
-# change touching any OTHER path (spec/, docs/, or anything else unlisted),
-# or spanning MORE THAN ONE of those five areas, is ambiguous and always runs
+# tests/cases/, examples/, stdlib/, or docs/**/*.md runs only that area's
+# minimal steps. A change touching any OTHER path (anything unlisted below),
+# or spanning MORE THAN ONE of those six areas, is ambiguous and always runs
 # the full `./make test` — never a partial skip.
+#
+# PROSE IS CLASSIFIED BY FILE TYPE, NOT PATH PREFIX (#2801): a markdown file
+# cannot change what any gate compiles or runs, so it must never select a
+# CODE bucket by riding a shared prefix (runtime/*.md is not runtime/*.bit).
+# docs/**/*.md gets its own bucket (test-docs compiles its code fences).
+# runtime/**/*.md, spec/**, bench/**/*.md, README.md, CONTRIBUTING.md, and
+# dist/README.md are known to have no gate at all — a diff confined to those
+# runs nothing and says so, distinct from a `full` PASS that implies
+# something ran. Mixed with a real bucket, they are silently ignored rather
+# than downgrading or widening that bucket's selection. Any OTHER path (spec
+# was JUST the two files above, not scripts or dist/stage0/SHA256SUMS, which
+# feeds the runtime rebuild fingerprint) still falls through to `full` —
+# under-selection is the failure this script exists to prevent, so a prefix
+# only gets a prose exception once it's proven output-irrelevant.
 #
 # TWO NARROW EXCEPTIONS (#2435), because registering a gate is mandatory in
 # this repo and otherwise forces `full` on every single ticket that adds one:
@@ -112,19 +126,31 @@ has_runtime=0
 has_testcases=0
 has_examples=0
 has_stdlib=0
+has_docs=0
 has_testsbit=0
 has_other=0
+has_noop=0
 other_list=""
 touched_list=""
 testsbit_list=""
+docs_list=""
+noop_list=""
 
 # Extracts the gate name(s) whose `Gate.argv` literally names path `$1`, by
 # grepping the source rather than building anything — `runArgs("<path>")` is
 # how every harness-running gate spells its target in tools/build/gates.bit.
-# Prints nothing for a path that isn't named that way (a case-data file under
-# tests/bit/checkercases/ or tests/bit/parsercases/, say, which a gate reaches
-# through an env var, not argv) — the caller treats empty as ambiguous.
+# TWO NAMED EXCEPTIONS (#2801): a fixture under tests/bit/checkercases/ or
+# tests/bit/parsercases/ is not passed as an argv path at all — its gate
+# reaches the whole directory through BIT_CHECKER_CASES_DIR/BIT_PARSER_CASES_DIR
+# — so the grep below would find nothing for it and the caller would treat a
+# perfectly ordinary fixture as unmapped, forcing `full`. Prints nothing for
+# any OTHER path that isn't named via `runArgs`; the caller treats that empty
+# result as ambiguous.
 gates_for_file() {
+  case "$1" in
+    tests/bit/checkercases/*) printf 'test-checker-diag\n'; return 0 ;;
+    tests/bit/parsercases/*) printf 'test-parser\n'; return 0 ;;
+  esac
   grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
     sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' || true
 }
@@ -237,6 +263,37 @@ EOF
 
 while IFS= read -r f; do
   case "${f}" in
+    # PROSE, CLASSIFIED BY FILE TYPE, NOT JUST PATH PREFIX (#2801). Placed
+    # ahead of the five-bucket matches below because e.g. `runtime/*.md` is a
+    # more specific case of `runtime/*` and must win it: a markdown file
+    # cannot change what any gate compiles or runs.
+    #
+    # docs/**/*.md compiles the code fences inside it (tests/bit/docs.bit),
+    # so it gets a REAL bucket, same shape as the five below.
+    docs/*.md)
+      has_docs=1
+      if [ -n "${docs_list}" ]; then
+        docs_list="${docs_list}, ${f}"
+      else
+        docs_list="${f}"
+      fi
+      ;;
+    # These paths are pure documentation that no gate reads: runtime/**/*.md
+    # (the runtime CODE bucket below is for runtime/*.bit etc, not prose),
+    # spec/** (SPEC.md/LINT.md only, checked by no automated gate), bench/**/*.md
+    # (bench/**/*.bit and bench/run.sh still fall through to `full`, unproven
+    # output-irrelevant), and the three standalone READMEs nothing greps.
+    # Deliberately NOT added to has_other, has_noop, or bucket_count: mixed
+    # with a real bucket it must be silently ignored, never force `full` and
+    # never downgrade the real bucket (constraint in #2801).
+    runtime/*.md|spec/*|bench/*.md|README.md|CONTRIBUTING.md|dist/README.md)
+      has_noop=1
+      if [ -n "${noop_list}" ]; then
+        noop_list="${noop_list}, ${f}"
+      else
+        noop_list="${f}"
+      fi
+      ;;
     compiler/*) has_selfhost=1 ;;
     runtime/*) has_runtime=1 ;;
     tests/cases/*) has_testcases=1 ;;
@@ -288,8 +345,12 @@ fi
 if [ "${has_stdlib}" -eq 1 ]; then
   if [ -n "${touched_list}" ]; then touched_list="${touched_list}, stdlib"; else touched_list="stdlib"; fi
 fi
+if [ "${has_docs}" -eq 1 ]; then
+  if [ -n "${touched_list}" ]; then touched_list="${touched_list}, docs"; else touched_list="docs"; fi
+fi
 
-bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib))
+# has_noop is deliberately excluded here — see its case arm above.
+bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_stdlib + has_docs))
 
 # Computed ONCE, ahead of bucket selection, regardless of whether one of the
 # five areas also fired (#2510). Two consequences fall out of computing it
@@ -337,16 +398,35 @@ elif [ "${has_examples}" -eq 1 ]; then
 elif [ "${has_stdlib}" -eq 1 ]; then
   BUCKET="stdlib"
   REASON="only stdlib/** changed"
+elif [ "${has_docs}" -eq 1 ]; then
+  BUCKET="docs"
+  REASON="only docs/**/*.md changed (${docs_list})"
 elif [ "${has_testsbit}" -eq 1 ]; then
   BUCKET="testsbit"
   REASON="only tests/bit/** changed (gate(s): ${testsbit_steps})"
+elif [ "${has_noop}" -eq 1 ]; then
+  BUCKET="noop"
+  REASON="matched only path(s) known to be pure documentation with no gate: ${noop_list}"
 else
-  # Nothing in the five buckets or tests/bit/** changed, has_other is 0, and
-  # CHANGED is non-empty — the only way here is a purely-additive
-  # tools/build/defs.bit/gates.bit registration with no accompanying harness
-  # or source change. Nothing to scope narrowly against, so full.
+  # Nothing in the five buckets, docs/**/*.md, tests/bit/**, or a known no-gate
+  # prose path changed, has_other is 0, and CHANGED is non-empty — the only
+  # way here is a purely-additive tools/build/defs.bit/gates.bit registration
+  # with no accompanying harness or source change. Nothing to scope narrowly
+  # against, so full.
   BUCKET="full"
   REASON="only additive tools/build/** registration changed; nothing left to scope against"
+fi
+
+# `noop` has NOTHING to run — no BUILD_STEPS, no pre/post script, no
+# `./make --list` validation to do. Exit here rather than threading an empty
+# case through the machinery below, which the header comment on BUILD_STEPS
+# explicitly says must never hold an empty array under this repo's bash 3.2.
+# Prints a distinct verdict, not GATE_RESULT=PASS, because nothing ran (#2801).
+if [ "${BUCKET}" = "noop" ]; then
+  echo "gate: bucket: noop (${REASON})"
+  echo "gate: no gate covers these path(s) — nothing to run"
+  echo "GATE_RESULT=NOOP"
+  exit 0
 fi
 
 # BUILD_STEPS is always a non-empty literal array, assigned per bucket below —
@@ -410,6 +490,9 @@ case "${BUCKET}" in
   stdlib)
     BUILD_STEPS=(test-imports-bit test-stdlib-docs)
     ;;
+  docs)
+    BUILD_STEPS=(test-docs)
+    ;;
   testsbit)
     # Populated from `testsbit_steps`, which the bucket-selection above
     # already guaranteed is non-empty before choosing this bucket — so this
@@ -460,7 +543,7 @@ esac
 # a renamed script is the #1593 class of silent hole.
 bucket_scripts full
 FULL_SCRIPTS=" ${BUCKET_PRE} ${BUCKET_POST} "
-for b in full selfhost runtime testcases examples stdlib testsbit; do
+for b in full selfhost runtime testcases examples stdlib docs testsbit; do
   bucket_scripts "${b}"
   for s in ${BUCKET_PRE} ${BUCKET_POST}; do
     [ -f "${s}" ] || {
