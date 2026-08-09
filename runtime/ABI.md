@@ -1057,11 +1057,15 @@ ChanRecvResult { value: u64, ok: bool }   // extern struct, 2-word return
   goroutine. `rt_call` threads only a single value word back through the IR, so
   the two-result form `let (v, ok) = <- c` (SPEC.md §16.2) lowers as
   `bit_rt_chan_recv` immediately followed by `bit_rt_chan_recv_ok`, with no
-  yield between them — the same adjacency the fallible-call error slot relies on
-  (§13), which makes a per-worker threadlocal goroutine-correct. This matters
-  because a *reference* element's zero word on a closed channel is a null
-  pointer: a receiver must be able to distinguish "closed" from "a real value"
-  before dereferencing it.
+  yield between them. The outcome lives in the same per-task scratch mechanism
+  the error slot uses (§13), not a threadlocal: word `scrRecvOk`, offset 264
+  of the per-task scratch block (`runtime/sched/scratch.bit:73`), read by
+  `bit_rt_chan_recv_ok` (`runtime/root/slots.bit:78`). The adjacency is what
+  keeps that word from being clobbered by another scratch-writing operation
+  before the ABI wrapper reads it back. This matters because a *reference*
+  element's zero word on a closed channel is a null pointer: a receiver must
+  be able to distinguish "closed" from "a real value" before dereferencing
+  it.
 
 - `capacity == 0` is unbuffered (synchronous rendezvous); `capacity > 0` is a
   bounded ring buffer (SPEC.md §16.2).
@@ -1631,11 +1635,16 @@ bit_rt_net_read(fd, max)        -> str   // up to max bytes; parks. "" at end of
 bit_rt_net_write(fd, s)         -> n     // all of s (retried internally). -1 on error
 ```
 
-**UDP** (connectionless). `recv` records the sender in a per-goroutine
-threadlocal, read back by the two accessors with no intervening park — the same
-goroutine-correctness argument as the error slot (§13). A failed `recv` returns
-`""` with `sender_port` `-1`, which is how it is told from a legitimate
-zero-length datagram (whose sender port is `0..65535`).
+**UDP** (connectionless). `recv` records the sender in per-OS module state —
+`udpSenderBuf`/`udpSenderValid` (`runtime/net/linux/netabi.bit:248-249`;
+`runtime/net/darwin/netabi.bit:237-238`) — read back by the two accessors
+with no intervening park. This is neither a threadlocal nor the §13 per-task
+scratch slot: the provider's own header says so outright ("THE LAST SENDER
+IS MODULE STATE, NOT A THREADLOCAL", `runtime/net/linux/netabi.bit:242`),
+and it is sound only because v1 pins the scheduler to one worker (§5/§9),
+not because of any per-thread or per-task isolation (§22's audit). A failed
+`recv` returns `""` with `sender_port` `-1`, which is how it is told from a
+legitimate zero-length datagram (whose sender port is `0..65535`).
 
 ```
 bit_rt_net_udp_bind(host, port)         -> fd    // datagram socket; port 0 = kernel picks. -1 on error
