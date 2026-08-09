@@ -1499,19 +1499,19 @@ inside an expression. There is no ternary `?:` operator in v0.1; use an `if`
 statement. `&&` and `||` short-circuit.
 
 ```
-expression   = arrow_fn | binary .
+expression   = arrow_fn | catch_expr .          (* catch_expr, §18.3 *)
 binary       = unary { binop unary } .          (* shaped by the precedence table *)
 binop        = "*" | "/" | "%" | "<<" | ">>" | "&"
              | "+" | "-" | "|" | "^"
              | "==" | "!=" | "<" | "<=" | ">" | ">="
              | "&&" | "||" .
 unary        = ( "!" | "-" | "+" | "~" | "<-" ) unary | postfix .
-postfix      = primary { call | index | slice | member | "?" } .
-call         = "[" type_args "]"  ... (* see §12.7 for the generic-call form *)
-             | "(" [ arguments ] ")" .
+postfix      = primary { call | index | slice | member | type_assert | "?" } .
+call         = [ "<" type { "," type } ">" ] "(" [ arguments ] ")" .   (* §12.7 *)
 index        = "[" expression "]" .
 slice        = "[" [ expression ] ":" [ expression ] "]" .
 member       = "." ( IDENT | INT_LIT ) .        (* INT_LIT selects a tuple element *)
+type_assert  = "." "(" type ")" .               (* §14.4 *)
 arguments    = arg { "," arg } [ "," ] .
 arg          = [ "..." ] expression .           (* '...' spreads a slice, §12.4 *)
 
@@ -1519,8 +1519,7 @@ primary      = literal
              | IDENT
              | "(" expression ")"
              | composite_lit
-             | "[" arguments "]"                 (* slice literal, element list *)
-             | block_expr .                      (* only where an expression block is allowed; see §12.8 *)
+             | "[" [ arguments ] "]" .           (* bare slice literal, possibly empty *)
 ```
 
 ### 12.1 Literals and Identifiers
@@ -2249,10 +2248,10 @@ let (c, ok) = iface.(Circle)     // ok=false instead of panicking if mismatch
 let c2      = iface.(Circle)     // panics on mismatch
 ```
 
-Grammar:
+Grammar (a `postfix` suffix alongside `call`/`index`/`slice`/`member`, §12):
 
 ```
-type_assert = postfix "." "(" type ")" .
+type_assert = "." "(" type ")" .
 ```
 
 The two-result form is valid only as the sole right-hand side of a declaration or
