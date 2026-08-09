@@ -1806,8 +1806,8 @@ return_stmt   = "return" [ expression { "," expression } ] .
 fail_stmt     = "fail" expression .
 break_stmt    = "break" .
 continue_stmt = "continue" .
-spawn_stmt    = "spawn" call_expression .        (* argument must be a call *)
-defer_stmt    = "defer" call_expression .
+spawn_stmt    = "spawn" postfix .                (* postfix must be a call *)
+defer_stmt    = "defer" postfix .                (* postfix must be a call *)
 ```
 
 - Multi-assignment `a, b = b, a` evaluates all right-hand sides before assigning
