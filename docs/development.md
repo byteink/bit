@@ -41,7 +41,7 @@ forced the 0.1.3 pin.)
 itself.** `tools/build/` — the build driver — is compiled by the pinned stage0
 too, and it transitively imports `std/fs`, `std/os` and the rest of the stdlib
 the driver's own artifact steps need. A stdlib module `tools/build/` imports
-that declares an `extern function` the pinned stage0's bundled `libbitrt.a`
+that declares an `extern fn` the pinned stage0's bundled `libbitrt.a`
 does not provide cannot land until stage0 is repinned to a release that has
 it — the checker resolves every extern a module declares whether or not the
 importer calls it, so it is not enough for the driver to avoid *calling* the

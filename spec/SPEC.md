@@ -49,7 +49,7 @@ scalar value; all keywords and operators are ASCII.
 
 ## 2. Design Pillars (settled — not open for relitigation)
 
-- **Syntax:** TypeScript-flavored — `let`/`const`, `function`, arrow functions,
+- **Syntax:** TypeScript-flavored — `let`/`const`, `fn`, arrow functions,
   `interface`, `<>` generics, optional semicolons.
 - **Semantics:** Go-like — tracing garbage collector, green threads (`spawn`),
   typed channels, structural interfaces, value/reference type split.
@@ -490,16 +490,9 @@ param         = [ "..." ] IDENT ":" type .
 result_type   = type .            (* may carry the fallible marker, §18 *)
 ```
 
-**The bootstrap bridge is closed (#2773).** For one release, the lexer also
-accepted `function` as a synonym for `fn` here, solely so compiler source
-still built by the previous stage0 release (which parsed `function` only)
-kept compiling until a release carrying `fn` existed and the pin moved.
-`function` is no longer a keyword; writing it where a declaration is expected
-is **E0089** `function_keyword_removed`, naming `fn` as the replacement.
-
 - The return type is written after `:`. If omitted, the function returns nothing
   (its result type is the empty tuple `()`, i.e. "void").
-- Named `function` declarations **require** type annotations on every parameter
+- Named `fn` declarations **require** type annotations on every parameter
   and (unless void) on the result. This keeps checking modular and diagnostics
   precise. Type inference applies to `let`/`const` initializers and to arrow
   function bodies (§12.8), not to named-function signatures.
@@ -510,17 +503,17 @@ is **E0089** `function_keyword_removed`, naming `fn` as the replacement.
 #### 10.3.1 Function Attributes
 
 An attribute constrains how a function is compiled. Attributes precede
-`function` and attach to function declarations only:
+`fn` and attach to function declarations only:
 
 ```
 attr_list     = attr { attr } .
-attr          = "@" IDENT [ "(" string_lit ")" ] .
+attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
 ```
 
-`export` stays outermost: `export @naked function f() {}`. An attribute list may
+`export` stays outermost: `export @naked fn f() {}`. An attribute list may
 also sit on its own line above the declaration it modifies; the semicolon
 automatic insertion would place there (§7) is not meaningful, because an
-attribute list is only ever followed by another attribute or `function`.
+attribute list is only ever followed by another attribute or `fn`.
 
 Three attributes are recognized; any other name is an error (**E0076**
 `unknown_attribute`). Only `@symbol` (§11.9) takes an argument — giving one to
@@ -615,15 +608,15 @@ register snapshot and the scheduler's context switch are both `@nosplit` by
 nature *and* irreducibly `asm`, so the attribute could not be applied to the two
 functions it most exists for.
 
-A call to an **`extern function` (§11.7) is permitted**, and is the *second* and
+A call to an **`extern fn` (§11.7) is permitted**, and is the *second* and
 last construct here admitted on assertion rather than on proof — on exactly the
 `asm` footing, for exactly the `asm` reason. The callee's body lives in another
 image, so it is opaque to every compiler pass and no proof about it is possible.
-`extern function` is already the unmanaged-subset marker for that boundary
+`extern fn` is already the unmanaged-subset marker for that boundary
 (§11.7 exists solely for the runtime's libSystem path, which is Darwin's
 counterpart to Linux's raw `syscall`), so requiring a second marker on the
 declaration would gate nothing an author willing to misuse it would not simply
-write. There is therefore **no `@nosplit` attribute on an `extern function`
+write. There is therefore **no `@nosplit` attribute on an `extern fn`
 declaration** — the grammar of §11.7 admits none, and the permission attaches to
 the *call site*, which is the smaller surface.
 
@@ -655,11 +648,11 @@ declaration order. Green-thread stacks are fixed-size and guarded (§20), so
 `@nosplit` removes only the safepoint poll — there is no stack-growth check.
 
 ```
-@naked function two(): int {
+@naked fn two(): int {
   return 2
 }
 
-@nosplit function doubled(x: int): int {
+@nosplit fn doubled(x: int): int {
   return x + x
 }
 ```
@@ -679,7 +672,7 @@ Example:
 ```
 struct Point { x: f64; y: f64 }
 
-function (p: Point) norm(): f64 {
+fn (p: Point) norm(): f64 {
   return sqrt(p.x * p.x + p.y * p.y)
 }
 ```
@@ -820,7 +813,7 @@ Example:
 ```
 interface Ord { less(other: Self): bool }   (* Self = the implementing type *)
 
-function max<T: Ord>(a: T, b: T): T {
+fn max<T: Ord>(a: T, b: T): T {
   if (a.less(b)) { return b }
   return a
 }
@@ -948,7 +941,7 @@ ordinary identifiers everywhere else. Only `asm` itself is reserved.
 
 ```
 // x0 = x1 + x2 on arm64; rax = rax + rcx on x64.
-function addAsm(a: int, b: int): int {
+fn addAsm(a: int, b: int): int {
   return asm {
     arm64 { 0x8B020020 }              // add x0, x1, x2
     x64   { 0x48, 0x01, 0xC8 }        // add rax, rcx
@@ -986,11 +979,11 @@ Branching *out* of a block is the part that genuinely does not work: a target in
 another block, in surrounding Bit code, or in another function would need a
 relocation the compiler does not emit, and there is no supported way to spell
 one. Reaching other code from `asm` is what a `call` to a pinned symbol (§11.9)
-or an `extern function` (§11.7) is for.
+or an `extern fn` (§11.7) is for.
 
 ### 11.7 External Functions (unmanaged subset)
 
-`extern function` binds a Bit name to an external symbol resolved at **link
+`extern fn` binds a Bit name to an external symbol resolved at **link
 time** from a dynamic library. Like `*T`, the atomics and `asm`, it exists for
 the **unmanaged subset** the runtime is written against — on macOS the runtime
 must reach the kernel through libSystem, because Apple does not guarantee stable
@@ -1009,10 +1002,10 @@ extern_fn_decl = "extern" "fn" IDENT signature .
   against the declared signature exactly like a normal function's.
 
 ```
-extern function getpid(): i32
-extern function getentropy(buf: *u8, n: i64): i32
+extern fn getpid(): i32
+extern fn getentropy(buf: *u8, n: i64): i32
 
-function main() {
+fn main() {
   print("${getpid()}\n")
 }
 ```
@@ -1097,7 +1090,7 @@ rather than producing a binary. An object emit that consulted an archive would
 also be circular, since the archive being built is made **of** these objects.
 
 Bit has no arch-conditional compilation, so a program needing a *libc* symbol on
-both platforms still uses `extern function` for Darwin and a raw syscall for
+both platforms still uses `extern fn` for Darwin and a raw syscall for
 Linux, not one source form. A **runtime** symbol (`bit_rt_*`) is the case this
 rule admits: it is present in the archive on every target, so one source form
 does work for it.
@@ -1153,12 +1146,12 @@ are (§11.6).
 
 ```
 // write(1, buf, 6) on either Linux architecture.
-function sysWrite(): int {
+fn sysWrite(): int {
   if (hostTarget() == 0) { return 1 }  // x86_64-linux
   return 64                            // aarch64-linux
 }
 
-function writeLine(buf: []int, n: int): int {
+fn writeLine(buf: []int, n: int): int {
   return syscall(sysWrite(), 1, i64(ptrOf(buf)), n)
 }
 ```
@@ -1167,12 +1160,12 @@ function writeLine(buf: []int, n: int): int {
 
 The `@symbol("name")` attribute (§10.3.1) pins the exact link-level symbol a
 function definition emits, and constrains its signature to the C ABI. It is the
-mirror of `extern function` (§11.7): that one **consumes** an external symbol,
+mirror of `extern fn` (§11.7): that one **consumes** an external symbol,
 this one **produces** one.
 
 ```
 export @symbol("bit_rt_alloc")
-function alloc(size: i64): *byte { ... }
+fn alloc(size: i64): *byte { ... }
 ```
 
 Ordinarily a function's emitted symbol carries its module's `m<id>$` prefix
@@ -1227,7 +1220,7 @@ yields that object's address — a different number on every run.
 
 ```
 // The shape a context switch needs: the entry written into a saved pc slot.
-function initialContext(entry: *byte): []i64 {
+fn initialContext(entry: *byte): []i64 {
   let ctx = []i64(4)
   ctx[0] = int(entry)
   return ctx
@@ -1334,7 +1327,7 @@ instead — which is how the runtime is structured anyway, and works today:
 ```
 // counters.bit
 let hits: i64 = 0
-export function recordHit(): i64 {
+export fn recordHit(): i64 {
   hits = hits + 1
   return hits
 }
@@ -1433,7 +1426,7 @@ select — passing an argument is **E0050**.
 
 ```
 // The shape a precise root walk needs: the merged table, as bytes.
-@nosplit function stackMapBytes(): int {
+@nosplit fn stackMapBytes(): int {
   return int(stackMapsEnd()) - int(stackMapsBegin())
 }
 ```
@@ -1447,7 +1440,7 @@ walking this table, and no other expression in the language yields its address.
 language that denote a *data* symbol the **linker** defines and no object may
 claim. The table is the concatenation of every contributing object's stack-map
 atoms, so no single object knows the total and any object that defined the bounds
-would collide with its siblings. §11.7's `extern function` is the wrong tool
+would collide with its siblings. §11.7's `extern fn` is the wrong tool
 twice over: it binds a *function*, and it binds one resolved from a dynamic
 library, which is not what a statically linker-defined symbol is. Spelling this
 as a builtin keeps the set of names a program can leave undefined closed and
@@ -1700,7 +1693,7 @@ three is reachable — the arrow function outliving the frame that declared them
 not a special case:
 
 ```bit
-function counter(): () => int {
+fn counter(): () => int {
   let n = 0
   return () => { n = n + 1; return n }   // one n, shared with the closure
 }
@@ -2084,11 +2077,11 @@ needlessly slow.
 cross-thread contact is the value it sends):
 
 ```
-function worker(id: int, results: chan<int>) {
+fn worker(id: int, results: chan<int>) {
   results <- id * id
 }
 
-function main() {
+fn main() {
   let n = 4
   let results = chan<int>(n)
   for (let i = 0; i < n; i++) {
@@ -2110,12 +2103,12 @@ does not help:
 ```
 let total = 0
 
-function bump(done: chan<int>) {
+fn bump(done: chan<int>) {
   total = total + 1 // read-modify-write, no edge vs. the other bump()
   done <- 0
 }
 
-function main() {
+fn main() {
   let done = chan<int>(0)
   spawn bump(done)
   spawn bump(done)
@@ -2560,7 +2553,7 @@ Visibility is by the explicit `export` keyword, not by identifier casing:
 - A struct **field** marked `export` is readable/writable outside the module; an
   unexported field is module-private (and may not appear in a foreign composite
   literal or be selected outside the module).
-- A method is exported by placing `export` before its `function` keyword (§10.4);
+- A method is exported by placing `export` before its `fn` keyword (§10.4);
   an exported type may still have unexported methods (they do not contribute to
   satisfaction of an interface used across module boundaries only if the interface
   is also foreign — normally satisfaction is checked where the value is used).
@@ -2573,10 +2566,10 @@ The executable module is the **root module** of a build (the directory passed to
 signatures:
 
 ```
-function main() { ... }          // exit code 0 on normal return
-function main(): int { ... }     // returned int is the process exit code
-function main(): ()! { ... }     // a returned error prints to stderr, exit code 1
-function main(): int! { ... }    // on ok the int is the exit code; on error, as above
+fn main() { ... }          // exit code 0 on normal return
+fn main(): int { ... }     // returned int is the process exit code
+fn main(): ()! { ... }     // a returned error prints to stderr, exit code 1
+fn main(): int! { ... }    // on ok the int is the exit code; on error, as above
 ```
 
 `main` takes no parameters; command-line arguments and environment are read via
@@ -2633,7 +2626,7 @@ module's code, so archiving them is an immediate duplicate-symbol error. A
 freestanding object holds only the functions the **root module itself**
 declares; a call into an imported module stays an undefined relocation, resolved
 at link against that module's own object, exactly as a call to an `extern
-function` (§11.7) is.
+fn` (§11.7) is.
 
 Because a cross-module reference now has to survive as a *name*, and an
 unpinned name carries the `m<id>$` prefix that whichever build imports the
@@ -2935,9 +2928,9 @@ rather than being silently caught.
 A function whose result type carries the `!` marker is **fallible**:
 
 ```
-function readAll(path: string): string! { ... }        // returns string OR error
-function fetch(u: string): Response ! HttpError { ... } // custom error type E
-function run(): ()! { ... }                             // returns nothing OR error
+fn readAll(path: string): string! { ... }        // returns string OR error
+fn fetch(u: string): Response ! HttpError { ... } // custom error type E
+fn run(): ()! { ... }                             // returns nothing OR error
 ```
 
 `T!` is shorthand for `T ! error` (the default error type is the predeclared
@@ -2972,7 +2965,7 @@ catch_expr = binary [ "catch" ( expression | IDENT block ) ] .
 Example:
 
 ```
-function loadConfig(path: string): Config! {
+fn loadConfig(path: string): Config! {
   let text = readAll(path)?              // propagate a read error upward
   let cfg  = parse(text) catch e {
     log("bad config: ${e.message()}")
@@ -3032,11 +3025,11 @@ A **test** is a top-level function whose name begins with `test_`, taking no
 parameters and returning nothing:
 
 ```
-function test_addition() {
+fn test_addition() {
   assert(1 + 1 == 2)
 }
 
-function test_concat() {
+fn test_concat() {
   assert("ab" + "c" == "abc", "string concat")
 }
 ```
@@ -3072,11 +3065,11 @@ interface Shape { area(): f64 }
 struct Circle { export r: f64 }
 struct Rect   { export w: f64; export h: f64 }
 
-function (c: Circle) area(): f64 { return 3.14159265358979 * c.r * c.r }
-function (r: Rect)   area(): f64 { return r.w * r.h }
+fn (c: Circle) area(): f64 { return 3.14159265358979 * c.r * c.r }
+fn (r: Rect)   area(): f64 { return r.w * r.h }
 
 // Generic: works for any Shape (structural satisfaction).
-function totalArea<T: Shape>(shapes: []T): f64 {
+fn totalArea<T: Shape>(shapes: []T): f64 {
   let sum = 0.0
   for s of shapes {
     sum += s.area()
@@ -3085,13 +3078,13 @@ function totalArea<T: Shape>(shapes: []T): f64 {
 }
 
 // Fallible: parse an f64 count from a file, default to a computed value on error.
-function loadCount(path: string): int! {
+fn loadCount(path: string): int! {
   let text = readAll(path)?           // propagate fs errors
   return parseInt(text)?              // propagate parse errors
 }
 
 // Concurrency: fan work out to green threads, collect over a channel.
-function sumSquares(n: int): int {
+fn sumSquares(n: int): int {
   let results = chan<int>(n)
   for (let i = 1; i <= n; i++) {
     spawn worker(i, results)
@@ -3103,11 +3096,11 @@ function sumSquares(n: int): int {
   return total
 }
 
-function worker(x: int, out: chan<int>) {
+fn worker(x: int, out: chan<int>) {
   out <- x * x
 }
 
-function main(): ()! {
+fn main(): ()! {
   let shapes: []Shape = [Circle{ r: 1.0 }, Rect{ w: 2.0, h: 3.0 }]
   println("area = ${totalArea(shapes)}")
   println("sum  = ${sumSquares(4)}")
@@ -3179,7 +3172,7 @@ type_alias    = "type" IDENT [ generic_params ] "=" type .
 
 func_decl     = [ attr_list ] "fn" IDENT [ generic_params ] signature block .
 attr_list     = attr { attr } .
-attr          = "@" IDENT [ "(" string_lit ")" ] .
+attr          = "@" IDENT [ "(" STRING_LIT ")" ] .
 method_decl   = [ "export" ] "fn" "(" receiver ")" IDENT [ generic_params ] signature block .
 receiver      = IDENT ":" type_name .
 signature     = "(" [ params ] ")" [ ":" result_type ] .
