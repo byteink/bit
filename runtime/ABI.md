@@ -982,12 +982,12 @@ bit_main() -> i32     // callconv(.c); the process exit code
 
 Normalization (all four collapse to this one shape):
 
-| Surface form                     | `bit_main` body                                  |
-|-----------------------------------|---------------------------------------------------|
-| `function main() { ... }`         | run the body, return `0`                          |
-| `function main(): int { ... }`    | return the declared `int` directly                |
-| `function main(): ()! { ... }`    | on ok, return `0`; on err, print it to stderr, return `1` |
-| `function main(): int! { ... }`   | on ok, return the declared `int`; on err, print it to stderr, return `1` |
+| Surface form               | `bit_main` body                                  |
+|-----------------------------|---------------------------------------------------|
+| `fn main() { ... }`         | run the body, return `0`                          |
+| `fn main(): int { ... }`    | return the declared `int` directly                |
+| `fn main(): ()! { ... }`    | on ok, return `0`; on err, print it to stderr, return `1` |
+| `fn main(): int! { ... }`   | on ok, return the declared `int`; on err, print it to stderr, return `1` |
 
 `boot` (§9) spawns `bit_main` as the first green thread and returns its `i32`
 as the process exit code, truncated to a byte for the OS `exit` syscall (a
@@ -1567,7 +1567,7 @@ answer somewhere other than the primitive:
     `runtime/root/linux/os.bit` vs `runtime/root/darwin/os.bit`. Mis-selection is a
     compile error, not a wrong answer: a Darwin `--emit-obj` refuses the Linux
     provider's `syscall` and a Linux one refuses the Darwin provider's
-    `extern function`, both even on an uncalled declaration.
+    `extern fn`, both even on an uncalled declaration.
   - the **arch** is an `asm` block's per-arch sub-blocks (SPEC §11.6), which the
     backend selects at codegen — `runtime/sched/sched.bit`'s `entryBias` shape.
     This is the axis the directory split does NOT draw, and x86_64-linux vs
@@ -1688,10 +1688,10 @@ lingering in memory.
 ## 21b. Hardware crypto fast paths (`runtime/cryptohw` + `runtime/cryptohw`, task #1223)
 
 x86-64 AES-NI / PCLMULQDQ / SHA-NI, runtime-CPUID-gated, reached from
-`stdlib/crypto/{aes,gcm,sha256}.bit` through plain `extern function`
+`stdlib/crypto/{aes,gcm,sha256}.bit` through plain `extern fn`
 declarations (SPEC.md §11.7) rather than the `RtFn` mechanism §12-§21 above
 use — every parameter and result is a scalar or raw pointer (`extern
-function`'s exact admission rule), so no compiler-side wiring (`RtFn` enum,
+fn`'s exact admission rule), so no compiler-side wiring (`RtFn` enum,
 lowering table, in either compiler) is needed. Highest-value primitives only,
 per the task's own scope: **ChaCha20/Poly1305 SIMD acceleration is an
 explicitly deferred follow-up**, not covered here.

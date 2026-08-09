@@ -19,7 +19,7 @@ expect some good patches to be declined on scope rather than quality.
 These were decided in planning and are **not open for relitigation**. A PR
 arguing one of them will be closed with a link to this section:
 
-- **Syntax** is TypeScript-flavored (`let`/`const`, `function`, arrows,
+- **Syntax** is TypeScript-flavored (`let`/`const`, `fn`, arrows,
   `interface`, `<>` generics, optional semicolons). "Easy to write" is the
   number one design goal.
 - **Semantics** are Go-like: garbage collected, green threads (`spawn`), typed

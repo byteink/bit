@@ -1,7 +1,7 @@
 # Bit
 
 Bit is a systems programming language with TypeScript-flavored syntax and
-Go-like semantics. You write `let`/`const`, `function`, arrows, `interface`,
+Go-like semantics. You write `let`/`const`, `fn`, arrows, `interface`,
 and `<>` generics; you get garbage collection, green threads (`spawn`), typed
 channels, and structural interfaces. Programs compile to a single static native
 binary with zero runtime and zero external toolchain - the compiler owns every
