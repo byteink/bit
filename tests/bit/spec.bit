@@ -1,0 +1,742 @@
+// The `spec/SPEC.md` grammar-consistency gate (#2758).
+//
+// Nothing in this repo had ever read `spec/SPEC.md` before this file: it is the
+// project's stated syntax authority, and it had contradicted itself, and the
+// parser, silently and repeatedly (#2754, #2815-#2820, #2774, #2823 — nine
+// corrections landed in one session, every one found by a human re-reading the
+// text). This is NOT a grammar validator — building one was explicitly ruled
+// out, and most of SPEC.md is illustrative prose or deliberately-invalid
+// examples a parser-based check would misjudge. Instead this is a symbol-table
+// pass and a structural cross-check over the EBNF blocks themselves, which is
+// cheap, has no false positives on the reviewed text below, and would have
+// caught five of the nine defects above (see the two checks below).
+//
+// SCOPE. Only the SYNTACTIC grammar: from the "## 9. Syntactic Grammar" heading
+// to end of file (so §10-21 and Appendix A, but never the lexical grammar in
+// §1-8). That boundary is deliberate, not lazy: §4's lexical productions
+// reference bare meta-identifiers with no production of their own
+// (`any_char`, `unicode_letter`, `a`..`z` ranges written as bare letters) —
+// legitimate in a lexical grammar, indistinguishable from a genuine dangling
+// reference by any check this file could write. Every historical defect this
+// gate targets was in §9 or later anyway.
+//
+// CHECK 1 — DANGLING NONTERMINALS. Every bare identifier referenced in an
+// EBNF block's right-hand side must either name a production defined
+// somewhere in scope, or be ALL UPPERCASE (this grammar's own convention for a
+// terminal: `IDENT`, `STRING_LIT`, `EOF`, ...). Anything else is reported —
+// and if its uppercase form matches a terminal actually used elsewhere, the
+// message says so directly (the #2823 shape: `string_lit` where `STRING_LIT`
+// was meant). This alone would have caught #2817 (`call_expression`, never
+// defined) and #2819 (`expr`, meant `expression`).
+//
+// CHECK 2 — APPENDIX A vs THE DEFINING SECTION. Appendix A's own header calls
+// itself a restatement ("this appendix collects the syntactic grammar"), so
+// for any production name that is both restated there AND defined in a body
+// section, the two must describe the SAME set of alternatives. This is NOT a
+// byte-identical comparison — that was tried first and rejected: on the
+// CURRENT, correct tree `struct_decl`/`interface_decl`/`enum_decl` spell out
+// `";" | ","` in their defining section but use the `fsep` shorthand in
+// Appendix A, `statement`'s alternatives are ordered differently in the two
+// places, and `constraint` names two UNRELATED grammars (a generic bound and a
+// semver range) that happen to share a name — all four are legitimate and
+// would have made a byte-identical check permanently red on main. What
+// actually distinguishes a real defect (#2754 dropped `match_stmt`; #2818
+// dropped `extern_fn_decl`) is that ONE ALTERNATIVE VANISHED — so this check
+// compares each side's set of alternatives by its LEADING token (skipping a
+// leading `[ "export" ]`-shaped optional), order-insensitive, tolerating any
+// difference deeper inside an alternative. Verified: zero findings on the
+// current tree; reproduces #2754/#2818's exact shape when reverted (see the
+// ticket's own report for the mutation tests).
+//
+// WHAT THIS GATE CANNOT SEE, STATED PLAINLY SO A GREEN RUN IS NOT MISREAD. It
+// never runs the actual parser, so a form the compiler accepts but the spec
+// never admits (or the reverse) is invisible here — that needs the parser as
+// an oracle, which is a much bigger job than this ticket, and is NOT done by
+// this file. It does not check prose correctness, worked examples (§20; see
+// `tests/bit/docs.bit`, a different gate, for compiled snippets — SPEC.md's
+// examples are not part of that corpus), or anything under §1-8. A production
+// restated in a body section with NO Appendix A counterpart (`extern_fn_decl`,
+// `type_args`) is not flagged: Appendix A does not claim to restate every
+// helper production, only whether what it DOES restate agrees.
+//
+// Run from the repository root: bit-out/bin/bit run tests/bit/spec.bit
+// `BIT_REPO` overrides the repository root (default: search . / .. / ../.. /
+// ../../..).
+
+import { exists, readFile } from "std/fs"
+import { env } from "std/os"
+import { hasPrefix, indexOf, join, split, trimSpace, toUpper } from "std/strings"
+
+// Bounds — every walk below is over a fixed, small file, but each is still
+// capped explicitly (Power of 10 rule 2).
+const maxSpecBytes: int = 2097152
+const maxScanLines: int = 8192
+const maxBlockLines: int = 400
+const maxAltsPerProduction: int = 64
+const maxTokensPerRhs: int = 256
+const maxCommentSpans: int = 16
+const maxOptionalSkips: int = 8
+const maxTotalProductions: int = 512
+
+// Floors, not exact counts (a pinned exact count merges cleanly across two
+// branches that each add one production while the total is actually two —
+// see this repo's own scar tissue on that). Each is set well under today's
+// real count (24 grammar blocks, 178 productions, 90 of them in Appendix A).
+const minGrammarBlocks: int = 15
+const minProductions: int = 100
+const minAppendixProductions: int = 50
+
+const scopeMarker: string = "## 9. Syntactic Grammar"
+const appendixMarker: string = "## Appendix A"
+
+struct Production {
+  name: string
+  rhs: string       // comments stripped, continuation lines joined with " | "
+  fileLine: int      // 1-based, for a diagnostic naming spec/SPEC.md:<line>
+  appendix: bool     // true if this occurrence is inside Appendix A
+}
+
+struct LineMatch { ok: bool, name: string, rest: string }
+
+struct BlockStat { isGrammar: bool, matched: int, nonBlank: int }
+
+struct Scan { failures: int, blocks: int, productions: int, appendixProductions: int }
+
+fn die(msg: string) {
+  eprint("spec: SETUP FAILED: ${msg}\n")
+  osExit(1)
+}
+
+fn report(sc: Scan, msg: string) {
+  eprint("spec: FAIL: ${msg}\n")
+  sc.failures = sc.failures + 1
+}
+
+// The repo root: the nearest ancestor holding `spec/SPEC.md`. BIT_REPO wins.
+// Never falls back silently — a wrong cwd must abort, not scan an empty file.
+fn repoRoot(): string {
+  let override = env("BIT_REPO")
+  if (len(override) > 0) {
+    return override
+  }
+  let candidates = [".", "..", "../..", "../../.."]
+  for c of candidates {
+    if (exists("${c}/spec/SPEC.md")) {
+      return c
+    }
+  }
+  die("cannot locate spec/SPEC.md from this cwd; set BIT_REPO")
+  return ""
+}
+
+fn isIdentStart(c: u8): bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+fn isIdentCont(c: u8): bool {
+  return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
+fn containsStr(xs: []string, s: string): bool {
+  for x of xs {
+    if (x == s) {
+      return true
+    }
+  }
+  return false
+}
+
+// Bounded insertion sort (n is at most maxAltsPerProduction) — mutates `xs`
+// in place through the shared backing slice, like every other in-place sort
+// in this codebase.
+fn sortStrings(xs: []string) {
+  let n = len(xs)
+  let i = 1
+  while (i < n) {
+    let key = xs[i]
+    let j = i - 1
+    while (j >= 0 && xs[j] > key) {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = key
+    i = i + 1
+  }
+}
+
+// Removes every `(* ... *)` span. Bounded: this grammar never leaves one
+// unterminated, but an unterminated one still terminates the scan rather than
+// looping — everything from the open marker onward is dropped.
+fn stripComment(s: string): string {
+  let out = s
+  let guard = 0
+  while (guard < maxCommentSpans) {
+    let startRel = indexOf(out, "(*")
+    if (startRel < 0) {
+      return out
+    }
+    let st = int(startRel)
+    let endRel = indexOf(out[st:len(out)], "*)")
+    if (endRel < 0) {
+      return out[0:st]
+    }
+    let en = st + int(endRel)
+    out = out[0:st] + out[en + 2:len(out)]
+    guard = guard + 1
+  }
+  return out
+}
+
+// A production's LHS, at column 0: `name<spaces>= <rest>`. Indentation, or no
+// `=` after the identifier, disqualifies it (that is what tells a defining
+// line apart from prose inside the same fenced block).
+fn matchProdLine(line: string): LineMatch {
+  let n = len(line)
+  if (n == 0 || !isIdentStart(line[0])) {
+    return LineMatch{ ok: false, name: "", rest: "" }
+  }
+  let i = 0
+  while (i < n && isIdentCont(line[i])) {
+    i = i + 1
+  }
+  let name = line[0:i]
+  let j = i
+  while (j < n && line[j] == ' ') {
+    j = j + 1
+  }
+  if (j >= n || line[j] != '=') {
+    return LineMatch{ ok: false, name: "", rest: "" }
+  }
+  return LineMatch{ ok: true, name: name, rest: line[j + 1:n] }
+}
+
+// A continuation alternative: optional leading whitespace, then `|`.
+fn matchContLine(line: string): LineMatch {
+  let n = len(line)
+  let i = 0
+  while (i < n && (line[i] == ' ' || line[i] == '\t')) {
+    i = i + 1
+  }
+  if (i >= n || line[i] != '|') {
+    return LineMatch{ ok: false, name: "", rest: "" }
+  }
+  return LineMatch{ ok: true, name: "", rest: line[i + 1:n] }
+}
+
+// A bare-fenced block is a grammar block when at least half its non-blank
+// lines are a production line or a continuation line — the same shape every
+// EBNF block in this spec has, and different enough from a Bit-code example
+// (whose lines are statements, braces and calls) that the two never blur in
+// practice; verified against the live corpus below.
+fn classifyBlock(lines: []string): BlockStat {
+  let nonBlank = 0
+  let matched = 0
+  for l of lines {
+    if (len(trimSpace(l)) == 0) {
+      continue
+    }
+    nonBlank = nonBlank + 1
+    let pm = matchProdLine(l)
+    if (pm.ok) {
+      matched = matched + 1
+      continue
+    }
+    let cm = matchContLine(l)
+    if (cm.ok) {
+      matched = matched + 1
+    }
+  }
+  return BlockStat{ isGrammar: nonBlank > 0 && matched * 2 >= nonBlank,
+    matched: matched, nonBlank: nonBlank }
+}
+
+// Every production in one already-classified grammar block, appended to
+// `out`. `startFileLine` is the 1-based file line of `lines[0]`.
+fn extractProductions(out: []Production, lines: []string, startFileLine: int,
+    appendix: bool): []Production {
+  let curName = ""
+  let curRhs = ""
+  let curLine = 0
+  let has = false
+  let i = 0
+  let n = len(lines)
+  while (i < n) {
+    let pm = matchProdLine(lines[i])
+    if (pm.ok) {
+      if (has) {
+        if (len(out) >= maxTotalProductions) {
+          die("more than ${maxTotalProductions} productions found; the corpus outgrew this harness's bound")
+        }
+        out = append(out, Production{ name: curName, rhs: curRhs, fileLine: curLine, appendix: appendix })
+      }
+      curName = pm.name
+      curRhs = stripComment(pm.rest)
+      curLine = startFileLine + i
+      has = true
+    } else {
+      let cm = matchContLine(lines[i])
+      if (cm.ok && has) {
+        curRhs = curRhs + " | " + stripComment(cm.rest)
+      }
+    }
+    i = i + 1
+  }
+  if (has) {
+    if (len(out) >= maxTotalProductions) {
+      die("more than ${maxTotalProductions} productions found; the corpus outgrew this harness's bound")
+    }
+    out = append(out, Production{ name: curName, rhs: curRhs, fileLine: curLine, appendix: appendix })
+  }
+  return out
+}
+
+// Every bare identifier token in `rhs` that is not inside a quoted terminal.
+fn identTokens(rhs: string): []string {
+  let out = []string(0)
+  let n = len(rhs)
+  let i = 0
+  let inQuote = false
+  while (i < n && len(out) < maxTokensPerRhs) {
+    let c = rhs[i]
+    if (inQuote) {
+      if (c == '"') {
+        inQuote = false
+      }
+      i = i + 1
+      continue
+    }
+    if (c == '"') {
+      inQuote = true
+      i = i + 1
+      continue
+    }
+    if (isIdentStart(c)) {
+      let j = i
+      while (j < n && isIdentCont(rhs[j])) {
+        j = j + 1
+      }
+      out = append(out, rhs[i:j])
+      i = j
+      continue
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Splits `rhs` on its TOP-LEVEL `|` only — one inside `(...)`/`[...]`/`{...}`
+// (e.g. `unary = ( "!" | "-" | ... ) unary | postfix .`) or inside a quoted
+// terminal (`binop`'s `"|"` alternative, the bitwise-or operator token) is
+// left alone.
+fn splitTopAlts(rhs: string): []string {
+  let alts = []string(0)
+  let depth = 0
+  let inQuote = false
+  let n = len(rhs)
+  let start = 0
+  let i = 0
+  while (i < n && len(alts) < maxAltsPerProduction) {
+    let c = rhs[i]
+    if (inQuote) {
+      if (c == '"') {
+        inQuote = false
+      }
+      i = i + 1
+      continue
+    }
+    if (c == '"') {
+      inQuote = true
+      i = i + 1
+      continue
+    }
+    if (c == '(' || c == '[' || c == '{') {
+      depth = depth + 1
+      i = i + 1
+      continue
+    }
+    if (c == ')' || c == ']' || c == '}') {
+      depth = depth - 1
+      i = i + 1
+      continue
+    }
+    if (c == '|' && depth == 0) {
+      let piece = trimSpace(rhs[start:i])
+      if (len(piece) > 0) {
+        alts = append(alts, piece)
+      }
+      start = i + 1
+      i = i + 1
+      continue
+    }
+    i = i + 1
+  }
+  let last = trimSpace(rhs[start:n])
+  if (len(last) > 0) {
+    alts = append(alts, last)
+  }
+  return alts
+}
+
+// Strips a leading `[ ... ]` optional group (quote- and depth-aware), so
+// `[ "export" ] value_decl` and `value_decl` alone yield the same
+// discriminator. Loops in case of more than one leading optional group.
+fn skipLeadingOptional(alt: string): string {
+  let s = trimSpace(alt)
+  let guard = 0
+  while (len(s) > 0 && s[0] == '[' && guard < maxOptionalSkips) {
+    let depth = 0
+    let inQuote = false
+    let n = len(s)
+    let j = 0
+    let closeAt = -1
+    while (j < n) {
+      let c = s[j]
+      if (inQuote) {
+        if (c == '"') {
+          inQuote = false
+        }
+        j = j + 1
+        continue
+      }
+      if (c == '"') {
+        inQuote = true
+        j = j + 1
+        continue
+      }
+      if (c == '[') {
+        depth = depth + 1
+        j = j + 1
+        continue
+      }
+      if (c == ']') {
+        depth = depth - 1
+        if (depth == 0) {
+          closeAt = j
+          j = j + 1
+          break
+        }
+        j = j + 1
+        continue
+      }
+      j = j + 1
+    }
+    if (closeAt < 0) {
+      return s
+    }
+    s = trimSpace(s[closeAt + 1:n])
+    guard = guard + 1
+  }
+  return s
+}
+
+// The token that identifies one alternative: its leading quoted terminal
+// (`"struct"`) or bare name (`value_decl`), after skipping a leading optional
+// group. This is deliberately coarse — only the FIRST token, so anything
+// abbreviated or reordered later in the alternative does not affect it.
+fn leadingDiscriminator(alt: string): string {
+  let s = skipLeadingOptional(alt)
+  if (len(s) == 0) {
+    return "<empty>"
+  }
+  if (s[0] == '"') {
+    let restRel = indexOf(s[1:len(s)], "\"")
+    if (restRel < 0) {
+      return s
+    }
+    let end = 1 + int(restRel)
+    return s[0:end + 1]
+  }
+  let i = 0
+  let n = len(s)
+  while (i < n && isIdentCont(s[i])) {
+    i = i + 1
+  }
+  if (i == 0) {
+    return s[0:1]
+  }
+  return s[0:i]
+}
+
+// The sorted, de-duplicated, newline-joined set of `rhs`'s alternatives'
+// leading discriminators — order-insensitive by construction, so two RHS
+// texts with the same alternatives in a different order compare equal.
+fn canonicalDiscriminators(rhs: string): string {
+  let toks = []string(0)
+  for a of splitTopAlts(rhs) {
+    let d = leadingDiscriminator(a)
+    if (!containsStr(toks, d)) {
+      toks = append(toks, d)
+    }
+  }
+  sortStrings(toks)
+  return join(toks, "\n")
+}
+
+fn humanize(canon: string): string {
+  return join(split(canon, "\n"), ", ")
+}
+
+// CHECK 1: every RHS token is either a defined production, or looks like a
+// terminal (ALL UPPERCASE, this grammar's own convention). Anything else is
+// dangling; if its uppercase form is a terminal seen elsewhere, the message
+// names the case mismatch directly (the #2823 shape).
+fn checkDangling(sc: Scan, productions: []Production) {
+  let defined = []string(0)
+  for p of productions {
+    if (!containsStr(defined, p.name)) {
+      defined = append(defined, p.name)
+    }
+  }
+  let upperSeen = []string(0)
+  for p of productions {
+    for tok of identTokens(p.rhs) {
+      if (toUpper(tok) == tok && !containsStr(upperSeen, tok)) {
+        upperSeen = append(upperSeen, tok)
+      }
+    }
+  }
+  for p of productions {
+    for tok of identTokens(p.rhs) {
+      if (containsStr(defined, tok)) {
+        continue
+      }
+      if (toUpper(tok) == tok) {
+        continue
+      }
+      let upperForm = toUpper(tok)
+      if (containsStr(upperSeen, upperForm)) {
+        report(sc, "spec/SPEC.md:${p.fileLine}: production `${p.name}` references `${tok}`, which looks like the terminal `${upperForm}` written in the wrong case")
+        continue
+      }
+      report(sc, "spec/SPEC.md:${p.fileLine}: production `${p.name}` references undefined nonterminal `${tok}`")
+    }
+  }
+}
+
+// CHECK 2: for every production restated in both Appendix A and a body
+// section, the two sides' alternative-discriminator sets must agree. A name
+// can legitimately have more than one body occurrence (`constraint` names two
+// unrelated grammars) — passing against ANY one of them is enough.
+fn checkAppendixConsistency(sc: Scan, productions: []Production) {
+  for p of productions {
+    if (!p.appendix) {
+      continue
+    }
+    let pd = canonicalDiscriminators(p.rhs)
+    let bodyCount = 0
+    let anyMatch = false
+    let detail = ""
+    for q of productions {
+      if (q.appendix || q.name != p.name) {
+        continue
+      }
+      bodyCount = bodyCount + 1
+      let qd = canonicalDiscriminators(q.rhs)
+      if (qd == pd) {
+        anyMatch = true
+      }
+      detail = detail + "\n    body spec/SPEC.md:${q.fileLine}: {${humanize(qd)}}"
+    }
+    if (bodyCount == 0 || anyMatch) {
+      continue
+    }
+    report(sc, "spec/SPEC.md:${p.fileLine}: Appendix A's `${p.name}` = {${humanize(pd)}} agrees with none of its body restatement(s):${detail}")
+  }
+}
+
+fn checkFloors(sc: Scan) {
+  if (sc.blocks < minGrammarBlocks) {
+    report(sc, "only ${sc.blocks} grammar block(s) found in the §9+ scope, want >= ${minGrammarBlocks} — the fence classifier broke or the scope boundary moved")
+  }
+  if (sc.productions < minProductions) {
+    report(sc, "only ${sc.productions} production(s) extracted, want >= ${minProductions}")
+  }
+  if (sc.appendixProductions < minAppendixProductions) {
+    report(sc, "only ${sc.appendixProductions} production(s) found inside Appendix A, want >= ${minAppendixProductions} — Appendix A may have been gutted")
+  }
+}
+
+// Runs BEFORE the corpus walk, on synthetic text, so a scanner bug is caught
+// before it silently mis-scores the real file. Mirrors docs.bit's
+// `plumbingSelfTest`/`runExtractTests` in spirit: a reader this file trusts
+// gets proven against known-good and known-bad input first.
+fn selfTest(): int {
+  let failed = 0
+
+  let pm1 = matchProdLine("top_decl      = import_decl")
+  if (!pm1.ok || pm1.name != "top_decl") {
+    eprint("spec: SELFTEST FAIL: matchProdLine did not read an unindented production line\n")
+    failed = failed + 1
+  }
+  let pm2 = matchProdLine("  top_decl    = import_decl")
+  if (pm2.ok) {
+    eprint("spec: SELFTEST FAIL: matchProdLine accepted an INDENTED line as a production\n")
+    failed = failed + 1
+  }
+  let pm3 = matchProdLine("let x = 1")
+  if (pm3.ok) {
+    eprint("spec: SELFTEST FAIL: matchProdLine accepted `let x = 1` (there is a name between the identifier and `=`)\n")
+    failed = failed + 1
+  }
+  let cm1 = matchContLine("              | [ \"export\" ] value_decl")
+  if (!cm1.ok) {
+    eprint("spec: SELFTEST FAIL: matchContLine did not read an indented continuation line\n")
+    failed = failed + 1
+  }
+
+  if (len(splitTopAlts("\"*\" | \"/\" | \"%\"")) != 3) {
+    eprint("spec: SELFTEST FAIL: splitTopAlts did not find 3 top-level alternatives in a flat list\n")
+    failed = failed + 1
+  }
+  if (len(splitTopAlts("( \"!\" | \"-\" | \"+\" ) unary | postfix")) != 2) {
+    eprint("spec: SELFTEST FAIL: splitTopAlts split on a `|` NESTED inside parens\n")
+    failed = failed + 1
+  }
+  if (len(splitTopAlts("\"*\" | \"|\" | \"%\"")) != 3) {
+    eprint("spec: SELFTEST FAIL: splitTopAlts split on a `|` INSIDE a quoted terminal\n")
+    failed = failed + 1
+  }
+
+  if (leadingDiscriminator("[ \"export\" ] value_decl") != "value_decl") {
+    eprint("spec: SELFTEST FAIL: leadingDiscriminator did not skip a leading optional group\n")
+    failed = failed + 1
+  }
+  if (leadingDiscriminator("\"struct\" IDENT") != "\"struct\"") {
+    eprint("spec: SELFTEST FAIL: leadingDiscriminator did not capture a leading quoted terminal\n")
+    failed = failed + 1
+  }
+
+  let a = canonicalDiscriminators("assign_stmt | inc_dec_stmt | expr_stmt")
+  let b = canonicalDiscriminators("expr_stmt | assign_stmt | inc_dec_stmt")
+  if (a != b) {
+    eprint("spec: SELFTEST FAIL: canonicalDiscriminators is order-SENSITIVE; it must not be\n")
+    failed = failed + 1
+  }
+  let c = canonicalDiscriminators("assign_stmt | inc_dec_stmt")
+  if (a == c) {
+    eprint("spec: SELFTEST FAIL: canonicalDiscriminators did not notice a dropped alternative\n")
+    failed = failed + 1
+  }
+
+  let grammarLines = ["top_decl      = import_decl", "              | value_decl ."]
+  if (!classifyBlock(grammarLines).isGrammar) {
+    eprint("spec: SELFTEST FAIL: classifyBlock rejected a genuine EBNF block\n")
+    failed = failed + 1
+  }
+  let codeLines = ["fn main() {", "  let total = sum(a, b)", "  println(total)", "}"]
+  if (classifyBlock(codeLines).isGrammar) {
+    eprint("spec: SELFTEST FAIL: classifyBlock accepted a Bit-code example as an EBNF block\n")
+    failed = failed + 1
+  }
+
+  return failed
+}
+
+fn main() {
+  let selfFailed = selfTest()
+  if (selfFailed != 0) {
+    eprint("spec: SELFTEST FAILED — ${selfFailed} case(s); aborting before the real scan\n")
+    osExit(1)
+  }
+
+  let root = repoRoot()
+  let path = "${root}/spec/SPEC.md"
+  let text = readFile(path) catch e {
+    die("cannot read ${path}: ${e.message()}")
+    ""
+  }
+  if (len(text) > maxSpecBytes) {
+    die("${path} is ${len(text)} bytes, over the ${maxSpecBytes} bound")
+  }
+
+  let scopeRel = indexOf(text, scopeMarker)
+  if (scopeRel < 0) {
+    die("could not find '${scopeMarker}' in ${path} — has §9's heading moved or been reworded?")
+  }
+  let scopeStart = int(scopeRel)
+  let scoped = text[scopeStart:len(text)]
+
+  let appendixRel = indexOf(scoped, appendixMarker)
+  if (appendixRel < 0) {
+    die("could not find '${appendixMarker}' within the syntactic-grammar scope of ${path}")
+  }
+  let appendixOffset = int(appendixRel)
+
+  // 1-based file line number of `scoped`'s first character.
+  let scopeStartFileLine = len(split(text[0:scopeStart], "\n"))
+
+  let lines = split(scoped, "\n")
+  if (len(lines) > maxScanLines) {
+    die("the syntactic-grammar scope of ${path} has ${len(lines)} lines, over the ${maxScanLines} bound")
+  }
+
+  let sc = Scan{ failures: 0, blocks: 0, productions: 0, appendixProductions: 0 }
+  let productions = []Production(0)
+
+  let offset = 0
+  let inFence = false
+  let grammarFence = false
+  let blockLines = []string(0)
+  let blockStartLineIdx = 0
+  let blockStartOffset = 0
+  let i = 0
+  let n = len(lines)
+  while (i < n) {
+    let line = lines[i]
+    if (hasPrefix(line, "```")) {
+      if (!inFence) {
+        inFence = true
+        blockStartOffset = offset
+        let tag = trimSpace(line[3:len(line)])
+        if (len(tag) == 0) {
+          grammarFence = true
+          blockLines = []string(0)
+          blockStartLineIdx = i + 1
+        } else {
+          grammarFence = false
+        }
+      } else {
+        if (grammarFence) {
+          let cls = classifyBlock(blockLines)
+          if (cls.isGrammar) {
+            sc.blocks = sc.blocks + 1
+            let isAppendix = blockStartOffset >= appendixOffset
+            productions = extractProductions(productions, blockLines,
+              scopeStartFileLine + blockStartLineIdx, isAppendix)
+          }
+        }
+        inFence = false
+        grammarFence = false
+      }
+    } else {
+      if (inFence && grammarFence) {
+        if (len(blockLines) >= maxBlockLines) {
+          die("a fenced block starting near spec/SPEC.md:${scopeStartFileLine + blockStartLineIdx} exceeds the ${maxBlockLines}-line bound")
+        }
+        blockLines = append(blockLines, line)
+      }
+    }
+    offset = offset + len(line) + 1
+    i = i + 1
+  }
+  if (inFence) {
+    die("an unterminated bare fence starts near spec/SPEC.md:${scopeStartFileLine + blockStartLineIdx - 1}")
+  }
+
+  sc.productions = len(productions)
+  for p of productions {
+    if (p.appendix) {
+      sc.appendixProductions = sc.appendixProductions + 1
+    }
+  }
+
+  checkFloors(sc)
+  checkDangling(sc, productions)
+  checkAppendixConsistency(sc, productions)
+
+  if (sc.failures > 0) {
+    eprint("spec: FAILED — ${sc.failures} finding(s) over ${sc.productions} production(s) in ${sc.blocks} grammar block(s)\n")
+    osExit(1)
+  }
+  print("spec: ok — ${sc.productions} production(s) (${sc.appendixProductions} in Appendix A) over ${sc.blocks} grammar block(s), 0 dangling reference(s), 0 Appendix/body disagreement(s)\n")
+}
