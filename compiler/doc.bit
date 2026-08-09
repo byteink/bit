@@ -5,9 +5,18 @@
 // the page. So the list is not maintained, it is DERIVED — from the same
 // `exports` set the resolver builds and the same signatures the checker infers.
 //
-// Two output forms, matching the seed's `runDoc` byte-for-byte:
-//   plain:   "<kind> <name> <type>\n" per symbol, sorted by name.
-//   --json:  a `[ {...} ]` array, one object per line, for tooling and humans.
+// Two output forms, close to the seed's `runDoc` but now diverging on purpose
+// (#2724): a named type's line no longer repeats its own name (the seed's
+// fixed `<kind> <name> <type>` printed "enum Option Option", since a named
+// type's rendered type IS its name), and both forms carry the symbol's own
+// generic parameter list, read from its declaration node rather than
+// reconstructed from source text.
+//   plain:   named type ("struct"/"enum"/"interface"/"type"):
+//              "<kind> <name><params>\n"
+//            everything else:
+//              "<kind> <name><params> <type>\n"
+//   --json:  a `[ {...} ]` array, one object per line, with a "params" key
+//            between "kind" and "type", for tooling and humans.
 //
 // A method is reported against its receiver (`File.readAll`), because that is how
 // it is called and how a reader looks it up. A method set also holds a type's
@@ -19,6 +28,11 @@
 struct DocSymbol {
   kind: string,
   name: string,
+  // The written generic parameter list, angle-bracketed and ", "-separated
+  // ("<T>", "<T, E>"), or "" when the symbol declares none. A method reports
+  // "" here unconditionally — its receiver's own doc line already carries
+  // the receiver's parameters.
+  params: string,
   typeText: string,
 }
 
@@ -53,6 +67,56 @@ fn docTypeDecl(c: Checker, name: string): int {
     return 0
   }
   return node
+}
+
+// Renders a `Tag.GenericParams` node's own parameter names, angle-bracketed
+// and comma-separated ("<T>", "<T, E>"). `node` is 0 for a non-generic
+// declaration, which renders as "". Reads only the parameter NAME (kid 0 of
+// each `Tag.GenericParam`, parsertype.bit's `parseGenericParam`), never the
+// `: Bound` constraint — the params list is the declaration's arity and
+// spelling, not its bounds.
+fn docGenericParamsText(tree: Tree, source: string, node: int): string {
+  if (node == 0) {
+    return ""
+  }
+  let items = kidsOf(tree, node)
+  let out = "<"
+  let i = 0
+  while (i < len(items)) {
+    if (i != 0) {
+      out = out + ", "
+    }
+    let nm = getNode(tree, kidsOf(tree, items[i])[0])
+    out = out + source[nm.span.start:nm.span.end]
+    i = i + 1
+  }
+  return out + ">"
+}
+
+// A named type's own generic parameter list, from its decl node's generics
+// slot: kid 1 of StructDecl/EnumDecl/InterfaceDecl/TypeAlias (parsertype.bit's
+// `mkNode` calls). `declNode` is whatever `docTypeDecl` returned, which only
+// ever answers from `c.typeDecls` — filled by `checkModule`'s pre-scan over
+// `c.tree` alone, never an import (checkmodule.bit) — so this reads
+// `c.tree`/`c.source` directly; there is no cross-module hop for a named type
+// the way there is for a function below.
+fn docTypeParamsText(c: Checker, declNode: int): string {
+  return docGenericParamsText(c.tree, c.source, kidsOf(c.tree, declNode)[1])
+}
+
+// A free function's own generic parameter list, from its FuncDecl node's
+// generics slot: kid 2 (parserdecl.bit). `owner` MUST be `declOwner(c, name)`
+// — an imported function's decl node lives in the EXPORTING module's tree
+// (checklookup.bit's `funcDeclLookup`), and indexing it against the
+// importer's tree would land on an unrelated node. An extern function is
+// never generic and keeps a 3-kid shape with no generics slot at all (SPEC
+// 11.7), and a name `funcDeclLookup` could not resolve reads as `declNode ==
+// 0` — both guarded rather than indexed.
+fn docFuncParamsText(owner: Checker, declNode: int): string {
+  if (declNode == 0 || isExternDecl(owner.tree, declNode)) {
+    return ""
+  }
+  return docGenericParamsText(owner.tree, owner.source, kidsOf(owner.tree, declNode)[2])
 }
 
 // Whether a concrete method carries `export`. A missing key is private.
@@ -101,14 +165,20 @@ fn collectDoc(c: Checker): []DocSymbol {
     let td = docTypeDecl(c, n)
     if (td != 0) {
       let id = userTypeLookup(c, n)
+      let params = docTypeParamsText(c, td)
+      // typeText is deliberately `n + params`, not `typeName(c.ctx, id)`: the
+      // latter renders the same "n" back (a named type's own id is never an
+      // instantiation of itself), so the two were always identical — the
+      // "enum Option Option" doubling this replaces (#2724).
       out = append(out, DocSymbol{ kind: docTypeKind(c, td), name: n,
-        typeText: typeName(c.ctx, id) })
+        params: params, typeText: n + params })
       out = docAppendMethods(c, out, n, id)
       continue
     }
     let sig = funcSigLookup(c, n)
     if (sig != 0) {
-      out = append(out, DocSymbol{ kind: "function", name: n,
+      let params = docFuncParamsText(declOwner(c, n), funcDeclLookup(c, n))
+      out = append(out, DocSymbol{ kind: "function", name: n, params: params,
         typeText: typeName(c.ctx, sig) })
       continue
     }
@@ -167,6 +237,7 @@ fn docJson(syms: []DocSymbol): string {
     let s = syms[i]
     out = out + "  {\"name\": " + docJsonString(s.name) +
       ", \"kind\": " + docJsonString(s.kind) +
+      ", \"params\": " + docJsonString(s.params) +
       ", \"type\": " + docJsonString(s.typeText) + "}"
     if (i + 1 < len(syms)) {
       out = out + ","
@@ -177,14 +248,26 @@ fn docJson(syms: []DocSymbol): string {
   return out + "]\n"
 }
 
-// The plain form: "<kind> <name> <type>\n" per symbol, byte-identical to the
-// seed's `for (d.symbols) |s| out.print("{s} {s} {s}\n", ...)`.
+// Whether `kind` is a named type's — the four the checker keys off the decl
+// symbol's own tag for (`docTypeKind`), never a method/function/const.
+fn docKindIsNamedType(kind: string): bool {
+  return kind == "struct" || kind == "enum" || kind == "interface" || kind == "type"
+}
+
+// The plain form, per symbol (#2724): a named type prints "<kind> <type>\n" —
+// `typeText` already holds `name + params`, so printing `name` too would
+// repeat it verbatim. Every other kind prints "<kind> <name><params>
+// <type>\n".
 fn docPlain(syms: []DocSymbol): string {
   let out = ""
   let i = 0
   while (i < len(syms)) {
     let s = syms[i]
-    out = out + s.kind + " " + s.name + " " + s.typeText + "\n"
+    if (docKindIsNamedType(s.kind)) {
+      out = out + s.kind + " " + s.typeText + "\n"
+    } else {
+      out = out + s.kind + " " + s.name + s.params + " " + s.typeText + "\n"
+    }
     i = i + 1
   }
   return out
