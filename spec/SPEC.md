@@ -3214,9 +3214,10 @@ result_type   = type [ "!" [ type ] ] .
 
 block         = "{" { statement ";" } "}" .
 statement     = value_decl | assign_stmt | inc_dec_stmt | expr_stmt
-              | if_stmt | for_stmt | while_stmt | switch_stmt | select_stmt
-              | return_stmt | fail_stmt | break_stmt | continue_stmt
-              | spawn_stmt | defer_stmt | send_stmt | block | ";" .
+              | if_stmt | for_stmt | while_stmt | switch_stmt | match_stmt
+              | select_stmt | return_stmt | fail_stmt | break_stmt
+              | continue_stmt | spawn_stmt | defer_stmt | send_stmt | block
+              | ";" .
 
 assign_stmt   = lhs { "," lhs } assign_op expression { "," expression } .
 lhs           = IDENT | index | member | tuple_pat .
@@ -3241,8 +3242,8 @@ for_in        = IDENT "in" expression .
 switch_stmt   = "switch" [ "(" expression ")" ] "{" { switch_case } "}" .
 switch_case   = "case" expression { "," expression } ":" { statement ";" }
               | "default" ":" { statement ";" } .
-match_stmt    = "match" "(" expression ")" "{" { match_arm [ ";" ] } "}" .
-match_arm     = variant_pat "=>" statement .
+match_stmt    = "match" "(" expression ")" "{" { match_arm [ "," | ";" ] } "}" .
+match_arm     = variant_pat "=>" ( statement | expression ) .
 variant_pat   = IDENT [ "(" IDENT { "," IDENT } ")" ] .   (* name + payload binders; §13.8 *)
 select_stmt   = "select" "{" { comm_clause } "}" .
 comm_clause   = "case" ( send_stmt | recv_bind ) ":" { statement ";" }
