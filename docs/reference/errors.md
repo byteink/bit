@@ -13,9 +13,9 @@ A result type carrying the `!` marker is fallible. `T!` is shorthand for
 returns nothing or an error.
 
 ```bit ignore
-function readAll(path: string): string! { }           // string OR error
-function fetch(url: string): Response ! HttpError { } // custom error type
-function run(): ()! { }                               // nothing OR error
+fn readAll(path: string): string! { }           // string OR error
+fn fetch(url: string): Response ! HttpError { } // custom error type
+fn run(): ()! { }                               // nothing OR error
 ```
 
 (Signatures only - the bodies are empty and `Response`/`HttpError` stand in for
@@ -35,7 +35,7 @@ hand, only via `return` (ok) and `fail` (err).
 import { readFile } from "std/fs"
 
 // A tiny decimal parser, so this page's examples are real code.
-function toInt(s: string): int! {
+fn toInt(s: string): int! {
   if (len(s) == 0) {
     fail newError("empty number")
   }
@@ -52,7 +52,7 @@ function toInt(s: string): int! {
   return n
 }
 
-function parsePort(s: string): int! {
+fn parsePort(s: string): int! {
   let n = toInt(s)?
   if (n < 0 || n > 65535) {
     fail newError("port out of range")   // err result
@@ -72,7 +72,7 @@ legal only inside a fallible function, and the propagated error type must be
 assignable to the enclosing function's error type.
 
 ```bit
-function loadCount(path: string): int! {
+fn loadCount(path: string): int! {
   let text = readFile(path)?     // returns early on a read error
   return parsePort(text)?        // returns early on a parse error
 }
@@ -91,19 +91,19 @@ function loadCount(path: string): int! {
 ```bit
 struct Config { export port: int }
 
-function defaults(): Config {
+fn defaults(): Config {
   return Config{ port: 8080 }
 }
 
-function parseConfig(text: string): Config! {
+fn parseConfig(text: string): Config! {
   return Config{ port: parsePort(text)? }
 }
 
-function (c: Config) valid(): bool {
+fn (c: Config) valid(): bool {
   return c.port > 0
 }
 
-function loadConfig(path: string): Config! {
+fn loadConfig(path: string): Config! {
   let text = readFile(path)?
   let cfg = parseConfig(text) catch e {
     println("bad config: ${e.message()}")
@@ -115,7 +115,7 @@ function loadConfig(path: string): Config! {
   return cfg
 }
 
-function quickCount(path: string): int {
+fn quickCount(path: string): int {
   return loadCount(path) catch 0                 // fall back to 0 on any error
 }
 ```
@@ -130,7 +130,7 @@ gives deterministic resource release without finalizers.
 ```bit
 import { open, create } from "std/fs"
 
-function copyFile(src: string, dst: string): ()! {
+fn copyFile(src: string, dst: string): ()! {
   let f = open(src)?
   defer f.close()             // runs on every exit path below
   let g = create(dst)?
@@ -159,7 +159,7 @@ invariants, never for expected failures. Sources include:
 - a failed `assert(cond)` or `assert(cond, msg)`
 
 ```bit
-function mustPositive(n: int): int {
+fn mustPositive(n: int): int {
   assert(n > 0, "n must be positive")   // panics if the condition is false
   return n
 }

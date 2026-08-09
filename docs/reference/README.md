@@ -32,7 +32,7 @@ statements are shown inside a function, because Bit allows only declarations at
 the top level (§9). A complete program looks like this:
 
 ```bit
-function main() {
+fn main() {
   println("hello, bit")
 }
 ```

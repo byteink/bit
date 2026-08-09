@@ -74,7 +74,7 @@ These need only the token stream and the AST, and land first for that reason.
 
 - **`max-file-lines`** counts *physical* lines, including blanks and
   comments - the reader pays for those too, so they count.
-- **`max-fn-lines`** counts from the line of the `function` keyword (or an
+- **`max-fn-lines`** counts from the line of the `fn` keyword (or an
   arrow's own start) through the line of its closing brace, inclusive.
 - **`max-params`** counts declared parameters; a method receiver never
   counts.
