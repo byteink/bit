@@ -40,13 +40,16 @@
 #
 # TWO NARROW EXCEPTIONS (#2435), because registering a gate is mandatory in
 # this repo and otherwise forces `full` on every single ticket that adds one:
-#   - tests/bit/** joins whichever of the five areas also changed, instead of
-#     forcing `full` on its own: its own mapped gate(s) run IN ADDITION to
-#     that area's steps (#2510 — a five-area bucket used to silently replace
-#     the file's own gate instead of adding to it). If tests/bit/** is the
-#     ONLY thing that changed, the gates whose `Gate.argv` names each changed
-#     file run — nothing more — or `full` if any changed file cannot be
-#     mapped that way, whether or not one of the five areas also fired.
+#   - tests/bit/** and tests/imports/** (#2825 added the latter — a new
+#     fixture directory under tests/imports/ used to fall through to the
+#     catch-all below and force `full` on its own) join whichever of the five
+#     areas also changed, instead of forcing `full` on their own: their own
+#     mapped gate(s) run IN ADDITION to that area's steps (#2510 — a
+#     five-area bucket used to silently replace the file's own gate instead
+#     of adding to it). If tests/bit/**/tests/imports/** is the ONLY thing
+#     that changed, the gates whose `Gate.argv` names each changed file run —
+#     nothing more — or `full` if any changed file cannot be mapped that way,
+#     whether or not one of the five areas also fired.
 #   - tools/build/defs.bit and tools/build/gates.bit are the same case only
 #     when the change is PURELY new `Step{}`/`Gate{}` registration: no edit to
 #     an existing entry, no edit to any function body. See
@@ -139,17 +142,19 @@ noop_list=""
 # Extracts the gate name(s) whose `Gate.argv` literally names path `$1`, by
 # grepping the source rather than building anything — `runArgs("<path>")` is
 # how every harness-running gate spells its target in tools/build/gates.bit.
-# TWO NAMED EXCEPTIONS (#2801): a fixture under tests/bit/checkercases/ or
-# tests/bit/parsercases/ is not passed as an argv path at all — its gate
-# reaches the whole directory through BIT_CHECKER_CASES_DIR/BIT_PARSER_CASES_DIR
-# — so the grep below would find nothing for it and the caller would treat a
-# perfectly ordinary fixture as unmapped, forcing `full`. Prints nothing for
-# any OTHER path that isn't named via `runArgs`; the caller treats that empty
-# result as ambiguous.
+# THREE NAMED EXCEPTIONS (#2801, #2825): a fixture under tests/bit/checkercases/,
+# tests/bit/parsercases/, or tests/imports/ is not passed as an argv path at
+# all — its gate reaches the fixture directory through an env var
+# (BIT_CHECKER_CASES_DIR, BIT_PARSER_CASES_DIR, BIT_IMPORTS_DIR) rather than a
+# per-file `runArgs` entry, so the grep below would find nothing for it and
+# the caller would treat a perfectly ordinary fixture as unmapped, forcing
+# `full`. Prints nothing for any OTHER path that isn't named via `runArgs`;
+# the caller treats that empty result as ambiguous.
 gates_for_file() {
   case "$1" in
     tests/bit/checkercases/*) printf 'test-checker-diag\n'; return 0 ;;
     tests/bit/parsercases/*) printf 'test-parser\n'; return 0 ;;
+    tests/imports/*) printf 'test-imports-bit\n'; return 0 ;;
   esac
   grep -F "runArgs(\"$1\")" tools/build/gates.bit 2>/dev/null |
     sed -n 's/.*Gate{name: "\([^"]*\)".*/\1/p' || true
@@ -299,7 +304,11 @@ while IFS= read -r f; do
     tests/cases/*) has_testcases=1 ;;
     examples/*) has_examples=1 ;;
     stdlib/*) has_stdlib=1 ;;
-    tests/bit/*)
+    # tests/imports/** joins tests/bit/** here (#2825): both are fixture-only
+    # paths whose gate is known by name, never by path prefix, so they share
+    # has_testsbit/testsbit_list end to end — see gates_for_file() above and
+    # the comment ahead of testsbit_steps below.
+    tests/bit/*|tests/imports/*)
       has_testsbit=1
       if [ -n "${testsbit_list}" ]; then
         testsbit_list="${testsbit_list} ${f}"
@@ -355,10 +364,11 @@ bucket_count=$((has_selfhost + has_runtime + has_testcases + has_examples + has_
 # Computed ONCE, ahead of bucket selection, regardless of whether one of the
 # five areas also fired (#2510). Two consequences fall out of computing it
 # here rather than only inside the old `has_testsbit` elif branch:
-#   - an UNMAPPED tests/bit/** file must force `full` even when it rides
-#     alongside a bucket, exactly like it already did when tests/bit/** was
-#     the only change — so `testsbit_unmapped` is checked ahead of every
-#     concrete bucket below, not after all five have had a chance to win.
+#   - an UNMAPPED tests/bit/** or tests/imports/** file must force `full` even
+#     when it rides alongside a bucket, exactly like it already did when
+#     tests/bit/** was the only change — so `testsbit_unmapped` is checked
+#     ahead of every concrete bucket below, not after all five have had a
+#     chance to win.
 #   - a MAPPED file's gate(s) are available to be unioned into whichever
 #     bucket is chosen below, instead of only ever being reachable via the
 #     dedicated `testsbit` bucket that a five-area change never reaches.
@@ -382,7 +392,7 @@ elif [ "${bucket_count}" -gt 1 ]; then
   REASON="spans more than one bucket: ${touched_list}"
 elif [ "${testsbit_unmapped}" -eq 1 ]; then
   BUCKET="full"
-  REASON="tests/bit/** changed but at least one file could not be mapped to a gate by name — falling through to full"
+  REASON="tests/bit/** or tests/imports/** changed but at least one file could not be mapped to a gate by name — falling through to full"
 elif [ "${has_selfhost}" -eq 1 ]; then
   BUCKET="selfhost"
   REASON="only compiler/** changed"
@@ -403,13 +413,14 @@ elif [ "${has_docs}" -eq 1 ]; then
   REASON="only docs/**/*.md changed (${docs_list})"
 elif [ "${has_testsbit}" -eq 1 ]; then
   BUCKET="testsbit"
-  REASON="only tests/bit/** changed (gate(s): ${testsbit_steps})"
+  REASON="only tests/bit/** or tests/imports/** changed (gate(s): ${testsbit_steps})"
 elif [ "${has_noop}" -eq 1 ]; then
   BUCKET="noop"
   REASON="matched only path(s) known to be pure documentation with no gate: ${noop_list}"
 else
-  # Nothing in the five buckets, docs/**/*.md, tests/bit/**, or a known no-gate
-  # prose path changed, has_other is 0, and CHANGED is non-empty — the only
+  # Nothing in the five buckets, docs/**/*.md, tests/bit/**, tests/imports/**,
+  # or a known no-gate prose path changed, has_other is 0, and CHANGED is
+  # non-empty — the only
   # way here is a purely-additive tools/build/defs.bit/gates.bit registration
   # with no accompanying harness or source change. Nothing to scope narrowly
   # against, so full.
@@ -504,10 +515,11 @@ case "${BUCKET}" in
     ;;
 esac
 
-# tests/bit/** riding alongside one of the five concrete areas contributes
-# its OWN mapped gate(s) too (#2510) — the case above only reflects the AREA
-# that also changed, so without this union a changed harness's gate silently
-# never ran even though `has_testsbit` was 1 and it mapped cleanly. `full`
+# tests/bit/** or tests/imports/** riding alongside one of the five concrete
+# areas contributes its OWN mapped gate(s) too (#2510) — the case above only
+# reflects the AREA that also changed, so without this union a changed
+# harness's gate silently never ran even though `has_testsbit` was 1 and it
+# mapped cleanly. `full`
 # already runs everything and `testsbit` already built its array from
 # `testsbit_steps` directly above, so only the five concrete-area buckets
 # need the union; `testsbit_unmapped` was already handled by forcing `full`
@@ -523,7 +535,7 @@ case "${BUCKET}" in
           *) BUILD_STEPS+=("${s}") ;;
         esac
       done
-      REASON="${REASON}; tests/bit/** also changed — added gate(s): ${testsbit_steps}"
+      REASON="${REASON}; tests/bit/** or tests/imports/** also changed — added gate(s): ${testsbit_steps}"
     fi
     ;;
 esac
