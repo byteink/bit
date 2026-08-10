@@ -44,6 +44,13 @@ ORACLE=${DIFFDOC_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and a
 # known-disagreeing doc surface. The verdict line names what was actually compared.
 BIT2=${DIFFDOC_BIT:-bit-out/bin/bit}
+# The alarm is a HANG guard, not a performance budget (#2863): `doc` derives a
+# module's public surface from the checker, comparable in cost to `check`,
+# whose measured worst case over this exact corpus is ~1.2s
+# (selfhost-diffcheck.sh). 20s matches the "basic" differentials in
+# selfhost-diffdump.sh that bound a single fast subcommand. Overridable so a
+# slower host does not read a scheduling delay as a hang.
+TIMEOUT=${DIFFDOC_TIMEOUT:-20}
 
 for bin in "$ORACLE" "$BIT2"; do
   [ -x "$bin" ] || { echo "diffdoc: missing $bin — run: ./make selfhost" >&2; exit 2; }
@@ -77,24 +84,46 @@ if [ -n "$absent" ]; then
 fi
 
 : >"$work/mismatch"
+: >"$work/timeout"
 match=0 skip=0
 
 for d in stdlib/*/ examples/*/ tests/imports/*/; do
   [ -d "$d" ] || continue
 
-  "$ORACLE" doc "$d" >"$work/seed.plain" 2>/dev/null
+  # The oracle is bounded too (#2863): it had no bound at all here, so a hung
+  # ORACLE wedged this script indefinitely — exactly the shape
+  # selfhost-diffcheck.sh's header warns about ("the seed side had no bound at
+  # all, so a hung ORACLE wedged the whole gate indefinitely"). A timeout is
+  # its own outcome, never folded into SKIP: SKIP means the oracle legitimately
+  # declined the directory (not a module, or a module it cannot compile); a
+  # hang means it never reached a verdict at all.
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" doc "$d" >"$work/seed.plain" 2>/dev/null
   seed_rc=$?
+  if [ "$seed_rc" -ge 128 ]; then
+    echo "$d (ORACLE timed out after ${TIMEOUT}s, rc=$seed_rc)" >>"$work/timeout"
+    continue
+  fi
   # A directory the oracle cannot document is out of scope.
   if [ "$seed_rc" -ne 0 ]; then
     skip=$((skip + 1))
     continue
   fi
-  "$ORACLE" doc --json "$d" >"$work/seed.json" 2>/dev/null
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" doc --json "$d" >"$work/seed.json" 2>/dev/null
+  seed_json_rc=$?
+  if [ "$seed_json_rc" -ge 128 ]; then
+    echo "$d (ORACLE --json timed out after ${TIMEOUT}s, rc=$seed_json_rc)" >>"$work/timeout"
+    continue
+  fi
 
-  "$BIT2" doc "$d" >"$work/bit.plain" 2>/dev/null
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" doc "$d" >"$work/bit.plain" 2>/dev/null
   bit_rc=$?
-  "$BIT2" doc --json "$d" >"$work/bit.json" 2>/dev/null
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" doc --json "$d" >"$work/bit.json" 2>/dev/null
   bit_json_rc=$?
+
+  if [ "$bit_rc" -ge 128 ] || [ "$bit_json_rc" -ge 128 ]; then
+    echo "$d (BIT2 timed out after ${TIMEOUT}s, rc=$bit_rc/$bit_json_rc)" >>"$work/timeout"
+    continue
+  fi
 
   if [ "$bit_rc" -ne 0 ] || [ "$bit_json_rc" -ne 0 ]; then
     echo "$d (bit doc exit $bit_rc / --json exit $bit_json_rc, seed exit 0)" >>"$work/mismatch"
@@ -109,8 +138,9 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
 done
 
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
+timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
 compared=$((match + mismatch))
-echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch SKIP(not a module)=$skip"
+echo "doc differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(not a module)=$skip"
 
 # Corpus floor (#1516): comparing nothing is not agreement.
 if [ "$compared" -eq 0 ]; then
@@ -118,6 +148,8 @@ if [ "$compared" -eq 0 ]; then
   echo "INVALID: zero modules were compared — no evidence of agreement."
   exit 2
 fi
+
+status=0
 
 if [ -s "$work/mismatch" ]; then
   echo
@@ -128,13 +160,22 @@ if [ -s "$work/mismatch" ]; then
     dir=${d%% *}
     echo
     echo "--- diff (seed vs bit): $dir"
-    "$ORACLE" doc "$dir" >"$work/da" 2>/dev/null
-    "$BIT2" doc "$dir" >"$work/db" 2>/dev/null
+    # Bounded on BOTH sides here too, exactly as the compare loop runs them —
+    # an unbounded oracle in the failure report would hang a run that already
+    # failed.
+    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" doc "$dir" >"$work/da" 2>/dev/null
+    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" doc "$dir" >"$work/db" 2>/dev/null
     diff "$work/da" "$work/db" | head -12
   done
-  exit 1
+  status=1
 fi
 
-echo
-echo "diffdoc: the two doc surfaces agree on every compared module."
-exit 0
+if [ -s "$work/timeout" ]; then
+  echo
+  echo "INVALID: $timeouts module(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
+  while read -r d; do echo "  $d"; done <"$work/timeout"
+  status=1
+fi
+
+[ "$status" -eq 0 ] && { echo; echo "diffdoc: the two doc surfaces agree on every compared module."; }
+exit "$status"
