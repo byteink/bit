@@ -75,9 +75,12 @@ def run_session(files, messages):
             return [fill(v) for v in obj]
         return obj
 
+    # A plain file, not PIPE: Popen leaves `.stderr` None for a non-PIPE
+    # target, so the handle to read back on failure has to be kept here.
+    stderr_f = tempfile.TemporaryFile()
     proc = subprocess.Popen(
         [BIT, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=tempfile.TemporaryFile())
+        stderr=stderr_f)
     bodies = []
     buf = b""
     deadline = time.monotonic() + 60
@@ -90,8 +93,9 @@ def run_session(files, messages):
     def fail(msg):
         proc.kill()
         proc.wait()
-        proc.stderr.seek(0)
-        err = proc.stderr.read().decode(errors="replace")
+        stderr_f.seek(0)
+        err = stderr_f.read().decode(errors="replace")
+        stderr_f.close()
         raise RuntimeError(f"{msg}\n--- bit lsp stderr ---\n{err}")
 
     def next_frame():
@@ -151,6 +155,7 @@ def run_session(files, messages):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    stderr_f.close()
     return bodies
 
 def check(name, cond, detail=""):
