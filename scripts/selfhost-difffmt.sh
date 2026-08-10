@@ -41,6 +41,16 @@
 # than being scored as a mismatch or silently passing. The `continue` makes the
 # byte comparison structurally unreachable unless both sides produced output.
 #
+# ## The bound, and why BOTH sides carry it (#2863)
+#
+# The BIT2 side was alarm-guarded from the start; the ORACLE side was not, so a
+# hung pinned oracle wedged this script indefinitely — exactly the shape
+# selfhost-diffcheck.sh's header warns about ("the seed side had no bound at
+# all, so a hung ORACLE wedged the whole gate indefinitely"). An oracle timeout
+# is reported through its own counter (ORACLE-TIMEOUT), never folded into SKIP:
+# SKIP means the oracle legitimately declined the file (the corpus deliberately
+# holds unparseable `// error` cases), a hang means it never reached a verdict.
+#
 # Usage: ./make selfhost && bash scripts/selfhost-difffmt.sh
 set -uo pipefail
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
@@ -95,6 +105,7 @@ fi
 
 : >"$work/mismatch"
 : >"$work/timeout"
+: >"$work/oracletimeout"
 match=0 skip=0
 
 # `compiler`, not `selfhost` — the directory was renamed in #1841 and this line
@@ -119,8 +130,12 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
   cp "$f" "$a/s.bit"
   cp "$f" "$b/s.bit"
 
-  "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
   seed_rc=$?
+  if [ "$seed_rc" -ge 128 ]; then
+    echo "$f" >>"$work/oracletimeout"
+    continue
+  fi
   # A file the oracle cannot format (the corpus deliberately holds unparseable
   # `// error` cases) is out of scope, exactly as difftypes skips files the
   # oracle's checker rejects.
@@ -146,7 +161,8 @@ done
 compared=$((match + $(wc -l <"$work/mismatch" | tr -d ' ')))
 mismatch=$(wc -l <"$work/mismatch" | tr -d ' ')
 timeouts=$(wc -l <"$work/timeout" | tr -d ' ')
-echo "fmt differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts SKIP(unformattable)=$skip"
+oracletimeouts=$(wc -l <"$work/oracletimeout" | tr -d ' ')
+echo "fmt differential ($ORACLE vs $BIT2): MATCH=$match MISMATCH=$mismatch TIMEOUT=$timeouts ORACLE-TIMEOUT=$oracletimeouts SKIP(unformattable)=$skip"
 
 status=0
 
@@ -171,7 +187,7 @@ if [ -s "$work/mismatch" ]; then
     a="$work/da"; b="$work/db"
     rm -rf "$a" "$b"; mkdir -p "$a" "$b"
     cp "$f" "$a/s.bit"; cp "$f" "$b/s.bit"
-    "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
+    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
     perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" fmt "$b/s.bit" >/dev/null 2>&1
     diff "$a/s.bit" "$b/s.bit" | head -12
   done
@@ -182,6 +198,16 @@ if [ -s "$work/timeout" ]; then
   echo
   echo "INVALID: $timeouts file(s) timed out after ${TIMEOUT}s — no verdict, not a match:"
   while read -r f; do echo "  timeout: $f"; done <"$work/timeout"
+  status=1
+fi
+
+# Reported apart from BIT2's timeout above because it means something
+# different: the PINNED oracle hung, so the corpus shrank rather than this
+# tree misbehaving (see selfhost-diffir.sh's identical reasoning for ORACLE-TIMEOUT).
+if [ -s "$work/oracletimeout" ]; then
+  echo
+  echo "INVALID: the pinned oracle timed out on $oracletimeouts file(s) after ${TIMEOUT}s — no verdict, not a match:"
+  while read -r f; do echo "  oracle-timeout: $f"; done <"$work/oracletimeout"
   status=1
 fi
 
