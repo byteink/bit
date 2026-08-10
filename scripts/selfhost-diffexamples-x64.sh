@@ -7,8 +7,17 @@
 #
 # Needs an x86-64 Linux host reachable over ssh. No hostname is baked into the
 # repo: set BITX64_HOST, or configure candidates for scripts/x64host.sh.
+#
+# The two LOCAL `build` calls below (compiling before the binaries are scp'd to
+# the remote host) are alarm-guarded (#2866): neither had a bound before, so a
+# hung ORACLE or BIT2 build wedged this script indefinitely — the same shape
+# selfhost-diffcheck.sh's header warns about. The remote *run* step already
+# bounds itself (`timeout 30 ...`, below) and is untouched by this.
+#
 # Usage: ./make selfhost && bash scripts/selfhost-diffexamples-x64.sh
 set -u
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -16,6 +25,12 @@ set -u
 # release; it cannot catch a bug present in both — docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=${BIT2:-bit-out/bin/bit}
+
+# 60s matches selfhost-diffexamples.sh's own build+run budget for this same
+# corpus; DIFFEXAMPLESX64_TIMEOUT overrides for a slower host. Do not go below
+# ~12s on a shared box: #2863's mutation run at a 3s bound produced 11 false
+# timeouts from ordinary machine load, redone at 12-20s.
+TIMEOUT=${DIFFEXAMPLESX64_TIMEOUT:-60}
 HOST=${BITX64_HOST:-$(bash "$(dirname "$0")/x64host.sh")}
 [ -n "$HOST" ] || exit 127
 echo "diffexamples-x64: host=$HOST"
@@ -38,14 +53,24 @@ ssh "$HOST" "rm -rf $REMOTE && mkdir -p $REMOTE" || { echo "cannot reach $HOST";
 # not an x64 gap, and counting them here would just mask a real one appearing.
 SKIP="h3fetch httpserver httpsserver http2server tlsclient"
 
-pass=0 diff=0 refused=0 oraclefail=0 skipped=0 scpfail=0
+pass=0 diff=0 refused=0 oraclefail=0 skipped=0 scpfail=0 oracletimeout=0 bit2timeout=0
 for d in examples/*/; do
   n=$(basename "$d")
   case " $SKIP " in *" $n "*) skipped=$((skipped + 1)); continue;; esac
-  if ! "$ORACLE" build "$d" -o "$TMP/oracle_$n" --target x86_64-linux >"$TMP/oerr_$n" 2>&1; then
+  ALARMRUN_KEEP_STDERR=1 alarmrun "$ORACLE" build "$d" -o "$TMP/oracle_$n" --target x86_64-linux >"$TMP/oerr_$n" 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    oracletimeout=$((oracletimeout + 1)); echo "ORACLE timed out after ${TIMEOUT}s: $n"; continue
+  fi
+  if [ "$rc" -ne 0 ]; then
     oraclefail=$((oraclefail + 1)); echo "ORACLE-FAIL $n"; continue
   fi
-  if ! "$BIT2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1; then
+  ALARMRUN_KEEP_STDERR=1 alarmrun "$BIT2" build "$d" -o "$TMP/b2_$n" --target x86_64-linux >"$TMP/berr_$n" 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    bit2timeout=$((bit2timeout + 1)); echo "BIT2 timed out after ${TIMEOUT}s: $n"; continue
+  fi
+  if [ "$rc" -ne 0 ]; then
     refused=$((refused + 1)); echo "REFUSED $n: $(head -1 "$TMP/berr_$n")"; continue
   fi
   # A failed transfer is a failure, not a silent skip: it printed SCP-FAIL and
@@ -64,7 +89,7 @@ for d in examples/*/; do
     echo "--- bit2: $bo" | head -5
   fi
 done
-echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused ORACLE-FAIL=$oraclefail SCP-FAIL=$scpfail SKIP(unported)=$skipped"
+echo "x86_64-linux example differential: PASS=$pass DIFF=$diff REFUSED=$refused ORACLE-FAIL=$oraclefail ORACLE-TIMEOUT=$oracletimeout BIT2-TIMEOUT=$bit2timeout SCP-FAIL=$scpfail SKIP(unported)=$skipped"
 
 # A phase that measured nothing must not pass (#1514). On an empty corpus the
 # loop runs zero comparisons and every counter below is 0 for the wrong reason.
@@ -73,4 +98,5 @@ if [ "$pass" -lt 1 ]; then
   exit 2
 fi
 
-[ "$diff" -eq 0 ] && [ "$oraclefail" -eq 0 ] && [ "$refused" -eq 0 ] && [ "$scpfail" -eq 0 ]
+[ "$diff" -eq 0 ] && [ "$oraclefail" -eq 0 ] && [ "$refused" -eq 0 ] && [ "$scpfail" -eq 0 ] \
+  && [ "$oracletimeout" -eq 0 ] && [ "$bit2timeout" -eq 0 ]
