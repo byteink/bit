@@ -1,0 +1,124 @@
+// #2167 follow-up: `../spawnjoin`'s correctness assertion cannot see a
+// per-spawn mapping leak whose slop is never touched, so it never becomes
+// resident (see `mapGuardedStack`'s "TAIL HOLE" comment in
+// `runtime/root/{linux,darwin}/boot.bit`). RSS is structurally the wrong
+// signal for that leak; live VMA count is the right one, and this program
+// reads it directly from `/proc/self/maps` rather than needing a new runtime
+// primitive — one line per mapping, so a line count IS the region count.
+//
+// linux-only (see the sibling marker file) because that file only exists on
+// Linux. The Darwin proof for this exact defect is external
+// (`vmmap | grep -c VM_ALLOCATE`, recorded on #2167) for the reason the
+// marker gives: no argv/output-capturing subprocess primitive is available
+// to a running Bit program, so there is nothing this file could read instead.
+//
+// WHY THIS MATTERS ON LINUX SPECIFICALLY, more than as a second platform to
+// cover: `vm.max_map_count` (default 65530) caps live VMAs per process, so
+// this is the platform where an unfixed tail hole actually kills a
+// long-running server — with a bare `exit 70` from `rtSpawn`'s own
+// unrecoverable-mapping-failure path, not a slow OOM kill.
+//
+// `File.read`, not `std/fs`'s `readFile`: `/proc/self/maps` reports size 0 to
+// `lseek`/`stat` (it is generated on read, not stored), and `readFile`'s
+// `rtFsReadAll` sizes itself from `lseek(fd, 0, SEEK_END)` — confirmed by
+// reading `runtime/root/linux/fs.bit` — so it would return empty here.
+// `File.read(max)` is a plain `read(2)` with a caller-supplied cap and no
+// size dependency (its own doc comment: "works on pipes and stdin, which
+// have no size to seek to" — the same reason applies to `/proc`).
+//
+// A SINGLE `read(2)` ON `/proc/self/maps` IS NOT THE WHOLE FILE, and this
+// program's first draft trusted it to be — silently, and it cost the whole
+// check: measured directly (`readlen=${len(chunk)}`, a debug probe run
+// against a process holding 4000 leaked mappings), one `read()` call
+// returned exactly 4073 bytes regardless of the buffer size requested (a
+// `seq_file`-backed proc file's own per-call chunking, not this runtime's
+// primitive — `wc`/`cat` never notice because glibc's buffered read loops
+// until EOF). A larger `max` does not help: it changes the buffer this
+// program offers, not what the kernel hands back in one call. Both samples
+// this program takes were truncated to that same ~4KB prefix regardless of
+// the real mapping count, so `growth` read as near-zero even against the
+// unfixed (tail-hole-open) runtime — a vacuous pass, caught by
+// mutation-testing THIS FILE, not just the fix: built against the
+// unfixed runtime, the first draft printed `true` at every scale. The loop
+// below reads until EOF (an empty chunk), matching `cat`'s own contract,
+// and the corrected version prints `false` against the same unfixed binary.
+
+import { newWaitGroup, WaitGroup } from "std/sync"
+import { open } from "std/fs"
+import { count } from "std/strings"
+
+struct S { wg: WaitGroup }
+
+fn noop(s: S) {
+  s.wg.done()
+}
+
+fn spawnBatch(n: int) {
+  let wg = newWaitGroup()
+  wg.add(i64(n))
+  let i = 0
+  while (i < n) {
+    spawn noop(S{ wg: wg })
+    i = i + 1
+  }
+  wg.wait()
+}
+
+// One line per mapping in `/proc/self/maps`. `readChunkBytes` is what one
+// `read(2)` call is offered, not what it returns — see the header — so
+// `maxReadLoops` is what actually bounds the total read (Power of 10 rule 2):
+// up to `maxReadLoops * readChunkBytes` = 256 MiB, far more than this
+// program's own batches (at most 6000 spawns, one mapping each if the tail
+// hole regresses) plus the process's ordinary baseline could ever produce.
+const readChunkBytes: int = 65536
+const maxReadLoops: int = 4096
+
+fn regionCount(): int {
+  let f = open("/proc/self/maps") catch e { return -1 }
+  let lines = 0
+  let guard = 0
+  while (guard < maxReadLoops) {
+    let chunk = f.read(readChunkBytes)
+    if (len(chunk) == 0) {
+      break
+    }
+    // Counting `\n` per chunk and summing is exact regardless of where a
+    // line happens to straddle a chunk boundary: a newline byte is tallied
+    // once, in whichever chunk it landed in, independent of how the read
+    // was split.
+    lines = lines + int(count(chunk, "\n"))
+    guard = guard + 1
+  }
+  f.close()
+  return lines
+}
+
+// A per-spawn slack the harness must forgive without hiding a real leak: a
+// batch may sample with a handful of its own tasks still mid-teardown, and
+// the runtime's own worker/thread bookkeeping is not perfectly mapping-free.
+// A real leak (the tail hole, unfixed) grows by very nearly N per N-spawn
+// batch — 507/2006/4937 mappings measured against 500/2000/6000 spawns on
+// the unfixed shape — so this floor is nowhere close to hiding one.
+const slack: int = 200
+
+fn main() {
+  let before = regionCount()
+  if (before < 0) {
+    print("spawnjoinregionslinux skip: /proc/self/maps unavailable\n")
+    return
+  }
+
+  spawnBatch(500)
+  let after500 = regionCount()
+  spawnBatch(2000)
+  let after2000 = regionCount()
+  spawnBatch(6000)
+  let after6000 = regionCount()
+
+  let growth500 = after500 - before
+  let growth2000 = after2000 - after500
+  let growth6000 = after6000 - after2000
+  let bounded = growth500 < slack && growth2000 < slack && growth6000 < slack
+
+  print("spawnjoinregionslinux ${bounded}\n")
+}
