@@ -2,6 +2,11 @@
 
 ## 0.1.1
 
+- Syntax highlighting no longer treats `function` as a declaration keyword.
+  `function` was retired in favor of `fn` (SPEC §10.3); highlighting the old
+  spelling told the reader a removed keyword was still valid. `fn` is
+  unaffected. `sample.bit` now declares everything with `fn`.
+
 - LSP child process now spawns with `argv0: "bit-lsp"`, so anything reading
   `argv[0]` tells the server apart from a compile: `ps`, `pgrep -f`, `htop`
   and `lsof` all show `bit-lsp lsp --stdio`.
