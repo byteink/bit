@@ -1829,6 +1829,27 @@ defer_stmt    = "defer" postfix .                (* postfix must be a call *)
   Its arity must match: a two-result form binds exactly two names, and a
   tuple-typed rhs binds exactly the tuple's arity. `_` discards an element.
 
+**Iteration (`for_of` / `for_in`).** The two forms share one set of legal
+iterables — slice, array, map, and (`for_of` only) `chan<T>` — and differ in
+what the binder receives:
+
+| iterable      | `for x of it` binds                     | `for x in it` binds | binder type |
+| ------------- | ---------------------------------------- | -------------------- | ----------- |
+| `[]T` / `[N]T`| the element                              | the **index**         | `int`       |
+| `map<K,V>`    | `(k, v)` pair: key and value             | the **key**           | `K`         |
+| `string`      | out of scope for v0.1 (§21)              | **rejected**          | —           |
+| `chan<T>`     | the received value, until closed (§16.2) | **rejected**          | —           |
+| anything else | **rejected**                             | **rejected**          | —           |
+
+A single (non-pair) binder over a map is rejected for `for_of` too (§12.6): one
+binder cannot say whether it means the key or the value, and neither guess is
+recoverable once shipped. `for_in` rejects everything that is not a slice,
+array, or map for the same reason in the other direction — there is no index
+or key to give a `string`, a `chan<T>` (a stream, not a container, so it has no
+keys), or anything else. A `(k, v)` pair binder over `for_in` is rejected too,
+and is not even grammatical: Appendix A's `for_in` production takes one
+`IDENT`, unlike `for_of`'s `( IDENT | "(" pat "," pat ")" )`.
+
 **Loop-variable scope.** A loop variable a `for` statement itself declares is a
 **new variable each iteration**: the `for_c` variables declared by the init clause,
 and the `for_of`/`for_in` binders. The first iteration uses the variable the init

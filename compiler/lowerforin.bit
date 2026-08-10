@@ -1,0 +1,154 @@
+// compiler/lowerforin.bit — lowers `for x in it` (#2162, owner decision
+// 2026-08-10: TypeScript semantics — `in` yields keys, `of` keeps yielding
+// values). Sibling of lowerctrl.bit: same module, so this needs no imports and
+// no call-site changes.
+//
+// New file rather than added to lowerctrl.bit (734 lines) or lowerfunc.bit
+// (758 lines): either would clear the 800-line ceiling compiler/lint.bit's
+// `max-file-lines` rule enforces by default, the same squeeze
+// validateloop.bit's own header records for its own extraction out of
+// validatestmt.bit.
+//
+// `for x in it` reuses lowerForOf's counted-loop SSA shape (header/body/step/
+// exit over a hidden $iter/$idx pair, compiler/lowerctrl.bit:16-195) but binds
+// ONE name to the CURSOR itself — the index for a slice/array, the key for a
+// map — never the element or value. That is strictly less work than
+// lowerForOf's body: no element fetch (`slice_get`/`IndexGet`) and no
+// `map_val_at` call, because the value the header already computed to test the
+// loop condition IS the value the body binds.
+//
+// string, chan<T>, a pair binder, and any other operand type are all rejected
+// before this ever runs: compiler/validateloop.bit's `vForIn` (E0091) blocks
+// `bit build` from reaching lowering on any of them, the same way
+// `vForOfString`/`vForOfMapBinder` already gate `for ... of ...`. So the
+// guards below are the invalid-cascade contract's defensive floor — never
+// expected to fire on a program `bit check` accepted — not the enforcement
+// itself.
+fn lowerForIn(fc: FnCtx, node: int) {
+  let k = kidsOf(fc.c.tree, node)
+  let iterTy = defaultType(fc.c, nodeType(fc, k[1]))
+  let id = fc.c.ctx.types[iterTy]
+  let isMap = id.kind == TypeKind.Map
+  if (id.kind != TypeKind.Slice && id.kind != TypeKind.Array && !isMap) {
+    fc.failed = true
+    return
+  }
+  let binderNode = getNode(fc.c.tree, k[0])
+  if (binderNode.tag != Tag.Ident) {
+    fc.failed = true
+    return
+  }
+  let i64ty = primType(fc.c.ctx, 3)
+  let iterVal = lowerExpr(fc, k[1])
+  if (fc.failed) {
+    return
+  }
+  // Carry the iterable + cursor as hidden locals so they thread through the
+  // loop's block params — identical setup to lowerForOf's.
+  declareLocal(fc, "$iter", iterVal, iterTy)
+  let startV = 0
+  if (isMap) {
+    let mi = mkInstr(Op.RtCall, i64ty)
+    mi.name = "map_iter_init"
+    mi.args = [iterVal]
+    startV = emitRtCall(fc, mi)
+  } else {
+    let zero = mkInstr(Op.ConstInt, i64ty)
+    startV = builderEmit(fc.b, zero)
+  }
+  declareLocal(fc, "$idx", startV, i64ty)
+  let preLen = len(fc.env)
+  let idxSlot = preLen - 1
+  let iterSlot = preLen - 2
+  let header = builderNewBlock(fc.b)
+  let bodyBlk = builderNewBlock(fc.b)
+  let stepBlk = builderNewBlock(fc.b)
+  let exitBlk = builderNewBlock(fc.b)
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Header: the same test lowerForOf's uses — a map continues while the slot
+  // cursor is >= 0; a slice/array while the index is below the length.
+  builderBeginBlock(fc.b, header)
+  addJoinParams(fc, preLen)
+  let idxVal = fc.env[idxSlot].value
+  let iterCur = fc.env[iterSlot].value
+  let cmp = mkInstr(Op.ICmpSge, primType(fc.c.ctx, 10))
+  if (isMap) {
+    let z = mkInstr(Op.ConstInt, i64ty)
+    cmp.lhs = idxVal
+    cmp.rhs = builderEmit(fc.b, z)
+  } else {
+    let lenVal = 0
+    if (id.kind == TypeKind.Array) {
+      let ci = mkInstr(Op.ConstInt, i64ty)
+      ci.ival = id.arrayLen
+      lenVal = builderEmit(fc.b, ci)
+    } else {
+      let sl = mkInstr(Op.SliceLen, i64ty)
+      sl.lhs = iterCur
+      lenVal = builderEmit(fc.b, sl)
+    }
+    cmp = mkInstr(Op.ICmpSlt, primType(fc.c.ctx, 10))
+    cmp.lhs = idxVal
+    cmp.rhs = lenVal
+  }
+  let br = mkInstr(Op.Br, fc.c.ctx.voidId)
+  br.lhs = builderEmit(fc.b, cmp)
+  br.ival = bodyBlk
+  br.thenArgs = []int(0)
+  br.ival2 = exitBlk
+  br.elseArgs = snapshotValues(fc, preLen)
+  builderEmit(fc.b, br)
+  builderEndBlock(fc.b)
+  // Body: bind the cursor itself — the index for a slice/array, the key for a
+  // map — then run the body and fall to the step.
+  fc.loops = append(fc.loops, LoopFrame{ exit: exitBlk, cont: stepBlk, preLen: preLen, isSwitch: false, exitUsed: false })
+  builderBeginBlock(fc.b, bodyBlk)
+  fc.terminated = false
+  let bodyMark = len(fc.env)
+  let bindTy = i64ty
+  let bindVal = idxVal
+  if (isMap) {
+    let kv = mkInstr(Op.RtCall, id.mapKey)
+    kv.name = "map_key_at"
+    kv.args = [iterCur, idxVal]
+    bindVal = emitRtCall(fc, kv)
+    bindTy = id.mapKey
+  }
+  declareLocal(fc, fc.c.source[binderNode.span.start:binderNode.span.end], bindVal, bindTy)
+  rebindCheckerName(fc, k[0], bindTy)
+  let deferBase = deferMark(fc)
+  lowerStmtList(fc, k[2])
+  deferScopeEnd(fc, deferBase, k[2])
+  truncateEnv(fc, bodyMark)
+  fc.loops = fc.loops[0:len(fc.loops) - 1]
+  if (!fc.terminated) {
+    emitJump(fc, stepBlk, snapshotValues(fc, preLen))
+  }
+  builderEndBlock(fc.b)
+  // Step: advance the cursor (map: next live slot; slice/array: +1), back to
+  // the header — identical to lowerForOf's.
+  builderBeginBlock(fc.b, stepBlk)
+  addJoinParams(fc, preLen)
+  if (isMap) {
+    let nx = mkInstr(Op.RtCall, i64ty)
+    nx.name = "map_iter_next"
+    nx.args = [fc.env[iterSlot].value, fc.env[idxSlot].value]
+    fc.env[idxSlot].value = emitRtCall(fc, nx)
+  } else {
+    let one = mkInstr(Op.ConstInt, i64ty)
+    one.ival = 1
+    let add = mkInstr(Op.Add, i64ty)
+    add.lhs = fc.env[idxSlot].value
+    add.rhs = builderEmit(fc.b, one)
+    fc.env[idxSlot].value = builderEmit(fc.b, add)
+  }
+  emitJump(fc, header, snapshotValues(fc, preLen))
+  builderEndBlock(fc.b)
+  // Exit.
+  builderBeginBlock(fc.b, exitBlk)
+  addJoinParams(fc, preLen)
+  fc.terminated = false
+  // Drop the hidden $iter/$idx locals.
+  truncateEnv(fc, preLen - 2)
+}
