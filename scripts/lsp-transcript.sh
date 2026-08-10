@@ -98,7 +98,7 @@ check("diagnostics: source is bitls", any('"source":"bitls"' in x for x in diag)
 b = run_session(
     {"main.bit":
         'import { sqrt } from "std/math"\n'
-        'function main() {\n'
+        'fn main() {\n'
         '  let d = sqrt(9.0)\n'
         '  println("d = ${d}")\n'
         '}\n'},
@@ -107,7 +107,7 @@ b = run_session(
         {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
             "textDocument":{"uri":"{URI:main.bit}","text":
                 'import { sqrt } from "std/math"\n'
-                'function main() {\n'
+                'fn main() {\n'
                 '  let d = sqrt(9.0)\n'
                 '  println("d = ${d}")\n'
                 '}\n'}}},
@@ -146,7 +146,7 @@ resp = [x for x in b if '"id":2' in x]
 check("hover-usage: type shown on a reference", any("i64" in x for x in resp), joined(resp))
 
 # 4. goto-definition crosses sibling files in the same directory.
-a_text = 'function greet(): string {\n  return "hi"\n}\n'
+a_text = 'fn greet(): string {\n  return "hi"\n}\n'
 b_text = "let msg = greet()\n"
 b = run_session(
     {"a.bit": a_text, "b.bit": b_text},
@@ -168,8 +168,8 @@ ctext = (
     "  wave(): string\n"
     "}\n"
     "struct Bot { name: string }\n"
-    "function (b: Bot) greet(): string { return b.name }\n"
-    "function (b: Bot) wave(): string { return b.name }\n"
+    "fn (b: Bot) greet(): string { return b.name }\n"
+    "fn (b: Bot) wave(): string { return b.name }\n"
     'let g: Greeter = Bot{name: "Ada"}\n'
     "let y = g.\n"
 )
@@ -188,7 +188,7 @@ check("completion: lists 'greet'", any('"greet"' in x for x in resp), joined(res
 check("completion: lists 'wave'", any('"wave"' in x for x in resp), joined(resp))
 
 # 6. documentSymbol lists a top-level declaration.
-dtext = "function greet(): string {\n  return \"hi\"\n}\nstruct Bot { name: string }\n"
+dtext = "fn greet(): string {\n  return \"hi\"\n}\nstruct Bot { name: string }\n"
 b = run_session(
     {"main.bit": dtext},
     [
@@ -242,9 +242,9 @@ check("shutdown: replies null", any('"id":2' in x and '"result":null' in x for x
 #    unacceptable class. A single `run_session` needs a Content-Length line here
 #    because Python len() differs from the byte count once we embed no non-ASCII.
 extern_ok = (
-    "extern function bit_rt_listen_tcp(host: *u8, hostLen: int, port: int): int\n"
-    "extern function bit_rt_addr_octets(sa: *u8, out: *u8)\n"
-    "@nosplit @symbol(\"bit_custom_entry\") function customEntry(p: *i64): int {\n"
+    "extern fn bit_rt_listen_tcp(host: *u8, hostLen: int, port: int): int\n"
+    "extern fn bit_rt_addr_octets(sa: *u8, out: *u8)\n"
+    "@nosplit @symbol(\"bit_custom_entry\") fn customEntry(p: *i64): int {\n"
     "  return 0\n"
     "}\n"
 )
@@ -263,7 +263,7 @@ check("extern: no diagnostics on valid extern/decorator/pointer code",
 # 9b. Not over-suppressed: a genuine type error in the SAME file as valid externs
 #     is still reported (severity 1), while the extern lines above stay clean.
 extern_mixed = (
-    "extern function bit_rt_listen_tcp(host: *u8, hostLen: int): int\n"
+    "extern fn bit_rt_listen_tcp(host: *u8, hostLen: int): int\n"
     "let bad: i32 = \"nope\"\n"
 )
 b = run_session(
