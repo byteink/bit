@@ -130,6 +130,7 @@ import {
   schedStackBytes, schedStackAligned, schedRegisterBigStack, wkDeque,
   schedSpawnTrampoline, taskSpawnEntry,
   schedIdleArm, schedIdleDisarm, schedIdlePark, wkId, wkSleepReq,
+  wkLastDone, taskStackBase, taskStackBytes,
 } from "../../sched"
 // The netpoller provider (#1673). `runtime/sched` may not import it — epoll
 // against kqueue is the platform split the parent module exists to stay clear of
@@ -311,8 +312,25 @@ const mainStackBytes: int = 8388608
 // returns a page-aligned address that may ALREADY be granule-aligned, in which
 // case aligning it to itself leaves zero slop and therefore no guard. The `+ 1`
 // forces the base strictly above the region, so the hole is never empty — at
-// least one page, at most the whole granule — and the remainder above the base is
-// still a full `schedStackBytes` either way.
+// least one page, at most the whole granule.
+//
+// THE TAIL HOLE (#2167 follow-up), and it is why the remainder above the base
+// is NOT "still a full `schedStackBytes` either way" as this comment used to
+// claim. `region` is `bytes + schedStackBytes` long; unmapping only the head
+// slop (`base - region`) leaves `[base, region + bytes + schedStackBytes)`
+// live, which is `bytes` PLUS a tail of `schedStackBytes - (base - region)`
+// bytes above `base + bytes` — zero only when `mapPages` happens to return an
+// address already `schedStackBytes`-aligned, otherwise up to a whole
+// `schedStackBytes - 1` bytes. That tail is never touched (the stack grows
+// DOWN from `base + bytes`, `schedTaskContext`'s call site below), so it never
+// shows up as RSS — which is exactly why an RSS-only leak check cannot see it
+// — but it is a live, counted VMA for as long as the process runs, one per
+// call. `rtSpawn` calls this once per `spawn`, and Linux caps live VMAs per
+// process at `vm.max_map_count` (default 65530): left unmapped, a long-running
+// server would trade a slow OOM kill for an abrupt `rootExit(70)` at roughly
+// 65k live spawns, which is not this ticket's fix, only a different failure
+// mode for the same unbounded growth. Unmapping it also gives the stack a
+// guard hole ABOVE its usable top, which it lacked before.
 @nosplit fn mapGuardedStack(bytes: int): int {
   if (bytes <= 0) {
     return 0
@@ -330,10 +348,19 @@ const mainStackBytes: int = 8388608
   if (!schedStackAligned(base) || base <= region || base - region > schedStackBytes) {
     return 0
   }
-  // The hole. A failure here is not fatal — the stack above is intact and usable,
-  // it just has no guard — but it is never expected, so it is not silent.
+  // The head hole. A failure here is not fatal — the stack above is intact and
+  // usable, it just has no guard — but it is never expected, so it is not silent.
   if (!unmapPages(region, base - region)) {
     return 0
+  }
+  // The tail hole. See the header: `region`'s whole mapping is
+  // `bytes + schedStackBytes` long, the head hole took `base - region` of it,
+  // so what remains above `base` is `bytes` plus this leftover tail.
+  let tailSlop = schedStackBytes - (base - region)
+  if (tailSlop > 0) {
+    if (!unmapPages(base + bytes, tailSlop)) {
+      return 0
+    }
   }
   return base
 }
@@ -465,6 +492,24 @@ fn workerBody(arg: *byte): *byte {
       schedIdleDisarm(w)
     }
     backoff = schedWorkerStepAt(w, addr, woke, backoff)
+    // TEARDOWN (#2167). `schedWorkerStep`, inside `schedWorkerStepAt`, already
+    // unregistered the retired task from the collector's root set before
+    // returning, so its stack and task block are unreachable and safe to
+    // release here. `wkLastDone` — not `addr` — names the retired task,
+    // because the netpoller-drain path picks its own task internally when
+    // `addr == 0` (see `wkLastDone`'s own comment in `runtime/sched/worker.bit`).
+    //
+    // `mainTaskBlock` IS EXCLUDED, ALWAYS. It is a fixed module array
+    // registered through `schedRegisterBigStack`, never `mapPages`'d, and it
+    // reaches this identical `taskDone` transition through this identical
+    // loop when `bit_main` returns. Unmapping it would `munmap` memory this
+    // module never `mmap`'d.
+    let doneTask = *(w + wkLastDone)
+    if (doneTask != 0 && doneTask != int(ptrOf(mainTaskBlock))) {
+      let dt = taskAt(doneTask)
+      unmapPages(*(dt + taskStackBase), *(dt + taskStackBytes))
+      unmapPages(doneTask, (taskWords + 1) * 8)
+    }
     if (backoff == workerStepStop) {
       break
     }
