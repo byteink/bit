@@ -87,9 +87,18 @@
 // captured pipes; until it exists this suite has a shell dependency it did not
 // have in Zig.
 //
-// Run it: `bit-out/bin/bit run tests/bit/stress.bit`, from the repository root.
+// Run it: `bit-out/bin/bit run tests/bit/stress`, from the repository root.
 // `BIT_STRESSGATE_DIR` / `BIT_STRESSGATE_ONLY` narrow the run for debugging and
 // mutation-testing; either one turns the corpus floors off and prints NOT A GATE.
+//
+// THIS HARNESS IS A TWO-FILE DIRECTORY MODULE (#2867), split only along
+// existing seams, not by line count. `stress.bit` (this file) keeps the
+// corpus census and its rationale, the exclusive/batch partition, setup, and
+// `main`. Sibling `verify.bit` keeps the per-program machinery `main` calls
+// into: build, run under both GC policies, and compute a `Verdict`. Files
+// side by side in one directory share ONE scope — no `import` between them —
+// so every name declared in either file is visible in the other, exactly as
+// if this were still a single file.
 
 // Upper bound on the directory walk (Power of 10 rule 2).
 const maxPrograms: int = 256
@@ -182,6 +191,10 @@ fn isExclusiveProgram(name: string): bool {
 // and not this list would otherwise drift in silence.
 const minExclusiveRunnable: int = 2
 
+// The harness-wide context every setup and per-program function threads
+// through. `Text`/`Marker`/`Outcome`/`Verdict` — the per-program result types
+// `checkProgram` and its callees use — live in `verify.bit` beside the code
+// that produces them.
 struct Ctx {
   root: string,
   compiler: string,
@@ -191,19 +204,6 @@ struct Ctx {
   timeoutMs: int,
   target: int,
 }
-
-struct Text { ok: bool, body: string }
-
-struct Marker { present: bool, reason: string }
-
-// One execution's verdict. `statsOk` is separate from `collections` for the
-// reason the header gives: absent and zero are different answers.
-struct Outcome { ok: bool, statsOk: bool, collections: int, abandoned: int }
-
-// One program's verdict. `oracled` marks a program the collection oracle applies
-// to at all; `proved` marks one whose stress count cleared `stressRatio`, which
-// is what `main`'s corpus-wide plumbing assertion counts.
-struct Verdict { failed: int, oracled: bool, proved: bool }
 
 fn say(s: string) {
   print(s)
@@ -297,271 +297,6 @@ fn shQuote(s: string): string {
     i = i + 1
   }
   return out + "'"
-}
-
-// --- files ------------------------------------------------------------------
-
-fn readText(path: string): Text {
-  let fd = fsOpen(path, false)
-  if (fd < 0) { return Text{ ok: false, body: "" } }
-  let body = fsReadAll(fd)
-  fsClose(fd)
-  return Text{ ok: true, body: body }
-}
-
-fn writeText(path: string, body: string): bool {
-  let fd = fsOpen(path, true)
-  if (fd < 0) { return false }
-  let n = fsWrite(fd, body)
-  fsClose(fd)
-  return n >= 0
-}
-
-// A per-directory oracle marker: absent, or the stated reason. An EMPTY marker
-// is an error — a bare file would let a program weaken the oracle without anyone
-// having to justify it, which is the failure mode the markers exist to prevent.
-fn readMarker(name: string, dir: string, marker: string): Marker {
-  let t = readText(dir + "/" + marker)
-  if (!t.ok) { return Marker{ present: false, reason: "" } }
-  let reason = trim(t.body)
-  if (len(reason) == 0) {
-    die("stress '" + name + "': '" + marker + "' marker is empty - state why it applies")
-  }
-  return Marker{ present: true, reason: reason }
-}
-
-// --- the aggregate stats line ----------------------------------------------
-//
-// `runtime/root/{linux,darwin}/boot.bit`'s `statsReport` writes ONE summary line
-// at exit under `BIT_GC_STATS`:
-//   `[bit-gc] collections=<n> swept=<n> live=<n> abandoned=<n> oom=<n> bad=<n>`
-// Every function on the collection path is `@nosplit`, which admits no
-// print/extern/syscall (E0075), so there is no per-collection line to count.
-
-fn statsPresent(stderrText: string): bool {
-  return indexOfAt(stderrText, aggregatePrefix, 0) >= 0
-}
-
-// `<field>=<n>` read from the aggregate line, or -1 when the field is absent.
-// Callers must have checked `statsPresent` first: -1 here means malformed, and
-// is never quietly folded into a count.
-fn statsField(stderrText: string, field: string): int {
-  let line = indexOfAt(stderrText, aggregatePrefix, 0)
-  if (line < 0) { return -1 }
-  let key = indexOfAt(stderrText, field, line)
-  if (key < 0) { return -1 }
-  let i = key + len(field)
-  if (i >= len(stderrText) || stderrText[i] < 48 || stderrText[i] > 57) { return -1 }
-  let v = 0
-  while (i < len(stderrText) && stderrText[i] >= 48 && stderrText[i] <= 57) {
-    v = v * 10 + int(stderrText[i]) - 48
-    i = i + 1
-  }
-  return v
-}
-
-// --- bounded subprocesses ---------------------------------------------------
-
-// `osRunBounded`'s three outcomes in one i64 (ABI.md §19) rendered as a message,
-// or "" when the child exited 0. Every branch names a DIFFERENT failure: a
-// deadlock, an outside kill and a non-zero exit must not read alike.
-fn runMsg(r: int): string {
-  if (r == 0) { return "" }
-  if (r == -1) { return "SPAWN FAILED (fork/exec/wait error)" }
-  if (r == -2) { return "TIMED OUT" }
-  if (r <= -100) { return "KILLED BY SIGNAL " + num(0 - r - 100) }
-  return "exited " + num(r)
-}
-
-// Write `body` as an executable `/bin/sh` script and run it under the deadline.
-fn runScript(cx: Ctx, path: string, body: string): int {
-  if (!writeText(path, body)) { die("cannot write wrapper script " + path) }
-  if (fsChmod(path, 493) != 0) { die("cannot chmod wrapper script " + path) }
-  return osRunBounded(path, cx.timeoutMs)
-}
-
-// --- one program ------------------------------------------------------------
-
-// Build `dir` with the self-hosted compiler. `BIT_LIBBITRT`/`BIT_STDLIB` pin the
-// archive and stdlib so the harness is independent of its working directory, and
-// a whole-PROJECT build (not a single module) is what `tests/stress/spinlock`
-// needs: it imports the lock under test straight out of `runtime/`.
-fn buildProgram(cx: Ctx, name: string, dir: string, bin: string): bool {
-  let base = cx.scratch + "/" + name
-  let errPath = base + ".berr"
-  let body = "#!/bin/sh\n" +
-    "BIT_STDLIB=" + shQuote(cx.stdlib) +
-    " BIT_LIBBITRT=" + shQuote(cx.libbitrt) +
-    " exec " + shQuote(cx.compiler) + " build " + shQuote(dir) + " -o " + shQuote(bin) +
-    " >" + shQuote(base + ".bout") + " 2>" + shQuote(errPath) + "\n"
-  let r = runScript(cx, base + ".build.sh", body)
-  if (r == 0) { return true }
-  say("stress '" + name + "' [compile]: " + runMsg(r))
-  let e = readText(errPath)
-  if (e.ok) { say(trim(e.body)) }
-  return false
-}
-
-// One execution. `envLine` is the environment prefix the wrapper applies; it is
-// always the whole story about the policy, so a run is labelled by what it got.
-//
-// `slot` keeps the two runs' capture files APART, and that is not tidiness: with
-// one shared pair of paths, a second run whose redirect never happened would
-// read the FIRST run's output and its stats line, and report the default run's
-// numbers as the stress run's. Absent has to look absent.
-fn runOnce(cx: Ctx, name: string, bin: string, slot: string, label: string, envLine: string, expected: string, statsRequired: bool): Outcome {
-  let base = cx.scratch + "/" + name + "." + slot
-  let outPath = base + ".out"
-  let errPath = base + ".err"
-  let body = "#!/bin/sh\nunset BIT_GC BIT_GC_STATS\n" +
-    envLine + " exec " + shQuote(bin) +
-    " >" + shQuote(outPath) + " 2>" + shQuote(errPath) + "\n"
-  let r = runScript(cx, base + ".run.sh", body)
-
-  let errText = readText(errPath)
-  if (!errText.ok) {
-    say("stress '" + name + "' [" + label + "]: could not read captured stderr " + errPath +
-      " - the wrapper never ran, so nothing about this program was verified")
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
-  }
-  if (r != 0) {
-    say("stress '" + name + "' [" + label + "]: " + runMsg(r))
-    say("stderr: " + trim(errText.body))
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
-  }
-
-  let outText = readText(outPath)
-  if (!outText.ok) {
-    say("stress '" + name + "' [" + label + "]: could not read captured stdout " + outPath)
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
-  }
-  if (outText.body != expected) {
-    say("stress '" + name + "' [" + label + "]: output mismatch")
-    say("  expected: " + trim(expected))
-    say("  got:      " + trim(outText.body))
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
-  }
-
-  // Both runs carry `BIT_GC_STATS=1`, so the aggregate line must be there in
-  // BOTH. Its absence is the tell that the environment never reached the child
-  // (or that the capture is broken), and it is fatal for exactly that reason —
-  // unless the program has DECLARED that it owns the exit path and therefore
-  // never reaches `statsReport` (`no-stats`, see `checkProgram`).
-  if (!statsPresent(errText.body)) {
-    if (statsRequired) {
-      say("stress '" + name + "' [" + label + "]: no '" + aggregatePrefix + "' line in " + errPath + ".")
-      say("  BIT_GC_STATS=1 was set for this run, so the line is missing only if the")
-      say("  environment never reached the child or the capture is broken. Either way")
-      say("  the collector oracle below would read every field as absent. A program that")
-      say("  replaces the runtime's own exit path declares that with a 'no-stats' file.")
-      return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
-    }
-    return Outcome{ ok: true, statsOk: false, collections: -1, abandoned: -1 }
-  }
-  let collections = statsField(errText.body, "collections=")
-  let abandoned = statsField(errText.body, "abandoned=")
-  if (collections < 0 || abandoned < 0) {
-    say("stress '" + name + "' [" + label + "]: malformed stats line in " + errPath)
-    return Outcome{ ok: false, statsOk: false, collections: -1, abandoned: -1 }
-  }
-  return Outcome{ ok: true, statsOk: true, collections: collections, abandoned: abandoned }
-}
-
-// Both policies for one program, plus the oracles the second run must satisfy.
-// Returns 1 on failure, 0 on success.
-fn checkProgram(cx: Ctx, name: string, dir: string): Verdict {
-  let bad = Verdict{ failed: 1, oracled: false, proved: false }
-  let expected = readText(dir + "/" + name + ".expected")
-  if (!expected.ok) {
-    // A hard error, never a skip: a rename would otherwise delete a program from
-    // the corpus in silence.
-    say("stress '" + name + "': cannot read " + dir + "/" + name + ".expected")
-    return bad
-  }
-
-  let noCollect = readMarker(name, dir, "no-collect")
-  let noAbandon = readMarker(name, dir, "no-abandon")
-  let waived = readMarker(name, dir, "stress-waived")
-  // A program that REPLACES the runtime's write/exit provider — `rootiodarwin`
-  // and `rootiolinux` are the whole of it — never reaches `statsReport`, so it
-  // emits no aggregate line however the environment is set. Declared, with a
-  // reason, exactly like the other markers: the alternative is treating a
-  // missing line as tolerable everywhere, which is how the oracle stops oracling.
-  let noStats = readMarker(name, dir, "no-stats")
-
-  let bin = cx.scratch + "/bin-" + name
-  if (!buildProgram(cx, name, dir, bin)) { return bad }
-
-  let base = "default"
-  let first = runOnce(cx, name, bin, "a", base, "BIT_GC_STATS=1", expected.body, !noStats.present)
-  if (!first.ok) { fsRemove(bin); return bad }
-
-  let label = "BIT_GC=stress"
-  let envLine = "BIT_GC=stress BIT_GC_STATS=1"
-  if (waived.present) {
-    // The waiver admits a hole rather than arguing one away, so it carries its
-    // reason into the output on every single run.
-    say("stress '" + name + "': STRESS-WAIVED, running BIT_GC=off instead:")
-    say("  " + waived.reason)
-    label = "BIT_GC=off (waived)"
-    envLine = "BIT_GC=off BIT_GC_STATS=1"
-  }
-  let second = runOnce(cx, name, bin, "b", label, envLine, expected.body, !noStats.present)
-  fsRemove(bin)
-  if (!second.ok) { return bad }
-  if (!second.statsOk) { return Verdict{ failed: 0, oracled: false, proved: false } }
-
-  // `BIT_GC=off` collects nothing BY DEFINITION, so a non-zero count here means
-  // the policy in the wrapper is not the policy the child ran under. The waived
-  // programs are the only place the port can prove that directly.
-  if (waived.present) {
-    if (second.collections != 0) {
-      say("stress '" + name + "' [" + label + "]: " + num(second.collections) +
-        " collections under BIT_GC=off. The policy in the wrapper did not reach the child.")
-      return bad
-    }
-    return Verdict{ failed: 0, oracled: false, proved: false }
-  }
-
-  let oracled = !noCollect.present
-  let proved = false
-  if (oracled) {
-    if (second.collections == 0) {
-      say("stress '" + name + "' [" + label + "]: the collector never ran, so this run verified")
-      say("  nothing about rooting. Give the program a loop where the roots it cares about are")
-      say("  live, or - if it proves something about emission or linking rather than rooting -")
-      say("  add a 'no-collect' file to its directory stating why.")
-      return bad
-    }
-    // The policy differential, and the reason it is reported rather than
-    // enforced HERE. Allocation-driven programs clear `stressRatio` by two to
-    // five orders of magnitude, but a sleep-bounded one does not: `schedtimer`
-    // measured 99 against 41 and `schedwakedarwin` 150 against 62, because their
-    // loops are paced by a clock rather than by back-edges. Failing those two
-    // would be calibrating the oracle to the wrong thing. The plumbing claim is
-    // a property of the HARNESS, not of each program, so it is asserted once
-    // over the corpus in `main` — see `minProofShare`.
-    proved = second.collections > first.collections * stressRatio
-    if (!proved) {
-      say("stress '" + name + "': " + num(second.collections) + " collections under " + label +
-        " against " + num(first.collections) + " under the default policy - below the " +
-        num(stressRatio) + "x margin, so this program is not one of the corpus's policy proofs.")
-    }
-  }
-
-  // Opt-in, and only where the program was built so the defect is the sole
-  // possible cause (ABI.md §6): an abandoned rendezvous is always SAFE, and a
-  // thread asleep in `parkSleepNs` reads as `running`, so most programs here
-  // cannot promise zero.
-  if (noAbandon.present && second.abandoned != 0) {
-    say("stress '" + name + "' [" + label + "]: " + num(second.abandoned) +
-      " collections were ABANDONED against " + num(second.collections) + " collected, and this")
-    say("  program's 'no-abandon' marker says none may be. Something stayed in the mutator")
-    say("  registry as 'running' that should not have - usually an OS thread that exited")
-    say("  without its slot being released (ABI.md §6).")
-    return bad
-  }
-  return Verdict{ failed: 0, oracled: oracled, proved: proved }
 }
 
 // --- setup ------------------------------------------------------------------
