@@ -39,9 +39,12 @@ changes the spec **in the same commit**, not afterwards.
    `tests/cases/*.bit` with a sibling `.expected`; line 1 selects the mode
    (`// run`, `// panic`, `// error`, `// fmt`, `// types`, `// lint`).
 2. **`scripts/gate.sh` green.** It reads your diff and runs only the steps that
-   diff can affect; it falls back to the full suite when the change is
-   cross-cutting. Do not skip a red step - a hang counts as a failure, not a
-   stall.
+   diff can affect. A cross-cutting change (`tools/build/`, `runtime/`, a mix
+   of areas, or anything else it cannot confidently scope) makes it refuse
+   instead of guessing - exit 3, nothing run, printing what to do next. Run
+   `scripts/gate.sh --full` or `./make test` directly (every gate, 18-18.5
+   min) to actually verify a change like that. Do not skip a red step - a
+   hang counts as a failure, not a stall.
 3. **The differentials agree.** The pinned previous release is the oracle: this
    tree's compiler must produce byte-identical AST/type/IR dumps over the corpus
    (`scripts/selfhost-diff*.sh`). A divergence is a change that is not finished.

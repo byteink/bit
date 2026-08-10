@@ -4,9 +4,20 @@
 # `./make test` runs all 28 harnesses (~270-450s). Most changes only touch
 # one area of the tree, so most of that time is wasted proving things that
 # could not have broken. This script looks at what actually changed and runs
-# only the steps that area needs — falling back to the full suite whenever
+# only the steps that area needs — falling back to the `full` bucket whenever
 # the change is ambiguous. It never silently skips a test: any change it
-# cannot confidently scope runs the full suite instead.
+# cannot confidently scope resolves to `full`.
+#
+# `full` IS A VERDICT, NOT AN ACTION, UNLESS YOU PASS --full (#2872). Without
+# --full, a diff that resolves to `full` prints the bucket and REASON and
+# exits 3 — it runs NOTHING, least of all the 18-18.5 minute `./make test`.
+# To actually verify a diff that lands here, run `scripts/gate.sh --full` or
+# `./make test` directly. In THIS repo's own workflow that full run is
+# batched once per push by whoever integrates (CLAUDE.md's verify-loop rule:
+# "the full suite runs once per push, and nobody else runs it at all") — but
+# that batching is a convention for this repo's own contributors, not a
+# substitute for verifying your own change if you have no integrator to
+# batch it for you.
 #
 # Usage:
 #   scripts/gate.sh                    # scope to `main...HEAD` PLUS the working tree
@@ -17,6 +28,23 @@
 #                                      # scripts/x64gate.sh (real x86_64 hardware)
 #   scripts/gate.sh --arm64            # route the computed build steps through
 #                                      # scripts/arm64gate.sh (native aarch64-linux)
+#
+# EXIT CODES:
+#   0  ran and PASSED — covers GATE_RESULT=PASS and the two distinct
+#      "nothing to run" verdicts: an empty diff on a clean tree ("nothing to
+#      test") and a diff confined to known no-gate prose (GATE_RESULT=NOOP).
+#      Neither of those two means bucket `full` was resolved; see exit 3.
+#   1  ran a bucket, including a --full-forced full suite, and it FAILED
+#      (GATE_RESULT=FAIL).
+#   2  usage or internal error: an unknown flag, a dirty tree contradicting
+#      an empty diff, or a bucket naming a stale/missing script or step.
+#   3  the diff resolved to bucket `full` but --full was NOT passed, so
+#      NOTHING RAN (GATE_RESULT=FULL_REQUIRED). Not a pass, not a fail — the
+#      printed BUCKET/REASON say why. Run `scripts/gate.sh --full` or
+#      `./make test` directly (18-18.5 min) to verify it; this repo's own
+#      contributors normally leave that run batched once per push for
+#      whoever integrates, but that is a convention, not this script's
+#      answer for someone with no integrator to hand it to.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
 # tests/cases/, examples/, stdlib/, or docs/**/*.md runs only that area's
@@ -438,6 +466,34 @@ if [ "${BUCKET}" = "noop" ]; then
   echo "gate: no gate covers these path(s) — nothing to run"
   echo "GATE_RESULT=NOOP"
   exit 0
+fi
+
+# `full` is a VERDICT by default, not an action (#2872). Resolving to `full`
+# used to execute the 18-18.5 minute `./make test` immediately — the one
+# thing CLAUDE.md's verify-loop rule reserves for the integrator's single run
+# before `git push`. A ticket subagent told to "run scripts/gate.sh" had no
+# way to learn which bucket this diff needs without also triggering that
+# run. So: print BUCKET and REASON exactly as already computed above, run
+# nothing, and exit with a code distinct from every other outcome — NOOP
+# above also runs nothing, but because no gate exists for the changed paths,
+# not because the suite was too broad to scope here; PASS/FAIL both mean a
+# bucket actually ran. --full bypasses this and remains the only way this
+# script itself executes the full suite.
+#
+# THE MESSAGE MUST NAME AN ACTION, not just a person (#2872 follow-up).
+# CONTRIBUTING.md sends every outside contributor here, and an outside
+# contributor has no integrator to hand a "this belongs to the integrator"
+# refusal to — they are the only one who will ever run this diff through
+# anything. So the printed text leads with the two commands that actually
+# verify it (`--full` or `./make test` directly) and states the batched
+# pre-push convention as context for THIS repo's own workflow, not as the
+# instruction.
+if [ "${BUCKET}" = "full" ] && [ "${FULL}" -eq 0 ]; then
+  echo "gate: bucket: full (${REASON})"
+  echo "gate: nothing ran — this diff is too broad to scope here. To verify it yourself, run 'scripts/gate.sh --full' or './make test' directly (18-18.5 min)."
+  echo "gate: in this repo's own workflow that run is batched once per push by whoever integrates — that is a convention, not a substitute for verifying your own change."
+  echo "GATE_RESULT=FULL_REQUIRED"
+  exit 3
 fi
 
 # BUILD_STEPS is always a non-empty literal array, assigned per bucket below —
