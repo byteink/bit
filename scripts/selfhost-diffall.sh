@@ -101,11 +101,11 @@ MIN=${DIFFALL_MIN:-15}
 # diffexamples builds 44 examples twice, so the honest ceiling is minutes.
 TIMEOUT=${DIFFALL_TIMEOUT:-3600}
 ABSENT_SET=${DIFFALL_ABSENT:-scripts/selfhost-diffall.absent}
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping. What a green run asserts changed with it: "unchanged versus the
-# last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
+# than skipping. A green run proves no behaviour change versus the last
+# release; it cannot catch a bug present in both — docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 

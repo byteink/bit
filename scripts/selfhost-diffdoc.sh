@@ -8,18 +8,18 @@
 #
 # ## What is being compared
 #
-# `bit-seed doc <dir>` output vs `bit doc <dir>` output, in BOTH forms — the plain
+# The pinned stage0's `doc <dir>` output vs `bit doc <dir>` output, in BOTH forms — the plain
 # "<kind> <name> <type>" listing and the `--json` array. The unit is a module
 # DIRECTORY, not a `.bit` file: `bit doc` documents a whole module (its files are
 # concatenated), and a lone-file root has no doc form (SPEC §17.1). So the corpus
 # is `stdlib/*/`, `examples/*/` and `tests/imports/*/`, not a `-name '*.bit'` glob.
 #
-# ## The seed is the oracle
+# ## Scope: only what the oracle can document
 #
-# A directory the seed cannot `doc` (an internal helper dir that is not a module,
-# or a module that does not compile) is out of scope and SKIPPED — exactly as
-# difftypes skips files the seed's checker rejects. Only the two compilers
-# disagreeing on a module the seed DID document is a finding.
+# A directory the oracle cannot `doc` (an internal helper dir that is not a
+# module, or a module that does not compile) is out of scope and SKIPPED —
+# exactly as difftypes skips files the oracle's checker rejects. Only the two
+# compilers disagreeing on a module the oracle DID document is a finding.
 #
 # ## Preconditions are hard failures, never a vacuous green (#1514)
 #
@@ -35,11 +35,11 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffdoc.sh
 set -uo pipefail
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping. What a green run asserts changed with it: "unchanged versus the
-# last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
+# than skipping. A green run proves no behaviour change versus the last
+# release; it cannot catch a bug present in both — docs/release/bootstrap.md §4/§5.
 ORACLE=${DIFFDOC_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and a
 # known-disagreeing doc surface. The verdict line names what was actually compared.
@@ -84,7 +84,7 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
 
   "$ORACLE" doc "$d" >"$work/seed.plain" 2>/dev/null
   seed_rc=$?
-  # The seed is the oracle: a directory it cannot document is out of scope.
+  # A directory the oracle cannot document is out of scope.
   if [ "$seed_rc" -ne 0 ]; then
     skip=$((skip + 1))
     continue

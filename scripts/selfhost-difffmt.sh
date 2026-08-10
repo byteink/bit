@@ -7,7 +7,7 @@
 #
 # ## What is being compared, and what is NOT
 #
-# seed-fmt output vs bit-fmt output. NOT fmt output vs the file on disk.
+# The pinned stage0's fmt output vs bit-fmt output. NOT fmt output vs the file on disk.
 # The formatter deliberately disagrees with most of the checked-in corpus
 # (it explodes hand-grouped crypto tables and mangles multi-line match bodies),
 # and the repo is deliberately NOT gated on `bit fmt` being a no-op: the
@@ -43,11 +43,11 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-difffmt.sh
 set -uo pipefail
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping. What a green run asserts changed with it: "unchanged versus the
-# last release", not "two implementations agree" — docs/release/bootstrap.md §4/§5.
+# than skipping. A green run proves no behaviour change versus the last
+# release; it cannot catch a bug present in both — docs/release/bootstrap.md §4/§5.
 ORACLE=${DIFFFMT_ORACLE:-$(sh scripts/stage0.sh)} || exit 2
 # Overridable so the script can be mutation-tested against a known-agreeing and
 # a known-disagreeing formatter. The verdict line always names what was actually
@@ -121,9 +121,9 @@ for f in $(find $CORPUS -name '*.bit' | sort); do
 
   "$ORACLE" fmt "$a/s.bit" >/dev/null 2>&1
   seed_rc=$?
-  # The seed is the oracle: a file it cannot format (the corpus deliberately
-  # holds unparseable `// error` cases) is out of scope, exactly as difftypes
-  # skips files the seed's checker rejects.
+  # A file the oracle cannot format (the corpus deliberately holds unparseable
+  # `// error` cases) is out of scope, exactly as difftypes skips files the
+  # oracle's checker rejects.
   if [ "$seed_rc" -ne 0 ]; then
     skip=$((skip + 1))
     continue

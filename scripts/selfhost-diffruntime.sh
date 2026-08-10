@@ -100,11 +100,11 @@
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
 
-# The oracle is the PINNED STAGE0 (previous release), like every other
-# differential since #1593. scripts/stage0.sh downloads and DIGEST-VERIFIES it
-# and refuses rather than skipping, so a failure here is loud. It also pins
-# BIT_STDLIB to the WORKING TREE for both sides — without that this would diff
-# two stdlibs instead of two compilers.
+# Oracle: the pinned stage0 (previous release), like every other differential
+# since #1593. scripts/stage0.sh downloads and DIGEST-VERIFIES it and refuses
+# rather than skipping, so a failure here is loud. It also pins BIT_STDLIB to
+# the WORKING TREE for both sides — without that this would diff two stdlibs
+# instead of two compilers.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 # The alarm is a HANG guard, not a performance budget (#2070). 20s sat below the

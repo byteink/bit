@@ -5,12 +5,12 @@
 # diffcheck runs the *existing corpus* through both compilers. A construct that
 # no corpus file happens to contain is invisible to it — and by construction the
 # corpus only contains constructs someone already thought to write down. #1470
-# (`let arr: [2]f32 = [4.5, 4.5]`: seed rejects, selfhost accepts and yields a
+# (`let arr: [2]f32 = [4.5, 4.5]`: the oracle rejects, selfhost accepts and yields a
 # wrong value) escaped every differential for exactly that reason, and surfaced
 # only when a human typed it by hand.
 #
 # The other differentials are structurally blind here, not merely unlucky:
-# difftypes/diffir/diffexamples all compare DUMPS, so when the seed refuses to
+# difftypes/diffir/diffexamples all compare DUMPS, so when the oracle refuses to
 # emit there is no pair to compare and the case scores SKIP, not MISMATCH.
 # A green board across all of them is not evidence about acceptance.
 #
@@ -23,10 +23,10 @@
 #
 # Four outcomes:
 #   MATCH    both accept, or both reject
-#   MISSING  seed rejects, selfhost accepts  — the #1470 shape. A hole in the
-#            selfhost checker, and the dangerous one: it admits a program the
-#            language does not define, which then miscompiles silently.
-#   FALSEPOS selfhost rejects, seed accepts  — selfhost refusing valid code.
+#   MISSING  the oracle rejects, selfhost accepts  — the #1470 shape. A hole in
+#            the selfhost checker, and the dangerous one: it admits a program
+#            the language does not define, which then miscompiles silently.
+#   FALSEPOS selfhost rejects, the oracle accepts  — selfhost refusing valid code.
 #   (Both are reported; either being non-zero fails the script.)
 #
 # This compares VERDICTS, not diagnostic text: diagnostic-text parity over the
@@ -38,7 +38,7 @@
 # A TIMEOUT IS NOT A VERDICT (#1538). `verdict()` used to fold an alarm kill into
 # "R", because it only read the truth of the `if` and never distinguished
 # "rejected" from "never finished". That fabricates the exact signal this script
-# exists to find: a timed-out SEED reads as seed=R bit=A, i.e. a MISSING — the
+# exists to find: a timed-out ORACLE reads as seed=R bit=A, i.e. a MISSING — the
 # #1470 shape — from a cell that was never actually decided. So a timeout is now
 # its own verdict "T", counted separately and `continue`d before classification.
 #
@@ -49,11 +49,11 @@
 #
 # Usage: ./make && bash scripts/selfhost-diffverdict.sh [-v]
 set -u
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping, so a failure here is loud. What a green run asserts changed with
-# it: "unchanged versus the last release", not "two implementations agree" —
+# than skipping, so a failure here is loud. A green run proves no behaviour
+# change versus the last release; it cannot catch a bug present in both —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
@@ -252,7 +252,7 @@ done
 
 # ---------------------------------------------------------------------------
 # CONVERSIONS (§12.9). Added for #1490: `string(x)` on an i64 was accepted by the
-# selfhost and SIGSEGV'd at runtime while the seed rejected it with E0053. This
+# selfhost and SIGSEGV'd at runtime while the oracle rejected it with E0053. This
 # whole family was absent from the matrix above — every cell there carries a
 # DECLARED slot type, and a conversion has none, so widening the type/expr
 # product could never have reached it. That is the same lesson the header

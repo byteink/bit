@@ -3,10 +3,10 @@
 # `check` and diff the rendered diagnostics.
 #
 # This is the guard the other differentials structurally cannot be. difftypes
-# SKIPs every file the seed rejects (202 of them — the entire invalid-program
-# corpus); diffdiags only covers lex+parse, because the seed's `--dump-diags` is
+# SKIPs every file the oracle rejects (202 of them — the entire invalid-program
+# corpus); diffdiags only covers lex+parse, because the oracle's `--dump-diags` is
 # front-end only; diffexamples only ever builds VALID programs. So a green board
-# across all three said nothing about whether bit2 REJECTS what the seed
+# across all three said nothing about whether bit2 REJECTS what the oracle
 # rejects — and for a long time it rejected nothing at all, silently compiling
 # `function f(): i32 { return "hi" }` into a binary that printed a raw pointer.
 #
@@ -22,31 +22,30 @@
 #            job is accept/reject fidelity (see above), not warning-text
 #            parity on valid programs — that is diffverdict's explicit
 #            non-goal for the reject side, applied here to the accept side.
-#   MISSING  the seed rejects, bit2 accepts    — a gap: an emit site not ported
-#            yet. Expected to shrink; harmless (the seed is still the gate).
-#   FALSEPOS bit2 rejects, the seed accepts    — a BUG, and the dangerous one:
+#   MISSING  the oracle rejects, bit2 accepts    — a gap: an emit site not ported
+#            yet. Expected to shrink; harmless (the oracle is still the gate).
+#   FALSEPOS bit2 rejects, the oracle accepts    — a BUG, and the dangerous one:
 #            bit2 refusing valid code breaks builds. Must stay 0.
 #   DIFF     both reject, different text        — usually a cascade: bit2 report
 #            a downstream error because the root site is not ported.
 #
 # Diagnostics go to stderr (both compilers), so stdout is discarded.
 #
-# PATH NORMALIZATION: the seed's file-check CLI absolutizes the display path (it
+# PATH NORMALIZATION: the oracle's file-check CLI absolutizes the display path (it
 # routes a lone file through `checkHostProject(absFromCwd(dirname), basename)`,
 # introduced when a lone .bit file became a module in 83b511f), so it renders
 # `--> /abs/repo/stdlib/x.bit`. bit2 renders the path AS GIVEN — `--> stdlib/x.bit`
 # — which is what gcc, clang and rustc all do, and what the `.expected` goldens encode,
-# so bit2 is the correct one. Rather than do loader surgery on the about-to-retire
-# seed, strip the repo-root prefix from the seed's output before comparing: the
-# diff then reflects only REAL diagnostic differences, and this script retires
-# with the seed. Verified exact (stripping the prefix collapsed all 44 path-diffs
-# to MATCH, 0 real).
+# so bit2 is the correct one. Rather than do loader surgery on the retired seed
+# compiler, strip the repo-root prefix from the oracle's output before comparing: the
+# diff then reflects only REAL diagnostic differences. Verified exact (stripping the
+# prefix collapsed all 44 path-diffs to MATCH, 0 real).
 #
 # A TIMEOUT IS NOT AN OUTCOME (#1538). The alarm-guarded run's exit status used
 # to be discarded, so a killed `bit` yielded an empty output that was then
 # classified by CONTENT — the classic shape of #1512/#1513/#1514/#1524/#1525.
 # Both directions were wrong, and both landed in numbers this workstream steers
-# by: a non-empty seed side scored MISSING (false red straight into the tracked
+# by: a non-empty oracle side scored MISSING (false red straight into the tracked
 # MISSING 24 -> 7 -> 4 metric), and the common case of a file with no
 # diagnostics scored `"" = ""` -> MATCH (silent false green: never compared).
 # Now a timeout gets its own counter and `continue`s BEFORE any comparison, so
@@ -55,16 +54,16 @@
 #
 # Exit codes (matching x64gate.sh / selfhost-diffsafepoints.sh / 3977211):
 #   0  every file compared, no false positive
-#   1  real failure: a FALSEPOS (bit rejects code the seed accepts)
+#   1  real failure: a FALSEPOS (bit rejects code the oracle accepts)
 #   2  could not decide: a file timed out and was never compared. Not a pass.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffcheck.sh
 set -u
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping, so a failure here is loud. What a green run asserts changed with
-# it: "unchanged versus the last release", not "two implementations agree" —
+# than skipping, so a failure here is loud. A green run proves no behaviour
+# change versus the last release; it cannot catch a bug present in both —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
@@ -108,7 +107,7 @@ run() {
 
 match=0 missing=0 falsepos=0 diff=0 timeout=0 firstfp="" firstdiff="" firsthang=""
 for f in $(find stdlib examples tests/cases tests/imports -name '*.bit' | sort); do
-  # BOTH sides are alarm-guarded and BOTH statuses are captured. The seed side
+  # BOTH sides are alarm-guarded and BOTH statuses are captured. The oracle side
   # had no bound at all, so a hung ORACLE wedged the whole gate indefinitely.
   seed=$(run "$ORACLE" check "$f"); src=$?
   b2=$(run "$BIT2" check "$f"); brc=$?

@@ -9,18 +9,55 @@
 #
 # BOTH sides of every comparison are now alarm-guarded (perl `alarm`, the same
 # mechanism the three already-guarded siblings used) — see
-# selfhost-diffcheck.sh's header for why that guard exists: "the seed side had
+# selfhost-diffcheck.sh's header for why that guard exists: "the oracle side had
 # no bound at all, so a hung ORACLE wedged the whole gate indefinitely."
 #
-# THE COMMENTS BELOW ARE CARRIED OVER VERBATIM FROM THE SIX FILES THIS
-# REPLACES, one block per original file, unedited — including the "two
-# independent implementations" framing in the `tokens` block below, which is
-# no longer accurate now that the oracle is the pinned stage0 rather than a
-# second implementation (#2600 owns fixing that prose across the family; this
-# ticket is a pure code consolidation and does not touch it).
+# THE COMMENTS BELOW ARE CARRIED OVER FROM THE SIX FILES THIS REPLACES, one
+# block per original file — except the `tokens` block's old two-compilers-
+# in-different-languages framing, corrected by #2600 across the family: the
+# oracle is the pinned stage0 (an earlier release of this same compiler), not
+# a second implementation written in something else.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffdump.sh <name>
 #   name: ast | tokens | diags | types | ir | iropt
+#
+# --- Reading a red types/ir/iropt run: outpaced oracle vs. real regression (#2382) ---
+#
+# All three of these compare against the PINNED STAGE0 -- a fixed earlier
+# release -- so any inference or lowering improvement that has landed since that
+# release IS a difference by construction. A mismatch here is not automatically a
+# divergence: it can be the fix working, with the oracle still on the buggy side.
+#
+# What to do about it while landing a fix, in the window before the next repin
+# (when nothing an author does makes this gate green): land the fix WITH its
+# golden case, and record on the fix's own ticket that types/ir/iropt are
+# expected red until stage0 repins past it. Do not delete the case, and do not
+# try to keep the exercising program out of the swept corpus -- #2280's two
+# lint_deferloop_* files are pre-existing corpus entries whose IR a legitimate
+# lowering fix changed, which is proof there is no such workaround even in
+# principle: the corpus holds a program for every construct on purpose.
+#
+# A stage0 repin (docs/release/bootstrap.md §4/§5) is what actually clears it --
+# not a code change to these scripts. Once the pin moves to a release cut from a
+# tree containing the fix, oracle and tree agree again and MISMATCH drops back on
+# its own. A mismatch that SURVIVES a repin is a real regression, not an oracle
+# lagging the tree, and should be treated like any other red gate.
+#
+# Telling the two apart before that repin lands: check that MATCH went UP, not
+# only that MISMATCH is the number you expected. A repin can make a broken
+# harness agree for the wrong reason -- both sides silently failing to parse the
+# same input reads identically to a real fix. This nearly happened on
+# selfhost-diffverdict.sh: its synthesized test source was still emitting the
+# `function` keyword #2773 had removed, so runs were scoring on rejected input
+# until #2846/#2848/#2850 fixed the emission sites.
+#
+# Why route 1 (repin) over the alternatives: a scoped expected-mismatch list was
+# tried and deleted for exactly this class of problem (#1883, "nothing is
+# permitted to differ now" above) -- re-admitting one bets against that history.
+# Making --dump-ir-pre refuse what `build` refuses only fixes the
+# signature-only-stub sub-case, not a file where both compilers lower and
+# legitimately disagree because one of them is right, and it would be a compiler
+# change made to serve a test harness rather than the other way round.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -50,10 +87,10 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 #
 # THE ORACLE CHANGED IN #1593, AND SO DID WHAT A GREEN RUN MEANS. It used to be
 # `bit-out/bin/bit-seed`, a compiler written in a different language, so green
-# meant "two independent implementations agree". It is now the last release of
-# this same compiler, so green means "this version did not change behaviour
-# versus the last release". See docs/release/bootstrap.md §4/§5 — the loss is
-# recorded there, not papered over.
+# meant two separately-written implementations agreed. It is now the last
+# release of this same compiler, so green means "this version did not change
+# behaviour versus the last release". See docs/release/bootstrap.md §4/§5 —
+# the loss is recorded there, not papered over.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-difftokens.sh
 # Exits non-zero (printing the first divergence) on any mismatch.
@@ -64,7 +101,7 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # only — resolve/check is Stage 2 and not yet ported) and diff. They must be
 # byte-identical: empty for a clean file, and the same rendered diagnostic for a
 # lex/parse error. Unlike difftokens/diffast this skips nothing — a valid file
-# produces empty output from both, and the seed's --dump-diags is frontend-only
+# produces empty output from both, and the oracle's --dump-diags is frontend-only
 # so checker `// error` cases are empty on both sides too.
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffdiags.sh
@@ -73,7 +110,7 @@ NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 # --- from scripts/selfhost-difftypes.sh ---
 # Self-host type differential (#1337/#364): run every corpus `.bit` through both
 # compilers' `--dump-types` (the binding/param/call type dump) and diff. Files
-# the seed rejects at check time are skipped (bit2's checker is still partial).
+# the oracle rejects at check time are skipped (bit2's checker is still partial).
 # This tracks Stage-2 inference coverage: MATCH grows as more constructs are
 # ported; a byte diff pins the exact expression whose inferred type differs.
 #
@@ -182,11 +219,11 @@ case "$NAME" in
 esac
 PREFIX="diff${NAME}"
 
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping, so a failure here is loud. What a green run asserts changed with
-# it: "unchanged versus the last release", not "two implementations agree" —
+# than skipping, so a failure here is loud. A green run proves no behaviour
+# change versus the last release; it cannot catch a bug present in both —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh "${ROOT}/scripts/stage0.sh")" || exit 2
 BIT2="${ROOT}/bit-out/bin/bit"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Self-host SAFEPOINT differential (#1440): compare the number of STATIC
-# `bit_rt_safepoint` call sites the seed and the self-hosted compiler emit for
+# `bit_rt_safepoint` call sites the oracle and the self-hosted compiler emit for
 # the same source.
 #
 # WHY THIS EXISTS. Every other selfhost-diff* gate compares diagnostics
@@ -20,11 +20,11 @@
 # neither is acceptable, so this compares for equality.
 set -u
 
-# The oracle is the PINNED STAGE0: the previous release, i.e. an EARLIER VERSION
-# OF THIS SAME COMPILER — which is exactly what limits the claim below.
+# Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
+# VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
-# than skipping, so a failure here is loud. What a green run asserts changed with
-# it: "unchanged versus the last release", not "two implementations agree" —
+# than skipping, so a failure here is loud. A green run proves no behaviour
+# change versus the last release; it cannot catch a bug present in both —
 # docs/release/bootstrap.md §4/§5.
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
@@ -104,7 +104,7 @@ echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not buil
 # optimized dumps. When #1448's agent mutation-tested its own fix, dropping
 # `optimizeModule` from `buildObjCmd` was CAUGHT at MISMATCH=81 exactly —
 # but dropping it from `writeModuleExe` SURVIVED every gate in the tree, while
-# the executable it produced ran 150 collections against the seed's 100.
+# the executable it produced ran 150 collections against the oracle's 100.
 #
 # WHY NOT COMPARE OUTPUT. That M2 mutant prints the RIGHT answer. It differs
 # only in how much collector work it does, so a stdout differential is blind to
