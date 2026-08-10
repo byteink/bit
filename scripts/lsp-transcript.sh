@@ -23,15 +23,40 @@ fi
 export BIT_STDLIB="$ROOT/stdlib"
 
 python3 - "$BIT" <<'PY'
-import json, os, subprocess, sys, tempfile
+import json, os, subprocess, sys, tempfile, time
 
 BIT = sys.argv[1]
 fails = 0
 
+# A private id space for the harness's own synchronization probes, well clear
+# of every id a scenario below writes (1, 2, 99, ...).
+_sync_seq = [1_000_000]
+
+def _next_sync_id():
+    _sync_seq[0] += 1
+    return _sync_seq[0]
+
 def run_session(files, messages):
-    """Write `files` (name->text) into a temp dir, pipe `messages` (list of
-    JSON-RPC dicts) framed into `bit lsp`, return the list of decoded reply
-    bodies. `{DIR}`/`{URI:name}` placeholders in messages are filled per dir."""
+    """Write `files` (name->text) into a temp dir, then deliver `messages`
+    (list of JSON-RPC dicts) to `bit lsp` ONE AT A TIME over its stdin,
+    confirming each is fully settled before sending the next, and return the
+    list of decoded reply bodies observed along the way, in the order the
+    server wrote them. `{DIR}`/`{URI:name}` placeholders in messages are
+    filled per dir.
+
+    #2852: a bulk write (the old `subprocess.run(input=payload)`) lands the
+    whole burst in one OS read, so `lspRun`'s post-handle flush check
+    (compiler/lspserver.bit:590,604 -- the #2201 coalescing gate, which only
+    republishes once its input buffer has drained to empty) fires once for
+    the entire burst instead of once per intended edit. Delivering messages
+    one at a time isn't enough on its own either: separate write() calls to a
+    pipe can still land in the same read() if the writer outruns the reader,
+    which is exactly what a fast Python loop does against a starting `bit
+    lsp`. The fix is synchronization, not spacing: `sync()`+`settle()` below
+    hold off writing message N+1 until message N's turn -- read, handle, and
+    (for a notification-carrying turn) any resulting flush -- has
+    provably finished, using request/response round trips already offered by
+    the protocol rather than a sleep."""
     d = tempfile.mkdtemp(prefix="bitls_")
     for name, text in files.items():
         with open(os.path.join(d, name), "w") as f:
@@ -50,23 +75,87 @@ def run_session(files, messages):
             return [fill(v) for v in obj]
         return obj
 
-    payload = b""
-    for m in messages:
-        body = json.dumps(fill(m)).encode()
-        payload += b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+    # A plain file, not PIPE: Popen leaves `.stderr` None for a non-PIPE
+    # target, so the handle to read back on failure has to be kept here.
+    stderr_f = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        [BIT, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=stderr_f)
+    bodies = []
+    buf = b""
+    deadline = time.monotonic() + 60
 
-    proc = subprocess.run([BIT, "lsp"], input=payload, capture_output=True, timeout=60)
-    out = proc.stdout
-    bodies, i = [], 0
-    while True:
-        hdr = out.find(b"\r\n\r\n", i)
-        if hdr < 0:
-            break
-        header = out[i:hdr].decode()
-        n = int(header.split("Content-Length:")[1].split("\r")[0].strip())
-        start = hdr + 4
-        bodies.append(out[start:start+n].decode())
-        i = start + n
+    def write(obj):
+        body = json.dumps(fill(obj)).encode()
+        proc.stdin.write(b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        proc.stdin.flush()
+
+    def fail(msg):
+        proc.kill()
+        proc.wait()
+        stderr_f.seek(0)
+        err = stderr_f.read().decode(errors="replace")
+        stderr_f.close()
+        raise RuntimeError(f"{msg}\n--- bit lsp stderr ---\n{err}")
+
+    def next_frame():
+        nonlocal buf
+        while True:
+            hdr = buf.find(b"\r\n\r\n")
+            if hdr >= 0:
+                cl = None
+                for line in buf[:hdr].decode(errors="replace").split("\r\n"):
+                    if line.lower().startswith("content-length:"):
+                        cl = int(line.split(":", 1)[1].strip())
+                if cl is not None and len(buf) >= hdr + 4 + cl:
+                    frame = buf[hdr + 4:hdr + 4 + cl].decode()
+                    buf = buf[hdr + 4 + cl:]
+                    return frame
+            if time.monotonic() > deadline:
+                fail("lsp-transcript: bit lsp timed out mid-session")
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                fail("lsp-transcript: bit lsp closed stdout mid-session")
+            buf += chunk
+
+    def sync(expect_id):
+        """Read frames, recording each, until the reply to `expect_id`."""
+        while True:
+            frame = next_frame()
+            bodies.append(frame)
+            if json.loads(frame).get("id") == expect_id:
+                return
+
+    def settle():
+        """A second round trip after the message's own. `lspRun`'s
+        post-handle flush check (len(r.buf) == 0) runs synchronously, still
+        inside the same loop turn, strictly before the loop reads again -- so
+        a reply to THIS probe can only exist once that check (and the flush
+        it may have triggered) has already run and been written: the process
+        cannot reach this probe's read without first finishing the prior
+        turn's. That is a program-order guarantee, not a timing one -- no
+        sleep, no fixed delay, and it holds regardless of how the OS happened
+        to chunk the reads."""
+        probe = _next_sync_id()
+        write({"jsonrpc": "2.0", "id": probe, "method": "$/sync", "params": {}})
+        sync(probe)
+
+    for m in messages:
+        write(m)
+        mid = m.get("id")
+        if mid is None:
+            mid = _next_sync_id()
+            write({"jsonrpc": "2.0", "id": mid, "method": "$/sync", "params": {}})
+        sync(mid)
+        settle()
+
+    proc.stdin.close()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    stderr_f.close()
     return bodies
 
 def check(name, cond, detail=""):
