@@ -142,28 +142,28 @@ EXPRS='1 4.5 true "s" [1,2] [4.5,4.5] [1,2,3]'
 for t in $TYPES; do
   for e in $EXPRS; do
     cell "let x: $t = $e" \
-"function main() {
+"fn main() {
   let x: $t = $e
   print(\"ok\")
 }"
     cell "var x: $t; x = $e" \
-"function main() {
+"fn main() {
   var x: $t
   x = $e
   print(\"ok\")
 }"
-    cell "function f(): $t { return $e }" \
-"function f(): $t {
+    cell "fn f(): $t { return $e }" \
+"fn f(): $t {
   return $e
 }
-function main() {
+fn main() {
   print(\"ok\")
 }"
     cell "f(p: $t) called with $e" \
-"function f(p: $t) {
+"fn f(p: $t) {
   print(\"ok\")
 }
-function main() {
+fn main() {
   f($e)
 }"
   done
@@ -186,37 +186,37 @@ for e in $EXPRS; do
 "struct S {
   v: f32,
 }
-function main() {
+fn main() {
   let s = S{ v: $e }
   print(\"ok\")
 }"
   cell "map value map<string,f32> = $e" \
-"function main() {
+"fn main() {
   let m = map<string, f32>{\"k\": $e}
   print(\"ok\")
 }"
   cell "map key map<i32,i32> = $e" \
-"function main() {
+"fn main() {
   let m = map<i32, i32>{$e: 1}
   print(\"ok\")
 }"
   cell "typed slice []f32{$e}" \
-"function main() {
+"fn main() {
   let s = []f32{$e}
   print(\"ok\")
 }"
   cell "module const c: f32 = $e" \
 "const c: f32 = $e
-function main() {
+fn main() {
   print(\"ok\")
 }"
   cell "module let g: f32 = $e" \
 "let g: f32 = $e
-function main() {
+fn main() {
   print(\"ok\")
 }"
   cell "chan send chan<f32> <- $e" \
-"function main() {
+"fn main() {
   let c = chan<f32>(1)
   c <- $e
   print(\"ok\")
@@ -231,7 +231,7 @@ done
 for decl in '[1]i32' '[2]i32' '[3]i32' '[4]i32'; do
   for lit in '[1]' '[1,2]' '[1,2,3]'; do
     cell "let a: $decl = $lit  (length)" \
-"function main() {
+"fn main() {
   let a: $decl = $lit
   print(\"ok\")
 }"
@@ -243,7 +243,7 @@ done
 for n_ in 1 2 3; do
   for lit in '4.5' '4.5, 4.5' '4.5, 4.5, 4.5'; do
     cell "let a: [$n_]f32 = [$n_]f32{$lit}" \
-"function main() {
+"fn main() {
   let a: [$n_]f32 = [$n_]f32{$lit}
   print(\"ok\")
 }"
@@ -278,7 +278,7 @@ for tgt in $CONV_TARGETS; do
   for src in $CONV_SOURCES; do
     init=$(conv_init "$src")
     cell "$tgt(x) where x: $src" \
-"function main() {
+"fn main() {
   let x: $src = $init
   let y = $tgt(x)
   print(\"ok\")
@@ -286,7 +286,7 @@ for tgt in $CONV_TARGETS; do
   done
   # `string([]u8)` is a conversion; every other target must reject a slice.
   cell "$tgt(x) where x: []u8" \
-"function main() {
+"fn main() {
   let x: []u8 = []byte(\"s\")
   let y = $tgt(x)
   print(\"ok\")
@@ -295,7 +295,7 @@ for tgt in $CONV_TARGETS; do
   # the concrete locals above, so they are their own row rather than a repeat.
   for lit in '1' '4.5' 'true' '"s"'; do
     cell "$tgt($lit)  (untyped literal)" \
-"function main() {
+"fn main() {
   let y = $tgt($lit)
   print(\"ok\")
 }"

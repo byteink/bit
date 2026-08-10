@@ -53,7 +53,7 @@ trap 'rm -rf "$tmp"' EXIT
 # and every case "matches". A loop-bearing program MUST report at least one
 # safepoint under both compilers, or this harness is measuring nothing.
 cat > "$tmp/selftest.bit" <<'EOF'
-function main() {
+fn main() {
   let n = 0
   let i = 0
   while (i < 10) {
@@ -70,6 +70,7 @@ if [ "$st_seed" = "x" ] || [ "$st_self" = "x" ] || [ "$st_seed" -lt 1 ] || [ "$s
   echo "       The counter is broken; a green run would be vacuous." >&2
   exit 2
 fi
+echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 
 # --- the differential ---------------------------------------------------------
 match=0 mismatch=0 skip=0
@@ -138,7 +139,7 @@ exe_stdout() { # $1=binary -> its stdout, or "x" if it did not exit 0
 # an if/else inside a loop is the exact construct of #1440.
 mkdir -p "$tmp/exe"
 cat > "$tmp/exe/ifelse_in_loop.bit" <<'EOF'
-function main() {
+fn main() {
   let n = 0
   let i = 0
   while (i < 50) {
@@ -149,7 +150,7 @@ function main() {
 }
 EOF
 cat > "$tmp/exe/nested_loops.bit" <<'EOF'
-function main() {
+fn main() {
   let n = 0
   let i = 0
   while (i < 12) {
@@ -164,7 +165,7 @@ function main() {
 }
 EOF
 cat > "$tmp/exe/forof_loop.bit" <<'EOF'
-function main() {
+fn main() {
   let xs = [1, 2, 3, 4, 5, 6, 7, 8]
   let n = 0
   for x of xs {
@@ -174,7 +175,7 @@ function main() {
 }
 EOF
 cat > "$tmp/exe/switch_in_loop.bit" <<'EOF'
-function main() {
+fn main() {
   let n = 0
   let i = 0
   while (i < 30) {
@@ -189,7 +190,7 @@ function main() {
 }
 EOF
 cat > "$tmp/exe/loop_with_call.bit" <<'EOF'
-function step(x: i64): i64 {
+fn step(x: i64): i64 {
   let r = 0
   let k = 0
   while (k < 3) {
@@ -198,7 +199,7 @@ function step(x: i64): i64 {
   }
   return r
 }
-function main() {
+fn main() {
   let n = 0
   let i = 0
   while (i < 20) {
@@ -224,6 +225,7 @@ if [ "$sc_seed" -lt 1 ] || [ "$sc_self" -lt 1 ]; then
   echo "       The runtime counter is not measuring anything; a green run would be vacuous." >&2
   exit 2
 fi
+echo "self-test: plain-loop collection count under BIT_GC=stress — seed=$sc_seed self=$sc_self"
 
 exe_match=0 exe_mismatch=0 exe_skip=0
 for f in "$tmp"/exe/*.bit; do
