@@ -31,15 +31,17 @@
 #
 # Diagnostics go to stderr (both compilers), so stdout is discarded.
 #
-# PATH NORMALIZATION: the oracle's file-check CLI absolutizes the display path (it
-# routes a lone file through `checkHostProject(absFromCwd(dirname), basename)`,
-# introduced when a lone .bit file became a module in 83b511f), so it renders
-# `--> /abs/repo/stdlib/x.bit`. bit2 renders the path AS GIVEN — `--> stdlib/x.bit`
-# — which is what gcc, clang and rustc all do, and what the `.expected` goldens encode,
-# so bit2 is the correct one. Rather than do loader surgery on the retired seed
-# compiler, strip the repo-root prefix from the oracle's output before comparing: the
-# diff then reflects only REAL diagnostic differences. Verified exact (stripping the
-# prefix collapsed all 44 path-diffs to MATCH, 0 real).
+# PATH NORMALIZATION (historical): the oracle's file-check CLI absolutizes the
+# display path (it routes a lone file through
+# `checkHostProject(absFromCwd(dirname), basename)`, introduced when a lone
+# .bit file became a module in 83b511f), so it used to render
+# `--> /abs/repo/stdlib/x.bit` where bit2 rendered the path AS GIVEN —
+# `--> stdlib/x.bit` — which is what gcc, clang and rustc all do, and what the
+# `.expected` goldens encode. That mismatch was once papered over by stripping
+# the repo-root prefix from the oracle's output before comparing (44 path-diffs
+# at the time, all cosmetic). See the #1893 block below: that filter is gone,
+# superseded by pinning BIT_STDLIB identically for both sides, and the script
+# now has no path filter of any kind.
 #
 # A TIMEOUT IS NOT AN OUTCOME (#1538). The alarm-guarded run's exit status used
 # to be discarded, so a killed `bit` yielded an empty output that was then
