@@ -28,9 +28,12 @@
 # ## The family is DISCOVERED, not listed
 #
 # `scripts/selfhost-*.sh`, minus `*-x64.sh` (the cross-arch variants belong to
-# x64gate.sh and need an emulator). A hardcoded list goes stale the day someone
-# adds the fifteenth differential, and a stale list is exactly the failure this
-# script exists to end.
+# x64gate.sh and need an emulator) and minus `selfhost-diffdump.sh` (the shared
+# table-driven driver behind six of the wrappers below, not itself a
+# differential -- it takes a required mode argument and exits 1 on a bare
+# usage error that used to be tallied as a real divergence, #2847). A
+# hardcoded list goes stale the day someone adds the fifteenth differential,
+# and a stale list is exactly the failure this script exists to end.
 #
 # But a glob that matches nothing must NEVER read as success -- that is the
 # #1514 shape (fuzzdiff once scored 6642 MATCH with no compiler on disk). So
@@ -125,6 +128,12 @@ for s in "$DIR"/selfhost-*.sh; do
   case "$s" in
     *-x64.sh) continue ;;          # cross-arch variant; x64gate.sh owns it
     */selfhost-diffall.sh) continue ;;  # never recurse into itself
+    */selfhost-diffdump.sh) continue ;;  # shared driver behind diffast/difftokens/
+                                          # diffdiags/difftypes/diffir/diffiropt
+                                          # (#2743); takes a REQUIRED mode selector,
+                                          # so invoking it bare is a usage error, not
+                                          # a differential -- the six wrappers already
+                                          # cover its six modes (#2847)
   esac
   [ -f "$s" ] || continue
   scripts+=("$s")
