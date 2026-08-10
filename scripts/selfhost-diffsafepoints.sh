@@ -18,7 +18,15 @@
 # lockstep), and a MISSING one is not — a loop that reaches no safepoint starves
 # the collector (ABI.md §5). Either direction is a real codegen divergence and
 # neither is acceptable, so this compares for equality.
+#
+# Both build invocations that feed sites()/exe_collections() are alarm-guarded
+# (#2866): neither had a bound before, so a hung ORACLE or BIT2 `build` wedged
+# this script indefinitely — the same shape selfhost-diffcheck.sh's header
+# warns about ("the seed side had no bound at all, so a hung ORACLE wedged the
+# whole gate indefinitely").
 set -u
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
 
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
@@ -29,6 +37,13 @@ set -u
 ORACLE="$(sh scripts/stage0.sh)" || exit 2
 BIT2=bit-out/bin/bit
 
+# 20s matches this family's single-call convention (diffdump.sh/diffcheck.sh/
+# diffverdict.sh/diffdoc.sh); DIFFSAFEPOINTS_TIMEOUT overrides for a slower
+# host. Do not go below ~12s on a shared box: #2863's mutation run at a 3s
+# bound produced 11 false timeouts from ordinary machine load, redone at
+# 12-20s.
+TIMEOUT=${DIFFSAFEPOINTS_TIMEOUT:-20}
+
 # --- preconditions, loud ------------------------------------------------------
 # A missing tool must ABORT, never silently score every case as "match". Four
 # mutation harnesses in this repo have already no-opped exactly that way.
@@ -38,9 +53,17 @@ command -v objdump >/dev/null 2>&1 || {
 }
 [ -x "$ORACLE" ] && [ -x "$BIT2" ] || { echo "FATAL: build both compilers first (./make)" >&2; exit 2; }
 
-sites() { # $1=compiler $2=source $3=objfile -> static bit_rt_safepoint call sites, or "x" if it did not build
+sites() { # $1=compiler $2=source $3=objfile -> safepoint count, "x" (did not build), "TIMEOUT" (build hung)
+  local rc side
   rm -f "$3"
-  "$1" build "$2" --emit-obj -o "$3" >/dev/null 2>&1
+  alarmrun "$1" build "$2" --emit-obj -o "$3" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+    echo "$side timed out after ${TIMEOUT}s building: $2" >&2
+    echo TIMEOUT
+    return
+  fi
   [ -f "$3" ] || { echo x; return; }
   objdump -r "$3" 2>/dev/null | grep -c bit_rt_safepoint
 }
@@ -65,6 +88,10 @@ fn main() {
 EOF
 st_seed=$(sites "$ORACLE" "$tmp/selftest.bit" "$tmp/st_seed.o")
 st_self=$(sites "$BIT2" "$tmp/selftest.bit" "$tmp/st_self.o")
+if [ "$st_seed" = "TIMEOUT" ] || [ "$st_self" = "TIMEOUT" ]; then
+  echo "FATAL: self-test build timed out (seed=$st_seed self=$st_self) — the harness cannot proceed." >&2
+  exit 2
+fi
 if [ "$st_seed" = "x" ] || [ "$st_self" = "x" ] || [ "$st_seed" -lt 1 ] || [ "$st_self" -lt 1 ]; then
   echo "FATAL: self-test found no safepoint in a plain loop (seed=$st_seed self=$st_self)." >&2
   echo "       The counter is broken; a green run would be vacuous." >&2
@@ -73,11 +100,23 @@ fi
 echo "self-test: plain-loop safepoint count — seed=$st_seed self=$st_self"
 
 # --- the differential ---------------------------------------------------------
-match=0 mismatch=0 skip=0
+# A timeout is not evidence, the same reasoning selfhost-diffdump.sh's header
+# carries for its own ORACLE/BIT2 timeouts: a build killed by the alarm
+# produced no verdict, so it is its own counter, not folded into SKIP (which
+# means "declined to build") or MISMATCH (which means "built and disagreed").
+match=0 mismatch=0 skip=0 timeout=0
 for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); do
   s=$(sites "$ORACLE" "$f" "$tmp/a.o")
+  if [ "$s" = "TIMEOUT" ]; then
+    timeout=$((timeout + 1))
+    continue
+  fi
   [ "$s" = "x" ] && { skip=$((skip + 1)); continue; }
   b=$(sites "$BIT2" "$f" "$tmp/b.o")
+  if [ "$b" = "TIMEOUT" ]; then
+    timeout=$((timeout + 1))
+    continue
+  fi
   [ "$b" = "x" ] && { skip=$((skip + 1)); continue; }
   if [ "$s" = "$b" ]; then
     match=$((match + 1))
@@ -87,7 +126,7 @@ for f in $(find stdlib examples tests/cases tests/stress -name '*.bit' | sort); 
   fi
 done
 
-echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not build alone)=$skip"
+echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not build alone)=$skip TIMEOUT=$timeout"
 
 # =============================================================================
 # PHASE 2 — the LINKED EXECUTABLE path (#1461)
@@ -118,9 +157,17 @@ echo "safepoint differential: MATCH=$match MISMATCH=$mismatch SKIP(does not buil
 # Counts must be equal: an extra safepoint is legal but wasteful, a missing one
 # starves the collector (ABI.md §5), and either is a real codegen divergence.
 
-exe_collections() { # $1=compiler $2=source $3=outbin -> collection count, or "x"
+exe_collections() { # $1=compiler $2=source $3=outbin -> collection count, "x" (did not build/link), "TIMEOUT" (build hung)
+  local rc side
   rm -f "$3"
-  "$1" build "$2" -o "$3" >/dev/null 2>&1
+  alarmrun "$1" build "$2" -o "$3" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 142 ]; then
+    [ "$1" = "$ORACLE" ] && side=ORACLE || side=BIT2
+    echo "$side timed out after ${TIMEOUT}s building: $2" >&2
+    echo TIMEOUT
+    return
+  fi
   [ -x "$3" ] || { echo x; return; }
   BIT_GC=stress BIT_GC_STATS=on "$3" 2>&1 >/dev/null | grep -c gc
 }
@@ -216,6 +263,10 @@ EOF
 # failure the phase-1 self-test exists to prevent, one layer down.
 sc_seed=$(exe_collections "$ORACLE" "$tmp/exe/ifelse_in_loop.bit" "$tmp/exe/st_seed")
 sc_self=$(exe_collections "$BIT2" "$tmp/exe/ifelse_in_loop.bit" "$tmp/exe/st_self")
+if [ "$sc_seed" = "TIMEOUT" ] || [ "$sc_self" = "TIMEOUT" ]; then
+  echo "FATAL: self-test build timed out (seed=$sc_seed self=$sc_self) — the harness cannot proceed." >&2
+  exit 2
+fi
 if [ "$sc_seed" = "x" ] || [ "$sc_self" = "x" ]; then
   echo "FATAL: self-test program did not build/link under both compilers (seed=$sc_seed self=$sc_self)." >&2
   exit 2
@@ -227,14 +278,25 @@ if [ "$sc_seed" -lt 1 ] || [ "$sc_self" -lt 1 ]; then
 fi
 echo "self-test: plain-loop collection count under BIT_GC=stress — seed=$sc_seed self=$sc_self"
 
-exe_match=0 exe_mismatch=0 exe_skip=0
+# A timeout is not evidence, same reasoning as phase 1's own counter above: a
+# build killed by the alarm produced no verdict, so it is counted apart from
+# SKIP (declined to build) and MISMATCH (built and disagreed).
+exe_match=0 exe_mismatch=0 exe_skip=0 exe_timeout=0
 for f in "$tmp"/exe/*.bit; do
   name=$(basename "$f")
   sb="$tmp/exe/${name}.seedbin"
   bb="$tmp/exe/${name}.selfbin"
   s=$(exe_collections "$ORACLE" "$f" "$sb")
+  if [ "$s" = "TIMEOUT" ]; then
+    exe_timeout=$((exe_timeout + 1))
+    continue
+  fi
   [ "$s" = "x" ] && { echo "EXE SKIP (seed did not build) $name"; exe_skip=$((exe_skip + 1)); continue; }
   b=$(exe_collections "$BIT2" "$f" "$bb")
+  if [ "$b" = "TIMEOUT" ]; then
+    exe_timeout=$((exe_timeout + 1))
+    continue
+  fi
   [ "$b" = "x" ] && { echo "EXE SKIP (self did not build) $name"; exe_skip=$((exe_skip + 1)); continue; }
 
   # Comparing collection counts is only meaningful if the two binaries compute
@@ -255,7 +317,7 @@ for f in "$tmp"/exe/*.bit; do
   fi
 done
 
-echo "linked-exe differential: MATCH=$exe_match MISMATCH=$exe_mismatch SKIP=$exe_skip"
+echo "linked-exe differential: MATCH=$exe_match MISMATCH=$exe_mismatch SKIP=$exe_skip TIMEOUT=$exe_timeout"
 
 # A phase that measured nothing must not pass. If every case skipped, the loop
 # above ran zero comparisons and `exe_mismatch` is 0 for the wrong reason.
@@ -264,4 +326,4 @@ if [ "$exe_match" -lt 1 ]; then
   exit 2
 fi
 
-[ "$mismatch" -eq 0 ] && [ "$exe_mismatch" -eq 0 ]
+[ "$mismatch" -eq 0 ] && [ "$timeout" -eq 0 ] && [ "$exe_mismatch" -eq 0 ] && [ "$exe_timeout" -eq 0 ]

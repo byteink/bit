@@ -64,6 +64,8 @@ ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 CORPUS="stdlib examples tests/cases tests/imports"
 # shellcheck source=scripts/selfhost-ir-canon.sh
 . "${ROOT}/scripts/selfhost-ir-canon.sh"
+# shellcheck source=scripts/alarmrun.sh
+. "${ROOT}/scripts/alarmrun.sh"
 
 NAME="${1:?usage: selfhost-diffdump.sh <ast|tokens|diags|types|ir|iropt>}"
 
@@ -237,8 +239,6 @@ BIT2="${ROOT}/bit-out/bin/bit"
 for bin in "$ORACLE" "$BIT2"; do
   [ -x "$bin" ] || { echo "${PREFIX}: missing $bin — run: ./make selfhost" >&2; exit 2; }
 done
-
-alarmrun() { perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$@" 2>/dev/null; }
 
 # Why a child died, for the report. 128+N is death by signal N; 14 is the alarm
 # this script set, so that alone is a timeout and every other signal is a crash.
