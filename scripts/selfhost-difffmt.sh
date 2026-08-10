@@ -74,7 +74,7 @@ trap 'rm -rf "$work"' EXIT
 probe_fmt() {
   local bin=$1 dir="$work/probe.$2"
   mkdir -p "$dir"
-  printf 'function main() {\n  print("hi\\n")\n}\n' >"$dir/p.bit"
+  printf 'fn main() {\n  print("hi\\n")\n}\n' >"$dir/p.bit"
   local out
   out=$("$bin" fmt "$dir/p.bit" 2>&1)
   local rc=$?

@@ -58,7 +58,7 @@ trap 'rm -rf "$work"' EXIT
 probe_doc() {
   local bin=$1 dir="$work/probe.$2"
   mkdir -p "$dir"
-  printf 'export function inc(n: i64): i64 {\n  return n + 1\n}\n' >"$dir/m.bit"
+  printf 'export fn inc(n: i64): i64 {\n  return n + 1\n}\n' >"$dir/m.bit"
   local out
   out=$("$bin" doc "$dir" 2>&1)
   if printf '%s' "$out" | grep -q 'unknown subcommand'; then
