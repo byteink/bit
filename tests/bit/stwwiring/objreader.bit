@@ -1,0 +1,311 @@
+// tests/bit/stwwiring/objreader.bit — the relocatable-object reader for the
+// stop-the-world wiring gate (#2867's split of `tests/bit/stwwiring.bit`).
+//
+// Sibling of `stwwiring.bit` in the same directory module: no `import`, one
+// shared scope. Given the raw bytes `bit build --emit-obj --freestanding`
+// produces, this file parses a Mach-O 64 or ELF64 relocatable object into
+// `Obj` — the section table, symbol table and global-symbol relocation list —
+// and nothing more; it knows nothing about `Edge`, `Cfg`, or what any of those
+// symbols are FOR. `stwwiring.bit`'s `loadObject` calls `readMacho`/`readElf`
+// here once per module and hands the resulting `Obj` to `checkEdge`, which
+// stays there beside the `Edge` table it evaluates.
+//
+// It reproduces `seed/link/object.zig`'s `atomizeModule` rule exactly, because
+// the rule IS what makes an edge check meaningful: an ATOM starts at each
+// defined symbol and spans to the NEXT defined symbol in the same section, and
+// a relocation belongs to the atom whose span contains its offset. A
+// relocation names a symbol only when that symbol is UNDEFINED or GLOBAL
+// (`N_EXT` / non-`STB_LOCAL`); a reference to a local definition is skipped.
+//
+// A byte-identical copy of this reader also lives in `tests/bit/rootpins/`
+// (#2867 phase 2 split both files the same way); `tests/bit/rootpins.bit`'s
+// own header already flags the two copies for consolidation into a shared
+// `tests/objread/` module the moment a third is wanted.
+
+// ---------------------------------------------------------------------------
+// The object model: what an edge question needs, and nothing more
+// ---------------------------------------------------------------------------
+
+// One section, in whichever fields its format uses. Mach-O fills addr/size/
+// reloff/nreloc; ELF fills kind/addr/off/size/link/info.
+struct Sec { kind: int, addr: int, off: int, size: int, link: int, info: int, reloff: int, nreloc: int }
+
+// `sect` is -1 unless the symbol DEFINES an atom in a section of this object
+// (undefined, absolute and debug symbols anchor nothing); `value` is then the
+// section-relative offset it starts at. `isGlobal` is true when a relocation
+// against it resolves by NAME at link time rather than to a local atom.
+struct ObjSym { name: string, sect: int, value: int, isGlobal: bool }
+
+// One relocation that names a global symbol, addressed the way the raw object
+// addresses it: an offset within its own section.
+struct ObjReloc { sect: int, off: int, toSym: string }
+
+struct Obj { ok: bool, secs: []Sec, syms: []ObjSym, relocs: []ObjReloc }
+
+fn badObj(): Obj {
+  return Obj{ ok: false, secs: []Sec(0), syms: []ObjSym(0), relocs: []ObjReloc(0) }
+}
+
+fn objFail(msg: string): Obj {
+  eprint("stwwiring: ${msg}\n")
+  return badObj()
+}
+
+// Every walk below is clamped to `maxScan` so it is provably bounded (Power of
+// 10 rule 2). A clamp that TRUNCATES a table would leave the gate examining less
+// than it thinks — the failure mode this whole file exists to prevent — so a
+// table at the bound is refused outright, as the Zig original's
+// `error.TooMuchToScan` did.
+fn objOversized(n: int, what: string): bool {
+  if (n < maxScan) { return false }
+  eprint("stwwiring: ${what} holds ${n} entries, at or above the ${maxScan} scan bound\n")
+  return true
+}
+
+// Little-endian primitive reads, unaligned-safe by construction: nothing in a
+// relocatable object may assume an alignment wider than the field it reads.
+fn rdU16(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8)
+}
+
+fn rdU32(b: []u8, off: int): int {
+  return int(b[off]) | (int(b[off + 1]) << 8) | (int(b[off + 2]) << 16) | (int(b[off + 3]) << 24)
+}
+
+fn rdU64(b: []u8, off: int): int {
+  return rdU32(b, off) | (rdU32(b, off + 4) << 32)
+}
+
+// The NUL-terminated name at `off` in a string table.
+fn cstr(b: []u8, off: int): string {
+  if (off < 0 || off >= len(b)) { return "" }
+  let end = off
+  while (end < len(b) && end - off < maxScan && b[end] != u8(0)) {
+    end = end + 1
+  }
+  return string(b[off:end])
+}
+
+// ---------------------------------------------------------------------------
+// Mach-O 64 relocatable objects (aarch64-macos)
+// ---------------------------------------------------------------------------
+//
+// Sections are numbered from 1 across every LC_SEGMENT_64 in load-command order,
+// which is what `nlist_64.n_sect` indexes. A section's `addr` exists only so a
+// symbol's ADDRESS can be turned back into the section-relative offset that
+// `relocation_info.r_address` already is.
+
+// Byte offsets of every load command, or empty if the header is not one.
+fn machoCmds(b: []u8): []int {
+  let out = []int(0)
+  if (len(b) < 32 || rdU32(b, 0) != 0xfeedfacf) { return out }
+  let ncmds = rdU32(b, 16)
+  let off = 32
+  let i = 0
+  while (i < ncmds && i < maxScan) {
+    if (off + 8 > len(b) || rdU32(b, off + 4) <= 0) { return []int(0) }
+    out = append(out, off)
+    off = off + rdU32(b, off + 4)
+    i = i + 1
+  }
+  return out
+}
+
+// Every section of every LC_SEGMENT_64 (0x19), in ordinal order.
+fn machoSecs(b: []u8, cmds: []int): []Sec {
+  let secs = []Sec(0)
+  for c of cmds {
+    if (rdU32(b, c) != 0x19) { continue }
+    let nsects = rdU32(b, c + 64)
+    let i = 0
+    while (i < nsects && i < maxScan) {
+      let s = c + 72 + i * 80
+      secs = append(secs, Sec{ kind: 0, addr: rdU64(b, s + 32), off: 0,
+        size: rdU64(b, s + 40), link: 0, info: 0,
+        reloff: rdU32(b, s + 56), nreloc: rdU32(b, s + 60) })
+      i = i + 1
+    }
+  }
+  return secs
+}
+
+// One `nlist_64` at `n`. N_STAB (0xe0) is debug bookkeeping: it anchors no atom
+// and names no relocation target. N_TYPE (0x0e) == N_SECT is a definition;
+// anything else (N_UNDF, N_ABS, N_INDR) defines nothing here.
+fn machoSym(b: []u8, strtab: []u8, n: int, secs: []Sec): ObjSym {
+  let ntype = int(b[n + 4])
+  let nsect = int(b[n + 5])
+  let stab = (ntype & 0xe0) != 0
+  let global = (!stab && (ntype & 0x0e) == 0) || (ntype & 0x01) != 0
+  let name = cstr(strtab, rdU32(b, n))
+  if (stab || (ntype & 0x0e) != 0x0e || nsect < 1 || nsect > len(secs)) {
+    return ObjSym{ name: name, sect: 0 - 1, value: 0, isGlobal: global }
+  }
+  return ObjSym{ name: name, sect: nsect - 1,
+    value: rdU64(b, n + 8) - secs[nsect - 1].addr, isGlobal: global }
+}
+
+// The LC_SYMTAB (0x2) symbols, rebased from address to section-relative offset.
+fn machoSyms(b: []u8, cmds: []int, secs: []Sec): []ObjSym {
+  let syms = []ObjSym(0)
+  for c of cmds {
+    if (rdU32(b, c) != 0x2) { continue }
+    let symoff = rdU32(b, c + 8)
+    let nsyms = rdU32(b, c + 12)
+    let strtab = b[rdU32(b, c + 16):rdU32(b, c + 16) + rdU32(b, c + 20)]
+    let i = 0
+    while (i < nsyms && i < maxScan) {
+      syms = append(syms, machoSym(b, strtab, symoff + i * 16, secs))
+      i = i + 1
+    }
+  }
+  return syms
+}
+
+// Every relocation that names a global symbol. R_SCATTERED (bit 31 of the first
+// word) reinterprets the whole entry and never names an external symbol, so it
+// carries no edge; this compiler emits none, and skipping is defensive rather
+// than load-bearing. r_extern (bit 27) distinguishes "r_symbolnum is a symbol
+// index" from "r_symbolnum is a section ordinal".
+fn machoRelocs(b: []u8, secs: []Sec, syms: []ObjSym): []ObjReloc {
+  let out = []ObjReloc(0)
+  let si = 0
+  while (si < len(secs)) {
+    let ri = 0
+    while (ri < secs[si].nreloc && ri < maxScan) {
+      let r = secs[si].reloff + ri * 8
+      let addr = rdU32(b, r)
+      let w = rdU32(b, r + 4)
+      ri = ri + 1
+      if ((addr & 0x80000000) != 0 || ((w >> 27) & 1) == 0) { continue }
+      let sn = w & 0xffffff
+      if (sn >= len(syms) || !syms[sn].isGlobal) { continue }
+      out = append(out, ObjReloc{ sect: si, off: addr, toSym: syms[sn].name })
+    }
+    si = si + 1
+  }
+  return out
+}
+
+fn readMacho(b: []u8): Obj {
+  let cmds = machoCmds(b)
+  if (len(cmds) == 0) { return objFail("not a 64-bit little-endian Mach-O object") }
+  let secs = machoSecs(b, cmds)
+  if (len(secs) == 0) { return objFail("Mach-O object has no sections") }
+  for c of cmds {
+    if (rdU32(b, c) == 0x2 && objOversized(rdU32(b, c + 12), "the Mach-O symbol table")) {
+      return badObj()
+    }
+  }
+  for s of secs {
+    if (objOversized(s.nreloc, "a Mach-O relocation table")) { return badObj() }
+  }
+  let syms = machoSyms(b, cmds, secs)
+  if (len(syms) == 0) { return objFail("Mach-O object has no symbol table") }
+  return Obj{ ok: true, secs: secs, syms: syms, relocs: machoRelocs(b, secs, syms) }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 relocatable objects (x86_64-linux)
+// ---------------------------------------------------------------------------
+//
+// `sh_info` of an SHT_RELA section names the section it relocates and `r_offset`
+// is an offset inside that section — already the atomizer's coordinate system,
+// so nothing needs rebasing beyond `sh_addr` (0 in ET_REL).
+
+fn elfSecs(b: []u8): []Sec {
+  let out = []Sec(0)
+  if (len(b) < 64 || b[0] != u8(0x7f) || b[1] != u8(0x45) || b[2] != u8(0x4c) ||
+      b[3] != u8(0x46) || b[4] != u8(2) || b[5] != u8(1)) {
+    return out
+  }
+  let shoff = rdU64(b, 0x28)
+  let shentsize = rdU16(b, 0x3a)
+  let shnum = rdU16(b, 0x3c)
+  let i = 0
+  while (i < shnum && i < maxScan) {
+    let s = shoff + i * shentsize
+    out = append(out, Sec{ kind: rdU32(b, s + 4), addr: rdU64(b, s + 16),
+      off: rdU64(b, s + 24), size: rdU64(b, s + 32), link: rdU32(b, s + 40),
+      info: rdU32(b, s + 44), reloff: 0, nreloc: 0 })
+    i = i + 1
+  }
+  return out
+}
+
+// The SHT_SYMTAB (2) symbols. STT_SECTION (3) names a section, not a definition,
+// and STT_FILE (4) names nothing at all; both would otherwise split an atom at
+// offset 0 and steal its relocations. SHN_ABS and up (0xff00) are not section
+// indices. An unnamed symbol anchors no atom for the same reason `atomizeModule`
+// identifies an atom by its symbol's name.
+fn elfSym(b: []u8, strtab: []u8, e: int, secs: []Sec): ObjSym {
+  let name = cstr(strtab, rdU32(b, e))
+  let info = int(b[e + 4])
+  let shndx = rdU16(b, e + 6)
+  let kind = info & 0x0f
+  let global = shndx == 0 || (info >> 4) != 0
+  if (shndx < 1 || shndx >= len(secs) || kind == 3 || kind == 4 || len(name) == 0) {
+    return ObjSym{ name: name, sect: 0 - 1, value: 0, isGlobal: global }
+  }
+  return ObjSym{ name: name, sect: shndx, value: rdU64(b, e + 8) - secs[shndx].addr,
+    isGlobal: global }
+}
+
+fn elfSyms(b: []u8, secs: []Sec, symIdx: int): []ObjSym {
+  let syms = []ObjSym(0)
+  let strIdx = secs[symIdx].link
+  if (strIdx <= 0 || strIdx >= len(secs)) { return syms }
+  let strtab = b[secs[strIdx].off:secs[strIdx].off + secs[strIdx].size]
+  let n = 0
+  while (n < secs[symIdx].size / 24 && n < maxScan) {
+    syms = append(syms, elfSym(b, strtab, secs[symIdx].off + n * 24, secs))
+    n = n + 1
+  }
+  return syms
+}
+
+// Every SHT_RELA (4) entry that names a global symbol. `r_info` is 8 bytes at
+// +8; the symbol index is its high half, at +12.
+fn elfRelocs(b: []u8, secs: []Sec, syms: []ObjSym): []ObjReloc {
+  let out = []ObjReloc(0)
+  let i = 0
+  while (i < len(secs)) {
+    let tgt = secs[i].info
+    if (secs[i].kind != 4 || tgt <= 0 || tgt >= len(secs)) {
+      i = i + 1
+      continue
+    }
+    let j = 0
+    while (j < secs[i].size / 24 && j < maxScan) {
+      let r = secs[i].off + j * 24
+      let sym = rdU32(b, r + 12)
+      j = j + 1
+      if (sym >= len(syms) || !syms[sym].isGlobal || len(syms[sym].name) == 0) { continue }
+      out = append(out, ObjReloc{ sect: tgt, off: rdU64(b, r), toSym: syms[sym].name })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+fn readElf(b: []u8): Obj {
+  let secs = elfSecs(b)
+  if (len(secs) == 0) { return objFail("not a 64-bit little-endian ELF object") }
+  // A missing .symtab is a parse FAILURE, never an empty symbol list: an empty
+  // list would make every `fromSym` report "anchor missing" and every `forbid`
+  // edge pass for the wrong reason.
+  let symIdx = 0 - 1
+  let k = 0
+  while (k < len(secs)) {
+    if (secs[k].kind == 2) { symIdx = k }
+    k = k + 1
+  }
+  if (symIdx < 0) { return objFail("ELF object has no .symtab") }
+  if (objOversized(secs[symIdx].size / 24, "the ELF symbol table")) { return badObj() }
+  for s of secs {
+    if (s.kind == 4 && objOversized(s.size / 24, "an ELF relocation table")) { return badObj() }
+  }
+  let syms = elfSyms(b, secs, symIdx)
+  if (len(syms) == 0) { return objFail("ELF .symtab is empty or has no string table") }
+  return Obj{ ok: true, secs: secs, syms: syms, relocs: elfRelocs(b, secs, syms) }
+}
