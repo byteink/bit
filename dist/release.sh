@@ -303,7 +303,7 @@ smoke() { # <tarball> <target> <runner...>
 	local lspFifo="${work}/lspfifo"
 	mkfifo "${lspFifo}"
 	mkdir -p "${work}/proj"
-	printf 'function main() {\n  print("smoke ok\\n")\n}\n' > "${work}/proj/smoke.bit"
+	printf 'fn main() {\n  print("smoke ok\\n")\n}\n' > "${work}/proj/smoke.bit"
 	local got
 	got="$(cd "${work}/proj" && BIT_STDLIB="${prefix}/stdlib" \
 		BIT_LIBBITRT="${prefix}/lib/${target}/libbitrt.a" \
@@ -371,7 +371,7 @@ if command -v docker >/dev/null; then
 		tar -C /w -xf /w/bit-${VERSION}-linux-aarch64.tar.xz
 		p=\$(ls -d /w/bit-${VERSION}-linux-aarch64)
 		mkdir -p /w/proj && cd /w/proj
-		printf 'function main() {\n  print("smoke ok\\\\n")\n}\n' > smoke.bit
+		printf 'fn main() {\n  print("smoke ok\\\\n")\n}\n' > smoke.bit
 		BIT_STDLIB="\$p/stdlib" BIT_LIBBITRT="\$p/lib/aarch64-linux/libbitrt.a" "\$p/bin/bit" run smoke.bit
 		# Same version assertion as the native path. \`grep -q\` below only inspects
 		# stdout, so a mismatch has to fail the script here via set -eu.
@@ -407,7 +407,7 @@ set -eu
 tar -C /w -xf /w/bit-${VERSION}-linux-x86_64.tar.xz
 p=\$(ls -d /w/bit-${VERSION}-linux-x86_64)
 mkdir -p /w/proj && cd /w/proj
-printf 'function main() {\n  print(\"smoke ok\\\\n\")\n}\n' > smoke.bit
+printf 'fn main() {\n  print(\"smoke ok\\\\n\")\n}\n' > smoke.bit
 BIT_STDLIB=\"\$p/stdlib\" BIT_LIBBITRT=\"\$p/lib/x86_64-linux/libbitrt.a\" \"\$p/bin/bit\" run smoke.bit
 v=\$(\"\$p/bin/bit\" --version)
 [ \"\$v\" = \"bit ${VERSION}\" ] || { echo \"reports '\$v', want 'bit ${VERSION}'\" >&2; exit 1; }

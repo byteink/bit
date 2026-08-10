@@ -95,7 +95,7 @@ RUN set -eux; \
     # PATH is all that is needed — no wrapper, no env vars (dist/README.md's
     # "Path resolution"). Verified below rather than assumed.
     ln -s /opt/bit/bin/bit /usr/local/bin/bit; \
-    cd /tmp && printf 'function main() {\n  print("toolchain ok\\n")\n}\n' > t.bit; \
+    cd /tmp && printf 'fn main() {\n  print("toolchain ok\\n")\n}\n' > t.bit; \
     bit run t.bit; \
     rm -f /tmp/t.bit
 
