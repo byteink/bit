@@ -82,7 +82,7 @@ RT="$REPO_ROOT/runtime"
 
 # The rename is a SOURCE property now, so this is a verification rather than a
 # transformation: zero live (non-comment) `bit_rt_root_` pins may exist. Kept
-# because it is the cheap pre-flight for the whole class — `tests/bit/rootpins.bit`
+# because it is the cheap pre-flight for the whole class — `tests/bit/rootpins/`
 # proves the pin graph has no cycle, but only after a full build.
 LEFT=$(find "$RT" -name '*.bit' -print0 | xargs -0 grep -n '@symbol("bit_rt_root_' \
   | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l | tr -d ' ')
@@ -97,7 +97,7 @@ if [ "$LEFT" != "0" ]; then
 fi
 
 # --- Module set: 15 platform-free dirs + 7 platform-specific pairs (22 total). ---
-# Matches tests/bit/rootpins.bit's module split and the module set the G3 (#1584)
+# Matches tests/bit/rootpins/'s module split and the module set the G3 (#1584)
 # attempts converged on. Each entry is REL (module directory relative to $RT,
 # empty string for $RT itself) and LABEL (the archive-member-friendly name,
 # matching the "runtime_alloc.o" / "runtime_root_darwin.o" shape prior
