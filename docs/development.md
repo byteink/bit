@@ -65,10 +65,20 @@ before merging to main, or right after a stage0 repin.
 **Verify scoped changes with `scripts/gate.sh`, not the full suite.** It reads
 your `git diff` and runs only the steps that change can affect — a `compiler/**`
 edit runs the selfhost diffs plus `test-imports-bit`, a `tests/cases/**` edit
-runs `./make test-golden`. Run the full `./make test` (every gate, ~7 min) only
-for a cross-cutting change (`tools/build/`, `runtime/`, `spec/`), a mixed change
-set, or the final pre-merge gate — and `gate.sh` already falls back to it
-automatically in those cases. Every harness also has its own named step
+runs `./make test-golden`. For a cross-cutting change (`tools/build/`,
+`runtime/`, `spec/`), a mixed change set, or anything else it cannot
+confidently scope, `gate.sh` (no flags) **refuses rather than guessing**: it
+prints the resolved bucket and the reason, runs nothing, and exits 3
+(`GATE_RESULT=FULL_REQUIRED`, #2872). Run `scripts/gate.sh --full` or
+`./make test` directly (every gate, **18-18.5 min** — measured four separate
+times, 18m13s-18m36s, most recently on `8f5e49e8`; the driver prints its own
+`make: test — total` line, which is the number to trust over anything
+reconstructed afterward) to actually verify a change like that, or as the
+final pre-merge gate. In this repo's own workflow that full run is batched
+once per push by whoever integrates (see `CLAUDE.md`'s verify-loop rule) —
+that batching is a convention for this repo's own contributors, not this
+script's answer for someone with no integrator to hand it to. Every harness
+also has its own named step
 (`./make test-golden|test-examples|test-stress|test-selfcheck|…`) for running one
 area directly.
 

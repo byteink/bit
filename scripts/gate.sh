@@ -10,10 +10,14 @@
 #
 # `full` IS A VERDICT, NOT AN ACTION, UNLESS YOU PASS --full (#2872). Without
 # --full, a diff that resolves to `full` prints the bucket and REASON and
-# exits 3 — it runs NOTHING, least of all the 18+-minute `./make test` that
-# belongs to the integrator's single pre-push run (CLAUDE.md's verify-loop
-# rule: "the full suite runs once per push, and nobody else runs it at all").
-# Pass --full only if you ARE that integrator running the pre-push suite.
+# exits 3 — it runs NOTHING, least of all the 18-18.5 minute `./make test`.
+# To actually verify a diff that lands here, run `scripts/gate.sh --full` or
+# `./make test` directly. In THIS repo's own workflow that full run is
+# batched once per push by whoever integrates (CLAUDE.md's verify-loop rule:
+# "the full suite runs once per push, and nobody else runs it at all") — but
+# that batching is a convention for this repo's own contributors, not a
+# substitute for verifying your own change if you have no integrator to
+# batch it for you.
 #
 # Usage:
 #   scripts/gate.sh                    # scope to `main...HEAD` PLUS the working tree
@@ -36,9 +40,11 @@
 #      an empty diff, or a bucket naming a stale/missing script or step.
 #   3  the diff resolved to bucket `full` but --full was NOT passed, so
 #      NOTHING RAN (GATE_RESULT=FULL_REQUIRED). Not a pass, not a fail — the
-#      printed BUCKET/REASON say why. The diff needs the integrator's single
-#      pre-push `./make test`, not a scoped run here; only --full makes this
-#      script execute that suite itself.
+#      printed BUCKET/REASON say why. Run `scripts/gate.sh --full` or
+#      `./make test` directly (18-18.5 min) to verify it; this repo's own
+#      contributors normally leave that run batched once per push for
+#      whoever integrates, but that is a convention, not this script's
+#      answer for someone with no integrator to hand it to.
 #
 # BUCKETS: a change confined to exactly one of compiler/, runtime/,
 # tests/cases/, examples/, stdlib/, or docs/**/*.md runs only that area's
@@ -463,8 +469,8 @@ if [ "${BUCKET}" = "noop" ]; then
 fi
 
 # `full` is a VERDICT by default, not an action (#2872). Resolving to `full`
-# used to execute the 18+-minute `./make test` immediately — the one thing
-# CLAUDE.md's verify-loop rule reserves for the integrator's single run
+# used to execute the 18-18.5 minute `./make test` immediately — the one
+# thing CLAUDE.md's verify-loop rule reserves for the integrator's single run
 # before `git push`. A ticket subagent told to "run scripts/gate.sh" had no
 # way to learn which bucket this diff needs without also triggering that
 # run. So: print BUCKET and REASON exactly as already computed above, run
@@ -473,9 +479,19 @@ fi
 # not because the suite was too broad to scope here; PASS/FAIL both mean a
 # bucket actually ran. --full bypasses this and remains the only way this
 # script itself executes the full suite.
+#
+# THE MESSAGE MUST NAME AN ACTION, not just a person (#2872 follow-up).
+# CONTRIBUTING.md sends every outside contributor here, and an outside
+# contributor has no integrator to hand a "this belongs to the integrator"
+# refusal to — they are the only one who will ever run this diff through
+# anything. So the printed text leads with the two commands that actually
+# verify it (`--full` or `./make test` directly) and states the batched
+# pre-push convention as context for THIS repo's own workflow, not as the
+# instruction.
 if [ "${BUCKET}" = "full" ] && [ "${FULL}" -eq 0 ]; then
   echo "gate: bucket: full (${REASON})"
-  echo "gate: not running without --full — this diff needs the integrator's single pre-push './make test', not a scoped run here"
+  echo "gate: nothing ran — this diff is too broad to scope here. To verify it yourself, run 'scripts/gate.sh --full' or './make test' directly (18-18.5 min)."
+  echo "gate: in this repo's own workflow that run is batched once per push by whoever integrates — that is a convention, not a substitute for verifying your own change."
   echo "GATE_RESULT=FULL_REQUIRED"
   exit 3
 fi
