@@ -1574,7 +1574,7 @@ deadline check inside the loop is what actually ends every real call.
 lowers to an `ir.RtFn` that codegen emits as a call to the symbol itself, and
 that lowering stays permanent for both (SEAM 6, #1580).** A Bit *provider* whose
 body called the primitive would therefore be a call to itself, now that #1369
-has dropped the `_root` infix (the pin cycle `tests/bit/rootpins.bit` guards). Both are
+has dropped the `_root` infix (the pin cycle `tests/bit/rootpins/` guards). Both are
 PORTED regardless — `auxv` by #1617, `host_target` by #1635 — each by finding the
 answer somewhere other than the primitive:
 
@@ -1603,7 +1603,7 @@ answer somewhere other than the primitive:
   aarch64-only, so (provider, arch) names all three exactly; Darwin therefore needs
   no `asm` at all and returns the literal 2. The provider must never call
   `hostTarget()` — that primitive lowers to a call to this very symbol, now that
-  #1583 has dropped the `_root` infix (the pin cycle `tests/bit/rootpins.bit`
+  #1583 has dropped the `_root` infix (the pin cycle `tests/bit/rootpins/`
   guards) — and an `asm` immediate is inline by construction, so there is no
   callee for the rename to redirect. Verified running on all three targets, not
   just by disassembly:

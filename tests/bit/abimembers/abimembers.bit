@@ -1,0 +1,366 @@
+// The ABI-membership gate (#1662) — the Bit port of `tests/rootabi_membership.zig`.
+//
+// THE PROPERTY. Two halves must agree on one set of names: the half that EMITS a
+// `call bit_rt_*` relocation, and the half that DEFINES the symbol. Every name
+// the first can emit must be defined by the second, or it is an undefined symbol
+// at link time — in every shipped binary that reaches the call, not just a test.
+//
+// WHY IT HAD TO MOVE. The Zig gate read the defining half from `runtime/*.zig`
+// (`export fn` plus `comptime { @export(...) }`) and asserted Zig ⊆ the Bit pins.
+// Right question while both runtimes existed, but it DIES WITH ITS OWN ORACLE:
+// G3 deletes `runtime/*.zig`, and `min_zig_abi_symbols = 90` against a directory
+// with no `.zig` left is a hard failure with nothing wrong — whose obvious "fix"
+// is to delete the gate with the files, taking the property with it.
+//
+// WHERE IT POINTS NOW. The emitting half is the compiler's own RtFn table, which
+// survives the deletion: `compiler/irrtfns.bit`'s `rtFnTags` through the symbol
+// convention `compiler/codegen.bit`'s `rtSymbol` states (`bit_rt_<tag>`, except
+// `err_set`/`err_get`, whose symbols read verb-first), plus the names a backend
+// emits DIRECTLY rather than through an `rt_call` — `bit_rt_gc_alloc`,
+// `bit_rt_iface_lookup`, `bit_rt_safepoint`. The providing half is unchanged:
+// the `@symbol("bit_rt_*")` pins under `runtime/**/*.bit`. So is the direction —
+// every emitted name needs a provider, while a pin with no caller is fine, since
+// the port-internal `bit_rt_port_*` names were never in the ABI.
+//
+// THE TABLE IS NOT THE ONLY DEMAND SOURCE, deliberately: it is written by hand,
+// so it can fall behind the compiler it describes. The compiler is scanned too —
+// every `<var>.name = "<tag>"`
+// whose `<var>` came from `mkInstr(Op.RtCall, ...)`, and every tag
+// `compiler/lowerprim.bit`'s `primRtName` returns. That half is INCOMPLETE by
+// construction (a tag reaching `.name` through a variable, as `print`/`eprint`
+// do, is invisible to a text scanner), and the floors are what stop the
+// incompleteness from passing quietly.
+//
+// It also runs the other way, which is what keeps a HAND-WRITTEN table honest:
+// every `rt_call` name the compiler is actually seen to build must appear in
+// `rtFnTags`. A floor only catches the table shrinking; `checkTableCovers`
+// catches the compiler growing past it, which is the likelier direction and the
+// one that ends in an undefined symbol at link time.
+//
+// THE FLOORS, and why they are right after the deletion. PER-SOURCE, for the
+// reason `tests/bit/pollfree.bit` records: one total floor lets one oracle die
+// while another's growth keeps the sum up.
+//
+//   `minRtFnTags` 90 against today's 96 — the same 96 the seed's enum carried
+//   when it was deleted, copied whole rather than re-derived. The Zig gate's 90-against-103 was the
+//   same shape and too slack — it would have absorbed the loss of thirteen
+//   symbols in silence. 90 leaves room to retire a primitive or two (the
+//   compiler already lowers `sqrt`/`floor`/`float_bits` as IR ops, so the table
+//   shrinking is real) and no room for the table moving, being renamed, or the
+//   block parser failing to find it.
+//
+//   `minCompilerTags` 80 against today's 84, same argument for the Bit-side scan.
+//   `minDemand` 96 against today's 99 — the union, so it cannot go vacuous even
+//   if both per-source scans clear their own floors on garbage.
+//   `minPins` 250 against today's 306 (the Zig gate used 200 against 277): the
+//   population has only grown as the port completed, and a broken pin scan
+//   yields ~0, not 240.
+//
+// IF `compiler/irrtfns.bit` GOES this gate FAILS LOUDLY, and so it should: the
+// compiler scan alone cannot meet `minRtFnTags` (84 < 90), because it is
+// incomplete by construction. That is the design, not an oversight — the
+// alternative to a red gate is a green one that proves nothing. Do not answer it
+// with a lower floor. This is how it behaved when `seed/ir.zig` was the oracle
+// and #1593 deleted it (#1858); the property moved with the table.
+//
+// THE TWO WAYS A TEXT SCANNER GOES WRONG, both carried over from the Zig gate's
+// header because both actually happened, and both unit-tested in `checkScanners`
+// before the walk runs:
+//
+//   (1) A FALSE POSITIVE IS NOT NOISE. `runtime/root.zig` held
+//       `fatal("bit_rt_string_from_float: float text exceeds buffer")`, and the
+//       rule "any `bit_rt_*` literal is an export name" reported it as a missing
+//       provider. An unsatisfiable demand is what pushes someone to weaken the
+//       check. So a literal counts only when the WHOLE literal is one identifier
+//       (never `"bit_rt_x: ..."`, never an interpolation), only outside comments,
+//       and — for `.name =` — only off an `Op.RtCall` local. `atoms.name =
+//       "bit_stack_maps"` is the live trap on that last rule.
+//
+//   (2) A FALSE NEGATIVE IS A GREEN HOLE. The Zig gate was got wrong by hand
+//       twice, green both times: reading only `export fn` (missing
+//       `bit_rt_safepoint`), then only `root.zig` (missing `bit_rt_unmap_pages`).
+//       The same class here is a pin the scanner fails to see, so a `@symbol(...)`
+//       not attached to a `function` on its own or the next line is a HARD
+//       FAILURE, not a skip.
+//
+// `compiler/*check.bit` is excluded from the emitting scan: those are the
+// compiler's in-tree unit tests, whose fixtures name symbols no runtime defines
+// on purpose (`bit_rt_absent`, `bit_rt_probe`, `bit_rt_no_such_symbol_exists_anywhere`).
+// What that exclusion could hide is a real emit site, so the five directly
+// emitted names are asserted BY NAME as anchors.
+//
+// Usage (cwd is the repository root):
+//
+//     bit run tests/bit/abimembers
+//
+// `BIT_REPO` overrides the repository root (default "."), which is also how this
+// gate is mutation-tested: copy the tree, break one pin, point `BIT_REPO` at it.
+//
+// #2867 phase 2 split this file into `tests/bit/abimembers/{abimembers,scanners}.bit`:
+// the three source-text scanners and their own unit tests now live in the
+// sibling `scanners.bit`, no `import`, one shared scope. This file dropped
+// from 917 to 355 lines and kept the walk over real files, the demand-set
+// gate, the floors, and `main`.
+
+import { exists, isDir, readFile, walk } from "std/fs"
+import { exit, envOr } from "std/os"
+import { hasSuffix } from "std/strings"
+
+// ==== Bounds — every walk and every scan is provably finite (Power of 10 rule 2). ====
+
+// Mirrors `rootabi_shared.max_bit_files`: an order of magnitude above today's
+// count of runtime and compiler sources.
+const maxBitFiles: int = 1024
+// Mirrors `rootabi_shared.max_source_bytes` (1 << 22).
+const maxSourceBytes: int = 4194304
+const maxLinesPerFile: int = 200000
+
+const abiPrefix: string = "bit_rt_"
+
+// ==== The floors — see this file's header for why each number is what it is. ====
+
+const minRtFnTags: int = 90
+const minCompilerTags: int = 80
+const minDemand: int = 96
+const minPins: int = 250
+
+// The lexical helpers and the three scanners (RtFn table, compiler rt_call/
+// direct-emission, runtime pins), plus their own unit tests, now live in the
+// sibling `scanners.bit` (#2867 phase 2) — this file calls `rtSymbol`,
+// `scanRtFnTags`, `scanPins`, `scanCompilerFile` and `checkScanners` from
+// there via the shared scope.
+
+// ==== The walk ====
+
+struct Sources {
+  paths: []string
+  ok: bool
+}
+
+// Every `.bit` file under `dir`, bounded.
+fn bitSources(dir: string): Sources {
+  let out = Sources{paths: []string(0), ok: false}
+  if (!isDir(dir)) {
+    eprint("abimembers: ${dir} is not a directory (set BIT_REPO to the repository root)\n")
+    return out
+  }
+  let paths = walk(dir) catch e {
+    eprint("abimembers: cannot walk ${dir}: ${e.message()}\n")
+    return out
+  }
+  for p of paths {
+    if (!hasSuffix(p, ".bit")) {
+      continue
+    }
+    out.paths = append(out.paths, p)
+    if (len(out.paths) > maxBitFiles) {
+      eprint("abimembers: more than ${maxBitFiles} sources under ${dir}; raise the bound deliberately\n")
+      return out
+    }
+  }
+  out.ok = true
+  return out
+}
+
+fn readBounded(path: string): string {
+  let source = readFile(path) catch e {
+    eprint("abimembers: cannot read ${path}: ${e.message()}\n")
+    return ""
+  }
+  if (len(source) > maxSourceBytes) {
+    eprint("abimembers: ${path} is larger than ${maxSourceBytes} bytes\n")
+    return ""
+  }
+  return source
+}
+
+// The providing half.
+fn collectPins(repo: string): PinScan {
+  let out = PinScan{names: []string(0), bad: 0}
+  let src = bitSources("${repo}/runtime")
+  if (!src.ok) {
+    out.bad = out.bad + 1
+    return out
+  }
+  for p of src.paths {
+    let s = scanPins(readBounded(p))
+    out.bad = out.bad + s.bad
+    if (s.bad != 0) {
+      eprint("abimembers: ${p}: ${s.bad} `@symbol(\"bit_rt_*\")` pin(s) not attached to a " +
+        "`function`. Teach `scanPins` about the shape — an unread pin is a provider this " +
+        "gate cannot see.\n")
+    }
+    for n of s.names {
+      out.names = append(out.names, n)
+    }
+  }
+  return out
+}
+
+// The emitting half, self-hosted side. `*check.bit` is excluded: see the header.
+fn collectCompiler(repo: string): EmitScan {
+  let out = EmitScan{tags: []string(0), names: []string(0)}
+  let src = bitSources("${repo}/compiler")
+  if (!src.ok) {
+    return out
+  }
+  for p of src.paths {
+    if (hasSuffix(p, "check.bit")) {
+      continue
+    }
+    scanCompilerFile(out, readBounded(p))
+  }
+  return out
+}
+
+// ==== The gate ====
+
+struct Demand {
+  name: string
+  origin: string
+}
+
+// The emitted names, deduplicated, each keeping the source that demanded it.
+struct DemandSet {
+  items: []Demand
+  seen: map<string, bool>
+}
+
+fn addDemand(d: DemandSet, name: string, origin: string) {
+  if (len(name) == 0 || d.seen[name]) {
+    return
+  }
+  d.seen[name] = true
+  d.items = append(d.items, Demand{name: name, origin: origin})
+}
+
+fn demandFromTags(d: DemandSet, tags: []string, origin: string) {
+  for t of tags {
+    addDemand(d, rtSymbol(t), origin)
+  }
+}
+
+// The five names the backends emit directly rather than through the RtFn table.
+// Asserted BY NAME because they are what the `*check.bit` exclusion could hide,
+// and because `bit_rt_set_err`/`bit_rt_get_err` exist only through `rtSymbol`'s
+// special case — finding them proves this file's copy of that mapping is current.
+fn emissionAnchors(): []string {
+  return ["bit_rt_gc_alloc", "bit_rt_iface_lookup", "bit_rt_safepoint",
+    "bit_rt_set_err", "bit_rt_get_err"]
+}
+
+fn checkAnchors(names: []string): int {
+  let have = map<string, bool>{}
+  for n of names {
+    have[n] = true
+  }
+  let missing = 0
+  for a of emissionAnchors() {
+    if (have[a]) {
+      continue
+    }
+    eprint("abimembers: `${a}` is emitted by no compiler source this gate can see. " +
+      "A backend call site or `rtSymbol`/`safepointSymbol` moved, or it now lives in a " +
+      "`*check.bit` file this scan skips — the demand set is no longer complete.\n")
+    missing = missing + 1
+  }
+  return missing
+}
+
+// How many DISTINCT names `xs` holds. Every floor counts distinct names, the way
+// the Zig gate's hash-map `count()` did: a scan that reads one file twice must
+// not be able to clear a floor with the duplicates.
+fn distinct(xs: []string): int {
+  let seen = map<string, bool>{}
+  let n = 0
+  for x of xs {
+    if (seen[x]) {
+      continue
+    }
+    seen[x] = true
+    n = n + 1
+  }
+  return n
+}
+
+fn checkFloor(got: int, want: int, what: string): int {
+  if (got >= want) {
+    return 0
+  }
+  eprint("abimembers: found only ${got} ${what} (expected at least ${want}). " +
+    "The membership check is reading nothing useful there — see this file's header " +
+    "on the floors; do NOT answer this by lowering one.\n")
+  return 1
+}
+
+fn reportMissing(demand: []Demand, pins: []string): int {
+  let provided = map<string, bool>{}
+  for p of pins {
+    provided[p] = true
+  }
+  let missing = 0
+  for d of demand {
+    if (provided[d.name]) {
+      continue
+    }
+    eprint("abimembers: `${d.name}` is emitted by the compiler (${d.origin}) but NO " +
+      "`@symbol(\"${d.name}\")` pin under runtime/ provides it. That is an undefined " +
+      "symbol at link time in every binary reaching the call. Add the pinned Bit " +
+      "provider, or drop the primitive from the compiler.\n")
+    missing = missing + 1
+  }
+  return missing
+}
+
+fn main() {
+  if (!checkScanners()) {
+    eprint("FAIL abimembers: the source scanners do not pass their own unit tests\n")
+    exit(1)
+  }
+  let repo = envOr("BIT_REPO", ".")
+  let irPath = "${repo}/compiler/irrtfns.bit"
+  if (!exists(irPath)) {
+    eprint("FAIL abimembers: ${irPath} is gone. Its `rtFnTags` table is this gate's " +
+      "demand oracle — the canonical list of runtime primitives the compiler can call. " +
+      "Restore it; a gate with no demand set passes everything.\n")
+    exit(1)
+  }
+
+  let table = scanRtFnTags(readBounded(irPath))
+  let comp = collectCompiler(repo)
+  let pins = collectPins(repo)
+
+  let bad = table.bad
+  if (table.bad != 0) {
+    eprint("abimembers: ${table.bad} line(s) of the `rtFnTags` table are in a shape this " +
+      "gate does not understand; every one of them is a primitive it is not demanding.\n")
+  }
+  bad = bad + pins.bad
+  let nTags = distinct(table.tags)
+  let nComp = distinct(comp.tags)
+  let nPins = distinct(pins.names)
+  bad = bad + checkFloor(nTags, minRtFnTags, "`rtFnTags` entries in compiler/irrtfns.bit")
+  bad = bad + checkFloor(nComp, minCompilerTags, "`rt_call` names in compiler/*.bit")
+  bad = bad + checkFloor(nPins, minPins, "`@symbol(\"bit_rt_*\")` pins under runtime/")
+  bad = bad + checkAnchors(comp.names)
+  bad = bad + checkTableCovers(table.tags, comp.tags)
+
+  let demand = DemandSet{items: []Demand(0), seen: map<string, bool>{}}
+  demandFromTags(demand, table.tags, "compiler/irrtfns.bit rtFnTags")
+  demandFromTags(demand, comp.tags, "compiler/*.bit rt_call")
+  for n of comp.names {
+    addDemand(demand, n, "compiler/*.bit direct emission")
+  }
+  bad = bad + checkFloor(len(demand.items), minDemand, "distinct `bit_rt_*` names the compiler emits")
+  bad = bad + reportMissing(demand.items, pins.names)
+
+  if (bad != 0) {
+    eprint("FAIL abimembers: ${bad} problem(s). Every `bit_rt_*` name the compiler emits " +
+      "must be defined by a `@symbol` pin under runtime/ — that set is the ABI, and a " +
+      "hole in it is an undefined symbol in every shipped binary.\n")
+    exit(1)
+  }
+  println("PASS abimembers: ${len(demand.items)} `bit_rt_*` names the compiler emits " +
+    "(${nTags} RtFn tags, ${nComp} compiler rt_call names) are all provided by the " +
+    "${nPins} `@symbol` pins under runtime/")
+}
