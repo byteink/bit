@@ -463,8 +463,18 @@ because it carries no address.
 
 A program that wants a **private** registry passes its own block to the
 parameterised doors (`bit_rt_port_stw_poll_on`,
-`bit_rt_port_gc_current_mutator_on`), which never touch the process-wide one —
-the rule #1833 established and `tests/stress/stwcollect` follows.
+`bit_rt_port_gc_current_mutator_on`), which never touch the process-wide
+**registry block** — the rule #1833 established and `tests/stress/stwcollect`
+follows. #1833's defect was a private caller REPLACING the live runtime's own
+address binding, so its own worker registered into the wrong registry entirely;
+"never touch" is about that block/binding, not about every word this file's
+module state holds. The per-thread poll hint (`mutHintSlot`, #1698/#2821) IS one
+process-wide word shared by both the global and the parameterised doors, and
+that is deliberate, not a hole in this rule: it never identifies which registry
+to consult (the `world` parameter always does that) and it is re-validated
+against THIS call's own registry before being trusted, so a hint left by a poll
+against the other registry can only miss and fall back to the exact search,
+never answer wrongly.
 
 ```
 running   executing Bit code; may reach a safepoint at any moment
