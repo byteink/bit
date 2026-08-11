@@ -94,6 +94,8 @@
 #   DIFFALL_DIR=path    constituent directory -- for mutation-testing this gate
 #   DIFFALL_KEEP=1      keep the per-constituent logs instead of deleting them
 set -uo pipefail
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
 
 DIR=${DIFFALL_DIR:-scripts}
 MIN=${DIFFALL_MIN:-15}
@@ -176,7 +178,7 @@ for s in "${scripts[@]}"; do
 
   # Own the process: spawn it, hold its PID, wait on that PID. `alarm` survives
   # exec, so the constituent inherits the deadline and dies with SIGALRM (142).
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" bash "$s" >"$log" 2>&1 &
+  ALARMRUN_KEEP_STDERR=1 alarmrun bash "$s" >"$log" 2>&1 &
   pid=$!
   wait "$pid"
   rc=$?

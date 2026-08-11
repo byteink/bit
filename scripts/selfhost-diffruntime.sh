@@ -99,6 +99,8 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffruntime.sh
 set -uo pipefail
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
 
 # Oracle: the pinned stage0 (previous release), like every other differential
 # since #1593. scripts/stage0.sh downloads and DIGEST-VERIFIES it and refuses
@@ -214,7 +216,7 @@ for f in $(find runtime -name '*.bit' | sort); do
   # The oracle is bounded too (#2070). Its timeout is NOT a skip: a skip means
   # the oracle could not lower the file, an expected outcome, while a hang is a
   # broken stage0 — and an unbounded oracle wedged this gate with no message.
-  a=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" --dump-ir-pre "$f" 2>/dev/null)
+  a=$(alarmrun "$ORACLE" --dump-ir-pre "$f")
   arc=$?
   if [ "$arc" -eq 142 ]; then
     echo "$f${sep}$(whydied "$arc")" >>"$work/oracletimeout"
@@ -231,7 +233,7 @@ for f in $(find runtime -name '*.bit' | sort); do
     continue
   fi
 
-  b=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" --dump-ir-pre "$f" 2>/dev/null)
+  b=$(alarmrun "$BIT2" --dump-ir-pre "$f")
   rc=$?
   # >=128 is death by signal, and WHICH signal is not a detail: 142 is our own
   # alarm, anything else is the compiler crashing. Either way no verdict (#2070).
@@ -282,7 +284,7 @@ while [ "$i" -lt "$NMOD" ]; do
   devobj="$objdev/${label}.o"
   orobj="$objor/${label}.o"
 
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" build "$dir" -c --freestanding -o "$orobj" >/dev/null 2>&1
+  alarmrun "$ORACLE" build "$dir" -c --freestanding -o "$orobj" >/dev/null
   orc=$?
   if [ "$orc" -eq 142 ]; then
     echo "$dir${sep}$(whydied "$orc")" >>"$work/mod_oracletimeout"
@@ -299,7 +301,7 @@ while [ "$i" -lt "$NMOD" ]; do
     continue
   fi
 
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" build "$dir" -c --freestanding -o "$devobj" >/dev/null 2>&1
+  alarmrun "$BIT2" build "$dir" -c --freestanding -o "$devobj" >/dev/null
   rc=$?
   if [ "$rc" -ge 128 ]; then
     echo "$dir${sep}$(whydied "$rc")" >>"$work/mod_timeout"

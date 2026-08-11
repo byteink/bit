@@ -35,6 +35,9 @@
 #
 # Usage: ./make selfhost && bash scripts/selfhost-diffdoc.sh
 set -uo pipefail
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -97,7 +100,7 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
   # its own outcome, never folded into SKIP: SKIP means the oracle legitimately
   # declined the directory (not a module, or a module it cannot compile); a
   # hang means it never reached a verdict at all.
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" doc "$d" >"$work/seed.plain" 2>/dev/null
+  alarmrun "$ORACLE" doc "$d" >"$work/seed.plain"
   seed_rc=$?
   if [ "$seed_rc" -ge 128 ]; then
     echo "$d (ORACLE timed out after ${TIMEOUT}s, rc=$seed_rc)" >>"$work/timeout"
@@ -108,16 +111,16 @@ for d in stdlib/*/ examples/*/ tests/imports/*/; do
     skip=$((skip + 1))
     continue
   fi
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" doc --json "$d" >"$work/seed.json" 2>/dev/null
+  alarmrun "$ORACLE" doc --json "$d" >"$work/seed.json"
   seed_json_rc=$?
   if [ "$seed_json_rc" -ge 128 ]; then
     echo "$d (ORACLE --json timed out after ${TIMEOUT}s, rc=$seed_json_rc)" >>"$work/timeout"
     continue
   fi
 
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" doc "$d" >"$work/bit.plain" 2>/dev/null
+  alarmrun "$BIT2" doc "$d" >"$work/bit.plain"
   bit_rc=$?
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" doc --json "$d" >"$work/bit.json" 2>/dev/null
+  alarmrun "$BIT2" doc --json "$d" >"$work/bit.json"
   bit_json_rc=$?
 
   if [ "$bit_rc" -ge 128 ] || [ "$bit_json_rc" -ge 128 ]; then
@@ -163,8 +166,8 @@ if [ -s "$work/mismatch" ]; then
     # Bounded on BOTH sides here too, exactly as the compare loop runs them —
     # an unbounded oracle in the failure report would hang a run that already
     # failed.
-    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$ORACLE" doc "$dir" >"$work/da" 2>/dev/null
-    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$BIT2" doc "$dir" >"$work/db" 2>/dev/null
+    alarmrun "$ORACLE" doc "$dir" >"$work/da"
+    alarmrun "$BIT2" doc "$dir" >"$work/db"
     diff "$work/da" "$work/db" | head -12
   done
   status=1

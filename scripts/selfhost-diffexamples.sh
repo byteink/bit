@@ -36,6 +36,9 @@
 #   2  could not decide: an example timed out and was never compared. Not a
 #      pass — see #1524/#1525.
 set -u
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -84,10 +87,11 @@ TIMEOUT_S=${TIMEOUT_S:-60}
 alarm_run() {
   local out=$1 rc
   shift
-  ( perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$@" >"$out" 2>&1 ) 2>/dev/null
+  local TIMEOUT="$TIMEOUT_S"
+  ( ALARMRUN_KEEP_STDERR=1 alarmrun "$@" >"$out" 2>&1 ) 2>/dev/null
   rc=$?
   [ "$rc" -ne 142 ] && return "$rc"
-  ( perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$@" >"$out" 2>&1 ) 2>/dev/null
+  ( ALARMRUN_KEEP_STDERR=1 alarmrun "$@" >"$out" 2>&1 ) 2>/dev/null
   return $?
 }
 # The pin. Override only to explore locally; the committed value is the gate.

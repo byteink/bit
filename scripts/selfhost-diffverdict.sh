@@ -49,6 +49,9 @@
 #
 # Usage: ./make && bash scripts/selfhost-diffverdict.sh [-v]
 set -u
+# shellcheck source=scripts/alarmrun.sh
+. "$(dirname -- "$0")/alarmrun.sh"
+
 # Oracle: the pinned stage0 -- the same compiler one release back, an EARLIER
 # VERSION OF THIS SAME COMPILER, which is exactly what limits the claim below.
 # scripts/stage0.sh downloads and DIGEST-VERIFIES it, and refuses rather
@@ -84,10 +87,11 @@ TIMEOUT_S=${TIMEOUT_S:-20}
 # enough to gate on.
 verdict() {
   local rc
-  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$1" check "$2" >/dev/null 2>&1
+  local TIMEOUT="$TIMEOUT_S"
+  alarmrun "$1" check "$2" >/dev/null
   rc=$?
   if [ "$rc" -eq 142 ]; then
-    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT_S" "$1" check "$2" >/dev/null 2>&1
+    alarmrun "$1" check "$2" >/dev/null
     rc=$?
   fi
   if [ "$rc" -eq 142 ]; then
