@@ -1,0 +1,254 @@
+// Self-host: E0057 unknown-member / E0046 unexported-name lookup (#2476,
+// split out of validateexpr.bit — 825 lines against the 800-line limit, the
+// second time over: #2428 first brought it to 777, then #2804's
+// wildcard-namespace member check regrew it past 800). This is `vMember` and
+// everything only it needs — edit-distance hinting, namespace/type-vs-value
+// discrimination, and the decl-rootedness safety check; validateexpr.bit
+// keeps interpolation, variant arity, generic bounds, enum inference, match
+// arms, call/index receivers, and comparison operands.
+
+// ---- E0057 unknown member (§13.4) ------------------------------------------
+
+// Levenshtein distance between two names, a direct port `editDistance`.
+// The 64-byte cap is the seed's: longer names return the cap, which exceeds the
+// distance-3 hint threshold, so an over-long name simply yields no hint. Two
+// rolling rows rather than a full matrix, exactly as the seed does.
+fn vEditDistance(a: string, b: string): int {
+  let maxLen = 64
+  if (len(a) > maxLen || len(b) > maxLen) {
+    return maxLen
+  }
+  let prev = []int(maxLen + 1)
+  let cur = []int(maxLen + 1)
+  let j = 0
+  while (j <= len(b)) {
+    prev[j] = j
+    j = j + 1
+  }
+  let i = 1
+  while (i <= len(a)) {
+    cur[0] = i
+    j = 1
+    while (j <= len(b)) {
+      let cost = 1
+      if (a[i - 1] == b[j - 1]) {
+        cost = 0
+      }
+      let best = cur[j - 1] + 1
+      if (prev[j] + 1 < best) {
+        best = prev[j] + 1
+      }
+      if (prev[j - 1] + cost < best) {
+        best = prev[j - 1] + cost
+      }
+      cur[j] = best
+      j = j + 1
+    }
+    // Swap the rows. Both are fully rewritten above before being read again, so
+    // sharing the backing arrays by reference is safe.
+    let tmp = prev
+    prev = cur
+    cur = tmp
+    i = i + 1
+  }
+  return prev[len(b)]
+}
+
+// Is `key` PRESENT in a member table, whatever type it maps to? The lookups in
+// check.bit answer "what type", conflating an absent member with one whose type
+// did not resolve; judging by absence needs the distinction.
+fn vHasMember(table: map<string, int>, key: string): bool {
+  for (k, v) of table {
+    if (k == key) {
+      return true
+    }
+  }
+  return false
+}
+
+// The method name on `recvTy` closest to `wanted`, or "" when none is within
+// edit distance 3. Ties go to the first key
+// visited, matching the seed's strictly-less-than comparison over its method
+// bucket. `methodResults` is the complete method set for a type — it carries the
+// predeclared `error.message` that `methodSigs` omits.
+fn vClosestMethodName(c: Checker, recvTy: int, wanted: string): string {
+  let prefix = "${recvTy}."
+  let best = ""
+  let bestDist = 64 + 1
+  for (k, v) of c.ctx.methodResults {
+    if (len(k) > len(prefix) && k[0:len(prefix)] == prefix) {
+      let name = k[len(prefix):len(k)]
+      let d = vEditDistance(name, wanted)
+      if (d < bestDist) {
+        bestDist = d
+        best = name
+      }
+    }
+  }
+  if (bestDist > 3) {
+    return "" // too far apart to be a useful hint
+  }
+  return best
+}
+
+// Emits E0057 when `recv.name` is neither a field of the receiver nor a method
+// on it.
+//
+// The safety rule bites hard here — this validator judges by ABSENCE, so every
+// gap in the member tables reads as an error. It fires only when the receiver's
+// type is confidently concrete AND is a shape whose members are fully known:
+//   - an unresolved receiver (0), one mentioning `invalid`, or one carrying an
+//     unbound type param is skipped (the seed dispatches a type param through
+//     its constraint; a template body is re-checked per monomorphization);
+//   - a receiver that is an enum TYPE name is not a value at all —
+//     `Color.Red` is resolved elsewhere and carries its own diagnostic (E0057
+//     unknown variant);
+//   - a receiver that is a MODULE NAMESPACE (`fs` in `fs.readFile`) is judged
+//     right here, by export-table presence rather than field/method lookup —
+//     E0046 unexported_name, the same code a bad NAMED import already gets;
+//   - only Struct and Interface receivers reach the field/method judgment
+//     below. Every other kind (slice, map, prim, chan, fallible, func) reaches
+//     members exclusively through methods, and a builtin method the tables do
+//     not model would false-positive.
+fn vMember(c: Checker, node: int) {
+  let kids = kidsOf(c.tree, node) // [recv, name]
+  let recv = kids[0]
+  // `Enum.Variant`: the base names a TYPE, not a value. `checkMember` resolves
+  // those separately.
+  if (typeNodeName(c, recv) != "" && userTypeLookup(c, typeNodeName(c, recv)) != 0) {
+    return
+  }
+  // `fs.readFile` / `fs.bogus`: the base names a namespace import, not a
+  // value, so it is never judged as a field/method lookup below — but unlike
+  // a type name, a namespace has a concrete export table (every entry
+  // `bindNamespaceImport` copied into `c.importedFrom` under "alias.name").
+  // Presence there is exactly the test the resolver already runs for a bad
+  // NAMED import (`import { bogus } from "std/fs"`, E0046) — a namespace
+  // member is simply the same test deferred to its use site, since the
+  // resolver cannot see which members a wildcard import will ever reach for.
+  // Guarded on `qn != ""`: an import whose path itself failed to resolve
+  // never populates `c.namespaces`, and that failure already has its own
+  // E0044/E0045 diagnostic — reporting E0046 on top would be a second,
+  // misleading error about the same missing module.
+  if (vIsNamespaceImportRef(c, recv)) {
+    let qn = nsQualifiedName(c, node)
+    if (qn != "") {
+      let (_, ok) = c.importedFrom[qn]
+      if (!ok) {
+        let mn = getNode(c.tree, kids[1])
+        let mname = c.source[mn.span.start:mn.span.end]
+        report(c.diags, ecUnexportedName, vSpan(c, kids[1]),
+          "'${mname}' is not exported by this module",
+          "add 'export' to its declaration in the source module, or check the spelling")
+      }
+    }
+    return
+  }
+  if (vIsNamespaceRef(c, recv)) {
+    return
+  }
+  if (!vDeclRooted(c, recv, 0)) {
+    return
+  }
+  let rt = checkExprType(c, recv)
+  if (rt == 0 || vMentionsInvalid(c, rt, 0) || vHasTypeParam(c, rt, 0)) {
+    return
+  }
+  let kind = c.ctx.types[rt].kind
+  if (kind != TypeKind.Struct && kind != TypeKind.Interface) {
+    return
+  }
+  let mn = getNode(c.tree, kids[1])
+  let mname = c.source[mn.span.start:mn.span.end]
+  let key = "${methodRecvType(c, rt)}." + mname
+  // PRESENCE, not a non-zero type. A member whose own type failed to resolve —
+  // `cipher: AesCipher` when the module declaring AesCipher is not loaded, which
+  // is every single-file check of a multi-file stdlib module — is recorded with
+  // type 0, which a `!= 0` lookup cannot tell apart from "no such member". That
+  // read turned a cascade into 13 invented E0057s across stdlib/crypto and tls.
+  if (vHasMember(c.ctx.structFields, key) || vHasMember(c.ctx.methodResults, key) ||
+    vHasMember(c.ctx.methodSigs, key)) {
+    return
+  }
+  let hint = vClosestMethodName(c, methodRecvType(c, rt), mname)
+  if (hint == "") {
+    reportNoHint(c.diags, ecUnknownMember, vSpan(c, kids[1]),
+      "no field or method '${mname}' on this type")
+    return
+  }
+  report(c.diags, ecUnknownMember, vSpan(c, kids[1]),
+    "no field or method '${mname}' on this type", "did you mean '${hint}'?")
+}
+
+// Does this expression's type trace back to a DECL the resolver resolved, rather
+// than to the module-wide flat `env`? Judging a member by ABSENCE is only sound
+// on a receiver whose type is trustworthy, and the flat-env fallback is not: a
+// name it cannot resolve reads back as whatever same-named local another
+// function left behind, so a perfectly valid `e.extType` gets judged against an
+// unrelated struct.
+//
+// Binder-bound names (for-of, match-arm payload, catch, comma-ok) are
+// deliberately absent from `declTypes` — they are typed best-effort in pre-pass 3
+// (see `envBind`) — so they read as not-decl-rooted and are skipped. That
+// under-reports E0057 inside loop and match-arm bodies, which is the correct
+// trade: the seed still gates, and this validator must never invent. Coverage
+// widens on its own once binders move onto the decl-path too.
+//
+// Depth-bounded: a receiver chain is walked to its base ident.
+fn vDeclRooted(c: Checker, node: int, depth: int): bool {
+  if (node == 0 || depth > 16) {
+    return false
+  }
+  let t = getNode(c.tree, node).tag
+  if (t == Tag.Ident) {
+    return declRefType(c, node) != 0
+  }
+  // An explicit type node fixes the type outright.
+  if (t == Tag.CompositeLit || t == Tag.TypeAssert) {
+    return true
+  }
+  if (t == Tag.Member || t == Tag.Index || t == Tag.Call || t == Tag.TryExpr) {
+    return vDeclRooted(c, kidsOf(c.tree, node)[0], depth + 1)
+  }
+  return false
+}
+
+// `node`'s resolved symbol kind, or `Poison` when it names none (not an
+// Ident, or an Ident the resolver never bound — the bare dump entry points
+// run with no resolver at all, and `node`/`nodeSymbols` bounds are the same
+// guard the resolver's own flat tables use elsewhere). `Poison` doubles as the
+// resolver's own "failed import" sentinel (symbols.bit), so it is never the
+// kind of a legitimate namespace or type reference — safe to reuse here.
+fn vNodeSymbolKind(c: Checker, node: int): SymbolKind {
+  if (getNode(c.tree, node).tag != Tag.Ident) {
+    return SymbolKind.Poison
+  }
+  if (node < 0 || node >= len(c.nodeSymbols)) {
+    return SymbolKind.Poison
+  }
+  let sid = c.nodeSymbols[node]
+  if (sid <= 0 || sid >= len(c.symbols)) {
+    return SymbolKind.Poison
+  }
+  return c.symbols[sid].kind
+}
+
+// Is `node` a bare reference to an imported MODULE namespace (`strings` in
+// `strings.trim(s)`) OR a type name (`Color` in `Color.Red`)? Neither is a
+// value, so member access on either must not be judged as a field/method
+// lookup — that path belongs to `vMember`'s Struct/Interface case below.
+fn vIsNamespaceRef(c: Checker, node: int): bool {
+  let k = vNodeSymbolKind(c, node)
+  return k == SymbolKind.ImportNamespace || k == SymbolKind.StructType ||
+    k == SymbolKind.EnumType || k == SymbolKind.InterfaceType ||
+    k == SymbolKind.TypeAlias || k == SymbolKind.BuiltinType
+}
+
+// Is `node` SPECIFICALLY a namespace-import alias (`fs` in `fs.readFile(p)`),
+// as opposed to the other receivers `vIsNamespaceRef` also admits (a type
+// name used for `Enum.Variant` etc.)? Only a namespace import has an export
+// table to validate a member against — E0046 below must not fire for a type
+// name, which is resolved by a completely different path.
+fn vIsNamespaceImportRef(c: Checker, node: int): bool {
+  return vNodeSymbolKind(c, node) == SymbolKind.ImportNamespace
+}
