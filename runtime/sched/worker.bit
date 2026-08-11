@@ -391,6 +391,17 @@ fn schedFindWorkIdle(w: *i64, nowFn: () => int,
 // shape ../root/<os>'s `workerBody` uses, and #1673 is what happens without it:
 // the boot path drove `schedWorkerStepNow`, which never polls, so a task parked
 // on the netpoller had no thread that could ever wake it.
+//
+// THIS IS THE REAL PRODUCTION IDLE PATH (#2530): every ordinary compiled Bit
+// program reaches this function on every idle turn of `runtime/root/<os>`'s
+// `workerBody`, which is why `schedCheckDeadlock` is wired in here rather than
+// into `schedFindWorkIdle` above — that seam is `schedWorkerRun`'s, and
+// `schedWorkerRun`'s only in-tree drivers are `tests/stress/sched*` programs
+// that embed a PRIVATE scheduler and coordinate with it from outside the
+// worker pool (see `schedWorkerRun`'s own header: "six of nine call sites"
+// call it directly from a boot thread that then pushes work in from the
+// side) — exactly the shape a queue/timer/poll-only check cannot see through,
+// so it stays unchecked there rather than guessed at.
 export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now: int): int {
   let addr = schedFindWork(w)
   if (addr != 0) {
@@ -403,7 +414,127 @@ export @symbol("bit_rt_port_sched_find_work_at") fn schedFindWorkAt(w: *i64, now
       return t
     }
   }
+  schedCheckDeadlock(s)
   return 0
+}
+
+// ---------------------------------------------------------------------------
+// Deadlock detection (#2530)
+// ---------------------------------------------------------------------------
+//
+// Go panics `fatal error: all goroutines are asleep - deadlock!` when no
+// goroutine can ever run again. This runtime used to just sit there, burning
+// ~1% of a core on the idle spin forever — silent, no exit code, no message.
+//
+// THE STATES WHERE THERE IS NO RUNNABLE TASK AND THE PROGRAM IS FINE, and
+// which of them this check can and cannot see from `runtime/sched/**` alone:
+//
+//   - a task parked on a TIMER that has not yet fired — SEEN: `schedTimerCount`
+//     (`../sched/timer.bit`) counts the whole sleeping-task list, not just due
+//     entries, so a sleeper excludes this check for its entire wait, not only
+//     at the instant it wakes.
+//   - a task parked on the NETPOLLER with a live registration (a server on
+//     `accept()`, a client waiting on a response) — SEEN: `schedPollPendingCount`
+//     (`../sched/timer.bit`) counts one-shot registrations armed with the
+//     kernel but not yet drained; see its own comment for the one thing it
+//     cannot see (a second, private scheduler+poller in the same process,
+//     stress-harness only, and safe in the direction it is wrong).
+//   - a task blocked in a genuine BLOCKING SYSCALL (unbracketed, off the
+//     scheduler entirely) — SEEN, BY CONSTRUCTION, NOT BY A FLAG: the OS
+//     thread performing that syscall cannot also be executing this function,
+//     since it is inside the kernel; only a worker that has reached its own
+//     idle turn ever evaluates this, so a thread mid-syscall is simply never
+//     the one asking.
+//   - ANOTHER OS WORKER THREAD still holding a runnable or running task —
+//     NOT SEEN in general, and this is why the check below refuses to run at
+//     all above one worker: nothing in this module's state says "a task is
+//     mid-execution on worker N" in a form a DIFFERENT idling worker can read
+//     safely (`wkRunning` is written without a memory fence, being touched
+//     only by the same thread today). With exactly one worker this case
+//     cannot arise — this very call is the only worker there is, so its
+//     reaching an idle turn already proves nothing else in the process is
+//     running. `BIT_WORKERS>1` gets no detection at all rather than a guess.
+//
+// SOUND FOR `nworkers == 1` — THIS RUNTIME'S DEFAULT — AND ONLY THAT.
+// A false positive here kills a working program, which the ticket (#2530)
+// weighs as strictly worse than the bug it fixes, so this stays off rather
+// than approximate the multi-worker case.
+//
+// THE FOURTH INPUT, AND WHY IT IS NOT OPTIONAL: `schedRegCount(s) > 0`. main's
+// own `schedTaskExit` (`../sched/task.bit`) now sets `scStopping` SYNCHRONOUSLY
+// with its own exit for exactly this reason — without it, an ordinary program
+// that returns from `main` while a fire-and-forget spawned task is still
+// alive but permanently parked (legitimate: an unwaited goroutine is simply
+// abandoned when `main` returns) would satisfy every other condition below on
+// the very next idle turn, before `runtime/root`'s separate boot thread ever
+// gets to notice `mainDone` and call `schedShutdown` itself. `scStopping` is
+// therefore checked FIRST, and is what makes that window closed rather than
+// merely narrow.
+//
+// PANICS RATHER THAN REPORTS, matching Go's shape and SPEC §18.4's "panics are
+// fatal by design": there is no `recover` in this language, so a caller who
+// wants to distinguish this from an ordinary crash can only do so from the
+// message on stderr, exactly as a Go program does from `recover`'s absence
+// facing its own fatal errors.
+fn schedCheckDeadlock(s: *i64) {
+  if (*(s + scNWorkers) != 1) {
+    return
+  }
+  if (atomicLoad(s + scStopping) != 0) {
+    return
+  }
+  if (schedTimerCount(s) != 0) {
+    return
+  }
+  if (schedPollPendingCount() != 0) {
+    return
+  }
+  if (schedRegCount(s) == 0) {
+    return
+  }
+  panicDeadlock()
+}
+
+// `bit_rt_panic` (ABI.md §12): prints `panic: <msg>` and exits 2 (SPEC §18.4).
+// Declared `extern` exactly as `runtime/chan/chanwrap.bit` and
+// `runtime/root/slices.bit` already do from their own modules — it is a
+// `libbitrt.a` member, so E0078 admits the declaration regardless of which
+// module reaches for it, and `@nosplit` may call an `extern function` (E0075
+// only forbids a non-`@nosplit` Bit one).
+extern fn bit_rt_panic(msg: int)
+
+// "all tasks are asleep - deadlock!" (32), Go's own wording with this
+// runtime's vocabulary. Packed little-endian into i64 words exactly as
+// `chanwrap.bit`'s panic messages are, and for the identical reason: computed,
+// not hand-derived, and a module-static buffer so the panic path allocates
+// nothing.
+const deadlockMsgWord0: int = 7742639335768091745
+const deadlockMsgWord1: int = 8313962007185399923
+const deadlockMsgWord2: int = 7214816220395431276
+const deadlockMsgWord3: int = 2408127755970699621
+const deadlockMsgLen: int = 32
+
+// The `{ptr, len}` string header (ABI.md §2) is words 0 and 1; `deadlockStrHeaderSize`
+// is its size in BYTES, used only to compute where the text starts. Mirrored
+// locally rather than imported: `runtime/sched` may import neither platform
+// provider, and `runtime/root` (where these are normally exported from)
+// imports `runtime/sched`, not the reverse — importing it back would be
+// circular. Two header words plus four text words: 32 bytes of text, exactly
+// `deadlockMsgLen`.
+const deadlockStrHeaderSize: int = 16
+let deadlockMsg: [6]i64
+
+// Report the deadlock and abort. NEVER RETURNS.
+fn panicDeadlock() {
+  let msg: *i64 = ptrOf(deadlockMsg)
+  let base = int(msg)
+  *msg = base + deadlockStrHeaderSize
+  *(msg + 1) = deadlockMsgLen
+  *(msg + 2) = deadlockMsgWord0
+  *(msg + 3) = deadlockMsgWord1
+  *(msg + 4) = deadlockMsgWord2
+  *(msg + 5) = deadlockMsgWord3
+  bit_rt_panic(base)
 }
 
 // The two seam arguments for a consumer that drives NEITHER timers nor I/O —
