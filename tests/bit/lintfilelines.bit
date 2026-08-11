@@ -1,0 +1,306 @@
+// `bit lint` never ran over `compiler/` or `runtime/` (#2747, following #2515's
+// same shape for E0211 over `runtime/` alone): the file that implements the
+// 800-line `max-file-lines` rule (E0200, `compiler/lint.bit`) itself drifted to
+// 1362 lines — 62 over its own 1300-line override — with nothing to catch it,
+// because no gate ever pointed `bit lint` at the compiler's own source.
+//
+// This gate enforces ZERO `E0200` findings in `compiler/` and `runtime/` — one
+// rule, not the whole set. #2567's 63 non-E0211 `runtime/` findings (including
+// its own E0200-adjacent readability rules) are a separate, still-open
+// decision; bundling them here guarantees a red gate on day one, which in this
+// repo means the gate gets ignored. `E0200` alone needs no such policy call:
+// the threshold is objective and #2470/#2471 already brought every prior
+// offender in both trees under 800 with no override, so this is green on day
+// one (#2747's own measured baseline on `main` @ `c2a1eb27`).
+//
+// SCOPE, STATED EXPLICITLY: `compiler/` and `runtime/` only.
+//   - `tests/cases/` is NEVER included — `lint_boundary_fail.bit` (801 lines)
+//     and `lint_boundary_pass.bit` (800 lines) are E0200's own boundary
+//     fixtures, deliberately sized to fail/pass at the threshold. A gate over
+//     that directory would fail by design on a correct fixture. Neither
+//     `compiler/` nor `runtime/` contains anything like it (checked: zero
+//     `.expected` files in either tree), so no exclusion logic is needed here.
+//   - `stdlib/` is DELIBERATELY EXCLUDED. It is legal today (closest:
+//     `stdlib/tls/handshake.bit` at 796) but that is a live scope choice, not
+//     an oversight — the one-line deliverable this gate was built against
+//     names exactly two trees. Extending coverage to `stdlib/` is a
+//     symmetrical, equally cheap follow-up; bundling a third tree into this
+//     gate is scope creep beyond what was asked.
+//
+// THE DENOMINATOR IS PRINTED ON PURPOSE. `tests/bit/filesize.bit` prints
+// "N file(s) scanned" with no paired count, and that number alone reads as a
+// whole-tree verdict while actually covering 77 of 1174 tracked `.bit` files —
+// the third documented instance of a gate whose scope is invisible in its own
+// output. This gate's pass line instead reports `N of N .bit file(s) scanned`
+// per directory PLUS the combined total, and says outright which trees it
+// does NOT cover, so nobody reading a green run mistakes it for whole-repo
+// coverage.
+//
+// `N` is computed by a HAND-ROLLED recursive directory walk (`countBitFiles`
+// below) rather than by importing `std/fs`'s `walk` — the same primitive
+// `bit lint`'s own `collectLintFiles` (compiler/lintbatch.bit) calls to build
+// its file list. Sharing that primitive would make the denominator blind to
+// exactly the bug it exists to catch: if `walk` silently dropped a file, both
+// the count AND the scan it is meant to police would shrink together and the
+// gate would still show N == N. A zero count from either directory is a hard
+// stop (`countBitFiles`'s caller), not a silent pass — the anti-vacuity
+// guard: a gate that reports 0 E0200 while scanning 0 files is not passing,
+// it is scanning nothing.
+//
+// Exactly like `tests/bit/lintruntime.bit`, none of a subprocess's exit code
+// or stderr is observable from inside the linting process, so this shells the
+// real `bit lint` out through `/bin/sh` and reads both back off disk.
+//
+// Run it from the repository root:
+//     ./bit-out/bin/bit run tests/bit/lintfilelines.bit
+// BIT_SELF_EXE names the compiler under test; BIT_REPO names the repo root
+// `compiler/` and `runtime/` hang off. Both are required — a missing one is a
+// hard stop, not a silently different (and silently green) pair of directories.
+import { env, envOr, exit } from "std/os"
+import { exists, isDir, mkdir, readDir, readFile, writeFile } from "std/fs"
+import { contains, hasPrefix, hasSuffix, parseInt, split } from "std/strings"
+import { uuidV4, format as uuidFormat } from "std/uuid"
+
+// Bounds on the independent walk below — Power of 10 rule 2: `compiler/` and
+// `runtime/` are small, fixed trees, but the recursion is still capped
+// explicitly rather than trusted to terminate on its own.
+const maxEntries: int = 4096
+const maxScanDepth: int = 16
+
+fn timeoutMs(): int {
+  let s = parseInt(envOr("BIT_TEST_TIMEOUT_S", "300")) catch _ {
+    300
+  }
+  if (s <= 0) {
+    return 300000
+  }
+  return s * 1000
+}
+
+// Runs `script` through /bin/sh and returns its exit code. Negative returns
+// are `osRunBounded`'s mechanism channel, never a program exit status, so
+// each one is a named panic rather than a value any assertion could consume.
+fn shell(scriptPath: string, script: string, ms: int): int! {
+  writeFile(scriptPath, script)?
+  if (fsChmod(scriptPath, 448) != 0) { // 0o700
+    fail newError("lintfilelines: cannot make script executable: ${scriptPath}")
+  }
+  let code = osRunBounded(scriptPath, ms)
+  if (code == -2) {
+    panic("lintfilelines: TIMED OUT after ${ms}ms running ${scriptPath}")
+  }
+  if (code == -1) {
+    panic("lintfilelines: could not spawn ${scriptPath}")
+  }
+  if (code <= -100) {
+    panic("lintfilelines: ${scriptPath} died on signal ${-100 - code}")
+  }
+  return code
+}
+
+fn requiredEnv(name: string): string! {
+  let v = env(name)
+  if (len(v) == 0) {
+    fail newError("lintfilelines: ${name} is required and was not set")
+  }
+  return v
+}
+
+// One `bit lint <dir>` invocation, as seen from outside it.
+struct Run { code: int, err: string }
+
+fn runLint(bit: string, dir: string, capDir: string, ms: int): Run! {
+  let outPath = "${capDir}/out.txt"
+  let errPath = "${capDir}/err.txt"
+  let codePath = "${capDir}/code.txt"
+  let script = "#!/bin/sh\n" + "'${bit}' lint '${dir}' > '${outPath}' 2> '${errPath}'\n" + "echo $? > '${codePath}'\n" + "exit 0\n"
+  let sh = shell("${capDir}/lint.sh", script, ms)?
+  if (sh != 0) {
+    fail newError("lintfilelines: wrapper script exited ${sh}, which it never should")
+  }
+  if (!exists(codePath)) {
+    fail newError("lintfilelines: no exit code was recorded — the run never happened")
+  }
+  let code = parseInt(trimWs(readFile(codePath)?))?
+  return Run{ code: code, err: readFile(errPath)? }
+}
+
+// `std/strings`'s `trimSpace` strips only space/tab, not the trailing `\n`
+// every captured `code.txt`/exit-code file carries — the same reason
+// `tests/bit/lintruntime.bit` rolls this locally rather than relying on it.
+fn trimWs(s: string): string {
+  let lo = 0
+  while (lo < len(s) && isWs(s[lo])) {
+    lo = lo + 1
+  }
+  let hi = len(s)
+  while (hi > lo && isWs(s[hi - 1])) {
+    hi = hi - 1
+  }
+  return s[lo:hi]
+}
+
+fn isWs(c: u8): bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// The header line of one finding, e.g. `warning[E0200]: file is 825 lines...`.
+fn isFindingHeader(line: string): bool {
+  return hasPrefix(line, "warning[E") || hasPrefix(line, "error[E")
+}
+
+// `r` is a usable observation of a real run, not silence mistaken for a clean
+// sheet. Anti-vacuity: `bit lint` always prints a summary to stderr, clean or
+// not (compiler/lintbatch.bit's `lintCmd`), so an empty capture means the run
+// produced nothing trustworthy. Exit 2 is SPEC's own "could not be trusted"
+// verdict (usage error, unreadable path, malformed directive) — reading it as
+// a clean run is exactly the hole `docs/development.md`'s four
+// ways-to-report-green warns about.
+fn assertTrustworthy(r: Run, dir: string) {
+  if (len(r.err) == 0) {
+    panic("lintfilelines: stderr is empty — `bit lint ${dir}` produced no summary")
+  }
+  if (r.code == 2) {
+    panic("lintfilelines: `bit lint ${dir}` exited 2 (untrusted run):\n${r.err}")
+  }
+  if (r.code != 0 && r.code != 1) {
+    panic("lintfilelines: `bit lint ${dir}` exited ${r.code}, want 0 or 1")
+  }
+}
+
+// Total finding-header lines, and how many of those are E0200.
+fn countFindings(err: string): (int, int) {
+  let e0200 = 0
+  let total = 0
+  for line of split(err, "\n") {
+    if (!isFindingHeader(line)) {
+      continue
+    }
+    total = total + 1
+    if (contains(line, "[E0200]")) {
+      e0200 = e0200 + 1
+    }
+  }
+  return total, e0200
+}
+
+// Prints every E0200 finding's header AND the file:line:col it names.
+// `renderOne` (compiler/diagnostics.bit) always emits the location as the
+// line immediately following the header (`<severity>[<code>]: <message>` then
+// `--> <path>:<line>:<col>`), so an index-based loop — not the `for..of` above
+// — is needed to look one line ahead. Printing the header alone (the bug this
+// replaced) named the violation but never the file, which is useless for a
+// gate whose whole job is telling the reader which file to split.
+fn printE0200Findings(err: string) {
+  let lines = split(err, "\n")
+  let i = 0
+  while (i < len(lines)) {
+    if (contains(lines[i], "[E0200]")) {
+      eprint("  ${lines[i]}\n")
+      if (i + 1 < len(lines)) {
+        eprint("  ${lines[i + 1]}\n")
+      }
+    }
+    i = i + 1
+  }
+}
+
+// The count of `.bit` files anywhere beneath `dir`, computed by a walk this
+// file owns rather than by calling `std/fs`'s `walk` — see the header for why
+// sharing that primitive with `bit lint`'s own file collector would make the
+// denominator blind to a bug in it. Bounded by `maxScanDepth` (Power of 10
+// rule 2), not merely documented as such.
+fn countBitFiles(dir: string, depth: int): int {
+  if (depth <= 0) {
+    panic("lintfilelines: ${dir} nesting exceeds ${maxScanDepth} levels")
+  }
+  let names = readDir(dir) catch e {
+    panic("lintfilelines: cannot list ${dir}: ${e.message()}")
+  }
+  if (len(names) > maxEntries) {
+    panic("lintfilelines: ${dir} has ${len(names)} entries, over the ${maxEntries} bound")
+  }
+  let n = 0
+  for name of names {
+    let path = "${dir}/${name}"
+    if (isDir(path)) {
+      n = n + countBitFiles(path, depth - 1)
+    } else if (hasSuffix(name, ".bit")) {
+      n = n + 1
+    }
+  }
+  return n
+}
+
+// One directory's full verdict: the independently walked file count plus
+// `bit lint`'s own findings, folded together so `main` never handles the raw
+// `Run` outside this file.
+struct DirScan { dir: string, files: int, findings: int, e0200: int, err: string }
+
+fn teardown(dir: string, ms: int) {
+  shell("${dir}/rm.sh", "#!/bin/sh\nrm -rf '${dir}'\n", ms) catch _ {
+    return
+  }
+}
+
+fn scanOne(bit: string, repo: string, dirName: string, ms: int): DirScan {
+  let full = "${repo}/${dirName}"
+  if (!exists(full)) {
+    panic("lintfilelines: no such directory: ${full}")
+  }
+  let files = countBitFiles(full, maxScanDepth)
+  if (files == 0) {
+    panic("lintfilelines: ${full} contains zero .bit files — refusing a vacuous scan")
+  }
+
+  let tmp = envOr("TMPDIR", "/tmp")
+  if (hasSuffix(tmp, "/")) {
+    tmp = tmp[:len(tmp) - 1]
+  }
+  let capDir = "${tmp}/bit-lintfilelines-${uuidFormat(uuidV4())}"
+  mkdir(capDir) catch e {
+    panic("lintfilelines: cannot create ${capDir}: ${e.message()}")
+  }
+  defer teardown(capDir, ms)
+
+  let r = runLint(bit, full, capDir, ms) catch e {
+    panic("lintfilelines: ${e.message()}")
+  }
+  assertTrustworthy(r, full)
+  let (total, e0200) = countFindings(r.err)
+  return DirScan{ dir: dirName, files: files, findings: total, e0200: e0200, err: r.err }
+}
+
+fn main() {
+  let ms = timeoutMs()
+  let bit = requiredEnv("BIT_SELF_EXE") catch e {
+    panic("lintfilelines: ${e.message()}")
+  }
+  let repo = requiredEnv("BIT_REPO") catch e {
+    panic("lintfilelines: ${e.message()}")
+  }
+
+  let dirs = ["compiler", "runtime"]
+  let totalFiles = 0
+  let totalE0200 = 0
+  let anyFail = false
+  for d of dirs {
+    let sc = scanOne(bit, repo, d, ms)
+    println("lint-filelines: ${sc.dir}/: ${sc.files} of ${sc.files} .bit file(s) scanned, ${sc.findings} finding(s) (${sc.e0200} E0200)")
+    totalFiles = totalFiles + sc.files
+    totalE0200 = totalE0200 + sc.e0200
+    if (sc.e0200 > 0) {
+      anyFail = true
+      eprint("FAIL: ${sc.e0200} warning[E0200] finding(s) in ${sc.dir}/ — each is a file over\n")
+      eprint("the 800-line limit (spec/LINT.md §4). Split the file; do not raise the limit.\n")
+      printE0200Findings(sc.err)
+    }
+  }
+  if (anyFail) {
+    eprint("FAIL: ${totalE0200} warning[E0200] finding(s) across ${totalFiles} .bit file(s)\n")
+    eprint("scanned in compiler/ + runtime/.\n")
+    exit(1)
+  }
+  println("lint-filelines: PASS — 0 E0200 findings across ${totalFiles} .bit file(s) scanned")
+  println("lint-filelines: scope is compiler/ + runtime/ ONLY — stdlib/, tests/, examples/ are NOT covered by this gate")
+}
